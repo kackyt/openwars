@@ -1,0 +1,20 @@
+# map-grid Specification
+
+## Purpose
+TBD - created by archiving change add-core-logic. Update Purpose after archive.
+## Requirements
+### Requirement: マップグリッドシステム (Map Grid System)
+システムは、設定により通常グリッド（上下左右の4方向接点）またはオフセットグリッド（奇数行と偶数行が半マスずれた6方向接点）を切り替え可能で、さまざまな地形タイプが配置された2D座標系のマップを提供しなければならない (SHALL)。
+
+#### Scenario: グリッドの作成
+- **WHEN** 指定された幅と高さでマップが初期化されたとき
+- **THEN** 地形のマスを表すグリッドを割り当てる
+
+#### Scenario: 座標の隣接マスの取得
+- **WHEN** オフセットグリッド設定で特定の座標の隣接マスを照会したとき
+- **THEN** 周囲6方向の正当な座標リストを返す（奇数・偶数行のズレを考慮する）
+
+#### Scenario: 地形の照会と指定地形のサポート
+- **WHEN** 境界内の特定の (x, y) 座標を照会したとき
+- **THEN** 指定URL（https://gbwn.main.jp/Terrain_GBWs.htm）に基づく13種類の地形（道路、橋、平地、川、森、山、海、浅瀬、都市、工場、空港、港、首都）のいずれかの正しい地形タイプを返す
+

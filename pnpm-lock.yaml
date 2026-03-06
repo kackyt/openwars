@@ -1,0 +1,22 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      openspec:
+        specifier: ^0.0.0
+        version: 0.0.0
+
+packages:
+
+  openspec@0.0.0:
+    resolution: {integrity: sha512-7+lOPJO4eDtQlC/wfpRuZ+c75hiXIfb+PDm7nmWkj6/ZKf2Utx6ST1Sg35Vjvrz6dGGUQEW9fuVe+thKvVstkA==}
+
+snapshots:
+
+  openspec@0.0.0: {}
