@@ -1,8 +1,7 @@
-# game-state Specification
+# game-state Specification Delta
 
-## Purpose
-TBD - created by archiving change add-core-logic. Update Purpose after archive.
-## Requirements
+## MODIFIED Requirements
+
 ### Requirement: ゲーム状態管理 (Game State Management)
 システムは、現在のターンとアクティブなプレイヤーを追跡し、対戦（マッチ）のライフサイクルを管理しなければならない (SHALL)。さらに、各プレイヤーの資金（予算）と、ゲームの勝利・終了判定を含まなければならない (SHALL)。
 
@@ -17,4 +16,3 @@ TBD - created by archiving change add-core-logic. Update Purpose after archive.
 #### Scenario: 勝利条件の判定（敵軍全滅）
 - **WHEN** ターン1以降において、敵プレイヤーの全てのユニットが破壊（消滅）したとき
 - **THEN** ゲームの勝利条件が満たされたと判定し、ゲーム状態を「終了（対戦完了）」に遷移させる
-

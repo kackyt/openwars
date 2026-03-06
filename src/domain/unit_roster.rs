@@ -59,11 +59,12 @@ pub struct Unit {
     pub fuel: u32,
     pub ammo1: u32,
     pub ammo2: u32,
-    pub owner_player_id: u32, // Simple player reference mapping
+    pub owner_player_id: u32,     // Simple player reference mapping
+    pub position: (usize, usize), // (x, y) map coordinate
 }
 
 impl Unit {
-    pub fn new(stats: UnitStats, owner_player_id: u32) -> Self {
+    pub fn new(stats: UnitStats, owner_player_id: u32, position: (usize, usize)) -> Self {
         Self {
             fuel: stats.max_fuel,
             ammo1: stats.max_ammo1,
@@ -71,6 +72,7 @@ impl Unit {
             stats,
             hp: 100, // Initialize to max 100 (represents 10 display HP)
             owner_player_id,
+            position,
         }
     }
 
@@ -143,7 +145,7 @@ mod tests {
     #[test]
     fn test_unit_creation_and_damage() {
         let stats = create_dummy_infantry();
-        let mut unit = Unit::new(stats, 1);
+        let mut unit = Unit::new(stats, 1, (0, 0));
 
         assert_eq!(unit.hp, 100);
         assert_eq!(unit.get_display_hp(), 10);

@@ -115,6 +115,36 @@ impl Map {
     fn in_bounds(&self, x: usize, y: usize) -> bool {
         x < self.width && y < self.height
     }
+
+    /// Calculate the minimum grid distance between two points using BFS
+    pub fn distance(&self, x1: usize, y1: usize, x2: usize, y2: usize) -> Option<u32> {
+        if !self.in_bounds(x1, y1) || !self.in_bounds(x2, y2) {
+            return None;
+        }
+        if x1 == x2 && y1 == y2 {
+            return Some(0);
+        }
+
+        let mut queue = std::collections::VecDeque::new();
+        let mut visited = std::collections::HashSet::new();
+
+        queue.push_back((x1, y1, 0));
+        visited.insert((x1, y1));
+
+        while let Some((cx, cy, dist)) = queue.pop_front() {
+            if cx == x2 && cy == y2 {
+                return Some(dist);
+            }
+
+            for (nx, ny) in self.get_adjacent(cx, cy) {
+                if visited.insert((nx, ny)) {
+                    queue.push_back((nx, ny, dist + 1));
+                }
+            }
+        }
+
+        None
+    }
 }
 
 #[cfg(test)]
