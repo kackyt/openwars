@@ -1,0 +1,10 @@
+[package]
+name = "core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy_ecs = "0.15.2"
+uuid = { version = "1.12", features = ["v4"] }
+thiserror = "2.0"
+anyhow = "1.0"

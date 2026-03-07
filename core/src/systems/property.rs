@@ -1,0 +1,225 @@
+use crate::components::*;
+use crate::events::*;
+use crate::resources::*;
+use bevy_ecs::prelude::*;
+
+pub fn capture_property_system(
+    mut capture_events: EventReader<CapturePropertyCommand>,
+    mut captured_events: EventWriter<PropertyCapturedEvent>,
+    mut q_units: Query<(
+        Entity,
+        &GridPosition,
+        &Faction,
+        &Health,
+        &UnitStats,
+        &mut ActionCompleted,
+    )>,
+    mut q_properties: Query<(&GridPosition, &mut Property)>,
+    mut match_state: ResMut<MatchState>,
+    players: Res<Players>,
+    _map: Res<Map>,
+) {
+    if match_state.game_over.is_some() {
+        return;
+    }
+    let active_player_id = players.0[match_state.active_player_index].id;
+
+    for event in capture_events.read() {
+        let (pos, faction, hp, stats, mut action) = match q_units.get_mut(event.unit_entity) {
+            Ok((_, p, f, h, s, a)) => (p.clone(), f.0, h.clone(), s.clone(), a),
+            _ => continue,
+        };
+
+        if faction != active_player_id || action.0 || hp.is_destroyed() || !stats.can_capture {
+            continue;
+        }
+
+        let action_power = hp.get_display_hp() * 10;
+        let mut captured = false;
+        let mut new_owner = None;
+
+        for (prop_pos, mut prop) in q_properties.iter_mut() {
+            if prop_pos.x == pos.x && prop_pos.y == pos.y {
+                let max_points = prop.terrain.max_capture_points();
+                if max_points == 0 {
+                    continue; // Not capturable
+                }
+
+                if prop.owner_id == Some(active_player_id) {
+                    // Repair
+                    prop.capture_points =
+                        std::cmp::min(prop.capture_points + action_power, max_points);
+                } else {
+                    // Capture
+                    if prop.capture_points <= action_power {
+                        prop.owner_id = Some(active_player_id);
+                        prop.capture_points = max_points;
+                        captured = true;
+                        new_owner = Some(active_player_id);
+                    } else {
+                        prop.capture_points -= action_power;
+                    }
+                }
+                action.0 = true;
+                break;
+            }
+        }
+
+        if captured {
+            captured_events.send(PropertyCapturedEvent {
+                x: pos.x,
+                y: pos.y,
+                new_owner,
+            });
+
+            // Check win conditions
+            let mut alive_players = Vec::new();
+            for player in &players.0 {
+                let mut has_capital = false;
+                for (_p_pos, p_prop) in q_properties.iter() {
+                    if p_prop.owner_id == Some(player.id) && p_prop.terrain == Terrain::Capital {
+                        has_capital = true;
+                        break;
+                    }
+                }
+
+                let mut has_units = false;
+                for (_, _u_pos, u_fac, u_hp, _, _) in q_units.iter() {
+                    if u_fac.0 == player.id && !u_hp.is_destroyed() {
+                        has_units = true;
+                        break;
+                    }
+                }
+
+                let is_annihilated = match_state.current_turn_number > 1 && !has_units;
+                if has_capital && !is_annihilated {
+                    alive_players.push(player.id);
+                }
+            }
+
+            if alive_players.len() == 1 {
+                match_state.game_over = Some(GameOverCondition::Winner(alive_players[0]));
+            } else if alive_players.is_empty() {
+                match_state.game_over = Some(GameOverCondition::Draw);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_capture_property_system() {
+        let mut world = World::new();
+
+        world.insert_resource(MatchState::default());
+        world.insert_resource(Players(vec![
+            Player::new(1, "P1".to_string()),
+            Player::new(2, "P2".to_string()),
+        ]));
+
+        world.insert_resource(Map::new(5, 5, Terrain::Plains, GridTopology::Square));
+        world.insert_resource(Events::<CapturePropertyCommand>::default());
+        world.insert_resource(Events::<PropertyCapturedEvent>::default());
+
+        let unit_entity = world
+            .spawn((
+                GridPosition { x: 2, y: 2 },
+                Faction(1),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    cost: 1000,
+                    max_movement: 3,
+                    movement_type: MovementType::Foot,
+                    max_fuel: 99,
+                    max_ammo1: 0,
+                    max_ammo2: 0,
+                    min_range: 1,
+                    max_range: 1,
+                    daily_fuel_consumption: 0,
+                    can_capture: true,
+                    can_supply: false,
+                    max_cargo: 0,
+                    loadable_unit_types: vec![],
+                },
+                ActionCompleted(false),
+            ))
+            .id();
+
+        world.spawn((
+            GridPosition { x: 2, y: 2 },
+            Property {
+                terrain: Terrain::City,
+                owner_id: None,
+                capture_points: 200, // max is 200
+            },
+        ));
+
+        // Add dummy capitals so players aren't instantly defeated upon capture
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property {
+                terrain: Terrain::Capital,
+                owner_id: Some(1),
+                capture_points: 200,
+            },
+        ));
+        world.spawn((
+            GridPosition { x: 4, y: 4 },
+            Property {
+                terrain: Terrain::Capital,
+                owner_id: Some(2),
+                capture_points: 200,
+            },
+        ));
+        world.spawn((
+            GridPosition { x: 4, y: 4 },
+            Faction(2),
+            Health {
+                current: 100,
+                max: 100,
+            },
+        )); // dummy unit for P2
+
+        world.send_event(CapturePropertyCommand { unit_entity });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(capture_property_system);
+        schedule.run(&mut world);
+
+        // Action power is 10 * 10 = 100
+        let mut query = world.query::<&Property>();
+        let mut iter = query.iter(&world);
+        let prop = iter.find(|p| p.terrain == Terrain::City).unwrap();
+
+        assert_eq!(prop.capture_points, 100);
+        assert_eq!(prop.owner_id, None);
+
+        let action = world.get::<ActionCompleted>(unit_entity).unwrap();
+        assert!(action.0); // Used action
+
+        // Reset action and capture again
+        world.get_mut::<ActionCompleted>(unit_entity).unwrap().0 = false;
+        world.send_event(CapturePropertyCommand { unit_entity });
+        schedule.run(&mut world);
+
+        let mut iter = query.iter(&world);
+        let prop = iter.find(|p| p.terrain == Terrain::City).unwrap();
+
+        assert_eq!(prop.capture_points, 200); // Reset after capture
+        assert_eq!(prop.owner_id, Some(1));
+
+        let events = world.resource::<Events<PropertyCapturedEvent>>();
+        let mut cursor = events.get_cursor();
+        let evs: Vec<_> = cursor.read(events).collect();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].x, 2);
+        assert_eq!(evs[0].new_owner, Some(1));
+    }
+}
