@@ -95,14 +95,17 @@ impl<R: UnitRepository> MoveUnitUseCase<R> {
 Reactはbullet proof reactでディレクトリは配置
 
 Rustはworkspaceを使ったマルチクレート構成にする
+coreクレートにはECS(Entity Component System)を採用する
+
 openwars/
 ├── Cargo.toml               # ワークスペース全体の定義
-├── core/                    # 【コア】DDDのDomain, Application, Infra層を含むライブラリ
+├── core/                    # 【コア】ECSを採用したゲームロジック
 │   ├── Cargo.toml
 │   └── src/
-│       ├── domain/          # エンティティ、値オブジェクト、リポジトリのtrait
-│       ├── application/     # ユースケース（CLI/GUIから呼ばれる窓口）
-│       ├── infrastructure/  # SQLiteやファイル保存などの実装
+│       ├── components/      # エンティティ、値オブジェクト、リポジトリのtrait
+│       ├── systems/         # システム
+│       ├── events/          # イベント (uiへの通知)
+│       ├── resources/       # リソース (マスターデータ等)
 │       └── lib.rs
 ├── apps/
 │   ├── cli/                 # 【プレゼン層 1】CUIアプリケーション
@@ -119,34 +122,27 @@ openwars/
 │       └── src/             # Tauriのフロントエンド（TypeScript / React / Vue など）
 
 ### coreクレートの構成
-
-DDDを意識してモデル、リポジトリ、ユースケースを作る。オニオンアーキテクチャを意識すること
-
-src/
-├── domain/                 # 【中心】ドメイン層（外部への依存ゼロ）
-│   ├── model/              # エンティティ、値オブジェクト、集約ルート
-│   │   ├── game_state.rs   # ゲーム状態
-│   │   ├── unit.rs         # ユニット
-│   │   ├── map.rs          # マップ
-│   │   └── faction.rs      # 勢力
-│   ├── repository/         # 永続化や外部アクセスなどのインターフェース（trait）
-│   │   ├── game_state_repository.rs
-│   │   └── map_repository.rs
-│   └── error.rs            # ドメイン固有のエラー定義
-│
-├── application/            # 【第2層】アプリケーション層（ユースケース）
-│   ├── usecase/            # アプリケーションサービス（ドメインを操作する手順）
-│   │   └── move_unit.rs    # 例: ユニット移動のユースケース (trait)
-│   └── query/              # （必要に応じて）参照専用のDTOやクエリインターフェース (trait)
-│
-├── infrastructure/         # 【第3層】インフラストラクチャ層（DB、ファイルIO等、マスターデータ管理）
-│   ├── persistence/        # repository traitの具体的な実装
-│   │   ├── in_memory/      # テスト用のオンメモリ実装
-│   │   └── file/           # fileへの保存、読み出し実装 (csvはここに置く)
-│   └── external/           # 外部API等のクライアント
-└── lib.rs
+#### Components に実装すべきもの
+「ゲームの盤面を再現するために最低限必要なデータ」に絞ります。描画用の Sprite や Transform (Bevyの場合) は含めず、純粋な座標やステータスを持たせます。カテゴリコンポーネント例役割位置・配置GridPosition(x, y)マップ上のセル座標。属性・所有Faction(u32), UnitType勢力ID、ユニットの種類（歩兵、戦車など）。ステータスHealth, ActionPointsHP、残り行動回数、移動力など。能力値AttackStat, DefenseStat攻撃力、防御力、射程などの静的/動的パラメータ。状態フラグIsExhausted, IsCapturing行動済みフラグ、占領中フラグなど。
 
 
+#### Systems に実装すべきもの
+「ルールの適用」と「状態の更新」を記述します。移動ロジック: GridPosition の更新。経路探索（A*等）の結果を適用し、移動コストを ActionPoints から差し引く。戦闘解決: 攻撃側と防御側のコンポーネントを参照し、乱数や定数に基づいて Health を減算する。ターン管理: 全ユニットの ActionPoints を回復させる、バフの継続時間を減らす等のバッチ処理。勝敗判定: 拠点の Health や特定のユニット（将軍など）の生存をチェックする。AI思考: 敵勢力のコンポーネントをスキャンし、次の行動を決定してコマンドを発行する。
+
+
+#### 描画Crate（別Crate）との連携パターンロジックと描画を分離する場合、
+
+イベント駆動方式（推奨）ロジックCrateは、何かが起きたときに Event を発行するだけに留めます。
+
+```
+// ロジックCrateで定義
+pub struct UnitMovedEvent {
+    pub entity: Entity,
+    pub from: GridPosition,
+    pub to: GridPosition,
+}
+```
+描画Crateはこのイベントを購読し、「移動アニメーション」を開始したり、「足音SE」を鳴らしたりします。これにより、ロジック側は「どう見えるか」を完全に無視できます。
 
 ### Testing Strategy
 
