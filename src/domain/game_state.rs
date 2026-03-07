@@ -135,6 +135,9 @@ impl MatchState {
             }
         }
 
+        // 拠点による自動補給（ターン開始時に資金を消費して補給）
+        self.apply_property_resupply(active_pid);
+
         self.add_budget_for_active_player();
         self.check_win_conditions();
     }
@@ -538,6 +541,190 @@ impl MatchState {
             .hash(&mut h);
         (h.finish() % 11) as u32 // 0..=10
     }
+
+    /// 補給輸送車が隣接する指定の味方ユニット 1 体に補給する。
+    /// 燃料・ammo1・ammo2 を最大値まで回復。移動後も実行可能。
+    pub fn supply_unit(
+        &mut self,
+        supplier_index: usize,
+        target_index: usize,
+    ) -> Result<(), &'static str> {
+        if self.game_over.is_some() {
+            return Err("Game is over");
+        }
+        let active_player_id = self.get_active_player().ok_or("No active player")?.id;
+
+        {
+            let supplier = self.units.get(supplier_index).ok_or("Supplier not found")?;
+            if supplier.owner_player_id != active_player_id {
+                return Err("Not your unit");
+            }
+            if supplier.action_completed {
+                return Err("Supplier already acted");
+            }
+            if !supplier.stats.can_supply {
+                return Err("Unit cannot supply");
+            }
+            if supplier.is_destroyed() {
+                return Err("Supplier is destroyed");
+            }
+
+            let target = self.units.get(target_index).ok_or("Target not found")?;
+            if target.owner_player_id != active_player_id {
+                return Err("Cannot supply enemy unit");
+            }
+            if target.is_destroyed() {
+                return Err("Target is destroyed");
+            }
+
+            // 距離チェック（マンハッタン距離 = 1 のみ）
+            let (sx, sy) = supplier.position;
+            let (tx, ty) = target.position;
+            let dist = (sx as i64 - tx as i64).unsigned_abs() as u32
+                + (sy as i64 - ty as i64).unsigned_abs() as u32;
+            if dist != 1 {
+                return Err("Target is not adjacent to supplier");
+            }
+        }
+
+        // 補給実行
+        {
+            let target = &mut self.units[target_index];
+            let max_fuel = target.stats.max_fuel;
+            let max_ammo1 = target.stats.max_ammo1;
+            let max_ammo2 = target.stats.max_ammo2;
+            target.fuel = max_fuel;
+            target.ammo1 = max_ammo1;
+            target.ammo2 = max_ammo2;
+        }
+        self.units[supplier_index].action_completed = true;
+        Ok(())
+    }
+
+    /// 補給輸送車が隣接するすべての味方ユニットに一括補給する（全自動補給）。
+    pub fn supply_all_adjacent(&mut self, supplier_index: usize) -> Result<(), &'static str> {
+        if self.game_over.is_some() {
+            return Err("Game is over");
+        }
+        let active_player_id = self.get_active_player().ok_or("No active player")?.id;
+
+        {
+            let supplier = self.units.get(supplier_index).ok_or("Supplier not found")?;
+            if supplier.owner_player_id != active_player_id {
+                return Err("Not your unit");
+            }
+            if supplier.action_completed {
+                return Err("Supplier already acted");
+            }
+            if !supplier.stats.can_supply {
+                return Err("Unit cannot supply");
+            }
+        }
+
+        let (sx, sy) = self.units[supplier_index].position;
+
+        // 補給対象インデックスを収集
+        let targets: Vec<usize> = self
+            .units
+            .iter()
+            .enumerate()
+            .filter(|(i, u)| {
+                if *i == supplier_index || u.is_destroyed() {
+                    return false;
+                }
+                if u.owner_player_id != active_player_id {
+                    return false;
+                }
+                let (tx, ty) = u.position;
+                let dist = (sx as i64 - tx as i64).unsigned_abs() as u32
+                    + (sy as i64 - ty as i64).unsigned_abs() as u32;
+                dist == 1
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        for target_idx in targets {
+            let target = &mut self.units[target_idx];
+            target.fuel = target.stats.max_fuel;
+            target.ammo1 = target.stats.max_ammo1;
+            target.ammo2 = target.stats.max_ammo2;
+        }
+
+        self.units[supplier_index].action_completed = true;
+        Ok(())
+    }
+
+    /// 指定ユニットを補給する内部ヘルパ（拠点補給で使用）。
+    /// 戻り値: (ammo_restored, fuel_restored) の量
+    fn restore_supplies(unit: &mut Unit) -> (u32, u32) {
+        let ammo_diff = (unit.stats.max_ammo1.saturating_sub(unit.ammo1))
+            + (unit.stats.max_ammo2.saturating_sub(unit.ammo2));
+        let fuel_diff = unit.stats.max_fuel.saturating_sub(unit.fuel);
+        unit.fuel = unit.stats.max_fuel;
+        unit.ammo1 = unit.stats.max_ammo1;
+        unit.ammo2 = unit.stats.max_ammo2;
+        (ammo_diff, fuel_diff)
+    }
+
+    /// ターン開始時にアクティブプレイヤーが所有する拠点にいる味方ユニットを自動補給する。
+    /// 弾薬 1 につき 15G、燃料 1 につき 5G を消費。資金不足なら補給スキップ。
+    fn apply_property_resupply(&mut self, player_id: u32) {
+        // 補給対象ユニットのインデックスと位置を収集
+        let unit_positions: Vec<(usize, (usize, usize))> = self
+            .units
+            .iter()
+            .enumerate()
+            .filter(|(_, u)| u.owner_player_id == player_id && !u.is_destroyed())
+            .map(|(i, u)| (i, u.position))
+            .collect();
+
+        // 自国拠点マスのセットを収集
+        let owned_property_positions: std::collections::HashSet<(usize, usize)> = self
+            .properties
+            .iter()
+            .filter(|(_, ps)| ps.owner_id == Some(player_id))
+            .filter(|(pos, _)| {
+                // 補給対象となる拠点種別（首都・都市・工場・空港・港）
+                matches!(
+                    self.map.get_terrain(pos.0, pos.1),
+                    Some(Terrain::Capital)
+                        | Some(Terrain::City)
+                        | Some(Terrain::Factory)
+                        | Some(Terrain::Airport)
+                        | Some(Terrain::Port)
+                )
+            })
+            .map(|(pos, _)| *pos)
+            .collect();
+
+        // 各ユニットのコストを計算し、資金が足りれば補給
+        for (unit_idx, pos) in unit_positions {
+            if !owned_property_positions.contains(&pos) {
+                continue;
+            }
+
+            let unit = &self.units[unit_idx];
+            let ammo_diff = (unit.stats.max_ammo1.saturating_sub(unit.ammo1))
+                + (unit.stats.max_ammo2.saturating_sub(unit.ammo2));
+            let fuel_diff = unit.stats.max_fuel.saturating_sub(unit.fuel);
+            let cost = ammo_diff * 15 + fuel_diff * 5;
+
+            // 資金チェック
+            let player_idx = self
+                .players
+                .iter()
+                .position(|p| p.id == player_id)
+                .expect("Player not found");
+
+            if self.players[player_idx].funds >= cost {
+                self.players[player_idx].funds -= cost;
+                let unit = &mut self.units[unit_idx];
+                unit.fuel = unit.stats.max_fuel;
+                unit.ammo1 = unit.stats.max_ammo1;
+                unit.ammo2 = unit.stats.max_ammo2;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -559,6 +746,7 @@ mod tests {
             max_range: 1,
             daily_fuel_consumption: 0,
             can_capture: true,
+            can_supply: false,
         }
     }
 
@@ -1150,5 +1338,197 @@ mod tests {
         let chart = make_chart_with_damage(UnitType::Infantry, UnitType::Infantry, 55);
         let result = game.attack(0, 1, &chart);
         assert!(result.is_err(), "Should fail: out of range");
+    }
+
+    // テスト用の補給輸送車ステータスを作成
+    fn supply_truck_stats() -> UnitStats {
+        let mut s = dummy_stats();
+        s.unit_type = UnitType::SupplyTruck;
+        s.max_fuel = 50;
+        s.max_ammo1 = 0;
+        s.max_ammo2 = 0;
+        s.can_supply = true;
+        s
+    }
+
+    #[test]
+    fn test_supply_unit_basic() {
+        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Capital).unwrap();
+        map.set_terrain(4, 4, Terrain::Capital).unwrap();
+
+        let mut properties = HashMap::new();
+        properties.insert((0, 0), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((4, 4), PropertyState::new(Terrain::Capital, Some(2)));
+
+        let p1 = Player::new(1, "Red".to_string());
+        let p2 = Player::new(2, "Blue".to_string());
+        let mut game = MatchState::new(map, vec![p1, p2], properties);
+
+        // u0: 補給輸送車 @(2,2)
+        let mut truck = Unit::new(supply_truck_stats(), 1, (2, 2));
+        truck.action_completed = false;
+        game.units.push(truck);
+
+        // u1: 歩兵 @(3,2) 燃料・弾薬消費済み
+        let mut inf_stats = dummy_stats();
+        inf_stats.max_fuel = 99;
+        inf_stats.max_ammo1 = 9;
+        let mut inf = Unit::new(inf_stats.clone(), 1, (3, 2));
+        inf.fuel = 10;
+        inf.ammo1 = 2;
+        game.units.push(inf);
+
+        let result = game.supply_unit(0, 1);
+        assert!(result.is_ok(), "{result:?}");
+        // 補給後は最大値に回復
+        assert_eq!(game.units[1].fuel, 99);
+        assert_eq!(game.units[1].ammo1, 9);
+        // 補給者は行動完了
+        assert!(game.units[0].action_completed);
+    }
+
+    #[test]
+    fn test_supply_unit_out_of_range_error() {
+        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Capital).unwrap();
+        map.set_terrain(4, 4, Terrain::Capital).unwrap();
+
+        let mut properties = HashMap::new();
+        properties.insert((0, 0), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((4, 4), PropertyState::new(Terrain::Capital, Some(2)));
+
+        let p1 = Player::new(1, "Red".to_string());
+        let p2 = Player::new(2, "Blue".to_string());
+        let mut game = MatchState::new(map, vec![p1, p2], properties);
+
+        let mut truck = Unit::new(supply_truck_stats(), 1, (2, 2));
+        truck.action_completed = false;
+        game.units.push(truck);
+
+        let inf = Unit::new(dummy_stats(), 1, (4, 2)); // 距離2
+        game.units.push(inf);
+
+        let result = game.supply_unit(0, 1);
+        assert!(result.is_err(), "Should fail: not adjacent");
+    }
+
+    #[test]
+    fn test_supply_all_adjacent() {
+        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Capital).unwrap();
+        map.set_terrain(4, 4, Terrain::Capital).unwrap();
+
+        let mut properties = HashMap::new();
+        properties.insert((0, 0), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((4, 4), PropertyState::new(Terrain::Capital, Some(2)));
+
+        let p1 = Player::new(1, "Red".to_string());
+        let p2 = Player::new(2, "Blue".to_string());
+        let mut game = MatchState::new(map, vec![p1, p2], properties);
+
+        let mut truck = Unit::new(supply_truck_stats(), 1, (2, 2));
+        truck.action_completed = false;
+        game.units.push(truck);
+
+        let mut inf_stats = dummy_stats();
+        inf_stats.max_fuel = 99;
+        inf_stats.max_ammo1 = 9;
+
+        let mut u1 = Unit::new(inf_stats.clone(), 1, (1, 2)); // 左隣
+        u1.fuel = 5;
+        game.units.push(u1);
+        let mut u2 = Unit::new(inf_stats.clone(), 1, (3, 2)); // 右隣
+        u2.fuel = 20;
+        game.units.push(u2);
+
+        let result = game.supply_all_adjacent(0);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(game.units[1].fuel, 99, "Left unit fully resupplied");
+        assert_eq!(game.units[2].fuel, 99, "Right unit fully resupplied");
+        assert!(game.units[0].action_completed);
+    }
+
+    #[test]
+    fn test_property_resupply_deducts_funds() {
+        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Capital).unwrap();
+        map.set_terrain(4, 4, Terrain::Capital).unwrap();
+        map.set_terrain(2, 2, Terrain::City).unwrap();
+
+        let mut properties = HashMap::new();
+        properties.insert((0, 0), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((4, 4), PropertyState::new(Terrain::Capital, Some(2)));
+        properties.insert((2, 2), PropertyState::new(Terrain::City, Some(1)));
+
+        let mut p1 = Player::new(1, "Red".to_string());
+        p1.funds = 10000;
+        let p2 = Player::new(2, "Blue".to_string());
+        let mut game = MatchState::new(map, vec![p1, p2], properties);
+
+        let mut inf_stats = dummy_stats();
+        inf_stats.max_fuel = 99;
+        inf_stats.max_ammo1 = 9;
+        // 弾薬差=9-0=9, 燃料差=99-0=99 ← 全消費状態
+        let mut inf = Unit::new(inf_stats.clone(), 1, (2, 2));
+        inf.fuel = 0;
+        inf.ammo1 = 0;
+        game.units.push(inf);
+
+        let funds_before = game.players[0].funds;
+        // advance_turn で P2 → P1 の順でリセット
+        // P1 のターン開始時に拠点補給が走る
+        game.advance_turn(); // P2
+        game.advance_turn(); // P1 (ここで拠点補給)
+
+        let expected_cost = 9 * 15 + 99 * 5; // 135 + 495 = 630G
+        // add_budget_for_active_player で都市 1 箇所 → +1000G も加算されているので差分確認
+        let funds_after_add_budget = 10000 + 1000; // 都市1個
+        assert_eq!(
+            game.players[0].funds,
+            funds_after_add_budget - expected_cost,
+            "Funds should decrease by supply cost"
+        );
+        assert_eq!(game.units[0].fuel, 99);
+        assert_eq!(game.units[0].ammo1, 9);
+    }
+
+    #[test]
+    fn test_property_resupply_insufficient_funds() {
+        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Capital).unwrap();
+        map.set_terrain(4, 4, Terrain::Capital).unwrap();
+        map.set_terrain(2, 2, Terrain::City).unwrap();
+
+        let mut properties = HashMap::new();
+        properties.insert((0, 0), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((4, 4), PropertyState::new(Terrain::Capital, Some(2)));
+        properties.insert((2, 2), PropertyState::new(Terrain::City, Some(1)));
+
+        let mut p1 = Player::new(1, "Red".to_string());
+        p1.funds = 10; // 資金不足
+        let p2 = Player::new(2, "Blue".to_string());
+        let mut game = MatchState::new(map, vec![p1, p2], properties);
+
+        let mut inf_stats = dummy_stats();
+        inf_stats.max_fuel = 99;
+        inf_stats.max_ammo1 = 9;
+        let mut inf = Unit::new(inf_stats.clone(), 1, (2, 2));
+        inf.fuel = 0;
+        inf.ammo1 = 0;
+        game.units.push(inf);
+
+        game.advance_turn(); // P2
+        game.advance_turn(); // P1
+
+        // 補給コスト > 10G なので補給されない（燃料・弾薬は 0 のまま）
+        assert_eq!(
+            game.units[0].fuel, 0,
+            "Should not be resupplied (insufficient funds)"
+        );
+        assert_eq!(
+            game.units[0].ammo1, 0,
+            "Should not be resupplied (insufficient funds)"
+        );
     }
 }

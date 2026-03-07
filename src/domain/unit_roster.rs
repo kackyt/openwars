@@ -52,6 +52,7 @@ pub struct UnitStats {
     pub max_range: u32,
     pub daily_fuel_consumption: u32,
     pub can_capture: bool,
+    pub can_supply: bool, // 補給能力を持つユニット（補給輸送車・空母）
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +165,7 @@ mod tests {
             max_range: 1,
             daily_fuel_consumption: 0,
             can_capture: true,
+            can_supply: false,
         }
     }
 
