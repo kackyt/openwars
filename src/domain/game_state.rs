@@ -1,5 +1,5 @@
 use crate::domain::map_grid::{Map, Terrain};
-use crate::domain::unit_roster::{Unit, UnitStats};
+use crate::domain::unit_roster::{DamageChart, Unit, UnitStats};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,12 +124,13 @@ impl MatchState {
             self.process_daily_updates();
         }
 
-        self.current_phase = Phase::Production; // Reset phase for new player
+        self.current_phase = Phase::Production; // 新プレイヤーのフェーズをリセット
 
-        // Reset action points
+        // 移動・攻撃フラグをリセット
         let active_pid = self.players[self.active_player_index].id;
         for unit in &mut self.units {
             if unit.owner_player_id == active_pid {
+                unit.has_moved = false;
                 unit.action_completed = false;
             }
         }
@@ -375,11 +376,167 @@ impl MatchState {
             let unit_mut = &mut self.units[unit_index];
             unit_mut.position = (target_x, target_y);
             unit_mut.fuel -= fuel_used;
-            unit_mut.action_completed = true;
+            unit_mut.has_moved = true; // 移動完了マーク（攻撃はまだ可能）
             Ok(())
         } else {
             Err("Unreachable target")
         }
+    }
+
+    /// 指定ユニットで相手ユニットに攻撃する。
+    /// 直接攻撃は同時ダメージ計算、間接攻撃は一方的。
+    pub fn attack(
+        &mut self,
+        attacker_index: usize,
+        defender_index: usize,
+        damage_chart: &DamageChart,
+    ) -> Result<(), &'static str> {
+        if self.game_over.is_some() {
+            return Err("Game is over");
+        }
+        let active_player_id = self.get_active_player().ok_or("No active player")?.id;
+        let attacker = self.units.get(attacker_index).ok_or("Attacker not found")?;
+        let defender = self.units.get(defender_index).ok_or("Defender not found")?;
+
+        // 基本チェック
+        if attacker.owner_player_id != active_player_id {
+            return Err("Not your unit");
+        }
+        if attacker.action_completed {
+            return Err("Attacker already acted");
+        }
+        if attacker.is_destroyed() {
+            return Err("Attacker is destroyed");
+        }
+        if defender.owner_player_id == active_player_id {
+            return Err("Cannot attack own unit");
+        }
+        if defender.is_destroyed() {
+            return Err("Defender is already destroyed");
+        }
+
+        // 攻撃者の武器を選択
+        let attacker_type = attacker.stats.unit_type;
+        let defender_type = defender.stats.unit_type;
+
+        let (ax, ay) = attacker.position;
+        let (dx, dy) = defender.position;
+        let dist = (ax as i64 - dx as i64).unsigned_abs() as u32
+            + (ay as i64 - dy as i64).unsigned_abs() as u32;
+
+        // 主武器・副武器を選択（ダメージ > 0 かつ弾薬ありを優先）
+        let attacker_weapon = {
+            let a = self.units.get(attacker_index).unwrap();
+            Self::select_weapon(a, defender_type, damage_chart)
+        };
+        let (a_weapon_slot, a_base_damage) =
+            attacker_weapon.ok_or("Attacker has no usable weapon against this target")?;
+
+        // 射程チェック
+        let attacker_stats = &self.units[attacker_index].stats;
+        let (min_r, max_r, is_indirect) = if a_weapon_slot == 1 {
+            (
+                attacker_stats.min_range,
+                attacker_stats.max_range,
+                attacker_stats.min_range > 1,
+            )
+        } else {
+            // ammo2 = 副武器は直接攻撃専用（min_range2・ max_range2は定義していないため常に直接扱い）
+            (1u32, 1u32, false)
+        };
+        if dist < min_r || dist > max_r {
+            return Err("Target out of weapon range");
+        }
+
+        // 間接攻撃・移動後は攻撃不可
+        if is_indirect && self.units[attacker_index].has_moved {
+            return Err("Indirect attack unit cannot attack after moving");
+        }
+
+        // 攻撃ダメージ計算（+5%アドバンテージ）
+        let attacker_display_hp = self.units[attacker_index].get_display_hp();
+        let a_advantage_damage = (a_base_damage as f64 * 1.05) as u32;
+        let a_damage = a_advantage_damage * attacker_display_hp / 10 + Self::random_bonus();
+
+        // 反撃判定（直接攻撃の場合のみ、攻撃前のHPで判断）
+        let do_counter = !is_indirect; // 間接攻撃は一方的
+        let counter_info = if do_counter {
+            Self::select_weapon(&self.units[defender_index], attacker_type, damage_chart)
+        } else {
+            None
+        };
+
+        let d_damage_opt: Option<u32> = if let Some((_, d_base)) = counter_info {
+            let defender_display_hp = self.units[defender_index].get_display_hp();
+            Some(d_base * defender_display_hp / 10 + Self::random_bonus())
+        } else {
+            None
+        };
+
+        // 弾薬消費（攻撃者）
+        match a_weapon_slot {
+            1 => self.units[attacker_index].ammo1 -= 1,
+            _ => self.units[attacker_index].ammo2 -= 1,
+        }
+
+        // 同時ダメージ適用
+        self.units[defender_index].take_damage(a_damage);
+        if let (Some((d_slot, _)), Some(d_dmg)) = (counter_info, d_damage_opt) {
+            // 弾薬消費（防衛者）
+            match d_slot {
+                1 => self.units[defender_index].ammo1 -= 1,
+                _ => self.units[defender_index].ammo2 -= 1,
+            }
+            self.units[attacker_index].take_damage(d_dmg);
+        }
+
+        // 攻撃完了マーク
+        self.units[attacker_index].action_completed = true;
+
+        self.check_win_conditions();
+        Ok(())
+    }
+
+    /// 武器を自動選択する。主武器(ammo1)優先、ダメージ > 0 かつ弾薬ありの場合に使用。
+    /// 戻り値: (weapon_slot, base_damage) または None
+    fn select_weapon(
+        unit: &Unit,
+        target_type: crate::domain::unit_roster::UnitType,
+        damage_chart: &DamageChart,
+    ) -> Option<(u32, u32)> {
+        // ammo1（主武器）
+        if unit.ammo1 > 0 {
+            if let Some(dmg) = damage_chart.get_base_damage(unit.stats.unit_type, target_type) {
+                if dmg > 0 {
+                    return Some((1, dmg));
+                }
+            }
+        }
+        // ammo2（副武器）へフォールバック
+        if unit.ammo2 > 0 {
+            if let Some(dmg) =
+                damage_chart.get_base_damage_secondary(unit.stats.unit_type, target_type)
+            {
+                if dmg > 0 {
+                    return Some((2, dmg));
+                }
+            }
+        }
+        None
+    }
+
+    /// 0【10 のランダム値を返す。公平性のため、仵要時にシード制御も可能な構造を想定。
+    fn random_bonus() -> u32 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        use std::time::SystemTime;
+        let mut h = DefaultHasher::new();
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+            .hash(&mut h);
+        (h.finish() % 11) as u32 // 0..=10
     }
 }
 
@@ -660,7 +817,15 @@ mod tests {
         assert!(res.is_ok());
         assert_eq!(game.units[0].position, (2, 4));
         assert_eq!(game.units[0].fuel, 97);
-        assert!(game.units[0].action_completed);
+        // 移動後は has_moved が true で、action_completed は false のまま（攻撃はまだできる）
+        assert!(
+            game.units[0].has_moved,
+            "has_moved should be true after moving"
+        );
+        assert!(
+            !game.units[0].action_completed,
+            "action_completed should stay false after moving"
+        );
     }
 
     #[test]
@@ -758,5 +923,232 @@ mod tests {
 
         // Since P2 lost its only capital, game should be over, P1 wins!
         assert_eq!(game.game_over, Some(GameOverCondition::Winner(1)));
+    }
+
+    // コンビニエンス関数: テスト用の DamageChart 作成
+    fn make_chart_with_damage(attacker: UnitType, defender: UnitType, damage: u32) -> DamageChart {
+        let mut chart = DamageChart::new();
+        chart.insert_damage(attacker, defender, damage);
+        chart
+    }
+
+    #[test]
+    fn test_attack_direct_basic() {
+        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Capital).unwrap();
+        map.set_terrain(4, 4, Terrain::Capital).unwrap();
+
+        let mut properties = HashMap::new();
+        properties.insert((0, 0), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((4, 4), PropertyState::new(Terrain::Capital, Some(2)));
+
+        let p1 = Player::new(1, "Red".to_string());
+        let p2 = Player::new(2, "Blue".to_string());
+        let mut game = MatchState::new(map, vec![p1, p2], properties);
+
+        let mut stats_inf = dummy_stats();
+        stats_inf.max_ammo1 = 9;
+
+        // P1 歩兵 @ (2,2), HP 100
+        let mut u0 = Unit::new(stats_inf.clone(), 1, (2, 2));
+        u0.action_completed = false;
+        game.units.push(u0);
+
+        // P2 歩兵 @ (3,2), HP 50 (表示HP5)
+        let mut u1 = Unit::new(stats_inf.clone(), 2, (3, 2));
+        u1.hp = 50;
+        game.units.push(u1);
+
+        // P1 歩兵 (display_hp=10) が P2 歩兵に攻撃。ダメージ = floor(55*1.05*10/10) + random
+        let chart = make_chart_with_damage(UnitType::Infantry, UnitType::Infantry, 55);
+
+        let result = game.attack(0, 1, &chart);
+        assert!(result.is_ok(), "{result:?}");
+
+        // 攻撃者は action_completed になる
+        assert!(game.units[0].action_completed);
+        // P2 は ammo1 が 1 減る（反撃時）
+        // ダメージが入っていることを確認（hp < 100）
+        assert!(game.units[1].hp < 100, "Defender should have taken damage");
+    }
+
+    #[test]
+    fn test_attack_direct_simultaneous_both_destroyed() {
+        // 互いに oneshot できる高ダメージで両者消滅を確認
+        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Capital).unwrap();
+        map.set_terrain(4, 4, Terrain::Capital).unwrap();
+
+        let mut properties = HashMap::new();
+        properties.insert((0, 0), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((4, 4), PropertyState::new(Terrain::Capital, Some(2)));
+
+        let p1 = Player::new(1, "Red".to_string());
+        let p2 = Player::new(2, "Blue".to_string());
+        let mut game = MatchState::new(map, vec![p1, p2], properties);
+
+        let mut stats = dummy_stats();
+        stats.max_ammo1 = 9;
+
+        let mut u0 = Unit::new(stats.clone(), 1, (2, 2));
+        u0.action_completed = false;
+        u0.hp = 100;
+        game.units.push(u0);
+
+        let mut u1 = Unit::new(stats.clone(), 2, (3, 2));
+        u1.hp = 100;
+        game.units.push(u1);
+
+        // ダメージ100 → floor(100*1.05*10/10)+rand >= 100 → 攻撃側は必ず撃破
+        // 反撃も同様に計算されるので両方消滅もありうる
+        let mut chart = DamageChart::new();
+        chart.insert_damage(UnitType::Infantry, UnitType::Infantry, 100);
+
+        let _ = game.attack(0, 1, &chart);
+
+        // 防衛者は撃破されているはず
+        assert!(game.units[1].is_destroyed(), "Defender should be destroyed");
+        // 反撃ダメージ（100*10/10 + 0-10 = 100-110）で攻撃者も撃破
+        assert!(
+            game.units[0].is_destroyed(),
+            "Attacker should also be destroyed by counter"
+        );
+    }
+
+    #[test]
+    fn test_attack_no_counter_when_defender_has_no_weapon() {
+        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Capital).unwrap();
+        map.set_terrain(4, 4, Terrain::Capital).unwrap();
+
+        let mut properties = HashMap::new();
+        properties.insert((0, 0), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((4, 4), PropertyState::new(Terrain::Capital, Some(2)));
+
+        let p1 = Player::new(1, "Red".to_string());
+        let p2 = Player::new(2, "Blue".to_string());
+        let mut game = MatchState::new(map, vec![p1, p2], properties);
+
+        let mut atk_stats = dummy_stats();
+        atk_stats.max_ammo1 = 9;
+
+        // 防衛者は弾なし（ammo0）なので反撃不可
+        let def_stats = dummy_stats(); // max_ammo1 = 0
+
+        let mut u0 = Unit::new(atk_stats.clone(), 1, (2, 2));
+        u0.action_completed = false;
+        game.units.push(u0);
+
+        let u1 = Unit::new(def_stats.clone(), 2, (3, 2));
+        game.units.push(u1);
+
+        let chart = make_chart_with_damage(UnitType::Infantry, UnitType::Infantry, 30);
+
+        let attacker_hp_before = game.units[0].hp;
+        let result = game.attack(0, 1, &chart);
+        assert!(result.is_ok());
+
+        // 攻撃者 HP は変わっていない（反撃なし）
+        assert_eq!(
+            game.units[0].hp, attacker_hp_before,
+            "No counter damage expected"
+        );
+    }
+
+    #[test]
+    fn test_attack_indirect_no_counter_and_no_attack_after_move() {
+        let mut map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Capital).unwrap();
+        map.set_terrain(9, 9, Terrain::Capital).unwrap();
+
+        let mut properties = HashMap::new();
+        properties.insert((0, 0), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((9, 9), PropertyState::new(Terrain::Capital, Some(2)));
+
+        let p1 = Player::new(1, "Red".to_string());
+        let p2 = Player::new(2, "Blue".to_string());
+        let mut game = MatchState::new(map, vec![p1, p2], properties);
+
+        // 間接攻撃ユニット: min_range=2, max_range=4
+        let mut art_stats = dummy_stats();
+        art_stats.unit_type = UnitType::Artillery;
+        art_stats.min_range = 2;
+        art_stats.max_range = 4;
+        art_stats.max_ammo1 = 9;
+
+        let mut def_stats = dummy_stats();
+        def_stats.max_ammo1 = 9;
+
+        // u0: P1 砲台 @ (3,3)
+        let mut u0 = Unit::new(art_stats.clone(), 1, (3, 3));
+        u0.action_completed = false;
+        u0.has_moved = false;
+        game.units.push(u0);
+
+        // u1: P2 歩兵 @ (3, 6) → 距離=3 (射程内)
+        let u1 = Unit::new(def_stats.clone(), 2, (3, 6));
+        game.units.push(u1);
+
+        let chart = make_chart_with_damage(UnitType::Artillery, UnitType::Infantry, 70);
+        let def_hp_before = game.units[0].hp;
+
+        // 間接攻撃 → 反撃なし: 攻撃者 HP 変わらず
+        let result = game.attack(0, 1, &chart);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            game.units[0].hp, def_hp_before,
+            "No counter expected for indirect"
+        );
+
+        // 移動後に間接攻撃しようとするには、別ユニットでテスト
+        // u0 が行動完了したので advance_turn でリセット
+        game.advance_turn(); // P2
+        game.advance_turn(); // P1
+
+        game.units[0].has_moved = true; // 移動済みを強制セット
+        game.units[0].action_completed = false;
+
+        // u1 を復活させる（advance_turn で撃破判定があるため再設定）
+        game.units[1].hp = 100;
+
+        let err_result = game.attack(0, 1, &chart);
+        assert!(
+            err_result.is_err(),
+            "Should fail: indirect attack after move"
+        );
+        assert!(
+            err_result
+                .unwrap_err()
+                .contains("cannot attack after moving")
+        );
+    }
+
+    #[test]
+    fn test_attack_out_of_range() {
+        let mut map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Capital).unwrap();
+        map.set_terrain(9, 9, Terrain::Capital).unwrap();
+
+        let mut properties = HashMap::new();
+        properties.insert((0, 0), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((9, 9), PropertyState::new(Terrain::Capital, Some(2)));
+
+        let p1 = Player::new(1, "Red".to_string());
+        let p2 = Player::new(2, "Blue".to_string());
+        let mut game = MatchState::new(map, vec![p1, p2], properties);
+
+        let mut inf_stats = dummy_stats();
+        inf_stats.max_ammo1 = 9;
+
+        let mut u0 = Unit::new(inf_stats.clone(), 1, (0, 0));
+        u0.action_completed = false;
+        game.units.push(u0);
+
+        let u1 = Unit::new(inf_stats.clone(), 2, (5, 5)); // 距離10 > max_range1
+        game.units.push(u1);
+
+        let chart = make_chart_with_damage(UnitType::Infantry, UnitType::Infantry, 55);
+        let result = game.attack(0, 1, &chart);
+        assert!(result.is_err(), "Should fail: out of range");
     }
 }

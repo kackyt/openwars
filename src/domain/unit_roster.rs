@@ -63,7 +63,8 @@ pub struct Unit {
     pub ammo2: u32,
     pub owner_player_id: u32,     // Simple player reference mapping
     pub position: (usize, usize), // (x, y) map coordinate
-    pub action_completed: bool,
+    pub has_moved: bool,          // 移動済みフラグ
+    pub action_completed: bool,   // 攻撃済みフラグ
 }
 
 impl Unit {
@@ -76,7 +77,8 @@ impl Unit {
             hp: 100, // Initialize to max 100 (represents 10 display HP)
             owner_player_id,
             position,
-            action_completed: true, // Should be true if produced this turn, or maybe false to allow moving immediately? Basic AW allows moving immediately in some versions, but standard is cannot move same turn. Let's make it true. No, wait, if you produce, usually you cannot move. Let's make it true.
+            has_moved: false,
+            action_completed: true, // 生産後は即座に行動できない
         }
     }
 
@@ -98,30 +100,47 @@ impl Unit {
     }
 }
 
-/// A simple struct holding the damage chart matrices
+/// 武器ダメージテーブル。主武器（ammo1）と副武器（ammo2）の両方を保持する。
 pub struct DamageChart {
-    // A mapping from Attacker UnitType to (Defender UnitType -> base damage)
-    // Values represent internal 10x HP scales ideally.
+    // 主武器（ammo1）: Attacker → Defender → base damage
     matrix: HashMap<UnitType, HashMap<UnitType, u32>>,
+    // 副武器（ammo2）: Attacker → Defender → base damage
+    secondary_matrix: HashMap<UnitType, HashMap<UnitType, u32>>,
 }
 
 impl DamageChart {
     pub fn new() -> Self {
         Self {
             matrix: HashMap::new(),
+            secondary_matrix: HashMap::new(),
         }
     }
 
-    // Placeholder until actual CSV Loader is complete.
+    // 主武器のダメージ値を取得
     pub fn get_base_damage(&self, attacker: UnitType, defender: UnitType) -> Option<u32> {
         self.matrix
             .get(&attacker)
             .and_then(|defenders| defenders.get(&defender).copied())
     }
 
-    // In actual app, parsed from CSV and populated here
+    // 副武器のダメージ値を取得
+    pub fn get_base_damage_secondary(&self, attacker: UnitType, defender: UnitType) -> Option<u32> {
+        self.secondary_matrix
+            .get(&attacker)
+            .and_then(|defenders| defenders.get(&defender).copied())
+    }
+
+    // 主武器のダメージ値を設定（CSVロード時に使用）
     pub fn insert_damage(&mut self, attacker: UnitType, defender: UnitType, damage: u32) {
         self.matrix
+            .entry(attacker)
+            .or_default()
+            .insert(defender, damage);
+    }
+
+    // 副武器のダメージ値を設定
+    pub fn insert_damage_secondary(&mut self, attacker: UnitType, defender: UnitType, damage: u32) {
+        self.secondary_matrix
             .entry(attacker)
             .or_default()
             .insert(defender, damage);
