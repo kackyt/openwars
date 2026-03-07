@@ -51,6 +51,7 @@ pub struct UnitStats {
     pub min_range: u32,
     pub max_range: u32,
     pub daily_fuel_consumption: u32,
+    pub can_capture: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +144,7 @@ mod tests {
             min_range: 1,
             max_range: 1,
             daily_fuel_consumption: 0,
+            can_capture: true,
         }
     }
 

@@ -3,6 +3,21 @@ use crate::domain::unit_roster::{Unit, UnitStats};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyState {
+    pub owner_id: Option<u32>,
+    pub capture_points: u32,
+}
+
+impl PropertyState {
+    pub fn new(terrain: Terrain, owner_id: Option<u32>) -> Self {
+        Self {
+            owner_id,
+            capture_points: terrain.max_capture_points(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Player {
     pub id: u32,
     pub name: String,
@@ -44,7 +59,7 @@ pub enum GameOverCondition {
 pub struct MatchState {
     pub map: Map,
     pub units: Vec<Unit>,
-    pub properties: HashMap<(usize, usize), u32>,
+    pub properties: HashMap<(usize, usize), PropertyState>,
     pub players: Vec<Player>,
     pub current_turn_number: u32,
     pub active_player_index: usize,
@@ -53,7 +68,11 @@ pub struct MatchState {
 }
 
 impl MatchState {
-    pub fn new(map: Map, players: Vec<Player>, properties: HashMap<(usize, usize), u32>) -> Self {
+    pub fn new(
+        map: Map,
+        players: Vec<Player>,
+        properties: HashMap<(usize, usize), PropertyState>,
+    ) -> Self {
         Self {
             map,
             units: Vec::new(),
@@ -78,8 +97,8 @@ impl MatchState {
         let active_player_id = self.players[self.active_player_index].id;
         let mut property_count = 0;
 
-        for (&(x, y), &owner_id) in &self.properties {
-            if owner_id == active_player_id {
+        for (&(x, y), state) in &self.properties {
+            if state.owner_id == Some(active_player_id) {
                 let terrain = self.map.get_terrain(x, y);
                 if terrain == Some(Terrain::City) || terrain == Some(Terrain::Airport) {
                     property_count += 1;
@@ -151,8 +170,8 @@ impl MatchState {
 
         for player in &self.players {
             let mut has_capital = false;
-            for (&(x, y), &owner_id) in &self.properties {
-                if owner_id == player.id {
+            for (&(x, y), state) in &self.properties {
+                if state.owner_id == Some(player.id) {
                     if let Some(Terrain::Capital) = self.map.get_terrain(x, y) {
                         has_capital = true;
                         break;
@@ -193,7 +212,7 @@ impl MatchState {
             return Err("Not active player's turn to produce");
         }
 
-        if self.properties.get(&(x, y)) != Some(&player_id) {
+        if self.properties.get(&(x, y)).and_then(|s| s.owner_id) != Some(player_id) {
             return Err("Property is not owned by player");
         }
 
@@ -203,8 +222,10 @@ impl MatchState {
         }
 
         let mut capital_coord = None;
-        for (&(cx, cy), &owner_id) in &self.properties {
-            if owner_id == player_id && self.map.get_terrain(cx, cy) == Some(Terrain::Capital) {
+        for (&(cx, cy), state) in &self.properties {
+            if state.owner_id == Some(player_id)
+                && self.map.get_terrain(cx, cy) == Some(Terrain::Capital)
+            {
                 capital_coord = Some((cx, cy));
                 break;
             }
@@ -252,6 +273,60 @@ impl MatchState {
                 }
             }
         }
+    }
+
+    pub fn capture_or_repair_property(&mut self, unit_index: usize) -> Result<(), &'static str> {
+        if self.game_over.is_some() {
+            return Err("Game is over");
+        }
+        let active_player_id = self.get_active_player().ok_or("No active player")?.id;
+        let unit = self.units.get(unit_index).ok_or("Unit not found")?;
+
+        if unit.owner_player_id != active_player_id {
+            return Err("Not your unit");
+        }
+        if unit.action_completed {
+            return Err("Unit already acted");
+        }
+        if unit.is_destroyed() {
+            return Err("Unit is destroyed");
+        }
+        if !unit.stats.can_capture {
+            return Err("Unit cannot capture properties");
+        }
+
+        let (x, y) = unit.position;
+        let terrain = self.map.get_terrain(x, y).ok_or("Out of bounds")?;
+        let max_points = terrain.max_capture_points();
+
+        if max_points == 0 {
+            return Err("Not a capturable property");
+        }
+
+        let action_power = unit.get_display_hp() * 10;
+
+        let prop = self
+            .properties
+            .entry((x, y))
+            .or_insert_with(|| PropertyState::new(terrain, None));
+
+        if prop.owner_id == Some(active_player_id) {
+            // Repair
+            prop.capture_points = std::cmp::min(prop.capture_points + action_power, max_points);
+        } else {
+            // Capture
+            if prop.capture_points <= action_power {
+                prop.owner_id = Some(active_player_id);
+                prop.capture_points = max_points;
+            } else {
+                prop.capture_points -= action_power;
+            }
+        }
+
+        self.units[unit_index].action_completed = true;
+        self.check_win_conditions();
+
+        Ok(())
     }
 
     pub fn move_unit(
@@ -326,6 +401,7 @@ mod tests {
             min_range: 1,
             max_range: 1,
             daily_fuel_consumption: 0,
+            can_capture: true,
         }
     }
 
@@ -337,9 +413,9 @@ mod tests {
         map.set_terrain(4, 4, Terrain::Capital).unwrap(); // P1 capital
 
         let mut properties = HashMap::new();
-        properties.insert((0, 0), 1);
-        properties.insert((1, 0), 1);
-        properties.insert((4, 4), 1);
+        properties.insert((0, 0), PropertyState::new(Terrain::City, Some(1)));
+        properties.insert((1, 0), PropertyState::new(Terrain::Airport, Some(1)));
+        properties.insert((4, 4), PropertyState::new(Terrain::Capital, Some(1)));
 
         let p1 = Player::new(1, "Red".to_string());
         let p2 = Player::new(2, "Blue".to_string());
@@ -358,8 +434,8 @@ mod tests {
         map.set_terrain(4, 4, Terrain::Capital).unwrap(); // P2 capital
 
         let mut properties = HashMap::new();
-        properties.insert((0, 0), 1);
-        properties.insert((4, 4), 2);
+        properties.insert((0, 0), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((4, 4), PropertyState::new(Terrain::Capital, Some(2)));
 
         let p1 = Player::new(1, "Red".to_string());
         let p2 = Player::new(2, "Blue".to_string());
@@ -367,7 +443,8 @@ mod tests {
         let mut game = MatchState::new(map, vec![p1, p2], properties);
 
         // P1 captures P2's capital
-        game.properties.insert((4, 4), 1);
+        game.properties
+            .insert((4, 4), PropertyState::new(Terrain::Capital, Some(1)));
         game.check_win_conditions();
 
         assert_eq!(game.game_over, Some(GameOverCondition::Winner(1)));
@@ -380,8 +457,8 @@ mod tests {
         map.set_terrain(4, 4, Terrain::Capital).unwrap();
 
         let mut properties = HashMap::new();
-        properties.insert((0, 0), 1);
-        properties.insert((4, 4), 2);
+        properties.insert((0, 0), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((4, 4), PropertyState::new(Terrain::Capital, Some(2)));
 
         let p1 = Player::new(1, "Red".to_string());
         let p2 = Player::new(2, "Blue".to_string());
@@ -407,9 +484,9 @@ mod tests {
         map.set_terrain(4, 0, Terrain::City).unwrap(); // distance 4
 
         let mut properties = HashMap::new();
-        properties.insert((0, 0), 1);
-        properties.insert((2, 0), 1);
-        properties.insert((4, 0), 1);
+        properties.insert((0, 0), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((2, 0), PropertyState::new(Terrain::City, Some(1)));
+        properties.insert((4, 0), PropertyState::new(Terrain::City, Some(1)));
 
         let mut p1 = Player::new(1, "Red".to_string());
         p1.funds = 1500;
@@ -446,9 +523,9 @@ mod tests {
         map.set_terrain(4, 4, Terrain::Capital).unwrap(); // P2 Capital
 
         let mut properties = HashMap::new();
-        properties.insert((0, 0), 1);
-        properties.insert((0, 1), 1);
-        properties.insert((4, 4), 2);
+        properties.insert((0, 0), PropertyState::new(Terrain::Airport, Some(1)));
+        properties.insert((0, 1), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((4, 4), PropertyState::new(Terrain::Capital, Some(2)));
 
         let p1 = Player::new(1, "Red".to_string());
         let p2 = Player::new(2, "Blue".to_string());
@@ -514,8 +591,8 @@ mod tests {
         map.set_terrain(4, 4, Terrain::Capital).unwrap();
 
         let mut properties = HashMap::new();
-        properties.insert((0, 0), 1);
-        properties.insert((4, 4), 2);
+        properties.insert((0, 0), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((4, 4), PropertyState::new(Terrain::Capital, Some(2)));
         let p1 = Player::new(1, "Red".to_string());
         let p2 = Player::new(2, "Blue".to_string());
         let mut game = MatchState::new(map, vec![p1, p2], properties);
@@ -564,8 +641,8 @@ mod tests {
         map.set_terrain(4, 4, Terrain::Capital).unwrap();
 
         let mut properties = HashMap::new();
-        properties.insert((0, 0), 1);
-        properties.insert((4, 4), 2);
+        properties.insert((0, 0), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((4, 4), PropertyState::new(Terrain::Capital, Some(2)));
 
         let p1 = Player::new(1, "Red".to_string());
         let p2 = Player::new(2, "Blue".to_string());
@@ -584,5 +661,102 @@ mod tests {
         assert_eq!(game.units[0].position, (2, 4));
         assert_eq!(game.units[0].fuel, 97);
         assert!(game.units[0].action_completed);
+    }
+
+    #[test]
+    fn test_property_capture_and_repair() {
+        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Capital).unwrap(); // P1 Capital
+        map.set_terrain(4, 4, Terrain::Capital).unwrap(); // P2 Capital
+        map.set_terrain(2, 2, Terrain::City).unwrap(); // Neutral City
+
+        let mut properties = HashMap::new();
+        properties.insert((0, 0), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((4, 4), PropertyState::new(Terrain::Capital, Some(2)));
+
+        let p1 = Player::new(1, "Red".to_string());
+        let p2 = Player::new(2, "Blue".to_string());
+        let mut game = MatchState::new(map, vec![p1, p2], properties);
+
+        let mut inf_stats = dummy_stats();
+        inf_stats.can_capture = true;
+
+        let mut tank_stats = dummy_stats();
+        tank_stats.unit_type = UnitType::TankZ;
+        tank_stats.can_capture = false;
+
+        // u0: P1 Infantry at neutral city (2,2)
+        game.units.push(Unit::new(inf_stats.clone(), 1, (2, 2)));
+        game.units[0].action_completed = false; // allow immediate action
+        game.units[0].hp = 50; // Display HP 5 (does 50 damage)
+
+        // u1: P1 Tank at P2 Capital (4,4)
+        game.units.push(Unit::new(tank_stats.clone(), 1, (4, 4)));
+        game.units[1].action_completed = false;
+
+        // u2: P2 Infantry to prevent annihilation game over
+        game.units.push(Unit::new(inf_stats.clone(), 2, (3, 3)));
+
+        // Test non-capturable unit
+        assert!(game.capture_or_repair_property(1).is_err()); // Tank cannot capture
+
+        // Test capturing neutral city
+        assert!(game.capture_or_repair_property(0).is_ok());
+        assert!(game.units[0].action_completed);
+
+        // Check city points
+        let city = game.properties.get(&(2, 2)).unwrap();
+        assert_eq!(city.owner_id, None);
+        assert_eq!(city.capture_points, 150); // 200 - 50
+
+        // Advance turn so P1 can act again
+        game.advance_turn(); // P2
+        game.advance_turn(); // P1
+
+        // Test persistent capture damage:
+        // move infantry away and back should keep points at 150
+        // for ease of test, simply acting again reduces it more:
+        game.units[0].action_completed = false;
+        game.units[0].hp = 100; // Display HP 10 (does 100 damage)
+        game.capture_or_repair_property(0).unwrap();
+        let city = game.properties.get(&(2, 2)).unwrap();
+        assert_eq!(city.capture_points, 50); // 150 - 100
+
+        // Act again to finish capture
+        game.advance_turn();
+        game.advance_turn();
+        game.units[0].action_completed = false;
+        game.capture_or_repair_property(0).unwrap();
+
+        // Ownership transferred, points reset
+        let city = game.properties.get(&(2, 2)).unwrap();
+        assert_eq!(city.owner_id, Some(1));
+        assert_eq!(city.capture_points, 200);
+
+        // Test Repair: City is damaged, we repair it
+        game.properties.get_mut(&(2, 2)).unwrap().capture_points = 180;
+        game.advance_turn();
+        game.advance_turn();
+        game.units[0].action_completed = false;
+        game.units[0].hp = 100; // 10 hp -> 100 repair
+        game.capture_or_repair_property(0).unwrap();
+
+        let city = game.properties.get(&(2, 2)).unwrap();
+        assert_eq!(city.capture_points, 200); // capped at max 200
+
+        // Test Capital Capture Victory
+        game.units[0].position = (4, 4); // Move infantry to P2 Capital
+        game.properties.get_mut(&(4, 4)).unwrap().capture_points = 50; // Almost captured
+        game.advance_turn();
+        game.advance_turn();
+        game.units[0].action_completed = false;
+
+        game.capture_or_repair_property(0).unwrap();
+        let enemy_capital = game.properties.get(&(4, 4)).unwrap();
+        assert_eq!(enemy_capital.owner_id, Some(1));
+        assert_eq!(enemy_capital.capture_points, 400); // capital max
+
+        // Since P2 lost its only capital, game should be over, P1 wins!
+        assert_eq!(game.game_over, Some(GameOverCondition::Winner(1)));
     }
 }

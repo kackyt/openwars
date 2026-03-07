@@ -15,6 +15,17 @@ pub enum Terrain {
     Capital,  // 首都
 }
 
+impl Terrain {
+    pub fn max_capture_points(&self) -> u32 {
+        match self {
+            Terrain::Capital => 400,
+            Terrain::Airport | Terrain::Port => 300,
+            Terrain::City | Terrain::Factory => 200,
+            _ => 0, // Not capturable
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GridTopology {
     Square,    // 4方向または8方向（今回は主に4方向を想定）
