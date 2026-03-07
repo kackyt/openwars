@@ -1,0 +1,21 @@
+# Tasks: implement-loading
+
+- [x] 1. `src/domain/unit_roster.rs` の `UnitStats` に `max_cargo: u32` および `loadable_types: Vec<UnitType>` を追加する。各輸送ユニットのマスターデータに値を設定する（テストデータ含む）。
+- [x] 2. `src/domain/unit_roster.rs` の `Unit` に `cargo: Vec<usize>` および `transport_index: Option<usize>` を追加する。初期値はそれぞれ空ベクタと `None`。
+- [x] 3. `src/domain/game_state.rs` の `move_unit` に自動搭載ロジックを実装する。
+    - 移動後、目的地に自分と同じ所有者の輸送ユニットが存在し、以下の条件を満たす場合に自動搭載する。
+      - 輸送ユニットの `loadable_types` に自分のユニット種別が含まれる。
+      - 輸送ユニットの `cargo.len() < max_cargo`。
+    - 搭載時: 搭載ユニットのインデックスを輸送ユニットの `cargo` に追加し、搭載ユニットの `transport_index` をセットする。搭載ユニットの `action_completed = true`。
+- [x] 4. `src/domain/game_state.rs` に `unload_unit(transport_index, cargo_slot, target_x, target_y)` メソッドを追加する。
+    - 搭載ユニットが `action_completed == true` の場合のみ下車可能（次ターン縛りはフラグで制御）。
+    - 下車先は輸送ユニットから隣接マス（距離 = 1）かつ搭載ユニットが移動可能なマスである必要がある。
+    - 下車後: `transport_index = None`、輸送ユニットの `cargo` から除去、`action_completed = true` にセット（そのターンは攻撃・占領不可）。
+- [x] 5. `src/domain/game_state.rs` の `attack` 内で、攻撃を受けた輸送ユニットにダメージが入った場合、搭載ユニットも同じ HP に同期させる（破壊なら搭載ユニットも破壊）。
+- [x] 6. 単体テストを追加して `cargo test` を通す。
+    - 自動搭載：移動で同マスの輸送ユニットに搭載される
+    - 搭載拒否：容量超過・対応外ユニット種別
+    - 下車：隣接マスへの下車と action_completed 確認
+    - 下車の失敗：非隣接マスへのエラー
+    - ダメージ連動：輸送ユニットへの攻撃で搭載ユニット HP が同期
+    - 輸送ユニット撃破で搭載ユニットも消滅

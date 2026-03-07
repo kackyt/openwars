@@ -53,6 +53,8 @@ pub struct UnitStats {
     pub daily_fuel_consumption: u32,
     pub can_capture: bool,
     pub can_supply: bool, // 補給能力を持つユニット（補給輸送車・空母）
+    pub max_cargo: u32,   // 搷載可能数ﾈ0 = 搷載不可ﾉ
+    pub loadable_unit_types: Vec<UnitType>, // 搷載可能なユニット種別ﾈ空リスト = 搷載不可ﾉ
 }
 
 #[derive(Debug, Clone)]
@@ -62,10 +64,12 @@ pub struct Unit {
     pub fuel: u32,
     pub ammo1: u32,
     pub ammo2: u32,
-    pub owner_player_id: u32,     // Simple player reference mapping
-    pub position: (usize, usize), // (x, y) map coordinate
-    pub has_moved: bool,          // 移動済みフラグ
-    pub action_completed: bool,   // 攻撃済みフラグ
+    pub owner_player_id: u32,
+    pub position: (usize, usize),
+    pub has_moved: bool,
+    pub action_completed: bool,
+    pub cargo: Vec<usize>,              // 搷載中ユニットのインデックス一覧
+    pub transport_index: Option<usize>, // 自分を違ぶ輸送ユニットのインデックス
 }
 
 impl Unit {
@@ -75,11 +79,13 @@ impl Unit {
             ammo1: stats.max_ammo1,
             ammo2: stats.max_ammo2,
             stats,
-            hp: 100, // Initialize to max 100 (represents 10 display HP)
+            hp: 100,
             owner_player_id,
             position,
             has_moved: false,
             action_completed: true, // 生産後は即座に行動できない
+            cargo: Vec::new(),
+            transport_index: None,
         }
     }
 
@@ -166,6 +172,8 @@ mod tests {
             daily_fuel_consumption: 0,
             can_capture: true,
             can_supply: false,
+            max_cargo: 0,
+            loadable_unit_types: vec![],
         }
     }
 

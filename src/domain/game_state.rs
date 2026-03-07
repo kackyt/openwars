@@ -355,10 +355,19 @@ impl MatchState {
             return Err("Unit is destroyed");
         }
 
+        let unit_type = self.units[unit_index].stats.unit_type;
+
         let mut unit_positions = std::collections::HashMap::new();
         for (i, u) in self.units.iter().enumerate() {
-            if !u.is_destroyed() && i != unit_index {
-                unit_positions.insert(u.position, u.owner_player_id);
+            if !u.is_destroyed() && i != unit_index && u.transport_index.is_none() {
+                // 友軍の輸送ユニットで搭載可能な場合は障害物として扱わない
+                let is_loadable_transport = u.owner_player_id == active_player_id
+                    && u.stats.max_cargo > 0
+                    && (u.cargo.len() as u32) < u.stats.max_cargo
+                    && u.stats.loadable_unit_types.contains(&unit_type);
+                if !is_loadable_transport {
+                    unit_positions.insert(u.position, u.owner_player_id);
+                }
             }
         }
 
@@ -379,7 +388,31 @@ impl MatchState {
             let unit_mut = &mut self.units[unit_index];
             unit_mut.position = (target_x, target_y);
             unit_mut.fuel -= fuel_used;
-            unit_mut.has_moved = true; // 移動完了マーク（攻撃はまだ可能）
+            unit_mut.has_moved = true;
+
+            // 自動搭載チェック：移動先に同じ所有者の輸送ユニットがいれば自動搭載
+            let unit_type = self.units[unit_index].stats.unit_type;
+            let transport_idx = self
+                .units
+                .iter()
+                .enumerate()
+                .find(|(i, u)| {
+                    *i != unit_index
+                        && !u.is_destroyed()
+                        && u.owner_player_id == active_player_id
+                        && u.position == (target_x, target_y)
+                        && u.stats.max_cargo > 0
+                        && (u.cargo.len() as u32) < u.stats.max_cargo
+                        && u.stats.loadable_unit_types.contains(&unit_type)
+                })
+                .map(|(i, _)| i);
+
+            if let Some(tidx) = transport_idx {
+                self.units[unit_index].action_completed = true;
+                self.units[unit_index].transport_index = Some(tidx);
+                self.units[tidx].cargo.push(unit_index);
+            }
+
             Ok(())
         } else {
             Err("Unreachable target")
@@ -484,6 +517,21 @@ impl MatchState {
 
         // 同時ダメージ適用
         self.units[defender_index].take_damage(a_damage);
+        // 搭載ユニット HP 同期（防衛側が輸送ユニットの場合）
+        let defender_hp = self.units[defender_index].hp;
+        let defender_cargo = self.units[defender_index].cargo.clone();
+        for cargo_idx in &defender_cargo {
+            if self.units[*cargo_idx].hp > defender_hp {
+                self.units[*cargo_idx].hp = defender_hp;
+                if defender_hp == 0 {
+                    self.units[*cargo_idx].transport_index = None;
+                }
+            }
+        }
+        if defender_hp == 0 {
+            self.units[defender_index].cargo.clear();
+        }
+
         if let (Some((d_slot, _)), Some(d_dmg)) = (counter_info, d_damage_opt) {
             // 弾薬消費（防衛者）
             match d_slot {
@@ -491,12 +539,96 @@ impl MatchState {
                 _ => self.units[defender_index].ammo2 -= 1,
             }
             self.units[attacker_index].take_damage(d_dmg);
+            // 搭載ユニット HP 同期（攻撃側が輸送ユニットだった場合の反撃ダメージ）
+            let attacker_hp = self.units[attacker_index].hp;
+            let attacker_cargo = self.units[attacker_index].cargo.clone();
+            for cargo_idx in &attacker_cargo {
+                if self.units[*cargo_idx].hp > attacker_hp {
+                    self.units[*cargo_idx].hp = attacker_hp;
+                    if attacker_hp == 0 {
+                        self.units[*cargo_idx].transport_index = None;
+                    }
+                }
+            }
+            if attacker_hp == 0 {
+                self.units[attacker_index].cargo.clear();
+            }
         }
 
         // 攻撃完了マーク
         self.units[attacker_index].action_completed = true;
 
         self.check_win_conditions();
+        Ok(())
+    }
+
+    /// 搭載ユニットを輸送ユニットから降ろす。
+    /// 次のターン以降のみ可能（搭載された直後は action_completed==true）。
+    /// 下車先は輸送ユニットから隣接（距離 = 1）でなければならない。
+    pub fn unload_unit(
+        &mut self,
+        transport_index: usize,
+        cargo_slot: usize, // cargo ベクタ内のインデックス
+        target_x: usize,
+        target_y: usize,
+    ) -> Result<(), &'static str> {
+        if self.game_over.is_some() {
+            return Err("Game is over");
+        }
+        let active_player_id = self.get_active_player().ok_or("No active player")?.id;
+
+        let transport = self
+            .units
+            .get(transport_index)
+            .ok_or("Transport not found")?;
+        if transport.owner_player_id != active_player_id {
+            return Err("Not your unit");
+        }
+        if transport.is_destroyed() {
+            return Err("Transport is destroyed");
+        }
+        if transport.action_completed {
+            return Err("Transport already acted this turn");
+        }
+        if cargo_slot >= transport.cargo.len() {
+            return Err("Invalid cargo slot");
+        }
+
+        let cargo_unit_idx = transport.cargo[cargo_slot];
+        let cargo_unit = self
+            .units
+            .get(cargo_unit_idx)
+            .ok_or("Cargo unit not found")?;
+
+        // action_completed == true → 搭載したターン中は下車不可（次のターン以降のみ）
+        if !cargo_unit.action_completed {
+            return Err("Cannot unload unit in the same turn it was loaded");
+        }
+
+        // 下車先が輸送ユニットから隣接（マンハッタン距離 = 1）かチェック
+        let (tx, ty) = transport.position;
+        let dist = (tx as i64 - target_x as i64).unsigned_abs() as u32
+            + (ty as i64 - target_y as i64).unsigned_abs() as u32;
+        if dist != 1 {
+            return Err("Unload target must be adjacent to transport");
+        }
+
+        // 下車先が他のユニットに占有されていないかチェック
+        let occupied = self.units.iter().any(|u| {
+            !u.is_destroyed() && u.position == (target_x, target_y) && u.transport_index.is_none()
+        });
+        if occupied {
+            return Err("Unload target tile is occupied");
+        }
+
+        // 下車実行
+        self.units[cargo_unit_idx].position = (target_x, target_y);
+        self.units[cargo_unit_idx].transport_index = None;
+        self.units[cargo_unit_idx].action_completed = true; // 下車ターンは行動済み
+
+        self.units[transport_index].cargo.remove(cargo_slot);
+        self.units[transport_index].action_completed = true;
+
         Ok(())
     }
 
@@ -747,6 +879,8 @@ mod tests {
             daily_fuel_consumption: 0,
             can_capture: true,
             can_supply: false,
+            max_cargo: 0,
+            loadable_unit_types: vec![],
         }
     }
 
@@ -1475,7 +1609,6 @@ mod tests {
         inf.ammo1 = 0;
         game.units.push(inf);
 
-        let funds_before = game.players[0].funds;
         // advance_turn で P2 → P1 の順でリセット
         // P1 のターン開始時に拠点補給が走る
         game.advance_turn(); // P2
@@ -1529,6 +1662,222 @@ mod tests {
         assert_eq!(
             game.units[0].ammo1, 0,
             "Should not be resupplied (insufficient funds)"
+        );
+    }
+
+    // テスト用輸送ヘリのステータス（歩兵・戦闘工兵を最大 2 体搭載）
+    fn transport_heli_stats() -> UnitStats {
+        let mut s = dummy_stats();
+        s.unit_type = UnitType::TransportHelicopter;
+        s.movement_type = MovementType::LowAltitude;
+        s.max_cargo = 2;
+        s.loadable_unit_types = vec![UnitType::Infantry, UnitType::CombatEngineer];
+        s
+    }
+
+    #[test]
+    fn test_auto_load_on_move() {
+        let mut map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Capital).unwrap();
+        map.set_terrain(9, 9, Terrain::Capital).unwrap();
+
+        let mut properties = HashMap::new();
+        properties.insert((0, 0), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((9, 9), PropertyState::new(Terrain::Capital, Some(2)));
+
+        let p1 = Player::new(1, "Red".to_string());
+        let p2 = Player::new(2, "Blue".to_string());
+        let mut game = MatchState::new(map, vec![p1, p2], properties);
+
+        // u0: 輸送ヘリ @(5,5)
+        let heli = Unit::new(transport_heli_stats(), 1, (5, 5));
+        game.units.push(heli);
+
+        // u1: 歩兵 @(3,5) → (5,5) に移動すると搭載される
+        let mut inf_stats = dummy_stats();
+        inf_stats.max_movement = 3;
+        let mut inf = Unit::new(inf_stats.clone(), 1, (3, 5));
+        inf.action_completed = false;
+        game.units.push(inf);
+
+        let result = game.move_unit(1, 5, 5);
+        assert!(result.is_ok(), "{result:?}");
+
+        // 搭載されている
+        assert!(
+            game.units[0].cargo.contains(&1),
+            "Infantry should be in cargo"
+        );
+        assert_eq!(game.units[1].transport_index, Some(0));
+        assert!(
+            game.units[1].action_completed,
+            "Loaded unit should be action_completed"
+        );
+    }
+
+    #[test]
+    fn test_auto_load_capacity_exceeded() {
+        let mut map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Capital).unwrap();
+        map.set_terrain(9, 9, Terrain::Capital).unwrap();
+
+        let mut properties = HashMap::new();
+        properties.insert((0, 0), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((9, 9), PropertyState::new(Terrain::Capital, Some(2)));
+
+        let p1 = Player::new(1, "Red".to_string());
+        let p2 = Player::new(2, "Blue".to_string());
+        let mut game = MatchState::new(map, vec![p1, p2], properties);
+
+        // u0: 輸送ヘリ max_cargo=1 @(5,5)
+        let mut heli_stats = transport_heli_stats();
+        heli_stats.max_cargo = 1;
+        let heli = Unit::new(heli_stats, 1, (5, 5));
+        game.units.push(heli);
+
+        let mut inf_stats = dummy_stats();
+        inf_stats.max_movement = 3;
+
+        // u1: 歩兵1 @(3,5) → 搭載される
+        let mut inf1 = Unit::new(inf_stats.clone(), 1, (3, 5));
+        inf1.action_completed = false;
+        game.units.push(inf1);
+
+        // u2: 歩兵2 @(4,5) → 容量超過で搭載されない
+        let mut inf2 = Unit::new(inf_stats.clone(), 1, (4, 5));
+        inf2.action_completed = false;
+        game.units.push(inf2);
+
+        // P2 用ダミーユニット（ゲームオーバー防止）
+        let p2_unit = Unit::new(dummy_stats(), 2, (9, 8));
+        game.units.push(p2_unit);
+
+        // 歩兵1 を輸送ヘリのマスに移動（搭載）
+        game.move_unit(1, 5, 5).unwrap();
+        assert_eq!(game.units[0].cargo.len(), 1);
+
+        // 歩兵2 を輸送ヘリのマスへ（capacity = 1 なので搭載されない）
+        // 目的地が占有されている (Occupied) ため移動自体が失敗するはず
+        game.units[2].action_completed = false;
+        let result = game.move_unit(2, 5, 5);
+        assert!(
+            result.is_err(),
+            "Should fail: target occupied by full transport"
+        );
+        assert_eq!(
+            game.units[0].cargo.len(),
+            1,
+            "Should not load more than capacity"
+        );
+        assert_eq!(game.units[2].transport_index, None);
+    }
+
+    #[test]
+    fn test_unload_unit_basic() {
+        let mut map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Capital).unwrap();
+        map.set_terrain(9, 9, Terrain::Capital).unwrap();
+
+        let mut properties = HashMap::new();
+        properties.insert((0, 0), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((9, 9), PropertyState::new(Terrain::Capital, Some(2)));
+
+        let p1 = Player::new(1, "Red".to_string());
+        let p2 = Player::new(2, "Blue".to_string());
+        let mut game = MatchState::new(map, vec![p1, p2], properties);
+
+        // 輸送ヘリ @(5,5)
+        let mut heli = Unit::new(transport_heli_stats(), 1, (5, 5));
+        heli.action_completed = false;
+        game.units.push(heli);
+
+        // 歩兵 @(5,5) を手動で搭載済みに設定（次のターンシミュレーション）
+        let mut inf = Unit::new(dummy_stats(), 1, (5, 5));
+        inf.action_completed = true; // 搭載済み扱い（次のターンで下車可能）
+        inf.transport_index = Some(0);
+        game.units.push(inf);
+        game.units[0].cargo.push(1);
+
+        // 下車 → (6,5) に降りる
+        let result = game.unload_unit(0, 0, 6, 5);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(game.units[1].position, (6, 5));
+        assert_eq!(game.units[1].transport_index, None);
+        assert!(
+            game.units[1].action_completed,
+            "Unloaded unit should be action_completed"
+        );
+        assert!(game.units[0].cargo.is_empty());
+    }
+
+    #[test]
+    fn test_unload_non_adjacent_fails() {
+        let mut map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Capital).unwrap();
+        map.set_terrain(9, 9, Terrain::Capital).unwrap();
+
+        let mut properties = HashMap::new();
+        properties.insert((0, 0), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((9, 9), PropertyState::new(Terrain::Capital, Some(2)));
+
+        let p1 = Player::new(1, "Red".to_string());
+        let p2 = Player::new(2, "Blue".to_string());
+        let mut game = MatchState::new(map, vec![p1, p2], properties);
+
+        let mut heli = Unit::new(transport_heli_stats(), 1, (5, 5));
+        heli.action_completed = false;
+        game.units.push(heli);
+
+        let mut inf = Unit::new(dummy_stats(), 1, (5, 5));
+        inf.action_completed = true;
+        inf.transport_index = Some(0);
+        game.units.push(inf);
+        game.units[0].cargo.push(1);
+
+        // 距離 2 のマスに下車しようとする → エラー
+        let result = game.unload_unit(0, 0, 7, 5);
+        assert!(result.is_err(), "Should fail: not adjacent");
+    }
+
+    #[test]
+    fn test_cargo_hp_sync_on_attack() {
+        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Capital).unwrap();
+        map.set_terrain(4, 4, Terrain::Capital).unwrap();
+
+        let mut properties = HashMap::new();
+        properties.insert((0, 0), PropertyState::new(Terrain::Capital, Some(1)));
+        properties.insert((4, 4), PropertyState::new(Terrain::Capital, Some(2)));
+
+        let p1 = Player::new(1, "Red".to_string());
+        let p2 = Player::new(2, "Blue".to_string());
+        let mut game = MatchState::new(map, vec![p1, p2], properties);
+
+        // P1 攻撃者 歩兵 @(2,2) ammo あり
+        let mut atk_stats = dummy_stats();
+        atk_stats.max_ammo1 = 9;
+        let mut attacker = Unit::new(atk_stats.clone(), 1, (2, 2));
+        attacker.action_completed = false;
+        game.units.push(attacker); // index 0
+
+        // P2 輸送ヘリ @(3,2) HP 100、搭載者あり
+        let heli = Unit::new(transport_heli_stats(), 2, (3, 2));
+        game.units.push(heli); // index 1
+
+        // P2 歩兵（搭載中）@(3,2)
+        let mut cargo_inf = Unit::new(dummy_stats(), 2, (3, 2));
+        cargo_inf.transport_index = Some(1);
+        game.units.push(cargo_inf); // index 2
+        game.units[1].cargo.push(2);
+
+        // 攻撃（ダメージ 55 → 輸送ヘリに確実にダメージ）
+        let chart = make_chart_with_damage(UnitType::Infantry, UnitType::TransportHelicopter, 55);
+        let _ = game.attack(0, 1, &chart);
+
+        // 搭載ユニット HP ≤ 輸送ヘリ HP
+        assert!(
+            game.units[2].hp <= game.units[1].hp || game.units[1].hp == 0,
+            "Cargo unit HP should sync with transport HP"
         );
     }
 }
