@@ -16,7 +16,7 @@
 ## Project Conventions
 
 ### Code Style
-
+- ソースコードにはロジックの内容がわかるように日本語のコメントをいれること
 
 ### Architecture Patterns
 Reactはbullet proof reactでディレクトリは配置

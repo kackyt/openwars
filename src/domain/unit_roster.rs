@@ -50,6 +50,7 @@ pub struct UnitStats {
     pub max_ammo2: u32,
     pub min_range: u32,
     pub max_range: u32,
+    pub daily_fuel_consumption: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +62,7 @@ pub struct Unit {
     pub ammo2: u32,
     pub owner_player_id: u32,     // Simple player reference mapping
     pub position: (usize, usize), // (x, y) map coordinate
+    pub action_completed: bool,
 }
 
 impl Unit {
@@ -73,6 +75,7 @@ impl Unit {
             hp: 100, // Initialize to max 100 (represents 10 display HP)
             owner_player_id,
             position,
+            action_completed: true, // Should be true if produced this turn, or maybe false to allow moving immediately? Basic AW allows moving immediately in some versions, but standard is cannot move same turn. Let's make it true. No, wait, if you produce, usually you cannot move. Let's make it true.
         }
     }
 
@@ -139,6 +142,7 @@ mod tests {
             max_ammo2: 0,
             min_range: 1,
             max_range: 1,
+            daily_fuel_consumption: 0,
         }
     }
 

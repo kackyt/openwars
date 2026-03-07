@@ -102,9 +102,18 @@ impl MatchState {
         if self.active_player_index >= self.players.len() {
             self.active_player_index = 0;
             self.current_turn_number += 1; // All players moved, next full turn day
+            self.process_daily_updates();
         }
 
         self.current_phase = Phase::Production; // Reset phase for new player
+
+        // Reset action points
+        let active_pid = self.players[self.active_player_index].id;
+        for unit in &mut self.units {
+            if unit.owner_player_id == active_pid {
+                unit.action_completed = false;
+            }
+        }
 
         self.add_budget_for_active_player();
         self.check_win_conditions();
@@ -223,6 +232,80 @@ impl MatchState {
 
         Ok(())
     }
+
+    fn process_daily_updates(&mut self) {
+        use crate::domain::unit_roster::MovementType;
+        for unit in &mut self.units {
+            if unit.is_destroyed() {
+                continue;
+            }
+            if unit.stats.movement_type == MovementType::LowAltitude
+                || unit.stats.movement_type == MovementType::HighAltitude
+            {
+                let terrain = self.map.get_terrain(unit.position.0, unit.position.1);
+                if terrain != Some(Terrain::Airport) {
+                    if unit.fuel == 0 {
+                        unit.hp = 0; // Destroyed
+                    } else {
+                        unit.fuel = unit.fuel.saturating_sub(unit.stats.daily_fuel_consumption);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn move_unit(
+        &mut self,
+        unit_index: usize,
+        target_x: usize,
+        target_y: usize,
+    ) -> Result<(), &'static str> {
+        if self.game_over.is_some() {
+            return Err("Game is over");
+        }
+        let active_player_id = self.get_active_player().ok_or("No active player")?.id;
+        let unit = self.units.get(unit_index).ok_or("Unit not found")?;
+
+        if unit.owner_player_id != active_player_id {
+            return Err("Not your unit");
+        }
+        if unit.action_completed {
+            return Err("Unit already acted");
+        }
+        if unit.is_destroyed() {
+            return Err("Unit is destroyed");
+        }
+
+        let mut unit_positions = std::collections::HashMap::new();
+        for (i, u) in self.units.iter().enumerate() {
+            if !u.is_destroyed() && i != unit_index {
+                unit_positions.insert(u.position, u.owner_player_id);
+            }
+        }
+
+        let context = crate::domain::movement::MovementContext {
+            map: &self.map,
+            unit_positions,
+        };
+
+        if let Some((_path, _cost, fuel_used)) = crate::domain::movement::find_path_a_star(
+            &context,
+            unit.position,
+            (target_x, target_y),
+            unit.stats.movement_type,
+            unit.stats.max_movement,
+            unit.fuel,
+            active_player_id,
+        ) {
+            let unit_mut = &mut self.units[unit_index];
+            unit_mut.position = (target_x, target_y);
+            unit_mut.fuel -= fuel_used;
+            unit_mut.action_completed = true;
+            Ok(())
+        } else {
+            Err("Unreachable target")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -242,6 +325,7 @@ mod tests {
             max_ammo2: 0,
             min_range: 1,
             max_range: 1,
+            daily_fuel_consumption: 0,
         }
     }
 
@@ -352,5 +436,153 @@ mod tests {
         assert_eq!(game.players[0].funds, 500);
         assert_eq!(game.units.len(), 1);
         assert_eq!(game.units[0].position, (2, 0));
+    }
+
+    #[test]
+    fn test_air_unit_fuel_and_crash() {
+        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Airport).unwrap();
+        map.set_terrain(0, 1, Terrain::Capital).unwrap(); // P1 Capital
+        map.set_terrain(4, 4, Terrain::Capital).unwrap(); // P2 Capital
+
+        let mut properties = HashMap::new();
+        properties.insert((0, 0), 1);
+        properties.insert((0, 1), 1);
+        properties.insert((4, 4), 2);
+
+        let p1 = Player::new(1, "Red".to_string());
+        let p2 = Player::new(2, "Blue".to_string());
+        let mut game = MatchState::new(map, vec![p1, p2], properties);
+
+        let mut air_stats = dummy_stats();
+        air_stats.movement_type = MovementType::HighAltitude;
+        air_stats.max_fuel = 3;
+        air_stats.daily_fuel_consumption = 2; // e.g. Helicopter uses 2
+
+        let mut u1 = Unit::new(air_stats.clone(), 1, (0, 0));
+        u1.fuel = 3;
+        game.units.push(u1);
+
+        let mut u2 = Unit::new(air_stats.clone(), 1, (1, 1));
+        u2.fuel = 3;
+        game.units.push(u2);
+
+        let u3 = Unit::new(air_stats.clone(), 2, (4, 4));
+        game.units.push(u3);
+
+        game.advance_turn(); // P2
+        game.advance_turn(); // P1 (Day 2)
+
+        assert_eq!(game.units[0].fuel, 3);
+        assert_eq!(game.units[1].fuel, 1);
+        assert!(!game.units[1].is_destroyed());
+
+        game.advance_turn(); // P2 
+        game.advance_turn(); // P1 (Day 3)
+
+        assert_eq!(game.units[1].fuel, 0);
+        assert!(!game.units[1].is_destroyed());
+
+        game.advance_turn(); // P2
+        game.advance_turn(); // P1 (Day 4)
+
+        assert!(game.units[1].is_destroyed());
+
+        // Now test another unit with 5 fuel consumption
+        let mut jet_stats = dummy_stats();
+        jet_stats.movement_type = MovementType::HighAltitude;
+        jet_stats.max_fuel = 10;
+        jet_stats.daily_fuel_consumption = 5;
+
+        let mut u4 = Unit::new(jet_stats, 2, (3, 3));
+        u4.fuel = 6;
+        game.units.push(u4);
+
+        // It is currently P1's turn (Day 4 start). Let's advance a full turn to P2.
+        game.advance_turn(); // P1
+        game.advance_turn(); // P2 (Day 5)
+
+        // u4 belongs to P2. Wait, daily update happens when active_player_index wraps to 0.
+        // Currently advance_turn() wraps around: P1 (index 0) -> P2 (index 1). Wraps to P1.
+        // Let's just create a new game state to cleanly test the 5 consumption to avoid confusion.
+    }
+
+    #[test]
+    fn test_air_unit_fuel_consumption_jet() {
+        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Capital).unwrap();
+        map.set_terrain(4, 4, Terrain::Capital).unwrap();
+
+        let mut properties = HashMap::new();
+        properties.insert((0, 0), 1);
+        properties.insert((4, 4), 2);
+        let p1 = Player::new(1, "Red".to_string());
+        let p2 = Player::new(2, "Blue".to_string());
+        let mut game = MatchState::new(map, vec![p1, p2], properties);
+
+        let mut jet_stats = dummy_stats();
+        jet_stats.movement_type = MovementType::HighAltitude;
+        jet_stats.max_fuel = 10;
+        jet_stats.daily_fuel_consumption = 5;
+
+        // Position (2, 2) is Plains
+        let mut u1 = Unit::new(jet_stats.clone(), 1, (2, 2));
+        u1.fuel = 8;
+        game.units.push(u1);
+
+        let u2 = Unit::new(dummy_stats(), 2, (4, 4)); // Infantry, no fuel burn
+        game.units.push(u2);
+
+        // Turn 1, P1 starts.
+        // Advance to P2:
+        game.advance_turn(); // P1 -> P2
+        // Advance to P1 (Day 2):
+        game.advance_turn(); // P2 -> P1, Day 2 starts.
+
+        assert_eq!(game.units[0].fuel, 3); // 8 - 5 = 3
+
+        // Advance to P2:
+        game.advance_turn(); // P1 -> P2
+        // Advance to P1 (Day 3):
+        game.advance_turn(); // P2 -> P1, Day 3 starts.
+
+        assert_eq!(game.units[0].fuel, 0); // 3 - 5 = 0 (saturating sub)
+        assert!(!game.units[0].is_destroyed());
+
+        // Advance to P2:
+        game.advance_turn(); // P1 -> P2
+        // Advance to P1 (Day 4):
+        game.advance_turn(); // P2 -> P1, Day 4 starts.
+
+        assert!(game.units[0].is_destroyed());
+    }
+
+    #[test]
+    fn test_move_unit() {
+        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Capital).unwrap();
+        map.set_terrain(4, 4, Terrain::Capital).unwrap();
+
+        let mut properties = HashMap::new();
+        properties.insert((0, 0), 1);
+        properties.insert((4, 4), 2);
+
+        let p1 = Player::new(1, "Red".to_string());
+        let p2 = Player::new(2, "Blue".to_string());
+        let mut game = MatchState::new(map, vec![p1, p2], properties);
+
+        let stats = dummy_stats();
+        let mut u1 = Unit::new(stats.clone(), 1, (2, 2));
+        u1.action_completed = false;
+        game.units.push(u1);
+
+        let u2 = Unit::new(stats.clone(), 2, (4, 4));
+        game.units.push(u2);
+
+        let res = game.move_unit(0, 2, 4);
+        assert!(res.is_ok());
+        assert_eq!(game.units[0].position, (2, 4));
+        assert_eq!(game.units[0].fuel, 97);
+        assert!(game.units[0].action_completed);
     }
 }
