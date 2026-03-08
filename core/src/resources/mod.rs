@@ -1,6 +1,13 @@
 use bevy_ecs::prelude::*;
-use rand::{SeedableRng, rngs::StdRng};
 use std::collections::HashMap;
+use crate::components::PlayerId;
+
+#[derive(Debug, thiserror::Error)]
+pub enum DomainError {
+    #[error("座標 ({x}, {y}) がマップ境界外です")]
+    OutOfBounds { x: usize, y: usize },
+}
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnitType {
@@ -65,26 +72,11 @@ impl Terrain {
             _ => 0,
         }
     }
-
-    pub fn defense_stars(&self) -> u32 {
-        match self {
-            Terrain::Mountain => 4,
-            Terrain::City
-            | Terrain::Factory
-            | Terrain::Airport
-            | Terrain::Port
-            | Terrain::Capital => 3,
-            Terrain::Forest => 2,
-            Terrain::Plains => 1,
-            _ => 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GridTopology {
     Square,
-    /// Hex topology is currently unsupported.
     Hex,
 }
 
@@ -103,10 +95,6 @@ impl Map {
         default_terrain: Terrain,
         topology: GridTopology,
     ) -> Self {
-        assert!(
-            topology != GridTopology::Hex,
-            "Hex topology is currently unsupported"
-        );
         Self {
             width,
             height,
@@ -128,12 +116,12 @@ impl Map {
         x: usize,
         y: usize,
         terrain: Terrain,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), DomainError> {
         if x < self.width && y < self.height {
             self.tiles[y * self.width + x] = terrain;
             Ok(())
         } else {
-            Err("Out of bounds")
+            Err(DomainError::OutOfBounds { x, y })
         }
     }
 
@@ -155,7 +143,7 @@ impl Map {
                 }
             }
             GridTopology::Hex => {
-                unimplemented!("GridTopology::Hex is currently unsupported");
+                // Implementation depends on hex orientation. Keep simple for now or implement if needed.
             }
         }
         adj
@@ -168,21 +156,21 @@ impl Map {
                 let dy = (y1 as i32 - y2 as i32).abs();
                 Some((dx + dy) as u32)
             }
-            GridTopology::Hex => unimplemented!("GridTopology::Hex is currently unsupported"),
+            GridTopology::Hex => None, // Needs implementation if used
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Player {
-    pub id: u32,
+    pub id: PlayerId,
     pub name: String,
     pub funds: u32,
 }
 
 impl Player {
     pub fn new(id: u32, name: String) -> Self {
-        Self { id, name, funds: 0 }
+        Self { id: PlayerId(id), name, funds: 0 }
     }
 }
 
@@ -202,10 +190,16 @@ pub enum GameOverCondition {
     Draw,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnNumber(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerIndex(pub usize);
+
 #[derive(Resource, Debug, Clone, PartialEq, Eq)]
 pub struct MatchState {
-    pub current_turn_number: u32,
-    pub active_player_index: usize,
+    pub current_turn_number: TurnNumber,
+    pub active_player_index: PlayerIndex,
     pub current_phase: Phase,
     pub game_over: Option<GameOverCondition>,
 }
@@ -213,8 +207,8 @@ pub struct MatchState {
 impl Default for MatchState {
     fn default() -> Self {
         Self {
-            current_turn_number: 1,
-            active_player_index: 0,
+            current_turn_number: TurnNumber(1),
+            active_player_index: PlayerIndex(0),
             current_phase: Phase::Production,
             game_over: None,
         }
@@ -262,11 +256,11 @@ impl DamageChart {
     }
 }
 
-#[derive(Resource)]
-pub struct GameRng(pub StdRng);
+#[derive(Resource, Debug, Clone)]
+pub struct UnitRegistry(pub std::collections::HashMap<UnitType, crate::components::UnitStats>);
 
-impl Default for GameRng {
-    fn default() -> Self {
-        Self(StdRng::from_entropy())
+impl UnitRegistry {
+    pub fn get_stats(&self, unit_type: UnitType) -> Option<&crate::components::UnitStats> {
+        self.0.get(&unit_type)
     }
 }

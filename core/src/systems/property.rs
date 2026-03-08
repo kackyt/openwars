@@ -3,6 +3,15 @@ use crate::events::*;
 use crate::resources::*;
 use bevy_ecs::prelude::*;
 
+/// 拠点の占領・修理コマンド(`CapturePropertyCommand`)を処理するシステム。
+///
+/// 【処理の流れ】
+/// 1. ユニットが占領能力を持ち、行動済みでないことを確認します。
+/// 2. ユニットの現在地と同じ座標にある拠点(`Property`)を取得します。
+/// 3. すでに自軍の拠点であれば、耐久値（占領ポイント）を回復（修理）します。
+/// 4. 敵軍または中立の拠点であれば、ユニットのHPに応じたアクションパワーで占領ポイントを減らします。
+/// 5. 占領ポイントが0以下になった場合、拠点の所有者を自軍に変更し、`PropertyCapturedEvent` を発行します。
+/// 6. ユニットの `ActionCompleted` を true に設定します。
 pub fn capture_property_system(
     mut capture_events: EventReader<CapturePropertyCommand>,
     mut captured_events: EventWriter<PropertyCapturedEvent>,
@@ -14,7 +23,7 @@ pub fn capture_property_system(
         &UnitStats,
         &mut ActionCompleted,
     )>,
-    mut q_properties: Query<(Entity, &GridPosition, &mut Property)>,
+    mut q_properties: Query<(&GridPosition, &mut Property)>,
     mut match_state: ResMut<MatchState>,
     players: Res<Players>,
     _map: Res<Map>,
@@ -22,12 +31,7 @@ pub fn capture_property_system(
     if match_state.game_over.is_some() {
         return;
     }
-    let active_player_id = players.0[match_state.active_player_index].id;
-
-    let mut prop_map = std::collections::HashMap::new();
-    for (entity, pos, _) in q_properties.iter() {
-        prop_map.insert((pos.x, pos.y), entity);
-    }
+    let active_player_id = players.0[match_state.active_player_index.0].id;
 
     for event in capture_events.read() {
         let (pos, faction, hp, stats, mut action) = match q_units.get_mut(event.unit_entity) {
@@ -43,27 +47,30 @@ pub fn capture_property_system(
         let mut captured = false;
         let mut new_owner = None;
 
-        if let Some(&prop_entity) = prop_map.get(&(pos.x, pos.y)) {
-            if let Ok((_, _, mut prop)) = q_properties.get_mut(prop_entity) {
+        for (prop_pos, mut prop) in q_properties.iter_mut() {
+            if prop_pos.x == pos.x && prop_pos.y == pos.y {
                 let max_points = prop.terrain.max_capture_points();
-                if max_points > 0 {
-                    if prop.owner_id == Some(active_player_id) {
-                        // Repair
-                        prop.capture_points =
-                            std::cmp::min(prop.capture_points + action_power, max_points);
-                    } else {
-                        // Capture
-                        if prop.capture_points <= action_power {
-                            prop.owner_id = Some(active_player_id);
-                            prop.capture_points = max_points;
-                            captured = true;
-                            new_owner = Some(active_player_id);
-                        } else {
-                            prop.capture_points -= action_power;
-                        }
-                    }
-                    action.0 = true;
+                if max_points == 0 {
+                    continue; // Not capturable
                 }
+
+                if prop.owner_id == Some(active_player_id) {
+                    // Repair
+                    prop.capture_points =
+                        std::cmp::min(prop.capture_points + action_power, max_points);
+                } else {
+                    // Capture
+                    if prop.capture_points <= action_power {
+                        prop.owner_id = Some(active_player_id);
+                        prop.capture_points = max_points;
+                        captured = true;
+                        new_owner = Some(active_player_id);
+                    } else {
+                        prop.capture_points -= action_power;
+                    }
+                }
+                action.0 = true;
+                break;
             }
         }
 
@@ -78,7 +85,7 @@ pub fn capture_property_system(
             let mut alive_players = Vec::new();
             for player in &players.0 {
                 let mut has_capital = false;
-                for (_, _, p_prop) in q_properties.iter() {
+                for (_p_pos, p_prop) in q_properties.iter() {
                     if p_prop.owner_id == Some(player.id) && p_prop.terrain == Terrain::Capital {
                         has_capital = true;
                         break;
@@ -93,14 +100,14 @@ pub fn capture_property_system(
                     }
                 }
 
-                let is_annihilated = match_state.current_turn_number > 1 && !has_units;
+                let is_annihilated = match_state.current_turn_number.0 > 1 && !has_units;
                 if has_capital && !is_annihilated {
                     alive_players.push(player.id);
                 }
             }
 
             if alive_players.len() == 1 {
-                match_state.game_over = Some(GameOverCondition::Winner(alive_players[0]));
+                match_state.game_over = Some(GameOverCondition::Winner(alive_players[0].0));
             } else if alive_players.is_empty() {
                 match_state.game_over = Some(GameOverCondition::Draw);
             }
@@ -129,7 +136,7 @@ mod tests {
         let unit_entity = world
             .spawn((
                 GridPosition { x: 2, y: 2 },
-                Faction(1),
+                Faction(PlayerId(1)),
                 Health {
                     current: 100,
                     max: 100,
@@ -168,7 +175,7 @@ mod tests {
             GridPosition { x: 0, y: 0 },
             Property {
                 terrain: Terrain::Capital,
-                owner_id: Some(1),
+                owner_id: Some(PlayerId(1)),
                 capture_points: 200,
             },
         ));
@@ -176,13 +183,13 @@ mod tests {
             GridPosition { x: 4, y: 4 },
             Property {
                 terrain: Terrain::Capital,
-                owner_id: Some(2),
+                owner_id: Some(PlayerId(2)),
                 capture_points: 200,
             },
         ));
         world.spawn((
             GridPosition { x: 4, y: 4 },
-            Faction(2),
+            Faction(PlayerId(2)),
             Health {
                 current: 100,
                 max: 100,
@@ -215,13 +222,56 @@ mod tests {
         let prop = iter.find(|p| p.terrain == Terrain::City).unwrap();
 
         assert_eq!(prop.capture_points, 200); // Reset after capture
-        assert_eq!(prop.owner_id, Some(1));
+        assert_eq!(prop.owner_id, Some(PlayerId(1)));
 
         let events = world.resource::<Events<PropertyCapturedEvent>>();
         let mut cursor = events.get_cursor();
         let evs: Vec<_> = cursor.read(events).collect();
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].x, 2);
-        assert_eq!(evs[0].new_owner, Some(1));
+        assert_eq!(evs[0].new_owner, Some(PlayerId(1)));
+    }
+}
+
+
+/// 勝敗判定システム。ターン終了時または拠点が占領された後に呼ばれるべきです。
+pub fn victory_check_system(
+    mut match_state: ResMut<MatchState>,
+    players: Res<Players>,
+    q_properties: Query<&Property>,
+    q_units: Query<(&Faction, &Health)>,
+) {
+    if match_state.game_over.is_some() {
+        return;
+    }
+
+    let mut alive_players = Vec::new();
+    for player in &players.0 {
+        let mut has_capital = false;
+        for prop in q_properties.iter() {
+            if prop.owner_id == Some(player.id) && prop.terrain == Terrain::Capital {
+                has_capital = true;
+                break;
+            }
+        }
+
+        let mut has_units = false;
+        for (u_fac, u_hp) in q_units.iter() {
+            if u_fac.0 == player.id && !u_hp.is_destroyed() {
+                has_units = true;
+                break;
+            }
+        }
+
+        let is_annihilated = match_state.current_turn_number.0 > 1 && !has_units;
+        if has_capital && !is_annihilated {
+            alive_players.push(player.id);
+        }
+    }
+
+    if alive_players.len() == 1 {
+        match_state.game_over = Some(GameOverCondition::Winner(alive_players[0].0));
+    } else if alive_players.is_empty() {
+        match_state.game_over = Some(GameOverCondition::Draw);
     }
 }

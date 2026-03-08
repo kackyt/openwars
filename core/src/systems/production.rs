@@ -3,6 +3,15 @@ use crate::events::*;
 use crate::resources::*;
 use bevy_ecs::prelude::*;
 
+/// ユニットの生産コマンド(`ProduceUnitCommand`)を処理するシステム。
+///
+/// 【処理の流れ】
+/// 1. コマンドを発行したプレイヤーがアクティブプレイヤーであることを確認します。
+/// 2. ターゲット座標が自軍の生産拠点（都市または空港）であることを確認します。
+/// 3. 自軍の首都からの距離が3マス以内であることを確認します。
+/// 4. プレイヤーの資金(`funds`)が生産コスト(`cost`)以上であることを確認し、資金を消費します。
+/// 5. 新しいユニットの実体(`Entity`)をコンポーネント群と共に生成（スポーン）します。
+///    ※生産された直後は行動できないため、`HasMoved` と `ActionCompleted` を true にします。
 pub fn produce_unit_system(
     mut commands: Commands,
     mut produce_events: EventReader<ProduceUnitCommand>,
@@ -12,10 +21,10 @@ pub fn produce_unit_system(
     q_properties: Query<(&GridPosition, &Property)>,
     unit_registry: Res<UnitRegistry>,
 ) {
-    if match_state.game_over.is_some() || match_state.current_phase != Phase::Production {
+    if match_state.game_over.is_some() {
         return;
     }
-    let active_player_id = players.0[match_state.active_player_index].id;
+    let active_player_id = players.0[match_state.active_player_index.0].id;
 
     for event in produce_events.read() {
         if event.player_id != active_player_id {
@@ -23,7 +32,8 @@ pub fn produce_unit_system(
         }
 
         let mut is_valid_property = false;
-        let mut owned_capitals = Vec::new();
+        let mut has_capital = false;
+        let mut capital_coord = None;
 
         for (pos, prop) in q_properties.iter() {
             if prop.owner_id == Some(event.player_id) {
@@ -33,40 +43,41 @@ pub fn produce_unit_system(
                     }
                 }
                 if prop.terrain == Terrain::Capital {
-                    owned_capitals.push((pos.x, pos.y));
+                    has_capital = true;
+                    capital_coord = Some((pos.x, pos.y));
                 }
             }
         }
 
-        let mut has_nearby_capital = false;
-        for (cx, cy) in owned_capitals {
-            if let Some(distance) = map.distance(event.target_x, event.target_y, cx, cy) {
-                if distance <= 3 {
-                    has_nearby_capital = true;
-                    break;
-                }
-            }
-        }
-
-        if !is_valid_property || !has_nearby_capital {
+        if !is_valid_property || !has_capital {
             continue;
         }
 
-        let canonical_stats = match unit_registry.units.get(&event.stats.unit_type) {
-            Some(s) => s,
-            None => continue,
-        };
+        if let Some((cx, cy)) = capital_coord {
+            if let Some(distance) = map.distance(event.target_x, event.target_y, cx, cy) {
+                if distance > 3 {
+                    continue; // Too far from capital
+                }
+            } else {
+                continue;
+            }
+        }
 
         let player = players
             .0
             .iter_mut()
             .find(|p| p.id == event.player_id)
             .unwrap();
-        if player.funds < canonical_stats.cost {
+        let stats = match unit_registry.get_stats(event.unit_type) {
+            Some(s) => s.clone(),
+            None => continue,
+        };
+
+        if player.funds < stats.cost {
             continue; // Insufficient funds
         }
 
-        player.funds -= canonical_stats.cost;
+        player.funds -= stats.cost;
 
         commands.spawn((
             GridPosition {
@@ -79,16 +90,16 @@ pub fn produce_unit_system(
                 max: 100,
             },
             Fuel {
-                current: canonical_stats.max_fuel,
-                max: canonical_stats.max_fuel,
+                current: stats.max_fuel,
+                max: stats.max_fuel,
             },
             Ammo {
-                ammo1: canonical_stats.max_ammo1,
-                max_ammo1: canonical_stats.max_ammo1,
-                ammo2: canonical_stats.max_ammo2,
-                max_ammo2: canonical_stats.max_ammo2,
+                ammo1: stats.max_ammo1,
+                max_ammo1: stats.max_ammo1,
+                ammo2: stats.max_ammo2,
+                max_ammo2: stats.max_ammo2,
             },
-            canonical_stats.clone(),
+            stats,
             HasMoved(true), // Produced units cannot move immediately
             ActionCompleted(true),
         ));
@@ -106,12 +117,12 @@ mod tests {
         world.insert_resource(MatchState::default());
         world.insert_resource(Players(vec![
             Player {
-                id: 1,
+                id: PlayerId(1),
                 name: "P1".to_string(),
                 funds: 2000,
             },
             Player {
-                id: 2,
+                id: PlayerId(2),
                 name: "P2".to_string(),
                 funds: 0,
             },
@@ -127,11 +138,11 @@ mod tests {
         // Spawn properties
         world.spawn((
             GridPosition { x: 0, y: 0 },
-            Property::new(Terrain::Capital, Some(1)),
+            Property::new(Terrain::Capital, Some(PlayerId(1))),
         ));
         world.spawn((
             GridPosition { x: 2, y: 0 },
-            Property::new(Terrain::City, Some(1)),
+            Property::new(Terrain::City, Some(PlayerId(1))),
         ));
 
         let stats = UnitStats {
@@ -151,17 +162,14 @@ mod tests {
             loadable_unit_types: vec![],
         };
 
-        let mut unit_registry = UnitRegistry::default();
-        unit_registry
-            .units
-            .insert(UnitType::Infantry, stats.clone());
-        world.insert_resource(unit_registry);
-
+        let mut registry = UnitRegistry(std::collections::HashMap::new());
+        registry.0.insert(UnitType::Infantry, stats);
+        world.insert_resource(registry);
         world.send_event(ProduceUnitCommand {
-            player_id: 1,
+            player_id: PlayerId(1),
             target_x: 2,
             target_y: 0,
-            stats: stats.clone(),
+            unit_type: UnitType::Infantry,
         });
 
         let mut schedule = Schedule::default();
@@ -172,7 +180,7 @@ mod tests {
         let mut query = world.query::<(&Faction, &UnitStats, &GridPosition)>();
         let mut iter = query.iter(&world);
         let (faction, spawned_stats, pos) = iter.next().expect("Unit should have been spawned");
-        assert_eq!(faction.0, 1);
+        assert_eq!(faction.0, PlayerId(1));
         assert_eq!(pos.x, 2);
         assert_eq!(pos.y, 0);
         assert_eq!(spawned_stats.unit_type, UnitType::Infantry);

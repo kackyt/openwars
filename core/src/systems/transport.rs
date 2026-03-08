@@ -3,6 +3,13 @@ use crate::events::*;
 use crate::resources::*;
 use bevy_ecs::prelude::*;
 
+/// 輸送ユニットへの積載コマンド(`LoadUnitCommand`)を処理するシステム。
+///
+/// 【処理の流れ】
+/// 1. 輸送ユニットと積載対象ユニットが同座標にあり、同じプレイヤーの所有であることを確認します。
+/// 2. 輸送ユニットの容量(`CargoCapacity`)と積載可能タイプ(`loadable_unit_types`)の条件を満たしているか確認します。
+/// 3. 積載対象ユニットを輸送ユニットの `CargoCapacity` に追加します。
+/// 4. 積載対象ユニットに `Transporting` コンポーネントを付与し、行動済み(`ActionCompleted`)にします。
 pub fn load_unit_system(
     mut load_events: EventReader<LoadUnitCommand>,
     mut commands: Commands,
@@ -21,7 +28,7 @@ pub fn load_unit_system(
     if match_state.game_over.is_some() {
         return;
     }
-    let active_player_id = players.0[match_state.active_player_index].id;
+    let active_player_id = players.0[match_state.active_player_index.0].id;
 
     for event in load_events.read() {
         let (trans_pos, trans_faction, trans_stats, trans_capacity) =
@@ -74,6 +81,15 @@ pub fn load_unit_system(
     }
 }
 
+/// 輸送ユニットからの降車コマンド(`UnloadUnitCommand`)を処理するシステム。
+///
+/// 【処理の流れ】
+/// 1. 降車対象ユニットが指定された輸送ユニットに積載されていることを確認します。
+/// 2. 降車対象ユニットがこのターンに積載されたばかりでないか（`ActionCompleted`フラグがリセットされているか）確認します。
+/// 3. 降車先の座標が輸送ユニットから距離1の空きマスであることを確認します。
+/// 4. 輸送ユニットの `CargoCapacity` からユニットを削除し、`Transporting` コンポーネントを外します。
+/// 5. 降車ユニットの座標(`GridPosition`)を更新し、行動済み(`ActionCompleted`)にします。
+/// 6. 輸送ユニット自身も行動済み(`ActionCompleted`)にします。
 pub fn unload_unit_system(
     mut commands: Commands,
     mut unload_events: EventReader<UnloadUnitCommand>,
@@ -91,14 +107,7 @@ pub fn unload_unit_system(
     if match_state.game_over.is_some() {
         return;
     }
-    let active_player_id = players.0[match_state.active_player_index].id;
-
-    let mut occupied_positions = std::collections::HashSet::new();
-    for (_, p, _, _, _, t) in q_units.iter() {
-        if t.is_none() {
-            occupied_positions.insert((p.x, p.y));
-        }
-    }
+    let active_player_id = players.0[match_state.active_player_index.0].id;
 
     for event in unload_events.read() {
         let (trans_pos, trans_faction, trans_action) = match q_units.get(event.transport_entity) {
@@ -130,7 +139,14 @@ pub fn unload_unit_system(
         }
 
         // Check if target is occupied
-        if occupied_positions.contains(&(event.target_x, event.target_y)) {
+        let mut occupied = false;
+        for (_, p, _, _, _, t) in q_units.iter() {
+            if p.x == event.target_x && p.y == event.target_y && t.is_none() {
+                occupied = true;
+                break;
+            }
+        }
+        if occupied {
             continue;
         }
 
@@ -146,7 +162,6 @@ pub fn unload_unit_system(
             cargo.1.y = event.target_y;
             cargo.3.0 = true; // Unloaded unit is completed for the turn
             commands.entity(event.cargo_entity).remove::<Transporting>();
-            occupied_positions.insert((event.target_x, event.target_y)); // Mark occupied to prevent double-unloads
         }
     }
 }
@@ -171,7 +186,7 @@ mod tests {
         let transport_entity = world
             .spawn((
                 GridPosition { x: 5, y: 5 },
-                Faction(1),
+                Faction(PlayerId(1)),
                 ActionCompleted(false),
                 UnitStats {
                     unit_type: UnitType::TransportHelicopter,
@@ -199,7 +214,7 @@ mod tests {
         let cargo_entity = world
             .spawn((
                 GridPosition { x: 5, y: 5 },
-                Faction(1),
+                Faction(PlayerId(1)),
                 ActionCompleted(false),
                 UnitStats {
                     unit_type: UnitType::Infantry,

@@ -4,6 +4,27 @@ use crate::resources::*;
 use bevy_ecs::prelude::*;
 use std::collections::HashSet;
 
+/// ターン開始時に呼ばれる日次更新システム。航空機などの燃料消費と墜落判定を行います。
+pub fn daily_update_system(
+    mut q_units: Query<(&UnitStats, &mut Fuel, &mut Health, &GridPosition)>,
+    map: Res<Map>,
+) {
+    for (stats, mut fuel, mut hp, pos) in q_units.iter_mut() {
+        if hp.is_destroyed() { continue; }
+        if stats.movement_type == MovementType::LowAltitude || stats.movement_type == MovementType::HighAltitude {
+            let terrain = map.get_terrain(pos.x, pos.y);
+            if terrain != Some(Terrain::Airport) {
+                if fuel.current == 0 {
+                    hp.current = 0; // 燃料枯渇による墜落
+                } else {
+                    fuel.current = fuel.current.saturating_sub(stats.daily_fuel_consumption);
+                }
+            }
+        }
+    }
+}
+
+/// フェーズの進行、ターンの切り替え、拠点による資金増加と自動補給を管理します。
 pub fn next_phase_system(
     _commands: Commands,
     mut match_state: ResMut<MatchState>,
@@ -31,29 +52,17 @@ pub fn next_phase_system(
     for _ in next_phase_events.read() {
         match match_state.current_phase {
             Phase::Production => {
-                let old_phase = match_state.current_phase.clone();
                 match_state.current_phase = Phase::MovementAndAttack;
-                phase_changed_events.send(GamePhaseChangedEvent {
-                    old_phase,
-                    new_phase: match_state.current_phase.clone(),
-                    active_player: players.0[match_state.active_player_index].id,
-                });
             }
             Phase::MovementAndAttack => {
-                let old_phase_tmp = match_state.current_phase.clone();
                 match_state.current_phase = Phase::EndTurn;
-                phase_changed_events.send(GamePhaseChangedEvent {
-                    old_phase: old_phase_tmp,
-                    new_phase: match_state.current_phase.clone(),
-                    active_player: players.0[match_state.active_player_index].id,
-                });
 
-                match_state.active_player_index += 1;
+                match_state.active_player_index.0 += 1;
 
                 // Wrap around players
-                if match_state.active_player_index >= players.0.len() {
-                    match_state.active_player_index = 0;
-                    match_state.current_turn_number += 1;
+                if match_state.active_player_index.0 >= players.0.len() {
+                    match_state.active_player_index.0 = 0;
+                    match_state.current_turn_number.0 += 1;
 
                     // Daily Updates (Fuel consumption, crashing)
                     for (_entity, _, _, _, stats, mut fuel, _, mut hp, pos) in q_units.iter_mut() {
@@ -76,15 +85,8 @@ pub fn next_phase_system(
                     }
                 }
 
-                let old_phase_tmp = match_state.current_phase.clone();
                 match_state.current_phase = Phase::Production;
-                let active_player_id = players.0[match_state.active_player_index].id;
-
-                phase_changed_events.send(GamePhaseChangedEvent {
-                    old_phase: old_phase_tmp,
-                    new_phase: match_state.current_phase.clone(),
-                    active_player: active_player_id,
-                });
+                let active_player_id = players.0[match_state.active_player_index.0].id;
 
                 // Reset flags and apply property resupply
                 let mut owned_properties = HashSet::new();
@@ -146,15 +148,14 @@ pub fn next_phase_system(
                         }
                     }
                 }
+
+                phase_changed_events.send(GamePhaseChangedEvent {
+                    new_phase: match_state.current_phase.clone(),
+                    active_player: active_player_id,
+                });
             }
             Phase::EndTurn => {
-                let old_phase = match_state.current_phase.clone();
                 match_state.current_phase = Phase::Production;
-                phase_changed_events.send(GamePhaseChangedEvent {
-                    old_phase,
-                    new_phase: match_state.current_phase.clone(),
-                    active_player: players.0[match_state.active_player_index].id,
-                });
             }
         }
     }
