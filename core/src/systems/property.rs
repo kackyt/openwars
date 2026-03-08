@@ -24,11 +24,11 @@ pub fn capture_property_system(
         &mut ActionCompleted,
     )>,
     mut q_properties: Query<(&GridPosition, &mut Property)>,
-    mut match_state: ResMut<MatchState>,
+    match_state: Res<MatchState>,
     players: Res<Players>,
     _map: Res<Map>,
 ) {
-    if match_state.game_over.is_some() {
+    if match_state.game_over.is_some() || match_state.current_phase != Phase::MovementAndAttack {
         return;
     }
     let active_player_id = players.0[match_state.active_player_index.0].id;
@@ -80,37 +80,6 @@ pub fn capture_property_system(
                 y: pos.y,
                 new_owner,
             });
-
-            // Check win conditions
-            let mut alive_players = Vec::new();
-            for player in &players.0 {
-                let mut has_capital = false;
-                for (_p_pos, p_prop) in q_properties.iter() {
-                    if p_prop.owner_id == Some(player.id) && p_prop.terrain == Terrain::Capital {
-                        has_capital = true;
-                        break;
-                    }
-                }
-
-                let mut has_units = false;
-                for (_, _u_pos, u_fac, u_hp, _, _) in q_units.iter() {
-                    if u_fac.0 == player.id && !u_hp.is_destroyed() {
-                        has_units = true;
-                        break;
-                    }
-                }
-
-                let is_annihilated = match_state.current_turn_number.0 > 1 && !has_units;
-                if has_capital && !is_annihilated {
-                    alive_players.push(player.id);
-                }
-            }
-
-            if alive_players.len() == 1 {
-                match_state.game_over = Some(GameOverCondition::Winner(alive_players[0].0));
-            } else if alive_players.is_empty() {
-                match_state.game_over = Some(GameOverCondition::Draw);
-            }
         }
     }
 }
@@ -123,7 +92,9 @@ mod tests {
     fn test_capture_property_system() {
         let mut world = World::new();
 
-        world.insert_resource(MatchState::default());
+        let mut ms = MatchState::default();
+        ms.current_phase = Phase::MovementAndAttack;
+        world.insert_resource(ms);
         world.insert_resource(Players(vec![
             Player::new(1, "P1".to_string()),
             Player::new(2, "P2".to_string()),
@@ -233,7 +204,6 @@ mod tests {
     }
 }
 
-
 /// 勝敗判定システム。ターン終了時または拠点が占領された後に呼ばれるべきです。
 pub fn victory_check_system(
     mut match_state: ResMut<MatchState>,
@@ -270,7 +240,7 @@ pub fn victory_check_system(
     }
 
     if alive_players.len() == 1 {
-        match_state.game_over = Some(GameOverCondition::Winner(alive_players[0].0));
+        match_state.game_over = Some(GameOverCondition::Winner(alive_players[0]));
     } else if alive_players.is_empty() {
         match_state.game_over = Some(GameOverCondition::Draw);
     }

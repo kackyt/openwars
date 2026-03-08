@@ -25,7 +25,7 @@ pub fn supply_unit_system(
     match_state: Res<MatchState>,
     players: Res<Players>,
 ) {
-    if match_state.game_over.is_some() {
+    if match_state.game_over.is_some() || match_state.current_phase != Phase::MovementAndAttack {
         return;
     }
     let active_player_id = players.0[match_state.active_player_index.0].id;
@@ -93,7 +93,9 @@ mod tests {
     fn test_supply_unit_system() {
         let mut world = World::new();
 
-        world.insert_resource(MatchState::default());
+        let mut ms = MatchState::default();
+        ms.current_phase = Phase::MovementAndAttack;
+        world.insert_resource(ms);
         world.insert_resource(Players(vec![
             Player::new(1, "P1".to_string()),
             Player::new(2, "P2".to_string()),

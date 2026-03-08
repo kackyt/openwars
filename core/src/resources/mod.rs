@@ -1,13 +1,42 @@
+use crate::components::PlayerId;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::time::SystemTime;
+
+#[derive(Resource, Debug, Clone)]
+pub struct GameRng {
+    pub seed: u64,
+}
+
+impl Default for GameRng {
+    fn default() -> Self {
+        let mut h = DefaultHasher::new();
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+            .hash(&mut h);
+        Self { seed: h.finish() }
+    }
+}
+
+impl GameRng {
+    pub fn new(seed: u64) -> Self {
+        Self { seed }
+    }
+    pub fn next_bonus(&mut self) -> u32 {
+        self.seed = self.seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((self.seed >> 33) % 11) as u32
+    }
+}
 use bevy_ecs::prelude::*;
 use std::collections::HashMap;
-use crate::components::PlayerId;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DomainError {
     #[error("座標 ({x}, {y}) がマップ境界外です")]
     OutOfBounds { x: usize, y: usize },
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnitType {
@@ -72,6 +101,20 @@ impl Terrain {
             _ => 0,
         }
     }
+
+    pub fn defense_stars(&self) -> u32 {
+        match self {
+            Terrain::Mountain => 4,
+            Terrain::City
+            | Terrain::Factory
+            | Terrain::Airport
+            | Terrain::Port
+            | Terrain::Capital => 3,
+            Terrain::Forest => 2,
+            Terrain::Plains => 1,
+            _ => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +138,9 @@ impl Map {
         default_terrain: Terrain,
         topology: GridTopology,
     ) -> Self {
+        if topology == GridTopology::Hex {
+            unimplemented!("GridTopology::Hex is not currently supported");
+        }
         Self {
             width,
             height,
@@ -111,12 +157,7 @@ impl Map {
         }
     }
 
-    pub fn set_terrain(
-        &mut self,
-        x: usize,
-        y: usize,
-        terrain: Terrain,
-    ) -> Result<(), DomainError> {
+    pub fn set_terrain(&mut self, x: usize, y: usize, terrain: Terrain) -> Result<(), DomainError> {
         if x < self.width && y < self.height {
             self.tiles[y * self.width + x] = terrain;
             Ok(())
@@ -170,7 +211,11 @@ pub struct Player {
 
 impl Player {
     pub fn new(id: u32, name: String) -> Self {
-        Self { id: PlayerId(id), name, funds: 0 }
+        Self {
+            id: PlayerId(id),
+            name,
+            funds: 0,
+        }
     }
 }
 
@@ -186,7 +231,7 @@ pub enum Phase {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GameOverCondition {
-    Winner(u32),
+    Winner(PlayerId),
     Draw,
 }
 

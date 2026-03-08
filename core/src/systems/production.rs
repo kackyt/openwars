@@ -21,7 +21,7 @@ pub fn produce_unit_system(
     q_properties: Query<(&GridPosition, &Property)>,
     unit_registry: Res<UnitRegistry>,
 ) {
-    if match_state.game_over.is_some() {
+    if match_state.game_over.is_some() || match_state.current_phase != Phase::Production {
         return;
     }
     let active_player_id = players.0[match_state.active_player_index.0].id;

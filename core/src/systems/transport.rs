@@ -15,7 +15,7 @@ pub fn load_unit_system(
     mut commands: Commands,
     mut q_units: Query<(
         Entity,
-        &GridPosition,
+        &mut GridPosition,
         &Faction,
         &UnitStats,
         &mut ActionCompleted,
@@ -25,7 +25,7 @@ pub fn load_unit_system(
     match_state: Res<MatchState>,
     players: Res<Players>,
 ) {
-    if match_state.game_over.is_some() {
+    if match_state.game_over.is_some() || match_state.current_phase != Phase::MovementAndAttack {
         return;
     }
     let active_player_id = players.0[match_state.active_player_index.0].id;
@@ -71,6 +71,8 @@ pub fn load_unit_system(
                     if let Some(mut cap) = transport.5 {
                         cap.loaded.push(event.unit_entity);
                     }
+                    unit.1.x = 9999; // Move off map
+                    unit.1.y = 9999;
                     unit.4.0 = true; // Action completed
                     commands
                         .entity(event.unit_entity)
@@ -104,7 +106,7 @@ pub fn unload_unit_system(
     match_state: Res<MatchState>,
     players: Res<Players>,
 ) {
-    if match_state.game_over.is_some() {
+    if match_state.game_over.is_some() || match_state.current_phase != Phase::MovementAndAttack {
         return;
     }
     let active_player_id = players.0[match_state.active_player_index.0].id;
@@ -174,7 +176,9 @@ mod tests {
     fn test_load_and_unload_unit_system() {
         let mut world = World::new();
 
-        world.insert_resource(MatchState::default());
+        let mut ms = MatchState::default();
+        ms.current_phase = Phase::MovementAndAttack;
+        world.insert_resource(ms);
         world.insert_resource(Players(vec![
             Player::new(1, "P1".to_string()),
             Player::new(2, "P2".to_string()),

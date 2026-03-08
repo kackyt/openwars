@@ -10,8 +10,12 @@ pub fn daily_update_system(
     map: Res<Map>,
 ) {
     for (stats, mut fuel, mut hp, pos) in q_units.iter_mut() {
-        if hp.is_destroyed() { continue; }
-        if stats.movement_type == MovementType::LowAltitude || stats.movement_type == MovementType::HighAltitude {
+        if hp.is_destroyed() {
+            continue;
+        }
+        if stats.movement_type == MovementType::LowAltitude
+            || stats.movement_type == MovementType::HighAltitude
+        {
             let terrain = map.get_terrain(pos.x, pos.y);
             if terrain != Some(Terrain::Airport) {
                 if fuel.current == 0 {
@@ -53,10 +57,21 @@ pub fn next_phase_system(
         match match_state.current_phase {
             Phase::Production => {
                 match_state.current_phase = Phase::MovementAndAttack;
+                let active_player_id = players.0[match_state.active_player_index.0].id;
+                phase_changed_events.send(GamePhaseChangedEvent {
+                    new_phase: Phase::MovementAndAttack,
+                    active_player: active_player_id,
+                });
             }
             Phase::MovementAndAttack => {
                 match_state.current_phase = Phase::EndTurn;
-
+                let active_player_id = players.0[match_state.active_player_index.0].id;
+                phase_changed_events.send(GamePhaseChangedEvent {
+                    new_phase: Phase::EndTurn,
+                    active_player: active_player_id,
+                });
+            }
+            Phase::EndTurn => {
                 match_state.active_player_index.0 += 1;
 
                 // Wrap around players
@@ -64,7 +79,7 @@ pub fn next_phase_system(
                     match_state.active_player_index.0 = 0;
                     match_state.current_turn_number.0 += 1;
 
-                    // Daily Updates (Fuel consumption, crashing)
+                    // Daily Updates (Fuel consumption, crashing) for all units when a day ends
                     for (_entity, _, _, _, stats, mut fuel, _, mut hp, pos) in q_units.iter_mut() {
                         if hp.is_destroyed() {
                             continue;
@@ -116,7 +131,7 @@ pub fn next_phase_system(
                     .unwrap();
                 players.0[active_player_idx].funds += budget_increase;
 
-                // Property resupply
+                // Property resupply & turn status reset
                 for (
                     _,
                     mut has_moved,
@@ -150,12 +165,9 @@ pub fn next_phase_system(
                 }
 
                 phase_changed_events.send(GamePhaseChangedEvent {
-                    new_phase: match_state.current_phase.clone(),
+                    new_phase: Phase::Production,
                     active_player: active_player_id,
                 });
-            }
-            Phase::EndTurn => {
-                match_state.current_phase = Phase::Production;
             }
         }
     }

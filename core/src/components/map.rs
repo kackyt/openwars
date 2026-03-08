@@ -1,5 +1,5 @@
-use bevy_ecs::prelude::*;
 use crate::components::player::PlayerId;
+use bevy_ecs::prelude::*;
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GridPosition {
