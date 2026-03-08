@@ -1,4 +1,5 @@
 use bevy_ecs::prelude::*;
+use crate::components::PlayerId;
 
 #[derive(Event, Debug, Clone)]
 pub struct MoveUnitCommand {
@@ -20,10 +21,10 @@ pub struct CapturePropertyCommand {
 
 #[derive(Event, Debug, Clone)]
 pub struct ProduceUnitCommand {
-    pub player_id: u32,
+    pub player_id: PlayerId,
     pub target_x: usize,
     pub target_y: usize,
-    pub stats: crate::components::UnitStats,
+    pub unit_type: crate::resources::UnitType,
 }
 
 #[derive(Event, Debug, Clone)]
@@ -76,14 +77,13 @@ pub struct UnitDestroyedEvent {
 pub struct PropertyCapturedEvent {
     pub x: usize,
     pub y: usize,
-    pub new_owner: Option<u32>,
+    pub new_owner: Option<PlayerId>,
 }
 
 #[derive(Event, Debug, Clone)]
 pub struct GamePhaseChangedEvent {
-    pub old_phase: crate::resources::Phase,
     pub new_phase: crate::resources::Phase,
-    pub active_player: u32,
+    pub active_player: PlayerId,
 }
 
 #[derive(Event, Debug, Clone)]

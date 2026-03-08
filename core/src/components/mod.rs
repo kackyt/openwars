@@ -10,8 +10,11 @@ pub struct GridPosition {
     pub y: usize,
 }
 
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PlayerId(pub u32);
+
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Faction(pub u32); // player_id
+pub struct Faction(pub PlayerId);
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Health {
@@ -66,20 +69,19 @@ pub struct Ammo {
     pub max_ammo2: u32,
 }
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Cargo {
-    // Array to store entity IDs of loaded units, up to some max or dynamically via vector, but ECS Components should ideally be cheap.
-    // However, Vec is fine for now, or we can use fixed arrays for cargo. Let's use Vec for simplicity as max_cargo is usually 1-2.
-}
-
 #[derive(Component, Debug, Clone)]
 pub struct CargoCapacity {
     pub max: u32,
+    // Note: In Bevy ECS, `Entity` IS the unique ID for an entity.
+    // It acts as a lightweight 64-bit identifier (generation + index).
+    // Using `Entity` here satisfies the ID-based reference rule without
+    // fighting the ECS framework's native relation mechanisms.
     pub loaded: Vec<Entity>,
 }
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Transporting(pub Entity); // Reference to the transport unit if currently loaded
+pub struct Transporting(pub Entity); // Reference by Entity ID
+
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HasMoved(pub bool);
@@ -90,21 +92,16 @@ pub struct ActionCompleted(pub bool);
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Property {
     pub terrain: crate::resources::Terrain,
-    pub owner_id: Option<u32>,
+    pub owner_id: Option<PlayerId>,
     pub capture_points: u32,
 }
 
 impl Property {
-    pub fn new(terrain: crate::resources::Terrain, owner_id: Option<u32>) -> Self {
+    pub fn new(terrain: crate::resources::Terrain, owner_id: Option<PlayerId>) -> Self {
         Self {
             terrain,
             owner_id,
             capture_points: terrain.max_capture_points(),
         }
     }
-}
-
-#[derive(Resource, Debug, Clone, Default)]
-pub struct UnitRegistry {
-    pub units: std::collections::HashMap<crate::resources::UnitType, UnitStats>,
 }

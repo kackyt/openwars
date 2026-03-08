@@ -18,10 +18,10 @@ pub fn supply_unit_system(
     match_state: Res<MatchState>,
     players: Res<Players>,
 ) {
-    if match_state.game_over.is_some() || match_state.current_phase != Phase::MovementAndAttack {
+    if match_state.game_over.is_some() {
         return;
     }
-    let active_player_id = players.0[match_state.active_player_index].id;
+    let active_player_id = players.0[match_state.active_player_index.0].id;
 
     for event in supply_events.read() {
         let (sup_pos, sup_faction, sup_stats, sup_hp, sup_action) =
@@ -55,20 +55,23 @@ pub fn supply_unit_system(
         }
 
         // Apply supply using get_many_mut
-        if let Ok([mut supplier, target]) =
+        if let Ok([supplier, target]) =
             q_units.get_many_mut([event.supplier_entity, event.target_entity])
         {
-            supplier.5.0 = true; // Action completed
+            let (_, _, _, _, _, mut sup_action, _, _) = supplier;
+            let (_, _, _, tar_stats, _, _, tar_fuel_opt, tar_ammo_opt) = target;
 
-            let max_fuel = target.3.max_fuel;
-            if let Some(mut fuel) = target.6 {
-                fuel.current = max_fuel;
+            sup_action.0 = true; // 補給者は行動完了状態になる
+
+            let max_fuel = tar_stats.max_fuel;
+            if let Some(mut fuel) = tar_fuel_opt {
+                fuel.current = max_fuel; // 燃料を最大値まで回復
             }
 
-            let max_a1 = target.3.max_ammo1;
-            let max_a2 = target.3.max_ammo2;
-            if let Some(mut ammo) = target.7 {
-                ammo.ammo1 = max_a1;
+            let max_a1 = tar_stats.max_ammo1;
+            let max_a2 = tar_stats.max_ammo2;
+            if let Some(mut ammo) = tar_ammo_opt {
+                ammo.ammo1 = max_a1; // 主武器と副武器の弾薬を最大値まで回復
                 ammo.ammo2 = max_a2;
             }
         }
@@ -83,9 +86,7 @@ mod tests {
     fn test_supply_unit_system() {
         let mut world = World::new();
 
-        let mut match_state = MatchState::default();
-        match_state.current_phase = Phase::MovementAndAttack;
-        world.insert_resource(match_state);
+        world.insert_resource(MatchState::default());
         world.insert_resource(Players(vec![
             Player::new(1, "P1".to_string()),
             Player::new(2, "P2".to_string()),
@@ -96,7 +97,7 @@ mod tests {
         let supplier_entity = world
             .spawn((
                 GridPosition { x: 2, y: 2 },
-                Faction(1),
+                Faction(PlayerId(1)),
                 Health {
                     current: 100,
                     max: 100,
@@ -124,7 +125,7 @@ mod tests {
         let target_entity = world
             .spawn((
                 GridPosition { x: 3, y: 2 },
-                Faction(1),
+                Faction(PlayerId(1)),
                 Health {
                     current: 100,
                     max: 100,
