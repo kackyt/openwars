@@ -10,6 +10,7 @@ use bevy_ecs::prelude::*;
 /// 2. 輸送ユニットの容量(`CargoCapacity`)と積載可能タイプ(`loadable_unit_types`)の条件を満たしているか確認します。
 /// 3. 積載対象ユニットを輸送ユニットの `CargoCapacity` に追加します。
 /// 4. 積載対象ユニットに `Transporting` コンポーネントを付与し、行動済み(`ActionCompleted`)にします。
+#[allow(clippy::type_complexity)]
 pub fn load_unit_system(
     mut load_events: EventReader<LoadUnitCommand>,
     mut commands: Commands,
@@ -34,7 +35,7 @@ pub fn load_unit_system(
         let (trans_pos, trans_faction, trans_stats, trans_capacity) =
             match q_units.get(event.transport_entity) {
                 Ok((_, p, f, s, _, c, _)) => (
-                    p.clone(),
+                    *p,
                     f.0,
                     s.clone(),
                     c.map(|cap| (cap.max, cap.loaded.clone())),
@@ -48,7 +49,7 @@ pub fn load_unit_system(
 
         let (unit_pos, unit_faction, unit_stats, unit_action, unit_trans) =
             match q_units.get(event.unit_entity) {
-                Ok((_, p, f, s, a, _, t)) => (p.clone(), f.0, s.clone(), a.0, t.is_some()),
+                Ok((_, p, f, s, a, _, t)) => (*p, f.0, s.clone(), a.0, t.is_some()),
                 _ => continue,
             };
 
@@ -59,25 +60,25 @@ pub fn load_unit_system(
             continue;
         } // Must be on same tile to load
 
-        if let Some((max_cap, loaded)) = trans_capacity {
-            if (loaded.len() as u32) < max_cap
+        #[allow(clippy::collapsible_if)]
+        if trans_capacity.is_some_and(|(max_cap, ref loaded)| {
+            (loaded.len() as u32) < max_cap
                 && trans_stats
                     .loadable_unit_types
                     .contains(&unit_stats.unit_type)
+        }) {
+            if let Ok([transport, mut unit]) =
+                q_units.get_many_mut([event.transport_entity, event.unit_entity])
             {
-                if let Ok([transport, mut unit]) =
-                    q_units.get_many_mut([event.transport_entity, event.unit_entity])
-                {
-                    if let Some(mut cap) = transport.5 {
-                        cap.loaded.push(event.unit_entity);
-                    }
-                    unit.1.x = 9999; // Move off map
-                    unit.1.y = 9999;
-                    unit.4.0 = true; // Action completed
-                    commands
-                        .entity(event.unit_entity)
-                        .insert(Transporting(event.transport_entity));
+                if let Some(mut cap) = transport.5 {
+                    cap.loaded.push(event.unit_entity);
                 }
+                unit.1.x = 9999; // Move off map
+                unit.1.y = 9999;
+                unit.4.0 = true; // Action completed
+                commands
+                    .entity(event.unit_entity)
+                    .insert(Transporting(event.transport_entity));
             }
         }
     }
@@ -92,6 +93,7 @@ pub fn load_unit_system(
 /// 4. 輸送ユニットの `CargoCapacity` からユニットを削除し、`Transporting` コンポーネントを外します。
 /// 5. 降車ユニットの座標(`GridPosition`)を更新し、行動済み(`ActionCompleted`)にします。
 /// 6. 輸送ユニット自身も行動済み(`ActionCompleted`)にします。
+#[allow(clippy::type_complexity)]
 pub fn unload_unit_system(
     mut commands: Commands,
     mut unload_events: EventReader<UnloadUnitCommand>,
@@ -113,7 +115,7 @@ pub fn unload_unit_system(
 
     for event in unload_events.read() {
         let (trans_pos, trans_faction, trans_action) = match q_units.get(event.transport_entity) {
-            Ok((_, p, f, a, _, _)) => (p.clone(), f.0, a.0),
+            Ok((_, p, f, a, _, _)) => (*p, f.0, a.0),
             _ => continue,
         };
 
@@ -176,8 +178,10 @@ mod tests {
     fn test_load_and_unload_unit_system() {
         let mut world = World::new();
 
-        let mut ms = MatchState::default();
-        ms.current_phase = Phase::MovementAndAttack;
+        let ms = MatchState {
+            current_phase: Phase::MovementAndAttack,
+            ..Default::default()
+        };
         world.insert_resource(ms);
         world.insert_resource(Players(vec![
             Player::new(1, "P1".to_string()),

@@ -37,10 +37,11 @@ pub fn produce_unit_system(
 
         for (pos, prop) in q_properties.iter() {
             if prop.owner_id == Some(event.player_id) {
-                if pos.x == event.target_x && pos.y == event.target_y {
-                    if prop.terrain == Terrain::City || prop.terrain == Terrain::Airport {
-                        is_valid_property = true;
-                    }
+                if pos.x == event.target_x
+                    && pos.y == event.target_y
+                    && (prop.terrain == Terrain::City || prop.terrain == Terrain::Airport)
+                {
+                    is_valid_property = true;
                 }
                 if prop.terrain == Terrain::Capital {
                     has_capital = true;

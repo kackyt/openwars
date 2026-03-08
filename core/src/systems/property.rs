@@ -35,7 +35,7 @@ pub fn capture_property_system(
 
     for event in capture_events.read() {
         let (pos, faction, hp, stats, mut action) = match q_units.get_mut(event.unit_entity) {
-            Ok((_, p, f, h, s, a)) => (p.clone(), f.0, h.clone(), s.clone(), a),
+            Ok((_, p, f, h, s, a)) => (*p, f.0, *h, s.clone(), a),
             _ => continue,
         };
 
@@ -84,6 +84,48 @@ pub fn capture_property_system(
     }
 }
 
+/// 勝敗判定システム。ターン終了時または拠点が占領された後に呼ばれるべきです。
+pub fn victory_check_system(
+    mut match_state: ResMut<MatchState>,
+    players: Res<Players>,
+    q_properties: Query<&Property>,
+    q_units: Query<(&Faction, &Health)>,
+) {
+    if match_state.game_over.is_some() {
+        return;
+    }
+
+    let mut alive_players = Vec::new();
+    for player in &players.0 {
+        let mut has_capital = false;
+        for prop in q_properties.iter() {
+            if prop.owner_id == Some(player.id) && prop.terrain == Terrain::Capital {
+                has_capital = true;
+                break;
+            }
+        }
+
+        let mut has_units = false;
+        for (u_fac, u_hp) in q_units.iter() {
+            if u_fac.0 == player.id && !u_hp.is_destroyed() {
+                has_units = true;
+                break;
+            }
+        }
+
+        let is_annihilated = match_state.current_turn_number.0 > 1 && !has_units;
+        if has_capital && !is_annihilated {
+            alive_players.push(player.id);
+        }
+    }
+
+    if alive_players.len() == 1 {
+        match_state.game_over = Some(GameOverCondition::Winner(alive_players[0]));
+    } else if alive_players.is_empty() {
+        match_state.game_over = Some(GameOverCondition::Draw);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,8 +134,10 @@ mod tests {
     fn test_capture_property_system() {
         let mut world = World::new();
 
-        let mut ms = MatchState::default();
-        ms.current_phase = Phase::MovementAndAttack;
+        let ms = MatchState {
+            current_phase: Phase::MovementAndAttack,
+            ..Default::default()
+        };
         world.insert_resource(ms);
         world.insert_resource(Players(vec![
             Player::new(1, "P1".to_string()),
@@ -201,47 +245,5 @@ mod tests {
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].x, 2);
         assert_eq!(evs[0].new_owner, Some(PlayerId(1)));
-    }
-}
-
-/// 勝敗判定システム。ターン終了時または拠点が占領された後に呼ばれるべきです。
-pub fn victory_check_system(
-    mut match_state: ResMut<MatchState>,
-    players: Res<Players>,
-    q_properties: Query<&Property>,
-    q_units: Query<(&Faction, &Health)>,
-) {
-    if match_state.game_over.is_some() {
-        return;
-    }
-
-    let mut alive_players = Vec::new();
-    for player in &players.0 {
-        let mut has_capital = false;
-        for prop in q_properties.iter() {
-            if prop.owner_id == Some(player.id) && prop.terrain == Terrain::Capital {
-                has_capital = true;
-                break;
-            }
-        }
-
-        let mut has_units = false;
-        for (u_fac, u_hp) in q_units.iter() {
-            if u_fac.0 == player.id && !u_hp.is_destroyed() {
-                has_units = true;
-                break;
-            }
-        }
-
-        let is_annihilated = match_state.current_turn_number.0 > 1 && !has_units;
-        if has_capital && !is_annihilated {
-            alive_players.push(player.id);
-        }
-    }
-
-    if alive_players.len() == 1 {
-        match_state.game_over = Some(GameOverCondition::Winner(alive_players[0]));
-    } else if alive_players.is_empty() {
-        match_state.game_over = Some(GameOverCondition::Draw);
     }
 }

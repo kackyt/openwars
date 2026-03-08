@@ -10,6 +10,7 @@ use bevy_ecs::prelude::*;
 /// 2. 補給対象(`target_entity`)が自軍であり、補給者と隣接（距離が1）していることを確認します。
 /// 3. 対象の燃料(`Fuel`)と弾薬(`Ammo`)を最大値まで回復(`resupply`)させます。
 /// 4. 補給者の `ActionCompleted` を true に設定します。
+#[allow(clippy::type_complexity)]
 pub fn supply_unit_system(
     mut supply_events: EventReader<SupplyUnitCommand>,
     mut q_units: Query<(
@@ -33,7 +34,7 @@ pub fn supply_unit_system(
     for event in supply_events.read() {
         let (sup_pos, sup_faction, sup_stats, sup_hp, sup_action) =
             match q_units.get_mut(event.supplier_entity) {
-                Ok((_, p, f, s, h, a, _, _)) => (p.clone(), f.0, s.clone(), h.clone(), a),
+                Ok((_, p, f, s, h, a, _, _)) => (*p, f.0, s.clone(), *h, a),
                 _ => continue,
             };
 
@@ -46,7 +47,7 @@ pub fn supply_unit_system(
         }
 
         let (tar_pos, tar_faction, tar_hp) = match q_units.get(event.target_entity) {
-            Ok((_, p, f, _, h, _, _, _)) => (p.clone(), f.0, h.clone()),
+            Ok((_, p, f, _, h, _, _, _)) => (*p, f.0, *h),
             _ => continue,
         };
 
@@ -93,8 +94,10 @@ mod tests {
     fn test_supply_unit_system() {
         let mut world = World::new();
 
-        let mut ms = MatchState::default();
-        ms.current_phase = Phase::MovementAndAttack;
+        let ms = MatchState {
+            current_phase: Phase::MovementAndAttack,
+            ..Default::default()
+        };
         world.insert_resource(ms);
         world.insert_resource(Players(vec![
             Player::new(1, "P1".to_string()),

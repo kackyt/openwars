@@ -29,6 +29,8 @@ pub fn daily_update_system(
 }
 
 /// フェーズの進行、ターンの切り替え、拠点による資金増加と自動補給を管理します。
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub fn next_phase_system(
     _commands: Commands,
     mut match_state: ResMut<MatchState>,
