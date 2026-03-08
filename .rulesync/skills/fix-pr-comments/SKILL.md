@@ -20,25 +20,28 @@ description: >-
 ## 実行フロー
 
 ### 1. PR情報の特定とコメントの取得
-まず、現在の環境に紐づくPRのレビューコメントを取得します。カレントブランチのPR情報を取得するには以下のコマンドを利用してください。
+
+現在の環境に紐づくPRの情報をJSON形式で取得し、スクリプトで解析可能な形式に変換します。
 
 ```bash
-# 現在のPRに関わるレビューコメント（ファイルごとのスレッド）を取得
-gh pr view --json comments,reviews -q ".comments[], .reviews[]"
+# 1. PRのレビューコメントと全体コメントをJSONとして書き出し
+# カレントブランチのPRを対象とする場合
+gh pr view --json comments,reviews > pr_comments.json
 
-# 別の方法として、コメントを直接見やすく表示する場合
-gh pr view --comments
+# 2. スクリプトを実行して Markdown (suggestions.md) に変換
+# スキルの scripts ディレクトリにある parse_comments.py を実行
+python scripts/parse_comments.py pr_comments.json
 ```
 
 ※もしカレントブランチからPRが特定できない場合は、`gh pr status` 等を用いるか、ユーザーに対象のPR番号やURLを尋ねてください。
+※生成された `suggestions.md` を `view_file` ツールで読み込み、指摘内容を確認してください。
 
-### 2. コメントの分析と修正計画の立案
-取得した内容を分析します。
-- commentがresolvedである場合、ownerが処理不要と回答している場合は該当コメントはスキップします。
+### 2. 指摘内容の分析
+`suggestions.md` の内容を分析します。
 - **どのファイルの、どの箇所のコードに対する指摘か**を把握します。
-- 指摘内容が追加のコミットで反映されていると判断できた場合(bot等がやる場合)はスキップします
-- 指摘内容が不明瞭であったり、大規模な設計変更（例えばアーキテクチャの大幅な見直し）を要求されている場合は、独断で進めずに `notify_user` ツールを使用してユーザーに意図や方針を確認してください。
-- どのような修正を行うか計画を立てます。
+- すでに解決済み（Resolved）の指摘や、意図的に対応不要とされたものはスキップします。
+- 指摘内容が不明瞭な場合は `notify_user` で確認してください。
+
 
 ### 3. コードの修正
 対象ファイルの現在の内容を `view_file` 等のツールで確認したあと、`replace_file_content` や `multi_replace_file_content` のツールを用いて指摘通りにコードを修正します。

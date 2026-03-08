@@ -126,3 +126,23 @@ hotfix/* → main AND develop: cherry-pick
 feature/* → main: rebase してから merge --no-ff が推奨
 bugfix/* → main: rebase または cherry-pick
 ```
+
+---
+
+## リモートからの更新 (Pull/Update) {#remote-pull}
+
+リモートリポジトリの変更をローカルに取り込む際の基準。
+
+### git pull --rebase を選ぶ状況
+- **ローカルに未 push のコミットがある**が、履歴を一直線に保ちたい
+- 開発中の feature ブランチを最新の `main` に追従させる
+- 小規模な修正でマージコミットを増やしたくない
+
+### git pull (--merge) を選ぶ状況
+- **共有ブランチ**（`main` など）で、誰がいつ更新を取り込んだか明確にしたい
+- 複雑な競合が予想され、マージの記録を残しておきたい
+
+### git pull --ff-only を選ぶ状況
+- ローカルで一切変更を行っておらず、単にリモートの状態に合わせたい
+- 予期せぬマージやリベースが発生するのを防ぎたい（安全策）
+

@@ -2,10 +2,10 @@
 name: git-smart-merge
 description: >-
   ブランチを指定して git rebase または git merge を実行するスキル。コミット履歴・コミットメッセージ・
-  ブランチ名から変更の意図を読み取り、適切な統合戦略（rebase / merge / squash merge）を選択して
+  ブランチ名から変更の意図を読み取り、適切な統合戦略（rebase / merge / squash merge / pull）を選択して
   実行する。コンフリクトが発生した場合はコミット内容から適切な解決策を提示する。
   ユーザーが「〜ブランチに rebase して」「〜に merge して」「ブランチを統合して」「git rebase」
-  「git merge」などと要求したときにトリガーする。
+  「git merge」「git pull」「リモートから更新して」などと要求したときにトリガーする。
 ---
 
 # Git Smart Merge/Rebase スキル
@@ -21,15 +21,20 @@ description: >-
 git status
 git branch --show-current
 
-# ローカルブランチ一覧
+# ローカルおよびリモートブランチ一覧
 git branch -a
+
+# リモートの最新情報を取得（更新があるか確認）
+git fetch origin
+git status -u
 ```
 
 ### Step 2: コミット履歴の分析
 
 ```bash
-# 対象ブランチのコミット履歴（メッセージ・差分サマリー）
+# 対象ブランチ（またはリモート追跡ブランチ）のコミット履歴
 git log <source-branch> --not <target-branch> --oneline --stat
+# 例: git log origin/main --not main --oneline
 
 # ブランチが分岐した共通祖先
 git merge-base <target-branch> <source-branch>
@@ -78,6 +83,19 @@ git merge --no-ff <source-branch> -m "merge: <source-branch> を <target-branch>
 git checkout <target-branch>
 git merge --squash <source-branch>
 git commit -m "feat: <変更内容の要約>"
+```
+
+**Pull (リモートからの更新) の場合:**
+リモートの `main` を現在の `main` に取り込む例：
+```bash
+# rebase を優先する場合（ローカルに未 push のコミットがある時）
+git pull --rebase origin main
+
+# fast-forward のみ許可する場合
+git pull --ff-only origin main
+
+# 通常のマージ（マージコミットを作成）
+git pull origin main
 ```
 
 ### Step 5: コンフリクト解決
