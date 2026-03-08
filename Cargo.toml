@@ -1,7 +1,5 @@
-[package]
-name = "openwars"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-tauri = "2.10.3"
+[workspace]
+members = [
+    "core"
+]
+resolver = "2"
