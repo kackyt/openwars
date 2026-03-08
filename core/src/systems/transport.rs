@@ -93,6 +93,13 @@ pub fn unload_unit_system(
     }
     let active_player_id = players.0[match_state.active_player_index].id;
 
+    let mut occupied_positions = std::collections::HashSet::new();
+    for (_, p, _, _, _, t) in q_units.iter() {
+        if t.is_none() {
+            occupied_positions.insert((p.x, p.y));
+        }
+    }
+
     for event in unload_events.read() {
         let (trans_pos, trans_faction, trans_action) = match q_units.get(event.transport_entity) {
             Ok((_, p, f, a, _, _)) => (p.clone(), f.0, a.0),
@@ -123,14 +130,7 @@ pub fn unload_unit_system(
         }
 
         // Check if target is occupied
-        let mut occupied = false;
-        for (_, p, _, _, _, t) in q_units.iter() {
-            if p.x == event.target_x && p.y == event.target_y && t.is_none() {
-                occupied = true;
-                break;
-            }
-        }
-        if occupied {
+        if occupied_positions.contains(&(event.target_x, event.target_y)) {
             continue;
         }
 
@@ -146,6 +146,7 @@ pub fn unload_unit_system(
             cargo.1.y = event.target_y;
             cargo.3.0 = true; // Unloaded unit is completed for the turn
             commands.entity(event.cargo_entity).remove::<Transporting>();
+            occupied_positions.insert((event.target_x, event.target_y)); // Mark occupied to prevent double-unloads
         }
     }
 }

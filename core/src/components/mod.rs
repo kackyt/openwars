@@ -103,3 +103,8 @@ impl Property {
         }
     }
 }
+
+#[derive(Resource, Debug, Clone, Default)]
+pub struct UnitRegistry {
+    pub units: std::collections::HashMap<crate::resources::UnitType, UnitStats>,
+}

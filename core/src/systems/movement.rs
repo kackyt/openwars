@@ -158,7 +158,7 @@ pub fn calculate_reachable_tiles(
             if let Some(terrain) = context.map.get_terrain(nx, ny) {
                 if let Some(terrain_cost) = get_movement_cost(movement_type, terrain) {
                     let next_cost = cost + terrain_cost;
-                    let next_fuel = fuel_used + 1;
+                    let next_fuel = fuel_used + terrain_cost;
 
                     if next_cost <= max_mp && next_fuel <= max_fuel {
                         let is_better = min_cost.get(&(nx, ny)).map_or(true, |&c| next_cost < c);
@@ -189,12 +189,6 @@ pub fn find_path_a_star(
     max_fuel: u32,
     player_id: u32,
 ) -> Option<(Vec<(usize, usize)>, u32, u32)> {
-    let reachable =
-        calculate_reachable_tiles(context, start, movement_type, max_mp, max_fuel, player_id);
-    if !reachable.contains(&goal) {
-        return None;
-    }
-
     #[derive(Copy, Clone, Eq, PartialEq)]
     struct AStarState {
         cost: u32,
@@ -276,7 +270,7 @@ pub fn find_path_a_star(
             if let Some(terrain) = context.map.get_terrain(nx, ny) {
                 if let Some(terrain_cost) = get_movement_cost(movement_type, terrain) {
                     let next_cost = cost + terrain_cost;
-                    let next_fuel = fuel_used + 1;
+                    let next_fuel = fuel_used + terrain_cost;
 
                     if next_cost <= max_mp && next_fuel <= max_fuel {
                         let is_better = g_score.get(&(nx, ny)).map_or(true, |&g| next_cost < g);
@@ -338,9 +332,15 @@ pub fn move_unit_system(
 
         let mut load_action = None;
 
-        if let Ok((entity, mut pos, mut fuel, mut has_moved, faction, stats, action_completed, _)) = q_units.get_mut(event.unit_entity) {
-            if faction.0 != active_player { continue; }
-            if action_completed.0 { continue; }
+        if let Ok((entity, mut pos, mut fuel, mut has_moved, faction, stats, action_completed, _)) =
+            q_units.get_mut(event.unit_entity)
+        {
+            if faction.0 != active_player {
+                continue;
+            }
+            if action_completed.0 {
+                continue;
+            }
 
             if let Some((_path, _cost, fuel_used)) = find_path_a_star(
                 &context,
@@ -354,7 +354,7 @@ pub fn move_unit_system(
                 let from = *pos;
                 pos.x = event.target_x;
                 pos.y = event.target_y;
-                fuel.current -= fuel_used;
+                fuel.current = fuel.current.saturating_sub(fuel_used);
                 has_moved.0 = true;
 
                 // Fire event
@@ -365,7 +365,13 @@ pub fn move_unit_system(
                     fuel_used,
                 });
 
-                load_action = Some((entity, event.target_x, event.target_y, faction.0, stats.unit_type));
+                load_action = Some((
+                    entity,
+                    event.target_x,
+                    event.target_y,
+                    faction.0,
+                    stats.unit_type,
+                ));
             }
         }
 
@@ -463,8 +469,6 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].to.x, 2);
     }
-}
-
     #[test]
     fn test_air_unit_fuel_and_crash() {
         let mut world = World::new();
@@ -505,28 +509,48 @@ mod tests {
         };
 
         // Heli at airport (will resupply/not crash)
-        let heli1 = world.spawn((
-            GridPosition { x: 0, y: 0 },
-            Faction(1),
-            Health { current: 100, max: 100 },
-            Fuel { current: 3, max: 3 },
-            Ammo { ammo1: 6, max_ammo1: 6, ammo2: 0, max_ammo2: 0 },
-            heli_stats.clone(),
-            HasMoved(false),
-            ActionCompleted(false),
-        )).id();
+        let heli1 = world
+            .spawn((
+                GridPosition { x: 0, y: 0 },
+                Faction(1),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Fuel { current: 3, max: 3 },
+                Ammo {
+                    ammo1: 6,
+                    max_ammo1: 6,
+                    ammo2: 0,
+                    max_ammo2: 0,
+                },
+                heli_stats.clone(),
+                HasMoved(false),
+                ActionCompleted(false),
+            ))
+            .id();
 
         // Heli away from airport (will consume fuel and crash)
-        let heli2 = world.spawn((
-            GridPosition { x: 1, y: 1 },
-            Faction(1),
-            Health { current: 100, max: 100 },
-            Fuel { current: 3, max: 3 },
-            Ammo { ammo1: 6, max_ammo1: 6, ammo2: 0, max_ammo2: 0 },
-            heli_stats.clone(),
-            HasMoved(false),
-            ActionCompleted(false),
-        )).id();
+        let heli2 = world
+            .spawn((
+                GridPosition { x: 1, y: 1 },
+                Faction(1),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Fuel { current: 3, max: 3 },
+                Ammo {
+                    ammo1: 6,
+                    max_ammo1: 6,
+                    ammo2: 0,
+                    max_ammo2: 0,
+                },
+                heli_stats.clone(),
+                HasMoved(false),
+                ActionCompleted(false),
+            ))
+            .id();
 
         // Send Next Phase to advance turns
         world.send_event(crate::events::NextPhaseCommand); // -> Movement
@@ -591,7 +615,7 @@ mod tests {
             Player::new(2, "P2".to_string()),
         ]));
 
-        let mut map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
+        let map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
         world.insert_resource(map);
 
         world.insert_resource(Events::<MoveUnitCommand>::default());
@@ -615,16 +639,27 @@ mod tests {
             loadable_unit_types: vec![UnitType::Infantry],
         };
 
-        let transport_entity = world.spawn((
-            GridPosition { x: 5, y: 5 },
-            Faction(1),
-            Health { current: 100, max: 100 },
-            Fuel { current: 99, max: 99 },
-            transport_stats,
-            HasMoved(false),
-            ActionCompleted(false),
-            CargoCapacity { max: 2, loaded: vec![] },
-        )).id();
+        let transport_entity = world
+            .spawn((
+                GridPosition { x: 5, y: 5 },
+                Faction(1),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                transport_stats,
+                HasMoved(false),
+                ActionCompleted(false),
+                CargoCapacity {
+                    max: 2,
+                    loaded: vec![],
+                },
+            ))
+            .id();
 
         let inf_stats = UnitStats {
             unit_type: UnitType::Infantry,
@@ -643,15 +678,23 @@ mod tests {
             loadable_unit_types: vec![],
         };
 
-        let inf_entity = world.spawn((
-            GridPosition { x: 3, y: 5 },
-            Faction(1),
-            Health { current: 100, max: 100 },
-            Fuel { current: 99, max: 99 },
-            inf_stats,
-            HasMoved(false),
-            ActionCompleted(false),
-        )).id();
+        let inf_entity = world
+            .spawn((
+                GridPosition { x: 3, y: 5 },
+                Faction(1),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                inf_stats,
+                HasMoved(false),
+                ActionCompleted(false),
+            ))
+            .id();
 
         world.send_event(MoveUnitCommand {
             unit_entity: inf_entity,
@@ -661,4 +704,16 @@ mod tests {
 
         // The auto-load behavior needs to be ported over to move_unit_system to match old logic
         // Let's modify move_unit_system slightly to check for transports upon arrival
+        let mut schedule = Schedule::default();
+        schedule.add_systems(move_unit_system);
+        schedule.run(&mut world);
+
+        // Assert load event sent
+        let load_events = world.resource::<Events<LoadUnitCommand>>();
+        let mut reader = load_events.get_cursor();
+        let events: Vec<_> = reader.read(load_events).collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].transport_entity, transport_entity);
+        assert_eq!(events[0].unit_entity, inf_entity);
     }
+}

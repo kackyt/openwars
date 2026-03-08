@@ -31,10 +31,22 @@ pub fn next_phase_system(
     for _ in next_phase_events.read() {
         match match_state.current_phase {
             Phase::Production => {
+                let old_phase = match_state.current_phase.clone();
                 match_state.current_phase = Phase::MovementAndAttack;
+                phase_changed_events.send(GamePhaseChangedEvent {
+                    old_phase,
+                    new_phase: match_state.current_phase.clone(),
+                    active_player: players.0[match_state.active_player_index].id,
+                });
             }
             Phase::MovementAndAttack => {
+                let old_phase_tmp = match_state.current_phase.clone();
                 match_state.current_phase = Phase::EndTurn;
+                phase_changed_events.send(GamePhaseChangedEvent {
+                    old_phase: old_phase_tmp,
+                    new_phase: match_state.current_phase.clone(),
+                    active_player: players.0[match_state.active_player_index].id,
+                });
 
                 match_state.active_player_index += 1;
 
@@ -64,8 +76,15 @@ pub fn next_phase_system(
                     }
                 }
 
+                let old_phase_tmp = match_state.current_phase.clone();
                 match_state.current_phase = Phase::Production;
                 let active_player_id = players.0[match_state.active_player_index].id;
+
+                phase_changed_events.send(GamePhaseChangedEvent {
+                    old_phase: old_phase_tmp,
+                    new_phase: match_state.current_phase.clone(),
+                    active_player: active_player_id,
+                });
 
                 // Reset flags and apply property resupply
                 let mut owned_properties = HashSet::new();
@@ -127,14 +146,15 @@ pub fn next_phase_system(
                         }
                     }
                 }
-
-                phase_changed_events.send(GamePhaseChangedEvent {
-                    new_phase: match_state.current_phase.clone(),
-                    active_player: active_player_id,
-                });
             }
             Phase::EndTurn => {
+                let old_phase = match_state.current_phase.clone();
                 match_state.current_phase = Phase::Production;
+                phase_changed_events.send(GamePhaseChangedEvent {
+                    old_phase,
+                    new_phase: match_state.current_phase.clone(),
+                    active_player: players.0[match_state.active_player_index].id,
+                });
             }
         }
     }

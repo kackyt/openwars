@@ -8,3 +8,4 @@ bevy_ecs = "0.15.2"
 uuid = { version = "1.12", features = ["v4"] }
 thiserror = "2.0"
 anyhow = "1.0"
+rand = "0.8"

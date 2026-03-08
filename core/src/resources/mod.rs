@@ -1,4 +1,5 @@
 use bevy_ecs::prelude::*;
+use rand::{SeedableRng, rngs::StdRng};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -64,11 +65,26 @@ impl Terrain {
             _ => 0,
         }
     }
+
+    pub fn defense_stars(&self) -> u32 {
+        match self {
+            Terrain::Mountain => 4,
+            Terrain::City
+            | Terrain::Factory
+            | Terrain::Airport
+            | Terrain::Port
+            | Terrain::Capital => 3,
+            Terrain::Forest => 2,
+            Terrain::Plains => 1,
+            _ => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GridTopology {
     Square,
+    /// Hex topology is currently unsupported.
     Hex,
 }
 
@@ -87,6 +103,10 @@ impl Map {
         default_terrain: Terrain,
         topology: GridTopology,
     ) -> Self {
+        assert!(
+            topology != GridTopology::Hex,
+            "Hex topology is currently unsupported"
+        );
         Self {
             width,
             height,
@@ -135,7 +155,7 @@ impl Map {
                 }
             }
             GridTopology::Hex => {
-                // Implementation depends on hex orientation. Keep simple for now or implement if needed.
+                unimplemented!("GridTopology::Hex is currently unsupported");
             }
         }
         adj
@@ -148,7 +168,7 @@ impl Map {
                 let dy = (y1 as i32 - y2 as i32).abs();
                 Some((dx + dy) as u32)
             }
-            GridTopology::Hex => None, // Needs implementation if used
+            GridTopology::Hex => unimplemented!("GridTopology::Hex is currently unsupported"),
         }
     }
 }
@@ -239,5 +259,14 @@ impl DamageChart {
             .get(&attacker)
             .and_then(|row| row.get(&defender))
             .copied()
+    }
+}
+
+#[derive(Resource)]
+pub struct GameRng(pub StdRng);
+
+impl Default for GameRng {
+    fn default() -> Self {
+        Self(StdRng::from_entropy())
     }
 }

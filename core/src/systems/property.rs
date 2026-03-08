@@ -14,7 +14,7 @@ pub fn capture_property_system(
         &UnitStats,
         &mut ActionCompleted,
     )>,
-    mut q_properties: Query<(&GridPosition, &mut Property)>,
+    mut q_properties: Query<(Entity, &GridPosition, &mut Property)>,
     mut match_state: ResMut<MatchState>,
     players: Res<Players>,
     _map: Res<Map>,
@@ -23,6 +23,11 @@ pub fn capture_property_system(
         return;
     }
     let active_player_id = players.0[match_state.active_player_index].id;
+
+    let mut prop_map = std::collections::HashMap::new();
+    for (entity, pos, _) in q_properties.iter() {
+        prop_map.insert((pos.x, pos.y), entity);
+    }
 
     for event in capture_events.read() {
         let (pos, faction, hp, stats, mut action) = match q_units.get_mut(event.unit_entity) {
@@ -38,30 +43,27 @@ pub fn capture_property_system(
         let mut captured = false;
         let mut new_owner = None;
 
-        for (prop_pos, mut prop) in q_properties.iter_mut() {
-            if prop_pos.x == pos.x && prop_pos.y == pos.y {
+        if let Some(&prop_entity) = prop_map.get(&(pos.x, pos.y)) {
+            if let Ok((_, _, mut prop)) = q_properties.get_mut(prop_entity) {
                 let max_points = prop.terrain.max_capture_points();
-                if max_points == 0 {
-                    continue; // Not capturable
-                }
-
-                if prop.owner_id == Some(active_player_id) {
-                    // Repair
-                    prop.capture_points =
-                        std::cmp::min(prop.capture_points + action_power, max_points);
-                } else {
-                    // Capture
-                    if prop.capture_points <= action_power {
-                        prop.owner_id = Some(active_player_id);
-                        prop.capture_points = max_points;
-                        captured = true;
-                        new_owner = Some(active_player_id);
+                if max_points > 0 {
+                    if prop.owner_id == Some(active_player_id) {
+                        // Repair
+                        prop.capture_points =
+                            std::cmp::min(prop.capture_points + action_power, max_points);
                     } else {
-                        prop.capture_points -= action_power;
+                        // Capture
+                        if prop.capture_points <= action_power {
+                            prop.owner_id = Some(active_player_id);
+                            prop.capture_points = max_points;
+                            captured = true;
+                            new_owner = Some(active_player_id);
+                        } else {
+                            prop.capture_points -= action_power;
+                        }
                     }
+                    action.0 = true;
                 }
-                action.0 = true;
-                break;
             }
         }
 
@@ -76,7 +78,7 @@ pub fn capture_property_system(
             let mut alive_players = Vec::new();
             for player in &players.0 {
                 let mut has_capital = false;
-                for (_p_pos, p_prop) in q_properties.iter() {
+                for (_, _, p_prop) in q_properties.iter() {
                     if p_prop.owner_id == Some(player.id) && p_prop.terrain == Terrain::Capital {
                         has_capital = true;
                         break;

@@ -81,6 +81,7 @@ pub struct PropertyCapturedEvent {
 
 #[derive(Event, Debug, Clone)]
 pub struct GamePhaseChangedEvent {
+    pub old_phase: crate::resources::Phase,
     pub new_phase: crate::resources::Phase,
     pub active_player: u32,
 }

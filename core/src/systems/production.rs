@@ -10,8 +10,9 @@ pub fn produce_unit_system(
     match_state: Res<MatchState>,
     map: Res<Map>,
     q_properties: Query<(&GridPosition, &Property)>,
+    unit_registry: Res<UnitRegistry>,
 ) {
-    if match_state.game_over.is_some() {
+    if match_state.game_over.is_some() || match_state.current_phase != Phase::Production {
         return;
     }
     let active_player_id = players.0[match_state.active_player_index].id;
@@ -22,8 +23,7 @@ pub fn produce_unit_system(
         }
 
         let mut is_valid_property = false;
-        let mut has_capital = false;
-        let mut capital_coord = None;
+        let mut owned_capitals = Vec::new();
 
         for (pos, prop) in q_properties.iter() {
             if prop.owner_id == Some(event.player_id) {
@@ -33,36 +33,40 @@ pub fn produce_unit_system(
                     }
                 }
                 if prop.terrain == Terrain::Capital {
-                    has_capital = true;
-                    capital_coord = Some((pos.x, pos.y));
+                    owned_capitals.push((pos.x, pos.y));
                 }
             }
         }
 
-        if !is_valid_property || !has_capital {
+        let mut has_nearby_capital = false;
+        for (cx, cy) in owned_capitals {
+            if let Some(distance) = map.distance(event.target_x, event.target_y, cx, cy) {
+                if distance <= 3 {
+                    has_nearby_capital = true;
+                    break;
+                }
+            }
+        }
+
+        if !is_valid_property || !has_nearby_capital {
             continue;
         }
 
-        if let Some((cx, cy)) = capital_coord {
-            if let Some(distance) = map.distance(event.target_x, event.target_y, cx, cy) {
-                if distance > 3 {
-                    continue; // Too far from capital
-                }
-            } else {
-                continue;
-            }
-        }
+        let canonical_stats = match unit_registry.units.get(&event.stats.unit_type) {
+            Some(s) => s,
+            None => continue,
+        };
 
         let player = players
             .0
             .iter_mut()
             .find(|p| p.id == event.player_id)
             .unwrap();
-        if player.funds < event.stats.cost {
+        if player.funds < canonical_stats.cost {
             continue; // Insufficient funds
         }
 
-        player.funds -= event.stats.cost;
+        player.funds -= canonical_stats.cost;
 
         commands.spawn((
             GridPosition {
@@ -75,16 +79,16 @@ pub fn produce_unit_system(
                 max: 100,
             },
             Fuel {
-                current: event.stats.max_fuel,
-                max: event.stats.max_fuel,
+                current: canonical_stats.max_fuel,
+                max: canonical_stats.max_fuel,
             },
             Ammo {
-                ammo1: event.stats.max_ammo1,
-                max_ammo1: event.stats.max_ammo1,
-                ammo2: event.stats.max_ammo2,
-                max_ammo2: event.stats.max_ammo2,
+                ammo1: canonical_stats.max_ammo1,
+                max_ammo1: canonical_stats.max_ammo1,
+                ammo2: canonical_stats.max_ammo2,
+                max_ammo2: canonical_stats.max_ammo2,
             },
-            event.stats.clone(),
+            canonical_stats.clone(),
             HasMoved(true), // Produced units cannot move immediately
             ActionCompleted(true),
         ));
@@ -146,6 +150,12 @@ mod tests {
             max_cargo: 0,
             loadable_unit_types: vec![],
         };
+
+        let mut unit_registry = UnitRegistry::default();
+        unit_registry
+            .units
+            .insert(UnitType::Infantry, stats.clone());
+        world.insert_resource(unit_registry);
 
         world.send_event(ProduceUnitCommand {
             player_id: 1,
