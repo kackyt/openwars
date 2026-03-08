@@ -12,8 +12,21 @@ Example:
 
 import sys
 import zipfile
+import traceback
+import importlib.util
 from pathlib import Path
-from quick_validate import validate_skill
+
+# Dynamically load validate_skill from quick_validate.py in the same directory
+def _load_validate_skill():
+    script_dir = Path(__file__).resolve().parent
+    spec = importlib.util.spec_from_file_location("quick_validate", script_dir / "quick_validate.py")
+    if spec and spec.loader:
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.validate_skill
+    raise ImportError("Could not load quick_validate.py")
+
+validate_skill = _load_validate_skill()
 
 
 def package_skill(skill_path, output_dir=None):
@@ -79,6 +92,7 @@ def package_skill(skill_path, output_dir=None):
 
     except Exception as e:
         print(f"❌ Error creating .skill file: {e}")
+        traceback.print_exc()
         return None
 
 

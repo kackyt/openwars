@@ -12,6 +12,7 @@ Examples:
 """
 
 import sys
+import re
 from pathlib import Path
 
 
@@ -191,6 +192,17 @@ def title_case_skill_name(skill_name):
     return ' '.join(word.capitalize() for word in skill_name.split('-'))
 
 
+def validate_skill_name(name):
+    """Validate skill name format. Returns (valid, error_message)."""
+    if not re.match(r'^[a-z0-9-]+$', name):
+        return False, f"Name '{name}' should be hyphen-case (lowercase letters, digits, and hyphens only)"
+    if name.startswith('-') or name.endswith('-') or '--' in name:
+        return False, f"Name '{name}' cannot start/end with hyphen or contain consecutive hyphens"
+    if len(name) > 64:
+        return False, f"Name is too long ({len(name)} characters). Maximum is 64 characters."
+    return True, None
+
+
 def init_skill(skill_name, path):
     """
     Initialize a new skill directory with template SKILL.md.
@@ -203,7 +215,8 @@ def init_skill(skill_name, path):
         Path to created skill directory, or None if error
     """
     # Determine skill directory path
-    skill_dir = Path(path).resolve() / skill_name
+    skill_base = Path(path).resolve()
+    skill_dir = skill_base / skill_name
 
     # Check if directory already exists
     if skill_dir.exists():
@@ -271,21 +284,41 @@ def init_skill(skill_name, path):
 
 
 def main():
-    if len(sys.argv) < 4 or sys.argv[2] != '--path':
-        print("Usage: init_skill.py <skill-name> --path <path>")
+    # Attempt to find the default path (.rulesync/skills in project root)
+    script_path = Path(__file__).resolve()
+    # The script is in .agent/skills/skill-creator/scripts/init_skill.py
+    # Project root is 4 levels up
+    project_root = script_path.parents[4]
+    default_path = project_root / '.rulesync' / 'skills'
+
+    if len(sys.argv) < 2:
+        print("Usage: init_skill.py <skill-name> [--path <path>]")
         print("\nSkill name requirements:")
         print("  - Hyphen-case identifier (e.g., 'data-analyzer')")
         print("  - Lowercase letters, digits, and hyphens only")
-        print("  - Max 40 characters")
+        print("  - Max 64 characters")
         print("  - Must match directory name exactly")
+        print(f"\nDefault path: {default_path}")
         print("\nExamples:")
-        print("  init_skill.py my-new-skill --path skills/public")
-        print("  init_skill.py my-api-helper --path skills/private")
-        print("  init_skill.py custom-skill --path /custom/location")
+        print(f"  init_skill.py my-new-skill")
+        print(f"  init_skill.py my-api-helper --path {default_path}")
         sys.exit(1)
 
     skill_name = sys.argv[1]
-    path = sys.argv[3]
+    
+    valid, error = validate_skill_name(skill_name)
+    if not valid:
+        print(f"❌ Invalid skill name: {error}")
+        sys.exit(1)
+
+    path = str(default_path)
+    if "--path" in sys.argv:
+        try:
+            path_index = sys.argv.index("--path") + 1
+            if path_index < len(sys.argv):
+                path = sys.argv[path_index]
+        except (ValueError, IndexError):
+            pass
 
     print(f"🚀 Initializing skill: {skill_name}")
     print(f"   Location: {path}")
@@ -297,6 +330,10 @@ def main():
         sys.exit(0)
     else:
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
