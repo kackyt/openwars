@@ -9,7 +9,8 @@
 
 ---
 
-## rebase vs merge の選択基準 {#rebase-vs-merge}
+<a id="rebase-vs-merge"></a>
+## rebase vs merge の選択基準
 
 ### rebase を選ぶ状況
 - **個人作業ブランチ**（まだリモートに push していない）
@@ -24,7 +25,7 @@
 - コミット数が多く、個々のコミットに意味がある場合
 
 ### 判断フロー
-```
+```text
 push 済み? → YES → merge --no-ff
      ↓ NO
 複数人が push? → YES → merge --no-ff
@@ -36,12 +37,13 @@ rebase してから merge --no-ff
 
 ---
 
-## squash merge の使いどき {#squash-merge}
+<a id="squash-merge"></a>
+## squash merge の使いどき
 
 多数の細かいコミット（"fix typo", "wip", "試し"など）を1つにまとめる場合に使用する。
 
 **squash が適切なコミット例:**
-```
+```text
 abc1234 fix typo
 bcd2345 WIP: working on feature
 cde3456 add test
@@ -56,7 +58,8 @@ efg5678 fix test
 
 ---
 
-## cherry-pick の使いどき {#cherry-pick}
+<a id="cherry-pick"></a>
+## cherry-pick の使いどき
 
 特定のコミットだけを別ブランチに適用したい場合:
 
@@ -76,9 +79,11 @@ git cherry-pick <hotfix-commit-hash>
 
 ---
 
-## コミットメッセージからの意図読み取り {#intent-from-commits}
+<a id="intent-from-commits"></a>
+## コミットメッセージからの意図読み取り
 
 ### Conventional Commits 規約の場合
+
 | プレフィックス | 意味 | 推奨戦略 |
 |---------------|------|----------|
 | `feat:` | 新機能 | rebase + merge --no-ff |
@@ -95,6 +100,7 @@ git cherry-pick <hotfix-commit-hash>
 - **履歴が複雑に絡み合っている**: merge --no-ff で履歴保持
 
 ### ブランチ名からの推測
+
 | ブランチ名パターン | 推奨戦略 |
 |-------------------|----------|
 | `feature/*` | rebase + merge --no-ff |
@@ -105,16 +111,17 @@ git cherry-pick <hotfix-commit-hash>
 
 ---
 
-## GitHub Flow / Git Flow との対応 {#branch-models}
+<a id="branch-models"></a>
+## GitHub Flow / Git Flow との対応
 
 ### GitHub Flow（シンプル: main + feature branches）
-```
+```text
 feature/* → main: rebase してから merge --no-ff
 hotfix/* → main: cherry-pick または rebase
 ```
 
 ### Git Flow（develop + release + feature）
-```
+```text
 feature/* → develop: merge --no-ff
 develop → release: merge --no-ff
 release → main: merge --no-ff（タグ付き）
@@ -122,14 +129,15 @@ hotfix/* → main AND develop: cherry-pick
 ```
 
 ### このプロジェクト（GitHub Flow ベース）
-```
+```text
 feature/* → main: rebase してから merge --no-ff が推奨
 bugfix/* → main: rebase または cherry-pick
 ```
 
 ---
 
-## リモートからの更新 (Pull/Update) {#remote-pull}
+<a id="remote-pull"></a>
+## リモートからの更新 (Pull/Update)
 
 リモートリポジトリの変更をローカルに取り込む際の基準。
 

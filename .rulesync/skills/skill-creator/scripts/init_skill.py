@@ -300,7 +300,7 @@ def main():
         print("  - Must match directory name exactly")
         print(f"\nDefault path: {default_path}")
         print("\nExamples:")
-        print(f"  init_skill.py my-new-skill")
+        print("  init_skill.py my-new-skill")
         print(f"  init_skill.py my-api-helper --path {default_path}")
         sys.exit(1)
 
@@ -330,10 +330,6 @@ def main():
         sys.exit(0)
     else:
         sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
 
 
 if __name__ == "__main__":

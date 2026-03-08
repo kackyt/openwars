@@ -27,6 +27,8 @@ description: >-
 # 1. PRのレビューコメントと全体コメントをJSONとして書き出し
 # カレントブランチのPRを対象とする場合
 gh pr view --json comments,reviews > pr_comments.json
+# インラインコメントをより確実に取得するために API も併用して取得します
+gh api repos/{owner}/{repo}/pulls/{pr_number}/comments > inline_comments.json
 
 # 2. スクリプトを実行して Markdown (suggestions.md) に変換
 # スキルの scripts ディレクトリにある parse_comments.py を実行
@@ -47,7 +49,7 @@ python scripts/parse_comments.py pr_comments.json
 対象ファイルの現在の内容を `view_file` 等のツールで確認したあと、`replace_file_content` や `multi_replace_file_content` のツールを用いて指摘通りにコードを修正します。
 - 複数のファイルにまたがる場合は、1つずつ慎重に適用してください。
 - 既存のロジックを不用意に壊さないよう、修正前後の文脈に注意を払ってください。
-- コードを編集する際は指摘の背景や判断理由がわかるように日本語で丁寧なコメントを追記してください。
+- コードを編集する際は意図が伝わるようにクリアなコードを心がけ、コミットメッセージやPRの文面で背景を説明してください。非自明な判断や複雑なロジックにのみ日本語でインラインコメントを追記してください。
 - 影響範囲を確認し、関連するテスト・型定義・ドキュメントも必要に応じて更新してください
 - 複雑な変更の場合は段階的にコミットできるよう、意識して変更を分割してください
 

@@ -38,9 +38,9 @@ def validate_skill(skill_path):
         return False, f"Invalid YAML in frontmatter: {e}"
 
     # Define allowed properties
-    ALLOWED_PROPERTIES = {'name', 'description', 'license', 'allowed-tools', 'metadata'}
+    ALLOWED_PROPERTIES = {'name', 'description'}
 
-    # Check for unexpected properties (excluding nested keys under metadata)
+    # Check for unexpected properties
     unexpected_keys = set(frontmatter.keys()) - ALLOWED_PROPERTIES
     if unexpected_keys:
         return False, (
@@ -56,8 +56,6 @@ def validate_skill(skill_path):
 
     # Extract name for validation
     name = frontmatter.get('name')
-    if name is None:
-        return False, "Missing 'name' in frontmatter"
     if not isinstance(name, str):
         return False, f"Name must be a string, got {type(name).__name__}"
     name = name.strip()

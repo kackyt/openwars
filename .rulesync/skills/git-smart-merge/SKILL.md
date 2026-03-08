@@ -34,7 +34,7 @@ git status -u
 ```bash
 # 対象ブランチ（またはリモート追跡ブランチ）のコミット履歴
 git log <source-branch> --not <target-branch> --oneline --stat
-# 例: git log origin/main --not main --oneline
+# 例: git log feature-branch --not main --oneline --stat
 
 # ブランチが分岐した共通祖先
 git merge-base <target-branch> <source-branch>
@@ -112,7 +112,7 @@ git rebase --abort      # 中止する場合
 コンフリクト解決の方針:
 1. コミットメッセージと diff から **双方の意図を把握**する
 2. 単純な追加同士 → 両方を保持
-3. 同じ行の変更 → 新しい変更（source-branch 側）を優先し、必要なら統合
+3. 同じ行の変更 → コードの意図を読みとってマージする。意図が不明確な場合は独断で進めず**必ずユーザーに確認**を求める
 4. 解決できない場合はユーザーに確認を求める
 
 ### Step 6: 結果確認

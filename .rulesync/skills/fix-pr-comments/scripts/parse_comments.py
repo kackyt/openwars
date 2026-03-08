@@ -59,7 +59,16 @@ def parse_pr_comments(json_path):
     if threads:
         output_lines.append("## Inline Suggestions by File\n")
         # Sort by path then line
-        sorted_keys = sorted(threads.keys())
+        def parse_key(k):
+            parts = k.split(':')
+            path = parts[0]
+            try:
+                line = int(parts[1])
+            except (IndexError, ValueError):
+                line = 0
+            return (path, line)
+            
+        sorted_keys = sorted(threads.keys(), key=parse_key)
         for key in sorted_keys:
             thread = threads[key]
             output_lines.append(f"### File: `{thread['path']}` (Line: {thread['line']})\n")
@@ -81,5 +90,7 @@ def parse_pr_comments(json_path):
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python parse_comments.py <pr_comments.json>")
+        sys.exit(1)
     else:
         parse_pr_comments(sys.argv[1])
+
