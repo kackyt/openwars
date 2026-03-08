@@ -3,6 +3,13 @@ use crate::events::*;
 use crate::resources::*;
 use bevy_ecs::prelude::*;
 
+/// 輸送ユニットへの積載コマンド(`LoadUnitCommand`)を処理するシステム。
+///
+/// 【処理の流れ】
+/// 1. 輸送ユニットと積載対象ユニットが同座標にあり、同じプレイヤーの所有であることを確認します。
+/// 2. 輸送ユニットの容量(`CargoCapacity`)と積載可能タイプ(`loadable_unit_types`)の条件を満たしているか確認します。
+/// 3. 積載対象ユニットを輸送ユニットの `CargoCapacity` に追加します。
+/// 4. 積載対象ユニットに `Transporting` コンポーネントを付与し、行動済み(`ActionCompleted`)にします。
 pub fn load_unit_system(
     mut load_events: EventReader<LoadUnitCommand>,
     mut commands: Commands,
@@ -74,6 +81,15 @@ pub fn load_unit_system(
     }
 }
 
+/// 輸送ユニットからの降車コマンド(`UnloadUnitCommand`)を処理するシステム。
+///
+/// 【処理の流れ】
+/// 1. 降車対象ユニットが指定された輸送ユニットに積載されていることを確認します。
+/// 2. 降車対象ユニットがこのターンに積載されたばかりでないか（`ActionCompleted`フラグがリセットされているか）確認します。
+/// 3. 降車先の座標が輸送ユニットから距離1の空きマスであることを確認します。
+/// 4. 輸送ユニットの `CargoCapacity` からユニットを削除し、`Transporting` コンポーネントを外します。
+/// 5. 降車ユニットの座標(`GridPosition`)を更新し、行動済み(`ActionCompleted`)にします。
+/// 6. 輸送ユニット自身も行動済み(`ActionCompleted`)にします。
 pub fn unload_unit_system(
     mut commands: Commands,
     mut unload_events: EventReader<UnloadUnitCommand>,

@@ -3,6 +3,15 @@ use crate::events::*;
 use crate::resources::*;
 use bevy_ecs::prelude::*;
 
+/// ユニットの生産コマンド(`ProduceUnitCommand`)を処理するシステム。
+///
+/// 【処理の流れ】
+/// 1. コマンドを発行したプレイヤーがアクティブプレイヤーであることを確認します。
+/// 2. ターゲット座標が自軍の生産拠点（都市または空港）であることを確認します。
+/// 3. 自軍の首都からの距離が3マス以内であることを確認します。
+/// 4. プレイヤーの資金(`funds`)が生産コスト(`cost`)以上であることを確認し、資金を消費します。
+/// 5. 新しいユニットの実体(`Entity`)をコンポーネント群と共に生成（スポーン）します。
+///    ※生産された直後は行動できないため、`HasMoved` と `ActionCompleted` を true にします。
 pub fn produce_unit_system(
     mut commands: Commands,
     mut produce_events: EventReader<ProduceUnitCommand>,

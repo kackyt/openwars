@@ -44,6 +44,17 @@ fn select_weapon(
     None
 }
 
+/// ユニットの攻撃コマンド(`AttackUnitCommand`)を処理するシステム。
+///
+/// 【処理の流れ】
+/// 1. 攻撃者が自軍か、行動済みでないか、HPが0でないかを確認します。
+/// 2. 防衛者が敵軍か、HPが0でないかを確認します。
+/// 3. `select_weapon` を使って最適な武器とダメージを決定します。
+/// 4. 射程と移動状態（間接攻撃は移動後不可）を確認します。
+/// 5. 攻撃ダメージを計算し、防衛者のHP(`Health`)を減算します。
+/// 6. 防衛者が直接攻撃の範囲内かつ反撃可能な武器を持っていれば、反撃ダメージを計算し攻撃者のHPを減算します。
+/// 7. 攻撃者の `ActionCompleted` を true にし、弾薬(`Ammo`)を消費します。
+/// 8. 結果を `UnitAttackedEvent` として発行します。
 pub fn attack_unit_system(
     mut attack_events: EventReader<AttackUnitCommand>,
     mut attacked_events: EventWriter<UnitAttackedEvent>,

@@ -3,6 +3,15 @@ use crate::events::*;
 use crate::resources::*;
 use bevy_ecs::prelude::*;
 
+/// 拠点の占領・修理コマンド(`CapturePropertyCommand`)を処理するシステム。
+///
+/// 【処理の流れ】
+/// 1. ユニットが占領能力を持ち、行動済みでないことを確認します。
+/// 2. ユニットの現在地と同じ座標にある拠点(`Property`)を取得します。
+/// 3. すでに自軍の拠点であれば、耐久値（占領ポイント）を回復（修理）します。
+/// 4. 敵軍または中立の拠点であれば、ユニットのHPに応じたアクションパワーで占領ポイントを減らします。
+/// 5. 占領ポイントが0以下になった場合、拠点の所有者を自軍に変更し、`PropertyCapturedEvent` を発行します。
+/// 6. ユニットの `ActionCompleted` を true に設定します。
 pub fn capture_property_system(
     mut capture_events: EventReader<CapturePropertyCommand>,
     mut captured_events: EventWriter<PropertyCapturedEvent>,

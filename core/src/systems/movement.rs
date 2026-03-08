@@ -299,6 +299,15 @@ pub fn find_path_a_star(
     None
 }
 
+/// ユニットの移動コマンド(`MoveUnitCommand`)を処理するシステム。
+///
+/// 【処理の流れ】
+/// 1. ユニットの現在位置(`GridPosition`)、燃料(`Fuel`)、移動力(`UnitStats`)を取得します。
+/// 2. A*アルゴリズムを用いて、目的地までの到達可能性と消費燃料・コストを計算します。
+/// 3. 移動可能であれば、位置情報を更新し、燃料を消費します。
+/// 4. ユニットの `HasMoved` フラグを true に設定します。
+/// 5. 移動先に同じプレイヤーの輸送ユニットが待機しており、積載条件を満たしていれば `LoadUnitCommand` を発行して自動積載します。
+/// 6. 移動結果を `UnitMovedEvent` として発行します。
 pub fn move_unit_system(
     mut move_events: EventReader<MoveUnitCommand>,
     mut moved_events: EventWriter<UnitMovedEvent>,
