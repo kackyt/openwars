@@ -38,7 +38,7 @@ pub fn load_unit_system(
                     *p,
                     f.0,
                     s.clone(),
-                    c.map(|cap| (cap.max, cap.loaded.clone())),
+                    c.map(|cap| (cap.max, cap.loaded.len() as u32)),
                 ),
                 _ => continue,
             };
@@ -61,8 +61,8 @@ pub fn load_unit_system(
         } // Must be on same tile to load
 
         #[allow(clippy::collapsible_if)]
-        if trans_capacity.is_some_and(|(max_cap, ref loaded)| {
-            (loaded.len() as u32) < max_cap
+        if trans_capacity.is_some_and(|(max_cap, loaded_len)| {
+            loaded_len < max_cap
                 && trans_stats
                     .loadable_unit_types
                     .contains(&unit_stats.unit_type)

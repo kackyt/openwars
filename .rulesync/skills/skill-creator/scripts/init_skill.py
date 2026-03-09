@@ -13,7 +13,12 @@ Examples:
 
 import sys
 import re
+import os
 from pathlib import Path
+
+# Add the current directory to sys.path so utils can be imported
+sys.path.insert(0, str(Path(__file__).parent.resolve()))
+from utils import validate_skill_name
 
 
 SKILL_TEMPLATE = """---
@@ -192,15 +197,6 @@ def title_case_skill_name(skill_name):
     return ' '.join(word.capitalize() for word in skill_name.split('-'))
 
 
-def validate_skill_name(name):
-    """Validate skill name format. Returns (valid, error_message)."""
-    if not re.match(r'^[a-z0-9-]+$', name):
-        return False, f"Name '{name}' should be hyphen-case (lowercase letters, digits, and hyphens only)"
-    if name.startswith('-') or name.endswith('-') or '--' in name:
-        return False, f"Name '{name}' cannot start/end with hyphen or contain consecutive hyphens"
-    if len(name) > 64:
-        return False, f"Name is too long ({len(name)} characters). Maximum is 64 characters."
-    return True, None
 
 
 def init_skill(skill_name, path):
@@ -227,7 +223,7 @@ def init_skill(skill_name, path):
     try:
         skill_dir.mkdir(parents=True, exist_ok=False)
         print(f"✅ Created skill directory: {skill_dir}")
-    except Exception as e:
+    except OSError as e:
         print(f"❌ Error creating directory: {e}")
         return None
 
@@ -242,7 +238,7 @@ def init_skill(skill_name, path):
     try:
         skill_md_path.write_text(skill_content)
         print("✅ Created SKILL.md")
-    except Exception as e:
+    except OSError as e:
         print(f"❌ Error creating SKILL.md: {e}")
         return None
 
@@ -253,7 +249,8 @@ def init_skill(skill_name, path):
         scripts_dir.mkdir(exist_ok=True)
         example_script = scripts_dir / 'example.py'
         example_script.write_text(EXAMPLE_SCRIPT.format(skill_name=skill_name))
-        example_script.chmod(0o755)
+        if os.name == 'posix':
+            example_script.chmod(0o755)
         print("✅ Created scripts/example.py")
 
         # Create references/ directory with example reference doc
@@ -269,7 +266,7 @@ def init_skill(skill_name, path):
         example_asset = assets_dir / 'example_asset.txt'
         example_asset.write_text(EXAMPLE_ASSET)
         print("✅ Created assets/example_asset.txt")
-    except Exception as e:
+    except OSError as e:
         print(f"❌ Error creating resource directories: {e}")
         return None
 
@@ -286,7 +283,7 @@ def init_skill(skill_name, path):
 def main():
     # Attempt to find the default path (.rulesync/skills in project root)
     script_path = Path(__file__).resolve()
-    # The script is in .agent/skills/skill-creator/scripts/init_skill.py
+    # The script is in .rulesync/skills/skill-creator/scripts/init_skill.py
     # Project root is 4 levels up
     project_root = script_path.parents[4]
     default_path = project_root / '.rulesync' / 'skills'
@@ -299,7 +296,7 @@ def main():
         print("  - Max 64 characters")
         print("  - Must match directory name exactly")
         print(f"\nDefault path: {default_path}")
-        print("\nExamples:")
+        print("Examples:")
         print("  init_skill.py my-new-skill")
         print(f"  init_skill.py my-api-helper --path {default_path}")
         sys.exit(1)

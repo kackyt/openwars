@@ -6,7 +6,12 @@ Quick validation script for skills - minimal version
 import sys
 import re
 import yaml
+import os
 from pathlib import Path
+
+# Add the current directory to sys.path so utils can be imported
+sys.path.insert(0, str(Path(__file__).parent.resolve()))
+from utils import validate_skill_name
 
 def validate_skill(skill_path):
     """Basic validation of a skill"""
@@ -63,18 +68,14 @@ def validate_skill(skill_path):
         return False, "Name is required and cannot be empty or whitespace"
     
     # Check naming convention (hyphen-case: lowercase with hyphens)
-    if not re.match(r'^[a-z0-9-]+$', name):
-        return False, f"Name '{name}' should be hyphen-case (lowercase letters, digits, and hyphens only)"
-    if name.startswith('-') or name.endswith('-') or '--' in name:
-        return False, f"Name '{name}' cannot start/end with hyphen or contain consecutive hyphens"
-    # Check name length (max 64 characters per spec)
-    if len(name) > 64:
-        return False, f"Name is too long ({len(name)} characters). Maximum is 64 characters."
+    valid_name, name_error = validate_skill_name(name)
+    if not valid_name:
+        return False, name_error
 
     # Extract and validate description
     description = frontmatter.get('description')
     if description is None:
-        return False, "Missing 'description' in frontmatter"
+        return False, "Description is explicitly null in frontmatter"
     if not isinstance(description, str):
         return False, f"Description must be a string, got {type(description).__name__}"
     description = description.strip()

@@ -34,16 +34,17 @@ pub fn capture_property_system(
     let active_player_id = players.0[match_state.active_player_index.0].id;
 
     for event in capture_events.read() {
-        let (pos, faction, hp, stats, mut action) = match q_units.get_mut(event.unit_entity) {
-            Ok((_, p, f, h, s, a)) => (*p, f.0, *h, s.clone(), a),
-            _ => continue,
+        let Ok((_, pos, faction, hp, stats, mut action)) = q_units.get_mut(event.unit_entity)
+        else {
+            continue;
         };
 
-        if faction != active_player_id || action.0 || hp.is_destroyed() || !stats.can_capture {
+        if faction.0 != active_player_id || action.0 || hp.is_destroyed() || !stats.can_capture {
             continue;
         }
 
         let action_power = hp.get_display_hp() * 10;
+        let pos = *pos;
         let mut captured = false;
         let mut new_owner = None;
 
@@ -245,5 +246,107 @@ mod tests {
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].x, 2);
         assert_eq!(evs[0].new_owner, Some(PlayerId(1)));
+    }
+
+    #[test]
+    fn test_victory_check_winner() {
+        let mut world = World::new();
+        let ms = MatchState {
+            current_turn_number: TurnNumber(2),
+            ..Default::default()
+        };
+        world.insert_resource(ms);
+        world.insert_resource(Players(vec![
+            Player::new(1, "P1".to_string()),
+            Player::new(2, "P2".to_string()),
+        ]));
+
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property {
+                terrain: Terrain::Capital,
+                owner_id: Some(PlayerId(1)),
+                capture_points: 200,
+            },
+        ));
+        world.spawn((
+            GridPosition { x: 1, y: 1 },
+            Faction(PlayerId(1)),
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ));
+
+        // P2 has no capital and no units -> gets eliminated
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(victory_check_system);
+        schedule.run(&mut world);
+
+        let ms = world.resource::<MatchState>();
+        assert_eq!(ms.game_over, Some(GameOverCondition::Winner(PlayerId(1))));
+    }
+
+    #[test]
+    fn test_victory_check_draw() {
+        let mut world = World::new();
+        let ms = MatchState {
+            current_turn_number: TurnNumber(2),
+            ..Default::default()
+        };
+        world.insert_resource(ms);
+        world.insert_resource(Players(vec![
+            Player::new(1, "P1".to_string()),
+            Player::new(2, "P2".to_string()),
+        ]));
+
+        // No players have units or capitals, they all get eliminated -> Draw
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(victory_check_system);
+        schedule.run(&mut world);
+
+        let ms = world.resource::<MatchState>();
+        assert_eq!(ms.game_over, Some(GameOverCondition::Draw));
+    }
+
+    #[test]
+    fn test_victory_check_turn1_exception() {
+        let mut world = World::new();
+        let ms = MatchState {
+            current_turn_number: TurnNumber(1), // Turn 1!
+            ..Default::default()
+        };
+        world.insert_resource(ms);
+        world.insert_resource(Players(vec![
+            Player::new(1, "P1".to_string()),
+            Player::new(2, "P2".to_string()),
+        ]));
+
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property {
+                terrain: Terrain::Capital,
+                owner_id: Some(PlayerId(1)),
+                capture_points: 200,
+            },
+        ));
+        world.spawn((
+            GridPosition { x: 1, y: 1 },
+            Property {
+                terrain: Terrain::Capital,
+                owner_id: Some(PlayerId(2)),
+                capture_points: 200,
+            },
+        ));
+        // No units for either player, but since it's turn 1 they shouldn't be annihilated yet!
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(victory_check_system);
+        schedule.run(&mut world);
+
+        let ms = world.resource::<MatchState>();
+        assert_eq!(ms.game_over, None); // Game should not be over yet
     }
 }

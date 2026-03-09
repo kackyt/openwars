@@ -31,7 +31,7 @@ gh pr view --json comments,reviews > pr_comments.json
 gh api repos/{owner}/{repo}/pulls/{pr_number}/comments > inline_comments.json
 
 # 2. スクリプトを実行して Markdown (suggestions.md) に変換
-# スキルの scripts ディレクトリにある parse_comments.py を実行
+# skill内のスクリプトを実行する
 python scripts/parse_comments.py pr_comments.json
 ```
 
