@@ -24,15 +24,17 @@ description: >-
 現在の環境に紐づくPRの情報をJSON形式で取得し、スクリプトで解析可能な形式に変換します。
 
 ```bash
-# 1. PRのレビューコメントと全体コメントをJSONとして書き出し
+# 1. PRのレビュー概要と全体コメントをJSONとして書き出し
 # カレントブランチのPRを対象とする場合
 gh pr view --json comments,reviews > pr_comments.json
-# インラインコメントをより確実に取得するために API も併用して取得します
-gh api repos/{owner}/{repo}/pulls/{pr_number}/comments > inline_comments.json
 
-# 2. スクリプトを実行して Markdown (suggestions.md) に変換
-# skill内のスクリプトを実行する
-python scripts/parse_comments.py pr_comments.json
+# 2. インラインコメント（個別の差分コメント）をJSONとして取得
+# PR番号を取得して実行
+gh api repos/:owner/:repo/pulls/:number/comments > inline_comments.json
+
+# 3. スクリプトを実行して Markdown (suggestions.md) に変換
+# リポジトリルートから実行する場合
+python .rulesync/skills/fix-pr-comments/scripts/parse_comments.py pr_comments.json inline_comments.json
 ```
 
 ※もしカレントブランチからPRが特定できない場合は、`gh pr status` 等を用いるか、ユーザーに対象のPR番号やURLを尋ねてください。
