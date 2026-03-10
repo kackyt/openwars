@@ -51,7 +51,7 @@ git diff <target-branch>...<source-branch> --stat
 
 ### Step 3: 統合戦略の選択
 
-判断基準は [merge-strategy.md](references/merge-strategy.md) を参照。
+判断基準は [./references/merge-strategy.md](./references/merge-strategy.md) を参照。
 
 | 状況 | 推奨戦略 |
 |------|----------|

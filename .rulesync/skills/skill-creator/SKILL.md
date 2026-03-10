@@ -79,6 +79,7 @@ Executable code (Python/Bash/etc.) for tasks that require deterministic reliabil
 - **Example**: `scripts/rotate_pdf.py` for PDF rotation tasks
 - **Benefits**: Token efficient, deterministic, may be executed without loading into context
 - **Note**: Scripts may still need to be read by Claude for patching or environment-specific adjustments
+- **Linking**: Always use relative paths when linking to scripts from `SKILL.md`, e.g., `[label](./scripts/filename.py)`. Do NOT use links inside code blocks (backticks or fenced blocks) as they will not render correctly. Instead, place the link immediately before the code block and use a descriptive placeholder (e.g., `<script_path>`) within the block. For best results, use the placeholder itself as the link label, e.g., `[<script_path>](./scripts/filename.py)`.
 
 ##### References (`references/`)
 
@@ -90,6 +91,7 @@ Documentation and reference material intended to be loaded as needed into contex
 - **Benefits**: Keeps SKILL.md lean, loaded only when Claude determines it's needed
 - **Best practice**: If files are large (>10k words), include grep search patterns in SKILL.md
 - **Avoid duplication**: Information should live in either SKILL.md or references files, not both. Prefer references files for detailed information unless it's truly core to the skill—this keeps SKILL.md lean while making information discoverable without hogging the context window. Keep only essential procedural instructions and workflow guidance in SKILL.md; move detailed reference material, schemas, and examples to references files.
+- **Linking**: Always use relative paths when linking to references from `SKILL.md`, e.g., `[label](./references/filename.md)`. Do NOT use links inside code blocks.
 
 ##### Assets (`assets/`)
 
@@ -206,9 +208,9 @@ Skill creation involves these steps:
 
 1. Understand the skill with concrete examples
 2. Plan reusable skill contents (scripts, references, assets)
-3. Initialize the skill (run init_skill.py)
+3. Initialize the skill (run [init_skill.py](./scripts/init_skill.py))
 4. Edit the skill (implement resources and write SKILL.md)
-5. Package the skill (run package_skill.py)
+5. Package the skill (run [package_skill.py](./scripts/package_skill.py))
 6. Iterate based on real usage
 
 Follow these steps in order, skipping only if there is a clear reason why they are not applicable.
@@ -260,12 +262,13 @@ At this point, it is time to actually create the skill.
 
 Skip this step only if the skill being developed already exists, and iteration or packaging is needed. In this case, continue to the next step.
 
-When creating a new skill from scratch, always run the `init_skill.py` script. The script conveniently generates a new template skill directory that automatically includes everything a skill requires, making the skill creation process much more efficient and reliable.
+When creating a new skill from scratch, always run the [init_skill.py](./scripts/init_skill.py) script. The script conveniently generates a new template skill directory that automatically includes everything a skill requires, making the skill creation process much more efficient and reliable.
 
 Usage:
 
+[<init_skill_path>](./scripts/init_skill.py)
 ```bash
-scripts/init_skill.py <skill-name> --path <output-directory>
+python <init_skill_path> <skill-name> --path <output-directory>
 ```
 
 The script:
@@ -285,8 +288,8 @@ When editing the (newly-generated or existing) skill, remember that the skill is
 
 Consult these helpful guides based on your skill's needs:
 
-- **Multi-step processes**: See references/workflows.md for sequential workflows and conditional logic
-- **Specific output formats or quality standards**: See references/output-patterns.md for template and example patterns
+- **Multi-step processes**: See [references/workflows.md](./references/workflows.md) for sequential workflows and conditional logic
+- **Specific output formats or quality standards**: See [references/output-patterns.md](./references/output-patterns.md) for template and example patterns
 
 These files contain established best practices for effective skill design.
 
@@ -322,14 +325,16 @@ Write instructions for using the skill and its bundled resources.
 
 Once development of the skill is complete, it must be packaged into a distributable .skill file that gets shared with the user. The packaging process automatically validates the skill first to ensure it meets all requirements:
 
+[<package_skill_path>](./scripts/package_skill.py)
 ```bash
-scripts/package_skill.py <path/to/skill-folder>
+python <package_skill_path> <path/to/skill-folder>
 ```
 
 Optional output directory specification:
 
+[<package_skill_path>](./scripts/package_skill.py)
 ```bash
-scripts/package_skill.py <path/to/skill-folder> ./dist
+python <package_skill_path> <path/to/skill-folder> ./dist
 ```
 
 The packaging script will:
