@@ -84,16 +84,18 @@ pub fn is_enemy_zoc(
 ) -> bool {
     let adj = map.get_adjacent(x, y);
     for &(nx, ny) in &adj {
-        if let Some(occ) = unit_positions.get(&(nx, ny)) {
-            if occ.player_id != player_id {
-                return true;
-            }
+        if unit_positions
+            .get(&(nx, ny))
+            .is_some_and(|occ| occ.player_id != player_id)
+        {
+            return true;
         }
     }
     false
 }
 
 /// 指定された地点から到達可能なすべてのタイルの座標を計算します。ZOCや燃料・移動コストも加味します。
+#[allow(clippy::too_many_arguments)]
 pub fn calculate_reachable_tiles(
     map: &Map,
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
@@ -142,10 +144,8 @@ pub fn calculate_reachable_tiles(
         position,
     }) = heap.pop()
     {
-        if let Some(&c) = min_cost.get(&position) {
-            if cost > c {
-                continue;
-            }
+        if min_cost.get(&position).is_some_and(|&c| cost > c) {
+            continue;
         }
 
         reachable.insert(position);
@@ -177,21 +177,22 @@ pub fn calculate_reachable_tiles(
                 }
             }
 
-            if let Some(terrain) = map.get_terrain(nx, ny) {
-                if let Some(terrain_cost) = get_movement_cost(movement_type, terrain) {
-                    let next_cost = cost + terrain_cost;
-                    let next_fuel = fuel_used + 1;
+            if let Some(terrain_cost) = map
+                .get_terrain(nx, ny)
+                .and_then(|t| get_movement_cost(movement_type, t))
+            {
+                let next_cost = cost + terrain_cost;
+                let next_fuel = fuel_used + 1;
 
-                    if next_cost <= max_mp && next_fuel <= max_fuel {
-                        let is_better = min_cost.get(&(nx, ny)).map_or(true, |&c| next_cost < c);
-                        if is_better {
-                            min_cost.insert((nx, ny), next_cost);
-                            heap.push(State {
-                                cost: next_cost,
-                                fuel_used: next_fuel,
-                                position: (nx, ny),
-                            });
-                        }
+                if next_cost <= max_mp && next_fuel <= max_fuel {
+                    let is_better = min_cost.get(&(nx, ny)).is_none_or(|&c| next_cost < c);
+                    if is_better {
+                        min_cost.insert((nx, ny), next_cost);
+                        heap.push(State {
+                            cost: next_cost,
+                            fuel_used: next_fuel,
+                            position: (nx, ny),
+                        });
                     }
                 }
             }
@@ -214,6 +215,8 @@ pub fn calculate_reachable_tiles(
 }
 
 /// A*アルゴリズムを用いて、目的地までの最短経路を探索し、(経路, 消費コスト, 消費燃料) を返します。
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub fn find_path_a_star(
     map: &Map,
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
@@ -297,10 +300,8 @@ pub fn find_path_a_star(
             return Some((path, cost, fuel_used));
         }
 
-        if let Some(&g) = g_score.get(&position) {
-            if cost > g {
-                continue;
-            }
+        if g_score.get(&position).is_some_and(|&g| cost > g) {
+            continue;
         }
 
         if fuel_used >= max_fuel {
@@ -331,24 +332,25 @@ pub fn find_path_a_star(
                 }
             }
 
-            if let Some(terrain) = map.get_terrain(nx, ny) {
-                if let Some(terrain_cost) = get_movement_cost(movement_type, terrain) {
-                    let next_cost = cost + terrain_cost;
-                    let next_fuel = fuel_used + 1;
+            if let Some(terrain_cost) = map
+                .get_terrain(nx, ny)
+                .and_then(|t| get_movement_cost(movement_type, t))
+            {
+                let next_cost = cost + terrain_cost;
+                let next_fuel = fuel_used + 1;
 
-                    if next_cost <= max_mp && next_fuel <= max_fuel {
-                        let is_better = g_score.get(&(nx, ny)).map_or(true, |&g| next_cost < g);
-                        if is_better {
-                            g_score.insert((nx, ny), next_cost);
-                            fuel_score.insert((nx, ny), next_fuel);
-                            came_from.insert((nx, ny), position);
-                            heap.push(AStarState {
-                                cost: next_cost,
-                                fuel_used: next_fuel,
-                                position: (nx, ny),
-                                f_score: next_cost + heuristic((nx, ny), goal),
-                            });
-                        }
+                if next_cost <= max_mp && next_fuel <= max_fuel {
+                    let is_better = g_score.get(&(nx, ny)).is_none_or(|&g| next_cost < g);
+                    if is_better {
+                        g_score.insert((nx, ny), next_cost);
+                        fuel_score.insert((nx, ny), next_fuel);
+                        came_from.insert((nx, ny), position);
+                        heap.push(AStarState {
+                            cost: next_cost,
+                            fuel_used: next_fuel,
+                            position: (nx, ny),
+                            f_score: next_cost + heuristic((nx, ny), goal),
+                        });
                     }
                 }
             }
@@ -367,6 +369,7 @@ pub fn find_path_a_star(
 /// 4. ユニットの `HasMoved` フラグを true に設定します。
 /// 5. 移動先に同じプレイヤーの輸送ユニットが待機しており、積載条件を満たしていれば `LoadUnitCommand` を発行して自動積載します。
 /// 6. 移動結果を `UnitMovedEvent` として発行します。
+#[allow(clippy::type_complexity)]
 pub fn move_unit_system(
     mut move_events: EventReader<MoveUnitCommand>,
     mut moved_events: EventWriter<UnitMovedEvent>,
@@ -472,11 +475,15 @@ pub fn move_unit_system(
         if let Some((unit_e, tx, ty, fac_id, u_type)) = load_action {
             let mut transport_entity = None;
             for (e, t_pos, _, _, f_faction, s_stats, _, _, _) in q_units.iter() {
-                if e != unit_e && t_pos.x == tx && t_pos.y == ty && f_faction.0 == fac_id {
-                    if s_stats.max_cargo > 0 && s_stats.loadable_unit_types.contains(&u_type) {
-                        transport_entity = Some(e);
-                        break;
-                    }
+                if e != unit_e
+                    && t_pos.x == tx
+                    && t_pos.y == ty
+                    && f_faction.0 == fac_id
+                    && s_stats.max_cargo > 0
+                    && s_stats.loadable_unit_types.contains(&u_type)
+                {
+                    transport_entity = Some(e);
+                    break;
                 }
             }
             if let Some(te) = transport_entity {
@@ -497,8 +504,10 @@ mod tests {
     fn test_move_unit_system() {
         let mut world = World::new();
 
-        let mut ms = MatchState::default();
-        ms.current_phase = Phase::MovementAndAttack;
+        let ms = MatchState {
+            current_phase: Phase::MovementAndAttack,
+            ..Default::default()
+        };
         world.insert_resource(ms);
         world.insert_resource(Players(vec![
             Player::new(1, "P1".to_string()),
@@ -651,7 +660,7 @@ mod tests {
         let mut schedule = Schedule::default();
         schedule.add_systems(crate::systems::turn_management::next_phase_system);
 
-        let mut advance_day = |w: &mut World, s: &mut Schedule| {
+        let advance_day = |w: &mut World, s: &mut Schedule| {
             for _ in 0..6 {
                 w.send_event(crate::events::NextPhaseCommand);
                 s.run(w);
@@ -774,8 +783,10 @@ mod tests {
             ))
             .id();
 
-        let mut ms = MatchState::default();
-        ms.current_phase = Phase::MovementAndAttack;
+        let ms = MatchState {
+            current_phase: Phase::MovementAndAttack,
+            ..Default::default()
+        };
         world.insert_resource(ms);
 
         world.send_event(MoveUnitCommand {

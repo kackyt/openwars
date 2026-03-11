@@ -14,20 +14,20 @@ fn select_weapon(
     defender_type: UnitType,
     damage_chart: &DamageChart,
 ) -> Option<(u32, u32)> {
-    if ammo1 > 0 {
-        if let Some(dmg) = damage_chart.get_base_damage(attacker_type, defender_type) {
-            if dmg > 0 {
-                return Some((1, dmg));
-            }
-        }
+    let dmg1 = damage_chart
+        .get_base_damage(attacker_type, defender_type)
+        .unwrap_or(0);
+    if ammo1 > 0 && dmg1 > 0 {
+        return Some((1, dmg1));
     }
-    if ammo2 > 0 {
-        if let Some(dmg) = damage_chart.get_base_damage_secondary(attacker_type, defender_type) {
-            if dmg > 0 {
-                return Some((2, dmg));
-            }
-        }
+
+    let dmg2 = damage_chart
+        .get_base_damage_secondary(attacker_type, defender_type)
+        .unwrap_or(0);
+    if ammo2 > 0 && dmg2 > 0 {
+        return Some((2, dmg2));
     }
+
     None
 }
 
@@ -42,6 +42,8 @@ fn select_weapon(
 /// 6. 防衛者が直接攻撃の範囲内かつ反撃可能な武器を持っていれば、反撃ダメージを計算し攻撃者のHPを減算します。
 /// 7. 攻撃者の `ActionCompleted` を true にし、弾薬(`Ammo`)を消費します。
 /// 8. 結果を `UnitAttackedEvent` として発行します。
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 pub fn attack_unit_system(
     mut attack_events: EventReader<AttackUnitCommand>,
     mut attacked_events: EventWriter<UnitAttackedEvent>,
@@ -79,14 +81,14 @@ pub fn attack_unit_system(
             attacker_hp,
         ) = match q_units.get(event.attacker_entity) {
             Ok((_, hp, Some(ammo), pos, fac, stats, Some(act), Some(mov))) => (
-                pos.clone(),
+                *pos,
                 fac.0,
                 stats.clone(),
                 act.0,
                 mov.0,
                 ammo.ammo1,
                 ammo.ammo2,
-                hp.clone(),
+                *hp,
             ),
             _ => continue,
         };
@@ -99,7 +101,7 @@ pub fn attack_unit_system(
             match q_units.get(event.defender_entity) {
                 Ok((_, hp, ammo, pos, fac, stats, _, _)) => {
                     let ammo_vals = ammo.map(|a| (a.ammo1, a.ammo2));
-                    (pos.clone(), fac.0, stats.clone(), hp.clone(), ammo_vals)
+                    (*pos, fac.0, stats.clone(), *hp, ammo_vals)
                 }
                 _ => continue,
             };
@@ -152,31 +154,30 @@ pub fn attack_unit_system(
         let mut d_damage_opt = None;
         let mut counter_info = None;
 
-        let mut def_hp_post = defender_hp.clone();
+        let mut def_hp_post = defender_hp;
         def_hp_post.damage(a_damage);
 
         if do_counter && !def_hp_post.is_destroyed() {
-            if let Some((def_ammo1, def_ammo2)) = def_ammo_opt {
-                counter_info = select_weapon(
-                    def_ammo1,
-                    def_ammo2,
-                    defender_stats.unit_type,
-                    attacker_stats.unit_type,
-                    &damage_chart,
-                );
-                if let Some((_, d_base)) = counter_info {
-                    let d_advantage_damage = (d_base as f64 * 1.05) as u32;
-                    let d_damage_base = d_advantage_damage * def_hp_post.get_display_hp() / 10;
+            let (def_ammo1, def_ammo2) = def_ammo_opt.unwrap_or((0, 0));
+            counter_info = select_weapon(
+                def_ammo1,
+                def_ammo2,
+                defender_stats.unit_type,
+                attacker_stats.unit_type,
+                &damage_chart,
+            );
+            if let Some((_, d_base)) = counter_info {
+                let d_advantage_damage = (d_base as f64 * 1.05) as u32;
+                let d_damage_base = d_advantage_damage * def_hp_post.get_display_hp() / 10;
 
-                    let att_terrain = map
-                        .get_terrain(attacker_pos.x, attacker_pos.y)
-                        .unwrap_or(Terrain::Plains);
-                    let att_terrain_stars = att_terrain.defense_stars();
-                    let d_defense_reduction = att_terrain_stars * attacker_hp.get_display_hp();
+                let att_terrain = map
+                    .get_terrain(attacker_pos.x, attacker_pos.y)
+                    .unwrap_or(Terrain::Plains);
+                let att_terrain_stars = att_terrain.defense_stars();
+                let d_defense_reduction = att_terrain_stars * attacker_hp.get_display_hp();
 
-                    let d_damage_reduced = d_damage_base.saturating_sub(d_defense_reduction);
-                    d_damage_opt = Some(d_damage_reduced + rng.next_bonus());
-                }
+                let d_damage_reduced = d_damage_base.saturating_sub(d_defense_reduction);
+                d_damage_opt = Some(d_damage_reduced + rng.next_bonus());
             }
         }
 
@@ -199,13 +200,11 @@ pub fn attack_unit_system(
             }
 
             defender.1.damage(a_damage);
-            if let Some((d_slot, _)) = counter_info {
-                if let Some(ref mut def_ammo) = defender.2 {
-                    if d_slot == 1 {
-                        def_ammo.ammo1 = def_ammo.ammo1.saturating_sub(1);
-                    } else {
-                        def_ammo.ammo2 = def_ammo.ammo2.saturating_sub(1);
-                    }
+            if let (Some((d_slot, _)), Some(def_ammo)) = (counter_info, defender.2.as_deref_mut()) {
+                if d_slot == 1 {
+                    def_ammo.ammo1 = def_ammo.ammo1.saturating_sub(1);
+                } else {
+                    def_ammo.ammo2 = def_ammo.ammo2.saturating_sub(1);
                 }
             }
         }
@@ -227,8 +226,10 @@ mod tests {
     fn test_attack_unit_system() {
         let mut world = World::new();
 
-        let mut match_state = MatchState::default();
-        match_state.current_phase = Phase::MovementAndAttack;
+        let match_state = MatchState {
+            current_phase: Phase::MovementAndAttack,
+            ..Default::default()
+        };
         world.insert_resource(match_state);
         world.insert_resource(Players(vec![
             Player::new(1, "P1".to_string()),
