@@ -20,6 +20,12 @@ pub struct CapturePropertyCommand {
 }
 
 #[derive(Event, Debug, Clone)]
+pub struct MergeUnitCommand {
+    pub source_entity: Entity,
+    pub target_entity: Entity,
+}
+
+#[derive(Event, Debug, Clone)]
 pub struct ProduceUnitCommand {
     pub player_id: PlayerId,
     pub target_x: usize,
@@ -71,6 +77,13 @@ pub struct UnitAttackedEvent {
 #[derive(Event, Debug, Clone)]
 pub struct UnitDestroyedEvent {
     pub entity: Entity,
+}
+
+#[derive(Event, Debug, Clone)]
+pub struct UnitMergedEvent {
+    pub source_entity: Entity,
+    pub target_entity: Entity,
+    pub refunded_funds: u32,
 }
 
 #[derive(Event, Debug, Clone)]

@@ -1,4 +1,5 @@
 pub mod combat;
+pub mod merge;
 pub mod movement;
 pub mod production;
 pub mod property;
@@ -7,6 +8,7 @@ pub mod transport;
 pub mod turn_management;
 
 pub use combat::*;
+pub use merge::*;
 pub use movement::*;
 pub use production::*;
 pub use property::*;
