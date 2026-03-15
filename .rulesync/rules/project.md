@@ -109,7 +109,7 @@ coreクレートにはECS(Entity Component System)を採用する
 
 openwars/
 ├── Cargo.toml               # ワークスペース全体の定義
-├── core/                    # 【コア】ECSを採用したゲームロジック
+├── engine/                    # 【コア】ECSを採用したゲームロジック
 │   ├── Cargo.toml
 │   └── src/
 │       ├── components/      # エンティティ、値オブジェクト、リポジトリのtrait
@@ -117,21 +117,20 @@ openwars/
 │       ├── events/          # イベント (uiへの通知)
 │       ├── resources/       # リソース (マスターデータ等)
 │       └── lib.rs
-├── apps/
-│   ├── cli/                 # 【プレゼン層 1】CUIアプリケーション
-│   │   ├── Cargo.toml       # coreクレートに依存
-│   │   └── src/
-│   │       └── main.rs      # clap等を使ったコマンドライン入力の処理
-│   └── gui/                 # 【プレゼン層 2】Tauriアプリケーション
-│       ├── Cargo.toml       # coreクレートに依存
-│       ├── src-tauri/       # Tauriのバックエンド（Rust）
-│       │   ├── src/
-│       │   │   ├── main.rs  # tauriのセットアップ、DIの注入
-│       │   │   └── cmd.rs   # tauri::command群（コントローラーの役割）
-│       │   └── tauri.conf.json
-│       └── src/             # Tauriのフロントエンド（TypeScript / React / Vue など）
+├── cli/                 # 【プレゼン層 1】CUIアプリケーション
+│   ├── Cargo.toml       # engineクレートに依存
+│   └── src/
+│       └── main.rs      # clap,ncurses等を使ったコマンドライン入力の処理
+├── gui/                 # 【プレゼン層 2】Tauriアプリケーション
+│   ├── Cargo.toml       # engineクレートに依存
+│   ├── src-tauri/       # Tauriのバックエンド（Rust）
+│   │   ├── src/
+│   │   │   ├── main.rs  # tauriのセットアップ、DIの注入
+│   │   │   └── cmd.rs   # tauri::command群（コントローラーの役割）
+│   │   └── tauri.conf.json
+│   └── src/             # Tauriのフロントエンド（TypeScript / React / Vue など）
 
-### coreクレートの構成
+### engineクレートの構成
 #### Components に実装すべきもの
 「ゲームの盤面を再現するために最低限必要なデータ」に絞ります。描画用の Sprite や Transform (Bevyの場合) は含めず、純粋な座標やステータスを持たせます。カテゴリコンポーネント例役割位置・配置GridPosition(x, y)マップ上のセル座標。属性・所有Faction(u32), UnitType勢力ID、ユニットの種類（歩兵、戦車など）。ステータスHealth, ActionPointsHP、残り行動回数、移動力など。能力値AttackStat, DefenseStat攻撃力、防御力、射程などの静的/動的パラメータ。状態フラグIsExhausted, IsCapturing行動済みフラグ、占領中フラグなど。
 
