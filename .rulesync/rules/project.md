@@ -14,16 +14,7 @@ Rustを使用して開発します。
 - Rust
 - cargo
 - anyhow
-- flatbuffers
-- iced
-
-# ディレクトリ構成
-
-- app (一人麻雀アプリ)
-- browser-app (Tauriを使ったネイティブアプリ)
-- loadlibrary (Windows dllを読み込むcrate)
-- mahjong-app-engine (麻雀基盤)
-  - ai_dll (d
+- bevy_ecs
 
 ## Project Conventions
 
