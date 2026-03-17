@@ -56,42 +56,42 @@ pub fn merge_unit_system(
                 t_faction,
                 t_pos,
             )) = q_units.get_mut(event.target_entity)
+        {
+            // Validate merge conditions
+            if s_entity == t_entity
+                || s_fac != t_faction.0
+                || s_type != t_stats.unit_type
+                || s_pos.x != t_pos.x
+                || s_pos.y != t_pos.y
             {
-                // Validate merge conditions
-                if s_entity == t_entity
-                    || s_fac != t_faction.0
-                    || s_type != t_stats.unit_type
-                    || s_pos.x != t_pos.x
-                    || s_pos.y != t_pos.y
-                {
-                    continue;
-                }
-
-                // Perform merge
-                t_health.current = std::cmp::min(100, t_health.current + s_hp);
-                t_fuel.current = std::cmp::min(t_fuel.max, t_fuel.current + s_fuel_val);
-                t_ammo.ammo1 = std::cmp::min(t_ammo.max_ammo1, t_ammo.ammo1 + s_ammo1_val);
-                t_ammo.ammo2 = std::cmp::min(t_ammo.max_ammo2, t_ammo.ammo2 + s_ammo2_val);
-
-                t_action.0 = true;
-
-                commands.entity(s_entity).despawn();
-
-                merged_events.send(UnitMergedEvent {
-                    source_entity: s_entity,
-                    target_entity: t_entity,
-                    refunded_funds: 0, // refund logic removed per spec update
-                });
-
-                destroyed_events.send(UnitDestroyedEvent { entity: s_entity });
+                continue;
             }
+
+            // Perform merge
+            t_health.current = std::cmp::min(100, t_health.current + s_hp);
+            t_fuel.current = std::cmp::min(t_fuel.max, t_fuel.current + s_fuel_val);
+            t_ammo.ammo1 = std::cmp::min(t_ammo.max_ammo1, t_ammo.ammo1 + s_ammo1_val);
+            t_ammo.ammo2 = std::cmp::min(t_ammo.max_ammo2, t_ammo.ammo2 + s_ammo2_val);
+
+            t_action.0 = true;
+
+            commands.entity(s_entity).despawn();
+
+            merged_events.send(UnitMergedEvent {
+                source_entity: s_entity,
+                target_entity: t_entity,
+                refunded_funds: 0, // refund logic removed per spec update
+            });
+
+            destroyed_events.send(UnitDestroyedEvent { entity: s_entity });
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use crate::events::*;
     use crate::resources::*;
 

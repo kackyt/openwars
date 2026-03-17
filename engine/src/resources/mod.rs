@@ -1,7 +1,7 @@
 pub mod master_data;
 
-use bevy_ecs::prelude::*;
 use crate::components::PlayerId;
+use bevy_ecs::prelude::*;
 
 pub fn init_master_data(world: &mut World) {
     let registry = master_data::MasterDataRegistry::load().expect("Failed to load master data");
@@ -37,7 +37,6 @@ impl GameRng {
         ((self.seed >> 33) % 11) as u32
     }
 }
-use bevy_ecs::prelude::*;
 use std::collections::HashMap;
 
 #[derive(Debug, thiserror::Error)]

@@ -2,10 +2,29 @@ use bevy_ecs::prelude::Resource;
 use serde::Deserialize;
 use std::collections::HashMap;
 
+/// マスターデータ読み込み時の専用エラー型
+#[derive(thiserror::Error, Debug)]
+pub enum MasterDataError {
+    #[error("CSVパーサーエラー: {0}")]
+    CsvError(#[from] csv::Error),
+    #[error("数値パースエラー: {0}")]
+    ParseError(#[from] std::num::ParseIntError),
+    #[error("不明なマスターデータ読み込みエラー")]
+    Unknown,
+}
+
+/// ユニットや武器などを識別するための名前のNewtype
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct UnitName(pub String);
+
+/// 地形を識別するためのIDのNewtype
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+pub struct LandscapeId(pub u32);
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct LandscapeRecord {
     #[serde(rename = "ID")]
-    pub id: u32,
+    pub id: LandscapeId,
     #[serde(rename = "名前")]
     pub name: String,
     #[serde(rename = "耐久度")]
@@ -21,7 +40,7 @@ pub struct LandscapeRecord {
 #[derive(Debug, Clone, Deserialize)]
 pub struct UnitRecord {
     #[serde(rename = "名前")]
-    pub name: String,
+    pub name: UnitName,
     #[serde(rename = "コスト")]
     pub cost: u32,
     #[serde(rename = "移動力")]
@@ -38,7 +57,7 @@ pub struct UnitRecord {
 
 #[derive(Debug, Clone)]
 pub struct WeaponRecord {
-    pub name: String,
+    pub name: UnitName,
     pub ammo: u32,
     pub supply_cost: u32,
     pub range_min: u32,
@@ -91,10 +110,10 @@ impl MapData {
 
 #[derive(Resource, Debug, Clone, Default)]
 pub struct MasterDataRegistry {
-    pub landscapes: HashMap<u32, LandscapeRecord>,
-    pub landscapes_by_name: HashMap<String, u32>,
-    pub units: HashMap<String, UnitRecord>,
-    pub weapons: HashMap<String, WeaponRecord>,
+    pub landscapes: HashMap<LandscapeId, LandscapeRecord>,
+    pub landscapes_by_name: HashMap<String, LandscapeId>,
+    pub units: HashMap<UnitName, UnitRecord>,
+    pub weapons: HashMap<UnitName, WeaponRecord>,
     pub movements: HashMap<String, MovementRecord>,
     pub loads: HashMap<String, Vec<LoadRecord>>,
     pub maps: HashMap<String, MapData>,
@@ -105,19 +124,23 @@ impl MasterDataRegistry {
         Self::default()
     }
 
-    pub fn load() -> Result<Self, anyhow::Error> {
+    pub fn load() -> Result<Self, MasterDataError> {
         let mut registry = Self::default();
 
-        // Load Landscape
+        // 1. 地形(Landscape)データ読み込み
+        // マップセルや効果計算に使用される地形の基本パラメータを登録します。
         let landscape_csv = include_str!("master_data/landscape.csv");
         let mut rdr = csv::Reader::from_reader(landscape_csv.as_bytes());
         for result in rdr.deserialize() {
             let record: LandscapeRecord = result?;
-            registry.landscapes_by_name.insert(record.name.clone(), record.id);
+            registry
+                .landscapes_by_name
+                .insert(record.name.clone(), record.id);
             registry.landscapes.insert(record.id, record);
         }
 
-        // Load Unit
+        // 2. ユニット(Unit)データ読み込み
+        // ユニットのコスト、移動力、搭載武器などの基礎特性を登録します。
         let unit_csv = include_str!("master_data/unit.csv");
         let mut rdr = csv::Reader::from_reader(unit_csv.as_bytes());
         for result in rdr.deserialize() {
@@ -125,7 +148,9 @@ impl MasterDataRegistry {
             registry.units.insert(record.name.clone(), record);
         }
 
-        // Load Weapon
+        // 3. 武器(Weapon)・ダメージデータ読み込み
+        // 武器毎のベーススタッツと、各防御ユニットへの可変長ダメージテーブルを解析します。
+        // csvクレートの #[serde(flatten)] サポート制約を回避するため手動でパースします。
         let weapon_csv = include_str!("master_data/weapon.csv");
         let mut rdr = csv::Reader::from_reader(weapon_csv.as_bytes());
         let headers = rdr.headers()?.clone();
@@ -140,7 +165,7 @@ impl MasterDataRegistry {
                 }
             }
             let weapon = WeaponRecord {
-                name: record.get(0).unwrap_or("").to_string(),
+                name: UnitName(record.get(0).unwrap_or("").to_string()),
                 ammo: record.get(1).unwrap_or("0").parse().unwrap_or(0),
                 supply_cost: record.get(2).unwrap_or("0").parse().unwrap_or(0),
                 range_min: record.get(3).unwrap_or("0").parse().unwrap_or(0),
@@ -150,7 +175,8 @@ impl MasterDataRegistry {
             registry.weapons.insert(weapon.name.clone(), weapon);
         }
 
-        // Load Movement
+        // 4. 移動コスト(Movement)データ読み込み
+        // 移動タイプごとの地形進入コストを抽出します。
         let movement_csv = include_str!("master_data/movement.csv");
         let mut rdr = csv::Reader::from_reader(movement_csv.as_bytes());
         let headers = rdr.headers()?.clone();
@@ -168,29 +194,39 @@ impl MasterDataRegistry {
                 movement_type: record.get(0).unwrap_or("").to_string(),
                 terrain_costs,
             };
-            registry.movements.insert(movement.movement_type.clone(), movement);
+            registry
+                .movements
+                .insert(movement.movement_type.clone(), movement);
         }
 
-        // Load Load
+        // 5. 搭載(Load)データ読み込み
+        // どの輸送ユニットがどのユニットを何体搭載できるかの制約を登録します。
         let load_csv = include_str!("master_data/load.csv");
         let mut rdr = csv::Reader::from_reader(load_csv.as_bytes());
         for result in rdr.deserialize() {
             let record: LoadRecord = result?;
-            registry.loads.entry(record.transport.clone()).or_default().push(record);
+            registry
+                .loads
+                .entry(record.transport.clone())
+                .or_default()
+                .push(record);
         }
 
-        // Load maps
+        // 6. マップ初期配置データ読み込み
+        // プレイヤーIDと地形IDが結合された数値を MapData としてパースします。
         let map_1_csv = include_str!("master_data/map/map_1.csv");
-        registry.maps.insert("map_1".to_string(), parse_map(map_1_csv)?);
+        registry
+            .maps
+            .insert("map_1".to_string(), parse_map(map_1_csv)?);
 
         Ok(registry)
     }
 
-    pub fn get_unit(&self, name: &str) -> Option<&UnitRecord> {
+    pub fn get_unit(&self, name: &UnitName) -> Option<&UnitRecord> {
         self.units.get(name)
     }
 
-    pub fn get_landscape(&self, id: u32) -> Option<&LandscapeRecord> {
+    pub fn get_landscape(&self, id: LandscapeId) -> Option<&LandscapeRecord> {
         self.landscapes.get(&id)
     }
 
@@ -205,7 +241,7 @@ impl MasterDataRegistry {
         cost_str.parse::<u32>().ok()
     }
 
-    pub fn get_damage(&self, weapon_name: &str, defender_name: &str) -> Option<u32> {
+    pub fn get_damage(&self, weapon_name: &UnitName, defender_name: &str) -> Option<u32> {
         let weapon = self.weapons.get(weapon_name)?;
         let damage_str = weapon.damages.get(defender_name)?;
         damage_str.parse::<u32>().ok()
@@ -216,12 +252,12 @@ impl MasterDataRegistry {
     }
 }
 
-fn parse_map(csv_data: &str) -> Result<MapData, anyhow::Error> {
+fn parse_map(csv_data: &str) -> Result<MapData, MasterDataError> {
     let mut cells = Vec::new();
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(false)
         .from_reader(csv_data.as_bytes());
-    
+
     let mut width = 0;
     for result in rdr.records() {
         let record = result?;
@@ -235,7 +271,7 @@ fn parse_map(csv_data: &str) -> Result<MapData, anyhow::Error> {
         }
         cells.push(row);
     }
-    
+
     Ok(MapData {
         width,
         height: cells.len(),
@@ -250,23 +286,29 @@ mod tests {
     #[test]
     fn test_load_landscape() {
         let registry = MasterDataRegistry::load().expect("Failed to load master data");
-        
-        let capital = registry.get_landscape_by_name("首都").expect("Capital not found");
-        assert_eq!(capital.id, 1);
+
+        let capital = registry
+            .get_landscape_by_name("首都")
+            .expect("Capital not found");
+        assert_eq!(capital.id, LandscapeId(1));
         assert_eq!(capital.durability, 400);
         assert_eq!(capital.defense_bonus, 50);
         assert_eq!(capital.supply_type.as_deref(), Some("地上部隊"));
         assert_eq!(capital.income, Some(4000));
 
-        let road = registry.get_landscape_by_name("道路").expect("Road not found");
+        let road = registry
+            .get_landscape_by_name("道路")
+            .expect("Road not found");
         assert_eq!(road.income, None);
     }
 
     #[test]
     fn test_load_unit() {
         let registry = MasterDataRegistry::load().unwrap();
-        
-        let tank = registry.get_unit("重戦車").expect("Heavy Tank not found");
+
+        let tank = registry
+            .get_unit(&UnitName("重戦車".to_string()))
+            .expect("Heavy Tank not found");
         assert_eq!(tank.cost, 28000);
         assert_eq!(tank.movement, 4);
         assert_eq!(tank.movement_type, "戦車");
@@ -277,18 +319,18 @@ mod tests {
     #[test]
     fn test_load_weapon_and_damage() {
         let registry = MasterDataRegistry::load().unwrap();
-        
-        let dmg = registry.get_damage("戦車砲S", "重戦車");
+
+        let dmg = registry.get_damage(&UnitName("戦車砲S".to_string()), "重戦車");
         assert_eq!(dmg, Some(47));
 
-        let cant_atk = registry.get_damage("地対空ミサイルA", "軽歩兵");
+        let cant_atk = registry.get_damage(&UnitName("地対空ミサイルA".to_string()), "軽歩兵");
         assert_eq!(cant_atk, None);
     }
 
     #[test]
     fn test_load_movement() {
         let registry = MasterDataRegistry::load().unwrap();
-        
+
         // 歩兵 in 森 should be 2
         assert_eq!(registry.get_movement_cost("歩兵", "森"), Some(2));
         // 戦車 in 山 should be 99
@@ -315,7 +357,7 @@ mod tests {
         let cell = map.get_cell(1, 7).unwrap();
         assert_eq!(cell.player_id, 2);
         assert_eq!(cell.terrain_id, 2);
-        
+
         // Cell (3, 11) is (x=3, y=11) -> 201 -> player 2, terrain 1 (首都)
         let cell_capital = map.get_cell(3, 11).unwrap();
         assert_eq!(cell_capital.player_id, 2);
