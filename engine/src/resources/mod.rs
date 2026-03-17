@@ -1,4 +1,12 @@
+pub mod master_data;
+
+use bevy_ecs::prelude::*;
 use crate::components::PlayerId;
+
+pub fn init_master_data(world: &mut World) {
+    let registry = master_data::MasterDataRegistry::load().expect("Failed to load master data");
+    world.insert_resource(registry);
+}
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::SystemTime;

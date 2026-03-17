@@ -1,0 +1,324 @@
+use bevy_ecs::prelude::Resource;
+use serde::Deserialize;
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LandscapeRecord {
+    #[serde(rename = "ID")]
+    pub id: u32,
+    #[serde(rename = "名前")]
+    pub name: String,
+    #[serde(rename = "耐久度")]
+    pub durability: u32,
+    #[serde(rename = "地形効果")]
+    pub defense_bonus: u32,
+    #[serde(rename = "補給補充")]
+    pub supply_type: Option<String>,
+    #[serde(rename = "収入")]
+    pub income: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UnitRecord {
+    #[serde(rename = "名前")]
+    pub name: String,
+    #[serde(rename = "コスト")]
+    pub cost: u32,
+    #[serde(rename = "移動力")]
+    pub movement: u32,
+    #[serde(rename = "移動タイプ")]
+    pub movement_type: String,
+    #[serde(rename = "燃料")]
+    pub fuel: u32,
+    #[serde(rename = "武器1")]
+    pub weapon1: Option<String>,
+    #[serde(rename = "武器2")]
+    pub weapon2: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WeaponRecord {
+    pub name: String,
+    pub ammo: u32,
+    pub supply_cost: u32,
+    pub range_min: u32,
+    pub range_max: u32,
+    pub damages: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MovementRecord {
+    pub movement_type: String,
+    pub terrain_costs: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoadRecord {
+    #[serde(rename = "輸送ユニット")]
+    pub transport: String,
+    #[serde(rename = "搭載可能ユニット")]
+    pub target: String,
+    #[serde(rename = "最大搭載数")]
+    pub capacity: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct MapCell {
+    pub player_id: u32,
+    pub terrain_id: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct MapData {
+    pub width: usize,
+    pub height: usize,
+    pub cells: Vec<Vec<u32>>,
+}
+
+impl MapData {
+    pub fn get_cell(&self, x: usize, y: usize) -> Option<MapCell> {
+        if y < self.height && x < self.width {
+            let val = self.cells[y][x];
+            Some(MapCell {
+                player_id: val / 100,
+                terrain_id: val % 100,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Resource, Debug, Clone, Default)]
+pub struct MasterDataRegistry {
+    pub landscapes: HashMap<u32, LandscapeRecord>,
+    pub landscapes_by_name: HashMap<String, u32>,
+    pub units: HashMap<String, UnitRecord>,
+    pub weapons: HashMap<String, WeaponRecord>,
+    pub movements: HashMap<String, MovementRecord>,
+    pub loads: HashMap<String, Vec<LoadRecord>>,
+    pub maps: HashMap<String, MapData>,
+}
+
+impl MasterDataRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn load() -> Result<Self, anyhow::Error> {
+        let mut registry = Self::default();
+
+        // Load Landscape
+        let landscape_csv = include_str!("master_data/landscape.csv");
+        let mut rdr = csv::Reader::from_reader(landscape_csv.as_bytes());
+        for result in rdr.deserialize() {
+            let record: LandscapeRecord = result?;
+            registry.landscapes_by_name.insert(record.name.clone(), record.id);
+            registry.landscapes.insert(record.id, record);
+        }
+
+        // Load Unit
+        let unit_csv = include_str!("master_data/unit.csv");
+        let mut rdr = csv::Reader::from_reader(unit_csv.as_bytes());
+        for result in rdr.deserialize() {
+            let record: UnitRecord = result?;
+            registry.units.insert(record.name.clone(), record);
+        }
+
+        // Load Weapon
+        let weapon_csv = include_str!("master_data/weapon.csv");
+        let mut rdr = csv::Reader::from_reader(weapon_csv.as_bytes());
+        let headers = rdr.headers()?.clone();
+        for result in rdr.records() {
+            let record = result?;
+            let mut damages = HashMap::new();
+            for (i, field) in record.iter().enumerate().skip(5) {
+                if let Some(header) = headers.get(i) {
+                    if !header.is_empty() {
+                        damages.insert(header.to_string(), field.to_string());
+                    }
+                }
+            }
+            let weapon = WeaponRecord {
+                name: record.get(0).unwrap_or("").to_string(),
+                ammo: record.get(1).unwrap_or("0").parse().unwrap_or(0),
+                supply_cost: record.get(2).unwrap_or("0").parse().unwrap_or(0),
+                range_min: record.get(3).unwrap_or("0").parse().unwrap_or(0),
+                range_max: record.get(4).unwrap_or("0").parse().unwrap_or(0),
+                damages,
+            };
+            registry.weapons.insert(weapon.name.clone(), weapon);
+        }
+
+        // Load Movement
+        let movement_csv = include_str!("master_data/movement.csv");
+        let mut rdr = csv::Reader::from_reader(movement_csv.as_bytes());
+        let headers = rdr.headers()?.clone();
+        for result in rdr.records() {
+            let record = result?;
+            let mut terrain_costs = HashMap::new();
+            for (i, field) in record.iter().enumerate().skip(1) {
+                if let Some(header) = headers.get(i) {
+                    if !header.is_empty() {
+                        terrain_costs.insert(header.to_string(), field.to_string());
+                    }
+                }
+            }
+            let movement = MovementRecord {
+                movement_type: record.get(0).unwrap_or("").to_string(),
+                terrain_costs,
+            };
+            registry.movements.insert(movement.movement_type.clone(), movement);
+        }
+
+        // Load Load
+        let load_csv = include_str!("master_data/load.csv");
+        let mut rdr = csv::Reader::from_reader(load_csv.as_bytes());
+        for result in rdr.deserialize() {
+            let record: LoadRecord = result?;
+            registry.loads.entry(record.transport.clone()).or_default().push(record);
+        }
+
+        // Load maps
+        let map_1_csv = include_str!("master_data/map/map_1.csv");
+        registry.maps.insert("map_1".to_string(), parse_map(map_1_csv)?);
+
+        Ok(registry)
+    }
+
+    pub fn get_unit(&self, name: &str) -> Option<&UnitRecord> {
+        self.units.get(name)
+    }
+
+    pub fn get_landscape(&self, id: u32) -> Option<&LandscapeRecord> {
+        self.landscapes.get(&id)
+    }
+
+    pub fn get_landscape_by_name(&self, name: &str) -> Option<&LandscapeRecord> {
+        let id = self.landscapes_by_name.get(name)?;
+        self.landscapes.get(id)
+    }
+
+    pub fn get_movement_cost(&self, target_movement_type: &str, terrain_name: &str) -> Option<u32> {
+        let movement = self.movements.get(target_movement_type)?;
+        let cost_str = movement.terrain_costs.get(terrain_name)?;
+        cost_str.parse::<u32>().ok()
+    }
+
+    pub fn get_damage(&self, weapon_name: &str, defender_name: &str) -> Option<u32> {
+        let weapon = self.weapons.get(weapon_name)?;
+        let damage_str = weapon.damages.get(defender_name)?;
+        damage_str.parse::<u32>().ok()
+    }
+
+    pub fn get_map(&self, map_name: &str) -> Option<&MapData> {
+        self.maps.get(map_name)
+    }
+}
+
+fn parse_map(csv_data: &str) -> Result<MapData, anyhow::Error> {
+    let mut cells = Vec::new();
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_reader(csv_data.as_bytes());
+    
+    let mut width = 0;
+    for result in rdr.records() {
+        let record = result?;
+        let mut row = Vec::new();
+        for field in record.iter() {
+            let val: u32 = field.trim().parse()?;
+            row.push(val);
+        }
+        if width == 0 {
+            width = row.len();
+        }
+        cells.push(row);
+    }
+    
+    Ok(MapData {
+        width,
+        height: cells.len(),
+        cells,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_load_landscape() {
+        let registry = MasterDataRegistry::load().expect("Failed to load master data");
+        
+        let capital = registry.get_landscape_by_name("首都").expect("Capital not found");
+        assert_eq!(capital.id, 1);
+        assert_eq!(capital.durability, 400);
+        assert_eq!(capital.defense_bonus, 50);
+        assert_eq!(capital.supply_type.as_deref(), Some("地上部隊"));
+        assert_eq!(capital.income, Some(4000));
+
+        let road = registry.get_landscape_by_name("道路").expect("Road not found");
+        assert_eq!(road.income, None);
+    }
+
+    #[test]
+    fn test_load_unit() {
+        let registry = MasterDataRegistry::load().unwrap();
+        
+        let tank = registry.get_unit("重戦車").expect("Heavy Tank not found");
+        assert_eq!(tank.cost, 28000);
+        assert_eq!(tank.movement, 4);
+        assert_eq!(tank.movement_type, "戦車");
+        assert_eq!(tank.weapon1.as_deref(), Some("戦車砲S"));
+        assert_eq!(tank.weapon2.as_deref(), Some("機銃S"));
+    }
+
+    #[test]
+    fn test_load_weapon_and_damage() {
+        let registry = MasterDataRegistry::load().unwrap();
+        
+        let dmg = registry.get_damage("戦車砲S", "重戦車");
+        assert_eq!(dmg, Some(47));
+
+        let cant_atk = registry.get_damage("地対空ミサイルA", "軽歩兵");
+        assert_eq!(cant_atk, None);
+    }
+
+    #[test]
+    fn test_load_movement() {
+        let registry = MasterDataRegistry::load().unwrap();
+        
+        // 歩兵 in 森 should be 2
+        assert_eq!(registry.get_movement_cost("歩兵", "森"), Some(2));
+        // 戦車 in 山 should be 99
+        assert_eq!(registry.get_movement_cost("戦車", "山"), Some(99));
+    }
+
+    #[test]
+    fn test_load_map() {
+        let registry = MasterDataRegistry::load().unwrap();
+        let map = registry.get_map("map_1").expect("map_1 not found");
+
+        assert_eq!(map.width, 10);
+        assert_eq!(map.height, 14);
+
+        // Check decoding at specific known coordinates from the csv output we saw
+        // Cell (0, 0) was '12' -> player 0, terrain 12 (海)
+        let cell_0_0 = map.get_cell(0, 0).unwrap();
+        assert_eq!(cell_0_0.player_id, 0);
+        assert_eq!(cell_0_0.terrain_id, 12);
+
+        // Cell (1, 7) was '202' -> player 2, terrain 2 (都市)
+        // Wait, cell (1, 7) meaning y=7 (row 8), x=1
+        // Let's verify (1, 7)
+        let cell = map.get_cell(1, 7).unwrap();
+        assert_eq!(cell.player_id, 2);
+        assert_eq!(cell.terrain_id, 2);
+        
+        // Cell (3, 11) is (x=3, y=11) -> 201 -> player 2, terrain 1 (首都)
+        let cell_capital = map.get_cell(3, 11).unwrap();
+        assert_eq!(cell_capital.player_id, 2);
+        assert_eq!(cell_capital.terrain_id, 1);
+    }
+}
