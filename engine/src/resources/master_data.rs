@@ -159,9 +159,10 @@ impl MasterDataRegistry {
             let mut damages = HashMap::new();
             for (i, field) in record.iter().enumerate().skip(5) {
                 if let Some(header) = headers.get(i)
-                    && !header.is_empty() {
-                        damages.insert(header.to_string(), field.to_string());
-                    }
+                    && !header.is_empty()
+                {
+                    damages.insert(header.to_string(), field.to_string());
+                }
             }
             let weapon = WeaponRecord {
                 name: UnitName(record.get(0).unwrap_or("").to_string()),
@@ -184,9 +185,10 @@ impl MasterDataRegistry {
             let mut terrain_costs = HashMap::new();
             for (i, field) in record.iter().enumerate().skip(1) {
                 if let Some(header) = headers.get(i)
-                    && !header.is_empty() {
-                        terrain_costs.insert(header.to_string(), field.to_string());
-                    }
+                    && !header.is_empty()
+                {
+                    terrain_costs.insert(header.to_string(), field.to_string());
+                }
             }
             let movement = MovementRecord {
                 movement_type: record.get(0).unwrap_or("").to_string(),
