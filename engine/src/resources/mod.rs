@@ -1,4 +1,13 @@
+pub mod master_data;
+
 use crate::components::PlayerId;
+use bevy_ecs::prelude::*;
+
+pub fn init_master_data(world: &mut World) -> Result<(), master_data::MasterDataError> {
+    let registry = master_data::MasterDataRegistry::load()?;
+    world.insert_resource(registry);
+    Ok(())
+}
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::SystemTime;
@@ -29,7 +38,6 @@ impl GameRng {
         ((self.seed >> 33) % 11) as u32
     }
 }
-use bevy_ecs::prelude::*;
 use std::collections::HashMap;
 
 #[derive(Debug, thiserror::Error)]
