@@ -57,7 +57,7 @@ pub fn merge_unit_system(
                 t_pos,
             )) = q_units.get_mut(event.target_entity)
         {
-            // Validate merge conditions
+            // マージ条件を検証
             if s_entity == t_entity
                 || s_fac != t_faction.0
                 || s_type != t_stats.unit_type
@@ -67,8 +67,8 @@ pub fn merge_unit_system(
                 continue;
             }
 
-            // Perform merge
-            t_health.current = std::cmp::min(100, t_health.current + s_hp);
+            // マージを実行
+            t_health.current = std::cmp::min(t_health.max, t_health.current + s_hp);
             t_fuel.current = std::cmp::min(t_fuel.max, t_fuel.current + s_fuel_val);
             t_ammo.ammo1 = std::cmp::min(t_ammo.max_ammo1, t_ammo.ammo1 + s_ammo1_val);
             t_ammo.ammo2 = std::cmp::min(t_ammo.max_ammo2, t_ammo.ammo2 + s_ammo2_val);

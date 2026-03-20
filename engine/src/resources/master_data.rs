@@ -9,6 +9,8 @@ pub enum MasterDataError {
     CsvError(#[from] csv::Error),
     #[error("数値パースエラー: {0}")]
     ParseError(#[from] std::num::ParseIntError),
+    #[error("マップCSVの列数が一致しません: expected {expected}, actual {actual}")]
+    InvalidMapWidth { expected: usize, actual: usize },
     #[error("不明なマスターデータ読み込みエラー")]
     Unknown,
 }
@@ -20,6 +22,34 @@ pub struct UnitName(pub String);
 /// 地形を識別するためのIDのNewtype
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 pub struct LandscapeId(pub u32);
+
+/// 移動タイプを識別するためのNewtype
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, serde::Serialize)]
+pub struct MovementType(pub String);
+
+impl From<String> for MovementType {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for MovementType {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+impl AsRef<str> for MovementType {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for MovementType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LandscapeRecord {
@@ -46,7 +76,7 @@ pub struct UnitRecord {
     #[serde(rename = "移動力")]
     pub movement: u32,
     #[serde(rename = "移動タイプ")]
-    pub movement_type: String,
+    pub movement_type: MovementType,
     #[serde(rename = "燃料")]
     pub fuel: u32,
     #[serde(rename = "武器1")]
@@ -62,13 +92,13 @@ pub struct WeaponRecord {
     pub supply_cost: u32,
     pub range_min: u32,
     pub range_max: u32,
-    pub damages: HashMap<String, String>,
+    pub damages: HashMap<String, u32>,
 }
 
 #[derive(Debug, Clone)]
 pub struct MovementRecord {
-    pub movement_type: String,
-    pub terrain_costs: HashMap<String, String>,
+    pub movement_type: MovementType,
+    pub terrain_costs: HashMap<String, u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -84,7 +114,7 @@ pub struct LoadRecord {
 #[derive(Debug, Clone)]
 pub struct MapCell {
     pub player_id: u32,
-    pub terrain_id: u32,
+    pub terrain_id: LandscapeId,
 }
 
 #[derive(Debug, Clone)]
@@ -100,7 +130,7 @@ impl MapData {
             let val = self.cells[y][x];
             Some(MapCell {
                 player_id: val / 100,
-                terrain_id: val % 100,
+                terrain_id: LandscapeId(val % 100),
             })
         } else {
             None
@@ -161,15 +191,34 @@ impl MasterDataRegistry {
                 if let Some(header) = headers.get(i)
                     && !header.is_empty()
                 {
-                    damages.insert(header.to_string(), field.to_string());
+                    let trimmed = field.trim();
+                    if trimmed != "-" && !trimmed.is_empty() {
+                        damages.insert(header.to_string(), trimmed.parse()?);
+                    }
                 }
             }
             let weapon = WeaponRecord {
                 name: UnitName(record.get(0).unwrap_or("").to_string()),
-                ammo: record.get(1).unwrap_or("0").parse().unwrap_or(0),
-                supply_cost: record.get(2).unwrap_or("0").parse().unwrap_or(0),
-                range_min: record.get(3).unwrap_or("0").parse().unwrap_or(0),
-                range_max: record.get(4).unwrap_or("0").parse().unwrap_or(0),
+                ammo: record
+                    .get(1)
+                    .ok_or(MasterDataError::Unknown)?
+                    .trim()
+                    .parse()?,
+                supply_cost: record
+                    .get(2)
+                    .ok_or(MasterDataError::Unknown)?
+                    .trim()
+                    .parse()?,
+                range_min: record
+                    .get(3)
+                    .ok_or(MasterDataError::Unknown)?
+                    .trim()
+                    .parse()?,
+                range_max: record
+                    .get(4)
+                    .ok_or(MasterDataError::Unknown)?
+                    .trim()
+                    .parse()?,
                 damages,
             };
             registry.weapons.insert(weapon.name.clone(), weapon);
@@ -187,16 +236,19 @@ impl MasterDataRegistry {
                 if let Some(header) = headers.get(i)
                     && !header.is_empty()
                 {
-                    terrain_costs.insert(header.to_string(), field.to_string());
+                    let trimmed = field.trim();
+                    if trimmed != "-" && !trimmed.is_empty() {
+                        terrain_costs.insert(header.to_string(), trimmed.parse()?);
+                    }
                 }
             }
             let movement = MovementRecord {
-                movement_type: record.get(0).unwrap_or("").to_string(),
+                movement_type: MovementType(record.get(0).unwrap_or("").to_string()),
                 terrain_costs,
             };
             registry
                 .movements
-                .insert(movement.movement_type.clone(), movement);
+                .insert(movement.movement_type.0.clone(), movement);
         }
 
         // 5. 搭載(Load)データ読み込み
@@ -237,14 +289,12 @@ impl MasterDataRegistry {
 
     pub fn get_movement_cost(&self, target_movement_type: &str, terrain_name: &str) -> Option<u32> {
         let movement = self.movements.get(target_movement_type)?;
-        let cost_str = movement.terrain_costs.get(terrain_name)?;
-        cost_str.parse::<u32>().ok()
+        movement.terrain_costs.get(terrain_name).copied()
     }
 
     pub fn get_damage(&self, weapon_name: &UnitName, defender_name: &str) -> Option<u32> {
         let weapon = self.weapons.get(weapon_name)?;
-        let damage_str = weapon.damages.get(defender_name)?;
-        damage_str.parse::<u32>().ok()
+        weapon.damages.get(defender_name).copied()
     }
 
     pub fn get_map(&self, map_name: &str) -> Option<&MapData> {
@@ -268,6 +318,11 @@ fn parse_map(csv_data: &str) -> Result<MapData, MasterDataError> {
         }
         if width == 0 {
             width = row.len();
+        } else if row.len() != width {
+            return Err(MasterDataError::InvalidMapWidth {
+                expected: width,
+                actual: row.len(),
+            });
         }
         cells.push(row);
     }
@@ -311,7 +366,7 @@ mod tests {
             .expect("Heavy Tank not found");
         assert_eq!(tank.cost, 28000);
         assert_eq!(tank.movement, 4);
-        assert_eq!(tank.movement_type, "戦車");
+        assert_eq!(tank.movement_type.0, "戦車");
         assert_eq!(tank.weapon1.as_deref(), Some("戦車砲S"));
         assert_eq!(tank.weapon2.as_deref(), Some("機銃S"));
     }
@@ -349,18 +404,31 @@ mod tests {
         // Cell (0, 0) was '12' -> player 0, terrain 12 (海)
         let cell_0_0 = map.get_cell(0, 0).unwrap();
         assert_eq!(cell_0_0.player_id, 0);
-        assert_eq!(cell_0_0.terrain_id, 12);
+        assert_eq!(cell_0_0.terrain_id, LandscapeId(12));
 
         // Cell (1, 7) was '202' -> player 2, terrain 2 (都市)
         // Wait, cell (1, 7) meaning y=7 (row 8), x=1
         // Let's verify (1, 7)
         let cell = map.get_cell(1, 7).unwrap();
         assert_eq!(cell.player_id, 2);
-        assert_eq!(cell.terrain_id, 2);
+        assert_eq!(cell.terrain_id, LandscapeId(2));
 
         // Cell (3, 11) is (x=3, y=11) -> 201 -> player 2, terrain 1 (首都)
         let cell_capital = map.get_cell(3, 11).unwrap();
         assert_eq!(cell_capital.player_id, 2);
-        assert_eq!(cell_capital.terrain_id, 1);
+        assert_eq!(cell_capital.terrain_id, LandscapeId(1));
+    }
+
+    #[test]
+    fn test_load_loads() {
+        let registry = MasterDataRegistry::load().unwrap();
+        let inf_loads = registry
+            .loads
+            .get("輸送ヘリ")
+            .expect("輸送ヘリ loads not found");
+        assert!(!inf_loads.is_empty());
+        assert_eq!(inf_loads[0].transport, "輸送ヘリ");
+        assert_eq!(inf_loads[0].target, "歩兵");
+        assert_eq!(inf_loads[0].capacity, 2);
     }
 }

@@ -1,7 +1,7 @@
 # master-data-loading Specification
 
 ## Purpose
-TBD - created by archiving change implement-master-data. Update Purpose after archive.
+本仕様書は、CSV形式のマスターデータ（地形、ユニット、武器、移動コスト、搭載制限、初期マップ配置等）を読み込み、ゲームロジックから簡便かつ型安全に参照できるよう `MasterDataRegistry` として構築する手順とデータ構造を定義する。
 ## Requirements
 ### Requirement: CSVファイルの構造定義とパース
 エンジンは、各CSVファイルの正確なカラム定義に基づいてマスターデータをパースしなければならない（SHALL）。以下の6種類のファイルを読み込む。
