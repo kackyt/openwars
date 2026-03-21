@@ -32,36 +32,20 @@ pub fn produce_unit_system(
         }
 
         let mut is_valid_property = false;
-        let mut has_capital = false;
-        let mut capital_coord = None;
 
         for (pos, prop) in q_properties.iter() {
             if prop.owner_id == Some(event.player_id) {
                 if pos.x == event.target_x
                     && pos.y == event.target_y
-                    && (prop.terrain == Terrain::City || prop.terrain == Terrain::Airport)
+                    && (prop.terrain == Terrain::Factory || prop.terrain == Terrain::Capital || prop.terrain == Terrain::Airport || prop.terrain == Terrain::Port)
                 {
                     is_valid_property = true;
                 }
-                if prop.terrain == Terrain::Capital {
-                    has_capital = true;
-                    capital_coord = Some((pos.x, pos.y));
-                }
             }
         }
 
-        if !is_valid_property || !has_capital {
+        if !is_valid_property {
             continue;
-        }
-
-        if let Some((cx, cy)) = capital_coord {
-            if let Some(distance) = map.distance(event.target_x, event.target_y, cx, cy) {
-                if distance > 3 {
-                    continue; // Too far from capital
-                }
-            } else {
-                continue;
-            }
         }
 
         let player = players
@@ -131,7 +115,7 @@ mod tests {
 
         let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
         map.set_terrain(0, 0, Terrain::Capital).unwrap();
-        map.set_terrain(2, 0, Terrain::City).unwrap();
+        map.set_terrain(2, 0, Terrain::Factory).unwrap();
         world.insert_resource(map);
 
         world.insert_resource(Events::<ProduceUnitCommand>::default());
@@ -143,7 +127,7 @@ mod tests {
         ));
         world.spawn((
             GridPosition { x: 2, y: 0 },
-            Property::new(Terrain::City, Some(PlayerId(1))),
+            Property::new(Terrain::Factory, Some(PlayerId(1))),
         ));
 
         let stats = UnitStats {

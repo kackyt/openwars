@@ -1,0 +1,788 @@
+use bevy_ecs::prelude::*;
+use openwars_engine::components::{GridPosition, PlayerId, Property};
+use openwars_engine::resources::master_data::MasterDataRegistry;
+use openwars_engine::resources::{GridTopology, Map, MatchState, Player, Players, Terrain};
+
+fn landscape_name_to_terrain(name: &str) -> Terrain {
+    match name {
+        "平地" => Terrain::Plains,
+        "道路" => Terrain::Road,
+        "川" => Terrain::River,
+        "橋" => Terrain::Bridge,
+        "山" => Terrain::Mountain,
+        "森" => Terrain::Forest,
+        "海" => Terrain::Sea,
+        "浅瀬" => Terrain::Shoal,
+        "都市" => Terrain::City,
+        "工場" => Terrain::Factory,
+        "空港" => Terrain::Airport,
+        "港" => Terrain::Port,
+        "首都" => Terrain::Capital,
+        _ => Terrain::Plains, // fallback
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CurrentScreen {
+    MapSelection,
+    InGame,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InGameState {
+    Normal,
+    UnitSelected {
+        unit_entity: Entity,
+        start_pos: (usize, usize),
+    },
+    ActionMenu {
+        unit_entity: Option<Entity>,
+        options: Vec<String>,
+        selected_index: usize,
+    },
+    ProductionMenu {
+        factory_pos: (usize, usize),
+        options: Vec<String>,
+        selected_index: usize,
+    },
+    TargetSelection {
+        unit_entity: Entity,
+        action: String,
+        targets: Vec<(usize, usize)>,
+        selected_index: usize,
+    },
+}
+
+pub struct UiState {
+    pub current_screen: CurrentScreen,
+    pub in_game_state: InGameState,
+    pub selected_map_index: usize,
+    pub available_maps: Vec<String>,
+    // In-game state
+    pub cursor_pos: (usize, usize),
+    pub log_messages: Vec<String>,
+}
+
+impl UiState {
+    pub fn new(maps: Vec<String>) -> Self {
+        Self {
+            current_screen: CurrentScreen::MapSelection,
+            in_game_state: InGameState::Normal,
+            selected_map_index: 0,
+            available_maps: maps,
+            cursor_pos: (0, 0),
+            log_messages: Vec::new(),
+        }
+    }
+
+    pub fn add_log(&mut self, msg: String) {
+        self.log_messages.push(msg);
+        if self.log_messages.len() > 10 {
+            self.log_messages.remove(0);
+        }
+    }
+}
+
+fn str_to_unit_type(name: &str) -> Option<openwars_engine::resources::UnitType> {
+    use openwars_engine::resources::UnitType::*;
+    match name {
+        "軽歩兵" | "歩兵" => Some(Infantry),
+        "重歩兵" | "バズーカ兵" => Some(Mech),
+        "装甲車" | "偵察車" => Some(Recon),
+        "軽戦車" | "戦車" => Some(Tank),
+        "中戦車" => Some(MdTank),
+        "重戦車" => Some(TankZ),
+        "砲台" | "自走砲" => Some(Artillery),
+        "ロケットランチャー" | "ロケット砲" => Some(Rockets),
+        "対空戦車" => Some(AntiAir),
+        "対空ミサイル" | "ミサイル" => Some(Missiles),
+        "軽戦闘機" | "戦闘機" => Some(Fighter),
+        "重戦闘機" | "爆撃機" => Some(Bomber),
+        "戦闘ヘリ" => Some(Bcopters),
+        "輸送ヘリ" => Some(TransportHelicopter),
+        "戦艦" => Some(Battleship),
+        "巡洋艦" => Some(Cruiser),
+        "輸送船" => Some(Lander),
+        "潜水艦" => Some(Submarine),
+        "補給輸送車" | "輸送車" => Some(SupplyTruck),
+        _ => None,
+    }
+}
+
+fn str_to_movement_type(name: &str) -> Option<openwars_engine::resources::MovementType> {
+    use openwars_engine::resources::MovementType::*;
+    match name {
+        "歩兵" => Some(Foot),
+        "車両" => Some(Vehicle),
+        "装軌" | "キャタピラ" => Some(Tracked),
+        "タイヤ" => Some(Tires),
+        "低空" => Some(LowAltitude),
+        "高空" => Some(HighAltitude),
+        "輸送船" | "艦船" => Some(Ship),
+        _ => None,
+    }
+}
+
+pub struct App {
+    pub master_data: MasterDataRegistry,
+    pub world: Option<World>,
+    pub schedule: Option<Schedule>,
+    pub ui_state: UiState,
+    pub should_quit: bool,
+}
+
+impl App {
+    pub fn new() -> Self {
+        let master_data = MasterDataRegistry::load().expect("Failed to load master data");
+        let mut map_names: Vec<String> = master_data.maps.keys().cloned().collect();
+        map_names.sort();
+
+        Self {
+            master_data,
+            world: None,
+            schedule: None,
+            ui_state: UiState::new(map_names),
+            should_quit: false,
+        }
+    }
+
+    pub fn handle_map_selection_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.ui_state.selected_map_index > 0 {
+                    self.ui_state.selected_map_index -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.ui_state.selected_map_index
+                    < self.ui_state.available_maps.len().saturating_sub(1)
+                {
+                    self.ui_state.selected_map_index += 1;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                // Determine the selected map
+                let map_name = self
+                    .ui_state
+                    .available_maps
+                    .get(self.ui_state.selected_map_index)
+                    .cloned();
+                if let Some(map_name) = map_name {
+                    // Transition to in-game
+                    self.initialize_world(map_name.clone());
+                    self.ui_state.current_screen = CurrentScreen::InGame;
+                    self.ui_state.add_log(format!("Map '{}' loaded.", map_name));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn handle_in_game_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+
+        match key.code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc => {
+                // Back to map selection
+                self.world = None;
+                self.schedule = None;
+                self.ui_state.current_screen = CurrentScreen::MapSelection;
+            }
+            KeyCode::Up | KeyCode::Char('k') => match &mut self.ui_state.in_game_state {
+                InGameState::ActionMenu { selected_index, .. }
+                | InGameState::ProductionMenu { selected_index, .. }
+                | InGameState::TargetSelection { selected_index, .. } => {
+                    if *selected_index > 0 {
+                        *selected_index -= 1;
+                    }
+                }
+                InGameState::Normal | InGameState::UnitSelected { .. } => {
+                    if self.ui_state.cursor_pos.1 > 0 {
+                        self.ui_state.cursor_pos.1 -= 1;
+                    }
+                }
+            },
+            KeyCode::Down | KeyCode::Char('j') => {
+                match &mut self.ui_state.in_game_state {
+                    InGameState::ActionMenu {
+                        selected_index,
+                        options,
+                        ..
+                    }
+                    | InGameState::ProductionMenu {
+                        selected_index,
+                        options,
+                        ..
+                    } => {
+                        if *selected_index < options.len().saturating_sub(1) {
+                            *selected_index += 1;
+                        }
+                    }
+                    InGameState::TargetSelection {
+                        selected_index,
+                        targets,
+                        ..
+                    } => {
+                        if *selected_index < targets.len().saturating_sub(1) {
+                            *selected_index += 1;
+                        }
+                    }
+                    InGameState::Normal | InGameState::UnitSelected { .. } => {
+                        self.ui_state.cursor_pos.1 += 1; // TODO bounds check
+                    }
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                if matches!(
+                    self.ui_state.in_game_state,
+                    InGameState::Normal | InGameState::UnitSelected { .. }
+                )
+                    && self.ui_state.cursor_pos.0 > 0 {
+                        self.ui_state.cursor_pos.0 -= 1;
+                    }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                if matches!(
+                    self.ui_state.in_game_state,
+                    InGameState::Normal | InGameState::UnitSelected { .. }
+                ) {
+                    self.ui_state.cursor_pos.0 += 1; // TODO bounds check
+                }
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                let state_clone = self.ui_state.in_game_state.clone();
+                match state_clone {
+                    InGameState::Normal => {
+                        let mut options = vec!["End Turn".to_string(), "Cancel".to_string()];
+                        let mut selected_unit = None;
+
+                        if let Some(world) = &mut self.world {
+                            let cx = self.ui_state.cursor_pos.0;
+                            let cy = self.ui_state.cursor_pos.1;
+
+                            // Check if there is an active player
+                            if let (Some(match_state), Some(players)) = (
+                                world.get_resource::<openwars_engine::resources::MatchState>(),
+                                world.get_resource::<openwars_engine::resources::Players>(),
+                            ) {
+                                let active_player_id =
+                                    players.0[match_state.active_player_index.0].id;
+
+                                // Check for unit
+                                let mut u_query = world.query::<(
+                                    Entity,
+                                    &openwars_engine::components::GridPosition,
+                                    &openwars_engine::components::Faction,
+                                    &openwars_engine::components::ActionCompleted,
+                                )>();
+                                for (entity, pos, faction, action_completed) in u_query.iter(world)
+                                {
+                                    if pos.x == cx
+                                        && pos.y == cy
+                                        && faction.0 == active_player_id
+                                        && !action_completed.0
+                                    {
+                                        selected_unit = Some(entity);
+                                    }
+                                }
+
+                                if let Some(entity) = selected_unit {
+                                    options.insert(0, "Wait".to_string());
+                                    self.ui_state.in_game_state = InGameState::UnitSelected {
+                                        unit_entity: entity,
+                                        start_pos: (cx, cy),
+                                    };
+                                    self.ui_state
+                                        .add_log(format!("Selected unit at {:?}", (cx, cy)));
+                                    return;
+                                }
+
+                                // Check for factory
+                                let mut p_query = world.query::<(
+                                    &openwars_engine::components::GridPosition,
+                                    &openwars_engine::components::Property,
+                                )>();
+                                let mut is_factory = false;
+                                for (pos, prop) in p_query.iter(world) {
+                                    if pos.x == cx
+                                        && pos.y == cy
+                                        && prop.owner_id == Some(active_player_id)
+                                        && (prop.terrain
+                                            == openwars_engine::resources::Terrain::Factory
+                                            || prop.terrain
+                                                == openwars_engine::resources::Terrain::Airport
+                                            || prop.terrain
+                                                == openwars_engine::resources::Terrain::Port
+                                            || prop.terrain
+                                                == openwars_engine::resources::Terrain::City
+                                            || prop.terrain
+                                                == openwars_engine::resources::Terrain::Capital)
+                                        {
+                                            is_factory = true;
+                                        }
+                                }
+
+                                if is_factory {
+                                    options.insert(0, "Produce".to_string());
+                                }
+                            }
+                        }
+
+                        self.ui_state.in_game_state = InGameState::ActionMenu {
+                            unit_entity: None,
+                            options,
+                            selected_index: 0,
+                        };
+                        self.ui_state.add_log(format!(
+                            "Opened action menu at {:?}",
+                            self.ui_state.cursor_pos
+                        ));
+                    }
+                    InGameState::ActionMenu {
+                        unit_entity,
+                        options,
+                        selected_index,
+                    } => {
+                        let selected = &options[selected_index];
+                        if selected == "Cancel" {
+                            self.ui_state.in_game_state = InGameState::Normal;
+                        } else if selected == "End Turn" {
+                            self.ui_state.in_game_state = InGameState::Normal;
+                            self.ui_state.add_log("Turn ended.".to_string());
+
+                            if let Some(world) = &mut self.world {
+                                if let Some(mut match_state) = world.get_resource_mut::<openwars_engine::resources::MatchState>() {
+                                    match_state.current_phase = openwars_engine::resources::Phase::EndTurn;
+                                }
+                                world.send_event(openwars_engine::events::NextPhaseCommand);
+                            }
+                        } else if selected == "Produce" {
+                            let build_options = vec!["軽歩兵", "重歩兵", "軽戦車", "砲台", "Cancel"]
+                                .into_iter()
+                                .map(|s| s.to_string())
+                                .collect();
+                            self.ui_state.in_game_state = InGameState::ProductionMenu {
+                                factory_pos: self.ui_state.cursor_pos,
+                                options: build_options,
+                                selected_index: 0,
+                            };
+                        } else if let Some(entity) = unit_entity {
+                            if selected == "Wait" {
+                                if let Some(world) = &mut self.world
+                                    && let Some(mut action_comp) = world.get_mut::<openwars_engine::components::ActionCompleted>(entity) {
+                                        action_comp.0 = true;
+                                    }
+                                self.ui_state.in_game_state = InGameState::Normal;
+                                self.ui_state.add_log("Unit waited.".to_string());
+                            } else if selected == "Capture" {
+                                if let Some(world) = &mut self.world {
+                                    world.send_event(
+                                        openwars_engine::events::CapturePropertyCommand {
+                                            unit_entity: entity,
+                                        },
+                                    );
+                                }
+                                self.ui_state.in_game_state = InGameState::Normal;
+                                self.ui_state.add_log("Capture initiated.".to_string());
+                            } else if selected == "Attack" {
+                                self.ui_state.in_game_state = InGameState::TargetSelection {
+                                    unit_entity: entity,
+                                    action: "Attack".to_string(),
+                                    targets: vec![],
+                                    selected_index: 0,
+                                };
+                                self.ui_state
+                                    .add_log("Select target to attack...".to_string());
+                            } else if selected == "Supply"
+                                || selected == "Join"
+                                || selected == "Load"
+                                || selected == "Drop"
+                            {
+                                self.ui_state.in_game_state = InGameState::TargetSelection {
+                                    unit_entity: entity,
+                                    action: selected.clone(),
+                                    targets: vec![],
+                                    selected_index: 0,
+                                };
+                                self.ui_state
+                                    .add_log(format!("Select target/tile for {}...", selected));
+                            }
+                        }
+                    }
+                    InGameState::TargetSelection {
+                        unit_entity,
+                        action,
+                        ..
+                    } => {
+                        let cx = self.ui_state.cursor_pos.0;
+                        let cy = self.ui_state.cursor_pos.1;
+
+                        if let Some(world) = &mut self.world {
+                            // Helper to find a unit at (cx, cy)
+                            let mut target_unit = None;
+                            let mut q = world
+                                .query::<(Entity, &openwars_engine::components::GridPosition)>();
+                            for (e, pos) in q.iter(world) {
+                                if pos.x == cx && pos.y == cy && e != unit_entity {
+                                    target_unit = Some(e);
+                                }
+                            }
+
+                            if action == "Attack" {
+                                if let Some(target) = target_unit {
+                                    world.send_event(openwars_engine::events::AttackUnitCommand {
+                                        attacker_entity: unit_entity,
+                                        defender_entity: target,
+                                    });
+                                    self.ui_state
+                                        .add_log(format!("Attacking target at {:?}", (cx, cy)));
+                                } else {
+                                    self.ui_state
+                                        .add_log("No target there. Cancelled.".to_string());
+                                }
+                            } else if action == "Supply" {
+                                if let Some(target) = target_unit {
+                                    world.send_event(openwars_engine::events::SupplyUnitCommand {
+                                        supplier_entity: unit_entity,
+                                        target_entity: target,
+                                    });
+                                    self.ui_state
+                                        .add_log(format!("Supplying unit at {:?}", (cx, cy)));
+                                } else {
+                                    self.ui_state
+                                        .add_log("No logic for supply. Cancelled.".to_string());
+                                }
+                            } else if action == "Join" {
+                                if let Some(target) = target_unit {
+                                    world.send_event(openwars_engine::events::MergeUnitCommand {
+                                        source_entity: unit_entity,
+                                        target_entity: target,
+                                    });
+                                    self.ui_state
+                                        .add_log(format!("Joining unit at {:?}", (cx, cy)));
+                                } else {
+                                    self.ui_state
+                                        .add_log("No logic for join. Cancelled.".to_string());
+                                }
+                            } else if action == "Load" {
+                                if let Some(target) = target_unit {
+                                    // Target should be the transport vehicle. CLI logic usually is: move infantry INTO transport.
+                                    // OpenWars Spec: LoadUnitCommand { transport_entity, unit_entity }
+                                    world.send_event(openwars_engine::events::LoadUnitCommand {
+                                        transport_entity: target,
+                                        unit_entity,
+                                    });
+                                    self.ui_state.add_log(format!(
+                                        "Loading into transport at {:?}",
+                                        (cx, cy)
+                                    ));
+                                } else {
+                                    self.ui_state
+                                        .add_log("No transport at target. Cancelled.".to_string());
+                                }
+                            } else if action == "Drop" {
+                                // For dropping we just need a coordinate
+                                // OpenWars Spec: UnloadUnitCommand { transport_entity, cargo_entity, target_x, target_y }
+                                // In the CLI, the transport drops *the first passenger it has*.
+                                // Since we don't have passenger ID directly without querying, we will fake it or query it.
+                                let mut passenger = None;
+                                if let Ok(cargo) = world.query_filtered::<&openwars_engine::components::CargoCapacity, bevy_ecs::query::With<openwars_engine::components::GridPosition>>().get(world, unit_entity)
+                                    && !cargo.loaded.is_empty() {
+                                        passenger = Some(cargo.loaded[0]);
+                                    }
+                                if let Some(p) = passenger {
+                                    world.send_event(openwars_engine::events::UnloadUnitCommand {
+                                        transport_entity: unit_entity,
+                                        cargo_entity: p,
+                                        target_x: cx,
+                                        target_y: cy,
+                                    });
+                                    self.ui_state
+                                        .add_log(format!("Dropping passenger at {:?}", (cx, cy)));
+                                } else {
+                                    self.ui_state
+                                        .add_log("No passengers to drop. Cancelled.".to_string());
+                                }
+                            }
+                        }
+                        self.ui_state.in_game_state = InGameState::Normal;
+                    }
+                    InGameState::ProductionMenu {
+                        factory_pos,
+                        options,
+                        selected_index,
+                    } => {
+                        let selected = &options[selected_index];
+                        if selected == "Cancel" {
+                            self.ui_state.in_game_state = InGameState::Normal;
+                        } else {
+                            if let Some(world) = &mut self.world
+                                && let (Some(match_state), Some(players)) = (
+                                    world.get_resource::<openwars_engine::resources::MatchState>(),
+                                    world.get_resource::<openwars_engine::resources::Players>(),
+                                ) {
+                                    let active_player_id =
+                                        players.0[match_state.active_player_index.0].id;
+                                    let unit_type = str_to_unit_type(selected)
+                                        .unwrap_or(openwars_engine::resources::UnitType::Infantry);
+                                    world.send_event(openwars_engine::events::ProduceUnitCommand {
+                                        player_id: active_player_id,
+                                        target_x: factory_pos.0,
+                                        target_y: factory_pos.1,
+                                        unit_type,
+                                    });
+                                    self.ui_state.add_log(format!(
+                                        "{} を生産しました。次ターンから行動可能です。(位置: {:?})",
+                                        selected, factory_pos
+                                    ));
+                                }
+                            self.ui_state.in_game_state = InGameState::Normal;
+                        }
+                    }
+                    InGameState::UnitSelected {
+                        unit_entity,
+                        start_pos: _,
+                    } => {
+                        let cx = self.ui_state.cursor_pos.0;
+                        let cy = self.ui_state.cursor_pos.1;
+                        if let Some(world) = &mut self.world {
+                            world.send_event(openwars_engine::events::MoveUnitCommand {
+                                unit_entity,
+                                target_x: cx,
+                                target_y: cy,
+                            });
+                        }
+                        self.ui_state
+                            .add_log(format!("Moved unit to {:?}", (cx, cy)));
+                        self.ui_state.in_game_state = InGameState::ActionMenu {
+                            unit_entity: Some(unit_entity),
+                            options: vec![
+                                "Wait".to_string(),
+                                "Attack".to_string(),
+                                "Capture".to_string(),
+                                "Supply".to_string(),
+                                "Join".to_string(),
+                                "Load".to_string(),
+                                "Drop".to_string(),
+                                "Cancel".to_string(),
+                            ],
+                            selected_index: 0,
+                        };
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
+        match self.ui_state.current_screen {
+            CurrentScreen::MapSelection => self.handle_map_selection_key(key),
+            CurrentScreen::InGame => self.handle_in_game_key(key),
+        }
+    }
+
+    fn initialize_world(&mut self, map_name: String) {
+        use openwars_engine::events::*;
+        use openwars_engine::systems::*;
+        
+        let mut world = World::new();
+        let mut schedule = Schedule::default();
+        
+        // Register events
+        world.init_resource::<Events<ProduceUnitCommand>>();
+        world.init_resource::<Events<MoveUnitCommand>>();
+        world.init_resource::<Events<AttackUnitCommand>>();
+        world.init_resource::<Events<CapturePropertyCommand>>();
+        world.init_resource::<Events<MergeUnitCommand>>();
+        world.init_resource::<Events<SupplyUnitCommand>>();
+        world.init_resource::<Events<LoadUnitCommand>>();
+        world.init_resource::<Events<UnloadUnitCommand>>();
+        world.init_resource::<Events<NextPhaseCommand>>();
+        
+        world.init_resource::<Events<UnitMovedEvent>>();
+        world.init_resource::<Events<UnitAttackedEvent>>();
+        world.init_resource::<Events<UnitDestroyedEvent>>();
+        world.init_resource::<Events<UnitMergedEvent>>();
+        world.init_resource::<Events<PropertyCapturedEvent>>();
+        world.init_resource::<Events<GamePhaseChangedEvent>>();
+        world.init_resource::<Events<GameOverEvent>>();
+        
+        // Add event clearing systems
+        // Intentionally skipping manual event clearance (update_system) to avoid Bevy version disparities. 
+        // EventReader correctly tracks indices, so old events won't be reprocessed.
+
+        // Add game logic systems (order is important for game loop, but default parallel works for independent ones)
+        // Note: engine systems are mostly command -> event processors.
+        schedule.add_systems((
+            produce_unit_system,
+            move_unit_system,
+            attack_unit_system,
+            capture_property_system,
+            merge_unit_system,
+            supply_unit_system,
+            load_unit_system,
+            unload_unit_system,
+            next_phase_system,
+            daily_update_system,
+        ));
+
+        // Build UnitRegistry and DamageChart from MasterDataRegistry
+        let mut damage_chart = openwars_engine::resources::DamageChart::new();
+        for (attacker, weapon) in &self.master_data.weapons {
+            if let Some(att_type) = str_to_unit_type(&attacker.0) {
+                for (def_name, dmg) in &weapon.damages {
+                    if let Some(def_type) = str_to_unit_type(def_name) {
+                        damage_chart.insert_damage(att_type, def_type, *dmg);
+                    }
+                }
+            }
+        }
+        world.insert_resource(damage_chart);
+
+        let mut unit_registry_map = std::collections::HashMap::new();
+        for (name, record) in &self.master_data.units {
+            if let Some(u_type) = str_to_unit_type(&name.0) {
+                let mut min_range = 1;
+                let mut max_range = 1;
+
+                let w1 = record.weapon1.as_ref().and_then(|w| self.master_data.weapons.get(&openwars_engine::resources::master_data::UnitName(w.clone())));
+                let w2 = record.weapon2.as_ref().and_then(|w| self.master_data.weapons.get(&openwars_engine::resources::master_data::UnitName(w.clone())));
+                
+                if let Some(w) = w1 {
+                    min_range = w.range_min;
+                    max_range = w.range_max;
+                } else if let Some(w) = w2 {
+                    min_range = w.range_min;
+                    max_range = w.range_max;
+                }
+
+                let can_capture = u_type == openwars_engine::resources::UnitType::Infantry || u_type == openwars_engine::resources::UnitType::Mech;
+                let can_supply = u_type == openwars_engine::resources::UnitType::SupplyTruck;
+                
+                let mut max_cargo = 0;
+                let mut loadable = Vec::new();
+                if let Some(loads) = self.master_data.loads.get(&name.0) {
+                    for load_record in loads {
+                        max_cargo = max_cargo.max(load_record.capacity);
+                        if let Some(target_type) = str_to_unit_type(&load_record.target) {
+                            loadable.push(target_type);
+                        }
+                    }
+                }
+
+                let daily_fuel = match u_type {
+                    openwars_engine::resources::UnitType::Fighter | openwars_engine::resources::UnitType::Bomber => 5,
+                    openwars_engine::resources::UnitType::Bcopters | openwars_engine::resources::UnitType::TransportHelicopter => 2,
+                    openwars_engine::resources::UnitType::Submarine => 1,
+                    openwars_engine::resources::UnitType::Battleship | openwars_engine::resources::UnitType::Cruiser | openwars_engine::resources::UnitType::Lander => 1,
+                    _ => 0,
+                };
+
+                let stats = openwars_engine::components::UnitStats {
+                    unit_type: u_type,
+                    cost: record.cost,
+                    max_movement: record.movement,
+                    movement_type: str_to_movement_type(&record.movement_type.0).unwrap_or(openwars_engine::resources::MovementType::Tires),
+                    max_fuel: record.fuel,
+                    max_ammo1: w1.map(|w| w.ammo).unwrap_or(0),
+                    max_ammo2: w2.map(|w| w.ammo).unwrap_or(0),
+                    min_range,
+                    max_range,
+                    daily_fuel_consumption: daily_fuel,
+                    can_capture,
+                    can_supply,
+                    max_cargo,
+                    loadable_unit_types: loadable,
+                };
+                unit_registry_map.insert(u_type, stats);
+            }
+        }
+        let unit_registry = openwars_engine::resources::UnitRegistry(unit_registry_map);
+        world.insert_resource(unit_registry);
+        
+        world.insert_resource(openwars_engine::resources::GameRng::default());
+
+        if let Some(map_data) = self.master_data.get_map(&map_name) {
+            let width = map_data.width;
+            let height = map_data.height;
+            let mut ecs_map = Map::new(width, height, Terrain::Plains, GridTopology::Square);
+
+            let mut players = std::collections::HashSet::new();
+
+            for y in 0..height {
+                for x in 0..width {
+                    if let Some(cell) = map_data.get_cell(x, y) {
+                        let landscape_name = self
+                            .master_data
+                            .get_landscape(cell.terrain_id)
+                            .map(|l| l.name.as_str())
+                            .unwrap_or("平地");
+
+                        let terrain = landscape_name_to_terrain(landscape_name);
+                        let _ = ecs_map.set_terrain(x, y, terrain);
+
+                        if cell.player_id != 0 {
+                            players.insert(cell.player_id);
+                        }
+
+                        // Spawn property entity if applicable
+                        if terrain.max_capture_points() > 0 {
+                            let owner = if cell.player_id == 0 {
+                                None
+                            } else {
+                                Some(PlayerId(cell.player_id))
+                            };
+                            world.spawn((GridPosition { x, y }, Property::new(terrain, owner)));
+                        }
+                    }
+                }
+            }
+
+            world.insert_resource(ecs_map);
+            world.insert_resource(MatchState::default());
+
+            let mut player_list = vec![];
+
+            // Ensure at least Player 1 and Player 2 are in the game
+            players.insert(1);
+            players.insert(2);
+
+            for &pid in &players {
+                let mut income = 0;
+                for y in 0..height {
+                    for x in 0..width {
+                        if let Some(cell) = map_data.get_cell(x, y) {
+                            if cell.player_id == pid {
+                                let landscape_name = self.master_data.get_landscape(cell.terrain_id)
+                                    .map(|l| l.name.as_str())
+                                    .unwrap_or("平地");
+                                if landscape_name == "都市" || landscape_name == "空港" {
+                                    income += 1000;
+                                }
+                            }
+                        }
+                    }
+                }
+                let mut p = Player::new(pid, format!("Player {}", pid));
+                p.funds = income; // Give turn 1 income
+                player_list.push(p);
+            }
+            if player_list.is_empty() {
+                player_list.push(Player::new(1, "Player 1".to_string()));
+            }
+            player_list.sort_by_key(|p| p.id.0); // Ensure consistent turn order
+            world.insert_resource(Players(player_list));
+        }
+
+        // Add a master data resource so systems can access it if needed
+        world.insert_resource(self.master_data.clone());
+
+        self.world = Some(world);
+        self.schedule = Some(schedule);
+    }
+}

@@ -30,6 +30,7 @@ Before proceeding with any implementation, you MUST draft a specific implementat
    - Any dummy/mock implementations needed if the infrastructure layer is not yet complete.
 3. Use your communication tools (e.g. `notify_user` or standard messaging if in a conversational agent context) to present the plan and ask the user for approval.
 4. DO NOT proceed to Step 3 until the user approves the implementation plan.
+5. **planは必ず日本語で書いてください**
 
 ## Step 3: Modern Rust TUI Approach (Recommended)
 

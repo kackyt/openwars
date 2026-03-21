@@ -2,6 +2,7 @@
 targets: ["*"]
 description: "openwars for Rust programming guidelines"
 globs: ["**/*"]
+root: true
 ---
 
 # はじめに
