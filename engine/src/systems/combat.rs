@@ -208,7 +208,7 @@ pub fn attack_unit_system(
 
             defender.1.damage(a_damage);
             d_hp_after = defender.1.current;
-            
+
             if let (Some((d_slot, _)), Some(def_ammo)) = (counter_info, defender.2.as_deref_mut()) {
                 if d_slot == 1 {
                     def_ammo.ammo1 = def_ammo.ammo1.saturating_sub(1);

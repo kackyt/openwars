@@ -230,10 +230,7 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         } => {
             menu_data = Some(("Produce".to_string(), options.clone(), *selected_index));
         }
-        crate::app::InGameState::TargetSelection {
-            action,
-            ..
-        } => {
+        crate::app::InGameState::TargetSelection { action, .. } => {
             menu_data = Some((action.clone(), vec!["[Select with Cursor]".to_string()], 0));
         }
         crate::app::InGameState::CargoSelection {
@@ -259,10 +256,12 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             }
             menu_data = Some(("Drop which?".to_string(), options, *selected_index));
         }
-        crate::app::InGameState::DropTargetSelection {
-            ..
-        } => {
-            menu_data = Some(("Drop where?".to_string(), vec!["[Select with Cursor]".to_string()], 0));
+        crate::app::InGameState::DropTargetSelection { .. } => {
+            menu_data = Some((
+                "Drop where?".to_string(),
+                vec!["[Select with Cursor]".to_string()],
+                0,
+            ));
         }
         _ => {}
     }

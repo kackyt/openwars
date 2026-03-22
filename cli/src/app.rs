@@ -314,7 +314,6 @@ impl App {
                         let mut selected_unit = None;
 
                         if let Some(world) = &mut self.world {
-
                             let cx = self.ui_state.cursor_pos.0;
                             let cy = self.ui_state.cursor_pos.1;
 
@@ -617,14 +616,25 @@ impl App {
                             if action == "Attack" {
                                 if let Some(target) = target_unit {
                                     let mut valid = false;
-                                    let mut q_attacker = world.query::<(&openwars_engine::components::GridPosition, &openwars_engine::components::UnitStats, &openwars_engine::components::HasMoved, &openwars_engine::components::Faction)>();
-                                    let mut q_target = world.query::<&openwars_engine::components::Faction>();
+                                    let mut q_attacker = world.query::<(
+                                        &openwars_engine::components::GridPosition,
+                                        &openwars_engine::components::UnitStats,
+                                        &openwars_engine::components::HasMoved,
+                                        &openwars_engine::components::Faction,
+                                    )>(
+                                    );
+                                    let mut q_target =
+                                        world.query::<&openwars_engine::components::Faction>();
 
-                                    if let Ok((pos, stats, has_moved, attacker_fac)) = q_attacker.get(world, unit_entity) {
-                                        let dist = (pos.x as i64 - cx as i64).unsigned_abs() as u32 + (pos.y as i64 - cy as i64).unsigned_abs() as u32;
+                                    if let Ok((pos, stats, has_moved, attacker_fac)) =
+                                        q_attacker.get(world, unit_entity)
+                                    {
+                                        let dist = (pos.x as i64 - cx as i64).unsigned_abs() as u32
+                                            + (pos.y as i64 - cy as i64).unsigned_abs() as u32;
 
                                         let is_indirect = stats.min_range > 1;
-                                        let in_range = dist >= stats.min_range && dist <= stats.max_range;
+                                        let in_range =
+                                            dist >= stats.min_range && dist <= stats.max_range;
                                         let can_attack = in_range && (!is_indirect || !has_moved.0);
 
                                         if can_attack
@@ -636,15 +646,19 @@ impl App {
                                     }
 
                                     if valid {
-                                        world.send_event(openwars_engine::events::AttackUnitCommand {
-                                            attacker_entity: unit_entity,
-                                            defender_entity: target,
-                                        });
+                                        world.send_event(
+                                            openwars_engine::events::AttackUnitCommand {
+                                                attacker_entity: unit_entity,
+                                                defender_entity: target,
+                                            },
+                                        );
                                         self.ui_state
                                             .add_log(format!("Attacking target at {:?}", (cx, cy)));
                                     } else {
-                                        self.ui_state
-                                            .add_log("Target invalid or out of range. Cancelled.".to_string());
+                                        self.ui_state.add_log(
+                                            "Target invalid or out of range. Cancelled."
+                                                .to_string(),
+                                        );
                                     }
                                 } else {
                                     self.ui_state
