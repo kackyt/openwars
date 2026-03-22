@@ -15,6 +15,32 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     }
 }
 
+fn unit_type_to_jp(unit_type: &openwars_engine::resources::UnitType) -> &'static str {
+    use openwars_engine::resources::UnitType::*;
+    match unit_type {
+        Infantry => "歩兵",
+        Mech => "重歩兵",
+        CombatEngineer => "工兵",
+        Recon => "装甲車",
+        Tank => "軽戦車",
+        MdTank => "中戦車",
+        TankZ => "重戦車",
+        Artillery => "自走砲",
+        Rockets => "ロケット砲",
+        AntiAir => "対空戦車",
+        Missiles => "対空ミサイル",
+        Fighter => "戦闘機",
+        Bomber => "爆撃機",
+        Bcopters => "戦闘ヘリ",
+        TransportHelicopter => "輸送ヘリ",
+        Battleship => "戦艦",
+        Cruiser => "巡洋艦",
+        Lander => "輸送船",
+        Submarine => "潜水艦",
+        SupplyTruck => "輸送車",
+    }
+}
+
 fn draw_map_selection(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -75,7 +101,10 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
     let cy = app.ui_state.cursor_pos.1;
 
     let mut reachable_tiles = None;
-    if let crate::app::InGameState::UnitSelected { reachable_tiles: r, .. } = &app.ui_state.in_game_state {
+    if let crate::app::InGameState::UnitSelected {
+        reachable_tiles: r, ..
+    } = &app.ui_state.in_game_state
+    {
         reachable_tiles = Some(r);
     }
 
@@ -207,7 +236,10 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             selected_index,
             ..
         } => {
-            let options: Vec<String> = targets.iter().map(|(x, y)| format!("At ({}, {})", x, y)).collect();
+            let options: Vec<String> = targets
+                .iter()
+                .map(|(x, y)| format!("At ({}, {})", x, y))
+                .collect();
             menu_data = Some((action.clone(), options, *selected_index));
         }
         crate::app::InGameState::CargoSelection {
@@ -220,7 +252,7 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                 for entity in passengers {
                     let mut q = world.query::<&openwars_engine::components::UnitStats>();
                     if let Ok(stats) = q.get(world, *entity) {
-                        options.push(format!("{:?}", stats.unit_type));
+                        options.push(unit_type_to_jp(&stats.unit_type).to_string());
                     } else {
                         options.push(format!("{:?}", entity));
                     }
@@ -238,7 +270,10 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             selected_index,
             ..
         } => {
-            let mut options: Vec<String> = targets.iter().map(|(x, y)| format!("To ({}, {})", x, y)).collect();
+            let mut options: Vec<String> = targets
+                .iter()
+                .map(|(x, y)| format!("To ({}, {})", x, y))
+                .collect();
             if options.is_empty() {
                 options.push("None".to_string());
             }
@@ -295,9 +330,11 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         let mut id = 0;
         let mut funds = 0;
         let mut has_player = false;
-        
-        if let (Some(match_state), Some(players)) = (world.get_resource::<openwars_engine::resources::MatchState>(), world.get_resource::<openwars_engine::resources::Players>())
-            && !players.0.is_empty()
+
+        if let (Some(match_state), Some(players)) = (
+            world.get_resource::<openwars_engine::resources::MatchState>(),
+            world.get_resource::<openwars_engine::resources::Players>(),
+        ) && !players.0.is_empty()
         {
             let active_player = &players.0[match_state.active_player_index.0];
             turn = match_state.current_turn_number.0;
@@ -327,16 +364,16 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         for (u_pos, u_faction, u_stats, u_health, u_fuel, u_ammo) in u_query.iter(world) {
             if u_pos.x == cx && u_pos.y == cy {
                 info_text.push_str("--- Unit Info ---\n");
-                info_text.push_str(&format!("Type: {:?}\n", u_stats.unit_type));
+                info_text.push_str(&format!("Type: {}\n", unit_type_to_jp(&u_stats.unit_type)));
                 info_text.push_str(&format!("Faction: P{}\n", u_faction.0.0));
-                
+
                 let display_hp = (u_health.current.saturating_add(9)) / 10;
                 info_text.push_str(&format!("HP: {}/10\n", display_hp));
 
                 if let Some(f) = u_fuel {
                     info_text.push_str(&format!("Fuel: {}/{}\n", f.current, f.max));
                 }
-                
+
                 if let Some(w) = u_ammo {
                     if w.max_ammo1 > 0 {
                         info_text.push_str(&format!("Ammo 1: {}/{}\n", w.ammo1, w.max_ammo1));
@@ -345,13 +382,15 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                         info_text.push_str(&format!("Ammo 2: {}/{}\n", w.ammo2, w.max_ammo2));
                     }
                 }
-                
+
                 info_text.push_str("-----------------\n\n");
                 break;
             }
         }
     }
-    info_text.push_str("Press [q] to quit.\nPress [Esc] map.\nUse [Arrows] move.\nPress [Space] action.");
+    info_text.push_str(
+        "Press [q] to quit.\nPress [Esc] map.\nUse [Arrows] move.\nPress [Space] action.",
+    );
 
     let info_paragraph = Paragraph::new(info_text).block(info_block);
     f.render_widget(info_paragraph, right_chunks[0]);

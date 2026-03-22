@@ -300,6 +300,42 @@ impl MasterDataRegistry {
     pub fn get_map(&self, map_name: &str) -> Option<&MapData> {
         self.maps.get(map_name)
     }
+
+    /// 地形名からターンごとの収入を返す（マスターデータのincomeフィールドを参照）
+    /// 収入フィールドがない地形（道路・平地など）は 0 を返す
+    pub fn landscape_income(&self, name: &str) -> u32 {
+        self.get_landscape_by_name(name)
+            .and_then(|l| l.income)
+            .unwrap_or(0)
+    }
+
+    /// 地形名から「生産施設かどうか」を判定する
+    /// 補給補充フィールド（supply_type）が存在する地形を生産施設とみなす
+    pub fn is_production_facility(&self, name: &str) -> bool {
+        self.get_landscape_by_name(name)
+            .map(|l| l.supply_type.is_some())
+            .unwrap_or(false)
+    }
+
+    /// 施設（地形名）でその移動タイプのユニットを生産できるか判定する
+    /// 施設の supply_type と unit の movement_type を照合する:
+    ///   - 地上部隊: 歩兵・戦車・砲台・装甲車 移動タイプ
+    ///   - 航空部隊: 航空 移動タイプ
+    ///   - 艦船部隊: 艦船 移動タイプ
+    pub fn can_produce_unit(&self, landscape_name: &str, unit_movement_type: &str) -> bool {
+        let Some(landscape) = self.get_landscape_by_name(landscape_name) else {
+            return false;
+        };
+        let Some(supply_type) = &landscape.supply_type else {
+            return false;
+        };
+        match supply_type.as_str() {
+            "地上部隊" => matches!(unit_movement_type, "歩兵" | "戦車" | "砲台" | "装甲車"),
+            "航空部隊" => unit_movement_type == "航空",
+            "艦船部隊" => unit_movement_type == "艦船",
+            _ => false,
+        }
+    }
 }
 
 fn parse_map(csv_data: &str) -> Result<MapData, MasterDataError> {

@@ -2,81 +2,81 @@ mod app;
 mod ui;
 
 use app::App;
+use crossterm::event::Event;
+#[cfg(not(feature = "ai-debug"))]
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
+    event::{self, DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{
-    Terminal,
-    backend::{Backend, CrosstermBackend},
-};
-#[cfg(feature = "ai-debug")]
-use ratatui::backend::TestBackend;
-#[cfg(feature = "ai-debug")]
-use std::io::{self, BufRead};
 #[cfg(not(feature = "ai-debug"))]
+use ratatui::backend::CrosstermBackend;
+use ratatui::{Terminal, backend::Backend};
 use std::{error::Error, io};
-#[cfg(feature = "ai-debug")]
-use std::error::Error;
 
 fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(feature = "ai-debug")]
     {
-        return run_ai_debug();
+        run_ai_debug()?;
+        Ok(())
     }
 
-    // 1. Setup App state
-    let mut app = App::new();
+    #[cfg(not(feature = "ai-debug"))]
+    {
+        // 1. Setup App state
+        let mut app = App::new()?;
 
-    // 2. Terminal setup
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+        // 2. Terminal setup
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend)?;
 
-    // 3. Main Event/Draw loop
-    let get_event = |_timeout: std::time::Duration| -> io::Result<Option<Event>> {
-        if event::poll(std::time::Duration::from_millis(50))? {
-            Ok(Some(event::read()?))
-        } else {
-            Ok(None)
+        // 3. Main Event/Draw loop
+        let get_event = |_timeout: std::time::Duration| -> io::Result<Option<Event>> {
+            if event::poll(std::time::Duration::from_millis(50))? {
+                Ok(Some(event::read()?))
+            } else {
+                Ok(None)
+            }
+        };
+        let on_draw = |_terminal: &Terminal<CrosstermBackend<std::io::Stdout>>| {};
+
+        let res = run_app(&mut terminal, &mut app, get_event, on_draw);
+
+        // 4. Terminal Teardown
+        disable_raw_mode()?;
+        execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        )?;
+        terminal.show_cursor()?;
+
+        if let Err(err) = res {
+            println!("{:?}", err);
         }
-    };
-    let on_draw = |_terminal: &Terminal<CrosstermBackend<std::io::Stdout>>| {};
 
-    let res = run_app(&mut terminal, &mut app, get_event, on_draw);
-
-    // 4. Terminal Teardown
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
-    if let Err(err) = res {
-        println!("{:?}", err);
+        Ok(())
     }
-
-    Ok(())
 }
 
 #[cfg(feature = "ai-debug")]
 fn run_ai_debug() -> Result<(), Box<dyn Error>> {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use ratatui::backend::TestBackend;
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyEventState};
     use std::io::{self, BufRead};
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let mut app = App::new();
+    let mut app = App::new()?;
     let backend = TestBackend::new(120, 30);
     let mut terminal = Terminal::new(backend)?;
 
     println!("--- AI TUI Debugger Started ---");
-    println!("Commands: 'up', 'down', 'left', 'right', 'enter', 'esc', 'space', 'dump', 'q' (quit), or single chars like 'j' or 'T'.");
+    println!(
+        "Commands: 'up', 'down', 'left', 'right', 'enter', 'esc', 'space', 'dump', 'q' (quit), or single chars like 'j' or 'T'."
+    );
 
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
@@ -88,7 +88,10 @@ fn run_ai_debug() -> Result<(), Box<dyn Error>> {
         if let Some(Ok(line_str)) = line {
             let cmd = line_str.trim();
             if cmd == "q" || cmd == "quit" {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "Quit requested by AI"));
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "Quit requested by AI",
+                ));
             }
             if cmd == "dump" {
                 SHOULD_DUMP.store(true, Ordering::SeqCst);
@@ -164,10 +167,10 @@ where
         terminal.draw(|f| ui::ui(f, app))?;
         on_draw(terminal);
 
-        if let Some(Event::Key(key)) = get_event(std::time::Duration::from_millis(50))? {
-            if key.kind == event::KeyEventKind::Press {
-                app.handle_key(key);
-            }
+        if let Some(Event::Key(key)) = get_event(std::time::Duration::from_millis(50))?
+            && key.kind == crossterm::event::KeyEventKind::Press
+        {
+            app.handle_key(key);
         }
 
         if app.should_quit {
