@@ -322,6 +322,7 @@ impl App {
                         let mut selected_unit = None;
 
                         if let Some(world) = &mut self.world {
+
                             let cx = self.ui_state.cursor_pos.0;
                             let cy = self.ui_state.cursor_pos.1;
 

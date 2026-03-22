@@ -67,15 +67,7 @@ pub fn next_phase_system(
 
     for _ in next_phase_events.read() {
         match match_state.current_phase {
-            Phase::Production => {
-                match_state.current_phase = Phase::MovementAndAttack;
-                let active_player_id = players.0[match_state.active_player_index.0].id;
-                phase_changed_events.send(GamePhaseChangedEvent {
-                    new_phase: Phase::MovementAndAttack,
-                    active_player: active_player_id,
-                });
-            }
-            Phase::MovementAndAttack => {
+            Phase::Main => {
                 match_state.current_phase = Phase::EndTurn;
                 let active_player_id = players.0[match_state.active_player_index.0].id;
                 phase_changed_events.send(GamePhaseChangedEvent {
@@ -97,7 +89,7 @@ pub fn next_phase_system(
                     }
                 }
 
-                match_state.current_phase = Phase::Production;
+                match_state.current_phase = Phase::Main;
                 let active_player_id = players.0[match_state.active_player_index.0].id;
 
                 process_resupply_and_reset(
@@ -108,7 +100,7 @@ pub fn next_phase_system(
                 );
 
                 phase_changed_events.send(GamePhaseChangedEvent {
-                    new_phase: Phase::Production,
+                    new_phase: Phase::Main,
                     active_player: active_player_id,
                 });
             }

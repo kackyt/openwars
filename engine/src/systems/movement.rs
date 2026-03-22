@@ -389,7 +389,7 @@ pub fn move_unit_system(
     players: Res<Players>,
     match_state: Res<MatchState>,
 ) {
-    if match_state.game_over.is_some() || match_state.current_phase != Phase::MovementAndAttack {
+    if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
     }
     let active_player = players.0[match_state.active_player_index.0].id;
@@ -505,7 +505,7 @@ mod tests {
         let mut world = World::new();
 
         let ms = MatchState {
-            current_phase: Phase::MovementAndAttack,
+            current_phase: Phase::Main,
             ..Default::default()
         };
         world.insert_resource(ms);
@@ -661,7 +661,7 @@ mod tests {
         schedule.add_systems(crate::systems::turn_management::next_phase_system);
 
         let advance_day = |w: &mut World, s: &mut Schedule| {
-            for _ in 0..6 {
+            for _ in 0..4 {
                 w.send_event(crate::events::NextPhaseCommand);
                 s.run(w);
             }
@@ -784,7 +784,7 @@ mod tests {
             .id();
 
         let ms = MatchState {
-            current_phase: Phase::MovementAndAttack,
+            current_phase: Phase::Main,
             ..Default::default()
         };
         world.insert_resource(ms);

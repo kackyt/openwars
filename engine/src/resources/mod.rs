@@ -232,8 +232,7 @@ pub struct Players(pub Vec<Player>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
-    Production,
-    MovementAndAttack,
+    Main,
     EndTurn,
 }
 
@@ -262,7 +261,7 @@ impl Default for MatchState {
         Self {
             current_turn_number: TurnNumber(1),
             active_player_index: PlayerIndex(0),
-            current_phase: Phase::Production,
+            current_phase: Phase::Main,
             game_over: None,
         }
     }

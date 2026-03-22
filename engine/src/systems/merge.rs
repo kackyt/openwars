@@ -22,7 +22,7 @@ pub fn merge_unit_system(
     )>,
     match_state: Res<MatchState>,
 ) {
-    if match_state.game_over.is_some() || match_state.current_phase != Phase::MovementAndAttack {
+    if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
     }
 
@@ -100,7 +100,7 @@ mod tests {
         let mut world = World::new();
 
         let ms = MatchState {
-            current_phase: Phase::MovementAndAttack,
+            current_phase: Phase::Main,
             ..Default::default()
         };
         world.insert_resource(ms);

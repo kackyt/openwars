@@ -325,26 +325,16 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
     let mut info_text = String::new();
 
     if let Some(world) = &mut app.world {
-        let mut turn = 0;
-        let mut name = String::new();
-        let mut id = 0;
-        let mut funds = 0;
-        let mut has_player = false;
-
         if let (Some(match_state), Some(players)) = (
             world.get_resource::<openwars_engine::resources::MatchState>(),
             world.get_resource::<openwars_engine::resources::Players>(),
         ) && !players.0.is_empty()
         {
             let active_player = &players.0[match_state.active_player_index.0];
-            turn = match_state.current_turn_number.0;
-            name = active_player.name.clone();
-            id = active_player.id.0;
-            funds = active_player.funds;
-            has_player = true;
-        }
-
-        if has_player {
+            let turn = match_state.current_turn_number.0;
+            let name = active_player.name.clone();
+            let id = active_player.id.0;
+            let funds = active_player.funds;
             info_text.push_str(&format!("Turn: {}\n", turn));
             info_text.push_str(&format!("Player: {} ({})\n", name, id));
             info_text.push_str(&format!("Funds: {}\n\n", funds));

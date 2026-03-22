@@ -63,7 +63,7 @@ pub fn attack_unit_system(
     map: Res<Map>,
     mut rng: ResMut<GameRng>,
 ) {
-    if match_state.game_over.is_some() || match_state.current_phase != Phase::MovementAndAttack {
+    if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
     }
     let active_player = players.0[match_state.active_player_index.0].id;
@@ -227,7 +227,7 @@ mod tests {
         let mut world = World::new();
 
         let match_state = MatchState {
-            current_phase: Phase::MovementAndAttack,
+            current_phase: Phase::Main,
             ..Default::default()
         };
         world.insert_resource(match_state);
