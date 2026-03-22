@@ -12,12 +12,23 @@ use bevy_ecs::prelude::*;
 /// 4. プレイヤーの資金(`funds`)が生産コスト(`cost`)以上であることを確認し、資金を消費します。
 /// 5. 新しいユニットの実体(`Entity`)をコンポーネント群と共に生成（スポーン）します。
 ///    ※生産された直後は行動できないため、`HasMoved` と `ActionCompleted` を true にします。
+/// 自軍の首都のある場所から生産可能範囲内にあるかどうかを判定するエンジン側の純粋なドメイン関数
+pub fn is_within_production_range(capital_pos: Option<(usize, usize)>, target_x: usize, target_y: usize) -> bool {
+    if let Some(cp) = capital_pos {
+        let distance = (target_x as isize - cp.0 as isize).unsigned_abs()
+            + (target_y as isize - cp.1 as isize).unsigned_abs();
+        distance <= 3
+    } else {
+        false
+    }
+}
+
 pub fn produce_unit_system(
     mut commands: Commands,
     mut produce_events: EventReader<ProduceUnitCommand>,
     mut players: ResMut<Players>,
     match_state: Res<MatchState>,
-    map: Res<Map>,
+    _map: Res<Map>,
     q_properties: Query<(&GridPosition, &Property)>,
     unit_registry: Res<UnitRegistry>,
 ) {
@@ -34,18 +45,29 @@ pub fn produce_unit_system(
         let mut is_valid_property = false;
 
         for (pos, prop) in q_properties.iter() {
-            if prop.owner_id == Some(event.player_id) {
-                if pos.x == event.target_x
-                    && pos.y == event.target_y
-                    && (prop.terrain == Terrain::Factory || prop.terrain == Terrain::Capital || prop.terrain == Terrain::Airport || prop.terrain == Terrain::Port)
-                {
-                    is_valid_property = true;
-                }
+            if prop.owner_id == Some(event.player_id)
+                && pos.x == event.target_x
+                && pos.y == event.target_y
+                && (prop.terrain == Terrain::Factory || prop.terrain == Terrain::Capital || prop.terrain == Terrain::Airport || prop.terrain == Terrain::Port)
+            {
+                is_valid_property = true;
             }
         }
 
         if !is_valid_property {
             continue;
+        }
+
+        let mut capital_pos = None;
+        for (pos, prop) in q_properties.iter() {
+            if prop.owner_id == Some(event.player_id) && prop.terrain == Terrain::Capital {
+                capital_pos = Some((pos.x, pos.y));
+                break;
+            }
+        }
+
+        if !is_within_production_range(capital_pos, event.target_x, event.target_y) {
+            continue; // Too far from Capital
         }
 
         let player = players

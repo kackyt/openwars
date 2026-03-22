@@ -74,6 +74,11 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
     let cx = app.ui_state.cursor_pos.0;
     let cy = app.ui_state.cursor_pos.1;
 
+    let mut reachable_tiles = None;
+    if let crate::app::InGameState::UnitSelected { reachable_tiles: r, .. } = &app.ui_state.in_game_state {
+        reachable_tiles = Some(r);
+    }
+
     if let Some(world) = &mut app.world {
         // Collect unit/property info
         let mut factions = std::collections::HashMap::new();
@@ -160,6 +165,12 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                             .add_modifier(Modifier::BOLD);
                     }
 
+                    if let Some(reachable) = reachable_tiles
+                        && reachable.contains(&(x, y))
+                    {
+                        style = style.bg(Color::DarkGray).fg(Color::White);
+                    }
+
                     if x == cx && y == cy {
                         style = style.bg(Color::White).fg(Color::Black);
                     }
@@ -181,14 +192,57 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             selected_index,
             ..
         } => {
-            menu_data = Some(("Action", options.clone(), *selected_index));
+            menu_data = Some(("Action".to_string(), options.clone(), *selected_index));
         }
         crate::app::InGameState::ProductionMenu {
             options,
             selected_index,
             ..
         } => {
-            menu_data = Some(("Produce", options.clone(), *selected_index));
+            menu_data = Some(("Produce".to_string(), options.clone(), *selected_index));
+        }
+        crate::app::InGameState::TargetSelection {
+            action,
+            targets,
+            selected_index,
+            ..
+        } => {
+            let options: Vec<String> = targets.iter().map(|(x, y)| format!("At ({}, {})", x, y)).collect();
+            menu_data = Some((action.clone(), options, *selected_index));
+        }
+        crate::app::InGameState::CargoSelection {
+            passengers,
+            selected_index,
+            ..
+        } => {
+            let mut options = Vec::new();
+            if let Some(world) = &mut app.world {
+                for entity in passengers {
+                    let mut q = world.query::<&openwars_engine::components::UnitStats>();
+                    if let Ok(stats) = q.get(world, *entity) {
+                        options.push(format!("{:?}", stats.unit_type));
+                    } else {
+                        options.push(format!("{:?}", entity));
+                    }
+                }
+            } else {
+                options = passengers.iter().map(|e| format!("{:?}", e)).collect();
+            }
+            if options.is_empty() {
+                options.push("None".to_string());
+            }
+            menu_data = Some(("Drop which?".to_string(), options, *selected_index));
+        }
+        crate::app::InGameState::DropTargetSelection {
+            targets,
+            selected_index,
+            ..
+        } => {
+            let mut options: Vec<String> = targets.iter().map(|(x, y)| format!("To ({}, {})", x, y)).collect();
+            if options.is_empty() {
+                options.push("None".to_string());
+            }
+            menu_data = Some(("Drop where?".to_string(), options, *selected_index));
         }
         _ => {}
     }
@@ -235,13 +289,65 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
     let info_block = Block::default().title(" Info ").borders(Borders::ALL);
     let mut info_text = String::new();
 
-    if let Some(world) = &app.world {
-        if let (Some(match_state), Some(players)) = (world.get_resource::<openwars_engine::resources::MatchState>(), world.get_resource::<openwars_engine::resources::Players>()) {
-            if !players.0.is_empty() {
-                let active_player = &players.0[match_state.active_player_index.0];
-                info_text.push_str(&format!("Turn: {}\n", match_state.current_turn_number.0));
-                info_text.push_str(&format!("Player: {} ({})\n", active_player.name, active_player.id.0));
-                info_text.push_str(&format!("Funds: {}\n\n", active_player.funds));
+    if let Some(world) = &mut app.world {
+        let mut turn = 0;
+        let mut name = String::new();
+        let mut id = 0;
+        let mut funds = 0;
+        let mut has_player = false;
+        
+        if let (Some(match_state), Some(players)) = (world.get_resource::<openwars_engine::resources::MatchState>(), world.get_resource::<openwars_engine::resources::Players>())
+            && !players.0.is_empty()
+        {
+            let active_player = &players.0[match_state.active_player_index.0];
+            turn = match_state.current_turn_number.0;
+            name = active_player.name.clone();
+            id = active_player.id.0;
+            funds = active_player.funds;
+            has_player = true;
+        }
+
+        if has_player {
+            info_text.push_str(&format!("Turn: {}\n", turn));
+            info_text.push_str(&format!("Player: {} ({})\n", name, id));
+            info_text.push_str(&format!("Funds: {}\n\n", funds));
+        }
+
+        let cx = app.ui_state.cursor_pos.0;
+        let cy = app.ui_state.cursor_pos.1;
+        let mut u_query = world.query::<(
+            &openwars_engine::components::GridPosition,
+            &openwars_engine::components::Faction,
+            &openwars_engine::components::UnitStats,
+            &openwars_engine::components::Health,
+            Option<&openwars_engine::components::Fuel>,
+            Option<&openwars_engine::components::Ammo>,
+        )>();
+
+        for (u_pos, u_faction, u_stats, u_health, u_fuel, u_ammo) in u_query.iter(world) {
+            if u_pos.x == cx && u_pos.y == cy {
+                info_text.push_str("--- Unit Info ---\n");
+                info_text.push_str(&format!("Type: {:?}\n", u_stats.unit_type));
+                info_text.push_str(&format!("Faction: P{}\n", u_faction.0.0));
+                
+                let display_hp = (u_health.current.saturating_add(9)) / 10;
+                info_text.push_str(&format!("HP: {}/10\n", display_hp));
+
+                if let Some(f) = u_fuel {
+                    info_text.push_str(&format!("Fuel: {}/{}\n", f.current, f.max));
+                }
+                
+                if let Some(w) = u_ammo {
+                    if w.max_ammo1 > 0 {
+                        info_text.push_str(&format!("Ammo 1: {}/{}\n", w.ammo1, w.max_ammo1));
+                    }
+                    if w.max_ammo2 > 0 {
+                        info_text.push_str(&format!("Ammo 2: {}/{}\n", w.ammo2, w.max_ammo2));
+                    }
+                }
+                
+                info_text.push_str("-----------------\n\n");
+                break;
             }
         }
     }
@@ -255,4 +361,23 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
     let logs_text = app.ui_state.log_messages.join("\n");
     let logs_paragraph = Paragraph::new(logs_text).block(logs_block);
     f.render_widget(logs_paragraph, right_chunks[1]);
+
+    if let crate::app::InGameState::EventPopup { message } = &app.ui_state.in_game_state {
+        let area = f.size();
+        let popup_rect = ratatui::layout::Rect {
+            x: area.width.saturating_sub(40) / 2,
+            y: area.height.saturating_sub(5) / 2,
+            width: 40.min(area.width),
+            height: 5.min(area.height),
+        };
+        let popup_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Event ")
+            .style(Style::default().bg(Color::Blue).fg(Color::White));
+        let popup_text = Paragraph::new(message.as_str())
+            .block(popup_block)
+            .alignment(ratatui::layout::Alignment::Center);
+        f.render_widget(ratatui::widgets::Clear, popup_rect);
+        f.render_widget(popup_text, popup_rect);
+    }
 }

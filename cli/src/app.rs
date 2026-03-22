@@ -34,6 +34,7 @@ pub enum InGameState {
     UnitSelected {
         unit_entity: Entity,
         start_pos: (usize, usize),
+        reachable_tiles: std::collections::HashSet<(usize, usize)>,
     },
     ActionMenu {
         unit_entity: Option<Entity>,
@@ -50,6 +51,20 @@ pub enum InGameState {
         action: String,
         targets: Vec<(usize, usize)>,
         selected_index: usize,
+    },
+    CargoSelection {
+        transport_entity: Entity,
+        passengers: Vec<Entity>,
+        selected_index: usize,
+    },
+    DropTargetSelection {
+        transport_entity: Entity,
+        cargo_entity: Entity,
+        targets: Vec<(usize, usize)>,
+        selected_index: usize,
+    },
+    EventPopup {
+        message: String,
     },
 }
 
@@ -195,11 +210,14 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => match &mut self.ui_state.in_game_state {
                 InGameState::ActionMenu { selected_index, .. }
                 | InGameState::ProductionMenu { selected_index, .. }
-                | InGameState::TargetSelection { selected_index, .. } => {
+                | InGameState::TargetSelection { selected_index, .. }
+                | InGameState::CargoSelection { selected_index, .. }
+                | InGameState::DropTargetSelection { selected_index, .. } => {
                     if *selected_index > 0 {
                         *selected_index -= 1;
                     }
                 }
+                InGameState::EventPopup { .. } => {}
                 InGameState::Normal | InGameState::UnitSelected { .. } => {
                     if self.ui_state.cursor_pos.1 > 0 {
                         self.ui_state.cursor_pos.1 -= 1;
@@ -231,6 +249,25 @@ impl App {
                             *selected_index += 1;
                         }
                     }
+                    InGameState::CargoSelection {
+                        selected_index,
+                        passengers,
+                        ..
+                    } => {
+                        if *selected_index < passengers.len().saturating_sub(1) {
+                            *selected_index += 1;
+                        }
+                    }
+                    InGameState::DropTargetSelection {
+                        selected_index,
+                        targets,
+                        ..
+                    } => {
+                        if *selected_index < targets.len().saturating_sub(1) {
+                            *selected_index += 1;
+                        }
+                    }
+                    InGameState::EventPopup { .. } => {}
                     InGameState::Normal | InGameState::UnitSelected { .. } => {
                         self.ui_state.cursor_pos.1 += 1; // TODO bounds check
                     }
@@ -292,9 +329,55 @@ impl App {
 
                                 if let Some(entity) = selected_unit {
                                     options.insert(0, "Wait".to_string());
+                                    
+                                    let mut reachable = std::collections::HashSet::new();
+                                    let mut active_player_id = None;
+                                    let mut u_stats = None;
+                                    let mut fuel_cur = 0;
+
+                                    if let (Some(players), Some(match_state)) = (world.get_resource::<openwars_engine::resources::Players>(), world.get_resource::<openwars_engine::resources::MatchState>()) {
+                                        active_player_id = Some(players.0[match_state.active_player_index.0].id);
+                                    }
+
+                                    if let Ok((st, f)) = world.query::<(&openwars_engine::components::UnitStats, &openwars_engine::components::Fuel)>().get(world, entity) {
+                                        u_stats = Some(st.clone());
+                                        fuel_cur = f.current;
+                                    }
+
+                                    let mut unit_positions = std::collections::HashMap::new();
+                                    let mut q_all = world.query::<(
+                                        &openwars_engine::components::GridPosition,
+                                        &openwars_engine::components::Faction,
+                                        &openwars_engine::components::UnitStats,
+                                        Option<&openwars_engine::components::CargoCapacity>
+                                    )>();
+                                    for (p, f, s, c) in q_all.iter(world) {
+                                        let free_slots = c.map(|c| c.max.saturating_sub(c.loaded.len() as u32)).unwrap_or(0);
+                                        unit_positions.insert((p.x, p.y), openwars_engine::systems::movement::OccupantInfo {
+                                            player_id: f.0,
+                                            is_transport: s.max_cargo > 0,
+                                            loadable_types: s.loadable_unit_types.clone(),
+                                            free_slots,
+                                        });
+                                    }
+
+                                    if let (Some(map), Some(active_id), Some(stats)) = (world.get_resource::<openwars_engine::resources::Map>(), active_player_id, u_stats) {
+                                        reachable = openwars_engine::systems::movement::calculate_reachable_tiles(
+                                            map,
+                                            &unit_positions,
+                                            (cx, cy),
+                                            stats.movement_type,
+                                            stats.max_movement,
+                                            fuel_cur,
+                                            active_id,
+                                            stats.unit_type,
+                                        );
+                                    }
+
                                     self.ui_state.in_game_state = InGameState::UnitSelected {
                                         unit_entity: entity,
                                         start_pos: (cx, cy),
+                                        reachable_tiles: reachable,
                                     };
                                     self.ui_state
                                         .add_log(format!("Selected unit at {:?}", (cx, cy)));
@@ -307,27 +390,32 @@ impl App {
                                     &openwars_engine::components::Property,
                                 )>();
                                 let mut is_factory = false;
+                                let mut capital_pos = None;
                                 for (pos, prop) in p_query.iter(world) {
-                                    if pos.x == cx
-                                        && pos.y == cy
-                                        && prop.owner_id == Some(active_player_id)
-                                        && (prop.terrain
-                                            == openwars_engine::resources::Terrain::Factory
-                                            || prop.terrain
-                                                == openwars_engine::resources::Terrain::Airport
-                                            || prop.terrain
-                                                == openwars_engine::resources::Terrain::Port
-                                            || prop.terrain
-                                                == openwars_engine::resources::Terrain::City
-                                            || prop.terrain
-                                                == openwars_engine::resources::Terrain::Capital)
+                                    if prop.owner_id == Some(active_player_id) {
+                                        if pos.x == cx && pos.y == cy
+                                            && matches!(
+                                                prop.terrain,
+                                                openwars_engine::resources::Terrain::Factory
+                                                    | openwars_engine::resources::Terrain::Airport
+                                                    | openwars_engine::resources::Terrain::Port
+                                                    | openwars_engine::resources::Terrain::Capital
+                                            )
                                         {
                                             is_factory = true;
                                         }
+                                        if prop.terrain == openwars_engine::resources::Terrain::Capital {
+                                            capital_pos = Some((pos.x, pos.y));
+                                        }
+                                    }
                                 }
 
                                 if is_factory {
-                                    options.insert(0, "Produce".to_string());
+                                    if openwars_engine::systems::production::is_within_production_range(capital_pos, cx, cy) {
+                                        options.insert(0, "Produce".to_string());
+                                    } else {
+                                        self.ui_state.add_log("Too far from Capital to produce!".to_string());
+                                    }
                                 }
                             }
                         }
@@ -361,13 +449,55 @@ impl App {
                                 world.send_event(openwars_engine::events::NextPhaseCommand);
                             }
                         } else if selected == "Produce" {
-                            let build_options = vec!["軽歩兵", "重歩兵", "軽戦車", "砲台", "Cancel"]
-                                .into_iter()
-                                .map(|s| s.to_string())
-                                .collect();
+                            let mut options = Vec::new();
+                            if let Some(world) = &mut self.world {
+                                let mut is_air = false;
+                                let mut is_port = false;
+                                let mut player_funds = 0;
+
+                                if let (Some(match_state), Some(players)) = (
+                                    world.get_resource::<openwars_engine::resources::MatchState>(),
+                                    world.get_resource::<openwars_engine::resources::Players>(),
+                                ) {
+                                    player_funds = players.0[match_state.active_player_index.0].funds;
+                                }
+
+                                let mut p_query = world.query::<(&openwars_engine::components::GridPosition, &openwars_engine::components::Property)>();
+                                for (pos, prop) in p_query.iter(world) {
+                                    if pos.x == self.ui_state.cursor_pos.0 && pos.y == self.ui_state.cursor_pos.1 {
+                                        if prop.terrain == openwars_engine::resources::Terrain::Airport {
+                                            is_air = true;
+                                        } else if prop.terrain == openwars_engine::resources::Terrain::Port {
+                                            is_port = true;
+                                        }
+                                    }
+                                }
+
+                                let mut sorted_names: Vec<_> = self.master_data.units.keys().cloned().collect();
+                                sorted_names.sort_by_key(|a| a.0.clone());
+                                for name in sorted_names {
+                                    if let Some(record) = self.master_data.units.get(&name) {
+                                        if player_funds < record.cost {
+                                            continue; // Can't afford it, don't show it!
+                                        }
+
+                                        let is_air_unit = record.movement_type.0 == "低空" || record.movement_type.0 == "高空" || record.movement_type.0 == "飛行";
+                                        let is_naval_unit = record.movement_type.0 == "艦船" || record.movement_type.0 == "輸送船" || record.movement_type.0 == "海軍";
+                                        
+                                        if (is_air && is_air_unit)
+                                            || (is_port && is_naval_unit)
+                                            || (!is_air && !is_port && !is_air_unit && !is_naval_unit)
+                                        {
+                                            options.push(name.0.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            options.push("Cancel".to_string());
+
                             self.ui_state.in_game_state = InGameState::ProductionMenu {
                                 factory_pos: self.ui_state.cursor_pos,
-                                options: build_options,
+                                options,
                                 selected_index: 0,
                             };
                         } else if let Some(entity) = unit_entity {
@@ -397,10 +527,26 @@ impl App {
                                 };
                                 self.ui_state
                                     .add_log("Select target to attack...".to_string());
+                            } else if selected == "Drop" {
+                                let mut passengers = vec![];
+                                if let Some(world) = &mut self.world {
+                                    let mut q = world.query::<&openwars_engine::components::CargoCapacity>();
+                                    if let Ok(cargo) = q.get(world, entity) {
+                                        passengers = cargo.loaded.clone();
+                                    }
+                                }
+                                if passengers.is_empty() {
+                                    self.ui_state.add_log("No passengers to drop.".to_string());
+                                } else {
+                                    self.ui_state.in_game_state = InGameState::CargoSelection {
+                                        transport_entity: entity,
+                                        passengers,
+                                        selected_index: 0,
+                                    };
+                                }
                             } else if selected == "Supply"
                                 || selected == "Join"
                                 || selected == "Load"
-                                || selected == "Drop"
                             {
                                 self.ui_state.in_game_state = InGameState::TargetSelection {
                                     unit_entity: entity,
@@ -484,29 +630,6 @@ impl App {
                                     self.ui_state
                                         .add_log("No transport at target. Cancelled.".to_string());
                                 }
-                            } else if action == "Drop" {
-                                // For dropping we just need a coordinate
-                                // OpenWars Spec: UnloadUnitCommand { transport_entity, cargo_entity, target_x, target_y }
-                                // In the CLI, the transport drops *the first passenger it has*.
-                                // Since we don't have passenger ID directly without querying, we will fake it or query it.
-                                let mut passenger = None;
-                                if let Ok(cargo) = world.query_filtered::<&openwars_engine::components::CargoCapacity, bevy_ecs::query::With<openwars_engine::components::GridPosition>>().get(world, unit_entity)
-                                    && !cargo.loaded.is_empty() {
-                                        passenger = Some(cargo.loaded[0]);
-                                    }
-                                if let Some(p) = passenger {
-                                    world.send_event(openwars_engine::events::UnloadUnitCommand {
-                                        transport_entity: unit_entity,
-                                        cargo_entity: p,
-                                        target_x: cx,
-                                        target_y: cy,
-                                    });
-                                    self.ui_state
-                                        .add_log(format!("Dropping passenger at {:?}", (cx, cy)));
-                                } else {
-                                    self.ui_state
-                                        .add_log("No passengers to drop. Cancelled.".to_string());
-                                }
                             }
                         }
                         self.ui_state.in_game_state = InGameState::Normal;
@@ -546,32 +669,74 @@ impl App {
                     InGameState::UnitSelected {
                         unit_entity,
                         start_pos: _,
+                        reachable_tiles,
+                    } => {
+                        let cx = self.ui_state.cursor_pos.0;
+                        let cy = self.ui_state.cursor_pos.1;
+
+                        if !reachable_tiles.contains(&(cx, cy)) {
+                            self.ui_state.add_log("Target is out of movement range.".to_string());
+                            self.ui_state.in_game_state = InGameState::Normal;
+                        } else {
+                            if let Some(world) = &mut self.world {
+                                world.send_event(openwars_engine::events::MoveUnitCommand {
+                                    unit_entity,
+                                    target_x: cx,
+                                    target_y: cy,
+                                });
+                            }
+                            self.ui_state
+                                .add_log(format!("Moved unit to {:?}", (cx, cy)));
+                            self.ui_state.in_game_state = InGameState::ActionMenu {
+                                unit_entity: Some(unit_entity),
+                                options: vec![
+                                    "Wait".to_string(),
+                                    "Attack".to_string(),
+                                    "Capture".to_string(),
+                                    "Supply".to_string(),
+                                    "Join".to_string(),
+                                    "Load".to_string(),
+                                    "Drop".to_string(),
+                                    "Cancel".to_string(),
+                                ],
+                                selected_index: 0,
+                            };
+                        }
+                    }
+                    InGameState::CargoSelection {
+                        transport_entity,
+                        passengers,
+                        selected_index,
+                    } => {
+                        let passenger = passengers[selected_index];
+                        self.ui_state.in_game_state = InGameState::DropTargetSelection {
+                            transport_entity,
+                            cargo_entity: passenger,
+                            targets: vec![],
+                            selected_index: 0,
+                        };
+                        self.ui_state.add_log("Select target tile to drop...".to_string());
+                    }
+                    InGameState::DropTargetSelection {
+                        transport_entity,
+                        cargo_entity,
+                        ..
                     } => {
                         let cx = self.ui_state.cursor_pos.0;
                         let cy = self.ui_state.cursor_pos.1;
                         if let Some(world) = &mut self.world {
-                            world.send_event(openwars_engine::events::MoveUnitCommand {
-                                unit_entity,
+                            world.send_event(openwars_engine::events::UnloadUnitCommand {
+                                transport_entity,
+                                cargo_entity,
                                 target_x: cx,
                                 target_y: cy,
                             });
                         }
-                        self.ui_state
-                            .add_log(format!("Moved unit to {:?}", (cx, cy)));
-                        self.ui_state.in_game_state = InGameState::ActionMenu {
-                            unit_entity: Some(unit_entity),
-                            options: vec![
-                                "Wait".to_string(),
-                                "Attack".to_string(),
-                                "Capture".to_string(),
-                                "Supply".to_string(),
-                                "Join".to_string(),
-                                "Load".to_string(),
-                                "Drop".to_string(),
-                                "Cancel".to_string(),
-                            ],
-                            selected_index: 0,
-                        };
+                        self.ui_state.add_log(format!("Dropping passenger at {:?}", (cx, cy)));
+                        self.ui_state.in_game_state = InGameState::Normal;
+                    }
+                    InGameState::EventPopup { .. } => {
+                        self.ui_state.in_game_state = InGameState::Normal;
                     }
                 }
             }
@@ -756,14 +921,14 @@ impl App {
                 let mut income = 0;
                 for y in 0..height {
                     for x in 0..width {
-                        if let Some(cell) = map_data.get_cell(x, y) {
-                            if cell.player_id == pid {
-                                let landscape_name = self.master_data.get_landscape(cell.terrain_id)
-                                    .map(|l| l.name.as_str())
-                                    .unwrap_or("平地");
-                                if landscape_name == "都市" || landscape_name == "空港" {
-                                    income += 1000;
-                                }
+                        if let Some(cell) = map_data.get_cell(x, y)
+                            && cell.player_id == pid
+                        {
+                            let landscape_name = self.master_data.get_landscape(cell.terrain_id)
+                                .map(|l| l.name.as_str())
+                                .unwrap_or("平地");
+                            if landscape_name == "都市" || landscape_name == "空港" {
+                                income += 1000;
                             }
                         }
                     }
