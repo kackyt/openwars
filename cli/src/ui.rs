@@ -232,15 +232,9 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         }
         crate::app::InGameState::TargetSelection {
             action,
-            targets,
-            selected_index,
             ..
         } => {
-            let options: Vec<String> = targets
-                .iter()
-                .map(|(x, y)| format!("At ({}, {})", x, y))
-                .collect();
-            menu_data = Some((action.clone(), options, *selected_index));
+            menu_data = Some((action.clone(), vec!["[Select with Cursor]".to_string()], 0));
         }
         crate::app::InGameState::CargoSelection {
             passengers,
@@ -266,18 +260,9 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             menu_data = Some(("Drop which?".to_string(), options, *selected_index));
         }
         crate::app::InGameState::DropTargetSelection {
-            targets,
-            selected_index,
             ..
         } => {
-            let mut options: Vec<String> = targets
-                .iter()
-                .map(|(x, y)| format!("To ({}, {})", x, y))
-                .collect();
-            if options.is_empty() {
-                options.push("None".to_string());
-            }
-            menu_data = Some(("Drop where?".to_string(), options, *selected_index));
+            menu_data = Some(("Drop where?".to_string(), vec!["[Select with Cursor]".to_string()], 0));
         }
         _ => {}
     }

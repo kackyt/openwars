@@ -228,15 +228,16 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => match &mut self.ui_state.in_game_state {
                 InGameState::ActionMenu { selected_index, .. }
                 | InGameState::ProductionMenu { selected_index, .. }
-                | InGameState::TargetSelection { selected_index, .. }
-                | InGameState::CargoSelection { selected_index, .. }
-                | InGameState::DropTargetSelection { selected_index, .. } => {
+                | InGameState::CargoSelection { selected_index, .. } => {
                     if *selected_index > 0 {
                         *selected_index -= 1;
                     }
                 }
                 InGameState::EventPopup { .. } => {}
-                InGameState::Normal | InGameState::UnitSelected { .. } => {
+                InGameState::Normal
+                | InGameState::UnitSelected { .. }
+                | InGameState::TargetSelection { .. }
+                | InGameState::DropTargetSelection { .. } => {
                     if self.ui_state.cursor_pos.1 > 0 {
                         self.ui_state.cursor_pos.1 -= 1;
                     }
@@ -257,15 +258,6 @@ impl App {
                         *selected_index += 1;
                     }
                 }
-                InGameState::TargetSelection {
-                    selected_index,
-                    targets,
-                    ..
-                } => {
-                    if *selected_index < targets.len().saturating_sub(1) {
-                        *selected_index += 1;
-                    }
-                }
                 InGameState::CargoSelection {
                     selected_index,
                     passengers,
@@ -275,17 +267,11 @@ impl App {
                         *selected_index += 1;
                     }
                 }
-                InGameState::DropTargetSelection {
-                    selected_index,
-                    targets,
-                    ..
-                } => {
-                    if *selected_index < targets.len().saturating_sub(1) {
-                        *selected_index += 1;
-                    }
-                }
                 InGameState::EventPopup { .. } => {}
-                InGameState::Normal | InGameState::UnitSelected { .. } => {
+                InGameState::Normal
+                | InGameState::UnitSelected { .. }
+                | InGameState::TargetSelection { .. }
+                | InGameState::DropTargetSelection { .. } => {
                     if let Some(world) = &self.world
                         && let Some(map) = world.get_resource::<openwars_engine::resources::Map>()
                         && self.ui_state.cursor_pos.1 < map.height.saturating_sub(1)
@@ -297,7 +283,10 @@ impl App {
             KeyCode::Left | KeyCode::Char('h') => {
                 if matches!(
                     self.ui_state.in_game_state,
-                    InGameState::Normal | InGameState::UnitSelected { .. }
+                    InGameState::Normal
+                        | InGameState::UnitSelected { .. }
+                        | InGameState::TargetSelection { .. }
+                        | InGameState::DropTargetSelection { .. }
                 ) && self.ui_state.cursor_pos.0 > 0
                 {
                     self.ui_state.cursor_pos.0 -= 1;
@@ -306,7 +295,10 @@ impl App {
             KeyCode::Right | KeyCode::Char('l') => {
                 if matches!(
                     self.ui_state.in_game_state,
-                    InGameState::Normal | InGameState::UnitSelected { .. }
+                    InGameState::Normal
+                        | InGameState::UnitSelected { .. }
+                        | InGameState::TargetSelection { .. }
+                        | InGameState::DropTargetSelection { .. }
                 ) && let Some(world) = &self.world
                     && let Some(map) = world.get_resource::<openwars_engine::resources::Map>()
                     && self.ui_state.cursor_pos.0 < map.width.saturating_sub(1)
