@@ -467,4 +467,33 @@ mod tests {
         assert_eq!(inf_loads[0].target, "歩兵");
         assert_eq!(inf_loads[0].capacity, 2);
     }
+
+    #[test]
+    fn test_landscape_income() {
+        let registry = MasterDataRegistry::load().unwrap();
+        // 首都は収入4000
+        assert_eq!(registry.landscape_income("首都"), 4000);
+        // 道路は収入なし
+        assert_eq!(registry.landscape_income("道路"), 0);
+        // 存在しない地形
+        assert_eq!(registry.landscape_income("存在しない"), 0);
+    }
+
+    #[test]
+    fn test_is_production_facility() {
+        let registry = MasterDataRegistry::load().unwrap();
+        // 首都は生産施設（supply_typeあり）
+        assert!(registry.is_production_facility("首都"));
+        // 道路は生産施設ではない
+        assert!(!registry.is_production_facility("道路"));
+    }
+
+    #[test]
+    fn test_can_produce_unit() {
+        let registry = MasterDataRegistry::load().unwrap();
+        // 首都（地上部隊）で歩兵生産可能
+        assert!(registry.can_produce_unit("首都", "歩兵"));
+        // 首都で航空は生産不可
+        assert!(!registry.can_produce_unit("首都", "航空"));
+    }
 }
