@@ -188,14 +188,15 @@ where
 
                 if let Some(mut events) = world.get_resource_mut::<Events<UnitAttackedEvent>>() {
                     for ev in events.drain() {
-                        let text = if let Some(cdmg) = ev.counter_damage_dealt {
-                            format!(
-                                "Combat Result\nDamage dealt: {}0%\nCounter damage: {}0%",
-                                ev.damage_dealt, cdmg
-                            )
-                        } else {
-                            format!("Combat Result\nDamage dealt: {}0%", ev.damage_dealt)
-                        };
+                        let a_before_disp = (ev.attacker_hp_before.saturating_add(9)) / 10;
+                        let a_after_disp = (ev.attacker_hp_after.saturating_add(9)) / 10;
+                        let d_before_disp = (ev.defender_hp_before.saturating_add(9)) / 10;
+                        let d_after_disp = (ev.defender_hp_after.saturating_add(9)) / 10;
+
+                        let text = format!(
+                            "Combat Result\nAttacker HP: {} -> {}\nDefender HP: {} -> {}",
+                            a_before_disp, a_after_disp, d_before_disp, d_after_disp
+                        );
                         popup_msg = Some(text);
                     }
                 }

@@ -616,12 +616,36 @@ impl App {
 
                             if action == "Attack" {
                                 if let Some(target) = target_unit {
-                                    world.send_event(openwars_engine::events::AttackUnitCommand {
-                                        attacker_entity: unit_entity,
-                                        defender_entity: target,
-                                    });
-                                    self.ui_state
-                                        .add_log(format!("Attacking target at {:?}", (cx, cy)));
+                                    let mut valid = false;
+                                    let mut q_attacker = world.query::<(&openwars_engine::components::GridPosition, &openwars_engine::components::UnitStats, &openwars_engine::components::HasMoved, &openwars_engine::components::Faction)>();
+                                    let mut q_target = world.query::<&openwars_engine::components::Faction>();
+
+                                    if let Ok((pos, stats, has_moved, attacker_fac)) = q_attacker.get(world, unit_entity) {
+                                        let dist = (pos.x as i64 - cx as i64).unsigned_abs() as u32 + (pos.y as i64 - cy as i64).unsigned_abs() as u32;
+
+                                        let is_indirect = stats.min_range > 1;
+                                        let in_range = dist >= stats.min_range && dist <= stats.max_range;
+                                        let can_attack = in_range && (!is_indirect || !has_moved.0);
+
+                                        if can_attack
+                                            && let Ok(target_fac) = q_target.get(world, target)
+                                            && attacker_fac.0 != target_fac.0
+                                        {
+                                            valid = true;
+                                        }
+                                    }
+
+                                    if valid {
+                                        world.send_event(openwars_engine::events::AttackUnitCommand {
+                                            attacker_entity: unit_entity,
+                                            defender_entity: target,
+                                        });
+                                        self.ui_state
+                                            .add_log(format!("Attacking target at {:?}", (cx, cy)));
+                                    } else {
+                                        self.ui_state
+                                            .add_log("Target invalid or out of range. Cancelled.".to_string());
+                                    }
                                 } else {
                                     self.ui_state
                                         .add_log("No target there. Cancelled.".to_string());
@@ -827,6 +851,7 @@ impl App {
             produce_unit_system,
             move_unit_system,
             attack_unit_system,
+            remove_destroyed_units_system,
             capture_property_system,
             merge_unit_system,
             supply_unit_system,
@@ -838,11 +863,28 @@ impl App {
 
         // Build UnitRegistry and DamageChart from MasterDataRegistry
         let mut damage_chart = openwars_engine::resources::DamageChart::new();
-        for (attacker, weapon) in &self.master_data.weapons {
-            if let Some(att_type) = str_to_unit_type(&attacker.0) {
-                for (def_name, dmg) in &weapon.damages {
-                    if let Some(def_type) = str_to_unit_type(def_name) {
-                        damage_chart.insert_damage(att_type, def_type, *dmg);
+        for (unit_name, unit_record) in &self.master_data.units {
+            if let Some(att_type) = str_to_unit_type(&unit_name.0) {
+                if let Some(w1_name) = &unit_record.weapon1
+                    && let Some(weapon) = self.master_data.weapons.get(
+                        &openwars_engine::resources::master_data::UnitName(w1_name.clone()),
+                    )
+                {
+                    for (def_name, dmg) in &weapon.damages {
+                        if let Some(def_type) = str_to_unit_type(def_name) {
+                            damage_chart.insert_damage(att_type, def_type, *dmg);
+                        }
+                    }
+                }
+                if let Some(w2_name) = &unit_record.weapon2
+                    && let Some(weapon) = self.master_data.weapons.get(
+                        &openwars_engine::resources::master_data::UnitName(w2_name.clone()),
+                    )
+                {
+                    for (def_name, dmg) in &weapon.damages {
+                        if let Some(def_type) = str_to_unit_type(def_name) {
+                            damage_chart.insert_secondary_damage(att_type, def_type, *dmg);
+                        }
                     }
                 }
             }

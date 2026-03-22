@@ -72,6 +72,10 @@ pub struct UnitAttackedEvent {
     pub defender: Entity,
     pub damage_dealt: u32,
     pub counter_damage_dealt: Option<u32>,
+    pub attacker_hp_before: u32,
+    pub attacker_hp_after: u32,
+    pub defender_hp_before: u32,
+    pub defender_hp_after: u32,
 }
 
 #[derive(Event, Debug, Clone)]

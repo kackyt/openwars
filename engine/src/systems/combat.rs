@@ -181,6 +181,12 @@ pub fn attack_unit_system(
             }
         }
 
+        let a_hp_before = attacker_hp.current;
+        let d_hp_before = defender_hp.current;
+
+        let mut a_hp_after = a_hp_before;
+        let mut d_hp_after = d_hp_before;
+
         // Apply ammo consumption and damage using disjoint mutable borrows via get_many_mut
         if let Ok([mut attacker, mut defender]) =
             q_units.get_many_mut([event.attacker_entity, event.defender_entity])
@@ -194,12 +200,15 @@ pub fn attack_unit_system(
             }
             if let Some(d_dmg) = d_damage_opt {
                 attacker.1.damage(d_dmg);
+                a_hp_after = attacker.1.current;
             }
             if let Some(ref mut act) = attacker.6 {
                 act.0 = true; // Set action completed to true
             }
 
             defender.1.damage(a_damage);
+            d_hp_after = defender.1.current;
+            
             if let (Some((d_slot, _)), Some(def_ammo)) = (counter_info, defender.2.as_deref_mut()) {
                 if d_slot == 1 {
                     def_ammo.ammo1 = def_ammo.ammo1.saturating_sub(1);
@@ -214,7 +223,24 @@ pub fn attack_unit_system(
             defender: event.defender_entity,
             damage_dealt: a_damage,
             counter_damage_dealt: d_damage_opt,
+            attacker_hp_before: a_hp_before,
+            attacker_hp_after: a_hp_after,
+            defender_hp_before: d_hp_before,
+            defender_hp_after: d_hp_after,
         });
+    }
+}
+
+pub fn remove_destroyed_units_system(
+    mut commands: Commands,
+    q_units: Query<(Entity, &Health)>,
+    mut destroyed_events: EventWriter<UnitDestroyedEvent>,
+) {
+    for (entity, health) in q_units.iter() {
+        if health.is_destroyed() {
+            commands.entity(entity).despawn();
+            destroyed_events.send(UnitDestroyedEvent { entity });
+        }
     }
 }
 
@@ -245,6 +271,7 @@ mod tests {
 
         world.insert_resource(Events::<AttackUnitCommand>::default());
         world.insert_resource(Events::<UnitAttackedEvent>::default());
+        world.insert_resource(Events::<UnitDestroyedEvent>::default());
 
         let entity_1 = world
             .spawn((
@@ -322,7 +349,7 @@ mod tests {
         });
 
         let mut schedule = Schedule::default();
-        schedule.add_systems(attack_unit_system);
+        schedule.add_systems((attack_unit_system, remove_destroyed_units_system));
         schedule.run(&mut world);
 
         let hp2 = world.get::<Health>(entity_2).unwrap();
