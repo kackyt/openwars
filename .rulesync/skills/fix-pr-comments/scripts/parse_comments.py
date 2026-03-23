@@ -12,9 +12,9 @@ def run_cmd(cmd):
 
 def get_pr_info(pr_arg=None):
     if pr_arg:
-        cmd = ['gh', 'pr', 'view', pr_arg, '--json', 'url,number,comments']
+        cmd = ['gh', 'pr', 'view', pr_arg, '--json', 'url,number,comments,reviews']
     else:
-        cmd = ['gh', 'pr', 'view', '--json', 'url,number,comments']
+        cmd = ['gh', 'pr', 'view', '--json', 'url,number,comments,reviews']
         
     out = run_cmd(cmd)
     data = json.loads(out)
@@ -22,6 +22,10 @@ def get_pr_info(pr_arg=None):
     url = data['url']
     number = data['number']
     general_comments = data.get('comments', [])
+    reviews = data.get('reviews', [])
+    for r in reviews:
+        if r.get('body'):
+            general_comments.append(r)
     
     parts = url.split('/')
     owner = parts[-4]
@@ -31,10 +35,14 @@ def get_pr_info(pr_arg=None):
 
 def fetch_threads(owner, repo, number):
     query = """
-    query($name: String!, $owner: String!, $number: Int!) {
+    query($name: String!, $owner: String!, $number: Int!, $cursor: String) {
       repository(owner: $owner, name: $name) {
         pullRequest(number: $number) {
-          reviewThreads(first: 100) {
+          reviewThreads(first: 100, after: $cursor) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
             nodes {
               isResolved
               isOutdated
@@ -57,16 +65,46 @@ def fetch_threads(owner, repo, number):
     }
     """
     
-    cmd = [
-        'gh', 'api', 'graphql',
-        '-F', f'owner={owner}',
-        '-F', f'name={repo}',
-        '-F', f'number={number}',
-        '-f', f'query={query}'
-    ]
+    all_threads = []
+    cursor = None
     
-    out = run_cmd(cmd)
-    return json.loads(out)
+    while True:
+        cmd = [
+            'gh', 'api', 'graphql',
+            '-F', f'owner={owner}',
+            '-F', f'name={repo}',
+            '-F', f'number={number}',
+            '-f', f'query={query}'
+        ]
+        if cursor:
+            cmd.extend(['-F', f'cursor={cursor}'])
+            
+        out = run_cmd(cmd)
+        data = json.loads(out)
+        
+        pr_data = data.get('data', {}).get('repository', {}).get('pullRequest', {})
+        threads_page = pr_data.get('reviewThreads', {})
+        
+        all_threads.extend(threads_page.get('nodes', []))
+        
+        page_info = threads_page.get('pageInfo', {})
+        if page_info.get('hasNextPage'):
+            cursor = page_info.get('endCursor')
+        else:
+            break
+            
+    result_data = {
+        'data': {
+            'repository': {
+                'pullRequest': {
+                    'reviewThreads': {
+                        'nodes': all_threads
+                    }
+                }
+            }
+        }
+    }
+    return result_data
 
 def generate_markdown(general_comments, threads_data):
     output_lines = ["# PR Review Comments Suggestions\n"]
