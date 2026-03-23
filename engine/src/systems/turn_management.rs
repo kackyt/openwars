@@ -14,9 +14,7 @@ fn apply_daily_updates_for_unit(
     if hp.is_destroyed() {
         return;
     }
-    if stats.movement_type == MovementType::Air
-        || stats.movement_type == MovementType::Air
-    {
+    if stats.movement_type == MovementType::Air || stats.movement_type == MovementType::Air {
         let terrain = map.get_terrain(pos.x, pos.y);
         if terrain != Some(Terrain::Airport) {
             if fuel.current == 0 {
@@ -177,4 +175,3 @@ fn process_resupply_and_reset(
         }
     }
 }
-

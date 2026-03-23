@@ -115,14 +115,11 @@ pub fn calculate_reachable_tiles(
                 }
             }
 
-            if let Some(terrain_cost) = map
-                .get_terrain(nx, ny)
-                .and_then(|t| {
-                    master_data
-                        .get_movement_cost(movement_type.as_str(), t.as_str())
-                        .filter(|&c| c < 99)
-                })
-            {
+            if let Some(terrain_cost) = map.get_terrain(nx, ny).and_then(|t| {
+                master_data
+                    .get_movement_cost(movement_type.as_str(), t.as_str())
+                    .filter(|&c| c < 99)
+            }) {
                 let next_cost = cost + terrain_cost;
                 let next_fuel = fuel_used + 1;
 
@@ -276,14 +273,11 @@ pub fn find_path_a_star(
                 }
             }
 
-            if let Some(terrain_cost) = map
-                .get_terrain(nx, ny)
-                .and_then(|t| {
-                    master_data
-                        .get_movement_cost(movement_type.as_str(), t.as_str())
-                        .filter(|&c| c < 99)
-                })
-            {
+            if let Some(terrain_cost) = map.get_terrain(nx, ny).and_then(|t| {
+                master_data
+                    .get_movement_cost(movement_type.as_str(), t.as_str())
+                    .filter(|&c| c < 99)
+            }) {
                 let next_cost = cost + terrain_cost;
                 let next_fuel = fuel_used + 1;
 
@@ -760,4 +754,3 @@ mod tests {
         // Let's modify move_unit_system slightly to check for transports upon arrival
     }
 }
-

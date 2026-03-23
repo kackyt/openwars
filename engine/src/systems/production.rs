@@ -204,4 +204,3 @@ mod tests {
         assert_eq!(players.0[0].funds, 1000); // 2000 - 1000
     }
 }
-

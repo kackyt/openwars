@@ -193,4 +193,3 @@ mod tests {
         assert_eq!(ammo.ammo1, 9);
     }
 }
-

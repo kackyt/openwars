@@ -296,4 +296,3 @@ mod tests {
         assert!(cargo_act.0);
     }
 }
-

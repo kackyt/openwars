@@ -23,8 +23,6 @@ pub struct UnitName(pub String);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 pub struct LandscapeId(pub u32);
 
-
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct LandscapeRecord {
     #[serde(rename = "ID")]

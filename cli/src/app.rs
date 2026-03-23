@@ -3,7 +3,6 @@ use openwars_engine::components::{GridPosition, PlayerId, Property};
 use openwars_engine::resources::master_data::MasterDataRegistry;
 use openwars_engine::resources::{GridTopology, Map, MatchState, Player, Players, Terrain};
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CurrentScreen {
     MapSelection,
@@ -79,9 +78,6 @@ impl UiState {
         }
     }
 }
-
-
-
 
 pub struct App {
     pub master_data: MasterDataRegistry,
@@ -350,8 +346,7 @@ impl App {
                                     if prop.owner_id == Some(active_player_id) {
                                         if pos.x == cx && pos.y == cy {
                                             // マスターデータを使った生産施設判定
-                                            let landscape_name =
-                                                prop.terrain.as_str();
+                                            let landscape_name = prop.terrain.as_str();
                                             if self
                                                 .master_data
                                                 .is_production_facility(landscape_name)
@@ -446,10 +441,10 @@ impl App {
                                         }
 
                                         // 施設とユニットマスターの移動タイプを照合して生産可能か判定
-                                        if self.master_data.can_produce_unit(
-                                            landscape_name,
-                                            &record.movement_type,
-                                        ) {
+                                        if self
+                                            .master_data
+                                            .can_produce_unit(landscape_name, &record.movement_type)
+                                        {
                                             options.push(name.0.clone());
                                         }
                                     }
@@ -653,7 +648,9 @@ impl App {
                             {
                                 let active_player_id =
                                     players.0[match_state.active_player_index.0].id;
-                                let Some(unit_type) = openwars_engine::resources::UnitType::from_str(selected) else {
+                                let Some(unit_type) =
+                                    openwars_engine::resources::UnitType::from_str(selected)
+                                else {
                                     self.ui_state
                                         .add_log(format!("未対応のユニット種別です: {}", selected));
                                     self.ui_state.in_game_state = InGameState::Normal;
@@ -820,7 +817,9 @@ impl App {
                     )
                 {
                     for (def_name, dmg) in &weapon.damages {
-                        if let Some(def_type) = openwars_engine::resources::UnitType::from_str(def_name) {
+                        if let Some(def_type) =
+                            openwars_engine::resources::UnitType::from_str(def_name)
+                        {
                             damage_chart.insert_damage(att_type, def_type, *dmg);
                         }
                     }
@@ -831,7 +830,9 @@ impl App {
                     )
                 {
                     for (def_name, dmg) in &weapon.damages {
-                        if let Some(def_type) = openwars_engine::resources::UnitType::from_str(def_name) {
+                        if let Some(def_type) =
+                            openwars_engine::resources::UnitType::from_str(def_name)
+                        {
                             damage_chart.insert_secondary_damage(att_type, def_type, *dmg);
                         }
                     }
@@ -874,7 +875,9 @@ impl App {
                 if let Some(loads) = self.master_data.loads.get(&name.0) {
                     for load_record in loads {
                         max_cargo = max_cargo.max(load_record.capacity);
-                        if let Some(target_type) = openwars_engine::resources::UnitType::from_str(&load_record.target) {
+                        if let Some(target_type) =
+                            openwars_engine::resources::UnitType::from_str(&load_record.target)
+                        {
                             loadable.push(target_type);
                         }
                     }
@@ -896,8 +899,10 @@ impl App {
                     unit_type: u_type,
                     cost: record.cost,
                     max_movement: record.movement,
-                    movement_type: openwars_engine::resources::MovementType::from_str(&record.movement_type)
-                        .unwrap_or(openwars_engine::resources::MovementType::Tank),
+                    movement_type: openwars_engine::resources::MovementType::from_str(
+                        &record.movement_type,
+                    )
+                    .unwrap_or(openwars_engine::resources::MovementType::Tank),
                     max_fuel: record.fuel,
                     max_ammo1: w1.map(|w| w.ammo).unwrap_or(0),
                     max_ammo2: w2.map(|w| w.ammo).unwrap_or(0),
@@ -933,7 +938,8 @@ impl App {
                             .map(|l| l.name.as_str())
                             .unwrap_or("平地");
 
-                        let terrain = openwars_engine::resources::Terrain::from_str(landscape_name).unwrap_or(openwars_engine::resources::Terrain::Plains);
+                        let terrain = openwars_engine::resources::Terrain::from_str(landscape_name)
+                            .unwrap_or(openwars_engine::resources::Terrain::Plains);
                         let _ = ecs_map.set_terrain(x, y, terrain);
 
                         if cell.player_id != 0 {

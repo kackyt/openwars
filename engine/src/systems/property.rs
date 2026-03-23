@@ -350,4 +350,3 @@ mod tests {
         assert_eq!(ms.game_over, None); // Game should not be over yet
     }
 }
-

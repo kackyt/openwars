@@ -372,4 +372,3 @@ mod tests {
         assert_eq!(events[0].defender, entity_2);
     }
 }
-

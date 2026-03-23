@@ -215,4 +215,3 @@ mod tests {
         assert_eq!(events2[0].entity, source_entity);
     }
 }
-
