@@ -312,6 +312,7 @@ pub fn find_path_a_star(
 /// 5. 移動先に同じプレイヤーの輸送ユニットが待機しており、積載条件を満たしていれば `LoadUnitCommand` を発行して自動積載します。
 /// 6. 移動結果を `UnitMovedEvent` として発行します。
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 pub fn move_unit_system(
     mut move_events: EventReader<MoveUnitCommand>,
     mut moved_events: EventWriter<UnitMovedEvent>,

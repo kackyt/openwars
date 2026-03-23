@@ -104,6 +104,7 @@ impl UnitType {
             .unwrap_or("不明")
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         UNIT_TYPE_MAP
             .iter()
@@ -139,6 +140,7 @@ impl MovementType {
             .map(|(_, s)| *s)
             .unwrap_or("不明")
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         MOVEMENT_TYPE_MAP
             .iter()
@@ -189,6 +191,7 @@ impl Terrain {
             .unwrap_or("不明")
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         TERRAIN_MAP
             .iter()
