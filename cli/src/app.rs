@@ -3,42 +3,6 @@ use openwars_engine::components::{GridPosition, PlayerId, Property};
 use openwars_engine::resources::master_data::MasterDataRegistry;
 use openwars_engine::resources::{GridTopology, Map, MatchState, Player, Players, Terrain};
 
-fn landscape_name_to_terrain(name: &str) -> Terrain {
-    match name {
-        "平地" => Terrain::Plains,
-        "道路" => Terrain::Road,
-        "川" => Terrain::River,
-        "橋" => Terrain::Bridge,
-        "山" => Terrain::Mountain,
-        "森" => Terrain::Forest,
-        "海" => Terrain::Sea,
-        "浅瀬" => Terrain::Shoal,
-        "都市" => Terrain::City,
-        "工場" => Terrain::Factory,
-        "空港" => Terrain::Airport,
-        "港" => Terrain::Port,
-        "首都" => Terrain::Capital,
-        _ => Terrain::Plains, // fallback
-    }
-}
-
-fn terrain_to_landscape_name(terrain: &Terrain) -> &'static str {
-    match terrain {
-        Terrain::Plains => "平地",
-        Terrain::Road => "道路",
-        Terrain::River => "川",
-        Terrain::Bridge => "橋",
-        Terrain::Mountain => "山",
-        Terrain::Forest => "森",
-        Terrain::Sea => "海",
-        Terrain::Shoal => "浅瀬",
-        Terrain::City => "都市",
-        Terrain::Factory => "工場",
-        Terrain::Airport => "空港",
-        Terrain::Port => "港",
-        Terrain::Capital => "首都",
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CurrentScreen {
@@ -116,45 +80,8 @@ impl UiState {
     }
 }
 
-fn str_to_unit_type(name: &str) -> Option<openwars_engine::resources::UnitType> {
-    use openwars_engine::resources::UnitType::*;
-    match name {
-        "軽歩兵" | "歩兵" => Some(Infantry),
-        "重歩兵" | "バズーカ兵" => Some(Mech),
-        "装甲車" | "偵察車" => Some(Recon),
-        "軽戦車" | "戦車" => Some(Tank),
-        "中戦車" => Some(MdTank),
-        "重戦車" => Some(TankZ),
-        "砲台" | "自走砲" => Some(Artillery),
-        "ロケットランチャー" | "ロケット砲" => Some(Rockets),
-        "対空戦車" => Some(AntiAir),
-        "対空ミサイル" | "ミサイル" => Some(Missiles),
-        "軽戦闘機" | "戦闘機" => Some(Fighter),
-        "重戦闘機" | "爆撃機" => Some(Bomber),
-        "戦闘ヘリ" => Some(Bcopters),
-        "輸送ヘリ" => Some(TransportHelicopter),
-        "戦艦" => Some(Battleship),
-        "巡洋艦" => Some(Cruiser),
-        "輸送船" => Some(Lander),
-        "潜水艦" => Some(Submarine),
-        "補給輸送車" | "輸送車" => Some(SupplyTruck),
-        _ => None,
-    }
-}
 
-fn str_to_movement_type(name: &str) -> Option<openwars_engine::resources::MovementType> {
-    use openwars_engine::resources::MovementType::*;
-    match name {
-        "歩兵" => Some(Foot),
-        "車両" => Some(Vehicle),
-        "装軌" | "キャタピラ" => Some(Tracked),
-        "タイヤ" => Some(Tires),
-        "低空" => Some(LowAltitude),
-        "高空" => Some(HighAltitude),
-        "輸送船" | "艦船" => Some(Ship),
-        _ => None,
-    }
-}
+
 
 pub struct App {
     pub master_data: MasterDataRegistry,
@@ -398,6 +325,7 @@ impl App {
                                             fuel_cur,
                                             active_player_id,
                                             u_type,
+                                            &self.master_data,
                                         );
                                     }
 
@@ -423,7 +351,7 @@ impl App {
                                         if pos.x == cx && pos.y == cy {
                                             // マスターデータを使った生産施設判定
                                             let landscape_name =
-                                                terrain_to_landscape_name(&prop.terrain);
+                                                prop.terrain.as_str();
                                             if self
                                                 .master_data
                                                 .is_production_facility(landscape_name)
@@ -504,7 +432,7 @@ impl App {
                                     if pos.x == self.ui_state.cursor_pos.0
                                         && pos.y == self.ui_state.cursor_pos.1
                                     {
-                                        landscape_name = terrain_to_landscape_name(&prop.terrain);
+                                        landscape_name = prop.terrain.as_str();
                                     }
                                 }
 
@@ -520,7 +448,7 @@ impl App {
                                         // 施設とユニットマスターの移動タイプを照合して生産可能か判定
                                         if self.master_data.can_produce_unit(
                                             landscape_name,
-                                            &record.movement_type.0,
+                                            &record.movement_type,
                                         ) {
                                             options.push(name.0.clone());
                                         }
@@ -725,8 +653,12 @@ impl App {
                             {
                                 let active_player_id =
                                     players.0[match_state.active_player_index.0].id;
-                                let unit_type = str_to_unit_type(selected)
-                                    .unwrap_or(openwars_engine::resources::UnitType::Infantry);
+                                let Some(unit_type) = openwars_engine::resources::UnitType::from_str(selected) else {
+                                    self.ui_state
+                                        .add_log(format!("未対応のユニット種別です: {}", selected));
+                                    self.ui_state.in_game_state = InGameState::Normal;
+                                    return;
+                                };
                                 world.send_event(openwars_engine::events::ProduceUnitCommand {
                                     player_id: active_player_id,
                                     target_x: factory_pos.0,
@@ -861,31 +793,34 @@ impl App {
 
         // Add game logic systems (order is important for game loop, but default parallel works for independent ones)
         // Note: engine systems are mostly command -> event processors.
-        schedule.add_systems((
-            produce_unit_system,
-            move_unit_system,
-            attack_unit_system,
-            remove_destroyed_units_system,
-            capture_property_system,
-            merge_unit_system,
-            supply_unit_system,
-            load_unit_system,
-            unload_unit_system,
-            next_phase_system,
-            daily_update_system,
-        ));
+        schedule.add_systems(
+            (
+                produce_unit_system,
+                move_unit_system,
+                attack_unit_system,
+                remove_destroyed_units_system,
+                capture_property_system,
+                merge_unit_system,
+                supply_unit_system,
+                load_unit_system,
+                unload_unit_system,
+                next_phase_system,
+                daily_update_system,
+            )
+                .chain(),
+        );
 
         // Build UnitRegistry and DamageChart from MasterDataRegistry
         let mut damage_chart = openwars_engine::resources::DamageChart::new();
         for (unit_name, unit_record) in &self.master_data.units {
-            if let Some(att_type) = str_to_unit_type(&unit_name.0) {
+            if let Some(att_type) = openwars_engine::resources::UnitType::from_str(&unit_name.0) {
                 if let Some(w1_name) = &unit_record.weapon1
                     && let Some(weapon) = self.master_data.weapons.get(
                         &openwars_engine::resources::master_data::UnitName(w1_name.clone()),
                     )
                 {
                     for (def_name, dmg) in &weapon.damages {
-                        if let Some(def_type) = str_to_unit_type(def_name) {
+                        if let Some(def_type) = openwars_engine::resources::UnitType::from_str(def_name) {
                             damage_chart.insert_damage(att_type, def_type, *dmg);
                         }
                     }
@@ -896,7 +831,7 @@ impl App {
                     )
                 {
                     for (def_name, dmg) in &weapon.damages {
-                        if let Some(def_type) = str_to_unit_type(def_name) {
+                        if let Some(def_type) = openwars_engine::resources::UnitType::from_str(def_name) {
                             damage_chart.insert_secondary_damage(att_type, def_type, *dmg);
                         }
                     }
@@ -907,9 +842,9 @@ impl App {
 
         let mut unit_registry_map = std::collections::HashMap::new();
         for (name, record) in &self.master_data.units {
-            if let Some(u_type) = str_to_unit_type(&name.0) {
-                let mut min_range = 1;
-                let mut max_range = 1;
+            if let Some(u_type) = openwars_engine::resources::UnitType::from_str(&name.0) {
+                let mut min_range = 0;
+                let mut max_range = 0;
 
                 let w1 = record.weapon1.as_ref().and_then(|w| {
                     self.master_data.weapons.get(
@@ -939,7 +874,7 @@ impl App {
                 if let Some(loads) = self.master_data.loads.get(&name.0) {
                     for load_record in loads {
                         max_cargo = max_cargo.max(load_record.capacity);
-                        if let Some(target_type) = str_to_unit_type(&load_record.target) {
+                        if let Some(target_type) = openwars_engine::resources::UnitType::from_str(&load_record.target) {
                             loadable.push(target_type);
                         }
                     }
@@ -947,12 +882,12 @@ impl App {
 
                 let daily_fuel = match u_type {
                     openwars_engine::resources::UnitType::Fighter
+                    | openwars_engine::resources::UnitType::HeavyFighter
                     | openwars_engine::resources::UnitType::Bomber => 5,
                     openwars_engine::resources::UnitType::Bcopters
                     | openwars_engine::resources::UnitType::TransportHelicopter => 2,
-                    openwars_engine::resources::UnitType::Submarine => 1,
                     openwars_engine::resources::UnitType::Battleship
-                    | openwars_engine::resources::UnitType::Cruiser
+                    | openwars_engine::resources::UnitType::Carrier
                     | openwars_engine::resources::UnitType::Lander => 1,
                     _ => 0,
                 };
@@ -961,8 +896,8 @@ impl App {
                     unit_type: u_type,
                     cost: record.cost,
                     max_movement: record.movement,
-                    movement_type: str_to_movement_type(&record.movement_type.0)
-                        .unwrap_or(openwars_engine::resources::MovementType::Tires),
+                    movement_type: openwars_engine::resources::MovementType::from_str(&record.movement_type)
+                        .unwrap_or(openwars_engine::resources::MovementType::Tank),
                     max_fuel: record.fuel,
                     max_ammo1: w1.map(|w| w.ammo).unwrap_or(0),
                     max_ammo2: w2.map(|w| w.ammo).unwrap_or(0),
@@ -998,7 +933,7 @@ impl App {
                             .map(|l| l.name.as_str())
                             .unwrap_or("平地");
 
-                        let terrain = landscape_name_to_terrain(landscape_name);
+                        let terrain = openwars_engine::resources::Terrain::from_str(landscape_name).unwrap_or(openwars_engine::resources::Terrain::Plains);
                         let _ = ecs_map.set_terrain(x, y, terrain);
 
                         if cell.player_id != 0 {

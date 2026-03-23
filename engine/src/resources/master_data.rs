@@ -23,33 +23,7 @@ pub struct UnitName(pub String);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 pub struct LandscapeId(pub u32);
 
-/// 移動タイプを識別するためのNewtype
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, serde::Serialize)]
-pub struct MovementType(pub String);
 
-impl From<String> for MovementType {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-
-impl From<&str> for MovementType {
-    fn from(s: &str) -> Self {
-        Self(s.to_string())
-    }
-}
-
-impl AsRef<str> for MovementType {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for MovementType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LandscapeRecord {
@@ -76,7 +50,7 @@ pub struct UnitRecord {
     #[serde(rename = "移動力")]
     pub movement: u32,
     #[serde(rename = "移動タイプ")]
-    pub movement_type: MovementType,
+    pub movement_type: String,
     #[serde(rename = "燃料")]
     pub fuel: u32,
     #[serde(rename = "武器1")]
@@ -97,7 +71,7 @@ pub struct WeaponRecord {
 
 #[derive(Debug, Clone)]
 pub struct MovementRecord {
-    pub movement_type: MovementType,
+    pub movement_type: String,
     pub terrain_costs: HashMap<String, u32>,
 }
 
@@ -243,12 +217,12 @@ impl MasterDataRegistry {
                 }
             }
             let movement = MovementRecord {
-                movement_type: MovementType(record.get(0).unwrap_or("").to_string()),
+                movement_type: record.get(0).unwrap_or("").to_string(),
                 terrain_costs,
             };
             registry
                 .movements
-                .insert(movement.movement_type.0.clone(), movement);
+                .insert(movement.movement_type.clone(), movement);
         }
 
         // 5. 搭載(Load)データ読み込み
@@ -402,7 +376,7 @@ mod tests {
             .expect("Heavy Tank not found");
         assert_eq!(tank.cost, 28000);
         assert_eq!(tank.movement, 4);
-        assert_eq!(tank.movement_type.0, "戦車");
+        assert_eq!(tank.movement_type, "戦車");
         assert_eq!(tank.weapon1.as_deref(), Some("戦車砲S"));
         assert_eq!(tank.weapon2.as_deref(), Some("機銃S"));
     }

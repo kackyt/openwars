@@ -12,69 +12,6 @@ pub struct OccupantInfo {
     pub free_slots: u32,
 }
 
-pub fn get_movement_cost(movement_type: MovementType, terrain: Terrain) -> Option<u32> {
-    match movement_type {
-        MovementType::Foot => match terrain {
-            Terrain::Road
-            | Terrain::Bridge
-            | Terrain::Plains
-            | Terrain::Shoal
-            | Terrain::City
-            | Terrain::Factory
-            | Terrain::Airport
-            | Terrain::Port
-            | Terrain::Capital
-            | Terrain::Forest => Some(1),
-            Terrain::River | Terrain::Mountain => Some(2),
-            Terrain::Sea => None,
-        },
-        MovementType::Vehicle => match terrain {
-            Terrain::Road
-            | Terrain::Bridge
-            | Terrain::City
-            | Terrain::Factory
-            | Terrain::Airport
-            | Terrain::Port
-            | Terrain::Capital => Some(1),
-            Terrain::Plains => Some(2),
-            Terrain::Forest
-            | Terrain::River
-            | Terrain::Mountain
-            | Terrain::Sea
-            | Terrain::Shoal => None,
-        },
-        MovementType::Tracked => match terrain {
-            Terrain::Road
-            | Terrain::Bridge
-            | Terrain::Plains
-            | Terrain::City
-            | Terrain::Factory
-            | Terrain::Airport
-            | Terrain::Port
-            | Terrain::Capital => Some(1),
-            Terrain::Forest => Some(2),
-            Terrain::River | Terrain::Mountain | Terrain::Sea | Terrain::Shoal => None,
-        },
-        MovementType::Tires => match terrain {
-            Terrain::Road
-            | Terrain::Bridge
-            | Terrain::City
-            | Terrain::Factory
-            | Terrain::Airport
-            | Terrain::Port
-            | Terrain::Capital => Some(1),
-            Terrain::Plains => Some(2),
-            Terrain::Forest => Some(3),
-            Terrain::River | Terrain::Mountain | Terrain::Sea | Terrain::Shoal => None,
-        },
-        MovementType::LowAltitude | MovementType::HighAltitude => Some(1),
-        MovementType::Ship => match terrain {
-            Terrain::Sea | Terrain::Shoal | Terrain::Port => Some(1),
-            _ => None,
-        },
-    }
-}
-
 pub fn is_enemy_zoc(
     map: &Map,
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
@@ -105,6 +42,7 @@ pub fn calculate_reachable_tiles(
     max_fuel: u32,
     player_id: PlayerId,
     moving_unit_type: UnitType,
+    master_data: &crate::resources::master_data::MasterDataRegistry,
 ) -> HashSet<(usize, usize)> {
     #[derive(Copy, Clone, Eq, PartialEq)]
     struct State {
@@ -179,7 +117,11 @@ pub fn calculate_reachable_tiles(
 
             if let Some(terrain_cost) = map
                 .get_terrain(nx, ny)
-                .and_then(|t| get_movement_cost(movement_type, t))
+                .and_then(|t| {
+                    master_data
+                        .get_movement_cost(movement_type.as_str(), t.as_str())
+                        .filter(|&c| c < 99)
+                })
             {
                 let next_cost = cost + terrain_cost;
                 let next_fuel = fuel_used + 1;
@@ -227,6 +169,7 @@ pub fn find_path_a_star(
     max_fuel: u32,
     player_id: PlayerId,
     moving_unit_type: UnitType,
+    master_data: &crate::resources::master_data::MasterDataRegistry,
 ) -> Option<(Vec<(usize, usize)>, u32, u32)> {
     let reachable = calculate_reachable_tiles(
         map,
@@ -237,6 +180,7 @@ pub fn find_path_a_star(
         max_fuel,
         player_id,
         moving_unit_type,
+        master_data,
     );
     if !reachable.contains(&goal) {
         return None;
@@ -334,7 +278,11 @@ pub fn find_path_a_star(
 
             if let Some(terrain_cost) = map
                 .get_terrain(nx, ny)
-                .and_then(|t| get_movement_cost(movement_type, t))
+                .and_then(|t| {
+                    master_data
+                        .get_movement_cost(movement_type.as_str(), t.as_str())
+                        .filter(|&c| c < 99)
+                })
             {
                 let next_cost = cost + terrain_cost;
                 let next_fuel = fuel_used + 1;
@@ -388,6 +336,7 @@ pub fn move_unit_system(
     map: Res<Map>,
     players: Res<Players>,
     match_state: Res<MatchState>,
+    master_data: Res<crate::resources::master_data::MasterDataRegistry>,
 ) {
     if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
@@ -447,6 +396,7 @@ pub fn move_unit_system(
                 fuel.current,
                 faction.0,
                 stats.unit_type,
+                &master_data,
             ) {
                 let from = *pos;
                 pos.x = event.target_x;
@@ -516,6 +466,7 @@ mod tests {
         let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
         map.set_terrain(0, 0, Terrain::Road).unwrap();
         world.insert_resource(map);
+        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
 
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
@@ -534,7 +485,7 @@ mod tests {
                     unit_type: UnitType::Infantry,
                     cost: 1000,
                     max_movement: 3,
-                    movement_type: MovementType::Foot,
+                    movement_type: MovementType::Infantry,
                     max_fuel: 10,
                     max_ammo1: 0,
                     max_ammo2: 0,
@@ -587,6 +538,7 @@ mod tests {
         let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
         map.set_terrain(0, 0, Terrain::Airport).unwrap();
         world.insert_resource(map);
+        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
 
         world.insert_resource(Events::<crate::events::NextPhaseCommand>::default());
         world.insert_resource(Events::<crate::events::GamePhaseChangedEvent>::default());
@@ -600,7 +552,7 @@ mod tests {
             unit_type: UnitType::Bcopters,
             cost: 9000,
             max_movement: 6,
-            movement_type: MovementType::HighAltitude,
+            movement_type: MovementType::Air,
             max_fuel: 3,
             max_ammo1: 6,
             max_ammo2: 0,
@@ -704,6 +656,7 @@ mod tests {
 
         let map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
         world.insert_resource(map);
+        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
 
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
@@ -713,7 +666,7 @@ mod tests {
             unit_type: UnitType::TransportHelicopter,
             cost: 5000,
             max_movement: 6,
-            movement_type: MovementType::LowAltitude,
+            movement_type: MovementType::Air,
             max_fuel: 99,
             max_ammo1: 0,
             max_ammo2: 0,
@@ -752,7 +705,7 @@ mod tests {
             unit_type: UnitType::Infantry,
             cost: 1000,
             max_movement: 3,
-            movement_type: MovementType::Foot,
+            movement_type: MovementType::Infantry,
             max_fuel: 99,
             max_ammo1: 9,
             max_ammo2: 0,
@@ -807,3 +760,4 @@ mod tests {
         // Let's modify move_unit_system slightly to check for transports upon arrival
     }
 }
+

@@ -53,32 +53,98 @@ pub enum UnitType {
     Recon,
     Tank,
     MdTank,
-    TankZ, // Example
+    TankZ,
     Artillery,
+    LightSpGun,
+    HeavySpGun,
     Rockets,
     AntiAir,
     Missiles,
     Fighter,
+    HeavyFighter,
     Bomber,
     Bcopters,
     TransportHelicopter,
     Battleship,
-    Cruiser,
+    Carrier,
     Lander,
-    Submarine,
     SupplyTruck,
-    CombatEngineer, // For repairs/capturing specifically if needed
+}
+
+const UNIT_TYPE_MAP: &[(UnitType, &str)] = &[
+    (UnitType::Infantry, "軽歩兵"),
+    (UnitType::Mech, "重歩兵"),
+    (UnitType::Recon, "装甲車"),
+    (UnitType::Tank, "軽戦車"),
+    (UnitType::MdTank, "中戦車"),
+    (UnitType::TankZ, "重戦車"),
+    (UnitType::Artillery, "砲台"),
+    (UnitType::LightSpGun, "軽自走砲"),
+    (UnitType::HeavySpGun, "重自走砲"),
+    (UnitType::Rockets, "ロケットランチャー"),
+    (UnitType::AntiAir, "対空戦車"),
+    (UnitType::Missiles, "対空ミサイル"),
+    (UnitType::Fighter, "軽戦闘機"),
+    (UnitType::HeavyFighter, "重戦闘機"),
+    (UnitType::Bomber, "爆撃機"),
+    (UnitType::Bcopters, "戦闘ヘリ"),
+    (UnitType::TransportHelicopter, "輸送ヘリ"),
+    (UnitType::Battleship, "戦艦"),
+    (UnitType::Carrier, "空母"),
+    (UnitType::Lander, "輸送船"),
+    (UnitType::SupplyTruck, "補給輸送車"),
+];
+
+impl UnitType {
+    pub fn as_str(&self) -> &'static str {
+        UNIT_TYPE_MAP
+            .iter()
+            .find(|(t, _)| t == self)
+            .map(|(_, s)| *s)
+            .unwrap_or("不明")
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        UNIT_TYPE_MAP
+            .iter()
+            .find(|(_, name)| *name == s)
+            .map(|(t, _)| *t)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MovementType {
-    Foot,
-    Vehicle,
-    Tracked,
-    Tires,
-    LowAltitude,
-    HighAltitude,
+    Infantry,
+    Tank,
+    Artillery,
+    ArmoredCar,
+    Air,
     Ship,
+}
+
+const MOVEMENT_TYPE_MAP: &[(MovementType, &str)] = &[
+    (MovementType::Infantry, "歩兵"),
+    (MovementType::Tank, "戦車"),
+    (MovementType::Artillery, "砲台"),
+    (MovementType::ArmoredCar, "装甲車"),
+    (MovementType::Air, "航空"),
+    (MovementType::Ship, "艦船"),
+];
+
+impl MovementType {
+    pub fn as_str(&self) -> &'static str {
+        MOVEMENT_TYPE_MAP
+            .iter()
+            .find(|(t, _)| t == self)
+            .map(|(_, s)| *s)
+            .unwrap_or("不明")
+    }
+    pub fn from_str(s: &str) -> Option<Self> {
+        MOVEMENT_TYPE_MAP
+            .iter()
+            .find(|(_, name)| *name == s)
+            .map(|(t, _)| *t)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +164,38 @@ pub enum Terrain {
     Capital,
 }
 
+const TERRAIN_MAP: &[(Terrain, &str)] = &[
+    (Terrain::Plains, "平地"),
+    (Terrain::Road, "道路"),
+    (Terrain::River, "川"),
+    (Terrain::Bridge, "橋"),
+    (Terrain::Mountain, "山"),
+    (Terrain::Forest, "森"),
+    (Terrain::Sea, "海"),
+    (Terrain::Shoal, "浅瀬"),
+    (Terrain::City, "都市"),
+    (Terrain::Factory, "工場"),
+    (Terrain::Airport, "空港"),
+    (Terrain::Port, "港"),
+    (Terrain::Capital, "首都"),
+];
+
 impl Terrain {
+    pub fn as_str(&self) -> &'static str {
+        TERRAIN_MAP
+            .iter()
+            .find(|(t, _)| t == self)
+            .map(|(_, s)| *s)
+            .unwrap_or("不明")
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        TERRAIN_MAP
+            .iter()
+            .find(|(_, name)| *name == s)
+            .map(|(t, _)| *t)
+    }
+
     pub fn max_capture_points(&self) -> u32 {
         match self {
             Terrain::City

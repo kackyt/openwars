@@ -163,7 +163,7 @@ mod tests {
             unit_type: UnitType::Infantry,
             cost: 1000,
             max_movement: 3,
-            movement_type: MovementType::Foot,
+            movement_type: MovementType::Infantry,
             max_fuel: 99,
             max_ammo1: 0,
             max_ammo2: 0,
@@ -204,3 +204,4 @@ mod tests {
         assert_eq!(players.0[0].funds, 1000); // 2000 - 1000
     }
 }
+

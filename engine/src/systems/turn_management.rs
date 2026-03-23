@@ -14,8 +14,8 @@ fn apply_daily_updates_for_unit(
     if hp.is_destroyed() {
         return;
     }
-    if stats.movement_type == MovementType::LowAltitude
-        || stats.movement_type == MovementType::HighAltitude
+    if stats.movement_type == MovementType::Air
+        || stats.movement_type == MovementType::Air
     {
         let terrain = map.get_terrain(pos.x, pos.y);
         if terrain != Some(Terrain::Airport) {
@@ -177,3 +177,4 @@ fn process_resupply_and_reset(
         }
     }
 }
+

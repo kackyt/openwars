@@ -113,7 +113,7 @@ mod tests {
             unit_type: UnitType::Infantry,
             cost: 1000,
             max_movement: 3,
-            movement_type: MovementType::Foot,
+            movement_type: MovementType::Infantry,
             max_fuel: 99,
             max_ammo1: 9,
             max_ammo2: 0,
@@ -215,3 +215,4 @@ mod tests {
         assert_eq!(events2[0].entity, source_entity);
     }
 }
+

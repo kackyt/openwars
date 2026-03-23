@@ -15,29 +15,30 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     }
 }
 
-fn unit_type_to_jp(unit_type: &openwars_engine::resources::UnitType) -> &'static str {
+fn unit_type_to_symbol(unit_type: &openwars_engine::resources::UnitType) -> &'static str {
     use openwars_engine::resources::UnitType::*;
     match unit_type {
-        Infantry => "歩兵",
-        Mech => "重歩兵",
-        CombatEngineer => "工兵",
-        Recon => "装甲車",
-        Tank => "軽戦車",
-        MdTank => "中戦車",
-        TankZ => "重戦車",
-        Artillery => "自走砲",
-        Rockets => "ロケット砲",
-        AntiAir => "対空戦車",
-        Missiles => "対空ミサイル",
-        Fighter => "戦闘機",
-        Bomber => "爆撃機",
-        Bcopters => "戦闘ヘリ",
-        TransportHelicopter => "輸送ヘリ",
-        Battleship => "戦艦",
-        Cruiser => "巡洋艦",
-        Lander => "輸送船",
-        Submarine => "潜水艦",
-        SupplyTruck => "輸送車",
+        Infantry => "i",
+        Mech => "I",
+        Recon => "R",
+        Tank => "T",
+        MdTank => "M",
+        TankZ => "Z",
+        Artillery => "a",
+        LightSpGun => "l",
+        HeavySpGun => "L",
+        Rockets => "r",
+        AntiAir => "A",
+        Missiles => "m",
+        Fighter => "F",
+        HeavyFighter => "H",
+        Bomber => "B",
+        Bcopters => "b",
+        TransportHelicopter => "h",
+        Battleship => "S",
+        Carrier => "C",
+        Lander => "l",
+        SupplyTruck => "t",
     }
 }
 
@@ -165,26 +166,7 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                     }
 
                     if let Some((owner, u_type)) = units.get(&(x, y)) {
-                        symbol = match u_type {
-                            openwars_engine::resources::UnitType::Infantry => "i",
-                            openwars_engine::resources::UnitType::Tank => "T",
-                            openwars_engine::resources::UnitType::MdTank => "M",
-                            openwars_engine::resources::UnitType::Recon => "R",
-                            openwars_engine::resources::UnitType::Artillery => "a",
-                            openwars_engine::resources::UnitType::Rockets => "r",
-                            openwars_engine::resources::UnitType::AntiAir => "A",
-                            openwars_engine::resources::UnitType::Missiles => "m",
-                            openwars_engine::resources::UnitType::Fighter => "F",
-                            openwars_engine::resources::UnitType::Bomber => "B",
-                            openwars_engine::resources::UnitType::Bcopters => "b",
-                            openwars_engine::resources::UnitType::TransportHelicopter => "h",
-                            openwars_engine::resources::UnitType::Battleship => "S",
-                            openwars_engine::resources::UnitType::Cruiser => "c",
-                            openwars_engine::resources::UnitType::Lander => "l",
-                            openwars_engine::resources::UnitType::Submarine => "s",
-                            openwars_engine::resources::UnitType::SupplyTruck => "t",
-                            _ => "?",
-                        };
+                        symbol = unit_type_to_symbol(u_type);
                         style = style
                             .fg(if *owner == 1 {
                                 Color::LightBlue
@@ -243,7 +225,7 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                 for entity in passengers {
                     let mut q = world.query::<&openwars_engine::components::UnitStats>();
                     if let Ok(stats) = q.get(world, *entity) {
-                        options.push(unit_type_to_jp(&stats.unit_type).to_string());
+                        options.push(stats.unit_type.as_str().to_string());
                     } else {
                         options.push(format!("{:?}", entity));
                     }
@@ -338,7 +320,7 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         for (u_pos, u_faction, u_stats, u_health, u_fuel, u_ammo) in u_query.iter(world) {
             if u_pos.x == cx && u_pos.y == cy {
                 info_text.push_str("--- Unit Info ---\n");
-                info_text.push_str(&format!("Type: {}\n", unit_type_to_jp(&u_stats.unit_type)));
+                info_text.push_str(&format!("Type: {}\n", u_stats.unit_type.as_str()));
                 info_text.push_str(&format!("Faction: P{}\n", u_faction.0.0));
 
                 let display_hp = (u_health.current.saturating_add(9)) / 10;
