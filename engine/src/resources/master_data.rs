@@ -254,6 +254,17 @@ impl MasterDataRegistry {
         self.landscapes.get(&id)
     }
 
+    pub fn terrain_from_id(
+        &self,
+        terrain_id: LandscapeId,
+    ) -> anyhow::Result<crate::resources::Terrain> {
+        let landscape = self
+            .get_landscape(terrain_id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown terrain ID: {:?}", terrain_id))?;
+        crate::resources::Terrain::from_str(&landscape.name)
+            .ok_or_else(|| anyhow::anyhow!("Invalid terrain name: {}", landscape.name))
+    }
+
     pub fn get_landscape_by_name(&self, name: &str) -> Option<&LandscapeRecord> {
         let id = self.landscapes_by_name.get(name)?;
         self.landscapes.get(id)

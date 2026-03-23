@@ -34,6 +34,11 @@ pub struct ProduceUnitCommand {
 }
 
 #[derive(Event, Debug, Clone)]
+pub struct WaitUnitCommand {
+    pub unit_entity: Entity,
+}
+
+#[derive(Event, Debug, Clone)]
 pub struct NextPhaseCommand;
 
 #[derive(Event, Debug, Clone)]

@@ -128,9 +128,14 @@ impl App {
                     .cloned();
                 if let Some(map_name) = map_name {
                     // Transition to in-game
-                    self.initialize_world(map_name.clone());
-                    self.ui_state.current_screen = CurrentScreen::InGame;
-                    self.ui_state.add_log(format!("Map '{}' loaded.", map_name));
+                    if let Err(e) = self.initialize_world(map_name.clone()) {
+                        self.ui_state.add_log(format!("Map load error: {}", e));
+                    } else {
+                        self.ui_state.current_screen = CurrentScreen::InGame;
+                        self.ui_state.in_game_state = InGameState::Normal;
+                        self.ui_state.cursor_pos = (0, 0);
+                        self.ui_state.add_log(format!("Map '{}' loaded.", map_name));
+                    }
                 }
             }
             _ => {}
@@ -147,6 +152,8 @@ impl App {
                 self.world = None;
                 self.schedule = None;
                 self.ui_state.current_screen = CurrentScreen::MapSelection;
+                self.ui_state.in_game_state = InGameState::Normal;
+                self.ui_state.cursor_pos = (0, 0);
             }
             KeyCode::Up | KeyCode::Char('k') => match &mut self.ui_state.in_game_state {
                 InGameState::ActionMenu { selected_index, .. }
@@ -254,13 +261,16 @@ impl App {
                                     &openwars_engine::components::GridPosition,
                                     &openwars_engine::components::Faction,
                                     &openwars_engine::components::ActionCompleted,
+                                    Option<&openwars_engine::components::HasMoved>,
                                 )>();
-                                for (entity, pos, faction, action_completed) in u_query.iter(world)
+                                for (entity, pos, faction, action_completed, has_moved) in
+                                    u_query.iter(world)
                                 {
                                     if pos.x == cx
                                         && pos.y == cy
                                         && faction.0 == active_player_id
                                         && !action_completed.0
+                                        && !has_moved.map(|h| h.0).unwrap_or(false)
                                     {
                                         selected_unit = Some(entity);
                                     }
@@ -395,14 +405,6 @@ impl App {
                             self.ui_state.add_log("Turn ended.".to_string());
 
                             if let Some(world) = &mut self.world {
-                                if let Some(mut match_state) =
-                                    world
-                                        .get_resource_mut::<openwars_engine::resources::MatchState>(
-                                        )
-                                {
-                                    match_state.current_phase =
-                                        openwars_engine::resources::Phase::EndTurn;
-                                }
                                 world.send_event(openwars_engine::events::NextPhaseCommand);
                             }
                         } else if selected == "Produce" {
@@ -459,10 +461,11 @@ impl App {
                             };
                         } else if let Some(entity) = unit_entity {
                             if selected == "Wait" {
-                                if let Some(world) = &mut self.world
-                                    && let Some(mut action_comp) = world.get_mut::<openwars_engine::components::ActionCompleted>(entity) {
-                                        action_comp.0 = true;
-                                    }
+                                if let Some(world) = &mut self.world {
+                                    world.send_event(openwars_engine::events::WaitUnitCommand {
+                                        unit_entity: entity,
+                                    });
+                                }
                                 self.ui_state.in_game_state = InGameState::Normal;
                                 self.ui_state.add_log("Unit waited.".to_string());
                             } else if selected == "Capture" {
@@ -758,7 +761,7 @@ impl App {
         }
     }
 
-    fn initialize_world(&mut self, map_name: String) {
+    fn initialize_world(&mut self, map_name: String) -> anyhow::Result<()> {
         use openwars_engine::events::*;
         use openwars_engine::systems::*;
 
@@ -774,6 +777,7 @@ impl App {
         world.init_resource::<Events<SupplyUnitCommand>>();
         world.init_resource::<Events<LoadUnitCommand>>();
         world.init_resource::<Events<UnloadUnitCommand>>();
+        world.init_resource::<Events<WaitUnitCommand>>();
         world.init_resource::<Events<NextPhaseCommand>>();
 
         world.init_resource::<Events<UnitMovedEvent>>();
@@ -801,6 +805,7 @@ impl App {
                 supply_unit_system,
                 load_unit_system,
                 unload_unit_system,
+                wait_unit_system,
                 next_phase_system,
                 daily_update_system,
             )
@@ -932,14 +937,7 @@ impl App {
             for y in 0..height {
                 for x in 0..width {
                     if let Some(cell) = map_data.get_cell(x, y) {
-                        let landscape_name = self
-                            .master_data
-                            .get_landscape(cell.terrain_id)
-                            .map(|l| l.name.as_str())
-                            .unwrap_or("平地");
-
-                        let terrain = openwars_engine::resources::Terrain::from_str(landscape_name)
-                            .unwrap_or(openwars_engine::resources::Terrain::Plains);
+                        let terrain = self.master_data.terrain_from_id(cell.terrain_id)?;
                         let _ = ecs_map.set_terrain(x, y, terrain);
 
                         if cell.player_id != 0 {
@@ -975,13 +973,12 @@ impl App {
                         if let Some(cell) = map_data.get_cell(x, y)
                             && cell.player_id == pid
                         {
-                            let landscape_name = self
-                                .master_data
-                                .get_landscape(cell.terrain_id)
-                                .map(|l| l.name.as_str())
-                                .unwrap_or("平地");
+                            let landscape =
+                                self.master_data.get_landscape(cell.terrain_id).ok_or_else(
+                                    || anyhow::anyhow!("Unknown terrain ID: {:?}", cell.terrain_id),
+                                )?;
                             // 収入判定ロジックをマスターデータ問い合わせに置換
-                            income += self.master_data.landscape_income(landscape_name);
+                            income += self.master_data.landscape_income(&landscape.name);
                         }
                     }
                 }
@@ -1002,5 +999,6 @@ impl App {
 
         self.world = Some(world);
         self.schedule = Some(schedule);
+        Ok(())
     }
 }

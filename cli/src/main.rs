@@ -212,6 +212,54 @@ where
                         ));
                     }
                 }
+
+                // Memory leak fix: Bevy 0.15.2 doesn't auto-clear events without an update system
+                use openwars_engine::events::*;
+                if let Some(mut e) = world.get_resource_mut::<Events<ProduceUnitCommand>>() {
+                    e.clear();
+                }
+                if let Some(mut e) = world.get_resource_mut::<Events<MoveUnitCommand>>() {
+                    e.clear();
+                }
+                if let Some(mut e) = world.get_resource_mut::<Events<AttackUnitCommand>>() {
+                    e.clear();
+                }
+                if let Some(mut e) = world.get_resource_mut::<Events<CapturePropertyCommand>>() {
+                    e.clear();
+                }
+                if let Some(mut e) = world.get_resource_mut::<Events<MergeUnitCommand>>() {
+                    e.clear();
+                }
+                if let Some(mut e) = world.get_resource_mut::<Events<SupplyUnitCommand>>() {
+                    e.clear();
+                }
+                if let Some(mut e) = world.get_resource_mut::<Events<LoadUnitCommand>>() {
+                    e.clear();
+                }
+                if let Some(mut e) = world.get_resource_mut::<Events<UnloadUnitCommand>>() {
+                    e.clear();
+                }
+                if let Some(mut e) = world.get_resource_mut::<Events<WaitUnitCommand>>() {
+                    e.clear();
+                }
+                if let Some(mut e) = world.get_resource_mut::<Events<NextPhaseCommand>>() {
+                    e.clear();
+                }
+                if let Some(mut e) = world.get_resource_mut::<Events<UnitMovedEvent>>() {
+                    e.clear();
+                }
+                if let Some(mut e) = world.get_resource_mut::<Events<UnitDestroyedEvent>>() {
+                    e.clear();
+                }
+                if let Some(mut e) = world.get_resource_mut::<Events<UnitMergedEvent>>() {
+                    e.clear();
+                }
+                if let Some(mut e) = world.get_resource_mut::<Events<PropertyCapturedEvent>>() {
+                    e.clear();
+                }
+                if let Some(mut e) = world.get_resource_mut::<Events<GameOverEvent>>() {
+                    e.clear();
+                }
             }
 
             if let Some(msg) = popup_msg {

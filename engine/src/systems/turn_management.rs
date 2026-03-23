@@ -175,3 +175,15 @@ fn process_resupply_and_reset(
         }
     }
 }
+
+/// ユニットの待機コマンドを処理します。
+pub fn wait_unit_system(
+    mut wait_events: EventReader<WaitUnitCommand>,
+    mut q_action: Query<&mut ActionCompleted>,
+) {
+    for ev in wait_events.read() {
+        if let Ok(mut action_comp) = q_action.get_mut(ev.unit_entity) {
+            action_comp.0 = true;
+        }
+    }
+}
