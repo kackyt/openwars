@@ -1,5 +1,5 @@
 use bevy_ecs::prelude::Resource;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
 
 /// マスターデータ読み込み時の専用エラー型
@@ -13,6 +13,21 @@ pub enum MasterDataError {
     InvalidMapWidth { expected: usize, actual: usize },
     #[error("不明なマスターデータ読み込みエラー")]
     Unknown,
+}
+
+pub mod supply_types {
+    pub const GROUND: &str = "地上部隊";
+    pub const AIR: &str = "航空部隊";
+    pub const NAVY: &str = "艦船部隊";
+}
+
+pub mod movement_types {
+    pub const INFANTRY: &str = "歩兵";
+    pub const TANK: &str = "戦車";
+    pub const ARTILLERY: &str = "砲台";
+    pub const ARMORED_CAR: &str = "装甲車";
+    pub const AIR: &str = "航空";
+    pub const NAVY: &str = "艦船";
 }
 
 /// ユニットや武器などを識別するための名前のNewtype
@@ -39,6 +54,17 @@ pub struct LandscapeRecord {
     pub income: Option<u32>,
 }
 
+fn deserialize_movement_type<'de, D>(
+    deserializer: D,
+) -> Result<crate::resources::MovementType, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+    crate::resources::MovementType::from_str(&s)
+        .ok_or_else(|| serde::de::Error::custom(format!("Unknown movement type: {}", s)))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct UnitRecord {
     #[serde(rename = "名前")]
@@ -48,7 +74,8 @@ pub struct UnitRecord {
     #[serde(rename = "移動力")]
     pub movement: u32,
     #[serde(rename = "移動タイプ")]
-    pub movement_type: String,
+    #[serde(deserialize_with = "deserialize_movement_type")]
+    pub movement_type: crate::resources::MovementType,
     #[serde(rename = "燃料")]
     pub fuel: u32,
     #[serde(rename = "武器1")]
@@ -69,7 +96,7 @@ pub struct WeaponRecord {
 
 #[derive(Debug, Clone)]
 pub struct MovementRecord {
-    pub movement_type: String,
+    pub movement_type: crate::resources::MovementType,
     pub terrain_costs: HashMap<String, u32>,
 }
 
@@ -116,7 +143,7 @@ pub struct MasterDataRegistry {
     pub landscapes_by_name: HashMap<String, LandscapeId>,
     pub units: HashMap<UnitName, UnitRecord>,
     pub weapons: HashMap<UnitName, WeaponRecord>,
-    pub movements: HashMap<String, MovementRecord>,
+    pub movements: HashMap<crate::resources::MovementType, MovementRecord>,
     pub loads: HashMap<String, Vec<LoadRecord>>,
     pub maps: HashMap<String, MapData>,
 }
@@ -214,13 +241,14 @@ impl MasterDataRegistry {
                     }
                 }
             }
-            let movement = MovementRecord {
-                movement_type: record.get(0).unwrap_or("").to_string(),
-                terrain_costs,
-            };
-            registry
-                .movements
-                .insert(movement.movement_type.clone(), movement);
+            let m_str = record.get(0).unwrap_or("");
+            if let Some(m_type) = crate::resources::MovementType::from_str(m_str) {
+                let movement = MovementRecord {
+                    movement_type: m_type,
+                    terrain_costs,
+                };
+                registry.movements.insert(m_type, movement);
+            }
         }
 
         // 5. 搭載(Load)データ読み込み
@@ -270,8 +298,8 @@ impl MasterDataRegistry {
         self.landscapes.get(id)
     }
 
-    pub fn get_movement_cost(&self, target_movement_type: &str, terrain_name: &str) -> Option<u32> {
-        let movement = self.movements.get(target_movement_type)?;
+    pub fn get_movement_cost(&self, target_movement_type: crate::resources::MovementType, terrain_name: &str) -> Option<u32> {
+        let movement = self.movements.get(&target_movement_type)?;
         movement.terrain_costs.get(terrain_name).copied()
     }
 
@@ -305,17 +333,21 @@ impl MasterDataRegistry {
     ///   - 地上部隊: 歩兵・戦車・砲台・装甲車 移動タイプ
     ///   - 航空部隊: 航空 移動タイプ
     ///   - 艦船部隊: 艦船 移動タイプ
-    pub fn can_produce_unit(&self, landscape_name: &str, unit_movement_type: &str) -> bool {
+    pub fn can_produce_unit(&self, landscape_name: &str, unit_movement_type: crate::resources::MovementType) -> bool {
         let Some(landscape) = self.get_landscape_by_name(landscape_name) else {
             return false;
         };
         let Some(supply_type) = &landscape.supply_type else {
             return false;
         };
+        use crate::resources::MovementType::*;
         match supply_type.as_str() {
-            "地上部隊" => matches!(unit_movement_type, "歩兵" | "戦車" | "砲台" | "装甲車"),
-            "航空部隊" => unit_movement_type == "航空",
-            "艦船部隊" => unit_movement_type == "艦船",
+            supply_types::GROUND => matches!(
+                unit_movement_type,
+                Infantry | Tank | Artillery | ArmoredCar
+            ),
+            supply_types::AIR => matches!(unit_movement_type, Air),
+            supply_types::NAVY => matches!(unit_movement_type, Ship),
             _ => false,
         }
     }
@@ -385,7 +417,7 @@ mod tests {
             .expect("Heavy Tank not found");
         assert_eq!(tank.cost, 28000);
         assert_eq!(tank.movement, 4);
-        assert_eq!(tank.movement_type, "戦車");
+        assert_eq!(tank.movement_type, crate::resources::MovementType::Tank);
         assert_eq!(tank.weapon1.as_deref(), Some("戦車砲S"));
         assert_eq!(tank.weapon2.as_deref(), Some("機銃S"));
     }
@@ -406,9 +438,9 @@ mod tests {
         let registry = MasterDataRegistry::load().unwrap();
 
         // 歩兵 in 森 should be 2
-        assert_eq!(registry.get_movement_cost("歩兵", "森"), Some(2));
+        assert_eq!(registry.get_movement_cost(crate::resources::MovementType::Infantry, "森"), Some(2));
         // 戦車 in 山 should be 99
-        assert_eq!(registry.get_movement_cost("戦車", "山"), Some(99));
+        assert_eq!(registry.get_movement_cost(crate::resources::MovementType::Tank, "山"), Some(99));
     }
 
     #[test]
@@ -475,8 +507,8 @@ mod tests {
     fn test_can_produce_unit() {
         let registry = MasterDataRegistry::load().unwrap();
         // 首都（地上部隊）で歩兵生産可能
-        assert!(registry.can_produce_unit("首都", "歩兵"));
+        assert!(registry.can_produce_unit("首都", crate::resources::MovementType::Infantry));
         // 首都で航空は生産不可
-        assert!(!registry.can_produce_unit("首都", "航空"));
+        assert!(!registry.can_produce_unit("首都", crate::resources::MovementType::Air));
     }
 }

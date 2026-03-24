@@ -1,6 +1,7 @@
 import sys
 import subprocess
 import argparse
+import shlex
 
 def main():
     parser = argparse.ArgumentParser(description="Run TUI AI Debug scenario")
@@ -24,8 +25,8 @@ def main():
     
     # Run process
     process = subprocess.Popen(
-        args.bin_cmd,
-        shell=True,
+        shlex.split(args.bin_cmd),
+        shell=False,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, # Keep stderr separate to avoid noise in stdout dump
@@ -39,8 +40,8 @@ def main():
     if process.returncode != 0:
         print(f"--- Process exited with code {process.returncode} ---")
         if stderr:
-             print("STDERR:")
-             print(stderr)
+            print("STDERR:")
+            print(stderr)
 
 if __name__ == "__main__":
     main()

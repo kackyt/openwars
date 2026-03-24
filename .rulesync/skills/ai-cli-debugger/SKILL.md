@@ -80,6 +80,10 @@ fn run_ai_debug() -> Result<(), Box<dyn std::error::Error>> {
     let mut lines = stdin.lock().lines();
     static SHOULD_DUMP: AtomicBool = AtomicBool::new(false);
 
+    // 注意: `lines`イテレータを以下のクロージャ内でキャプチャしてmoveすると、後で`FnMut`として
+    // 利用される際に所有権や借用のエラーが発生する可能性があります。
+    // 実際の実装では、クロージャが`&mut self`を取れるようにするか、`RefCell<Vec<String>>`でラップする、
+    // あるいは構造体のフィールドとしてイテレータを保持する等の方法で所有権（Borrow/Ownership）の問題を回避してください。
     let get_event = |_timeout: std::time::Duration| -> io::Result<Option<Event>> {
         if let Some(Ok(line_str)) = lines.next() {
             let cmd = line_str.trim();

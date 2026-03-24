@@ -23,17 +23,17 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     #[cfg(not(feature = "ai-debug"))]
     {
-        // 1. Setup App state
+        // 1. アプリケーション状態の初期化
         let mut app = App::new()?;
 
-        // 2. Terminal setup
+        // 2. ターミナルのセットアップ
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        // 3. Main Event/Draw loop
+        // 3. メインイベント/描画ループ
         let get_event = |_timeout: std::time::Duration| -> io::Result<Option<Event>> {
             if event::poll(std::time::Duration::from_millis(50))? {
                 Ok(Some(event::read()?))
@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         let res = run_app(&mut terminal, &mut app, get_event, on_draw);
 
-        // 4. Terminal Teardown
+        // 4. ターミナルの終了処理
         disable_raw_mode()?;
         execute!(
             terminal.backend_mut(),
@@ -83,7 +83,7 @@ fn run_ai_debug() -> Result<(), Box<dyn Error>> {
     static SHOULD_DUMP: AtomicBool = AtomicBool::new(false);
 
     let get_event = |_timeout: std::time::Duration| -> io::Result<Option<Event>> {
-        // AI Wait for input
+        // AIによる入力待ち
         let line = lines.next();
         if let Some(Ok(line_str)) = line {
             let cmd = line_str.trim();
@@ -95,7 +95,7 @@ fn run_ai_debug() -> Result<(), Box<dyn Error>> {
             }
             if cmd == "dump" {
                 SHOULD_DUMP.store(true, Ordering::SeqCst);
-                // Send dummy event to force render loop
+                // 強制的な描画ループを発生させるダミーイベントを送信
                 return Ok(Some(Event::Key(KeyEvent {
                     code: KeyCode::Null,
                     modifiers: KeyModifiers::empty(),
@@ -177,7 +177,7 @@ where
             return Ok(());
         }
 
-        // Run systems if in-game
+        // インゲーム中であればシステムを実行
         if app.ui_state.current_screen == app::CurrentScreen::InGame {
             let mut popup_msg = None;
             if let (Some(world), Some(schedule)) = (&mut app.world, &mut app.schedule) {
@@ -213,7 +213,7 @@ where
                     }
                 }
 
-                // Memory leak fix: Bevy 0.15.2 doesn't auto-clear events without an update system
+                // メモリリーク対策: Bevy 0.15.2 はアップデートシステムがないと自動でイベントをクリアしない
                 use openwars_engine::events::*;
                 if let Some(mut e) = world.get_resource_mut::<Events<ProduceUnitCommand>>() {
                     e.clear();

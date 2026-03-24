@@ -14,15 +14,18 @@ use bevy_ecs::prelude::*;
 ///    ※生産された直後は行動できないため、`HasMoved` と `ActionCompleted` を true にします。
 ///
 /// 自軍の首都のある場所から生産可能範囲内にあるかどうかを判定するエンジン側の純粋なドメイン関数
+/// 首都からの生産可能範囲（マンハッタン距離）
+pub const PRODUCTION_RANGE: usize = 3;
+
 pub fn is_within_production_range(
-    capital_pos: Option<(usize, usize)>,
+    capital_pos: Option<GridPosition>,
     target_x: usize,
     target_y: usize,
 ) -> bool {
     if let Some(cp) = capital_pos {
-        let distance = (target_x as isize - cp.0 as isize).unsigned_abs()
-            + (target_y as isize - cp.1 as isize).unsigned_abs();
-        distance <= 3
+        let distance = (target_x as isize - cp.x as isize).unsigned_abs()
+            + (target_y as isize - cp.y as isize).unsigned_abs();
+        distance <= PRODUCTION_RANGE
     } else {
         false
     }
@@ -69,7 +72,7 @@ pub fn produce_unit_system(
         let mut capital_pos = None;
         for (pos, prop) in q_properties.iter() {
             if prop.owner_id == Some(event.player_id) && prop.terrain == Terrain::Capital {
-                capital_pos = Some((pos.x, pos.y));
+                capital_pos = Some(*pos);
                 break;
             }
         }

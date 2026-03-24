@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Combat Validation
-MUST: システムは、CLIから攻撃コマンドを発行する前に、射程距離、陣営、被間接移動の制約などを検証する。
+MUST: システムは、CLIから攻撃コマンドを発行する前に、射程、陣営、被間接移動の制約などを検証する。
 
 #### Scenario: Attacking out of range
 - **WHEN** ユーザーが武器の射程外の攻撃対象を選択した場合

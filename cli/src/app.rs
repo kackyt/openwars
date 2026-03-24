@@ -367,7 +367,7 @@ impl App {
                                         if prop.terrain
                                             == openwars_engine::resources::Terrain::Capital
                                         {
-                                            capital_pos = Some((pos.x, pos.y));
+                                            capital_pos = Some(*pos);
                                         }
                                     }
                                 }
@@ -445,7 +445,7 @@ impl App {
                                         // 施設とユニットマスターの移動タイプを照合して生産可能か判定
                                         if self
                                             .master_data
-                                            .can_produce_unit(landscape_name, &record.movement_type)
+                                            .can_produce_unit(landscape_name, record.movement_type)
                                         {
                                             options.push(name.0.clone());
                                         }
@@ -541,50 +541,20 @@ impl App {
 
                             if action == "Attack" {
                                 if let Some(target) = target_unit {
-                                    let mut valid = false;
-                                    let mut q_attacker = world.query::<(
-                                        &openwars_engine::components::GridPosition,
-                                        &openwars_engine::components::UnitStats,
-                                        &openwars_engine::components::HasMoved,
-                                        &openwars_engine::components::Faction,
-                                    )>(
-                                    );
-                                    let mut q_target =
-                                        world.query::<&openwars_engine::components::Faction>();
-
-                                    if let Ok((pos, stats, has_moved, attacker_fac)) =
-                                        q_attacker.get(world, unit_entity)
-                                    {
-                                        let dist = (pos.x as i64 - cx as i64).unsigned_abs() as u32
-                                            + (pos.y as i64 - cy as i64).unsigned_abs() as u32;
-
-                                        let is_indirect = stats.min_range > 1;
-                                        let in_range =
-                                            dist >= stats.min_range && dist <= stats.max_range;
-                                        let can_attack = in_range && (!is_indirect || !has_moved.0);
-
-                                        if can_attack
-                                            && let Ok(target_fac) = q_target.get(world, target)
-                                            && attacker_fac.0 != target_fac.0
-                                        {
-                                            valid = true;
+                                    match openwars_engine::systems::combat::can_attack(unit_entity, target, world) {
+                                        Ok(()) => {
+                                            world.send_event(
+                                                openwars_engine::events::AttackUnitCommand {
+                                                    attacker_entity: unit_entity,
+                                                    defender_entity: target,
+                                                },
+                                            );
+                                            self.ui_state
+                                                .add_log(format!("Attacking target at {:?}", (cx, cy)));
                                         }
-                                    }
-
-                                    if valid {
-                                        world.send_event(
-                                            openwars_engine::events::AttackUnitCommand {
-                                                attacker_entity: unit_entity,
-                                                defender_entity: target,
-                                            },
-                                        );
-                                        self.ui_state
-                                            .add_log(format!("Attacking target at {:?}", (cx, cy)));
-                                    } else {
-                                        self.ui_state.add_log(
-                                            "Target invalid or out of range. Cancelled."
-                                                .to_string(),
-                                        );
+                                        Err(e) => {
+                                            self.ui_state.add_log(format!("Attack cancelled: {}", e));
+                                        }
                                     }
                                 } else {
                                     self.ui_state
@@ -695,18 +665,29 @@ impl App {
                             }
                             self.ui_state
                                 .add_log(format!("Moved unit to {:?}", (cx, cy)));
+                            let mut options = vec!["Wait".to_string(), "Attack".to_string()];
+                            let mut can_cap = false;
+                            let mut can_sup = false;
+                            let mut has_car = false;
+                            if let Some(world) = &mut self.world {
+                                if let Ok(stats) = world.query::<&openwars_engine::components::UnitStats>().get(world, unit_entity) {
+                                    can_cap = stats.can_capture;
+                                    can_sup = stats.can_supply;
+                                    has_car = stats.max_cargo > 0;
+                                }
+                            }
+                            if can_cap { options.push("Capture".to_string()); }
+                            if can_sup { options.push("Supply".to_string()); }
+                            options.push("Join".to_string());
+                            if has_car {
+                                options.push("Load".to_string());
+                                options.push("Drop".to_string());
+                            }
+                            options.push("Cancel".to_string());
+
                             self.ui_state.in_game_state = InGameState::ActionMenu {
                                 unit_entity: Some(unit_entity),
-                                options: vec![
-                                    "Wait".to_string(),
-                                    "Attack".to_string(),
-                                    "Capture".to_string(),
-                                    "Supply".to_string(),
-                                    "Join".to_string(),
-                                    "Load".to_string(),
-                                    "Drop".to_string(),
-                                    "Cancel".to_string(),
-                                ],
+                                options,
                                 selected_index: 0,
                             };
                         }
@@ -904,10 +885,7 @@ impl App {
                     unit_type: u_type,
                     cost: record.cost,
                     max_movement: record.movement,
-                    movement_type: openwars_engine::resources::MovementType::from_str(
-                        &record.movement_type,
-                    )
-                    .unwrap_or(openwars_engine::resources::MovementType::Tank),
+                    movement_type: record.movement_type,
                     max_fuel: record.fuel,
                     max_ammo1: w1.map(|w| w.ammo).unwrap_or(0),
                     max_ammo2: w2.map(|w| w.ammo).unwrap_or(0),

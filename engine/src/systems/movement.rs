@@ -31,6 +31,17 @@ pub fn is_enemy_zoc(
     false
 }
 
+/// ユニットの移動タイプと地形から有効な移動コスト（99未満）を返します。
+pub fn get_valid_movement_cost(
+    master_data: &crate::resources::master_data::MasterDataRegistry,
+    movement_type: MovementType,
+    terrain: Terrain,
+) -> Option<u32> {
+    master_data
+        .get_movement_cost(movement_type, terrain.as_str())
+        .filter(|&c| c < 99)
+}
+
 /// 指定された地点から到達可能なすべてのタイルの座標を計算します。ZOCや燃料・移動コストも加味します。
 #[allow(clippy::too_many_arguments)]
 pub fn calculate_reachable_tiles(
@@ -116,9 +127,7 @@ pub fn calculate_reachable_tiles(
             }
 
             if let Some(terrain_cost) = map.get_terrain(nx, ny).and_then(|t| {
-                master_data
-                    .get_movement_cost(movement_type.as_str(), t.as_str())
-                    .filter(|&c| c < 99)
+                get_valid_movement_cost(master_data, movement_type, t)
             }) {
                 let next_cost = cost + terrain_cost;
                 let next_fuel = fuel_used + 1;
@@ -274,9 +283,7 @@ pub fn find_path_a_star(
             }
 
             if let Some(terrain_cost) = map.get_terrain(nx, ny).and_then(|t| {
-                master_data
-                    .get_movement_cost(movement_type.as_str(), t.as_str())
-                    .filter(|&c| c < 99)
+                get_valid_movement_cost(master_data, movement_type, t)
             }) {
                 let next_cost = cost + terrain_cost;
                 let next_fuel = fuel_used + 1;

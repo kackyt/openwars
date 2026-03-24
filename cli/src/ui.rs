@@ -94,7 +94,7 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
         .split(f.size());
 
-    // Left side: Map
+    // 左側: マップ表示
     let map_block = Block::default().title(" Map ").borders(Borders::ALL);
 
     let mut map_lines = vec![];
@@ -110,11 +110,11 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
     }
 
     if let Some(world) = &mut app.world {
-        // Collect unit/property info
+        // ユニット/不動産情報の収集
         let mut factions = std::collections::HashMap::new();
         let mut units = std::collections::HashMap::new();
 
-        // Property query
+        // 不動産のクエリ
         let mut p_query = world.query::<(
             &openwars_engine::components::GridPosition,
             &openwars_engine::components::Property,
@@ -125,7 +125,7 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             }
         }
 
-        // Unit query
+        // ユニットのクエリ
         let mut u_query = world.query::<(
             &openwars_engine::components::GridPosition,
             &openwars_engine::components::Faction,
@@ -150,7 +150,7 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                         openwars_engine::resources::Terrain::Bridge => "=",
                         openwars_engine::resources::Terrain::Mountain => "^",
                         openwars_engine::resources::Terrain::Forest => "\"",
-                        openwars_engine::resources::Terrain::Sea => "~",
+                        openwars_engine::resources::Terrain::Sea => "≈",
                         openwars_engine::resources::Terrain::Shoal => ",",
                         openwars_engine::resources::Terrain::City => "C",
                         openwars_engine::resources::Terrain::Factory => "F",
@@ -265,9 +265,9 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             })
             .collect();
 
-        // Overlay menu near cursor
+        // カーソル付近へのメニューのオーバーレイ表示
         let menu_rect = ratatui::layout::Rect {
-            x: chunks[0].x + 2, // simplified placement
+            x: chunks[0].x + 2, // 簡易的な固定配置
             y: chunks[0].y + 2,
             width: 20,
             height: (options.len() as u16) + 2,
@@ -280,13 +280,13 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         f.render_widget(menu_list, menu_rect);
     }
 
-    // Right side split: Info & Logs
+    // 右側: 情報 & ログの分割表示
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(chunks[1]);
 
-    // Info
+    // 情報パネル
     let info_block = Block::default().title(" Info ").borders(Borders::ALL);
     let mut info_text = String::new();
 
@@ -351,7 +351,7 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
     let info_paragraph = Paragraph::new(info_text).block(info_block);
     f.render_widget(info_paragraph, right_chunks[0]);
 
-    // Logs
+    // ログパネル
     let logs_block = Block::default().title(" Logs ").borders(Borders::ALL);
     let logs_text = app.ui_state.log_messages.join("\n");
     let logs_paragraph = Paragraph::new(logs_text).block(logs_block);
