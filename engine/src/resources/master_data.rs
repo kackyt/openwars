@@ -298,7 +298,11 @@ impl MasterDataRegistry {
         self.landscapes.get(id)
     }
 
-    pub fn get_movement_cost(&self, target_movement_type: crate::resources::MovementType, terrain_name: &str) -> Option<u32> {
+    pub fn get_movement_cost(
+        &self,
+        target_movement_type: crate::resources::MovementType,
+        terrain_name: &str,
+    ) -> Option<u32> {
         let movement = self.movements.get(&target_movement_type)?;
         movement.terrain_costs.get(terrain_name).copied()
     }
@@ -333,7 +337,11 @@ impl MasterDataRegistry {
     ///   - 地上部隊: 歩兵・戦車・砲台・装甲車 移動タイプ
     ///   - 航空部隊: 航空 移動タイプ
     ///   - 艦船部隊: 艦船 移動タイプ
-    pub fn can_produce_unit(&self, landscape_name: &str, unit_movement_type: crate::resources::MovementType) -> bool {
+    pub fn can_produce_unit(
+        &self,
+        landscape_name: &str,
+        unit_movement_type: crate::resources::MovementType,
+    ) -> bool {
         let Some(landscape) = self.get_landscape_by_name(landscape_name) else {
             return false;
         };
@@ -342,10 +350,9 @@ impl MasterDataRegistry {
         };
         use crate::resources::MovementType::*;
         match supply_type.as_str() {
-            supply_types::GROUND => matches!(
-                unit_movement_type,
-                Infantry | Tank | Artillery | ArmoredCar
-            ),
+            supply_types::GROUND => {
+                matches!(unit_movement_type, Infantry | Tank | Artillery | ArmoredCar)
+            }
             supply_types::AIR => matches!(unit_movement_type, Air),
             supply_types::NAVY => matches!(unit_movement_type, Ship),
             _ => false,
@@ -438,9 +445,15 @@ mod tests {
         let registry = MasterDataRegistry::load().unwrap();
 
         // 歩兵 in 森 should be 2
-        assert_eq!(registry.get_movement_cost(crate::resources::MovementType::Infantry, "森"), Some(2));
+        assert_eq!(
+            registry.get_movement_cost(crate::resources::MovementType::Infantry, "森"),
+            Some(2)
+        );
         // 戦車 in 山 should be 99
-        assert_eq!(registry.get_movement_cost(crate::resources::MovementType::Tank, "山"), Some(99));
+        assert_eq!(
+            registry.get_movement_cost(crate::resources::MovementType::Tank, "山"),
+            Some(99)
+        );
     }
 
     #[test]

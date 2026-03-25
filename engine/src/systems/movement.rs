@@ -126,9 +126,10 @@ pub fn calculate_reachable_tiles(
                 }
             }
 
-            if let Some(terrain_cost) = map.get_terrain(nx, ny).and_then(|t| {
-                get_valid_movement_cost(master_data, movement_type, t)
-            }) {
+            if let Some(terrain_cost) = map
+                .get_terrain(nx, ny)
+                .and_then(|t| get_valid_movement_cost(master_data, movement_type, t))
+            {
                 let next_cost = cost + terrain_cost;
                 let next_fuel = fuel_used + 1;
 
@@ -282,9 +283,10 @@ pub fn find_path_a_star(
                 }
             }
 
-            if let Some(terrain_cost) = map.get_terrain(nx, ny).and_then(|t| {
-                get_valid_movement_cost(master_data, movement_type, t)
-            }) {
+            if let Some(terrain_cost) = map
+                .get_terrain(nx, ny)
+                .and_then(|t| get_valid_movement_cost(master_data, movement_type, t))
+            {
                 let next_cost = cost + terrain_cost;
                 let next_fuel = fuel_used + 1;
 

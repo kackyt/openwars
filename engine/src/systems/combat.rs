@@ -28,19 +28,15 @@ pub fn can_attack(
     defender_entity: Entity,
     world: &mut World,
 ) -> Result<(), AttackError> {
-    let mut q_attacker = world.query::<(
-        &GridPosition,
-        &UnitStats,
-        Option<&HasMoved>,
-        &Faction,
-    )>();
-    let mut q_target = world.query::<(
-        &GridPosition,
-        &Faction,
-    )>();
+    let mut q_attacker = world.query::<(&GridPosition, &UnitStats, Option<&HasMoved>, &Faction)>();
+    let mut q_target = world.query::<(&GridPosition, &Faction)>();
 
-    let (a_pos, a_stats, a_has_moved, a_fac) = q_attacker.get(world, attacker_entity).map_err(|_| AttackError::InvalidEntity)?;
-    let (d_pos, d_fac) = q_target.get(world, defender_entity).map_err(|_| AttackError::InvalidEntity)?;
+    let (a_pos, a_stats, a_has_moved, a_fac) = q_attacker
+        .get(world, attacker_entity)
+        .map_err(|_| AttackError::InvalidEntity)?;
+    let (d_pos, d_fac) = q_target
+        .get(world, defender_entity)
+        .map_err(|_| AttackError::InvalidEntity)?;
 
     if a_fac.0 == d_fac.0 {
         return Err(AttackError::FriendlyFire);

@@ -541,7 +541,11 @@ impl App {
 
                             if action == "Attack" {
                                 if let Some(target) = target_unit {
-                                    match openwars_engine::systems::combat::can_attack(unit_entity, target, world) {
+                                    match openwars_engine::systems::combat::can_attack(
+                                        unit_entity,
+                                        target,
+                                        world,
+                                    ) {
                                         Ok(()) => {
                                             world.send_event(
                                                 openwars_engine::events::AttackUnitCommand {
@@ -549,11 +553,14 @@ impl App {
                                                     defender_entity: target,
                                                 },
                                             );
-                                            self.ui_state
-                                                .add_log(format!("Attacking target at {:?}", (cx, cy)));
+                                            self.ui_state.add_log(format!(
+                                                "Attacking target at {:?}",
+                                                (cx, cy)
+                                            ));
                                         }
                                         Err(e) => {
-                                            self.ui_state.add_log(format!("Attack cancelled: {}", e));
+                                            self.ui_state
+                                                .add_log(format!("Attack cancelled: {}", e));
                                         }
                                     }
                                 } else {
@@ -669,15 +676,21 @@ impl App {
                             let mut can_cap = false;
                             let mut can_sup = false;
                             let mut has_car = false;
-                            if let Some(world) = &mut self.world {
-                                if let Ok(stats) = world.query::<&openwars_engine::components::UnitStats>().get(world, unit_entity) {
-                                    can_cap = stats.can_capture;
-                                    can_sup = stats.can_supply;
-                                    has_car = stats.max_cargo > 0;
-                                }
+                            if let Some(world) = &mut self.world
+                                && let Ok(stats) = world
+                                    .query::<&openwars_engine::components::UnitStats>()
+                                    .get(world, unit_entity)
+                            {
+                                can_cap = stats.can_capture;
+                                can_sup = stats.can_supply;
+                                has_car = stats.max_cargo > 0;
                             }
-                            if can_cap { options.push("Capture".to_string()); }
-                            if can_sup { options.push("Supply".to_string()); }
+                            if can_cap {
+                                options.push("Capture".to_string());
+                            }
+                            if can_sup {
+                                options.push("Supply".to_string());
+                            }
                             options.push("Join".to_string());
                             if has_car {
                                 options.push("Load".to_string());
