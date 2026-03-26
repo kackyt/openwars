@@ -14,10 +14,10 @@ def main():
     for token in args.keys.split():
         if '*' in token:
             parts = token.split('*')
-            if len(parts) == 2 and parts[0].isdigit():
+            if len(parts) == 2 and parts[0].isdigit() and parts[1]:
                 expanded_keys.extend([parts[1]] * int(parts[0]))
             else:
-                expanded_keys.append(token)
+                parser.error(f"Invalid key macro: '{token}'. Use N*key (e.g. 5*right).")
         else:
             expanded_keys.append(token)
     
@@ -34,14 +34,26 @@ def main():
         encoding='utf-8'
     )
     
-    stdout, stderr = process.communicate(input=input_str)
+    try:
+        stdout, stderr = process.communicate(input=input_str, timeout=30)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate()
+        print("--- Process timed out after 30s ---", file=sys.stderr)
+        if stdout:
+            print(stdout)
+        if stderr:
+            print("STDERR:", file=sys.stderr)
+            print(stderr, file=sys.stderr)
+        sys.exit(124)
     
     print(stdout)
     if process.returncode != 0:
-        print(f"--- Process exited with code {process.returncode} ---")
+        print(f"--- Process exited with code {process.returncode} ---", file=sys.stderr)
         if stderr:
-            print("STDERR:")
-            print(stderr)
+            print("STDERR:", file=sys.stderr)
+            print(stderr, file=sys.stderr, end="")
+        sys.exit(process.returncode)
 
 if __name__ == "__main__":
     main()

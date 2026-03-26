@@ -104,6 +104,33 @@ impl UnitType {
             .unwrap_or("不明")
     }
 
+    pub fn symbol(&self) -> &'static str {
+        use UnitType::*;
+        match self {
+            Infantry => "i",
+            Mech => "I",
+            Recon => "R",
+            Tank => "T",
+            MdTank => "M",
+            TankZ => "Z",
+            Artillery => "a",
+            LightSpGun => "g",
+            HeavySpGun => "G",
+            Rockets => "r",
+            AntiAir => "A",
+            Missiles => "m",
+            Fighter => "F",
+            HeavyFighter => "H",
+            Bomber => "B",
+            Bcopters => "b",
+            TransportHelicopter => "h",
+            Battleship => "S",
+            Carrier => "C",
+            Lander => "l",
+            SupplyTruck => "t",
+        }
+    }
+
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         UNIT_TYPE_MAP
@@ -221,6 +248,24 @@ impl Terrain {
             Terrain::Forest => 2,
             Terrain::Plains => 1,
             _ => 0,
+        }
+    }
+
+    pub fn symbol(&self) -> &'static str {
+        match self {
+            Terrain::Plains => ".",
+            Terrain::Road => "=",
+            Terrain::River => "~",
+            Terrain::Bridge => "=",
+            Terrain::Mountain => "^",
+            Terrain::Forest => "\"",
+            Terrain::Sea => "≈",
+            Terrain::Shoal => ",",
+            Terrain::City => "C",
+            Terrain::Factory => "F",
+            Terrain::Airport => "A",
+            Terrain::Port => "P",
+            Terrain::Capital => "H",
         }
     }
 }

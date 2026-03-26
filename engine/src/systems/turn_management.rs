@@ -179,10 +179,20 @@ fn process_resupply_and_reset(
 /// ユニットの待機コマンドを処理します。
 pub fn wait_unit_system(
     mut wait_events: EventReader<WaitUnitCommand>,
-    mut q_action: Query<&mut ActionCompleted>,
+    mut q_units: Query<(&Faction, &mut ActionCompleted)>,
+    players: Res<Players>,
+    match_state: Res<MatchState>,
 ) {
+    if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
+        return;
+    }
+    let active_player = players.0[match_state.active_player_index.0].id;
+
     for ev in wait_events.read() {
-        if let Ok(mut action_comp) = q_action.get_mut(ev.unit_entity) {
+        if let Ok((faction, mut action_comp)) = q_units.get_mut(ev.unit_entity) {
+            if faction.0 != active_player {
+                continue;
+            }
             action_comp.0 = true;
         }
     }

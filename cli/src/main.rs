@@ -54,11 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?;
         terminal.show_cursor()?;
 
-        if let Err(err) = res {
-            println!("{:?}", err);
-        }
-
-        Ok(())
+        res.map_err(Into::into)
     }
 }
 
@@ -201,16 +197,20 @@ where
                     }
                 }
 
-                if popup_msg.is_none()
-                    && let Some(mut phase_events) =
-                        world.get_resource_mut::<Events<GamePhaseChangedEvent>>()
+                let mut phase_popup = None;
+                if let Some(mut phase_events) =
+                    world.get_resource_mut::<Events<GamePhaseChangedEvent>>()
                 {
                     for ev in phase_events.drain() {
-                        popup_msg = Some(format!(
+                        phase_popup = Some(format!(
                             "Player {}'s Turn\n\nPress Space to continue...",
                             ev.active_player.0
                         ));
                     }
+                }
+
+                if popup_msg.is_none() {
+                    popup_msg = phase_popup;
                 }
 
                 // メモリリーク対策: Bevy 0.15.2 はアップデートシステムがないと自動でイベントをクリアしない

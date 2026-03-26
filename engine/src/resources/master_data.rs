@@ -11,6 +11,10 @@ pub enum MasterDataError {
     ParseError(#[from] std::num::ParseIntError),
     #[error("マップCSVの列数が一致しません: expected {expected}, actual {actual}")]
     InvalidMapWidth { expected: usize, actual: usize },
+    #[error("不明な地形ID: {0:?}")]
+    UnknownTerrainId(LandscapeId),
+    #[error("不正な地形名: {0}")]
+    InvalidTerrainName(String),
     #[error("不明なマスターデータ読み込みエラー")]
     Unknown,
 }
@@ -285,12 +289,12 @@ impl MasterDataRegistry {
     pub fn terrain_from_id(
         &self,
         terrain_id: LandscapeId,
-    ) -> anyhow::Result<crate::resources::Terrain> {
+    ) -> Result<crate::resources::Terrain, MasterDataError> {
         let landscape = self
             .get_landscape(terrain_id)
-            .ok_or_else(|| anyhow::anyhow!("Unknown terrain ID: {:?}", terrain_id))?;
+            .ok_or(MasterDataError::UnknownTerrainId(terrain_id))?;
         crate::resources::Terrain::from_str(&landscape.name)
-            .ok_or_else(|| anyhow::anyhow!("Invalid terrain name: {}", landscape.name))
+            .ok_or_else(|| MasterDataError::InvalidTerrainName(landscape.name.clone()))
     }
 
     pub fn get_landscape_by_name(&self, name: &str) -> Option<&LandscapeRecord> {

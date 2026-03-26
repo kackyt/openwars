@@ -16,30 +16,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
 }
 
 fn unit_type_to_symbol(unit_type: &openwars_engine::resources::UnitType) -> &'static str {
-    use openwars_engine::resources::UnitType::*;
-    match unit_type {
-        Infantry => "i",
-        Mech => "I",
-        Recon => "R",
-        Tank => "T",
-        MdTank => "M",
-        TankZ => "Z",
-        Artillery => "a",
-        LightSpGun => "g",
-        HeavySpGun => "G",
-        Rockets => "r",
-        AntiAir => "A",
-        Missiles => "m",
-        Fighter => "F",
-        HeavyFighter => "H",
-        Bomber => "B",
-        Bcopters => "b",
-        TransportHelicopter => "h",
-        Battleship => "S",
-        Carrier => "C",
-        Lander => "l",
-        SupplyTruck => "t",
-    }
+    unit_type.symbol()
 }
 
 fn draw_map_selection(f: &mut Frame, app: &mut App) {
@@ -130,8 +107,12 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             &openwars_engine::components::GridPosition,
             &openwars_engine::components::Faction,
             &openwars_engine::components::UnitStats,
+            Option<&openwars_engine::components::Transporting>,
         )>();
-        for (pos, faction, stats) in u_query.iter(world) {
+        for (pos, faction, stats, transporting) in u_query.iter(world) {
+            if transporting.is_some() {
+                continue;
+            }
             units.insert((pos.x, pos.y), (faction.0.0, stats.unit_type));
         }
 
@@ -143,21 +124,7 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                         .get_terrain(x, y)
                         .unwrap_or(openwars_engine::resources::Terrain::Plains);
 
-                    let mut symbol = match terrain {
-                        openwars_engine::resources::Terrain::Plains => ".",
-                        openwars_engine::resources::Terrain::Road => "=",
-                        openwars_engine::resources::Terrain::River => "~",
-                        openwars_engine::resources::Terrain::Bridge => "=",
-                        openwars_engine::resources::Terrain::Mountain => "^",
-                        openwars_engine::resources::Terrain::Forest => "\"",
-                        openwars_engine::resources::Terrain::Sea => "≈",
-                        openwars_engine::resources::Terrain::Shoal => ",",
-                        openwars_engine::resources::Terrain::City => "C",
-                        openwars_engine::resources::Terrain::Factory => "F",
-                        openwars_engine::resources::Terrain::Airport => "A",
-                        openwars_engine::resources::Terrain::Port => "P",
-                        openwars_engine::resources::Terrain::Capital => "H",
-                    };
+                    let mut symbol = terrain.symbol();
 
                     let mut style = Style::default().fg(Color::DarkGray);
 
@@ -315,9 +282,15 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             &openwars_engine::components::Health,
             Option<&openwars_engine::components::Fuel>,
             Option<&openwars_engine::components::Ammo>,
+            Option<&openwars_engine::components::Transporting>,
         )>();
 
-        for (u_pos, u_faction, u_stats, u_health, u_fuel, u_ammo) in u_query.iter(world) {
+        for (u_pos, u_faction, u_stats, u_health, u_fuel, u_ammo, transporting) in
+            u_query.iter(world)
+        {
+            if transporting.is_some() {
+                continue;
+            }
             if u_pos.x == cx && u_pos.y == cy {
                 info_text.push_str("--- Unit Info ---\n");
                 info_text.push_str(&format!("Type: {}\n", u_stats.unit_type.as_str()));
