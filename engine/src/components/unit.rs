@@ -29,7 +29,7 @@ impl Damagable for Health {
     }
 }
 
-#[derive(Component, Debug, Clone, PartialEq, Eq)]
+#[derive(Component, Debug, Clone, PartialEq, Eq, Default)]
 pub struct UnitStats {
     pub unit_type: crate::resources::UnitType,
     pub cost: u32,

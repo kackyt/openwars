@@ -46,8 +46,9 @@ pub enum DomainError {
     OutOfBounds { x: usize, y: usize },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum UnitType {
+    #[default]
     Infantry,
     Mech,
     Recon,
@@ -140,8 +141,9 @@ impl UnitType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum MovementType {
+    #[default]
     Infantry,
     Tank,
     Artillery,
