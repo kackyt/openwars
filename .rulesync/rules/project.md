@@ -2,6 +2,7 @@
 targets: ["*"]
 description: "openwars for Rust programming guidelines"
 globs: ["**/*"]
+root: true
 ---
 
 # はじめに
@@ -106,6 +107,10 @@ Reactはbullet proof reactでディレクトリは配置
 
 Rustはworkspaceを使ったマルチクレート構成にする
 coreクレートにはECS(Entity Component System)を採用する
+
+#### ドメインロジックの非漏出（責務の分離）
+- ゲームのルールや制約（例: 「首都から3マス以内でしか生産できない」「攻撃可能な範囲の計算」など）の判定ロジックを、プレゼンテーション層（`cli` や `gui` クレート）に直接記述してはなりません。
+- これらのビジネスロジックは必ず `engine` クレート内の System や純粋なドメイン関数として実装し、プレゼンテーション層はそれらを呼び出して結果（表示の切り替えや警告文の表示など）を利用するのみに留めてください。
 
 openwars/
 ├── Cargo.toml               # ワークスペース全体の定義

@@ -3,6 +3,60 @@ use crate::events::*;
 use crate::resources::*;
 use bevy_ecs::prelude::*;
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum AttackError {
+    InvalidEntity,
+    FriendlyFire,
+    OutOfRange,
+    IndirectAfterMove,
+}
+
+impl std::fmt::Display for AttackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidEntity => write!(f, "Invalid target entity format."),
+            Self::FriendlyFire => write!(f, "Cannot attack own units."),
+            Self::OutOfRange => write!(f, "Target is out of range."),
+            Self::IndirectAfterMove => write!(f, "Cannot use indirect weapons after moving."),
+        }
+    }
+}
+impl std::error::Error for AttackError {}
+
+pub fn can_attack(
+    attacker_entity: Entity,
+    defender_entity: Entity,
+    world: &mut World,
+) -> Result<(), AttackError> {
+    let mut q_attacker = world.query::<(&GridPosition, &UnitStats, Option<&HasMoved>, &Faction)>();
+    let mut q_target = world.query::<(&GridPosition, &Faction)>();
+
+    let (a_pos, a_stats, a_has_moved, a_fac) = q_attacker
+        .get(world, attacker_entity)
+        .map_err(|_| AttackError::InvalidEntity)?;
+    let (d_pos, d_fac) = q_target
+        .get(world, defender_entity)
+        .map_err(|_| AttackError::InvalidEntity)?;
+
+    if a_fac.0 == d_fac.0 {
+        return Err(AttackError::FriendlyFire);
+    }
+
+    let dist = (a_pos.x as i64 - d_pos.x as i64).unsigned_abs() as u32
+        + (a_pos.y as i64 - d_pos.y as i64).unsigned_abs() as u32;
+
+    if dist < a_stats.min_range || dist > a_stats.max_range {
+        return Err(AttackError::OutOfRange);
+    }
+
+    let is_indirect = a_stats.min_range > 1;
+    if is_indirect && a_has_moved.map(|m| m.0).unwrap_or(false) {
+        return Err(AttackError::IndirectAfterMove);
+    }
+
+    Ok(())
+}
+
 /// 攻撃者と防衛者のユニットタイプに基づき、ダメージ計算表（DamageChart）を参照して
 /// 最適な武器（主武器 または 副武器）を選択します。
 ///
@@ -63,7 +117,7 @@ pub fn attack_unit_system(
     map: Res<Map>,
     mut rng: ResMut<GameRng>,
 ) {
-    if match_state.game_over.is_some() || match_state.current_phase != Phase::MovementAndAttack {
+    if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
     }
     let active_player = players.0[match_state.active_player_index.0].id;
@@ -181,6 +235,12 @@ pub fn attack_unit_system(
             }
         }
 
+        let a_hp_before = attacker_hp.current;
+        let d_hp_before = defender_hp.current;
+
+        let mut a_hp_after = a_hp_before;
+        let mut d_hp_after = d_hp_before;
+
         // Apply ammo consumption and damage using disjoint mutable borrows via get_many_mut
         if let Ok([mut attacker, mut defender]) =
             q_units.get_many_mut([event.attacker_entity, event.defender_entity])
@@ -194,12 +254,15 @@ pub fn attack_unit_system(
             }
             if let Some(d_dmg) = d_damage_opt {
                 attacker.1.damage(d_dmg);
+                a_hp_after = attacker.1.current;
             }
             if let Some(ref mut act) = attacker.6 {
                 act.0 = true; // Set action completed to true
             }
 
             defender.1.damage(a_damage);
+            d_hp_after = defender.1.current;
+
             if let (Some((d_slot, _)), Some(def_ammo)) = (counter_info, defender.2.as_deref_mut()) {
                 if d_slot == 1 {
                     def_ammo.ammo1 = def_ammo.ammo1.saturating_sub(1);
@@ -214,7 +277,30 @@ pub fn attack_unit_system(
             defender: event.defender_entity,
             damage_dealt: a_damage,
             counter_damage_dealt: d_damage_opt,
+            attacker_hp_before: a_hp_before,
+            attacker_hp_after: a_hp_after,
+            defender_hp_before: d_hp_before,
+            defender_hp_after: d_hp_after,
         });
+    }
+}
+
+/// HPが0になったユニットを削除するシステム。
+///
+/// 【処理の流れ】
+/// 1. 全ユニットの `Health` コンポーネントを確認します。
+/// 2. `is_destroyed()` が true のユニットをデスポーンします。
+/// 3. `UnitDestroyedEvent` を発行して他システムに通知します。
+pub fn remove_destroyed_units_system(
+    mut commands: Commands,
+    q_units: Query<(Entity, &Health)>,
+    mut destroyed_events: EventWriter<UnitDestroyedEvent>,
+) {
+    for (entity, health) in q_units.iter() {
+        if health.is_destroyed() {
+            commands.entity(entity).despawn();
+            destroyed_events.send(UnitDestroyedEvent { entity });
+        }
     }
 }
 
@@ -227,7 +313,7 @@ mod tests {
         let mut world = World::new();
 
         let match_state = MatchState {
-            current_phase: Phase::MovementAndAttack,
+            current_phase: Phase::Main,
             ..Default::default()
         };
         world.insert_resource(match_state);
@@ -245,6 +331,7 @@ mod tests {
 
         world.insert_resource(Events::<AttackUnitCommand>::default());
         world.insert_resource(Events::<UnitAttackedEvent>::default());
+        world.insert_resource(Events::<UnitDestroyedEvent>::default());
 
         let entity_1 = world
             .spawn((
@@ -264,7 +351,7 @@ mod tests {
                     unit_type: UnitType::Infantry,
                     cost: 1000,
                     max_movement: 3,
-                    movement_type: MovementType::Foot,
+                    movement_type: MovementType::Infantry,
                     max_fuel: 10,
                     max_ammo1: 9,
                     max_ammo2: 0,
@@ -299,7 +386,7 @@ mod tests {
                     unit_type: UnitType::Infantry,
                     cost: 1000,
                     max_movement: 3,
-                    movement_type: MovementType::Foot,
+                    movement_type: MovementType::Infantry,
                     max_fuel: 10,
                     max_ammo1: 9,
                     max_ammo2: 0,
@@ -322,7 +409,7 @@ mod tests {
         });
 
         let mut schedule = Schedule::default();
-        schedule.add_systems(attack_unit_system);
+        schedule.add_systems((attack_unit_system, remove_destroyed_units_system));
         schedule.run(&mut world);
 
         let hp2 = world.get::<Health>(entity_2).unwrap();

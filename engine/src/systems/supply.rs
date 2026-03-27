@@ -26,7 +26,7 @@ pub fn supply_unit_system(
     match_state: Res<MatchState>,
     players: Res<Players>,
 ) {
-    if match_state.game_over.is_some() || match_state.current_phase != Phase::MovementAndAttack {
+    if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
     }
     let active_player_id = players.0[match_state.active_player_index.0].id;
@@ -95,7 +95,7 @@ mod tests {
         let mut world = World::new();
 
         let ms = MatchState {
-            current_phase: Phase::MovementAndAttack,
+            current_phase: Phase::Main,
             ..Default::default()
         };
         world.insert_resource(ms);
@@ -118,7 +118,7 @@ mod tests {
                     unit_type: UnitType::SupplyTruck,
                     cost: 1000,
                     max_movement: 3,
-                    movement_type: MovementType::Tires,
+                    movement_type: MovementType::ArmoredCar,
                     max_fuel: 99,
                     max_ammo1: 0,
                     max_ammo2: 0,
@@ -146,7 +146,7 @@ mod tests {
                     unit_type: UnitType::Infantry,
                     cost: 1000,
                     max_movement: 3,
-                    movement_type: MovementType::Foot,
+                    movement_type: MovementType::Infantry,
                     max_fuel: 99,
                     max_ammo1: 9,
                     max_ammo2: 0,

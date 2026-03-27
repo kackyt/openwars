@@ -14,9 +14,7 @@ fn apply_daily_updates_for_unit(
     if hp.is_destroyed() {
         return;
     }
-    if stats.movement_type == MovementType::LowAltitude
-        || stats.movement_type == MovementType::HighAltitude
-    {
+    if stats.movement_type == MovementType::Air {
         let terrain = map.get_terrain(pos.x, pos.y);
         if terrain != Some(Terrain::Airport) {
             if fuel.current == 0 {
@@ -67,15 +65,7 @@ pub fn next_phase_system(
 
     for _ in next_phase_events.read() {
         match match_state.current_phase {
-            Phase::Production => {
-                match_state.current_phase = Phase::MovementAndAttack;
-                let active_player_id = players.0[match_state.active_player_index.0].id;
-                phase_changed_events.send(GamePhaseChangedEvent {
-                    new_phase: Phase::MovementAndAttack,
-                    active_player: active_player_id,
-                });
-            }
-            Phase::MovementAndAttack => {
+            Phase::Main => {
                 match_state.current_phase = Phase::EndTurn;
                 let active_player_id = players.0[match_state.active_player_index.0].id;
                 phase_changed_events.send(GamePhaseChangedEvent {
@@ -97,7 +87,7 @@ pub fn next_phase_system(
                     }
                 }
 
-                match_state.current_phase = Phase::Production;
+                match_state.current_phase = Phase::Main;
                 let active_player_id = players.0[match_state.active_player_index.0].id;
 
                 process_resupply_and_reset(
@@ -108,7 +98,7 @@ pub fn next_phase_system(
                 );
 
                 phase_changed_events.send(GamePhaseChangedEvent {
-                    new_phase: Phase::Production,
+                    new_phase: Phase::Main,
                     active_player: active_player_id,
                 });
             }
@@ -182,6 +172,28 @@ fn process_resupply_and_reset(
                     ammo.ammo2 = stats.max_ammo2;
                 }
             }
+        }
+    }
+}
+
+/// ユニットの待機コマンドを処理します。
+pub fn wait_unit_system(
+    mut wait_events: EventReader<WaitUnitCommand>,
+    mut q_units: Query<(&Faction, &mut ActionCompleted)>,
+    players: Res<Players>,
+    match_state: Res<MatchState>,
+) {
+    if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
+        return;
+    }
+    let active_player = players.0[match_state.active_player_index.0].id;
+
+    for ev in wait_events.read() {
+        if let Ok((faction, mut action_comp)) = q_units.get_mut(ev.unit_entity) {
+            if faction.0 != active_player {
+                continue;
+            }
+            action_comp.0 = true;
         }
     }
 }

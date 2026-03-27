@@ -12,16 +12,35 @@ use bevy_ecs::prelude::*;
 /// 4. プレイヤーの資金(`funds`)が生産コスト(`cost`)以上であることを確認し、資金を消費します。
 /// 5. 新しいユニットの実体(`Entity`)をコンポーネント群と共に生成（スポーン）します。
 ///    ※生産された直後は行動できないため、`HasMoved` と `ActionCompleted` を true にします。
+///
+/// 自軍の首都のある場所から生産可能範囲内にあるかどうかを判定するエンジン側の純粋なドメイン関数
+/// 首都からの生産可能範囲（マンハッタン距離）
+pub const PRODUCTION_RANGE: usize = 3;
+
+pub fn is_within_production_range(
+    capital_pos: Option<GridPosition>,
+    target_x: usize,
+    target_y: usize,
+) -> bool {
+    if let Some(cp) = capital_pos {
+        let distance = (target_x as isize - cp.x as isize).unsigned_abs()
+            + (target_y as isize - cp.y as isize).unsigned_abs();
+        distance <= PRODUCTION_RANGE
+    } else {
+        false
+    }
+}
+
 pub fn produce_unit_system(
     mut commands: Commands,
     mut produce_events: EventReader<ProduceUnitCommand>,
     mut players: ResMut<Players>,
     match_state: Res<MatchState>,
-    map: Res<Map>,
+    _map: Res<Map>,
     q_properties: Query<(&GridPosition, &Property)>,
     unit_registry: Res<UnitRegistry>,
 ) {
-    if match_state.game_over.is_some() || match_state.current_phase != Phase::Production {
+    if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
     }
     let active_player_id = players.0[match_state.active_player_index.0].id;
@@ -32,43 +51,40 @@ pub fn produce_unit_system(
         }
 
         let mut is_valid_property = false;
-        let mut has_capital = false;
-        let mut capital_coord = None;
 
         for (pos, prop) in q_properties.iter() {
-            if prop.owner_id == Some(event.player_id) {
-                if pos.x == event.target_x
-                    && pos.y == event.target_y
-                    && (prop.terrain == Terrain::City || prop.terrain == Terrain::Airport)
-                {
-                    is_valid_property = true;
-                }
-                if prop.terrain == Terrain::Capital {
-                    has_capital = true;
-                    capital_coord = Some((pos.x, pos.y));
-                }
+            if prop.owner_id == Some(event.player_id)
+                && pos.x == event.target_x
+                && pos.y == event.target_y
+                && (prop.terrain == Terrain::Factory
+                    || prop.terrain == Terrain::Capital
+                    || prop.terrain == Terrain::Airport
+                    || prop.terrain == Terrain::Port)
+            {
+                is_valid_property = true;
             }
         }
 
-        if !is_valid_property || !has_capital {
+        if !is_valid_property {
             continue;
         }
 
-        if let Some((cx, cy)) = capital_coord {
-            if let Some(distance) = map.distance(event.target_x, event.target_y, cx, cy) {
-                if distance > 3 {
-                    continue; // Too far from capital
-                }
-            } else {
-                continue;
+        let mut capital_pos = None;
+        for (pos, prop) in q_properties.iter() {
+            if prop.owner_id == Some(event.player_id) && prop.terrain == Terrain::Capital {
+                capital_pos = Some(*pos);
+                break;
             }
         }
 
-        let player = players
-            .0
-            .iter_mut()
-            .find(|p| p.id == event.player_id)
-            .unwrap();
+        if !is_within_production_range(capital_pos, event.target_x, event.target_y) {
+            continue; // Too far from Capital
+        }
+
+        // イベントで指定されたプレイヤーを可変参照で取得する（存在しない場合はスキップ）
+        let Some(player) = players.0.iter_mut().find(|p| p.id == event.player_id) else {
+            continue;
+        };
         let stats = match unit_registry.get_stats(event.unit_type) {
             Some(s) => s.clone(),
             None => continue,
@@ -131,7 +147,7 @@ mod tests {
 
         let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
         map.set_terrain(0, 0, Terrain::Capital).unwrap();
-        map.set_terrain(2, 0, Terrain::City).unwrap();
+        map.set_terrain(2, 0, Terrain::Factory).unwrap();
         world.insert_resource(map);
 
         world.insert_resource(Events::<ProduceUnitCommand>::default());
@@ -143,14 +159,14 @@ mod tests {
         ));
         world.spawn((
             GridPosition { x: 2, y: 0 },
-            Property::new(Terrain::City, Some(PlayerId(1))),
+            Property::new(Terrain::Factory, Some(PlayerId(1))),
         ));
 
         let stats = UnitStats {
             unit_type: UnitType::Infantry,
             cost: 1000,
             max_movement: 3,
-            movement_type: MovementType::Foot,
+            movement_type: MovementType::Infantry,
             max_fuel: 99,
             max_ammo1: 0,
             max_ammo2: 0,

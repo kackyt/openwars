@@ -1,0 +1,9 @@
+schema: spec-driven
+context: |
+  Language: Japanese
+  Write in Japanese, but:
+  - Keep technical terms like "API", "REST", "GraphQL" in English
+  - Code examples and file paths remain in English
+  - **重要**: Fission-AI仕様に従い、各 `spec.md` の要求事項（Requirement）の要約文には、必ず RFC-2119 のキーワードである `MUST` または `SHALL` を含める必要があります。MUSTやSHALLは文頭に記述してください。
+    例: `MUST: システムは、ターゲットの選択フローを必須で提供する。` や `SHALL: エンジンは、HPが0になったユニットをただちにデスポーンさせる。`
+    既存の `spec.md` が英語になっている場合や、不備（`MUST` や `SHALL` の欠如）がある場合も、この段階で日本語へ修正・翻訳しつつキーワードを補完します。

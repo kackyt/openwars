@@ -22,7 +22,7 @@ pub fn merge_unit_system(
     )>,
     match_state: Res<MatchState>,
 ) {
-    if match_state.game_over.is_some() || match_state.current_phase != Phase::MovementAndAttack {
+    if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
     }
 
@@ -100,7 +100,7 @@ mod tests {
         let mut world = World::new();
 
         let ms = MatchState {
-            current_phase: Phase::MovementAndAttack,
+            current_phase: Phase::Main,
             ..Default::default()
         };
         world.insert_resource(ms);
@@ -113,7 +113,7 @@ mod tests {
             unit_type: UnitType::Infantry,
             cost: 1000,
             max_movement: 3,
-            movement_type: MovementType::Foot,
+            movement_type: MovementType::Infantry,
             max_fuel: 99,
             max_ammo1: 9,
             max_ammo2: 0,
