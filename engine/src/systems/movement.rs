@@ -108,22 +108,20 @@ pub fn calculate_reachable_tiles(
             continue;
         }
 
-        if position != start && unit_positions.contains_key(&position) {
-            continue; // Cannot expand through ANY occupied tile
+        if position != start
+            && unit_positions
+                .get(&position)
+                .is_some_and(|occ| occ.player_id != player_id)
+        {
+            continue; // Enemy unit: Cannot expand through (block)
         }
 
         for (nx, ny) in map.get_adjacent(position.0, position.1) {
-            if let Some(occ) = unit_positions.get(&(nx, ny)) {
-                if occ.player_id != player_id {
-                    continue; // Enemy, can't pass
-                } else {
-                    let can_load = occ.is_transport
-                        && occ.free_slots > 0
-                        && occ.loadable_types.contains(&moving_unit_type);
-                    if !can_load {
-                        continue; // Allied unit that is not a valid transport, can't pass
-                    }
-                }
+            if unit_positions
+                .get(&(nx, ny))
+                .is_some_and(|occ| occ.player_id != player_id)
+            {
+                continue; // Enemy: Can't enter/pass
             }
 
             if let Some(terrain_cost) = map
@@ -263,23 +261,26 @@ pub fn find_path_a_star(
             continue;
         }
 
-        if position != start && unit_positions.contains_key(&position) {
-            continue; // Cannot expand through occupied tile
+        if position != start
+            && unit_positions
+                .get(&position)
+                .is_some_and(|occ| occ.player_id != player_id)
+        {
+            continue; // Enemy unit: Cannot expand through
         }
 
         for (nx, ny) in map.get_adjacent(position.0, position.1) {
             if let Some(occ) = unit_positions.get(&(nx, ny)) {
                 if occ.player_id != player_id {
-                    continue; // Enemy, can't pass
-                } else if (nx, ny) == goal {
+                    continue; // Enemy: Can't enter/pass
+                }
+                if (nx, ny) == goal {
                     let can_load = occ.is_transport
                         && occ.free_slots > 0
                         && occ.loadable_types.contains(&moving_unit_type);
                     if !can_load {
-                        continue; // Allied unit that is not a valid transport, can't pass
+                        continue; // Destination occupied by ally, not a valid transport
                     }
-                } else {
-                    continue; // Allied unit not the goal, can't pass
                 }
             }
 
@@ -762,5 +763,260 @@ mod tests {
         assert_eq!(emitted.len(), 1);
 
         // Let's modify move_unit_system slightly to check for transports upon arrival
+    }
+
+    #[test]
+    fn test_pass_through_allied_unit() {
+        let mut world = World::new();
+        world.insert_resource(MatchState {
+            current_phase: Phase::Main,
+            ..Default::default()
+        });
+        world.insert_resource(Players(vec![
+            Player::new(1, "P1".to_string()),
+            Player::new(2, "P2".to_string()),
+        ]));
+        let map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        world.insert_resource(map);
+        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
+        world.insert_resource(Events::<MoveUnitCommand>::default());
+        world.insert_resource(Events::<UnitMovedEvent>::default());
+        world.insert_resource(Events::<LoadUnitCommand>::default());
+
+        let inf_stats = UnitStats {
+            unit_type: UnitType::Infantry,
+            cost: 1000,
+            max_movement: 3,
+            movement_type: MovementType::Infantry,
+            max_fuel: 99,
+            max_ammo1: 0,
+            max_ammo2: 0,
+            min_range: 1,
+            max_range: 1,
+            daily_fuel_consumption: 0,
+            can_capture: true,
+            can_supply: false,
+            max_cargo: 0,
+            loadable_unit_types: vec![],
+        };
+
+        // Subject unit
+        let subject = world
+            .spawn((
+                GridPosition { x: 0, y: 0 },
+                Faction(PlayerId(1)),
+                Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                inf_stats.clone(),
+                HasMoved(false),
+                ActionCompleted(false),
+            ))
+            .id();
+
+        // Allied unit at (1, 0)
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Faction(PlayerId(1)),
+            inf_stats.clone(),
+            Fuel {
+                current: 10,
+                max: 10,
+            },
+            HasMoved(false),
+            ActionCompleted(false),
+        ));
+
+        // Move to (2, 0) through (1, 0)
+        world.send_event(MoveUnitCommand {
+            unit_entity: subject,
+            target_x: 2,
+            target_y: 0,
+        });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(move_unit_system);
+        schedule.run(&mut world);
+
+        let pos = world.get::<GridPosition>(subject).unwrap();
+        assert_eq!(pos.x, 2, "Should be able to pass through allied unit");
+        assert_eq!(pos.y, 0);
+    }
+
+    #[test]
+    fn test_cannot_stop_on_allied_unit() {
+        let mut world = World::new();
+        world.insert_resource(MatchState {
+            current_phase: Phase::Main,
+            ..Default::default()
+        });
+        world.insert_resource(Players(vec![
+            Player::new(1, "P1".to_string()),
+            Player::new(2, "P2".to_string()),
+        ]));
+        let map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        world.insert_resource(map);
+        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
+        world.insert_resource(Events::<MoveUnitCommand>::default());
+        world.insert_resource(Events::<UnitMovedEvent>::default());
+        world.insert_resource(Events::<LoadUnitCommand>::default());
+
+        let inf_stats = UnitStats {
+            unit_type: UnitType::Infantry,
+            cost: 1000,
+            max_movement: 3,
+            movement_type: MovementType::Infantry,
+            max_fuel: 99,
+            max_ammo1: 0,
+            max_ammo2: 0,
+            min_range: 1,
+            max_range: 1,
+            daily_fuel_consumption: 0,
+            can_capture: true,
+            can_supply: false,
+            max_cargo: 0,
+            loadable_unit_types: vec![],
+        };
+
+        // Subject unit
+        let subject = world
+            .spawn((
+                GridPosition { x: 0, y: 0 },
+                Faction(PlayerId(1)),
+                Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                inf_stats.clone(),
+                HasMoved(false),
+                ActionCompleted(false),
+            ))
+            .id();
+
+        // Allied unit at (1, 0)
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Faction(PlayerId(1)),
+            inf_stats.clone(),
+            Fuel {
+                current: 10,
+                max: 10,
+            },
+            HasMoved(false),
+            ActionCompleted(false),
+        ));
+
+        // Try to move to (1, 0)
+        world.send_event(MoveUnitCommand {
+            unit_entity: subject,
+            target_x: 1,
+            target_y: 0,
+        });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(move_unit_system);
+        schedule.run(&mut world);
+
+        let pos = world.get::<GridPosition>(subject).unwrap();
+        assert_eq!(pos.x, 0, "Should NOT be able to stop on allied unit");
+        assert_eq!(pos.y, 0);
+    }
+
+    #[test]
+    fn test_zoc_stoppage_with_ally() {
+        let mut world = World::new();
+        world.insert_resource(MatchState {
+            current_phase: Phase::Main,
+            ..Default::default()
+        });
+        world.insert_resource(Players(vec![
+            Player::new(1, "P1".to_string()),
+            Player::new(2, "P2".to_string()),
+        ]));
+        let map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        world.insert_resource(map);
+        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
+        world.insert_resource(Events::<MoveUnitCommand>::default());
+        world.insert_resource(Events::<UnitMovedEvent>::default());
+        world.insert_resource(Events::<LoadUnitCommand>::default());
+
+        let inf_stats = UnitStats {
+            unit_type: UnitType::Infantry,
+            cost: 1000,
+            max_movement: 3,
+            movement_type: MovementType::Infantry,
+            max_fuel: 99,
+            max_ammo1: 0,
+            max_ammo2: 0,
+            min_range: 1,
+            max_range: 1,
+            daily_fuel_consumption: 0,
+            can_capture: true,
+            can_supply: false,
+            max_cargo: 0,
+            loadable_unit_types: vec![],
+        };
+
+        // Subject unit
+        let subject = world
+            .spawn((
+                GridPosition { x: 0, y: 0 },
+                Faction(PlayerId(1)),
+                Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                inf_stats.clone(),
+                HasMoved(false),
+                ActionCompleted(false),
+            ))
+            .id();
+
+        // Enemy at (1, 1). This makes (1, 0) a ZOC tile.
+        world.spawn((
+            GridPosition { x: 1, y: 1 },
+            Faction(PlayerId(2)),
+            inf_stats.clone(),
+            Fuel {
+                current: 10,
+                max: 10,
+            },
+            HasMoved(false),
+            ActionCompleted(false),
+        ));
+
+        // Allied unit at (1, 0)
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Faction(PlayerId(1)),
+            inf_stats.clone(),
+            Fuel {
+                current: 10,
+                max: 10,
+            },
+            HasMoved(false),
+            ActionCompleted(false),
+        ));
+
+        // Try to move to (2, 0) through (1, 0)
+        // (1, 0) is ZOC, so expansion should stop there.
+        // But (1, 0) is occupied by ally, so we can't stop there either.
+        // Result: Should only be able to stay at (0, 0) or move to empty non-ZOC tiles if any.
+        world.send_event(MoveUnitCommand {
+            unit_entity: subject,
+            target_x: 2,
+            target_y: 0,
+        });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(move_unit_system);
+        schedule.run(&mut world);
+
+        let pos = world.get::<GridPosition>(subject).unwrap();
+        assert_eq!(
+            pos.x, 0,
+            "Should be stopped by ZOC and unable to stop on ally at (1,0)"
+        );
     }
 }
