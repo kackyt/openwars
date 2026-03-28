@@ -103,27 +103,27 @@ pub fn calculate_reachable_tiles(
             continue;
         }
 
+        // 敵ユニットによるZOC（隣接マスに敵がいる）に進入した場合は、そのマスで停止しなければならない
         if position != start && is_enemy_zoc(map, unit_positions, player_id, position.0, position.1)
         {
             continue;
         }
 
-        if position != start && unit_positions.contains_key(&position) {
-            continue; // Cannot expand through ANY occupied tile
+        // 敵ユニットが占有しているマスは通過不可
+        if position != start
+            && unit_positions
+                .get(&position)
+                .is_some_and(|occ| occ.player_id != player_id)
+        {
+            continue; // Enemy unit: Cannot expand through (block)
         }
 
         for (nx, ny) in map.get_adjacent(position.0, position.1) {
-            if let Some(occ) = unit_positions.get(&(nx, ny)) {
-                if occ.player_id != player_id {
-                    continue; // Enemy, can't pass
-                } else {
-                    let can_load = occ.is_transport
-                        && occ.free_slots > 0
-                        && occ.loadable_types.contains(&moving_unit_type);
-                    if !can_load {
-                        continue; // Allied unit that is not a valid transport, can't pass
-                    }
-                }
+            if unit_positions
+                .get(&(nx, ny))
+                .is_some_and(|occ| occ.player_id != player_id)
+            {
+                continue; // Enemy: Can't enter/pass
             }
 
             if let Some(terrain_cost) = map
@@ -258,28 +258,33 @@ pub fn find_path_a_star(
         if fuel_used >= max_fuel {
             continue;
         }
+        // 敵ZOC進入による強制停止
         if position != start && is_enemy_zoc(map, unit_positions, player_id, position.0, position.1)
         {
             continue;
         }
 
-        if position != start && unit_positions.contains_key(&position) {
-            continue; // Cannot expand through occupied tile
+        // 敵ユニットがいるマスは通過不可
+        if position != start
+            && unit_positions
+                .get(&position)
+                .is_some_and(|occ| occ.player_id != player_id)
+        {
+            continue; // Enemy unit: Cannot expand through
         }
 
         for (nx, ny) in map.get_adjacent(position.0, position.1) {
             if let Some(occ) = unit_positions.get(&(nx, ny)) {
                 if occ.player_id != player_id {
-                    continue; // Enemy, can't pass
-                } else if (nx, ny) == goal {
+                    continue; // Enemy: Can't enter/pass
+                }
+                if (nx, ny) == goal {
                     let can_load = occ.is_transport
                         && occ.free_slots > 0
                         && occ.loadable_types.contains(&moving_unit_type);
                     if !can_load {
-                        continue; // Allied unit that is not a valid transport, can't pass
+                        continue; // Destination occupied by ally, not a valid transport
                     }
-                } else {
-                    continue; // Allied unit not the goal, can't pass
                 }
             }
 
@@ -454,105 +459,27 @@ pub fn move_unit_system(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_move_unit_system() {
-        let mut world = World::new();
-
-        let ms = MatchState {
-            current_phase: Phase::Main,
-            ..Default::default()
-        };
-        world.insert_resource(ms);
-        world.insert_resource(Players(vec![
-            Player::new(1, "P1".to_string()),
-            Player::new(2, "P2".to_string()),
-        ]));
-        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
-        map.set_terrain(0, 0, Terrain::Road).unwrap();
-        world.insert_resource(map);
-        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
-
-        world.insert_resource(Events::<MoveUnitCommand>::default());
-        world.insert_resource(Events::<UnitMovedEvent>::default());
-        world.insert_resource(Events::<LoadUnitCommand>::default());
-
-        let entity = world
-            .spawn((
-                GridPosition { x: 0, y: 0 },
-                Fuel {
-                    current: 10,
-                    max: 10,
-                },
-                HasMoved(false),
-                Faction(PlayerId(1)),
-                UnitStats {
-                    unit_type: UnitType::Infantry,
-                    cost: 1000,
-                    max_movement: 3,
-                    movement_type: MovementType::Infantry,
-                    max_fuel: 10,
-                    max_ammo1: 0,
-                    max_ammo2: 0,
-                    min_range: 1,
-                    max_range: 1,
-                    daily_fuel_consumption: 0,
-                    can_capture: true,
-                    can_supply: false,
-                    max_cargo: 0,
-                    loadable_unit_types: vec![],
-                },
-                ActionCompleted(false),
-            ))
-            .id();
-
-        world.send_event(MoveUnitCommand {
-            unit_entity: entity,
-            target_x: 2,
-            target_y: 0,
-        });
-
-        let mut schedule = Schedule::default();
-        schedule.add_systems(move_unit_system);
-
-        schedule.run(&mut world);
-
-        let pos = world.get::<GridPosition>(entity).unwrap();
-        assert_eq!(pos.x, 2);
-        assert_eq!(pos.y, 0);
-
-        let fuel = world.get::<Fuel>(entity).unwrap();
-        assert_eq!(fuel.current, 8); // Moved 2 tiles plains cost 1 each
-
-        let moved_events = world.resource::<Events<UnitMovedEvent>>();
-        let mut reader = moved_events.get_cursor();
-        let events: Vec<_> = reader.read(moved_events).collect();
-        assert_eq!(events.len(), 1);
+    fn create_infantry_stats() -> UnitStats {
+        UnitStats {
+            unit_type: UnitType::Infantry,
+            cost: 1000,
+            max_movement: 3,
+            movement_type: MovementType::Infantry,
+            max_fuel: 99,
+            max_ammo1: 0,
+            max_ammo2: 0,
+            min_range: 1,
+            max_range: 1,
+            daily_fuel_consumption: 0,
+            can_capture: true,
+            can_supply: false,
+            max_cargo: 0,
+            loadable_unit_types: vec![],
+        }
     }
 
-    #[test]
-    fn test_air_unit_fuel_and_crash() {
-        let mut world = World::new();
-
-        world.insert_resource(MatchState::default());
-        world.insert_resource(Players(vec![
-            Player::new(1, "P1".to_string()),
-            Player::new(2, "P2".to_string()),
-        ]));
-
-        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
-        map.set_terrain(0, 0, Terrain::Airport).unwrap();
-        world.insert_resource(map);
-        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
-
-        world.insert_resource(Events::<crate::events::NextPhaseCommand>::default());
-        world.insert_resource(Events::<crate::events::GamePhaseChangedEvent>::default());
-
-        world.spawn((
-            GridPosition { x: 0, y: 0 },
-            crate::components::Property::new(Terrain::Airport, Some(PlayerId(1))),
-        ));
-
-        let heli_stats = UnitStats {
+    fn create_bcopter_stats() -> UnitStats {
+        UnitStats {
             unit_type: UnitType::Bcopters,
             cost: 9000,
             max_movement: 6,
@@ -567,7 +494,103 @@ mod tests {
             can_supply: false,
             max_cargo: 0,
             loadable_unit_types: vec![],
-        };
+        }
+    }
+
+    fn create_transport_heli_stats() -> UnitStats {
+        UnitStats {
+            unit_type: UnitType::TransportHelicopter,
+            cost: 5000,
+            max_movement: 6,
+            movement_type: MovementType::Air,
+            max_fuel: 99,
+            max_ammo1: 0,
+            max_ammo2: 0,
+            min_range: 1,
+            max_range: 1,
+            daily_fuel_consumption: 2,
+            can_capture: false,
+            can_supply: false,
+            max_cargo: 2,
+            loadable_unit_types: vec![UnitType::Infantry],
+        }
+    }
+
+    #[test]
+    fn test_move_unit_system() {
+        let mut world = World::new();
+        world.insert_resource(MatchState {
+            current_phase: Phase::Main,
+            ..Default::default()
+        });
+        world.insert_resource(Players(vec![
+            Player::new(1, "P1".to_string()),
+            Player::new(2, "P2".to_string()),
+        ]));
+        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Road).unwrap();
+        world.insert_resource(map);
+        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
+        world.insert_resource(Events::<MoveUnitCommand>::default());
+        world.insert_resource(Events::<UnitMovedEvent>::default());
+        world.insert_resource(Events::<LoadUnitCommand>::default());
+
+        let entity = world
+            .spawn((
+                GridPosition { x: 0, y: 0 },
+                Fuel {
+                    current: 10,
+                    max: 10,
+                },
+                HasMoved(false),
+                Faction(PlayerId(1)),
+                UnitStats {
+                    max_fuel: 10,
+                    ..create_infantry_stats()
+                },
+                ActionCompleted(false),
+            ))
+            .id();
+
+        world.send_event(MoveUnitCommand {
+            unit_entity: entity,
+            target_x: 2,
+            target_y: 0,
+        });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(move_unit_system);
+        schedule.run(&mut world);
+
+        let pos = world.get::<GridPosition>(entity).unwrap();
+        assert_eq!(pos.x, 2);
+        assert_eq!(pos.y, 0);
+
+        let fuel = world.get::<Fuel>(entity).unwrap();
+        assert_eq!(fuel.current, 8); // Moved 2 tiles plains cost 1 each
+    }
+
+    #[test]
+    fn test_air_unit_fuel_and_crash() {
+        let mut world = World::new();
+        world.insert_resource(MatchState::default());
+        world.insert_resource(Players(vec![
+            Player::new(1, "P1".to_string()),
+            Player::new(2, "P2".to_string()),
+        ]));
+        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Airport).unwrap();
+        world.insert_resource(map);
+        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
+        world.insert_resource(Events::<crate::events::NextPhaseCommand>::default());
+        world.insert_resource(Events::<crate::events::GamePhaseChangedEvent>::default());
+
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            crate::components::Property::new(Terrain::Airport, Some(PlayerId(1))),
+        ));
+
+        let heli_stats = create_bcopter_stats();
 
         // Heli at airport (will resupply/not crash)
         let heli1 = world
@@ -623,104 +646,56 @@ mod tests {
             }
         };
 
-        // Advance to Day 2
         advance_day(&mut world, &mut schedule);
-
-        // Check Fuel for Day 2
         let f2 = world.get::<Fuel>(heli2).unwrap();
         assert_eq!(f2.current, 1); // 3 - 2
 
-        // Turn Day 3
         advance_day(&mut world, &mut schedule);
-
         let f2 = world.get::<Fuel>(heli2).unwrap();
-        assert_eq!(f2.current, 0); // 1 - 2 = 0
-        let h2 = world.get::<Health>(heli2).unwrap();
-        assert!(!h2.is_destroyed()); // Crashes next turn
+        assert_eq!(f2.current, 0);
 
-        // Turn Day 4
         advance_day(&mut world, &mut schedule);
-
         let h2 = world.get::<Health>(heli2).unwrap();
-        assert!(h2.is_destroyed()); // Fuel was 0, so it crashed
+        assert!(h2.is_destroyed());
 
         let h1 = world.get::<Health>(heli1).unwrap();
-        assert!(!h1.is_destroyed()); // Was at airport
+        assert!(!h1.is_destroyed());
     }
 
     #[test]
     fn test_auto_load_on_move() {
         let mut world = World::new();
-
         world.insert_resource(MatchState::default());
         world.insert_resource(Players(vec![
             Player::new(1, "P1".to_string()),
             Player::new(2, "P2".to_string()),
         ]));
-
         let map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
         world.insert_resource(map);
         world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
-
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
 
-        let transport_stats = UnitStats {
-            unit_type: UnitType::TransportHelicopter,
-            cost: 5000,
-            max_movement: 6,
-            movement_type: MovementType::Air,
-            max_fuel: 99,
-            max_ammo1: 0,
-            max_ammo2: 0,
-            min_range: 1,
-            max_range: 1,
-            daily_fuel_consumption: 2,
-            can_capture: false,
-            can_supply: false,
-            max_cargo: 2,
-            loadable_unit_types: vec![UnitType::Infantry],
-        };
-
-        let _transport_entity = world
-            .spawn((
-                GridPosition { x: 5, y: 5 },
-                Faction(PlayerId(1)),
-                Health {
-                    current: 100,
-                    max: 100,
-                },
-                Fuel {
-                    current: 99,
-                    max: 99,
-                },
-                transport_stats,
-                HasMoved(false),
-                ActionCompleted(false),
-                CargoCapacity {
-                    max: 2,
-                    loaded: vec![],
-                },
-            ))
-            .id();
-
-        let inf_stats = UnitStats {
-            unit_type: UnitType::Infantry,
-            cost: 1000,
-            max_movement: 3,
-            movement_type: MovementType::Infantry,
-            max_fuel: 99,
-            max_ammo1: 9,
-            max_ammo2: 0,
-            min_range: 1,
-            max_range: 1,
-            daily_fuel_consumption: 0,
-            can_capture: true,
-            can_supply: false,
-            max_cargo: 0,
-            loadable_unit_types: vec![],
-        };
+        world.spawn((
+            GridPosition { x: 5, y: 5 },
+            Faction(PlayerId(1)),
+            Health {
+                current: 100,
+                max: 100,
+            },
+            Fuel {
+                current: 99,
+                max: 99,
+            },
+            create_transport_heli_stats(),
+            HasMoved(false),
+            ActionCompleted(false),
+            CargoCapacity {
+                max: 2,
+                loaded: vec![],
+            },
+        ));
 
         let inf_entity = world
             .spawn((
@@ -734,17 +709,16 @@ mod tests {
                     current: 99,
                     max: 99,
                 },
-                inf_stats,
+                create_infantry_stats(),
                 HasMoved(false),
                 ActionCompleted(false),
             ))
             .id();
 
-        let ms = MatchState {
+        world.insert_resource(MatchState {
             current_phase: Phase::Main,
             ..Default::default()
-        };
-        world.insert_resource(ms);
+        });
 
         world.send_event(MoveUnitCommand {
             unit_entity: inf_entity,
@@ -760,7 +734,212 @@ mod tests {
         let mut reader = load_events.get_cursor();
         let emitted: Vec<_> = reader.read(load_events).collect();
         assert_eq!(emitted.len(), 1);
+    }
 
-        // Let's modify move_unit_system slightly to check for transports upon arrival
+    #[test]
+    fn test_pass_through_allied_unit() {
+        let mut world = World::new();
+        world.insert_resource(MatchState {
+            current_phase: Phase::Main,
+            ..Default::default()
+        });
+        world.insert_resource(Players(vec![
+            Player::new(1, "P1".to_string()),
+            Player::new(2, "P2".to_string()),
+        ]));
+        let map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        world.insert_resource(map);
+        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
+        world.insert_resource(Events::<MoveUnitCommand>::default());
+        world.insert_resource(Events::<UnitMovedEvent>::default());
+        world.insert_resource(Events::<LoadUnitCommand>::default());
+
+        let inf_stats = create_infantry_stats();
+
+        // Subject unit (Player 1)
+        let subject = world
+            .spawn((
+                GridPosition { x: 0, y: 0 },
+                Faction(PlayerId(1)),
+                Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                inf_stats.clone(),
+                HasMoved(false),
+                ActionCompleted(false),
+            ))
+            .id();
+
+        // Allied unit at (1, 0)
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Faction(PlayerId(1)),
+            inf_stats.clone(),
+            Fuel {
+                current: 10,
+                max: 10,
+            },
+            HasMoved(false),
+            ActionCompleted(false),
+        ));
+
+        // Move to (2, 0) through (1, 0)
+        world.send_event(MoveUnitCommand {
+            unit_entity: subject,
+            target_x: 2,
+            target_y: 0,
+        });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(move_unit_system);
+        schedule.run(&mut world);
+
+        let pos = world.get::<GridPosition>(subject).unwrap();
+        assert_eq!(pos.x, 2, "Should be able to pass through allied unit");
+        assert_eq!(pos.y, 0);
+    }
+
+    #[test]
+    fn test_cannot_stop_on_allied_unit() {
+        let mut world = World::new();
+        world.insert_resource(MatchState {
+            current_phase: Phase::Main,
+            ..Default::default()
+        });
+        world.insert_resource(Players(vec![
+            Player::new(1, "P1".to_string()),
+            Player::new(2, "P2".to_string()),
+        ]));
+        let map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        world.insert_resource(map);
+        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
+        world.insert_resource(Events::<MoveUnitCommand>::default());
+        world.insert_resource(Events::<UnitMovedEvent>::default());
+        world.insert_resource(Events::<LoadUnitCommand>::default());
+
+        let inf_stats = create_infantry_stats();
+
+        // Subject unit
+        let subject = world
+            .spawn((
+                GridPosition { x: 0, y: 0 },
+                Faction(PlayerId(1)),
+                Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                inf_stats.clone(),
+                HasMoved(false),
+                ActionCompleted(false),
+            ))
+            .id();
+
+        // Allied unit at (1, 0)
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Faction(PlayerId(1)),
+            inf_stats.clone(),
+            Fuel {
+                current: 10,
+                max: 10,
+            },
+            HasMoved(false),
+            ActionCompleted(false),
+        ));
+
+        // Try to move to (1, 0)
+        world.send_event(MoveUnitCommand {
+            unit_entity: subject,
+            target_x: 1,
+            target_y: 0,
+        });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(move_unit_system);
+        schedule.run(&mut world);
+
+        let pos = world.get::<GridPosition>(subject).unwrap();
+        assert_eq!(pos.x, 0, "Should NOT be able to stop on allied unit");
+        assert_eq!(pos.y, 0);
+    }
+
+    #[test]
+    fn test_zoc_stoppage_with_ally() {
+        let mut world = World::new();
+        world.insert_resource(MatchState {
+            current_phase: Phase::Main,
+            ..Default::default()
+        });
+        world.insert_resource(Players(vec![
+            Player::new(1, "P1".to_string()),
+            Player::new(2, "P2".to_string()),
+        ]));
+        let map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        world.insert_resource(map);
+        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
+        world.insert_resource(Events::<MoveUnitCommand>::default());
+        world.insert_resource(Events::<UnitMovedEvent>::default());
+        world.insert_resource(Events::<LoadUnitCommand>::default());
+
+        let inf_stats = create_infantry_stats();
+
+        // Subject unit
+        let subject = world
+            .spawn((
+                GridPosition { x: 0, y: 0 },
+                Faction(PlayerId(1)),
+                Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                inf_stats.clone(),
+                HasMoved(false),
+                ActionCompleted(false),
+            ))
+            .id();
+
+        // Enemy at (1, 1). This makes (1, 0) a ZOC tile.
+        world.spawn((
+            GridPosition { x: 1, y: 1 },
+            Faction(PlayerId(2)),
+            inf_stats.clone(),
+            Fuel {
+                current: 10,
+                max: 10,
+            },
+            HasMoved(false),
+            ActionCompleted(false),
+        ));
+
+        // Allied unit at (1, 0)
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Faction(PlayerId(1)),
+            inf_stats.clone(),
+            Fuel {
+                current: 10,
+                max: 10,
+            },
+            HasMoved(false),
+            ActionCompleted(false),
+        ));
+
+        // Try to move to (2, 0) through (1, 0)
+        world.send_event(MoveUnitCommand {
+            unit_entity: subject,
+            target_x: 2,
+            target_y: 0,
+        });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(move_unit_system);
+        schedule.run(&mut world);
+
+        let pos = world.get::<GridPosition>(subject).unwrap();
+        assert_eq!(
+            pos.x, 0,
+            "Should be stopped by ZOC and unable to stop on ally at (1,0)"
+        );
     }
 }
