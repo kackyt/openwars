@@ -105,6 +105,14 @@ pub struct MovementRecord {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct CategoryRecord {
+    #[serde(rename = "ユニット名")]
+    pub unit_name: String,
+    #[serde(rename = "カテゴリ")]
+    pub category: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct LoadRecord {
     #[serde(rename = "輸送ユニット")]
     pub transport: String,
@@ -149,6 +157,7 @@ pub struct MasterDataRegistry {
     pub weapons: HashMap<UnitName, WeaponRecord>,
     pub movements: HashMap<crate::resources::MovementType, MovementRecord>,
     pub loads: HashMap<String, Vec<LoadRecord>>,
+    pub categories: HashMap<String, Vec<crate::resources::UnitType>>,
     pub maps: HashMap<String, MapData>,
 }
 
@@ -268,7 +277,22 @@ impl MasterDataRegistry {
                 .push(record);
         }
 
-        // 6. マップ初期配置データ読み込み
+        // 6. カテゴリ(Category)データ読み込み
+        // ユニットの属性グループ（「歩兵」「地上部隊」など）を登録します。
+        let category_csv = include_str!("master_data/category.csv");
+        let mut rdr = csv::Reader::from_reader(category_csv.as_bytes());
+        for result in rdr.deserialize() {
+            let record: CategoryRecord = result?;
+            if let Some(u_type) = crate::resources::UnitType::from_str(&record.unit_name) {
+                registry
+                    .categories
+                    .entry(record.category)
+                    .or_default()
+                    .push(u_type);
+            }
+        }
+
+        // 7. マップ初期配置データ読み込み
         // プレイヤーIDと地形IDが結合された数値を MapData としてパースします。
         let map_1_csv = include_str!("master_data/map/map_1.csv");
         registry
@@ -276,6 +300,16 @@ impl MasterDataRegistry {
             .insert("map_1".to_string(), parse_map(map_1_csv)?);
 
         Ok(registry)
+    }
+
+    pub fn expand_target(&self, target: &str) -> Vec<crate::resources::UnitType> {
+        if let Some(units) = self.categories.get(target) {
+            units.clone()
+        } else if let Some(u_type) = crate::resources::UnitType::from_str(target) {
+            vec![u_type]
+        } else {
+            vec![]
+        }
     }
 
     pub fn get_unit(&self, name: &UnitName) -> Option<&UnitRecord> {
@@ -344,7 +378,7 @@ impl MasterDataRegistry {
     pub fn can_produce_unit(
         &self,
         landscape_name: &str,
-        unit_movement_type: crate::resources::MovementType,
+        unit_type: crate::resources::UnitType,
     ) -> bool {
         let Some(landscape) = self.get_landscape_by_name(landscape_name) else {
             return false;
@@ -352,14 +386,16 @@ impl MasterDataRegistry {
         let Some(supply_type) = &landscape.supply_type else {
             return false;
         };
-        use crate::resources::MovementType::*;
-        match supply_type.as_str() {
-            supply_types::GROUND => {
-                matches!(unit_movement_type, Infantry | Tank | Artillery | ArmoredCar)
+
+        if let Some(allowed_units) = self.categories.get(supply_type) {
+            allowed_units.contains(&unit_type)
+        } else {
+            // カテゴリ名でない場合は、直接のユニット名として一致するか確認
+            if let Some(target_type) = crate::resources::UnitType::from_str(supply_type) {
+                target_type == unit_type
+            } else {
+                false
             }
-            supply_types::AIR => matches!(unit_movement_type, Air),
-            supply_types::NAVY => matches!(unit_movement_type, Ship),
-            _ => false,
         }
     }
 }
@@ -524,8 +560,26 @@ mod tests {
     fn test_can_produce_unit() {
         let registry = MasterDataRegistry::load().unwrap();
         // 首都（地上部隊）で歩兵生産可能
-        assert!(registry.can_produce_unit("首都", crate::resources::MovementType::Infantry));
+        assert!(registry.can_produce_unit("首都", crate::resources::UnitType::Infantry));
         // 首都で航空は生産不可
-        assert!(!registry.can_produce_unit("首都", crate::resources::MovementType::Air));
+        assert!(!registry.can_produce_unit("首都", crate::resources::UnitType::Fighter));
+    }
+
+    #[test]
+    fn test_expand_target() {
+        let registry = MasterDataRegistry::load().unwrap();
+        // カテゴリ展開
+        let units = registry.expand_target("歩兵");
+        assert!(units.contains(&crate::resources::UnitType::Infantry));
+        assert!(units.contains(&crate::resources::UnitType::Mech));
+        assert_eq!(units.len(), 2);
+
+        // 個別名称
+        let units = registry.expand_target("軽歩兵");
+        assert_eq!(units, vec![crate::resources::UnitType::Infantry]);
+
+        // 不明な名称
+        let units = registry.expand_target("存在しないユニット");
+        assert!(units.is_empty());
     }
 }

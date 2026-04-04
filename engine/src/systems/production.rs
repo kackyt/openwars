@@ -105,7 +105,7 @@ pub fn produce_unit_system(
 
         player.funds -= stats.cost;
 
-        commands.spawn((
+        let spawn_cmd = commands.spawn((
             GridPosition {
                 x: event.target_x,
                 y: event.target_y,
@@ -125,10 +125,19 @@ pub fn produce_unit_system(
                 ammo2: stats.max_ammo2,
                 max_ammo2: stats.max_ammo2,
             },
-            stats,
+            stats.clone(),
             HasMoved(true), // Produced units cannot move immediately
             ActionCompleted(true),
         ));
+
+        // 輸送ユニットの場合、CargoCapacityコンポーネントを追加
+        if stats.max_cargo > 0 {
+            let entity = spawn_cmd.id();
+            commands.entity(entity).insert(CargoCapacity {
+                max: stats.max_cargo,
+                loaded: vec![],
+            });
+        }
     }
 }
 

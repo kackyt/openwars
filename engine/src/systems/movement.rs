@@ -354,8 +354,8 @@ pub fn move_unit_system(
 
     for event in move_events.read() {
         let mut unit_positions = HashMap::new();
-        for (_, pos, _, _, faction, stats, _, trans, cargo_opt) in q_units.iter() {
-            if trans.is_none() {
+        for (e, pos, _, _, faction, stats, _, trans, cargo_opt) in q_units.iter() {
+            if e != event.unit_entity && trans.is_none() {
                 let free_slots = cargo_opt
                     .map(|c| c.max.saturating_sub(c.loaded.len() as u32))
                     .unwrap_or(0);
@@ -941,5 +941,113 @@ mod tests {
             pos.x, 0,
             "Should be stopped by ZOC and unable to stop on ally at (1,0)"
         );
+    }
+
+    #[test]
+    fn test_load_into_produced_transport_bug_reproduction() {
+        let mut world = World::new();
+        world.insert_resource(MatchState {
+            current_phase: Phase::Main,
+            ..Default::default()
+        });
+        world.insert_resource(Players(vec![Player {
+            id: PlayerId(1),
+            name: "P1".to_string(),
+            funds: 10000,
+        }]));
+        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Capital).unwrap();
+        map.set_terrain(1, 1, Terrain::Airport).unwrap();
+        world.insert_resource(map);
+        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
+
+        // Spawn properties for production
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(PlayerId(1))),
+        ));
+        world.spawn((
+            GridPosition { x: 1, y: 1 },
+            Property::new(Terrain::Airport, Some(PlayerId(1))),
+        ));
+
+        // Registry for production
+        let mut registry = UnitRegistry(std::collections::HashMap::new());
+        registry
+            .0
+            .insert(UnitType::Infantry, create_infantry_stats());
+        registry
+            .0
+            .insert(UnitType::TransportHelicopter, create_transport_heli_stats());
+        world.insert_resource(registry);
+
+        world.insert_resource(Events::<ProduceUnitCommand>::default());
+        world.insert_resource(Events::<MoveUnitCommand>::default());
+        world.insert_resource(Events::<UnitMovedEvent>::default());
+        world.insert_resource(Events::<LoadUnitCommand>::default());
+
+        // 1. Produce a transport heli at (1, 1)
+        world.send_event(ProduceUnitCommand {
+            player_id: PlayerId(1),
+            target_x: 1,
+            target_y: 1,
+            unit_type: UnitType::TransportHelicopter,
+        });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(crate::systems::production::produce_unit_system);
+        schedule.run(&mut world);
+
+        // Verify it was produced and HAS CargoCapacity (the fix)
+        let mut transport_query =
+            world.query_filtered::<Entity, (With<GridPosition>, With<Faction>)>();
+        let transport_entity = transport_query.single(&world);
+        assert!(
+            world.get::<CargoCapacity>(transport_entity).is_some(),
+            "CargoCapacity should be present on produced transport"
+        );
+
+        // 2. Spawn an infantry at (2, 1)
+        let infantry_entity = world
+            .spawn((
+                GridPosition { x: 2, y: 1 },
+                Faction(PlayerId(1)),
+                Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                create_infantry_stats(),
+                HasMoved(false),
+                ActionCompleted(false),
+            ))
+            .id();
+
+        // 3. Try to move infantry into transport at (1, 1)
+        world.get_mut::<HasMoved>(transport_entity).unwrap().0 = false;
+        world
+            .get_mut::<ActionCompleted>(transport_entity)
+            .unwrap()
+            .0 = false;
+
+        world.send_event(MoveUnitCommand {
+            unit_entity: infantry_entity,
+            target_x: 1,
+            target_y: 1,
+        });
+
+        let mut move_schedule = Schedule::default();
+        move_schedule.add_systems(move_unit_system);
+        move_schedule.run(&mut world);
+
+        // Verify movement SUCCEEDED
+        let infantry_pos = world.get::<GridPosition>(infantry_entity).unwrap();
+        assert_eq!(infantry_pos.x, 1, "Movement should succeed after fix");
+        assert_eq!(infantry_pos.y, 1);
+
+        // Verify LoadUnitCommand was emitted
+        let load_events = world.resource::<Events<LoadUnitCommand>>();
+        let mut reader = load_events.get_cursor();
+        let emitted: Vec<_> = reader.read(load_events).collect();
+        assert_eq!(emitted.len(), 1, "LoadUnitCommand should be emitted");
     }
 }
