@@ -36,8 +36,8 @@ pub fn produce_unit_system(
     mut produce_events: EventReader<ProduceUnitCommand>,
     mut players: ResMut<Players>,
     match_state: Res<MatchState>,
-    _map: Res<Map>,
     q_properties: Query<(&GridPosition, &Property)>,
+    q_units: Query<&GridPosition, (With<Faction>, Without<Transporting>)>,
     unit_registry: Res<UnitRegistry>,
 ) {
     if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
@@ -47,6 +47,15 @@ pub fn produce_unit_system(
 
     for event in produce_events.read() {
         if event.player_id != active_player_id {
+            continue;
+        }
+
+        // 生産対象の座標に既にユニット（Factionを持つ＝マップ上に存在する実体）がいないかチェック
+        let is_occupied = q_units
+            .iter()
+            .any(|pos| pos.x == event.target_x && pos.y == event.target_y);
+
+        if is_occupied {
             continue;
         }
 
@@ -96,7 +105,7 @@ pub fn produce_unit_system(
 
         player.funds -= stats.cost;
 
-        commands.spawn((
+        let spawn_cmd = commands.spawn((
             GridPosition {
                 x: event.target_x,
                 y: event.target_y,
@@ -116,10 +125,19 @@ pub fn produce_unit_system(
                 ammo2: stats.max_ammo2,
                 max_ammo2: stats.max_ammo2,
             },
-            stats,
+            stats.clone(),
             HasMoved(true), // Produced units cannot move immediately
             ActionCompleted(true),
         ));
+
+        // 輸送ユニットの場合、CargoCapacityコンポーネントを追加
+        if stats.max_cargo > 0 {
+            let entity = spawn_cmd.id();
+            commands.entity(entity).insert(CargoCapacity {
+                max: stats.max_cargo,
+                loaded: vec![],
+            });
+        }
     }
 }
 
@@ -205,5 +223,71 @@ mod tests {
         // Check if funds were deducted
         let players = world.resource::<Players>();
         assert_eq!(players.0[0].funds, 1000); // 2000 - 1000
+    }
+
+    #[test]
+    fn test_production_collision() {
+        let mut world = World::new();
+
+        world.insert_resource(MatchState::default());
+        world.insert_resource(Players(vec![Player {
+            id: PlayerId(1),
+            name: "P1".to_string(),
+            funds: 2000,
+        }]));
+
+        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(2, 0, Terrain::Factory).unwrap();
+        world.insert_resource(map);
+
+        world.init_resource::<Events<ProduceUnitCommand>>();
+
+        world.spawn((
+            GridPosition { x: 2, y: 0 },
+            Property::new(Terrain::Factory, Some(PlayerId(1))),
+        ));
+
+        // 既にユニットを配置
+        world.spawn((
+            GridPosition { x: 2, y: 0 },
+            Faction(PlayerId(1)),
+            Health {
+                current: 100,
+                max: 100,
+            },
+            UnitStats::default(),
+        ));
+
+        let mut registry = UnitRegistry(std::collections::HashMap::new());
+        registry.0.insert(
+            UnitType::Infantry,
+            UnitStats {
+                unit_type: UnitType::Infantry,
+                cost: 1000,
+                ..Default::default()
+            },
+        );
+        world.insert_resource(registry);
+
+        world.send_event(ProduceUnitCommand {
+            player_id: PlayerId(1),
+            target_x: 2,
+            target_y: 0,
+            unit_type: UnitType::Infantry,
+        });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(produce_unit_system);
+        schedule.run(&mut world);
+
+        // 資金が減っていないことを確認
+        let players = world.resource::<Players>();
+        assert_eq!(players.0[0].funds, 2000);
+
+        // ユニットが増えていないことを確認 (既存の1体のみ)
+        // Note: GridPositionを持つエンティティは Property と Unit の2つあるはず
+        let mut query = world.query_filtered::<&GridPosition, With<Faction>>();
+        let count = query.iter(&world).filter(|p| p.x == 2 && p.y == 0).count();
+        assert_eq!(count, 1);
     }
 }

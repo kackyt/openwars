@@ -64,45 +64,34 @@ pub fn next_phase_system(
     }
 
     for _ in next_phase_events.read() {
-        match match_state.current_phase {
-            Phase::Main => {
-                match_state.current_phase = Phase::EndTurn;
-                let active_player_id = players.0[match_state.active_player_index.0].id;
-                phase_changed_events.send(GamePhaseChangedEvent {
-                    new_phase: Phase::EndTurn,
-                    active_player: active_player_id,
-                });
-            }
-            Phase::EndTurn => {
-                match_state.active_player_index.0 += 1;
+        // ターン終了処理 (現在のフェーズが Main であると仮定)
+        // 常に次のプレイヤーの Main フェーズまで一気に進めます。
+        // これまでは EndTurn フェーズで止まっていましたが、2回クリックが必要になるためアトミック化します。
 
-                // Wrap around players
-                if match_state.active_player_index.0 >= players.0.len() {
-                    match_state.active_player_index.0 = 0;
-                    match_state.current_turn_number.0 += 1;
+        match_state.active_player_index.0 += 1;
 
-                    // Daily Updates (Fuel consumption, crashing) for all units when a day ends
-                    for (_entity, _, _, _, stats, mut fuel, _, mut hp, pos) in q_units.iter_mut() {
-                        apply_daily_updates_for_unit(stats, pos, &map, &mut fuel, &mut hp);
-                    }
-                }
+        // プレイヤー一周による日次更新
+        if match_state.active_player_index.0 >= players.0.len() {
+            match_state.active_player_index.0 = 0;
+            match_state.current_turn_number.0 += 1;
 
-                match_state.current_phase = Phase::Main;
-                let active_player_id = players.0[match_state.active_player_index.0].id;
-
-                process_resupply_and_reset(
-                    active_player_id,
-                    &mut players,
-                    &q_properties,
-                    &mut q_units,
-                );
-
-                phase_changed_events.send(GamePhaseChangedEvent {
-                    new_phase: Phase::Main,
-                    active_player: active_player_id,
-                });
+            // 全ユニットの日次更新 (燃料消費、墜落)
+            for (_entity, _, _, _, stats, mut fuel, _, mut hp, pos) in q_units.iter_mut() {
+                apply_daily_updates_for_unit(stats, pos, &map, &mut fuel, &mut hp);
             }
         }
+
+        match_state.current_phase = Phase::Main;
+        let active_player_id = players.0[match_state.active_player_index.0].id;
+
+        // 次のプレイヤーの補給、資金増加、行動フラグリセット
+        process_resupply_and_reset(active_player_id, &mut players, &q_properties, &mut q_units);
+
+        // UIへ通知 (Mainフェーズ開始のみ通知)
+        phase_changed_events.send(GamePhaseChangedEvent {
+            new_phase: Phase::Main,
+            active_player: active_player_id,
+        });
     }
 }
 

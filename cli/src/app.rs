@@ -349,12 +349,17 @@ impl App {
 
                     let mut unit_positions = std::collections::HashMap::new();
                     let mut q_all = world.query::<(
+                        Entity,
                         &openwars_engine::components::GridPosition,
                         &openwars_engine::components::Faction,
                         &openwars_engine::components::UnitStats,
                         Option<&openwars_engine::components::CargoCapacity>,
+                        Option<&openwars_engine::components::Transporting>,
                     )>();
-                    for (p, f, s, c) in q_all.iter(world) {
+                    for (e, p, f, s, c, t) in q_all.iter(world) {
+                        if e == entity || t.is_some() {
+                            continue;
+                        }
                         let free_slots = c
                             .map(|c| c.max.saturating_sub(c.loaded.len() as u32))
                             .unwrap_or(0);
@@ -417,7 +422,18 @@ impl App {
                 }
 
                 if is_factory {
-                    if openwars_engine::systems::production::is_within_production_range(
+                    // 他のユニット（Factionを持ち、輸送中を除くマップ上のユニット）が既にそのマスにいないかチェック
+                    let is_occupied = world
+                        .query_filtered::<&openwars_engine::components::GridPosition, (
+                            With<openwars_engine::components::Faction>,
+                            Without<openwars_engine::components::Transporting>,
+                        )>()
+                        .iter(world)
+                        .any(|u_pos| u_pos.x == cx && u_pos.y == cy);
+
+                    if is_occupied {
+                        self.ui_state.add_log("Tile is occupied!".to_string());
+                    } else if openwars_engine::systems::production::is_within_production_range(
                         capital_pos,
                         cx,
                         cy,
@@ -485,9 +501,9 @@ impl App {
                             continue;
                         }
 
-                        if self
-                            .master_data
-                            .can_produce_unit(landscape_name, record.movement_type)
+                        if let Some(u_type) =
+                            openwars_engine::resources::UnitType::from_str(&name.0)
+                            && self.master_data.can_produce_unit(landscape_name, u_type)
                         {
                             options.push(name.0.clone());
                         }
@@ -922,11 +938,8 @@ impl App {
                 if let Some(loads) = self.master_data.loads.get(&name.0) {
                     for load_record in loads {
                         max_cargo = max_cargo.max(load_record.capacity);
-                        if let Some(target_type) =
-                            openwars_engine::resources::UnitType::from_str(&load_record.target)
-                        {
-                            loadable.push(target_type);
-                        }
+                        let expanded = self.master_data.expand_target(&load_record.target);
+                        loadable.extend(expanded);
                     }
                 }
 
