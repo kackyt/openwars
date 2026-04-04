@@ -640,7 +640,7 @@ mod tests {
         schedule.add_systems(crate::systems::turn_management::next_phase_system);
 
         let advance_day = |w: &mut World, s: &mut Schedule| {
-            for _ in 0..4 {
+            for _ in 0..2 {
                 w.send_event(crate::events::NextPhaseCommand);
                 s.run(w);
             }

@@ -202,10 +202,12 @@ where
                     world.get_resource_mut::<Events<GamePhaseChangedEvent>>()
                 {
                     for ev in phase_events.drain() {
-                        phase_popup = Some(format!(
-                            "Player {}'s Turn\n\nPress Space to continue...",
-                            ev.active_player.0
-                        ));
+                        if ev.new_phase == openwars_engine::resources::Phase::Main {
+                            phase_popup = Some(format!(
+                                "Player {}'s Turn\n\nPress Space to continue...",
+                                ev.active_player.0
+                            ));
+                        }
                     }
                 }
 
