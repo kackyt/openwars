@@ -417,7 +417,18 @@ impl App {
                 }
 
                 if is_factory {
-                    if openwars_engine::systems::production::is_within_production_range(
+                    // 他のユニット（Factionを持ち、輸送中を除くマップ上のユニット）が既にそのマスにいないかチェック
+                    let is_occupied = world
+                        .query_filtered::<&openwars_engine::components::GridPosition, (
+                            With<openwars_engine::components::Faction>,
+                            Without<openwars_engine::components::Transporting>,
+                        )>()
+                        .iter(world)
+                        .any(|u_pos| u_pos.x == cx && u_pos.y == cy);
+
+                    if is_occupied {
+                        self.ui_state.add_log("Tile is occupied!".to_string());
+                    } else if openwars_engine::systems::production::is_within_production_range(
                         capital_pos,
                         cx,
                         cy,
