@@ -1,5 +1,6 @@
 use crate::components::*;
 use crate::events::*;
+pub use crate::resources::master_data::MasterDataRegistry;
 use crate::resources::*;
 use bevy_ecs::prelude::*;
 
@@ -13,7 +14,6 @@ use bevy_ecs::prelude::*;
 /// 5. 新しいユニットの実体(`Entity`)をコンポーネント群と共に生成（スポーン）します。
 ///    ※生産された直後は行動できないため、`HasMoved` と `ActionCompleted` を true にします。
 ///
-/// 自軍の首都のある場所から生産可能範囲内にあるかどうかを判定するエンジン側の純粋なドメイン関数
 /// 首都からの生産可能範囲（マンハッタン距離）
 pub const PRODUCTION_RANGE: usize = 3;
 
@@ -31,6 +31,121 @@ pub fn is_within_production_range(
     }
 }
 
+fn check_production_rules(
+    is_occupied: bool,
+    landscape_name: Option<&str>,
+    capital_pos: Option<GridPosition>,
+    target_x: usize,
+    target_y: usize,
+    unit_type: UnitType,
+    master_data: &MasterDataRegistry,
+) -> Result<(), String> {
+    if is_occupied {
+        return Err("Tile is occupied!".to_string());
+    }
+
+    let Some(ln) = landscape_name else {
+        return Err("Not a friendly property!".to_string());
+    };
+
+    if !master_data.can_produce_unit(ln, unit_type) {
+        return Err(format!("Cannot produce {:?} at {}", unit_type, ln));
+    }
+
+    if !is_within_production_range(capital_pos, target_x, target_y) {
+        return Err("Too far from Capital!".to_string());
+    }
+
+    Ok(())
+}
+
+pub fn can_produce_at_tile(
+    world: &mut World,
+    player_id: PlayerId,
+    target_x: usize,
+    target_y: usize,
+) -> Result<(), String> {
+    // この関数では全ユニット種別をチェックする代わりに「何かしら生産可能か」を確認する
+    // 簡略化のため、occupancy と range だけチェックする
+    let is_occupied = world
+        .query_filtered::<&GridPosition, (With<Faction>, Without<Transporting>)>()
+        .iter(world)
+        .any(|pos| pos.x == target_x && pos.y == target_y);
+    if is_occupied {
+        return Err("Tile is occupied!".to_string());
+    }
+
+    let mut capital_pos = None;
+    let mut is_valid_facility = false;
+    let mut q_prop = world.query::<(&GridPosition, &Property)>();
+    for (pos, prop) in q_prop.iter(world) {
+        if prop.owner_id == Some(player_id) {
+            if prop.terrain == Terrain::Capital {
+                capital_pos = Some(*pos);
+            }
+            if pos.x == target_x
+                && pos.y == target_y
+                && matches!(
+                    prop.terrain,
+                    Terrain::Factory | Terrain::Capital | Terrain::Airport | Terrain::Port
+                )
+            {
+                is_valid_facility = true;
+            }
+        }
+    }
+
+    if !is_valid_facility {
+        return Err("Not a production facility!".to_string());
+    }
+
+    if !is_within_production_range(capital_pos, target_x, target_y) {
+        return Err("Too far from Capital!".to_string());
+    }
+
+    Ok(())
+}
+
+pub fn can_produce_at(
+    world: &mut World,
+    player_id: PlayerId,
+    target_x: usize,
+    target_y: usize,
+    unit_type: UnitType,
+    master_data: &MasterDataRegistry,
+) -> Result<(), String> {
+    let is_occupied = world
+        .query_filtered::<&GridPosition, (With<Faction>, Without<Transporting>)>()
+        .iter(world)
+        .any(|pos| pos.x == target_x && pos.y == target_y);
+
+    let mut landscape_name = None;
+    let mut capital_pos = None;
+    let mut q_prop = world.query::<(&GridPosition, &Property)>();
+    for (pos, prop) in q_prop.iter(world) {
+        if prop.owner_id == Some(player_id) {
+            if pos.x == target_x && pos.y == target_y {
+                landscape_name = Some(prop.terrain.as_str());
+            }
+            if prop.terrain == Terrain::Capital {
+                capital_pos = Some(*pos);
+            }
+        }
+    }
+
+    check_production_rules(
+        is_occupied,
+        landscape_name,
+        capital_pos,
+        target_x,
+        target_y,
+        unit_type,
+        master_data,
+    )
+}
+
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 pub fn produce_unit_system(
     mut commands: Commands,
     mut produce_events: EventReader<ProduceUnitCommand>,
@@ -38,6 +153,7 @@ pub fn produce_unit_system(
     match_state: Res<MatchState>,
     q_properties: Query<(&GridPosition, &Property)>,
     q_units: Query<&GridPosition, (With<Faction>, Without<Transporting>)>,
+    master_data: Res<MasterDataRegistry>,
     unit_registry: Res<UnitRegistry>,
 ) {
     if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
@@ -50,44 +166,33 @@ pub fn produce_unit_system(
             continue;
         }
 
-        // 生産対象の座標に既にユニット（Factionを持つ＝マップ上に存在する実体）がいないかチェック
         let is_occupied = q_units
             .iter()
             .any(|pos| pos.x == event.target_x && pos.y == event.target_y);
 
-        if is_occupied {
-            continue;
-        }
-
-        let mut is_valid_property = false;
-
-        for (pos, prop) in q_properties.iter() {
-            if prop.owner_id == Some(event.player_id)
-                && pos.x == event.target_x
-                && pos.y == event.target_y
-                && (prop.terrain == Terrain::Factory
-                    || prop.terrain == Terrain::Capital
-                    || prop.terrain == Terrain::Airport
-                    || prop.terrain == Terrain::Port)
-            {
-                is_valid_property = true;
-            }
-        }
-
-        if !is_valid_property {
-            continue;
-        }
-
+        let mut landscape_name = None;
         let mut capital_pos = None;
         for (pos, prop) in q_properties.iter() {
-            if prop.owner_id == Some(event.player_id) && prop.terrain == Terrain::Capital {
-                capital_pos = Some(*pos);
-                break;
+            if prop.owner_id == Some(event.player_id) {
+                if pos.x == event.target_x && pos.y == event.target_y {
+                    landscape_name = Some(prop.terrain.as_str());
+                }
+                if prop.terrain == Terrain::Capital {
+                    capital_pos = Some(*pos);
+                }
             }
         }
 
-        if !is_within_production_range(capital_pos, event.target_x, event.target_y) {
-            continue; // Too far from Capital
+        if let Err(_e) = check_production_rules(
+            is_occupied,
+            landscape_name,
+            capital_pos,
+            event.target_x,
+            event.target_y,
+            event.unit_type,
+            &master_data,
+        ) {
+            continue;
         }
 
         // イベントで指定されたプレイヤーを可変参照で取得する（存在しない場合はスキップ）
@@ -169,6 +274,7 @@ mod tests {
         world.insert_resource(map);
 
         world.insert_resource(Events::<ProduceUnitCommand>::default());
+        world.insert_resource(MasterDataRegistry::load().unwrap());
 
         // Spawn properties
         world.spawn((
@@ -241,6 +347,13 @@ mod tests {
         world.insert_resource(map);
 
         world.init_resource::<Events<ProduceUnitCommand>>();
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+
+        // 首都を配置
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(PlayerId(1))),
+        ));
 
         world.spawn((
             GridPosition { x: 2, y: 0 },

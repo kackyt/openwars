@@ -26,16 +26,6 @@ fn apply_daily_updates_for_unit(
     }
 }
 
-/// ターン開始時に呼ばれる日次更新システム。航空機などの燃料消費と墜落判定を行います。
-pub fn daily_update_system(
-    mut q_units: Query<(&UnitStats, &mut Fuel, &mut Health, &GridPosition)>,
-    map: Res<Map>,
-) {
-    for (stats, mut fuel, mut hp, pos) in q_units.iter_mut() {
-        apply_daily_updates_for_unit(stats, pos, &map, &mut fuel, &mut hp);
-    }
-}
-
 /// フェーズの進行、ターンの切り替え、拠点による資金増加と自動補給を管理します。
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
@@ -74,18 +64,20 @@ pub fn next_phase_system(
         if match_state.active_player_index.0 >= players.0.len() {
             match_state.active_player_index.0 = 0;
             match_state.current_turn_number.0 += 1;
-
-            // 全ユニットの日次更新 (燃料消費、墜落)
-            for (_entity, _, _, _, stats, mut fuel, _, mut hp, pos) in q_units.iter_mut() {
-                apply_daily_updates_for_unit(stats, pos, &map, &mut fuel, &mut hp);
-            }
+            // NOTE: 全ユニットの日次更新（燃料消費・墜落）は daily_update_system が担当するためここでは行わない
         }
 
         match_state.current_phase = Phase::Main;
         let active_player_id = players.0[match_state.active_player_index.0].id;
 
         // 次のプレイヤーの補給、資金増加、行動フラグリセット
-        process_resupply_and_reset(active_player_id, &mut players, &q_properties, &mut q_units);
+        process_resupply_and_reset(
+            active_player_id,
+            &mut players,
+            &q_properties,
+            &mut q_units,
+            &map,
+        );
 
         // UIへ通知 (Mainフェーズ開始のみ通知)
         phase_changed_events.send(GamePhaseChangedEvent {
@@ -111,6 +103,7 @@ fn process_resupply_and_reset(
         &mut Health,
         &GridPosition,
     )>,
+    map: &Map,
 ) {
     // Reset flags and apply property resupply
     let mut owned_properties = HashSet::new();
@@ -141,19 +134,22 @@ fn process_resupply_and_reset(
     players.0[active_player_idx].funds += budget_increase;
 
     // Property resupply & turn status reset
-    for (_, mut has_moved, mut action_completed, faction, stats, mut fuel, mut ammo, _, pos) in
+    for (_, mut has_moved, mut action_completed, faction, stats, mut fuel, mut ammo, mut hp, pos) in
         q_units.iter_mut()
     {
         if faction.0 == active_player_id {
             has_moved.0 = false;
             action_completed.0 = false;
-
+            // 日次更新 (燃料消費、墜落判定)
+            apply_daily_updates_for_unit(stats, pos, map, &mut fuel, &mut hp);
+            if hp.is_destroyed() {
+                continue;
+            }
             if owned_properties.contains(&(pos.x, pos.y)) {
                 let ammo_diff = (stats.max_ammo1.saturating_sub(ammo.ammo1))
                     + (stats.max_ammo2.saturating_sub(ammo.ammo2));
                 let fuel_diff = stats.max_fuel.saturating_sub(fuel.current);
                 let cost = ammo_diff * 15 + fuel_diff * 5;
-
                 if players.0[active_player_idx].funds >= cost {
                     players.0[active_player_idx].funds -= cost;
                     fuel.current = stats.max_fuel;

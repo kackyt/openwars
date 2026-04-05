@@ -401,47 +401,38 @@ impl App {
                     return;
                 }
 
-                let mut p_query = world.query::<(
-                    &openwars_engine::components::GridPosition,
-                    &openwars_engine::components::Property,
-                )>();
                 let mut is_factory = false;
-                let mut capital_pos = None;
-                for (pos, prop) in p_query.iter(world) {
-                    if prop.owner_id == Some(active_player_id) {
-                        if pos.x == cx && pos.y == cy {
-                            let landscape_name = prop.terrain.as_str();
-                            if self.master_data.is_production_facility(landscape_name) {
-                                is_factory = true;
-                            }
+                for (pos, prop) in world
+                    .query::<(
+                        &openwars_engine::components::GridPosition,
+                        &openwars_engine::components::Property,
+                    )>()
+                    .iter(world)
+                {
+                    if pos.x == cx && pos.y == cy {
+                        if self
+                            .master_data
+                            .is_production_facility(prop.terrain.as_str())
+                        {
+                            is_factory = true;
                         }
-                        if prop.terrain == openwars_engine::resources::Terrain::Capital {
-                            capital_pos = Some(*pos);
-                        }
+                        break;
                     }
                 }
 
                 if is_factory {
-                    // 他のユニット（Factionを持ち、輸送中を除くマップ上のユニット）が既にそのマスにいないかチェック
-                    let is_occupied = world
-                        .query_filtered::<&openwars_engine::components::GridPosition, (
-                            With<openwars_engine::components::Faction>,
-                            Without<openwars_engine::components::Transporting>,
-                        )>()
-                        .iter(world)
-                        .any(|u_pos| u_pos.x == cx && u_pos.y == cy);
-
-                    if is_occupied {
-                        self.ui_state.add_log("Tile is occupied!".to_string());
-                    } else if openwars_engine::systems::production::is_within_production_range(
-                        capital_pos,
+                    match openwars_engine::systems::production::can_produce_at_tile(
+                        world,
+                        active_player_id,
                         cx,
                         cy,
                     ) {
-                        options.insert(0, "Produce".to_string());
-                    } else {
-                        self.ui_state
-                            .add_log("Too far from Capital to produce!".to_string());
+                        Ok(()) => {
+                            options.insert(0, "Produce".to_string());
+                        }
+                        Err(e) => {
+                            self.ui_state.add_log(e);
+                        }
                     }
                 }
             }
@@ -501,8 +492,7 @@ impl App {
                             continue;
                         }
 
-                        if let Some(u_type) =
-                            openwars_engine::resources::UnitType::from_str(&name.0)
+                        if let Ok(u_type) = self.master_data.unit_type_for_name(&name.0)
                             && self.master_data.can_produce_unit(landscape_name, u_type)
                         {
                             options.push(name.0.clone());
@@ -590,8 +580,7 @@ impl App {
                 )
             {
                 let active_player_id = players.0[match_state.active_player_index.0].id;
-                let Some(unit_type) = openwars_engine::resources::UnitType::from_str(selected)
-                else {
+                let Ok(unit_type) = self.master_data.unit_type_for_name(selected) else {
                     self.ui_state
                         .add_log(format!("未対応のユニット種別です: {}", selected));
                     self.ui_state.in_game_state = InGameState::Normal;
@@ -865,7 +854,6 @@ impl App {
                 unload_unit_system,
                 wait_unit_system,
                 next_phase_system,
-                daily_update_system,
             )
                 .chain(),
         );
@@ -873,16 +861,14 @@ impl App {
         // Build UnitRegistry and DamageChart from MasterDataRegistry
         let mut damage_chart = openwars_engine::resources::DamageChart::new();
         for (unit_name, unit_record) in &self.master_data.units {
-            if let Some(att_type) = openwars_engine::resources::UnitType::from_str(&unit_name.0) {
+            if let Ok(att_type) = self.master_data.unit_type_for_name(&unit_name.0) {
                 if let Some(w1_name) = &unit_record.weapon1
                     && let Some(weapon) = self.master_data.weapons.get(
                         &openwars_engine::resources::master_data::UnitName(w1_name.clone()),
                     )
                 {
                     for (def_name, dmg) in &weapon.damages {
-                        if let Some(def_type) =
-                            openwars_engine::resources::UnitType::from_str(def_name)
-                        {
+                        if let Ok(def_type) = self.master_data.unit_type_for_name(def_name) {
                             damage_chart.insert_damage(att_type, def_type, *dmg);
                         }
                     }
@@ -893,9 +879,7 @@ impl App {
                     )
                 {
                     for (def_name, dmg) in &weapon.damages {
-                        if let Some(def_type) =
-                            openwars_engine::resources::UnitType::from_str(def_name)
-                        {
+                        if let Ok(def_type) = self.master_data.unit_type_for_name(def_name) {
                             damage_chart.insert_secondary_damage(att_type, def_type, *dmg);
                         }
                     }
@@ -906,7 +890,7 @@ impl App {
 
         let mut unit_registry_map = std::collections::HashMap::new();
         for (name, record) in &self.master_data.units {
-            if let Some(u_type) = openwars_engine::resources::UnitType::from_str(&name.0) {
+            if let Ok(u_type) = self.master_data.unit_type_for_name(&name.0) {
                 let mut min_range = 0;
                 let mut max_range = 0;
 
@@ -938,8 +922,9 @@ impl App {
                 if let Some(loads) = self.master_data.loads.get(&name.0) {
                     for load_record in loads {
                         max_cargo = max_cargo.max(load_record.capacity);
-                        let expanded = self.master_data.expand_target(&load_record.target);
-                        loadable.extend(expanded);
+                        if let Ok(expanded) = self.master_data.expand_target(&load_record.target) {
+                            loadable.extend(expanded);
+                        }
                     }
                 }
 

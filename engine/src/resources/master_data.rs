@@ -15,6 +15,12 @@ pub enum MasterDataError {
     UnknownTerrainId(LandscapeId),
     #[error("不正な地形名: {0}")]
     InvalidTerrainName(String),
+    #[error("不明なユニット名: {0}")]
+    InvalidUnitName(String),
+    #[error("不明なカテゴリ名: {0}")]
+    InvalidCategoryName(String),
+    #[error("不明な移動タイプ: {0}")]
+    InvalidMovementType(String),
     #[error("不明なマスターデータ読み込みエラー")]
     Unknown,
 }
@@ -255,13 +261,14 @@ impl MasterDataRegistry {
                 }
             }
             let m_str = record.get(0).unwrap_or("");
-            if let Some(m_type) = crate::resources::MovementType::from_str(m_str) {
-                let movement = MovementRecord {
-                    movement_type: m_type,
-                    terrain_costs,
-                };
-                registry.movements.insert(m_type, movement);
-            }
+            let m_type = crate::resources::MovementType::from_str(m_str)
+                .ok_or_else(|| MasterDataError::InvalidMovementType(m_str.to_string()))?;
+
+            let movement = MovementRecord {
+                movement_type: m_type,
+                terrain_costs,
+            };
+            registry.movements.insert(m_type, movement);
         }
 
         // 5. 搭載(Load)データ読み込み
@@ -283,13 +290,14 @@ impl MasterDataRegistry {
         let mut rdr = csv::Reader::from_reader(category_csv.as_bytes());
         for result in rdr.deserialize() {
             let record: CategoryRecord = result?;
-            if let Some(u_type) = crate::resources::UnitType::from_str(&record.unit_name) {
-                registry
-                    .categories
-                    .entry(record.category)
-                    .or_default()
-                    .push(u_type);
-            }
+            let u_type = crate::resources::UnitType::from_str(&record.unit_name)
+                .ok_or_else(|| MasterDataError::InvalidUnitName(record.unit_name.clone()))?;
+
+            registry
+                .categories
+                .entry(record.category)
+                .or_default()
+                .push(u_type);
         }
 
         // 7. マップ初期配置データ読み込み
@@ -302,14 +310,25 @@ impl MasterDataRegistry {
         Ok(registry)
     }
 
-    pub fn expand_target(&self, target: &str) -> Vec<crate::resources::UnitType> {
+    pub fn expand_target(
+        &self,
+        target: &str,
+    ) -> Result<Vec<crate::resources::UnitType>, MasterDataError> {
         if let Some(units) = self.categories.get(target) {
-            units.clone()
+            Ok(units.clone())
         } else if let Some(u_type) = crate::resources::UnitType::from_str(target) {
-            vec![u_type]
+            Ok(vec![u_type])
         } else {
-            vec![]
+            Err(MasterDataError::InvalidCategoryName(target.to_string()))
         }
+    }
+
+    pub fn unit_type_for_name(
+        &self,
+        name: &str,
+    ) -> Result<crate::resources::UnitType, MasterDataError> {
+        crate::resources::UnitType::from_str(name)
+            .ok_or_else(|| MasterDataError::InvalidUnitName(name.to_string()))
     }
 
     pub fn get_unit(&self, name: &UnitName) -> Option<&UnitRecord> {
@@ -569,17 +588,17 @@ mod tests {
     fn test_expand_target() {
         let registry = MasterDataRegistry::load().unwrap();
         // カテゴリ展開
-        let units = registry.expand_target("歩兵");
+        let units = registry.expand_target("歩兵").unwrap();
         assert!(units.contains(&crate::resources::UnitType::Infantry));
         assert!(units.contains(&crate::resources::UnitType::Mech));
         assert_eq!(units.len(), 2);
 
         // 個別名称
-        let units = registry.expand_target("軽歩兵");
+        let units = registry.expand_target("軽歩兵").unwrap();
         assert_eq!(units, vec![crate::resources::UnitType::Infantry]);
 
         // 不明な名称
         let units = registry.expand_target("存在しないユニット");
-        assert!(units.is_empty());
+        assert!(units.is_err());
     }
 }
