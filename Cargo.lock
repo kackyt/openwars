@@ -214,6 +214,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bevy_ecs",
+ "crossterm",
+ "engine",
+ "ratatui",
+]
+
+[[package]]
 name = "compact_str"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -351,6 +362,18 @@ name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
+
+[[package]]
+name = "engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bevy_ecs",
+ "csv",
+ "serde",
+ "thiserror",
+ "uuid",
+]
 
 [[package]]
 name = "equivalent"
@@ -617,29 +640,6 @@ name = "once_cell"
 version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
-
-[[package]]
-name = "openwars_cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bevy_ecs",
- "crossterm",
- "openwars_engine",
- "ratatui",
-]
-
-[[package]]
-name = "openwars_engine"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bevy_ecs",
- "csv",
- "serde",
- "thiserror",
- "uuid",
-]
 
 [[package]]
 name = "parking"
