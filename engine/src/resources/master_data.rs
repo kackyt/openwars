@@ -307,6 +307,17 @@ impl MasterDataRegistry {
             .maps
             .insert("map_1".to_string(), parse_map(map_1_csv)?);
 
+        // 8. 整合性バリデーション
+        // 地形(Landscape)の補給タイプ(supply_type)が、存在するカテゴリまたはユニット種別であるか検証します。
+        for landscape in registry.landscapes.values() {
+            if let Some(supply_type) = &landscape.supply_type
+                && !registry.categories.contains_key(supply_type)
+                && crate::resources::UnitType::from_str(supply_type).is_none()
+            {
+                return Err(MasterDataError::InvalidCategoryName(supply_type.clone()));
+            }
+        }
+
         Ok(registry)
     }
 

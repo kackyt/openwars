@@ -64,6 +64,7 @@ pub fn can_produce_at_tile(
     player_id: PlayerId,
     target_x: usize,
     target_y: usize,
+    master_data: &MasterDataRegistry,
 ) -> Result<(), String> {
     // この関数では全ユニット種別をチェックする代わりに「何かしら生産可能か」を確認する
     // 簡略化のため、occupancy と range だけチェックする
@@ -85,10 +86,7 @@ pub fn can_produce_at_tile(
             }
             if pos.x == target_x
                 && pos.y == target_y
-                && matches!(
-                    prop.terrain,
-                    Terrain::Factory | Terrain::Capital | Terrain::Airport | Terrain::Port
-                )
+                && master_data.is_production_facility(prop.terrain.as_str())
             {
                 is_valid_facility = true;
             }

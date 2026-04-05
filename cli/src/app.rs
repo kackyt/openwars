@@ -422,6 +422,7 @@ impl App {
                         active_player_id,
                         cx,
                         cy,
+                        &self.master_data,
                     ) {
                         Ok(()) => {
                             options.insert(0, "Produce".to_string());
@@ -854,30 +855,35 @@ impl App {
         // Build UnitRegistry and DamageChart from MasterDataRegistry
         let mut damage_chart = engine::resources::DamageChart::new();
         for (unit_name, unit_record) in &self.master_data.units {
-            if let Ok(att_type) = self.master_data.unit_type_for_name(&unit_name.0) {
-                if let Some(w1_name) = &unit_record.weapon1
-                    && let Some(weapon) = self
-                        .master_data
-                        .weapons
-                        .get(&engine::resources::master_data::UnitName(w1_name.clone()))
-                {
-                    for (def_name, dmg) in &weapon.damages {
-                        if let Ok(def_type) = self.master_data.unit_type_for_name(def_name) {
-                            damage_chart.insert_damage(att_type, def_type, *dmg);
-                        }
-                    }
+            let att_type = self.master_data.unit_type_for_name(&unit_name.0)?;
+
+            if let Some(w1_name) = &unit_record.weapon1 {
+                let weapon = self
+                    .master_data
+                    .weapons
+                    .get(&engine::resources::master_data::UnitName(w1_name.clone()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Weapon '{}' not found for unit '{}'", w1_name, unit_name.0)
+                    })?;
+
+                for (def_name, dmg) in &weapon.damages {
+                    let def_type = self.master_data.unit_type_for_name(def_name)?;
+                    damage_chart.insert_damage(att_type, def_type, *dmg);
                 }
-                if let Some(w2_name) = &unit_record.weapon2
-                    && let Some(weapon) = self
-                        .master_data
-                        .weapons
-                        .get(&engine::resources::master_data::UnitName(w2_name.clone()))
-                {
-                    for (def_name, dmg) in &weapon.damages {
-                        if let Ok(def_type) = self.master_data.unit_type_for_name(def_name) {
-                            damage_chart.insert_secondary_damage(att_type, def_type, *dmg);
-                        }
-                    }
+            }
+
+            if let Some(w2_name) = &unit_record.weapon2 {
+                let weapon = self
+                    .master_data
+                    .weapons
+                    .get(&engine::resources::master_data::UnitName(w2_name.clone()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Weapon '{}' not found for unit '{}'", w2_name, unit_name.0)
+                    })?;
+
+                for (def_name, dmg) in &weapon.damages {
+                    let def_type = self.master_data.unit_type_for_name(def_name)?;
+                    damage_chart.insert_secondary_damage(att_type, def_type, *dmg);
                 }
             }
         }
@@ -885,74 +891,87 @@ impl App {
 
         let mut unit_registry_map = std::collections::HashMap::new();
         for (name, record) in &self.master_data.units {
-            if let Ok(u_type) = self.master_data.unit_type_for_name(&name.0) {
-                let mut min_range = 0;
-                let mut max_range = 0;
+            let u_type = self.master_data.unit_type_for_name(&name.0)?;
+            let mut min_range = 0;
+            let mut max_range = 0;
 
-                let w1 = record.weapon1.as_ref().and_then(|w| {
+            let w1 = record
+                .weapon1
+                .as_ref()
+                .map(|w| {
                     self.master_data
                         .weapons
                         .get(&engine::resources::master_data::UnitName(w.clone()))
-                });
-                let w2 = record.weapon2.as_ref().and_then(|w| {
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Weapon '{}' not found for unit '{}'", w, name.0)
+                        })
+                })
+                .transpose()?;
+
+            let w2 = record
+                .weapon2
+                .as_ref()
+                .map(|w| {
                     self.master_data
                         .weapons
                         .get(&engine::resources::master_data::UnitName(w.clone()))
-                });
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Weapon '{}' not found for unit '{}'", w, name.0)
+                        })
+                })
+                .transpose()?;
 
-                if let Some(w) = w1 {
-                    min_range = w.range_min;
-                    max_range = w.range_max;
-                } else if let Some(w) = w2 {
-                    min_range = w.range_min;
-                    max_range = w.range_max;
-                }
-
-                let can_capture = u_type == engine::resources::UnitType::Infantry
-                    || u_type == engine::resources::UnitType::Mech;
-                let can_supply = u_type == engine::resources::UnitType::SupplyTruck;
-
-                let mut max_cargo = 0;
-                let mut loadable = Vec::new();
-                if let Some(loads) = self.master_data.loads.get(&name.0) {
-                    for load_record in loads {
-                        max_cargo = max_cargo.max(load_record.capacity);
-                        if let Ok(expanded) = self.master_data.expand_target(&load_record.target) {
-                            loadable.extend(expanded);
-                        }
-                    }
-                }
-
-                let daily_fuel = match u_type {
-                    engine::resources::UnitType::Fighter
-                    | engine::resources::UnitType::HeavyFighter
-                    | engine::resources::UnitType::Bomber => 5,
-                    engine::resources::UnitType::Bcopters
-                    | engine::resources::UnitType::TransportHelicopter => 2,
-                    engine::resources::UnitType::Battleship
-                    | engine::resources::UnitType::Carrier
-                    | engine::resources::UnitType::Lander => 1,
-                    _ => 0,
-                };
-
-                let stats = engine::components::UnitStats {
-                    unit_type: u_type,
-                    cost: record.cost,
-                    max_movement: record.movement,
-                    movement_type: record.movement_type,
-                    max_fuel: record.fuel,
-                    max_ammo1: w1.map(|w| w.ammo).unwrap_or(0),
-                    max_ammo2: w2.map(|w| w.ammo).unwrap_or(0),
-                    min_range,
-                    max_range,
-                    daily_fuel_consumption: daily_fuel,
-                    can_capture,
-                    can_supply,
-                    max_cargo,
-                    loadable_unit_types: loadable,
-                };
-                unit_registry_map.insert(u_type, stats);
+            if let Some(w) = w1 {
+                min_range = w.range_min;
+                max_range = w.range_max;
+            } else if let Some(w) = w2 {
+                min_range = w.range_min;
+                max_range = w.range_max;
             }
+
+            let can_capture = u_type == engine::resources::UnitType::Infantry
+                || u_type == engine::resources::UnitType::Mech;
+            let can_supply = u_type == engine::resources::UnitType::SupplyTruck;
+
+            let mut max_cargo = 0;
+            let mut loadable = Vec::new();
+            if let Some(loads) = self.master_data.loads.get(&name.0) {
+                for load_record in loads {
+                    max_cargo = max_cargo.max(load_record.capacity);
+                    let expanded = self.master_data.expand_target(&load_record.target)?;
+                    loadable.extend(expanded);
+                }
+            }
+
+            let daily_fuel = match u_type {
+                engine::resources::UnitType::Fighter
+                | engine::resources::UnitType::HeavyFighter
+                | engine::resources::UnitType::Bomber => 5,
+                engine::resources::UnitType::Bcopters
+                | engine::resources::UnitType::TransportHelicopter => 2,
+                engine::resources::UnitType::Battleship
+                | engine::resources::UnitType::Carrier
+                | engine::resources::UnitType::Lander => 1,
+                _ => 0,
+            };
+
+            let stats = engine::components::UnitStats {
+                unit_type: u_type,
+                cost: record.cost,
+                max_movement: record.movement,
+                movement_type: record.movement_type,
+                max_fuel: record.fuel,
+                max_ammo1: w1.map(|w| w.ammo).unwrap_or(0),
+                max_ammo2: w2.map(|w| w.ammo).unwrap_or(0),
+                min_range,
+                max_range,
+                daily_fuel_consumption: daily_fuel,
+                can_capture,
+                can_supply,
+                max_cargo,
+                loadable_unit_types: loadable,
+            };
+            unit_registry_map.insert(u_type, stats);
         }
         let unit_registry = engine::resources::UnitRegistry(unit_registry_map);
         world.insert_resource(unit_registry);

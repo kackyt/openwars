@@ -26,6 +26,27 @@ fn apply_daily_updates_for_unit(
     }
 }
 
+/// 全ユニットに対して日次更新（燃料消費、墜落判定）を適用します。
+#[allow(clippy::type_complexity)]
+fn run_daily_update_for_all(
+    q_units: &mut Query<(
+        Entity,
+        &mut HasMoved,
+        &mut ActionCompleted,
+        &Faction,
+        &UnitStats,
+        &mut Fuel,
+        &mut Ammo,
+        &mut Health,
+        &GridPosition,
+    )>,
+    map: &Map,
+) {
+    for (_, _, _, _, stats, mut fuel, _, mut hp, pos) in q_units.iter_mut() {
+        apply_daily_updates_for_unit(stats, pos, map, &mut fuel, &mut hp);
+    }
+}
+
 /// フェーズの進行、ターンの切り替え、拠点による資金増加と自動補給を管理します。
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
@@ -64,7 +85,9 @@ pub fn next_phase_system(
         if match_state.active_player_index.0 >= players.0.len() {
             match_state.active_player_index.0 = 0;
             match_state.current_turn_number.0 += 1;
-            // NOTE: 全ユニットの日次更新（燃料消費・墜落）は daily_update_system が担当するためここでは行わない
+
+            // 全ユニットの日次更新（燃料消費・墜落）を実行
+            run_daily_update_for_all(&mut q_units, &map);
         }
 
         match_state.current_phase = Phase::Main;
@@ -103,7 +126,7 @@ fn process_resupply_and_reset(
         &mut Health,
         &GridPosition,
     )>,
-    map: &Map,
+    _map: &Map,
 ) {
     // Reset flags and apply property resupply
     let mut owned_properties = HashSet::new();
@@ -134,14 +157,13 @@ fn process_resupply_and_reset(
     players.0[active_player_idx].funds += budget_increase;
 
     // Property resupply & turn status reset
-    for (_, mut has_moved, mut action_completed, faction, stats, mut fuel, mut ammo, mut hp, pos) in
+    for (_, mut has_moved, mut action_completed, faction, stats, mut fuel, mut ammo, hp, pos) in
         q_units.iter_mut()
     {
         if faction.0 == active_player_id {
             has_moved.0 = false;
             action_completed.0 = false;
-            // 日次更新 (燃料消費、墜落判定)
-            apply_daily_updates_for_unit(stats, pos, map, &mut fuel, &mut hp);
+            // 日次更新 (燃料消費、墜落判定) は next_phase_system でラウンド単位で行われるためここでは削除
             if hp.is_destroyed() {
                 continue;
             }
@@ -179,6 +201,140 @@ pub fn wait_unit_system(
                 continue;
             }
             action_comp.0 = true;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup_world() -> (World, Schedule) {
+        let mut world = World::new();
+        let mut schedule = Schedule::default();
+
+        world.insert_resource(MatchState::default());
+        world.insert_resource(Players(vec![
+            Player::new(1, "P1".to_string()),
+            Player::new(2, "P2".to_string()),
+        ]));
+        world.insert_resource(Map::new(5, 5, Terrain::Plains, GridTopology::Square));
+        world.init_resource::<Events<NextPhaseCommand>>();
+        world.init_resource::<Events<GamePhaseChangedEvent>>();
+
+        schedule.add_systems(next_phase_system);
+
+        (world, schedule)
+    }
+
+    #[test]
+    fn test_turn_progression() {
+        let (mut world, mut schedule) = setup_world();
+
+        // Initially Player 1, Turn 1
+        {
+            let ms = world.resource::<MatchState>();
+            assert_eq!(ms.active_player_index.0, 0);
+            assert_eq!(ms.current_turn_number.0, 1);
+        }
+
+        // P1 -> P2
+        world.send_event(NextPhaseCommand);
+        schedule.run(&mut world);
+        {
+            let ms = world.resource::<MatchState>();
+            assert_eq!(ms.active_player_index.0, 1);
+            assert_eq!(ms.current_turn_number.0, 1);
+            assert_eq!(ms.current_phase, Phase::Main);
+        }
+
+        // P2 -> P1 (New Turn)
+        world.send_event(NextPhaseCommand);
+        schedule.run(&mut world);
+        {
+            let ms = world.resource::<MatchState>();
+            assert_eq!(ms.active_player_index.0, 0);
+            assert_eq!(ms.current_turn_number.0, 2);
+        }
+    }
+
+    #[test]
+    fn test_air_unit_fuel_and_crash() {
+        let (mut world, mut schedule) = setup_world();
+
+        // Spawn a bomber for P1 (consumes 5 fuel per round)
+        let bomber = world
+            .spawn((
+                GridPosition { x: 0, y: 0 },
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::Bomber,
+                    movement_type: MovementType::Air,
+                    daily_fuel_consumption: 5,
+                    ..Default::default()
+                },
+                Fuel {
+                    current: 10,
+                    max: 50,
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                HasMoved(false),
+                ActionCompleted(false),
+                Ammo {
+                    ammo1: 0,
+                    max_ammo1: 0,
+                    ammo2: 0,
+                    max_ammo2: 0,
+                },
+            ))
+            .id();
+
+        // Round 1: P1 -> P2 (NextPhaseCommand 1)
+        world.send_event(NextPhaseCommand);
+        schedule.run(&mut world);
+        {
+            let fuel = world.get::<Fuel>(bomber).unwrap();
+            assert_eq!(
+                fuel.current, 10,
+                "Fuel should not decrease on midway phase change"
+            );
+        }
+
+        // Round 1 ends: P2 -> P1 (NextPhaseCommand 2)
+        world.send_event(NextPhaseCommand);
+        schedule.run(&mut world);
+        {
+            let fuel = world.get::<Fuel>(bomber).unwrap();
+            assert_eq!(
+                fuel.current, 5,
+                "Fuel should decrease exactly once per full round"
+            );
+        }
+
+        // Round 2 ends: P2 -> P1 (NextPhaseCommand 4 total)
+        world.send_event(NextPhaseCommand); // P1 -> P2
+        schedule.run(&mut world);
+        world.send_event(NextPhaseCommand); // P2 -> P1
+        schedule.run(&mut world);
+        {
+            let fuel = world.get::<Fuel>(bomber).unwrap();
+            assert_eq!(fuel.current, 0, "Fuel should be 0");
+        }
+
+        // Round 3 ends: P2 -> P1 (Crash)
+        world.send_event(NextPhaseCommand); // P1 -> P2
+        schedule.run(&mut world);
+        world.send_event(NextPhaseCommand); // P2 -> P1
+        schedule.run(&mut world);
+        {
+            let hp = world.get::<Health>(bomber).unwrap();
+            assert_eq!(
+                hp.current, 0,
+                "Aircraft with 0 fuel not on airport should crash"
+            );
         }
     }
 }
