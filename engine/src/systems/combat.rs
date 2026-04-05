@@ -431,4 +431,96 @@ mod tests {
         assert_eq!(events[0].attacker, entity_1);
         assert_eq!(events[0].defender, entity_2);
     }
+
+    #[test]
+    fn test_attack_unit_on_property() {
+        let mut world = World::new();
+
+        world.insert_resource(MatchState {
+            current_phase: Phase::Main,
+            ..Default::default()
+        });
+        world.insert_resource(Players(vec![
+            Player::new(1, "P1".to_string()),
+            Player::new(2, "P2".to_string()),
+        ]));
+        world.insert_resource(Map::new(5, 5, Terrain::Plains, GridTopology::Square));
+        world.insert_resource(GameRng::new(42));
+        let mut damage_chart = DamageChart::new();
+        damage_chart.insert_damage(UnitType::Infantry, UnitType::Infantry, 50);
+        world.insert_resource(damage_chart);
+
+        world.insert_resource(Events::<AttackUnitCommand>::default());
+        world.insert_resource(Events::<UnitAttackedEvent>::default());
+
+        let attacker = world
+            .spawn((
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Ammo {
+                    ammo1: 9,
+                    max_ammo1: 9,
+                    ammo2: 0,
+                    max_ammo2: 0,
+                },
+                GridPosition { x: 0, y: 0 },
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    min_range: 1,
+                    max_range: 1,
+                    ..Default::default()
+                },
+                ActionCompleted(false),
+                HasMoved(false),
+            ))
+            .id();
+
+        // 拠点とユニットを同じ座標 (0, 1) に配置
+        world.spawn((
+            GridPosition { x: 0, y: 1 },
+            Property::new(Terrain::Factory, Some(PlayerId(2))),
+        ));
+
+        let defender = world
+            .spawn((
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Ammo {
+                    ammo1: 9,
+                    max_ammo1: 9,
+                    ammo2: 0,
+                    max_ammo2: 0,
+                },
+                GridPosition { x: 0, y: 1 },
+                Faction(PlayerId(2)),
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    min_range: 1,
+                    max_range: 1,
+                    ..Default::default()
+                },
+            ))
+            .id();
+
+        // can_attack が成功することを確認
+        assert!(can_attack(attacker, defender, &mut world).is_ok());
+
+        world.send_event(AttackUnitCommand {
+            attacker_entity: attacker,
+            defender_entity: defender,
+        });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(attack_unit_system);
+        schedule.run(&mut world);
+
+        // 防衛者のHPが減っていることを確認
+        let hp_def = world.get::<Health>(defender).unwrap();
+        assert!(hp_def.current < 100);
+    }
 }

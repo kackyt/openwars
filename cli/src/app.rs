@@ -604,7 +604,7 @@ impl App {
 
         if let Some(world) = &mut self.world {
             let mut target_unit = None;
-            let mut q = world.query::<(Entity, &engine::components::GridPosition)>();
+            let mut q = world.query_filtered::<(Entity, &engine::components::GridPosition), With<engine::components::Faction>>();
             for (e, pos) in q.iter(world) {
                 if pos.x == cx && pos.y == cy && e != unit_entity {
                     target_unit = Some(e);
@@ -710,7 +710,7 @@ impl App {
                     // 攻撃可能か判定
                     let mut can_atk = false;
                     let mut q_targets =
-                        world.query::<(Entity, &engine::components::GridPosition)>();
+                        world.query_filtered::<(Entity, &engine::components::GridPosition), With<engine::components::Faction>>();
                     for (target_ent, target_pos) in q_targets.iter(world) {
                         if target_ent != unit_entity {
                             let dist = (cx as i64 - target_pos.x as i64).unsigned_abs() as u32
