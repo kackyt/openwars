@@ -180,7 +180,7 @@ where
                 schedule.run(world);
 
                 use bevy_ecs::event::Events;
-                use openwars_engine::events::{GamePhaseChangedEvent, UnitAttackedEvent};
+                use engine::events::{GamePhaseChangedEvent, UnitAttackedEvent};
 
                 if let Some(mut events) = world.get_resource_mut::<Events<UnitAttackedEvent>>() {
                     for ev in events.drain() {
@@ -202,7 +202,7 @@ where
                     world.get_resource_mut::<Events<GamePhaseChangedEvent>>()
                 {
                     for ev in phase_events.drain() {
-                        if ev.new_phase == openwars_engine::resources::Phase::Main {
+                        if ev.new_phase == engine::resources::Phase::Main {
                             phase_popup = Some(format!(
                                 "Player {}'s Turn\n\nPress Space to continue...",
                                 ev.active_player.0
@@ -216,7 +216,7 @@ where
                 }
 
                 // メモリリーク対策: Bevy 0.15.2 はアップデートシステムがないと自動でイベントをクリアしない
-                use openwars_engine::events::*;
+                use engine::events::*;
                 if let Some(mut e) = world.get_resource_mut::<Events<ProduceUnitCommand>>() {
                     e.clear();
                 }

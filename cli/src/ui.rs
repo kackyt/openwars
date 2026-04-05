@@ -15,7 +15,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     }
 }
 
-fn unit_type_to_symbol(unit_type: &openwars_engine::resources::UnitType) -> &'static str {
+fn unit_type_to_symbol(unit_type: &engine::resources::UnitType) -> &'static str {
     unit_type.symbol()
 }
 
@@ -93,8 +93,8 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
 
         // 不動産のクエリ
         let mut p_query = world.query::<(
-            &openwars_engine::components::GridPosition,
-            &openwars_engine::components::Property,
+            &engine::components::GridPosition,
+            &engine::components::Property,
         )>();
         for (pos, prop) in p_query.iter(world) {
             if let Some(owner) = prop.owner_id {
@@ -104,10 +104,10 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
 
         // ユニットのクエリ
         let mut u_query = world.query::<(
-            &openwars_engine::components::GridPosition,
-            &openwars_engine::components::Faction,
-            &openwars_engine::components::UnitStats,
-            Option<&openwars_engine::components::Transporting>,
+            &engine::components::GridPosition,
+            &engine::components::Faction,
+            &engine::components::UnitStats,
+            Option<&engine::components::Transporting>,
         )>();
         for (pos, faction, stats, transporting) in u_query.iter(world) {
             if transporting.is_some() {
@@ -116,13 +116,13 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             units.insert((pos.x, pos.y), (faction.0.0, stats.unit_type));
         }
 
-        if let Some(map_res) = world.get_resource::<openwars_engine::resources::Map>() {
+        if let Some(map_res) = world.get_resource::<engine::resources::Map>() {
             for y in 0..map_res.height {
                 let mut line_spans = vec![];
                 for x in 0..map_res.width {
                     let terrain = map_res
                         .get_terrain(x, y)
-                        .unwrap_or(openwars_engine::resources::Terrain::Plains);
+                        .unwrap_or(engine::resources::Terrain::Plains);
 
                     let mut symbol = terrain.symbol();
 
@@ -190,7 +190,7 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             let mut options = Vec::new();
             if let Some(world) = &mut app.world {
                 for entity in passengers {
-                    let mut q = world.query::<&openwars_engine::components::UnitStats>();
+                    let mut q = world.query::<&engine::components::UnitStats>();
                     if let Ok(stats) = q.get(world, *entity) {
                         options.push(stats.unit_type.as_str().to_string());
                     } else {
@@ -259,8 +259,8 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
 
     if let Some(world) = &mut app.world {
         if let (Some(match_state), Some(players)) = (
-            world.get_resource::<openwars_engine::resources::MatchState>(),
-            world.get_resource::<openwars_engine::resources::Players>(),
+            world.get_resource::<engine::resources::MatchState>(),
+            world.get_resource::<engine::resources::Players>(),
         ) && !players.0.is_empty()
         {
             let active_player = &players.0[match_state.active_player_index.0];
@@ -276,13 +276,13 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         let cx = app.ui_state.cursor_pos.0;
         let cy = app.ui_state.cursor_pos.1;
         let mut u_query = world.query::<(
-            &openwars_engine::components::GridPosition,
-            &openwars_engine::components::Faction,
-            &openwars_engine::components::UnitStats,
-            &openwars_engine::components::Health,
-            Option<&openwars_engine::components::Fuel>,
-            Option<&openwars_engine::components::Ammo>,
-            Option<&openwars_engine::components::Transporting>,
+            &engine::components::GridPosition,
+            &engine::components::Faction,
+            &engine::components::UnitStats,
+            &engine::components::Health,
+            Option<&engine::components::Fuel>,
+            Option<&engine::components::Ammo>,
+            Option<&engine::components::Transporting>,
         )>();
 
         for (u_pos, u_faction, u_stats, u_health, u_fuel, u_ammo, transporting) in
