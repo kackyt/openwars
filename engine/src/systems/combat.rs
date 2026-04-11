@@ -199,11 +199,8 @@ pub fn attack_unit_system(
             .unwrap_or(Terrain::Plains);
         let def_bonus = master_data.get_terrain_defense_bonus(def_terrain);
 
-        let a_advantage_damage = (a_base_damage as f64 * 1.05) as u32;
-        let a_damage_base = a_advantage_damage * attacker_hp.get_display_hp() / 10;
-        let a_defense_reduction = def_bonus * defender_hp.get_display_hp() / 10; // ★1につき10、HP1につき1/10
-        let a_damage_reduced = a_damage_base.saturating_sub(a_defense_reduction);
-        let a_damage = a_damage_reduced + rng.next_bonus();
+        let a_damage =
+            (a_base_damage * attacker_hp.current + 105) / (100 + def_bonus) + rng.next_bonus();
 
         let do_counter = !is_indirect;
         let mut d_damage_opt = None;
@@ -212,7 +209,7 @@ pub fn attack_unit_system(
         let mut def_hp_post = defender_hp;
         def_hp_post.damage(a_damage);
 
-        if do_counter && !def_hp_post.is_destroyed() {
+        if do_counter {
             let (def_ammo1, def_ammo2) = def_ammo_opt.unwrap_or((0, 0));
             counter_info = select_weapon(
                 def_ammo1,
@@ -221,18 +218,16 @@ pub fn attack_unit_system(
                 attacker_stats.unit_type,
                 &damage_chart,
             );
-            if let Some((_, d_base)) = counter_info {
-                let d_advantage_damage = (d_base as f64 * 1.05) as u32;
-                let d_damage_base = d_advantage_damage * def_hp_post.get_display_hp() / 10;
-
+            if let Some((_, d_base_damage)) = counter_info {
                 let att_terrain = map
                     .get_terrain(attacker_pos.x, attacker_pos.y)
                     .unwrap_or(Terrain::Plains);
                 let att_bonus = master_data.get_terrain_defense_bonus(att_terrain);
-                let d_defense_reduction = att_bonus * attacker_hp.get_display_hp() / 10;
 
-                let d_damage_reduced = d_damage_base.saturating_sub(d_defense_reduction);
-                d_damage_opt = Some(d_damage_reduced + rng.next_bonus());
+                let d_damage = (d_base_damage * defender_hp.current + 105) / (100 + att_bonus)
+                    + rng.next_bonus();
+
+                d_damage_opt = Some(d_damage);
             }
         }
 

@@ -429,7 +429,7 @@ impl MasterDataRegistry {
         }
     }
 
-    /// 地形から防御ボーナス（★1につき10）を返す
+    /// 地形から地形効果(防御ボーナス)を返す
     pub fn get_terrain_defense_bonus(&self, terrain: crate::resources::Terrain) -> u32 {
         self.get_landscape_by_name(terrain.as_str())
             .map(|l| l.defense_bonus)
