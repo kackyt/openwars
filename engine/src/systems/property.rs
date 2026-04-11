@@ -12,6 +12,31 @@ use bevy_ecs::prelude::*;
 /// 4. 敵軍または中立の拠点であれば、ユニットのHPに応じたアクションパワーで占領ポイントを減らします。
 /// 5. 占領ポイントが0以下になった場合、拠点の所有者を自軍に変更し、`PropertyCapturedEvent` を発行します。
 /// 6. ユニットの `ActionCompleted` を true に設定します。
+/// 指定されたユニットが現在地で占領可能な拠点エンティティを返します。
+pub fn get_capturable_property(world: &mut World, unit: Entity) -> Option<Entity> {
+    let (unit_pos, unit_stats, unit_faction) = {
+        let mut q_unit = world.query::<(&GridPosition, &UnitStats, &Faction)>();
+        let Ok((u_pos, u_stats, u_faction)) = q_unit.get(world, unit) else {
+            return None;
+        };
+        (*u_pos, u_stats.clone(), u_faction.0)
+    };
+
+    if !unit_stats.can_capture {
+        return None;
+    }
+
+    let mut q_properties = world.query::<(Entity, &GridPosition, &Property)>();
+    for (p_ent, p_pos, p_prop) in q_properties.iter(world) {
+        if p_pos.x == unit_pos.x && p_pos.y == unit_pos.y && p_prop.owner_id != Some(unit_faction) {
+            return Some(p_ent);
+        }
+    }
+
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn capture_property_system(
     mut capture_events: EventReader<CapturePropertyCommand>,
     mut captured_events: EventWriter<PropertyCapturedEvent>,
@@ -27,6 +52,7 @@ pub fn capture_property_system(
     match_state: Res<MatchState>,
     players: Res<Players>,
     _map: Res<Map>,
+    mut commands: Commands,
 ) {
     if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
@@ -82,6 +108,8 @@ pub fn capture_property_system(
                 new_owner,
             });
         }
+        // アクション確定時に移動履歴を削除
+        commands.remove_resource::<PendingMove>();
     }
 }
 

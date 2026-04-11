@@ -78,14 +78,6 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
     let cx = app.ui_state.cursor_pos.0;
     let cy = app.ui_state.cursor_pos.1;
 
-    let mut reachable_tiles = None;
-    if let crate::app::InGameState::UnitSelected {
-        reachable_tiles: r, ..
-    } = &app.ui_state.in_game_state
-    {
-        reachable_tiles = Some(r);
-    }
-
     if let Some(world) = &mut app.world {
         // ユニット/不動産情報の収集
         let mut factions = std::collections::HashMap::new();
@@ -116,6 +108,28 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             units.insert((pos.x, pos.y), (faction.0.0, stats.unit_type));
         }
 
+        // 到達可能タイルの収集
+        let mut reachable_tiles = std::collections::HashSet::new();
+        if let crate::app::InGameState::UnitSelected {
+            reachable_tiles: rt, ..
+        } = &app.ui_state.in_game_state
+        {
+            for pos in rt {
+                reachable_tiles.insert(*pos);
+            }
+        }
+
+        // ターゲットタイルの収集
+        let mut target_tiles = std::collections::HashSet::new();
+        if let crate::app::InGameState::TargetSelection { targets, .. } = &app.ui_state.in_game_state {
+            let mut q_pos = world.query::<&engine::components::GridPosition>();
+            for entity in targets {
+                if let Ok(pos) = q_pos.get(world, *entity) {
+                    target_tiles.insert((pos.x, pos.y));
+                }
+            }
+        }
+
         if let Some(map_res) = world.get_resource::<engine::resources::Map>() {
             for y in 0..map_res.height {
                 let mut line_spans = vec![];
@@ -143,10 +157,12 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                             .add_modifier(Modifier::BOLD);
                     }
 
-                    if let Some(reachable) = reachable_tiles
-                        && reachable.contains(&(x, y))
-                    {
+                    if reachable_tiles.contains(&(x, y)) {
                         style = style.bg(Color::DarkGray).fg(Color::White);
+                    }
+
+                    if target_tiles.contains(&(x, y)) {
+                        style = style.bg(Color::Red).fg(Color::White);
                     }
 
                     if x == cx && y == cy {
@@ -318,7 +334,7 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         }
     }
     info_text.push_str(
-        "Press [q] to quit.\nPress [Esc] map.\nUse [Arrows] move.\nPress [Space] action.",
+        "Press [q] to quit. [Esc] map.\nUse [Arrows] move. [Space] action.\n[x] Back/Cancel.",
     );
 
     let info_paragraph = Paragraph::new(info_text).block(info_block);

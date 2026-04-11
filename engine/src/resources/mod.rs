@@ -390,6 +390,14 @@ pub struct MatchState {
     pub game_over: Option<GameOverCondition>,
 }
 
+/// ユニットの移動を一時的に記録し、キャンセル（Undo）を可能にするためのリソース
+#[derive(Resource, Debug, Clone)]
+pub struct PendingMove {
+    pub unit_entity: Entity,
+    pub original_pos: crate::components::GridPosition,
+    pub original_fuel: u32,
+}
+
 impl Default for MatchState {
     fn default() -> Self {
         Self {

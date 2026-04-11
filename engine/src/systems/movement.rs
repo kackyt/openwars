@@ -346,6 +346,7 @@ pub fn move_unit_system(
     players: Res<Players>,
     match_state: Res<MatchState>,
     master_data: Res<crate::resources::master_data::MasterDataRegistry>,
+    mut commands: Commands,
 ) {
     if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
@@ -410,8 +411,16 @@ pub fn move_unit_system(
                 let from = *pos;
                 pos.x = event.target_x;
                 pos.y = event.target_y;
+                let old_fuel = fuel.current;
                 fuel.current = fuel.current.saturating_sub(fuel_used);
                 has_moved.0 = true;
+
+                // Record for undo
+                commands.insert_resource(PendingMove {
+                    unit_entity: entity,
+                    original_pos: from,
+                    original_fuel: old_fuel,
+                });
 
                 // Fire event
                 moved_events.send(UnitMovedEvent {
@@ -451,6 +460,27 @@ pub fn move_unit_system(
                     unit_entity: unit_e,
                 });
             }
+        }
+    }
+}
+
+/// 移動の取り消し（Undo）コマンドを処理します。
+pub fn undo_move_system(
+    mut commands: Commands,
+    mut undo_events: EventReader<UndoMoveCommand>,
+    pending_move: Option<Res<PendingMove>>,
+    mut q_units: Query<(&mut GridPosition, &mut Fuel, &mut HasMoved)>,
+) {
+    for _ in undo_events.read() {
+        if let Some(pending) = &pending_move {
+            if let Ok((mut pos, mut fuel, mut has_moved)) = q_units.get_mut(pending.unit_entity) {
+                // 位置、燃料、移動済みフラグを復元
+                *pos = pending.original_pos;
+                fuel.current = pending.original_fuel;
+                has_moved.0 = false;
+            }
+            // 移動履歴を削除
+            commands.remove_resource::<PendingMove>();
         }
     }
 }
@@ -1049,5 +1079,79 @@ mod tests {
         let mut reader = load_events.get_cursor();
         let emitted: Vec<_> = reader.read(load_events).collect();
         assert_eq!(emitted.len(), 1, "LoadUnitCommand should be emitted");
+    }
+
+    #[test]
+    fn test_undo_move() {
+        let mut world = World::new();
+        // マップ、コマンド、イベントのセットアップ
+        world.insert_resource(MatchState {
+            current_phase: Phase::Main,
+            ..Default::default()
+        });
+        world.insert_resource(Players(vec![Player {
+            id: PlayerId(1),
+            name: "P1".to_string(),
+            funds: 1000,
+        }]));
+        let map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
+        world.insert_resource(map);
+        world.insert_resource(Events::<MoveUnitCommand>::default());
+        world.insert_resource(Events::<UndoMoveCommand>::default());
+        world.insert_resource(Events::<UnitMovedEvent>::default());
+        world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
+
+        // ユニットのスポーン (位置: 1,1  燃料: 50)
+        let unit_entity = world
+            .spawn((
+                GridPosition { x: 1, y: 1 },
+                Faction(PlayerId(1)),
+                Fuel {
+                    current: 50,
+                    max: 99,
+                },
+                UnitStats {
+                    movement_type: MovementType::Infantry,
+                    max_movement: 3,
+                    ..Default::default()
+                },
+                HasMoved(false),
+                ActionCompleted(false),
+            ))
+            .id();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems((move_unit_system, undo_move_system));
+
+        // 1. 移動を実行 (1,1 -> 1,2)
+        world.send_event(MoveUnitCommand {
+            unit_entity,
+            target_x: 1,
+            target_y: 2,
+        });
+        schedule.run(&mut world);
+
+        // 移動後の状態確認
+        let pos = world.get::<GridPosition>(unit_entity).unwrap();
+        assert_eq!(pos.x, 1);
+        assert_eq!(pos.y, 2);
+        let fuel = world.get::<Fuel>(unit_entity).unwrap();
+        assert!(fuel.current < 50); // 燃料が減っている
+        assert!(world.get::<HasMoved>(unit_entity).unwrap().0); // 移動済みフラグ
+        assert!(world.contains_resource::<PendingMove>()); // 履歴が記録されている
+
+        // 2. 移動を取り消し
+        world.send_event(UndoMoveCommand);
+        schedule.run(&mut world);
+
+        // 取り消し後の状態確認 (元の位置 1,1  燃料 50 に戻っている)
+        let pos = world.get::<GridPosition>(unit_entity).unwrap();
+        assert_eq!(pos.x, 1);
+        assert_eq!(pos.y, 1);
+        let fuel = world.get::<Fuel>(unit_entity).unwrap();
+        assert_eq!(fuel.current, 50);
+        assert!(!world.get::<HasMoved>(unit_entity).unwrap().0); // 移動済みフラグ解除
+        assert!(!world.contains_resource::<PendingMove>()); // 履歴が削除されている
     }
 }

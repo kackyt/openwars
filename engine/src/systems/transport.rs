@@ -10,6 +10,89 @@ use bevy_ecs::prelude::*;
 /// 2. 輸送ユニットの容量(`CargoCapacity`)と積載可能タイプ(`loadable_unit_types`)の条件を満たしているか確認します。
 /// 3. 積載対象ユニットを輸送ユニットの `CargoCapacity` に追加します。
 /// 4. 積載対象ユニットに `Transporting` コンポーネントを付与し、行動済み(`ActionCompleted`)にします。
+/// 指定されたユニットを搭載可能な、隣接する輸送ユニットエンティティのリストを返します。
+pub fn get_loadable_transports(world: &mut World, unit: Entity) -> Vec<Entity> {
+    let mut targets = vec![];
+    let (u_pos, u_stats, unit_faction) = {
+        let mut q_unit = world.query::<(&GridPosition, &UnitStats, &Faction)>();
+        let Ok((u_pos, u_stats, u_faction)) = q_unit.get(world, unit) else {
+            return targets;
+        };
+        (*u_pos, u_stats.clone(), u_faction.0)
+    };
+
+    let mut q_transports = world.query_filtered::<
+        (Entity, &GridPosition, &Faction, &UnitStats, &CargoCapacity),
+        With<Faction>,
+    >();
+    for (t_ent, t_pos, t_faction, t_stats, t_cargo) in q_transports.iter(world) {
+        if t_ent != unit && t_faction.0 == unit_faction {
+            let dist = (u_pos.x as i64 - t_pos.x as i64).unsigned_abs() as u32
+                + (u_pos.y as i64 - t_pos.y as i64).unsigned_abs() as u32;
+            if dist == 1 {
+                // 空き容量があり、かつ搭載可能タイプに含まれているか
+                if t_cargo.loaded.len() < t_cargo.max as usize
+                    && t_stats.loadable_unit_types.contains(&u_stats.unit_type)
+                {
+                    targets.push(t_ent);
+                }
+            }
+        }
+    }
+
+    targets
+}
+
+/// 指定された輸送ユニットからユニットを降車させることが可能な、隣接マスのリストを返します。
+pub fn get_droppable_tiles(world: &mut World, transport: Entity) -> Vec<(usize, usize)> {
+    let mut targets = vec![];
+    let t_pos = {
+        let mut q_trans = world.query::<(&GridPosition, &UnitStats)>();
+        let Ok((t_pos, _t_stats)) = q_trans.get(world, transport) else {
+            return targets;
+        };
+        *t_pos
+    };
+
+    let (map_w, map_h) = if let Some(map) = world.get_resource::<crate::resources::Map>() {
+        (map.width, map.height)
+    } else {
+        return targets;
+    };
+
+    // 周囲1マスの座標をチェック
+    let neighbors = [
+        (t_pos.x as i64 - 1, t_pos.y as i64),
+        (t_pos.x as i64 + 1, t_pos.y as i64),
+        (t_pos.x as i64, t_pos.y as i64 - 1),
+        (t_pos.x as i64, t_pos.y as i64 + 1),
+    ];
+
+    for (nx, ny) in neighbors {
+        if nx >= 0 && nx < map_w as i64 && ny >= 0 && ny < map_h as i64 {
+            let x = nx as usize;
+            let y = ny as usize;
+
+            // TODO: 本来は「降ろすユニットの移動タイプ」で通行可能か判定すべきだが、
+            // 今は簡単のため「空きマスであること」のみをチェックする（必要に応じて後で強化）
+            let mut q_units = world.query_filtered::<&GridPosition, With<crate::components::Faction>>();
+            let mut is_occupied = false;
+            for u_pos in q_units.iter(world) {
+                if u_pos.x == x && u_pos.y == y {
+                    is_occupied = true;
+                    break;
+                }
+            }
+
+            if !is_occupied {
+                targets.push((x, y));
+            }
+        }
+    }
+
+    targets
+}
+
 #[allow(clippy::type_complexity)]
 pub fn load_unit_system(
     mut load_events: EventReader<LoadUnitCommand>,

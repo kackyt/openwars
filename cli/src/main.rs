@@ -244,6 +244,9 @@ where
                 if let Some(mut e) = world.get_resource_mut::<Events<WaitUnitCommand>>() {
                     e.clear();
                 }
+                if let Some(mut e) = world.get_resource_mut::<Events<UndoMoveCommand>>() {
+                    e.clear();
+                }
                 if let Some(mut e) = world.get_resource_mut::<Events<NextPhaseCommand>>() {
                     e.clear();
                 }

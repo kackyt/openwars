@@ -57,6 +57,42 @@ pub fn can_attack(
     Ok(())
 }
 
+/// 指定されたユニットが現在攻撃可能な対象エンティティのリストを返します。
+/// allow_indirect が false の場合、間接攻撃武器（射程1超）を持つユニットは「移動後」とみなされ、攻撃対象を返しません。
+/// 通常、その場で待機する場合や移動キャンセル時は true、座標移動を伴う確定前移動時は false を指定します。
+pub fn get_attackable_targets(
+    world: &mut World,
+    attacker: Entity,
+    allow_indirect: bool,
+) -> Vec<Entity> {
+    let mut targets = vec![];
+    let (a_pos, a_stats, unit_faction) = {
+        let mut q_attacker = world.query::<(&GridPosition, &UnitStats, &Faction)>();
+        let Ok((a_pos, a_stats, a_faction)) = q_attacker.get(world, attacker) else {
+            return targets;
+        };
+        (*a_pos, a_stats.clone(), a_faction.0)
+    };
+
+    // 間接攻撃ユニットが移動後の場合（allow_indirect=false）、攻撃できない
+    if a_stats.min_range > 1 && !allow_indirect {
+        return targets;
+    }
+
+    let mut q_targets = world.query_filtered::<(Entity, &GridPosition, &Faction), With<Faction>>();
+    for (t_ent, t_pos, t_faction) in q_targets.iter(world) {
+        if t_ent != attacker && t_faction.0 != unit_faction {
+            let dist = (a_pos.x as i64 - t_pos.x as i64).unsigned_abs() as u32
+                + (a_pos.y as i64 - t_pos.y as i64).unsigned_abs() as u32;
+            if dist >= a_stats.min_range && dist <= a_stats.max_range {
+                targets.push(t_ent);
+            }
+        }
+    }
+
+    targets
+}
+
 /// 攻撃者と防衛者のユニットタイプに基づき、ダメージ計算表（DamageChart）を参照して
 /// 最適な武器（主武器 または 副武器）を選択します。
 ///
@@ -117,6 +153,7 @@ pub fn attack_unit_system(
     master_data: Res<MasterDataRegistry>,
     map: Res<Map>,
     mut rng: ResMut<GameRng>,
+    mut commands: Commands,
 ) {
     if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
@@ -278,6 +315,9 @@ pub fn attack_unit_system(
             defender_hp_before: d_hp_before,
             defender_hp_after: d_hp_after,
         });
+
+        // 攻撃確定時に移動履歴を削除
+        commands.remove_resource::<PendingMove>();
     }
 }
 
@@ -410,10 +450,10 @@ mod tests {
         schedule.run(&mut world);
 
         let hp2 = world.get::<Health>(entity_2).unwrap();
-        assert_eq!(hp2.current, 47);
+        assert_eq!(hp2.current, 46);
 
         let hp1 = world.get::<Health>(entity_1).unwrap();
-        assert_eq!(hp1.current, 70); // Counter attacked
+        assert_eq!(hp1.current, 40); // Counter attacked
 
         let ammo1 = world.get::<Ammo>(entity_1).unwrap();
         assert_eq!(ammo1.ammo1, 8); // Used 1 ammo

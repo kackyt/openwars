@@ -10,6 +10,36 @@ use bevy_ecs::prelude::*;
 /// 2. 補給対象(`target_entity`)が自軍であり、補給者と隣接（距離が1）していることを確認します。
 /// 3. 対象の燃料(`Fuel`)と弾薬(`Ammo`)を最大値まで回復(`resupply`)させます。
 /// 4. 補給者の `ActionCompleted` を true に設定します。
+/// 指定されたユニットが現在補給可能な対象エンティティのリストを返します。
+/// 補給能力（can_supply）を持つユニットの隣接マスにいる同勢力ユニットが対象です。
+pub fn get_suppliable_targets(world: &mut World, supplier: Entity) -> Vec<Entity> {
+    let mut targets = vec![];
+    let (s_pos, unit_faction) = {
+        let mut q_supplier = world.query::<(&GridPosition, &UnitStats, &Faction)>();
+        let Ok((s_pos, s_stats, s_faction)) = q_supplier.get(world, supplier) else {
+            return targets;
+        };
+
+        if !s_stats.can_supply {
+            return targets;
+        }
+        (*s_pos, s_faction.0)
+    };
+
+    let mut q_targets = world.query_filtered::<(Entity, &GridPosition, &Faction), With<Faction>>();
+    for (t_ent, t_pos, t_faction) in q_targets.iter(world) {
+        if t_ent != supplier && t_faction.0 == unit_faction {
+            let dist = (s_pos.x as i64 - t_pos.x as i64).unsigned_abs() as u32
+                + (s_pos.y as i64 - t_pos.y as i64).unsigned_abs() as u32;
+            if dist == 1 {
+                targets.push(t_ent);
+            }
+        }
+    }
+
+    targets
+}
+
 #[allow(clippy::type_complexity)]
 pub fn supply_unit_system(
     mut supply_events: EventReader<SupplyUnitCommand>,
@@ -25,6 +55,7 @@ pub fn supply_unit_system(
     )>,
     match_state: Res<MatchState>,
     players: Res<Players>,
+    mut commands: Commands,
 ) {
     if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
@@ -82,6 +113,8 @@ pub fn supply_unit_system(
                 ammo.ammo1 = max_a1; // 主武器と副武器の弾薬を最大値まで回復
                 ammo.ammo2 = max_a2;
             }
+            // 補給確定時に移動履歴を削除
+            commands.remove_resource::<PendingMove>();
         }
     }
 }
