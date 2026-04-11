@@ -1,4 +1,5 @@
 pub mod master_data;
+pub use master_data::MasterDataRegistry;
 
 use crate::components::PlayerId;
 use bevy_ecs::prelude::*;
@@ -235,20 +236,6 @@ impl Terrain {
             | Terrain::Airport
             | Terrain::Port
             | Terrain::Capital => 200,
-            _ => 0,
-        }
-    }
-
-    pub fn defense_stars(&self) -> u32 {
-        match self {
-            Terrain::Mountain => 4,
-            Terrain::City
-            | Terrain::Factory
-            | Terrain::Airport
-            | Terrain::Port
-            | Terrain::Capital => 3,
-            Terrain::Forest => 2,
-            Terrain::Plains => 1,
             _ => 0,
         }
     }

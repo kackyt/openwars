@@ -114,6 +114,7 @@ pub fn attack_unit_system(
     match_state: Res<MatchState>,
     players: Res<Players>,
     damage_chart: Res<DamageChart>,
+    master_data: Res<MasterDataRegistry>,
     map: Res<Map>,
     mut rng: ResMut<GameRng>,
 ) {
@@ -196,11 +197,11 @@ pub fn attack_unit_system(
         let def_terrain = map
             .get_terrain(defender_pos.x, defender_pos.y)
             .unwrap_or(Terrain::Plains);
-        let def_terrain_stars = def_terrain.defense_stars();
+        let def_bonus = master_data.get_terrain_defense_bonus(def_terrain);
 
         let a_advantage_damage = (a_base_damage as f64 * 1.05) as u32;
         let a_damage_base = a_advantage_damage * attacker_hp.get_display_hp() / 10;
-        let a_defense_reduction = def_terrain_stars * defender_hp.get_display_hp(); // 0..40
+        let a_defense_reduction = def_bonus * defender_hp.get_display_hp() / 10; // ★1につき10、HP1につき1/10
         let a_damage_reduced = a_damage_base.saturating_sub(a_defense_reduction);
         let a_damage = a_damage_reduced + rng.next_bonus();
 
@@ -227,8 +228,8 @@ pub fn attack_unit_system(
                 let att_terrain = map
                     .get_terrain(attacker_pos.x, attacker_pos.y)
                     .unwrap_or(Terrain::Plains);
-                let att_terrain_stars = att_terrain.defense_stars();
-                let d_defense_reduction = att_terrain_stars * attacker_hp.get_display_hp();
+                let att_bonus = master_data.get_terrain_defense_bonus(att_terrain);
+                let d_defense_reduction = att_bonus * attacker_hp.get_display_hp() / 10;
 
                 let d_damage_reduced = d_damage_base.saturating_sub(d_defense_reduction);
                 d_damage_opt = Some(d_damage_reduced + rng.next_bonus());
@@ -328,6 +329,7 @@ mod tests {
         let mut damage_chart = DamageChart::new();
         damage_chart.insert_damage(UnitType::Infantry, UnitType::Infantry, 55);
         world.insert_resource(damage_chart);
+        world.insert_resource(MasterDataRegistry::load().unwrap());
 
         world.insert_resource(Events::<AttackUnitCommand>::default());
         world.insert_resource(Events::<UnitAttackedEvent>::default());
@@ -413,10 +415,10 @@ mod tests {
         schedule.run(&mut world);
 
         let hp2 = world.get::<Health>(entity_2).unwrap();
-        assert_eq!(hp2.current, 52);
+        assert_eq!(hp2.current, 47);
 
         let hp1 = world.get::<Health>(entity_1).unwrap();
-        assert_eq!(hp1.current, 69); // Counter attacked
+        assert_eq!(hp1.current, 70); // Counter attacked
 
         let ammo1 = world.get::<Ammo>(entity_1).unwrap();
         assert_eq!(ammo1.ammo1, 8); // Used 1 ammo
@@ -449,6 +451,7 @@ mod tests {
         let mut damage_chart = DamageChart::new();
         damage_chart.insert_damage(UnitType::Infantry, UnitType::Infantry, 50);
         world.insert_resource(damage_chart);
+        world.insert_resource(MasterDataRegistry::load().unwrap());
 
         world.insert_resource(Events::<AttackUnitCommand>::default());
         world.insert_resource(Events::<UnitAttackedEvent>::default());
@@ -522,5 +525,141 @@ mod tests {
         // 防衛者のHPが減っていることを確認
         let hp_def = world.get::<Health>(defender).unwrap();
         assert!(hp_def.current < 100);
+    }
+
+    #[test]
+    fn test_terrain_defense_scaling() {
+        let mut world = World::new();
+        world.insert_resource(MatchState {
+            current_phase: Phase::Main,
+            ..Default::default()
+        });
+        world.insert_resource(Players(vec![
+            Player::new(1, "P1".to_string()),
+            Player::new(2, "P2".to_string()),
+        ]));
+        world.insert_resource(GameRng::new(42));
+        let mut damage_chart = DamageChart::new();
+        damage_chart.insert_damage(UnitType::Tank, UnitType::Infantry, 70);
+        world.insert_resource(damage_chart);
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+
+        world.insert_resource(Events::<AttackUnitCommand>::default());
+        world.insert_resource(Events::<UnitAttackedEvent>::default());
+
+        // Case 1: Defender on Plains (5 bonus)
+        world.insert_resource(Map::new(5, 5, Terrain::Plains, GridTopology::Square));
+
+        let attacker = world
+            .spawn((
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Ammo {
+                    ammo1: 9,
+                    max_ammo1: 9,
+                    ammo2: 0,
+                    max_ammo2: 0,
+                },
+                GridPosition { x: 0, y: 0 },
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    min_range: 1,
+                    max_range: 1,
+                    ..Default::default()
+                },
+                ActionCompleted(false),
+                HasMoved(false),
+            ))
+            .id();
+
+        let defender_plains = world
+            .spawn((
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                GridPosition { x: 0, y: 1 },
+                Faction(PlayerId(2)),
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    ..Default::default()
+                },
+            ))
+            .id();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(attack_unit_system);
+
+        world.send_event(AttackUnitCommand {
+            attacker_entity: attacker,
+            defender_entity: defender_plains,
+        });
+        schedule.run(&mut world);
+
+        let hp_plains = world.get::<Health>(defender_plains).unwrap().current;
+
+        // Case 2: Defender on Mountain (40 bonus)
+        world.insert_resource(GameRng::new(42)); // Reset RNG seed
+        let mut map_mt = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        map_mt.set_terrain(0, 1, Terrain::Mountain).unwrap();
+        world.insert_resource(map_mt);
+
+        let attacker2 = world
+            .spawn((
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Ammo {
+                    ammo1: 9,
+                    max_ammo1: 9,
+                    ammo2: 0,
+                    max_ammo2: 0,
+                },
+                GridPosition { x: 0, y: 0 },
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    min_range: 1,
+                    max_range: 1,
+                    ..Default::default()
+                },
+                ActionCompleted(false),
+                HasMoved(false),
+            ))
+            .id();
+        let defender_mt = world
+            .spawn((
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                GridPosition { x: 0, y: 1 },
+                Faction(PlayerId(2)),
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    ..Default::default()
+                },
+            ))
+            .id();
+
+        world.send_event(AttackUnitCommand {
+            attacker_entity: attacker2,
+            defender_entity: defender_mt,
+        });
+        schedule.run(&mut world);
+
+        let hp_mt = world.get::<Health>(defender_mt).unwrap().current;
+
+        // Mountain should provide MORE defense (higher HP remaining)
+        assert!(
+            hp_mt > hp_plains,
+            "Mountain (HP={}) should provide more defense than Plains (HP={})",
+            hp_mt,
+            hp_plains
+        );
     }
 }
