@@ -30,7 +30,7 @@ pub fn get_loadable_transports(world: &mut World, unit: Entity) -> Vec<Entity> {
         if t_ent != unit && t_faction.0 == unit_faction {
             let dist = (u_pos.x as i64 - t_pos.x as i64).unsigned_abs() as u32
                 + (u_pos.y as i64 - t_pos.y as i64).unsigned_abs() as u32;
-            if dist == 1 {
+            if dist == 0 {
                 // 空き容量があり、かつ搭載可能タイプに含まれているか
                 if t_cargo.loaded.len() < t_cargo.max as usize
                     && t_stats.loadable_unit_types.contains(&u_type)
@@ -413,5 +413,112 @@ mod tests {
 
         let cargo_act = world.get::<ActionCompleted>(cargo_entity).unwrap();
         assert!(cargo_act.0);
+    }
+
+    #[test]
+    fn test_get_loadable_transports() {
+        let mut world = World::new();
+
+        let transport_entity = world
+            .spawn((
+                GridPosition { x: 5, y: 5 },
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::TransportHelicopter,
+                    loadable_unit_types: vec![UnitType::Infantry],
+                    ..Default::default()
+                },
+                CargoCapacity {
+                    max: 1,
+                    loaded: vec![],
+                },
+            ))
+            .id();
+
+        let cargo_entity = world
+            .spawn((
+                GridPosition { x: 5, y: 5 },
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    ..Default::default()
+                },
+            ))
+            .id();
+
+        // 同一座標なので見つかるはず
+        let targets = get_loadable_transports(&mut world, cargo_entity);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0], transport_entity);
+
+        // 座標をずらすと見つからなくなるはず
+        world.get_mut::<GridPosition>(cargo_entity).unwrap().x = 6;
+        let targets = get_loadable_transports(&mut world, cargo_entity);
+        assert_eq!(targets.len(), 0);
+
+        // 容量がいっぱいだと見つからないはず
+        world.get_mut::<GridPosition>(cargo_entity).unwrap().x = 5;
+        world.get_mut::<CargoCapacity>(transport_entity).unwrap().loaded.push(Entity::from_raw(999));
+        let targets = get_loadable_transports(&mut world, cargo_entity);
+        assert_eq!(targets.len(), 0);
+    }
+
+    #[test]
+    fn test_get_droppable_tiles() {
+        let mut world = World::new();
+
+        // マップとマスターデータのセットアップ
+        let map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        world.insert_resource(map);
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+
+        let transport_entity = world
+            .spawn((
+                GridPosition { x: 1, y: 1 },
+                Faction(PlayerId(1)),
+                CargoCapacity {
+                    max: 1,
+                    loaded: vec![],
+                },
+            ))
+            .id();
+
+        let cargo_entity = world
+            .spawn((
+                GridPosition { x: 999, y: 999 }, // 搭載中を想定
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    movement_type: MovementType::Infantry,
+                    ..Default::default()
+                },
+                Transporting(transport_entity),
+            ))
+            .id();
+
+        world.get_mut::<CargoCapacity>(transport_entity).unwrap().loaded.push(cargo_entity);
+
+        // 初期状態：周囲4マス空いている
+        let tiles = get_droppable_tiles(&mut world, transport_entity);
+        assert_eq!(tiles.len(), 4);
+
+        // 隣接マス (1, 0) に他のユニットを配置
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Faction(PlayerId(1)),
+        ));
+
+        let tiles = get_droppable_tiles(&mut world, transport_entity);
+        assert_eq!(tiles.len(), 3);
+        assert!(!tiles.contains(&(1, 0)));
+
+        // 地形を通行不能にする (1, 1 -> 0, 1 を海にする)
+        let mut map = world.get_resource_mut::<Map>().unwrap();
+        map.set_terrain(0, 1, Terrain::Sea).unwrap();
+
+        let tiles = get_droppable_tiles(&mut world, transport_entity);
+        // 歩兵は海を通行できないので、(0, 1) も除外されるはず
+        assert_eq!(tiles.len(), 2);
+        assert!(!tiles.contains(&(0, 1)));
     }
 }

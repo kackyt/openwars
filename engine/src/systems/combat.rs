@@ -29,10 +29,11 @@ pub fn can_attack(
     defender_entity: Entity,
     world: &mut World,
 ) -> Result<(), AttackError> {
-    let mut q_attacker = world.query::<(&GridPosition, &UnitStats, Option<&HasMoved>, &Faction)>();
+    let mut q_attacker =
+        world.query::<(&GridPosition, &UnitStats, Option<&HasMoved>, &Faction, Option<&Ammo>)>();
     let mut q_target = world.query::<(&GridPosition, &UnitStats, &Faction)>();
 
-    let (a_pos, a_stats, a_has_moved, a_fac) = q_attacker
+    let (a_pos, a_stats, a_has_moved, a_fac, a_ammo) = q_attacker
         .get(world, attacker_entity)
         .map_err(|_| AttackError::InvalidEntity)?;
 
@@ -40,6 +41,8 @@ pub fn can_attack(
     let a_pos_val = *a_pos;
     let a_fac_val = a_fac.0;
     let a_type_name = a_stats.unit_type.as_str();
+    let a_ammo1 = a_ammo.map(|a| a.ammo1).unwrap_or(0);
+    let a_ammo2 = a_ammo.map(|a| a.ammo2).unwrap_or(0);
 
     let mut has_moved_val = false;
     if let Some(pm) = world.get_resource::<crate::resources::PendingMove>() {
@@ -63,7 +66,9 @@ pub fn can_attack(
 
     let target_type_name = d_stats.unit_type.as_str();
 
-    let master_data = world.get_resource::<MasterDataRegistry>().unwrap();
+    let Some(master_data) = world.get_resource::<MasterDataRegistry>() else {
+        return Err(AttackError::InvalidEntity);
+    };
     let unit_record = master_data.get_unit(&UnitName(a_type_name.to_string()));
 
     let mut indirect_after_move = false;
@@ -74,7 +79,8 @@ pub fn can_attack(
             .weapon1
             .as_ref()
             .and_then(|name| master_data.weapons.get(&UnitName(name.clone())))
-            && w1.damages.contains_key(target_type_name)
+            && a_ammo1 > 0
+            && w1.damages.get(target_type_name).copied().unwrap_or(0) > 0
             && dist >= w1.range_min
             && dist <= w1.range_max
         {
@@ -90,7 +96,8 @@ pub fn can_attack(
             .weapon2
             .as_ref()
             .and_then(|name| master_data.weapons.get(&UnitName(name.clone())))
-            && w2.damages.contains_key(target_type_name)
+            && a_ammo2 > 0
+            && w2.damages.get(target_type_name).copied().unwrap_or(0) > 0
             && dist >= w2.range_min
             && dist <= w2.range_max
         {
@@ -123,16 +130,20 @@ pub fn get_attackable_targets(
 ) -> Vec<Entity> {
     let mut targets = vec![];
 
-    let (a_pos, a_stats, unit_faction) = {
-        let mut q_attacker = world.query::<(&GridPosition, &UnitStats, &Faction)>();
-        let Ok((a_pos, a_stats, a_faction)) = q_attacker.get(world, attacker) else {
+    let (a_pos, a_stats, unit_faction, a_ammo1, a_ammo2) = {
+        let mut q_attacker = world.query::<(&GridPosition, &UnitStats, &Faction, Option<&Ammo>)>();
+        let Ok((a_pos, a_stats, a_faction, a_ammo)) = q_attacker.get(world, attacker) else {
             return targets;
         };
-        (*a_pos, a_stats.clone(), a_faction.0)
+        let ammo1 = a_ammo.map(|a| a.ammo1).unwrap_or(0);
+        let ammo2 = a_ammo.map(|a| a.ammo2).unwrap_or(0);
+        (*a_pos, a_stats.clone(), a_faction.0, ammo1, ammo2)
     };
 
     let (weapon1_rec, weapon2_rec) = {
-        let master_data = world.get_resource::<MasterDataRegistry>().unwrap();
+        let Some(master_data) = world.get_resource::<MasterDataRegistry>() else {
+            return targets;
+        };
         let unit_type_name = a_stats.unit_type.as_str();
         let unit_record = master_data.get_unit(&UnitName(unit_type_name.to_string()));
         if let Some(rec) = unit_record {
@@ -168,7 +179,10 @@ pub fn get_attackable_targets(
         // 武器1（主武器）の判定
         if let Some(w1) = &weapon1_rec {
             // ダメージが定義されているか
-            if w1.damages.contains_key(target_type_name) {
+            if let Some(&dmg) = w1.damages.get(target_type_name)
+                && dmg > 0
+                && a_ammo1 > 0
+            {
                 let is_indirect = w1.range_min > 1;
                 // 移動制限にかからず、かつ射程内であれば攻撃可能
                 if (!is_indirect || allow_indirect) && dist >= w1.range_min && dist <= w1.range_max
@@ -181,7 +195,8 @@ pub fn get_attackable_targets(
         // 武器2（副武器）の判定（主武器で攻撃不可な場合のみチェック）
         if !can_attack
             && let Some(w2) = &weapon2_rec
-            && w2.damages.contains_key(target_type_name)
+            && w2.damages.get(target_type_name).copied().unwrap_or(0) > 0
+            && a_ammo2 > 0
         {
             let is_indirect = w2.range_min > 1;
             if (!is_indirect || allow_indirect) && dist >= w2.range_min && dist <= w2.range_max {

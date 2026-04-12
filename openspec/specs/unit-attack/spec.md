@@ -27,7 +27,7 @@
 - **THEN** 攻撃は有効とみなされる。
 
 #### Scenario: 射程外への攻撃の拒否
-- **WHEN** 攻撃者と対象ের距離が `max_range` を超えるか `min_range` 未満の場合
+- **WHEN** 攻撃者と対象の距離が `max_range` を超えるか `min_range` 未満の場合
 - **THEN** 攻撃は無効（エラー）となる。
 
 ### Requirement: 武器の自動選択
