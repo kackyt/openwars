@@ -100,7 +100,11 @@ pub fn get_droppable_tiles(world: &mut World, transport: Entity) -> Vec<(usize, 
             // 地形通行可能判定
             // master_data を借用中なので、Mapへのアクセスも immutable borrow で行う
             let terrain = if let Some(map) = world.get_resource::<crate::resources::Map>() {
-                map.get_terrain(x, y).unwrap()
+                if let Some(t) = map.get_terrain(x, y) {
+                    t
+                } else {
+                    continue;
+                }
             } else {
                 continue;
             };

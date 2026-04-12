@@ -206,6 +206,16 @@ mod tests {
             ))
             .id();
 
+        // モックのPendingMoveを挿入
+        world.insert_resource(PendingMove {
+            unit_entity: supplier_entity,
+            original_pos: GridPosition { x: 2, y: 1 },
+            original_fuel: Fuel {
+                current: 20,
+                max: 99,
+            },
+        });
+
         world.send_event(SupplyUnitCommand {
             supplier_entity,
             target_entity,
@@ -225,5 +235,79 @@ mod tests {
 
         let ammo = world.get::<Ammo>(target_entity).unwrap();
         assert_eq!(ammo.ammo1, 9);
+
+        // PendingMove should be removed
+        assert!(world.get_resource::<PendingMove>().is_none());
+    }
+
+    #[test]
+    fn test_get_suppliable_targets() {
+        let mut world = World::new();
+
+        let inf_stats = UnitStats {
+            unit_type: UnitType::Infantry,
+            cost: 1000,
+            max_movement: 3,
+            movement_type: MovementType::Infantry,
+            max_fuel: 99,
+            max_ammo1: 9,
+            max_ammo2: 0,
+            min_range: 1,
+            max_range: 1,
+            daily_fuel_consumption: 0,
+            can_capture: true,
+            can_supply: false,
+            max_cargo: 0,
+            loadable_unit_types: vec![],
+        };
+
+        // Supplier (Supply Truck)
+        let supplier = world
+            .spawn((
+                GridPosition { x: 5, y: 5 },
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::SupplyTruck,
+                    can_supply: true,
+                    ..inf_stats.clone()
+                },
+            ))
+            .id();
+
+        // Valid target (Adjacent, same faction)
+        let target_ok = world
+            .spawn((
+                GridPosition { x: 5, y: 6 },
+                Faction(PlayerId(1)),
+                inf_stats.clone(),
+            ))
+            .id();
+
+        // Invalid: Too far
+        let _target_far = world
+            .spawn((
+                GridPosition { x: 5, y: 7 },
+                Faction(PlayerId(1)),
+                inf_stats.clone(),
+            ))
+            .id();
+
+        // Invalid: Different faction
+        let _target_enemy = world
+            .spawn((
+                GridPosition { x: 6, y: 5 },
+                Faction(PlayerId(2)),
+                inf_stats.clone(),
+            ))
+            .id();
+
+        let targets = get_suppliable_targets(&mut world, supplier);
+        assert_eq!(targets.len(), 1);
+        assert!(targets.contains(&target_ok));
+
+        // Test with can_supply = false
+        world.get_mut::<UnitStats>(supplier).unwrap().can_supply = false;
+        let targets_none = get_suppliable_targets(&mut world, supplier);
+        assert!(targets_none.is_empty());
     }
 }
