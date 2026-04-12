@@ -49,14 +49,15 @@ pub fn can_attack(
     let a_ammo1 = a_ammo.map(|a| a.ammo1).unwrap_or(0);
     let a_ammo2 = a_ammo.map(|a| a.ammo2).unwrap_or(0);
 
-    let mut has_moved_val = false;
-    if let Some(pm) = world.get_resource::<crate::resources::PendingMove>() {
+    let has_moved_val = if let Some(pm) = world.get_resource::<crate::resources::PendingMove>() {
         if pm.unit_entity == attacker_entity {
-            has_moved_val = a_pos_val.x != pm.original_pos.x || a_pos_val.y != pm.original_pos.y;
+            a_pos_val.x != pm.original_pos.x || a_pos_val.y != pm.original_pos.y
+        } else {
+            a_has_moved.is_some_and(|m| m.0)
         }
     } else {
-        has_moved_val = a_has_moved.map(|m| m.0).unwrap_or(false);
-    }
+        a_has_moved.is_some_and(|m| m.0)
+    };
 
     let (d_pos, d_stats, d_fac) = q_target
         .get(world, defender_entity)

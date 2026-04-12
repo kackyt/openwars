@@ -24,7 +24,7 @@ pub fn get_loadable_transports(world: &mut World, unit: Entity) -> Vec<Entity> {
 
     let mut q_transports = world.query_filtered::<
         (Entity, &GridPosition, &Faction, &UnitStats, &CargoCapacity),
-        With<Faction>,
+        (With<Faction>, Without<Transporting>),
     >();
     for (t_ent, t_pos, t_faction, t_stats, t_cargo) in q_transports.iter(world) {
         if t_ent != unit && t_faction.0 == unit_faction {
@@ -69,7 +69,8 @@ pub fn get_droppable_tiles(world: &mut World, transport: Entity) -> Vec<(usize, 
     // 1. ユニットがいる座標を事前に取得（借用チェッカー対策: &mut World を使う操作を最初に行う）
     use std::collections::HashSet;
     let mut occupied_positions = HashSet::new();
-    let mut q_units = world.query_filtered::<&GridPosition, With<crate::components::Faction>>();
+    let mut q_units =
+        world.query_filtered::<&GridPosition, (With<Faction>, Without<Transporting>)>();
     for u_pos in q_units.iter(world) {
         occupied_positions.insert((u_pos.x, u_pos.y));
     }
