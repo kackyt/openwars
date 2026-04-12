@@ -258,15 +258,6 @@ impl App {
                         *selected_index += 1;
                     }
                 }
-                InGameState::DropTargetSelection {
-                    selected_index,
-                    targets,
-                    ..
-                } => {
-                    if *selected_index < targets.len().saturating_sub(1) {
-                        *selected_index += 1;
-                    }
-                }
                 InGameState::EventPopup { .. } | InGameState::WaitActionMenu { .. } => {}
                 _ => {
                     if let Some(world) = &self.world
@@ -282,8 +273,7 @@ impl App {
                 | InGameState::ProductionMenu { .. }
                 | InGameState::CargoSelection { .. }
                 | InGameState::WaitActionMenu { .. }
-                | InGameState::EventPopup { .. }
-                | InGameState::DropTargetSelection { .. } => {}
+                | InGameState::EventPopup { .. } => {}
                 _ => {
                     if self.ui_state.cursor_pos.0 > 0 {
                         self.ui_state.cursor_pos.0 -= 1;
@@ -295,8 +285,7 @@ impl App {
                 | InGameState::ProductionMenu { .. }
                 | InGameState::CargoSelection { .. }
                 | InGameState::WaitActionMenu { .. }
-                | InGameState::EventPopup { .. }
-                | InGameState::DropTargetSelection { .. } => {}
+                | InGameState::EventPopup { .. } => {}
                 _ => {
                     if let Some(world) = &self.world
                         && let Some(map) = world.get_resource::<engine::resources::Map>()
@@ -340,14 +329,28 @@ impl App {
                 selected_index,
             } => {
                 let passenger = passengers[selected_index];
-                self.ui_state.in_game_state = InGameState::DropTargetSelection {
-                    transport_entity,
-                    cargo_entity: passenger,
-                    targets: vec![],
-                    selected_index: 0,
-                };
-                self.ui_state
-                    .add_log("Select target tile to drop...".to_string());
+                let mut targets = vec![];
+                if let Some(world) = &mut self.world {
+                    targets =
+                        engine::systems::transport::get_droppable_tiles(world, transport_entity);
+                }
+
+                if targets.is_empty() {
+                    self.ui_state.add_log("No valid tiles to drop.".to_string());
+                    // アクションメニューに戻すのが丁寧だが、簡略化のため Normal に戻す
+                    self.ui_state.in_game_state = InGameState::Normal;
+                } else {
+                    // 最初の有効な降車先にカーソルを移動
+                    self.ui_state.cursor_pos = targets[0];
+                    self.ui_state.in_game_state = InGameState::DropTargetSelection {
+                        transport_entity,
+                        cargo_entity: passenger,
+                        targets,
+                        selected_index: 0,
+                    };
+                    self.ui_state
+                        .add_log("Select target tile to drop...".to_string());
+                }
             }
             InGameState::DropTargetSelection {
                 transport_entity,

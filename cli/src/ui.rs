@@ -122,15 +122,21 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
 
         // ターゲットタイルの収集
         let mut target_tiles = std::collections::HashSet::new();
-        if let crate::app::InGameState::TargetSelection { targets, .. } =
-            &app.ui_state.in_game_state
-        {
-            let mut q_pos = world.query::<&engine::components::GridPosition>();
-            for entity in targets {
-                if let Ok(pos) = q_pos.get(world, *entity) {
-                    target_tiles.insert((pos.x, pos.y));
+        match &app.ui_state.in_game_state {
+            crate::app::InGameState::TargetSelection { targets, .. } => {
+                let mut q_pos = world.query::<&engine::components::GridPosition>();
+                for entity in targets {
+                    if let Ok(pos) = q_pos.get(world, *entity) {
+                        target_tiles.insert((pos.x, pos.y));
+                    }
                 }
             }
+            crate::app::InGameState::DropTargetSelection { targets, .. } => {
+                for pos in targets {
+                    target_tiles.insert(*pos);
+                }
+            }
+            _ => {}
         }
 
         if let Some(map_res) = world.get_resource::<engine::resources::Map>() {
