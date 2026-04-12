@@ -73,7 +73,7 @@ pub enum UnitType {
     SupplyTruck,
 }
 
-const UNIT_TYPE_MAP: &[(UnitType, &str)] = &[
+pub(crate) const UNIT_TYPE_MAP: &[(UnitType, &str)] = &[
     (UnitType::Infantry, "軽歩兵"),
     (UnitType::Mech, "重歩兵"),
     (UnitType::Recon, "装甲車"),
@@ -153,7 +153,7 @@ pub enum MovementType {
     Ship,
 }
 
-const MOVEMENT_TYPE_MAP: &[(MovementType, &str)] = &[
+pub(crate) const MOVEMENT_TYPE_MAP: &[(MovementType, &str)] = &[
     (MovementType::Infantry, "歩兵"),
     (MovementType::Tank, "戦車"),
     (MovementType::Artillery, "砲台"),
@@ -196,7 +196,7 @@ pub enum Terrain {
     Capital,
 }
 
-const TERRAIN_MAP: &[(Terrain, &str)] = &[
+pub(crate) const TERRAIN_MAP: &[(Terrain, &str)] = &[
     (Terrain::Plains, "平地"),
     (Terrain::Road, "道路"),
     (Terrain::River, "川"),
@@ -395,7 +395,7 @@ pub struct MatchState {
 pub struct PendingMove {
     pub unit_entity: Entity,
     pub original_pos: crate::components::GridPosition,
-    pub original_fuel: u32,
+    pub original_fuel: crate::components::Fuel,
 }
 
 impl Default for MatchState {

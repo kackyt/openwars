@@ -258,7 +258,11 @@ impl App {
                         *selected_index += 1;
                     }
                 }
-                InGameState::DropTargetSelection { selected_index, targets, .. } => {
+                InGameState::DropTargetSelection {
+                    selected_index,
+                    targets,
+                    ..
+                } => {
                     if *selected_index < targets.len().saturating_sub(1) {
                         *selected_index += 1;
                     }
@@ -273,39 +277,35 @@ impl App {
                     }
                 }
             },
-            KeyCode::Left | KeyCode::Char('h') => {
-                match &mut self.ui_state.in_game_state {
-                    InGameState::ActionMenu { .. }
-                        | InGameState::ProductionMenu { .. }
-                        | InGameState::CargoSelection { .. }
-                        | InGameState::WaitActionMenu { .. }
-                        | InGameState::EventPopup { .. }
-                        | InGameState::DropTargetSelection { .. } => {}
-                    _ => {
-                        if self.ui_state.cursor_pos.0 > 0 {
-                            self.ui_state.cursor_pos.0 -= 1;
-                        }
+            KeyCode::Left | KeyCode::Char('h') => match &mut self.ui_state.in_game_state {
+                InGameState::ActionMenu { .. }
+                | InGameState::ProductionMenu { .. }
+                | InGameState::CargoSelection { .. }
+                | InGameState::WaitActionMenu { .. }
+                | InGameState::EventPopup { .. }
+                | InGameState::DropTargetSelection { .. } => {}
+                _ => {
+                    if self.ui_state.cursor_pos.0 > 0 {
+                        self.ui_state.cursor_pos.0 -= 1;
                     }
                 }
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                match &mut self.ui_state.in_game_state {
-                    InGameState::ActionMenu { .. }
-                        | InGameState::ProductionMenu { .. }
-                        | InGameState::CargoSelection { .. }
-                        | InGameState::WaitActionMenu { .. }
-                        | InGameState::EventPopup { .. }
-                        | InGameState::DropTargetSelection { .. } => {}
-                    _ => {
-                        if let Some(world) = &self.world
-                            && let Some(map) = world.get_resource::<engine::resources::Map>()
-                            && self.ui_state.cursor_pos.0 < map.width.saturating_sub(1)
-                        {
-                            self.ui_state.cursor_pos.0 += 1;
-                        }
+            },
+            KeyCode::Right | KeyCode::Char('l') => match &mut self.ui_state.in_game_state {
+                InGameState::ActionMenu { .. }
+                | InGameState::ProductionMenu { .. }
+                | InGameState::CargoSelection { .. }
+                | InGameState::WaitActionMenu { .. }
+                | InGameState::EventPopup { .. }
+                | InGameState::DropTargetSelection { .. } => {}
+                _ => {
+                    if let Some(world) = &self.world
+                        && let Some(map) = world.get_resource::<engine::resources::Map>()
+                        && self.ui_state.cursor_pos.0 < map.width.saturating_sub(1)
+                    {
+                        self.ui_state.cursor_pos.0 += 1;
                     }
                 }
-            }
+            },
             _ => {}
         }
     }
@@ -574,12 +574,11 @@ impl App {
         } else if let Some(entity) = unit_entity {
             let is_moved = if let Some(world) = &mut self.world {
                 let mut moved = false;
-                if let Some(pm) = world.get_resource::<engine::resources::PendingMove>() {
-                    if pm.unit_entity == entity {
-                        if let Some(pos) = world.get::<engine::components::GridPosition>(entity) {
-                            moved = pos.x != pm.original_pos.x || pos.y != pm.original_pos.y;
-                        }
-                    }
+                if let Some(pm) = world.get_resource::<engine::resources::PendingMove>()
+                    && pm.unit_entity == entity
+                    && let Some(pos) = world.get::<engine::components::GridPosition>(entity)
+                {
+                    moved = pos.x != pm.original_pos.x || pos.y != pm.original_pos.y;
                 }
                 moved
             } else {
@@ -645,7 +644,8 @@ impl App {
                     targets,
                     selected_index: 0,
                 };
-                self.ui_state.add_log("Select target to supply...".to_string());
+                self.ui_state
+                    .add_log("Select target to supply...".to_string());
             } else if selected == "Join" {
                 let targets = if let Some(world) = &mut self.world {
                     engine::systems::merge::get_mergable_targets(world, entity)
@@ -658,7 +658,8 @@ impl App {
                     targets,
                     selected_index: 0,
                 };
-                self.ui_state.add_log("Select unit to join with...".to_string());
+                self.ui_state
+                    .add_log("Select unit to join with...".to_string());
             } else if selected == "Load" {
                 let targets = if let Some(world) = &mut self.world {
                     engine::systems::transport::get_loadable_transports(world, entity)
@@ -671,7 +672,8 @@ impl App {
                     targets,
                     selected_index: 0,
                 };
-                self.ui_state.add_log("Select transport to load into...".to_string());
+                self.ui_state
+                    .add_log("Select transport to load into...".to_string());
             }
         }
     }
@@ -826,47 +828,33 @@ impl App {
     pub fn reopen_unit_action_menu(&mut self, unit_entity: Entity) {
         if let Some(world) = &mut self.world {
             let mut is_moved = false;
-            if let Some(pm) = world.get_resource::<engine::resources::PendingMove>() {
-                if pm.unit_entity == unit_entity {
-                    if let Some(pos) = world.get::<engine::components::GridPosition>(unit_entity) {
-                        // 座標が変化している場合のみ「移動済み」とみなす（間接攻撃制限のため）
-                        is_moved = pos.x != pm.original_pos.x || pos.y != pm.original_pos.y;
-                    }
-                }
+            if let Some(pm) = world.get_resource::<engine::resources::PendingMove>()
+                && pm.unit_entity == unit_entity
+                && let Some(pos) = world.get::<engine::components::GridPosition>(unit_entity)
+            {
+                is_moved = pos.x != pm.original_pos.x || pos.y != pm.original_pos.y;
             }
 
+            let actions =
+                engine::systems::action::get_available_actions(world, unit_entity, is_moved);
             let mut options = vec!["Wait".to_string()];
 
-            // 攻撃可能か判定
-            if !engine::systems::combat::get_attackable_targets(world, unit_entity, !is_moved).is_empty() {
+            if actions.can_attack {
                 options.insert(0, "Attack".to_string());
             }
-
-            // 占領可能か判定
-            if engine::systems::property::get_capturable_property(world, unit_entity).is_some() {
+            if actions.can_capture {
                 options.push("Capture".to_string());
             }
-
-            // 補給可能か判定
-            if !engine::systems::supply::get_suppliable_targets(world, unit_entity).is_empty() {
+            if actions.can_supply {
                 options.push("Supply".to_string());
             }
-
-            // 輸送関連
-            let mut has_passengers = false;
-            if let Ok(cargo) = world.query::<&engine::components::CargoCapacity>().get(world, unit_entity) {
-                has_passengers = !cargo.loaded.is_empty();
-            }
-            if has_passengers {
+            if actions.can_drop {
                 options.push("Drop".to_string());
             }
-
-            if !engine::systems::transport::get_loadable_transports(world, unit_entity).is_empty() {
+            if actions.can_load {
                 options.push("Load".to_string());
             }
-
-            // 合流可能か判定
-            if !engine::systems::merge::get_mergable_targets(world, unit_entity).is_empty() {
+            if actions.can_join {
                 options.push("Join".to_string());
             }
 

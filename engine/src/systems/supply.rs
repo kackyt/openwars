@@ -10,6 +10,7 @@ use bevy_ecs::prelude::*;
 /// 2. 補給対象(`target_entity`)が自軍であり、補給者と隣接（距離が1）していることを確認します。
 /// 3. 対象の燃料(`Fuel`)と弾薬(`Ammo`)を最大値まで回復(`resupply`)させます。
 /// 4. 補給者の `ActionCompleted` を true に設定します。
+///
 /// 指定されたユニットが現在補給可能な対象エンティティのリストを返します。
 /// 補給能力（can_supply）を持つユニットの隣接マスにいる同勢力ユニットが対象です。
 pub fn get_suppliable_targets(world: &mut World, supplier: Entity) -> Vec<Entity> {

@@ -16,12 +16,11 @@ pub fn get_mergable_targets(world: &mut World, unit: Entity) -> Vec<Entity> {
         (*pos, stats.clone(), faction.0)
     };
 
-    let mut q_targets = world.query_filtered::<
-        (Entity, &GridPosition, &Faction, &UnitStats),
-        With<Faction>,
-    >();
+    let mut q_targets =
+        world.query_filtered::<(Entity, &GridPosition, &Faction, &UnitStats), With<Faction>>();
     for (t_ent, t_pos, t_faction, t_stats) in q_targets.iter(world) {
-        if t_ent != unit && t_faction.0 == unit_faction && t_stats.unit_type == unit_stats.unit_type {
+        if t_ent != unit && t_faction.0 == unit_faction && t_stats.unit_type == unit_stats.unit_type
+        {
             let dist = (unit_pos.x as i64 - t_pos.x as i64).unsigned_abs() as u32
                 + (unit_pos.y as i64 - t_pos.y as i64).unsigned_abs() as u32;
             if dist == 1 {

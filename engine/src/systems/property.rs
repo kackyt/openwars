@@ -12,6 +12,7 @@ use bevy_ecs::prelude::*;
 /// 4. 敵軍または中立の拠点であれば、ユニットのHPに応じたアクションパワーで占領ポイントを減らします。
 /// 5. 占領ポイントが0以下になった場合、拠点の所有者を自軍に変更し、`PropertyCapturedEvent` を発行します。
 /// 6. ユニットの `ActionCompleted` を true に設定します。
+///
 /// 指定されたユニットが現在地で占領可能な拠点エンティティを返します。
 pub fn get_capturable_property(world: &mut World, unit: Entity) -> Option<Entity> {
     let (unit_pos, unit_stats, unit_faction) = {

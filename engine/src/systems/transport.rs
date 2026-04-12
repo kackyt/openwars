@@ -10,15 +10,16 @@ use bevy_ecs::prelude::*;
 /// 2. 輸送ユニットの容量(`CargoCapacity`)と積載可能タイプ(`loadable_unit_types`)の条件を満たしているか確認します。
 /// 3. 積載対象ユニットを輸送ユニットの `CargoCapacity` に追加します。
 /// 4. 積載対象ユニットに `Transporting` コンポーネントを付与し、行動済み(`ActionCompleted`)にします。
+///
 /// 指定されたユニットを搭載可能な、隣接する輸送ユニットエンティティのリストを返します。
 pub fn get_loadable_transports(world: &mut World, unit: Entity) -> Vec<Entity> {
     let mut targets = vec![];
-    let (u_pos, u_stats, unit_faction) = {
+    let (u_pos, u_type, unit_faction) = {
         let mut q_unit = world.query::<(&GridPosition, &UnitStats, &Faction)>();
         let Ok((u_pos, u_stats, u_faction)) = q_unit.get(world, unit) else {
             return targets;
         };
-        (*u_pos, u_stats.clone(), u_faction.0)
+        (*u_pos, u_stats.unit_type, u_faction.0)
     };
 
     let mut q_transports = world.query_filtered::<
@@ -32,7 +33,7 @@ pub fn get_loadable_transports(world: &mut World, unit: Entity) -> Vec<Entity> {
             if dist == 1 {
                 // 空き容量があり、かつ搭載可能タイプに含まれているか
                 if t_cargo.loaded.len() < t_cargo.max as usize
-                    && t_stats.loadable_unit_types.contains(&u_stats.unit_type)
+                    && t_stats.loadable_unit_types.contains(&u_type)
                 {
                     targets.push(t_ent);
                 }
@@ -46,16 +47,39 @@ pub fn get_loadable_transports(world: &mut World, unit: Entity) -> Vec<Entity> {
 /// 指定された輸送ユニットからユニットを降車させることが可能な、隣接マスのリストを返します。
 pub fn get_droppable_tiles(world: &mut World, transport: Entity) -> Vec<(usize, usize)> {
     let mut targets = vec![];
-    let t_pos = {
-        let mut q_trans = world.query::<(&GridPosition, &UnitStats)>();
-        let Ok((t_pos, _t_stats)) = q_trans.get(world, transport) else {
+    let (t_pos, cargo_stats) = {
+        let mut q_trans = world.query::<(&GridPosition, &CargoCapacity)>();
+        let mut q_unit = world.query::<&UnitStats>();
+
+        let Ok((pos, cargo)) = q_trans.get(world, transport) else {
             return targets;
         };
-        *t_pos
+
+        // 積載されている全ユニットの「最悪の移動タイプ」または「全個別の判定」が必要だが、
+        // ここでは全積載ユニットが通行可能な場所のみを返すようにする。
+        let mut stats_list = vec![];
+        for &cargo_entity in &cargo.loaded {
+            if let Ok(stats) = q_unit.get(world, cargo_entity) {
+                stats_list.push(stats.movement_type);
+            }
+        }
+        (*pos, stats_list)
     };
 
-    let (map_w, map_h) = if let Some(map) = world.get_resource::<crate::resources::Map>() {
-        (map.width, map.height)
+    // 1. ユニットがいる座標を事前に取得（借用チェッカー対策: &mut World を使う操作を最初に行う）
+    use std::collections::HashSet;
+    let mut occupied_positions = HashSet::new();
+    let mut q_units = world.query_filtered::<&GridPosition, With<crate::components::Faction>>();
+    for u_pos in q_units.iter(world) {
+        occupied_positions.insert((u_pos.x, u_pos.y));
+    }
+
+    // 2. リソースを取得
+    let (map_w, map_h, master_data) = if let (Some(map), Some(md)) = (
+        world.get_resource::<crate::resources::Map>(),
+        world.get_resource::<crate::resources::master_data::MasterDataRegistry>(),
+    ) {
+        (map.width, map.height, md)
     } else {
         return targets;
     };
@@ -73,18 +97,29 @@ pub fn get_droppable_tiles(world: &mut World, transport: Entity) -> Vec<(usize, 
             let x = nx as usize;
             let y = ny as usize;
 
-            // TODO: 本来は「降ろすユニットの移動タイプ」で通行可能か判定すべきだが、
-            // 今は簡単のため「空きマスであること」のみをチェックする（必要に応じて後で強化）
-            let mut q_units = world.query_filtered::<&GridPosition, With<crate::components::Faction>>();
-            let mut is_occupied = false;
-            for u_pos in q_units.iter(world) {
-                if u_pos.x == x && u_pos.y == y {
-                    is_occupied = true;
+            // 地形通行可能判定
+            // master_data を借用中なので、Mapへのアクセスも immutable borrow で行う
+            let terrain = if let Some(map) = world.get_resource::<crate::resources::Map>() {
+                map.get_terrain(x, y).unwrap()
+            } else {
+                continue;
+            };
+
+            let mut can_pass_all = true;
+            for &m_type in &cargo_stats {
+                if crate::systems::movement::get_valid_movement_cost(master_data, m_type, terrain)
+                    .is_none()
+                {
+                    can_pass_all = false;
                     break;
                 }
             }
 
-            if !is_occupied {
+            if !can_pass_all {
+                continue;
+            }
+
+            if !occupied_positions.contains(&(x, y)) {
                 targets.push((x, y));
             }
         }
@@ -130,9 +165,9 @@ pub fn load_unit_system(
             continue;
         }
 
-        let (unit_pos, unit_faction, unit_stats, unit_action, unit_trans) =
+        let (unit_pos, unit_faction, unit_type, unit_action, unit_trans) =
             match q_units.get(event.unit_entity) {
-                Ok((_, p, f, s, a, _, t)) => (*p, f.0, s.clone(), a.0, t.is_some()),
+                Ok((_, p, f, s, a, _, t)) => (*p, f.0, s.unit_type, a.0, t.is_some()),
                 _ => continue,
             };
 
@@ -145,10 +180,7 @@ pub fn load_unit_system(
 
         #[allow(clippy::collapsible_if)]
         if trans_capacity.is_some_and(|(max_cap, loaded_len)| {
-            loaded_len < max_cap
-                && trans_stats
-                    .loadable_unit_types
-                    .contains(&unit_stats.unit_type)
+            loaded_len < max_cap && trans_stats.loadable_unit_types.contains(&unit_type)
         }) {
             if let Ok([transport, mut unit]) =
                 q_units.get_many_mut([event.transport_entity, event.unit_entity])

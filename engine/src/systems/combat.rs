@@ -35,12 +35,12 @@ pub fn can_attack(
     let (a_pos, a_stats, a_has_moved, a_fac) = q_attacker
         .get(world, attacker_entity)
         .map_err(|_| AttackError::InvalidEntity)?;
-    
+
     // a_statsの所有権問題を回避するため、必要な情報をクローン/コピーしておく
     let a_pos_val = *a_pos;
     let a_fac_val = a_fac.0;
     let a_type_name = a_stats.unit_type.as_str();
-    
+
     let mut has_moved_val = false;
     if let Some(pm) = world.get_resource::<crate::resources::PendingMove>() {
         if pm.unit_entity == attacker_entity {
@@ -65,38 +65,40 @@ pub fn can_attack(
 
     let master_data = world.get_resource::<MasterDataRegistry>().unwrap();
     let unit_record = master_data.get_unit(&UnitName(a_type_name.to_string()));
-    
+
     let mut indirect_after_move = false;
 
     if let Some(rec) = unit_record {
         // Weapon1のチェック
-        if let Some(w1_name) = &rec.weapon1 {
-            if let Some(w1) = master_data.weapons.get(&UnitName(w1_name.clone())) {
-                if w1.damages.contains_key(target_type_name) {
-                    let is_indirect = w1.range_min > 1;
-                    if dist >= w1.range_min && dist <= w1.range_max {
-                        if is_indirect && has_moved_val {
-                            indirect_after_move = true;
-                        } else {
-                            return Ok(()); // 攻撃可能な武器が見つかった
-                        }
-                    }
-                }
+        if let Some(w1) = rec
+            .weapon1
+            .as_ref()
+            .and_then(|name| master_data.weapons.get(&UnitName(name.clone())))
+            && w1.damages.contains_key(target_type_name)
+            && dist >= w1.range_min
+            && dist <= w1.range_max
+        {
+            let is_indirect = w1.range_min > 1;
+            if is_indirect && has_moved_val {
+                indirect_after_move = true;
+            } else {
+                return Ok(()); // 攻撃可能な武器が見つかった
             }
         }
         // Weapon2のチェック
-        if let Some(w2_name) = &rec.weapon2 {
-            if let Some(w2) = master_data.weapons.get(&UnitName(w2_name.clone())) {
-                if w2.damages.contains_key(target_type_name) {
-                    let is_indirect = w2.range_min > 1;
-                    if dist >= w2.range_min && dist <= w2.range_max {
-                        if is_indirect && has_moved_val {
-                            indirect_after_move = true;
-                        } else {
-                            return Ok(());
-                        }
-                    }
-                }
+        if let Some(w2) = rec
+            .weapon2
+            .as_ref()
+            .and_then(|name| master_data.weapons.get(&UnitName(name.clone())))
+            && w2.damages.contains_key(target_type_name)
+            && dist >= w2.range_min
+            && dist <= w2.range_max
+        {
+            let is_indirect = w2.range_min > 1;
+            if is_indirect && has_moved_val {
+                indirect_after_move = true;
+            } else {
+                return Ok(());
             }
         }
     }
@@ -134,15 +136,24 @@ pub fn get_attackable_targets(
         let unit_type_name = a_stats.unit_type.as_str();
         let unit_record = master_data.get_unit(&UnitName(unit_type_name.to_string()));
         if let Some(rec) = unit_record {
-            let w1 = rec.weapon1.as_ref().and_then(|w| master_data.weapons.get(&UnitName(w.clone()))).cloned();
-            let w2 = rec.weapon2.as_ref().and_then(|w| master_data.weapons.get(&UnitName(w.clone()))).cloned();
+            let w1 = rec
+                .weapon1
+                .as_ref()
+                .and_then(|w| master_data.weapons.get(&UnitName(w.clone())))
+                .cloned();
+            let w2 = rec
+                .weapon2
+                .as_ref()
+                .and_then(|w| master_data.weapons.get(&UnitName(w.clone())))
+                .cloned();
             (w1, w2)
         } else {
             (None, None)
         }
     };
 
-    let mut q_targets = world.query_filtered::<(Entity, &GridPosition, &Faction, &UnitStats), With<Faction>>();
+    let mut q_targets =
+        world.query_filtered::<(Entity, &GridPosition, &Faction, &UnitStats), With<Faction>>();
     for (t_ent, t_pos, t_faction, t_stats) in q_targets.iter(world) {
         if t_ent == attacker || t_faction.0 == unit_faction {
             continue;
@@ -160,21 +171,21 @@ pub fn get_attackable_targets(
             if w1.damages.contains_key(target_type_name) {
                 let is_indirect = w1.range_min > 1;
                 // 移動制限にかからず、かつ射程内であれば攻撃可能
-                if !(is_indirect && !allow_indirect) && dist >= w1.range_min && dist <= w1.range_max {
+                if (!is_indirect || allow_indirect) && dist >= w1.range_min && dist <= w1.range_max
+                {
                     can_attack = true;
                 }
             }
         }
 
         // 武器2（副武器）の判定（主武器で攻撃不可な場合のみチェック）
-        if !can_attack {
-            if let Some(w2) = &weapon2_rec {
-                if w2.damages.contains_key(target_type_name) {
-                    let is_indirect = w2.range_min > 1;
-                    if !(is_indirect && !allow_indirect) && dist >= w2.range_min && dist <= w2.range_max {
-                        can_attack = true;
-                    }
-                }
+        if !can_attack
+            && let Some(w2) = &weapon2_rec
+            && w2.damages.contains_key(target_type_name)
+        {
+            let is_indirect = w2.range_min > 1;
+            if (!is_indirect || allow_indirect) && dist >= w2.range_min && dist <= w2.range_max {
+                can_attack = true;
             }
         }
 
@@ -201,35 +212,37 @@ fn select_weapon(
     let unit_record = master_data.get_unit(&UnitName(attacker_name.to_string()))?;
 
     // Try weapon 1
-    if let Some(w1_name) = &unit_record.weapon1 {
-        if let Some(w1) = master_data.weapons.get(&UnitName(w1_name.clone())) {
-            if ammo1 > 0 && dist >= w1.range_min && dist <= w1.range_max {
-                if let Some(dmg) = w1.damages.get(defender_name) {
-                    if *dmg > 0 {
-                        return Some((1, *dmg, w1.range_min > 1));
-                    }
-                }
-            }
-        }
+    if let Some(w1) = unit_record
+        .weapon1
+        .as_ref()
+        .and_then(|name| master_data.weapons.get(&UnitName(name.clone())))
+        && ammo1 > 0
+        && dist >= w1.range_min
+        && dist <= w1.range_max
+        && let Some(&dmg) = w1.damages.get(defender_name)
+        && dmg > 0
+    {
+        return Some((1, dmg, w1.range_min > 1));
     }
 
     // Try weapon 2
-    if let Some(w2_name) = &unit_record.weapon2 {
-        if let Some(w2) = master_data.weapons.get(&UnitName(w2_name.clone())) {
-            if dist >= w2.range_min && dist <= w2.range_max {
-                // Note: secondary weapons (e.g. machine guns) usually don't consume primary ammo. 
-                // However, openwars seems to use ammo1 and ammo2. Most secondary weapons have infinite ammo? 
-                // Let's assume ammo2 > 0 is required if max_ammo2 > 0, but for now we'll just check if it's usable.
-                // In advance wars, secondary weapons have infinite ammo. So we will skip ammo2 check here, or assume 
-                // openwars models it such that ammo2 is handled elsewhere.
-                if ammo2 > 0 {
-                    if let Some(dmg) = w2.damages.get(defender_name) {
-                        if *dmg > 0 {
-                            return Some((2, *dmg, w2.range_min > 1));
-                        }
-                    }
-                }
-            }
+    if let Some(w2) = unit_record
+        .weapon2
+        .as_ref()
+        .and_then(|name| master_data.weapons.get(&UnitName(name.clone())))
+        && dist >= w2.range_min
+        && dist <= w2.range_max
+    {
+        // Note: secondary weapons (e.g. machine guns) usually don't consume primary ammo.
+        // However, openwars seems to use ammo1 and ammo2. Most secondary weapons have infinite ammo?
+        // Let's assume ammo2 > 0 is required if max_ammo2 > 0, but for now we'll just check if it's usable.
+        // In advance wars, secondary weapons have infinite ammo. So we will skip ammo2 check here, or assume
+        // openwars models it such that ammo2 is handled elsewhere.
+        if ammo2 > 0
+            && let Some(&dmg) = w2.damages.get(defender_name)
+            && dmg > 0
+        {
+            return Some((2, dmg, w2.range_min > 1));
         }
     }
 
@@ -402,7 +415,9 @@ pub fn attack_unit_system(
             defender.1.damage(a_damage);
             d_hp_after = defender.1.current;
 
-            if let (Some((d_slot, _, _)), Some(def_ammo)) = (counter_info, defender.2.as_deref_mut()) {
+            if let (Some((d_slot, _, _)), Some(def_ammo)) =
+                (counter_info, defender.2.as_deref_mut())
+            {
                 if d_slot == 1 {
                     def_ammo.ammo1 = def_ammo.ammo1.saturating_sub(1);
                 } else {
@@ -556,15 +571,14 @@ mod tests {
         schedule.run(&mut world);
 
         let hp2 = world.get::<Health>(entity_2).unwrap();
-        // Plains = +1 defense bonus = 10%. 
-        // Real Base = 55. 
-        // 55 * 10 = 550. 
-        // Without defense it would be 55. With 10% defense it's reduced.
-        // We just assert it takes damage.
-        assert!(hp2.current < 100);
+        // Calculation: (45 * 100 + 105) / (100 + 5) + 1 = 4605 / 105 + 1 = 43 + 1 = 44.
+        // 100 - 44 = 56.
+        assert_eq!(hp2.current, 56);
 
         let hp1 = world.get::<Health>(entity_1).unwrap();
-        assert!(hp1.current < 100); // Counter attacked
+        // Counter calculation: (45 * 100 + 105) / (100 + 5) + 7 = 43 + 7 = 50.
+        // 100 - 50 = 50.
+        assert_eq!(hp1.current, 50); // Counter attacked
 
         let ammo1 = world.get::<Ammo>(entity_1).unwrap();
         assert_eq!(ammo1.ammo1, 8); // Used 1 ammo
@@ -617,6 +631,8 @@ mod tests {
                     unit_type: UnitType::Infantry,
                     min_range: 1,
                     max_range: 1,
+                    max_ammo1: 9,
+                    max_ammo2: 0,
                     ..Default::default()
                 },
                 ActionCompleted(false),
@@ -625,6 +641,11 @@ mod tests {
             .id();
 
         // 拠点とユニットを同じ座標 (0, 1) に配置
+        // Map資源も更新する必要がある（戦闘システムはMap資源から地形を取得するため）
+        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 1, Terrain::Factory).unwrap();
+        world.insert_resource(map);
+
         world.spawn((
             GridPosition { x: 0, y: 1 },
             Property::new(Terrain::Factory, Some(PlayerId(2))),
@@ -667,7 +688,10 @@ mod tests {
 
         // 防衛者のHPが減っていることを確認
         let hp_def = world.get::<Health>(defender).unwrap();
-        assert!(hp_def.current < 100);
+        // (45 * 100 + 105) / (100 + 20) + 1 = 4605 / 120 + 1 = 38 + 1 = 39.
+        // 100 - 39 = 61.
+        // Note: Factory has 20 bonus in landscape.csv
+        assert_eq!(hp_def.current, 61);
     }
 
     #[test]
@@ -798,11 +822,10 @@ mod tests {
         let hp_mt = world.get::<Health>(defender_mt).unwrap().current;
 
         // Mountain should provide MORE defense (higher HP remaining)
-        assert!(
-            hp_mt > hp_plains,
-            "Mountain (HP={}) should provide more defense than Plains (HP={})",
-            hp_mt,
-            hp_plains
-        );
+        assert!(hp_mt > hp_plains);
+        // Case 1 (Plains: 5): (38 * 100 + 105) / 105 + 1 = 3905 / 105 + 1 = 37 + 1 = 38. 100 - 38 = 62.
+        assert_eq!(hp_plains, 62);
+        // Case 2 (Mountain: 40): (38 * 100 + 105) / 140 + 1 = 3905 / 140 + 1 = 27 + 1 = 28. 100 - 28 = 72.
+        assert_eq!(hp_mt, 72);
     }
 }

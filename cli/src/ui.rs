@@ -111,7 +111,8 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         // 到達可能タイルの収集
         let mut reachable_tiles = std::collections::HashSet::new();
         if let crate::app::InGameState::UnitSelected {
-            reachable_tiles: rt, ..
+            reachable_tiles: rt,
+            ..
         } = &app.ui_state.in_game_state
         {
             for pos in rt {
@@ -121,7 +122,9 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
 
         // ターゲットタイルの収集
         let mut target_tiles = std::collections::HashSet::new();
-        if let crate::app::InGameState::TargetSelection { targets, .. } = &app.ui_state.in_game_state {
+        if let crate::app::InGameState::TargetSelection { targets, .. } =
+            &app.ui_state.in_game_state
+        {
             let mut q_pos = world.query::<&engine::components::GridPosition>();
             for entity in targets {
                 if let Ok(pos) = q_pos.get(world, *entity) {

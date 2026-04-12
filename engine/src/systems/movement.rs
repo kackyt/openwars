@@ -420,7 +420,10 @@ pub fn move_unit_system(
                     commands.insert_resource(PendingMove {
                         unit_entity: entity,
                         original_pos: from,
-                        original_fuel: old_fuel,
+                        original_fuel: Fuel {
+                            current: old_fuel,
+                            max: fuel.max,
+                        },
                     });
                 }
 
@@ -478,7 +481,7 @@ pub fn undo_move_system(
             if let Ok((mut pos, mut fuel, mut has_moved)) = q_units.get_mut(pending.unit_entity) {
                 // 位置、燃料、移動済みフラグを復元
                 *pos = pending.original_pos;
-                fuel.current = pending.original_fuel;
+                *fuel = pending.original_fuel;
                 has_moved.0 = false;
             }
             // 移動履歴を削除
