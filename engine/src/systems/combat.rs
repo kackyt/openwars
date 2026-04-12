@@ -302,6 +302,7 @@ pub fn attack_unit_system(
     map: Res<Map>,
     mut rng: ResMut<GameRng>,
     mut commands: Commands,
+    pending_move: Option<Res<PendingMove>>,
 ) {
     if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
@@ -315,7 +316,7 @@ pub fn attack_unit_system(
             attacker_faction,
             attacker_stats,
             attacker_action,
-            attacker_has_moved,
+            attacker_has_moved_comp,
             attacker_ammo_1,
             attacker_ammo_2,
             attacker_hp,
@@ -331,6 +332,16 @@ pub fn attack_unit_system(
                 *hp,
             ),
             _ => continue,
+        };
+
+        let attacker_has_moved = if let Some(pm) = pending_move.as_ref() {
+            if pm.unit_entity == event.attacker_entity {
+                attacker_pos.x != pm.original_pos.x || attacker_pos.y != pm.original_pos.y
+            } else {
+                attacker_has_moved_comp
+            }
+        } else {
+            attacker_has_moved_comp
         };
 
         if attacker_faction != active_player || attacker_action || attacker_hp.is_destroyed() {

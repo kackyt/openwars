@@ -11,7 +11,7 @@ use bevy_ecs::prelude::*;
 /// 3. 積載対象ユニットを輸送ユニットの `CargoCapacity` に追加します。
 /// 4. 積載対象ユニットに `Transporting` コンポーネントを付与し、行動済み(`ActionCompleted`)にします。
 ///
-/// 指定されたユニットを搭載可能な、隣接する輸送ユニットエンティティのリストを返します。
+/// 指定されたユニットを搭載可能な、同一座標の輸送ユニットエンティティのリストを返します。
 pub fn get_loadable_transports(world: &mut World, unit: Entity) -> Vec<Entity> {
     let mut targets = vec![];
     let (u_pos, u_type, unit_faction) = {
@@ -55,13 +55,18 @@ pub fn get_droppable_tiles(world: &mut World, transport: Entity) -> Vec<(usize, 
             return targets;
         };
 
+        if cargo.loaded.is_empty() {
+            return targets;
+        }
+
         // 積載されている全ユニットの「最悪の移動タイプ」または「全個別の判定」が必要だが、
         // ここでは全積載ユニットが通行可能な場所のみを返すようにする。
         let mut stats_list = vec![];
         for &cargo_entity in &cargo.loaded {
-            if let Ok(stats) = q_unit.get(world, cargo_entity) {
-                stats_list.push(stats.movement_type);
-            }
+            let Ok(stats) = q_unit.get(world, cargo_entity) else {
+                return targets;
+            };
+            stats_list.push(stats.movement_type);
         }
         (*pos, stats_list)
     };
