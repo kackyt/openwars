@@ -44,6 +44,9 @@ pub enum InGameState {
         targets: Vec<(usize, usize)>,
         selected_index: usize,
     },
+    WaitActionMenu {
+        unit_entity: Entity,
+    },
     EventPopup {
         message: String,
     },
@@ -200,6 +203,12 @@ impl App {
                 // 簡易化のためアクションメニューに戻す
                 self.reopen_unit_action_menu(transport_entity);
             }
+            InGameState::WaitActionMenu { unit_entity: _ } => {
+                if let Some(world) = &mut self.world {
+                    world.send_event(engine::events::UndoMoveCommand);
+                }
+                self.ui_state.in_game_state = InGameState::Normal;
+            }
             InGameState::EventPopup { .. } => {
                 self.ui_state.in_game_state = InGameState::Normal;
             }
@@ -218,7 +227,7 @@ impl App {
                         *selected_index -= 1;
                     }
                 }
-                InGameState::EventPopup { .. } => {}
+                InGameState::EventPopup { .. } | InGameState::WaitActionMenu { .. } => {}
                 _ => {
                     if self.ui_state.cursor_pos.1 > 0 {
                         self.ui_state.cursor_pos.1 -= 1;
@@ -249,7 +258,12 @@ impl App {
                         *selected_index += 1;
                     }
                 }
-                InGameState::EventPopup { .. } => {}
+                InGameState::DropTargetSelection { selected_index, targets, .. } => {
+                    if *selected_index < targets.len().saturating_sub(1) {
+                        *selected_index += 1;
+                    }
+                }
+                InGameState::EventPopup { .. } | InGameState::WaitActionMenu { .. } => {}
                 _ => {
                     if let Some(world) = &self.world
                         && let Some(map) = world.get_resource::<engine::resources::Map>()
@@ -260,29 +274,36 @@ impl App {
                 }
             },
             KeyCode::Left | KeyCode::Char('h') => {
-                if !matches!(
-                    self.ui_state.in_game_state,
+                match &mut self.ui_state.in_game_state {
                     InGameState::ActionMenu { .. }
                         | InGameState::ProductionMenu { .. }
                         | InGameState::CargoSelection { .. }
+                        | InGameState::WaitActionMenu { .. }
                         | InGameState::EventPopup { .. }
-                ) && self.ui_state.cursor_pos.0 > 0
-                {
-                    self.ui_state.cursor_pos.0 -= 1;
+                        | InGameState::DropTargetSelection { .. } => {}
+                    _ => {
+                        if self.ui_state.cursor_pos.0 > 0 {
+                            self.ui_state.cursor_pos.0 -= 1;
+                        }
+                    }
                 }
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                if !matches!(
-                    self.ui_state.in_game_state,
+                match &mut self.ui_state.in_game_state {
                     InGameState::ActionMenu { .. }
                         | InGameState::ProductionMenu { .. }
                         | InGameState::CargoSelection { .. }
+                        | InGameState::WaitActionMenu { .. }
                         | InGameState::EventPopup { .. }
-                ) && let Some(world) = &self.world
-                    && let Some(map) = world.get_resource::<engine::resources::Map>()
-                    && self.ui_state.cursor_pos.0 < map.width.saturating_sub(1)
-                {
-                    self.ui_state.cursor_pos.0 += 1;
+                        | InGameState::DropTargetSelection { .. } => {}
+                    _ => {
+                        if let Some(world) = &self.world
+                            && let Some(map) = world.get_resource::<engine::resources::Map>()
+                            && self.ui_state.cursor_pos.0 < map.width.saturating_sub(1)
+                        {
+                            self.ui_state.cursor_pos.0 += 1;
+                        }
+                    }
                 }
             }
             _ => {}
@@ -333,6 +354,7 @@ impl App {
                 cargo_entity,
                 ..
             } => self.handle_drop_target_confirm(transport_entity, cargo_entity),
+            InGameState::WaitActionMenu { .. } => {}
             InGameState::EventPopup { .. } => {
                 self.ui_state.in_game_state = InGameState::Normal;
             }
@@ -551,8 +573,15 @@ impl App {
             };
         } else if let Some(entity) = unit_entity {
             let is_moved = if let Some(world) = &mut self.world {
-                let mut q = world.query::<&engine::components::HasMoved>();
-                q.get(world, entity).map(|m| m.0).unwrap_or(false)
+                let mut moved = false;
+                if let Some(pm) = world.get_resource::<engine::resources::PendingMove>() {
+                    if pm.unit_entity == entity {
+                        if let Some(pos) = world.get::<engine::components::GridPosition>(entity) {
+                            moved = pos.x != pm.original_pos.x || pos.y != pm.original_pos.y;
+                        }
+                    }
+                }
+                moved
             } else {
                 false
             };
@@ -787,14 +816,14 @@ impl App {
                     target_y: cy,
                 });
 
-                self.reopen_unit_action_menu(unit_entity);
+                self.ui_state.in_game_state = InGameState::WaitActionMenu { unit_entity };
             }
             self.ui_state
                 .add_log(format!("Moved unit to {:?}", (cx, cy)));
         }
     }
 
-    fn reopen_unit_action_menu(&mut self, unit_entity: Entity) {
+    pub fn reopen_unit_action_menu(&mut self, unit_entity: Entity) {
         if let Some(world) = &mut self.world {
             let mut is_moved = false;
             if let Some(pm) = world.get_resource::<engine::resources::PendingMove>() {

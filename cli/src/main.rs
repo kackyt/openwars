@@ -273,6 +273,10 @@ where
                     app.ui_state.in_game_state = app::InGameState::EventPopup { message: msg };
                 }
             }
+
+            if let app::InGameState::WaitActionMenu { unit_entity } = app.ui_state.in_game_state.clone() {
+                app.reopen_unit_action_menu(unit_entity);
+            }
         }
     }
 }
