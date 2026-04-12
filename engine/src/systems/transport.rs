@@ -458,7 +458,11 @@ mod tests {
 
         // 容量がいっぱいだと見つからないはず
         world.get_mut::<GridPosition>(cargo_entity).unwrap().x = 5;
-        world.get_mut::<CargoCapacity>(transport_entity).unwrap().loaded.push(Entity::from_raw(999));
+        world
+            .get_mut::<CargoCapacity>(transport_entity)
+            .unwrap()
+            .loaded
+            .push(Entity::from_raw(999));
         let targets = get_loadable_transports(&mut world, cargo_entity);
         assert_eq!(targets.len(), 0);
     }
@@ -496,17 +500,18 @@ mod tests {
             ))
             .id();
 
-        world.get_mut::<CargoCapacity>(transport_entity).unwrap().loaded.push(cargo_entity);
+        world
+            .get_mut::<CargoCapacity>(transport_entity)
+            .unwrap()
+            .loaded
+            .push(cargo_entity);
 
         // 初期状態：周囲4マス空いている
         let tiles = get_droppable_tiles(&mut world, transport_entity);
         assert_eq!(tiles.len(), 4);
 
         // 隣接マス (1, 0) に他のユニットを配置
-        world.spawn((
-            GridPosition { x: 1, y: 0 },
-            Faction(PlayerId(1)),
-        ));
+        world.spawn((GridPosition { x: 1, y: 0 }, Faction(PlayerId(1))));
 
         let tiles = get_droppable_tiles(&mut world, transport_entity);
         assert_eq!(tiles.len(), 3);

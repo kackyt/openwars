@@ -29,8 +29,13 @@ pub fn can_attack(
     defender_entity: Entity,
     world: &mut World,
 ) -> Result<(), AttackError> {
-    let mut q_attacker =
-        world.query::<(&GridPosition, &UnitStats, Option<&HasMoved>, &Faction, Option<&Ammo>)>();
+    let mut q_attacker = world.query::<(
+        &GridPosition,
+        &UnitStats,
+        Option<&HasMoved>,
+        &Faction,
+        Option<&Ammo>,
+    )>();
     let mut q_target = world.query::<(&GridPosition, &UnitStats, &Faction)>();
 
     let (a_pos, a_stats, a_has_moved, a_fac, a_ammo) = q_attacker
