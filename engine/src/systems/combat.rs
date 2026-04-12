@@ -380,7 +380,7 @@ pub fn attack_unit_system(
                     .unwrap_or(Terrain::Plains);
                 let att_bonus = master_data.get_terrain_defense_bonus(att_terrain);
 
-                let d_damage = (d_base_damage * defender_hp.current + 105) / (100 + att_bonus)
+                let d_damage = (d_base_damage * defender_hp.current + 100) / (100 + att_bonus)
                     + rng.next_bonus();
 
                 d_damage_opt = Some(d_damage);
