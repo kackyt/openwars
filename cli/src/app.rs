@@ -426,6 +426,7 @@ impl App {
                             engine::systems::movement::OccupantInfo {
                                 player_id: f.0,
                                 is_transport: s.max_cargo > 0,
+                                unit_type: s.unit_type,
                                 loadable_types: s.loadable_unit_types.clone(),
                                 free_slots,
                             },
@@ -646,34 +647,57 @@ impl App {
                 };
                 self.ui_state
                     .add_log("Select target to supply...".to_string());
-            } else if selected == "Join" {
+            } else if selected == "Merge" {
                 let targets = if let Some(world) = &mut self.world {
                     engine::systems::merge::get_mergable_targets(world, entity)
                 } else {
                     vec![]
                 };
-                self.ui_state.in_game_state = InGameState::TargetSelection {
-                    unit_entity: entity,
-                    action: selected.clone(),
-                    targets,
-                    selected_index: 0,
-                };
-                self.ui_state
-                    .add_log("Select unit to join with...".to_string());
+                if targets.len() == 1 {
+                    if let Some(world) = &mut self.world {
+                        world.send_event(engine::events::MergeUnitCommand {
+                            source_entity: entity,
+                            target_entity: targets[0],
+                        });
+                        self.ui_state.add_log("Merging unit...".to_string());
+                        self.ui_state.in_game_state = InGameState::Normal;
+                    }
+                } else {
+                    self.ui_state.in_game_state = InGameState::TargetSelection {
+                        unit_entity: entity,
+                        action: selected.clone(),
+                        targets,
+                        selected_index: 0,
+                    };
+                    self.ui_state
+                        .add_log("Select unit to merge with...".to_string());
+                }
             } else if selected == "Load" {
                 let targets = if let Some(world) = &mut self.world {
                     engine::systems::transport::get_loadable_transports(world, entity)
                 } else {
                     vec![]
                 };
-                self.ui_state.in_game_state = InGameState::TargetSelection {
-                    unit_entity: entity,
-                    action: selected.clone(),
-                    targets,
-                    selected_index: 0,
-                };
-                self.ui_state
-                    .add_log("Select transport to load into...".to_string());
+                if targets.len() == 1 {
+                    if let Some(world) = &mut self.world {
+                        world.send_event(engine::events::LoadUnitCommand {
+                            transport_entity: targets[0],
+                            unit_entity: entity,
+                        });
+                        self.ui_state
+                            .add_log("Loading into transport...".to_string());
+                        self.ui_state.in_game_state = InGameState::Normal;
+                    }
+                } else {
+                    self.ui_state.in_game_state = InGameState::TargetSelection {
+                        unit_entity: entity,
+                        action: selected.clone(),
+                        targets,
+                        selected_index: 0,
+                    };
+                    self.ui_state
+                        .add_log("Select transport to load into...".to_string());
+                }
             }
         }
     }
@@ -765,18 +789,18 @@ impl App {
                         .add_log("No target for supply. Cancelled.".to_string());
                     self.reopen_unit_action_menu(unit_entity);
                 }
-            } else if action == "Join" {
+            } else if action == "Merge" {
                 if let Some(target) = target_unit {
                     world.send_event(engine::events::MergeUnitCommand {
                         source_entity: unit_entity,
                         target_entity: target,
                     });
                     self.ui_state
-                        .add_log(format!("Joining unit at {:?}", (cx, cy)));
+                        .add_log(format!("Merging unit at {:?}", (cx, cy)));
                     self.ui_state.in_game_state = InGameState::Normal;
                 } else {
                     self.ui_state
-                        .add_log("No target for join. Cancelled.".to_string());
+                        .add_log("No target for merge. Cancelled.".to_string());
                     self.reopen_unit_action_menu(unit_entity);
                 }
             } else if action == "Load" {
@@ -837,7 +861,11 @@ impl App {
 
             let actions =
                 engine::systems::action::get_available_actions(world, unit_entity, is_moved);
-            let mut options = vec!["Wait".to_string()];
+            let mut options = Vec::new();
+
+            if actions.can_wait {
+                options.push("Wait".to_string());
+            }
 
             if actions.can_attack {
                 options.insert(0, "Attack".to_string());
@@ -854,8 +882,8 @@ impl App {
             if actions.can_load {
                 options.push("Load".to_string());
             }
-            if actions.can_join {
-                options.push("Join".to_string());
+            if actions.can_merge {
+                options.push("Merge".to_string());
             }
 
             options.push("Cancel".to_string());

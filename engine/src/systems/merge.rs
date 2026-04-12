@@ -4,8 +4,8 @@ use crate::components::*;
 use crate::events::{MergeUnitCommand, UnitDestroyedEvent, UnitMergedEvent};
 use crate::resources::{MatchState, PendingMove, Phase};
 
-/// 指定されたユニットが現在合流（Join/Merge）可能な対象エンティティのリストを返します。
-/// 同タイプ、同勢力の隣接ユニットが対象です。
+/// 指定されたユニットが現在合流（Merge）可能な対象エンティティのリストを返します。
+/// 同タイプ、同勢力の同一座標ユニットが対象です。
 pub fn get_mergable_targets(world: &mut World, unit: Entity) -> Vec<Entity> {
     let mut targets = vec![];
     let (unit_pos, unit_stats, unit_faction) = {

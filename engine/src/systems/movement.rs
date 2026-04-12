@@ -8,6 +8,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 pub struct OccupantInfo {
     pub player_id: PlayerId,
     pub is_transport: bool,
+    pub unit_type: UnitType,
     pub loadable_types: Vec<UnitType>,
     pub free_slots: u32,
 }
@@ -153,9 +154,10 @@ pub fn calculate_reachable_tiles(
             true
         } else if let Some(occ) = unit_positions.get(&pos) {
             occ.player_id == player_id
-                && occ.is_transport
-                && occ.free_slots > 0
-                && occ.loadable_types.contains(&moving_unit_type)
+                && ((occ.is_transport
+                    && occ.free_slots > 0
+                    && occ.loadable_types.contains(&moving_unit_type))
+                    || occ.unit_type == moving_unit_type)
         } else {
             true
         }
@@ -282,8 +284,9 @@ pub fn find_path_a_star(
                     let can_load = occ.is_transport
                         && occ.free_slots > 0
                         && occ.loadable_types.contains(&moving_unit_type);
-                    if !can_load {
-                        continue; // Destination occupied by ally, not a valid transport
+                    let can_merge = occ.unit_type == moving_unit_type;
+                    if !can_load && !can_merge {
+                        continue; // Destination occupied by ally, not a valid transport or merge target
                     }
                 }
             }
@@ -323,14 +326,12 @@ pub fn find_path_a_star(
 /// 2. A*アルゴリズムを用いて、目的地までの到達可能性と消費燃料・コストを計算します。
 /// 3. 移動可能であれば、位置情報を更新し、燃料を消費します。
 /// 4. ユニットの `HasMoved` フラグを true に設定します。
-/// 5. 移動先に同じプレイヤーの輸送ユニットが待機しており、積載条件を満たしていれば `LoadUnitCommand` を発行して自動積載します。
-/// 6. 移動結果を `UnitMovedEvent` として発行します。
+/// 5. 移動結果を `UnitMovedEvent` として発行します。
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 pub fn move_unit_system(
-    mut move_events: EventReader<MoveUnitCommand>,
+    mut event_reader: EventReader<MoveUnitCommand>,
     mut moved_events: EventWriter<UnitMovedEvent>,
-    mut load_events: EventWriter<LoadUnitCommand>,
     mut q_units: Query<(
         Entity,
         &mut GridPosition,
@@ -353,7 +354,7 @@ pub fn move_unit_system(
     }
     let active_player = players.0[match_state.active_player_index.0].id;
 
-    for event in move_events.read() {
+    for event in event_reader.read() {
         let mut unit_positions = HashMap::new();
         for (e, pos, _, _, faction, stats, _, trans, cargo_opt) in q_units.iter() {
             if e != event.unit_entity && trans.is_none() {
@@ -365,14 +366,13 @@ pub fn move_unit_system(
                     OccupantInfo {
                         player_id: faction.0,
                         is_transport: stats.max_cargo > 0,
+                        unit_type: stats.unit_type,
                         loadable_types: stats.loadable_unit_types.clone(),
                         free_slots,
                     },
                 );
             }
         }
-
-        let mut load_action = None;
 
         if let Ok((
             entity,
@@ -433,36 +433,6 @@ pub fn move_unit_system(
                     from,
                     to: *pos,
                     fuel_used,
-                });
-
-                load_action = Some((
-                    entity,
-                    event.target_x,
-                    event.target_y,
-                    faction.0,
-                    stats.unit_type,
-                ));
-            }
-        }
-
-        if let Some((unit_e, tx, ty, fac_id, u_type)) = load_action {
-            let mut transport_entity = None;
-            for (e, t_pos, _, _, f_faction, s_stats, _, _, _) in q_units.iter() {
-                if e != unit_e
-                    && t_pos.x == tx
-                    && t_pos.y == ty
-                    && f_faction.0 == fac_id
-                    && s_stats.max_cargo > 0
-                    && s_stats.loadable_unit_types.contains(&u_type)
-                {
-                    transport_entity = Some(e);
-                    break;
-                }
-            }
-            if let Some(te) = transport_entity {
-                load_events.send(LoadUnitCommand {
-                    transport_entity: te,
-                    unit_entity: unit_e,
                 });
             }
         }
@@ -842,20 +812,21 @@ mod tests {
             current_phase: Phase::Main,
             ..Default::default()
         });
-        world.insert_resource(Players(vec![
-            Player::new(1, "P1".to_string()),
-            Player::new(2, "P2".to_string()),
-        ]));
-        let map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        world.insert_resource(Players(vec![Player {
+            id: PlayerId(1),
+            name: "P1".to_string(),
+            funds: 1000,
+        }]));
+        let map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
         world.insert_resource(map);
-        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
 
         let inf_stats = create_infantry_stats();
 
-        // Subject unit
+        // Subject unit (Infantry)
         let subject = world
             .spawn((
                 GridPosition { x: 0, y: 0 },
@@ -870,11 +841,13 @@ mod tests {
             ))
             .id();
 
-        // Allied unit at (1, 0)
+        // Allied unit at (1, 0) - Different type (Tank) to test blocking (cannot merge)
+        let mut tank_stats = inf_stats.clone();
+        tank_stats.unit_type = UnitType::Tank;
         world.spawn((
             GridPosition { x: 1, y: 0 },
             Faction(PlayerId(1)),
-            inf_stats.clone(),
+            tank_stats,
             Fuel {
                 current: 10,
                 max: 10,
@@ -895,7 +868,78 @@ mod tests {
         schedule.run(&mut world);
 
         let pos = world.get::<GridPosition>(subject).unwrap();
-        assert_eq!(pos.x, 0, "Should NOT be able to stop on allied unit");
+        assert_eq!(
+            pos.x, 0,
+            "Should NOT be able to stop on different type allied unit"
+        );
+        assert_eq!(pos.y, 0);
+    }
+
+    #[test]
+    fn test_merge_reachability() {
+        let mut world = World::new();
+        world.insert_resource(MatchState {
+            current_phase: Phase::Main,
+            ..Default::default()
+        });
+        world.insert_resource(Players(vec![Player {
+            id: PlayerId(1),
+            name: "P1".to_string(),
+            funds: 1000,
+        }]));
+        let map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
+        world.insert_resource(map);
+        world.insert_resource(Events::<MoveUnitCommand>::default());
+        world.insert_resource(Events::<UnitMovedEvent>::default());
+        world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
+
+        let inf_stats = create_infantry_stats();
+
+        let subject = world
+            .spawn((
+                GridPosition { x: 0, y: 0 },
+                Faction(PlayerId(1)),
+                Fuel {
+                    current: 50,
+                    max: 99,
+                },
+                inf_stats.clone(),
+                HasMoved(false),
+                ActionCompleted(false),
+            ))
+            .id();
+
+        // Same type allied unit at (1, 0) - Should allow merge movement
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Faction(PlayerId(1)),
+            inf_stats.clone(),
+            Fuel {
+                current: 10,
+                max: 10,
+            },
+            HasMoved(false),
+            ActionCompleted(false),
+        ));
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(move_unit_system);
+
+        // Try to move to (1, 0) for merge
+        world.send_event(MoveUnitCommand {
+            unit_entity: subject,
+            target_x: 1,
+            target_y: 0,
+        });
+
+        schedule.run(&mut world);
+
+        let pos = world.get::<GridPosition>(subject).unwrap();
+        assert_eq!(
+            pos.x, 1,
+            "Should be able to move onto allied unit for merging"
+        );
         assert_eq!(pos.y, 0);
     }
 
