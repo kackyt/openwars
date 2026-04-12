@@ -45,7 +45,6 @@ pub fn get_available_actions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::*;
     use crate::resources::*;
 
     #[test]
@@ -79,7 +78,7 @@ mod tests {
         let player_id = PlayerId(1);
 
         // 輸送ユニット設置 (SupplyTruck)
-        let apc = world
+        let _ = world
             .spawn((
                 GridPosition { x: 1, y: 1 },
                 Faction(player_id),
