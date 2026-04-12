@@ -744,18 +744,27 @@ impl App {
     }
 
     fn handle_target_selection_confirm(&mut self, unit_entity: Entity, action: String) {
-        let cx = self.ui_state.cursor_pos.0;
-        let cy = self.ui_state.cursor_pos.1;
-
-        if let Some(world) = &mut self.world {
-            let mut target_unit = None;
-            let mut q = world.query_filtered::<(Entity, &engine::components::GridPosition), With<engine::components::Faction>>();
-            for (e, pos) in q.iter(world) {
-                if pos.x == cx && pos.y == cy && e != unit_entity {
-                    target_unit = Some(e);
-                }
+        let (target_unit, cx, cy) = if let InGameState::TargetSelection {
+            targets,
+            selected_index,
+            ..
+        } = &self.ui_state.in_game_state
+        {
+            let target = targets[*selected_index];
+            // 座標はログ表示用に取得
+            let mut pos = (0, 0);
+            if let Some(world) = &self.world
+                && let Some(gp) = world.get::<engine::components::GridPosition>(target)
+            {
+                pos = (gp.x, gp.y);
             }
 
+            (Some(target), pos.0, pos.1)
+        } else {
+            (None, 0, 0)
+        };
+
+        if let Some(world) = &mut self.world {
             if action == "Attack" {
                 if let Some(target) = target_unit {
                     match engine::systems::combat::can_attack(unit_entity, target, world) {

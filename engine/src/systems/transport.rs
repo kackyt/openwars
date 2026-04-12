@@ -229,9 +229,12 @@ pub fn unload_unit_system(
         &mut ActionCompleted,
         Option<&mut CargoCapacity>,
         Option<&Transporting>,
+        &UnitStats,
     )>,
     match_state: Res<MatchState>,
     players: Res<Players>,
+    map: Res<Map>,
+    master_data: Res<MasterDataRegistry>,
 ) {
     if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
@@ -240,7 +243,7 @@ pub fn unload_unit_system(
 
     for event in unload_events.read() {
         let (trans_pos, trans_faction, trans_action) = match q_units.get(event.transport_entity) {
-            Ok((_, p, f, a, _, _)) => (*p, f.0, a.0),
+            Ok((_, p, f, a, _, _, _)) => (*p, f.0, a.0),
             _ => continue,
         };
 
@@ -248,10 +251,11 @@ pub fn unload_unit_system(
             continue;
         }
 
-        let (_cargo_faction, cargo_action, cargo_trans) = match q_units.get(event.cargo_entity) {
-            Ok((_, _, f, a, _, t)) => (f.0, a.0, t.map(|x| x.0)),
-            _ => continue,
-        };
+        let (_cargo_faction, cargo_action, cargo_trans, cargo_stats) =
+            match q_units.get(event.cargo_entity) {
+                Ok((_, _, f, a, _, t, s)) => (f.0, a.0, t.map(|x| x.0), s),
+                _ => continue,
+            };
 
         if cargo_trans != Some(event.transport_entity) {
             continue;
@@ -267,9 +271,25 @@ pub fn unload_unit_system(
             continue;
         }
 
+        // Check terrain passability for the cargo
+        let terrain = if let Some(t) = map.get_terrain(event.target_x, event.target_y) {
+            t
+        } else {
+            continue;
+        };
+        if crate::systems::movement::get_valid_movement_cost(
+            &master_data,
+            cargo_stats.movement_type,
+            terrain,
+        )
+        .is_none()
+        {
+            continue;
+        }
+
         // Check if target is occupied
         let mut occupied = false;
-        for (_, p, _, _, _, t) in q_units.iter() {
+        for (_, p, _, _, _, t, _) in q_units.iter() {
             if p.x == event.target_x && p.y == event.target_y && t.is_none() {
                 occupied = true;
                 break;
@@ -315,6 +335,17 @@ mod tests {
 
         world.insert_resource(Events::<LoadUnitCommand>::default());
         world.insert_resource(Events::<UnloadUnitCommand>::default());
+
+        // Insert Map and MasterDataRegistry for terrain checks
+        let mut map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
+        for x in 0..10 {
+            for y in 0..10 {
+                let _ = map.set_terrain(x, y, Terrain::Plains);
+            }
+        }
+
+        world.insert_resource(map);
+        world.insert_resource(MasterDataRegistry::load().unwrap());
 
         let transport_entity = world
             .spawn((

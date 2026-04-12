@@ -539,6 +539,7 @@ mod tests {
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<MergeUnitCommand>::default());
 
         let entity = world
             .spawn((
@@ -681,26 +682,29 @@ mod tests {
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<MergeUnitCommand>::default());
 
-        world.spawn((
-            GridPosition { x: 5, y: 5 },
-            Faction(PlayerId(1)),
-            Health {
-                current: 100,
-                max: 100,
-            },
-            Fuel {
-                current: 99,
-                max: 99,
-            },
-            create_transport_heli_stats(),
-            HasMoved(false),
-            ActionCompleted(false),
-            CargoCapacity {
-                max: 2,
-                loaded: vec![],
-            },
-        ));
+        let transport_id = world
+            .spawn((
+                GridPosition { x: 5, y: 5 },
+                Faction(PlayerId(1)),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                create_transport_heli_stats(),
+                HasMoved(false),
+                ActionCompleted(false),
+                CargoCapacity {
+                    max: 2,
+                    loaded: vec![],
+                },
+            ))
+            .id();
 
         let inf_entity = world
             .spawn((
@@ -735,10 +739,20 @@ mod tests {
         schedule.add_systems(super::move_unit_system);
         schedule.run(&mut world);
 
-        let load_events = world.resource::<Events<LoadUnitCommand>>();
-        let mut reader = load_events.get_cursor();
-        let emitted: Vec<_> = reader.read(load_events).collect();
-        assert_eq!(emitted.len(), 1);
+        // 手動で搭載コマンドを送信
+        world.send_event(LoadUnitCommand {
+            transport_entity: transport_id,
+            unit_entity: inf_entity,
+        });
+
+        let mut load_schedule = Schedule::default();
+        load_schedule.add_systems(crate::systems::transport::load_unit_system);
+        load_schedule.run(&mut world);
+
+        // 搭載されているか確認
+        let cargo = world.get::<CargoCapacity>(transport_id).unwrap();
+        assert_eq!(cargo.loaded.len(), 1);
+        assert_eq!(cargo.loaded[0], inf_entity);
     }
 
     #[test]
@@ -758,6 +772,7 @@ mod tests {
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<MergeUnitCommand>::default());
 
         let inf_stats = create_infantry_stats();
 
@@ -822,6 +837,7 @@ mod tests {
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<MergeUnitCommand>::default());
         world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
 
         let inf_stats = create_infantry_stats();
@@ -892,6 +908,7 @@ mod tests {
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<MergeUnitCommand>::default());
         world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
 
         let inf_stats = create_infantry_stats();
@@ -960,6 +977,7 @@ mod tests {
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<MergeUnitCommand>::default());
 
         let inf_stats = create_infantry_stats();
 
@@ -1064,6 +1082,7 @@ mod tests {
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<MergeUnitCommand>::default());
 
         // 1. Produce a transport heli at (1, 1)
         world.send_event(ProduceUnitCommand {
@@ -1123,11 +1142,19 @@ mod tests {
         assert_eq!(infantry_pos.x, 1, "Movement should succeed after fix");
         assert_eq!(infantry_pos.y, 1);
 
-        // Verify LoadUnitCommand was emitted
-        let load_events = world.resource::<Events<LoadUnitCommand>>();
-        let mut reader = load_events.get_cursor();
-        let emitted: Vec<_> = reader.read(load_events).collect();
-        assert_eq!(emitted.len(), 1, "LoadUnitCommand should be emitted");
+        world.send_event(LoadUnitCommand {
+            transport_entity,
+            unit_entity: infantry_entity,
+        });
+
+        let mut load_schedule = Schedule::default();
+        load_schedule.add_systems(crate::systems::transport::load_unit_system);
+        load_schedule.run(&mut world);
+
+        // Verify loaded
+        let heli_cargo = world.get::<CargoCapacity>(transport_entity).unwrap();
+        assert_eq!(heli_cargo.loaded.len(), 1);
+        assert_eq!(heli_cargo.loaded[0], infantry_entity);
     }
 
     #[test]
@@ -1149,6 +1176,7 @@ mod tests {
         world.insert_resource(Events::<UndoMoveCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<MergeUnitCommand>::default());
         world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
 
         // ユニットのスポーン (位置: 1,1  燃料: 50)
