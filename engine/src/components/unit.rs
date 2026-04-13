@@ -45,6 +45,8 @@ pub struct UnitStats {
     pub can_supply: bool,
     pub max_cargo: u32,
     pub loadable_unit_types: Vec<crate::resources::UnitType>,
+    pub weapon1_name: Option<String>,
+    pub weapon2_name: Option<String>,
 }
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]

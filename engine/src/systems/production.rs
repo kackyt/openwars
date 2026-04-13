@@ -299,6 +299,7 @@ mod tests {
             can_supply: false,
             max_cargo: 0,
             loadable_unit_types: vec![],
+            ..Default::default()
         };
 
         let mut registry = UnitRegistry(std::collections::HashMap::new());

@@ -190,7 +190,7 @@ where
                         let d_after_disp = (ev.defender_hp_after.saturating_add(9)) / 10;
 
                         let text = format!(
-                            "Combat Result\nAttacker HP: {} -> {}\nDefender HP: {} -> {}",
+                            "戦闘結果\n攻撃側 HP: {} -> {}\n防御側 HP: {} -> {}",
                             a_before_disp, a_after_disp, d_before_disp, d_after_disp
                         );
                         popup_msg = Some(text);
@@ -204,7 +204,7 @@ where
                     for ev in phase_events.drain() {
                         if ev.new_phase == engine::resources::Phase::Main {
                             phase_popup = Some(format!(
-                                "Player {}'s Turn\n\nPress Space to continue...",
+                                "プレイヤー {} のターン\n\nSpaceキーで開始...",
                                 ev.active_player.0
                             ));
                         }

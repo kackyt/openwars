@@ -480,6 +480,7 @@ mod tests {
             can_supply: false,
             max_cargo: 0,
             loadable_unit_types: vec![],
+            ..Default::default()
         }
     }
 
@@ -499,6 +500,7 @@ mod tests {
             can_supply: false,
             max_cargo: 0,
             loadable_unit_types: vec![],
+            ..Default::default()
         }
     }
 
@@ -518,6 +520,7 @@ mod tests {
             can_supply: false,
             max_cargo: 2,
             loadable_unit_types: vec![UnitType::Infantry],
+            ..Default::default()
         }
     }
 
