@@ -30,7 +30,7 @@ pub enum InGameState {
     TargetSelection {
         unit_entity: Entity,
         action: String,
-        targets: Vec<(usize, usize)>,
+        targets: Vec<Entity>,
         selected_index: usize,
     },
     CargoSelection {
@@ -43,6 +43,9 @@ pub enum InGameState {
         cargo_entity: Entity,
         targets: Vec<(usize, usize)>,
         selected_index: usize,
+    },
+    WaitActionMenu {
+        unit_entity: Entity,
     },
     EventPopup {
         message: String,
@@ -164,7 +167,52 @@ impl App {
             | KeyCode::Right
             | KeyCode::Char('l') => self.handle_navigation_key(key.code),
             KeyCode::Char(' ') | KeyCode::Enter => self.handle_action_key(),
+            KeyCode::Char('x') => self.handle_cancel_key(),
             _ => {}
+        }
+    }
+
+    fn handle_cancel_key(&mut self) {
+        match self.ui_state.in_game_state.clone() {
+            InGameState::UnitSelected { .. } => {
+                self.ui_state.in_game_state = InGameState::Normal;
+            }
+            InGameState::ActionMenu { unit_entity, .. } => {
+                if let Some(_ue) = unit_entity {
+                    // 移動の取り消し
+                    if let Some(world) = &mut self.world {
+                        world.send_event(engine::events::UndoMoveCommand);
+                    }
+                }
+                self.ui_state.in_game_state = InGameState::Normal;
+            }
+            InGameState::ProductionMenu { .. } => {
+                self.ui_state.in_game_state = InGameState::Normal;
+            }
+            InGameState::TargetSelection { unit_entity, .. } => {
+                // アクション選択メニューに戻る
+                self.reopen_unit_action_menu(unit_entity);
+            }
+            InGameState::CargoSelection { .. } => {
+                self.ui_state.in_game_state = InGameState::Normal;
+            }
+            InGameState::DropTargetSelection {
+                transport_entity, ..
+            } => {
+                // 乗降選択またはアクションメニューに戻るのが理想だが
+                // 簡易化のためアクションメニューに戻す
+                self.reopen_unit_action_menu(transport_entity);
+            }
+            InGameState::WaitActionMenu { unit_entity: _ } => {
+                if let Some(world) = &mut self.world {
+                    world.send_event(engine::events::UndoMoveCommand);
+                }
+                self.ui_state.in_game_state = InGameState::Normal;
+            }
+            InGameState::EventPopup { .. } => {
+                self.ui_state.in_game_state = InGameState::Normal;
+            }
+            InGameState::Normal => {}
         }
     }
 
@@ -179,7 +227,7 @@ impl App {
                         *selected_index -= 1;
                     }
                 }
-                InGameState::EventPopup { .. } => {}
+                InGameState::EventPopup { .. } | InGameState::WaitActionMenu { .. } => {}
                 _ => {
                     if self.ui_state.cursor_pos.1 > 0 {
                         self.ui_state.cursor_pos.1 -= 1;
@@ -210,7 +258,7 @@ impl App {
                         *selected_index += 1;
                     }
                 }
-                InGameState::EventPopup { .. } => {}
+                InGameState::EventPopup { .. } | InGameState::WaitActionMenu { .. } => {}
                 _ => {
                     if let Some(world) = &self.world
                         && let Some(map) = world.get_resource::<engine::resources::Map>()
@@ -220,32 +268,33 @@ impl App {
                     }
                 }
             },
-            KeyCode::Left | KeyCode::Char('h') => {
-                if !matches!(
-                    self.ui_state.in_game_state,
-                    InGameState::ActionMenu { .. }
-                        | InGameState::ProductionMenu { .. }
-                        | InGameState::CargoSelection { .. }
-                        | InGameState::EventPopup { .. }
-                ) && self.ui_state.cursor_pos.0 > 0
-                {
-                    self.ui_state.cursor_pos.0 -= 1;
+            KeyCode::Left | KeyCode::Char('h') => match &mut self.ui_state.in_game_state {
+                InGameState::ActionMenu { .. }
+                | InGameState::ProductionMenu { .. }
+                | InGameState::CargoSelection { .. }
+                | InGameState::WaitActionMenu { .. }
+                | InGameState::EventPopup { .. } => {}
+                _ => {
+                    if self.ui_state.cursor_pos.0 > 0 {
+                        self.ui_state.cursor_pos.0 -= 1;
+                    }
                 }
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                if !matches!(
-                    self.ui_state.in_game_state,
-                    InGameState::ActionMenu { .. }
-                        | InGameState::ProductionMenu { .. }
-                        | InGameState::CargoSelection { .. }
-                        | InGameState::EventPopup { .. }
-                ) && let Some(world) = &self.world
-                    && let Some(map) = world.get_resource::<engine::resources::Map>()
-                    && self.ui_state.cursor_pos.0 < map.width.saturating_sub(1)
-                {
-                    self.ui_state.cursor_pos.0 += 1;
+            },
+            KeyCode::Right | KeyCode::Char('l') => match &mut self.ui_state.in_game_state {
+                InGameState::ActionMenu { .. }
+                | InGameState::ProductionMenu { .. }
+                | InGameState::CargoSelection { .. }
+                | InGameState::WaitActionMenu { .. }
+                | InGameState::EventPopup { .. } => {}
+                _ => {
+                    if let Some(world) = &self.world
+                        && let Some(map) = world.get_resource::<engine::resources::Map>()
+                        && self.ui_state.cursor_pos.0 < map.width.saturating_sub(1)
+                    {
+                        self.ui_state.cursor_pos.0 += 1;
+                    }
                 }
-            }
+            },
             _ => {}
         }
     }
@@ -280,20 +329,38 @@ impl App {
                 selected_index,
             } => {
                 let passenger = passengers[selected_index];
-                self.ui_state.in_game_state = InGameState::DropTargetSelection {
-                    transport_entity,
-                    cargo_entity: passenger,
-                    targets: vec![],
-                    selected_index: 0,
-                };
-                self.ui_state
-                    .add_log("Select target tile to drop...".to_string());
+                let mut targets = vec![];
+                if let Some(world) = &mut self.world {
+                    targets = engine::systems::transport::get_droppable_tiles(
+                        world,
+                        transport_entity,
+                        passenger,
+                    );
+                }
+
+                if targets.is_empty() {
+                    self.ui_state.add_log("No valid tiles to drop.".to_string());
+                    // アクションメニューに戻すのが丁寧だが、簡略化のため Normal に戻す
+                    self.ui_state.in_game_state = InGameState::Normal;
+                } else {
+                    // 最初の有効な降車先にカーソルを移動
+                    self.ui_state.cursor_pos = targets[0];
+                    self.ui_state.in_game_state = InGameState::DropTargetSelection {
+                        transport_entity,
+                        cargo_entity: passenger,
+                        targets,
+                        selected_index: 0,
+                    };
+                    self.ui_state
+                        .add_log("Select target tile to drop...".to_string());
+                }
             }
             InGameState::DropTargetSelection {
                 transport_entity,
                 cargo_entity,
                 ..
             } => self.handle_drop_target_confirm(transport_entity, cargo_entity),
+            InGameState::WaitActionMenu { .. } => {}
             InGameState::EventPopup { .. } => {
                 self.ui_state.in_game_state = InGameState::Normal;
             }
@@ -365,6 +432,7 @@ impl App {
                             engine::systems::movement::OccupantInfo {
                                 player_id: f.0,
                                 is_transport: s.max_cargo > 0,
+                                unit_type: s.unit_type,
                                 loadable_types: s.loadable_unit_types.clone(),
                                 free_slots,
                             },
@@ -450,6 +518,12 @@ impl App {
     ) {
         let selected = &options[selected_index];
         if selected == "Cancel" {
+            if let Some(_ue) = unit_entity {
+                // 移動の取り消し
+                if let Some(world) = &mut self.world {
+                    world.send_event(engine::events::UndoMoveCommand);
+                }
+            }
             self.ui_state.in_game_state = InGameState::Normal;
         } else if selected == "End Turn" {
             self.ui_state.in_game_state = InGameState::Normal;
@@ -505,6 +579,19 @@ impl App {
                 selected_index: 0,
             };
         } else if let Some(entity) = unit_entity {
+            let is_moved = if let Some(world) = &mut self.world {
+                let mut moved = false;
+                if let Some(pm) = world.get_resource::<engine::resources::PendingMove>()
+                    && pm.unit_entity == entity
+                    && let Some(pos) = world.get::<engine::components::GridPosition>(entity)
+                {
+                    moved = pos.x != pm.original_pos.x || pos.y != pm.original_pos.y;
+                }
+                moved
+            } else {
+                false
+            };
+
             if selected == "Wait" {
                 if let Some(world) = &mut self.world {
                     world.send_event(engine::events::WaitUnitCommand {
@@ -522,10 +609,15 @@ impl App {
                 self.ui_state.in_game_state = InGameState::Normal;
                 self.ui_state.add_log("Capture initiated.".to_string());
             } else if selected == "Attack" {
+                let targets = if let Some(world) = &mut self.world {
+                    engine::systems::combat::get_attackable_targets(world, entity, !is_moved)
+                } else {
+                    vec![]
+                };
                 self.ui_state.in_game_state = InGameState::TargetSelection {
                     unit_entity: entity,
                     action: "Attack".to_string(),
-                    targets: vec![],
+                    targets,
                     selected_index: 0,
                 };
                 self.ui_state
@@ -547,15 +639,71 @@ impl App {
                         selected_index: 0,
                     };
                 }
-            } else if selected == "Supply" || selected == "Join" || selected == "Load" {
+            } else if selected == "Supply" {
+                let targets = if let Some(world) = &mut self.world {
+                    engine::systems::supply::get_suppliable_targets(world, entity)
+                } else {
+                    vec![]
+                };
                 self.ui_state.in_game_state = InGameState::TargetSelection {
                     unit_entity: entity,
                     action: selected.clone(),
-                    targets: vec![],
+                    targets,
                     selected_index: 0,
                 };
                 self.ui_state
-                    .add_log(format!("Select target/tile for {}...", selected));
+                    .add_log("Select target to supply...".to_string());
+            } else if selected == "Merge" {
+                let targets = if let Some(world) = &mut self.world {
+                    engine::systems::merge::get_mergable_targets(world, entity)
+                } else {
+                    vec![]
+                };
+                if targets.len() == 1 {
+                    if let Some(world) = &mut self.world {
+                        world.send_event(engine::events::MergeUnitCommand {
+                            source_entity: entity,
+                            target_entity: targets[0],
+                        });
+                        self.ui_state.add_log("Merging unit...".to_string());
+                        self.ui_state.in_game_state = InGameState::Normal;
+                    }
+                } else {
+                    self.ui_state.in_game_state = InGameState::TargetSelection {
+                        unit_entity: entity,
+                        action: selected.clone(),
+                        targets,
+                        selected_index: 0,
+                    };
+                    self.ui_state
+                        .add_log("Select unit to merge with...".to_string());
+                }
+            } else if selected == "Load" {
+                let targets = if let Some(world) = &mut self.world {
+                    engine::systems::transport::get_loadable_transports(world, entity)
+                } else {
+                    vec![]
+                };
+                if targets.len() == 1 {
+                    if let Some(world) = &mut self.world {
+                        world.send_event(engine::events::LoadUnitCommand {
+                            transport_entity: targets[0],
+                            unit_entity: entity,
+                        });
+                        self.ui_state
+                            .add_log("Loading into transport...".to_string());
+                        self.ui_state.in_game_state = InGameState::Normal;
+                    }
+                } else {
+                    self.ui_state.in_game_state = InGameState::TargetSelection {
+                        unit_entity: entity,
+                        action: selected.clone(),
+                        targets,
+                        selected_index: 0,
+                    };
+                    self.ui_state
+                        .add_log("Select transport to load into...".to_string());
+                }
             }
         }
     }
@@ -599,18 +747,27 @@ impl App {
     }
 
     fn handle_target_selection_confirm(&mut self, unit_entity: Entity, action: String) {
-        let cx = self.ui_state.cursor_pos.0;
-        let cy = self.ui_state.cursor_pos.1;
-
-        if let Some(world) = &mut self.world {
-            let mut target_unit = None;
-            let mut q = world.query_filtered::<(Entity, &engine::components::GridPosition), With<engine::components::Faction>>();
-            for (e, pos) in q.iter(world) {
-                if pos.x == cx && pos.y == cy && e != unit_entity {
-                    target_unit = Some(e);
-                }
+        let (target_unit, cx, cy) = if let InGameState::TargetSelection {
+            targets,
+            selected_index,
+            ..
+        } = &self.ui_state.in_game_state
+        {
+            let target = targets[*selected_index];
+            // 座標はログ表示用に取得
+            let mut pos = (0, 0);
+            if let Some(world) = &self.world
+                && let Some(gp) = world.get::<engine::components::GridPosition>(target)
+            {
+                pos = (gp.x, gp.y);
             }
 
+            (Some(target), pos.0, pos.1)
+        } else {
+            (None, 0, 0)
+        };
+
+        if let Some(world) = &mut self.world {
             if action == "Attack" {
                 if let Some(target) = target_unit {
                     match engine::systems::combat::can_attack(unit_entity, target, world) {
@@ -621,14 +778,17 @@ impl App {
                             });
                             self.ui_state
                                 .add_log(format!("Attacking target at {:?}", (cx, cy)));
+                            self.ui_state.in_game_state = InGameState::Normal;
                         }
                         Err(e) => {
                             self.ui_state.add_log(format!("Attack cancelled: {}", e));
+                            self.reopen_unit_action_menu(unit_entity);
                         }
                     }
                 } else {
                     self.ui_state
                         .add_log("No target there. Cancelled.".to_string());
+                    self.reopen_unit_action_menu(unit_entity);
                 }
             } else if action == "Supply" {
                 if let Some(target) = target_unit {
@@ -638,21 +798,25 @@ impl App {
                     });
                     self.ui_state
                         .add_log(format!("Supplying unit at {:?}", (cx, cy)));
+                    self.ui_state.in_game_state = InGameState::Normal;
                 } else {
                     self.ui_state
-                        .add_log("No logic for supply. Cancelled.".to_string());
+                        .add_log("No target for supply. Cancelled.".to_string());
+                    self.reopen_unit_action_menu(unit_entity);
                 }
-            } else if action == "Join" {
+            } else if action == "Merge" {
                 if let Some(target) = target_unit {
                     world.send_event(engine::events::MergeUnitCommand {
                         source_entity: unit_entity,
                         target_entity: target,
                     });
                     self.ui_state
-                        .add_log(format!("Joining unit at {:?}", (cx, cy)));
+                        .add_log(format!("Merging unit at {:?}", (cx, cy)));
+                    self.ui_state.in_game_state = InGameState::Normal;
                 } else {
                     self.ui_state
-                        .add_log("No logic for join. Cancelled.".to_string());
+                        .add_log("No target for merge. Cancelled.".to_string());
+                    self.reopen_unit_action_menu(unit_entity);
                 }
             } else if action == "Load" {
                 if let Some(target) = target_unit {
@@ -662,13 +826,14 @@ impl App {
                     });
                     self.ui_state
                         .add_log(format!("Loading into transport at {:?}", (cx, cy)));
+                    self.ui_state.in_game_state = InGameState::Normal;
                 } else {
                     self.ui_state
                         .add_log("No transport at target. Cancelled.".to_string());
+                    self.reopen_unit_action_menu(unit_entity);
                 }
             }
         }
-        self.ui_state.in_game_state = InGameState::Normal;
     }
 
     fn handle_unit_selected_confirm(
@@ -692,93 +857,59 @@ impl App {
                     target_y: cy,
                 });
 
-                // --- アクションメニューの動的生成 ---
-                let mut options = vec!["Wait".to_string()];
-
-                if let Ok((stats, faction)) = world
-                    .query::<(&engine::components::UnitStats, &engine::components::Faction)>()
-                    .get(world, unit_entity)
-                {
-                    // 借用エラー回避のため必要な情報を取得
-                    let stats_can_capture = stats.can_capture;
-                    let stats_can_supply = stats.can_supply;
-                    let stats_max_cargo = stats.max_cargo;
-                    let stats_min_range = stats.min_range;
-                    let stats_max_range = stats.max_range;
-                    let unit_faction = faction.0;
-
-                    // 攻撃可能か判定
-                    let mut can_atk = false;
-                    let mut q_targets =
-                        world.query_filtered::<(Entity, &engine::components::GridPosition), With<engine::components::Faction>>();
-                    for (target_ent, target_pos) in q_targets.iter(world) {
-                        if target_ent != unit_entity {
-                            let dist = (cx as i64 - target_pos.x as i64).unsigned_abs() as u32
-                                + (cy as i64 - target_pos.y as i64).unsigned_abs() as u32;
-                            if dist >= stats_min_range && dist <= stats_max_range {
-                                // 間接攻撃ユニットは、移動したターンには攻撃できない(仕様)
-                                if stats_min_range > 1 && (cx, cy) != _start_pos {
-                                    continue;
-                                }
-                                can_atk = true;
-                                break;
-                            }
-                        }
-                    }
-                    if can_atk {
-                        options.insert(0, "Attack".to_string());
-                    }
-
-                    if stats_can_capture {
-                        // 現在地が占領可能な施設か判定
-                        let mut q_prop = world.query::<(
-                            &engine::components::GridPosition,
-                            &engine::components::Property,
-                        )>();
-                        for (p_pos, p_prop) in q_prop.iter(world) {
-                            if p_pos.x == cx && p_pos.y == cy {
-                                // 自軍の拠点以外なら占領可能
-                                if p_prop.owner_id != Some(unit_faction) {
-                                    options.push("Capture".to_string());
-                                }
-                            }
-                        }
-                    }
-
-                    if stats_can_supply {
-                        options.push("Supply".to_string());
-                    }
-
-                    if stats_max_cargo > 0 {
-                        let mut has_passengers = false;
-                        if let Ok(cargo) = world
-                            .query::<&engine::components::CargoCapacity>()
-                            .get(world, unit_entity)
-                        {
-                            has_passengers = !cargo.loaded.is_empty();
-                        }
-                        if has_passengers {
-                            options.push("Drop".to_string());
-                        }
-                        options.push("Load".to_string());
-                    }
-
-                    options.push("Join".to_string());
-                }
-
-                options.push("Cancel".to_string());
-
-                self.ui_state.in_game_state = InGameState::ActionMenu {
-                    unit_entity: Some(unit_entity),
-                    options,
-                    selected_index: 0,
-                };
+                self.ui_state.in_game_state = InGameState::WaitActionMenu { unit_entity };
             }
             self.ui_state
                 .add_log(format!("Moved unit to {:?}", (cx, cy)));
         }
     }
 
+    pub fn reopen_unit_action_menu(&mut self, unit_entity: Entity) {
+        if let Some(world) = &mut self.world {
+            let mut is_moved = false;
+            if let Some(pm) = world.get_resource::<engine::resources::PendingMove>()
+                && pm.unit_entity == unit_entity
+                && let Some(pos) = world.get::<engine::components::GridPosition>(unit_entity)
+            {
+                is_moved = pos.x != pm.original_pos.x || pos.y != pm.original_pos.y;
+            }
+
+            let actions =
+                engine::systems::action::get_available_actions(world, unit_entity, is_moved);
+            let mut options = Vec::new();
+
+            if actions.can_wait {
+                options.push("Wait".to_string());
+            }
+
+            if actions.can_attack {
+                options.insert(0, "Attack".to_string());
+            }
+            if actions.can_capture {
+                options.push("Capture".to_string());
+            }
+            if actions.can_supply {
+                options.push("Supply".to_string());
+            }
+            if actions.can_drop {
+                options.push("Drop".to_string());
+            }
+            if actions.can_load {
+                options.push("Load".to_string());
+            }
+            if actions.can_merge {
+                options.push("Merge".to_string());
+            }
+
+            options.push("Cancel".to_string());
+
+            self.ui_state.in_game_state = InGameState::ActionMenu {
+                unit_entity: Some(unit_entity),
+                options,
+                selected_index: 0,
+            };
+        }
+    }
     fn handle_drop_target_confirm(&mut self, transport_entity: Entity, cargo_entity: Entity) {
         let cx = self.ui_state.cursor_pos.0;
         let cy = self.ui_state.cursor_pos.1;
@@ -828,6 +959,7 @@ impl App {
         world.init_resource::<Events<PropertyCapturedEvent>>();
         world.init_resource::<Events<GamePhaseChangedEvent>>();
         world.init_resource::<Events<GameOverEvent>>();
+        world.init_resource::<Events<UndoMoveCommand>>();
 
         // Add event clearing systems
         // Intentionally skipping manual event clearance (update_system) to avoid Bevy version disparities.
@@ -847,6 +979,7 @@ impl App {
                 load_unit_system,
                 unload_unit_system,
                 wait_unit_system,
+                undo_move_system,
                 next_phase_system,
             )
                 .chain(),

@@ -2,7 +2,35 @@ use bevy_ecs::prelude::*;
 
 use crate::components::*;
 use crate::events::{MergeUnitCommand, UnitDestroyedEvent, UnitMergedEvent};
-use crate::resources::{MatchState, Phase};
+use crate::resources::{MatchState, PendingMove, Phase};
+
+/// 指定されたユニットが現在合流（Merge）可能な対象エンティティのリストを返します。
+/// 同タイプ、同勢力の同一座標ユニットが対象です。
+pub fn get_mergable_targets(world: &mut World, unit: Entity) -> Vec<Entity> {
+    let mut targets = vec![];
+    let (unit_pos, unit_stats, unit_faction) = {
+        let mut q_unit = world.query::<(&GridPosition, &UnitStats, &Faction)>();
+        let Ok((pos, stats, faction)) = q_unit.get(world, unit) else {
+            return targets;
+        };
+        (*pos, stats.clone(), faction.0)
+    };
+
+    let mut q_targets =
+        world.query_filtered::<(Entity, &GridPosition, &Faction, &UnitStats), With<Faction>>();
+    for (t_ent, t_pos, t_faction, t_stats) in q_targets.iter(world) {
+        if t_ent != unit
+            && t_faction.0 == unit_faction
+            && t_stats.unit_type == unit_stats.unit_type
+            && unit_pos.x == t_pos.x
+            && unit_pos.y == t_pos.y
+        {
+            targets.push(t_ent);
+        }
+    }
+
+    targets
+}
 
 #[allow(clippy::type_complexity)]
 pub fn merge_unit_system(
@@ -84,6 +112,9 @@ pub fn merge_unit_system(
             });
 
             destroyed_events.send(UnitDestroyedEvent { entity: s_entity });
+
+            // 合流確定時に移動履歴を削除
+            commands.remove_resource::<PendingMove>();
         }
     }
 }

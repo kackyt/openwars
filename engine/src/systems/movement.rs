@@ -8,6 +8,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 pub struct OccupantInfo {
     pub player_id: PlayerId,
     pub is_transport: bool,
+    pub unit_type: UnitType,
     pub loadable_types: Vec<UnitType>,
     pub free_slots: u32,
 }
@@ -153,9 +154,10 @@ pub fn calculate_reachable_tiles(
             true
         } else if let Some(occ) = unit_positions.get(&pos) {
             occ.player_id == player_id
-                && occ.is_transport
-                && occ.free_slots > 0
-                && occ.loadable_types.contains(&moving_unit_type)
+                && ((occ.is_transport
+                    && occ.free_slots > 0
+                    && occ.loadable_types.contains(&moving_unit_type))
+                    || occ.unit_type == moving_unit_type)
         } else {
             true
         }
@@ -282,8 +284,9 @@ pub fn find_path_a_star(
                     let can_load = occ.is_transport
                         && occ.free_slots > 0
                         && occ.loadable_types.contains(&moving_unit_type);
-                    if !can_load {
-                        continue; // Destination occupied by ally, not a valid transport
+                    let can_merge = occ.unit_type == moving_unit_type;
+                    if !can_load && !can_merge {
+                        continue; // Destination occupied by ally, not a valid transport or merge target
                     }
                 }
             }
@@ -323,14 +326,12 @@ pub fn find_path_a_star(
 /// 2. A*アルゴリズムを用いて、目的地までの到達可能性と消費燃料・コストを計算します。
 /// 3. 移動可能であれば、位置情報を更新し、燃料を消費します。
 /// 4. ユニットの `HasMoved` フラグを true に設定します。
-/// 5. 移動先に同じプレイヤーの輸送ユニットが待機しており、積載条件を満たしていれば `LoadUnitCommand` を発行して自動積載します。
-/// 6. 移動結果を `UnitMovedEvent` として発行します。
+/// 5. 移動結果を `UnitMovedEvent` として発行します。
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 pub fn move_unit_system(
-    mut move_events: EventReader<MoveUnitCommand>,
+    mut event_reader: EventReader<MoveUnitCommand>,
     mut moved_events: EventWriter<UnitMovedEvent>,
-    mut load_events: EventWriter<LoadUnitCommand>,
     mut q_units: Query<(
         Entity,
         &mut GridPosition,
@@ -346,13 +347,14 @@ pub fn move_unit_system(
     players: Res<Players>,
     match_state: Res<MatchState>,
     master_data: Res<crate::resources::master_data::MasterDataRegistry>,
+    mut commands: Commands,
 ) {
     if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
     }
     let active_player = players.0[match_state.active_player_index.0].id;
 
-    for event in move_events.read() {
+    for event in event_reader.read() {
         let mut unit_positions = HashMap::new();
         for (e, pos, _, _, faction, stats, _, trans, cargo_opt) in q_units.iter() {
             if e != event.unit_entity && trans.is_none() {
@@ -364,14 +366,13 @@ pub fn move_unit_system(
                     OccupantInfo {
                         player_id: faction.0,
                         is_transport: stats.max_cargo > 0,
+                        unit_type: stats.unit_type,
                         loadable_types: stats.loadable_unit_types.clone(),
                         free_slots,
                     },
                 );
             }
         }
-
-        let mut load_action = None;
 
         if let Ok((
             entity,
@@ -410,8 +411,21 @@ pub fn move_unit_system(
                 let from = *pos;
                 pos.x = event.target_x;
                 pos.y = event.target_y;
+                let old_fuel = fuel.current;
                 fuel.current = fuel.current.saturating_sub(fuel_used);
-                has_moved.0 = true;
+                if from.x != event.target_x || from.y != event.target_y {
+                    has_moved.0 = true;
+
+                    // Record for undo
+                    commands.insert_resource(PendingMove {
+                        unit_entity: entity,
+                        original_pos: from,
+                        original_fuel: Fuel {
+                            current: old_fuel,
+                            max: fuel.max,
+                        },
+                    });
+                }
 
                 // Fire event
                 moved_events.send(UnitMovedEvent {
@@ -420,37 +434,28 @@ pub fn move_unit_system(
                     to: *pos,
                     fuel_used,
                 });
-
-                load_action = Some((
-                    entity,
-                    event.target_x,
-                    event.target_y,
-                    faction.0,
-                    stats.unit_type,
-                ));
             }
         }
+    }
+}
 
-        if let Some((unit_e, tx, ty, fac_id, u_type)) = load_action {
-            let mut transport_entity = None;
-            for (e, t_pos, _, _, f_faction, s_stats, _, _, _) in q_units.iter() {
-                if e != unit_e
-                    && t_pos.x == tx
-                    && t_pos.y == ty
-                    && f_faction.0 == fac_id
-                    && s_stats.max_cargo > 0
-                    && s_stats.loadable_unit_types.contains(&u_type)
-                {
-                    transport_entity = Some(e);
-                    break;
-                }
+/// 移動の取り消し（Undo）コマンドを処理します。
+pub fn undo_move_system(
+    mut commands: Commands,
+    mut undo_events: EventReader<UndoMoveCommand>,
+    pending_move: Option<Res<PendingMove>>,
+    mut q_units: Query<(&mut GridPosition, &mut Fuel, &mut HasMoved)>,
+) {
+    for _ in undo_events.read() {
+        if let Some(pending) = &pending_move {
+            if let Ok((mut pos, mut fuel, mut has_moved)) = q_units.get_mut(pending.unit_entity) {
+                // 位置、燃料、移動済みフラグを復元
+                *pos = pending.original_pos;
+                *fuel = pending.original_fuel;
+                has_moved.0 = false;
             }
-            if let Some(te) = transport_entity {
-                load_events.send(LoadUnitCommand {
-                    transport_entity: te,
-                    unit_entity: unit_e,
-                });
-            }
+            // 移動履歴を削除
+            commands.remove_resource::<PendingMove>();
         }
     }
 }
@@ -534,6 +539,7 @@ mod tests {
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<MergeUnitCommand>::default());
 
         let entity = world
             .spawn((
@@ -676,26 +682,29 @@ mod tests {
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<MergeUnitCommand>::default());
 
-        world.spawn((
-            GridPosition { x: 5, y: 5 },
-            Faction(PlayerId(1)),
-            Health {
-                current: 100,
-                max: 100,
-            },
-            Fuel {
-                current: 99,
-                max: 99,
-            },
-            create_transport_heli_stats(),
-            HasMoved(false),
-            ActionCompleted(false),
-            CargoCapacity {
-                max: 2,
-                loaded: vec![],
-            },
-        ));
+        let transport_id = world
+            .spawn((
+                GridPosition { x: 5, y: 5 },
+                Faction(PlayerId(1)),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                create_transport_heli_stats(),
+                HasMoved(false),
+                ActionCompleted(false),
+                CargoCapacity {
+                    max: 2,
+                    loaded: vec![],
+                },
+            ))
+            .id();
 
         let inf_entity = world
             .spawn((
@@ -730,10 +739,20 @@ mod tests {
         schedule.add_systems(super::move_unit_system);
         schedule.run(&mut world);
 
-        let load_events = world.resource::<Events<LoadUnitCommand>>();
-        let mut reader = load_events.get_cursor();
-        let emitted: Vec<_> = reader.read(load_events).collect();
-        assert_eq!(emitted.len(), 1);
+        // 手動で搭載コマンドを送信
+        world.send_event(LoadUnitCommand {
+            transport_entity: transport_id,
+            unit_entity: inf_entity,
+        });
+
+        let mut load_schedule = Schedule::default();
+        load_schedule.add_systems(crate::systems::transport::load_unit_system);
+        load_schedule.run(&mut world);
+
+        // 搭載されているか確認
+        let cargo = world.get::<CargoCapacity>(transport_id).unwrap();
+        assert_eq!(cargo.loaded.len(), 1);
+        assert_eq!(cargo.loaded[0], inf_entity);
     }
 
     #[test]
@@ -753,6 +772,7 @@ mod tests {
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<MergeUnitCommand>::default());
 
         let inf_stats = create_infantry_stats();
 
@@ -807,20 +827,22 @@ mod tests {
             current_phase: Phase::Main,
             ..Default::default()
         });
-        world.insert_resource(Players(vec![
-            Player::new(1, "P1".to_string()),
-            Player::new(2, "P2".to_string()),
-        ]));
-        let map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        world.insert_resource(Players(vec![Player {
+            id: PlayerId(1),
+            name: "P1".to_string(),
+            funds: 1000,
+        }]));
+        let map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
         world.insert_resource(map);
-        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<MergeUnitCommand>::default());
+        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
 
         let inf_stats = create_infantry_stats();
 
-        // Subject unit
+        // Subject unit (Infantry)
         let subject = world
             .spawn((
                 GridPosition { x: 0, y: 0 },
@@ -835,11 +857,13 @@ mod tests {
             ))
             .id();
 
-        // Allied unit at (1, 0)
+        // Allied unit at (1, 0) - Different type (Tank) to test blocking (cannot merge)
+        let mut tank_stats = inf_stats.clone();
+        tank_stats.unit_type = UnitType::Tank;
         world.spawn((
             GridPosition { x: 1, y: 0 },
             Faction(PlayerId(1)),
-            inf_stats.clone(),
+            tank_stats,
             Fuel {
                 current: 10,
                 max: 10,
@@ -860,7 +884,79 @@ mod tests {
         schedule.run(&mut world);
 
         let pos = world.get::<GridPosition>(subject).unwrap();
-        assert_eq!(pos.x, 0, "Should NOT be able to stop on allied unit");
+        assert_eq!(
+            pos.x, 0,
+            "Should NOT be able to stop on different type allied unit"
+        );
+        assert_eq!(pos.y, 0);
+    }
+
+    #[test]
+    fn test_merge_reachability() {
+        let mut world = World::new();
+        world.insert_resource(MatchState {
+            current_phase: Phase::Main,
+            ..Default::default()
+        });
+        world.insert_resource(Players(vec![Player {
+            id: PlayerId(1),
+            name: "P1".to_string(),
+            funds: 1000,
+        }]));
+        let map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
+        world.insert_resource(map);
+        world.insert_resource(Events::<MoveUnitCommand>::default());
+        world.insert_resource(Events::<UnitMovedEvent>::default());
+        world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<MergeUnitCommand>::default());
+        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
+
+        let inf_stats = create_infantry_stats();
+
+        let subject = world
+            .spawn((
+                GridPosition { x: 0, y: 0 },
+                Faction(PlayerId(1)),
+                Fuel {
+                    current: 50,
+                    max: 99,
+                },
+                inf_stats.clone(),
+                HasMoved(false),
+                ActionCompleted(false),
+            ))
+            .id();
+
+        // Same type allied unit at (1, 0) - Should allow merge movement
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Faction(PlayerId(1)),
+            inf_stats.clone(),
+            Fuel {
+                current: 10,
+                max: 10,
+            },
+            HasMoved(false),
+            ActionCompleted(false),
+        ));
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(move_unit_system);
+
+        // Try to move to (1, 0) for merge
+        world.send_event(MoveUnitCommand {
+            unit_entity: subject,
+            target_x: 1,
+            target_y: 0,
+        });
+
+        schedule.run(&mut world);
+
+        let pos = world.get::<GridPosition>(subject).unwrap();
+        assert_eq!(
+            pos.x, 1,
+            "Should be able to move onto allied unit for merging"
+        );
         assert_eq!(pos.y, 0);
     }
 
@@ -881,6 +977,7 @@ mod tests {
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<MergeUnitCommand>::default());
 
         let inf_stats = create_infantry_stats();
 
@@ -985,6 +1082,7 @@ mod tests {
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<MergeUnitCommand>::default());
 
         // 1. Produce a transport heli at (1, 1)
         world.send_event(ProduceUnitCommand {
@@ -1044,10 +1142,93 @@ mod tests {
         assert_eq!(infantry_pos.x, 1, "Movement should succeed after fix");
         assert_eq!(infantry_pos.y, 1);
 
-        // Verify LoadUnitCommand was emitted
-        let load_events = world.resource::<Events<LoadUnitCommand>>();
-        let mut reader = load_events.get_cursor();
-        let emitted: Vec<_> = reader.read(load_events).collect();
-        assert_eq!(emitted.len(), 1, "LoadUnitCommand should be emitted");
+        world.send_event(LoadUnitCommand {
+            transport_entity,
+            unit_entity: infantry_entity,
+        });
+
+        let mut load_schedule = Schedule::default();
+        load_schedule.add_systems(crate::systems::transport::load_unit_system);
+        load_schedule.run(&mut world);
+
+        // Verify loaded
+        let heli_cargo = world.get::<CargoCapacity>(transport_entity).unwrap();
+        assert_eq!(heli_cargo.loaded.len(), 1);
+        assert_eq!(heli_cargo.loaded[0], infantry_entity);
+    }
+
+    #[test]
+    fn test_undo_move() {
+        let mut world = World::new();
+        // マップ、コマンド、イベントのセットアップ
+        world.insert_resource(MatchState {
+            current_phase: Phase::Main,
+            ..Default::default()
+        });
+        world.insert_resource(Players(vec![Player {
+            id: PlayerId(1),
+            name: "P1".to_string(),
+            funds: 1000,
+        }]));
+        let map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
+        world.insert_resource(map);
+        world.insert_resource(Events::<MoveUnitCommand>::default());
+        world.insert_resource(Events::<UndoMoveCommand>::default());
+        world.insert_resource(Events::<UnitMovedEvent>::default());
+        world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<MergeUnitCommand>::default());
+        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
+
+        // ユニットのスポーン (位置: 1,1  燃料: 50)
+        let unit_entity = world
+            .spawn((
+                GridPosition { x: 1, y: 1 },
+                Faction(PlayerId(1)),
+                Fuel {
+                    current: 50,
+                    max: 99,
+                },
+                UnitStats {
+                    movement_type: MovementType::Infantry,
+                    max_movement: 3,
+                    ..Default::default()
+                },
+                HasMoved(false),
+                ActionCompleted(false),
+            ))
+            .id();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems((move_unit_system, undo_move_system));
+
+        // 1. 移動を実行 (1,1 -> 1,2)
+        world.send_event(MoveUnitCommand {
+            unit_entity,
+            target_x: 1,
+            target_y: 2,
+        });
+        schedule.run(&mut world);
+
+        // 移動後の状態確認
+        let pos = world.get::<GridPosition>(unit_entity).unwrap();
+        assert_eq!(pos.x, 1);
+        assert_eq!(pos.y, 2);
+        let fuel = world.get::<Fuel>(unit_entity).unwrap();
+        assert!(fuel.current < 50); // 燃料が減っている
+        assert!(world.get::<HasMoved>(unit_entity).unwrap().0); // 移動済みフラグ
+        assert!(world.contains_resource::<PendingMove>()); // 履歴が記録されている
+
+        // 2. 移動を取り消し
+        world.send_event(UndoMoveCommand);
+        schedule.run(&mut world);
+
+        // 取り消し後の状態確認 (元の位置 1,1  燃料 50 に戻っている)
+        let pos = world.get::<GridPosition>(unit_entity).unwrap();
+        assert_eq!(pos.x, 1);
+        assert_eq!(pos.y, 1);
+        let fuel = world.get::<Fuel>(unit_entity).unwrap();
+        assert_eq!(fuel.current, 50);
+        assert!(!world.get::<HasMoved>(unit_entity).unwrap().0); // 移動済みフラグ解除
+        assert!(!world.contains_resource::<PendingMove>()); // 履歴が削除されている
     }
 }

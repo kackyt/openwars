@@ -42,6 +42,9 @@ pub struct WaitUnitCommand {
 pub struct NextPhaseCommand;
 
 #[derive(Event, Debug, Clone)]
+pub struct UndoMoveCommand;
+
+#[derive(Event, Debug, Clone)]
 pub struct SupplyUnitCommand {
     pub supplier_entity: Entity,
     pub target_entity: Entity,

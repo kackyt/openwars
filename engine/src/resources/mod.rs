@@ -1,4 +1,5 @@
 pub mod master_data;
+pub use master_data::MasterDataRegistry;
 
 use crate::components::PlayerId;
 use bevy_ecs::prelude::*;
@@ -72,7 +73,7 @@ pub enum UnitType {
     SupplyTruck,
 }
 
-const UNIT_TYPE_MAP: &[(UnitType, &str)] = &[
+pub(crate) const UNIT_TYPE_MAP: &[(UnitType, &str)] = &[
     (UnitType::Infantry, "軽歩兵"),
     (UnitType::Mech, "重歩兵"),
     (UnitType::Recon, "装甲車"),
@@ -152,7 +153,7 @@ pub enum MovementType {
     Ship,
 }
 
-const MOVEMENT_TYPE_MAP: &[(MovementType, &str)] = &[
+pub(crate) const MOVEMENT_TYPE_MAP: &[(MovementType, &str)] = &[
     (MovementType::Infantry, "歩兵"),
     (MovementType::Tank, "戦車"),
     (MovementType::Artillery, "砲台"),
@@ -195,7 +196,7 @@ pub enum Terrain {
     Capital,
 }
 
-const TERRAIN_MAP: &[(Terrain, &str)] = &[
+pub(crate) const TERRAIN_MAP: &[(Terrain, &str)] = &[
     (Terrain::Plains, "平地"),
     (Terrain::Road, "道路"),
     (Terrain::River, "川"),
@@ -235,20 +236,6 @@ impl Terrain {
             | Terrain::Airport
             | Terrain::Port
             | Terrain::Capital => 200,
-            _ => 0,
-        }
-    }
-
-    pub fn defense_stars(&self) -> u32 {
-        match self {
-            Terrain::Mountain => 4,
-            Terrain::City
-            | Terrain::Factory
-            | Terrain::Airport
-            | Terrain::Port
-            | Terrain::Capital => 3,
-            Terrain::Forest => 2,
-            Terrain::Plains => 1,
             _ => 0,
         }
     }
@@ -401,6 +388,14 @@ pub struct MatchState {
     pub active_player_index: PlayerIndex,
     pub current_phase: Phase,
     pub game_over: Option<GameOverCondition>,
+}
+
+/// ユニットの移動を一時的に記録し、キャンセル（Undo）を可能にするためのリソース
+#[derive(Resource, Debug, Clone)]
+pub struct PendingMove {
+    pub unit_entity: Entity,
+    pub original_pos: crate::components::GridPosition,
+    pub original_fuel: crate::components::Fuel,
 }
 
 impl Default for MatchState {

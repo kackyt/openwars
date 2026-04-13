@@ -428,6 +428,13 @@ impl MasterDataRegistry {
             }
         }
     }
+
+    /// 地形から地形効果(防御ボーナス)を返す
+    pub fn get_terrain_defense_bonus(&self, terrain: crate::resources::Terrain) -> u32 {
+        self.get_landscape_by_name(terrain.as_str())
+            .map(|l| l.defense_bonus)
+            .unwrap_or(0)
+    }
 }
 
 fn parse_map(csv_data: &str) -> Result<MapData, MasterDataError> {
@@ -611,5 +618,51 @@ mod tests {
         // 不明な名称
         let units = registry.expand_target("存在しないユニット");
         assert!(units.is_err());
+    }
+
+    #[test]
+    fn test_master_data_completeness() {
+        use crate::resources::*;
+        let registry = MasterDataRegistry::load().unwrap();
+
+        // 1. unit.csv に定義されているすべてのユニットが、割り当てられた武器を weapon.csv に持っているか確認
+        for (unit_name, unit_rec) in &registry.units {
+            if let Some(w1_name) = &unit_rec.weapon1 {
+                assert!(
+                    registry.weapons.contains_key(&UnitName(w1_name.clone())),
+                    "Unit '{}' has weapon1 '{}' which is missing from weapon.csv",
+                    unit_name.0,
+                    w1_name
+                );
+            }
+            if let Some(w2_name) = &unit_rec.weapon2 {
+                assert!(
+                    registry.weapons.contains_key(&UnitName(w2_name.clone())),
+                    "Unit '{}' has weapon2 '{}' which is missing from weapon.csv",
+                    unit_name.0,
+                    w2_name
+                );
+            }
+        }
+
+        // 2. UnitType Enum のすべてのバリアントが unit.csv に存在するか確認
+        for &(unit_type, name) in UNIT_TYPE_MAP {
+            assert!(
+                registry.units.contains_key(&UnitName(name.to_string())),
+                "unit.csv is missing record for UnitType::{:?} ({})",
+                unit_type,
+                name
+            );
+        }
+
+        // 3. Terrain Enum のすべてのバリアントが landscape.csv に存在するか確認
+        for &(terrain, name) in TERRAIN_MAP {
+            assert!(
+                registry.get_landscape_by_name(name).is_some(),
+                "landscape.csv is missing record for Terrain::{:?} ({})",
+                terrain,
+                name
+            );
+        }
     }
 }

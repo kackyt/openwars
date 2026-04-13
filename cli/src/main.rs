@@ -244,6 +244,9 @@ where
                 if let Some(mut e) = world.get_resource_mut::<Events<WaitUnitCommand>>() {
                     e.clear();
                 }
+                if let Some(mut e) = world.get_resource_mut::<Events<UndoMoveCommand>>() {
+                    e.clear();
+                }
                 if let Some(mut e) = world.get_resource_mut::<Events<NextPhaseCommand>>() {
                     e.clear();
                 }
@@ -264,11 +267,17 @@ where
                 }
             }
 
-            if let Some(msg) = popup_msg {
-                let current_state = app.ui_state.in_game_state.clone();
-                if !matches!(current_state, app::InGameState::EventPopup { .. }) {
-                    app.ui_state.in_game_state = app::InGameState::EventPopup { message: msg };
-                }
+            if let Some(msg) = popup_msg
+                && !matches!(
+                    app.ui_state.in_game_state,
+                    app::InGameState::EventPopup { .. }
+                )
+            {
+                app.ui_state.in_game_state = app::InGameState::EventPopup { message: msg };
+            }
+
+            if let app::InGameState::WaitActionMenu { unit_entity } = &app.ui_state.in_game_state {
+                app.reopen_unit_action_menu(*unit_entity);
             }
         }
     }

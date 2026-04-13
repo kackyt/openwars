@@ -1,16 +1,21 @@
-## ADDED Requirements
+# cli-production Specification
 
-### Requirement: Factory Production Menu
-MUST: システムは、工場、空港、港などの施設タイプによってフィルタリングされた動的な生産メニューを提供する。
+## Purpose
+拠点（工場、空港、港）におけるユニット生産メニューの表示およびフィルタリングの仕様を定義します。
 
-#### Scenario: Factory properties show correct units
-- **WHEN** ユーザーが工場のプロパティでアクションメニューを開いた場合
-- **THEN** SHALL: システムは、陸上車両と歩兵ユニットのみを含む生産メニューを表示する。
+## Requirements
 
-#### Scenario: Airport properties show correct units
-- **WHEN** ユーザーが空港のプロパティでアクションメニューを開いた場合
-- **THEN** SHALL: システムは、航空ユニットのみを含む生産メニューを表示する。
+### Requirement: 施設ごとの生産メニュー (Factory Production Menu)
+システムは、利用可能な施設（工場、空港、港）の種類に応じて、生産可能なユニットをフィルタリングした動的なメニューを提供しなければならない (MUST)。
 
-#### Scenario: Port properties show correct units
-- **WHEN** ユーザーが港のプロパティでアクションメニューを開いた場合
-- **THEN** SHALL: システムは、艦船ユニットのみを含む生産メニューを表示する。
+#### Scenario: 工場での生産ユニット表示 (Factory properties show correct units)
+- **WHEN** ユーザーが工場拠点で生産メニューを開いた場合
+- **THEN** システムは、陸上車両と歩兵ユニットのみを含むリストを表示しなければならない (SHALL)。
+
+#### Scenario: 空港での生産ユニット表示 (Airport properties show correct units)
+- **WHEN** ユーザーが空港拠点で生産メニューを開いた場合
+- **THEN** システムは、航空ユニットのみを含むリストを表示しなければならない (SHALL)。
+
+#### Scenario: 港での生産ユニット表示 (Port properties show correct units)
+- **WHEN** ユーザーが港拠点で生産メニューを開いた場合
+- **THEN** システムは、艦船ユニットのみを含むリストを表示しなければならない (SHALL)。

@@ -10,6 +10,128 @@ use bevy_ecs::prelude::*;
 /// 2. 輸送ユニットの容量(`CargoCapacity`)と積載可能タイプ(`loadable_unit_types`)の条件を満たしているか確認します。
 /// 3. 積載対象ユニットを輸送ユニットの `CargoCapacity` に追加します。
 /// 4. 積載対象ユニットに `Transporting` コンポーネントを付与し、行動済み(`ActionCompleted`)にします。
+///
+/// 指定されたユニットを搭載可能な、同一座標の輸送ユニットエンティティのリストを返します。
+pub fn get_loadable_transports(world: &mut World, unit: Entity) -> Vec<Entity> {
+    let mut targets = vec![];
+    let (u_pos, u_type, unit_faction) = {
+        let mut q_unit = world.query::<(&GridPosition, &UnitStats, &Faction)>();
+        let Ok((u_pos, u_stats, u_faction)) = q_unit.get(world, unit) else {
+            return targets;
+        };
+        (*u_pos, u_stats.unit_type, u_faction.0)
+    };
+
+    let mut q_transports = world.query_filtered::<
+        (Entity, &GridPosition, &Faction, &UnitStats, &CargoCapacity),
+        (With<Faction>, Without<Transporting>),
+    >();
+    for (t_ent, t_pos, t_faction, t_stats, t_cargo) in q_transports.iter(world) {
+        if t_ent != unit && t_faction.0 == unit_faction {
+            let dist = (u_pos.x as i64 - t_pos.x as i64).unsigned_abs() as u32
+                + (u_pos.y as i64 - t_pos.y as i64).unsigned_abs() as u32;
+            if dist == 0 {
+                // 空き容量があり、かつ搭載可能タイプに含まれているか
+                if t_cargo.loaded.len() < t_cargo.max as usize
+                    && t_stats.loadable_unit_types.contains(&u_type)
+                {
+                    targets.push(t_ent);
+                }
+            }
+        }
+    }
+
+    targets
+}
+
+/// 指定された輸送ユニットからユニットを降車させることが可能な、隣接マスのリストを返します。
+pub fn get_droppable_tiles(
+    world: &mut World,
+    transport: Entity,
+    cargo_entity: Entity,
+) -> Vec<(usize, usize)> {
+    let mut targets = vec![];
+    let (t_pos, cargo_movement_type) = {
+        let mut q_trans = world.query::<(&GridPosition, &CargoCapacity)>();
+        let mut q_unit = world.query::<&UnitStats>();
+
+        let Ok((pos, cargo)) = q_trans.get(world, transport) else {
+            return targets;
+        };
+
+        if !cargo.loaded.contains(&cargo_entity) {
+            return targets;
+        }
+
+        let Ok(stats) = q_unit.get(world, cargo_entity) else {
+            return targets;
+        };
+        (*pos, stats.movement_type)
+    };
+
+    // 1. ユニットがいる座標を事前に取得（借用チェッカー対策: &mut World を使う操作を最初に行う）
+    use std::collections::HashSet;
+    let mut occupied_positions = HashSet::new();
+    let mut q_units =
+        world.query_filtered::<&GridPosition, (With<Faction>, Without<Transporting>)>();
+    for u_pos in q_units.iter(world) {
+        occupied_positions.insert((u_pos.x, u_pos.y));
+    }
+
+    // 2. リソースを取得
+    let (map_w, map_h, master_data) = if let (Some(map), Some(md)) = (
+        world.get_resource::<crate::resources::Map>(),
+        world.get_resource::<crate::resources::master_data::MasterDataRegistry>(),
+    ) {
+        (map.width, map.height, md)
+    } else {
+        return targets;
+    };
+
+    // 周囲1マスの座標をチェック
+    let neighbors = [
+        (t_pos.x as i64 - 1, t_pos.y as i64),
+        (t_pos.x as i64 + 1, t_pos.y as i64),
+        (t_pos.x as i64, t_pos.y as i64 - 1),
+        (t_pos.x as i64, t_pos.y as i64 + 1),
+    ];
+
+    for (nx, ny) in neighbors {
+        if nx >= 0 && nx < map_w as i64 && ny >= 0 && ny < map_h as i64 {
+            let x = nx as usize;
+            let y = ny as usize;
+
+            // 地形通行可能判定
+            // master_data を借用中なので、Mapへのアクセスも immutable borrow で行う
+            let terrain = if let Some(map) = world.get_resource::<crate::resources::Map>() {
+                if let Some(t) = map.get_terrain(x, y) {
+                    t
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            };
+
+            if crate::systems::movement::get_valid_movement_cost(
+                master_data,
+                cargo_movement_type,
+                terrain,
+            )
+            .is_none()
+            {
+                continue;
+            }
+
+            if !occupied_positions.contains(&(x, y)) {
+                targets.push((x, y));
+            }
+        }
+    }
+
+    targets
+}
+
 #[allow(clippy::type_complexity)]
 pub fn load_unit_system(
     mut load_events: EventReader<LoadUnitCommand>,
@@ -47,9 +169,9 @@ pub fn load_unit_system(
             continue;
         }
 
-        let (unit_pos, unit_faction, unit_stats, unit_action, unit_trans) =
+        let (unit_pos, unit_faction, unit_type, unit_action, unit_trans) =
             match q_units.get(event.unit_entity) {
-                Ok((_, p, f, s, a, _, t)) => (*p, f.0, s.clone(), a.0, t.is_some()),
+                Ok((_, p, f, s, a, _, t)) => (*p, f.0, s.unit_type, a.0, t.is_some()),
                 _ => continue,
             };
 
@@ -62,10 +184,7 @@ pub fn load_unit_system(
 
         #[allow(clippy::collapsible_if)]
         if trans_capacity.is_some_and(|(max_cap, loaded_len)| {
-            loaded_len < max_cap
-                && trans_stats
-                    .loadable_unit_types
-                    .contains(&unit_stats.unit_type)
+            loaded_len < max_cap && trans_stats.loadable_unit_types.contains(&unit_type)
         }) {
             if let Ok([transport, mut unit]) =
                 q_units.get_many_mut([event.transport_entity, event.unit_entity])
@@ -104,9 +223,12 @@ pub fn unload_unit_system(
         &mut ActionCompleted,
         Option<&mut CargoCapacity>,
         Option<&Transporting>,
+        &UnitStats,
     )>,
     match_state: Res<MatchState>,
     players: Res<Players>,
+    map: Res<Map>,
+    master_data: Res<MasterDataRegistry>,
 ) {
     if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
@@ -115,7 +237,7 @@ pub fn unload_unit_system(
 
     for event in unload_events.read() {
         let (trans_pos, trans_faction, trans_action) = match q_units.get(event.transport_entity) {
-            Ok((_, p, f, a, _, _)) => (*p, f.0, a.0),
+            Ok((_, p, f, a, _, _, _)) => (*p, f.0, a.0),
             _ => continue,
         };
 
@@ -123,10 +245,11 @@ pub fn unload_unit_system(
             continue;
         }
 
-        let (_cargo_faction, cargo_action, cargo_trans) = match q_units.get(event.cargo_entity) {
-            Ok((_, _, f, a, _, t)) => (f.0, a.0, t.map(|x| x.0)),
-            _ => continue,
-        };
+        let (_cargo_faction, cargo_action, cargo_trans, cargo_stats) =
+            match q_units.get(event.cargo_entity) {
+                Ok((_, _, f, a, _, t, s)) => (f.0, a.0, t.map(|x| x.0), s),
+                _ => continue,
+            };
 
         if cargo_trans != Some(event.transport_entity) {
             continue;
@@ -142,9 +265,25 @@ pub fn unload_unit_system(
             continue;
         }
 
+        // Check terrain passability for the cargo
+        let terrain = if let Some(t) = map.get_terrain(event.target_x, event.target_y) {
+            t
+        } else {
+            continue;
+        };
+        if crate::systems::movement::get_valid_movement_cost(
+            &master_data,
+            cargo_stats.movement_type,
+            terrain,
+        )
+        .is_none()
+        {
+            continue;
+        }
+
         // Check if target is occupied
         let mut occupied = false;
-        for (_, p, _, _, _, t) in q_units.iter() {
+        for (_, p, _, _, _, t, _) in q_units.iter() {
             if p.x == event.target_x && p.y == event.target_y && t.is_none() {
                 occupied = true;
                 break;
@@ -190,6 +329,17 @@ mod tests {
 
         world.insert_resource(Events::<LoadUnitCommand>::default());
         world.insert_resource(Events::<UnloadUnitCommand>::default());
+
+        // Insert Map and MasterDataRegistry for terrain checks
+        let mut map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
+        for x in 0..10 {
+            for y in 0..10 {
+                let _ = map.set_terrain(x, y, Terrain::Plains);
+            }
+        }
+
+        world.insert_resource(map);
+        world.insert_resource(MasterDataRegistry::load().unwrap());
 
         let transport_entity = world
             .spawn((
@@ -294,5 +444,190 @@ mod tests {
 
         let cargo_act = world.get::<ActionCompleted>(cargo_entity).unwrap();
         assert!(cargo_act.0);
+    }
+
+    #[test]
+    fn test_get_loadable_transports() {
+        let mut world = World::new();
+
+        let transport_entity = world
+            .spawn((
+                GridPosition { x: 5, y: 5 },
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::TransportHelicopter,
+                    loadable_unit_types: vec![UnitType::Infantry],
+                    ..Default::default()
+                },
+                CargoCapacity {
+                    max: 1,
+                    loaded: vec![],
+                },
+            ))
+            .id();
+
+        let cargo_entity = world
+            .spawn((
+                GridPosition { x: 5, y: 5 },
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    ..Default::default()
+                },
+            ))
+            .id();
+
+        // 同一座標なので見つかるはず
+        let targets = get_loadable_transports(&mut world, cargo_entity);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0], transport_entity);
+
+        // 座標をずらすと見つからなくなるはず
+        world.get_mut::<GridPosition>(cargo_entity).unwrap().x = 6;
+        let targets = get_loadable_transports(&mut world, cargo_entity);
+        assert_eq!(targets.len(), 0);
+
+        // 容量がいっぱいだと見つからないはず
+        world.get_mut::<GridPosition>(cargo_entity).unwrap().x = 5;
+        world
+            .get_mut::<CargoCapacity>(transport_entity)
+            .unwrap()
+            .loaded
+            .push(Entity::from_raw(999));
+        let targets = get_loadable_transports(&mut world, cargo_entity);
+        assert_eq!(targets.len(), 0);
+    }
+
+    #[test]
+    fn test_get_droppable_tiles() {
+        let mut world = World::new();
+
+        // マップとマスターデータのセットアップ
+        let map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        world.insert_resource(map);
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+
+        let transport_entity = world
+            .spawn((
+                GridPosition { x: 1, y: 1 },
+                Faction(PlayerId(1)),
+                CargoCapacity {
+                    max: 1,
+                    loaded: vec![],
+                },
+            ))
+            .id();
+
+        let cargo_entity = world
+            .spawn((
+                GridPosition { x: 999, y: 999 }, // 搭載中を想定
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    movement_type: MovementType::Infantry,
+                    ..Default::default()
+                },
+                Transporting(transport_entity),
+            ))
+            .id();
+
+        world
+            .get_mut::<CargoCapacity>(transport_entity)
+            .unwrap()
+            .loaded
+            .push(cargo_entity);
+
+        // 初期状態：周囲4マス空いている
+        let tiles = get_droppable_tiles(&mut world, transport_entity, cargo_entity);
+        assert_eq!(tiles.len(), 4);
+
+        // 隣接マス (1, 0) に他のユニットを配置
+        world.spawn((GridPosition { x: 1, y: 0 }, Faction(PlayerId(1))));
+
+        let tiles = get_droppable_tiles(&mut world, transport_entity, cargo_entity);
+        assert_eq!(tiles.len(), 3);
+        assert!(!tiles.contains(&(1, 0)));
+
+        // 地形を通行不能にする (1, 1 -> 0, 1 を海にする)
+        let mut map = world.get_resource_mut::<Map>().unwrap();
+        map.set_terrain(0, 1, Terrain::Sea).unwrap();
+
+        let tiles = get_droppable_tiles(&mut world, transport_entity, cargo_entity);
+        // 歩兵は海を通行できないので、(0, 1) も除外されるはず
+        assert_eq!(tiles.len(), 2);
+        assert!(!tiles.contains(&(0, 1)));
+    }
+
+    #[test]
+    fn test_get_droppable_tiles_mixed_cargo() {
+        let mut world = World::new();
+
+        // 1. マップとマスターデータのセットアップ
+        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        // (0, 1) を「山」にする（歩兵は入れるが、車両は入れない）
+        map.set_terrain(0, 1, Terrain::Mountain).unwrap();
+        world.insert_resource(map);
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+
+        // 2. 輸送ユニット（輸送ヘリ）の配置
+        let transport_entity = world
+            .spawn((
+                GridPosition { x: 1, y: 1 },
+                Faction(PlayerId(1)),
+                CargoCapacity {
+                    max: 2,
+                    loaded: vec![],
+                },
+            ))
+            .id();
+
+        // 3. 乗員1：歩兵（山に入れる）
+        let infantry_entity = world
+            .spawn((
+                GridPosition { x: 999, y: 999 },
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    movement_type: MovementType::Infantry,
+                    ..Default::default()
+                },
+                Transporting(transport_entity),
+            ))
+            .id();
+
+        // 4. 乗員2：偵察車（山に入れない。ここでは簡易的に戦車系移動タイプを想定）
+        let vehicle_entity = world
+            .spawn((
+                GridPosition { x: 999, y: 999 },
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::Recon,
+                    movement_type: MovementType::Tank,
+                    ..Default::default()
+                },
+                Transporting(transport_entity),
+            ))
+            .id();
+
+        // 5. 積載
+        world
+            .get_mut::<CargoCapacity>(transport_entity)
+            .unwrap()
+            .loaded = vec![infantry_entity, vehicle_entity];
+
+        // 6. 検証
+        // 歩兵を選択した場合：山 (0, 1) を含む周囲が降車可能
+        let tiles_inf = get_droppable_tiles(&mut world, transport_entity, infantry_entity);
+        assert!(
+            tiles_inf.contains(&(0, 1)),
+            "Infantry should be able to drop on Mountain"
+        );
+
+        // 車両を選択した場合：山 (0, 1) は降車不可
+        let tiles_veh = get_droppable_tiles(&mut world, transport_entity, vehicle_entity);
+        assert!(
+            !tiles_veh.contains(&(0, 1)),
+            "Vehicle should NOT be able to drop on Mountain"
+        );
     }
 }

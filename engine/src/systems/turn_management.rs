@@ -189,6 +189,7 @@ pub fn wait_unit_system(
     mut q_units: Query<(&Faction, &mut ActionCompleted)>,
     players: Res<Players>,
     match_state: Res<MatchState>,
+    mut commands: Commands,
 ) {
     if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
@@ -201,6 +202,8 @@ pub fn wait_unit_system(
                 continue;
             }
             action_comp.0 = true;
+            // アクション確定時に移動履歴を削除
+            commands.remove_resource::<PendingMove>();
         }
     }
 }
