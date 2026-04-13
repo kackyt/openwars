@@ -331,8 +331,11 @@ impl App {
                 let passenger = passengers[selected_index];
                 let mut targets = vec![];
                 if let Some(world) = &mut self.world {
-                    targets =
-                        engine::systems::transport::get_droppable_tiles(world, transport_entity);
+                    targets = engine::systems::transport::get_droppable_tiles(
+                        world,
+                        transport_entity,
+                        passenger,
+                    );
                 }
 
                 if targets.is_empty() {
