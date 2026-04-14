@@ -171,7 +171,10 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                     }
 
                     if target_tiles.contains(&(x, y)) {
-                        style = style.bg(Color::Red).fg(Color::White);
+                        style = style
+                            .bg(Color::Rgb(150, 0, 0))
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD);
                     }
 
                     if x == cx && y == cy {
@@ -195,7 +198,8 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             selected_index,
             ..
         } => {
-            menu_data = Some(("アクション".to_string(), options.clone(), *selected_index));
+            let labels: Vec<String> = options.iter().map(|o| o.label().to_string()).collect();
+            menu_data = Some(("アクション".to_string(), labels, *selected_index));
         }
         crate::app::InGameState::ProductionMenu {
             options,
@@ -262,14 +266,31 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             .collect();
 
         // カーソル付近へのメニューのオーバーレイ表示
+        let map_x = chunks[0].x + 1;
+        let map_y = chunks[0].y + 1;
+
+        // カーソル座標 (x, y) はマップ内の相対座標。これを絶対座標に変換
+        let mut menu_x = map_x + (cx as u16 * 3) + 4; // 記号が " X " なので 3マス分
+        let mut menu_y = map_y + cy as u16;
+
+        let menu_width = 30;
+        let menu_height = (options.len() as u16) + 2;
+
+        // 画面端の考慮
+        if menu_x + menu_width > chunks[0].x + chunks[0].width {
+            menu_x = (map_x + (cx as u16 * 3)).saturating_sub(menu_width);
+        }
+        if menu_y + menu_height > chunks[0].y + chunks[0].height {
+            menu_y = (chunks[0].y + chunks[0].height).saturating_sub(menu_height);
+        }
+
         let menu_rect = ratatui::layout::Rect {
-            x: chunks[0].x + 2, // 簡易的な固定配置
-            y: chunks[0].y + 2,
-            width: 30,
-            height: (options.len() as u16) + 2,
+            x: menu_x,
+            y: menu_y,
+            width: menu_width,
+            height: menu_height,
         };
-        let menu_block = ratatui::widgets::Clear;
-        f.render_widget(menu_block, menu_rect);
+        f.render_widget(ratatui::widgets::Clear, menu_rect);
 
         let menu_list =
             List::new(menu_items).block(Block::default().borders(Borders::ALL).title(title));
@@ -334,17 +355,29 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
 
                 if let Some(w) = u_ammo {
                     if w.max_ammo1 > 0 {
-                        let w_name = u_stats
-                            .weapon1_name
-                            .as_deref()
-                            .expect("Weapon 1 name not initialized");
+                        let mut w_name = "武器1";
+                        if let Some(record) =
+                            app.master_data
+                                .get_unit(&engine::resources::master_data::UnitName(
+                                    u_stats.unit_type.as_str().to_string(),
+                                ))
+                            && let Some(name) = &record.weapon1
+                        {
+                            w_name = name;
+                        }
                         info_text.push_str(&format!("{}: {}/{}\n", w_name, w.ammo1, w.max_ammo1));
                     }
                     if w.max_ammo2 > 0 {
-                        let w_name = u_stats
-                            .weapon2_name
-                            .as_deref()
-                            .expect("Weapon 2 name not initialized");
+                        let mut w_name = "武器2";
+                        if let Some(record) =
+                            app.master_data
+                                .get_unit(&engine::resources::master_data::UnitName(
+                                    u_stats.unit_type.as_str().to_string(),
+                                ))
+                            && let Some(name) = &record.weapon2
+                        {
+                            w_name = name;
+                        }
                         info_text.push_str(&format!("{}: {}/{}\n", w_name, w.ammo2, w.max_ammo2));
                     }
                 }

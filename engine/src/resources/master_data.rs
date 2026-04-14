@@ -88,6 +88,8 @@ pub struct UnitRecord {
     pub movement_type: crate::resources::MovementType,
     #[serde(rename = "燃料")]
     pub fuel: u32,
+    #[serde(rename = "日毎燃料消費量")]
+    pub daily_fuel: u32,
     #[serde(rename = "武器1")]
     pub weapon1: Option<String>,
     #[serde(rename = "武器2")]
@@ -437,8 +439,7 @@ impl MasterDataRegistry {
     }
 
     /// ユニット名(UnitName)からコンポーネントとしての UnitStats を構築して返す。
-    /// マスターデータに不備がある場合は None (または Error) を返すべきだが、
-    /// 現状の利用箇所に合わせて Option または anyhow::Result に準じた扱いとする。
+    /// マスターデータに不備がある場合は MasterDataError を返す。
     pub fn create_unit_stats(
         &self,
         name: &UnitName,
@@ -492,19 +493,6 @@ impl MasterDataRegistry {
                 loadable.extend(expanded);
             }
         }
-
-        let daily_fuel = match u_type {
-            crate::resources::UnitType::Fighter
-            | crate::resources::UnitType::HeavyFighter
-            | crate::resources::UnitType::Bomber => 5,
-            crate::resources::UnitType::Bcopters
-            | crate::resources::UnitType::TransportHelicopter => 2,
-            crate::resources::UnitType::Battleship
-            | crate::resources::UnitType::Carrier
-            | crate::resources::UnitType::Lander => 1,
-            _ => 0,
-        };
-
         Ok(crate::components::UnitStats {
             unit_type: u_type,
             cost: record.cost,
@@ -515,13 +503,11 @@ impl MasterDataRegistry {
             max_ammo2: w2.map(|w| w.ammo).unwrap_or(0),
             min_range,
             max_range,
-            daily_fuel_consumption: daily_fuel,
+            daily_fuel_consumption: record.daily_fuel,
             can_capture,
             can_supply,
             max_cargo,
             loadable_unit_types: loadable,
-            weapon1_name: record.weapon1.clone(),
-            weapon2_name: record.weapon2.clone(),
         })
     }
 }

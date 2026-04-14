@@ -552,7 +552,6 @@ mod tests {
                     can_supply: false,
                     max_cargo: 0,
                     loadable_unit_types: vec![],
-                    ..UnitStats::mock()
                 },
                 ActionCompleted(false),
                 HasMoved(false),
@@ -588,7 +587,6 @@ mod tests {
                     can_supply: false,
                     max_cargo: 0,
                     loadable_unit_types: vec![],
-                    ..UnitStats::mock()
                 },
                 ActionCompleted(false),
                 HasMoved(false),

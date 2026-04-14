@@ -361,7 +361,6 @@ mod tests {
                     can_supply: false,
                     max_cargo: 2,
                     loadable_unit_types: vec![UnitType::Infantry],
-                    ..UnitStats::mock()
                 },
                 CargoCapacity {
                     max: 2,
@@ -390,7 +389,6 @@ mod tests {
                     can_supply: false,
                     max_cargo: 0,
                     loadable_unit_types: vec![],
-                    ..UnitStats::mock()
                 },
             ))
             .id();

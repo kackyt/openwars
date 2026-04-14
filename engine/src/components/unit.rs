@@ -31,22 +31,34 @@ impl Damagable for Health {
 
 #[derive(Component, Debug, Clone, PartialEq, Eq)]
 pub struct UnitStats {
+    /// ユニットの種類（歩兵、戦車など）
     pub unit_type: crate::resources::UnitType,
+    /// 生産コスト
     pub cost: u32,
+    /// 最大移動力
     pub max_movement: u32,
+    /// 移動タイプ（地形コスト計算用）
     pub movement_type: crate::resources::MovementType,
+    /// 最大燃料
     pub max_fuel: u32,
+    /// 武器1の最大弾薬数
     pub max_ammo1: u32,
+    /// 武器2の最大弾薬数
     pub max_ammo2: u32,
+    /// 最小射程
     pub min_range: u32,
+    /// 最大射程
     pub max_range: u32,
+    /// 1ターンあたりの燃料消費量
     pub daily_fuel_consumption: u32,
+    /// 占領能力の有無
     pub can_capture: bool,
+    /// 補給能力の有無
     pub can_supply: bool,
+    /// 最大搭載数
     pub max_cargo: u32,
+    /// 搭載可能なユニットの種類
     pub loadable_unit_types: Vec<crate::resources::UnitType>,
-    pub weapon1_name: Option<String>,
-    pub weapon2_name: Option<String>,
 }
 
 impl UnitStats {
@@ -67,8 +79,6 @@ impl UnitStats {
             can_supply: false,
             max_cargo: 0,
             loadable_unit_types: vec![],
-            weapon1_name: None,
-            weapon2_name: None,
         }
     }
 }
