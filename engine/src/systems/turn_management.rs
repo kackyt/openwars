@@ -274,7 +274,7 @@ mod tests {
                     unit_type: UnitType::Bomber,
                     movement_type: MovementType::Air,
                     daily_fuel_consumption: 5,
-                    ..Default::default()
+                    ..UnitStats::mock()
                 },
                 Fuel {
                     current: 10,

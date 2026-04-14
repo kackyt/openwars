@@ -435,6 +435,95 @@ impl MasterDataRegistry {
             .map(|l| l.defense_bonus)
             .unwrap_or(0)
     }
+
+    /// ユニット名(UnitName)からコンポーネントとしての UnitStats を構築して返す。
+    /// マスターデータに不備がある場合は None (または Error) を返すべきだが、
+    /// 現状の利用箇所に合わせて Option または anyhow::Result に準じた扱いとする。
+    pub fn create_unit_stats(
+        &self,
+        name: &UnitName,
+    ) -> Result<crate::components::UnitStats, MasterDataError> {
+        let record = self
+            .get_unit(name)
+            .ok_or_else(|| MasterDataError::InvalidUnitName(name.0.clone()))?;
+        let u_type = self.unit_type_for_name(&name.0)?;
+
+        let mut min_range = 0;
+        let mut max_range = 0;
+
+        let w1 = record
+            .weapon1
+            .as_ref()
+            .map(|w| {
+                self.weapons
+                    .get(&UnitName(w.clone()))
+                    .ok_or_else(|| MasterDataError::InvalidUnitName(w.clone()))
+            })
+            .transpose()?;
+
+        let w2 = record
+            .weapon2
+            .as_ref()
+            .map(|w| {
+                self.weapons
+                    .get(&UnitName(w.clone()))
+                    .ok_or_else(|| MasterDataError::InvalidUnitName(w.clone()))
+            })
+            .transpose()?;
+
+        if let Some(w) = w1 {
+            min_range = w.range_min;
+            max_range = w.range_max;
+        } else if let Some(w) = w2 {
+            min_range = w.range_min;
+            max_range = w.range_max;
+        }
+
+        let can_capture = u_type == crate::resources::UnitType::Infantry
+            || u_type == crate::resources::UnitType::Mech;
+        let can_supply = u_type == crate::resources::UnitType::SupplyTruck;
+
+        let mut max_cargo = 0;
+        let mut loadable = Vec::new();
+        if let Some(loads) = self.loads.get(&name.0) {
+            for load_record in loads {
+                max_cargo = max_cargo.max(load_record.capacity);
+                let expanded = self.expand_target(&load_record.target)?;
+                loadable.extend(expanded);
+            }
+        }
+
+        let daily_fuel = match u_type {
+            crate::resources::UnitType::Fighter
+            | crate::resources::UnitType::HeavyFighter
+            | crate::resources::UnitType::Bomber => 5,
+            crate::resources::UnitType::Bcopters
+            | crate::resources::UnitType::TransportHelicopter => 2,
+            crate::resources::UnitType::Battleship
+            | crate::resources::UnitType::Carrier
+            | crate::resources::UnitType::Lander => 1,
+            _ => 0,
+        };
+
+        Ok(crate::components::UnitStats {
+            unit_type: u_type,
+            cost: record.cost,
+            max_movement: record.movement,
+            movement_type: record.movement_type,
+            max_fuel: record.fuel,
+            max_ammo1: w1.map(|w| w.ammo).unwrap_or(0),
+            max_ammo2: w2.map(|w| w.ammo).unwrap_or(0),
+            min_range,
+            max_range,
+            daily_fuel_consumption: daily_fuel,
+            can_capture,
+            can_supply,
+            max_cargo,
+            loadable_unit_types: loadable,
+            weapon1_name: record.weapon1.clone(),
+            weapon2_name: record.weapon2.clone(),
+        })
+    }
 }
 
 fn parse_map(csv_data: &str) -> Result<MapData, MasterDataError> {

@@ -334,11 +334,17 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
 
                 if let Some(w) = u_ammo {
                     if w.max_ammo1 > 0 {
-                        let w_name = u_stats.weapon1_name.as_deref().unwrap_or("武器 1");
+                        let w_name = u_stats
+                            .weapon1_name
+                            .as_deref()
+                            .expect("Weapon 1 name not initialized");
                         info_text.push_str(&format!("{}: {}/{}\n", w_name, w.ammo1, w.max_ammo1));
                     }
                     if w.max_ammo2 > 0 {
-                        let w_name = u_stats.weapon2_name.as_deref().unwrap_or("武器 2");
+                        let w_name = u_stats
+                            .weapon2_name
+                            .as_deref()
+                            .expect("Weapon 2 name not initialized");
                         info_text.push_str(&format!("{}: {}/{}\n", w_name, w.ammo2, w.max_ammo2));
                     }
                 }

@@ -60,7 +60,7 @@ mod tests {
             u_type,
             UnitStats {
                 unit_type: u_type,
-                ..Default::default()
+                ..UnitStats::mock()
             },
         );
         registry.insert(
@@ -69,7 +69,7 @@ mod tests {
                 unit_type: t_type,
                 max_cargo: 1,
                 loadable_unit_types: vec![u_type],
-                ..Default::default()
+                ..UnitStats::mock()
             },
         );
         world.insert_resource(UnitRegistry(registry));
@@ -86,7 +86,7 @@ mod tests {
                     unit_type: t_type,
                     max_cargo: 1,
                     loadable_unit_types: vec![u_type],
-                    ..Default::default()
+                    ..UnitStats::mock()
                 },
                 CargoCapacity {
                     max: 1,
@@ -102,7 +102,7 @@ mod tests {
                 Faction(player_id),
                 UnitStats {
                     unit_type: u_type,
-                    ..Default::default()
+                    ..UnitStats::mock()
                 },
             ))
             .id();

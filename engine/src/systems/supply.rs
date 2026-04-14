@@ -163,7 +163,7 @@ mod tests {
                     can_supply: true, // CAN SUPPLY
                     max_cargo: 0,
                     loadable_unit_types: vec![],
-                    ..Default::default()
+                    ..UnitStats::mock()
                 },
                 ActionCompleted(false),
             ))
@@ -192,7 +192,7 @@ mod tests {
                     can_supply: false,
                     max_cargo: 0,
                     loadable_unit_types: vec![],
-                    ..Default::default()
+                    ..UnitStats::mock()
                 },
                 ActionCompleted(false),
                 Fuel {
@@ -261,7 +261,7 @@ mod tests {
             can_supply: false,
             max_cargo: 0,
             loadable_unit_types: vec![],
-            ..Default::default()
+            ..UnitStats::mock()
         };
 
         // Supplier (Supply Truck)

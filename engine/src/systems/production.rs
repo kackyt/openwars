@@ -299,7 +299,7 @@ mod tests {
             can_supply: false,
             max_cargo: 0,
             loadable_unit_types: vec![],
-            ..Default::default()
+            ..UnitStats::mock()
         };
 
         let mut registry = UnitRegistry(std::collections::HashMap::new());
@@ -367,7 +367,7 @@ mod tests {
                 current: 100,
                 max: 100,
             },
-            UnitStats::default(),
+            UnitStats::mock(),
         ));
 
         let mut registry = UnitRegistry(std::collections::HashMap::new());
@@ -376,7 +376,7 @@ mod tests {
             UnitStats {
                 unit_type: UnitType::Infantry,
                 cost: 1000,
-                ..Default::default()
+                ..UnitStats::mock()
             },
         );
         world.insert_resource(registry);

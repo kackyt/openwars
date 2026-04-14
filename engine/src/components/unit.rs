@@ -29,7 +29,7 @@ impl Damagable for Health {
     }
 }
 
-#[derive(Component, Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Component, Debug, Clone, PartialEq, Eq)]
 pub struct UnitStats {
     pub unit_type: crate::resources::UnitType,
     pub cost: u32,
@@ -47,6 +47,30 @@ pub struct UnitStats {
     pub loadable_unit_types: Vec<crate::resources::UnitType>,
     pub weapon1_name: Option<String>,
     pub weapon2_name: Option<String>,
+}
+
+impl UnitStats {
+    #[cfg(test)]
+    pub fn mock() -> Self {
+        Self {
+            unit_type: crate::resources::UnitType::Infantry,
+            cost: 0,
+            max_movement: 0,
+            movement_type: crate::resources::MovementType::Infantry,
+            max_fuel: 0,
+            max_ammo1: 0,
+            max_ammo2: 0,
+            min_range: 0,
+            max_range: 0,
+            daily_fuel_consumption: 0,
+            can_capture: false,
+            can_supply: false,
+            max_cargo: 0,
+            loadable_unit_types: vec![],
+            weapon1_name: None,
+            weapon2_name: None,
+        }
+    }
 }
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
