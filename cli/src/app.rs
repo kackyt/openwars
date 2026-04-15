@@ -376,8 +376,7 @@ impl App {
                 if targets.is_empty() {
                     self.ui_state
                         .add_log("降ろせる場所がありません。".to_string());
-                    // アクションメニューに戻すのが丁寧だが、簡略化のため Normal に戻す
-                    self.ui_state.in_game_state = InGameState::Normal;
+                    self.reopen_unit_action_menu(transport_entity);
                 } else {
                     // 最初の有効な降車先にカーソルを移動
                     self.ui_state.cursor_pos = targets[0];
@@ -583,7 +582,7 @@ impl App {
                         player_funds = players.0[match_state.active_player_index.0].funds;
                     }
 
-                    let mut landscape_name = "平地";
+                    let mut landscape_name = None;
                     let mut p_query = world.query::<(
                         &engine::components::GridPosition,
                         &engine::components::Property,
@@ -592,9 +591,16 @@ impl App {
                         if pos.x == self.ui_state.cursor_pos.0
                             && pos.y == self.ui_state.cursor_pos.1
                         {
-                            landscape_name = prop.terrain.as_str();
+                            landscape_name = Some(prop.terrain.as_str());
                         }
                     }
+
+                    let Some(landscape_name) = landscape_name else {
+                        self.ui_state
+                            .add_log("生産施設の地形取得に失敗しました。".to_string());
+                        self.ui_state.in_game_state = InGameState::Normal;
+                        return;
+                    };
 
                     let mut sorted_names: Vec<_> = self.master_data.units.keys().cloned().collect();
                     sorted_names.sort_by(|a, b| a.0.cmp(&b.0));
@@ -968,7 +974,7 @@ impl App {
         {
             self.ui_state
                 .add_log("降車位置が不正です。キャンセルされました。".to_string());
-            self.ui_state.in_game_state = InGameState::Normal;
+            self.reopen_unit_action_menu(transport_entity);
             return;
         }
 
