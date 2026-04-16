@@ -10,13 +10,15 @@
 - ステータス情報（資金、ターン、各ユニット詳細）のラベルの日本語化。
 - 操作ヘルプおよびフッターメッセージの日本語化。
 - ゲーム内イベントおよびログメッセージの日本語化。
-- **追加機能**: CLIのユニット情報パネルに武器名（主兵装・副兵装）を表示するように拡張。
+- **追加機能**: CLIのユニット情報パネルに武器名（主兵装・副兵装）を表示するように拡張（マスターデータから動的に解決）。
+- **追加機能**: 航空ユニットのターン毎の燃料消費ロジックと、燃料切れ時の墜落判定の実装。
 
 ## Capabilities
 
 ### New Capabilities
 - `cli-i18n`: CLIにおける多言語対応（または日本語への固定）を管理するための要件を定義します。
-- `unit-weapon-display`: ユニットの武器名を保持し、表示するための要件を定義します。
+- `unit-weapon-display`: ユニットの武器名をマスターデータから取得し、表示するための要件を定義します。
+- `engine-fuel-consumption`: 航空ユニット等の日次燃料消費と、それに伴う墜落等のペナルティに関する要件を定義します。
 
 ### Modified Capabilities
 - `cli-action-menus`: アクションメニューに表示される項目名の要件を日本語に更新します。
@@ -26,7 +28,8 @@
 ## Impact
 
 - `cli/src/app.rs`: UI状態管理およびログ生成ロジック。
-- `cli/src/ui.rs`: レンダリングロジック。武器名の表示に対応。
-- `engine/src/components/unit.rs`: `UnitStats` コンポーネントに武器名フィールドを追加。
-- `engine/src/resources/master_data.rs`: ユニット生成時の武器名設定。
+- `cli/src/ui.rs`: レンダリングロジック。武器名の解決と表示に対応。
+- `engine/src/components/unit.rs`: `UnitStats` コンポーネントのクリーンアップ（表示用フィールドの排除）。
+- `engine/src/resources/master_data.rs`: `UnitRecord` への武器名フィールドの追加と、燃料消費データのロード。
+- `engine/src/systems/turn_management.rs`: 航空ユニットの燃料消費ロジックの実装。
 - `engine/src/resources/mod.rs`: 一部のドメインエラーや文字列（既存のものは既に日本語化されているが、不備があれば修正）。
