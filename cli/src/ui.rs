@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
 
 use crate::app::{App, CurrentScreen};
@@ -34,7 +34,7 @@ fn draw_map_selection(f: &mut Frame, app: &mut App) {
         .borders(Borders::ALL)
         .title(" OpenWars CLI ")
         .style(Style::default().fg(Color::Cyan));
-    let title = Paragraph::new("Select a Map to Play").block(title_block);
+    let title = Paragraph::new("プレイするマップを選択してください").block(title_block);
     f.render_widget(title, chunks[0]);
 
     let items: Vec<ListItem> = app
@@ -55,12 +55,12 @@ fn draw_map_selection(f: &mut Frame, app: &mut App) {
         })
         .collect();
 
-    let maps_list = List::new(items).block(Block::default().borders(Borders::ALL).title(" Maps "));
+    let maps_list =
+        List::new(items).block(Block::default().borders(Borders::ALL).title(" マップ一覧 "));
     f.render_widget(maps_list, chunks[1]);
 
-    let footer =
-        Paragraph::new("Use [Up/Down] to navigate. Press [Enter] to select. Press [q] to quit.")
-            .block(Block::default().borders(Borders::ALL));
+    let footer = Paragraph::new("方向キー(↑/↓)で選択、Enterで決定、qで終了")
+        .block(Block::default().borders(Borders::ALL));
     f.render_widget(footer, chunks[2]);
 }
 
@@ -72,7 +72,7 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         .split(f.size());
 
     // 左側: マップ表示
-    let map_block = Block::default().title(" Map ").borders(Borders::ALL);
+    let map_block = Block::default().title(" マップ ").borders(Borders::ALL);
 
     let mut map_lines = vec![];
     let cx = app.ui_state.cursor_pos.0;
@@ -171,7 +171,10 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                     }
 
                     if target_tiles.contains(&(x, y)) {
-                        style = style.bg(Color::Red).fg(Color::White);
+                        style = style
+                            .bg(Color::Rgb(150, 0, 0))
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD);
                     }
 
                     if x == cx && y == cy {
@@ -195,17 +198,22 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             selected_index,
             ..
         } => {
-            menu_data = Some(("Action".to_string(), options.clone(), *selected_index));
+            let labels: Vec<String> = options.iter().map(|o| o.label().to_string()).collect();
+            menu_data = Some(("アクション".to_string(), labels, *selected_index));
         }
         crate::app::InGameState::ProductionMenu {
             options,
             selected_index,
             ..
         } => {
-            menu_data = Some(("Produce".to_string(), options.clone(), *selected_index));
+            menu_data = Some(("生産".to_string(), options.clone(), *selected_index));
         }
         crate::app::InGameState::TargetSelection { action, .. } => {
-            menu_data = Some((action.clone(), vec!["[Select with Cursor]".to_string()], 0));
+            menu_data = Some((
+                action.clone(),
+                vec!["[カーソルで対象を選択]".to_string()],
+                0,
+            ));
         }
         crate::app::InGameState::CargoSelection {
             passengers,
@@ -226,14 +234,14 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                 options = passengers.iter().map(|e| format!("{:?}", e)).collect();
             }
             if options.is_empty() {
-                options.push("None".to_string());
+                options.push("なし".to_string());
             }
-            menu_data = Some(("Drop which?".to_string(), options, *selected_index));
+            menu_data = Some(("何を降ろしますか？".to_string(), options, *selected_index));
         }
         crate::app::InGameState::DropTargetSelection { .. } => {
             menu_data = Some((
-                "Drop where?".to_string(),
-                vec!["[Select with Cursor]".to_string()],
+                "どこに降ろしますか？".to_string(),
+                vec!["[カーソルで対象を選択]".to_string()],
                 0,
             ));
         }
@@ -258,14 +266,31 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             .collect();
 
         // カーソル付近へのメニューのオーバーレイ表示
+        let map_x = chunks[0].x + 1;
+        let map_y = chunks[0].y + 1;
+
+        // カーソル座標 (x, y) はマップ内の相対座標。これを絶対座標に変換
+        let mut menu_x = map_x + (cx as u16 * 3) + 4; // 記号が " X " なので 3マス分
+        let mut menu_y = map_y + cy as u16;
+
+        let menu_width = 30;
+        let menu_height = (options.len() as u16) + 2;
+
+        // 画面端の考慮
+        if menu_x + menu_width > chunks[0].x + chunks[0].width {
+            menu_x = (map_x + (cx as u16 * 3)).saturating_sub(menu_width);
+        }
+        if menu_y + menu_height > chunks[0].y + chunks[0].height {
+            menu_y = (chunks[0].y + chunks[0].height).saturating_sub(menu_height);
+        }
+
         let menu_rect = ratatui::layout::Rect {
-            x: chunks[0].x + 2, // 簡易的な固定配置
-            y: chunks[0].y + 2,
-            width: 20,
-            height: (options.len() as u16) + 2,
+            x: menu_x,
+            y: menu_y,
+            width: menu_width,
+            height: menu_height,
         };
-        let menu_block = ratatui::widgets::Clear;
-        f.render_widget(menu_block, menu_rect);
+        f.render_widget(ratatui::widgets::Clear, menu_rect);
 
         let menu_list =
             List::new(menu_items).block(Block::default().borders(Borders::ALL).title(title));
@@ -279,7 +304,7 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         .split(chunks[1]);
 
     // 情報パネル
-    let info_block = Block::default().title(" Info ").borders(Borders::ALL);
+    let info_block = Block::default().title(" 情報 ").borders(Borders::ALL);
     let mut info_text = String::new();
 
     if let Some(world) = &mut app.world {
@@ -293,9 +318,9 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             let name = active_player.name.clone();
             let id = active_player.id.0;
             let funds = active_player.funds;
-            info_text.push_str(&format!("Turn: {}\n", turn));
-            info_text.push_str(&format!("Player: {} ({})\n", name, id));
-            info_text.push_str(&format!("Funds: {}\n\n", funds));
+            info_text.push_str(&format!("ターン: {}\n", turn));
+            info_text.push_str(&format!("プレイヤー: {} ({})\n", name, id));
+            info_text.push_str(&format!("資金: {}\n\n", funds));
         }
 
         let cx = app.ui_state.cursor_pos.0;
@@ -317,23 +342,43 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                 continue;
             }
             if u_pos.x == cx && u_pos.y == cy {
-                info_text.push_str("--- Unit Info ---\n");
-                info_text.push_str(&format!("Type: {}\n", u_stats.unit_type.as_str()));
-                info_text.push_str(&format!("Faction: P{}\n", u_faction.0.0));
+                info_text.push_str("--- ユニット情報 ---\n");
+                info_text.push_str(&format!("種別: {}\n", u_stats.unit_type.as_str()));
+                info_text.push_str(&format!("勢力: P{}\n", u_faction.0.0));
 
                 let display_hp = (u_health.current.saturating_add(9)) / 10;
                 info_text.push_str(&format!("HP: {}/10\n", display_hp));
 
                 if let Some(f) = u_fuel {
-                    info_text.push_str(&format!("Fuel: {}/{}\n", f.current, f.max));
+                    info_text.push_str(&format!("燃料: {}/{}\n", f.current, f.max));
                 }
 
                 if let Some(w) = u_ammo {
                     if w.max_ammo1 > 0 {
-                        info_text.push_str(&format!("Ammo 1: {}/{}\n", w.ammo1, w.max_ammo1));
+                        let mut w_name = "武器1";
+                        if let Some(record) =
+                            app.master_data
+                                .get_unit(&engine::resources::master_data::UnitName(
+                                    u_stats.unit_type.as_str().to_string(),
+                                ))
+                            && let Some(name) = &record.weapon1
+                        {
+                            w_name = name;
+                        }
+                        info_text.push_str(&format!("{}: {}/{}\n", w_name, w.ammo1, w.max_ammo1));
                     }
                     if w.max_ammo2 > 0 {
-                        info_text.push_str(&format!("Ammo 2: {}/{}\n", w.ammo2, w.max_ammo2));
+                        let mut w_name = "武器2";
+                        if let Some(record) =
+                            app.master_data
+                                .get_unit(&engine::resources::master_data::UnitName(
+                                    u_stats.unit_type.as_str().to_string(),
+                                ))
+                            && let Some(name) = &record.weapon2
+                        {
+                            w_name = name;
+                        }
+                        info_text.push_str(&format!("{}: {}/{}\n", w_name, w.ammo2, w.max_ammo2));
                     }
                 }
 
@@ -343,16 +388,27 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         }
     }
     info_text.push_str(
-        "Press [q] to quit. [Esc] map.\nUse [Arrows] move. [Space] action.\n[x] Back/Cancel.",
+        "q: 終了 / Esc: マップ選択へ戻る\n方向キー: カーソル移動 / Space: アクション\nx: 戻る・キャンセル",
     );
 
-    let info_paragraph = Paragraph::new(info_text).block(info_block);
+    let info_paragraph = Paragraph::new(info_text)
+        .block(info_block)
+        .wrap(Wrap { trim: true });
     f.render_widget(info_paragraph, right_chunks[0]);
 
     // ログパネル
-    let logs_block = Block::default().title(" Logs ").borders(Borders::ALL);
-    let logs_text = app.ui_state.log_messages.join("\n");
-    let logs_paragraph = Paragraph::new(logs_text).block(logs_block);
+    let logs_block = Block::default().title(" ログ ").borders(Borders::ALL);
+    let logs_text = app
+        .ui_state
+        .log_messages
+        .iter()
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let logs_paragraph = Paragraph::new(logs_text)
+        .block(logs_block)
+        .wrap(Wrap { trim: true });
     f.render_widget(logs_paragraph, right_chunks[1]);
 
     if let crate::app::InGameState::EventPopup { message } = &app.ui_state.in_game_state {
@@ -365,11 +421,12 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         };
         let popup_block = Block::default()
             .borders(Borders::ALL)
-            .title(" Event ")
+            .title(" イベント ")
             .style(Style::default().bg(Color::Blue).fg(Color::White));
         let popup_text = Paragraph::new(message.as_str())
             .block(popup_block)
-            .alignment(ratatui::layout::Alignment::Center);
+            .alignment(ratatui::layout::Alignment::Center)
+            .wrap(Wrap { trim: true });
         f.render_widget(ratatui::widgets::Clear, popup_rect);
         f.render_widget(popup_text, popup_rect);
     }

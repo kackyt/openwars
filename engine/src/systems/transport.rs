@@ -457,7 +457,7 @@ mod tests {
                 UnitStats {
                     unit_type: UnitType::TransportHelicopter,
                     loadable_unit_types: vec![UnitType::Infantry],
-                    ..Default::default()
+                    ..UnitStats::mock()
                 },
                 CargoCapacity {
                     max: 1,
@@ -472,7 +472,7 @@ mod tests {
                 Faction(PlayerId(1)),
                 UnitStats {
                     unit_type: UnitType::Infantry,
-                    ..Default::default()
+                    ..UnitStats::mock()
                 },
             ))
             .id();
@@ -525,7 +525,7 @@ mod tests {
                 UnitStats {
                     unit_type: UnitType::Infantry,
                     movement_type: MovementType::Infantry,
-                    ..Default::default()
+                    ..UnitStats::mock()
                 },
                 Transporting(transport_entity),
             ))
@@ -589,7 +589,7 @@ mod tests {
                 UnitStats {
                     unit_type: UnitType::Infantry,
                     movement_type: MovementType::Infantry,
-                    ..Default::default()
+                    ..UnitStats::mock()
                 },
                 Transporting(transport_entity),
             ))
@@ -603,7 +603,7 @@ mod tests {
                 UnitStats {
                     unit_type: UnitType::Recon,
                     movement_type: MovementType::Tank,
-                    ..Default::default()
+                    ..UnitStats::mock()
                 },
                 Transporting(transport_entity),
             ))

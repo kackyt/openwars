@@ -1191,7 +1191,7 @@ mod tests {
                 UnitStats {
                     movement_type: MovementType::Infantry,
                     max_movement: 3,
-                    ..Default::default()
+                    ..UnitStats::mock()
                 },
                 HasMoved(false),
                 ActionCompleted(false),

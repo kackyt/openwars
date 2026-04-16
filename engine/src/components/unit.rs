@@ -29,22 +29,58 @@ impl Damagable for Health {
     }
 }
 
-#[derive(Component, Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Component, Debug, Clone, PartialEq, Eq)]
 pub struct UnitStats {
+    /// ユニットの種類（歩兵、戦車など）
     pub unit_type: crate::resources::UnitType,
+    /// 生産コスト
     pub cost: u32,
+    /// 最大移動力
     pub max_movement: u32,
+    /// 移動タイプ（地形コスト計算用）
     pub movement_type: crate::resources::MovementType,
+    /// 最大燃料
     pub max_fuel: u32,
+    /// 武器1の最大弾薬数
     pub max_ammo1: u32,
+    /// 武器2の最大弾薬数
     pub max_ammo2: u32,
+    /// 最小射程
     pub min_range: u32,
+    /// 最大射程
     pub max_range: u32,
+    /// 1ターンあたりの燃料消費量
     pub daily_fuel_consumption: u32,
+    /// 占領能力の有無
     pub can_capture: bool,
+    /// 補給能力の有無
     pub can_supply: bool,
+    /// 最大搭載数
     pub max_cargo: u32,
+    /// 搭載可能なユニットの種類
     pub loadable_unit_types: Vec<crate::resources::UnitType>,
+}
+
+impl UnitStats {
+    #[cfg(test)]
+    pub fn mock() -> Self {
+        Self {
+            unit_type: crate::resources::UnitType::Infantry,
+            cost: 0,
+            max_movement: 0,
+            movement_type: crate::resources::MovementType::Infantry,
+            max_fuel: 0,
+            max_ammo1: 0,
+            max_ammo2: 0,
+            min_range: 0,
+            max_range: 0,
+            daily_fuel_consumption: 0,
+            can_capture: false,
+            can_supply: false,
+            max_cargo: 0,
+            loadable_unit_types: vec![],
+        }
+    }
 }
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]

@@ -665,7 +665,7 @@ mod tests {
                     max_range: 1,
                     max_ammo1: 9,
                     max_ammo2: 0,
-                    ..Default::default()
+                    ..UnitStats::mock()
                 },
                 ActionCompleted(false),
                 HasMoved(false),
@@ -701,7 +701,7 @@ mod tests {
                     unit_type: UnitType::Infantry,
                     min_range: 1,
                     max_range: 1,
-                    ..Default::default()
+                    ..UnitStats::mock()
                 },
             ))
             .id();
@@ -767,7 +767,7 @@ mod tests {
                     unit_type: UnitType::Tank,
                     min_range: 1,
                     max_range: 1,
-                    ..Default::default()
+                    ..UnitStats::mock()
                 },
                 ActionCompleted(false),
                 HasMoved(false),
@@ -784,7 +784,7 @@ mod tests {
                 Faction(PlayerId(2)),
                 UnitStats {
                     unit_type: UnitType::Infantry,
-                    ..Default::default()
+                    ..UnitStats::mock()
                 },
             ))
             .id();
@@ -824,7 +824,7 @@ mod tests {
                     unit_type: UnitType::Tank,
                     min_range: 1,
                     max_range: 1,
-                    ..Default::default()
+                    ..UnitStats::mock()
                 },
                 ActionCompleted(false),
                 HasMoved(false),
@@ -840,7 +840,7 @@ mod tests {
                 Faction(PlayerId(2)),
                 UnitStats {
                     unit_type: UnitType::Infantry,
-                    ..Default::default()
+                    ..UnitStats::mock()
                 },
             ))
             .id();
