@@ -277,11 +277,11 @@ mod tests {
         // Spawn properties
         world.spawn((
             GridPosition { x: 0, y: 0 },
-            Property::new(Terrain::Capital, Some(PlayerId(1))),
+            Property::new(Terrain::Capital, Some(PlayerId(1)), 200),
         ));
         world.spawn((
             GridPosition { x: 2, y: 0 },
-            Property::new(Terrain::Factory, Some(PlayerId(1))),
+            Property::new(Terrain::Factory, Some(PlayerId(1)), 200),
         ));
 
         let stats = UnitStats {
@@ -350,12 +350,12 @@ mod tests {
         // 首都を配置
         world.spawn((
             GridPosition { x: 0, y: 0 },
-            Property::new(Terrain::Capital, Some(PlayerId(1))),
+            Property::new(Terrain::Capital, Some(PlayerId(1)), 200),
         ));
 
         world.spawn((
             GridPosition { x: 2, y: 0 },
-            Property::new(Terrain::Factory, Some(PlayerId(1))),
+            Property::new(Terrain::Factory, Some(PlayerId(1)), 200),
         ));
 
         // 既にユニットを配置

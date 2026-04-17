@@ -100,12 +100,20 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             &engine::components::Faction,
             &engine::components::UnitStats,
             Option<&engine::components::Transporting>,
+            Option<&engine::components::ActionCompleted>,
+            Option<&engine::components::CargoCapacity>,
         )>();
-        for (pos, faction, stats, transporting) in u_query.iter(world) {
+        for (pos, faction, stats, transporting, action, cargo) in u_query.iter(world) {
             if transporting.is_some() {
                 continue;
             }
-            units.insert((pos.x, pos.y), (faction.0.0, stats.unit_type));
+            let is_completed = action.map(|a| a.0).unwrap_or(false);
+            let has_cargo = cargo.map(|c| !c.loaded.is_empty()).unwrap_or(false);
+
+            units.insert(
+                (pos.x, pos.y),
+                (faction.0.0, stats.unit_type, is_completed, has_cargo),
+            );
         }
 
         // 到達可能タイルの収集
@@ -148,40 +156,68 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                         .unwrap_or(engine::resources::Terrain::Plains);
 
                     let mut symbol = terrain.symbol();
-
                     let mut style = Style::default().fg(Color::DarkGray);
 
                     if let Some(owner) = factions.get(&(x, y)) {
                         style = style.fg(if *owner == 1 { Color::Blue } else { Color::Red });
                     }
 
-                    if let Some((owner, u_type)) = units.get(&(x, y)) {
-                        symbol = unit_type_to_symbol(u_type);
-                        style = style
-                            .fg(if *owner == 1 {
+                    if let Some(&(owner, u_type, is_completed, has_cargo)) = units.get(&(x, y)) {
+                        symbol = unit_type_to_symbol(&u_type);
+                        let mut u_style = style
+                            .fg(if owner == 1 {
                                 Color::LightBlue
                             } else {
                                 Color::LightRed
                             })
                             .add_modifier(Modifier::BOLD);
-                    }
 
-                    if reachable_tiles.contains(&(x, y)) {
-                        style = style.bg(Color::DarkGray).fg(Color::White);
-                    }
+                        // 行動済みユニットは暗く表示（勢力色は維持）
+                        if is_completed {
+                            u_style = u_style
+                                .remove_modifier(Modifier::BOLD)
+                                .add_modifier(Modifier::DIM)
+                                .fg(if owner == 1 {
+                                    Color::Blue
+                                } else {
+                                    Color::Red
+                                });
+                        }
 
-                    if target_tiles.contains(&(x, y)) {
-                        style = style
-                            .bg(Color::Rgb(150, 0, 0))
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD);
-                    }
+                        // カーソル位置なら反転表示
+                        if x == cx && y == cy {
+                            u_style = u_style.bg(Color::White).fg(Color::Black);
+                        }
 
-                    if x == cx && y == cy {
-                        style = style.bg(Color::White).fg(Color::Black);
-                    }
+                        // 搭載がある場合は記号にアスタリスクを付ける
+                        let mut cargo_symbol = symbol.to_string();
+                        if has_cargo {
+                            cargo_symbol.push('*');
+                        }
 
-                    line_spans.push(Span::styled(format!(" {} ", symbol), style));
+                        if cargo_symbol.len() > 1 {
+                            line_spans.push(Span::styled(format!(" {} ", cargo_symbol), u_style));
+                        } else {
+                            line_spans.push(Span::styled(format!(" {} ", symbol), u_style));
+                        }
+                    } else {
+                        if reachable_tiles.contains(&(x, y)) {
+                            style = style.bg(Color::DarkGray).fg(Color::White);
+                        }
+
+                        if target_tiles.contains(&(x, y)) {
+                            style = style
+                                .bg(Color::Rgb(150, 0, 0))
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD);
+                        }
+
+                        if x == cx && y == cy {
+                            style = style.bg(Color::White).fg(Color::Black);
+                        }
+
+                        line_spans.push(Span::styled(format!(" {} ", symbol), style));
+                    }
                 }
                 map_lines.push(Line::from(line_spans));
             }
@@ -245,6 +281,16 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                 0,
             ));
         }
+        crate::app::InGameState::EventPopup { message } => {
+            menu_data = Some(("イベント".to_string(), vec![message.clone()], 0));
+        }
+        crate::app::InGameState::GameOverPopup { message, .. } => {
+            menu_data = Some((
+                "ゲーム終了".to_string(),
+                vec![message.clone(), "[Esc] マップ選択へ戻る".to_string()],
+                0,
+            ));
+        }
         _ => {}
     }
 
@@ -297,17 +343,12 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         f.render_widget(menu_list, menu_rect);
     }
 
-    // 右側: 情報 & ログの分割表示
-    let right_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[1]);
-
-    // 情報パネル
-    let info_block = Block::default().title(" 情報 ").borders(Borders::ALL);
+    // 右側: 情報 & ログの表示準備
     let mut info_text = String::new();
+    let mut has_unit_at_cursor = false;
 
     if let Some(world) = &mut app.world {
+        // プレイヤー情報
         if let (Some(match_state), Some(players)) = (
             world.get_resource::<engine::resources::MatchState>(),
             world.get_resource::<engine::resources::Players>(),
@@ -318,42 +359,60 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             let name = active_player.name.clone();
             let id = active_player.id.0;
             let funds = active_player.funds;
-            info_text.push_str(&format!("ターン: {}\n", turn));
-            info_text.push_str(&format!("プレイヤー: {} ({})\n", name, id));
+            info_text.push_str(&format!("ターン: {} (P{} : {})\n", turn, id, name));
             info_text.push_str(&format!("資金: {}\n\n", funds));
         }
 
-        let cx = app.ui_state.cursor_pos.0;
-        let cy = app.ui_state.cursor_pos.1;
-        let mut u_query = world.query::<(
-            &engine::components::GridPosition,
-            &engine::components::Faction,
-            &engine::components::UnitStats,
-            &engine::components::Health,
-            Option<&engine::components::Fuel>,
-            Option<&engine::components::Ammo>,
-            Option<&engine::components::Transporting>,
-        )>();
-
-        for (u_pos, u_faction, u_stats, u_health, u_fuel, u_ammo, transporting) in
-            u_query.iter(world)
+        // ユニット情報
+        for (
+            u_pos,
+            u_faction,
+            u_stats,
+            u_health,
+            u_fuel,
+            u_ammo,
+            transporting,
+            action_completed,
+            has_moved,
+            cargo_capacity,
+        ) in world
+            .query::<(
+                &engine::components::GridPosition,
+                &engine::components::Faction,
+                &engine::components::UnitStats,
+                &engine::components::Health,
+                Option<&engine::components::Fuel>,
+                Option<&engine::components::Ammo>,
+                Option<&engine::components::Transporting>,
+                &engine::components::ActionCompleted,
+                Option<&engine::components::HasMoved>,
+                Option<&engine::components::CargoCapacity>,
+            )>()
+            .iter(world)
         {
             if transporting.is_some() {
                 continue;
             }
             if u_pos.x == cx && u_pos.y == cy {
+                has_unit_at_cursor = true;
                 info_text.push_str("--- ユニット情報 ---\n");
-                info_text.push_str(&format!("種別: {}\n", u_stats.unit_type.as_str()));
-                info_text.push_str(&format!("勢力: P{}\n", u_faction.0.0));
+                info_text.push_str(&format!(
+                    "{} (P{})\n",
+                    u_stats.unit_type.as_str(),
+                    u_faction.0.0
+                ));
 
                 let display_hp = (u_health.current.saturating_add(9)) / 10;
-                info_text.push_str(&format!("HP: {}/10\n", display_hp));
-
+                let mut hp_fuel = format!("HP: {}/10", display_hp);
                 if let Some(f) = u_fuel {
-                    info_text.push_str(&format!("燃料: {}/{}\n", f.current, f.max));
+                    hp_fuel.push_str(&format!("  燃料: {}/{}", f.current, f.max));
                 }
+                info_text.push_str(&format!("{}\n", hp_fuel));
 
-                if let Some(w) = u_ammo {
+                if let Some(w) = u_ammo
+                    && (w.max_ammo1 > 0 || w.max_ammo2 > 0)
+                {
+                    let mut ammo_line = String::new();
                     if w.max_ammo1 > 0 {
                         let mut w_name = "武器1";
                         if let Some(record) =
@@ -365,7 +424,7 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                         {
                             w_name = name;
                         }
-                        info_text.push_str(&format!("{}: {}/{}\n", w_name, w.ammo1, w.max_ammo1));
+                        ammo_line.push_str(&format!("{}: {}/{}", w_name, w.ammo1, w.max_ammo1));
                     }
                     if w.max_ammo2 > 0 {
                         let mut w_name = "武器2";
@@ -378,19 +437,76 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                         {
                             w_name = name;
                         }
-                        info_text.push_str(&format!("{}: {}/{}\n", w_name, w.ammo2, w.max_ammo2));
+                        if !ammo_line.is_empty() {
+                            ammo_line.push_str("  ");
+                        }
+                        ammo_line.push_str(&format!("{}: {}/{}", w_name, w.ammo2, w.max_ammo2));
                     }
+                    info_text.push_str(&format!("{}\n", ammo_line));
                 }
 
+                let status = if action_completed.0 {
+                    "行動終了"
+                } else if has_moved.map(|h| h.0).unwrap_or(false) {
+                    "移動済み"
+                } else {
+                    "未行動"
+                };
+                let mut status_line = format!("状態: {}", status);
+                if let Some(cargo) = cargo_capacity
+                    && !cargo.loaded.is_empty()
+                {
+                    status_line.push_str(&format!("  搭載: {}体", cargo.loaded.len()));
+                }
+                info_text.push_str(&format!("{}\n", status_line));
                 info_text.push_str("-----------------\n\n");
                 break;
             }
         }
-    }
-    info_text.push_str(
-        "q: 終了 / Esc: マップ選択へ戻る\n方向キー: カーソル移動 / Space: アクション\nx: 戻る・キャンセル",
-    );
 
+        // 地形情報の表示
+        if let Some(map) = world.get_resource::<engine::resources::Map>()
+            && let Some(terrain) = map.get_terrain(cx, cy)
+        {
+            info_text.push_str("--- 地形情報 ---\n");
+            let terrain_name = terrain.as_str();
+            info_text.push_str(&format!("地形: {}\n", terrain_name));
+            if let Some(master_data) = world.get_resource::<engine::resources::MasterDataRegistry>()
+            {
+                info_text.push_str(&format!(
+                    "防御: +{}%\n",
+                    master_data.get_terrain_defense_bonus(terrain)
+                ));
+            }
+
+            let mut q_prop = world.query::<(
+                &engine::components::GridPosition,
+                &engine::components::Property,
+            )>();
+            for (p_pos, prop) in q_prop.iter(world) {
+                if p_pos.x == cx && p_pos.y == cy {
+                    info_text.push_str(&format!(
+                        "占領: {}/{}\n",
+                        prop.capture_points / 10,
+                        prop.max_capture_points / 10
+                    ));
+                    break;
+                }
+            }
+            info_text.push_str("-----------------\n\n");
+        }
+    }
+    info_text.push_str("q:終了 / Esc:戻る\n方向キー:移動 / Space:決定\nx:キャンセル");
+
+    // レイアウト計算：ユニットの有無に応じて情報パネルの高さを調整
+    // ユニットあり 20行、地形のみ 13行に拡張して情報の欠落を防ぐ
+    let info_height = if has_unit_at_cursor { 20 } else { 12 };
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(info_height), Constraint::Min(0)])
+        .split(chunks[1]);
+
+    let info_block = Block::default().title(" 情報 ").borders(Borders::ALL);
     let info_paragraph = Paragraph::new(info_text)
         .block(info_block)
         .wrap(Wrap { trim: true });
@@ -411,23 +527,51 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         .wrap(Wrap { trim: true });
     f.render_widget(logs_paragraph, right_chunks[1]);
 
-    if let crate::app::InGameState::EventPopup { message } = &app.ui_state.in_game_state {
-        let area = f.size();
-        let popup_rect = ratatui::layout::Rect {
-            x: area.width.saturating_sub(40) / 2,
-            y: area.height.saturating_sub(5) / 2,
-            width: 40.min(area.width),
-            height: 5.min(area.height),
-        };
-        let popup_block = Block::default()
-            .borders(Borders::ALL)
-            .title(" イベント ")
-            .style(Style::default().bg(Color::Blue).fg(Color::White));
-        let popup_text = Paragraph::new(message.as_str())
-            .block(popup_block)
-            .alignment(ratatui::layout::Alignment::Center)
-            .wrap(Wrap { trim: true });
-        f.render_widget(ratatui::widgets::Clear, popup_rect);
-        f.render_widget(popup_text, popup_rect);
+    match &app.ui_state.in_game_state {
+        crate::app::InGameState::EventPopup { message } => {
+            let area = f.size();
+            let popup_rect = ratatui::layout::Rect {
+                x: area.width.saturating_sub(40) / 2,
+                y: area.height.saturating_sub(5) / 2,
+                width: 40.min(area.width),
+                height: 5.min(area.height),
+            };
+            let popup_block = Block::default()
+                .borders(Borders::ALL)
+                .title(" イベント ")
+                .style(Style::default().bg(Color::Blue).fg(Color::White));
+            let popup_text = Paragraph::new(message.as_str())
+                .block(popup_block)
+                .alignment(ratatui::layout::Alignment::Center)
+                .wrap(Wrap { trim: true });
+            f.render_widget(ratatui::widgets::Clear, popup_rect);
+            f.render_widget(popup_text, popup_rect);
+        }
+        crate::app::InGameState::GameOverPopup {
+            message,
+            condition: _,
+        } => {
+            let area = f.size();
+            let popup_rect = ratatui::layout::Rect {
+                x: area.width.saturating_sub(40) / 2,
+                y: area.height.saturating_sub(5) / 2,
+                width: 40.min(area.width),
+                height: 5.min(area.height),
+            };
+            let title = " ゲームセット ";
+            let s = format!("{}\n\n[Esc/Enter] で戻る", message);
+            let popup_text = Paragraph::new(s.as_str())
+                .block(
+                    Block::default()
+                        .title(title)
+                        .borders(Borders::ALL)
+                        .style(Style::default().bg(Color::Yellow).fg(Color::Black)),
+                )
+                .alignment(ratatui::layout::Alignment::Center)
+                .wrap(Wrap { trim: true });
+            f.render_widget(ratatui::widgets::Clear, popup_rect);
+            f.render_widget(popup_text, popup_rect);
+        }
+        _ => {}
     }
 }

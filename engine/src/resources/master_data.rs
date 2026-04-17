@@ -394,6 +394,13 @@ impl MasterDataRegistry {
             .unwrap_or(0)
     }
 
+    /// 地形名から地形の耐久度（占領ポイント最大値）を返す
+    pub fn landscape_durability(&self, name: &str) -> u32 {
+        self.get_landscape_by_name(name)
+            .map(|l| l.durability)
+            .unwrap_or(0)
+    }
+
     /// 地形名から「生産施設かどうか」を判定する
     /// 補給補充フィールド（supply_type）が存在する地形を生産施設とみなす
     pub fn is_production_facility(&self, name: &str) -> bool {

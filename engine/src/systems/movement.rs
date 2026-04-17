@@ -593,7 +593,7 @@ mod tests {
 
         world.spawn((
             GridPosition { x: 0, y: 0 },
-            crate::components::Property::new(Terrain::Airport, Some(PlayerId(1))),
+            crate::components::Property::new(Terrain::Airport, Some(PlayerId(1)), 200),
         ));
 
         let heli_stats = create_bcopter_stats();
@@ -1061,11 +1061,11 @@ mod tests {
         // Spawn properties for production
         world.spawn((
             GridPosition { x: 0, y: 0 },
-            Property::new(Terrain::Capital, Some(PlayerId(1))),
+            Property::new(Terrain::Capital, Some(PlayerId(1)), 200),
         ));
         world.spawn((
             GridPosition { x: 1, y: 1 },
-            Property::new(Terrain::Airport, Some(PlayerId(1))),
+            Property::new(Terrain::Airport, Some(PlayerId(1)), 200),
         ));
 
         // Registry for production

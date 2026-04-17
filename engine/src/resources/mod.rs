@@ -229,17 +229,6 @@ impl Terrain {
             .map(|(t, _)| *t)
     }
 
-    pub fn max_capture_points(&self) -> u32 {
-        match self {
-            Terrain::City
-            | Terrain::Factory
-            | Terrain::Airport
-            | Terrain::Port
-            | Terrain::Capital => 200,
-            _ => 0,
-        }
-    }
-
     pub fn symbol(&self) -> &'static str {
         match self {
             Terrain::Plains => ".",

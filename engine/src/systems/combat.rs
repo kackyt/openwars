@@ -680,7 +680,7 @@ mod tests {
 
         world.spawn((
             GridPosition { x: 0, y: 1 },
-            Property::new(Terrain::Factory, Some(PlayerId(2))),
+            Property::new(Terrain::Factory, Some(PlayerId(2)), 200),
         ));
 
         let defender = world

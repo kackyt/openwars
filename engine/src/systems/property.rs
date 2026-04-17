@@ -29,8 +29,14 @@ pub fn get_capturable_property(world: &mut World, unit: Entity) -> Option<Entity
 
     let mut q_properties = world.query::<(Entity, &GridPosition, &Property)>();
     for (p_ent, p_pos, p_prop) in q_properties.iter(world) {
-        if p_pos.x == unit_pos.x && p_pos.y == unit_pos.y && p_prop.owner_id != Some(unit_faction) {
-            return Some(p_ent);
+        if p_pos.x == unit_pos.x && p_pos.y == unit_pos.y {
+            let max_points = p_prop.max_capture_points;
+            // 敵軍・中立拠点、またはダメージを受けている自軍拠点であれば対象とする
+            if max_points > 0
+                && (p_prop.owner_id != Some(unit_faction) || p_prop.capture_points < max_points)
+            {
+                return Some(p_ent);
+            }
         }
     }
 
@@ -77,7 +83,7 @@ pub fn capture_property_system(
 
         for (prop_pos, mut prop) in q_properties.iter_mut() {
             if prop_pos.x == pos.x && prop_pos.y == pos.y {
-                let max_points = prop.terrain.max_capture_points();
+                let max_points = prop.max_capture_points;
                 if max_points == 0 {
                     continue; // Not capturable
                 }
@@ -115,15 +121,33 @@ pub fn capture_property_system(
 }
 
 /// 勝敗判定システム。ターン終了時または拠点が占領された後に呼ばれるべきです。
+#[allow(clippy::too_many_arguments)]
 pub fn victory_check_system(
     mut match_state: ResMut<MatchState>,
     players: Res<Players>,
+    mut game_over_events: EventWriter<GameOverEvent>,
+    mut property_captured_events: EventReader<PropertyCapturedEvent>,
+    mut unit_destroyed_events: EventReader<UnitDestroyedEvent>,
+    mut phase_changed_events: EventReader<GamePhaseChangedEvent>,
     q_properties: Query<&Property>,
     q_units: Query<(&Faction, &Health)>,
 ) {
     if match_state.game_over.is_some() {
         return;
     }
+
+    // 関連イベントが発生していない場合は早期リターン
+    if property_captured_events.is_empty()
+        && unit_destroyed_events.is_empty()
+        && phase_changed_events.is_empty()
+    {
+        return;
+    }
+    // Read events to clear them (actually is_empty is enough, but we should clear readers in some cases)
+    // Here we just consume them.
+    property_captured_events.clear();
+    unit_destroyed_events.clear();
+    phase_changed_events.clear();
 
     let mut alive_players = Vec::new();
     for player in &players.0 {
@@ -150,9 +174,13 @@ pub fn victory_check_system(
     }
 
     if alive_players.len() == 1 {
-        match_state.game_over = Some(GameOverCondition::Winner(alive_players[0]));
+        let condition = GameOverCondition::Winner(alive_players[0]);
+        match_state.game_over = Some(condition.clone());
+        game_over_events.send(GameOverEvent { condition });
     } else if alive_players.is_empty() {
-        match_state.game_over = Some(GameOverCondition::Draw);
+        let condition = GameOverCondition::Draw;
+        match_state.game_over = Some(condition.clone());
+        game_over_events.send(GameOverEvent { condition });
     }
 }
 
@@ -211,7 +239,8 @@ mod tests {
             Property {
                 terrain: Terrain::City,
                 owner_id: None,
-                capture_points: 200, // max is 200
+                capture_points: 200,
+                max_capture_points: 200,
             },
         ));
 
@@ -222,6 +251,7 @@ mod tests {
                 terrain: Terrain::Capital,
                 owner_id: Some(PlayerId(1)),
                 capture_points: 200,
+                max_capture_points: 200,
             },
         ));
         world.spawn((
@@ -230,6 +260,7 @@ mod tests {
                 terrain: Terrain::Capital,
                 owner_id: Some(PlayerId(2)),
                 capture_points: 200,
+                max_capture_points: 200,
             },
         ));
         world.spawn((
@@ -280,6 +311,11 @@ mod tests {
     #[test]
     fn test_victory_check_winner() {
         let mut world = World::new();
+        world.init_resource::<Events<PropertyCapturedEvent>>();
+        world.init_resource::<Events<UnitDestroyedEvent>>();
+        world.init_resource::<Events<GamePhaseChangedEvent>>();
+        world.init_resource::<Events<GameOverEvent>>();
+
         let ms = MatchState {
             current_turn_number: TurnNumber(2),
             ..Default::default()
@@ -296,6 +332,7 @@ mod tests {
                 terrain: Terrain::Capital,
                 owner_id: Some(PlayerId(1)),
                 capture_points: 200,
+                max_capture_points: 200,
             },
         ));
         world.spawn((
@@ -308,6 +345,11 @@ mod tests {
         ));
 
         // P2 has no capital and no units -> gets eliminated
+        // Trigger manually by sending an event
+        world.send_event(GamePhaseChangedEvent {
+            active_player: PlayerId(1),
+            new_phase: Phase::Main,
+        });
 
         let mut schedule = Schedule::default();
         schedule.add_systems(victory_check_system);
@@ -320,6 +362,11 @@ mod tests {
     #[test]
     fn test_victory_check_draw() {
         let mut world = World::new();
+        world.init_resource::<Events<PropertyCapturedEvent>>();
+        world.init_resource::<Events<UnitDestroyedEvent>>();
+        world.init_resource::<Events<GamePhaseChangedEvent>>();
+        world.init_resource::<Events<GameOverEvent>>();
+
         let ms = MatchState {
             current_turn_number: TurnNumber(2),
             ..Default::default()
@@ -331,6 +378,10 @@ mod tests {
         ]));
 
         // No players have units or capitals, they all get eliminated -> Draw
+        world.send_event(GamePhaseChangedEvent {
+            active_player: PlayerId(1),
+            new_phase: Phase::Main,
+        });
 
         let mut schedule = Schedule::default();
         schedule.add_systems(victory_check_system);
@@ -343,6 +394,11 @@ mod tests {
     #[test]
     fn test_victory_check_turn1_exception() {
         let mut world = World::new();
+        world.init_resource::<Events<PropertyCapturedEvent>>();
+        world.init_resource::<Events<UnitDestroyedEvent>>();
+        world.init_resource::<Events<GamePhaseChangedEvent>>();
+        world.init_resource::<Events<GameOverEvent>>();
+
         let ms = MatchState {
             current_turn_number: TurnNumber(1), // Turn 1!
             ..Default::default()
@@ -359,6 +415,7 @@ mod tests {
                 terrain: Terrain::Capital,
                 owner_id: Some(PlayerId(1)),
                 capture_points: 200,
+                max_capture_points: 200,
             },
         ));
         world.spawn((
@@ -367,9 +424,14 @@ mod tests {
                 terrain: Terrain::Capital,
                 owner_id: Some(PlayerId(2)),
                 capture_points: 200,
+                max_capture_points: 200,
             },
         ));
         // No units for either player, but since it's turn 1 they shouldn't be annihilated yet!
+        world.send_event(GamePhaseChangedEvent {
+            active_player: PlayerId(1),
+            new_phase: Phase::Main,
+        });
 
         let mut schedule = Schedule::default();
         schedule.add_systems(victory_check_system);
@@ -377,5 +439,76 @@ mod tests {
 
         let ms = world.resource::<MatchState>();
         assert_eq!(ms.game_over, None); // Game should not be over yet
+    }
+
+    #[test]
+    fn test_friendly_property_repair() {
+        let mut world = World::new();
+
+        let ms = MatchState {
+            current_phase: Phase::Main,
+            ..Default::default()
+        };
+        world.insert_resource(ms);
+        world.insert_resource(Players(vec![Player::new(1, "P1".to_string())]));
+
+        world.insert_resource(Map::new(5, 5, Terrain::Plains, GridTopology::Square));
+        world.init_resource::<Events<CapturePropertyCommand>>();
+        world.init_resource::<Events<PropertyCapturedEvent>>();
+
+        let unit_entity = world
+            .spawn((
+                GridPosition { x: 2, y: 2 },
+                Faction(PlayerId(1)),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    cost: 1000,
+                    max_movement: 3,
+                    movement_type: MovementType::Infantry,
+                    max_fuel: 99,
+                    max_ammo1: 0,
+                    max_ammo2: 0,
+                    min_range: 1,
+                    max_range: 1,
+                    daily_fuel_consumption: 0,
+                    can_capture: true,
+                    can_supply: false,
+                    max_cargo: 0,
+                    loadable_unit_types: vec![],
+                },
+                ActionCompleted(false),
+            ))
+            .id();
+
+        world.spawn((
+            GridPosition { x: 2, y: 2 },
+            Property {
+                terrain: Terrain::City,
+                owner_id: Some(PlayerId(1)), // Friendly!
+                capture_points: 100,         // Damaged!
+                max_capture_points: 200,
+            },
+        ));
+
+        world.send_event(CapturePropertyCommand { unit_entity });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(capture_property_system);
+        schedule.run(&mut world);
+
+        let mut query = world.query::<&Property>();
+        let mut iter = query.iter(&world);
+        let prop = iter.find(|p| p.terrain == Terrain::City).unwrap();
+
+        // 10*10 = 100 + original 100 = 200
+        assert_eq!(prop.capture_points, 200);
+        assert_eq!(prop.owner_id, Some(PlayerId(1)));
+
+        let action = world.get::<ActionCompleted>(unit_entity).unwrap();
+        assert!(action.0); // Used action
     }
 }
