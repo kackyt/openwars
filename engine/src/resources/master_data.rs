@@ -304,10 +304,13 @@ impl MasterDataRegistry {
 
         // 7. マップ初期配置データ読み込み
         // プレイヤーIDと地形IDが結合された数値を MapData としてパースします。
-        let map_1_csv = include_str!("master_data/map/map_1.csv");
-        registry
-            .maps
-            .insert("map_1".to_string(), parse_map(map_1_csv)?);
+        let maps = [
+            ("map_1", include_str!("master_data/map/map_1.csv")),
+            ("map_2", include_str!("master_data/map/map_2.csv")),
+        ];
+        for (name, csv) in maps {
+            registry.maps.insert(name.to_string(), parse_map(csv)?);
+        }
 
         // 8. 整合性バリデーション
         // 地形(Landscape)の補給タイプ(supply_type)が、存在するカテゴリまたはユニット種別であるか検証します。
@@ -618,26 +621,31 @@ mod tests {
     #[test]
     fn test_load_map() {
         let registry = MasterDataRegistry::load().unwrap();
-        let map = registry.get_map("map_1").expect("map_1 not found");
+        // map_1 の確認
+        let map1 = registry.get_map("map_1").expect("map_1 not found");
+        assert_eq!(map1.width, 10);
+        assert_eq!(map1.height, 14);
 
-        assert_eq!(map.width, 10);
-        assert_eq!(map.height, 14);
+        // map_2 の確認
+        let map2 = registry.get_map("map_2").expect("map_2 not found");
+        assert!(map2.width > 0);
+        assert!(map2.height > 0);
 
         // Check decoding at specific known coordinates from the csv output we saw
         // Cell (0, 0) was '12' -> player 0, terrain 12 (海)
-        let cell_0_0 = map.get_cell(0, 0).unwrap();
+        let cell_0_0 = map1.get_cell(0, 0).unwrap();
         assert_eq!(cell_0_0.player_id, 0);
         assert_eq!(cell_0_0.terrain_id, LandscapeId(12));
 
         // Cell (1, 7) was '202' -> player 2, terrain 2 (都市)
         // Wait, cell (1, 7) meaning y=7 (row 8), x=1
         // Let's verify (1, 7)
-        let cell = map.get_cell(1, 7).unwrap();
+        let cell = map1.get_cell(1, 7).unwrap();
         assert_eq!(cell.player_id, 2);
         assert_eq!(cell.terrain_id, LandscapeId(2));
 
         // Cell (3, 11) is (x=3, y=11) -> 201 -> player 2, terrain 1 (首都)
-        let cell_capital = map.get_cell(3, 11).unwrap();
+        let cell_capital = map1.get_cell(3, 11).unwrap();
         assert_eq!(cell_capital.player_id, 2);
         assert_eq!(cell_capital.terrain_id, LandscapeId(1));
     }
