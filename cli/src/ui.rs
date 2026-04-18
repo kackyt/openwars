@@ -164,6 +164,7 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
 
                     if let Some(&(owner, u_type, is_completed, has_cargo)) = units.get(&(x, y)) {
                         symbol = unit_type_to_symbol(&u_type);
+                        // 基本色
                         let mut u_style = style
                             .fg(if owner == 1 {
                                 Color::LightBlue
@@ -172,20 +173,29 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                             })
                             .add_modifier(Modifier::BOLD);
 
-                        // ターゲットなら赤く強調（最優先に近い）
-                        if target_tiles.contains(&(x, y)) {
-                            u_style = u_style.bg(Color::Rgb(150, 0, 0)).fg(Color::White);
-                        } else if is_completed {
-                            // 行動済みユニットは中間色の反転表示
+                        // 背景色（優先度の低い順に適用）
+
+                        // 1. 移動可能範囲（青系/グレー）
+                        if reachable_tiles.contains(&(x, y)) {
+                            u_style = u_style.bg(Color::DarkGray).fg(Color::White);
+                        }
+
+                        // 2. 行動済み（反転/減衰系）
+                        if is_completed {
                             u_style = u_style
                                 .remove_modifier(Modifier::BOLD)
                                 .bg(if owner == 1 { Color::Rgb(40, 80, 160) } else { Color::Rgb(160, 60, 60) })
                                 .fg(Color::Black);
                         }
 
-                        // カーソル位置なら反転表示（これが最優先）
+                        // 3. ターゲット（赤）
+                        if target_tiles.contains(&(x, y)) {
+                            u_style = u_style.bg(Color::Rgb(150, 0, 0)).fg(Color::White).add_modifier(Modifier::BOLD);
+                        }
+
+                        // 4. カーソル位置（白） - 最優先
                         if x == cx && y == cy {
-                            u_style = u_style.bg(Color::White).fg(Color::Black);
+                            u_style = u_style.bg(Color::White).fg(Color::Black).add_modifier(Modifier::BOLD);
                         }
 
                         if has_cargo {

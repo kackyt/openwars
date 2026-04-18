@@ -1231,4 +1231,43 @@ mod tests {
         assert!(!world.get::<HasMoved>(unit_entity).unwrap().0); // 移動済みフラグ解除
         assert!(!world.contains_resource::<PendingMove>()); // 履歴が削除されている
     }
+
+    #[test]
+    fn test_transport_reachability_highlight() {
+        let map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        let master_data = crate::resources::master_data::MasterDataRegistry::load().unwrap();
+
+        // (1, 0) に輸送ユニットを配置
+        let mut unit_positions = HashMap::new();
+        let inf_type = UnitType::Infantry;
+        let transport_type = UnitType::TransportHelicopter;
+
+        unit_positions.insert(
+            (1, 0),
+            OccupantInfo {
+                player_id: PlayerId(1),
+                is_transport: true,
+                unit_type: transport_type,
+                loadable_types: vec![inf_type],
+                free_slots: 1,
+            },
+        );
+
+        let reachable = calculate_reachable_tiles(
+            &map,
+            &unit_positions,
+            (0, 0),
+            MovementType::Infantry,
+            3,
+            99,
+            PlayerId(1),
+            inf_type,
+            &master_data,
+        );
+
+        assert!(
+            reachable.contains(&(1, 0)),
+            "輸送ユニットがいるマスは、搭載可能な場合ハイライト（移動可能）されるべきです"
+        );
+    }
 }
