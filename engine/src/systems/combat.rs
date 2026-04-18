@@ -15,10 +15,10 @@ pub enum AttackError {
 impl std::fmt::Display for AttackError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidEntity => write!(f, "Invalid target entity format."),
-            Self::FriendlyFire => write!(f, "Cannot attack own units."),
-            Self::OutOfRange => write!(f, "Target is out of range."),
-            Self::IndirectAfterMove => write!(f, "Cannot use indirect weapons after moving."),
+            Self::InvalidEntity => write!(f, "無効なエンティティです。"),
+            Self::FriendlyFire => write!(f, "自軍ユニットは攻撃できません。"),
+            Self::OutOfRange => write!(f, "射程外です。"),
+            Self::IndirectAfterMove => write!(f, "間接攻撃武器は移動後に使用できません。"),
         }
     }
 }
@@ -232,7 +232,7 @@ fn select_weapon(
 ) -> Option<(u32, u32, bool)> {
     let unit_record = master_data.get_unit(&UnitName(attacker_name.to_string()))?;
 
-    // Try weapon 1
+    // 武器 1 を試行
     if let Some(w1) = unit_record
         .weapon1
         .as_ref()
@@ -246,7 +246,7 @@ fn select_weapon(
         return Some((1, dmg, w1.range_min > 1));
     }
 
-    // Try weapon 2
+    // 武器 2 を試行
     if let Some(w2) = unit_record
         .weapon2
         .as_ref()
@@ -254,11 +254,9 @@ fn select_weapon(
         && dist >= w2.range_min
         && dist <= w2.range_max
     {
-        // Note: secondary weapons (e.g. machine guns) usually don't consume primary ammo.
-        // However, openwars seems to use ammo1 and ammo2. Most secondary weapons have infinite ammo?
-        // Let's assume ammo2 > 0 is required if max_ammo2 > 0, but for now we'll just check if it's usable.
-        // In advance wars, secondary weapons have infinite ammo. So we will skip ammo2 check here, or assume
-        // openwars models it such that ammo2 is handled elsewhere.
+        // 備考: 副兵装（機関銃など）は通常、主兵装の弾薬を消費しません。
+        // openwars では ammo1/ammo2 を使用しますが、多くの副兵装は無限弾薬である可能性があります。
+        // ここでは ammo2 > 0 を条件としますが、Advance Wars のように無限弾薬とする場合は調整が必要です。
         if ammo2 > 0
             && let Some(&dmg) = w2.damages.get(defender_name)
             && dmg > 0
@@ -538,20 +536,12 @@ mod tests {
                 GridPosition { x: 0, y: 0 },
                 Faction(PlayerId(1)),
                 UnitStats {
-                    unit_type: UnitType::Infantry,
-                    cost: 1000,
-                    max_movement: 3,
-                    movement_type: MovementType::Infantry,
-                    max_fuel: 10,
                     max_ammo1: 9,
                     max_ammo2: 0,
                     min_range: 1,
                     max_range: 1,
-                    daily_fuel_consumption: 0,
                     can_capture: true,
-                    can_supply: false,
-                    max_cargo: 0,
-                    loadable_unit_types: vec![],
+                    ..UnitStats::mock()
                 },
                 ActionCompleted(false),
                 HasMoved(false),
@@ -573,20 +563,12 @@ mod tests {
                 GridPosition { x: 0, y: 1 },
                 Faction(PlayerId(2)),
                 UnitStats {
-                    unit_type: UnitType::Infantry,
-                    cost: 1000,
-                    max_movement: 3,
-                    movement_type: MovementType::Infantry,
-                    max_fuel: 10,
                     max_ammo1: 9,
                     max_ammo2: 0,
                     min_range: 1,
                     max_range: 1,
-                    daily_fuel_consumption: 0,
                     can_capture: true,
-                    can_supply: false,
-                    max_cargo: 0,
-                    loadable_unit_types: vec![],
+                    ..UnitStats::mock()
                 },
                 ActionCompleted(false),
                 HasMoved(false),

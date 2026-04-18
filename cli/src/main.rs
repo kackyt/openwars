@@ -69,9 +69,9 @@ fn run_ai_debug() -> Result<(), Box<dyn Error>> {
     let backend = TestBackend::new(120, 30);
     let mut terminal = Terminal::new(backend)?;
 
-    println!("--- AI TUI Debugger Started ---");
+    println!("--- AI TUI デバッガーが開始されました ---");
     println!(
-        "Commands: 'up', 'down', 'left', 'right', 'enter', 'esc', 'space', 'dump', 'q' (quit), or single chars like 'j' or 'T'."
+        "コマンド: 'up', 'down', 'left', 'right', 'enter', 'esc', 'space', 'dump', 'q' (終了), または 'j' や 'T' などの単一文字。"
     );
 
     let stdin = io::stdin();
@@ -86,7 +86,7 @@ fn run_ai_debug() -> Result<(), Box<dyn Error>> {
             if cmd == "q" || cmd == "quit" {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
-                    "Quit requested by AI",
+                    "AIによって終了が要求されました",
                 ));
             }
             if cmd == "dump" {

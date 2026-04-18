@@ -177,11 +177,7 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                             u_style = u_style
                                 .remove_modifier(Modifier::BOLD)
                                 .add_modifier(Modifier::DIM)
-                                .fg(if owner == 1 {
-                                    Color::Blue
-                                } else {
-                                    Color::Red
-                                });
+                                .fg(if owner == 1 { Color::Blue } else { Color::Red });
                         }
 
                         // カーソル位置なら反転表示
@@ -345,7 +341,6 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
 
     // 右側: 情報 & ログの表示準備
     let mut info_text = String::new();
-    let mut has_unit_at_cursor = false;
 
     if let Some(world) = &mut app.world {
         // プレイヤー情報
@@ -394,7 +389,6 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                 continue;
             }
             if u_pos.x == cx && u_pos.y == cy {
-                has_unit_at_cursor = true;
                 info_text.push_str("--- ユニット情報 ---\n");
                 info_text.push_str(&format!(
                     "{} (P{})\n",
@@ -487,8 +481,8 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                 if p_pos.x == cx && p_pos.y == cy {
                     info_text.push_str(&format!(
                         "占領: {}/{}\n",
-                        prop.capture_points / 10,
-                        prop.max_capture_points / 10
+                        prop.display_capture_points(),
+                        prop.display_max_capture_points()
                     ));
                     break;
                 }
@@ -498,9 +492,10 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
     }
     info_text.push_str("q:終了 / Esc:戻る\n方向キー:移動 / Space:決定\nx:キャンセル");
 
-    // レイアウト計算：ユニットの有無に応じて情報パネルの高さを調整
-    // ユニットあり 20行、地形のみ 13行に拡張して情報の欠落を防ぐ
-    let info_height = if has_unit_at_cursor { 20 } else { 12 };
+    // レイアウト計算：表示内容の行数に応じて情報パネルの高さを調整
+    // 行数に上下のボーダー分（+2）と、ある程度の余白を加えて動的に計算
+    let info_height = (info_text.lines().count() as u16).saturating_add(3);
+    let info_height = info_height.max(12); // 最低限の高さを確保
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(info_height), Constraint::Min(0)])

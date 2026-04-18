@@ -169,14 +169,16 @@ impl App {
                     .get(self.ui_state.selected_map_index)
                     .cloned();
                 if let Some(map_name) = map_name {
-                    // Transition to in-game
+                    // ゲーム画面へ遷移
                     if let Err(e) = self.initialize_world(map_name.clone()) {
-                        self.ui_state.add_log(format!("Map load error: {}", e));
+                        self.ui_state
+                            .add_log(format!("マップ読み込みエラー: {}", e));
                     } else {
                         self.ui_state.current_screen = CurrentScreen::InGame;
                         self.ui_state.in_game_state = InGameState::Normal;
                         self.ui_state.cursor_pos = (0, 0);
-                        self.ui_state.add_log(format!("Map '{}' loaded.", map_name));
+                        self.ui_state
+                            .add_log(format!("マップ '{}' を読み込みました。", map_name));
                     }
                 }
             }
@@ -967,33 +969,11 @@ impl App {
         }
 
         if actions.can_capture {
-            // 自軍拠点なら「修復」、そうでなければ「占領」
-            let mut is_friendly = false;
-            let u_faction = world
-                .get::<engine::components::Faction>(unit_entity)
-                .map(|f| f.0);
-            let u_pos = world
-                .get::<engine::components::GridPosition>(unit_entity)
-                .cloned();
+            options.push(ActionType::Capture);
+        }
 
-            if let (Some(fac_id), Some(pos)) = (u_faction, u_pos) {
-                let mut q_prop = world.query::<(
-                    &engine::components::GridPosition,
-                    &engine::components::Property,
-                )>();
-                for (p_pos, p_prop) in q_prop.iter(world) {
-                    if p_pos.x == pos.x && p_pos.y == pos.y && p_prop.owner_id == Some(fac_id) {
-                        is_friendly = true;
-                        break;
-                    }
-                }
-            }
-
-            if is_friendly {
-                options.push(ActionType::Repair);
-            } else {
-                options.push(ActionType::Capture);
-            }
+        if actions.can_repair {
+            options.push(ActionType::Repair);
         }
 
         if actions.can_supply {

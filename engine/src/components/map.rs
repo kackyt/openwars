@@ -28,4 +28,12 @@ impl Property {
             max_capture_points,
         }
     }
+
+    pub fn display_capture_points(&self) -> u32 {
+        self.capture_points / 10
+    }
+
+    pub fn display_max_capture_points(&self) -> u32 {
+        self.max_capture_points / 10
+    }
 }

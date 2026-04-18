@@ -175,12 +175,16 @@ pub fn victory_check_system(
 
     if alive_players.len() == 1 {
         let condition = GameOverCondition::Winner(alive_players[0]);
-        match_state.game_over = Some(condition.clone());
-        game_over_events.send(GameOverEvent { condition });
+        game_over_events.send(GameOverEvent {
+            condition: condition.clone(),
+        });
+        match_state.game_over = Some(condition);
     } else if alive_players.is_empty() {
         let condition = GameOverCondition::Draw;
-        match_state.game_over = Some(condition.clone());
-        game_over_events.send(GameOverEvent { condition });
+        game_over_events.send(GameOverEvent {
+            condition: condition.clone(),
+        });
+        match_state.game_over = Some(condition);
     }
 }
 
@@ -215,20 +219,8 @@ mod tests {
                     max: 100,
                 },
                 UnitStats {
-                    unit_type: UnitType::Infantry,
-                    cost: 1000,
-                    max_movement: 3,
-                    movement_type: MovementType::Infantry,
-                    max_fuel: 99,
-                    max_ammo1: 0,
-                    max_ammo2: 0,
-                    min_range: 1,
-                    max_range: 1,
-                    daily_fuel_consumption: 0,
                     can_capture: true,
-                    can_supply: false,
-                    max_cargo: 0,
-                    loadable_unit_types: vec![],
+                    ..UnitStats::mock()
                 },
                 ActionCompleted(false),
             ))
@@ -465,20 +457,8 @@ mod tests {
                     max: 100,
                 },
                 UnitStats {
-                    unit_type: UnitType::Infantry,
-                    cost: 1000,
-                    max_movement: 3,
-                    movement_type: MovementType::Infantry,
-                    max_fuel: 99,
-                    max_ammo1: 0,
-                    max_ammo2: 0,
-                    min_range: 1,
-                    max_range: 1,
-                    daily_fuel_consumption: 0,
                     can_capture: true,
-                    can_supply: false,
-                    max_cargo: 0,
-                    loadable_unit_types: vec![],
+                    ..UnitStats::mock()
                 },
                 ActionCompleted(false),
             ))
