@@ -1062,26 +1062,8 @@ impl App {
         // Intentionally skipping manual event clearance (update_system) to avoid Bevy version disparities.
         // EventReader correctly tracks indices, so old events won't be reprocessed.
 
-        // Add game logic systems (order is important for game loop, but default parallel works for independent ones)
-        // Note: engine systems are mostly command -> event processors.
-        schedule.add_systems(
-            (
-                produce_unit_system,
-                move_unit_system,
-                attack_unit_system,
-                remove_destroyed_units_system,
-                capture_property_system,
-                merge_unit_system,
-                supply_unit_system,
-                load_unit_system,
-                unload_unit_system,
-                wait_unit_system,
-                undo_move_system,
-                next_phase_system,
-                victory_check_system,
-            )
-                .chain(),
-        );
+        // Add game logic systems (order is managed by engine)
+        add_main_game_systems(&mut schedule);
 
         // Build UnitRegistry and DamageChart from MasterDataRegistry
         let mut damage_chart = engine::resources::DamageChart::new();

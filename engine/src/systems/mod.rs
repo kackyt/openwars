@@ -17,3 +17,29 @@ pub use property::*;
 pub use supply::*;
 pub use transport::*;
 pub use turn_management::*;
+
+use bevy_ecs::schedule::{IntoSystemConfigs, Schedule};
+
+/// すべてのゲームロジックシステムを正しい順序でスケジュールに追加します。
+/// プレゼンテーション層はこの関数を呼び出すことで、ビジネスロジックの整合性を保つことができます。
+pub fn add_main_game_systems(schedule: &mut Schedule) {
+    schedule.add_systems(
+        (
+            produce_unit_system,
+            move_unit_system,
+            attack_unit_system,
+            sync_cargo_health_system,
+            remove_destroyed_units_system,
+            capture_property_system,
+            merge_unit_system,
+            supply_unit_system,
+            load_unit_system,
+            unload_unit_system,
+            wait_unit_system,
+            undo_move_system,
+            next_phase_system,
+            victory_check_system,
+        )
+            .chain(),
+    );
+}

@@ -309,6 +309,40 @@ pub fn unload_unit_system(
     }
 }
 
+/// 輸送ユニットのHPが減少した際、搭載されているユニットのHPを輸送ユニットのHP以下に同期させます。
+/// (cargo_hp = min(cargo_hp, transport_hp))
+pub fn sync_cargo_health_system(
+    mut set: ParamSet<(
+        Query<(&Transporting, Entity)>,
+        Query<&mut Health>,
+        Query<&Health>,
+    )>,
+) {
+    let mut updates = Vec::new();
+
+    // 1. 更新が必要な積載ユニットを特定
+    {
+        let links: Vec<(Entity, Entity)> = set.p0().iter().map(|(t, c)| (c, t.0)).collect();
+        let q_health = set.p2();
+
+        for (cargo_ent, transport_ent) in links {
+            if let (Ok(c_hp), Ok(t_hp)) = (q_health.get(cargo_ent), q_health.get(transport_ent)) {
+                if c_hp.current > t_hp.current {
+                    updates.push((cargo_ent, t_hp.current));
+                }
+            }
+        }
+    }
+
+    // 2. HPの更新を適用
+    let mut q_health_mut = set.p1();
+    for (ent, new_hp) in updates {
+        if let Ok(mut hp) = q_health_mut.get_mut(ent) {
+            hp.current = new_hp;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,5 +663,71 @@ mod tests {
             !tiles_veh.contains(&(0, 1)),
             "Vehicle should NOT be able to drop on Mountain"
         );
+    }
+
+    #[test]
+    fn test_cargo_health_sync_on_damage() {
+        let mut world = World::new();
+
+        // 輸送ユニット (HP 100)
+        let transport_entity = world
+            .spawn((
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                CargoCapacity {
+                    max: 1,
+                    loaded: vec![],
+                },
+            ))
+            .id();
+
+        // 搭載ユニット1 (HP 100) - 輸送ユニットと同レベル
+        let cargo1_entity = world
+            .spawn((
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Transporting(transport_entity),
+            ))
+            .id();
+
+        // 搭載ユニット2 (HP 40) - 輸送ユニットより低い
+        let cargo2_entity = world
+            .spawn((
+                Health {
+                    current: 40,
+                    max: 100,
+                },
+                Transporting(transport_entity),
+            ))
+            .id();
+
+        world
+            .get_mut::<CargoCapacity>(transport_entity)
+            .unwrap()
+            .loaded = vec![cargo1_entity, cargo2_entity];
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(sync_cargo_health_system);
+
+        // 1. 輸送ユニットにダメージ (HP 100 -> 60)
+        world.get_mut::<Health>(transport_entity).unwrap().current = 60;
+        schedule.run(&mut world);
+
+        // cargo1 は 60 になるはず
+        assert_eq!(world.get::<Health>(cargo1_entity).unwrap().current, 60);
+        // cargo2 は 40 のまま（増えない）はず
+        assert_eq!(world.get::<Health>(cargo2_entity).unwrap().current, 40);
+
+        // 2. 輸送ユニット撃破 (HP 60 -> 0)
+        world.get_mut::<Health>(transport_entity).unwrap().current = 0;
+        schedule.run(&mut world);
+
+        // 両方 0 になるはず
+        assert_eq!(world.get::<Health>(cargo1_entity).unwrap().current, 0);
+        assert_eq!(world.get::<Health>(cargo2_entity).unwrap().current, 0);
     }
 }
