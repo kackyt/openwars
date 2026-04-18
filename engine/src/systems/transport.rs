@@ -311,6 +311,7 @@ pub fn unload_unit_system(
 
 /// 輸送ユニットのHPが減少した際、搭載されているユニットのHPを輸送ユニットのHP以下に同期させます。
 /// (cargo_hp = min(cargo_hp, transport_hp))
+#[allow(clippy::type_complexity)]
 pub fn sync_cargo_health_system(
     mut set: ParamSet<(
         Query<(&Transporting, Entity)>,
@@ -326,10 +327,10 @@ pub fn sync_cargo_health_system(
         let q_health = set.p2();
 
         for (cargo_ent, transport_ent) in links {
-            if let (Ok(c_hp), Ok(t_hp)) = (q_health.get(cargo_ent), q_health.get(transport_ent)) {
-                if c_hp.current > t_hp.current {
-                    updates.push((cargo_ent, t_hp.current));
-                }
+            if let (Ok(c_hp), Ok(t_hp)) = (q_health.get(cargo_ent), q_health.get(transport_ent))
+                && c_hp.current > t_hp.current
+            {
+                updates.push((cargo_ent, t_hp.current));
             }
         }
     }

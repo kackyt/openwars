@@ -184,18 +184,28 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                         if is_completed {
                             u_style = u_style
                                 .remove_modifier(Modifier::BOLD)
-                                .bg(if owner == 1 { Color::Rgb(40, 80, 160) } else { Color::Rgb(160, 60, 60) })
+                                .bg(if owner == 1 {
+                                    Color::Rgb(40, 80, 160)
+                                } else {
+                                    Color::Rgb(160, 60, 60)
+                                })
                                 .fg(Color::Black);
                         }
 
                         // 3. ターゲット（赤）
                         if target_tiles.contains(&(x, y)) {
-                            u_style = u_style.bg(Color::Rgb(150, 0, 0)).fg(Color::White).add_modifier(Modifier::BOLD);
+                            u_style = u_style
+                                .bg(Color::Rgb(150, 0, 0))
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD);
                         }
 
                         // 4. カーソル位置（白） - 最優先
                         if x == cx && y == cy {
-                            u_style = u_style.bg(Color::White).fg(Color::Black).add_modifier(Modifier::BOLD);
+                            u_style = u_style
+                                .bg(Color::White)
+                                .fg(Color::Black)
+                                .add_modifier(Modifier::BOLD);
                         }
 
                         if has_cargo {
@@ -281,16 +291,6 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             menu_data = Some((
                 "どこに降ろしますか？".to_string(),
                 vec!["[カーソルで対象を選択]".to_string()],
-                0,
-            ));
-        }
-        crate::app::InGameState::EventPopup { message } => {
-            menu_data = Some(("イベント".to_string(), vec![message.clone()], 0));
-        }
-        crate::app::InGameState::GameOverPopup { message, .. } => {
-            menu_data = Some((
-                "ゲーム終了".to_string(),
-                vec![message.clone(), "[Esc] マップ選択へ戻る".to_string()],
                 0,
             ));
         }
