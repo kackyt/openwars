@@ -188,14 +188,8 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                             u_style = u_style.bg(Color::White).fg(Color::Black);
                         }
 
-                        // 搭載がある場合は記号にアスタリスクを付ける
-                        let mut cargo_symbol = symbol.to_string();
                         if has_cargo {
-                            cargo_symbol.push('*');
-                        }
-
-                        if cargo_symbol.len() > 1 {
-                            line_spans.push(Span::styled(format!(" {} ", cargo_symbol), u_style));
+                            line_spans.push(Span::styled(format!(" {}*", symbol), u_style));
                         } else {
                             line_spans.push(Span::styled(format!(" {} ", symbol), u_style));
                         }
