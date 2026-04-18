@@ -216,14 +216,17 @@ pub fn load_unit_system(
 pub fn unload_unit_system(
     mut commands: Commands,
     mut unload_events: EventReader<UnloadUnitCommand>,
-    mut q_units: Query<(
-        Entity,
-        &mut GridPosition,
-        &Faction,
-        &mut ActionCompleted,
-        Option<&mut CargoCapacity>,
-        Option<&Transporting>,
-        &UnitStats,
+    mut set: ParamSet<(
+        Query<(
+            Entity,
+            &mut GridPosition,
+            &Faction,
+            &mut ActionCompleted,
+            Option<&mut CargoCapacity>,
+            Option<&Transporting>,
+            &UnitStats,
+        )>,
+        Query<&ActionCompleted>,
     )>,
     match_state: Res<MatchState>,
     players: Res<Players>,
@@ -236,7 +239,7 @@ pub fn unload_unit_system(
     let active_player_id = players.0[match_state.active_player_index.0].id;
 
     for event in unload_events.read() {
-        let (trans_pos, trans_faction, trans_action) = match q_units.get(event.transport_entity) {
+        let (trans_pos, trans_faction, trans_action) = match set.p0().get(event.transport_entity) {
             Ok((_, p, f, a, _, _, _)) => (*p, f.0, a.0),
             _ => continue,
         };
@@ -245,9 +248,9 @@ pub fn unload_unit_system(
             continue;
         }
 
-        let (_cargo_faction, cargo_action, cargo_trans, cargo_stats) =
-            match q_units.get(event.cargo_entity) {
-                Ok((_, _, f, a, _, t, s)) => (f.0, a.0, t.map(|x| x.0), s),
+        let (cargo_action, cargo_trans, cargo_movement_type) =
+            match set.p0().get(event.cargo_entity) {
+                Ok((_, _, _, a, _, t, s)) => (a.0, t.map(|x| x.0), s.movement_type),
                 _ => continue,
             };
 
@@ -273,7 +276,7 @@ pub fn unload_unit_system(
         };
         if crate::systems::movement::get_valid_movement_cost(
             &master_data,
-            cargo_stats.movement_type,
+            cargo_movement_type,
             terrain,
         )
         .is_none()
@@ -283,7 +286,7 @@ pub fn unload_unit_system(
 
         // Check if target is occupied
         let mut occupied = false;
-        for (_, p, _, _, _, t, _) in q_units.iter() {
+        for (_, p, _, _, _, t, _) in set.p0().iter() {
             if p.x == event.target_x && p.y == event.target_y && t.is_none() {
                 occupied = true;
                 break;
@@ -293,13 +296,39 @@ pub fn unload_unit_system(
             continue;
         }
 
+        // 他の未行動ユニットが残っているか事前にチェック
+        let other_cargo_candidates: Vec<Entity> =
+            if let Ok((_, _, _, _, Some(cap), _, _)) = set.p0().get(event.transport_entity) {
+                cap.loaded
+                    .iter()
+                    .cloned()
+                    .filter(|&e| e != event.cargo_entity)
+                    .collect()
+            } else {
+                vec![]
+            };
+
+        let mut has_other_ready_cargo = false;
+        for other_ent in other_cargo_candidates {
+            if let Ok(other_act) = set.p1().get(other_ent) {
+                if !other_act.0 {
+                    has_other_ready_cargo = true;
+                    break;
+                }
+            }
+        }
+
+        let mut q_units = set.p0();
         if let Ok([mut transport, mut cargo]) =
             q_units.get_many_mut([event.transport_entity, event.cargo_entity])
         {
-            if let Some(mut cap) = transport.4 {
+            if let Some(ref mut cap) = transport.4 {
                 cap.loaded.retain(|&e| e != event.cargo_entity);
             }
-            transport.3.0 = true; // Transport action completed
+
+            if !has_other_ready_cargo {
+                transport.3.0 = true; // Transport action completed
+            }
 
             cargo.1.x = event.target_x;
             cargo.1.y = event.target_y;
@@ -730,5 +759,112 @@ mod tests {
         // 両方 0 になるはず
         assert_eq!(world.get::<Health>(cargo1_entity).unwrap().current, 0);
         assert_eq!(world.get::<Health>(cargo2_entity).unwrap().current, 0);
+    }
+
+    #[test]
+    fn test_multiple_unload_sequence() {
+        let mut world = World::new();
+
+        let ms = MatchState {
+            current_phase: Phase::Main,
+            ..Default::default()
+        };
+        world.insert_resource(ms);
+        world.insert_resource(Players(vec![Player::new(1, "P1".to_string())]));
+
+        world.insert_resource(Events::<UnloadUnitCommand>::default());
+
+        let map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
+        world.insert_resource(map);
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+
+        let transport_entity = world
+            .spawn((
+                GridPosition { x: 5, y: 5 },
+                Faction(PlayerId(1)),
+                ActionCompleted(false),
+                UnitStats {
+                    unit_type: UnitType::TransportHelicopter,
+                    max_cargo: 2,
+                    loadable_unit_types: vec![UnitType::Infantry],
+                    ..UnitStats::mock()
+                },
+                CargoCapacity {
+                    max: 2,
+                    loaded: vec![],
+                },
+            ))
+            .id();
+
+        let cargo1 = world
+            .spawn((
+                GridPosition { x: 999, y: 999 },
+                Faction(PlayerId(1)),
+                ActionCompleted(false),
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    ..UnitStats::mock()
+                },
+                Transporting(transport_entity),
+            ))
+            .id();
+
+        let cargo2 = world
+            .spawn((
+                GridPosition { x: 999, y: 999 },
+                Faction(PlayerId(1)),
+                ActionCompleted(false),
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    ..UnitStats::mock()
+                },
+                Transporting(transport_entity),
+            ))
+            .id();
+
+        world.get_mut::<CargoCapacity>(transport_entity).unwrap().loaded = vec![cargo1, cargo2];
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(unload_unit_system);
+
+        // 1回目の降車
+        world.send_event(UnloadUnitCommand {
+            transport_entity,
+            cargo_entity: cargo1,
+            target_x: 6,
+            target_y: 5,
+        });
+        schedule.run(&mut world);
+
+        // まだ cargo2 が未行動なので、輸送艦は行動済みにならないはず
+        assert!(!world.get::<ActionCompleted>(transport_entity).unwrap().0);
+        assert_eq!(
+            world
+                .get::<CargoCapacity>(transport_entity)
+                .unwrap()
+                .loaded
+                .len(),
+            1
+        );
+
+        // 2回目の降車
+        world.send_event(UnloadUnitCommand {
+            transport_entity,
+            cargo_entity: cargo2,
+            target_x: 4,
+            target_y: 5,
+        });
+        schedule.run(&mut world);
+
+        // これで全て降ろしたので、輸送艦は行動済みになるはず
+        assert!(world.get::<ActionCompleted>(transport_entity).unwrap().0);
+        assert_eq!(
+            world
+                .get::<CargoCapacity>(transport_entity)
+                .unwrap()
+                .loaded
+                .len(),
+            0
+        );
     }
 }

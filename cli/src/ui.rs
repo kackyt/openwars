@@ -272,9 +272,26 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             let mut options = Vec::new();
             if let Some(world) = &mut app.world {
                 for entity in passengers {
-                    let mut q = world.query::<&engine::components::UnitStats>();
-                    if let Ok(stats) = q.get(world, *entity) {
-                        options.push(stats.unit_type.as_str().to_string());
+                    if let (Ok(stats), Some(h)) = (
+                        world.query::<&engine::components::UnitStats>().get(world, *entity),
+                        world.get::<engine::components::Health>(*entity),
+                    ) {
+                        let mut info = format!("{} ", stats.unit_type.as_str());
+                        let display_hp = (h.current.saturating_add(9)) / 10;
+                        info.push_str(&format!("HP:{:2} ", display_hp));
+                        
+                        if let Some(f) = world.get::<engine::components::Fuel>(*entity) {
+                            info.push_str(&format!("燃料:{:2}/{:2} ", f.current, f.max));
+                        }
+                        if let Some(a) = world.get::<engine::components::Ammo>(*entity) {
+                            if a.max_ammo1 > 0 {
+                                info.push_str(&format!("弾1:{:2}/{:2} ", a.ammo1, a.max_ammo1));
+                            }
+                            if a.max_ammo2 > 0 {
+                                info.push_str(&format!("弾2:{:2}/{:2} ", a.ammo2, a.max_ammo2));
+                            }
+                        }
+                        options.push(info);
                     } else {
                         options.push(format!("{:?}", entity));
                     }
@@ -322,7 +339,16 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         let mut menu_x = map_x + (cx as u16 * 3) + 4; // 記号が " X " なので 3マス分
         let mut menu_y = map_y + cy as u16;
 
-        let menu_width = 30;
+        let mut menu_width = 30u16;
+        for opt in &options {
+            // 日本語文字(2byte)を考慮して簡易的に計算
+            let width = opt.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum::<u16>() + 4;
+            if width > menu_width {
+                menu_width = width;
+            }
+        }
+        let menu_width = menu_width.min(f.size().width.saturating_sub(menu_x)); // 画面端を超えないように制限
+
         let menu_height = (options.len() as u16) + 2;
 
         // 画面端の考慮

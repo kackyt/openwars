@@ -705,14 +705,24 @@ impl App {
                         ActionType::Drop => {
                             let mut passengers = vec![];
                             if let Some(world) = &mut self.world {
-                                let mut q = world.query::<&engine::components::CargoCapacity>();
-                                if let Ok(cargo) = q.get(world, entity) {
-                                    passengers = cargo.loaded.clone();
+                                if let Ok(cargo) = world
+                                    .query::<&engine::components::CargoCapacity>()
+                                    .get(world, entity)
+                                {
+                                    for &p_ent in &cargo.loaded {
+                                        if let Some(act) =
+                                            world.get::<engine::components::ActionCompleted>(p_ent)
+                                        {
+                                            if !act.0 {
+                                                passengers.push(p_ent);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             if passengers.is_empty() {
                                 self.ui_state
-                                    .add_log("降車させるユニットがいません。".to_string());
+                                    .add_log("降車可能な未行動ユニットがいません。".to_string());
                             } else {
                                 self.ui_state.in_game_state = InGameState::CargoSelection {
                                     transport_entity: entity,
@@ -1020,7 +1030,9 @@ impl App {
         }
         self.ui_state
             .add_log(format!("ユニットを降ろしました: {:?}", (cx, cy)));
-        self.ui_state.in_game_state = InGameState::Normal;
+        self.ui_state.in_game_state = InGameState::WaitActionMenu {
+            unit_entity: transport_entity,
+        };
     }
 
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {

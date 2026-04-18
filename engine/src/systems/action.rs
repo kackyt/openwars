@@ -74,12 +74,19 @@ pub fn get_available_actions(
         can_supply: !supply::get_suppliable_targets(world, unit_entity).is_empty(),
         can_load,
         can_drop: {
-            let mut has_passengers = false;
+            let mut can_drop = false;
             let mut q_cargo = world.query::<&CargoCapacity>();
             if let Ok(cargo) = q_cargo.get(world, unit_entity) {
-                has_passengers = !cargo.loaded.is_empty();
+                for &passenger in &cargo.loaded {
+                    if let Some(action) = world.get::<ActionCompleted>(passenger) {
+                        if !action.0 {
+                            can_drop = true;
+                            break;
+                        }
+                    }
+                }
             }
-            has_passengers
+            can_drop
         },
         can_merge,
         // 移動先が搭載または合流対象である場合、待機は不可（重なり防止）
