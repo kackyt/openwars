@@ -172,15 +172,18 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                             })
                             .add_modifier(Modifier::BOLD);
 
-                        // 行動済みユニットは中間色の反転表示
-                        if is_completed {
+                        // ターゲットなら赤く強調（最優先に近い）
+                        if target_tiles.contains(&(x, y)) {
+                            u_style = u_style.bg(Color::Rgb(150, 0, 0)).fg(Color::White);
+                        } else if is_completed {
+                            // 行動済みユニットは中間色の反転表示
                             u_style = u_style
                                 .remove_modifier(Modifier::BOLD)
                                 .bg(if owner == 1 { Color::Rgb(40, 80, 160) } else { Color::Rgb(160, 60, 60) })
                                 .fg(Color::Black);
                         }
 
-                        // カーソル位置なら反転表示
+                        // カーソル位置なら反転表示（これが最優先）
                         if x == cx && y == cy {
                             u_style = u_style.bg(Color::White).fg(Color::Black);
                         }
