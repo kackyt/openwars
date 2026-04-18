@@ -172,12 +172,12 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                             })
                             .add_modifier(Modifier::BOLD);
 
-                        // 行動済みユニットは暗く表示（勢力色は維持）
+                        // 行動済みユニットは中間色の反転表示
                         if is_completed {
                             u_style = u_style
                                 .remove_modifier(Modifier::BOLD)
-                                .add_modifier(Modifier::DIM)
-                                .fg(if owner == 1 { Color::Blue } else { Color::Red });
+                                .bg(if owner == 1 { Color::Rgb(40, 80, 160) } else { Color::Rgb(160, 60, 60) })
+                                .fg(Color::Black);
                         }
 
                         // カーソル位置なら反転表示
