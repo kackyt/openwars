@@ -30,10 +30,10 @@ impl Property {
     }
 
     pub fn display_capture_points(&self) -> u32 {
-        self.capture_points / 10
+        self.capture_points
     }
 
     pub fn display_max_capture_points(&self) -> u32 {
-        self.max_capture_points / 10
+        self.max_capture_points
     }
 }
