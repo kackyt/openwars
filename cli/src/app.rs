@@ -91,23 +91,35 @@ pub enum InGameState {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayerControlType {
+    Human,
+    Ai,
+}
+
 pub struct UiState {
     pub current_screen: CurrentScreen,
     pub in_game_state: InGameState,
     pub selected_map_index: usize,
     pub available_maps: Vec<String>,
     // In-game state
+    pub player_controls: std::collections::HashMap<u32, PlayerControlType>,
     pub cursor_pos: (usize, usize),
     pub log_messages: Vec<String>,
 }
 
 impl UiState {
     pub fn new(maps: Vec<String>) -> Self {
+        let mut controls = std::collections::HashMap::new();
+        controls.insert(1, PlayerControlType::Human);
+        controls.insert(2, PlayerControlType::Ai);
+
         Self {
             current_screen: CurrentScreen::MapSelection,
             in_game_state: InGameState::Normal,
             selected_map_index: 0,
             available_maps: maps,
+            player_controls: controls,
             cursor_pos: (0, 0),
             log_messages: Vec::new(),
         }
@@ -160,6 +172,36 @@ impl App {
                 self.ui_state.selected_map_index += 1;
             }
             KeyCode::Down | KeyCode::Char('j') => {}
+            KeyCode::Char('1') => {
+                let current = self
+                    .ui_state
+                    .player_controls
+                    .get(&1)
+                    .copied()
+                    .unwrap_or(PlayerControlType::Human);
+                self.ui_state.player_controls.insert(
+                    1,
+                    match current {
+                        PlayerControlType::Human => PlayerControlType::Ai,
+                        PlayerControlType::Ai => PlayerControlType::Human,
+                    },
+                );
+            }
+            KeyCode::Char('2') => {
+                let current = self
+                    .ui_state
+                    .player_controls
+                    .get(&2)
+                    .copied()
+                    .unwrap_or(PlayerControlType::Ai);
+                self.ui_state.player_controls.insert(
+                    2,
+                    match current {
+                        PlayerControlType::Human => PlayerControlType::Ai,
+                        PlayerControlType::Ai => PlayerControlType::Human,
+                    },
+                );
+            }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 // Determine the selected map
                 let map_name = self
@@ -186,6 +228,21 @@ impl App {
     }
 
     pub fn handle_in_game_key(&mut self, key: crossterm::event::KeyEvent) {
+        // AIターンの場合は一部のキー（終了など）以外は無視する
+        if let Some(world) = &self.world
+            && let Some(match_state) = world.get_resource::<engine::resources::MatchState>()
+                && let Some(players) = world.get_resource::<engine::resources::Players>()
+                    && let Some(active_player) = players.0.get(match_state.active_player_index.0)
+                        && let InGameState::Normal = self.ui_state.in_game_state
+                            && self.ui_state.player_controls.get(&active_player.id.0)
+                                == Some(&PlayerControlType::Ai)
+                            {
+                                match key.code {
+                                    crossterm::event::KeyCode::Char('q') => self.should_quit = true,
+                                    _ => return, // AIターン中は他の入力を無視
+                                }
+                            }
+
         use crossterm::event::KeyCode;
 
         match key.code {
@@ -1026,6 +1083,32 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
+        // AIモードトグルのためのホットキー ('p')
+        if let crossterm::event::KeyCode::Char('p') = key.code
+            && let Some(world) = &self.world
+                && let Some(match_state) = world.get_resource::<engine::resources::MatchState>()
+                    && let Some(players) = world.get_resource::<engine::resources::Players>()
+                        && let Some(active_player) =
+                            players.0.get(match_state.active_player_index.0)
+                        {
+                            let pid = active_player.id.0;
+                            let new_ctrl =
+                                if let Some(ctrl) = self.ui_state.player_controls.get_mut(&pid) {
+                                    *ctrl = match *ctrl {
+                                        PlayerControlType::Human => PlayerControlType::Ai,
+                                        PlayerControlType::Ai => PlayerControlType::Human,
+                                    };
+                                    Some(*ctrl)
+                                } else {
+                                    None
+                                };
+
+                            if let Some(ctrl) = new_ctrl {
+                                self.ui_state
+                                    .add_log(format!("Player {} is now {:?}", pid, ctrl));
+                            }
+                        }
+
         match self.ui_state.current_screen {
             CurrentScreen::MapSelection => self.handle_map_selection_key(key),
             CurrentScreen::InGame => self.handle_in_game_key(key),

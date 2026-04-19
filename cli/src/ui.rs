@@ -59,8 +59,21 @@ fn draw_map_selection(f: &mut Frame, app: &mut App) {
         List::new(items).block(Block::default().borders(Borders::ALL).title(" マップ一覧 "));
     f.render_widget(maps_list, chunks[1]);
 
-    let footer = Paragraph::new("方向キー(↑/↓)で選択、Enterで決定、qで終了")
-        .block(Block::default().borders(Borders::ALL));
+    // Player controls section
+    let p1_ctrl = match app.ui_state.player_controls.get(&1) {
+        Some(crate::app::PlayerControlType::Ai) => "AI",
+        _ => "Human",
+    };
+    let p2_ctrl = match app.ui_state.player_controls.get(&2) {
+        Some(crate::app::PlayerControlType::Ai) => "AI",
+        _ => "Human",
+    };
+
+    let footer_text = format!(
+        "方向キー(↑/↓)で選択、Enterで決定、qで終了 | P1 (押下 '1'): {} | P2 (押下 '2'): {}",
+        p1_ctrl, p2_ctrl
+    );
+    let footer = Paragraph::new(footer_text).block(Block::default().borders(Borders::ALL));
     f.render_widget(footer, chunks[2]);
 }
 

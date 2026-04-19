@@ -177,12 +177,136 @@ where
         if app.ui_state.current_screen == app::CurrentScreen::InGame {
             let mut popup_msg = None;
             if let (Some(world), Some(schedule)) = (&mut app.world, &mut app.schedule) {
-                schedule.run(world);
-
-                use app::InGameState;
+                use app::{InGameState, PlayerControlType};
                 use bevy_ecs::event::Events;
+                use engine::ai::engine::{AiCommand, decide_ai_action};
+                use engine::ai::production::decide_production;
+                use engine::events::{
+                    AttackUnitCommand, CapturePropertyCommand, MoveUnitCommand, ProduceUnitCommand,
+                    WaitUnitCommand,
+                };
                 use engine::events::{GameOverEvent, GamePhaseChangedEvent, UnitAttackedEvent};
-                use engine::resources::{GameOverCondition, Players};
+                use engine::resources::{GameOverCondition, MatchState, Players};
+
+                // AIターンの自動進行
+                if let InGameState::Normal = app.ui_state.in_game_state {
+                    let mut active_player_opt = None;
+                    if let Some(match_state) = world.get_resource::<MatchState>()
+                        && let Some(players) = world.get_resource::<Players>() {
+                            let idx = match_state.active_player_index.0;
+                            if let Some(player) = players.0.get(idx) {
+                                active_player_opt = Some(player.id);
+                            }
+                        }
+
+                    if let Some(active_player) = active_player_opt
+                        && app.ui_state.player_controls.get(&active_player.0)
+                            == Some(&PlayerControlType::Ai)
+                        {
+                            // 生産AIの実行
+                            let mut prod_commands = decide_production(world, active_player);
+                            if let Some(mut events) =
+                                world.get_resource_mut::<Events<ProduceUnitCommand>>()
+                            {
+                                for cmd in prod_commands.drain(..) {
+                                    events.send(cmd);
+                                }
+                            }
+
+                            // 行動決定AIの実行
+                            if let Some((entity, command)) = decide_ai_action(world, active_player)
+                            {
+                                match command {
+                                    AiCommand::Move { target_pos } => {
+                                        if let Some(mut move_events) =
+                                            world.get_resource_mut::<Events<MoveUnitCommand>>()
+                                        {
+                                            move_events.send(MoveUnitCommand {
+                                                unit_entity: entity,
+                                                target_x: target_pos.x,
+                                                target_y: target_pos.y,
+                                            });
+                                        }
+                                        if let Some(mut wait_events) =
+                                            world.get_resource_mut::<Events<WaitUnitCommand>>()
+                                        {
+                                            wait_events.send(WaitUnitCommand {
+                                                unit_entity: entity,
+                                            });
+                                        }
+                                    }
+                                    AiCommand::Attack {
+                                        target_pos,
+                                        target_entity,
+                                    } => {
+                                        if let Some(mut move_events) =
+                                            world.get_resource_mut::<Events<MoveUnitCommand>>()
+                                        {
+                                            move_events.send(MoveUnitCommand {
+                                                unit_entity: entity,
+                                                target_x: target_pos.x,
+                                                target_y: target_pos.y,
+                                            });
+                                        }
+                                        if let Some(mut atk_events) =
+                                            world.get_resource_mut::<Events<AttackUnitCommand>>()
+                                        {
+                                            atk_events.send(AttackUnitCommand {
+                                                attacker_entity: entity,
+                                                defender_entity: target_entity,
+                                            });
+                                        }
+                                    }
+                                    AiCommand::Capture { target_pos } => {
+                                        if let Some(mut move_events) =
+                                            world.get_resource_mut::<Events<MoveUnitCommand>>()
+                                        {
+                                            move_events.send(MoveUnitCommand {
+                                                unit_entity: entity,
+                                                target_x: target_pos.x,
+                                                target_y: target_pos.y,
+                                            });
+                                        }
+                                        if let Some(mut cap_events) = world
+                                            .get_resource_mut::<Events<CapturePropertyCommand>>()
+                                        {
+                                            cap_events.send(CapturePropertyCommand {
+                                                unit_entity: entity,
+                                            });
+                                        }
+                                    }
+                                    AiCommand::Wait { target_pos } => {
+                                        if let Some(mut move_events) =
+                                            world.get_resource_mut::<Events<MoveUnitCommand>>()
+                                        {
+                                            move_events.send(MoveUnitCommand {
+                                                unit_entity: entity,
+                                                target_x: target_pos.x,
+                                                target_y: target_pos.y,
+                                            });
+                                        }
+                                        if let Some(mut wait_events) =
+                                            world.get_resource_mut::<Events<WaitUnitCommand>>()
+                                        {
+                                            wait_events.send(WaitUnitCommand {
+                                                unit_entity: entity,
+                                            });
+                                        }
+                                    }
+                                }
+                            } else {
+                                // 全ユニット行動済みならターン終了
+                                use engine::events::NextPhaseCommand;
+                                if let Some(mut end_events) =
+                                    world.get_resource_mut::<Events<NextPhaseCommand>>()
+                                {
+                                    end_events.send(NextPhaseCommand);
+                                }
+                            }
+                        }
+                }
+
+                schedule.run(world);
 
                 if let Some(mut events) = world.get_resource_mut::<Events<UnitAttackedEvent>>() {
                     for ev in events.drain() {
