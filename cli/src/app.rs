@@ -575,10 +575,19 @@ impl App {
         let selected = options[selected_index];
         match selected {
             ActionType::Cancel => {
-                if let Some(_ue) = unit_entity {
+                if let Some(ue) = unit_entity {
                     // 移動の取り消し
                     if let Some(world) = &mut self.world {
-                        world.send_event(engine::events::UndoMoveCommand);
+                        let mut moved = false;
+                        if let Some(pm) = world.get_resource::<engine::resources::PendingMove>()
+                            && pm.unit_entity == ue
+                            && let Some(pos) = world.get::<engine::components::GridPosition>(ue)
+                        {
+                            moved = pos.x != pm.original_pos.x || pos.y != pm.original_pos.y;
+                        }
+                        if moved {
+                            world.send_event(engine::events::UndoMoveCommand);
+                        }
                     }
                 }
                 self.ui_state.in_game_state = InGameState::Normal;
@@ -682,7 +691,7 @@ impl App {
                             if selected == ActionType::Capture {
                                 self.ui_state.add_log("占領を開始しました。".to_string());
                             } else {
-                                self.ui_state.add_log("拠点を修復しました。".to_string());
+                                self.ui_state.add_log("修復しています...".to_string());
                             }
                         }
                         ActionType::Attack => {
@@ -997,9 +1006,7 @@ impl App {
             options.push(ActionType::Merge);
         }
 
-        if is_moved {
-            options.push(ActionType::Cancel);
-        }
+        options.push(ActionType::Cancel);
 
         self.ui_state.in_game_state = InGameState::ActionMenu {
             unit_entity: Some(unit_entity),

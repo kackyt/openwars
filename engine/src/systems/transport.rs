@@ -346,7 +346,8 @@ pub fn sync_cargo_health_system(
         let q_health = set.p2();
 
         for (cargo_ent, transport_ent) in links {
-            if let (Ok(c_hp), Ok(t_hp)) = (q_health.get(cargo_ent), q_health.get(transport_ent))
+            if let Ok(c_hp) = q_health.get(cargo_ent)
+                && let Ok(t_hp) = q_health.get(transport_ent)
                 && c_hp.current > t_hp.current
             {
                 updates.push((cargo_ent, t_hp.current));
@@ -359,6 +360,22 @@ pub fn sync_cargo_health_system(
     for (ent, new_hp) in updates {
         if let Ok(mut hp) = q_health_mut.get_mut(ent) {
             hp.current = new_hp;
+        }
+    }
+}
+
+/// 輸送ユニットが破壊された際、搭載されていたユニットも破壊するシステム。
+pub fn cleanup_cargo_system(
+    mut commands: Commands,
+    mut destroyed_events: EventReader<UnitDestroyedEvent>,
+    q_cargo: Query<(Entity, &Transporting)>,
+) {
+    for event in destroyed_events.read() {
+        for (cargo_ent, trans) in q_cargo.iter() {
+            if trans.0 == event.entity {
+                // 輸送ユニットが破壊されたので、搭載ユニットも破壊（デスポーン）
+                commands.entity(cargo_ent).despawn();
+            }
         }
     }
 }

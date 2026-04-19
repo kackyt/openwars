@@ -25,6 +25,9 @@ pub enum MasterDataError {
     Unknown,
 }
 
+// include the generated maps from build.rs
+include!(concat!(env!("OUT_DIR"), "/generated_maps.rs"));
+
 pub mod supply_types {
     pub const GROUND: &str = "地上部隊";
     pub const AIR: &str = "航空部隊";
@@ -304,12 +307,9 @@ impl MasterDataRegistry {
 
         // 7. マップ初期配置データ読み込み
         // プレイヤーIDと地形IDが結合された数値を MapData としてパースします。
-        let maps = [
-            ("map_1", include_str!("master_data/map/map_1.csv")),
-            ("map_2", include_str!("master_data/map/map_2.csv")),
-        ];
-        for (name, csv) in maps {
-            registry.maps.insert(name.to_string(), parse_map(csv)?);
+        for (name, content) in MAPS {
+            let map = parse_map(content)?;
+            registry.maps.insert(name.to_string(), map);
         }
 
         // 8. 整合性バリデーション

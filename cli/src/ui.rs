@@ -501,15 +501,15 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         if let Some(map) = world.get_resource::<engine::resources::Map>()
             && let Some(terrain) = map.get_terrain(cx, cy)
         {
-            info_text.push_str("--- 地形情報 ---\n");
-            let terrain_name = terrain.as_str();
-            info_text.push_str(&format!("地形: {}\n", terrain_name));
             if let Some(master_data) = world.get_resource::<engine::resources::MasterDataRegistry>()
             {
                 info_text.push_str(&format!(
-                    "防御: +{}%\n",
+                    "{} (防: {})\n",
+                    terrain.as_str(),
                     master_data.get_terrain_defense_bonus(terrain)
                 ));
+            } else {
+                info_text.push_str(&format!("{}\n", terrain.as_str()));
             }
 
             let mut q_prop = world.query::<(
