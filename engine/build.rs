@@ -27,7 +27,7 @@ fn main() {
             //
             // 確実なのは、CSVの中身をそのまま文字列リテラルとして埋め込むこと。
             let content = fs::read_to_string(&path).expect("Failed to read map file");
-            generated_code.push_str(&format!("    (\"{}\", r#\"{}\"#),\n", file_name, content));
+            generated_code.push_str(&format!("    ({:?}, {:?}),\n", file_name, content));
         }
     }
 

@@ -190,14 +190,7 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Esc => {
-                // Back to map selection
-                self.world = None;
-                self.schedule = None;
-                self.ui_state.current_screen = CurrentScreen::MapSelection;
-                self.ui_state.in_game_state = InGameState::Normal;
-                self.ui_state.cursor_pos = (0, 0);
-            }
+            KeyCode::Esc => self.return_to_map_selection(),
             KeyCode::Up
             | KeyCode::Char('k')
             | KeyCode::Down
@@ -252,9 +245,7 @@ impl App {
             InGameState::EventPopup { .. } => {
                 self.ui_state.in_game_state = InGameState::Normal;
             }
-            InGameState::GameOverPopup { .. } => {
-                // Return to map selection is handled in handle_key
-            }
+            InGameState::GameOverPopup { .. } => self.return_to_map_selection(),
             InGameState::Normal => {}
         }
     }
@@ -411,14 +402,7 @@ impl App {
             InGameState::EventPopup { .. } => {
                 self.ui_state.in_game_state = InGameState::Normal;
             }
-            InGameState::GameOverPopup { .. } => {
-                // タイトル（マップ選択）へ戻る
-                self.world = None;
-                self.schedule = None;
-                self.ui_state.current_screen = CurrentScreen::MapSelection;
-                self.ui_state.in_game_state = InGameState::Normal;
-                self.ui_state.cursor_pos = (0, 0);
-            }
+            InGameState::GameOverPopup { .. } => self.return_to_map_selection(),
         }
     }
     fn handle_normal_confirm(&mut self) {
@@ -1208,5 +1192,13 @@ impl App {
         self.world = Some(world);
         self.schedule = Some(schedule);
         Ok(())
+    }
+
+    fn return_to_map_selection(&mut self) {
+        self.world = None;
+        self.schedule = None;
+        self.ui_state.current_screen = CurrentScreen::MapSelection;
+        self.ui_state.in_game_state = InGameState::Normal;
+        self.ui_state.cursor_pos = (0, 0);
     }
 }
