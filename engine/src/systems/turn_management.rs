@@ -51,7 +51,7 @@ fn run_daily_update_for_all(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 pub fn next_phase_system(
-    _commands: Commands,
+    mut commands: Commands,
     mut match_state: ResMut<MatchState>,
     mut next_phase_events: EventReader<NextPhaseCommand>,
     mut phase_changed_events: EventWriter<GamePhaseChangedEvent>,
@@ -75,7 +75,14 @@ pub fn next_phase_system(
     }
 
     for _ in next_phase_events.read() {
-        // ターン終了処理 (現在のフェーズが Main であると仮定)
+        // ターン終了命令受信時に全ユニットの状態をリセット
+        for (_, mut has_moved, mut action_completed, _, _, _, _, _, _) in q_units.iter_mut() {
+            has_moved.0 = false;
+            action_completed.0 = false;
+        }
+
+        // 移動履歴を強制削除 (ターン終了時は移動中であってはならない)
+        commands.remove_resource::<PendingMove>();
         // 常に次のプレイヤーの Main フェーズまで一気に進めます。
         // これまでは EndTurn フェーズで止まっていましたが、2回クリックが必要になるためアトミック化します。
 
@@ -93,8 +100,8 @@ pub fn next_phase_system(
         match_state.current_phase = Phase::Main;
         let active_player_id = players.0[match_state.active_player_index.0].id;
 
-        // 次のプレイヤーの補給、資金増加、行動フラグリセット
-        process_resupply_and_reset(
+        // 次のプレイヤーの補給、資金増加
+        process_resupply(
             active_player_id,
             &mut players,
             &q_properties,
@@ -111,7 +118,7 @@ pub fn next_phase_system(
 }
 
 #[allow(clippy::type_complexity)]
-fn process_resupply_and_reset(
+fn process_resupply(
     active_player_id: PlayerId,
     players: &mut Players,
     q_properties: &Query<(&GridPosition, &Property)>,
@@ -128,7 +135,7 @@ fn process_resupply_and_reset(
     )>,
     _map: &Map,
 ) {
-    // Reset flags and apply property resupply
+    // Apply property resupply
     let mut owned_properties = HashSet::new();
     let mut city_count = 0;
     for (pos, prop) in q_properties.iter() {
@@ -156,13 +163,9 @@ fn process_resupply_and_reset(
         .unwrap();
     players.0[active_player_idx].funds += budget_increase;
 
-    // Property resupply & turn status reset
-    for (_, mut has_moved, mut action_completed, faction, stats, mut fuel, mut ammo, hp, pos) in
-        q_units.iter_mut()
-    {
+    // Property resupply
+    for (_, _, _, faction, stats, mut fuel, mut ammo, hp, pos) in q_units.iter_mut() {
         if faction.0 == active_player_id {
-            has_moved.0 = false;
-            action_completed.0 = false;
             // 日次更新 (燃料消費、墜落判定) は next_phase_system でラウンド単位で行われるためここでは削除
             if hp.is_destroyed() {
                 continue;
@@ -339,5 +342,75 @@ mod tests {
                 "Aircraft with 0 fuel not on airport should crash"
             );
         }
+    }
+
+    #[test]
+    fn test_all_units_reset_on_next_phase() {
+        let (mut world, mut schedule) = setup_world();
+
+        // P1 unit (will act)
+        let p1_unit = world
+            .spawn((
+                GridPosition { x: 0, y: 0 },
+                Faction(PlayerId(1)),
+                UnitStats::mock(),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Fuel {
+                    current: 10,
+                    max: 10,
+                },
+                Ammo {
+                    ammo1: 0,
+                    max_ammo1: 0,
+                    ammo2: 0,
+                    max_ammo2: 0,
+                },
+                HasMoved(true),
+                ActionCompleted(true),
+            ))
+            .id();
+
+        // P2 unit (already acted somehow, maybe in previous turn)
+        let p2_unit = world
+            .spawn((
+                GridPosition { x: 1, y: 1 },
+                Faction(PlayerId(2)),
+                UnitStats::mock(),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Fuel {
+                    current: 10,
+                    max: 10,
+                },
+                Ammo {
+                    ammo1: 0,
+                    max_ammo1: 0,
+                    ammo2: 0,
+                    max_ammo2: 0,
+                },
+                HasMoved(true),
+                ActionCompleted(true),
+            ))
+            .id();
+
+        // P1 turn ends -> P2 turn starts
+        world.send_event(NextPhaseCommand);
+        schedule.run(&mut world);
+
+        // BOTH units should be reset immediately
+        let p1_moved = world.get::<HasMoved>(p1_unit).unwrap();
+        let p1_action = world.get::<ActionCompleted>(p1_unit).unwrap();
+        let p2_moved = world.get::<HasMoved>(p2_unit).unwrap();
+        let p2_action = world.get::<ActionCompleted>(p2_unit).unwrap();
+
+        assert!(!p1_moved.0, "P1 unit should be reset");
+        assert!(!p1_action.0, "P1 unit should be reset");
+        assert!(!p2_moved.0, "P2 unit should be reset");
+        assert!(!p2_action.0, "P2 unit should be reset");
     }
 }
