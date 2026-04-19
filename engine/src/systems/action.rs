@@ -78,11 +78,11 @@ pub fn get_available_actions(
             let mut q_cargo = world.query::<&CargoCapacity>();
             if let Ok(cargo) = q_cargo.get(world, unit_entity) {
                 for &passenger in &cargo.loaded {
-                    if let Some(action) = world.get::<ActionCompleted>(passenger) {
-                        if !action.0 {
-                            can_drop = true;
-                            break;
-                        }
+                    if let Some(action) = world.get::<ActionCompleted>(passenger)
+                        && !action.0
+                    {
+                        can_drop = true;
+                        break;
                     }
                 }
             }

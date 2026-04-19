@@ -704,19 +704,17 @@ impl App {
                         }
                         ActionType::Drop => {
                             let mut passengers = vec![];
-                            if let Some(world) = &mut self.world {
-                                if let Ok(cargo) = world
+                            if let Some(world) = &mut self.world
+                                && let Ok(cargo) = world
                                     .query::<&engine::components::CargoCapacity>()
                                     .get(world, entity)
-                                {
-                                    for &p_ent in &cargo.loaded {
-                                        if let Some(act) =
-                                            world.get::<engine::components::ActionCompleted>(p_ent)
-                                        {
-                                            if !act.0 {
-                                                passengers.push(p_ent);
-                                            }
-                                        }
+                            {
+                                for &p_ent in &cargo.loaded {
+                                    if let Some(act) =
+                                        world.get::<engine::components::ActionCompleted>(p_ent)
+                                        && !act.0
+                                    {
+                                        passengers.push(p_ent);
                                     }
                                 }
                             }
@@ -999,7 +997,9 @@ impl App {
             options.push(ActionType::Merge);
         }
 
-        options.push(ActionType::Cancel);
+        if is_moved {
+            options.push(ActionType::Cancel);
+        }
 
         self.ui_state.in_game_state = InGameState::ActionMenu {
             unit_entity: Some(unit_entity),

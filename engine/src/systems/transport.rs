@@ -186,18 +186,25 @@ pub fn load_unit_system(
         if trans_capacity.is_some_and(|(max_cap, loaded_len)| {
             loaded_len < max_cap && trans_stats.loadable_unit_types.contains(&unit_type)
         }) {
-            if let Ok([transport, mut unit]) =
+            if let Ok([mut transport, mut unit]) =
                 q_units.get_many_mut([event.transport_entity, event.unit_entity])
             {
-                if let Some(mut cap) = transport.5 {
+                if let Some(cap) = transport.5.as_mut() {
                     cap.loaded.push(event.unit_entity);
                 }
                 unit.1.x = 9999; // Move off map
                 unit.1.y = 9999;
                 unit.4.0 = true; // Action completed
+
+                // 輸送ユニットも行動済みにする
+                transport.4.0 = true;
+
                 commands
                     .entity(event.unit_entity)
                     .insert(Transporting(event.transport_entity));
+
+                // アクション確定時に移動履歴を削除
+                commands.remove_resource::<PendingMove>();
             }
         }
     }
@@ -239,12 +246,14 @@ pub fn unload_unit_system(
     let active_player_id = players.0[match_state.active_player_index.0].id;
 
     for event in unload_events.read() {
-        let (trans_pos, trans_faction, trans_action) = match set.p0().get(event.transport_entity) {
+        let (trans_pos, trans_faction, _trans_action) = match set.p0().get(event.transport_entity) {
             Ok((_, p, f, a, _, _, _)) => (*p, f.0, a.0),
             _ => continue,
         };
 
-        if trans_faction != active_player_id || trans_action {
+        // 勢力のチェックのみ行い、行動済みチェックは降車ロジック内で行う、
+        // あるいは複数降車を許可するためにここでは緩和する
+        if trans_faction != active_player_id {
             continue;
         }
 
@@ -296,28 +305,6 @@ pub fn unload_unit_system(
             continue;
         }
 
-        // 他の未行動ユニットが残っているか事前にチェック
-        let other_cargo_candidates: Vec<Entity> =
-            if let Ok((_, _, _, _, Some(cap), _, _)) = set.p0().get(event.transport_entity) {
-                cap.loaded
-                    .iter()
-                    .cloned()
-                    .filter(|&e| e != event.cargo_entity)
-                    .collect()
-            } else {
-                vec![]
-            };
-
-        let mut has_other_ready_cargo = false;
-        for other_ent in other_cargo_candidates {
-            if let Ok(other_act) = set.p1().get(other_ent) {
-                if !other_act.0 {
-                    has_other_ready_cargo = true;
-                    break;
-                }
-            }
-        }
-
         let mut q_units = set.p0();
         if let Ok([mut transport, mut cargo]) =
             q_units.get_many_mut([event.transport_entity, event.cargo_entity])
@@ -326,14 +313,17 @@ pub fn unload_unit_system(
                 cap.loaded.retain(|&e| e != event.cargo_entity);
             }
 
-            if !has_other_ready_cargo {
-                transport.3.0 = true; // Transport action completed
-            }
+            // はじめて降車した時点で、輸送ユニットを行動済みにする
+            // これによりUIでグレーアウトされ、移動のキャンセルもできなくなる
+            transport.3.0 = true;
 
             cargo.1.x = event.target_x;
             cargo.1.y = event.target_y;
             cargo.3.0 = true; // Unloaded unit is completed for the turn
             commands.entity(event.cargo_entity).remove::<Transporting>();
+
+            // アクション確定時に移動履歴を削除
+            commands.remove_resource::<PendingMove>();
         }
     }
 }
@@ -822,7 +812,10 @@ mod tests {
             ))
             .id();
 
-        world.get_mut::<CargoCapacity>(transport_entity).unwrap().loaded = vec![cargo1, cargo2];
+        world
+            .get_mut::<CargoCapacity>(transport_entity)
+            .unwrap()
+            .loaded = vec![cargo1, cargo2];
 
         let mut schedule = Schedule::default();
         schedule.add_systems(unload_unit_system);
@@ -836,8 +829,8 @@ mod tests {
         });
         schedule.run(&mut world);
 
-        // まだ cargo2 が未行動なので、輸送艦は行動済みにならないはず
-        assert!(!world.get::<ActionCompleted>(transport_entity).unwrap().0);
+        // 1人目を降ろした時点で、輸送ユニットは行動済みになる（仕様）
+        assert!(world.get::<ActionCompleted>(transport_entity).unwrap().0);
         assert_eq!(
             world
                 .get::<CargoCapacity>(transport_entity)
@@ -866,5 +859,121 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[test]
+    fn test_load_exhausts_transport() {
+        let mut world = World::new();
+        world.insert_resource(MatchState::default());
+        world.insert_resource(Players(vec![Player::new(1, "P1".to_string())]));
+        world.insert_resource(Events::<LoadUnitCommand>::default());
+
+        let transport = world
+            .spawn((
+                GridPosition { x: 5, y: 5 },
+                Faction(PlayerId(1)),
+                ActionCompleted(false),
+                UnitStats {
+                    unit_type: UnitType::SupplyTruck,
+                    max_cargo: 1,
+                    loadable_unit_types: vec![UnitType::Infantry],
+                    ..UnitStats::mock()
+                },
+                CargoCapacity {
+                    max: 1,
+                    loaded: vec![],
+                },
+            ))
+            .id();
+
+        let cargo = world
+            .spawn((
+                GridPosition { x: 5, y: 5 },
+                Faction(PlayerId(1)),
+                ActionCompleted(false),
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    ..UnitStats::mock()
+                },
+            ))
+            .id();
+
+        world.send_event(LoadUnitCommand {
+            transport_entity: transport,
+            unit_entity: cargo,
+        });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(load_unit_system);
+        schedule.run(&mut world);
+
+        // 積載後、輸送ユニットも行動済みになるはず
+        assert!(world.get::<ActionCompleted>(transport).unwrap().0);
+    }
+
+    #[test]
+    fn test_undo_prevention_on_transport_actions() {
+        let mut world = World::new();
+        world.insert_resource(MatchState::default());
+        world.insert_resource(Players(vec![Player::new(1, "P1".to_string())]));
+        world.insert_resource(Events::<UnloadUnitCommand>::default());
+        world.insert_resource(Map::new(10, 10, Terrain::Plains, GridTopology::Square));
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+
+        let transport = world
+            .spawn((
+                GridPosition { x: 5, y: 5 },
+                Faction(PlayerId(1)),
+                ActionCompleted(false),
+                UnitStats {
+                    unit_type: UnitType::SupplyTruck,
+                    max_cargo: 1,
+                    loadable_unit_types: vec![UnitType::Infantry],
+                    ..UnitStats::mock()
+                },
+                CargoCapacity {
+                    max: 1,
+                    loaded: vec![],
+                },
+            ))
+            .id();
+
+        let cargo = world
+            .spawn((
+                GridPosition { x: 999, y: 999 },
+                Faction(PlayerId(1)),
+                ActionCompleted(false),
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    ..UnitStats::mock()
+                },
+                Transporting(transport),
+            ))
+            .id();
+        world.get_mut::<CargoCapacity>(transport).unwrap().loaded = vec![cargo];
+
+        // 移動履歴を設定
+        world.insert_resource(PendingMove {
+            unit_entity: transport,
+            original_pos: GridPosition { x: 1, y: 1 },
+            original_fuel: Fuel {
+                current: 20,
+                max: 20,
+            },
+        });
+
+        world.send_event(UnloadUnitCommand {
+            transport_entity: transport,
+            cargo_entity: cargo,
+            target_x: 6,
+            target_y: 5,
+        });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(unload_unit_system);
+        schedule.run(&mut world);
+
+        // 降車後、PendingMove が削除されているはず
+        assert!(world.get_resource::<PendingMove>().is_none());
     }
 }

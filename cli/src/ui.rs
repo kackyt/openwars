@@ -273,13 +273,15 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             if let Some(world) = &mut app.world {
                 for entity in passengers {
                     if let (Ok(stats), Some(h)) = (
-                        world.query::<&engine::components::UnitStats>().get(world, *entity),
+                        world
+                            .query::<&engine::components::UnitStats>()
+                            .get(world, *entity),
                         world.get::<engine::components::Health>(*entity),
                     ) {
                         let mut info = format!("{} ", stats.unit_type.as_str());
                         let display_hp = (h.current.saturating_add(9)) / 10;
                         info.push_str(&format!("HP:{:2} ", display_hp));
-                        
+
                         if let Some(f) = world.get::<engine::components::Fuel>(*entity) {
                             info.push_str(&format!("燃料:{:2}/{:2} ", f.current, f.max));
                         }
@@ -342,7 +344,11 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         let mut menu_width = 30u16;
         for opt in &options {
             // 日本語文字(2byte)を考慮して簡易的に計算
-            let width = opt.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum::<u16>() + 4;
+            let width = opt
+                .chars()
+                .map(|c| if c.is_ascii() { 1 } else { 2 })
+                .sum::<u16>()
+                + 4;
             if width > menu_width {
                 menu_width = width;
             }
