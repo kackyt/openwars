@@ -1,5 +1,5 @@
 use crate::components::*;
-use crate::systems::{combat, merge, property, supply, transport};
+use crate::systems::{combat, merge, supply, transport};
 use bevy_ecs::prelude::*;
 
 /// ユニットが現在実行可能なアクションをまとめた構造体
@@ -7,6 +7,7 @@ use bevy_ecs::prelude::*;
 pub struct AvailableActions {
     pub can_attack: bool,
     pub can_capture: bool,
+    pub can_repair: bool, // 自軍拠点修復が可能か
     pub can_supply: bool,
     pub can_load: bool,
     pub can_drop: bool,
@@ -23,18 +24,69 @@ pub fn get_available_actions(
     let can_load = !transport::get_loadable_transports(world, unit_entity).is_empty();
     let can_merge = !merge::get_mergable_targets(world, unit_entity).is_empty();
 
+    let (can_capture, can_repair) = {
+        let (unit_pos, unit_stats, unit_faction) = {
+            let mut q_unit = world.query::<(&GridPosition, &UnitStats, &Faction)>();
+            let Ok((u_pos, u_stats, u_faction)) = q_unit.get(world, unit_entity) else {
+                return AvailableActions {
+                    can_attack: false,
+                    can_capture: false,
+                    can_repair: false,
+                    can_supply: false,
+                    can_load: false,
+                    can_drop: false,
+                    can_merge: false,
+                    can_wait: false,
+                };
+            };
+            (*u_pos, u_stats.clone(), u_faction.0)
+        };
+
+        if !unit_stats.can_capture {
+            (false, false)
+        } else {
+            let mut capturable = false;
+            let mut repairable = false;
+            let mut q_properties = world.query::<(&GridPosition, &Property)>();
+            for (p_pos, p_prop) in q_properties.iter(world) {
+                if p_pos.x == unit_pos.x && p_pos.y == unit_pos.y {
+                    let max_points = p_prop.max_capture_points;
+                    if max_points > 0 {
+                        if p_prop.owner_id == Some(unit_faction) {
+                            if p_prop.capture_points < max_points {
+                                repairable = true;
+                            }
+                        } else {
+                            capturable = true;
+                        }
+                    }
+                    break;
+                }
+            }
+            (capturable, repairable)
+        }
+    };
+
     AvailableActions {
         can_attack: !combat::get_attackable_targets(world, unit_entity, !is_moved).is_empty(),
-        can_capture: property::get_capturable_property(world, unit_entity).is_some(),
+        can_capture,
+        can_repair,
         can_supply: !supply::get_suppliable_targets(world, unit_entity).is_empty(),
         can_load,
         can_drop: {
-            let mut has_passengers = false;
+            let mut can_drop = false;
             let mut q_cargo = world.query::<&CargoCapacity>();
             if let Ok(cargo) = q_cargo.get(world, unit_entity) {
-                has_passengers = !cargo.loaded.is_empty();
+                for &passenger in &cargo.loaded {
+                    if let Some(action) = world.get::<ActionCompleted>(passenger)
+                        && !action.0
+                    {
+                        can_drop = true;
+                        break;
+                    }
+                }
             }
-            has_passengers
+            can_drop
         },
         can_merge,
         // 移動先が搭載または合流対象である場合、待機は不可（重なり防止）

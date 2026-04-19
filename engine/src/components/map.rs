@@ -12,14 +12,28 @@ pub struct Property {
     pub terrain: crate::resources::Terrain,
     pub owner_id: Option<PlayerId>,
     pub capture_points: u32,
+    pub max_capture_points: u32,
 }
 
 impl Property {
-    pub fn new(terrain: crate::resources::Terrain, owner_id: Option<PlayerId>) -> Self {
+    pub fn new(
+        terrain: crate::resources::Terrain,
+        owner_id: Option<PlayerId>,
+        max_capture_points: u32,
+    ) -> Self {
         Self {
             terrain,
             owner_id,
-            capture_points: terrain.max_capture_points(),
+            capture_points: max_capture_points,
+            max_capture_points,
         }
+    }
+
+    pub fn display_capture_points(&self) -> u32 {
+        self.capture_points
+    }
+
+    pub fn display_max_capture_points(&self) -> u32 {
+        self.max_capture_points
     }
 }

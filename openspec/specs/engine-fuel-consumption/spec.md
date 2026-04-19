@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+航空ユニットの運用において、ターンの経過に伴う燃料消費と、燃料切れによる損失を定義し、補給の戦略的重要性を担保する。
+
+## Requirements
 
 ### Requirement: 毎ターンの燃料消費 (Daily Fuel Consumption)
 MUST: エンジンは、各ターンの開始時に、すべての航空ユニット（`MovementType::Air`）に対して、マスターデータで定義された「日毎燃料消費量」分の燃料を減算しなければならない。

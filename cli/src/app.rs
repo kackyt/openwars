@@ -1,7 +1,9 @@
 use bevy_ecs::prelude::*;
 use engine::components::{GridPosition, PlayerId, Property};
 use engine::resources::master_data::MasterDataRegistry;
-use engine::resources::{GridTopology, Map, MatchState, Player, Players, Terrain};
+use engine::resources::{
+    GameOverCondition, GridTopology, Map, MatchState, Player, Players, Terrain,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CurrentScreen {
@@ -21,6 +23,7 @@ pub enum ActionType {
     Cancel,
     EndTurn,
     Produce,
+    Repair,
 }
 
 impl ActionType {
@@ -36,6 +39,7 @@ impl ActionType {
             ActionType::Cancel => "キャンセル",
             ActionType::EndTurn => "ターン終了",
             ActionType::Produce => "生産",
+            ActionType::Repair => "修復",
         }
     }
 }
@@ -80,6 +84,10 @@ pub enum InGameState {
     },
     EventPopup {
         message: String,
+    },
+    GameOverPopup {
+        message: String,
+        condition: GameOverCondition,
     },
 }
 
@@ -141,18 +149,17 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.ui_state.selected_map_index > 0 {
-                    self.ui_state.selected_map_index -= 1;
-                }
+            KeyCode::Up | KeyCode::Char('k') if self.ui_state.selected_map_index > 0 => {
+                self.ui_state.selected_map_index -= 1;
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Up | KeyCode::Char('k') => {}
+            KeyCode::Down | KeyCode::Char('j')
                 if self.ui_state.selected_map_index
-                    < self.ui_state.available_maps.len().saturating_sub(1)
-                {
-                    self.ui_state.selected_map_index += 1;
-                }
+                    < self.ui_state.available_maps.len().saturating_sub(1) =>
+            {
+                self.ui_state.selected_map_index += 1;
             }
+            KeyCode::Down | KeyCode::Char('j') => {}
             KeyCode::Enter | KeyCode::Char(' ') => {
                 // Determine the selected map
                 let map_name = self
@@ -161,14 +168,16 @@ impl App {
                     .get(self.ui_state.selected_map_index)
                     .cloned();
                 if let Some(map_name) = map_name {
-                    // Transition to in-game
+                    // ゲーム画面へ遷移
                     if let Err(e) = self.initialize_world(map_name.clone()) {
-                        self.ui_state.add_log(format!("Map load error: {}", e));
+                        self.ui_state
+                            .add_log(format!("マップ読み込みエラー: {}", e));
                     } else {
                         self.ui_state.current_screen = CurrentScreen::InGame;
                         self.ui_state.in_game_state = InGameState::Normal;
                         self.ui_state.cursor_pos = (0, 0);
-                        self.ui_state.add_log(format!("Map '{}' loaded.", map_name));
+                        self.ui_state
+                            .add_log(format!("マップ '{}' を読み込みました。", map_name));
                     }
                 }
             }
@@ -181,14 +190,7 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Esc => {
-                // Back to map selection
-                self.world = None;
-                self.schedule = None;
-                self.ui_state.current_screen = CurrentScreen::MapSelection;
-                self.ui_state.in_game_state = InGameState::Normal;
-                self.ui_state.cursor_pos = (0, 0);
-            }
+            KeyCode::Esc => self.return_to_map_selection(),
             KeyCode::Up
             | KeyCode::Char('k')
             | KeyCode::Down
@@ -243,6 +245,7 @@ impl App {
             InGameState::EventPopup { .. } => {
                 self.ui_state.in_game_state = InGameState::Normal;
             }
+            InGameState::GameOverPopup { .. } => self.return_to_map_selection(),
             InGameState::Normal => {}
         }
     }
@@ -399,6 +402,7 @@ impl App {
             InGameState::EventPopup { .. } => {
                 self.ui_state.in_game_state = InGameState::Normal;
             }
+            InGameState::GameOverPopup { .. } => self.return_to_map_selection(),
         }
     }
     fn handle_normal_confirm(&mut self) {
@@ -554,10 +558,19 @@ impl App {
         let selected = options[selected_index];
         match selected {
             ActionType::Cancel => {
-                if let Some(_ue) = unit_entity {
+                if let Some(ue) = unit_entity {
                     // 移動の取り消し
                     if let Some(world) = &mut self.world {
-                        world.send_event(engine::events::UndoMoveCommand);
+                        let mut moved = false;
+                        if let Some(pm) = world.get_resource::<engine::resources::PendingMove>()
+                            && pm.unit_entity == ue
+                            && let Some(pos) = world.get::<engine::components::GridPosition>(ue)
+                        {
+                            moved = pos.x != pm.original_pos.x || pos.y != pm.original_pos.y;
+                        }
+                        if moved {
+                            world.send_event(engine::events::UndoMoveCommand);
+                        }
                     }
                 }
                 self.ui_state.in_game_state = InGameState::Normal;
@@ -651,14 +664,18 @@ impl App {
                             self.ui_state.in_game_state = InGameState::Normal;
                             self.ui_state.add_log("待機しました。".to_string());
                         }
-                        ActionType::Capture => {
+                        ActionType::Capture | ActionType::Repair => {
                             if let Some(world) = &mut self.world {
                                 world.send_event(engine::events::CapturePropertyCommand {
                                     unit_entity: entity,
                                 });
                             }
                             self.ui_state.in_game_state = InGameState::Normal;
-                            self.ui_state.add_log("占領を開始しました。".to_string());
+                            if selected == ActionType::Capture {
+                                self.ui_state.add_log("占領を開始しました。".to_string());
+                            } else {
+                                self.ui_state.add_log("修復しています...".to_string());
+                            }
                         }
                         ActionType::Attack => {
                             let targets = if let Some(world) = &mut self.world {
@@ -679,15 +696,23 @@ impl App {
                         }
                         ActionType::Drop => {
                             let mut passengers = vec![];
-                            if let Some(world) = &mut self.world {
-                                let mut q = world.query::<&engine::components::CargoCapacity>();
-                                if let Ok(cargo) = q.get(world, entity) {
-                                    passengers = cargo.loaded.clone();
+                            if let Some(world) = &mut self.world
+                                && let Ok(cargo) = world
+                                    .query::<&engine::components::CargoCapacity>()
+                                    .get(world, entity)
+                            {
+                                for &p_ent in &cargo.loaded {
+                                    if let Some(act) =
+                                        world.get::<engine::components::ActionCompleted>(p_ent)
+                                        && !act.0
+                                    {
+                                        passengers.push(p_ent);
+                                    }
                                 }
                             }
                             if passengers.is_empty() {
                                 self.ui_state
-                                    .add_log("降車させるユニットがいません。".to_string());
+                                    .add_log("降車可能な未行動ユニットがいません。".to_string());
                             } else {
                                 self.ui_state.in_game_state = InGameState::CargoSelection {
                                     transport_entity: entity,
@@ -918,52 +943,59 @@ impl App {
                 .add_log(format!("ユニットを移動しました: {:?}", (cx, cy)));
         }
     }
-
     pub fn reopen_unit_action_menu(&mut self, unit_entity: Entity) {
-        if let Some(world) = &mut self.world {
-            let mut is_moved = false;
-            if let Some(pm) = world.get_resource::<engine::resources::PendingMove>()
-                && pm.unit_entity == unit_entity
-                && let Some(pos) = world.get::<engine::components::GridPosition>(unit_entity)
-            {
-                is_moved = pos.x != pm.original_pos.x || pos.y != pm.original_pos.y;
-            }
+        let world = match &mut self.world {
+            Some(w) => w,
+            None => return,
+        };
 
-            let actions =
-                engine::systems::action::get_available_actions(world, unit_entity, is_moved);
-            let mut options = Vec::new();
-
-            if actions.can_wait {
-                options.push(ActionType::Wait);
-            }
-
-            if actions.can_attack {
-                options.insert(0, ActionType::Attack);
-            }
-            if actions.can_capture {
-                options.push(ActionType::Capture);
-            }
-            if actions.can_supply {
-                options.push(ActionType::Supply);
-            }
-            if actions.can_drop {
-                options.push(ActionType::Drop);
-            }
-            if actions.can_load {
-                options.push(ActionType::Load);
-            }
-            if actions.can_merge {
-                options.push(ActionType::Merge);
-            }
-
-            options.push(ActionType::Cancel);
-
-            self.ui_state.in_game_state = InGameState::ActionMenu {
-                unit_entity: Some(unit_entity),
-                options,
-                selected_index: 0,
-            };
+        let mut is_moved = false;
+        if let Some(pm) = world.get_resource::<engine::resources::PendingMove>()
+            && pm.unit_entity == unit_entity
+            && let Some(pos) = world.get::<engine::components::GridPosition>(unit_entity)
+        {
+            is_moved = pos.x != pm.original_pos.x || pos.y != pm.original_pos.y;
         }
+
+        let actions = engine::systems::action::get_available_actions(world, unit_entity, is_moved);
+        let mut options = Vec::new();
+
+        if actions.can_wait {
+            options.push(ActionType::Wait);
+        }
+
+        if actions.can_attack {
+            options.insert(0, ActionType::Attack);
+        }
+
+        if actions.can_capture {
+            options.push(ActionType::Capture);
+        }
+
+        if actions.can_repair {
+            options.push(ActionType::Repair);
+        }
+
+        if actions.can_supply {
+            options.push(ActionType::Supply);
+        }
+        if actions.can_drop {
+            options.push(ActionType::Drop);
+        }
+        if actions.can_load {
+            options.push(ActionType::Load);
+        }
+        if actions.can_merge {
+            options.push(ActionType::Merge);
+        }
+
+        options.push(ActionType::Cancel);
+
+        self.ui_state.in_game_state = InGameState::ActionMenu {
+            unit_entity: Some(unit_entity),
+            options,
+            selected_index: 0,
+        };
     }
     fn handle_drop_target_confirm(&mut self, transport_entity: Entity, cargo_entity: Entity) {
         let cx = self.ui_state.cursor_pos.0;
@@ -988,7 +1020,9 @@ impl App {
         }
         self.ui_state
             .add_log(format!("ユニットを降ろしました: {:?}", (cx, cy)));
-        self.ui_state.in_game_state = InGameState::Normal;
+        self.ui_state.in_game_state = InGameState::WaitActionMenu {
+            unit_entity: transport_entity,
+        };
     }
 
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
@@ -1030,25 +1064,8 @@ impl App {
         // Intentionally skipping manual event clearance (update_system) to avoid Bevy version disparities.
         // EventReader correctly tracks indices, so old events won't be reprocessed.
 
-        // Add game logic systems (order is important for game loop, but default parallel works for independent ones)
-        // Note: engine systems are mostly command -> event processors.
-        schedule.add_systems(
-            (
-                produce_unit_system,
-                move_unit_system,
-                attack_unit_system,
-                remove_destroyed_units_system,
-                capture_property_system,
-                merge_unit_system,
-                supply_unit_system,
-                load_unit_system,
-                unload_unit_system,
-                wait_unit_system,
-                undo_move_system,
-                next_phase_system,
-            )
-                .chain(),
-        );
+        // Add game logic systems (order is managed by engine)
+        add_main_game_systems(&mut schedule);
 
         // Build UnitRegistry and DamageChart from MasterDataRegistry
         let mut damage_chart = engine::resources::DamageChart::new();
@@ -1115,13 +1132,18 @@ impl App {
                         }
 
                         // Spawn property entity if applicable
-                        if terrain.max_capture_points() > 0 {
+                        let landscape_name = terrain.as_str();
+                        let durability = self.master_data.landscape_durability(landscape_name);
+                        if durability > 0 {
                             let owner = if cell.player_id == 0 {
                                 None
                             } else {
                                 Some(PlayerId(cell.player_id))
                             };
-                            world.spawn((GridPosition { x, y }, Property::new(terrain, owner)));
+                            world.spawn((
+                                GridPosition { x, y },
+                                Property::new(terrain, owner, durability),
+                            ));
                         }
                     }
                 }
@@ -1170,5 +1192,13 @@ impl App {
         self.world = Some(world);
         self.schedule = Some(schedule);
         Ok(())
+    }
+
+    fn return_to_map_selection(&mut self) {
+        self.world = None;
+        self.schedule = None;
+        self.ui_state.current_screen = CurrentScreen::MapSelection;
+        self.ui_state.in_game_state = InGameState::Normal;
+        self.ui_state.cursor_pos = (0, 0);
     }
 }

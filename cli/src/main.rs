@@ -69,9 +69,9 @@ fn run_ai_debug() -> Result<(), Box<dyn Error>> {
     let backend = TestBackend::new(120, 30);
     let mut terminal = Terminal::new(backend)?;
 
-    println!("--- AI TUI Debugger Started ---");
+    println!("--- AI TUI デバッガーが開始されました ---");
     println!(
-        "Commands: 'up', 'down', 'left', 'right', 'enter', 'esc', 'space', 'dump', 'q' (quit), or single chars like 'j' or 'T'."
+        "コマンド: 'up', 'down', 'left', 'right', 'enter', 'esc', 'space', 'dump', 'q' (終了), または 'j' や 'T' などの単一文字。"
     );
 
     let stdin = io::stdin();
@@ -86,7 +86,7 @@ fn run_ai_debug() -> Result<(), Box<dyn Error>> {
             if cmd == "q" || cmd == "quit" {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
-                    "Quit requested by AI",
+                    "AIによって終了が要求されました",
                 ));
             }
             if cmd == "dump" {
@@ -179,8 +179,10 @@ where
             if let (Some(world), Some(schedule)) = (&mut app.world, &mut app.schedule) {
                 schedule.run(world);
 
+                use app::InGameState;
                 use bevy_ecs::event::Events;
-                use engine::events::{GamePhaseChangedEvent, UnitAttackedEvent};
+                use engine::events::{GameOverEvent, GamePhaseChangedEvent, UnitAttackedEvent};
+                use engine::resources::{GameOverCondition, Players};
 
                 if let Some(mut events) = world.get_resource_mut::<Events<UnitAttackedEvent>>() {
                     for ev in events.drain() {
@@ -211,60 +213,63 @@ where
                     }
                 }
 
+                if let Some(events) = world.get_resource::<Events<GameOverEvent>>() {
+                    let mut cursor = events.get_cursor();
+                    if let Some(ev) = cursor.read(events).next() {
+                        let condition = ev.condition.clone();
+                        let msg = match &condition {
+                            GameOverCondition::Winner(pid) => {
+                                let players = world.resource::<Players>();
+                                if let Some(p) = players.0.iter().find(|p| p.id == *pid) {
+                                    format!("勝利：{} 勢力", p.name)
+                                } else {
+                                    format!("勝利：プレイヤー {:?}", pid)
+                                }
+                            }
+                            GameOverCondition::Draw => "引き分け".to_string(),
+                        };
+                        app.ui_state.in_game_state = InGameState::GameOverPopup {
+                            message: msg,
+                            condition,
+                        };
+                    }
+                }
+
                 if popup_msg.is_none() {
                     popup_msg = phase_popup;
                 }
 
                 // メモリリーク対策: Bevy 0.15.2 はアップデートシステムがないと自動でイベントをクリアしない
                 use engine::events::*;
-                if let Some(mut e) = world.get_resource_mut::<Events<ProduceUnitCommand>>() {
-                    e.clear();
+                macro_rules! clear_events {
+                    ($($t:ty),*) => {
+                        $(
+                            if let Some(mut e) = world.get_resource_mut::<Events<$t>>() {
+                                e.clear();
+                            }
+                        )*
+                    };
                 }
-                if let Some(mut e) = world.get_resource_mut::<Events<MoveUnitCommand>>() {
-                    e.clear();
-                }
-                if let Some(mut e) = world.get_resource_mut::<Events<AttackUnitCommand>>() {
-                    e.clear();
-                }
-                if let Some(mut e) = world.get_resource_mut::<Events<CapturePropertyCommand>>() {
-                    e.clear();
-                }
-                if let Some(mut e) = world.get_resource_mut::<Events<MergeUnitCommand>>() {
-                    e.clear();
-                }
-                if let Some(mut e) = world.get_resource_mut::<Events<SupplyUnitCommand>>() {
-                    e.clear();
-                }
-                if let Some(mut e) = world.get_resource_mut::<Events<LoadUnitCommand>>() {
-                    e.clear();
-                }
-                if let Some(mut e) = world.get_resource_mut::<Events<UnloadUnitCommand>>() {
-                    e.clear();
-                }
-                if let Some(mut e) = world.get_resource_mut::<Events<WaitUnitCommand>>() {
-                    e.clear();
-                }
-                if let Some(mut e) = world.get_resource_mut::<Events<UndoMoveCommand>>() {
-                    e.clear();
-                }
-                if let Some(mut e) = world.get_resource_mut::<Events<NextPhaseCommand>>() {
-                    e.clear();
-                }
-                if let Some(mut e) = world.get_resource_mut::<Events<UnitMovedEvent>>() {
-                    e.clear();
-                }
-                if let Some(mut e) = world.get_resource_mut::<Events<UnitDestroyedEvent>>() {
-                    e.clear();
-                }
-                if let Some(mut e) = world.get_resource_mut::<Events<UnitMergedEvent>>() {
-                    e.clear();
-                }
-                if let Some(mut e) = world.get_resource_mut::<Events<PropertyCapturedEvent>>() {
-                    e.clear();
-                }
-                if let Some(mut e) = world.get_resource_mut::<Events<GameOverEvent>>() {
-                    e.clear();
-                }
+
+                clear_events!(
+                    ProduceUnitCommand,
+                    MoveUnitCommand,
+                    AttackUnitCommand,
+                    CapturePropertyCommand,
+                    MergeUnitCommand,
+                    SupplyUnitCommand,
+                    LoadUnitCommand,
+                    UnloadUnitCommand,
+                    WaitUnitCommand,
+                    UndoMoveCommand,
+                    NextPhaseCommand,
+                    GameOverEvent,
+                    PropertyCapturedEvent,
+                    UnitDestroyedEvent,
+                    GamePhaseChangedEvent,
+                    UnitMovedEvent,
+                    UnitMergedEvent
+                );
             }
 
             if let Some(msg) = popup_msg

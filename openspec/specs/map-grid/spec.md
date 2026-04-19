@@ -16,5 +16,5 @@ TBD - created by archiving change add-core-logic. Update Purpose after archive.
 
 #### Scenario: 地形の照会と指定地形のサポート
 - **WHEN** 境界内の特定の (x, y) 座標を照会したとき
-- **THEN** 指定URL（https://gbwn.main.jp/Terrain_GBWs.htm）に基づく13種類の地形（道路、橋、平地、川、森、山、海、浅瀬、都市、工場、空港、港、首都）のいずれかの正しい地形タイプを返す
+- **THEN** 地形（道路、橋、平地、川、森、山、海、浅瀬、都市、工場、空港、港、首都）のいずれかの正しい地形タイプを返す
 
