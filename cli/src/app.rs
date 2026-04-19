@@ -149,18 +149,17 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.ui_state.selected_map_index > 0 {
-                    self.ui_state.selected_map_index -= 1;
-                }
+            KeyCode::Up | KeyCode::Char('k') if self.ui_state.selected_map_index > 0 => {
+                self.ui_state.selected_map_index -= 1;
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Up | KeyCode::Char('k') => {}
+            KeyCode::Down | KeyCode::Char('j')
                 if self.ui_state.selected_map_index
-                    < self.ui_state.available_maps.len().saturating_sub(1)
-                {
-                    self.ui_state.selected_map_index += 1;
-                }
+                    < self.ui_state.available_maps.len().saturating_sub(1) =>
+            {
+                self.ui_state.selected_map_index += 1;
             }
+            KeyCode::Down | KeyCode::Char('j') => {}
             KeyCode::Enter | KeyCode::Char(' ') => {
                 // Determine the selected map
                 let map_name = self
