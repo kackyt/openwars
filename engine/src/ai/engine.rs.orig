@@ -245,98 +245,38 @@ mod tests {
     fn test_decide_ai_action_attack() {
         let mut world = World::new();
         let mut dc = DamageChart::new();
-        dc.insert_damage(UnitType::Tank, UnitType::Infantry, 90);
+        dc.insert_damage(
+            UnitType::Tank,
+            UnitType::Infantry,
+            90,
+        );
         world.insert_resource(dc);
-        world.insert_resource(crate::resources::Map {
-            width: 10,
-            height: 10,
-            tiles: vec![crate::resources::Terrain::Plains; 100],
-            topology: crate::resources::GridTopology::Square,
-        });
-        crate::resources::master_data::MasterDataRegistry::load()
-            .map(|m| world.insert_resource(m))
-            .unwrap();
+        world.insert_resource(crate::resources::Map { width: 10, height: 10, tiles: vec![crate::resources::Terrain::Plains; 100], topology: crate::resources::GridTopology::Square });
 
         let p1 = PlayerId(1);
         let p2 = PlayerId(2);
 
-        let attacker = world
-            .spawn((
-                p1,
-                Faction(p1),
-                HasMoved(false),
-                ActionCompleted(false),
-                GridPosition { x: 1, y: 1 },
-                UnitStats {
-                    unit_type: UnitType::Tank,
-                    cost: 7000,
-                    min_range: 1,
-                    max_range: 1,
-                    max_ammo1: 10,
-                    max_ammo2: 10,
-                    movement_type: crate::resources::MovementType::Tank,
-                    max_movement: 6,
-                    max_fuel: 99,
-                    daily_fuel_consumption: 0,
-                    can_capture: false,
-                    can_supply: false,
-                    max_cargo: 0,
-                    loadable_unit_types: vec![],
-                },
-                Health {
-                    current: 100,
-                    max: 100,
-                },
-                crate::components::Ammo {
-                    ammo1: 10,
-                    max_ammo1: 10,
-                    ammo2: 10,
-                    max_ammo2: 10,
-                },
-                crate::components::Fuel {
-                    current: 99,
-                    max: 99,
-                },
-            ))
-            .id();
+        let attacker = world.spawn((
+            p1,
+            Faction(p1),
+            HasMoved(false),
+            ActionCompleted(false),
+            GridPosition { x: 1, y: 1 },
+            UnitStats { unit_type: UnitType::Tank, cost: 7000, min_range: 1, max_range: 1, max_ammo1: 10, max_ammo2: 10, movement_type: crate::resources::MovementType::Tank, max_movement: 6, max_fuel: 99, daily_fuel_consumption: 0, can_capture: false, can_supply: false, max_cargo: 0, loadable_unit_types: vec![] },
+            Health { current: 100, max: 100 },
+            crate::components::Ammo { ammo1: 10, max_ammo1: 10, ammo2: 10, max_ammo2: 10 },
+            crate::components::Fuel { current: 99, max: 99 }
+        )).id();
 
-        let defender = world
-            .spawn((
-                p2,
-                Faction(p2),
-                GridPosition { x: 1, y: 2 }, // adjacent
-                UnitStats {
-                    unit_type: UnitType::Infantry,
-                    cost: 1000,
-                    min_range: 1,
-                    max_range: 1,
-                    max_ammo1: 10,
-                    max_ammo2: 10,
-                    movement_type: crate::resources::MovementType::Infantry,
-                    max_movement: 3,
-                    max_fuel: 99,
-                    daily_fuel_consumption: 0,
-                    can_capture: true,
-                    can_supply: false,
-                    max_cargo: 0,
-                    loadable_unit_types: vec![],
-                },
-                Health {
-                    current: 100,
-                    max: 100,
-                },
-                crate::components::Ammo {
-                    ammo1: 10,
-                    max_ammo1: 10,
-                    ammo2: 10,
-                    max_ammo2: 10,
-                },
-                crate::components::Fuel {
-                    current: 99,
-                    max: 99,
-                },
-            ))
-            .id();
+        let defender = world.spawn((
+            p2,
+            Faction(p2),
+            GridPosition { x: 1, y: 2 }, // adjacent
+            UnitStats { unit_type: UnitType::Infantry, cost: 1000, min_range: 1, max_range: 1, max_ammo1: 10, max_ammo2: 10, movement_type: crate::resources::MovementType::Infantry, max_movement: 3, max_fuel: 99, daily_fuel_consumption: 0, can_capture: true, can_supply: false, max_cargo: 0, loadable_unit_types: vec![] },
+            Health { current: 100, max: 100 },
+            crate::components::Ammo { ammo1: 10, max_ammo1: 10, ammo2: 10, max_ammo2: 10 },
+            crate::components::Fuel { current: 99, max: 99 }
+        )).id();
 
         let action = decide_ai_action(&mut world, p1);
         assert!(action.is_some());
@@ -352,58 +292,25 @@ mod tests {
     fn test_decide_ai_action_capture() {
         let mut world = World::new();
         world.insert_resource(DamageChart::new());
-        world.insert_resource(crate::resources::Map {
-            width: 10,
-            height: 10,
-            tiles: vec![crate::resources::Terrain::Plains; 100],
-            topology: crate::resources::GridTopology::Square,
-        });
+        world.insert_resource(crate::resources::Map { width: 10, height: 10, tiles: vec![crate::resources::Terrain::Plains; 100], topology: crate::resources::GridTopology::Square });
         let p1 = PlayerId(1);
 
-        let unit = world
-            .spawn((
-                p1,
-                Faction(p1),
-                HasMoved(false),
-                ActionCompleted(false),
-                GridPosition { x: 1, y: 1 },
-                UnitStats {
-                    unit_type: UnitType::Infantry,
-                    cost: 1000,
-                    can_capture: true,
-                    movement_type: crate::resources::MovementType::Infantry,
-                    max_movement: 3,
-                    max_fuel: 99,
-                    daily_fuel_consumption: 0,
-                    can_supply: false,
-                    max_cargo: 0,
-                    loadable_unit_types: vec![],
-                    max_ammo1: 0,
-                    max_ammo2: 0,
-                    min_range: 0,
-                    max_range: 0,
-                },
-                Health {
-                    current: 100,
-                    max: 100,
-                },
-                crate::components::Ammo {
-                    ammo1: 10,
-                    max_ammo1: 10,
-                    ammo2: 10,
-                    max_ammo2: 10,
-                },
-                crate::components::Fuel {
-                    current: 99,
-                    max: 99,
-                },
-            ))
-            .id();
+        let unit = world.spawn((
+            p1,
+            Faction(p1),
+            HasMoved(false),
+            ActionCompleted(false),
+            GridPosition { x: 1, y: 1 },
+            UnitStats { unit_type: UnitType::Infantry, cost: 1000, can_capture: true, movement_type: crate::resources::MovementType::Infantry, max_movement: 3, max_fuel: 99, daily_fuel_consumption: 0, can_supply: false, max_cargo: 0, loadable_unit_types: vec![], max_ammo1: 0, max_ammo2: 0, min_range: 0, max_range: 0 },
+            Health { current: 100, max: 100 },
+            crate::components::Ammo { ammo1: 10, max_ammo1: 10, ammo2: 10, max_ammo2: 10 },
+            crate::components::Fuel { current: 99, max: 99 }
+        )).id();
 
         // Neutral property on the same tile
         world.spawn((
             GridPosition { x: 1, y: 1 },
-            crate::components::Property::new(crate::resources::Terrain::City, None, 200),
+            crate::components::Property::new(crate::resources::Terrain::City, None, 200)
         ));
 
         let action = decide_ai_action(&mut world, p1);

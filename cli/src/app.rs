@@ -47,6 +47,7 @@ impl ActionType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InGameState {
     Normal,
+    WaitAiAction,
     UnitSelected {
         unit_entity: Entity,
         start_pos: (usize, usize),
@@ -231,17 +232,17 @@ impl App {
         // AIターンの場合は一部のキー（終了など）以外は無視する
         if let Some(world) = &self.world
             && let Some(match_state) = world.get_resource::<engine::resources::MatchState>()
-                && let Some(players) = world.get_resource::<engine::resources::Players>()
-                    && let Some(active_player) = players.0.get(match_state.active_player_index.0)
-                        && let InGameState::Normal = self.ui_state.in_game_state
-                            && self.ui_state.player_controls.get(&active_player.id.0)
-                                == Some(&PlayerControlType::Ai)
-                            {
-                                match key.code {
-                                    crossterm::event::KeyCode::Char('q') => self.should_quit = true,
-                                    _ => return, // AIターン中は他の入力を無視
-                                }
-                            }
+            && let Some(players) = world.get_resource::<engine::resources::Players>()
+            && let Some(active_player) = players.0.get(match_state.active_player_index.0)
+            && let InGameState::Normal = self.ui_state.in_game_state
+            && self.ui_state.player_controls.get(&active_player.id.0)
+                == Some(&PlayerControlType::Ai)
+        {
+            match key.code {
+                crossterm::event::KeyCode::Char('q') => self.should_quit = true,
+                _ => return, // AIターン中は他の入力を無視
+            }
+        }
 
         use crossterm::event::KeyCode;
 
@@ -303,7 +304,7 @@ impl App {
                 self.ui_state.in_game_state = InGameState::Normal;
             }
             InGameState::GameOverPopup { .. } => self.return_to_map_selection(),
-            InGameState::Normal => {}
+            InGameState::Normal | InGameState::WaitAiAction => {}
         }
     }
 
@@ -398,6 +399,7 @@ impl App {
         let state_clone = self.ui_state.in_game_state.clone();
         match state_clone {
             InGameState::Normal => self.handle_normal_confirm(),
+            InGameState::WaitAiAction => {}
             InGameState::ActionMenu {
                 unit_entity,
                 options,
@@ -1086,28 +1088,26 @@ impl App {
         // AIモードトグルのためのホットキー ('p')
         if let crossterm::event::KeyCode::Char('p') = key.code
             && let Some(world) = &self.world
-                && let Some(match_state) = world.get_resource::<engine::resources::MatchState>()
-                    && let Some(players) = world.get_resource::<engine::resources::Players>()
-                        && let Some(active_player) =
-                            players.0.get(match_state.active_player_index.0)
-                        {
-                            let pid = active_player.id.0;
-                            let new_ctrl =
-                                if let Some(ctrl) = self.ui_state.player_controls.get_mut(&pid) {
-                                    *ctrl = match *ctrl {
-                                        PlayerControlType::Human => PlayerControlType::Ai,
-                                        PlayerControlType::Ai => PlayerControlType::Human,
-                                    };
-                                    Some(*ctrl)
-                                } else {
-                                    None
-                                };
+            && let Some(match_state) = world.get_resource::<engine::resources::MatchState>()
+            && let Some(players) = world.get_resource::<engine::resources::Players>()
+            && let Some(active_player) = players.0.get(match_state.active_player_index.0)
+        {
+            let pid = active_player.id.0;
+            let new_ctrl = if let Some(ctrl) = self.ui_state.player_controls.get_mut(&pid) {
+                *ctrl = match *ctrl {
+                    PlayerControlType::Human => PlayerControlType::Ai,
+                    PlayerControlType::Ai => PlayerControlType::Human,
+                };
+                Some(*ctrl)
+            } else {
+                None
+            };
 
-                            if let Some(ctrl) = new_ctrl {
-                                self.ui_state
-                                    .add_log(format!("Player {} is now {:?}", pid, ctrl));
-                            }
-                        }
+            if let Some(ctrl) = new_ctrl {
+                self.ui_state
+                    .add_log(format!("Player {} is now {:?}", pid, ctrl));
+            }
+        }
 
         match self.ui_state.current_screen {
             CurrentScreen::MapSelection => self.handle_map_selection_key(key),
