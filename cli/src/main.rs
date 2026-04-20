@@ -179,12 +179,7 @@ where
             if let (Some(world), Some(schedule)) = (&mut app.world, &mut app.schedule) {
                 use app::{InGameState, PlayerControlType};
                 use bevy_ecs::event::Events;
-                use engine::ai::engine::decide_ai_action;
-                use engine::ai::production::decide_production;
-                use engine::events::{
-                    AttackUnitCommand, CapturePropertyCommand, MoveUnitCommand, ProduceUnitCommand,
-                    WaitUnitCommand,
-                };
+                use engine::ai::engine::execute_ai_turn;
                 use engine::events::{GameOverEvent, GamePhaseChangedEvent, UnitAttackedEvent};
                 use engine::resources::{GameOverCondition, MatchState, Players};
 
@@ -203,30 +198,9 @@ where
                     if let Some(active_player) = active_player_opt
                         && app.ui_state.player_controls.get(&active_player.0)
                             == Some(&PlayerControlType::Ai)
+                        && execute_ai_turn(world, active_player)
                     {
-                        // 生産AIの実行
-                        let mut prod_commands = decide_production(world, active_player);
-                        if let Some(mut events) =
-                            world.get_resource_mut::<Events<ProduceUnitCommand>>()
-                        {
-                            for cmd in prod_commands.drain(..) {
-                                events.send(cmd);
-                            }
-                        }
-
-                        // 行動決定AIの実行
-                        if let Some((entity, command)) = decide_ai_action(world, active_player) {
-                            engine::ai::engine::execute_ai_command(world, entity, command);
-                            app.ui_state.in_game_state = InGameState::WaitAiAction;
-                        } else {
-                            // 全ユニット行動済みならターン終了
-                            use engine::events::NextPhaseCommand;
-                            if let Some(mut end_events) =
-                                world.get_resource_mut::<Events<NextPhaseCommand>>()
-                            {
-                                end_events.send(NextPhaseCommand);
-                            }
-                        }
+                        app.ui_state.in_game_state = InGameState::WaitAiAction;
                     }
                 }
 

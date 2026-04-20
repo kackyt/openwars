@@ -415,3 +415,36 @@ mod tests {
         }
     }
 }
+
+/// 一度の呼び出しで、該当勢力のAI行動（生産、または1ユニットの行動）を1ステップ実行し、イベントを発行します。
+/// 行動可能ユニットがなくなったらターン終了コマンドを発行します。
+/// 何らかの行動を実行した場合は true、ターンが終了した場合は false を返します。
+pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> bool {
+    // 1. 生産行動
+    let prod_commands = super::production::decide_production(world, active_player);
+    if !prod_commands.is_empty() {
+        if let Some(mut events) =
+            world.get_resource_mut::<Events<crate::events::ProduceUnitCommand>>()
+        {
+            for cmd in prod_commands {
+                events.send(cmd);
+            }
+        }
+        // 生産の直後は一旦状態更新を待つために true を返す
+        return true;
+    }
+
+    // 2. ユニット行動
+    if let Some((entity, command)) = decide_ai_action(world, active_player) {
+        execute_ai_command(world, entity, command);
+        return true;
+    }
+
+    // 3. 全行動完了 -> ターン終了
+    if let Some(mut end_events) =
+        world.get_resource_mut::<Events<crate::events::NextPhaseCommand>>()
+    {
+        end_events.send(crate::events::NextPhaseCommand);
+    }
+    false
+}

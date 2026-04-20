@@ -759,12 +759,14 @@ dependencies = [
 name = "mcp-server"
 version = "0.1.0"
 dependencies = [
+ "bevy_ecs",
  "engine",
  "rmcp",
  "schemars",
  "serde",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
