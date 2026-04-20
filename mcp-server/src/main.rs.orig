@@ -1,21 +1,21 @@
-use rmcp::handler::server::tool::Parameters;
-use rmcp::model::{Implementation, ServerInfo};
-use rmcp::{ServerHandler, tool};
-use schemars::JsonSchema;
-use serde::Deserialize;
+use rmcp::{tool, ServerHandler};
+use rmcp::model::{ServerInfo, Implementation};
+
+use rmcp::serde::{Deserialize, Serialize};
+use rmcp::schemars::JsonSchema;
 
 #[derive(Clone)]
 struct OpenWarsAiServer;
 
 #[derive(Deserialize, JsonSchema)]
-pub struct LoadMapArgs {
-    pub map_name: String,
+struct LoadMapArgs {
+    map_name: String,
 }
 
 #[tool]
 impl OpenWarsAiServer {
     #[tool(description = "Loads a specific map to evaluate. Example maps: 'g1_01', 'g1_02'")]
-    async fn load_map(&self, _args: Parameters<LoadMapArgs>) -> Result<String, String> {
+    async fn load_map(&self, _args: rmcp::handler::server::tool::Parameters<LoadMapArgs>) -> Result<String, String> {
         Err("Tool 'load_map' is not wired to the engine yet".into())
     }
 
