@@ -47,7 +47,7 @@ pub struct GetValidActionsArgs {
 #[derive(Deserialize, JsonSchema)]
 pub struct ExecuteActionArgs {}
 
-#[tool]
+#[tool(tool_box)]
 impl OpenWarsAiServer {
     #[tool(description = "Loads a specific map to evaluate.")]
     async fn load_map(&self, args: Parameters<LoadMapArgs>) -> Result<String, String> {
@@ -110,8 +110,11 @@ impl OpenWarsAiServer {
 }
 
 impl ServerHandler for OpenWarsAiServer {
+    rmcp::tool_box!(@derive);
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
+            capabilities: rmcp::model::ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation {
                 name: "openwars-mcp".into(),
                 version: "1.0.0".into(),
@@ -130,7 +133,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state: Arc::new(Mutex::new(None)),
     };
 
-    serve_server(server, stdio()).await?;
+    let running_service = serve_server(server, stdio()).await?;
+    running_service.waiting().await?;
 
     Ok(())
 }
