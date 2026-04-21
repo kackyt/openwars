@@ -236,7 +236,8 @@ impl App {
             && let Some(match_state) = world.get_resource::<MatchState>()
             && let Some(players) = world.get_resource::<Players>()
             && let Some(active_player) = players.0.get(match_state.active_player_index.0)
-            && let InGameState::Normal = self.ui_state.in_game_state
+            && (matches!(self.ui_state.in_game_state, InGameState::Normal)
+                || matches!(self.ui_state.in_game_state, InGameState::WaitAiAction))
             && self.ui_state.player_controls.get(&active_player.id.0)
                 == Some(&PlayerControlType::Ai)
         {

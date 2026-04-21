@@ -41,10 +41,8 @@ pub fn create_world() -> (World, Schedule) {
     (world, schedule)
 }
 
-/// 全イベントバッファを回転させるシステム。
-/// 手動で Schedule を実行する場合、各ターンの開始時にこれを実行する必要があります。
-/// 全イベントバッファを回転させるシステム。
-/// 手動で Schedule を実行する場合、各ターンの開始時にこれを実行する必要があります。
+/// 全イベントバッファをフレーム末尾で回転させるシステム。
+/// 手動で Schedule を実行する場合、各ターンの末尾でこれを呼び出す必要があります。
 pub fn update_all_events(world: &mut World) {
     world.resource_mut::<Events<ProduceUnitCommand>>().update();
     world.resource_mut::<Events<MoveUnitCommand>>().update();

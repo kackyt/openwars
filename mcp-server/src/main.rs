@@ -30,6 +30,11 @@ struct OpenWarsAiServer {
     pub state: Arc<Mutex<Option<GameState>>>,
 }
 
+fn parse_player_id(value: u64) -> Result<PlayerId, String> {
+    let id = u32::try_from(value).map_err(|_| format!("Player ID {} is out of range", value))?;
+    Ok(PlayerId(id))
+}
+
 #[derive(Deserialize, JsonSchema)]
 pub struct LoadMapArgs {
     pub map_name: String,
@@ -127,8 +132,9 @@ impl OpenWarsAiServer {
             }
 
             // Player validation
+            let player_id = parse_player_id(args.0.player_id)?;
             let players = world.resource::<Players>();
-            if !players.0.iter().any(|p| p.id.0 == args.0.player_id as u32) {
+            if !players.0.iter().any(|p| p.id == player_id) {
                 return Err(format!("Player ID {} not found", args.0.player_id));
             }
 
@@ -143,7 +149,7 @@ impl OpenWarsAiServer {
                     x: args.0.x as usize,
                     y: args.0.y as usize,
                 },
-                Faction(PlayerId(args.0.player_id as u32)),
+                Faction(player_id),
                 stats.clone(),
                 Health {
                     current: 100,
@@ -179,10 +185,8 @@ impl OpenWarsAiServer {
     ) -> Result<String, String> {
         let mut state_lock = self.state.lock().await;
         if let Some(state) = state_lock.as_mut() {
-            let score = engine::ai::eval::evaluate_board(
-                &mut state.world,
-                PlayerId(args.0.player_id as u32),
-            );
+            let player_id = parse_player_id(args.0.player_id)?;
+            let score = engine::ai::eval::evaluate_board(&mut state.world, player_id);
             Ok(serde_json::json!({
                 "player_id": args.0.player_id,
                 "score": score
@@ -249,9 +253,10 @@ impl OpenWarsAiServer {
                         &Faction,
                         &UnitStats,
                         Option<&engine::components::CargoCapacity>,
+                        Option<&engine::components::Transporting>,
                     )>();
-                    for (e, p, f, s, cargo_opt) in q_occupants.iter(world) {
-                        if e != entity {
+                    for (e, p, f, s, cargo_opt, transporting_opt) in q_occupants.iter(world) {
+                        if e != entity && transporting_opt.is_none() {
                             let free_slots = cargo_opt
                                 .map(|c| c.max.saturating_sub(c.loaded.len() as u32))
                                 .unwrap_or(0);

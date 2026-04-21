@@ -56,10 +56,24 @@ pub fn decide_ai_action(
             &ActionCompleted,
             &UnitStats,
             Option<&crate::components::CargoCapacity>,
+            Option<&crate::components::Transporting>,
         )>();
-        for (entity, pos, faction, has_moved, action_completed, stats, cargo_opt) in
-            query.iter(world)
+        for (
+            entity,
+            pos,
+            faction,
+            has_moved,
+            action_completed,
+            stats,
+            cargo_opt,
+            transporting_opt,
+        ) in query.iter(world)
         {
+            // 輸送中のユニットはマップ上に実体がないためスキップ
+            if transporting_opt.is_some() {
+                continue;
+            }
+
             // movable_units への登録判定（行動候補）
             if !skip_entities.contains(&entity)
                 && faction.0 == player_id
@@ -69,7 +83,7 @@ pub fn decide_ai_action(
                 movable_units.push(entity);
             }
 
-            // 占領情報の登録（常に全ユニット対象）
+            // 占有情報の登録（輸送中以外は常に全ユニット対象）
             let free_slots = cargo_opt
                 .map(|c| c.max.saturating_sub(c.loaded.len() as u32))
                 .unwrap_or(0);
@@ -91,21 +105,22 @@ pub fn decide_ai_action(
     }
 
     // 2. 行動可能なユニットを順に評価
+    let mut best_overall_score = i32::MIN;
+    let mut best_overall_choice: Option<(Entity, AiCommand)> = None;
+
     for unit_entity in movable_units {
-        let (stats, pos, fuel, _ammo) = {
+        let (stats, pos, fuel) = {
             let stats = world.get::<UnitStats>(unit_entity).cloned();
             let pos = world.get::<GridPosition>(unit_entity).cloned();
             let fuel = world
                 .get::<crate::components::Fuel>(unit_entity)
                 .map(|f| f.current);
-            let is_transported = world
-                .get::<crate::components::Transporting>(unit_entity)
-                .is_some();
 
-            if stats.is_none() || pos.is_none() || fuel.is_none() || is_transported {
+            // この時点では transported 判定は不要（movable_units収集時に除外済み）
+            if stats.is_none() || pos.is_none() || fuel.is_none() {
                 continue;
             }
-            (stats.unwrap(), pos.unwrap(), fuel.unwrap(), (0, 0))
+            (stats.unwrap(), pos.unwrap(), fuel.unwrap())
         };
 
         let map = world.resource::<Map>().clone();
@@ -224,15 +239,17 @@ pub fn decide_ai_action(
                     });
                 }
             }
-            // (他アクション省略、必要に応じて追加)
         }
 
-        if let Some(choice) = best_unit_choice {
-            return Some((unit_entity, choice));
+        if let Some(choice) = best_unit_choice
+            && best_unit_score > best_overall_score
+        {
+            best_overall_score = best_unit_score;
+            best_overall_choice = Some((unit_entity, choice));
         }
     }
 
-    None
+    best_overall_choice
 }
 
 pub fn execute_ai_command(world: &mut World, unit_entity: Entity, command: AiCommand) {
