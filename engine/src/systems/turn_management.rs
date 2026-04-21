@@ -70,7 +70,7 @@ pub fn next_phase_system(
     q_properties: Query<(&GridPosition, &Property)>,
     map: Res<Map>,
     registry: Res<MasterDataRegistry>,
-    mut diagnostic: ResMut<ProductionDiagnostic>,
+    mut diagnostic: Option<ResMut<ProductionDiagnostic>>,
 ) {
     if match_state.game_over.is_some() {
         return;
@@ -109,7 +109,7 @@ pub fn next_phase_system(
             &q_properties,
             &mut q_units,
             &registry,
-            &mut diagnostic,
+            diagnostic.as_deref_mut(),
         );
 
         // UIへ通知 (Mainフェーズ開始のみ通知)
@@ -137,9 +137,11 @@ fn process_resupply(
         &GridPosition,
     )>,
     registry: &MasterDataRegistry,
-    diagnostic: &mut ProductionDiagnostic,
+    mut diagnostic: Option<&mut ProductionDiagnostic>,
 ) {
-    diagnostic.income_log.clear();
+    if let Some(ref mut diag) = diagnostic {
+        diag.income_log.clear();
+    }
     // Apply property resupply
     let mut owned_properties = HashSet::new();
     let mut budget_increase = 0;
@@ -149,9 +151,10 @@ fn process_resupply(
             let terrain_name = prop.terrain.as_str();
             let income = registry.landscape_income(terrain_name);
             budget_increase += income;
-            diagnostic
-                .income_log
-                .push(format!("{}: {}G", terrain_name, income));
+            if let Some(ref mut diag) = diagnostic {
+                diag.income_log
+                    .push(format!("{}: {}G", terrain_name, income));
+            }
 
             // Collect for resupply check
             if prop.terrain == Terrain::City

@@ -153,7 +153,7 @@ pub fn produce_unit_system(
     q_units: Query<&GridPosition, (With<Faction>, Without<Transporting>)>,
     master_data: Res<MasterDataRegistry>,
     unit_registry: Res<UnitRegistry>,
-    mut diagnostic: ResMut<ProductionDiagnostic>,
+    mut diagnostic: Option<ResMut<ProductionDiagnostic>>,
 ) {
     if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
@@ -162,7 +162,9 @@ pub fn produce_unit_system(
     let mut newly_spawned_positions = std::collections::HashSet::new();
 
     for event in produce_events.read() {
-        diagnostic.last_event = Some(format!("{:?}", event));
+        if let Some(ref mut diag) = diagnostic {
+            diag.last_event = Some(format!("{:?}", event));
+        }
         if event.player_id != active_player_id {
             continue;
         }
@@ -194,7 +196,9 @@ pub fn produce_unit_system(
             event.unit_type,
             &master_data,
         ) {
-            diagnostic.last_error = Some(e.to_string());
+            if let Some(ref mut diag) = diagnostic {
+                diag.last_error = Some(e.to_string());
+            }
             continue;
         }
 
