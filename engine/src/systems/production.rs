@@ -194,7 +194,7 @@ pub fn produce_unit_system(
             event.unit_type,
             &master_data,
         ) {
-            diagnostic.last_error = Some(format!("{}", e));
+            diagnostic.last_error = Some(e.to_string());
             continue;
         }
 

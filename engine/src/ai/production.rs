@@ -1,7 +1,7 @@
 use crate::components::{GridPosition, PlayerId, Property, Transporting, UnitStats};
 use crate::events::ProduceUnitCommand;
 use crate::resources::master_data::MasterDataRegistry;
-use crate::resources::{Players, Terrain, UnitRegistry, UnitType};
+use crate::resources::{Players, UnitRegistry, UnitType};
 use bevy_ecs::prelude::*;
 
 /// 単純な生産AI。
@@ -94,6 +94,7 @@ mod tests {
     use super::*;
     use crate::components::Faction;
     use crate::resources::Player;
+    use crate::resources::Terrain;
     use std::collections::HashMap;
 
     #[test]
@@ -189,7 +190,7 @@ mod tests {
         // (3,0) is skipped because of funds (needs 1000 buffer + 3*1000 = 4000, but has 3500)
         assert_eq!(commands.len(), 2); // Wait, if funds 3500, available 2500. So 2 units.
         // The order might depend on query order, but usually (0,0) comes first.
-        assert_eq!(commands[0].target_x, 0); 
+        assert_eq!(commands[0].target_x, 0);
         assert_eq!(commands[1].target_x, 1);
     }
 

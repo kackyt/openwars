@@ -149,7 +149,9 @@ fn process_resupply(
             let terrain_name = prop.terrain.as_str();
             let income = registry.landscape_income(terrain_name);
             budget_increase += income;
-            diagnostic.income_log.push(format!("{}: {}G", terrain_name, income));
+            diagnostic
+                .income_log
+                .push(format!("{}: {}G", terrain_name, income));
 
             // Collect for resupply check
             if prop.terrain == Terrain::City

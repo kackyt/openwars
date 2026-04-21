@@ -173,7 +173,7 @@ impl OpenWarsAiServer {
         let mut state_lock = self.state.lock().await;
         if let Some(state) = state_lock.as_mut() {
             let world = &mut state.world;
-            let entity = Entity::from_bits(args.0.unit_id as u64);
+            let entity = Entity::from_bits(args.0.unit_id);
 
             if world.get_entity(entity).is_ok() {
                 let pos = if let (Some(x), Some(y)) = (args.0.x, args.0.y) {
@@ -186,12 +186,8 @@ impl OpenWarsAiServer {
                 };
 
                 let is_moved = world.get::<HasMoved>(entity).map(|h| h.0).unwrap_or(false);
-                let actions = engine::systems::action::get_available_actions_at(
-                    world,
-                    entity,
-                    pos,
-                    is_moved,
-                );
+                let actions =
+                    engine::systems::action::get_available_actions_at(world, entity, pos, is_moved);
                 Ok(serde_json::to_string(&actions).map_err(|e| e.to_string())?)
             } else {
                 Err(format!("Unit with ID {} not found", args.0.unit_id))
@@ -209,7 +205,7 @@ impl OpenWarsAiServer {
         let mut state_lock = self.state.lock().await;
         if let Some(state) = state_lock.as_mut() {
             let world = &mut state.world;
-            let entity = Entity::from_bits(args.0.unit_id as u64);
+            let entity = Entity::from_bits(args.0.unit_id);
 
             if let Ok(e) = world.get_entity(entity) {
                 if let (Some(pos), Some(faction), Some(stats), Some(fuel)) = (
@@ -218,49 +214,49 @@ impl OpenWarsAiServer {
                     e.get::<UnitStats>().cloned(),
                     e.get::<Fuel>().cloned(),
                 ) {
-                let mut unit_positions = std::collections::HashMap::new();
-                let mut q_occupants = world.query::<(
-                    Entity,
-                    &GridPosition,
-                    &Faction,
-                    &UnitStats,
-                    Option<&engine::components::CargoCapacity>,
-                )>();
-                for (e, p, f, s, cargo_opt) in q_occupants.iter(world) {
-                    if e != entity {
-                        let free_slots = cargo_opt
-                            .map(|c| c.max.saturating_sub(c.loaded.len() as u32))
-                            .unwrap_or(0);
-                        unit_positions.insert(
-                            (p.x, p.y),
-                            engine::systems::movement::OccupantInfo {
-                                player_id: f.0,
-                                is_transport: s.max_cargo > 0,
-                                unit_type: s.unit_type,
-                                loadable_types: s.loadable_unit_types.clone(),
-                                free_slots,
-                            },
-                        );
+                    let mut unit_positions = std::collections::HashMap::new();
+                    let mut q_occupants = world.query::<(
+                        Entity,
+                        &GridPosition,
+                        &Faction,
+                        &UnitStats,
+                        Option<&engine::components::CargoCapacity>,
+                    )>();
+                    for (e, p, f, s, cargo_opt) in q_occupants.iter(world) {
+                        if e != entity {
+                            let free_slots = cargo_opt
+                                .map(|c| c.max.saturating_sub(c.loaded.len() as u32))
+                                .unwrap_or(0);
+                            unit_positions.insert(
+                                (p.x, p.y),
+                                engine::systems::movement::OccupantInfo {
+                                    player_id: f.0,
+                                    is_transport: s.max_cargo > 0,
+                                    unit_type: s.unit_type,
+                                    loadable_types: s.loadable_unit_types.clone(),
+                                    free_slots,
+                                },
+                            );
+                        }
                     }
-                }
 
-                let map = world.resource::<engine::resources::Map>();
-                let registry = world.resource::<MasterDataRegistry>();
+                    let map = world.resource::<engine::resources::Map>();
+                    let registry = world.resource::<MasterDataRegistry>();
 
-                let reachable = engine::systems::movement::calculate_reachable_tiles(
-                    map,
-                    &unit_positions,
-                    (pos.x, pos.y),
-                    stats.movement_type,
-                    stats.max_movement,
-                    fuel.current,
-                    faction.0,
-                    stats.unit_type,
-                    registry,
-                );
+                    let reachable = engine::systems::movement::calculate_reachable_tiles(
+                        map,
+                        &unit_positions,
+                        (pos.x, pos.y),
+                        stats.movement_type,
+                        stats.max_movement,
+                        fuel.current,
+                        faction.0,
+                        stats.unit_type,
+                        registry,
+                    );
 
-                let tiles: Vec<_> = reachable.into_iter().map(|(x, y)| vec![x, y]).collect();
-                Ok(serde_json::to_string(&tiles).map_err(|e| e.to_string())?)
+                    let tiles: Vec<_> = reachable.into_iter().map(|(x, y)| vec![x, y]).collect();
+                    Ok(serde_json::to_string(&tiles).map_err(|e| e.to_string())?)
                 } else {
                     Err(format!("Unit with ID {} is missing stats", args.0.unit_id))
                 }
