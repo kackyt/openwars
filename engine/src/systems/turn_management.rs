@@ -69,6 +69,7 @@ pub fn next_phase_system(
     mut players: ResMut<Players>,
     q_properties: Query<(&GridPosition, &Property)>,
     map: Res<Map>,
+    registry: Res<MasterDataRegistry>,
 ) {
     if match_state.game_over.is_some() {
         return;
@@ -106,7 +107,7 @@ pub fn next_phase_system(
             &mut players,
             &q_properties,
             &mut q_units,
-            &map,
+            &registry,
         );
 
         // UIへ通知 (Mainフェーズ開始のみ通知)
@@ -133,13 +134,17 @@ fn process_resupply(
         &mut Health,
         &GridPosition,
     )>,
-    _map: &Map,
+    registry: &MasterDataRegistry,
 ) {
     // Apply property resupply
     let mut owned_properties = HashSet::new();
-    let mut city_count = 0;
+    let mut budget_increase = 0;
     for (pos, prop) in q_properties.iter() {
         if prop.owner_id == Some(active_player_id) {
+            // Count for income
+            budget_increase += registry.landscape_income(prop.terrain.as_str());
+
+            // Collect for resupply check
             if prop.terrain == Terrain::City
                 || prop.terrain == Terrain::Airport
                 || prop.terrain == Terrain::Factory
@@ -148,14 +153,10 @@ fn process_resupply(
             {
                 owned_properties.insert((pos.x, pos.y));
             }
-            if prop.terrain == Terrain::City || prop.terrain == Terrain::Airport {
-                city_count += 1;
-            }
         }
     }
 
     // Add funds
-    let budget_increase = city_count * 1000;
     let active_player_idx = players
         .0
         .iter()
@@ -240,6 +241,7 @@ mod tests {
             Player::new(2, "P2".to_string()),
         ]));
         world.insert_resource(Map::new(5, 5, Terrain::Plains, GridTopology::Square));
+        world.insert_resource(MasterDataRegistry::load().unwrap());
         world.init_resource::<Events<NextPhaseCommand>>();
         world.init_resource::<Events<GamePhaseChangedEvent>>();
 
