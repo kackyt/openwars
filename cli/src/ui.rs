@@ -60,18 +60,20 @@ fn draw_map_selection(f: &mut Frame, app: &mut App) {
     f.render_widget(maps_list, chunks[1]);
 
     // Player controls section
-    let p1_ctrl = match app.ui_state.player_controls.get(&1) {
-        Some(crate::app::PlayerControlType::Ai) => "AI",
-        _ => "Human",
-    };
-    let p2_ctrl = match app.ui_state.player_controls.get(&2) {
-        Some(crate::app::PlayerControlType::Ai) => "AI",
-        _ => "Human",
-    };
+    let mut controls_text = String::from("Toggles: ");
+    let mut sorted_pids: Vec<_> = app.ui_state.player_controls.keys().cloned().collect();
+    sorted_pids.sort();
+    for pid in sorted_pids {
+        let mode = match app.ui_state.player_controls.get(&pid) {
+            Some(crate::app::PlayerControlType::Ai) => "AI",
+            _ => "Human",
+        };
+        controls_text.push_str(&format!("P{}('{}'): {}  ", pid, pid, mode));
+    }
 
     let footer_text = format!(
-        "方向キー(↑/↓)で選択、Enterで決定、qで終了 | P1 (押下 '1'): {} | P2 (押下 '2'): {}",
-        p1_ctrl, p2_ctrl
+        "方向キー(↑/↓)で選択、Enterで決定、qで終了 | {}",
+        controls_text
     );
     let footer = Paragraph::new(footer_text).block(Block::default().borders(Borders::ALL));
     f.render_widget(footer, chunks[2]);
@@ -406,7 +408,14 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             let name = active_player.name.clone();
             let id = active_player.id.0;
             let funds = active_player.funds;
-            info_text.push_str(&format!("ターン: {} (P{} : {})\n", turn, id, name));
+            let control_mode = match app.ui_state.player_controls.get(&id) {
+                Some(crate::app::PlayerControlType::Ai) => "AI",
+                _ => "Human",
+            };
+            info_text.push_str(&format!(
+                "ターン: {} (P{} : {} [{}])\n",
+                turn, id, name, control_mode
+            ));
             info_text.push_str(&format!("資金: {}\n\n", funds));
         }
 

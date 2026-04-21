@@ -21,9 +21,18 @@ pub fn get_available_actions(
     unit_entity: Entity,
     is_moved: bool,
 ) -> AvailableActions {
-    let u_pos = *world
-        .get::<GridPosition>(unit_entity)
-        .unwrap_or(&GridPosition { x: 0, y: 0 });
+    let Some(u_pos) = world.get::<GridPosition>(unit_entity).copied() else {
+        return AvailableActions {
+            can_attack: false,
+            can_capture: false,
+            can_repair: false,
+            can_supply: false,
+            can_load: false,
+            can_drop: false,
+            can_merge: false,
+            can_wait: false,
+        };
+    };
     get_available_actions_at(world, unit_entity, u_pos, is_moved)
 }
 

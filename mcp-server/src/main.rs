@@ -1,4 +1,4 @@
-use bevy_ecs::prelude::Entity;
+use bevy_ecs::prelude::{Entity, With};
 use bevy_ecs::schedule::Schedule;
 use bevy_ecs::world::World;
 #[allow(dead_code)]
@@ -40,12 +40,12 @@ pub struct SpawnUnitArgs {
     pub x: u32,
     pub y: u32,
     pub unit_name: String,
-    pub player_id: u32,
+    pub player_id: u64,
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub struct EvaluateBoardArgs {
-    pub player_id: u32,
+    pub player_id: u64,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -105,8 +105,34 @@ impl OpenWarsAiServer {
         let mut state_lock = self.state.lock().await;
         if let Some(state) = state_lock.as_mut() {
             let world = &mut state.world;
-            let registry = world.resource::<MasterDataRegistry>().clone();
 
+            // Coordinate validation
+            let map = world.resource::<engine::resources::Map>();
+            if args.0.x as usize >= map.width || args.0.y as usize >= map.height {
+                return Err(format!(
+                    "Coordinates out of bounds: ({}, {}) for map size {}x{}",
+                    args.0.x, args.0.y, map.width, map.height
+                ));
+            }
+
+            // Occupancy check
+            let mut q_pos = world.query_filtered::<&GridPosition, (With<Health>, With<Faction>)>();
+            for pos in q_pos.iter(world) {
+                if pos.x == args.0.x as usize && pos.y == args.0.y as usize {
+                    return Err(format!(
+                        "Tile ({}, {}) is already occupied",
+                        args.0.x, args.0.y
+                    ));
+                }
+            }
+
+            // Player validation
+            let players = world.resource::<Players>();
+            if !players.0.iter().any(|p| p.id.0 == args.0.player_id as u32) {
+                return Err(format!("Player ID {} not found", args.0.player_id));
+            }
+
+            let registry = world.resource::<MasterDataRegistry>().clone();
             let unit_name = UnitName(args.0.unit_name.clone());
             let stats = registry
                 .create_unit_stats(&unit_name)
@@ -117,7 +143,7 @@ impl OpenWarsAiServer {
                     x: args.0.x as usize,
                     y: args.0.y as usize,
                 },
-                Faction(PlayerId(args.0.player_id)),
+                Faction(PlayerId(args.0.player_id as u32)),
                 stats.clone(),
                 Health {
                     current: 100,
@@ -153,8 +179,10 @@ impl OpenWarsAiServer {
     ) -> Result<String, String> {
         let mut state_lock = self.state.lock().await;
         if let Some(state) = state_lock.as_mut() {
-            let score =
-                engine::ai::eval::evaluate_board(&mut state.world, PlayerId(args.0.player_id));
+            let score = engine::ai::eval::evaluate_board(
+                &mut state.world,
+                PlayerId(args.0.player_id as u32),
+            );
             Ok(serde_json::json!({
                 "player_id": args.0.player_id,
                 "score": score
@@ -278,13 +306,14 @@ impl OpenWarsAiServer {
             let world = &mut state.world;
 
             let mut properties = vec![];
-            let mut prop_query = world.query::<(&GridPosition, &Property)>();
-            for (pos, prop) in prop_query.iter(world) {
+            let mut prop_query = world.query::<(Entity, &GridPosition, &Property)>();
+            for (entity, pos, prop) in prop_query.iter(world) {
                 properties.push(serde_json::json!({
+                    "entity_id": entity.to_bits(),
                     "x": pos.x,
                     "y": pos.y,
                     "terrain": prop.terrain.as_str(),
-                    "owner": prop.owner_id.map(|p| p.0)
+                    "owner": prop.owner_id.map(|p| p.0 as u64)
                 }));
             }
 
@@ -306,7 +335,7 @@ impl OpenWarsAiServer {
             let mut players_info = vec![];
             for p in &players.0 {
                 players_info.push(serde_json::json!({
-                    "player_id": p.id.0,
+                    "player_id": p.id.0 as u64,
                     "name": p.name,
                     "funds": p.funds
                 }));

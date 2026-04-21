@@ -1081,20 +1081,19 @@ impl App {
             && let Some(active_player) = players.0.get(match_state.active_player_index.0)
         {
             let pid = active_player.id.0;
-            let new_ctrl = if let Some(ctrl) = self.ui_state.player_controls.get_mut(&pid) {
-                *ctrl = match *ctrl {
-                    PlayerControlType::Human => PlayerControlType::Ai,
-                    PlayerControlType::Ai => PlayerControlType::Human,
-                };
-                Some(*ctrl)
-            } else {
-                None
+            let ctrl = self
+                .ui_state
+                .player_controls
+                .entry(pid)
+                .or_insert(PlayerControlType::Human);
+            *ctrl = match *ctrl {
+                PlayerControlType::Human => PlayerControlType::Ai,
+                PlayerControlType::Ai => PlayerControlType::Human,
             };
+            let new_ctrl = *ctrl;
 
-            if let Some(ctrl) = new_ctrl {
-                self.ui_state
-                    .add_log(format!("Player {} is now {:?}", pid, ctrl));
-            }
+            self.ui_state
+                .add_log(format!("Player {} is now {:?}", pid, new_ctrl));
         }
 
         match self.ui_state.current_screen {

@@ -73,11 +73,24 @@ pub fn update_all_events(world: &mut World) {
     world.resource_mut::<Events<GameOverEvent>>().update();
 }
 
+/// マスターデータの設定中に発生するエラー。
+#[derive(Debug, thiserror::Error)]
+pub enum SetupError {
+    #[error("Map '{0}' not found")]
+    MapNotFound(String),
+    #[error("Weapon '{0}' not found")]
+    WeaponNotFound(String),
+    #[error("Unit type for '{0}' not found")]
+    UnitTypeNotFound(String),
+    #[error("Master data error: {0}")]
+    MasterData(String),
+}
+
 /// マスターデータからワールドを完全に初期化します。
 pub fn initialize_world_from_master_data(
     master_data: &MasterDataRegistry,
     map_name: &str,
-) -> anyhow::Result<(World, Schedule)> {
+) -> Result<(World, Schedule), SetupError> {
     let (mut world, schedule) = create_world();
 
     // 1. DamageChart & UnitRegistry の構築
@@ -85,17 +98,17 @@ pub fn initialize_world_from_master_data(
     for (unit_name, unit_record) in &master_data.units {
         let att_type = master_data
             .unit_type_for_name(&unit_name.0)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(|e| SetupError::UnitTypeNotFound(format!("{:?}", e)))?;
 
         if let Some(w1_name) = &unit_record.weapon1 {
             let weapon = master_data
                 .weapons
                 .get(&crate::resources::master_data::UnitName(w1_name.clone()))
-                .ok_or_else(|| anyhow::anyhow!("Weapon '{}' not found", w1_name))?;
+                .ok_or_else(|| SetupError::WeaponNotFound(w1_name.clone()))?;
             for (def_name, dmg) in &weapon.damages {
                 let def_type = master_data
                     .unit_type_for_name(def_name)
-                    .map_err(|e| anyhow::anyhow!(e))?;
+                    .map_err(|e| SetupError::UnitTypeNotFound(format!("{:?}", e)))?;
                 damage_chart.insert_damage(att_type, def_type, *dmg);
             }
         }
@@ -103,11 +116,11 @@ pub fn initialize_world_from_master_data(
             let weapon = master_data
                 .weapons
                 .get(&crate::resources::master_data::UnitName(w2_name.clone()))
-                .ok_or_else(|| anyhow::anyhow!("Weapon '{}' not found", w2_name))?;
+                .ok_or_else(|| SetupError::WeaponNotFound(w2_name.clone()))?;
             for (def_name, dmg) in &weapon.damages {
                 let def_type = master_data
                     .unit_type_for_name(def_name)
-                    .map_err(|e| anyhow::anyhow!(e))?;
+                    .map_err(|e| SetupError::UnitTypeNotFound(format!("{:?}", e)))?;
                 damage_chart.insert_secondary_damage(att_type, def_type, *dmg);
             }
         }
@@ -118,7 +131,7 @@ pub fn initialize_world_from_master_data(
     for name in master_data.units.keys() {
         let stats = master_data
             .create_unit_stats(name)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(|e| SetupError::MasterData(format!("{:?}", e)))?;
         unit_registry_map.insert(stats.unit_type, stats);
     }
     world.insert_resource(UnitRegistry(unit_registry_map));
@@ -127,7 +140,7 @@ pub fn initialize_world_from_master_data(
     // 2. マップとプレイヤーの構築
     let map_data = master_data
         .get_map(map_name)
-        .ok_or_else(|| anyhow::anyhow!("Map '{}' not found", map_name))?;
+        .ok_or_else(|| SetupError::MapNotFound(map_name.to_string()))?;
 
     let mut ecs_map = Map::new(
         map_data.width,
@@ -142,7 +155,7 @@ pub fn initialize_world_from_master_data(
             if let Some(cell) = map_data.get_cell(x, y) {
                 let terrain = master_data
                     .terrain_from_id(cell.terrain_id)
-                    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                    .map_err(|e| SetupError::MasterData(format!("{:?}", e)))?;
                 let _ = ecs_map.set_terrain(x, y, terrain);
 
                 if cell.player_id != 0 {
@@ -179,7 +192,7 @@ pub fn initialize_world_from_master_data(
                 if let Some(cell) = map_data.get_cell(x, y).filter(|c| c.player_id == pid) {
                     let terrain = master_data
                         .terrain_from_id(cell.terrain_id)
-                        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                        .map_err(|e| SetupError::MasterData(format!("{:?}", e)))?;
                     income += master_data.landscape_income(terrain.as_str());
                 }
             }

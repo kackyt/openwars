@@ -36,23 +36,24 @@ pub fn is_suicidal_attack(
         let base_damage = damage_chart
             .get_base_damage(atk_type, def_type)
             .unwrap_or(0);
+        let effective_base_damage = base_damage * 105 / 100;
         let atk_display = atk_hp.div_ceil(10);
-        let expected_damage_to_enemy = (base_damage * atk_display) / 10;
+        let expected_damage_to_enemy = (effective_base_damage * atk_display) / 10;
         let actual_damage_to_enemy = std::cmp::min(expected_damage_to_enemy, def_hp);
 
         // 与える被害価値
         expected_damage_value = (actual_damage_to_enemy as i32 * def_cost as i32) / def_max as i32;
 
-        // 反撃ダメージの予測（敵が生き残る場合のみ）
+        // 反撃ダメージの予測（戦闘は同時解決のため撃破予定でも反撃する）
         // 間接攻撃 (min_range > 1) の場合は反撃を受けない
         let is_indirect = atk_min_range > 1;
-        let remaining_enemy_hp = def_hp.saturating_sub(actual_damage_to_enemy);
-        if remaining_enemy_hp > 0 && !is_indirect {
+        if !is_indirect {
             let counter_base_damage = damage_chart
                 .get_base_damage(def_type, atk_type)
                 .unwrap_or(0);
-            let remaining_display_hp = remaining_enemy_hp.div_ceil(10);
-            let expected_counter_damage = (counter_base_damage * remaining_display_hp) / 10;
+            // 防御側は攻撃を受けた時点のHPで反撃（同時解決）
+            let defender_display_hp = def_hp.div_ceil(10);
+            let expected_counter_damage = (counter_base_damage * defender_display_hp) / 10;
             let actual_counter_damage = std::cmp::min(expected_counter_damage, atk_hp);
 
             // 受ける被害価値
