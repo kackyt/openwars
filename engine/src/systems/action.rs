@@ -3,7 +3,7 @@ use crate::systems::{combat, merge, supply, transport};
 use bevy_ecs::prelude::*;
 
 /// ユニットが現在実行可能なアクションをまとめた構造体
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct AvailableActions {
     pub can_attack: bool,
     pub can_capture: bool,
