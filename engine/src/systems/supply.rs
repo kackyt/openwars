@@ -12,7 +12,9 @@ use bevy_ecs::prelude::*;
 /// 4. 補給者の `ActionCompleted` を true に設定します。
 ///
 pub fn get_suppliable_targets(world: &mut World, supplier: Entity) -> Vec<Entity> {
-    let s_pos = *world.get::<GridPosition>(supplier).unwrap();
+    let Some(s_pos) = world.get::<GridPosition>(supplier).cloned() else {
+        return vec![];
+    };
     get_suppliable_targets_at(world, supplier, s_pos)
 }
 

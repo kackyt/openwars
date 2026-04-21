@@ -61,7 +61,9 @@ pub fn is_suicidal_attack(
         }
     }
 
-    expected_self_damage_value > expected_damage_value
+    // 被害価値の比較。攻撃側有利（同時解決だが先制ダメージが反映される）を考慮し、
+    // 完全に無謀（受ける被害が与える被害の1.5倍を超える）な場合のみ suicidal と判定。
+    expected_self_damage_value > (expected_damage_value * 15 / 10)
 }
 
 #[cfg(test)]

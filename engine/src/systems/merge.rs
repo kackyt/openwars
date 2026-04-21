@@ -5,7 +5,9 @@ use crate::events::{MergeUnitCommand, UnitDestroyedEvent, UnitMergedEvent};
 use crate::resources::{MatchState, PendingMove, Phase};
 
 pub fn get_mergable_targets(world: &mut World, unit: Entity) -> Vec<Entity> {
-    let unit_pos = *world.get::<GridPosition>(unit).unwrap();
+    let Some(unit_pos) = world.get::<GridPosition>(unit).cloned() else {
+        return vec![];
+    };
     get_mergable_targets_at(world, unit, unit_pos)
 }
 

@@ -12,7 +12,9 @@ use bevy_ecs::prelude::*;
 /// 4. 積載対象ユニットに `Transporting` コンポーネントを付与し、行動済み(`ActionCompleted`)にします。
 ///
 pub fn get_loadable_transports(world: &mut World, unit: Entity) -> Vec<Entity> {
-    let u_pos = *world.get::<GridPosition>(unit).unwrap();
+    let Some(u_pos) = world.get::<GridPosition>(unit).cloned() else {
+        return vec![];
+    };
     get_loadable_transports_at(world, unit, u_pos)
 }
 
@@ -58,7 +60,9 @@ pub fn get_droppable_tiles(
     transport: Entity,
     cargo_entity: Entity,
 ) -> Vec<(usize, usize)> {
-    let t_pos = *world.get::<GridPosition>(transport).unwrap();
+    let Some(t_pos) = world.get::<GridPosition>(transport).cloned() else {
+        return vec![];
+    };
     get_droppable_tiles_at(world, transport, cargo_entity, t_pos)
 }
 

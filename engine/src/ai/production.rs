@@ -1,11 +1,13 @@
 use crate::components::{GridPosition, PlayerId, Property, Transporting, UnitStats};
 use crate::events::ProduceUnitCommand;
+use crate::resources::master_data::MasterDataRegistry;
 use crate::resources::{Players, Terrain, UnitRegistry, UnitType};
 use bevy_ecs::prelude::*;
 
 /// 単純な生産AI。
 /// 指定プレイヤーの空いている工場すべてに対して、歩兵の生産を試みます。
 pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceUnitCommand> {
+    use crate::systems::production::can_produce_at;
     let mut commands = Vec::new();
 
     // 現在の資金を取得
@@ -56,13 +58,21 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
     }
 
     for pos in factory_positions {
-        // 資金不足なら終了
         if available_funds < infantry_cost {
             break;
         }
-
-        // 工場の上にユニットがいなければ生産コマンドを追加
-        if !occupied_positions.contains(&pos) {
+        // システム層のバリデーションを呼び出し
+        let master_data = world.resource::<MasterDataRegistry>().clone();
+        if can_produce_at(
+            world,
+            player_id,
+            pos.x,
+            pos.y,
+            UnitType::Infantry,
+            &master_data,
+        )
+        .is_ok()
+        {
             commands.push(ProduceUnitCommand {
                 target_x: pos.x,
                 target_y: pos.y,
@@ -70,7 +80,6 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                 player_id,
             });
             available_funds -= infantry_cost;
-            occupied_positions.insert(pos);
         }
     }
 

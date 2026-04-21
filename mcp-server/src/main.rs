@@ -21,11 +21,8 @@ use engine::components::{
     UnitStats,
 };
 use engine::resources::master_data::{MasterDataRegistry, UnitName};
-use engine::resources::{
-    DamageChart, GameRng, GridTopology, Map, MatchState, Player as EnginePlayer, Players, Terrain,
-    UnitRegistry,
-};
-use engine::setup::create_world;
+use engine::resources::{MatchState, Players};
+use engine::setup::initialize_world_from_master_data;
 
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -59,15 +56,20 @@ pub struct GetBoardStateArgs {}
 
 #[derive(Deserialize, JsonSchema)]
 pub struct GetValidActionsArgs {
-    pub x: u32,
-    pub y: u32,
+    pub unit_id: u32,
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub struct NextPhaseArgs {}
 
 #[derive(Deserialize, JsonSchema)]
-pub struct ExecuteActionArgs {}
+pub struct ExecuteActionArgs {
+    pub action_type: String,
+    pub unit_id: Option<u32>,
+    pub target_x: Option<u32>,
+    pub target_y: Option<u32>,
+    pub target_id: Option<u32>,
+}
 
 #[tool(tool_box)]
 impl OpenWarsAiServer {
@@ -78,80 +80,9 @@ impl OpenWarsAiServer {
     ) -> Result<String, String> {
         let registry =
             MasterDataRegistry::load().map_err(|e| format!("Failed to load master data: {}", e))?;
-        let map_data = registry
-            .get_map(&args.0.map_name)
-            .ok_or_else(|| format!("Map '{}' not found", args.0.map_name))?;
 
-        let (mut world, schedule) = create_world();
-
-        // 1. Initialize Map resource & Properties
-        let mut map_tiles = vec![Terrain::Plains; map_data.width * map_data.height];
-        for y in 0..map_data.height {
-            for x in 0..map_data.width {
-                let cell = map_data.get_cell(x, y).unwrap();
-                let terrain = registry
-                    .terrain_from_id(cell.terrain_id)
-                    .map_err(|e| e.to_string())?;
-                map_tiles[y * map_data.width + x] = terrain;
-
-                let durability = registry.landscape_durability(terrain.as_str());
-                let owner_id = if cell.player_id > 0 {
-                    Some(PlayerId(cell.player_id))
-                } else {
-                    None
-                };
-
-                // Spawn property entities
-                world.spawn((
-                    GridPosition { x, y },
-                    Property::new(terrain, owner_id, durability),
-                ));
-            }
-        }
-        world.insert_resource(Map {
-            width: map_data.width,
-            height: map_data.height,
-            tiles: map_tiles,
-            topology: GridTopology::Square,
-        });
-
-        // 2. Initialize Players resource
-        world.insert_resource(Players(vec![
-            EnginePlayer {
-                id: PlayerId(1),
-                name: "Player 1".to_string(),
-                funds: 10000,
-            },
-            EnginePlayer {
-                id: PlayerId(2),
-                name: "Player 2".to_string(),
-                funds: 10000,
-            },
-        ]));
-
-        // 3. Initialize UnitRegistry and DamageChart from MasterDataRegistry
-        let mut unit_stats_map = std::collections::HashMap::new();
-        for u_name in registry.units.keys() {
-            if let Ok(stats) = registry.create_unit_stats(u_name) {
-                unit_stats_map.insert(stats.unit_type, stats);
-            }
-        }
-        world.insert_resource(UnitRegistry(unit_stats_map));
-
-        let mut damage_chart = DamageChart::new();
-        for (w_name, w_rec) in &registry.weapons {
-            if let Some(unit_type) = engine::resources::UnitType::from_str(&w_name.0) {
-                for (def_name, &dmg) in &w_rec.damages {
-                    if let Some(def_type) = engine::resources::UnitType::from_str(def_name) {
-                        damage_chart.insert_damage(unit_type, def_type, dmg);
-                    }
-                }
-            }
-        }
-        world.insert_resource(damage_chart);
-        world.insert_resource(GameRng::default());
-        world.insert_resource(MatchState::default());
-        world.insert_resource(registry);
+        let (world, schedule) = initialize_world_from_master_data(&registry, &args.0.map_name)
+            .map_err(|e| format!("Initialization failed: {}", e))?;
 
         let mut state_lock = self.state.lock().await;
         *state_lock = Some(GameState { world, schedule });
@@ -227,7 +158,7 @@ impl OpenWarsAiServer {
         }
     }
 
-    #[tool(description = "Returns valid actions for a unit at a given coordinate.")]
+    #[tool(description = "Returns valid actions for a unit given its ID.")]
     async fn get_valid_actions(
         &self,
         #[tool(aggr)] args: Parameters<GetValidActionsArgs>,
@@ -235,24 +166,14 @@ impl OpenWarsAiServer {
         let mut state_lock = self.state.lock().await;
         if let Some(state) = state_lock.as_mut() {
             let world = &mut state.world;
-            // Find unit at (x, y)
-            let mut unit_entity = None;
-            let mut query = world.query::<(Entity, &GridPosition)>();
-            for (entity, pos) in query.iter(world) {
-                if pos.x == args.0.x as usize
-                    && pos.y == args.0.y as usize
-                    && world.get::<UnitStats>(entity).is_some()
-                {
-                    unit_entity = Some(entity);
-                    break;
-                }
-            }
+            let entity = Entity::from_bits(args.0.unit_id as u64);
 
-            if let Some(entity) = unit_entity {
-                let actions = engine::systems::get_available_actions(world, entity, false);
+            if world.get_entity(entity).is_ok() {
+                let is_moved = world.get::<HasMoved>(entity).map(|h| h.0).unwrap_or(false);
+                let actions = engine::systems::get_available_actions(world, entity, is_moved);
                 Ok(serde_json::to_string(&actions).map_err(|e| e.to_string())?)
             } else {
-                Ok("[]".into())
+                Err(format!("Unit with ID {} not found", args.0.unit_id))
             }
         } else {
             Err("Map not loaded".into())

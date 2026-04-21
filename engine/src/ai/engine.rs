@@ -60,12 +60,16 @@ pub fn decide_ai_action(
         for (entity, pos, faction, has_moved, action_completed, stats, cargo_opt) in
             query.iter(world)
         {
-            if skip_entities.contains(&entity) {
-                continue;
-            }
-            if faction.0 == player_id && !has_moved.0 && !action_completed.0 {
+            // movable_units への登録判定（行動候補）
+            if !skip_entities.contains(&entity)
+                && faction.0 == player_id
+                && !has_moved.0
+                && !action_completed.0
+            {
                 movable_units.push(entity);
             }
+
+            // 占領情報の登録（常に全ユニット対象）
             let free_slots = cargo_opt
                 .map(|c| c.max.saturating_sub(c.loaded.len() as u32))
                 .unwrap_or(0);
