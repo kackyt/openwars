@@ -4,16 +4,20 @@ use crate::components::*;
 use crate::events::{MergeUnitCommand, UnitDestroyedEvent, UnitMergedEvent};
 use crate::resources::{MatchState, PendingMove, Phase};
 
-/// 指定されたユニットが現在合流（Merge）可能な対象エンティティのリストを返します。
-/// 同タイプ、同勢力の同一座標ユニットが対象です。
 pub fn get_mergable_targets(world: &mut World, unit: Entity) -> Vec<Entity> {
+    let unit_pos = *world.get::<GridPosition>(unit).unwrap();
+    get_mergable_targets_at(world, unit, unit_pos)
+}
+
+/// 指定された位置で合流可能な対象エンティティのリストを返します。
+pub fn get_mergable_targets_at(world: &mut World, unit: Entity, unit_pos: GridPosition) -> Vec<Entity> {
     let mut targets = vec![];
-    let (unit_pos, unit_stats, unit_faction) = {
-        let mut q_unit = world.query::<(&GridPosition, &UnitStats, &Faction)>();
-        let Ok((pos, stats, faction)) = q_unit.get(world, unit) else {
+    let (unit_stats, unit_faction) = {
+        let mut q_unit = world.query::<(&UnitStats, &Faction)>();
+        let Ok((stats, faction)) = q_unit.get(world, unit) else {
             return targets;
         };
-        (*pos, stats.clone(), faction.0)
+        (stats.clone(), faction.0)
     };
 
     let mut q_targets =

@@ -158,6 +158,7 @@ pub fn produce_unit_system(
         return;
     }
     let active_player_id = players.0[match_state.active_player_index.0].id;
+    let mut newly_spawned_positions = std::collections::HashSet::new();
 
     for event in produce_events.read() {
         if event.player_id != active_player_id {
@@ -166,7 +167,8 @@ pub fn produce_unit_system(
 
         let is_occupied = q_units
             .iter()
-            .any(|pos| pos.x == event.target_x && pos.y == event.target_y);
+            .any(|pos| pos.x == event.target_x && pos.y == event.target_y)
+            || newly_spawned_positions.contains(&(event.target_x, event.target_y));
 
         let mut landscape_name = None;
         let mut capital_pos = None;
@@ -232,6 +234,8 @@ pub fn produce_unit_system(
             HasMoved(true), // Produced units cannot move immediately
             ActionCompleted(true),
         ));
+
+        newly_spawned_positions.insert((event.target_x, event.target_y));
 
         // 輸送ユニットの場合、CargoCapacityコンポーネントを追加
         if stats.max_cargo > 0 {

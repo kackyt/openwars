@@ -21,13 +21,29 @@ pub fn get_available_actions(
     unit_entity: Entity,
     is_moved: bool,
 ) -> AvailableActions {
-    let can_load = !transport::get_loadable_transports(world, unit_entity).is_empty();
-    let can_merge = !merge::get_mergable_targets(world, unit_entity).is_empty();
+    let u_pos = *world
+        .get::<GridPosition>(unit_entity)
+        .unwrap_or(&GridPosition { x: 0, y: 0 });
+    get_available_actions_at(world, unit_entity, u_pos, is_moved)
+}
+
+/// 指定された位置おける、ユニットの利用可能なアクションを返します。
+pub fn get_available_actions_at(
+    world: &mut World,
+    unit_entity: Entity,
+    u_pos: GridPosition,
+    is_moved: bool,
+) -> AvailableActions {
+    let (can_load, can_merge) = {
+        let loadable = transport::get_loadable_transports_at(world, unit_entity, u_pos);
+        let mergable = merge::get_mergable_targets_at(world, unit_entity, u_pos);
+        (!loadable.is_empty(), !mergable.is_empty())
+    };
 
     let (can_capture, can_repair) = {
-        let (unit_pos, unit_stats, unit_faction) = {
-            let mut q_unit = world.query::<(&GridPosition, &UnitStats, &Faction)>();
-            let Ok((u_pos, u_stats, u_faction)) = q_unit.get(world, unit_entity) else {
+        let (unit_stats, unit_faction) = {
+            let mut q_unit = world.query::<(&UnitStats, &Faction)>();
+            let Ok((u_stats, u_faction)) = q_unit.get(world, unit_entity) else {
                 return AvailableActions {
                     can_attack: false,
                     can_capture: false,
@@ -39,7 +55,7 @@ pub fn get_available_actions(
                     can_wait: false,
                 };
             };
-            (*u_pos, u_stats.clone(), u_faction.0)
+            (u_stats.clone(), u_faction.0)
         };
 
         if !unit_stats.can_capture {
@@ -49,7 +65,7 @@ pub fn get_available_actions(
             let mut repairable = false;
             let mut q_properties = world.query::<(&GridPosition, &Property)>();
             for (p_pos, p_prop) in q_properties.iter(world) {
-                if p_pos.x == unit_pos.x && p_pos.y == unit_pos.y {
+                if p_pos.x == u_pos.x && p_pos.y == u_pos.y {
                     let max_points = p_prop.max_capture_points;
                     if max_points > 0 {
                         if p_prop.owner_id == Some(unit_faction) {
@@ -67,32 +83,39 @@ pub fn get_available_actions(
         }
     };
 
-    AvailableActions {
-        can_attack: !combat::get_attackable_targets(world, unit_entity, !is_moved).is_empty(),
-        can_capture,
-        can_repair,
-        can_supply: !supply::get_suppliable_targets(world, unit_entity).is_empty(),
-        can_load,
-        can_drop: {
-            let mut can_drop = false;
-            let mut q_cargo = world.query::<&CargoCapacity>();
-            if let Ok(cargo) = q_cargo.get(world, unit_entity) {
-                for &passenger in &cargo.loaded {
-                    if let Some(action) = world.get::<ActionCompleted>(passenger)
-                        && !action.0
-                    {
-                        can_drop = true;
-                        break;
+        let is_occupied_by_other = {
+            let mut q_occupants = world.query_filtered::<(Entity, &GridPosition), (With<Faction>, Without<Transporting>)>();
+            q_occupants.iter(world).any(|(e, p)| e != unit_entity && p.x == u_pos.x && p.y == u_pos.y)
+        };
+
+        AvailableActions {
+            can_attack: !combat::get_attackable_targets_at(world, unit_entity, u_pos, !is_moved)
+                .is_empty(),
+            can_capture,
+            can_repair,
+            can_supply: !supply::get_suppliable_targets_at(world, unit_entity, u_pos).is_empty(),
+            can_load,
+            can_drop: {
+                let mut can_drop = false;
+                let mut q_cargo = world.query::<&CargoCapacity>();
+                if let Ok(cargo) = q_cargo.get(world, unit_entity) {
+                    for &passenger in &cargo.loaded {
+                        if let Some(action) = world.get::<ActionCompleted>(passenger)
+                            && !action.0
+                        {
+                            can_drop = true;
+                            break;
+                        }
                     }
                 }
-            }
-            can_drop
-        },
-        can_merge,
-        // 移動先が搭載または合流対象である場合、待機は不可（重なり防止）
-        can_wait: !is_moved || (!can_load && !can_merge),
+                can_drop
+            },
+            can_merge,
+            // 空きマスであるか、移動していない（元の位置に留まる）場合のみ待機可能
+            // 搭載や合流が可能なマスであっても、通常の「待機」で重なることは許さない
+            can_wait: !is_occupied_by_other,
+        }
     }
-}
 
 #[cfg(test)]
 mod tests {
@@ -178,5 +201,48 @@ mod tests {
             actions_before.can_wait,
             "Wait should be allowed if not moved yet"
         );
+    }
+
+    #[test]
+    fn test_cannot_wait_on_occupied_tile() {
+        let mut world = World::new();
+        let p1 = PlayerId(1);
+        let inf_type = UnitType::Infantry;
+
+        // Setup Registry
+        let mut registry = std::collections::HashMap::new();
+        registry.insert(
+            inf_type,
+            UnitStats {
+                unit_type: inf_type,
+                ..UnitStats::mock()
+            },
+        );
+        world.insert_resource(UnitRegistry(registry));
+
+        // Spawn existing unit at (1,0)
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Faction(p1),
+            UnitStats::mock(),
+        ));
+
+        // Spawn current unit at (0,0)
+        let unit = world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Faction(p1),
+            UnitStats {
+                unit_type: inf_type,
+                ..UnitStats::mock()
+            },
+            ActionCompleted(false),
+        )).id();
+
+        // Check actions at (1,0) after moving
+        let actions = get_available_actions_at(&mut world, unit, GridPosition { x: 1, y: 0 }, true);
+
+        assert!(!actions.can_wait, "Should not be able to wait on occupied tile");
+        // can_merge might be true depending on compatibility, but that's fine.
+        // The point is can_wait must be false.
     }
 }

@@ -6,15 +6,20 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use engine::setup::create_world;
 use bevy_ecs::world::World;
 use bevy_ecs::schedule::Schedule;
+use bevy_ecs::prelude::Entity;
 
 #[allow(dead_code)]
 struct GameState {
     pub world: World,
     pub schedule: Schedule,
 }
+
+use engine::resources::master_data::{MasterDataRegistry, UnitName};
+use engine::resources::{Map, GridTopology, Terrain, Player as EnginePlayer, Players, UnitRegistry, DamageChart, GameRng, MatchState};
+use engine::setup::create_world;
+use engine::components::{GridPosition, Health, PlayerId, Faction, UnitStats, Property, Fuel, Ammo, HasMoved, ActionCompleted};
 
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -25,6 +30,14 @@ struct OpenWarsAiServer {
 #[derive(Deserialize, JsonSchema)]
 pub struct LoadMapArgs {
     pub map_name: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SpawnUnitArgs {
+    pub x: u32,
+    pub y: u32,
+    pub unit_name: String,
+    pub player_id: u32,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -45,105 +58,74 @@ pub struct GetValidActionsArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
-pub struct ExecuteActionArgs {}
+pub struct NextPhaseArgs {}
 
-use engine::components::{GridPosition, Health, PlayerId, Faction, UnitStats, Property};
-use engine::resources::{GameRng, MatchState, Players, Player, Map, UnitRegistry, DamageChart, Terrain, GridTopology};
-use engine::resources::master_data::{MasterDataRegistry, UnitName};
-use bevy_ecs::prelude::Entity;
+#[derive(Deserialize, JsonSchema)]
+pub struct ExecuteActionArgs {}
 
 #[tool(tool_box)]
 impl OpenWarsAiServer {
     #[tool(description = "Loads a specific map to evaluate.")]
-    async fn load_map(&self, args: Parameters<LoadMapArgs>) -> Result<String, String> {
+    async fn load_map(&self, #[tool(aggr)] args: Parameters<LoadMapArgs>) -> Result<String, String> {
         let registry = MasterDataRegistry::load().map_err(|e| format!("Failed to load master data: {}", e))?;
         let map_data = registry.get_map(&args.0.map_name).ok_or_else(|| format!("Map '{}' not found", args.0.map_name))?;
 
         let (mut world, schedule) = create_world();
 
-        // 1. Setup Resources from Registry
-        let mut damage_chart = DamageChart::new();
-        for (unit_name, record) in &registry.units {
-            let att_type = registry.unit_type_for_name(&unit_name.0).map_err(|e| e.to_string())?;
-            if let Some(w1_name) = &record.weapon1 {
-                if let Some(w) = registry.weapons.get(&UnitName(w1_name.clone())) {
-                    for (def_name, dmg) in &w.damages {
-                        let def_type = registry.unit_type_for_name(def_name).map_err(|e| e.to_string())?;
-                        damage_chart.insert_damage(att_type, def_type, *dmg);
-                    }
-                }
+        // 1. Initialize Map resource & Properties
+        let mut map_tiles = vec![Terrain::Plains; map_data.width * map_data.height];
+        for y in 0..map_data.height {
+            for x in 0..map_data.width {
+                let cell = map_data.get_cell(x, y).unwrap();
+                let terrain = registry.terrain_from_id(cell.terrain_id).map_err(|e| e.to_string())?;
+                map_tiles[y * map_data.width + x] = terrain;
+                
+                let durability = registry.landscape_durability(terrain.as_str());
+                let owner_id = if cell.player_id > 0 { Some(PlayerId(cell.player_id)) } else { None };
+                
+                // Spawn property entities
+                world.spawn((
+                    GridPosition { x, y },
+                    Property::new(terrain, owner_id, durability),
+                ));
             }
-            if let Some(w2_name) = &record.weapon2 {
-                if let Some(w) = registry.weapons.get(&UnitName(w2_name.clone())) {
-                    for (def_name, dmg) in &w.damages {
-                        let def_type = registry.unit_type_for_name(def_name).map_err(|e| e.to_string())?;
-                        damage_chart.insert_secondary_damage(att_type, def_type, *dmg);
+        }
+        world.insert_resource(Map {
+            width: map_data.width,
+            height: map_data.height,
+            tiles: map_tiles,
+            topology: GridTopology::Square,
+        });
+
+        // 2. Initialize Players resource
+        world.insert_resource(Players(vec![
+            EnginePlayer { id: PlayerId(1), name: "Player 1".to_string(), funds: 10000 },
+            EnginePlayer { id: PlayerId(2), name: "Player 2".to_string(), funds: 10000 },
+        ]));
+
+        // 3. Initialize UnitRegistry and DamageChart from MasterDataRegistry
+        let mut unit_stats_map = std::collections::HashMap::new();
+        for (u_name, _) in &registry.units {
+            if let Ok(stats) = registry.create_unit_stats(u_name) {
+                unit_stats_map.insert(stats.unit_type, stats);
+            }
+        }
+        world.insert_resource(UnitRegistry(unit_stats_map));
+
+        let mut damage_chart = DamageChart::new();
+        for (w_name, w_rec) in &registry.weapons {
+            if let Some(unit_type) = engine::resources::UnitType::from_str(&w_name.0) {
+                for (def_name, &dmg) in &w_rec.damages {
+                    if let Some(def_type) = engine::resources::UnitType::from_str(def_name) {
+                        damage_chart.insert_damage(unit_type, def_type, dmg);
                     }
                 }
             }
         }
         world.insert_resource(damage_chart);
-
-        let mut unit_registry_map = std::collections::HashMap::new();
-        for name in registry.units.keys() {
-            let stats = registry.create_unit_stats(name).map_err(|e| e.to_string())?;
-            unit_registry_map.insert(stats.unit_type, stats);
-        }
-        world.insert_resource(UnitRegistry(unit_registry_map));
         world.insert_resource(GameRng::default());
-        world.insert_resource(registry.clone());
-
-        // 2. Setup Map and Properties
-        let width = map_data.width;
-        let height = map_data.height;
-        let mut ecs_map = Map::new(width, height, Terrain::Plains, GridTopology::Square);
-        let mut players_in_map = std::collections::HashSet::new();
-
-        for y in 0..height {
-            for x in 0..width {
-                if let Some(cell) = map_data.get_cell(x, y) {
-                    let terrain = registry.terrain_from_id(cell.terrain_id).map_err(|e| e.to_string())?;
-                    let _ = ecs_map.set_terrain(x, y, terrain);
-                    if cell.player_id != 0 {
-                        players_in_map.insert(cell.player_id);
-                    }
-
-                    // Properties
-                    let landscape_name = terrain.as_str();
-                    let durability = registry.landscape_durability(landscape_name);
-                    if durability > 0 {
-                        let owner = if cell.player_id == 0 { None } else { Some(PlayerId(cell.player_id)) };
-                        world.spawn((
-                            GridPosition { x, y },
-                            Property::new(terrain, owner, durability),
-                        ));
-                    }
-                }
-            }
-        }
-        world.insert_resource(ecs_map);
         world.insert_resource(MatchState::default());
-
-        // 3. Players
-        players_in_map.insert(1);
-        players_in_map.insert(2);
-        let mut player_list = vec![];
-        for &pid in &players_in_map {
-            let mut income = 0;
-            for y in 0..height {
-                for x in 0..width {
-                    if let Some(cell) = map_data.get_cell(x, y) && cell.player_id == pid {
-                        let landscape = registry.get_landscape(cell.terrain_id).ok_or_else(|| "Unknown terrain".to_string())?;
-                        income += registry.landscape_income(&landscape.name);
-                    }
-                }
-            }
-            let mut p = Player::new(pid, format!("Player {}", pid));
-            p.funds = income;
-            player_list.push(p);
-        }
-        player_list.sort_by_key(|p| p.id.0);
-        world.insert_resource(Players(player_list));
+        world.insert_resource(registry);
 
         let mut state_lock = self.state.lock().await;
         *state_lock = Some(GameState { world, schedule });
@@ -151,8 +133,38 @@ impl OpenWarsAiServer {
         Ok(format!("Loaded map: {}", args.0.map_name))
     }
 
+    #[tool(description = "Spawns a specific unit at a given coordinate.")]
+    async fn spawn_unit(&self, #[tool(aggr)] args: Parameters<SpawnUnitArgs>) -> Result<String, String> {
+        let mut state_lock = self.state.lock().await;
+        if let Some(state) = state_lock.as_mut() {
+            let world = &mut state.world;
+            let registry = world.resource::<MasterDataRegistry>().clone();
+            
+            let unit_name = UnitName(args.0.unit_name.clone());
+            let stats = registry.create_unit_stats(&unit_name).map_err(|e| format!("Failed to create unit stats: {}", e))?;
+            
+            world.spawn((
+                GridPosition { x: args.0.x as usize, y: args.0.y as usize },
+                Faction(PlayerId(args.0.player_id)),
+                stats.clone(),
+                Health { current: 100, max: 100 },
+                Fuel { current: stats.max_fuel, max: stats.max_fuel },
+                Ammo { 
+                    ammo1: stats.max_ammo1, max_ammo1: stats.max_ammo1,
+                    ammo2: stats.max_ammo2, max_ammo2: stats.max_ammo2
+                },
+                HasMoved(false),
+                ActionCompleted(false),
+            ));
+            
+            Ok(format!("Spawned {} at ({}, {}) for player {}", args.0.unit_name, args.0.x, args.0.y, args.0.player_id))
+        } else {
+            Err("No map loaded".into())
+        }
+    }
+
     #[tool(description = "Evaluates the board.")]
-    async fn evaluate_board(&self, args: Parameters<EvaluateBoardArgs>) -> Result<String, String> {
+    async fn evaluate_board(&self, #[tool(aggr)] args: Parameters<EvaluateBoardArgs>) -> Result<String, String> {
         let mut state_lock = self.state.lock().await;
         if let Some(state) = state_lock.as_mut() {
             let score = engine::ai::eval::evaluate_board(&mut state.world, PlayerId(args.0.player_id));
@@ -166,7 +178,7 @@ impl OpenWarsAiServer {
     }
 
     #[tool(description = "Returns valid actions for a unit at a given coordinate.")]
-    async fn get_valid_actions(&self, args: Parameters<GetValidActionsArgs>) -> Result<String, String> {
+    async fn get_valid_actions(&self, #[tool(aggr)] args: Parameters<GetValidActionsArgs>) -> Result<String, String> {
         let mut state_lock = self.state.lock().await;
         if let Some(state) = state_lock.as_mut() {
             let world = &mut state.world;
@@ -194,37 +206,37 @@ impl OpenWarsAiServer {
     }
 
     #[tool(description = "Returns the current state of the board.")]
-    async fn get_board_state(&self, _args: Parameters<GetBoardStateArgs>) -> Result<String, String> {
+    async fn get_board_state(&self, #[tool(aggr)] _args: Parameters<GetBoardStateArgs>) -> Result<String, String> {
         let mut state_lock = self.state.lock().await;
         if let Some(state) = state_lock.as_mut() {
             let world = &mut state.world;
-            let mut units = Vec::new();
-            let mut query = world.query::<(Entity, &GridPosition, &Faction, &Health, &UnitStats)>();
-            for (entity, pos, faction, health, stats) in query.iter(world) {
-                units.push(serde_json::json!({
-                    "entity": format!("{:?}", entity),
-                    "x": pos.x,
-                    "y": pos.y,
-                    "faction": faction.0.0,
-                    "hp": health.current,
-                    "unit_type": format!("{:?}", stats.unit_type)
-                }));
-            }
-
-            let mut properties = Vec::new();
+            
+            let mut properties = vec![];
             let mut prop_query = world.query::<(&GridPosition, &Property)>();
             for (pos, prop) in prop_query.iter(world) {
                 properties.push(serde_json::json!({
                     "x": pos.x,
                     "y": pos.y,
-                    "owner": prop.owner_id.map(|p| p.0),
-                    "terrain": prop.terrain.as_str()
+                    "terrain": prop.terrain.as_str(),
+                    "owner": prop.owner_id.map(|p| p.0)
+                }));
+            }
+
+            let mut units = vec![];
+            let mut unit_query = world.query::<(Entity, &GridPosition, &Faction, &UnitStats, &Health)>();
+            for (_entity, pos, faction, stats, health) in unit_query.iter(world) {
+                units.push(serde_json::json!({
+                    "x": pos.x,
+                    "y": pos.y,
+                    "player_id": faction.0.0,
+                    "unit_type": stats.unit_type.as_str(),
+                    "hp": health.current
                 }));
             }
 
             Ok(serde_json::json!({
-                "units": units,
-                "properties": properties
+                "properties": properties,
+                "units": units
             }).to_string())
         } else {
             Err("Map not loaded".into())
@@ -232,7 +244,7 @@ impl OpenWarsAiServer {
     }
 
     #[tool(description = "Simulates an AI turn using the AI engine logic.")]
-    async fn simulate_ai_turn(&self, _args: Parameters<SimulateAiTurnArgs>) -> Result<String, String> {
+    async fn simulate_ai_turn(&self, #[tool(aggr)] _args: Parameters<SimulateAiTurnArgs>) -> Result<String, String> {
         let mut state_lock = self.state.lock().await;
         if let Some(state) = state_lock.as_mut() {
             let (active_player_id, active_player_index) = {
@@ -262,8 +274,27 @@ impl OpenWarsAiServer {
         }
     }
 
+    #[tool(description = "Advances to the next game phase/player.")]
+    async fn next_phase(&self, #[tool(aggr)] _args: Parameters<NextPhaseArgs>) -> Result<String, String> {
+        let mut state_lock = self.state.lock().await;
+        if let Some(state) = state_lock.as_mut() {
+            let world = &mut state.world;
+            world.send_event(engine::events::NextPhaseCommand);
+            state.schedule.run(world);
+            
+            let ms = world.get_resource::<MatchState>().unwrap();
+            let players = world.get_resource::<Players>().unwrap();
+            let active_player = &players.0[ms.active_player_index.0];
+            
+            Ok(format!("Advanced to turn {}, player {} (Phase: {:?})", 
+                ms.current_turn_number.0, active_player.id.0, ms.current_phase))
+        } else {
+            Err("Map not loaded".into())
+        }
+    }
+
     #[tool(description = "Executes an action.")]
-    async fn execute_action(&self, _args: Parameters<ExecuteActionArgs>) -> Result<String, String> {
+    async fn execute_action(&self, #[tool(aggr)] _args: Parameters<ExecuteActionArgs>) -> Result<String, String> {
         Ok("Executed action (Stated stub, please use JSON params for specific commands)".into())
     }
 }

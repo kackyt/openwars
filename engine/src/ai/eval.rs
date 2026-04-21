@@ -9,9 +9,8 @@ pub fn evaluate_board(world: &mut World, perspective_player: PlayerId) -> i32 {
 
     // 1. ユニット戦力の評価
     // 自軍ユニットはプラス、敵軍ユニットはマイナスとして加算します。
-    // 輸送中のユニット（Transportingコンポーネントを持つ）は、二重計上を防ぐため評価から除外します。
-    let mut query =
-        world.query_filtered::<(&Faction, &Health, &UnitStats), Without<Transporting>>();
+    // 輸送中のユニット（Transportingコンポーネントを持つ）も、HPに応じた価値を評価に含めます。
+    let mut query = world.query::<(&Faction, &Health, &UnitStats)>();
     for (faction, health, stats) in query.iter(world) {
         // 現在のHP割合を掛けた実質価値を算出
         let value = if health.max > 0 {
@@ -101,7 +100,7 @@ mod tests {
             },
         ));
 
-        // Enemy transported unit -> should be ignored
+        // Enemy transported unit -> should be included
         world.spawn((
             Faction(p2),
             Health {
@@ -137,14 +136,14 @@ mod tests {
         let score = evaluate_board(&mut world, p1);
         // Expected score:
         // P1 Units: 1000 + 1000 = 2000
-        // P2 Units: -1500
+        // P2 Units: -1500 - 5000 = -6500
         // P1 Props: 10000 + 1000 = 11000
         // P2 Props: -2000
-        // Total: 2000 - 1500 + 11000 - 2000 = 9500
-        assert_eq!(score, 9500);
+        // Total: 2000 - 6500 + 11000 - 2000 = 4500
+        assert_eq!(score, 4500);
 
         let score_p2 = evaluate_board(&mut world, p2);
         // From P2's perspective, it should be the exact inverse
-        assert_eq!(score_p2, -9500);
+        assert_eq!(score_p2, -4500);
     }
 }

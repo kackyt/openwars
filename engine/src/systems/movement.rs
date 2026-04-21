@@ -374,6 +374,15 @@ pub fn move_unit_system(
             }
         }
 
+        // ハードガード: 目的地が既に他のユニットによって占有されているか再確認
+        let is_target_occupied = q_units.iter().any(|(e, p, _, _, _, _, _, trans, _)| {
+            e != event.unit_entity && p.x == event.target_x && p.y == event.target_y && trans.is_none()
+        });
+
+        if is_target_occupied {
+            continue;
+        }
+
         if let Ok((
             entity,
             mut pos,
@@ -395,7 +404,6 @@ pub fn move_unit_system(
             if has_moved.0 {
                 continue;
             }
-
             if let Some((_path, _cost, fuel_used)) = find_path_a_star(
                 &map,
                 &unit_positions,

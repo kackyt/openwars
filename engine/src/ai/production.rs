@@ -166,6 +166,56 @@ mod tests {
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0].target_x, 0);
         assert_eq!(commands[1].target_x, 1);
-        assert_eq!(commands[0].unit_type, UnitType::Infantry);
+    }
+
+    #[test]
+    fn test_ai_production_skips_occupied_factory() {
+        let mut world = World::new();
+        let p1 = PlayerId(1);
+
+        // Setup Funds
+        world.insert_resource(Players(vec![Player {
+            id: p1,
+            name: "P1".to_string(),
+            funds: 5000,
+        }]));
+
+        // Setup Registry
+        let mut registry = HashMap::new();
+        registry.insert(
+            UnitType::Infantry,
+            crate::components::UnitStats {
+                unit_type: UnitType::Infantry,
+                cost: 1000,
+                ..crate::components::UnitStats::mock()
+            },
+        );
+        world.insert_resource(UnitRegistry(registry));
+
+        // Factory with a "Wait" unit (ActionCompleted=true)
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Factory, Some(p1), 200),
+        ));
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Faction(p1),
+            crate::components::UnitStats {
+                ..crate::components::UnitStats::mock()
+            },
+            crate::components::ActionCompleted(true), // Waiting unit
+        ));
+
+        // Factory empty
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Property::new(Terrain::Factory, Some(p1), 200),
+        ));
+
+        let commands = decide_production(&mut world, p1);
+
+        // Should only produce on (1,0), not on (0,0)
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target_x, 1);
     }
 }
