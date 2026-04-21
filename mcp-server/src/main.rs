@@ -56,7 +56,14 @@ pub struct GetBoardStateArgs {}
 
 #[derive(Deserialize, JsonSchema)]
 pub struct GetValidActionsArgs {
-    pub unit_id: u32,
+    pub unit_id: u64,
+    pub x: Option<usize>,
+    pub y: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct GetReachableTilesArgs {
+    pub unit_id: u64,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -64,11 +71,11 @@ pub struct NextPhaseArgs {}
 
 #[derive(Deserialize, JsonSchema)]
 pub struct ExecuteActionArgs {
+    pub unit_id: u64,
     pub action_type: String,
-    pub unit_id: Option<u32>,
+    pub target_id: Option<u64>,
     pub target_x: Option<u32>,
     pub target_y: Option<u32>,
-    pub target_id: Option<u32>,
 }
 
 #[tool(tool_box)]
@@ -158,7 +165,7 @@ impl OpenWarsAiServer {
         }
     }
 
-    #[tool(description = "Returns valid actions for a unit given its ID.")]
+    #[tool(description = "Returns valid actions for a unit at a given position.")]
     async fn get_valid_actions(
         &self,
         #[tool(aggr)] args: Parameters<GetValidActionsArgs>,
@@ -169,9 +176,94 @@ impl OpenWarsAiServer {
             let entity = Entity::from_bits(args.0.unit_id as u64);
 
             if world.get_entity(entity).is_ok() {
+                let pos = if let (Some(x), Some(y)) = (args.0.x, args.0.y) {
+                    engine::components::GridPosition { x, y }
+                } else {
+                    world
+                        .get::<GridPosition>(entity)
+                        .cloned()
+                        .unwrap_or(GridPosition { x: 0, y: 0 })
+                };
+
                 let is_moved = world.get::<HasMoved>(entity).map(|h| h.0).unwrap_or(false);
-                let actions = engine::systems::get_available_actions(world, entity, is_moved);
+                let actions = engine::systems::action::get_available_actions_at(
+                    world,
+                    entity,
+                    pos,
+                    is_moved,
+                );
                 Ok(serde_json::to_string(&actions).map_err(|e| e.to_string())?)
+            } else {
+                Err(format!("Unit with ID {} not found", args.0.unit_id))
+            }
+        } else {
+            Err("Map not loaded".into())
+        }
+    }
+
+    #[tool(description = "Returns reachable tiles for a unit.")]
+    async fn get_reachable_tiles(
+        &self,
+        #[tool(aggr)] args: Parameters<GetReachableTilesArgs>,
+    ) -> Result<String, String> {
+        let mut state_lock = self.state.lock().await;
+        if let Some(state) = state_lock.as_mut() {
+            let world = &mut state.world;
+            let entity = Entity::from_bits(args.0.unit_id as u64);
+
+            if let Ok(e) = world.get_entity(entity) {
+                if let (Some(pos), Some(faction), Some(stats), Some(fuel)) = (
+                    e.get::<GridPosition>().cloned(),
+                    e.get::<Faction>().cloned(),
+                    e.get::<UnitStats>().cloned(),
+                    e.get::<Fuel>().cloned(),
+                ) {
+                let mut unit_positions = std::collections::HashMap::new();
+                let mut q_occupants = world.query::<(
+                    Entity,
+                    &GridPosition,
+                    &Faction,
+                    &UnitStats,
+                    Option<&engine::components::CargoCapacity>,
+                )>();
+                for (e, p, f, s, cargo_opt) in q_occupants.iter(world) {
+                    if e != entity {
+                        let free_slots = cargo_opt
+                            .map(|c| c.max.saturating_sub(c.loaded.len() as u32))
+                            .unwrap_or(0);
+                        unit_positions.insert(
+                            (p.x, p.y),
+                            engine::systems::movement::OccupantInfo {
+                                player_id: f.0,
+                                is_transport: s.max_cargo > 0,
+                                unit_type: s.unit_type,
+                                loadable_types: s.loadable_unit_types.clone(),
+                                free_slots,
+                            },
+                        );
+                    }
+                }
+
+                let map = world.resource::<engine::resources::Map>();
+                let registry = world.resource::<MasterDataRegistry>();
+
+                let reachable = engine::systems::movement::calculate_reachable_tiles(
+                    map,
+                    &unit_positions,
+                    (pos.x, pos.y),
+                    stats.movement_type,
+                    stats.max_movement,
+                    fuel.current,
+                    faction.0,
+                    stats.unit_type,
+                    registry,
+                );
+
+                let tiles: Vec<_> = reachable.into_iter().map(|(x, y)| vec![x, y]).collect();
+                Ok(serde_json::to_string(&tiles).map_err(|e| e.to_string())?)
+                } else {
+                    Err(format!("Unit with ID {} is missing stats", args.0.unit_id))
+                }
             } else {
                 Err(format!("Unit with ID {} not found", args.0.unit_id))
             }
@@ -203,8 +295,9 @@ impl OpenWarsAiServer {
             let mut units = vec![];
             let mut unit_query =
                 world.query::<(Entity, &GridPosition, &Faction, &UnitStats, &Health)>();
-            for (_entity, pos, faction, stats, health) in unit_query.iter(world) {
+            for (entity, pos, faction, stats, health) in unit_query.iter(world) {
                 units.push(serde_json::json!({
+                    "unit_id": entity.to_bits(),
                     "x": pos.x,
                     "y": pos.y,
                     "player_id": faction.0.0,
@@ -213,9 +306,25 @@ impl OpenWarsAiServer {
                 }));
             }
 
+            let players = world.resource::<engine::resources::Players>();
+            let mut players_info = vec![];
+            for p in &players.0 {
+                players_info.push(serde_json::json!({
+                    "player_id": p.id.0,
+                    "name": p.name,
+                    "funds": p.funds
+                }));
+            }
+
+            let match_state = world.resource::<engine::resources::MatchState>();
+
             Ok(serde_json::json!({
                 "properties": properties,
-                "units": units
+                "units": units,
+                "players": players_info,
+                "turn": match_state.current_turn_number.0,
+                "active_player_index": match_state.active_player_index.0,
+                "phase": format!("{:?}", match_state.current_phase)
             })
             .to_string())
         } else {

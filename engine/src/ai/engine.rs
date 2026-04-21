@@ -159,8 +159,8 @@ pub fn decide_ai_action(
             // 占領価値・拠点接近スコア
             let mut min_objective_dist = 99;
             if stats.can_capture {
-                for (p_pos, p_terrain, p_owner) in &properties {
-                    if *p_terrain != Terrain::Capital && *p_owner != Some(player_id) {
+                for (p_pos, _p_terrain, p_owner) in &properties {
+                    if *p_owner != Some(player_id) {
                         let d = (current_grid.x as i32 - p_pos.x as i32).abs()
                             + (current_grid.y as i32 - p_pos.y as i32).abs();
                         if d < min_objective_dist {
@@ -169,7 +169,7 @@ pub fn decide_ai_action(
                     }
                 }
                 // 拠点を狙うスコアを大幅に強化
-                base_tile_score += (20 - min_objective_dist).max(0) * 150;
+                base_tile_score += (20 - min_objective_dist).max(0) * 400;
             } else {
                 for ((ex, ey), occ) in &unit_positions {
                     if occ.player_id != player_id {
@@ -180,7 +180,7 @@ pub fn decide_ai_action(
                         }
                     }
                 }
-                base_tile_score += (20 - min_objective_dist).max(0) * 30;
+                base_tile_score += (20 - min_objective_dist).max(0) * 100;
             }
 
             // (A) Capture
