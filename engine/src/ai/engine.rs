@@ -7,6 +7,10 @@ use crate::resources::{DamageChart, Map, Terrain};
 use crate::systems::movement::{calculate_reachable_tiles, OccupantInfo};
 use bevy_ecs::prelude::*;
 use std::collections::HashMap;
+use std::collections::HashSet;
+
+#[derive(Resource, Default)]
+pub struct AiActionCooldown(pub HashSet<Entity>);
 
 #[derive(Debug, Clone)]
 pub enum AiCommand {
@@ -36,7 +40,11 @@ pub enum AiCommand {
 
 
 /// AIの思考エンジン。未行動のユニットに対して最も評価の高いコマンドを決定します。
-pub fn decide_ai_action(world: &mut World, player_id: PlayerId) -> Option<(Entity, AiCommand)> {
+pub fn decide_ai_action(
+    world: &mut World,
+    player_id: PlayerId,
+    skip_entities: &std::collections::HashSet<Entity>,
+) -> Option<(Entity, AiCommand)> {
     // 1. 行動可能なユニットを収集
     let mut movable_units = Vec::new();
     let mut unit_positions = HashMap::new();
@@ -53,6 +61,9 @@ pub fn decide_ai_action(world: &mut World, player_id: PlayerId) -> Option<(Entit
         for (entity, pos, faction, has_moved, action_completed, stats, cargo_opt) in
             query.iter(world)
         {
+            if skip_entities.contains(&entity) {
+                continue;
+            }
             if faction.0 == player_id && !has_moved.0 && !action_completed.0 {
                 movable_units.push(entity);
             }
@@ -138,7 +149,7 @@ pub fn decide_ai_action(world: &mut World, player_id: PlayerId) -> Option<(Entit
                 base_tile_score += registry.get_terrain_defense_bonus(terrain) as i32 * 10;
             }
 
-            // 目標接近重要度
+            // 占領価値・拠点接近スコア
             let mut min_objective_dist = 99;
             if stats.can_capture {
                 for (p_pos, p_terrain, p_owner) in &properties {
@@ -150,7 +161,8 @@ pub fn decide_ai_action(world: &mut World, player_id: PlayerId) -> Option<(Entit
                         }
                     }
                 }
-                base_tile_score += (20 - min_objective_dist).max(0) * 100;
+                // 拠点を狙うスコアを大幅に強化
+                base_tile_score += (20 - min_objective_dist).max(0) * 150;
             } else {
                 for ((ex, ey), occ) in &unit_positions {
                     if occ.player_id != player_id {
@@ -161,7 +173,7 @@ pub fn decide_ai_action(world: &mut World, player_id: PlayerId) -> Option<(Entit
                         }
                     }
                 }
-                base_tile_score += (20 - min_objective_dist).max(0) * 20;
+                base_tile_score += (20 - min_objective_dist).max(0) * 30;
             }
 
             // (A) Capture
@@ -216,13 +228,7 @@ pub fn decide_ai_action(world: &mut World, player_id: PlayerId) -> Option<(Entit
     None
 }
 
-/// AIコマンドを実際のエンジンコマンドに変換し、キューに送信する
 pub fn execute_ai_command(world: &mut World, unit_entity: Entity, command: AiCommand) {
-    // 常にこのユニットのアクションを完了したとみなす（無限ループ防止）
-    if let Some(mut action_completed) = world.get_mut::<ActionCompleted>(unit_entity) {
-        action_completed.0 = true;
-    }
-
     match command {
         AiCommand::Attack {
             target_pos,
@@ -337,7 +343,8 @@ mod tests {
     #[test]
     fn test_decide_ai_action_no_units() {
         let mut world = World::new();
-        assert!(decide_ai_action(&mut world, PlayerId(1)).is_none());
+        let skips = std::collections::HashSet::new();
+        assert!(decide_ai_action(&mut world, PlayerId(1), &skips).is_none());
     }
 
     #[test]
@@ -376,7 +383,8 @@ mod tests {
         ));
 
         // Since there is no enemy to attack and no property to capture, it should return Wait.
-        let action = decide_ai_action(&mut world, PlayerId(1));
+        let skips = std::collections::HashSet::new();
+        let action = decide_ai_action(&mut world, PlayerId(1), &skips);
         assert!(action.is_some());
         if let Some((_, AiCommand::Wait { .. })) = action {
         } else {
@@ -458,7 +466,8 @@ mod tests {
             },
         ));
 
-        let action = decide_ai_action(&mut world, p1);
+        let skips = std::collections::HashSet::new();
+        let action = decide_ai_action(&mut world, p1, &skips);
         assert!(action.is_some());
         if let Some((entity, AiCommand::Attack { target_entity, .. })) = action {
             assert_eq!(entity, attacker);
@@ -516,7 +525,9 @@ mod tests {
             Property::new(Terrain::City, None, 200),
         ));
 
-        let action = decide_ai_action(&mut world, p1);
+        let p1 = PlayerId(1);
+        let mut skips = std::collections::HashSet::new();
+        let action = decide_ai_action(&mut world, p1, &skips);
         assert!(action.is_some());
         if let Some((entity, AiCommand::Capture { .. })) = action {
             assert_eq!(entity, unit);
@@ -529,8 +540,36 @@ mod tests {
 /// 一度の呼び出しで、該当勢力のAI行動（生産、または1ユニットの行動）を1ステップ実行し、イベントを発行します。
 /// 行動可能ユニットがなくなったらターン終了コマンドを発行します。
 /// 何らかの行動を実行した場合は true、ターンが終了した場合は false を返します。
+/// AIのメイン実行エントリーポイント。
 pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> bool {
-    // 1. 生産行動
+    // 1. ユニット行動を1つ決定・実行
+    // AI思考ループの中で、エンジン側のフラグが更新されるのを待たずに
+    // 同一フレーム内の重複思考を避けるために、リソースで「指示済みユニット」を管理します。
+    let mut skip_entities = std::collections::HashSet::new();
+    if let Some(res) = world.get_resource::<AiActionCooldown>() {
+        skip_entities = res.0.clone();
+    }
+
+    if let Some((entity, command)) = decide_ai_action(world, active_player, &skip_entities) {
+        execute_ai_command(world, entity, command);
+        
+        // リソースを更新して、次回の呼び出しでもこのユニットをスキップするようにする
+        if let Some(mut res) = world.get_resource_mut::<AiActionCooldown>() {
+            res.0.insert(entity);
+        } else {
+            let mut set = std::collections::HashSet::new();
+            set.insert(entity);
+            world.insert_resource(AiActionCooldown(set));
+        }
+        return true; 
+    }
+
+    // 全ユニットの検討が終わったら冷却リストをクリアする（生産や次ターン移行の準備）
+    if let Some(mut res) = world.get_resource_mut::<AiActionCooldown>() {
+        res.0.clear();
+    }
+
+    // 2. 生産行動
     let prod_commands = super::production::decide_production(world, active_player);
     if let Some(cmd) = prod_commands.into_iter().next() {
         if let Some(mut events) =
@@ -538,13 +577,6 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> bool {
         {
             events.send(cmd);
         }
-        // 生産を1つ決定したら一旦終了し、エンジンの更新を待つ
-        return true;
-    }
-
-    // 2. ユニット行動
-    if let Some((entity, command)) = decide_ai_action(world, active_player) {
-        execute_ai_command(world, entity, command);
         return true;
     }
 

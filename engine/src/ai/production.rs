@@ -20,7 +20,8 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
         return commands;
     };
 
-    let mut available_funds = current_funds;
+    // 補充・修理用に一定額(1000G)を温存するように計算
+    let mut available_funds = current_funds.saturating_sub(1000);
 
     // 歩兵のコストを取得
     let infantry_cost = if let Some(registry) = world.get_resource::<UnitRegistry>() {
@@ -94,8 +95,8 @@ mod tests {
             Player {
                 id: p1,
                 name: "P1".to_string(),
-                funds: 2500,
-            }, // Can afford 2 Infantry (cost 1000)
+                funds: 3500,
+            }, // Can afford 2 Infantry (cost 1000) with 1000 buffer
             Player {
                 id: p2,
                 name: "P2".to_string(),

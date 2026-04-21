@@ -164,19 +164,34 @@ fn process_resupply(
     players.0[active_player_idx].funds += budget_increase;
 
     // Property resupply
-    for (_, _, _, faction, stats, mut fuel, mut ammo, hp, pos) in q_units.iter_mut() {
+    for (_, _, _, faction, stats, mut fuel, mut ammo, mut hp, pos) in q_units.iter_mut() {
         if faction.0 == active_player_id {
             // 日次更新 (燃料消費、墜落判定) は next_phase_system でラウンド単位で行われるためここでは削除
             if hp.is_destroyed() {
                 continue;
             }
             if owned_properties.contains(&(pos.x, pos.y)) {
+                // 回復・補充にかかるコストを計算
+                // HP回復（最大20回復）
+                let hp_to_restore = 20.min(hp.max.saturating_sub(hp.current));
+                let repair_cost = (stats.cost as f32 * (hp_to_restore as f32 / 100.0)) as u32;
+
                 let ammo_diff = (stats.max_ammo1.saturating_sub(ammo.ammo1))
                     + (stats.max_ammo2.saturating_sub(ammo.ammo2));
                 let fuel_diff = stats.max_fuel.saturating_sub(fuel.current);
-                let cost = ammo_diff * 15 + fuel_diff * 5;
-                if players.0[active_player_idx].funds >= cost {
-                    players.0[active_player_idx].funds -= cost;
+                let resupply_cost = ammo_diff * 15 + fuel_diff * 5;
+
+                let total_cost = repair_cost + resupply_cost;
+
+                if players.0[active_player_idx].funds >= total_cost && total_cost > 0 {
+                    players.0[active_player_idx].funds -= total_cost;
+                    hp.current = (hp.current + hp_to_restore).min(hp.max);
+                    fuel.current = stats.max_fuel;
+                    ammo.ammo1 = stats.max_ammo1;
+                    ammo.ammo2 = stats.max_ammo2;
+                } else if players.0[active_player_idx].funds >= resupply_cost && resupply_cost > 0 {
+                    // 資金不足で修理はできないが、補給だけはできる場合
+                    players.0[active_player_idx].funds -= resupply_cost;
                     fuel.current = stats.max_fuel;
                     ammo.ammo1 = stats.max_ammo1;
                     ammo.ammo2 = stats.max_ammo2;

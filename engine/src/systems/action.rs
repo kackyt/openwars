@@ -89,13 +89,12 @@ pub fn get_available_actions_at(
         };
 
         AvailableActions {
-            can_attack: !combat::get_attackable_targets_at(world, unit_entity, u_pos, !is_moved)
-                .is_empty(),
-            can_capture,
-            can_repair,
-            can_supply: !supply::get_suppliable_targets_at(world, unit_entity, u_pos).is_empty(),
+            can_attack: !is_occupied_by_other && !combat::get_attackable_targets_at(world, unit_entity, u_pos, !is_moved).is_empty(),
+            can_capture: !is_occupied_by_other && can_capture,
+            can_repair: !is_occupied_by_other && can_repair,
+            can_supply: !is_occupied_by_other && !supply::get_suppliable_targets_at(world, unit_entity, u_pos).is_empty(),
             can_load,
-            can_drop: {
+            can_drop: !is_occupied_by_other && {
                 let mut can_drop = false;
                 let mut q_cargo = world.query::<&CargoCapacity>();
                 if let Ok(cargo) = q_cargo.get(world, unit_entity) {
@@ -113,7 +112,7 @@ pub fn get_available_actions_at(
             can_merge,
             // 空きマスであるか、移動していない（元の位置に留まる）場合のみ待機可能
             // 搭載や合流が可能なマスであっても、通常の「待機」で重なることは許さない
-            can_wait: !is_occupied_by_other,
+            can_wait: !is_occupied_by_other || !is_moved,
         }
     }
 
