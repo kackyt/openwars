@@ -126,31 +126,41 @@ mod tests {
         world.insert_resource(UnitRegistry(registry));
 
         // Setup factories
-        // 1. P1 owned, empty -> Should produce
+        // 0. Setup Capital (needed for can_produce_at scope)
         world.spawn((
             GridPosition { x: 0, y: 0 },
-            Property::new(Terrain::Factory, Some(p1), 200),
+            Property::new(Terrain::Capital, Some(p1), 100),
         ));
 
-        // 2. P1 owned, empty -> Should produce (has 2500 funds)
+        // Setup Registry
+        let registry = MasterDataRegistry::load().unwrap();
+        world.insert_resource(registry);
+
+        // 1. P1 owned, empty -> Should produce (has 2500 funds)
         world.spawn((
             GridPosition { x: 1, y: 0 },
             Property::new(Terrain::Factory, Some(p1), 200),
         ));
 
-        // 3. P1 owned, empty -> Should NOT produce (funds 2500 -> 1500 -> 500, needs 1000)
+        // 2. P1 owned, empty -> Should produce (has 2500 funds)
         world.spawn((
             GridPosition { x: 2, y: 0 },
             Property::new(Terrain::Factory, Some(p1), 200),
         ));
 
-        // 4. P1 owned, occupied -> Should NOT produce
+        // 3. P1 owned, empty -> Should NOT produce (funds 2500 -> 1500 -> 500, needs 1000)
         world.spawn((
             GridPosition { x: 3, y: 0 },
             Property::new(Terrain::Factory, Some(p1), 200),
         ));
+
+        // 4. P1 owned, occupied -> Should NOT produce
         world.spawn((
-            GridPosition { x: 3, y: 0 },
+            GridPosition { x: 4, y: 0 },
+            Property::new(Terrain::Factory, Some(p1), 200),
+        ));
+        world.spawn((
+            GridPosition { x: 4, y: 0 },
             Faction(p1),
             crate::components::UnitStats {
                 ..crate::components::UnitStats::mock()
@@ -159,23 +169,23 @@ mod tests {
 
         // 5. Unowned factory -> Should NOT produce
         world.spawn((
-            GridPosition { x: 4, y: 0 },
+            GridPosition { x: 5, y: 0 },
             Property::new(Terrain::Factory, None, 200),
         ));
 
         // 6. P2 owned factory -> Should NOT produce
         world.spawn((
-            GridPosition { x: 5, y: 0 },
+            GridPosition { x: 6, y: 0 },
             Property::new(Terrain::Factory, Some(p2), 200),
         ));
 
         // Execute decide_production
         let commands = decide_production(&mut world, p1);
 
-        // We expect exactly 2 commands for (0,0) and (1,0)
+        // We expect exactly 2 commands for (1,0) and (2,0)
         assert_eq!(commands.len(), 2);
-        assert_eq!(commands[0].target_x, 0);
-        assert_eq!(commands[1].target_x, 1);
+        assert_eq!(commands[0].target_x, 1);
+        assert_eq!(commands[1].target_x, 2);
     }
 
     #[test]
@@ -202,21 +212,32 @@ mod tests {
         );
         world.insert_resource(UnitRegistry(registry));
 
-        // Factory with a "Wait" unit (ActionCompleted=true)
+        // Setup MasterDataRegistry
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+
+        // Setup Capital
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(p1), 100),
+        ));
+
+        // Case: Factory at (0,0) (Capital position) with a unit
+        // Factory at (0,0)
         world.spawn((
             GridPosition { x: 0, y: 0 },
             Property::new(Terrain::Factory, Some(p1), 200),
         ));
+        // Factory at (0,0) occupied by a "Wait" unit
         world.spawn((
             GridPosition { x: 0, y: 0 },
             Faction(p1),
             crate::components::UnitStats {
                 ..crate::components::UnitStats::mock()
             },
-            crate::components::ActionCompleted(true), // Waiting unit
+            crate::components::ActionCompleted(true),
         ));
 
-        // Factory empty
+        // Factory empty at (1,0)
         world.spawn((
             GridPosition { x: 1, y: 0 },
             Property::new(Terrain::Factory, Some(p1), 200),
