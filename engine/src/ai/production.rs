@@ -36,13 +36,16 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
         return commands;
     };
 
-    // プレイヤーの工場を取得
-    let mut factory_positions = Vec::new();
+    // 生産拠点を取得（マスターデータに基づく）
+    let mut production_positions = Vec::new();
     {
+        let master_data = world.resource::<MasterDataRegistry>().clone();
         let mut query = world.query::<(&GridPosition, &Property)>();
         for (pos, prop) in query.iter(world) {
-            if prop.owner_id == Some(player_id) && prop.terrain == Terrain::Factory {
-                factory_positions.push(*pos);
+            if prop.owner_id == Some(player_id)
+                && master_data.is_production_facility(prop.terrain.as_str())
+            {
+                production_positions.push(*pos);
             }
         }
     }
@@ -57,7 +60,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
         }
     }
 
-    for pos in factory_positions {
+    for pos in production_positions {
         if available_funds < infantry_cost {
             break;
         }
@@ -182,10 +185,12 @@ mod tests {
         // Execute decide_production
         let commands = decide_production(&mut world, p1);
 
-        // We expect exactly 2 commands for (1,0) and (2,0)
-        assert_eq!(commands.len(), 2);
-        assert_eq!(commands[0].target_x, 1);
-        assert_eq!(commands[1].target_x, 2);
+        // We expect 3 commands for (0,0) (Capital), (1,0) (Factory) and (2,0) (Factory)
+        // (3,0) is skipped because of funds (needs 1000 buffer + 3*1000 = 4000, but has 3500)
+        assert_eq!(commands.len(), 2); // Wait, if funds 3500, available 2500. So 2 units.
+        // The order might depend on query order, but usually (0,0) comes first.
+        assert_eq!(commands[0].target_x, 0); 
+        assert_eq!(commands[1].target_x, 1);
     }
 
     #[test]

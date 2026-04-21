@@ -12,6 +12,7 @@ pub fn create_world() -> (World, Schedule) {
 
     // Register events
     world.init_resource::<Events<ProduceUnitCommand>>();
+    world.init_resource::<ProductionDiagnostic>();
     world.init_resource::<Events<MoveUnitCommand>>();
     world.init_resource::<Events<AttackUnitCommand>>();
     world.init_resource::<Events<CapturePropertyCommand>>();
@@ -34,8 +35,8 @@ pub fn create_world() -> (World, Schedule) {
     // Add main game systems
     add_main_game_systems(&mut schedule);
 
-    // Add event update system to be run at the start of each frame
-    schedule.add_systems(update_all_events);
+    // Add event update system to be run at the end of each frame
+    schedule.add_systems(update_all_events.after(crate::systems::GameSystemSet));
 
     (world, schedule)
 }
@@ -176,10 +177,10 @@ pub fn initialize_world_from_master_data(
         for y in 0..map_data.height {
             for x in 0..map_data.width {
                 if let Some(cell) = map_data.get_cell(x, y).filter(|c| c.player_id == pid) {
-                    let landscape = master_data
-                        .get_landscape(cell.terrain_id)
-                        .ok_or_else(|| anyhow::anyhow!("Unknown terrain ID"))?;
-                    income += master_data.landscape_income(&landscape.name);
+                    let terrain = master_data
+                        .terrain_from_id(cell.terrain_id)
+                        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                    income += master_data.landscape_income(terrain.as_str());
                 }
             }
         }

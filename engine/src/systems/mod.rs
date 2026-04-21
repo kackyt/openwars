@@ -18,11 +18,15 @@ pub use supply::*;
 pub use transport::*;
 pub use turn_management::*;
 
-use bevy_ecs::schedule::{IntoSystemConfigs, Schedule};
+use bevy_ecs::schedule::{IntoSystemConfigs, Schedule, SystemSet};
+
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GameSystemSet;
 
 /// すべてのゲームロジックシステムを正しい順序でスケジュールに追加します。
 /// プレゼンテーション層はこの関数を呼び出すことで、ビジネスロジックの整合性を保つことができます。
 pub fn add_main_game_systems(schedule: &mut Schedule) {
+    schedule.configure_sets(GameSystemSet);
     schedule.add_systems(
         (
             produce_unit_system,
@@ -40,6 +44,7 @@ pub fn add_main_game_systems(schedule: &mut Schedule) {
             next_phase_system,
             victory_check_system,
         )
-            .chain(),
+            .chain()
+            .in_set(GameSystemSet),
     );
 }

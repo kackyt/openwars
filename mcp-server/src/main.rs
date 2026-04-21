@@ -316,15 +316,27 @@ impl OpenWarsAiServer {
                 }));
             }
 
+            let diagnostic = world.get_resource::<engine::resources::ProductionDiagnostic>();
+            let diag_info = if let Some(d) = diagnostic {
+                serde_json::json!({
+                    "last_error": d.last_error,
+                    "last_event": d.last_event,
+                    "income_log": d.income_log
+                })
+            } else {
+                serde_json::json!({})
+            };
+
             let match_state = world.resource::<engine::resources::MatchState>();
 
             Ok(serde_json::json!({
-                "properties": properties,
-                "units": units,
-                "players": players_info,
                 "turn": match_state.current_turn_number.0,
                 "active_player_index": match_state.active_player_index.0,
-                "phase": format!("{:?}", match_state.current_phase)
+                "phase": format!("{:?}", match_state.current_phase),
+                "players": players_info,
+                "properties": properties,
+                "units": units,
+                "diagnostics": diag_info
             })
             .to_string())
         } else {
