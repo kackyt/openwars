@@ -2,9 +2,9 @@ use crate::components::{
     ActionCompleted, Faction, GridPosition, HasMoved, PlayerId, Property, UnitStats,
 };
 use crate::events::{AttackUnitCommand, CapturePropertyCommand, MoveUnitCommand, WaitUnitCommand};
-use crate::resources::master_data::{MasterDataRegistry, UnitName};
-use crate::resources::{DamageChart, Map, Terrain};
-use crate::systems::movement::{calculate_reachable_tiles, OccupantInfo};
+use crate::resources::master_data::MasterDataRegistry;
+use crate::resources::{Map, Terrain};
+use crate::systems::movement::{OccupantInfo, calculate_reachable_tiles};
 use bevy_ecs::prelude::*;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -37,7 +37,6 @@ pub enum AiCommand {
         target_entity: Entity,
     },
 }
-
 
 /// AIの思考エンジン。未行動のユニットに対して最も評価の高いコマンドを決定します。
 pub fn decide_ai_action(
@@ -92,8 +91,12 @@ pub fn decide_ai_action(
         let (stats, pos, fuel, _ammo) = {
             let stats = world.get::<UnitStats>(unit_entity).cloned();
             let pos = world.get::<GridPosition>(unit_entity).cloned();
-            let fuel = world.get::<crate::components::Fuel>(unit_entity).map(|f| f.current);
-            let is_transported = world.get::<crate::components::Transporting>(unit_entity).is_some();
+            let fuel = world
+                .get::<crate::components::Fuel>(unit_entity)
+                .map(|f| f.current);
+            let is_transported = world
+                .get::<crate::components::Transporting>(unit_entity)
+                .is_some();
 
             if stats.is_none() || pos.is_none() || fuel.is_none() || is_transported {
                 continue;
@@ -283,7 +286,8 @@ pub fn execute_ai_command(world: &mut World, unit_entity: Entity, command: AiCom
                     target_y: target_pos.y,
                 });
             }
-            if let Some(mut evs) = world.get_resource_mut::<Events<crate::events::MergeUnitCommand>>()
+            if let Some(mut evs) =
+                world.get_resource_mut::<Events<crate::events::MergeUnitCommand>>()
             {
                 evs.send(crate::events::MergeUnitCommand {
                     source_entity: unit_entity,
@@ -334,11 +338,63 @@ pub fn execute_ai_command(world: &mut World, unit_entity: Entity, command: AiCom
     }
 }
 
+/// 一度の呼び出しで、該当勢力のAI行動（生産、または1ユニットの行動）を1ステップ実行し、イベントを発行します。
+/// 行動可能ユニットがなくなったらターン終了コマンドを発行します。
+/// 何らかの行動を実行した場合は true、ターンが終了した場合は false を返します。
+/// AIのメイン実行エントリーポイント。
+pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> bool {
+    // 1. ユニット行動を1つ決定・実行
+    // AI思考ループの中で、エンジン側のフラグが更新されるのを待たずに
+    // 同一フレーム内の重複思考を避けるために、リソースで「指示済みユニット」を管理します。
+    let mut skip_entities = std::collections::HashSet::new();
+    if let Some(res) = world.get_resource::<AiActionCooldown>() {
+        skip_entities = res.0.clone();
+    }
+
+    if let Some((entity, command)) = decide_ai_action(world, active_player, &skip_entities) {
+        execute_ai_command(world, entity, command);
+
+        // リソースを更新して、次回の呼び出しでもこのユニットをスキップするようにする
+        if let Some(mut res) = world.get_resource_mut::<AiActionCooldown>() {
+            res.0.insert(entity);
+        } else {
+            let mut set = std::collections::HashSet::new();
+            set.insert(entity);
+            world.insert_resource(AiActionCooldown(set));
+        }
+        return true;
+    }
+
+    // 全ユニットの検討が終わったら冷却リストをクリアする（生産や次ターン移行の準備）
+    if let Some(mut res) = world.get_resource_mut::<AiActionCooldown>() {
+        res.0.clear();
+    }
+
+    // 2. 生産行動
+    let prod_commands = super::production::decide_production(world, active_player);
+    if let Some(cmd) = prod_commands.into_iter().next() {
+        if let Some(mut events) =
+            world.get_resource_mut::<Events<crate::events::ProduceUnitCommand>>()
+        {
+            events.send(cmd);
+        }
+        return true;
+    }
+
+    // 3. 全行動完了 -> ターン終了
+    if let Some(mut end_events) =
+        world.get_resource_mut::<Events<crate::events::NextPhaseCommand>>()
+    {
+        end_events.send(crate::events::NextPhaseCommand);
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::{Health, UnitStats};
-    use crate::resources::UnitType;
+    use crate::components::{Faction, Health, PlayerId, Property, UnitStats};
+    use crate::resources::{DamageChart, UnitType};
 
     #[test]
     fn test_decide_ai_action_no_units() {
@@ -379,7 +435,10 @@ mod tests {
                 current: 100,
                 max: 100,
             },
-            crate::components::Fuel { current: 99, max: 99 },
+            crate::components::Fuel {
+                current: 99,
+                max: 99,
+            },
         ));
 
         // Since there is no enemy to attack and no property to capture, it should return Wait.
@@ -515,7 +574,10 @@ mod tests {
                     current: 100,
                     max: 100,
                 },
-                crate::components::Fuel { current: 99, max: 99 },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
             ))
             .id();
 
@@ -526,7 +588,7 @@ mod tests {
         ));
 
         let p1 = PlayerId(1);
-        let mut skips = std::collections::HashSet::new();
+        let skips = std::collections::HashSet::new();
         let action = decide_ai_action(&mut world, p1, &skips);
         assert!(action.is_some());
         if let Some((entity, AiCommand::Capture { .. })) = action {
@@ -535,56 +597,4 @@ mod tests {
             panic!("Expected Capture command, got {:?}", action);
         }
     }
-}
-
-/// 一度の呼び出しで、該当勢力のAI行動（生産、または1ユニットの行動）を1ステップ実行し、イベントを発行します。
-/// 行動可能ユニットがなくなったらターン終了コマンドを発行します。
-/// 何らかの行動を実行した場合は true、ターンが終了した場合は false を返します。
-/// AIのメイン実行エントリーポイント。
-pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> bool {
-    // 1. ユニット行動を1つ決定・実行
-    // AI思考ループの中で、エンジン側のフラグが更新されるのを待たずに
-    // 同一フレーム内の重複思考を避けるために、リソースで「指示済みユニット」を管理します。
-    let mut skip_entities = std::collections::HashSet::new();
-    if let Some(res) = world.get_resource::<AiActionCooldown>() {
-        skip_entities = res.0.clone();
-    }
-
-    if let Some((entity, command)) = decide_ai_action(world, active_player, &skip_entities) {
-        execute_ai_command(world, entity, command);
-        
-        // リソースを更新して、次回の呼び出しでもこのユニットをスキップするようにする
-        if let Some(mut res) = world.get_resource_mut::<AiActionCooldown>() {
-            res.0.insert(entity);
-        } else {
-            let mut set = std::collections::HashSet::new();
-            set.insert(entity);
-            world.insert_resource(AiActionCooldown(set));
-        }
-        return true; 
-    }
-
-    // 全ユニットの検討が終わったら冷却リストをクリアする（生産や次ターン移行の準備）
-    if let Some(mut res) = world.get_resource_mut::<AiActionCooldown>() {
-        res.0.clear();
-    }
-
-    // 2. 生産行動
-    let prod_commands = super::production::decide_production(world, active_player);
-    if let Some(cmd) = prod_commands.into_iter().next() {
-        if let Some(mut events) =
-            world.get_resource_mut::<Events<crate::events::ProduceUnitCommand>>()
-        {
-            events.send(cmd);
-        }
-        return true;
-    }
-
-    // 3. 全行動完了 -> ターン終了
-    if let Some(mut end_events) =
-        world.get_resource_mut::<Events<crate::events::NextPhaseCommand>>()
-    {
-        end_events.send(crate::events::NextPhaseCommand);
-    }
-    false
 }

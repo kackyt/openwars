@@ -83,38 +83,43 @@ pub fn get_available_actions_at(
         }
     };
 
-        let is_occupied_by_other = {
-            let mut q_occupants = world.query_filtered::<(Entity, &GridPosition), (With<Faction>, Without<Transporting>)>();
-            q_occupants.iter(world).any(|(e, p)| e != unit_entity && p.x == u_pos.x && p.y == u_pos.y)
-        };
+    let is_occupied_by_other = {
+        let mut q_occupants = world
+            .query_filtered::<(Entity, &GridPosition), (With<Faction>, Without<Transporting>)>();
+        q_occupants
+            .iter(world)
+            .any(|(e, p)| e != unit_entity && p.x == u_pos.x && p.y == u_pos.y)
+    };
 
-        AvailableActions {
-            can_attack: !is_occupied_by_other && !combat::get_attackable_targets_at(world, unit_entity, u_pos, !is_moved).is_empty(),
-            can_capture: !is_occupied_by_other && can_capture,
-            can_repair: !is_occupied_by_other && can_repair,
-            can_supply: !is_occupied_by_other && !supply::get_suppliable_targets_at(world, unit_entity, u_pos).is_empty(),
-            can_load,
-            can_drop: !is_occupied_by_other && {
-                let mut can_drop = false;
-                let mut q_cargo = world.query::<&CargoCapacity>();
-                if let Ok(cargo) = q_cargo.get(world, unit_entity) {
-                    for &passenger in &cargo.loaded {
-                        if let Some(action) = world.get::<ActionCompleted>(passenger)
-                            && !action.0
-                        {
-                            can_drop = true;
-                            break;
-                        }
+    AvailableActions {
+        can_attack: !is_occupied_by_other
+            && !combat::get_attackable_targets_at(world, unit_entity, u_pos, !is_moved).is_empty(),
+        can_capture: !is_occupied_by_other && can_capture,
+        can_repair: !is_occupied_by_other && can_repair,
+        can_supply: !is_occupied_by_other
+            && !supply::get_suppliable_targets_at(world, unit_entity, u_pos).is_empty(),
+        can_load,
+        can_drop: !is_occupied_by_other && {
+            let mut can_drop = false;
+            let mut q_cargo = world.query::<&CargoCapacity>();
+            if let Ok(cargo) = q_cargo.get(world, unit_entity) {
+                for &passenger in &cargo.loaded {
+                    if let Some(action) = world.get::<ActionCompleted>(passenger)
+                        && !action.0
+                    {
+                        can_drop = true;
+                        break;
                     }
                 }
-                can_drop
-            },
-            can_merge,
-            // 空きマスであるか、移動していない（元の位置に留まる）場合のみ待機可能
-            // 搭載や合流が可能なマスであっても、通常の「待機」で重なることは許さない
-            can_wait: !is_occupied_by_other || !is_moved,
-        }
+            }
+            can_drop
+        },
+        can_merge,
+        // 空きマスであるか、移動していない（元の位置に留まる）場合のみ待機可能
+        // 搭載や合流が可能なマスであっても、通常の「待機」で重なることは許さない
+        can_wait: !is_occupied_by_other || !is_moved,
     }
+}
 
 #[cfg(test)]
 mod tests {
@@ -220,27 +225,28 @@ mod tests {
         world.insert_resource(UnitRegistry(registry));
 
         // Spawn existing unit at (1,0)
-        world.spawn((
-            GridPosition { x: 1, y: 0 },
-            Faction(p1),
-            UnitStats::mock(),
-        ));
+        world.spawn((GridPosition { x: 1, y: 0 }, Faction(p1), UnitStats::mock()));
 
         // Spawn current unit at (0,0)
-        let unit = world.spawn((
-            GridPosition { x: 0, y: 0 },
-            Faction(p1),
-            UnitStats {
-                unit_type: inf_type,
-                ..UnitStats::mock()
-            },
-            ActionCompleted(false),
-        )).id();
+        let unit = world
+            .spawn((
+                GridPosition { x: 0, y: 0 },
+                Faction(p1),
+                UnitStats {
+                    unit_type: inf_type,
+                    ..UnitStats::mock()
+                },
+                ActionCompleted(false),
+            ))
+            .id();
 
         // Check actions at (1,0) after moving
         let actions = get_available_actions_at(&mut world, unit, GridPosition { x: 1, y: 0 }, true);
 
-        assert!(!actions.can_wait, "Should not be able to wait on occupied tile");
+        assert!(
+            !actions.can_wait,
+            "Should not be able to wait on occupied tile"
+        );
         // can_merge might be true depending on compatibility, but that's fine.
         // The point is can_wait must be false.
     }

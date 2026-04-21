@@ -10,7 +10,11 @@ pub fn get_mergable_targets(world: &mut World, unit: Entity) -> Vec<Entity> {
 }
 
 /// 指定された位置で合流可能な対象エンティティのリストを返します。
-pub fn get_mergable_targets_at(world: &mut World, unit: Entity, unit_pos: GridPosition) -> Vec<Entity> {
+pub fn get_mergable_targets_at(
+    world: &mut World,
+    unit: Entity,
+    unit_pos: GridPosition,
+) -> Vec<Entity> {
     let mut targets = vec![];
     let (unit_stats, unit_faction) = {
         let mut q_unit = world.query::<(&UnitStats, &Faction)>();

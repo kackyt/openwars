@@ -1,4 +1,4 @@
-use crate::components::{Faction, Health, PlayerId, Property, Transporting, UnitStats};
+use crate::components::{Faction, Health, PlayerId, Property, UnitStats};
 use bevy_ecs::prelude::*;
 
 /// 盤面の静的評価関数。
@@ -53,6 +53,7 @@ pub fn evaluate_board(world: &mut World, perspective_player: PlayerId) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::Transporting;
     use crate::resources::Terrain;
 
     #[test]

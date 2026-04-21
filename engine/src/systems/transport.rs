@@ -17,7 +17,11 @@ pub fn get_loadable_transports(world: &mut World, unit: Entity) -> Vec<Entity> {
 }
 
 /// 指定された位置でユニットを搭載可能な、輸送ユニットエンティティのリストを返します。
-pub fn get_loadable_transports_at(world: &mut World, unit: Entity, u_pos: GridPosition) -> Vec<Entity> {
+pub fn get_loadable_transports_at(
+    world: &mut World,
+    unit: Entity,
+    u_pos: GridPosition,
+) -> Vec<Entity> {
     let mut targets = vec![];
     let (u_type, unit_faction) = {
         let mut q_unit = world.query::<(&UnitStats, &Faction)>();
