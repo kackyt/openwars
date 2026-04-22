@@ -161,20 +161,19 @@ fn apply_income(
         diag.income_log.clear();
     }
 
-    let mut budget_increase = 0;
-    for (_, prop) in q_properties.iter() {
-        if prop.owner_id == Some(active_player_id) {
-            let terrain_name = prop.terrain.as_str();
-            let income = registry.landscape_income(terrain_name);
-            budget_increase += income;
-            if let Some(ref mut diag) = diagnostic {
-                diag.income_log
-                    .push(format!("{}: {}G", terrain_name, income));
-            }
-        }
+    // 1. Map & Reduce: 所有物件から合計金額を算出
+    let budget_increase: u32 = q_properties
+        .iter()
+        .filter(|(_, prop)| prop.owner_id == Some(active_player_id))
+        .map(|(_, prop)| registry.landscape_income(prop.terrain.as_str()))
+        .sum();
+
+    // 2. Diagnostic への書き込み
+    if let Some(ref mut diag) = diagnostic {
+        diag.income_log.push(format!("Total: {}G", budget_increase));
     }
 
-    // Add funds
+    // 3. プレイヤー資金への反映
     if let Some(player) = players.0.iter_mut().find(|p| p.id == active_player_id) {
         player.funds += budget_increase;
     }
