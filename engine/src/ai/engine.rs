@@ -208,13 +208,16 @@ pub fn decide_ai_action(
                     // ダメージ期待値を概算（相性とコストとHPを考慮）
                     let base_dmg = damage_chart
                         .get_base_damage(stats.unit_type, *e_type)
-                        .or_else(|| damage_chart.get_base_damage_secondary(stats.unit_type, *e_type))
+                        .or_else(|| {
+                            damage_chart.get_base_damage_secondary(stats.unit_type, *e_type)
+                        })
                         .unwrap_or(0);
-                    
+
                     // 価値 = ダメージ期待値 * ユニットコスト
                     // ※HPが低い敵ほど仕留めやすいため評価を少し上げる
-                    let potential = base_dmg as f32 * (*e_cost as f32 / 100.0) * (2.0 - *e_hp as f32 / 100.0);
-                    
+                    let potential =
+                        base_dmg as f32 * (*e_cost as f32 / 100.0) * (2.0 - *e_hp as f32 / 100.0);
+
                     if potential > max_potential {
                         max_potential = potential;
                         best_target_dist = d;
@@ -282,7 +285,7 @@ pub fn decide_ai_action(
                     }
 
                     let mut attack_score = 2000;
-                    
+
                     // ターゲットの詳細を取得してスコアを加点
                     if let (Some(t_stats), Some(t_health)) = (
                         world.get::<UnitStats>(target_entity),
@@ -290,16 +293,19 @@ pub fn decide_ai_action(
                     ) {
                         let base_dmg = damage_chart
                             .get_base_damage(stats.unit_type, t_stats.unit_type)
-                            .or_else(|| damage_chart.get_base_damage_secondary(stats.unit_type, t_stats.unit_type))
+                            .or_else(|| {
+                                damage_chart
+                                    .get_base_damage_secondary(stats.unit_type, t_stats.unit_type)
+                            })
                             .unwrap_or(0);
-                        
+
                         // 与えるダメージ量に応じた加点 (0 ~ 10000程度)
                         // ダメージ量 * 敵のコスト / 10
-                        let damage_val = (base_dmg as u32 * t_stats.cost) / 100;
+                        let damage_val = (base_dmg * t_stats.cost) / 100;
                         attack_score += damage_val as i32;
 
                         // 撃破できる場合はボーナス
-                        if base_dmg as u32 >= t_health.current {
+                        if base_dmg >= t_health.current {
                             attack_score += 5000;
                         }
                     }
@@ -727,7 +733,7 @@ mod tests {
         let p1 = PlayerId(1);
         let p2 = PlayerId(2);
 
-        // Artillery at (0,0), can move 5 tiles. 
+        // Artillery at (0,0), can move 5 tiles.
         // Max range 3, Min range 2.
         world.spawn((
             p1,
@@ -745,9 +751,20 @@ mod tests {
                 max_fuel: 99,
                 ..UnitStats::mock()
             },
-            Health { current: 100, max: 100 },
-            crate::components::Fuel { current: 99, max: 99 },
-            crate::components::Ammo { ammo1: 10, max_ammo1: 10, ammo2: 0, max_ammo2: 0 },
+            Health {
+                current: 100,
+                max: 100,
+            },
+            crate::components::Fuel {
+                current: 99,
+                max: 99,
+            },
+            crate::components::Ammo {
+                ammo1: 10,
+                max_ammo1: 10,
+                ammo2: 0,
+                max_ammo2: 0,
+            },
         ));
 
         // Tank at (7,0). Distance is 7.
@@ -762,12 +779,15 @@ mod tests {
                 cost: 7000,
                 ..UnitStats::mock()
             },
-            Health { current: 100, max: 100 },
+            Health {
+                current: 100,
+                max: 100,
+            },
         ));
 
         let skips = std::collections::HashSet::new();
         let action = decide_ai_action(&mut world, p1, &skips);
-        
+
         assert!(action.is_some());
         if let Some((_, AiCommand::Wait { target_pos, .. })) = action {
             // Should be at distance 3 from (7,0) -> x=4, y=0
@@ -814,9 +834,20 @@ mod tests {
                 max_fuel: 99,
                 ..UnitStats::mock()
             },
-            Health { current: 100, max: 100 },
-            crate::components::Fuel { current: 99, max: 99 },
-            crate::components::Ammo { ammo1: 10, max_ammo1: 10, ammo2: 0, max_ammo2: 0 },
+            Health {
+                current: 100,
+                max: 100,
+            },
+            crate::components::Fuel {
+                current: 99,
+                max: 99,
+            },
+            crate::components::Ammo {
+                ammo1: 10,
+                max_ammo1: 10,
+                ammo2: 0,
+                max_ammo2: 0,
+            },
         ));
 
         world.spawn((
@@ -828,22 +859,29 @@ mod tests {
                 cost: 7000,
                 ..UnitStats::mock()
             },
-            Health { current: 100, max: 100 },
+            Health {
+                current: 100,
+                max: 100,
+            },
         ));
 
         let skips = std::collections::HashSet::new();
         let action = decide_ai_action(&mut world, p1, &skips);
-        
+
         assert!(action.is_some());
         if let Some((_, AiCommand::Wait { target_pos })) = action {
             // Distance to (5,0) should be >= 2. (4,0) is dist 1.
-            let dist = (target_pos.x as i32 - 5).abs() + (target_pos.y as i32 - 0).abs();
-            assert!(dist >= 2, "Artillery should move away from adjacency, got pos {:?}", target_pos);
+            let dist = (target_pos.x as i32 - 5).abs() + (target_pos.y as i32).abs();
+            assert!(
+                dist >= 2,
+                "Artillery should move away from adjacency, got pos {:?}",
+                target_pos
+            );
         } else {
             // Note: In this case, Wait is expected because it can't attack after moving (indirect).
             // But it should at least move to a better position.
             if let Some((_, cmd)) = action {
-                 println!("Action: {:?}", cmd);
+                println!("Action: {:?}", cmd);
             }
         }
     }
@@ -887,9 +925,20 @@ mod tests {
                 max_fuel: 99,
                 ..UnitStats::mock()
             },
-            Health { current: 100, max: 100 },
-            crate::components::Fuel { current: 99, max: 99 },
-            crate::components::Ammo { ammo1: 10, max_ammo1: 10, ammo2: 10, max_ammo2: 10 },
+            Health {
+                current: 100,
+                max: 100,
+            },
+            crate::components::Fuel {
+                current: 99,
+                max: 99,
+            },
+            crate::components::Ammo {
+                ammo1: 10,
+                max_ammo1: 10,
+                ammo2: 10,
+                max_ammo2: 10,
+            },
         ));
 
         // Tank (P2) at (1,2)
@@ -902,12 +951,15 @@ mod tests {
                 cost: 7000,
                 ..UnitStats::mock()
             },
-            Health { current: 100, max: 100 },
+            Health {
+                current: 100,
+                max: 100,
+            },
         ));
 
         let skips = std::collections::HashSet::new();
         let action = decide_ai_action(&mut world, p1, &skips);
-        
+
         assert!(action.is_some());
         if let Some((_, AiCommand::Attack { .. })) = action {
             panic!("AI should not perform a suicidal attack (Infantry vs Tank)");

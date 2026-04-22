@@ -36,9 +36,13 @@ pub fn is_suicidal_attack(
         }
 
         // 地形防御ボーナスの取得
-        let def_terrain = map.get_terrain(def_pos.x, def_pos.y).unwrap_or(crate::resources::Terrain::Plains);
+        let def_terrain = map
+            .get_terrain(def_pos.x, def_pos.y)
+            .unwrap_or(crate::resources::Terrain::Plains);
         let def_bonus = registry.get_terrain_defense_bonus(def_terrain);
-        let atk_terrain = map.get_terrain(atk_pos.x, atk_pos.y).unwrap_or(crate::resources::Terrain::Plains);
+        let atk_terrain = map
+            .get_terrain(atk_pos.x, atk_pos.y)
+            .unwrap_or(crate::resources::Terrain::Plains);
         let atk_bonus = registry.get_terrain_defense_bonus(atk_terrain);
 
         // 与えるダメージの予測
@@ -46,7 +50,7 @@ pub fn is_suicidal_attack(
             .get_base_damage(atk_type, def_type)
             .or_else(|| damage_chart.get_base_damage_secondary(atk_type, def_type))
             .unwrap_or(0);
-        
+
         // 攻撃ダメージ計算式: (base * hp + 105) / (100 + bonus)
         // 期待値として rng 分 (+5) を加算
         let expected_damage_to_enemy = (base_damage * atk_hp + 105) / (100 + def_bonus) + 5;
@@ -63,9 +67,10 @@ pub fn is_suicidal_attack(
                 .get_base_damage(def_type, atk_type)
                 .or_else(|| damage_chart.get_base_damage_secondary(def_type, atk_type))
                 .unwrap_or(0);
-            
+
             // 防御側は攻撃を受けた時点のHPで反撃（同時解決）
-            let expected_counter_damage = (counter_base_damage * def_hp + 100) / (100 + atk_bonus) + 5;
+            let expected_counter_damage =
+                (counter_base_damage * def_hp + 100) / (100 + atk_bonus) + 5;
             let actual_counter_damage = std::cmp::min(expected_counter_damage, atk_hp);
 
             // 受ける被害価値
@@ -153,37 +158,17 @@ mod tests {
         let dc = world.resource::<DamageChart>().clone();
 
         // 1. Infantry attacking Tank is suicidal
-        assert!(is_suicidal_attack(
-            &mut world,
-            infantry,
-            tank,
-            &dc
-        ));
+        assert!(is_suicidal_attack(&mut world, infantry, tank, &dc));
 
         // 2. Artillery attacking Tank is NOT suicidal
-        assert!(!is_suicidal_attack(
-            &mut world,
-            artillery,
-            tank,
-            &dc
-        ));
+        assert!(!is_suicidal_attack(&mut world, artillery, tank, &dc));
 
         // 3. Tank attacking Infantry is NOT suicidal
-        assert!(!is_suicidal_attack(
-            &mut world,
-            tank,
-            infantry,
-            &dc
-        ));
+        assert!(!is_suicidal_attack(&mut world, tank, infantry, &dc));
 
         // 4. Missing components -> not suicidal (returns false gracefully)
         let empty_entity = world.spawn_empty().id();
-        assert!(!is_suicidal_attack(
-            &mut world,
-            empty_entity,
-            tank,
-            &dc
-        ));
+        assert!(!is_suicidal_attack(&mut world, empty_entity, tank, &dc));
 
         // 5. Zero max hp -> safely ignored (returns false)
         let bugged_unit = world
@@ -201,11 +186,6 @@ mod tests {
                 GridPosition { x: 0, y: 1 },
             ))
             .id();
-        assert!(!is_suicidal_attack(
-            &mut world,
-            bugged_unit,
-            tank,
-            &dc
-        ));
+        assert!(!is_suicidal_attack(&mut world, bugged_unit, tank, &dc));
     }
 }

@@ -128,11 +128,19 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
     let mut choice = vec![vec![None; budget + 1]; max_items + 1];
 
     for i in 1..=max_items {
+        let (_pos, terrain) = my_facilities[i - 1];
+        let terrain_name = terrain.as_str();
+
         for w in 0..=budget {
             dp[i][w] = dp[i - 1][w];
             choice[i][w] = None;
 
             for (cost, score, ut) in &production_candidates {
+                // その施設で生産可能なユニットのみを検討する
+                if !master_data.can_produce_unit(terrain_name, *ut) {
+                    continue;
+                }
+
                 let scaled_cost = (*cost / 100) as usize;
                 if scaled_cost <= w {
                     let new_score = dp[i - 1][w - scaled_cost] + score;
@@ -424,7 +432,7 @@ mod tests {
 #[cfg(test)]
 mod additional_tests {
     use super::*;
-    use crate::resources::{DamageChart, Player, Players};
+    use crate::resources::{DamageChart, Player, Players, Terrain};
 
     #[test]
     fn test_dp_selects_optimal_units() {
@@ -477,5 +485,103 @@ mod additional_tests {
 
         println!("COMMANDS: {:?}", commands);
         assert_eq!(commands.len(), 3);
+    }
+
+    #[test]
+    fn test_ai_production_air_and_navy() {
+        let mut world = World::new();
+        let p1 = PlayerId(1);
+        let master_data = MasterDataRegistry::load().unwrap();
+
+        world.insert_resource(Players(vec![Player {
+            id: p1,
+            name: "P1".to_string(),
+            funds: 50000, // 高価なユニットも買える予算
+        }]));
+
+        let mut unit_registry_map = std::collections::HashMap::new();
+        let mut damage_chart = crate::resources::DamageChart::new();
+        for (name, unit_rec) in &master_data.units {
+            let stats = master_data.create_unit_stats(name).unwrap();
+            let u_type = stats.unit_type;
+            unit_registry_map.insert(u_type, stats);
+
+            // ダメージチャートの作成
+            if let Some(weapon) = unit_rec.weapon1.as_ref().and_then(|w| {
+                master_data
+                    .weapons
+                    .get(&crate::resources::master_data::UnitName(w.clone()))
+            }) {
+                for (def_name, dmg) in &weapon.damages {
+                    if let Some(def_type) = crate::resources::UnitType::from_str(def_name) {
+                        damage_chart.insert_damage(u_type, def_type, *dmg);
+                    }
+                }
+            }
+            if let Some(weapon) = unit_rec.weapon2.as_ref().and_then(|w| {
+                master_data
+                    .weapons
+                    .get(&crate::resources::master_data::UnitName(w.clone()))
+            }) {
+                for (def_name, dmg) in &weapon.damages {
+                    if let Some(def_type) = crate::resources::UnitType::from_str(def_name) {
+                        damage_chart.insert_secondary_damage(u_type, def_type, *dmg);
+                    }
+                }
+            }
+        }
+        world.insert_resource(UnitRegistry(unit_registry_map));
+        world.insert_resource(damage_chart);
+        world.insert_resource(master_data);
+
+        // 首都 (地上部隊)
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(p1), 200),
+        ));
+        // 空港 (航空部隊)
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Property::new(Terrain::Airport, Some(p1), 200),
+        ));
+        // 港 (艦船部隊)
+        world.spawn((
+            GridPosition { x: 2, y: 0 },
+            Property::new(Terrain::Port, Some(p1), 200),
+        ));
+
+        // 敵ユニットを配置してスコアが出るようにする
+        let p2 = PlayerId(2);
+        world.spawn((
+            GridPosition { x: 5, y: 5 },
+            Faction(p2),
+            UnitStats {
+                unit_type: crate::resources::UnitType::Tank,
+                cost: 7000,
+                ..UnitStats::mock()
+            },
+        ));
+
+        let commands = decide_production(&mut world, p1);
+
+        println!("COMMANDS: {:?}", commands);
+
+        let mut has_air = false;
+        let mut has_navy = false;
+        let mut has_ground = false;
+
+        let registry = world.resource::<UnitRegistry>();
+        for cmd in &commands {
+            let stats = registry.get_stats(cmd.unit_type).unwrap();
+            match stats.movement_type {
+                crate::resources::MovementType::Air => has_air = true,
+                crate::resources::MovementType::Ship => has_navy = true,
+                _ => has_ground = true,
+            }
+        }
+
+        assert!(has_air, "空港で航空部隊が生産されるはず");
+        assert!(has_navy, "港で艦船部隊が生産されるはず");
+        assert!(has_ground, "首都で地上部隊が生産されるはず");
     }
 }
