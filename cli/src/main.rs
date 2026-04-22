@@ -177,12 +177,34 @@ where
         if app.ui_state.current_screen == app::CurrentScreen::InGame {
             let mut popup_msg = None;
             if let (Some(world), Some(schedule)) = (&mut app.world, &mut app.schedule) {
-                schedule.run(world);
-
-                use app::InGameState;
+                use app::{InGameState, PlayerControlType};
                 use bevy_ecs::event::Events;
+                use engine::ai::engine::execute_ai_turn;
                 use engine::events::{GameOverEvent, GamePhaseChangedEvent, UnitAttackedEvent};
-                use engine::resources::{GameOverCondition, Players};
+                use engine::resources::{GameOverCondition, MatchState, Players};
+
+                // AIターンの自動進行
+                if let InGameState::Normal = app.ui_state.in_game_state {
+                    let mut active_player_opt = None;
+                    if let Some(match_state) = world.get_resource::<MatchState>()
+                        && let Some(players) = world.get_resource::<Players>()
+                    {
+                        let idx = match_state.active_player_index.0;
+                        if let Some(player) = players.0.get(idx) {
+                            active_player_opt = Some(player.id);
+                        }
+                    }
+
+                    if let Some(active_player) = active_player_opt
+                        && app.ui_state.player_controls.get(&active_player.0)
+                            == Some(&PlayerControlType::Ai)
+                        && execute_ai_turn(world, active_player)
+                    {
+                        app.ui_state.in_game_state = InGameState::WaitAiAction;
+                    }
+                }
+
+                schedule.run(world);
 
                 if let Some(mut events) = world.get_resource_mut::<Events<UnitAttackedEvent>>() {
                     for ev in events.drain() {
@@ -211,6 +233,12 @@ where
                             ));
                         }
                     }
+                }
+
+                if let InGameState::WaitAiAction = app.ui_state.in_game_state {
+                    // 一定の遅延やイベント処理を待った後にNormalに戻す
+                    // （現在のアニメーションやイベント処理機構がないため即座に戻す）
+                    app.ui_state.in_game_state = InGameState::Normal;
                 }
 
                 if let Some(events) = world.get_resource::<Events<GameOverEvent>>() {

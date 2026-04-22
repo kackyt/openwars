@@ -447,3 +447,10 @@ impl UnitRegistry {
         self.0.get(&unit_type)
     }
 }
+
+#[derive(Resource, Debug, Clone, Default)]
+pub struct ProductionDiagnostic {
+    pub last_error: Option<String>,
+    pub last_event: Option<String>,
+    pub income_log: Vec<String>,
+}

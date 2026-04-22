@@ -1,9 +1,11 @@
 use bevy_ecs::prelude::*;
-use engine::components::{GridPosition, PlayerId, Property};
-use engine::resources::master_data::MasterDataRegistry;
-use engine::resources::{
-    GameOverCondition, GridTopology, Map, MatchState, Player, Players, Terrain,
+use engine::components::{
+    ActionCompleted, CargoCapacity, Faction, Fuel, GridPosition, HasMoved, Property, Transporting,
+    UnitStats,
 };
+use engine::resources::master_data::MasterDataRegistry;
+use engine::resources::{GameOverCondition, Map, MatchState, PendingMove, Players};
+use engine::setup::initialize_world_from_master_data;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CurrentScreen {
@@ -47,6 +49,7 @@ impl ActionType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InGameState {
     Normal,
+    WaitAiAction,
     UnitSelected {
         unit_entity: Entity,
         start_pos: (usize, usize),
@@ -91,23 +94,35 @@ pub enum InGameState {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayerControlType {
+    Human,
+    Ai,
+}
+
 pub struct UiState {
     pub current_screen: CurrentScreen,
     pub in_game_state: InGameState,
     pub selected_map_index: usize,
     pub available_maps: Vec<String>,
     // In-game state
+    pub player_controls: std::collections::HashMap<u32, PlayerControlType>,
     pub cursor_pos: (usize, usize),
     pub log_messages: Vec<String>,
 }
 
 impl UiState {
     pub fn new(maps: Vec<String>) -> Self {
+        let mut controls = std::collections::HashMap::new();
+        controls.insert(1, PlayerControlType::Human);
+        controls.insert(2, PlayerControlType::Ai);
+
         Self {
             current_screen: CurrentScreen::MapSelection,
             in_game_state: InGameState::Normal,
             selected_map_index: 0,
             available_maps: maps,
+            player_controls: controls,
             cursor_pos: (0, 0),
             log_messages: Vec::new(),
         }
@@ -160,6 +175,36 @@ impl App {
                 self.ui_state.selected_map_index += 1;
             }
             KeyCode::Down | KeyCode::Char('j') => {}
+            KeyCode::Char('1') => {
+                let current = self
+                    .ui_state
+                    .player_controls
+                    .get(&1)
+                    .copied()
+                    .unwrap_or(PlayerControlType::Human);
+                self.ui_state.player_controls.insert(
+                    1,
+                    match current {
+                        PlayerControlType::Human => PlayerControlType::Ai,
+                        PlayerControlType::Ai => PlayerControlType::Human,
+                    },
+                );
+            }
+            KeyCode::Char('2') => {
+                let current = self
+                    .ui_state
+                    .player_controls
+                    .get(&2)
+                    .copied()
+                    .unwrap_or(PlayerControlType::Ai);
+                self.ui_state.player_controls.insert(
+                    2,
+                    match current {
+                        PlayerControlType::Human => PlayerControlType::Ai,
+                        PlayerControlType::Ai => PlayerControlType::Human,
+                    },
+                );
+            }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 // Determine the selected map
                 let map_name = self
@@ -186,6 +231,22 @@ impl App {
     }
 
     pub fn handle_in_game_key(&mut self, key: crossterm::event::KeyEvent) {
+        // AIターンの場合は一部のキー（終了など）以外は無視する
+        if let Some(world) = &self.world
+            && let Some(match_state) = world.get_resource::<MatchState>()
+            && let Some(players) = world.get_resource::<Players>()
+            && let Some(active_player) = players.0.get(match_state.active_player_index.0)
+            && (matches!(self.ui_state.in_game_state, InGameState::Normal)
+                || matches!(self.ui_state.in_game_state, InGameState::WaitAiAction))
+            && self.ui_state.player_controls.get(&active_player.id.0)
+                == Some(&PlayerControlType::Ai)
+        {
+            match key.code {
+                crossterm::event::KeyCode::Char('q') => self.should_quit = true,
+                _ => return, // AIターン中は他の入力を無視
+            }
+        }
+
         use crossterm::event::KeyCode;
 
         match key.code {
@@ -246,7 +307,7 @@ impl App {
                 self.ui_state.in_game_state = InGameState::Normal;
             }
             InGameState::GameOverPopup { .. } => self.return_to_map_selection(),
-            InGameState::Normal => {}
+            InGameState::Normal | InGameState::WaitAiAction => {}
         }
     }
 
@@ -299,7 +360,7 @@ impl App {
                 InGameState::EventPopup { .. } | InGameState::WaitActionMenu { .. } => {}
                 _ => {
                     if let Some(world) = &self.world
-                        && let Some(map) = world.get_resource::<engine::resources::Map>()
+                        && let Some(map) = world.get_resource::<Map>()
                         && self.ui_state.cursor_pos.1 < map.height.saturating_sub(1)
                     {
                         self.ui_state.cursor_pos.1 += 1;
@@ -326,7 +387,7 @@ impl App {
                 | InGameState::EventPopup { .. } => {}
                 _ => {
                     if let Some(world) = &self.world
-                        && let Some(map) = world.get_resource::<engine::resources::Map>()
+                        && let Some(map) = world.get_resource::<Map>()
                         && self.ui_state.cursor_pos.0 < map.width.saturating_sub(1)
                     {
                         self.ui_state.cursor_pos.0 += 1;
@@ -341,6 +402,7 @@ impl App {
         let state_clone = self.ui_state.in_game_state.clone();
         match state_clone {
             InGameState::Normal => self.handle_normal_confirm(),
+            InGameState::WaitAiAction => {}
             InGameState::ActionMenu {
                 unit_entity,
                 options,
@@ -414,17 +476,17 @@ impl App {
             let cy = self.ui_state.cursor_pos.1;
 
             if let (Some(match_state), Some(players)) = (
-                world.get_resource::<engine::resources::MatchState>(),
-                world.get_resource::<engine::resources::Players>(),
+                world.get_resource::<MatchState>(),
+                world.get_resource::<Players>(),
             ) {
                 let active_player_id = players.0[match_state.active_player_index.0].id;
 
                 let mut u_query = world.query::<(
                     Entity,
-                    &engine::components::GridPosition,
-                    &engine::components::Faction,
-                    &engine::components::ActionCompleted,
-                    Option<&engine::components::HasMoved>,
+                    &GridPosition,
+                    &Faction,
+                    &ActionCompleted,
+                    Option<&HasMoved>,
                 )>();
                 for (entity, pos, faction, action_completed, has_moved) in u_query.iter(world) {
                     if pos.x == cx
@@ -442,10 +504,7 @@ impl App {
                     let mut u_stats = None;
                     let mut fuel_cur = 0;
 
-                    if let Ok((st, f)) = world
-                        .query::<(&engine::components::UnitStats, &engine::components::Fuel)>()
-                        .get(world, entity)
-                    {
+                    if let Ok((st, f)) = world.query::<(&UnitStats, &Fuel)>().get(world, entity) {
                         u_stats = Some((st.movement_type, st.max_movement, st.unit_type));
                         fuel_cur = f.current;
                     }
@@ -453,11 +512,11 @@ impl App {
                     let mut unit_positions = std::collections::HashMap::new();
                     let mut q_all = world.query::<(
                         Entity,
-                        &engine::components::GridPosition,
-                        &engine::components::Faction,
-                        &engine::components::UnitStats,
-                        Option<&engine::components::CargoCapacity>,
-                        Option<&engine::components::Transporting>,
+                        &GridPosition,
+                        &Faction,
+                        &UnitStats,
+                        Option<&CargoCapacity>,
+                        Option<&Transporting>,
                     )>();
                     for (e, p, f, s, c, t) in q_all.iter(world) {
                         if e == entity || t.is_some() {
@@ -479,7 +538,7 @@ impl App {
                     }
 
                     if let (Some(map), Some((m_type, max_mov, u_type))) =
-                        (world.get_resource::<engine::resources::Map>(), u_stats)
+                        (world.get_resource::<Map>(), u_stats)
                     {
                         reachable = engine::systems::movement::calculate_reachable_tiles(
                             map,
@@ -505,13 +564,7 @@ impl App {
                 }
 
                 let mut is_factory = false;
-                for (pos, prop) in world
-                    .query::<(
-                        &engine::components::GridPosition,
-                        &engine::components::Property,
-                    )>()
-                    .iter(world)
-                {
+                for (pos, prop) in world.query::<(&GridPosition, &Property)>().iter(world) {
                     if pos.x == cx && pos.y == cy {
                         if self
                             .master_data
@@ -562,9 +615,9 @@ impl App {
                     // 移動の取り消し
                     if let Some(world) = &mut self.world {
                         let mut moved = false;
-                        if let Some(pm) = world.get_resource::<engine::resources::PendingMove>()
+                        if let Some(pm) = world.get_resource::<PendingMove>()
                             && pm.unit_entity == ue
-                            && let Some(pos) = world.get::<engine::components::GridPosition>(ue)
+                            && let Some(pos) = world.get::<GridPosition>(ue)
                         {
                             moved = pos.x != pm.original_pos.x || pos.y != pm.original_pos.y;
                         }
@@ -589,17 +642,14 @@ impl App {
                     let mut player_funds = 0;
 
                     if let (Some(match_state), Some(players)) = (
-                        world.get_resource::<engine::resources::MatchState>(),
-                        world.get_resource::<engine::resources::Players>(),
+                        world.get_resource::<MatchState>(),
+                        world.get_resource::<Players>(),
                     ) {
                         player_funds = players.0[match_state.active_player_index.0].funds;
                     }
 
                     let mut landscape_name = None;
-                    let mut p_query = world.query::<(
-                        &engine::components::GridPosition,
-                        &engine::components::Property,
-                    )>();
+                    let mut p_query = world.query::<(&GridPosition, &Property)>();
                     for (pos, prop) in p_query.iter(world) {
                         if pos.x == self.ui_state.cursor_pos.0
                             && pos.y == self.ui_state.cursor_pos.1
@@ -643,9 +693,9 @@ impl App {
                 if let Some(entity) = unit_entity {
                     let is_moved = if let Some(world) = &mut self.world {
                         let mut moved = false;
-                        if let Some(pm) = world.get_resource::<engine::resources::PendingMove>()
+                        if let Some(pm) = world.get_resource::<PendingMove>()
                             && pm.unit_entity == entity
-                            && let Some(pos) = world.get::<engine::components::GridPosition>(entity)
+                            && let Some(pos) = world.get::<GridPosition>(entity)
                         {
                             moved = pos.x != pm.original_pos.x || pos.y != pm.original_pos.y;
                         }
@@ -697,13 +747,11 @@ impl App {
                         ActionType::Drop => {
                             let mut passengers = vec![];
                             if let Some(world) = &mut self.world
-                                && let Ok(cargo) = world
-                                    .query::<&engine::components::CargoCapacity>()
-                                    .get(world, entity)
+                                && let Ok(cargo) =
+                                    world.query::<&CargoCapacity>().get(world, entity)
                             {
                                 for &p_ent in &cargo.loaded {
-                                    if let Some(act) =
-                                        world.get::<engine::components::ActionCompleted>(p_ent)
+                                    if let Some(act) = world.get::<ActionCompleted>(p_ent)
                                         && !act.0
                                     {
                                         passengers.push(p_ent);
@@ -808,8 +856,8 @@ impl App {
         } else {
             if let Some(world) = &mut self.world
                 && let (Some(match_state), Some(players)) = (
-                    world.get_resource::<engine::resources::MatchState>(),
-                    world.get_resource::<engine::resources::Players>(),
+                    world.get_resource::<MatchState>(),
+                    world.get_resource::<Players>(),
                 )
             {
                 let active_player_id = players.0[match_state.active_player_index.0].id;
@@ -842,7 +890,7 @@ impl App {
             && let Some(world) = &self.world
         {
             for &target in targets {
-                if let Some(pos) = world.get::<engine::components::GridPosition>(target)
+                if let Some(pos) = world.get::<GridPosition>(target)
                     && pos.x == cx
                     && pos.y == cy
                 {
@@ -950,9 +998,9 @@ impl App {
         };
 
         let mut is_moved = false;
-        if let Some(pm) = world.get_resource::<engine::resources::PendingMove>()
+        if let Some(pm) = world.get_resource::<PendingMove>()
             && pm.unit_entity == unit_entity
-            && let Some(pos) = world.get::<engine::components::GridPosition>(unit_entity)
+            && let Some(pos) = world.get::<GridPosition>(unit_entity)
         {
             is_moved = pos.x != pm.original_pos.x || pos.y != pm.original_pos.y;
         }
@@ -1026,6 +1074,29 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
+        // AIモードトグルのためのホットキー ('p')
+        if let crossterm::event::KeyCode::Char('p') = key.code
+            && let Some(world) = &self.world
+            && let Some(match_state) = world.get_resource::<MatchState>()
+            && let Some(players) = world.get_resource::<Players>()
+            && let Some(active_player) = players.0.get(match_state.active_player_index.0)
+        {
+            let pid = active_player.id.0;
+            let ctrl = self
+                .ui_state
+                .player_controls
+                .entry(pid)
+                .or_insert(PlayerControlType::Human);
+            *ctrl = match *ctrl {
+                PlayerControlType::Human => PlayerControlType::Ai,
+                PlayerControlType::Ai => PlayerControlType::Human,
+            };
+            let new_ctrl = *ctrl;
+
+            self.ui_state
+                .add_log(format!("Player {} is now {:?}", pid, new_ctrl));
+        }
+
         match self.ui_state.current_screen {
             CurrentScreen::MapSelection => self.handle_map_selection_key(key),
             CurrentScreen::InGame => self.handle_in_game_key(key),
@@ -1067,127 +1138,7 @@ impl App {
         // Add game logic systems (order is managed by engine)
         add_main_game_systems(&mut schedule);
 
-        // Build UnitRegistry and DamageChart from MasterDataRegistry
-        let mut damage_chart = engine::resources::DamageChart::new();
-        for (unit_name, unit_record) in &self.master_data.units {
-            let att_type = self.master_data.unit_type_for_name(&unit_name.0)?;
-
-            if let Some(w1_name) = &unit_record.weapon1 {
-                let weapon = self
-                    .master_data
-                    .weapons
-                    .get(&engine::resources::master_data::UnitName(w1_name.clone()))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Weapon '{}' not found for unit '{}'", w1_name, unit_name.0)
-                    })?;
-
-                for (def_name, dmg) in &weapon.damages {
-                    let def_type = self.master_data.unit_type_for_name(def_name)?;
-                    damage_chart.insert_damage(att_type, def_type, *dmg);
-                }
-            }
-
-            if let Some(w2_name) = &unit_record.weapon2 {
-                let weapon = self
-                    .master_data
-                    .weapons
-                    .get(&engine::resources::master_data::UnitName(w2_name.clone()))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Weapon '{}' not found for unit '{}'", w2_name, unit_name.0)
-                    })?;
-
-                for (def_name, dmg) in &weapon.damages {
-                    let def_type = self.master_data.unit_type_for_name(def_name)?;
-                    damage_chart.insert_secondary_damage(att_type, def_type, *dmg);
-                }
-            }
-        }
-        world.insert_resource(damage_chart);
-
-        let mut unit_registry_map = std::collections::HashMap::new();
-        for name in self.master_data.units.keys() {
-            let stats = self.master_data.create_unit_stats(name)?;
-            unit_registry_map.insert(stats.unit_type, stats);
-        }
-        let unit_registry = engine::resources::UnitRegistry(unit_registry_map);
-        world.insert_resource(unit_registry);
-
-        world.insert_resource(engine::resources::GameRng::default());
-
-        if let Some(map_data) = self.master_data.get_map(&map_name) {
-            let width = map_data.width;
-            let height = map_data.height;
-            let mut ecs_map = Map::new(width, height, Terrain::Plains, GridTopology::Square);
-
-            let mut players = std::collections::HashSet::new();
-
-            for y in 0..height {
-                for x in 0..width {
-                    if let Some(cell) = map_data.get_cell(x, y) {
-                        let terrain = self.master_data.terrain_from_id(cell.terrain_id)?;
-                        let _ = ecs_map.set_terrain(x, y, terrain);
-
-                        if cell.player_id != 0 {
-                            players.insert(cell.player_id);
-                        }
-
-                        // Spawn property entity if applicable
-                        let landscape_name = terrain.as_str();
-                        let durability = self.master_data.landscape_durability(landscape_name);
-                        if durability > 0 {
-                            let owner = if cell.player_id == 0 {
-                                None
-                            } else {
-                                Some(PlayerId(cell.player_id))
-                            };
-                            world.spawn((
-                                GridPosition { x, y },
-                                Property::new(terrain, owner, durability),
-                            ));
-                        }
-                    }
-                }
-            }
-
-            world.insert_resource(ecs_map);
-            world.insert_resource(MatchState::default());
-
-            let mut player_list = vec![];
-
-            // Ensure at least Player 1 and Player 2 are in the game
-            players.insert(1);
-            players.insert(2);
-
-            for &pid in &players {
-                let mut income = 0;
-                for y in 0..height {
-                    for x in 0..width {
-                        if let Some(cell) = map_data.get_cell(x, y)
-                            && cell.player_id == pid
-                        {
-                            let landscape =
-                                self.master_data.get_landscape(cell.terrain_id).ok_or_else(
-                                    || anyhow::anyhow!("Unknown terrain ID: {:?}", cell.terrain_id),
-                                )?;
-                            // 収入判定ロジックをマスターデータ問い合わせに置換
-                            income += self.master_data.landscape_income(&landscape.name);
-                        }
-                    }
-                }
-                // --- ターンごとの収入を初期資金に付与。この処理はエンジンイベントへと移行予定だが現状維持 ---
-                let mut p = Player::new(pid, format!("Player {}", pid));
-                p.funds = income; // Give turn 1 income
-                player_list.push(p);
-            }
-            if player_list.is_empty() {
-                player_list.push(Player::new(1, "Player 1".to_string()));
-            }
-            player_list.sort_by_key(|p| p.id.0); // Ensure consistent turn order
-            world.insert_resource(Players(player_list));
-        }
-
-        // Add a master data resource so systems can access it if needed
-        world.insert_resource(self.master_data.clone());
+        let (world, schedule) = initialize_world_from_master_data(&self.master_data, &map_name)?;
 
         self.world = Some(world);
         self.schedule = Some(schedule);

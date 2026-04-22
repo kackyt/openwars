@@ -134,16 +134,27 @@ pub fn get_attackable_targets(
     attacker: Entity,
     allow_indirect: bool,
 ) -> Vec<Entity> {
+    let a_pos = *world.get::<GridPosition>(attacker).unwrap();
+    get_attackable_targets_at(world, attacker, a_pos, allow_indirect)
+}
+
+/// 指定された位置からユニットが現在攻撃可能な対象エンティティのリストを返します。
+pub fn get_attackable_targets_at(
+    world: &mut World,
+    attacker: Entity,
+    a_pos: GridPosition,
+    allow_indirect: bool,
+) -> Vec<Entity> {
     let mut targets = vec![];
 
-    let (a_pos, a_stats, unit_faction, a_ammo1, a_ammo2) = {
-        let mut q_attacker = world.query::<(&GridPosition, &UnitStats, &Faction, Option<&Ammo>)>();
-        let Ok((a_pos, a_stats, a_faction, a_ammo)) = q_attacker.get(world, attacker) else {
+    let (a_stats, unit_faction, a_ammo1, a_ammo2) = {
+        let mut q_attacker = world.query::<(&UnitStats, &Faction, Option<&Ammo>)>();
+        let Ok((a_stats, a_faction, a_ammo)) = q_attacker.get(world, attacker) else {
             return targets;
         };
         let ammo1 = a_ammo.map(|a| a.ammo1).unwrap_or(0);
         let ammo2 = a_ammo.map(|a| a.ammo2).unwrap_or(0);
-        (*a_pos, a_stats.clone(), a_faction.0, ammo1, ammo2)
+        (a_stats.clone(), a_faction.0, ammo1, ammo2)
     };
 
     let (weapon1_rec, weapon2_rec) = {

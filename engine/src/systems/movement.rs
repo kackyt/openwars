@@ -348,6 +348,7 @@ pub fn move_unit_system(
     match_state: Res<MatchState>,
     master_data: Res<crate::resources::master_data::MasterDataRegistry>,
     mut commands: Commands,
+    mut diagnostic: Option<ResMut<ProductionDiagnostic>>,
 ) {
     if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
@@ -355,6 +356,9 @@ pub fn move_unit_system(
     let active_player = players.0[match_state.active_player_index.0].id;
 
     for event in event_reader.read() {
+        if let Some(ref mut diag) = diagnostic {
+            diag.last_event = Some(format!("{:?}", event));
+        }
         let mut unit_positions = HashMap::new();
         for (e, pos, _, _, faction, stats, _, trans, cargo_opt) in q_units.iter() {
             if e != event.unit_entity && trans.is_none() {
@@ -395,7 +399,6 @@ pub fn move_unit_system(
             if has_moved.0 {
                 continue;
             }
-
             if let Some((_path, _cost, fuel_used)) = find_path_a_star(
                 &map,
                 &unit_positions,

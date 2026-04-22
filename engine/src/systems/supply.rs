@@ -11,21 +11,31 @@ use bevy_ecs::prelude::*;
 /// 3. 対象の燃料(`Fuel`)と弾薬(`Ammo`)を最大値まで回復(`resupply`)させます。
 /// 4. 補給者の `ActionCompleted` を true に設定します。
 ///
-/// 指定されたユニットが現在補給可能な対象エンティティのリストを返します。
-/// 補給能力（can_supply）を持つユニットの隣接マスにいる同勢力ユニットが対象です。
 pub fn get_suppliable_targets(world: &mut World, supplier: Entity) -> Vec<Entity> {
+    let Some(s_pos) = world.get::<GridPosition>(supplier).cloned() else {
+        return vec![];
+    };
+    get_suppliable_targets_at(world, supplier, s_pos)
+}
+
+/// 指定された位置で補給可能な対象エンティティのリストを返します。
+pub fn get_suppliable_targets_at(
+    world: &mut World,
+    supplier: Entity,
+    s_pos: GridPosition,
+) -> Vec<Entity> {
     let mut targets = vec![];
-    let (s_pos, unit_faction) = {
-        let mut q_supplier = world.query::<(&GridPosition, &UnitStats, &Faction)>();
-        let Ok((s_pos, s_stats, s_faction)) = q_supplier.get(world, supplier) else {
+    let (unit_faction, can_supply) = {
+        let mut q_supplier = world.query::<(&UnitStats, &Faction)>();
+        let Ok((s_stats, s_faction)) = q_supplier.get(world, supplier) else {
             return targets;
         };
-
-        if !s_stats.can_supply {
-            return targets;
-        }
-        (*s_pos, s_faction.0)
+        (s_faction.0, s_stats.can_supply)
     };
+
+    if !can_supply {
+        return targets;
+    }
 
     let mut q_targets = world.query_filtered::<(Entity, &GridPosition, &Faction), With<Faction>>();
     for (t_ent, t_pos, t_faction) in q_targets.iter(world) {

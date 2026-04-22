@@ -69,6 +69,8 @@ pub fn next_phase_system(
     mut players: ResMut<Players>,
     q_properties: Query<(&GridPosition, &Property)>,
     map: Res<Map>,
+    registry: Res<MasterDataRegistry>,
+    mut diagnostic: Option<ResMut<ProductionDiagnostic>>,
 ) {
     if match_state.game_over.is_some() {
         return;
@@ -106,7 +108,8 @@ pub fn next_phase_system(
             &mut players,
             &q_properties,
             &mut q_units,
-            &map,
+            &registry,
+            diagnostic.as_deref_mut(),
         );
 
         // UIへ通知 (Mainフェーズ開始のみ通知)
@@ -133,13 +136,27 @@ fn process_resupply(
         &mut Health,
         &GridPosition,
     )>,
-    _map: &Map,
+    registry: &MasterDataRegistry,
+    mut diagnostic: Option<&mut ProductionDiagnostic>,
 ) {
+    if let Some(ref mut diag) = diagnostic {
+        diag.income_log.clear();
+    }
     // Apply property resupply
     let mut owned_properties = HashSet::new();
-    let mut city_count = 0;
+    let mut budget_increase = 0;
     for (pos, prop) in q_properties.iter() {
         if prop.owner_id == Some(active_player_id) {
+            // Count for income
+            let terrain_name = prop.terrain.as_str();
+            let income = registry.landscape_income(terrain_name);
+            budget_increase += income;
+            if let Some(ref mut diag) = diagnostic {
+                diag.income_log
+                    .push(format!("{}: {}G", terrain_name, income));
+            }
+
+            // Collect for resupply check
             if prop.terrain == Terrain::City
                 || prop.terrain == Terrain::Airport
                 || prop.terrain == Terrain::Factory
@@ -148,14 +165,10 @@ fn process_resupply(
             {
                 owned_properties.insert((pos.x, pos.y));
             }
-            if prop.terrain == Terrain::City || prop.terrain == Terrain::Airport {
-                city_count += 1;
-            }
         }
     }
 
     // Add funds
-    let budget_increase = city_count * 1000;
     let active_player_idx = players
         .0
         .iter()
@@ -164,19 +177,34 @@ fn process_resupply(
     players.0[active_player_idx].funds += budget_increase;
 
     // Property resupply
-    for (_, _, _, faction, stats, mut fuel, mut ammo, hp, pos) in q_units.iter_mut() {
+    for (_, _, _, faction, stats, mut fuel, mut ammo, mut hp, pos) in q_units.iter_mut() {
         if faction.0 == active_player_id {
             // 日次更新 (燃料消費、墜落判定) は next_phase_system でラウンド単位で行われるためここでは削除
             if hp.is_destroyed() {
                 continue;
             }
             if owned_properties.contains(&(pos.x, pos.y)) {
+                // 回復・補充にかかるコストを計算
+                // HP回復（最大20回復）
+                let hp_to_restore = 20.min(hp.max.saturating_sub(hp.current));
+                let repair_cost = (stats.cost as f32 * (hp_to_restore as f32 / 100.0)) as u32;
+
                 let ammo_diff = (stats.max_ammo1.saturating_sub(ammo.ammo1))
                     + (stats.max_ammo2.saturating_sub(ammo.ammo2));
                 let fuel_diff = stats.max_fuel.saturating_sub(fuel.current);
-                let cost = ammo_diff * 15 + fuel_diff * 5;
-                if players.0[active_player_idx].funds >= cost {
-                    players.0[active_player_idx].funds -= cost;
+                let resupply_cost = ammo_diff * 15 + fuel_diff * 5;
+
+                let total_cost = repair_cost + resupply_cost;
+
+                if players.0[active_player_idx].funds >= total_cost && total_cost > 0 {
+                    players.0[active_player_idx].funds -= total_cost;
+                    hp.current = (hp.current + hp_to_restore).min(hp.max);
+                    fuel.current = stats.max_fuel;
+                    ammo.ammo1 = stats.max_ammo1;
+                    ammo.ammo2 = stats.max_ammo2;
+                } else if players.0[active_player_idx].funds >= resupply_cost && resupply_cost > 0 {
+                    // 資金不足で修理はできないが、補給だけはできる場合
+                    players.0[active_player_idx].funds -= resupply_cost;
                     fuel.current = stats.max_fuel;
                     ammo.ammo1 = stats.max_ammo1;
                     ammo.ammo2 = stats.max_ammo2;
@@ -225,6 +253,7 @@ mod tests {
             Player::new(2, "P2".to_string()),
         ]));
         world.insert_resource(Map::new(5, 5, Terrain::Plains, GridTopology::Square));
+        world.insert_resource(MasterDataRegistry::load().unwrap());
         world.init_resource::<Events<NextPhaseCommand>>();
         world.init_resource::<Events<GamePhaseChangedEvent>>();
 
