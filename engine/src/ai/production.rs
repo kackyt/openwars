@@ -98,11 +98,9 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                 let infantry_shortage_bonus = infantry_cost;
                 score += (10 - my_infantry_count) * infantry_shortage_bonus;
             }
-            if *ut == UnitType::Infantry {
-                score += 500;
-            } else {
-                score += 700;
-            }
+            // 軽歩兵と重歩兵の基礎スコアを、ユニットの機動力（移動力）と潜在的な戦闘力（コスト）のバランスから動的に算出する
+            // 軽歩兵は移動力が高いこと、重歩兵はコストが高いこと（戦闘力に比例）が評価に反映される
+            score += stats.max_movement * 100 + (stats.cost / 10);
         }
 
         let mut combat_score = 0;
