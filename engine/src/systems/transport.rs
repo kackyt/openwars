@@ -441,19 +441,11 @@ mod tests {
                 ActionCompleted(false),
                 UnitStats {
                     unit_type: UnitType::TransportHelicopter,
-                    cost: 5000,
-                    max_movement: 6,
-                    movement_type: MovementType::Air,
                     max_fuel: 99,
-                    max_ammo1: 0,
-                    max_ammo2: 0,
-                    min_range: 1,
-                    max_range: 1,
                     daily_fuel_consumption: 2,
-                    can_capture: false,
-                    can_supply: false,
                     max_cargo: 2,
                     loadable_unit_types: vec![UnitType::Infantry],
+                    ..UnitStats::mock()
                 },
                 CargoCapacity {
                     max: 2,
@@ -469,19 +461,10 @@ mod tests {
                 ActionCompleted(false),
                 UnitStats {
                     unit_type: UnitType::Infantry,
-                    cost: 1000,
-                    max_movement: 3,
-                    movement_type: MovementType::Infantry,
                     max_fuel: 99,
                     max_ammo1: 9,
-                    max_ammo2: 0,
-                    min_range: 1,
-                    max_range: 1,
-                    daily_fuel_consumption: 0,
                     can_capture: true,
-                    can_supply: false,
-                    max_cargo: 0,
-                    loadable_unit_types: vec![],
+                    ..UnitStats::mock()
                 },
             ))
             .id();

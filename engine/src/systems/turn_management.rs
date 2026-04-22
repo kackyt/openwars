@@ -229,10 +229,11 @@ fn apply_unit_resupply(
                 let hp_to_restore = 20.min(hp.max.saturating_sub(hp.current));
                 let repair_cost = stats.cost * hp_to_restore / 100;
 
-                let ammo_diff = (stats.max_ammo1.saturating_sub(ammo.ammo1))
-                    + (stats.max_ammo2.saturating_sub(ammo.ammo2));
+                let ammo1_diff = stats.max_ammo1.saturating_sub(ammo.ammo1);
+                let ammo2_diff = stats.max_ammo2.saturating_sub(ammo.ammo2);
                 let fuel_diff = stats.max_fuel.saturating_sub(fuel.current);
-                let resupply_cost = ammo_diff * 15 + fuel_diff * 5;
+                let resupply_cost =
+                    ammo1_diff * stats.ammo1_cost + ammo2_diff * stats.ammo2_cost + fuel_diff * 5;
 
                 let total_cost = repair_cost + resupply_cost;
 
@@ -481,5 +482,82 @@ mod tests {
         assert!(!p1_action.0, "P1 unit should be reset");
         assert!(!p2_moved.0, "P2 unit should be reset");
         assert!(!p2_action.0, "P2 unit should be reset");
+    }
+
+    #[test]
+    fn test_resupply_cost_calculation() {
+        let (mut world, mut schedule) = setup_world();
+
+        // P1 starts with 10000 funds
+        {
+            let mut players = world.resource_mut::<Players>();
+            players.0[0].funds = 10000;
+        }
+
+        // City for P1 at (0, 0)
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::City, Some(PlayerId(1)), 200),
+        ));
+
+        // Heavy Tank for P1 at city (0, 0)
+        let tank = world
+            .spawn((
+                GridPosition { x: 0, y: 0 },
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::TankZ,
+                    cost: 16000,
+                    max_fuel: 50,
+                    max_ammo1: 8,
+                    ammo1_cost: 50, // 1発 50G
+                    max_ammo2: 0,
+                    ..UnitStats::mock()
+                },
+                Fuel {
+                    current: 40, // 10 diff * 5G = 50G
+                    max: 50,
+                },
+                Health {
+                    current: 80, // 20 diff -> 3200G
+                    max: 100,
+                },
+                Ammo {
+                    ammo1: 4, // 4 diff * 50G = 200G
+                    max_ammo1: 8,
+                    ammo2: 0,
+                    max_ammo2: 0,
+                },
+                HasMoved(false),
+                ActionCompleted(false),
+            ))
+            .id();
+
+        // Phase 1: P1 Main -> P2 Main
+        world.send_event(NextPhaseCommand);
+        schedule.run(&mut world);
+
+        // Phase 2: P2 Main -> P1 Main (Resupply happens here)
+        world.send_event(NextPhaseCommand);
+        schedule.run(&mut world);
+
+        // Expected costs:
+        // Repair: 16000 * 20 / 100 = 3200
+        // Fuel: (50-40) * 5 = 50
+        // Ammo: (8-4) * 50 = 200
+        // Total cost: 3450
+        // Income: 1000 (from 1 city)
+        // Funds: 10000 + 1000 - 3450 = 7550
+
+        let player1 = &world.resource::<Players>().0[0];
+        assert_eq!(player1.funds, 7550);
+
+        // Check if unit is restored
+        let hp = world.get::<Health>(tank).unwrap();
+        assert_eq!(hp.current, 100);
+        let fuel = world.get::<Fuel>(tank).unwrap();
+        assert_eq!(fuel.current, 50);
+        let ammo = world.get::<Ammo>(tank).unwrap();
+        assert_eq!(ammo.ammo1, 8);
     }
 }

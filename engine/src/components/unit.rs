@@ -29,7 +29,7 @@ impl Damagable for Health {
     }
 }
 
-#[derive(Component, Debug, Clone, PartialEq, Eq)]
+#[derive(Component, Debug, Clone, PartialEq, Eq, Default)]
 pub struct UnitStats {
     /// ユニットの種類（歩兵、戦車など）
     pub unit_type: crate::resources::UnitType,
@@ -43,8 +43,12 @@ pub struct UnitStats {
     pub max_fuel: u32,
     /// 武器1の最大弾薬数
     pub max_ammo1: u32,
+    /// 武器1の補給価格（1発あたり）
+    pub ammo1_cost: u32,
     /// 武器2の最大弾薬数
     pub max_ammo2: u32,
+    /// 武器2の補給価格（1発あたり）
+    pub ammo2_cost: u32,
     /// 最小射程
     pub min_range: u32,
     /// 最大射程
@@ -71,7 +75,9 @@ impl UnitStats {
             movement_type: crate::resources::MovementType::Infantry,
             max_fuel: 0,
             max_ammo1: 0,
+            ammo1_cost: 0,
             max_ammo2: 0,
+            ammo2_cost: 0,
             min_range: 0,
             max_range: 0,
             daily_fuel_consumption: 0,
