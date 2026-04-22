@@ -165,35 +165,44 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
 
             let mut place_score: isize = 0;
 
-            let dist = |p1: &GridPosition, p2: &GridPosition| {
-                (p1.x as isize - p2.x as isize).abs() + (p1.y as isize - p2.y as isize).abs()
-            };
+            let stats = unit_registry.get_stats(ut).unwrap();
+            let max_movement = std::cmp::max(1, stats.max_movement) as isize;
+            let max_range = stats.max_range as isize;
+
+            // ユニットの機動力と移動コストを加味して到達ターン数を近似する
+            // 本格的な経路探索は重いため、対象までの直線距離(マンハッタン)に対し、平地(Plains)の移動コストを掛けて概算する
+            let plains_cost = master_data
+                .get_movement_cost(stats.movement_type, "平地")
+                .unwrap_or(1) as isize;
+            let avg_move_cost = plains_cost;
 
             if ut == UnitType::Infantry || ut == UnitType::Mech {
-                let mut min_dist = isize::MAX;
+                let mut min_turns = isize::MAX;
                 for unowned_pos in &unowned_properties {
-                    let d = dist(pos, unowned_pos);
-                    if d < min_dist {
-                        min_dist = d;
+                    let dist = (pos.x as isize - unowned_pos.x as isize).abs()
+                        + (pos.y as isize - unowned_pos.y as isize).abs();
+                    // 拠点に到達するまでのターン数を計算 (切り上げ)
+                    let turns = std::cmp::max(1, ((dist * avg_move_cost) + max_movement - 1) / max_movement);
+                    if turns < min_turns {
+                        min_turns = turns;
                     }
                 }
-                if min_dist != isize::MAX {
-                    // 距離が近いほど高い評価を与える（最大1000点、1マス離れるごとに10点減点）
-                    // 1000点は初期の歩兵ボーナスと同等スケールにするための基準値
-                    let infantry_cost = unit_registry
-                        .get_stats(UnitType::Infantry)
-                        .map(|s| s.cost)
-                        .unwrap_or(1000) as isize;
-                    // 距離が近いほど高い評価を与える（最大コストと同等、1マス離れるごとに10点減点）
-                    let max_place_score = infantry_cost;
-                    const DISTANCE_PENALTY: isize = 10;
-                    place_score += max_place_score - (min_dist * DISTANCE_PENALTY);
+                if min_turns != isize::MAX {
+                    let infantry_cost = stats.cost as isize;
+                    // 到達ターン数で評価値を割り引く（1ターンの場合は期待値/1, 2ターンの場合は期待値/2）
+                    place_score += infantry_cost / min_turns;
                 }
             } else {
                 let mut combat_place_score = 0;
                 for (enemy_pos, enemy_stats) in &enemy_units {
-                    let d = dist(pos, enemy_pos);
-                    let d = if d == 0 { 1 } else { d };
+                    let dist = (pos.x as isize - enemy_pos.x as isize).abs()
+                        + (pos.y as isize - enemy_pos.y as isize).abs();
+                    // 遠距離ユニットの場合は射程に入るまでの距離で計算する
+                    let target_dist = std::cmp::max(0, dist - max_range);
+                    // 射程に入るまでのターン数を計算 (切り上げ)
+                    let turns =
+                        std::cmp::max(1, ((target_dist * avg_move_cost) + max_movement - 1) / max_movement);
+
                     let base_dmg = damage_chart
                         .get_base_damage(ut, enemy_stats.unit_type)
                         .unwrap_or(0);
@@ -203,8 +212,10 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                     let max_dmg = std::cmp::max(base_dmg, sec_dmg);
 
                     if max_dmg > 0 {
-                        combat_place_score +=
-                            ((max_dmg as isize * enemy_stats.cost as isize) / 100) / d;
+                        // 基礎期待値を到達ターン数で割り引いて評価する
+                        let base_expected_value =
+                            (max_dmg as isize * enemy_stats.cost as isize) / 100;
+                        combat_place_score += base_expected_value / turns;
                     }
                 }
                 place_score += combat_place_score;
