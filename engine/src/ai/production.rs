@@ -25,7 +25,9 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
         return commands;
     };
 
-    let available_funds = current_funds.saturating_sub(1000);
+    // 補充や修理のための予備資金として1000Gを残す
+    const RESERVE_FUNDS: u32 = 1000;
+    let available_funds = current_funds.saturating_sub(RESERVE_FUNDS);
 
     let (unit_registry, damage_chart, master_data) = {
         let ur = world.get_resource::<UnitRegistry>().cloned();
@@ -87,7 +89,9 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
 
         if *ut == UnitType::Infantry || *ut == UnitType::Mech {
             if my_infantry_count < 10 {
-                score += (10 - my_infantry_count) * 1000;
+                // 歩兵が足りない場合、1体につき1000点（歩兵の標準コスト相当）のボーナスを与えて生産を促進する
+                const INFANTRY_SHORTAGE_BONUS: u32 = 1000;
+                score += (10 - my_infantry_count) * INFANTRY_SHORTAGE_BONUS;
             }
             if *ut == UnitType::Infantry {
                 score += 500;
@@ -147,29 +151,33 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
 
     for ut in selected_units {
         let mut best_facility_idx = None;
-        let mut best_place_score = -1;
+        let mut best_place_score: isize = -1;
 
         for (idx, (pos, _terrain)) in my_facilities.iter().enumerate() {
             if can_produce_at(world, player_id, pos.x, pos.y, ut, &master_data).is_err() {
                 continue;
             }
 
-            let mut place_score = 0;
+            let mut place_score: isize = 0;
 
             let dist = |p1: &GridPosition, p2: &GridPosition| {
                 (p1.x as isize - p2.x as isize).abs() + (p1.y as isize - p2.y as isize).abs()
             };
 
             if ut == UnitType::Infantry || ut == UnitType::Mech {
-                let mut min_dist = 999;
+                let mut min_dist = isize::MAX;
                 for unowned_pos in &unowned_properties {
                     let d = dist(pos, unowned_pos);
                     if d < min_dist {
                         min_dist = d;
                     }
                 }
-                if min_dist < 999 {
-                    place_score += 1000 - min_dist * 10;
+                if min_dist != isize::MAX {
+                    // 距離が近いほど高い評価を与える（最大1000点、1マス離れるごとに10点減点）
+                    // 1000点は初期の歩兵ボーナスと同等スケールにするための基準値
+                    const MAX_PLACE_SCORE: isize = 1000;
+                    const DISTANCE_PENALTY: isize = 10;
+                    place_score += MAX_PLACE_SCORE - (min_dist * DISTANCE_PENALTY);
                 }
             } else {
                 let mut combat_place_score = 0;
