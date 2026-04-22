@@ -182,7 +182,10 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                     let dist = (pos.x as isize - unowned_pos.x as isize).abs()
                         + (pos.y as isize - unowned_pos.y as isize).abs();
                     // 拠点に到達するまでのターン数を計算 (切り上げ)
-                    let turns = std::cmp::max(1, ((dist * avg_move_cost) + max_movement - 1) / max_movement);
+                    let turns = std::cmp::max(
+                        1,
+                        ((dist * avg_move_cost) + max_movement - 1) / max_movement,
+                    );
                     if turns < min_turns {
                         min_turns = turns;
                     }
@@ -200,8 +203,10 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                     // 遠距離ユニットの場合は射程に入るまでの距離で計算する
                     let target_dist = std::cmp::max(0, dist - max_range);
                     // 射程に入るまでのターン数を計算 (切り上げ)
-                    let turns =
-                        std::cmp::max(1, ((target_dist * avg_move_cost) + max_movement - 1) / max_movement);
+                    let turns = std::cmp::max(
+                        1,
+                        ((target_dist * avg_move_cost) + max_movement - 1) / max_movement,
+                    );
 
                     let base_dmg = damage_chart
                         .get_base_damage(ut, enemy_stats.unit_type)
