@@ -48,80 +48,141 @@ fn run_daily_update_for_all(
 }
 
 /// フェーズの進行、ターンの切り替え、拠点による資金増加と自動補給を管理します。
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::type_complexity)]
 pub fn next_phase_system(
-    mut commands: Commands,
-    mut match_state: ResMut<MatchState>,
     mut next_phase_events: EventReader<NextPhaseCommand>,
-    mut phase_changed_events: EventWriter<GamePhaseChangedEvent>,
-    mut q_units: Query<(
-        Entity,
-        &mut HasMoved,
-        &mut ActionCompleted,
-        &Faction,
-        &UnitStats,
-        &mut Fuel,
-        &mut Ammo,
-        &mut Health,
-        &GridPosition,
-    )>,
-    mut players: ResMut<Players>,
-    q_properties: Query<(&GridPosition, &Property)>,
-    map: Res<Map>,
-    registry: Res<MasterDataRegistry>,
-    mut diagnostic: Option<ResMut<ProductionDiagnostic>>,
+    mut commands: Commands,
 ) {
-    if match_state.game_over.is_some() {
-        return;
-    }
-
     for _ in next_phase_events.read() {
-        // ターン終了命令受信時に全ユニットの状態をリセット
-        for (_, mut has_moved, mut action_completed, _, _, _, _, _, _) in q_units.iter_mut() {
-            has_moved.0 = false;
-            action_completed.0 = false;
-        }
-
-        // 移動履歴を強制削除 (ターン終了時は移動中であってはならない)
-        commands.remove_resource::<PendingMove>();
-        // 常に次のプレイヤーの Main フェーズまで一気に進めます。
-        // これまでは EndTurn フェーズで止まっていましたが、2回クリックが必要になるためアトミック化します。
-
-        match_state.active_player_index.0 += 1;
-
-        // プレイヤー一周による日次更新
-        if match_state.active_player_index.0 >= players.0.len() {
-            match_state.active_player_index.0 = 0;
-            match_state.current_turn_number.0 += 1;
-
-            // 全ユニットの日次更新（燃料消費・墜落）を実行
-            run_daily_update_for_all(&mut q_units, &map);
-        }
-
-        match_state.current_phase = Phase::Main;
-        let active_player_id = players.0[match_state.active_player_index.0].id;
-
-        // 次のプレイヤーの補給、資金増加
-        process_resupply(
-            active_player_id,
-            &mut players,
-            &q_properties,
-            &mut q_units,
-            &registry,
-            diagnostic.as_deref_mut(),
-        );
-
-        // UIへ通知 (Mainフェーズ開始のみ通知)
-        phase_changed_events.send(GamePhaseChangedEvent {
-            new_phase: Phase::Main,
-            active_player: active_player_id,
+        commands.queue(|world: &mut World| {
+            advance_next_phase(world);
         });
     }
 }
 
+/// 次のフェーズ、または次のプレイヤーのターンへ移行させます。
+/// この関数はシステム内から、あるいは初期化時などに直接呼び出すことができます。
 #[allow(clippy::type_complexity)]
-fn process_resupply(
+pub fn advance_next_phase(world: &mut World) {
+    use bevy_ecs::system::SystemState;
+
+    let mut system_state: SystemState<(
+        Commands,
+        ResMut<MatchState>,
+        Query<(
+            Entity,
+            &mut HasMoved,
+            &mut ActionCompleted,
+            &Faction,
+            &UnitStats,
+            &mut Fuel,
+            &mut Ammo,
+            &mut Health,
+            &GridPosition,
+        )>,
+        ResMut<Players>,
+        Query<(&GridPosition, &Property)>,
+        Res<Map>,
+        Res<MasterDataRegistry>,
+        Option<ResMut<ProductionDiagnostic>>,
+        EventWriter<GamePhaseChangedEvent>,
+    )> = SystemState::new(world);
+
+    let (
+        mut commands,
+        mut match_state,
+        mut q_units,
+        mut players,
+        q_properties,
+        map,
+        registry,
+        mut diagnostic,
+        mut phase_changed_events,
+    ) = system_state.get_mut(world);
+
+    if match_state.game_over.is_some() {
+        return;
+    }
+
+    // 1. 全ユニットの状態をリセット
+    for (_, mut has_moved, mut action_completed, _, _, _, _, _, _) in q_units.iter_mut() {
+        has_moved.0 = false;
+        action_completed.0 = false;
+    }
+
+    // 2. 移動履歴を強制削除 (ターン終了時は移動中であってはならない)
+    commands.remove_resource::<PendingMove>();
+
+    // 3. プレイヤーの切り替え
+    match_state.active_player_index.0 += 1;
+
+    // 4. プレイヤー一周による日次更新
+    if match_state.active_player_index.0 >= players.0.len() {
+        match_state.active_player_index.0 = 0;
+        match_state.current_turn_number.0 += 1;
+
+        // 全ユニットの日次更新（燃料消費・墜落）を実行
+        run_daily_update_for_all(&mut q_units, &map);
+    }
+
+    match_state.current_phase = Phase::Main;
+    let active_player_id = players.0[match_state.active_player_index.0].id;
+
+    // 5. 資金増加
+    apply_income(
+        active_player_id,
+        &mut players,
+        &q_properties,
+        &registry,
+        diagnostic.as_deref_mut(),
+    );
+
+    // 6. ユニット補給
+    apply_unit_resupply(active_player_id, &mut players, &q_properties, &mut q_units);
+
+    // 7. UIへ通知 (Mainフェーズ開始のみ通知)
+    phase_changed_events.send(GamePhaseChangedEvent {
+        new_phase: Phase::Main,
+        active_player: active_player_id,
+    });
+
+    // 変更をワールドに適用（Commandsの実行など）
+    system_state.apply(world);
+}
+
+/// プレイヤーの所有物件に基づいて資金を増加させます。
+fn apply_income(
+    active_player_id: PlayerId,
+    players: &mut Players,
+    q_properties: &Query<(&GridPosition, &Property)>,
+    registry: &MasterDataRegistry,
+    mut diagnostic: Option<&mut ProductionDiagnostic>,
+) {
+    if let Some(ref mut diag) = diagnostic {
+        diag.income_log.clear();
+    }
+
+    let mut budget_increase = 0;
+    for (_, prop) in q_properties.iter() {
+        if prop.owner_id == Some(active_player_id) {
+            let terrain_name = prop.terrain.as_str();
+            let income = registry.landscape_income(terrain_name);
+            budget_increase += income;
+            if let Some(ref mut diag) = diagnostic {
+                diag.income_log
+                    .push(format!("{}: {}G", terrain_name, income));
+            }
+        }
+    }
+
+    // Add funds
+    if let Some(player) = players.0.iter_mut().find(|p| p.id == active_player_id) {
+        player.funds += budget_increase;
+    }
+}
+
+/// プレイヤーの所有物件に滞在しているユニットの補給（燃料・弾薬・HP回復）を行います。
+#[allow(clippy::type_complexity)]
+fn apply_unit_resupply(
     active_player_id: PlayerId,
     players: &mut Players,
     q_properties: &Query<(&GridPosition, &Property)>,
@@ -136,58 +197,38 @@ fn process_resupply(
         &mut Health,
         &GridPosition,
     )>,
-    registry: &MasterDataRegistry,
-    mut diagnostic: Option<&mut ProductionDiagnostic>,
 ) {
-    if let Some(ref mut diag) = diagnostic {
-        diag.income_log.clear();
-    }
-    // Apply property resupply
-    let mut owned_properties = HashSet::new();
-    let mut budget_increase = 0;
+    // 補給可能な物件の座標を収集
+    let mut resupply_tiles = HashSet::new();
     for (pos, prop) in q_properties.iter() {
-        if prop.owner_id == Some(active_player_id) {
-            // Count for income
-            let terrain_name = prop.terrain.as_str();
-            let income = registry.landscape_income(terrain_name);
-            budget_increase += income;
-            if let Some(ref mut diag) = diagnostic {
-                diag.income_log
-                    .push(format!("{}: {}G", terrain_name, income));
-            }
-
-            // Collect for resupply check
-            if prop.terrain == Terrain::City
+        if prop.owner_id == Some(active_player_id)
+            && (prop.terrain == Terrain::City
                 || prop.terrain == Terrain::Airport
                 || prop.terrain == Terrain::Factory
                 || prop.terrain == Terrain::Port
-                || prop.terrain == Terrain::Capital
-            {
-                owned_properties.insert((pos.x, pos.y));
-            }
+                || prop.terrain == Terrain::Capital)
+        {
+            resupply_tiles.insert((pos.x, pos.y));
         }
     }
 
-    // Add funds
     let active_player_idx = players
         .0
         .iter()
         .position(|p| p.id == active_player_id)
         .unwrap();
-    players.0[active_player_idx].funds += budget_increase;
 
-    // Property resupply
+    // 物件補給の実行
     for (_, _, _, faction, stats, mut fuel, mut ammo, mut hp, pos) in q_units.iter_mut() {
         if faction.0 == active_player_id {
-            // 日次更新 (燃料消費、墜落判定) は next_phase_system でラウンド単位で行われるためここでは削除
             if hp.is_destroyed() {
                 continue;
             }
-            if owned_properties.contains(&(pos.x, pos.y)) {
+            if resupply_tiles.contains(&(pos.x, pos.y)) {
                 // 回復・補充にかかるコストを計算
                 // HP回復（最大20回復）
                 let hp_to_restore = 20.min(hp.max.saturating_sub(hp.current));
-                let repair_cost = (stats.cost as f32 * (hp_to_restore as f32 / 100.0)) as u32;
+                let repair_cost = stats.cost * hp_to_restore / 100;
 
                 let ammo_diff = (stats.max_ammo1.saturating_sub(ammo.ammo1))
                     + (stats.max_ammo2.saturating_sub(ammo.ammo2));

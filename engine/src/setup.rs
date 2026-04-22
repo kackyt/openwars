@@ -176,7 +176,6 @@ pub fn initialize_world_from_master_data(
         }
     }
     world.insert_resource(ecs_map);
-    world.insert_resource(MatchState::default());
 
     let mut player_list = vec![];
     // P1, P2 は最低限保証
@@ -184,24 +183,23 @@ pub fn initialize_world_from_master_data(
     players_set.insert(2);
 
     for &pid in &players_set {
-        let mut income = 0;
-        for y in 0..map_data.height {
-            for x in 0..map_data.width {
-                if let Some(cell) = map_data.get_cell(x, y).filter(|c| c.player_id == pid) {
-                    let terrain = master_data
-                        .terrain_from_id(cell.terrain_id)
-                        .map_err(|e| SetupError::MasterData(format!("{:?}", e)))?;
-                    income += master_data.landscape_income(terrain.as_str());
-                }
-            }
-        }
-        let mut p = Player::new(pid, format!("Player {}", pid));
-        p.funds = income; // 初期収入を付与
+        let p = Player::new(pid, format!("Player {}", pid));
         player_list.push(p);
     }
     player_list.sort_by_key(|p| p.id.0);
+
+    let player_count = player_list.len();
     world.insert_resource(Players(player_list));
+    world.insert_resource(MatchState {
+        current_turn_number: TurnNumber(0),
+        active_player_index: PlayerIndex(player_count - 1),
+        current_phase: Phase::EndTurn,
+        game_over: None,
+    });
     world.insert_resource(master_data.clone());
+
+    // 最初（Turn 1, P1）のターン開始処理（資金付与・補給など）を直接実行します。
+    crate::systems::turn_management::advance_next_phase(&mut world);
 
     Ok((world, schedule))
 }
