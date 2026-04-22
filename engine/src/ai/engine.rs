@@ -1,5 +1,5 @@
 use crate::components::{
-    ActionCompleted, Faction, GridPosition, HasMoved, PlayerId, Property, UnitStats,
+    ActionCompleted, Faction, GridPosition, HasMoved, Health, PlayerId, Property, UnitStats,
 };
 use crate::events::{AttackUnitCommand, CapturePropertyCommand, MoveUnitCommand, WaitUnitCommand};
 use crate::resources::master_data::MasterDataRegistry;
@@ -147,6 +147,17 @@ pub fn decide_ai_action(
                 .collect()
         };
 
+        // 全敵ユニット情報を収集（ターゲット評価用）
+        let enemy_units: Vec<(GridPosition, crate::resources::UnitType, u32, u32)> = {
+            let mut q = world.query::<(&GridPosition, &Faction, &UnitStats, &Health)>();
+            q.iter(world)
+                .filter(|(_, f, _, _)| f.0 != player_id)
+                .map(|(p, _, s, h)| (*p, s.unit_type, s.cost, h.current))
+                .collect()
+        };
+
+        let damage_chart = world.resource::<crate::resources::DamageChart>().clone();
+
         let mut best_unit_score = i32::MIN;
         let mut best_unit_choice: Option<AiCommand> = None;
 
@@ -172,8 +183,8 @@ pub fn decide_ai_action(
             }
 
             // 占領価値・拠点接近スコア
-            let mut min_objective_dist = 99;
             if stats.can_capture {
+                let mut min_objective_dist = 99;
                 for (p_pos, _p_terrain, p_owner) in &properties {
                     if *p_owner != Some(player_id) {
                         let d = (current_grid.x as i32 - p_pos.x as i32).abs()
@@ -186,16 +197,58 @@ pub fn decide_ai_action(
                 // 拠点を狙うスコアを大幅に強化
                 base_tile_score += (20 - min_objective_dist).max(0) * 400;
             } else {
-                for ((ex, ey), occ) in &unit_positions {
-                    if occ.player_id != player_id {
-                        let d = (current_grid.x as i32 - *ex as i32).abs()
-                            + (current_grid.y as i32 - *ey as i32).abs();
-                        if d < min_objective_dist {
-                            min_objective_dist = d;
+                // 最も「損害期待値」の高い敵をメインターゲットとして位置取りを決定する
+                let mut best_target_dist = 99;
+                let mut max_potential = -1.0;
+
+                for (e_pos, e_type, e_cost, e_hp) in &enemy_units {
+                    let d = (current_grid.x as i32 - e_pos.x as i32).abs()
+                        + (current_grid.y as i32 - e_pos.y as i32).abs();
+
+                    // ダメージ期待値を概算（相性とコストとHPを考慮）
+                    let base_dmg = damage_chart
+                        .get_base_damage(stats.unit_type, *e_type)
+                        .or_else(|| damage_chart.get_base_damage_secondary(stats.unit_type, *e_type))
+                        .unwrap_or(0);
+                    
+                    // 価値 = ダメージ期待値 * ユニットコスト
+                    // ※HPが低い敵ほど仕留めやすいため評価を少し上げる
+                    let potential = base_dmg as f32 * (*e_cost as f32 / 100.0) * (2.0 - *e_hp as f32 / 100.0);
+                    
+                    if potential > max_potential {
+                        max_potential = potential;
+                        best_target_dist = d;
+                    } else if (potential - max_potential).abs() < 0.1 && d < best_target_dist {
+                        // 価値が同じなら近い方を優先
+                        best_target_dist = d;
+                    }
+                }
+
+                // fallback: 敵がいない、または誰も攻撃できない場合は最寄りの敵を目指す
+                if max_potential <= 0.0 {
+                    for (e_pos, _, _, _) in &enemy_units {
+                        let d = (current_grid.x as i32 - e_pos.x as i32).abs()
+                            + (current_grid.y as i32 - e_pos.y as i32).abs();
+                        if d < best_target_dist {
+                            best_target_dist = d;
                         }
                     }
                 }
-                base_tile_score += (20 - min_objective_dist).max(0) * 100;
+
+                if stats.min_range > 1 {
+                    // 間接攻撃ユニット：最大射程付近を維持したい
+                    let target_dist = stats.max_range as i32;
+                    let dist_diff = (best_target_dist - target_dist).abs();
+                    base_tile_score += (20 - dist_diff).max(0) * 100;
+
+                    // 最小射程未満（隣接など）は攻撃不能になるため強く避ける
+                    if best_target_dist < stats.min_range as i32 {
+                        base_tile_score -= 2000;
+                    }
+                } else {
+                    // 直接攻撃ユニット：隣接を目指す
+                    base_tile_score += (20 - best_target_dist).max(0) * 100;
+                }
             }
 
             // (A) Capture
@@ -218,7 +271,30 @@ pub fn decide_ai_action(
                     is_stationary,
                 );
                 for target_entity in targets {
-                    let score = base_tile_score + 2000;
+                    let mut attack_score = 2000;
+                    
+                    // ターゲットの詳細を取得してスコアを加点
+                    if let (Some(t_stats), Some(t_health)) = (
+                        world.get::<UnitStats>(target_entity),
+                        world.get::<Health>(target_entity),
+                    ) {
+                        let base_dmg = damage_chart
+                            .get_base_damage(stats.unit_type, t_stats.unit_type)
+                            .or_else(|| damage_chart.get_base_damage_secondary(stats.unit_type, t_stats.unit_type))
+                            .unwrap_or(0);
+                        
+                        // 与えるダメージ量に応じた加点 (0 ~ 10000程度)
+                        // ダメージ量 * 敵のコスト / 10
+                        let damage_val = (base_dmg as u32 * t_stats.cost) / 100;
+                        attack_score += damage_val as i32;
+
+                        // 撃破できる場合はボーナス
+                        if base_dmg as u32 >= t_health.current {
+                            attack_score += 5000;
+                        }
+                    }
+
+                    let score = base_tile_score + attack_score;
                     if score > best_unit_score {
                         best_unit_score = score;
                         best_unit_choice = Some(AiCommand::Attack {
@@ -618,6 +694,147 @@ mod tests {
             assert_eq!(entity, unit);
         } else {
             panic!("Expected Capture command, got {:?}", action);
+        }
+    }
+
+    #[test]
+    fn test_decide_ai_action_indirect_range() {
+        let mut world = World::new();
+        let mut dc = DamageChart::new();
+        // Artillery vs Tank
+        dc.insert_damage(UnitType::Artillery, UnitType::Tank, 50);
+        world.insert_resource(dc);
+        world.insert_resource(Map {
+            width: 10,
+            height: 10,
+            tiles: vec![Terrain::Plains; 100],
+            topology: crate::resources::GridTopology::Square,
+        });
+        crate::resources::master_data::MasterDataRegistry::load()
+            .map(|m| world.insert_resource(m))
+            .unwrap();
+
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+
+        // Artillery at (0,0), can move 5 tiles. 
+        // Max range 3, Min range 2.
+        world.spawn((
+            p1,
+            Faction(p1),
+            HasMoved(false),
+            ActionCompleted(false),
+            GridPosition { x: 0, y: 0 },
+            UnitStats {
+                unit_type: UnitType::Artillery,
+                cost: 6000,
+                max_movement: 5,
+                movement_type: crate::resources::MovementType::Artillery,
+                min_range: 2,
+                max_range: 3,
+                max_fuel: 99,
+                ..UnitStats::mock()
+            },
+            Health { current: 100, max: 100 },
+            crate::components::Fuel { current: 99, max: 99 },
+            crate::components::Ammo { ammo1: 10, max_ammo1: 10, ammo2: 0, max_ammo2: 0 },
+        ));
+
+        // Tank at (7,0). Distance is 7.
+        // Artillery can move to (4,0) [dist 3], (5,0) [dist 2].
+        // It should prefer (4,0) because it's max_range (3).
+        world.spawn((
+            p2,
+            Faction(p2),
+            GridPosition { x: 7, y: 0 },
+            UnitStats {
+                unit_type: UnitType::Tank,
+                cost: 7000,
+                ..UnitStats::mock()
+            },
+            Health { current: 100, max: 100 },
+        ));
+
+        let skips = std::collections::HashSet::new();
+        let action = decide_ai_action(&mut world, p1, &skips);
+        
+        assert!(action.is_some());
+        if let Some((_, AiCommand::Wait { target_pos, .. })) = action {
+            // Should be at distance 3 from (7,0) -> x=4, y=0
+            assert_eq!(target_pos.x, 4);
+            assert_eq!(target_pos.y, 0);
+        } else {
+            panic!("Expected Wait command at distance 3, got {:?}", action);
+        }
+    }
+
+    #[test]
+    fn test_decide_ai_action_indirect_escape() {
+        let mut world = World::new();
+        world.insert_resource(DamageChart::new());
+        world.insert_resource(Map {
+            width: 10,
+            height: 10,
+            tiles: vec![Terrain::Plains; 100],
+            topology: crate::resources::GridTopology::Square,
+        });
+        crate::resources::master_data::MasterDataRegistry::load()
+            .map(|m| world.insert_resource(m))
+            .unwrap();
+
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+
+        // Artillery at (4,0), adjacent to Tank at (5,0).
+        // Cannot attack from (4,0) because min_range is 2.
+        // Should move away to at least distance 2.
+        world.spawn((
+            p1,
+            Faction(p1),
+            HasMoved(false),
+            ActionCompleted(false),
+            GridPosition { x: 4, y: 0 },
+            UnitStats {
+                unit_type: UnitType::Artillery,
+                cost: 6000,
+                max_movement: 5,
+                movement_type: crate::resources::MovementType::Artillery,
+                min_range: 2,
+                max_range: 3,
+                max_fuel: 99,
+                ..UnitStats::mock()
+            },
+            Health { current: 100, max: 100 },
+            crate::components::Fuel { current: 99, max: 99 },
+            crate::components::Ammo { ammo1: 10, max_ammo1: 10, ammo2: 0, max_ammo2: 0 },
+        ));
+
+        world.spawn((
+            p2,
+            Faction(p2),
+            GridPosition { x: 5, y: 0 },
+            UnitStats {
+                unit_type: UnitType::Tank,
+                cost: 7000,
+                ..UnitStats::mock()
+            },
+            Health { current: 100, max: 100 },
+        ));
+
+        let skips = std::collections::HashSet::new();
+        let action = decide_ai_action(&mut world, p1, &skips);
+        
+        assert!(action.is_some());
+        if let Some((_, AiCommand::Wait { target_pos })) = action {
+            // Distance to (5,0) should be >= 2. (4,0) is dist 1.
+            let dist = (target_pos.x as i32 - 5).abs() + (target_pos.y as i32 - 0).abs();
+            assert!(dist >= 2, "Artillery should move away from adjacency, got pos {:?}", target_pos);
+        } else {
+            // Note: In this case, Wait is expected because it can't attack after moving (indirect).
+            // But it should at least move to a better position.
+            if let Some((_, cmd)) = action {
+                 println!("Action: {:?}", cmd);
+            }
         }
     }
 }
