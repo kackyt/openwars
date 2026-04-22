@@ -271,6 +271,16 @@ pub fn decide_ai_action(
                     is_stationary,
                 );
                 for target_entity in targets {
+                    // カミカゼアタック（無謀な攻撃）の回避
+                    if crate::ai::pruning::is_suicidal_attack(
+                        world,
+                        unit_entity,
+                        target_entity,
+                        &damage_chart,
+                    ) {
+                        continue;
+                    }
+
                     let mut attack_score = 2000;
                     
                     // ターゲットの詳細を取得してスコアを加点
@@ -835,6 +845,72 @@ mod tests {
             if let Some((_, cmd)) = action {
                  println!("Action: {:?}", cmd);
             }
+        }
+    }
+
+    #[test]
+    fn test_decide_ai_action_avoid_kamikaze() {
+        let mut world = World::new();
+        let mut dc = DamageChart::new();
+        // Infantry vs Tank: 1% damage
+        dc.insert_damage(UnitType::Infantry, UnitType::Tank, 1);
+        // Tank vs Infantry: 90% damage
+        dc.insert_damage(UnitType::Tank, UnitType::Infantry, 90);
+        world.insert_resource(dc);
+        world.insert_resource(Map {
+            width: 10,
+            height: 10,
+            tiles: vec![Terrain::Plains; 100],
+            topology: crate::resources::GridTopology::Square,
+        });
+        crate::resources::master_data::MasterDataRegistry::load()
+            .map(|m| world.insert_resource(m))
+            .unwrap();
+
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+
+        // Infantry (P1) at (1,1)
+        world.spawn((
+            p1,
+            Faction(p1),
+            HasMoved(false),
+            ActionCompleted(false),
+            GridPosition { x: 1, y: 1 },
+            UnitStats {
+                unit_type: UnitType::Infantry,
+                cost: 1000,
+                min_range: 1,
+                max_range: 1,
+                max_movement: 3,
+                movement_type: crate::resources::MovementType::Infantry,
+                max_fuel: 99,
+                ..UnitStats::mock()
+            },
+            Health { current: 100, max: 100 },
+            crate::components::Fuel { current: 99, max: 99 },
+            crate::components::Ammo { ammo1: 10, max_ammo1: 10, ammo2: 10, max_ammo2: 10 },
+        ));
+
+        // Tank (P2) at (1,2)
+        world.spawn((
+            p2,
+            Faction(p2),
+            GridPosition { x: 1, y: 2 },
+            UnitStats {
+                unit_type: UnitType::Tank,
+                cost: 7000,
+                ..UnitStats::mock()
+            },
+            Health { current: 100, max: 100 },
+        ));
+
+        let skips = std::collections::HashSet::new();
+        let action = decide_ai_action(&mut world, p1, &skips);
+        
+        assert!(action.is_some());
+        if let Some((_, AiCommand::Attack { .. })) = action {
+            panic!("AI should not perform a suicidal attack (Infantry vs Tank)");
         }
     }
 }
