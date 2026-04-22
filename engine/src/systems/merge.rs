@@ -151,6 +151,8 @@ mod tests {
         world.insert_resource(Events::<UnitDestroyedEvent>::default());
 
         let inf_stats = UnitStats {
+            ammo1_cost: 0,
+            ammo2_cost: 0,
             unit_type: UnitType::Infantry,
             cost: 1000,
             max_movement: 3,

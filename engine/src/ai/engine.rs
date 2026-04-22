@@ -499,6 +499,8 @@ mod tests {
                 ActionCompleted(false),
                 GridPosition { x: 1, y: 1 },
                 UnitStats {
+                    ammo1_cost: 0,
+                    ammo2_cost: 0,
                     unit_type: UnitType::Tank,
                     cost: 7000,
                     min_range: 1,

@@ -296,6 +296,8 @@ mod tests {
         ));
 
         let stats = UnitStats {
+            ammo1_cost: 0,
+            ammo2_cost: 0,
             unit_type: UnitType::Infantry,
             cost: 1000,
             max_movement: 3,

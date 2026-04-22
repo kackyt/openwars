@@ -469,6 +469,8 @@ mod tests {
 
     fn create_infantry_stats() -> UnitStats {
         UnitStats {
+            ammo1_cost: 0,
+            ammo2_cost: 0,
             unit_type: UnitType::Infantry,
             cost: 1000,
             max_movement: 3,
@@ -488,6 +490,8 @@ mod tests {
 
     fn create_bcopter_stats() -> UnitStats {
         UnitStats {
+            ammo1_cost: 0,
+            ammo2_cost: 0,
             unit_type: UnitType::Bcopters,
             cost: 9000,
             max_movement: 6,
@@ -507,6 +511,8 @@ mod tests {
 
     fn create_transport_heli_stats() -> UnitStats {
         UnitStats {
+            ammo1_cost: 0,
+            ammo2_cost: 0,
             unit_type: UnitType::TransportHelicopter,
             cost: 5000,
             max_movement: 6,
