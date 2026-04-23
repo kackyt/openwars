@@ -1,5 +1,6 @@
-use crate::components::{GridPosition, Health, UnitStats};
+use crate::components::{Ammo, GridPosition, Health, UnitStats};
 use crate::resources::{DamageChart, Map, master_data::MasterDataRegistry};
+use crate::systems::combat::get_expected_damage;
 use bevy_ecs::prelude::*;
 
 /// 攻撃行動が無謀（カミカゼアタック）かどうかを判定します。
@@ -17,18 +18,28 @@ pub fn is_suicidal_attack(
     let registry = world.resource::<MasterDataRegistry>().clone();
 
     if let (
-        Some((atk_hp, atk_max, atk_cost, atk_type, atk_min_range, atk_pos)),
-        Some((def_hp, def_max, def_cost, def_type, _def_min_range, def_pos)),
+        Some((atk_hp, atk_max, atk_stats, atk_pos, atk_ammo)),
+        Some((def_hp, def_max, def_stats, def_pos, def_ammo)),
     ) = {
-        let mut query = world.query::<(&Health, &UnitStats, &GridPosition)>();
-        let atk = query
-            .get(world, attacker_entity)
-            .ok()
-            .map(|(h, s, p)| (h.current, h.max, s.cost, s.unit_type, s.min_range, *p));
-        let def = query
-            .get(world, defender_entity)
-            .ok()
-            .map(|(h, s, p)| (h.current, h.max, s.cost, s.unit_type, s.min_range, *p));
+        let mut query = world.query::<(&Health, &UnitStats, &GridPosition, Option<&Ammo>)>();
+        let atk = query.get(world, attacker_entity).ok().map(|(h, s, p, a)| {
+            (
+                h.current,
+                h.max,
+                s.clone(),
+                *p,
+                a.map(|am| (am.ammo1, am.ammo2)).unwrap_or((99, 99)),
+            )
+        });
+        let def = query.get(world, defender_entity).ok().map(|(h, s, p, a)| {
+            (
+                h.current,
+                h.max,
+                s.clone(),
+                *p,
+                a.map(|am| (am.ammo1, am.ammo2)).unwrap_or((99, 99)),
+            )
+        });
         (atk, def)
     } {
         if def_max == 0 || atk_max == 0 {
@@ -45,37 +56,46 @@ pub fn is_suicidal_attack(
             .unwrap_or(crate::resources::Terrain::Plains);
         let atk_bonus = registry.get_terrain_defense_bonus(atk_terrain);
 
-        // 与えるダメージの予測
-        let base_damage = damage_chart
-            .get_base_damage(atk_type, def_type)
-            .or_else(|| damage_chart.get_base_damage_secondary(atk_type, def_type))
-            .unwrap_or(0);
+        let dist = (atk_pos.x as i64 - def_pos.x as i64).unsigned_abs() as u32
+            + (atk_pos.y as i64 - def_pos.y as i64).unsigned_abs() as u32;
 
-        // 攻撃ダメージ計算式: (base * hp + 105) / (100 + bonus)
-        // 期待値として rng 分 (+5) を加算
-        let expected_damage_to_enemy = (base_damage * atk_hp + 105) / (100 + def_bonus) + 5;
+        // 与えるダメージの予測 (+5 は乱数期待値)
+        let expected_damage_to_enemy = get_expected_damage(
+            &atk_stats,
+            atk_hp,
+            atk_ammo,
+            &def_stats,
+            def_bonus,
+            dist,
+            &registry,
+            damage_chart,
+            false,
+        ) + 5;
         let actual_damage_to_enemy = std::cmp::min(expected_damage_to_enemy, def_hp);
 
         // 与える被害価値
-        expected_damage_value = (actual_damage_to_enemy as i32 * def_cost as i32) / def_max as i32;
+        expected_damage_value =
+            (actual_damage_to_enemy as i32 * def_stats.cost as i32) / def_max as i32;
 
         // 反撃ダメージの予測（戦闘は同時解決のため撃破予定でも反撃する）
-        // 間接攻撃 (min_range > 1) の場合は反撃を受けない
-        let is_indirect = atk_min_range > 1;
-        if !is_indirect {
-            let counter_base_damage = damage_chart
-                .get_base_damage(def_type, atk_type)
-                .or_else(|| damage_chart.get_base_damage_secondary(def_type, atk_type))
-                .unwrap_or(0);
-
-            // 防御側は攻撃を受けた時点のHPで反撃（同時解決）
-            let expected_counter_damage =
-                (counter_base_damage * def_hp + 100) / (100 + atk_bonus) + 5;
+        // 反撃判定: 射程1の近接攻撃のみ
+        if atk_stats.min_range <= 1 {
+            let expected_counter_damage = get_expected_damage(
+                &def_stats,
+                def_hp,
+                def_ammo,
+                &atk_stats,
+                atk_bonus,
+                dist,
+                &registry,
+                damage_chart,
+                true,
+            ) + 5;
             let actual_counter_damage = std::cmp::min(expected_counter_damage, atk_hp);
 
             // 受ける被害価値
             expected_self_damage_value =
-                (actual_counter_damage as i32 * atk_cost as i32) / atk_max as i32;
+                (actual_counter_damage as i32 * atk_stats.cost as i32) / atk_max as i32;
         }
     }
 

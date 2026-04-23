@@ -4,6 +4,7 @@ use crate::components::{
 use crate::events::{AttackUnitCommand, CapturePropertyCommand, MoveUnitCommand, WaitUnitCommand};
 use crate::resources::master_data::MasterDataRegistry;
 use crate::resources::{Map, Terrain};
+use crate::systems::combat::get_expected_damage;
 use crate::systems::movement::{OccupantInfo, calculate_reachable_tiles};
 use bevy_ecs::prelude::*;
 use std::collections::HashMap;
@@ -109,18 +110,29 @@ pub fn decide_ai_action(
     let mut best_overall_choice: Option<(Entity, AiCommand)> = None;
 
     for unit_entity in movable_units {
-        let (stats, pos, fuel) = {
+        let (stats, pos, fuel, atk_hp, atk_ammo) = {
             let stats = world.get::<UnitStats>(unit_entity).cloned();
             let pos = world.get::<GridPosition>(unit_entity).cloned();
             let fuel = world
                 .get::<crate::components::Fuel>(unit_entity)
                 .map(|f| f.current);
+            let health = world.get::<Health>(unit_entity).map(|h| h.current);
+            let ammo = world
+                .get::<crate::components::Ammo>(unit_entity)
+                .map(|a| (a.ammo1, a.ammo2))
+                .unwrap_or((99, 99));
 
             // この時点では transported 判定は不要（movable_units収集時に除外済み）
-            if stats.is_none() || pos.is_none() || fuel.is_none() {
+            if stats.is_none() || pos.is_none() || fuel.is_none() || health.is_none() {
                 continue;
             }
-            (stats.unwrap(), pos.unwrap(), fuel.unwrap())
+            (
+                stats.unwrap(),
+                pos.unwrap(),
+                fuel.unwrap(),
+                health.unwrap(),
+                ammo,
+            )
         };
 
         let map = world.resource::<Map>().clone();
@@ -151,7 +163,7 @@ pub fn decide_ai_action(
         let enemy_units: Vec<(GridPosition, crate::resources::UnitType, u32, u32)> = {
             let mut q = world.query::<(&GridPosition, &Faction, &UnitStats, &Health)>();
             q.iter(world)
-                .filter(|(_, f, _, _)| f.0 != player_id)
+                .filter(|(_, f, _, h)| f.0 != player_id && h.current > 0)
                 .map(|(p, _, s, h)| (*p, s.unit_type, s.cost, h.current))
                 .collect()
         };
@@ -287,25 +299,39 @@ pub fn decide_ai_action(
                     let mut attack_score = 2000;
 
                     // ターゲットの詳細を取得してスコアを加点
-                    if let (Some(t_stats), Some(t_health)) = (
+                    if let (Some(t_stats), Some(t_health), Some(t_pos)) = (
                         world.get::<UnitStats>(target_entity),
                         world.get::<Health>(target_entity),
+                        world.get::<GridPosition>(target_entity),
                     ) {
-                        let base_dmg = damage_chart
-                            .get_base_damage(stats.unit_type, t_stats.unit_type)
-                            .or_else(|| {
-                                damage_chart
-                                    .get_base_damage_secondary(stats.unit_type, t_stats.unit_type)
-                            })
-                            .unwrap_or(0);
+                        // 撃破判定・ダメージ期待値の算出: 攻撃側HP、弾薬、距離、および地形防御ボーナスを考慮
+                        let t_terrain = map
+                            .get_terrain(t_pos.x, t_pos.y)
+                            .unwrap_or(crate::resources::Terrain::Plains);
+                        let def_bonus = registry.get_terrain_defense_bonus(t_terrain);
+                        let dist = (pos.x as i64 - t_pos.x as i64).unsigned_abs() as u32
+                            + (pos.y as i64 - t_pos.y as i64).unsigned_abs() as u32;
+
+                        let expected_actual_damage = get_expected_damage(
+                            &stats,
+                            atk_hp,
+                            atk_ammo,
+                            t_stats,
+                            def_bonus,
+                            dist,
+                            &registry,
+                            &damage_chart,
+                            false,
+                        );
 
                         // 与えるダメージ量に応じた加点 (0 ~ 10000程度)
-                        // ダメージ量 * 敵のコスト / 10
-                        let damage_val = (base_dmg * t_stats.cost) / 100;
+                        // ダメージ量 * 敵のコスト / 100
+                        // 100%時のダメージ(base_dmg)ではなく、現在のHPや弾薬を考慮した期待ダメージ(expected_actual_damage)を使用する
+                        let damage_val = (expected_actual_damage * t_stats.cost) / 100;
                         attack_score += damage_val as i32;
 
                         // 撃破できる場合はボーナス
-                        if base_dmg >= t_health.current {
+                        if expected_actual_damage >= t_health.current {
                             attack_score += 5000;
                         }
                     }
@@ -569,6 +595,7 @@ mod tests {
         let mut world = World::new();
         let mut dc = DamageChart::new();
         dc.insert_damage(UnitType::Tank, UnitType::Infantry, 90);
+        dc.insert_damage(UnitType::Infantry, UnitType::Tank, 1); // Ensure not suicidal
         world.insert_resource(dc);
         world.insert_resource(Map {
             width: 10,
