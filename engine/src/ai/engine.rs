@@ -296,8 +296,6 @@ pub fn decide_ai_action(
                         continue;
                     }
 
-                    let mut attack_score = 2000;
-
                     // ターゲットの詳細を取得してスコアを加点
                     if let (Some(t_stats), Some(t_health), Some(t_pos)) = (
                         world.get::<UnitStats>(target_entity),
@@ -312,6 +310,7 @@ pub fn decide_ai_action(
                         let dist = (pos.x as i64 - t_pos.x as i64).unsigned_abs() as u32
                             + (pos.y as i64 - t_pos.y as i64).unsigned_abs() as u32;
 
+                        // ターゲットへのダメージ予測
                         let expected_actual_damage = get_expected_damage(
                             &stats,
                             atk_hp,
@@ -324,6 +323,13 @@ pub fn decide_ai_action(
                             false,
                         );
 
+                        // 期待ダメージが0の場合は攻撃候補から外す（Waitを上回る誤挙動を防止）
+                        if expected_actual_damage == 0 {
+                            continue;
+                        }
+
+                        let mut attack_score = 2000;
+
                         // 与えるダメージ量に応じた加点 (0 ~ 10000程度)
                         // ダメージ量 * 敵のコスト / 100
                         // 100%時のダメージ(base_dmg)ではなく、現在のHPや弾薬を考慮した期待ダメージ(expected_actual_damage)を使用する
@@ -334,15 +340,15 @@ pub fn decide_ai_action(
                         if expected_actual_damage >= t_health.current {
                             attack_score += 5000;
                         }
-                    }
 
-                    let score = base_tile_score + attack_score;
-                    if score > best_unit_score {
-                        best_unit_score = score;
-                        best_unit_choice = Some(AiCommand::Attack {
-                            target_pos: current_grid,
-                            target_entity,
-                        });
+                        let score = base_tile_score + attack_score;
+                        if score > best_unit_score {
+                            best_unit_score = score;
+                            best_unit_choice = Some(AiCommand::Attack {
+                                target_pos: current_grid,
+                                target_entity,
+                            });
+                        }
                     }
                 }
             }
@@ -895,22 +901,20 @@ mod tests {
         let skips = std::collections::HashSet::new();
         let action = decide_ai_action(&mut world, p1, &skips);
 
-        assert!(action.is_some());
-        if let Some((_, AiCommand::Wait { target_pos })) = action {
-            // Distance to (5,0) should be >= 2. (4,0) is dist 1.
-            let dist = (target_pos.x as i32 - 5).abs() + (target_pos.y as i32).abs();
-            assert!(
-                dist >= 2,
-                "Artillery should move away from adjacency, got pos {:?}",
-                target_pos
-            );
-        } else {
-            // Note: In this case, Wait is expected because it can't attack after moving (indirect).
-            // But it should at least move to a better position.
-            if let Some((_, cmd)) = action {
-                println!("Action: {:?}", cmd);
-            }
-        }
+        let (_, cmd) = action.expect("some action must be chosen");
+        let target_pos = match cmd {
+            AiCommand::Wait { target_pos } => target_pos,
+            other => panic!("Expected Wait command, got {:?}", other),
+        };
+
+        // Distance to (5,0) should be >= 2. (4,0) is dist 1.
+        let dist = (target_pos.x as i32 - 5).abs() + (target_pos.y as i32).abs();
+        assert!(
+            dist >= 2,
+            "Artillery should move away from adjacency, got pos {:?} (dist {})",
+            target_pos,
+            dist
+        );
     }
 
     #[test]

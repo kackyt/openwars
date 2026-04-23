@@ -78,8 +78,22 @@ pub fn is_suicidal_attack(
             (actual_damage_to_enemy as i32 * def_stats.cost as i32) / def_max as i32;
 
         // 反撃ダメージの予測（戦闘は同時解決のため撃破予定でも反撃する）
-        // 反撃判定: 射程1の近接攻撃のみ
-        if atk_stats.min_range <= 1 {
+        // 反撃判定: 攻撃側が間接攻撃武器を選択していない場合のみ反撃が発生する
+        let atk_res = crate::systems::combat::get_detailed_expected_damage(
+            &atk_stats,
+            atk_hp,
+            atk_ammo,
+            &def_stats,
+            def_bonus,
+            dist,
+            &registry,
+            damage_chart,
+            false,
+        );
+
+        if let Some((_, (_, _, is_indirect))) = atk_res
+            && !is_indirect
+        {
             let expected_counter_damage = get_expected_damage(
                 &def_stats,
                 def_hp,

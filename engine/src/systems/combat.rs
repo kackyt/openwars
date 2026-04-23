@@ -459,7 +459,7 @@ pub fn attack_unit_system(
         let (defender_pos, defender_faction, defender_stats, defender_hp, def_ammo_opt) =
             match q_units.get(event.defender_entity) {
                 Ok((_, hp, ammo, pos, fac, stats, _, _)) => {
-                    let ammo_vals = ammo.map(|a| (a.ammo1, a.ammo2));
+                    let ammo_vals = ammo.map(|a| (a.ammo1, a.ammo2)).unwrap_or((0, 0));
                     (*pos, fac.0, stats.clone(), *hp, ammo_vals)
                 }
                 _ => continue,
@@ -504,11 +504,11 @@ pub fn attack_unit_system(
         let mut d_damage_opt = None;
         let mut counter_info = None;
 
-        let mut def_hp_post = defender_hp;
-        def_hp_post.damage(a_damage);
+        let mut _def_hp_post = defender_hp;
+        _def_hp_post.damage(a_damage);
 
-        if do_counter && !def_hp_post.is_destroyed() {
-            let (def_ammo1, def_ammo2) = def_ammo_opt.unwrap_or((0, 0));
+        if do_counter {
+            let (def_ammo1, def_ammo2) = def_ammo_opt;
             let att_terrain = map
                 .get_terrain(attacker_pos.x, attacker_pos.y)
                 .unwrap_or(Terrain::Plains);
