@@ -1,5 +1,6 @@
-use crate::components::{Health, UnitStats};
-use crate::resources::DamageChart;
+use crate::components::{Ammo, GridPosition, Health, UnitStats};
+use crate::resources::{DamageChart, Map, master_data::MasterDataRegistry};
+use crate::systems::combat::get_detailed_expected_damage;
 use bevy_ecs::prelude::*;
 
 /// 攻撃行動が無謀（カミカゼアタック）かどうかを判定します。
@@ -13,58 +14,111 @@ pub fn is_suicidal_attack(
     let mut expected_damage_value = 0;
     let mut expected_self_damage_value = 0;
 
+    let map = world.resource::<Map>().clone();
+    let registry = world.resource::<MasterDataRegistry>().clone();
+
     if let (
-        Some((atk_hp, atk_max, atk_cost, atk_type, atk_min_range)),
-        Some((def_hp, def_max, def_cost, def_type, _def_min_range)),
+        Some((atk_hp, atk_max, atk_stats, atk_pos, atk_ammo)),
+        Some((def_hp, def_max, def_stats, def_pos, def_ammo)),
     ) = {
-        let mut query = world.query::<(&Health, &UnitStats)>();
-        let atk = query
-            .get(world, attacker_entity)
-            .ok()
-            .map(|(h, s)| (h.current, h.max, s.cost, s.unit_type, s.min_range));
-        let def = query
-            .get(world, defender_entity)
-            .ok()
-            .map(|(h, s)| (h.current, h.max, s.cost, s.unit_type, s.min_range));
+        let mut query = world.query::<(&Health, &UnitStats, &GridPosition, Option<&Ammo>)>();
+        let atk = query.get(world, attacker_entity).ok().map(|(h, s, p, a)| {
+            (
+                h.current,
+                h.max,
+                s.clone(),
+                *p,
+                a.map(|am| (am.ammo1, am.ammo2)).unwrap_or((99, 99)),
+            )
+        });
+        let def = query.get(world, defender_entity).ok().map(|(h, s, p, a)| {
+            (
+                h.current,
+                h.max,
+                s.clone(),
+                *p,
+                a.map(|am| (am.ammo1, am.ammo2)).unwrap_or((99, 99)),
+            )
+        });
         (atk, def)
     } {
         if def_max == 0 || atk_max == 0 {
             return false;
         }
 
-        // 与えるダメージの予測
-        let base_damage = damage_chart
-            .get_base_damage(atk_type, def_type)
-            .unwrap_or(0);
-        let effective_base_damage = base_damage * 105 / 100;
-        let atk_display = atk_hp.div_ceil(10);
-        let expected_damage_to_enemy = (effective_base_damage * atk_display) / 10;
+        // 地形防御ボーナスの取得
+        let def_terrain = map
+            .get_terrain(def_pos.x, def_pos.y)
+            .unwrap_or(crate::resources::Terrain::Plains);
+        let def_bonus = registry.get_terrain_defense_bonus(def_terrain);
+        let atk_terrain = map
+            .get_terrain(atk_pos.x, atk_pos.y)
+            .unwrap_or(crate::resources::Terrain::Plains);
+        let atk_bonus = registry.get_terrain_defense_bonus(atk_terrain);
+
+        let dist = (atk_pos.x as i64 - def_pos.x as i64).unsigned_abs() as u32
+            + (atk_pos.y as i64 - def_pos.y as i64).unsigned_abs() as u32;
+
+        // 与えるダメージの予測 (+5 は乱数期待値)
+        let expected_damage_to_enemy = get_detailed_expected_damage(
+            &atk_stats,
+            atk_hp,
+            atk_ammo,
+            &def_stats,
+            def_bonus,
+            dist,
+            &registry,
+            damage_chart,
+            false,
+        )
+        .map(|(d, _)| d + 5)
+        .unwrap_or(0);
         let actual_damage_to_enemy = std::cmp::min(expected_damage_to_enemy, def_hp);
 
         // 与える被害価値
-        expected_damage_value = (actual_damage_to_enemy as i32 * def_cost as i32) / def_max as i32;
+        expected_damage_value =
+            (actual_damage_to_enemy as i32 * def_stats.cost as i32) / def_max as i32;
 
         // 反撃ダメージの予測（戦闘は同時解決のため撃破予定でも反撃する）
-        // 間接攻撃 (min_range > 1) の場合は反撃を受けない
-        let is_indirect = atk_min_range > 1;
-        if !is_indirect {
-            let counter_base_damage = damage_chart
-                .get_base_damage(def_type, atk_type)
-                .unwrap_or(0);
-            // 防御側は攻撃を受けた時点のHPで反撃（同時解決）
-            let defender_display_hp = def_hp.div_ceil(10);
-            let expected_counter_damage = (counter_base_damage * defender_display_hp) / 10;
+        // 反撃判定: 攻撃側が間接攻撃武器を選択していない場合のみ反撃が発生する
+        let atk_res = crate::systems::combat::get_detailed_expected_damage(
+            &atk_stats,
+            atk_hp,
+            atk_ammo,
+            &def_stats,
+            def_bonus,
+            dist,
+            &registry,
+            damage_chart,
+            false,
+        );
+
+        if let Some((_, (_, _, is_indirect))) = atk_res
+            && !is_indirect
+            && let Some((base_counter_damage, _)) = get_detailed_expected_damage(
+                &def_stats,
+                def_hp,
+                def_ammo,
+                &atk_stats,
+                atk_bonus,
+                dist,
+                &registry,
+                damage_chart,
+                true,
+            )
+        {
+            let expected_counter_damage = base_counter_damage + 5;
             let actual_counter_damage = std::cmp::min(expected_counter_damage, atk_hp);
 
             // 受ける被害価値
             expected_self_damage_value =
-                (actual_counter_damage as i32 * atk_cost as i32) / atk_max as i32;
+                (actual_counter_damage as i32 * atk_stats.cost as i32) / atk_max as i32;
         }
     }
 
-    // 被害価値の比較。攻撃側有利（同時解決だが先制ダメージが反映される）を考慮し、
-    // 完全に無謀（受ける被害が与える被害の1.5倍を超える）な場合のみ suicidal と判定。
-    expected_self_damage_value > (expected_damage_value * 15 / 10)
+    // 被害価値の比較。
+    // 仕様書に基づき、敵へ与える被害価値よりも、反撃で受ける被害価値のほうが大きい場合に無謀と判定します。
+    expected_self_damage_value > expected_damage_value
 }
 
 #[cfg(test)]
@@ -80,6 +134,15 @@ mod tests {
         damage_chart.insert_damage(UnitType::Tank, UnitType::Infantry, 90);
         damage_chart.insert_damage(UnitType::Artillery, UnitType::Tank, 50);
         damage_chart.insert_damage(UnitType::Tank, UnitType::Artillery, 50);
+        world.insert_resource(damage_chart);
+
+        world.insert_resource(Map {
+            width: 5,
+            height: 5,
+            tiles: vec![crate::resources::Terrain::Plains; 25],
+            topology: crate::resources::GridTopology::Square,
+        });
+        world.insert_resource(MasterDataRegistry::load().unwrap());
 
         let infantry = world
             .spawn((
@@ -93,6 +156,7 @@ mod tests {
                     min_range: 1,
                     ..UnitStats::mock()
                 },
+                GridPosition { x: 0, y: 0 },
             ))
             .id();
 
@@ -108,6 +172,7 @@ mod tests {
                     min_range: 1,
                     ..UnitStats::mock()
                 },
+                GridPosition { x: 1, y: 0 },
             ))
             .id();
 
@@ -123,44 +188,24 @@ mod tests {
                     min_range: 2,
                     ..UnitStats::mock()
                 },
+                GridPosition { x: 2, y: 0 },
             ))
             .id();
 
-        // 1. Infantry attacking Tank is suicidal (does 1% damage, receives 90% counter on its own 1000 cost vs tank 7000 cost)
-        // expected damage: 1 dmg * 7000 / 100 = 70 value
-        // expected counter: 90 dmg * 1000 / 100 = 900 value
-        // 900 > 70 => true
-        assert!(is_suicidal_attack(
-            &mut world,
-            infantry,
-            tank,
-            &damage_chart
-        ));
+        let dc = world.resource::<DamageChart>().clone();
 
-        // 2. Artillery attacking Tank is NOT suicidal, because indirect attacks receive no counter-attack damage
-        assert!(!is_suicidal_attack(
-            &mut world,
-            artillery,
-            tank,
-            &damage_chart
-        ));
+        // 1. Infantry attacking Tank is suicidal
+        assert!(is_suicidal_attack(&mut world, infantry, tank, &dc));
 
-        // 3. Tank attacking Infantry is NOT suicidal (receives minimal counter)
-        assert!(!is_suicidal_attack(
-            &mut world,
-            tank,
-            infantry,
-            &damage_chart
-        ));
+        // 2. Artillery attacking Tank is NOT suicidal
+        assert!(!is_suicidal_attack(&mut world, artillery, tank, &dc));
+
+        // 3. Tank attacking Infantry is NOT suicidal
+        assert!(!is_suicidal_attack(&mut world, tank, infantry, &dc));
 
         // 4. Missing components -> not suicidal (returns false gracefully)
         let empty_entity = world.spawn_empty().id();
-        assert!(!is_suicidal_attack(
-            &mut world,
-            empty_entity,
-            tank,
-            &damage_chart
-        ));
+        assert!(!is_suicidal_attack(&mut world, empty_entity, tank, &dc));
 
         // 5. Zero max hp -> safely ignored (returns false)
         let bugged_unit = world
@@ -175,13 +220,9 @@ mod tests {
                     min_range: 1,
                     ..UnitStats::mock()
                 },
+                GridPosition { x: 0, y: 1 },
             ))
             .id();
-        assert!(!is_suicidal_attack(
-            &mut world,
-            bugged_unit,
-            tank,
-            &damage_chart
-        ));
+        assert!(!is_suicidal_attack(&mut world, bugged_unit, tank, &dc));
     }
 }
