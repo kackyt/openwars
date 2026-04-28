@@ -307,8 +307,8 @@ pub fn decide_ai_action(
                             .get_terrain(t_pos.x, t_pos.y)
                             .unwrap_or(crate::resources::Terrain::Plains);
                         let def_bonus = registry.get_terrain_defense_bonus(t_terrain);
-                        let dist = (pos.x as i64 - t_pos.x as i64).unsigned_abs() as u32
-                            + (pos.y as i64 - t_pos.y as i64).unsigned_abs() as u32;
+                        let dist = (current_grid.x as i64 - t_pos.x as i64).unsigned_abs() as u32
+                            + (current_grid.y as i64 - t_pos.y as i64).unsigned_abs() as u32;
 
                         // ターゲットへのダメージ予測
                         let expected_actual_damage = get_expected_damage(

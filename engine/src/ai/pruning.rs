@@ -1,6 +1,6 @@
 use crate::components::{Ammo, GridPosition, Health, UnitStats};
 use crate::resources::{DamageChart, Map, master_data::MasterDataRegistry};
-use crate::systems::combat::get_expected_damage;
+use crate::systems::combat::get_detailed_expected_damage;
 use bevy_ecs::prelude::*;
 
 /// 攻撃行動が無謀（カミカゼアタック）かどうかを判定します。
@@ -60,7 +60,7 @@ pub fn is_suicidal_attack(
             + (atk_pos.y as i64 - def_pos.y as i64).unsigned_abs() as u32;
 
         // 与えるダメージの予測 (+5 は乱数期待値)
-        let expected_damage_to_enemy = get_expected_damage(
+        let expected_damage_to_enemy = get_detailed_expected_damage(
             &atk_stats,
             atk_hp,
             atk_ammo,
@@ -70,7 +70,9 @@ pub fn is_suicidal_attack(
             &registry,
             damage_chart,
             false,
-        ) + 5;
+        )
+        .map(|(d, _)| d + 5)
+        .unwrap_or(0);
         let actual_damage_to_enemy = std::cmp::min(expected_damage_to_enemy, def_hp);
 
         // 与える被害価値
@@ -93,8 +95,7 @@ pub fn is_suicidal_attack(
 
         if let Some((_, (_, _, is_indirect))) = atk_res
             && !is_indirect
-        {
-            let expected_counter_damage = get_expected_damage(
+            && let Some((base_counter_damage, _)) = get_detailed_expected_damage(
                 &def_stats,
                 def_hp,
                 def_ammo,
@@ -104,7 +105,9 @@ pub fn is_suicidal_attack(
                 &registry,
                 damage_chart,
                 true,
-            ) + 5;
+            )
+        {
+            let expected_counter_damage = base_counter_damage + 5;
             let actual_counter_damage = std::cmp::min(expected_counter_damage, atk_hp);
 
             // 受ける被害価値
