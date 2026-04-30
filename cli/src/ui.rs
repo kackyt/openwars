@@ -603,28 +603,56 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             f.render_widget(ratatui::widgets::Clear, popup_rect);
             f.render_widget(popup_text, popup_rect);
         }
-        crate::app::InGameState::GameOverPopup {
-            message,
-            condition: _,
-        } => {
+        crate::app::InGameState::GameOverPopup { message, condition } => {
             let area = f.size();
+            // 少し大きめのポップアップ
             let popup_rect = ratatui::layout::Rect {
-                x: area.width.saturating_sub(40) / 2,
-                y: area.height.saturating_sub(5) / 2,
-                width: 40.min(area.width),
-                height: 5.min(area.height),
+                x: area.width.saturating_sub(50) / 2,
+                y: area.height.saturating_sub(8) / 2,
+                width: 50.min(area.width),
+                height: 8.min(area.height),
             };
-            let title = " ゲームセット ";
-            let s = format!("{}\n\n[Esc/Enter] で戻る", message);
+
+            // 勝利・敗北・引き分けに応じて色を変える
+            let (style, title) = match condition {
+                engine::resources::GameOverCondition::Winner(pid) => {
+                    // 自軍が勝利したか判定 (Player 1 を暫定的に自軍とする)
+                    if pid.0 == 1 {
+                        (
+                            Style::default()
+                                .bg(Color::Cyan)
+                                .fg(Color::Black)
+                                .add_modifier(Modifier::BOLD),
+                            " ★ 勝利 ★ ",
+                        )
+                    } else {
+                        (
+                            Style::default()
+                                .bg(Color::Red)
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                            " 敗北... ",
+                        )
+                    }
+                }
+                engine::resources::GameOverCondition::Draw => (
+                    Style::default().bg(Color::Yellow).fg(Color::Black),
+                    " 引き分け ",
+                ),
+            };
+
+            let s = format!("\n{}\n\n[Enter/Esc] キーでマップ選択へ戻る", message);
             let popup_text = Paragraph::new(s.as_str())
                 .block(
                     Block::default()
                         .title(title)
+                        .title_alignment(ratatui::layout::Alignment::Center)
                         .borders(Borders::ALL)
-                        .style(Style::default().bg(Color::Yellow).fg(Color::Black)),
+                        .style(style),
                 )
                 .alignment(ratatui::layout::Alignment::Center)
                 .wrap(Wrap { trim: true });
+
             f.render_widget(ratatui::widgets::Clear, popup_rect);
             f.render_widget(popup_text, popup_rect);
         }

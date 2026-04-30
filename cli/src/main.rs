@@ -303,7 +303,7 @@ where
             if let Some(msg) = popup_msg
                 && !matches!(
                     app.ui_state.in_game_state,
-                    app::InGameState::EventPopup { .. }
+                    app::InGameState::EventPopup { .. } | app::InGameState::GameOverPopup { .. }
                 )
             {
                 app.ui_state.in_game_state = app::InGameState::EventPopup { message: msg };
