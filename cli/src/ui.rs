@@ -674,3 +674,146 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{App, InGameState, PlayerControlType};
+    use engine::components::PlayerId;
+    use engine::resources::GameOverCondition;
+    use ratatui::{Terminal, backend::TestBackend, style::Color};
+
+    fn setup_test_app() -> App {
+        let mut app = App::new().expect("Failed to create App");
+        app.ui_state.player_controls.clear();
+        app.ui_state.current_screen = crate::app::CurrentScreen::InGame;
+        app
+    }
+
+    #[test]
+    fn test_game_over_popup_winner_human() {
+        let mut app = setup_test_app();
+        let pid = PlayerId(1);
+        app.ui_state
+            .player_controls
+            .insert(pid.0, PlayerControlType::Human);
+        app.ui_state.in_game_state = InGameState::GameOverPopup {
+            message: "人間プレイヤーの勝利".to_string(),
+            condition: GameOverCondition::Winner(pid),
+        };
+
+        let backend = TestBackend::new(60, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_buffer_contains(buffer, "勝利");
+        assert_buffer_contains(buffer, "人間プレイヤーの勝利");
+        assert!(has_bg_color(buffer, Color::Cyan));
+    }
+
+    #[test]
+    fn test_game_over_popup_winner_ai_with_human() {
+        let mut app = setup_test_app();
+        let human_pid = PlayerId(1);
+        let ai_pid = PlayerId(2);
+        app.ui_state
+            .player_controls
+            .insert(human_pid.0, PlayerControlType::Human);
+        app.ui_state
+            .player_controls
+            .insert(ai_pid.0, PlayerControlType::Ai);
+        app.ui_state.in_game_state = InGameState::GameOverPopup {
+            message: "AIプレイヤーの勝利".to_string(),
+            condition: GameOverCondition::Winner(ai_pid),
+        };
+
+        let backend = TestBackend::new(60, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_buffer_contains(buffer, "敗北");
+        assert_buffer_contains(buffer, "AIプレイヤーの勝利");
+        assert!(has_bg_color(buffer, Color::Red));
+    }
+
+    #[test]
+    fn test_game_over_popup_winner_no_human() {
+        let mut app = setup_test_app();
+        let ai_pid = PlayerId(2);
+        app.ui_state
+            .player_controls
+            .insert(ai_pid.0, PlayerControlType::Ai);
+        app.ui_state.in_game_state = InGameState::GameOverPopup {
+            message: "AI同士の決着".to_string(),
+            condition: GameOverCondition::Winner(ai_pid),
+        };
+
+        let backend = TestBackend::new(60, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_buffer_contains(buffer, "終了");
+        assert_buffer_contains(buffer, "AI同士の決着");
+        assert!(has_bg_color(buffer, Color::Yellow));
+    }
+
+    #[test]
+    fn test_game_over_popup_draw() {
+        let mut app = setup_test_app();
+        app.ui_state.in_game_state = InGameState::GameOverPopup {
+            message: "引き分けです".to_string(),
+            condition: GameOverCondition::Draw,
+        };
+
+        let backend = TestBackend::new(60, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_buffer_contains(buffer, "引き分け");
+        assert!(has_bg_color(buffer, Color::Yellow));
+    }
+
+    fn assert_buffer_contains(buffer: &ratatui::buffer::Buffer, text: &str) {
+        let content = buffer_to_string(buffer).replace(" ", "").replace("\n", "");
+        assert!(content.contains(text), "Buffer does not contain '{}'", text);
+    }
+
+    fn has_bg_color(buffer: &ratatui::buffer::Buffer, color: Color) -> bool {
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                if buffer.get(x, y).bg == color {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
+        let mut s = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let cell = buffer.get(x, y);
+                // 広い文字の2セル目などはスキップ
+                if x > 0
+                    && buffer.get(x - 1, y).symbol().chars().count() > 1
+                    && cell.symbol() == " "
+                {
+                    // 簡易的な判定だが、前の文字が2バイト文字なら現在の空白はスキップ
+                    // (ただしratatuiの内部表現に依存するため注意)
+                }
+                s.push_str(cell.symbol());
+            }
+            s.push('\n');
+        }
+        s
+    }
+}
