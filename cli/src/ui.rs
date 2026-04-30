@@ -64,9 +64,10 @@ fn draw_map_selection(f: &mut Frame, app: &mut App) {
     let mut sorted_pids: Vec<_> = app.ui_state.player_controls.keys().cloned().collect();
     sorted_pids.sort();
     for pid in sorted_pids {
-        let mode = match app.ui_state.player_controls.get(&pid) {
-            Some(crate::app::PlayerControlType::Ai) => "AI",
-            _ => "Human",
+        let mode = if app.ui_state.is_human(pid) {
+            "Human"
+        } else {
+            "AI"
         };
         controls_text.push_str(&format!("P{}('{}'): {}  ", pid, pid, mode));
     }
@@ -408,9 +409,10 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             let name = active_player.name.clone();
             let id = active_player.id.0;
             let funds = active_player.funds;
-            let control_mode = match app.ui_state.player_controls.get(&id) {
-                Some(crate::app::PlayerControlType::Ai) => "AI",
-                _ => "Human",
+            let control_mode = if app.ui_state.is_human(id) {
+                "Human"
+            } else {
+                "AI"
             };
             info_text.push_str(&format!(
                 "ターン: {} (P{} : {} [{}])\n",
@@ -603,31 +605,233 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             f.render_widget(ratatui::widgets::Clear, popup_rect);
             f.render_widget(popup_text, popup_rect);
         }
-        crate::app::InGameState::GameOverPopup {
-            message,
-            condition: _,
-        } => {
+        crate::app::InGameState::GameOverPopup { message, condition } => {
             let area = f.size();
+            // 少し大きめのポップアップ
             let popup_rect = ratatui::layout::Rect {
-                x: area.width.saturating_sub(40) / 2,
-                y: area.height.saturating_sub(5) / 2,
-                width: 40.min(area.width),
-                height: 5.min(area.height),
+                x: area.width.saturating_sub(50) / 2,
+                y: area.height.saturating_sub(8) / 2,
+                width: 50.min(area.width),
+                height: 8.min(area.height),
             };
-            let title = " ゲームセット ";
-            let s = format!("{}\n\n[Esc/Enter] で戻る", message);
+
+            // 勝利・敗北・引き分けに応じて色を変える
+            let (style, title) = match condition {
+                engine::resources::GameOverCondition::Winner(pid) => {
+                    let is_human = app.ui_state.is_human(pid.0);
+                    let has_human_player = app.ui_state.has_human_player();
+
+                    if is_human {
+                        (
+                            Style::default()
+                                .bg(Color::Cyan)
+                                .fg(Color::Black)
+                                .add_modifier(Modifier::BOLD),
+                            " ★ 勝利 ★ ",
+                        )
+                    } else if has_human_player {
+                        (
+                            Style::default()
+                                .bg(Color::Red)
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                            " 敗北... ",
+                        )
+                    } else {
+                        (
+                            Style::default()
+                                .bg(Color::Yellow)
+                                .fg(Color::Black)
+                                .add_modifier(Modifier::BOLD),
+                            " ★ 終了 ★ ",
+                        )
+                    }
+                }
+                engine::resources::GameOverCondition::Draw => (
+                    Style::default().bg(Color::Yellow).fg(Color::Black),
+                    " 引き分け ",
+                ),
+            };
+
+            let s = format!("\n{}\n\n[Enter/Esc] キーでマップ選択へ戻る", message);
             let popup_text = Paragraph::new(s.as_str())
                 .block(
                     Block::default()
                         .title(title)
+                        .title_alignment(ratatui::layout::Alignment::Center)
                         .borders(Borders::ALL)
-                        .style(Style::default().bg(Color::Yellow).fg(Color::Black)),
+                        .style(style),
                 )
                 .alignment(ratatui::layout::Alignment::Center)
                 .wrap(Wrap { trim: true });
+
             f.render_widget(ratatui::widgets::Clear, popup_rect);
             f.render_widget(popup_text, popup_rect);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{App, InGameState, PlayerControlType};
+    use engine::components::PlayerId;
+    use engine::resources::GameOverCondition;
+    use ratatui::{Terminal, backend::TestBackend, style::Color};
+
+    fn setup_test_app() -> App {
+        let mut app = App::new().expect("Failed to create App");
+        app.ui_state.player_controls.clear();
+        app.ui_state.current_screen = crate::app::CurrentScreen::InGame;
+        app
+    }
+
+    #[test]
+    fn test_game_over_popup_winner_human() {
+        let mut app = setup_test_app();
+        let pid = PlayerId(1);
+        app.ui_state
+            .player_controls
+            .insert(pid.0, PlayerControlType::Human);
+        app.ui_state.in_game_state = InGameState::GameOverPopup {
+            message: "人間プレイヤーの勝利".to_string(),
+            condition: GameOverCondition::Winner(pid),
+        };
+
+        let backend = TestBackend::new(60, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_buffer_contains(buffer, "勝利");
+        assert_buffer_contains(buffer, "人間プレイヤーの勝利");
+        assert!(has_bg_color(buffer, Color::Cyan));
+    }
+
+    #[test]
+    fn test_game_over_popup_winner_ai_with_human() {
+        let mut app = setup_test_app();
+        let human_pid = PlayerId(1);
+        let ai_pid = PlayerId(2);
+        app.ui_state
+            .player_controls
+            .insert(human_pid.0, PlayerControlType::Human);
+        app.ui_state
+            .player_controls
+            .insert(ai_pid.0, PlayerControlType::Ai);
+        app.ui_state.in_game_state = InGameState::GameOverPopup {
+            message: "AIプレイヤーの勝利".to_string(),
+            condition: GameOverCondition::Winner(ai_pid),
+        };
+
+        let backend = TestBackend::new(60, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_buffer_contains(buffer, "敗北");
+        assert_buffer_contains(buffer, "AIプレイヤーの勝利");
+        assert!(has_bg_color(buffer, Color::Red));
+    }
+
+    #[test]
+    fn test_game_over_popup_winner_no_human() {
+        let mut app = setup_test_app();
+        let ai_pid = PlayerId(2);
+        app.ui_state
+            .player_controls
+            .insert(ai_pid.0, PlayerControlType::Ai);
+        app.ui_state.in_game_state = InGameState::GameOverPopup {
+            message: "AI同士の決着".to_string(),
+            condition: GameOverCondition::Winner(ai_pid),
+        };
+
+        let backend = TestBackend::new(60, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_buffer_contains(buffer, "終了");
+        assert_buffer_contains(buffer, "AI同士の決着");
+        assert!(has_bg_color(buffer, Color::Yellow));
+    }
+
+    #[test]
+    fn test_game_over_popup_draw() {
+        let mut app = setup_test_app();
+        app.ui_state.in_game_state = InGameState::GameOverPopup {
+            message: "引き分けです".to_string(),
+            condition: GameOverCondition::Draw,
+        };
+
+        let backend = TestBackend::new(60, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_buffer_contains(buffer, "引き分け");
+        assert!(has_bg_color(buffer, Color::Yellow));
+    }
+
+    #[test]
+    fn test_game_over_popup_winner_missing_pid_is_human() {
+        let mut app = setup_test_app();
+        let pid = PlayerId(99); // 存在しないPID
+        // player_controls はデフォルトでP1:Human, P2:AI が入っているが P99 は未登録
+        app.ui_state.in_game_state = InGameState::GameOverPopup {
+            message: "未知のプレイヤーの勝利".to_string(),
+            condition: GameOverCondition::Winner(pid),
+        };
+
+        let backend = TestBackend::new(60, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_buffer_contains(buffer, "勝利"); // デフォルトで人間扱い
+        assert_buffer_contains(buffer, "未知のプレイヤーの勝利");
+        assert!(has_bg_color(buffer, Color::Cyan));
+    }
+
+    fn assert_buffer_contains(buffer: &ratatui::buffer::Buffer, text: &str) {
+        let content = buffer_to_string(buffer).replace(" ", "").replace("\n", "");
+        assert!(content.contains(text), "Buffer does not contain '{}'", text);
+    }
+
+    fn has_bg_color(buffer: &ratatui::buffer::Buffer, color: Color) -> bool {
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                if buffer.get(x, y).bg == color {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
+        let mut s = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let cell = buffer.get(x, y);
+                // 広い文字の2セル目などはスキップ
+                if x > 0
+                    && buffer.get(x - 1, y).symbol().chars().count() > 1
+                    && cell.symbol() == " "
+                {
+                    // 簡易的な判定だが、前の文字が2バイト文字なら現在の空白はスキップ
+                    // (ただしratatuiの内部表現に依存するため注意)
+                }
+                s.push_str(cell.symbol());
+            }
+            s.push('\n');
+        }
+        s
     }
 }

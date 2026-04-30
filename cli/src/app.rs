@@ -134,6 +134,22 @@ impl UiState {
             self.log_messages.remove(0);
         }
     }
+
+    /// 指定されたプレイヤーIDが人間かどうかを判定します。
+    /// 未登録のプレイヤーはデフォルトで人間とみなします。
+    pub fn is_human(&self, player_id: u32) -> bool {
+        !matches!(
+            self.player_controls.get(&player_id),
+            Some(PlayerControlType::Ai)
+        )
+    }
+
+    /// 登録されているプレイヤーの中に人間がいるかどうかを判定します。
+    pub fn has_human_player(&self) -> bool {
+        self.player_controls
+            .values()
+            .any(|v| *v == PlayerControlType::Human)
+    }
 }
 
 pub struct App {
@@ -238,8 +254,7 @@ impl App {
             && let Some(active_player) = players.0.get(match_state.active_player_index.0)
             && (matches!(self.ui_state.in_game_state, InGameState::Normal)
                 || matches!(self.ui_state.in_game_state, InGameState::WaitAiAction))
-            && self.ui_state.player_controls.get(&active_player.id.0)
-                == Some(&PlayerControlType::Ai)
+            && !self.ui_state.is_human(active_player.id.0)
         {
             match key.code {
                 crossterm::event::KeyCode::Char('q') => self.should_quit = true,
