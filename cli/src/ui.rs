@@ -616,8 +616,15 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             // 勝利・敗北・引き分けに応じて色を変える
             let (style, title) = match condition {
                 engine::resources::GameOverCondition::Winner(pid) => {
-                    // 自軍が勝利したか判定 (Player 1 を暫定的に自軍とする)
-                    if pid.0 == 1 {
+                    let is_human = app.ui_state.player_controls.get(&pid.0)
+                        == Some(&crate::app::PlayerControlType::Human);
+                    let has_human_player = app
+                        .ui_state
+                        .player_controls
+                        .values()
+                        .any(|v| *v == crate::app::PlayerControlType::Human);
+
+                    if is_human {
                         (
                             Style::default()
                                 .bg(Color::Cyan)
@@ -625,13 +632,21 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                                 .add_modifier(Modifier::BOLD),
                             " ★ 勝利 ★ ",
                         )
-                    } else {
+                    } else if has_human_player {
                         (
                             Style::default()
                                 .bg(Color::Red)
                                 .fg(Color::White)
                                 .add_modifier(Modifier::BOLD),
                             " 敗北... ",
+                        )
+                    } else {
+                        (
+                            Style::default()
+                                .bg(Color::Yellow)
+                                .fg(Color::Black)
+                                .add_modifier(Modifier::BOLD),
+                            " ★ 終了 ★ ",
                         )
                     }
                 }
