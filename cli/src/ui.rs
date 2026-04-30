@@ -64,9 +64,10 @@ fn draw_map_selection(f: &mut Frame, app: &mut App) {
     let mut sorted_pids: Vec<_> = app.ui_state.player_controls.keys().cloned().collect();
     sorted_pids.sort();
     for pid in sorted_pids {
-        let mode = match app.ui_state.player_controls.get(&pid) {
-            Some(crate::app::PlayerControlType::Ai) => "AI",
-            _ => "Human",
+        let mode = if app.ui_state.is_human(pid) {
+            "Human"
+        } else {
+            "AI"
         };
         controls_text.push_str(&format!("P{}('{}'): {}  ", pid, pid, mode));
     }
@@ -408,9 +409,10 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             let name = active_player.name.clone();
             let id = active_player.id.0;
             let funds = active_player.funds;
-            let control_mode = match app.ui_state.player_controls.get(&id) {
-                Some(crate::app::PlayerControlType::Ai) => "AI",
-                _ => "Human",
+            let control_mode = if app.ui_state.is_human(id) {
+                "Human"
+            } else {
+                "AI"
             };
             info_text.push_str(&format!(
                 "ターン: {} (P{} : {} [{}])\n",
@@ -616,13 +618,8 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
             // 勝利・敗北・引き分けに応じて色を変える
             let (style, title) = match condition {
                 engine::resources::GameOverCondition::Winner(pid) => {
-                    let is_human = app.ui_state.player_controls.get(&pid.0)
-                        == Some(&crate::app::PlayerControlType::Human);
-                    let has_human_player = app
-                        .ui_state
-                        .player_controls
-                        .values()
-                        .any(|v| *v == crate::app::PlayerControlType::Human);
+                    let is_human = app.ui_state.is_human(pid.0);
+                    let has_human_player = app.ui_state.has_human_player();
 
                     if is_human {
                         (
@@ -779,6 +776,27 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_buffer_contains(buffer, "引き分け");
         assert!(has_bg_color(buffer, Color::Yellow));
+    }
+
+    #[test]
+    fn test_game_over_popup_winner_missing_pid_is_human() {
+        let mut app = setup_test_app();
+        let pid = PlayerId(99); // 存在しないPID
+        // player_controls はデフォルトでP1:Human, P2:AI が入っているが P99 は未登録
+        app.ui_state.in_game_state = InGameState::GameOverPopup {
+            message: "未知のプレイヤーの勝利".to_string(),
+            condition: GameOverCondition::Winner(pid),
+        };
+
+        let backend = TestBackend::new(60, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_buffer_contains(buffer, "勝利"); // デフォルトで人間扱い
+        assert_buffer_contains(buffer, "未知のプレイヤーの勝利");
+        assert!(has_bg_color(buffer, Color::Cyan));
     }
 
     fn assert_buffer_contains(buffer: &ratatui::buffer::Buffer, text: &str) {
