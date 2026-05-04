@@ -13,6 +13,28 @@ use std::collections::HashSet;
 #[derive(Resource, Default)]
 pub struct AiActionCooldown(pub HashSet<Entity>);
 
+#[derive(Resource, Default)]
+pub struct AiProductionCooldown(pub HashSet<(usize, usize)>);
+
+/// ターン開始時にAIの冷却リストをクリアするシステム。
+pub fn clear_ai_cooldowns_system(
+    mut events: EventReader<crate::events::GamePhaseChangedEvent>,
+    action_cooldown: Option<ResMut<AiActionCooldown>>,
+    prod_cooldown: Option<ResMut<AiProductionCooldown>>,
+) {
+    if events.is_empty() {
+        return;
+    }
+    events.clear();
+
+    if let Some(mut ac) = action_cooldown {
+        ac.0.clear();
+    }
+    if let Some(mut pc) = prod_cooldown {
+        pc.0.clear();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum AiCommand {
     Attack {
@@ -726,20 +748,62 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> bool {
         return true;
     }
 
-    // 全ユニットの検討が終わったら冷却リストをクリアする（生産や次ターン移行の準備）
-    if let Some(mut res) = world.get_resource_mut::<AiActionCooldown>() {
-        res.0.clear();
-    }
-
     // 2. 生産行動
     let prod_commands = super::production::decide_production(world, active_player);
-    if let Some(cmd) = prod_commands.into_iter().next() {
+
+    let cooldown_set = if let Some(res) = world.get_resource::<AiProductionCooldown>() {
+        res.0.clone()
+    } else {
+        HashSet::new()
+    };
+
+    // 診断情報を取得（前回のエラーを確認）
+    let (last_error, last_event_str) =
+        if let Some(diag) = world.get_resource::<crate::resources::ProductionDiagnostic>() {
+            (diag.last_error.clone(), diag.last_event.clone())
+        } else {
+            (None, None)
+        };
+
+    for cmd in prod_commands {
+        // 冷却中（今ターン既に試行済み）の座標はスキップ
+        if cooldown_set.contains(&(cmd.target_x, cmd.target_y)) {
+            continue;
+        }
+
+        // 直前のエラーがこのコマンドに関連しているかチェック
+        let cmd_debug = format!("{:?}", cmd);
+        if last_error.is_some() && last_event_str.as_deref() == Some(&cmd_debug) {
+            // 前回と同じコマンドでエラーが発生している場合はスキップ
+            // 座標を冷却リストに入れて再試行を防ぐ
+            if let Some(mut res) = world.get_resource_mut::<AiProductionCooldown>() {
+                res.0.insert((cmd.target_x, cmd.target_y));
+            }
+            continue;
+        }
+
+        // コマンドを発行し、冷却リストに追加
+        let mut sent = false;
+        {
+            if let Some(mut res) = world.get_resource_mut::<AiProductionCooldown>() {
+                res.0.insert((cmd.target_x, cmd.target_y));
+            } else {
+                let mut set = HashSet::new();
+                set.insert((cmd.target_x, cmd.target_y));
+                world.insert_resource(AiProductionCooldown(set));
+            }
+        }
+
         if let Some(mut events) =
             world.get_resource_mut::<Events<crate::events::ProduceUnitCommand>>()
         {
             events.send(cmd);
+            sent = true;
         }
-        return true;
+
+        if sent {
+            return true;
+        }
     }
 
     // 3. 全行動完了 -> ターン終了

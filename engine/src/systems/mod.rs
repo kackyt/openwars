@@ -29,6 +29,7 @@ pub fn add_main_game_systems(schedule: &mut Schedule) {
     schedule.configure_sets(GameSystemSet);
     schedule.add_systems(
         (
+            crate::ai::engine::clear_ai_cooldowns_system,
             produce_unit_system,
             move_unit_system,
             attack_unit_system,
