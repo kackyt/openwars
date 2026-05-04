@@ -33,6 +33,10 @@ pub enum AiCommand {
         target_pos: GridPosition,
         transport_entity: Entity,
     },
+    Drop {
+        target_pos: GridPosition,
+        cargo_entity: Entity,
+    },
     Supply {
         target_pos: GridPosition,
         target_entity: Entity,
@@ -363,13 +367,125 @@ pub fn decide_ai_action(
                     });
                 }
             }
+
+            // (D) Load
+            if actions.can_load {
+                let transports = crate::systems::transport::get_loadable_transports_at(
+                    world,
+                    unit_entity,
+                    current_grid,
+                );
+                for transport_entity in transports {
+                    // 目的地までの距離が遠いほど、搭載する価値が高まる
+                    let mut min_objective_dist = 99;
+                    for (p_pos, _, p_owner) in &properties {
+                        if *p_owner != Some(player_id) {
+                            let d = (current_grid.x as i32 - p_pos.x as i32).abs()
+                                + (current_grid.y as i32 - p_pos.y as i32).abs();
+                            if d < min_objective_dist {
+                                min_objective_dist = d;
+                            }
+                        }
+                    }
+
+                    let mut load_score = 2000;
+                    if min_objective_dist > 5 {
+                        load_score += 1500; // 遠い場合は積極的に乗る
+                    }
+
+                    let score = base_tile_score + load_score;
+                    #[allow(clippy::collapsible_if)]
+                    if score > best_unit_score {
+                        best_unit_score = score;
+                        best_unit_choice = Some(AiCommand::Load {
+                            transport_entity,
+                            target_pos: current_grid,
+                        });
+                    }
+                }
+            }
+
+            // (E) Drop
+            if actions.can_drop {
+                #[allow(clippy::collapsible_if)]
+                if let Ok(cargo) = world
+                    .query::<&crate::components::CargoCapacity>()
+                    .get(world, unit_entity)
+                {
+                    let cargo_entities = cargo.loaded.clone();
+                    for cargo_entity in cargo_entities {
+                        // 未行動のユニットのみ降ろす
+                        if let Some(action) =
+                            world.get::<crate::components::ActionCompleted>(cargo_entity)
+                        {
+                            #[allow(clippy::collapsible_if)]
+                            if !action.0 {
+                                // 降車可能なマスを探索
+                                let drop_tiles = crate::systems::transport::get_droppable_tiles(
+                                    world,
+                                    unit_entity,
+                                    cargo_entity,
+                                );
+                                for drop_tile in drop_tiles {
+                                    let drop_pos = GridPosition {
+                                        x: drop_tile.0,
+                                        y: drop_tile.1,
+                                    };
+
+                                    // 降車先の価値を評価
+                                    let mut drop_score = 5000; // 基本的に降ろすのは良いこと
+
+                                    // 降車先が拠点ならボーナス
+                                    for (p_pos, _, p_owner) in &properties {
+                                        if p_pos.x == drop_pos.x && p_pos.y == drop_pos.y {
+                                            if *p_owner != Some(player_id) {
+                                                drop_score += 3000; // 敵拠点の占領準備
+                                            }
+                                            break;
+                                        }
+                                    }
+
+                                    // 敵に近いならボーナス（攻撃準備）
+                                    let mut min_enemy_dist = 99;
+                                    for (e_pos, _, _, _) in &enemy_units {
+                                        let d = (drop_pos.x as i32 - e_pos.x as i32).abs()
+                                            + (drop_pos.y as i32 - e_pos.y as i32).abs();
+                                        if d < min_enemy_dist {
+                                            min_enemy_dist = d;
+                                        }
+                                    }
+                                    if min_enemy_dist <= 1 {
+                                        drop_score += 2000;
+                                    }
+
+                                    // 危険地帯（敵の攻撃範囲）ならペナルティ
+                                    if min_enemy_dist == 0 {
+                                        drop_score -= 1000;
+                                    }
+
+                                    let score = base_tile_score + drop_score;
+                                    #[allow(clippy::collapsible_if)]
+                                    if score > best_unit_score {
+                                        best_unit_score = score;
+                                        best_unit_choice = Some(AiCommand::Drop {
+                                            target_pos: drop_pos,
+                                            cargo_entity,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        if let Some(choice) = best_unit_choice
-            && best_unit_score > best_overall_score
-        {
-            best_overall_score = best_unit_score;
-            best_overall_choice = Some((unit_entity, choice));
+        #[allow(clippy::collapsible_if)]
+        if let Some(choice) = best_unit_choice {
+            if best_unit_score > best_overall_score {
+                best_overall_score = best_unit_score;
+                best_overall_choice = Some((unit_entity, choice));
+            }
         }
     }
 
@@ -457,6 +573,21 @@ pub fn execute_ai_command(world: &mut World, unit_entity: Entity, command: AiCom
                 evs.send(crate::events::LoadUnitCommand {
                     unit_entity,
                     transport_entity,
+                });
+            }
+        }
+        AiCommand::Drop {
+            target_pos,
+            cargo_entity,
+        } => {
+            if let Some(mut evs) =
+                world.get_resource_mut::<Events<crate::events::UnloadUnitCommand>>()
+            {
+                evs.send(crate::events::UnloadUnitCommand {
+                    transport_entity: unit_entity,
+                    cargo_entity,
+                    target_x: target_pos.x,
+                    target_y: target_pos.y,
                 });
             }
         }
@@ -994,6 +1125,193 @@ mod tests {
         assert!(action.is_some());
         if let Some((_, AiCommand::Attack { .. })) = action {
             panic!("AI should not perform a suicidal attack (Infantry vs Tank)");
+        }
+    }
+
+    #[test]
+    fn test_decide_ai_action_load() {
+        let mut world = World::new();
+        world.insert_resource(DamageChart::new());
+        world.insert_resource(Map {
+            width: 10,
+            height: 10,
+            tiles: vec![Terrain::Plains; 100],
+            topology: crate::resources::GridTopology::Square,
+        });
+        crate::resources::master_data::MasterDataRegistry::load()
+            .map(|m| world.insert_resource(m))
+            .unwrap();
+
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+
+        world.spawn((
+            GridPosition { x: 9, y: 9 },
+            Property {
+                terrain: Terrain::City,
+                owner_id: Some(p2),
+                capture_points: 20,
+                max_capture_points: 20,
+            },
+        ));
+
+        let _inf = world
+            .spawn((
+                p1,
+                Faction(p1),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 1, y: 1 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    max_movement: 3,
+                    can_capture: true,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+            ))
+            .id();
+
+        let _transport = world
+            .spawn((
+                p1,
+                Faction(p1),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 1, y: 1 },
+                UnitStats {
+                    unit_type: UnitType::TransportHelicopter,
+                    max_cargo: 2,
+                    loadable_unit_types: vec![UnitType::Infantry],
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                crate::components::CargoCapacity {
+                    max: 2,
+                    loaded: vec![],
+                },
+            ))
+            .id();
+
+        let skips = std::collections::HashSet::new();
+        let action = decide_ai_action(&mut world, p1, &skips);
+
+        assert!(action.is_some());
+        let (_ent, cmd) = action.unwrap();
+        match cmd {
+            AiCommand::Load { .. } => {}
+            other => panic!("Expected Load command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decide_ai_action_drop() {
+        let mut world = World::new();
+        world.insert_resource(DamageChart::new());
+        world.insert_resource(Map {
+            width: 10,
+            height: 10,
+            tiles: vec![Terrain::Plains; 100],
+            topology: crate::resources::GridTopology::Square,
+        });
+        crate::resources::master_data::MasterDataRegistry::load()
+            .map(|m| world.insert_resource(m))
+            .unwrap();
+
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+
+        world.spawn((
+            GridPosition { x: 1, y: 2 },
+            Property {
+                terrain: Terrain::City,
+                owner_id: Some(p2),
+                capture_points: 20,
+                max_capture_points: 20,
+            },
+        ));
+
+        let inf = world
+            .spawn((
+                p1,
+                Faction(p1),
+                HasMoved(true),
+                ActionCompleted(false),
+                GridPosition { x: 999, y: 999 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    movement_type: crate::resources::MovementType::Infantry,
+                    can_capture: true,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Transporting(Entity::from_raw(0)),
+            ))
+            .id();
+
+        let transport = world
+            .spawn((
+                p1,
+                Faction(p1),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 1, y: 1 },
+                UnitStats {
+                    unit_type: UnitType::TransportHelicopter,
+                    max_cargo: 2,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                crate::components::CargoCapacity {
+                    max: 2,
+                    loaded: vec![inf],
+                },
+            ))
+            .id();
+
+        world
+            .entity_mut(inf)
+            .insert(crate::components::Transporting(transport));
+
+        let skips = std::collections::HashSet::new();
+        let action = decide_ai_action(&mut world, p1, &skips);
+
+        assert!(action.is_some());
+        let (_ent, cmd) = action.unwrap();
+        match cmd {
+            AiCommand::Drop {
+                target_pos,
+                cargo_entity,
+            } => {
+                assert_eq!(cargo_entity, inf);
+                assert_eq!(target_pos.x, 1);
+                assert_eq!(target_pos.y, 2);
+            }
+            other => panic!("Expected Drop command, got {:?}", other),
         }
     }
 }
