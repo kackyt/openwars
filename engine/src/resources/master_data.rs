@@ -448,6 +448,15 @@ impl MasterDataRegistry {
             .unwrap_or(0)
     }
 
+    /// 施設（地形）でそのユニットを補給・回復できるか判定する
+    pub fn can_repair_on_terrain(
+        &self,
+        unit_type: crate::resources::UnitType,
+        terrain: crate::resources::Terrain,
+    ) -> bool {
+        self.can_produce_unit(terrain.as_str(), unit_type)
+    }
+
     /// ユニット名(UnitName)からコンポーネントとしての UnitStats を構築して返す。
     /// マスターデータに不備がある場合は MasterDataError を返す。
     pub fn create_unit_stats(

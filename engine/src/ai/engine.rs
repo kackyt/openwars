@@ -139,6 +139,8 @@ pub fn decide_ai_action(
             )
         };
 
+        let is_combat_ineffective = atk_hp < 40 || (stats.max_ammo1 > 0 && atk_ammo.0 == 0);
+
         let map = world.resource::<Map>().clone();
         let registry = world.resource::<MasterDataRegistry>().clone();
 
@@ -196,6 +198,24 @@ pub fn decide_ai_action(
             let mut base_tile_score = 0;
             if let Some(terrain) = map.get_terrain(current_grid.x, current_grid.y) {
                 base_tile_score += registry.get_terrain_defense_bonus(terrain) as i32 * 10;
+            }
+
+            // 戦闘不能時の撤退先探索
+            if is_combat_ineffective {
+                let mut min_recovery_dist = 99;
+                for (p_pos, p_terrain, p_owner) in &properties {
+                    if *p_owner == Some(player_id)
+                        && registry.can_repair_on_terrain(stats.unit_type, *p_terrain)
+                    {
+                        let d = (current_grid.x as i32 - p_pos.x as i32).abs()
+                            + (current_grid.y as i32 - p_pos.y as i32).abs();
+                        if d < min_recovery_dist {
+                            min_recovery_dist = d;
+                        }
+                    }
+                }
+                // 拠点に近づくほど高スコア
+                base_tile_score += (20 - min_recovery_dist).max(0) * 100;
             }
 
             // 占領価値・拠点接近スコア
@@ -340,6 +360,11 @@ pub fn decide_ai_action(
                         let damage_val = (expected_actual_damage * t_stats.cost) / 100;
                         attack_score += damage_val as i32;
 
+                        // 戦闘不能時は攻撃を躊躇させる（撃破できない限り）
+                        if is_combat_ineffective && expected_actual_damage < t_health.current {
+                            attack_score -= 3000;
+                        }
+
                         // 撃破できる場合はボーナス
                         if expected_actual_damage >= t_health.current {
                             attack_score += 5000;
@@ -359,12 +384,72 @@ pub fn decide_ai_action(
 
             // (C) Wait
             if actions.can_wait {
-                let score = base_tile_score;
+                let mut score = base_tile_score;
+
+                // 拠点での待機評価
+                let mut is_on_recovery_property = false;
+                for (p_pos, p_terrain, p_owner) in &properties {
+                    if p_pos.x == current_grid.x
+                        && p_pos.y == current_grid.y
+                        && *p_owner == Some(player_id)
+                        && registry.can_repair_on_terrain(stats.unit_type, *p_terrain)
+                    {
+                        is_on_recovery_property = true;
+                        break;
+                    }
+                }
+
+                if is_on_recovery_property {
+                    if is_combat_ineffective {
+                        score += 8000; // 戦闘不能なら最優先
+                    } else if atk_hp < 100 || atk_ammo.0 < stats.max_ammo1 {
+                        score += 1000; // 少しでも消耗していれば拠点に留まる価値あり
+                    }
+                } else if is_combat_ineffective {
+                    // 拠点以外の場所での待機は避ける
+                    score -= 5000;
+                }
+
                 if score > best_unit_score {
                     best_unit_score = score;
                     best_unit_choice = Some(AiCommand::Wait {
                         target_pos: current_grid,
                     });
+                }
+            }
+
+            // (F) Merge
+            if actions.can_merge {
+                let targets = crate::systems::merge::get_mergable_targets_at(
+                    world,
+                    unit_entity,
+                    current_grid,
+                );
+                for target_entity in targets {
+                    let mut merge_score = 3000;
+                    if let (Some(t_health), Some(_t_stats)) = (
+                        world.get::<Health>(target_entity),
+                        world.get::<UnitStats>(target_entity),
+                    ) {
+                        // 自身または相手のHPが低い場合、合流の価値を高める
+                        if is_combat_ineffective || t_health.current < 40 {
+                            merge_score += 4000;
+                        }
+                        // 合流後のHPが無駄にならない（100を大幅に超えない）なら加点
+                        let total_hp = atk_hp + t_health.current;
+                        if total_hp <= 110 {
+                            merge_score += 1000;
+                        }
+
+                        let score = base_tile_score + merge_score;
+                        if score > best_unit_score {
+                            best_unit_score = score;
+                            best_unit_choice = Some(AiCommand::Merge {
+                                target_pos: current_grid,
+                                target_entity,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -1312,6 +1397,221 @@ mod tests {
                 assert_eq!(target_pos.y, 2);
             }
             other => panic!("Expected Drop command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decide_ai_action_retreat_low_hp() {
+        let mut world = World::new();
+        world.insert_resource(DamageChart::new());
+        world.insert_resource(Map {
+            width: 5,
+            height: 5,
+            tiles: vec![Terrain::Plains; 25],
+            topology: crate::resources::GridTopology::Square,
+        });
+        crate::resources::master_data::MasterDataRegistry::load()
+            .map(|m| world.insert_resource(m))
+            .unwrap();
+
+        let p1 = PlayerId(1);
+        // 都市を(1,1)に設置
+        world.spawn((
+            GridPosition { x: 1, y: 1 },
+            Property::new(Terrain::City, Some(p1), 200),
+        ));
+
+        // 低HP(30)の戦車を(1,0)に配置
+        world.spawn((
+            p1,
+            Faction(p1),
+            HasMoved(false),
+            ActionCompleted(false),
+            GridPosition { x: 1, y: 0 },
+            UnitStats {
+                unit_type: UnitType::Tank,
+                cost: 7000,
+                max_movement: 3,
+                movement_type: crate::resources::MovementType::Tank,
+                max_fuel: 99,
+                ..UnitStats::mock()
+            },
+            Health {
+                current: 30,
+                max: 100,
+            },
+            crate::components::Fuel {
+                current: 99,
+                max: 99,
+            },
+        ));
+
+        let skips = std::collections::HashSet::new();
+        let action = decide_ai_action(&mut world, p1, &skips);
+
+        assert!(action.is_some());
+        if let Some((_, AiCommand::Wait { target_pos })) = action {
+            // (1,1)の都市へ移動して待機することを確認
+            assert_eq!(target_pos.x, 1);
+            assert_eq!(target_pos.y, 1);
+        } else {
+            panic!("Expected Wait at (1,1), got {:?}", action);
+        }
+    }
+
+    #[test]
+    fn test_decide_ai_action_merge() {
+        let mut world = World::new();
+        world.insert_resource(DamageChart::new());
+        world.insert_resource(Map {
+            width: 5,
+            height: 5,
+            tiles: vec![Terrain::Plains; 25],
+            topology: crate::resources::GridTopology::Square,
+        });
+        crate::resources::master_data::MasterDataRegistry::load()
+            .map(|m| world.insert_resource(m))
+            .unwrap();
+
+        let p1 = PlayerId(1);
+
+        // 低HP(50)の歩兵Aを(0,0)に配置
+        let unit_a = world
+            .spawn((
+                p1,
+                Faction(p1),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 0, y: 0 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    cost: 1000,
+                    max_movement: 3,
+                    movement_type: crate::resources::MovementType::Infantry,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 50,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+            ))
+            .id();
+
+        // 低HP(40)の歩兵Bを(1,0)に配置
+        let unit_b = world
+            .spawn((
+                p1,
+                Faction(p1),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 1, y: 0 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    cost: 1000,
+                    max_movement: 3,
+                    movement_type: crate::resources::MovementType::Infantry,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 40,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+            ))
+            .id();
+
+        let skips = std::collections::HashSet::new();
+        let action = decide_ai_action(&mut world, p1, &skips);
+
+        assert!(action.is_some());
+        // 歩兵Aが歩兵Bの位置(1,0)へ移動してMergeすることを確認
+        if let Some((
+            entity,
+            AiCommand::Merge {
+                target_pos,
+                target_entity,
+            },
+        )) = action
+        {
+            assert_eq!(entity, unit_a);
+            assert_eq!(target_pos.x, 1);
+            assert_eq!(target_pos.y, 0);
+            assert_eq!(target_entity, unit_b);
+        } else {
+            panic!("Expected Merge command, got {:?}", action);
+        }
+    }
+
+    #[test]
+    fn test_decide_ai_action_retreat_no_ammo() {
+        let mut world = World::new();
+        world.insert_resource(DamageChart::new());
+        world.insert_resource(Map {
+            width: 5,
+            height: 5,
+            tiles: vec![Terrain::Plains; 25],
+            topology: crate::resources::GridTopology::Square,
+        });
+        crate::resources::master_data::MasterDataRegistry::load()
+            .map(|m| world.insert_resource(m))
+            .unwrap();
+
+        let p1 = PlayerId(1);
+        // 都市を(1,1)に設置
+        world.spawn((
+            GridPosition { x: 1, y: 1 },
+            Property::new(Terrain::City, Some(p1), 200),
+        ));
+
+        // 弾薬切れ(0)の戦車を(1,0)に配置
+        world.spawn((
+            p1,
+            Faction(p1),
+            HasMoved(false),
+            ActionCompleted(false),
+            GridPosition { x: 1, y: 0 },
+            UnitStats {
+                unit_type: UnitType::Tank,
+                cost: 7000,
+                max_movement: 3,
+                movement_type: crate::resources::MovementType::Tank,
+                max_fuel: 99,
+                max_ammo1: 5, // 主武装あり
+                ..UnitStats::mock()
+            },
+            Health {
+                current: 100, // HPは満タン
+                max: 100,
+            },
+            crate::components::Ammo {
+                ammo1: 0, // 弾薬切れ
+                max_ammo1: 5,
+                ammo2: 99,
+                max_ammo2: 99,
+            },
+            crate::components::Fuel {
+                current: 99,
+                max: 99,
+            },
+        ));
+
+        let skips = std::collections::HashSet::new();
+        let action = decide_ai_action(&mut world, p1, &skips);
+
+        assert!(action.is_some());
+        if let Some((_, AiCommand::Wait { target_pos })) = action {
+            // (1,1)の都市へ移動して待機することを確認
+            assert_eq!(target_pos.x, 1);
+            assert_eq!(target_pos.y, 1);
+        } else {
+            panic!("Expected Wait at (1,1) due to no ammo, got {:?}", action);
         }
     }
 }
