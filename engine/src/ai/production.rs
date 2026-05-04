@@ -1,18 +1,31 @@
-use crate::components::{Faction, GridPosition, PlayerId, Property, Transporting, UnitStats};
+use crate::ai::strategy::{ProductionPlan, ProductionStrategy, analyze_strategy};
+use crate::components::{Faction, GridPosition, PlayerId, Property, UnitStats};
 use crate::events::ProduceUnitCommand;
 use crate::resources::master_data::MasterDataRegistry;
 use crate::resources::{DamageChart, Players, UnitRegistry, UnitType};
 use bevy_ecs::prelude::*;
 
+use super::strategy::GamePhase;
+
 /// 生産AI。
 /// 以下のロジックで生産計画を立てます。
 /// - 歩兵・重歩兵は占領等のため10体を目安に高く評価
-/// - その他のユニットは敵軍のユニットとの相性やコストから評価値を計算
-/// - 予算内で最も評価が高くなるよう動的計画法（ナップサック問題）で生産数・ユニットを決定
-/// - 配置場所は、敵や未占領拠点からの距離で最も評価が高くなる位置を選ぶ
+/// - その他のユニットは戦略（フェーズ）、アンチ性能、到達ターン数（ETA）に基づき多角的に評価
+/// - 予算（貯金を差し引いた仮想予算）内で最も評価が高くなるよう動的計画法（ナップサック問題）で生産を決定
 pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceUnitCommand> {
-    use crate::systems::production::can_produce_at;
     let mut commands = Vec::new();
+
+    let strategy = analyze_strategy(world, player_id);
+
+    let (unit_registry, damage_chart, master_data) = {
+        let ur = world.get_resource::<UnitRegistry>().cloned();
+        let dc = world.get_resource::<DamageChart>().cloned();
+        let md = world.get_resource::<MasterDataRegistry>().cloned();
+        if ur.is_none() || dc.is_none() || md.is_none() {
+            return commands;
+        }
+        (ur.unwrap(), dc.unwrap(), md.unwrap())
+    };
 
     let current_funds = if let Some(players) = world.get_resource::<Players>() {
         players
@@ -25,34 +38,102 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
         return commands;
     };
 
-    // 補充や修理のための予備資金として1000Gを残す
-    const RESERVE_FUNDS: u32 = 1000;
-    let available_funds = current_funds.saturating_sub(RESERVE_FUNDS);
+    // 1. 資金計画の更新
+    let mut reserves = 0;
+    if let Some(mut plan) = world.get_resource_mut::<ProductionPlan>() {
+        if strategy.phase == GamePhase::Defense {
+            // 防衛期は貯金を崩して全力生産
+            plan.reserves.insert(player_id.0, 0);
+        } else {
+            reserves = *plan.reserves.get(&player_id.0).unwrap_or(&0);
 
-    let (unit_registry, damage_chart, master_data) = {
-        let ur = world.get_resource::<UnitRegistry>().cloned();
-        let dc = world.get_resource::<DamageChart>().cloned();
-        let md = world.get_resource::<MasterDataRegistry>().cloned();
-        if ur.is_none() || dc.is_none() || md.is_none() {
-            return commands;
+            // 欲しいユニット（一番スコアが高いもの）が買えない場合、貯金を検討
+            let mut available_types = Vec::new();
+            for (unit_type, stats) in &unit_registry.0 {
+                available_types.push((*unit_type, stats.clone()));
+            }
+
+            let mut best_unit = None;
+            let mut max_score = 0;
+            // 仮の拠点を中心にスコアを計算
+            let dummy_pos = GridPosition { x: 0, y: 0 };
+
+            for (ut, stats) in &available_types {
+                let score = calculate_unit_score_at(
+                    *ut,
+                    stats,
+                    dummy_pos,
+                    &strategy,
+                    &[],
+                    &[],
+                    &damage_chart,
+                    &master_data,
+                );
+                if score > max_score {
+                    max_score = score;
+                    best_unit = Some((*ut, stats.cost));
+                }
+            }
+
+            if let Some((ut, cost)) = best_unit
+                && cost > current_funds
+                && cost > reserves
+            {
+                // 現在の所持金で買えず、かつ貯金目標も下回っているなら貯金目標を更新
+                plan.reserves.insert(player_id.0, cost);
+                plan.reservations.entry(player_id.0).or_default().push(ut);
+                reserves = cost;
+            }
         }
-        (ur.unwrap(), dc.unwrap(), md.unwrap())
+    } else {
+        // リソースがない場合は作成
+        world.insert_resource(ProductionPlan::default());
+    }
+
+    // 2. 実行予算の算出
+    // 貯金目標（reserves）がある場合、今ターンは「(所持金 - 目標額)」ではなく
+    // 「今ターンの収入を貯金に回す」イメージ。
+    // ここでは単純に「(所持金 - 1000G buffer) のうち、目標額に達するまでは控えめに使う」とする。
+    const MIN_BUFFER: u32 = 1000;
+    let available_funds = if strategy.phase == GamePhase::Defense {
+        current_funds.saturating_sub(MIN_BUFFER)
+    } else {
+        // 貯金目標がある場合、その半分程度は今ターン使わずに残す
+        current_funds
+            .saturating_sub(MIN_BUFFER)
+            .saturating_sub(reserves / 2)
     };
 
-    let mut my_infantry_count = 0;
     let mut enemy_units = Vec::new();
-    let mut unowned_properties = Vec::new();
     let mut my_facilities = Vec::new();
     let mut occupied_positions = std::collections::HashSet::new();
+    let mut my_empty_transports = Vec::new();
 
     {
-        let mut q_units =
-            world.query_filtered::<(&GridPosition, &Faction, &UnitStats), Without<Transporting>>();
-        for (pos, faction, stats) in q_units.iter(world) {
+        // マップ上の全ユニットをスキャン
+        let mut q_units = world.query::<(
+            Entity,
+            &GridPosition,
+            &Faction,
+            &UnitStats,
+            Option<&crate::components::CargoCapacity>,
+            Option<&crate::components::Transporting>,
+        )>();
+        for (_entity, pos, faction, stats, cargo_opt, transporting_opt) in q_units.iter(world) {
+            // 輸送中のユニットはマップ上に存在しないため除外
+            if transporting_opt.is_some() {
+                continue;
+            }
+
             occupied_positions.insert(*pos);
             if faction.0 == player_id {
-                if stats.unit_type == UnitType::Infantry || stats.unit_type == UnitType::Mech {
-                    my_infantry_count += 1;
+                // 空の輸送ユニット（収容数が0）を収集
+                if let Some(cargo) = cargo_opt
+                    && cargo.loaded.is_empty()
+                    && (stats.unit_type == UnitType::SupplyTruck
+                        || stats.unit_type == UnitType::TransportHelicopter)
+                {
+                    my_empty_transports.push(*pos);
                 }
             } else {
                 enemy_units.push((*pos, stats.clone()));
@@ -63,12 +144,9 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
         for (pos, prop) in q_props.iter(world) {
             if prop.owner_id == Some(player_id)
                 && master_data.is_production_facility(prop.terrain.as_str())
+                && !occupied_positions.contains(pos)
             {
-                if !occupied_positions.contains(pos) {
-                    my_facilities.push((*pos, prop.terrain));
-                }
-            } else if prop.owner_id != Some(player_id) {
-                unowned_properties.push(*pos);
+                my_facilities.push((*pos, prop.terrain));
             }
         }
     }
@@ -82,176 +160,155 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
         available_types.push((*unit_type, stats.clone()));
     }
 
-    let mut production_candidates = Vec::new();
-
-    for (ut, stats) in &available_types {
-        let mut score = 0;
-
-        if *ut == UnitType::Infantry || *ut == UnitType::Mech {
-            if my_infantry_count < 10 {
-                // 歩兵が足りない場合、1体につき1000点（歩兵の標準コスト相当）のボーナスを与えて生産を促進する
-                let infantry_cost = unit_registry
-                    .get_stats(UnitType::Infantry)
-                    .map(|s| s.cost)
-                    .unwrap_or(1000);
-                // 歩兵が足りない場合、1体につき歩兵の標準コスト相当のボーナスを与えて生産を促進する
-                let infantry_shortage_bonus = infantry_cost;
-                score += (10 - my_infantry_count) * infantry_shortage_bonus;
-            }
-            // 軽歩兵と重歩兵の基礎スコアを、ユニットの機動力（移動力）と潜在的な戦闘力（コスト）のバランスから動的に算出する
-            // 軽歩兵は移動力が高いこと、重歩兵はコストが高いこと（戦闘力に比例）が評価に反映される
-            score += stats.max_movement * 100 + (stats.cost / 10);
-        }
-
-        let mut combat_score = 0;
-        for (_, enemy_stats) in &enemy_units {
-            let base_dmg = damage_chart
-                .get_base_damage(*ut, enemy_stats.unit_type)
-                .unwrap_or(0);
-            let sec_dmg = damage_chart
-                .get_base_damage_secondary(*ut, enemy_stats.unit_type)
-                .unwrap_or(0);
-            let max_dmg = std::cmp::max(base_dmg, sec_dmg);
-
-            // ダメージはパーセンテージ（0-100）であるため、敵のコストに掛けて100で割ることで、実質的なダメージ金額価値を算出する
-            combat_score += (max_dmg * enemy_stats.cost) / 100;
-        }
-        score += combat_score;
-
-        production_candidates.push((stats.cost, score, *ut));
-    }
-
     let max_items = my_facilities.len();
-    // 計算量を削減するため、予算とコストを100G単位にスケールダウンしてDPテーブルを構築する
     let budget = (available_funds / 100) as usize;
     let mut dp = vec![vec![0; budget + 1]; max_items + 1];
     let mut choice = vec![vec![None; budget + 1]; max_items + 1];
 
     for i in 1..=max_items {
-        let (_pos, terrain) = my_facilities[i - 1];
+        let (facility_pos, terrain) = my_facilities[i - 1];
         let terrain_name = terrain.as_str();
 
         for w in 0..=budget {
             dp[i][w] = dp[i - 1][w];
             choice[i][w] = None;
 
-            for (cost, score, ut) in &production_candidates {
-                // その施設で生産可能なユニットのみを検討する
+            for (ut, stats) in &available_types {
                 if !master_data.can_produce_unit(terrain_name, *ut) {
                     continue;
                 }
 
-                let scaled_cost = (*cost / 100) as usize;
+                let scaled_cost = (stats.cost / 100) as usize;
                 if scaled_cost <= w {
+                    let score = calculate_unit_score_at(
+                        *ut,
+                        stats,
+                        facility_pos,
+                        &strategy,
+                        &enemy_units,
+                        &my_empty_transports,
+                        &damage_chart,
+                        &master_data,
+                    );
+
+                    #[cfg(test)]
+                    println!(
+                        "AI Production: Unit={:?}, Pos={:?}, Score={}, Phase={:?}",
+                        ut, facility_pos, score, strategy.phase
+                    );
+
                     let new_score = dp[i - 1][w - scaled_cost] + score;
                     if new_score > dp[i][w] {
                         dp[i][w] = new_score;
-                        choice[i][w] = Some((*ut, scaled_cost));
+                        choice[i][w] = Some((*ut, scaled_cost, facility_pos));
                     }
                 }
             }
         }
     }
 
-    let mut selected_units = Vec::new();
     let mut curr_w = budget;
     for i in (1..=max_items).rev() {
-        if let Some((ut, cost)) = choice[i][curr_w] {
-            selected_units.push(ut);
-            curr_w -= cost;
-        }
-    }
-
-    for ut in selected_units {
-        let mut best_facility_idx = None;
-        let mut best_place_score: isize = -1;
-
-        for (idx, (pos, _terrain)) in my_facilities.iter().enumerate() {
-            if can_produce_at(world, player_id, pos.x, pos.y, ut, &master_data).is_err() {
-                continue;
-            }
-
-            let mut place_score: isize = 0;
-
-            let stats = unit_registry.get_stats(ut).unwrap();
-            let max_movement = std::cmp::max(1, stats.max_movement) as isize;
-            let max_range = stats.max_range as isize;
-
-            // ユニットの機動力と移動コストを加味して到達ターン数を近似する
-            // 本格的な経路探索は重いため、対象までの直線距離(マンハッタン)に対し、平地(Plains)の移動コストを掛けて概算する
-            let plains_cost = master_data
-                .get_movement_cost(stats.movement_type, "平地")
-                .unwrap_or(1) as isize;
-            let avg_move_cost = plains_cost;
-
-            if ut == UnitType::Infantry || ut == UnitType::Mech {
-                let mut min_turns = isize::MAX;
-                for unowned_pos in &unowned_properties {
-                    let dist = (pos.x as isize - unowned_pos.x as isize).abs()
-                        + (pos.y as isize - unowned_pos.y as isize).abs();
-                    // 拠点に到達するまでのターン数を計算 (切り上げ)
-                    let turns = std::cmp::max(
-                        1,
-                        ((dist * avg_move_cost) + max_movement - 1) / max_movement,
-                    );
-                    if turns < min_turns {
-                        min_turns = turns;
-                    }
-                }
-                if min_turns != isize::MAX {
-                    let infantry_cost = stats.cost as isize;
-                    // 到達ターン数で評価値を割り引く（1ターンの場合は期待値/1, 2ターンの場合は期待値/2）
-                    place_score += infantry_cost / min_turns;
-                }
-            } else {
-                let mut combat_place_score = 0;
-                for (enemy_pos, enemy_stats) in &enemy_units {
-                    let dist = (pos.x as isize - enemy_pos.x as isize).abs()
-                        + (pos.y as isize - enemy_pos.y as isize).abs();
-                    // 遠距離ユニットの場合は射程に入るまでの距離で計算する
-                    let target_dist = std::cmp::max(0, dist - max_range);
-                    // 射程に入るまでのターン数を計算 (切り上げ)
-                    let turns = std::cmp::max(
-                        1,
-                        ((target_dist * avg_move_cost) + max_movement - 1) / max_movement,
-                    );
-
-                    let base_dmg = damage_chart
-                        .get_base_damage(ut, enemy_stats.unit_type)
-                        .unwrap_or(0);
-                    let sec_dmg = damage_chart
-                        .get_base_damage_secondary(ut, enemy_stats.unit_type)
-                        .unwrap_or(0);
-                    let max_dmg = std::cmp::max(base_dmg, sec_dmg);
-
-                    if max_dmg > 0 {
-                        // 基礎期待値を到達ターン数で割り引いて評価する
-                        let base_expected_value =
-                            (max_dmg as isize * enemy_stats.cost as isize) / 100;
-                        combat_place_score += base_expected_value / turns;
-                    }
-                }
-                place_score += combat_place_score;
-            }
-
-            if place_score > best_place_score {
-                best_place_score = place_score;
-                best_facility_idx = Some(idx);
-            }
-        }
-
-        if let Some(idx) = best_facility_idx {
-            let (pos, _) = my_facilities.remove(idx);
+        if let Some((ut, _cost, pos)) = choice[i][curr_w] {
             commands.push(ProduceUnitCommand {
                 target_x: pos.x,
                 target_y: pos.y,
                 unit_type: ut,
                 player_id,
             });
+            curr_w -= choice[i][curr_w].unwrap().1;
         }
     }
 
     commands
+}
+
+#[allow(clippy::too_many_arguments)]
+fn calculate_unit_score_at(
+    unit_type: UnitType,
+    stats: &UnitStats,
+    facility_pos: GridPosition,
+    strategy: &ProductionStrategy,
+    enemy_units: &[(GridPosition, UnitStats)],
+    my_empty_transports: &[GridPosition],
+    damage_chart: &DamageChart,
+    master_data: &MasterDataRegistry,
+) -> u32 {
+    // 1. BaseValue: 機動力、射程、コストをベースにする
+    // コストの重みを上げ、高価なユニットが選ばれやすくする
+    let base_value = (stats.max_movement * 20) + (stats.max_range * 50) + (stats.cost / 10);
+
+    // 2. StrategyBonus: 戦略フェーズと理想構成比率に基づく
+    let mut strategy_bonus = 0.0;
+    if let Some(&weight) = strategy.ideal_composition.get(&unit_type) {
+        strategy_bonus += weight * 4000.0;
+    }
+
+    // 防衛フェーズかつ戦闘ユニットなら追加ボーナス
+    if strategy.phase == GamePhase::Defense
+        && (unit_type == UnitType::Tank
+            || unit_type == UnitType::AntiAir
+            || unit_type == UnitType::Artillery)
+    {
+        strategy_bonus += 2000.0;
+    }
+
+    // 3. CounterBonus: 敵軍ユニットに対する有効性
+    let mut counter_bonus = 0;
+    for (_, enemy_stats) in enemy_units {
+        let base_dmg = damage_chart
+            .get_base_damage(unit_type, enemy_stats.unit_type)
+            .unwrap_or(0);
+        let sec_dmg = damage_chart
+            .get_base_damage_secondary(unit_type, enemy_stats.unit_type)
+            .unwrap_or(0);
+        let max_dmg = std::cmp::max(base_dmg, sec_dmg);
+        counter_bonus += (max_dmg * enemy_stats.cost) / 500;
+    }
+
+    // 4. EtaPenalty: ターゲットへの到着ターン数によるペナルティ
+    let mut eta_penalty = 0;
+    if !strategy.priority_targets.is_empty() {
+        let mut min_eta = 99;
+        let avg_move_cost = master_data
+            .get_movement_cost(stats.movement_type, "平地")
+            .unwrap_or(1);
+
+        // 周囲に空の輸送車がいるかチェック
+        let has_transport_near = my_empty_transports.iter().any(|t_pos| {
+            (t_pos.x as i32 - facility_pos.x as i32).abs()
+                + (t_pos.y as i32 - facility_pos.y as i32).abs()
+                <= 1
+        });
+
+        for target_pos in &strategy.priority_targets {
+            let dist = (facility_pos.x as i32 - target_pos.x as i32).abs()
+                + (facility_pos.y as i32 - target_pos.y as i32).abs();
+            // 射程を加味したターゲット距離
+            let target_dist = std::cmp::max(0, dist - stats.max_range as i32);
+
+            let mut eta = (target_dist as u32 * avg_move_cost + stats.max_movement - 1)
+                .checked_div(std::cmp::max(1, stats.max_movement))
+                .unwrap_or(1);
+
+            // 歩兵かつ輸送車が近くにいる場合、ETAを軽減
+            if (unit_type == UnitType::Infantry || unit_type == UnitType::Mech)
+                && has_transport_near
+            {
+                eta /= 2;
+            }
+
+            if eta < min_eta {
+                min_eta = eta;
+            }
+        }
+        // 1ターン遅れるごとに100点のペナルティ（最大1000点）
+        eta_penalty = std::cmp::min(1000, min_eta * 100);
+    }
+
+    let total_score =
+        (base_value as f32 + strategy_bonus) as i32 + counter_bonus as i32 - eta_penalty as i32;
+    std::cmp::max(1, total_score) as u32
 }
 
 #[cfg(test)]
@@ -364,6 +421,103 @@ mod tests {
     }
 
     #[test]
+    fn test_production_strategy_integration() {
+        let mut world = World::new();
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+
+        let mut registry = std::collections::HashMap::new();
+        registry.insert(
+            UnitType::Infantry,
+            UnitStats {
+                unit_type: UnitType::Infantry,
+                cost: 1000,
+                max_movement: 3,
+                max_range: 1,
+                ..UnitStats::mock()
+            },
+        );
+        registry.insert(
+            UnitType::Tank,
+            UnitStats {
+                unit_type: UnitType::Tank,
+                cost: 7000,
+                max_movement: 6,
+                max_range: 1,
+                ..UnitStats::mock()
+            },
+        );
+        world.insert_resource(UnitRegistry(registry));
+        world.insert_resource(DamageChart::new());
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+
+        // 1. Expansion Phase Test (Many unowned properties)
+        world.insert_resource(Players(vec![
+            Player {
+                id: p1,
+                name: "P1".to_string(),
+                funds: 50000,
+            },
+            Player {
+                id: p2,
+                name: "P2".to_string(),
+                funds: 10000,
+            },
+        ]));
+
+        // Capital at (0,0), Factory at (1,0)
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(p1), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Property::new(Terrain::Factory, Some(p1), 100),
+        ));
+
+        // Many neutral properties to trigger Expansion phase
+        for x in 2..10 {
+            world.spawn((
+                GridPosition { x, y: 0 },
+                Property::new(Terrain::City, None, 100),
+            ));
+        }
+
+        let commands = decide_production(&mut world, p1);
+        // Expansion phase should prioritize Infantry
+        assert!(commands.iter().any(|c| c.unit_type == UnitType::Infantry));
+
+        // 2. Defense Phase Test (Capital threatened)
+        world.insert_resource(Players(vec![Player {
+            id: p1,
+            name: "P1".to_string(),
+            funds: 50000,
+        }]));
+        // Capital at (0,0)
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(p1), 100),
+        ));
+        // Unit at (5,5) - not on factory
+        world.spawn((GridPosition { x: 5, y: 5 }, Faction(p1), UnitStats::mock()));
+        // Enemy tank near capital
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Faction(p2),
+            UnitStats::mock(),
+            crate::components::Health {
+                current: 100,
+                max: 100,
+            },
+        ));
+
+        let commands = decide_production(&mut world, p1);
+        // Defense phase should prioritize combat units (Tank) or AntiAir
+        // (Base score for Tank is much higher than Infantry when target is very close)
+        assert!(commands.iter().any(|c| c.unit_type == UnitType::Tank));
+    }
+
+    #[test]
     fn test_ai_production_skips_occupied_factory() {
         let mut world = World::new();
         let p1 = PlayerId(1);
@@ -468,6 +622,11 @@ mod additional_tests {
         world.insert_resource(MasterDataRegistry::load().unwrap());
 
         // Setup 2 factories
+        world.insert_resource(Players(vec![Player {
+            id: p1,
+            name: "P1".to_string(),
+            funds: 50000,
+        }]));
         world.spawn((
             GridPosition { x: 0, y: 0 },
             Property::new(crate::resources::Terrain::Capital, Some(p1), 200),
