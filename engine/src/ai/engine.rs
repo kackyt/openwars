@@ -13,6 +13,28 @@ use std::collections::HashSet;
 #[derive(Resource, Default)]
 pub struct AiActionCooldown(pub HashSet<Entity>);
 
+#[derive(Resource, Default)]
+pub struct AiProductionCooldown(pub HashSet<(usize, usize)>);
+
+/// ターン開始時にAIの冷却リストをクリアするシステム。
+pub fn clear_ai_cooldowns_system(
+    mut events: EventReader<crate::events::GamePhaseChangedEvent>,
+    action_cooldown: Option<ResMut<AiActionCooldown>>,
+    prod_cooldown: Option<ResMut<AiProductionCooldown>>,
+) {
+    if events.is_empty() {
+        return;
+    }
+    events.clear();
+
+    if let Some(mut ac) = action_cooldown {
+        ac.0.clear();
+    }
+    if let Some(mut pc) = prod_cooldown {
+        pc.0.clear();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum AiCommand {
     Attack {
@@ -32,6 +54,10 @@ pub enum AiCommand {
     Load {
         target_pos: GridPosition,
         transport_entity: Entity,
+    },
+    Drop {
+        target_pos: GridPosition,
+        cargo_entity: Entity,
     },
     Supply {
         target_pos: GridPosition,
@@ -135,6 +161,8 @@ pub fn decide_ai_action(
             )
         };
 
+        let is_combat_ineffective = atk_hp < 40 || (stats.max_ammo1 > 0 && atk_ammo.0 == 0);
+
         let map = world.resource::<Map>().clone();
         let registry = world.resource::<MasterDataRegistry>().clone();
 
@@ -160,11 +188,11 @@ pub fn decide_ai_action(
         };
 
         // 全敵ユニット情報を収集（ターゲット評価用）
-        let enemy_units: Vec<(GridPosition, crate::resources::UnitType, u32, u32)> = {
+        let enemy_units: Vec<(GridPosition, crate::resources::UnitType, u32, u32, u32)> = {
             let mut q = world.query::<(&GridPosition, &Faction, &UnitStats, &Health)>();
             q.iter(world)
                 .filter(|(_, f, _, h)| f.0 != player_id && h.current > 0)
-                .map(|(p, _, s, h)| (*p, s.unit_type, s.cost, h.current))
+                .map(|(p, _, s, h)| (*p, s.unit_type, s.cost, h.current, s.max_range))
                 .collect()
         };
 
@@ -194,6 +222,24 @@ pub fn decide_ai_action(
                 base_tile_score += registry.get_terrain_defense_bonus(terrain) as i32 * 10;
             }
 
+            // 戦闘不能時の撤退先探索
+            if is_combat_ineffective {
+                let mut min_recovery_dist = 99;
+                for (p_pos, p_terrain, p_owner) in &properties {
+                    if *p_owner == Some(player_id)
+                        && registry.can_repair_on_terrain(stats.unit_type, *p_terrain)
+                    {
+                        let d = (current_grid.x as i32 - p_pos.x as i32).abs()
+                            + (current_grid.y as i32 - p_pos.y as i32).abs();
+                        if d < min_recovery_dist {
+                            min_recovery_dist = d;
+                        }
+                    }
+                }
+                // 拠点に近づくほど高スコア
+                base_tile_score += (20 - min_recovery_dist).max(0) * 100;
+            }
+
             // 占領価値・拠点接近スコア
             if stats.can_capture {
                 let mut min_objective_dist = 99;
@@ -213,7 +259,7 @@ pub fn decide_ai_action(
                 let mut best_target_dist = 99;
                 let mut max_potential = -1.0;
 
-                for (e_pos, e_type, e_cost, e_hp) in &enemy_units {
+                for (e_pos, e_type, e_cost, e_hp, _) in &enemy_units {
                     let d = (current_grid.x as i32 - e_pos.x as i32).abs()
                         + (current_grid.y as i32 - e_pos.y as i32).abs();
 
@@ -241,7 +287,7 @@ pub fn decide_ai_action(
 
                 // fallback: 敵がいない、または誰も攻撃できない場合は最寄りの敵を目指す
                 if max_potential <= 0.0 {
-                    for (e_pos, _, _, _) in &enemy_units {
+                    for (e_pos, _, _, _, _) in &enemy_units {
                         let d = (current_grid.x as i32 - e_pos.x as i32).abs()
                             + (current_grid.y as i32 - e_pos.y as i32).abs();
                         if d < best_target_dist {
@@ -336,6 +382,11 @@ pub fn decide_ai_action(
                         let damage_val = (expected_actual_damage * t_stats.cost) / 100;
                         attack_score += damage_val as i32;
 
+                        // 戦闘不能時は攻撃を躊躇させる（撃破できない限り）
+                        if is_combat_ineffective && expected_actual_damage < t_health.current {
+                            attack_score -= 3000;
+                        }
+
                         // 撃破できる場合はボーナス
                         if expected_actual_damage >= t_health.current {
                             attack_score += 5000;
@@ -355,7 +406,32 @@ pub fn decide_ai_action(
 
             // (C) Wait
             if actions.can_wait {
-                let score = base_tile_score;
+                let mut score = base_tile_score;
+
+                // 拠点での待機評価
+                let mut is_on_recovery_property = false;
+                for (p_pos, p_terrain, p_owner) in &properties {
+                    if p_pos.x == current_grid.x
+                        && p_pos.y == current_grid.y
+                        && *p_owner == Some(player_id)
+                        && registry.can_repair_on_terrain(stats.unit_type, *p_terrain)
+                    {
+                        is_on_recovery_property = true;
+                        break;
+                    }
+                }
+
+                if is_on_recovery_property {
+                    if is_combat_ineffective {
+                        score += 8000; // 戦闘不能なら最優先
+                    } else if atk_hp < 100 || atk_ammo.0 < stats.max_ammo1 {
+                        score += 1000; // 少しでも消耗していれば拠点に留まる価値あり
+                    }
+                } else if is_combat_ineffective {
+                    // 拠点以外の場所での待機は避ける
+                    score -= 5000;
+                }
+
                 if score > best_unit_score {
                     best_unit_score = score;
                     best_unit_choice = Some(AiCommand::Wait {
@@ -363,13 +439,165 @@ pub fn decide_ai_action(
                     });
                 }
             }
+
+            // (F) Merge
+            if actions.can_merge {
+                let targets = crate::systems::merge::get_mergable_targets_at(
+                    world,
+                    unit_entity,
+                    current_grid,
+                );
+                for target_entity in targets {
+                    let mut merge_score = 3000;
+                    if let (Some(t_health), Some(_t_stats)) = (
+                        world.get::<Health>(target_entity),
+                        world.get::<UnitStats>(target_entity),
+                    ) {
+                        // 自身または相手のHPが低い場合、合流の価値を高める
+                        if is_combat_ineffective || t_health.current < 40 {
+                            merge_score += 4000;
+                        }
+                        // 合流後のHPが無駄にならない（100を大幅に超えない）なら加点
+                        let total_hp = atk_hp + t_health.current;
+                        if total_hp <= 110 {
+                            merge_score += 1000;
+                        }
+
+                        let score = base_tile_score + merge_score;
+                        if score > best_unit_score {
+                            best_unit_score = score;
+                            best_unit_choice = Some(AiCommand::Merge {
+                                target_pos: current_grid,
+                                target_entity,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // (D) Load
+            if actions.can_load {
+                let transports = crate::systems::transport::get_loadable_transports_at(
+                    world,
+                    unit_entity,
+                    current_grid,
+                );
+                for transport_entity in transports {
+                    // 目的地までの距離が遠いほど、搭載する価値が高まる
+                    let mut min_objective_dist = 99;
+                    for (p_pos, _, p_owner) in &properties {
+                        if *p_owner != Some(player_id) {
+                            let d = (current_grid.x as i32 - p_pos.x as i32).abs()
+                                + (current_grid.y as i32 - p_pos.y as i32).abs();
+                            if d < min_objective_dist {
+                                min_objective_dist = d;
+                            }
+                        }
+                    }
+
+                    let mut load_score = 2000;
+                    if min_objective_dist > 5 {
+                        load_score += 1500; // 遠い場合は積極的に乗る
+                    }
+
+                    let score = base_tile_score + load_score;
+                    #[allow(clippy::collapsible_if)]
+                    if score > best_unit_score {
+                        best_unit_score = score;
+                        best_unit_choice = Some(AiCommand::Load {
+                            transport_entity,
+                            target_pos: current_grid,
+                        });
+                    }
+                }
+            }
+
+            // (E) Drop
+            if actions.can_drop {
+                #[allow(clippy::collapsible_if)]
+                if let Ok(cargo) = world
+                    .query::<&crate::components::CargoCapacity>()
+                    .get(world, unit_entity)
+                {
+                    let cargo_entities = cargo.loaded.clone();
+                    for cargo_entity in cargo_entities {
+                        // 未行動のユニットのみ降ろす
+                        if let Some(action) =
+                            world.get::<crate::components::ActionCompleted>(cargo_entity)
+                        {
+                            #[allow(clippy::collapsible_if)]
+                            if !action.0 {
+                                // 降車可能なマスを探索
+                                let drop_tiles = crate::systems::transport::get_droppable_tiles(
+                                    world,
+                                    unit_entity,
+                                    cargo_entity,
+                                );
+                                for drop_tile in drop_tiles {
+                                    let drop_pos = GridPosition {
+                                        x: drop_tile.0,
+                                        y: drop_tile.1,
+                                    };
+
+                                    // 降車先の価値を評価
+                                    let mut drop_score = 5000; // 基本的に降ろすのは良いこと
+
+                                    // 降車先が拠点ならボーナス
+                                    for (p_pos, _, p_owner) in &properties {
+                                        if p_pos.x == drop_pos.x && p_pos.y == drop_pos.y {
+                                            if *p_owner != Some(player_id) {
+                                                drop_score += 3000; // 敵拠点の占領準備
+                                            }
+                                            break;
+                                        }
+                                    }
+
+                                    // 敵との距離と危険度を評価
+                                    let mut min_enemy_dist = 99;
+                                    let mut is_in_danger = false;
+                                    for (e_pos, _, _, _, e_max_range) in &enemy_units {
+                                        let d = (drop_pos.x as i32 - e_pos.x as i32).abs()
+                                            + (drop_pos.y as i32 - e_pos.y as i32).abs();
+                                        if d < min_enemy_dist {
+                                            min_enemy_dist = d;
+                                        }
+                                        // 敵の攻撃範囲（射程内）なら危険とみなす
+                                        if d <= *e_max_range as i32 {
+                                            is_in_danger = true;
+                                        }
+                                    }
+
+                                    // 敵が遠ければ攻撃準備として中距離でボーナス、
+                                    // 隣接や射程内（=次ターン即攻撃される）はペナルティ
+                                    if is_in_danger {
+                                        drop_score -= 1500;
+                                    } else if (2..=3).contains(&min_enemy_dist) {
+                                        drop_score += 2000;
+                                    }
+
+                                    let score = base_tile_score + drop_score;
+                                    #[allow(clippy::collapsible_if)]
+                                    if score > best_unit_score {
+                                        best_unit_score = score;
+                                        best_unit_choice = Some(AiCommand::Drop {
+                                            target_pos: drop_pos,
+                                            cargo_entity,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        if let Some(choice) = best_unit_choice
-            && best_unit_score > best_overall_score
-        {
-            best_overall_score = best_unit_score;
-            best_overall_choice = Some((unit_entity, choice));
+        #[allow(clippy::collapsible_if)]
+        if let Some(choice) = best_unit_choice {
+            if best_unit_score > best_overall_score {
+                best_overall_score = best_unit_score;
+                best_overall_choice = Some((unit_entity, choice));
+            }
         }
     }
 
@@ -460,6 +688,21 @@ pub fn execute_ai_command(world: &mut World, unit_entity: Entity, command: AiCom
                 });
             }
         }
+        AiCommand::Drop {
+            target_pos,
+            cargo_entity,
+        } => {
+            if let Some(mut evs) =
+                world.get_resource_mut::<Events<crate::events::UnloadUnitCommand>>()
+            {
+                evs.send(crate::events::UnloadUnitCommand {
+                    transport_entity: unit_entity,
+                    cargo_entity,
+                    target_x: target_pos.x,
+                    target_y: target_pos.y,
+                });
+            }
+        }
         AiCommand::Supply {
             target_pos,
             target_entity,
@@ -510,20 +753,62 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> bool {
         return true;
     }
 
-    // 全ユニットの検討が終わったら冷却リストをクリアする（生産や次ターン移行の準備）
-    if let Some(mut res) = world.get_resource_mut::<AiActionCooldown>() {
-        res.0.clear();
-    }
-
     // 2. 生産行動
     let prod_commands = super::production::decide_production(world, active_player);
-    if let Some(cmd) = prod_commands.into_iter().next() {
+
+    let cooldown_set = if let Some(res) = world.get_resource::<AiProductionCooldown>() {
+        res.0.clone()
+    } else {
+        HashSet::new()
+    };
+
+    // 診断情報を取得（前回のエラーを確認）
+    let (last_error, last_event_str) =
+        if let Some(diag) = world.get_resource::<crate::resources::ProductionDiagnostic>() {
+            (diag.last_error.clone(), diag.last_event.clone())
+        } else {
+            (None, None)
+        };
+
+    for cmd in prod_commands {
+        // 冷却中（今ターン既に試行済み）の座標はスキップ
+        if cooldown_set.contains(&(cmd.target_x, cmd.target_y)) {
+            continue;
+        }
+
+        // 直前のエラーがこのコマンドに関連しているかチェック
+        let cmd_debug = format!("{:?}", cmd);
+        if last_error.is_some() && last_event_str.as_deref() == Some(&cmd_debug) {
+            // 前回と同じコマンドでエラーが発生している場合はスキップ
+            // 座標を冷却リストに入れて再試行を防ぐ
+            if let Some(mut res) = world.get_resource_mut::<AiProductionCooldown>() {
+                res.0.insert((cmd.target_x, cmd.target_y));
+            }
+            continue;
+        }
+
+        // コマンドを発行し、冷却リストに追加
+        let mut sent = false;
+        {
+            if let Some(mut res) = world.get_resource_mut::<AiProductionCooldown>() {
+                res.0.insert((cmd.target_x, cmd.target_y));
+            } else {
+                let mut set = HashSet::new();
+                set.insert((cmd.target_x, cmd.target_y));
+                world.insert_resource(AiProductionCooldown(set));
+            }
+        }
+
         if let Some(mut events) =
             world.get_resource_mut::<Events<crate::events::ProduceUnitCommand>>()
         {
             events.send(cmd);
+            sent = true;
         }
-        return true;
+
+        if sent {
+            return true;
+        }
     }
 
     // 3. 全行動完了 -> ターン終了
@@ -994,6 +1279,408 @@ mod tests {
         assert!(action.is_some());
         if let Some((_, AiCommand::Attack { .. })) = action {
             panic!("AI should not perform a suicidal attack (Infantry vs Tank)");
+        }
+    }
+
+    #[test]
+    fn test_decide_ai_action_load() {
+        let mut world = World::new();
+        world.insert_resource(DamageChart::new());
+        world.insert_resource(Map {
+            width: 10,
+            height: 10,
+            tiles: vec![Terrain::Plains; 100],
+            topology: crate::resources::GridTopology::Square,
+        });
+        crate::resources::master_data::MasterDataRegistry::load()
+            .map(|m| world.insert_resource(m))
+            .unwrap();
+
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+
+        world.spawn((
+            GridPosition { x: 9, y: 9 },
+            Property {
+                terrain: Terrain::City,
+                owner_id: Some(p2),
+                capture_points: 20,
+                max_capture_points: 20,
+            },
+        ));
+
+        let _inf = world
+            .spawn((
+                p1,
+                Faction(p1),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 1, y: 1 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    max_movement: 3,
+                    can_capture: true,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+            ))
+            .id();
+
+        let _transport = world
+            .spawn((
+                p1,
+                Faction(p1),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 1, y: 1 },
+                UnitStats {
+                    unit_type: UnitType::TransportHelicopter,
+                    max_cargo: 2,
+                    loadable_unit_types: vec![UnitType::Infantry],
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                crate::components::CargoCapacity {
+                    max: 2,
+                    loaded: vec![],
+                },
+            ))
+            .id();
+
+        let skips = std::collections::HashSet::new();
+        let action = decide_ai_action(&mut world, p1, &skips);
+
+        assert!(action.is_some());
+        let (_ent, cmd) = action.unwrap();
+        match cmd {
+            AiCommand::Load { .. } => {}
+            other => panic!("Expected Load command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decide_ai_action_drop() {
+        let mut world = World::new();
+        world.insert_resource(DamageChart::new());
+        world.insert_resource(Map {
+            width: 10,
+            height: 10,
+            tiles: vec![Terrain::Plains; 100],
+            topology: crate::resources::GridTopology::Square,
+        });
+        crate::resources::master_data::MasterDataRegistry::load()
+            .map(|m| world.insert_resource(m))
+            .unwrap();
+
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+
+        world.spawn((
+            GridPosition { x: 1, y: 2 },
+            Property {
+                terrain: Terrain::City,
+                owner_id: Some(p2),
+                capture_points: 20,
+                max_capture_points: 20,
+            },
+        ));
+
+        let inf = world
+            .spawn((
+                p1,
+                Faction(p1),
+                HasMoved(true),
+                ActionCompleted(false),
+                GridPosition { x: 999, y: 999 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    movement_type: crate::resources::MovementType::Infantry,
+                    can_capture: true,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Transporting(Entity::from_raw(0)),
+            ))
+            .id();
+
+        let transport = world
+            .spawn((
+                p1,
+                Faction(p1),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 1, y: 1 },
+                UnitStats {
+                    unit_type: UnitType::TransportHelicopter,
+                    max_cargo: 2,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                crate::components::CargoCapacity {
+                    max: 2,
+                    loaded: vec![inf],
+                },
+            ))
+            .id();
+
+        world
+            .entity_mut(inf)
+            .insert(crate::components::Transporting(transport));
+
+        let skips = std::collections::HashSet::new();
+        let action = decide_ai_action(&mut world, p1, &skips);
+
+        assert!(action.is_some());
+        let (_ent, cmd) = action.unwrap();
+        match cmd {
+            AiCommand::Drop {
+                target_pos,
+                cargo_entity,
+            } => {
+                assert_eq!(cargo_entity, inf);
+                assert_eq!(target_pos.x, 1);
+                assert_eq!(target_pos.y, 2);
+            }
+            other => panic!("Expected Drop command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decide_ai_action_retreat_low_hp() {
+        let mut world = World::new();
+        world.insert_resource(DamageChart::new());
+        world.insert_resource(Map {
+            width: 5,
+            height: 5,
+            tiles: vec![Terrain::Plains; 25],
+            topology: crate::resources::GridTopology::Square,
+        });
+        crate::resources::master_data::MasterDataRegistry::load()
+            .map(|m| world.insert_resource(m))
+            .unwrap();
+
+        let p1 = PlayerId(1);
+        // 都市を(1,1)に設置
+        world.spawn((
+            GridPosition { x: 1, y: 1 },
+            Property::new(Terrain::City, Some(p1), 200),
+        ));
+
+        // 低HP(30)の戦車を(1,0)に配置
+        world.spawn((
+            p1,
+            Faction(p1),
+            HasMoved(false),
+            ActionCompleted(false),
+            GridPosition { x: 1, y: 0 },
+            UnitStats {
+                unit_type: UnitType::Tank,
+                cost: 7000,
+                max_movement: 3,
+                movement_type: crate::resources::MovementType::Tank,
+                max_fuel: 99,
+                ..UnitStats::mock()
+            },
+            Health {
+                current: 30,
+                max: 100,
+            },
+            crate::components::Fuel {
+                current: 99,
+                max: 99,
+            },
+        ));
+
+        let skips = std::collections::HashSet::new();
+        let action = decide_ai_action(&mut world, p1, &skips);
+
+        assert!(action.is_some());
+        if let Some((_, AiCommand::Wait { target_pos })) = action {
+            // (1,1)の都市へ移動して待機することを確認
+            assert_eq!(target_pos.x, 1);
+            assert_eq!(target_pos.y, 1);
+        } else {
+            panic!("Expected Wait at (1,1), got {:?}", action);
+        }
+    }
+
+    #[test]
+    fn test_decide_ai_action_merge() {
+        let mut world = World::new();
+        world.insert_resource(DamageChart::new());
+        world.insert_resource(Map {
+            width: 5,
+            height: 5,
+            tiles: vec![Terrain::Plains; 25],
+            topology: crate::resources::GridTopology::Square,
+        });
+        crate::resources::master_data::MasterDataRegistry::load()
+            .map(|m| world.insert_resource(m))
+            .unwrap();
+
+        let p1 = PlayerId(1);
+
+        // 低HP(50)の歩兵Aを(0,0)に配置
+        let unit_a = world
+            .spawn((
+                p1,
+                Faction(p1),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 0, y: 0 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    cost: 1000,
+                    max_movement: 3,
+                    movement_type: crate::resources::MovementType::Infantry,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 50,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+            ))
+            .id();
+
+        // 低HP(40)の歩兵Bを(1,0)に配置
+        let unit_b = world
+            .spawn((
+                p1,
+                Faction(p1),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 1, y: 0 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    cost: 1000,
+                    max_movement: 3,
+                    movement_type: crate::resources::MovementType::Infantry,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 40,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+            ))
+            .id();
+
+        let skips = std::collections::HashSet::new();
+        let action = decide_ai_action(&mut world, p1, &skips);
+
+        assert!(action.is_some());
+        // 歩兵Aが歩兵Bの位置(1,0)へ移動してMergeすることを確認
+        if let Some((
+            entity,
+            AiCommand::Merge {
+                target_pos,
+                target_entity,
+            },
+        )) = action
+        {
+            assert_eq!(entity, unit_a);
+            assert_eq!(target_pos.x, 1);
+            assert_eq!(target_pos.y, 0);
+            assert_eq!(target_entity, unit_b);
+        } else {
+            panic!("Expected Merge command, got {:?}", action);
+        }
+    }
+
+    #[test]
+    fn test_decide_ai_action_retreat_no_ammo() {
+        let mut world = World::new();
+        world.insert_resource(DamageChart::new());
+        world.insert_resource(Map {
+            width: 5,
+            height: 5,
+            tiles: vec![Terrain::Plains; 25],
+            topology: crate::resources::GridTopology::Square,
+        });
+        crate::resources::master_data::MasterDataRegistry::load()
+            .map(|m| world.insert_resource(m))
+            .unwrap();
+
+        let p1 = PlayerId(1);
+        // 都市を(1,1)に設置
+        world.spawn((
+            GridPosition { x: 1, y: 1 },
+            Property::new(Terrain::City, Some(p1), 200),
+        ));
+
+        // 弾薬切れ(0)の戦車を(1,0)に配置
+        world.spawn((
+            p1,
+            Faction(p1),
+            HasMoved(false),
+            ActionCompleted(false),
+            GridPosition { x: 1, y: 0 },
+            UnitStats {
+                unit_type: UnitType::Tank,
+                cost: 7000,
+                max_movement: 3,
+                movement_type: crate::resources::MovementType::Tank,
+                max_fuel: 99,
+                max_ammo1: 5, // 主武装あり
+                ..UnitStats::mock()
+            },
+            Health {
+                current: 100, // HPは満タン
+                max: 100,
+            },
+            crate::components::Ammo {
+                ammo1: 0, // 弾薬切れ
+                max_ammo1: 5,
+                ammo2: 99,
+                max_ammo2: 99,
+            },
+            crate::components::Fuel {
+                current: 99,
+                max: 99,
+            },
+        ));
+
+        let skips = std::collections::HashSet::new();
+        let action = decide_ai_action(&mut world, p1, &skips);
+
+        assert!(action.is_some());
+        if let Some((_, AiCommand::Wait { target_pos })) = action {
+            // (1,1)の都市へ移動して待機することを確認
+            assert_eq!(target_pos.x, 1);
+            assert_eq!(target_pos.y, 1);
+        } else {
+            panic!("Expected Wait at (1,1) due to no ammo, got {:?}", action);
         }
     }
 }

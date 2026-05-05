@@ -448,6 +448,15 @@ impl MasterDataRegistry {
             .unwrap_or(0)
     }
 
+    /// 施設（地形）でそのユニットを補給・回復できるか判定する
+    pub fn can_repair_on_terrain(
+        &self,
+        unit_type: crate::resources::UnitType,
+        terrain: crate::resources::Terrain,
+    ) -> bool {
+        self.can_produce_unit(terrain.as_str(), unit_type)
+    }
+
     /// ユニット名(UnitName)からコンポーネントとしての UnitStats を構築して返す。
     /// マスターデータに不備がある場合は MasterDataError を返す。
     pub fn create_unit_stats(
@@ -756,5 +765,28 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn test_can_repair_on_terrain() {
+        let registry = MasterDataRegistry::load().unwrap();
+        use crate::resources::{Terrain, UnitType};
+
+        // 首都（地上部隊補給可能）で歩兵は修理可能
+        assert!(registry.can_repair_on_terrain(UnitType::Infantry, Terrain::Capital));
+        // 首都で重戦車も修理可能（地上部隊カテゴリに含まれるため）
+        assert!(registry.can_repair_on_terrain(UnitType::TankZ, Terrain::Capital));
+
+        // 首都で戦闘機は修理不可（地上部隊カテゴリに含まれない）
+        assert!(!registry.can_repair_on_terrain(UnitType::Fighter, Terrain::Capital));
+
+        // 道路では歩兵は修理不可
+        assert!(!registry.can_repair_on_terrain(UnitType::Infantry, Terrain::Road));
+
+        // 現在の実装が can_produce_unit に委譲していることを確認
+        assert_eq!(
+            registry.can_repair_on_terrain(UnitType::Infantry, Terrain::Capital),
+            registry.can_produce_unit(Terrain::Capital.as_str(), UnitType::Infantry)
+        );
     }
 }

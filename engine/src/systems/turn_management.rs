@@ -109,8 +109,10 @@ pub fn advance_next_phase(world: &mut World) {
         action_completed.0 = false;
     }
 
-    // 2. 移動履歴を強制削除 (ターン終了時は移動中であってはならない)
+    // 2. 移動履歴・AIクールダウンを強制削除 (ターン終了時にリセット)
     commands.remove_resource::<PendingMove>();
+    commands.remove_resource::<crate::ai::engine::AiActionCooldown>();
+    commands.remove_resource::<crate::ai::engine::AiProductionCooldown>();
 
     // 3. プレイヤーの切り替え
     match_state.active_player_index.0 += 1;
@@ -559,5 +561,36 @@ mod tests {
         assert_eq!(fuel.current, 50);
         let ammo = world.get::<Ammo>(tank).unwrap();
         assert_eq!(ammo.ammo1, 8);
+    }
+
+    #[test]
+    fn test_ai_cooldown_reset_on_next_phase() {
+        let (mut world, mut schedule) = setup_world();
+
+        let entity = world.spawn_empty().id();
+
+        // クールダウンをセット
+        world.insert_resource(crate::ai::engine::AiActionCooldown(
+            [entity].into_iter().collect(),
+        ));
+        world.insert_resource(crate::ai::engine::AiProductionCooldown(
+            [(5, 5)].into_iter().collect(),
+        ));
+
+        // ターン終了 -> P2へ
+        world.send_event(NextPhaseCommand);
+        schedule.run(&mut world);
+
+        // クールダウンが削除されていることを確認
+        assert!(
+            world
+                .get_resource::<crate::ai::engine::AiActionCooldown>()
+                .is_none()
+        );
+        assert!(
+            world
+                .get_resource::<crate::ai::engine::AiProductionCooldown>()
+                .is_none()
+        );
     }
 }

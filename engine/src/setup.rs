@@ -10,6 +10,10 @@ pub fn create_world() -> (World, Schedule) {
     let mut world = World::new();
     let mut schedule = Schedule::default();
 
+    // Register resources
+    world.init_resource::<crate::ai::engine::AiActionCooldown>();
+    world.init_resource::<crate::ai::engine::AiProductionCooldown>();
+
     // Register events
     world.init_resource::<Events<ProduceUnitCommand>>();
     world.init_resource::<ProductionDiagnostic>();
