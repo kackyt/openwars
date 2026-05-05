@@ -161,7 +161,8 @@ pub fn decide_ai_action(
             )
         };
 
-        let is_combat_ineffective = atk_hp < 40 || (stats.max_ammo1 > 0 && atk_ammo.0 == 0);
+        // 戦闘不能判定（HPが低い、または弾薬切れ）
+        let is_combat_ineffective = atk_hp < 70 || (stats.max_ammo1 > 0 && atk_ammo.0 == 0);
 
         let map = world.resource::<Map>().clone();
         let registry = world.resource::<MasterDataRegistry>().clone();
@@ -237,7 +238,7 @@ pub fn decide_ai_action(
                     }
                 }
                 // 拠点に近づくほど高スコア
-                base_tile_score += (20 - min_recovery_dist).max(0) * 100;
+                base_tile_score += (20 - min_recovery_dist).max(0) * 300;
             }
 
             // 占領価値・拠点接近スコア
@@ -263,6 +264,23 @@ pub fn decide_ai_action(
                     let d = (current_grid.x as i32 - e_pos.x as i32).abs()
                         + (current_grid.y as i32 - e_pos.y as i32).abs();
 
+                    let mut effective_dist = d;
+                    // 海軍ユニットが陸上の敵を追跡する場合の補正
+                    if stats.movement_type == crate::resources::MovementType::Ship
+                        && let Some(e_terrain) = map.get_terrain(e_pos.x, e_pos.y)
+                    {
+                        let move_cost = registry
+                            .get_movement_cost(
+                                crate::resources::MovementType::Ship,
+                                e_terrain.as_str(),
+                            )
+                            .unwrap_or(99);
+                        if move_cost >= 99 && stats.max_range <= 1 {
+                            // 進入不可能な陸地で、かつ直接攻撃ユニットの場合は距離を大幅に水増し
+                            effective_dist += 20;
+                        }
+                    }
+
                     // ダメージ期待値を概算（相性とコストとHPを考慮）
                     let base_dmg = damage_chart
                         .get_base_damage(stats.unit_type, *e_type)
@@ -278,22 +296,62 @@ pub fn decide_ai_action(
 
                     if potential > max_potential {
                         max_potential = potential;
-                        best_target_dist = d;
-                    } else if (potential - max_potential).abs() < 0.1 && d < best_target_dist {
+                        best_target_dist = effective_dist;
+                    } else if (potential - max_potential).abs() < 0.1
+                        && effective_dist < best_target_dist
+                    {
                         // 価値が同じなら近い方を優先
-                        best_target_dist = d;
+                        best_target_dist = effective_dist;
                     }
                 }
 
-                // fallback: 敵がいない、または誰も攻撃できない場合は最寄りの敵を目指す
+                // fallback: 敵がいない、または誰も攻撃できない場合は最寄りの敵、または拠点を指す
                 if max_potential <= 0.0 {
+                    let mut min_dist = 99;
+                    // 1. 敵ユニットを探す
                     for (e_pos, _, _, _, _) in &enemy_units {
-                        let d = (current_grid.x as i32 - e_pos.x as i32).abs()
+                        let mut d = (current_grid.x as i32 - e_pos.x as i32).abs()
                             + (current_grid.y as i32 - e_pos.y as i32).abs();
-                        if d < best_target_dist {
-                            best_target_dist = d;
+
+                        if stats.movement_type == crate::resources::MovementType::Ship
+                            && let Some(e_terrain) = map.get_terrain(e_pos.x, e_pos.y)
+                        {
+                            let move_cost = registry
+                                .get_movement_cost(
+                                    crate::resources::MovementType::Ship,
+                                    e_terrain.as_str(),
+                                )
+                                .unwrap_or(99);
+                            if move_cost >= 99 && stats.max_range <= 1 {
+                                d += 20;
+                            }
+                        }
+                        if d < min_dist {
+                            min_dist = d;
                         }
                     }
+                    // 2. 敵がいない場合は、未占領または敵の拠点をターゲットにする
+                    if enemy_units.is_empty() {
+                        for (p_pos, p_terrain, p_owner) in &properties {
+                            if *p_owner != Some(player_id) {
+                                let d = (current_grid.x as i32 - p_pos.x as i32).abs()
+                                    + (current_grid.y as i32 - p_pos.y as i32).abs();
+                                if d < min_dist {
+                                    min_dist = d;
+                                }
+                            } else if is_combat_ineffective
+                                && registry.can_repair_on_terrain(stats.unit_type, *p_terrain)
+                            {
+                                // 自身が修理が必要な場合のみ、自分の拠点もターゲットに含める
+                                let d = (current_grid.x as i32 - p_pos.x as i32).abs()
+                                    + (current_grid.y as i32 - p_pos.y as i32).abs();
+                                if d < min_dist {
+                                    min_dist = d;
+                                }
+                            }
+                        }
+                    }
+                    best_target_dist = min_dist;
                 }
 
                 if stats.min_range > 1 {
@@ -453,14 +511,19 @@ pub fn decide_ai_action(
                         world.get::<Health>(target_entity),
                         world.get::<UnitStats>(target_entity),
                     ) {
-                        // 自身または相手のHPが低い場合、合流の価値を高める
-                        if is_combat_ineffective || t_health.current < 40 {
-                            merge_score += 4000;
-                        }
-                        // 合流後のHPが無駄にならない（100を大幅に超えない）なら加点
+                        // フルHP同士の合流は無意味なのでスコアを0にする
                         let total_hp = atk_hp + t_health.current;
-                        if total_hp <= 110 {
-                            merge_score += 1000;
+                        if total_hp > 100 {
+                            merge_score = 0;
+                        } else {
+                            // 自身または相手のHPが低い場合、合流の価値を高める
+                            if is_combat_ineffective || t_health.current < 40 {
+                                merge_score += 4000;
+                            }
+                            // 合流後のHPが無駄にならないなら加点
+                            if total_hp <= 100 {
+                                merge_score += 1000;
+                            }
                         }
 
                         let score = base_tile_score + merge_score;
@@ -497,7 +560,10 @@ pub fn decide_ai_action(
 
                     let mut load_score = 2000;
                     if min_objective_dist > 5 {
-                        load_score += 1500; // 遠い場合は積極的に乗る
+                        load_score += 3000; // 遠い場合は積極的に乗る
+                    }
+                    if stats.can_capture && min_objective_dist > 8 {
+                        load_score += 2000; // 占領可能な歩兵は特に遠い場合に優先
                     }
 
                     let score = base_tile_score + load_score;

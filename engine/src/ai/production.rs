@@ -1,8 +1,9 @@
+use crate::ai::demand::compute_unit_affinity;
 use crate::ai::strategy::{ProductionPlan, ProductionStrategy, analyze_strategy};
 use crate::components::{Faction, GridPosition, PlayerId, Property, UnitStats};
 use crate::events::ProduceUnitCommand;
 use crate::resources::master_data::MasterDataRegistry;
-use crate::resources::{DamageChart, Players, Terrain, UnitRegistry, UnitType};
+use crate::resources::{DamageChart, MovementType, Players, Terrain, UnitRegistry, UnitType};
 use bevy_ecs::prelude::*;
 
 use super::strategy::GamePhase;
@@ -16,6 +17,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
     let mut commands = Vec::new();
 
     let strategy = analyze_strategy(world, player_id);
+    let map = world.resource::<crate::resources::Map>().clone();
 
     let (unit_registry, damage_chart, master_data) = {
         let ur = world.get_resource::<UnitRegistry>().cloned();
@@ -41,6 +43,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
     // --- 0. 施設・ユニット・首都のスキャン ---
     let mut occupied_positions = std::collections::HashSet::new();
     let mut enemy_units = Vec::new();
+    let mut my_units = Vec::new();
     let mut my_empty_transports = Vec::new();
 
     {
@@ -58,6 +61,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
             }
             occupied_positions.insert(*pos);
             if faction.0 == player_id {
+                my_units.push((*pos, stats.clone()));
                 if let Some(cargo) = cargo_opt
                     && cargo.loaded.is_empty()
                     && (stats.unit_type == UnitType::SupplyTruck
@@ -138,6 +142,8 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                     &my_empty_transports,
                     &damage_chart,
                     &master_data,
+                    &map,
+                    &unit_registry,
                 );
                 if score > max_score {
                     max_score = score;
@@ -178,6 +184,11 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
             .saturating_sub(MIN_BUFFER)
             .saturating_sub(reserve_cut);
 
+        // ユニット数が極端に少ない(5体未満)場合は、予算制限を緩和して生産を優先する
+        if my_units.len() < 5 {
+            budget = current_funds.saturating_sub(500);
+        }
+
         // もし資金があり、かつ歩兵すら買えないほど予算が削られているなら、
         // 貯金目標を少し妥協して歩兵1体分(1000G)は確保する
         if current_funds >= 2000 && budget < 1000 {
@@ -186,65 +197,66 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
         budget
     };
 
-    // --- 3. 動的計画法による生産決定 ---
+    // --- 3. 逐次的な生産決定 (施設単位の貪欲法) ---
+    // 輸送需要(transport_demand)を動的に更新しながら生産を決定するため、
+    // DPではなく施設ごとにベストな選択を行う方式を採用します。
     let mut available_types = Vec::new();
     for (unit_type, stats) in &unit_registry.0 {
         available_types.push((*unit_type, stats.clone()));
     }
 
-    let max_items = my_facilities.len();
-    let budget_idx = (available_funds / 100) as usize;
-    let mut dp = vec![vec![0; budget_idx + 1]; max_items + 1];
-    let mut choice = vec![vec![None; budget_idx + 1]; max_items + 1];
+    let mut remaining_funds = available_funds;
+    let mut current_strategy = strategy.clone();
 
-    for i in 1..=max_items {
-        let (facility_pos, terrain) = my_facilities[i - 1];
+    for (facility_pos, terrain) in my_facilities {
         let terrain_name = terrain.as_str();
+        let mut best_unit = None;
+        let mut max_score = 0;
 
-        for w in 0..=budget_idx {
-            dp[i][w] = dp[i - 1][w];
-            choice[i][w] = None;
+        for (ut, stats) in &available_types {
+            if !master_data.can_produce_unit(terrain_name, *ut) {
+                continue;
+            }
+            if stats.cost > remaining_funds {
+                continue;
+            }
 
-            for (ut, stats) in &available_types {
-                if !master_data.can_produce_unit(terrain_name, *ut) {
-                    continue;
-                }
+            let score = calculate_unit_score_at(
+                *ut,
+                stats,
+                facility_pos,
+                &current_strategy,
+                &enemy_units,
+                &my_empty_transports,
+                &damage_chart,
+                &master_data,
+                &map,
+                &unit_registry,
+            );
 
-                let scaled_cost = (stats.cost / 100) as usize;
-                if scaled_cost <= w {
-                    let score = calculate_unit_score_at(
-                        *ut,
-                        stats,
-                        facility_pos,
-                        &strategy,
-                        &enemy_units,
-                        &my_empty_transports,
-                        &damage_chart,
-                        &master_data,
-                    );
-
-                    let new_score = dp[i - 1][w - scaled_cost] + score;
-                    if new_score > dp[i][w] {
-                        dp[i][w] = new_score;
-                        choice[i][w] = Some((*ut, scaled_cost));
-                    }
-                }
+            if score > max_score {
+                max_score = score;
+                best_unit = Some((*ut, stats.cost, stats.max_cargo, stats.can_capture));
             }
         }
-    }
 
-    // 結果の復元
-    let mut curr_w = budget_idx;
-    for i in (1..=max_items).rev() {
-        if let Some((ut, cost)) = choice[i][curr_w] {
-            let (facility_pos, _) = my_facilities[i - 1];
+        if let Some((ut, cost, cargo, can_capture)) = best_unit {
             commands.push(ProduceUnitCommand {
                 player_id,
                 target_x: facility_pos.x,
                 target_y: facility_pos.y,
                 unit_type: ut,
             });
-            curr_w -= cost;
+            remaining_funds = remaining_funds.saturating_sub(cost);
+            // 輸送需要を更新
+            if cargo > 0 {
+                current_strategy.transport_demand =
+                    current_strategy.transport_demand.saturating_sub(cargo);
+            }
+            // 占領需要を更新
+            if can_capture {
+                current_strategy.capture_demand = current_strategy.capture_demand.saturating_sub(1);
+            }
         }
     }
 
@@ -259,18 +271,64 @@ pub fn calculate_unit_score_at(
     pos: GridPosition,
     strategy: &ProductionStrategy,
     enemy_units: &[(GridPosition, UnitStats)],
-    my_empty_transports: &[GridPosition],
+    _my_empty_transports: &[GridPosition],
     damage_chart: &DamageChart,
     master_data: &MasterDataRegistry,
+    map: &crate::resources::Map,
+    unit_registry: &UnitRegistry,
 ) -> u32 {
     // 1. 基本スコア（敵との距離、脅威度）
+    let mut min_eta = 0;
     let mut score: u32 = if !strategy.priority_targets.is_empty() {
-        let mut min_eta = 99;
-        let base_val: i32 = 1000;
+        let mut local_min_eta = 99;
+        let mut base_val: i32 = 2000; // ベースを引き上げ
 
         for target in &strategy.priority_targets {
-            let dist = (pos.x as isize - target.x as isize).unsigned_abs()
+            let mut dist = (pos.x as isize - target.x as isize).unsigned_abs()
                 + (pos.y as isize - target.y as isize).unsigned_abs();
+
+            // 海軍ユニットの対地評価補正
+            if stats.movement_type == MovementType::Ship {
+                let mut reachable_target = false;
+                if let Some(t_terrain) = map.get_terrain(target.x, target.y) {
+                    let move_cost = master_data
+                        .get_movement_cost(MovementType::Ship, t_terrain.as_str())
+                        .unwrap_or(99);
+                    if move_cost < 99 {
+                        reachable_target = true;
+                    }
+                }
+
+                // 隣接マスが海なら「沿岸」として到達可能とみなす
+                if !reachable_target {
+                    for adj in map.get_adjacent(target.x, target.y) {
+                        if let Some(at) = map.get_terrain(adj.0, adj.1)
+                            && master_data
+                                .get_movement_cost(MovementType::Ship, at.as_str())
+                                .unwrap_or(99)
+                                < 99
+                        {
+                            reachable_target = true;
+                            break;
+                        }
+                    }
+                }
+
+                if !reachable_target {
+                    // 目標が直接到達不能な場合
+                    if stats.max_range <= 1 {
+                        // 直接攻撃ユニットは距離ペナルティ
+                        dist += 20;
+                        if stats.max_cargo == 0 {
+                            // 輸送能力もないならベース値を大幅に下げる
+                            base_val /= 4;
+                        }
+                    } else {
+                        // 間接攻撃ユニットは多少マシにする
+                        dist += 10;
+                    }
+                }
+            }
 
             // 地形コストを考慮したETAの簡易見積もり
             let move_cost = master_data
@@ -278,13 +336,14 @@ pub fn calculate_unit_score_at(
                 .unwrap_or(1);
             let eta =
                 (dist as u32 * move_cost + stats.max_movement - 1) / stats.max_movement.max(1);
-            if eta < min_eta {
-                min_eta = eta;
+            if eta < local_min_eta {
+                local_min_eta = eta;
             }
         }
+        min_eta = local_min_eta;
 
-        // 1ターン遅れるごとに100点のペナルティ（最大1000点）
-        let eta_penalty = std::cmp::min(1000, min_eta * 100);
+        // 1ターン遅れるごとに40点のペナルティ（緩和）
+        let eta_penalty = min_eta * 40;
         base_val.saturating_sub(eta_penalty as i32).max(1) as u32
     } else {
         // 敵がいない場合は均一
@@ -292,15 +351,31 @@ pub fn calculate_unit_score_at(
     };
 
     // 2. 特殊役割ボーナス
-    if stats.can_capture && strategy.phase == GamePhase::Expansion {
-        score += 2000;
+    if stats.can_capture {
+        if strategy.capture_demand > 0 {
+            score += 2000; // 不足している場合は最優先
+        } else if strategy.phase == GamePhase::Expansion {
+            score += 1000; // 拡張期なら充足していても加点
+        }
     }
-    // 輸送ユニットの評価（空の輸送ユニットがある場合は抑制、ない場合は高評価）
+    // 輸送ユニットの評価（キャパシティ需要に基づく）
     if stats.max_cargo > 0 {
-        if my_empty_transports.is_empty() {
-            score += 800;
+        if strategy.transport_demand > 0 {
+            score += 2000; // 不足している場合は大幅加点
+
+            // 長距離補給ボーナス: 前線が遠いほど輸送機の価値を高める
+            if min_eta > 8 {
+                score += 1000;
+            }
         } else {
-            score = score.saturating_sub(500);
+            // 需要が満たされている場合
+            if stats.max_ammo1 == 0 {
+                // 武器がない純粋な輸送機は強く抑制
+                score = score.saturating_sub(1000);
+            } else {
+                // 装甲車などの戦闘能力がある場合は抑制を小さくする
+                score = score.saturating_sub(200);
+            }
         }
     }
 
@@ -349,6 +424,20 @@ pub fn calculate_unit_score_at(
                 score += 500;
             }
         }
+    }
+
+    // 5. 包括的需要ドット積ボーナス（Potential Impact Model）
+    // DemandMatrix（自軍の能力の欠け）とユニット適性のドット積で加点する。
+    // 既存のフェーズボーナス・アンチボーナスと共存させ、相乗効果で航空等の専門需要を反映する。
+    {
+        // DEMAND_WEIGHT: 需要が最大値(1.0)のとき、フェーズボーナス(最大1500)を上回る値に設定
+        const DEMAND_WEIGHT: f32 = 3000.0;
+        let normalization_scale =
+            crate::ai::demand::average_attack_expectation(damage_chart, unit_registry);
+        let affinity =
+            compute_unit_affinity(unit_type, damage_chart, unit_registry, normalization_scale);
+        let demand_score = strategy.demand.dot(&affinity) * DEMAND_WEIGHT;
+        score += demand_score as u32;
     }
 
     score

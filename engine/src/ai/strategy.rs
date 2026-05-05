@@ -1,5 +1,6 @@
+use crate::ai::demand::{DemandMatrix, compute_demand};
 use crate::components::{Faction, GridPosition, PlayerId, Property, UnitStats};
-use crate::resources::UnitType;
+use crate::resources::{Terrain, UnitType};
 use bevy_ecs::prelude::*;
 use std::collections::HashMap;
 
@@ -27,6 +28,12 @@ pub struct ProductionStrategy {
     pub ideal_composition: HashMap<UnitType, f32>,
     /// 戦略的に優先すべきターゲット位置（未占領拠点や敵の群れ）。
     pub priority_targets: Vec<GridPosition>,
+    /// 不足している輸送キャパシティ数。
+    pub transport_demand: u32,
+    /// 不足している占領ユニット数。
+    pub capture_demand: u32,
+    /// 包括的需要マトリクス（各戦闘カテゴリの脅威ギャップと占領脅威）。
+    pub demand: DemandMatrix,
 }
 
 /// 複数ターンにまたがる生産計画。
@@ -44,7 +51,6 @@ pub struct ProductionPlan {
 pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStrategy {
     let mut strategy = ProductionStrategy::default();
 
-    let mut total_properties = 0;
     let mut unowned_properties = Vec::new();
     let mut my_properties = Vec::new();
     let mut enemy_properties = Vec::new();
@@ -54,7 +60,6 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
     {
         let mut q_props = world.query::<(&GridPosition, &Property)>();
         for (pos, prop) in q_props.iter(world) {
-            total_properties += 1;
             if prop.owner_id == Some(player_id) {
                 my_properties.push(*pos);
                 if prop.terrain == crate::resources::Terrain::Capital {
@@ -75,37 +80,44 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
     {
         let mut q_units = world.query::<(&GridPosition, &Faction, &UnitStats)>();
         for (pos, faction, stats) in q_units.iter(world) {
+            // マップ外（輸送機内など）のユニットは距離計算などの分析から除外
+            if pos.x >= 9999 {
+                continue;
+            }
             if faction.0 == player_id {
-                my_units.push((*pos, stats.unit_type));
+                my_units.push((*pos, stats.clone()));
             } else {
-                enemy_units.push((*pos, stats.unit_type));
+                enemy_units.push((*pos, stats.clone()));
             }
         }
     }
 
-    // 3. フェーズの判定
-    let unowned_ratio = if total_properties > 0 {
-        unowned_properties.len() as f32 / total_properties as f32
+    // 交戦可能性の判定
+    let mut min_enemy_dist = 999;
+    for (m_pos, _) in &my_units {
+        for (e_pos, _) in &enemy_units {
+            let dist =
+                (m_pos.x as i32 - e_pos.x as i32).abs() + (m_pos.y as i32 - e_pos.y as i32).abs();
+            if dist < min_enemy_dist {
+                min_enemy_dist = dist;
+            }
+        }
+    }
+
+    // 自軍平均移動力 + 射程 を閾値とする
+    let avg_engagement_range = if !my_units.is_empty() {
+        let total_reach: u32 = my_units
+            .iter()
+            .map(|(_, s)| s.max_movement + s.max_range)
+            .sum();
+        total_reach / my_units.len() as u32
     } else {
-        0.0
+        5
     };
 
-    // 輸送需要の計算
-    let infantry_count = my_units
-        .iter()
-        .filter(|(_, ut)| *ut == UnitType::Infantry || *ut == UnitType::Mech)
-        .count();
-    let transport_capacity = my_units
-        .iter()
-        .filter(|(_, ut)| {
-            *ut == UnitType::SupplyTruck
-                || *ut == UnitType::TransportHelicopter
-                || *ut == UnitType::Lander
-        })
-        .count(); // 簡易的に1ユニットにつき1人収容と仮定
+    let is_engaged = min_enemy_dist <= (avg_engagement_range + 1) as i32;
 
-    let transport_demand = infantry_count > transport_capacity + 2;
-
+    // 3. フェーズの判定
     // 首都付近に敵がいるかチェック
     let mut capital_threatened = false;
     if let Some(cap_pos) = my_capital_pos {
@@ -119,54 +131,104 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
         }
     }
 
-    let is_capital_threatened = capital_threatened;
-
-    if is_capital_threatened {
+    if capital_threatened {
         strategy.phase = GamePhase::Defense;
-    } else if unowned_ratio > 0.2 {
+    } else if unowned_properties.len() > 2 {
+        // 中立拠点がまだ残っているなら、多少の交戦があっても拡張を優先
         strategy.phase = GamePhase::Expansion;
-    } else if enemy_units.len() > my_units.len() + 2 {
-        strategy.phase = GamePhase::Contested;
+    } else if is_engaged {
+        if enemy_units.len() >= my_units.len() {
+            strategy.phase = GamePhase::Contested;
+        } else {
+            strategy.phase = GamePhase::Assault;
+        }
     } else {
-        strategy.phase = GamePhase::Assault;
+        strategy.phase = GamePhase::Expansion;
     }
 
-    // 4. 理想構成比率の決定
+    // ターゲットの統合: フェーズに関わらず、中立拠点と敵拠点の両方を考慮する
+    // ただしフェーズによって重みを変えるために、ここではリストの順序や内容を調整
+    strategy.priority_targets = match strategy.phase {
+        GamePhase::Expansion => {
+            let mut targets = unowned_properties.clone();
+            targets.extend(enemy_properties.iter().cloned());
+            targets
+        }
+        GamePhase::Contested | GamePhase::Assault => {
+            let mut targets = enemy_properties.clone();
+            // 中立拠点も近いものはターゲットに含める
+            targets.extend(unowned_properties.iter().cloned());
+            targets
+        }
+        GamePhase::Defense => {
+            if let Some(cap_pos) = my_capital_pos {
+                vec![cap_pos]
+            } else {
+                enemy_properties.clone()
+            }
+        }
+    };
+
+    // 占領需要の計算: (未占領拠点 + 敵拠点) に対して歩兵が足りているか
+    let total_properties = unowned_properties.len() + enemy_properties.len();
+    let current_capture_units = my_units.iter().filter(|(_, s)| s.can_capture).count();
+    // 拠点の50%程度を目安としつつ、常に5〜12体程度を維持するように調整
+    let ideal_capture_units = ((total_properties as f32 * 0.5).ceil() as usize).clamp(5, 12);
+    strategy.capture_demand =
+        (ideal_capture_units.saturating_sub(current_capture_units)).max(1) as u32;
+
+    // 理想構成の適用
     match strategy.phase {
         GamePhase::Expansion => {
             strategy.ideal_composition.insert(UnitType::Infantry, 0.7);
             strategy.ideal_composition.insert(UnitType::Tank, 0.2);
             strategy.ideal_composition.insert(UnitType::Recon, 0.1);
-            strategy.priority_targets = unowned_properties;
         }
         GamePhase::Contested => {
             strategy.ideal_composition.insert(UnitType::Infantry, 0.4);
             strategy.ideal_composition.insert(UnitType::Tank, 0.4);
             strategy.ideal_composition.insert(UnitType::Artillery, 0.2);
-            strategy.priority_targets = enemy_properties;
         }
         GamePhase::Assault => {
             strategy.ideal_composition.insert(UnitType::Infantry, 0.2);
             strategy.ideal_composition.insert(UnitType::Tank, 0.6);
             strategy.ideal_composition.insert(UnitType::Artillery, 0.2);
-            strategy.priority_targets = enemy_properties;
         }
         GamePhase::Defense => {
             strategy.ideal_composition.insert(UnitType::Infantry, 0.5);
             strategy.ideal_composition.insert(UnitType::Tank, 0.3);
             strategy.ideal_composition.insert(UnitType::AntiAir, 0.2);
-            if let Some(cap_pos) = my_capital_pos {
-                strategy.priority_targets = vec![cap_pos];
-            }
         }
     }
 
-    // 輸送需要が高い場合、輸送ユニットの比率を底上げする
-    if transport_demand {
-        *strategy
-            .ideal_composition
-            .entry(UnitType::SupplyTruck)
-            .or_default() += 0.2;
+    // 輸送需要の計算 (キャパシティベース)
+    let total_needed_capacity = strategy.priority_targets.len() as u32;
+    let current_capacity: u32 = my_units.iter().map(|(_, s)| s.max_cargo).sum();
+    strategy.transport_demand = total_needed_capacity.saturating_sub(current_capacity);
+
+    // 包括的需要マトリクスの計算
+    // 自軍・敵軍の状況から、占領脅威・消耗ギャップを数値化した需要ベクトル。
+    {
+        let damage_chart = world.get_resource::<crate::resources::DamageChart>().cloned();
+        let unit_registry = world.get_resource::<crate::resources::UnitRegistry>().cloned();
+
+        if let (Some(chart), Some(registry)) = (damage_chart, unit_registry) {
+            // 自軍屠性を制限する：拠点の terrain を取得
+            let my_props_for_demand: Vec<(GridPosition, Terrain)> = {
+                let mut q = world.query::<(&GridPosition, &Property)>();
+                q.iter(world)
+                    .filter(|(_, p)| p.owner_id == Some(player_id))
+                    .map(|(pos, p)| (*pos, p.terrain))
+                    .collect()
+            };
+            strategy.demand = compute_demand(
+                &my_units,
+                &enemy_units,
+                &my_props_for_demand,
+                &chart,
+                &registry,
+            );
+        }
     }
 
     strategy
