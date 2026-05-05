@@ -188,11 +188,11 @@ pub fn decide_ai_action(
         };
 
         // 全敵ユニット情報を収集（ターゲット評価用）
-        let enemy_units: Vec<(GridPosition, crate::resources::UnitType, u32, u32)> = {
+        let enemy_units: Vec<(GridPosition, crate::resources::UnitType, u32, u32, u32)> = {
             let mut q = world.query::<(&GridPosition, &Faction, &UnitStats, &Health)>();
             q.iter(world)
                 .filter(|(_, f, _, h)| f.0 != player_id && h.current > 0)
-                .map(|(p, _, s, h)| (*p, s.unit_type, s.cost, h.current))
+                .map(|(p, _, s, h)| (*p, s.unit_type, s.cost, h.current, s.max_range))
                 .collect()
         };
 
@@ -259,7 +259,7 @@ pub fn decide_ai_action(
                 let mut best_target_dist = 99;
                 let mut max_potential = -1.0;
 
-                for (e_pos, e_type, e_cost, e_hp) in &enemy_units {
+                for (e_pos, e_type, e_cost, e_hp, _) in &enemy_units {
                     let d = (current_grid.x as i32 - e_pos.x as i32).abs()
                         + (current_grid.y as i32 - e_pos.y as i32).abs();
 
@@ -287,7 +287,7 @@ pub fn decide_ai_action(
 
                 // fallback: 敵がいない、または誰も攻撃できない場合は最寄りの敵を目指す
                 if max_potential <= 0.0 {
-                    for (e_pos, _, _, _) in &enemy_units {
+                    for (e_pos, _, _, _, _) in &enemy_units {
                         let d = (current_grid.x as i32 - e_pos.x as i32).abs()
                             + (current_grid.y as i32 - e_pos.y as i32).abs();
                         if d < best_target_dist {
@@ -552,22 +552,27 @@ pub fn decide_ai_action(
                                         }
                                     }
 
-                                    // 敵に近いならボーナス（攻撃準備）
+                                    // 敵との距離と危険度を評価
                                     let mut min_enemy_dist = 99;
-                                    for (e_pos, _, _, _) in &enemy_units {
+                                    let mut is_in_danger = false;
+                                    for (e_pos, _, _, _, e_max_range) in &enemy_units {
                                         let d = (drop_pos.x as i32 - e_pos.x as i32).abs()
                                             + (drop_pos.y as i32 - e_pos.y as i32).abs();
                                         if d < min_enemy_dist {
                                             min_enemy_dist = d;
                                         }
-                                    }
-                                    if min_enemy_dist <= 1 {
-                                        drop_score += 2000;
+                                        // 敵の攻撃範囲（射程内）なら危険とみなす
+                                        if d <= *e_max_range as i32 {
+                                            is_in_danger = true;
+                                        }
                                     }
 
-                                    // 危険地帯（敵の攻撃範囲）ならペナルティ
-                                    if min_enemy_dist == 0 {
-                                        drop_score -= 1000;
+                                    // 敵が遠ければ攻撃準備として中距離でボーナス、
+                                    // 隣接や射程内（=次ターン即攻撃される）はペナルティ
+                                    if is_in_danger {
+                                        drop_score -= 1500;
+                                    } else if (2..=3).contains(&min_enemy_dist) {
+                                        drop_score += 2000;
                                     }
 
                                     let score = base_tile_score + drop_score;
