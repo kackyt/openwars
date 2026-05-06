@@ -1,10 +1,10 @@
-use bevy_ecs::prelude::{Entity, With};
+use bevy_ecs::prelude::Entity;
 use bevy_ecs::schedule::Schedule;
 use bevy_ecs::world::World;
 #[allow(dead_code)]
-use rmcp::handler::server::tool::Parameters;
-use rmcp::model::{Implementation, ServerInfo};
-use rmcp::{ServerHandler, tool};
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::ServerInfo;
+use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -17,10 +17,9 @@ struct GameState {
 }
 
 use engine::components::{
-    ActionCompleted, Ammo, Faction, Fuel, GridPosition, HasMoved, Health, PlayerId, Property,
-    UnitStats,
+    Faction, Fuel, GridPosition, HasMoved, Health, PlayerId, Property, UnitStats,
 };
-use engine::resources::master_data::{MasterDataRegistry, UnitName};
+use engine::resources::master_data::MasterDataRegistry;
 use engine::resources::{MatchState, Players};
 use engine::setup::initialize_world_from_master_data;
 
@@ -72,123 +71,45 @@ pub struct GetReachableTilesArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
-pub struct NextPhaseArgs {}
-
-#[derive(Deserialize, JsonSchema)]
 pub struct ExecuteActionArgs {
-    pub unit_id: u64,
     pub action_type: String,
+    pub unit_id: Option<u64>,
     pub target_id: Option<u64>,
     pub target_x: Option<u32>,
     pub target_y: Option<u32>,
+    pub unit_name: Option<String>,
 }
 
-#[tool(tool_box)]
+#[tool_router]
 impl OpenWarsAiServer {
     #[tool(description = "Loads a specific map to evaluate.")]
     async fn load_map(
         &self,
-        #[tool(aggr)] args: Parameters<LoadMapArgs>,
+        Parameters(args): Parameters<LoadMapArgs>,
     ) -> Result<String, String> {
         let registry =
             MasterDataRegistry::load().map_err(|e| format!("Failed to load master data: {}", e))?;
 
-        let (world, schedule) = initialize_world_from_master_data(&registry, &args.0.map_name)
+        let (world, schedule) = initialize_world_from_master_data(&registry, &args.map_name)
             .map_err(|e| format!("Initialization failed: {}", e))?;
 
         let mut state_lock = self.state.lock().await;
         *state_lock = Some(GameState { world, schedule });
 
-        Ok(format!("Loaded map: {}", args.0.map_name))
-    }
-
-    #[tool(description = "Spawns a specific unit at a given coordinate.")]
-    async fn spawn_unit(
-        &self,
-        #[tool(aggr)] args: Parameters<SpawnUnitArgs>,
-    ) -> Result<String, String> {
-        let mut state_lock = self.state.lock().await;
-        if let Some(state) = state_lock.as_mut() {
-            let world = &mut state.world;
-
-            // Coordinate validation
-            let map = world.resource::<engine::resources::Map>();
-            if args.0.x as usize >= map.width || args.0.y as usize >= map.height {
-                return Err(format!(
-                    "Coordinates out of bounds: ({}, {}) for map size {}x{}",
-                    args.0.x, args.0.y, map.width, map.height
-                ));
-            }
-
-            // Occupancy check
-            let mut q_pos = world.query_filtered::<&GridPosition, (With<Health>, With<Faction>)>();
-            for pos in q_pos.iter(world) {
-                if pos.x == args.0.x as usize && pos.y == args.0.y as usize {
-                    return Err(format!(
-                        "Tile ({}, {}) is already occupied",
-                        args.0.x, args.0.y
-                    ));
-                }
-            }
-
-            // Player validation
-            let player_id = parse_player_id(args.0.player_id)?;
-            let players = world.resource::<Players>();
-            if !players.0.iter().any(|p| p.id == player_id) {
-                return Err(format!("Player ID {} not found", args.0.player_id));
-            }
-
-            let registry = world.resource::<MasterDataRegistry>().clone();
-            let unit_name = UnitName(args.0.unit_name.clone());
-            let stats = registry
-                .create_unit_stats(&unit_name)
-                .map_err(|e| format!("Failed to create unit stats: {}", e))?;
-
-            world.spawn((
-                GridPosition {
-                    x: args.0.x as usize,
-                    y: args.0.y as usize,
-                },
-                Faction(player_id),
-                stats.clone(),
-                Health {
-                    current: 100,
-                    max: 100,
-                },
-                Fuel {
-                    current: stats.max_fuel,
-                    max: stats.max_fuel,
-                },
-                Ammo {
-                    ammo1: stats.max_ammo1,
-                    max_ammo1: stats.max_ammo1,
-                    ammo2: stats.max_ammo2,
-                    max_ammo2: stats.max_ammo2,
-                },
-                HasMoved(false),
-                ActionCompleted(false),
-            ));
-
-            Ok(format!(
-                "Spawned {} at ({}, {}) for player {}",
-                args.0.unit_name, args.0.x, args.0.y, args.0.player_id
-            ))
-        } else {
-            Err("No map loaded".into())
-        }
+        Ok(format!("Loaded map: {}", args.map_name))
     }
 
     #[tool(description = "Evaluates the board.")]
     async fn evaluate_board(
         &self,
-        #[tool(aggr)] args: Parameters<EvaluateBoardArgs>,
+        Parameters(args): Parameters<EvaluateBoardArgs>,
     ) -> Result<String, String> {
         let mut state_lock = self.state.lock().await;
         if let Some(state) = state_lock.as_mut() {
-            let player_id = parse_player_id(args.0.player_id)?;
+            let player_id = parse_player_id(args.player_id)?;
             let score = engine::ai::eval::evaluate_board(&mut state.world, player_id);
             Ok(serde_json::json!({
-                "player_id": args.0.player_id,
+                "player_id": args.player_id,
                 "score": score
             })
             .to_string())
@@ -200,15 +121,15 @@ impl OpenWarsAiServer {
     #[tool(description = "Returns valid actions for a unit at a given position.")]
     async fn get_valid_actions(
         &self,
-        #[tool(aggr)] args: Parameters<GetValidActionsArgs>,
+        Parameters(args): Parameters<GetValidActionsArgs>,
     ) -> Result<String, String> {
         let mut state_lock = self.state.lock().await;
         if let Some(state) = state_lock.as_mut() {
             let world = &mut state.world;
-            let entity = Entity::from_bits(args.0.unit_id);
+            let entity = Entity::from_bits(args.unit_id);
 
             if world.get_entity(entity).is_ok() {
-                let pos = if let (Some(x), Some(y)) = (args.0.x, args.0.y) {
+                let pos = if let (Some(x), Some(y)) = (args.x, args.y) {
                     engine::components::GridPosition { x, y }
                 } else {
                     world
@@ -222,7 +143,7 @@ impl OpenWarsAiServer {
                     engine::systems::action::get_available_actions_at(world, entity, pos, is_moved);
                 Ok(serde_json::to_string(&actions).map_err(|e| e.to_string())?)
             } else {
-                Err(format!("Unit with ID {} not found", args.0.unit_id))
+                Err(format!("Unit with ID {} not found", args.unit_id))
             }
         } else {
             Err("Map not loaded".into())
@@ -232,12 +153,12 @@ impl OpenWarsAiServer {
     #[tool(description = "Returns reachable tiles for a unit.")]
     async fn get_reachable_tiles(
         &self,
-        #[tool(aggr)] args: Parameters<GetReachableTilesArgs>,
+        Parameters(args): Parameters<GetReachableTilesArgs>,
     ) -> Result<String, String> {
         let mut state_lock = self.state.lock().await;
         if let Some(state) = state_lock.as_mut() {
             let world = &mut state.world;
-            let entity = Entity::from_bits(args.0.unit_id);
+            let entity = Entity::from_bits(args.unit_id);
 
             if let Ok(e) = world.get_entity(entity) {
                 if let (Some(pos), Some(faction), Some(stats), Some(fuel)) = (
@@ -291,10 +212,10 @@ impl OpenWarsAiServer {
                     let tiles: Vec<_> = reachable.into_iter().map(|(x, y)| vec![x, y]).collect();
                     Ok(serde_json::to_string(&tiles).map_err(|e| e.to_string())?)
                 } else {
-                    Err(format!("Unit with ID {} is missing stats", args.0.unit_id))
+                    Err(format!("Unit with ID {} is missing stats", args.unit_id))
                 }
             } else {
-                Err(format!("Unit with ID {} not found", args.0.unit_id))
+                Err(format!("Unit with ID {} not found", args.unit_id))
             }
         } else {
             Err("Map not loaded".into())
@@ -304,7 +225,7 @@ impl OpenWarsAiServer {
     #[tool(description = "Returns the current state of the board.")]
     async fn get_board_state(
         &self,
-        #[tool(aggr)] _args: Parameters<GetBoardStateArgs>,
+        Parameters(_args): Parameters<GetBoardStateArgs>,
     ) -> Result<String, String> {
         let mut state_lock = self.state.lock().await;
         if let Some(state) = state_lock.as_mut() {
@@ -377,7 +298,7 @@ impl OpenWarsAiServer {
     #[tool(description = "Simulates an AI turn using the AI engine logic.")]
     async fn simulate_ai_turn(
         &self,
-        #[tool(aggr)] _args: Parameters<SimulateAiTurnArgs>,
+        Parameters(_args): Parameters<SimulateAiTurnArgs>,
     ) -> Result<String, String> {
         let mut state_lock = self.state.lock().await;
         if let Some(state) = state_lock.as_mut() {
@@ -398,7 +319,7 @@ impl OpenWarsAiServer {
             let action_taken =
                 engine::ai::engine::execute_ai_turn(&mut state.world, active_player_id);
 
-            // 重要: AIの行動(Event)を発行したあとは、システムを実行して状態を更新する必要がある
+            // 鬩･蟠趣ｽｦ繝ｻ AI邵ｺ・ｮ髯ｦ謔溯劒(Event)郢ｧ蝣､蛹ｱ髯ｦ蠕鯉ｼ邵ｺ貅倪旺邵ｺ・ｨ邵ｺ・ｯ邵ｲ竏壹☆郢ｧ・ｹ郢昴・ﾎ堤ｹｧ雋橸ｽｮ貅ｯ・｡蠕鯉ｼ邵ｺ・ｦ霑･・ｶ隲ｷ荵晢ｽ定ｭ厄ｽｴ隴・ｽｰ邵ｺ蜷ｶ・玖｢繝ｻ・ｦ竏壺ｲ邵ｺ繧・ｽ・
             state.schedule.run(&mut state.world);
 
             let after_score = engine::ai::eval::evaluate_board(&mut state.world, active_player_id);
@@ -416,53 +337,193 @@ impl OpenWarsAiServer {
         }
     }
 
-    #[tool(description = "Advances to the next game phase/player.")]
-    async fn next_phase(
+    #[tool(description = "Executes an action.")]
+    async fn execute_action(
         &self,
-        #[tool(aggr)] _args: Parameters<NextPhaseArgs>,
+        Parameters(args): Parameters<ExecuteActionArgs>,
     ) -> Result<String, String> {
         let mut state_lock = self.state.lock().await;
         if let Some(state) = state_lock.as_mut() {
             let world = &mut state.world;
-            world.send_event(engine::events::NextPhaseCommand);
+
+            match args.action_type.as_str() {
+                "next_phase" => {
+                    world.send_event(engine::events::NextPhaseCommand);
+                }
+                "move" => {
+                    let unit_entity = Entity::from_bits(
+                        args
+                            .unit_id
+                            .ok_or_else(|| "unit_id is required for move".to_string())?,
+                    );
+                    let target_x = args
+                        .target_x
+                        .ok_or_else(|| "target_x is required for move".to_string())?
+                        as usize;
+                    let target_y = args
+                        .target_y
+                        .ok_or_else(|| "target_y is required for move".to_string())?
+                        as usize;
+                    world.send_event(engine::events::MoveUnitCommand {
+                        unit_entity,
+                        target_x,
+                        target_y,
+                    });
+                }
+                "attack" => {
+                    let attacker_entity = Entity::from_bits(
+                        args
+                            .unit_id
+                            .ok_or_else(|| "unit_id is required for attack".to_string())?,
+                    );
+                    let defender_entity = Entity::from_bits(
+                        args
+                            .target_id
+                            .ok_or_else(|| "target_id is required for attack".to_string())?,
+                    );
+                    world.send_event(engine::events::AttackUnitCommand {
+                        attacker_entity,
+                        defender_entity,
+                    });
+                }
+                "capture" => {
+                    let unit_entity = Entity::from_bits(
+                        args
+                            .unit_id
+                            .ok_or_else(|| "unit_id is required for capture".to_string())?,
+                    );
+                    world.send_event(engine::events::CapturePropertyCommand { unit_entity });
+                }
+                "wait" => {
+                    let unit_entity = Entity::from_bits(
+                        args
+                            .unit_id
+                            .ok_or_else(|| "unit_id is required for wait".to_string())?,
+                    );
+                    world.send_event(engine::events::WaitUnitCommand { unit_entity });
+                }
+                "supply" => {
+                    let supplier_entity = Entity::from_bits(
+                        args
+                            .unit_id
+                            .ok_or_else(|| "unit_id is required for supply".to_string())?,
+                    );
+                    let target_entity = Entity::from_bits(
+                        args
+                            .target_id
+                            .ok_or_else(|| "target_id is required for supply".to_string())?,
+                    );
+                    world.send_event(engine::events::SupplyUnitCommand {
+                        supplier_entity,
+                        target_entity,
+                    });
+                }
+                "load" => {
+                    let unit_entity = Entity::from_bits(
+                        args
+                            .unit_id
+                            .ok_or_else(|| "unit_id is required for load".to_string())?,
+                    );
+                    let transport_entity = Entity::from_bits(
+                        args
+                            .target_id
+                            .ok_or_else(|| "target_id is required for load".to_string())?,
+                    );
+                    world.send_event(engine::events::LoadUnitCommand {
+                        transport_entity,
+                        unit_entity,
+                    });
+                }
+                "unload" => {
+                    let transport_entity = Entity::from_bits(
+                        args
+                            .unit_id
+                            .ok_or_else(|| "unit_id (transport) is required for unload".to_string())?,
+                    );
+                    let cargo_entity = Entity::from_bits(
+                        args
+                            .target_id
+                            .ok_or_else(|| "target_id (cargo) is required for unload".to_string())?,
+                    );
+                    let target_x = args
+                        .target_x
+                        .ok_or_else(|| "target_x is required for unload".to_string())?
+                        as usize;
+                    let target_y = args
+                        .target_y
+                        .ok_or_else(|| "target_y is required for unload".to_string())?
+                        as usize;
+                    world.send_event(engine::events::UnloadUnitCommand {
+                        transport_entity,
+                        cargo_entity,
+                        target_x,
+                        target_y,
+                    });
+                }
+                "merge" => {
+                    let source_entity = Entity::from_bits(
+                        args
+                            .unit_id
+                            .ok_or_else(|| "unit_id (source) is required for merge".to_string())?,
+                    );
+                    let target_entity = Entity::from_bits(
+                        args
+                            .target_id
+                            .ok_or_else(|| "target_id is required for merge".to_string())?,
+                    );
+                    world.send_event(engine::events::MergeUnitCommand {
+                        source_entity,
+                        target_entity,
+                    });
+                }
+                "produce" => {
+                    let target_x = args
+                        .target_x
+                        .ok_or_else(|| "target_x is required for produce".to_string())?
+                        as usize;
+                    let target_y = args
+                        .target_y
+                        .ok_or_else(|| "target_y is required for produce".to_string())?
+                        as usize;
+                    let unit_name_str = args
+                        .unit_name
+                        .as_ref()
+                        .ok_or_else(|| "unit_name is required for produce".to_string())?;
+                    let unit_type = engine::resources::UnitType::from_str(unit_name_str)
+                        .ok_or_else(|| format!("Unknown unit type: {}", unit_name_str))?;
+
+                    let active_player_id = {
+                        let ms = world.resource::<MatchState>();
+                        let players = world.resource::<Players>();
+                        players.0[ms.active_player_index.0].id
+                    };
+
+                    world.send_event(engine::events::ProduceUnitCommand {
+                        player_id: active_player_id,
+                        target_x,
+                        target_y,
+                        unit_type,
+                    });
+                }
+                _ => return Err(format!("Unknown action type: {}", args.action_type)),
+            }
+
             state.schedule.run(world);
-
-            let ms = world.get_resource::<MatchState>().unwrap();
-            let players = world.get_resource::<Players>().unwrap();
-            let active_player = &players.0[ms.active_player_index.0];
-
-            Ok(format!(
-                "Advanced to turn {}, player {} (Phase: {:?})",
-                ms.current_turn_number.0, active_player.id.0, ms.current_phase
-            ))
+            Ok(format!("Executed action: {}", args.action_type))
         } else {
             Err("Map not loaded".into())
         }
     }
-
-    #[tool(description = "Executes an action.")]
-    async fn execute_action(
-        &self,
-        #[tool(aggr)] _args: Parameters<ExecuteActionArgs>,
-    ) -> Result<String, String> {
-        Ok("Executed action (Stated stub, please use JSON params for specific commands)".into())
-    }
 }
 
+#[tool_handler(name = "openwars-mcp", version = "1.0.0")]
 impl ServerHandler for OpenWarsAiServer {
-    rmcp::tool_box!(@derive);
-
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            capabilities: rmcp::model::ServerCapabilities::builder()
+        ServerInfo::new(
+            rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
                 .build(),
-            server_info: Implementation {
-                name: "openwars-mcp".into(),
-                version: "1.0.0".into(),
-            },
-            ..Default::default()
-        }
+        )
     }
 }
 
