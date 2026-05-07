@@ -201,16 +201,41 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
         }
     }
 
-    // 輸送需要の計算 (キャパシティベース)
-    let total_needed_capacity = strategy.priority_targets.len() as u32;
+    // 輸送需要の計算 (キャパシティベース + 地形分析)
+    let mut total_needed_capacity = 0;
+    if let Some(cap_pos) = my_capital_pos {
+        for target in &strategy.priority_targets {
+            let dist = (cap_pos.x as i32 - target.x as i32).abs()
+                + (cap_pos.y as i32 - target.y as i32).abs();
+            // 単純な距離だけでなく、海を挟んでいる可能性が高い（または極端に遠い）場合に需要を加算
+            if dist > 15 {
+                total_needed_capacity += 2;
+            } else if dist > 8 {
+                total_needed_capacity += 1;
+            }
+        }
+    } else {
+        total_needed_capacity = strategy.priority_targets.len() as u32 / 2;
+    }
+
     let current_capacity: u32 = my_units.iter().map(|(_, s)| s.max_cargo).sum();
-    strategy.transport_demand = total_needed_capacity.saturating_sub(current_capacity);
+    strategy.transport_demand = total_needed_capacity.saturating_sub(current_capacity).max(
+        if !strategy.priority_targets.is_empty() && current_capacity == 0 {
+            1
+        } else {
+            0
+        },
+    );
 
     // 包括的需要マトリクスの計算
     // 自軍・敵軍の状況から、占領脅威・消耗ギャップを数値化した需要ベクトル。
     {
-        let damage_chart = world.get_resource::<crate::resources::DamageChart>().cloned();
-        let unit_registry = world.get_resource::<crate::resources::UnitRegistry>().cloned();
+        let damage_chart = world
+            .get_resource::<crate::resources::DamageChart>()
+            .cloned();
+        let unit_registry = world
+            .get_resource::<crate::resources::UnitRegistry>()
+            .cloned();
 
         if let (Some(chart), Some(registry)) = (damage_chart, unit_registry) {
             // 自軍屠性を制限する：拠点の terrain を取得

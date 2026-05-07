@@ -60,14 +60,11 @@ impl DemandMatrix {
 
 /// `DamageChart` を走査し、全ユニット×全カテゴリの平均攻撃期待値を算出します。
 /// これを正規化スケールとして使用することで、ユニット追加・変更に自動対応します。
-pub fn average_attack_expectation(
-    damage_chart: &DamageChart,
-    unit_registry: &UnitRegistry,
-) -> f32 {
+pub fn average_attack_expectation(damage_chart: &DamageChart, unit_registry: &UnitRegistry) -> f32 {
     let mut total = 0.0f32;
     let mut count = 0u32;
 
-    for (attacker_type, _) in &unit_registry.0 {
+    for attacker_type in unit_registry.0.keys() {
         for (defender_type, defender_stats) in &unit_registry.0 {
             // 主武器
             if let Some(dmg) = damage_chart.get_base_damage(*attacker_type, *defender_type) {
@@ -266,7 +263,7 @@ pub fn compute_demand(
             let dist = (enemy_pos.x as i32 - prop_pos.x as i32).unsigned_abs()
                 + (enemy_pos.y as i32 - prop_pos.y as i32).unsigned_abs();
             // 移動力を考慮した ETA の簡易見積もり（最低1ターン）
-            let eta = ((dist as u32) / enemy_stats.max_movement.max(1)).max(1);
+            let eta = (dist / enemy_stats.max_movement.max(1)).max(1);
             // 重要度 × 到達しやすさ（ETAが短いほど高い）
             capture_threat += importance(*terrain) / eta as f32;
         }
@@ -401,8 +398,7 @@ mod tests {
         // 自軍：首都を所有
         let my_properties = vec![(GridPosition { x: 3, y: 3 }, Terrain::Capital)];
 
-        let demand_near =
-            compute_demand(&[], &enemy_units, &my_properties, &chart, &registry);
+        let demand_near = compute_demand(&[], &enemy_units, &my_properties, &chart, &registry);
 
         // 敵歩兵が遠い場合（ETA=4）
         let enemy_far = vec![(
@@ -417,8 +413,7 @@ mod tests {
                 ..UnitStats::mock()
             },
         )];
-        let demand_far =
-            compute_demand(&[], &enemy_far, &my_properties, &chart, &registry);
+        let demand_far = compute_demand(&[], &enemy_far, &my_properties, &chart, &registry);
 
         assert!(
             demand_near.capture > demand_far.capture,

@@ -4,7 +4,7 @@ use bevy_ecs::world::World;
 #[allow(dead_code)]
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::ServerInfo;
-use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -83,10 +83,7 @@ pub struct ExecuteActionArgs {
 #[tool_router]
 impl OpenWarsAiServer {
     #[tool(description = "Loads a specific map to evaluate.")]
-    async fn load_map(
-        &self,
-        Parameters(args): Parameters<LoadMapArgs>,
-    ) -> Result<String, String> {
+    async fn load_map(&self, Parameters(args): Parameters<LoadMapArgs>) -> Result<String, String> {
         let registry =
             MasterDataRegistry::load().map_err(|e| format!("Failed to load master data: {}", e))?;
 
@@ -352,8 +349,7 @@ impl OpenWarsAiServer {
                 }
                 "move" => {
                     let unit_entity = Entity::from_bits(
-                        args
-                            .unit_id
+                        args.unit_id
                             .ok_or_else(|| "unit_id is required for move".to_string())?,
                     );
                     let target_x = args
@@ -372,13 +368,11 @@ impl OpenWarsAiServer {
                 }
                 "attack" => {
                     let attacker_entity = Entity::from_bits(
-                        args
-                            .unit_id
+                        args.unit_id
                             .ok_or_else(|| "unit_id is required for attack".to_string())?,
                     );
                     let defender_entity = Entity::from_bits(
-                        args
-                            .target_id
+                        args.target_id
                             .ok_or_else(|| "target_id is required for attack".to_string())?,
                     );
                     world.send_event(engine::events::AttackUnitCommand {
@@ -388,29 +382,25 @@ impl OpenWarsAiServer {
                 }
                 "capture" => {
                     let unit_entity = Entity::from_bits(
-                        args
-                            .unit_id
+                        args.unit_id
                             .ok_or_else(|| "unit_id is required for capture".to_string())?,
                     );
                     world.send_event(engine::events::CapturePropertyCommand { unit_entity });
                 }
                 "wait" => {
                     let unit_entity = Entity::from_bits(
-                        args
-                            .unit_id
+                        args.unit_id
                             .ok_or_else(|| "unit_id is required for wait".to_string())?,
                     );
                     world.send_event(engine::events::WaitUnitCommand { unit_entity });
                 }
                 "supply" => {
                     let supplier_entity = Entity::from_bits(
-                        args
-                            .unit_id
+                        args.unit_id
                             .ok_or_else(|| "unit_id is required for supply".to_string())?,
                     );
                     let target_entity = Entity::from_bits(
-                        args
-                            .target_id
+                        args.target_id
                             .ok_or_else(|| "target_id is required for supply".to_string())?,
                     );
                     world.send_event(engine::events::SupplyUnitCommand {
@@ -420,13 +410,11 @@ impl OpenWarsAiServer {
                 }
                 "load" => {
                     let unit_entity = Entity::from_bits(
-                        args
-                            .unit_id
+                        args.unit_id
                             .ok_or_else(|| "unit_id is required for load".to_string())?,
                     );
                     let transport_entity = Entity::from_bits(
-                        args
-                            .target_id
+                        args.target_id
                             .ok_or_else(|| "target_id is required for load".to_string())?,
                     );
                     world.send_event(engine::events::LoadUnitCommand {
@@ -435,16 +423,14 @@ impl OpenWarsAiServer {
                     });
                 }
                 "unload" => {
-                    let transport_entity = Entity::from_bits(
-                        args
-                            .unit_id
-                            .ok_or_else(|| "unit_id (transport) is required for unload".to_string())?,
-                    );
-                    let cargo_entity = Entity::from_bits(
-                        args
-                            .target_id
-                            .ok_or_else(|| "target_id (cargo) is required for unload".to_string())?,
-                    );
+                    let transport_entity =
+                        Entity::from_bits(args.unit_id.ok_or_else(|| {
+                            "unit_id (transport) is required for unload".to_string()
+                        })?);
+                    let cargo_entity =
+                        Entity::from_bits(args.target_id.ok_or_else(|| {
+                            "target_id (cargo) is required for unload".to_string()
+                        })?);
                     let target_x = args
                         .target_x
                         .ok_or_else(|| "target_x is required for unload".to_string())?
@@ -462,13 +448,11 @@ impl OpenWarsAiServer {
                 }
                 "merge" => {
                     let source_entity = Entity::from_bits(
-                        args
-                            .unit_id
+                        args.unit_id
                             .ok_or_else(|| "unit_id (source) is required for merge".to_string())?,
                     );
                     let target_entity = Entity::from_bits(
-                        args
-                            .target_id
+                        args.target_id
                             .ok_or_else(|| "target_id is required for merge".to_string())?,
                     );
                     world.send_event(engine::events::MergeUnitCommand {

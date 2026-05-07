@@ -363,18 +363,22 @@ pub fn calculate_unit_score_at(
         if strategy.transport_demand > 0 {
             score += 2000; // 不足している場合は大幅加点
 
-            // 長距離補給ボーナス: 前線が遠いほど輸送機の価値を高める
+            // 物流効率ボーナス: 前線が遠いほど輸送機の価値を高める
+            // また、戦艦などの高コストユニットを運べる能力を評価
             if min_eta > 8 {
-                score += 1000;
+                score += 1500;
+            }
+            if min_eta > 15 {
+                score += 2000;
             }
         } else {
             // 需要が満たされている場合
             if stats.max_ammo1 == 0 {
                 // 武器がない純粋な輸送機は強く抑制
-                score = score.saturating_sub(1000);
+                score = score.saturating_sub(1500);
             } else {
                 // 装甲車などの戦闘能力がある場合は抑制を小さくする
-                score = score.saturating_sub(200);
+                score = score.saturating_sub(500);
             }
         }
     }

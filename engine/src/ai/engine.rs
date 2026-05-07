@@ -242,7 +242,21 @@ pub fn decide_ai_action(
             }
 
             // 占領価値・拠点接近スコア
-            if stats.can_capture {
+            let mut effective_can_capture = stats.can_capture;
+            if !effective_can_capture
+                && let Some(cargo) = world.get::<crate::components::CargoCapacity>(unit_entity)
+            {
+                for &cargo_ent in &cargo.loaded {
+                    if let Some(c_stats) = world.get::<UnitStats>(cargo_ent)
+                        && c_stats.can_capture
+                    {
+                        effective_can_capture = true;
+                        break;
+                    }
+                }
+            }
+
+            if effective_can_capture {
                 let mut min_objective_dist = 99;
                 for (p_pos, _p_terrain, p_owner) in &properties {
                     if *p_owner != Some(player_id) {
@@ -594,61 +608,81 @@ pub fn decide_ai_action(
                             #[allow(clippy::collapsible_if)]
                             if !action.0 {
                                 // 降車可能なマスを探索
-                                let drop_tiles = crate::systems::transport::get_droppable_tiles(
-                                    world,
-                                    unit_entity,
-                                    cargo_entity,
-                                );
-                                for drop_tile in drop_tiles {
-                                    let drop_pos = GridPosition {
-                                        x: drop_tile.0,
-                                        y: drop_tile.1,
-                                    };
+                                if let Some(cargo_unit_type) =
+                                    world.get::<UnitStats>(cargo_entity).map(|s| s.unit_type)
+                                {
+                                    let drop_tiles = crate::systems::transport::get_droppable_tiles(
+                                        world,
+                                        unit_entity,
+                                        cargo_entity,
+                                    );
+                                    for drop_tile in drop_tiles {
+                                        let drop_pos = GridPosition {
+                                            x: drop_tile.0,
+                                            y: drop_tile.1,
+                                        };
 
-                                    // 降車先の価値を評価
-                                    let mut drop_score = 5000; // 基本的に降ろすのは良いこと
+                                        // 降車先の価値を評価
+                                        let mut drop_score: i32 = 5000; // 基本的に降ろすのは良いこと
 
-                                    // 降車先が拠点ならボーナス
-                                    for (p_pos, _, p_owner) in &properties {
-                                        if p_pos.x == drop_pos.x && p_pos.y == drop_pos.y {
-                                            if *p_owner != Some(player_id) {
-                                                drop_score += 3000; // 敵拠点の占領準備
+                                        // 降車先が拠点ならボーナス
+                                        for (p_pos, _, p_owner) in &properties {
+                                            if p_pos.x == drop_pos.x && p_pos.y == drop_pos.y {
+                                                if *p_owner != Some(player_id) {
+                                                    drop_score += 3000; // 敵拠点の占領準備
+                                                }
+                                                break;
                                             }
-                                            break;
                                         }
-                                    }
 
-                                    // 敵との距離と危険度を評価
-                                    let mut min_enemy_dist = 99;
-                                    let mut is_in_danger = false;
-                                    for (e_pos, _, _, _, e_max_range) in &enemy_units {
-                                        let d = (drop_pos.x as i32 - e_pos.x as i32).abs()
-                                            + (drop_pos.y as i32 - e_pos.y as i32).abs();
-                                        if d < min_enemy_dist {
-                                            min_enemy_dist = d;
+                                        // 敵との距離と危険度を評価
+                                        let mut min_enemy_dist = 99;
+                                        let mut max_threat = 0;
+                                        for (e_pos, e_unit_type, _, _, e_max_range) in
+                                            &enemy_units
+                                        {
+                                            let d = (drop_pos.x as i32 - e_pos.x as i32).abs()
+                                                + (drop_pos.y as i32 - e_pos.y as i32).abs();
+                                            if d < min_enemy_dist {
+                                                min_enemy_dist = d;
+                                            }
+                                            // 敵の攻撃範囲（射程内）なら脅威を計算
+                                            if d <= *e_max_range as i32 {
+                                                if let Some(dmg) = damage_chart.get_base_damage(
+                                                    *e_unit_type,
+                                                    cargo_unit_type,
+                                                ) {
+                                                    if dmg > max_threat {
+                                                        max_threat = dmg;
+                                                    }
+                                                }
+                                            }
                                         }
-                                        // 敵の攻撃範囲（射程内）なら危険とみなす
-                                        if d <= *e_max_range as i32 {
-                                            is_in_danger = true;
+
+                                        // 脅威度に応じた動的なペナルティ
+                                        // ダメージ期待値が50%を超えるような無謀な降車は避ける
+                                        if max_threat > 50 {
+                                            drop_score = drop_score.saturating_sub(4000);
+                                        } else if max_threat > 20 {
+                                            drop_score = drop_score.saturating_sub(1500);
+                                        } else if max_threat > 0 {
+                                            drop_score = drop_score.saturating_sub(500);
                                         }
-                                    }
 
-                                    // 敵が遠ければ攻撃準備として中距離でボーナス、
-                                    // 隣接や射程内（=次ターン即攻撃される）はペナルティ
-                                    if is_in_danger {
-                                        drop_score -= 1500;
-                                    } else if (2..=3).contains(&min_enemy_dist) {
-                                        drop_score += 2000;
-                                    }
+                                        // 敵が近く、かつ安全ならボーナス（次ターン攻撃用）
+                                        if max_threat == 0 && (1..=3).contains(&min_enemy_dist) {
+                                            drop_score += 2000;
+                                        }
 
-                                    let score = base_tile_score + drop_score;
-                                    #[allow(clippy::collapsible_if)]
-                                    if score > best_unit_score {
-                                        best_unit_score = score;
-                                        best_unit_choice = Some(AiCommand::Drop {
-                                            target_pos: drop_pos,
-                                            cargo_entity,
-                                        });
+                                        let score = base_tile_score + drop_score;
+                                        #[allow(clippy::collapsible_if)]
+                                        if score > best_unit_score {
+                                            best_unit_score = score;
+                                            best_unit_choice = Some(AiCommand::Drop {
+                                                target_pos: drop_pos,
+                                                cargo_entity,
+                                            });
+                                        }
                                     }
                                 }
                             }
