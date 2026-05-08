@@ -241,6 +241,29 @@ pub fn decide_ai_action(
                 base_tile_score += (20 - min_recovery_dist).max(0) * 300;
             }
 
+            // 7.3 タクシー帰りロジック: 空の輸送車は生産拠点へ引き返す
+            let is_empty_transport = stats.max_cargo > 0
+                && world
+                    .get::<crate::components::CargoCapacity>(unit_entity)
+                    .is_some_and(|c| c.loaded.is_empty());
+
+            if is_empty_transport {
+                let mut min_base_dist = 99;
+                for (p_pos, p_terrain, p_owner) in &properties {
+                    if *p_owner == Some(player_id)
+                        && registry.is_production_facility(p_terrain.as_str())
+                    {
+                        let d = (current_grid.x as i32 - p_pos.x as i32).abs()
+                            + (current_grid.y as i32 - p_pos.y as i32).abs();
+                        if d < min_base_dist {
+                            min_base_dist = d;
+                        }
+                    }
+                }
+                // 拠点に近づくほど高スコア（磁力）
+                base_tile_score += (20 - min_base_dist).max(0) * 500;
+            }
+
             // 占領価値・拠点接近スコア
             let mut effective_can_capture = stats.can_capture;
             if !effective_can_capture
@@ -638,8 +661,7 @@ pub fn decide_ai_action(
                                         // 敵との距離と危険度を評価
                                         let mut min_enemy_dist = 99;
                                         let mut max_threat = 0;
-                                        for (e_pos, e_unit_type, _, _, e_max_range) in
-                                            &enemy_units
+                                        for (e_pos, e_unit_type, _, _, e_max_range) in &enemy_units
                                         {
                                             let d = (drop_pos.x as i32 - e_pos.x as i32).abs()
                                                 + (drop_pos.y as i32 - e_pos.y as i32).abs();
@@ -648,10 +670,9 @@ pub fn decide_ai_action(
                                             }
                                             // 敵の攻撃範囲（射程内）なら脅威を計算
                                             if d <= *e_max_range as i32 {
-                                                if let Some(dmg) = damage_chart.get_base_damage(
-                                                    *e_unit_type,
-                                                    cargo_unit_type,
-                                                ) {
+                                                if let Some(dmg) = damage_chart
+                                                    .get_base_damage(*e_unit_type, cargo_unit_type)
+                                                {
                                                     if dmg > max_threat {
                                                         max_threat = dmg;
                                                     }
@@ -1781,6 +1802,73 @@ mod tests {
             assert_eq!(target_pos.y, 1);
         } else {
             panic!("Expected Wait at (1,1) due to no ammo, got {:?}", action);
+        }
+    }
+
+    #[test]
+    fn test_ai_action_taxi_back() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (mut world, _) =
+            crate::setup::initialize_world_from_master_data(&master_data, "map_1").unwrap();
+        let p1 = PlayerId(1);
+
+        // 1. 全ユニットをクリア
+        let entities: Vec<Entity> = world.query::<Entity>().iter(&world).collect();
+        for e in entities {
+            world.despawn(e);
+        }
+
+        // 2. 首都（生産拠点）を設置 (x=0, y=0)
+        let capital_pos = GridPosition { x: 0, y: 0 };
+        world.spawn((capital_pos, Property::new(Terrain::Capital, Some(p1), 100)));
+
+        // 3. 空の輸送ヘリを「前線（遠く）」に設置 (x=8, y=0)
+        let heli_pos = GridPosition { x: 8, y: 0 };
+        let heli_entity = world
+            .spawn((
+                heli_pos,
+                p1,
+                Faction(p1),
+                HasMoved(false),
+                ActionCompleted(false),
+                UnitStats {
+                    unit_type: UnitType::TransportHelicopter,
+                    max_movement: 6,
+                    movement_type: crate::resources::MovementType::Air,
+                    max_cargo: 1,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                crate::components::CargoCapacity {
+                    loaded: vec![],
+                    max: 1,
+                },
+            ))
+            .id();
+
+        // 4. AIに行動を決定させる
+        let skips = std::collections::HashSet::new();
+        let action = decide_ai_action(&mut world, p1, &skips);
+
+        // 5. 検証: 輸送ヘリが首都（x=0）の方向に移動しようとしていること
+        assert!(action.is_some());
+        if let Some((entity, AiCommand::Wait { target_pos })) = action {
+            assert_eq!(entity, heli_entity);
+            assert!(
+                target_pos.x < heli_pos.x,
+                "Empty transport should move back towards capital (x=0). Target: {:?}, Current: {:?}",
+                target_pos,
+                heli_pos
+            );
+        } else {
+            panic!("Expected Wait command for taxi-back, got {:?}", action);
         }
     }
 }

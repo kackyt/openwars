@@ -1,6 +1,8 @@
-use crate::ai::demand::{DemandMatrix, compute_demand};
+use crate::ai::demand::{
+    DemandMatrix, average_attack_expectation, compute_demand, compute_unit_affinity,
+};
 use crate::components::{Faction, GridPosition, PlayerId, Property, UnitStats};
-use crate::resources::{Terrain, UnitType};
+use crate::resources::{MovementType, Terrain, UnitType};
 use bevy_ecs::prelude::*;
 use std::collections::HashMap;
 
@@ -34,6 +36,10 @@ pub struct ProductionStrategy {
     pub capture_demand: u32,
     /// 包括的需要マトリクス（各戦闘カテゴリの脅威ギャップと占領脅威）。
     pub demand: DemandMatrix,
+    /// 輸送を必要としている既存ユニットのリスト（位置、ステータス、基本価値）。
+    pub transport_candidates: Vec<(GridPosition, UnitStats, f32)>,
+    /// 現在保有している輸送ユニットの数
+    pub existing_transport_count: usize,
 }
 
 /// 複数ターンにまたがる生産計画。
@@ -201,14 +207,40 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
         }
     }
 
+    // 占領需要の計算: (未占領拠点 + 敵拠点) に対して歩兵が足りているか
+    let total_properties = unowned_properties.len() + enemy_properties.len();
+    let current_capture_units = my_units.iter().filter(|(_, s)| s.can_capture).count();
+    // 拠点の50%程度を目安としつつ、常に5〜12体程度を維持するように調整
+    let ideal_capture_units = ((total_properties as f32 * 0.5).ceil() as usize).clamp(5, 12);
+    // 足りている場合は0にする（既存の max(1) は過剰生産を招く）
+    strategy.capture_demand = (ideal_capture_units.saturating_sub(current_capture_units)) as u32;
+
     // 輸送需要の計算 (キャパシティベース + 地形分析)
     let mut total_needed_capacity = 0;
     if let Some(cap_pos) = my_capital_pos {
         for target in &strategy.priority_targets {
+            let map = world.resource::<crate::resources::Map>();
             let dist = (cap_pos.x as i32 - target.x as i32).abs()
                 + (cap_pos.y as i32 - target.y as i32).abs();
-            // 単純な距離だけでなく、海を挟んでいる可能性が高い（または極端に遠い）場合に需要を加算
-            if dist > 15 {
+
+            // 海を跨いでいるかチェック（簡易サンプリング）
+            let mut across_sea = false;
+            let steps = 5;
+            for i in 1..steps {
+                let check_x = cap_pos.x as i32 + (target.x as i32 - cap_pos.x as i32) * i / steps;
+                let check_y = cap_pos.y as i32 + (target.y as i32 - cap_pos.y as i32) * i / steps;
+                if let Some(Terrain::Sea | Terrain::Shoal) =
+                    map.get_terrain(check_x as usize, check_y as usize)
+                {
+                    across_sea = true;
+                    break;
+                }
+            }
+
+            // 単純な距離だけでなく、海を挟んでいる場合や極端に遠い場合に需要を加算
+            if across_sea {
+                total_needed_capacity += 3; // 海を越えるのは優先度高
+            } else if dist > 15 {
                 total_needed_capacity += 2;
             } else if dist > 8 {
                 total_needed_capacity += 1;
@@ -219,8 +251,12 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
     }
 
     let current_capacity: u32 = my_units.iter().map(|(_, s)| s.max_cargo).sum();
+    strategy.existing_transport_count = my_units.iter().filter(|(_, s)| s.max_cargo > 0).count();
     strategy.transport_demand = total_needed_capacity.saturating_sub(current_capacity).max(
-        if !strategy.priority_targets.is_empty() && current_capacity == 0 {
+        if !strategy.priority_targets.is_empty()
+            && current_capacity == 0
+            && total_needed_capacity > 0
+        {
             1
         } else {
             0
@@ -253,6 +289,66 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                 &chart,
                 &registry,
             );
+
+            // 輸送が必要なユニット（停滞ユニット）の抽出
+            let map = world.resource::<crate::resources::Map>();
+            let normalization_scale = average_attack_expectation(&chart, &registry);
+            for (pos, stats) in &my_units {
+                // 陸上ユニットかつ、輸送能力を持たない戦闘/占領用ユニットのみ
+                if matches!(
+                    stats.movement_type,
+                    MovementType::Infantry
+                        | MovementType::Tank
+                        | MovementType::ArmoredCar
+                        | MovementType::Artillery
+                ) && stats.max_cargo == 0
+                {
+                    // 最寄りのターゲットへの距離と「海による遮断」を判定
+                    let mut min_dist = 999;
+                    let mut blocked_by_sea = false;
+
+                    for target in &strategy.priority_targets {
+                        let dist = (pos.x as i32 - target.x as i32).abs()
+                            + (pos.y as i32 - target.y as i32).abs();
+                        if dist < min_dist {
+                            min_dist = dist;
+
+                            // 簡易パスサンプリングで海があるかチェック
+                            blocked_by_sea = false;
+                            let steps = 4;
+                            for i in 1..steps {
+                                let check_x =
+                                    pos.x as i32 + (target.x as i32 - pos.x as i32) * i / steps;
+                                let check_y =
+                                    pos.y as i32 + (target.y as i32 - pos.y as i32) * i / steps;
+                                if let Some(Terrain::Sea | Terrain::Shoal) =
+                                    map.get_terrain(check_x as usize, check_y as usize)
+                                {
+                                    blocked_by_sea = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // 輸送を検討すべき条件: 海で遮断されている、または距離が極端に遠い
+                    if blocked_by_sea || min_dist > 15 {
+                        let affinity = compute_unit_affinity(
+                            stats.unit_type,
+                            &chart,
+                            &registry,
+                            normalization_scale,
+                        );
+                        // 価値 = (需要との一致度 * 係数) + (占領能力ボーナス)
+                        let value = strategy.demand.dot(&affinity) * 2000.0
+                            + (if stats.can_capture { 3000.0 } else { 0.0 });
+
+                        strategy
+                            .transport_candidates
+                            .push((*pos, stats.clone(), value));
+                    }
+                }
+            }
         }
     }
 
@@ -262,11 +358,12 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resources::Terrain;
+    use crate::resources::{GridTopology, Map, Terrain};
 
     #[test]
     fn test_analyze_strategy_expansion() {
         let mut world = World::new();
+        world.insert_resource(Map::new(15, 15, Terrain::Plains, GridTopology::Square));
         let p1 = PlayerId(1);
 
         // 拠点を配置 (未占領が多い)
@@ -291,6 +388,7 @@ mod tests {
     #[test]
     fn test_analyze_strategy_defense() {
         let mut world = World::new();
+        world.insert_resource(Map::new(15, 15, Terrain::Plains, GridTopology::Square));
         let p1 = PlayerId(1);
         let p2 = PlayerId(2);
 
