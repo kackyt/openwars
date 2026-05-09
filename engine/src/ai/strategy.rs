@@ -84,10 +84,15 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
 
     // 2. ユニットの分析
     {
-        let mut q_units = world.query::<(&GridPosition, &Faction, &UnitStats)>();
-        for (pos, faction, stats) in q_units.iter(world) {
+        let mut q_units = world.query::<(
+            &GridPosition,
+            &Faction,
+            &UnitStats,
+            Option<&crate::components::Transporting>,
+        )>();
+        for (pos, faction, stats, transporting) in q_units.iter(world) {
             // マップ外（輸送機内など）のユニットは距離計算などの分析から除外
-            if pos.x >= 9999 {
+            if pos.x >= 9999 || transporting.is_some() {
                 continue;
             }
             if faction.0 == player_id {
@@ -215,53 +220,23 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
     // 足りている場合は0にする（既存の max(1) は過剰生産を招く）
     strategy.capture_demand = (ideal_capture_units.saturating_sub(current_capture_units)) as u32;
 
-    // 輸送需要の計算 (キャパシティベース + 地形分析)
-    let mut total_needed_capacity = 0;
-    if let Some(cap_pos) = my_capital_pos {
-        for target in &strategy.priority_targets {
-            let map = world.resource::<crate::resources::Map>();
-            let dist = (cap_pos.x as i32 - target.x as i32).abs()
-                + (cap_pos.y as i32 - target.y as i32).abs();
-
-            // 海を跨いでいるかチェック（簡易サンプリング）
-            let mut across_sea = false;
-            let steps = 5;
-            for i in 1..steps {
-                let check_x = cap_pos.x as i32 + (target.x as i32 - cap_pos.x as i32) * i / steps;
-                let check_y = cap_pos.y as i32 + (target.y as i32 - cap_pos.y as i32) * i / steps;
-                if let Some(Terrain::Sea | Terrain::Shoal) =
-                    map.get_terrain(check_x as usize, check_y as usize)
-                {
-                    across_sea = true;
-                    break;
-                }
-            }
-
-            // 単純な距離だけでなく、海を挟んでいる場合や極端に遠い場合に需要を加算
-            if across_sea {
-                total_needed_capacity += 3; // 海を越えるのは優先度高
-            } else if dist > 15 {
-                total_needed_capacity += 2;
-            } else if dist > 8 {
-                total_needed_capacity += 1;
-            }
-        }
-    } else {
-        total_needed_capacity = strategy.priority_targets.len() as u32 / 2;
-    }
-
     let current_capacity: u32 = my_units.iter().map(|(_, s)| s.max_cargo).sum();
-    strategy.existing_transport_count = my_units.iter().filter(|(_, s)| s.max_cargo > 0).count();
-    strategy.transport_demand = total_needed_capacity.saturating_sub(current_capacity).max(
-        if !strategy.priority_targets.is_empty()
-            && current_capacity == 0
-            && total_needed_capacity > 0
-        {
-            1
-        } else {
-            0
-        },
-    );
+    // 海上輸送需要については、海軍ユニットのみをカウントする
+    strategy.existing_transport_count = my_units
+        .iter()
+        .filter(|(_, s)| s.max_cargo > 0 && s.movement_type == MovementType::Ship)
+        .count();
+
+    // 輸送需要の計算: transport_candidates（実際に停滞しているユニット）の数に基づく
+    strategy.transport_demand = (strategy.transport_candidates.len() as u32)
+        .saturating_sub(current_capacity)
+        .max(
+            if !strategy.transport_candidates.is_empty() && current_capacity == 0 {
+                1
+            } else {
+                0
+            },
+        );
 
     // 包括的需要マトリクスの計算
     // 自軍・敵軍の状況から、占領脅威・消耗ギャップを数値化した需要ベクトル。

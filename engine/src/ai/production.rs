@@ -200,81 +200,85 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
         budget
     };
 
-    // --- 3. 実行可能な生産候補を全施設から収集 ---
-    let mut candidates = Vec::new();
     let available_types: Vec<(UnitType, UnitStats)> = unit_registry
         .0
         .iter()
         .map(|(ut, s)| (*ut, s.clone()))
         .collect();
 
-    for (facility_pos, terrain) in &my_facilities {
-        let terrain_name = terrain.as_str();
-        for (ut, stats) in &available_types {
-            if !master_data.can_produce_unit(terrain_name, *ut) {
-                continue;
-            }
-            // スコア計算
-            let score = calculate_unit_score_at(
-                *ut,
-                stats,
-                *facility_pos,
-                &strategy,
-                &enemy_units,
-                &my_empty_transports,
-                &damage_chart,
-                &master_data,
-                &map,
-                &unit_registry,
-                *terrain,
-            );
-            candidates.push((
-                score,
-                *facility_pos,
-                *ut,
-                stats.cost,
-                stats.max_cargo,
-                stats.can_capture,
-            ));
-        }
-    }
-
-    // スコア降順にソート
-    candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    // --- 4. 予算と施設重複を考慮して生産決定 ---
+    // --- 4. 予算と施設重複を考慮して生産決定 (Greedy selection with dynamic re-scoring) ---
     let mut remaining_funds = available_funds;
     let mut current_strategy = strategy.clone();
     let mut used_facilities = std::collections::HashSet::new();
 
-    for (score, pos, ut, cost, cargo, can_capture) in candidates {
-        if used_facilities.contains(&pos) {
-            continue;
-        }
-        if cost > remaining_funds {
-            continue;
-        }
-        if score == 0 {
-            continue;
+    loop {
+        let mut best_candidate = None;
+        let mut best_score = 0u32;
+
+        for (facility_pos, terrain) in &my_facilities {
+            if used_facilities.contains(facility_pos) {
+                continue;
+            }
+
+            let terrain_name = terrain.as_str();
+            for (ut, stats) in &available_types {
+                if !master_data.can_produce_unit(terrain_name, *ut) {
+                    continue;
+                }
+                if stats.cost > remaining_funds {
+                    continue;
+                }
+
+                // 現在の戦略（減衰後）でスコアを計算
+                let score = calculate_unit_score_at(
+                    *ut,
+                    stats,
+                    *facility_pos,
+                    &current_strategy,
+                    &enemy_units,
+                    &my_empty_transports,
+                    &damage_chart,
+                    &master_data,
+                    &map,
+                    &unit_registry,
+                    *terrain,
+                );
+
+                if score > best_score && score > 0 {
+                    best_score = score;
+                    best_candidate = Some((
+                        *facility_pos,
+                        *ut,
+                        stats.cost,
+                        stats.max_cargo,
+                        stats.can_capture,
+                    ));
+                }
+            }
         }
 
-        // 決定
-        commands.push(ProduceUnitCommand {
-            player_id,
-            target_x: pos.x,
-            target_y: pos.y,
-            unit_type: ut,
-        });
-        remaining_funds = remaining_funds.saturating_sub(cost);
-        used_facilities.insert(pos);
+        if let Some((pos, ut, cost, cargo, can_capture)) = best_candidate {
+            // 生産決定
+            commands.push(ProduceUnitCommand {
+                player_id,
+                target_x: pos.x,
+                target_y: pos.y,
+                unit_type: ut,
+            });
+            remaining_funds = remaining_funds.saturating_sub(cost);
+            used_facilities.insert(pos);
 
-        // 需要を動的に減衰させる
-        if cargo > 0 {
-            current_strategy.transport_demand =
-                current_strategy.transport_demand.saturating_sub(cargo);
-        }
-        if can_capture {
-            current_strategy.capture_demand = current_strategy.capture_demand.saturating_sub(1);
+            // 需要を動的に減衰させる（次の候補評価に反映）
+            if cargo > 0 {
+                current_strategy.transport_demand =
+                    current_strategy.transport_demand.saturating_sub(cargo);
+            }
+            if can_capture {
+                current_strategy.capture_demand = current_strategy.capture_demand.saturating_sub(1);
+            }
+        } else {
+            // これ以上生産可能なものがないか、予算不足
+            break;
         }
     }
 

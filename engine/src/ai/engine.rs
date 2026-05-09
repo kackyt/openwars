@@ -189,11 +189,11 @@ pub fn decide_ai_action(
         };
 
         // 全敵ユニット情報を収集（ターゲット評価用）
-        let enemy_units: Vec<(GridPosition, crate::resources::UnitType, u32, u32, u32)> = {
+        let enemy_units: Vec<(GridPosition, crate::resources::UnitType, u32, u32, u32, u32)> = {
             let mut q = world.query::<(&GridPosition, &Faction, &UnitStats, &Health)>();
             q.iter(world)
                 .filter(|(_, f, _, h)| f.0 != player_id && h.current > 0)
-                .map(|(p, _, s, h)| (*p, s.unit_type, s.cost, h.current, s.max_range))
+                .map(|(p, _, s, h)| (*p, s.unit_type, s.cost, h.current, s.min_range, s.max_range))
                 .collect()
         };
 
@@ -297,7 +297,7 @@ pub fn decide_ai_action(
                 let mut best_target_dist = 99;
                 let mut max_potential = -1.0;
 
-                for (e_pos, e_type, e_cost, e_hp, _) in &enemy_units {
+                for (e_pos, e_type, e_cost, e_hp, _, _) in &enemy_units {
                     let d = (current_grid.x as i32 - e_pos.x as i32).abs()
                         + (current_grid.y as i32 - e_pos.y as i32).abs();
 
@@ -346,7 +346,7 @@ pub fn decide_ai_action(
                 if max_potential <= 0.0 {
                     let mut min_dist = 99;
                     // 1. 敵ユニットを探す
-                    for (e_pos, _, _, _, _) in &enemy_units {
+                    for (e_pos, _, _, _, _, _) in &enemy_units {
                         let mut d = (current_grid.x as i32 - e_pos.x as i32).abs()
                             + (current_grid.y as i32 - e_pos.y as i32).abs();
 
@@ -661,7 +661,8 @@ pub fn decide_ai_action(
                                         // 敵との距離と危険度を評価
                                         let mut min_enemy_dist = 99;
                                         let mut max_threat = 0;
-                                        for (e_pos, e_unit_type, _, _, e_max_range) in &enemy_units
+                                        for (e_pos, e_unit_type, _, _, e_min_range, e_max_range) in
+                                            &enemy_units
                                         {
                                             let d = (drop_pos.x as i32 - e_pos.x as i32).abs()
                                                 + (drop_pos.y as i32 - e_pos.y as i32).abs();
@@ -669,7 +670,9 @@ pub fn decide_ai_action(
                                                 min_enemy_dist = d;
                                             }
                                             // 敵の攻撃範囲（射程内）なら脅威を計算
-                                            if d <= *e_max_range as i32 {
+                                            // 間接攻撃ユニットの死角を考慮するため、最小射程もチェックする
+                                            if d >= *e_min_range as i32 && d <= *e_max_range as i32
+                                            {
                                                 if let Some(dmg) = damage_chart
                                                     .get_base_damage(*e_unit_type, cargo_unit_type)
                                                 {

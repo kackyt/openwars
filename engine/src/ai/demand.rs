@@ -65,13 +65,14 @@ pub fn average_attack_expectation(damage_chart: &DamageChart, unit_registry: &Un
     let mut count = 0u32;
 
     for attacker_type in unit_registry.0.keys() {
-        for (defender_type, defender_stats) in &unit_registry.0 {
+        for defender_type in unit_registry.0.keys() {
             // 主武器
             if let Some(dmg) = damage_chart.get_base_damage(*attacker_type, *defender_type) {
-                // 輸送・非戦闘ユニット（弾薬0）は除外
-                let _ = defender_stats;
-                total += dmg as f32;
-                count += 1;
+                // 攻撃力を持たない組み合わせは除外（分母に入れない）
+                if dmg > 0 {
+                    total += dmg as f32;
+                    count += 1;
+                }
             }
         }
     }

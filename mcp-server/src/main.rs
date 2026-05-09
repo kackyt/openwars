@@ -479,7 +479,11 @@ impl OpenWarsAiServer {
                     let active_player_id = {
                         let ms = world.resource::<MatchState>();
                         let players = world.resource::<Players>();
-                        players.0[ms.active_player_index.0].id
+                        players
+                            .0
+                            .get(ms.active_player_index.0)
+                            .ok_or_else(|| "Active player index is out of range".to_string())?
+                            .id
                     };
 
                     world.send_event(engine::events::ProduceUnitCommand {
