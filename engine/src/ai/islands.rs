@@ -11,7 +11,7 @@ pub struct Island {
     pub tiles: HashSet<GridPosition>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bevy_ecs::prelude::Resource)]
 pub struct IslandMap {
     pub islands: Vec<Island>,
 }
@@ -48,14 +48,12 @@ impl IslandMap {
 
                     for (nx, ny) in map.get_adjacent(cx, cy) {
                         let n_idx = ny * map.width + nx;
-                        if !visited[n_idx] {
-                            if let Some(n_terrain) = map.get_terrain(nx, ny) {
-                                if n_terrain != Terrain::Sea {
+                        if !visited[n_idx]
+                            && let Some(n_terrain) = map.get_terrain(nx, ny)
+                                && n_terrain != Terrain::Sea {
                                     visited[n_idx] = true;
                                     queue.push_back((nx, ny));
                                 }
-                            }
-                        }
                     }
                 }
 
@@ -72,6 +70,8 @@ impl IslandMap {
 
     /// 指定した座標が属する島を返す
     pub fn get_island_at(&self, pos: &GridPosition) -> Option<&Island> {
-        self.islands.iter().find(|island| island.tiles.contains(pos))
+        self.islands
+            .iter()
+            .find(|island| island.tiles.contains(pos))
     }
 }

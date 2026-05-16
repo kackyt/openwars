@@ -1,6 +1,9 @@
 pub mod demand;
 pub mod engine;
 pub mod eval;
+pub mod islands;
+pub mod missions;
+pub mod planner;
 pub mod production;
 pub mod pruning;
 pub mod strategy;

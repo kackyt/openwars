@@ -858,11 +858,47 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> bool {
     // 1. ユニット行動を1つ決定・実行
     // AI思考ループの中で、エンジン側のフラグが更新されるのを待たずに
     // 同一フレーム内の重複思考を避けるために、リソースで「指示済みユニット」を管理します。
+    // ミッションの割り当てを試行する
+    crate::ai::planner::assign_test_transport_mission(world, active_player);
+
     let mut skip_entities = std::collections::HashSet::new();
     if let Some(res) = world.get_resource::<AiActionCooldown>() {
         skip_entities = res.0.clone();
     }
 
+    // ミッションを持つユニットがいたら優先して実行
+    let mut mission_to_execute = None;
+    let mut transport_entities = vec![];
+    if let Some(manager) = world.get_resource::<crate::ai::missions::TransportMissionManager>() {
+        for mission in &manager.missions {
+            if !skip_entities.contains(&mission.transport_entity) {
+                transport_entities.push((mission.transport_entity, mission.clone()));
+            }
+        }
+    }
+
+    let mut query = world.query::<&Faction>();
+    for (entity, mission) in transport_entities {
+        if let Ok(faction) = query.get(world, entity)
+            && faction.0 == active_player {
+                mission_to_execute = Some(mission);
+                break;
+            }
+    }
+
+    if let Some(mission) = mission_to_execute
+        && let Some(cmd) = crate::ai::missions::execute_mission_step(world, &mission) {
+            execute_ai_command(world, mission.transport_entity, cmd);
+            let entity = mission.transport_entity;
+            if let Some(mut res) = world.get_resource_mut::<AiActionCooldown>() {
+                res.0.insert(entity);
+            } else {
+                let mut set = std::collections::HashSet::new();
+                set.insert(entity);
+                world.insert_resource(AiActionCooldown(set));
+            }
+            return true;
+        }
     if let Some((entity, command)) = decide_ai_action(world, active_player, &skip_entities) {
         execute_ai_command(world, entity, command);
 
