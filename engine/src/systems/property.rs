@@ -2,6 +2,7 @@ use crate::components::*;
 use crate::events::*;
 use crate::resources::*;
 use bevy_ecs::prelude::*;
+use std::collections::HashSet;
 
 /// 拠点の占領・修理コマンド(`CapturePropertyCommand`)を処理するシステム。
 ///
@@ -149,23 +150,26 @@ pub fn victory_check_system(
     unit_destroyed_events.clear();
     phase_changed_events.clear();
 
+    let mut players_with_capitals = HashSet::new();
+    for prop in q_properties.iter() {
+        if prop.terrain == Terrain::Capital {
+            if let Some(owner_id) = prop.owner_id {
+                players_with_capitals.insert(owner_id);
+            }
+        }
+    }
+
+    let mut players_with_units = HashSet::new();
+    for (u_fac, u_hp) in q_units.iter() {
+        if !u_hp.is_destroyed() {
+            players_with_units.insert(u_fac.0);
+        }
+    }
+
     let mut alive_players = Vec::new();
     for player in &players.0 {
-        let mut has_capital = false;
-        for prop in q_properties.iter() {
-            if prop.owner_id == Some(player.id) && prop.terrain == Terrain::Capital {
-                has_capital = true;
-                break;
-            }
-        }
-
-        let mut has_units = false;
-        for (u_fac, u_hp) in q_units.iter() {
-            if u_fac.0 == player.id && !u_hp.is_destroyed() {
-                has_units = true;
-                break;
-            }
-        }
+        let has_capital = players_with_capitals.contains(&player.id);
+        let has_units = players_with_units.contains(&player.id);
 
         let is_annihilated = match_state.current_turn_number.0 > 1 && !has_units;
         if has_capital && !is_annihilated {
