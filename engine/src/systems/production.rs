@@ -414,4 +414,162 @@ mod tests {
         let count = query.iter(&world).filter(|p| p.x == 2 && p.y == 0).count();
         assert_eq!(count, 1);
     }
+
+    #[test]
+    fn test_can_produce_at_tile_success() {
+        let mut world = World::new();
+        let master_data = MasterDataRegistry::load().unwrap();
+
+        world.insert_resource(Players(vec![Player {
+            id: PlayerId(1),
+            name: "P1".to_string(),
+            funds: 2000,
+        }]));
+
+        // Capital at (0,0), Factory at (2,1) -> distance 3
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(PlayerId(1)), 400),
+        ));
+        world.spawn((
+            GridPosition { x: 2, y: 1 },
+            Property::new(Terrain::Factory, Some(PlayerId(1)), 200),
+        ));
+
+        let result = can_produce_at_tile(&mut world, PlayerId(1), 2, 1, &master_data);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_can_produce_at_tile_occupied() {
+        let mut world = World::new();
+        let master_data = MasterDataRegistry::load().unwrap();
+
+        world.insert_resource(Players(vec![Player {
+            id: PlayerId(1),
+            name: "P1".to_string(),
+            funds: 2000,
+        }]));
+
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(PlayerId(1)), 400),
+        ));
+        world.spawn((
+            GridPosition { x: 2, y: 1 },
+            Property::new(Terrain::Factory, Some(PlayerId(1)), 200),
+        ));
+
+        // Spawn a unit at (2,1)
+        world.spawn((
+            GridPosition { x: 2, y: 1 },
+            Faction(PlayerId(1)),
+        ));
+
+        let result = can_produce_at_tile(&mut world, PlayerId(1), 2, 1, &master_data);
+        assert_eq!(result.unwrap_err(), "Tile is occupied!");
+    }
+
+    #[test]
+    fn test_can_produce_at_tile_invalid_facility() {
+        let mut world = World::new();
+        let master_data = MasterDataRegistry::load().unwrap();
+
+        world.insert_resource(Players(vec![Player {
+            id: PlayerId(1),
+            name: "P1".to_string(),
+            funds: 2000,
+        }]));
+
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(PlayerId(1)), 400),
+        ));
+        // Plains is not a production facility
+        world.spawn((
+            GridPosition { x: 1, y: 1 },
+            Property::new(Terrain::Plains, Some(PlayerId(1)), 0),
+        ));
+
+        let result = can_produce_at_tile(&mut world, PlayerId(1), 1, 1, &master_data);
+        assert_eq!(result.unwrap_err(), "Not a production facility!");
+    }
+
+    #[test]
+    fn test_can_produce_at_tile_ownership() {
+        let mut world = World::new();
+        let master_data = MasterDataRegistry::load().unwrap();
+
+        world.insert_resource(Players(vec![
+            Player {
+                id: PlayerId(1),
+                name: "P1".to_string(),
+                funds: 2000,
+            },
+            Player {
+                id: PlayerId(2),
+                name: "P2".to_string(),
+                funds: 2000,
+            },
+        ]));
+
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(PlayerId(1)), 400),
+        ));
+        // Factory owned by P2
+        world.spawn((
+            GridPosition { x: 2, y: 1 },
+            Property::new(Terrain::Factory, Some(PlayerId(2)), 200),
+        ));
+
+        let result = can_produce_at_tile(&mut world, PlayerId(1), 2, 1, &master_data);
+        assert_eq!(result.unwrap_err(), "Not a production facility!");
+    }
+
+    #[test]
+    fn test_can_produce_at_tile_range() {
+        let mut world = World::new();
+        let master_data = MasterDataRegistry::load().unwrap();
+
+        world.insert_resource(Players(vec![Player {
+            id: PlayerId(1),
+            name: "P1".to_string(),
+            funds: 2000,
+        }]));
+
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(PlayerId(1)), 400),
+        ));
+        // Factory at (3,1) -> distance 4 (> PRODUCTION_RANGE 3)
+        world.spawn((
+            GridPosition { x: 3, y: 1 },
+            Property::new(Terrain::Factory, Some(PlayerId(1)), 200),
+        ));
+
+        let result = can_produce_at_tile(&mut world, PlayerId(1), 3, 1, &master_data);
+        assert_eq!(result.unwrap_err(), "Too far from Capital!");
+    }
+
+    #[test]
+    fn test_can_produce_at_tile_no_capital() {
+        let mut world = World::new();
+        let master_data = MasterDataRegistry::load().unwrap();
+
+        world.insert_resource(Players(vec![Player {
+            id: PlayerId(1),
+            name: "P1".to_string(),
+            funds: 2000,
+        }]));
+
+        // No Capital spawned
+        world.spawn((
+            GridPosition { x: 2, y: 1 },
+            Property::new(Terrain::Factory, Some(PlayerId(1)), 200),
+        ));
+
+        let result = can_produce_at_tile(&mut world, PlayerId(1), 2, 1, &master_data);
+        assert_eq!(result.unwrap_err(), "Too far from Capital!");
+    }
 }
