@@ -161,7 +161,8 @@ pub fn decide_ai_action(
             )
         };
 
-        let is_combat_ineffective = atk_hp < 40 || (stats.max_ammo1 > 0 && atk_ammo.0 == 0);
+        // 戦闘不能判定（HPが低い、または弾薬切れ）
+        let is_combat_ineffective = atk_hp < 70 || (stats.max_ammo1 > 0 && atk_ammo.0 == 0);
 
         let map = world.resource::<Map>().clone();
         let registry = world.resource::<MasterDataRegistry>().clone();
@@ -188,11 +189,11 @@ pub fn decide_ai_action(
         };
 
         // 全敵ユニット情報を収集（ターゲット評価用）
-        let enemy_units: Vec<(GridPosition, crate::resources::UnitType, u32, u32, u32)> = {
+        let enemy_units: Vec<(GridPosition, crate::resources::UnitType, u32, u32, u32, u32)> = {
             let mut q = world.query::<(&GridPosition, &Faction, &UnitStats, &Health)>();
             q.iter(world)
                 .filter(|(_, f, _, h)| f.0 != player_id && h.current > 0)
-                .map(|(p, _, s, h)| (*p, s.unit_type, s.cost, h.current, s.max_range))
+                .map(|(p, _, s, h)| (*p, s.unit_type, s.cost, h.current, s.min_range, s.max_range))
                 .collect()
         };
 
@@ -237,11 +238,48 @@ pub fn decide_ai_action(
                     }
                 }
                 // 拠点に近づくほど高スコア
-                base_tile_score += (20 - min_recovery_dist).max(0) * 100;
+                base_tile_score += (20 - min_recovery_dist).max(0) * 300;
+            }
+
+            // 7.3 タクシー帰りロジック: 空の輸送車は生産拠点へ引き返す
+            let is_empty_transport = stats.max_cargo > 0
+                && world
+                    .get::<crate::components::CargoCapacity>(unit_entity)
+                    .is_some_and(|c| c.loaded.is_empty());
+
+            if is_empty_transport {
+                let mut min_base_dist = 99;
+                for (p_pos, p_terrain, p_owner) in &properties {
+                    if *p_owner == Some(player_id)
+                        && registry.is_production_facility(p_terrain.as_str())
+                    {
+                        let d = (current_grid.x as i32 - p_pos.x as i32).abs()
+                            + (current_grid.y as i32 - p_pos.y as i32).abs();
+                        if d < min_base_dist {
+                            min_base_dist = d;
+                        }
+                    }
+                }
+                // 拠点に近づくほど高スコア（磁力）
+                base_tile_score += (20 - min_base_dist).max(0) * 500;
             }
 
             // 占領価値・拠点接近スコア
-            if stats.can_capture {
+            let mut effective_can_capture = stats.can_capture;
+            if !effective_can_capture
+                && let Some(cargo) = world.get::<crate::components::CargoCapacity>(unit_entity)
+            {
+                for &cargo_ent in &cargo.loaded {
+                    if let Some(c_stats) = world.get::<UnitStats>(cargo_ent)
+                        && c_stats.can_capture
+                    {
+                        effective_can_capture = true;
+                        break;
+                    }
+                }
+            }
+
+            if effective_can_capture {
                 let mut min_objective_dist = 99;
                 for (p_pos, _p_terrain, p_owner) in &properties {
                     if *p_owner != Some(player_id) {
@@ -259,9 +297,26 @@ pub fn decide_ai_action(
                 let mut best_target_dist = 99;
                 let mut max_potential = -1.0;
 
-                for (e_pos, e_type, e_cost, e_hp, _) in &enemy_units {
+                for (e_pos, e_type, e_cost, e_hp, _, _) in &enemy_units {
                     let d = (current_grid.x as i32 - e_pos.x as i32).abs()
                         + (current_grid.y as i32 - e_pos.y as i32).abs();
+
+                    let mut effective_dist = d;
+                    // 海軍ユニットが陸上の敵を追跡する場合の補正
+                    if stats.movement_type == crate::resources::MovementType::Ship
+                        && let Some(e_terrain) = map.get_terrain(e_pos.x, e_pos.y)
+                    {
+                        let move_cost = registry
+                            .get_movement_cost(
+                                crate::resources::MovementType::Ship,
+                                e_terrain.as_str(),
+                            )
+                            .unwrap_or(99);
+                        if move_cost >= 99 && stats.max_range <= 1 {
+                            // 進入不可能な陸地で、かつ直接攻撃ユニットの場合は距離を大幅に水増し
+                            effective_dist += 20;
+                        }
+                    }
 
                     // ダメージ期待値を概算（相性とコストとHPを考慮）
                     let base_dmg = damage_chart
@@ -278,22 +333,62 @@ pub fn decide_ai_action(
 
                     if potential > max_potential {
                         max_potential = potential;
-                        best_target_dist = d;
-                    } else if (potential - max_potential).abs() < 0.1 && d < best_target_dist {
+                        best_target_dist = effective_dist;
+                    } else if (potential - max_potential).abs() < 0.1
+                        && effective_dist < best_target_dist
+                    {
                         // 価値が同じなら近い方を優先
-                        best_target_dist = d;
+                        best_target_dist = effective_dist;
                     }
                 }
 
-                // fallback: 敵がいない、または誰も攻撃できない場合は最寄りの敵を目指す
+                // fallback: 敵がいない、または誰も攻撃できない場合は最寄りの敵、または拠点を指す
                 if max_potential <= 0.0 {
-                    for (e_pos, _, _, _, _) in &enemy_units {
-                        let d = (current_grid.x as i32 - e_pos.x as i32).abs()
+                    let mut min_dist = 99;
+                    // 1. 敵ユニットを探す
+                    for (e_pos, _, _, _, _, _) in &enemy_units {
+                        let mut d = (current_grid.x as i32 - e_pos.x as i32).abs()
                             + (current_grid.y as i32 - e_pos.y as i32).abs();
-                        if d < best_target_dist {
-                            best_target_dist = d;
+
+                        if stats.movement_type == crate::resources::MovementType::Ship
+                            && let Some(e_terrain) = map.get_terrain(e_pos.x, e_pos.y)
+                        {
+                            let move_cost = registry
+                                .get_movement_cost(
+                                    crate::resources::MovementType::Ship,
+                                    e_terrain.as_str(),
+                                )
+                                .unwrap_or(99);
+                            if move_cost >= 99 && stats.max_range <= 1 {
+                                d += 20;
+                            }
+                        }
+                        if d < min_dist {
+                            min_dist = d;
                         }
                     }
+                    // 2. 敵がいない場合は、未占領または敵の拠点をターゲットにする
+                    if enemy_units.is_empty() {
+                        for (p_pos, p_terrain, p_owner) in &properties {
+                            if *p_owner != Some(player_id) {
+                                let d = (current_grid.x as i32 - p_pos.x as i32).abs()
+                                    + (current_grid.y as i32 - p_pos.y as i32).abs();
+                                if d < min_dist {
+                                    min_dist = d;
+                                }
+                            } else if is_combat_ineffective
+                                && registry.can_repair_on_terrain(stats.unit_type, *p_terrain)
+                            {
+                                // 自身が修理が必要な場合のみ、自分の拠点もターゲットに含める
+                                let d = (current_grid.x as i32 - p_pos.x as i32).abs()
+                                    + (current_grid.y as i32 - p_pos.y as i32).abs();
+                                if d < min_dist {
+                                    min_dist = d;
+                                }
+                            }
+                        }
+                    }
+                    best_target_dist = min_dist;
                 }
 
                 if stats.min_range > 1 {
@@ -453,14 +548,19 @@ pub fn decide_ai_action(
                         world.get::<Health>(target_entity),
                         world.get::<UnitStats>(target_entity),
                     ) {
-                        // 自身または相手のHPが低い場合、合流の価値を高める
-                        if is_combat_ineffective || t_health.current < 40 {
-                            merge_score += 4000;
-                        }
-                        // 合流後のHPが無駄にならない（100を大幅に超えない）なら加点
+                        // フルHP同士の合流は無意味なのでスコアを0にする
                         let total_hp = atk_hp + t_health.current;
-                        if total_hp <= 110 {
-                            merge_score += 1000;
+                        if total_hp > 100 {
+                            merge_score = 0;
+                        } else {
+                            // 自身または相手のHPが低い場合、合流の価値を高める
+                            if is_combat_ineffective || t_health.current < 40 {
+                                merge_score += 4000;
+                            }
+                            // 合流後のHPが無駄にならないなら加点
+                            if total_hp <= 100 {
+                                merge_score += 1000;
+                            }
                         }
 
                         let score = base_tile_score + merge_score;
@@ -497,7 +597,10 @@ pub fn decide_ai_action(
 
                     let mut load_score = 2000;
                     if min_objective_dist > 5 {
-                        load_score += 1500; // 遠い場合は積極的に乗る
+                        load_score += 3000; // 遠い場合は積極的に乗る
+                    }
+                    if stats.can_capture && min_objective_dist > 8 {
+                        load_score += 2000; // 占領可能な歩兵は特に遠い場合に優先
                     }
 
                     let score = base_tile_score + load_score;
@@ -528,61 +631,82 @@ pub fn decide_ai_action(
                             #[allow(clippy::collapsible_if)]
                             if !action.0 {
                                 // 降車可能なマスを探索
-                                let drop_tiles = crate::systems::transport::get_droppable_tiles(
-                                    world,
-                                    unit_entity,
-                                    cargo_entity,
-                                );
-                                for drop_tile in drop_tiles {
-                                    let drop_pos = GridPosition {
-                                        x: drop_tile.0,
-                                        y: drop_tile.1,
-                                    };
+                                if let Some(cargo_unit_type) =
+                                    world.get::<UnitStats>(cargo_entity).map(|s| s.unit_type)
+                                {
+                                    let drop_tiles = crate::systems::transport::get_droppable_tiles(
+                                        world,
+                                        unit_entity,
+                                        cargo_entity,
+                                    );
+                                    for drop_tile in drop_tiles {
+                                        let drop_pos = GridPosition {
+                                            x: drop_tile.0,
+                                            y: drop_tile.1,
+                                        };
 
-                                    // 降車先の価値を評価
-                                    let mut drop_score = 5000; // 基本的に降ろすのは良いこと
+                                        // 降車先の価値を評価
+                                        let mut drop_score: i32 = 5000; // 基本的に降ろすのは良いこと
 
-                                    // 降車先が拠点ならボーナス
-                                    for (p_pos, _, p_owner) in &properties {
-                                        if p_pos.x == drop_pos.x && p_pos.y == drop_pos.y {
-                                            if *p_owner != Some(player_id) {
-                                                drop_score += 3000; // 敵拠点の占領準備
+                                        // 降車先が拠点ならボーナス
+                                        for (p_pos, _, p_owner) in &properties {
+                                            if p_pos.x == drop_pos.x && p_pos.y == drop_pos.y {
+                                                if *p_owner != Some(player_id) {
+                                                    drop_score += 3000; // 敵拠点の占領準備
+                                                }
+                                                break;
                                             }
-                                            break;
                                         }
-                                    }
 
-                                    // 敵との距離と危険度を評価
-                                    let mut min_enemy_dist = 99;
-                                    let mut is_in_danger = false;
-                                    for (e_pos, _, _, _, e_max_range) in &enemy_units {
-                                        let d = (drop_pos.x as i32 - e_pos.x as i32).abs()
-                                            + (drop_pos.y as i32 - e_pos.y as i32).abs();
-                                        if d < min_enemy_dist {
-                                            min_enemy_dist = d;
+                                        // 敵との距離と危険度を評価
+                                        let mut min_enemy_dist = 99;
+                                        let mut max_threat = 0;
+                                        for (e_pos, e_unit_type, _, _, e_min_range, e_max_range) in
+                                            &enemy_units
+                                        {
+                                            let d = (drop_pos.x as i32 - e_pos.x as i32).abs()
+                                                + (drop_pos.y as i32 - e_pos.y as i32).abs();
+                                            if d < min_enemy_dist {
+                                                min_enemy_dist = d;
+                                            }
+                                            // 敵の攻撃範囲（射程内）なら脅威を計算
+                                            // 間接攻撃ユニットの死角を考慮するため、最小射程もチェックする
+                                            if d >= *e_min_range as i32 && d <= *e_max_range as i32
+                                            {
+                                                if let Some(dmg) = damage_chart
+                                                    .get_base_damage(*e_unit_type, cargo_unit_type)
+                                                {
+                                                    if dmg > max_threat {
+                                                        max_threat = dmg;
+                                                    }
+                                                }
+                                            }
                                         }
-                                        // 敵の攻撃範囲（射程内）なら危険とみなす
-                                        if d <= *e_max_range as i32 {
-                                            is_in_danger = true;
+
+                                        // 脅威度に応じた動的なペナルティ
+                                        // ダメージ期待値が50%を超えるような無謀な降車は避ける
+                                        if max_threat > 50 {
+                                            drop_score = drop_score.saturating_sub(4000);
+                                        } else if max_threat > 20 {
+                                            drop_score = drop_score.saturating_sub(1500);
+                                        } else if max_threat > 0 {
+                                            drop_score = drop_score.saturating_sub(500);
                                         }
-                                    }
 
-                                    // 敵が遠ければ攻撃準備として中距離でボーナス、
-                                    // 隣接や射程内（=次ターン即攻撃される）はペナルティ
-                                    if is_in_danger {
-                                        drop_score -= 1500;
-                                    } else if (2..=3).contains(&min_enemy_dist) {
-                                        drop_score += 2000;
-                                    }
+                                        // 敵が近く、かつ安全ならボーナス（次ターン攻撃用）
+                                        if max_threat == 0 && (1..=3).contains(&min_enemy_dist) {
+                                            drop_score += 2000;
+                                        }
 
-                                    let score = base_tile_score + drop_score;
-                                    #[allow(clippy::collapsible_if)]
-                                    if score > best_unit_score {
-                                        best_unit_score = score;
-                                        best_unit_choice = Some(AiCommand::Drop {
-                                            target_pos: drop_pos,
-                                            cargo_entity,
-                                        });
+                                        let score = base_tile_score + drop_score;
+                                        #[allow(clippy::collapsible_if)]
+                                        if score > best_unit_score {
+                                            best_unit_score = score;
+                                            best_unit_choice = Some(AiCommand::Drop {
+                                                target_pos: drop_pos,
+                                                cargo_entity,
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -1681,6 +1805,73 @@ mod tests {
             assert_eq!(target_pos.y, 1);
         } else {
             panic!("Expected Wait at (1,1) due to no ammo, got {:?}", action);
+        }
+    }
+
+    #[test]
+    fn test_ai_action_taxi_back() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (mut world, _) =
+            crate::setup::initialize_world_from_master_data(&master_data, "map_1").unwrap();
+        let p1 = PlayerId(1);
+
+        // 1. 全ユニットをクリア
+        let entities: Vec<Entity> = world.query::<Entity>().iter(&world).collect();
+        for e in entities {
+            world.despawn(e);
+        }
+
+        // 2. 首都（生産拠点）を設置 (x=0, y=0)
+        let capital_pos = GridPosition { x: 0, y: 0 };
+        world.spawn((capital_pos, Property::new(Terrain::Capital, Some(p1), 100)));
+
+        // 3. 空の輸送ヘリを「前線（遠く）」に設置 (x=8, y=0)
+        let heli_pos = GridPosition { x: 8, y: 0 };
+        let heli_entity = world
+            .spawn((
+                heli_pos,
+                p1,
+                Faction(p1),
+                HasMoved(false),
+                ActionCompleted(false),
+                UnitStats {
+                    unit_type: UnitType::TransportHelicopter,
+                    max_movement: 6,
+                    movement_type: crate::resources::MovementType::Air,
+                    max_cargo: 1,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                crate::components::CargoCapacity {
+                    loaded: vec![],
+                    max: 1,
+                },
+            ))
+            .id();
+
+        // 4. AIに行動を決定させる
+        let skips = std::collections::HashSet::new();
+        let action = decide_ai_action(&mut world, p1, &skips);
+
+        // 5. 検証: 輸送ヘリが首都（x=0）の方向に移動しようとしていること
+        assert!(action.is_some());
+        if let Some((entity, AiCommand::Wait { target_pos })) = action {
+            assert_eq!(entity, heli_entity);
+            assert!(
+                target_pos.x < heli_pos.x,
+                "Empty transport should move back towards capital (x=0). Target: {:?}, Current: {:?}",
+                target_pos,
+                heli_pos
+            );
+        } else {
+            panic!("Expected Wait command for taxi-back, got {:?}", action);
         }
     }
 }
