@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Objective Management
-AIは盤面上の拠点を戦略目標として評価し、攻略優先度を決定しなければならない。
+MUST: AIは盤面上の拠点を戦略目標として評価し、攻略優先度を決定しなければならない。
 
 #### Scenario: Priority Calculation
 - **WHEN** AIプランナーが戦略目標を評価するとき

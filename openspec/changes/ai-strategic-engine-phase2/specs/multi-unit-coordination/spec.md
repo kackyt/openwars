@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Multi-Unit Coordination
-AIは1つの目標に対して、適切な数のユニットを連携させて割り当てなければならない。
+MUST: AIは1つの目標に対して、適切な数のユニットを連携させて割り当てなければならない。
 
 #### Scenario: Coordinated Assignment
 - **WHEN** AIプランナーが目標攻略のためのミッションを生成するとき
