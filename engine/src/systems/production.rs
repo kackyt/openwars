@@ -417,6 +417,7 @@ mod tests {
 
     #[test]
     fn test_can_produce_at_tile_success() {
+        // 正常系：自軍の生産施設が首都の範囲内にある場合
         let mut world = World::new();
         let master_data = MasterDataRegistry::load().unwrap();
 
@@ -426,7 +427,7 @@ mod tests {
             funds: 2000,
         }]));
 
-        // Capital at (0,0), Factory at (2,1) -> distance 3
+        // 首都を (0,0)、工場を (2,1) に配置 (マンハッタン距離 3)
         world.spawn((
             GridPosition { x: 0, y: 0 },
             Property::new(Terrain::Capital, Some(PlayerId(1)), 400),
@@ -442,6 +443,7 @@ mod tests {
 
     #[test]
     fn test_can_produce_at_tile_occupied() {
+        // 異常系：ターゲット座標に既にユニットが存在する場合
         let mut world = World::new();
         let master_data = MasterDataRegistry::load().unwrap();
 
@@ -460,11 +462,8 @@ mod tests {
             Property::new(Terrain::Factory, Some(PlayerId(1)), 200),
         ));
 
-        // Spawn a unit at (2,1)
-        world.spawn((
-            GridPosition { x: 2, y: 1 },
-            Faction(PlayerId(1)),
-        ));
+        // 座標 (2,1) にユニットを配置
+        world.spawn((GridPosition { x: 2, y: 1 }, Faction(PlayerId(1))));
 
         let result = can_produce_at_tile(&mut world, PlayerId(1), 2, 1, &master_data);
         assert_eq!(result.unwrap_err(), "Tile is occupied!");
@@ -472,6 +471,7 @@ mod tests {
 
     #[test]
     fn test_can_produce_at_tile_invalid_facility() {
+        // 異常系：ターゲット座標が生産施設ではない（平地など）場合
         let mut world = World::new();
         let master_data = MasterDataRegistry::load().unwrap();
 
@@ -485,7 +485,7 @@ mod tests {
             GridPosition { x: 0, y: 0 },
             Property::new(Terrain::Capital, Some(PlayerId(1)), 400),
         ));
-        // Plains is not a production facility
+        // 平地は生産施設ではない
         world.spawn((
             GridPosition { x: 1, y: 1 },
             Property::new(Terrain::Plains, Some(PlayerId(1)), 0),
@@ -497,6 +497,7 @@ mod tests {
 
     #[test]
     fn test_can_produce_at_tile_ownership() {
+        // 異常系：他軍の生産施設である場合
         let mut world = World::new();
         let master_data = MasterDataRegistry::load().unwrap();
 
@@ -517,7 +518,7 @@ mod tests {
             GridPosition { x: 0, y: 0 },
             Property::new(Terrain::Capital, Some(PlayerId(1)), 400),
         ));
-        // Factory owned by P2
+        // Player 2 が所有する工場
         world.spawn((
             GridPosition { x: 2, y: 1 },
             Property::new(Terrain::Factory, Some(PlayerId(2)), 200),
@@ -529,6 +530,7 @@ mod tests {
 
     #[test]
     fn test_can_produce_at_tile_range() {
+        // 異常系：生産施設が首都から遠すぎる場合
         let mut world = World::new();
         let master_data = MasterDataRegistry::load().unwrap();
 
@@ -542,7 +544,7 @@ mod tests {
             GridPosition { x: 0, y: 0 },
             Property::new(Terrain::Capital, Some(PlayerId(1)), 400),
         ));
-        // Factory at (3,1) -> distance 4 (> PRODUCTION_RANGE 3)
+        // (3,1) は首都 (0,0) から距離 4 (PRODUCTION_RANGE 3 を超える)
         world.spawn((
             GridPosition { x: 3, y: 1 },
             Property::new(Terrain::Factory, Some(PlayerId(1)), 200),
@@ -554,6 +556,7 @@ mod tests {
 
     #[test]
     fn test_can_produce_at_tile_no_capital() {
+        // 異常系：自軍の首都がマップ上に存在しない場合
         let mut world = World::new();
         let master_data = MasterDataRegistry::load().unwrap();
 
@@ -563,7 +566,7 @@ mod tests {
             funds: 2000,
         }]));
 
-        // No Capital spawned
+        // 首都なし
         world.spawn((
             GridPosition { x: 2, y: 1 },
             Property::new(Terrain::Factory, Some(PlayerId(1)), 200),
