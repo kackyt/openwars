@@ -179,7 +179,9 @@ pub fn initialize_world_from_master_data(
             }
         }
     }
+    let island_map = crate::ai::islands::IslandMap::analyze(&ecs_map);
     world.insert_resource(ecs_map);
+    world.insert_resource(island_map);
 
     let mut player_list = vec![];
     // P1, P2 は最低限保証

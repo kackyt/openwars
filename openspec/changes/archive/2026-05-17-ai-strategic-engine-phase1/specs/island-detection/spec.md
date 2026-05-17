@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Island Detection
-AIはマップの地形を解析し、連続した陸地を「島」として認識しなければならない。
+MUST: AIはマップの地形を解析し、連続した陸地を「島」として認識しなければならない。
 
 #### Scenario: AI Initialization
 - **WHEN** AIエンジンが初期化される、または地形が変更されたとき
