@@ -82,25 +82,28 @@ pub fn capture_property_system(
         let mut captured = false;
         let mut new_owner = None;
 
+        // ユニットと同じ位置にある拠点を探す
         for (prop_pos, mut prop) in q_properties.iter_mut() {
             if prop_pos.x == pos.x && prop_pos.y == pos.y {
                 let max_points = prop.max_capture_points;
                 if max_points == 0 {
-                    continue; // Not capturable
+                    continue; // 占領不可能な拠点
                 }
 
                 if prop.owner_id == Some(active_player_id) {
-                    // Repair
+                    // 自軍拠点の場合は修理
                     prop.capture_points =
                         std::cmp::min(prop.capture_points + action_power, max_points);
                 } else {
-                    // Capture
+                    // 敵軍・中立拠点の場合は占領を進行
                     if prop.capture_points <= action_power {
+                        // 占領完了
                         prop.owner_id = Some(active_player_id);
                         prop.capture_points = max_points;
                         captured = true;
                         new_owner = Some(active_player_id);
                     } else {
+                        // 耐久値を減らす
                         prop.capture_points -= action_power;
                     }
                 }
@@ -150,15 +153,15 @@ pub fn victory_check_system(
     unit_destroyed_events.clear();
     phase_changed_events.clear();
 
+    // 首都を所有しているプレイヤーを収集 (O(M))
     let mut players_with_capitals = HashSet::new();
     for prop in q_properties.iter() {
-        if prop.terrain == Terrain::Capital {
-            if let Some(owner_id) = prop.owner_id {
-                players_with_capitals.insert(owner_id);
-            }
+        if let (Terrain::Capital, Some(owner_id)) = (prop.terrain, prop.owner_id) {
+            players_with_capitals.insert(owner_id);
         }
     }
 
+    // 生存しているユニットを所有しているプレイヤーを収集 (O(N))
     let mut players_with_units = HashSet::new();
     for (u_fac, u_hp) in q_units.iter() {
         if !u_hp.is_destroyed() {
@@ -166,17 +169,20 @@ pub fn victory_check_system(
         }
     }
 
+    // 各プレイヤーが生存条件（首都を所有、かつ全滅していない）を満たしているか確認 (O(P))
     let mut alive_players = Vec::new();
     for player in &players.0 {
         let has_capital = players_with_capitals.contains(&player.id);
         let has_units = players_with_units.contains(&player.id);
 
+        // ターン2以降でユニットが1つもない場合は全滅とみなす
         let is_annihilated = match_state.current_turn_number.0 > 1 && !has_units;
         if has_capital && !is_annihilated {
             alive_players.push(player.id);
         }
     }
 
+    // 生存しているプレイヤーが1人の場合は勝利
     if alive_players.len() == 1 {
         let condition = GameOverCondition::Winner(alive_players[0]);
         game_over_events.send(GameOverEvent {
@@ -184,6 +190,7 @@ pub fn victory_check_system(
         });
         match_state.game_over = Some(condition);
     } else if alive_players.is_empty() {
+        // 全員全滅した場合は引き分け
         let condition = GameOverCondition::Draw;
         game_over_events.send(GameOverEvent {
             condition: condition.clone(),
