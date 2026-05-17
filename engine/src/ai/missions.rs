@@ -82,7 +82,7 @@ pub fn execute_mission_step(
     let registry = world.resource::<MasterDataRegistry>();
 
     let reachable = calculate_reachable_tiles(
-        &map,
+        map,
         &unit_positions,
         (t_pos.x, t_pos.y),
         t_stats.movement_type,
@@ -90,7 +90,7 @@ pub fn execute_mission_step(
         t_fuel,
         t_faction,
         t_stats.unit_type,
-        &registry,
+        registry,
     );
 
     match mission.phase {
@@ -118,11 +118,10 @@ pub fn execute_mission_step(
             });
         }
         TransportPhase::Transit => {
-            if let Some(target_island_id) = mission.target_island
-                && let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>()
-                    && let Some(island) =
-                        island_map.islands.iter().find(|i| i.id == target_island_id)
-                        && let Some(target_pos) = island.tiles.iter().next() {
+            if let Some(target_island_id) = mission.target_island {
+                if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() {
+                    if let Some(island) = island_map.islands.iter().find(|i| i.id == target_island_id) {
+                        if let Some(target_pos) = island.tiles.iter().next() {
                             let mut best_tile = t_pos;
                             let mut min_dist = (t_pos.x as i32 - target_pos.x as i32).abs()
                                 + (t_pos.y as i32 - target_pos.y as i32).abs();
@@ -142,6 +141,9 @@ pub fn execute_mission_step(
                                 target_pos: best_tile,
                             });
                         }
+                    }
+                }
+            }
         }
         TransportPhase::Drop => {
             let drop_tiles = crate::systems::transport::get_droppable_tiles(

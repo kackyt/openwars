@@ -13,11 +13,11 @@ pub fn assign_test_transport_mission(world: &mut World, player_id: PlayerId) {
     // すでに進行中のミッションがある場合はスキップ (簡略化)
     let has_mission = world
         .get_resource::<TransportMissionManager>()
-        .map_or(false, |manager| {
+        .is_some_and(|manager| {
             manager.missions.iter().any(|m| {
                 world
                     .get::<Faction>(m.transport_entity)
-                    .map_or(false, |f| f.0 == player_id)
+                    .is_some_and(|f| f.0 == player_id)
             })
         });
 
