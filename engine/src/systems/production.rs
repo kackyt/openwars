@@ -414,4 +414,165 @@ mod tests {
         let count = query.iter(&world).filter(|p| p.x == 2 && p.y == 0).count();
         assert_eq!(count, 1);
     }
+
+    #[test]
+    fn test_can_produce_at_tile_success() {
+        // 正常系：自軍の生産施設が首都の範囲内にある場合
+        let mut world = World::new();
+        let master_data = MasterDataRegistry::load().unwrap();
+
+        world.insert_resource(Players(vec![Player {
+            id: PlayerId(1),
+            name: "P1".to_string(),
+            funds: 2000,
+        }]));
+
+        // 首都を (0,0)、工場を (2,1) に配置 (マンハッタン距離 3)
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(PlayerId(1)), 400),
+        ));
+        world.spawn((
+            GridPosition { x: 2, y: 1 },
+            Property::new(Terrain::Factory, Some(PlayerId(1)), 200),
+        ));
+
+        let result = can_produce_at_tile(&mut world, PlayerId(1), 2, 1, &master_data);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_can_produce_at_tile_occupied() {
+        // 異常系：ターゲット座標に既にユニットが存在する場合
+        let mut world = World::new();
+        let master_data = MasterDataRegistry::load().unwrap();
+
+        world.insert_resource(Players(vec![Player {
+            id: PlayerId(1),
+            name: "P1".to_string(),
+            funds: 2000,
+        }]));
+
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(PlayerId(1)), 400),
+        ));
+        world.spawn((
+            GridPosition { x: 2, y: 1 },
+            Property::new(Terrain::Factory, Some(PlayerId(1)), 200),
+        ));
+
+        // 座標 (2,1) にユニットを配置
+        world.spawn((GridPosition { x: 2, y: 1 }, Faction(PlayerId(1))));
+
+        let result = can_produce_at_tile(&mut world, PlayerId(1), 2, 1, &master_data);
+        assert_eq!(result.unwrap_err(), "Tile is occupied!");
+    }
+
+    #[test]
+    fn test_can_produce_at_tile_invalid_facility() {
+        // 異常系：ターゲット座標が生産施設ではない（平地など）場合
+        let mut world = World::new();
+        let master_data = MasterDataRegistry::load().unwrap();
+
+        world.insert_resource(Players(vec![Player {
+            id: PlayerId(1),
+            name: "P1".to_string(),
+            funds: 2000,
+        }]));
+
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(PlayerId(1)), 400),
+        ));
+        // 平地は生産施設ではない
+        world.spawn((
+            GridPosition { x: 1, y: 1 },
+            Property::new(Terrain::Plains, Some(PlayerId(1)), 0),
+        ));
+
+        let result = can_produce_at_tile(&mut world, PlayerId(1), 1, 1, &master_data);
+        assert_eq!(result.unwrap_err(), "Not a production facility!");
+    }
+
+    #[test]
+    fn test_can_produce_at_tile_ownership() {
+        // 異常系：他軍の生産施設である場合
+        let mut world = World::new();
+        let master_data = MasterDataRegistry::load().unwrap();
+
+        world.insert_resource(Players(vec![
+            Player {
+                id: PlayerId(1),
+                name: "P1".to_string(),
+                funds: 2000,
+            },
+            Player {
+                id: PlayerId(2),
+                name: "P2".to_string(),
+                funds: 2000,
+            },
+        ]));
+
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(PlayerId(1)), 400),
+        ));
+        // Player 2 が所有する工場
+        world.spawn((
+            GridPosition { x: 2, y: 1 },
+            Property::new(Terrain::Factory, Some(PlayerId(2)), 200),
+        ));
+
+        let result = can_produce_at_tile(&mut world, PlayerId(1), 2, 1, &master_data);
+        assert_eq!(result.unwrap_err(), "Not a production facility!");
+    }
+
+    #[test]
+    fn test_can_produce_at_tile_range() {
+        // 異常系：生産施設が首都から遠すぎる場合
+        let mut world = World::new();
+        let master_data = MasterDataRegistry::load().unwrap();
+
+        world.insert_resource(Players(vec![Player {
+            id: PlayerId(1),
+            name: "P1".to_string(),
+            funds: 2000,
+        }]));
+
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(PlayerId(1)), 400),
+        ));
+        // (3,1) は首都 (0,0) から距離 4 (PRODUCTION_RANGE 3 を超える)
+        world.spawn((
+            GridPosition { x: 3, y: 1 },
+            Property::new(Terrain::Factory, Some(PlayerId(1)), 200),
+        ));
+
+        let result = can_produce_at_tile(&mut world, PlayerId(1), 3, 1, &master_data);
+        assert_eq!(result.unwrap_err(), "Too far from Capital!");
+    }
+
+    #[test]
+    fn test_can_produce_at_tile_no_capital() {
+        // 異常系：自軍の首都がマップ上に存在しない場合
+        let mut world = World::new();
+        let master_data = MasterDataRegistry::load().unwrap();
+
+        world.insert_resource(Players(vec![Player {
+            id: PlayerId(1),
+            name: "P1".to_string(),
+            funds: 2000,
+        }]));
+
+        // 首都なし
+        world.spawn((
+            GridPosition { x: 2, y: 1 },
+            Property::new(Terrain::Factory, Some(PlayerId(1)), 200),
+        ));
+
+        let result = can_produce_at_tile(&mut world, PlayerId(1), 2, 1, &master_data);
+        assert_eq!(result.unwrap_err(), "Too far from Capital!");
+    }
 }
