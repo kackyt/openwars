@@ -33,16 +33,57 @@ def analyze_board():
     my_units = [u for u in units if u.get('player_id') == active_player_id]
     enemy_units = [u for u in units if u.get('player_id') != active_player_id]
 
+    # 資金の取得
+    my_funds = 0
+    if players and active_player_index < len(players):
+        my_funds = players[active_player_index].get('funds', 0)
+
     recommendations = []
 
     # 簡易的なサマリー生成
-    summary = f"ターン{turn}です。自軍のユニットは{len(my_units)}体、敵軍のユニットは{len(enemy_units)}体です。"
-    if len(my_units) > len(enemy_units):
-         summary += " 自軍が優勢な状況です。"
-    elif len(my_units) < len(enemy_units):
-         summary += " 敵軍が優勢な状況です。注意して進軍してください。"
+    if not my_units and turn == 1:
+        summary = f"ターン1です。現在、自軍のユニットは配置されていません。手持ちの資金 {my_funds}G を使用して、工場でユニットを生産しましょう。"
     else:
-         summary += " 互角の戦況です。"
+        summary = f"ターン{turn}です。自軍のユニットは{len(my_units)}体、敵軍のユニットは{len(enemy_units)}体です。"
+        if len(my_units) > len(enemy_units):
+             summary += " 自軍が優勢な状況です。"
+        elif len(my_units) < len(enemy_units):
+             summary += " 敵軍が優勢な状況です。注意して進軍してください。"
+        else:
+             summary += " 互角の戦況です。"
+
+    # ユニットが0、またはターン1の初期生産レコメンド
+    occupied_positions = set((u.get('x'), u.get('y')) for u in units)
+    my_factories = [p for p in properties if p.get('owner') == active_player_id and p.get('terrain') == '工場' and (p.get('x'), p.get('y')) not in occupied_positions]
+
+    if not my_units and my_factories:
+        remaining_funds = my_funds
+        production_plan = []
+        
+        # 優先度の高いユニットリストとコスト
+        choices = [
+            ("軽戦車", 6000),
+            ("対空戦車", 5500),
+            ("重歩兵", 2000),
+            ("軽歩兵", 1000)
+        ]
+        
+        for factory in my_factories:
+            fx, fy = factory.get('x'), factory.get('y')
+            for name, cost in choices:
+                if remaining_funds >= cost:
+                    production_plan.append({
+                        "unit_id": None,
+                        "unit_name": name,
+                        "action_type": "Produce",
+                        "target_x": fx,
+                        "target_y": fy,
+                        "explanation": f"({fx},{fy})の工場で「{name}」({cost}G) を生産することを推奨します。"
+                    })
+                    remaining_funds -= cost
+                    break
+        
+        recommendations.extend(production_plan)
 
     for unit in my_units:
         unit_id = unit.get('unit_id')
