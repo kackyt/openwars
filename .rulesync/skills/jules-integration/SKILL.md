@@ -17,7 +17,7 @@ Julesに新しい作業を依頼します。現在のブランチを自動で付
 - **ツール**: `mcp_jules_create_session`
 - **パラメータ例**:
   - `prompt`: "指示内容..."
-  - `repo`: "kackyt/mahjong-ai-server"
+  - `repo`: "<OWNER/REPO>"
   - `branch`: "現在のブランチ名" (例: `git rev-parse --abbrev-ref HEAD` の実行結果)
   - `autoPr`: `true` (完了時に自動的にPRを作成)
 

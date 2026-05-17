@@ -11,7 +11,7 @@ Julesにタスクを依頼します。詳細なパラメータ指定が可能で
     - `prompt`: タスクの詳細な指示。
     - `branch`: 開始ブランチ名（現在のブランチを `git rev-parse --abbrev-ref HEAD` 等で取得して指定）。
     - `autoPr`: `true` (完了時に自動的にプルリクエストを作成)。
-    - `repo`: 対象リポジトリ名 (例: `kackyt/mahjong-ai-server`)。
+    - `repo`: 対象リポジトリ名 (例: `<OWNER/REPO>`)。
 
 ### セッション状態の監視
 - **ツール**: `mcp_jules_get_session_state`
@@ -45,6 +45,6 @@ pnpm jules remote pull --session <SESSION_ID> --apply
 ---
 
 ## 運用ルール (Antigravity用)
-1. **ブランチ指定**: `mcp_jules_create_session` 呼び出し時には、必ず `--branch` パラメータに現在の作業ブランチを含めること。
+1. **ブランチ指定**: `mcp_jules_create_session` 呼び出し時には、必ず `branch` パラメータに現在の作業ブランチを含めること。
 2. **レビューフロー**: `Completed` 到着後、すぐに `teleport` せず、まず `mcp_jules_show_code_diff` で内容を精査し、ユーザーに要約を報告すること。
 3. **対話**: Julesがプランを提示した場合は、 `mcp_jules_send_reply_to_session` で承認またはフィードバックを返し、自律的に作業を完結させること。

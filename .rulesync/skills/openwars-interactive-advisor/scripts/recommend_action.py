@@ -85,11 +85,54 @@ def analyze_board():
         # issueの要件「敵ユニットを攻撃可能な位置にいる、または移動して攻撃できる場合は攻撃アクションを推奨する。」
         # 距離が近い(例えば1〜4程度)なら攻撃可能とみなして推奨する。
         if closest_enemy and min_enemy_dist <= 3:
+            ex = closest_enemy.get('x')
+            ey = closest_enemy.get('y')
+
+            # 既に隣接している場合は、移動せずにその場から攻撃する
+            if min_enemy_dist == 1:
+                target_x = ux
+                target_y = uy
+            else:
+                # 敵の隣接4方向の座標候補
+                candidates = [
+                    (ex - 1, ey),
+                    (ex + 1, ey),
+                    (ex, ey - 1),
+                    (ex, ey + 1)
+                ]
+
+                # 自分以外の他のユニットがいる座標を特定
+                occupied = set((u.get('x'), u.get('y')) for u in units if u.get('unit_id') != unit_id)
+
+                # properties と units の最大値からマップサイズ（概算）を推測
+                max_x = max([p.get('x', 0) for p in properties] + [u.get('x', 0) for u in units] + [10])
+                max_y = max([p.get('y', 0) for p in properties] + [u.get('y', 0) for u in units] + [10])
+
+                # 範囲内で、かつ他のユニットに占有されていない隣接セルをフィルタ
+                valid_candidates = []
+                for cx, cy in candidates:
+                    if 0 <= cx <= max_x and 0 <= cy <= max_y:
+                        if (cx, cy) not in occupied:
+                            valid_candidates.append((cx, cy))
+
+                if valid_candidates:
+                    # 自軍ユニット(ux, uy)から最も近い隣接セルを選択
+                    valid_candidates.sort(key=lambda coord: get_manhattan_distance(ux, uy, coord[0], coord[1]))
+                    target_x, target_y = valid_candidates[0]
+                else:
+                    # 空きマスがない場合はフォールバックとして最も近い隣接セルを選択
+                    candidates.sort(key=lambda coord: get_manhattan_distance(ux, uy, coord[0], coord[1]))
+                    bounded = [(cx, cy) for cx, cy in candidates if 0 <= cx <= max_x and 0 <= cy <= max_y]
+                    if bounded:
+                        target_x, target_y = bounded[0]
+                    else:
+                        target_x, target_y = candidates[0]
+
             action_rec["action_type"] = "MoveAndAttack"
-            action_rec["target_x"] = closest_enemy.get('x') # 本来は移動先の座標を入れるべきだが、簡易的に敵の位置の隣接マスなどを意図
-            action_rec["target_y"] = closest_enemy.get('y')
+            action_rec["target_x"] = target_x
+            action_rec["target_y"] = target_y
             action_rec["target_id"] = closest_enemy.get('unit_id')
-            action_rec["explanation"] = f"({closest_enemy.get('x')},{closest_enemy.get('y')})の敵ユニットを攻撃可能なため、移動して攻撃することを推奨します。"
+            action_rec["explanation"] = f"({ex},{ey})の敵ユニットを攻撃するため、({target_x},{target_y})へ移動して攻撃することを推奨します。"
 
         # 2. 中立または敵の拠点を占領可能な位置にいる場合
         elif closest_prop and min_prop_dist <= 1:
