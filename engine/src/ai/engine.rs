@@ -852,9 +852,9 @@ pub fn execute_ai_command(world: &mut World, unit_entity: Entity, command: AiCom
 
 /// 一度の呼び出しで、該当勢力のAI行動（生産、または1ユニットの行動）を1ステップ実行し、イベントを発行します。
 /// 行動可能ユニットがなくなったらターン終了コマンドを発行します。
-/// 何らかの行動を実行した場合は true、ターンが終了した場合は false を返します。
+/// 何らかの行動を実行した場合はその行動内容（文字列）を `Some` で返し、ターンが終了した場合は `None` を返します。
 /// AIのメイン実行エントリーポイント。
-pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> bool {
+pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> Option<String> {
     // 1. ユニット行動を1つ決定・実行
     // AI思考ループの中で、エンジン側のフラグが更新されるのを待たずに
     // 同一フレーム内の重複思考を避けるために、リソースで「指示済みユニット」を管理します。
@@ -864,6 +864,7 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> bool {
     }
 
     if let Some((entity, command)) = decide_ai_action(world, active_player, &skip_entities) {
+        let cmd_str = format!("{:?}", command);
         execute_ai_command(world, entity, command);
 
         // リソースを更新して、次回の呼び出しでもこのユニットをスキップするようにする
@@ -874,7 +875,7 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> bool {
             set.insert(entity);
             world.insert_resource(AiActionCooldown(set));
         }
-        return true;
+        return Some(cmd_str);
     }
 
     // 2. 生産行動
@@ -900,9 +901,10 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> bool {
             continue;
         }
 
+        let cmd_str = format!("{:?}", cmd);
+
         // 直前のエラーがこのコマンドに関連しているかチェック
-        let cmd_debug = format!("{:?}", cmd);
-        if last_error.is_some() && last_event_str.as_deref() == Some(&cmd_debug) {
+        if last_error.is_some() && last_event_str.as_deref() == Some(&cmd_str) {
             // 前回と同じコマンドでエラーが発生している場合はスキップ
             // 座標を冷却リストに入れて再試行を防ぐ
             if let Some(mut res) = world.get_resource_mut::<AiProductionCooldown>() {
@@ -931,7 +933,7 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> bool {
         }
 
         if sent {
-            return true;
+            return Some(cmd_str);
         }
     }
 
@@ -941,7 +943,7 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> bool {
     {
         end_events.send(crate::events::NextPhaseCommand);
     }
-    false
+    None
 }
 
 #[cfg(test)]

@@ -198,7 +198,7 @@ where
                     if let Some(active_player) = active_player_opt
                         && app.ui_state.player_controls.get(&active_player.0)
                             == Some(&PlayerControlType::Ai)
-                        && execute_ai_turn(world, active_player)
+                        && execute_ai_turn(world, active_player).is_some()
                     {
                         app.ui_state.in_game_state = InGameState::WaitAiAction;
                     }
