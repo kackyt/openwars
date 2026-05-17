@@ -79,7 +79,7 @@ impl IslandMap {
     pub fn classify_islands(
         &self,
         player_id: crate::components::PlayerId,
-        properties: &std::collections::HashMap<GridPosition, crate::components::Property>,
+        properties: &std::collections::HashMap<GridPosition, Option<crate::components::PlayerId>>,
     ) -> (Vec<IslandId>, Vec<IslandId>) {
         let mut base_islands = Vec::new();
         let mut target_islands = Vec::new();
@@ -89,8 +89,8 @@ impl IslandMap {
             let mut has_other_property = false;
 
             for tile in &island.tiles {
-                if let Some(prop) = properties.get(tile) {
-                    if prop.owner_id == Some(player_id) {
+                if let Some(owner_id) = properties.get(tile) {
+                    if *owner_id == Some(player_id) {
                         has_own_property = true;
                     } else {
                         has_other_property = true;

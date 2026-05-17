@@ -18,52 +18,50 @@ pub fn assign_transport_missions(world: &mut World, player_id: PlayerId) {
 
     if let Some(manager) = world.get_resource::<TransportMissionManager>() {
         for m in &manager.missions {
-            #[allow(clippy::collapsible_if)]
-            if let Some(faction) = world.get::<Faction>(m.transport_entity) {
-                if faction.0 == player_id {
-                    busy_transports.insert(m.transport_entity);
-                    busy_infantry.insert(m.cargo_entity);
-                }
+            if world
+                .get::<Faction>(m.transport_entity)
+                .is_some_and(|faction| faction.0 == player_id)
+            {
+                busy_transports.insert(m.transport_entity);
+                busy_infantry.insert(m.cargo_entity);
             }
         }
     }
 
     // 1. 全拠点情報を収集
     let mut properties_map = HashMap::new();
+    let mut ownership_map = HashMap::new();
     {
         let mut query = world.query::<(&GridPosition, &Property)>();
         for (pos, prop) in query.iter(world) {
             properties_map.insert(*pos, *prop);
+            ownership_map.insert(*pos, prop.owner_id);
         }
     }
 
-    // 島情報の取得と分類
-    let (base_islands, target_islands) = {
-        if let Some(island_map) = world.get_resource::<IslandMap>() {
-            island_map.classify_islands(player_id, &properties_map)
-        } else {
-            return;
-        }
-    };
-
-    if target_islands.is_empty() {
-        return; // 目標がない
-    }
-
-    // 2. 目標の優先度評価
-    let island_map = world.get_resource::<IslandMap>().unwrap().clone();
+    // 2. 目標の優先度評価と島情報の取得
     let mut objectives = Vec::new();
+    let mut base_islands_cache = HashSet::new();
 
-    // 簡易的な前線距離計算のため、自軍拠点の平均座標（重心）を求める
-    let mut base_center_x = 0;
-    let mut base_center_y = 0;
-    let mut base_count = 0;
-    for base_id in &base_islands {
-        if let Some(island) = island_map.islands.iter().find(|i| i.id == *base_id) {
-            for tile in &island.tiles {
-                #[allow(clippy::collapsible_if)]
-                if let Some(prop) = properties_map.get(tile) {
-                    if prop.owner_id == Some(player_id) {
+    world.resource_scope(|_world, island_map: Mut<IslandMap>| {
+        let (base_islands, target_islands) = island_map.classify_islands(player_id, &ownership_map);
+
+        if target_islands.is_empty() {
+            return; // 目標がない
+        }
+
+        base_islands_cache.extend(base_islands.iter().copied());
+
+        // 簡易的な前線距離計算のため、自軍拠点の平均座標（重心）を求める
+        let mut base_center_x = 0;
+        let mut base_center_y = 0;
+        let mut base_count = 0;
+        for base_id in &base_islands {
+            if let Some(island) = island_map.islands.iter().find(|i| i.id == *base_id) {
+                for tile in &island.tiles {
+                    if let Some(prop) = properties_map.get(tile)
+                        && prop.owner_id == Some(player_id)
+                    {
                         base_center_x += tile.x;
                         base_center_y += tile.y;
                         base_count += 1;
@@ -71,44 +69,47 @@ pub fn assign_transport_missions(world: &mut World, player_id: PlayerId) {
                 }
             }
         }
-    }
 
-    if base_count > 0 {
-        base_center_x /= base_count;
-        base_center_y /= base_count;
-    }
+        if base_count > 0 {
+            base_center_x /= base_count;
+            base_center_y /= base_count;
+        }
 
-    for target_id in target_islands {
-        if let Some(island) = island_map.islands.iter().find(|i| i.id == target_id) {
-            let mut island_props = Vec::new();
-            let mut target_center_x = 0;
-            let mut target_center_y = 0;
-            let mut target_prop_count = 0;
+        for target_id in target_islands {
+            if let Some(island) = island_map.islands.iter().find(|i| i.id == target_id) {
+                let mut island_props = Vec::new();
+                let mut target_center_x = 0;
+                let mut target_center_y = 0;
+                let mut target_prop_count = 0;
 
-            for tile in &island.tiles {
-                #[allow(clippy::collapsible_if)]
-                if let Some(prop) = properties_map.get(tile) {
-                    if prop.owner_id != Some(player_id) {
+                for tile in &island.tiles {
+                    if let Some(prop) = properties_map.get(tile)
+                        && prop.owner_id != Some(player_id)
+                    {
                         island_props.push((*tile, prop.terrain));
                         target_center_x += tile.x;
                         target_center_y += tile.y;
                         target_prop_count += 1;
                     }
                 }
+
+                if target_prop_count > 0 {
+                    target_center_x /= target_prop_count;
+                    target_center_y /= target_prop_count;
+                }
+
+                // 自軍重心からのマンハッタン距離をペナルティとして計算（遠いほど優先度減）
+                let distance_penalty = (target_center_x as i32 - base_center_x as i32).abs()
+                    + (target_center_y as i32 - base_center_y as i32).abs();
+
+                let objective = Objective::evaluate(target_id, &island_props, distance_penalty);
+                objectives.push(objective);
             }
-
-            if target_prop_count > 0 {
-                target_center_x /= target_prop_count;
-                target_center_y /= target_prop_count;
-            }
-
-            // 自軍重心からのマンハッタン距離をペナルティとして計算（遠いほど優先度減）
-            let distance_penalty = (target_center_x as i32 - base_center_x as i32).abs()
-                + (target_center_y as i32 - base_center_y as i32).abs();
-
-            let objective = Objective::evaluate(target_id, &island_props, distance_penalty);
-            objectives.push(objective);
         }
+    });
+
+    if objectives.is_empty() {
+        return;
     }
 
     // スコア降順でソート
@@ -132,7 +133,7 @@ pub fn assign_transport_missions(world: &mut World, player_id: PlayerId) {
     }
 
     let mut free_infantry = Vec::new();
-    {
+    world.resource_scope(|world, island_map: Mut<IslandMap>| {
         let mut query = world.query::<(
             Entity,
             &Faction,
@@ -147,15 +148,14 @@ pub fn assign_transport_missions(world: &mut World, player_id: PlayerId) {
                 && !busy_infantry.contains(&entity)
             {
                 // 歩兵が「自軍の島」にいるか確認（すでに別の目標島で戦闘中の場合は再割り当てしない）
-                #[allow(clippy::collapsible_if)]
-                if let Some(island) = island_map.get_island_at(pos) {
-                    if base_islands.contains(&island.id) {
-                        free_infantry.push((entity, *pos));
-                    }
+                if let Some(island) = island_map.get_island_at(pos)
+                    && base_islands_cache.contains(&island.id)
+                {
+                    free_infantry.push((entity, *pos));
                 }
             }
         }
-    }
+    });
 
     // 目標に対して割り当てを行う
     for objective in objectives {
@@ -166,16 +166,18 @@ pub fn assign_transport_missions(world: &mut World, player_id: PlayerId) {
         let mut current_assigned = 0;
         if let Some(manager) = world.get_resource::<TransportMissionManager>() {
             for m in &manager.missions {
-                #[allow(clippy::collapsible_if)]
-                if let Some(faction) = world.get::<Faction>(m.transport_entity) {
-                    if faction.0 == player_id && m.target_island == Some(objective.target_island) {
-                        current_assigned += 1;
-                    }
+                if world
+                    .get::<Faction>(m.transport_entity)
+                    .is_some_and(|faction| {
+                        faction.0 == player_id && m.target_island == Some(objective.target_island)
+                    })
+                {
+                    current_assigned += 1;
                 }
             }
         }
 
-        let mut to_assign = needed.saturating_sub(current_assigned);
+        let mut to_assign = needed.0.saturating_sub(current_assigned);
 
         while to_assign > 0 && !free_transports.is_empty() && !free_infantry.is_empty() {
             let (transport_entity, _) = free_transports.pop().unwrap();
@@ -209,12 +211,12 @@ pub fn assign_transport_missions(world: &mut World, player_id: PlayerId) {
     }
 }
 
-pub fn assign_test_transport_mission(world: &mut World, player_id: PlayerId) {
-    assign_transport_missions(world, player_id);
-}
-
 #[cfg(test)]
 mod tests {
+    pub fn assign_test_transport_mission(world: &mut World, player_id: PlayerId) {
+        super::assign_transport_missions(world, player_id);
+    }
+
     use super::*;
     use crate::ai::islands::{Island, IslandId, IslandMap};
     use crate::components::{Faction, GridPosition, PlayerId, Property, UnitStats};

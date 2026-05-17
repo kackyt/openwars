@@ -267,51 +267,31 @@ pub fn decide_ai_action(
             // 歩兵の待機移動ロジック: やることがない歩兵は海岸へ向かう
             let is_infantry = stats.unit_type == crate::resources::UnitType::Infantry
                 || stats.unit_type == crate::resources::UnitType::Mech;
-            if is_infantry && !is_combat_ineffective {
-                // 島情報を取得
-                let mut is_stranded = false;
-                #[allow(clippy::collapsible_if)]
-                if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() {
-                    if let Some(my_island) = island_map.get_island_at(&pos) {
-                        let mut local_targets = false;
-                        for (p_pos, _, p_owner) in &properties {
-                            if *p_owner != Some(player_id) && my_island.tiles.contains(p_pos) {
-                                local_targets = true;
-                                break;
-                            }
-                        }
+            if is_infantry && !is_combat_ineffective && is_unit_stranded(world, &pos, player_id, &properties, &enemy_units) {
+                let mut min_coast_dist = 99;
 
-                        let mut local_enemies = false;
-                        for (e_pos, _, _, _, _, _) in &enemy_units {
-                            if my_island.tiles.contains(e_pos) {
-                                local_enemies = true;
-                                break;
-                            }
-                        }
+                // 効率化: 全マス走査を避け、現在位置周辺の限定された範囲で海岸を探す
+                let check_range = 10;
+                let min_x = current_grid.x.saturating_sub(check_range);
+                let max_x = (current_grid.x + check_range).min(map.width - 1);
+                let min_y = current_grid.y.saturating_sub(check_range);
+                let max_y = (current_grid.y + check_range).min(map.height - 1);
 
-                        if !local_targets && !local_enemies {
-                            is_stranded = true;
+                for cy in min_y..=max_y {
+                    for cx in min_x..=max_x {
+                        if map.get_terrain(cx, cy) == Some(crate::resources::Terrain::Sea) {
+                            let d = (current_grid.x as i32 - cx as i32).abs()
+                                + (current_grid.y as i32 - cy as i32).abs();
+                            if d < min_coast_dist {
+                                min_coast_dist = d;
+                            }
                         }
                     }
                 }
 
-                if is_stranded {
-                    let mut min_coast_dist = 99;
-                    for cy in 0..map.height {
-                        for cx in 0..map.width {
-                            if map.get_terrain(cx, cy) == Some(crate::resources::Terrain::Sea) {
-                                let d = (current_grid.x as i32 - cx as i32).abs()
-                                    + (current_grid.y as i32 - cy as i32).abs();
-                                if d < min_coast_dist {
-                                    min_coast_dist = d;
-                                }
-                            }
-                        }
-                    }
-                    // 海岸に近いほど加点（距離1を最適とする）
-                    if min_coast_dist > 0 {
-                        base_tile_score += (20 - min_coast_dist).max(0) * 100;
-                    }
+                // 海岸に近いほど加点（距離1を最適とする）
+                if min_coast_dist < 99 && min_coast_dist > 0 {
+                    base_tile_score += (20 - min_coast_dist).max(0) * 100;
                 }
             }
 
@@ -910,7 +890,7 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> bool {
     // AI思考ループの中で、エンジン側のフラグが更新されるのを待たずに
     // 同一フレーム内の重複思考を避けるために、リソースで「指示済みユニット」を管理します。
     // ミッションの割り当てを試行する
-    crate::ai::planner::assign_test_transport_mission(world, active_player);
+    crate::ai::planner::assign_transport_missions(world, active_player);
 
     let mut skip_entities = std::collections::HashSet::new();
     if let Some(res) = world.get_resource::<AiActionCooldown>() {
@@ -1043,6 +1023,39 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> bool {
         world.get_resource_mut::<Events<crate::events::NextPhaseCommand>>()
     {
         end_events.send(crate::events::NextPhaseCommand);
+    }
+    false
+}
+
+fn is_unit_stranded(
+    world: &World,
+    pos: &GridPosition,
+    player_id: PlayerId,
+    properties: &[(GridPosition, crate::resources::Terrain, Option<PlayerId>)],
+    enemy_units: &[(GridPosition, crate::resources::UnitType, u32, u32, u32, u32)],
+) -> bool {
+    if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>()
+        && let Some(my_island) = island_map.get_island_at(pos)
+    {
+        let mut local_targets = false;
+        for (p_pos, _, p_owner) in properties {
+            if *p_owner != Some(player_id) && my_island.tiles.contains(p_pos) {
+                local_targets = true;
+                break;
+            }
+        }
+
+        let mut local_enemies = false;
+        for (e_pos, _, _, _, _, _) in enemy_units {
+            if my_island.tiles.contains(e_pos) {
+                local_enemies = true;
+                break;
+            }
+        }
+
+        if !local_targets && !local_enemies {
+            return true;
+        }
     }
     false
 }
