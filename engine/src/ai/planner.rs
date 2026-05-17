@@ -11,24 +11,15 @@ use bevy_ecs::prelude::*;
 /// 4. 任務を作成し、TransportMissionManager に登録する
 pub fn assign_test_transport_mission(world: &mut World, player_id: PlayerId) {
     // すでに進行中のミッションがある場合はスキップ (簡略化)
-    let has_mission = {
-        let mut found = false;
-        let mut missions_entities = vec![];
-        if let Some(manager) = world.get_resource::<TransportMissionManager>() {
-            for m in &manager.missions {
-                missions_entities.push(m.transport_entity);
-            }
-        }
-        let mut query = world.query::<&Faction>();
-        for entity in missions_entities {
-            if let Ok(faction) = query.get(world, entity)
-                && faction.0 == player_id {
-                    found = true;
-                    break;
-                }
-        }
-        found
-    };
+    let has_mission = world
+        .get_resource::<TransportMissionManager>()
+        .map_or(false, |manager| {
+            manager.missions.iter().any(|m| {
+                world
+                    .get::<Faction>(m.transport_entity)
+                    .map_or(false, |f| f.0 == player_id)
+            })
+        });
 
     if has_mission {
         return;
@@ -61,20 +52,11 @@ pub fn assign_test_transport_mission(world: &mut World, player_id: PlayerId) {
     // 2. フリーな歩兵を探す（他のCargoに入っていないかチェック）
     let mut free_infantry = None;
     {
-        // まず、すでに搭載されているエンティティのリストを作る
-        let mut loaded_entities = std::collections::HashSet::new();
-        let mut query_cargo = world.query::<&CargoCapacity>();
-        for cargo in query_cargo.iter(world) {
-            for &e in &cargo.loaded {
-                loaded_entities.insert(e);
-            }
-        }
-
-        let mut query_inf = world.query::<(Entity, &Faction, &UnitStats)>();
-        for (entity, faction, stats) in query_inf.iter(world) {
+        let mut query_inf = world.query::<(Entity, &Faction, &UnitStats, Option<&crate::components::Transporting>)>();
+        for (entity, faction, stats, transporting_opt) in query_inf.iter(world) {
             if faction.0 == player_id
                 && stats.unit_type == UnitType::Infantry
-                && !loaded_entities.contains(&entity)
+                && transporting_opt.is_none()
             {
                 free_infantry = Some(entity);
                 break;

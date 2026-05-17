@@ -6,15 +6,17 @@ use crate::systems::movement::{OccupantInfo, calculate_reachable_tiles};
 use bevy_ecs::prelude::*;
 use std::collections::HashMap;
 
+/// 輸送ミッションの各フェーズ
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportPhase {
-    Pickup,
-    Transit,
-    Drop,
-    Return,
+    Pickup,  // 歩兵の回収に向かうフェーズ
+    Transit, // 目標の島へ海上を移動するフェーズ
+    Drop,    // 目標の島に歩兵を降ろすフェーズ
+    Return,  // 任務完了後、拠点に帰還するフェーズ
 }
 
-#[derive(Debug, Clone)]
+/// 輸送ミッションの情報
+#[derive(Debug, Clone, Copy)]
 pub struct TransportMission {
     pub transport_entity: Entity,
     pub cargo_entity: Entity,
@@ -31,7 +33,7 @@ pub fn execute_mission_step(
     world: &mut World,
     mission: &TransportMission,
 ) -> Option<super::engine::AiCommand> {
-    // Basic checks
+    // 輸送機の基本情報を取得
     let (t_pos, t_stats, t_fuel, t_faction) = {
         let t_pos = world
             .get::<GridPosition>(mission.transport_entity)
@@ -44,10 +46,8 @@ pub fn execute_mission_step(
         (t_pos, t_stats, t_fuel, t_faction.0)
     };
 
-    let map = world.resource::<Map>().clone();
-    let registry = world.resource::<MasterDataRegistry>().clone();
 
-    // Occupant info for pathfinding
+    // 経路探索のために他ユニットの占有情報を取得
     let mut unit_positions = HashMap::new();
     {
         let mut query = world.query::<(
@@ -78,6 +78,9 @@ pub fn execute_mission_step(
         }
     }
 
+    let map = world.resource::<Map>();
+    let registry = world.resource::<MasterDataRegistry>();
+
     let reachable = calculate_reachable_tiles(
         &map,
         &unit_positions,
@@ -94,7 +97,7 @@ pub fn execute_mission_step(
         TransportPhase::Pickup => {
             let cargo_pos = world.get::<GridPosition>(mission.cargo_entity).cloned()?;
 
-            // For now, let's just make the transport move towards the cargo and wait.
+            // 対象の歩兵の現在位置に最も近いタイルへ移動して待機する
             let mut best_tile = t_pos;
             let mut min_dist = (t_pos.x as i32 - cargo_pos.x as i32).abs()
                 + (t_pos.y as i32 - cargo_pos.y as i32).abs();
@@ -155,7 +158,7 @@ pub fn execute_mission_step(
                     cargo_entity: mission.cargo_entity,
                 });
             } else {
-                // Move transport towards target island if we can't drop
+                // 降ろせる場所がない場合は、待機して機を伺う
                 return Some(super::engine::AiCommand::Wait { target_pos: t_pos });
             }
         }
