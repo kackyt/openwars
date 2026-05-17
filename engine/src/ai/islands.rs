@@ -48,13 +48,11 @@ impl IslandMap {
 
                     for (nx, ny) in map.get_adjacent(cx, cy) {
                         let n_idx = ny * map.width + nx;
-                        if !visited[n_idx] {
-                            if let Some(n_terrain) = map.get_terrain(nx, ny) {
-                                if n_terrain != Terrain::Sea {
-                                    visited[n_idx] = true;
-                                    queue.push_back((nx, ny));
-                                }
-                            }
+                        if !visited[n_idx]
+                            && map.get_terrain(nx, ny).is_some_and(|t| t != Terrain::Sea)
+                        {
+                            visited[n_idx] = true;
+                            queue.push_back((nx, ny));
                         }
                     }
                 }

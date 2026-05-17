@@ -52,7 +52,12 @@ pub fn assign_test_transport_mission(world: &mut World, player_id: PlayerId) {
     // 2. フリーな歩兵を探す（他のCargoに入っていないかチェック）
     let mut free_infantry = None;
     {
-        let mut query_inf = world.query::<(Entity, &Faction, &UnitStats, Option<&crate::components::Transporting>)>();
+        let mut query_inf = world.query::<(
+            Entity,
+            &Faction,
+            &UnitStats,
+            Option<&crate::components::Transporting>,
+        )>();
         for (entity, faction, stats, transporting_opt) in query_inf.iter(world) {
             if faction.0 == player_id
                 && stats.unit_type == UnitType::Infantry
