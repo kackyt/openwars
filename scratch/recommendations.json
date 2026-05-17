@@ -1,0 +1,23 @@
+{
+  "summary": "ターン1です。自軍のユニットは2体、敵軍のユニットは1体です。 自軍が優勢な状況です。",
+  "recommendations": [
+    {
+      "unit_id": 1,
+      "unit_name": "Infantry",
+      "action_type": "MoveAndAttack",
+      "target_x": 4,
+      "target_y": 3,
+      "target_id": 3,
+      "explanation": "(4,3)の敵ユニットを攻撃可能なため、移動して攻撃することを推奨します。"
+    },
+    {
+      "unit_id": 2,
+      "unit_name": "Tank",
+      "action_type": "MoveAndAttack",
+      "target_x": 4,
+      "target_y": 3,
+      "target_id": 3,
+      "explanation": "(4,3)の敵ユニットを攻撃可能なため、移動して攻撃することを推奨します。"
+    }
+  ]
+}
