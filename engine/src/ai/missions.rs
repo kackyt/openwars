@@ -463,7 +463,7 @@ mod tests {
         assert!(cmd.is_some());
         if let Some(crate::ai::engine::AiCommand::Wait { target_pos }) = cmd {
             // ヘリは (0,0) にいて、歩兵は (2,0) にいる。ヘリは (2,0) に隣接するマス（(1,0), (3,0), (2,1) など）へ向かうべき
-            let dist = (target_pos.x as i32 - 2).abs() + (target_pos.y as i32 - 0).abs();
+            let dist = (target_pos.x as i32 - 2).abs() + (target_pos.y as i32).abs();
             assert_eq!(dist, 1);
         } else {
             panic!("Expected Wait command, got {:?}", cmd);

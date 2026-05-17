@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Transport Mission Definition
-AIは複数ターンにまたがる輸送行動を「ミッション」として管理し、既存の貪欲アルゴリズムよりも優先して実行しなければならない。
+MUST: AIは複数ターンにまたがる輸送行動を「ミッション」として管理し、既存の貪欲アルゴリズムよりも優先して実行しなければならない。
 
 #### Scenario: Mission Execution
 - **WHEN** AIの行動決定ループ (`decide_ai_action`) が開始したとき
