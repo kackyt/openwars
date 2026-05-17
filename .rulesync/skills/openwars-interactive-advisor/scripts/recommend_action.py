@@ -2,15 +2,21 @@ import json
 import os
 import sys
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SKILL_DIR = os.path.dirname(SCRIPT_DIR)
+SCRATCH_DIR = os.path.join(SKILL_DIR, "scratch")
+BOARD_STATE_PATH = os.path.join(SCRATCH_DIR, "board_state.json")
+RECOMMENDATIONS_PATH = os.path.join(SCRATCH_DIR, "recommendations.json")
+
 def get_manhattan_distance(x1, y1, x2, y2):
     return abs(x1 - x2) + abs(y1 - y2)
 
 def analyze_board():
     try:
-        with open('.rulesync/skills/openwars-interactive-advisor/scratch/board_state.json', 'r', encoding='utf-8') as f:
+        with open(BOARD_STATE_PATH, 'r', encoding='utf-8') as f:
             board_state = json.load(f)
     except FileNotFoundError:
-        print("Error: .rulesync/skills/openwars-interactive-advisor/scratch/board_state.json not found.", file=sys.stderr)
+        print(f"Error: {BOARD_STATE_PATH} not found.", file=sys.stderr)
         sys.exit(1)
 
     turn = board_state.get('turn', 1)
@@ -118,8 +124,8 @@ def analyze_board():
         "recommendations": recommendations
     }
 
-    os.makedirs('.rulesync/skills/openwars-interactive-advisor/scratch', exist_ok=True)
-    with open('.rulesync/skills/openwars-interactive-advisor/scratch/recommendations.json', 'w', encoding='utf-8') as f:
+    os.makedirs(SCRATCH_DIR, exist_ok=True)
+    with open(RECOMMENDATIONS_PATH, 'w', encoding='utf-8') as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
 if __name__ == "__main__":
