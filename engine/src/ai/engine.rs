@@ -264,6 +264,57 @@ pub fn decide_ai_action(
                 base_tile_score += (20 - min_base_dist).max(0) * 500;
             }
 
+            // 歩兵の待機移動ロジック: やることがない歩兵は海岸へ向かう
+            let is_infantry = stats.unit_type == crate::resources::UnitType::Infantry
+                || stats.unit_type == crate::resources::UnitType::Mech;
+            if is_infantry && !is_combat_ineffective {
+                // 島情報を取得
+                let mut is_stranded = false;
+                #[allow(clippy::collapsible_if)]
+                if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() {
+                    if let Some(my_island) = island_map.get_island_at(&pos) {
+                        let mut local_targets = false;
+                        for (p_pos, _, p_owner) in &properties {
+                            if *p_owner != Some(player_id) && my_island.tiles.contains(p_pos) {
+                                local_targets = true;
+                                break;
+                            }
+                        }
+
+                        let mut local_enemies = false;
+                        for (e_pos, _, _, _, _, _) in &enemy_units {
+                            if my_island.tiles.contains(e_pos) {
+                                local_enemies = true;
+                                break;
+                            }
+                        }
+
+                        if !local_targets && !local_enemies {
+                            is_stranded = true;
+                        }
+                    }
+                }
+
+                if is_stranded {
+                    let mut min_coast_dist = 99;
+                    for cy in 0..map.height {
+                        for cx in 0..map.width {
+                            if map.get_terrain(cx, cy) == Some(crate::resources::Terrain::Sea) {
+                                let d = (current_grid.x as i32 - cx as i32).abs()
+                                    + (current_grid.y as i32 - cy as i32).abs();
+                                if d < min_coast_dist {
+                                    min_coast_dist = d;
+                                }
+                            }
+                        }
+                    }
+                    // 海岸に近いほど加点（距離1を最適とする）
+                    if min_coast_dist > 0 {
+                        base_tile_score += (20 - min_coast_dist).max(0) * 100;
+                    }
+                }
+            }
+
             // 占領価値・拠点接近スコア
             let mut effective_can_capture = stats.can_capture;
             if !effective_can_capture

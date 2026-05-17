@@ -74,4 +74,44 @@ impl IslandMap {
             .iter()
             .find(|island| island.tiles.contains(pos))
     }
+
+    /// 各島を「自軍の拠点島（Base）」と「目標島（Target）」に分類する
+    pub fn classify_islands(
+        &self,
+        player_id: crate::components::PlayerId,
+        properties: &std::collections::HashMap<GridPosition, crate::components::Property>,
+    ) -> (Vec<IslandId>, Vec<IslandId>) {
+        let mut base_islands = Vec::new();
+        let mut target_islands = Vec::new();
+
+        for island in &self.islands {
+            let mut has_own_property = false;
+            let mut has_other_property = false;
+
+            for tile in &island.tiles {
+                if let Some(prop) = properties.get(tile) {
+                    if prop.owner_id == Some(player_id) {
+                        has_own_property = true;
+                    } else {
+                        has_other_property = true;
+                    }
+                }
+            }
+
+            // 自軍の拠点が1つでもあればBase Islandとみなす（より厳密には生産拠点等で判定してもよい）
+            if has_own_property {
+                base_islands.push(island.id);
+                // 敵の拠点も混在している場合はTarget Islandとしても扱うか？
+                // ここでは侵攻先という意味で、他勢力・中立の拠点があるならTargetにも入れる
+                if has_other_property {
+                    target_islands.push(island.id);
+                }
+            } else if has_other_property {
+                // 自軍拠点がなく、他勢力・中立の拠点があるなら完全なTarget Island
+                target_islands.push(island.id);
+            }
+        }
+
+        (base_islands, target_islands)
+    }
 }
