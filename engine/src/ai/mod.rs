@@ -3,6 +3,7 @@ pub mod engine;
 pub mod eval;
 pub mod islands;
 pub mod missions;
+pub mod objectives;
 pub mod planner;
 pub mod production;
 pub mod pruning;
