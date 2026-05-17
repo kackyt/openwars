@@ -96,6 +96,60 @@ impl OpenWarsAiServer {
         Ok(format!("Loaded map: {}", args.map_name))
     }
 
+    #[tool(description = "Spawns a specific unit at a given coordinate.")]
+    async fn spawn_unit(
+        &self,
+        Parameters(args): Parameters<SpawnUnitArgs>,
+    ) -> Result<String, String> {
+        use engine::components::{ActionCompleted, Ammo};
+        use engine::resources::master_data::UnitName;
+        let mut state_lock = self.state.lock().await;
+        if let Some(state) = state_lock.as_mut() {
+            let world = &mut state.world;
+            let registry = world
+                .get_resource::<MasterDataRegistry>()
+                .ok_or_else(|| "No MasterDataRegistry".to_string())?
+                .clone();
+
+            let unit_name = UnitName(args.unit_name.clone());
+            let stats = registry
+                .create_unit_stats(&unit_name)
+                .map_err(|e| format!("Failed to create unit stats: {}", e))?;
+
+            world.spawn((
+                GridPosition {
+                    x: args.x as usize,
+                    y: args.y as usize,
+                },
+                Faction(PlayerId(args.player_id as u32)),
+                stats.clone(),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Fuel {
+                    current: stats.max_fuel,
+                    max: stats.max_fuel,
+                },
+                Ammo {
+                    ammo1: stats.max_ammo1,
+                    max_ammo1: stats.max_ammo1,
+                    ammo2: stats.max_ammo2,
+                    max_ammo2: stats.max_ammo2,
+                },
+                HasMoved(false),
+                ActionCompleted(false),
+            ));
+
+            Ok(format!(
+                "Spawned {} at ({}, {}) for player {}",
+                args.unit_name, args.x, args.y, args.player_id
+            ))
+        } else {
+            Err("No map loaded".into())
+        }
+    }
+
     #[tool(description = "Evaluates the board.")]
     async fn evaluate_board(
         &self,
@@ -313,16 +367,26 @@ impl OpenWarsAiServer {
             };
 
             let before_score = engine::ai::eval::evaluate_board(&mut state.world, active_player_id);
-            let action_taken =
-                engine::ai::engine::execute_ai_turn(&mut state.world, active_player_id);
 
-            // 鬩･蟠趣ｽｦ繝ｻ AI邵ｺ・ｮ髯ｦ謔溯劒(Event)郢ｧ蝣､蛹ｱ髯ｦ蠕鯉ｼ邵ｺ貅倪旺邵ｺ・ｨ邵ｺ・ｯ邵ｲ竏壹☆郢ｧ・ｹ郢昴・ﾎ堤ｹｧ雋橸ｽｮ貅ｯ・｡蠕鯉ｼ邵ｺ・ｦ霑･・ｶ隲ｷ荵晢ｽ定ｭ厄ｽｴ隴・ｽｰ邵ｺ蜷ｶ・玖｢繝ｻ・ｦ竏壺ｲ邵ｺ繧・ｽ・
-            state.schedule.run(&mut state.world);
+            let mut actions_taken = vec![];
+            loop {
+                let action_taken =
+                    engine::ai::engine::execute_ai_turn(&mut state.world, active_player_id);
+
+                // イベント処理
+                state.schedule.run(&mut state.world);
+
+                if let Some(action) = action_taken {
+                    actions_taken.push(action);
+                } else {
+                    break;
+                }
+            }
 
             let after_score = engine::ai::eval::evaluate_board(&mut state.world, active_player_id);
 
             Ok(serde_json::json!({
-                "action_taken": action_taken,
+                "actions_taken": actions_taken,
                 "player_id": active_player_id.0,
                 "player_index": active_player_index.0,
                 "before_score": before_score,
