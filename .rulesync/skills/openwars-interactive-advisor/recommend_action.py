@@ -7,10 +7,10 @@ def get_manhattan_distance(x1, y1, x2, y2):
 
 def analyze_board():
     try:
-        with open('scratch/board_state.json', 'r', encoding='utf-8') as f:
+        with open('.rulesync/skills/openwars-interactive-advisor/scratch/board_state.json', 'r', encoding='utf-8') as f:
             board_state = json.load(f)
     except FileNotFoundError:
-        print("Error: scratch/board_state.json not found.", file=sys.stderr)
+        print("Error: .rulesync/skills/openwars-interactive-advisor/scratch/board_state.json not found.", file=sys.stderr)
         sys.exit(1)
 
     turn = board_state.get('turn', 1)
@@ -118,8 +118,8 @@ def analyze_board():
         "recommendations": recommendations
     }
 
-    os.makedirs('scratch', exist_ok=True)
-    with open('scratch/recommendations.json', 'w', encoding='utf-8') as f:
+    os.makedirs('.rulesync/skills/openwars-interactive-advisor/scratch', exist_ok=True)
+    with open('.rulesync/skills/openwars-interactive-advisor/scratch/recommendations.json', 'w', encoding='utf-8') as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
 if __name__ == "__main__":
