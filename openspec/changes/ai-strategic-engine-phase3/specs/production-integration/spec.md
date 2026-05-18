@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Production Integration
-AIは目標達成に必要なユニット数が不足している場合、動的に生産要求を発行しなければならない。
+SHALL: AIは目標達成に必要なユニット数が不足している場合、動的に生産要求を発行しなければならない。
 
 #### Scenario: Unit Shortage
 - **WHEN** 戦略目標（島）に対して歩兵や輸送機を割り当てる際、稼働可能な待機ユニットが不足しているとき
