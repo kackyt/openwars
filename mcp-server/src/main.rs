@@ -313,16 +313,26 @@ impl OpenWarsAiServer {
             };
 
             let before_score = engine::ai::eval::evaluate_board(&mut state.world, active_player_id);
-            let action_taken =
-                engine::ai::engine::execute_ai_turn(&mut state.world, active_player_id);
 
-            // 鬩･蟠趣ｽｦ繝ｻ AI邵ｺ・ｮ髯ｦ謔溯劒(Event)郢ｧ蝣､蛹ｱ髯ｦ蠕鯉ｼ邵ｺ貅倪旺邵ｺ・ｨ邵ｺ・ｯ邵ｲ竏壹☆郢ｧ・ｹ郢昴・ﾎ堤ｹｧ雋橸ｽｮ貅ｯ・｡蠕鯉ｼ邵ｺ・ｦ霑･・ｶ隲ｷ荵晢ｽ定ｭ厄ｽｴ隴・ｽｰ邵ｺ蜷ｶ・玖｢繝ｻ・ｦ竏壺ｲ邵ｺ繧・ｽ・
-            state.schedule.run(&mut state.world);
+            let mut actions_taken = vec![];
+            loop {
+                let action_taken =
+                    engine::ai::engine::execute_ai_turn(&mut state.world, active_player_id);
+
+                // イベント処理
+                state.schedule.run(&mut state.world);
+
+                if let Some(action) = action_taken {
+                    actions_taken.push(action);
+                } else {
+                    break;
+                }
+            }
 
             let after_score = engine::ai::eval::evaluate_board(&mut state.world, active_player_id);
 
             Ok(serde_json::json!({
-                "action_taken": action_taken,
+                "actions_taken": actions_taken,
                 "player_id": active_player_id.0,
                 "player_index": active_player_index.0,
                 "before_score": before_score,
