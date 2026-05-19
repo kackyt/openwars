@@ -3,7 +3,7 @@ use crate::systems::{combat, merge, supply, transport};
 use bevy_ecs::prelude::*;
 
 /// ユニットが現在実行可能なアクションをまとめた構造体
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct AvailableActions {
     pub can_attack: bool,
     pub can_capture: bool,
@@ -22,16 +22,7 @@ pub fn get_available_actions(
     is_moved: bool,
 ) -> AvailableActions {
     let Some(u_pos) = world.get::<GridPosition>(unit_entity).copied() else {
-        return AvailableActions {
-            can_attack: false,
-            can_capture: false,
-            can_repair: false,
-            can_supply: false,
-            can_load: false,
-            can_drop: false,
-            can_merge: false,
-            can_wait: false,
-        };
+        return AvailableActions::default();
     };
     get_available_actions_at(world, unit_entity, u_pos, is_moved)
 }
@@ -53,16 +44,7 @@ pub fn get_available_actions_at(
         let (unit_stats, unit_faction) = {
             let mut q_unit = world.query::<(&UnitStats, &Faction)>();
             let Ok((u_stats, u_faction)) = q_unit.get(world, unit_entity) else {
-                return AvailableActions {
-                    can_attack: false,
-                    can_capture: false,
-                    can_repair: false,
-                    can_supply: false,
-                    can_load: false,
-                    can_drop: false,
-                    can_merge: false,
-                    can_wait: false,
-                };
+                return AvailableActions::default();
             };
             (u_stats.clone(), u_faction.0)
         };
