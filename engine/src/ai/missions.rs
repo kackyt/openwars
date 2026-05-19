@@ -124,7 +124,14 @@ pub fn execute_mission_step(
                     if let Some(island) =
                         island_map.islands.iter().find(|i| i.id == target_island_id)
                     {
-                        if let Some(target_pos) = island.tiles.iter().next() {
+                        if let Some(target_pos) = island.tiles.iter().min_by_key(|p| {
+                            (
+                                (p.x as i32 - t_pos.x as i32).abs()
+                                    + (p.y as i32 - t_pos.y as i32).abs(),
+                                p.x,
+                                p.y,
+                            )
+                        }) {
                             let mut best_tile = t_pos;
                             let mut min_dist = (t_pos.x as i32 - target_pos.x as i32).abs()
                                 + (t_pos.y as i32 - target_pos.y as i32).abs();
@@ -235,7 +242,7 @@ pub fn update_mission_phase(world: &mut World, mission: &mut TransportMission) -
             };
             let transporting = world
                 .get::<crate::components::Transporting>(mission.cargo_entity)
-                .is_some();
+                .is_some_and(|t| t.0 == mission.transport_entity);
 
             if loaded || transporting {
                 mission.phase = TransportPhase::Transit;
@@ -275,7 +282,7 @@ pub fn update_mission_phase(world: &mut World, mission: &mut TransportMission) -
             };
             let transporting = world
                 .get::<crate::components::Transporting>(mission.cargo_entity)
-                .is_some();
+                .is_some_and(|t| t.0 == mission.transport_entity);
 
             if !loaded && !transporting {
                 mission.phase = TransportPhase::Return;

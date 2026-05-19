@@ -267,7 +267,10 @@ pub fn decide_ai_action(
             // 歩兵の待機移動ロジック: やることがない歩兵は海岸へ向かう
             let is_infantry = stats.unit_type == crate::resources::UnitType::Infantry
                 || stats.unit_type == crate::resources::UnitType::Mech;
-            if is_infantry && !is_combat_ineffective && is_unit_stranded(world, &pos, player_id, &properties, &enemy_units) {
+            if is_infantry
+                && !is_combat_ineffective
+                && is_unit_stranded(world, &pos, player_id, &properties, &enemy_units)
+            {
                 let mut min_coast_dist = 99;
 
                 // 効率化: 全マス走査を避け、現在位置周辺の限定された範囲で海岸を探す
@@ -889,9 +892,6 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> bool {
     // 1. ユニット行動を1つ決定・実行
     // AI思考ループの中で、エンジン側のフラグが更新されるのを待たずに
     // 同一フレーム内の重複思考を避けるために、リソースで「指示済みユニット」を管理します。
-    // ミッションの割り当てを試行する
-    crate::ai::planner::assign_transport_missions(world, active_player);
-
     let mut skip_entities = std::collections::HashSet::new();
     if let Some(res) = world.get_resource::<AiActionCooldown>() {
         skip_entities = res.0.clone();
@@ -914,6 +914,9 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> bool {
         }
         world.insert_resource(manager);
     }
+
+    // クリーンアップ後の状態を基に、新規ミッションを割り当てる
+    crate::ai::planner::assign_transport_missions(world, active_player);
 
     let mission_cmd_and_entity = if let Some(manager) =
         world.get_resource::<crate::ai::missions::TransportMissionManager>()
@@ -1989,5 +1992,276 @@ mod tests {
         } else {
             panic!("Expected Wait command for taxi-back, got {:?}", action);
         }
+    }
+
+    #[test]
+    fn test_is_unit_stranded_coast_attraction() {
+        let mut world = World::new();
+        let mut damage_chart = DamageChart::new();
+        damage_chart.insert_damage(UnitType::Infantry, UnitType::Infantry, 55);
+        world.insert_resource(damage_chart);
+
+        // 5x5のマップ。左上の3x3が陸地、それ以外は海
+        // (0,0) ~ (2,2) は Plains、それ以外は Sea
+        let mut tiles = vec![Terrain::Sea; 25];
+        for y in 0..3 {
+            for x in 0..3 {
+                tiles[y * 5 + x] = Terrain::Plains;
+            }
+        }
+
+        let map = Map {
+            width: 5,
+            height: 5,
+            tiles,
+            topology: crate::resources::GridTopology::Square,
+        };
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        world.insert_resource(map);
+        world.insert_resource(island_map);
+
+        crate::resources::master_data::MasterDataRegistry::load()
+            .map(|m| world.insert_resource(m))
+            .unwrap();
+
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+
+        // 孤立した歩兵を (1,1) に配置。周囲は海に接する Plains
+        let infantry = world
+            .spawn((
+                p1,
+                Faction(p1),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 1, y: 1 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    cost: 1000,
+                    max_movement: 1, // 移動力1
+                    movement_type: crate::resources::MovementType::Infantry,
+                    can_capture: true,
+                    min_range: 1,
+                    max_range: 1,
+                    max_ammo1: 10,
+                    max_ammo2: 10,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                crate::components::Ammo {
+                    ammo1: 10,
+                    max_ammo1: 10,
+                    ammo2: 10,
+                    max_ammo2: 10,
+                },
+            ))
+            .id();
+
+        // 1. 敵や建物が他にない場合（孤立状態）
+        // (1,1) にいる歩兵は海に隣接するマス（例: (0,1), (1,0), (1,2), (2,1)）のいずれかに移動して待機するはず。
+        // なぜなら (1,1) は海に隣接しておらず、海までの距離が2だが、
+        // 周囲4マスは海に隣接しており距離1だからである。
+        let skips = std::collections::HashSet::new();
+        let action = decide_ai_action(&mut world, p1, &skips);
+        assert!(action.is_some());
+        if let Some((entity, AiCommand::Wait { target_pos })) = action {
+            assert_eq!(entity, infantry);
+            // (1,1) のままでなく、海に面した隣接マスのいずれかに移動していることを確認
+            let dist = (target_pos.x as i32 - 1).abs() + (target_pos.y as i32 - 1).abs();
+            assert_eq!(dist, 1); // 隣接マスへ移動
+            assert!(target_pos.x < 3 && target_pos.y < 3); // かつ陸地の中
+        } else {
+            panic!("Expected Wait at coast tile, got {:?}", action);
+        }
+
+        // 2. 同じ島に敵ユニットを配置した場合（孤立していない状態）
+        // 敵ユニットを (0,0) に配置
+        let enemy = world
+            .spawn((
+                p2,
+                Faction(p2),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 0, y: 0 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    cost: 1000,
+                    max_movement: 3,
+                    movement_type: crate::resources::MovementType::Infantry,
+                    max_ammo1: 10,
+                    max_ammo2: 10,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                crate::components::Ammo {
+                    ammo1: 10,
+                    max_ammo1: 10,
+                    ammo2: 10,
+                    max_ammo2: 10,
+                },
+            ))
+            .id();
+
+        // これにより、島には敵がいるため、is_unit_stranded は false になるはず。
+        // 歩兵は敵を攻撃しようとするはず。
+        // (1,1) から (0,1) または (1,0) に移動して (0,0) の敵を攻撃するコマンドになるはず。
+        let action2 = decide_ai_action(&mut world, p1, &skips);
+        assert!(action2.is_some());
+        if let Some((
+            entity,
+            AiCommand::Attack {
+                target_pos,
+                target_entity,
+            },
+        )) = action2
+        {
+            assert_eq!(entity, infantry);
+            assert!(
+                (target_pos.x == 0 && target_pos.y == 1)
+                    || (target_pos.x == 1 && target_pos.y == 0)
+            );
+            assert_eq!(target_entity, enemy);
+        } else {
+            panic!("Expected Attack command on enemy, got {:?}", action2);
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_ai_mission_priority_and_cooldown() {
+        let mut world = World::new();
+        world.insert_resource(DamageChart::new());
+
+        // 5x5の平地マップ
+        let map = Map {
+            width: 5,
+            height: 5,
+            tiles: vec![Terrain::Plains; 25],
+            topology: crate::resources::GridTopology::Square,
+        };
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        world.insert_resource(map);
+        world.insert_resource(island_map);
+        crate::resources::master_data::MasterDataRegistry::load()
+            .map(|m| world.insert_resource(m))
+            .unwrap();
+
+        // 必要なイベントリソースを登録
+        world.insert_resource(Events::<crate::events::MoveUnitCommand>::default());
+        world.insert_resource(Events::<crate::events::WaitUnitCommand>::default());
+        world.insert_resource(Events::<crate::events::NextPhaseCommand>::default());
+
+        let p1 = PlayerId(1);
+
+        // 1. 輸送機(ヘリ)を(0,0)に配置
+        let heli = world
+            .spawn((
+                p1,
+                Faction(p1),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 0, y: 0 },
+                UnitStats {
+                    unit_type: UnitType::TransportHelicopter,
+                    max_movement: 6,
+                    movement_type: crate::resources::MovementType::Air,
+                    max_cargo: 1,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+            ))
+            .id();
+
+        // 2. 歩兵を(3,0)に配置
+        let infantry = world
+            .spawn((
+                p1,
+                Faction(p1),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 3, y: 0 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    cost: 1000,
+                    max_movement: 3,
+                    movement_type: crate::resources::MovementType::Infantry,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+            ))
+            .id();
+
+        // 3. ミッションを登録する
+        // phase: Pickup, transport: heli, cargo: infantry
+        let mission = crate::ai::missions::TransportMission {
+            transport_entity: heli,
+            cargo_entity: infantry,
+            phase: crate::ai::missions::TransportPhase::Pickup,
+            target_island: None,
+        };
+        let mut manager = crate::ai::missions::TransportMissionManager::default();
+        manager.missions.push(mission);
+        world.insert_resource(manager);
+
+        // クールダウン用のリソースを登録
+        world.insert_resource(AiActionCooldown(std::collections::HashSet::new()));
+
+        // 4. execute_ai_turn を呼び出す (1回目)
+        // ミッション優先実行により、ヘリが歩兵(3,0)へ向かうコマンドが実行され、trueが返るはず。
+        let result1 = execute_ai_turn(&mut world, p1);
+        assert!(result1);
+
+        // 5. ヘリが AiActionCooldown に追加されていることを確認
+        let cooldown = world.get_resource::<AiActionCooldown>().unwrap();
+        assert!(cooldown.0.contains(&heli));
+
+        // イベントが送られていることを確認
+        let move_events = world
+            .get_resource::<Events<crate::events::MoveUnitCommand>>()
+            .unwrap();
+        let mut reader = move_events.get_reader();
+        let sent_move = reader.read(move_events).next();
+        assert!(sent_move.is_some());
+        let move_cmd = sent_move.unwrap();
+        assert_eq!(move_cmd.unit_entity, heli);
+        // ヘリが (0, 0) から右方向 (x > 0) の歩兵 (3, 0) に向けて移動を開始したことを検証する
+        assert!(move_cmd.target_x > 0 && move_cmd.target_x < 5);
+        assert_eq!(move_cmd.target_y, 0);
+
+        // 6. 同一ターン内での2回目の execute_ai_turn 呼び出し
+        // ヘリは cooldown のため無視される。
+        let _result2 = execute_ai_turn(&mut world, p1);
+
+        // cooldown リソースを確認し、ヘリがクールダウン中に留まっていること
+        let cooldown2 = world.get_resource::<AiActionCooldown>().unwrap();
+        assert!(cooldown2.0.contains(&heli));
     }
 }

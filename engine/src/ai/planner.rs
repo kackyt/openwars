@@ -70,9 +70,11 @@ pub fn assign_transport_missions(world: &mut World, player_id: PlayerId) {
             }
         }
 
-        if base_count > 0 {
-            base_center_x /= base_count;
-            base_center_y /= base_count;
+        if let Some(div_x) = base_center_x.checked_div(base_count) {
+            base_center_x = div_x;
+        }
+        if let Some(div_y) = base_center_y.checked_div(base_count) {
+            base_center_y = div_y;
         }
 
         for target_id in target_islands {
@@ -93,9 +95,11 @@ pub fn assign_transport_missions(world: &mut World, player_id: PlayerId) {
                     }
                 }
 
-                if target_prop_count > 0 {
-                    target_center_x /= target_prop_count;
-                    target_center_y /= target_prop_count;
+                if let Some(div_x) = target_center_x.checked_div(target_prop_count) {
+                    target_center_x = div_x;
+                }
+                if let Some(div_y) = target_center_y.checked_div(target_prop_count) {
+                    target_center_y = div_y;
                 }
 
                 // 自軍重心からのマンハッタン距離をペナルティとして計算（遠いほど優先度減）
@@ -113,7 +117,7 @@ pub fn assign_transport_missions(world: &mut World, player_id: PlayerId) {
     }
 
     // スコア降順でソート
-    objectives.sort_by(|a, b| b.priority_score.cmp(&a.priority_score));
+    objectives.sort_by_key(|b| std::cmp::Reverse(b.priority_score));
 
     // 3. フリーなユニットの収集
     let mut free_transports = Vec::new();
