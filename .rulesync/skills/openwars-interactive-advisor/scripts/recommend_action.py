@@ -18,6 +18,9 @@ def analyze_board():
     except FileNotFoundError:
         print(f"Error: {BOARD_STATE_PATH} not found.", file=sys.stderr)
         sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"Error: invalid JSON in {BOARD_STATE_PATH}: {e}", file=sys.stderr)
+        sys.exit(1)
 
     turn = board_state.get('turn', 1)
     active_player_index = board_state.get('active_player_index', 0)
@@ -25,7 +28,7 @@ def analyze_board():
     units = board_state.get('units', [])
     properties = board_state.get('properties', [])
 
-    if not players or active_player_index >= len(players):
+    if not players or not (0 <= active_player_index < len(players)):
         active_player_id = 0
     else:
         active_player_id = players[active_player_index].get('player_id', 0)
@@ -161,13 +164,13 @@ def analyze_board():
                     valid_candidates.sort(key=lambda coord: get_manhattan_distance(ux, uy, coord[0], coord[1]))
                     target_x, target_y = valid_candidates[0]
                 else:
-                    # 空きマスがない場合はフォールバックとして最も近い隣接セルを選択
-                    candidates.sort(key=lambda coord: get_manhattan_distance(ux, uy, coord[0], coord[1]))
-                    bounded = [(cx, cy) for cx, cy in candidates if 0 <= cx <= max_x and 0 <= cy <= max_y]
-                    if bounded:
-                        target_x, target_y = bounded[0]
-                    else:
-                        target_x, target_y = candidates[0]
+                    # 有効な移動先がないため待機にフォールバック
+                    action_rec["action_type"] = "Wait"
+                    action_rec["target_x"] = ux
+                    action_rec["target_y"] = uy
+                    action_rec["explanation"] = "攻撃可能位置への移動先がないため、待機を推奨します。"
+                    recommendations.append(action_rec)
+                    continue
 
             action_rec["action_type"] = "MoveAndAttack"
             action_rec["target_x"] = target_x
