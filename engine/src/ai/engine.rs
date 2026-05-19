@@ -939,6 +939,7 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> Option<Str
     };
 
     if let Some((entity, cmd)) = mission_cmd_and_entity {
+        let cmd_str = format!("{:?}", cmd);
         execute_ai_command(world, entity, cmd);
         if let Some(mut res) = world.get_resource_mut::<AiActionCooldown>() {
             res.0.insert(entity);
@@ -947,7 +948,7 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> Option<Str
             set.insert(entity);
             world.insert_resource(AiActionCooldown(set));
         }
-        return true;
+        return Some(cmd_str);
     }
     if let Some((entity, command)) = decide_ai_action(world, active_player, &skip_entities) {
         let cmd_str = format!("{:?}", command);
@@ -2237,9 +2238,9 @@ mod tests {
         world.insert_resource(AiActionCooldown(std::collections::HashSet::new()));
 
         // 4. execute_ai_turn を呼び出す (1回目)
-        // ミッション優先実行により、ヘリが歩兵(3,0)へ向かうコマンドが実行され、trueが返るはず。
+        // ミッション優先実行により、ヘリが歩兵(3,0)へ向かうコマンドが実行され、Someが返るはず。
         let result1 = execute_ai_turn(&mut world, p1);
-        assert!(result1);
+        assert!(result1.is_some());
 
         // 5. ヘリが AiActionCooldown に追加されていることを確認
         let cooldown = world.get_resource::<AiActionCooldown>().unwrap();
