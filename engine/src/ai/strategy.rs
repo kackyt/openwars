@@ -78,6 +78,12 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
         .cloned()
         .unwrap_or_else(|| crate::ai::islands::IslandMap::analyze(&map));
 
+    let mut allowed_islands = std::collections::HashMap::new();
+    for island in &island_map.islands {
+        let allowed = crate::ai::planner::is_invasion_allowed(world, player_id, island.id, island);
+        allowed_islands.insert(island.id, allowed);
+    }
+
     let get_island_id =
         |pos: &GridPosition| -> Option<usize> { island_map.get_island_at(pos).map(|i| i.id.0) };
 
@@ -284,24 +290,6 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
         strategy.capture_demand = 0;
     }
 
-    let current_capacity: u32 = my_units.iter().map(|(_, s)| s.max_cargo).sum();
-    // 海上輸送需要については、海軍ユニットのみをカウントする
-    strategy.existing_transport_count = my_units
-        .iter()
-        .filter(|(_, s)| s.max_cargo > 0 && s.movement_type == MovementType::Ship)
-        .count();
-
-    // 輸送需要の計算: transport_candidates（実際に停滞しているユニット）の数に基づく
-    strategy.transport_demand = (strategy.transport_candidates.len() as u32)
-        .saturating_sub(current_capacity)
-        .max(
-            if !strategy.transport_candidates.is_empty() && current_capacity == 0 {
-                1
-            } else {
-                0
-            },
-        );
-
     // 包括的需要マトリクスの計算
     // 自軍・敵軍の状況から、占領脅威・消耗ギャップを数値化した需要ベクトル。
     {
@@ -347,6 +335,20 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                     let mut blocked_by_sea = false;
 
                     for target in &strategy.priority_targets {
+                        // ターゲットがある島を取得し、侵攻が許可されているかチェック
+                        if let Some(target_island_id) =
+                            island_map.get_island_at(target).map(|i| i.id)
+                        {
+                            let allowed = allowed_islands
+                                .get(&target_island_id)
+                                .cloned()
+                                .unwrap_or(true);
+                            // 侵攻が許可されていない島は、海を越える輸送のターゲットとして考慮しない
+                            if !allowed {
+                                continue;
+                            }
+                        }
+
                         let dist = (pos.x as i32 - target.x as i32).abs()
                             + (pos.y as i32 - target.y as i32).abs();
                         if dist < min_dist {
@@ -388,6 +390,24 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                     }
                 }
             }
+
+            let current_capacity: u32 = my_units.iter().map(|(_, s)| s.max_cargo).sum();
+            // 海上輸送需要については、海軍ユニットのみをカウントする
+            strategy.existing_transport_count = my_units
+                .iter()
+                .filter(|(_, s)| s.max_cargo > 0 && s.movement_type == MovementType::Ship)
+                .count();
+
+            // 輸送需要の計算: transport_candidates（実際に停滞しているユニット）の数に基づく
+            strategy.transport_demand = (strategy.transport_candidates.len() as u32)
+                .saturating_sub(current_capacity)
+                .max(
+                    if !strategy.transport_candidates.is_empty() && current_capacity == 0 {
+                        1
+                    } else {
+                        0
+                    },
+                );
         }
     }
 
@@ -396,8 +416,7 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
     let mut island_has_enemy = std::collections::HashSet::new();
     #[allow(clippy::collapsible_if)]
     for (e_pos, e_stats) in &enemy_units {
-        if e_stats.movement_type != MovementType::Air
-            && e_stats.movement_type != MovementType::Ship
+        if e_stats.movement_type != MovementType::Air && e_stats.movement_type != MovementType::Ship
         {
             if let Some(island_id) = get_island_id(e_pos) {
                 island_has_enemy.insert(island_id);

@@ -98,20 +98,61 @@ impl IslandMap {
                 }
             }
 
-            // 自軍の拠点が1つでもあればBase Islandとみなす（より厳密には生産拠点等で判定してもよい）
+            // 自軍の拠点が1つでもあればBase Islandとみなす
             if has_own_property {
                 base_islands.push(island.id);
-                // 敵の拠点も混在している場合はTarget Islandとしても扱うか？
-                // ここでは侵攻先という意味で、他勢力・中立の拠点があるならTargetにも入れる
-                if has_other_property {
-                    target_islands.push(island.id);
-                }
-            } else if has_other_property {
-                // 自軍拠点がなく、他勢力・中立の拠点があるなら完全なTarget Island
+            }
+
+            // 他勢力や中立の未占領拠点があるならTarget Islandとしても扱う
+            // （本島であっても、非常に遠い拠点への輸送は有効であるため、一律排除せず距離コストで判定する）
+            if has_other_property {
                 target_islands.push(island.id);
             }
         }
 
         (base_islands, target_islands)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resources::master_data::MasterDataRegistry;
+    use crate::resources::{Map, Terrain};
+
+    #[test]
+    #[ignore]
+    fn test_print_map_3_islands() {
+        let registry = MasterDataRegistry::load().unwrap();
+        let map_data = registry.get_map("map_3").unwrap();
+
+        let mut ecs_map = Map::new(
+            map_data.width,
+            map_data.height,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        for y in 0..map_data.height {
+            for x in 0..map_data.width {
+                if let Some(cell) = map_data.get_cell(x, y) {
+                    let terrain = registry.terrain_from_id(cell.terrain_id).unwrap();
+                    let _ = ecs_map.set_terrain(x, y, terrain);
+                }
+            }
+        }
+
+        let island_map = IslandMap::analyze(&ecs_map);
+        println!("=== map_3 ISLANDS ANALYSIS ===");
+        for island in &island_map.islands {
+            for tile in &island.tiles {
+                if tile.x == 7 && tile.y == 6 {
+                    println!("  FOUND (7, 6) in Island {:?}", island.id);
+                }
+                if tile.x == 8 && tile.y == 6 {
+                    println!("  FOUND (8, 6) in Island {:?}", island.id);
+                }
+            }
+        }
+        panic!("Show stdout");
     }
 }

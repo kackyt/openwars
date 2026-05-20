@@ -609,147 +609,6 @@ pub fn decide_ai_action(
                     }
                 }
             }
-
-            // (D) Load
-            if actions.can_load {
-                let transports = crate::systems::transport::get_loadable_transports_at(
-                    world,
-                    unit_entity,
-                    current_grid,
-                );
-                for transport_entity in transports {
-                    // 目的地までの距離が遠いほど、搭載する価値が高まる
-                    let mut min_objective_dist = 99;
-                    for (p_pos, _, p_owner) in &properties {
-                        if *p_owner != Some(player_id) {
-                            let d = (current_grid.x as i32 - p_pos.x as i32).abs()
-                                + (current_grid.y as i32 - p_pos.y as i32).abs();
-                            if d < min_objective_dist {
-                                min_objective_dist = d;
-                            }
-                        }
-                    }
-
-                    let mut load_score = 2000;
-                    if min_objective_dist > 5 {
-                        load_score += 3000; // 遠い場合は積極的に乗る
-                    }
-                    if stats.can_capture && min_objective_dist > 8 {
-                        load_score += 2000; // 占領可能な歩兵は特に遠い場合に優先
-                    }
-
-                    let score = base_tile_score + load_score;
-                    #[allow(clippy::collapsible_if)]
-                    if score > best_unit_score {
-                        best_unit_score = score;
-                        best_unit_choice = Some(AiCommand::Load {
-                            transport_entity,
-                            target_pos: current_grid,
-                        });
-                    }
-                }
-            }
-
-            // (E) Drop
-            if actions.can_drop {
-                #[allow(clippy::collapsible_if)]
-                if let Ok(cargo) = world
-                    .query::<&crate::components::CargoCapacity>()
-                    .get(world, unit_entity)
-                {
-                    let cargo_entities = cargo.loaded.clone();
-                    for cargo_entity in cargo_entities {
-                        // 未行動のユニットのみ降ろす
-                        if let Some(action) =
-                            world.get::<crate::components::ActionCompleted>(cargo_entity)
-                        {
-                            #[allow(clippy::collapsible_if)]
-                            if !action.0 {
-                                // 降車可能なマスを探索
-                                if let Some(cargo_unit_type) =
-                                    world.get::<UnitStats>(cargo_entity).map(|s| s.unit_type)
-                                {
-                                    let drop_tiles = crate::systems::transport::get_droppable_tiles(
-                                        world,
-                                        unit_entity,
-                                        cargo_entity,
-                                    );
-                                    for drop_tile in drop_tiles {
-                                        let drop_pos = GridPosition {
-                                            x: drop_tile.0,
-                                            y: drop_tile.1,
-                                        };
-
-                                        // 降車先の価値を評価
-                                        let mut drop_score: i32 = 5000; // 基本的に降ろすのは良いこと
-
-                                        // 降車先が拠点ならボーナス
-                                        for (p_pos, _, p_owner) in &properties {
-                                            if p_pos.x == drop_pos.x && p_pos.y == drop_pos.y {
-                                                if *p_owner != Some(player_id) {
-                                                    drop_score += 3000; // 敵拠点の占領準備
-                                                }
-                                                break;
-                                            }
-                                        }
-
-                                        // 敵との距離と危険度を評価
-                                        let mut min_enemy_dist = 99;
-                                        let mut max_threat = 0;
-                                        for (e_pos, e_unit_type, _, _, e_min_range, e_max_range) in
-                                            &enemy_units
-                                        {
-                                            let d = (drop_pos.x as i32 - e_pos.x as i32).abs()
-                                                + (drop_pos.y as i32 - e_pos.y as i32).abs();
-                                            if d < min_enemy_dist {
-                                                min_enemy_dist = d;
-                                            }
-                                            // 敵の攻撃範囲（射程内）なら脅威を計算
-                                            // 間接攻撃ユニットの死角を考慮するため、最小射程もチェックする
-                                            if d >= *e_min_range as i32 && d <= *e_max_range as i32
-                                            {
-                                                if let Some(dmg) = damage_chart
-                                                    .get_base_damage(*e_unit_type, cargo_unit_type)
-                                                {
-                                                    if dmg > max_threat {
-                                                        max_threat = dmg;
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        // 脅威度に応じた動的なペナルティ
-                                        // ダメージ期待値が50%を超えるような無謀な降車は避ける
-                                        if max_threat > 50 {
-                                            drop_score = drop_score.saturating_sub(4000);
-                                        } else if max_threat > 20 {
-                                            drop_score = drop_score.saturating_sub(1500);
-                                        } else if max_threat > 0 {
-                                            drop_score = drop_score.saturating_sub(500);
-                                        }
-
-                                        // 敵が近く、かつ安全ならボーナス（次ターン攻撃用）
-                                        if max_threat == 0 && (1..=3).contains(&min_enemy_dist) {
-                                            drop_score += 2000;
-                                        }
-
-                                        let score = base_tile_score + drop_score;
-                                        #[allow(clippy::collapsible_if)]
-                                        if score > best_unit_score {
-                                            best_unit_score = score;
-                                            best_unit_choice = Some(AiCommand::Drop {
-                                                transport_target_pos: current_grid,
-                                                cargo_drop_pos: drop_pos,
-                                                cargo_entity,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
         }
 
         #[allow(clippy::collapsible_if)]
@@ -928,18 +787,39 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> Option<Str
     // クリーンアップ後の状態を基に、新規ミッションを割り当てる
     crate::ai::planner::assign_transport_missions(world, active_player);
 
+    // ミッションに関与している全Entity（輸送機と歩兵）を収集し、通常の意思決定から完全に除外する
+    let mut mission_entities = std::collections::HashSet::new();
+    if let Some(manager) = world.get_resource::<crate::ai::missions::TransportMissionManager>() {
+        for m in &manager.missions {
+            if world
+                .get::<Faction>(m.transport_entity)
+                .is_some_and(|f| f.0 == active_player)
+            {
+                mission_entities.insert(m.transport_entity);
+                mission_entities.insert(m.cargo_entity);
+            }
+        }
+    }
+
     let mission_cmd_and_entity = if let Some(manager) =
         world.get_resource::<crate::ai::missions::TransportMissionManager>()
     {
         let missions = manager.missions.clone();
         missions.into_iter().find_map(|m| {
-            if !skip_entities.contains(&m.transport_entity)
-                && world
-                    .get::<Faction>(m.transport_entity)
-                    .is_some_and(|f| f.0 == active_player)
+            if world
+                .get::<Faction>(m.transport_entity)
+                .is_some_and(|f| f.0 == active_player)
             {
-                crate::ai::missions::execute_mission_step(world, &m)
-                    .map(|cmd| (m.transport_entity, cmd))
+                if let Some((entity, cmd)) = crate::ai::missions::execute_mission_step(world, &m) {
+                    // コマンド実行主体が冷却中（今ターン指示済み）でないかチェック
+                    if !skip_entities.contains(&entity) {
+                        Some((entity, cmd))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -960,7 +840,12 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> Option<Str
         }
         return Some(cmd_str);
     }
-    if let Some((entity, command)) = decide_ai_action(world, active_player, &skip_entities) {
+
+    // 通常の意思決定を行う際には、ミッション中ユニット（mission_entities）も skip_entities に追加して除外する
+    let mut decide_skip_entities = skip_entities.clone();
+    decide_skip_entities.extend(mission_entities);
+
+    if let Some((entity, command)) = decide_ai_action(world, active_player, &decide_skip_entities) {
         let cmd_str = format!("{:?}", command);
         execute_ai_command(world, entity, command);
 
@@ -1622,9 +1507,8 @@ mod tests {
 
         assert!(action.is_some());
         let (_ent, cmd) = action.unwrap();
-        match cmd {
-            AiCommand::Load { .. } => {}
-            other => panic!("Expected Load command, got {:?}", other),
+        if let AiCommand::Load { .. } = cmd {
+            panic!("Expected Load command to be completely removed from normal decision making")
         }
     }
 
@@ -1712,19 +1596,8 @@ mod tests {
 
         assert!(action.is_some());
         let (_ent, cmd) = action.unwrap();
-        match cmd {
-            AiCommand::Drop {
-                transport_target_pos,
-                cargo_drop_pos,
-                cargo_entity,
-            } => {
-                assert_eq!(cargo_entity, inf);
-                assert_eq!(transport_target_pos.x, 1);
-                assert_eq!(transport_target_pos.y, 1);
-                assert_eq!(cargo_drop_pos.x, 1);
-                assert_eq!(cargo_drop_pos.y, 2);
-            }
-            other => panic!("Expected Drop command, got {:?}", other),
+        if let AiCommand::Drop { .. } = cmd {
+            panic!("Expected Drop command to be completely removed from normal decision making")
         }
     }
 

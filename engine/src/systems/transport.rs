@@ -327,6 +327,32 @@ pub fn unload_unit_system(
             continue;
         }
 
+        let mut has_active_cargo = false;
+        let mut loaded_units = Vec::new();
+
+        // 1. まず輸送ユニットの loaded リスト（から今回の cargo を除いたもの）を取得する
+        if let Some(cap) = set.p0().get(event.transport_entity).ok().and_then(|t| t.4) {
+            loaded_units = cap
+                .loaded
+                .iter()
+                .filter(|&&e| e != event.cargo_entity)
+                .copied()
+                .collect();
+        }
+
+        // 2. set.p0() の借用は終わったので、set.p1() を安全に使える！
+        if !loaded_units.is_empty() {
+            let q_action = set.p1();
+            has_active_cargo = loaded_units.iter().any(|&e| {
+                if let Ok(action_completed) = q_action.get(e) {
+                    !action_completed.0
+                } else {
+                    false
+                }
+            });
+        }
+
+        // 3. 最後に、可変更新を行う（set.p0() を再度 mutable 借用）
         let mut q_units = set.p0();
         if let Ok([mut transport, mut cargo]) =
             q_units.get_many_mut([event.transport_entity, event.cargo_entity])
@@ -335,9 +361,9 @@ pub fn unload_unit_system(
                 cap.loaded.retain(|&e| e != event.cargo_entity);
             }
 
-            // はじめて降車した時点で、輸送ユニットを行動済みにする
-            // これによりUIでグレーアウトされ、移動のキャンセルもできなくなる
-            transport.3.0 = true;
+            if !has_active_cargo {
+                transport.3.0 = true;
+            }
 
             cargo.1.x = event.target_x;
             cargo.1.y = event.target_y;
@@ -851,8 +877,8 @@ mod tests {
         });
         schedule.run(&mut world);
 
-        // 1人目を降ろした時点で、輸送ユニットは行動済みになる（仕様）
-        assert!(world.get::<ActionCompleted>(transport_entity).unwrap().0);
+        // 1人目を降ろした時点（まだ未行動の歩兵が残っている）では、輸送ユニットは行動済みにならない
+        assert!(!world.get::<ActionCompleted>(transport_entity).unwrap().0);
         assert_eq!(
             world
                 .get::<CargoCapacity>(transport_entity)

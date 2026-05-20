@@ -31,10 +31,63 @@ pub struct TransportMissionManager {
     pub missions: Vec<TransportMission>,
 }
 
+/// 輸送ユニットの移動タイプに応じて、目標島に対する最適な目的地タイルを返します。
+/// 航空ユニットの場合は、島の中で最も現在地に最も近いタイルを直接ターゲットにします。
+/// 船舶ユニット（Landerなど）の場合は、島内の陸地タイルに隣接し、かつ船舶が進入可能な海・港タイルの中から
+/// 最も現在地に最も近いものをターゲット（接岸可能タイル）として返します。
+fn get_target_position_for_island(
+    map: &Map,
+    registry: &MasterDataRegistry,
+    island: &crate::ai::islands::Island,
+    t_pos: GridPosition,
+    movement_type: crate::resources::MovementType,
+) -> Option<GridPosition> {
+    if movement_type == crate::resources::MovementType::Ship {
+        let mut best_dock_tile = None;
+        let mut min_dist = 9999;
+
+        for tile in &island.tiles {
+            // 隣接4マスを取得
+            for (ax, ay) in map.get_adjacent(tile.x, tile.y) {
+                if let Some(terrain) = map.get_terrain(ax, ay) {
+                    // 船舶が進入可能（移動コスト < 99）かチェック
+                    if crate::systems::movement::get_valid_movement_cost(
+                        registry,
+                        movement_type,
+                        terrain,
+                    )
+                    .is_some()
+                    {
+                        let dist =
+                            (ax as i32 - t_pos.x as i32).abs() + (ay as i32 - t_pos.y as i32).abs();
+                        if dist < min_dist {
+                            min_dist = dist;
+                            best_dock_tile = Some(GridPosition { x: ax, y: ay });
+                        }
+                    }
+                }
+            }
+        }
+        best_dock_tile
+    } else {
+        island
+            .tiles
+            .iter()
+            .min_by_key(|p| {
+                (
+                    (p.x as i32 - t_pos.x as i32).abs() + (p.y as i32 - t_pos.y as i32).abs(),
+                    p.x,
+                    p.y,
+                )
+            })
+            .cloned()
+    }
+}
+
 pub fn execute_mission_step(
     world: &mut World,
     mission: &TransportMission,
-) -> Option<super::engine::AiCommand> {
+) -> Option<(Entity, super::engine::AiCommand)> {
     // 輸送機の基本情報を取得
     let (t_pos, t_stats, t_fuel, t_faction) = {
         let t_pos = world
@@ -79,44 +132,62 @@ pub fn execute_mission_step(
         }
     }
 
-    let map = world.resource::<Map>();
-    let registry = world.resource::<MasterDataRegistry>();
-
-    let reachable = calculate_reachable_tiles(
-        map,
-        &unit_positions,
-        (t_pos.x, t_pos.y),
-        t_stats.movement_type,
-        t_stats.max_movement,
-        t_fuel,
-        t_faction,
-        t_stats.unit_type,
-        registry,
-    );
+    let reachable = {
+        let map = world.resource::<Map>();
+        let registry = world.resource::<MasterDataRegistry>();
+        calculate_reachable_tiles(
+            map,
+            &unit_positions,
+            (t_pos.x, t_pos.y),
+            t_stats.movement_type,
+            t_stats.max_movement,
+            t_fuel,
+            t_faction,
+            t_stats.unit_type,
+            registry,
+        )
+    };
 
     match mission.phase {
         TransportPhase::Pickup => {
             let cargo_pos = world.get::<GridPosition>(mission.cargo_entity).cloned()?;
 
-            // 対象の歩兵の現在位置に最も近いタイルへ移動して待機する
-            let mut best_tile = t_pos;
-            let mut min_dist = (t_pos.x as i32 - cargo_pos.x as i32).abs()
+            // ヘリと歩兵の距離を計算
+            let dist = (t_pos.x as i32 - cargo_pos.x as i32).abs()
                 + (t_pos.y as i32 - cargo_pos.y as i32).abs();
 
-            for target_tile in &reachable {
-                let dist = (target_tile.0 as i32 - cargo_pos.x as i32).abs()
-                    + (target_tile.1 as i32 - cargo_pos.y as i32).abs();
-                if dist < min_dist {
-                    min_dist = dist;
-                    best_tile = GridPosition {
-                        x: target_tile.0,
-                        y: target_tile.1,
-                    };
+            if dist <= 1 {
+                // 隣接または同マスの場合は、歩兵(cargo_entity)がヘリの現在位置に移動して乗り込む(Load)
+                return Some((
+                    mission.cargo_entity,
+                    super::engine::AiCommand::Load {
+                        transport_entity: mission.transport_entity,
+                        target_pos: t_pos,
+                    },
+                ));
+            } else {
+                // 離れている場合は、ヘリ(transport_entity)が歩兵に向かって移動する(Wait)
+                let mut best_tile = t_pos;
+                let mut min_dist = dist;
+
+                for target_tile in &reachable {
+                    let d = (target_tile.0 as i32 - cargo_pos.x as i32).abs()
+                        + (target_tile.1 as i32 - cargo_pos.y as i32).abs();
+                    if d < min_dist {
+                        min_dist = d;
+                        best_tile = GridPosition {
+                            x: target_tile.0,
+                            y: target_tile.1,
+                        };
+                    }
                 }
+                return Some((
+                    mission.transport_entity,
+                    super::engine::AiCommand::Wait {
+                        target_pos: best_tile,
+                    },
+                ));
             }
-            return Some(super::engine::AiCommand::Wait {
-                target_pos: best_tile,
-            });
         }
         TransportPhase::Transit => {
             if let Some(target_island_id) = mission.target_island {
@@ -124,14 +195,15 @@ pub fn execute_mission_step(
                     if let Some(island) =
                         island_map.islands.iter().find(|i| i.id == target_island_id)
                     {
-                        if let Some(target_pos) = island.tiles.iter().min_by_key(|p| {
-                            (
-                                (p.x as i32 - t_pos.x as i32).abs()
-                                    + (p.y as i32 - t_pos.y as i32).abs(),
-                                p.x,
-                                p.y,
-                            )
-                        }) {
+                        let map = world.resource::<Map>();
+                        let registry = world.resource::<MasterDataRegistry>();
+                        if let Some(target_pos) = get_target_position_for_island(
+                            map,
+                            registry,
+                            island,
+                            t_pos,
+                            t_stats.movement_type,
+                        ) {
                             let mut best_tile = t_pos;
                             let mut min_dist = (t_pos.x as i32 - target_pos.x as i32).abs()
                                 + (t_pos.y as i32 - target_pos.y as i32).abs();
@@ -147,9 +219,12 @@ pub fn execute_mission_step(
                                     };
                                 }
                             }
-                            return Some(super::engine::AiCommand::Wait {
-                                target_pos: best_tile,
-                            });
+                            return Some((
+                                mission.transport_entity,
+                                super::engine::AiCommand::Wait {
+                                    target_pos: best_tile,
+                                },
+                            ));
                         }
                     }
                 }
@@ -163,14 +238,17 @@ pub fn execute_mission_step(
                 mission.cargo_entity,
             );
             if let Some(drop_tile) = drop_tiles.first() {
-                return Some(super::engine::AiCommand::Drop {
-                    transport_target_pos: t_pos,
-                    cargo_drop_pos: GridPosition {
-                        x: drop_tile.0,
-                        y: drop_tile.1,
+                return Some((
+                    mission.transport_entity,
+                    super::engine::AiCommand::Drop {
+                        transport_target_pos: t_pos,
+                        cargo_drop_pos: GridPosition {
+                            x: drop_tile.0,
+                            y: drop_tile.1,
+                        },
+                        cargo_entity: mission.cargo_entity,
                     },
-                    cargo_entity: mission.cargo_entity,
-                });
+                ));
             } else {
                 // 現在位置から降ろせない場合、降車可能な移動先を探す
                 let mut best_drop_tile_pair = None;
@@ -202,11 +280,14 @@ pub fn execute_mission_step(
                 }
 
                 if let Some((trans_pos, drop_pos)) = best_drop_tile_pair {
-                    return Some(super::engine::AiCommand::Drop {
-                        transport_target_pos: trans_pos,
-                        cargo_drop_pos: drop_pos,
-                        cargo_entity: mission.cargo_entity,
-                    });
+                    return Some((
+                        mission.transport_entity,
+                        super::engine::AiCommand::Drop {
+                            transport_target_pos: trans_pos,
+                            cargo_drop_pos: drop_pos,
+                            cargo_entity: mission.cargo_entity,
+                        },
+                    ));
                 }
 
                 // それでも降ろせる場所が見つからない場合は、目標島に向かってとりあえず近づく
@@ -216,14 +297,15 @@ pub fn execute_mission_step(
                         if let Some(island) =
                             island_map.islands.iter().find(|i| i.id == target_island_id)
                         {
-                            if let Some(target_pos) = island.tiles.iter().min_by_key(|p| {
-                                (
-                                    (p.x as i32 - t_pos.x as i32).abs()
-                                        + (p.y as i32 - t_pos.y as i32).abs(),
-                                    p.x,
-                                    p.y,
-                                )
-                            }) {
+                            let map = world.resource::<Map>();
+                            let registry = world.resource::<MasterDataRegistry>();
+                            if let Some(target_pos) = get_target_position_for_island(
+                                map,
+                                registry,
+                                island,
+                                t_pos,
+                                t_stats.movement_type,
+                            ) {
                                 let mut best_tile = t_pos;
                                 let mut min_dist = (t_pos.x as i32 - target_pos.x as i32).abs()
                                     + (t_pos.y as i32 - target_pos.y as i32).abs();
@@ -239,15 +321,21 @@ pub fn execute_mission_step(
                                         };
                                     }
                                 }
-                                return Some(super::engine::AiCommand::Wait {
-                                    target_pos: best_tile,
-                                });
+                                return Some((
+                                    mission.transport_entity,
+                                    super::engine::AiCommand::Wait {
+                                        target_pos: best_tile,
+                                    },
+                                ));
                             }
                         }
                     }
                 }
                 // フォールバック：現在位置で待機
-                return Some(super::engine::AiCommand::Wait { target_pos: t_pos });
+                return Some((
+                    mission.transport_entity,
+                    super::engine::AiCommand::Wait { target_pos: t_pos },
+                ));
             }
         }
         TransportPhase::Return => {
@@ -280,9 +368,12 @@ pub fn execute_mission_step(
                     };
                 }
             }
-            return Some(super::engine::AiCommand::Wait {
-                target_pos: best_tile,
-            });
+            return Some((
+                mission.transport_entity,
+                super::engine::AiCommand::Wait {
+                    target_pos: best_tile,
+                },
+            ));
         }
     }
     None
@@ -334,13 +425,22 @@ pub fn update_mission_phase(world: &mut World, mission: &mut TransportMission) -
                         if let Some(t_pos) =
                             world.get::<GridPosition>(mission.transport_entity).cloned()
                         {
-                            let is_adjacent = island.tiles.iter().any(|tile| {
-                                (tile.x as i32 - t_pos.x as i32).abs()
-                                    + (tile.y as i32 - t_pos.y as i32).abs()
+                            let map = world.resource::<Map>();
+                            let registry = world.resource::<MasterDataRegistry>();
+                            let t_stats = world.get::<UnitStats>(mission.transport_entity).unwrap();
+                            if let Some(target_pos) = get_target_position_for_island(
+                                map,
+                                registry,
+                                island,
+                                t_pos,
+                                t_stats.movement_type,
+                            ) {
+                                if (target_pos.x as i32 - t_pos.x as i32).abs()
+                                    + (target_pos.y as i32 - t_pos.y as i32).abs()
                                     <= 1
-                            });
-                            if is_adjacent {
-                                mission.phase = TransportPhase::Drop;
+                                {
+                                    mission.phase = TransportPhase::Drop;
+                                }
                             }
                         }
                     }
@@ -544,7 +644,7 @@ mod tests {
 
         let cmd = execute_mission_step(&mut world, &mission);
         assert!(cmd.is_some());
-        if let Some(crate::ai::engine::AiCommand::Wait { target_pos }) = cmd {
+        if let Some((_entity, crate::ai::engine::AiCommand::Wait { target_pos })) = cmd {
             // ヘリは (0,0) にいて、歩兵は (2,0) にいる。ヘリは (2,0) に隣接するマス（(1,0), (3,0), (2,1) など）へ向かうべき
             let dist = (target_pos.x as i32 - 2).abs() + (target_pos.y as i32).abs();
             assert_eq!(dist, 1);
@@ -573,7 +673,7 @@ mod tests {
 
         let cmd = execute_mission_step(&mut world, &mission);
         assert!(cmd.is_some());
-        if let Some(crate::ai::engine::AiCommand::Wait { target_pos }) = cmd {
+        if let Some((_entity, crate::ai::engine::AiCommand::Wait { target_pos })) = cmd {
             // (0,0) から (5,5) へ移動可能な最大範囲内で最も近い場所へ向かうはず
             // ヘリの最大移動力は 5 なので、(5,0) などが選ばれるはず（マンハッタン距離で最も近いところ）
             let dist_to_target = (target_pos.x as i32 - 5).abs() + (target_pos.y as i32 - 5).abs();
@@ -605,11 +705,14 @@ mod tests {
 
         let cmd = execute_mission_step(&mut world, &mission);
         assert!(cmd.is_some());
-        if let Some(crate::ai::engine::AiCommand::Drop {
-            transport_target_pos,
-            cargo_drop_pos,
-            cargo_entity,
-        }) = cmd
+        if let Some((
+            _entity,
+            crate::ai::engine::AiCommand::Drop {
+                transport_target_pos,
+                cargo_drop_pos,
+                cargo_entity,
+            },
+        )) = cmd
         {
             assert_eq!(cargo_entity, cargo);
             assert_eq!(transport_target_pos, GridPosition { x: 5, y: 4 });
@@ -648,7 +751,7 @@ mod tests {
 
         let cmd = execute_mission_step(&mut world, &mission);
         assert!(cmd.is_some());
-        if let Some(crate::ai::engine::AiCommand::Wait { target_pos }) = cmd {
+        if let Some((_entity, crate::ai::engine::AiCommand::Wait { target_pos })) = cmd {
             // 降車不可時の Wait フォールバック。現在位置で待機する
             assert_eq!(target_pos.x, 0);
             assert_eq!(target_pos.y, 0);
@@ -680,10 +783,109 @@ mod tests {
 
         let cmd = execute_mission_step(&mut world, &mission);
         assert!(cmd.is_some());
-        if let Some(crate::ai::engine::AiCommand::Wait { target_pos }) = cmd {
+        if let Some((_entity, crate::ai::engine::AiCommand::Wait { target_pos })) = cmd {
             // 拠点 (0,0) に最も近づく方向へ移動するはず
             let dist_to_base = target_pos.x as i32 + target_pos.y as i32;
             assert!(dist_to_base < 10); // 最初(10)より近づいているはず
+        } else {
+            panic!("Expected Wait command, got {:?}", cmd);
+        }
+    }
+
+    #[test]
+    fn test_execute_mission_step_transit_lander() {
+        let mut world = World::new();
+
+        // 船舶ユニットなので、陸(Plains等)には侵入できず、海(Sea)しか進めないマップを作る
+        // (0,0)-(2,0)は海で、(3,0)は平地(陸地)
+        let mut map = Map::new(5, 1, Terrain::Sea, GridTopology::Square);
+        map.set_terrain(3, 0, Terrain::Plains).unwrap();
+        map.set_terrain(4, 0, Terrain::Plains).unwrap();
+        world.insert_resource(map);
+
+        MasterDataRegistry::load()
+            .map(|m| world.insert_resource(m))
+            .unwrap();
+
+        let p1 = PlayerId(1);
+
+        // Lander（船）を (0,0) に配置
+        let transport = world
+            .spawn((
+                p1,
+                Faction(p1),
+                GridPosition { x: 0, y: 0 },
+                UnitStats {
+                    unit_type: crate::resources::UnitType::Lander,
+                    max_movement: 3,
+                    movement_type: crate::resources::MovementType::Ship,
+                    max_fuel: 99,
+                    ..UnitStats::mock()
+                },
+                Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                CargoCapacity {
+                    max: 2,
+                    loaded: vec![],
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+
+        // 積載する歩兵
+        let cargo = world
+            .spawn((
+                p1,
+                Faction(p1),
+                GridPosition { x: 9999, y: 9999 }, // マップ外
+                UnitStats {
+                    unit_type: crate::resources::UnitType::Infantry,
+                    max_movement: 3,
+                    movement_type: crate::resources::MovementType::Infantry,
+                    max_fuel: 99,
+                    ..UnitStats::mock()
+                },
+                Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+
+        // ターゲットの島は (3,0) と (4,0)
+        let island_map = IslandMap {
+            islands: vec![Island {
+                id: IslandId(1),
+                tiles: vec![GridPosition { x: 3, y: 0 }, GridPosition { x: 4, y: 0 }]
+                    .into_iter()
+                    .collect(),
+            }],
+        };
+        world.insert_resource(island_map);
+
+        let mission = TransportMission {
+            transport_entity: transport,
+            cargo_entity: cargo,
+            phase: TransportPhase::Transit,
+            target_island: Some(IslandId(1)),
+        };
+
+        let cmd = execute_mission_step(&mut world, &mission);
+        assert!(cmd.is_some());
+        if let Some((_entity, crate::ai::engine::AiCommand::Wait { target_pos })) = cmd {
+            // 目標島内の陸地 (3,0) 自体ではなく、隣接する海マスである (2,0) をターゲットにし、
+            // 最大移動力 3 の範囲内（(0,0)から(2,0)は距離2）で到達可能なため、(2,0) が移動先となるべき
+            assert_eq!(target_pos.x, 2);
+            assert_eq!(target_pos.y, 0);
         } else {
             panic!("Expected Wait command, got {:?}", cmd);
         }
