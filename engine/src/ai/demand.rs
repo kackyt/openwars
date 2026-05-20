@@ -234,8 +234,13 @@ pub fn compute_demand(
     let gap_ground = (enemy_ground_threat - my_power_vs_ground).max(0.0);
     let gap_sea = (enemy_sea_threat - my_power_vs_sea).max(0.0);
 
-    // 正規化スケール：「1体分の適性値（≒1.0）」を基準とする
-    let unit_scale = 1.0f32.max(normalization_scale / 100.0);
+    // 正規化スケール：「1体分の適性値（≒1.0）」を基準とする。敵の総数が極めて少ない序盤は、戦闘需要に過剰反応しないように scale を底上げする
+    let base_scale = if enemy_units.len() <= 2 {
+        3.0f32 // 敵が少ない場合は3体分に相当するスケールにして需要を抑制
+    } else {
+        1.0f32
+    };
+    let unit_scale = base_scale.max(normalization_scale / 100.0);
 
     let anti_air = (gap_air / unit_scale).clamp(0.0, 1.0);
     let anti_ground = (gap_ground / unit_scale).clamp(0.0, 1.0);

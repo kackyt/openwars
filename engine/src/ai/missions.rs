@@ -156,6 +156,7 @@ pub fn execute_mission_step(
             }
         }
         TransportPhase::Drop => {
+            // 移動せず現在地から降車できる場合
             let drop_tiles = crate::systems::transport::get_droppable_tiles(
                 world,
                 mission.transport_entity,
@@ -163,14 +164,89 @@ pub fn execute_mission_step(
             );
             if let Some(drop_tile) = drop_tiles.first() {
                 return Some(super::engine::AiCommand::Drop {
-                    target_pos: GridPosition {
+                    transport_target_pos: t_pos,
+                    cargo_drop_pos: GridPosition {
                         x: drop_tile.0,
                         y: drop_tile.1,
                     },
                     cargo_entity: mission.cargo_entity,
                 });
             } else {
-                // 降ろせる場所がない場合は、待機して機を伺う
+                // 現在位置から降ろせない場合、降車可能な移動先を探す
+                let mut best_drop_tile_pair = None;
+                let mut min_drop_dist = 9999;
+
+                for &(rx, ry) in &reachable {
+                    let test_pos = GridPosition { x: rx, y: ry };
+                    let drop_targets = crate::systems::transport::get_droppable_tiles_at(
+                        world,
+                        mission.transport_entity,
+                        mission.cargo_entity,
+                        test_pos,
+                    );
+                    if let Some(drop_target) = drop_targets.first() {
+                        let dist =
+                            (rx as i32 - t_pos.x as i32).abs() + (ry as i32 - t_pos.y as i32).abs();
+                        // 可能な限り移動距離が少ない（または目標に近い）ものを選ぶが、ここでは距離優先
+                        if dist < min_drop_dist {
+                            min_drop_dist = dist;
+                            best_drop_tile_pair = Some((
+                                test_pos,
+                                GridPosition {
+                                    x: drop_target.0,
+                                    y: drop_target.1,
+                                },
+                            ));
+                        }
+                    }
+                }
+
+                if let Some((trans_pos, drop_pos)) = best_drop_tile_pair {
+                    return Some(super::engine::AiCommand::Drop {
+                        transport_target_pos: trans_pos,
+                        cargo_drop_pos: drop_pos,
+                        cargo_entity: mission.cargo_entity,
+                    });
+                }
+
+                // それでも降ろせる場所が見つからない場合は、目標島に向かってとりあえず近づく
+                if let Some(target_island_id) = mission.target_island {
+                    if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>()
+                    {
+                        if let Some(island) =
+                            island_map.islands.iter().find(|i| i.id == target_island_id)
+                        {
+                            if let Some(target_pos) = island.tiles.iter().min_by_key(|p| {
+                                (
+                                    (p.x as i32 - t_pos.x as i32).abs()
+                                        + (p.y as i32 - t_pos.y as i32).abs(),
+                                    p.x,
+                                    p.y,
+                                )
+                            }) {
+                                let mut best_tile = t_pos;
+                                let mut min_dist = (t_pos.x as i32 - target_pos.x as i32).abs()
+                                    + (t_pos.y as i32 - target_pos.y as i32).abs();
+
+                                for target_tile in &reachable {
+                                    let dist = (target_tile.0 as i32 - target_pos.x as i32).abs()
+                                        + (target_tile.1 as i32 - target_pos.y as i32).abs();
+                                    if dist < min_dist {
+                                        min_dist = dist;
+                                        best_tile = GridPosition {
+                                            x: target_tile.0,
+                                            y: target_tile.1,
+                                        };
+                                    }
+                                }
+                                return Some(super::engine::AiCommand::Wait {
+                                    target_pos: best_tile,
+                                });
+                            }
+                        }
+                    }
+                }
+                // フォールバック：現在位置で待機
                 return Some(super::engine::AiCommand::Wait { target_pos: t_pos });
             }
         }
@@ -530,15 +606,14 @@ mod tests {
         let cmd = execute_mission_step(&mut world, &mission);
         assert!(cmd.is_some());
         if let Some(crate::ai::engine::AiCommand::Drop {
-            target_pos,
+            transport_target_pos,
+            cargo_drop_pos,
             cargo_entity,
         }) = cmd
         {
             assert_eq!(cargo_entity, cargo);
-            // 降車先は隣接するタイル（通常は平地 (5,5) 等）
-            // get_droppable_tiles は隣接する平地に降車可能かを判定する
-            // transportの周囲のタイルのうち平地の箇所に降車する
-            let dist = (target_pos.x as i32 - 5).abs() + (target_pos.y as i32 - 4).abs();
+            assert_eq!(transport_target_pos, GridPosition { x: 5, y: 4 });
+            let dist = (cargo_drop_pos.x as i32 - 5).abs() + (cargo_drop_pos.y as i32 - 4).abs();
             assert_eq!(dist, 1);
         } else {
             panic!("Expected Drop command, got {:?}", cmd);

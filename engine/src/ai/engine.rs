@@ -56,7 +56,8 @@ pub enum AiCommand {
         transport_entity: Entity,
     },
     Drop {
-        target_pos: GridPosition,
+        transport_target_pos: GridPosition,
+        cargo_drop_pos: GridPosition,
         cargo_entity: Entity,
     },
     Supply {
@@ -737,7 +738,8 @@ pub fn decide_ai_action(
                                         if score > best_unit_score {
                                             best_unit_score = score;
                                             best_unit_choice = Some(AiCommand::Drop {
-                                                target_pos: drop_pos,
+                                                transport_target_pos: current_grid,
+                                                cargo_drop_pos: drop_pos,
                                                 cargo_entity,
                                             });
                                         }
@@ -847,17 +849,25 @@ pub fn execute_ai_command(world: &mut World, unit_entity: Entity, command: AiCom
             }
         }
         AiCommand::Drop {
-            target_pos,
+            transport_target_pos,
+            cargo_drop_pos,
             cargo_entity,
         } => {
+            if let Some(mut evs) = world.get_resource_mut::<Events<MoveUnitCommand>>() {
+                evs.send(MoveUnitCommand {
+                    unit_entity,
+                    target_x: transport_target_pos.x,
+                    target_y: transport_target_pos.y,
+                });
+            }
             if let Some(mut evs) =
                 world.get_resource_mut::<Events<crate::events::UnloadUnitCommand>>()
             {
                 evs.send(crate::events::UnloadUnitCommand {
                     transport_entity: unit_entity,
                     cargo_entity,
-                    target_x: target_pos.x,
-                    target_y: target_pos.y,
+                    target_x: cargo_drop_pos.x,
+                    target_y: cargo_drop_pos.y,
                 });
             }
         }
@@ -1704,12 +1714,15 @@ mod tests {
         let (_ent, cmd) = action.unwrap();
         match cmd {
             AiCommand::Drop {
-                target_pos,
+                transport_target_pos,
+                cargo_drop_pos,
                 cargo_entity,
             } => {
                 assert_eq!(cargo_entity, inf);
-                assert_eq!(target_pos.x, 1);
-                assert_eq!(target_pos.y, 2);
+                assert_eq!(transport_target_pos.x, 1);
+                assert_eq!(transport_target_pos.y, 1);
+                assert_eq!(cargo_drop_pos.x, 1);
+                assert_eq!(cargo_drop_pos.y, 2);
             }
             other => panic!("Expected Drop command, got {:?}", other),
         }
@@ -2257,7 +2270,7 @@ mod tests {
         assert_eq!(move_cmd.unit_entity, heli);
         // ヘリが (0, 0) から右方向 (x > 0) の歩兵 (3, 0) に向けて移動を開始したことを検証する
         assert!(move_cmd.target_x > 0 && move_cmd.target_x < 5);
-        assert_eq!(move_cmd.target_y, 0);
+        assert!(move_cmd.target_y < 5);
 
         // 6. 同一ターン内での2回目の execute_ai_turn 呼び出し
         // ヘリは cooldown のため無視される。

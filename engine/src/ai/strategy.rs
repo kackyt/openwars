@@ -30,6 +30,8 @@ pub struct ProductionStrategy {
     pub ideal_composition: HashMap<UnitType, f32>,
     /// 戦略的に優先すべきターゲット位置（未占領拠点や敵の群れ）。
     pub priority_targets: Vec<GridPosition>,
+    /// 未占領（中立）拠点の座標リスト
+    pub unowned_properties: std::collections::HashSet<GridPosition>,
     /// 不足している輸送キャパシティ数。
     pub transport_demand: u32,
     /// 不足している占領ユニット数。
@@ -40,6 +42,8 @@ pub struct ProductionStrategy {
     pub transport_candidates: Vec<(GridPosition, UnitStats, f32)>,
     /// 現在保有している輸送ユニットの数
     pub existing_transport_count: usize,
+    /// 敵地上ユニットが存在しない平和な島にあるプロパティの座標セット
+    pub peaceful_properties: std::collections::HashSet<GridPosition>,
 }
 
 /// 複数ターンにまたがる生産計画。
@@ -62,6 +66,23 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
     let mut enemy_properties = Vec::new();
     let mut my_capital_pos = None;
 
+    let master_data = world
+        .get_resource::<crate::resources::master_data::MasterDataRegistry>()
+        .cloned()
+        .unwrap_or_else(|| {
+            crate::resources::master_data::MasterDataRegistry::load().unwrap_or_default()
+        });
+    let map = world.resource::<crate::resources::Map>().clone();
+    let island_map = world
+        .get_resource::<crate::ai::islands::IslandMap>()
+        .cloned()
+        .unwrap_or_else(|| crate::ai::islands::IslandMap::analyze(&map));
+
+    let get_island_id =
+        |pos: &GridPosition| -> Option<usize> { island_map.get_island_at(pos).map(|i| i.id.0) };
+
+    let mut my_base_island_ids = std::collections::HashSet::new();
+
     // 1. 拠点の分析
     {
         let mut q_props = world.query::<(&GridPosition, &Property)>();
@@ -71,6 +92,12 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                 if prop.terrain == crate::resources::Terrain::Capital {
                     my_capital_pos = Some(*pos);
                 }
+                // 自軍の生産拠点がある島IDを収集
+                if master_data.is_production_facility(prop.terrain.as_str())
+                    && let Some(island_id) = get_island_id(pos)
+                {
+                    my_base_island_ids.insert(island_id);
+                }
             } else if prop.owner_id.is_none() {
                 unowned_properties.push(*pos);
             } else {
@@ -78,6 +105,9 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
             }
         }
     }
+
+    // unowned_properties を strategy に保存
+    strategy.unowned_properties = unowned_properties.iter().cloned().collect();
 
     let mut my_units = Vec::new();
     let mut enemy_units = Vec::new();
@@ -142,11 +172,48 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
         }
     }
 
-    if capital_threatened {
-        strategy.phase = GamePhase::Defense;
-    } else if unowned_properties.len() > 2 {
-        // 中立拠点がまだ残っているなら、多少の交戦があっても拡張を優先
+    // --- 3.1 島嶼（IslandMap）と拠点獲得劣勢（収入不足）の分析 ---
+    let mut island_unowned_properties = 0;
+    for pos in &unowned_properties {
+        if let Some(island_id) = get_island_id(pos)
+            && my_base_island_ids.contains(&island_id)
+        {
+            island_unowned_properties += 1;
+        }
+    }
+
+    let mut island_enemy_properties = 0;
+    for pos in &enemy_properties {
+        if let Some(island_id) = get_island_id(pos)
+            && my_base_island_ids.contains(&island_id)
+        {
+            island_enemy_properties += 1;
+        }
+    }
+
+    let mut island_my_capture_units = 0;
+    for (pos, stats) in &my_units {
+        if stats.can_capture
+            && let Some(island_id) = get_island_id(pos)
+            && my_base_island_ids.contains(&island_id)
+        {
+            island_my_capture_units += 1;
+        }
+    }
+
+    // 島内の拠点数に基づく目標占領ユニット数
+    let total_island_properties = island_unowned_properties + island_enemy_properties;
+    let ideal_capture_units = ((total_island_properties as f32 * 0.5).ceil() as usize).clamp(3, 10);
+
+    // 収入（拠点確保）優先判定: 島内に中立拠点が残っており、歩兵が目標未満である場合
+    let need_more_revenue =
+        island_unowned_properties > 0 && island_my_capture_units < ideal_capture_units;
+
+    // フェーズの判定
+    if need_more_revenue {
         strategy.phase = GamePhase::Expansion;
+    } else if capital_threatened {
+        strategy.phase = GamePhase::Defense;
     } else if is_engaged {
         if enemy_units.len() >= my_units.len() {
             strategy.phase = GamePhase::Contested;
@@ -180,14 +247,6 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
         }
     };
 
-    // 占領需要の計算: (未占領拠点 + 敵拠点) に対して歩兵が足りているか
-    let total_properties = unowned_properties.len() + enemy_properties.len();
-    let current_capture_units = my_units.iter().filter(|(_, s)| s.can_capture).count();
-    // 拠点の50%程度を目安としつつ、常に5〜12体程度を維持するように調整
-    let ideal_capture_units = ((total_properties as f32 * 0.5).ceil() as usize).clamp(5, 12);
-    strategy.capture_demand =
-        (ideal_capture_units.saturating_sub(current_capture_units)).max(1) as u32;
-
     // 理想構成の適用
     match strategy.phase {
         GamePhase::Expansion => {
@@ -212,13 +271,18 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
         }
     }
 
-    // 占領需要の計算: (未占領拠点 + 敵拠点) に対して歩兵が足りているか
-    let total_properties = unowned_properties.len() + enemy_properties.len();
-    let current_capture_units = my_units.iter().filter(|(_, s)| s.can_capture).count();
-    // 拠点の50%程度を目安としつつ、常に5〜12体程度を維持するように調整
-    let ideal_capture_units = ((total_properties as f32 * 0.5).ceil() as usize).clamp(5, 12);
-    // 足りている場合は0にする（既存の max(1) は過剰生産を招く）
-    strategy.capture_demand = (ideal_capture_units.saturating_sub(current_capture_units)) as u32;
+    // 占領需要の計算
+    if total_island_properties > 0 {
+        let base_demand = ideal_capture_units.saturating_sub(island_my_capture_units);
+        if need_more_revenue {
+            // 収入確保優先（歩兵不足）時は需要を上乗せし、歩兵生産が確実に最優先になるようにする
+            strategy.capture_demand = (base_demand + 4).max(1) as u32;
+        } else {
+            strategy.capture_demand = base_demand as u32;
+        }
+    } else {
+        strategy.capture_demand = 0;
+    }
 
     let current_capacity: u32 = my_units.iter().map(|(_, s)| s.max_cargo).sum();
     // 海上輸送需要については、海軍ユニットのみをカウントする
@@ -326,6 +390,55 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
             }
         }
     }
+
+    // 平和な島（敵地上ユニットが存在しない、または敵地上ユニットが十分に遠い）の分析
+    let mut peaceful_properties = std::collections::HashSet::new();
+    let mut island_has_enemy = std::collections::HashSet::new();
+    #[allow(clippy::collapsible_if)]
+    for (e_pos, e_stats) in &enemy_units {
+        if e_stats.movement_type != MovementType::Air
+            && e_stats.movement_type != MovementType::Ship
+        {
+            if let Some(island_id) = get_island_id(e_pos) {
+                island_has_enemy.insert(island_id);
+            }
+        }
+    }
+
+    for pos in &my_properties {
+        let island_id = get_island_id(pos);
+
+        // 1. 島の中に敵地上ユニットがいないかチェック
+        let mut is_peaceful = if let Some(i_id) = island_id {
+            !island_has_enemy.contains(&i_id)
+        } else {
+            enemy_units.is_empty()
+        };
+
+        // 2. 同じ島に敵がいても、すべての地上敵ユニットから 8 マス以上離れていれば平和とみなす
+        if !is_peaceful {
+            let mut closest_dist = 999;
+            for (e_pos, e_stats) in &enemy_units {
+                if e_stats.movement_type != MovementType::Air
+                    && e_stats.movement_type != MovementType::Ship
+                {
+                    let dist = (pos.x as i32 - e_pos.x as i32).abs()
+                        + (pos.y as i32 - e_pos.y as i32).abs();
+                    if dist < closest_dist {
+                        closest_dist = dist;
+                    }
+                }
+            }
+            if closest_dist >= 8 {
+                is_peaceful = true;
+            }
+        }
+
+        if is_peaceful {
+            peaceful_properties.insert(*pos);
+        }
+    }
+    strategy.peaceful_properties = peaceful_properties;
 
     strategy
 }
