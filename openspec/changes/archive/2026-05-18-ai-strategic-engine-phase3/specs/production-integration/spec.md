@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+AI戦略エンジン Phase 3 における生産統合機能の要件を定義します。目標達成に必要なユニットが不足している場合、AIが動的に生産要求を発行する仕組みを規定します。
+
+## Requirements
 
 ### Requirement: Production Integration
 SHALL: AIは目標達成に必要なユニット数が不足している場合、動的に生産要求を発行しなければならない。

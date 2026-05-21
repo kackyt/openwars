@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+AI戦略エンジンにおける戦略目標の評価と優先度決定機能を定義します。
+
+## Requirements
 
 ### Requirement: Objective Management
 MUST: AIは盤面上の拠点を戦略目標として評価し、攻略優先度を決定しなければならない。

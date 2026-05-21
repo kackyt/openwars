@@ -1,4 +1,4 @@
-﻿use crate::ai::islands::IslandMap;
+use crate::ai::islands::IslandMap;
 use crate::ai::missions::{TransportMission, TransportMissionManager, TransportPhase};
 use crate::ai::objectives::Objective;
 use crate::components::{CargoCapacity, Faction, GridPosition, PlayerId, Property, UnitStats};
@@ -20,8 +20,18 @@ pub fn is_invasion_allowed(
     let mut own_combat_total = 0;
     let mut enemy_combat_total = 0;
 
-    let mut query = world.query::<(&GridPosition, &Faction, &UnitStats)>();
-    for (pos, faction, stats) in query.iter(world) {
+    let mut query = world.query::<(
+        &GridPosition,
+        &Faction,
+        &UnitStats,
+        Option<&crate::components::Transporting>,
+    )>();
+    for (pos, faction, stats, transporting) in query.iter(world) {
+        // 輸送中のユニットは盤上の戦闘ユニットから除外する
+        if transporting.is_some() {
+            continue;
+        }
+
         let is_combat_unit = !matches!(
             stats.unit_type,
             UnitType::Infantry
@@ -49,7 +59,7 @@ pub fn is_invasion_allowed(
     }
 
     // 圧倒的優勢判定: 自軍戦闘ユニット総数 >= 敵軍戦闘ユニット総数 * 1.2 + 2
-    let threshold = ((enemy_combat_total as f64 * 1.2) as u32) + 2;
+    let threshold = (enemy_combat_total as f64 * 1.2).ceil() as u32 + 2;
     if own_combat_total >= threshold {
         return true;
     }

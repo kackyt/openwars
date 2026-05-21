@@ -1,7 +1,9 @@
 # objective-management Specification
 
 ## Purpose
-TBD - created by archiving change ai-strategic-engine-phase2. Update Purpose after archive.
+
+複数ターンにわたる攻略計画を可能にするため、拠点の戦略的重要度を定量評価し、AIの意思決定を自動化して戦略の一貫性を担保します。
+
 ## Requirements
 ### Requirement: Objective Management
 MUST: AIは盤面上の拠点を戦略目標として評価し、攻略優先度を決定しなければならない。

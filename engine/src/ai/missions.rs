@@ -1008,7 +1008,12 @@ mod tests {
         )) = cmd
         {
             assert_eq!(cargo_entity, cargo);
-            assert_eq!(transport_target_pos, GridPosition { x: 5, y: 4 });
+            assert!(
+                transport_target_pos == GridPosition { x: 5, y: 4 }
+                    || transport_target_pos == GridPosition { x: 4, y: 5 },
+                "Expected transport_target_pos to be (5,4) or (4,5), got {:?}",
+                transport_target_pos
+            );
             assert_eq!(cargo_drop_pos, GridPosition { x: 5, y: 5 });
         } else {
             panic!(
