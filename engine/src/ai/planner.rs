@@ -1,4 +1,4 @@
-use crate::ai::islands::IslandMap;
+﻿use crate::ai::islands::IslandMap;
 use crate::ai::missions::{TransportMission, TransportMissionManager, TransportPhase};
 use crate::ai::objectives::Objective;
 use crate::components::{CargoCapacity, Faction, GridPosition, PlayerId, Property, UnitStats};
@@ -76,7 +76,11 @@ pub fn assign_transport_missions(world: &mut World, player_id: PlayerId) {
                 .is_some_and(|faction| faction.0 == player_id)
             {
                 busy_transports.insert(m.transport_entity);
-                busy_infantry.insert(m.cargo_entity);
+                // Return フェーズでは歩兵はすでに降ろされているため、
+                // busy_infantry に登録せず通常のAI意思決定（占領など）に参加させる
+                if m.phase != TransportPhase::Return {
+                    busy_infantry.insert(m.cargo_entity);
+                }
             }
         }
     }
@@ -195,7 +199,13 @@ pub fn assign_transport_missions(world: &mut World, player_id: PlayerId) {
     }
 
     // スコア降順でソート
-    objectives.sort_by_key(|b| std::cmp::Reverse(b.priority_score));
+    // 海を渡る必要がある「別の島」を最優先とし、その次にスコア降順でソート。
+    // 同じ島（歩いて到達できる）への輸送は、余剰輸送機がある場合のみ行う。
+    objectives.sort_by_key(|b| {
+        let is_same_island = base_islands_cache.contains(&b.target_island);
+        let group = if is_same_island { 1u8 } else { 0u8 }; // 別島=0(高優先), 同島=1(低優先)
+        (group, std::cmp::Reverse(b.priority_score))
+    });
 
     // 3. フリーなユニットの収集
     let mut free_empty_transports = Vec::new();

@@ -143,14 +143,21 @@ mod tests {
 
         let island_map = IslandMap::analyze(&ecs_map);
         println!("=== map_3 ISLANDS ANALYSIS ===");
+        println!("Total islands: {}", island_map.islands.len());
         for island in &island_map.islands {
-            for tile in &island.tiles {
-                if tile.x == 7 && tile.y == 6 {
-                    println!("  FOUND (7, 6) in Island {:?}", island.id);
-                }
-                if tile.x == 8 && tile.y == 6 {
-                    println!("  FOUND (8, 6) in Island {:?}", island.id);
-                }
+            println!("Island {:?}: {} tiles", island.id, island.tiles.len());
+            let mut tiles: Vec<_> = island.tiles.iter().collect();
+            tiles.sort_by_key(|p| (p.y, p.x));
+            for tile in tiles.iter().take(15) {
+                let cell = map_data.get_cell(tile.x, tile.y).unwrap();
+                let terrain = registry.terrain_from_id(cell.terrain_id).unwrap();
+                println!(
+                    "  ({}, {}) = {:?} [player {}]",
+                    tile.x, tile.y, terrain, cell.player_id
+                );
+            }
+            if tiles.len() > 15 {
+                println!("  ... and {} more tiles", tiles.len() - 15);
             }
         }
         panic!("Show stdout");

@@ -796,7 +796,11 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> Option<Str
                 .is_some_and(|f| f.0 == active_player)
             {
                 mission_entities.insert(m.transport_entity);
-                mission_entities.insert(m.cargo_entity);
+                // Return フェーズでは歩兵はすでに島に展開済みなので、
+                // 通常のAI意思決定（占領など）に参加させる
+                if m.phase != crate::ai::missions::TransportPhase::Return {
+                    mission_entities.insert(m.cargo_entity);
+                }
             }
         }
     }
