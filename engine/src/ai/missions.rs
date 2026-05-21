@@ -191,42 +191,95 @@ pub fn execute_mission_step(
         }
         TransportPhase::Transit => {
             if let Some(target_island_id) = mission.target_island {
-                if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() {
-                    if let Some(island) =
-                        island_map.islands.iter().find(|i| i.id == target_island_id)
+                // 借用チェッカーを回避するため、必要なデータをスコープ内で事前にコピーまたはクローンします。
+                let (island_tiles, target_pos) = {
+                    if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>()
                     {
-                        let map = world.resource::<Map>();
-                        let registry = world.resource::<MasterDataRegistry>();
-                        if let Some(target_pos) = get_target_position_for_island(
-                            map,
-                            registry,
-                            island,
-                            t_pos,
-                            t_stats.movement_type,
-                        ) {
-                            let mut best_tile = t_pos;
-                            let mut min_dist = (t_pos.x as i32 - target_pos.x as i32).abs()
-                                + (t_pos.y as i32 - target_pos.y as i32).abs();
+                        if let Some(island) =
+                            island_map.islands.iter().find(|i| i.id == target_island_id)
+                        {
+                            let map = world.resource::<Map>();
+                            let registry = world.resource::<MasterDataRegistry>();
+                            let target_pos = get_target_position_for_island(
+                                map,
+                                registry,
+                                island,
+                                t_pos,
+                                t_stats.movement_type,
+                            );
+                            (Some(island.tiles.clone()), target_pos)
+                        } else {
+                            (None, None)
+                        }
+                    } else {
+                        (None, None)
+                    }
+                };
 
-                            for target_tile in &reachable {
-                                let dist = (target_tile.0 as i32 - target_pos.x as i32).abs()
-                                    + (target_tile.1 as i32 - target_pos.y as i32).abs();
-                                if dist < min_dist {
-                                    min_dist = dist;
-                                    best_tile = GridPosition {
-                                        x: target_tile.0,
-                                        y: target_tile.1,
-                                    };
+                if let (Some(island_tiles), Some(target_pos)) = (island_tiles, target_pos) {
+                    // ここからは world を安全に借用できます。
+                    let mut best_drop_tile_pair = None;
+                    let mut min_drop_dist = 9999;
+
+                    for &(rx, ry) in &reachable {
+                        let test_pos = GridPosition { x: rx, y: ry };
+                        let drop_targets = crate::systems::transport::get_droppable_tiles_at(
+                            world,
+                            mission.transport_entity,
+                            mission.cargo_entity,
+                            test_pos,
+                        );
+                        for drop_target in drop_targets {
+                            let drop_pos = GridPosition {
+                                x: drop_target.0,
+                                y: drop_target.1,
+                            };
+                            // 降車先が目標島に含まれているかチェック
+                            if island_tiles.contains(&drop_pos) {
+                                let dist = (rx as i32 - t_pos.x as i32).abs()
+                                    + (ry as i32 - t_pos.y as i32).abs();
+                                if dist < min_drop_dist {
+                                    min_drop_dist = dist;
+                                    best_drop_tile_pair = Some((test_pos, drop_pos));
                                 }
                             }
-                            return Some((
-                                mission.transport_entity,
-                                super::engine::AiCommand::Wait {
-                                    target_pos: best_tile,
-                                },
-                            ));
                         }
                     }
+
+                    // 降車可能な場所が見つかった場合は、移動と降車を同一ターンで行う AiCommand::Drop を即座に発行する
+                    if let Some((trans_pos, drop_pos)) = best_drop_tile_pair {
+                        return Some((
+                            mission.transport_entity,
+                            super::engine::AiCommand::Drop {
+                                transport_target_pos: trans_pos,
+                                cargo_drop_pos: drop_pos,
+                                cargo_entity: mission.cargo_entity,
+                            },
+                        ));
+                    }
+
+                    // 降車可能な場所が見つからない場合は、従来通り目標島に最も近づく
+                    let mut best_tile = t_pos;
+                    let mut min_dist = (t_pos.x as i32 - target_pos.x as i32).abs()
+                        + (t_pos.y as i32 - target_pos.y as i32).abs();
+
+                    for target_tile in &reachable {
+                        let dist = (target_tile.0 as i32 - target_pos.x as i32).abs()
+                            + (target_tile.1 as i32 - target_pos.y as i32).abs();
+                        if dist < min_dist {
+                            min_dist = dist;
+                            best_tile = GridPosition {
+                                x: target_tile.0,
+                                y: target_tile.1,
+                            };
+                        }
+                    }
+                    return Some((
+                        mission.transport_entity,
+                        super::engine::AiCommand::Wait {
+                            target_pos: best_tile,
+                        },
+                    ));
                 }
             }
         }
@@ -416,30 +469,49 @@ pub fn update_mission_phase(world: &mut World, mission: &mut TransportMission) -
             }
         }
         TransportPhase::Transit => {
-            // ヘリが target_island のいずれかのタイルと隣接している、あるいはその島にいる（距離1以下）
-            if let Some(target_island_id) = mission.target_island {
-                if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() {
-                    if let Some(island) =
-                        island_map.islands.iter().find(|i| i.id == target_island_id)
+            // 移動＋降車が同一ターンで完了した場合に備え、積載状態と輸送中フラグをチェック
+            let loaded = if let Some(cargo) =
+                world.get::<crate::components::CargoCapacity>(mission.transport_entity)
+            {
+                cargo.loaded.contains(&mission.cargo_entity)
+            } else {
+                false
+            };
+            let transporting = world
+                .get::<crate::components::Transporting>(mission.cargo_entity)
+                .is_some_and(|t| t.0 == mission.transport_entity);
+
+            if !loaded && !transporting {
+                // すでに歩兵がヘリに積載されておらず輸送中でない場合、降下完了したとみなし Return へ直接遷移する
+                mission.phase = TransportPhase::Return;
+            } else {
+                // ヘリが target_island のいずれかのタイルと隣接している、あるいはその島にいる（距離1以下）
+                if let Some(target_island_id) = mission.target_island {
+                    if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>()
                     {
-                        if let Some(t_pos) =
-                            world.get::<GridPosition>(mission.transport_entity).cloned()
+                        if let Some(island) =
+                            island_map.islands.iter().find(|i| i.id == target_island_id)
                         {
-                            let map = world.resource::<Map>();
-                            let registry = world.resource::<MasterDataRegistry>();
-                            let t_stats = world.get::<UnitStats>(mission.transport_entity).unwrap();
-                            if let Some(target_pos) = get_target_position_for_island(
-                                map,
-                                registry,
-                                island,
-                                t_pos,
-                                t_stats.movement_type,
-                            ) {
-                                if (target_pos.x as i32 - t_pos.x as i32).abs()
-                                    + (target_pos.y as i32 - t_pos.y as i32).abs()
-                                    <= 1
-                                {
-                                    mission.phase = TransportPhase::Drop;
+                            if let Some(t_pos) =
+                                world.get::<GridPosition>(mission.transport_entity).cloned()
+                            {
+                                let map = world.resource::<Map>();
+                                let registry = world.resource::<MasterDataRegistry>();
+                                let t_stats =
+                                    world.get::<UnitStats>(mission.transport_entity).unwrap();
+                                if let Some(target_pos) = get_target_position_for_island(
+                                    map,
+                                    registry,
+                                    island,
+                                    t_pos,
+                                    t_stats.movement_type,
+                                ) {
+                                    if (target_pos.x as i32 - t_pos.x as i32).abs()
+                                        + (target_pos.y as i32 - t_pos.y as i32).abs()
+                                        <= 1
+                                    {
+                                        mission.phase = TransportPhase::Drop;
+                                    }
                                 }
                             }
                         }
@@ -889,5 +961,72 @@ mod tests {
         } else {
             panic!("Expected Wait command, got {:?}", cmd);
         }
+    }
+
+    #[test]
+    fn test_execute_mission_step_transit_to_direct_drop() {
+        let (mut world, transport, cargo) = setup_test_world();
+        // 降車テストのため、歩兵をロード状態にする
+        world
+            .get_mut::<CargoCapacity>(transport)
+            .unwrap()
+            .loaded
+            .push(cargo);
+        world.entity_mut(cargo).insert(Transporting(transport));
+
+        // ターゲットの島は (5,5)
+        let island_map = IslandMap {
+            islands: vec![Island {
+                id: IslandId(1),
+                tiles: vec![GridPosition { x: 5, y: 5 }].into_iter().collect(),
+            }],
+        };
+        world.insert_resource(island_map);
+
+        // ヘリを (0,0) に配置
+        *world.get_mut::<GridPosition>(transport).unwrap() = GridPosition { x: 0, y: 0 };
+        // ヘリの最大移動力を 10 に設定して確実に (5,4) に移動できるようにする
+        world.get_mut::<UnitStats>(transport).unwrap().max_movement = 10;
+
+        let mut mission = TransportMission {
+            transport_entity: transport,
+            cargo_entity: cargo,
+            phase: TransportPhase::Transit,
+            target_island: Some(IslandId(1)),
+        };
+
+        // execute_mission_step を実行すると、Wait ではなく Drop コマンドが返るはず！
+        let cmd = execute_mission_step(&mut world, &mission);
+        assert!(cmd.is_some());
+        if let Some((
+            _entity,
+            crate::ai::engine::AiCommand::Drop {
+                transport_target_pos,
+                cargo_drop_pos,
+                cargo_entity,
+            },
+        )) = cmd
+        {
+            assert_eq!(cargo_entity, cargo);
+            assert_eq!(transport_target_pos, GridPosition { x: 5, y: 4 });
+            assert_eq!(cargo_drop_pos, GridPosition { x: 5, y: 5 });
+        } else {
+            panic!(
+                "Expected Drop command (due to direct drop from transit), got {:?}",
+                cmd
+            );
+        }
+
+        // 移動＋降車が実行されて cargo がヘリから降ろされた状態にする
+        world
+            .get_mut::<CargoCapacity>(transport)
+            .unwrap()
+            .loaded
+            .clear();
+        world.entity_mut(cargo).remove::<Transporting>();
+
+        // この状態で update_mission_phase を呼び出すと、Transit から Return へ直接遷移するはず
+        assert!(!update_mission_phase(&mut world, &mut mission));
+        assert_eq!(mission.phase, TransportPhase::Return);
     }
 }
