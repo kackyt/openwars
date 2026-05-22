@@ -9,8 +9,8 @@ importers:
   .:
     devDependencies:
       '@fission-ai/openspec':
-        specifier: ^1.2.0
-        version: 1.2.0
+        specifier: ^1.3.1
+        version: 1.3.1
       rulesync:
         specifier: ^7.21.0
         version: 7.21.0(valibot@1.3.1)
@@ -20,8 +20,8 @@ packages:
   '@borewit/text-codec@0.2.2':
     resolution: {integrity: sha512-DDaRehssg1aNrH4+2hnj1B7vnUGEjU6OIlyRdkMd0aUdIUvKXrJfXsy8LVtXAy7DRvYVluWbMspsRhz2lcW0mQ==}
 
-  '@fission-ai/openspec@1.2.0':
-    resolution: {integrity: sha512-2XDmPZcVY0Bs014lP9aoxe3VoEU8hFvqaBFxQaiJO2nhC8vTKCyo6sT/5YpQcOTfR/a64Hht2anTyqLR4eNhlg==}
+  '@fission-ai/openspec@1.3.1':
+    resolution: {integrity: sha512-QnbJfq/lUNCRY+TTXo87fuIpGCCaOYt280tmbuI112B/1vF0feIneK0/qhoTZNslRDhwwg1YcYDX0suxq2h6tw==}
     engines: {node: '>=20.19.0'}
     hasBin: true
 
@@ -1221,7 +1221,7 @@ snapshots:
 
   '@borewit/text-codec@0.2.2': {}
 
-  '@fission-ai/openspec@1.2.0':
+  '@fission-ai/openspec@1.3.1':
     dependencies:
       '@inquirer/core': 10.3.2
       '@inquirer/prompts': 7.10.1
