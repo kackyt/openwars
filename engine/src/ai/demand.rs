@@ -234,8 +234,13 @@ pub fn compute_demand(
     let gap_ground = (enemy_ground_threat - my_power_vs_ground).max(0.0);
     let gap_sea = (enemy_sea_threat - my_power_vs_sea).max(0.0);
 
-    // 正規化スケール：「1体分の適性値（≒1.0）」を基準とする
-    let unit_scale = 1.0f32.max(normalization_scale / 100.0);
+    // 正規化スケール：「1体分の適性値（≒1.0）」を基準とする。敵の総数が極めて少ない序盤は、戦闘需要に過剰反応しないように scale を底上げする
+    let base_scale = if enemy_units.len() <= 2 {
+        3.0f32 // 敵が少ない場合は3体分に相当するスケールにして需要を抑制
+    } else {
+        1.0f32
+    };
+    let unit_scale = base_scale.max(normalization_scale / 100.0);
 
     let anti_air = (gap_air / unit_scale).clamp(0.0, 1.0);
     let anti_ground = (gap_ground / unit_scale).clamp(0.0, 1.0);
@@ -450,6 +455,130 @@ mod tests {
             "対空戦車の anti_air 適性({}) > 装甲車({}) のはずだが",
             antiair_affinity.anti_air,
             recon_affinity.anti_air
+        );
+    }
+
+    /// 敵の数が極めて少ない序盤に戦闘需要が適切に抑制されること、および normalization_scale の境界での挙動を確認する
+    #[test]
+    fn test_early_game_scaling_logic() {
+        let mut chart = DamageChart::new();
+        // 適性計算用の適当なダミーダメージを設定
+        chart.insert_damage(UnitType::Recon, UnitType::Recon, 50);
+
+        let registry = make_registry_with(vec![(UnitType::Recon, MovementType::ArmoredCar, 6, 0)]);
+
+        let my_units = vec![
+            (
+                GridPosition { x: 3, y: 3 },
+                UnitStats {
+                    unit_type: UnitType::Recon,
+                    movement_type: MovementType::ArmoredCar,
+                    max_ammo1: 6,
+                    max_ammo2: 0,
+                    ..UnitStats::mock()
+                },
+            ),
+            (
+                GridPosition { x: 3, y: 4 },
+                UnitStats {
+                    unit_type: UnitType::Recon,
+                    movement_type: MovementType::ArmoredCar,
+                    max_ammo1: 6,
+                    max_ammo2: 0,
+                    ..UnitStats::mock()
+                },
+            ),
+        ];
+
+        // --- ケース1: 敵が2体以下 (enemy_units.len() <= 2) ---
+        let enemy_units_2 = vec![
+            (
+                GridPosition { x: 5, y: 5 },
+                UnitStats {
+                    unit_type: UnitType::Recon,
+                    movement_type: MovementType::ArmoredCar,
+                    max_ammo1: 6,
+                    max_ammo2: 0,
+                    ..UnitStats::mock()
+                },
+            ),
+            (
+                GridPosition { x: 6, y: 6 },
+                UnitStats {
+                    unit_type: UnitType::Recon,
+                    movement_type: MovementType::ArmoredCar,
+                    max_ammo1: 6,
+                    max_ammo2: 0,
+                    ..UnitStats::mock()
+                },
+            ),
+        ];
+
+        // 期待される挙動: 敵が2体以下なので base_scale = 3.0。需要が抑制される
+        let demand_2 = compute_demand(&my_units, &enemy_units_2, &[], &chart, &registry);
+
+        // --- ケース2: 敵が3体以上 (enemy_units.len() >= 3) ---
+        let enemy_units_3 = vec![
+            (
+                GridPosition { x: 5, y: 5 },
+                UnitStats {
+                    unit_type: UnitType::Recon,
+                    movement_type: MovementType::ArmoredCar,
+                    max_ammo1: 6,
+                    max_ammo2: 0,
+                    ..UnitStats::mock()
+                },
+            ),
+            (
+                GridPosition { x: 6, y: 6 },
+                UnitStats {
+                    unit_type: UnitType::Recon,
+                    movement_type: MovementType::ArmoredCar,
+                    max_ammo1: 6,
+                    max_ammo2: 0,
+                    ..UnitStats::mock()
+                },
+            ),
+            (
+                GridPosition { x: 7, y: 7 },
+                UnitStats {
+                    unit_type: UnitType::Recon,
+                    movement_type: MovementType::ArmoredCar,
+                    max_ammo1: 6,
+                    max_ammo2: 0,
+                    ..UnitStats::mock()
+                },
+            ),
+        ];
+
+        // 期待される挙動: 敵が3体以上なので base_scale = 1.0。スケーリングによる需要抑制が解除され、需要が高くなる
+        let demand_3 = compute_demand(&my_units, &enemy_units_3, &[], &chart, &registry);
+
+        // 敵2体のときの方が、敵3体のときよりも需要が抑制される（base_scaleが大きいため）
+        assert!(
+            demand_2.anti_ground < demand_3.anti_ground,
+            "敵が2体以下(base_scale=3.0)の時の方が、敵3体以上(base_scale=1.0)の時より需要が小さくなるはずだが、demand_2.anti_ground={}, demand_3.anti_ground={}",
+            demand_2.anti_ground,
+            demand_3.anti_ground
+        );
+
+        // --- ケース3: normalization_scale が 100.0 の境界付近でのテスト ---
+        // 高ダメージ (normalization_scale = 200.0) -> unit_scale = 1.0.max(2.0) = 2.0
+        let mut chart_high = DamageChart::new();
+        chart_high.insert_damage(UnitType::Recon, UnitType::Recon, 200);
+        let demand_high = compute_demand(&my_units, &enemy_units_3, &[], &chart_high, &registry);
+
+        // 低ダメージ (normalization_scale = 50.0) -> unit_scale = 1.0.max(0.5) = 1.0
+        let mut chart_low = DamageChart::new();
+        chart_low.insert_damage(UnitType::Recon, UnitType::Recon, 50);
+        let demand_low = compute_demand(&my_units, &enemy_units_3, &[], &chart_low, &registry);
+
+        // 高ダメージ（＝平均期待値が大きい＝敵戦力が脅威）の方が unit_scale が大きくなるため、個々の戦闘ユニット差による需要は相対的に抑制される
+        assert!(
+            demand_high.anti_ground < demand_low.anti_ground,
+            "normalization_scaleが大きい（high）場合の方が、unit_scaleが大きくなって相対的需要が抑制されるはずだが、high={}, low={}",
+            demand_high.anti_ground,
+            demand_low.anti_ground
         );
     }
 }

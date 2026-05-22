@@ -301,11 +301,20 @@ pub fn calculate_unit_score_at(
     produced_at: Terrain,
 ) -> u32 {
     // 1. 基本スコア（敵との距離、脅威度）
+    let mut min_eta = 99;
     let mut score: u32 = if !strategy.priority_targets.is_empty() {
         let mut local_min_eta = 99;
         let mut base_val: i32 = 2000; // ベースを引き上げ
 
         for target in &strategy.priority_targets {
+            // ターゲットが未占領（中立）拠点か判定
+            let is_unowned_property = strategy.unowned_properties.contains(target);
+
+            // 論理防衛評価: 占領できない戦闘ユニットは、中立拠点のETA評価を無視（スキップ）する
+            if is_unowned_property && !stats.can_capture {
+                continue;
+            }
+
             let mut dist = (pos.x as isize - target.x as isize).unsigned_abs()
                 + (pos.y as isize - target.y as isize).unsigned_abs();
 
@@ -387,7 +396,7 @@ pub fn calculate_unit_score_at(
                 local_min_eta = final_eta;
             }
         }
-        let min_eta = local_min_eta;
+        min_eta = local_min_eta;
 
         // 1ターン遅れるごとに40点のペナルティ（緩和）
         let eta_penalty = min_eta * 40;
@@ -399,14 +408,18 @@ pub fn calculate_unit_score_at(
 
     // 2. 特殊役割ボーナス
     if stats.can_capture {
+        // 不足している占領可能ユニット数（capture_demand）に応じて線形に価値を高める
         if strategy.capture_demand > 0 {
-            score += 2000; // 不足している場合は最優先
+            score += 2500 * strategy.capture_demand; // 不足数が多い（特に収入危機時）ほど超強力に歩兵を優先
         } else if strategy.phase == GamePhase::Expansion {
-            // 歩兵が既に十分な場合は大幅に評価を下げる
-            score = score.saturating_sub(500);
+            score = score.saturating_sub(1000);
         } else {
-            // 戦闘フェーズで歩兵が足りているなら、他のユニットを優先
-            score = score.saturating_sub(1500);
+            score = score.saturating_sub(2000);
+        }
+
+        // 近く（ETA=1〜2）に未占領拠点がある場合、収入確保の近接占領ボーナスを付与
+        if strategy.capture_demand > 0 && min_eta <= 2 {
+            score += 2000;
         }
     }
     // 輸送ユニットの評価（期待状態価値の向上分に基づく）
@@ -540,11 +553,22 @@ pub fn calculate_unit_score_at(
         score += demand_score as u32;
     }
 
-    // 6. コスト正規化（ナップサックバイアス緩和）
-    // スコアが同じなら安価な方が効率が良いが、高コストユニットが全く選ばれないのを防ぐため、
-    // 「生存性と突破力」の対価として、高コストユニットに比例的なボーナスを与える。
-    let cost_factor = (stats.cost as f32 / 5000.0).sqrt(); // 5000Gを基準に緩やかに加算
-    score = (score as f32 * (1.0 + cost_factor * 0.5)) as u32; // 補正係数を 0.2 -> 0.5 に強化
+    // 6. コストに応じた非論理的なボーナスは完全に削除します。
+    // ユニットは純粋に戦闘力と役割で評価されます。
+
+    // --- 6. 敵の脅威がない平和な時の戦闘ユニット生産ロック ---
+    // 生産拠点がある島に敵の地上脅威が存在せず、交戦状態でもない平和な拡張期
+    // かつ、占領ユニットの需要（未占領拠点）が存在する場合のみ純戦闘ユニットをロックする
+    let is_peaceful_expansion = strategy.phase == GamePhase::Expansion
+        && strategy.capture_demand > 0
+        && strategy.peaceful_properties.contains(&pos);
+
+    if is_peaceful_expansion {
+        // 敵の脅威がゼロの平和な時は、占領・輸送・補給ができない純戦闘ユニットを生産する意味は皆無
+        if !stats.can_capture && stats.max_cargo == 0 && !stats.can_supply {
+            score = 0;
+        }
+    }
 
     score
 }
@@ -676,16 +700,17 @@ mod additional_tests {
         ));
 
         // 敵ユニットも設置
+        let enemy_stats = UnitStats {
+            unit_type: UnitType::Infantry,
+            cost: 1000,
+            max_movement: 3,
+            movement_type: MovementType::Tank,
+            ..UnitStats::mock()
+        };
         world.spawn((
             enemy_pos,
             Faction(PlayerId(2)),
-            UnitStats {
-                unit_type: UnitType::Infantry,
-                cost: 1000,
-                max_movement: 3,
-                movement_type: MovementType::Tank,
-                ..UnitStats::mock()
-            },
+            enemy_stats.clone(),
             Health {
                 current: 100,
                 max: 100,
@@ -704,6 +729,8 @@ mod additional_tests {
             ..UnitStats::mock()
         };
 
+        let enemy_units = vec![(enemy_pos, enemy_stats)];
+
         // シナリオA: 輸送車なしでタンクのスコアを計測
         let score_without_transport;
         {
@@ -713,7 +740,7 @@ mod additional_tests {
                 &tank_stats,
                 factory_pos,
                 &strategy,
-                &[],
+                &enemy_units,
                 &[],
                 &chart,
                 &master_data,
@@ -743,7 +770,7 @@ mod additional_tests {
                 &tank_stats,
                 factory_pos,
                 &strategy,
-                &[],
+                &enemy_units,
                 &empty_transports,
                 &chart,
                 &master_data,
@@ -821,6 +848,96 @@ mod additional_tests {
             produced_types.contains(&UnitType::AntiAir)
                 || produced_types.contains(&UnitType::Missiles),
             "Should produce anti-air units against helicopters. Got: {:?}",
+            produced_types
+        );
+    }
+
+    #[test]
+    fn test_ai_production_infantry_priority_at_start() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (mut world, _) =
+            crate::setup::initialize_world_from_master_data(&master_data, "map_1").unwrap();
+
+        // テスト用の15x15平地マップを作成して挿入（島IDが正しく認識されるように）
+        let map = Map {
+            width: 15,
+            height: 15,
+            tiles: vec![Terrain::Plains; 225],
+            topology: crate::resources::GridTopology::Square,
+        };
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        world.insert_resource(map);
+        world.insert_resource(island_map);
+
+        let p1 = PlayerId(1);
+        if let Some(mut players) = world.get_resource_mut::<Players>() {
+            for p in &mut players.0 {
+                if p.id == p1 {
+                    p.funds = 10000; // 十分な資金（ロケットランチャー等も買える額）
+                }
+            }
+        }
+
+        // 全エンティティをクリアして初期マップ状態をシミュレート
+        let entities: Vec<Entity> = world.query::<Entity>().iter(&world).collect();
+        for e in entities {
+            world.despawn(e);
+        }
+
+        // 自軍の生産施設
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(p1), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Property::new(Terrain::Factory, Some(p1), 100),
+        ));
+
+        // 中立拠点が島に点在
+        world.spawn((
+            GridPosition { x: 3, y: 0 },
+            Property::new(Terrain::City, None, 100),
+        ));
+        world.spawn((
+            GridPosition { x: 0, y: 3 },
+            Property::new(Terrain::City, None, 100),
+        ));
+
+        // 敵歩兵が極めて少数（1体）のみ、遠くに存在し平和な状態
+        world.spawn((
+            GridPosition { x: 10, y: 10 },
+            Faction(PlayerId(2)),
+            UnitStats {
+                unit_type: UnitType::Infantry,
+                cost: 1000,
+                max_movement: 3,
+                movement_type: MovementType::Infantry,
+                can_capture: true,
+                ..UnitStats::mock()
+            },
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ));
+
+        let commands = decide_production(&mut world, p1);
+
+        let produced_types: Vec<UnitType> = commands.iter().map(|c| c.unit_type).collect();
+
+        // 資金が豊富であっても、中立拠点獲得を最優先して「歩兵（軽歩兵または重歩兵）」を生産するはず
+        assert!(
+            produced_types.contains(&UnitType::Infantry)
+                || produced_types.contains(&UnitType::Mech),
+            "Should prioritize producing capturing units (Infantry/Mech) at start. Got: {:?}",
+            produced_types
+        );
+
+        // ロケットランチャーなどの高額戦闘ユニットは生産されていないはず
+        assert!(
+            !produced_types.contains(&UnitType::Rockets),
+            "Should not produce Rocket Launchers when it is peaceful and capturing is needed. Got: {:?}",
             produced_types
         );
     }

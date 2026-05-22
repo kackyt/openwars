@@ -1,7 +1,7 @@
 ## Purpose
 輸送ユニットの生産価値を、搭載可能なユニットの価値と輸送による時間短縮効果（ETA Gain）に基づいて動的に評価するロジックを定義する。
 
-## ADDED Requirements
+## Requirements
 ### Requirement: 輸送可能ユニットに応じた動的評価
 MUST: AIは輸送ユニットのスコアを算出する際、一律のボーナスではなく、そのユニットが実際に搭載可能なユニット種別（`loadable_unit_types`）に基づいて評価を行わなければならない。
 
