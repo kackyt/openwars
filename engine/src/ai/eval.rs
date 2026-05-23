@@ -2,7 +2,7 @@
 #![allow(clippy::clone_on_copy)]
 
 use crate::ai::ai_version::{AiVersion, PlayerAiSettings};
-use crate::ai::turn_distance::{TurnDistanceCache, calculate_turn_distance};
+
 use crate::components::{Ammo, Faction, GridPosition, Health, PlayerId, Property, UnitStats};
 use crate::resources::{Map, Terrain, master_data::MasterDataRegistry};
 use bevy_ecs::prelude::*;
@@ -13,7 +13,11 @@ const CONSOLIDATION_RADIUS_TURNS: u32 = 2;
 
 /// 盤面の静的評価関数。
 /// プレイヤーごとの AI バージョン (V1 / V2) に応じて評価ロジックを切り替えます。
-pub fn evaluate_board(world: &mut World, perspective_player: PlayerId) -> i32 {
+pub fn evaluate_board(
+    world: &mut World,
+    perspective_player: PlayerId,
+    cache: Option<&mut crate::ai::turn_distance::AiTurnCache>,
+) -> i32 {
     let ai_version = {
         let settings = world.get_resource::<PlayerAiSettings>();
         settings
@@ -23,7 +27,7 @@ pub fn evaluate_board(world: &mut World, perspective_player: PlayerId) -> i32 {
 
     match ai_version {
         AiVersion::V1 => evaluate_board_v1(world, perspective_player),
-        AiVersion::V2 => evaluate_board_v2(world, perspective_player),
+        AiVersion::V2 => evaluate_board_v2(world, perspective_player, cache),
     }
 }
 
@@ -131,7 +135,11 @@ fn evaluate_board_v1(world: &mut World, perspective_player: PlayerId) -> i32 {
 // ==========================================
 // 戦術部隊 AI 用の精緻な評価ロジック (V2)
 // ==========================================
-fn evaluate_board_v2(world: &mut World, perspective_player: PlayerId) -> i32 {
+fn evaluate_board_v2(
+    world: &mut World,
+    perspective_player: PlayerId,
+    cache: Option<&mut crate::ai::turn_distance::AiTurnCache>,
+) -> i32 {
     let mut score = 0;
 
     let map = world.resource::<Map>().clone();
@@ -139,8 +147,6 @@ fn evaluate_board_v2(world: &mut World, perspective_player: PlayerId) -> i32 {
         .get_resource::<MasterDataRegistry>()
         .cloned()
         .unwrap_or_default();
-
-    let mut turn_cache = TurnDistanceCache::default();
 
     // 占有情報（TurnDistance用）
     let mut unit_positions = HashMap::new();
@@ -157,6 +163,13 @@ fn evaluate_board_v2(world: &mut World, perspective_player: PlayerId) -> i32 {
             },
         );
     }
+
+    // AI専用の個別に確保した一時キャッシュを準備
+    let mut local_cache = crate::ai::turn_distance::AiTurnCache::default();
+    let turn_cache = match cache {
+        Some(c) => c,
+        None => &mut local_cache,
+    };
 
     // 拠点のリスト化
     let mut properties = Vec::new();
@@ -182,9 +195,9 @@ fn evaluate_board_v2(world: &mut World, perspective_player: PlayerId) -> i32 {
         }
     }
 
-    // 1. ユニット戦力評価
-    let mut my_units = Vec::new();
-    let mut enemy_units = Vec::new();
+    // 1. ユニット戦力評価と SSSP テーブル構築
+    let mut my_unit_distances = Vec::new();
+    let mut enemy_unit_distances = Vec::new();
 
     let mut query = world.query::<(
         Entity,
@@ -232,7 +245,7 @@ fn evaluate_board_v2(world: &mut World, perspective_player: PlayerId) -> i32 {
             };
             base_value *= position_modifier;
 
-            // 最寄り生産拠点までの TurnDistance を計算し「孤立ペナルティ」を適用
+            // --- 生産拠点からの逆引き SSSP による孤立ペナルティ計算 ---
             let target_production_bases = if is_my_unit {
                 &my_production_bases
             } else {
@@ -241,19 +254,20 @@ fn evaluate_board_v2(world: &mut World, perspective_player: PlayerId) -> i32 {
             let mut min_turn_dist = 99;
 
             for &p_pos in target_production_bases {
-                let turns = calculate_turn_distance(
+                let p_turns_map = crate::ai::turn_distance::calculate_all_turn_distances_cached(
                     &map,
                     &registry,
                     &unit_positions,
-                    (pos.x, pos.y),
                     (p_pos.x, p_pos.y),
                     stats.movement_type,
                     stats.max_movement,
                     faction.0,
-                    &mut turn_cache,
+                    turn_cache,
                 );
-                if turns < min_turn_dist {
-                    min_turn_dist = turns;
+                if let Some(&turns) = p_turns_map.get(pos) {
+                    if turns < min_turn_dist {
+                        min_turn_dist = turns;
+                    }
                 }
             }
 
@@ -265,6 +279,13 @@ fn evaluate_board_v2(world: &mut World, perspective_player: PlayerId) -> i32 {
                 1.0
             };
             base_value *= isolation_modifier;
+
+            // 領域支配スコア用の情報を保存（SSSPテーブルはここでは保持しない）
+            if is_my_unit {
+                my_unit_distances.push((*pos, stats.clone(), faction.0));
+            } else {
+                enemy_unit_distances.push((*pos, stats.clone(), faction.0));
+            }
         }
 
         // (B) 弾薬状態補正
@@ -293,14 +314,8 @@ fn evaluate_board_v2(world: &mut World, perspective_player: PlayerId) -> i32 {
 
         if is_my_unit {
             score += value;
-            if let Some(pos) = pos_opt {
-                my_units.push((*pos, stats.clone()));
-            }
         } else {
             score -= value;
-            if let Some(pos) = pos_opt {
-                enemy_units.push((*pos, stats.clone()));
-            }
         }
     }
 
@@ -314,7 +329,19 @@ fn evaluate_board_v2(world: &mut World, perspective_player: PlayerId) -> i32 {
                 _ => 0,
             };
 
-            // その拠点から 2 ターン圏内の拠点を調査
+            // 拠点から MovementType::Infantry (基準の歩兵) で 2ターン以内の周辺の他の拠点を調査。
+            // これも拠点 pos を始点とする SSSP 1回で $O(1)$ 判定可能。
+            let p_turns_map = crate::ai::turn_distance::calculate_all_turn_distances_cached(
+                &map,
+                &registry,
+                &unit_positions,
+                (pos.x, pos.y),
+                crate::resources::MovementType::Infantry,
+                3,
+                owner,
+                turn_cache,
+            );
+
             let mut total_nearby = 0;
             let mut friendly_nearby = 0;
 
@@ -323,22 +350,12 @@ fn evaluate_board_v2(world: &mut World, perspective_player: PlayerId) -> i32 {
                     continue;
                 }
 
-                let turns = calculate_turn_distance(
-                    &map,
-                    &registry,
-                    &unit_positions,
-                    (pos.x, pos.y),
-                    (other_pos.x, other_pos.y),
-                    crate::resources::MovementType::Infantry, // 基準の歩兵
-                    3,
-                    owner,
-                    &mut turn_cache,
-                );
-
-                if turns <= CONSOLIDATION_RADIUS_TURNS {
-                    total_nearby += 1;
-                    if other_prop.owner_id == Some(owner) {
-                        friendly_nearby += 1;
+                if let Some(&turns) = p_turns_map.get(other_pos) {
+                    if turns <= CONSOLIDATION_RADIUS_TURNS {
+                        total_nearby += 1;
+                        if other_prop.owner_id == Some(owner) {
+                            friendly_nearby += 1;
+                        }
                     }
                 }
             }
@@ -364,43 +381,43 @@ fn evaluate_board_v2(world: &mut World, perspective_player: PlayerId) -> i32 {
     let mut enemy_dominated_count = 0;
 
     for (p_pos, _) in &properties {
-        // 自軍の最短到達ターン数を計算
+        // 自軍の最短到達ターン数を計算 (拠点始点 SSSP から逆引き)
         let mut min_my_turns = 99;
-        for (u_pos, u_stats) in &my_units {
-            let turns = calculate_turn_distance(
+        for (u_pos, u_stats, u_faction) in &my_unit_distances {
+            let p_turns_map = crate::ai::turn_distance::calculate_all_turn_distances_cached(
                 &map,
                 &registry,
                 &unit_positions,
-                (u_pos.x, u_pos.y),
                 (p_pos.x, p_pos.y),
                 u_stats.movement_type,
                 u_stats.max_movement,
-                perspective_player,
-                &mut turn_cache,
+                *u_faction,
+                turn_cache,
             );
-            if turns < min_my_turns {
-                min_my_turns = turns;
+            if let Some(&turns) = p_turns_map.get(u_pos) {
+                if turns < min_my_turns {
+                    min_my_turns = turns;
+                }
             }
         }
 
-        // 敵軍の最短到達ターン数を計算
+        // 敵軍 of 最短到達ターン数を計算 (拠点始点 SSSP から逆引き)
         let mut min_enemy_turns = 99;
-        for (u_pos, u_stats) in &enemy_units {
-            // 敵ユニットの勢力
-            let enemy_id = PlayerId(if perspective_player.0 == 1 { 2 } else { 1 });
-            let turns = calculate_turn_distance(
+        for (u_pos, u_stats, u_faction) in &enemy_unit_distances {
+            let p_turns_map = crate::ai::turn_distance::calculate_all_turn_distances_cached(
                 &map,
                 &registry,
                 &unit_positions,
-                (u_pos.x, u_pos.y),
                 (p_pos.x, p_pos.y),
                 u_stats.movement_type,
                 u_stats.max_movement,
-                enemy_id,
-                &mut turn_cache,
+                *u_faction,
+                turn_cache,
             );
-            if turns < min_enemy_turns {
-                min_enemy_turns = turns;
+            if let Some(&turns) = p_turns_map.get(u_pos) {
+                if turns < min_enemy_turns {
+                    min_enemy_turns = turns;
+                }
             }
         }
 
@@ -490,10 +507,10 @@ mod tests {
         world.spawn(Property::new(Terrain::Factory, Some(p2), 200));
         world.spawn(Property::new(Terrain::City, None, 200));
 
-        let score = evaluate_board(&mut world, p1);
+        let score = evaluate_board(&mut world, p1, None);
         assert_eq!(score, -4500); // 簡易版の計算
 
-        let score_p2 = evaluate_board(&mut world, p2);
+        let score_p2 = evaluate_board(&mut world, p2, None);
         assert_eq!(score_p2, 4500);
     }
 }

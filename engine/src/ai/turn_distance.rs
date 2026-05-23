@@ -3,11 +3,12 @@
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::manual_checked_ops)]
 
-use crate::components::PlayerId;
+use crate::components::{GridPosition, PlayerId};
 use crate::resources::{Map, MovementType, master_data::MasterDataRegistry};
 use crate::systems::movement::{OccupantInfo, get_valid_movement_cost};
 use bevy_ecs::prelude::*;
 use std::collections::{BinaryHeap, HashMap};
+use std::sync::Arc;
 
 /// ターン数ベースの距離計算をキャッシュするためのリソース
 #[derive(Resource, Default)]
@@ -139,6 +140,123 @@ pub fn calculate_turn_distance(
     cache.cache.insert(cache_key, u32::MAX);
     u32::MAX
 }
+
+/// 始点（start）からマップ上のすべての到達可能な座標への最短到達ターン数をダイクストラ法で一括計算し、
+/// HashMap として返します。
+pub fn calculate_all_turn_distances(
+    map: &Map,
+    registry: &MasterDataRegistry,
+    unit_positions: &HashMap<(usize, usize), OccupantInfo>,
+    start: (usize, usize),
+    movement_type: MovementType,
+    max_mp: u32,
+    player_id: PlayerId,
+) -> HashMap<GridPosition, u32> {
+    let mut dist = HashMap::new();
+    let mut heap = BinaryHeap::new();
+    let mut turns_map = HashMap::new();
+
+    if max_mp == 0 {
+        return turns_map;
+    }
+
+    dist.insert(start, 0);
+    heap.push(State {
+        cost: 0,
+        position: start,
+    });
+
+    while let Some(State { cost, position }) = heap.pop() {
+        if cost > *dist.get(&position).unwrap_or(&u32::MAX) {
+            continue;
+        }
+
+        for next_pos in map.get_adjacent(position.0, position.1) {
+            let Some(next_terrain) = map.get_terrain(next_pos.0, next_pos.1) else {
+                continue;
+            };
+
+            let Some(move_cost) = get_valid_movement_cost(registry, movement_type, next_terrain) else {
+                continue;
+            };
+
+            // 敵ユニットによるゾック（通行不可）判定
+            if let Some(occupant) = unit_positions.get(&next_pos) {
+                if occupant.player_id != player_id {
+                    continue; // 敵がいるマスは通過不可
+                }
+            }
+
+            let next_cost = cost + move_cost;
+            let current_best = *dist.get(&next_pos).unwrap_or(&u32::MAX);
+
+            if next_cost < current_best {
+                dist.insert(next_pos, next_cost);
+                heap.push(State {
+                    cost: next_cost,
+                    position: next_pos,
+                });
+            }
+        }
+    }
+
+    // コスト (move_cost の合計) をターン数 (ceil(cost / max_mp)) に変換
+    for (pos, cost) in dist {
+        let turns = (cost + max_mp - 1) / max_mp;
+        turns_map.insert(GridPosition { x: pos.0, y: pos.1 }, turns);
+    }
+
+    turns_map
+}
+
+/// AIの意思決定・ビーム探索プロセスにおいて、個別に確保して使い回すためのキャッシュ領域。
+/// メモリー肥大化を防ぎ、かつ同一ターン内の探索全体でキャッシュを安全に共有します。
+pub struct AiTurnCache {
+    /// キー: (始点x, 始点y, 移動タイプ, 移動力, 勢力ID)
+    /// 値: その始点からマップ上の全到達座標への最短到達ターン数テーブル (Arc)
+    pub sssp_cache: HashMap<(usize, usize, MovementType, u32, PlayerId), Arc<HashMap<crate::components::GridPosition, u32>>>,
+}
+
+impl AiTurnCache {
+    pub fn new() -> Self {
+        Self {
+            sssp_cache: HashMap::new(),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.sssp_cache.clear();
+    }
+}
+
+impl Default for AiTurnCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// キャッシュを利用して、始点から全座標への最短ターン数テーブルを一括取得します。
+pub fn calculate_all_turn_distances_cached(
+    map: &Map,
+    registry: &MasterDataRegistry,
+    unit_positions: &HashMap<(usize, usize), OccupantInfo>,
+    start: (usize, usize),
+    movement_type: MovementType,
+    max_mp: u32,
+    player_id: PlayerId,
+    cache: &mut AiTurnCache,
+) -> Arc<HashMap<crate::components::GridPosition, u32>> {
+    let key = (start.0, start.1, movement_type, max_mp, player_id);
+    if let Some(cached_map) = cache.sssp_cache.get(&key) {
+        return cached_map.clone(); // Arc の clone なので極めて高速
+    }
+
+    let result = calculate_all_turn_distances(map, registry, unit_positions, start, movement_type, max_mp, player_id);
+    let shared_result = Arc::new(result);
+    cache.sssp_cache.insert(key, shared_result.clone());
+    shared_result
+}
+
 
 #[cfg(test)]
 mod tests {

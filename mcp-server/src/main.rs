@@ -110,7 +110,7 @@ impl OpenWarsAiServer {
         let mut state_lock = self.state.lock().await;
         if let Some(state) = state_lock.as_mut() {
             let player_id = parse_player_id(args.player_id)?;
-            let score = engine::ai::eval::evaluate_board(&mut state.world, player_id);
+            let score = engine::ai::eval::evaluate_board(&mut state.world, player_id, None);
             Ok(serde_json::json!({
                 "player_id": args.player_id,
                 "score": score
@@ -391,7 +391,7 @@ impl OpenWarsAiServer {
                 (p.id, ms.active_player_index)
             };
 
-            let before_score = engine::ai::eval::evaluate_board(&mut state.world, active_player_id);
+            let before_score = engine::ai::eval::evaluate_board(&mut state.world, active_player_id, None);
 
             let mut actions_taken = vec![];
             loop {
@@ -408,7 +408,7 @@ impl OpenWarsAiServer {
                 }
             }
 
-            let after_score = engine::ai::eval::evaluate_board(&mut state.world, active_player_id);
+            let after_score = engine::ai::eval::evaluate_board(&mut state.world, active_player_id, None);
 
             Ok(serde_json::json!({
                 "actions_taken": actions_taken,
