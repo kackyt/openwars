@@ -6,8 +6,8 @@ from collections import defaultdict
 
 # 定数定義
 MAX_TURNS = 60  # 1ゲームの最大ターン数
-MAPS_TO_TEST = ["map_1", "island_map"]  # 評価に使用するマップ一覧
-GAMES_PER_MATCHUP = 5  # 各先攻後攻の組み合わせでの対戦数（合計: マップ数 * 2パターン * N回）
+MAPS_TO_TEST = ["map_1", "map_2", "map_3"]  # 評価に使用するマップ一覧
+GAMES_PER_MATCHUP = 1  # 各先攻後攻の組み合わせでの対戦数（合計: マップ数 * 2パターン * N回）
 
 # 環境変数の設定
 env = os.environ.copy()
@@ -18,7 +18,7 @@ os.system('taskkill /F /IM mcp-server.exe >nul 2>&1')
 
 # MCP サーバープロセスの起動
 p = subprocess.Popen(
-    ['target/debug/mcp-server.exe'],
+    ['target/release/mcp-server.exe'],
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
@@ -127,13 +127,11 @@ def run_single_game(map_name, p1_version, p2_version):
         
         total_thinking_time[player_id] += elapsed
         turn_counts[player_id] += 1
-        
-        # フェーズを進める (NextPhaseCommand)
-        call_tool("execute_action", {"action_type": "next_phase"})
-        
+                
         # 状態を再取得してターン数を更新
         next_state = call_tool("get_board_state")
         turn = next_state["turn"]
+        print(f"turn: {turn} ({player_id}) end {elapsed} ms")
     
     # ターン上限に達した場合は、残存リソース（ユニット総コスト＋資金）が多い方を暫定勝者とする
     print("    -> Turn limit reached. Resolving by resources...")
