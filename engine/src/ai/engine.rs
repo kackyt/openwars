@@ -1311,8 +1311,38 @@ pub fn decide_ai_action_v2(
                         }
                     }
                     base_tile_score += (100 - min_recovery_dist as i32).max(0) * 500;
+                } else if stats.can_capture {
+                    // 占領可能ユニット（歩兵）は、自律的に最寄りの未占領・敵拠点に向かう
+                    let mut min_prop_dist = 99;
+                    for (p_pos, p_terrain, p_owner) in &properties {
+                        if *p_owner != Some(player_id)
+                            && (*p_terrain == Terrain::City
+                                || *p_terrain == Terrain::Factory
+                                || *p_terrain == Terrain::Capital
+                                || *p_terrain == Terrain::Airport
+                                || *p_terrain == Terrain::Port)
+                        {
+                            let d = calculate_turn_distance(
+                                &map,
+                                &registry,
+                                &unit_positions,
+                                (current_grid.x, current_grid.y),
+                                (p_pos.x, p_pos.y),
+                                stats.movement_type,
+                                stats.max_movement,
+                                player_id,
+                                &mut turn_cache,
+                            );
+                            if d < min_prop_dist {
+                                min_prop_dist = d;
+                            }
+                        }
+                    }
+                    if min_prop_dist < 99 {
+                        base_tile_score += (100 - min_prop_dist as i32).max(0) * 400;
+                    }
                 } else {
-                    // 健全な SoloFallback: 貪欲に最寄りの部隊目標に向かって合流接近する
+                    // 健全な SoloFallback (戦闘ユニットなど): 貪欲に最寄りの部隊目標に向かって合流接近する
                     let mut min_target_dist = 99;
                     for squad in &manager.squads {
                         if let Some(t) = squad.target {
@@ -1499,7 +1529,7 @@ pub fn decide_ai_action_v2(
                     let dist_diff = (best_target_dist as i32 - target_dist).abs();
                     base_tile_score += (100 - dist_diff).max(0) * 100;
 
-                    if best_target_dist < stats.min_range as u32 {
+                    if best_target_dist < stats.min_range {
                         base_tile_score -= 2000;
                     }
                 } else {

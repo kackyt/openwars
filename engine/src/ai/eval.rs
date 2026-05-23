@@ -8,7 +8,7 @@ use crate::resources::{Map, Terrain, master_data::MasterDataRegistry};
 use bevy_ecs::prelude::*;
 use std::collections::HashMap;
 
-const TERRITORY_WEIGHT: i32 = 500;
+const TERRITORY_WEIGHT: i32 = 2500;
 const CONSOLIDATION_RADIUS_TURNS: u32 = 2;
 
 /// 盤面の静的評価関数。

@@ -176,26 +176,17 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
     }
 
     // --- 2. 実行予算の算出 ---
-    const MIN_BUFFER: u32 = 1000;
     let available_funds = if strategy.phase == GamePhase::Defense {
-        current_funds.saturating_sub(MIN_BUFFER)
+        current_funds
     } else {
-        // 貯金目標がある場合、その半分程度は今ターン使わずに残す
-        // ただし、歩兵(1000G)すら買えなくなるのは避けるため、下限を設ける
-        let reserve_cut = reserves / 2;
-        let mut budget = current_funds
-            .saturating_sub(MIN_BUFFER)
-            .saturating_sub(reserve_cut);
+        // 貯金目標がある場合、貯金目標の達成を確実にするため、バッファを含めて予算を制限する
+        let reserve_cut = if reserves > 0 { reserves / 2 + 1000 } else { 0 };
+        let mut budget = current_funds.saturating_sub(reserve_cut);
 
-        // ユニット数が極端に少ない(5体未満)場合は、予算制限を緩和して生産を優先する
-        if my_units.len() < 5 {
-            budget = current_funds.saturating_sub(500);
-        }
-
-        // もし資金があり、かつ歩兵すら買えないほど予算が削られているなら、
-        // 貯金目標を少し妥協して歩兵1体分(1000G)は確保する
-        if current_funds >= 2000 && budget < 1000 {
-            budget = 1000;
+        // ユニット数が極端に少ない(5体未満)場合、または予算が歩兵コスト(1000G)を下回っている場合は、
+        // 貯金よりも即座の占領・戦力拡張を最優先するため全額を実行予算とする
+        if my_units.len() < 5 || budget < 1000 {
+            budget = current_funds;
         }
         budget
     };

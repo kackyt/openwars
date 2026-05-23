@@ -176,7 +176,8 @@ pub fn calculate_all_turn_distances(
                 continue;
             };
 
-            let Some(move_cost) = get_valid_movement_cost(registry, movement_type, next_terrain) else {
+            let Some(move_cost) = get_valid_movement_cost(registry, movement_type, next_terrain)
+            else {
                 continue;
             };
 
@@ -214,7 +215,11 @@ pub fn calculate_all_turn_distances(
 pub struct AiTurnCache {
     /// キー: (始点x, 始点y, 移動タイプ, 移動力, 勢力ID)
     /// 値: その始点からマップ上の全到達座標への最短到達ターン数テーブル (Arc)
-    pub sssp_cache: HashMap<(usize, usize, MovementType, u32, PlayerId), Arc<HashMap<crate::components::GridPosition, u32>>>,
+    #[allow(clippy::type_complexity)]
+    pub sssp_cache: HashMap<
+        (usize, usize, MovementType, u32, PlayerId),
+        Arc<HashMap<crate::components::GridPosition, u32>>,
+    >,
 }
 
 impl AiTurnCache {
@@ -251,12 +256,19 @@ pub fn calculate_all_turn_distances_cached(
         return cached_map.clone(); // Arc の clone なので極めて高速
     }
 
-    let result = calculate_all_turn_distances(map, registry, unit_positions, start, movement_type, max_mp, player_id);
+    let result = calculate_all_turn_distances(
+        map,
+        registry,
+        unit_positions,
+        start,
+        movement_type,
+        max_mp,
+        player_id,
+    );
     let shared_result = Arc::new(result);
     cache.sssp_cache.insert(key, shared_result.clone());
     shared_result
 }
-
 
 #[cfg(test)]
 mod tests {

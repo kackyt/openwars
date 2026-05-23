@@ -159,6 +159,27 @@ pub fn update_squads(world: &mut World, perspective_player: PlayerId) {
         }
     }
 
+    // 占領完了した Capture 部隊の解散
+    let mut properties_ownership = HashMap::new();
+    {
+        let mut q_props = world.query::<(&GridPosition, &Property)>();
+        for (pos, prop) in q_props.iter(world) {
+            properties_ownership.insert(*pos, prop.owner_id);
+        }
+    }
+
+    manager.squads.retain(|squad| {
+        if squad.mission_type == MissionType::Capture {
+            if let Some(target_pos) = squad.target {
+                if properties_ownership.get(&target_pos) == Some(&Some(perspective_player)) {
+                    // 自軍の所有になったので解散
+                    return false;
+                }
+            }
+        }
+        true
+    });
+
     // メンバーが0になった部隊の解散
     manager
         .squads
@@ -340,11 +361,27 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
 
     // C. 占領部隊の立ち上げ（Expansionフェーズ）
     for unowned_pos in &strategy.unowned_properties {
-        let is_on_base_island = island_map
-            .get_island_at(unowned_pos)
-            .map_or(false, |i| base_islands.contains(&i.id));
+        let target_island_opt = island_map.get_island_at(unowned_pos);
+        if target_island_opt.is_none() {
+            continue;
+        }
+        let target_island = target_island_opt.unwrap();
+        let is_on_base_island = base_islands.contains(&target_island.id);
 
-        if is_on_base_island && !free_infantry.is_empty() {
+        // この未占領拠点と同じ島にいるフリーの歩兵を探す
+        let inf_on_same_island_idx = free_infantry.iter().position(|(_, pos, _)| {
+            island_map
+                .get_island_at(pos)
+                .map_or(false, |i| i.id == target_island.id)
+        });
+
+        // 占領部隊を立ち上げられる条件：
+        // 1. その島にフリーの歩兵がすでにいる
+        // 2. または、自軍の初期島（Base Island）であり、フリーの歩兵が（どの島でもいいから）存在する
+        let can_capture =
+            inf_on_same_island_idx.is_some() || (is_on_base_island && !free_infantry.is_empty());
+
+        if can_capture {
             let exists = manager
                 .squads
                 .iter()
@@ -355,7 +392,15 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                 squad.target = Some(*unowned_pos);
                 squad.phase = MissionPhase::Forming;
 
-                let (inf_ent, _, _) = free_infantry.pop().unwrap();
+                // 割り当てる歩兵の選択：
+                // 同じ島にいる歩兵がいればそれを優先、いなければ free_infantry の最後の歩兵を割り当てる
+                let assigned_inf_idx = if let Some(idx) = inf_on_same_island_idx {
+                    idx
+                } else {
+                    free_infantry.len() - 1
+                };
+
+                let (inf_ent, _, _) = free_infantry.remove(assigned_inf_idx);
                 squad.members.insert(inf_ent);
             }
         }
@@ -690,7 +735,17 @@ pub fn execute_transport_squad_step(
                         target_pos: t_pos,
                     },
                 ));
-            } else {
+            }
+
+            // 1. 輸送機がまだ行動していないなら、輸送機を歩兵へ近づける
+            let transport_moved = world
+                .get::<crate::components::HasMoved>(transport_entity)
+                .map_or(true, |h| h.0);
+            let transport_action_completed = world
+                .get::<crate::components::ActionCompleted>(transport_entity)
+                .map_or(true, |a| a.0);
+
+            if !transport_moved && !transport_action_completed {
                 let mut best_tile = t_pos;
                 let mut min_dist = dist;
 
@@ -707,6 +762,59 @@ pub fn execute_transport_squad_step(
                 }
                 return Some((
                     transport_entity,
+                    crate::ai::engine::AiCommand::Wait {
+                        target_pos: best_tile,
+                    },
+                ));
+            }
+
+            // 2. 輸送機がすでに行動済みなら、歩兵を輸送機へ近づける
+            let cargo_moved = world
+                .get::<crate::components::HasMoved>(cargo_entity)
+                .map_or(true, |h| h.0);
+            let cargo_action_completed = world
+                .get::<crate::components::ActionCompleted>(cargo_entity)
+                .map_or(true, |a| a.0);
+
+            if !cargo_moved && !cargo_action_completed {
+                let c_stats = world.get::<UnitStats>(cargo_entity).cloned()?;
+                let c_fuel = world
+                    .get::<crate::components::Fuel>(cargo_entity)
+                    .map(|f| f.current)?;
+
+                let cargo_reachable = {
+                    let map = world.resource::<Map>();
+                    let registry = world.resource::<MasterDataRegistry>();
+                    crate::systems::movement::calculate_reachable_tiles(
+                        map,
+                        &unit_positions,
+                        (cargo_pos.x, cargo_pos.y),
+                        c_stats.movement_type,
+                        c_stats.max_movement,
+                        c_fuel,
+                        t_faction,
+                        c_stats.unit_type,
+                        registry,
+                    )
+                };
+
+                let mut best_tile = cargo_pos;
+                let mut min_dist = dist;
+
+                for target_tile in &cargo_reachable {
+                    let d = (target_tile.0 as i32 - t_pos.x as i32).abs()
+                        + (target_tile.1 as i32 - t_pos.y as i32).abs();
+                    if d < min_dist {
+                        min_dist = d;
+                        best_tile = GridPosition {
+                            x: target_tile.0,
+                            y: target_tile.1,
+                        };
+                    }
+                }
+
+                return Some((
+                    cargo_entity,
                     crate::ai::engine::AiCommand::Wait {
                         target_pos: best_tile,
                     },

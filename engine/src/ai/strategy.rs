@@ -158,10 +158,8 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                 if prop.terrain == crate::resources::Terrain::Capital {
                     my_capital_pos = Some(*pos);
                 }
-                // 自軍の生産拠点がある島IDを収集
-                if master_data.is_production_facility(prop.terrain.as_str())
-                    && let Some(island_id) = get_island_id(pos)
-                {
+                // 自軍の任意の拠点がある島IDを収集
+                if let Some(island_id) = get_island_id(pos) {
                     my_base_island_ids.insert(island_id);
                 }
             } else if prop.owner_id.is_none() {
@@ -195,6 +193,16 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                 my_units.push((*pos, stats.clone()));
             } else {
                 enemy_units.push((*pos, stats.clone()));
+            }
+        }
+    }
+
+    // 自軍の歩兵が存在する島IDも収集対象に加える
+    for (pos, stats) in &my_units {
+        #[allow(clippy::collapsible_if)]
+        if stats.can_capture {
+            if let Some(island_id) = get_island_id(pos) {
+                my_base_island_ids.insert(island_id);
             }
         }
     }
@@ -357,7 +365,14 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
             strategy.capture_demand = base_demand as u32;
         }
     } else {
-        strategy.capture_demand = 0;
+        // 安全バリア：マップ全体で未占領の拠点が存在し、かつ自軍の歩兵の総数が極めて少ない（3体未満）場合、
+        // 島の制限にかかわらず最低限の歩兵需要（1体）を常に発生させる
+        let total_my_infantry = my_units.iter().filter(|(_, s)| s.can_capture).count();
+        if !unowned_properties.is_empty() && total_my_infantry < 3 {
+            strategy.capture_demand = 1;
+        } else {
+            strategy.capture_demand = 0;
+        }
     }
 
     // 包括的需要マトリクスの計算

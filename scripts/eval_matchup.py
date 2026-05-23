@@ -1,12 +1,13 @@
 import subprocess
 import json
 import os
+import sys
 import time
 from collections import defaultdict
 
 # 定数定義
-MAX_TURNS = 60  # 1ゲームの最大ターン数
-MAPS_TO_TEST = ["map_3"]  # 評価に使用するマップ一覧
+MAX_TURNS = 30  # 1ゲームの最大ターン数
+MAPS_TO_TEST = ["map_1", "map_2", "map_3"]  # 評価に使用するマップ一覧
 GAMES_PER_MATCHUP = 1  # 各先攻後攻の組み合わせでの対戦数（合計: マップ数 * 2パターン * N回）
 
 # 環境変数の設定
@@ -21,7 +22,7 @@ p = subprocess.Popen(
     ['target/release/mcp-server.exe'],
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
+    stderr=sys.stderr,
     text=True,
     encoding='utf-8',
     env=env
@@ -133,19 +134,24 @@ def run_single_game(map_name, p1_version, p2_version):
         next_state = call_tool("get_board_state")
         turn = next_state["turn"]
     
-    # ターン上限に達した場合は、残存リソース（ユニット総コスト＋資金）が多い方を暫定勝者とする
-    print("    -> Turn limit reached. Resolving by resources...")
+    # ターン上限に達した場合は、状態価値スコア（拠点数 * 2000 + ユニットコスト、所持金無視）が高い方を暫定勝者とする
+    print("    -> Turn limit reached. Resolving by board state value...")
     state = call_tool("get_board_state")
     p1 = state["players"][0]
     p2 = state["players"][1]
     
-    p1_total = p1["funds"] + p1.get("unit_cost", 0)
-    p2_total = p2["funds"] + p2.get("unit_cost", 0)
+    p1_props = p1.get("property_count", 0)
+    p2_props = p2.get("property_count", 0)
+    p1_unit_cost = p1.get("unit_cost", 0)
+    p2_unit_cost = p2.get("unit_cost", 0)
     
-    winner_id = 1 if p1_total > p2_total else (2 if p2_total > p1_total else None)
-    winner_str = f"Player {winner_id} (Resource Decision)" if winner_id else "Draw"
+    p1_score = p1_props * 20000 + p1_unit_cost
+    p2_score = p2_props * 20000 + p2_unit_cost
     
-    print(f"    -> Winner by Resource: {winner_str} (P1: {p1_total}G vs P2: {p2_total}G)")
+    winner_id = 1 if p1_score > p2_score else (2 if p2_score > p1_score else None)
+    winner_str = f"Player {winner_id} (State Value Decision)" if winner_id else "Draw"
+    
+    print(f"    -> Winner by Board Value: {winner_str} (P1 Score: {p1_score} [Props: {p1_props}, Units: {p1_unit_cost}] vs P2 Score: {p2_score} [Props: {p2_props}, Units: {p2_unit_cost}])")
     
     return {
         "result": winner_str,
