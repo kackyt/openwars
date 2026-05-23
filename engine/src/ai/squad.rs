@@ -328,7 +328,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                         )
                     });
 
-                    let assign_count = free_combat_units.len().min(2);
+                    let assign_count = free_combat_units.len().min(3);
                     for _ in 0..assign_count {
                         let (ent, _, _) = free_combat_units.remove(0);
                         squad.members.insert(ent);
@@ -392,7 +392,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                 )
             });
 
-            let assign_count = free_combat_units.len().min(2);
+            let assign_count = free_combat_units.len().min(3);
             for _ in 0..assign_count {
                 let (ent, _, _) = free_combat_units.remove(0);
                 squad.members.insert(ent);

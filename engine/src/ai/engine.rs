@@ -1193,6 +1193,13 @@ pub fn decide_ai_action_v2(
             .map(|(p, prop)| (*p, prop.terrain, prop.owner_id))
             .collect()
     };
+    let enemy_units: Vec<(GridPosition, crate::resources::UnitType, u32, u32, u32, u32)> = {
+        let mut q = world.query::<(&GridPosition, &Faction, &UnitStats, &Health)>();
+        q.iter(world)
+            .filter(|(_, f, _, h)| f.0 != player_id && h.current > 0)
+            .map(|(p, _, s, h)| (*p, s.unit_type, s.cost, h.current, s.min_range, s.max_range))
+            .collect()
+    };
     let damage_chart = world.resource::<crate::resources::DamageChart>().clone();
 
     let mut turn_cache = TurnDistanceCache::default();
@@ -1276,7 +1283,7 @@ pub fn decide_ai_action_v2(
                     player_id,
                     &mut turn_cache,
                 );
-                base_tile_score += (20 - turn_dist).max(0) as i32 * 300;
+                base_tile_score += (100 - turn_dist as i32).max(0) * 300;
             }
 
             // 2. SoloFallback / 孤立・戦闘不能のインセンティブ
@@ -1303,7 +1310,7 @@ pub fn decide_ai_action_v2(
                             }
                         }
                     }
-                    base_tile_score += (20 - min_recovery_dist).max(0) as i32 * 500;
+                    base_tile_score += (100 - min_recovery_dist as i32).max(0) * 500;
                 } else {
                     // 健全な SoloFallback: 貪欲に最寄りの部隊目標に向かって合流接近する
                     let mut min_target_dist = 99;
@@ -1326,8 +1333,177 @@ pub fn decide_ai_action_v2(
                         }
                     }
                     if min_target_dist < 99 {
-                        base_tile_score += (20 - min_target_dist).max(0) as i32 * 300;
+                        base_tile_score += (100 - min_target_dist as i32).max(0) * 300;
                     }
+                }
+            }
+
+            // (A) タクシー帰りロジック: 空の輸送車は生産拠点へ引き返す
+            let is_empty_transport = stats.max_cargo > 0
+                && world
+                    .get::<crate::components::CargoCapacity>(unit_entity)
+                    .is_some_and(|c| c.loaded.is_empty());
+
+            if is_empty_transport {
+                let mut min_base_dist = 99;
+                for (p_pos, p_terrain, p_owner) in &properties {
+                    if *p_owner == Some(player_id)
+                        && registry.is_production_facility(p_terrain.as_str())
+                    {
+                        let d = calculate_turn_distance(
+                            &map,
+                            &registry,
+                            &unit_positions,
+                            (current_grid.x, current_grid.y),
+                            (p_pos.x, p_pos.y),
+                            stats.movement_type,
+                            stats.max_movement,
+                            player_id,
+                            &mut turn_cache,
+                        );
+                        if d < min_base_dist {
+                            min_base_dist = d;
+                        }
+                    }
+                }
+                base_tile_score += (100 - min_base_dist as i32).max(0) * 500;
+            }
+
+            // (B) 歩兵の待機移動ロジック: やることがない歩兵は海岸へ向かう
+            let is_infantry = stats.unit_type == crate::resources::UnitType::Infantry
+                || stats.unit_type == crate::resources::UnitType::Mech;
+            if is_infantry
+                && !is_combat_ineffective
+                && is_unit_stranded(world, &pos, player_id, &properties, &enemy_units)
+            {
+                let mut min_coast_dist = 99;
+                let check_range = 10;
+                let min_x = current_grid.x.saturating_sub(check_range);
+                let max_x = (current_grid.x + check_range).min(map.width - 1);
+                let min_y = current_grid.y.saturating_sub(check_range);
+                let max_y = (current_grid.y + check_range).min(map.height - 1);
+
+                for cy in min_y..=max_y {
+                    for cx in min_x..=max_x {
+                        if map.get_terrain(cx, cy) == Some(crate::resources::Terrain::Sea) {
+                            let d = (current_grid.x as i32 - cx as i32).abs()
+                                + (current_grid.y as i32 - cy as i32).abs();
+                            if d < min_coast_dist {
+                                min_coast_dist = d;
+                            }
+                        }
+                    }
+                }
+
+                if min_coast_dist < 99 && min_coast_dist > 0 {
+                    base_tile_score += (20 - min_coast_dist).max(0) * 100;
+                }
+            }
+
+            // (C) 敵ユニットへの接近・射程維持スコア (squad_target がない場合のみ)
+            if squad_target.is_none() {
+                let mut best_target_dist = 99;
+                let mut max_potential = -1.0;
+
+                for (e_pos, e_type, e_cost, e_hp, _, _) in &enemy_units {
+                    let d = calculate_turn_distance(
+                        &map,
+                        &registry,
+                        &unit_positions,
+                        (current_grid.x, current_grid.y),
+                        (e_pos.x, e_pos.y),
+                        stats.movement_type,
+                        stats.max_movement,
+                        player_id,
+                        &mut turn_cache,
+                    );
+
+                    let mut effective_dist = d;
+                    if stats.movement_type == crate::resources::MovementType::Ship
+                        && let Some(e_terrain) = map.get_terrain(e_pos.x, e_pos.y)
+                    {
+                        let move_cost = registry
+                            .get_movement_cost(
+                                crate::resources::MovementType::Ship,
+                                e_terrain.as_str(),
+                            )
+                            .unwrap_or(99);
+                        if move_cost >= 99 && stats.max_range <= 1 {
+                            effective_dist += 20;
+                        }
+                    }
+
+                    let base_dmg = damage_chart
+                        .get_base_damage(stats.unit_type, *e_type)
+                        .or_else(|| {
+                            damage_chart.get_base_damage_secondary(stats.unit_type, *e_type)
+                        })
+                        .unwrap_or(0);
+
+                    let potential =
+                        base_dmg as f32 * (*e_cost as f32 / 100.0) * (2.0 - *e_hp as f32 / 100.0);
+
+                    if potential > max_potential {
+                        max_potential = potential;
+                        best_target_dist = effective_dist;
+                    } else if (potential - max_potential).abs() < 0.1
+                        && effective_dist < best_target_dist
+                    {
+                        best_target_dist = effective_dist;
+                    }
+                }
+
+                if max_potential <= 0.0 {
+                    let mut min_dist = 99;
+                    for (e_pos, _, _, _, _, _) in &enemy_units {
+                        let d = calculate_turn_distance(
+                            &map,
+                            &registry,
+                            &unit_positions,
+                            (current_grid.x, current_grid.y),
+                            (e_pos.x, e_pos.y),
+                            stats.movement_type,
+                            stats.max_movement,
+                            player_id,
+                            &mut turn_cache,
+                        );
+                        if d < min_dist {
+                            min_dist = d;
+                        }
+                    }
+                    if enemy_units.is_empty() {
+                        for (p_pos, _, p_owner) in &properties {
+                            if *p_owner != Some(player_id) {
+                                let d = calculate_turn_distance(
+                                    &map,
+                                    &registry,
+                                    &unit_positions,
+                                    (current_grid.x, current_grid.y),
+                                    (p_pos.x, p_pos.y),
+                                    stats.movement_type,
+                                    stats.max_movement,
+                                    player_id,
+                                    &mut turn_cache,
+                                );
+                                if d < min_dist {
+                                    min_dist = d;
+                                }
+                            }
+                        }
+                    }
+                    best_target_dist = min_dist;
+                }
+
+                if stats.min_range > 1 {
+                    let target_dist = stats.max_range as i32;
+                    let dist_diff = (best_target_dist as i32 - target_dist).abs();
+                    base_tile_score += (100 - dist_diff).max(0) * 100;
+
+                    if best_target_dist < stats.min_range as u32 {
+                        base_tile_score -= 2000;
+                    }
+                } else {
+                    base_tile_score += (100 - best_target_dist as i32).max(0) * 100;
                 }
             }
 
