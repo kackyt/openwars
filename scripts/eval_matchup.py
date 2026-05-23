@@ -70,7 +70,7 @@ def call_tool(name, arguments=None, req_id=1):
 # 1. MCP初期化シーケンス
 send_request("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "ai-matchup-evaluator", "version": "1.0.0"}}, 0)
 receive_response()
-send_request("notifications/initialized", None)
+# send_request("notifications/initialized", None)
 
 def run_single_game(map_name, p1_version, p2_version):
     """指定されたマップとAIの組み合わせで1ゲーム実行し、結果を辞書で返します。"""

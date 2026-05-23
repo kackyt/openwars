@@ -34,6 +34,9 @@ impl PlayerAiSettings {
 
     /// 指定したプレイヤーのAIバージョンを取得します。デフォルトは V1 とします。
     pub fn get_version(&self, player_id: PlayerId) -> AiVersion {
-        self.versions.get(&player_id).copied().unwrap_or(AiVersion::V1)
+        self.versions
+            .get(&player_id)
+            .copied()
+            .unwrap_or(AiVersion::V1)
     }
 }

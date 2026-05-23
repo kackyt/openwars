@@ -132,10 +132,17 @@ impl OpenWarsAiServer {
             let version = match args.version.as_str() {
                 "V1" => engine::ai::AiVersion::V1,
                 "V2" => engine::ai::AiVersion::V2,
-                _ => return Err(format!("Invalid AI version: {}. Must be 'V1' or 'V2'", args.version)),
+                _ => {
+                    return Err(format!(
+                        "Invalid AI version: {}. Must be 'V1' or 'V2'",
+                        args.version
+                    ));
+                }
             };
 
-            let mut settings = state.world.get_resource_mut::<engine::ai::PlayerAiSettings>();
+            let mut settings = state
+                .world
+                .get_resource_mut::<engine::ai::PlayerAiSettings>();
             if let Some(ref mut s) = settings {
                 s.set_version(player_id, version);
             } else {
@@ -144,7 +151,10 @@ impl OpenWarsAiServer {
                 state.world.insert_resource(s);
             }
 
-            Ok(format!("Successfully set Player {} to {:?}", args.player_id, version))
+            Ok(format!(
+                "Successfully set Player {} to {:?}",
+                args.player_id, version
+            ))
         } else {
             Err("Map not loaded".into())
         }
@@ -316,7 +326,7 @@ impl OpenWarsAiServer {
                 Some(engine::resources::GameOverCondition::Draw) => serde_json::json!({
                     "status": "draw"
                 }),
-                None => serde_json::json!(null)
+                None => serde_json::json!(null),
             };
 
             let mut players_info = vec![];

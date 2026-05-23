@@ -1,6 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::manual_div_ceil)]
 #![allow(clippy::collapsible_if)]
+#![allow(clippy::manual_checked_ops)]
 
 use crate::components::PlayerId;
 use crate::resources::{Map, MovementType, master_data::MasterDataRegistry};
@@ -105,7 +106,8 @@ pub fn calculate_turn_distance(
                 continue;
             };
 
-            let Some(move_cost) = get_valid_movement_cost(registry, movement_type, next_terrain) else {
+            let Some(move_cost) = get_valid_movement_cost(registry, movement_type, next_terrain)
+            else {
                 continue;
             };
 
@@ -145,7 +147,12 @@ mod tests {
 
     #[test]
     fn test_turn_distance() {
-        let map = Map::new(5, 1, Terrain::Plains, crate::resources::GridTopology::Square);
+        let map = Map::new(
+            5,
+            1,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
         let registry = MasterDataRegistry::load().unwrap_or_default();
         let mut cache = TurnDistanceCache::default();
         let unit_positions = HashMap::new();
@@ -182,7 +189,12 @@ mod tests {
 
     #[test]
     fn test_turn_distance_unreachable() {
-        let mut map = Map::new(5, 1, Terrain::Plains, crate::resources::GridTopology::Square);
+        let mut map = Map::new(
+            5,
+            1,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
         let _ = map.set_terrain(2, 0, Terrain::Sea); // 海は歩兵進入不可
         let registry = MasterDataRegistry::load().unwrap_or_default();
         let mut cache = TurnDistanceCache::default();

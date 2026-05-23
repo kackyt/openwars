@@ -10,5 +10,10 @@ pub mod production;
 pub mod pruning;
 pub mod strategy;
 
-pub use ai_version::{AiVersion, PlayerAiSettings};
+pub mod beam_search;
+pub mod cluster;
+pub mod simulation;
+pub mod squad;
+pub mod turn_distance;
 
+pub use ai_version::{AiVersion, PlayerAiSettings};

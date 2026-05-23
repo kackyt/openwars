@@ -25,20 +25,23 @@ pub fn detect_enemy_clusters(
     let mut query = world.query::<(Entity, &Faction, &GridPosition, &UnitStats)>();
     for (entity, faction, pos, stats) in query.iter(world) {
         if faction.0 != perspective_player {
-            enemy_units.push((entity, *pos, stats.clone()));
+            enemy_units.push((entity, *pos, stats.clone(), faction.0));
         }
     }
 
     let mut unit_positions = std::collections::HashMap::new();
     let mut q_all_units = world.query::<(&Faction, &GridPosition, &UnitStats)>();
     for (faction, pos, stats) in q_all_units.iter(world) {
-        unit_positions.insert((pos.x, pos.y), crate::systems::movement::OccupantInfo {
-            player_id: faction.0,
-            is_transport: false,
-            unit_type: stats.unit_type,
-            loadable_types: vec![],
-            free_slots: 0,
-        });
+        unit_positions.insert(
+            (pos.x, pos.y),
+            crate::systems::movement::OccupantInfo {
+                player_id: faction.0,
+                is_transport: false,
+                unit_type: stats.unit_type,
+                loadable_types: vec![],
+                free_slots: 0,
+            },
+        );
     }
 
     let mut clusters = Vec::new();
@@ -65,7 +68,7 @@ pub fn detect_enemy_clusters(
         let mut queue = vec![enemy_units[i].clone()];
         visited.insert(enemy_units[i].0);
 
-        while let Some((e, pos, stats)) = queue.pop() {
+        while let Some((e, pos, stats, enemy_player_id)) = queue.pop() {
             cluster_units.insert(e);
             total_value += stats.cost;
             total_threat += stats.cost / 1000;
@@ -84,7 +87,7 @@ pub fn detect_enemy_clusters(
                         (other_pos.x, other_pos.y),
                         stats.movement_type,
                         stats.max_movement,
-                        perspective_player,
+                        enemy_player_id,
                         &mut turn_cache,
                     );
 

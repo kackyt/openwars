@@ -1,8 +1,11 @@
+#![allow(clippy::too_many_arguments)]
+
 use crate::ai::demand::{
     DemandMatrix, average_attack_expectation, compute_demand, compute_unit_affinity,
 };
+use crate::ai::turn_distance::{TurnDistanceCache, calculate_turn_distance};
 use crate::components::{Faction, GridPosition, PlayerId, Property, UnitStats};
-use crate::resources::{MovementType, Terrain, UnitType};
+use crate::resources::{Map, MovementType, Terrain, UnitType, master_data::MasterDataRegistry};
 use bevy_ecs::prelude::*;
 use std::collections::HashMap;
 
@@ -59,33 +62,43 @@ pub struct ProductionPlan {
 
 /// 敵ユニットが特定の拠点を脅かしているかを判定するヘルパー関数。
 fn enemy_threatens_property(
+    map: &Map,
+    registry: &MasterDataRegistry,
+    unit_positions: &HashMap<(usize, usize), crate::systems::movement::OccupantInfo>,
+    turn_cache: &mut TurnDistanceCache,
+    player_id: PlayerId,
     prop_pos: &GridPosition,
-    prop_island_id: Option<usize>,
+    _prop_island_id: Option<usize>,
     enemy_pos: &GridPosition,
     enemy_stats: &UnitStats,
-    enemy_island_id: Option<usize>,
+    _enemy_island_id: Option<usize>,
 ) -> bool {
-    let dist = (prop_pos.x as i32 - enemy_pos.x as i32).abs()
-        + (prop_pos.y as i32 - enemy_pos.y as i32).abs();
+    let dist = calculate_turn_distance(
+        map,
+        registry,
+        unit_positions,
+        (enemy_pos.x, enemy_pos.y),
+        (prop_pos.x, prop_pos.y),
+        enemy_stats.movement_type,
+        enemy_stats.max_movement,
+        player_id,
+        turn_cache,
+    );
+
+    if dist == u32::MAX {
+        return false;
+    }
 
     match enemy_stats.movement_type {
         MovementType::Air => {
-            // 航空ユニットは島をまたいで長距離を移動できるため、
-            // 攻撃力を持つユニットであり、かつ「移動力 + 射程 + 猶予(3マス)」以内にいる場合に脅威と判定する
             let has_weapons = enemy_stats.max_ammo1 > 0 || enemy_stats.max_ammo2 > 0;
-            has_weapons && dist <= (enemy_stats.max_movement + enemy_stats.max_range + 3) as i32
+            has_weapons && dist <= 2
         }
         MovementType::Ship => {
-            // 海上ユニットは沿岸に近づいて攻撃するため、
-            // 攻撃力を持つユニットであり、かつ「最大射程 + 2マス」または5マス以内にいる場合に脅威と判定する
             let has_weapons = enemy_stats.max_ammo1 > 0 || enemy_stats.max_ammo2 > 0;
-            has_weapons && dist <= (enemy_stats.max_range + 2).max(5) as i32
+            has_weapons && dist <= 2
         }
-        _ => {
-            // 地上ユニットの場合、同じ島にいるか、または島を問わず距離が極めて近い（8マス未満）場合に脅威と判定する
-            let same_island = prop_island_id.is_some() && prop_island_id == enemy_island_id;
-            same_island || dist < 8
-        }
+        _ => dist <= 2,
     }
 }
 
@@ -105,6 +118,21 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
             crate::resources::master_data::MasterDataRegistry::load().unwrap_or_default()
         });
     let map = world.resource::<crate::resources::Map>().clone();
+    let mut turn_cache = TurnDistanceCache::default();
+    let mut unit_positions = HashMap::new();
+    let mut q_all_units = world.query::<(&Faction, &GridPosition, &UnitStats)>();
+    for (faction, pos, stats) in q_all_units.iter(world) {
+        unit_positions.insert(
+            (pos.x, pos.y),
+            crate::systems::movement::OccupantInfo {
+                player_id: faction.0,
+                is_transport: stats.max_cargo > 0,
+                unit_type: stats.unit_type,
+                loadable_types: stats.loadable_unit_types.clone(),
+                free_slots: stats.max_cargo,
+            },
+        );
+    }
     let island_map = world
         .get_resource::<crate::ai::islands::IslandMap>()
         .cloned()
@@ -200,10 +228,20 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
     // 首都付近に敵がいるかチェック
     let mut capital_threatened = false;
     if let Some(cap_pos) = my_capital_pos {
-        for (enemy_pos, _) in &enemy_units {
-            let dist = (cap_pos.x as i32 - enemy_pos.x as i32).abs()
-                + (cap_pos.y as i32 - enemy_pos.y as i32).abs();
-            if dist <= 5 {
+        for (enemy_pos, enemy_stats) in &enemy_units {
+            let enemy_id = PlayerId(if player_id.0 == 1 { 2 } else { 1 });
+            let dist = calculate_turn_distance(
+                &map,
+                &master_data,
+                &unit_positions,
+                (enemy_pos.x, enemy_pos.y),
+                (cap_pos.x, cap_pos.y),
+                enemy_stats.movement_type,
+                enemy_stats.max_movement,
+                enemy_id,
+                &mut turn_cache,
+            );
+            if dist <= 2 {
                 capital_threatened = true;
                 break;
             }
@@ -452,7 +490,19 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
 
         for (e_pos, e_stats) in &enemy_units {
             let e_island_id = get_island_id(e_pos);
-            if enemy_threatens_property(pos, prop_island_id, e_pos, e_stats, e_island_id) {
+            let enemy_id = PlayerId(if player_id.0 == 1 { 2 } else { 1 });
+            if enemy_threatens_property(
+                &map,
+                &master_data,
+                &unit_positions,
+                &mut turn_cache,
+                enemy_id,
+                pos,
+                prop_island_id,
+                e_pos,
+                e_stats,
+                e_island_id,
+            ) {
                 is_peaceful = false;
                 break;
             }
@@ -501,6 +551,7 @@ mod tests {
     fn test_analyze_strategy_defense() {
         let mut world = World::new();
         world.insert_resource(Map::new(15, 15, Terrain::Plains, GridTopology::Square));
+        world.insert_resource(crate::resources::MasterDataRegistry::load().unwrap());
         let p1 = PlayerId(1);
         let p2 = PlayerId(2);
 
@@ -516,6 +567,8 @@ mod tests {
             Faction(p2),
             UnitStats {
                 unit_type: UnitType::Tank,
+                max_movement: 6,
+                movement_type: crate::resources::MovementType::Tank,
                 ..UnitStats::mock()
             },
         ));
@@ -556,6 +609,8 @@ mod tests {
             Faction(p2),
             UnitStats {
                 unit_type: UnitType::Tank,
+                max_movement: 6,
+                movement_type: crate::resources::MovementType::Tank,
                 max_ammo1: 9,
                 max_ammo2: 0,
                 ..UnitStats::mock()
