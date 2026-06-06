@@ -226,7 +226,7 @@ AIが生成したドキュメント・コードは、以下のタイミングで
 
 #### コード
 
-- **変数名**: camelCase（例: userName, isActive）
+- **変数名**: snake_case（Rustの場合。例: user_name, is_active）または camelCase（TypeScriptの場合。例: userName, isActive）
 - **定数名**: UPPER_SNAKE_CASE（例: MAX_RETRY_COUNT）
 - **型名/インターフェース**: PascalCase（例: UserProfile, ApiResponse）
 - **ファイル名**:

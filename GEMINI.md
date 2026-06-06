@@ -133,9 +133,9 @@ ACE-XXX の XXX は **PRスコープ式 ID** に置換する: ACE-<PR番号>-<�
 
 エントリ追加時に以下を更新する:
 
-- ersion: マイナーバージョンをインクリメント
+- version: マイナーバージョンをインクリメント
 - updated: 今日の日付
-- ce_entry_count: 全エントリ数（deprecated 含む）
+- ace_entry_count: 全エントリ数（deprecated 含む）
 
 #### コミットメッセージ規則
 
