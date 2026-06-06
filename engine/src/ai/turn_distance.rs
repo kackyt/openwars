@@ -13,9 +13,9 @@ use std::sync::Arc;
 /// ターン数ベースの距離計算をキャッシュするためのリソース
 #[derive(Resource, Default)]
 pub struct TurnDistanceCache {
-    /// キー: (出発地x, 出発地y, 目標地x, 目標地y, 移動タイプ, 移動力)
+    /// キー: (出発地x, 出発地y, 目標地x, 目標地y, 移動タイプ, 移動力, 勢力ID)
     /// 値: 到達ターン数 (到達不可の場合は u32::MAX)
-    pub cache: HashMap<(usize, usize, usize, usize, MovementType, u32), u32>,
+    pub cache: HashMap<(usize, usize, usize, usize, MovementType, u32, PlayerId), u32>,
 }
 
 impl TurnDistanceCache {
@@ -63,7 +63,15 @@ pub fn calculate_turn_distance(
         return 0;
     }
 
-    let cache_key = (start.0, start.1, target.0, target.1, movement_type, max_mp);
+    let cache_key = (
+        start.0,
+        start.1,
+        target.0,
+        target.1,
+        movement_type,
+        max_mp,
+        player_id,
+    );
     if let Some(&dist) = cache.cache.get(&cache_key) {
         return dist;
     }
