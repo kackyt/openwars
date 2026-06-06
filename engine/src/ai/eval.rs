@@ -284,7 +284,12 @@ fn evaluate_board_v2(
             if is_my_unit {
                 my_unit_distances.push((*pos, stats.movement_type, stats.max_movement, faction.0));
             } else {
-                enemy_unit_distances.push((*pos, stats.movement_type, stats.max_movement, faction.0));
+                enemy_unit_distances.push((
+                    *pos,
+                    stats.movement_type,
+                    stats.max_movement,
+                    faction.0,
+                ));
             }
         }
 

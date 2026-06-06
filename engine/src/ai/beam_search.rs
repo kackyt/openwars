@@ -141,7 +141,9 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                 // 未割り当ての残りの部隊を貪欲法（最寄りの目標）で一時的に補完して完成プランにする
                 let mut complete_assignments = new_plan.assignments.clone();
                 for other_squad in &active_squads {
-                    if let std::collections::hash_map::Entry::Vacant(e) = complete_assignments.entry(other_squad.id) {
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        complete_assignments.entry(other_squad.id)
+                    {
                         // 最寄りのターゲットを貪欲に仮割り当て
                         if let Some(&first_member) = other_squad.members.iter().next()
                             && let Some(pos) = world.get::<GridPosition>(first_member).cloned()

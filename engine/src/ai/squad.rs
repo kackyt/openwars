@@ -519,7 +519,8 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                 for (p_pos, p_owner) in &properties_ownership {
                     if *p_owner != Some(perspective_player) {
                         // 処理時間を削減するためマンハッタン距離による概算を使用
-                        let dist = (pos.x as i32 - p_pos.x as i32).unsigned_abs() + (pos.y as i32 - p_pos.y as i32).unsigned_abs();
+                        let dist = (pos.x as i32 - p_pos.x as i32).unsigned_abs()
+                            + (pos.y as i32 - p_pos.y as i32).unsigned_abs();
                         if dist < nearest_prop_dist {
                             nearest_prop_dist = dist;
                             nearest_prop_pos = Some(*p_pos);
