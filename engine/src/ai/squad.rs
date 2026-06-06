@@ -804,7 +804,7 @@ pub fn execute_transport_squad_step(
             let dist = (t_pos.x as i32 - cargo_pos.x as i32).abs()
                 + (t_pos.y as i32 - cargo_pos.y as i32).abs();
 
-            if dist <= 1 {
+            if dist == 0 {
                 return Some((
                     cargo_entity,
                     crate::ai::engine::AiCommand::Load {
