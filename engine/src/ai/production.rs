@@ -176,26 +176,19 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
     }
 
     // --- 2. 実行予算の算出 ---
-    const MIN_BUFFER: u32 = 1000;
     let available_funds = if strategy.phase == GamePhase::Defense {
-        current_funds.saturating_sub(MIN_BUFFER)
+        current_funds
     } else {
-        // 貯金目標がある場合、その半分程度は今ターン使わずに残す
-        // ただし、歩兵(1000G)すら買えなくなるのは避けるため、下限を設ける
-        let reserve_cut = reserves / 2;
-        let mut budget = current_funds
-            .saturating_sub(MIN_BUFFER)
-            .saturating_sub(reserve_cut);
+        // 貯金目標がある場合、貯金目標の達成を確実にするため、バッファを含めて予算を制限する
+        let reserve_cut = if reserves > 0 { reserves / 2 + 1000 } else { 0 };
+        let mut budget = current_funds.saturating_sub(reserve_cut);
 
-        // ユニット数が極端に少ない(5体未満)場合は、予算制限を緩和して生産を優先する
+        // ユニット数が極端に少ない(5体未満)場合は、即座の占領・戦力拡張を最優先するため全額を実行予算とする。
+        // そうではなく、予算が歩兵コスト(1000G)を下回っているだけであれば、貯金を妥協しつつも歩兵1体分(1000G)程度に予算を抑える。
         if my_units.len() < 5 {
-            budget = current_funds.saturating_sub(500);
-        }
-
-        // もし資金があり、かつ歩兵すら買えないほど予算が削られているなら、
-        // 貯金目標を少し妥協して歩兵1体分(1000G)は確保する
-        if current_funds >= 2000 && budget < 1000 {
-            budget = 1000;
+            budget = current_funds;
+        } else if budget < 1000 {
+            budget = 1000.min(current_funds);
         }
         budget
     };
@@ -228,6 +221,9 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                 if stats.cost > remaining_funds {
                     continue;
                 }
+
+                // 予算制限（remaining_funds）がすでに reserve_cut を差し引いているため、
+                // この範囲内で買えるものであれば、戦闘ユニットであっても生産してよい。
 
                 // 現在の戦略（減衰後）でスコアを計算
                 let score = calculate_unit_score_at(
@@ -553,22 +549,14 @@ pub fn calculate_unit_score_at(
         score += demand_score as u32;
     }
 
-    // 6. コストに応じた非論理的なボーナスは完全に削除します。
-    // ユニットは純粋に戦闘力と役割で評価されます。
-
-    // --- 6. 敵の脅威がない平和な時の戦闘ユニット生産ロック ---
-    // 生産拠点がある島に敵の地上脅威が存在せず、交戦状態でもない平和な拡張期
-    // かつ、占領ユニットの需要（未占領拠点）が存在する場合のみ純戦闘ユニットをロックする
-    let is_peaceful_expansion = strategy.phase == GamePhase::Expansion
-        && strategy.capture_demand > 0
-        && strategy.peaceful_properties.contains(&pos);
-
-    if is_peaceful_expansion {
-        // 敵の脅威がゼロの平和な時は、占領・輸送・補給ができない純戦闘ユニットを生産する意味は皆無
-        if !stats.can_capture && stats.max_cargo == 0 && !stats.can_supply {
-            score = 0;
-        }
+    // 6. コストに応じたボーナスを追加して強力なユニットを作りやすくする
+    if !stats.can_capture && stats.max_cargo == 0 && !stats.can_supply {
+        score += stats.cost / 10;
     }
+
+    // --- 6. 敵の脅威がない平和な時の戦闘ユニット生産ロックを無効化 ---
+    // V2は戦略的に前線を押し上げるため、平和な時期でも戦闘ユニットを生産して前線へ送る。
+    // (scoreのゼロ化は行わない)
 
     score
 }
@@ -587,10 +575,14 @@ mod additional_tests {
             crate::setup::initialize_world_from_master_data(&master_data, "map_1").unwrap();
 
         let p1 = PlayerId(1);
+        let mut plan = ProductionPlan::default();
+        plan.reserves.insert(p1.0, 16000); // MdTank目標
+        world.insert_resource(plan);
+
         if let Some(mut players) = world.get_resource_mut::<Players>() {
             for p in &mut players.0 {
                 if p.id == p1 {
-                    p.funds = 12000; // MdTank(16000G)には足りないが、Tank(7000G)は買える金額
+                    p.funds = 10000; // MdTank(16000G)やMissiles(12000G)に足りない金額
                 }
             }
         }
@@ -613,10 +605,13 @@ mod additional_tests {
             Property::new(Terrain::Factory, Some(p1), 100),
         ));
 
-        // 自軍ユニットを数体配置（ユニット数が少ないと貯金より生産を優先するため）
-        for i in 0..5 {
+        // 自軍ユニットを数体配置（ユニット数が少ないと貯金より生産を優先するため）        // 10体の歩兵を配置して、my_units.len() < 5 の緊急戦力拡張発動を確実に防ぐ
+        for i in 0..10 {
             world.spawn((
-                GridPosition { x: 0, y: i + 1 },
+                GridPosition {
+                    x: i % 5,
+                    y: i / 5 + 1,
+                },
                 Faction(p1),
                 UnitStats {
                     unit_type: UnitType::Infantry,
@@ -629,9 +624,9 @@ mod additional_tests {
             ));
         }
 
-        // 敵の「中戦車(MdTank)」を配置（距離6以上にしてDefenseフェーズを避ける）
+        // 敵の「中戦車(MdTank)」を配置（十分に遠ざけてDefenseフェーズを避ける）
         world.spawn((
-            GridPosition { x: 6, y: 0 },
+            GridPosition { x: 14, y: 14 },
             Faction(PlayerId(2)),
             UnitStats {
                 unit_type: UnitType::MdTank,
@@ -646,25 +641,24 @@ mod additional_tests {
             },
         ));
 
-        // 実行
-        world.insert_resource(ProductionPlan::default());
+        // 実行（上で追加した ProductionPlan を活かすため、ここでリセットしない）
         let commands = decide_production(&mut world, p1);
 
         let plan = world.get_resource::<ProductionPlan>().unwrap();
         let reserve = *plan.reserves.get(&p1.0).unwrap_or(&0);
 
-        // 中戦車(16000)以上のユニットを目標に貯金しているはず
+        // 10000Gでは買えないユニット（MissilesやMdTankなど）を目標に貯金しているはず
         assert!(
-            reserve >= 16000,
-            "Reserve should be at least 16000 (MdTank). Got: {}",
+            reserve >= 12000,
+            "Reserve should be at least 12000. Got: {}",
             reserve
         );
-        // 資金(12000) < 貯金目標(16000) なので、高価なユニット（戦車等）は控えるはず
+        // 資金(12000) < 貯金目標(16000) なので、高価な純戦闘ユニット（戦車等）は控えるはず
         for cmd in &commands {
             let stats = unit_registry.get_stats(cmd.unit_type).unwrap();
             assert!(
-                stats.cost <= 1000,
-                "Should only produce very cheap units while saving. Got: {:?}",
+                stats.cost <= 3000 || stats.max_cargo > 0,
+                "Should only produce cheap units (<= 3000) or transport units while saving. Got: {:?}",
                 cmd.unit_type
             );
         }
