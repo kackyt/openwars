@@ -535,6 +535,32 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                 } else {
                     0
                 });
+
+            // 海を越えた島への侵攻需要（Base Invasion Demand）の計算
+            let mut has_sea_bound_target = false;
+            for target in &strategy.priority_targets {
+                if let Some(target_island_id) = get_island_id(target) 
+                    && !my_base_island_ids.contains(&target_island_id) 
+                {
+                    has_sea_bound_target = true;
+                    break;
+                }
+            }
+
+            if has_sea_bound_target {
+                // 海を越えた侵攻目標がある場合、輸送需要のベースラインを保証する
+                // 現存する輸送能力が0であれば、最低1を要求する
+                if current_light_capacity == 0 {
+                    strategy.light_transport_demand = strategy.light_transport_demand.max(1);
+                }
+                if current_heavy_capacity == 0 {
+                    strategy.heavy_transport_demand = strategy.heavy_transport_demand.max(1);
+                }
+
+                // さらに、乗車させる部隊の需要ベースラインも保証する
+                strategy.capture_demand = strategy.capture_demand.max(2);
+                strategy.demand.anti_ground = strategy.demand.anti_ground.max(0.5);
+            }
         }
     }
 
@@ -679,6 +705,107 @@ mod tests {
             strategy.phase,
             GamePhase::Defense,
             "首都が脅かされている場合は、中立拠点があっても Defense フェーズが優先されるべき"
+        );
+    }
+
+    /// 海を越えた島に攻略目標がある場合、自軍の地上ユニットが0であっても
+    /// 輸送および地上部隊の最低需要（Base Invasion Demand）が発生することを確認するテスト
+    #[test]
+    fn test_analyze_strategy_sea_bound_invasion_demand() {
+        let mut world = World::new();
+        let master_data = crate::resources::MasterDataRegistry::load().unwrap();
+
+        // 1. DamageChart & UnitRegistry の手動構築と登録
+        let mut damage_chart = crate::resources::DamageChart::new();
+        for (unit_name, unit_record) in &master_data.units {
+            let att_type = master_data.unit_type_for_name(&unit_name.0).unwrap();
+            if let Some(w1_name) = &unit_record.weapon1 {
+                let weapon = master_data
+                    .weapons
+                    .get(&crate::resources::master_data::UnitName(w1_name.clone()))
+                    .unwrap();
+                for (def_name, dmg) in &weapon.damages {
+                    let def_type = master_data.unit_type_for_name(def_name).unwrap();
+                    damage_chart.insert_damage(att_type, def_type, *dmg);
+                }
+            }
+            if let Some(w2_name) = &unit_record.weapon2 {
+                let weapon = master_data
+                    .weapons
+                    .get(&crate::resources::master_data::UnitName(w2_name.clone()))
+                    .unwrap();
+                for (def_name, dmg) in &weapon.damages {
+                    let def_type = master_data.unit_type_for_name(def_name).unwrap();
+                    damage_chart.insert_secondary_damage(att_type, def_type, *dmg);
+                }
+            }
+        }
+        world.insert_resource(damage_chart);
+
+        let mut unit_registry_map = std::collections::HashMap::new();
+        for name in master_data.units.keys() {
+            let stats = master_data.create_unit_stats(name).unwrap();
+            unit_registry_map.insert(stats.unit_type, stats);
+        }
+        world.insert_resource(crate::resources::UnitRegistry(unit_registry_map));
+        world.insert_resource(master_data.clone());
+
+        // 2. マップと島情報の構築
+        let mut map = Map::new(10, 10, Terrain::Sea, GridTopology::Square);
+        // 島A (0,0)〜(2,2)
+        for x in 0..=2 {
+            for y in 0..=2 {
+                let _ = map.set_terrain(x, y, Terrain::Plains);
+            }
+        }
+        // 島B (7,7)〜(9,9)
+        for x in 7..=9 {
+            for y in 7..=9 {
+                let _ = map.set_terrain(x, y, Terrain::Plains);
+            }
+        }
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        world.insert_resource(map);
+        world.insert_resource(island_map);
+
+        let p1 = PlayerId(1);
+
+        // 島Aに自軍の首都を配置
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(p1), 100),
+        ));
+
+        // 島Bに未占領の工場（攻略目標）を配置
+        world.spawn((
+            GridPosition { x: 8, y: 8 },
+            Property::new(Terrain::Factory, None, 100),
+        ));
+
+        // 自軍ユニットは0、敵ユニットも0とする
+
+        let strategy = analyze_strategy(&mut world, p1);
+
+        // 海を隔てた未攻略の島が存在するため、最低需要が発生しているはず
+        assert!(
+            strategy.light_transport_demand >= 1,
+            "海越え侵攻需要により light_transport_demand は1以上になるべきだが、実際は {}",
+            strategy.light_transport_demand
+        );
+        assert!(
+            strategy.heavy_transport_demand >= 1,
+            "海越え侵攻需要により heavy_transport_demand は1以上になるべきだが、実際は {}",
+            strategy.heavy_transport_demand
+        );
+        assert!(
+            strategy.capture_demand >= 2,
+            "海越え侵攻需要により capture_demand は2以上になるべきだが、実際は {}",
+            strategy.capture_demand
+        );
+        assert!(
+            strategy.demand.anti_ground >= 0.5,
+            "海越え侵攻需要により demand.anti_ground は0.5以上になるべきだが、実際は {}",
+            strategy.demand.anti_ground
         );
     }
 }

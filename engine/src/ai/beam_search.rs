@@ -67,11 +67,11 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
         all_target_candidates.push(cap);
     }
 
-    // 2. 割り当てが必要な部隊（Squad）を収集（輸送部隊は planner が目標を固定するため除外）
+    // 2. 割り当てが必要な部隊（Squad）を収集
     let active_squads: Vec<Squad> = manager
         .squads
         .iter()
-        .filter(|s| s.mission_type != MissionType::Transport && !s.members.is_empty())
+        .filter(|s| !s.members.is_empty())
         .cloned()
         .collect();
 
@@ -114,7 +114,9 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                 }
                 valid_targets.extend(&target_enemies);
             }
-            MissionType::Transport => {}
+            MissionType::Transport => {
+                valid_targets.extend(&target_props);
+            }
         }
 
         if valid_targets.is_empty() {
@@ -209,21 +211,33 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                                 world.get::<crate::components::Faction>(member),
                             ) {
                                 // 目標を始点とした SSSP で各ユニットへの最短ターン数を取得
-                                let dist_map =
-                                    crate::ai::turn_distance::calculate_all_turn_distances_cached(
-                                        &map,
-                                        &registry,
-                                        &unit_positions,
-                                        (target_pos.x, target_pos.y),
-                                        stats.movement_type,
-                                        stats.max_movement,
-                                        faction.0,
-                                        &mut search_cache,
-                                    );
+                                let mut turns = u32::MAX;
 
-                                if let Some(&turns) = dist_map.get(pos)
-                                    && turns != u32::MAX
-                                {
+                                if squad.mission_type == MissionType::Transport {
+                                    // 輸送部隊の場合、海をまたぐため歩兵のSSSPや船の陸地発SSSPは機能しない。
+                                    // 代わりにマンハッタン距離から概算ターン数を算出する
+                                    let dist = (target_pos.x as i32 - pos.x as i32).abs()
+                                        + (target_pos.y as i32 - pos.y as i32).abs();
+                                    // 移動力（輸送船なら約6）で割ってターン数を概算
+                                    turns = (dist as u32) / stats.max_movement.max(1);
+                                } else {
+                                    let dist_map =
+                                        crate::ai::turn_distance::calculate_all_turn_distances_cached(
+                                            &map,
+                                            &registry,
+                                            &unit_positions,
+                                            (target_pos.x, target_pos.y),
+                                            stats.movement_type,
+                                            stats.max_movement,
+                                            faction.0,
+                                            &mut search_cache,
+                                        );
+                                    if let Some(&t) = dist_map.get(pos) {
+                                        turns = t;
+                                    }
+                                }
+
+                                if turns != u32::MAX {
                                     // 1ターン近づくごとに 150 相当の加点を行う
                                     let mut proximity_bonus = (50 - turns.min(50)) as i32 * 150;
                                     if Some(target_pos) == enemy_capital_pos
@@ -233,6 +247,12 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                                         // 攻撃・占領部隊にとって敵首都は最重要目標なので、3倍のボーナス（極端な特攻はしないが優先はする）
                                         proximity_bonus *= 3;
                                     }
+
+                                    // 輸送部隊の Time Discounting: 到達ターン数に応じたペナルティ（遠すぎる島への無謀な輸送を防ぐ）
+                                    if squad.mission_type == MissionType::Transport {
+                                        proximity_bonus -= turns as i32 * 200;
+                                    }
+
                                     score += proximity_bonus;
                                 }
                             }
@@ -258,7 +278,15 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
         for squad in &mut manager.squads {
             if let Some(&target) = best_plan.assignments.get(&squad.id) {
                 squad.target = Some(target);
-                squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+                if squad.mission_type == MissionType::Transport {
+                    if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>()
+                        && let Some(island) = island_map.get_island_at(&target) 
+                    {
+                        squad.target_island = Some(island.id);
+                    }
+                } else {
+                    squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+                }
             }
         }
     }

@@ -295,26 +295,29 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     base_islands.extend(b_islands.iter().copied());
     target_islands.extend(t_islands.iter().copied());
 
-    for target_island_id in target_islands {
+    let max_transport_squads = target_islands.len();
+    let mut formed_transport_squads = 0;
+    for squad in &manager.squads {
+        if squad.mission_type == MissionType::Transport {
+            formed_transport_squads += 1;
+        }
+    }
+
+    while formed_transport_squads < max_transport_squads {
         if free_transports.is_empty() || free_infantry.is_empty() {
             break;
         }
 
-        // すでにその島をターゲットとしている輸送部隊があるか確認
-        let already_assigned = manager.squads.iter().any(|s| {
-            s.mission_type == MissionType::Transport && s.target_island == Some(target_island_id)
-        });
+        let (trans_ent, _, _) = free_transports.pop().unwrap();
+        let (inf_ent, _, _) = free_infantry.pop().unwrap();
 
-        if !already_assigned {
-            let (trans_ent, _, _) = free_transports.pop().unwrap();
-            let (inf_ent, _, _) = free_infantry.pop().unwrap();
+        let squad = manager.create_squad(MissionType::Transport);
+        squad.members.insert(trans_ent);
+        squad.transport_cargo = Some(inf_ent);
+        squad.target_island = None; // ターゲット島は Beam Search で動的決定する
+        squad.phase = MissionPhase::Transport(TransportPhase::Pickup);
 
-            let squad = manager.create_squad(MissionType::Transport);
-            squad.members.insert(trans_ent);
-            squad.transport_cargo = Some(inf_ent);
-            squad.target_island = Some(target_island_id);
-            squad.phase = MissionPhase::Transport(TransportPhase::Pickup);
-        }
+        formed_transport_squads += 1;
     }
 
     // B. 防衛部隊の立ち上げ（Defenseフェーズ）

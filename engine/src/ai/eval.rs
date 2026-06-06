@@ -206,8 +206,10 @@ fn evaluate_board_v2(
         &UnitStats,
         Option<&GridPosition>,
         Option<&Ammo>,
+        Option<&crate::components::Transporting>,
+        Option<&crate::components::CargoCapacity>,
     )>();
-    for (_entity, faction, health, stats, pos_opt, ammo_opt) in query.iter(world) {
+    for (_entity, faction, health, stats, pos_opt, ammo_opt, _transporting_opt, _cargo_opt) in query.iter(world) {
         let is_my_unit = faction.0 == perspective_player;
 
         let mut base_value = if health.max > 0 {
@@ -241,7 +243,11 @@ fn evaluate_board_v2(
             let position_modifier = if nearest_my_prop_dist <= nearest_enemy_prop_dist {
                 1.2 // 自軍支配タイル
             } else {
-                0.7 // 敵軍支配タイル
+                let is_offensive_or_transport = stats.movement_type
+                    == crate::resources::MovementType::Air
+                    || stats.movement_type == crate::resources::MovementType::Ship
+                    || stats.max_cargo > 0;
+                if is_offensive_or_transport { 1.0 } else { 0.7 } // 敵軍支配タイル
             };
             base_value *= position_modifier;
 
@@ -272,9 +278,17 @@ fn evaluate_board_v2(
             }
 
             let isolation_modifier = if min_turn_dist > 5 {
-                0.7
+                let is_offensive_or_transport = stats.movement_type
+                    == crate::resources::MovementType::Air
+                    || stats.movement_type == crate::resources::MovementType::Ship
+                    || stats.max_cargo > 0;
+                if is_offensive_or_transport { 1.0 } else { 0.7 }
             } else if min_turn_dist >= 3 {
-                0.85
+                let is_offensive_or_transport = stats.movement_type
+                    == crate::resources::MovementType::Air
+                    || stats.movement_type == crate::resources::MovementType::Ship
+                    || stats.max_cargo > 0;
+                if is_offensive_or_transport { 1.0 } else { 0.85 }
             } else {
                 1.0
             };

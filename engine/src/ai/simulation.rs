@@ -92,6 +92,23 @@ impl AiSimulationState {
                 continue;
             };
 
+            if squad.mission_type == MissionType::Transport {
+                // マクロ・シミュレーション（深い読み）: ターゲットにワープ＆ドロップ
+                // 歩兵を目標地点に直接配置することで、直後の evaluate_board が「上陸完了」として高く評価する
+                if let Some(cargo_ent) = squad.transport_cargo {
+                    if let Some(mut pos) = world.get_mut::<GridPosition>(cargo_ent) {
+                        *pos = target_pos;
+                    }
+                }
+
+                for &member in &squad.members {
+                    if let Some(mut pos) = world.get_mut::<GridPosition>(member) {
+                        *pos = target_pos;
+                    }
+                }
+                continue;
+            }
+
             for &member in &squad.members {
                 let Some(stats) = world.get::<UnitStats>(member).cloned() else {
                     continue;

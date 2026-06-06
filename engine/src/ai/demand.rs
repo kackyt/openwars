@@ -197,14 +197,20 @@ pub fn compute_demand(
         // 「敵が Air カテゴリ」= 自軍は anti_air 能力が必要
         match category {
             UnitCategory::Air => {
-                // 航空ユニットの「地上への攻撃適性」を航空脅威として積算
-                enemy_air_threat += affinity.anti_ground.max(affinity.anti_sea);
+                // 航空ユニットの「地上への攻撃適性」を航空脅威として積算。さらに標的としての最小脅威0.1を保証
+                let threat = affinity.anti_ground.max(affinity.anti_sea).max(0.1);
+                enemy_air_threat += threat;
             }
             UnitCategory::Ground => {
-                enemy_ground_threat += affinity.anti_ground;
+                // 地上ユニットの対地適性を積算。占領可能ユニット（歩兵）は最小脅威0.25、その他は0.1を保証
+                let base_min = if enemy_stats.can_capture { 0.25 } else { 0.1 };
+                let threat = affinity.anti_ground.max(base_min);
+                enemy_ground_threat += threat;
             }
             UnitCategory::Sea => {
-                enemy_sea_threat += affinity.anti_sea.max(affinity.anti_ground);
+                // 海上ユニットの対海適性を積算。さらに標的としての最小脅威0.1を保証
+                let threat = affinity.anti_sea.max(affinity.anti_ground).max(0.1);
+                enemy_sea_threat += threat;
             }
         }
     }
@@ -579,6 +585,47 @@ mod tests {
             "normalization_scaleが大きい（high）場合の方が、unit_scaleが大きくなって相対的需要が抑制されるはずだが、high={}, low={}",
             demand_high.anti_ground,
             demand_low.anti_ground
+        );
+    }
+
+    /// 敵が歩兵（戦闘力は低いが占領可能）を大量に持っている場合、標的ボリュームにより anti_ground の需要が高くなること
+    #[test]
+    fn test_anti_ground_demand_rises_with_many_enemy_infantry() {
+        let mut chart = DamageChart::new();
+        // 攻撃適性計算用の適当なダミーダメージを設定
+        chart.insert_damage(UnitType::Recon, UnitType::Infantry, 70);
+        chart.insert_damage(UnitType::Infantry, UnitType::Recon, 10); // 歩兵からの反撃は弱い
+
+        let registry = make_registry_with(vec![
+            (UnitType::Infantry, MovementType::Infantry, 0, 0),
+            (UnitType::Recon, MovementType::ArmoredCar, 6, 0),
+        ]);
+
+        let my_units = vec![]; // 自軍は戦闘ユニットなし
+
+        // 敵歩兵が5体
+        let enemy_units = (0..5)
+            .map(|i| {
+                (
+                    GridPosition { x: i, y: 5 },
+                    UnitStats {
+                        unit_type: UnitType::Infantry,
+                        movement_type: MovementType::Infantry,
+                        can_capture: true,
+                        // 攻撃能力を持たせるために弾薬を設定（非戦闘ユニット扱いされないように）
+                        max_ammo1: 1,
+                        ..UnitStats::mock()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let demand = compute_demand(&my_units, &enemy_units, &[], &chart, &registry);
+
+        assert!(
+            demand.anti_ground > 0.5,
+            "敵歩兵が大量に存在する場合、自軍地上戦力がなければ anti_ground 需要が高くなるべきだが、実際は {}",
+            demand.anti_ground
         );
     }
 }

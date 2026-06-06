@@ -147,6 +147,14 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
             let ratio_diff =
                 strategy.ideal_composition.get(ut).copied().unwrap_or(0.0) - current_ratio;
 
+            let prod_facility_terrain = if stats.movement_type == MovementType::Ship {
+                Terrain::Port
+            } else if stats.movement_type == MovementType::Air {
+                Terrain::Airport
+            } else {
+                Terrain::Factory
+            };
+
             let score = calculate_unit_score_at(
                 *ut,
                 stats,
@@ -158,7 +166,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                 &master_data,
                 &map,
                 &unit_registry,
-                Terrain::Capital, // 貯金目標計算時は仮でCapital
+                prod_facility_terrain, // 適切な施設タイプを渡す
                 ratio_diff,
             );
             if score > max_score {
@@ -520,6 +528,56 @@ pub fn calculate_unit_score_at(
         let attenuation = 1.0 / (1.0 + strategy.existing_transport_count as f32);
         score += (transport_utility * 0.15 * attenuation) as u32;
 
+        // 2.5. Lander侵攻価値スコア (Invasion Value)
+        let mut invasion_value = 0.0;
+        for target in &strategy.priority_targets {
+            let mut is_blocked = false;
+            let steps = 4;
+            for i in 1..steps {
+                let cx = pos.x as i32 + (target.x as i32 - pos.x as i32) * i / steps;
+                let cy = pos.y as i32 + (target.y as i32 - pos.y as i32) * i / steps;
+                if let Some(Terrain::Sea | Terrain::Shoal) =
+                    map.get_terrain(cx as usize, cy as usize)
+                {
+                    is_blocked = true;
+                    break;
+                }
+            }
+
+            if is_blocked {
+                let property_value = if let Some(t_terrain) = map.get_terrain(target.x, target.y) {
+                    match t_terrain {
+                        Terrain::Capital => 5000,
+                        Terrain::Factory => 3000,
+                        Terrain::Port | Terrain::Airport => 2000,
+                        _ => 1000,
+                    }
+                } else {
+                    1000
+                };
+
+                let cargo_value = strategy
+                    .transport_candidates
+                    .iter()
+                    .filter(|(_, c_stats, _)| {
+                        stats.loadable_unit_types.contains(&c_stats.unit_type)
+                    })
+                    .map(|(_, _, val)| *val)
+                    .fold(f32::MIN, |a, b| a.max(b));
+
+                if cargo_value > f32::MIN {
+                    let dist_to_target = (pos.x as i32 - target.x as i32).abs()
+                        + (pos.y as i32 - target.y as i32).abs();
+                    let transport_eta =
+                        (dist_to_target as f32) / (stats.max_movement as f32).max(1.0);
+                    invasion_value +=
+                        (property_value as f32) * cargo_value / transport_eta.max(1.0);
+                }
+            }
+        }
+        let attenuation_inv = 1.0 / (1.0 + strategy.existing_transport_count as f32);
+        score += (invasion_value * attenuation_inv * 0.002) as u32;
+
         // 輸送需要がない場合は減衰（既存ロジックの維持）
         let can_load_heavy = stats.loadable_unit_types.contains(&UnitType::Tank);
         let can_load_light = stats.loadable_unit_types.contains(&UnitType::Infantry);
@@ -567,6 +625,49 @@ pub fn calculate_unit_score_at(
             .is_some_and(|damage| damage >= 30)
         {
             score += 300;
+        }
+    }
+
+    // 3.5. 拠点競争阻止ボーナス (Interception Score)
+    for target in &strategy.priority_targets {
+        if strategy.unowned_properties.contains(target) {
+            for (e_pos, e_stats) in enemy_units {
+                if !e_stats.can_capture {
+                    continue;
+                }
+                let enemy_dist = (e_pos.x as isize - target.x as isize).unsigned_abs()
+                    + (e_pos.y as isize - target.y as isize).unsigned_abs();
+                let enemy_eta =
+                    (enemy_dist as u32 + e_stats.max_movement - 1) / e_stats.max_movement.max(1);
+
+                let my_dist = (pos.x as isize - target.x as isize).unsigned_abs()
+                    + (pos.y as isize - target.y as isize).unsigned_abs();
+                let my_eta = (my_dist as u32 + stats.max_movement - 1) / stats.max_movement.max(1);
+
+                if enemy_eta <= my_eta {
+                    let property_value =
+                        if let Some(t_terrain) = map.get_terrain(target.x, target.y) {
+                            match t_terrain {
+                                Terrain::Capital => 5000,
+                                Terrain::Factory => 3000,
+                                Terrain::Port | Terrain::Airport => 2000,
+                                _ => 1000,
+                            }
+                        } else {
+                            1000
+                        };
+
+                    let damage_vs_enemy = damage_chart
+                        .get_base_damage(unit_type, e_stats.unit_type)
+                        .unwrap_or(0);
+
+                    if damage_vs_enemy > 0 {
+                        let interception_score =
+                            (property_value * damage_vs_enemy) / (my_eta.max(1) * 10);
+                        score += interception_score;
+                    }
+                }
+            }
         }
     }
 
