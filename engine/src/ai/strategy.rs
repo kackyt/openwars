@@ -360,11 +360,12 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
     let total_unowned_or_enemy = unowned_properties.len() + enemy_properties.len();
     if total_unowned_or_enemy > 0 {
         // マップ全体での占領目標に対する歩兵の理想数（マップが広ければ多い）
-        let ideal_capture_units_global = ((total_unowned_or_enemy as f32 * 0.4).ceil() as usize).clamp(3, 10);
+        let ideal_capture_units_global =
+            ((total_unowned_or_enemy as f32 * 0.4).ceil() as usize).clamp(3, 10);
         let total_my_capture_units = my_units.iter().filter(|(_, s)| s.can_capture).count();
-        
+
         let base_demand = ideal_capture_units_global.saturating_sub(total_my_capture_units);
-        
+
         // 収入不足（自軍の島の未占領拠点が残っているのに歩兵が足りない等）の場合はさらに上乗せ
         if need_more_revenue {
             strategy.capture_demand = (base_demand + 4).max(1) as u32;
@@ -443,7 +444,10 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                             blocked_by_sea = false;
                             let my_island_id = get_island_id(pos);
                             let target_island_id = get_island_id(target);
-                            if my_island_id.is_some() && target_island_id.is_some() && my_island_id != target_island_id {
+                            if my_island_id.is_some()
+                                && target_island_id.is_some()
+                                && my_island_id != target_island_id
+                            {
                                 blocked_by_sea = true;
                             } else {
                                 // 同一島IDがない場合（海の上など）や判定できない場合は簡易パスサンプリングでフォールバック
@@ -485,10 +489,8 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
 
             let current_capacity: u32 = my_units.iter().map(|(_, s)| s.max_cargo).sum();
             // 輸送需要については、輸送能力を持つ全ユニット（海軍・空軍）をカウントする
-            strategy.existing_transport_count = my_units
-                .iter()
-                .filter(|(_, s)| s.max_cargo > 0)
-                .count();
+            strategy.existing_transport_count =
+                my_units.iter().filter(|(_, s)| s.max_cargo > 0).count();
 
             // 輸送需要の計算: transport_candidates（実際に停滞しているユニット）の数に基づく
             strategy.transport_demand = (strategy.transport_candidates.len() as u32)

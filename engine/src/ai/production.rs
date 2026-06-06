@@ -216,10 +216,10 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                 if !master_data.can_produce_unit(terrain_name, *ut) {
                     continue;
                 }
-                 if stats.cost > remaining_funds {
+                if stats.cost > remaining_funds {
                     continue;
                 }
-                
+
                 // 予算制限（remaining_funds）がすでに reserve_cut を差し引いているため、
                 // この範囲内で買えるものであれば、戦闘ユニットであっても生産してよい。
 
@@ -607,7 +607,10 @@ mod additional_tests {
         // 自軍ユニットを数体配置（ユニット数が少ないと貯金より生産を優先するため）        // 10体の歩兵を配置して、my_units.len() < 5 の緊急戦力拡張発動を確実に防ぐ
         for i in 0..10 {
             world.spawn((
-                GridPosition { x: i % 5, y: i / 5 + 1 },
+                GridPosition {
+                    x: i % 5,
+                    y: i / 5 + 1,
+                },
                 Faction(p1),
                 UnitStats {
                     unit_type: UnitType::Infantry,

@@ -1254,27 +1254,27 @@ pub fn decide_ai_action_v2(
         let mut best_unit_choice: Option<AiCommand> = None;
 
         for target_tile in &reachable {
-                let current_grid = GridPosition {
-                    x: target_tile.0,
-                    y: target_tile.1,
-                };
-                let is_stationary = current_grid.x == pos.x && current_grid.y == pos.y;
+            let current_grid = GridPosition {
+                x: target_tile.0,
+                y: target_tile.1,
+            };
+            let is_stationary = current_grid.x == pos.x && current_grid.y == pos.y;
 
-                let actions = crate::systems::action::get_available_actions_at(
-                    world,
-                    unit_entity,
-                    current_grid,
-                    !is_stationary,
-                );
+            let actions = crate::systems::action::get_available_actions_at(
+                world,
+                unit_entity,
+                current_grid,
+                !is_stationary,
+            );
 
-                let mut base_tile_score = 0;
-                if let Some(terrain) = map.get_terrain(current_grid.x, current_grid.y) {
-                    base_tile_score += registry.get_terrain_defense_bonus(terrain) as i32 * 10;
-                }
+            let mut base_tile_score = 0;
+            if let Some(terrain) = map.get_terrain(current_grid.x, current_grid.y) {
+                base_tile_score += registry.get_terrain_defense_bonus(terrain) as i32 * 10;
+            }
 
-                // 1. 部隊目標への接近ボーナス
-                if !is_solo && squad_target.is_some() {
-                    let target = squad_target.unwrap();
+            // 1. 部隊目標への接近ボーナス
+            if !is_solo {
+                if let Some(target) = squad_target {
                     let turn_dist = calculate_turn_distance(
                         &map,
                         &registry,
@@ -1288,68 +1288,15 @@ pub fn decide_ai_action_v2(
                     );
                     base_tile_score += (100 - turn_dist as i32).max(0) * 300;
                 }
+            }
 
-                // 2. SoloFallback / 孤立・戦闘不能のインセンティブ
-                if is_solo {
-                    if is_combat_ineffective {
-                        let mut min_recovery_dist = 99;
-                        for (p_pos, p_terrain, p_owner) in &properties {
-                            if *p_owner == Some(player_id)
-                                && registry.can_repair_on_terrain(stats.unit_type, *p_terrain)
-                            {
-                                let d = calculate_turn_distance(
-                                    &map,
-                                    &registry,
-                                    &unit_positions,
-                                    (current_grid.x, current_grid.y),
-                                    (p_pos.x, p_pos.y),
-                                    stats.movement_type,
-                                    stats.max_movement,
-                                    player_id,
-                                    &mut turn_cache,
-                                );
-                                if d < min_recovery_dist {
-                                    min_recovery_dist = d;
-                                }
-                            }
-                        }
-                        base_tile_score += (100 - min_recovery_dist as i32).max(0) * 500;
-                    } else if !stats.can_capture {
-                        // 健全な SoloFallback: 敵ユニットに接近する
-                        let mut min_target_dist = 99;
-                        for (e_pos, _, _, _, _, _) in &enemy_units {
-                            let d = calculate_turn_distance(
-                                &map,
-                                &registry,
-                                &unit_positions,
-                                (current_grid.x, current_grid.y),
-                                (e_pos.x, e_pos.y),
-                                stats.movement_type,
-                                stats.max_movement,
-                                player_id,
-                                &mut turn_cache,
-                            );
-                            if d < min_target_dist {
-                                min_target_dist = d;
-                            }
-                        }
-                        if min_target_dist < 99 {
-                            base_tile_score += (100 - min_target_dist as i32).max(0) * 300;
-                        }
-                    }
-                }
-
-                // (A) タクシー帰りロジック
-                let is_empty_transport = stats.max_cargo > 0
-                    && world
-                        .get::<crate::components::CargoCapacity>(unit_entity)
-                        .is_some_and(|c| c.loaded.is_empty());
-
-                if is_empty_transport {
-                    let mut min_base_dist = 99;
+            // 2. SoloFallback / 孤立・戦闘不能のインセンティブ
+            if is_solo {
+                if is_combat_ineffective {
+                    let mut min_recovery_dist = 99;
                     for (p_pos, p_terrain, p_owner) in &properties {
                         if *p_owner == Some(player_id)
-                            && registry.is_production_facility(p_terrain.as_str())
+                            && registry.can_repair_on_terrain(stats.unit_type, *p_terrain)
                         {
                             let d = calculate_turn_distance(
                                 &map,
@@ -1362,96 +1309,199 @@ pub fn decide_ai_action_v2(
                                 player_id,
                                 &mut turn_cache,
                             );
-                            if d < min_base_dist {
-                                min_base_dist = d;
+                            if d < min_recovery_dist {
+                                min_recovery_dist = d;
                             }
                         }
                     }
-                    base_tile_score += (100 - min_base_dist as i32).max(0) * 500;
-                }
-
-                // (B) 歩兵の待機移動ロジック
-                let is_infantry = stats.unit_type == crate::resources::UnitType::Infantry
-                    || stats.unit_type == crate::resources::UnitType::Mech;
-                if is_infantry
-                    && !is_combat_ineffective
-                    && is_unit_stranded(world, &pos, player_id, &properties, &enemy_units)
-                {
-                    let mut min_coast_dist = 99;
-                    let check_range = 10;
-                    let min_x = current_grid.x.saturating_sub(check_range);
-                    let max_x = (current_grid.x + check_range).min(map.width - 1);
-                    let min_y = current_grid.y.saturating_sub(check_range);
-                    let max_y = (current_grid.y + check_range).min(map.height - 1);
-
-                    for cy in min_y..=max_y {
-                        for cx in min_x..=max_x {
-                            if map.get_terrain(cx, cy) == Some(crate::resources::Terrain::Sea) {
-                                let d = calculate_turn_distance(
-                                    &map,
-                                    &registry,
-                                    &unit_positions,
-                                    (current_grid.x, current_grid.y),
-                                    (cx, cy),
-                                    stats.movement_type,
-                                    stats.max_movement,
-                                    player_id,
-                                    &mut turn_cache,
-                                );
-                                if d < min_coast_dist {
-                                    min_coast_dist = d;
-                                }
-                            }
+                    base_tile_score += (100 - min_recovery_dist as i32).max(0) * 500;
+                } else if !stats.can_capture {
+                    // 健全な SoloFallback: 敵ユニットに接近する
+                    let mut min_target_dist = 99;
+                    for (e_pos, _, _, _, _, _) in &enemy_units {
+                        let d = calculate_turn_distance(
+                            &map,
+                            &registry,
+                            &unit_positions,
+                            (current_grid.x, current_grid.y),
+                            (e_pos.x, e_pos.y),
+                            stats.movement_type,
+                            stats.max_movement,
+                            player_id,
+                            &mut turn_cache,
+                        );
+                        if d < min_target_dist {
+                            min_target_dist = d;
                         }
                     }
-                    if min_coast_dist < 99 && min_coast_dist > 0 {
-                        base_tile_score += (100 - min_coast_dist as i32).max(0) * 100;
+                    if min_target_dist < 99 {
+                        base_tile_score += (100 - min_target_dist as i32).max(0) * 300;
                     }
                 }
+            }
 
-                // 占領価値・拠点接近スコア
-                let mut effective_can_capture = stats.can_capture;
-                if !effective_can_capture
-                    && let Some(cargo) = world.get::<crate::components::CargoCapacity>(unit_entity)
-                {
-                    for &cargo_ent in &cargo.loaded {
-                        if let Some(c_stats) = world.get::<UnitStats>(cargo_ent)
-                            && c_stats.can_capture
-                        {
-                            effective_can_capture = true;
-                            break;
+            // (A) タクシー帰りロジック
+            let is_empty_transport = stats.max_cargo > 0
+                && world
+                    .get::<crate::components::CargoCapacity>(unit_entity)
+                    .is_some_and(|c| c.loaded.is_empty());
+
+            if is_empty_transport {
+                let mut min_base_dist = 99;
+                for (p_pos, p_terrain, p_owner) in &properties {
+                    if *p_owner == Some(player_id)
+                        && registry.is_production_facility(p_terrain.as_str())
+                    {
+                        let d = calculate_turn_distance(
+                            &map,
+                            &registry,
+                            &unit_positions,
+                            (current_grid.x, current_grid.y),
+                            (p_pos.x, p_pos.y),
+                            stats.movement_type,
+                            stats.max_movement,
+                            player_id,
+                            &mut turn_cache,
+                        );
+                        if d < min_base_dist {
+                            min_base_dist = d;
                         }
                     }
                 }
+                base_tile_score += (100 - min_base_dist as i32).max(0) * 500;
+            }
 
-                if effective_can_capture {
-                    let mut min_objective_dist = 99;
-                    for (p_pos, _p_terrain, p_owner) in &properties {
-                        if *p_owner != Some(player_id) {
+            // (B) 歩兵の待機移動ロジック
+            let is_infantry = stats.unit_type == crate::resources::UnitType::Infantry
+                || stats.unit_type == crate::resources::UnitType::Mech;
+            if is_infantry
+                && !is_combat_ineffective
+                && is_unit_stranded(world, &pos, player_id, &properties, &enemy_units)
+            {
+                let mut min_coast_dist = 99;
+                let check_range = 10;
+                let min_x = current_grid.x.saturating_sub(check_range);
+                let max_x = (current_grid.x + check_range).min(map.width - 1);
+                let min_y = current_grid.y.saturating_sub(check_range);
+                let max_y = (current_grid.y + check_range).min(map.height - 1);
+
+                for cy in min_y..=max_y {
+                    for cx in min_x..=max_x {
+                        if map.get_terrain(cx, cy) == Some(crate::resources::Terrain::Sea) {
                             let d = calculate_turn_distance(
                                 &map,
                                 &registry,
                                 &unit_positions,
                                 (current_grid.x, current_grid.y),
-                                (p_pos.x, p_pos.y),
+                                (cx, cy),
                                 stats.movement_type,
                                 stats.max_movement,
                                 player_id,
                                 &mut turn_cache,
                             );
-                            if d < min_objective_dist {
-                                min_objective_dist = d;
+                            if d < min_coast_dist {
+                                min_coast_dist = d;
                             }
                         }
                     }
-                    base_tile_score += (100 - min_objective_dist as i32).max(0) * 400;
-                } else if is_solo {
-                    // Fallback: 敵に近づく
-                    let mut best_target_dist = 99;
-                    let mut max_potential = -1.0;
+                }
+                if min_coast_dist < 99 && min_coast_dist > 0 {
+                    base_tile_score += (100 - min_coast_dist as i32).max(0) * 100;
+                }
+            }
 
-                    for (e_pos, e_type, e_cost, e_hp, _, _) in &enemy_units {
-                        let mut effective_dist = calculate_turn_distance(
+            // 占領価値・拠点接近スコア
+            let mut effective_can_capture = stats.can_capture;
+            if !effective_can_capture
+                && let Some(cargo) = world.get::<crate::components::CargoCapacity>(unit_entity)
+            {
+                for &cargo_ent in &cargo.loaded {
+                    if let Some(c_stats) = world.get::<UnitStats>(cargo_ent)
+                        && c_stats.can_capture
+                    {
+                        effective_can_capture = true;
+                        break;
+                    }
+                }
+            }
+
+            if effective_can_capture {
+                let mut min_objective_dist = 99;
+                for (p_pos, _p_terrain, p_owner) in &properties {
+                    if *p_owner != Some(player_id) {
+                        let d = calculate_turn_distance(
+                            &map,
+                            &registry,
+                            &unit_positions,
+                            (current_grid.x, current_grid.y),
+                            (p_pos.x, p_pos.y),
+                            stats.movement_type,
+                            stats.max_movement,
+                            player_id,
+                            &mut turn_cache,
+                        );
+                        if d < min_objective_dist {
+                            min_objective_dist = d;
+                        }
+                    }
+                }
+                base_tile_score += (100 - min_objective_dist as i32).max(0) * 400;
+            } else if is_solo {
+                // Fallback: 敵に近づく
+                let mut best_target_dist = 99;
+                let mut max_potential = -1.0;
+
+                for (e_pos, e_type, e_cost, e_hp, _, _) in &enemy_units {
+                    let mut effective_dist = calculate_turn_distance(
+                        &map,
+                        &registry,
+                        &unit_positions,
+                        (current_grid.x, current_grid.y),
+                        (e_pos.x, e_pos.y),
+                        stats.movement_type,
+                        stats.max_movement,
+                        player_id,
+                        &mut turn_cache,
+                    );
+
+                    if stats.movement_type == crate::resources::MovementType::Ship
+                        && let Some(e_terrain) = map.get_terrain(e_pos.x, e_pos.y)
+                    {
+                        let move_cost = registry
+                            .get_movement_cost(
+                                crate::resources::MovementType::Ship,
+                                e_terrain.as_str(),
+                            )
+                            .unwrap_or(99);
+                        if move_cost >= 99 && stats.max_range <= 1 {
+                            effective_dist += 20;
+                        }
+                    }
+
+                    let base_dmg = damage_chart
+                        .get_base_damage(stats.unit_type, *e_type)
+                        .or_else(|| {
+                            damage_chart.get_base_damage_secondary(stats.unit_type, *e_type)
+                        })
+                        .unwrap_or(0);
+
+                    let potential =
+                        base_dmg as f32 * (*e_cost as f32 / 100.0) * (2.0 - *e_hp as f32 / 100.0);
+
+                    if potential > max_potential {
+                        max_potential = potential;
+                        best_target_dist = effective_dist;
+                    } else if (potential - max_potential).abs() < 0.1
+                        && effective_dist < best_target_dist
+                    {
+                        best_target_dist = effective_dist;
+                    }
+                }
+
+                if max_potential <= 0.0 {
+                    let mut min_dist = 99;
+                    for (e_pos, _, _, _, _, _) in &enemy_units {
+                        let mut d = calculate_turn_distance(
                             &map,
                             &registry,
                             &unit_positions,
@@ -1473,256 +1523,206 @@ pub fn decide_ai_action_v2(
                                 )
                                 .unwrap_or(99);
                             if move_cost >= 99 && stats.max_range <= 1 {
-                                effective_dist += 20;
+                                d += 20;
                             }
                         }
-
-                        let base_dmg = damage_chart
-                            .get_base_damage(stats.unit_type, *e_type)
-                            .or_else(|| {
-                                damage_chart.get_base_damage_secondary(stats.unit_type, *e_type)
-                            })
-                            .unwrap_or(0);
-
-                        let potential =
-                            base_dmg as f32 * (*e_cost as f32 / 100.0) * (2.0 - *e_hp as f32 / 100.0);
-
-                        if potential > max_potential {
-                            max_potential = potential;
-                            best_target_dist = effective_dist;
-                        } else if (potential - max_potential).abs() < 0.1
-                            && effective_dist < best_target_dist
-                        {
-                            best_target_dist = effective_dist;
+                        if d < min_dist {
+                            min_dist = d;
                         }
                     }
-
-                    if max_potential <= 0.0 {
-                        let mut min_dist = 99;
-                        for (e_pos, _, _, _, _, _) in &enemy_units {
-                            let mut d = calculate_turn_distance(
-                                &map,
-                                &registry,
-                                &unit_positions,
-                                (current_grid.x, current_grid.y),
-                                (e_pos.x, e_pos.y),
-                                stats.movement_type,
-                                stats.max_movement,
-                                player_id,
-                                &mut turn_cache,
-                            );
-
-                            if stats.movement_type == crate::resources::MovementType::Ship
-                                && let Some(e_terrain) = map.get_terrain(e_pos.x, e_pos.y)
-                            {
-                                let move_cost = registry
-                                    .get_movement_cost(
-                                        crate::resources::MovementType::Ship,
-                                        e_terrain.as_str(),
-                                    )
-                                    .unwrap_or(99);
-                                if move_cost >= 99 && stats.max_range <= 1 {
-                                    d += 20;
-                                }
-                            }
-                            if d < min_dist {
-                                min_dist = d;
-                            }
-                        }
-                        if min_dist == 99 {
-                            for (p_pos, _, p_owner) in &properties {
-                                if *p_owner != Some(player_id) {
-                                    let d = calculate_turn_distance(
-                                        &map,
-                                        &registry,
-                                        &unit_positions,
-                                        (current_grid.x, current_grid.y),
-                                        (p_pos.x, p_pos.y),
-                                        stats.movement_type,
-                                        stats.max_movement,
-                                        player_id,
-                                        &mut turn_cache,
-                                    );
-                                    if d < min_dist {
-                                        min_dist = d;
-                                    }
+                    if min_dist == 99 {
+                        for (p_pos, _, p_owner) in &properties {
+                            if *p_owner != Some(player_id) {
+                                let d = calculate_turn_distance(
+                                    &map,
+                                    &registry,
+                                    &unit_positions,
+                                    (current_grid.x, current_grid.y),
+                                    (p_pos.x, p_pos.y),
+                                    stats.movement_type,
+                                    stats.max_movement,
+                                    player_id,
+                                    &mut turn_cache,
+                                );
+                                if d < min_dist {
+                                    min_dist = d;
                                 }
                             }
                         }
-                        best_target_dist = min_dist;
                     }
-
-                    if stats.min_range > 1 {
-                        let target_dist = stats.max_range as i32;
-                        let dist_diff = (best_target_dist as i32 - target_dist).abs();
-                        base_tile_score += (100 - dist_diff).max(0) * 100;
-
-                        if best_target_dist < stats.min_range {
-                            base_tile_score -= 2000;
-                        }
-                    } else {
-                        base_tile_score += (100 - best_target_dist as i32).max(0) * 100;
-                    }
+                    best_target_dist = min_dist;
                 }
 
-                // (A) Capture
-                if actions.can_capture {
-                    let score = base_tile_score + 10000;
-                    if score > best_unit_score {
-                        best_unit_score = score;
-                        best_unit_choice = Some(AiCommand::Capture {
-                            target_pos: current_grid,
-                        });
-                    }
-                }
+                if stats.min_range > 1 {
+                    let target_dist = stats.max_range as i32;
+                    let dist_diff = (best_target_dist as i32 - target_dist).abs();
+                    base_tile_score += (100 - dist_diff).max(0) * 100;
 
-                // (B) Attack
-                if actions.can_attack {
-                    let targets = crate::systems::combat::get_attackable_targets_at(
+                    if best_target_dist < stats.min_range {
+                        base_tile_score -= 2000;
+                    }
+                } else {
+                    base_tile_score += (100 - best_target_dist as i32).max(0) * 100;
+                }
+            }
+
+            // (A) Capture
+            if actions.can_capture {
+                let score = base_tile_score + 10000;
+                if score > best_unit_score {
+                    best_unit_score = score;
+                    best_unit_choice = Some(AiCommand::Capture {
+                        target_pos: current_grid,
+                    });
+                }
+            }
+
+            // (B) Attack
+            if actions.can_attack {
+                let targets = crate::systems::combat::get_attackable_targets_at(
+                    world,
+                    unit_entity,
+                    current_grid,
+                    is_stationary,
+                );
+                for target_entity in targets {
+                    if crate::ai::pruning::is_suicidal_attack(
                         world,
                         unit_entity,
-                        current_grid,
-                        is_stationary,
-                    );
-                    for target_entity in targets {
-                        if crate::ai::pruning::is_suicidal_attack(
-                            world,
-                            unit_entity,
-                            target_entity,
+                        target_entity,
+                        &damage_chart,
+                    ) {
+                        continue;
+                    }
+
+                    // ターゲットの詳細を取得してスコアを加点
+                    if let (Some(t_stats), Some(t_health), Some(t_pos)) = (
+                        world.get::<UnitStats>(target_entity),
+                        world.get::<Health>(target_entity),
+                        world.get::<GridPosition>(target_entity),
+                    ) {
+                        // 撃破判定・ダメージ期待値の算出
+                        let t_terrain = map
+                            .get_terrain(t_pos.x, t_pos.y)
+                            .unwrap_or(crate::resources::Terrain::Plains);
+                        let def_bonus = registry.get_terrain_defense_bonus(t_terrain);
+                        let dist = (current_grid.x as i64 - t_pos.x as i64).unsigned_abs() as u32
+                            + (current_grid.y as i64 - t_pos.y as i64).unsigned_abs() as u32;
+
+                        let expected_actual_damage = crate::systems::combat::get_expected_damage(
+                            &stats,
+                            atk_hp,
+                            atk_ammo,
+                            t_stats,
+                            def_bonus,
+                            dist,
+                            &registry,
                             &damage_chart,
-                        ) {
+                            false,
+                        );
+
+                        // 期待ダメージが0の場合は攻撃候補から外す
+                        if expected_actual_damage == 0 {
                             continue;
                         }
 
-                        // ターゲットの詳細を取得してスコアを加点
-                        if let (Some(t_stats), Some(t_health), Some(t_pos)) = (
-                            world.get::<UnitStats>(target_entity),
-                            world.get::<Health>(target_entity),
-                            world.get::<GridPosition>(target_entity),
-                        ) {
-                            // 撃破判定・ダメージ期待値の算出
-                            let t_terrain = map
-                                .get_terrain(t_pos.x, t_pos.y)
-                                .unwrap_or(crate::resources::Terrain::Plains);
-                            let def_bonus = registry.get_terrain_defense_bonus(t_terrain);
-                            let dist = (current_grid.x as i64 - t_pos.x as i64).unsigned_abs()
-                                as u32
-                                + (current_grid.y as i64 - t_pos.y as i64).unsigned_abs() as u32;
+                        let mut attack_score = 2000;
+                        let damage_val = (expected_actual_damage * t_stats.cost) / 100;
+                        attack_score += damage_val as i32;
 
-                            let expected_actual_damage = crate::systems::combat::get_expected_damage(
-                                &stats,
-                                atk_hp,
-                                atk_ammo,
-                                t_stats,
-                                def_bonus,
-                                dist,
-                                &registry,
-                                &damage_chart,
-                                false,
-                            );
+                        if is_combat_ineffective && expected_actual_damage < t_health.current {
+                            attack_score -= 3000;
+                        }
 
-                            // 期待ダメージが0の場合は攻撃候補から外す
-                            if expected_actual_damage == 0 {
-                                continue;
-                            }
+                        if expected_actual_damage >= t_health.current {
+                            attack_score += 5000;
+                        }
 
-                            let mut attack_score = 2000;
-                            let damage_val = (expected_actual_damage * t_stats.cost) / 100;
-                            attack_score += damage_val as i32;
-
-                            if is_combat_ineffective && expected_actual_damage < t_health.current {
-                                attack_score -= 3000;
-                            }
-
-                            if expected_actual_damage >= t_health.current {
-                                attack_score += 5000;
-                            }
-
-                            let score = base_tile_score + attack_score;
-                            if score > best_unit_score {
-                                best_unit_score = score;
-                                best_unit_choice = Some(AiCommand::Attack {
-                                    target_pos: current_grid,
-                                    target_entity,
-                                });
-                            }
+                        let score = base_tile_score + attack_score;
+                        if score > best_unit_score {
+                            best_unit_score = score;
+                            best_unit_choice = Some(AiCommand::Attack {
+                                target_pos: current_grid,
+                                target_entity,
+                            });
                         }
                     }
                 }
+            }
 
-                // (C) Wait
-                if actions.can_wait {
-                    let mut score = base_tile_score;
-                    let mut is_on_recovery_property = false;
-                    for (p_pos, p_terrain, p_owner) in &properties {
-                        if p_pos.x == current_grid.x
-                            && p_pos.y == current_grid.y
-                            && *p_owner == Some(player_id)
-                            && registry.can_repair_on_terrain(stats.unit_type, *p_terrain)
-                        {
-                            is_on_recovery_property = true;
-                            break;
-                        }
+            // (C) Wait
+            if actions.can_wait {
+                let mut score = base_tile_score;
+                let mut is_on_recovery_property = false;
+                for (p_pos, p_terrain, p_owner) in &properties {
+                    if p_pos.x == current_grid.x
+                        && p_pos.y == current_grid.y
+                        && *p_owner == Some(player_id)
+                        && registry.can_repair_on_terrain(stats.unit_type, *p_terrain)
+                    {
+                        is_on_recovery_property = true;
+                        break;
                     }
+                }
 
-                    if is_on_recovery_property {
-                        if is_combat_ineffective {
-                            score += 8000;
-                        } else if atk_hp < 100 || atk_ammo.0 < stats.max_ammo1 {
-                            score += 1000;
+                if is_on_recovery_property {
+                    if is_combat_ineffective {
+                        score += 8000;
+                    } else if atk_hp < 100 || atk_ammo.0 < stats.max_ammo1 {
+                        score += 1000;
+                    } else {
+                        // 回復の必要がないのに生産施設や回復施設の上にいる場合は、
+                        // 施設の生産ラインを塞がないようにペナルティを与えてどかせる
+                        score -= 2000;
+                    }
+                } else if is_combat_ineffective {
+                    score -= 5000;
+                }
+
+                if score > best_unit_score {
+                    best_unit_score = score;
+                    best_unit_choice = Some(AiCommand::Wait {
+                        target_pos: current_grid,
+                    });
+                }
+            }
+
+            // (D) Merge
+            if actions.can_merge {
+                let targets = crate::systems::merge::get_mergable_targets_at(
+                    world,
+                    unit_entity,
+                    current_grid,
+                );
+                for target_entity in targets {
+                    let mut merge_score = 3000;
+                    if let (Some(t_health), Some(_t_stats)) = (
+                        world.get::<Health>(target_entity),
+                        world.get::<UnitStats>(target_entity),
+                    ) {
+                        let total_hp = atk_hp + t_health.current;
+                        if total_hp > 100 {
+                            merge_score = 0;
                         } else {
-                            // 回復の必要がないのに生産施設や回復施設の上にいる場合は、
-                            // 施設の生産ラインを塞がないようにペナルティを与えてどかせる
-                            score -= 2000;
+                            if is_combat_ineffective || t_health.current < 40 {
+                                merge_score += 4000;
+                            }
+                            if total_hp <= 100 {
+                                merge_score += 1000;
+                            }
                         }
-                    } else if is_combat_ineffective {
-                        score -= 5000;
-                    }
 
-                    if score > best_unit_score {
-                        best_unit_score = score;
-                        best_unit_choice = Some(AiCommand::Wait {
-                            target_pos: current_grid,
-                        });
-                    }
-                }
-
-                // (D) Merge
-                if actions.can_merge {
-                    let targets = crate::systems::merge::get_mergable_targets_at(
-                        world,
-                        unit_entity,
-                        current_grid,
-                    );
-                    for target_entity in targets {
-                        let mut merge_score = 3000;
-                        if let (Some(t_health), Some(_t_stats)) = (
-                            world.get::<Health>(target_entity),
-                            world.get::<UnitStats>(target_entity),
-                        ) {
-                            let total_hp = atk_hp + t_health.current;
-                            if total_hp > 100 {
-                                merge_score = 0;
-                            } else {
-                                if is_combat_ineffective || t_health.current < 40 {
-                                    merge_score += 4000;
-                                }
-                                if total_hp <= 100 {
-                                    merge_score += 1000;
-                                }
-                            }
-
-                            let score = base_tile_score + merge_score;
-                            if score > best_unit_score {
-                                best_unit_score = score;
-                                best_unit_choice = Some(AiCommand::Merge {
-                                    target_pos: current_grid,
-                                    target_entity,
-                                });
-                            }
+                        let score = base_tile_score + merge_score;
+                        if score > best_unit_score {
+                            best_unit_score = score;
+                            best_unit_choice = Some(AiCommand::Merge {
+                                target_pos: current_grid,
+                                target_entity,
+                            });
                         }
                     }
                 }
+            }
         }
 
         if let Some(choice) = best_unit_choice {
@@ -1734,7 +1734,10 @@ pub fn decide_ai_action_v2(
     }
 
     if let Some((entity, AiCommand::Wait { target_pos })) = &best_overall_choice {
-        if let (Some(stats), Some(pos)) = (world.get::<UnitStats>(*entity), world.get::<GridPosition>(*entity)) {
+        if let (Some(stats), Some(pos)) = (
+            world.get::<UnitStats>(*entity),
+            world.get::<GridPosition>(*entity),
+        ) {
             let target_str = if let Some(target) = unit_squad_targets.get(entity) {
                 format!("SquadTarget: ({}, {})", target.x, target.y)
             } else if solo_fallbacks.contains(entity) {
@@ -1742,7 +1745,17 @@ pub fn decide_ai_action_v2(
             } else {
                 "NoSquad".to_string()
             };
-            eprintln!("DEBUG_WAIT: Player {} Unit {:?} at ({}, {}) chose WAIT at ({}, {}) | {} | Score: {}", player_id.0, stats.unit_type, pos.x, pos.y, target_pos.x, target_pos.y, target_str, best_overall_score);
+            eprintln!(
+                "DEBUG_WAIT: Player {} Unit {:?} at ({}, {}) chose WAIT at ({}, {}) | {} | Score: {}",
+                player_id.0,
+                stats.unit_type,
+                pos.x,
+                pos.y,
+                target_pos.x,
+                target_pos.y,
+                target_str,
+                best_overall_score
+            );
         }
     }
 

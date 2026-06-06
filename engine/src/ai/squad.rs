@@ -509,7 +509,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                 }
             }
 
-            let mut final_target = None;
+            let final_target;
             // 敵が15ターン以上遠い場合や存在しない場合は、最寄りの拠点（未占領または敵所有）を目標にする
             if nearest_cluster_dist <= 15 {
                 final_target = nearest_cluster_center;
@@ -519,7 +519,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                 for (p_pos, p_owner) in &properties_ownership {
                     if *p_owner != Some(perspective_player) {
                         // 処理時間を削減するためマンハッタン距離による概算を使用
-                        let dist = (pos.x as i32 - p_pos.x as i32).abs() as u32 + (pos.y as i32 - p_pos.y as i32).abs() as u32;
+                        let dist = (pos.x as i32 - p_pos.x as i32).unsigned_abs() + (pos.y as i32 - p_pos.y as i32).unsigned_abs();
                         if dist < nearest_prop_dist {
                             nearest_prop_dist = dist;
                             nearest_prop_pos = Some(*p_pos);
