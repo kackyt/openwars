@@ -1733,6 +1733,7 @@ pub fn decide_ai_action_v2(
         }
     }
 
+    #[cfg(debug_assertions)]
     if let Some((entity, AiCommand::Wait { target_pos })) = &best_overall_choice {
         if let (Some(stats), Some(pos)) = (
             world.get::<UnitStats>(*entity),

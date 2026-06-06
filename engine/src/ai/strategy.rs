@@ -237,7 +237,7 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
     let mut capital_threatened = false;
     if let Some(cap_pos) = my_capital_pos {
         for (enemy_pos, enemy_stats) in &enemy_units {
-            let enemy_id = PlayerId(if player_id.0 == 1 { 2 } else { 1 });
+            let enemy_id = player_id.opposite();
             let dist = calculate_turn_distance(
                 &map,
                 &master_data,
@@ -514,7 +514,7 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
 
         for (e_pos, e_stats) in &enemy_units {
             let e_island_id = get_island_id(e_pos);
-            let enemy_id = PlayerId(if player_id.0 == 1 { 2 } else { 1 });
+            let enemy_id = player_id.opposite();
             if enemy_threatens_property(
                 &map,
                 &master_data,

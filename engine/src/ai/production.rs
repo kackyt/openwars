@@ -183,10 +183,12 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
         let reserve_cut = if reserves > 0 { reserves / 2 + 1000 } else { 0 };
         let mut budget = current_funds.saturating_sub(reserve_cut);
 
-        // ユニット数が極端に少ない(5体未満)場合、または予算が歩兵コスト(1000G)を下回っている場合は、
-        // 貯金よりも即座の占領・戦力拡張を最優先するため全額を実行予算とする
-        if my_units.len() < 5 || budget < 1000 {
+        // ユニット数が極端に少ない(5体未満)場合は、即座の占領・戦力拡張を最優先するため全額を実行予算とする。
+        // そうではなく、予算が歩兵コスト(1000G)を下回っているだけであれば、貯金を妥協しつつも歩兵1体分(1000G)程度に予算を抑える。
+        if my_units.len() < 5 {
             budget = current_funds;
+        } else if budget < 1000 {
+            budget = 1000.min(current_funds);
         }
         budget
     };
@@ -567,7 +569,6 @@ mod additional_tests {
     use crate::resources::{Map, Terrain};
 
     #[test]
-    #[ignore]
     fn test_ai_production_saving_for_mdtank() {
         let master_data = MasterDataRegistry::load().unwrap();
         let (mut world, _) =
@@ -623,9 +624,9 @@ mod additional_tests {
             ));
         }
 
-        // 敵の「中戦車(MdTank)」を配置（距離6以上にしてDefenseフェーズを避ける）
+        // 敵の「中戦車(MdTank)」を配置（十分に遠ざけてDefenseフェーズを避ける）
         world.spawn((
-            GridPosition { x: 6, y: 0 },
+            GridPosition { x: 14, y: 14 },
             Faction(PlayerId(2)),
             UnitStats {
                 unit_type: UnitType::MdTank,

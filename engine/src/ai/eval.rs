@@ -280,11 +280,11 @@ fn evaluate_board_v2(
             };
             base_value *= isolation_modifier;
 
-            // 領域支配スコア用の情報を保存（SSSPテーブルはここでは保持しない）
+            // 領域支配スコア用の情報を保存（SSSPテーブルはここでは保持しない。不要なクローンを避けるため movement_type と max_movement のみ保持）
             if is_my_unit {
-                my_unit_distances.push((*pos, stats.clone(), faction.0));
+                my_unit_distances.push((*pos, stats.movement_type, stats.max_movement, faction.0));
             } else {
-                enemy_unit_distances.push((*pos, stats.clone(), faction.0));
+                enemy_unit_distances.push((*pos, stats.movement_type, stats.max_movement, faction.0));
             }
         }
 
@@ -383,14 +383,14 @@ fn evaluate_board_v2(
     for (p_pos, _) in &properties {
         // 自軍の最短到達ターン数を計算 (拠点始点 SSSP から逆引き)
         let mut min_my_turns = 99;
-        for (u_pos, u_stats, u_faction) in &my_unit_distances {
+        for (u_pos, u_movement_type, u_max_movement, u_faction) in &my_unit_distances {
             let p_turns_map = crate::ai::turn_distance::calculate_all_turn_distances_cached(
                 &map,
                 &registry,
                 &unit_positions,
                 (p_pos.x, p_pos.y),
-                u_stats.movement_type,
-                u_stats.max_movement,
+                *u_movement_type,
+                *u_max_movement,
                 *u_faction,
                 turn_cache,
             );
@@ -401,16 +401,16 @@ fn evaluate_board_v2(
             }
         }
 
-        // 敵軍 of 最短到達ターン数を計算 (拠点始点 SSSP から逆引き)
+        // 敵軍の最短到達ターン数を計算 (拠点始点 SSSP から逆引き)
         let mut min_enemy_turns = 99;
-        for (u_pos, u_stats, u_faction) in &enemy_unit_distances {
+        for (u_pos, u_movement_type, u_max_movement, u_faction) in &enemy_unit_distances {
             let p_turns_map = crate::ai::turn_distance::calculate_all_turn_distances_cached(
                 &map,
                 &registry,
                 &unit_positions,
                 (p_pos.x, p_pos.y),
-                u_stats.movement_type,
-                u_stats.max_movement,
+                *u_movement_type,
+                *u_max_movement,
                 *u_faction,
                 turn_cache,
             );
@@ -501,16 +501,34 @@ mod tests {
             Transporting(Entity::from_raw(999)),
         ));
 
-        // Properties
-        world.spawn(Property::new(Terrain::Capital, Some(p1), 200));
-        world.spawn(Property::new(Terrain::City, Some(p1), 200));
-        world.spawn(Property::new(Terrain::Factory, Some(p2), 200));
-        world.spawn(Property::new(Terrain::City, None, 200));
+        // Properties (位置情報 GridPosition がないと `prop_query` にマッチしなくなるため付与)
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(p1), 200),
+        ));
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Property::new(Terrain::City, Some(p1), 200),
+        ));
+        world.spawn((
+            GridPosition { x: 2, y: 0 },
+            Property::new(Terrain::Factory, Some(p2), 200),
+        ));
+        world.spawn((
+            GridPosition { x: 3, y: 0 },
+            Property::new(Terrain::City, None, 200),
+        ));
 
         let score = evaluate_board(&mut world, p1, None);
-        assert_eq!(score, -4500); // 簡易版の計算
+        // 期待スコア内訳:
+        // P1 ユニット価値: 1000 + 1000 = +2000
+        // P2 ユニット価値: -1500 - 5000 = -6500
+        // 拠点価値: 10000(Capital) + 1000(City) - 2000(Factory) = +9000
+        // 領域支配: (2[P1所有] - 1[P2所有]) * 2500 = +2500
+        // 合計: 2000 - 6500 + 9000 + 2500 = 7000
+        assert_eq!(score, 7000);
 
         let score_p2 = evaluate_board(&mut world, p2, None);
-        assert_eq!(score_p2, 4500);
+        assert_eq!(score_p2, -7000);
     }
 }

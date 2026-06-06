@@ -1,6 +1,3 @@
-#![allow(clippy::collapsible_if)]
-#![allow(clippy::map_entry)]
-
 use crate::ai::eval::evaluate_board;
 use crate::ai::simulation::AiSimulationState;
 use crate::ai::squad::{MissionType, Squad, SquadManager};
@@ -64,10 +61,10 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
             all_target_candidates.push(*p);
         }
     }
-    if let Some(cap) = my_capital_pos {
-        if !all_target_candidates.contains(&cap) {
-            all_target_candidates.push(cap);
-        }
+    if let Some(cap) = my_capital_pos
+        && !all_target_candidates.contains(&cap)
+    {
+        all_target_candidates.push(cap);
     }
 
     // 2. 割り当てが必要な部隊（Squad）を収集（輸送部隊は planner が目標を固定するため除外）
@@ -102,10 +99,10 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                 valid_targets.extend(&target_enemies);
                 // 前線の押し上げ：未占領拠点や敵拠点もターゲット候補に含める
                 valid_targets.extend(&target_props);
-                if let Some(cap) = enemy_capital_pos {
-                    if !valid_targets.contains(&cap) {
-                        valid_targets.push(cap);
-                    }
+                if let Some(cap) = enemy_capital_pos
+                    && !valid_targets.contains(&cap)
+                {
+                    valid_targets.push(cap);
                 }
             }
             MissionType::Capture => {
@@ -126,12 +123,12 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
 
         // ターゲット候補が多すぎると処理時間が爆発するため、各部隊の現在位置から近い N 個に絞る
         let mut sorted_targets = valid_targets.clone();
-        if let Some(&first_member) = squad.members.iter().next() {
-            if let Some(pos) = world.get::<GridPosition>(first_member) {
-                sorted_targets.sort_by_key(|t| {
-                    (pos.x as i32 - t.x as i32).abs() + (pos.y as i32 - t.y as i32).abs()
-                });
-            }
+        if let Some(&first_member) = squad.members.iter().next()
+            && let Some(pos) = world.get::<GridPosition>(first_member)
+        {
+            sorted_targets.sort_by_key(|t| {
+                (pos.x as i32 - t.x as i32).abs() + (pos.y as i32 - t.y as i32).abs()
+            });
         }
         sorted_targets.truncate(5); // 直近の5つのターゲット候補に絞る
         valid_targets = sorted_targets;
@@ -144,20 +141,20 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                 // 未割り当ての残りの部隊を貪欲法（最寄りの目標）で一時的に補完して完成プランにする
                 let mut complete_assignments = new_plan.assignments.clone();
                 for other_squad in &active_squads {
-                    if !complete_assignments.contains_key(&other_squad.id) {
+                    if let std::collections::hash_map::Entry::Vacant(e) = complete_assignments.entry(other_squad.id) {
                         // 最寄りのターゲットを貪欲に仮割り当て
-                        if let Some(&first_member) = other_squad.members.iter().next() {
-                            if let Some(pos) = world.get::<GridPosition>(first_member).cloned() {
-                                let best_target = all_target_candidates
-                                    .iter()
-                                    .min_by_key(|t| {
-                                        (pos.x as i32 - t.x as i32).abs()
-                                            + (pos.y as i32 - t.y as i32).abs()
-                                    })
-                                    .cloned();
-                                if let Some(t) = best_target {
-                                    complete_assignments.insert(other_squad.id, t);
-                                }
+                        if let Some(&first_member) = other_squad.members.iter().next()
+                            && let Some(pos) = world.get::<GridPosition>(first_member).cloned()
+                        {
+                            let best_target = all_target_candidates
+                                .iter()
+                                .min_by_key(|t| {
+                                    (pos.x as i32 - t.x as i32).abs()
+                                        + (pos.y as i32 - t.y as i32).abs()
+                                })
+                                .cloned();
+                            if let Some(t) = best_target {
+                                e.insert(t);
                             }
                         }
                     }
@@ -222,19 +219,19 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                                         &mut search_cache,
                                     );
 
-                                if let Some(&turns) = dist_map.get(pos) {
-                                    if turns != u32::MAX {
-                                        // 1ターン近づくごとに 150 相当の加点を行う
-                                        let mut proximity_bonus = (50 - turns.min(50)) as i32 * 150;
-                                        if Some(target_pos) == enemy_capital_pos
-                                            && (squad.mission_type == MissionType::Attack
-                                                || squad.mission_type == MissionType::Capture)
-                                        {
-                                            // 攻撃・占領部隊にとって敵首都は最重要目標なので、3倍のボーナス（極端な特攻はしないが優先はする）
-                                            proximity_bonus *= 3;
-                                        }
-                                        score += proximity_bonus;
+                                if let Some(&turns) = dist_map.get(pos)
+                                    && turns != u32::MAX
+                                {
+                                    // 1ターン近づくごとに 150 相当の加点を行う
+                                    let mut proximity_bonus = (50 - turns.min(50)) as i32 * 150;
+                                    if Some(target_pos) == enemy_capital_pos
+                                        && (squad.mission_type == MissionType::Attack
+                                            || squad.mission_type == MissionType::Capture)
+                                    {
+                                        // 攻撃・占領部隊にとって敵首都は最重要目標なので、3倍のボーナス（極端な特攻はしないが優先はする）
+                                        proximity_bonus *= 3;
                                     }
+                                    score += proximity_bonus;
                                 }
                             }
                         }
