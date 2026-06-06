@@ -35,8 +35,10 @@ pub struct ProductionStrategy {
     pub priority_targets: Vec<GridPosition>,
     /// 未占領（中立）拠点の座標リスト
     pub unowned_properties: std::collections::HashSet<GridPosition>,
-    /// 不足している輸送キャパシティ数。
-    pub transport_demand: u32,
+    /// 歩兵など、ヘリでも運搬可能な軽輸送需要
+    pub light_transport_demand: u32,
+    /// 車両など、輸送船でしか運搬できない重輸送需要
+    pub heavy_transport_demand: u32,
     /// 不足している占領ユニット数。
     pub capture_demand: u32,
     /// 包括的需要マトリクス（各戦闘カテゴリの脅威ギャップと占領脅威）。
@@ -359,7 +361,7 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
     // 自軍の島に未占領・敵拠点があるかどうかにかかわらず、マップ全体で占領すべき拠点があるなら歩兵を需要とする
     let total_unowned_or_enemy = unowned_properties.len() + enemy_properties.len();
     if total_unowned_or_enemy > 0 {
-        // マップ全体での占領目標に対する歩兵の理想数（マップが広ければ多い）
+        // マップ全体での占領目標に対する歩兵的理想数（マップが広ければ多い）
         let ideal_capture_units_global =
             ((total_unowned_or_enemy as f32 * 0.4).ceil() as usize).clamp(3, 10);
         let total_my_capture_units = my_units.iter().filter(|(_, s)| s.can_capture).count();
@@ -403,7 +405,7 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                 &registry,
             );
 
-            // 輸送が必要なユニット（停滞ユニット）の抽出
+            // 輸送が必要なユニット（停滞ユニット）的抽出
             let map = world.resource::<crate::resources::Map>();
             let normalization_scale = average_attack_expectation(&chart, &registry);
             for (pos, stats) in &my_units {
@@ -487,21 +489,52 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                 }
             }
 
-            let current_capacity: u32 = my_units.iter().map(|(_, s)| s.max_cargo).sum();
+            let current_light_capacity: u32 = my_units
+                .iter()
+                .filter(|(_, s)| s.loadable_unit_types.contains(&UnitType::Infantry))
+                .map(|(_, s)| s.max_cargo)
+                .sum();
+
+            let current_heavy_capacity: u32 = my_units
+                .iter()
+                .filter(|(_, s)| s.loadable_unit_types.contains(&UnitType::Tank))
+                .map(|(_, s)| s.max_cargo)
+                .sum();
+
             // 輸送需要については、輸送能力を持つ全ユニット（海軍・空軍）をカウントする
             strategy.existing_transport_count =
                 my_units.iter().filter(|(_, s)| s.max_cargo > 0).count();
 
-            // 輸送需要の計算: transport_candidates（実際に停滞しているユニット）の数に基づく
-            strategy.transport_demand = (strategy.transport_candidates.len() as u32)
-                .saturating_sub(current_capacity)
-                .max(
-                    if !strategy.transport_candidates.is_empty() && current_capacity == 0 {
-                        1
-                    } else {
-                        0
-                    },
-                );
+            // 軽ユニット（歩兵・バズーカ）と重ユニット（車両）の待機数をカウント
+            let light_candidates = strategy
+                .transport_candidates
+                .iter()
+                .filter(|(_, s, _)| {
+                    s.unit_type == UnitType::Infantry || s.unit_type == UnitType::Mech
+                })
+                .count() as u32;
+            let heavy_candidates = strategy
+                .transport_candidates
+                .iter()
+                .filter(|(_, s, _)| {
+                    s.unit_type != UnitType::Infantry && s.unit_type != UnitType::Mech
+                })
+                .count() as u32;
+
+            strategy.light_transport_demand = light_candidates
+                .saturating_sub(current_light_capacity)
+                .max(if light_candidates > 0 && current_light_capacity == 0 {
+                    1
+                } else {
+                    0
+                });
+            strategy.heavy_transport_demand = heavy_candidates
+                .saturating_sub(current_heavy_capacity)
+                .max(if heavy_candidates > 0 && current_heavy_capacity == 0 {
+                    1
+                } else {
+                    0
+                });
         }
     }
 
