@@ -56,6 +56,12 @@ pub struct EvaluateBoardArgs {
 pub struct SimulateAiTurnArgs {}
 
 #[derive(Deserialize, JsonSchema)]
+pub struct SetPlayerAiVersionArgs {
+    pub player_id: u64,
+    pub version: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct GetBoardStateArgs {}
 
 #[derive(Deserialize, JsonSchema)]
@@ -104,12 +110,51 @@ impl OpenWarsAiServer {
         let mut state_lock = self.state.lock().await;
         if let Some(state) = state_lock.as_mut() {
             let player_id = parse_player_id(args.player_id)?;
-            let score = engine::ai::eval::evaluate_board(&mut state.world, player_id);
+            let score = engine::ai::eval::evaluate_board(&mut state.world, player_id, None);
             Ok(serde_json::json!({
                 "player_id": args.player_id,
                 "score": score
             })
             .to_string())
+        } else {
+            Err("Map not loaded".into())
+        }
+    }
+
+    #[tool(description = "Sets the AI version for a specific player.")]
+    async fn set_player_ai_version(
+        &self,
+        Parameters(args): Parameters<SetPlayerAiVersionArgs>,
+    ) -> Result<String, String> {
+        let mut state_lock = self.state.lock().await;
+        if let Some(state) = state_lock.as_mut() {
+            let player_id = parse_player_id(args.player_id)?;
+            let version = match args.version.as_str() {
+                "V1" => engine::ai::AiVersion::V1,
+                "V2" => engine::ai::AiVersion::V2,
+                _ => {
+                    return Err(format!(
+                        "Invalid AI version: {}. Must be 'V1' or 'V2'",
+                        args.version
+                    ));
+                }
+            };
+
+            let mut settings = state
+                .world
+                .get_resource_mut::<engine::ai::PlayerAiSettings>();
+            if let Some(ref mut s) = settings {
+                s.set_version(player_id, version);
+            } else {
+                let mut s = engine::ai::PlayerAiSettings::new();
+                s.set_version(player_id, version);
+                state.world.insert_resource(s);
+            }
+
+            Ok(format!(
+                "Successfully set Player {} to {:?}",
+                args.player_id, version
+            ))
         } else {
             Err("Map not loaded".into())
         }
@@ -255,12 +300,47 @@ impl OpenWarsAiServer {
             }
 
             let players = world.resource::<engine::resources::Players>();
+            let match_state = world.resource::<engine::resources::MatchState>();
+
+            // 所有拠点数と生存ユニット総コストの計算
+            let mut player_properties_count = std::collections::HashMap::new();
+            let mut player_units_cost = std::collections::HashMap::new();
+
+            for (_, _, prop) in prop_query.iter(world) {
+                if let Some(owner) = prop.owner_id {
+                    *player_properties_count.entry(owner.0).or_insert(0) += 1;
+                }
+            }
+
+            for (_, _, faction, stats, health) in unit_query.iter(world) {
+                if health.current > 0 {
+                    *player_units_cost.entry(faction.0.0).or_insert(0) += stats.cost;
+                }
+            }
+
+            let game_over_info = match &match_state.game_over {
+                Some(engine::resources::GameOverCondition::Winner(pid)) => serde_json::json!({
+                    "status": "winner",
+                    "winner_id": pid.0
+                }),
+                Some(engine::resources::GameOverCondition::Draw) => serde_json::json!({
+                    "status": "draw"
+                }),
+                None => serde_json::json!(null),
+            };
+
             let mut players_info = vec![];
             for p in &players.0 {
+                let pid_u32 = p.id.0;
+                let prop_count = player_properties_count.get(&pid_u32).copied().unwrap_or(0);
+                let unit_cost = player_units_cost.get(&pid_u32).copied().unwrap_or(0);
+
                 players_info.push(serde_json::json!({
                     "player_id": p.id.0 as u64,
                     "name": p.name,
-                    "funds": p.funds
+                    "funds": p.funds,
+                    "property_count": prop_count,
+                    "unit_cost": unit_cost
                 }));
             }
 
@@ -275,12 +355,11 @@ impl OpenWarsAiServer {
                 serde_json::json!({})
             };
 
-            let match_state = world.resource::<engine::resources::MatchState>();
-
             Ok(serde_json::json!({
                 "turn": match_state.current_turn_number.0,
                 "active_player_index": match_state.active_player_index.0,
                 "phase": format!("{:?}", match_state.current_phase),
+                "game_over": game_over_info,
                 "players": players_info,
                 "properties": properties,
                 "units": units,
@@ -312,7 +391,8 @@ impl OpenWarsAiServer {
                 (p.id, ms.active_player_index)
             };
 
-            let before_score = engine::ai::eval::evaluate_board(&mut state.world, active_player_id);
+            let before_score =
+                engine::ai::eval::evaluate_board(&mut state.world, active_player_id, None);
 
             let mut actions_taken = vec![];
             loop {
@@ -329,7 +409,8 @@ impl OpenWarsAiServer {
                 }
             }
 
-            let after_score = engine::ai::eval::evaluate_board(&mut state.world, active_player_id);
+            let after_score =
+                engine::ai::eval::evaluate_board(&mut state.world, active_player_id, None);
 
             Ok(serde_json::json!({
                 "actions_taken": actions_taken,

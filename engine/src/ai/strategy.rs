@@ -1,8 +1,11 @@
+#![allow(clippy::too_many_arguments)]
+
 use crate::ai::demand::{
     DemandMatrix, average_attack_expectation, compute_demand, compute_unit_affinity,
 };
+use crate::ai::turn_distance::{TurnDistanceCache, calculate_turn_distance};
 use crate::components::{Faction, GridPosition, PlayerId, Property, UnitStats};
-use crate::resources::{MovementType, Terrain, UnitType};
+use crate::resources::{Map, MovementType, Terrain, UnitType, master_data::MasterDataRegistry};
 use bevy_ecs::prelude::*;
 use std::collections::HashMap;
 
@@ -59,33 +62,43 @@ pub struct ProductionPlan {
 
 /// 敵ユニットが特定の拠点を脅かしているかを判定するヘルパー関数。
 fn enemy_threatens_property(
+    map: &Map,
+    registry: &MasterDataRegistry,
+    unit_positions: &HashMap<(usize, usize), crate::systems::movement::OccupantInfo>,
+    turn_cache: &mut TurnDistanceCache,
+    player_id: PlayerId,
     prop_pos: &GridPosition,
-    prop_island_id: Option<usize>,
+    _prop_island_id: Option<usize>,
     enemy_pos: &GridPosition,
     enemy_stats: &UnitStats,
-    enemy_island_id: Option<usize>,
+    _enemy_island_id: Option<usize>,
 ) -> bool {
-    let dist = (prop_pos.x as i32 - enemy_pos.x as i32).abs()
-        + (prop_pos.y as i32 - enemy_pos.y as i32).abs();
+    let dist = calculate_turn_distance(
+        map,
+        registry,
+        unit_positions,
+        (enemy_pos.x, enemy_pos.y),
+        (prop_pos.x, prop_pos.y),
+        enemy_stats.movement_type,
+        enemy_stats.max_movement,
+        player_id,
+        turn_cache,
+    );
+
+    if dist == u32::MAX {
+        return false;
+    }
 
     match enemy_stats.movement_type {
         MovementType::Air => {
-            // 航空ユニットは島をまたいで長距離を移動できるため、
-            // 攻撃力を持つユニットであり、かつ「移動力 + 射程 + 猶予(3マス)」以内にいる場合に脅威と判定する
             let has_weapons = enemy_stats.max_ammo1 > 0 || enemy_stats.max_ammo2 > 0;
-            has_weapons && dist <= (enemy_stats.max_movement + enemy_stats.max_range + 3) as i32
+            has_weapons && dist <= 2
         }
         MovementType::Ship => {
-            // 海上ユニットは沿岸に近づいて攻撃するため、
-            // 攻撃力を持つユニットであり、かつ「最大射程 + 2マス」または5マス以内にいる場合に脅威と判定する
             let has_weapons = enemy_stats.max_ammo1 > 0 || enemy_stats.max_ammo2 > 0;
-            has_weapons && dist <= (enemy_stats.max_range + 2).max(5) as i32
+            has_weapons && dist <= 2
         }
-        _ => {
-            // 地上ユニットの場合、同じ島にいるか、または島を問わず距離が極めて近い（8マス未満）場合に脅威と判定する
-            let same_island = prop_island_id.is_some() && prop_island_id == enemy_island_id;
-            same_island || dist < 8
-        }
+        _ => dist <= 2,
     }
 }
 
@@ -105,6 +118,21 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
             crate::resources::master_data::MasterDataRegistry::load().unwrap_or_default()
         });
     let map = world.resource::<crate::resources::Map>().clone();
+    let mut turn_cache = TurnDistanceCache::default();
+    let mut unit_positions = HashMap::new();
+    let mut q_all_units = world.query::<(&Faction, &GridPosition, &UnitStats)>();
+    for (faction, pos, stats) in q_all_units.iter(world) {
+        unit_positions.insert(
+            (pos.x, pos.y),
+            crate::systems::movement::OccupantInfo {
+                player_id: faction.0,
+                is_transport: stats.max_cargo > 0,
+                unit_type: stats.unit_type,
+                loadable_types: stats.loadable_unit_types.clone(),
+                free_slots: stats.max_cargo,
+            },
+        );
+    }
     let island_map = world
         .get_resource::<crate::ai::islands::IslandMap>()
         .cloned()
@@ -130,10 +158,8 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                 if prop.terrain == crate::resources::Terrain::Capital {
                     my_capital_pos = Some(*pos);
                 }
-                // 自軍の生産拠点がある島IDを収集
-                if master_data.is_production_facility(prop.terrain.as_str())
-                    && let Some(island_id) = get_island_id(pos)
-                {
+                // 自軍の任意の拠点がある島IDを収集
+                if let Some(island_id) = get_island_id(pos) {
                     my_base_island_ids.insert(island_id);
                 }
             } else if prop.owner_id.is_none() {
@@ -171,6 +197,16 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
         }
     }
 
+    // 自軍の歩兵が存在する島IDも収集対象に加える
+    for (pos, stats) in &my_units {
+        #[allow(clippy::collapsible_if)]
+        if stats.can_capture {
+            if let Some(island_id) = get_island_id(pos) {
+                my_base_island_ids.insert(island_id);
+            }
+        }
+    }
+
     // 交戦可能性の判定
     let mut min_enemy_dist = 999;
     for (m_pos, _) in &my_units {
@@ -200,10 +236,20 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
     // 首都付近に敵がいるかチェック
     let mut capital_threatened = false;
     if let Some(cap_pos) = my_capital_pos {
-        for (enemy_pos, _) in &enemy_units {
-            let dist = (cap_pos.x as i32 - enemy_pos.x as i32).abs()
-                + (cap_pos.y as i32 - enemy_pos.y as i32).abs();
-            if dist <= 5 {
+        for (enemy_pos, enemy_stats) in &enemy_units {
+            let enemy_id = player_id.opposite();
+            let dist = calculate_turn_distance(
+                &map,
+                &master_data,
+                &unit_positions,
+                (enemy_pos.x, enemy_pos.y),
+                (cap_pos.x, cap_pos.y),
+                enemy_stats.movement_type,
+                enemy_stats.max_movement,
+                enemy_id,
+                &mut turn_cache,
+            );
+            if dist <= 2 {
                 capital_threatened = true;
                 break;
             }
@@ -310,10 +356,18 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
     }
 
     // 占領需要の計算
-    if total_island_properties > 0 {
-        let base_demand = ideal_capture_units.saturating_sub(island_my_capture_units);
+    // 自軍の島に未占領・敵拠点があるかどうかにかかわらず、マップ全体で占領すべき拠点があるなら歩兵を需要とする
+    let total_unowned_or_enemy = unowned_properties.len() + enemy_properties.len();
+    if total_unowned_or_enemy > 0 {
+        // マップ全体での占領目標に対する歩兵の理想数（マップが広ければ多い）
+        let ideal_capture_units_global =
+            ((total_unowned_or_enemy as f32 * 0.4).ceil() as usize).clamp(3, 10);
+        let total_my_capture_units = my_units.iter().filter(|(_, s)| s.can_capture).count();
+
+        let base_demand = ideal_capture_units_global.saturating_sub(total_my_capture_units);
+
+        // 収入不足（自軍の島の未占領拠点が残っているのに歩兵が足りない等）の場合はさらに上乗せ
         if need_more_revenue {
-            // 収入確保優先（歩兵不足）時は需要を上乗せし、歩兵生産が確実に最優先になるようにする
             strategy.capture_demand = (base_demand + 4).max(1) as u32;
         } else {
             strategy.capture_demand = base_demand as u32;
@@ -386,19 +440,29 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                         if dist < min_dist {
                             min_dist = dist;
 
-                            // 簡易パスサンプリングで海があるかチェック
+                            // IslandMap を使って異なる島かどうかを判定（海で遮断されているとみなす）
                             blocked_by_sea = false;
-                            let steps = 4;
-                            for i in 1..steps {
-                                let check_x =
-                                    pos.x as i32 + (target.x as i32 - pos.x as i32) * i / steps;
-                                let check_y =
-                                    pos.y as i32 + (target.y as i32 - pos.y as i32) * i / steps;
-                                if let Some(Terrain::Sea | Terrain::Shoal) =
-                                    map.get_terrain(check_x as usize, check_y as usize)
-                                {
-                                    blocked_by_sea = true;
-                                    break;
+                            let my_island_id = get_island_id(pos);
+                            let target_island_id = get_island_id(target);
+                            if my_island_id.is_some()
+                                && target_island_id.is_some()
+                                && my_island_id != target_island_id
+                            {
+                                blocked_by_sea = true;
+                            } else {
+                                // 同一島IDがない場合（海の上など）や判定できない場合は簡易パスサンプリングでフォールバック
+                                let steps = 4;
+                                for i in 1..steps {
+                                    let check_x =
+                                        pos.x as i32 + (target.x as i32 - pos.x as i32) * i / steps;
+                                    let check_y =
+                                        pos.y as i32 + (target.y as i32 - pos.y as i32) * i / steps;
+                                    if let Some(Terrain::Sea | Terrain::Shoal) =
+                                        map.get_terrain(check_x as usize, check_y as usize)
+                                    {
+                                        blocked_by_sea = true;
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -424,11 +488,9 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
             }
 
             let current_capacity: u32 = my_units.iter().map(|(_, s)| s.max_cargo).sum();
-            // 海上輸送需要については、海軍ユニットのみをカウントする
-            strategy.existing_transport_count = my_units
-                .iter()
-                .filter(|(_, s)| s.max_cargo > 0 && s.movement_type == MovementType::Ship)
-                .count();
+            // 輸送需要については、輸送能力を持つ全ユニット（海軍・空軍）をカウントする
+            strategy.existing_transport_count =
+                my_units.iter().filter(|(_, s)| s.max_cargo > 0).count();
 
             // 輸送需要の計算: transport_candidates（実際に停滞しているユニット）の数に基づく
             strategy.transport_demand = (strategy.transport_candidates.len() as u32)
@@ -452,7 +514,19 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
 
         for (e_pos, e_stats) in &enemy_units {
             let e_island_id = get_island_id(e_pos);
-            if enemy_threatens_property(pos, prop_island_id, e_pos, e_stats, e_island_id) {
+            let enemy_id = player_id.opposite();
+            if enemy_threatens_property(
+                &map,
+                &master_data,
+                &unit_positions,
+                &mut turn_cache,
+                enemy_id,
+                pos,
+                prop_island_id,
+                e_pos,
+                e_stats,
+                e_island_id,
+            ) {
                 is_peaceful = false;
                 break;
             }
@@ -501,6 +575,7 @@ mod tests {
     fn test_analyze_strategy_defense() {
         let mut world = World::new();
         world.insert_resource(Map::new(15, 15, Terrain::Plains, GridTopology::Square));
+        world.insert_resource(crate::resources::MasterDataRegistry::load().unwrap());
         let p1 = PlayerId(1);
         let p2 = PlayerId(2);
 
@@ -516,6 +591,8 @@ mod tests {
             Faction(p2),
             UnitStats {
                 unit_type: UnitType::Tank,
+                max_movement: 6,
+                movement_type: crate::resources::MovementType::Tank,
                 ..UnitStats::mock()
             },
         ));
@@ -556,6 +633,8 @@ mod tests {
             Faction(p2),
             UnitStats {
                 unit_type: UnitType::Tank,
+                max_movement: 6,
+                movement_type: crate::resources::MovementType::Tank,
                 max_ammo1: 9,
                 max_ammo2: 0,
                 ..UnitStats::mock()

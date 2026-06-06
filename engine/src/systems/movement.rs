@@ -278,9 +278,10 @@ pub fn find_path_a_star(
         for (nx, ny) in map.get_adjacent(position.0, position.1) {
             if let Some(occ) = unit_positions.get(&(nx, ny)) {
                 if occ.player_id != player_id {
-                    continue; // Enemy: Can't enter/pass
-                }
-                if (nx, ny) == goal {
+                    if (nx, ny) != goal {
+                        continue; // Enemy: Can't enter/pass unless it's the goal itself
+                    }
+                } else if (nx, ny) == goal {
                     let can_load = occ.is_transport
                         && occ.free_slots > 0
                         && occ.loadable_types.contains(&moving_unit_type);

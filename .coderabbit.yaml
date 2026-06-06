@@ -3,7 +3,7 @@ early_access: false
 reviews:
     request_changes_workflow: false
     high_level_summary: true
-    poem: true
+    poem: false
     review_status: true
     collapse_walkthrough: false
     path_filters:
@@ -32,7 +32,7 @@ reviews:
             | 🟡 警告 | プリミティブ型（`i32`, `String` 等）を直接フィールドに使用している | Newtypeパターンの徹底 |
             重要な問題を特定し、解決して全体的なコード品質を向上させることを目指してください。細かい問題は意図的に無視してください。
     auto_review:
-        enabled: true
+        enabled: false
         ignore_title_keywords:
             - "WIP"
             - "DO NOT MERGE"
@@ -41,4 +41,4 @@ reviews:
             - "develop"
             - "feature/*"
 chat:
-    auto_reply: true
+    auto_reply: false
