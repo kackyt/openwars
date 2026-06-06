@@ -118,7 +118,7 @@ def run_single_game(map_name, p1_version, p2_version):
         
         # AIターンのシミュレート
         start_time = time.time()
-        call_tool("simulate_ai_turn")
+        ai_result = call_tool("simulate_ai_turn")
         end_time = time.time()
         
         # 思考時間の記録
@@ -128,7 +128,17 @@ def run_single_game(map_name, p1_version, p2_version):
         
         total_thinking_time[player_id] += elapsed
         turn_counts[player_id] += 1
-                
+        
+        
+        # アクションの出力（V2のスタック問題を調査するため）
+        if player_id == 2 or True:
+            actions = ai_result.get("actions_taken", [])
+            print(f"    Actions taken: {len(actions)}")
+            if len(actions) > 0 and len(actions) < 10:
+                print(f"    {actions}")
+            elif len(actions) >= 10:
+                print(f"    {actions[:5]} ... and {len(actions)-5} more")
+            
         print(f"turn: {turn} ({player_id}) end {elapsed} ms")
         # 状態を再取得してターン数を更新
         next_state = call_tool("get_board_state")

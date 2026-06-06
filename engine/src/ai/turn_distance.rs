@@ -72,8 +72,11 @@ pub fn calculate_turn_distance(
     if let Some(target_terrain) = map.get_terrain(target.0, target.1) {
         let t_cost = get_valid_movement_cost(registry, movement_type, target_terrain);
         if t_cost.is_none() {
-            cache.cache.insert(cache_key, u32::MAX);
-            return u32::MAX;
+            let dx = (start.0 as i32 - target.0 as i32).abs();
+            let dy = (start.1 as i32 - target.1 as i32).abs();
+            let approx = 50 + ((dx + dy) as u32 / 4);
+            cache.cache.insert(cache_key, approx);
+            return approx;
         }
     }
 
@@ -137,8 +140,14 @@ pub fn calculate_turn_distance(
         }
     }
 
-    cache.cache.insert(cache_key, u32::MAX);
-    u32::MAX
+    // 完全に到達不可な場合でも、マンハッタン距離ベースの近似値を返す
+    // 遠すぎる値にするとスコア計算で差分が出なくなるため、50 + 距離/4 程度に留める
+    let dx = (start.0 as i32 - target.0 as i32).abs();
+    let dy = (start.1 as i32 - target.1 as i32).abs();
+    let approx = 50 + ((dx + dy) as u32 / 4);
+
+    cache.cache.insert(cache_key, approx);
+    approx
 }
 
 /// 始点（start）からマップ上のすべての到達可能な座標への最短到達ターン数をダイクストラ法で一括計算し、
@@ -341,6 +350,6 @@ mod tests {
             PlayerId(1),
             &mut cache,
         );
-        assert_eq!(dist, u32::MAX);
+        assert_eq!(dist, 51);
     }
 }

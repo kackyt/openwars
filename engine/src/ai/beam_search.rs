@@ -31,39 +31,42 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
     }
 
     // 1. 目標候補（Target）の収集
-    let mut target_candidates = Vec::new();
-
-    // (A) 敵クラスターの中心
+    let mut target_enemies = Vec::new();
     let enemy_clusters = crate::ai::cluster::detect_enemy_clusters(world, perspective_player);
     for cluster in &enemy_clusters {
-        if !target_candidates.contains(&cluster.center) {
-            target_candidates.push(cluster.center);
+        if !target_enemies.contains(&cluster.center) {
+            target_enemies.push(cluster.center);
         }
     }
 
-    // (B) 未占領または敵所有の拠点
+    let mut target_props = Vec::new();
+    let mut my_capital_pos = None;
+    let mut enemy_capital_pos = None;
+
     let mut q_props = world.query::<(&GridPosition, &crate::components::Property)>();
     for (pos, prop) in q_props.iter(world) {
         if prop.owner_id != Some(perspective_player) {
-            if !target_candidates.contains(pos) {
-                target_candidates.push(*pos);
+            if !target_props.contains(pos) {
+                target_props.push(*pos);
             }
+            if prop.terrain == crate::resources::Terrain::Capital && prop.owner_id.is_some() {
+                enemy_capital_pos = Some(*pos);
+            }
+        } else if prop.terrain == crate::resources::Terrain::Capital {
+            my_capital_pos = Some(*pos);
         }
     }
 
-    // (C) 首都防衛の場合は自軍の首都
-    let mut my_capital_pos = None;
-    for (pos, prop) in q_props.iter(world) {
-        if prop.terrain == crate::resources::Terrain::Capital
-            && prop.owner_id == Some(perspective_player)
-        {
-            my_capital_pos = Some(*pos);
-            break;
+    let mut all_target_candidates = Vec::new();
+    all_target_candidates.extend(&target_enemies);
+    for p in &target_props {
+        if !all_target_candidates.contains(p) {
+            all_target_candidates.push(*p);
         }
     }
-    if let Some(capital) = my_capital_pos {
-        if !target_candidates.contains(&capital) {
-            target_candidates.push(capital);
+    if let Some(cap) = my_capital_pos {
+        if !all_target_candidates.contains(&cap) {
+            all_target_candidates.push(cap);
         }
     }
 
@@ -75,7 +78,7 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
         .cloned()
         .collect();
 
-    if active_squads.is_empty() || target_candidates.is_empty() {
+    if active_squads.is_empty() || all_target_candidates.is_empty() {
         world.insert_resource(manager);
         return;
     }
@@ -93,8 +96,34 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
     for squad in &active_squads {
         let mut next_beam = Vec::new();
 
+        let mut valid_targets = Vec::new();
+        match squad.mission_type {
+            MissionType::Attack => {
+                valid_targets.extend(&target_enemies);
+                if let Some(cap) = enemy_capital_pos {
+                    if !valid_targets.contains(&cap) {
+                        valid_targets.push(cap);
+                    }
+                }
+            }
+            MissionType::Capture => {
+                valid_targets.extend(&target_props);
+            }
+            MissionType::Defense => {
+                if let Some(cap) = my_capital_pos {
+                    valid_targets.push(cap);
+                }
+                valid_targets.extend(&target_enemies);
+            }
+            MissionType::Transport => {}
+        }
+
+        if valid_targets.is_empty() {
+            valid_targets.extend(&all_target_candidates);
+        }
+
         for plan in &beam {
-            for &target in &target_candidates {
+            for &target in &valid_targets {
                 let mut new_plan = plan.clone();
                 new_plan.assignments.insert(squad.id, target);
 
@@ -105,7 +134,7 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                         // 最寄りのターゲットを貪欲に仮割り当て
                         if let Some(&first_member) = other_squad.members.iter().next() {
                             if let Some(pos) = world.get::<GridPosition>(first_member).cloned() {
-                                let best_target = target_candidates
+                                let best_target = all_target_candidates
                                     .iter()
                                     .min_by_key(|t| {
                                         (pos.x as i32 - t.x as i32).abs()
@@ -181,8 +210,15 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
 
                                 if let Some(&turns) = dist_map.get(pos) {
                                     if turns != u32::MAX {
-                                        // 1ターン近づくごとに 150 相当の加点を行う（日本語のコメント）
-                                        let proximity_bonus = (20 - turns.min(20)) as i32 * 150;
+                                        // 1ターン近づくごとに 150 相当の加点を行う
+                                        let mut proximity_bonus = (20 - turns.min(20)) as i32 * 150;
+                                        if Some(target_pos) == enemy_capital_pos
+                                            && (squad.mission_type == MissionType::Attack
+                                                || squad.mission_type == MissionType::Capture)
+                                        {
+                                            // 攻撃・占領部隊にとって敵首都は最重要目標なので、3倍のボーナス（極端な特攻はしないが優先はする）
+                                            proximity_bonus *= 3;
+                                        }
                                         score += proximity_bonus;
                                     }
                                 }

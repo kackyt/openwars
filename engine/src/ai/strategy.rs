@@ -356,23 +356,23 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
     }
 
     // 占領需要の計算
-    if total_island_properties > 0 {
-        let base_demand = ideal_capture_units.saturating_sub(island_my_capture_units);
+    // 自軍の島に未占領・敵拠点があるかどうかにかかわらず、マップ全体で占領すべき拠点があるなら歩兵を需要とする
+    let total_unowned_or_enemy = unowned_properties.len() + enemy_properties.len();
+    if total_unowned_or_enemy > 0 {
+        // マップ全体での占領目標に対する歩兵の理想数（マップが広ければ多い）
+        let ideal_capture_units_global = ((total_unowned_or_enemy as f32 * 0.4).ceil() as usize).clamp(3, 10);
+        let total_my_capture_units = my_units.iter().filter(|(_, s)| s.can_capture).count();
+        
+        let base_demand = ideal_capture_units_global.saturating_sub(total_my_capture_units);
+        
+        // 収入不足（自軍の島の未占領拠点が残っているのに歩兵が足りない等）の場合はさらに上乗せ
         if need_more_revenue {
-            // 収入確保優先（歩兵不足）時は需要を上乗せし、歩兵生産が確実に最優先になるようにする
             strategy.capture_demand = (base_demand + 4).max(1) as u32;
         } else {
             strategy.capture_demand = base_demand as u32;
         }
     } else {
-        // 安全バリア：マップ全体で未占領の拠点が存在し、かつ自軍の歩兵の総数が極めて少ない（3体未満）場合、
-        // 島の制限にかかわらず最低限の歩兵需要（1体）を常に発生させる
-        let total_my_infantry = my_units.iter().filter(|(_, s)| s.can_capture).count();
-        if !unowned_properties.is_empty() && total_my_infantry < 3 {
-            strategy.capture_demand = 1;
-        } else {
-            strategy.capture_demand = 0;
-        }
+        strategy.capture_demand = 0;
     }
 
     // 包括的需要マトリクスの計算
@@ -439,19 +439,26 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                         if dist < min_dist {
                             min_dist = dist;
 
-                            // 簡易パスサンプリングで海があるかチェック
+                            // IslandMap を使って異なる島かどうかを判定（海で遮断されているとみなす）
                             blocked_by_sea = false;
-                            let steps = 4;
-                            for i in 1..steps {
-                                let check_x =
-                                    pos.x as i32 + (target.x as i32 - pos.x as i32) * i / steps;
-                                let check_y =
-                                    pos.y as i32 + (target.y as i32 - pos.y as i32) * i / steps;
-                                if let Some(Terrain::Sea | Terrain::Shoal) =
-                                    map.get_terrain(check_x as usize, check_y as usize)
-                                {
-                                    blocked_by_sea = true;
-                                    break;
+                            let my_island_id = get_island_id(pos);
+                            let target_island_id = get_island_id(target);
+                            if my_island_id.is_some() && target_island_id.is_some() && my_island_id != target_island_id {
+                                blocked_by_sea = true;
+                            } else {
+                                // 同一島IDがない場合（海の上など）や判定できない場合は簡易パスサンプリングでフォールバック
+                                let steps = 4;
+                                for i in 1..steps {
+                                    let check_x =
+                                        pos.x as i32 + (target.x as i32 - pos.x as i32) * i / steps;
+                                    let check_y =
+                                        pos.y as i32 + (target.y as i32 - pos.y as i32) * i / steps;
+                                    if let Some(Terrain::Sea | Terrain::Shoal) =
+                                        map.get_terrain(check_x as usize, check_y as usize)
+                                    {
+                                        blocked_by_sea = true;
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -477,10 +484,10 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
             }
 
             let current_capacity: u32 = my_units.iter().map(|(_, s)| s.max_cargo).sum();
-            // 海上輸送需要については、海軍ユニットのみをカウントする
+            // 輸送需要については、輸送能力を持つ全ユニット（海軍・空軍）をカウントする
             strategy.existing_transport_count = my_units
                 .iter()
-                .filter(|(_, s)| s.max_cargo > 0 && s.movement_type == MovementType::Ship)
+                .filter(|(_, s)| s.max_cargo > 0)
                 .count();
 
             // 輸送需要の計算: transport_candidates（実際に停滞しているユニット）の数に基づく

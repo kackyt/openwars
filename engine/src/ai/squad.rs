@@ -445,15 +445,22 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         }
     }
 
-    // 残ったすべての戦闘ユニットを、最も近い既存の攻撃・防衛部隊に吸収させます
+    // ---------------------------------------------------------------
+    // 定員管理付きの余剰ユニット割り当てロジック（交通渋滞解消）
+    // 1部隊の最大人数。これを超えると後続ユニットが前線で渋滞を起こす
+    const MAX_SQUAD_SIZE: usize = 3;
+
     while !free_combat_units.is_empty() {
         let (ent, pos, stats) = free_combat_units.pop().unwrap();
+
+        // ステップ1: 定員未満の既存 Attack/Defense 部隊のうち、最も近いものを探す
         let mut best_squad_idx = None;
         let mut min_dist = u32::MAX;
 
         for (idx, squad) in manager.squads.iter().enumerate() {
-            if squad.mission_type == MissionType::Attack
-                || squad.mission_type == MissionType::Defense
+            if (squad.mission_type == MissionType::Attack
+                || squad.mission_type == MissionType::Defense)
+                && squad.members.len() < MAX_SQUAD_SIZE
             {
                 if let Some(target) = squad.target {
                     let dist = calculate_turn_distance(
@@ -476,9 +483,33 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         }
 
         if let Some(idx) = best_squad_idx {
+            // 定員未満の部隊に吸収
             manager.squads[idx].members.insert(ent);
         } else {
-            // 吸収先がない場合は、単独で SoloFallback 的に動かすため放置します
+            // ステップ2: 既存部隊がすべて定員に達している場合、
+            // 最も近い敵クラスターを目標とする新規 Attack 部隊（第2波）を新設する
+            let nearest_cluster = enemy_clusters.iter().min_by_key(|cluster| {
+                calculate_turn_distance(
+                    &map,
+                    &registry,
+                    &unit_positions,
+                    (pos.x, pos.y),
+                    (cluster.center.x, cluster.center.y),
+                    stats.movement_type,
+                    stats.max_movement,
+                    perspective_player,
+                    &mut turn_cache,
+                )
+            });
+
+            if let Some(cluster) = nearest_cluster {
+                // 新規部隊を立ち上げて1体目のメンバーとして割り当てる
+                let new_squad = manager.create_squad(MissionType::Attack);
+                new_squad.target = Some(cluster.center);
+                new_squad.phase = MissionPhase::Forming;
+                new_squad.members.insert(ent);
+            }
+            // クラスターがまったく存在しない場合は放置（SoloFallback として機能）
         }
     }
 
