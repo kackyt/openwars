@@ -10,12 +10,14 @@ use bevy_ecs::prelude::*;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
+pub type TurnCacheKey = (usize, usize, usize, usize, MovementType, u32, PlayerId);
+
 /// ターン数ベースの距離計算をキャッシュするためのリソース
 #[derive(Resource, Default)]
 pub struct TurnDistanceCache {
     /// キー: (出発地x, 出発地y, 目標地x, 目標地y, 移動タイプ, 移動力, 勢力ID)
     /// 値: 到達ターン数 (到達不可の場合は u32::MAX)
-    pub cache: HashMap<(usize, usize, usize, usize, MovementType, u32, PlayerId), u32>,
+    pub cache: HashMap<TurnCacheKey, u32>,
 }
 
 impl TurnDistanceCache {

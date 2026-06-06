@@ -13,7 +13,7 @@ pub const BEAM_WIDTH: usize = 3;
 pub struct SquadAssignmentPlan {
     /// キー: Squad ID
     /// 値: 割り当てられた目標座標
-    pub assignments: HashMap<u32, GridPosition>,
+    pub assignments: HashMap<crate::ai::squad::SquadId, GridPosition>,
     /// プランの暫定評価スコア
     pub score: i32,
 }

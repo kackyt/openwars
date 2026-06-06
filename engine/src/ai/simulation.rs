@@ -62,7 +62,7 @@ impl AiSimulationState {
     pub fn simulate_plan(
         world: &mut World,
         squads: &[Squad],
-        assignments: &HashMap<u32, GridPosition>, // Squad ID -> Target GridPosition
+        assignments: &HashMap<crate::ai::squad::SquadId, GridPosition>, // Squad ID -> Target GridPosition
         perspective_player: PlayerId,
         cache: &mut crate::ai::turn_distance::AiTurnCache,
     ) {

@@ -40,10 +40,13 @@ pub enum MissionPhase {
     Transport(TransportPhase),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SquadId(pub u32);
+
 /// 部隊（Squad）の定義
 #[derive(Debug, Clone)]
 pub struct Squad {
-    pub id: u32,
+    pub id: SquadId,
     pub members: HashSet<Entity>,
     pub mission_type: MissionType,
     pub target: Option<GridPosition>, // 攻撃・防衛・占領の目標座標
@@ -67,7 +70,7 @@ impl SquadManager {
 
     pub fn create_squad(&mut self, mission_type: MissionType) -> &mut Squad {
         let squad = Squad {
-            id: self.next_id,
+            id: SquadId(self.next_id),
             members: HashSet::new(),
             mission_type,
             target: None,
@@ -80,7 +83,7 @@ impl SquadManager {
         self.squads.last_mut().unwrap()
     }
 
-    pub fn remove_squad(&mut self, id: u32) {
+    pub fn remove_squad(&mut self, id: SquadId) {
         self.squads.retain(|s| s.id != id);
     }
 }

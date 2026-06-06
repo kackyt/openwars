@@ -47,11 +47,10 @@ pub fn detect_enemy_clusters(
     let mut clusters = Vec::new();
     let mut visited = HashSet::new();
 
-    let map = world.resource::<crate::resources::Map>().clone();
+    let map = world.resource::<crate::resources::Map>();
     let registry = world
         .get_resource::<crate::resources::master_data::MasterDataRegistry>()
-        .cloned()
-        .unwrap_or_default();
+        .unwrap();
     let mut turn_cache = crate::ai::turn_distance::TurnDistanceCache::default();
 
     for i in 0..enemy_units.len() {
@@ -82,8 +81,8 @@ pub fn detect_enemy_clusters(
                     let other_player_id = enemy_units[j].3;
 
                     let turn_dist = crate::ai::turn_distance::calculate_turn_distance(
-                        &map,
-                        &registry,
+                        map,
+                        registry,
                         &unit_positions,
                         (pos.x, pos.y),
                         (other_pos.x, other_pos.y),
@@ -94,8 +93,8 @@ pub fn detect_enemy_clusters(
                     );
 
                     let turn_dist_rev = crate::ai::turn_distance::calculate_turn_distance(
-                        &map,
-                        &registry,
+                        map,
+                        registry,
                         &unit_positions,
                         (other_pos.x, other_pos.y),
                         (pos.x, pos.y),
