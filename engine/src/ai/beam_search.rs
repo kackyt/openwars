@@ -100,6 +100,8 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
         match squad.mission_type {
             MissionType::Attack => {
                 valid_targets.extend(&target_enemies);
+                // 前線の押し上げ：未占領拠点や敵拠点もターゲット候補に含める
+                valid_targets.extend(&target_props);
                 if let Some(cap) = enemy_capital_pos {
                     if !valid_targets.contains(&cap) {
                         valid_targets.push(cap);
@@ -121,6 +123,18 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
         if valid_targets.is_empty() {
             valid_targets.extend(&all_target_candidates);
         }
+
+        // ターゲット候補が多すぎると処理時間が爆発するため、各部隊の現在位置から近い N 個に絞る
+        let mut sorted_targets = valid_targets.clone();
+        if let Some(&first_member) = squad.members.iter().next() {
+            if let Some(pos) = world.get::<GridPosition>(first_member) {
+                sorted_targets.sort_by_key(|t| {
+                    (pos.x as i32 - t.x as i32).abs() + (pos.y as i32 - t.y as i32).abs()
+                });
+            }
+        }
+        sorted_targets.truncate(5); // 直近の5つのターゲット候補に絞る
+        valid_targets = sorted_targets;
 
         for plan in &beam {
             for &target in &valid_targets {
@@ -211,7 +225,7 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                                 if let Some(&turns) = dist_map.get(pos) {
                                     if turns != u32::MAX {
                                         // 1ターン近づくごとに 150 相当の加点を行う
-                                        let mut proximity_bonus = (20 - turns.min(20)) as i32 * 150;
+                                        let mut proximity_bonus = (50 - turns.min(50)) as i32 * 150;
                                         if Some(target_pos) == enemy_capital_pos
                                             && (squad.mission_type == MissionType::Attack
                                                 || squad.mission_type == MissionType::Capture)

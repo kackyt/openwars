@@ -488,8 +488,11 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         } else {
             // ステップ2: 既存部隊がすべて定員に達している場合、
             // 最も近い敵クラスターを目標とする新規 Attack 部隊（第2波）を新設する
-            let nearest_cluster = enemy_clusters.iter().min_by_key(|cluster| {
-                calculate_turn_distance(
+            let mut nearest_cluster_dist = u32::MAX;
+            let mut nearest_cluster_center = None;
+
+            for cluster in &enemy_clusters {
+                let dist = calculate_turn_distance(
                     &map,
                     &registry,
                     &unit_positions,
@@ -499,17 +502,41 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                     stats.max_movement,
                     perspective_player,
                     &mut turn_cache,
-                )
-            });
+                );
+                if dist < nearest_cluster_dist {
+                    nearest_cluster_dist = dist;
+                    nearest_cluster_center = Some(cluster.center);
+                }
+            }
 
-            if let Some(cluster) = nearest_cluster {
+            let mut final_target = None;
+            // 敵が15ターン以上遠い場合や存在しない場合は、最寄りの拠点（未占領または敵所有）を目標にする
+            if nearest_cluster_dist <= 15 {
+                final_target = nearest_cluster_center;
+            } else {
+                let mut nearest_prop_dist = u32::MAX;
+                let mut nearest_prop_pos = None;
+                for (p_pos, p_owner) in &properties_ownership {
+                    if *p_owner != Some(perspective_player) {
+                        // 処理時間を削減するためマンハッタン距離による概算を使用
+                        let dist = (pos.x as i32 - p_pos.x as i32).abs() as u32 + (pos.y as i32 - p_pos.y as i32).abs() as u32;
+                        if dist < nearest_prop_dist {
+                            nearest_prop_dist = dist;
+                            nearest_prop_pos = Some(*p_pos);
+                        }
+                    }
+                }
+                final_target = nearest_prop_pos.or(nearest_cluster_center);
+            }
+
+            if let Some(target) = final_target {
                 // 新規部隊を立ち上げて1体目のメンバーとして割り当てる
                 let new_squad = manager.create_squad(MissionType::Attack);
-                new_squad.target = Some(cluster.center);
+                new_squad.target = Some(target);
                 new_squad.phase = MissionPhase::Forming;
                 new_squad.members.insert(ent);
             }
-            // クラスターがまったく存在しない場合は放置（SoloFallback として機能）
+            // 目標がまったく存在しない場合は放置（SoloFallback として機能）
         }
     }
 
