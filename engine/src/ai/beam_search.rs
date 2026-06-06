@@ -247,7 +247,7 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
             }
         }
 
-        // スコア降順でソートし、ビーム幅（N = 5）に絞り込む
+        // スコア降順でソートし、ビーム幅（BEAM_WIDTH = 3）に絞り込む
         next_beam.sort_by_key(|p| std::cmp::Reverse(p.score));
         next_beam.truncate(BEAM_WIDTH);
         beam = next_beam;

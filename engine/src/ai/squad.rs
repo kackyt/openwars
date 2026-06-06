@@ -220,8 +220,16 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
 
     // 占有情報（経路探索用）
     let mut unit_positions = HashMap::new();
-    let mut q_all_units = world.query::<(&Faction, &GridPosition, &UnitStats)>();
-    for (faction, pos, stats) in q_all_units.iter(world) {
+    let mut q_all_units = world.query::<(
+        &Faction,
+        &GridPosition,
+        &UnitStats,
+        Option<&crate::components::Transporting>,
+    )>();
+    for (faction, pos, stats, transporting) in q_all_units.iter(world) {
+        if transporting.is_some() {
+            continue;
+        }
         unit_positions.insert(
             (pos.x, pos.y),
             crate::systems::movement::OccupantInfo {
@@ -241,11 +249,18 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     let mut free_infantry = Vec::new();
     let mut free_transports = Vec::new();
 
-    let mut q_my_units = world.query::<(Entity, &Faction, &GridPosition, &UnitStats)>();
-    for (entity, faction, pos, stats) in q_my_units.iter(world) {
+    let mut q_my_units = world.query::<(
+        Entity,
+        &Faction,
+        &GridPosition,
+        &UnitStats,
+        Option<&crate::components::Transporting>,
+    )>();
+    for (entity, faction, pos, stats, transporting) in q_my_units.iter(world) {
         if faction.0 == perspective_player
             && !busy_entities.contains(&entity)
             && !manager.solo_fallbacks.contains(&entity)
+            && transporting.is_none()
         {
             let is_transport = stats.unit_type == UnitType::TransportHelicopter
                 || stats.unit_type == UnitType::Lander;
@@ -975,15 +990,32 @@ pub fn execute_transport_squad_step(
                 transport_entity,
                 cargo_entity,
             );
-            if let Some(drop_tile) = drop_tiles.first() {
+            let mut chosen_drop_tile = None;
+            if let Some(target_island_id) = squad.target_island
+                && let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>()
+            {
+                for &tile in &drop_tiles {
+                    let pos = GridPosition {
+                        x: tile.0,
+                        y: tile.1,
+                    };
+                    if let Some(island) = island_map.get_island_at(&pos) {
+                        if island.id == target_island_id {
+                            chosen_drop_tile = Some(pos);
+                            break;
+                        }
+                    }
+                }
+            }
+            let final_drop_pos = chosen_drop_tile
+                .or_else(|| drop_tiles.first().map(|t| GridPosition { x: t.0, y: t.1 }));
+
+            if let Some(drop_pos) = final_drop_pos {
                 return Some((
                     transport_entity,
                     crate::ai::engine::AiCommand::Drop {
                         transport_target_pos: t_pos,
-                        cargo_drop_pos: GridPosition {
-                            x: drop_tile.0,
-                            y: drop_tile.1,
-                        },
+                        cargo_drop_pos: drop_pos,
                         cargo_entity,
                     },
                 ));

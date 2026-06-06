@@ -103,7 +103,8 @@ def run_single_game(map_name, p1_version, p2_version):
                     "result": f"Player {winner_id}",
                     "winner_id": winner_id,
                     "turns": turn,
-                    "avg_thinking_time": dict(total_thinking_time),
+                    "thinking_time_ms": dict(total_thinking_time),
+                    "turn_counts": dict(turn_counts),
                     "final_state": state
                 }
             elif status == "draw":
@@ -112,7 +113,8 @@ def run_single_game(map_name, p1_version, p2_version):
                     "result": "Draw",
                     "winner_id": None,
                     "turns": turn,
-                    "avg_thinking_time": dict(total_thinking_time),
+                    "thinking_time_ms": dict(total_thinking_time),
+                    "turn_counts": dict(turn_counts),
                     "final_state": state
                 }
         
@@ -167,7 +169,8 @@ def run_single_game(map_name, p1_version, p2_version):
         "result": winner_str,
         "winner_id": winner_id,
         "turns": MAX_TURNS,
-        "avg_thinking_time": dict(total_thinking_time),
+        "thinking_time_ms": dict(total_thinking_time),
+        "turn_counts": dict(turn_counts),
         "final_state": state
     }
 
@@ -202,12 +205,15 @@ def generate_report(results):
         turns = game["turns"]
         
         # 思考時間の集計
-        for pid, t_time in game["avg_thinking_time"].items():
+        for pid, t_time in game["thinking_time_ms"].items():
             ver = p1_ver if pid == 1 else p2_ver
+            player_turns = game["turn_counts"].get(pid, 0)
+            if player_turns == 0:
+                continue
             if ver == "V1":
-                thinking_times_v1.append(t_time / turns)
+                thinking_times_v1.append(t_time / player_turns)
             else:
-                thinking_times_v2.append(t_time / turns)
+                thinking_times_v2.append(t_time / player_turns)
         
         # 勝者の判定
         v2_is_winner = False

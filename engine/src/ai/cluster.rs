@@ -78,6 +78,8 @@ pub fn detect_enemy_clusters(
             for j in 0..enemy_units.len() {
                 if !visited.contains(&enemy_units[j].0) {
                     let other_pos = enemy_units[j].1;
+                    let other_stats = &enemy_units[j].2;
+                    let other_player_id = enemy_units[j].3;
 
                     let turn_dist = crate::ai::turn_distance::calculate_turn_distance(
                         &map,
@@ -91,7 +93,19 @@ pub fn detect_enemy_clusters(
                         &mut turn_cache,
                     );
 
-                    if turn_dist <= 2 {
+                    let turn_dist_rev = crate::ai::turn_distance::calculate_turn_distance(
+                        &map,
+                        &registry,
+                        &unit_positions,
+                        (other_pos.x, other_pos.y),
+                        (pos.x, pos.y),
+                        other_stats.movement_type,
+                        other_stats.max_movement,
+                        other_player_id,
+                        &mut turn_cache,
+                    );
+
+                    if turn_dist <= 2 && turn_dist_rev <= 2 {
                         visited.insert(enemy_units[j].0);
                         queue.push(enemy_units[j].clone());
                     }
