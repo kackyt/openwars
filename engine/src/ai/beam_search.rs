@@ -118,12 +118,13 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                 // squad.rs の段階ですでに戦略的価値に基づく target_island が設定されているはず
                 if let Some(target_island_id) = squad.target_island {
                     let mut island_targets = Vec::new();
-                    if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() {
+                    if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>()
+                    {
                         for &t_pos in &target_props {
-                            if let Some(island) = island_map.get_island_at(&t_pos) {
-                                if island.id == target_island_id {
-                                    island_targets.push(t_pos);
-                                }
+                            if let Some(island) = island_map.get_island_at(&t_pos)
+                                && island.id == target_island_id
+                            {
+                                island_targets.push(t_pos);
                             }
                         }
                     }

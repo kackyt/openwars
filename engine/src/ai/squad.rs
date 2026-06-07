@@ -304,15 +304,24 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
 
     for (pos, owner) in &properties_ownership {
         if let Some(island) = island_map.get_island_at(pos) {
-            island_props_map.entry(island.id).or_insert_with(Vec::new).push(*pos);
+            island_props_map
+                .entry(island.id)
+                .or_insert_with(Vec::new)
+                .push(*pos);
 
-            let terrain = map.get_terrain(pos.x, pos.y).unwrap_or(crate::resources::Terrain::City);
+            let terrain = map
+                .get_terrain(pos.x, pos.y)
+                .unwrap_or(crate::resources::Terrain::City);
             if *owner == Some(perspective_player) {
-                if terrain == crate::resources::Terrain::Factory || terrain == crate::resources::Terrain::Capital {
+                if terrain == crate::resources::Terrain::Factory
+                    || terrain == crate::resources::Terrain::Capital
+                {
                     own_production_bases.push(*pos);
                 }
             } else if owner.is_some() {
-                if terrain == crate::resources::Terrain::Factory || terrain == crate::resources::Terrain::Capital {
+                if terrain == crate::resources::Terrain::Factory
+                    || terrain == crate::resources::Terrain::Capital
+                {
                     *enemy_production_count_map.entry(island.id).or_insert(0) += 1;
                 }
             }
@@ -329,12 +338,17 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                 if properties_ownership.get(tile) == Some(&Some(perspective_player)) {
                     continue; // 自分の拠点はスキップ
                 }
-                props_with_terrain.push((*tile, map.get_terrain(tile.x, tile.y).unwrap_or(crate::resources::Terrain::City)));
+                props_with_terrain.push((
+                    *tile,
+                    map.get_terrain(tile.x, tile.y)
+                        .unwrap_or(crate::resources::Terrain::City),
+                ));
 
                 let mut local_min_dist = i32::MAX;
                 let mut nearest_base_pos = None;
                 for base_pos in &own_production_bases {
-                    let dist = (tile.x as i32 - base_pos.x as i32).abs() + (tile.y as i32 - base_pos.y as i32).abs();
+                    let dist = (tile.x as i32 - base_pos.x as i32).abs()
+                        + (tile.y as i32 - base_pos.y as i32).abs();
                     if dist < local_min_dist {
                         local_min_dist = dist;
                         nearest_base_pos = Some(*base_pos);
@@ -342,7 +356,11 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                 }
 
                 // 徒歩圏内（6マス以下かつ同じ島）は除外
-                if nearest_base_pos.and_then(|p| island_map.get_island_at(&p)).filter(|base_island| base_island.id == target_id && local_min_dist <= 6).is_some() {
+                if nearest_base_pos
+                    .and_then(|p| island_map.get_island_at(&p))
+                    .filter(|base_island| base_island.id == target_id && local_min_dist <= 6)
+                    .is_some()
+                {
                     continue;
                 }
 
@@ -352,7 +370,11 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
             }
         }
 
-        let distance_to_nearest_base = if min_distance == i32::MAX { 10 } else { min_distance };
+        let distance_to_nearest_base = if min_distance == i32::MAX {
+            10
+        } else {
+            min_distance
+        };
         let enemy_prod = *enemy_production_count_map.get(&target_id).unwrap_or(&0);
 
         let objective = crate::ai::objectives::Objective::evaluate(
@@ -379,14 +401,17 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         }
 
         let mut to_assign = objective.needed_infantry.0;
-        
+
         while to_assign > 0 && !free_transports.is_empty() {
             let trans_idx = free_transports.len() - 1;
             let (trans_ent, t_pos, trans_stats) = free_transports[trans_idx].clone();
 
             // すでに搭載済みの歩兵がいるかチェック
             let mut existing_cargo = None;
-            if let Ok(cargo) = world.query::<&crate::components::CargoCapacity>().get(world, trans_ent) {
+            if let Ok(cargo) = world
+                .query::<&crate::components::CargoCapacity>()
+                .get(world, trans_ent)
+            {
                 if !cargo.loaded.is_empty() {
                     existing_cargo = Some(cargo.loaded[0]);
                 }
@@ -419,10 +444,16 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                     }
 
                     let dist = calculate_turn_distance(
-                        &map, &registry, &unit_positions,
-                        (pos.x, pos.y), (t_pos.x, t_pos.y),
-                        stats.movement_type, stats.max_movement, 1,
-                        perspective_player, &mut turn_cache,
+                        &map,
+                        &registry,
+                        &unit_positions,
+                        (pos.x, pos.y),
+                        (t_pos.x, t_pos.y),
+                        stats.movement_type,
+                        stats.max_movement,
+                        1,
+                        perspective_player,
+                        &mut turn_cache,
                     );
                     if dist < min_turn_dist {
                         min_turn_dist = dist;
@@ -442,10 +473,16 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                         }
 
                         let dist = calculate_turn_distance(
-                            &map, &registry, &unit_positions,
-                            (pos.x, pos.y), (t_pos.x, t_pos.y),
-                            stats.movement_type, stats.max_movement, 1,
-                            perspective_player, &mut turn_cache,
+                            &map,
+                            &registry,
+                            &unit_positions,
+                            (pos.x, pos.y),
+                            (t_pos.x, t_pos.y),
+                            stats.movement_type,
+                            stats.max_movement,
+                            1,
+                            perspective_player,
+                            &mut turn_cache,
                         );
                         if dist < min_turn_dist {
                             min_turn_dist = dist;
@@ -482,7 +519,10 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     while i < free_transports.len() {
         let trans_ent = free_transports[i].0;
         let mut existing_cargo = None;
-        if let Ok(cargo) = world.query::<&crate::components::CargoCapacity>().get(world, trans_ent) {
+        if let Ok(cargo) = world
+            .query::<&crate::components::CargoCapacity>()
+            .get(world, trans_ent)
+        {
             if !cargo.loaded.is_empty() {
                 existing_cargo = Some(cargo.loaded[0]);
             }
@@ -824,7 +864,9 @@ pub fn update_transport_squad_phase(world: &mut World, squad: &mut Squad) -> boo
 
     if phase != TransportPhase::Return && world.get::<GridPosition>(cargo_entity).is_none() {
         // Cargo が GridPosition を持っていない場合でも、すでにヘリに乗っている（Transportingを持つ）なら正常
-        let is_in_heli = world.get::<crate::components::Transporting>(cargo_entity).is_some();
+        let is_in_heli = world
+            .get::<crate::components::Transporting>(cargo_entity)
+            .is_some();
         if !is_in_heli {
             return true;
         }
@@ -1015,10 +1057,13 @@ pub fn execute_transport_squad_step(
                 .get::<crate::components::ActionCompleted>(transport_entity)
                 .map_or(true, |a| a.0);
 
-            if !transport_moved && !transport_action_completed && !skip_entities.contains(&transport_entity) {
+            if !transport_moved
+                && !transport_action_completed
+                && !skip_entities.contains(&transport_entity)
+            {
                 let mut best_tile = t_pos;
                 let mut min_turn_dist = 999.0;
-                
+
                 let mut cache = crate::ai::turn_distance::TurnDistanceCache::default();
                 let map = world.resource::<Map>();
                 let registry = world.resource::<MasterDataRegistry>();
@@ -1036,7 +1081,7 @@ pub fn execute_transport_squad_step(
                         t_faction,
                         &mut cache,
                     );
-                    
+
                     let dx = target_tile.0 as i32 - cargo_pos.x as i32;
                     let dy = target_tile.1 as i32 - cargo_pos.y as i32;
                     let m_dist = dx.abs() + dy.abs();
@@ -1096,7 +1141,7 @@ pub fn execute_transport_squad_step(
 
                 let mut best_tile = cargo_pos;
                 let mut min_turn_dist = 999.0;
-                
+
                 let mut cache = crate::ai::turn_distance::TurnDistanceCache::default();
                 let map = world.resource::<Map>();
                 let registry = world.resource::<MasterDataRegistry>();
@@ -1114,7 +1159,7 @@ pub fn execute_transport_squad_step(
                         t_faction,
                         &mut cache,
                     );
-                    
+
                     let dx = target_tile.0 as i32 - t_pos.x as i32;
                     let dy = target_tile.1 as i32 - t_pos.y as i32;
                     let m_dist = dx.abs() + dy.abs();
@@ -1230,7 +1275,7 @@ pub fn execute_transport_squad_step(
                             t_faction,
                             &mut cache,
                         );
-                        
+
                         let dx = target_tile.0 as i32 - target_pos.x as i32;
                         let dy = target_tile.1 as i32 - target_pos.y as i32;
                         let m_dist = dx.abs() + dy.abs();
@@ -1242,7 +1287,7 @@ pub fn execute_transport_squad_step(
                             + (e_dist_sq as f32 / 10_000_000.0)
                             + (target_tile.0 as f32 / 100_000_000.0)
                             + (target_tile.1 as f32 / 1_000_000_000.0);
-                        
+
                         if score < min_turn_dist {
                             min_turn_dist = score;
                             best_tile = GridPosition {
@@ -1251,7 +1296,7 @@ pub fn execute_transport_squad_step(
                             };
                         }
                     }
-                    
+
                     return Some((
                         transport_entity,
                         crate::ai::engine::AiCommand::Wait {
@@ -1355,7 +1400,8 @@ pub fn execute_transport_squad_step(
                             ) {
                                 let mut best_tile = t_pos;
                                 let mut min_turn_dist = 999.0;
-                                let mut cache = crate::ai::turn_distance::TurnDistanceCache::default();
+                                let mut cache =
+                                    crate::ai::turn_distance::TurnDistanceCache::default();
                                 let map = world.resource::<Map>();
                                 let registry = world.resource::<MasterDataRegistry>();
 

@@ -141,8 +141,6 @@ pub fn decide_ai_action(
     let mut best_overall_score = i32::MIN;
     let mut best_overall_choice: Option<(Entity, AiCommand)> = None;
 
-    println!("--- decide_ai_action for player {:?} ---", player_id);
-    println!("Total active units found: {}", movable_units.len());
     let mut turn_cache = crate::ai::turn_distance::AiTurnCache::default();
 
     for unit_entity in movable_units {
@@ -1345,7 +1343,6 @@ pub fn decide_ai_action_v2(
             );
 
             let mut base_tile_score = 0;
-            let is_battleship = stats.unit_type == crate::resources::UnitType::Battleship;
             if let Some(terrain) = map.get_terrain(current_grid.x, current_grid.y) {
                 base_tile_score += registry.get_terrain_defense_bonus(terrain) as i32 * 10;
             }
