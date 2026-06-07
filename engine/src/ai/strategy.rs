@@ -83,6 +83,7 @@ fn enemy_threatens_property(
         (prop_pos.x, prop_pos.y),
         enemy_stats.movement_type,
         enemy_stats.max_movement,
+        1,
         player_id,
         turn_cache,
     );
@@ -248,6 +249,7 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                 (cap_pos.x, cap_pos.y),
                 enemy_stats.movement_type,
                 enemy_stats.max_movement,
+                1,
                 enemy_id,
                 &mut turn_cache,
             );

@@ -291,6 +291,7 @@ pub fn execute_mission_step(
                         (best_meetup_tile.x, best_meetup_tile.y),
                         t_stats.movement_type,
                         t_stats.max_movement,
+                        0,
                         t_faction,
                         &mut turn_cache,
                     );
@@ -382,6 +383,7 @@ pub fn execute_mission_step(
                                 (target.x, target.y),
                                 c_stats.movement_type,
                                 c_stats.max_movement,
+                                0,
                                 t_faction,
                                 &mut turn_cache,
                             );
@@ -496,6 +498,7 @@ pub fn execute_mission_step(
                             (target_pos.x, target_pos.y),
                             t_stats.movement_type,
                             t_stats.max_movement,
+                            0,
                             t_faction,
                             &mut turn_cache,
                         );

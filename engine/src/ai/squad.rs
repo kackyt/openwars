@@ -295,61 +295,198 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     base_islands.extend(b_islands.iter().copied());
     target_islands.extend(t_islands.iter().copied());
 
-    let max_transport_squads = target_islands.len();
-    let mut formed_transport_squads = 0;
-    for squad in &manager.squads {
-        if squad.mission_type == MissionType::Transport {
-            formed_transport_squads += 1;
+    // ---------------------------------------------------------
+    // V1からの統合: 島ごとの期待値（IslandScore）の算出
+    // ---------------------------------------------------------
+    let mut own_production_bases = Vec::new();
+    let mut enemy_production_count_map = std::collections::HashMap::new();
+    let mut island_props_map = std::collections::HashMap::new();
+
+    for (pos, owner) in &properties_ownership {
+        if let Some(island) = island_map.get_island_at(pos) {
+            island_props_map.entry(island.id).or_insert_with(Vec::new).push(*pos);
+
+            let terrain = map.get_terrain(pos.x, pos.y).unwrap_or(crate::resources::Terrain::City);
+            if *owner == Some(perspective_player) {
+                if terrain == crate::resources::Terrain::Factory || terrain == crate::resources::Terrain::Capital {
+                    own_production_bases.push(*pos);
+                }
+            } else if owner.is_some() {
+                if terrain == crate::resources::Terrain::Factory || terrain == crate::resources::Terrain::Capital {
+                    *enemy_production_count_map.entry(island.id).or_insert(0) += 1;
+                }
+            }
         }
     }
 
-    while formed_transport_squads < max_transport_squads {
-        if free_transports.is_empty() {
-            break;
-        }
+    let mut objectives = Vec::new();
+    for &target_id in &target_islands {
+        let mut min_distance = i32::MAX;
+        let mut props_with_terrain = Vec::new();
 
-        let trans_idx = free_transports.len() - 1;
-        let (_, _, trans_stats) = &free_transports[trans_idx];
+        if let Some(positions) = island_props_map.get(&target_id) {
+            for tile in positions {
+                if properties_ownership.get(tile) == Some(&Some(perspective_player)) {
+                    continue; // 自分の拠点はスキップ
+                }
+                props_with_terrain.push((*tile, map.get_terrain(tile.x, tile.y).unwrap_or(crate::resources::Terrain::City)));
 
-        // 搭載可能なユニットを「戦闘ユニット（重車両など）」から優先して探し、次に「歩兵」から探す
-        let mut cargo_idx = None;
-        let mut is_combat_cargo = true;
+                let mut local_min_dist = i32::MAX;
+                let mut nearest_base_pos = None;
+                for base_pos in &own_production_bases {
+                    let dist = (tile.x as i32 - base_pos.x as i32).abs() + (tile.y as i32 - base_pos.y as i32).abs();
+                    if dist < local_min_dist {
+                        local_min_dist = dist;
+                        nearest_base_pos = Some(*base_pos);
+                    }
+                }
 
-        for (i, (_, _, stats)) in free_combat_units.iter().enumerate() {
-            if trans_stats.loadable_unit_types.contains(&stats.unit_type) {
-                cargo_idx = Some(i);
-                break;
-            }
-        }
+                // 徒歩圏内（6マス以下かつ同じ島）は除外
+                if nearest_base_pos.and_then(|p| island_map.get_island_at(&p)).filter(|base_island| base_island.id == target_id && local_min_dist <= 6).is_some() {
+                    continue;
+                }
 
-        if cargo_idx.is_none() {
-            is_combat_cargo = false;
-            for (i, (_, _, stats)) in free_infantry.iter().enumerate() {
-                if trans_stats.loadable_unit_types.contains(&stats.unit_type) {
-                    cargo_idx = Some(i);
-                    break;
+                if local_min_dist < min_distance {
+                    min_distance = local_min_dist;
                 }
             }
         }
 
-        if let Some(idx) = cargo_idx {
-            let (trans_ent, _, _) = free_transports.remove(trans_idx);
-            let (cargo_ent, _, _) = if is_combat_cargo {
-                free_combat_units.remove(idx)
-            } else {
-                free_infantry.remove(idx)
-            };
+        let distance_to_nearest_base = if min_distance == i32::MAX { 10 } else { min_distance };
+        let enemy_prod = *enemy_production_count_map.get(&target_id).unwrap_or(&0);
 
+        let objective = crate::ai::objectives::Objective::evaluate(
+            target_id,
+            &props_with_terrain,
+            distance_to_nearest_base,
+            enemy_prod,
+            &registry,
+        );
+        objectives.push(objective);
+    }
+
+    // スコア降順ソート（海を渡る必要がある別島を最優先）
+    objectives.sort_by_key(|b| {
+        let is_same_island = base_islands.contains(&b.target_island);
+        let group = if is_same_island { 1u8 } else { 0u8 }; // 別島=0(高優先), 同島=1(低優先)
+        (group, std::cmp::Reverse(b.priority_score))
+    });
+
+    // 優先順位の高い島から輸送機を割り当てる
+    for objective in objectives.iter() {
+        if free_transports.is_empty() {
+            break;
+        }
+
+        let mut to_assign = objective.needed_infantry.0;
+        
+        while to_assign > 0 && !free_transports.is_empty() {
+            let trans_idx = free_transports.len() - 1;
+            let (trans_ent, t_pos, trans_stats) = free_transports[trans_idx].clone();
+
+            // すでに搭載済みの歩兵がいるかチェック
+            let mut existing_cargo = None;
+            if let Ok(cargo) = world.query::<&crate::components::CargoCapacity>().get(world, trans_ent) {
+                if !cargo.loaded.is_empty() {
+                    existing_cargo = Some(cargo.loaded[0]);
+                }
+            }
+
+            if let Some(cargo_ent) = existing_cargo {
+                let squad = manager.create_squad(MissionType::Transport);
+                squad.members.insert(trans_ent);
+                squad.transport_cargo = Some(cargo_ent);
+                squad.target_island = Some(objective.target_island);
+                squad.phase = MissionPhase::Transport(TransportPhase::Transit);
+                free_transports.remove(trans_idx);
+                to_assign -= 1;
+                continue;
+            }
+
+            // ---------------------------------------------------------
+            // 距離ベースでの Cargo（歩兵）割り当て
+            // ---------------------------------------------------------
+            let mut best_cargo_idx = None;
+            let mut is_combat_cargo = true;
+            let mut min_turn_dist = u32::MAX;
+
+            // 重車両から探す
+            for (i, (_, pos, stats)) in free_combat_units.iter().enumerate() {
+                if trans_stats.loadable_unit_types.contains(&stats.unit_type) {
+                    let dist = calculate_turn_distance(
+                        &map, &registry, &unit_positions,
+                        (pos.x, pos.y), (t_pos.x, t_pos.y),
+                        stats.movement_type, stats.max_movement, 1,
+                        perspective_player, &mut turn_cache,
+                    );
+                    if dist < min_turn_dist {
+                        min_turn_dist = dist;
+                        best_cargo_idx = Some(i);
+                    }
+                }
+            }
+
+            // 見つからなければ歩兵から探す
+            if best_cargo_idx.is_none() {
+                is_combat_cargo = false;
+                for (i, (_, pos, stats)) in free_infantry.iter().enumerate() {
+                    if trans_stats.loadable_unit_types.contains(&stats.unit_type) {
+                        let dist = calculate_turn_distance(
+                            &map, &registry, &unit_positions,
+                            (pos.x, pos.y), (t_pos.x, t_pos.y),
+                            stats.movement_type, stats.max_movement, 1,
+                            perspective_player, &mut turn_cache,
+                        );
+                        if dist < min_turn_dist {
+                            min_turn_dist = dist;
+                            best_cargo_idx = Some(i);
+                        }
+                    }
+                }
+            }
+
+            if let Some(idx) = best_cargo_idx {
+                let (trans_ent_remove, _, _) = free_transports.remove(trans_idx);
+                let (cargo_ent, _, _) = if is_combat_cargo {
+                    free_combat_units.remove(idx)
+                } else {
+                    free_infantry.remove(idx)
+                };
+
+                let squad = manager.create_squad(MissionType::Transport);
+                squad.members.insert(trans_ent_remove);
+                squad.transport_cargo = Some(cargo_ent);
+                squad.target_island = Some(objective.target_island); // V1の期待値ベースで決定した島をセット！
+                squad.phase = MissionPhase::Transport(TransportPhase::Pickup);
+
+                to_assign -= 1;
+            } else {
+                // この輸送機に載せられるユニットがいない場合は諦める
+                free_transports.remove(trans_idx);
+            }
+        }
+    }
+
+    // 割り当てられなかった搭載済み輸送機の救済（Dropフェーズにして直ちに降ろすよう促す）
+    let mut i = 0;
+    while i < free_transports.len() {
+        let trans_ent = free_transports[i].0;
+        let mut existing_cargo = None;
+        if let Ok(cargo) = world.query::<&crate::components::CargoCapacity>().get(world, trans_ent) {
+            if !cargo.loaded.is_empty() {
+                existing_cargo = Some(cargo.loaded[0]);
+            }
+        }
+
+        if let Some(cargo_ent) = existing_cargo {
             let squad = manager.create_squad(MissionType::Transport);
             squad.members.insert(trans_ent);
             squad.transport_cargo = Some(cargo_ent);
-            squad.target_island = None; // ターゲット島は Beam Search で動的決定する
-            squad.phase = MissionPhase::Transport(TransportPhase::Pickup);
-
-            formed_transport_squads += 1;
+            squad.target_island = None; // 目標島なし
+            squad.phase = MissionPhase::Transport(TransportPhase::Drop); // とりあえずDropを試みる
+            free_transports.remove(i);
         } else {
-            // この輸送機に載せられるユニットがいない場合は諦める
-            free_transports.remove(trans_idx);
+            i += 1;
         }
     }
 
@@ -373,6 +510,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                 (cluster.center.x, cluster.center.y),
                 crate::resources::MovementType::Infantry,
                 3,
+                1,
                 perspective_player,
                 &mut turn_cache,
             );
@@ -398,6 +536,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                             (cluster.center.x, cluster.center.y),
                             stats.movement_type,
                             stats.max_movement,
+                            1,
                             perspective_player,
                             &mut turn_cache,
                         )
@@ -486,6 +625,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                     (cluster.center.x, cluster.center.y),
                     stats.movement_type,
                     stats.max_movement,
+                    1,
                     perspective_player,
                     &mut turn_cache,
                 )
@@ -525,6 +665,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                         (target.x, target.y),
                         stats.movement_type,
                         stats.max_movement,
+                        1,
                         perspective_player,
                         &mut turn_cache,
                     );
@@ -554,6 +695,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                     (cluster.center.x, cluster.center.y),
                     stats.movement_type,
                     stats.max_movement,
+                    1,
                     perspective_player,
                     &mut turn_cache,
                 );
@@ -671,7 +813,11 @@ pub fn update_transport_squad_phase(world: &mut World, squad: &mut Squad) -> boo
     };
 
     if phase != TransportPhase::Return && world.get::<GridPosition>(cargo_entity).is_none() {
-        return true;
+        // Cargo が GridPosition を持っていない場合でも、すでにヘリに乗っている（Transportingを持つ）なら正常
+        let is_in_heli = world.get::<crate::components::Transporting>(cargo_entity).is_some();
+        if !is_in_heli {
+            return true;
+        }
     }
 
     match phase {
@@ -771,6 +917,7 @@ pub fn update_transport_squad_phase(world: &mut World, squad: &mut Squad) -> boo
 pub fn execute_transport_squad_step(
     world: &mut World,
     squad: &Squad,
+    skip_entities: &std::collections::HashSet<Entity>,
 ) -> Option<(Entity, crate::ai::engine::AiCommand)> {
     let transport_entity = *squad.members.iter().next()?;
     let cargo_entity = squad.transport_cargo?;
@@ -858,15 +1005,40 @@ pub fn execute_transport_squad_step(
                 .get::<crate::components::ActionCompleted>(transport_entity)
                 .map_or(true, |a| a.0);
 
-            if !transport_moved && !transport_action_completed {
+            if !transport_moved && !transport_action_completed && !skip_entities.contains(&transport_entity) {
                 let mut best_tile = t_pos;
-                let mut min_dist = dist;
+                let mut min_turn_dist = 999.0;
+                
+                let mut cache = crate::ai::turn_distance::TurnDistanceCache::default();
+                let map = world.resource::<Map>();
+                let registry = world.resource::<MasterDataRegistry>();
 
                 for target_tile in &reachable {
-                    let d = (target_tile.0 as i32 - cargo_pos.x as i32).abs()
-                        + (target_tile.1 as i32 - cargo_pos.y as i32).abs();
-                    if d < min_dist {
-                        min_dist = d;
+                    let t_dist = crate::ai::turn_distance::calculate_turn_distance(
+                        map,
+                        registry,
+                        &unit_positions,
+                        (target_tile.0, target_tile.1),
+                        (cargo_pos.x, cargo_pos.y),
+                        t_stats.movement_type,
+                        t_stats.max_movement,
+                        1, // 歩兵に隣接または重なる場所を目指す
+                        t_faction,
+                        &mut cache,
+                    );
+                    
+                    let dx = target_tile.0 as i32 - cargo_pos.x as i32;
+                    let dy = target_tile.1 as i32 - cargo_pos.y as i32;
+                    let m_dist = dx.abs() + dy.abs();
+                    let e_dist_sq = dx * dx + dy * dy;
+                    let score = t_dist as f32
+                        + (m_dist as f32 / 1_000.0)
+                        + (e_dist_sq as f32 / 10_000_000.0)
+                        + (target_tile.0 as f32 / 100_000_000.0)
+                        + (target_tile.1 as f32 / 1_000_000_000.0);
+
+                    if score < min_turn_dist {
+                        min_turn_dist = score;
                         best_tile = GridPosition {
                             x: target_tile.0,
                             y: target_tile.1,
@@ -889,11 +1061,12 @@ pub fn execute_transport_squad_step(
                 .get::<crate::components::ActionCompleted>(cargo_entity)
                 .map_or(true, |a| a.0);
 
-            if !cargo_moved && !cargo_action_completed {
+            if !cargo_moved && !cargo_action_completed && !skip_entities.contains(&cargo_entity) {
                 let c_stats = world.get::<UnitStats>(cargo_entity).cloned()?;
                 let c_fuel = world
                     .get::<crate::components::Fuel>(cargo_entity)
-                    .map(|f| f.current)?;
+                    .map(|f| f.current)
+                    .unwrap_or(99);
 
                 let cargo_reachable = {
                     let map = world.resource::<Map>();
@@ -912,13 +1085,38 @@ pub fn execute_transport_squad_step(
                 };
 
                 let mut best_tile = cargo_pos;
-                let mut min_dist = dist;
+                let mut min_turn_dist = 999.0;
+                
+                let mut cache = crate::ai::turn_distance::TurnDistanceCache::default();
+                let map = world.resource::<Map>();
+                let registry = world.resource::<MasterDataRegistry>();
 
                 for target_tile in &cargo_reachable {
-                    let d = (target_tile.0 as i32 - t_pos.x as i32).abs()
-                        + (target_tile.1 as i32 - t_pos.y as i32).abs();
-                    if d < min_dist {
-                        min_dist = d;
+                    let t_dist = crate::ai::turn_distance::calculate_turn_distance(
+                        map,
+                        registry,
+                        &unit_positions,
+                        (target_tile.0, target_tile.1),
+                        (t_pos.x, t_pos.y),
+                        c_stats.movement_type,
+                        c_stats.max_movement,
+                        0, // ヘリと同じマスを目指す
+                        t_faction,
+                        &mut cache,
+                    );
+                    
+                    let dx = target_tile.0 as i32 - t_pos.x as i32;
+                    let dy = target_tile.1 as i32 - t_pos.y as i32;
+                    let m_dist = dx.abs() + dy.abs();
+                    let e_dist_sq = dx * dx + dy * dy;
+                    let score = t_dist as f32
+                        + (m_dist as f32 / 1_000.0)
+                        + (e_dist_sq as f32 / 10_000_000.0)
+                        + (target_tile.0 as f32 / 100_000_000.0)
+                        + (target_tile.1 as f32 / 1_000_000_000.0);
+
+                    if score < min_turn_dist {
+                        min_turn_dist = score;
                         best_tile = GridPosition {
                             x: target_tile.0,
                             y: target_tile.1,
@@ -935,6 +1133,9 @@ pub fn execute_transport_squad_step(
             }
         }
         TransportPhase::Transit => {
+            if skip_entities.contains(&transport_entity) {
+                return None;
+            }
             if let Some(target_island_id) = squad.target_island {
                 let (island_tiles, target_pos) = {
                     if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>()
@@ -1000,20 +1201,47 @@ pub fn execute_transport_squad_step(
                     }
 
                     let mut best_tile = t_pos;
-                    let mut min_dist = (t_pos.x as i32 - target_pos.x as i32).abs()
-                        + (t_pos.y as i32 - target_pos.y as i32).abs();
+                    let mut min_turn_dist = 999.0;
+
+                    let mut cache = crate::ai::turn_distance::TurnDistanceCache::default();
+                    let map = world.resource::<Map>();
+                    let registry = world.resource::<MasterDataRegistry>();
 
                     for target_tile in &reachable {
-                        let dist = (target_tile.0 as i32 - target_pos.x as i32).abs()
-                            + (target_tile.1 as i32 - target_pos.y as i32).abs();
-                        if dist < min_dist {
-                            min_dist = dist;
+                        let t_dist = crate::ai::turn_distance::calculate_turn_distance(
+                            map,
+                            registry,
+                            &unit_positions,
+                            (target_tile.0, target_tile.1),
+                            (target_pos.x, target_pos.y),
+                            t_stats.movement_type,
+                            t_stats.max_movement,
+                            1, // 目標に隣接するマスを目指す
+                            t_faction,
+                            &mut cache,
+                        );
+                        
+                        let dx = target_tile.0 as i32 - target_pos.x as i32;
+                        let dy = target_tile.1 as i32 - target_pos.y as i32;
+                        let m_dist = dx.abs() + dy.abs();
+                        // ユークリッド距離の2乗（直線的な経路を好むようにする）
+                        let e_dist_sq = dx * dx + dy * dy;
+                        // タイブレーク: 1. ターン数 2. マンハッタン距離 3. ユークリッド距離(直線重視) 4. 座標(確定的決定)
+                        let score = t_dist as f32
+                            + (m_dist as f32 / 1_000.0)
+                            + (e_dist_sq as f32 / 10_000_000.0)
+                            + (target_tile.0 as f32 / 100_000_000.0)
+                            + (target_tile.1 as f32 / 1_000_000_000.0);
+                        
+                        if score < min_turn_dist {
+                            min_turn_dist = score;
                             best_tile = GridPosition {
                                 x: target_tile.0,
                                 y: target_tile.1,
                             };
                         }
                     }
+                    
                     return Some((
                         transport_entity,
                         crate::ai::engine::AiCommand::Wait {
@@ -1024,6 +1252,9 @@ pub fn execute_transport_squad_step(
             }
         }
         TransportPhase::Drop => {
+            if skip_entities.contains(&transport_entity) {
+                return None;
+            }
             let drop_tiles = crate::systems::transport::get_droppable_tiles(
                 world,
                 transport_entity,
@@ -1113,14 +1344,30 @@ pub fn execute_transport_squad_step(
                                 t_stats.movement_type,
                             ) {
                                 let mut best_tile = t_pos;
-                                let mut min_dist = (t_pos.x as i32 - target_pos.x as i32).abs()
-                                    + (t_pos.y as i32 - target_pos.y as i32).abs();
+                                let mut min_turn_dist = 999.0;
+                                let mut cache = crate::ai::turn_distance::TurnDistanceCache::default();
+                                let map = world.resource::<Map>();
+                                let registry = world.resource::<MasterDataRegistry>();
 
                                 for target_tile in &reachable {
-                                    let dist = (target_tile.0 as i32 - target_pos.x as i32).abs()
+                                    let t_dist = crate::ai::turn_distance::calculate_turn_distance(
+                                        map,
+                                        registry,
+                                        &unit_positions,
+                                        (target_tile.0, target_tile.1),
+                                        (target_pos.x, target_pos.y),
+                                        t_stats.movement_type,
+                                        t_stats.max_movement,
+                                        1, // 目標に隣接するマスを目指す
+                                        t_faction,
+                                        &mut cache,
+                                    );
+                                    let m_dist = (target_tile.0 as i32 - target_pos.x as i32).abs()
                                         + (target_tile.1 as i32 - target_pos.y as i32).abs();
-                                    if dist < min_dist {
-                                        min_dist = dist;
+                                    let score = t_dist as f32 + (m_dist as f32 / 1000.0);
+
+                                    if score < min_turn_dist {
+                                        min_turn_dist = score;
                                         best_tile = GridPosition {
                                             x: target_tile.0,
                                             y: target_tile.1,
@@ -1159,14 +1406,36 @@ pub fn execute_transport_squad_step(
             }
 
             let mut best_tile = t_pos;
-            let mut best_dist = (t_pos.x as i32 - nearest_prop_pos.x as i32).abs()
-                + (t_pos.y as i32 - nearest_prop_pos.y as i32).abs();
+            let mut min_turn_dist = 999.0;
+            let mut cache = crate::ai::turn_distance::TurnDistanceCache::default();
+            let map = world.resource::<Map>();
+            let registry = world.resource::<MasterDataRegistry>();
 
             for target_tile in &reachable {
-                let dist = (target_tile.0 as i32 - nearest_prop_pos.x as i32).abs()
-                    + (target_tile.1 as i32 - nearest_prop_pos.y as i32).abs();
-                if dist < best_dist {
-                    best_dist = dist;
+                let t_dist = crate::ai::turn_distance::calculate_turn_distance(
+                    map,
+                    registry,
+                    &unit_positions,
+                    (target_tile.0, target_tile.1),
+                    (nearest_prop_pos.x, nearest_prop_pos.y),
+                    t_stats.movement_type,
+                    t_stats.max_movement,
+                    1,
+                    t_faction,
+                    &mut cache,
+                );
+                let dx = target_tile.0 as i32 - nearest_prop_pos.x as i32;
+                let dy = target_tile.1 as i32 - nearest_prop_pos.y as i32;
+                let m_dist = dx.abs() + dy.abs();
+                let e_dist_sq = dx * dx + dy * dy;
+                let score = t_dist as f32
+                    + (m_dist as f32 / 1_000.0)
+                    + (e_dist_sq as f32 / 10_000_000.0)
+                    + (target_tile.0 as f32 / 100_000_000.0)
+                    + (target_tile.1 as f32 / 1_000_000_000.0);
+
+                if score < min_turn_dist {
+                    min_turn_dist = score;
                     best_tile = GridPosition {
                         x: target_tile.0,
                         y: target_tile.1,

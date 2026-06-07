@@ -115,7 +115,28 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                 valid_targets.extend(&target_enemies);
             }
             MissionType::Transport => {
-                valid_targets.extend(&target_props);
+                // squad.rs の段階ですでに戦略的価値に基づく target_island が設定されているはず
+                if let Some(target_island_id) = squad.target_island {
+                    let mut island_targets = Vec::new();
+                    if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() {
+                        for &t_pos in &target_props {
+                            if let Some(island) = island_map.get_island_at(&t_pos) {
+                                if island.id == target_island_id {
+                                    island_targets.push(t_pos);
+                                }
+                            }
+                        }
+                    }
+                    if !island_targets.is_empty() {
+                        valid_targets.extend(&island_targets);
+                    } else {
+                        // 万が一、対象の島に未占領拠点が無い（すでに占領済み等の）場合はフォールバック
+                        valid_targets.extend(&target_props);
+                    }
+                } else {
+                    // target_island が未設定の場合は通常のフォールバック
+                    valid_targets.extend(&target_props);
+                }
             }
         }
 

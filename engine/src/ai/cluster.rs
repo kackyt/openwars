@@ -88,6 +88,7 @@ pub fn detect_enemy_clusters(
                         (other_pos.x, other_pos.y),
                         stats.movement_type,
                         stats.max_movement,
+                        1,
                         enemy_player_id,
                         &mut turn_cache,
                     );
@@ -100,6 +101,7 @@ pub fn detect_enemy_clusters(
                         (pos.x, pos.y),
                         other_stats.movement_type,
                         other_stats.max_movement,
+                        1,
                         other_player_id,
                         &mut turn_cache,
                     );

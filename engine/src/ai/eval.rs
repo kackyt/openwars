@@ -470,8 +470,12 @@ mod tests {
         let p1 = PlayerId(1);
         let p2 = PlayerId(2);
 
-        // V1/V2 用の PlayerAiSettings を登録 (デフォルト V1)
-        world.insert_resource(PlayerAiSettings::new());
+        // V1/V2 用の PlayerAiSettings を登録 (デフォルト V1 に設定してテスト互換性を保つか、Mapを追加するか)
+        // ここではV1としてテストするか、Mapを入れるかですが、V1のスコアをアサートしているのでV1に設定します。
+        let mut settings = PlayerAiSettings::new();
+        settings.set_version(p1, AiVersion::V1);
+        settings.set_version(p2, AiVersion::V1);
+        world.insert_resource(settings);
 
         // Friendly unit (full hp) -> 1000 cost * 10/10 = +1000
         world.spawn((

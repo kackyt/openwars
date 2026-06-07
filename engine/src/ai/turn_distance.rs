@@ -10,12 +10,12 @@ use bevy_ecs::prelude::*;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
-pub type TurnCacheKey = (usize, usize, usize, usize, MovementType, u32, PlayerId);
+pub type TurnCacheKey = (usize, usize, usize, usize, MovementType, u32, u32, PlayerId);
 
 /// ターン数ベースの距離計算をキャッシュするためのリソース
 #[derive(Resource, Default)]
 pub struct TurnDistanceCache {
-    /// キー: (出発地x, 出発地y, 目標地x, 目標地y, 移動タイプ, 移動力, 勢力ID)
+    /// キー: (出発地x, 出発地y, 目標地x, 目標地y, 移動タイプ, 移動力, インタラクション射程, 勢力ID)
     /// 値: 到達ターン数 (到達不可の場合は u32::MAX)
     pub cache: HashMap<TurnCacheKey, u32>,
 }
@@ -60,6 +60,7 @@ pub fn calculate_turn_distance(
     target: (usize, usize),
     movement_type: MovementType,
     max_mp: u32,
+    interaction_max_range: u32,
     player_id: PlayerId,
     cache: &mut TurnDistanceCache,
 ) -> u32 {
@@ -74,35 +75,45 @@ pub fn calculate_turn_distance(
         target.1,
         movement_type,
         max_mp,
+        interaction_max_range,
         player_id,
     );
     if let Some(&dist) = cache.cache.get(&cache_key) {
         return dist;
     }
 
-    // ターゲットの地形が進入不可の場合（船→陸地など）、
-    // ターゲットに隣接する進入可能なマスへのルートに切り替える
-    let target_passable = map
-        .get_terrain(target.0, target.1)
-        .and_then(|t| get_valid_movement_cost(registry, movement_type, t))
-        .is_some();
+    // ターゲットから interaction_max_range 以内の進入可能な全マスを目標地点とする
+    let mut effective_targets = Vec::new();
+    for dx in -(interaction_max_range as i32)..=(interaction_max_range as i32) {
+        for dy in -(interaction_max_range as i32)..=(interaction_max_range as i32) {
+            let m_dist = dx.abs() + dy.abs();
+            if m_dist > interaction_max_range as i32 {
+                continue;
+            }
 
-    // 実際の到達目標タイル群を決定する
-    // ターゲットが進入可能 → そのまま [target]
-    // ターゲットが進入不可 → ターゲットに隣接する進入可能なタイル群
-    let effective_targets: Vec<(usize, usize)> = if target_passable {
-        vec![target]
-    } else {
-        let mut adj_targets = Vec::new();
-        for adj in map.get_adjacent(target.0, target.1) {
-            if let Some(adj_terrain) = map.get_terrain(adj.0, adj.1) {
-                if get_valid_movement_cost(registry, movement_type, adj_terrain).is_some() {
-                    adj_targets.push(adj);
+            let nx = target.0 as i32 + dx;
+            let ny = target.1 as i32 + dy;
+            if nx >= 0 && nx < map.width as i32 && ny >= 0 && ny < map.height as i32 {
+                let pos = (nx as usize, ny as usize);
+                if let Some(terrain) = map.get_terrain(pos.0, pos.1) {
+                    if get_valid_movement_cost(registry, movement_type, terrain).is_some() {
+                        let mut can_enter = true;
+                        // 目標地点そのもの以外で、敵がいる場合は到達不可
+                        if pos != target {
+                            if let Some(occupant) = unit_positions.get(&pos) {
+                                if occupant.player_id != player_id {
+                                    can_enter = false;
+                                }
+                            }
+                        }
+                        if can_enter {
+                            effective_targets.push(pos);
+                        }
+                    }
                 }
             }
         }
-        adj_targets
-    };
+    }
 
     if effective_targets.is_empty() {
         // ターゲットに隣接する進入可能タイルが存在しない → 到達不可
@@ -386,6 +397,7 @@ mod tests {
             (4, 0),
             MovementType::Infantry,
             3,
+            0,
             PlayerId(1),
             &mut cache,
         );
@@ -400,6 +412,7 @@ mod tests {
             (4, 0),
             MovementType::Infantry,
             3,
+            0,
             PlayerId(1),
             &mut cache,
         );
@@ -427,6 +440,7 @@ mod tests {
             (4, 0),
             MovementType::Infantry,
             3,
+            0,
             PlayerId(1),
             &mut cache,
         );
