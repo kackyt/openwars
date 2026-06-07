@@ -413,6 +413,11 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
             // 重車両から探す
             for (i, (_, pos, stats)) in free_combat_units.iter().enumerate() {
                 if trans_stats.loadable_unit_types.contains(&stats.unit_type) {
+                    let cargo_island = island_map.get_island_at(pos).map(|id| id.id);
+                    if cargo_island == Some(objective.target_island) {
+                        continue;
+                    }
+
                     let dist = calculate_turn_distance(
                         &map, &registry, &unit_positions,
                         (pos.x, pos.y), (t_pos.x, t_pos.y),
@@ -431,6 +436,11 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                 is_combat_cargo = false;
                 for (i, (_, pos, stats)) in free_infantry.iter().enumerate() {
                     if trans_stats.loadable_unit_types.contains(&stats.unit_type) {
+                        let cargo_island = island_map.get_island_at(pos).map(|id| id.id);
+                        if cargo_island == Some(objective.target_island) {
+                            continue;
+                        }
+
                         let dist = calculate_turn_distance(
                             &map, &registry, &unit_positions,
                             (pos.x, pos.y), (t_pos.x, t_pos.y),
@@ -850,7 +860,7 @@ pub fn update_transport_squad_phase(world: &mut World, squad: &mut Squad) -> boo
                 .is_some_and(|t| t.0 == transport_entity);
 
             if !loaded && !transporting {
-                squad.phase = MissionPhase::Transport(TransportPhase::Return);
+                return true;
             } else if let Some(target_island_id) = squad.target_island {
                 if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() {
                     if let Some(island) =
@@ -892,7 +902,7 @@ pub fn update_transport_squad_phase(world: &mut World, squad: &mut Squad) -> boo
                 .is_some_and(|t| t.0 == transport_entity);
 
             if !loaded && !transporting {
-                squad.phase = MissionPhase::Transport(TransportPhase::Return);
+                return true;
             }
         }
         TransportPhase::Return => {

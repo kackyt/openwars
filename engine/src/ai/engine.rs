@@ -1059,7 +1059,8 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
                     continue;
                 }
 
-                let step_res = crate::ai::squad::execute_transport_squad_step(world, squad, &skip_entities);
+                let step_res =
+                    crate::ai::squad::execute_transport_squad_step(world, squad, &skip_entities);
                 if let Some((entity, cmd)) = step_res {
                     if !skip_entities.contains(&entity) {
                         transport_action = Some((entity, cmd));
@@ -1350,18 +1351,6 @@ pub fn decide_ai_action_v2(
             }
 
             // 1. 部隊目標への接近ボーナス
-            if stats.unit_type == crate::resources::UnitType::Battleship {
-                println!(
-                    "Battleship evaluating tile ({}, {}), is_solo={}, squad_target={:?}",
-                    current_grid.x, current_grid.y, is_solo, squad_target
-                );
-            }
-            if is_battleship {
-                println!(
-                    "BATTLESHIP [Eval Tile ({}, {})] is_solo: {}, squad_target: {:?}",
-                    current_grid.x, current_grid.y, is_solo, squad_target
-                );
-            }
             if !is_solo {
                 if let Some(target) = squad_target {
                     let turn_dist = calculate_turn_distance(
@@ -1642,12 +1631,6 @@ pub fn decide_ai_action_v2(
                 if max_potential <= 0.0 {
                     let mut min_dist = 99;
                     let mut min_p = 999.0;
-                    if is_battleship {
-                        println!(
-                            "BATTLESHIP max_potential <= 0.0, best_target_dist: {}",
-                            best_target_dist
-                        );
-                    }
                     for (e_pos, _, _, _, _, _) in &enemy_units {
                         let mut d = calculate_turn_distance(
                             &map,
@@ -1726,16 +1709,6 @@ pub fn decide_ai_action_v2(
                     }
                 }
 
-                if is_battleship {
-                    println!(
-                        "BATTLESHIP Final score for tile ({}, {}): {} (best_target_pos: {:?}, target_dist: {})",
-                        current_grid.x,
-                        current_grid.y,
-                        base_tile_score,
-                        best_target_pos,
-                        best_target_dist
-                    );
-                }
                 if stats.min_range > 1 {
                     if let Some(t_pos) = best_target_pos {
                         let m_dist = (current_grid.x as i32 - t_pos.x as i32).abs()
@@ -1924,8 +1897,6 @@ pub fn decide_ai_action_v2(
             }
         }
     }
-
-
 
     best_overall_choice
 }
