@@ -478,8 +478,9 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                             &registry,
                             normalization_scale,
                         );
-                        // 価値 = (需要との一致度 * 係数) + (占領能力ボーナス)
-                        let value = strategy.demand.dot(&affinity) * 2000.0
+                        // 価値 = (需要との一致度 * 基本コスト相当) + (占領能力ボーナス)
+                        let base_value = stats.cost as f32;
+                        let value = strategy.demand.dot(&affinity) * base_value
                             + (if stats.can_capture { 3000.0 } else { 0.0 });
 
                         strategy
@@ -539,8 +540,8 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
             // 海を越えた島への侵攻需要（Base Invasion Demand）の計算
             let mut has_sea_bound_target = false;
             for target in &strategy.priority_targets {
-                if let Some(target_island_id) = get_island_id(target) 
-                    && !my_base_island_ids.contains(&target_island_id) 
+                if let Some(target_island_id) = get_island_id(target)
+                    && !my_base_island_ids.contains(&target_island_id)
                 {
                     has_sea_bound_target = true;
                     break;

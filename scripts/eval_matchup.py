@@ -7,7 +7,7 @@ from collections import defaultdict
 
 # 定数定義
 MAX_TURNS = 30  # 1ゲームの最大ターン数
-MAPS_TO_TEST = ["map_1", "map_2", "map_3"]  # 評価に使用するマップ一覧
+MAPS_TO_TEST = ["map_3"]  # 評価に使用するマップ一覧
 GAMES_PER_MATCHUP = 1  # 各先攻後攻の組み合わせでの対戦数（合計: マップ数 * 2パターン * N回）
 
 # 環境変数の設定
@@ -87,6 +87,9 @@ def run_single_game(map_name, p1_version, p2_version):
     turn = 1
     total_thinking_time = defaultdict(float)
     turn_counts = defaultdict(int)
+    produced_units = defaultdict(lambda: defaultdict(int))
+    
+    import re
     
     while turn <= MAX_TURNS:
         # 現在の状態を取得
@@ -99,6 +102,8 @@ def run_single_game(map_name, p1_version, p2_version):
             if status == "winner":
                 winner_id = game_over.get("winner_id")
                 print(f"    -> Game Finished on Turn {turn}! Winner: Player {winner_id}")
+                print(f"    -> [P1 Produced]: {dict(produced_units[1])}")
+                print(f"    -> [P2 Produced]: {dict(produced_units[2])}")
                 return {
                     "result": f"Player {winner_id}",
                     "winner_id": winner_id,
@@ -109,6 +114,8 @@ def run_single_game(map_name, p1_version, p2_version):
                 }
             elif status == "draw":
                 print(f"    -> Game Finished on Turn {turn} (Draw)!")
+                print(f"    -> [P1 Produced]: {dict(produced_units[1])}")
+                print(f"    -> [P2 Produced]: {dict(produced_units[2])}")
                 return {
                     "result": "Draw",
                     "winner_id": None,
@@ -131,6 +138,15 @@ def run_single_game(map_name, p1_version, p2_version):
         total_thinking_time[player_id] += elapsed
         turn_counts[player_id] += 1
         
+        # 生産アクションの集計
+        actions = ai_result.get("actions_taken", [])
+        for action in actions:
+            action_str = str(action)
+            match = re.search(r"ProduceUnitCommand\s*\{\s*player_id:\s*PlayerId\((\d+)\),\s*.*unit_type:\s*(\w+)", action_str)
+            if match:
+                pid = int(match.group(1))
+                utype = match.group(2)
+                produced_units[pid][utype] += 1
         
         # アクションの出力（V2のスタック問題を調査するため）
         if player_id == 2 or True:
@@ -148,6 +164,8 @@ def run_single_game(map_name, p1_version, p2_version):
     
     # ターン上限に達した場合は、状態価値スコア（拠点数 * 2000 + ユニットコスト、所持金無視）が高い方を暫定勝者とする
     print("    -> Turn limit reached. Resolving by board state value...")
+    print(f"    -> [P1 Produced]: {dict(produced_units[1])}")
+    print(f"    -> [P2 Produced]: {dict(produced_units[2])}")
     state = call_tool("get_board_state")
     p1 = state["players"][0]
     p2 = state["players"][1]

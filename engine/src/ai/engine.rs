@@ -141,6 +141,8 @@ pub fn decide_ai_action(
     let mut best_overall_score = i32::MIN;
     let mut best_overall_choice: Option<(Entity, AiCommand)> = None;
 
+    let mut turn_cache = crate::ai::turn_distance::AiTurnCache::default();
+
     for unit_entity in movable_units {
         let (stats, pos, fuel, atk_hp, atk_ammo) = {
             let stats = world.get::<UnitStats>(unit_entity).cloned();
@@ -323,8 +325,28 @@ pub fn decide_ai_action(
                 let mut min_objective_dist = 99;
                 for (p_pos, _p_terrain, p_owner) in &properties {
                     if *p_owner != Some(player_id) {
-                        let d = (current_grid.x as i32 - p_pos.x as i32).abs()
+                        let mut d = (current_grid.x as i32 - p_pos.x as i32).abs()
                             + (current_grid.y as i32 - p_pos.y as i32).abs();
+                        if stats.movement_type == crate::resources::MovementType::Ship {
+                            let dist_map =
+                                crate::ai::turn_distance::calculate_all_turn_distances_cached(
+                                    &map,
+                                    &registry,
+                                    &unit_positions,
+                                    (p_pos.x, p_pos.y),
+                                    stats.movement_type,
+                                    stats.max_movement,
+                                    1, // 拠点占領/輸送は隣接(距離1)の海が必要
+                                    player_id,
+                                    &mut turn_cache,
+                                );
+                            let t_dist = dist_map.get(&current_grid).copied().unwrap_or(u32::MAX);
+                            if t_dist != u32::MAX {
+                                d = (t_dist * stats.max_movement) as i32;
+                            } else {
+                                d = 999;
+                            }
+                        }
                         if d < min_objective_dist {
                             min_objective_dist = d;
                         }
@@ -338,23 +360,28 @@ pub fn decide_ai_action(
                 let mut max_potential = -1.0;
 
                 for (e_pos, e_type, e_cost, e_hp, _, _) in &enemy_units {
-                    let d = (current_grid.x as i32 - e_pos.x as i32).abs()
+                    let mut effective_dist = (current_grid.x as i32 - e_pos.x as i32).abs()
                         + (current_grid.y as i32 - e_pos.y as i32).abs();
 
-                    let mut effective_dist = d;
-                    // 海軍ユニットが陸上の敵を追跡する場合の補正
-                    if stats.movement_type == crate::resources::MovementType::Ship
-                        && let Some(e_terrain) = map.get_terrain(e_pos.x, e_pos.y)
-                    {
-                        let move_cost = registry
-                            .get_movement_cost(
-                                crate::resources::MovementType::Ship,
-                                e_terrain.as_str(),
-                            )
-                            .unwrap_or(99);
-                        if move_cost >= 99 && stats.max_range <= 1 {
-                            // 進入不可能な陸地で、かつ直接攻撃ユニットの場合は距離を大幅に水増し
-                            effective_dist += 20;
+                    // 海軍ユニットが陸上の敵を追跡する場合の補正（または単純なターン距離）
+                    if stats.movement_type == crate::resources::MovementType::Ship {
+                        let dist_map =
+                            crate::ai::turn_distance::calculate_all_turn_distances_cached(
+                                &map,
+                                &registry,
+                                &unit_positions,
+                                (e_pos.x, e_pos.y),
+                                stats.movement_type,
+                                stats.max_movement,
+                                stats.max_range, // 敵が射程に入る海マスへのターン距離
+                                player_id,
+                                &mut turn_cache,
+                            );
+                        let t_dist = dist_map.get(&current_grid).copied().unwrap_or(u32::MAX);
+                        if t_dist != u32::MAX {
+                            effective_dist = (t_dist * stats.max_movement) as i32;
+                        } else {
+                            effective_dist = 999;
                         }
                     }
 
@@ -390,17 +417,24 @@ pub fn decide_ai_action(
                         let mut d = (current_grid.x as i32 - e_pos.x as i32).abs()
                             + (current_grid.y as i32 - e_pos.y as i32).abs();
 
-                        if stats.movement_type == crate::resources::MovementType::Ship
-                            && let Some(e_terrain) = map.get_terrain(e_pos.x, e_pos.y)
-                        {
-                            let move_cost = registry
-                                .get_movement_cost(
-                                    crate::resources::MovementType::Ship,
-                                    e_terrain.as_str(),
-                                )
-                                .unwrap_or(99);
-                            if move_cost >= 99 && stats.max_range <= 1 {
-                                d += 20;
+                        if stats.movement_type == crate::resources::MovementType::Ship {
+                            let dist_map =
+                                crate::ai::turn_distance::calculate_all_turn_distances_cached(
+                                    &map,
+                                    &registry,
+                                    &unit_positions,
+                                    (e_pos.x, e_pos.y),
+                                    stats.movement_type,
+                                    stats.max_movement,
+                                    stats.max_range, // 敵が射程に入る海マスへのターン距離
+                                    player_id,
+                                    &mut turn_cache,
+                                );
+                            let t_dist = dist_map.get(&current_grid).copied().unwrap_or(u32::MAX);
+                            if t_dist != u32::MAX {
+                                d = (t_dist * stats.max_movement) as i32;
+                            } else {
+                                d = 999;
                             }
                         }
                         if d < min_dist {
@@ -411,8 +445,28 @@ pub fn decide_ai_action(
                     if enemy_units.is_empty() {
                         for (p_pos, p_terrain, p_owner) in &properties {
                             if *p_owner != Some(player_id) {
-                                let d = (current_grid.x as i32 - p_pos.x as i32).abs()
+                                let mut d = (current_grid.x as i32 - p_pos.x as i32).abs()
                                     + (current_grid.y as i32 - p_pos.y as i32).abs();
+                                if stats.movement_type == crate::resources::MovementType::Ship {
+                                    let dist_map = crate::ai::turn_distance::calculate_all_turn_distances_cached(
+                                         &map,
+                                         &registry,
+                                         &unit_positions,
+                                         (p_pos.x, p_pos.y),
+                                         stats.movement_type,
+                                         stats.max_movement,
+                                         1, // 拠点に隣接する海マスへのターン距離
+                                         player_id,
+                                         &mut turn_cache,
+                                     );
+                                    let t_dist =
+                                        dist_map.get(&current_grid).copied().unwrap_or(u32::MAX);
+                                    if t_dist != u32::MAX {
+                                        d = (t_dist * stats.max_movement) as i32;
+                                    } else {
+                                        d = 999;
+                                    }
+                                }
                                 if d < min_dist {
                                     min_dist = d;
                                 }
@@ -420,8 +474,28 @@ pub fn decide_ai_action(
                                 && registry.can_repair_on_terrain(stats.unit_type, *p_terrain)
                             {
                                 // 自身が修理が必要な場合のみ、自分の拠点もターゲットに含める
-                                let d = (current_grid.x as i32 - p_pos.x as i32).abs()
+                                let mut d = (current_grid.x as i32 - p_pos.x as i32).abs()
                                     + (current_grid.y as i32 - p_pos.y as i32).abs();
+                                if stats.movement_type == crate::resources::MovementType::Ship {
+                                    let dist_map = crate::ai::turn_distance::calculate_all_turn_distances_cached(
+                                         &map,
+                                         &registry,
+                                         &unit_positions,
+                                         (p_pos.x, p_pos.y),
+                                         stats.movement_type,
+                                         stats.max_movement,
+                                         1, // 修理拠点は隣接する海が必要
+                                         player_id,
+                                         &mut turn_cache,
+                                     );
+                                    let t_dist =
+                                        dist_map.get(&current_grid).copied().unwrap_or(u32::MAX);
+                                    if t_dist != u32::MAX {
+                                        d = (t_dist * stats.max_movement) as i32;
+                                    } else {
+                                        d = 999;
+                                    }
+                                }
                                 if d < min_dist {
                                     min_dist = d;
                                 }
@@ -828,22 +902,22 @@ pub fn execute_ai_turn_v1(world: &mut World, active_player: PlayerId) -> Option<
     let mission_cmd_and_entity = if let Some(manager) =
         world.get_resource::<crate::ai::missions::TransportMissionManager>()
     {
-        let missions = manager.missions.clone();
+        let mut missions = manager.missions.clone();
+        // Pickupを優先することで、同じ輸送船に複数のミッションがある場合に先に乗せる
+        missions.sort_by_key(|m| match m.phase {
+            crate::ai::missions::TransportPhase::Pickup => 0,
+            crate::ai::missions::TransportPhase::Drop => 1,
+            crate::ai::missions::TransportPhase::Transit => 2,
+            crate::ai::missions::TransportPhase::Return => 3,
+        });
         missions.into_iter().find_map(|m| {
             if world
                 .get::<Faction>(m.transport_entity)
                 .is_some_and(|f| f.0 == active_player)
             {
-                if let Some((entity, cmd)) = crate::ai::missions::execute_mission_step(world, &m) {
-                    // コマンド実行主体が冷却中（今ターン指示済み）でないかチェック
-                    if !skip_entities.contains(&entity) {
-                        Some((entity, cmd))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+                let cmds = crate::ai::missions::execute_mission_step(world, &m);
+                cmds.into_iter()
+                    .find(|(entity, _cmd)| !skip_entities.contains(entity))
             } else {
                 None
             }

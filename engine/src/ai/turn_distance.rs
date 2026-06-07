@@ -49,6 +49,8 @@ impl PartialOrd for State {
 }
 
 /// 指定した2地点間のターン数距離を計算します。
+/// ターゲットが移動タイプ的に進入不可の場合（船→陸地など）、
+/// ターゲットに隣接する進入可能なマスまでの最短ターン数を返します。
 /// 到達不可能な場合は u32::MAX を返します。
 pub fn calculate_turn_distance(
     map: &Map,
@@ -78,30 +80,60 @@ pub fn calculate_turn_distance(
         return dist;
     }
 
-    // 移動先の地形が進入可能か大まかにチェック (完全に進入不可なら即弾く)
-    if let Some(target_terrain) = map.get_terrain(target.0, target.1) {
-        let t_cost = get_valid_movement_cost(registry, movement_type, target_terrain);
-        if t_cost.is_none() {
-            let dx = (start.0 as i32 - target.0 as i32).abs();
-            let dy = (start.1 as i32 - target.1 as i32).abs();
-            let approx = 50 + ((dx + dy) as u32 / 4);
-            cache.cache.insert(cache_key, approx);
-            return approx;
+    // ターゲットの地形が進入不可の場合（船→陸地など）、
+    // ターゲットに隣接する進入可能なマスへのルートに切り替える
+    let target_passable = map
+        .get_terrain(target.0, target.1)
+        .and_then(|t| get_valid_movement_cost(registry, movement_type, t))
+        .is_some();
+
+    // 実際の到達目標タイル群を決定する
+    // ターゲットが進入可能 → そのまま [target]
+    // ターゲットが進入不可 → ターゲットに隣接する進入可能なタイル群
+    let effective_targets: Vec<(usize, usize)> = if target_passable {
+        vec![target]
+    } else {
+        let mut adj_targets = Vec::new();
+        for adj in map.get_adjacent(target.0, target.1) {
+            if let Some(adj_terrain) = map.get_terrain(adj.0, adj.1) {
+                if get_valid_movement_cost(registry, movement_type, adj_terrain).is_some() {
+                    adj_targets.push(adj);
+                }
+            }
+        }
+        adj_targets
+    };
+
+    if effective_targets.is_empty() {
+        // ターゲットに隣接する進入可能タイルが存在しない → 到達不可
+        let dx = (start.0 as i32 - target.0 as i32).abs();
+        let dy = (start.1 as i32 - target.1 as i32).abs();
+        let approx = 50 + ((dx + dy) as u32 / 4);
+        cache.cache.insert(cache_key, approx);
+        return approx;
+    }
+
+    // スタート地点がいずれかの到達目標に一致する場合
+    for &et in &effective_targets {
+        if start == et {
+            cache.cache.insert(cache_key, 0);
+            return 0;
         }
     }
 
+    // ダイクストラ法でスタートから各タイルへの最短移動コストを計算
     let mut dist = HashMap::new();
     let mut heap = BinaryHeap::new();
 
-    dist.insert(start, 0);
+    dist.insert(start, 0u32);
     heap.push(State {
         cost: 0,
         position: start,
     });
 
     while let Some(State { cost, position }) = heap.pop() {
-        if position == target {
-            // 到達した
+        // いずれかの到達目標に到達した
+        if effective_targets.contains(&position) {
             let turns = if max_mp == 0 {
                 u32::MAX
             } else {
@@ -126,10 +158,8 @@ pub fn calculate_turn_distance(
             };
 
             // 敵ユニットによるゾック（通行不可）判定
-            // ただし目標地点に敵がいる場合は攻撃可能なので通行可能とみなす（隣接マスまで計算するだけにするか、ここでは通れるとする）
-            // この関数は「到達可能か」なので、目標地点にいるユニットの通過は通れないとしても、その手前までは行ける。
-            // しかし「そのマスに入る」コストなので、目標マス以外に敵がいたらそこは通過不可。
-            if next_pos != target {
+            // ただし目標地点に敵がいる場合は攻撃可能なので通行可能とみなす
+            if !effective_targets.contains(&next_pos) {
                 if let Some(occupant) = unit_positions.get(&next_pos) {
                     if occupant.player_id != player_id {
                         continue; // 敵がいるマスは通過不可
@@ -166,9 +196,10 @@ pub fn calculate_all_turn_distances(
     map: &Map,
     registry: &MasterDataRegistry,
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
-    start: (usize, usize),
+    target: (usize, usize),
     movement_type: MovementType,
     max_mp: u32,
+    interaction_max_range: u32,
     player_id: PlayerId,
 ) -> HashMap<GridPosition, u32> {
     let mut dist = HashMap::new();
@@ -179,11 +210,41 @@ pub fn calculate_all_turn_distances(
         return turns_map;
     }
 
-    dist.insert(start, 0);
-    heap.push(State {
-        cost: 0,
-        position: start,
-    });
+    // ターゲットからインタラクション可能な（射程内の）全ての進入可能タイルを始点として登録
+    for dx in -(interaction_max_range as i32)..=(interaction_max_range as i32) {
+        for dy in -(interaction_max_range as i32)..=(interaction_max_range as i32) {
+            let m_dist = dx.abs() + dy.abs();
+            if m_dist > interaction_max_range as i32 {
+                continue;
+            }
+
+            let nx = target.0 as i32 + dx;
+            let ny = target.1 as i32 + dy;
+            if nx >= 0 && nx < map.width as i32 && ny >= 0 && ny < map.height as i32 {
+                let pos = (nx as usize, ny as usize);
+                if let Some(terrain) = map.get_terrain(pos.0, pos.1) {
+                    if get_valid_movement_cost(registry, movement_type, terrain).is_some() {
+                        let mut can_enter = true;
+                        // 目標地点そのもの以外で、敵がいる場合は始点にできない
+                        if pos != target {
+                            if let Some(occupant) = unit_positions.get(&pos) {
+                                if occupant.player_id != player_id {
+                                    can_enter = false;
+                                }
+                            }
+                        }
+                        if can_enter {
+                            dist.insert(pos, 0);
+                            heap.push(State {
+                                cost: 0,
+                                position: pos,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     while let Some(State { cost, position }) = heap.pop() {
         if cost > *dist.get(&position).unwrap_or(&u32::MAX) {
@@ -232,11 +293,11 @@ pub fn calculate_all_turn_distances(
 /// AIの意思決定・ビーム探索プロセスにおいて、個別に確保して使い回すためのキャッシュ領域。
 /// メモリー肥大化を防ぎ、かつ同一ターン内の探索全体でキャッシュを安全に共有します。
 pub struct AiTurnCache {
-    /// キー: (始点x, 始点y, 移動タイプ, 移動力, 勢力ID)
+    /// キー: (始点x, 始点y, 移動タイプ, 移動力, 射程, 勢力ID)
     /// 値: その始点からマップ上の全到達座標への最短到達ターン数テーブル (Arc)
     #[allow(clippy::type_complexity)]
     pub sssp_cache: HashMap<
-        (usize, usize, MovementType, u32, PlayerId),
+        (usize, usize, MovementType, u32, u32, PlayerId),
         Arc<HashMap<crate::components::GridPosition, u32>>,
     >,
 }
@@ -264,13 +325,21 @@ pub fn calculate_all_turn_distances_cached(
     map: &Map,
     registry: &MasterDataRegistry,
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
-    start: (usize, usize),
+    target: (usize, usize),
     movement_type: MovementType,
     max_mp: u32,
+    interaction_max_range: u32,
     player_id: PlayerId,
     cache: &mut AiTurnCache,
 ) -> Arc<HashMap<crate::components::GridPosition, u32>> {
-    let key = (start.0, start.1, movement_type, max_mp, player_id);
+    let key = (
+        target.0,
+        target.1,
+        movement_type,
+        max_mp,
+        interaction_max_range,
+        player_id,
+    );
     if let Some(cached_map) = cache.sssp_cache.get(&key) {
         return cached_map.clone(); // Arc の clone なので極めて高速
     }
@@ -279,9 +348,10 @@ pub fn calculate_all_turn_distances_cached(
         map,
         registry,
         unit_positions,
-        start,
+        target,
         movement_type,
         max_mp,
+        interaction_max_range,
         player_id,
     );
     let shared_result = Arc::new(result);

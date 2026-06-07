@@ -128,6 +128,48 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
         if let Some(&first_member) = squad.members.iter().next()
             && let Some(pos) = world.get::<GridPosition>(first_member)
         {
+            let stats = world
+                .get::<crate::components::UnitStats>(first_member)
+                .cloned()
+                .unwrap_or_default();
+            let map = world.resource::<crate::resources::Map>();
+
+            // ターゲットが Naval ユニットの攻撃対象として適切か（水域が射程内にあるか）を判定
+            sorted_targets.retain(|t| {
+                if stats.movement_type != crate::resources::MovementType::Ship {
+                    return true; // 海軍以外はフィルタしない
+                }
+                let range = if stats.max_range > 0 {
+                    stats.max_range as i32
+                } else {
+                    1
+                };
+                for dx in -range..=range {
+                    for dy in -range..=range {
+                        if dx.abs() + dy.abs() > range {
+                            continue;
+                        }
+                        let nx = t.x as i32 + dx;
+                        let ny = t.y as i32 + dy;
+                        if nx >= 0
+                            && nx < map.width as i32
+                            && ny >= 0
+                            && ny < map.height as i32
+                            && let Some(terrain) = map.get_terrain(nx as usize, ny as usize)
+                            && matches!(
+                                terrain,
+                                crate::resources::Terrain::Sea
+                                    | crate::resources::Terrain::Shoal
+                                    | crate::resources::Terrain::Port
+                            )
+                        {
+                            return true;
+                        }
+                    }
+                }
+                false
+            });
+
             sorted_targets.sort_by_key(|t| {
                 (pos.x as i32 - t.x as i32).abs() + (pos.y as i32 - t.y as i32).abs()
             });
@@ -213,28 +255,32 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                                 // 目標を始点とした SSSP で各ユニットへの最短ターン数を取得
                                 let mut turns = u32::MAX;
 
-                                if squad.mission_type == MissionType::Transport {
-                                    // 輸送部隊の場合、海をまたぐため歩兵のSSSPや船の陸地発SSSPは機能しない。
-                                    // 代わりにマンハッタン距離から概算ターン数を算出する
-                                    let dist = (target_pos.x as i32 - pos.x as i32).abs()
-                                        + (target_pos.y as i32 - pos.y as i32).abs();
-                                    // 移動力（輸送船なら約6）で割ってターン数を概算
-                                    turns = (dist as u32) / stats.max_movement.max(1);
-                                } else {
-                                    let dist_map =
-                                        crate::ai::turn_distance::calculate_all_turn_distances_cached(
-                                            &map,
-                                            &registry,
-                                            &unit_positions,
-                                            (target_pos.x, target_pos.y),
-                                            stats.movement_type,
-                                            stats.max_movement,
-                                            faction.0,
-                                            &mut search_cache,
-                                        );
-                                    if let Some(&t) = dist_map.get(pos) {
-                                        turns = t;
+                                let interaction_max_range = match squad.mission_type {
+                                    MissionType::Attack | MissionType::Defense => {
+                                        if stats.max_range > 0 {
+                                            stats.max_range
+                                        } else {
+                                            1
+                                        }
                                     }
+                                    MissionType::Capture => 0,
+                                    MissionType::Transport => 1,
+                                };
+
+                                let dist_map =
+                                    crate::ai::turn_distance::calculate_all_turn_distances_cached(
+                                        &map,
+                                        &registry,
+                                        &unit_positions,
+                                        (target_pos.x, target_pos.y),
+                                        stats.movement_type,
+                                        stats.max_movement,
+                                        interaction_max_range,
+                                        faction.0,
+                                        &mut search_cache,
+                                    );
+                                if let Some(&t) = dist_map.get(pos) {
+                                    turns = t;
                                 }
 
                                 if turns != u32::MAX {
@@ -280,7 +326,7 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                 squad.target = Some(target);
                 if squad.mission_type == MissionType::Transport {
                     if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>()
-                        && let Some(island) = island_map.get_island_at(&target) 
+                        && let Some(island) = island_map.get_island_at(&target)
                     {
                         squad.target_island = Some(island.id);
                     }

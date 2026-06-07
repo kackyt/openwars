@@ -595,7 +595,8 @@ pub fn calculate_unit_score_at(
         if demand == 0 {
             score = score.saturating_sub(3000);
         } else {
-            score += demand * 5000; // 需要がある場合は非常に強く生産を促す
+            // 基本的な需要ボーナス（過剰な固定加点ではなく、主役は transport_utility に任せる）
+            score += demand * 1500;
         }
     }
 

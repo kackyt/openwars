@@ -123,6 +123,19 @@ impl AiSimulationState {
                         continue;
                     };
 
+                    let interaction_max_range = match squad.mission_type {
+                        crate::ai::squad::MissionType::Attack
+                        | crate::ai::squad::MissionType::Defense => {
+                            if stats.max_range > 0 {
+                                stats.max_range
+                            } else {
+                                1
+                            }
+                        }
+                        crate::ai::squad::MissionType::Capture => 0,
+                        crate::ai::squad::MissionType::Transport => 1,
+                    };
+
                     // 目標からの SSSP 最短距離テーブルをキャッシュを利用して取得 (O(1)再利用)
                     let dist_map = calculate_all_turn_distances_cached(
                         &map,
@@ -131,6 +144,7 @@ impl AiSimulationState {
                         (target_pos.x, target_pos.y),
                         stats.movement_type,
                         stats.max_movement,
+                        interaction_max_range,
                         perspective_player,
                         cache,
                     );

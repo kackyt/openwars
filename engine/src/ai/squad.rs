@@ -304,20 +304,53 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     }
 
     while formed_transport_squads < max_transport_squads {
-        if free_transports.is_empty() || free_infantry.is_empty() {
+        if free_transports.is_empty() {
             break;
         }
 
-        let (trans_ent, _, _) = free_transports.pop().unwrap();
-        let (inf_ent, _, _) = free_infantry.pop().unwrap();
+        let trans_idx = free_transports.len() - 1;
+        let (_, _, trans_stats) = &free_transports[trans_idx];
 
-        let squad = manager.create_squad(MissionType::Transport);
-        squad.members.insert(trans_ent);
-        squad.transport_cargo = Some(inf_ent);
-        squad.target_island = None; // ターゲット島は Beam Search で動的決定する
-        squad.phase = MissionPhase::Transport(TransportPhase::Pickup);
+        // 搭載可能なユニットを「戦闘ユニット（重車両など）」から優先して探し、次に「歩兵」から探す
+        let mut cargo_idx = None;
+        let mut is_combat_cargo = true;
 
-        formed_transport_squads += 1;
+        for (i, (_, _, stats)) in free_combat_units.iter().enumerate() {
+            if trans_stats.loadable_unit_types.contains(&stats.unit_type) {
+                cargo_idx = Some(i);
+                break;
+            }
+        }
+
+        if cargo_idx.is_none() {
+            is_combat_cargo = false;
+            for (i, (_, _, stats)) in free_infantry.iter().enumerate() {
+                if trans_stats.loadable_unit_types.contains(&stats.unit_type) {
+                    cargo_idx = Some(i);
+                    break;
+                }
+            }
+        }
+
+        if let Some(idx) = cargo_idx {
+            let (trans_ent, _, _) = free_transports.remove(trans_idx);
+            let (cargo_ent, _, _) = if is_combat_cargo {
+                free_combat_units.remove(idx)
+            } else {
+                free_infantry.remove(idx)
+            };
+
+            let squad = manager.create_squad(MissionType::Transport);
+            squad.members.insert(trans_ent);
+            squad.transport_cargo = Some(cargo_ent);
+            squad.target_island = None; // ターゲット島は Beam Search で動的決定する
+            squad.phase = MissionPhase::Transport(TransportPhase::Pickup);
+
+            formed_transport_squads += 1;
+        } else {
+            // この輸送機に載せられるユニットがいない場合は諦める
+            free_transports.remove(trans_idx);
+        }
     }
 
     // B. 防衛部隊の立ち上げ（Defenseフェーズ）

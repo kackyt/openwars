@@ -209,7 +209,9 @@ fn evaluate_board_v2(
         Option<&crate::components::Transporting>,
         Option<&crate::components::CargoCapacity>,
     )>();
-    for (_entity, faction, health, stats, pos_opt, ammo_opt, _transporting_opt, _cargo_opt) in query.iter(world) {
+    for (_entity, faction, health, stats, pos_opt, ammo_opt, _transporting_opt, _cargo_opt) in
+        query.iter(world)
+    {
         let is_my_unit = faction.0 == perspective_player;
 
         let mut base_value = if health.max > 0 {
@@ -267,6 +269,7 @@ fn evaluate_board_v2(
                     (p_pos.x, p_pos.y),
                     stats.movement_type,
                     stats.max_movement,
+                    0, // interaction_max_range
                     faction.0,
                     turn_cache,
                 );
@@ -357,6 +360,7 @@ fn evaluate_board_v2(
                 (pos.x, pos.y),
                 crate::resources::MovementType::Infantry,
                 3,
+                0, // interaction_max_range
                 owner,
                 turn_cache,
             );
@@ -410,6 +414,7 @@ fn evaluate_board_v2(
                 (p_pos.x, p_pos.y),
                 *u_movement_type,
                 *u_max_movement,
+                0, // interaction_max_range
                 *u_faction,
                 turn_cache,
             );
@@ -430,6 +435,7 @@ fn evaluate_board_v2(
                 (p_pos.x, p_pos.y),
                 *u_movement_type,
                 *u_max_movement,
+                0, // interaction_max_range
                 *u_faction,
                 turn_cache,
             );
