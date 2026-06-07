@@ -343,8 +343,12 @@ pub fn execute_mission_step(
                             c_stats.unit_type,
                             registry,
                         );
-                        let dist = (cargo_pos.x as i32 - t_pos.x as i32).abs() + (cargo_pos.y as i32 - t_pos.y as i32).abs();
-                        if c_reachable.contains(&(t_pos.x, t_pos.y)) || cargo_pos == t_pos || dist <= 1 {
+                        let dist = (cargo_pos.x as i32 - t_pos.x as i32).abs()
+                            + (cargo_pos.y as i32 - t_pos.y as i32).abs();
+                        if c_reachable.contains(&(t_pos.x, t_pos.y))
+                            || cargo_pos == t_pos
+                            || dist <= 1
+                        {
                             can_load = true;
                         }
                     }

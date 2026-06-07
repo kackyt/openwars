@@ -333,18 +333,30 @@ mod tests {
         // V1: 従来から輸送ミッションをサポートするようになったため、V1も輸送計画を立てる
         let mut world_v1 = setup_transport_invasion();
         crate::ai::planner::assign_transport_missions(&mut world_v1, p1);
-        let manager_v1 = world_v1.get_resource::<crate::ai::missions::TransportMissionManager>().expect("V1 should create transport manager");
+        let manager_v1 = world_v1
+            .get_resource::<crate::ai::missions::TransportMissionManager>()
+            .expect("V1 should create transport manager");
         assert!(
-            manager_v1.missions.iter().any(|m| m.phase == crate::ai::missions::TransportPhase::Pickup),
+            manager_v1
+                .missions
+                .iter()
+                .any(|m| m.phase == crate::ai::missions::TransportPhase::Pickup),
             "V1 should plan a Pickup transport mission"
         );
 
         // V2: 輸送ミッションを計画し、歩兵が輸送船に向かう
         let mut world_v2 = setup_transport_invasion();
         crate::ai::squad::plan_squads(&mut world_v2, p1);
-        let manager_v2 = world_v2.get_resource::<crate::ai::squad::SquadManager>().expect("V2 should create squad manager");
+        let manager_v2 = world_v2
+            .get_resource::<crate::ai::squad::SquadManager>()
+            .expect("V2 should create squad manager");
         assert!(
-            manager_v2.squads.iter().any(|s| s.mission_type == crate::ai::squad::MissionType::Transport && s.phase == crate::ai::squad::MissionPhase::Transport(crate::ai::squad::TransportPhase::Pickup)),
+            manager_v2.squads.iter().any(|s| s.mission_type
+                == crate::ai::squad::MissionType::Transport
+                && s.phase
+                    == crate::ai::squad::MissionPhase::Transport(
+                        crate::ai::squad::TransportPhase::Pickup
+                    )),
             "V2 should plan a Pickup transport mission"
         );
     }
@@ -559,17 +571,29 @@ mod tests {
         // V1: V1も輸送ロジックを共有しているため、Transitミッションを計画する
         let mut world_v1 = setup_amphibious_assault();
         crate::ai::planner::assign_transport_missions(&mut world_v1, p1);
-        let manager_v1 = world_v1.get_resource::<crate::ai::missions::TransportMissionManager>().expect("V1 should create transport manager");
+        let manager_v1 = world_v1
+            .get_resource::<crate::ai::missions::TransportMissionManager>()
+            .expect("V1 should create transport manager");
         assert!(
-            manager_v1.missions.iter().any(|m| m.phase == crate::ai::missions::TransportPhase::Transit),
+            manager_v1
+                .missions
+                .iter()
+                .any(|m| m.phase == crate::ai::missions::TransportPhase::Transit),
             "V1 should plan a Transit transport mission to drop units"
         );
 
         let mut world_v2 = setup_amphibious_assault();
         crate::ai::squad::plan_squads(&mut world_v2, p1);
-        let manager_v2 = world_v2.get_resource::<crate::ai::squad::SquadManager>().expect("V2 should create squad manager");
+        let manager_v2 = world_v2
+            .get_resource::<crate::ai::squad::SquadManager>()
+            .expect("V2 should create squad manager");
         assert!(
-            manager_v2.squads.iter().any(|s| s.mission_type == crate::ai::squad::MissionType::Transport && s.phase == crate::ai::squad::MissionPhase::Transport(crate::ai::squad::TransportPhase::Transit)),
+            manager_v2.squads.iter().any(|s| s.mission_type
+                == crate::ai::squad::MissionType::Transport
+                && s.phase
+                    == crate::ai::squad::MissionPhase::Transport(
+                        crate::ai::squad::TransportPhase::Transit
+                    )),
             "V2 should plan a Transit transport mission to drop units"
         );
     }
