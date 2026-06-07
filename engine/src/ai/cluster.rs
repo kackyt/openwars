@@ -129,3 +129,149 @@ pub fn detect_enemy_clusters(
 
     clusters
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::components::*;
+    use crate::resources::master_data::*;
+    use crate::resources::*;
+
+    fn setup_test_world() -> World {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (mut world, _) =
+            crate::setup::initialize_world_from_master_data(&master_data, "map_1").unwrap();
+
+        let entities: Vec<Entity> = world.query::<Entity>().iter(&world).collect();
+        for e in entities {
+            world.despawn(e);
+        }
+
+        let map = Map {
+            width: 10,
+            height: 10,
+            tiles: vec![Terrain::Plains; 100],
+            topology: GridTopology::Square,
+        };
+        world.insert_resource(map);
+        world
+    }
+
+    #[test]
+    fn test_detect_enemy_clusters_single_group() {
+        let mut world = setup_test_world();
+        let p1 = PlayerId(1); // Perspective player
+        let p2 = PlayerId(2); // Enemy
+
+        // Spawn 3 enemy infantry close to each other
+        for i in 0..3 {
+            world.spawn((
+                p2,
+                Faction(p2),
+                GridPosition { x: 5 + i, y: 5 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    movement_type: MovementType::Infantry,
+                    max_movement: 3,
+                    cost: 1000,
+                    ..UnitStats::mock()
+                },
+            ));
+        }
+
+        let clusters = detect_enemy_clusters(&mut world, p1);
+
+        assert_eq!(clusters.len(), 1, "Should detect exactly 1 cluster");
+        assert_eq!(clusters[0].units.len(), 3, "Cluster should contain 3 units");
+        assert_eq!(clusters[0].total_value, 3000, "Total value should be 3000");
+        assert_eq!(clusters[0].threat_level, 3, "Threat level should be 3");
+        assert_eq!(
+            clusters[0].center,
+            GridPosition { x: 6, y: 5 },
+            "Center should be average of (5,5), (6,5), (7,5)"
+        );
+    }
+
+    #[test]
+    fn test_detect_enemy_clusters_multiple_groups() {
+        let mut world = setup_test_world();
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+
+        // Group 1: 2 units at (1,1) and (1,2)
+        world.spawn((
+            p2,
+            Faction(p2),
+            GridPosition { x: 1, y: 1 },
+            UnitStats {
+                unit_type: UnitType::Infantry,
+                movement_type: MovementType::Infantry,
+                max_movement: 3,
+                cost: 1000,
+                ..UnitStats::mock()
+            },
+        ));
+        world.spawn((
+            p2,
+            Faction(p2),
+            GridPosition { x: 1, y: 2 },
+            UnitStats {
+                unit_type: UnitType::Infantry,
+                movement_type: MovementType::Infantry,
+                max_movement: 3,
+                cost: 1000,
+                ..UnitStats::mock()
+            },
+        ));
+
+        // Group 2: 1 unit far away at (8,8)
+        world.spawn((
+            p2,
+            Faction(p2),
+            GridPosition { x: 8, y: 8 },
+            UnitStats {
+                unit_type: UnitType::Tank,
+                movement_type: MovementType::Tank,
+                max_movement: 6,
+                cost: 7000,
+                ..UnitStats::mock()
+            },
+        ));
+
+        // Also add a friendly unit (should be ignored)
+        world.spawn((
+            p1,
+            Faction(p1),
+            GridPosition { x: 5, y: 5 },
+            UnitStats {
+                unit_type: UnitType::Infantry,
+                movement_type: MovementType::Infantry,
+                max_movement: 3,
+                ..UnitStats::mock()
+            },
+        ));
+
+        let mut clusters = detect_enemy_clusters(&mut world, p1);
+
+        // Sort clusters by center X to make assertions deterministic
+        clusters.sort_by_key(|c| c.center.x);
+
+        assert_eq!(clusters.len(), 2, "Should detect 2 distinct clusters");
+
+        assert_eq!(clusters[0].units.len(), 2, "Group 1 should have 2 units");
+        assert_eq!(
+            clusters[0].center,
+            GridPosition { x: 1, y: 1 },
+            "Group 1 center (integer div: (1+1)/2, (1+2)/2)"
+        );
+        assert_eq!(clusters[0].total_value, 2000);
+
+        assert_eq!(clusters[1].units.len(), 1, "Group 2 should have 1 unit");
+        assert_eq!(
+            clusters[1].center,
+            GridPosition { x: 8, y: 8 },
+            "Group 2 center"
+        );
+        assert_eq!(clusters[1].total_value, 7000);
+    }
+}

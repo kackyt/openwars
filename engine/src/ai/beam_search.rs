@@ -361,3 +361,106 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
 
     world.insert_resource(manager);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::components::*;
+    use crate::resources::master_data::*;
+    use crate::resources::*;
+    use std::collections::HashSet;
+
+    fn setup_test_world() -> World {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (mut world, _) =
+            crate::setup::initialize_world_from_master_data(&master_data, "map_1").unwrap();
+
+        let entities: Vec<Entity> = world.query::<Entity>().iter(&world).collect();
+        for e in entities {
+            world.despawn(e);
+        }
+
+        let map = Map {
+            width: 10,
+            height: 10,
+            tiles: vec![Terrain::Plains; 100],
+            topology: GridTopology::Square,
+        };
+
+        world.insert_resource(map);
+        world.insert_resource(crate::ai::ai_version::PlayerAiSettings::default());
+        world
+    }
+
+    #[test]
+    fn test_beam_search_assigns_targets() {
+        let mut world = setup_test_world();
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+
+        // Enemy unit to act as a target at (8, 8)
+        world.spawn((
+            p2,
+            Faction(p2),
+            GridPosition { x: 8, y: 8 },
+            UnitStats {
+                unit_type: UnitType::Tank,
+                movement_type: MovementType::Tank,
+                max_movement: 6,
+                cost: 7000,
+                ..UnitStats::mock()
+            },
+        ));
+
+        // Friendly unit
+        let u1 = world
+            .spawn((
+                p1,
+                Faction(p1),
+                GridPosition { x: 2, y: 2 },
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Tank,
+                    max_movement: 6,
+                    cost: 7000,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+
+        let mut squad = Squad {
+            id: crate::ai::squad::SquadId(1),
+            members: HashSet::new(),
+            mission_type: MissionType::Attack,
+            target: None,
+            target_island: None,
+            phase: crate::ai::squad::MissionPhase::Forming,
+            transport_cargo: None,
+        };
+        squad.members.insert(u1);
+
+        let mut manager = SquadManager::new();
+        manager.squads.push(squad);
+        world.insert_resource(manager);
+
+        // Also add PlayerAiSettings so the evaluation runs V2 (if the default is correctly mapped, but run_squad_beam_search uses evaluate_board which checks it)
+        let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
+        settings.set_version(p1, crate::ai::ai_version::AiVersion::V2);
+        world.insert_resource(settings);
+
+        run_squad_beam_search(&mut world, p1);
+
+        let manager = world.get_resource::<SquadManager>().unwrap();
+
+        assert_eq!(manager.squads.len(), 1);
+        assert_eq!(manager.squads[0].target, Some(GridPosition { x: 8, y: 8 }));
+        assert_eq!(
+            manager.squads[0].phase,
+            crate::ai::squad::MissionPhase::MovingToTarget
+        );
+    }
+}

@@ -164,15 +164,27 @@ impl AiSimulationState {
                             let mut next_best_tile = temp_pos;
                             let mut min_next_turns = temp_turns;
 
+                            let mut best_manhattan = (temp_pos.x as i32 - target_pos.x as i32)
+                                .abs()
+                                + (temp_pos.y as i32 - target_pos.y as i32).abs();
+
                             for next_tile in map.get_adjacent(temp_pos.x, temp_pos.y) {
                                 let next_pos = GridPosition {
                                     x: next_tile.0,
                                     y: next_tile.1,
                                 };
                                 let next_dist = *dist_map.get(&next_pos).unwrap_or(&u32::MAX);
-                                if next_dist < min_next_turns {
+                                let next_manhattan = (next_pos.x as i32 - target_pos.x as i32)
+                                    .abs()
+                                    + (next_pos.y as i32 - target_pos.y as i32).abs();
+
+                                if next_dist < min_next_turns
+                                    || (next_dist == min_next_turns
+                                        && next_manhattan < best_manhattan)
+                                {
                                     min_next_turns = next_dist;
                                     next_best_tile = next_pos;
+                                    best_manhattan = next_manhattan;
                                 }
                             }
 
@@ -215,5 +227,138 @@ impl AiSimulationState {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::squad::{MissionPhase, MissionType, SquadId};
+    use crate::components::{Faction, GridPosition, Health, PlayerId, Property, UnitStats};
+    use crate::resources::{GridTopology, Map, Terrain, master_data::MasterDataRegistry};
+    use std::collections::HashSet;
+
+    fn setup_test_world() -> World {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (mut world, _) =
+            crate::setup::initialize_world_from_master_data(&master_data, "map_1").unwrap();
+
+        let entities: Vec<Entity> = world.query::<Entity>().iter(&world).collect();
+        for e in entities {
+            world.despawn(e);
+        }
+
+        let map = Map {
+            width: 10,
+            height: 10,
+            tiles: vec![Terrain::Plains; 100],
+            topology: GridTopology::Square,
+        };
+        world.insert_resource(map);
+        world
+    }
+
+    #[test]
+    fn test_simulation_state_backup_restore() {
+        let mut world = setup_test_world();
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+
+        let unit_entity = world
+            .spawn((
+                p1,
+                Faction(p1),
+                GridPosition { x: 2, y: 2 },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+
+        let prop_entity = world
+            .spawn((
+                GridPosition { x: 5, y: 5 },
+                Property::new(Terrain::City, Some(p2), 100),
+            ))
+            .id();
+
+        // Backup state
+        let backup = AiSimulationState::backup(&mut world);
+
+        // Mutate state
+        if let Some(mut h) = world.get_mut::<Health>(unit_entity) {
+            h.current = 50;
+        }
+        if let Some(mut p) = world.get_mut::<GridPosition>(unit_entity) {
+            p.x = 9;
+        }
+        if let Some(mut prop) = world.get_mut::<Property>(prop_entity) {
+            prop.owner_id = Some(p1);
+            prop.capture_points = 10;
+        }
+
+        // Restore state
+        backup.restore(&mut world);
+
+        // Verify restored
+        let h = world.get::<Health>(unit_entity).unwrap();
+        let p = world.get::<GridPosition>(unit_entity).unwrap();
+        let prop = world.get::<Property>(prop_entity).unwrap();
+
+        assert_eq!(h.current, 100);
+        assert_eq!(p.x, 2);
+        assert_eq!(prop.owner_id, Some(p2));
+        assert_eq!(prop.capture_points, 100);
+    }
+
+    #[test]
+    fn test_simulate_plan_moves_units() {
+        let mut world = setup_test_world();
+        let p1 = PlayerId(1);
+
+        let unit_entity = world
+            .spawn((
+                p1,
+                Faction(p1),
+                GridPosition { x: 1, y: 1 },
+                UnitStats {
+                    unit_type: crate::resources::UnitType::Infantry,
+                    movement_type: crate::resources::MovementType::Infantry,
+                    max_movement: 3,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+
+        let mut squad = Squad {
+            id: SquadId(1),
+            members: HashSet::new(),
+            mission_type: MissionType::Attack,
+            target: Some(GridPosition { x: 1, y: 8 }),
+            target_island: None,
+            phase: MissionPhase::Executing,
+            transport_cargo: None,
+        };
+        squad.members.insert(unit_entity);
+
+        let mut assignments = HashMap::new();
+        assignments.insert(squad.id, squad.target.unwrap());
+
+        let mut cache = crate::ai::turn_distance::AiTurnCache::new();
+
+        AiSimulationState::simulate_plan(&mut world, &[squad], &assignments, p1, &mut cache);
+
+        // Unit should have moved up to 3 tiles towards (1, 8), so Y should be 4
+        let p = world.get::<GridPosition>(unit_entity).unwrap();
+        assert_eq!(p.x, 1);
+        assert_eq!(
+            p.y, 4,
+            "Unit should use tiebreaker to move closer to target"
+        );
     }
 }

@@ -184,9 +184,11 @@ pub fn update_squads(world: &mut World, perspective_player: PlayerId) {
     });
 
     // メンバーが0になった部隊の解散
-    manager
-        .squads
-        .retain(|s| !s.members.is_empty() || s.phase == MissionPhase::Forming);
+    manager.squads.retain(|s| {
+        !s.members.is_empty()
+            || s.phase == MissionPhase::Completed
+            || s.phase == MissionPhase::Forming
+    });
 
     world.insert_resource(manager);
 }
@@ -1507,4 +1509,224 @@ pub fn execute_transport_squad_step(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::components::*;
+    use crate::resources::master_data::*;
+    use crate::resources::*;
+
+    fn setup_test_world() -> World {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (mut world, _) =
+            crate::setup::initialize_world_from_master_data(&master_data, "map_1").unwrap();
+
+        let entities: Vec<Entity> = world.query::<Entity>().iter(&world).collect();
+        for e in entities {
+            world.despawn(e);
+        }
+
+        let map = Map {
+            width: 10,
+            height: 10,
+            tiles: vec![Terrain::Plains; 100],
+            topology: GridTopology::Square,
+        };
+
+        // Setup a small map
+        world.insert_resource(map.clone());
+        world.insert_resource(crate::ai::islands::IslandMap::analyze(&map));
+        world.insert_resource(SquadManager::new());
+        world
+    }
+
+    #[test]
+    fn test_update_squads_solo_fallback() {
+        let mut world = setup_test_world();
+        let p1 = PlayerId(1);
+
+        // Spawn a unit with low HP
+        let unit1 = world
+            .spawn((
+                p1,
+                Faction(p1),
+                GridPosition { x: 5, y: 5 },
+                Health {
+                    current: 50,
+                    max: 100,
+                },
+            ))
+            .id();
+
+        // Spawn a healthy unit
+        let unit2 = world
+            .spawn((
+                p1,
+                Faction(p1),
+                GridPosition { x: 6, y: 5 },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+
+        update_squads(&mut world, p1);
+
+        let manager = world.get_resource::<SquadManager>().unwrap();
+        assert!(
+            manager.solo_fallbacks.contains(&unit1),
+            "Unit with 50 HP should be in fallback"
+        );
+        assert!(
+            !manager.solo_fallbacks.contains(&unit2),
+            "Healthy unit should not be in fallback"
+        );
+
+        // Now heal the unit
+        if let Some(mut h) = world.get_mut::<Health>(unit1) {
+            h.current = 100;
+        }
+
+        update_squads(&mut world, p1);
+
+        let manager = world.get_resource::<SquadManager>().unwrap();
+        assert!(
+            !manager.solo_fallbacks.contains(&unit1),
+            "Unit should have recovered and left fallback"
+        );
+    }
+
+    #[test]
+    fn test_plan_squads_attack_creation() {
+        let mut world = setup_test_world();
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+
+        // Enemy cluster at (8,8)
+        world.spawn((
+            p2,
+            Faction(p2),
+            GridPosition { x: 8, y: 8 },
+            UnitStats {
+                unit_type: UnitType::Tank,
+                movement_type: MovementType::Tank,
+                max_movement: 6,
+                cost: 7000,
+                ..UnitStats::mock()
+            },
+        ));
+
+        // Friendly units to form an attack squad
+        let u1 = world
+            .spawn((
+                p1,
+                Faction(p1),
+                GridPosition { x: 2, y: 2 },
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Tank,
+                    max_movement: 6,
+                    cost: 7000,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+
+        let u2 = world
+            .spawn((
+                p1,
+                Faction(p1),
+                GridPosition { x: 2, y: 3 },
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Tank,
+                    max_movement: 6,
+                    cost: 7000,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+
+        plan_squads(&mut world, p1);
+
+        let manager = world.get_resource::<SquadManager>().unwrap();
+
+        // Verify Attack squad created
+        let attack_squads: Vec<_> = manager
+            .squads
+            .iter()
+            .filter(|s| s.mission_type == MissionType::Attack)
+            .collect();
+        assert_eq!(
+            attack_squads.len(),
+            1,
+            "Should create exactly 1 attack squad"
+        );
+        assert!(attack_squads[0].members.contains(&u1));
+        assert!(attack_squads[0].members.contains(&u2));
+        assert_eq!(attack_squads[0].target, Some(GridPosition { x: 8, y: 8 }));
+    }
+
+    #[test]
+    fn test_plan_squads_capture() {
+        let mut world = setup_test_world();
+        let p1 = PlayerId(1);
+
+        // Friendly base so it doesn't think it's off-island
+        world.spawn((
+            GridPosition { x: 1, y: 1 },
+            Property::new(Terrain::Factory, Some(p1), 100),
+        ));
+
+        // Unowned city to capture
+        world.spawn((
+            GridPosition { x: 5, y: 5 },
+            Property::new(Terrain::City, None, 100),
+        ));
+
+        // Friendly infantry
+        let inf = world
+            .spawn((
+                p1,
+                Faction(p1),
+                GridPosition { x: 4, y: 4 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    movement_type: MovementType::Infantry,
+                    max_movement: 3,
+                    can_capture: true,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+
+        plan_squads(&mut world, p1);
+
+        let manager = world.get_resource::<SquadManager>().unwrap();
+
+        // Verify Capture squad created
+        let capture_squads: Vec<_> = manager
+            .squads
+            .iter()
+            .filter(|s| s.mission_type == MissionType::Capture)
+            .collect();
+        assert_eq!(capture_squads.len(), 1, "Should create 1 capture squad");
+        assert!(capture_squads[0].members.contains(&inf));
+        assert_eq!(capture_squads[0].target, Some(GridPosition { x: 5, y: 5 }));
+    }
 }
