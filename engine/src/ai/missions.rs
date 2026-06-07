@@ -280,8 +280,19 @@ pub fn execute_mission_step(
             // 1. 輸送機の処理
             if !t_exhausted {
                 let mut best_t_tile = t_pos;
-                let mut min_t_dist = 999;
                 let mut turn_cache = crate::ai::turn_distance::TurnDistanceCache::default();
+                let mut min_t_dist = crate::ai::turn_distance::calculate_turn_distance(
+                    map,
+                    registry,
+                    &unit_positions,
+                    (t_pos.x, t_pos.y),
+                    (best_meetup_tile.x, best_meetup_tile.y),
+                    t_stats.movement_type,
+                    t_stats.max_movement,
+                    0,
+                    t_faction,
+                    &mut turn_cache,
+                );
                 for target_tile in &reachable {
                     let d = crate::ai::turn_distance::calculate_turn_distance(
                         map,
@@ -332,7 +343,8 @@ pub fn execute_mission_step(
                             c_stats.unit_type,
                             registry,
                         );
-                        if c_reachable.contains(&(t_pos.x, t_pos.y)) || cargo_pos == t_pos {
+                        let dist = (cargo_pos.x as i32 - t_pos.x as i32).abs() + (cargo_pos.y as i32 - t_pos.y as i32).abs();
+                        if c_reachable.contains(&(t_pos.x, t_pos.y)) || cargo_pos == t_pos || dist <= 1 {
                             can_load = true;
                         }
                     }
@@ -371,8 +383,19 @@ pub fn execute_mission_step(
                         } else {
                             best_meetup_tile
                         };
-                        let mut min_dist = 999;
                         let mut turn_cache = crate::ai::turn_distance::TurnDistanceCache::default();
+                        let mut min_dist = crate::ai::turn_distance::calculate_turn_distance(
+                            map,
+                            registry,
+                            &unit_positions,
+                            (cargo_pos.x, cargo_pos.y),
+                            (target.x, target.y),
+                            c_stats.movement_type,
+                            c_stats.max_movement,
+                            0,
+                            t_faction,
+                            &mut turn_cache,
+                        );
 
                         for target_tile in &c_reachable {
                             let d = crate::ai::turn_distance::calculate_turn_distance(
