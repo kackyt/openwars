@@ -1,11 +1,11 @@
 ---
 title: "PLAYBOOK"
-version: "1.0.0"
+version: "1.1.0"
 status: "approved"
 created: "2026-06-06"
-updated: "2026-06-06"
+updated: "2026-06-08"
 owner: "@t_kak"
-ace_entry_count: 0
+ace_entry_count: 3
 tags: [ace, playbook, knowledge-management]
 references:
   - docs/ACE_FRAMEWORK.md
@@ -179,6 +179,62 @@ Playbook が 800 行を超えた場合、以下のように分割する：
 **Action**: 一覧取得時は `include` オプションで関連を一括取得する。`findMany({ include: { organization: true } })`
 -->
 
+<a id="ace-47-1"></a>
+
+### ACE-47-1: AIの部隊管理におけるユニットの解放忘れと再搭乗ループ防止
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | architecture |
+| Origin     | PR #47 |
+| Date       | 2026-06-08 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: AIの部隊（Squad）ロジックにおいて、任務完了後に部隊を明示的に解散（解放）しないと、所属ユニットがフリー状態と認識されず、次の行動（占領や帰還など）に移行できなくなる。また、ピストン輸送の際は「すでに目標地点にいるユニット」を対象から除外しないと無限ループに陥る。
+
+**Context**: V2 AIの輸送ロジックにおいて、歩兵を降ろした後も輸送部隊が解散されなかったため、歩兵が占領行動に移らず、空の輸送ヘリも帰還しない不具合が発生した。さらに、降ろした歩兵を再度拾ってしまう問題があった。
+
+**Action**: 任務完了時（例：輸送のDropフェーズ完了時）に即座に部隊を解散（`return true;`などで解放）し、個々のユニットが自律的な次のタスク評価（タクシー帰りや占領など）を受けられるようにする。輸送対象の探索時には「すでに目標地点にいるか」のフィルタリング処理を必ず実装する。
+
+<a id="ace-47-2"></a>
+
+### ACE-47-2: ECSクエリのループ内呼び出しによるオーバーヘッド回避
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | performance |
+| Origin     | PR #47 |
+| Date       | 2026-06-08 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: `width * height` のような大規模なループ内で変化しないエンティティのコンポーネント（`UnitStats` など）を毎回 `world.get::<T>` で取得すると、ECSのクエリオフセットが累積してパフォーマンス低下を招く。
+
+**Context**: AIの輸送待ち合わせタイルの計算時、マップ全域のループ（`width * height`）内で、対象となる輸送貨物（カーゴ）の `UnitStats` を毎ループ取得していたため無駄な処理が発生していた。
+
+**Action**: ループ内で変化しない ECS コンポーネントへのアクセスは、必ずループの外で1度だけ取得し、変数にキャッシュして再利用する。
+
+<a id="ace-47-3"></a>
+
+### ACE-47-3: 探索アルゴリズム内の Vec::contains によるパフォーマンス低下の回避
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | performance |
+| Origin     | PR #47 |
+| Date       | 2026-06-08 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: ダイクストラ法などの経路探索アルゴリズムのループ内で `Vec::contains` を多用すると、線形探索（O(N)）となり重大なパフォーマンスのボトルネックになる。
+
+**Context**: AIの距離計算（`calculate_turn_distance`）において、有効なターゲット一覧を `Vec` で保持し、探索ループ内で毎回 `effective_targets.contains(&position)` を呼び出していたため計算量が増大していた。
+
+**Action**: 探索のルックアップ対象となるコレクションは `std::collections::HashSet` を使用し、判定を O(1) に高速化する。
 
 ## Changelog
 
