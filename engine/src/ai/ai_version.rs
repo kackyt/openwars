@@ -32,11 +32,11 @@ impl PlayerAiSettings {
         self.versions.insert(player_id, version);
     }
 
-    /// 指定したプレイヤーのAIバージョンを取得します。デフォルトは V1 とします。
+    /// 指定したプレイヤーのAIバージョンを取得します。デフォルトは V2 とします。
     pub fn get_version(&self, player_id: PlayerId) -> AiVersion {
         self.versions
             .get(&player_id)
             .copied()
-            .unwrap_or(AiVersion::V1)
+            .unwrap_or(AiVersion::V2)
     }
 }

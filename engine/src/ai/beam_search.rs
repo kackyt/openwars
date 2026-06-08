@@ -67,11 +67,11 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
         all_target_candidates.push(cap);
     }
 
-    // 2. 割り当てが必要な部隊（Squad）を収集（輸送部隊は planner が目標を固定するため除外）
+    // 2. 割り当てが必要な部隊（Squad）を収集
     let active_squads: Vec<Squad> = manager
         .squads
         .iter()
-        .filter(|s| s.mission_type != MissionType::Transport && !s.members.is_empty())
+        .filter(|s| !s.members.is_empty())
         .cloned()
         .collect();
 
@@ -114,7 +114,31 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                 }
                 valid_targets.extend(&target_enemies);
             }
-            MissionType::Transport => {}
+            MissionType::Transport => {
+                // squad.rs の段階ですでに戦略的価値に基づく target_island が設定されているはず
+                if let Some(target_island_id) = squad.target_island {
+                    let mut island_targets = Vec::new();
+                    if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>()
+                    {
+                        for &t_pos in &target_props {
+                            if let Some(island) = island_map.get_island_at(&t_pos)
+                                && island.id == target_island_id
+                            {
+                                island_targets.push(t_pos);
+                            }
+                        }
+                    }
+                    if !island_targets.is_empty() {
+                        valid_targets.extend(&island_targets);
+                    } else {
+                        // 万が一、対象の島に未占領拠点が無い（すでに占領済み等の）場合はフォールバック
+                        valid_targets.extend(&target_props);
+                    }
+                } else {
+                    // target_island が未設定の場合は通常のフォールバック
+                    valid_targets.extend(&target_props);
+                }
+            }
         }
 
         if valid_targets.is_empty() {
@@ -126,6 +150,48 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
         if let Some(&first_member) = squad.members.iter().next()
             && let Some(pos) = world.get::<GridPosition>(first_member)
         {
+            let stats = world
+                .get::<crate::components::UnitStats>(first_member)
+                .cloned()
+                .unwrap_or_default();
+            let map = world.resource::<crate::resources::Map>();
+
+            // ターゲットが Naval ユニットの攻撃対象として適切か（水域が射程内にあるか）を判定
+            sorted_targets.retain(|t| {
+                if stats.movement_type != crate::resources::MovementType::Ship {
+                    return true; // 海軍以外はフィルタしない
+                }
+                let range = if stats.max_range > 0 {
+                    stats.max_range as i32
+                } else {
+                    1
+                };
+                for dx in -range..=range {
+                    for dy in -range..=range {
+                        if dx.abs() + dy.abs() > range {
+                            continue;
+                        }
+                        let nx = t.x as i32 + dx;
+                        let ny = t.y as i32 + dy;
+                        if nx >= 0
+                            && nx < map.width as i32
+                            && ny >= 0
+                            && ny < map.height as i32
+                            && let Some(terrain) = map.get_terrain(nx as usize, ny as usize)
+                            && matches!(
+                                terrain,
+                                crate::resources::Terrain::Sea
+                                    | crate::resources::Terrain::Shoal
+                                    | crate::resources::Terrain::Port
+                            )
+                        {
+                            return true;
+                        }
+                    }
+                }
+                false
+            });
+
             sorted_targets.sort_by_key(|t| {
                 (pos.x as i32 - t.x as i32).abs() + (pos.y as i32 - t.y as i32).abs()
             });
@@ -209,6 +275,20 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                                 world.get::<crate::components::Faction>(member),
                             ) {
                                 // 目標を始点とした SSSP で各ユニットへの最短ターン数を取得
+                                let mut turns = u32::MAX;
+
+                                let interaction_max_range = match squad.mission_type {
+                                    MissionType::Attack | MissionType::Defense => {
+                                        if stats.max_range > 0 {
+                                            stats.max_range
+                                        } else {
+                                            1
+                                        }
+                                    }
+                                    MissionType::Capture => 0,
+                                    MissionType::Transport => 1,
+                                };
+
                                 let dist_map =
                                     crate::ai::turn_distance::calculate_all_turn_distances_cached(
                                         &map,
@@ -217,13 +297,15 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                                         (target_pos.x, target_pos.y),
                                         stats.movement_type,
                                         stats.max_movement,
+                                        interaction_max_range,
                                         faction.0,
                                         &mut search_cache,
                                     );
+                                if let Some(&t) = dist_map.get(pos) {
+                                    turns = t;
+                                }
 
-                                if let Some(&turns) = dist_map.get(pos)
-                                    && turns != u32::MAX
-                                {
+                                if turns != u32::MAX {
                                     // 1ターン近づくごとに 150 相当の加点を行う
                                     let mut proximity_bonus = (50 - turns.min(50)) as i32 * 150;
                                     if Some(target_pos) == enemy_capital_pos
@@ -233,6 +315,12 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                                         // 攻撃・占領部隊にとって敵首都は最重要目標なので、3倍のボーナス（極端な特攻はしないが優先はする）
                                         proximity_bonus *= 3;
                                     }
+
+                                    // 輸送部隊の Time Discounting: 到達ターン数に応じたペナルティ（遠すぎる島への無謀な輸送を防ぐ）
+                                    if squad.mission_type == MissionType::Transport {
+                                        proximity_bonus -= turns as i32 * 200;
+                                    }
+
                                     score += proximity_bonus;
                                 }
                             }
@@ -258,10 +346,121 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
         for squad in &mut manager.squads {
             if let Some(&target) = best_plan.assignments.get(&squad.id) {
                 squad.target = Some(target);
-                squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+                if squad.mission_type == MissionType::Transport {
+                    if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>()
+                        && let Some(island) = island_map.get_island_at(&target)
+                    {
+                        squad.target_island = Some(island.id);
+                    }
+                } else {
+                    squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+                }
             }
         }
     }
 
     world.insert_resource(manager);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::components::*;
+    use crate::resources::master_data::*;
+    use crate::resources::*;
+    use std::collections::HashSet;
+
+    fn setup_test_world() -> World {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (mut world, _) =
+            crate::setup::initialize_world_from_master_data(&master_data, "map_1").unwrap();
+
+        let entities: Vec<Entity> = world.query::<Entity>().iter(&world).collect();
+        for e in entities {
+            world.despawn(e);
+        }
+
+        let map = Map {
+            width: 10,
+            height: 10,
+            tiles: vec![Terrain::Plains; 100],
+            topology: GridTopology::Square,
+        };
+
+        world.insert_resource(map);
+        world.insert_resource(crate::ai::ai_version::PlayerAiSettings::default());
+        world
+    }
+
+    #[test]
+    fn test_beam_search_assigns_targets() {
+        let mut world = setup_test_world();
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+
+        // Enemy unit to act as a target at (8, 8)
+        world.spawn((
+            p2,
+            Faction(p2),
+            GridPosition { x: 8, y: 8 },
+            UnitStats {
+                unit_type: UnitType::Tank,
+                movement_type: MovementType::Tank,
+                max_movement: 6,
+                cost: 7000,
+                ..UnitStats::mock()
+            },
+        ));
+
+        // Friendly unit
+        let u1 = world
+            .spawn((
+                p1,
+                Faction(p1),
+                GridPosition { x: 2, y: 2 },
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Tank,
+                    max_movement: 6,
+                    cost: 7000,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+
+        let mut squad = Squad {
+            id: crate::ai::squad::SquadId(1),
+            members: HashSet::new(),
+            mission_type: MissionType::Attack,
+            target: None,
+            target_island: None,
+            phase: crate::ai::squad::MissionPhase::Forming,
+            transport_cargo: None,
+        };
+        squad.members.insert(u1);
+
+        let mut manager = SquadManager::new();
+        manager.squads.push(squad);
+        world.insert_resource(manager);
+
+        // Also add PlayerAiSettings so the evaluation runs V2 (if the default is correctly mapped, but run_squad_beam_search uses evaluate_board which checks it)
+        let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
+        settings.set_version(p1, crate::ai::ai_version::AiVersion::V2);
+        world.insert_resource(settings);
+
+        run_squad_beam_search(&mut world, p1);
+
+        let manager = world.get_resource::<SquadManager>().unwrap();
+
+        assert_eq!(manager.squads.len(), 1);
+        assert_eq!(manager.squads[0].target, Some(GridPosition { x: 8, y: 8 }));
+        assert_eq!(
+            manager.squads[0].phase,
+            crate::ai::squad::MissionPhase::MovingToTarget
+        );
+    }
 }

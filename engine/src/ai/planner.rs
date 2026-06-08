@@ -74,7 +74,8 @@ pub fn is_invasion_allowed(
 /// 3. 必要な歩兵数と輸送機数を算出し、フリーなユニットから割り当てる。
 pub fn assign_transport_missions(world: &mut World, player_id: PlayerId) {
     // 進行中の自軍ミッションに割り当てられているユニットを収集
-    let mut busy_transports = HashSet::new();
+    let mut assigned_missions_count = HashMap::new();
+    let mut transport_target_islands = HashMap::new();
     let mut busy_infantry = HashSet::new();
     let mut missions_to_add = Vec::new();
     let mut enemy_invasion_islands = HashSet::new();
@@ -85,7 +86,11 @@ pub fn assign_transport_missions(world: &mut World, player_id: PlayerId) {
                 .get::<Faction>(m.transport_entity)
                 .is_some_and(|faction| faction.0 == player_id)
             {
-                busy_transports.insert(m.transport_entity);
+                *assigned_missions_count
+                    .entry(m.transport_entity)
+                    .or_insert(0) += 1;
+                transport_target_islands.insert(m.transport_entity, m.target_island);
+
                 // Return フェーズでは歩兵はすでに降ろされているため、
                 // busy_infantry に登録せず通常のAI意思決定（占領など）に参加させる
                 if m.phase != TransportPhase::Return {
@@ -218,7 +223,7 @@ pub fn assign_transport_missions(world: &mut World, player_id: PlayerId) {
     });
 
     // 3. フリーなユニットの収集
-    let mut free_empty_transports = Vec::new();
+    let mut available_transports = Vec::new(); // (entity, free_slots, target_island)
     let mut free_loaded_transports = Vec::new();
     {
         let mut query =
@@ -227,12 +232,25 @@ pub fn assign_transport_missions(world: &mut World, player_id: PlayerId) {
             if faction.0 == player_id
                 && (stats.unit_type == UnitType::TransportHelicopter
                     || stats.unit_type == UnitType::Lander)
-                && !busy_transports.contains(&entity)
             {
-                if cargo.loaded.is_empty() {
-                    free_empty_transports.push((entity, *pos));
-                } else if let Some(&cargo_entity) = cargo.loaded.first() {
-                    free_loaded_transports.push((entity, cargo_entity, *pos));
+                let assigned_count = assigned_missions_count.get(&entity).copied().unwrap_or(0);
+
+                // すでに積載されているカーゴ（ミッション未割り当て）を抽出
+                let mut unassigned_loaded = 0;
+                for (i, &cargo_entity) in cargo.loaded.iter().enumerate() {
+                    if (i as u32) >= assigned_count {
+                        free_loaded_transports.push((entity, cargo_entity, *pos));
+                        unassigned_loaded += 1;
+                    }
+                }
+
+                // 空きスロット = max_cargo - (割り当て済みミッション数 + 積載済み未割り当てカーゴ数)
+                let used_slots = assigned_count + unassigned_loaded;
+                let free_slots = cargo.max.saturating_sub(used_slots);
+
+                if free_slots > 0 {
+                    let target_island = transport_target_islands.get(&entity).copied().flatten();
+                    available_transports.push((entity, free_slots, target_island));
                 }
             }
         }
@@ -249,15 +267,40 @@ pub fn assign_transport_missions(world: &mut World, player_id: PlayerId) {
         )>();
         for (entity, faction, stats, pos, transporting_opt) in query.iter(world) {
             if faction.0 == player_id
-                && (stats.unit_type == UnitType::Infantry || stats.unit_type == UnitType::Mech)
                 && transporting_opt.is_none()
                 && !busy_infantry.contains(&entity)
             {
-                // 歩兵が「自軍の島」にいるか確認（すでに別の目標島で戦闘中の場合は再割り当てしない）
-                if let Some(island) = island_map.get_island_at(pos)
-                    && base_islands_cache.contains(&island.id)
-                {
-                    free_infantry.push((entity, *pos));
+                // check if the unit is loadable by any transport
+                let mut is_loadable = false;
+                if world.get_resource::<TransportMissionManager>().is_some() {
+                    // Check if this unit is loadable by at least one type of free transport
+                    // Since we're looking for units that *can* be transported
+                    if stats.unit_type == UnitType::Infantry || stats.unit_type == UnitType::Mech {
+                        is_loadable = true; // Infantry and Mech are always loadable by all transports
+                    } else {
+                        // Check master data or transport loadable list
+                        // To be efficient, we check if the unit is in the loadable list of any of our free transports
+                        for (t_entity, _, _) in &available_transports {
+                            if let Some(t_stats) = world.get::<UnitStats>(*t_entity)
+                                && t_stats.loadable_unit_types.contains(&stats.unit_type)
+                            {
+                                is_loadable = true;
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    is_loadable =
+                        stats.unit_type == UnitType::Infantry || stats.unit_type == UnitType::Mech;
+                }
+
+                if is_loadable {
+                    // 歩兵が「自軍の島」にいるか確認（すでに別の目標島で戦闘中の場合は再割り当てしない）
+                    if let Some(island) = island_map.get_island_at(pos)
+                        && base_islands_cache.contains(&island.id)
+                    {
+                        free_infantry.push((entity, *pos));
+                    }
                 }
             }
         }
@@ -317,23 +360,36 @@ pub fn assign_transport_missions(world: &mut World, player_id: PlayerId) {
             to_assign -= 1;
         }
 
-        // 優先度2: 空の輸送機とフリーの歩兵をマッチングして新規割り当て（フェーズは Pickup から開始）
-        while to_assign > 0 && !free_empty_transports.is_empty() && !free_infantry.is_empty() {
-            let (transport_entity, _) = free_empty_transports.pop().unwrap();
-            let (cargo_entity, _) = free_infantry.pop().unwrap();
+        // 優先度2: 空きスロットのある輸送機とフリーの歩兵をマッチングして新規割り当て（フェーズは Pickup から開始）
+        while to_assign > 0 && !free_infantry.is_empty() {
+            let mut matched_idx = None;
+            for (idx, t) in available_transports.iter_mut().enumerate() {
+                if t.1 > 0 && (t.2.is_none() || t.2 == Some(objective.target_island)) {
+                    t.1 -= 1; // スロットを減らす
+                    t.2 = Some(objective.target_island); // 目標を設定
+                    matched_idx = Some(idx);
+                    break;
+                }
+            }
 
-            missions_to_add.push(TransportMission {
-                transport_entity,
-                cargo_entity,
-                phase: TransportPhase::Pickup,
-                target_island: Some(objective.target_island),
-            });
+            if let Some(idx) = matched_idx {
+                let transport_entity = available_transports[idx].0;
+                let (cargo_entity, _) = free_infantry.pop().unwrap();
 
-            to_assign -= 1;
+                missions_to_add.push(TransportMission {
+                    transport_entity,
+                    cargo_entity,
+                    phase: TransportPhase::Pickup,
+                    target_island: Some(objective.target_island),
+                });
+                to_assign -= 1;
+            } else {
+                break; // この目標島に向かえる（または新規の）空きスロットを持つ輸送機がもうない
+            }
         }
 
         // ユニットが尽きたら終了
-        if free_empty_transports.is_empty() && free_loaded_transports.is_empty() {
+        if free_infantry.is_empty() && free_loaded_transports.is_empty() {
             break;
         }
     }

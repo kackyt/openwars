@@ -141,6 +141,8 @@ pub fn decide_ai_action(
     let mut best_overall_score = i32::MIN;
     let mut best_overall_choice: Option<(Entity, AiCommand)> = None;
 
+    let mut turn_cache = crate::ai::turn_distance::AiTurnCache::default();
+
     for unit_entity in movable_units {
         let (stats, pos, fuel, atk_hp, atk_ammo) = {
             let stats = world.get::<UnitStats>(unit_entity).cloned();
@@ -323,8 +325,28 @@ pub fn decide_ai_action(
                 let mut min_objective_dist = 99;
                 for (p_pos, _p_terrain, p_owner) in &properties {
                     if *p_owner != Some(player_id) {
-                        let d = (current_grid.x as i32 - p_pos.x as i32).abs()
+                        let mut d = (current_grid.x as i32 - p_pos.x as i32).abs()
                             + (current_grid.y as i32 - p_pos.y as i32).abs();
+                        if stats.movement_type == crate::resources::MovementType::Ship {
+                            let dist_map =
+                                crate::ai::turn_distance::calculate_all_turn_distances_cached(
+                                    &map,
+                                    &registry,
+                                    &unit_positions,
+                                    (p_pos.x, p_pos.y),
+                                    stats.movement_type,
+                                    stats.max_movement,
+                                    1, // 拠点占領/輸送は隣接(距離1)の海が必要
+                                    player_id,
+                                    &mut turn_cache,
+                                );
+                            let t_dist = dist_map.get(&current_grid).copied().unwrap_or(u32::MAX);
+                            if t_dist != u32::MAX {
+                                d = (t_dist * stats.max_movement) as i32;
+                            } else {
+                                d = 999;
+                            }
+                        }
                         if d < min_objective_dist {
                             min_objective_dist = d;
                         }
@@ -338,23 +360,28 @@ pub fn decide_ai_action(
                 let mut max_potential = -1.0;
 
                 for (e_pos, e_type, e_cost, e_hp, _, _) in &enemy_units {
-                    let d = (current_grid.x as i32 - e_pos.x as i32).abs()
+                    let mut effective_dist = (current_grid.x as i32 - e_pos.x as i32).abs()
                         + (current_grid.y as i32 - e_pos.y as i32).abs();
 
-                    let mut effective_dist = d;
-                    // 海軍ユニットが陸上の敵を追跡する場合の補正
-                    if stats.movement_type == crate::resources::MovementType::Ship
-                        && let Some(e_terrain) = map.get_terrain(e_pos.x, e_pos.y)
-                    {
-                        let move_cost = registry
-                            .get_movement_cost(
-                                crate::resources::MovementType::Ship,
-                                e_terrain.as_str(),
-                            )
-                            .unwrap_or(99);
-                        if move_cost >= 99 && stats.max_range <= 1 {
-                            // 進入不可能な陸地で、かつ直接攻撃ユニットの場合は距離を大幅に水増し
-                            effective_dist += 20;
+                    // 海軍ユニットが陸上の敵を追跡する場合の補正（または単純なターン距離）
+                    if stats.movement_type == crate::resources::MovementType::Ship {
+                        let dist_map =
+                            crate::ai::turn_distance::calculate_all_turn_distances_cached(
+                                &map,
+                                &registry,
+                                &unit_positions,
+                                (e_pos.x, e_pos.y),
+                                stats.movement_type,
+                                stats.max_movement,
+                                stats.max_range, // 敵が射程に入る海マスへのターン距離
+                                player_id,
+                                &mut turn_cache,
+                            );
+                        let t_dist = dist_map.get(&current_grid).copied().unwrap_or(u32::MAX);
+                        if t_dist != u32::MAX {
+                            effective_dist = (t_dist * stats.max_movement) as i32;
+                        } else {
+                            effective_dist = 999;
                         }
                     }
 
@@ -390,17 +417,24 @@ pub fn decide_ai_action(
                         let mut d = (current_grid.x as i32 - e_pos.x as i32).abs()
                             + (current_grid.y as i32 - e_pos.y as i32).abs();
 
-                        if stats.movement_type == crate::resources::MovementType::Ship
-                            && let Some(e_terrain) = map.get_terrain(e_pos.x, e_pos.y)
-                        {
-                            let move_cost = registry
-                                .get_movement_cost(
-                                    crate::resources::MovementType::Ship,
-                                    e_terrain.as_str(),
-                                )
-                                .unwrap_or(99);
-                            if move_cost >= 99 && stats.max_range <= 1 {
-                                d += 20;
+                        if stats.movement_type == crate::resources::MovementType::Ship {
+                            let dist_map =
+                                crate::ai::turn_distance::calculate_all_turn_distances_cached(
+                                    &map,
+                                    &registry,
+                                    &unit_positions,
+                                    (e_pos.x, e_pos.y),
+                                    stats.movement_type,
+                                    stats.max_movement,
+                                    stats.max_range, // 敵が射程に入る海マスへのターン距離
+                                    player_id,
+                                    &mut turn_cache,
+                                );
+                            let t_dist = dist_map.get(&current_grid).copied().unwrap_or(u32::MAX);
+                            if t_dist != u32::MAX {
+                                d = (t_dist * stats.max_movement) as i32;
+                            } else {
+                                d = 999;
                             }
                         }
                         if d < min_dist {
@@ -411,8 +445,28 @@ pub fn decide_ai_action(
                     if enemy_units.is_empty() {
                         for (p_pos, p_terrain, p_owner) in &properties {
                             if *p_owner != Some(player_id) {
-                                let d = (current_grid.x as i32 - p_pos.x as i32).abs()
+                                let mut d = (current_grid.x as i32 - p_pos.x as i32).abs()
                                     + (current_grid.y as i32 - p_pos.y as i32).abs();
+                                if stats.movement_type == crate::resources::MovementType::Ship {
+                                    let dist_map = crate::ai::turn_distance::calculate_all_turn_distances_cached(
+                                         &map,
+                                         &registry,
+                                         &unit_positions,
+                                         (p_pos.x, p_pos.y),
+                                         stats.movement_type,
+                                         stats.max_movement,
+                                         1, // 拠点に隣接する海マスへのターン距離
+                                         player_id,
+                                         &mut turn_cache,
+                                     );
+                                    let t_dist =
+                                        dist_map.get(&current_grid).copied().unwrap_or(u32::MAX);
+                                    if t_dist != u32::MAX {
+                                        d = (t_dist * stats.max_movement) as i32;
+                                    } else {
+                                        d = 999;
+                                    }
+                                }
                                 if d < min_dist {
                                     min_dist = d;
                                 }
@@ -420,8 +474,28 @@ pub fn decide_ai_action(
                                 && registry.can_repair_on_terrain(stats.unit_type, *p_terrain)
                             {
                                 // 自身が修理が必要な場合のみ、自分の拠点もターゲットに含める
-                                let d = (current_grid.x as i32 - p_pos.x as i32).abs()
+                                let mut d = (current_grid.x as i32 - p_pos.x as i32).abs()
                                     + (current_grid.y as i32 - p_pos.y as i32).abs();
+                                if stats.movement_type == crate::resources::MovementType::Ship {
+                                    let dist_map = crate::ai::turn_distance::calculate_all_turn_distances_cached(
+                                         &map,
+                                         &registry,
+                                         &unit_positions,
+                                         (p_pos.x, p_pos.y),
+                                         stats.movement_type,
+                                         stats.max_movement,
+                                         1, // 修理拠点は隣接する海が必要
+                                         player_id,
+                                         &mut turn_cache,
+                                     );
+                                    let t_dist =
+                                        dist_map.get(&current_grid).copied().unwrap_or(u32::MAX);
+                                    if t_dist != u32::MAX {
+                                        d = (t_dist * stats.max_movement) as i32;
+                                    } else {
+                                        d = 999;
+                                    }
+                                }
                                 if d < min_dist {
                                     min_dist = d;
                                 }
@@ -767,7 +841,7 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> Option<Str
         let settings = world.get_resource::<crate::ai::ai_version::PlayerAiSettings>();
         settings
             .map(|s| s.get_version(active_player))
-            .unwrap_or(crate::ai::ai_version::AiVersion::V1)
+            .unwrap_or(crate::ai::ai_version::AiVersion::V2)
     };
 
     match ai_version {
@@ -828,22 +902,22 @@ pub fn execute_ai_turn_v1(world: &mut World, active_player: PlayerId) -> Option<
     let mission_cmd_and_entity = if let Some(manager) =
         world.get_resource::<crate::ai::missions::TransportMissionManager>()
     {
-        let missions = manager.missions.clone();
+        let mut missions = manager.missions.clone();
+        // Pickupを優先することで、同じ輸送船に複数のミッションがある場合に先に乗せる
+        missions.sort_by_key(|m| match m.phase {
+            crate::ai::missions::TransportPhase::Pickup => 0,
+            crate::ai::missions::TransportPhase::Drop => 1,
+            crate::ai::missions::TransportPhase::Transit => 2,
+            crate::ai::missions::TransportPhase::Return => 3,
+        });
         missions.into_iter().find_map(|m| {
             if world
                 .get::<Faction>(m.transport_entity)
                 .is_some_and(|f| f.0 == active_player)
             {
-                if let Some((entity, cmd)) = crate::ai::missions::execute_mission_step(world, &m) {
-                    // コマンド実行主体が冷却中（今ターン指示済み）でないかチェック
-                    if !skip_entities.contains(&entity) {
-                        Some((entity, cmd))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+                let cmds = crate::ai::missions::execute_mission_step(world, &m);
+                cmds.into_iter()
+                    .find(|(entity, _cmd)| !skip_entities.contains(entity))
             } else {
                 None
             }
@@ -978,13 +1052,14 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
                     transport_ent.map_or(true, |e| skip_entities.contains(&e));
                 let is_cargo_cooldown = cargo_ent.map_or(false, |e| skip_entities.contains(&e));
 
-                if is_transport_cooldown || is_cargo_cooldown {
+                // 輸送機と歩兵は独立して行動できるため、どちらかがまだ行動可能なら中に入る
+                if is_transport_cooldown && is_cargo_cooldown {
                     continue;
                 }
 
-                if let Some((entity, cmd)) =
-                    crate::ai::squad::execute_transport_squad_step(world, squad)
-                {
+                let step_res =
+                    crate::ai::squad::execute_transport_squad_step(world, squad, &skip_entities);
+                if let Some((entity, cmd)) = step_res {
                     if !skip_entities.contains(&entity) {
                         transport_action = Some((entity, cmd));
                         break;
@@ -1283,10 +1358,15 @@ pub fn decide_ai_action_v2(
                         (target.x, target.y),
                         stats.movement_type,
                         stats.max_movement,
+                        stats.max_range,
                         player_id,
                         &mut turn_cache,
                     );
-                    base_tile_score += (100 - turn_dist as i32).max(0) * 300;
+                    let m_dist = (current_grid.x as i32 - target.x as i32).abs()
+                        + (current_grid.y as i32 - target.y as i32).abs();
+                    let p_dist = m_dist as f32 / stats.max_movement as f32;
+                    base_tile_score += (100 - turn_dist as i32).max(0) * 1000;
+                    base_tile_score += ((100.0 - p_dist).max(0.0) * 2000.0) as i32;
                 }
             }
 
@@ -1294,6 +1374,7 @@ pub fn decide_ai_action_v2(
             if is_solo {
                 if is_combat_ineffective {
                     let mut min_recovery_dist = 99;
+                    let mut min_recovery_p = 999.0;
                     for (p_pos, p_terrain, p_owner) in &properties {
                         if *p_owner == Some(player_id)
                             && registry.can_repair_on_terrain(stats.unit_type, *p_terrain)
@@ -1306,18 +1387,29 @@ pub fn decide_ai_action_v2(
                                 (p_pos.x, p_pos.y),
                                 stats.movement_type,
                                 stats.max_movement,
+                                0,
                                 player_id,
                                 &mut turn_cache,
                             );
+                            let m = (current_grid.x as i32 - p_pos.x as i32).abs()
+                                + (current_grid.y as i32 - p_pos.y as i32).abs();
+                            let p = m as f32 / stats.max_movement as f32;
                             if d < min_recovery_dist {
                                 min_recovery_dist = d;
+                                min_recovery_p = p;
+                            } else if d == min_recovery_dist && p < min_recovery_p {
+                                min_recovery_p = p;
                             }
                         }
                     }
-                    base_tile_score += (100 - min_recovery_dist as i32).max(0) * 500;
+                    if min_recovery_dist < 99 {
+                        base_tile_score += (100 - min_recovery_dist as i32).max(0) * 1000;
+                        base_tile_score += ((100.0 - min_recovery_p).max(0.0) * 2000.0) as i32;
+                    }
                 } else if !stats.can_capture {
                     // 健全な SoloFallback: 敵ユニットに接近する
                     let mut min_target_dist = 99;
+                    let mut min_target_p = 999.0;
                     for (e_pos, _, _, _, _, _) in &enemy_units {
                         let d = calculate_turn_distance(
                             &map,
@@ -1327,15 +1419,23 @@ pub fn decide_ai_action_v2(
                             (e_pos.x, e_pos.y),
                             stats.movement_type,
                             stats.max_movement,
+                            stats.max_range,
                             player_id,
                             &mut turn_cache,
                         );
+                        let m = (current_grid.x as i32 - e_pos.x as i32).abs()
+                            + (current_grid.y as i32 - e_pos.y as i32).abs();
+                        let p = m as f32 / stats.max_movement as f32;
                         if d < min_target_dist {
                             min_target_dist = d;
+                            min_target_p = p;
+                        } else if d == min_target_dist && p < min_target_p {
+                            min_target_p = p;
                         }
                     }
                     if min_target_dist < 99 {
-                        base_tile_score += (100 - min_target_dist as i32).max(0) * 300;
+                        base_tile_score += (100 - min_target_dist as i32).max(0) * 1000;
+                        base_tile_score += ((100.0 - min_target_p).max(0.0) * 2000.0) as i32;
                     }
                 }
             }
@@ -1348,6 +1448,7 @@ pub fn decide_ai_action_v2(
 
             if is_empty_transport {
                 let mut min_base_dist = 99;
+                let mut min_base_p = 999.0;
                 for (p_pos, p_terrain, p_owner) in &properties {
                     if *p_owner == Some(player_id)
                         && registry.is_production_facility(p_terrain.as_str())
@@ -1360,15 +1461,25 @@ pub fn decide_ai_action_v2(
                             (p_pos.x, p_pos.y),
                             stats.movement_type,
                             stats.max_movement,
+                            0,
                             player_id,
                             &mut turn_cache,
                         );
+                        let m = (current_grid.x as i32 - p_pos.x as i32).abs()
+                            + (current_grid.y as i32 - p_pos.y as i32).abs();
+                        let p = m as f32 / stats.max_movement as f32;
                         if d < min_base_dist {
                             min_base_dist = d;
+                            min_base_p = p;
+                        } else if d == min_base_dist && p < min_base_p {
+                            min_base_p = p;
                         }
                     }
                 }
-                base_tile_score += (100 - min_base_dist as i32).max(0) * 500;
+                if min_base_dist < 99 {
+                    base_tile_score += (100 - min_base_dist as i32).max(0) * 1000;
+                    base_tile_score += ((100.0 - min_base_p).max(0.0) * 2000.0) as i32;
+                }
             }
 
             // (B) 歩兵の待機移動ロジック
@@ -1396,6 +1507,7 @@ pub fn decide_ai_action_v2(
                                 (cx, cy),
                                 stats.movement_type,
                                 stats.max_movement,
+                                0,
                                 player_id,
                                 &mut turn_cache,
                             );
@@ -1427,6 +1539,7 @@ pub fn decide_ai_action_v2(
 
             if effective_can_capture {
                 let mut min_objective_dist = 99;
+                let mut min_objective_p = 999.0;
                 for (p_pos, _p_terrain, p_owner) in &properties {
                     if *p_owner != Some(player_id) {
                         let d = calculate_turn_distance(
@@ -1437,18 +1550,29 @@ pub fn decide_ai_action_v2(
                             (p_pos.x, p_pos.y),
                             stats.movement_type,
                             stats.max_movement,
+                            stats.max_range,
                             player_id,
                             &mut turn_cache,
                         );
+                        let m = (current_grid.x as i32 - p_pos.x as i32).abs()
+                            + (current_grid.y as i32 - p_pos.y as i32).abs();
+                        let p = m as f32 / stats.max_movement as f32;
                         if d < min_objective_dist {
                             min_objective_dist = d;
+                            min_objective_p = p;
+                        } else if d == min_objective_dist && p < min_objective_p {
+                            min_objective_p = p;
                         }
                     }
                 }
-                base_tile_score += (100 - min_objective_dist as i32).max(0) * 400;
+                if min_objective_dist < 99 {
+                    base_tile_score += (100 - min_objective_dist as i32).max(0) * 1000;
+                    base_tile_score += ((100.0 - min_objective_p).max(0.0) * 2000.0) as i32;
+                }
             } else if is_solo {
                 // Fallback: 敵に近づく
                 let mut best_target_dist = 99;
+                let mut best_target_pos = None;
                 let mut max_potential = -1.0;
 
                 for (e_pos, e_type, e_cost, e_hp, _, _) in &enemy_units {
@@ -1460,6 +1584,7 @@ pub fn decide_ai_action_v2(
                         (e_pos.x, e_pos.y),
                         stats.movement_type,
                         stats.max_movement,
+                        stats.max_range,
                         player_id,
                         &mut turn_cache,
                     );
@@ -1491,15 +1616,18 @@ pub fn decide_ai_action_v2(
                     if potential > max_potential {
                         max_potential = potential;
                         best_target_dist = effective_dist;
+                        best_target_pos = Some(*e_pos);
                     } else if (potential - max_potential).abs() < 0.1
                         && effective_dist < best_target_dist
                     {
                         best_target_dist = effective_dist;
+                        best_target_pos = Some(*e_pos);
                     }
                 }
 
                 if max_potential <= 0.0 {
                     let mut min_dist = 99;
+                    let mut min_p = 999.0;
                     for (e_pos, _, _, _, _, _) in &enemy_units {
                         let mut d = calculate_turn_distance(
                             &map,
@@ -1509,6 +1637,7 @@ pub fn decide_ai_action_v2(
                             (e_pos.x, e_pos.y),
                             stats.movement_type,
                             stats.max_movement,
+                            stats.max_range,
                             player_id,
                             &mut turn_cache,
                         );
@@ -1526,8 +1655,18 @@ pub fn decide_ai_action_v2(
                                 d += 20;
                             }
                         }
+
+                        let m = (current_grid.x as i32 - e_pos.x as i32).abs()
+                            + (current_grid.y as i32 - e_pos.y as i32).abs();
+                        let p = m as f32 / stats.max_movement as f32;
+
                         if d < min_dist {
                             min_dist = d;
+                            min_p = p;
+                            best_target_pos = Some(*e_pos);
+                        } else if d == min_dist && p < min_p {
+                            min_p = p;
+                            best_target_pos = Some(*e_pos);
                         }
                     }
                     if min_dist == 99 {
@@ -1541,25 +1680,48 @@ pub fn decide_ai_action_v2(
                                     (p_pos.x, p_pos.y),
                                     stats.movement_type,
                                     stats.max_movement,
+                                    0,
                                     player_id,
                                     &mut turn_cache,
                                 );
+                                let m = (current_grid.x as i32 - p_pos.x as i32).abs()
+                                    + (current_grid.y as i32 - p_pos.y as i32).abs();
+                                let p = m as f32 / stats.max_movement as f32;
+
                                 if d < min_dist {
                                     min_dist = d;
+                                    min_p = p;
+                                    best_target_pos = Some(*p_pos);
+                                } else if d == min_dist && p < min_p {
+                                    min_p = p;
+                                    best_target_pos = Some(*p_pos);
                                 }
                             }
                         }
                     }
                     best_target_dist = min_dist;
+                    if min_dist < 99 {
+                        base_tile_score += (100 - min_dist as i32).max(0) * 1000;
+                        base_tile_score += ((100.0 - min_p).max(0.0) * 2000.0) as i32;
+                    }
                 }
 
                 if stats.min_range > 1 {
-                    let target_dist = stats.max_range as i32;
-                    let dist_diff = (best_target_dist as i32 - target_dist).abs();
-                    base_tile_score += (100 - dist_diff).max(0) * 100;
-
-                    if best_target_dist < stats.min_range {
-                        base_tile_score -= 2000;
+                    if let Some(t_pos) = best_target_pos {
+                        let m_dist = (current_grid.x as i32 - t_pos.x as i32).abs()
+                            + (current_grid.y as i32 - t_pos.y as i32).abs();
+                        if m_dist >= stats.min_range as i32 && m_dist <= stats.max_range as i32 {
+                            // 射程内に入った！絶好のポジション
+                            base_tile_score += 10000;
+                        } else if m_dist < stats.min_range as i32 {
+                            // 近すぎる！ペナルティ
+                            base_tile_score -= 2000;
+                        } else {
+                            // まだ遠い。ターン距離が短いほど良い
+                            base_tile_score += (100 - best_target_dist as i32).max(0) * 100;
+                        }
+                    } else {
+                        base_tile_score += (100 - best_target_dist as i32).max(0) * 100;
                     }
                 } else {
                     base_tile_score += (100 - best_target_dist as i32).max(0) * 100;
@@ -1730,33 +1892,6 @@ pub fn decide_ai_action_v2(
                 best_overall_score = best_unit_score;
                 best_overall_choice = Some((unit_entity, choice));
             }
-        }
-    }
-
-    #[cfg(debug_assertions)]
-    if let Some((entity, AiCommand::Wait { target_pos })) = &best_overall_choice {
-        if let (Some(stats), Some(pos)) = (
-            world.get::<UnitStats>(*entity),
-            world.get::<GridPosition>(*entity),
-        ) {
-            let target_str = if let Some(target) = unit_squad_targets.get(entity) {
-                format!("SquadTarget: ({}, {})", target.x, target.y)
-            } else if solo_fallbacks.contains(entity) {
-                "SoloFallback".to_string()
-            } else {
-                "NoSquad".to_string()
-            };
-            eprintln!(
-                "DEBUG_WAIT: Player {} Unit {:?} at ({}, {}) chose WAIT at ({}, {}) | {} | Score: {}",
-                player_id.0,
-                stats.unit_type,
-                pos.x,
-                pos.y,
-                target_pos.x,
-                target_pos.y,
-                target_str,
-                best_overall_score
-            );
         }
     }
 

@@ -138,6 +138,23 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                 continue;
             }
 
+            let current_ratio = if !my_units.is_empty() {
+                my_units.iter().filter(|(_, s)| s.unit_type == *ut).count() as f32
+                    / my_units.len() as f32
+            } else {
+                0.0
+            };
+            let ratio_diff =
+                strategy.ideal_composition.get(ut).copied().unwrap_or(0.0) - current_ratio;
+
+            let prod_facility_terrain = if stats.movement_type == MovementType::Ship {
+                Terrain::Port
+            } else if stats.movement_type == MovementType::Air {
+                Terrain::Airport
+            } else {
+                Terrain::Factory
+            };
+
             let score = calculate_unit_score_at(
                 *ut,
                 stats,
@@ -149,7 +166,8 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                 &master_data,
                 &map,
                 &unit_registry,
-                Terrain::Capital, // 貯金目標計算時は仮でCapital
+                prod_facility_terrain, // 適切な施設タイプを渡す
+                ratio_diff,
             );
             if score > max_score {
                 max_score = score;
@@ -225,6 +243,19 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                 // 予算制限（remaining_funds）がすでに reserve_cut を差し引いているため、
                 // この範囲内で買えるものであれば、戦闘ユニットであっても生産してよい。
 
+                let current_ratio = if !my_units.is_empty() {
+                    my_units.iter().filter(|(_, s)| s.unit_type == *ut).count() as f32
+                        / my_units.len() as f32
+                } else {
+                    0.0
+                };
+                let ratio_diff = current_strategy
+                    .ideal_composition
+                    .get(ut)
+                    .copied()
+                    .unwrap_or(0.0)
+                    - current_ratio;
+
                 // 現在の戦略（減衰後）でスコアを計算
                 let score = calculate_unit_score_at(
                     *ut,
@@ -238,6 +269,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                     &map,
                     &unit_registry,
                     *terrain,
+                    ratio_diff,
                 );
 
                 if score > best_score && score > 0 {
@@ -266,8 +298,21 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
 
             // 需要を動的に減衰させる（次の候補評価に反映）
             if cargo > 0 {
-                current_strategy.transport_demand =
-                    current_strategy.transport_demand.saturating_sub(cargo);
+                if ut == UnitType::Lander {
+                    if current_strategy.heavy_transport_demand > 0 {
+                        current_strategy.heavy_transport_demand = current_strategy
+                            .heavy_transport_demand
+                            .saturating_sub(cargo);
+                    } else {
+                        current_strategy.light_transport_demand = current_strategy
+                            .light_transport_demand
+                            .saturating_sub(cargo);
+                    }
+                } else {
+                    current_strategy.light_transport_demand = current_strategy
+                        .light_transport_demand
+                        .saturating_sub(cargo);
+                }
             }
             if can_capture {
                 current_strategy.capture_demand = current_strategy.capture_demand.saturating_sub(1);
@@ -295,6 +340,7 @@ pub fn calculate_unit_score_at(
     map: &crate::resources::Map,
     unit_registry: &UnitRegistry,
     produced_at: Terrain,
+    ratio_diff: f32,
 ) -> u32 {
     // 1. 基本スコア（敵との距離、脅威度）
     let mut min_eta = 99;
@@ -349,6 +395,9 @@ pub fn calculate_unit_score_at(
                         if stats.max_cargo == 0 {
                             // 輸送能力もないならベース値を大幅に下げる
                             base_val /= 4;
+                        } else {
+                            // 輸送能力がある場合は沿岸まで到達できれば良いのでペナルティを軽減
+                            dist -= 15; // +20されたのを+5に緩和
                         }
                     } else {
                         // 間接攻撃ユニットは多少マシにする
@@ -358,8 +407,13 @@ pub fn calculate_unit_score_at(
             }
 
             // 地形コストを考慮したETAの簡易見積もり
+            let base_terrain = if stats.movement_type == MovementType::Ship {
+                Terrain::Sea.as_str()
+            } else {
+                Terrain::Plains.as_str()
+            };
             let move_cost = master_data
-                .get_movement_cost(stats.movement_type, Terrain::Plains.as_str())
+                .get_movement_cost(stats.movement_type, base_terrain)
                 .unwrap_or(1);
             let mut eta =
                 (dist as u32 * move_cost + stats.max_movement - 1) / stats.max_movement.max(1);
@@ -474,9 +528,75 @@ pub fn calculate_unit_score_at(
         let attenuation = 1.0 / (1.0 + strategy.existing_transport_count as f32);
         score += (transport_utility * 0.15 * attenuation) as u32;
 
+        // 2.5. Lander侵攻価値スコア (Invasion Value)
+        let mut invasion_value = 0.0;
+        for target in &strategy.priority_targets {
+            let mut is_blocked = false;
+            let steps = 4;
+            for i in 1..steps {
+                let cx = pos.x as i32 + (target.x as i32 - pos.x as i32) * i / steps;
+                let cy = pos.y as i32 + (target.y as i32 - pos.y as i32) * i / steps;
+                if let Some(Terrain::Sea | Terrain::Shoal) =
+                    map.get_terrain(cx as usize, cy as usize)
+                {
+                    is_blocked = true;
+                    break;
+                }
+            }
+
+            if is_blocked {
+                let property_value = if let Some(t_terrain) = map.get_terrain(target.x, target.y) {
+                    match t_terrain {
+                        Terrain::Capital => 5000,
+                        Terrain::Factory => 3000,
+                        Terrain::Port | Terrain::Airport => 2000,
+                        _ => 1000,
+                    }
+                } else {
+                    1000
+                };
+
+                let cargo_value = strategy
+                    .transport_candidates
+                    .iter()
+                    .filter(|(_, c_stats, _)| {
+                        stats.loadable_unit_types.contains(&c_stats.unit_type)
+                    })
+                    .map(|(_, _, val)| *val)
+                    .fold(f32::MIN, |a, b| a.max(b));
+
+                if cargo_value > f32::MIN {
+                    let dist_to_target = (pos.x as i32 - target.x as i32).abs()
+                        + (pos.y as i32 - target.y as i32).abs();
+                    let transport_eta =
+                        (dist_to_target as f32) / (stats.max_movement as f32).max(1.0);
+                    invasion_value +=
+                        (property_value as f32) * cargo_value / transport_eta.max(1.0);
+                }
+            }
+        }
+        let attenuation_inv = 1.0 / (1.0 + strategy.existing_transport_count as f32);
+        score += (invasion_value * attenuation_inv * 0.002) as u32;
+
         // 輸送需要がない場合は減衰（既存ロジックの維持）
-        if strategy.transport_demand == 0 {
+        let can_load_heavy = stats.loadable_unit_types.contains(&UnitType::Tank);
+        let can_load_light = stats.loadable_unit_types.contains(&UnitType::Infantry);
+
+        let demand = if can_load_heavy && can_load_light {
+            strategy
+                .heavy_transport_demand
+                .max(strategy.light_transport_demand)
+        } else if can_load_heavy {
+            strategy.heavy_transport_demand
+        } else {
+            strategy.light_transport_demand
+        };
+
+        if demand == 0 {
             score = score.saturating_sub(3000);
+        } else {
+            // 基本的な需要ボーナス（過剰な固定加点ではなく、主役は transport_utility に任せる）
+            score += demand * 1500;
         }
     }
 
@@ -506,6 +626,49 @@ pub fn calculate_unit_score_at(
             .is_some_and(|damage| damage >= 30)
         {
             score += 300;
+        }
+    }
+
+    // 3.5. 拠点競争阻止ボーナス (Interception Score)
+    for target in &strategy.priority_targets {
+        if strategy.unowned_properties.contains(target) {
+            for (e_pos, e_stats) in enemy_units {
+                if !e_stats.can_capture {
+                    continue;
+                }
+                let enemy_dist = (e_pos.x as isize - target.x as isize).unsigned_abs()
+                    + (e_pos.y as isize - target.y as isize).unsigned_abs();
+                let enemy_eta =
+                    (enemy_dist as u32 + e_stats.max_movement - 1) / e_stats.max_movement.max(1);
+
+                let my_dist = (pos.x as isize - target.x as isize).unsigned_abs()
+                    + (pos.y as isize - target.y as isize).unsigned_abs();
+                let my_eta = (my_dist as u32 + stats.max_movement - 1) / stats.max_movement.max(1);
+
+                if enemy_eta <= my_eta {
+                    let property_value =
+                        if let Some(t_terrain) = map.get_terrain(target.x, target.y) {
+                            match t_terrain {
+                                Terrain::Capital => 5000,
+                                Terrain::Factory => 3000,
+                                Terrain::Port | Terrain::Airport => 2000,
+                                _ => 1000,
+                            }
+                        } else {
+                            1000
+                        };
+
+                    let damage_vs_enemy = damage_chart
+                        .get_base_damage(unit_type, e_stats.unit_type)
+                        .unwrap_or(0);
+
+                    if damage_vs_enemy > 0 {
+                        let interception_score =
+                            (property_value * damage_vs_enemy) / (my_eta.max(1) * 10);
+                        score += interception_score;
+                    }
+                }
+            }
         }
     }
 
@@ -558,7 +721,22 @@ pub fn calculate_unit_score_at(
     // V2は戦略的に前線を押し上げるため、平和な時期でも戦闘ユニットを生産して前線へ送る。
     // (scoreのゼロ化は行わない)
 
-    score
+    // 7. 理想構成（ideal_composition）の適用
+    let mut final_score = score as i32;
+    if ratio_diff > 0.0 {
+        // 例: 30%足りないなら 0.3 * 4000 = 1200 のボーナス
+        final_score += (ratio_diff * 4000.0) as i32;
+    } else if ratio_diff < -0.1 {
+        // 例: 10%以上過剰ならペナルティ
+        // ただし、序盤(Expansion)で占領需要が高い時は歩兵などへのペナルティを無効化する
+        if strategy.phase == GamePhase::Expansion && stats.can_capture {
+            // ペナルティなし
+        } else {
+            final_score -= 1000;
+        }
+    }
+
+    final_score.max(1) as u32
 }
 
 #[cfg(test)]
@@ -741,6 +919,7 @@ mod additional_tests {
                 &map,
                 &registry,
                 Terrain::Factory,
+                0.0,
             );
         }
 
@@ -771,6 +950,7 @@ mod additional_tests {
                 &map,
                 &registry,
                 Terrain::Factory,
+                0.0,
             );
         }
 

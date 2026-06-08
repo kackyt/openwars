@@ -8,6 +8,8 @@ pub mod objectives;
 pub mod planner;
 pub mod production;
 pub mod pruning;
+#[cfg(test)]
+pub mod scenario_tests;
 pub mod strategy;
 
 pub mod beam_search;
