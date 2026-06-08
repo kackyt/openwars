@@ -904,7 +904,7 @@ pub fn update_transport_squad_phase(world: &mut World, squad: &mut Squad) -> boo
                 .is_some_and(|t| t.0 == transport_entity);
 
             if !loaded && !transporting {
-                return true;
+                squad.phase = MissionPhase::Transport(TransportPhase::Return);
             } else if let Some(target_island_id) = squad.target_island {
                 if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() {
                     if let Some(island) =
@@ -946,7 +946,7 @@ pub fn update_transport_squad_phase(world: &mut World, squad: &mut Squad) -> boo
                 .is_some_and(|t| t.0 == transport_entity);
 
             if !loaded && !transporting {
-                return true;
+                squad.phase = MissionPhase::Transport(TransportPhase::Return);
             }
         }
         TransportPhase::Return => {

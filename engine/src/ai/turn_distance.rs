@@ -262,17 +262,26 @@ pub fn calculate_all_turn_distances(
             continue;
         }
 
+        // 逆方向探索: 順方向では next_pos から position へ移動するため、position の進入コストを加算する
+        let Some(pos_terrain) = map.get_terrain(position.0, position.1) else {
+            continue;
+        };
+        let Some(move_cost) = get_valid_movement_cost(registry, movement_type, pos_terrain) else {
+            continue;
+        };
+
         for next_pos in map.get_adjacent(position.0, position.1) {
             let Some(next_terrain) = map.get_terrain(next_pos.0, next_pos.1) else {
                 continue;
             };
 
-            let Some(move_cost) = get_valid_movement_cost(registry, movement_type, next_terrain)
-            else {
+            // 順方向の移動元(next_pos)自体が進入可能かどうかのチェック
+            if get_valid_movement_cost(registry, movement_type, next_terrain).is_none() {
                 continue;
-            };
+            }
 
             // 敵ユニットによるゾック（通行不可）判定
+            // 逆方向探索では、next_pos が味方にとって通行可能かを見る（実際には next_pos から出発するため）
             if let Some(occupant) = unit_positions.get(&next_pos) {
                 if occupant.player_id != player_id {
                     continue; // 敵がいるマスは通過不可
