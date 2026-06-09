@@ -150,11 +150,11 @@ impl AiSimulationState {
                     );
 
                     let mut best_tile = *pos;
-                    let current_turns = *dist_map.get(&pos).unwrap_or(&u32::MAX);
+                    let current_turns = *dist_map.get(&pos).unwrap_or(&crate::ai::turn_distance::TurnDistance { turns: u32::MAX, used_mp: u32::MAX });
 
-                    if current_turns != u32::MAX && current_turns > 0 {
+                    if current_turns.turns != u32::MAX && current_turns.turns > 0 {
                         // 目標までのターン数が 1 減る位置（あるいは目標そのもの）まで隣接マスを辿って高速に進む
-                        let target_turns = current_turns.saturating_sub(1);
+                        let target_turns = current_turns.turns.saturating_sub(1);
                         let mut temp_pos = *pos;
                         let mut temp_turns = current_turns;
 
@@ -173,7 +173,7 @@ impl AiSimulationState {
                                     x: next_tile.0,
                                     y: next_tile.1,
                                 };
-                                let next_dist = *dist_map.get(&next_pos).unwrap_or(&u32::MAX);
+                                let next_dist = *dist_map.get(&next_pos).unwrap_or(&crate::ai::turn_distance::TurnDistance { turns: u32::MAX, used_mp: u32::MAX });
                                 let next_manhattan = (next_pos.x as i32 - target_pos.x as i32)
                                     .abs()
                                     + (next_pos.y as i32 - target_pos.y as i32).abs();
@@ -197,7 +197,7 @@ impl AiSimulationState {
                             temp_turns = min_next_turns;
 
                             // ターン数が目標値（現在ターン-1）以下になったら終了
-                            if temp_turns <= target_turns {
+                            if temp_turns.turns <= target_turns {
                                 break;
                             }
                         }

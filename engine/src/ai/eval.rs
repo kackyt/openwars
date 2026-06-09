@@ -274,8 +274,8 @@ fn evaluate_board_v2(
                     turn_cache,
                 );
                 if let Some(&turns) = p_turns_map.get(pos) {
-                    if turns < min_turn_dist {
-                        min_turn_dist = turns;
+                    if turns.turns < min_turn_dist {
+                        min_turn_dist = turns.turns;
                     }
                 }
             }
@@ -374,7 +374,7 @@ fn evaluate_board_v2(
                 }
 
                 if let Some(&turns) = p_turns_map.get(other_pos) {
-                    if turns <= CONSOLIDATION_RADIUS_TURNS {
+                    if turns.turns <= CONSOLIDATION_RADIUS_TURNS {
                         total_nearby += 1;
                         if other_prop.owner_id == Some(owner) {
                             friendly_nearby += 1;
@@ -419,8 +419,8 @@ fn evaluate_board_v2(
                 turn_cache,
             );
             if let Some(&turns) = p_turns_map.get(u_pos) {
-                if turns < min_my_turns {
-                    min_my_turns = turns;
+                if turns.turns < min_my_turns {
+                    min_my_turns = turns.turns;
                 }
             }
         }
@@ -440,8 +440,8 @@ fn evaluate_board_v2(
                 turn_cache,
             );
             if let Some(&turns) = p_turns_map.get(u_pos) {
-                if turns < min_enemy_turns {
-                    min_enemy_turns = turns;
+                if turns.turns < min_enemy_turns {
+                    min_enemy_turns = turns.turns;
                 }
             }
         }

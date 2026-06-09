@@ -435,7 +435,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
             // ---------------------------------------------------------
             let mut best_cargo_idx = None;
             let mut is_combat_cargo = true;
-            let mut min_turn_dist = u32::MAX;
+            let mut min_turn_dist = crate::ai::turn_distance::TurnDistance { turns: u32::MAX, used_mp: u32::MAX };
 
             // 重車両から探す
             for (i, (_, pos, stats)) in free_combat_units.iter().enumerate() {
@@ -567,7 +567,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                 &mut turn_cache,
             );
 
-            if turn_dist <= 5 {
+            if turn_dist.turns <= 5 {
                 // すでにこのクラスターを防衛目標としている部隊があるか
                 let exists = manager.squads.iter().any(|s| {
                     s.mission_type == MissionType::Defense && s.target == Some(cluster.center)
@@ -701,7 +701,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
 
         // ステップ1: 定員未満の既存 Attack/Defense 部隊のうち、最も近いものを探す
         let mut best_squad_idx = None;
-        let mut min_dist = u32::MAX;
+        let mut min_dist = crate::ai::turn_distance::TurnDistance { turns: u32::MAX, used_mp: u32::MAX };
 
         for (idx, squad) in manager.squads.iter().enumerate() {
             if (squad.mission_type == MissionType::Attack
@@ -735,7 +735,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         } else {
             // ステップ2: 既存部隊がすべて定員に達している場合、
             // 最も近い敵クラスターを目標とする新規 Attack 部隊（第2波）を新設する
-            let mut nearest_cluster_dist = u32::MAX;
+            let mut nearest_cluster_dist = crate::ai::turn_distance::TurnDistance { turns: u32::MAX, used_mp: u32::MAX };
             let mut nearest_cluster_center = None;
 
             for cluster in &enemy_clusters {
@@ -759,7 +759,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
 
             let final_target;
             // 敵が15ターン以上遠い場合や存在しない場合は、最寄りの拠点（未占領または敵所有）を目標にする
-            if nearest_cluster_dist <= 15 {
+            if nearest_cluster_dist.turns <= 15 {
                 final_target = nearest_cluster_center;
             } else {
                 let mut nearest_prop_dist = u32::MAX;
@@ -1088,7 +1088,7 @@ pub fn execute_transport_squad_step(
                     let dy = target_tile.1 as i32 - cargo_pos.y as i32;
                     let m_dist = dx.abs() + dy.abs();
                     let e_dist_sq = dx * dx + dy * dy;
-                    let score = t_dist as f32
+                    let score = t_dist.turns as f32
                         + (m_dist as f32 / 1_000.0)
                         + (e_dist_sq as f32 / 10_000_000.0)
                         + (target_tile.0 as f32 / 100_000_000.0)
@@ -1166,7 +1166,7 @@ pub fn execute_transport_squad_step(
                     let dy = target_tile.1 as i32 - t_pos.y as i32;
                     let m_dist = dx.abs() + dy.abs();
                     let e_dist_sq = dx * dx + dy * dy;
-                    let score = t_dist as f32
+                    let score = t_dist.turns as f32
                         + (m_dist as f32 / 1_000.0)
                         + (e_dist_sq as f32 / 10_000_000.0)
                         + (target_tile.0 as f32 / 100_000_000.0)
@@ -1284,7 +1284,7 @@ pub fn execute_transport_squad_step(
                         // ユークリッド距離の2乗（直線的な経路を好むようにする）
                         let e_dist_sq = dx * dx + dy * dy;
                         // タイブレーク: 1. ターン数 2. マンハッタン距離 3. ユークリッド距離(直線重視) 4. 座標(確定的決定)
-                        let score = t_dist as f32
+                        let score = t_dist.turns as f32
                             + (m_dist as f32 / 1_000.0)
                             + (e_dist_sq as f32 / 10_000_000.0)
                             + (target_tile.0 as f32 / 100_000_000.0)
@@ -1422,7 +1422,7 @@ pub fn execute_transport_squad_step(
                                     );
                                     let m_dist = (target_tile.0 as i32 - target_pos.x as i32).abs()
                                         + (target_tile.1 as i32 - target_pos.y as i32).abs();
-                                    let score = t_dist as f32 + (m_dist as f32 / 1000.0);
+                                    let score = t_dist.turns as f32 + (m_dist as f32 / 1000.0);
 
                                     if score < min_turn_dist {
                                         min_turn_dist = score;
@@ -1486,7 +1486,7 @@ pub fn execute_transport_squad_step(
                 let dy = target_tile.1 as i32 - nearest_prop_pos.y as i32;
                 let m_dist = dx.abs() + dy.abs();
                 let e_dist_sq = dx * dx + dy * dy;
-                let score = t_dist as f32
+                let score = t_dist.turns as f32
                     + (m_dist as f32 / 1_000.0)
                     + (e_dist_sq as f32 / 10_000_000.0)
                     + (target_tile.0 as f32 / 100_000_000.0)

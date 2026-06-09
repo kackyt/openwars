@@ -106,7 +106,7 @@ pub fn detect_enemy_clusters(
                         &mut turn_cache,
                     );
 
-                    if turn_dist <= 2 && turn_dist_rev <= 2 {
+                    if turn_dist.turns <= 2 && turn_dist_rev.turns <= 2 {
                         visited.insert(enemy_units[j].0);
                         queue.push(enemy_units[j].clone());
                     }

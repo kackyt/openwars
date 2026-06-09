@@ -88,20 +88,20 @@ fn enemy_threatens_property(
         turn_cache,
     );
 
-    if dist == u32::MAX {
+    if dist.turns == u32::MAX {
         return false;
     }
 
     match enemy_stats.movement_type {
         MovementType::Air => {
             let has_weapons = enemy_stats.max_ammo1 > 0 || enemy_stats.max_ammo2 > 0;
-            has_weapons && dist <= 2
+            has_weapons && dist.turns <= 2
         }
         MovementType::Ship => {
             let has_weapons = enemy_stats.max_ammo1 > 0 || enemy_stats.max_ammo2 > 0;
-            has_weapons && dist <= 2
+            has_weapons && dist.turns <= 2
         }
-        _ => dist <= 2,
+        _ => dist.turns <= 2,
     }
 }
 
@@ -253,7 +253,7 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                 enemy_id,
                 &mut turn_cache,
             );
-            if dist <= 2 {
+            if dist.turns <= 2 {
                 capital_threatened = true;
                 break;
             }

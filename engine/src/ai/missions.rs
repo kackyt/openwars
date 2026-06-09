@@ -511,7 +511,7 @@ pub fn execute_mission_step(
 
                     // 降車可能な場所が見つからない場合は、従来通り目標島に最も近づく
                     let mut best_tile = t_pos;
-                    let mut min_dist = 999;
+                    let mut min_dist = u32::MAX;
                     let map = world.resource::<Map>();
                     let registry = world.resource::<MasterDataRegistry>();
                     let mut turn_cache = crate::ai::turn_distance::TurnDistanceCache::default();
@@ -529,8 +529,8 @@ pub fn execute_mission_step(
                             t_faction,
                             &mut turn_cache,
                         );
-                        if dist < min_dist {
-                            min_dist = dist;
+                        if dist.turns < min_dist {
+                            min_dist = dist.turns;
                             best_tile = GridPosition {
                                 x: target_tile.0,
                                 y: target_tile.1,
