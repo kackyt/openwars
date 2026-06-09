@@ -1064,7 +1064,7 @@ pub fn execute_transport_squad_step(
                 && !skip_entities.contains(&transport_entity)
             {
                 let mut best_tile = t_pos;
-                let mut min_turn_dist = 999.0;
+                let mut min_score = None;
 
                 let mut cache = crate::ai::turn_distance::TurnDistanceCache::default();
                 let map = world.resource::<Map>();
@@ -1087,15 +1087,10 @@ pub fn execute_transport_squad_step(
                     let dx = target_tile.0 as i32 - cargo_pos.x as i32;
                     let dy = target_tile.1 as i32 - cargo_pos.y as i32;
                     let m_dist = dx.abs() + dy.abs();
-                    let e_dist_sq = dx * dx + dy * dy;
-                    let score = t_dist.turns as f32
-                        + (m_dist as f32 / 1_000.0)
-                        + (e_dist_sq as f32 / 10_000_000.0)
-                        + (target_tile.0 as f32 / 100_000_000.0)
-                        + (target_tile.1 as f32 / 1_000_000_000.0);
+                    let score = (t_dist, m_dist, target_tile.0, target_tile.1);
 
-                    if score < min_turn_dist {
-                        min_turn_dist = score;
+                    if min_score.map_or(true, |m| score < m) {
+                        min_score = Some(score);
                         best_tile = GridPosition {
                             x: target_tile.0,
                             y: target_tile.1,
@@ -1142,7 +1137,7 @@ pub fn execute_transport_squad_step(
                 };
 
                 let mut best_tile = cargo_pos;
-                let mut min_turn_dist = 999.0;
+                let mut min_score = None;
 
                 let mut cache = crate::ai::turn_distance::TurnDistanceCache::default();
                 let map = world.resource::<Map>();
@@ -1165,15 +1160,10 @@ pub fn execute_transport_squad_step(
                     let dx = target_tile.0 as i32 - t_pos.x as i32;
                     let dy = target_tile.1 as i32 - t_pos.y as i32;
                     let m_dist = dx.abs() + dy.abs();
-                    let e_dist_sq = dx * dx + dy * dy;
-                    let score = t_dist.turns as f32
-                        + (m_dist as f32 / 1_000.0)
-                        + (e_dist_sq as f32 / 10_000_000.0)
-                        + (target_tile.0 as f32 / 100_000_000.0)
-                        + (target_tile.1 as f32 / 1_000_000_000.0);
+                    let score = (t_dist, m_dist, target_tile.0, target_tile.1);
 
-                    if score < min_turn_dist {
-                        min_turn_dist = score;
+                    if min_score.map_or(true, |m| score < m) {
+                        min_score = Some(score);
                         best_tile = GridPosition {
                             x: target_tile.0,
                             y: target_tile.1,
@@ -1258,7 +1248,7 @@ pub fn execute_transport_squad_step(
                     }
 
                     let mut best_tile = t_pos;
-                    let mut min_turn_dist = 999.0;
+                    let mut min_score = None;
 
                     let mut cache = crate::ai::turn_distance::TurnDistanceCache::default();
                     let map = world.resource::<Map>();
@@ -1281,17 +1271,10 @@ pub fn execute_transport_squad_step(
                         let dx = target_tile.0 as i32 - target_pos.x as i32;
                         let dy = target_tile.1 as i32 - target_pos.y as i32;
                         let m_dist = dx.abs() + dy.abs();
-                        // ユークリッド距離の2乗（直線的な経路を好むようにする）
-                        let e_dist_sq = dx * dx + dy * dy;
-                        // タイブレーク: 1. ターン数 2. マンハッタン距離 3. ユークリッド距離(直線重視) 4. 座標(確定的決定)
-                        let score = t_dist.turns as f32
-                            + (m_dist as f32 / 1_000.0)
-                            + (e_dist_sq as f32 / 10_000_000.0)
-                            + (target_tile.0 as f32 / 100_000_000.0)
-                            + (target_tile.1 as f32 / 1_000_000_000.0);
+                        let score = (t_dist, m_dist, target_tile.0, target_tile.1);
 
-                        if score < min_turn_dist {
-                            min_turn_dist = score;
+                        if min_score.map_or(true, |m| score < m) {
+                            min_score = Some(score);
                             best_tile = GridPosition {
                                 x: target_tile.0,
                                 y: target_tile.1,
@@ -1401,7 +1384,7 @@ pub fn execute_transport_squad_step(
                                 t_stats.movement_type,
                             ) {
                                 let mut best_tile = t_pos;
-                                let mut min_turn_dist = 999.0;
+                                let mut min_score = None;
                                 let mut cache =
                                     crate::ai::turn_distance::TurnDistanceCache::default();
                                 let map = world.resource::<Map>();
@@ -1422,10 +1405,10 @@ pub fn execute_transport_squad_step(
                                     );
                                     let m_dist = (target_tile.0 as i32 - target_pos.x as i32).abs()
                                         + (target_tile.1 as i32 - target_pos.y as i32).abs();
-                                    let score = t_dist.turns as f32 + (m_dist as f32 / 1000.0);
+                                    let score = (t_dist, m_dist, target_tile.0, target_tile.1);
 
-                                    if score < min_turn_dist {
-                                        min_turn_dist = score;
+                                    if min_score.map_or(true, |m| score < m) {
+                                        min_score = Some(score);
                                         best_tile = GridPosition {
                                             x: target_tile.0,
                                             y: target_tile.1,

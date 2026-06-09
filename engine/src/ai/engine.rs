@@ -1373,8 +1373,7 @@ pub fn decide_ai_action_v2(
             // 2. SoloFallback / 孤立・戦闘不能のインセンティブ
             if is_solo {
                 if is_combat_ineffective {
-                    let mut min_recovery_dist = u32::MAX;
-                    let mut min_recovery_p = 999.0;
+                    let mut min_score: Option<(crate::ai::turn_distance::TurnDistance, i32)> = None;
                     for (p_pos, p_terrain, p_owner) in &properties {
                         if *p_owner == Some(player_id)
                             && registry.can_repair_on_terrain(stats.unit_type, *p_terrain)
@@ -1393,23 +1392,22 @@ pub fn decide_ai_action_v2(
                             );
                             let m = (current_grid.x as i32 - p_pos.x as i32).abs()
                                 + (current_grid.y as i32 - p_pos.y as i32).abs();
-                            let p = m as f32 / stats.max_movement as f32;
-                            if d.turns < min_recovery_dist {
-                                min_recovery_dist = d.turns;
-                                min_recovery_p = p;
-                            } else if d.turns == min_recovery_dist && p < min_recovery_p {
-                                min_recovery_p = p;
+                            let score = (d, m);
+                            if min_score.map_or(true, |min| score < min) {
+                                min_score = Some(score);
                             }
                         }
                     }
-                    if min_recovery_dist < 99 {
-                        base_tile_score += (100 - min_recovery_dist as i32).max(0) * 1000;
-                        base_tile_score += ((100.0 - min_recovery_p).max(0.0) * 2000.0) as i32;
+                    if let Some((d, m)) = min_score {
+                        if d.turns < 99 {
+                            let p = m as f32 / stats.max_movement as f32;
+                            base_tile_score += (100 - d.turns as i32).max(0) * 1000;
+                            base_tile_score += ((100.0 - p).max(0.0) * 2000.0) as i32;
+                        }
                     }
                 } else if !stats.can_capture {
                     // 健全な SoloFallback: 敵ユニットに接近する
-                    let mut min_target_dist = u32::MAX;
-                    let mut min_target_p = 999.0;
+                    let mut min_score: Option<(crate::ai::turn_distance::TurnDistance, i32)> = None;
                     for (e_pos, _, _, _, _, _) in &enemy_units {
                         let d = calculate_turn_distance(
                             &map,
@@ -1425,17 +1423,17 @@ pub fn decide_ai_action_v2(
                         );
                         let m = (current_grid.x as i32 - e_pos.x as i32).abs()
                             + (current_grid.y as i32 - e_pos.y as i32).abs();
-                        let p = m as f32 / stats.max_movement as f32;
-                        if d.turns < min_target_dist {
-                            min_target_dist = d.turns;
-                            min_target_p = p;
-                        } else if d.turns == min_target_dist && p < min_target_p {
-                            min_target_p = p;
+                        let score = (d, m);
+                        if min_score.map_or(true, |min| score < min) {
+                            min_score = Some(score);
                         }
                     }
-                    if min_target_dist < 99 {
-                        base_tile_score += (100 - min_target_dist as i32).max(0) * 1000;
-                        base_tile_score += ((100.0 - min_target_p).max(0.0) * 2000.0) as i32;
+                    if let Some((d, m)) = min_score {
+                        if d.turns < 99 {
+                            let p = m as f32 / stats.max_movement as f32;
+                            base_tile_score += (100 - d.turns as i32).max(0) * 1000;
+                            base_tile_score += ((100.0 - p).max(0.0) * 2000.0) as i32;
+                        }
                     }
                 }
             }
@@ -1447,8 +1445,7 @@ pub fn decide_ai_action_v2(
                     .is_some_and(|c| c.loaded.is_empty());
 
             if is_empty_transport {
-                let mut min_base_dist = u32::MAX;
-                let mut min_base_p = 999.0;
+                let mut min_score: Option<(crate::ai::turn_distance::TurnDistance, i32)> = None;
                 for (p_pos, p_terrain, p_owner) in &properties {
                     if *p_owner == Some(player_id)
                         && registry.is_production_facility(p_terrain.as_str())
@@ -1467,18 +1464,18 @@ pub fn decide_ai_action_v2(
                         );
                         let m = (current_grid.x as i32 - p_pos.x as i32).abs()
                             + (current_grid.y as i32 - p_pos.y as i32).abs();
-                        let p = m as f32 / stats.max_movement as f32;
-                        if d.turns < min_base_dist {
-                            min_base_dist = d.turns;
-                            min_base_p = p;
-                        } else if d.turns == min_base_dist && p < min_base_p {
-                            min_base_p = p;
+                        let score = (d, m);
+                        if min_score.map_or(true, |min| score < min) {
+                            min_score = Some(score);
                         }
                     }
                 }
-                if min_base_dist < 99 {
-                    base_tile_score += (100 - min_base_dist as i32).max(0) * 1000;
-                    base_tile_score += ((100.0 - min_base_p).max(0.0) * 2000.0) as i32;
+                if let Some((d, m)) = min_score {
+                    if d.turns < 99 {
+                        let p = m as f32 / stats.max_movement as f32;
+                        base_tile_score += (100 - d.turns as i32).max(0) * 1000;
+                        base_tile_score += ((100.0 - p).max(0.0) * 2000.0) as i32;
+                    }
                 }
             }
 
@@ -1538,8 +1535,7 @@ pub fn decide_ai_action_v2(
             }
 
             if effective_can_capture {
-                let mut min_objective_dist = u32::MAX;
-                let mut min_objective_p = 999.0;
+                let mut min_score: Option<(crate::ai::turn_distance::TurnDistance, i32)> = None;
                 for (p_pos, _p_terrain, p_owner) in &properties {
                     if *p_owner != Some(player_id) {
                         let d = calculate_turn_distance(
@@ -1556,18 +1552,18 @@ pub fn decide_ai_action_v2(
                         );
                         let m = (current_grid.x as i32 - p_pos.x as i32).abs()
                             + (current_grid.y as i32 - p_pos.y as i32).abs();
-                        let p = m as f32 / stats.max_movement as f32;
-                        if d.turns < min_objective_dist {
-                            min_objective_dist = d.turns;
-                            min_objective_p = p;
-                        } else if d.turns == min_objective_dist && p < min_objective_p {
-                            min_objective_p = p;
+                        let score = (d, m);
+                        if min_score.map_or(true, |min| score < min) {
+                            min_score = Some(score);
                         }
                     }
                 }
-                if min_objective_dist < 99 {
-                    base_tile_score += (100 - min_objective_dist as i32).max(0) * 1000;
-                    base_tile_score += ((100.0 - min_objective_p).max(0.0) * 2000.0) as i32;
+                if let Some((d, m)) = min_score {
+                    if d.turns < 99 {
+                        let p = m as f32 / stats.max_movement as f32;
+                        base_tile_score += (100 - d.turns as i32).max(0) * 1000;
+                        base_tile_score += ((100.0 - p).max(0.0) * 2000.0) as i32;
+                    }
                 }
             } else if is_solo {
                 // Fallback: 敵に近づく
@@ -1626,8 +1622,7 @@ pub fn decide_ai_action_v2(
                 }
 
                 if max_potential <= 0.0 {
-                    let mut min_dist: i32 = 999;
-                    let mut min_p = 999.0;
+                    let mut min_score: Option<(crate::ai::turn_distance::TurnDistance, i32)> = None;
                     for (e_pos, _, _, _, _, _) in &enemy_units {
                         let mut d = calculate_turn_distance(
                             &map,
@@ -1658,18 +1653,14 @@ pub fn decide_ai_action_v2(
 
                         let m = (current_grid.x as i32 - e_pos.x as i32).abs()
                             + (current_grid.y as i32 - e_pos.y as i32).abs();
-                        let p = m as f32 / stats.max_movement as f32;
+                        let score = (d, m);
 
-                        if (d.turns as i32) < min_dist {
-                            min_dist = d.turns as i32;
-                            min_p = p;
-                            best_target_pos = Some(*e_pos);
-                        } else if (d.turns as i32) == min_dist && p < min_p {
-                            min_p = p;
+                        if min_score.map_or(true, |min| score < min) {
+                            min_score = Some(score);
                             best_target_pos = Some(*e_pos);
                         }
                     }
-                    if min_dist == 99 {
+                    if min_score.is_none() || min_score.unwrap().0.turns >= 99 {
                         for (p_pos, _, p_owner) in &properties {
                             if *p_owner != Some(player_id) {
                                 let d = calculate_turn_distance(
@@ -1686,23 +1677,22 @@ pub fn decide_ai_action_v2(
                                 );
                                 let m = (current_grid.x as i32 - p_pos.x as i32).abs()
                                     + (current_grid.y as i32 - p_pos.y as i32).abs();
-                                let p = m as f32 / stats.max_movement as f32;
+                                let score = (d, m);
 
-                                if (d.turns as i32) < min_dist {
-                                    min_dist = d.turns as i32;
-                                    min_p = p;
-                                    best_target_pos = Some(*p_pos);
-                                } else if (d.turns as i32) == min_dist && p < min_p {
-                                    min_p = p;
+                                if min_score.map_or(true, |min| score < min) {
+                                    min_score = Some(score);
                                     best_target_pos = Some(*p_pos);
                                 }
                             }
                         }
                     }
-                    best_target_dist = min_dist;
-                    if min_dist < 99 {
-                        base_tile_score += (100 - min_dist as i32).max(0) * 1000;
-                        base_tile_score += ((100.0 - min_p).max(0.0) * 2000.0) as i32;
+                    if let Some((d, m)) = min_score {
+                        best_target_dist = d.turns as i32;
+                        if d.turns < 99 {
+                            let p = m as f32 / stats.max_movement as f32;
+                            base_tile_score += (100 - d.turns as i32).max(0) * 1000;
+                            base_tile_score += ((100.0 - p).max(0.0) * 2000.0) as i32;
+                        }
                     }
                 }
 
