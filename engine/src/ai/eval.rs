@@ -288,7 +288,7 @@ fn evaluate_board_v2(
                     || stats.movement_type == crate::resources::MovementType::Ship
                     || stats.max_cargo > 0;
                 if is_offensive_or_transport { 1.0 } else { 0.7 }
-            } else if min_turn_dist >= 3 {
+            } else if min_turns >= 3 {
                 let is_offensive_or_transport = stats.movement_type
                     == crate::resources::MovementType::Air
                     || stats.movement_type == crate::resources::MovementType::Ship

@@ -598,6 +598,14 @@ pub fn calculate_unit_score_at(
             // 基本的な需要ボーナス（過剰な固定加点ではなく、主役は transport_utility に任せる）
             score += demand * 1500;
         }
+
+        // 輸送機を持ちすぎている場合は強力なペナルティを課す
+        if strategy.existing_transport_count >= 1 {
+            score = (score as f32 * 0.5) as u32; // 2台目以降は半減
+        }
+        if strategy.existing_transport_count >= 2 {
+            score = score.saturating_sub(2000); // 3台目以降はさらに減点
+        }
     }
 
     // 港での艦船ボーナス
@@ -698,19 +706,7 @@ pub fn calculate_unit_score_at(
         }
     }
 
-    // 5. 包括的需要ドット積ボーナス（Potential Impact Model）
-    // DemandMatrix（自軍の能力の欠け）とユニット適性のドット積で加点する。
-    // 既存のフェーズボーナス・アンチボーナスと共存させ、相乗効果で航空等の専門需要を反映する。
-    {
-        // DEMAND_WEIGHT: 需要が最大値(1.0)のとき、フェーズボーナス(最大1500)を上回る値に設定
-        const DEMAND_WEIGHT: f32 = 4000.0; // 若干強化
-        let normalization_scale =
-            crate::ai::demand::average_attack_expectation(damage_chart, unit_registry);
-        let affinity =
-            compute_unit_affinity(unit_type, damage_chart, unit_registry, normalization_scale);
-        let demand_score = strategy.demand.dot(&affinity) * DEMAND_WEIGHT;
-        score += demand_score as u32;
-    }
+    // 5. 削除済（かつてのDemandMatrixによる加算ブロックがあった場所）
 
     // 6. コストに応じたボーナスを追加して強力なユニットを作りやすくする
     if !stats.can_capture && stats.max_cargo == 0 && !stats.can_supply {
