@@ -34,7 +34,7 @@ pub fn evaluate_board(
 // ==========================================
 // 従来型 AI 用の簡易評価ロジック (V1)
 // ==========================================
-fn evaluate_board_v1(world: &mut World, perspective_player: PlayerId) -> i32 {
+pub fn evaluate_board_v1(world: &mut World, perspective_player: PlayerId) -> i32 {
     let mut score = 0;
 
     let mut capturing_props = HashMap::new();

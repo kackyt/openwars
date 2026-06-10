@@ -121,6 +121,25 @@ impl OpenWarsAiServer {
         }
     }
 
+    #[tool(description = "Evaluates the board objectively (always uses V1 logic).")]
+    async fn evaluate_board_objective(
+        &self,
+        Parameters(args): Parameters<EvaluateBoardArgs>,
+    ) -> Result<String, String> {
+        let mut state_lock = self.state.lock().await;
+        if let Some(state) = state_lock.as_mut() {
+            let player_id = parse_player_id(args.player_id)?;
+            let score = engine::ai::eval::evaluate_board_v1(&mut state.world, player_id);
+            Ok(serde_json::json!({
+                "player_id": args.player_id,
+                "score": score
+            })
+            .to_string())
+        } else {
+            Err("Map not loaded".into())
+        }
+    }
+
     #[tool(description = "Sets the AI version for a specific player.")]
     async fn set_player_ai_version(
         &self,
