@@ -259,7 +259,7 @@ fn evaluate_board_v2(
             } else {
                 &enemy_production_bases
             };
-            let mut min_turn_dist = 99;
+            let mut min_turn_dist = None;
 
             for &p_pos in target_production_bases {
                 let p_turns_map = crate::ai::turn_distance::calculate_all_turn_distances_cached(
@@ -274,13 +274,15 @@ fn evaluate_board_v2(
                     turn_cache,
                 );
                 if let Some(&turns) = p_turns_map.get(pos) {
-                    if turns.turns < min_turn_dist {
-                        min_turn_dist = turns.turns;
+                    if min_turn_dist.map_or(true, |m| turns < m) {
+                        min_turn_dist = Some(turns);
                     }
                 }
             }
 
-            let isolation_modifier = if min_turn_dist > 5 {
+            let min_turns = min_turn_dist.map(|d| d.turns).unwrap_or(99);
+
+            let isolation_modifier = if min_turns > 5 {
                 let is_offensive_or_transport = stats.movement_type
                     == crate::resources::MovementType::Air
                     || stats.movement_type == crate::resources::MovementType::Ship
@@ -405,7 +407,7 @@ fn evaluate_board_v2(
 
     for (p_pos, _) in &properties {
         // 自軍の最短到達ターン数を計算 (拠点始点 SSSP から逆引き)
-        let mut min_my_turns = 99;
+        let mut min_my_dist = None;
         for (u_pos, u_movement_type, u_max_movement, u_faction) in &my_unit_distances {
             let p_turns_map = crate::ai::turn_distance::calculate_all_turn_distances_cached(
                 &map,
@@ -419,14 +421,14 @@ fn evaluate_board_v2(
                 turn_cache,
             );
             if let Some(&turns) = p_turns_map.get(u_pos) {
-                if turns.turns < min_my_turns {
-                    min_my_turns = turns.turns;
+                if min_my_dist.map_or(true, |m| turns < m) {
+                    min_my_dist = Some(turns);
                 }
             }
         }
 
         // 敵軍の最短到達ターン数を計算 (拠点始点 SSSP から逆引き)
-        let mut min_enemy_turns = 99;
+        let mut min_enemy_dist = None;
         for (u_pos, u_movement_type, u_max_movement, u_faction) in &enemy_unit_distances {
             let p_turns_map = crate::ai::turn_distance::calculate_all_turn_distances_cached(
                 &map,
@@ -440,15 +442,18 @@ fn evaluate_board_v2(
                 turn_cache,
             );
             if let Some(&turns) = p_turns_map.get(u_pos) {
-                if turns.turns < min_enemy_turns {
-                    min_enemy_turns = turns.turns;
+                if min_enemy_dist.map_or(true, |m| turns < m) {
+                    min_enemy_dist = Some(turns);
                 }
             }
         }
 
-        if min_my_turns < min_enemy_turns {
+        let my_dist = min_my_dist.unwrap_or(crate::ai::turn_distance::TurnDistance { turns: 99, used_mp: 99999 });
+        let enemy_dist = min_enemy_dist.unwrap_or(crate::ai::turn_distance::TurnDistance { turns: 99, used_mp: 99999 });
+
+        if my_dist < enemy_dist {
             my_dominated_count += 1;
-        } else if min_enemy_turns < min_my_turns {
+        } else if enemy_dist < my_dist {
             enemy_dominated_count += 1;
         }
     }
