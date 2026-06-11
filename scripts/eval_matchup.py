@@ -137,6 +137,8 @@ def run_single_game(map_name, p1_ver, p2_ver, max_turns, ui_callback=None):
         s2 = call_tool("evaluate_board", {"player_id": 2})
         m["p1_score"] = s1.get("score", 0) if isinstance(s1, dict) else 0
         m["p2_score"] = s2.get("score", 0) if isinstance(s2, dict) else 0
+        m["p1_metrics"] = s1.get("metrics", {}) if isinstance(s1, dict) else {}
+        m["p2_metrics"] = s2.get("metrics", {}) if isinstance(s2, dict) else {}
 
         for player in p_info:
             pid = player.get("player_id")
@@ -298,6 +300,23 @@ def generate_report(results):
             p2_act = "<br>".join([f"{k}: {v}" for k, v in g['p2_actions'].items()]) if g['p2_actions'] else "None"
             report.append(f"| {g['matchup']} | **{g['result']}** | {g['turns']} | {p1_act} | {p2_act} |")
         report.append("\n")
+        
+        # メトリクス（支配面積・NPV推移）の表を追加
+        report.append("#### 📈 AI 内部評価値 (Metrics) の推移")
+        report.append("| ターン | P1 (V2/V1) 支配拠点数 | P1 支配面積 | P1 NPV | P2 (V1/V2) 支配拠点数 | P2 支配面積 | P2 NPV |")
+        report.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+        for g in games:
+            report.append(f"*(Game Result: {g['result']})*")
+            for i, m in enumerate(g['metrics']):
+                if i % 5 == 0 or i == len(g['metrics']) - 1: # 5ターンごと、または最終ターン
+                    p1_m = m.get("p1_metrics", {})
+                    p2_m = m.get("p2_metrics", {})
+                    p1_dom = p1_m.get("my_dominated_count", 0)
+                    p1_npv = p1_m.get("npv_score", 0)
+                    p2_dom = p2_m.get("my_dominated_count", 0)
+                    p2_npv = p2_m.get("npv_score", 0)
+                    report.append(f"| {m['turn']} | {m['p1_props']} | {p1_dom} | {p1_npv} | {m['p2_props']} | {p2_dom} | {p2_npv} |")
+            report.append("\n")
         
     return "\n".join(report)
 

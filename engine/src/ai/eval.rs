@@ -11,6 +11,15 @@ use std::collections::HashMap;
 const TERRITORY_WEIGHT: i32 = 2500;
 const CONSOLIDATION_RADIUS_TURNS: u32 = 2;
 
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct BoardMetrics {
+    pub total_score: i32,
+    pub my_dominated_count: i32,
+    pub enemy_dominated_count: i32,
+    pub npv_score: i32,
+    pub roi_score: i32,
+}
+
 /// 盤面の静的評価関数。
 /// プレイヤーごとの AI バージョン (V1 / V2) に応じて評価ロジックを切り替えます。
 pub fn evaluate_board(
@@ -18,6 +27,14 @@ pub fn evaluate_board(
     perspective_player: PlayerId,
     cache: Option<&mut crate::ai::turn_distance::AiTurnCache>,
 ) -> i32 {
+    evaluate_board_with_metrics(world, perspective_player, cache).total_score
+}
+
+pub fn evaluate_board_with_metrics(
+    world: &mut World,
+    perspective_player: PlayerId,
+    cache: Option<&mut crate::ai::turn_distance::AiTurnCache>,
+) -> BoardMetrics {
     let ai_version = {
         let settings = world.get_resource::<PlayerAiSettings>();
         settings
@@ -34,7 +51,7 @@ pub fn evaluate_board(
 // ==========================================
 // 従来型 AI 用の簡易評価ロジック (V1)
 // ==========================================
-pub fn evaluate_board_v1(world: &mut World, perspective_player: PlayerId) -> i32 {
+pub fn evaluate_board_v1(world: &mut World, perspective_player: PlayerId) -> BoardMetrics {
     let mut score = 0;
 
     let mut capturing_props = HashMap::new();
@@ -129,7 +146,13 @@ pub fn evaluate_board_v1(world: &mut World, perspective_player: PlayerId) -> i32
     }
     score += (my_territory - enemy_territory) * TERRITORY_WEIGHT;
 
-    score
+    BoardMetrics {
+        total_score: score,
+        my_dominated_count: my_territory,
+        enemy_dominated_count: enemy_territory,
+        npv_score: 0,
+        roi_score: 0,
+    }
 }
 
 // ==========================================
@@ -139,14 +162,18 @@ fn evaluate_board_v2(
     world: &mut World,
     perspective_player: PlayerId,
     cache: Option<&mut crate::ai::turn_distance::AiTurnCache>,
-) -> i32 {
+) -> BoardMetrics {
     let mut score = 0;
+    let mut my_npv = 0;
+    let mut enemy_npv = 0;
 
     let map = world.resource::<Map>().clone();
-    let registry = world
-        .get_resource::<MasterDataRegistry>()
-        .cloned()
-        .unwrap_or_default();
+    let registry = world.resource::<MasterDataRegistry>().clone();
+
+    let current_turn = world
+        .get_resource::<crate::resources::MatchState>()
+        .map(|ms| ms.current_turn_number.0)
+        .unwrap_or(1);
 
     // 占有情報（TurnDistance用）
     let mut unit_positions = HashMap::new();
@@ -401,12 +428,21 @@ fn evaluate_board_v2(
         }
     }
 
-    // 3. 領域支配スコアの本実装 (最短到達ターン数での支配者判定)
+    // 3. 領域支配スコアの本実装
     let mut my_dominated_count = 0;
     let mut enemy_dominated_count = 0;
 
-    for (p_pos, _) in &properties {
-        // 自軍の最短到達ターン数を計算 (拠点始点 SSSP から逆引き)
+    for (p_pos, prop) in &properties {
+        // すでに占領済みの拠点は、無条件でそのプレイヤーの支配領域としてカウントする
+        if prop.owner_id == Some(perspective_player) {
+            my_dominated_count += 1;
+            continue;
+        } else if prop.owner_id.is_some() {
+            enemy_dominated_count += 1;
+            continue;
+        }
+
+        // 未占領（中立）の拠点についてのみ、最短到達ターン数で支配を仮判定する
         let mut min_my_dist = None;
         for (u_pos, u_movement_type, u_max_movement, u_faction) in &my_unit_distances {
             let p_turns_map = crate::ai::turn_distance::calculate_all_turn_distances_cached(
@@ -460,7 +496,13 @@ fn evaluate_board_v2(
 
     score += (my_dominated_count - enemy_dominated_count) * TERRITORY_WEIGHT;
 
-    score
+    BoardMetrics {
+        total_score: score,
+        my_dominated_count,
+        enemy_dominated_count,
+        npv_score: 0,
+        roi_score: 0,
+    }
 }
 
 #[cfg(test)]
@@ -564,5 +606,93 @@ mod tests {
 
         let score_p2 = evaluate_board(&mut world, p2, None);
         assert_eq!(score_p2, -7000);
+    }
+
+    #[test]
+    fn test_evaluate_board_v2_dominated_area() {
+        let mut world = World::new();
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+
+        // V2 用の PlayerAiSettings を登録
+        let mut settings = PlayerAiSettings::new();
+        settings.set_version(p1, AiVersion::V2);
+        settings.set_version(p2, AiVersion::V2);
+        world.insert_resource(settings);
+
+        // テスト用のマップを登録（幅10, 高さ10）
+        let mut map = Map::new(10, 10, Terrain::Plains, crate::resources::GridTopology::Square);
+        // 全て平原にしておく
+        for x in 0..10 {
+            for y in 0..10 {
+                map.set_terrain(x, y, Terrain::Plains);
+            }
+        }
+        world.insert_resource(map);
+
+        // MasterDataRegistryを登録
+        world.insert_resource(crate::resources::MasterDataRegistry::load().unwrap());
+        world.insert_resource(crate::resources::MatchState::default());
+
+        // 拠点の配置
+        // 1. すでにP1が占領済みの拠点 (x=0, y=0) -> 敵が近くにいてもP1の支配領域になるはず
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::City, Some(p1), 200),
+        ));
+        // 2. すでにP2が占領済みの拠点 (x=9, y=9)
+        world.spawn((
+            GridPosition { x: 9, y: 9 },
+            Property::new(Terrain::City, Some(p2), 200),
+        ));
+        // 3. 未占領（中立）の拠点 (x=5, y=5)
+        world.spawn((
+            GridPosition { x: 5, y: 5 },
+            Property::new(Terrain::City, None, 200),
+        ));
+
+        // ユニットの配置
+        // P1のユニットを中立拠点に近づける (x=4, y=5)
+        world.spawn((
+            Faction(p1),
+            GridPosition { x: 4, y: 5 },
+            Health { current: 100, max: 100 },
+            UnitStats {
+                movement_type: crate::resources::MovementType::Infantry,
+                max_movement: 3,
+                ..UnitStats::mock()
+            },
+        ));
+        // P2のユニットを中立拠点から遠ざける (x=8, y=8)
+        world.spawn((
+            Faction(p2),
+            GridPosition { x: 8, y: 8 },
+            Health { current: 100, max: 100 },
+            UnitStats {
+                movement_type: crate::resources::MovementType::Infantry,
+                max_movement: 3,
+                ..UnitStats::mock()
+            },
+        ));
+        // P2のユニットをP1の拠点に隣接させる (x=1, y=0)
+        // 距離的にはP2の方がP1拠点に近いが、すでにP1所有なのでP1の支配領域になることを確認する
+        world.spawn((
+            Faction(p2),
+            GridPosition { x: 1, y: 0 },
+            Health { current: 100, max: 100 },
+            UnitStats {
+                movement_type: crate::resources::MovementType::Infantry,
+                max_movement: 3,
+                ..UnitStats::mock()
+            },
+        ));
+
+        let metrics = super::evaluate_board_with_metrics(&mut world, p1, None);
+
+        // 期待される結果:
+        // P1支配拠点: (0, 0) [P1所有] + (5, 5) [P1ユニットの方が近いため仮支配] = 2
+        // P2支配拠点: (9, 9) [P2所有] = 1
+        assert_eq!(metrics.my_dominated_count, 2, "P1 should dominate 2 properties");
+        assert_eq!(metrics.enemy_dominated_count, 1, "P2 should dominate 1 property");
     }
 }
