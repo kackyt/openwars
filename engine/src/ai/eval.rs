@@ -9,6 +9,8 @@ use bevy_ecs::prelude::*;
 use std::collections::HashMap;
 
 const TERRITORY_WEIGHT: i32 = 2500;
+/// V2 の ZOC 方式支配面積はマス単位のため、拠点単位の TERRITORY_WEIGHT より大幅に小さくする
+const ZOC_TERRITORY_WEIGHT: i32 = 300;
 const CONSOLIDATION_RADIUS_TURNS: u32 = 2;
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -222,9 +224,9 @@ fn evaluate_board_v2(
         }
     }
 
-    // 1. ユニット戦力評価と SSSP テーブル構築
-    let mut my_unit_distances = Vec::new();
-    let mut enemy_unit_distances = Vec::new();
+    // 1. ユニット戦力評価
+    let mut my_unit_positions_list = Vec::new();
+    let mut enemy_unit_positions_list = Vec::new();
 
     let mut query = world.query::<(
         Entity,
@@ -326,16 +328,11 @@ fn evaluate_board_v2(
             };
             base_value *= isolation_modifier;
 
-            // 領域支配スコア用の情報を保存（SSSPテーブルはここでは保持しない。不要なクローンを避けるため movement_type と max_movement のみ保持）
+            // 領域支配スコア (ZOC) 用にユニット位置を保存
             if is_my_unit {
-                my_unit_distances.push((*pos, stats.movement_type, stats.max_movement, faction.0));
+                my_unit_positions_list.push(*pos);
             } else {
-                enemy_unit_distances.push((
-                    *pos,
-                    stats.movement_type,
-                    stats.max_movement,
-                    faction.0,
-                ));
+                enemy_unit_positions_list.push(*pos);
             }
         }
 
@@ -428,73 +425,38 @@ fn evaluate_board_v2(
         }
     }
 
-    // 3. 領域支配スコアの本実装
-    let mut my_dominated_count = 0;
-    let mut enemy_dominated_count = 0;
+    // 3. 領域支配スコア (ZOC 方式)
+    // 支配領域 = ユニットのいるマス + その隣接マス (ZOC) + 占領済み拠点のマス
+    let mut my_cells: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    let mut enemy_cells: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
 
-    for (p_pos, prop) in &properties {
-        // すでに占領済みの拠点は、無条件でそのプレイヤーの支配領域としてカウントする
-        if prop.owner_id == Some(perspective_player) {
-            my_dominated_count += 1;
-            continue;
-        } else if prop.owner_id.is_some() {
-            enemy_dominated_count += 1;
-            continue;
+    for pos in &my_unit_positions_list {
+        my_cells.insert((pos.x, pos.y));
+        for adj in map.get_adjacent(pos.x, pos.y) {
+            my_cells.insert(adj);
         }
-
-        // 未占領（中立）の拠点についてのみ、最短到達ターン数で支配を仮判定する
-        let mut min_my_dist = None;
-        for (u_pos, u_movement_type, u_max_movement, u_faction) in &my_unit_distances {
-            let p_turns_map = crate::ai::turn_distance::calculate_all_turn_distances_cached(
-                &map,
-                &registry,
-                &unit_positions,
-                (p_pos.x, p_pos.y),
-                *u_movement_type,
-                *u_max_movement,
-                0, // interaction_max_range
-                *u_faction,
-                turn_cache,
-            );
-            if let Some(&turns) = p_turns_map.get(u_pos) {
-                if min_my_dist.map_or(true, |m| turns < m) {
-                    min_my_dist = Some(turns);
-                }
-            }
-        }
-
-        // 敵軍の最短到達ターン数を計算 (拠点始点 SSSP から逆引き)
-        let mut min_enemy_dist = None;
-        for (u_pos, u_movement_type, u_max_movement, u_faction) in &enemy_unit_distances {
-            let p_turns_map = crate::ai::turn_distance::calculate_all_turn_distances_cached(
-                &map,
-                &registry,
-                &unit_positions,
-                (p_pos.x, p_pos.y),
-                *u_movement_type,
-                *u_max_movement,
-                0, // interaction_max_range
-                *u_faction,
-                turn_cache,
-            );
-            if let Some(&turns) = p_turns_map.get(u_pos) {
-                if min_enemy_dist.map_or(true, |m| turns < m) {
-                    min_enemy_dist = Some(turns);
-                }
-            }
-        }
-
-        let my_dist = min_my_dist.unwrap_or(crate::ai::turn_distance::TurnDistance { turns: 99, used_mp: 99999 });
-        let enemy_dist = min_enemy_dist.unwrap_or(crate::ai::turn_distance::TurnDistance { turns: 99, used_mp: 99999 });
-
-        if my_dist < enemy_dist {
-            my_dominated_count += 1;
-        } else if enemy_dist < my_dist {
-            enemy_dominated_count += 1;
+    }
+    for pos in &enemy_unit_positions_list {
+        enemy_cells.insert((pos.x, pos.y));
+        for adj in map.get_adjacent(pos.x, pos.y) {
+            enemy_cells.insert(adj);
         }
     }
 
-    score += (my_dominated_count - enemy_dominated_count) * TERRITORY_WEIGHT;
+    for (p_pos, prop) in &properties {
+        if let Some(owner) = prop.owner_id {
+            if owner == perspective_player {
+                my_cells.insert((p_pos.x, p_pos.y));
+            } else {
+                enemy_cells.insert((p_pos.x, p_pos.y));
+            }
+        }
+    }
+
+    let my_dominated_count = my_cells.len() as i32;
+    let enemy_dominated_count = enemy_cells.len() as i32;
+
+    score += (my_dominated_count - enemy_dominated_count) * ZOC_TERRITORY_WEIGHT;
 
     BoardMetrics {
         total_score: score,
@@ -689,10 +651,11 @@ mod tests {
 
         let metrics = super::evaluate_board_with_metrics(&mut world, p1, None);
 
-        // 期待される結果:
-        // P1支配拠点: (0, 0) [P1所有] + (5, 5) [P1ユニットの方が近いため仮支配] = 2
-        // P2支配拠点: (9, 9) [P2所有] = 1
-        assert_eq!(metrics.my_dominated_count, 2, "P1 should dominate 2 properties");
-        assert_eq!(metrics.enemy_dominated_count, 1, "P2 should dominate 1 property");
+        // 期待される結果 (ZOC方式: ユニットのマス + 隣接4マス + 占領済み拠点):
+        // P1: ユニット(4,5) -> {(4,5),(3,5),(5,5),(4,4),(4,6)} の5マス + 所有拠点(0,0) = 6
+        // P2: ユニット(8,8) -> 5マス、ユニット(1,0) -> {(1,0),(0,0),(2,0),(1,1)} の4マス(マップ端)、
+        //     所有拠点(9,9) = 5 + 4 + 1 = 10
+        assert_eq!(metrics.my_dominated_count, 6, "P1 should dominate 6 cells");
+        assert_eq!(metrics.enemy_dominated_count, 10, "P2 should dominate 10 cells");
     }
 }
