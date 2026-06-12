@@ -1,11 +1,11 @@
 ---
 title: "PLAYBOOK"
-version: "1.1.0"
+version: "1.2.0"
 status: "approved"
 created: "2026-06-06"
-updated: "2026-06-08"
+updated: "2026-06-13"
 owner: "@t_kak"
-ace_entry_count: 3
+ace_entry_count: 5
 tags: [ace, playbook, knowledge-management]
 references:
   - docs/ACE_FRAMEWORK.md
@@ -235,6 +235,44 @@ Playbook が 800 行を超えた場合、以下のように分割する：
 **Context**: AIの距離計算（`calculate_turn_distance`）において、有効なターゲット一覧を `Vec` で保持し、探索ループ内で毎回 `effective_targets.contains(&position)` を呼び出していたため計算量が増大していた。
 
 **Action**: 探索のルックアップ対象となるコレクションは `std::collections::HashSet` を使用し、判定を O(1) に高速化する。
+
+<a id="ace-52-1"></a>
+
+### ACE-52-1: AI評価における主観メトリクスと客観メトリクスの分離
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | testing |
+| Origin     | PR #52 |
+| Date       | 2026-06-13 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: AIの評価において、主観的メトリクス（AI内部の計算式に依存）と客観的メトリクス（バージョン非依存）を分離することで、AIの強さを定量的かつ客観的に比較・検証可能にする。
+
+**Context**: PR #52 でAIの評価関数を更新した際、新旧AIの性能を定量的に比較するために、AI内部のスコア内訳（主観）と、支配面積・ターン収入・拠点数といったバージョンに依存しないメトリクス（客観）を分離して出力する基盤を構築した。
+
+**Action**: AIの性能向上を検証する基盤を設計する際は、AI自身が計算するスコアに頼るのではなく、支配面積や収入などバージョン非依存の客観的指標（Objective Metrics）を定義し、それで合否や優劣を判定する。
+
+<a id="ace-52-2"></a>
+
+### ACE-52-2: ROI等の蓄積指標と盤面評価（スコア）の二重計上防止と分離
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | architecture |
+| Origin     | PR #52 |
+| Date       | 2026-06-13 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: 戦闘の効率や損益（ROI）などの蓄積指標を盤面の評価スコアに直接加算すると、現在盤面におけるユニットHPやユニット数などの静的評価と二重計上になり、評価が歪む原因となる。
+
+**Context**: PR #52 で与/被ダメージのゴールド換算価値を累積するROI計測を導入した際、`CombatLedger` というリソースに計測用として分離し、盤面評価スコアには加算しない設計とした。
+
+**Action**: 戦闘結果や累積損益（ROI）のような履歴・蓄積データは、盤面の直接評価には組み込まず、専用の計測リソース（`CombatLedger` 等）として分離する。これにより、純粋な計測用途や上位の戦略判断の材料として利用できるようにする。
 
 ## Changelog
 
