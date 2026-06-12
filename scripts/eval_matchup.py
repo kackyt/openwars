@@ -112,7 +112,8 @@ def run_single_game(map_name, p1_ver, p2_ver, max_turns, ui_callback=None):
             status = game_over.get("status")
             if status == "winner":
                 winner_id = game_over.get("winner_id")
-                if ui_callback: ui_callback({"type": "log", "msg": f"Game Finished! Winner: P{winner_id}"})
+                winner_ver = p1_ver if winner_id == 1 else p2_ver
+                if ui_callback: ui_callback({"type": "log", "msg": f"Game Finished! Winner: P{winner_id} ({winner_ver})"})
                 return {
                     "result": f"P{winner_id}_Win",
                     "turns": turn,
@@ -164,7 +165,8 @@ def run_single_game(map_name, p1_ver, p2_ver, max_turns, ui_callback=None):
                 m["p2_funds"] = player.get("funds", 0)
                 m["p2_abs_score"] = p2_props * 20000 + p2_units
         metrics.append(m)
-        if ui_callback: ui_callback({"type": "status_update", "metrics": m})
+        # 入れ替え戦でもTUIのラベルが実際の対戦カードを示すよう、AIバージョンをイベントに含める
+        if ui_callback: ui_callback({"type": "status_update", "metrics": m, "p1_ver": p1_ver, "p2_ver": p2_ver})
 
         active_idx = state.get("active_player_index", 0)
         if ui_callback and active_idx == 0:
@@ -228,7 +230,8 @@ def run_single_game(map_name, p1_ver, p2_ver, max_turns, ui_callback=None):
 
     if ui_callback:
         if winner_id:
-            ui_callback({"type": "log", "msg": f"Game Finished! Winner: P{winner_id} (Absolute Score: {p1_final} vs {p2_final})"})
+            winner_ver = p1_ver if winner_id == 1 else p2_ver
+            ui_callback({"type": "log", "msg": f"Game Finished! Winner: P{winner_id} ({winner_ver}) (Absolute Score: {p1_final} vs {p2_final})"})
         else:
             ui_callback({"type": "log", "msg": f"Game Finished! Draw (Absolute Score: {p1_final} vs {p2_final})"})
 
@@ -467,8 +470,10 @@ def main():
             t.add_column("Unit Value (NPV)")
             t.add_column("AI Eval Score")
             t.add_column("Absolute Score")
-            t.add_row(f"P1 ({args.p1})", str(m["p1_funds"]), str(m["p1_props"]), str(m["p1_units"]), str(m.get("p1_score", 0)), str(m.get("p1_abs_score", 0)))
-            t.add_row(f"P2 ({args.p2})", str(m["p2_funds"]), str(m["p2_props"]), str(m["p2_units"]), str(m.get("p2_score", 0)), str(m.get("p2_abs_score", 0)))
+            p1_ver = event.get("p1_ver", args.p1)
+            p2_ver = event.get("p2_ver", args.p2)
+            t.add_row(f"P1 ({p1_ver})", str(m["p1_funds"]), str(m["p1_props"]), str(m["p1_units"]), str(m.get("p1_score", 0)), str(m.get("p1_abs_score", 0)))
+            t.add_row(f"P2 ({p2_ver})", str(m["p2_funds"]), str(m["p2_props"]), str(m["p2_units"]), str(m.get("p2_score", 0)), str(m.get("p2_abs_score", 0)))
             layout["status"].update(Panel(t, title=f"Turn {m['turn']}"))
         
         live.refresh()
