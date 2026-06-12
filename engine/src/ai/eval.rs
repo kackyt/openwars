@@ -64,8 +64,18 @@ fn capture_eta(
     );
     let mut best = inf_map.get(&unit.pos).map(|d| d.turns);
 
+    // 徒歩で十分近い場合、輸送経由 (最短でも 迎え0 + 運搬1 + 降車1 + 徒歩1 = 3T) が
+    // 上回ることはほぼないため、SSSP の追加実行を省略する
+    const TRANSPORT_SKIP_WALK_TURNS: u32 = 4;
+    if best.is_some_and(|b| b <= TRANSPORT_SKIP_WALK_TURNS) {
+        return best;
+    }
+
     for t in transports {
         if !t.loadable.contains(&unit.unit_type) {
+            continue;
+        }
+        if t.max_movement == 0 {
             continue;
         }
         // 降車地点の近似: ヘリ・装甲車は拠点隣接に降車して徒歩1T、
@@ -74,22 +84,12 @@ fn capture_eta(
             crate::resources::MovementType::Ship => (3, 2),
             _ => (1, 1),
         };
-        // 迎え: 輸送ユニット現在地 → ユニットの隣接マス
-        let pickup_map = crate::ai::turn_distance::calculate_all_turn_distances_cached(
-            map,
-            registry,
-            unit_positions,
-            (unit.pos.x, unit.pos.y),
-            t.movement_type,
-            t.max_movement,
-            1,
-            t.faction,
-            turn_cache,
-        );
-        let Some(pickup) = pickup_map.get(&t.pos) else {
-            continue;
-        };
-        // 運搬: ユニット位置 → 拠点近傍 (drop_range 以内)
+        // 迎え: 輸送ユニット現在地 → ユニット隣接。
+        // ユニット位置はビーム探索中に頻繁に変わり SSSP キャッシュが効かないため、
+        // マンハッタン距離 / 移動力 の近似で済ませる（思考時間 200ms 制約対策）
+        let pickup_dist = unit.pos.x.abs_diff(t.pos.x) + unit.pos.y.abs_diff(t.pos.y);
+        let pickup_turns = (pickup_dist.saturating_sub(1) as u32).div_ceil(t.max_movement);
+        // 運搬: ユニット位置 → 拠点近傍 (drop_range 以内)。拠点起点なのでキャッシュが効く
         let carry_map = crate::ai::turn_distance::calculate_all_turn_distances_cached(
             map,
             registry,
@@ -104,7 +104,7 @@ fn capture_eta(
         let Some(carry) = carry_map.get(&unit.pos) else {
             continue;
         };
-        let eta = pickup.turns + carry.turns + 1 + drop_walk;
+        let eta = pickup_turns + carry.turns + 1 + drop_walk;
         if best.is_none_or(|b| eta < b) {
             best = Some(eta);
         }
