@@ -411,6 +411,7 @@ pub fn attack_unit_system(
     mut rng: ResMut<GameRng>,
     mut commands: Commands,
     pending_move: Option<Res<PendingMove>>,
+    mut combat_ledger: Option<ResMut<crate::resources::CombatLedger>>,
 ) {
     if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
@@ -569,6 +570,28 @@ pub fn attack_unit_system(
                     def_ammo.ammo2 = def_ammo.ammo2.saturating_sub(1);
                 }
             }
+        }
+
+        // ROI 計測用にダメージをゴールド換算して損益台帳に記録する
+        if let Some(ledger) = combat_ledger.as_mut() {
+            let dealt_value = if defender_hp.max > 0 {
+                defender_stats.cost as i64 * (d_hp_before - d_hp_after) as i64
+                    / defender_hp.max as i64
+            } else {
+                0
+            };
+            let counter_value = if attacker_hp.max > 0 {
+                attacker_stats.cost as i64 * (a_hp_before - a_hp_after) as i64
+                    / attacker_hp.max as i64
+            } else {
+                0
+            };
+            ledger.record_attack(
+                attacker_faction,
+                defender_faction,
+                dealt_value,
+                counter_value,
+            );
         }
 
         attacked_events.send(UnitAttackedEvent {

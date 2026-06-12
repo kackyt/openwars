@@ -302,7 +302,7 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                                         &mut search_cache,
                                     );
                                 if let Some(&t) = dist_map.get(pos) {
-                                    turns = t;
+                                    turns = t.turns;
                                 }
 
                                 if turns != u32::MAX {

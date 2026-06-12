@@ -1,6 +1,7 @@
 {
   "targets": [
-    "antigravity"
+    "antigravity",
+    "claudecode"
   ],
   "features": [
     "rules",

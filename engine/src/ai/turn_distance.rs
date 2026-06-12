@@ -10,14 +10,38 @@ use bevy_ecs::prelude::*;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
+/// 目的地までのターン数と消費移動力（MP）を保持する構造体。
+/// ターン数が同じ場合、消費移動力が小さい経路を優先するために使用します。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnDistance {
+    /// 到達にかかるターン数
+    pub turns: u32,
+    /// 累計で消費した移動力（MP）
+    pub used_mp: u32,
+}
+
+impl PartialOrd for TurnDistance {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TurnDistance {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.turns
+            .cmp(&other.turns)
+            .then_with(|| self.used_mp.cmp(&other.used_mp))
+    }
+}
+
 pub type TurnCacheKey = (usize, usize, usize, usize, MovementType, u32, u32, PlayerId);
 
 /// ターン数ベースの距離計算をキャッシュするためのリソース
 #[derive(Resource, Default)]
 pub struct TurnDistanceCache {
     /// キー: (出発地x, 出発地y, 目標地x, 目標地y, 移動タイプ, 移動力, インタラクション射程, 勢力ID)
-    /// 値: 到達ターン数 (到達不可の場合は u32::MAX)
-    pub cache: HashMap<TurnCacheKey, u32>,
+    /// 値: 到達ターン数と消費移動力を保持する TurnDistance 構造体
+    pub cache: HashMap<TurnCacheKey, TurnDistance>,
 }
 
 impl TurnDistanceCache {
@@ -63,9 +87,12 @@ pub fn calculate_turn_distance(
     interaction_max_range: u32,
     player_id: PlayerId,
     cache: &mut TurnDistanceCache,
-) -> u32 {
+) -> TurnDistance {
     if start == target {
-        return 0;
+        return TurnDistance {
+            turns: 0,
+            used_mp: 0,
+        };
     }
 
     let cache_key = (
@@ -120,15 +147,23 @@ pub fn calculate_turn_distance(
         let dx = (start.0 as i32 - target.0 as i32).abs();
         let dy = (start.1 as i32 - target.1 as i32).abs();
         let approx = 50 + ((dx + dy) as u32 / 4);
-        cache.cache.insert(cache_key, approx);
-        return approx;
+        let approx_encoded = TurnDistance {
+            turns: approx,
+            used_mp: 0xFFFFFFFF,
+        };
+        cache.cache.insert(cache_key, approx_encoded);
+        return approx_encoded;
     }
 
     // スタート地点がいずれかの到達目標に一致する場合
     for &et in &effective_targets {
         if start == et {
-            cache.cache.insert(cache_key, 0);
-            return 0;
+            let zero = TurnDistance {
+                turns: 0,
+                used_mp: 0,
+            };
+            cache.cache.insert(cache_key, zero);
+            return zero;
         }
     }
 
@@ -146,9 +181,16 @@ pub fn calculate_turn_distance(
         // いずれかの到達目標に到達した
         if effective_targets.contains(&position) {
             let turns = if max_mp == 0 {
-                u32::MAX
+                TurnDistance {
+                    turns: u32::MAX,
+                    used_mp: u32::MAX,
+                }
             } else {
-                (cost + max_mp - 1) / max_mp // ceil(cost / max_mp)
+                let base_turns = (cost + max_mp - 1) / max_mp; // ceil(cost / max_mp)
+                TurnDistance {
+                    turns: base_turns,
+                    used_mp: cost,
+                }
             };
             cache.cache.insert(cache_key, turns);
             return turns;
@@ -196,9 +238,13 @@ pub fn calculate_turn_distance(
     let dx = (start.0 as i32 - target.0 as i32).abs();
     let dy = (start.1 as i32 - target.1 as i32).abs();
     let approx = 50 + ((dx + dy) as u32 / 4);
+    let approx_encoded = TurnDistance {
+        turns: approx,
+        used_mp: 0xFFFFFFFF,
+    };
 
-    cache.cache.insert(cache_key, approx);
-    approx
+    cache.cache.insert(cache_key, approx_encoded);
+    approx_encoded
 }
 
 /// 始点（start）からマップ上のすべての到達可能な座標への最短到達ターン数をダイクストラ法で一括計算し、
@@ -212,7 +258,7 @@ pub fn calculate_all_turn_distances(
     max_mp: u32,
     interaction_max_range: u32,
     player_id: PlayerId,
-) -> HashMap<GridPosition, u32> {
+) -> HashMap<GridPosition, TurnDistance> {
     let mut dist = HashMap::new();
     let mut heap = BinaryHeap::new();
     let mut turns_map = HashMap::new();
@@ -301,10 +347,14 @@ pub fn calculate_all_turn_distances(
         }
     }
 
-    // コスト (move_cost の合計) をターン数 (ceil(cost / max_mp)) に変換
+    // コスト (move_cost の合計) を TurnDistance 構造体に変換
     for (pos, cost) in dist {
-        let turns = (cost + max_mp - 1) / max_mp;
-        turns_map.insert(GridPosition { x: pos.0, y: pos.1 }, turns);
+        let base_turns = (cost + max_mp - 1) / max_mp;
+        let encoded_turns = TurnDistance {
+            turns: base_turns,
+            used_mp: cost,
+        };
+        turns_map.insert(GridPosition { x: pos.0, y: pos.1 }, encoded_turns);
     }
 
     turns_map
@@ -318,7 +368,7 @@ pub struct AiTurnCache {
     #[allow(clippy::type_complexity)]
     pub sssp_cache: HashMap<
         (usize, usize, MovementType, u32, u32, PlayerId),
-        Arc<HashMap<crate::components::GridPosition, u32>>,
+        Arc<HashMap<crate::components::GridPosition, TurnDistance>>,
     >,
 }
 
@@ -351,7 +401,7 @@ pub fn calculate_all_turn_distances_cached(
     interaction_max_range: u32,
     player_id: PlayerId,
     cache: &mut AiTurnCache,
-) -> Arc<HashMap<crate::components::GridPosition, u32>> {
+) -> Arc<HashMap<crate::components::GridPosition, TurnDistance>> {
     let key = (
         target.0,
         target.1,
@@ -377,6 +427,16 @@ pub fn calculate_all_turn_distances_cached(
     let shared_result = Arc::new(result);
     cache.sssp_cache.insert(key, shared_result.clone());
     shared_result
+}
+
+/// エンコードされたターン数（上位16bit: 実ターン数、下位16bit: 消費コスト）から
+/// 実ターン数を取り出します。
+pub fn decode_turn_distance(encoded: u32) -> u32 {
+    if encoded == u32::MAX {
+        u32::MAX
+    } else {
+        encoded >> 16
+    }
 }
 
 #[cfg(test)]
@@ -410,7 +470,7 @@ mod tests {
             PlayerId(1),
             &mut cache,
         );
-        assert_eq!(dist, 2);
+        assert_eq!(dist.turns, 2);
 
         // キャッシュヒットの確認
         let dist2 = calculate_turn_distance(
@@ -425,7 +485,7 @@ mod tests {
             PlayerId(1),
             &mut cache,
         );
-        assert_eq!(dist2, 2);
+        assert_eq!(dist2.turns, 2);
     }
 
     #[test]
@@ -453,6 +513,6 @@ mod tests {
             PlayerId(1),
             &mut cache,
         );
-        assert_eq!(dist, 51);
+        assert_eq!(dist.turns, 51);
     }
 }

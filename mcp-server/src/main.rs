@@ -110,10 +110,38 @@ impl OpenWarsAiServer {
         let mut state_lock = self.state.lock().await;
         if let Some(state) = state_lock.as_mut() {
             let player_id = parse_player_id(args.player_id)?;
-            let score = engine::ai::eval::evaluate_board(&mut state.world, player_id, None);
+            // 主観評価値 (AI バージョン依存の探索スコアと内訳)
+            let subjective =
+                engine::ai::eval::evaluate_board_with_metrics(&mut state.world, player_id, None);
+            // 客観メトリクス (バージョン非依存。V1/V2 比較・検証用)
+            let objective =
+                engine::ai::eval::compute_objective_metrics(&mut state.world, player_id);
             Ok(serde_json::json!({
                 "player_id": args.player_id,
-                "score": score
+                "score": subjective.total_score,
+                "subjective_metrics": subjective,
+                "objective_metrics": objective
+            })
+            .to_string())
+        } else {
+            Err("Map not loaded".into())
+        }
+    }
+
+    /// プレイヤーのAIバージョンに依存しない客観的な盤面評価メトリクスを計算して返します。
+    #[tool(description = "Computes AI-version-independent objective board metrics for a player.")]
+    async fn evaluate_board_objective(
+        &self,
+        Parameters(args): Parameters<EvaluateBoardArgs>,
+    ) -> Result<String, String> {
+        let mut state_lock = self.state.lock().await;
+        if let Some(state) = state_lock.as_mut() {
+            let player_id = parse_player_id(args.player_id)?;
+            let objective =
+                engine::ai::eval::compute_objective_metrics(&mut state.world, player_id);
+            Ok(serde_json::json!({
+                "player_id": args.player_id,
+                "objective_metrics": objective
             })
             .to_string())
         } else {
@@ -391,8 +419,11 @@ impl OpenWarsAiServer {
                 (p.id, ms.active_player_index)
             };
 
-            let before_score =
-                engine::ai::eval::evaluate_board(&mut state.world, active_player_id, None);
+            let before_metrics = engine::ai::eval::evaluate_board_with_metrics(
+                &mut state.world,
+                active_player_id,
+                None,
+            );
 
             let mut actions_taken = vec![];
             loop {
@@ -409,15 +440,20 @@ impl OpenWarsAiServer {
                 }
             }
 
-            let after_score =
-                engine::ai::eval::evaluate_board(&mut state.world, active_player_id, None);
+            let after_metrics = engine::ai::eval::evaluate_board_with_metrics(
+                &mut state.world,
+                active_player_id,
+                None,
+            );
 
             Ok(serde_json::json!({
                 "actions_taken": actions_taken,
                 "player_id": active_player_id.0,
                 "player_index": active_player_index.0,
-                "before_score": before_score,
-                "after_score": after_score
+                "before_score": before_metrics.total_score,
+                "after_score": after_metrics.total_score,
+                "before_metrics": before_metrics,
+                "after_metrics": after_metrics
             })
             .to_string())
         } else {
