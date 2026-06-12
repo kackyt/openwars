@@ -1,4 +1,3 @@
-use crate::ai::demand::compute_unit_affinity;
 use crate::ai::strategy::{ProductionPlan, ProductionStrategy, analyze_strategy};
 use crate::components::{Faction, GridPosition, PlayerId, Property, UnitStats};
 use crate::events::ProduceUnitCommand;
@@ -338,7 +337,7 @@ pub fn calculate_unit_score_at(
     damage_chart: &DamageChart,
     master_data: &MasterDataRegistry,
     map: &crate::resources::Map,
-    unit_registry: &UnitRegistry,
+    _unit_registry: &UnitRegistry,
     produced_at: Terrain,
     ratio_diff: f32,
 ) -> u32 {

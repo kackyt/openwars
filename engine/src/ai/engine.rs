@@ -246,7 +246,7 @@ pub fn decide_ai_action(
                     }
                 }
                 // 拠点に近づくほど高スコア
-                base_tile_score += (20 - min_recovery_dist as i32).max(0) * 300;
+                base_tile_score += (20 - min_recovery_dist).max(0) * 300;
             }
 
             // 7.3 タクシー帰りロジック: 空の輸送車は生産拠点へ引き返す
@@ -269,7 +269,7 @@ pub fn decide_ai_action(
                     }
                 }
                 // 拠点に近づくほど高スコア（磁力）
-                base_tile_score += (20 - min_base_dist as i32).max(0) * 500;
+                base_tile_score += (20 - min_base_dist).max(0) * 500;
             }
 
             // 歩兵の待機移動ロジック: やることがない歩兵は海岸へ向かう
@@ -302,7 +302,7 @@ pub fn decide_ai_action(
 
                 // 海岸に近いほど加点（距離1を最適とする）
                 if min_coast_dist < 99 && min_coast_dist > 0 {
-                    base_tile_score += (20 - min_coast_dist as i32).max(0) * 100;
+                    base_tile_score += (20 - min_coast_dist).max(0) * 100;
                 }
             }
 
@@ -340,9 +340,14 @@ pub fn decide_ai_action(
                                     player_id,
                                     &mut turn_cache,
                                 );
-                            let t_dist = dist_map.get(&current_grid).copied().unwrap_or(crate::ai::turn_distance::TurnDistance { turns: u32::MAX, used_mp: u32::MAX });
-                                    if t_dist.turns != u32::MAX {
-                                        d = (t_dist.turns * stats.max_movement) as i32;
+                            let t_dist = dist_map.get(&current_grid).copied().unwrap_or(
+                                crate::ai::turn_distance::TurnDistance {
+                                    turns: u32::MAX,
+                                    used_mp: u32::MAX,
+                                },
+                            );
+                            if t_dist.turns != u32::MAX {
+                                d = (t_dist.turns * stats.max_movement) as i32;
                             } else {
                                 d = 999;
                             }
@@ -353,7 +358,7 @@ pub fn decide_ai_action(
                     }
                 }
                 // 拠点を狙うスコアを大幅に強化
-                base_tile_score += (20 - min_objective_dist as i32).max(0) * 400;
+                base_tile_score += (20 - min_objective_dist).max(0) * 400;
             } else {
                 // 最も「損害期待値」の高い敵をメインターゲットとして位置取りを決定する
                 let mut best_target_dist: i32 = 999;
@@ -377,9 +382,14 @@ pub fn decide_ai_action(
                                 player_id,
                                 &mut turn_cache,
                             );
-                        let t_dist = dist_map.get(&current_grid).copied().unwrap_or(crate::ai::turn_distance::TurnDistance { turns: u32::MAX, used_mp: u32::MAX });
-                                    if t_dist.turns != u32::MAX {
-                                        effective_dist = (t_dist.turns * stats.max_movement) as i32;
+                        let t_dist = dist_map.get(&current_grid).copied().unwrap_or(
+                            crate::ai::turn_distance::TurnDistance {
+                                turns: u32::MAX,
+                                used_mp: u32::MAX,
+                            },
+                        );
+                        if t_dist.turns != u32::MAX {
+                            effective_dist = (t_dist.turns * stats.max_movement) as i32;
                         } else {
                             effective_dist = 999;
                         }
@@ -430,9 +440,14 @@ pub fn decide_ai_action(
                                     player_id,
                                     &mut turn_cache,
                                 );
-                            let t_dist = dist_map.get(&current_grid).copied().unwrap_or(crate::ai::turn_distance::TurnDistance { turns: u32::MAX, used_mp: u32::MAX });
-                                    if t_dist.turns != u32::MAX {
-                                        d = (t_dist.turns * stats.max_movement) as i32;
+                            let t_dist = dist_map.get(&current_grid).copied().unwrap_or(
+                                crate::ai::turn_distance::TurnDistance {
+                                    turns: u32::MAX,
+                                    used_mp: u32::MAX,
+                                },
+                            );
+                            if t_dist.turns != u32::MAX {
+                                d = (t_dist.turns * stats.max_movement) as i32;
                             } else {
                                 d = 999;
                             }
@@ -459,8 +474,12 @@ pub fn decide_ai_action(
                                          player_id,
                                          &mut turn_cache,
                                      );
-                                    let t_dist =
-                                        dist_map.get(&current_grid).copied().unwrap_or(crate::ai::turn_distance::TurnDistance { turns: u32::MAX, used_mp: u32::MAX });
+                                    let t_dist = dist_map.get(&current_grid).copied().unwrap_or(
+                                        crate::ai::turn_distance::TurnDistance {
+                                            turns: u32::MAX,
+                                            used_mp: u32::MAX,
+                                        },
+                                    );
                                     if t_dist.turns != u32::MAX {
                                         d = (t_dist.turns * stats.max_movement) as i32;
                                     } else {
@@ -488,8 +507,12 @@ pub fn decide_ai_action(
                                          player_id,
                                          &mut turn_cache,
                                      );
-                                    let t_dist =
-                                        dist_map.get(&current_grid).copied().unwrap_or(crate::ai::turn_distance::TurnDistance { turns: u32::MAX, used_mp: u32::MAX });
+                                    let t_dist = dist_map.get(&current_grid).copied().unwrap_or(
+                                        crate::ai::turn_distance::TurnDistance {
+                                            turns: u32::MAX,
+                                            used_mp: u32::MAX,
+                                        },
+                                    );
                                     if t_dist.turns != u32::MAX {
                                         d = (t_dist.turns * stats.max_movement) as i32;
                                     } else {
@@ -517,7 +540,7 @@ pub fn decide_ai_action(
                     }
                 } else {
                     // 直接攻撃ユニット：隣接を目指す
-                    base_tile_score += (20 - best_target_dist as i32).max(0) * 100;
+                    base_tile_score += (20 - best_target_dist).max(0) * 100;
                 }
             }
 
@@ -1708,13 +1731,13 @@ pub fn decide_ai_action_v2(
                             base_tile_score -= 2000;
                         } else {
                             // まだ遠い。ターン距離が短いほど良い
-                            base_tile_score += (100 - best_target_dist as i32).max(0) * 100;
+                            base_tile_score += (100 - best_target_dist).max(0) * 100;
                         }
                     } else {
-                        base_tile_score += (100 - best_target_dist as i32).max(0) * 100;
+                        base_tile_score += (100 - best_target_dist).max(0) * 100;
                     }
                 } else {
-                    base_tile_score += (100 - best_target_dist as i32).max(0) * 100;
+                    base_tile_score += (100 - best_target_dist).max(0) * 100;
                 }
             }
 
