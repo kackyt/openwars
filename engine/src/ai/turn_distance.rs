@@ -10,9 +10,13 @@ use bevy_ecs::prelude::*;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
+/// 目的地までのターン数と消費移動力（MP）を保持する構造体。
+/// ターン数が同じ場合、消費移動力が小さい経路を優先するために使用します。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TurnDistance {
+    /// 到達にかかるターン数
     pub turns: u32,
+    /// 累計で消費した移動力（MP）
     pub used_mp: u32,
 }
 
@@ -36,7 +40,7 @@ pub type TurnCacheKey = (usize, usize, usize, usize, MovementType, u32, u32, Pla
 #[derive(Resource, Default)]
 pub struct TurnDistanceCache {
     /// キー: (出発地x, 出発地y, 目標地x, 目標地y, 移動タイプ, 移動力, インタラクション射程, 勢力ID)
-    /// 値: 到達ターン数 (到達不可の場合は u32::MAX)
+    /// 値: 到達ターン数と消費移動力を保持する TurnDistance 構造体
     pub cache: HashMap<TurnCacheKey, TurnDistance>,
 }
 
@@ -343,7 +347,7 @@ pub fn calculate_all_turn_distances(
         }
     }
 
-    // コスト (move_cost の合計) をエンコードされたターン数に変換
+    // コスト (move_cost の合計) を TurnDistance 構造体に変換
     for (pos, cost) in dist {
         let base_turns = (cost + max_mp - 1) / max_mp;
         let encoded_turns = TurnDistance {

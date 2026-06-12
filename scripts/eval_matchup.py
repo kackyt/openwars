@@ -22,10 +22,14 @@ def init_mcp_server():
     global p
     env = os.environ.copy()
     env['RUST_LOG'] = 'info'
-    os.system('taskkill /F /IM mcp-server.exe >nul 2>&1')
+    if os.name == 'nt':
+        os.system('taskkill /F /IM mcp-server.exe >nul 2>&1')
+    else:
+        os.system('pkill -f mcp-server >/dev/null 2>&1')
     # スクリプト位置基準でリポジトリルートの実行ファイルを絶対パス解決する
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    exe_path = os.path.join(repo_root, 'target', 'release', 'mcp-server.exe')
+    exe_name = 'mcp-server.exe' if os.name == 'nt' else 'mcp-server'
+    exe_path = os.path.join(repo_root, 'target', 'release', exe_name)
     p = subprocess.Popen(
         [exe_path],
         stdin=subprocess.PIPE,

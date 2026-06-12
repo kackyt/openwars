@@ -598,7 +598,7 @@ pub fn calculate_unit_score_at(
             score += demand * 1500;
         }
 
-        // 輸送機を持ちすぎている場合は強力なペナルティを課す
+        // 輸送ユニットを持ちすぎている場合は強力なペナルティを課す
         if strategy.existing_transport_count >= 1 {
             score = (score as f32 * 0.5) as u32; // 2台目以降は半減
         }

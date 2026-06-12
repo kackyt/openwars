@@ -128,6 +128,7 @@ impl OpenWarsAiServer {
         }
     }
 
+    /// プレイヤーのAIバージョンに依存しない客観的な盤面評価メトリクスを計算して返します。
     #[tool(description = "Computes AI-version-independent objective board metrics for a player.")]
     async fn evaluate_board_objective(
         &self,
