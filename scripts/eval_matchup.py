@@ -23,8 +23,11 @@ def init_mcp_server():
     env = os.environ.copy()
     env['RUST_LOG'] = 'info'
     os.system('taskkill /F /IM mcp-server.exe >nul 2>&1')
+    # スクリプト位置基準でリポジトリルートの実行ファイルを絶対パス解決する
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe_path = os.path.join(repo_root, 'target', 'release', 'mcp-server.exe')
     p = subprocess.Popen(
-        ['target/release/mcp-server.exe'],
+        [exe_path],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL, # エラー出力を無視して画面崩れを防ぐ
@@ -137,8 +140,12 @@ def run_single_game(map_name, p1_ver, p2_ver, max_turns, ui_callback=None):
         s2 = call_tool("evaluate_board", {"player_id": 2})
         m["p1_score"] = s1.get("score", 0) if isinstance(s1, dict) else 0
         m["p2_score"] = s2.get("score", 0) if isinstance(s2, dict) else 0
-        m["p1_metrics"] = s1.get("metrics", {}) if isinstance(s1, dict) else {}
-        m["p2_metrics"] = s2.get("metrics", {}) if isinstance(s2, dict) else {}
+        # 主観メトリクス（AIバージョン依存の評価内訳。形勢認識の分析用）
+        m["p1_subj"] = s1.get("subjective_metrics", {}) if isinstance(s1, dict) else {}
+        m["p2_subj"] = s2.get("subjective_metrics", {}) if isinstance(s2, dict) else {}
+        # 客観メトリクス（バージョン非依存。合否判定・ジリ貧分析用）
+        m["p1_obj"] = s1.get("objective_metrics", {}) if isinstance(s1, dict) else {}
+        m["p2_obj"] = s2.get("objective_metrics", {}) if isinstance(s2, dict) else {}
 
         for player in p_info:
             pid = player.get("player_id")
@@ -234,6 +241,81 @@ def run_single_game(map_name, p1_ver, p2_ver, max_turns, ui_callback=None):
         "final_state": state
     }
 
+def moving_average(values, window=5):
+    """5ターン移動平均（先頭は利用可能な範囲で平均）"""
+    out = []
+    for i in range(len(values)):
+        w = values[max(0, i - window + 1):i + 1]
+        out.append(sum(w) / len(w))
+    return out
+
+
+def check_no_decline(series, start_turn=15):
+    """5ターン移動平均が start_turn 以降に減少トレンドへ転じていないか。
+    判定: 最終時点の移動平均が start_turn 時点の移動平均以上であること。
+    start_turn 未満で決着したゲームはジリ貧とは見なさない。"""
+    if len(series) < start_turn:
+        return True
+    ma = moving_average(series)
+    return ma[-1] >= ma[start_turn - 1]
+
+
+def extract_side_series(game, side, key):
+    """ゲームのメトリクス列から指定サイド(p1/p2)の客観メトリクス時系列を取り出す"""
+    return [m.get(f"{side}_obj", {}).get(key, 0) for m in game.get("metrics", [])]
+
+
+def judge_objective_criteria(results):
+    """確定済みの客観メトリクス基準で合否判定する。
+    基準1: 判定時点(30T or 決着時点)の ZOC支配面積 V2平均 > V1平均（先攻・後攻それぞれ）
+    基準2: 同・ターン収入
+    基準3: V2の支配面積・収入の5T移動平均が15T以降に減少トレンドへ転じない
+    戻り値: (per_map判定dict, 全体PASS/FAIL, 詳細行リスト)"""
+    # (map, order) -> 集計
+    buckets = defaultdict(lambda: {"v2_zoc": [], "v1_zoc": [], "v2_inc": [], "v1_inc": [], "trend_ok": []})
+
+    for g in results:
+        p1, p2 = g["p1"], g["p2"]
+        if "V2" not in (p1, p2) or p1 == p2:
+            continue
+        v2_side = "p1" if p1 == "V2" else "p2"
+        v1_side = "p2" if v2_side == "p1" else "p1"
+        order = "先攻" if v2_side == "p1" else "後攻"
+        metrics = g.get("metrics", [])
+        if not metrics:
+            continue
+        last = metrics[-1]
+        b = buckets[(g["map"], order)]
+        b["v2_zoc"].append(last.get(f"{v2_side}_obj", {}).get("zoc_area", 0))
+        b["v1_zoc"].append(last.get(f"{v1_side}_obj", {}).get("zoc_area", 0))
+        b["v2_inc"].append(last.get(f"{v2_side}_obj", {}).get("income_per_turn", 0))
+        b["v1_inc"].append(last.get(f"{v1_side}_obj", {}).get("income_per_turn", 0))
+        zoc_ok = check_no_decline(extract_side_series(g, v2_side, "zoc_area"))
+        inc_ok = check_no_decline(extract_side_series(g, v2_side, "income_per_turn"))
+        b["trend_ok"].append(zoc_ok and inc_ok)
+
+    def avg(xs):
+        return sum(xs) / len(xs) if xs else 0
+
+    detail_rows = []
+    map_pass = {}
+    for (map_name, order), b in sorted(buckets.items()):
+        c1 = avg(b["v2_zoc"]) > avg(b["v1_zoc"])
+        c2 = avg(b["v2_inc"]) > avg(b["v1_inc"])
+        c3 = all(b["trend_ok"]) if b["trend_ok"] else False
+        detail_rows.append({
+            "map": map_name, "order": order,
+            "v2_zoc": avg(b["v2_zoc"]), "v1_zoc": avg(b["v1_zoc"]), "c1": c1,
+            "v2_inc": avg(b["v2_inc"]), "v1_inc": avg(b["v1_inc"]), "c2": c2,
+            "c3": c3,
+        })
+        ok = c1 and c2 and c3
+        map_pass[map_name] = map_pass.get(map_name, True) and ok
+
+    overall = all(map_pass.values()) if map_pass else False
+    return map_pass, overall, detail_rows
+
+
 def generate_report(results):
     v2_wins = 0
     v1_wins = 0
@@ -281,9 +363,27 @@ def generate_report(results):
     avg_time_v1 = sum(thinking_times_v1) / len(thinking_times_v1) if thinking_times_v1 else 0
     
     report = ["# 🏆 AI Matchup Evaluator Report"]
+
+    # 客観メトリクス基準の合否判定 (Issue #48 確定基準)
+    map_pass, overall, detail_rows = judge_objective_criteria(results)
+    report.append("## ✅ 合否判定（客観メトリクス基準）")
+    report.append("判定時点 = 各戦の30ターン時点（それ以前に決着した場合は決着時点）。")
+    report.append("")
+    report.append("| マップ | 手番 | 基準1: ZOC支配面積 (V2 vs V1) | 基準2: ターン収入 (V2 vs V1) | 基準3: ジリ貧解消 | 判定 |")
+    report.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
+    for r in detail_rows:
+        c1s = f"{'✅' if r['c1'] else '❌'} {r['v2_zoc']:.1f} vs {r['v1_zoc']:.1f}"
+        c2s = f"{'✅' if r['c2'] else '❌'} {r['v2_inc']:.0f} vs {r['v1_inc']:.0f}"
+        c3s = '✅' if r['c3'] else '❌'
+        ok = '**PASS**' if (r['c1'] and r['c2'] and r['c3']) else '**FAIL**'
+        report.append(f"| {r['map']} | {r['order']} | {c1s} | {c2s} | {c3s} | {ok} |")
+    report.append("")
+    report.append(f"**全体判定: {'✅ PASS' if overall else '❌ FAIL'}**" )
+    report.append("")
+
     report.append("## 📊 総合結果サマリー")
     report.append(f"- **総対戦数**: {total_games} ゲーム")
-    report.append(f"- **V2 (新AI) の総合勝率**: **{v2_win_rate:.1f}%** ({v2_wins}勝 {v1_wins}敗 {draws}分)")
+    report.append(f"- **V2 (新AI) の総合勝率（参考・ガードレール40%）**: **{v2_win_rate:.1f}%** ({v2_wins}勝 {v1_wins}敗 {draws}分)")
     report.append(f"- **平均勝利ターン数**: ")
     report.append(f"  - **V2 (新AI) 勝利時**: {avg_turns_v2:.1f} ターン")
     report.append(f"  - **V1 (旧AI) 勝利時**: {avg_turns_v1:.1f} ターン")
@@ -301,29 +401,40 @@ def generate_report(results):
             report.append(f"| {g['matchup']} | **{g['result']}** | {g['turns']} | {p1_act} | {p2_act} |")
         report.append("\n")
         
-        # メトリクス（支配面積・NPV推移）の表を追加
-        report.append("#### 📈 AI 内部評価値 (Metrics) の推移")
-        report.append("| ターン | P1 (V2/V1) 支配拠点数 | P1 支配面積 | P1 NPV | P2 (V1/V2) 支配拠点数 | P2 支配面積 | P2 NPV |")
-        report.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+        # 客観メトリクス（支配面積・収入・NPV）の推移表
+        report.append("#### 📈 客観メトリクス (Objective Metrics) の推移")
         for g in games:
-            report.append(f"*(Game Result: {g['result']})*")
+            report.append(f"*{g['matchup']} (Result: {g['result']})*")
+            report.append("| ターン | P1 ZOC面積 | P1 収入 | P1 拠点 | P1 NPV | P1 主観スコア | P2 ZOC面積 | P2 収入 | P2 拠点 | P2 NPV | P2 主観スコア |")
+            report.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
             for i, m in enumerate(g['metrics']):
-                if i % 5 == 0 or i == len(g['metrics']) - 1: # 5ターンごと、または最終ターン
-                    p1_m = m.get("p1_metrics", {})
-                    p2_m = m.get("p2_metrics", {})
-                    p1_dom = p1_m.get("my_dominated_count", 0)
-                    p1_npv = p1_m.get("npv_score", 0)
-                    p2_dom = p2_m.get("my_dominated_count", 0)
-                    p2_npv = p2_m.get("npv_score", 0)
-                    report.append(f"| {m['turn']} | {m['p1_props']} | {p1_dom} | {p1_npv} | {m['p2_props']} | {p2_dom} | {p2_npv} |")
+                if i % 5 == 0 or i == len(g['metrics']) - 1:  # 5ターンごと、または最終ターン
+                    o1 = m.get("p1_obj", {})
+                    o2 = m.get("p2_obj", {})
+                    report.append(
+                        f"| {m['turn']} | {o1.get('zoc_area', 0)} | {o1.get('income_per_turn', 0)} | {o1.get('owned_properties', 0)} | {o1.get('npv', 0)} | {m.get('p1_score', 0)} "
+                        f"| {o2.get('zoc_area', 0)} | {o2.get('income_per_turn', 0)} | {o2.get('owned_properties', 0)} | {o2.get('npv', 0)} | {m.get('p2_score', 0)} |"
+                    )
+            # 戦闘効率 (ROI): 最終時点の累計与/被ダメージ価値
+            if g['metrics']:
+                last = g['metrics'][-1]
+                roi_parts = []
+                for side in ("p1", "p2"):
+                    o = last.get(f"{side}_obj", {})
+                    dealt = o.get("combat_value_dealt", 0)
+                    received = o.get("combat_value_received", 0)
+                    eff = f"{dealt / received:.2f}" if received > 0 else "-"
+                    roi_parts.append(f"{side.upper()}: 与{dealt} / 被{received} (効率 {eff})")
+                report.append("")
+                report.append(f"戦闘効率(ROI): {' , '.join(roi_parts)}")
             report.append("\n")
-        
+
     return "\n".join(report)
 
 def main():
     parser = argparse.ArgumentParser(description="AI Matchup Evaluator for OpenWars")
     parser.add_argument("--mode", choices=["tui", "batch"], default="tui", help="Execution mode (tui or batch)")
-    parser.add_argument("--map", default="map_3", help="Map to test")
+    parser.add_argument("--map", default="map_3", help="Map(s) to test (comma separated, e.g. map_1,map_2,map_3)")
     parser.add_argument("--p1", default="V2", help="Player 1 AI Version")
     parser.add_argument("--p2", default="V1", help="Player 2 AI Version")
     parser.add_argument("--games", type=int, default=1, help="Number of games per matchup")
@@ -364,6 +475,8 @@ def main():
             m = event["metrics"]
             print(json.dumps({"type": "metrics", "data": m}))
             
+    maps = [mn.strip() for mn in args.map.split(",") if mn.strip()]
+
     try:
         if args.mode == "tui" and HAS_RICH:
             layout = Layout()
@@ -375,36 +488,38 @@ def main():
             layout["header"].update(Panel(f"[bold cyan]OpenWars AI Matchup: {args.p1} vs {args.p2} on {args.map}[/bold cyan]"))
             layout["status"].update(Panel("Waiting for game to start..."))
             layout["log"].update(Panel("Logs will appear here..."))
-            
+
             with Live(layout, refresh_per_second=4) as live:
+                for map_name in maps:
+                    for i in range(args.games):
+                        res = run_single_game(map_name, args.p1, args.p2, args.max_turns, lambda e: ui_callback_tui(e, layout, live))
+                        res["map"] = map_name
+                        res["p1"] = args.p1
+                        res["p2"] = args.p2
+                        all_results.append(res)
+
+                        res2 = run_single_game(map_name, args.p2, args.p1, args.max_turns, lambda e: ui_callback_tui(e, layout, live))
+                        res2["map"] = map_name
+                        res2["p1"] = args.p2
+                        res2["p2"] = args.p1
+                        all_results.append(res2)
+        else:
+            print(json.dumps({"type": "info", "msg": f"Starting batch run: {args.p1} vs {args.p2} on {maps} ({args.games} games x 2 orders per map)"}))
+            for map_name in maps:
                 for i in range(args.games):
-                    res = run_single_game(args.map, args.p1, args.p2, args.max_turns, lambda e: ui_callback_tui(e, layout, live))
-                    res["map"] = args.map
+                    res = run_single_game(map_name, args.p1, args.p2, args.max_turns, ui_callback_batch)
+                    res["map"] = map_name
                     res["p1"] = args.p1
                     res["p2"] = args.p2
                     all_results.append(res)
-                    
-                    res2 = run_single_game(args.map, args.p2, args.p1, args.max_turns, lambda e: ui_callback_tui(e, layout, live))
-                    res2["map"] = args.map
+                    print(json.dumps({"type": "result", "data": {k: v for k, v in res.items() if k != "metrics" and k != "final_state"}}))
+
+                    res2 = run_single_game(map_name, args.p2, args.p1, args.max_turns, ui_callback_batch)
+                    res2["map"] = map_name
                     res2["p1"] = args.p2
                     res2["p2"] = args.p1
                     all_results.append(res2)
-        else:
-            print(json.dumps({"type": "info", "msg": f"Starting batch run: {args.p1} vs {args.p2} on {args.map} ({args.games} games)"}))
-            for i in range(args.games):
-                res = run_single_game(args.map, args.p1, args.p2, args.max_turns, ui_callback_batch)
-                res["map"] = args.map
-                res["p1"] = args.p1
-                res["p2"] = args.p2
-                all_results.append(res)
-                print(json.dumps({"type": "result", "data": res}))
-                
-                res2 = run_single_game(args.map, args.p2, args.p1, args.max_turns, ui_callback_batch)
-                res2["map"] = args.map
-                res2["p1"] = args.p2
-                res2["p2"] = args.p1
-                all_results.append(res2)
-                print(json.dumps({"type": "result", "data": res2}))
+                    print(json.dumps({"type": "result", "data": {k: v for k, v in res2.items() if k != "metrics" and k != "final_state"}}))
                 
         report = generate_report(all_results)
         with open(args.output, "w", encoding="utf-8") as f:
