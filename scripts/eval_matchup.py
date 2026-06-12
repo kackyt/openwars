@@ -260,16 +260,13 @@ def check_no_decline(series, start_turn=15):
     return ma[-1] >= ma[start_turn - 1]
 
 
-def extract_side_series(game, side, key):
-    """ゲームのメトリクス列から指定サイド(p1/p2)の客観メトリクス時系列を取り出す"""
-    return [m.get(f"{side}_obj", {}).get(key, 0) for m in game.get("metrics", [])]
-
-
 def judge_objective_criteria(results):
     """確定済みの客観メトリクス基準で合否判定する。
     基準1: 判定時点(30T or 決着時点)の ZOC支配面積 V2平均 > V1平均（先攻・後攻それぞれ）
     基準2: 同・ターン収入
-    基準3: V2の支配面積・収入の5T移動平均が15T以降に減少トレンドへ転じない
+    基準3: V2のユニット資産価値・収入の5T移動平均が15T以降に減少トレンドへ転じない
+           （ZOCは終盤のユニット密集で重複減少し誤検知するため、ストック指標で判定する。
+            ZOCの優位性自体は基準1でカバーされる）
     戻り値: (per_map判定dict, 全体PASS/FAIL, 詳細行リスト)"""
     # (map, order) -> 集計
     buckets = defaultdict(lambda: {"v2_zoc": [], "v1_zoc": [], "v2_inc": [], "v1_inc": [], "trend_ok": []})
@@ -281,18 +278,26 @@ def judge_objective_criteria(results):
         v2_side = "p1" if p1 == "V2" else "p2"
         v1_side = "p2" if v2_side == "p1" else "p1"
         order = "先攻" if v2_side == "p1" else "後攻"
-        metrics = g.get("metrics", [])
-        if not metrics:
+        raw_metrics = g.get("metrics", [])
+        if not raw_metrics:
             continue
+        # 1ターンに両手番分の2エントリが記録されるため、ターンごとに最後のエントリへ集約する
+        by_turn = {}
+        for m in raw_metrics:
+            by_turn[m["turn"]] = m
+        metrics = [by_turn[t] for t in sorted(by_turn)]
         last = metrics[-1]
         b = buckets[(g["map"], order)]
         b["v2_zoc"].append(last.get(f"{v2_side}_obj", {}).get("zoc_area", 0))
         b["v1_zoc"].append(last.get(f"{v1_side}_obj", {}).get("zoc_area", 0))
         b["v2_inc"].append(last.get(f"{v2_side}_obj", {}).get("income_per_turn", 0))
         b["v1_inc"].append(last.get(f"{v1_side}_obj", {}).get("income_per_turn", 0))
-        zoc_ok = check_no_decline(extract_side_series(g, v2_side, "zoc_area"))
-        inc_ok = check_no_decline(extract_side_series(g, v2_side, "income_per_turn"))
-        b["trend_ok"].append(zoc_ok and inc_ok)
+        # ユニット資産価値 (unit_cost合計) はゲームステート由来の p1_units/p2_units を使う
+        asset_series = [m.get(f"{v2_side}_units", 0) for m in metrics]
+        asset_ok = check_no_decline(asset_series)
+        inc_series = [m.get(f"{v2_side}_obj", {}).get("income_per_turn", 0) for m in metrics]
+        inc_ok = check_no_decline(inc_series)
+        b["trend_ok"].append(asset_ok and inc_ok)
 
     def avg(xs):
         return sum(xs) / len(xs) if xs else 0
