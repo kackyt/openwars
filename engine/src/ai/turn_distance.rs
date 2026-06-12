@@ -24,7 +24,9 @@ impl PartialOrd for TurnDistance {
 
 impl Ord for TurnDistance {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.turns.cmp(&other.turns).then_with(|| self.used_mp.cmp(&other.used_mp))
+        self.turns
+            .cmp(&other.turns)
+            .then_with(|| self.used_mp.cmp(&other.used_mp))
     }
 }
 
@@ -83,7 +85,10 @@ pub fn calculate_turn_distance(
     cache: &mut TurnDistanceCache,
 ) -> TurnDistance {
     if start == target {
-        return TurnDistance { turns: 0, used_mp: 0 };
+        return TurnDistance {
+            turns: 0,
+            used_mp: 0,
+        };
     }
 
     let cache_key = (
@@ -138,7 +143,10 @@ pub fn calculate_turn_distance(
         let dx = (start.0 as i32 - target.0 as i32).abs();
         let dy = (start.1 as i32 - target.1 as i32).abs();
         let approx = 50 + ((dx + dy) as u32 / 4);
-        let approx_encoded = TurnDistance { turns: approx, used_mp: 0xFFFFFFFF };
+        let approx_encoded = TurnDistance {
+            turns: approx,
+            used_mp: 0xFFFFFFFF,
+        };
         cache.cache.insert(cache_key, approx_encoded);
         return approx_encoded;
     }
@@ -146,7 +154,10 @@ pub fn calculate_turn_distance(
     // スタート地点がいずれかの到達目標に一致する場合
     for &et in &effective_targets {
         if start == et {
-            let zero = TurnDistance { turns: 0, used_mp: 0 };
+            let zero = TurnDistance {
+                turns: 0,
+                used_mp: 0,
+            };
             cache.cache.insert(cache_key, zero);
             return zero;
         }
@@ -166,10 +177,16 @@ pub fn calculate_turn_distance(
         // いずれかの到達目標に到達した
         if effective_targets.contains(&position) {
             let turns = if max_mp == 0 {
-                TurnDistance { turns: u32::MAX, used_mp: u32::MAX }
+                TurnDistance {
+                    turns: u32::MAX,
+                    used_mp: u32::MAX,
+                }
             } else {
                 let base_turns = (cost + max_mp - 1) / max_mp; // ceil(cost / max_mp)
-                TurnDistance { turns: base_turns, used_mp: cost }
+                TurnDistance {
+                    turns: base_turns,
+                    used_mp: cost,
+                }
             };
             cache.cache.insert(cache_key, turns);
             return turns;
@@ -217,7 +234,10 @@ pub fn calculate_turn_distance(
     let dx = (start.0 as i32 - target.0 as i32).abs();
     let dy = (start.1 as i32 - target.1 as i32).abs();
     let approx = 50 + ((dx + dy) as u32 / 4);
-    let approx_encoded = TurnDistance { turns: approx, used_mp: 0xFFFFFFFF };
+    let approx_encoded = TurnDistance {
+        turns: approx,
+        used_mp: 0xFFFFFFFF,
+    };
 
     cache.cache.insert(cache_key, approx_encoded);
     approx_encoded
@@ -326,7 +346,10 @@ pub fn calculate_all_turn_distances(
     // コスト (move_cost の合計) をエンコードされたターン数に変換
     for (pos, cost) in dist {
         let base_turns = (cost + max_mp - 1) / max_mp;
-        let encoded_turns = TurnDistance { turns: base_turns, used_mp: cost };
+        let encoded_turns = TurnDistance {
+            turns: base_turns,
+            used_mp: cost,
+        };
         turns_map.insert(GridPosition { x: pos.0, y: pos.1 }, encoded_turns);
     }
 

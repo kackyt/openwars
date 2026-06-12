@@ -105,7 +105,7 @@ fn capture_eta(
             continue;
         };
         let eta = pickup.turns + carry.turns + 1 + drop_walk;
-        if best.map_or(true, |b| eta < b) {
+        if best.is_none_or(|b| eta < b) {
             best = Some(eta);
         }
     }
@@ -147,7 +147,7 @@ fn side_npv(
                 (p_pos.x, p_pos.y),
                 turn_cache,
             ) {
-                if best_eta.map_or(true, |b| eta < b) {
+                if best_eta.is_none_or(|b| eta < b) {
                     best_eta = Some(eta);
                 }
             }
@@ -161,13 +161,39 @@ fn side_npv(
     total
 }
 
+/// AI の主観評価値（探索に使うスコア）の内訳。
+/// AI バージョンごとに定義が異なるため、バージョン間の比較には ObjectiveMetrics を使うこと。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct BoardMetrics {
     pub total_score: i32,
+    /// ユニット価値スコア (cost × HP残率 ± 各種補正)
+    pub unit_score: i32,
+    /// 拠点価値スコア
+    pub property_score: i32,
+    /// 領域支配スコア (V1: 拠点数ベース, V2: ZOCマス数ベース)
+    pub territory_score: i32,
+    /// NPV スコア (V2 のみ。my_npv − enemy_npv)
+    pub npv_score: i32,
     pub my_dominated_count: i32,
     pub enemy_dominated_count: i32,
-    pub npv_score: i32,
-    pub roi_score: i32,
+}
+
+/// AI バージョンに依存しない客観的な盤面計測値。
+/// V1 / V2 を同じ物差しで比較するための検証用メトリクス。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ObjectiveMetrics {
+    /// ZOC 方式の支配面積 (ユニットのマス + 隣接マス + 占領済み拠点)
+    pub zoc_area: i32,
+    /// 所有拠点数
+    pub owned_properties: i32,
+    /// 1ターンあたりの収入合計
+    pub income_per_turn: i32,
+    /// 未占領・敵拠点の獲得機会価値 (NPV) 合計
+    pub npv: i32,
+    /// 開始からの累計与ダメージ価値 (ゴールド換算)
+    pub combat_value_dealt: i64,
+    /// 開始からの累計被ダメージ価値 (ゴールド換算)
+    pub combat_value_received: i64,
 }
 
 /// 盤面の静的評価関数。
@@ -202,7 +228,8 @@ pub fn evaluate_board_with_metrics(
 // 従来型 AI 用の簡易評価ロジック (V1)
 // ==========================================
 pub fn evaluate_board_v1(world: &mut World, perspective_player: PlayerId) -> BoardMetrics {
-    let mut score = 0;
+    let mut unit_score = 0;
+    let mut property_score = 0;
 
     let mut capturing_props = HashMap::new();
     let mut prop_query = world.query::<(&GridPosition, &Property)>();
@@ -249,7 +276,7 @@ pub fn evaluate_board_v1(world: &mut World, perspective_player: PlayerId) -> Boa
                     }
                 }
             }
-            score += value;
+            unit_score += value;
         } else {
             if let Some(pos) = pos_opt {
                 if let Some(&capture_points) = capturing_props.get(pos) {
@@ -260,7 +287,7 @@ pub fn evaluate_board_v1(world: &mut World, perspective_player: PlayerId) -> Boa
                     }
                 }
             }
-            score -= value;
+            unit_score -= value;
         }
     }
 
@@ -275,9 +302,9 @@ pub fn evaluate_board_v1(world: &mut World, perspective_player: PlayerId) -> Boa
             };
 
             if owner == perspective_player {
-                score += prop_value;
+                property_score += prop_value;
             } else {
-                score -= prop_value;
+                property_score -= prop_value;
             }
         }
     }
@@ -294,14 +321,16 @@ pub fn evaluate_board_v1(world: &mut World, perspective_player: PlayerId) -> Boa
             }
         }
     }
-    score += (my_territory - enemy_territory) * TERRITORY_WEIGHT;
+    let territory_score = (my_territory - enemy_territory) * TERRITORY_WEIGHT;
 
     BoardMetrics {
-        total_score: score,
+        total_score: unit_score + property_score + territory_score,
+        unit_score,
+        property_score,
+        territory_score,
+        npv_score: 0,
         my_dominated_count: my_territory,
         enemy_dominated_count: enemy_territory,
-        npv_score: 0,
-        roi_score: 0,
     }
 }
 
@@ -313,7 +342,8 @@ fn evaluate_board_v2(
     perspective_player: PlayerId,
     cache: Option<&mut crate::ai::turn_distance::AiTurnCache>,
 ) -> BoardMetrics {
-    let mut score = 0;
+    let mut unit_score = 0;
+    let mut property_score = 0;
 
     let map = world.resource::<Map>().clone();
     let registry = world.resource::<MasterDataRegistry>().clone();
@@ -460,7 +490,7 @@ fn evaluate_board_v2(
                     turn_cache,
                 );
                 if let Some(&turns) = p_turns_map.get(pos) {
-                    if min_turn_dist.map_or(true, |m| turns < m) {
+                    if min_turn_dist.is_none_or(|m| turns < m) {
                         min_turn_dist = Some(turns);
                     }
                 }
@@ -553,9 +583,9 @@ fn evaluate_board_v2(
         }
 
         if is_my_unit {
-            score += value;
+            unit_score += value;
         } else {
-            score -= value;
+            unit_score -= value;
         }
     }
 
@@ -610,9 +640,9 @@ fn evaluate_board_v2(
             let prop_value = (base_prop_value as f32 * (0.5 + consolidation_ratio)) as i32;
 
             if owner == perspective_player {
-                score += prop_value;
+                property_score += prop_value;
             } else {
-                score -= prop_value;
+                property_score -= prop_value;
             }
         }
     }
@@ -620,7 +650,8 @@ fn evaluate_board_v2(
     // 3. 領域支配スコア (ZOC 方式)
     // 支配領域 = ユニットのいるマス + その隣接マス (ZOC) + 占領済み拠点のマス
     let mut my_cells: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
-    let mut enemy_cells: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    let mut enemy_cells: std::collections::HashSet<(usize, usize)> =
+        std::collections::HashSet::new();
 
     for pos in &my_unit_positions_list {
         my_cells.insert((pos.x, pos.y));
@@ -648,7 +679,7 @@ fn evaluate_board_v2(
     let my_dominated_count = my_cells.len() as i32;
     let enemy_dominated_count = enemy_cells.len() as i32;
 
-    score += (my_dominated_count - enemy_dominated_count) * ZOC_TERRITORY_WEIGHT;
+    let territory_score = (my_dominated_count - enemy_dominated_count) * ZOC_TERRITORY_WEIGHT;
 
     // 4. NPV (正味現在価値) ベースの占領評価
     let t_end = expected_end_turn(&map);
@@ -680,14 +711,138 @@ fn evaluate_board_v2(
         None => 0,
     };
     let npv_score = my_npv - enemy_npv;
-    score += (npv_score as f32 * NPV_WEIGHT) as i32;
+    let npv_contribution = (npv_score as f32 * NPV_WEIGHT) as i32;
 
     BoardMetrics {
-        total_score: score,
+        total_score: unit_score + property_score + territory_score + npv_contribution,
+        unit_score,
+        property_score,
+        territory_score,
+        npv_score,
         my_dominated_count,
         enemy_dominated_count,
-        npv_score,
-        roi_score: 0,
+    }
+}
+
+/// AI バージョンに依存しない客観メトリクスを計算する。
+/// V1 / V2 を同じ物差しで比較する検証・分析用であり、AI の探索評価には使用しない
+/// （毎ターン1回程度の呼び出しを想定）。
+pub fn compute_objective_metrics(world: &mut World, player: PlayerId) -> ObjectiveMetrics {
+    let map = world.resource::<Map>().clone();
+    let registry = world.resource::<MasterDataRegistry>().clone();
+    let current_turn = world
+        .get_resource::<crate::resources::MatchState>()
+        .map(|ms| ms.current_turn_number.0)
+        .unwrap_or(1);
+
+    // ユニット走査: 占有情報・ZOC・占領可能ユニット・輸送ユニットの収集
+    let mut unit_positions = HashMap::new();
+    let mut my_positions: Vec<GridPosition> = Vec::new();
+    let mut capture_units: Vec<CaptureUnitInfo> = Vec::new();
+    let mut transports: Vec<TransportInfo> = Vec::new();
+
+    let mut q = world.query::<(
+        &Faction,
+        &GridPosition,
+        &UnitStats,
+        Option<&crate::components::Transporting>,
+        Option<&crate::components::CargoCapacity>,
+    )>();
+    for (faction, pos, stats, transporting_opt, cargo_opt) in q.iter(world) {
+        // 輸送中ユニットは盤外座標 (x=9999) のため除外
+        if transporting_opt.is_some() {
+            continue;
+        }
+        unit_positions.insert(
+            (pos.x, pos.y),
+            crate::systems::movement::OccupantInfo {
+                player_id: faction.0,
+                is_transport: stats.max_cargo > 0,
+                unit_type: stats.unit_type,
+                loadable_types: stats.loadable_unit_types.clone(),
+                free_slots: stats.max_cargo,
+            },
+        );
+        if faction.0 != player {
+            continue;
+        }
+        my_positions.push(*pos);
+        if stats.can_capture {
+            capture_units.push(CaptureUnitInfo {
+                pos: *pos,
+                movement_type: stats.movement_type,
+                max_movement: stats.max_movement,
+                faction: faction.0,
+                unit_type: stats.unit_type,
+            });
+        }
+        if stats.max_cargo > 0 {
+            let free_slots = cargo_opt
+                .map(|c| c.max.saturating_sub(c.loaded.len() as u32))
+                .unwrap_or(stats.max_cargo);
+            if free_slots > 0 {
+                transports.push(TransportInfo {
+                    pos: *pos,
+                    movement_type: stats.movement_type,
+                    max_movement: stats.max_movement,
+                    faction: faction.0,
+                    loadable: stats.loadable_unit_types.clone(),
+                });
+            }
+        }
+    }
+
+    // ZOC 支配面積 (ユニットのマス + 隣接マス)
+    let mut cells: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    for pos in &my_positions {
+        cells.insert((pos.x, pos.y));
+        for adj in map.get_adjacent(pos.x, pos.y) {
+            cells.insert(adj);
+        }
+    }
+
+    // 拠点: 所有数・収入・支配セル追加
+    let mut properties = Vec::new();
+    let mut owned_properties = 0;
+    let mut income_per_turn = 0i32;
+    let mut prop_query = world.query::<(&GridPosition, &Property)>();
+    for (pos, prop) in prop_query.iter(world) {
+        properties.push((*pos, prop.clone()));
+        if prop.owner_id == Some(player) {
+            owned_properties += 1;
+            income_per_turn += registry.landscape_income(prop.terrain.as_str()) as i32;
+            cells.insert((pos.x, pos.y));
+        }
+    }
+
+    // NPV (獲得機会価値)
+    let mut cache = crate::ai::turn_distance::AiTurnCache::default();
+    let npv = side_npv(
+        &map,
+        &registry,
+        &unit_positions,
+        &properties,
+        player,
+        &capture_units,
+        &transports,
+        current_turn,
+        expected_end_turn(&map),
+        &mut cache,
+    );
+
+    // 戦闘損益 (累計、ゴールド換算)
+    let record = world
+        .get_resource::<crate::resources::CombatLedger>()
+        .and_then(|l| l.records.get(&player).copied())
+        .unwrap_or_default();
+
+    ObjectiveMetrics {
+        zoc_area: cells.len() as i32,
+        owned_properties,
+        income_per_turn,
+        npv,
+        combat_value_dealt: record.value_dealt,
+        combat_value_received: record.value_received,
     }
 }
 
@@ -807,11 +962,16 @@ mod tests {
         world.insert_resource(settings);
 
         // テスト用のマップを登録（幅10, 高さ10）
-        let mut map = Map::new(10, 10, Terrain::Plains, crate::resources::GridTopology::Square);
+        let mut map = Map::new(
+            10,
+            10,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
         // 全て平原にしておく
         for x in 0..10 {
             for y in 0..10 {
-                map.set_terrain(x, y, Terrain::Plains);
+                let _ = map.set_terrain(x, y, Terrain::Plains);
             }
         }
         world.insert_resource(map);
@@ -842,7 +1002,10 @@ mod tests {
         world.spawn((
             Faction(p1),
             GridPosition { x: 4, y: 5 },
-            Health { current: 100, max: 100 },
+            Health {
+                current: 100,
+                max: 100,
+            },
             UnitStats {
                 movement_type: crate::resources::MovementType::Infantry,
                 max_movement: 3,
@@ -853,7 +1016,10 @@ mod tests {
         world.spawn((
             Faction(p2),
             GridPosition { x: 8, y: 8 },
-            Health { current: 100, max: 100 },
+            Health {
+                current: 100,
+                max: 100,
+            },
             UnitStats {
                 movement_type: crate::resources::MovementType::Infantry,
                 max_movement: 3,
@@ -865,7 +1031,10 @@ mod tests {
         world.spawn((
             Faction(p2),
             GridPosition { x: 1, y: 0 },
-            Health { current: 100, max: 100 },
+            Health {
+                current: 100,
+                max: 100,
+            },
             UnitStats {
                 movement_type: crate::resources::MovementType::Infantry,
                 max_movement: 3,
@@ -880,7 +1049,10 @@ mod tests {
         // P2: ユニット(8,8) -> 5マス、ユニット(1,0) -> {(1,0),(0,0),(2,0),(1,1)} の4マス(マップ端)、
         //     所有拠点(9,9) = 5 + 4 + 1 = 10
         assert_eq!(metrics.my_dominated_count, 6, "P1 should dominate 6 cells");
-        assert_eq!(metrics.enemy_dominated_count, 10, "P2 should dominate 10 cells");
+        assert_eq!(
+            metrics.enemy_dominated_count, 10,
+            "P2 should dominate 10 cells"
+        );
     }
 
     #[test]
@@ -936,6 +1108,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(eta_with_heli, 4);
-        assert!(eta_with_heli < walk_eta, "輸送ヘリ活用でETAが短縮されること");
+        assert!(
+            eta_with_heli < walk_eta,
+            "輸送ヘリ活用でETAが短縮されること"
+        );
     }
 }

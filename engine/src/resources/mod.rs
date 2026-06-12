@@ -454,3 +454,36 @@ pub struct ProductionDiagnostic {
     pub last_event: Option<String>,
     pub income_log: Vec<String>,
 }
+
+/// プレイヤーごとの戦闘損益（ゴールド換算）の累計。
+/// ROI（戦闘効率 = 与ダメージ価値 / 被ダメージ価値）の計測に使用する。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CombatRecord {
+    /// 敵ユニットに与えたダメージのゴールド換算価値 (cost × ダメージ / 最大HP)
+    pub value_dealt: i64,
+    /// 自軍ユニットが受けたダメージのゴールド換算価値
+    pub value_received: i64,
+}
+
+#[derive(Resource, Debug, Clone, Default)]
+pub struct CombatLedger {
+    pub records: HashMap<crate::components::PlayerId, CombatRecord>,
+}
+
+impl CombatLedger {
+    /// 攻撃1回分の損益を両陣営に記録する
+    pub fn record_attack(
+        &mut self,
+        attacker: crate::components::PlayerId,
+        defender: crate::components::PlayerId,
+        dealt_value: i64,
+        counter_value: i64,
+    ) {
+        let a = self.records.entry(attacker).or_default();
+        a.value_dealt += dealt_value;
+        a.value_received += counter_value;
+        let d = self.records.entry(defender).or_default();
+        d.value_dealt += counter_value;
+        d.value_received += dealt_value;
+    }
+}

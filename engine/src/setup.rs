@@ -13,6 +13,7 @@ pub fn create_world() -> (World, Schedule) {
     // Register resources
     world.init_resource::<crate::ai::engine::AiActionCooldown>();
     world.init_resource::<crate::ai::engine::AiProductionCooldown>();
+    world.init_resource::<CombatLedger>();
 
     // Register events
     world.init_resource::<Events<ProduceUnitCommand>>();
