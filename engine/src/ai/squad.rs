@@ -435,7 +435,10 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
             // ---------------------------------------------------------
             let mut best_cargo_idx = None;
             let mut is_combat_cargo = true;
-            let mut min_turn_dist = crate::ai::turn_distance::TurnDistance { turns: u32::MAX, used_mp: u32::MAX };
+            let mut min_turn_dist = crate::ai::turn_distance::TurnDistance {
+                turns: u32::MAX,
+                used_mp: u32::MAX,
+            };
 
             // 重車両から探す
             for (i, (_, pos, stats)) in free_combat_units.iter().enumerate() {
@@ -701,7 +704,10 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
 
         // ステップ1: 定員未満の既存 Attack/Defense 部隊のうち、最も近いものを探す
         let mut best_squad_idx = None;
-        let mut min_dist = crate::ai::turn_distance::TurnDistance { turns: u32::MAX, used_mp: u32::MAX };
+        let mut min_dist = crate::ai::turn_distance::TurnDistance {
+            turns: u32::MAX,
+            used_mp: u32::MAX,
+        };
 
         for (idx, squad) in manager.squads.iter().enumerate() {
             if (squad.mission_type == MissionType::Attack
@@ -735,7 +741,10 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         } else {
             // ステップ2: 既存部隊がすべて定員に達している場合、
             // 最も近い敵クラスターを目標とする新規 Attack 部隊（第2波）を新設する
-            let mut nearest_cluster_dist = crate::ai::turn_distance::TurnDistance { turns: u32::MAX, used_mp: u32::MAX };
+            let mut nearest_cluster_dist = crate::ai::turn_distance::TurnDistance {
+                turns: u32::MAX,
+                used_mp: u32::MAX,
+            };
             let mut nearest_cluster_center = None;
 
             for cluster in &enemy_clusters {
