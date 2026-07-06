@@ -13,6 +13,10 @@ const TERRITORY_WEIGHT: i32 = 2500;
 const ZOC_TERRITORY_WEIGHT: i32 = 300;
 const CONSOLIDATION_RADIUS_TURNS: u32 = 2;
 const NPV_WEIGHT: f32 = 1.0;
+/// #49 (V3): 回復インフラの条件付き価値の重み。
+/// 毀損価値 (cost × 欠損HP率) のうち、最寄り回復拠点への到達しやすさに応じて
+/// 回収可能とみなす割合。収入NPVとは独立したモデルのため控えめに設定する。
+const RECOVERY_INFRA_WEIGHT: f32 = 0.5;
 
 /// マップ面積に基づく期待終了ターン (map_1(140マス)≈30T, map_3(900マス)≈61T)
 fn expected_end_turn(map: &Map) -> u32 {
@@ -174,6 +178,8 @@ pub struct BoardMetrics {
     pub territory_score: i32,
     /// NPV スコア (V2 のみ。my_npv − enemy_npv)
     pub npv_score: i32,
+    /// #49 (V3 のみ): 回復インフラの条件付き価値 (my − enemy)
+    pub recovery_score: i32,
     pub my_dominated_count: i32,
     pub enemy_dominated_count: i32,
 }
@@ -220,7 +226,13 @@ pub fn evaluate_board_with_metrics(
 
     match ai_version {
         AiVersion::V1 => evaluate_board_v1(world, perspective_player),
-        AiVersion::V2 => evaluate_board_v2(world, perspective_player, cache),
+        // V3 は V2 の評価をベースに、#49 の回復インフラ評価項を追加する
+        AiVersion::V2 | AiVersion::V3 => evaluate_board_v2(
+            world,
+            perspective_player,
+            cache,
+            ai_version.uses_v3_tactics(),
+        ),
     }
 }
 
@@ -329,18 +341,68 @@ pub fn evaluate_board_v1(world: &mut World, perspective_player: PlayerId) -> Boa
         property_score,
         territory_score,
         npv_score: 0,
+        recovery_score: 0,
         my_dominated_count: my_territory,
         enemy_dominated_count: enemy_territory,
     }
 }
 
+/// #49 (V3): 損傷ユニット1体分の回復インフラ条件付き価値。
+/// 毀損価値 (cost × 欠損HP率) を、最寄りの回復可能な自軍拠点への
+/// 到達ターン数 (ETA, マンハッタン距離/移動力の近似) で割り引く。
+/// 回復拠点が存在しなければ価値は 0 (インフラを失うと損傷が回収不能になる)。
+struct DamagedUnitInfo {
+    pos: GridPosition,
+    unit_type: crate::resources::UnitType,
+    max_movement: u32,
+    faction: PlayerId,
+    /// cost × 欠損HP率 (ゴールド換算の毀損価値)
+    lost_value: i32,
+}
+
+fn side_recovery_infra_value(
+    registry: &MasterDataRegistry,
+    properties: &[(GridPosition, Property)],
+    damaged_units: &[DamagedUnitInfo],
+) -> i32 {
+    let mut total = 0i32;
+    for u in damaged_units {
+        // 最寄りの「このユニットを回復できる」自軍拠点までの距離
+        let mut best_dist: Option<u32> = None;
+        for (p_pos, prop) in properties {
+            if prop.owner_id != Some(u.faction) {
+                continue;
+            }
+            if !registry.can_repair_on_terrain(u.unit_type, prop.terrain) {
+                continue;
+            }
+            let d = (p_pos.x.abs_diff(u.pos.x) + p_pos.y.abs_diff(u.pos.y)) as u32;
+            if best_dist.is_none_or(|b| d < b) {
+                best_dist = Some(d);
+            }
+        }
+        let Some(dist) = best_dist else {
+            continue;
+        };
+        // ETA = 距離 / 移動力 (切り上げ)。移動力 0 のユニットはその場から動けないため対象外
+        if u.max_movement == 0 {
+            continue;
+        }
+        let eta = dist.div_ceil(u.max_movement);
+        total += (u.lost_value as f32 * RECOVERY_INFRA_WEIGHT / (eta + 1) as f32) as i32;
+    }
+    total
+}
+
 // ==========================================
-// 戦術部隊 AI 用の精緻な評価ロジック (V2)
+// 戦術部隊 AI 用の精緻な評価ロジック (V2 / V3)
 // ==========================================
 fn evaluate_board_v2(
     world: &mut World,
     perspective_player: PlayerId,
     cache: Option<&mut crate::ai::turn_distance::AiTurnCache>,
+    // V3 のみ true。#49 の回復インフラ評価項を追加する
+    with_recovery_infra: bool,
 ) -> BoardMetrics {
     let mut unit_score = 0;
     let mut property_score = 0;
@@ -407,6 +469,9 @@ fn evaluate_board_v2(
     let mut enemy_capture_units: Vec<CaptureUnitInfo> = Vec::new();
     let mut my_transports: Vec<TransportInfo> = Vec::new();
     let mut enemy_transports: Vec<TransportInfo> = Vec::new();
+    // #49 (V3): 回復インフラ評価用の損傷ユニット収集
+    let mut my_damaged_units: Vec<DamagedUnitInfo> = Vec::new();
+    let mut enemy_damaged_units: Vec<DamagedUnitInfo> = Vec::new();
 
     let mut query = world.query::<(
         Entity,
@@ -554,6 +619,24 @@ fn evaluate_board_v2(
                     } else {
                         enemy_transports.push(info);
                     }
+                }
+            }
+
+            // #49 (V3): 損傷しているユニットを回復インフラ評価の対象として収集
+            if with_recovery_infra && health.current < health.max && health.max > 0 {
+                let lost_value = (stats.cost as f32 * (health.max - health.current) as f32
+                    / health.max as f32) as i32;
+                let info = DamagedUnitInfo {
+                    pos: *pos,
+                    unit_type: stats.unit_type,
+                    max_movement: stats.max_movement,
+                    faction: faction.0,
+                    lost_value,
+                };
+                if is_my_unit {
+                    my_damaged_units.push(info);
+                } else {
+                    enemy_damaged_units.push(info);
                 }
             }
         }
@@ -713,12 +796,27 @@ fn evaluate_board_v2(
     let npv_score = my_npv - enemy_npv;
     let npv_contribution = (npv_score as f32 * NPV_WEIGHT) as i32;
 
+    // 5. #49 (V3): 回復インフラの条件付き価値。
+    // 損傷ユニットが多く、かつ回復拠点が近いほど価値が高い。
+    // 敵側も同様に評価し、差分をスコアへ加算する。
+    let recovery_score = if with_recovery_infra {
+        side_recovery_infra_value(&registry, &properties, &my_damaged_units)
+            - side_recovery_infra_value(&registry, &properties, &enemy_damaged_units)
+    } else {
+        0
+    };
+
     BoardMetrics {
-        total_score: unit_score + property_score + territory_score + npv_contribution,
+        total_score: unit_score
+            + property_score
+            + territory_score
+            + npv_contribution
+            + recovery_score,
         unit_score,
         property_score,
         territory_score,
         npv_score,
+        recovery_score,
         my_dominated_count,
         enemy_dominated_count,
     }
@@ -1111,6 +1209,77 @@ mod tests {
         assert!(
             eta_with_heli < walk_eta,
             "輸送ヘリ活用でETAが短縮されること"
+        );
+    }
+
+    /// Issue #49: V3 では損傷ユニットの近くに回復インフラ (首都等) があるほど
+    /// recovery_score が高く評価され、V2 では常に 0 であることを検証する
+    #[test]
+    fn test_v3_recovery_infra_value() {
+        // capital_x: 回復拠点 (首都) の x 座標
+        let build_metrics = |version: AiVersion, capital_x: usize| -> BoardMetrics {
+            let mut world = World::new();
+            let p1 = PlayerId(1);
+            let p2 = PlayerId(2);
+
+            let mut settings = PlayerAiSettings::new();
+            settings.set_version(p1, version);
+            settings.set_version(p2, version);
+            world.insert_resource(settings);
+
+            let map = Map::new(
+                12,
+                1,
+                Terrain::Plains,
+                crate::resources::GridTopology::Square,
+            );
+            world.insert_resource(map);
+            world.insert_resource(crate::resources::MasterDataRegistry::load().unwrap());
+            world.insert_resource(crate::resources::MatchState::default());
+
+            // 損傷した自軍戦車 (cost 6000, HP 50/100, 移動4) at x=0
+            world.spawn((
+                Faction(p1),
+                GridPosition { x: 0, y: 0 },
+                Health {
+                    current: 50,
+                    max: 100,
+                },
+                UnitStats {
+                    unit_type: crate::resources::UnitType::Tank,
+                    cost: 6000,
+                    max_movement: 4,
+                    movement_type: crate::resources::MovementType::Tank,
+                    ..UnitStats::mock()
+                },
+            ));
+
+            // 自軍の回復拠点 (首都: 地上部隊を補給・回復できる)
+            world.spawn((
+                GridPosition { x: capital_x, y: 0 },
+                Property::new(Terrain::Capital, Some(p1), 200),
+            ));
+
+            evaluate_board_with_metrics(&mut world, p1, None)
+        };
+
+        // V2: 回復インフラ評価は常に 0
+        let v2 = build_metrics(AiVersion::V2, 1);
+        assert_eq!(v2.recovery_score, 0, "V2 では recovery_score は 0");
+
+        // V3: 回復拠点が近い (x=1, ETA 1) ほうが遠い (x=11, ETA 3) より高評価
+        let v3_near = build_metrics(AiVersion::V3, 1);
+        let v3_far = build_metrics(AiVersion::V3, 11);
+        assert!(
+            v3_near.recovery_score > 0,
+            "損傷ユニット + 回復拠点があれば正の価値 (actual: {})",
+            v3_near.recovery_score
+        );
+        assert!(
+            v3_near.recovery_score > v3_far.recovery_score,
+            "回復拠点が近いほど価値が高い (near: {}, far: {})",
+            v3_near.recovery_score,
+            v3_far.recovery_score
         );
     }
 }

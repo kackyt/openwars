@@ -869,7 +869,11 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> Option<Str
 
     match ai_version {
         crate::ai::ai_version::AiVersion::V1 => execute_ai_turn_v1(world, active_player),
-        crate::ai::ai_version::AiVersion::V2 => execute_ai_turn_v2(world, active_player),
+        // V3 は V2 と同じ部隊編成・ビーム探索パイプラインを共有し、
+        // タイル評価 (decide_ai_action_v2) と盤面評価の中でバージョン別の強化を行う
+        crate::ai::ai_version::AiVersion::V2 | crate::ai::ai_version::AiVersion::V3 => {
+            execute_ai_turn_v2(world, active_player)
+        }
     }
 }
 
@@ -1200,13 +1204,76 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     None
 }
 
-/// 新しいAI (V2) 用の行動意思決定エンジン。
+/// #45 (V3): 待ち伏せポジションのスコア。射程内で待機して先制攻撃を狙う位置
+const AMBUSH_IN_RANGE_BONUS: i32 = 4000;
+/// #45 (V3): 敵の進行を1〜2ターン待ち受けられる位置のスコア
+const AMBUSH_NEAR_RANGE_BONUS: i32 = 2000;
+/// #45 (V3): 最小射程より内側 (攻撃不能な近距離) へ前進するペナルティ
+const AMBUSH_TOO_CLOSE_PENALTY: i32 = 3000;
+/// #45 (V3): 待ち受けゾーンとみなす最大射程からのマージン (敵の接近を想定)
+const AMBUSH_APPROACH_MARGIN: u32 = 2;
+
+/// #50 (V3): 露出ペナルティのリスク係数 (分子/分母 = 1.5倍)。
+/// 期待被弾価値をそのまま引くのではなく、翌ターン以降も継続して撃たれる
+/// リスクを織り込んで少し重めに評価する
+const EXPOSURE_RISK_NUM: i32 = 3;
+const EXPOSURE_RISK_DEN: i32 = 2;
+
+/// #50 (V3): 指定タイルに立った場合に敵の間接攻撃ユニットから受ける
+/// 期待被弾価値 (ゴールド換算) に基づく露出ペナルティを計算する。
+/// 地形防御ボーナスで軽減されるため、防御地形に隠れる行動 (#44) と整合する。
+#[allow(clippy::too_many_arguments)]
+fn indirect_exposure_penalty(
+    tile: (usize, usize),
+    my_unit_type: crate::resources::UnitType,
+    my_cost: u32,
+    my_hp: u32,
+    tile_def_bonus: u32,
+    enemy_units: &[(GridPosition, crate::resources::UnitType, u32, u32, u32, u32)],
+    damage_chart: &crate::resources::DamageChart,
+) -> i32 {
+    let mut total_damage: u32 = 0;
+    for (e_pos, e_type, _e_cost, _e_hp, e_min_range, e_max_range) in enemy_units {
+        // 間接攻撃ユニット (min_range > 1) のみが対象。
+        // 間接ユニットは移動後に攻撃できないため、脅威範囲は現在位置からの射程とする
+        if *e_min_range <= 1 {
+            continue;
+        }
+        let dist = (e_pos.x.abs_diff(tile.0) + e_pos.y.abs_diff(tile.1)) as u32;
+        if dist < *e_min_range || dist > *e_max_range {
+            continue;
+        }
+        let base_dmg = damage_chart
+            .get_base_damage(*e_type, my_unit_type)
+            .or_else(|| damage_chart.get_base_damage_secondary(*e_type, my_unit_type))
+            .unwrap_or(0);
+        // 地形防御ボーナスによる軽減 (簡易近似)
+        total_damage += base_dmg * (100 - tile_def_bonus.min(100)) / 100;
+    }
+    if total_damage == 0 {
+        return 0;
+    }
+    // 被弾は残HPを超えない
+    let effective_damage = total_damage.min(my_hp);
+    let expected_loss_value = (effective_damage * my_cost / 100) as i32;
+    expected_loss_value * EXPOSURE_RISK_NUM / EXPOSURE_RISK_DEN
+}
+
+/// 新しいAI (V2/V3) 用の行動意思決定エンジン。
 /// 各ユニットの所属部隊の割り当て目標（squad.target）に向かう接近スコアをベースに行動を決定します。
+/// V3 の場合は #44 (低HP時の地形防御優先)・#45 (間接攻撃の待ち伏せ)・
+/// #50 (間接砲火への露出ペナルティ) の戦術評価が追加されます。
 pub fn decide_ai_action_v2(
     world: &mut World,
     player_id: PlayerId,
     skip_entities: &std::collections::HashSet<Entity>,
 ) -> Option<(Entity, AiCommand)> {
+    // V3 の戦術評価 (#44/#45/#50) を有効にするかどうか
+    let is_v3 = world
+        .get_resource::<crate::ai::ai_version::PlayerAiSettings>()
+        .map(|s| s.get_version(player_id).uses_v3_tactics())
+        .unwrap_or(false);
+
     // 1. 行動可能なユニットを収集
     let mut movable_units = Vec::new();
     let mut unit_positions = HashMap::new();
@@ -1366,8 +1433,53 @@ pub fn decide_ai_action_v2(
             );
 
             let mut base_tile_score = 0;
-            if let Some(terrain) = map.get_terrain(current_grid.x, current_grid.y) {
-                base_tile_score += registry.get_terrain_defense_bonus(terrain) as i32 * 10;
+            let tile_def_bonus = map
+                .get_terrain(current_grid.x, current_grid.y)
+                .map(|t| registry.get_terrain_defense_bonus(t))
+                .unwrap_or(0);
+            base_tile_score += tile_def_bonus as i32 * 10;
+
+            // #44 (V3): HP が低下しているほど防御地形 (森・山) への評価を引き上げ、
+            // 生存率を高める位置取りを優先させる
+            if is_v3 && atk_hp < 70 {
+                base_tile_score += tile_def_bonus as i32 * (100 - atk_hp as i32) * 2;
+            }
+
+            // #50 (V3): 敵間接攻撃ユニットの射程内 (脅威マップ) に入るタイルには
+            // 期待被弾価値に応じた露出ペナルティを課す。
+            // 撃破 (+5000) や占領 (+10000) などリターンの大きい行動は
+            // 行動側の加点によって自然に相殺される
+            if is_v3 {
+                base_tile_score -= indirect_exposure_penalty(
+                    (current_grid.x, current_grid.y),
+                    stats.unit_type,
+                    stats.cost,
+                    atk_hp,
+                    tile_def_bonus,
+                    &enemy_units,
+                    &damage_chart,
+                );
+            }
+
+            // #45 (V3): 間接攻撃ユニットの待ち伏せポジショニング。
+            // 射程内 (先制攻撃圏) や敵の接近を待ち受けられる位置での待機を加点し、
+            // 最小射程より内側への不要な前進を減点する
+            if is_v3 && stats.min_range > 1 && !is_combat_ineffective && !enemy_units.is_empty() {
+                let mut nearest_enemy_dist = u32::MAX;
+                for (e_pos, _, _, _, _, _) in &enemy_units {
+                    let d = (e_pos.x.abs_diff(current_grid.x) + e_pos.y.abs_diff(current_grid.y))
+                        as u32;
+                    if d < nearest_enemy_dist {
+                        nearest_enemy_dist = d;
+                    }
+                }
+                if nearest_enemy_dist < stats.min_range {
+                    base_tile_score -= AMBUSH_TOO_CLOSE_PENALTY;
+                } else if nearest_enemy_dist <= stats.max_range {
+                    base_tile_score += AMBUSH_IN_RANGE_BONUS;
+                } else if nearest_enemy_dist <= stats.max_range + AMBUSH_APPROACH_MARGIN {
+                    base_tile_score += AMBUSH_NEAR_RANGE_BONUS;
+                }
             }
 
             // 1. 部隊目標への接近ボーナス
@@ -3135,5 +3247,282 @@ mod tests {
         // cooldown リソースを確認し、ヘリがクールダウン中に留まっていること
         let cooldown2 = world.get_resource::<AiActionCooldown>().unwrap();
         assert!(cooldown2.0.contains(&heli));
+    }
+
+    /// V3 テスト用の共通ワールドを構築するヘルパー。
+    /// 幅 width x 高さ 1 の平原マップと必要リソースを登録する。
+    fn setup_v3_test_world(width: usize, version: crate::ai::ai_version::AiVersion) -> World {
+        let mut world = World::new();
+        world.insert_resource(Map {
+            width,
+            height: 1,
+            tiles: vec![Terrain::Plains; width],
+            topology: crate::resources::GridTopology::Square,
+        });
+        crate::resources::master_data::MasterDataRegistry::load()
+            .map(|m| world.insert_resource(m))
+            .unwrap();
+        let mut settings = crate::ai::ai_version::PlayerAiSettings::new();
+        settings.set_version(PlayerId(1), version);
+        settings.set_version(PlayerId(2), version);
+        world.insert_resource(settings);
+        world
+    }
+
+    /// 移動可能な自軍ユニットをスポーンするヘルパー
+    fn spawn_v3_test_unit(
+        world: &mut World,
+        player: PlayerId,
+        x: usize,
+        hp: u32,
+        stats: UnitStats,
+    ) -> Entity {
+        world
+            .spawn((
+                Faction(player),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x, y: 0 },
+                stats,
+                Health {
+                    current: hp,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+            ))
+            .id()
+    }
+
+    /// 指定ユニット1体のみからなる部隊 (目標つき) を登録するヘルパー
+    fn insert_single_unit_squad(world: &mut World, member: Entity, target: GridPosition) {
+        let mut manager = crate::ai::squad::SquadManager::default();
+        let mut members = std::collections::HashSet::new();
+        members.insert(member);
+        manager.squads.push(crate::ai::squad::Squad {
+            id: crate::ai::squad::SquadId(1),
+            members,
+            mission_type: crate::ai::squad::MissionType::Attack,
+            target: Some(target),
+            target_island: None,
+            phase: crate::ai::squad::MissionPhase::MovingToTarget,
+            transport_cargo: None,
+        });
+        world.insert_resource(manager);
+    }
+
+    /// Issue #50: V3 は敵間接攻撃ユニットの射程 (脅威マップ) 内への
+    /// 前進を避け、V2 は露出を考慮せず前進することを検証する
+    #[test]
+    fn test_v3_avoids_indirect_fire_exposure() {
+        use crate::ai::ai_version::AiVersion;
+
+        let run = |version: AiVersion| -> (usize, usize) {
+            let mut world = setup_v3_test_world(12, version);
+            let mut dc = DamageChart::new();
+            // 重自走砲 (射程3-5) は軽戦車に大ダメージ、軽戦車の反対方向は中程度
+            dc.insert_damage(UnitType::HeavySpGun, UnitType::Tank, 92);
+            dc.insert_damage(UnitType::Tank, UnitType::HeavySpGun, 43);
+            world.insert_resource(dc);
+
+            // 自軍: 軽戦車 (移動4) at x=0
+            let tank = spawn_v3_test_unit(
+                &mut world,
+                PlayerId(1),
+                0,
+                100,
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    cost: 6000,
+                    max_movement: 4,
+                    movement_type: crate::resources::MovementType::Tank,
+                    min_range: 1,
+                    max_range: 1,
+                    max_fuel: 99,
+                    ..UnitStats::mock()
+                },
+            );
+            let _ = tank;
+
+            // 敵軍: 重自走砲 (射程3-5) at x=9 -> 脅威ゾーンは x in [4,6]
+            world.spawn((
+                Faction(PlayerId(2)),
+                HasMoved(true),
+                ActionCompleted(true),
+                GridPosition { x: 9, y: 0 },
+                UnitStats {
+                    unit_type: UnitType::HeavySpGun,
+                    cost: 16500,
+                    max_movement: 5,
+                    movement_type: crate::resources::MovementType::Tank,
+                    min_range: 3,
+                    max_range: 5,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ));
+
+            let skips = std::collections::HashSet::new();
+            let action =
+                decide_ai_action_v2(&mut world, PlayerId(1), &skips).expect("行動が決定されること");
+            match action.1 {
+                AiCommand::Wait { target_pos } => (target_pos.x, target_pos.y),
+                other => panic!("Wait/Move を期待したが {:?}", other),
+            }
+        };
+
+        // V2: 露出を考慮せず、最も敵に近い x=4 (脅威ゾーン内) へ前進する
+        let (v2_x, _) = run(AiVersion::V2);
+        assert_eq!(v2_x, 4, "V2 は脅威ゾーン内 (x=4) まで前進するはず");
+
+        // V3: 脅威ゾーン (x in [4,6]) を避けて手前で待機する
+        let (v3_x, _) = run(AiVersion::V3);
+        assert!(
+            v3_x < 4,
+            "V3 は敵間接攻撃の射程外 (x<4) で待機するはず (actual: x={})",
+            v3_x
+        );
+    }
+
+    /// Issue #45: 間接攻撃ユニットが最小射程より内側へ不要な前進をせず、
+    /// 先制攻撃圏 (待ち伏せ位置) で待機することを検証する
+    #[test]
+    fn test_v3_indirect_ambush_positioning() {
+        use crate::ai::ai_version::AiVersion;
+
+        let run = |version: AiVersion| -> usize {
+            let mut world = setup_v3_test_world(12, version);
+            let mut dc = DamageChart::new();
+            dc.insert_damage(UnitType::LightSpGun, UnitType::Tank, 55);
+            dc.insert_damage(UnitType::Tank, UnitType::LightSpGun, 56);
+            world.insert_resource(dc);
+
+            // 自軍: 軽自走砲 (射程2-3, 移動4) at x=0
+            let sp_gun = spawn_v3_test_unit(
+                &mut world,
+                PlayerId(1),
+                0,
+                100,
+                UnitStats {
+                    unit_type: UnitType::LightSpGun,
+                    cost: 6200,
+                    max_movement: 4,
+                    movement_type: crate::resources::MovementType::Tank,
+                    min_range: 2,
+                    max_range: 3,
+                    max_fuel: 99,
+                    ..UnitStats::mock()
+                },
+            );
+
+            // 敵軍: 軽戦車 at x=5
+            world.spawn((
+                Faction(PlayerId(2)),
+                HasMoved(true),
+                ActionCompleted(true),
+                GridPosition { x: 5, y: 0 },
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    cost: 6000,
+                    max_movement: 4,
+                    movement_type: crate::resources::MovementType::Tank,
+                    min_range: 1,
+                    max_range: 1,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ));
+
+            // 部隊目標は敵戦車の位置
+            insert_single_unit_squad(&mut world, sp_gun, GridPosition { x: 5, y: 0 });
+
+            let skips = std::collections::HashSet::new();
+            let action =
+                decide_ai_action_v2(&mut world, PlayerId(1), &skips).expect("行動が決定されること");
+            match action.1 {
+                AiCommand::Wait { target_pos } => target_pos.x,
+                other => panic!("Wait/Move を期待したが {:?}", other),
+            }
+        };
+
+        // V2: 接近ボーナスの勾配に従い、最小射程の内側 x=4 (距離1) まで前進してしまう
+        let v2_x = run(AiVersion::V2);
+        assert_eq!(v2_x, 4, "V2 は最小射程の内側 (x=4) まで前進するはず");
+
+        // V3: 先制攻撃圏 (距離2-3 = x in [2,3]) で待ち伏せする
+        let v3_x = run(AiVersion::V3);
+        let v3_dist = 5 - v3_x;
+        assert!(
+            (2..=3).contains(&v3_dist),
+            "V3 は射程内の待ち伏せ位置 (距離2-3) で待機するはず (actual: x={}, dist={})",
+            v3_x,
+            v3_dist
+        );
+    }
+
+    /// Issue #44: HP が低下したユニットが、接近ボーナスの勾配に逆らってでも
+    /// 平地より防御効果の高い森で待機することを検証する
+    #[test]
+    fn test_v3_low_hp_prefers_defensive_terrain() {
+        use crate::ai::ai_version::AiVersion;
+
+        let run = |version: AiVersion, hp: u32| -> usize {
+            let mut world = setup_v3_test_world(12, version);
+            world.insert_resource(DamageChart::new());
+            // x=2 だけ森 (防御20)、他は平地 (防御5)
+            world
+                .resource_mut::<Map>()
+                .set_terrain(2, 0, Terrain::Forest)
+                .unwrap();
+
+            // 自軍: 軽戦車 at x=0 (部隊目標 x=10 に向かって前進中)
+            let tank = spawn_v3_test_unit(
+                &mut world,
+                PlayerId(1),
+                0,
+                hp,
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    cost: 6000,
+                    max_movement: 4,
+                    movement_type: crate::resources::MovementType::Tank,
+                    min_range: 1,
+                    max_range: 1,
+                    max_fuel: 99,
+                    ..UnitStats::mock()
+                },
+            );
+            insert_single_unit_squad(&mut world, tank, GridPosition { x: 10, y: 0 });
+
+            let skips = std::collections::HashSet::new();
+            let action =
+                decide_ai_action_v2(&mut world, PlayerId(1), &skips).expect("行動が決定されること");
+            match action.1 {
+                AiCommand::Wait { target_pos } => target_pos.x,
+                other => panic!("Wait/Move を期待したが {:?}", other),
+            }
+        };
+
+        // V2 は低HPでも目標へ最短で前進する (森 x=2 の移動コストにより x=3 が最遠到達点)
+        let v2_x = run(AiVersion::V2, 40);
+        assert_eq!(v2_x, 3, "V2 は低HPでも平地 (x=3) まで前進するはず");
+
+        // V3 は健全時は前進を優先し、低HP時は森 (x=2) で待機する
+        let v3_healthy_x = run(AiVersion::V3, 100);
+        assert_eq!(v3_healthy_x, 3, "V3 も健全時は前進を優先するはず");
+        let v3_low_hp_x = run(AiVersion::V3, 40);
+        assert_eq!(
+            v3_low_hp_x, 2,
+            "V3 は低HP時に森 (x=2) で待機するはず (actual: x={})",
+            v3_low_hp_x
+        );
     }
 }

@@ -160,9 +160,10 @@ impl OpenWarsAiServer {
             let version = match args.version.as_str() {
                 "V1" => engine::ai::AiVersion::V1,
                 "V2" => engine::ai::AiVersion::V2,
+                "V3" => engine::ai::AiVersion::V3,
                 _ => {
                     return Err(format!(
-                        "Invalid AI version: {}. Must be 'V1' or 'V2'",
+                        "Invalid AI version: {}. Must be 'V1', 'V2' or 'V3'",
                         args.version
                     ));
                 }
