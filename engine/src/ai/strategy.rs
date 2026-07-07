@@ -35,6 +35,8 @@ pub struct ProductionStrategy {
     pub priority_targets: Vec<GridPosition>,
     /// 未占領（中立）拠点の座標リスト
     pub unowned_properties: std::collections::HashSet<GridPosition>,
+    /// 敵所有拠点の座標リスト (#53: 占領部隊の奪取目標として使用)
+    pub enemy_properties: std::collections::HashSet<GridPosition>,
     /// 歩兵など、ヘリでも運搬可能な軽輸送需要
     pub light_transport_demand: u32,
     /// 車両など、輸送船でしか運搬できない重輸送需要
@@ -173,8 +175,9 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
         }
     }
 
-    // unowned_properties を strategy に保存
+    // unowned_properties / enemy_properties を strategy に保存
     strategy.unowned_properties = unowned_properties.iter().cloned().collect();
+    strategy.enemy_properties = enemy_properties.iter().cloned().collect();
 
     let mut my_units = Vec::new();
     let mut enemy_units = Vec::new();

@@ -209,6 +209,26 @@ def run_single_game(map_name, p1_ver, p2_ver, max_turns, ui_callback=None):
                 acts_dict["Load"] += 1
             elif "DropUnitCommand" in action_str:
                 acts_dict["Drop"] += 1
+            # AiCommand (V2/V3 系) のデバッグ文字列。Capture は座標付きで記録し、
+            # どの拠点を占領しようとしているか追跡できるようにする
+            elif action_str.startswith("Capture"):
+                m2 = re.search(r"x:\s*(\d+),\s*y:\s*(\d+)", action_str)
+                if m2:
+                    acts_dict[f"Capture@({m2.group(1)},{m2.group(2)})"] += 1
+                else:
+                    acts_dict["Capture"] += 1
+            elif action_str.startswith("Attack"):
+                acts_dict["Attack"] += 1
+            elif action_str.startswith("Wait"):
+                acts_dict["Wait"] += 1
+            elif action_str.startswith("Merge"):
+                acts_dict["Merge"] += 1
+            elif action_str.startswith("Load"):
+                acts_dict["Load"] += 1
+            elif action_str.startswith("Drop"):
+                acts_dict["Drop"] += 1
+            elif action_str.startswith("Supply"):
+                acts_dict["Supply"] += 1
 
         if ui_callback and acts_dict:
             act_str = ", ".join([f"{k}({v})" for k, v in acts_dict.items()])

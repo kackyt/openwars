@@ -1213,11 +1213,12 @@ const AMBUSH_TOO_CLOSE_PENALTY: i32 = 3000;
 /// #45 (V3): 待ち受けゾーンとみなす最大射程からのマージン (敵の接近を想定)
 const AMBUSH_APPROACH_MARGIN: u32 = 2;
 
-/// #50 (V3): 露出ペナルティのリスク係数 (分子/分母 = 1.5倍)。
-/// 期待被弾価値をそのまま引くのではなく、翌ターン以降も継続して撃たれる
-/// リスクを織り込んで少し重めに評価する
-const EXPOSURE_RISK_NUM: i32 = 3;
-const EXPOSURE_RISK_DEN: i32 = 2;
+/// #50 (V3): 露出ペナルティのリスク係数 (分子/分母 = 1.0倍)。
+/// 1.5倍で運用したところ、重ねられた間接砲火の脅威圏に前線ユニットが
+/// 一切踏み込まなくなり、防衛線を明け渡す過剰回避が観測されたため、
+/// 期待被弾価値の等倍に設定する
+const EXPOSURE_RISK_NUM: i32 = 1;
+const EXPOSURE_RISK_DEN: i32 = 1;
 
 /// #50 (V3): 指定タイルに立った場合に敵の間接攻撃ユニットから受ける
 /// 期待被弾価値 (ゴールド換算) に基づく露出ペナルティを計算する。
@@ -1669,7 +1670,11 @@ pub fn decide_ai_action_v2(
                 }
             }
 
-            if effective_can_capture {
+            // #53 (V3): 部隊に所属する占領ユニットは部隊目標への接近のみに従う。
+            // 汎用の「最寄り非所有拠点への引力」は部隊目標と同じ重みを持つため、
+            // これを併用すると常に最寄りの前線都市へ引き戻され、
+            // 後方の敵生産施設を目標とする部隊が機能しなくなる
+            if effective_can_capture && (!is_v3 || is_solo) {
                 let mut min_score: Option<(crate::ai::turn_distance::TurnDistance, i32)> = None;
                 for (p_pos, _p_terrain, p_owner) in &properties {
                     if *p_owner != Some(player_id) {
