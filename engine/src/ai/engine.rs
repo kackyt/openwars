@@ -1616,6 +1616,10 @@ pub fn decide_ai_action_v2(
             }
 
             // (B) 歩兵の待機移動ロジック
+            // 注: 座礁した戦闘車両にも海岸移動を適用する実験を行ったが、
+            // 全ユニットが海岸に密集して海峡越しに交戦誤判定 (is_engaged は
+            // 海を無視したマンハッタン距離) を誘発し、フェーズが Contested に
+            // 固定されて拡張が停止する退行が観測されたため、歩兵限定に戻した
             let is_infantry = stats.unit_type == crate::resources::UnitType::Infantry
                 || stats.unit_type == crate::resources::UnitType::Mech;
             if is_infantry

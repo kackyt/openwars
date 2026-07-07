@@ -694,7 +694,13 @@ pub fn calculate_unit_score_at(
         // 敵がロケラン主体ならそれをアウトレンジする自走砲、航空主体なら対空、
         // のように敵の主力へのカウンターが自動的に浮上する
         let counter = counter_efficiency_score(stats, enemy_units, damage_chart);
-        let scaled = (counter * 3).clamp(-4000, 8000);
+        let mut scaled = (counter * 3).clamp(-4000, 8000);
+        // 拡張期 (未交戦) はカウンター生産よりも経済 (歩兵・輸送) を優先する。
+        // 敵が別の島にいて届かない段階でカウンターユニットを量産しても
+        // 価値を発揮できず、拡張と輸送の予算を食い潰すだけになるため
+        if strategy.phase == GamePhase::Expansion {
+            scaled /= 4;
+        }
         score = score.saturating_add_signed(scaled);
     } else {
         // V2: 敵の主力ユニットに対して有利なユニットを頭数で加点する従来方式

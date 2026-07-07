@@ -428,7 +428,11 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                     let mut blocked_by_sea = false;
 
                     for target in &strategy.priority_targets {
-                        // ターゲットがある島を取得し、侵攻が許可されているかチェック
+                        // ターゲットがある島を取得し、侵攻が許可されているかチェック。
+                        // 注 (#54): このフィルタを V3 で無効化する実験を行ったが、
+                        // 輸送候補が爆発して輸送スコアが歪み、拡張用の歩兵輸送が
+                        // 止まる退行が観測されたため従来挙動を維持している。
+                        // 侵攻許可のデッドロック解消は別設計 (侵攻オブジェクティブ) が必要
                         if let Some(target_island_id) =
                             island_map.get_island_at(target).map(|i| i.id)
                         {

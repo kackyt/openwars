@@ -411,6 +411,22 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         (group, std::cmp::Reverse(b.priority_score))
     });
 
+    // #54 (V3): 自軍の歩兵 (占領要員) が存在する島の集合。
+    // 輸送カーゴの選定で「占領要員が未着の島へはまず歩兵を送る」判定に使う
+    let mut my_infantry_islands = HashSet::new();
+    if is_v3 {
+        for ((x, y), occ) in &unit_positions {
+            if occ.player_id == perspective_player
+                && matches!(occ.unit_type, UnitType::Infantry | UnitType::Mech)
+            {
+                let pos = GridPosition { x: *x, y: *y };
+                if let Some(island) = island_map.get_island_at(&pos) {
+                    my_infantry_islands.insert(island.id);
+                }
+            }
+        }
+    }
+
     // 優先順位の高い島から輸送機を割り当てる
     for objective in objectives.iter() {
         if free_transports.is_empty() {
@@ -446,46 +462,37 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
             }
 
             // ---------------------------------------------------------
-            // 距離ベースでの Cargo（歩兵）割り当て
+            // 距離ベースでの Cargo 割り当て。
+            // 従来は重車両を無条件に優先していたが、#54 (V3) では
+            // 「目標島に自軍歩兵 (占領要員) が未着なら歩兵を優先」する。
+            // 重車両を先に送ると占領が進まず、輸送枠が戦闘ユニットで
+            // 埋まって島の拡張が停止するため
             // ---------------------------------------------------------
+            let prefer_infantry = is_v3 && !my_infantry_islands.contains(&objective.target_island);
+
             let mut best_cargo_idx = None;
-            let mut is_combat_cargo = true;
+            let mut is_combat_cargo = false;
             let mut min_turn_dist = crate::ai::turn_distance::TurnDistance {
                 turns: u32::MAX,
                 used_mp: u32::MAX,
             };
 
-            // 重車両から探す
-            for (i, (_, pos, stats)) in free_combat_units.iter().enumerate() {
-                if trans_stats.loadable_unit_types.contains(&stats.unit_type) {
-                    let cargo_island = island_map.get_island_at(pos).map(|id| id.id);
-                    if cargo_island == Some(objective.target_island) {
-                        continue;
-                    }
-
-                    let dist = calculate_turn_distance(
-                        &map,
-                        &registry,
-                        &unit_positions,
-                        (pos.x, pos.y),
-                        (t_pos.x, t_pos.y),
-                        stats.movement_type,
-                        stats.max_movement,
-                        1,
-                        perspective_player,
-                        &mut turn_cache,
-                    );
-                    if dist < min_turn_dist {
-                        min_turn_dist = dist;
-                        best_cargo_idx = Some(i);
-                    }
+            // 探索順: (戦闘ユニットリストか, 対象リスト) を優先度順に並べる
+            let search_order: [bool; 2] = if prefer_infantry {
+                [false, true] // 歩兵 → 重車両
+            } else {
+                [true, false] // 重車両 → 歩兵 (従来挙動)
+            };
+            for search_combat in search_order {
+                if best_cargo_idx.is_some() {
+                    break;
                 }
-            }
-
-            // 見つからなければ歩兵から探す
-            if best_cargo_idx.is_none() {
-                is_combat_cargo = false;
-                for (i, (_, pos, stats)) in free_infantry.iter().enumerate() {
+                let list = if search_combat {
+                    &free_combat_units
+                } else {
+                    &free_infantry
+                };
+                for (i, (_, pos, stats)) in list.iter().enumerate() {
                     if trans_stats.loadable_unit_types.contains(&stats.unit_type) {
                         let cargo_island = island_map.get_island_at(pos).map(|id| id.id);
                         if cargo_island == Some(objective.target_island) {
@@ -507,6 +514,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                         if dist < min_turn_dist {
                             min_turn_dist = dist;
                             best_cargo_idx = Some(i);
+                            is_combat_cargo = search_combat;
                         }
                     }
                 }
