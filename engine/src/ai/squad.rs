@@ -88,6 +88,32 @@ impl SquadManager {
     }
 }
 
+/// #53 (V3): 敵生産施設への奪取部隊の護衛として適格かを判定する。
+/// 「歩兵に随伴できる機動力があり、損傷しておらず、弾薬がある」戦闘ユニットのみ。
+/// 鈍足ユニット (砲台等)・損傷ユニット・弾切れユニットを護衛に組み込むと、
+/// 部隊の足が揃わない/戦力にならず奪取が成立しないため除外する。
+fn escort_is_eligible(
+    stats: &UnitStats,
+    infantry_movement: u32,
+    hp: u32,
+    ammo1: u32,
+    ammo2: u32,
+) -> bool {
+    // 機動力: 歩兵と同等以上 (鈍足ユニットを弾く)
+    if stats.max_movement < infantry_movement {
+        return false;
+    }
+    // 損傷: HP < 70 のユニットは前線から抜くべきでない
+    if hp < 70 {
+        return false;
+    }
+    // 弾薬: 主武器が弾切れ (副武器も無し) なら戦力にならない
+    if stats.max_ammo1 > 0 && ammo1 == 0 && !(stats.max_ammo2 > 0 && ammo2 > 0) {
+        return false;
+    }
+    true
+}
+
 /// 毎ターンの部隊の再編成と SoloFallback の判定を行います。
 pub fn update_squads(world: &mut World, perspective_player: PlayerId) {
     let mut manager = world.remove_resource::<SquadManager>().unwrap_or_default();
@@ -737,20 +763,38 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                     free_infantry.len() - 1
                 };
 
-                let (inf_ent, _, _) = free_infantry.remove(assigned_inf_idx);
+                let (inf_ent, _, inf_stats) = free_infantry.remove(assigned_inf_idx);
+                let inf_movement = inf_stats.max_movement;
                 squad.members.insert(inf_ent);
 
                 // #53 (V3): 敵生産施設 (工場・首都等) への奪取部隊には護衛の
                 // 戦闘ユニットを最大2両随伴させる。敵の生産圏は防御が厚く、
-                // 単独の歩兵では到達前に撃破されて奪取が成立しないため
+                // 単独の歩兵では到達前に撃破されて奪取が成立しないため。
+                // 護衛は「歩兵に随伴できる機動力があり戦闘可能」なユニットに限定する
+                // (鈍足の砲台や弾切れ・損傷ユニットを組み込むと部隊が機能しないため)
                 if is_v3 && target_is_enemy_facility {
                     free_combat_units.sort_by_key(|(_, pos, _)| {
                         pos.x.abs_diff(unowned_pos.x) + pos.y.abs_diff(unowned_pos.y)
                     });
-                    let escort_count = free_combat_units.len().min(2);
-                    for _ in 0..escort_count {
-                        let (ent, _, _) = free_combat_units.remove(0);
-                        squad.members.insert(ent);
+                    let mut assigned = 0;
+                    let mut i = 0;
+                    while i < free_combat_units.len() && assigned < 2 {
+                        let (ent, _, stats) = &free_combat_units[i];
+                        let hp = world
+                            .get::<crate::components::Health>(*ent)
+                            .map(|h| h.current)
+                            .unwrap_or(100);
+                        let (ammo1, ammo2) = world
+                            .get::<crate::components::Ammo>(*ent)
+                            .map(|a| (a.ammo1, a.ammo2))
+                            .unwrap_or((u32::MAX, u32::MAX));
+                        if escort_is_eligible(stats, inf_movement, hp, ammo1, ammo2) {
+                            let (e, _, _) = free_combat_units.remove(i);
+                            squad.members.insert(e);
+                            assigned += 1;
+                        } else {
+                            i += 1;
+                        }
                     }
                     active_facility_captures += 1;
                 }
@@ -1892,6 +1936,57 @@ mod tests {
             run(crate::ai::ai_version::AiVersion::V3),
             Some(GridPosition { x: 5, y: 5 }),
             "V3 は敵拠点 (5,5) への占領部隊を編成するはず"
+        );
+    }
+
+    /// Issue #53 (Gemini #4): 敵生産施設への護衛の適格判定。
+    /// 鈍足・損傷・弾切れのユニットは護衛から除外され、
+    /// 機動力があり健全で弾薬のあるユニットのみが選ばれることを検証する。
+    #[test]
+    fn test_escort_eligibility_filter() {
+        let infantry_movement = 3;
+
+        // 機動力十分・健全・弾薬あり → 適格 (中戦車 移動6)
+        let fast_tank = UnitStats {
+            unit_type: UnitType::MdTank,
+            max_movement: 6,
+            max_ammo1: 6,
+            max_ammo2: 9,
+            ..UnitStats::mock()
+        };
+        assert!(
+            escort_is_eligible(&fast_tank, infantry_movement, 100, 6, 9),
+            "健全で機動力・弾薬のある戦車は護衛適格のはず"
+        );
+
+        // 鈍足 (移動1 < 歩兵3) → 不適格 (砲台のような据置き砲)
+        let slow_gun = UnitStats {
+            unit_type: UnitType::Artillery,
+            max_movement: 1,
+            max_ammo1: 5,
+            ..UnitStats::mock()
+        };
+        assert!(
+            !escort_is_eligible(&slow_gun, infantry_movement, 100, 5, 0),
+            "歩兵より鈍足のユニットは護衛不適格のはず"
+        );
+
+        // 損傷 (HP < 70) → 不適格
+        assert!(
+            !escort_is_eligible(&fast_tank, infantry_movement, 50, 6, 9),
+            "HP50 の損傷ユニットは護衛不適格のはず"
+        );
+
+        // 弾切れ (主武器0・副武器0) → 不適格
+        assert!(
+            !escort_is_eligible(&fast_tank, infantry_movement, 100, 0, 0),
+            "主武器・副武器とも弾切れのユニットは護衛不適格のはず"
+        );
+
+        // 主武器弾切れでも副武器が残っていれば適格
+        assert!(
+            escort_is_eligible(&fast_tank, infantry_movement, 100, 0, 5),
+            "副武器が残っていれば護衛適格のはず"
         );
     }
 

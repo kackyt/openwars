@@ -197,11 +197,29 @@ pub fn decide_ai_action(
         };
 
         // 全敵ユニット情報を収集（ターゲット評価用）
-        let enemy_units: Vec<(GridPosition, crate::resources::UnitType, u32, u32, u32, u32)> = {
+        let enemy_units: Vec<(
+            GridPosition,
+            crate::resources::UnitType,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+        )> = {
             let mut q = world.query::<(&GridPosition, &Faction, &UnitStats, &Health)>();
             q.iter(world)
                 .filter(|(_, f, _, h)| f.0 != player_id && h.current > 0)
-                .map(|(p, _, s, h)| (*p, s.unit_type, s.cost, h.current, s.min_range, s.max_range))
+                .map(|(p, _, s, h)| {
+                    (
+                        *p,
+                        s.unit_type,
+                        s.cost,
+                        h.current,
+                        s.min_range,
+                        s.max_range,
+                        s.max_movement,
+                    )
+                })
                 .collect()
         };
 
@@ -364,7 +382,7 @@ pub fn decide_ai_action(
                 let mut best_target_dist: i32 = 999;
                 let mut max_potential = -1.0;
 
-                for (e_pos, e_type, e_cost, e_hp, _, _) in &enemy_units {
+                for (e_pos, e_type, e_cost, e_hp, _, _, _) in &enemy_units {
                     let mut effective_dist = (current_grid.x as i32 - e_pos.x as i32).abs()
                         + (current_grid.y as i32 - e_pos.y as i32).abs();
 
@@ -423,7 +441,7 @@ pub fn decide_ai_action(
                 if max_potential <= 0.0 {
                     let mut min_dist: i32 = 999;
                     // 1. 敵ユニットを探す
-                    for (e_pos, _, _, _, _, _) in &enemy_units {
+                    for (e_pos, _, _, _, _, _, _) in &enemy_units {
                         let mut d = (current_grid.x as i32 - e_pos.x as i32).abs()
                             + (current_grid.y as i32 - e_pos.y as i32).abs();
 
@@ -1220,41 +1238,64 @@ const AMBUSH_APPROACH_MARGIN: u32 = 2;
 const EXPOSURE_RISK_NUM: i32 = 1;
 const EXPOSURE_RISK_DEN: i32 = 1;
 
-/// #50 (V3): 指定タイルに立った場合に敵の間接攻撃ユニットから受ける
-/// 期待被弾価値 (ゴールド換算) に基づく露出ペナルティを計算する。
-/// 地形防御ボーナスで軽減されるため、防御地形に隠れる行動 (#44) と整合する。
+/// #50 (V3): 指定タイルに立った場合に敵から受ける期待被弾価値 (ゴールド換算) に
+/// 基づく露出ペナルティを計算する。地形防御ボーナスで軽減されるため、防御地形に
+/// 隠れる行動 (#44) と整合する。
+/// - 間接攻撃ユニット: 現在位置からの射程内 (移動後は攻撃不可のため据置き) を脅威圏とする。
+///   全ユニット共通で減点する (間接砲火は反撃不能な一方的損失のため)
+/// - 直接攻撃ユニット: 敵の「移動+攻撃」到達圏 (max_movement + max_range) を脅威圏とするが、
+///   **自軍が間接攻撃ユニット (min_range > 1) の場合に限り**減点する。
+///   自走砲等は隣接反撃ができず戦車の踏み込みに一方的に轢かれるためこれを避けさせる。
+///   直接攻撃ユニット同士の間合いは反撃・is_suicidal 判定・攻撃スコアが扱うので、
+///   ここで減点すると前線への踏み込みが過剰に抑制され勝率が落ちる (実測で確認)
 #[allow(clippy::too_many_arguments)]
 fn indirect_exposure_penalty(
     tile: (usize, usize),
     my_unit_type: crate::resources::UnitType,
     my_cost: u32,
     my_hp: u32,
+    my_min_range: u32,
     tile_def_bonus: u32,
-    enemy_units: &[(GridPosition, crate::resources::UnitType, u32, u32, u32, u32)],
+    enemy_units: &[(
+        GridPosition,
+        crate::resources::UnitType,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+    )],
     damage_chart: &crate::resources::DamageChart,
 ) -> i32 {
+    // 自軍が間接攻撃ユニットなら隣接反撃ができないため、直接攻撃の到達圏も脅威とする
+    let my_is_indirect = my_min_range > 1;
     let mut total_damage: u32 = 0;
-    for (e_pos, e_type, _e_cost, _e_hp, e_min_range, e_max_range) in enemy_units {
-        // 間接攻撃ユニット (min_range > 1) のみが対象。
-        // 間接ユニットは移動後に攻撃できないため、脅威範囲は現在位置からの射程とする
-        if *e_min_range <= 1 {
-            continue;
-        }
+    for (e_pos, e_type, _e_cost, _e_hp, e_min_range, e_max_range, e_max_movement) in enemy_units {
         let dist = (e_pos.x.abs_diff(tile.0) + e_pos.y.abs_diff(tile.1)) as u32;
-        if dist < *e_min_range || dist > *e_max_range {
-            continue;
+        let base_dmg = || {
+            damage_chart
+                .get_base_damage(*e_type, my_unit_type)
+                .or_else(|| damage_chart.get_base_damage_secondary(*e_type, my_unit_type))
+                .unwrap_or(0)
+                * (100 - tile_def_bonus.min(100))
+                / 100
+        };
+        if *e_min_range > 1 {
+            // 間接: 現在射程内 (移動後は撃てないので据置き)。全ユニット共通で脅威
+            if dist >= *e_min_range && dist <= *e_max_range {
+                total_damage += base_dmg();
+            }
+        } else if my_is_indirect {
+            // 直接: 移動+攻撃の到達圏。反撃できない間接ユニットのみ脅威とみなす
+            let reach = *e_max_movement + *e_max_range;
+            if dist <= reach {
+                total_damage += base_dmg();
+            }
         }
-        let base_dmg = damage_chart
-            .get_base_damage(*e_type, my_unit_type)
-            .or_else(|| damage_chart.get_base_damage_secondary(*e_type, my_unit_type))
-            .unwrap_or(0);
-        // 地形防御ボーナスによる軽減 (簡易近似)
-        total_damage += base_dmg * (100 - tile_def_bonus.min(100)) / 100;
     }
     if total_damage == 0 {
         return 0;
     }
-    // 被弾は残HPを超えない
     let effective_damage = total_damage.min(my_hp);
     let expected_loss_value = (effective_damage * my_cost / 100) as i32;
     expected_loss_value * EXPOSURE_RISK_NUM / EXPOSURE_RISK_DEN
@@ -1359,11 +1400,29 @@ pub fn decide_ai_action_v2(
             .map(|(p, prop)| (*p, prop.terrain, prop.owner_id))
             .collect()
     };
-    let enemy_units: Vec<(GridPosition, crate::resources::UnitType, u32, u32, u32, u32)> = {
+    let enemy_units: Vec<(
+        GridPosition,
+        crate::resources::UnitType,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+    )> = {
         let mut q = world.query::<(&GridPosition, &Faction, &UnitStats, &Health)>();
         q.iter(world)
             .filter(|(_, f, _, h)| f.0 != player_id && h.current > 0)
-            .map(|(p, _, s, h)| (*p, s.unit_type, s.cost, h.current, s.min_range, s.max_range))
+            .map(|(p, _, s, h)| {
+                (
+                    *p,
+                    s.unit_type,
+                    s.cost,
+                    h.current,
+                    s.min_range,
+                    s.max_range,
+                    s.max_movement,
+                )
+            })
             .collect()
     };
     let damage_chart = world.resource::<crate::resources::DamageChart>().clone();
@@ -1398,6 +1457,14 @@ pub fn decide_ai_action_v2(
         };
 
         let is_combat_ineffective = atk_hp < 70 || (stats.max_ammo1 > 0 && atk_ammo.0 == 0);
+
+        // #44 (V3): 敵の脅威がこのユニットの近傍にあるか (森・山への退避を
+        // 意味のある局面に限定するためのゲート)。敵の攻撃到達圏 (移動+射程) を
+        // 少し余裕をもって見た半径で判定する
+        const THREAT_PROXIMITY_RADIUS: u32 = 8;
+        let enemy_threat_nearby = enemy_units.iter().any(|(e_pos, _, _, _, _, _, _)| {
+            (e_pos.x.abs_diff(pos.x) + e_pos.y.abs_diff(pos.y)) as u32 <= THREAT_PROXIMITY_RADIUS
+        });
 
         let reachable = calculate_reachable_tiles(
             &map,
@@ -1441,21 +1508,24 @@ pub fn decide_ai_action_v2(
             base_tile_score += tile_def_bonus as i32 * 10;
 
             // #44 (V3): HP が低下しているほど防御地形 (森・山) への評価を引き上げ、
-            // 生存率を高める位置取りを優先させる
-            if is_v3 && atk_hp < 70 {
+            // 生存率を高める位置取りを優先させる。
+            // ただし敵の脅威が近くにある場合に限る (安全な後方でダメージを負った
+            // ユニットが森を求めて無意味に引きこもり、前線合流が遅れるのを防ぐ)
+            if is_v3 && atk_hp < 70 && enemy_threat_nearby {
                 base_tile_score += tile_def_bonus as i32 * (100 - atk_hp as i32) * 2;
             }
 
-            // #50 (V3): 敵間接攻撃ユニットの射程内 (脅威マップ) に入るタイルには
-            // 期待被弾価値に応じた露出ペナルティを課す。
-            // 撃破 (+5000) や占領 (+10000) などリターンの大きい行動は
-            // 行動側の加点によって自然に相殺される
+            // #50 (V3): 敵攻撃ユニットの脅威圏 (脅威マップ) に入るタイルには
+            // 期待被弾価値に応じた露出ペナルティを課す (間接=現在射程、
+            // 直接=移動+攻撃到達圏)。撃破 (+5000) や占領 (+10000) など
+            // リターンの大きい行動は行動側の加点によって自然に相殺される
             if is_v3 {
                 base_tile_score -= indirect_exposure_penalty(
                     (current_grid.x, current_grid.y),
                     stats.unit_type,
                     stats.cost,
                     atk_hp,
+                    stats.min_range,
                     tile_def_bonus,
                     &enemy_units,
                     &damage_chart,
@@ -1467,7 +1537,7 @@ pub fn decide_ai_action_v2(
             // 最小射程より内側への不要な前進を減点する
             if is_v3 && stats.min_range > 1 && !is_combat_ineffective && !enemy_units.is_empty() {
                 let mut nearest_enemy_dist = u32::MAX;
-                for (e_pos, _, _, _, _, _) in &enemy_units {
+                for (e_pos, _, _, _, _, _, _) in &enemy_units {
                     let d = (e_pos.x.abs_diff(current_grid.x) + e_pos.y.abs_diff(current_grid.y))
                         as u32;
                     if d < nearest_enemy_dist {
@@ -1544,7 +1614,7 @@ pub fn decide_ai_action_v2(
                 } else if !stats.can_capture {
                     // 健全な SoloFallback: 敵ユニットに接近する
                     let mut min_score: Option<(crate::ai::turn_distance::TurnDistance, i32)> = None;
-                    for (e_pos, _, _, _, _, _) in &enemy_units {
+                    for (e_pos, _, _, _, _, _, _) in &enemy_units {
                         let d = calculate_turn_distance(
                             &map,
                             &registry,
@@ -1715,7 +1785,7 @@ pub fn decide_ai_action_v2(
                 let mut best_target_pos = None;
                 let mut max_potential = -1.0;
 
-                for (e_pos, e_type, e_cost, e_hp, _, _) in &enemy_units {
+                for (e_pos, e_type, e_cost, e_hp, _, _, _) in &enemy_units {
                     let mut effective_dist = calculate_turn_distance(
                         &map,
                         &registry,
@@ -1767,7 +1837,7 @@ pub fn decide_ai_action_v2(
 
                 if max_potential <= 0.0 {
                     let mut min_score: Option<(crate::ai::turn_distance::TurnDistance, i32)> = None;
-                    for (e_pos, _, _, _, _, _) in &enemy_units {
+                    for (e_pos, _, _, _, _, _, _) in &enemy_units {
                         let mut d = calculate_turn_distance(
                             &map,
                             &registry,
@@ -2037,7 +2107,15 @@ fn is_unit_stranded(
     pos: &GridPosition,
     player_id: PlayerId,
     properties: &[(GridPosition, crate::resources::Terrain, Option<PlayerId>)],
-    enemy_units: &[(GridPosition, crate::resources::UnitType, u32, u32, u32, u32)],
+    enemy_units: &[(
+        GridPosition,
+        crate::resources::UnitType,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+    )],
 ) -> bool {
     if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>()
         && let Some(my_island) = island_map.get_island_at(pos)
@@ -2051,7 +2129,7 @@ fn is_unit_stranded(
         }
 
         let mut local_enemies = false;
-        for (e_pos, _, _, _, _, _) in enemy_units {
+        for (e_pos, _, _, _, _, _, _) in enemy_units {
             if my_island.tiles.contains(e_pos) {
                 local_enemies = true;
                 break;
@@ -3398,6 +3476,85 @@ mod tests {
         );
     }
 
+    /// Issue #50 (Gemini #5): 間接攻撃ユニット (自走砲) が、敵直接攻撃ユニット
+    /// (戦車) の「移動+攻撃」到達圏を避けることを検証する。反撃できない自走砲が
+    /// 戦車の踏み込みに轢かれる配置を防ぐ。
+    #[test]
+    fn test_v3_avoids_direct_attacker_move_reach() {
+        use crate::ai::ai_version::AiVersion;
+
+        let run = |version: AiVersion| -> usize {
+            let mut world = setup_v3_test_world(14, version);
+            let mut dc = DamageChart::new();
+            // 戦車 → 自走砲に大ダメージ (踏み込まれると一方的に轢かれる)
+            dc.insert_damage(UnitType::Tank, UnitType::LightSpGun, 80);
+            world.insert_resource(dc);
+
+            // 自軍: 軽自走砲 (間接 射程2-3, 移動4) at x=0、部隊目標は x=13
+            let sp = spawn_v3_test_unit(
+                &mut world,
+                PlayerId(1),
+                0,
+                100,
+                UnitStats {
+                    unit_type: UnitType::LightSpGun,
+                    cost: 6200,
+                    max_movement: 4,
+                    movement_type: crate::resources::MovementType::Tank,
+                    min_range: 2,
+                    max_range: 3,
+                    max_ammo1: 5,
+                    max_fuel: 99,
+                    ..UnitStats::mock()
+                },
+            );
+            insert_single_unit_squad(&mut world, sp, GridPosition { x: 13, y: 0 });
+
+            // 敵軍: 軽戦車 (直接 射程1, 移動4) at x=9 -> 移動+攻撃到達圏は距離5以内 (x>=4)
+            world.spawn((
+                Faction(PlayerId(2)),
+                HasMoved(true),
+                ActionCompleted(true),
+                GridPosition { x: 9, y: 0 },
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    cost: 6000,
+                    max_movement: 4,
+                    movement_type: crate::resources::MovementType::Tank,
+                    min_range: 1,
+                    max_range: 1,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ));
+
+            let skips = std::collections::HashSet::new();
+            let action =
+                decide_ai_action_v2(&mut world, PlayerId(1), &skips).expect("行動が決定されること");
+            match action.1 {
+                AiCommand::Wait { target_pos } | AiCommand::Attack { target_pos, .. } => {
+                    target_pos.x
+                }
+                other => panic!("Wait/Attack を期待したが {:?}", other),
+            }
+        };
+
+        // V2: 移動+攻撃到達圏を考慮せず、目標へ最接近する x=4 (戦車の踏み込み圏内) へ
+        let v2_x = run(AiVersion::V2);
+        assert_eq!(v2_x, 4, "V2 は戦車の移動+攻撃圏内 (x=4) まで前進するはず");
+
+        // V3: 戦車の移動+攻撃到達圏 (x>=4) を避けて x<=3 で待機する
+        let v3_x = run(AiVersion::V3);
+        assert!(
+            v3_x <= 3,
+            "V3 は戦車の移動+攻撃到達圏外 (x<=3) で待機するはず (actual: x={})",
+            v3_x
+        );
+    }
+
     /// Issue #45: 間接攻撃ユニットが最小射程より内側へ不要な前進をせず、
     /// 先制攻撃圏 (待ち伏せ位置) で待機することを検証する
     #[test]
@@ -3478,12 +3635,15 @@ mod tests {
     }
 
     /// Issue #44: HP が低下したユニットが、接近ボーナスの勾配に逆らってでも
-    /// 平地より防御効果の高い森で待機することを検証する
+    /// 平地より防御効果の高い森で待機することを検証する。
+    /// ただし敵の脅威が近くにある場合に限る（Gemini 指摘 #3: 安全な後方での
+    /// 無意味な引きこもりを防ぐゲート）。
     #[test]
     fn test_v3_low_hp_prefers_defensive_terrain() {
         use crate::ai::ai_version::AiVersion;
 
-        let run = |version: AiVersion, hp: u32| -> usize {
+        // enemy_x: 敵ユニットの位置。None なら敵なし（安全な後方）
+        let run = |version: AiVersion, hp: u32, enemy_x: Option<usize>| -> usize {
             let mut world = setup_v3_test_world(12, version);
             world.insert_resource(DamageChart::new());
             // x=2 だけ森 (防御20)、他は平地 (防御5)
@@ -3511,27 +3671,64 @@ mod tests {
             );
             insert_single_unit_squad(&mut world, tank, GridPosition { x: 10, y: 0 });
 
+            // 敵ユニット (行動済み・脅威の存在のみを表現)
+            if let Some(ex) = enemy_x {
+                world.spawn((
+                    Faction(PlayerId(2)),
+                    HasMoved(true),
+                    ActionCompleted(true),
+                    GridPosition { x: ex, y: 0 },
+                    UnitStats {
+                        unit_type: UnitType::Tank,
+                        cost: 6000,
+                        max_movement: 4,
+                        movement_type: crate::resources::MovementType::Tank,
+                        min_range: 1,
+                        max_range: 1,
+                        ..UnitStats::mock()
+                    },
+                    Health {
+                        current: 100,
+                        max: 100,
+                    },
+                ));
+            }
+
             let skips = std::collections::HashSet::new();
             let action =
                 decide_ai_action_v2(&mut world, PlayerId(1), &skips).expect("行動が決定されること");
             match action.1 {
-                AiCommand::Wait { target_pos } => target_pos.x,
-                other => panic!("Wait/Move を期待したが {:?}", other),
+                AiCommand::Wait { target_pos }
+                | AiCommand::Attack { target_pos, .. }
+                | AiCommand::Capture { target_pos }
+                | AiCommand::Merge { target_pos, .. } => target_pos.x,
+                other => panic!("位置を伴う行動を期待したが {:?}", other),
             }
         };
 
+        // 近傍脅威あり (敵戦車 x=6, 前線の森 x=2 から距離4)
+        let threat = Some(6usize);
+
         // V2 は低HPでも目標へ最短で前進する (森 x=2 の移動コストにより x=3 が最遠到達点)
-        let v2_x = run(AiVersion::V2, 40);
+        let v2_x = run(AiVersion::V2, 40, threat);
         assert_eq!(v2_x, 3, "V2 は低HPでも平地 (x=3) まで前進するはず");
 
-        // V3 は健全時は前進を優先し、低HP時は森 (x=2) で待機する
-        let v3_healthy_x = run(AiVersion::V3, 100);
+        // V3 は健全時は前進を優先し、低HP＋近傍脅威ありなら森 (x=2) で待機する
+        let v3_healthy_x = run(AiVersion::V3, 100, threat);
         assert_eq!(v3_healthy_x, 3, "V3 も健全時は前進を優先するはず");
-        let v3_low_hp_x = run(AiVersion::V3, 40);
+        let v3_low_hp_x = run(AiVersion::V3, 40, threat);
         assert_eq!(
             v3_low_hp_x, 2,
-            "V3 は低HP時に森 (x=2) で待機するはず (actual: x={})",
+            "V3 は低HP+近傍脅威で森 (x=2) に退避するはず (actual: x={})",
             v3_low_hp_x
+        );
+
+        // #3 ゲート: 敵が近くにいない安全な後方では、低HPでも森に引きこもらず前進する
+        let v3_low_hp_safe = run(AiVersion::V3, 40, None);
+        assert_eq!(
+            v3_low_hp_safe, 3,
+            "V3 は低HPでも脅威がなければ森に籠らず前進するはず (actual: x={})",
+            v3_low_hp_safe
         );
     }
 }

@@ -124,6 +124,9 @@ fn capture_eta(
 
 /// 片陣営の NPV 合計。
 /// NPV(拠点) = 収入 × max(0, T_end − 現在ターン − ETA) / (ETA + 1)
+/// 副産物として、拠点ごとの最短 ETA (SSSP + 輸送近似による地形考慮済みの値) を
+/// `best_etas` に書き出す。#55 の先着レース評価で再利用するためのもので、
+/// 追加の経路探索コストは発生しない。
 #[allow(clippy::too_many_arguments)]
 fn side_npv(
     map: &Map,
@@ -136,6 +139,7 @@ fn side_npv(
     current_turn: u32,
     t_end: u32,
     turn_cache: &mut crate::ai::turn_distance::AiTurnCache,
+    best_etas: &mut HashMap<GridPosition, u32>,
 ) -> i32 {
     let mut total = 0i32;
     for (p_pos, prop) in properties {
@@ -165,6 +169,7 @@ fn side_npv(
         let Some(eta) = best_eta else {
             continue;
         };
+        best_etas.insert(*p_pos, eta);
         let remaining = t_end.saturating_sub(current_turn).saturating_sub(eta);
         total += (income * remaining / (eta + 1)) as i32;
     }
@@ -372,23 +377,14 @@ struct DamagedUnitInfo {
 /// #55 (V3): 中立拠点の先着レース評価。
 /// 自軍の占領ユニットが敵より早く到達できる中立拠点の収入に応じて加点する。
 /// 「敵が取れたはずの拠点を先に押さえる」= 敵の拡張機会の阻止を評価に組み込む。
+/// ETA は NPV 計算 (side_npv) が算出した SSSP ベースの値を流用するため、
+/// 地形コスト・海による遮断・輸送短縮を織り込んだ判定になる (追加の経路探索なし)。
 fn contested_territory_advantage(
     registry: &MasterDataRegistry,
     properties: &[(GridPosition, Property)],
-    my_capture_units: &[CaptureUnitInfo],
-    enemy_capture_units: &[CaptureUnitInfo],
+    my_etas: &HashMap<GridPosition, u32>,
+    enemy_etas: &HashMap<GridPosition, u32>,
 ) -> i32 {
-    // マンハッタン距離 / 移動力 による軽量な ETA 近似 (探索中に頻繁に呼ばれるため SSSP は使わない)
-    let eta = |units: &[CaptureUnitInfo], p: &GridPosition| -> Option<u32> {
-        units
-            .iter()
-            .filter(|u| u.max_movement > 0)
-            .map(|u| {
-                let d = (u.pos.x.abs_diff(p.x) + u.pos.y.abs_diff(p.y)) as u32;
-                d.div_ceil(u.max_movement)
-            })
-            .min()
-    };
     let mut total = 0i32;
     for (p_pos, prop) in properties {
         // レースの対象は中立拠点のみ (所有済み拠点の価値は NPV・property_score が扱う)
@@ -399,9 +395,7 @@ fn contested_territory_advantage(
         if income == 0 {
             continue;
         }
-        let mine = eta(my_capture_units, p_pos);
-        let theirs = eta(enemy_capture_units, p_pos);
-        let wins = match (mine, theirs) {
+        let wins = match (my_etas.get(p_pos), enemy_etas.get(p_pos)) {
             (Some(m), Some(t)) => m < t,
             (Some(_), None) => true,
             _ => false,
@@ -441,11 +435,34 @@ fn front_pressure_targets(
 /// #55 (V3): 片陣営の前線圧力。
 /// 戦闘ユニットが圧力目標 (敵の生産施設等) に近いほど加点する。
 /// 前線を敵陣側へ押し上げる配置が評価上有利になる。
-fn side_front_pressure(combat_positions: &[GridPosition], targets: &[GridPosition]) -> i32 {
+/// 地上ユニットは海を越えて圧力をかけられないため、島情報がある場合は
+/// 同一島の目標のみを対象とする (海岸に並ぶだけで加点される幻覚の防止)。
+fn side_front_pressure(
+    combat_units: &[(GridPosition, crate::resources::MovementType)],
+    targets: &[GridPosition],
+    island_map: Option<&crate::ai::islands::IslandMap>,
+) -> i32 {
     let mut total = 0i32;
-    for unit_pos in combat_positions {
+    for (unit_pos, movement_type) in combat_units {
+        // 空・海ユニットは海を越えられるため島の制約を受けない
+        let ground_bound = !matches!(
+            movement_type,
+            crate::resources::MovementType::Air | crate::resources::MovementType::Ship
+        );
+        let unit_island = if ground_bound {
+            island_map.and_then(|im| im.get_island_at(unit_pos).map(|i| i.id))
+        } else {
+            None
+        };
         let mut best: Option<i32> = None;
         for t in targets {
+            // 地上ユニットは同一島の目標のみ圧力対象
+            if ground_bound && let Some(im) = island_map {
+                let target_island = im.get_island_at(t).map(|i| i.id);
+                if unit_island != target_island {
+                    continue;
+                }
+            }
             let d = (t.x.abs_diff(unit_pos.x) + t.y.abs_diff(unit_pos.y)) as i32;
             if best.is_none_or(|b| d < b) {
                 best = Some(d);
@@ -570,9 +587,14 @@ fn evaluate_board_v2(
     // #49 (V3): 回復インフラ評価用の損傷ユニット収集
     let mut my_damaged_units: Vec<DamagedUnitInfo> = Vec::new();
     let mut enemy_damaged_units: Vec<DamagedUnitInfo> = Vec::new();
-    // #55 (V3): 前線圧力評価用の戦闘ユニット位置収集 (占領・輸送ユニットは除く)
-    let mut my_combat_positions: Vec<GridPosition> = Vec::new();
-    let mut enemy_combat_positions: Vec<GridPosition> = Vec::new();
+    // #55 (V3): 前線圧力評価用の戦闘ユニット位置収集 (占領・輸送ユニットは除く)。
+    // 移動タイプは「地上ユニットは海越しの目標に圧力をかけられない」島判定に使う
+    let mut my_combat_positions: Vec<(GridPosition, crate::resources::MovementType)> = Vec::new();
+    let mut enemy_combat_positions: Vec<(GridPosition, crate::resources::MovementType)> =
+        Vec::new();
+    // #55 (V3): NPV 計算の副産物として得る拠点ごとの最短 ETA (先着レース評価用)
+    let mut my_prop_etas: HashMap<GridPosition, u32> = HashMap::new();
+    let mut enemy_prop_etas: HashMap<GridPosition, u32> = HashMap::new();
 
     let mut query = world.query::<(
         Entity,
@@ -726,9 +748,9 @@ fn evaluate_board_v2(
             // #55 (V3): 戦闘ユニット (攻撃可能・非占領・非輸送) を前線圧力評価の対象として収集
             if is_v3 && !stats.can_capture && stats.max_cargo == 0 && stats.max_ammo1 > 0 {
                 if is_my_unit {
-                    my_combat_positions.push(*pos);
+                    my_combat_positions.push((*pos, stats.movement_type));
                 } else {
-                    enemy_combat_positions.push(*pos);
+                    enemy_combat_positions.push((*pos, stats.movement_type));
                 }
             }
 
@@ -887,6 +909,7 @@ fn evaluate_board_v2(
         current_turn,
         t_end,
         turn_cache,
+        &mut my_prop_etas,
     );
     let enemy_npv = match enemy_capture_units.first() {
         Some(u) => side_npv(
@@ -900,6 +923,7 @@ fn evaluate_board_v2(
             current_turn,
             t_end,
             turn_cache,
+            &mut enemy_prop_etas,
         ),
         None => 0,
     };
@@ -920,22 +944,24 @@ fn evaluate_board_v2(
     // 中立拠点の先着レースに勝つ配置と、戦闘ユニットで敵拠点へ圧力をかける
     // 配置を加点し、「自陣に籠って動かない」ことが安定解になるのを防ぐ。
     let initiative_score = if is_v3 {
-        let contested = contested_territory_advantage(
-            &registry,
-            &properties,
-            &my_capture_units,
-            &enemy_capture_units,
-        );
+        let contested =
+            contested_territory_advantage(&registry, &properties, &my_prop_etas, &enemy_prop_etas);
+        // 前線圧力の島判定用 (地上ユニットは海越しの目標に圧力をかけられない)
+        let island_map = world
+            .get_resource::<crate::ai::islands::IslandMap>()
+            .cloned();
         // 自軍戦闘ユニット → 敵の生産施設 (無ければ敵拠点) への圧力
         let my_targets = front_pressure_targets(&registry, &properties, |owner| {
             owner.is_some() && owner != Some(perspective_player)
         });
-        let my_pressure = side_front_pressure(&my_combat_positions, &my_targets);
+        let my_pressure =
+            side_front_pressure(&my_combat_positions, &my_targets, island_map.as_ref());
         // 敵戦闘ユニット → 自軍の生産施設への圧力 (受けている圧力は減点)
         let enemy_targets = front_pressure_targets(&registry, &properties, |owner| {
             owner == Some(perspective_player)
         });
-        let enemy_pressure = side_front_pressure(&enemy_combat_positions, &enemy_targets);
+        let enemy_pressure =
+            side_front_pressure(&enemy_combat_positions, &enemy_targets, island_map.as_ref());
         contested + my_pressure - enemy_pressure
     } else {
         0
@@ -1052,6 +1078,8 @@ pub fn compute_objective_metrics(world: &mut World, player: PlayerId) -> Objecti
 
     // NPV (獲得機会価値)
     let mut cache = crate::ai::turn_distance::AiTurnCache::default();
+    // 客観メトリクスでは ETA の副産物は使用しない
+    let mut unused_etas = HashMap::new();
     let npv = side_npv(
         &map,
         &registry,
@@ -1063,6 +1091,7 @@ pub fn compute_objective_metrics(world: &mut World, player: PlayerId) -> Objecti
         current_turn,
         expected_end_turn(&map),
         &mut cache,
+        &mut unused_etas,
     );
 
     // 戦闘損益 (累計、ゴールド換算)
