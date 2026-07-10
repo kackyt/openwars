@@ -29,6 +29,9 @@ struct OpenWarsAiServer {
     pub state: Arc<Mutex<Option<GameState>>>,
 }
 
+// テストプロファイルの bin ビルドでは実 main が置換され、本関数を呼ぶ #[tool] メソッドが
+// 到達不能扱いになり dead_code 警告が出る。実バイナリでは使用されているため test 時のみ許可する。
+#[cfg_attr(test, allow(dead_code))]
 fn parse_player_id(value: u64) -> Result<PlayerId, String> {
     let id = u32::try_from(value).map_err(|_| format!("Player ID {} is out of range", value))?;
     Ok(PlayerId(id))
