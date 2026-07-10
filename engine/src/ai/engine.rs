@@ -882,7 +882,7 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> Option<Str
         let settings = world.get_resource::<crate::ai::ai_version::PlayerAiSettings>();
         settings
             .map(|s| s.get_version(active_player))
-            .unwrap_or(crate::ai::ai_version::AiVersion::V2)
+            .unwrap_or(crate::ai::ai_version::AiVersion::V3)
     };
 
     match ai_version {
@@ -3237,6 +3237,9 @@ mod tests {
         world.insert_resource(Events::<crate::events::NextPhaseCommand>::default());
 
         let p1 = PlayerId(1);
+        let mut ai_settings = crate::ai::ai_version::PlayerAiSettings::new();
+        ai_settings.set_version(p1, crate::ai::ai_version::AiVersion::V1);
+        world.insert_resource(ai_settings);
 
         // 1. 輸送機(ヘリ)を(0,0)に配置
         let heli = world
