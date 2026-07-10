@@ -13,6 +13,16 @@ const TERRITORY_WEIGHT: i32 = 2500;
 const ZOC_TERRITORY_WEIGHT: i32 = 300;
 const CONSOLIDATION_RADIUS_TURNS: u32 = 2;
 const NPV_WEIGHT: f32 = 1.0;
+/// #49 (V3): 回復インフラの条件付き価値の重み。
+/// 毀損価値 (cost × 欠損HP率) のうち、最寄り回復拠点への到達しやすさに応じて
+/// 回収可能とみなす割合。収入NPVとは独立したモデルのため控えめに設定する。
+const RECOVERY_INFRA_WEIGHT: f32 = 0.5;
+/// #55 (V3): 中立拠点の先着レースに勝っている場合に加点する収入の除数 (income / N)
+const CONTEST_INCOME_DIVISOR: i32 = 4;
+/// #55 (V3): 前線圧力を加点するマンハッタン距離のホライズン
+const FRONT_PRESSURE_HORIZON: i32 = 20;
+/// #55 (V3): 前線圧力の1マス近づくごとの加点 (1ユニット最大 HORIZON×WEIGHT = 600)
+const FRONT_PRESSURE_WEIGHT: i32 = 30;
 
 /// マップ面積に基づく期待終了ターン (map_1(140マス)≈30T, map_3(900マス)≈61T)
 fn expected_end_turn(map: &Map) -> u32 {
@@ -114,6 +124,9 @@ fn capture_eta(
 
 /// 片陣営の NPV 合計。
 /// NPV(拠点) = 収入 × max(0, T_end − 現在ターン − ETA) / (ETA + 1)
+/// 副産物として、拠点ごとの最短 ETA (SSSP + 輸送近似による地形考慮済みの値) を
+/// `best_etas` に書き出す。#55 の先着レース評価で再利用するためのもので、
+/// 追加の経路探索コストは発生しない。
 #[allow(clippy::too_many_arguments)]
 fn side_npv(
     map: &Map,
@@ -126,6 +139,7 @@ fn side_npv(
     current_turn: u32,
     t_end: u32,
     turn_cache: &mut crate::ai::turn_distance::AiTurnCache,
+    best_etas: &mut HashMap<GridPosition, u32>,
 ) -> i32 {
     let mut total = 0i32;
     for (p_pos, prop) in properties {
@@ -155,6 +169,7 @@ fn side_npv(
         let Some(eta) = best_eta else {
             continue;
         };
+        best_etas.insert(*p_pos, eta);
         let remaining = t_end.saturating_sub(current_turn).saturating_sub(eta);
         total += (income * remaining / (eta + 1)) as i32;
     }
@@ -174,6 +189,10 @@ pub struct BoardMetrics {
     pub territory_score: i32,
     /// NPV スコア (V2 のみ。my_npv − enemy_npv)
     pub npv_score: i32,
+    /// #49 (V3 のみ): 回復インフラの条件付き価値 (my − enemy)
+    pub recovery_score: i32,
+    /// #55 (V3 のみ): イニシアチブ評価。中立拠点の先着レース優位 + 前線圧力 (my − enemy)
+    pub initiative_score: i32,
     pub my_dominated_count: i32,
     pub enemy_dominated_count: i32,
 }
@@ -220,7 +239,13 @@ pub fn evaluate_board_with_metrics(
 
     match ai_version {
         AiVersion::V1 => evaluate_board_v1(world, perspective_player),
-        AiVersion::V2 => evaluate_board_v2(world, perspective_player, cache),
+        // V3 は V2 の評価をベースに、#49 の回復インフラ評価項を追加する
+        AiVersion::V2 | AiVersion::V3 => evaluate_board_v2(
+            world,
+            perspective_player,
+            cache,
+            ai_version.uses_v3_tactics(),
+        ),
     }
 }
 
@@ -329,18 +354,170 @@ pub fn evaluate_board_v1(world: &mut World, perspective_player: PlayerId) -> Boa
         property_score,
         territory_score,
         npv_score: 0,
+        recovery_score: 0,
+        initiative_score: 0,
         my_dominated_count: my_territory,
         enemy_dominated_count: enemy_territory,
     }
 }
 
+/// #49 (V3): 損傷ユニット1体分の回復インフラ条件付き価値。
+/// 毀損価値 (cost × 欠損HP率) を、最寄りの回復可能な自軍拠点への
+/// 到達ターン数 (ETA, マンハッタン距離/移動力の近似) で割り引く。
+/// 回復拠点が存在しなければ価値は 0 (インフラを失うと損傷が回収不能になる)。
+struct DamagedUnitInfo {
+    pos: GridPosition,
+    unit_type: crate::resources::UnitType,
+    max_movement: u32,
+    faction: PlayerId,
+    /// cost × 欠損HP率 (ゴールド換算の毀損価値)
+    lost_value: i32,
+}
+
+/// #55 (V3): 中立拠点の先着レース評価。
+/// 自軍の占領ユニットが敵より早く到達できる中立拠点の収入に応じて加点する。
+/// 「敵が取れたはずの拠点を先に押さえる」= 敵の拡張機会の阻止を評価に組み込む。
+/// ETA は NPV 計算 (side_npv) が算出した SSSP ベースの値を流用するため、
+/// 地形コスト・海による遮断・輸送短縮を織り込んだ判定になる (追加の経路探索なし)。
+fn contested_territory_advantage(
+    registry: &MasterDataRegistry,
+    properties: &[(GridPosition, Property)],
+    my_etas: &HashMap<GridPosition, u32>,
+    enemy_etas: &HashMap<GridPosition, u32>,
+) -> i32 {
+    let mut total = 0i32;
+    for (p_pos, prop) in properties {
+        // レースの対象は中立拠点のみ (所有済み拠点の価値は NPV・property_score が扱う)
+        if prop.owner_id.is_some() {
+            continue;
+        }
+        let income = registry.landscape_income(prop.terrain.as_str()) as i32;
+        if income == 0 {
+            continue;
+        }
+        let wins = match (my_etas.get(p_pos), enemy_etas.get(p_pos)) {
+            (Some(m), Some(t)) => m < t,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if wins {
+            total += income / CONTEST_INCOME_DIVISOR;
+        }
+    }
+    total
+}
+
+/// #55 (V3): 前線圧力の目標となる拠点を選ぶ。
+/// 増援の発生源である生産施設 (工場・首都等) を優先し、
+/// 存在しない場合のみその他の拠点 (都市等) へフォールバックする。
+/// 前線都市の取り返し合いではなく、敵の生産基盤への突破圧力を評価するため。
+fn front_pressure_targets(
+    registry: &MasterDataRegistry,
+    properties: &[(GridPosition, Property)],
+    is_target: impl Fn(Option<PlayerId>) -> bool,
+) -> Vec<GridPosition> {
+    let all: Vec<&(GridPosition, Property)> = properties
+        .iter()
+        .filter(|(_, prop)| is_target(prop.owner_id))
+        .collect();
+    let production: Vec<GridPosition> = all
+        .iter()
+        .filter(|(_, prop)| registry.is_production_facility(prop.terrain.as_str()))
+        .map(|(pos, _)| *pos)
+        .collect();
+    if !production.is_empty() {
+        production
+    } else {
+        all.iter().map(|(pos, _)| *pos).collect()
+    }
+}
+
+/// #55 (V3): 片陣営の前線圧力。
+/// 戦闘ユニットが圧力目標 (敵の生産施設等) に近いほど加点する。
+/// 前線を敵陣側へ押し上げる配置が評価上有利になる。
+/// 地上ユニットは海を越えて圧力をかけられないため、島情報がある場合は
+/// 同一島の目標のみを対象とする (海岸に並ぶだけで加点される幻覚の防止)。
+fn side_front_pressure(
+    combat_units: &[(GridPosition, crate::resources::MovementType)],
+    targets: &[GridPosition],
+    island_map: Option<&crate::ai::islands::IslandMap>,
+) -> i32 {
+    let mut total = 0i32;
+    for (unit_pos, movement_type) in combat_units {
+        // 空・海ユニットは海を越えられるため島の制約を受けない
+        let ground_bound = !matches!(
+            movement_type,
+            crate::resources::MovementType::Air | crate::resources::MovementType::Ship
+        );
+        let unit_island = if ground_bound {
+            island_map.and_then(|im| im.get_island_at(unit_pos).map(|i| i.id))
+        } else {
+            None
+        };
+        let mut best: Option<i32> = None;
+        for t in targets {
+            // 地上ユニットは同一島の目標のみ圧力対象
+            if ground_bound && let Some(im) = island_map {
+                let target_island = im.get_island_at(t).map(|i| i.id);
+                if unit_island != target_island {
+                    continue;
+                }
+            }
+            let d = (t.x.abs_diff(unit_pos.x) + t.y.abs_diff(unit_pos.y)) as i32;
+            if best.is_none_or(|b| d < b) {
+                best = Some(d);
+            }
+        }
+        if let Some(d) = best {
+            total += (FRONT_PRESSURE_HORIZON - d).max(0) * FRONT_PRESSURE_WEIGHT;
+        }
+    }
+    total
+}
+
+fn side_recovery_infra_value(
+    registry: &MasterDataRegistry,
+    properties: &[(GridPosition, Property)],
+    damaged_units: &[DamagedUnitInfo],
+) -> i32 {
+    let mut total = 0i32;
+    for u in damaged_units {
+        // 最寄りの「このユニットを回復できる」自軍拠点までの距離
+        let mut best_dist: Option<u32> = None;
+        for (p_pos, prop) in properties {
+            if prop.owner_id != Some(u.faction) {
+                continue;
+            }
+            if !registry.can_repair_on_terrain(u.unit_type, prop.terrain) {
+                continue;
+            }
+            let d = (p_pos.x.abs_diff(u.pos.x) + p_pos.y.abs_diff(u.pos.y)) as u32;
+            if best_dist.is_none_or(|b| d < b) {
+                best_dist = Some(d);
+            }
+        }
+        let Some(dist) = best_dist else {
+            continue;
+        };
+        // ETA = 距離 / 移動力 (切り上げ)。移動力 0 のユニットはその場から動けないため対象外
+        if u.max_movement == 0 {
+            continue;
+        }
+        let eta = dist.div_ceil(u.max_movement);
+        total += (u.lost_value as f32 * RECOVERY_INFRA_WEIGHT / (eta + 1) as f32) as i32;
+    }
+    total
+}
+
 // ==========================================
-// 戦術部隊 AI 用の精緻な評価ロジック (V2)
+// 戦術部隊 AI 用の精緻な評価ロジック (V2 / V3)
 // ==========================================
 fn evaluate_board_v2(
     world: &mut World,
     perspective_player: PlayerId,
     cache: Option<&mut crate::ai::turn_distance::AiTurnCache>,
+    // V3 のみ true。#49 の回復インフラ評価項と #55 のイニシアチブ評価項を追加する
+    is_v3: bool,
 ) -> BoardMetrics {
     let mut unit_score = 0;
     let mut property_score = 0;
@@ -407,6 +584,17 @@ fn evaluate_board_v2(
     let mut enemy_capture_units: Vec<CaptureUnitInfo> = Vec::new();
     let mut my_transports: Vec<TransportInfo> = Vec::new();
     let mut enemy_transports: Vec<TransportInfo> = Vec::new();
+    // #49 (V3): 回復インフラ評価用の損傷ユニット収集
+    let mut my_damaged_units: Vec<DamagedUnitInfo> = Vec::new();
+    let mut enemy_damaged_units: Vec<DamagedUnitInfo> = Vec::new();
+    // #55 (V3): 前線圧力評価用の戦闘ユニット位置収集 (占領・輸送ユニットは除く)。
+    // 移動タイプは「地上ユニットは海越しの目標に圧力をかけられない」島判定に使う
+    let mut my_combat_positions: Vec<(GridPosition, crate::resources::MovementType)> = Vec::new();
+    let mut enemy_combat_positions: Vec<(GridPosition, crate::resources::MovementType)> =
+        Vec::new();
+    // #55 (V3): NPV 計算の副産物として得る拠点ごとの最短 ETA (先着レース評価用)
+    let mut my_prop_etas: HashMap<GridPosition, u32> = HashMap::new();
+    let mut enemy_prop_etas: HashMap<GridPosition, u32> = HashMap::new();
 
     let mut query = world.query::<(
         Entity,
@@ -556,6 +744,35 @@ fn evaluate_board_v2(
                     }
                 }
             }
+
+            // #55 (V3): 戦闘ユニット (攻撃可能・非占領・非輸送) を前線圧力評価の対象として収集
+            // 攻撃能力の有無は射程 (max_range > 0) で判定する。max_ammo1 だと無限弾薬や
+            // 副兵装のみを持つ戦闘ユニットを取りこぼすため (#57 レビュー対応)。
+            if is_v3 && !stats.can_capture && stats.max_cargo == 0 && stats.max_range > 0 {
+                if is_my_unit {
+                    my_combat_positions.push((*pos, stats.movement_type));
+                } else {
+                    enemy_combat_positions.push((*pos, stats.movement_type));
+                }
+            }
+
+            // #49 (V3): 損傷しているユニットを回復インフラ評価の対象として収集
+            if is_v3 && health.current < health.max && health.max > 0 {
+                let lost_value = (stats.cost as f32 * (health.max - health.current) as f32
+                    / health.max as f32) as i32;
+                let info = DamagedUnitInfo {
+                    pos: *pos,
+                    unit_type: stats.unit_type,
+                    max_movement: stats.max_movement,
+                    faction: faction.0,
+                    lost_value,
+                };
+                if is_my_unit {
+                    my_damaged_units.push(info);
+                } else {
+                    enemy_damaged_units.push(info);
+                }
+            }
         }
 
         // (B) 弾薬状態補正
@@ -694,6 +911,7 @@ fn evaluate_board_v2(
         current_turn,
         t_end,
         turn_cache,
+        &mut my_prop_etas,
     );
     let enemy_npv = match enemy_capture_units.first() {
         Some(u) => side_npv(
@@ -707,18 +925,63 @@ fn evaluate_board_v2(
             current_turn,
             t_end,
             turn_cache,
+            &mut enemy_prop_etas,
         ),
         None => 0,
     };
     let npv_score = my_npv - enemy_npv;
     let npv_contribution = (npv_score as f32 * NPV_WEIGHT) as i32;
 
+    // 5. #49 (V3): 回復インフラの条件付き価値。
+    // 損傷ユニットが多く、かつ回復拠点が近いほど価値が高い。
+    // 敵側も同様に評価し、差分をスコアへ加算する。
+    let recovery_score = if is_v3 {
+        side_recovery_infra_value(&registry, &properties, &my_damaged_units)
+            - side_recovery_infra_value(&registry, &properties, &enemy_damaged_units)
+    } else {
+        0
+    };
+
+    // 6. #55 (V3): イニシアチブ評価 (敵拡張の阻止 + 前線圧力)。
+    // 中立拠点の先着レースに勝つ配置と、戦闘ユニットで敵拠点へ圧力をかける
+    // 配置を加点し、「自陣に籠って動かない」ことが安定解になるのを防ぐ。
+    let initiative_score = if is_v3 {
+        let contested =
+            contested_territory_advantage(&registry, &properties, &my_prop_etas, &enemy_prop_etas);
+        // 前線圧力の島判定用 (地上ユニットは海越しの目標に圧力をかけられない)
+        let island_map = world
+            .get_resource::<crate::ai::islands::IslandMap>()
+            .cloned();
+        // 自軍戦闘ユニット → 敵の生産施設 (無ければ敵拠点) への圧力
+        let my_targets = front_pressure_targets(&registry, &properties, |owner| {
+            owner.is_some() && owner != Some(perspective_player)
+        });
+        let my_pressure =
+            side_front_pressure(&my_combat_positions, &my_targets, island_map.as_ref());
+        // 敵戦闘ユニット → 自軍の生産施設への圧力 (受けている圧力は減点)
+        let enemy_targets = front_pressure_targets(&registry, &properties, |owner| {
+            owner == Some(perspective_player)
+        });
+        let enemy_pressure =
+            side_front_pressure(&enemy_combat_positions, &enemy_targets, island_map.as_ref());
+        contested + my_pressure - enemy_pressure
+    } else {
+        0
+    };
+
     BoardMetrics {
-        total_score: unit_score + property_score + territory_score + npv_contribution,
+        total_score: unit_score
+            + property_score
+            + territory_score
+            + npv_contribution
+            + recovery_score
+            + initiative_score,
         unit_score,
         property_score,
         territory_score,
         npv_score,
+        recovery_score,
+        initiative_score,
         my_dominated_count,
         enemy_dominated_count,
     }
@@ -817,6 +1080,8 @@ pub fn compute_objective_metrics(world: &mut World, player: PlayerId) -> Objecti
 
     // NPV (獲得機会価値)
     let mut cache = crate::ai::turn_distance::AiTurnCache::default();
+    // 客観メトリクスでは ETA の副産物は使用しない
+    let mut unused_etas = HashMap::new();
     let npv = side_npv(
         &map,
         &registry,
@@ -828,6 +1093,7 @@ pub fn compute_objective_metrics(world: &mut World, player: PlayerId) -> Objecti
         current_turn,
         expected_end_turn(&map),
         &mut cache,
+        &mut unused_etas,
     );
 
     // 戦闘損益 (累計、ゴールド換算)
@@ -1112,5 +1378,193 @@ mod tests {
             eta_with_heli < walk_eta,
             "輸送ヘリ活用でETAが短縮されること"
         );
+    }
+
+    /// Issue #49: V3 では損傷ユニットの近くに回復インフラ (首都等) があるほど
+    /// recovery_score が高く評価され、V2 では常に 0 であることを検証する
+    #[test]
+    fn test_v3_recovery_infra_value() {
+        // capital_x: 回復拠点 (首都) の x 座標
+        let build_metrics = |version: AiVersion, capital_x: usize| -> BoardMetrics {
+            let mut world = World::new();
+            let p1 = PlayerId(1);
+            let p2 = PlayerId(2);
+
+            let mut settings = PlayerAiSettings::new();
+            settings.set_version(p1, version);
+            settings.set_version(p2, version);
+            world.insert_resource(settings);
+
+            let map = Map::new(
+                12,
+                1,
+                Terrain::Plains,
+                crate::resources::GridTopology::Square,
+            );
+            world.insert_resource(map);
+            world.insert_resource(crate::resources::MasterDataRegistry::load().unwrap());
+            world.insert_resource(crate::resources::MatchState::default());
+
+            // 損傷した自軍戦車 (cost 6000, HP 50/100, 移動4) at x=0
+            world.spawn((
+                Faction(p1),
+                GridPosition { x: 0, y: 0 },
+                Health {
+                    current: 50,
+                    max: 100,
+                },
+                UnitStats {
+                    unit_type: crate::resources::UnitType::Tank,
+                    cost: 6000,
+                    max_movement: 4,
+                    movement_type: crate::resources::MovementType::Tank,
+                    ..UnitStats::mock()
+                },
+            ));
+
+            // 自軍の回復拠点 (首都: 地上部隊を補給・回復できる)
+            world.spawn((
+                GridPosition { x: capital_x, y: 0 },
+                Property::new(Terrain::Capital, Some(p1), 200),
+            ));
+
+            evaluate_board_with_metrics(&mut world, p1, None)
+        };
+
+        // V2: 回復インフラ評価は常に 0
+        let v2 = build_metrics(AiVersion::V2, 1);
+        assert_eq!(v2.recovery_score, 0, "V2 では recovery_score は 0");
+
+        // V3: 回復拠点が近い (x=1, ETA 1) ほうが遠い (x=11, ETA 3) より高評価
+        let v3_near = build_metrics(AiVersion::V3, 1);
+        let v3_far = build_metrics(AiVersion::V3, 11);
+        assert!(
+            v3_near.recovery_score > 0,
+            "損傷ユニット + 回復拠点があれば正の価値 (actual: {})",
+            v3_near.recovery_score
+        );
+        assert!(
+            v3_near.recovery_score > v3_far.recovery_score,
+            "回復拠点が近いほど価値が高い (near: {}, far: {})",
+            v3_near.recovery_score,
+            v3_far.recovery_score
+        );
+    }
+
+    /// Issue #55 テスト用の共通ワールド (幅12x1 平原、V3設定)
+    fn setup_initiative_world(version: AiVersion) -> World {
+        let mut world = World::new();
+        let mut settings = PlayerAiSettings::new();
+        settings.set_version(PlayerId(1), version);
+        settings.set_version(PlayerId(2), version);
+        world.insert_resource(settings);
+        world.insert_resource(Map::new(
+            12,
+            1,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        ));
+        world.insert_resource(crate::resources::MasterDataRegistry::load().unwrap());
+        world.insert_resource(crate::resources::MatchState::default());
+        world
+    }
+
+    fn spawn_eval_infantry(world: &mut World, player: PlayerId, x: usize) {
+        world.spawn((
+            Faction(player),
+            GridPosition { x, y: 0 },
+            Health {
+                current: 100,
+                max: 100,
+            },
+            UnitStats {
+                unit_type: crate::resources::UnitType::Infantry,
+                cost: 1000,
+                max_movement: 3,
+                movement_type: crate::resources::MovementType::Infantry,
+                can_capture: true,
+                ..UnitStats::mock()
+            },
+        ));
+    }
+
+    /// Issue #55: 中立拠点の先着レースに勝っている盤面ほど
+    /// initiative_score が高いことを検証する
+    #[test]
+    fn test_v3_initiative_contested_territory() {
+        // 中立都市 (6,0)。自軍歩兵が敵歩兵より近い盤面 A と、遠い盤面 B を比較
+        let build = |my_x: usize, enemy_x: usize| -> BoardMetrics {
+            let mut world = setup_initiative_world(AiVersion::V3);
+            world.spawn((
+                GridPosition { x: 6, y: 0 },
+                Property::new(Terrain::City, None, 200),
+            ));
+            spawn_eval_infantry(&mut world, PlayerId(1), my_x);
+            spawn_eval_infantry(&mut world, PlayerId(2), enemy_x);
+            evaluate_board_with_metrics(&mut world, PlayerId(1), None)
+        };
+
+        let winning = build(4, 11); // 自軍が先着できる (ETA 1 vs 2)
+        let losing = build(11, 4); // 敵が先着できる
+
+        assert!(
+            winning.initiative_score > losing.initiative_score,
+            "先着レースに勝つ盤面ほどイニシアチブが高い (win: {}, lose: {})",
+            winning.initiative_score,
+            losing.initiative_score
+        );
+        assert!(
+            winning.initiative_score > 0,
+            "先着できる中立拠点があれば正の値 (actual: {})",
+            winning.initiative_score
+        );
+    }
+
+    /// Issue #55: 同一ユニット構成で、戦闘ユニットが敵拠点寄りに位置する
+    /// 配置のほうが initiative_score が高いことを検証する。V2 では常に 0。
+    #[test]
+    fn test_v3_initiative_front_pressure() {
+        let build = |version: AiVersion, tank_x: usize| -> BoardMetrics {
+            let mut world = setup_initiative_world(version);
+            // 敵所有の都市 (11,0)
+            world.spawn((
+                GridPosition { x: 11, y: 0 },
+                Property::new(Terrain::City, Some(PlayerId(2)), 200),
+            ));
+            // 自軍の戦闘ユニット (戦車)
+            world.spawn((
+                Faction(PlayerId(1)),
+                GridPosition { x: tank_x, y: 0 },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                UnitStats {
+                    unit_type: crate::resources::UnitType::Tank,
+                    cost: 6000,
+                    max_movement: 4,
+                    max_ammo1: 6,
+                    // 戦闘ユニット判定は max_range > 0 で行うため、戦車の射程を設定する
+                    max_range: 1,
+                    movement_type: crate::resources::MovementType::Tank,
+                    ..UnitStats::mock()
+                },
+            ));
+            evaluate_board_with_metrics(&mut world, PlayerId(1), None)
+        };
+
+        // V3: 前線押し上げ (敵拠点に近い) 配置のほうが高評価
+        let forward = build(AiVersion::V3, 8);
+        let backward = build(AiVersion::V3, 0);
+        assert!(
+            forward.initiative_score > backward.initiative_score,
+            "前線押し上げ配置のほうがイニシアチブが高い (fwd: {}, back: {})",
+            forward.initiative_score,
+            backward.initiative_score
+        );
+
+        // V2: イニシアチブ評価は常に 0
+        let v2 = build(AiVersion::V2, 8);
+        assert_eq!(v2.initiative_score, 0, "V2 では initiative_score は 0");
     }
 }

@@ -209,6 +209,26 @@ def run_single_game(map_name, p1_ver, p2_ver, max_turns, ui_callback=None):
                 acts_dict["Load"] += 1
             elif "DropUnitCommand" in action_str:
                 acts_dict["Drop"] += 1
+            # AiCommand (V2/V3 系) のデバッグ文字列。Capture は座標付きで記録し、
+            # どの拠点を占領しようとしているか追跡できるようにする
+            elif action_str.startswith("Capture"):
+                m2 = re.search(r"x:\s*(\d+),\s*y:\s*(\d+)", action_str)
+                if m2:
+                    acts_dict[f"Capture@({m2.group(1)},{m2.group(2)})"] += 1
+                else:
+                    acts_dict["Capture"] += 1
+            elif action_str.startswith("Attack"):
+                acts_dict["Attack"] += 1
+            elif action_str.startswith("Wait"):
+                acts_dict["Wait"] += 1
+            elif action_str.startswith("Merge"):
+                acts_dict["Merge"] += 1
+            elif action_str.startswith("Load"):
+                acts_dict["Load"] += 1
+            elif action_str.startswith("Drop"):
+                acts_dict["Drop"] += 1
+            elif action_str.startswith("Supply"):
+                acts_dict["Supply"] += 1
 
         if ui_callback and acts_dict:
             act_str = ", ".join([f"{k}({v})" for k, v in acts_dict.items()])
@@ -267,11 +287,12 @@ def check_no_decline(series, start_turn=15):
     return ma[-1] >= ma[start_turn - 1]
 
 
-def judge_objective_criteria(results):
+def judge_objective_criteria(results, subject="V2", baseline="V1"):
     """確定済みの客観メトリクス基準で合否判定する。
-    基準1: 判定時点(30T or 決着時点)の ZOC支配面積 V2平均 > V1平均（先攻・後攻それぞれ）
+    subject = 評価対象の新AI、baseline = 比較対象の旧AI。
+    基準1: 判定時点(30T or 決着時点)の ZOC支配面積 subject平均 > baseline平均（先攻・後攻それぞれ）
     基準2: 同・ターン収入
-    基準3: V2のユニット資産価値・収入の5T移動平均が15T以降に減少トレンドへ転じない
+    基準3: subjectのユニット資産価値・収入の5T移動平均が15T以降に減少トレンドへ転じない
            （ZOCは終盤のユニット密集で重複減少し誤検知するため、ストック指標で判定する。
             ZOCの優位性自体は基準1でカバーされる）
     戻り値: (per_map判定dict, 全体PASS/FAIL, 詳細行リスト)"""
@@ -280,9 +301,9 @@ def judge_objective_criteria(results):
 
     for g in results:
         p1, p2 = g["p1"], g["p2"]
-        if "V2" not in (p1, p2) or p1 == p2:
+        if subject not in (p1, p2) or p1 == p2:
             continue
-        v2_side = "p1" if p1 == "V2" else "p2"
+        v2_side = "p1" if p1 == subject else "p2"
         v1_side = "p2" if v2_side == "p1" else "p1"
         order = "先攻" if v2_side == "p1" else "後攻"
         raw_metrics = g.get("metrics", [])
@@ -328,35 +349,35 @@ def judge_objective_criteria(results):
     return map_pass, overall, detail_rows
 
 
-def generate_report(results):
+def generate_report(results, subject="V2", baseline="V1"):
     v2_wins = 0
     v1_wins = 0
     draws = 0
     total_games = len(results)
-    
+
     thinking_times_v2 = []
     thinking_times_v1 = []
     v2_win_turns = []
     v1_win_turns = []
     map_summaries = defaultdict(list)
-    
+
     for game in results:
         p1, p2 = game["p1"], game["p2"]
         res = game["result"]
         if "P1_Win" in res:
-            if p1 == "V2": v2_wins += 1; v2_win_turns.append(game["turns"])
+            if p1 == subject: v2_wins += 1; v2_win_turns.append(game["turns"])
             else: v1_wins += 1; v1_win_turns.append(game["turns"])
         elif "P2_Win" in res:
-            if p2 == "V2": v2_wins += 1; v2_win_turns.append(game["turns"])
+            if p2 == subject: v2_wins += 1; v2_win_turns.append(game["turns"])
             else: v1_wins += 1; v1_win_turns.append(game["turns"])
         else:
             draws += 1
-            
+
         t1 = game.get("thinking_times", {}).get(1, [])
         t2 = game.get("thinking_times", {}).get(2, [])
-        if p1 == "V2": thinking_times_v2.extend(t1)
+        if p1 == subject: thinking_times_v2.extend(t1)
         else: thinking_times_v1.extend(t1)
-        if p2 == "V2": thinking_times_v2.extend(t2)
+        if p2 == subject: thinking_times_v2.extend(t2)
         else: thinking_times_v1.extend(t2)
         
         map_summaries[game["map"]].append({
@@ -377,11 +398,11 @@ def generate_report(results):
     report = ["# 🏆 AI Matchup Evaluator Report"]
 
     # 客観メトリクス基準の合否判定 (Issue #48 確定基準)
-    map_pass, overall, detail_rows = judge_objective_criteria(results)
+    map_pass, overall, detail_rows = judge_objective_criteria(results, subject, baseline)
     report.append("## ✅ 合否判定（客観メトリクス基準）")
     report.append("判定時点 = 各戦の30ターン時点（それ以前に決着した場合は決着時点）。")
     report.append("")
-    report.append("| マップ | 手番 | 基準1: ZOC支配面積 (V2 vs V1) | 基準2: ターン収入 (V2 vs V1) | 基準3: ジリ貧解消 | 判定 |")
+    report.append(f"| マップ | 手番 | 基準1: ZOC支配面積 ({subject} vs {baseline}) | 基準2: ターン収入 ({subject} vs {baseline}) | 基準3: ジリ貧解消 | 判定 |")
     report.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
     for r in detail_rows:
         c1s = f"{'✅' if r['c1'] else '❌'} {r['v2_zoc']:.1f} vs {r['v1_zoc']:.1f}"
@@ -395,13 +416,13 @@ def generate_report(results):
 
     report.append("## 📊 総合結果サマリー")
     report.append(f"- **総対戦数**: {total_games} ゲーム")
-    report.append(f"- **V2 (新AI) の総合勝率（参考・ガードレール40%）**: **{v2_win_rate:.1f}%** ({v2_wins}勝 {v1_wins}敗 {draws}分)")
+    report.append(f"- **{subject} (新AI) の総合勝率（参考・ガードレール40%）**: **{v2_win_rate:.1f}%** ({v2_wins}勝 {v1_wins}敗 {draws}分)")
     report.append(f"- **平均勝利ターン数**: ")
-    report.append(f"  - **V2 (新AI) 勝利時**: {avg_turns_v2:.1f} ターン")
-    report.append(f"  - **V1 (旧AI) 勝利時**: {avg_turns_v1:.1f} ターン")
+    report.append(f"  - **{subject} (新AI) 勝利時**: {avg_turns_v2:.1f} ターン")
+    report.append(f"  - **{baseline} (旧AI) 勝利時**: {avg_turns_v1:.1f} ターン")
     report.append(f"- **平均思考時間 (1ターンあたり)**: ")
-    report.append(f"  - **V2 (新AI)**: **{avg_time_v2:.1f} ms**")
-    report.append(f"  - **V1 (旧AI)**: **{avg_time_v1:.1f} ms**\n")
+    report.append(f"  - **{subject} (新AI)**: **{avg_time_v2:.1f} ms**")
+    report.append(f"  - **{baseline} (旧AI)**: **{avg_time_v1:.1f} ms**\n")
     
     for map_name, games in map_summaries.items():
         report.append(f"### 📍 {map_name}")
@@ -535,7 +556,7 @@ def main():
                     all_results.append(res2)
                     print(json.dumps({"type": "result", "data": {k: v for k, v in res2.items() if k != "metrics" and k != "final_state"}}))
                 
-        report = generate_report(all_results)
+        report = generate_report(all_results, subject=args.p1, baseline=args.p2)
         with open(args.output, "w", encoding="utf-8") as f:
             f.write(report)
             

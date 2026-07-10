@@ -88,6 +88,32 @@ impl SquadManager {
     }
 }
 
+/// #53 (V3): 敵生産施設への奪取部隊の護衛として適格かを判定する。
+/// 「歩兵に随伴できる機動力があり、損傷しておらず、弾薬がある」戦闘ユニットのみ。
+/// 鈍足ユニット (砲台等)・損傷ユニット・弾切れユニットを護衛に組み込むと、
+/// 部隊の足が揃わない/戦力にならず奪取が成立しないため除外する。
+fn escort_is_eligible(
+    stats: &UnitStats,
+    infantry_movement: u32,
+    hp: u32,
+    ammo1: u32,
+    ammo2: u32,
+) -> bool {
+    // 機動力: 歩兵と同等以上 (鈍足ユニットを弾く)
+    if stats.max_movement < infantry_movement {
+        return false;
+    }
+    // 損傷: HP < 70 のユニットは前線から抜くべきでない
+    if hp < 70 {
+        return false;
+    }
+    // 弾薬: 主武器が弾切れ (副武器も無し) なら戦力にならない
+    if stats.max_ammo1 > 0 && ammo1 == 0 && !(stats.max_ammo2 > 0 && ammo2 > 0) {
+        return false;
+    }
+    true
+}
+
 /// 毎ターンの部隊の再編成と SoloFallback の判定を行います。
 pub fn update_squads(world: &mut World, perspective_player: PlayerId) {
     let mut manager = world.remove_resource::<SquadManager>().unwrap_or_default();
@@ -201,6 +227,21 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     let mut manager = world.remove_resource::<SquadManager>().unwrap_or_default();
     let strategy = analyze_strategy(world, perspective_player);
     let enemy_clusters = detect_enemy_clusters(world, perspective_player);
+
+    // V3 の戦略拡張 (#53: 敵拠点の奪取目標化) を有効にするかどうか
+    let is_v3 = world
+        .get_resource::<crate::ai::ai_version::PlayerAiSettings>()
+        .map(|s| s.get_version(perspective_player).uses_v3_tactics())
+        .unwrap_or(false);
+
+    // #53 (V3): メンバーが全滅した占領部隊を解散する。
+    // 残しておくと「そのターゲットには部隊が存在する」と誤判定され続け
+    // (dedupe に引っかかる)、失敗した奪取目標へ二度と部隊が送られなくなる
+    if is_v3 {
+        manager
+            .squads
+            .retain(|s| s.mission_type != MissionType::Capture || !s.members.is_empty());
+    }
 
     let map = world.resource::<Map>().clone();
     let registry = world
@@ -396,6 +437,22 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         (group, std::cmp::Reverse(b.priority_score))
     });
 
+    // #54 (V3): 自軍の歩兵 (占領要員) が存在する島の集合。
+    // 輸送カーゴの選定で「占領要員が未着の島へはまず歩兵を送る」判定に使う
+    let mut my_infantry_islands = HashSet::new();
+    if is_v3 {
+        for ((x, y), occ) in &unit_positions {
+            if occ.player_id == perspective_player
+                && matches!(occ.unit_type, UnitType::Infantry | UnitType::Mech)
+            {
+                let pos = GridPosition { x: *x, y: *y };
+                if let Some(island) = island_map.get_island_at(&pos) {
+                    my_infantry_islands.insert(island.id);
+                }
+            }
+        }
+    }
+
     // 優先順位の高い島から輸送機を割り当てる
     for objective in objectives.iter() {
         if free_transports.is_empty() {
@@ -431,46 +488,37 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
             }
 
             // ---------------------------------------------------------
-            // 距離ベースでの Cargo（歩兵）割り当て
+            // 距離ベースでの Cargo 割り当て。
+            // 従来は重車両を無条件に優先していたが、#54 (V3) では
+            // 「目標島に自軍歩兵 (占領要員) が未着なら歩兵を優先」する。
+            // 重車両を先に送ると占領が進まず、輸送枠が戦闘ユニットで
+            // 埋まって島の拡張が停止するため
             // ---------------------------------------------------------
+            let prefer_infantry = is_v3 && !my_infantry_islands.contains(&objective.target_island);
+
             let mut best_cargo_idx = None;
-            let mut is_combat_cargo = true;
+            let mut is_combat_cargo = false;
             let mut min_turn_dist = crate::ai::turn_distance::TurnDistance {
                 turns: u32::MAX,
                 used_mp: u32::MAX,
             };
 
-            // 重車両から探す
-            for (i, (_, pos, stats)) in free_combat_units.iter().enumerate() {
-                if trans_stats.loadable_unit_types.contains(&stats.unit_type) {
-                    let cargo_island = island_map.get_island_at(pos).map(|id| id.id);
-                    if cargo_island == Some(objective.target_island) {
-                        continue;
-                    }
-
-                    let dist = calculate_turn_distance(
-                        &map,
-                        &registry,
-                        &unit_positions,
-                        (pos.x, pos.y),
-                        (t_pos.x, t_pos.y),
-                        stats.movement_type,
-                        stats.max_movement,
-                        1,
-                        perspective_player,
-                        &mut turn_cache,
-                    );
-                    if dist < min_turn_dist {
-                        min_turn_dist = dist;
-                        best_cargo_idx = Some(i);
-                    }
+            // 探索順: (戦闘ユニットリストか, 対象リスト) を優先度順に並べる
+            let search_order: [bool; 2] = if prefer_infantry {
+                [false, true] // 歩兵 → 重車両
+            } else {
+                [true, false] // 重車両 → 歩兵 (従来挙動)
+            };
+            for search_combat in search_order {
+                if best_cargo_idx.is_some() {
+                    break;
                 }
-            }
-
-            // 見つからなければ歩兵から探す
-            if best_cargo_idx.is_none() {
-                is_combat_cargo = false;
-                for (i, (_, pos, stats)) in free_infantry.iter().enumerate() {
+                let list = if search_combat {
+                    &free_combat_units
+                } else {
+                    &free_infantry
+                };
+                for (i, (_, pos, stats)) in list.iter().enumerate() {
                     if trans_stats.loadable_unit_types.contains(&stats.unit_type) {
                         let cargo_island = island_map.get_island_at(pos).map(|id| id.id);
                         if cargo_island == Some(objective.target_island) {
@@ -492,6 +540,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                         if dist < min_turn_dist {
                             min_turn_dist = dist;
                             best_cargo_idx = Some(i);
+                            is_combat_cargo = search_combat;
                         }
                     }
                 }
@@ -608,7 +657,73 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     }
 
     // C. 占領部隊の立ち上げ（Expansionフェーズ）
-    for unowned_pos in &strategy.unowned_properties {
+    // #53 (V3): 中立拠点に加えて敵所有拠点も奪取目標に含める。
+    // 従来は中立拠点のみが対象だったため、中立を取り切ると占領部隊が
+    // 編成されなくなり、敵領土の奪取が発生しなかった。
+    let mut capture_targets: Vec<GridPosition> =
+        strategy.unowned_properties.iter().cloned().collect();
+    if is_v3 {
+        capture_targets.extend(strategy.enemy_properties.iter().cloned());
+    }
+    // 最寄りのフリー歩兵から近い順に割り当てる (HashSet 順の非決定性も排除し、
+    // 限られた歩兵を近い目標へ優先的に振り分ける)。
+    // #53 (V3): 工場・首都などの生産施設は敵の増援源であり、奪取すれば
+    // 前線の消耗戦を根本から崩せるため、多少遠くても優先する
+    // (前線都市の取り返し合いに全歩兵が吸われる膠着の解消)
+    const PRODUCTION_FACILITY_DIST_BONUS: usize = 6;
+    // #53 (V3): 敵生産施設への奪取部隊は同時に1個まで (集中スピアヘッド)。
+    // 複数同時に編成すると前線から兵力が抜かれすぎて防衛線が崩壊し、
+    // 逐次投入の各個撃破で全部隊が溶けるため
+    const MAX_CONCURRENT_FACILITY_CAPTURES: usize = 1;
+    let is_enemy_facility = |t: &GridPosition| -> bool {
+        properties_ownership
+            .get(t)
+            .is_some_and(|o| o.is_some() && *o != Some(perspective_player))
+            && map
+                .get_terrain(t.x, t.y)
+                .is_some_and(|tr| registry.is_production_facility(tr.as_str()))
+    };
+    let mut active_facility_captures = manager
+        .squads
+        .iter()
+        .filter(|s| {
+            s.mission_type == MissionType::Capture
+                && !s.members.is_empty()
+                && s.target.as_ref().is_some_and(&is_enemy_facility)
+        })
+        .count();
+    capture_targets.sort_by_key(|t| {
+        let d = free_infantry
+            .iter()
+            .map(|(_, pos, _)| pos.x.abs_diff(t.x) + pos.y.abs_diff(t.y))
+            .min()
+            .unwrap_or(usize::MAX);
+        let facility_bonus = if is_v3
+            && map
+                .get_terrain(t.x, t.y)
+                .is_some_and(|tr| registry.is_production_facility(tr.as_str()))
+        {
+            PRODUCTION_FACILITY_DIST_BONUS
+        } else {
+            0
+        };
+        (d.saturating_sub(facility_bonus), t.x, t.y)
+    });
+
+    // #53 (V3): 敵生産施設への突入 (スピアヘッド) は戦力優勢 (Assault フェーズ)
+    // のときのみ許可する。拮抗・劣勢時に前線から兵力を抜くと防衛線が崩壊する
+    let allow_facility_capture = strategy.phase == crate::ai::strategy::GamePhase::Assault;
+
+    for unowned_pos in &capture_targets {
+        // #53 (V3): 敵生産施設への奪取部隊は同時 MAX_CONCURRENT_FACILITY_CAPTURES 個まで
+        let target_is_enemy_facility = is_enemy_facility(unowned_pos);
+        if target_is_enemy_facility
+            && (!allow_facility_capture
+                || active_facility_captures >= MAX_CONCURRENT_FACILITY_CAPTURES)
+        {
+            continue;
+        }
+
         let target_island_opt = island_map.get_island_at(unowned_pos);
         if target_island_opt.is_none() {
             continue;
@@ -648,8 +763,49 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                     free_infantry.len() - 1
                 };
 
-                let (inf_ent, _, _) = free_infantry.remove(assigned_inf_idx);
+                let (inf_ent, _, inf_stats) = free_infantry.remove(assigned_inf_idx);
+                let inf_movement = inf_stats.max_movement;
                 squad.members.insert(inf_ent);
+
+                // #53 (V3): 敵生産施設 (工場・首都等) への奪取部隊には護衛の
+                // 戦闘ユニットを最大2両随伴させる。敵の生産圏は防御が厚く、
+                // 単独の歩兵では到達前に撃破されて奪取が成立しないため。
+                // 護衛は「歩兵に随伴できる機動力があり戦闘可能」なユニットに限定する
+                // (鈍足の砲台や弾切れ・損傷ユニットを組み込むと部隊が機能しないため)
+                if is_v3 && target_is_enemy_facility {
+                    // 対象拠点から「遠い順」に並べ替え、末尾 (最も近いユニット) から pop() で
+                    // 取り出すことで Vec 先頭削除による O(N) シフトを避ける (#57 レビュー対応)。
+                    free_combat_units.sort_by_key(|(_, pos, _)| {
+                        std::cmp::Reverse(
+                            pos.x.abs_diff(unowned_pos.x) + pos.y.abs_diff(unowned_pos.y),
+                        )
+                    });
+                    let mut assigned = 0;
+                    // 護衛条件を満たさず不採用としたユニットは後で free pool に戻す
+                    let mut rejected = Vec::new();
+                    while assigned < 2 {
+                        let Some((ent, pos, stats)) = free_combat_units.pop() else {
+                            break;
+                        };
+                        let hp = world
+                            .get::<crate::components::Health>(ent)
+                            .map(|h| h.current)
+                            .unwrap_or(100);
+                        let (ammo1, ammo2) = world
+                            .get::<crate::components::Ammo>(ent)
+                            .map(|a| (a.ammo1, a.ammo2))
+                            .unwrap_or((u32::MAX, u32::MAX));
+                        if escort_is_eligible(&stats, inf_movement, hp, ammo1, ammo2) {
+                            squad.members.insert(ent);
+                            assigned += 1;
+                        } else {
+                            rejected.push((ent, pos, stats));
+                        }
+                    }
+                    // 護衛に採用しなかった候補は他部隊が利用できるよう free pool へ戻す
+                    free_combat_units.append(&mut rejected);
+                    active_facility_captures += 1;
+                }
             }
         }
     }
@@ -1720,5 +1876,185 @@ mod tests {
         assert_eq!(capture_squads.len(), 1, "Should create 1 capture squad");
         assert!(capture_squads[0].members.contains(&inf));
         assert_eq!(capture_squads[0].target, Some(GridPosition { x: 5, y: 5 }));
+    }
+
+    /// Issue #53: V3 では中立拠点が無くても敵所有拠点を目標とする占領部隊が
+    /// 編成されること、V2 では従来通り編成されないことを検証する
+    #[test]
+    fn test_v3_capture_squad_targets_enemy_property() {
+        let run = |version: crate::ai::ai_version::AiVersion| -> Option<GridPosition> {
+            let mut world = setup_test_world();
+            let p1 = PlayerId(1);
+            let p2 = PlayerId(2);
+
+            let mut settings = crate::ai::ai_version::PlayerAiSettings::new();
+            settings.set_version(p1, version);
+            settings.set_version(p2, version);
+            world.insert_resource(settings);
+
+            // 自軍の工場 (base island 判定用)
+            world.spawn((
+                GridPosition { x: 1, y: 1 },
+                Property::new(Terrain::Factory, Some(p1), 100),
+            ));
+
+            // 敵所有の都市 (中立拠点は存在しない)
+            world.spawn((
+                GridPosition { x: 5, y: 5 },
+                Property::new(Terrain::City, Some(p2), 100),
+            ));
+
+            // フリーの自軍歩兵
+            world.spawn((
+                p1,
+                Faction(p1),
+                GridPosition { x: 4, y: 4 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    movement_type: MovementType::Infantry,
+                    max_movement: 3,
+                    can_capture: true,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ));
+
+            plan_squads(&mut world, p1);
+
+            let manager = world.get_resource::<SquadManager>().unwrap();
+            manager
+                .squads
+                .iter()
+                .find(|s| s.mission_type == MissionType::Capture)
+                .and_then(|s| s.target)
+        };
+
+        // V2: 敵拠点は占領部隊の対象にならない (従来挙動)
+        assert_eq!(
+            run(crate::ai::ai_version::AiVersion::V2),
+            None,
+            "V2 は敵拠点への占領部隊を編成しないはず"
+        );
+
+        // V3: 敵拠点を目標とする占領部隊が編成される
+        assert_eq!(
+            run(crate::ai::ai_version::AiVersion::V3),
+            Some(GridPosition { x: 5, y: 5 }),
+            "V3 は敵拠点 (5,5) への占領部隊を編成するはず"
+        );
+    }
+
+    /// Issue #53 (Gemini #4): 敵生産施設への護衛の適格判定。
+    /// 鈍足・損傷・弾切れのユニットは護衛から除外され、
+    /// 機動力があり健全で弾薬のあるユニットのみが選ばれることを検証する。
+    #[test]
+    fn test_escort_eligibility_filter() {
+        let infantry_movement = 3;
+
+        // 機動力十分・健全・弾薬あり → 適格 (中戦車 移動6)
+        let fast_tank = UnitStats {
+            unit_type: UnitType::MdTank,
+            max_movement: 6,
+            max_ammo1: 6,
+            max_ammo2: 9,
+            ..UnitStats::mock()
+        };
+        assert!(
+            escort_is_eligible(&fast_tank, infantry_movement, 100, 6, 9),
+            "健全で機動力・弾薬のある戦車は護衛適格のはず"
+        );
+
+        // 鈍足 (移動1 < 歩兵3) → 不適格 (砲台のような据置き砲)
+        let slow_gun = UnitStats {
+            unit_type: UnitType::Artillery,
+            max_movement: 1,
+            max_ammo1: 5,
+            ..UnitStats::mock()
+        };
+        assert!(
+            !escort_is_eligible(&slow_gun, infantry_movement, 100, 5, 0),
+            "歩兵より鈍足のユニットは護衛不適格のはず"
+        );
+
+        // 損傷 (HP < 70) → 不適格
+        assert!(
+            !escort_is_eligible(&fast_tank, infantry_movement, 50, 6, 9),
+            "HP50 の損傷ユニットは護衛不適格のはず"
+        );
+
+        // 弾切れ (主武器0・副武器0) → 不適格
+        assert!(
+            !escort_is_eligible(&fast_tank, infantry_movement, 100, 0, 0),
+            "主武器・副武器とも弾切れのユニットは護衛不適格のはず"
+        );
+
+        // 主武器弾切れでも副武器が残っていれば適格
+        assert!(
+            escort_is_eligible(&fast_tank, infantry_movement, 100, 0, 5),
+            "副武器が残っていれば護衛適格のはず"
+        );
+    }
+
+    /// Issue #53: 中立拠点と敵拠点が混在する場合、歩兵から近い目標が
+    /// 優先的に割り当てられる (決定的な順序) ことを検証する
+    #[test]
+    fn test_v3_capture_targets_sorted_by_distance() {
+        let mut world = setup_test_world();
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+
+        let mut settings = crate::ai::ai_version::PlayerAiSettings::new();
+        settings.set_version(p1, crate::ai::ai_version::AiVersion::V3);
+        world.insert_resource(settings);
+
+        world.spawn((
+            GridPosition { x: 1, y: 1 },
+            Property::new(Terrain::Factory, Some(p1), 100),
+        ));
+        // 近い敵拠点 (歩兵から距離2) と遠い中立拠点 (距離8)
+        world.spawn((
+            GridPosition { x: 5, y: 3 },
+            Property::new(Terrain::City, Some(p2), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 9, y: 5 },
+            Property::new(Terrain::City, None, 100),
+        ));
+
+        // フリー歩兵は1体のみ → 近い方 (敵拠点) に割り当てられるはず
+        world.spawn((
+            p1,
+            Faction(p1),
+            GridPosition { x: 3, y: 3 },
+            UnitStats {
+                unit_type: UnitType::Infantry,
+                movement_type: MovementType::Infantry,
+                max_movement: 3,
+                can_capture: true,
+                ..UnitStats::mock()
+            },
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ));
+
+        plan_squads(&mut world, p1);
+
+        let manager = world.get_resource::<SquadManager>().unwrap();
+        let capture_targets: Vec<_> = manager
+            .squads
+            .iter()
+            .filter(|s| s.mission_type == MissionType::Capture && !s.members.is_empty())
+            .filter_map(|s| s.target)
+            .collect();
+        assert_eq!(
+            capture_targets,
+            vec![GridPosition { x: 5, y: 3 }],
+            "1体しかいない歩兵は最も近い目標 (敵拠点) に割り当てられるはず"
+        );
     }
 }

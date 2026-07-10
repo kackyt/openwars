@@ -18,6 +18,12 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
     let strategy = analyze_strategy(world, player_id);
     let map = world.resource::<crate::resources::Map>().clone();
 
+    // V3 の生産拡張 (対編成カウンター効率) を有効にするかどうか
+    let is_v3 = world
+        .get_resource::<crate::ai::ai_version::PlayerAiSettings>()
+        .map(|s| s.get_version(player_id).uses_v3_tactics())
+        .unwrap_or(false);
+
     let (unit_registry, damage_chart, master_data) = {
         let ur = world.get_resource::<UnitRegistry>().cloned();
         let dc = world.get_resource::<DamageChart>().cloned();
@@ -167,6 +173,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                 &unit_registry,
                 prod_facility_terrain, // 適切な施設タイプを渡す
                 ratio_diff,
+                is_v3,
             );
             if score > max_score {
                 max_score = score;
@@ -269,6 +276,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                     &unit_registry,
                     *terrain,
                     ratio_diff,
+                    is_v3,
                 );
 
                 if score > best_score && score > 0 {
@@ -325,6 +333,68 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
     commands
 }
 
+/// #53/#55 (V3): 交戦成立率。攻撃側が防御側に対してどれだけ容易に射撃機会を
+/// 得られるかを射程と機動力から近似する。
+/// アウトレンジする側 (射程で上回る側) は撃ち逃げで一方的に攻撃でき、
+/// アウトレンジされる側は接近中に削られて攻撃機会が減る。
+fn engagement_factor(attacker: &UnitStats, defender: &UnitStats) -> f32 {
+    let att_reach = attacker.max_movement + attacker.max_range;
+    let def_reach = defender.max_movement + defender.max_range;
+    if attacker.max_range > defender.max_range {
+        // アウトレンジ可能: リーチでも上回るなら完全な撃ち逃げが成立する
+        if att_reach >= def_reach { 1.0 } else { 0.8 }
+    } else if attacker.max_range < defender.max_range {
+        // アウトレンジされる側: 射程内に入るまでに一方的に削られる
+        0.5
+    } else {
+        1.0
+    }
+}
+
+/// #53/#55 (V3): 対編成カウンター効率スコア。
+/// 候補ユニット U を1体生産した場合の、敵軍全体との「価値交換」の期待値を
+/// ゴールド換算で見積もる。敵ユニット e ごとに
+///   与える価値 = dmg(U→e) × cost_e × 交戦成立率(U,e)
+///   受ける価値 = dmg(e→U) × cost_U × 交戦成立率(e,U)
+/// の差を取り、敵軍の平均を返す。敵の主力構成に対して効率よく価値を刈り取れる
+/// ユニット (例: ロケラン主体の敵にはそれをアウトレンジする自走砲) が高評価になる。
+pub(crate) fn counter_efficiency_score(
+    unit_stats: &UnitStats,
+    enemy_units: &[(GridPosition, UnitStats)],
+    damage_chart: &DamageChart,
+) -> i32 {
+    if enemy_units.is_empty() {
+        return 0;
+    }
+    let mut total_net = 0i64;
+    for (_, e_stats) in enemy_units {
+        // 与える価値 (主武器・副武器の高い方)
+        let dmg_out = damage_chart
+            .get_base_damage(unit_stats.unit_type, e_stats.unit_type)
+            .unwrap_or(0)
+            .max(
+                damage_chart
+                    .get_base_damage_secondary(unit_stats.unit_type, e_stats.unit_type)
+                    .unwrap_or(0),
+            );
+        // 受ける価値
+        let dmg_in = damage_chart
+            .get_base_damage(e_stats.unit_type, unit_stats.unit_type)
+            .unwrap_or(0)
+            .max(
+                damage_chart
+                    .get_base_damage_secondary(e_stats.unit_type, unit_stats.unit_type)
+                    .unwrap_or(0),
+            );
+        let value_out =
+            dmg_out as f32 * e_stats.cost as f32 / 100.0 * engagement_factor(unit_stats, e_stats);
+        let value_in =
+            dmg_in as f32 * unit_stats.cost as f32 / 100.0 * engagement_factor(e_stats, unit_stats);
+        total_net += (value_out - value_in) as i64;
+    }
+    (total_net / enemy_units.len() as i64) as i32
+}
+
 /// 指定した地点で特定のユニットを生産した場合の期待スコアを算出します。
 #[allow(clippy::too_many_arguments)]
 pub fn calculate_unit_score_at(
@@ -340,6 +410,8 @@ pub fn calculate_unit_score_at(
     _unit_registry: &UnitRegistry,
     produced_at: Terrain,
     ratio_diff: f32,
+    // V3 のみ true。対編成カウンター効率スコアで生産を敵構成に適応させる
+    is_v3: bool,
 ) -> u32 {
     // 1. 基本スコア（敵との距離、脅威度）
     let mut min_eta = 99;
@@ -616,23 +688,39 @@ pub fn calculate_unit_score_at(
     }
 
     // 3. アンチ性能ボーナス
-    // 敵の主力ユニットに対して有利なユニットを高く評価
-    for (_, enemy_stats) in enemy_units {
-        // 武器1での相性
-        if let Some(damage) = damage_chart.get_base_damage(unit_type, enemy_stats.unit_type) {
-            if damage >= 50 {
-                score += 500;
-            }
-            if damage >= 80 {
-                score += 1000;
-            }
+    if is_v3 {
+        // #53/#55 (V3): 対編成カウンター効率。敵軍の実構成に対する価値交換の
+        // 期待値 (射程・機動の相性込み) で生産を適応させる。
+        // 敵がロケラン主体ならそれをアウトレンジする自走砲、航空主体なら対空、
+        // のように敵の主力へのカウンターが自動的に浮上する
+        let counter = counter_efficiency_score(stats, enemy_units, damage_chart);
+        let mut scaled = (counter * 3).clamp(-4000, 8000);
+        // 拡張期 (未交戦) はカウンター生産よりも経済 (歩兵・輸送) を優先する。
+        // 敵が別の島にいて届かない段階でカウンターユニットを量産しても
+        // 価値を発揮できず、拡張と輸送の予算を食い潰すだけになるため
+        if strategy.phase == GamePhase::Expansion {
+            scaled /= 4;
         }
-        // 武器2での相性
-        if damage_chart
-            .get_base_damage_secondary(unit_type, enemy_stats.unit_type)
-            .is_some_and(|damage| damage >= 30)
-        {
-            score += 300;
+        score = score.saturating_add_signed(scaled);
+    } else {
+        // V2: 敵の主力ユニットに対して有利なユニットを頭数で加点する従来方式
+        for (_, enemy_stats) in enemy_units {
+            // 武器1での相性
+            if let Some(damage) = damage_chart.get_base_damage(unit_type, enemy_stats.unit_type) {
+                if damage >= 50 {
+                    score += 500;
+                }
+                if damage >= 80 {
+                    score += 1000;
+                }
+            }
+            // 武器2での相性
+            if damage_chart
+                .get_base_damage_secondary(unit_type, enemy_stats.unit_type)
+                .is_some_and(|damage| damage >= 30)
+            {
+                score += 300;
+            }
         }
     }
 
@@ -740,6 +828,56 @@ mod additional_tests {
     use crate::ai::strategy;
     use crate::components::Health;
     use crate::resources::{Map, Terrain};
+
+    /// #53/#55 (V3): 対編成カウンター効率スコアの検証。
+    /// ロケラン主体の敵編成に対して、それをアウトレンジできる重自走砲が
+    /// ロケラン同型や歩兵より高評価になること
+    #[test]
+    fn test_counter_efficiency_vs_rocket_army() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (world, _) =
+            crate::setup::initialize_world_from_master_data(&master_data, "map_1").unwrap();
+        let registry = world.get_resource::<UnitRegistry>().unwrap().clone();
+        let chart = world.get_resource::<DamageChart>().unwrap().clone();
+
+        // 敵編成: ロケットランチャー主体 (V2 の典型的なスパム構成)
+        let rockets_stats = registry.0.get(&UnitType::Rockets).unwrap().clone();
+        let enemy_army: Vec<(GridPosition, UnitStats)> = (0..10)
+            .map(|i| (GridPosition { x: i, y: 0 }, rockets_stats.clone()))
+            .collect();
+
+        let heavy_sp_gun = registry.0.get(&UnitType::HeavySpGun).unwrap();
+        let infantry = registry.0.get(&UnitType::Infantry).unwrap();
+
+        let sp_gun_score = counter_efficiency_score(heavy_sp_gun, &enemy_army, &chart);
+        let rockets_score = counter_efficiency_score(&rockets_stats, &enemy_army, &chart);
+        let infantry_score = counter_efficiency_score(infantry, &enemy_army, &chart);
+
+        // 重自走砲 (射程3-5) はロケラン (射程2-3) をアウトレンジして一方的に叩ける
+        assert!(
+            sp_gun_score > 0,
+            "重自走砲はロケラン軍への正の交換価値を持つはず (actual: {})",
+            sp_gun_score
+        );
+        assert!(
+            sp_gun_score > rockets_score,
+            "重自走砲はロケラン同型生産より高評価のはず (sp_gun: {}, rockets: {})",
+            sp_gun_score,
+            rockets_score
+        );
+        assert!(
+            sp_gun_score > infantry_score,
+            "重自走砲は歩兵より高評価のはず (sp_gun: {}, infantry: {})",
+            sp_gun_score,
+            infantry_score
+        );
+        // 歩兵はロケランに一方的に虐殺される (87ダメージ) ため負の交換価値
+        assert!(
+            infantry_score < 0,
+            "歩兵はロケラン軍に対して負の交換価値のはず (actual: {})",
+            infantry_score
+        );
+    }
 
     #[test]
     fn test_ai_production_saving_for_mdtank() {
@@ -915,6 +1053,7 @@ mod additional_tests {
                 &registry,
                 Terrain::Factory,
                 0.0,
+                false,
             );
         }
 
@@ -946,6 +1085,7 @@ mod additional_tests {
                 &registry,
                 Terrain::Factory,
                 0.0,
+                false,
             );
         }
 

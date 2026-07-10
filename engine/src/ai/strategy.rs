@@ -35,6 +35,8 @@ pub struct ProductionStrategy {
     pub priority_targets: Vec<GridPosition>,
     /// 未占領（中立）拠点の座標リスト
     pub unowned_properties: std::collections::HashSet<GridPosition>,
+    /// 敵所有拠点の座標リスト (#53: 占領部隊の奪取目標として使用)
+    pub enemy_properties: std::collections::HashSet<GridPosition>,
     /// 歩兵など、ヘリでも運搬可能な軽輸送需要
     pub light_transport_demand: u32,
     /// 車両など、輸送船でしか運搬できない重輸送需要
@@ -173,8 +175,9 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
         }
     }
 
-    // unowned_properties を strategy に保存
+    // unowned_properties / enemy_properties を strategy に保存
     strategy.unowned_properties = unowned_properties.iter().cloned().collect();
+    strategy.enemy_properties = enemy_properties.iter().cloned().collect();
 
     let mut my_units = Vec::new();
     let mut enemy_units = Vec::new();
@@ -425,7 +428,11 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                     let mut blocked_by_sea = false;
 
                     for target in &strategy.priority_targets {
-                        // ターゲットがある島を取得し、侵攻が許可されているかチェック
+                        // ターゲットがある島を取得し、侵攻が許可されているかチェック。
+                        // 注 (#54): このフィルタを V3 で無効化する実験を行ったが、
+                        // 輸送候補が爆発して輸送スコアが歪み、拡張用の歩兵輸送が
+                        // 止まる退行が観測されたため従来挙動を維持している。
+                        // 侵攻許可のデッドロック解消は別設計 (侵攻オブジェクティブ) が必要
                         if let Some(target_island_id) =
                             island_map.get_island_at(target).map(|i| i.id)
                         {
