@@ -773,29 +773,37 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                 // 護衛は「歩兵に随伴できる機動力があり戦闘可能」なユニットに限定する
                 // (鈍足の砲台や弾切れ・損傷ユニットを組み込むと部隊が機能しないため)
                 if is_v3 && target_is_enemy_facility {
+                    // 対象拠点から「遠い順」に並べ替え、末尾 (最も近いユニット) から pop() で
+                    // 取り出すことで Vec 先頭削除による O(N) シフトを避ける (#57 レビュー対応)。
                     free_combat_units.sort_by_key(|(_, pos, _)| {
-                        pos.x.abs_diff(unowned_pos.x) + pos.y.abs_diff(unowned_pos.y)
+                        std::cmp::Reverse(
+                            pos.x.abs_diff(unowned_pos.x) + pos.y.abs_diff(unowned_pos.y),
+                        )
                     });
                     let mut assigned = 0;
-                    let mut i = 0;
-                    while i < free_combat_units.len() && assigned < 2 {
-                        let (ent, _, stats) = &free_combat_units[i];
+                    // 護衛条件を満たさず不採用としたユニットは後で free pool に戻す
+                    let mut rejected = Vec::new();
+                    while assigned < 2 {
+                        let Some((ent, pos, stats)) = free_combat_units.pop() else {
+                            break;
+                        };
                         let hp = world
-                            .get::<crate::components::Health>(*ent)
+                            .get::<crate::components::Health>(ent)
                             .map(|h| h.current)
                             .unwrap_or(100);
                         let (ammo1, ammo2) = world
-                            .get::<crate::components::Ammo>(*ent)
+                            .get::<crate::components::Ammo>(ent)
                             .map(|a| (a.ammo1, a.ammo2))
                             .unwrap_or((u32::MAX, u32::MAX));
-                        if escort_is_eligible(stats, inf_movement, hp, ammo1, ammo2) {
-                            let (e, _, _) = free_combat_units.remove(i);
-                            squad.members.insert(e);
+                        if escort_is_eligible(&stats, inf_movement, hp, ammo1, ammo2) {
+                            squad.members.insert(ent);
                             assigned += 1;
                         } else {
-                            i += 1;
+                            rejected.push((ent, pos, stats));
                         }
                     }
+                    // 護衛に採用しなかった候補は他部隊が利用できるよう free pool へ戻す
+                    free_combat_units.append(&mut rejected);
                     active_facility_captures += 1;
                 }
             }

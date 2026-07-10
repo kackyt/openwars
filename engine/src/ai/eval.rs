@@ -746,7 +746,9 @@ fn evaluate_board_v2(
             }
 
             // #55 (V3): 戦闘ユニット (攻撃可能・非占領・非輸送) を前線圧力評価の対象として収集
-            if is_v3 && !stats.can_capture && stats.max_cargo == 0 && stats.max_ammo1 > 0 {
+            // 攻撃能力の有無は射程 (max_range > 0) で判定する。max_ammo1 だと無限弾薬や
+            // 副兵装のみを持つ戦闘ユニットを取りこぼすため (#57 レビュー対応)。
+            if is_v3 && !stats.can_capture && stats.max_cargo == 0 && stats.max_range > 0 {
                 if is_my_unit {
                     my_combat_positions.push((*pos, stats.movement_type));
                 } else {
@@ -1542,6 +1544,8 @@ mod tests {
                     cost: 6000,
                     max_movement: 4,
                     max_ammo1: 6,
+                    // 戦闘ユニット判定は max_range > 0 で行うため、戦車の射程を設定する
+                    max_range: 1,
                     movement_type: crate::resources::MovementType::Tank,
                     ..UnitStats::mock()
                 },
