@@ -102,25 +102,19 @@ pub fn get_droppable_tiles_at(
     }
 
     // 2. リソースを取得
-    let (neighbors, master_data) = if let (Some(map), Some(md)) = (
+    let (neighbors, map, master_data) = if let (Some(map), Some(md)) = (
         world.get_resource::<crate::resources::Map>(),
         world.get_resource::<crate::resources::master_data::MasterDataRegistry>(),
     ) {
         // トポロジー（スクエア=4近傍/ヘックス=6近傍）に応じた隣接マスを取得
-        (map.get_adjacent(t_pos.x, t_pos.y), md)
+        (map.get_adjacent(t_pos.x, t_pos.y), map, md)
     } else {
         return targets;
     };
 
     for (x, y) in neighbors {
         // 地形通行可能判定
-        let terrain = if let Some(map) = world.get_resource::<crate::resources::Map>() {
-            if let Some(t) = map.get_terrain(x, y) {
-                t
-            } else {
-                continue;
-            }
-        } else {
+        let Some(terrain) = map.get_terrain(x, y) else {
             continue;
         };
 

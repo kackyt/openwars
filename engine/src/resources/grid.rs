@@ -21,7 +21,10 @@ impl GridTopology {
 
     /// 2点間のグリッド距離（最短ステップ数）を返す
     pub fn distance(&self, a: (usize, usize), b: (usize, usize)) -> u32 {
-        self.geometry().distance(a, b)
+        match self {
+            GridTopology::Square => SquareGrid.distance(a, b),
+            GridTopology::Hex => HexGrid.distance(a, b),
+        }
     }
 
     /// マップ境界内の隣接セルを列挙する
@@ -32,7 +35,10 @@ impl GridTopology {
         width: usize,
         height: usize,
     ) -> Vec<(usize, usize)> {
-        self.geometry().neighbors(x, y, width, height)
+        match self {
+            GridTopology::Square => SquareGrid.neighbors(x, y, width, height),
+            GridTopology::Hex => HexGrid.neighbors(x, y, width, height),
+        }
     }
 }
 
@@ -101,11 +107,8 @@ impl GridGeometry for HexGrid {
         const EVEN_ROW: [(i64, i64); 6] = [(1, 0), (-1, 0), (0, -1), (-1, -1), (0, 1), (-1, 1)];
         const ODD_ROW: [(i64, i64); 6] = [(1, 0), (-1, 0), (1, -1), (0, -1), (1, 1), (0, 1)];
 
-        let offsets = if y.is_multiple_of(2) {
-            &EVEN_ROW
-        } else {
-            &ODD_ROW
-        };
+        #[allow(clippy::manual_is_multiple_of)]
+        let offsets = if y % 2 == 0 { &EVEN_ROW } else { &ODD_ROW };
         let mut adj = Vec::with_capacity(6);
         for (dx, dy) in offsets {
             let nx = x as i64 + dx;
