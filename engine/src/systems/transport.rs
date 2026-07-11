@@ -102,52 +102,40 @@ pub fn get_droppable_tiles_at(
     }
 
     // 2. リソースを取得
-    let (map_w, map_h, master_data) = if let (Some(map), Some(md)) = (
+    let (neighbors, master_data) = if let (Some(map), Some(md)) = (
         world.get_resource::<crate::resources::Map>(),
         world.get_resource::<crate::resources::master_data::MasterDataRegistry>(),
     ) {
-        (map.width, map.height, md)
+        // トポロジー（スクエア=4近傍/ヘックス=6近傍）に応じた隣接マスを取得
+        (map.get_adjacent(t_pos.x, t_pos.y), md)
     } else {
         return targets;
     };
 
-    // 周囲1マスの座標をチェック
-    let neighbors = [
-        (t_pos.x as i64 - 1, t_pos.y as i64),
-        (t_pos.x as i64 + 1, t_pos.y as i64),
-        (t_pos.x as i64, t_pos.y as i64 - 1),
-        (t_pos.x as i64, t_pos.y as i64 + 1),
-    ];
-
-    for (nx, ny) in neighbors {
-        if nx >= 0 && nx < map_w as i64 && ny >= 0 && ny < map_h as i64 {
-            let x = nx as usize;
-            let y = ny as usize;
-
-            // 地形通行可能判定
-            let terrain = if let Some(map) = world.get_resource::<crate::resources::Map>() {
-                if let Some(t) = map.get_terrain(x, y) {
-                    t
-                } else {
-                    continue;
-                }
+    for (x, y) in neighbors {
+        // 地形通行可能判定
+        let terrain = if let Some(map) = world.get_resource::<crate::resources::Map>() {
+            if let Some(t) = map.get_terrain(x, y) {
+                t
             } else {
                 continue;
-            };
-
-            if crate::systems::movement::get_valid_movement_cost(
-                master_data,
-                cargo_movement_type,
-                terrain,
-            )
-            .is_none()
-            {
-                continue;
             }
+        } else {
+            continue;
+        };
 
-            if !occupied_positions.contains(&(x, y)) {
-                targets.push((x, y));
-            }
+        if crate::systems::movement::get_valid_movement_cost(
+            master_data,
+            cargo_movement_type,
+            terrain,
+        )
+        .is_none()
+        {
+            continue;
+        }
+
+        if !occupied_positions.contains(&(x, y)) {
+            targets.push((x, y));
         }
     }
 
@@ -292,8 +280,8 @@ pub fn unload_unit_system(
             continue;
         } // Cannot unload on the same turn it was loaded
 
-        let dist = (trans_pos.x as i64 - event.target_x as i64).unsigned_abs() as u32
-            + (trans_pos.y as i64 - event.target_y as i64).unsigned_abs() as u32;
+        // トポロジー（スクエア/ヘックス）に応じた距離で隣接判定する
+        let dist = map.distance(trans_pos.x, trans_pos.y, event.target_x, event.target_y);
 
         if dist != 1 {
             continue;
@@ -658,6 +646,56 @@ mod tests {
         // 歩兵は海を通行できないので、(0, 1) も除外されるはず
         assert_eq!(tiles.len(), 2);
         assert!(!tiles.contains(&(0, 1)));
+    }
+
+    /// ヘックスモードでは降車先候補が周囲6マスになることの確認 (#37)
+    #[test]
+    fn test_get_droppable_tiles_hex() {
+        let mut world = World::new();
+
+        // ヘックスマップとマスターデータのセットアップ
+        let map = Map::new(5, 5, Terrain::Plains, GridTopology::Hex);
+        world.insert_resource(map);
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+
+        let transport_entity = world
+            .spawn((
+                GridPosition { x: 1, y: 1 },
+                Faction(PlayerId(1)),
+                CargoCapacity {
+                    max: 1,
+                    loaded: vec![],
+                },
+            ))
+            .id();
+
+        let cargo_entity = world
+            .spawn((
+                GridPosition { x: 999, y: 999 }, // 搭載中を想定
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    movement_type: MovementType::Infantry,
+                    ..UnitStats::mock()
+                },
+                Transporting(transport_entity),
+            ))
+            .id();
+
+        world
+            .get_mut::<CargoCapacity>(transport_entity)
+            .unwrap()
+            .loaded
+            .push(cargo_entity);
+
+        // (1,1) は奇数行なので odd-r レイアウトの6近傍すべてが候補になる
+        let mut tiles = get_droppable_tiles(&mut world, transport_entity, cargo_entity);
+        tiles.sort();
+        assert_eq!(
+            tiles,
+            vec![(0, 1), (1, 0), (1, 2), (2, 0), (2, 1), (2, 2)],
+            "ヘックスモードでは周囲6マスが降車候補になるはず"
+        );
     }
 
     #[test]

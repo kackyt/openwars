@@ -37,11 +37,16 @@ pub fn get_suppliable_targets_at(
         return targets;
     }
 
+    // マップのトポロジー（スクエア/ヘックス）に応じた距離で隣接判定する
+    let topology = world
+        .get_resource::<Map>()
+        .map(|m| m.topology)
+        .unwrap_or(GridTopology::Square);
+
     let mut q_targets = world.query_filtered::<(Entity, &GridPosition, &Faction), With<Faction>>();
     for (t_ent, t_pos, t_faction) in q_targets.iter(world) {
         if t_ent != supplier && t_faction.0 == unit_faction {
-            let dist = (s_pos.x as i64 - t_pos.x as i64).unsigned_abs() as u32
-                + (s_pos.y as i64 - t_pos.y as i64).unsigned_abs() as u32;
+            let dist = topology.distance((s_pos.x, s_pos.y), (t_pos.x, t_pos.y));
             if dist == 1 {
                 targets.push(t_ent);
             }
@@ -67,6 +72,7 @@ pub fn supply_unit_system(
     match_state: Res<MatchState>,
     players: Res<Players>,
     mut commands: Commands,
+    map: Option<Res<Map>>,
 ) {
     if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
@@ -97,8 +103,12 @@ pub fn supply_unit_system(
             continue;
         }
 
-        let dist = (sup_pos.x as i64 - tar_pos.x as i64).unsigned_abs() as u32
-            + (sup_pos.y as i64 - tar_pos.y as i64).unsigned_abs() as u32;
+        // マップのトポロジー（スクエア/ヘックス）に応じた距離で隣接判定する
+        let topology = map
+            .as_ref()
+            .map(|m| m.topology)
+            .unwrap_or(GridTopology::Square);
+        let dist = topology.distance((sup_pos.x, sup_pos.y), (tar_pos.x, tar_pos.y));
 
         if dist != 1 {
             continue;
@@ -291,5 +301,54 @@ mod tests {
         world.get_mut::<UnitStats>(supplier).unwrap().can_supply = false;
         let targets_none = get_suppliable_targets(&mut world, supplier);
         assert!(targets_none.is_empty());
+    }
+
+    /// ヘックスモードでは斜め方向の隣接ユニットにも補給できることの確認
+    #[test]
+    fn test_get_suppliable_targets_hex() {
+        let mut world = World::new();
+        world.insert_resource(Map::new(10, 10, Terrain::Plains, GridTopology::Hex));
+
+        let inf_stats = UnitStats {
+            unit_type: UnitType::Infantry,
+            max_fuel: 99,
+            max_ammo1: 9,
+            ..UnitStats::mock()
+        };
+
+        // 補給車を奇数行 (5,5) に配置
+        let supplier = world
+            .spawn((
+                GridPosition { x: 5, y: 5 },
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::SupplyTruck,
+                    can_supply: true,
+                    ..inf_stats.clone()
+                },
+            ))
+            .id();
+
+        // (6,6) は奇数行の斜め隣接（ヘックス距離1、マンハッタン距離2）
+        let target_diag = world
+            .spawn((
+                GridPosition { x: 6, y: 6 },
+                Faction(PlayerId(1)),
+                inf_stats.clone(),
+            ))
+            .id();
+
+        // (4,4) はヘックスでは隣接しない（マンハッタン距離2）
+        let _target_not_adjacent = world
+            .spawn((
+                GridPosition { x: 4, y: 4 },
+                Faction(PlayerId(1)),
+                inf_stats.clone(),
+            ))
+            .id();
+
+        let targets = get_suppliable_targets(&mut world, supplier);
+        assert_eq!(targets.len(), 1);
+        assert!(targets.contains(&target_diag));
     }
 }
