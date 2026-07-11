@@ -14,23 +14,26 @@ use bevy_ecs::prelude::*;
 /// 5. 新しいユニットの実体(`Entity`)をコンポーネント群と共に生成（スポーン）します。
 ///    ※生産された直後は行動できないため、`HasMoved` と `ActionCompleted` を true にします。
 ///
-/// 首都からの生産可能範囲（マンハッタン距離）
+/// 首都からの生産可能範囲（グリッド距離）
 pub const PRODUCTION_RANGE: usize = 3;
 
+/// 首都からのグリッド距離（トポロジーに応じたマンハッタン距離/ヘックス距離）が
+/// 生産可能範囲内かどうかを判定する
 pub fn is_within_production_range(
     capital_pos: Option<GridPosition>,
     target_x: usize,
     target_y: usize,
+    topology: GridTopology,
 ) -> bool {
     if let Some(cp) = capital_pos {
-        let distance = (target_x as isize - cp.x as isize).unsigned_abs()
-            + (target_y as isize - cp.y as isize).unsigned_abs();
-        distance <= PRODUCTION_RANGE
+        let distance = topology.distance((cp.x, cp.y), (target_x, target_y));
+        distance as usize <= PRODUCTION_RANGE
     } else {
         false
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_production_rules(
     is_occupied: bool,
     landscape_name: Option<&str>,
@@ -39,6 +42,7 @@ fn check_production_rules(
     target_y: usize,
     unit_type: UnitType,
     master_data: &MasterDataRegistry,
+    topology: GridTopology,
 ) -> Result<(), String> {
     if is_occupied {
         return Err("Tile is occupied!".to_string());
@@ -52,7 +56,7 @@ fn check_production_rules(
         return Err(format!("Cannot produce {:?} at {}", unit_type, ln));
     }
 
-    if !is_within_production_range(capital_pos, target_x, target_y) {
+    if !is_within_production_range(capital_pos, target_x, target_y, topology) {
         return Err("Too far from Capital!".to_string());
     }
 
@@ -97,7 +101,11 @@ pub fn can_produce_at_tile(
         return Err("Not a production facility!".to_string());
     }
 
-    if !is_within_production_range(capital_pos, target_x, target_y) {
+    let topology = world
+        .get_resource::<Map>()
+        .map(|m| m.topology)
+        .unwrap_or(GridTopology::Square);
+    if !is_within_production_range(capital_pos, target_x, target_y, topology) {
         return Err("Too far from Capital!".to_string());
     }
 
@@ -131,6 +139,10 @@ pub fn can_produce_at(
         }
     }
 
+    let topology = world
+        .get_resource::<Map>()
+        .map(|m| m.topology)
+        .unwrap_or(GridTopology::Square);
     check_production_rules(
         is_occupied,
         landscape_name,
@@ -139,6 +151,7 @@ pub fn can_produce_at(
         target_y,
         unit_type,
         master_data,
+        topology,
     )
 }
 
@@ -154,6 +167,7 @@ pub fn produce_unit_system(
     master_data: Res<MasterDataRegistry>,
     unit_registry: Res<UnitRegistry>,
     mut diagnostic: Option<ResMut<ProductionDiagnostic>>,
+    map: Option<Res<Map>>,
 ) {
     if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
@@ -195,6 +209,9 @@ pub fn produce_unit_system(
             event.target_y,
             event.unit_type,
             &master_data,
+            map.as_ref()
+                .map(|m| m.topology)
+                .unwrap_or(GridTopology::Square),
         ) {
             if let Some(ref mut diag) = diagnostic {
                 diag.last_error = Some(e.to_string());

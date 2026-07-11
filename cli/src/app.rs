@@ -4,8 +4,8 @@ use engine::components::{
     UnitStats,
 };
 use engine::resources::master_data::MasterDataRegistry;
-use engine::resources::{GameOverCondition, Map, MatchState, PendingMove, Players};
-use engine::setup::initialize_world_from_master_data;
+use engine::resources::{GameOverCondition, GridTopology, Map, MatchState, PendingMove, Players};
+use engine::setup::initialize_world_from_master_data_with_topology;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CurrentScreen {
@@ -105,6 +105,8 @@ pub struct UiState {
     pub in_game_state: InGameState,
     pub selected_map_index: usize,
     pub available_maps: Vec<String>,
+    /// マップ選択画面で選ぶグリッド形状（スクエア/ヘックス）
+    pub selected_topology: GridTopology,
     // In-game state
     pub player_controls: std::collections::HashMap<u32, PlayerControlType>,
     pub cursor_pos: (usize, usize),
@@ -122,6 +124,7 @@ impl UiState {
             in_game_state: InGameState::Normal,
             selected_map_index: 0,
             available_maps: maps,
+            selected_topology: GridTopology::Square,
             player_controls: controls,
             cursor_pos: (0, 0),
             log_messages: Vec::new(),
@@ -221,6 +224,13 @@ impl App {
                     },
                 );
             }
+            // グリッド形状（スクエア/ヘックス）の切り替え
+            KeyCode::Char('t') => {
+                self.ui_state.selected_topology = match self.ui_state.selected_topology {
+                    GridTopology::Square => GridTopology::Hex,
+                    GridTopology::Hex => GridTopology::Square,
+                };
+            }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 // Determine the selected map
                 let map_name = self
@@ -237,8 +247,14 @@ impl App {
                         self.ui_state.current_screen = CurrentScreen::InGame;
                         self.ui_state.in_game_state = InGameState::Normal;
                         self.ui_state.cursor_pos = (0, 0);
-                        self.ui_state
-                            .add_log(format!("マップ '{}' を読み込みました。", map_name));
+                        let grid_label = match self.ui_state.selected_topology {
+                            GridTopology::Square => "スクエア",
+                            GridTopology::Hex => "ヘックス",
+                        };
+                        self.ui_state.add_log(format!(
+                            "マップ '{}' を読み込みました。(グリッド: {})",
+                            map_name, grid_label
+                        ));
                     }
                 }
             }
@@ -1153,7 +1169,11 @@ impl App {
         // Add game logic systems (order is managed by engine)
         add_main_game_systems(&mut schedule);
 
-        let (world, schedule) = initialize_world_from_master_data(&self.master_data, &map_name)?;
+        let (world, schedule) = initialize_world_from_master_data_with_topology(
+            &self.master_data,
+            &map_name,
+            self.ui_state.selected_topology,
+        )?;
 
         self.world = Some(world);
         self.schedule = Some(schedule);

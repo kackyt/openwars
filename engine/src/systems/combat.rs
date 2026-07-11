@@ -165,8 +165,12 @@ pub fn can_attack(
         return Err(AttackError::FriendlyFire);
     }
 
-    let dist = (a_pos_val.x as i64 - d_pos.x as i64).unsigned_abs() as u32
-        + (a_pos_val.y as i64 - d_pos.y as i64).unsigned_abs() as u32;
+    // マップのトポロジー（スクエア/ヘックス）に応じた距離で射程を判定する
+    let topology = world
+        .get_resource::<Map>()
+        .map(|m| m.topology)
+        .unwrap_or(GridTopology::Square);
+    let dist = topology.distance((a_pos_val.x, a_pos_val.y), (d_pos.x, d_pos.y));
 
     let target_type_name = d_stats.unit_type.as_str();
 
@@ -278,6 +282,12 @@ pub fn get_attackable_targets_at(
         }
     };
 
+    // マップのトポロジーに応じた距離で射程を判定する
+    let topology = world
+        .get_resource::<Map>()
+        .map(|m| m.topology)
+        .unwrap_or(GridTopology::Square);
+
     let mut q_targets =
         world.query_filtered::<(Entity, &GridPosition, &Faction, &UnitStats), With<Faction>>();
     for (t_ent, t_pos, t_faction, t_stats) in q_targets.iter(world) {
@@ -285,8 +295,7 @@ pub fn get_attackable_targets_at(
             continue;
         }
 
-        let dist = (a_pos.x as i64 - t_pos.x as i64).unsigned_abs() as u32
-            + (a_pos.y as i64 - t_pos.y as i64).unsigned_abs() as u32;
+        let dist = topology.distance((a_pos.x, a_pos.y), (t_pos.x, t_pos.y));
 
         let target_type_name = t_stats.unit_type.as_str();
         let mut can_attack = false;
@@ -470,8 +479,13 @@ pub fn attack_unit_system(
             continue;
         }
 
-        let dist = (attacker_pos.x as i64 - defender_pos.x as i64).unsigned_abs() as u32
-            + (attacker_pos.y as i64 - defender_pos.y as i64).unsigned_abs() as u32;
+        // マップのトポロジーに応じた距離で射程を判定する
+        let dist = map.distance(
+            attacker_pos.x,
+            attacker_pos.y,
+            defender_pos.x,
+            defender_pos.y,
+        );
 
         let def_terrain = map
             .get_terrain(defender_pos.x, defender_pos.y)
