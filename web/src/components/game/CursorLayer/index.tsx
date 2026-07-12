@@ -19,8 +19,6 @@ export const CursorLayer = ({ x, y, tileSize }: CursorProps) => {
     g.lineStyle(4, 0xffeb3b, 1);
     
     const margin = 2;
-    const size = tileSize - margin * 2;
-    
     // コーナーだけを描画してターゲットスコープのように見せる
     const cornerSize = 12;
     

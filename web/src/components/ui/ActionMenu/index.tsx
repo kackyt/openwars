@@ -13,6 +13,10 @@ const ACTION_MAP: Record<string, string> = {
   Wait: '待機',
   Attack: '攻撃',
   Capture: '占領',
+  Supply: '補給',
+  Load: '搭載',
+  Drop: '降車',
+  Merge: '合流',
 };
 
 export const ActionMenu = ({ x, y, actions, onSelect, onClose }: ActionMenuProps) => {

@@ -106,8 +106,9 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                 && !occupied_positions.contains(pos)
             {
                 // 首都から3マス以内（PRODUCTION_RANGE）の施設のみを有効とする
+                let capital_positions: Vec<GridPosition> = capital_pos.into_iter().collect();
                 if crate::systems::production::is_within_production_range(
-                    capital_pos,
+                    &capital_positions,
                     pos.x,
                     pos.y,
                     topology,

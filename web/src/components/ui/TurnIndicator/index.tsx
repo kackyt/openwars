@@ -1,7 +1,7 @@
-import { Paper, Text, Group, ColorSwatch } from '@mantine/core';
+import { Paper, Text, Group, ColorSwatch, Button, Stack } from '@mantine/core';
 import { turnIndicatorContainer } from './index.css';
 
-export const TurnIndicator = ({ turn, phase }: { turn: number; phase: string }) => {
+export const TurnIndicator = ({ turn, phase, funds, onEndTurn }: { turn: number; phase: string; funds: number; onEndTurn: () => void }) => {
   const isP1 = phase === 'P1';
   const isP2 = phase === 'P2';
   
@@ -11,15 +11,22 @@ export const TurnIndicator = ({ turn, phase }: { turn: number; phase: string }) 
   return (
     <Paper shadow="md" p="sm" radius="md" withBorder className={turnIndicatorContainer} style={{ borderLeft: `6px solid var(--mantine-color-${phaseColor}-filled)` }}>
       <Group justify="space-between">
-        <Text size="lg" fw={800}>
-          Turn {turn}
-        </Text>
-        <Group gap="xs">
-          <ColorSwatch color={`var(--mantine-color-${phaseColor}-filled)`} size={14} />
-          <Text size="sm" fw={700} c={phaseColor}>
-            {phaseText}
-          </Text>
-        </Group>
+        <Stack gap={0}>
+          <Text size="lg" fw={800}>Turn {turn}</Text>
+          <Text size="sm" fw={700} c="yellow">資金: {funds} G</Text>
+        </Stack>
+        
+        <Stack gap="xs" align="flex-end">
+          <Group gap="xs">
+            <ColorSwatch color={`var(--mantine-color-${phaseColor}-filled)`} size={14} />
+            <Text size="sm" fw={700} c={phaseColor}>
+              {phaseText}
+            </Text>
+          </Group>
+          <Button size="xs" color="red" variant="light" onClick={onEndTurn}>
+            End Turn
+          </Button>
+        </Stack>
       </Group>
     </Paper>
   );

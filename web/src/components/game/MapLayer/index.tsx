@@ -1,7 +1,7 @@
-import { Container, Sprite } from '@pixi/react';
+import { Container, Sprite, Graphics } from '@pixi/react';
 import { useGameStore } from '../../../store/gameStore';
 
-const TILE_SIZE = 64;
+const TILE_SIZE = 48;
 
 const TERRAIN_IMAGE_MAP: Record<string, string> = {
   'plains': 'plain',
@@ -32,20 +32,35 @@ export const MapLayer = () => {
       {mapData.map((row, y) => (
         row.map((cell, x) => {
           const isHexOddRow = topology === 'hex' && y % 2 !== 0;
-          const offsetX = isHexOddRow ? 32 : 0; // 32 is TILE_SIZE / 2
-          const px = x * 64 + offsetX;
-          const py = y * 64;
+          const offsetX = isHexOddRow ? TILE_SIZE / 2 : 0;
+          const px = x * TILE_SIZE + offsetX;
+          const py = y * TILE_SIZE;
           const property = propertyData.find(p => p.x === x && p.y === y);
 
           return (
-            <Sprite
-              key={`cell-${x}-${y}`}
-              image={getTerrainImagePath(cell, property?.owner || 'neutral')}
-              x={px}
-              y={py}
-              width={TILE_SIZE}
-              height={TILE_SIZE}
-            />
+            <Container key={`cell-${x}-${y}`} x={px} y={py}>
+              <Sprite
+                image={getTerrainImagePath(cell, property?.owner || 'neutral')}
+                width={TILE_SIZE}
+                height={TILE_SIZE}
+              />
+              {property && property.capture_points < property.max_capture_points && property.max_capture_points > 0 && (
+                <Graphics
+                  x={4}
+                  y={TILE_SIZE - 8}
+                  draw={(g) => {
+                    g.clear();
+                    g.beginFill(0x000000, 0.5);
+                    g.drawRect(0, 0, TILE_SIZE - 8, 6);
+                    g.endFill();
+                    g.beginFill(0x00ff00);
+                    const ratio = property.capture_points / property.max_capture_points;
+                    g.drawRect(1, 1, (TILE_SIZE - 10) * ratio, 4);
+                    g.endFill();
+                  }}
+                />
+              )}
+            </Container>
           );
         })
       ))}

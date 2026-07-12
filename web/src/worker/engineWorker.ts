@@ -46,10 +46,89 @@ export class EngineWorker {
     return JSON.parse(res as string);
   }
 
-  async calculateMovePath(unitId: string, destX: number, destY: number) {
+  async getReachableCells(unitId: string) {
     if (!this.engine) throw new Error("Engine not initialized");
-    const res = await this.engine.calculate_move_path(unitId, destX, destY);
-    return JSON.parse(res as string);
+    const jsonStr = this.engine.get_reachable_cells(unitId);
+    return JSON.parse(jsonStr as string);
+  }
+
+  async getAvailableActions(unitId: string, destX: number, destY: number) {
+    if (!this.engine) throw new Error("Engine not initialized");
+    const jsonStr = this.engine.get_available_actions(unitId, destX, destY);
+    return JSON.parse(jsonStr as string);
+  }
+
+  async getAttackableTargets(unitId: string, destX: number, destY: number) {
+    if (!this.engine) throw new Error("Engine not initialized");
+    const jsonStr = this.engine.get_attackable_targets(unitId, destX, destY);
+    return JSON.parse(jsonStr as string);
+  }
+
+  async getProducibleUnits(x: number, y: number) {
+    if (!this.engine) throw new Error("Engine not initialized");
+    const jsonStr = this.engine.get_producible_units(x, y);
+    return JSON.parse(jsonStr as string);
+  }
+
+  async submitMoveCommand(unitId: string, destX: number, destY: number) {
+    if (!this.engine) throw new Error("Engine not initialized");
+    this.engine.submit_move_command(unitId, destX, destY);
+  }
+
+  async submitWaitCommand(unitId: string) {
+    if (!this.engine) throw new Error("Engine not initialized");
+    this.engine.submit_wait_command(unitId);
+  }
+
+  async submitAttackCommand(unitId: string, targetId: string) {
+    if (!this.engine) throw new Error("Engine not initialized");
+    this.engine.submit_attack_command(unitId, targetId);
+  }
+
+  async submitCaptureCommand(unitId: string) {
+    if (!this.engine) throw new Error("Engine not initialized");
+    this.engine.submit_capture_command(unitId);
+  }
+
+  async submitLoadCommand(unitId: string, targetId: string) {
+    if (!this.engine) throw new Error("Engine not initialized");
+    this.engine.submit_load_command(unitId, targetId);
+  }
+
+  async submitProduceCommand(unitType: string, x: number, y: number) {
+    if (!this.engine) throw new Error("Engine not initialized");
+    this.engine.submit_produce_command(unitType, x, y);
+  }
+
+  // 輸送ユニットに積載されているユニット一覧を取得する
+  async getLoadedUnits(transportId: string): Promise<{ id: string, type: string }[]> {
+    if (!this.engine) throw new Error("Engine not initialized");
+    const jsonStr = this.engine.get_loaded_units(transportId);
+    return JSON.parse(jsonStr as string);
+  }
+
+  // 指定ユニットの降車可能マス一覧を取得する
+  async getDroppableTiles(transportId: string, cargoId: string): Promise<{ x: number, y: number }[]> {
+    if (!this.engine) throw new Error("Engine not initialized");
+    const jsonStr = this.engine.get_droppable_tiles(transportId, cargoId);
+    return JSON.parse(jsonStr as string);
+  }
+
+  // 降車コマンドを送信する
+  async submitUnloadCommand(transportId: string, cargoId: string, targetX: number, targetY: number) {
+    if (!this.engine) throw new Error("Engine not initialized");
+    this.engine.submit_unload_command(transportId, cargoId, targetX, targetY);
+  }
+
+  // 合流コマンドを送信する
+  async submitMergeCommand(unitId: string, targetId: string) {
+    if (!this.engine) throw new Error("Engine not initialized");
+    this.engine.submit_merge_command(unitId, targetId);
+  }
+
+  async endTurn() {
+    if (!this.engine) throw new Error("Engine not initialized");
+    this.engine.end_turn();
   }
 }
 

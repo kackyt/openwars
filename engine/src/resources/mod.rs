@@ -118,6 +118,33 @@ impl UnitType {
             .unwrap_or("不明")
     }
 
+    pub fn from_english_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "infantry" => Some(UnitType::Infantry),
+            "mech" | "mech_infantry" => Some(UnitType::Mech),
+            "recon" | "armored_vehicle" => Some(UnitType::Recon),
+            "tank" | "light_tank" => Some(UnitType::Tank),
+            "mdtank" | "medium_tank" => Some(UnitType::MdTank),
+            "tankz" | "heavy_tank" => Some(UnitType::TankZ),
+            "artillery" => Some(UnitType::Artillery),
+            "lightspgun" | "light_artillery" => Some(UnitType::LightSpGun),
+            "heavyspgun" | "heavy_artillery" => Some(UnitType::HeavySpGun),
+            "rockets" | "rocket" => Some(UnitType::Rockets),
+            "antiair" | "anti_air_tank" => Some(UnitType::AntiAir),
+            "missiles" | "anti_air_missile" => Some(UnitType::Missiles),
+            "fighter" => Some(UnitType::Fighter),
+            "heavyfighter" | "heavy_fighter" => Some(UnitType::HeavyFighter),
+            "bomber" => Some(UnitType::Bomber),
+            "bcopters" | "battle_copter" => Some(UnitType::Bcopters),
+            "transporthelicopter" | "transport_copter" => Some(UnitType::TransportHelicopter),
+            "battleship" => Some(UnitType::Battleship),
+            "carrier" => Some(UnitType::Carrier),
+            "lander" => Some(UnitType::Lander),
+            "supplytruck" | "supply_truck" => Some(UnitType::SupplyTruck),
+            _ => None,
+        }
+    }
+
     pub fn symbol(&self) -> &'static str {
         use UnitType::*;
         match self {

@@ -1,7 +1,7 @@
-import { Container, Sprite } from '@pixi/react';
+import { Container, Sprite, Text, Graphics } from '@pixi/react';
 import { useGameStore } from '../../../store/gameStore';
 
-const TILE_SIZE = 64;
+const TILE_SIZE = 48;
 
 const UNIT_IMAGE_MAP: Record<string, string> = {
   'infantry': 'infantry',
@@ -34,19 +34,31 @@ export const UnitLayer = () => {
     <Container>
       {unitData.map((unit) => {
         const isHexOddRow = topology === 'hex' && unit.y % 2 !== 0;
-        const offsetX = isHexOddRow ? 32 : 0;
+        const offsetX = isHexOddRow ? TILE_SIZE / 2 : 0;
         const px = unit.x * TILE_SIZE + offsetX;
         const py = unit.y * TILE_SIZE;
 
         return (
-          <Sprite
-            key={unit.id}
-            image={`/assets/units/${unit.faction}/${UNIT_IMAGE_MAP[unit.type] || 'infantry'}.png`}
-            x={px}
-            y={py}
-            width={TILE_SIZE}
-            height={TILE_SIZE}
-          />
+          <Container key={unit.id} x={px} y={py}>
+            <Sprite
+              image={`/assets/units/${unit.faction}/${UNIT_IMAGE_MAP[unit.type] || 'infantry'}.png`}
+              width={TILE_SIZE}
+              height={TILE_SIZE}
+            />
+            {unit.is_loaded && (
+              <Container x={TILE_SIZE - 16} y={TILE_SIZE - 16}>
+                <Graphics
+                  draw={(g) => {
+                    g.clear();
+                    g.beginFill(0x000000, 0.7);
+                    g.drawRoundedRect(0, 0, 16, 16, 4);
+                    g.endFill();
+                  }}
+                />
+                <Text text="L" style={{ fill: 'white', fontSize: 12, fontWeight: 'bold' }} x={4} y={1} />
+              </Container>
+            )}
+          </Container>
         );
       })}
     </Container>

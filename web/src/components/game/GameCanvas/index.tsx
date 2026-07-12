@@ -3,13 +3,20 @@ import * as PIXI from 'pixi.js';
 import { MapLayer } from '../MapLayer';
 import { UnitLayer } from '../UnitLayer';
 import { CursorLayer } from '../CursorLayer';
+import { ReachableLayer } from '../ReachableLayer';
 import { useGameStore } from '../../../store/gameStore';
 import { useState, useEffect } from 'react';
 
-const TILE_SIZE = 64;
+const TILE_SIZE = 48;
 
 export const GameCanvas = () => {
-  const { mapData, unitData, setHoveredCell, openActionMenu, closeActionMenu, topology } = useGameStore();
+  const { 
+    mapData, unitData, 
+    interactionState, reachableCells, attackableTargets,
+    setHoveredCell, selectUnit, selectMoveTarget, executeAction, cancelInteraction, openProduceMenu,
+    executeDropTarget,
+    topology 
+  } = useGameStore();
   
   const [windowSize, setWindowSize] = useState({ width: window.innerWidth, height: window.innerHeight });
   useEffect(() => {
@@ -49,7 +56,6 @@ export const GameCanvas = () => {
   const clampCameraPos = (newX: number, newY: number) => {
     const mapWidth = (mapData[0]?.length || 0) * TILE_SIZE;
     const mapHeight = mapData.length * TILE_SIZE;
-    // マップが画面より小さい場合は左上に固定する
     const minX = Math.min(0, windowSize.width - mapWidth);
     const minY = Math.min(0, windowSize.height - mapHeight);
     
@@ -95,12 +101,41 @@ export const GameCanvas = () => {
     
     if (dist < 10) {
       const cellData = getCellData(e.data.global.x, e.data.global.y);
-      if (cellData && cellData.unit) {
-        const clientX = e.data.originalEvent.clientX;
-        const clientY = e.data.originalEvent.clientY;
-        openActionMenu(clientX, clientY, cellData.unit.id, ['Wait', 'Attack', 'Capture']);
-      } else {
-        closeActionMenu();
+      if (!cellData) return;
+      const { gridX, gridY, unit, cellType } = cellData;
+
+      if (interactionState === 'idle') {
+        if (unit) {
+          selectUnit(unit.id);
+        } else if (['factory', 'airport', 'port', 'capital', 'city'].includes(cellType)) {
+          openProduceMenu(gridX, gridY);
+        } else {
+          cancelInteraction();
+        }
+      } else if (interactionState === 'unit_selected') {
+        const isReachable = reachableCells.some(c => c.x === gridX && c.y === gridY);
+        if (isReachable) {
+          selectMoveTarget(gridX, gridY);
+        } else {
+          cancelInteraction();
+        }
+      } else if (interactionState === 'target_selection') {
+        const target = attackableTargets.find(t => t.x === gridX && t.y === gridY);
+        if (target) {
+          executeAction('Attack', target.id);
+        } else {
+          cancelInteraction();
+        }
+      } else if (interactionState === 'drop_target_selection') {
+        // 降車先マスのタップ: ハイライト済みマスをタップしたら降車コマンドを送信する
+        const isDroppable = reachableCells.some(c => c.x === gridX && c.y === gridY);
+        if (isDroppable) {
+          executeDropTarget(gridX, gridY);
+        } else {
+          cancelInteraction();
+        }
+      } else if (interactionState === 'action_menu' || interactionState === 'produce_menu' || interactionState === 'drop_unit_selection') {
+        cancelInteraction();
       }
     }
   };
@@ -123,6 +158,7 @@ export const GameCanvas = () => {
         <Sprite texture={PIXI.Texture.WHITE} width={windowSize.width} height={windowSize.height} alpha={0} />
         <Container x={cameraPos.x} y={cameraPos.y}>
           <MapLayer />
+          <ReachableLayer tileSize={TILE_SIZE} />
           <UnitLayer />
           {hoverX >= 0 && hoverY >= 0 && <CursorLayer x={hoverX} y={hoverY} tileSize={TILE_SIZE} />}
         </Container>
