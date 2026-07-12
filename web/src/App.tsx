@@ -11,8 +11,14 @@ import type { EngineWorker } from './worker/engineWorker';
 function App() {
   const [engineReady, setEngineReady] = useState(false);
   const [turnInfo, setTurnInfo] = useState({ turn: 1, phase: 'P1' });
-  const [selectedUnit, setSelectedUnit] = useState<{id: string, type: string, faction: string, hp?: number} | null>(null);
-  const [selectedTerrain, setSelectedTerrain] = useState<{type: string, def?: number} | null>(null);
+  
+  // ホバー用
+  const [hoverX, setHoverX] = useState(-1);
+  const [hoverY, setHoverY] = useState(-1);
+  const [hoveredUnit, setHoveredUnit] = useState<{id: string, type: string, faction: string, hp?: number} | null>(null);
+  const [hoveredTerrain, setHoveredTerrain] = useState<{type: string, def?: number} | null>(null);
+  
+  // アクションメニュー用
   const [actionMenu, setActionMenu] = useState<{x: number, y: number, actions: string[]} | null>(null);
 
   useEffect(() => {
@@ -35,20 +41,26 @@ function App() {
     initWorker();
   }, []);
 
-  const handleCellClick = (_x: number, _y: number, cellType: number, unitInfo: any | null, clientX: number, clientY: number) => {
+  const handleCellHover = (x: number, y: number, cellType: number, unitInfo: any | null) => {
+    if (x === hoverX && y === hoverY) return; // 変わってなければ無視
+
+    setHoverX(x);
+    setHoverY(y);
+
     const terrains = ['plain', 'woods', 'mountain'];
     const defs = [1, 2, 3];
-    setSelectedTerrain({ type: terrains[cellType] || 'unknown', def: defs[cellType] || 0 });
+    setHoveredTerrain({ type: terrains[cellType] || 'unknown', def: defs[cellType] || 0 });
+    setHoveredUnit(unitInfo);
+  };
 
+  const handleCellClick = (_x: number, _y: number, _cellType: number, unitInfo: any | null, clientX: number, clientY: number) => {
     if (unitInfo) {
-      setSelectedUnit(unitInfo);
       setActionMenu({
         x: clientX,
         y: clientY,
         actions: ['Wait', 'Attack', 'Capture']
       });
     } else {
-      setSelectedUnit(null);
       setActionMenu(null);
     }
   };
@@ -61,11 +73,16 @@ function App() {
   return (
     <MantineProvider defaultColorScheme="dark">
       <div style={{ position: 'relative', height: '100vh', width: '100vw', overflow: 'hidden' }}>
-        <GameCanvas onCellClick={handleCellClick} />
+        <GameCanvas 
+          hoverX={hoverX}
+          hoverY={hoverY}
+          onCellHover={handleCellHover}
+          onCellClick={handleCellClick} 
+        />
         
         {engineReady && <TurnIndicator turn={turnInfo.turn} phase={turnInfo.phase} />}
         
-        <UnitInfoPanel unit={selectedUnit} terrain={selectedTerrain} />
+        <UnitInfoPanel unit={hoveredUnit} terrain={hoveredTerrain} />
         
         {actionMenu && (
           <ActionMenu 
