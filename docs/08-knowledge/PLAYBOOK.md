@@ -1,11 +1,11 @@
 ---
 title: "PLAYBOOK"
-version: "1.3.0"
+version: "1.4.0"
 status: "approved"
 created: "2026-06-06"
-updated: "2026-07-11"
+updated: "2026-07-12"
 owner: "@t_kak"
-ace_entry_count: 8
+ace_entry_count: 9
 tags: [ace, playbook, knowledge-management]
 references:
   - docs/ACE_FRAMEWORK.md
@@ -207,7 +207,7 @@ Playbook が 800 行を超えた場合、以下のように分割する：
 | Category   | performance |
 | Origin     | PR #47 |
 | Date       | 2026-06-08 |
-| Helpful    | 0 |
+| Helpful    | 1 |
 | Harmful    | 0 |
 | Status     | active |
 
@@ -330,6 +330,25 @@ Playbook が 800 行を超えた場合、以下のように分割する：
 **Context**: PR #57 にて、AI V3 の生産評価ロジックが改善された。従来の頭数加算から、ユニット間の相対的な価値交換に基づくモデルに置換したことで、例えば「対ロケットランチャーには射程外から攻撃できる重自走砲」といったカウンターが自動的に選択されるようになった。
 
 **Action**: AI の生産やターゲティング評価において、固定のメタ（例: AはBに強い）をハードコードするのではなく、「予想されるダメージ交換の価値」と「接敵する確率（射程や移動力）」を掛け合わせた期待値計算を実装する。
+
+<a id="ace-59-1"></a>
+
+### ACE-59-1: Hot pathでの動的ディスパッチ（dyn Trait）回避によるパフォーマンス改善
+
+| フィールド | 値           |
+| ---------- | ------------ |
+| Category   | performance  |
+| Origin     | PR #59       |
+| Date       | 2026-07-12   |
+| Helpful    | 0            |
+| Harmful    | 0            |
+| Status     | active       |
+
+**Insight**: 距離計算や隣接判定などの頻繁に呼ばれる hot path において、`dyn Trait` による動的ディスパッチを避けることでパフォーマンスのボトルネックを解消できる。
+
+**Context**: PR #59 のヘックスグリッド対応にて、グリッド形状の抽象化に `dyn GridGeometry` を用いたが、レビューにてパフォーマンス懸念が指摘された。解決策として、`GridTopology` enum 内の `match self` によって各構造体に処理を委譲する静的ディスパッチ方式に変更された。
+
+**Action**: ゲームループ内の hot path ではポリモーフィズムの実現に `dyn Trait`（動的ディスパッチ）を避け、列挙型（enum）による `match` 分岐（静的ディスパッチ）を採用する。
 
 ## Changelog
 
