@@ -5,7 +5,8 @@ edition = "2024"
 
 [dependencies]
 bevy_ecs = "0.15.2"
-uuid = { version = "1.12", features = ["v4"] }
+uuid = { version = "1.12", features = ["v4", "js"] }
+getrandom = { version = "0.3.4", features = ["wasm_js"] }
 thiserror = "2.0"
 anyhow = "1.0"
 csv = "1.3"
