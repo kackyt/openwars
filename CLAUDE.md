@@ -43,7 +43,7 @@ impl HitPoint {
 
 Rust
 // domain/model/map.rs
-pub struct HexMap {
+pub struct Map {
     pub id: MapId,
     // &Unit ではなく UnitId を保持する
     cells: HashMap<Position, Option<UnitId>>, 
