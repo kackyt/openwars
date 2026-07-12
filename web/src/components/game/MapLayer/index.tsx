@@ -1,29 +1,45 @@
 import { Container, Sprite } from '@pixi/react';
+import { useGameStore } from '../../../store/gameStore';
 
 const TILE_SIZE = 64;
 
-// モック用のマップデータ (0=平地, 1=森, 2=山)
-export const MOCK_MAP = [
-  [0, 0, 1, 2, 0],
-  [0, 1, 1, 0, 0],
-  [0, 0, 0, 0, 2],
-  [1, 0, 0, 0, 0],
-];
+const TERRAIN_IMAGE_MAP: Record<string, string> = {
+  'plains': 'plain',
+  'forest': 'woods',
+  'mountain': 'mountain',
+  'river': 'river',
+  'road': 'road',
+  'bridge': 'bridge',
+  'sea': 'sea',
+  'shoal': 'shoal',
+};
 
-const TERRAIN_TEXTURES: Record<number, string> = {
-  0: '/assets/terrains/plain.png',
-  1: '/assets/terrains/woods.png',
-  2: '/assets/terrains/mountain.png',
+const getTerrainImagePath = (cell: string, propertyOwner: string = 'neutral') => {
+  if (['city', 'factory', 'airport', 'port', 'capital'].includes(cell)) {
+    const filename = cell === 'capital' ? 'hq' : cell;
+    return `/assets/properties/${propertyOwner}/${filename}.png`;
+  }
+  
+  const mapped = TERRAIN_IMAGE_MAP[cell] || 'plain';
+  return `/assets/terrains/${mapped}.png`;
 };
 
 export const MapLayer = () => {
+  const mapData = useGameStore(state => state.mapData);
+  const propertyData = useGameStore(state => state.propertyData);
+
+  const propertyMap = new Map();
+  propertyData.forEach(p => {
+    propertyMap.set(`${p.x},${p.y}`, p.owner);
+  });
+
   return (
     <Container>
-      {MOCK_MAP.map((row, y) =>
+      {mapData.map((row, y) =>
         row.map((cell, x) => (
           <Sprite
             key={`cell-${x}-${y}`}
-            image={TERRAIN_TEXTURES[cell]}
+            image={getTerrainImagePath(cell, propertyMap.get(`${x},${y}`) || 'neutral')}
             x={x * TILE_SIZE}
             y={y * TILE_SIZE}
             width={TILE_SIZE}

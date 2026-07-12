@@ -13,7 +13,6 @@ pub fn init_master_data(world: &mut World) -> Result<(), master_data::MasterData
 }
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::time::SystemTime;
 
 #[derive(Resource, Debug, Clone)]
 pub struct GameRng {
@@ -23,11 +22,22 @@ pub struct GameRng {
 impl Default for GameRng {
     fn default() -> Self {
         let mut h = DefaultHasher::new();
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos()
-            .hash(&mut h);
+        
+        #[cfg(target_arch = "wasm32")]
+        {
+            let now = js_sys::Date::now();
+            (now as u64).hash(&mut h);
+        }
+        
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+                .hash(&mut h);
+        }
+        
         Self { seed: h.finish() }
     }
 }

@@ -9,6 +9,12 @@ interface ActionMenuProps {
   onClose: () => void;
 }
 
+const ACTION_MAP: Record<string, string> = {
+  Wait: '待機',
+  Attack: '攻撃',
+  Capture: '占領',
+};
+
 export const ActionMenu = ({ x, y, actions, onSelect, onClose }: ActionMenuProps) => {
   if (actions.length === 0) return null;
 
@@ -23,11 +29,11 @@ export const ActionMenu = ({ x, y, actions, onSelect, onClose }: ActionMenuProps
       <Stack gap="xs">
         {actions.map((action) => (
           <Button key={action} variant="light" size="sm" fullWidth onClick={() => onSelect(action)}>
-            {action.toUpperCase()}
+            {ACTION_MAP[action] || action.toUpperCase()}
           </Button>
         ))}
         <Button variant="subtle" color="gray" size="sm" fullWidth onClick={onClose}>
-          Cancel
+          キャンセル
         </Button>
       </Stack>
     </Paper>

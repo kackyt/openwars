@@ -1,30 +1,55 @@
 import * as Comlink from "comlink";
-import init, {
-  calculate_move_path,
-  execute_ai_turn,
-  get_game_state,
-  get_turn_info,
-} from "../wasm/engine.js";
+import { WasmEngine, default as initWasm } from "../wasm/engine.js";
+import wasmUrl from "../wasm/engine_bg.wasm?url";
 
 export class EngineWorker {
-  async initWasm() {
-    await init();
+  private engine: WasmEngine | null = null;
+
+  async init() {
+    await initWasm(wasmUrl);
+    this.engine = new WasmEngine();
   }
 
-  getGameState() {
-    return get_game_state();
+  async getMap() {
+    if (!this.engine) throw new Error("Engine not initialized");
+    const jsonStr = this.engine.get_map();
+    return JSON.parse(jsonStr as string);
   }
 
-  getTurnInfo() {
-    return get_turn_info();
+  async getUnits() {
+    if (!this.engine) throw new Error("Engine not initialized");
+    const jsonStr = this.engine.get_units();
+    return JSON.parse(jsonStr as string);
+  }
+
+  async getTurnInfo() {
+    if (!this.engine) throw new Error("Engine not initialized");
+    const jsonStr = this.engine.get_turn_info();
+    return JSON.parse(jsonStr as string);
+  }
+
+  async getProperties() {
+    if (!this.engine) throw new Error("Engine not initialized");
+    const jsonStr = this.engine.get_properties();
+    return JSON.parse(jsonStr as string);
+  }
+
+  async getTerrainDefs() {
+    if (!this.engine) throw new Error("Engine not initialized");
+    const jsonStr = this.engine.get_terrain_defs();
+    return JSON.parse(jsonStr as string);
   }
 
   async executeAiTurn() {
-    return await execute_ai_turn();
+    if (!this.engine) throw new Error("Engine not initialized");
+    const res = await this.engine.execute_ai_turn();
+    return JSON.parse(res as string);
   }
 
   async calculateMovePath(unitId: string, destX: number, destY: number) {
-    return await calculate_move_path(unitId, destX, destY);
+    if (!this.engine) throw new Error("Engine not initialized");
+    const res = await this.engine.calculate_move_path(unitId, destX, destY);
+    return JSON.parse(res as string);
   }
 }
 

@@ -4,7 +4,6 @@ export const turnIndicatorContainer = style({
   position: "absolute",
   top: "20px",
   right: "20px",
-  minWidth: "150px",
-  textAlign: "center",
+  minWidth: "200px",
   zIndex: 100,
 });
