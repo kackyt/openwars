@@ -4,3 +4,6 @@ pub mod events;
 pub mod resources;
 pub mod setup;
 pub mod systems;
+
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;

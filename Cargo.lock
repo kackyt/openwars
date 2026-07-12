@@ -478,9 +478,12 @@ dependencies = [
  "anyhow",
  "bevy_ecs",
  "csv",
+ "js-sys",
  "serde",
  "thiserror",
  "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]
