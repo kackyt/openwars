@@ -217,9 +217,9 @@ pub fn find_path_a_star(
         }
     }
 
-    let heuristic = |a: (usize, usize), b: (usize, usize)| -> u32 {
-        ((a.0 as isize - b.0 as isize).abs() + (a.1 as isize - b.1 as isize).abs()) as u32
-    };
+    // トポロジー（スクエア/ヘックス）に応じたグリッド距離を許容ヒューリスティックとして使う
+    let heuristic =
+        |a: (usize, usize), b: (usize, usize)| -> u32 { map.distance(a.0, a.1, b.0, b.1) };
 
     let mut heap = BinaryHeap::new();
     let mut came_from: HashMap<(usize, usize), (usize, usize)> = HashMap::new();

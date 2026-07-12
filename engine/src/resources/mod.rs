@@ -1,4 +1,6 @@
+pub mod grid;
 pub mod master_data;
+pub use grid::{GridGeometry, GridTopology, HexGrid, SquareGrid};
 pub use master_data::MasterDataRegistry;
 
 use crate::components::PlayerId;
@@ -248,12 +250,6 @@ impl Terrain {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GridTopology {
-    Square,
-    Hex,
-}
-
 #[derive(Resource, Debug, Clone, PartialEq, Eq)]
 pub struct Map {
     pub width: usize,
@@ -269,9 +265,6 @@ impl Map {
         default_terrain: Terrain,
         topology: GridTopology,
     ) -> Self {
-        if topology == GridTopology::Hex {
-            unimplemented!("GridTopology::Hex is not currently supported");
-        }
         Self {
             width,
             height,
@@ -297,39 +290,14 @@ impl Map {
         }
     }
 
+    /// トポロジー（スクエア/ヘックス）に応じた隣接セルを返す
     pub fn get_adjacent(&self, x: usize, y: usize) -> Vec<(usize, usize)> {
-        let mut adj = Vec::new();
-        match self.topology {
-            GridTopology::Square => {
-                if x > 0 {
-                    adj.push((x - 1, y));
-                }
-                if x + 1 < self.width {
-                    adj.push((x + 1, y));
-                }
-                if y > 0 {
-                    adj.push((x, y - 1));
-                }
-                if y + 1 < self.height {
-                    adj.push((x, y + 1));
-                }
-            }
-            GridTopology::Hex => {
-                // Implementation depends on hex orientation. Keep simple for now or implement if needed.
-            }
-        }
-        adj
+        self.topology.neighbors(x, y, self.width, self.height)
     }
 
-    pub fn distance(&self, x1: usize, y1: usize, x2: usize, y2: usize) -> Option<u32> {
-        match self.topology {
-            GridTopology::Square => {
-                let dx = (x1 as i32 - x2 as i32).abs();
-                let dy = (y1 as i32 - y2 as i32).abs();
-                Some((dx + dy) as u32)
-            }
-            GridTopology::Hex => None, // Needs implementation if used
-        }
+    /// トポロジーに応じた2点間のグリッド距離（最短ステップ数）を返す
+    pub fn distance(&self, x1: usize, y1: usize, x2: usize, y2: usize) -> u32 {
+        self.topology.distance((x1, y1), (x2, y2))
     }
 }
 

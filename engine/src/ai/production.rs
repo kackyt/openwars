@@ -83,6 +83,12 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
     let mut my_facilities = Vec::new();
     let mut producible_types = std::collections::HashSet::new();
 
+    // 生産範囲判定に使うマップのトポロジー（スクエア/ヘックス）
+    let topology = world
+        .get_resource::<crate::resources::Map>()
+        .map(|m| m.topology)
+        .unwrap_or(crate::resources::GridTopology::Square);
+
     {
         let mut q_props = world.query::<(&GridPosition, &Property)>();
         // まず首都を探す
@@ -100,8 +106,12 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                 && !occupied_positions.contains(pos)
             {
                 // 首都から3マス以内（PRODUCTION_RANGE）の施設のみを有効とする
-                if crate::systems::production::is_within_production_range(capital_pos, pos.x, pos.y)
-                {
+                if crate::systems::production::is_within_production_range(
+                    capital_pos,
+                    pos.x,
+                    pos.y,
+                    topology,
+                ) {
                     my_facilities.push((*pos, prop.terrain));
                     // この施設で生産可能なユニットタイプを記録
                     for ut in unit_registry.0.keys() {

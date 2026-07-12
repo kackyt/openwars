@@ -19,6 +19,24 @@ fn unit_type_to_symbol(unit_type: &engine::resources::UnitType) -> &'static str 
     unit_type.symbol()
 }
 
+/// グリッド形状の表示名を返す
+fn topology_label(topology: engine::resources::GridTopology) -> &'static str {
+    match topology {
+        engine::resources::GridTopology::Square => "スクエア",
+        engine::resources::GridTopology::Hex => "ヘックス",
+    }
+}
+
+/// ヘックスモード時、奇数行を半マス分（セル幅3文字の約半分＝2文字）右にずらすための
+/// インデント幅を返す。スクエアモードでは常に 0。
+fn hex_row_indent(topology: engine::resources::GridTopology, y: usize) -> u16 {
+    if topology == engine::resources::GridTopology::Hex && y % 2 == 1 {
+        2
+    } else {
+        0
+    }
+}
+
 fn draw_map_selection(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -73,7 +91,8 @@ fn draw_map_selection(f: &mut Frame, app: &mut App) {
     }
 
     let footer_text = format!(
-        "方向キー(↑/↓)で選択、Enterで決定、qで終了 | {}",
+        "方向キー(↑/↓)で選択、Enterで決定、qで終了 | t: グリッド切替 [{}] | {}",
+        topology_label(app.ui_state.selected_topology),
         controls_text
     );
     let footer = Paragraph::new(footer_text).block(Block::default().borders(Borders::ALL));
@@ -88,11 +107,11 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         .split(f.size());
 
     // 左側: マップ表示
-    let map_block = Block::default().title(" マップ ").borders(Borders::ALL);
-
     let mut map_lines = vec![];
     let cx = app.ui_state.cursor_pos.0;
     let cy = app.ui_state.cursor_pos.1;
+    // メニュー位置計算やタイトル表示で使うため、マップのトポロジーを保持しておく
+    let mut map_topology = engine::resources::GridTopology::Square;
 
     if let Some(world) = &mut app.world {
         // ユニット/不動産情報の収集
@@ -164,8 +183,14 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         }
 
         if let Some(map_res) = world.get_resource::<engine::resources::Map>() {
+            map_topology = map_res.topology;
             for y in 0..map_res.height {
                 let mut line_spans = vec![];
+                // ヘックスモードでは奇数行を半マス分右にずらし、六角形の配置を模す
+                let indent = hex_row_indent(map_topology, y);
+                if indent > 0 {
+                    line_spans.push(Span::raw(" ".repeat(indent as usize)));
+                }
                 for x in 0..map_res.width {
                     let terrain = map_res
                         .get_terrain(x, y)
@@ -253,6 +278,11 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         }
     }
 
+    let map_title = match map_topology {
+        engine::resources::GridTopology::Hex => " マップ (ヘックス) ",
+        engine::resources::GridTopology::Square => " マップ ",
+    };
+    let map_block = Block::default().title(map_title).borders(Borders::ALL);
     let map_paragraph = Paragraph::new(map_lines).block(map_block);
     f.render_widget(map_paragraph, chunks[0]);
 
@@ -354,7 +384,9 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         let map_y = chunks[0].y + 1;
 
         // カーソル座標 (x, y) はマップ内の相対座標。これを絶対座標に変換
-        let mut menu_x = map_x + (cx as u16 * 3) + 4; // 記号が " X " なので 3マス分
+        // ヘックスモードの奇数行は描画が半マスずれるため、その分を加算する
+        let cursor_indent = hex_row_indent(map_topology, cy);
+        let mut menu_x = map_x + (cx as u16 * 3) + 4 + cursor_indent; // 記号が " X " なので 3マス分
         let mut menu_y = map_y + cy as u16;
 
         let mut menu_width = 30u16;
@@ -375,7 +407,7 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
 
         // 画面端の考慮
         if menu_x + menu_width > chunks[0].x + chunks[0].width {
-            menu_x = (map_x + (cx as u16 * 3)).saturating_sub(menu_width);
+            menu_x = (map_x + (cx as u16 * 3) + cursor_indent).saturating_sub(menu_width);
         }
         if menu_y + menu_height > chunks[0].y + chunks[0].height {
             menu_y = (chunks[0].y + chunks[0].height).saturating_sub(menu_height);
@@ -797,6 +829,94 @@ mod tests {
         assert_buffer_contains(buffer, "勝利"); // デフォルトで人間扱い
         assert_buffer_contains(buffer, "未知のプレイヤーの勝利");
         assert!(has_bg_color(buffer, Color::Cyan));
+    }
+
+    #[test]
+    fn test_hex_row_indent() {
+        use engine::resources::GridTopology;
+        // スクエアではずらしなし
+        assert_eq!(hex_row_indent(GridTopology::Square, 0), 0);
+        assert_eq!(hex_row_indent(GridTopology::Square, 1), 0);
+        // ヘックスでは奇数行のみ半マス（2文字）ずらす
+        assert_eq!(hex_row_indent(GridTopology::Hex, 0), 0);
+        assert_eq!(hex_row_indent(GridTopology::Hex, 1), 2);
+        assert_eq!(hex_row_indent(GridTopology::Hex, 2), 0);
+        assert_eq!(hex_row_indent(GridTopology::Hex, 3), 2);
+    }
+
+    #[test]
+    fn test_map_selection_topology_toggle_key() {
+        use engine::resources::GridTopology;
+        let mut app = App::new().expect("Failed to create App");
+        assert_eq!(app.ui_state.selected_topology, GridTopology::Square);
+
+        let key = crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('t'));
+        app.handle_map_selection_key(key);
+        assert_eq!(app.ui_state.selected_topology, GridTopology::Hex);
+        app.handle_map_selection_key(key);
+        assert_eq!(app.ui_state.selected_topology, GridTopology::Square);
+    }
+
+    /// ヘックスモードで奇数行が半マス（2文字）右にずれて描画されることの確認。
+    /// 同じマップをスクエア/ヘックスで描画し、奇数行の内容を比較する。
+    #[test]
+    fn test_hex_mode_shifts_odd_rows() {
+        use engine::resources::GridTopology;
+        use engine::setup::initialize_world_from_master_data_with_topology;
+
+        let mut app = setup_test_app();
+        app.ui_state.in_game_state = InGameState::Normal;
+        let map_name = app
+            .ui_state
+            .available_maps
+            .first()
+            .cloned()
+            .expect("マップが1つも存在しません");
+
+        let render_map_rows = |app: &mut App, topology: GridTopology| -> (String, String) {
+            let (world, schedule) = initialize_world_from_master_data_with_topology(
+                &app.master_data,
+                &map_name,
+                topology,
+            )
+            .expect("world初期化に失敗");
+            app.world = Some(world);
+            app.schedule = Some(schedule);
+
+            let backend = TestBackend::new(120, 40);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| ui(f, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+
+            // margin(1) + 上ボーダー(1) より、マップの0行目は y=2、1行目（奇数行）は y=3
+            (row_to_string(buffer, 2), row_to_string(buffer, 3))
+        };
+
+        let (square_row0, square_row1) = render_map_rows(&mut app, GridTopology::Square);
+        let (hex_row0, hex_row1) = render_map_rows(&mut app, GridTopology::Hex);
+
+        // 偶数行（0行目）はずれない
+        assert_eq!(hex_row0, square_row0);
+        // 奇数行（1行目）は2文字分右にずれる（マルチバイト文字を考慮して char 単位で比較）
+        let square_chars: Vec<char> = square_row1.chars().collect();
+        let hex_chars: Vec<char> = hex_row1.chars().collect();
+        assert_eq!(&hex_chars[0..2], &[' ', ' ']);
+        assert_eq!(
+            &hex_chars[2..],
+            &square_chars[..square_chars.len().saturating_sub(2)]
+        );
+        assert_ne!(hex_row1, square_row1);
+    }
+
+    /// マップ領域内（左ボーダーの内側 x=2 以降）の1行分の文字列を取り出す
+    fn row_to_string(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        let mut s = String::new();
+        // マップペイン（幅75%）の内側だけを対象にする
+        let width = (buffer.area.width as f32 * 0.75) as u16;
+        for x in 2..width.saturating_sub(1) {
+            s.push_str(buffer.get(x, y).symbol());
+        }
+        s
     }
 
     fn assert_buffer_contains(buffer: &ratatui::buffer::Buffer, text: &str) {

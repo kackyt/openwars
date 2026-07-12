@@ -89,10 +89,20 @@ pub enum SetupError {
     MasterData(String),
 }
 
-/// マスターデータからワールドを完全に初期化します。
+/// マスターデータからワールドを完全に初期化します（グリッドはスクエア）。
 pub fn initialize_world_from_master_data(
     master_data: &MasterDataRegistry,
     map_name: &str,
+) -> Result<(World, Schedule), SetupError> {
+    initialize_world_from_master_data_with_topology(master_data, map_name, GridTopology::Square)
+}
+
+/// マスターデータからワールドを完全に初期化します。
+/// グリッドのトポロジー（スクエア/ヘックス）を指定できます。
+pub fn initialize_world_from_master_data_with_topology(
+    master_data: &MasterDataRegistry,
+    map_name: &str,
+    topology: GridTopology,
 ) -> Result<(World, Schedule), SetupError> {
     let (mut world, schedule) = create_world();
 
@@ -145,12 +155,7 @@ pub fn initialize_world_from_master_data(
         .get_map(map_name)
         .ok_or_else(|| SetupError::MapNotFound(map_name.to_string()))?;
 
-    let mut ecs_map = Map::new(
-        map_data.width,
-        map_data.height,
-        Terrain::Plains,
-        GridTopology::Square,
-    );
+    let mut ecs_map = Map::new(map_data.width, map_data.height, Terrain::Plains, topology);
     let mut players_set = std::collections::HashSet::new();
 
     for y in 0..map_data.height {
