@@ -1,7 +1,7 @@
-import { style } from '@vanilla-extract/css';
+import { style } from "@vanilla-extract/css";
 
 export const actionMenuContainer = style({
-  position: 'absolute',
+  position: "absolute",
   zIndex: 200,
-  width: '150px',
+  width: "150px",
 });

@@ -1,5 +1,10 @@
-import * as Comlink from 'comlink';
-import init, { get_game_state, get_turn_info, execute_ai_turn, calculate_move_path } from '../wasm/engine.js';
+import * as Comlink from "comlink";
+import init, {
+  calculate_move_path,
+  execute_ai_turn,
+  get_game_state,
+  get_turn_info,
+} from "../wasm/engine.js";
 
 export class EngineWorker {
   async initWasm() {
