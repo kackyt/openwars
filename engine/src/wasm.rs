@@ -16,11 +16,16 @@ pub struct WasmEngine {
 #[wasm_bindgen]
 impl WasmEngine {
     #[wasm_bindgen(constructor)]
-    pub fn new() -> Result<WasmEngine, JsValue> {
+    pub fn new(map_name: &str, topology_str: &str) -> Result<WasmEngine, JsValue> {
         let master_data = MasterDataRegistry::load()
             .map_err(|e| JsValue::from_str(&format!("Failed to load master data: {:?}", e)))?;
         
-        let (world, schedule) = crate::setup::initialize_world_from_master_data(&master_data, "map_1")
+        let topology = match topology_str {
+            "hex" => crate::resources::GridTopology::Hex,
+            _ => crate::resources::GridTopology::Square,
+        };
+        
+        let (world, schedule) = crate::setup::initialize_world_from_master_data_with_topology(&master_data, map_name, topology)
             .map_err(|e| JsValue::from_str(&format!("Failed to init world: {:?}", e)))?;
             
         Ok(WasmEngine { world, schedule })

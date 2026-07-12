@@ -4,11 +4,13 @@ import { GameCanvas } from './components/game/GameCanvas';
 import { TurnIndicator } from './components/ui/TurnIndicator';
 import { UnitInfoPanel } from './components/ui/UnitInfoPanel';
 import { ActionMenu } from './components/ui/ActionMenu';
+import { MainMenu } from './components/ui/MainMenu';
 import { useEffect } from 'react';
 import { useGameStore } from './store/gameStore';
 
 function App() {
   const { 
+    appState,
     isEngineReady, 
     turnInfo, 
     hoveredUnit, 
@@ -18,14 +20,18 @@ function App() {
     closeActionMenu
   } = useGameStore();
 
-  useEffect(() => {
-    initEngine();
-  }, [initEngine]);
-
   const handleActionSelect = (action: string) => {
     console.log(`Action selected: ${action}`);
     closeActionMenu();
   };
+
+  if (appState === 'menu') {
+    return (
+      <MantineProvider defaultColorScheme="dark">
+        <MainMenu />
+      </MantineProvider>
+    );
+  }
 
   return (
     <MantineProvider defaultColorScheme="dark">

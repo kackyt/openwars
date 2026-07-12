@@ -5,9 +5,9 @@ import wasmUrl from "../wasm/engine_bg.wasm?url";
 export class EngineWorker {
   private engine: WasmEngine | null = null;
 
-  async init() {
+  async init(mapName: string, topology: string) {
     await initWasm(wasmUrl);
-    this.engine = new WasmEngine();
+    this.engine = new WasmEngine(mapName, topology);
   }
 
   async getMap() {

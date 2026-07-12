@@ -9,7 +9,7 @@ import { useState, useEffect } from 'react';
 const TILE_SIZE = 64;
 
 export const GameCanvas = () => {
-  const { mapData, unitData, setHoveredCell, openActionMenu, closeActionMenu } = useGameStore();
+  const { mapData, unitData, setHoveredCell, openActionMenu, closeActionMenu, topology } = useGameStore();
   
   const [windowSize, setWindowSize] = useState({ width: window.innerWidth, height: window.innerHeight });
   useEffect(() => {
@@ -29,8 +29,13 @@ export const GameCanvas = () => {
   const getCellData = (globalX: number, globalY: number) => {
     const localX = globalX - cameraPos.x;
     const localY = globalY - cameraPos.y;
-    const gridX = Math.floor(localX / TILE_SIZE);
+    
     const gridY = Math.floor(localY / TILE_SIZE);
+    let offsetX = 0;
+    if (topology === 'hex' && gridY % 2 !== 0) {
+      offsetX = TILE_SIZE / 2;
+    }
+    const gridX = Math.floor((localX - offsetX) / TILE_SIZE);
     
     if (gridY < 0 || gridY >= mapData.length || gridX < 0 || gridX >= (mapData[0]?.length || 0)) {
       return null;

@@ -25,28 +25,30 @@ const getTerrainImagePath = (cell: string, propertyOwner: string = 'neutral') =>
 };
 
 export const MapLayer = () => {
-  const mapData = useGameStore(state => state.mapData);
-  const propertyData = useGameStore(state => state.propertyData);
-
-  const propertyMap = new Map();
-  propertyData.forEach(p => {
-    propertyMap.set(`${p.x},${p.y}`, p.owner);
-  });
+  const { mapData, propertyData, topology } = useGameStore();
 
   return (
     <Container>
-      {mapData.map((row, y) =>
-        row.map((cell, x) => (
-          <Sprite
-            key={`cell-${x}-${y}`}
-            image={getTerrainImagePath(cell, propertyMap.get(`${x},${y}`) || 'neutral')}
-            x={x * TILE_SIZE}
-            y={y * TILE_SIZE}
-            width={TILE_SIZE}
-            height={TILE_SIZE}
-          />
-        ))
-      )}
+      {mapData.map((row, y) => (
+        row.map((cell, x) => {
+          const isHexOddRow = topology === 'hex' && y % 2 !== 0;
+          const offsetX = isHexOddRow ? 32 : 0; // 32 is TILE_SIZE / 2
+          const px = x * 64 + offsetX;
+          const py = y * 64;
+          const property = propertyData.find(p => p.x === x && p.y === y);
+
+          return (
+            <Sprite
+              key={`cell-${x}-${y}`}
+              image={getTerrainImagePath(cell, property?.owner || 'neutral')}
+              x={px}
+              y={py}
+              width={TILE_SIZE}
+              height={TILE_SIZE}
+            />
+          );
+        })
+      ))}
     </Container>
   );
 };

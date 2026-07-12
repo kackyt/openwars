@@ -28,20 +28,27 @@ const UNIT_IMAGE_MAP: Record<string, string> = {
 };
 
 export const UnitLayer = () => {
-  const unitData = useGameStore(state => state.unitData);
+  const { unitData, topology } = useGameStore();
 
   return (
     <Container>
-      {unitData.map((unit) => (
-        <Sprite
-          key={unit.id}
-          image={`/assets/units/${unit.faction}/${UNIT_IMAGE_MAP[unit.type] || 'infantry'}.png`}
-          x={unit.x * TILE_SIZE}
-          y={unit.y * TILE_SIZE}
-          width={TILE_SIZE}
-          height={TILE_SIZE}
-        />
-      ))}
+      {unitData.map((unit) => {
+        const isHexOddRow = topology === 'hex' && unit.y % 2 !== 0;
+        const offsetX = isHexOddRow ? 32 : 0;
+        const px = unit.x * TILE_SIZE + offsetX;
+        const py = unit.y * TILE_SIZE;
+
+        return (
+          <Sprite
+            key={unit.id}
+            image={`/assets/units/${unit.faction}/${UNIT_IMAGE_MAP[unit.type] || 'infantry'}.png`}
+            x={px}
+            y={py}
+            width={TILE_SIZE}
+            height={TILE_SIZE}
+          />
+        );
+      })}
     </Container>
   );
 };

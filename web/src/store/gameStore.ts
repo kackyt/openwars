@@ -31,6 +31,10 @@ interface ActionMenuState {
 }
 
 interface GameState {
+  appState: 'menu' | 'playing';
+  topology: 'square' | 'hex';
+  p1IsAi: boolean;
+  p2IsAi: boolean;
   isEngineReady: boolean;
   engineWorker: Comlink.Remote<EngineWorker> | null;
   mapData: string[][];
@@ -47,7 +51,7 @@ interface GameState {
   actionMenu: ActionMenuState | null;
 
   // Actions
-  initEngine: () => Promise<void>;
+  initEngine: (mapName: string, topology: string, p1IsAi: boolean, p2IsAi: boolean) => Promise<void>;
   syncGameState: () => Promise<void>;
   setHoveredCell: (x: number, y: number) => void;
   openActionMenu: (x: number, y: number, unitId: string, actions: string[]) => void;
@@ -55,6 +59,10 @@ interface GameState {
 }
 
 export const useGameStore = create<GameState>((set, get) => ({
+  appState: 'menu',
+  topology: 'square',
+  p1IsAi: false,
+  p2IsAi: false,
   isEngineReady: false,
   engineWorker: null,
   mapData: [],
@@ -69,18 +77,23 @@ export const useGameStore = create<GameState>((set, get) => ({
   hoveredUnit: null,
   actionMenu: null,
 
-  initEngine: async () => {
-    if (get().isEngineReady) return;
-
+  initEngine: async (mapName, topology, p1IsAi, p2IsAi) => {
     try {
       const worker = new Worker(new URL('../worker/engineWorker.ts', import.meta.url), {
         type: 'module',
       });
       const engineClass = Comlink.wrap<typeof EngineWorker>(worker);
       const engineWorker = await new engineClass();
-      await engineWorker.init();
+      await engineWorker.init(mapName, topology);
       
-      set({ engineWorker, isEngineReady: true });
+      set({ 
+        engineWorker, 
+        isEngineReady: true, 
+        appState: 'playing', 
+        topology: topology as 'square' | 'hex',
+        p1IsAi,
+        p2IsAi
+      });
       await get().syncGameState();
     } catch (e) {
       console.error("Failed to initialize engine:", e);
