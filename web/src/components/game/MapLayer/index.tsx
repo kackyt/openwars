@@ -3,7 +3,7 @@ import { Container, Sprite } from '@pixi/react';
 const TILE_SIZE = 64;
 
 // モック用のマップデータ (0=平地, 1=森, 2=山)
-const MOCK_MAP = [
+export const MOCK_MAP = [
   [0, 0, 1, 2, 0],
   [0, 1, 1, 0, 0],
   [0, 0, 0, 0, 2],

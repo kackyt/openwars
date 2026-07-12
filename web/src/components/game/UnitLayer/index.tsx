@@ -3,7 +3,7 @@ import { Container, Sprite } from '@pixi/react';
 const TILE_SIZE = 64;
 
 // モック用のユニットデータ
-const MOCK_UNITS = [
+export const MOCK_UNITS = [
   { id: 'u1', type: 'infantry', faction: 'blue', x: 1, y: 1 },
   { id: 'u2', type: 'medium_tank', faction: 'green', x: 3, y: 2 },
 ];
