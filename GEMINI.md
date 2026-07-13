@@ -163,3 +163,43 @@ ACE-XXX の XXX は **PRスコープ式 ID** に置換する: ACE-<PR番号>-<�
 2. 重複する場合は既存エントリの Helpful を +1 する
 3. 矛盾する場合は既存エントリの Status を deprecated に変更し、新エントリを作成する
 4. 新規の場合のみ末尾に追記する
+
+## Git コミット規律（AI Agent 必読）
+
+> [!CAUTION]
+> AIエージェントは作業中に生成した一時ファイル・出力ファイルをリポジトリに混入させてはなりません。
+> 過去に `benchmark_*.md`、`*_log.txt`、`diff.txt`、`matchup_report_*.md`、`suggestions.md` 等がコミットされた事例があります。
+
+### コミット前に必ず確認すること
+
+1. **`git diff --staged --name-only` でステージ内容を確認する**  
+   コミット前に必ずステージされたファイル一覧を確認し、意図したソースコードのみが含まれているかチェックする。
+
+2. **以下のパターンに該当するファイルは絶対にコミットしない**
+   - `benchmark_*.md` / `*_benchmark*.md` — AI評価ベンチマーク結果
+   - `*_log.txt` / `full*_log.txt` / `diag*_log.txt` — シミュレーションログ
+   - `diff.txt` — 作業中の差分メモ
+   - `matchup_report*.md` — 対戦レポート
+   - `suggestions.md` — 作業メモ・提案メモ
+   - `review_*.md` — レビューメモ（`docs/` 配下のものを除く）
+
+3. **`git add -p`（パッチモード）または明示的なファイル指定でステージする**  
+   `git add .` や `git add *` は使用禁止。必ず変更ファイルを個別指定すること。
+   ```bash
+   # 良い例
+   git add engine/src/foo.rs web/src/bar.tsx
+   
+   # 悪い例（禁止）
+   git add .
+   git add *
+   ```
+
+4. **作業用一時ファイルは `.gitignore` に登録する**  
+   新しい種類の一時出力ファイルが生まれたら、コミット前に `.gitignore` へ追加すること。
+   ```
+   # 例: .gitignore への追記パターン
+   benchmark_*.md
+   *_log.txt
+   diff.txt
+   matchup_report*.md
+   ```
