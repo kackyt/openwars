@@ -158,13 +158,10 @@ impl WasmEngine {
             pid
         };
 
-        if crate::ai::engine::execute_ai_turn(&mut self.world, active_player).is_some() {
-            self.schedule.run(&mut self.world);
-            crate::setup::update_all_events(&mut self.world);
-            true
-        } else {
-            false
-        }
+        let res = crate::ai::engine::execute_ai_turn(&mut self.world, active_player);
+        self.schedule.run(&mut self.world);
+        crate::setup::update_all_events(&mut self.world);
+        res.is_some()
     }
 
     pub fn submit_end_turn_command(&mut self) -> JsValue {

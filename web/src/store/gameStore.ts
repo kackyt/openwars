@@ -343,7 +343,16 @@ export const useGameStore = create<GameState>((set, get) => ({
       if (!acted) break;
     }
 
-    await get().endTurn();
+    // AIターンはWasm内部でNextPhaseCommandが処理されて終了しているため、直接次のターンの状態を確認する
+    const { turnInfo, p1IsAi, p2IsAi } = get();
+    if (turnInfo) {
+      const isNextAiTurn = (turnInfo.phase === 'P1' && p1IsAi) || (turnInfo.phase === 'P2' && p2IsAi);
+      if (isNextAiTurn) {
+        get().tickAiTurn();
+      } else {
+        set({ interactionState: 'idle' });
+      }
+    }
   },
 
   endTurn: async () => {
