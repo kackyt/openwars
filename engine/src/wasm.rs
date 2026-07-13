@@ -1,6 +1,4 @@
 use wasm_bindgen::prelude::*;
-use js_sys::Promise;
-use wasm_bindgen_futures::future_to_promise;
 use bevy_ecs::prelude::*;
 
 use crate::resources::master_data::MasterDataRegistry;
@@ -147,8 +145,51 @@ impl WasmEngine {
         }
     }
 
-    pub fn execute_ai_turn(&mut self) -> Promise {
-        future_to_promise(async { Ok(JsValue::from_str("{}")) })
+    /// AIの1アクションを実行する。行動があればtrue、なければfalseを返す。
+    pub fn execute_ai_turn(&mut self) -> bool {
+        // PlayerIndex（0, 1）ではなく、Playersリソースから実際のPlayerId（1, 2）を取得する
+        let active_player = {
+            let idx = self.world.get_resource::<MatchState>()
+                .map(|ms| ms.active_player_index.0);
+            let Some(idx) = idx else { return false };
+            let pid = self.world.get_resource::<crate::resources::Players>()
+                .and_then(|players| players.0.get(idx).map(|p| p.id));
+            let Some(pid) = pid else { return false };
+            pid
+        };
+
+        if crate::ai::engine::execute_ai_turn(&mut self.world, active_player).is_some() {
+            self.schedule.run(&mut self.world);
+            crate::setup::update_all_events(&mut self.world);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn submit_end_turn_command(&mut self) -> JsValue {
+        if let Some(mut evs) = self.world.get_resource_mut::<Events<crate::events::NextPhaseCommand>>() {
+            evs.send(crate::events::NextPhaseCommand);
+        }
+        self.schedule.run(&mut self.world);
+        crate::setup::update_all_events(&mut self.world);
+        JsValue::from_str("{}")
+    }
+
+    pub fn check_game_over(&self) -> JsValue {
+        if let Some(match_state) = self.world.get_resource::<MatchState>() {
+            if let Some(game_over) = &match_state.game_over {
+                match game_over {
+                    crate::resources::GameOverCondition::Winner(player_id) => {
+                        return JsValue::from_str(&format!(r#"{{"winner": {}}}"#, player_id.0));
+                    },
+                    crate::resources::GameOverCondition::Draw => {
+                        return JsValue::from_str(r#"{"draw": true}"#);
+                    }
+                }
+            }
+        }
+        JsValue::from_str("null")
     }
 
     pub fn get_reachable_cells(&mut self, unit_id_str: &str) -> JsValue {

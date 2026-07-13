@@ -52,9 +52,10 @@ interface GameState {
   turnInfo: TurnInfo | null;
   propertyData: PropertyData[];
   terrainDefs: Record<string, number>;
+  gameOver: { winner: number } | { draw: boolean } | null;
   
   // UI / Interaction State
-  interactionState: 'idle' | 'unit_selected' | 'action_menu' | 'target_selection' | 'produce_menu' | 'drop_unit_selection' | 'drop_target_selection';
+  interactionState: 'idle' | 'unit_selected' | 'action_menu' | 'target_selection' | 'produce_menu' | 'drop_unit_selection' | 'drop_target_selection' | 'ai_thinking';
   selectedUnitId: string | null;
   reachableCells: { x: number, y: number }[];
   attackableTargets: { id: string, x: number, y: number }[];
@@ -73,6 +74,7 @@ interface GameState {
   // Actions
   initEngine: (mapName: string, topology: string, p1IsAi: boolean, p2IsAi: boolean) => Promise<void>;
   syncGameState: () => Promise<void>;
+  tickAiTurn: () => Promise<void>;
   setHoveredCell: (x: number, y: number) => void;
   openActionMenu: (x: number, y: number, unitId: string, actions: string[]) => void;
   closeActionMenu: () => void;
@@ -104,6 +106,7 @@ export const useGameStore = create<GameState>((set, get) => ({
   turnInfo: null,
   propertyData: [],
   terrainDefs: {},
+  gameOver: null,
   
   interactionState: 'idle',
   selectedUnitId: null,
@@ -138,6 +141,14 @@ export const useGameStore = create<GameState>((set, get) => ({
         p2IsAi
       });
       await get().syncGameState();
+      
+      const { turnInfo, p1IsAi: isP1Ai, p2IsAi: isP2Ai } = get();
+      if (turnInfo) {
+        const isAiTurn = (turnInfo.phase === 'P1' && isP1Ai) || (turnInfo.phase === 'P2' && isP2Ai);
+        if (isAiTurn) {
+          get().tickAiTurn();
+        }
+      }
     } catch (e) {
       console.error("Failed to initialize engine:", e);
     }
@@ -148,15 +159,16 @@ export const useGameStore = create<GameState>((set, get) => ({
     if (!engineWorker) return;
 
     try {
-      const [mapData, unitData, turnInfo, propertyData, terrainDefs] = await Promise.all([
+      const [mapData, unitData, turnInfo, propertyData, terrainDefs, gameOver] = await Promise.all([
         engineWorker.getMap(),
         engineWorker.getUnits(),
         engineWorker.getTurnInfo(),
         engineWorker.getProperties(),
         engineWorker.getTerrainDefs(),
+        engineWorker.checkGameOver(),
       ]);
 
-      set({ mapData, unitData, turnInfo, propertyData, terrainDefs });
+      set({ mapData, unitData, turnInfo, propertyData, terrainDefs, gameOver });
     } catch (e) {
       console.error("Failed to sync game state:", e);
     }
@@ -319,12 +331,39 @@ export const useGameStore = create<GameState>((set, get) => ({
     await get().syncGameState();
   },
 
+  tickAiTurn: async () => {
+    const { engineWorker } = get();
+    if (!engineWorker) return;
+
+    set({ interactionState: 'ai_thinking', selectedUnitId: null, actionMenu: null, produceMenu: null });
+
+    while (true) {
+      const acted = await engineWorker.executeAiTurn();
+      await get().syncGameState();
+      if (!acted) break;
+    }
+
+    await get().endTurn();
+  },
+
   endTurn: async () => {
     const { engineWorker } = get();
     if (!engineWorker) return;
+
+    const gameOverObj = await engineWorker.checkGameOver();
+    if (gameOverObj) return;
+
     await engineWorker.endTurn();
     await get().syncGameState();
     
-    // AIターンの自動実行ロジックは必要に応じてここに追記
+    const { turnInfo, p1IsAi, p2IsAi } = get();
+    if (turnInfo) {
+      const isAiTurn = (turnInfo.phase === 'P1' && p1IsAi) || (turnInfo.phase === 'P2' && p2IsAi);
+      if (isAiTurn) {
+        get().tickAiTurn();
+      } else {
+        set({ interactionState: 'idle' });
+      }
+    }
   }
 }));

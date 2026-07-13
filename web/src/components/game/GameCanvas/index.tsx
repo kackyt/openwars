@@ -104,6 +104,10 @@ export const GameCanvas = () => {
       if (!cellData) return;
       const { gridX, gridY, unit, cellType } = cellData;
 
+      if (interactionState === 'ai_thinking') {
+        return; // Ignore clicks while AI is thinking
+      }
+
       if (interactionState === 'idle') {
         if (unit) {
           selectUnit(unit.id);

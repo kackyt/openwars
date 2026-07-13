@@ -1,11 +1,11 @@
 import { Paper, Text, Group, ColorSwatch, Button, Stack } from '@mantine/core';
 import { turnIndicatorContainer } from './index.css';
 
-export const TurnIndicator = ({ turn, phase, funds, onEndTurn }: { turn: number; phase: string; funds: number; onEndTurn: () => void }) => {
+export const TurnIndicator = ({ turn, phase, funds, onEndTurn, isAiThinking }: { turn: number; phase: string; funds: number; onEndTurn: () => void; isAiThinking: boolean }) => {
   const isP1 = phase === 'P1';
   const isP2 = phase === 'P2';
   
-  const phaseText = isP1 ? '緑軍のターン' : isP2 ? '青軍のターン' : phase;
+  const phaseText = isAiThinking ? 'AI思考中...' : isP1 ? '緑軍のターン' : isP2 ? '青軍のターン' : phase;
   const phaseColor = isP1 ? 'green' : isP2 ? 'blue' : 'gray';
 
   return (
@@ -23,7 +23,7 @@ export const TurnIndicator = ({ turn, phase, funds, onEndTurn }: { turn: number;
               {phaseText}
             </Text>
           </Group>
-          <Button size="xs" color="red" variant="light" onClick={onEndTurn}>
+          <Button size="xs" color="red" variant="light" onClick={onEndTurn} disabled={isAiThinking}>
             End Turn
           </Button>
         </Stack>

@@ -1,4 +1,4 @@
-import { MantineProvider } from '@mantine/core';
+import { MantineProvider, Modal, Title, Text, Button } from '@mantine/core';
 import '@mantine/core/styles.css';
 import { GameCanvas } from './components/game/GameCanvas';
 import { TurnIndicator } from './components/ui/TurnIndicator';
@@ -26,7 +26,8 @@ function App() {
     executeAction,
     executeProduce,
     selectDropCargo,
-    endTurn
+    endTurn,
+    gameOver
   } = useGameStore();
 
   const handleActionSelect = async (action: string) => {
@@ -57,7 +58,8 @@ function App() {
             turn={turnInfo.turn} 
             phase={turnInfo.phase} 
             funds={turnInfo.funds}
-            onEndTurn={endTurn} 
+            onEndTurn={endTurn}
+            isAiThinking={interactionState === 'ai_thinking'}
           />
         )}
         
@@ -92,6 +94,23 @@ function App() {
             onClose={cancelInteraction}
           />
         )}
+
+        <Modal 
+          opened={!!gameOver} 
+          onClose={() => window.location.reload()} 
+          title="Game Over"
+          centered
+        >
+          <Title order={2} ta="center" mb="md">
+            {gameOver && 'winner' in gameOver ? `Player ${gameOver.winner} Wins!` : 'Draw!'}
+          </Title>
+          <Text ta="center" mb="xl">
+            {gameOver && 'winner' in gameOver ? 'The enemy HQ has been captured.' : 'The game ended in a draw.'}
+          </Text>
+          <Button fullWidth onClick={() => window.location.reload()}>
+            Back to Main Menu
+          </Button>
+        </Modal>
       </div>
     </MantineProvider>
   );

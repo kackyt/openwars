@@ -1,4 +1,5 @@
 import { Container, Sprite, Text, Graphics } from '@pixi/react';
+import { TextStyle } from 'pixi.js';
 import { useGameStore } from '../../../store/gameStore';
 
 const TILE_SIZE = 48;
@@ -55,7 +56,7 @@ export const UnitLayer = () => {
                     g.endFill();
                   }}
                 />
-                <Text text="L" style={{ fill: 'white', fontSize: 12, fontWeight: 'bold' }} x={4} y={1} />
+                <Text text="L" style={new TextStyle({ fill: 'white', fontSize: 12, fontWeight: 'bold' })} x={4} y={1} />
               </Container>
             )}
           </Container>

@@ -26,6 +26,10 @@
 - テスト: `cargo test`
 - フォーマット確認: `cargo fmt --all -- --check`
 - Linter確認: `cargo clippy --all-targets --all-features -- -D warnings`
+- Webアプリ（フロントエンド）のパッケージ管理・ビルド: `pnpm` を使用（`npm` や `yarn` の使用は厳禁）
+  - 依存のインストール: `pnpm install`
+  - 開発用起動: `pnpm dev` （またはワークスペースルートから `pnpm -C web dev`）
+  - ビルド: `pnpm build` （またはワークスペースルートから `pnpm -C web build`）
 
 ## Development Workflow
 1. **Issue駆動**: すべての作業はIssueから開始し、専用ブランチを作成します。

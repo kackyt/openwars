@@ -40,10 +40,10 @@ export class EngineWorker {
     return JSON.parse(jsonStr as string);
   }
 
-  async executeAiTurn() {
+  async executeAiTurn(): Promise<boolean> {
     if (!this.engine) throw new Error("Engine not initialized");
-    const res = await this.engine.execute_ai_turn();
-    return JSON.parse(res as string);
+    const res = this.engine.execute_ai_turn();
+    return res;
   }
 
   async getReachableCells(unitId: string) {
@@ -126,9 +126,17 @@ export class EngineWorker {
     this.engine.submit_merge_command(unitId, targetId);
   }
 
+  // ターン終了コマンドを送信
   async endTurn() {
     if (!this.engine) throw new Error("Engine not initialized");
-    this.engine.end_turn();
+    this.engine.submit_end_turn_command();
+  }
+
+  // ゲームオーバー状態のチェック
+  async checkGameOver(): Promise<{ winner: number } | { draw: boolean } | null> {
+    if (!this.engine) throw new Error("Engine not initialized");
+    const jsonStr = this.engine.check_game_over();
+    return JSON.parse(jsonStr as string);
   }
 }
 
