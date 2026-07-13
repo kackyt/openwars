@@ -49,33 +49,31 @@ pub fn create_world() -> (World, Schedule) {
 /// 全イベントバッファをフレーム末尾で回転させるシステム。
 /// 手動で Schedule を実行する場合、各ターンの末尾でこれを呼び出す必要があります。
 pub fn update_all_events(world: &mut World) {
-    // clear() を使用する。update() はダブルバッファ方式でイベントが1フレーム残留するため、
-    // Wasm環境のように schedule.run を手動で複数回呼ぶ場合、同じイベントが再処理されてしまう。
-    world.resource_mut::<Events<ProduceUnitCommand>>().clear();
-    world.resource_mut::<Events<MoveUnitCommand>>().clear();
-    world.resource_mut::<Events<AttackUnitCommand>>().clear();
+    world.resource_mut::<Events<ProduceUnitCommand>>().update();
+    world.resource_mut::<Events<MoveUnitCommand>>().update();
+    world.resource_mut::<Events<AttackUnitCommand>>().update();
     world
         .resource_mut::<Events<CapturePropertyCommand>>()
-        .clear();
-    world.resource_mut::<Events<MergeUnitCommand>>().clear();
-    world.resource_mut::<Events<SupplyUnitCommand>>().clear();
-    world.resource_mut::<Events<LoadUnitCommand>>().clear();
-    world.resource_mut::<Events<UnloadUnitCommand>>().clear();
-    world.resource_mut::<Events<WaitUnitCommand>>().clear();
-    world.resource_mut::<Events<NextPhaseCommand>>().clear();
-    world.resource_mut::<Events<UndoMoveCommand>>().clear();
+        .update();
+    world.resource_mut::<Events<MergeUnitCommand>>().update();
+    world.resource_mut::<Events<SupplyUnitCommand>>().update();
+    world.resource_mut::<Events<LoadUnitCommand>>().update();
+    world.resource_mut::<Events<UnloadUnitCommand>>().update();
+    world.resource_mut::<Events<WaitUnitCommand>>().update();
+    world.resource_mut::<Events<NextPhaseCommand>>().update();
+    world.resource_mut::<Events<UndoMoveCommand>>().update();
 
-    world.resource_mut::<Events<UnitMovedEvent>>().clear();
-    world.resource_mut::<Events<UnitAttackedEvent>>().clear();
-    world.resource_mut::<Events<UnitDestroyedEvent>>().clear();
-    world.resource_mut::<Events<UnitMergedEvent>>().clear();
+    world.resource_mut::<Events<UnitMovedEvent>>().update();
+    world.resource_mut::<Events<UnitAttackedEvent>>().update();
+    world.resource_mut::<Events<UnitDestroyedEvent>>().update();
+    world.resource_mut::<Events<UnitMergedEvent>>().update();
     world
         .resource_mut::<Events<PropertyCapturedEvent>>()
-        .clear();
+        .update();
     world
         .resource_mut::<Events<GamePhaseChangedEvent>>()
-        .clear();
-    world.resource_mut::<Events<GameOverEvent>>().clear();
+        .update();
+    world.resource_mut::<Events<GameOverEvent>>().update();
 }
 
 /// マスターデータの設定中に発生するエラー。
