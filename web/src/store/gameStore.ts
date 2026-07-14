@@ -10,6 +10,9 @@ interface UnitData {
   y: number;
   hp: number;
   is_loaded: boolean;
+  is_exhausted: boolean;
+  fuel: { current: number; max: number };
+  weapons: { name: string; ammo: number; max_ammo: number; min_range: number; max_range: number }[];
 }
 
 interface TurnInfo {
@@ -67,13 +70,13 @@ interface GameState {
 
   hoveredCellX: number;
   hoveredCellY: number;
-  hoveredTerrain: { type: string, def?: number } | null;
+  hoveredTerrain: { type: string, def?: number, property?: PropertyData | null } | null;
   hoveredUnit: UnitData | null;
   actionMenu: ActionMenuState | null;
 
   // Actions
   initEngine: (mapName: string, topology: string, p1IsAi: boolean, p2IsAi: boolean) => Promise<void>;
-  syncGameState: () => Promise<void>;
+  syncGameState: (additionalState?: Partial<GameState>) => Promise<void>;
   tickAiTurn: () => Promise<void>;
   setHoveredCell: (x: number, y: number) => void;
   openActionMenu: (x: number, y: number, unitId: string, actions: string[]) => void;
@@ -92,6 +95,8 @@ interface GameState {
   selectDropCargo: (cargoId: string) => Promise<void>;
   executeDropTarget: (x: number, y: number) => Promise<void>;
   endTurn: () => Promise<void>;
+  recentlyDestroyedUnitIds: string[];
+  clearRecentlyDestroyedUnits: () => void;
 }
 
 export const useGameStore = create<GameState>((set, get) => ({
@@ -121,7 +126,12 @@ export const useGameStore = create<GameState>((set, get) => ({
   hoveredCellY: -1,
   hoveredTerrain: null,
   hoveredUnit: null,
+  recentlyDestroyedUnitIds: [],
   actionMenu: null,
+
+  clearRecentlyDestroyedUnits: () => {
+    set({ recentlyDestroyedUnitIds: [] });
+  },
 
   initEngine: async (mapName, topology, p1IsAi, p2IsAi) => {
     try {
@@ -154,7 +164,7 @@ export const useGameStore = create<GameState>((set, get) => ({
     }
   },
 
-  syncGameState: async () => {
+  syncGameState: async (additionalState?: Partial<GameState>) => {
     const { engineWorker } = get();
     if (!engineWorker) return;
 
@@ -168,21 +178,30 @@ export const useGameStore = create<GameState>((set, get) => ({
         engineWorker.checkGameOver(),
       ]);
 
-      set({ mapData, unitData, turnInfo, propertyData, terrainDefs, gameOver });
+      set({ 
+        mapData, 
+        unitData, 
+        turnInfo, 
+        propertyData, 
+        terrainDefs, 
+        gameOver,
+        ...additionalState
+      });
     } catch (e) {
       console.error("Failed to sync game state:", e);
     }
   },
 
   setHoveredCell: (x: number, y: number) => {
-    const { mapData, unitData, terrainDefs } = get();
+    const { mapData, unitData, terrainDefs, propertyData } = get();
     const cellType = mapData[y]?.[x] || 'unknown';
     const unit = unitData.find(u => u.x === x && u.y === y) || null;
+    const property = propertyData.find(p => p.x === x && p.y === y) || null;
     
     set({
       hoveredCellX: x,
       hoveredCellY: y,
-      hoveredTerrain: { type: cellType, def: terrainDefs[cellType] || 0 },
+      hoveredTerrain: { type: cellType, def: terrainDefs[cellType] || 0, property },
       hoveredUnit: unit
     });
   },
@@ -193,11 +212,14 @@ export const useGameStore = create<GameState>((set, get) => ({
 
   closeActionMenu: () => {
     set({ actionMenu: null });
+    get().cancelInteraction();
   },
 
   selectUnit: async (unitId: string) => {
-    const { engineWorker } = get();
+    const { engineWorker, unitData } = get();
     if (!engineWorker) return;
+    const unit = unitData.find(u => u.id === unitId);
+    if (unit?.is_exhausted) return; // 行動済みなら選択不可
     const cells = await engineWorker.getReachableCells(unitId);
     set({
       interactionState: 'unit_selected',
@@ -249,7 +271,10 @@ export const useGameStore = create<GameState>((set, get) => ({
         return;
       } else {
         await engineWorker.submitMoveCommand(selectedUnitId, selectedTargetPos.x, selectedTargetPos.y);
-        await engineWorker.submitAttackCommand(selectedUnitId, targetId);
+        const destroyedIds = await engineWorker.submitAttackCommand(selectedUnitId, targetId);
+        get().cancelInteraction();
+        await get().syncGameState({ recentlyDestroyedUnitIds: destroyedIds });
+        return;
       }
     } else if (actionType === 'Capture') {
       await engineWorker.submitMoveCommand(selectedUnitId, selectedTargetPos.x, selectedTargetPos.y);
@@ -338,9 +363,13 @@ export const useGameStore = create<GameState>((set, get) => ({
     set({ interactionState: 'ai_thinking', selectedUnitId: null, actionMenu: null, produceMenu: null });
 
     while (true) {
-      const acted = await engineWorker.executeAiTurn();
-      await get().syncGameState();
-      if (!acted) break;
+      const aiResult = await engineWorker.executeAiTurn();
+      await get().syncGameState(
+        aiResult.destroyed && aiResult.destroyed.length > 0
+          ? { recentlyDestroyedUnitIds: aiResult.destroyed }
+          : undefined
+      );
+      if (!aiResult.acted) break;
     }
 
     // AIターンはWasm内部でNextPhaseCommandが処理されて終了しているため、直接次のターンの状態を確認する

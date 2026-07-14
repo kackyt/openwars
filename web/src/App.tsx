@@ -20,6 +20,7 @@ function App() {
     produceMenu,
     interactionState,
     loadedUnits,
+    propertyData,
     closeActionMenu,
     closeProduceMenu,
     cancelInteraction,
@@ -38,6 +39,26 @@ function App() {
     if (produceMenu) {
       await executeProduce(unitType, produceMenu.x, produceMenu.y);
     }
+  };
+
+  const getGameOverText = () => {
+    if (!gameOver) return '';
+    if ('draw' in gameOver && gameOver.draw) {
+      return 'ゲームは引き分けで終了しました。';
+    }
+    if ('winner' in gameOver) {
+      const winner = gameOver.winner;
+      const loserFaction = winner === 1 ? 'blue' : 'green';
+      const loserName = winner === 1 ? 'プレイヤー2 (青軍)' : 'プレイヤー1 (緑軍)';
+      
+      const loserCapital = propertyData.find(p => p.type === 'capital' && p.owner === loserFaction);
+      if (!loserCapital) {
+        return `${loserName}の首都が占領されました。`;
+      } else {
+        return `${loserName}の全部隊が全滅しました。`;
+      }
+    }
+    return '';
   };
 
   if (appState === 'menu') {
@@ -98,17 +119,17 @@ function App() {
         <Modal 
           opened={!!gameOver} 
           onClose={() => window.location.reload()} 
-          title="Game Over"
+          title="ゲーム終了"
           centered
         >
           <Title order={2} ta="center" mb="md">
-            {gameOver && 'winner' in gameOver ? `Player ${gameOver.winner} Wins!` : 'Draw!'}
+            {gameOver && 'winner' in gameOver ? `プレイヤー ${gameOver.winner} の勝利！` : '引き分け！'}
           </Title>
           <Text ta="center" mb="xl">
-            {gameOver && 'winner' in gameOver ? 'The enemy HQ has been captured.' : 'The game ended in a draw.'}
+            {getGameOverText()}
           </Text>
           <Button fullWidth onClick={() => window.location.reload()}>
-            Back to Main Menu
+            メインメニューに戻る
           </Button>
         </Modal>
       </div>

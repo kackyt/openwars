@@ -40,10 +40,10 @@ export class EngineWorker {
     return JSON.parse(jsonStr as string);
   }
 
-  async executeAiTurn(): Promise<boolean> {
+  async executeAiTurn(): Promise<{ acted: boolean, destroyed: string[] }> {
     if (!this.engine) throw new Error("Engine not initialized");
-    const res = this.engine.execute_ai_turn();
-    return res;
+    const jsonStr = this.engine.execute_ai_turn();
+    return JSON.parse(jsonStr as string);
   }
 
   async getReachableCells(unitId: string) {
@@ -80,9 +80,10 @@ export class EngineWorker {
     this.engine.submit_wait_command(unitId);
   }
 
-  async submitAttackCommand(unitId: string, targetId: string) {
+  async submitAttackCommand(unitId: string, targetId: string): Promise<string[]> {
     if (!this.engine) throw new Error("Engine not initialized");
-    this.engine.submit_attack_command(unitId, targetId);
+    const jsonStr = this.engine.submit_attack_command(unitId, targetId);
+    return JSON.parse(jsonStr as string);
   }
 
   async submitCaptureCommand(unitId: string) {
@@ -138,6 +139,7 @@ export class EngineWorker {
     const jsonStr = this.engine.check_game_over();
     return JSON.parse(jsonStr as string);
   }
+
 }
 
 Comlink.expose(EngineWorker);
