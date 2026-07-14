@@ -1,32 +1,32 @@
-import { Container, Sprite, Text, Graphics, useTick } from '@pixi/react';
-import { TextStyle } from 'pixi.js';
-import { useGameStore } from '../../../store/gameStore';
-import { useState, useEffect, useRef } from 'react';
+import { Container, Graphics, Sprite, Text, useTick } from "@pixi/react";
+import { TextStyle } from "pixi.js";
+import { useEffect, useRef, useState } from "react";
+import { useGameStore } from "../../../store/gameStore";
 
 const TILE_SIZE = 48;
 
 const UNIT_IMAGE_MAP: Record<string, string> = {
-  'infantry': 'infantry',
-  'mech': 'mech_infantry',
-  'recon': 'armored_vehicle',
-  'tank': 'light_tank',
-  'mdtank': 'medium_tank',
-  'tankz': 'heavy_tank',
-  'artillery': 'artillery',
-  'lightspgun': 'light_artillery',
-  'heavyspgun': 'heavy_artillery',
-  'rockets': 'rocket',
-  'antiair': 'anti_air_tank',
-  'missiles': 'anti_air_missile',
-  'fighter': 'fighter',
-  'heavyfighter': 'heavy_fighter',
-  'bomber': 'bomber',
-  'bcopters': 'battle_copter',
-  'transporthelicopter': 'transport_copter',
-  'battleship': 'battleship',
-  'carrier': 'carrier',
-  'lander': 'lander',
-  'supplytruck': 'supply_truck',
+  infantry: "infantry",
+  mech: "mech_infantry",
+  recon: "armored_vehicle",
+  tank: "light_tank",
+  mdtank: "medium_tank",
+  tankz: "heavy_tank",
+  artillery: "artillery",
+  lightspgun: "light_artillery",
+  heavyspgun: "heavy_artillery",
+  rockets: "rocket",
+  antiair: "anti_air_tank",
+  missiles: "anti_air_missile",
+  fighter: "fighter",
+  heavyfighter: "heavy_fighter",
+  bomber: "bomber",
+  bcopters: "battle_copter",
+  transporthelicopter: "transport_copter",
+  battleship: "battleship",
+  carrier: "carrier",
+  lander: "lander",
+  supplytruck: "supply_truck",
 };
 
 interface ExplosionState {
@@ -36,9 +36,14 @@ interface ExplosionState {
 }
 
 export const UnitLayer = () => {
-  const { 
-    unitData, topology, selectedUnitId, selectedTargetPos, interactionState,
-    recentlyDestroyedUnitIds, clearRecentlyDestroyedUnits
+  const {
+    unitData,
+    topology,
+    selectedUnitId,
+    selectedTargetPos,
+    interactionState,
+    recentlyDestroyedUnitIds,
+    clearRecentlyDestroyedUnits,
   } = useGameStore();
 
   const renderedHpsRef = useRef<Record<string, number>>({});
@@ -51,7 +56,7 @@ export const UnitLayer = () => {
 
   useEffect(() => {
     const prevUnits = prevUnitsRef.current;
-    const currentIds = new Set(unitData.map(u => u.id));
+    const currentIds = new Set(unitData.map((u) => u.id));
 
     // 爆発エフェクト開始判定
     let explosionsChanged = false;
@@ -127,13 +132,19 @@ export const UnitLayer = () => {
     <Container>
       {/* ユニット描画 */}
       {unitData.map((unit) => {
-        const isSelectedAndMoving = selectedUnitId === unit.id && 
-          ['action_menu', 'target_selection', 'drop_unit_selection', 'drop_target_selection'].includes(interactionState) && 
+        const isSelectedAndMoving =
+          selectedUnitId === unit.id &&
+          [
+            "action_menu",
+            "target_selection",
+            "drop_unit_selection",
+            "drop_target_selection",
+          ].includes(interactionState) &&
           selectedTargetPos;
         const targetX = isSelectedAndMoving ? selectedTargetPos.x : unit.x;
         const targetY = isSelectedAndMoving ? selectedTargetPos.y : unit.y;
 
-        const isHexOddRow = topology === 'hex' && targetY % 2 !== 0;
+        const isHexOddRow = topology === "hex" && targetY % 2 !== 0;
         const offsetX = isHexOddRow ? TILE_SIZE / 2 : 0;
         const px = targetX * TILE_SIZE + offsetX;
         const py = targetY * TILE_SIZE;
@@ -143,11 +154,11 @@ export const UnitLayer = () => {
         return (
           <Container key={unit.id} x={px} y={py}>
             <Sprite
-              image={`/assets/units/${unit.faction}/${UNIT_IMAGE_MAP[unit.type] || 'infantry'}.png`}
+              image={`/assets/units/${unit.faction}/${UNIT_IMAGE_MAP[unit.type] || "infantry"}.png`}
               width={TILE_SIZE}
               height={TILE_SIZE}
             />
-            
+
             {/* L: 積載中 */}
             {unit.is_loaded && (
               <Container x={TILE_SIZE - 16} y={TILE_SIZE - 16}>
@@ -159,7 +170,12 @@ export const UnitLayer = () => {
                     g.endFill();
                   }}
                 />
-                <Text text="L" style={new TextStyle({ fill: 'white', fontSize: 12, fontWeight: 'bold' })} x={4} y={1} />
+                <Text
+                  text="L"
+                  style={new TextStyle({ fill: "white", fontSize: 12, fontWeight: "bold" })}
+                  x={4}
+                  y={1}
+                />
               </Container>
             )}
 
@@ -174,7 +190,12 @@ export const UnitLayer = () => {
                     g.endFill();
                   }}
                 />
-                <Text text="E" style={new TextStyle({ fill: 'white', fontSize: 12, fontWeight: 'bold' })} x={4} y={1} />
+                <Text
+                  text="E"
+                  style={new TextStyle({ fill: "white", fontSize: 12, fontWeight: "bold" })}
+                  x={4}
+                  y={1}
+                />
               </Container>
             )}
 
@@ -185,7 +206,7 @@ export const UnitLayer = () => {
                 g.beginFill(0x000000, 0.6);
                 g.drawRect(2, TILE_SIZE - 6, TILE_SIZE - 4, 4);
                 g.endFill();
-                
+
                 const ratio = displayHp / 10;
                 let color = 0x00ff00; // 緑
                 if (displayHp < 3) {
@@ -193,7 +214,7 @@ export const UnitLayer = () => {
                 } else if (displayHp < 7) {
                   color = 0xff9900; // 橙
                 }
-                
+
                 g.beginFill(color);
                 g.drawRect(2, TILE_SIZE - 6, (TILE_SIZE - 4) * ratio, 4);
                 g.endFill();
@@ -205,7 +226,7 @@ export const UnitLayer = () => {
 
       {/* 爆発エフェクト */}
       {Object.entries(explosions).map(([id, exp]) => {
-        const isHexOddRow = topology === 'hex' && exp.y % 2 !== 0;
+        const isHexOddRow = topology === "hex" && exp.y % 2 !== 0;
         const offsetX = isHexOddRow ? TILE_SIZE / 2 : 0;
         const px = exp.x * TILE_SIZE + offsetX;
         const py = exp.y * TILE_SIZE;

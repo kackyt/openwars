@@ -1,27 +1,27 @@
-import { useState, useEffect, useRef } from 'react';
-import { Container, Sprite, Graphics, useTick } from '@pixi/react';
-import { useGameStore } from '../../../store/gameStore';
+import { Container, Graphics, Sprite, useTick } from "@pixi/react";
+import { useEffect, useRef, useState } from "react";
+import { useGameStore } from "../../../store/gameStore";
 
 const TILE_SIZE = 48;
 
 const TERRAIN_IMAGE_MAP: Record<string, string> = {
-  'plains': 'plain',
-  'forest': 'woods',
-  'mountain': 'mountain',
-  'river': 'river',
-  'road': 'road',
-  'bridge': 'bridge',
-  'sea': 'sea',
-  'shoal': 'shoal',
+  plains: "plain",
+  forest: "woods",
+  mountain: "mountain",
+  river: "river",
+  road: "road",
+  bridge: "bridge",
+  sea: "sea",
+  shoal: "shoal",
 };
 
-const getTerrainImagePath = (cell: string, propertyOwner: string = 'neutral') => {
-  if (['city', 'factory', 'airport', 'port', 'capital'].includes(cell)) {
-    const filename = cell === 'capital' ? 'hq' : cell;
+const getTerrainImagePath = (cell: string, propertyOwner = "neutral") => {
+  if (["city", "factory", "airport", "port", "capital"].includes(cell)) {
+    const filename = cell === "capital" ? "hq" : cell;
     return `/assets/properties/${propertyOwner}/${filename}.png`;
   }
-  
-  const mapped = TERRAIN_IMAGE_MAP[cell] || 'plain';
+
+  const mapped = TERRAIN_IMAGE_MAP[cell] || "plain";
   return `/assets/terrains/${mapped}.png`;
 };
 
@@ -72,52 +72,54 @@ export const MapLayer = () => {
 
   return (
     <Container>
-      {mapData.map((row, y) => (
+      {mapData.map((row, y) =>
         row.map((cell, x) => {
-          const isHexOddRow = topology === 'hex' && y % 2 !== 0;
+          const isHexOddRow = topology === "hex" && y % 2 !== 0;
           const offsetX = isHexOddRow ? TILE_SIZE / 2 : 0;
           const px = x * TILE_SIZE + offsetX;
           const py = y * TILE_SIZE;
-          const property = propertyData.find(p => p.x === x && p.y === y);
+          const property = propertyData.find((p) => p.x === x && p.y === y);
 
           return (
             <Container key={`cell-${x}-${y}`} x={px} y={py}>
               <Sprite
-                image={getTerrainImagePath(cell, property?.owner || 'neutral')}
+                image={getTerrainImagePath(cell, property?.owner || "neutral")}
                 width={TILE_SIZE}
                 height={TILE_SIZE}
               />
-              {property && property.capture_points < property.max_capture_points && property.max_capture_points > 0 && (
-                <Graphics
-                  x={4}
-                  y={4}
-                  draw={(g) => {
-                    const key = `${property.x}-${property.y}`;
-                    const displayPoints = renderedPoints[key] ?? property.capture_points;
+              {property &&
+                property.capture_points < property.max_capture_points &&
+                property.max_capture_points > 0 && (
+                  <Graphics
+                    x={4}
+                    y={4}
+                    draw={(g) => {
+                      const key = `${property.x}-${property.y}`;
+                      const displayPoints = renderedPoints[key] ?? property.capture_points;
 
-                    g.clear();
-                    g.beginFill(0x000000, 0.5);
-                    g.drawRect(0, 0, TILE_SIZE - 8, 6);
-                    g.endFill();
+                      g.clear();
+                      g.beginFill(0x000000, 0.5);
+                      g.drawRect(0, 0, TILE_SIZE - 8, 6);
+                      g.endFill();
 
-                    const ratio = displayPoints / property.max_capture_points;
-                    let barColor = 0x00ff00; // 緑
-                    if (ratio < 0.3) {
-                      barColor = 0xff0000; // 赤
-                    } else if (ratio < 0.7) {
-                      barColor = 0xff9900; // 橙
-                    }
+                      const ratio = displayPoints / property.max_capture_points;
+                      let barColor = 0x00ff00; // 緑
+                      if (ratio < 0.3) {
+                        barColor = 0xff0000; // 赤
+                      } else if (ratio < 0.7) {
+                        barColor = 0xff9900; // 橙
+                      }
 
-                    g.beginFill(barColor);
-                    g.drawRect(1, 1, (TILE_SIZE - 10) * ratio, 4);
-                    g.endFill();
-                  }}
-                />
-              )}
+                      g.beginFill(barColor);
+                      g.drawRect(1, 1, (TILE_SIZE - 10) * ratio, 4);
+                      g.endFill();
+                    }}
+                  />
+                )}
             </Container>
           );
-        })
-      ))}
+        }),
+      )}
     </Container>
   );
 };

@@ -1,28 +1,40 @@
-import { Stage, Container, Sprite } from '@pixi/react';
-import * as PIXI from 'pixi.js';
-import { MapLayer } from '../MapLayer';
-import { UnitLayer } from '../UnitLayer';
-import { CursorLayer } from '../CursorLayer';
-import { ReachableLayer } from '../ReachableLayer';
-import { useGameStore } from '../../../store/gameStore';
-import { useState, useEffect } from 'react';
+import { Container, Sprite, Stage } from "@pixi/react";
+import * as PIXI from "pixi.js";
+import { useEffect, useState } from "react";
+import { useGameStore } from "../../../store/gameStore";
+import { CursorLayer } from "../CursorLayer";
+import { MapLayer } from "../MapLayer";
+import { ReachableLayer } from "../ReachableLayer";
+import { UnitLayer } from "../UnitLayer";
 
 const TILE_SIZE = 48;
 
 export const GameCanvas = () => {
-  const { 
-    mapData, unitData, 
-    interactionState, reachableCells, attackableTargets,
-    setHoveredCell, selectUnit, selectMoveTarget, executeAction, cancelInteraction, openProduceMenu,
+  const {
+    mapData,
+    unitData,
+    interactionState,
+    reachableCells,
+    attackableTargets,
+    setHoveredCell,
+    selectUnit,
+    selectMoveTarget,
+    executeAction,
+    cancelInteraction,
+    openProduceMenu,
     executeDropTarget,
-    topology 
+    topology,
   } = useGameStore();
-  
-  const [windowSize, setWindowSize] = useState({ width: window.innerWidth, height: window.innerHeight });
+
+  const [windowSize, setWindowSize] = useState({
+    width: window.innerWidth,
+    height: window.innerHeight,
+  });
   useEffect(() => {
-    const handleResize = () => setWindowSize({ width: window.innerWidth, height: window.innerHeight });
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
+    const handleResize = () =>
+      setWindowSize({ width: window.innerWidth, height: window.innerHeight });
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
   }, []);
 
   const [hoverX, setHoverX] = useState(-1);
@@ -36,20 +48,20 @@ export const GameCanvas = () => {
   const getCellData = (globalX: number, globalY: number) => {
     const localX = globalX - cameraPos.x;
     const localY = globalY - cameraPos.y;
-    
+
     const gridY = Math.floor(localY / TILE_SIZE);
     let offsetX = 0;
-    if (topology === 'hex' && gridY % 2 !== 0) {
+    if (topology === "hex" && gridY % 2 !== 0) {
       offsetX = TILE_SIZE / 2;
     }
     const gridX = Math.floor((localX - offsetX) / TILE_SIZE);
-    
+
     if (gridY < 0 || gridY >= mapData.length || gridX < 0 || gridX >= (mapData[0]?.length || 0)) {
       return null;
     }
-    
-    const cellType = mapData[gridY]?.[gridX] || 'unknown';
-    const unit = unitData.find(u => u.x === gridX && u.y === gridY) || null;
+
+    const cellType = mapData[gridY]?.[gridX] || "unknown";
+    const unit = unitData.find((u) => u.x === gridX && u.y === gridY) || null;
     return { gridX, gridY, cellType, unit };
   };
 
@@ -58,10 +70,10 @@ export const GameCanvas = () => {
     const mapHeight = mapData.length * TILE_SIZE;
     const minX = Math.min(0, windowSize.width - mapWidth);
     const minY = Math.min(0, windowSize.height - mapHeight);
-    
+
     return {
       x: Math.max(minX, Math.min(0, newX)),
-      y: Math.max(minY, Math.min(0, newY))
+      y: Math.max(minY, Math.min(0, newY)),
     };
   };
 
@@ -94,51 +106,55 @@ export const GameCanvas = () => {
 
   const handlePointerUp = (e: any) => {
     setIsDragging(false);
-    
+
     const dx = e.data.global.x - pointerStart.x;
     const dy = e.data.global.y - pointerStart.y;
     const dist = Math.abs(dx) + Math.abs(dy);
-    
+
     if (dist < 10) {
       const cellData = getCellData(e.data.global.x, e.data.global.y);
       if (!cellData) return;
       const { gridX, gridY, unit, cellType } = cellData;
 
-      if (interactionState === 'ai_thinking') {
+      if (interactionState === "ai_thinking") {
         return; // Ignore clicks while AI is thinking
       }
 
-      if (interactionState === 'idle') {
+      if (interactionState === "idle") {
         if (unit) {
           selectUnit(unit.id);
-        } else if (['factory', 'airport', 'port', 'capital', 'city'].includes(cellType)) {
+        } else if (["factory", "airport", "port", "capital", "city"].includes(cellType)) {
           openProduceMenu(gridX, gridY);
         } else {
           cancelInteraction();
         }
-      } else if (interactionState === 'unit_selected') {
-        const isReachable = reachableCells.some(c => c.x === gridX && c.y === gridY);
+      } else if (interactionState === "unit_selected") {
+        const isReachable = reachableCells.some((c) => c.x === gridX && c.y === gridY);
         if (isReachable) {
           selectMoveTarget(gridX, gridY);
         } else {
           cancelInteraction();
         }
-      } else if (interactionState === 'target_selection') {
-        const target = attackableTargets.find(t => t.x === gridX && t.y === gridY);
+      } else if (interactionState === "target_selection") {
+        const target = attackableTargets.find((t) => t.x === gridX && t.y === gridY);
         if (target) {
-          executeAction('Attack', target.id);
+          executeAction("Attack", target.id);
         } else {
           cancelInteraction();
         }
-      } else if (interactionState === 'drop_target_selection') {
+      } else if (interactionState === "drop_target_selection") {
         // 降車先マスのタップ: ハイライト済みマスをタップしたら降車コマンドを送信する
-        const isDroppable = reachableCells.some(c => c.x === gridX && c.y === gridY);
+        const isDroppable = reachableCells.some((c) => c.x === gridX && c.y === gridY);
         if (isDroppable) {
           executeDropTarget(gridX, gridY);
         } else {
           cancelInteraction();
         }
-      } else if (interactionState === 'action_menu' || interactionState === 'produce_menu' || interactionState === 'drop_unit_selection') {
+      } else if (
+        interactionState === "action_menu" ||
+        interactionState === "produce_menu" ||
+        interactionState === "drop_unit_selection"
+      ) {
         cancelInteraction();
       }
     }
@@ -146,20 +162,30 @@ export const GameCanvas = () => {
 
   const handleWheel = (e: any) => {
     // prevent default behavior in native events if necessary
-    setCameraPos(prev => clampCameraPos(prev.x - e.deltaX, prev.y - e.deltaY));
+    setCameraPos((prev) => clampCameraPos(prev.x - e.deltaX, prev.y - e.deltaY));
   };
 
   return (
-    <Stage width={windowSize.width} height={windowSize.height} options={{ backgroundColor: 0x1099bb }} onWheel={handleWheel}>
+    <Stage
+      width={windowSize.width}
+      height={windowSize.height}
+      options={{ backgroundColor: 0x1099bb }}
+      onWheel={handleWheel}
+    >
       {/* @ts-ignore */}
-      <Container 
-        interactive={true} 
-        pointerdown={handlePointerDown} 
+      <Container
+        interactive={true}
+        pointerdown={handlePointerDown}
         pointermove={handlePointerMove}
         pointerup={handlePointerUp}
         pointerupoutside={handlePointerUp}
       >
-        <Sprite texture={PIXI.Texture.WHITE} width={windowSize.width} height={windowSize.height} alpha={0} />
+        <Sprite
+          texture={PIXI.Texture.WHITE}
+          width={windowSize.width}
+          height={windowSize.height}
+          alpha={0}
+        />
         <Container x={cameraPos.x} y={cameraPos.y}>
           <MapLayer />
           <ReachableLayer tileSize={TILE_SIZE} />

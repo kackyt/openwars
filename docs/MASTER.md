@@ -199,7 +199,7 @@ AIが生成したドキュメント・コードは、以下のタイミングで
 #### 開発ツール
 
 - パッケージマネージャー/ビルド: `cargo` (Rust), `pnpm` (Web/TypeScript - `npm` や `yarn` は使用禁止)
-- リンター/フォーマッター: `cargo clippy`, `cargo fmt` (Rust), `eslint`, `prettier` 等 (TypeScript)
+- リンター/フォーマッター: `cargo clippy`, `cargo fmt` (Rust), `Biome` (TypeScript)
 - AI駆動デバッグ: カスタムAIデバッガー (`ai-debug` featureフラグによるTUIデバッグ), MCP経由の自己対戦評価
 
 ※ 詳細な技術スタックと選定理由（ADR）は [ARCHITECTURE.md](./02-design/ARCHITECTURE.md) を参照

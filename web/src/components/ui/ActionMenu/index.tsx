@@ -1,5 +1,5 @@
-import { Paper, Stack, Button } from '@mantine/core';
-import { actionMenuContainer } from './index.css';
+import { Button, Paper, Stack } from "@mantine/core";
+import { actionMenuContainer } from "./index.css";
 
 interface ActionMenuProps {
   x: number;
@@ -10,23 +10,23 @@ interface ActionMenuProps {
 }
 
 const ACTION_MAP: Record<string, string> = {
-  Wait: '待機',
-  Attack: '攻撃',
-  Capture: '占領',
-  Supply: '補給',
-  Load: '搭載',
-  Drop: '降車',
-  Merge: '合流',
+  Wait: "待機",
+  Attack: "攻撃",
+  Capture: "占領",
+  Supply: "補給",
+  Load: "搭載",
+  Drop: "降車",
+  Merge: "合流",
 };
 
 export const ActionMenu = ({ x, y, actions, onSelect, onClose }: ActionMenuProps) => {
   if (actions.length === 0) return null;
 
   return (
-    <Paper 
-      shadow="xl" 
-      p="xs" 
-      withBorder 
+    <Paper
+      shadow="xl"
+      p="xs"
+      withBorder
       className={actionMenuContainer}
       style={{ left: `${x}px`, top: `${y}px` }}
     >
