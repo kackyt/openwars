@@ -1,5 +1,5 @@
 import * as Comlink from "comlink";
-import { WasmEngine, default as initWasm } from "../wasm/engine.js";
+import { default as initWasm, WasmEngine } from "../wasm/engine.js";
 import wasmUrl from "../wasm/engine_bg.wasm?url";
 
 export class EngineWorker {
@@ -101,21 +101,29 @@ export class EngineWorker {
   }
 
   // 輸送ユニットに積載されているユニット一覧を取得する
-  async getLoadedUnits(transportId: string): Promise<{ id: string, type: string }[]> {
+  async getLoadedUnits(transportId: string): Promise<{ id: string; type: string }[]> {
     if (!this.engine) throw new Error("Engine not initialized");
     const jsonStr = this.engine.get_loaded_units(transportId);
     return JSON.parse(jsonStr as string);
   }
 
   // 指定ユニットの降車可能マス一覧を取得する
-  async getDroppableTiles(transportId: string, cargoId: string): Promise<{ x: number, y: number }[]> {
+  async getDroppableTiles(
+    transportId: string,
+    cargoId: string,
+  ): Promise<{ x: number; y: number }[]> {
     if (!this.engine) throw new Error("Engine not initialized");
     const jsonStr = this.engine.get_droppable_tiles(transportId, cargoId);
     return JSON.parse(jsonStr as string);
   }
 
   // 降車コマンドを送信する
-  async submitUnloadCommand(transportId: string, cargoId: string, targetX: number, targetY: number) {
+  async submitUnloadCommand(
+    transportId: string,
+    cargoId: string,
+    targetX: number,
+    targetY: number,
+  ) {
     if (!this.engine) throw new Error("Engine not initialized");
     this.engine.submit_unload_command(transportId, cargoId, targetX, targetY);
   }
