@@ -80,7 +80,7 @@ export const MapLayer = () => {
       if (Math.abs(current - p.capture_points) > CAPTURE_THRESHOLD) {
         if (current > p.capture_points) {
           // 最大値（p.max_capture_points）に対する割合ベースで減少量を算出し、HP減少アニメーションと速度感を統一する
-          const decreaseAmount = (p.max_capture_points * CAPTURE_SPEED_COEFF * step) / 10;
+          const decreaseAmount = Math.max(0.1, (p.max_capture_points * CAPTURE_SPEED_COEFF * step) / 10);
           renderedPointsRef.current[key] = Math.max(p.capture_points, current - decreaseAmount);
         } else {
           // 増加（回復）した時は瞬時に戻す

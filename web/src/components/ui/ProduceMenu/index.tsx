@@ -1,5 +1,5 @@
 import { Button, Paper, ScrollArea, Stack, Text } from "@mantine/core";
-import { produceMenuContainer } from "./index.css";
+import { produceMenuContainer, unitName } from "./index.css";
 
 interface ProduceMenuProps {
   x: number;
@@ -35,7 +35,7 @@ export const ProduceMenu = ({ x, y, units, currentFunds, onSelect, onClose }: Pr
                 onClick={() => onSelect(unit.type)}
                 styles={{ inner: { justifyContent: "space-between", width: "100%" } }}
               >
-                <span className="flex-1 font-bold">{unit.name}</span>
+                <span className={unitName}>{unit.name}</span>
                 <Text size="sm" c={canAfford ? "yellow" : "red"}>
                   {unit.cost}
                 </Text>

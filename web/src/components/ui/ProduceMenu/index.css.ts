@@ -7,3 +7,9 @@ export const produceMenuContainer = style({
   backgroundColor: "rgba(20, 20, 20, 0.95)",
   backdropFilter: "blur(8px)",
 });
+
+export const unitName = style({
+  flex: 1,
+  fontWeight: "bold",
+  textAlign: "left",
+});

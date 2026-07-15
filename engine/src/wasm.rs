@@ -522,8 +522,7 @@ impl WasmEngine {
 
         let master_data_opt = self
             .world
-            .get_resource::<crate::resources::master_data::MasterDataRegistry>()
-            .cloned();
+            .get_resource::<crate::resources::master_data::MasterDataRegistry>();
 
         let mut producible = Vec::new();
         if let Some(master_data) = master_data_opt {
@@ -532,7 +531,7 @@ impl WasmEngine {
                 active_player_id,
                 x as usize,
                 y as usize,
-                &master_data,
+                master_data,
             )
             .is_ok()
             {
