@@ -22,13 +22,13 @@ pub struct GameRng {
 impl Default for GameRng {
     fn default() -> Self {
         let mut h = DefaultHasher::new();
-        
+
         #[cfg(target_arch = "wasm32")]
         {
             let now = js_sys::Date::now();
             (now as u64).hash(&mut h);
         }
-        
+
         #[cfg(not(target_arch = "wasm32"))]
         {
             std::time::SystemTime::now()
@@ -37,7 +37,7 @@ impl Default for GameRng {
                 .subsec_nanos()
                 .hash(&mut h);
         }
-        
+
         Self { seed: h.finish() }
     }
 }

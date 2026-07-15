@@ -1,12 +1,11 @@
-use wasm_bindgen::prelude::*;
 use bevy_ecs::prelude::*;
+use wasm_bindgen::prelude::*;
 
-use crate::resources::master_data::MasterDataRegistry;
-use crate::resources::{Map, MatchState, Phase, Terrain, Players};
 use crate::components::{
-    CargoCapacity, Faction, GridPosition, Health, Property,
-    UnitStats, Fuel, Ammo, ActionCompleted,
+    ActionCompleted, Ammo, CargoCapacity, Faction, Fuel, GridPosition, Health, Property, UnitStats,
 };
+use crate::resources::master_data::MasterDataRegistry;
+use crate::resources::{Map, MatchState, Phase, Players, Terrain};
 
 #[wasm_bindgen]
 pub struct WasmEngine {
@@ -20,15 +19,19 @@ impl WasmEngine {
     pub fn new(map_name: &str, topology_str: &str) -> Result<WasmEngine, JsValue> {
         let master_data = MasterDataRegistry::load()
             .map_err(|e| JsValue::from_str(&format!("Failed to load master data: {:?}", e)))?;
-        
+
         let topology = match topology_str {
             "hex" => crate::resources::GridTopology::Hex,
             _ => crate::resources::GridTopology::Square,
         };
-        
-        let (world, schedule) = crate::setup::initialize_world_from_master_data_with_topology(&master_data, map_name, topology)
-            .map_err(|e| JsValue::from_str(&format!("Failed to init world: {:?}", e)))?;
-            
+
+        let (world, schedule) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master_data,
+            map_name,
+            topology,
+        )
+        .map_err(|e| JsValue::from_str(&format!("Failed to init world: {:?}", e)))?;
+
         Ok(WasmEngine { world, schedule })
     }
 
@@ -37,7 +40,7 @@ impl WasmEngine {
         let mut phase_str = "P1".to_string();
         let mut funds = 0;
         let mut active_player_index = 0;
-        
+
         if let Some(match_state) = self.world.get_resource::<MatchState>() {
             turn = match_state.current_turn_number.0;
             active_player_index = match_state.active_player_index.0;
@@ -46,14 +49,17 @@ impl WasmEngine {
                 _ => format!("{:?}", match_state.current_phase),
             };
         }
-        
+
         if let Some(players) = self.world.get_resource::<crate::resources::Players>() {
             if let Some(p) = players.0.get(active_player_index) {
                 funds = p.funds;
             }
         }
-        
-        let json = format!(r#"{{"turn": {}, "phase": "{}", "funds": {}}}"#, turn, phase_str, funds);
+
+        let json = format!(
+            r#"{{"turn": {}, "phase": "{}", "funds": {}}}"#,
+            turn, phase_str, funds
+        );
         JsValue::from_str(&json)
     }
 
@@ -61,7 +67,7 @@ impl WasmEngine {
         if let Some(map) = self.world.get_resource::<Map>() {
             let width = map.width;
             let height = map.height;
-            
+
             let mut rows = Vec::new();
             for y in 0..height {
                 let mut row = Vec::new();
@@ -105,22 +111,38 @@ impl WasmEngine {
                 Option<&Ammo>,
                 Option<&ActionCompleted>,
                 Option<&crate::components::Transporting>,
-                Option<&crate::components::CargoCapacity>
+                Option<&crate::components::CargoCapacity>,
             )>();
-            
-            for (entity, pos, faction, stats, hp_opt, fuel_opt, ammo_opt, action_opt, trans_opt, cargo_opt) in query.iter(&self.world) {
+
+            for (
+                entity,
+                pos,
+                faction,
+                stats,
+                hp_opt,
+                fuel_opt,
+                ammo_opt,
+                action_opt,
+                trans_opt,
+                cargo_opt,
+            ) in query.iter(&self.world)
+            {
                 if trans_opt.is_some() {
                     continue; // 搭載されているユニットは除外
                 }
-                
+
                 let faction_str = match faction.0.0 {
                     1 => "green", // Map P1 to green
                     2 => "blue",  // Map P2 to blue
                     _ => "unknown",
                 };
-                let hp = if let Some(h) = hp_opt { (h.current.saturating_add(9)) / 10 } else { 10 };
+                let hp = if let Some(h) = hp_opt {
+                    (h.current.saturating_add(9)) / 10
+                } else {
+                    10
+                };
                 let is_loaded = cargo_opt.map_or(false, |c| !c.loaded.is_empty());
-                
+
                 let fuel_curr = fuel_opt.map_or(stats.max_fuel, |f| f.current);
                 let fuel_max = stats.max_fuel;
                 let is_exhausted = action_opt.map_or(false, |a| a.0);
@@ -142,16 +164,23 @@ impl WasmEngine {
             }
         } // Bevy query borrow ends here
 
-        let master_data = self.world.get_resource::<crate::resources::MasterDataRegistry>();
-        
+        let master_data = self
+            .world
+            .get_resource::<crate::resources::MasterDataRegistry>();
+
         let mut units = Vec::new();
         for u in temp_units {
             let mut weapons_json = Vec::new();
             if let Some(registry) = master_data {
                 let unit_name_str = u.unit_type.as_str();
-                if let Some(unit_rec) = registry.units.get(&crate::resources::master_data::UnitName(unit_name_str.to_string())) {
+                if let Some(unit_rec) = registry.units.get(
+                    &crate::resources::master_data::UnitName(unit_name_str.to_string()),
+                ) {
                     if let Some(w1_name) = &unit_rec.weapon1 {
-                        if let Some(w1_rec) = registry.weapons.get(&crate::resources::master_data::UnitName(w1_name.clone())) {
+                        if let Some(w1_rec) = registry
+                            .weapons
+                            .get(&crate::resources::master_data::UnitName(w1_name.clone()))
+                        {
                             let ammo_curr = u.ammo.as_ref().map_or(w1_rec.ammo, |a| a.ammo1);
                             weapons_json.push(format!(
                                 r#"{{"name": "{}", "ammo": {}, "max_ammo": {}, "min_range": {}, "max_range": {}}}"#,
@@ -160,7 +189,10 @@ impl WasmEngine {
                         }
                     }
                     if let Some(w2_name) = &unit_rec.weapon2 {
-                        if let Some(w2_rec) = registry.weapons.get(&crate::resources::master_data::UnitName(w2_name.clone())) {
+                        if let Some(w2_rec) = registry
+                            .weapons
+                            .get(&crate::resources::master_data::UnitName(w2_name.clone()))
+                        {
                             let ammo_curr = u.ammo.as_ref().map_or(w2_rec.ammo, |a| a.ammo2);
                             weapons_json.push(format!(
                                 r#"{{"name": "{}", "ammo": {}, "max_ammo": {}, "min_range": {}, "max_range": {}}}"#,
@@ -172,22 +204,34 @@ impl WasmEngine {
             }
             let weapons_str = format!("[{}]", weapons_json.join(","));
             let unit_type_str = format!("{:?}", u.unit_type).to_lowercase();
-            
+
             let unit_json = format!(
                 r#"{{"id": "{}", "type": "{}", "faction": "{}", "x": {}, "y": {}, "hp": {}, "is_loaded": {}, "is_exhausted": {}, "fuel": {{"current": {}, "max": {}}}, "weapons": {}}}"#,
-                u.id, unit_type_str, u.faction_str, u.x, u.y, u.hp, u.is_loaded, u.is_exhausted, u.fuel_curr, u.fuel_max, weapons_str
+                u.id,
+                unit_type_str,
+                u.faction_str,
+                u.x,
+                u.y,
+                u.hp,
+                u.is_loaded,
+                u.is_exhausted,
+                u.fuel_curr,
+                u.fuel_max,
+                weapons_str
             );
             units.push(unit_json);
         }
-        
+
         let json = format!("[{}]", units.join(","));
         JsValue::from_str(&json)
     }
 
     pub fn get_properties(&mut self) -> JsValue {
         let mut properties = Vec::new();
-        let mut query = self.world.query::<(&GridPosition, &crate::components::Property)>();
-        
+        let mut query = self
+            .world
+            .query::<(&GridPosition, &crate::components::Property)>();
+
         for (pos, property) in query.iter(&self.world) {
             let owner_str = match property.owner_id {
                 Some(crate::components::PlayerId(1)) => "green",
@@ -195,20 +239,28 @@ impl WasmEngine {
                 _ => "neutral",
             };
             let terrain_str = format!("{:?}", property.terrain).to_lowercase();
-            
+
             let json = format!(
                 r#"{{"x": {}, "y": {}, "type": "{}", "owner": "{}", "capture_points": {}, "max_capture_points": {}}}"#,
-                pos.x, pos.y, terrain_str, owner_str, property.capture_points, property.max_capture_points
+                pos.x,
+                pos.y,
+                terrain_str,
+                owner_str,
+                property.capture_points,
+                property.max_capture_points
             );
             properties.push(json);
         }
-        
+
         let json = format!("[{}]", properties.join(","));
         JsValue::from_str(&json)
     }
 
     pub fn get_terrain_defs(&self) -> JsValue {
-        if let Some(master) = self.world.get_resource::<crate::resources::MasterDataRegistry>() {
+        if let Some(master) = self
+            .world
+            .get_resource::<crate::resources::MasterDataRegistry>()
+        {
             let mut defs = Vec::new();
             for &(terrain, _) in crate::resources::TERRAIN_MAP {
                 let def = master.get_terrain_defense_bonus(terrain);
@@ -226,53 +278,74 @@ impl WasmEngine {
     pub fn execute_ai_turn(&mut self) -> JsValue {
         // PlayerIndex（0, 1）ではなく、Playersリソースから実際のPlayerId（1, 2）を取得する
         let active_player = {
-            let idx = self.world.get_resource::<MatchState>()
+            let idx = self
+                .world
+                .get_resource::<MatchState>()
                 .map(|ms| ms.active_player_index.0);
-            let Some(idx) = idx else { return JsValue::from_str(r#"{"acted":false,"destroyed":[]}"#) };
-            let pid = self.world.get_resource::<crate::resources::Players>()
+            let Some(idx) = idx else {
+                return JsValue::from_str(r#"{"acted":false,"destroyed":[]}"#);
+            };
+            let pid = self
+                .world
+                .get_resource::<crate::resources::Players>()
                 .and_then(|players| players.0.get(idx).map(|p| p.id));
-            let Some(pid) = pid else { return JsValue::from_str(r#"{"acted":false,"destroyed":[]}"#) };
+            let Some(pid) = pid else {
+                return JsValue::from_str(r#"{"acted":false,"destroyed":[]}"#);
+            };
             pid
         };
 
         let res = crate::ai::engine::execute_ai_turn(&mut self.world, active_player);
         self.schedule.run(&mut self.world);
-        
+
         let acted = res.is_some();
-        
+
         let mut destroyed = Vec::new();
         let mut merged = Vec::new();
-        
-        if let Some(events) = self.world.get_resource::<Events<crate::events::UnitDestroyedEvent>>() {
+
+        if let Some(events) = self
+            .world
+            .get_resource::<Events<crate::events::UnitDestroyedEvent>>()
+        {
             let mut reader = events.get_cursor();
             for ev in reader.read(events) {
                 destroyed.push(ev.entity);
             }
         }
-        if let Some(events) = self.world.get_resource::<Events<crate::events::UnitMergedEvent>>() {
+        if let Some(events) = self
+            .world
+            .get_resource::<Events<crate::events::UnitMergedEvent>>()
+        {
             let mut reader = events.get_cursor();
             for ev in reader.read(events) {
                 merged.push(ev.source_entity);
             }
         }
         crate::setup::update_all_events(&mut self.world);
-        
+
         let mut destroyed_ids = Vec::new();
         for entity in destroyed {
             if !merged.contains(&entity) {
                 destroyed_ids.push(entity.to_bits().to_string());
             }
         }
-        
+
         let destroyed_json = format!(r#"["{}"]"#, destroyed_ids.join(r#"",""#));
-        let destroyed_str = if destroyed_json == r#"[""]"# { "[]" } else { &destroyed_json };
-        
+        let destroyed_str = if destroyed_json == r#"[""]"# {
+            "[]"
+        } else {
+            &destroyed_json
+        };
+
         let json = format!(r#"{{"acted": {}, "destroyed": {}}}"#, acted, destroyed_str);
         JsValue::from_str(&json)
     }
 
     pub fn submit_end_turn_command(&mut self) -> JsValue {
-        if let Some(mut evs) = self.world.get_resource_mut::<Events<crate::events::NextPhaseCommand>>() {
+        if let Some(mut evs) = self
+            .world
+            .get_resource_mut::<Events<crate::events::NextPhaseCommand>>()
+        {
             evs.send(crate::events::NextPhaseCommand);
         }
         self.schedule.run(&mut self.world);
@@ -286,7 +359,7 @@ impl WasmEngine {
                 match game_over {
                     crate::resources::GameOverCondition::Winner(player_id) => {
                         return JsValue::from_str(&format!(r#"{{"winner": {}}}"#, player_id.0));
-                    },
+                    }
                     crate::resources::GameOverCondition::Draw => {
                         return JsValue::from_str(r#"{"draw": true}"#);
                     }
@@ -299,7 +372,7 @@ impl WasmEngine {
     pub fn get_reachable_cells(&mut self, unit_id_str: &str) -> JsValue {
         let unit_entity_bits = unit_id_str.parse::<u64>().unwrap_or(0);
         let target_entity = Entity::from_bits(unit_entity_bits);
-        
+
         let mut start_pos = None;
         let mut mov_type = None;
         let mut max_mov = 0;
@@ -335,7 +408,9 @@ impl WasmEngine {
             if e == target_entity || t.is_some() {
                 continue;
             }
-            let free_slots = c.map(|c| c.max.saturating_sub(c.loaded.len() as u32)).unwrap_or(0);
+            let free_slots = c
+                .map(|c| c.max.saturating_sub(c.loaded.len() as u32))
+                .unwrap_or(0);
             unit_positions.insert(
                 (p.x, p.y),
                 crate::systems::movement::OccupantInfo {
@@ -351,7 +426,8 @@ impl WasmEngine {
         if let (Some(start), Some(m_type)) = (start_pos, mov_type) {
             if let (Some(map), Some(master_data)) = (
                 self.world.get_resource::<Map>(),
-                self.world.get_resource::<crate::resources::master_data::MasterDataRegistry>(),
+                self.world
+                    .get_resource::<crate::resources::master_data::MasterDataRegistry>(),
             ) {
                 let reachable = crate::systems::movement::calculate_reachable_tiles(
                     map,
@@ -364,7 +440,7 @@ impl WasmEngine {
                     u_type,
                     master_data,
                 );
-                
+
                 let mut coords = Vec::new();
                 for &(rx, ry) in &reachable {
                     coords.push(format!(r#"{{"x": {}, "y": {}}}"#, rx, ry));
@@ -376,33 +452,55 @@ impl WasmEngine {
         JsValue::from_str("[]")
     }
 
-    pub fn get_available_actions(&mut self, unit_id_str: &str, dest_x: i32, dest_y: i32) -> JsValue {
+    pub fn get_available_actions(
+        &mut self,
+        unit_id_str: &str,
+        dest_x: i32,
+        dest_y: i32,
+    ) -> JsValue {
         let unit_entity_bits = unit_id_str.parse::<u64>().unwrap_or(0);
         let unit_entity = Entity::from_bits(unit_entity_bits);
-        
+
         let mut is_moved = false;
         if let Some(pos) = self.world.get::<GridPosition>(unit_entity) {
             if pos.x != dest_x as usize || pos.y != dest_y as usize {
                 is_moved = true;
             }
         }
-        
+
         let actions = crate::systems::action::get_available_actions_at(
-            &mut self.world, 
-            unit_entity, 
-            crate::components::GridPosition { x: dest_x as usize, y: dest_y as usize },
-            is_moved
+            &mut self.world,
+            unit_entity,
+            crate::components::GridPosition {
+                x: dest_x as usize,
+                y: dest_y as usize,
+            },
+            is_moved,
         );
-        
+
         let mut options = Vec::new();
-        if actions.can_wait { options.push("\"Wait\""); }
-        if actions.can_attack { options.push("\"Attack\""); }
-        if actions.can_capture { options.push("\"Capture\""); }
-        if actions.can_supply { options.push("\"Supply\""); }
-        if actions.can_merge { options.push("\"Merge\""); }
-        if actions.can_load { options.push("\"Load\""); }
-        if actions.can_drop { options.push("\"Drop\""); }
-        
+        if actions.can_wait {
+            options.push("\"Wait\"");
+        }
+        if actions.can_attack {
+            options.push("\"Attack\"");
+        }
+        if actions.can_capture {
+            options.push("\"Capture\"");
+        }
+        if actions.can_supply {
+            options.push("\"Supply\"");
+        }
+        if actions.can_merge {
+            options.push("\"Merge\"");
+        }
+        if actions.can_load {
+            options.push("\"Load\"");
+        }
+        if actions.can_drop {
+            options.push("\"Drop\"");
+        }
+
         let json = format!("[{}]", options.join(","));
         JsValue::from_str(&json)
     }
@@ -410,15 +508,34 @@ impl WasmEngine {
     pub fn get_producible_units(&mut self, x: i32, y: i32) -> JsValue {
         let active_player_id = if let Some(match_state) = self.world.get_resource::<MatchState>() {
             if let Some(players) = self.world.get_resource::<Players>() {
-                players.0.get(match_state.active_player_index.0).map(|p| p.id).unwrap_or(crate::components::PlayerId(0))
-            } else { crate::components::PlayerId(0) }
-        } else { crate::components::PlayerId(0) };
+                players
+                    .0
+                    .get(match_state.active_player_index.0)
+                    .map(|p| p.id)
+                    .unwrap_or(crate::components::PlayerId(0))
+            } else {
+                crate::components::PlayerId(0)
+            }
+        } else {
+            crate::components::PlayerId(0)
+        };
 
-        let master_data_opt = self.world.get_resource::<crate::resources::master_data::MasterDataRegistry>().cloned();
+        let master_data_opt = self
+            .world
+            .get_resource::<crate::resources::master_data::MasterDataRegistry>()
+            .cloned();
 
         let mut producible = Vec::new();
         if let Some(master_data) = master_data_opt {
-            if crate::systems::production::can_produce_at_tile(&mut self.world, active_player_id, x as usize, y as usize, &master_data).is_ok() {
+            if crate::systems::production::can_produce_at_tile(
+                &mut self.world,
+                active_player_id,
+                x as usize,
+                y as usize,
+                &master_data,
+            )
+            .is_ok()
+            {
                 let mut target_prop = None;
                 let mut q_prop = self.world.query::<(&GridPosition, &Property)>();
                 for (pos, prop) in q_prop.iter(&self.world) {
@@ -427,14 +544,16 @@ impl WasmEngine {
                         break;
                     }
                 }
-                
+
                 if let Some(prop) = target_prop {
                     for (name, record) in &master_data.units {
                         if let Ok(u_type) = master_data.unit_type_for_name(&name.0) {
                             if master_data.can_produce_unit(prop.terrain.as_str(), u_type) {
                                 producible.push(format!(
                                     r#"{{"type": "{}", "name": "{}", "cost": {}}}"#,
-                                    format!("{:?}", u_type).to_lowercase(), record.name.0, record.cost
+                                    format!("{:?}", u_type).to_lowercase(),
+                                    record.name.0,
+                                    record.cost
                                 ));
                             }
                         }
@@ -442,35 +561,50 @@ impl WasmEngine {
                 }
             }
         }
-        
+
         let json = format!("[{}]", producible.join(","));
         JsValue::from_str(&json)
     }
 
-    pub fn get_attackable_targets(&mut self, unit_id_str: &str, dest_x: i32, dest_y: i32) -> JsValue {
+    pub fn get_attackable_targets(
+        &mut self,
+        unit_id_str: &str,
+        dest_x: i32,
+        dest_y: i32,
+    ) -> JsValue {
         let unit_entity_bits = unit_id_str.parse::<u64>().unwrap_or(0);
         let unit_entity = Entity::from_bits(unit_entity_bits);
-        
+
         let mut is_moved = false;
         if let Some(pos) = self.world.get::<GridPosition>(unit_entity) {
             if pos.x != dest_x as usize || pos.y != dest_y as usize {
                 is_moved = true;
             }
         }
-        
-        let dest_pos = GridPosition { x: dest_x as usize, y: dest_y as usize };
-        let targets = crate::systems::combat::get_attackable_targets_at(&mut self.world, unit_entity, dest_pos, !is_moved);
-        
+
+        let dest_pos = GridPosition {
+            x: dest_x as usize,
+            y: dest_y as usize,
+        };
+        let targets = crate::systems::combat::get_attackable_targets_at(
+            &mut self.world,
+            unit_entity,
+            dest_pos,
+            !is_moved,
+        );
+
         let mut target_list = Vec::new();
         for target_entity in targets {
             if let Some(pos) = self.world.get::<GridPosition>(target_entity) {
                 target_list.push(format!(
                     r#"{{"id": "{}", "x": {}, "y": {}}}"#,
-                    target_entity.to_bits(), pos.x, pos.y
+                    target_entity.to_bits(),
+                    pos.x,
+                    pos.y
                 ));
             }
         }
-        
+
         let json = format!("[{}]", target_list.join(","));
         JsValue::from_str(&json)
     }
@@ -478,8 +612,11 @@ impl WasmEngine {
     pub fn submit_move_command(&mut self, unit_id_str: &str, x: i32, y: i32) -> JsValue {
         let unit_entity_bits = unit_id_str.parse::<u64>().unwrap_or(0);
         let unit_entity = Entity::from_bits(unit_entity_bits);
-        
-        if let Some(mut evs) = self.world.get_resource_mut::<Events<crate::events::MoveUnitCommand>>() {
+
+        if let Some(mut evs) = self
+            .world
+            .get_resource_mut::<Events<crate::events::MoveUnitCommand>>()
+        {
             evs.send(crate::events::MoveUnitCommand {
                 unit_entity,
                 target_x: x as usize,
@@ -494,8 +631,11 @@ impl WasmEngine {
     pub fn submit_wait_command(&mut self, unit_id_str: &str) -> JsValue {
         let unit_entity_bits = unit_id_str.parse::<u64>().unwrap_or(0);
         let unit_entity = Entity::from_bits(unit_entity_bits);
-        
-        if let Some(mut evs) = self.world.get_resource_mut::<Events<crate::events::WaitUnitCommand>>() {
+
+        if let Some(mut evs) = self
+            .world
+            .get_resource_mut::<Events<crate::events::WaitUnitCommand>>()
+        {
             evs.send(crate::events::WaitUnitCommand { unit_entity });
         }
         self.schedule.run(&mut self.world);
@@ -508,8 +648,11 @@ impl WasmEngine {
         let unit_entity = Entity::from_bits(unit_entity_bits);
         let target_entity_bits = target_id_str.parse::<u64>().unwrap_or(0);
         let target_entity = Entity::from_bits(target_entity_bits);
-        
-        if let Some(mut evs) = self.world.get_resource_mut::<Events<crate::events::AttackUnitCommand>>() {
+
+        if let Some(mut evs) = self
+            .world
+            .get_resource_mut::<Events<crate::events::AttackUnitCommand>>()
+        {
             evs.send(crate::events::AttackUnitCommand {
                 attacker_entity: unit_entity,
                 defender_entity: target_entity,
@@ -518,14 +661,17 @@ impl WasmEngine {
         self.schedule.run(&mut self.world);
 
         let mut destroyed = Vec::new();
-        if let Some(events) = self.world.get_resource::<Events<crate::events::UnitDestroyedEvent>>() {
+        if let Some(events) = self
+            .world
+            .get_resource::<Events<crate::events::UnitDestroyedEvent>>()
+        {
             let mut reader = events.get_cursor();
             for ev in reader.read(events) {
                 destroyed.push(ev.entity.to_bits().to_string());
             }
         }
         crate::setup::update_all_events(&mut self.world);
-        
+
         let json = format!(r#"["{}"]"#, destroyed.join(r#"",""#));
         JsValue::from_str(&if json == r#"[""]"# { "[]" } else { &json })
     }
@@ -533,8 +679,11 @@ impl WasmEngine {
     pub fn submit_capture_command(&mut self, unit_id_str: &str) -> JsValue {
         let unit_entity_bits = unit_id_str.parse::<u64>().unwrap_or(0);
         let unit_entity = Entity::from_bits(unit_entity_bits);
-        
-        if let Some(mut evs) = self.world.get_resource_mut::<Events<crate::events::CapturePropertyCommand>>() {
+
+        if let Some(mut evs) = self
+            .world
+            .get_resource_mut::<Events<crate::events::CapturePropertyCommand>>()
+        {
             evs.send(crate::events::CapturePropertyCommand { unit_entity });
         }
         self.schedule.run(&mut self.world);
@@ -547,8 +696,11 @@ impl WasmEngine {
         let unit_entity = Entity::from_bits(unit_entity_bits);
         let target_entity_bits = target_id_str.parse::<u64>().unwrap_or(0);
         let transport_entity = Entity::from_bits(target_entity_bits);
-        
-        if let Some(mut evs) = self.world.get_resource_mut::<Events<crate::events::LoadUnitCommand>>() {
+
+        if let Some(mut evs) = self
+            .world
+            .get_resource_mut::<Events<crate::events::LoadUnitCommand>>()
+        {
             evs.send(crate::events::LoadUnitCommand {
                 transport_entity,
                 unit_entity,
@@ -565,11 +717,22 @@ impl WasmEngine {
 
         let active_player_id = if let Some(match_state) = self.world.get_resource::<MatchState>() {
             if let Some(players) = self.world.get_resource::<Players>() {
-                players.0.get(match_state.active_player_index.0).map(|p| p.id).unwrap_or(crate::components::PlayerId(0))
-            } else { crate::components::PlayerId(0) }
-        } else { crate::components::PlayerId(0) };
+                players
+                    .0
+                    .get(match_state.active_player_index.0)
+                    .map(|p| p.id)
+                    .unwrap_or(crate::components::PlayerId(0))
+            } else {
+                crate::components::PlayerId(0)
+            }
+        } else {
+            crate::components::PlayerId(0)
+        };
 
-        if let Some(mut evs) = self.world.get_resource_mut::<Events<crate::events::ProduceUnitCommand>>() {
+        if let Some(mut evs) = self
+            .world
+            .get_resource_mut::<Events<crate::events::ProduceUnitCommand>>()
+        {
             evs.send(crate::events::ProduceUnitCommand {
                 player_id: active_player_id,
                 unit_type,
@@ -583,12 +746,15 @@ impl WasmEngine {
     }
 
     pub fn end_turn(&mut self) -> JsValue {
-        if let Some(mut evs) = self.world.get_resource_mut::<Events<crate::events::NextPhaseCommand>>() {
+        if let Some(mut evs) = self
+            .world
+            .get_resource_mut::<Events<crate::events::NextPhaseCommand>>()
+        {
             evs.send(crate::events::NextPhaseCommand);
         }
         self.schedule.run(&mut self.world);
         crate::setup::update_all_events(&mut self.world);
-        
+
         // PhaseがEndTurnになった場合は、次のターンの処理へ遷移させる
         let mut needs_advance = false;
         if let Some(match_state) = self.world.get_resource::<MatchState>() {
@@ -624,7 +790,8 @@ impl WasmEngine {
                 let unit_type_str = format!("{:?}", stats.unit_type).to_lowercase();
                 result.push(format!(
                     r#"{{"id": "{}", "type": "{}"}}"#,
-                    passenger.to_bits(), unit_type_str
+                    passenger.to_bits(),
+                    unit_type_str
                 ));
             }
         }
@@ -667,7 +834,10 @@ impl WasmEngine {
         let cargo_bits = cargo_id_str.parse::<u64>().unwrap_or(0);
         let cargo_entity = Entity::from_bits(cargo_bits);
 
-        if let Some(mut evs) = self.world.get_resource_mut::<Events<crate::events::UnloadUnitCommand>>() {
+        if let Some(mut evs) = self
+            .world
+            .get_resource_mut::<Events<crate::events::UnloadUnitCommand>>()
+        {
             evs.send(crate::events::UnloadUnitCommand {
                 transport_entity,
                 cargo_entity,
@@ -682,17 +852,16 @@ impl WasmEngine {
 
     /// ユニット同士を合流させるコマンドを送信します。
     /// source ユニットが target ユニットに吸収される形で合流します。
-    pub fn submit_merge_command(
-        &mut self,
-        unit_id_str: &str,
-        target_id_str: &str,
-    ) -> JsValue {
+    pub fn submit_merge_command(&mut self, unit_id_str: &str, target_id_str: &str) -> JsValue {
         let unit_bits = unit_id_str.parse::<u64>().unwrap_or(0);
         let unit_entity = Entity::from_bits(unit_bits);
         let target_bits = target_id_str.parse::<u64>().unwrap_or(0);
         let target_entity = Entity::from_bits(target_bits);
 
-        if let Some(mut evs) = self.world.get_resource_mut::<Events<crate::events::MergeUnitCommand>>() {
+        if let Some(mut evs) = self
+            .world
+            .get_resource_mut::<Events<crate::events::MergeUnitCommand>>()
+        {
             evs.send(crate::events::MergeUnitCommand {
                 source_entity: unit_entity,
                 target_entity,
