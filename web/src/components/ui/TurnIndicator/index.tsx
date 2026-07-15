@@ -1,21 +1,29 @@
 import { Button, ColorSwatch, Group, Paper, Stack, Text } from "@mantine/core";
+import { PHASE_P1, PHASE_P2 } from "../../../constants/mappings";
+import { COLOR_SWATCH_SIZE } from "../../../constants/rendering";
 import { turnIndicatorContainer } from "./index.css";
 
+interface TurnIndicatorProps {
+  turn: number;
+  phase: string;
+  funds: number;
+  onEndTurn: () => void;
+  isAiThinking: boolean;
+}
+
+/**
+ * ターンインジケーターコンポーネント
+ * 現在のターン数、フェーズ（プレイヤー）、資金量を表示し、ターン終了操作を行うためのUIです。
+ */
 export const TurnIndicator = ({
   turn,
   phase,
   funds,
   onEndTurn,
   isAiThinking,
-}: {
-  turn: number;
-  phase: string;
-  funds: number;
-  onEndTurn: () => void;
-  isAiThinking: boolean;
-}) => {
-  const isP1 = phase === "P1";
-  const isP2 = phase === "P2";
+}: TurnIndicatorProps) => {
+  const isP1 = phase === PHASE_P1;
+  const isP2 = phase === PHASE_P2;
 
   const phaseText = isAiThinking
     ? "AI思考中..."
@@ -47,7 +55,10 @@ export const TurnIndicator = ({
 
         <Stack gap="xs" align="flex-end">
           <Group gap="xs">
-            <ColorSwatch color={`var(--mantine-color-${phaseColor}-filled)`} size={14} />
+            <ColorSwatch
+              color={`var(--mantine-color-${phaseColor}-filled)`}
+              size={COLOR_SWATCH_SIZE}
+            />
             <Text size="sm" fw={700} c={phaseColor}>
               {phaseText}
             </Text>

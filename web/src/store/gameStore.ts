@@ -1,8 +1,64 @@
+/**
+ * @file gameStore.ts
+ * @description Zustandを用いたゲームのグローバル状態管理ストア。
+ * エンジンの初期化、Wasm Worker との通信同期、ゲーム内のインタラクション状態マシン（状態遷移）を管理します。
+ *
+ * 【インタラクション状態マシン (interactionState) 遷移図】
+ *
+ *        ┌───────────────────────┐
+ *        │         idle          │◄─────────────────────────────────────────────┐
+ *        └─────┬───────────┬─────┘                                              │
+ *              │           │                                                    │
+ *      (Select Unit) (Select Factory)                                           │
+ *              │           │                                                    │
+ *              ▼           ▼                                                    │
+ *    ┌───────────┐   ┌──────────────┐                                           │
+ *    │   unit_   │   │ produce_menu │                                           │
+ *    │ selected  │   └──────┬───────┘                                           │
+ *    └─────┬─────┘          │                                                   │
+ *          │           (Produce Unit)                                           │
+ *    (Select Move)          │                                                   │
+ *          │                ▼                                                   │
+ *          ▼          [Sync State] ─────────────────────────────────────────────┤
+ *    ┌───────────┐                                                              │
+ *    │  action_  │                                                              │
+ *    │   menu    │                                                              │
+ *    └─────┬─────┘                                                              │
+ *          ├───────────────┬──────────────────┐                                 │
+ *       (Attack)        (Drop)             (Wait / Capture / Load / Merge)      │
+ *          │               │                  │                                 │
+ *          ▼               ▼                  ▼                                 │
+ *    ┌───────────┐   ┌──────────────┐   [Sync State] ───────────────────────────┤
+ *    │  target_  │   │  drop_unit_  │                                           │
+ *    │ selection │   │  selection   │                                           │
+ *    └─────┬─────┘   └──────┬───────┘                                           │
+ *          │                │                                                   │
+ *       (Select          (Select                                                │
+ *       Target)          Cargo)                                                 │
+ *          │                ▼                                                   │
+ *          │         ┌──────────────┐                                           │
+ *          │         │ drop_target_ │                                           │
+ *          │         │  selection   │                                           │
+ *          │         └──────┬───────┘                                           │
+ *          │                │                                                   │
+ *          │             (Select                                                │
+ *          │           Drop Tile)                                               │
+ *          ▼                ▼                                                   │
+ *     [Sync State] ────[Sync State] ────────────────────────────────────────────┘
+ *
+ *    ※ AIターン時は、一時的に interactionState: "ai_thinking" となり、
+ *       すべてのプレイヤー入力が無視されます。
+ */
+
 import * as Comlink from "comlink";
 import { create } from "zustand";
+import { PHASE_P1, PHASE_P2 } from "../constants/mappings";
 import type { EngineWorker } from "../worker/engineWorker";
 
-interface UnitData {
+/** AIの思考ターンで無限ループに陥らないための最大ループ回数ガード */
+const MAX_AI_ACTION_LOOPS = 100;
+
+export interface UnitData {
   id: string;
   type: string;
   faction: string;
@@ -15,13 +71,13 @@ interface UnitData {
   weapons: { name: string; ammo: number; max_ammo: number; min_range: number; max_range: number }[];
 }
 
-interface TurnInfo {
+export interface TurnInfo {
   turn: number;
   phase: string;
   funds: number;
 }
 
-interface PropertyData {
+export interface PropertyData {
   x: number;
   y: number;
   type: string;
@@ -30,20 +86,20 @@ interface PropertyData {
   max_capture_points: number;
 }
 
-interface ActionMenuState {
+export interface ActionMenuState {
   x: number;
   y: number;
   unitId: string;
   actions: string[];
 }
 
-interface ProduceMenuState {
+export interface ProduceMenuState {
   x: number;
   y: number;
   units: { type: string; name: string; cost: number }[];
 }
 
-interface GameState {
+export interface GameState {
   appState: "menu" | "playing";
   topology: "square" | "hex";
   p1IsAi: boolean;
@@ -155,6 +211,8 @@ export const useGameStore = create<GameState>((set, get) => ({
       const engineWorker = await new engineClass();
       await engineWorker.init(mapName, topology);
 
+      // topology パラメータは 'square' | 'hex' のいずれかであることが前提
+      // ドメイン上の安全性のため、型アサーションを行っています。
       set({
         engineWorker,
         isEngineReady: true,
@@ -167,9 +225,10 @@ export const useGameStore = create<GameState>((set, get) => ({
 
       const { turnInfo, p1IsAi: isP1Ai, p2IsAi: isP2Ai } = get();
       if (turnInfo) {
-        const isAiTurn = (turnInfo.phase === "P1" && isP1Ai) || (turnInfo.phase === "P2" && isP2Ai);
+        const isAiTurn =
+          (turnInfo.phase === PHASE_P1 && isP1Ai) || (turnInfo.phase === PHASE_P2 && isP2Ai);
         if (isAiTurn) {
-          get().tickAiTurn();
+          await get().tickAiTurn();
         }
       }
     } catch (e) {
@@ -231,25 +290,33 @@ export const useGameStore = create<GameState>((set, get) => ({
   selectUnit: async (unitId: string) => {
     const { engineWorker, unitData } = get();
     if (!engineWorker) return;
-    const unit = unitData.find((u) => u.id === unitId);
-    if (unit?.is_exhausted) return; // 行動済みなら選択不可
-    const cells = await engineWorker.getReachableCells(unitId);
-    set({
-      interactionState: "unit_selected",
-      selectedUnitId: unitId,
-      reachableCells: cells,
-    });
+    try {
+      const unit = unitData.find((u) => u.id === unitId);
+      if (unit?.is_exhausted) return; // 行動済みなら選択不可
+      const cells = await engineWorker.getReachableCells(unitId);
+      set({
+        interactionState: "unit_selected",
+        selectedUnitId: unitId,
+        reachableCells: cells,
+      });
+    } catch (e) {
+      console.error("Failed in selectUnit action:", e);
+    }
   },
 
   selectMoveTarget: async (x: number, y: number) => {
     const { engineWorker, selectedUnitId } = get();
     if (!engineWorker || !selectedUnitId) return;
-    const actions = await engineWorker.getAvailableActions(selectedUnitId, x, y);
-    set({
-      interactionState: "action_menu",
-      selectedTargetPos: { x, y },
-    });
-    get().openActionMenu(x, y, selectedUnitId, actions);
+    try {
+      const actions = await engineWorker.getAvailableActions(selectedUnitId, x, y);
+      set({
+        interactionState: "action_menu",
+        selectedTargetPos: { x, y },
+      });
+      get().openActionMenu(x, y, selectedUnitId, actions);
+    } catch (e) {
+      console.error("Failed in selectMoveTarget action:", e);
+    }
   },
 
   cancelInteraction: () => {
@@ -270,94 +337,103 @@ export const useGameStore = create<GameState>((set, get) => ({
     const { engineWorker, selectedUnitId, selectedTargetPos } = get();
     if (!engineWorker || !selectedUnitId || !selectedTargetPos) return;
 
-    if (actionType === "Wait") {
-      await engineWorker.submitMoveCommand(
-        selectedUnitId,
-        selectedTargetPos.x,
-        selectedTargetPos.y,
-      );
-      await engineWorker.submitWaitCommand(selectedUnitId);
-    } else if (actionType === "Attack") {
-      if (!targetId) {
-        const targets = await engineWorker.getAttackableTargets(
+    try {
+      if (actionType === "Wait") {
+        await engineWorker.submitMoveCommand(
           selectedUnitId,
           selectedTargetPos.x,
           selectedTargetPos.y,
         );
-        set({
-          interactionState: "target_selection",
-          attackableTargets: targets,
-          actionMenu: null,
-        });
+        await engineWorker.submitWaitCommand(selectedUnitId);
+      } else if (actionType === "Attack") {
+        if (!targetId) {
+          const targets = await engineWorker.getAttackableTargets(
+            selectedUnitId,
+            selectedTargetPos.x,
+            selectedTargetPos.y,
+          );
+          set({
+            interactionState: "target_selection",
+            attackableTargets: targets,
+            actionMenu: null,
+          });
+          return;
+        }
+        await engineWorker.submitMoveCommand(
+          selectedUnitId,
+          selectedTargetPos.x,
+          selectedTargetPos.y,
+        );
+        const destroyedIds = await engineWorker.submitAttackCommand(selectedUnitId, targetId);
+        get().cancelInteraction();
+        await get().syncGameState({ recentlyDestroyedUnitIds: destroyedIds });
         return;
+      } else if (actionType === "Capture") {
+        await engineWorker.submitMoveCommand(
+          selectedUnitId,
+          selectedTargetPos.x,
+          selectedTargetPos.y,
+        );
+        await engineWorker.submitCaptureCommand(selectedUnitId);
+      } else if (actionType === "Load") {
+        await engineWorker.submitMoveCommand(
+          selectedUnitId,
+          selectedTargetPos.x,
+          selectedTargetPos.y,
+        );
+        const targetUnit = get().unitData.find(
+          (u) =>
+            u.x === selectedTargetPos.x && u.y === selectedTargetPos.y && u.id !== selectedUnitId,
+        );
+        if (targetUnit) {
+          await engineWorker.submitLoadCommand(selectedUnitId, targetUnit.id);
+        }
+      } else if (actionType === "Merge") {
+        // 移動先に同じ勢力・同種のユニットを探して合流する
+        await engineWorker.submitMoveCommand(
+          selectedUnitId,
+          selectedTargetPos.x,
+          selectedTargetPos.y,
+        );
+        const targetUnit = get().unitData.find(
+          (u) =>
+            u.x === selectedTargetPos.x && u.y === selectedTargetPos.y && u.id !== selectedUnitId,
+        );
+        if (targetUnit) {
+          await engineWorker.submitMergeCommand(selectedUnitId, targetUnit.id);
+        }
+      } else if (actionType === "Drop") {
+        // 移動コマンドは送信済みの状態で、降車する積載ユニットの選択メニューを開く
+        await engineWorker.submitMoveCommand(
+          selectedUnitId,
+          selectedTargetPos.x,
+          selectedTargetPos.y,
+        );
+        await get().openDropMenu();
+        return; // まだ cancelInteraction / syncGameState は呼ばない
       }
-      await engineWorker.submitMoveCommand(
-        selectedUnitId,
-        selectedTargetPos.x,
-        selectedTargetPos.y,
-      );
-      const destroyedIds = await engineWorker.submitAttackCommand(selectedUnitId, targetId);
-      get().cancelInteraction();
-      await get().syncGameState({ recentlyDestroyedUnitIds: destroyedIds });
-      return;
-    } else if (actionType === "Capture") {
-      await engineWorker.submitMoveCommand(
-        selectedUnitId,
-        selectedTargetPos.x,
-        selectedTargetPos.y,
-      );
-      await engineWorker.submitCaptureCommand(selectedUnitId);
-    } else if (actionType === "Load") {
-      await engineWorker.submitMoveCommand(
-        selectedUnitId,
-        selectedTargetPos.x,
-        selectedTargetPos.y,
-      );
-      const targetUnit = get().unitData.find(
-        (u) =>
-          u.x === selectedTargetPos.x && u.y === selectedTargetPos.y && u.id !== selectedUnitId,
-      );
-      if (targetUnit) {
-        await engineWorker.submitLoadCommand(selectedUnitId, targetUnit.id);
-      }
-    } else if (actionType === "Merge") {
-      // 移動先に同じ勢力・同種のユニットを探して合流する
-      await engineWorker.submitMoveCommand(
-        selectedUnitId,
-        selectedTargetPos.x,
-        selectedTargetPos.y,
-      );
-      const targetUnit = get().unitData.find(
-        (u) =>
-          u.x === selectedTargetPos.x && u.y === selectedTargetPos.y && u.id !== selectedUnitId,
-      );
-      if (targetUnit) {
-        await engineWorker.submitMergeCommand(selectedUnitId, targetUnit.id);
-      }
-    } else if (actionType === "Drop") {
-      // 移動コマンドは送信済みの状態で、降車する積載ユニットの選択メニューを開く
-      await engineWorker.submitMoveCommand(
-        selectedUnitId,
-        selectedTargetPos.x,
-        selectedTargetPos.y,
-      );
-      await get().openDropMenu();
-      return; // まだ cancelInteraction / syncGameState は呼ばない
-    }
 
-    get().cancelInteraction();
-    await get().syncGameState();
+      get().cancelInteraction();
+      await get().syncGameState();
+    } catch (e) {
+      console.error(`Failed to execute action "${actionType}":`, e);
+      get().cancelInteraction();
+    }
   },
 
   openProduceMenu: async (x: number, y: number) => {
     const { engineWorker } = get();
     if (!engineWorker) return;
-    const units = await engineWorker.getProducibleUnits(x, y);
-    if (units && units.length > 0) {
-      set({
-        interactionState: "produce_menu",
-        produceMenu: { x, y, units },
-      });
+    try {
+      const units = await engineWorker.getProducibleUnits(x, y);
+      if (units && units.length > 0) {
+        set({
+          interactionState: "produce_menu",
+          produceMenu: { x, y, units },
+        });
+      }
+    } catch (e) {
+      console.error("Failed to open produce menu:", e);
     }
   },
 
@@ -368,38 +444,58 @@ export const useGameStore = create<GameState>((set, get) => ({
   executeProduce: async (unitType: string, x: number, y: number) => {
     const { engineWorker } = get();
     if (!engineWorker) return;
-    await engineWorker.submitProduceCommand(unitType, x, y);
-    get().closeProduceMenu();
-    await get().syncGameState();
+    try {
+      await engineWorker.submitProduceCommand(unitType, x, y);
+      get().closeProduceMenu();
+      await get().syncGameState();
+    } catch (e) {
+      console.error(`Failed to produce unit "${unitType}":`, e);
+      get().closeProduceMenu();
+    }
   },
 
   // 積載ユニット一覧を取得して降車ユニット選択モードに遷移する
   openDropMenu: async () => {
     const { engineWorker, selectedUnitId } = get();
     if (!engineWorker || !selectedUnitId) return;
-    const loadedUnits = await engineWorker.getLoadedUnits(selectedUnitId);
-    set({ interactionState: "drop_unit_selection", loadedUnits, actionMenu: null });
+    try {
+      const loadedUnits = await engineWorker.getLoadedUnits(selectedUnitId);
+      set({ interactionState: "drop_unit_selection", loadedUnits, actionMenu: null });
+    } catch (e) {
+      console.error("Failed to open drop menu:", e);
+      get().cancelInteraction();
+    }
   },
 
   // 降車するユニットを選択し、降ろせるマスのハイライトに遷移する
   selectDropCargo: async (cargoId: string) => {
     const { engineWorker, selectedUnitId } = get();
     if (!engineWorker || !selectedUnitId) return;
-    const droppableTiles = await engineWorker.getDroppableTiles(selectedUnitId, cargoId);
-    set({
-      interactionState: "drop_target_selection",
-      dropCargoId: cargoId,
-      reachableCells: droppableTiles, // 降車可能マスをハイライト表示に流用する
-    });
+    try {
+      const droppableTiles = await engineWorker.getDroppableTiles(selectedUnitId, cargoId);
+      set({
+        interactionState: "drop_target_selection",
+        dropCargoId: cargoId,
+        reachableCells: droppableTiles, // 降車可能マスをハイライト表示に流用する
+      });
+    } catch (e) {
+      console.error("Failed to select drop cargo:", e);
+      get().cancelInteraction();
+    }
   },
 
   // 降車先マスを選択して降車コマンドを送信する
   executeDropTarget: async (x: number, y: number) => {
     const { engineWorker, selectedUnitId, dropCargoId } = get();
     if (!engineWorker || !selectedUnitId || !dropCargoId) return;
-    await engineWorker.submitUnloadCommand(selectedUnitId, dropCargoId, x, y);
-    get().cancelInteraction();
-    await get().syncGameState();
+    try {
+      await engineWorker.submitUnloadCommand(selectedUnitId, dropCargoId, x, y);
+      get().cancelInteraction();
+      await get().syncGameState();
+    } catch (e) {
+      console.error("Failed to execute drop target:", e);
+      get().cancelInteraction();
+    }
   },
 
   tickAiTurn: async () => {
@@ -413,26 +509,38 @@ export const useGameStore = create<GameState>((set, get) => ({
       produceMenu: null,
     });
 
-    while (true) {
-      const aiResult = await engineWorker.executeAiTurn();
-      await get().syncGameState(
-        aiResult.destroyed && aiResult.destroyed.length > 0
-          ? { recentlyDestroyedUnitIds: aiResult.destroyed }
-          : undefined,
-      );
-      if (!aiResult.acted) break;
-    }
+    try {
+      let loopCount = 0;
+      while (true) {
+        // AIの無限ループ防止ガード
+        if (loopCount++ > MAX_AI_ACTION_LOOPS) {
+          console.warn("AI turn reached loop threshold guard, terminating AI execution.");
+          break;
+        }
 
-    // AIターンはWasm内部でNextPhaseCommandが処理されて終了しているため、直接次のターンの状態を確認する
-    const { turnInfo, p1IsAi, p2IsAi } = get();
-    if (turnInfo) {
-      const isNextAiTurn =
-        (turnInfo.phase === "P1" && p1IsAi) || (turnInfo.phase === "P2" && p2IsAi);
-      if (isNextAiTurn) {
-        get().tickAiTurn();
-      } else {
-        set({ interactionState: "idle" });
+        const aiResult = await engineWorker.executeAiTurn();
+        await get().syncGameState(
+          aiResult.destroyed && aiResult.destroyed.length > 0
+            ? { recentlyDestroyedUnitIds: aiResult.destroyed }
+            : undefined,
+        );
+        if (!aiResult.acted) break;
       }
+
+      // AIターンはWasm内部でNextPhaseCommandが処理されて終了しているため、直接次のターンの状態を確認する
+      const { turnInfo, p1IsAi, p2IsAi } = get();
+      if (turnInfo) {
+        const isNextAiTurn =
+          (turnInfo.phase === PHASE_P1 && p1IsAi) || (turnInfo.phase === PHASE_P2 && p2IsAi);
+        if (isNextAiTurn) {
+          await get().tickAiTurn();
+        } else {
+          set({ interactionState: "idle" });
+        }
+      }
+    } catch (e) {
+      console.error("Failed during AI turn execution:", e);
+      set({ interactionState: "idle" });
     }
   },
 
@@ -440,20 +548,26 @@ export const useGameStore = create<GameState>((set, get) => ({
     const { engineWorker } = get();
     if (!engineWorker) return;
 
-    const gameOverObj = await engineWorker.checkGameOver();
-    if (gameOverObj) return;
+    try {
+      const gameOverObj = await engineWorker.checkGameOver();
+      if (gameOverObj) return;
 
-    await engineWorker.endTurn();
-    await get().syncGameState();
+      await engineWorker.endTurn();
+      await get().syncGameState();
 
-    const { turnInfo, p1IsAi, p2IsAi } = get();
-    if (turnInfo) {
-      const isAiTurn = (turnInfo.phase === "P1" && p1IsAi) || (turnInfo.phase === "P2" && p2IsAi);
-      if (isAiTurn) {
-        get().tickAiTurn();
-      } else {
-        set({ interactionState: "idle" });
+      const { turnInfo, p1IsAi, p2IsAi } = get();
+      if (turnInfo) {
+        const isAiTurn =
+          (turnInfo.phase === PHASE_P1 && p1IsAi) || (turnInfo.phase === PHASE_P2 && p2IsAi);
+        if (isAiTurn) {
+          await get().tickAiTurn();
+        } else {
+          set({ interactionState: "idle" });
+        }
       }
+    } catch (e) {
+      console.error("Failed to end turn:", e);
+      set({ interactionState: "idle" });
     }
   },
 }));

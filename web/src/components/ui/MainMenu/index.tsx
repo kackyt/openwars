@@ -1,15 +1,23 @@
 import { Button, Container, Group, Paper, Select, Stack, Title } from "@mantine/core";
 import { useState } from "react";
+import { MAIN_MENU_MARGIN_TOP } from "../../../constants/rendering";
 import { useGameStore } from "../../../store/gameStore";
 
+/**
+ * メインメニューコンポーネント
+ * ゲーム起動時の初期設定（マップ、グリッド形式、プレイヤー/AI設定）を行い、ゲームを開始する画面です。
+ */
 export const MainMenu = () => {
-  const { initEngine } = useGameStore();
+  // Zustand のセレクタを用いて initEngine のみを取得する
+  const initEngine = useGameStore((state) => state.initEngine);
+
   const [mapName, setMapName] = useState("map_1");
   const [topology, setTopology] = useState("square");
   const [p1Type, setP1Type] = useState("player");
   const [p2Type, setP2Type] = useState("ai");
   const [isLoading, setIsLoading] = useState(false);
 
+  /** ゲームを開始する */
   const handleStart = async () => {
     setIsLoading(true);
     await initEngine(mapName, topology, p1Type === "ai", p2Type === "ai");
@@ -17,7 +25,7 @@ export const MainMenu = () => {
   };
 
   return (
-    <Container size="sm" mt={100}>
+    <Container size="sm" mt={MAIN_MENU_MARGIN_TOP}>
       <Paper shadow="md" p="xl" radius="md" withBorder>
         <Stack gap="lg">
           <Title order={1} ta="center">
