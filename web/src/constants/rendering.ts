@@ -62,7 +62,7 @@ export const CAPTURE_STEP = 0.05;
 /** 占領バーのアニメーション完了判定閾値 */
 export const CAPTURE_THRESHOLD = 0.01;
 /** 占領バーの減少速度係数 */
-export const CAPTURE_SPEED_COEFF = 20;
+export const CAPTURE_SPEED_COEFF = 10;
 
 /** HP補間ステップ係数 */
 export const HP_STEP = 0.05;
