@@ -32,8 +32,12 @@ export const ReachableLayer = ({ tileSize }: ReachableLayerProps) => {
     (g: PIXI.Graphics) => {
       g.clear();
 
-      // 移動可能なセル範囲を描画する
-      if (interactionState === "unit_selected" || interactionState === "action_menu") {
+      // 移動可能範囲または降車可能マスのハイライトを描画する
+      if (
+        interactionState === "unit_selected" ||
+        interactionState === "action_menu" ||
+        interactionState === "drop_target_selection"
+      ) {
         g.beginFill(REACHABLE_CELL_COLOR, REACHABLE_CELL_ALPHA);
         g.lineStyle(1, REACHABLE_BORDER_COLOR, REACHABLE_BORDER_ALPHA);
         for (const cell of reachableCells) {
