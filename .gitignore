@@ -4,3 +4,12 @@ node_modules/
 __pycache__/
 *.pyc
 .claude/settings.local.json
+
+# AI Agent が生成する一時ファイル（リポジトリに含めない）
+benchmark_*.md
+*_benchmark*.md
+*_log.txt
+diff.txt
+matchup_report*.md
+suggestions.md
+review_feature_*.md

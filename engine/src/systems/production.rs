@@ -20,24 +20,25 @@ pub const PRODUCTION_RANGE: usize = 3;
 /// 首都からのグリッド距離（トポロジーに応じたマンハッタン距離/ヘックス距離）が
 /// 生産可能範囲内かどうかを判定する
 pub fn is_within_production_range(
-    capital_pos: Option<GridPosition>,
+    capital_positions: &[GridPosition],
     target_x: usize,
     target_y: usize,
     topology: GridTopology,
 ) -> bool {
-    if let Some(cp) = capital_pos {
+    if capital_positions.is_empty() {
+        return false;
+    }
+    capital_positions.iter().any(|cp| {
         let distance = topology.distance((cp.x, cp.y), (target_x, target_y));
         distance as usize <= PRODUCTION_RANGE
-    } else {
-        false
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
 fn check_production_rules(
     is_occupied: bool,
     landscape_name: Option<&str>,
-    capital_pos: Option<GridPosition>,
+    capital_positions: &[GridPosition],
     target_x: usize,
     target_y: usize,
     unit_type: UnitType,
@@ -56,7 +57,7 @@ fn check_production_rules(
         return Err(format!("Cannot produce {:?} at {}", unit_type, ln));
     }
 
-    if !is_within_production_range(capital_pos, target_x, target_y, topology) {
+    if !is_within_production_range(capital_positions, target_x, target_y, topology) {
         return Err("Too far from Capital!".to_string());
     }
 
@@ -80,13 +81,13 @@ pub fn can_produce_at_tile(
         return Err("Tile is occupied!".to_string());
     }
 
-    let mut capital_pos = None;
+    let mut capital_positions = Vec::new();
     let mut is_valid_facility = false;
     let mut q_prop = world.query::<(&GridPosition, &Property)>();
     for (pos, prop) in q_prop.iter(world) {
         if prop.owner_id == Some(player_id) {
             if prop.terrain == Terrain::Capital {
-                capital_pos = Some(*pos);
+                capital_positions.push(*pos);
             }
             if pos.x == target_x
                 && pos.y == target_y
@@ -105,7 +106,7 @@ pub fn can_produce_at_tile(
         .get_resource::<Map>()
         .map(|m| m.topology)
         .unwrap_or(GridTopology::Square);
-    if !is_within_production_range(capital_pos, target_x, target_y, topology) {
+    if !is_within_production_range(&capital_positions, target_x, target_y, topology) {
         return Err("Too far from Capital!".to_string());
     }
 
@@ -126,7 +127,7 @@ pub fn can_produce_at(
         .any(|pos| pos.x == target_x && pos.y == target_y);
 
     let mut landscape_name = None;
-    let mut capital_pos = None;
+    let mut capital_positions = Vec::new();
     let mut q_prop = world.query::<(&GridPosition, &Property)>();
     for (pos, prop) in q_prop.iter(world) {
         if prop.owner_id == Some(player_id) {
@@ -134,7 +135,7 @@ pub fn can_produce_at(
                 landscape_name = Some(prop.terrain.as_str());
             }
             if prop.terrain == Terrain::Capital {
-                capital_pos = Some(*pos);
+                capital_positions.push(*pos);
             }
         }
     }
@@ -146,7 +147,7 @@ pub fn can_produce_at(
     check_production_rules(
         is_occupied,
         landscape_name,
-        capital_pos,
+        &capital_positions,
         target_x,
         target_y,
         unit_type,
@@ -189,14 +190,14 @@ pub fn produce_unit_system(
             || newly_spawned_positions.contains(&(event.target_x, event.target_y));
 
         let mut landscape_name = None;
-        let mut capital_pos = None;
+        let mut capital_positions = Vec::new();
         for (pos, prop) in q_properties.iter() {
             if prop.owner_id == Some(event.player_id) {
                 if pos.x == event.target_x && pos.y == event.target_y {
                     landscape_name = Some(prop.terrain.as_str());
                 }
                 if prop.terrain == Terrain::Capital {
-                    capital_pos = Some(*pos);
+                    capital_positions.push(*pos);
                 }
             }
         }
@@ -204,7 +205,7 @@ pub fn produce_unit_system(
         if let Err(e) = check_production_rules(
             is_occupied,
             landscape_name,
-            capital_pos,
+            &capital_positions,
             event.target_x,
             event.target_y,
             event.unit_type,

@@ -1,11 +1,11 @@
 ---
 title: "MASTER"
-version: "1.1.0"
+version: "1.1.1"
 status: "draft"
 owner: "@your-github-handle"
 created: "YYYY-MM-DD"
-updated: "2026-05-07"
-changeImpact: "MEDIUM"
+updated: "2026-07-13"
+changeImpact: "LOW"
 ---
 
 # AI駆動開発マスタードキュメント
@@ -168,6 +168,7 @@ AIが生成したドキュメント・コードは、以下のタイミングで
 | Core/State| bevy_ecs    | 0.15.x系   | Component, System, Resource, Event を駆使した純粋なロジック構築 |
 | CUI UI   | ratatui     | (latest)   | イベント駆動での再描画、1フレーム遅延に注意 |
 | GUI UI   | Tauri       | (将来予定) | React等との連携予定 |
+| Web UI   | React / TS  | (latest)   | パッケージマネージャーは必ず `pnpm` を使用（npm/yarn禁止） |
 
 ### AIへの補足（カットオフ対策）
 
@@ -197,8 +198,8 @@ AIが生成したドキュメント・コードは、以下のタイミングで
 
 #### 開発ツール
 
-- パッケージマネージャー/ビルド: `cargo`
-- リンター/フォーマッター: `cargo clippy`, `cargo fmt`
+- パッケージマネージャー/ビルド: `cargo` (Rust), `pnpm` (Web/TypeScript - `npm` や `yarn` は使用禁止)
+- リンター/フォーマッター: `cargo clippy`, `cargo fmt` (Rust), `Biome` (TypeScript)
 - AI駆動デバッグ: カスタムAIデバッガー (`ai-debug` featureフラグによるTUIデバッグ), MCP経由の自己対戦評価
 
 ※ 詳細な技術スタックと選定理由（ADR）は [ARCHITECTURE.md](./02-design/ARCHITECTURE.md) を参照
@@ -651,6 +652,12 @@ Changelog エントリには以下のカテゴリを使用する（[Keep a Chang
 - [ ] 定数の配置が層責務に沿っている（Domain/Application/Infrastructure）
 
 ## Changelog
+
+### [1.1.1] - 2026-07-13
+
+#### 変更
+
+- Web版（TypeScript/Front-end）でパッケージマネージャーとして `pnpm` の使用を必須化し、`npm` や `yarn` の使用を禁止するルールを明記
 
 ### [1.1.0] - 2026-04-27
 

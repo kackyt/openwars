@@ -9,6 +9,22 @@ Rustを使用して開発します。
 - cargo
 - anyhow
 - bevy_ecs
+- TypeScript / React (Webフロントエンド)
+- pnpm (Webパッケージマネージャー - `npm` や `yarn` の使用は厳禁)
+
+## 開発コマンド
+
+### Rust (バックエンド/コアエンジン/CUI)
+- ビルド: `cargo build`
+- テスト: `cargo test`
+- Linter確認: `cargo clippy --all-targets --all-features -- -D warnings`
+- フォーマット確認: `cargo fmt --all -- --check`
+
+### Web (フロントエンド/Tauri)
+- **パッケージ管理には必ず `pnpm` を使用してください。`npm` や `yarn` の使用は厳禁です。**
+- 依存のインストール: `pnpm install`
+- 開発用起動: `pnpm dev` （またはワークスペースルートから `pnpm -C web dev`）
+- ビルド: `pnpm build` （またはワークスペースルートから `pnpm -C web build`）
 
 ## Project Conventions
 

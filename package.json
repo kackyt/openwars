@@ -1,17 +1,9 @@
 {
-  "name": "openwars",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "name": "openwars-root",
+  "private": true,
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "packageManager": "pnpm@10.19.0",
-  "devDependencies": {
-    "@fission-ai/openspec": "^1.3.1",
-    "rulesync": "^7.21.0"
+    "dev": "pnpm -C web dev",
+    "build": "pnpm -C web build",
+    "build:wasm": "wasm-pack build engine --target web --release --out-dir ../web/src/wasm"
   }
 }

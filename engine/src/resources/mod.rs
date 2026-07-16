@@ -13,7 +13,6 @@ pub fn init_master_data(world: &mut World) -> Result<(), master_data::MasterData
 }
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::time::SystemTime;
 
 #[derive(Resource, Debug, Clone)]
 pub struct GameRng {
@@ -23,11 +22,22 @@ pub struct GameRng {
 impl Default for GameRng {
     fn default() -> Self {
         let mut h = DefaultHasher::new();
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos()
-            .hash(&mut h);
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let now = js_sys::Date::now();
+            (now as u64).hash(&mut h);
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+                .hash(&mut h);
+        }
+
         Self { seed: h.finish() }
     }
 }
@@ -106,6 +116,33 @@ impl UnitType {
             .find(|(t, _)| t == self)
             .map(|(_, s)| *s)
             .unwrap_or("不明")
+    }
+
+    pub fn from_english_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "infantry" => Some(UnitType::Infantry),
+            "mech" | "mech_infantry" => Some(UnitType::Mech),
+            "recon" | "armored_vehicle" => Some(UnitType::Recon),
+            "tank" | "light_tank" => Some(UnitType::Tank),
+            "mdtank" | "medium_tank" => Some(UnitType::MdTank),
+            "tankz" | "heavy_tank" => Some(UnitType::TankZ),
+            "artillery" => Some(UnitType::Artillery),
+            "lightspgun" | "light_artillery" => Some(UnitType::LightSpGun),
+            "heavyspgun" | "heavy_artillery" => Some(UnitType::HeavySpGun),
+            "rockets" | "rocket" => Some(UnitType::Rockets),
+            "antiair" | "anti_air_tank" => Some(UnitType::AntiAir),
+            "missiles" | "anti_air_missile" => Some(UnitType::Missiles),
+            "fighter" => Some(UnitType::Fighter),
+            "heavyfighter" | "heavy_fighter" => Some(UnitType::HeavyFighter),
+            "bomber" => Some(UnitType::Bomber),
+            "bcopters" | "battle_copter" => Some(UnitType::Bcopters),
+            "transporthelicopter" | "transport_copter" => Some(UnitType::TransportHelicopter),
+            "battleship" => Some(UnitType::Battleship),
+            "carrier" => Some(UnitType::Carrier),
+            "lander" => Some(UnitType::Lander),
+            "supplytruck" | "supply_truck" => Some(UnitType::SupplyTruck),
+            _ => None,
+        }
     }
 
     pub fn symbol(&self) -> &'static str {
