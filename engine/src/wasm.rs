@@ -522,10 +522,11 @@ impl WasmEngine {
 
         let master_data_opt = self
             .world
-            .get_resource::<crate::resources::master_data::MasterDataRegistry>();
+            .get_resource::<crate::resources::master_data::MasterDataRegistry>()
+            .cloned();
 
         let mut producible = Vec::new();
-        if let Some(master_data) = master_data_opt {
+        if let Some(master_data) = &master_data_opt {
             if crate::systems::production::can_produce_at_tile(
                 &mut self.world,
                 active_player_id,
