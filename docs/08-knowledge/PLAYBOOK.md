@@ -1,11 +1,11 @@
 ---
 title: "PLAYBOOK"
-version: "1.4.0"
+version: "1.5.0"
 status: "approved"
 created: "2026-06-06"
-updated: "2026-07-12"
+updated: "2026-07-16"
 owner: "@t_kak"
-ace_entry_count: 9
+ace_entry_count: 12
 tags: [ace, playbook, knowledge-management]
 references:
   - docs/ACE_FRAMEWORK.md
@@ -349,6 +349,63 @@ Playbook が 800 行を超えた場合、以下のように分割する：
 **Context**: PR #59 のヘックスグリッド対応にて、グリッド形状の抽象化に `dyn GridGeometry` を用いたが、レビューにてパフォーマンス懸念が指摘された。解決策として、`GridTopology` enum 内の `match self` によって各構造体に処理を委譲する静的ディスパッチ方式に変更された。
 
 **Action**: ゲームループ内の hot path ではポリモーフィズムの実現に `dyn Trait`（動的ディスパッチ）を避け、列挙型（enum）による `match` 分岐（静的ディスパッチ）を採用する。
+
+<a id="ace-63-1"></a>
+
+### ACE-63-1: Zustandストア設計での不要な再レンダリング防止（Zustand Selectors）
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | performance |
+| Origin     | PR #63 |
+| Date       | 2026-07-16 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: React × Zustand 構成において、コンポーネントがストアの全体オブジェクトを分割代入するのではなく、個別の `state => state.xxx` をセレクタ経由で購読するように変更し、不要な再描画を抑制する。
+
+**Context**: PR #63 にて、フロントエンドのパフォーマンス改善のため、ストア全体を分割代入して購読していたコンポーネントを、Zustand のセレクタ（例: `const currentTurn = useGameStore(state => state.currentTurn)`）を使用する形にリファクタリングした。これによって、関連のない状態変更時に無駄な再レンダリングが走るのを防いだ。
+
+**Action**: Zustand を使用する場合は、`const { a, b } = useStore()` ではなく、`const a = useStore(s => s.a); const b = useStore(s => s.b)` のように個々のセレクタを使用して状態を購読することを徹底する。
+
+<a id="ace-63-2"></a>
+
+### ACE-63-2: WebAssembly / Web Worker での安全なエラー境界 (ErrorBoundary) の適用
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | architecture |
+| Origin     | PR #63 |
+| Date       | 2026-07-16 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: Rust (WASM) や Web Worker のようにメインスレッド外で動作する重いゲームロジックがクラッシュした際に、アプリケーション全体が真っ白になるのを防ぐため、WASM / Worker 連携部の直上に React の ErrorBoundary を設置して安全なフォールバックと回復手段を提供する。
+
+**Context**: PR #63 にて、WASM 統合に伴い `ErrorBoundary` コンポーネントを新規実装し、ゲームキャンバスやコントロールパネルを含むゲーム領域全体を包むことで、WASMエンジンやWorkerでの不測のパニック・クラッシュから回復し、安全なエラー画面の提示と再起動を可能にした。
+
+**Action**: Rust / WASM を React アプリケーションに統合する際は、WASM エンジンを使用するコンポーネントの最上位層に必ず `ErrorBoundary` を配置し、例外発生時にクラッシュをキャッチしてユーザーに適切なフィードバックと再試行手段を提供する。
+
+<a id="ace-63-3"></a>
+
+### ACE-63-3: RustのWASMバインディングにおけるヒープアロケーション削減（std::slice::from_ref）
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | performance |
+| Origin     | PR #63 |
+| Date       | 2026-07-16 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: Rust/WASMバインディング層で単一の要素をスライスとして渡す際、`vec![item]` などの動的アロケーションを伴う Vec を構築するのではなく、`std::slice::from_ref(&item)` を使用することで、ヒープアロケーションを回避し、高頻度で実行されるWASM-JS間ブリッジ処理のパフォーマンスを大幅に向上できる。
+
+**Context**: PR #63 のコードレビューにおいて、WasmEngine バインディング層で単一の要素を一時的な Vec に包んで渡していた箇所が指摘された。これを `std::slice::from_ref` による参照のスライス化、および `MasterDataRegistry` などの巨大な読み取り専用データを参照渡し (`&MasterDataRegistry`) に変更することで、アロケーション回数を劇的に削減した。
+
+**Action**: WASM バインディング層やゲームループの Hot path で単一要素をスライス（`&[T]`）として要求する関数に渡す場合は、`vec![x]` や配列アロケーションを避け、`std::slice::from_ref(&x)` を使用してスタック上の参照からスライスを作成する。また、読み取り専用のマスターデータ等は値コピーを避け、必ず参照で引き回す。
 
 ## Changelog
 
