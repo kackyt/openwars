@@ -106,7 +106,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                 && !occupied_positions.contains(pos)
             {
                 // 首都から3マス以内（PRODUCTION_RANGE）の施設のみを有効とする
-                let capital_positions = capital_pos.as_ref().map(std::slice::from_ref).unwrap_or(&[]);
+                let capital_positions = capital_pos.as_slice();
                 if crate::systems::production::is_within_production_range(
                     capital_positions,
                     pos.x,
