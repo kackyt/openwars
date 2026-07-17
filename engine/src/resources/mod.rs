@@ -59,7 +59,9 @@ pub enum DomainError {
     OutOfBounds { x: usize, y: usize },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum UnitType {
     #[default]
     Infantry,
@@ -218,7 +220,7 @@ impl MovementType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Terrain {
     Plains,
     Road,

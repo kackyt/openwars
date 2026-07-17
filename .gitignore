@@ -12,4 +12,6 @@ benchmark_*.md
 diff.txt
 matchup_report*.md
 suggestions.md
-review_feature_*.md
+review_*.md
+saves/
+/web/.firebase

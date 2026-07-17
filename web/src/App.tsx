@@ -1,4 +1,5 @@
 import { Button, MantineProvider, Modal, Text, Title } from "@mantine/core";
+import { useState } from "react";
 import "@mantine/core/styles.css";
 import { appContainer } from "./App.css";
 import { ErrorBoundary } from "./components/common/ErrorBoundary";
@@ -7,6 +8,7 @@ import { ActionMenu } from "./components/ui/ActionMenu";
 import { DropMenu } from "./components/ui/DropMenu";
 import { MainMenu } from "./components/ui/MainMenu";
 import { ProduceMenu } from "./components/ui/ProduceMenu";
+import { SaveLoadModal } from "./components/ui/SaveLoadModal";
 import { TurnIndicator } from "./components/ui/TurnIndicator";
 import { UnitInfoPanel } from "./components/ui/UnitInfoPanel";
 import { FACTION_BLUE, FACTION_GREEN, TERRAIN_CAPITAL } from "./constants/mappings";
@@ -18,6 +20,9 @@ import { useGameStore } from "./store/gameStore";
  * ゲームオーバーモーダルの表示制御を行います。
  */
 function App() {
+  const [saveModalOpened, setSaveModalOpened] = useState(false);
+  const [loadModalOpened, setLoadModalOpened] = useState(false);
+
   // Zustand のセレクタを用いて必要な状態のみを個別に購読する (再描画の抑制)
   const appState = useGameStore((state) => state.appState);
   const isEngineReady = useGameStore((state) => state.isEngineReady);
@@ -100,6 +105,8 @@ function App() {
               phase={turnInfo.phase}
               funds={turnInfo.funds}
               onEndTurn={endTurn}
+              onSaveClick={() => setSaveModalOpened(true)}
+              onLoadClick={() => setLoadModalOpened(true)}
               isAiThinking={interactionState === "ai_thinking"}
             />
           )}
@@ -149,6 +156,17 @@ function App() {
               メインメニューに戻る
             </Button>
           </Modal>
+
+          <SaveLoadModal
+            opened={saveModalOpened}
+            onClose={() => setSaveModalOpened(false)}
+            mode="save"
+          />
+          <SaveLoadModal
+            opened={loadModalOpened}
+            onClose={() => setLoadModalOpened(false)}
+            mode="load"
+          />
         </div>
       </ErrorBoundary>
     </MantineProvider>

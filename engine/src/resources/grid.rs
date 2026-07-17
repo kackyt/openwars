@@ -4,7 +4,7 @@
 //! 距離計算はオフセット座標をキューブ座標に変換してから行う。
 
 /// マップのグリッド形状（トポロジー）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GridTopology {
     Square,
     Hex,

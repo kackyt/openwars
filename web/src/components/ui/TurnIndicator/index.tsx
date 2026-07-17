@@ -8,6 +8,8 @@ interface TurnIndicatorProps {
   phase: string;
   funds: number;
   onEndTurn: () => void;
+  onSaveClick: () => void;
+  onLoadClick: () => void;
   isAiThinking: boolean;
 }
 
@@ -20,6 +22,8 @@ export const TurnIndicator = ({
   phase,
   funds,
   onEndTurn,
+  onSaveClick,
+  onLoadClick,
   isAiThinking,
 }: TurnIndicatorProps) => {
   const isP1 = phase === PHASE_P1;
@@ -63,9 +67,17 @@ export const TurnIndicator = ({
               {phaseText}
             </Text>
           </Group>
-          <Button size="xs" color="red" variant="light" onClick={onEndTurn} disabled={isAiThinking}>
-            End Turn
-          </Button>
+          <Group gap="xs">
+            <Button size="xs" color="blue" variant="subtle" onClick={onSaveClick} disabled={isAiThinking}>
+              セーブ
+            </Button>
+            <Button size="xs" color="green" variant="subtle" onClick={onLoadClick} disabled={isAiThinking}>
+              ロード
+            </Button>
+            <Button size="xs" color="red" variant="light" onClick={onEndTurn} disabled={isAiThinking}>
+              End Turn
+            </Button>
+          </Group>
         </Stack>
       </Group>
     </Paper>

@@ -26,6 +26,8 @@ pub enum ActionType {
     EndTurn,
     Produce,
     Repair,
+    SaveGame,
+    LoadGame,
 }
 
 impl ActionType {
@@ -42,6 +44,8 @@ impl ActionType {
             ActionType::EndTurn => "ターン終了",
             ActionType::Produce => "生産",
             ActionType::Repair => "修復",
+            ActionType::SaveGame => "セーブ",
+            ActionType::LoadGame => "ロード",
         }
     }
 }
@@ -91,6 +95,17 @@ pub enum InGameState {
     GameOverPopup {
         message: String,
         condition: GameOverCondition,
+    },
+    SaveSelection {
+        selected_index: usize,
+        options: Vec<String>,
+        files: Vec<Option<String>>,
+    },
+    LoadSelection {
+        selected_index: usize,
+        options: Vec<String>,
+        files: Vec<Option<String>>,
+        is_title_screen: bool,
     },
 }
 
@@ -181,6 +196,17 @@ impl App {
     pub fn handle_map_selection_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::KeyCode;
 
+        if let InGameState::LoadSelection {
+            selected_index,
+            options,
+            files,
+            is_title_screen,
+        } = self.ui_state.in_game_state.clone()
+        {
+            self.handle_load_selection_key(key, selected_index, options, files, is_title_screen);
+            return;
+        }
+
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Up | KeyCode::Char('k') if self.ui_state.selected_map_index > 0 => {
@@ -231,6 +257,16 @@ impl App {
                     GridTopology::Hex => GridTopology::Square,
                 };
             }
+            // セーブデータのロード画面を表示する
+            KeyCode::Char('l') | KeyCode::Char('L') => {
+                let (options, files) = self.get_slot_status();
+                self.ui_state.in_game_state = InGameState::LoadSelection {
+                    selected_index: 0,
+                    options,
+                    files,
+                    is_title_screen: true,
+                };
+            }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 // Determine the selected map
                 let map_name = self
@@ -262,7 +298,215 @@ impl App {
         }
     }
 
+    pub fn get_slot_status(&self) -> (Vec<String>, Vec<Option<String>>) {
+        let mut options = Vec::new();
+        let mut files = Vec::new();
+        let saves_dir = std::path::Path::new("saves");
+        if !saves_dir.exists() {
+            let _ = std::fs::create_dir_all(saves_dir);
+        }
+
+        for i in 1..=5 {
+            let file_name = format!("slot_{}.sav", i);
+            let file_path = saves_dir.join(&file_name);
+            let path_str = file_path.to_string_lossy().into_owned();
+
+            if file_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&file_path) {
+                    match engine::serialize::read_save_header(&content) {
+                        Ok(header) => {
+                            options.push(format!(
+                                "スロット {} : {} (Turn {}, {})",
+                                i, header.map_name, header.turn_number, header.active_player_name
+                            ));
+                        }
+                        Err(_) => {
+                            options.push(format!("スロット {} : [破損データ]", i));
+                        }
+                    }
+                } else {
+                    options.push(format!("スロット {} : [読込失敗]", i));
+                }
+                files.push(Some(path_str));
+            } else {
+                options.push(format!("スロット {} : [空スロット]", i));
+                files.push(None);
+            }
+        }
+        (options, files)
+    }
+
+    pub fn save_game_to_file(&mut self, path: &str, map_name: &str) -> anyhow::Result<()> {
+        let world = self
+            .world
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("World not initialized"))?;
+        let save_str = engine::serialize::export_save_data(world, map_name)?;
+
+        let path_obj = std::path::Path::new(path);
+        if let Some(parent) = path_obj.parent()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, save_str)?;
+        Ok(())
+    }
+
+    pub fn load_game_from_file(&mut self, path: &str) -> anyhow::Result<()> {
+        let save_str = std::fs::read_to_string(path)?;
+        let (world, schedule) = engine::serialize::import_save_data(&save_str, &self.master_data)?;
+
+        // 読み込んだマップのトポロジーを App の UI 状態に同期する
+        if let Some(map) = world.get_resource::<engine::resources::Map>() {
+            self.ui_state.selected_topology = map.topology;
+        }
+
+        self.world = Some(world);
+        self.schedule = Some(schedule);
+        Ok(())
+    }
+
+    fn handle_save_selection_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        selected_index: usize,
+        options: Vec<String>,
+        files: Vec<Option<String>>,
+    ) {
+        use crossterm::event::KeyCode;
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') if selected_index > 0 => {
+                self.ui_state.in_game_state = InGameState::SaveSelection {
+                    selected_index: selected_index - 1,
+                    options,
+                    files,
+                };
+            }
+            KeyCode::Down | KeyCode::Char('j')
+                if selected_index < options.len().saturating_sub(1) =>
+            {
+                self.ui_state.in_game_state = InGameState::SaveSelection {
+                    selected_index: selected_index + 1,
+                    options,
+                    files,
+                };
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                let slot = selected_index + 1;
+                let path = format!("saves/slot_{}.sav", slot);
+                let map_name = self
+                    .ui_state
+                    .available_maps
+                    .get(self.ui_state.selected_map_index)
+                    .cloned()
+                    .unwrap_or_else(|| "unknown_map".to_string());
+
+                match self.save_game_to_file(&path, &map_name) {
+                    Ok(()) => {
+                        self.ui_state
+                            .add_log(format!("スロット {} にセーブしました。", slot));
+                    }
+                    Err(e) => {
+                        self.ui_state.add_log(format!("セーブ失敗: {}", e));
+                    }
+                }
+                self.ui_state.in_game_state = InGameState::Normal;
+            }
+            KeyCode::Esc | KeyCode::Char('x') => {
+                self.ui_state.in_game_state = InGameState::Normal;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_load_selection_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        selected_index: usize,
+        options: Vec<String>,
+        files: Vec<Option<String>>,
+        is_title_screen: bool,
+    ) {
+        use crossterm::event::KeyCode;
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') if selected_index > 0 => {
+                self.ui_state.in_game_state = InGameState::LoadSelection {
+                    selected_index: selected_index - 1,
+                    options,
+                    files,
+                    is_title_screen,
+                };
+            }
+            KeyCode::Down | KeyCode::Char('j')
+                if selected_index < options.len().saturating_sub(1) =>
+            {
+                self.ui_state.in_game_state = InGameState::LoadSelection {
+                    selected_index: selected_index + 1,
+                    options,
+                    files,
+                    is_title_screen,
+                };
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                if let Some(Some(path)) = files.get(selected_index) {
+                    match self.load_game_from_file(path) {
+                        Ok(()) => {
+                            self.ui_state.add_log(format!(
+                                "スロット {} からロードしました。",
+                                selected_index + 1
+                            ));
+                            self.ui_state.current_screen = CurrentScreen::InGame;
+                        }
+                        Err(e) => {
+                            self.ui_state.add_log(format!("ロード失敗: {}", e));
+                        }
+                    }
+                } else {
+                    self.ui_state
+                        .add_log("選択されたスロットは空です。".to_string());
+                }
+                self.ui_state.in_game_state = InGameState::Normal;
+            }
+            KeyCode::Esc | KeyCode::Char('x') => {
+                self.ui_state.in_game_state = InGameState::Normal;
+                if is_title_screen {
+                    self.ui_state.current_screen = CurrentScreen::MapSelection;
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn handle_in_game_key(&mut self, key: crossterm::event::KeyEvent) {
+        // セーブ/ロードメニューが開いている場合はそちらのキー処理に流す
+        match self.ui_state.in_game_state.clone() {
+            InGameState::SaveSelection {
+                selected_index,
+                options,
+                files,
+            } => {
+                self.handle_save_selection_key(key, selected_index, options, files);
+                return;
+            }
+            InGameState::LoadSelection {
+                selected_index,
+                options,
+                files,
+                is_title_screen,
+            } => {
+                self.handle_load_selection_key(
+                    key,
+                    selected_index,
+                    options,
+                    files,
+                    is_title_screen,
+                );
+                return;
+            }
+            _ => {}
+        }
+
         // AIターンの場合は一部のキー（終了など）以外は無視する
         if let Some(world) = &self.world
             && let Some(match_state) = world.get_resource::<MatchState>()
@@ -338,6 +582,9 @@ impl App {
                 self.ui_state.in_game_state = InGameState::Normal;
             }
             InGameState::GameOverPopup { .. } => self.return_to_map_selection(),
+            InGameState::SaveSelection { .. } | InGameState::LoadSelection { .. } => {
+                self.ui_state.in_game_state = InGameState::Normal;
+            }
             InGameState::Normal | InGameState::WaitAiAction => {}
         }
     }
@@ -496,10 +743,16 @@ impl App {
                 self.ui_state.in_game_state = InGameState::Normal;
             }
             InGameState::GameOverPopup { .. } => self.return_to_map_selection(),
+            InGameState::SaveSelection { .. } | InGameState::LoadSelection { .. } => {}
         }
     }
     fn handle_normal_confirm(&mut self) {
-        let mut options = vec![ActionType::EndTurn, ActionType::Cancel];
+        let mut options = vec![
+            ActionType::EndTurn,
+            ActionType::SaveGame,
+            ActionType::LoadGame,
+            ActionType::Cancel,
+        ];
         let mut selected_unit = None;
 
         if let Some(world) = &mut self.world {
@@ -666,6 +919,23 @@ impl App {
                 if let Some(world) = &mut self.world {
                     world.send_event(engine::events::NextPhaseCommand);
                 }
+            }
+            ActionType::SaveGame => {
+                let (options, files) = self.get_slot_status();
+                self.ui_state.in_game_state = InGameState::SaveSelection {
+                    selected_index: 0,
+                    options,
+                    files,
+                };
+            }
+            ActionType::LoadGame => {
+                let (options, files) = self.get_slot_status();
+                self.ui_state.in_game_state = InGameState::LoadSelection {
+                    selected_index: 0,
+                    options,
+                    files,
+                    is_title_screen: false,
+                };
             }
             ActionType::Produce => {
                 let mut options = Vec::new();
