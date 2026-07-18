@@ -201,9 +201,15 @@ impl App {
             options,
             files,
             is_title_screen,
-        } = self.ui_state.in_game_state.clone()
+        } = &self.ui_state.in_game_state
         {
-            self.handle_load_selection_key(key, selected_index, options, files, is_title_screen);
+            self.handle_load_selection_key(
+                key,
+                *selected_index,
+                options.clone(),
+                files.clone(),
+                *is_title_screen,
+            );
             return;
         }
 
@@ -480,12 +486,15 @@ impl App {
 
     pub fn handle_in_game_key(&mut self, key: crossterm::event::KeyEvent) {
         // セーブ/ロードメニューが開いている場合はそちらのキー処理に流す
-        match self.ui_state.in_game_state.clone() {
+        match &self.ui_state.in_game_state {
             InGameState::SaveSelection {
                 selected_index,
                 options,
                 files,
             } => {
+                let selected_index = *selected_index;
+                let options = options.clone();
+                let files = files.clone();
                 self.handle_save_selection_key(key, selected_index, options, files);
                 return;
             }
@@ -495,6 +504,10 @@ impl App {
                 files,
                 is_title_screen,
             } => {
+                let selected_index = *selected_index;
+                let options = options.clone();
+                let files = files.clone();
+                let is_title_screen = *is_title_screen;
                 self.handle_load_selection_key(
                     key,
                     selected_index,

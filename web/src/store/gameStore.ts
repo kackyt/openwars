@@ -628,6 +628,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       await get().syncGameState();
     } catch (e) {
       console.error("initAndLoadSaveString failed:", e);
+      throw e;
     }
   },
 
@@ -639,6 +640,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       localStorage.setItem(`openwars_save_slot_${slotIndex}`, saveStr);
     } catch (e) {
       console.error("Save game failed:", e);
+      throw e;
     }
   },
 
