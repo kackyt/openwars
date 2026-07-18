@@ -1,11 +1,11 @@
 ---
 title: "PLAYBOOK"
-version: "1.5.0"
+version: "1.6.0"
 status: "approved"
 created: "2026-06-06"
-updated: "2026-07-16"
+updated: "2026-07-18"
 owner: "@t_kak"
-ace_entry_count: 12
+ace_entry_count: 15
 tags: [ace, playbook, knowledge-management]
 references:
   - docs/ACE_FRAMEWORK.md
@@ -406,6 +406,63 @@ Playbook が 800 行を超えた場合、以下のように分割する：
 **Context**: PR #63 のコードレビューにおいて、WasmEngine バインディング層で単一の要素を一時的な Vec に包んで渡していた箇所が指摘された。これを `std::slice::from_ref` による参照のスライス化、および `MasterDataRegistry` などの巨大な読み取り専用データを参照渡し (`&MasterDataRegistry`) に変更することで、アロケーション回数を劇的に削減した。
 
 **Action**: WASM バインディング層やゲームループの Hot path で単一要素をスライス（`&[T]`）として要求する関数に渡す場合は、`vec![x]` や配列アロケーションを避け、`std::slice::from_ref(&x)` を使用してスタック上の参照からスライスを作成する。また、読み取り専用のマスターデータ等は値コピーを避け、必ず参照で引き回す。
+
+<a id="ace-64-1"></a>
+
+### ACE-64-1: セーブ・ロードにおける空の輸送コンポーネント復元漏れバグの防止
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | architecture |
+| Origin     | PR #64 |
+| Date       | 2026-07-18 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: セーブデータから ECS コンポーネントを復元する際、「現在中身が空（例：積載数ゼロ）」という理由でコンポーネント（`CargoCapacity` など）の生成・アタッチをスキップすると、ロード後にそのユニットの本来の機能（積載機能など）が失われる。
+
+**Context**: 輸送ユニットの積載リストが空（`loaded_ids: []`）の場合に `CargoCapacity` を復元しなかったため、ロード後にユニットが「積載容量ゼロ」と判定され、新規積載ができなくなるバグが発生した。
+
+**Action**: 復元ロジックでは、リストが空であっても統計情報（`max_cargo > 0`）からその機能を持つべきと判定できる場合は、必ず空のコンポーネントを初期化してアタッチする。また、テストコードには「空の状態で保存→ロードされた後に本来の機能が正常動作するか」の検証を含める。
+
+<a id="ace-64-2"></a>
+
+### ACE-64-2: コアゲームエンジンにおける anyhow 依存排除と thiserror による型安全なエラー境界
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | architecture |
+| Origin     | PR #64 |
+| Date       | 2026-07-18 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: コアエンジン層（ドメインやシリアライズ等のインフラに近いレイヤー）のパブリックAPIで `anyhow` を使用すると、上位層（Tauri/WASMバインディングやGUI/CLI）がエラー原因（署名不一致、フォーマット不正など）を型安全に識別・処理することが不可能になり、エラーの隠蔽や UI でのフォールバック失敗を招く。
+
+**Context**: `engine` クレートがセーブデータのインポート処理などで `anyhow::Result` を返していたため、呼び出し側の React (WASM経由) や CLI がロード失敗の詳細原因を区別できず、一律で UI モーダルを閉じる等の不適切なハンドリングが起きていた。
+
+**Action**: コア層・インフラ層では `thiserror` を用いて詳細なカスタムエラー型（例：`SaveError`）を定義し、呼び出し側がエラーバリアントを識別できるようにする。UIやバインディング層などの「エラーの境界」においてのみ、表示用メッセージへの変換や `anyhow` への集約を行う。
+
+<a id="ace-64-3"></a>
+
+### ACE-64-3: useCallback を用いた React ライフサイクル関数の安定化とリンター警告解消
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | tooling |
+| Origin     | PR #64 |
+| Date       | 2026-07-18 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: React の `useEffect` 内でストア操作やリフレッシュ用のコールバック関数を呼び出す際、依存配列にその関数を含めないと Biome 等のリンターで `useExhaustiveDependencies` 警告（エラー）が発生し、状態の同期バグを誘発する。
+
+**Context**: `SaveLoadModal` の `useEffect` 内で、スロットの更新処理 `refreshSlots` を呼んでいたが、依存配列に含まれていなかったため Biome リンターによるビルドエラーが発生した。
+
+**Action**: `useEffect` から参照される外部関数は、親コンポーネント側で `useCallback` を用いてメモ化（参照を安定化）した上で、効果の依存配列（dependency array）に明示的に含める。
 
 ## Changelog
 
