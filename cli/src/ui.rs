@@ -97,6 +97,52 @@ fn draw_map_selection(f: &mut Frame, app: &mut App) {
     );
     let footer = Paragraph::new(footer_text).block(Block::default().borders(Borders::ALL));
     f.render_widget(footer, chunks[2]);
+
+    // ロード画面オーバーレイ
+    if let crate::app::InGameState::LoadSelection {
+        options,
+        selected_index,
+        ..
+    } = &app.ui_state.in_game_state
+    {
+        let menu_items: Vec<ListItem> = options
+            .iter()
+            .enumerate()
+            .map(|(i, opt)| {
+                let style = if i == *selected_index {
+                    Style::default()
+                        .bg(Color::White)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Span::styled(format!(" {} ", opt), style))
+            })
+            .collect();
+
+        // 画面中央にロード画面を描画する
+        let area = f.size();
+        let menu_width = 60u16;
+        let menu_height = (options.len() as u16) + 2;
+        let menu_x = area.width.saturating_sub(menu_width) / 2;
+        let menu_y = area.height.saturating_sub(menu_height) / 2;
+
+        let menu_rect = ratatui::layout::Rect {
+            x: menu_x,
+            y: menu_y,
+            width: menu_width.min(area.width),
+            height: menu_height.min(area.height),
+        };
+
+        f.render_widget(ratatui::widgets::Clear, menu_rect);
+        let menu_list = List::new(menu_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" ロードスロット選択 (Esc:キャンセル) "),
+        );
+        f.render_widget(menu_list, menu_rect);
+    }
 }
 
 fn draw_in_game(f: &mut Frame, app: &mut App) {
@@ -357,6 +403,28 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                 "どこに降ろしますか？".to_string(),
                 vec!["[カーソルで対象を選択]".to_string()],
                 0,
+            ));
+        }
+        crate::app::InGameState::SaveSelection {
+            options,
+            selected_index,
+            ..
+        } => {
+            menu_data = Some((
+                "セーブスロット選択".to_string(),
+                options.clone(),
+                *selected_index,
+            ));
+        }
+        crate::app::InGameState::LoadSelection {
+            options,
+            selected_index,
+            ..
+        } => {
+            menu_data = Some((
+                "ロードスロット選択".to_string(),
+                options.clone(),
+                *selected_index,
             ));
         }
         _ => {}

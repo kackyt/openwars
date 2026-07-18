@@ -236,6 +236,7 @@ pub fn produce_unit_system(
         player.funds -= stats.cost;
 
         let spawn_cmd = commands.spawn((
+            UnitId(uuid::Uuid::new_v4()),
             GridPosition {
                 x: event.target_x,
                 y: event.target_y,

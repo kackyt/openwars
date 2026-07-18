@@ -259,6 +259,22 @@ export class EngineWorker {
     const jsonStr = this.engine.check_game_over();
     return JSON.parse(jsonStr as string);
   }
+
+  /**
+   * ゲームデータをエクスポートします。
+   */
+  async exportSaveData(mapName: string): Promise<string> {
+    if (!this.engine) throw new Error("Engine not initialized");
+    return this.engine.export_save_data(mapName);
+  }
+
+  /**
+   * ゲームデータをインポートします。
+   */
+  async importSaveData(saveStr: string): Promise<void> {
+    if (!this.engine) throw new Error("Engine not initialized");
+    this.engine.import_save_data(saveStr);
+  }
 }
 
 Comlink.expose(EngineWorker);

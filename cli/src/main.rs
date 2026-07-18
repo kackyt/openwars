@@ -23,8 +23,31 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     #[cfg(not(feature = "ai-debug"))]
     {
+        let args: Vec<String> = std::env::args().collect();
+        let mut load_path = None;
+        for i in 0..args.len() {
+            if args[i] == "--load" && i + 1 < args.len() {
+                load_path = Some(args[i + 1].clone());
+            }
+        }
+
         // 1. アプリケーション状態の初期化
         let mut app = App::new()?;
+
+        if let Some(path) = load_path {
+            match app.load_game_from_file(&path) {
+                Ok(()) => {
+                    app.ui_state.current_screen = app::CurrentScreen::InGame;
+                    app.ui_state.in_game_state = app::InGameState::Normal;
+                    app.ui_state.cursor_pos = (0, 0);
+                    app.ui_state
+                        .add_log(format!("ファイル {} から局面をロードしました。", path));
+                }
+                Err(e) => {
+                    app.ui_state.add_log(format!("ロード失敗: {}", e));
+                }
+            }
+        }
 
         // 2. ターミナルのセットアップ
         enable_raw_mode()?;
@@ -65,7 +88,29 @@ fn run_ai_debug() -> Result<(), Box<dyn Error>> {
     use std::io::{self, BufRead};
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    let args: Vec<String> = std::env::args().collect();
+    let mut load_path = None;
+    for i in 0..args.len() {
+        if args[i] == "--load" && i + 1 < args.len() {
+            load_path = Some(args[i + 1].clone());
+        }
+    }
+
     let mut app = App::new()?;
+
+    if let Some(path) = load_path {
+        if let Err(e) = app.load_game_from_file(&path) {
+            println!(
+                "Warning: failed to load save file ({}). Starting normally.",
+                e
+            );
+        } else {
+            app.ui_state.current_screen = app::CurrentScreen::InGame;
+            app.ui_state.in_game_state = app::InGameState::Normal;
+            app.ui_state.cursor_pos = (0, 0);
+        }
+    }
+
     let backend = TestBackend::new(120, 30);
     let mut terminal = Terminal::new(backend)?;
 

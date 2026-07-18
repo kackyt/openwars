@@ -166,6 +166,22 @@ export interface GameState {
   endTurn: () => Promise<void>;
   recentlyDestroyedUnitIds: string[];
   clearRecentlyDestroyedUnits: () => void;
+
+  // セーブ・ロード機能
+  initAndLoadSaveString: (saveStr: string) => Promise<void>;
+  saveGame: (slotIndex: number) => Promise<void>;
+  loadGame: (slotIndex: number) => Promise<void>;
+  downloadSaveData: () => Promise<void>;
+  uploadSaveData: (file: File) => Promise<void>;
+  getSlotStatus: () => Promise<
+    {
+      slotIndex: number;
+      hasData: boolean;
+      mapName?: string;
+      turn?: number;
+      activePlayer?: string;
+    }[]
+  >;
 }
 
 export const useGameStore = create<GameState>((set, get) => ({
@@ -570,4 +586,165 @@ export const useGameStore = create<GameState>((set, get) => ({
       set({ interactionState: "idle" });
     }
   },
+
+  initAndLoadSaveString: async (saveStr: string) => {
+    try {
+      const worker = new Worker(new URL("../worker/engineWorker.ts", import.meta.url), {
+        type: "module",
+      });
+      const engineClass = Comlink.wrap<typeof EngineWorker>(worker);
+      const engineWorker = await new engineClass();
+
+      // Wasmエンジン側で初期化を行ってからインポート
+      await engineWorker.init("map_1", "square");
+      await engineWorker.importSaveData(saveStr);
+
+      let topology: "square" | "hex" = "square";
+      const parts = saveStr.split(".");
+      if (parts.length === 3 && parts[0] === "OPWS1") {
+        const decoded = JSON.parse(
+          new TextDecoder().decode(
+            new Uint8Array(
+              atob(parts[1])
+                .split("")
+                .map((c) => c.charCodeAt(0)),
+            ),
+          ),
+        );
+        if (decoded.map_topology === "Hex") {
+          topology = "hex";
+        }
+      }
+
+      set({
+        engineWorker,
+        isEngineReady: true,
+        appState: "playing",
+        topology,
+        p1IsAi: false,
+        p2IsAi: true,
+      });
+
+      await get().syncGameState();
+    } catch (e) {
+      console.error("initAndLoadSaveString failed:", e);
+      throw e;
+    }
+  },
+
+  saveGame: async (slotIndex: number) => {
+    const { engineWorker } = get();
+    if (!engineWorker) return;
+    try {
+      const saveStr = await engineWorker.exportSaveData("OpenWarsMap");
+      localStorage.setItem(`openwars_save_slot_${slotIndex}`, saveStr);
+    } catch (e) {
+      console.error("Save game failed:", e);
+      throw e;
+    }
+  },
+
+  loadGame: async (slotIndex: number) => {
+    const { engineWorker } = get();
+    try {
+      const saveStr = localStorage.getItem(`openwars_save_slot_${slotIndex}`);
+      if (!saveStr) throw new Error("指定されたスロットにセーブデータがありません。");
+      if (engineWorker) {
+        await engineWorker.importSaveData(saveStr);
+        await get().syncGameState();
+      } else {
+        await get().initAndLoadSaveString(saveStr);
+      }
+    } catch (e) {
+      console.error("Load game failed:", e);
+      throw e;
+    }
+  },
+
+  downloadSaveData: async () => {
+    const { engineWorker } = get();
+    if (!engineWorker) return;
+    try {
+      const saveStr = await engineWorker.exportSaveData("OpenWarsMap");
+      const blob = new Blob([saveStr], { type: "text/plain" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "openwars_save.sav";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error("Download save data failed:", e);
+    }
+  },
+
+  uploadSaveData: async (file: File) => {
+    const { engineWorker } = get();
+    try {
+      const saveStr = await file.text();
+      if (engineWorker) {
+        await engineWorker.importSaveData(saveStr);
+        await get().syncGameState();
+      } else {
+        await get().initAndLoadSaveString(saveStr);
+      }
+    } catch (e) {
+      console.error("Upload save data failed:", e);
+      throw e;
+    }
+  },
+
+  getSlotStatus: async () => {
+    const statusList = [];
+    for (let i = 1; i <= 5; i++) {
+      const saveStr = localStorage.getItem(`openwars_save_slot_${i}`);
+      if (saveStr) {
+        const header = parseSaveHeader(saveStr);
+        if (header) {
+          statusList.push({
+            slotIndex: i,
+            hasData: true,
+            mapName: header.mapName,
+            turn: header.turn,
+            activePlayer: header.activePlayer,
+          });
+          continue;
+        }
+      }
+      statusList.push({ slotIndex: i, hasData: false });
+    }
+    return statusList;
+  },
 }));
+
+interface SaveHeader {
+  mapName: string;
+  turn: number;
+  activePlayer: string;
+}
+
+function parseSaveHeader(saveStr: string): SaveHeader | null {
+  try {
+    const parts = saveStr.split(".");
+    if (parts.length !== 3 || parts[0] !== "OPWS1") return null;
+    const base64Data = parts[1];
+    const binary = atob(base64Data);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    const jsonStr = new TextDecoder().decode(bytes);
+    const val = JSON.parse(jsonStr);
+
+    const mapName = val.map_name || "不明";
+    const turn = val.match_state?.current_turn_number || 0;
+    const activeIdx = val.match_state?.active_player_index || 0;
+    const activePlayer = val.players?.[activeIdx]?.name || "不明";
+
+    return { mapName, turn, activePlayer };
+  } catch {
+    return null;
+  }
+}

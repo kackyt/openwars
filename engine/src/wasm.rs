@@ -871,4 +871,24 @@ impl WasmEngine {
         crate::setup::update_all_events(&mut self.world);
         JsValue::from_str("{}")
     }
+
+    /// セーブデータを文字列としてエクスポートします。
+    pub fn export_save_data(&mut self, map_name: &str) -> Result<String, JsValue> {
+        crate::serialize::export_save_data(&mut self.world, map_name)
+            .map_err(|e| JsValue::from_str(&format!("セーブデータの書き出しに失敗しました: {}", e)))
+    }
+
+    /// セーブデータ文字列からワールドをロードします。
+    pub fn import_save_data(&mut self, save_str: &str) -> Result<(), JsValue> {
+        let master_data = MasterDataRegistry::load().map_err(|e| {
+            JsValue::from_str(&format!("マスターデータの読み込みに失敗しました: {:?}", e))
+        })?;
+        let (world, schedule) = crate::serialize::import_save_data(save_str, &master_data)
+            .map_err(|e| {
+                JsValue::from_str(&format!("セーブデータの読み込みに失敗しました: {}", e))
+            })?;
+        self.world = world;
+        self.schedule = schedule;
+        Ok(())
+    }
 }

@@ -2,6 +2,7 @@ import { Button, Container, Group, Paper, Select, Stack, Title } from "@mantine/
 import { useState } from "react";
 import { MAIN_MENU_MARGIN_TOP } from "../../../constants/rendering";
 import { useGameStore } from "../../../store/gameStore";
+import { SaveLoadModal } from "../SaveLoadModal";
 
 /**
  * メインメニューコンポーネント
@@ -16,6 +17,7 @@ export const MainMenu = () => {
   const [p1Type, setP1Type] = useState("player");
   const [p2Type, setP2Type] = useState("ai");
   const [isLoading, setIsLoading] = useState(false);
+  const [loadOpened, setLoadOpened] = useState(false);
 
   /** ゲームを開始する */
   const handleStart = async () => {
@@ -66,13 +68,19 @@ export const MainMenu = () => {
                 { value: "ai", label: "AI" },
               ]}
               value={p2Type}
-              onChange={(val) => setP2Type(val || "ai")}
+              onChange={(val) => setP2Type(val || "player")}
             />
           </Group>
 
           <Button size="lg" mt="md" onClick={handleStart} loading={isLoading}>
             Start Game
           </Button>
+
+          <Button size="lg" variant="outline" color="green" onClick={() => setLoadOpened(true)}>
+            Load Game
+          </Button>
+
+          <SaveLoadModal opened={loadOpened} onClose={() => setLoadOpened(false)} mode="load" />
         </Stack>
       </Paper>
     </Container>
