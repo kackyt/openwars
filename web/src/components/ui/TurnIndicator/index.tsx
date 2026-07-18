@@ -68,13 +68,31 @@ export const TurnIndicator = ({
             </Text>
           </Group>
           <Group gap="xs">
-            <Button size="xs" color="blue" variant="subtle" onClick={onSaveClick} disabled={isAiThinking}>
+            <Button
+              size="xs"
+              color="blue"
+              variant="subtle"
+              onClick={onSaveClick}
+              disabled={isAiThinking}
+            >
               セーブ
             </Button>
-            <Button size="xs" color="green" variant="subtle" onClick={onLoadClick} disabled={isAiThinking}>
+            <Button
+              size="xs"
+              color="green"
+              variant="subtle"
+              onClick={onLoadClick}
+              disabled={isAiThinking}
+            >
               ロード
             </Button>
-            <Button size="xs" color="red" variant="light" onClick={onEndTurn} disabled={isAiThinking}>
+            <Button
+              size="xs"
+              color="red"
+              variant="light"
+              onClick={onEndTurn}
+              disabled={isAiThinking}
+            >
               End Turn
             </Button>
           </Group>

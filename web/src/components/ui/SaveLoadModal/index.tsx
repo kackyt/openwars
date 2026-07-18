@@ -9,7 +9,7 @@ import {
   Text,
   Title,
 } from "@mantine/core";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useGameStore } from "../../../store/gameStore";
 
 interface SaveLoadModalProps {
@@ -36,48 +36,60 @@ export const SaveLoadModal = ({ opened, onClose, mode }: SaveLoadModalProps) => 
   const [slots, setSlots] = useState<SlotInfo[]>([]);
   const [loadingSlot, setLoadingSlot] = useState<number | null>(null);
   const [loadingFile, setLoadingFile] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   // モーダルが開かれたらスロット状態をリフレッシュする
-  const refreshSlots = async () => {
+  const refreshSlots = useCallback(async () => {
     const status = await getSlotStatus();
     setSlots(status);
-  };
+  }, [getSlotStatus]);
 
   useEffect(() => {
     if (opened) {
+      setError(null); // モーダルを開いたときはエラーをクリア
       refreshSlots();
     }
-  }, [opened]);
+  }, [opened, refreshSlots]);
 
   const handleSlotAction = async (slotIndex: number) => {
     setLoadingSlot(slotIndex);
-    if (mode === "save") {
-      await saveGame(slotIndex);
-    } else {
-      await loadGame(slotIndex);
-      onClose(); // ロード成功時は閉じる
+    setError(null);
+    try {
+      if (mode === "save") {
+        await saveGame(slotIndex);
+        await refreshSlots();
+      } else {
+        await loadGame(slotIndex);
+        onClose(); // ロード成功時は閉じる
+      }
+    } catch (e) {
+      console.error(e);
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoadingSlot(null);
     }
-    await refreshSlots();
-    setLoadingSlot(null);
   };
 
   const handleFileUpload = async (file: File | null) => {
     if (!file) return;
     setLoadingFile(true);
-    await uploadSaveData(file);
-    setLoadingFile(false);
-    onClose();
+    setError(null);
+    try {
+      await uploadSaveData(file);
+      onClose(); // ロード成功時は閉じる
+    } catch (e) {
+      console.error(e);
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoadingFile(false);
+    }
   };
 
   return (
     <Modal
       opened={opened}
       onClose={onClose}
-      title={
-        <Title order={3}>
-          {mode === "save" ? "ゲームのセーブ" : "ゲームのロード"}
-        </Title>
-      }
+      title={<Title order={3}>{mode === "save" ? "ゲームのセーブ" : "ゲームのロード"}</Title>}
       centered
       size="md"
     >
@@ -87,6 +99,19 @@ export const SaveLoadModal = ({ opened, onClose, mode }: SaveLoadModalProps) => 
             ? "保存先のスロットを選択してください。既存データは上書きされます。"
             : "ロード元のスロットを選択してください。"}
         </Text>
+
+        {error && (
+          <Paper
+            withBorder
+            p="xs"
+            bg="red.0"
+            style={{ borderColor: "var(--mantine-color-red-filled)" }}
+          >
+            <Text size="xs" c="red" fw={700}>
+              {error}
+            </Text>
+          </Paper>
+        )}
 
         <Stack gap="xs">
           {slots.map((slot) => (
@@ -125,28 +150,13 @@ export const SaveLoadModal = ({ opened, onClose, mode }: SaveLoadModalProps) => 
         <Divider my="xs" label="ファイルの入出力" labelPosition="center" />
 
         {mode === "save" ? (
-          <Button
-            variant="outline"
-            fullWidth
-            color="blue"
-            onClick={downloadSaveData}
-          >
+          <Button variant="outline" fullWidth color="blue" onClick={downloadSaveData}>
             セーブデータファイル (.sav) をダウンロード
           </Button>
         ) : (
-          <FileButton
-            onChange={handleFileUpload}
-            accept=".sav"
-            disabled={loadingFile}
-          >
+          <FileButton onChange={handleFileUpload} accept=".sav" disabled={loadingFile}>
             {(props) => (
-              <Button
-                {...props}
-                variant="outline"
-                fullWidth
-                color="green"
-                loading={loadingFile}
-              >
+              <Button {...props} variant="outline" fullWidth color="green" loading={loadingFile}>
                 セーブデータファイル (.sav) からロード
               </Button>
             )}

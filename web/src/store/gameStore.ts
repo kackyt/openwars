@@ -173,7 +173,15 @@ export interface GameState {
   loadGame: (slotIndex: number) => Promise<void>;
   downloadSaveData: () => Promise<void>;
   uploadSaveData: (file: File) => Promise<void>;
-  getSlotStatus: () => Promise<{ slotIndex: number; hasData: boolean; mapName?: string; turn?: number; activePlayer?: string }[]>;
+  getSlotStatus: () => Promise<
+    {
+      slotIndex: number;
+      hasData: boolean;
+      mapName?: string;
+      turn?: number;
+      activePlayer?: string;
+    }[]
+  >;
 }
 
 export const useGameStore = create<GameState>((set, get) => ({
@@ -586,7 +594,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       });
       const engineClass = Comlink.wrap<typeof EngineWorker>(worker);
       const engineWorker = await new engineClass();
-      
+
       // Wasmエンジン側で初期化を行ってからインポート
       await engineWorker.init("map_1", "square");
       await engineWorker.importSaveData(saveStr);
@@ -596,8 +604,12 @@ export const useGameStore = create<GameState>((set, get) => ({
       if (parts.length === 3 && parts[0] === "OPWS1") {
         const decoded = JSON.parse(
           new TextDecoder().decode(
-            new Uint8Array(atob(parts[1]).split("").map((c) => c.charCodeAt(0)))
-          )
+            new Uint8Array(
+              atob(parts[1])
+                .split("")
+                .map((c) => c.charCodeAt(0)),
+            ),
+          ),
         );
         if (decoded.map_topology === "Hex") {
           topology = "hex";
@@ -634,7 +646,7 @@ export const useGameStore = create<GameState>((set, get) => ({
     const { engineWorker } = get();
     try {
       const saveStr = localStorage.getItem(`openwars_save_slot_${slotIndex}`);
-      if (!saveStr) throw new Error("No save data in this slot");
+      if (!saveStr) throw new Error("指定されたスロットにセーブデータがありません。");
       if (engineWorker) {
         await engineWorker.importSaveData(saveStr);
         await get().syncGameState();
@@ -643,6 +655,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       }
     } catch (e) {
       console.error("Load game failed:", e);
+      throw e;
     }
   },
 
@@ -677,6 +690,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       }
     } catch (e) {
       console.error("Upload save data failed:", e);
+      throw e;
     }
   },
 
@@ -728,7 +742,7 @@ function parseSaveHeader(saveStr: string): SaveHeader | null {
     const activePlayer = val.players?.[activeIdx]?.name || "不明";
 
     return { mapName, turn, activePlayer };
-  } catch (e) {
+  } catch {
     return null;
   }
 }

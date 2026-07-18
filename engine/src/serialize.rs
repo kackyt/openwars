@@ -8,6 +8,32 @@ use std::collections::{HashMap, HashSet};
 
 type HmacSha256 = Hmac<Sha256>;
 
+#[derive(Debug, thiserror::Error)]
+pub enum SaveError {
+    #[error("形式不正: {0}")]
+    InvalidFormat(String),
+
+    #[error("Base64デコード失敗: {0}")]
+    Base64DecodeError(#[from] base64::DecodeError),
+
+    #[error("JSONデコード失敗: {0}")]
+    JsonError(#[from] serde_json::Error),
+
+    #[error(
+        "署名検証失敗: 署名が一致しません。データが破損しているか、改ざんされた可能性があります。"
+    )]
+    SignatureMismatch,
+
+    #[error("マスターデータ不整合: {0}")]
+    MasterDataMismatch(String),
+
+    #[error("リソースが見つかりません: {0}")]
+    ResourceNotFound(String),
+
+    #[error("HMAC初期化失敗: {0}")]
+    HmacInitError(String),
+}
+
 fn get_hmac_key() -> &'static [u8] {
     option_env!("OPENWARS_HMAC_KEY")
         .map(|k| k.as_bytes())
@@ -104,19 +130,19 @@ pub struct SaveState {
 }
 
 /// ワールドの状態を HMAC 署名付きの Base64 文字列（OPWS1.base64.signature）にエクスポートします。
-pub fn export_save_data(world: &mut World, map_name: &str) -> anyhow::Result<String> {
+pub fn export_save_data(world: &mut World, map_name: &str) -> Result<String, SaveError> {
     // 1. 各リソースからのデータ退避（借用の競合を避けるためブロック内でコピー/クローン）
     let (map_width, map_height, map_tiles, map_topology) = {
         let map = world
             .get_resource::<Map>()
-            .ok_or_else(|| anyhow::anyhow!("Map resource not found"))?;
+            .ok_or_else(|| SaveError::ResourceNotFound("Map".to_string()))?;
         (map.width, map.height, map.tiles.clone(), map.topology)
     };
 
     let match_state = {
         let match_state_res = world
             .get_resource::<MatchState>()
-            .ok_or_else(|| anyhow::anyhow!("MatchState resource not found"))?;
+            .ok_or_else(|| SaveError::ResourceNotFound("MatchState".to_string()))?;
         MatchStateSave {
             current_turn_number: match_state_res.current_turn_number.0,
             active_player_index: match_state_res.active_player_index.0,
@@ -134,7 +160,7 @@ pub fn export_save_data(world: &mut World, map_name: &str) -> anyhow::Result<Str
     let players = {
         let players_res = world
             .get_resource::<Players>()
-            .ok_or_else(|| anyhow::anyhow!("Players resource not found"))?;
+            .ok_or_else(|| SaveError::ResourceNotFound("Players".to_string()))?;
         players_res
             .0
             .iter()
@@ -149,14 +175,14 @@ pub fn export_save_data(world: &mut World, map_name: &str) -> anyhow::Result<Str
     let rng_seed = {
         let rng_res = world
             .get_resource::<GameRng>()
-            .ok_or_else(|| anyhow::anyhow!("GameRng resource not found"))?;
+            .ok_or_else(|| SaveError::ResourceNotFound("GameRng".to_string()))?;
         rng_res.seed
     };
 
     let combat_ledger = {
         let combat_ledger_res = world
             .get_resource::<CombatLedger>()
-            .ok_or_else(|| anyhow::anyhow!("CombatLedger resource not found"))?;
+            .ok_or_else(|| SaveError::ResourceNotFound("CombatLedger".to_string()))?;
         let records = combat_ledger_res
             .records
             .iter()
@@ -298,7 +324,7 @@ pub fn export_save_data(world: &mut World, map_name: &str) -> anyhow::Result<Str
 
     // 4. HMAC 署名の計算
     let mut mac = HmacSha256::new_from_slice(get_hmac_key())
-        .map_err(|e| anyhow::anyhow!("HMAC key initialization failed: {}", e))?;
+        .map_err(|e| SaveError::HmacInitError(e.to_string()))?;
     mac.update(base64_data.as_bytes());
     let result = mac.finalize();
     let signature = BASE64_STANDARD.encode(result.into_bytes());
@@ -311,11 +337,11 @@ pub fn export_save_data(world: &mut World, map_name: &str) -> anyhow::Result<Str
 pub fn import_save_data(
     save_str: &str,
     master_data: &MasterDataRegistry,
-) -> anyhow::Result<(World, Schedule)> {
+) -> Result<(World, Schedule), SaveError> {
     let parts: Vec<&str> = save_str.split('.').collect();
     if parts.len() != 3 {
-        return Err(anyhow::anyhow!(
-            "Invalid save data format. Expected 3 segments separated by dots."
+        return Err(SaveError::InvalidFormat(
+            "Expected 3 segments separated by dots.".to_string(),
         ));
     }
 
@@ -324,31 +350,28 @@ pub fn import_save_data(
     let signature_str = parts[2];
 
     if header != "OPWS1" {
-        return Err(anyhow::anyhow!(
+        return Err(SaveError::InvalidFormat(format!(
             "Unsupported save data version or header: {}",
             header
-        ));
+        )));
     }
 
     // 1. 署名検証
     let mut mac = HmacSha256::new_from_slice(get_hmac_key())
-        .map_err(|e| anyhow::anyhow!("HMAC key initialization failed: {}", e))?;
+        .map_err(|e| SaveError::HmacInitError(e.to_string()))?;
     mac.update(base64_data.as_bytes());
 
     let decoded_signature = BASE64_STANDARD
         .decode(signature_str.as_bytes())
-        .map_err(|e| anyhow::anyhow!("Base64 decode failed for signature: {}", e))?;
+        .map_err(SaveError::Base64DecodeError)?;
 
-    mac.verify_slice(&decoded_signature).map_err(|_| {
-        anyhow::anyhow!(
-            "Save data verification failed: signature mismatch (data may be corrupted or modified)."
-        )
-    })?;
+    mac.verify_slice(&decoded_signature)
+        .map_err(|_| SaveError::SignatureMismatch)?;
 
     // 2. Base64 デコードと JSON デシリアライズ
     let decoded_json_bytes = BASE64_STANDARD
         .decode(base64_data.as_bytes())
-        .map_err(|e| anyhow::anyhow!("Base64 decode failed for save data: {}", e))?;
+        .map_err(SaveError::Base64DecodeError)?;
     let save_state: SaveState = serde_json::from_slice(&decoded_json_bytes)?;
 
     // 3. World と Schedule の構築
@@ -359,17 +382,19 @@ pub fn import_save_data(
     for (unit_name, unit_record) in &master_data.units {
         let att_type = master_data
             .unit_type_for_name(&unit_name.0)
-            .map_err(|e| anyhow::anyhow!("Unit type not found: {:?}", e))?;
+            .map_err(|e| SaveError::MasterDataMismatch(format!("Unit type not found: {:?}", e)))?;
 
         if let Some(w1_name) = &unit_record.weapon1 {
             let weapon = master_data
                 .weapons
                 .get(&crate::resources::master_data::UnitName(w1_name.clone()))
-                .ok_or_else(|| anyhow::anyhow!("Weapon not found: {}", w1_name))?;
+                .ok_or_else(|| {
+                    SaveError::MasterDataMismatch(format!("Weapon not found: {}", w1_name))
+                })?;
             for (def_name, dmg) in &weapon.damages {
-                let def_type = master_data
-                    .unit_type_for_name(def_name)
-                    .map_err(|e| anyhow::anyhow!("Unit type not found: {:?}", e))?;
+                let def_type = master_data.unit_type_for_name(def_name).map_err(|e| {
+                    SaveError::MasterDataMismatch(format!("Unit type not found: {:?}", e))
+                })?;
                 damage_chart.insert_damage(att_type, def_type, *dmg);
             }
         }
@@ -377,11 +402,13 @@ pub fn import_save_data(
             let weapon = master_data
                 .weapons
                 .get(&crate::resources::master_data::UnitName(w2_name.clone()))
-                .ok_or_else(|| anyhow::anyhow!("Weapon not found: {}", w2_name))?;
+                .ok_or_else(|| {
+                    SaveError::MasterDataMismatch(format!("Weapon not found: {}", w2_name))
+                })?;
             for (def_name, dmg) in &weapon.damages {
-                let def_type = master_data
-                    .unit_type_for_name(def_name)
-                    .map_err(|e| anyhow::anyhow!("Unit type not found: {:?}", e))?;
+                let def_type = master_data.unit_type_for_name(def_name).map_err(|e| {
+                    SaveError::MasterDataMismatch(format!("Unit type not found: {:?}", e))
+                })?;
                 damage_chart.insert_secondary_damage(att_type, def_type, *dmg);
             }
         }
@@ -392,7 +419,7 @@ pub fn import_save_data(
     for name in master_data.units.keys() {
         let stats = master_data
             .create_unit_stats(name)
-            .map_err(|e| anyhow::anyhow!("Master data error: {:?}", e))?;
+            .map_err(|e| SaveError::MasterDataMismatch(format!("Master data error: {:?}", e)))?;
         unit_registry_map.insert(stats.unit_type, stats);
     }
     world.insert_resource(UnitRegistry(unit_registry_map));
@@ -476,12 +503,19 @@ pub fn import_save_data(
     for u in &save_state.units {
         let stats = registry
             .get_stats(u.unit_type)
-            .ok_or_else(|| anyhow::anyhow!("Stats not found for unit type: {:?}", u.unit_type))?
+            .ok_or_else(|| {
+                SaveError::MasterDataMismatch(format!(
+                    "Stats not found for unit type: {:?}",
+                    u.unit_type
+                ))
+            })?
             .clone();
 
         let mut cmd = world.spawn_empty();
         let entity = cmd.id();
         uuid_to_entity.insert(u.id, entity);
+
+        let max_cargo = stats.max_cargo;
 
         cmd.insert((
             UnitId(u.id),
@@ -495,6 +529,13 @@ pub fn import_save_data(
             HasMoved(u.has_moved),
             ActionCompleted(u.action_completed),
         ));
+
+        if max_cargo > 0 {
+            cmd.insert(CargoCapacity {
+                max: max_cargo,
+                loaded: Vec::new(),
+            });
+        }
 
         if let Some((curr, max)) = u.fuel {
             cmd.insert(Fuel { current: curr, max });
@@ -526,15 +567,10 @@ pub fn import_save_data(
                     .insert(Transporting(parent_entity));
             }
         }
-        // 親ユニットに CargoCapacity を追加（限界積載数は DTO から取得できないため、UnitStats から取る）
-        let max_cargo = world
-            .get::<UnitStats>(parent_entity)
-            .map(|s| s.max_cargo)
-            .unwrap_or(0);
-        world.entity_mut(parent_entity).insert(CargoCapacity {
-            max: max_cargo,
-            loaded: loaded_entities,
-        });
+        // すでに CargoCapacity が入っているはずなので、それを取得して loaded を更新する
+        if let Some(mut cargo) = world.entity_mut(parent_entity).get_mut::<CargoCapacity>() {
+            cargo.loaded = loaded_entities;
+        }
     }
 
     // AIクールダウンの復元
@@ -568,15 +604,17 @@ pub struct SaveHeader {
 
 /// セーブデータ文字列から署名検証を行わずにヘッダー情報を読み取ります。
 /// メニュー表示などの目的で高速に情報を読み取るために使用します。
-pub fn read_save_header(save_str: &str) -> anyhow::Result<SaveHeader> {
+pub fn read_save_header(save_str: &str) -> Result<SaveHeader, SaveError> {
     let parts: Vec<&str> = save_str.split('.').collect();
     if parts.len() != 3 || parts[0] != "OPWS1" {
-        return Err(anyhow::anyhow!("Invalid save data format"));
+        return Err(SaveError::InvalidFormat(
+            "Invalid save data format".to_string(),
+        ));
     }
     let base64_data = parts[1];
     let decoded_json_bytes = BASE64_STANDARD
         .decode(base64_data.as_bytes())
-        .map_err(|e| anyhow::anyhow!("Base64 decode failed for save data header: {}", e))?;
+        .map_err(SaveError::Base64DecodeError)?;
     let val: serde_json::Value = serde_json::from_slice(&decoded_json_bytes)?;
 
     let map_name = val
@@ -718,6 +756,136 @@ mod tests {
         let res = import_save_data(&tampered_str, &master_data);
         assert!(res.is_err());
         let err = res.err().unwrap();
-        assert!(err.to_string().contains("Save data verification failed"));
+        assert!(err.to_string().contains("署名検証失敗"));
+    }
+
+    #[test]
+    fn test_cargo_capacity_serialization() {
+        let master_data = MasterDataRegistry::load().expect("Failed to load master data");
+        let (mut world, _schedule) =
+            crate::setup::initialize_world_from_master_data(&master_data, "map_1")
+                .expect("Failed to initialize world");
+
+        // 1. 空の輸送ユニット（輸送ヘリ: max_cargo=1）と、積載用ユニット（軽歩兵）をスポーン
+        let transport_id = uuid::Uuid::new_v4();
+        let passenger_id = uuid::Uuid::new_v4();
+
+        let transport_stats = master_data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                "輸送ヘリ".to_string(),
+            ))
+            .unwrap();
+        let passenger_stats = master_data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                "軽歩兵".to_string(),
+            ))
+            .unwrap();
+
+        // 空の輸送ヘリをスポーン
+        let transport_entity = world
+            .spawn((
+                UnitId(transport_id),
+                Faction(PlayerId(1)),
+                GridPosition { x: 1, y: 1 },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Fuel {
+                    current: transport_stats.max_fuel,
+                    max: transport_stats.max_fuel,
+                },
+                transport_stats.clone(),
+                HasMoved(false),
+                ActionCompleted(false),
+                CargoCapacity {
+                    max: transport_stats.max_cargo,
+                    loaded: Vec::new(),
+                },
+            ))
+            .id();
+
+        // 軽歩兵をスポーン
+        let passenger_entity = world
+            .spawn((
+                UnitId(passenger_id),
+                Faction(PlayerId(1)),
+                GridPosition { x: 2, y: 2 },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Fuel {
+                    current: passenger_stats.max_fuel,
+                    max: passenger_stats.max_fuel,
+                },
+                passenger_stats.clone(),
+                HasMoved(false),
+                ActionCompleted(false),
+            ))
+            .id();
+
+        // 2. セーブ -> ロード
+        let exported_str = export_save_data(&mut world, "map_1").expect("Export failed");
+        let (mut imported_world, _imported_schedule) =
+            import_save_data(&exported_str, &master_data).expect("Import failed");
+
+        // 3. ロード後の空の輸送ヘリが CargoCapacity を持っていることを検証
+        let mut t_query = imported_world.query_filtered::<(Entity, &UnitId), With<CargoCapacity>>();
+        let trans_list: Vec<_> = t_query.iter(&imported_world).collect();
+        assert_eq!(trans_list.len(), 1);
+        let (imp_transport_entity, imp_transport_id) = trans_list[0];
+        assert_eq!(imp_transport_id.0, transport_id);
+
+        let cargo = imported_world
+            .get::<CargoCapacity>(imp_transport_entity)
+            .unwrap();
+        assert_eq!(cargo.max, transport_stats.max_cargo);
+        assert!(cargo.loaded.is_empty());
+
+        // 4. 今度は積載した状態でセーブ -> ロード
+        // passenger_entity を transport_entity に搭載する
+        world.entity_mut(transport_entity).insert(CargoCapacity {
+            max: transport_stats.max_cargo,
+            loaded: vec![passenger_entity],
+        });
+        world
+            .entity_mut(passenger_entity)
+            .insert(Transporting(transport_entity));
+
+        let exported_str2 = export_save_data(&mut world, "map_1").expect("Export failed");
+        let (mut imported_world2, _imported_schedule2) =
+            import_save_data(&exported_str2, &master_data).expect("Import failed");
+
+        // 5. ロード後に積載関係が正しく復元されていることを検証
+        let mut u_query = imported_world2.query::<(
+            Entity,
+            &UnitId,
+            Option<&CargoCapacity>,
+            Option<&Transporting>,
+        )>();
+        let mut imp_trans_cargo = None;
+        let mut imp_pass_transporting = None;
+        let mut imp_trans_entity = None;
+        let mut imp_pass_entity = None;
+
+        for (ent, uid, cargo, transporting) in u_query.iter(&imported_world2) {
+            if uid.0 == transport_id {
+                imp_trans_cargo = cargo.cloned();
+                imp_trans_entity = Some(ent);
+            } else if uid.0 == passenger_id {
+                imp_pass_transporting = transporting.cloned();
+                imp_pass_entity = Some(ent);
+            }
+        }
+
+        let imp_trans_cargo = imp_trans_cargo.expect("CargoCapacity missing");
+        let imp_pass_transporting = imp_pass_transporting.expect("Transporting missing");
+        let imp_trans_entity = imp_trans_entity.unwrap();
+        let imp_pass_entity = imp_pass_entity.unwrap();
+
+        assert_eq!(imp_trans_cargo.max, transport_stats.max_cargo);
+        assert_eq!(imp_trans_cargo.loaded, vec![imp_pass_entity]);
+        assert_eq!(imp_pass_transporting.0, imp_trans_entity);
     }
 }
