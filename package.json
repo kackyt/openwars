@@ -1,9 +1,13 @@
 {
   "name": "openwars-root",
   "private": true,
+  "packageManager": "pnpm@10.19.0",
   "scripts": {
     "dev": "pnpm -C web dev",
     "build": "pnpm -C web build",
     "build:wasm": "wasm-pack build engine --target web --release --out-dir ../web/src/wasm"
+  },
+  "devDependencies": {
+    "rulesync": "^14.0.1"
   }
 }

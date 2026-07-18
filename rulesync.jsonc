@@ -1,7 +1,8 @@
 {
   "targets": [
-    "antigravity",
-    "claudecode"
+    "antigravity-ide",
+    "claudecode",
+    "codexcli"
   ],
   "features": [
     "rules",
