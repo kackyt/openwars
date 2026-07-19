@@ -36,6 +36,12 @@ pub fn create_world() -> (World, Schedule) {
     world.init_resource::<Events<PropertyCapturedEvent>>();
     world.init_resource::<Events<GamePhaseChangedEvent>>();
     world.init_resource::<Events<GameOverEvent>>();
+    world.init_resource::<Events<UnitProducedEvent>>();
+    world.init_resource::<Events<UnitSuppliedEvent>>();
+    world.init_resource::<Events<UnitLoadedEvent>>();
+    world.init_resource::<Events<UnitUnloadedEvent>>();
+    world.init_resource::<Events<UnitWaitedEvent>>();
+    world.init_resource::<Events<AiActionEvaluatedEvent>>();
 
     // Add main game systems
     add_main_game_systems(&mut schedule);
@@ -74,6 +80,14 @@ pub fn update_all_events(world: &mut World) {
         .resource_mut::<Events<GamePhaseChangedEvent>>()
         .update();
     world.resource_mut::<Events<GameOverEvent>>().update();
+    world.resource_mut::<Events<UnitProducedEvent>>().update();
+    world.resource_mut::<Events<UnitSuppliedEvent>>().update();
+    world.resource_mut::<Events<UnitLoadedEvent>>().update();
+    world.resource_mut::<Events<UnitUnloadedEvent>>().update();
+    world.resource_mut::<Events<UnitWaitedEvent>>().update();
+    world
+        .resource_mut::<Events<AiActionEvaluatedEvent>>()
+        .update();
 }
 
 /// マスターデータの設定中に発生するエラー。

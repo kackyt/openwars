@@ -260,6 +260,7 @@ fn apply_unit_resupply(
 /// ユニットの待機コマンドを処理します。
 pub fn wait_unit_system(
     mut wait_events: EventReader<WaitUnitCommand>,
+    mut waited_writer: EventWriter<UnitWaitedEvent>,
     mut q_units: Query<(&Faction, &mut ActionCompleted)>,
     players: Res<Players>,
     match_state: Res<MatchState>,
@@ -276,6 +277,9 @@ pub fn wait_unit_system(
                 continue;
             }
             action_comp.0 = true;
+            waited_writer.send(UnitWaitedEvent {
+                entity: ev.unit_entity,
+            });
             // アクション確定時に移動履歴を削除
             commands.remove_resource::<PendingMove>();
         }

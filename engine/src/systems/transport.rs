@@ -139,6 +139,7 @@ pub fn get_droppable_tiles_at(
 #[allow(clippy::type_complexity)]
 pub fn load_unit_system(
     mut load_events: EventReader<LoadUnitCommand>,
+    mut loaded_writer: EventWriter<UnitLoadedEvent>,
     mut commands: Commands,
     mut q_units: Query<(
         Entity,
@@ -207,6 +208,11 @@ pub fn load_unit_system(
                     .entity(event.unit_entity)
                     .insert(Transporting(event.transport_entity));
 
+                loaded_writer.send(UnitLoadedEvent {
+                    transport: event.transport_entity,
+                    cargo: event.unit_entity,
+                });
+
                 // アクション確定時に移動履歴を削除
                 commands.remove_resource::<PendingMove>();
             }
@@ -223,10 +229,12 @@ pub fn load_unit_system(
 /// 4. 輸送ユニットの `CargoCapacity` からユニットを削除し、`Transporting` コンポーネントを外します。
 /// 5. 降車ユニットの座標(`GridPosition`)を更新し、行動済み(`ActionCompleted`)にします。
 /// 6. 輸送ユニット自身も行動済み(`ActionCompleted`)にします。
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 pub fn unload_unit_system(
     mut commands: Commands,
     mut unload_events: EventReader<UnloadUnitCommand>,
+    mut unloaded_writer: EventWriter<UnitUnloadedEvent>,
     mut set: ParamSet<(
         Query<(
             Entity,
@@ -352,6 +360,13 @@ pub fn unload_unit_system(
             cargo.3.0 = true; // Unloaded unit is completed for the turn
             commands.entity(event.cargo_entity).remove::<Transporting>();
 
+            unloaded_writer.send(UnitUnloadedEvent {
+                transport: event.transport_entity,
+                cargo: event.cargo_entity,
+                target_x: event.target_x,
+                target_y: event.target_y,
+            });
+
             // アクション確定時に移動履歴を削除
             commands.remove_resource::<PendingMove>();
         }
@@ -430,6 +445,8 @@ mod tests {
 
         world.insert_resource(Events::<LoadUnitCommand>::default());
         world.insert_resource(Events::<UnloadUnitCommand>::default());
+        world.insert_resource(Events::<UnitLoadedEvent>::default());
+        world.insert_resource(Events::<UnitUnloadedEvent>::default());
 
         // Insert Map and MasterDataRegistry for terrain checks
         let mut map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
@@ -843,6 +860,7 @@ mod tests {
         world.insert_resource(Players(vec![Player::new(1, "P1".to_string())]));
 
         world.insert_resource(Events::<UnloadUnitCommand>::default());
+        world.insert_resource(Events::<UnitUnloadedEvent>::default());
 
         let map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
         world.insert_resource(map);
@@ -947,6 +965,7 @@ mod tests {
         world.insert_resource(MatchState::default());
         world.insert_resource(Players(vec![Player::new(1, "P1".to_string())]));
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<UnitLoadedEvent>::default());
 
         let transport = world
             .spawn((
@@ -997,6 +1016,7 @@ mod tests {
         world.insert_resource(MatchState::default());
         world.insert_resource(Players(vec![Player::new(1, "P1".to_string())]));
         world.insert_resource(Events::<UnloadUnitCommand>::default());
+        world.insert_resource(Events::<UnitUnloadedEvent>::default());
         world.insert_resource(Map::new(10, 10, Terrain::Plains, GridTopology::Square));
         world.insert_resource(MasterDataRegistry::load().unwrap());
 

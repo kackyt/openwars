@@ -59,6 +59,7 @@ pub fn get_suppliable_targets_at(
 #[allow(clippy::type_complexity)]
 pub fn supply_unit_system(
     mut supply_events: EventReader<SupplyUnitCommand>,
+    mut supplied_writer: EventWriter<UnitSuppliedEvent>,
     mut q_units: Query<(
         Entity,
         &GridPosition,
@@ -108,6 +109,7 @@ pub fn supply_unit_system(
             .as_ref()
             .map(|m| m.topology)
             .unwrap_or(GridTopology::Square);
+
         let dist = topology.distance((sup_pos.x, sup_pos.y), (tar_pos.x, tar_pos.y));
 
         if dist != 1 {
@@ -134,6 +136,12 @@ pub fn supply_unit_system(
                 ammo.ammo1 = max_a1; // 主武器と副武器の弾薬を最大値まで回復
                 ammo.ammo2 = max_a2;
             }
+
+            supplied_writer.send(UnitSuppliedEvent {
+                supplier: event.supplier_entity,
+                target: event.target_entity,
+            });
+
             // 補給確定時に移動履歴を削除
             commands.remove_resource::<PendingMove>();
         }
@@ -159,6 +167,7 @@ mod tests {
         ]));
 
         world.insert_resource(Events::<SupplyUnitCommand>::default());
+        world.insert_resource(Events::<UnitSuppliedEvent>::default());
 
         let supplier_entity = world
             .spawn((
