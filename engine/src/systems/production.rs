@@ -264,6 +264,7 @@ pub fn produce_unit_system(
 
         let entity = spawn_cmd.id();
 
+        // ユニット生産完了イベントを送出
         produced_writer.send(UnitProducedEvent {
             player_id: event.player_id,
             target_x: event.target_x,

@@ -277,6 +277,7 @@ pub fn wait_unit_system(
                 continue;
             }
             action_comp.0 = true;
+            // ユニット待機完了イベントを送出
             waited_writer.send(UnitWaitedEvent {
                 entity: ev.unit_entity,
             });

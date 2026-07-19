@@ -137,6 +137,7 @@ pub fn supply_unit_system(
                 ammo.ammo2 = max_a2;
             }
 
+            // 補給完了イベントを送出
             supplied_writer.send(UnitSuppliedEvent {
                 supplier: event.supplier_entity,
                 target: event.target_entity,

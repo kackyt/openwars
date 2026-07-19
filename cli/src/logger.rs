@@ -71,6 +71,22 @@ impl BattleLogger {
         Ok(())
     }
 
+    /// 複数のレコードを一度にファイルへ追記
+    fn write_records(&self, records: &[LogRecord]) -> std::io::Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.file_path)?;
+        for record in records {
+            let json_line = serde_json::to_string(record)?;
+            writeln!(file, "{}", json_line)?;
+        }
+        Ok(())
+    }
+
     /// ワールドからスナップショットを生成しログに出力
     pub fn log_snapshot(&self, world: &mut World) -> std::io::Result<()> {
         let (turn, active_player) = {
@@ -171,6 +187,8 @@ impl BattleLogger {
             }
         };
 
+        let mut records = Vec::new();
+
         // 移動イベント
         if let Some(events) = world.get_resource::<Events<UnitMovedEvent>>() {
             let mut cursor = events.get_cursor();
@@ -181,12 +199,12 @@ impl BattleLogger {
                     "to": [ev.to.x, ev.to.y],
                     "fuel_used": ev.fuel_used,
                 });
-                self.write_record(&LogRecord {
+                records.push(LogRecord {
                     turn,
                     player: active_player,
                     event: "UnitMoved".to_string(),
                     payload,
-                })?;
+                });
             }
         }
 
@@ -204,12 +222,12 @@ impl BattleLogger {
                     "defender_hp_before": ev.defender_hp_before,
                     "defender_hp_after": ev.defender_hp_after,
                 });
-                self.write_record(&LogRecord {
+                records.push(LogRecord {
                     turn,
                     player: active_player,
                     event: "UnitAttacked".to_string(),
                     payload,
-                })?;
+                });
             }
         }
 
@@ -220,12 +238,12 @@ impl BattleLogger {
                 let payload = serde_json::json!({
                     "entity": ev.entity.index(),
                 });
-                self.write_record(&LogRecord {
+                records.push(LogRecord {
                     turn,
                     player: active_player,
                     event: "UnitDestroyed".to_string(),
                     payload,
-                })?;
+                });
             }
         }
 
@@ -238,12 +256,12 @@ impl BattleLogger {
                     "y": ev.y,
                     "new_owner": ev.new_owner.map(|p| p.0),
                 });
-                self.write_record(&LogRecord {
+                records.push(LogRecord {
                     turn,
                     player: active_player,
                     event: "PropertyCaptured".to_string(),
                     payload,
-                })?;
+                });
             }
         }
 
@@ -253,17 +271,16 @@ impl BattleLogger {
             for ev in cursor.read(events) {
                 let payload = serde_json::json!({
                     "entity": ev.entity.index(),
-                    "player": ev.player_id.0,
                     "unit_type": format!("{:?}", ev.unit_type),
                     "x": ev.target_x,
                     "y": ev.target_y,
                 });
-                self.write_record(&LogRecord {
+                records.push(LogRecord {
                     turn,
                     player: ev.player_id.0,
                     event: "UnitProduced".to_string(),
                     payload,
-                })?;
+                });
             }
         }
 
@@ -276,12 +293,12 @@ impl BattleLogger {
                     "target": ev.target_entity.index(),
                     "refunded_funds": ev.refunded_funds,
                 });
-                self.write_record(&LogRecord {
+                records.push(LogRecord {
                     turn,
                     player: active_player,
                     event: "UnitMerged".to_string(),
                     payload,
-                })?;
+                });
             }
         }
 
@@ -293,12 +310,12 @@ impl BattleLogger {
                     "supplier": ev.supplier.index(),
                     "target": ev.target.index(),
                 });
-                self.write_record(&LogRecord {
+                records.push(LogRecord {
                     turn,
                     player: active_player,
                     event: "UnitSupplied".to_string(),
                     payload,
-                })?;
+                });
             }
         }
 
@@ -310,12 +327,12 @@ impl BattleLogger {
                     "transport": ev.transport.index(),
                     "cargo": ev.cargo.index(),
                 });
-                self.write_record(&LogRecord {
+                records.push(LogRecord {
                     turn,
                     player: active_player,
                     event: "UnitLoaded".to_string(),
                     payload,
-                })?;
+                });
             }
         }
 
@@ -329,12 +346,12 @@ impl BattleLogger {
                     "x": ev.target_x,
                     "y": ev.target_y,
                 });
-                self.write_record(&LogRecord {
+                records.push(LogRecord {
                     turn,
                     player: active_player,
                     event: "UnitUnloaded".to_string(),
                     payload,
-                })?;
+                });
             }
         }
 
@@ -345,12 +362,12 @@ impl BattleLogger {
                 let payload = serde_json::json!({
                     "entity": ev.entity.index(),
                 });
-                self.write_record(&LogRecord {
+                records.push(LogRecord {
                     turn,
                     player: active_player,
                     event: "UnitWaited".to_string(),
                     payload,
-                })?;
+                });
             }
         }
 
@@ -364,12 +381,12 @@ impl BattleLogger {
                     "action_type": ev.action_type,
                     "score": ev.score,
                 });
-                self.write_record(&LogRecord {
+                records.push(LogRecord {
                     turn,
                     player: active_player,
                     event: "AiActionEvaluated".to_string(),
                     payload,
-                })?;
+                });
             }
         }
 
@@ -380,16 +397,16 @@ impl BattleLogger {
                 let payload = serde_json::json!({
                     "condition": format!("{:?}", ev.condition),
                 });
-                self.write_record(&LogRecord {
+                records.push(LogRecord {
                     turn,
                     player: active_player,
                     event: "GameOver".to_string(),
                     payload,
-                })?;
+                });
             }
         }
 
-        Ok(())
+        self.write_records(&records)
     }
 }
 

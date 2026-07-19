@@ -2113,6 +2113,7 @@ pub fn decide_ai_action_v2(
                 }
             });
 
+        // AIが決定した最善の行動評価情報をイベントとして送出する
         if let Some(mut events) =
             world.get_resource_mut::<Events<crate::events::AiActionEvaluatedEvent>>()
         {

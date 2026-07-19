@@ -208,6 +208,7 @@ pub fn load_unit_system(
                     .entity(event.unit_entity)
                     .insert(Transporting(event.transport_entity));
 
+                // 積載完了イベントを送出
                 loaded_writer.send(UnitLoadedEvent {
                     transport: event.transport_entity,
                     cargo: event.unit_entity,
@@ -360,6 +361,7 @@ pub fn unload_unit_system(
             cargo.3.0 = true; // Unloaded unit is completed for the turn
             commands.entity(event.cargo_entity).remove::<Transporting>();
 
+            // 降車完了イベントを送出
             unloaded_writer.send(UnitUnloadedEvent {
                 transport: event.transport_entity,
                 cargo: event.cargo_entity,
