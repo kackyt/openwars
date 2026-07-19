@@ -161,6 +161,7 @@ pub fn can_produce_at(
 pub fn produce_unit_system(
     mut commands: Commands,
     mut produce_events: EventReader<ProduceUnitCommand>,
+    mut produced_writer: EventWriter<UnitProducedEvent>,
     mut players: ResMut<Players>,
     match_state: Res<MatchState>,
     q_properties: Query<(&GridPosition, &Property)>,
@@ -261,11 +262,21 @@ pub fn produce_unit_system(
             ActionCompleted(true),
         ));
 
+        let entity = spawn_cmd.id();
+
+        // ユニット生産完了イベントを送出
+        produced_writer.send(UnitProducedEvent {
+            player_id: event.player_id,
+            target_x: event.target_x,
+            target_y: event.target_y,
+            unit_type: event.unit_type,
+            entity,
+        });
+
         newly_spawned_positions.insert((event.target_x, event.target_y));
 
         // 輸送ユニットの場合、CargoCapacityコンポーネントを追加
         if stats.max_cargo > 0 {
-            let entity = spawn_cmd.id();
             commands.entity(entity).insert(CargoCapacity {
                 max: stats.max_cargo,
                 loaded: vec![],
@@ -302,6 +313,7 @@ mod tests {
         world.insert_resource(map);
 
         world.insert_resource(Events::<ProduceUnitCommand>::default());
+        world.insert_resource(Events::<UnitProducedEvent>::default());
         world.insert_resource(MasterDataRegistry::load().unwrap());
 
         // Spawn properties
@@ -377,6 +389,7 @@ mod tests {
         world.insert_resource(map);
 
         world.init_resource::<Events<ProduceUnitCommand>>();
+        world.init_resource::<Events<UnitProducedEvent>>();
         world.insert_resource(MasterDataRegistry::load().unwrap());
 
         // 首都を配置

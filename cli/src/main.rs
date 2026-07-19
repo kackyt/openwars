@@ -1,4 +1,5 @@
 mod app;
+mod logger;
 mod ui;
 
 use app::App;
@@ -9,6 +10,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use logger::BattleLogger;
 #[cfg(not(feature = "ai-debug"))]
 use ratatui::backend::CrosstermBackend;
 use ratatui::{Terminal, backend::Backend};
@@ -25,11 +27,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     {
         let args: Vec<String> = std::env::args().collect();
         let mut load_path = None;
+        let mut battle_log_path = None;
         for i in 0..args.len() {
             if args[i] == "--load" && i + 1 < args.len() {
                 load_path = Some(args[i + 1].clone());
             }
+            if args[i] == "--battle-log" && i + 1 < args.len() {
+                battle_log_path = Some(args[i + 1].clone());
+            }
         }
+
+        let logger = battle_log_path.map(BattleLogger::new);
 
         // 1. アプリケーション状態の初期化
         let mut app = App::new()?;
@@ -66,7 +74,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
         let on_draw = |_terminal: &Terminal<CrosstermBackend<std::io::Stdout>>| {};
 
-        let res = run_app(&mut terminal, &mut app, get_event, on_draw);
+        let res = run_app(&mut terminal, &mut app, get_event, on_draw, logger.as_ref());
 
         // 4. ターミナルの終了処理
         disable_raw_mode()?;
@@ -188,7 +196,7 @@ fn run_ai_debug() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    if let Err(err) = run_app(&mut terminal, &mut app, get_event, on_draw) {
+    if let Err(err) = run_app(&mut terminal, &mut app, get_event, on_draw, None) {
         println!("Error: {:?}", err);
     }
     Ok(())
@@ -199,6 +207,7 @@ fn run_app<B: Backend, E, D>(
     app: &mut App,
     mut get_event: E,
     mut on_draw: D,
+    logger: Option<&BattleLogger>,
 ) -> io::Result<()>
 where
     E: FnMut(std::time::Duration) -> io::Result<Option<Event>>,
@@ -251,6 +260,10 @@ where
 
                 schedule.run(world);
 
+                if let Some(l) = logger {
+                    let _ = l.process_events(world);
+                }
+
                 if let Some(mut events) = world.get_resource_mut::<Events<UnitAttackedEvent>>() {
                     for ev in events.drain() {
                         let a_before_disp = (ev.attacker_hp_before.saturating_add(9)) / 10;
@@ -267,16 +280,23 @@ where
                 }
 
                 let mut phase_popup = None;
-                if let Some(mut phase_events) =
+                let phase_evs = if let Some(mut phase_events) =
                     world.get_resource_mut::<Events<GamePhaseChangedEvent>>()
                 {
-                    for ev in phase_events.drain() {
-                        if ev.new_phase == engine::resources::Phase::Main {
-                            phase_popup = Some(format!(
-                                "プレイヤー {} のターン\n\nSpaceキーで開始...",
-                                ev.active_player.0
-                            ));
+                    phase_events.drain().collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+
+                for ev in phase_evs {
+                    if ev.new_phase == engine::resources::Phase::Main {
+                        if let Some(l) = logger {
+                            let _ = l.log_snapshot(world);
                         }
+                        phase_popup = Some(format!(
+                            "プレイヤー {} のターン\n\nSpaceキーで開始...",
+                            ev.active_player.0
+                        ));
                     }
                 }
 
@@ -341,7 +361,13 @@ where
                     UnitDestroyedEvent,
                     GamePhaseChangedEvent,
                     UnitMovedEvent,
-                    UnitMergedEvent
+                    UnitMergedEvent,
+                    UnitProducedEvent,
+                    UnitSuppliedEvent,
+                    UnitLoadedEvent,
+                    UnitUnloadedEvent,
+                    UnitWaitedEvent,
+                    AiActionEvaluatedEvent
                 );
             }
 

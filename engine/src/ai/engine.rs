@@ -2099,6 +2099,33 @@ pub fn decide_ai_action_v2(
         }
     }
 
+    if let Some((entity, ref command)) = best_overall_choice {
+        let mission_type = manager
+            .squads
+            .iter()
+            .find(|s| s.members.contains(&entity))
+            .map(|s| format!("{:?}", s.mission_type))
+            .unwrap_or_else(|| {
+                if manager.solo_fallbacks.contains(&entity) {
+                    "SoloFallback".to_string()
+                } else {
+                    "Unknown".to_string()
+                }
+            });
+
+        // AIが決定した最善の行動評価情報をイベントとして送出する
+        if let Some(mut events) =
+            world.get_resource_mut::<Events<crate::events::AiActionEvaluatedEvent>>()
+        {
+            events.send(crate::events::AiActionEvaluatedEvent {
+                entity,
+                mission_type,
+                action_type: format!("{:?}", command),
+                score: best_overall_score,
+            });
+        }
+    }
+
     best_overall_choice
 }
 

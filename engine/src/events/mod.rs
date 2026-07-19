@@ -115,3 +115,51 @@ pub struct GamePhaseChangedEvent {
 pub struct GameOverEvent {
     pub condition: crate::resources::GameOverCondition,
 }
+
+/// ユニット生産完了イベント
+#[derive(Event, Debug, Clone)]
+pub struct UnitProducedEvent {
+    pub player_id: PlayerId,
+    pub target_x: usize,
+    pub target_y: usize,
+    pub unit_type: crate::resources::UnitType,
+    pub entity: Entity,
+}
+
+/// 補給完了イベント
+#[derive(Event, Debug, Clone)]
+pub struct UnitSuppliedEvent {
+    pub supplier: Entity,
+    pub target: Entity,
+}
+
+/// 輸送ユニットへの積載完了イベント
+#[derive(Event, Debug, Clone)]
+pub struct UnitLoadedEvent {
+    pub transport: Entity,
+    pub cargo: Entity,
+}
+
+/// 輸送ユニットからの降車完了イベント
+#[derive(Event, Debug, Clone)]
+pub struct UnitUnloadedEvent {
+    pub transport: Entity,
+    pub cargo: Entity,
+    pub target_x: usize,
+    pub target_y: usize,
+}
+
+/// ユニット待機完了イベント
+#[derive(Event, Debug, Clone)]
+pub struct UnitWaitedEvent {
+    pub entity: Entity,
+}
+
+/// AIの思考評価・決定情報イベント
+#[derive(Event, Debug, Clone)]
+pub struct AiActionEvaluatedEvent {
+    pub entity: Entity,
+    pub mission_type: String,
+    pub action_type: String,
+    pub score: i32,
+}

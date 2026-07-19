@@ -549,6 +549,7 @@ mod tests {
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<UnitLoadedEvent>::default());
         world.insert_resource(Events::<MergeUnitCommand>::default());
 
         let entity = world
@@ -692,6 +693,7 @@ mod tests {
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<UnitLoadedEvent>::default());
         world.insert_resource(Events::<MergeUnitCommand>::default());
 
         let transport_id = world
@@ -782,6 +784,7 @@ mod tests {
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<UnitLoadedEvent>::default());
         world.insert_resource(Events::<MergeUnitCommand>::default());
 
         let inf_stats = create_infantry_stats();
@@ -847,6 +850,7 @@ mod tests {
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<UnitLoadedEvent>::default());
         world.insert_resource(Events::<MergeUnitCommand>::default());
         world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
 
@@ -918,6 +922,7 @@ mod tests {
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<UnitLoadedEvent>::default());
         world.insert_resource(Events::<MergeUnitCommand>::default());
         world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
 
@@ -987,6 +992,7 @@ mod tests {
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<UnitLoadedEvent>::default());
         world.insert_resource(Events::<MergeUnitCommand>::default());
 
         let inf_stats = create_infantry_stats();
@@ -1089,9 +1095,11 @@ mod tests {
         world.insert_resource(registry);
 
         world.insert_resource(Events::<ProduceUnitCommand>::default());
+        world.insert_resource(Events::<UnitProducedEvent>::default());
         world.insert_resource(Events::<MoveUnitCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<UnitLoadedEvent>::default());
         world.insert_resource(Events::<MergeUnitCommand>::default());
 
         // 1. Produce a transport heli at (1, 1)
@@ -1186,6 +1194,7 @@ mod tests {
         world.insert_resource(Events::<UndoMoveCommand>::default());
         world.insert_resource(Events::<UnitMovedEvent>::default());
         world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<UnitLoadedEvent>::default());
         world.insert_resource(Events::<MergeUnitCommand>::default());
         world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
 
