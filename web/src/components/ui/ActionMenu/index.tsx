@@ -13,6 +13,7 @@ const ACTION_MAP: Record<string, string> = {
   Wait: "待機",
   Attack: "攻撃",
   Capture: "占領",
+  Repair: "修復",
   Supply: "補給",
   Load: "搭載",
   Drop: "降車",

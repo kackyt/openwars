@@ -488,6 +488,9 @@ impl WasmEngine {
         if actions.can_capture {
             options.push("\"Capture\"");
         }
+        if actions.can_repair {
+            options.push("\"Repair\"");
+        }
         if actions.can_supply {
             options.push("\"Supply\"");
         }
@@ -546,15 +549,18 @@ impl WasmEngine {
                 }
 
                 if let Some(prop) = target_prop {
-                    for (name, record) in &master_data.units {
-                        if let Ok(u_type) = master_data.unit_type_for_name(&name.0) {
-                            if master_data.can_produce_unit(prop.terrain.as_str(), u_type) {
-                                producible.push(format!(
-                                    r#"{{"type": "{}", "name": "{}", "cost": {}}}"#,
-                                    format!("{:?}", u_type).to_lowercase(),
-                                    record.name.0,
-                                    record.cost
-                                ));
+                    // マスターデータの定義順（unit.csvの並び順）に従って、生産可能なユニットの一覧を構築します。
+                    for name in &master_data.unit_order {
+                        if let Some(record) = master_data.units.get(name) {
+                            if let Ok(u_type) = master_data.unit_type_for_name(&name.0) {
+                                if master_data.can_produce_unit(prop.terrain.as_str(), u_type) {
+                                    producible.push(format!(
+                                        r#"{{"type": "{}", "name": "{}", "cost": {}}}"#,
+                                        format!("{:?}", u_type).to_lowercase(),
+                                        record.name.0,
+                                        record.cost
+                                    ));
+                                }
                             }
                         }
                     }
@@ -678,6 +684,28 @@ impl WasmEngine {
 
     pub fn submit_capture_command(&mut self, unit_id_str: &str) -> JsValue {
         let unit_entity_bits = unit_id_str.parse::<u64>().unwrap_or(0);
+        let unit_entity = Entity::from_bits(unit_entity_bits);
+
+        if let Some(mut evs) = self
+            .world
+            .get_resource_mut::<Events<crate::events::CapturePropertyCommand>>()
+        {
+            evs.send(crate::events::CapturePropertyCommand { unit_entity });
+        }
+        self.schedule.run(&mut self.world);
+        crate::setup::update_all_events(&mut self.world);
+        JsValue::from_str("{}")
+    }
+
+    /// 自軍拠点の修復コマンドを送信します。
+    /// 内部では `CapturePropertyCommand` を再利用し、自軍拠点の capture_points を回復させます。
+    /// # Arguments
+    /// * `unit_id_str` - 修復を実行するユニットのエンティティIDの文字列表現
+    pub fn submit_repair_command(&mut self, unit_id_str: &str) -> JsValue {
+        let unit_entity_bits = match unit_id_str.parse::<u64>() {
+            Ok(bits) => bits,
+            Err(_) => return JsValue::from_str(r#"{"error": "invalid unit id"}"#),
+        };
         let unit_entity = Entity::from_bits(unit_entity_bits);
 
         if let Some(mut evs) = self

@@ -51,7 +51,7 @@ function App() {
   /** 生産メニュー選択時のハンドラー */
   const handleProduceSelect = async (unitType: string) => {
     if (produceMenu) {
-      await executeProduce(unitType, produceMenu.x, produceMenu.y);
+      await executeProduce(unitType, produceMenu.gridX, produceMenu.gridY);
     }
   };
 

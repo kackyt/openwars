@@ -103,3 +103,19 @@ export const MAP_HP_THRESHOLD_DANGER = 0.3;
 /** UnitLayer用のHP絶対値閾値 */
 export const UNIT_HP_THRESHOLD_WARNING = 7;
 export const UNIT_HP_THRESHOLD_DANGER = 3;
+
+/** TurnIndicator（右上固定パネル）の高さに対応するスクロール余白 (px) */
+export const CAMERA_PADDING_TOP = 120;
+/** UnitInfoPanel（左下固定パネル）の高さに対応するスクロール余白 (px) */
+export const CAMERA_PADDING_BOTTOM = 140;
+/** UnitInfoPanel の横幅に対応するスクロール余白 (px) */
+export const CAMERA_PADDING_LEFT = 60;
+/** TurnIndicator の横幅に対応するスクロール余白 (px) */
+export const CAMERA_PADDING_RIGHT = 120;
+
+/** アクションメニュー/生産メニューの概算横幅 (px) */
+export const POPUP_MENU_APPROX_WIDTH = 220;
+/** アクションメニュー/生産メニューの概算縦幅 (px) */
+export const POPUP_MENU_APPROX_HEIGHT = 250;
+/** ポップアップメニューの最小画面マージン (px) */
+export const POPUP_MENU_MIN_MARGIN = 10;
