@@ -979,6 +979,7 @@ impl App {
                         return;
                     };
 
+                    // マスターデータの定義順（unit.csvの並び順）に従って、生産可能なユニットを走査します。
                     for name in &self.master_data.unit_order {
                         if let Some(record) = self.master_data.units.get(name) {
                             if player_funds < record.cost {

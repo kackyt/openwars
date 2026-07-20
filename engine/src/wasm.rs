@@ -549,6 +549,7 @@ impl WasmEngine {
                 }
 
                 if let Some(prop) = target_prop {
+                    // マスターデータの定義順（unit.csvの並び順）に従って、生産可能なユニットの一覧を構築します。
                     for name in &master_data.unit_order {
                         if let Some(record) = master_data.units.get(name) {
                             if let Ok(u_type) = master_data.unit_type_for_name(&name.0) {
