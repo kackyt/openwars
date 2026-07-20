@@ -3,6 +3,13 @@
  * @description カメラの位置クランプや、画面座標からグリッド座標への変換を行う純粋関数ヘルパー。
  */
 
+import {
+  CAMERA_PADDING_BOTTOM,
+  CAMERA_PADDING_LEFT,
+  CAMERA_PADDING_RIGHT,
+  CAMERA_PADDING_TOP,
+} from "../constants/rendering";
+
 /**
  * 画面上の位置 (px) をカメラ位置とグリッド形式を考慮してグリッドのセル座標 (X, Y) に変換します。
  * @param globalX 画面X座標
@@ -59,12 +66,6 @@ export const gridToGlobal = (
   return { globalX, globalY };
 };
 
-/** UI要素（TurnIndicatorやUnitInfoPanelなど）による遮蔽を回避するための画面余白（px） */
-const PADDING_TOP = 120;
-const PADDING_BOTTOM = 140;
-const PADDING_LEFT = 60;
-const PADDING_RIGHT = 120;
-
 /**
  * マップ全体の描画範囲と画面サイズを比較し、カメラが範囲外スクロールしないようにクランプします。
  * UIパネルによる遮蔽を避けるため、上・下・左右にスクロール可能な余裕（パディング）を持たせます。
@@ -83,11 +84,11 @@ export const clampCameraPosition = (
   windowWidth: number,
   windowHeight: number,
 ): { x: number; y: number } => {
-  const maxX = PADDING_LEFT;
-  const minX = Math.min(PADDING_LEFT, windowWidth - mapWidth - PADDING_RIGHT);
+  const maxX = CAMERA_PADDING_LEFT;
+  const minX = Math.min(CAMERA_PADDING_LEFT, windowWidth - mapWidth - CAMERA_PADDING_RIGHT);
 
-  const maxY = PADDING_TOP;
-  const minY = Math.min(PADDING_TOP, windowHeight - mapHeight - PADDING_BOTTOM);
+  const maxY = CAMERA_PADDING_TOP;
+  const minY = Math.min(CAMERA_PADDING_TOP, windowHeight - mapHeight - CAMERA_PADDING_BOTTOM);
 
   return {
     x: Math.max(minX, Math.min(maxX, newX)),

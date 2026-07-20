@@ -2,7 +2,14 @@ import { Container, Sprite, Stage } from "@pixi/react";
 import * as PIXI from "pixi.js";
 import { useEffect, useState } from "react";
 import { PRODUCIBLE_TERRAINS } from "../../../constants/mappings";
-import { DRAG_THRESHOLD, STAGE_BACKGROUND_COLOR, TILE_SIZE } from "../../../constants/rendering";
+import {
+  DRAG_THRESHOLD,
+  POPUP_MENU_APPROX_HEIGHT,
+  POPUP_MENU_APPROX_WIDTH,
+  POPUP_MENU_MIN_MARGIN,
+  STAGE_BACKGROUND_COLOR,
+  TILE_SIZE,
+} from "../../../constants/rendering";
 import { useGameStore } from "../../../store/gameStore";
 import { clampCameraPosition, globalToGrid, gridToGlobal } from "../../../utils/camera";
 import { CursorLayer } from "../CursorLayer";
@@ -111,8 +118,14 @@ export const GameCanvas = () => {
       TILE_SIZE,
     );
     // メニュー表示位置が画面外（右端・下端）にはみ出さないようクランプ
-    const screenX = Math.min(Math.max(10, globalX + TILE_SIZE / 2), windowSize.width - 220);
-    const screenY = Math.min(Math.max(10, globalY), windowSize.height - 250);
+    const screenX = Math.min(
+      Math.max(POPUP_MENU_MIN_MARGIN, globalX + TILE_SIZE / 2),
+      windowSize.width - POPUP_MENU_APPROX_WIDTH,
+    );
+    const screenY = Math.min(
+      Math.max(POPUP_MENU_MIN_MARGIN, globalY),
+      windowSize.height - POPUP_MENU_APPROX_HEIGHT,
+    );
     return { screenX, screenY };
   };
 

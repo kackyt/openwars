@@ -37,8 +37,8 @@ interface UnitInfoProps {
 
 /**
  * ユニット情報パネルコンポーネント
- * 現在ホバー中のセルに存在する地形情報、およびユニットのステータス情報（HP、燃料、残弾等）を表示します。
- * カーソル位置に応じて表示位置を左右（左下 / 右下）に自動切替し、操作中のマップの隠蔽を防ぎます。
+ * 現在ホバー中のセルに存在する地形情報、およびユニットのステータス情報（HP、燃料、残弾等）を
+ * 画面左下に固定表示します。
  */
 export const UnitInfoPanel = ({ unit, terrain }: UnitInfoProps) => {
   if (!unit && !terrain) return null;

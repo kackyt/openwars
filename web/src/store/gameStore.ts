@@ -94,9 +94,13 @@ export interface ActionMenuState {
 }
 
 export interface ProduceMenuState {
+  /** ポップアップ表示の画面ピクセルX座標 */
   x: number;
+  /** ポップアップ表示の画面ピクセルY座標 */
   y: number;
+  /** 生産対象のグリッドX座標 */
   gridX: number;
+  /** 生産対象のグリッドY座標 */
   gridY: number;
   units: { type: string; name: string; cost: number }[];
 }

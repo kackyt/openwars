@@ -696,8 +696,15 @@ impl WasmEngine {
         JsValue::from_str("{}")
     }
 
+    /// 自軍拠点の修復コマンドを送信します。
+    /// 内部では `CapturePropertyCommand` を再利用し、自軍拠点の capture_points を回復させます。
+    /// # Arguments
+    /// * `unit_id_str` - 修復を実行するユニットのエンティティIDの文字列表現
     pub fn submit_repair_command(&mut self, unit_id_str: &str) -> JsValue {
-        let unit_entity_bits = unit_id_str.parse::<u64>().unwrap_or(0);
+        let unit_entity_bits = match unit_id_str.parse::<u64>() {
+            Ok(bits) => bits,
+            Err(_) => return JsValue::from_str(r#"{"error": "invalid unit id"}"#),
+        };
         let unit_entity = Entity::from_bits(unit_entity_bits);
 
         if let Some(mut evs) = self
