@@ -1,11 +1,11 @@
 ---
 title: "PLAYBOOK"
-version: "1.6.0"
+version: "1.7.0"
 status: "approved"
 created: "2026-06-06"
-updated: "2026-07-18"
+updated: "2026-07-20"
 owner: "@t_kak"
-ace_entry_count: 15
+ace_entry_count: 17
 tags: [ace, playbook, knowledge-management]
 references:
   - docs/ACE_FRAMEWORK.md
@@ -463,6 +463,44 @@ Playbook が 800 行を超えた場合、以下のように分割する：
 **Context**: `SaveLoadModal` の `useEffect` 内で、スロットの更新処理 `refreshSlots` を呼んでいたが、依存配列に含まれていなかったため Biome リンターによるビルドエラーが発生した。
 
 **Action**: `useEffect` から参照される外部関数は、親コンポーネント側で `useCallback` を用いてメモ化（参照を安定化）した上で、効果の依存配列（dependency array）に明示的に含める。
+
+<a id="ace-65-1"></a>
+
+### ACE-65-1: スナップショットとイベントストリームを分離した軽量対戦ログ設計
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | architecture |
+| Origin     | PR #65 |
+| Date       | 2026-07-20 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: ゲーム対戦ログの記録において、毎アクションごとに全盤面状態をダンプするのではなく、ターン開始時の状態スナップショット（State Snapshot）と離散的な行動イベント（Event Stream）を分離して単一の JSONL ストリームに出力することで、ログ容量を最小限に抑えつつ戦況と意思決定を完全に再構成可能にする。
+
+**Context**: PR #65 にて CLI 対戦時のログ収集を実装。盤面全体データ（Snapshots）と移動・生産・補給・AI評価等の各イベント（Events）を分離した JSONL フォーマットを採用したことで、軽量なログ出力と詳細な事後解析スクリプト（Python/スキル）の両立を実現した。
+
+**Action**: 対戦ログやシミュレーション結果の記録基盤を設計する際は、状態のフルダンプを避け、定期的なアンカー（スナップショット）と各システムから発行される標準化イベントの組み合わせによる JSONL ストリーム構造を採用する。
+
+<a id="ace-65-2"></a>
+
+### ACE-65-2: AI思考評価ログの可視化とLLMエージェントによる自律敗因分析
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | tooling |
+| Origin     | PR #65 |
+| Date       | 2026-07-20 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: AIの内部評価スコアや行動選択肢を対戦ログのイベントとして出力し、専用のパーススクリプトおよび分析スキルを整備することで、勝敗結果だけでなく「なぜそのターンに不合理な判断をしたか」を LLM/AI エージェントが自律的にデバッグ・評価改善できる。
+
+**Context**: PR #65 では `cli/src/logger.rs` と `scripts/analyze_battle_log.py` に加え、`.rulesync/skills/openwars-battle-analyzer` スキルを追加。AIが対戦ログから特定のターンにおける評価関数の失敗や期待値計算の誤りを自律的に検出・レポーティングできる基盤を確立した。
+
+**Action**: AIゲームエンジンの思考ロジックを開発・検証する際は、結果（勝率）のみを記録するのではなく、AI内部の選択肢評価イベント（`AiEvaluationEvent` 等）を対戦ログに記録し、LLM/AIエージェントが直接ログを分析して改善策を立案できる分析ツールチェーンとスキルを併せて提供する。
 
 ## Changelog
 
