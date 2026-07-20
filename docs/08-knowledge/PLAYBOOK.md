@@ -1,11 +1,11 @@
 ---
 title: "PLAYBOOK"
-version: "1.7.0"
+version: "1.8.0"
 status: "approved"
 created: "2026-06-06"
 updated: "2026-07-20"
 owner: "@t_kak"
-ace_entry_count: 17
+ace_entry_count: 19
 tags: [ace, playbook, knowledge-management]
 references:
   - docs/ACE_FRAMEWORK.md
@@ -501,6 +501,44 @@ Playbook が 800 行を超えた場合、以下のように分割する：
 **Context**: PR #65 では `cli/src/logger.rs` と `scripts/analyze_battle_log.py` に加え、`.rulesync/skills/openwars-battle-analyzer` スキルを追加。AIが対戦ログから特定のターンにおける評価関数の失敗や期待値計算の誤りを自律的に検出・レポーティングできる基盤を確立した。
 
 **Action**: AIゲームエンジンの思考ロジックを開発・検証する際は、結果（勝率）のみを記録するのではなく、AI内部の選択肢評価イベント（`AiEvaluationEvent` 等）を対戦ログに記録し、LLM/AIエージェントが直接ログを分析して改善策を立案できる分析ツールチェーンとスキルを併せて提供する。
+
+<a id="ace-67-1"></a>
+
+### ACE-67-1: マスターデータの定義順（ロード順）保持によるUI一覧順序の全環境統一
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | architecture |
+| Origin     | PR #67 / Issue #66 |
+| Date       | 2026-07-20 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: CSV や設定ファイルから読み込まれるマスターデータを HashMap や BTreeMap などのキー順コレクションのみで保持すると定義順が失われ、UIごとの表示順が不一致になる。登録時にロード順（`Vec<Id>` 等）を保持し、パブリック一覧 API でその順序にソートして返すことで全フロントエンド（CLI/Web）での一貫性を保証できる。
+
+**Context**: PR #67 (Issue #66) において、生産可能ユニットの並び順が CLI と Web (WASM) で異なったりマスターデータ変更が反映されない問題が発生したため、`MasterDataRegistry` に `unit_order` を追加してロード順を統制した。
+
+**Action**: マスターデータを保持するリソースやレジストリを設計する際は、単なる Map 格納だけでなく定義順を記録する Vec (`unit_order` 等) を保持し、データ取得用 API ではその定義順に基づいてソートしてリストを返す設計とする。
+
+<a id="ace-67-2"></a>
+
+### ACE-67-2: 固定UIパネルによるマップ遮蔽を防ぐカメラパディング制御
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | coding |
+| Origin     | PR #67 / Issue #66 |
+| Date       | 2026-07-20 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: 画面端や四隅に固定表示されるUIパネル（ターン表示、ユニット情報パネル等）が存在するキャンバス/マップビューでは、単にマップ外周にカメラをクランプするとマップ端のセルが固定UIに隠れて操作不能になる。カメラ座標クランプ処理にUIサイズに応じた可逆なパディング（スクロール余白）を設定することで、すべてのセルを安全域までスクロール可能にする。
+
+**Context**: PR #67 において、Web版で画面右上の TurnIndicator や左下の UnitInfoPanel にマップ端のヘックスが被り、ドラッグ/スクロールを行ってもクリック・操作が困難になる現象が発生したため、`clampCameraPosition` に `CAMERA_PADDING_*` を組み込んで解剖・解決した。
+
+**Action**: ビューポート上にオーバーレイ UI を配置するマップビューやゲームビューのカメラクランプ関数を実装する際は、単にビューポート枠 `[0, mapSize - windowSize]` にクランプするのではなく、固定UIの占有エリアに応じたカメラパディング（`CAMERA_PADDING_TOP` 等）を境界値に加算・減算してスクロール移動範囲を拡張する。
 
 ## Changelog
 
