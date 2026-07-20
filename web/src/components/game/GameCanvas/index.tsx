@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { PRODUCIBLE_TERRAINS } from "../../../constants/mappings";
 import { DRAG_THRESHOLD, STAGE_BACKGROUND_COLOR, TILE_SIZE } from "../../../constants/rendering";
 import { useGameStore } from "../../../store/gameStore";
-import { clampCameraPosition, globalToGrid } from "../../../utils/camera";
+import { clampCameraPosition, globalToGrid, gridToGlobal } from "../../../utils/camera";
 import { CursorLayer } from "../CursorLayer";
 import { MapLayer } from "../MapLayer";
 import { ReachableLayer } from "../ReachableLayer";
@@ -83,7 +83,8 @@ export const GameCanvas = () => {
    * @param newY クランプ前のY座標
    */
   const clampCameraPos = (newX: number, newY: number) => {
-    const mapWidth = (mapData[0]?.length || 0) * TILE_SIZE;
+    const isHex = topology === "hex";
+    const mapWidth = (mapData[0]?.length || 0) * TILE_SIZE + (isHex ? TILE_SIZE / 2 : 0);
     const mapHeight = mapData.length * TILE_SIZE;
     return clampCameraPosition(
       newX,
@@ -93,6 +94,26 @@ export const GameCanvas = () => {
       windowSize.width,
       windowSize.height,
     );
+  };
+
+  /**
+   * 指定のグリッド座標における、画面上の表示ピクセル位置（ポップアップ用）を取得する
+   * @param gridX グリッドX
+   * @param gridY グリッドY
+   */
+  const getScreenPos = (gridX: number, gridY: number) => {
+    const { globalX, globalY } = gridToGlobal(
+      gridX,
+      gridY,
+      cameraPos.x,
+      cameraPos.y,
+      topology,
+      TILE_SIZE,
+    );
+    // メニュー表示位置が画面外（右端・下端）にはみ出さないようクランプ
+    const screenX = Math.min(Math.max(10, globalX + TILE_SIZE / 2), windowSize.width - 220);
+    const screenY = Math.min(Math.max(10, globalY), windowSize.height - 250);
+    return { screenX, screenY };
   };
 
   /** ポインターが押された（ドラッグ開始）時のイベントハンドラー */
@@ -150,7 +171,8 @@ export const GameCanvas = () => {
           selectUnit(unit.id);
         } else if (PRODUCIBLE_TERRAINS.includes(cellType)) {
           // 生産可能な拠点がタップされたら生産メニューを開く
-          openProduceMenu(gridX, gridY);
+          const { screenX, screenY } = getScreenPos(gridX, gridY);
+          openProduceMenu(gridX, gridY, screenX, screenY);
         } else {
           cancelInteraction();
         }
@@ -158,7 +180,8 @@ export const GameCanvas = () => {
         const isReachable = reachableCells.some((c) => c.x === gridX && c.y === gridY);
         if (isReachable) {
           // 移動範囲内であれば目的地を選択
-          selectMoveTarget(gridX, gridY);
+          const { screenX, screenY } = getScreenPos(gridX, gridY);
+          selectMoveTarget(gridX, gridY, screenX, screenY);
         } else {
           cancelInteraction();
         }

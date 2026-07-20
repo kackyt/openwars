@@ -165,6 +165,7 @@ pub struct MasterDataRegistry {
     pub landscapes: HashMap<LandscapeId, LandscapeRecord>,
     pub landscapes_by_name: HashMap<String, LandscapeId>,
     pub units: HashMap<UnitName, UnitRecord>,
+    pub unit_order: Vec<UnitName>,
     pub weapons: HashMap<UnitName, WeaponRecord>,
     pub movements: HashMap<crate::resources::MovementType, MovementRecord>,
     pub loads: HashMap<String, Vec<LoadRecord>>,
@@ -198,6 +199,7 @@ impl MasterDataRegistry {
         let mut rdr = csv::Reader::from_reader(unit_csv.as_bytes());
         for result in rdr.deserialize() {
             let record: UnitRecord = result?;
+            registry.unit_order.push(record.name.clone());
             registry.units.insert(record.name.clone(), record);
         }
 

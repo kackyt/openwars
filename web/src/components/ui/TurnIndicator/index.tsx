@@ -16,6 +16,7 @@ interface TurnIndicatorProps {
 /**
  * ターンインジケーターコンポーネント
  * 現在のターン数、フェーズ（プレイヤー）、資金量を表示し、ターン終了操作を行うためのUIです。
+ * カーソルが画面右上エリアにホバーした場合は左上に動的退避し、マップ遮蔽を防ぎます。
  */
 export const TurnIndicator = ({
   turn,

@@ -96,6 +96,8 @@ export interface ActionMenuState {
 export interface ProduceMenuState {
   x: number;
   y: number;
+  gridX: number;
+  gridY: number;
   units: { type: string; name: string; cost: number }[];
 }
 
@@ -153,10 +155,10 @@ export interface GameState {
 
   // Interaction Actions
   selectUnit: (unitId: string) => Promise<void>;
-  selectMoveTarget: (x: number, y: number) => Promise<void>;
+  selectMoveTarget: (x: number, y: number, screenX?: number, screenY?: number) => Promise<void>;
   cancelInteraction: () => void;
   executeAction: (actionType: string, targetId?: string) => Promise<void>;
-  openProduceMenu: (x: number, y: number) => Promise<void>;
+  openProduceMenu: (x: number, y: number, screenX?: number, screenY?: number) => Promise<void>;
   closeProduceMenu: () => void;
   executeProduce: (unitType: string, x: number, y: number) => Promise<void>;
   // 降車フロー用アクション
@@ -320,7 +322,7 @@ export const useGameStore = create<GameState>((set, get) => ({
     }
   },
 
-  selectMoveTarget: async (x: number, y: number) => {
+  selectMoveTarget: async (x: number, y: number, screenX?: number, screenY?: number) => {
     const { engineWorker, selectedUnitId } = get();
     if (!engineWorker || !selectedUnitId) return;
     try {
@@ -329,7 +331,9 @@ export const useGameStore = create<GameState>((set, get) => ({
         interactionState: "action_menu",
         selectedTargetPos: { x, y },
       });
-      get().openActionMenu(x, y, selectedUnitId, actions);
+      const menuX = screenX !== undefined ? screenX : x;
+      const menuY = screenY !== undefined ? screenY : y;
+      get().openActionMenu(menuX, menuY, selectedUnitId, actions);
     } catch (e) {
       console.error("Failed in selectMoveTarget action:", e);
     }
@@ -391,6 +395,13 @@ export const useGameStore = create<GameState>((set, get) => ({
           selectedTargetPos.y,
         );
         await engineWorker.submitCaptureCommand(selectedUnitId);
+      } else if (actionType === "Repair") {
+        await engineWorker.submitMoveCommand(
+          selectedUnitId,
+          selectedTargetPos.x,
+          selectedTargetPos.y,
+        );
+        await engineWorker.submitRepairCommand(selectedUnitId);
       } else if (actionType === "Load") {
         await engineWorker.submitMoveCommand(
           selectedUnitId,
@@ -437,15 +448,17 @@ export const useGameStore = create<GameState>((set, get) => ({
     }
   },
 
-  openProduceMenu: async (x: number, y: number) => {
+  openProduceMenu: async (x: number, y: number, screenX?: number, screenY?: number) => {
     const { engineWorker } = get();
     if (!engineWorker) return;
     try {
       const units = await engineWorker.getProducibleUnits(x, y);
       if (units && units.length > 0) {
+        const menuX = screenX !== undefined ? screenX : x;
+        const menuY = screenY !== undefined ? screenY : y;
         set({
           interactionState: "produce_menu",
-          produceMenu: { x, y, units },
+          produceMenu: { x: menuX, y: menuY, gridX: x, gridY: y, units },
         });
       }
     } catch (e) {

@@ -979,10 +979,8 @@ impl App {
                         return;
                     };
 
-                    let mut sorted_names: Vec<_> = self.master_data.units.keys().cloned().collect();
-                    sorted_names.sort_by(|a, b| a.0.cmp(&b.0));
-                    for name in sorted_names {
-                        if let Some(record) = self.master_data.units.get(&name) {
+                    for name in &self.master_data.unit_order {
+                        if let Some(record) = self.master_data.units.get(name) {
                             if player_funds < record.cost {
                                 continue;
                             }

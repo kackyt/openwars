@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { clampCameraPosition, globalToGrid } from "./camera";
+import { clampCameraPosition, globalToGrid, gridToGlobal } from "./camera";
 
 describe("camera utils", () => {
   describe("globalToGrid", () => {
@@ -28,30 +28,44 @@ describe("camera utils", () => {
     });
   });
 
-  describe("clampCameraPosition", () => {
-    it("should clamp camera coordinates within maps boundaries", () => {
-      // マップサイズ 480x480、ウィンドウサイズ 640x480
-      // ウィンドウの方が大きい場合、minX = 640 - 480 = 160. だが Math.min(0, 160) = 0.
-      // したがって、xは [0, 0] にクランプされる。
-      const result = clampCameraPosition(100, 100, 480, 480, 640, 480);
-      expect(result).toEqual({ x: 0, y: 0 });
+  describe("gridToGlobal", () => {
+    it("should calculate correct screen coordinates for square topology", () => {
+      const result = gridToGlobal(2, 1, -10, -20, "square", 48);
+      // X: 2 * 48 + 0 - 10 = 86
+      // Y: 1 * 48 - 20 = 28
+      expect(result).toEqual({ globalX: 86, globalY: 28 });
     });
 
-    it("should allow scroll up to negative map boundaries when window is smaller", () => {
+    it("should offset globalX for odd rows in hex topology", () => {
+      const result = gridToGlobal(2, 1, -10, -20, "hex", 48);
+      // X: 2 * 48 + 24 - 10 = 110
+      // Y: 1 * 48 - 20 = 28
+      expect(result).toEqual({ globalX: 110, globalY: 28 });
+    });
+  });
+
+  describe("clampCameraPosition", () => {
+    it("should clamp camera coordinates within padded boundaries", () => {
+      // マップサイズ 480x480、ウィンドウサイズ 640x480
+      // PADDING_LEFT=60, PADDING_TOP=120 にクランプされる
+      const result = clampCameraPosition(200, 200, 480, 480, 640, 480);
+      expect(result).toEqual({ x: 60, y: 120 });
+    });
+
+    it("should allow scrolling with padding to expose map edges around UI panels", () => {
       // マップサイズ 960x960, ウィンドウサイズ 640x480
-      // minX = 640 - 960 = -320
-      // minY = 480 - 960 = -480
-      // 正常スクロール範囲は x: [-320, 0], y: [-480, 0]
+      // minX = 640 - 960 - 120 = -440, maxX = 60
+      // minY = 480 - 960 - 140 = -620, maxY = 120
       const resultNormal = clampCameraPosition(-100, -200, 960, 960, 640, 480);
       expect(resultNormal).toEqual({ x: -100, y: -200 });
 
-      // 左上の境界外にクランプされる
-      const resultTooFarLeftUp = clampCameraPosition(100, 50, 960, 960, 640, 480);
-      expect(resultTooFarLeftUp).toEqual({ x: 0, y: 0 });
+      // 左上の限界値
+      const resultTooFarLeftUp = clampCameraPosition(200, 300, 960, 960, 640, 480);
+      expect(resultTooFarLeftUp).toEqual({ x: 60, y: 120 });
 
-      // 右下の境界外にクランプされる
-      const resultTooFarRightDown = clampCameraPosition(-500, -600, 960, 960, 640, 480);
-      expect(resultTooFarRightDown).toEqual({ x: -320, y: -480 });
+      // 右下の限界値
+      const resultTooFarRightDown = clampCameraPosition(-700, -800, 960, 960, 640, 480);
+      expect(resultTooFarRightDown).toEqual({ x: -440, y: -620 });
     });
   });
 });

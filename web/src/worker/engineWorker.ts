@@ -171,6 +171,15 @@ export class EngineWorker {
   }
 
   /**
+   * 施設修復コマンドを送信します。
+   * @param unitId 修復を実行するユニットID
+   */
+  async submitRepairCommand(unitId: string): Promise<void> {
+    if (!this.engine) throw new Error("Engine not initialized");
+    this.engine.submit_repair_command(unitId);
+  }
+
+  /**
    * ユニット積載コマンドを送信します。
    * @param unitId 搭載するユニットID
    * @param targetId 搭載先（輸送船等）のユニットID
