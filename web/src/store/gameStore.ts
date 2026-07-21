@@ -52,7 +52,7 @@
 
 import * as Comlink from "comlink";
 import { create } from "zustand";
-import { PHASE_P1, PHASE_P2 } from "../constants/mappings";
+import { getActiveFaction, PHASE_P1, PHASE_P2 } from "../constants/mappings";
 import type { EngineWorker } from "../worker/engineWorker";
 
 /** AIの思考ターンで無限ループに陥らないための最大ループ回数ガード */
@@ -311,11 +311,21 @@ export const useGameStore = create<GameState>((set, get) => ({
   },
 
   selectUnit: async (unitId: string) => {
-    const { engineWorker, unitData } = get();
+    const { engineWorker, unitData, turnInfo, p1IsAi, p2IsAi } = get();
     if (!engineWorker) return;
     try {
+      const activeFaction = getActiveFaction(turnInfo?.phase);
+      if (!activeFaction) return;
+
+      // 現在のターンがAIのターンの場合は操作不可
+      const isAiTurn =
+        (turnInfo?.phase === PHASE_P1 && p1IsAi) || (turnInfo?.phase === PHASE_P2 && p2IsAi);
+      if (isAiTurn) return;
+
       const unit = unitData.find((u) => u.id === unitId);
-      if (unit?.is_exhausted) return; // 行動済みなら選択不可
+      if (!unit) return;
+      if (unit.faction !== activeFaction) return; // 操作対象でない軍のユニットなら選択不可
+      if (unit.is_exhausted) return; // 行動済みなら選択不可
 
       if (unit?.has_moved) {
         // すでに移動済みのユニットが選択された場合：
@@ -473,9 +483,20 @@ export const useGameStore = create<GameState>((set, get) => ({
   },
 
   openProduceMenu: async (x: number, y: number, screenX?: number, screenY?: number) => {
-    const { engineWorker } = get();
+    const { engineWorker, propertyData, turnInfo, p1IsAi, p2IsAi } = get();
     if (!engineWorker) return;
     try {
+      const activeFaction = getActiveFaction(turnInfo?.phase);
+      if (!activeFaction) return;
+
+      // 現在のターンがAIのターンの場合は操作不可
+      const isAiTurn =
+        (turnInfo?.phase === PHASE_P1 && p1IsAi) || (turnInfo?.phase === PHASE_P2 && p2IsAi);
+      if (isAiTurn) return;
+
+      const property = propertyData.find((p) => p.x === x && p.y === y);
+      if (!property || property.owner !== activeFaction) return; // 自軍拠点でなければ生産不可
+
       const units = await engineWorker.getProducibleUnits(x, y);
       if (units && units.length > 0) {
         const menuX = screenX !== undefined ? screenX : x;

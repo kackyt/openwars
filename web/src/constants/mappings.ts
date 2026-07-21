@@ -100,3 +100,10 @@ export const FACTION_GREEN = "green";
 export const FACTION_NEUTRAL = "neutral";
 
 export const TERRAIN_CAPITAL = "capital";
+
+/** 現在のフェーズ(P1/P2)に対応するアクティブな勢力を取得する */
+export const getActiveFaction = (phase?: string): string | null => {
+  if (phase === PHASE_P1) return FACTION_GREEN;
+  if (phase === PHASE_P2) return FACTION_BLUE;
+  return null;
+};

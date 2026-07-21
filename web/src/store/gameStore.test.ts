@@ -89,4 +89,94 @@ describe("gameStore", () => {
       });
     });
   });
+
+  describe("selectUnit & openProduceMenu faction guard", () => {
+    it("should not select non-active faction unit", async () => {
+      const store = useGameStore.getState();
+
+      // P1ターン (緑軍: green) の状態をセット
+      useGameStore.setState({
+        turnInfo: { turn: 1, phase: "P1", funds: 1000 },
+        engineWorker: {
+          getReachableCells: async () => [{ x: 1, y: 1 }],
+        } as unknown as import("comlink").Remote<import("../worker/engineWorker").EngineWorker>,
+        unitData: [
+          {
+            id: "enemy-unit",
+            type: "infantry",
+            faction: "blue", // 敵軍 (青軍)
+            x: 2,
+            y: 2,
+            hp: 10,
+            is_loaded: false,
+            is_exhausted: false,
+            fuel: { current: 99, max: 99 },
+            weapons: [],
+          },
+          {
+            id: "own-unit",
+            type: "infantry",
+            faction: "green", // 自軍 (緑軍)
+            x: 1,
+            y: 1,
+            hp: 10,
+            is_loaded: false,
+            is_exhausted: false,
+            fuel: { current: 99, max: 99 },
+            weapons: [],
+          },
+        ],
+      });
+
+      // 敵ユニットを選択しようとする
+      await store.selectUnit("enemy-unit");
+      expect(useGameStore.getState().interactionState).toBe("idle");
+      expect(useGameStore.getState().selectedUnitId).toBeNull();
+
+      // 自軍ユニットを選択する
+      await store.selectUnit("own-unit");
+      expect(useGameStore.getState().interactionState).toBe("unit_selected");
+      expect(useGameStore.getState().selectedUnitId).toBe("own-unit");
+    });
+
+    it("should not open produce menu for non-active faction property", async () => {
+      const store = useGameStore.getState();
+
+      // P1ターン (緑軍: green) の状態をセット
+      useGameStore.setState({
+        turnInfo: { turn: 1, phase: "P1", funds: 1000 },
+        engineWorker: {
+          getProducibleUnits: async () => [{ type: "infantry", name: "歩兵", cost: 1000 }],
+        } as unknown as import("comlink").Remote<import("../worker/engineWorker").EngineWorker>,
+        propertyData: [
+          {
+            x: 0,
+            y: 0,
+            type: "factory",
+            owner: "blue", // 敵拠点
+            capture_points: 20,
+            max_capture_points: 20,
+          },
+          {
+            x: 1,
+            y: 1,
+            type: "factory",
+            owner: "green", // 自軍拠点
+            capture_points: 20,
+            max_capture_points: 20,
+          },
+        ],
+      });
+
+      // 敵拠点に対して生産メニューを開こうとする
+      await store.openProduceMenu(0, 0);
+      expect(useGameStore.getState().produceMenu).toBeNull();
+      expect(useGameStore.getState().interactionState).toBe("idle");
+
+      // 自軍拠点に対して生産メニューを開こうとする
+      await store.openProduceMenu(1, 1);
+      expect(useGameStore.getState().produceMenu).not.toBeNull();
+      expect(useGameStore.getState().interactionState).toBe("produce_menu");
+    });
+  });
 });
