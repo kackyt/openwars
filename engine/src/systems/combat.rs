@@ -192,7 +192,7 @@ pub fn can_attack(
             && dist >= w1.range_min
             && dist <= w1.range_max
         {
-            let is_indirect = w1.range_min > 1;
+            let is_indirect = dist > 1;
             if is_indirect && has_moved_val {
                 indirect_after_move = true;
             } else {
@@ -307,7 +307,7 @@ pub fn get_attackable_targets_at(
                 && dmg > 0
                 && a_ammo1 > 0
             {
-                let is_indirect = w1.range_min > 1;
+                let is_indirect = dist > 1;
                 // 移動制限にかからず、かつ射程内であれば攻撃可能
                 if (!is_indirect || allow_indirect) && dist >= w1.range_min && dist <= w1.range_max
                 {
@@ -322,7 +322,7 @@ pub fn get_attackable_targets_at(
             && w2.damages.get(target_type_name).copied().unwrap_or(0) > 0
             && a_ammo2 > 0
         {
-            let is_indirect = w2.range_min > 1;
+            let is_indirect = dist > 1;
             if (!is_indirect || allow_indirect) && dist >= w2.range_min && dist <= w2.range_max {
                 can_attack = true;
             }
@@ -361,7 +361,7 @@ pub fn select_weapon(
         && let Some(&dmg) = w1.damages.get(defender_name)
         && dmg > 0
     {
-        return Some((1, dmg, w1.range_min > 1));
+        return Some((1, dmg, dist > 1));
     }
 
     // 武器 2 を試行
@@ -379,7 +379,7 @@ pub fn select_weapon(
             && let Some(&dmg) = w2.damages.get(defender_name)
             && dmg > 0
         {
-            return Some((2, dmg, w2.range_min > 1));
+            return Some((2, dmg, dist > 1));
         }
     }
 
@@ -996,5 +996,169 @@ mod tests {
         // Observed results
         assert_eq!(hp_plains, 32);
         assert_eq!(hp_mt, 49);
+    }
+
+    #[test]
+    fn test_heavy_tank_indirect_attack_after_move_prohibited() {
+        let mut world = World::new();
+        world.insert_resource(Map::new(10, 10, Terrain::Plains, GridTopology::Square));
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+
+        let tankz = world
+            .spawn((
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Ammo {
+                    ammo1: 9,
+                    max_ammo1: 9,
+                    ammo2: 9,
+                    max_ammo2: 9,
+                },
+                GridPosition { x: 0, y: 0 },
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::TankZ,
+                    min_range: 1,
+                    max_range: 3,
+                    ..UnitStats::mock()
+                },
+            ))
+            .id();
+
+        let enemy_dist1 = world
+            .spawn((
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                GridPosition { x: 0, y: 1 },
+                Faction(PlayerId(2)),
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    ..UnitStats::mock()
+                },
+            ))
+            .id();
+
+        let enemy_dist2 = world
+            .spawn((
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                GridPosition { x: 0, y: 2 },
+                Faction(PlayerId(2)),
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    ..UnitStats::mock()
+                },
+            ))
+            .id();
+
+        // 移動後 (allow_indirect = false)
+        let targets_after_move =
+            get_attackable_targets_at(&mut world, tankz, GridPosition { x: 0, y: 0 }, false);
+        assert!(
+            targets_after_move.contains(&enemy_dist1),
+            "移動後でも距離1(隣接)には攻撃可能"
+        );
+        assert!(
+            !targets_after_move.contains(&enemy_dist2),
+            "移動後は距離2(間接)には攻撃不可"
+        );
+
+        // 移動前 (allow_indirect = true)
+        let targets_before_move =
+            get_attackable_targets_at(&mut world, tankz, GridPosition { x: 0, y: 0 }, true);
+        assert!(
+            targets_before_move.contains(&enemy_dist1),
+            "移動前は距離1に攻撃可能"
+        );
+        assert!(
+            targets_before_move.contains(&enemy_dist2),
+            "移動前は距離2(間接)に攻撃可能"
+        );
+    }
+
+    #[test]
+    fn test_rockets_indirect_attack_after_move_prohibited() {
+        let mut world = World::new();
+        world.insert_resource(Map::new(10, 10, Terrain::Plains, GridTopology::Square));
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+
+        let rockets = world
+            .spawn((
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Ammo {
+                    ammo1: 9,
+                    max_ammo1: 9,
+                    ammo2: 0,
+                    max_ammo2: 0,
+                },
+                GridPosition { x: 0, y: 0 },
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::Rockets,
+                    min_range: 2,
+                    max_range: 3,
+                    ..UnitStats::mock()
+                },
+            ))
+            .id();
+
+        let enemy_dist1 = world
+            .spawn((
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                GridPosition { x: 0, y: 1 },
+                Faction(PlayerId(2)),
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    ..UnitStats::mock()
+                },
+            ))
+            .id();
+
+        let enemy_dist2 = world
+            .spawn((
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                GridPosition { x: 0, y: 2 },
+                Faction(PlayerId(2)),
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    ..UnitStats::mock()
+                },
+            ))
+            .id();
+
+        // 移動前 (allow_indirect = true)
+        let targets_before_move =
+            get_attackable_targets_at(&mut world, rockets, GridPosition { x: 0, y: 0 }, true);
+        assert!(
+            !targets_before_move.contains(&enemy_dist1),
+            "ロケットランチャーは距離1に攻撃不可"
+        );
+        assert!(
+            targets_before_move.contains(&enemy_dist2),
+            "ロケットランチャーは移動前に距離2へ攻撃可能"
+        );
+
+        // 移動後 (allow_indirect = false)
+        let targets_after_move =
+            get_attackable_targets_at(&mut world, rockets, GridPosition { x: 0, y: 0 }, false);
+        assert!(
+            targets_after_move.is_empty(),
+            "ロケットランチャーは移動後に一切攻撃不可"
+        );
     }
 }
