@@ -119,6 +119,21 @@ pub fn calculate_reachable_tiles(
             continue; // Enemy unit: Cannot expand through (block)
         }
 
+        // 浅瀬の自軍輸送船マスに到達した場合は搭載停止となるため、そこからの移動拡張は行わない
+        if position != start
+            && movement_type != MovementType::Air
+            && movement_type != MovementType::Ship
+            && map.get_terrain(position.0, position.1) == Some(Terrain::Shoal)
+            && unit_positions.get(&position).is_some_and(|occ| {
+                occ.player_id == player_id
+                    && occ.is_transport
+                    && occ.free_slots > 0
+                    && occ.loadable_types.contains(&moving_unit_type)
+            })
+        {
+            continue;
+        }
+
         for (nx, ny) in map.get_adjacent(position.0, position.1) {
             if unit_positions
                 .get(&(nx, ny))
@@ -127,10 +142,31 @@ pub fn calculate_reachable_tiles(
                 continue; // Enemy: Can't enter/pass
             }
 
-            if let Some(terrain_cost) = map
+            let normal_terrain_cost = map
                 .get_terrain(nx, ny)
-                .and_then(|t| get_valid_movement_cost(master_data, movement_type, t))
+                .and_then(|t| get_valid_movement_cost(master_data, movement_type, t));
+
+            let is_shoal_transport = if movement_type != MovementType::Air
+                && movement_type != MovementType::Ship
+                && map.get_terrain(nx, ny) == Some(Terrain::Shoal)
             {
+                unit_positions.get(&(nx, ny)).is_some_and(|occ| {
+                    occ.player_id == player_id
+                        && occ.is_transport
+                        && occ.free_slots > 0
+                        && occ.loadable_types.contains(&moving_unit_type)
+                })
+            } else {
+                false
+            };
+
+            let terrain_cost = if is_shoal_transport {
+                Some(1)
+            } else {
+                normal_terrain_cost
+            };
+
+            if let Some(terrain_cost) = terrain_cost {
                 let next_cost = cost + terrain_cost;
                 let next_fuel = fuel_used + 1;
 
@@ -276,7 +312,8 @@ pub fn find_path_a_star(
         }
 
         for (nx, ny) in map.get_adjacent(position.0, position.1) {
-            if let Some(occ) = unit_positions.get(&(nx, ny)) {
+            let occ_opt = unit_positions.get(&(nx, ny));
+            if let Some(occ) = occ_opt {
                 if occ.player_id != player_id {
                     if (nx, ny) != goal {
                         continue; // Enemy: Can't enter/pass unless it's the goal itself
@@ -292,10 +329,35 @@ pub fn find_path_a_star(
                 }
             }
 
-            if let Some(terrain_cost) = map
+            let normal_terrain_cost = map
                 .get_terrain(nx, ny)
-                .and_then(|t| get_valid_movement_cost(master_data, movement_type, t))
+                .and_then(|t| get_valid_movement_cost(master_data, movement_type, t));
+
+            let is_shoal_transport = if movement_type != MovementType::Air
+                && movement_type != MovementType::Ship
+                && map.get_terrain(nx, ny) == Some(Terrain::Shoal)
             {
+                occ_opt.is_some_and(|occ| {
+                    occ.player_id == player_id
+                        && occ.is_transport
+                        && occ.free_slots > 0
+                        && occ.loadable_types.contains(&moving_unit_type)
+                })
+            } else {
+                false
+            };
+
+            let terrain_cost = if is_shoal_transport {
+                Some(1)
+            } else {
+                normal_terrain_cost
+            };
+
+            if is_shoal_transport && (nx, ny) != goal {
+                continue;
+            }
+
+            if let Some(terrain_cost) = terrain_cost {
                 let next_cost = cost + terrain_cost;
                 let next_fuel = fuel_used + 1;
 
