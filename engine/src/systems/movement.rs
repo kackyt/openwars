@@ -479,9 +479,9 @@ pub fn move_unit_system(
                 pos.y = event.target_y;
                 let old_fuel = fuel.current;
                 fuel.current = fuel.current.saturating_sub(fuel_used);
-                if from.x != event.target_x || from.y != event.target_y {
-                    has_moved.0 = true;
+                has_moved.0 = true;
 
+                if from.x != event.target_x || from.y != event.target_y {
                     // Record for undo
                     commands.insert_resource(PendingMove {
                         unit_entity: entity,

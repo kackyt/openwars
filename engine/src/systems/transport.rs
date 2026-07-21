@@ -215,6 +215,9 @@ pub fn load_unit_system(
                 commands
                     .entity(event.unit_entity)
                     .insert(Transporting(event.transport_entity));
+                commands
+                    .entity(event.transport_entity)
+                    .insert(HasMoved(true));
 
                 // 積載完了イベントを送出
                 loaded_writer.send(UnitLoadedEvent {
@@ -377,6 +380,9 @@ pub fn unload_unit_system(
             cargo.1.y = event.target_y;
             cargo.3.0 = true; // Unloaded unit is completed for the turn
             commands.entity(event.cargo_entity).remove::<Transporting>();
+            commands
+                .entity(event.transport_entity)
+                .insert(HasMoved(true));
 
             // 降車完了イベントを送出
             unloaded_writer.send(UnitUnloadedEvent {
@@ -1262,5 +1268,8 @@ mod tests {
         let cargo_pos = world.get::<GridPosition>(cargo).unwrap();
         assert_eq!(cargo_pos.x, 3);
         assert_eq!(cargo_pos.y, 2);
+
+        // 降車後、輸送ユニットに HasMoved(true) が付与されていることを検証
+        assert!(world.get::<HasMoved>(transport).is_some_and(|h| h.0));
     }
 }

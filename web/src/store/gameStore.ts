@@ -67,6 +67,7 @@ export interface UnitData {
   hp: number;
   is_loaded: boolean;
   is_exhausted: boolean;
+  has_moved?: boolean;
   fuel: { current: number; max: number };
   weapons: { name: string; ammo: number; max_ammo: number; min_range: number; max_range: number }[];
 }
@@ -315,6 +316,25 @@ export const useGameStore = create<GameState>((set, get) => ({
     try {
       const unit = unitData.find((u) => u.id === unitId);
       if (unit?.is_exhausted) return; // 行動済みなら選択不可
+
+      if (unit?.has_moved) {
+        // すでに移動済みのユニットが選択された場合：
+        // 移動先選択モード (unit_selected) には遷移せず、直ちに現在地でのアクションメニューを開く
+        const actions = await engineWorker.getAvailableActions(unitId, unit.x, unit.y);
+        if (actions && actions.length > 0) {
+          set({
+            interactionState: "action_menu",
+            selectedUnitId: unitId,
+            selectedTargetPos: { x: unit.x, y: unit.y },
+            reachableCells: [],
+          });
+          get().openActionMenu(unit.x, unit.y, unitId, actions);
+        } else {
+          get().cancelInteraction();
+        }
+        return;
+      }
+
       const cells = await engineWorker.getReachableCells(unitId);
       set({
         interactionState: "unit_selected",
@@ -523,8 +543,19 @@ export const useGameStore = create<GameState>((set, get) => ({
     if (!engineWorker || !selectedUnitId || !dropCargoId) return;
     try {
       await engineWorker.submitUnloadCommand(selectedUnitId, dropCargoId, x, y);
-      get().cancelInteraction();
+      const remainingLoaded = await engineWorker.getLoadedUnits(selectedUnitId);
       await get().syncGameState();
+      if (remainingLoaded && remainingLoaded.length > 0) {
+        set({
+          interactionState: "drop_unit_selection",
+          loadedUnits: remainingLoaded,
+          actionMenu: null,
+          reachableCells: [],
+          dropCargoId: null,
+        });
+      } else {
+        get().cancelInteraction();
+      }
     } catch (e) {
       console.error("Failed to execute drop target:", e);
       get().cancelInteraction();
