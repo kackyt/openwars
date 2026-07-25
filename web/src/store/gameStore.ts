@@ -52,11 +52,15 @@
 
 import * as Comlink from "comlink";
 import { create } from "zustand";
-import { getActiveFaction, PHASE_P1, PHASE_P2 } from "../constants/mappings";
+import { PHASE_P1, PHASE_P2 } from "../constants/mappings";
 import type { EngineWorker } from "../worker/engineWorker";
 
 /** AIの思考ターンで無限ループに陥らないための最大ループ回数ガード */
 const MAX_AI_ACTION_LOOPS = 100;
+
+/** 現在のフェーズがAIプレイヤーの手番かを判定する */
+const isAiPhase = (phase: string | undefined, p1IsAi: boolean, p2IsAi: boolean): boolean =>
+  (phase === PHASE_P1 && p1IsAi) || (phase === PHASE_P2 && p2IsAi);
 
 export interface UnitData {
   id: string;
@@ -248,8 +252,7 @@ export const useGameStore = create<GameState>((set, get) => ({
 
       const { turnInfo, p1IsAi: isP1Ai, p2IsAi: isP2Ai } = get();
       if (turnInfo) {
-        const isAiTurn =
-          (turnInfo.phase === PHASE_P1 && isP1Ai) || (turnInfo.phase === PHASE_P2 && isP2Ai);
+        const isAiTurn = isAiPhase(turnInfo.phase, isP1Ai, isP2Ai);
         if (isAiTurn) {
           await get().tickAiTurn();
         }
@@ -314,22 +317,17 @@ export const useGameStore = create<GameState>((set, get) => ({
     const { engineWorker, unitData, turnInfo, p1IsAi, p2IsAi } = get();
     if (!engineWorker) return;
     try {
-      const activeFaction = getActiveFaction(turnInfo?.phase);
-      if (!activeFaction) return;
+      // AIプレイヤーの手番中はプレイヤー入力を受け付けない
+      if (isAiPhase(turnInfo?.phase, p1IsAi, p2IsAi)) return;
 
-      // 現在のターンがAIのターンの場合は操作不可
-      const isAiTurn =
-        (turnInfo?.phase === PHASE_P1 && p1IsAi) || (turnInfo?.phase === PHASE_P2 && p2IsAi);
-      if (isAiTurn) return;
+      // 勢力・行動済み・搭載中などのゲームルールは engine の判定を利用する
+      if (!(await engineWorker.isUnitSelectable(unitId))) return;
 
-      const unit = unitData.find((u) => u.id === unitId);
+      const unit = unitData.find((candidate) => candidate.id === unitId);
       if (!unit) return;
-      if (unit.faction !== activeFaction) return; // 操作対象でない軍のユニットなら選択不可
-      if (unit.is_exhausted) return; // 行動済みなら選択不可
 
-      if (unit?.has_moved) {
-        // すでに移動済みのユニットが選択された場合：
-        // 移動先選択モード (unit_selected) には遷移せず、直ちに現在地でのアクションメニューを開く
+      if (!(await engineWorker.canUnitMove(unitId))) {
+        // 再移動不可の場合は、engine が返す現在地でのアクションだけを表示する
         const actions = await engineWorker.getAvailableActions(unitId, unit.x, unit.y);
         if (actions && actions.length > 0) {
           set({
@@ -483,20 +481,13 @@ export const useGameStore = create<GameState>((set, get) => ({
   },
 
   openProduceMenu: async (x: number, y: number, screenX?: number, screenY?: number) => {
-    const { engineWorker, propertyData, turnInfo, p1IsAi, p2IsAi } = get();
+    const { engineWorker, turnInfo, p1IsAi, p2IsAi } = get();
     if (!engineWorker) return;
     try {
-      const activeFaction = getActiveFaction(turnInfo?.phase);
-      if (!activeFaction) return;
+      // AIプレイヤーの手番中はプレイヤー入力を受け付けない
+      if (isAiPhase(turnInfo?.phase, p1IsAi, p2IsAi)) return;
 
-      // 現在のターンがAIのターンの場合は操作不可
-      const isAiTurn =
-        (turnInfo?.phase === PHASE_P1 && p1IsAi) || (turnInfo?.phase === PHASE_P2 && p2IsAi);
-      if (isAiTurn) return;
-
-      const property = propertyData.find((p) => p.x === x && p.y === y);
-      if (!property || property.owner !== activeFaction) return; // 自軍拠点でなければ生産不可
-
+      // 所有者・地形・占有・生産範囲などは engine が返す生産可能一覧に集約する
       const units = await engineWorker.getProducibleUnits(x, y);
       if (units && units.length > 0) {
         const menuX = screenX !== undefined ? screenX : x;
@@ -615,8 +606,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       // AIターンはWasm内部でNextPhaseCommandが処理されて終了しているため、直接次のターンの状態を確認する
       const { turnInfo, p1IsAi, p2IsAi } = get();
       if (turnInfo) {
-        const isNextAiTurn =
-          (turnInfo.phase === PHASE_P1 && p1IsAi) || (turnInfo.phase === PHASE_P2 && p2IsAi);
+        const isNextAiTurn = isAiPhase(turnInfo.phase, p1IsAi, p2IsAi);
         if (isNextAiTurn) {
           await get().tickAiTurn();
         } else {
@@ -642,8 +632,7 @@ export const useGameStore = create<GameState>((set, get) => ({
 
       const { turnInfo, p1IsAi, p2IsAi } = get();
       if (turnInfo) {
-        const isAiTurn =
-          (turnInfo.phase === PHASE_P1 && p1IsAi) || (turnInfo.phase === PHASE_P2 && p2IsAi);
+        const isAiTurn = isAiPhase(turnInfo.phase, p1IsAi, p2IsAi);
         if (isAiTurn) {
           await get().tickAiTurn();
         } else {

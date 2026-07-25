@@ -1,11 +1,23 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import type { Remote } from "comlink";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { EngineWorker } from "../worker/engineWorker";
 import { useGameStore } from "./gameStore";
+
+const asEngineWorker = (worker: Partial<EngineWorker>): Remote<EngineWorker> =>
+  worker as unknown as Remote<EngineWorker>;
 
 describe("gameStore", () => {
   beforeEach(() => {
     // 各テスト前にストアの状態を初期化する
-    const store = useGameStore.getState();
-    store.cancelInteraction();
+    useGameStore.setState({
+      engineWorker: null,
+      unitData: [],
+      propertyData: [],
+      turnInfo: null,
+      p1IsAi: false,
+      p2IsAi: false,
+    });
+    useGameStore.getState().cancelInteraction();
   });
 
   describe("cancelInteraction", () => {
@@ -90,93 +102,141 @@ describe("gameStore", () => {
     });
   });
 
-  describe("selectUnit & openProduceMenu faction guard", () => {
-    it("should not select non-active faction unit", async () => {
-      const store = useGameStore.getState();
+  describe("engine-backed interaction guards", () => {
+    const units = [
+      {
+        id: "enemy-unit",
+        type: "infantry",
+        faction: "blue",
+        x: 2,
+        y: 2,
+        hp: 10,
+        is_loaded: false,
+        is_exhausted: false,
+        fuel: { current: 99, max: 99 },
+        weapons: [],
+      },
+      {
+        id: "own-unit",
+        type: "infantry",
+        faction: "green",
+        x: 1,
+        y: 1,
+        hp: 10,
+        is_loaded: false,
+        is_exhausted: false,
+        fuel: { current: 99, max: 99 },
+        weapons: [],
+      },
+    ];
 
-      // P1ターン (緑軍: green) の状態をセット
+    it("uses the engine result to decide whether a unit is selectable", async () => {
+      const isUnitSelectable = vi.fn(async (unitId: string) => unitId === "own-unit");
       useGameStore.setState({
         turnInfo: { turn: 1, phase: "P1", funds: 1000 },
-        engineWorker: {
+        engineWorker: asEngineWorker({
+          isUnitSelectable,
+          canUnitMove: async () => true,
           getReachableCells: async () => [{ x: 1, y: 1 }],
-        } as unknown as import("comlink").Remote<import("../worker/engineWorker").EngineWorker>,
-        unitData: [
-          {
-            id: "enemy-unit",
-            type: "infantry",
-            faction: "blue", // 敵軍 (青軍)
-            x: 2,
-            y: 2,
-            hp: 10,
-            is_loaded: false,
-            is_exhausted: false,
-            fuel: { current: 99, max: 99 },
-            weapons: [],
-          },
-          {
-            id: "own-unit",
-            type: "infantry",
-            faction: "green", // 自軍 (緑軍)
-            x: 1,
-            y: 1,
-            hp: 10,
-            is_loaded: false,
-            is_exhausted: false,
-            fuel: { current: 99, max: 99 },
-            weapons: [],
-          },
-        ],
+        }),
+        unitData: units,
       });
 
-      // 敵ユニットを選択しようとする
-      await store.selectUnit("enemy-unit");
+      await useGameStore.getState().selectUnit("enemy-unit");
       expect(useGameStore.getState().interactionState).toBe("idle");
       expect(useGameStore.getState().selectedUnitId).toBeNull();
 
-      // 自軍ユニットを選択する
-      await store.selectUnit("own-unit");
+      await useGameStore.getState().selectUnit("own-unit");
       expect(useGameStore.getState().interactionState).toBe("unit_selected");
       expect(useGameStore.getState().selectedUnitId).toBe("own-unit");
+      expect(isUnitSelectable).toHaveBeenCalledWith("own-unit");
     });
 
-    it("should not open produce menu for non-active faction property", async () => {
-      const store = useGameStore.getState();
-
-      // P1ターン (緑軍: green) の状態をセット
+    it("opens the current-position action menu when the engine disallows another move", async () => {
       useGameStore.setState({
         turnInfo: { turn: 1, phase: "P1", funds: 1000 },
-        engineWorker: {
-          getProducibleUnits: async () => [{ type: "infantry", name: "歩兵", cost: 1000 }],
-        } as unknown as import("comlink").Remote<import("../worker/engineWorker").EngineWorker>,
-        propertyData: [
-          {
-            x: 0,
-            y: 0,
-            type: "factory",
-            owner: "blue", // 敵拠点
-            capture_points: 20,
-            max_capture_points: 20,
-          },
-          {
-            x: 1,
-            y: 1,
-            type: "factory",
-            owner: "green", // 自軍拠点
-            capture_points: 20,
-            max_capture_points: 20,
-          },
-        ],
+        engineWorker: asEngineWorker({
+          isUnitSelectable: async () => true,
+          canUnitMove: async () => false,
+          getAvailableActions: async () => ["Attack", "Wait"],
+        }),
+        unitData: [units[1]],
+        reachableCells: [{ x: 9, y: 9 }],
       });
 
-      // 敵拠点に対して生産メニューを開こうとする
-      await store.openProduceMenu(0, 0);
-      expect(useGameStore.getState().produceMenu).toBeNull();
-      expect(useGameStore.getState().interactionState).toBe("idle");
+      await useGameStore.getState().selectUnit("own-unit");
 
-      // 自軍拠点に対して生産メニューを開こうとする
-      await store.openProduceMenu(1, 1);
-      expect(useGameStore.getState().produceMenu).not.toBeNull();
+      const state = useGameStore.getState();
+      expect(state.interactionState).toBe("action_menu");
+      expect(state.selectedTargetPos).toEqual({ x: 1, y: 1 });
+      expect(state.reachableCells).toEqual([]);
+      expect(state.actionMenu?.actions).toEqual(["Attack", "Wait"]);
+    });
+
+    it("blocks unit selection and production during an AI phase", async () => {
+      const isUnitSelectable = vi.fn(async () => true);
+      const getProducibleUnits = vi.fn(async () => [
+        { type: "infantry", name: "歩兵", cost: 1000 },
+      ]);
+      useGameStore.setState({
+        turnInfo: { turn: 1, phase: "P1", funds: 1000 },
+        p1IsAi: true,
+        engineWorker: asEngineWorker({ isUnitSelectable, getProducibleUnits }),
+        unitData: [units[1]],
+      });
+
+      await useGameStore.getState().selectUnit("own-unit");
+      await useGameStore.getState().openProduceMenu(1, 1);
+
+      expect(isUnitSelectable).not.toHaveBeenCalled();
+      expect(getProducibleUnits).not.toHaveBeenCalled();
+      expect(useGameStore.getState().interactionState).toBe("idle");
+    });
+
+    it("uses the engine producible list instead of property ownership in the UI", async () => {
+      const getProducibleUnits = vi.fn(async (x: number) =>
+        x === 1 ? [{ type: "infantry", name: "歩兵", cost: 1000 }] : [],
+      );
+      useGameStore.setState({
+        turnInfo: { turn: 1, phase: "P1", funds: 1000 },
+        engineWorker: asEngineWorker({ getProducibleUnits }),
+      });
+
+      await useGameStore.getState().openProduceMenu(0, 0);
+      expect(useGameStore.getState().produceMenu).toBeNull();
+
+      await useGameStore.getState().openProduceMenu(1, 1);
       expect(useGameStore.getState().interactionState).toBe("produce_menu");
+      expect(useGameStore.getState().produceMenu?.gridX).toBe(1);
+    });
+  });
+
+  describe("executeDropTarget", () => {
+    it("returns to cargo selection when loaded units remain", async () => {
+      const submitUnloadCommand = vi.fn(async () => undefined);
+      const remainingLoaded = [{ id: "cargo-2", type: "infantry" }];
+      const syncGameState = vi.fn(async () => undefined);
+      useGameStore.setState({
+        engineWorker: asEngineWorker({
+          submitUnloadCommand,
+          getLoadedUnits: async () => remainingLoaded,
+        }),
+        selectedUnitId: "transport-1",
+        dropCargoId: "cargo-1",
+        interactionState: "drop_target_selection",
+        reachableCells: [{ x: 2, y: 2 }],
+        syncGameState,
+      });
+
+      await useGameStore.getState().executeDropTarget(2, 2);
+
+      expect(submitUnloadCommand).toHaveBeenCalledWith("transport-1", "cargo-1", 2, 2);
+      expect(syncGameState).toHaveBeenCalledOnce();
+      const state = useGameStore.getState();
+      expect(state.interactionState).toBe("drop_unit_selection");
+      expect(state.loadedUnits).toEqual(remainingLoaded);
+      expect(state.dropCargoId).toBeNull();
+      expect(state.reachableCells).toEqual([]);
     });
   });
 });

@@ -149,7 +149,7 @@ impl WasmEngine {
                 let fuel_curr = fuel_opt.map_or(stats.max_fuel, |f| f.current);
                 let fuel_max = stats.max_fuel;
                 let is_exhausted = action_opt.map_or(false, |a| a.0);
-                let has_moved = has_moved_opt.map_or(false, |h| h.0);
+                let has_moved = has_moved_opt.is_some_and(|h| h.0);
                 let ammo = ammo_opt.cloned();
 
                 temp_units.push(TempUnit {
@@ -408,7 +408,7 @@ impl WasmEngine {
         // すでに移動済みのユニットは再移動不可（現在地のみ返却）
         if has_moved {
             if let Some((sx, sy)) = start_pos {
-                return JsValue::from_str(&format!(r#"[{{\"x\": {}, \"y\": {}}}]"#, sx, sy));
+                return JsValue::from_str(&format!(r#"[{{"x": {}, "y": {}}}]"#, sx, sy));
             }
             return JsValue::from_str("[]");
         }
@@ -470,6 +470,20 @@ impl WasmEngine {
         JsValue::from_str("[]")
     }
 
+    /// 指定ユニットを現在のプレイヤーが操作対象として選択できるかを返します。
+    pub fn is_unit_selectable(&self, unit_id_str: &str) -> bool {
+        let unit_entity_bits = unit_id_str.parse::<u64>().unwrap_or(0);
+        let unit_entity = Entity::from_bits(unit_entity_bits);
+        crate::systems::action::is_unit_selectable(&self.world, unit_entity)
+    }
+
+    /// 指定ユニットが新たな移動先を選択できるかを返します。
+    pub fn can_unit_move(&self, unit_id_str: &str) -> bool {
+        let unit_entity_bits = unit_id_str.parse::<u64>().unwrap_or(0);
+        let unit_entity = Entity::from_bits(unit_entity_bits);
+        crate::systems::action::can_unit_move(&self.world, unit_entity)
+    }
+
     pub fn get_available_actions(
         &mut self,
         unit_id_str: &str,
@@ -479,12 +493,14 @@ impl WasmEngine {
         let unit_entity_bits = unit_id_str.parse::<u64>().unwrap_or(0);
         let unit_entity = Entity::from_bits(unit_entity_bits);
 
-        let mut is_moved = false;
-        if let Some(pos) = self.world.get::<GridPosition>(unit_entity) {
-            if pos.x != dest_x as usize || pos.y != dest_y as usize {
-                is_moved = true;
-            }
-        }
+        let is_moved = crate::systems::action::is_unit_moved_at(
+            &self.world,
+            unit_entity,
+            GridPosition {
+                x: dest_x as usize,
+                y: dest_y as usize,
+            },
+        );
 
         let actions = crate::systems::action::get_available_actions_at(
             &mut self.world,
@@ -599,12 +615,14 @@ impl WasmEngine {
         let unit_entity_bits = unit_id_str.parse::<u64>().unwrap_or(0);
         let unit_entity = Entity::from_bits(unit_entity_bits);
 
-        let mut is_moved = false;
-        if let Some(pos) = self.world.get::<GridPosition>(unit_entity) {
-            if pos.x != dest_x as usize || pos.y != dest_y as usize {
-                is_moved = true;
-            }
-        }
+        let is_moved = crate::systems::action::is_unit_moved_at(
+            &self.world,
+            unit_entity,
+            GridPosition {
+                x: dest_x as usize,
+                y: dest_y as usize,
+            },
+        );
 
         let dest_pos = GridPosition {
             x: dest_x as usize,

@@ -3,6 +3,18 @@ use crate::events::*;
 use crate::resources::*;
 use bevy_ecs::prelude::*;
 
+/// 輸送ユニットが現在地の地形から積載ユニットを降ろせるかを判定します。
+pub fn can_unload_from_terrain(
+    movement_type: Option<MovementType>,
+    terrain: Option<Terrain>,
+) -> bool {
+    if movement_type != Some(MovementType::Ship) {
+        return true;
+    }
+
+    matches!(terrain, Some(Terrain::Port | Terrain::Shoal))
+}
+
 /// 輸送ユニットへの積載コマンド(`LoadUnitCommand`)を処理するシステム。
 ///
 /// 【処理の流れ】
@@ -78,7 +90,7 @@ pub fn get_droppable_tiles_at(
         let mut q_trans = world.query::<(&CargoCapacity, Option<&UnitStats>)>();
         let mut q_unit = world.query::<&UnitStats>();
 
-        let Ok((cargo, t_stats_opt)) = q_trans.get(world, transport) else {
+        let Ok((cargo, transport_stats)) = q_trans.get(world, transport) else {
             return targets;
         };
 
@@ -89,7 +101,10 @@ pub fn get_droppable_tiles_at(
         let Ok(stats) = q_unit.get(world, cargo_entity) else {
             return targets;
         };
-        (stats.movement_type, t_stats_opt.map(|s| s.movement_type))
+        (
+            stats.movement_type,
+            transport_stats.map(|stats| stats.movement_type),
+        )
     };
 
     // 1. ユニットがいる座標を事前に取得
@@ -112,12 +127,9 @@ pub fn get_droppable_tiles_at(
         return targets;
     };
 
-    // 輸送船 (MovementType::Ship) の場合、現在位置が港(Port)または浅瀬(Shoal)以外であれば降車不可
-    if trans_movement_type == Some(crate::resources::MovementType::Ship) {
-        let current_terrain = map.get_terrain(t_pos.x, t_pos.y);
-        if !matches!(current_terrain, Some(Terrain::Port | Terrain::Shoal)) {
-            return targets;
-        }
+    // 輸送船は接岸可能な港または浅瀬からのみ降車できる
+    if !can_unload_from_terrain(trans_movement_type, map.get_terrain(t_pos.x, t_pos.y)) {
+        return targets;
     }
 
     for (x, y) in neighbors {
@@ -215,6 +227,7 @@ pub fn load_unit_system(
                 commands
                     .entity(event.unit_entity)
                     .insert(Transporting(event.transport_entity));
+                // 搭載を行った輸送ユニットの再移動と移動後アクションを禁止する
                 commands
                     .entity(event.transport_entity)
                     .insert(HasMoved(true));
@@ -282,12 +295,12 @@ pub fn unload_unit_system(
             continue;
         }
 
-        // 輸送船 (MovementType::Ship) の場合、現在位置の地形が Port または Shoal でなければ降車不可
-        if trans_movement_type == crate::resources::MovementType::Ship {
-            let current_terrain = map.get_terrain(trans_pos.x, trans_pos.y);
-            if !matches!(current_terrain, Some(Terrain::Port | Terrain::Shoal)) {
-                continue;
-            }
+        // 候補表示と同じルールで、輸送船が接岸可能な地形にいることを検証する
+        if !can_unload_from_terrain(
+            Some(trans_movement_type),
+            map.get_terrain(trans_pos.x, trans_pos.y),
+        ) {
+            continue;
         }
 
         let (cargo_action, cargo_trans, cargo_movement_type) =
@@ -380,6 +393,7 @@ pub fn unload_unit_system(
             cargo.1.y = event.target_y;
             cargo.3.0 = true; // Unloaded unit is completed for the turn
             commands.entity(event.cargo_entity).remove::<Transporting>();
+            // 降車を行った輸送ユニットの再移動と移動後アクションを禁止する
             commands
                 .entity(event.transport_entity)
                 .insert(HasMoved(true));

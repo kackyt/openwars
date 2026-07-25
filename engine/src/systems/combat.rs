@@ -30,6 +30,12 @@ pub enum WeaponSlot {
     Secondary,
 }
 
+/// 実際の攻撃距離が間接攻撃に該当するかを判定します。
+#[inline]
+fn is_indirect_attack(distance: u32) -> bool {
+    distance > 1
+}
+
 /// ダメージ計算の基礎となる計算式を適用します（乱数補正を除く）。
 /// 計算式: (base_damage * attacker_hp + offset) / (100 + defense_bonus)
 /// offset は通常攻撃なら 105、反撃なら 100 です。
@@ -192,7 +198,7 @@ pub fn can_attack(
             && dist >= w1.range_min
             && dist <= w1.range_max
         {
-            let is_indirect = dist > 1;
+            let is_indirect = is_indirect_attack(dist);
             if is_indirect && has_moved_val {
                 indirect_after_move = true;
             } else {
@@ -209,7 +215,7 @@ pub fn can_attack(
             && dist >= w2.range_min
             && dist <= w2.range_max
         {
-            let is_indirect = w2.range_min > 1;
+            let is_indirect = is_indirect_attack(dist);
             if is_indirect && has_moved_val {
                 indirect_after_move = true;
             } else {
@@ -307,7 +313,7 @@ pub fn get_attackable_targets_at(
                 && dmg > 0
                 && a_ammo1 > 0
             {
-                let is_indirect = dist > 1;
+                let is_indirect = is_indirect_attack(dist);
                 // 移動制限にかからず、かつ射程内であれば攻撃可能
                 if (!is_indirect || allow_indirect) && dist >= w1.range_min && dist <= w1.range_max
                 {
@@ -322,7 +328,7 @@ pub fn get_attackable_targets_at(
             && w2.damages.get(target_type_name).copied().unwrap_or(0) > 0
             && a_ammo2 > 0
         {
-            let is_indirect = dist > 1;
+            let is_indirect = is_indirect_attack(dist);
             if (!is_indirect || allow_indirect) && dist >= w2.range_min && dist <= w2.range_max {
                 can_attack = true;
             }
@@ -361,7 +367,7 @@ pub fn select_weapon(
         && let Some(&dmg) = w1.damages.get(defender_name)
         && dmg > 0
     {
-        return Some((1, dmg, dist > 1));
+        return Some((1, dmg, is_indirect_attack(dist)));
     }
 
     // 武器 2 を試行
@@ -379,7 +385,7 @@ pub fn select_weapon(
             && let Some(&dmg) = w2.damages.get(defender_name)
             && dmg > 0
         {
-            return Some((2, dmg, dist > 1));
+            return Some((2, dmg, is_indirect_attack(dist)));
         }
     }
 
@@ -1024,6 +1030,7 @@ mod tests {
                     max_range: 3,
                     ..UnitStats::mock()
                 },
+                HasMoved(true),
             ))
             .id();
 
@@ -1056,6 +1063,12 @@ mod tests {
                 },
             ))
             .id();
+
+        // can_attack でも主兵装・副兵装の双方が距離2を間接攻撃として扱う
+        assert_eq!(
+            can_attack(tankz, enemy_dist2, &mut world),
+            Err(AttackError::IndirectAfterMove)
+        );
 
         // 移動後 (allow_indirect = false)
         let targets_after_move =
