@@ -43,6 +43,29 @@ pub fn get_valid_movement_cost(
         .filter(|&c| c < 99)
 }
 
+/// 指定マスの自軍輸送船へ、陸上ユニットが浅瀬から搭載目的で進入できるかを判定します。
+fn is_boardable_shoal_transport(
+    map: &Map,
+    unit_positions: &HashMap<(usize, usize), OccupantInfo>,
+    tile: (usize, usize),
+    movement_type: MovementType,
+    player_id: PlayerId,
+    moving_unit_type: UnitType,
+) -> bool {
+    if matches!(movement_type, MovementType::Air | MovementType::Ship)
+        || map.get_terrain(tile.0, tile.1) != Some(Terrain::Shoal)
+    {
+        return false;
+    }
+
+    unit_positions.get(&tile).is_some_and(|occupant| {
+        occupant.player_id == player_id
+            && occupant.is_transport
+            && occupant.free_slots > 0
+            && occupant.loadable_types.contains(&moving_unit_type)
+    })
+}
+
 /// 指定された地点から到達可能なすべてのタイルの座標を計算します。ZOCや燃料・移動コストも加味します。
 #[allow(clippy::too_many_arguments)]
 pub fn calculate_reachable_tiles(
@@ -119,6 +142,20 @@ pub fn calculate_reachable_tiles(
             continue; // Enemy unit: Cannot expand through (block)
         }
 
+        // 浅瀬の自軍輸送船マスに到達した場合は搭載停止となるため、そこからの移動拡張は行わない
+        if position != start
+            && is_boardable_shoal_transport(
+                map,
+                unit_positions,
+                position,
+                movement_type,
+                player_id,
+                moving_unit_type,
+            )
+        {
+            continue;
+        }
+
         for (nx, ny) in map.get_adjacent(position.0, position.1) {
             if unit_positions
                 .get(&(nx, ny))
@@ -127,10 +164,26 @@ pub fn calculate_reachable_tiles(
                 continue; // Enemy: Can't enter/pass
             }
 
-            if let Some(terrain_cost) = map
+            let normal_terrain_cost = map
                 .get_terrain(nx, ny)
-                .and_then(|t| get_valid_movement_cost(master_data, movement_type, t))
-            {
+                .and_then(|t| get_valid_movement_cost(master_data, movement_type, t));
+
+            let is_shoal_transport = is_boardable_shoal_transport(
+                map,
+                unit_positions,
+                (nx, ny),
+                movement_type,
+                player_id,
+                moving_unit_type,
+            );
+
+            let terrain_cost = if is_shoal_transport {
+                Some(1)
+            } else {
+                normal_terrain_cost
+            };
+
+            if let Some(terrain_cost) = terrain_cost {
                 let next_cost = cost + terrain_cost;
                 let next_fuel = fuel_used + 1;
 
@@ -276,7 +329,8 @@ pub fn find_path_a_star(
         }
 
         for (nx, ny) in map.get_adjacent(position.0, position.1) {
-            if let Some(occ) = unit_positions.get(&(nx, ny)) {
+            let occ_opt = unit_positions.get(&(nx, ny));
+            if let Some(occ) = occ_opt {
                 if occ.player_id != player_id {
                     if (nx, ny) != goal {
                         continue; // Enemy: Can't enter/pass unless it's the goal itself
@@ -292,10 +346,30 @@ pub fn find_path_a_star(
                 }
             }
 
-            if let Some(terrain_cost) = map
+            let normal_terrain_cost = map
                 .get_terrain(nx, ny)
-                .and_then(|t| get_valid_movement_cost(master_data, movement_type, t))
-            {
+                .and_then(|t| get_valid_movement_cost(master_data, movement_type, t));
+
+            let is_shoal_transport = is_boardable_shoal_transport(
+                map,
+                unit_positions,
+                (nx, ny),
+                movement_type,
+                player_id,
+                moving_unit_type,
+            );
+
+            let terrain_cost = if is_shoal_transport {
+                Some(1)
+            } else {
+                normal_terrain_cost
+            };
+
+            if is_shoal_transport && (nx, ny) != goal {
+                continue;
+            }
+
+            if let Some(terrain_cost) = terrain_cost {
                 let next_cost = cost + terrain_cost;
                 let next_fuel = fuel_used + 1;
 
@@ -417,9 +491,10 @@ pub fn move_unit_system(
                 pos.y = event.target_y;
                 let old_fuel = fuel.current;
                 fuel.current = fuel.current.saturating_sub(fuel_used);
+
+                // 実際に座標が変化した場合だけ移動済みとし、移動履歴を記録する
                 if from.x != event.target_x || from.y != event.target_y {
                     has_moved.0 = true;
-
                     // Record for undo
                     commands.insert_resource(PendingMove {
                         unit_entity: entity,
@@ -585,6 +660,58 @@ mod tests {
 
         let fuel = world.get::<Fuel>(entity).unwrap();
         assert_eq!(fuel.current, 8); // Moved 2 tiles plains cost 1 each
+    }
+
+    #[test]
+    fn test_move_unit_system_same_position_does_not_mark_as_moved() {
+        let mut world = World::new();
+        world.insert_resource(MatchState {
+            current_phase: Phase::Main,
+            ..Default::default()
+        });
+        world.insert_resource(Players(vec![
+            Player::new(1, "P1".to_string()),
+            Player::new(2, "P2".to_string()),
+        ]));
+        world.insert_resource(Map::new(5, 5, Terrain::Plains, GridTopology::Square));
+        world.insert_resource(crate::resources::master_data::MasterDataRegistry::load().unwrap());
+        world.insert_resource(Events::<MoveUnitCommand>::default());
+        world.insert_resource(Events::<UnitMovedEvent>::default());
+        world.insert_resource(Events::<LoadUnitCommand>::default());
+        world.insert_resource(Events::<UnitLoadedEvent>::default());
+        world.insert_resource(Events::<MergeUnitCommand>::default());
+
+        let entity = world
+            .spawn((
+                GridPosition { x: 2, y: 2 },
+                Fuel {
+                    current: 10,
+                    max: 10,
+                },
+                HasMoved(false),
+                Faction(PlayerId(1)),
+                UnitStats {
+                    max_fuel: 10,
+                    ..create_infantry_stats()
+                },
+                ActionCompleted(false),
+            ))
+            .id();
+
+        world.send_event(MoveUnitCommand {
+            unit_entity: entity,
+            target_x: 2,
+            target_y: 2,
+        });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(move_unit_system);
+        schedule.run(&mut world);
+
+        // その場に留まる操作は実移動ではないため、間接攻撃を妨げる移動済み状態にしない
+        assert!(!world.get::<HasMoved>(entity).unwrap().0);
+        assert!(world.get_resource::<PendingMove>().is_none());
+        assert_eq!(world.get::<Fuel>(entity).unwrap().current, 10);
     }
 
     #[test]

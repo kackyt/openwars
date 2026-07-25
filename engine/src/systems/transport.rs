@@ -3,6 +3,18 @@ use crate::events::*;
 use crate::resources::*;
 use bevy_ecs::prelude::*;
 
+/// 輸送ユニットが現在地の地形から積載ユニットを降ろせるかを判定します。
+pub fn can_unload_from_terrain(
+    movement_type: Option<MovementType>,
+    terrain: Option<Terrain>,
+) -> bool {
+    if movement_type != Some(MovementType::Ship) {
+        return true;
+    }
+
+    matches!(terrain, Some(Terrain::Port | Terrain::Shoal))
+}
+
 /// 輸送ユニットへの積載コマンド(`LoadUnitCommand`)を処理するシステム。
 ///
 /// 【処理の流れ】
@@ -74,11 +86,11 @@ pub fn get_droppable_tiles_at(
     t_pos: GridPosition,
 ) -> Vec<(usize, usize)> {
     let mut targets = vec![];
-    let cargo_movement_type = {
-        let mut q_trans = world.query::<&CargoCapacity>();
+    let (cargo_movement_type, trans_movement_type) = {
+        let mut q_trans = world.query::<(&CargoCapacity, Option<&UnitStats>)>();
         let mut q_unit = world.query::<&UnitStats>();
 
-        let Ok(cargo) = q_trans.get(world, transport) else {
+        let Ok((cargo, transport_stats)) = q_trans.get(world, transport) else {
             return targets;
         };
 
@@ -89,7 +101,10 @@ pub fn get_droppable_tiles_at(
         let Ok(stats) = q_unit.get(world, cargo_entity) else {
             return targets;
         };
-        stats.movement_type
+        (
+            stats.movement_type,
+            transport_stats.map(|stats| stats.movement_type),
+        )
     };
 
     // 1. ユニットがいる座標を事前に取得
@@ -111,6 +126,11 @@ pub fn get_droppable_tiles_at(
     } else {
         return targets;
     };
+
+    // 輸送船は接岸可能な港または浅瀬からのみ降車できる
+    if !can_unload_from_terrain(trans_movement_type, map.get_terrain(t_pos.x, t_pos.y)) {
+        return targets;
+    }
 
     for (x, y) in neighbors {
         // 地形通行可能判定
@@ -207,6 +227,10 @@ pub fn load_unit_system(
                 commands
                     .entity(event.unit_entity)
                     .insert(Transporting(event.transport_entity));
+                // 搭載を行った輸送ユニットの再移動と移動後アクションを禁止する
+                commands
+                    .entity(event.transport_entity)
+                    .insert(HasMoved(true));
 
                 // 積載完了イベントを送出
                 loaded_writer.send(UnitLoadedEvent {
@@ -259,14 +283,23 @@ pub fn unload_unit_system(
     let active_player_id = players.0[match_state.active_player_index.0].id;
 
     for event in unload_events.read() {
-        let (trans_pos, trans_faction, _trans_action) = match set.p0().get(event.transport_entity) {
-            Ok((_, p, f, a, _, _, _)) => (*p, f.0, a.0),
-            _ => continue,
-        };
+        let (trans_pos, trans_faction, _trans_action, trans_movement_type) =
+            match set.p0().get(event.transport_entity) {
+                Ok((_, p, f, a, _, _, s)) => (*p, f.0, a.0, s.movement_type),
+                _ => continue,
+            };
 
         // 勢力のチェックのみ行い、行動済みチェックは降車ロジック内で行う、
         // あるいは複数降車を許可するためにここでは緩和する
         if trans_faction != active_player_id {
+            continue;
+        }
+
+        // 候補表示と同じルールで、輸送船が接岸可能な地形にいることを検証する
+        if !can_unload_from_terrain(
+            Some(trans_movement_type),
+            map.get_terrain(trans_pos.x, trans_pos.y),
+        ) {
             continue;
         }
 
@@ -360,6 +393,10 @@ pub fn unload_unit_system(
             cargo.1.y = event.target_y;
             cargo.3.0 = true; // Unloaded unit is completed for the turn
             commands.entity(event.cargo_entity).remove::<Transporting>();
+            // 降車を行った輸送ユニットの再移動と移動後アクションを禁止する
+            commands
+                .entity(event.transport_entity)
+                .insert(HasMoved(true));
 
             // 降車完了イベントを送出
             unloaded_writer.send(UnitUnloadedEvent {
@@ -1077,5 +1114,176 @@ mod tests {
 
         // 降車後、PendingMove が削除されているはず
         assert!(world.get_resource::<PendingMove>().is_none());
+    }
+
+    #[test]
+    fn test_shoal_transport_load_reachability() {
+        use crate::systems::movement::{OccupantInfo, calculate_reachable_tiles};
+        use std::collections::HashMap;
+
+        let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
+        // (2, 2) を浅瀬 (Shoal), (3, 2) を海 (Sea) に設定
+        let _ = map.set_terrain(2, 2, Terrain::Shoal);
+        let _ = map.set_terrain(3, 2, Terrain::Sea);
+
+        let master_data = MasterDataRegistry::load().unwrap();
+        let p1 = PlayerId(1);
+
+        let mut unit_positions = HashMap::new();
+
+        // (2, 2) 浅瀬に空きありの自軍輸送船 (Lander) を配置
+        unit_positions.insert(
+            (2, 2),
+            OccupantInfo {
+                player_id: p1,
+                is_transport: true,
+                unit_type: UnitType::Lander,
+                loadable_types: vec![UnitType::Infantry],
+                free_slots: 1,
+            },
+        );
+
+        // (3, 2) 海に空きありの自軍輸送船 (Lander) を配置
+        unit_positions.insert(
+            (3, 2),
+            OccupantInfo {
+                player_id: p1,
+                is_transport: true,
+                unit_type: UnitType::Lander,
+                loadable_types: vec![UnitType::Infantry],
+                free_slots: 1,
+            },
+        );
+
+        // 歩兵 (Infantry, MovementType::Infantry) が (1, 2) 平地から移動開始 (移動力 3)
+        let reachable = calculate_reachable_tiles(
+            &map,
+            &unit_positions,
+            (1, 2),
+            MovementType::Infantry,
+            3,
+            99,
+            p1,
+            UnitType::Infantry,
+            &master_data,
+        );
+
+        // 浅瀬の自軍輸送船 (2, 2) には進入（到達）できる
+        assert!(reachable.contains(&(2, 2)));
+
+        // 海の自軍輸送船 (3, 2) には進入（到達）できない
+        assert!(!reachable.contains(&(3, 2)));
+
+        // 満載の場合のテスト
+        unit_positions.insert(
+            (2, 2),
+            OccupantInfo {
+                player_id: p1,
+                is_transport: true,
+                unit_type: UnitType::Lander,
+                loadable_types: vec![UnitType::Infantry],
+                free_slots: 0, // 満載
+            },
+        );
+
+        let reachable_full = calculate_reachable_tiles(
+            &map,
+            &unit_positions,
+            (1, 2),
+            MovementType::Infantry,
+            3,
+            99,
+            p1,
+            UnitType::Infantry,
+            &master_data,
+        );
+
+        // 満載の場合は進入できない
+        assert!(!reachable_full.contains(&(2, 2)));
+    }
+
+    #[test]
+    fn test_lander_unload_terrain_restriction() {
+        let mut world = World::new();
+        world.insert_resource(MatchState::default());
+        world.insert_resource(Players(vec![Player::new(1, "P1".to_string())]));
+        world.insert_resource(Events::<UnloadUnitCommand>::default());
+        world.insert_resource(Events::<UnitUnloadedEvent>::default());
+
+        let mut map = Map::new(5, 5, Terrain::Sea, GridTopology::Square);
+        let _ = map.set_terrain(2, 2, Terrain::Sea);
+        let _ = map.set_terrain(1, 2, Terrain::Plains);
+        let _ = map.set_terrain(3, 3, Terrain::Shoal);
+        let _ = map.set_terrain(3, 2, Terrain::Plains);
+        world.insert_resource(map);
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+
+        // (2, 2) Sea に輸送船 (Lander) を配置
+        let transport = world
+            .spawn((
+                GridPosition { x: 2, y: 2 },
+                Faction(PlayerId(1)),
+                ActionCompleted(false),
+                UnitStats {
+                    unit_type: UnitType::Lander,
+                    movement_type: MovementType::Ship,
+                    max_cargo: 2,
+                    loadable_unit_types: vec![UnitType::Infantry],
+                    ..UnitStats::mock()
+                },
+                CargoCapacity {
+                    max: 2,
+                    loaded: vec![],
+                },
+            ))
+            .id();
+
+        let cargo = world
+            .spawn((
+                GridPosition { x: 999, y: 999 },
+                Faction(PlayerId(1)),
+                ActionCompleted(false),
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    movement_type: MovementType::Infantry,
+                    ..UnitStats::mock()
+                },
+                Transporting(transport),
+            ))
+            .id();
+
+        world.get_mut::<CargoCapacity>(transport).unwrap().loaded = vec![cargo];
+
+        // Sea 上での get_droppable_tiles は空を返すはず
+        let droppable = get_droppable_tiles(&mut world, transport, cargo);
+        assert!(droppable.is_empty());
+
+        // 輸送船を (3, 3) Shoal (浅瀬) に移動
+        world.get_mut::<GridPosition>(transport).unwrap().x = 3;
+        world.get_mut::<GridPosition>(transport).unwrap().y = 3;
+
+        // Shoal 上では隣接する Plains (3, 2) への降車可能マスが返るはず
+        let droppable_shoal = get_droppable_tiles(&mut world, transport, cargo);
+        assert!(droppable_shoal.contains(&(3, 2)));
+
+        // 実際に降車コマンドを実行
+        world.send_event(UnloadUnitCommand {
+            transport_entity: transport,
+            cargo_entity: cargo,
+            target_x: 3,
+            target_y: 2,
+        });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(unload_unit_system);
+        schedule.run(&mut world);
+
+        // 降車成功
+        let cargo_pos = world.get::<GridPosition>(cargo).unwrap();
+        assert_eq!(cargo_pos.x, 3);
+        assert_eq!(cargo_pos.y, 2);
+
+        // 降車後、輸送ユニットに HasMoved(true) が付与されていることを検証
+        assert!(world.get::<HasMoved>(transport).is_some_and(|h| h.0));
     }
 }

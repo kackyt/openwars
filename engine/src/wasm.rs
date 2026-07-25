@@ -94,6 +94,7 @@ impl WasmEngine {
             hp: u32,
             is_loaded: bool,
             is_exhausted: bool,
+            has_moved: bool,
             fuel_curr: u32,
             fuel_max: u32,
             ammo: Option<Ammo>,
@@ -110,6 +111,7 @@ impl WasmEngine {
                 Option<&Fuel>,
                 Option<&Ammo>,
                 Option<&ActionCompleted>,
+                Option<&crate::components::HasMoved>,
                 Option<&crate::components::Transporting>,
                 Option<&crate::components::CargoCapacity>,
             )>();
@@ -123,6 +125,7 @@ impl WasmEngine {
                 fuel_opt,
                 ammo_opt,
                 action_opt,
+                has_moved_opt,
                 trans_opt,
                 cargo_opt,
             ) in query.iter(&self.world)
@@ -146,6 +149,7 @@ impl WasmEngine {
                 let fuel_curr = fuel_opt.map_or(stats.max_fuel, |f| f.current);
                 let fuel_max = stats.max_fuel;
                 let is_exhausted = action_opt.map_or(false, |a| a.0);
+                let has_moved = has_moved_opt.is_some_and(|h| h.0);
                 let ammo = ammo_opt.cloned();
 
                 temp_units.push(TempUnit {
@@ -157,6 +161,7 @@ impl WasmEngine {
                     hp,
                     is_loaded,
                     is_exhausted,
+                    has_moved,
                     fuel_curr,
                     fuel_max,
                     ammo,
@@ -206,7 +211,7 @@ impl WasmEngine {
             let unit_type_str = format!("{:?}", u.unit_type).to_lowercase();
 
             let unit_json = format!(
-                r#"{{"id": "{}", "type": "{}", "faction": "{}", "x": {}, "y": {}, "hp": {}, "is_loaded": {}, "is_exhausted": {}, "fuel": {{"current": {}, "max": {}}}, "weapons": {}}}"#,
+                r#"{{"id": "{}", "type": "{}", "faction": "{}", "x": {}, "y": {}, "hp": {}, "is_loaded": {}, "is_exhausted": {}, "has_moved": {}, "fuel": {{"current": {}, "max": {}}}, "weapons": {}}}"#,
                 u.id,
                 unit_type_str,
                 u.faction_str,
@@ -215,6 +220,7 @@ impl WasmEngine {
                 u.hp,
                 u.is_loaded,
                 u.is_exhausted,
+                u.has_moved,
                 u.fuel_curr,
                 u.fuel_max,
                 weapons_str
@@ -379,6 +385,7 @@ impl WasmEngine {
         let mut fuel_cur = 0;
         let mut active_player_id = crate::components::PlayerId(1);
         let mut u_type = crate::resources::UnitType::Infantry;
+        let mut has_moved = false;
 
         if let Some(pos) = self.world.get::<GridPosition>(target_entity) {
             start_pos = Some((pos.x, pos.y));
@@ -393,6 +400,17 @@ impl WasmEngine {
         }
         if let Some(faction) = self.world.get::<Faction>(target_entity) {
             active_player_id = faction.0;
+        }
+        if let Some(hm) = self.world.get::<crate::components::HasMoved>(target_entity) {
+            has_moved = hm.0;
+        }
+
+        // すでに移動済みのユニットは再移動不可（現在地のみ返却）
+        if has_moved {
+            if let Some((sx, sy)) = start_pos {
+                return JsValue::from_str(&format!(r#"[{{"x": {}, "y": {}}}]"#, sx, sy));
+            }
+            return JsValue::from_str("[]");
         }
 
         let mut unit_positions = std::collections::HashMap::new();
@@ -452,6 +470,20 @@ impl WasmEngine {
         JsValue::from_str("[]")
     }
 
+    /// 指定ユニットを現在のプレイヤーが操作対象として選択できるかを返します。
+    pub fn is_unit_selectable(&self, unit_id_str: &str) -> bool {
+        let unit_entity_bits = unit_id_str.parse::<u64>().unwrap_or(0);
+        let unit_entity = Entity::from_bits(unit_entity_bits);
+        crate::systems::action::is_unit_selectable(&self.world, unit_entity)
+    }
+
+    /// 指定ユニットが新たな移動先を選択できるかを返します。
+    pub fn can_unit_move(&self, unit_id_str: &str) -> bool {
+        let unit_entity_bits = unit_id_str.parse::<u64>().unwrap_or(0);
+        let unit_entity = Entity::from_bits(unit_entity_bits);
+        crate::systems::action::can_unit_move(&self.world, unit_entity)
+    }
+
     pub fn get_available_actions(
         &mut self,
         unit_id_str: &str,
@@ -461,12 +493,14 @@ impl WasmEngine {
         let unit_entity_bits = unit_id_str.parse::<u64>().unwrap_or(0);
         let unit_entity = Entity::from_bits(unit_entity_bits);
 
-        let mut is_moved = false;
-        if let Some(pos) = self.world.get::<GridPosition>(unit_entity) {
-            if pos.x != dest_x as usize || pos.y != dest_y as usize {
-                is_moved = true;
-            }
-        }
+        let is_moved = crate::systems::action::is_unit_moved_at(
+            &self.world,
+            unit_entity,
+            GridPosition {
+                x: dest_x as usize,
+                y: dest_y as usize,
+            },
+        );
 
         let actions = crate::systems::action::get_available_actions_at(
             &mut self.world,
@@ -581,12 +615,14 @@ impl WasmEngine {
         let unit_entity_bits = unit_id_str.parse::<u64>().unwrap_or(0);
         let unit_entity = Entity::from_bits(unit_entity_bits);
 
-        let mut is_moved = false;
-        if let Some(pos) = self.world.get::<GridPosition>(unit_entity) {
-            if pos.x != dest_x as usize || pos.y != dest_y as usize {
-                is_moved = true;
-            }
-        }
+        let is_moved = crate::systems::action::is_unit_moved_at(
+            &self.world,
+            unit_entity,
+            GridPosition {
+                x: dest_x as usize,
+                y: dest_y as usize,
+            },
+        );
 
         let dest_pos = GridPosition {
             x: dest_x as usize,

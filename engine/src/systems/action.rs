@@ -1,6 +1,59 @@
 use crate::components::*;
+use crate::resources::{MatchState, Phase, Players};
 use crate::systems::{combat, merge, supply, transport};
 use bevy_ecs::prelude::*;
+
+/// 指定ユニットを現在のプレイヤーが操作対象として選択できるかを判定します。
+pub fn is_unit_selectable(world: &World, unit_entity: Entity) -> bool {
+    let Some(match_state) = world.get_resource::<MatchState>() else {
+        return false;
+    };
+    if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
+        return false;
+    }
+
+    let Some(active_player) = world
+        .get_resource::<Players>()
+        .and_then(|players| players.0.get(match_state.active_player_index.0))
+    else {
+        return false;
+    };
+
+    let Some(faction) = world.get::<Faction>(unit_entity) else {
+        return false;
+    };
+    if faction.0 != active_player.id
+        || world
+            .get::<ActionCompleted>(unit_entity)
+            .is_some_and(|action| action.0)
+        || world.get::<Transporting>(unit_entity).is_some()
+        || world
+            .get::<Health>(unit_entity)
+            .is_some_and(Health::is_destroyed)
+    {
+        return false;
+    }
+
+    true
+}
+
+/// 指定ユニットが新たな移動先を選択できるかを判定します。
+pub fn can_unit_move(world: &World, unit_entity: Entity) -> bool {
+    is_unit_selectable(world, unit_entity)
+        && !world
+            .get::<HasMoved>(unit_entity)
+            .is_some_and(|has_moved| has_moved.0)
+}
+
+/// 既存の移動済み状態と指定座標への実移動の双方を考慮して、移動後かを判定します。
+pub fn is_unit_moved_at(world: &World, unit_entity: Entity, destination: GridPosition) -> bool {
+    world
+        .get::<HasMoved>(unit_entity)
+        .is_some_and(|has_moved| has_moved.0)
+        || world
+            .get::<GridPosition>(unit_entity)
+            .is_some_and(|position| *position != destination)
+}
 
 /// ユニットが現在実行可能なアクションをまとめた構造体
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
@@ -91,16 +144,22 @@ pub fn get_available_actions_at(
             && !supply::get_suppliable_targets_at(world, unit_entity, u_pos).is_empty(),
         can_load,
         can_drop: !is_occupied_by_other && {
+            let loaded_passengers = {
+                let mut q_cargo = world.query::<&CargoCapacity>();
+                q_cargo
+                    .get(world, unit_entity)
+                    .map(|cargo| cargo.loaded.clone())
+                    .unwrap_or_default()
+            };
             let mut can_drop = false;
-            let mut q_cargo = world.query::<&CargoCapacity>();
-            if let Ok(cargo) = q_cargo.get(world, unit_entity) {
-                for &passenger in &cargo.loaded {
-                    if let Some(action) = world.get::<ActionCompleted>(passenger)
-                        && !action.0
-                    {
-                        can_drop = true;
-                        break;
-                    }
+            for passenger in loaded_passengers {
+                if let Some(action) = world.get::<ActionCompleted>(passenger)
+                    && !action.0
+                    && !transport::get_droppable_tiles_at(world, unit_entity, passenger, u_pos)
+                        .is_empty()
+                {
+                    can_drop = true;
+                    break;
                 }
             }
             can_drop
@@ -116,6 +175,76 @@ pub fn get_available_actions_at(
 mod tests {
     use super::*;
     use crate::resources::*;
+
+    fn setup_selection_world() -> World {
+        let mut world = World::new();
+        world.insert_resource(MatchState {
+            current_phase: Phase::Main,
+            ..Default::default()
+        });
+        world.insert_resource(Players(vec![
+            Player::new(1, "P1".to_string()),
+            Player::new(2, "P2".to_string()),
+        ]));
+        world
+    }
+
+    #[test]
+    fn test_unit_selection_and_movement_are_decided_by_engine_state() {
+        let mut world = setup_selection_world();
+        let own_unit = world
+            .spawn((
+                GridPosition { x: 1, y: 1 },
+                Faction(PlayerId(1)),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                ActionCompleted(false),
+                HasMoved(false),
+            ))
+            .id();
+        let moved_unit = world
+            .spawn((
+                GridPosition { x: 2, y: 2 },
+                Faction(PlayerId(1)),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                ActionCompleted(false),
+                HasMoved(true),
+            ))
+            .id();
+        let enemy_unit = world
+            .spawn((
+                GridPosition { x: 3, y: 3 },
+                Faction(PlayerId(2)),
+                ActionCompleted(false),
+                HasMoved(false),
+            ))
+            .id();
+
+        assert!(is_unit_selectable(&world, own_unit));
+        assert!(can_unit_move(&world, own_unit));
+        assert!(is_unit_selectable(&world, moved_unit));
+        assert!(!can_unit_move(&world, moved_unit));
+        assert!(!is_unit_selectable(&world, enemy_unit));
+    }
+
+    #[test]
+    fn test_is_unit_moved_at_considers_component_and_destination() {
+        let mut world = World::new();
+        let unit = world
+            .spawn((GridPosition { x: 1, y: 1 }, HasMoved(false)))
+            .id();
+
+        assert!(!is_unit_moved_at(&world, unit, GridPosition { x: 1, y: 1 }));
+        assert!(is_unit_moved_at(&world, unit, GridPosition { x: 2, y: 1 }));
+
+        world.get_mut::<HasMoved>(unit).unwrap().0 = true;
+        assert!(is_unit_moved_at(&world, unit, GridPosition { x: 1, y: 1 }));
+    }
 
     #[test]
     fn test_get_available_actions_on_transport() {

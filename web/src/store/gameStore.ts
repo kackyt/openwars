@@ -58,6 +58,10 @@ import type { EngineWorker } from "../worker/engineWorker";
 /** AIの思考ターンで無限ループに陥らないための最大ループ回数ガード */
 const MAX_AI_ACTION_LOOPS = 100;
 
+/** 現在のフェーズがAIプレイヤーの手番かを判定する */
+const isAiPhase = (phase: string | undefined, p1IsAi: boolean, p2IsAi: boolean): boolean =>
+  (phase === PHASE_P1 && p1IsAi) || (phase === PHASE_P2 && p2IsAi);
+
 export interface UnitData {
   id: string;
   type: string;
@@ -67,6 +71,7 @@ export interface UnitData {
   hp: number;
   is_loaded: boolean;
   is_exhausted: boolean;
+  has_moved?: boolean;
   fuel: { current: number; max: number };
   weapons: { name: string; ammo: number; max_ammo: number; min_range: number; max_range: number }[];
 }
@@ -247,8 +252,7 @@ export const useGameStore = create<GameState>((set, get) => ({
 
       const { turnInfo, p1IsAi: isP1Ai, p2IsAi: isP2Ai } = get();
       if (turnInfo) {
-        const isAiTurn =
-          (turnInfo.phase === PHASE_P1 && isP1Ai) || (turnInfo.phase === PHASE_P2 && isP2Ai);
+        const isAiTurn = isAiPhase(turnInfo.phase, isP1Ai, isP2Ai);
         if (isAiTurn) {
           await get().tickAiTurn();
         }
@@ -310,11 +314,35 @@ export const useGameStore = create<GameState>((set, get) => ({
   },
 
   selectUnit: async (unitId: string) => {
-    const { engineWorker, unitData } = get();
+    const { engineWorker, unitData, turnInfo, p1IsAi, p2IsAi } = get();
     if (!engineWorker) return;
     try {
-      const unit = unitData.find((u) => u.id === unitId);
-      if (unit?.is_exhausted) return; // 行動済みなら選択不可
+      // AIプレイヤーの手番中はプレイヤー入力を受け付けない
+      if (isAiPhase(turnInfo?.phase, p1IsAi, p2IsAi)) return;
+
+      // 勢力・行動済み・搭載中などのゲームルールは engine の判定を利用する
+      if (!(await engineWorker.isUnitSelectable(unitId))) return;
+
+      const unit = unitData.find((candidate) => candidate.id === unitId);
+      if (!unit) return;
+
+      if (!(await engineWorker.canUnitMove(unitId))) {
+        // 再移動不可の場合は、engine が返す現在地でのアクションだけを表示する
+        const actions = await engineWorker.getAvailableActions(unitId, unit.x, unit.y);
+        if (actions && actions.length > 0) {
+          set({
+            interactionState: "action_menu",
+            selectedUnitId: unitId,
+            selectedTargetPos: { x: unit.x, y: unit.y },
+            reachableCells: [],
+          });
+          get().openActionMenu(unit.x, unit.y, unitId, actions);
+        } else {
+          get().cancelInteraction();
+        }
+        return;
+      }
+
       const cells = await engineWorker.getReachableCells(unitId);
       set({
         interactionState: "unit_selected",
@@ -453,9 +481,13 @@ export const useGameStore = create<GameState>((set, get) => ({
   },
 
   openProduceMenu: async (x: number, y: number, screenX?: number, screenY?: number) => {
-    const { engineWorker } = get();
+    const { engineWorker, turnInfo, p1IsAi, p2IsAi } = get();
     if (!engineWorker) return;
     try {
+      // AIプレイヤーの手番中はプレイヤー入力を受け付けない
+      if (isAiPhase(turnInfo?.phase, p1IsAi, p2IsAi)) return;
+
+      // 所有者・地形・占有・生産範囲などは engine が返す生産可能一覧に集約する
       const units = await engineWorker.getProducibleUnits(x, y);
       if (units && units.length > 0) {
         const menuX = screenX !== undefined ? screenX : x;
@@ -523,8 +555,19 @@ export const useGameStore = create<GameState>((set, get) => ({
     if (!engineWorker || !selectedUnitId || !dropCargoId) return;
     try {
       await engineWorker.submitUnloadCommand(selectedUnitId, dropCargoId, x, y);
-      get().cancelInteraction();
+      const remainingLoaded = await engineWorker.getLoadedUnits(selectedUnitId);
       await get().syncGameState();
+      if (remainingLoaded && remainingLoaded.length > 0) {
+        set({
+          interactionState: "drop_unit_selection",
+          loadedUnits: remainingLoaded,
+          actionMenu: null,
+          reachableCells: [],
+          dropCargoId: null,
+        });
+      } else {
+        get().cancelInteraction();
+      }
     } catch (e) {
       console.error("Failed to execute drop target:", e);
       get().cancelInteraction();
@@ -563,8 +606,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       // AIターンはWasm内部でNextPhaseCommandが処理されて終了しているため、直接次のターンの状態を確認する
       const { turnInfo, p1IsAi, p2IsAi } = get();
       if (turnInfo) {
-        const isNextAiTurn =
-          (turnInfo.phase === PHASE_P1 && p1IsAi) || (turnInfo.phase === PHASE_P2 && p2IsAi);
+        const isNextAiTurn = isAiPhase(turnInfo.phase, p1IsAi, p2IsAi);
         if (isNextAiTurn) {
           await get().tickAiTurn();
         } else {
@@ -590,8 +632,7 @@ export const useGameStore = create<GameState>((set, get) => ({
 
       const { turnInfo, p1IsAi, p2IsAi } = get();
       if (turnInfo) {
-        const isAiTurn =
-          (turnInfo.phase === PHASE_P1 && p1IsAi) || (turnInfo.phase === PHASE_P2 && p2IsAi);
+        const isAiTurn = isAiPhase(turnInfo.phase, p1IsAi, p2IsAi);
         if (isAiTurn) {
           await get().tickAiTurn();
         } else {

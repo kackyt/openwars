@@ -45,6 +45,8 @@ fn get_target_position_for_island(
     if movement_type == crate::resources::MovementType::Ship {
         let mut best_dock_tile = None;
         let mut min_dist = 9999;
+        let mut fallback_dock_tile = None;
+        let mut fallback_min_dist = 9999;
 
         for tile in &island.tiles {
             // 隣接4マスを取得
@@ -60,15 +62,23 @@ fn get_target_position_for_island(
                     {
                         let dist =
                             (ax as i32 - t_pos.x as i32).abs() + (ay as i32 - t_pos.y as i32).abs();
-                        if dist < min_dist {
-                            min_dist = dist;
-                            best_dock_tile = Some(GridPosition { x: ax, y: ay });
+                        if matches!(
+                            terrain,
+                            crate::resources::Terrain::Port | crate::resources::Terrain::Shoal
+                        ) {
+                            if dist < min_dist {
+                                min_dist = dist;
+                                best_dock_tile = Some(GridPosition { x: ax, y: ay });
+                            }
+                        } else if dist < fallback_min_dist {
+                            fallback_min_dist = dist;
+                            fallback_dock_tile = Some(GridPosition { x: ax, y: ay });
                         }
                     }
                 }
             }
         }
-        best_dock_tile
+        best_dock_tile.or(fallback_dock_tile)
     } else {
         island
             .tiles
@@ -182,9 +192,11 @@ pub fn execute_mission_step(
 
             let mut best_meetup_tile = cargo_pos;
             if t_stats.movement_type == crate::resources::MovementType::Ship {
-                // Lander (Ship): Find the best dock tile for the island
+                // Lander (Ship): Find the best dock tile for the island (preferring Port or Shoal)
                 let mut best_dock_tile = None;
                 let mut min_dist = 9999;
+                let mut fallback_dock_tile = None;
+                let mut fallback_min_dist = 9999;
 
                 // cargo_island_tiles is optional, so we use it if available
                 if let Some(tiles) = &cargo_island_tiles {
@@ -200,9 +212,18 @@ pub fn execute_mission_step(
                                 {
                                     let dist = (ax as i32 - t_pos.x as i32).abs()
                                         + (ay as i32 - t_pos.y as i32).abs();
-                                    if dist < min_dist {
-                                        min_dist = dist;
-                                        best_dock_tile = Some(GridPosition { x: ax, y: ay });
+                                    if matches!(
+                                        terrain,
+                                        crate::resources::Terrain::Port
+                                            | crate::resources::Terrain::Shoal
+                                    ) {
+                                        if dist < min_dist {
+                                            min_dist = dist;
+                                            best_dock_tile = Some(GridPosition { x: ax, y: ay });
+                                        }
+                                    } else if dist < fallback_min_dist {
+                                        fallback_min_dist = dist;
+                                        fallback_dock_tile = Some(GridPosition { x: ax, y: ay });
                                     }
                                 }
                             }
@@ -210,7 +231,7 @@ pub fn execute_mission_step(
                     }
                 }
 
-                if let Some(dock_tile) = best_dock_tile {
+                if let Some(dock_tile) = best_dock_tile.or(fallback_dock_tile) {
                     best_meetup_tile = dock_tile;
                 }
             } else {

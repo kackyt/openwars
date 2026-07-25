@@ -88,6 +88,22 @@ export class EngineWorker {
   }
 
   /**
+   * 現在のプレイヤーが指定ユニットを選択できるかを取得します。
+   */
+  async isUnitSelectable(unitId: string): Promise<boolean> {
+    if (!this.engine) throw new Error("Engine not initialized");
+    return this.engine.is_unit_selectable(unitId);
+  }
+
+  /**
+   * 指定ユニットが新たな移動先を選択できるかを取得します。
+   */
+  async canUnitMove(unitId: string): Promise<boolean> {
+    if (!this.engine) throw new Error("Engine not initialized");
+    return this.engine.can_unit_move(unitId);
+  }
+
+  /**
    * ユニットが目的地に移動した後に実行可能なアクション一覧を取得します。
    * @param unitId ユニットID
    * @param destX 目的地X
