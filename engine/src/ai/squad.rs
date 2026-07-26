@@ -121,6 +121,7 @@ fn select_nearest_compatible_cargo(
     unit_positions: &HashMap<(usize, usize), crate::systems::movement::OccupantInfo>,
     player_id: PlayerId,
     turn_cache: &mut TurnDistanceCache,
+    connectivity: &mut TerrainConnectivity,
     enemy_types: &[UnitType],
     damage_chart: Option<&crate::resources::DamageChart>,
     require_effective_combat: bool,
@@ -134,7 +135,7 @@ fn select_nearest_compatible_cargo(
             continue;
         }
         let already_reachable = target_position.is_some_and(|target| {
-            is_terrain_reachable(
+            connectivity.is_reachable(
                 map,
                 registry,
                 (position.x, position.y),
@@ -200,10 +201,10 @@ fn select_pickup_position(
     transport_position: GridPosition,
     transport_stats: &UnitStats,
     cargo_entities: &[Entity],
+    connectivity: &mut TerrainConnectivity,
 ) -> Option<GridPosition> {
     let map = world.resource::<Map>();
     let registry = world.resource::<MasterDataRegistry>();
-    let mut connectivity = TerrainConnectivity::default();
     let cargo_data: Vec<_> = cargo_entities
         .iter()
         .filter_map(|cargo| {
@@ -571,6 +572,8 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     }
 
     let mut turn_cache = TurnDistanceCache::default();
+    // マップ全体のフラッドフィルを毎回やり直さないよう、地形連結判定を使い回す。
+    let mut connectivity = TerrainConnectivity::default();
 
     // フリーの自軍ユニットを収集
     let mut free_combat_units = Vec::new();
@@ -755,7 +758,9 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     }
 
     // 輸送役の選択順を座標と Entity ID で固定する。
-    free_transports.sort_by_key(|(entity, pos, _)| (pos.y, pos.x, entity.to_bits()));
+    // 逆順にソートし、後続のループで pop() (O(1)) から取り出せるようにする。
+    free_transports
+        .sort_by_key(|(entity, pos, _)| std::cmp::Reverse((pos.y, pos.x, entity.to_bits())));
 
     // 優先順位の高い島から輸送機を割り当てる
     for objective in objectives.iter() {
@@ -797,7 +802,8 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
             .cloned();
 
         while to_assign > 0 && !free_transports.is_empty() {
-            let (transport_entity, transport_position, transport_stats) = free_transports.remove(0);
+            let (transport_entity, transport_position, transport_stats) =
+                free_transports.pop().unwrap();
             let capacity = world
                 .get::<crate::components::CargoCapacity>(transport_entity)
                 .map(|cargo| cargo.max as usize)
@@ -855,6 +861,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                         &unit_positions,
                         perspective_player,
                         &mut turn_cache,
+                        &mut connectivity,
                         &enemy_types,
                         damage_chart.as_ref(),
                         search_combat,
@@ -862,9 +869,9 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                         continue;
                     };
                     let entry = if search_combat {
-                        free_combat_units.remove(index)
+                        free_combat_units.swap_remove(index)
                     } else {
-                        free_infantry.remove(index)
+                        free_infantry.swap_remove(index)
                     };
                     if entry.2.can_capture {
                         assigned_capture_count += 1;
@@ -891,13 +898,14 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                         &unit_positions,
                         perspective_player,
                         &mut turn_cache,
+                        &mut connectivity,
                         &enemy_types,
                         damage_chart.as_ref(),
                         false,
                     ) else {
                         break;
                     };
-                    let entry = free_infantry.remove(index);
+                    let entry = free_infantry.swap_remove(index);
                     if entry.2.can_capture {
                         assigned_capture_count += 1;
                     }
@@ -916,6 +924,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                     transport_position,
                     &transport_stats,
                     &cargo_entities[initially_loaded_count..],
+                    &mut connectivity,
                 )
             } else {
                 Some(transport_position)
@@ -956,6 +965,9 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
             to_assign = to_assign.saturating_sub(assigned_capture_count);
         }
     }
+
+    // pop() で取り出した分だけ逆順になっているため、元の昇順（座標と Entity ID 順）へ戻す。
+    free_transports.reverse();
 
     // 割り当てられなかった搭載済み輸送機は、全カーゴを追跡して安全に降ろす。
     let mut i = 0;
@@ -2984,6 +2996,7 @@ mod tests {
             ..UnitStats::mock()
         };
         let mut cache = TurnDistanceCache::default();
+        let mut connectivity = TerrainConnectivity::default();
 
         assert_eq!(
             select_nearest_compatible_cargo(
@@ -2998,6 +3011,7 @@ mod tests {
                 &HashMap::new(),
                 PlayerId(1),
                 &mut cache,
+                &mut connectivity,
                 &[],
                 None,
                 false,
@@ -3039,6 +3053,7 @@ mod tests {
                 GridPosition { x: 1, y: 0 },
                 &transport_stats,
                 &[cargo],
+                &mut TerrainConnectivity::default(),
             ),
             Some(GridPosition { x: 1, y: 0 })
         );
