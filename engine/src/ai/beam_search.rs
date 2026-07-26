@@ -71,7 +71,9 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
     let active_squads: Vec<Squad> = manager
         .squads
         .iter()
-        .filter(|s| !s.members.is_empty())
+        // 輸送部隊は複数ターンのフェーズと侵攻島を保持するため、
+        // 単ターンの Beam Search で目標を上書きしない。
+        .filter(|s| !s.members.is_empty() && s.mission_type != MissionType::Transport)
         .cloned()
         .collect();
 
@@ -138,6 +140,23 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                     // target_island が未設定の場合は通常のフォールバック
                     valid_targets.extend(&target_props);
                 }
+            }
+        }
+
+        // 上陸後に引き継がれた部隊は、侵攻対象島の外へ目標を飛ばさない。
+        if squad.mission_type != MissionType::Transport
+            && let Some(target_island) = squad.target_island
+            && let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>()
+        {
+            valid_targets.retain(|target| {
+                island_map
+                    .get_island_at(target)
+                    .is_some_and(|island| island.id == target_island)
+            });
+            if valid_targets.is_empty()
+                && let Some(current_target) = squad.target
+            {
+                valid_targets.push(current_target);
             }
         }
 
@@ -439,7 +458,11 @@ mod tests {
             target: None,
             target_island: None,
             phase: crate::ai::squad::MissionPhase::Forming,
-            transport_cargo: None,
+            transport_entity: None,
+            cargo_entities: Vec::new(),
+            pickup_position: None,
+            drop_position: None,
+            delivered_cargo: Vec::new(),
         };
         squad.members.insert(u1);
 
@@ -462,5 +485,54 @@ mod tests {
             manager.squads[0].phase,
             crate::ai::squad::MissionPhase::MovingToTarget
         );
+    }
+
+    #[test]
+    fn beam_search_does_not_redirect_transport_invasion() {
+        let mut world = setup_test_world();
+        let p1 = PlayerId(1);
+        let map = world.resource::<Map>().clone();
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_id = island_map
+            .get_island_at(&GridPosition { x: 8, y: 8 })
+            .unwrap()
+            .id;
+        world.insert_resource(island_map);
+        world.spawn((
+            GridPosition { x: 1, y: 1 },
+            crate::components::Property::new(Terrain::Capital, Some(p1), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 8, y: 8 },
+            crate::components::Property::new(Terrain::City, Some(PlayerId(2)), 100),
+        ));
+        let transport = world
+            .spawn((
+                Faction(p1),
+                GridPosition { x: 2, y: 2 },
+                UnitStats {
+                    unit_type: UnitType::Lander,
+                    movement_type: MovementType::Ship,
+                    max_movement: 6,
+                    max_cargo: 2,
+                    ..UnitStats::mock()
+                },
+            ))
+            .id();
+
+        let mut manager = SquadManager::new();
+        let squad = manager.create_squad(MissionType::Transport);
+        squad.members.insert(transport);
+        squad.transport_entity = Some(transport);
+        squad.target = Some(GridPosition { x: 8, y: 8 });
+        squad.target_island = Some(island_id);
+        squad.phase =
+            crate::ai::squad::MissionPhase::Transport(crate::ai::squad::TransportPhase::Transit);
+        world.insert_resource(manager);
+
+        run_squad_beam_search(&mut world, p1);
+        let manager = world.resource::<SquadManager>();
+        assert_eq!(manager.squads[0].target, Some(GridPosition { x: 8, y: 8 }));
+        assert_eq!(manager.squads[0].target_island, Some(island_id));
     }
 }

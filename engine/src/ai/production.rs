@@ -556,6 +556,14 @@ pub fn calculate_unit_score_at(
     }
     // 輸送ユニットの評価（期待状態価値の向上分に基づく）
     if stats.max_cargo > 0 && !strategy.transport_candidates.is_empty() {
+        let transport_targets = if is_v3 {
+            strategy
+                .invasion_target
+                .map(|target| vec![target.target_position])
+                .unwrap_or_else(|| strategy.priority_targets.clone())
+        } else {
+            strategy.priority_targets.clone()
+        };
         let mut transport_utility: f32 = 0.0;
         for (c_pos, c_stats, c_value) in &strategy.transport_candidates {
             // この輸送ユニットが搭載可能かチェック
@@ -563,7 +571,7 @@ pub fn calculate_unit_score_at(
                 // 候補ユニットにとっての最寄りのターゲットを特定
                 let mut min_dist_to_target = 999;
                 let mut best_target = GridPosition { x: 0, y: 0 };
-                for target in &strategy.priority_targets {
+                for target in &transport_targets {
                     let d = (c_pos.x as i32 - target.x as i32).abs()
                         + (c_pos.y as i32 - target.y as i32).abs();
                     if d < min_dist_to_target {
@@ -612,7 +620,7 @@ pub fn calculate_unit_score_at(
 
         // 2.5. Lander侵攻価値スコア (Invasion Value)
         let mut invasion_value = 0.0;
-        for target in &strategy.priority_targets {
+        for target in &transport_targets {
             let mut is_blocked = false;
             let steps = 4;
             for i in 1..steps {

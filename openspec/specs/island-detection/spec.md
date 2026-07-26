@@ -10,3 +10,14 @@ MUST: AIはマップの地形を解析し、連続した陸地を「島」とし
 - **WHEN** AIエンジンが初期化される、または地形が変更されたとき
 - **THEN** Sea以外の地形をフラッドフィルで連結し、一意のIsland IDを持つIslandMapを生成する。
 
+### Requirement: Movement-aware Strategic Connectivity
+MUST: 地上部隊の交戦・侵攻要否は Island ID だけでなく、対象ユニットの移動タイプによる地形到達可能性で判定しなければならない。
+
+#### Scenario: Ground Forces Separated by Sea or Shoal
+- **WHEN** 近距離にいる地上ユニット同士が、Sea または地上移動不能な Shoal によって分断されているとき
+- **THEN** AIはそれらを近距離の交戦相手として数えず、敵島への輸送侵攻を検討する。
+
+#### Scenario: Air and Ship Engagement
+- **WHEN** Air または Ship ユニットが別島の敵と交戦可能な距離にいるとき
+- **THEN** 島の分離だけを理由に交戦候補から除外しない。
+

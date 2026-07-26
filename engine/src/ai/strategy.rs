@@ -3,7 +3,7 @@
 use crate::ai::demand::{
     DemandMatrix, average_attack_expectation, compute_demand, compute_unit_affinity,
 };
-use crate::ai::turn_distance::{TurnDistanceCache, calculate_turn_distance};
+use crate::ai::turn_distance::{TerrainConnectivity, TurnDistanceCache, calculate_turn_distance};
 use crate::components::{Faction, GridPosition, PlayerId, Property, UnitStats};
 use crate::resources::{Map, MovementType, Terrain, UnitType, master_data::MasterDataRegistry};
 use bevy_ecs::prelude::*;
@@ -51,6 +51,8 @@ pub struct ProductionStrategy {
     pub existing_transport_count: usize,
     /// 敵地上ユニットが存在しない平和な島にあるプロパティの座標セット
     pub peaceful_properties: std::collections::HashSet<GridPosition>,
+    /// V3 が現在優先する、地上移動では到達できない敵島の侵攻目標。
+    pub invasion_target: Option<crate::ai::objectives::InvasionTarget>,
 }
 
 /// 複数ターンにまたがる生産計画。
@@ -62,6 +64,41 @@ pub struct ProductionPlan {
     pub reserves: HashMap<u32, u32>,
     /// 勢力ごとの次ターン生産予約ユニット。
     pub reservations: HashMap<u32, Vec<UnitType>>,
+}
+
+fn is_ground_movement(movement_type: MovementType) -> bool {
+    !matches!(movement_type, MovementType::Air | MovementType::Ship)
+}
+
+/// 2ユニットを戦略上の近距離交戦候補として扱えるかを判定します。
+/// 地上ユニット同士だけは、互いの地形移動で接続されていない場合に除外します。
+fn can_form_ground_engagement(
+    map: &Map,
+    registry: &MasterDataRegistry,
+    my_pos: GridPosition,
+    my_stats: &UnitStats,
+    enemy_pos: GridPosition,
+    enemy_stats: &UnitStats,
+    connectivity: &mut TerrainConnectivity,
+) -> bool {
+    if !is_ground_movement(my_stats.movement_type) || !is_ground_movement(enemy_stats.movement_type)
+    {
+        return true;
+    }
+
+    connectivity.is_reachable(
+        map,
+        registry,
+        (my_pos.x, my_pos.y),
+        (enemy_pos.x, enemy_pos.y),
+        my_stats.movement_type,
+    ) || connectivity.is_reachable(
+        map,
+        registry,
+        (enemy_pos.x, enemy_pos.y),
+        (my_pos.x, my_pos.y),
+        enemy_stats.movement_type,
+    )
 }
 
 /// 敵ユニットが特定の拠点を脅かしているかを判定するヘルパー関数。
@@ -123,6 +160,10 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
             crate::resources::master_data::MasterDataRegistry::load().unwrap_or_default()
         });
     let map = world.resource::<crate::resources::Map>().clone();
+    let is_v3 = world
+        .get_resource::<crate::ai::ai_version::PlayerAiSettings>()
+        .map(|settings| settings.get_version(player_id).uses_v3_tactics())
+        .unwrap_or(false);
     let mut turn_cache = TurnDistanceCache::default();
     let mut unit_positions = HashMap::new();
     let mut q_all_units = world.query::<(&Faction, &GridPosition, &UnitStats)>();
@@ -213,14 +254,107 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
         }
     }
 
-    // 交戦可能性の判定
+    let mut terrain_connectivity = TerrainConnectivity::default();
+
+    // V3 は進行中の侵攻島を、敵所有拠点が残る間は維持する。
+    if is_v3 {
+        let active_island = world
+            .get_resource::<crate::ai::squad::SquadManager>()
+            .and_then(|manager| {
+                manager.squads.iter().find_map(|squad| {
+                    let belongs_to_player = squad
+                        .transport_entity
+                        .and_then(|entity| world.get::<Faction>(entity))
+                        .or_else(|| {
+                            squad
+                                .members
+                                .iter()
+                                .find_map(|entity| world.get::<Faction>(*entity))
+                        })
+                        .is_some_and(|faction| faction.0 == player_id);
+                    belongs_to_player.then_some(squad.target_island).flatten()
+                })
+            });
+        if let Some(active_island) = active_island {
+            let mut active_targets: Vec<_> = enemy_properties
+                .iter()
+                .filter(|target| {
+                    island_map
+                        .get_island_at(target)
+                        .is_some_and(|island| island.id == active_island)
+                })
+                .copied()
+                .collect();
+            active_targets.sort_by_key(|target| (target.y, target.x));
+            if let Some(target_position) = active_targets.first().copied() {
+                strategy.invasion_target = Some(crate::ai::objectives::InvasionTarget {
+                    target_island: active_island,
+                    target_position,
+                });
+            }
+        }
+    }
+
+    // 新規侵攻では、地上移動だけでは到達できない敵所有拠点から1島を選ぶ。
+    if is_v3 && strategy.invasion_target.is_none() {
+        let mut invasion_candidates = Vec::new();
+        for target in &enemy_properties {
+            let Some(island) = island_map.get_island_at(target) else {
+                continue;
+            };
+            let reachable_by_ground = my_units.iter().any(|(pos, stats)| {
+                is_ground_movement(stats.movement_type)
+                    && terrain_connectivity.is_reachable(
+                        &map,
+                        &master_data,
+                        (pos.x, pos.y),
+                        (target.x, target.y),
+                        stats.movement_type,
+                    )
+            });
+            if reachable_by_ground {
+                continue;
+            }
+
+            let terrain_rank = if map.get_terrain(target.x, target.y) == Some(Terrain::Capital) {
+                0u8
+            } else {
+                1u8
+            };
+            invasion_candidates.push((
+                island.id.0,
+                terrain_rank,
+                target.y,
+                target.x,
+                crate::ai::objectives::InvasionTarget {
+                    target_island: island.id,
+                    target_position: *target,
+                },
+            ));
+        }
+        invasion_candidates
+            .sort_by_key(|candidate| (candidate.0, candidate.1, candidate.2, candidate.3));
+        strategy.invasion_target = invasion_candidates.first().map(|candidate| candidate.4);
+    }
+
+    // 交戦可能性の判定。地上部隊同士は、海や進入不能地形で分断された組を除外する。
     let mut min_enemy_dist = 999;
-    for (m_pos, _) in &my_units {
-        for (e_pos, _) in &enemy_units {
-            let dist =
-                (m_pos.x as i32 - e_pos.x as i32).abs() + (m_pos.y as i32 - e_pos.y as i32).abs();
-            if dist < min_enemy_dist {
-                min_enemy_dist = dist;
+    for (m_pos, m_stats) in &my_units {
+        for (e_pos, e_stats) in &enemy_units {
+            if !can_form_ground_engagement(
+                &map,
+                &master_data,
+                *m_pos,
+                m_stats,
+                *e_pos,
+                e_stats,
+                &mut terrain_connectivity,
+            ) {
+                continue;
+            }
+            let distance = map.distance(m_pos.x, m_pos.y, e_pos.x, e_pos.y) as i32;
+            if distance < min_enemy_dist {
+                min_enemy_dist = distance;
             }
         }
     }
@@ -410,9 +544,18 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                 &registry,
             );
 
-            // 輸送が必要なユニット（停滞ユニット）的抽出
+            // 輸送が必要なユニット（停滞ユニット）的抽出。
+            // V3 は選択済みの敵島侵攻目標だけを使い、複数島への需要分散を防ぐ。
             let map = world.resource::<crate::resources::Map>();
             let normalization_scale = average_attack_expectation(&chart, &registry);
+            let transport_targets = if is_v3 {
+                strategy
+                    .invasion_target
+                    .map(|target| vec![target.target_position])
+                    .unwrap_or_else(|| strategy.priority_targets.clone())
+            } else {
+                strategy.priority_targets.clone()
+            };
             for (pos, stats) in &my_units {
                 // 陸上ユニットかつ、輸送能力を持たない戦闘/占領用ユニットのみ
                 if matches!(
@@ -427,20 +570,17 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                     let mut min_dist = 999;
                     let mut blocked_by_sea = false;
 
-                    for target in &strategy.priority_targets {
-                        // ターゲットがある島を取得し、侵攻が許可されているかチェック。
-                        // 注 (#54): このフィルタを V3 で無効化する実験を行ったが、
-                        // 輸送候補が爆発して輸送スコアが歪み、拡張用の歩兵輸送が
-                        // 止まる退行が観測されたため従来挙動を維持している。
-                        // 侵攻許可のデッドロック解消は別設計 (侵攻オブジェクティブ) が必要
-                        if let Some(target_island_id) =
-                            island_map.get_island_at(target).map(|i| i.id)
+                    for target in &transport_targets {
+                        // V2 は既存の侵攻許可を維持する。V3 は決定済みの単一侵攻目標を使うため、
+                        // 旧ゲートで再度除外して生産と実行を不一致にしない。
+                        if !is_v3
+                            && let Some(target_island_id) =
+                                island_map.get_island_at(target).map(|i| i.id)
                         {
                             let allowed = allowed_islands
                                 .get(&target_island_id)
                                 .cloned()
                                 .unwrap_or(true);
-                            // 侵攻が許可されていない島は、海を越える輸送のターゲットとして考慮しない
                             if !allowed {
                                 continue;
                             }
@@ -547,15 +687,15 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                 });
 
             // 海を越えた島への侵攻需要（Base Invasion Demand）の計算
-            let mut has_sea_bound_target = false;
-            for target in &strategy.priority_targets {
-                if let Some(target_island_id) = get_island_id(target)
-                    && !my_base_island_ids.contains(&target_island_id)
-                {
-                    has_sea_bound_target = true;
-                    break;
-                }
-            }
+            let has_sea_bound_target = if is_v3 {
+                strategy.invasion_target.is_some()
+            } else {
+                strategy.priority_targets.iter().any(|target| {
+                    get_island_id(target).is_some_and(|target_island_id| {
+                        !my_base_island_ids.contains(&target_island_id)
+                    })
+                })
+            };
 
             if has_sea_bound_target {
                 // 海を越えた侵攻目標がある場合、輸送需要のベースラインを保証する
@@ -816,6 +956,197 @@ mod tests {
             strategy.demand.anti_ground >= 0.5,
             "海越え侵攻需要により demand.anti_ground は0.5以上になるべきだが、実際は {}",
             strategy.demand.anti_ground
+        );
+    }
+
+    fn setup_separated_units(
+        friendly_movement: MovementType,
+        enemy_movement: MovementType,
+        separator: Terrain,
+    ) -> World {
+        let mut world = World::new();
+        let master_data = MasterDataRegistry::load().unwrap();
+        let mut map = Map::new(3, 1, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(1, 0, separator).unwrap();
+        world.insert_resource(map.clone());
+        world.insert_resource(master_data);
+        world.insert_resource(crate::ai::islands::IslandMap::analyze(&map));
+
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Faction(p1),
+            UnitStats {
+                unit_type: if friendly_movement == MovementType::Air {
+                    UnitType::Fighter
+                } else if friendly_movement == MovementType::Ship {
+                    UnitType::Battleship
+                } else {
+                    UnitType::Infantry
+                },
+                movement_type: friendly_movement,
+                max_movement: 3,
+                max_range: 1,
+                ..UnitStats::mock()
+            },
+        ));
+        world.spawn((
+            GridPosition { x: 2, y: 0 },
+            Faction(p2),
+            UnitStats {
+                unit_type: if enemy_movement == MovementType::Air {
+                    UnitType::Fighter
+                } else if enemy_movement == MovementType::Ship {
+                    UnitType::Battleship
+                } else {
+                    UnitType::Infantry
+                },
+                movement_type: enemy_movement,
+                max_movement: 3,
+                max_range: 1,
+                ..UnitStats::mock()
+            },
+        ));
+        world
+    }
+
+    #[test]
+    fn ground_units_across_sea_are_not_engaged() {
+        let mut world =
+            setup_separated_units(MovementType::Infantry, MovementType::Infantry, Terrain::Sea);
+        assert_eq!(
+            analyze_strategy(&mut world, PlayerId(1)).phase,
+            GamePhase::Expansion
+        );
+    }
+
+    #[test]
+    fn air_or_ship_across_sea_remains_engaged() {
+        for movement in [MovementType::Air, MovementType::Ship] {
+            let mut world = setup_separated_units(movement, MovementType::Infantry, Terrain::Sea);
+            assert_eq!(
+                analyze_strategy(&mut world, PlayerId(1)).phase,
+                GamePhase::Contested
+            );
+        }
+    }
+
+    #[test]
+    fn shoal_does_not_connect_ground_engagement() {
+        let mut world = setup_separated_units(
+            MovementType::Infantry,
+            MovementType::Infantry,
+            Terrain::Shoal,
+        );
+        let island_count = world
+            .resource::<crate::ai::islands::IslandMap>()
+            .islands
+            .len();
+        assert_eq!(island_count, 1, "IslandMap 上は浅瀬で同じ島になる前提");
+        assert_eq!(
+            analyze_strategy(&mut world, PlayerId(1)).phase,
+            GamePhase::Expansion
+        );
+    }
+
+    #[test]
+    fn v3_selects_one_deterministic_enemy_island() {
+        let build_world = |reverse_spawn: bool| {
+            let mut world = World::new();
+            let master_data = MasterDataRegistry::load().unwrap();
+            let mut map = Map::new(7, 1, Terrain::Sea, GridTopology::Square);
+            for x in [0, 3, 6] {
+                map.set_terrain(x, 0, Terrain::Plains).unwrap();
+            }
+            world.insert_resource(map.clone());
+            world.insert_resource(master_data);
+            world.insert_resource(crate::ai::islands::IslandMap::analyze(&map));
+            let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
+            settings.set_version(PlayerId(1), crate::ai::ai_version::AiVersion::V3);
+            world.insert_resource(settings);
+
+            world.spawn((
+                GridPosition { x: 0, y: 0 },
+                Property::new(Terrain::Capital, Some(PlayerId(1)), 100),
+            ));
+            let enemy_properties = [
+                (GridPosition { x: 3, y: 0 }, Terrain::City),
+                (GridPosition { x: 6, y: 0 }, Terrain::Capital),
+            ];
+            let order: Vec<_> = if reverse_spawn {
+                enemy_properties.into_iter().rev().collect()
+            } else {
+                enemy_properties.into_iter().collect()
+            };
+            for (position, terrain) in order {
+                world.spawn((position, Property::new(terrain, Some(PlayerId(2)), 100)));
+            }
+            world
+        };
+
+        let mut normal = build_world(false);
+        let mut reversed = build_world(true);
+        let normal_target = analyze_strategy(&mut normal, PlayerId(1)).invasion_target;
+        let reversed_target = analyze_strategy(&mut reversed, PlayerId(1)).invasion_target;
+        assert_eq!(normal_target, reversed_target);
+        assert_eq!(
+            normal_target.unwrap().target_position,
+            GridPosition { x: 3, y: 0 }
+        );
+    }
+
+    #[test]
+    fn active_invasion_persists_after_combat_unit_lands() {
+        let mut world = World::new();
+        let master_data = MasterDataRegistry::load().unwrap();
+        let mut map = Map::new(4, 1, Terrain::Sea, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Plains).unwrap();
+        map.set_terrain(3, 0, Terrain::Plains).unwrap();
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let target_island = island_map
+            .get_island_at(&GridPosition { x: 3, y: 0 })
+            .unwrap()
+            .id;
+        world.insert_resource(map);
+        world.insert_resource(master_data);
+        world.insert_resource(island_map);
+        let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
+        settings.set_version(PlayerId(1), crate::ai::ai_version::AiVersion::V3);
+        world.insert_resource(settings);
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(PlayerId(1)), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 3, y: 0 },
+            Property::new(Terrain::City, Some(PlayerId(2)), 100),
+        ));
+        let landed_tank = world
+            .spawn((
+                GridPosition { x: 3, y: 0 },
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Tank,
+                    max_movement: 6,
+                    ..UnitStats::mock()
+                },
+            ))
+            .id();
+        let mut manager = crate::ai::squad::SquadManager::new();
+        let squad = manager.create_squad(crate::ai::squad::MissionType::Attack);
+        squad.members.insert(landed_tank);
+        squad.target_island = Some(target_island);
+        squad.target = Some(GridPosition { x: 3, y: 0 });
+        world.insert_resource(manager);
+
+        assert_eq!(
+            analyze_strategy(&mut world, PlayerId(1)).invasion_target,
+            Some(crate::ai::objectives::InvasionTarget {
+                target_island,
+                target_position: GridPosition { x: 3, y: 0 },
+            })
         );
     }
 }

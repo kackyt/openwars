@@ -239,7 +239,7 @@ mod tests {
     /// 4. 輸送連携 (Transport Invasion)
     fn setup_transport_invasion() -> World {
         let mut world = setup_test_world(10, 10, Terrain::Sea);
-        world.resource_mut::<Map>().tiles[11] = Terrain::Plains;
+        world.resource_mut::<Map>().tiles[11] = Terrain::Port;
         world.resource_mut::<Map>().tiles[8 * 10 + 8] = Terrain::Plains;
         let map = world.resource::<Map>().clone();
         world.insert_resource(crate::ai::islands::IslandMap::analyze(&map));
@@ -272,7 +272,7 @@ mod tests {
                 loadable_unit_types: vec![UnitType::Infantry, UnitType::Mech],
                 ..UnitStats::mock()
             },
-            GridPosition { x: 1, y: 2 },
+            GridPosition { x: 1, y: 1 },
             CargoCapacity {
                 max: 2,
                 loaded: vec![],
@@ -449,7 +449,7 @@ mod tests {
     /// 6. 海を隔てた強襲上陸と敵地攻撃 (Amphibious Assault & Attack)
     fn setup_amphibious_assault() -> World {
         let mut world = setup_test_world(10, 10, Terrain::Sea);
-        world.resource_mut::<Map>().tiles[11] = Terrain::Plains;
+        world.resource_mut::<Map>().tiles[11] = Terrain::Port;
         world.resource_mut::<Map>().tiles[8 * 10 + 8] = Terrain::Plains;
         // 島Bに降車用の空き地(8,7)を追加
         world.resource_mut::<Map>().tiles[7 * 10 + 8] = Terrain::Plains;
@@ -465,7 +465,7 @@ mod tests {
             GridPosition { x: 1, y: 1 }, // Map defaults to Sea, but let's assume it's acceptable or we change it to plains
             Property::new(Terrain::Factory, Some(p1), 100),
         ));
-        world.resource_mut::<Map>().tiles[11] = Terrain::Plains;
+        world.resource_mut::<Map>().tiles[11] = Terrain::Port;
 
         world.spawn((
             GridPosition { x: 8, y: 8 },
@@ -587,14 +587,435 @@ mod tests {
         let manager_v2 = world_v2
             .get_resource::<crate::ai::squad::SquadManager>()
             .expect("V2 should create squad manager");
-        assert!(
-            manager_v2.squads.iter().any(|s| s.mission_type
-                == crate::ai::squad::MissionType::Transport
-                && s.phase
-                    == crate::ai::squad::MissionPhase::Transport(
-                        crate::ai::squad::TransportPhase::Transit
-                    )),
-            "V2 should plan a Transit transport mission to drop units"
+        let transport_squad = manager_v2
+            .squads
+            .iter()
+            .find(|squad| {
+                squad.mission_type == crate::ai::squad::MissionType::Transport
+                    && squad.phase
+                        == crate::ai::squad::MissionPhase::Transport(
+                            crate::ai::squad::TransportPhase::Transit,
+                        )
+            })
+            .expect("V2 should plan a Transit transport mission to drop units");
+        assert!(transport_squad.transport_entity.is_some());
+        assert_eq!(
+            transport_squad.cargo_entities.len(),
+            2,
+            "搭載済みの全カーゴを輸送部隊が追跡する必要がある"
         );
+    }
+
+    #[test]
+    fn test_v3_transport_wave_contains_capture_and_combat_cargo() {
+        let p1 = PlayerId(1);
+        let mut world = setup_transport_invasion();
+        let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
+        settings.set_version(p1, crate::ai::ai_version::AiVersion::V3);
+        world.insert_resource(settings);
+
+        // 輸送船が戦車を搭載できる侵攻用構成にする。
+        let lander = world
+            .query::<(Entity, &UnitStats)>()
+            .iter(&world)
+            .find(|(_, stats)| stats.unit_type == UnitType::Lander)
+            .map(|(entity, _)| entity)
+            .unwrap();
+        world
+            .get_mut::<UnitStats>(lander)
+            .unwrap()
+            .loadable_unit_types
+            .push(UnitType::Tank);
+
+        let tank = world
+            .spawn((
+                p1,
+                Faction(p1),
+                HasMoved(false),
+                ActionCompleted(false),
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Tank,
+                    max_movement: 6,
+                    can_capture: false,
+                    ..UnitStats::mock()
+                },
+                GridPosition { x: 1, y: 1 },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                Ammo {
+                    ammo1: 9,
+                    ammo2: 0,
+                    max_ammo1: 9,
+                    max_ammo2: 0,
+                },
+            ))
+            .id();
+
+        crate::ai::squad::plan_squads(&mut world, p1);
+        let manager = world.resource::<crate::ai::squad::SquadManager>();
+        let transport = manager
+            .squads
+            .iter()
+            .find(|squad| squad.mission_type == crate::ai::squad::MissionType::Transport)
+            .expect("V3 should create one invasion transport squad");
+        assert_eq!(transport.transport_entity, Some(lander));
+        assert_eq!(transport.cargo_entities.len(), 2);
+        assert!(
+            transport.cargo_entities.contains(&tank),
+            "侵攻波には戦闘要員を含める"
+        );
+        assert!(transport.cargo_entities.iter().any(|entity| {
+            world
+                .get::<UnitStats>(*entity)
+                .is_some_and(|stats| stats.can_capture)
+        }));
+        assert!(transport.cargo_entities.len() <= 2);
+    }
+
+    #[test]
+    fn test_v3_partially_loaded_transport_fills_remaining_capacity() {
+        let p1 = PlayerId(1);
+        let mut world = setup_transport_invasion();
+        let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
+        settings.set_version(p1, crate::ai::ai_version::AiVersion::V3);
+        world.insert_resource(settings);
+        let lander = world
+            .query::<(Entity, &UnitStats)>()
+            .iter(&world)
+            .find(|(_, stats)| stats.unit_type == UnitType::Lander)
+            .map(|(entity, _)| entity)
+            .unwrap();
+        world
+            .get_mut::<UnitStats>(lander)
+            .unwrap()
+            .loadable_unit_types
+            .push(UnitType::Tank);
+        let infantry = world
+            .query::<(Entity, &UnitStats)>()
+            .iter(&world)
+            .find(|(_, stats)| stats.unit_type == UnitType::Infantry)
+            .map(|(entity, _)| entity)
+            .unwrap();
+        world.get_mut::<CargoCapacity>(lander).unwrap().loaded = vec![infantry];
+        world.entity_mut(infantry).insert(Transporting(lander));
+        *world.get_mut::<GridPosition>(infantry).unwrap() = GridPosition { x: 9999, y: 9999 };
+        let tank = world
+            .spawn((
+                Faction(p1),
+                GridPosition { x: 1, y: 1 },
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Tank,
+                    max_movement: 6,
+                    ..UnitStats::mock()
+                },
+                HasMoved(false),
+                ActionCompleted(false),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Fuel {
+                    current: 99,
+                    max: 99,
+                },
+            ))
+            .id();
+
+        crate::ai::squad::plan_squads(&mut world, p1);
+        let manager = world.resource::<crate::ai::squad::SquadManager>();
+        let transport = manager
+            .squads
+            .iter()
+            .find(|squad| squad.mission_type == crate::ai::squad::MissionType::Transport)
+            .unwrap();
+        assert_eq!(transport.cargo_entities.len(), 2);
+        assert!(transport.cargo_entities.contains(&infantry));
+        assert!(transport.cargo_entities.contains(&tank));
+        assert_eq!(
+            transport.phase,
+            crate::ai::squad::MissionPhase::Transport(crate::ai::squad::TransportPhase::Pickup)
+        );
+    }
+
+    #[test]
+    fn test_v3_keeps_neutral_island_transport_expansion() {
+        let p1 = PlayerId(1);
+        let mut world = setup_transport_invasion();
+        let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
+        settings.set_version(p1, crate::ai::ai_version::AiVersion::V3);
+        world.insert_resource(settings);
+        let neutral_property = world
+            .query::<(Entity, &GridPosition, &Property)>()
+            .iter(&world)
+            .find(|(_, position, _)| **position == GridPosition { x: 8, y: 8 })
+            .map(|(entity, _, _)| entity)
+            .unwrap();
+        world
+            .get_mut::<Property>(neutral_property)
+            .unwrap()
+            .owner_id = None;
+
+        crate::ai::squad::plan_squads(&mut world, p1);
+        assert!(
+            world
+                .resource::<crate::ai::squad::SquadManager>()
+                .squads
+                .iter()
+                .any(|squad| squad.mission_type == crate::ai::squad::MissionType::Transport),
+            "敵島侵攻が無い場合も中立島への輸送拡張を維持する"
+        );
+    }
+
+    #[test]
+    fn test_v3_multi_cargo_invasion_loads_transits_and_lands() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (mut world, mut schedule) =
+            crate::setup::initialize_world_from_master_data(&master_data, "map_1").unwrap();
+        let entities: Vec<Entity> = world.query::<Entity>().iter(&world).collect();
+        for entity in entities {
+            world.despawn(entity);
+        }
+
+        let mut map = Map::new(5, 3, Terrain::Sea, GridTopology::Square);
+        map.set_terrain(0, 1, Terrain::Port).unwrap();
+        map.set_terrain(3, 1, Terrain::Shoal).unwrap();
+        for position in [(3, 0), (4, 0), (4, 1), (4, 2)] {
+            map.set_terrain(position.0, position.1, Terrain::Plains)
+                .unwrap();
+        }
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let target_island = island_map
+            .get_island_at(&GridPosition { x: 4, y: 0 })
+            .unwrap()
+            .id;
+        world.insert_resource(map);
+        world.insert_resource(island_map);
+
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+        world.spawn((
+            GridPosition { x: 0, y: 1 },
+            Property::new(Terrain::Capital, Some(p1), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 4, y: 0 },
+            Property::new(Terrain::Capital, Some(p2), 100),
+        ));
+        world.spawn((
+            Faction(p2),
+            GridPosition { x: 4, y: 2 },
+            UnitStats {
+                unit_type: UnitType::Tank,
+                movement_type: MovementType::Tank,
+                max_movement: 6,
+                ..UnitStats::mock()
+            },
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ));
+
+        let capture = world
+            .spawn((
+                p1,
+                Faction(p1),
+                GridPosition { x: 0, y: 1 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    movement_type: MovementType::Infantry,
+                    max_movement: 3,
+                    can_capture: true,
+                    cost: 1000,
+                    ..UnitStats::mock()
+                },
+                HasMoved(false),
+                ActionCompleted(false),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Fuel {
+                    current: 99,
+                    max: 99,
+                },
+            ))
+            .id();
+        let combat = world
+            .spawn((
+                p1,
+                Faction(p1),
+                GridPosition { x: 0, y: 1 },
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Tank,
+                    max_movement: 6,
+                    cost: 7000,
+                    ..UnitStats::mock()
+                },
+                HasMoved(false),
+                ActionCompleted(false),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Fuel {
+                    current: 99,
+                    max: 99,
+                },
+            ))
+            .id();
+        let transport = world
+            .spawn((
+                p1,
+                Faction(p1),
+                GridPosition { x: 0, y: 1 },
+                UnitStats {
+                    unit_type: UnitType::Lander,
+                    movement_type: MovementType::Ship,
+                    max_movement: 6,
+                    max_cargo: 2,
+                    loadable_unit_types: vec![UnitType::Infantry, UnitType::Tank],
+                    ..UnitStats::mock()
+                },
+                CargoCapacity {
+                    max: 2,
+                    loaded: Vec::new(),
+                },
+                HasMoved(false),
+                ActionCompleted(false),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Fuel {
+                    current: 99,
+                    max: 99,
+                },
+            ))
+            .id();
+
+        let mut manager = crate::ai::squad::SquadManager::new();
+        let squad = manager.create_squad(crate::ai::squad::MissionType::Transport);
+        squad.members.insert(transport);
+        squad.transport_entity = Some(transport);
+        squad.cargo_entities = vec![capture, combat];
+        squad.pickup_position = Some(GridPosition { x: 0, y: 1 });
+        squad.target_island = Some(target_island);
+        squad.target = Some(GridPosition { x: 4, y: 0 });
+        squad.phase =
+            crate::ai::squad::MissionPhase::Transport(crate::ai::squad::TransportPhase::Pickup);
+        world.insert_resource(manager);
+
+        let execute_transport = |world: &mut World, schedule: &mut Schedule| {
+            let mut manager = world
+                .remove_resource::<crate::ai::squad::SquadManager>()
+                .unwrap();
+            let squad = manager
+                .squads
+                .iter_mut()
+                .find(|squad| squad.mission_type == crate::ai::squad::MissionType::Transport)
+                .unwrap();
+            let (entity, command) = crate::ai::squad::execute_transport_squad_step(
+                world,
+                squad,
+                &std::collections::HashSet::new(),
+            )
+            .expect("transport should produce a command");
+            let result = command.clone();
+            world.insert_resource(manager);
+            crate::ai::engine::execute_ai_command(world, entity, command);
+            schedule.run(world);
+            result
+        };
+        let reset_actions = |world: &mut World| {
+            let mut query = world.query::<(&mut ActionCompleted, &mut HasMoved)>();
+            for (mut action, mut moved) in query.iter_mut(world) {
+                action.0 = false;
+                moved.0 = false;
+            }
+        };
+
+        assert!(matches!(
+            execute_transport(&mut world, &mut schedule),
+            AiCommand::Load { .. }
+        ));
+        crate::ai::squad::update_squads(&mut world, p1);
+        assert_eq!(
+            world.get::<CargoCapacity>(transport).unwrap().loaded.len(),
+            1
+        );
+        reset_actions(&mut world);
+        assert!(matches!(
+            execute_transport(&mut world, &mut schedule),
+            AiCommand::Load { .. }
+        ));
+        crate::ai::squad::update_squads(&mut world, p1);
+        assert_eq!(
+            world.get::<CargoCapacity>(transport).unwrap().loaded.len(),
+            2
+        );
+        assert_eq!(
+            world
+                .resource::<crate::ai::squad::SquadManager>()
+                .squads
+                .iter()
+                .find(|squad| squad.mission_type == crate::ai::squad::MissionType::Transport)
+                .unwrap()
+                .phase,
+            crate::ai::squad::MissionPhase::Transport(crate::ai::squad::TransportPhase::Transit)
+        );
+
+        reset_actions(&mut world);
+        assert!(matches!(
+            execute_transport(&mut world, &mut schedule),
+            AiCommand::Drop { .. }
+        ));
+        crate::ai::squad::update_squads(&mut world, p1);
+        assert_eq!(
+            world.get::<CargoCapacity>(transport).unwrap().loaded.len(),
+            1
+        );
+        assert!(
+            world
+                .resource::<crate::ai::squad::SquadManager>()
+                .squads
+                .iter()
+                .any(|squad| squad.mission_type == crate::ai::squad::MissionType::Capture)
+        );
+
+        reset_actions(&mut world);
+        assert!(matches!(
+            execute_transport(&mut world, &mut schedule),
+            AiCommand::Drop { .. }
+        ));
+        crate::ai::squad::update_squads(&mut world, p1);
+        let manager = world.resource::<crate::ai::squad::SquadManager>();
+        let transport_squad = manager
+            .squads
+            .iter()
+            .find(|squad| squad.mission_type == crate::ai::squad::MissionType::Transport)
+            .unwrap();
+        assert_eq!(
+            transport_squad.phase,
+            crate::ai::squad::MissionPhase::Transport(crate::ai::squad::TransportPhase::Return)
+        );
+        assert!(transport_squad.cargo_entities.is_empty());
+        assert!(
+            manager
+                .squads
+                .iter()
+                .any(|squad| squad.mission_type == crate::ai::squad::MissionType::Attack)
+        );
+        assert!(world.get::<GridPosition>(capture).unwrap().x >= 3);
+        assert!(world.get::<GridPosition>(combat).unwrap().x >= 3);
     }
 }
