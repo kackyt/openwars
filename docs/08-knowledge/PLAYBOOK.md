@@ -1,11 +1,11 @@
 ---
 title: "PLAYBOOK"
-version: "1.10.0"
+version: "1.11.0"
 status: "approved"
 created: "2026-06-06"
 updated: "2026-07-27"
 owner: "@t_kak"
-ace_entry_count: 24
+ace_entry_count: 26
 tags: [ace, playbook, knowledge-management]
 references:
   - docs/ACE_FRAMEWORK.md
@@ -634,6 +634,44 @@ Playbook が 800 行を超えた場合、以下のように分割する：
 **Context**: PR #81 において、上陸地点の安全評価と通常移動での危険度評価が個別に実装・重複していたため、間接攻撃の被害予測ロジックを `threat.rs` へ一括抽出し共通利用することで計算の一貫性を保ちつつ二重計算バグを防いだ。
 
 **Action**: 敵からの被攻撃リスクや脅威度計算が複数箇所（移動評価、拠点選定、上陸地点評価等）に及ぶ場合は、単一の脅威評価モジュール（`threat.rs` 等）に計算をカプセル化し、各評価関数はこれを参照して安全度を評価する設計とする。
+
+<a id="ace-82-1"></a>
+
+### ACE-82-1: エンティティID追跡による複合行動パイプラインのシーケンス成立検証
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | testing |
+| Origin     | PR #82 |
+| Date       | 2026-07-27 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: 勝敗やスコアなどのマクロな結果指標ではなく、エンティティIDをキーにしたイベントトレース（Load → Unload → Attack/Capture）を収集し、特定の行動シーケンスが一定ターン内に成立したかを判定基準とすることで、複合AIパイプラインを決定的に検証できる。
+
+**Context**: PR #82 にて島嶼侵攻AIの性能検証を行う際、ゲームの勝敗や最終スコアは相手の挙動や盤面全体に左右されるため合否判定から除外し、`InvasionTraceCollector` により「同一カーゴIDの搭載・敵島上陸・攻撃/被攻撃/占領開始」という一連のライフサイクルが達成されたか否かを判定基準（Criteria）として評価・テストした。
+
+**Action**: 勝敗や全体スコアでは検証しづらい多段階の行動・協力パイプライン（例: ピストン輸送〜敵地展開〜拠点攻撃）を検証する際は、構成ユニットの Entity ID で関連イベントを相関させるトレース収集メカニズムを実装し、その状態遷移シーケンスの成否を明示的な評価基準として定義する。
+
+<a id="ace-82-2"></a>
+
+### ACE-82-2: Rust テストコードにおける nightly 機能 (let_chains) 回避による stable 互換性維持
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | coding |
+| Origin     | PR #82 |
+| Date       | 2026-07-27 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: テストコード内であっても `let_chains` (`if let ... && let ...`) のような Rust の nightly 限定の実験的構文を使用すると、標準の stable ツールチェーン環境でコンパイルエラーを引き起こす原因となる。
+
+**Context**: PR #82 のテストコード実装時に `if let` の連鎖条件構文を使用したところ、コードレビューにおいて stable Rust で非互換となる nightly機能 (`let_chains`) の使用が指摘され、ネストした `if let` または `match` 構文へ修正された。
+
+**Action**: テストコードを含めすべての Rust コードにおいて nightly 限定機能のうっかり使用を避け、stable ツールチェーンで通過する標準的な構文（ネストされた `if let` や `match` またはパターンマッチの平坦化）を使用する。
 
 ## Changelog
 
