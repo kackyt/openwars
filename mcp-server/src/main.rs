@@ -1,3 +1,4 @@
+#[cfg_attr(test, allow(dead_code))]
 mod invasion_trace;
 
 use bevy_ecs::prelude::Entity;
