@@ -95,9 +95,9 @@ impl AiSimulationState {
             if squad.mission_type == MissionType::Transport {
                 // マクロ・シミュレーション（深い読み）: ターゲットにワープ＆ドロップ
                 // 歩兵を目標地点に直接配置することで、直後の evaluate_board が「上陸完了」として高く評価する
-                if let Some(cargo_ent) = squad.transport_cargo {
-                    if let Some(mut pos) = world.get_mut::<GridPosition>(cargo_ent) {
-                        *pos = target_pos;
+                for &cargo_entity in &squad.cargo_entities {
+                    if let Some(mut position) = world.get_mut::<GridPosition>(cargo_entity) {
+                        *position = target_pos;
                     }
                 }
 
@@ -353,7 +353,11 @@ mod tests {
             target: Some(GridPosition { x: 1, y: 8 }),
             target_island: None,
             phase: MissionPhase::Executing,
-            transport_cargo: None,
+            transport_entity: None,
+            cargo_entities: Vec::new(),
+            pickup_position: None,
+            drop_position: None,
+            delivered_cargo: Vec::new(),
         };
         squad.members.insert(unit_entity);
 

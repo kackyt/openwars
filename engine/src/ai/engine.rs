@@ -1083,22 +1083,47 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     if skip_entities.is_empty() {
         crate::ai::squad::plan_squads(world, active_player);
         crate::ai::beam_search::run_squad_beam_search(world, active_player);
+    } else {
+        // 降車が実際に発生した場合だけ再編成し、通常行動ごとの全盤面走査を避ける。
+        let needs_transport_reconcile = world
+            .get_resource::<crate::ai::squad::SquadManager>()
+            .is_some_and(|manager| {
+                manager.squads.iter().any(|squad| {
+                    matches!(
+                        squad.phase,
+                        crate::ai::squad::MissionPhase::Transport(
+                            crate::ai::squad::TransportPhase::Transit
+                                | crate::ai::squad::TransportPhase::Drop
+                        )
+                    ) && squad.cargo_entities.iter().any(|cargo| {
+                        world
+                            .get::<crate::components::Transporting>(*cargo)
+                            .is_none()
+                            && world.get::<GridPosition>(*cargo).is_some()
+                    })
+                })
+            });
+        if needs_transport_reconcile {
+            crate::ai::squad::update_squads(world, active_player);
+        }
     }
 
     // 1. 輸送部隊の優先実行
     let mut transport_action = None;
-    if let Some(manager) = world.remove_resource::<crate::ai::squad::SquadManager>() {
-        for squad in &manager.squads {
+    if let Some(mut manager) = world.remove_resource::<crate::ai::squad::SquadManager>() {
+        for squad in &mut manager.squads {
             if squad.mission_type == crate::ai::squad::MissionType::Transport {
-                let transport_ent = squad.members.iter().next().copied();
-                let cargo_ent = squad.transport_cargo;
+                let is_transport_cooldown = squad
+                    .transport_entity
+                    .is_none_or(|entity| skip_entities.contains(&entity));
+                let are_all_cargo_on_cooldown = !squad.cargo_entities.is_empty()
+                    && squad
+                        .cargo_entities
+                        .iter()
+                        .all(|entity| skip_entities.contains(entity));
 
-                let is_transport_cooldown =
-                    transport_ent.map_or(true, |e| skip_entities.contains(&e));
-                let is_cargo_cooldown = cargo_ent.map_or(false, |e| skip_entities.contains(&e));
-
-                // 輸送機と歩兵は独立して行動できるため、どちらかがまだ行動可能なら中に入る
-                if is_transport_cooldown && is_cargo_cooldown {
+                // 輸送役と指名カーゴは独立して行動できるため、いずれかが行動可能なら継続する。
+                if is_transport_cooldown && are_all_cargo_on_cooldown {
                     continue;
                 }
 
@@ -1133,12 +1158,10 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     if let Some(manager) = world.get_resource::<crate::ai::squad::SquadManager>() {
         for squad in &manager.squads {
             if squad.mission_type == crate::ai::squad::MissionType::Transport {
-                if let Some(&t_ent) = squad.members.iter().next() {
-                    decide_skip_entities.insert(t_ent);
+                if let Some(transport_entity) = squad.transport_entity {
+                    decide_skip_entities.insert(transport_entity);
                 }
-                if let Some(c_ent) = squad.transport_cargo {
-                    decide_skip_entities.insert(c_ent);
-                }
+                decide_skip_entities.extend(squad.cargo_entities.iter().copied());
             }
         }
     }
@@ -1230,76 +1253,6 @@ const AMBUSH_NEAR_RANGE_BONUS: i32 = 2000;
 const AMBUSH_TOO_CLOSE_PENALTY: i32 = 3000;
 /// #45 (V3): 待ち受けゾーンとみなす最大射程からのマージン (敵の接近を想定)
 const AMBUSH_APPROACH_MARGIN: u32 = 2;
-
-/// #50 (V3): 露出ペナルティのリスク係数 (分子/分母 = 1.0倍)。
-/// 1.5倍で運用したところ、重ねられた間接砲火の脅威圏に前線ユニットが
-/// 一切踏み込まなくなり、防衛線を明け渡す過剰回避が観測されたため、
-/// 期待被弾価値の等倍に設定する
-const EXPOSURE_RISK_NUM: i32 = 1;
-const EXPOSURE_RISK_DEN: i32 = 1;
-
-/// #50 (V3): 指定タイルに立った場合に敵から受ける期待被弾価値 (ゴールド換算) に
-/// 基づく露出ペナルティを計算する。地形防御ボーナスで軽減されるため、防御地形に
-/// 隠れる行動 (#44) と整合する。
-/// - 間接攻撃ユニット: 現在位置からの射程内 (移動後は攻撃不可のため据置き) を脅威圏とする。
-///   全ユニット共通で減点する (間接砲火は反撃不能な一方的損失のため)
-/// - 直接攻撃ユニット: 敵の「移動+攻撃」到達圏 (max_movement + max_range) を脅威圏とするが、
-///   **自軍が間接攻撃ユニット (min_range > 1) の場合に限り**減点する。
-///   自走砲等は隣接反撃ができず戦車の踏み込みに一方的に轢かれるためこれを避けさせる。
-///   直接攻撃ユニット同士の間合いは反撃・is_suicidal 判定・攻撃スコアが扱うので、
-///   ここで減点すると前線への踏み込みが過剰に抑制され勝率が落ちる (実測で確認)
-#[allow(clippy::too_many_arguments)]
-fn indirect_exposure_penalty(
-    tile: (usize, usize),
-    my_unit_type: crate::resources::UnitType,
-    my_cost: u32,
-    my_hp: u32,
-    my_min_range: u32,
-    tile_def_bonus: u32,
-    enemy_units: &[(
-        GridPosition,
-        crate::resources::UnitType,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-    )],
-    damage_chart: &crate::resources::DamageChart,
-) -> i32 {
-    // 自軍が間接攻撃ユニットなら隣接反撃ができないため、直接攻撃の到達圏も脅威とする
-    let my_is_indirect = my_min_range > 1;
-    let mut total_damage: u32 = 0;
-    for (e_pos, e_type, _e_cost, _e_hp, e_min_range, e_max_range, e_max_movement) in enemy_units {
-        let dist = (e_pos.x.abs_diff(tile.0) + e_pos.y.abs_diff(tile.1)) as u32;
-        let base_dmg = || {
-            damage_chart
-                .get_base_damage(*e_type, my_unit_type)
-                .or_else(|| damage_chart.get_base_damage_secondary(*e_type, my_unit_type))
-                .unwrap_or(0)
-                * (100 - tile_def_bonus.min(100))
-                / 100
-        };
-        if *e_min_range > 1 {
-            // 間接: 現在射程内 (移動後は撃てないので据置き)。全ユニット共通で脅威
-            if dist >= *e_min_range && dist <= *e_max_range {
-                total_damage += base_dmg();
-            }
-        } else if my_is_indirect {
-            // 直接: 移動+攻撃の到達圏。反撃できない間接ユニットのみ脅威とみなす
-            let reach = *e_max_movement + *e_max_range;
-            if dist <= reach {
-                total_damage += base_dmg();
-            }
-        }
-    }
-    if total_damage == 0 {
-        return 0;
-    }
-    let effective_damage = total_damage.min(my_hp);
-    let expected_loss_value = (effective_damage * my_cost / 100) as i32;
-    expected_loss_value * EXPOSURE_RISK_NUM / EXPOSURE_RISK_DEN
-}
 
 /// 新しいAI (V2/V3) 用の行動意思決定エンジン。
 /// 各ユニットの所属部隊の割り当て目標（squad.target）に向かう接近スコアをベースに行動を決定します。
@@ -1520,7 +1473,8 @@ pub fn decide_ai_action_v2(
             // 直接=移動+攻撃到達圏)。撃破 (+5000) や占領 (+10000) など
             // リターンの大きい行動は行動側の加点によって自然に相殺される
             if is_v3 {
-                base_tile_score -= indirect_exposure_penalty(
+                base_tile_score -= crate::ai::threat::exposure_penalty(
+                    &map,
                     (current_grid.x, current_grid.y),
                     stats.unit_type,
                     stats.cost,
@@ -1538,8 +1492,7 @@ pub fn decide_ai_action_v2(
             if is_v3 && stats.min_range > 1 && !is_combat_ineffective && !enemy_units.is_empty() {
                 let mut nearest_enemy_dist = u32::MAX;
                 for (e_pos, _, _, _, _, _, _) in &enemy_units {
-                    let d = (e_pos.x.abs_diff(current_grid.x) + e_pos.y.abs_diff(current_grid.y))
-                        as u32;
+                    let d = map.distance(e_pos.x, e_pos.y, current_grid.x, current_grid.y);
                     if d < nearest_enemy_dist {
                         nearest_enemy_dist = d;
                     }
@@ -3425,7 +3378,11 @@ mod tests {
             target: Some(target),
             target_island: None,
             phase: crate::ai::squad::MissionPhase::MovingToTarget,
-            transport_cargo: None,
+            transport_entity: None,
+            cargo_entities: Vec::new(),
+            pickup_position: None,
+            drop_position: None,
+            delivered_cargo: Vec::new(),
         });
         world.insert_resource(manager);
     }

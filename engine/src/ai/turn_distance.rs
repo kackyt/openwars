@@ -7,7 +7,7 @@ use crate::components::{GridPosition, PlayerId};
 use crate::resources::{Map, MovementType, master_data::MasterDataRegistry};
 use crate::systems::movement::{OccupantInfo, get_valid_movement_cost};
 use bevy_ecs::prelude::*;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::Arc;
 
 /// 目的地までのターン数と消費移動力（MP）を保持する構造体。
@@ -35,6 +35,85 @@ impl Ord for TurnDistance {
 }
 
 pub type TurnCacheKey = (usize, usize, usize, usize, MovementType, u32, u32, PlayerId);
+
+/// 移動タイプごとの地形連結成分を計算し、同一分析中の到達判定で再利用します。
+#[derive(Default)]
+pub struct TerrainConnectivity {
+    components: HashMap<MovementType, Vec<Option<usize>>>,
+}
+
+impl TerrainConnectivity {
+    pub fn is_reachable(
+        &mut self,
+        map: &Map,
+        registry: &MasterDataRegistry,
+        start: (usize, usize),
+        target: (usize, usize),
+        movement_type: MovementType,
+    ) -> bool {
+        if start.0 >= map.width
+            || start.1 >= map.height
+            || target.0 >= map.width
+            || target.1 >= map.height
+        {
+            return false;
+        }
+        let components = self.components.entry(movement_type).or_insert_with(|| {
+            let mut result = vec![None; map.width * map.height];
+            let mut next_component = 0;
+            for y in 0..map.height {
+                for x in 0..map.width {
+                    let index = y * map.width + x;
+                    if result[index].is_some()
+                        || map
+                            .get_terrain(x, y)
+                            .and_then(|terrain| {
+                                get_valid_movement_cost(registry, movement_type, terrain)
+                            })
+                            .is_none()
+                    {
+                        continue;
+                    }
+                    let mut queue = VecDeque::from([(x, y)]);
+                    result[index] = Some(next_component);
+                    while let Some(position) = queue.pop_front() {
+                        for adjacent in map.get_adjacent(position.0, position.1) {
+                            let adjacent_index = adjacent.1 * map.width + adjacent.0;
+                            if result[adjacent_index].is_some()
+                                || map
+                                    .get_terrain(adjacent.0, adjacent.1)
+                                    .and_then(|terrain| {
+                                        get_valid_movement_cost(registry, movement_type, terrain)
+                                    })
+                                    .is_none()
+                            {
+                                continue;
+                            }
+                            result[adjacent_index] = Some(next_component);
+                            queue.push_back(adjacent);
+                        }
+                    }
+                    next_component += 1;
+                }
+            }
+            result
+        });
+        let start_component = components[start.1 * map.width + start.0];
+        let target_component = components[target.1 * map.width + target.0];
+        start_component.is_some() && start_component == target_component
+    }
+}
+
+/// ユニット配置や ZOC を無視し、地形だけを使って2地点が接続されているか判定します。
+pub fn is_terrain_reachable(
+    map: &Map,
+    registry: &MasterDataRegistry,
+    start: (usize, usize),
+    target: (usize, usize),
+    movement_type: MovementType,
+) -> bool {
+    TerrainConnectivity::default().is_reachable(map, registry, start, target, movement_type)
+}
 
 /// ターン数ベースの距離計算をキャッシュするためのリソース
 #[derive(Resource, Default)]
@@ -514,5 +593,32 @@ mod tests {
             &mut cache,
         );
         assert_eq!(dist.turns, 51);
+    }
+
+    #[test]
+    fn terrain_reachability_does_not_use_unreachable_approximation() {
+        let mut map = Map::new(
+            3,
+            1,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        map.set_terrain(1, 0, Terrain::Sea).unwrap();
+        let registry = MasterDataRegistry::load().unwrap_or_default();
+
+        assert!(!is_terrain_reachable(
+            &map,
+            &registry,
+            (0, 0),
+            (2, 0),
+            MovementType::Infantry,
+        ));
+        assert!(is_terrain_reachable(
+            &map,
+            &registry,
+            (0, 0),
+            (2, 0),
+            MovementType::Air,
+        ));
     }
 }

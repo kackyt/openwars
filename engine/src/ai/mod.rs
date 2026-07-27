@@ -16,6 +16,7 @@ pub mod beam_search;
 pub mod cluster;
 pub mod simulation;
 pub mod squad;
+pub mod threat;
 pub mod turn_distance;
 
 pub use ai_version::{AiVersion, PlayerAiSettings};
