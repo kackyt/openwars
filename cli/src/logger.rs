@@ -265,6 +265,27 @@ impl BattleLogger {
             }
         }
 
+        // 占領進行イベント
+        if let Some(events) = world.get_resource::<Events<PropertyCaptureProgressedEvent>>() {
+            let mut cursor = events.get_cursor();
+            for ev in cursor.read(events) {
+                let payload = serde_json::json!({
+                    "unit": ev.unit.to_bits(),
+                    "x": ev.x,
+                    "y": ev.y,
+                    "previous_capture_points": ev.previous_capture_points,
+                    "remaining_capture_points": ev.remaining_capture_points,
+                    "completed": ev.completed,
+                });
+                records.push(LogRecord {
+                    turn,
+                    player: active_player,
+                    event: "PropertyCaptureProgressed".to_string(),
+                    payload,
+                });
+            }
+        }
+
         // 生産イベント
         if let Some(events) = world.get_resource::<Events<UnitProducedEvent>>() {
             let mut cursor = events.get_cursor();
