@@ -34,6 +34,7 @@ pub fn create_world() -> (World, Schedule) {
     world.init_resource::<Events<UnitDestroyedEvent>>();
     world.init_resource::<Events<UnitMergedEvent>>();
     world.init_resource::<Events<PropertyCapturedEvent>>();
+    world.init_resource::<Events<PropertyCaptureProgressedEvent>>();
     world.init_resource::<Events<GamePhaseChangedEvent>>();
     world.init_resource::<Events<GameOverEvent>>();
     world.init_resource::<Events<UnitProducedEvent>>();
@@ -75,6 +76,9 @@ pub fn update_all_events(world: &mut World) {
     world.resource_mut::<Events<UnitMergedEvent>>().update();
     world
         .resource_mut::<Events<PropertyCapturedEvent>>()
+        .update();
+    world
+        .resource_mut::<Events<PropertyCaptureProgressedEvent>>()
         .update();
     world
         .resource_mut::<Events<GamePhaseChangedEvent>>()

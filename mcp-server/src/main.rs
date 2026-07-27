@@ -1,3 +1,5 @@
+mod invasion_trace;
+
 use bevy_ecs::prelude::Entity;
 use bevy_ecs::schedule::Schedule;
 use bevy_ecs::world::World;
@@ -14,10 +16,12 @@ use tokio::sync::Mutex;
 struct GameState {
     pub world: World,
     pub schedule: Schedule,
+    pub invasion_trace: invasion_trace::InvasionTraceCollector,
 }
 
 use engine::components::{
-    Faction, Fuel, GridPosition, HasMoved, Health, PlayerId, Property, UnitStats,
+    CargoCapacity, Faction, Fuel, GridPosition, HasMoved, Health, PlayerId, Property, Transporting,
+    UnitStats,
 };
 use engine::resources::master_data::MasterDataRegistry;
 use engine::resources::{MatchState, Players};
@@ -40,6 +44,7 @@ fn parse_player_id(value: u64) -> Result<PlayerId, String> {
 #[derive(Deserialize, JsonSchema)]
 pub struct LoadMapArgs {
     pub map_name: String,
+    pub seed: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -96,11 +101,19 @@ impl OpenWarsAiServer {
         let registry =
             MasterDataRegistry::load().map_err(|e| format!("Failed to load master data: {}", e))?;
 
-        let (world, schedule) = initialize_world_from_master_data(&registry, &args.map_name)
+        let (mut world, schedule) = initialize_world_from_master_data(&registry, &args.map_name)
             .map_err(|e| format!("Initialization failed: {}", e))?;
+        if let Some(seed) = args.seed {
+            world.insert_resource(engine::resources::GameRng::new(seed));
+        }
+        let invasion_trace = invasion_trace::InvasionTraceCollector::new(&world);
 
         let mut state_lock = self.state.lock().await;
-        *state_lock = Some(GameState { world, schedule });
+        *state_lock = Some(GameState {
+            world,
+            schedule,
+            invasion_trace,
+        });
 
         Ok(format!("Loaded map: {}", args.map_name))
     }
@@ -304,6 +317,7 @@ impl OpenWarsAiServer {
         let mut state_lock = self.state.lock().await;
         if let Some(state) = state_lock.as_mut() {
             let world = &mut state.world;
+            let island_map = world.resource::<engine::ai::islands::IslandMap>().clone();
 
             let mut properties = vec![];
             let mut prop_query = world.query::<(Entity, &GridPosition, &Property)>();
@@ -313,21 +327,46 @@ impl OpenWarsAiServer {
                     "x": pos.x,
                     "y": pos.y,
                     "terrain": prop.terrain.as_str(),
-                    "owner": prop.owner_id.map(|p| p.0 as u64)
+                    "terrain_type": format!("{:?}", prop.terrain),
+                    "owner": prop.owner_id.map(|p| p.0 as u64),
+                    "capture_points": prop.capture_points,
+                    "max_capture_points": prop.max_capture_points,
+                    "island_id": island_map.get_island_at(pos).map(|island| island.id.0)
                 }));
             }
 
             let mut units = vec![];
-            let mut unit_query =
-                world.query::<(Entity, &GridPosition, &Faction, &UnitStats, &Health)>();
-            for (entity, pos, faction, stats, health) in unit_query.iter(world) {
+            let mut unit_query = world.query::<(
+                Entity,
+                &GridPosition,
+                &Faction,
+                &UnitStats,
+                &Health,
+                Option<&Transporting>,
+                Option<&CargoCapacity>,
+            )>();
+            for (entity, pos, faction, stats, health, transporting, cargo) in unit_query.iter(world)
+            {
+                let mut cargo_ids: Vec<_> = cargo
+                    .map(|capacity| {
+                        capacity
+                            .loaded
+                            .iter()
+                            .map(|cargo| cargo.to_bits())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                cargo_ids.sort_unstable();
                 units.push(serde_json::json!({
                     "unit_id": entity.to_bits(),
                     "x": pos.x,
                     "y": pos.y,
                     "player_id": faction.0.0,
                     "unit_type": stats.unit_type.as_str(),
-                    "hp": health.current
+                    "hp": health.current,
+                    "island_id": island_map.get_island_at(pos).map(|island| island.id.0),
+                    "transporting_by": transporting.map(|transporting| transporting.0.to_bits()),
+                    "cargo_ids": cargo_ids
                 }));
             }
 
@@ -344,7 +383,7 @@ impl OpenWarsAiServer {
                 }
             }
 
-            for (_, _, faction, stats, health) in unit_query.iter(world) {
+            for (_, _, faction, stats, health, _, _) in unit_query.iter(world) {
                 if health.current > 0 {
                     *player_units_cost.entry(faction.0.0).or_insert(0) += stats.cost;
                 }
@@ -376,6 +415,7 @@ impl OpenWarsAiServer {
                 }));
             }
 
+            let transport_squads = invasion_trace::snapshot_transport_squads(world);
             let diagnostic = world.get_resource::<engine::resources::ProductionDiagnostic>();
             let diag_info = if let Some(d) = diagnostic {
                 serde_json::json!({
@@ -395,6 +435,7 @@ impl OpenWarsAiServer {
                 "players": players_info,
                 "properties": properties,
                 "units": units,
+                "transport_squads": transport_squads,
                 "diagnostics": diag_info
             })
             .to_string())
@@ -430,12 +471,24 @@ impl OpenWarsAiServer {
             );
 
             let mut actions_taken = vec![];
+            let mut invasion_events = vec![];
+            let mut step = 0usize;
             loop {
+                let turn = state.world.resource::<MatchState>().current_turn_number.0;
+                let positions_before = invasion_trace::snapshot_unit_positions(&mut state.world);
                 let action_taken =
                     engine::ai::engine::execute_ai_turn(&mut state.world, active_player_id);
 
-                // イベント処理
+                // イベント処理後に、実行済みの侵攻イベントだけを構造化して収集する。
                 state.schedule.run(&mut state.world);
+                invasion_events.extend(state.invasion_trace.collect_step(
+                    &state.world,
+                    turn,
+                    active_player_id.0,
+                    step,
+                    &positions_before,
+                ));
+                step += 1;
 
                 if let Some(action) = action_taken {
                     actions_taken.push(action);
@@ -443,6 +496,7 @@ impl OpenWarsAiServer {
                     break;
                 }
             }
+            let transport_squads = invasion_trace::snapshot_transport_squads(&state.world);
 
             let after_metrics = engine::ai::eval::evaluate_board_with_metrics(
                 &mut state.world,
@@ -452,6 +506,8 @@ impl OpenWarsAiServer {
 
             Ok(serde_json::json!({
                 "actions_taken": actions_taken,
+                "invasion_events": invasion_events,
+                "transport_squads": transport_squads,
                 "player_id": active_player_id.0,
                 "player_index": active_player_index.0,
                 "before_score": before_metrics.total_score,

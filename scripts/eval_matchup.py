@@ -92,16 +92,22 @@ def call_tool(name, arguments=None, req_id=1):
     except json.JSONDecodeError:
         return content
 
-def run_single_game(map_name, p1_ver, p2_ver, max_turns, ui_callback=None):
+def run_single_game(map_name, p1_ver, p2_ver, max_turns, seed=None, ui_callback=None):
     if ui_callback: ui_callback({"type": "log", "msg": f"Match started: P1({p1_ver}) vs P2({p2_ver}) on {map_name}"})
     
-    call_tool("load_map", {"map_name": map_name})
+    load_args = {"map_name": map_name}
+    if seed is not None:
+        load_args["seed"] = seed
+    call_tool("load_map", load_args)
     call_tool("set_player_ai_version", {"player_id": 1, "version": p1_ver})
     call_tool("set_player_ai_version", {"player_id": 2, "version": p2_ver})
 
     thinking_times = {1: [], 2: []}
     action_counts = {1: defaultdict(int), 2: defaultdict(int)}
     metrics = []
+    invasion_events = []
+    transport_history = []
+    initial_state = None
 
     turn = 1
     while turn <= max_turns:
@@ -110,6 +116,8 @@ def run_single_game(map_name, p1_ver, p2_ver, max_turns, ui_callback=None):
         if isinstance(state, dict) and state.get("error"):
             if ui_callback: ui_callback({"type": "log", "msg": f"Error: {state['error']}"})
             break
+        if initial_state is None:
+            initial_state = state
 
         game_over = state.get("game_over")
         if game_over:
@@ -124,7 +132,10 @@ def run_single_game(map_name, p1_ver, p2_ver, max_turns, ui_callback=None):
                     "thinking_times": thinking_times,
                     "action_counts": action_counts,
                     "metrics": metrics,
-                    "final_state": state
+                    "final_state": state,
+                    "initial_state": initial_state,
+                    "invasion_events": invasion_events,
+                    "transport_history": transport_history
                 }
             elif status == "draw":
                 if ui_callback: ui_callback({"type": "log", "msg": f"Game Finished! Draw"})
@@ -134,7 +145,10 @@ def run_single_game(map_name, p1_ver, p2_ver, max_turns, ui_callback=None):
                     "thinking_times": thinking_times,
                     "action_counts": action_counts,
                     "metrics": metrics,
-                    "final_state": state
+                    "final_state": state,
+                    "initial_state": initial_state,
+                    "invasion_events": invasion_events,
+                    "transport_history": transport_history
                 }
 
         # ターンごとのメトリクス収集
@@ -188,7 +202,13 @@ def run_single_game(map_name, p1_ver, p2_ver, max_turns, ui_callback=None):
         if isinstance(ai_result, dict) and ai_result.get("error"):
             if ui_callback: ui_callback({"type": "log", "msg": f"AI Error: {ai_result['error']}"})
             break
-            
+
+        invasion_events.extend(ai_result.get("invasion_events", []))
+        transport_history.append({
+            "turn": turn,
+            "player_id": current_player,
+            "squads": ai_result.get("transport_squads", []),
+        })
         actions = ai_result.get("actions_taken", [])
         acts_dict = defaultdict(int)
         for action in actions:
@@ -265,8 +285,192 @@ def run_single_game(map_name, p1_ver, p2_ver, max_turns, ui_callback=None):
         "thinking_times": thinking_times,
         "action_counts": action_counts,
         "metrics": metrics,
-        "final_state": state
+        "final_state": state,
+        "initial_state": initial_state,
+        "invasion_events": invasion_events,
+        "transport_history": transport_history
     }
+
+def analyze_issue54_game(game, subject="V3", stall_turns=5):
+    """同一カーゴの搭載・敵初期島上陸・侵攻成立と輸送停滞を判定する。"""
+    if game.get("p1") == subject:
+        subject_player = 1
+        order = "先攻"
+    elif game.get("p2") == subject:
+        subject_player = 2
+        order = "後攻"
+    else:
+        return None
+    enemy_player = 2 if subject_player == 1 else 1
+    initial_state = game.get("initial_state") or {}
+    enemy_capital_islands = {
+        prop.get("island_id")
+        for prop in initial_state.get("properties", [])
+        if str(prop.get("terrain_type", prop.get("terrain", ""))).lower() == "capital"
+        and prop.get("owner") == enemy_player
+        and prop.get("island_id") is not None
+    }
+
+    loads = {}
+    landings = {}
+    invasion_cargo = set()
+    evidence = []
+    for event in game.get("invasion_events", []):
+        event_type = event.get("type")
+        if event_type == "unit_loaded" and event.get("player_id") == subject_player:
+            loads[event.get("cargo_id")] = event
+        elif event_type == "unit_unloaded" and event.get("player_id") == subject_player:
+            cargo_id = event.get("cargo_id")
+            loaded = loads.get(cargo_id)
+            if (
+                loaded
+                and loaded.get("transport_id") == event.get("transport_id")
+                and loaded.get("island_id") != event.get("island_id")
+                and event.get("island_id") in enemy_capital_islands
+            ):
+                landings[cargo_id] = event
+                evidence.append({
+                    "cargo_id": cargo_id,
+                    "transport_id": event.get("transport_id"),
+                    "load_turn": loaded.get("turn"),
+                    "unload_turn": event.get("turn"),
+                    "unload_position": [event.get("x"), event.get("y")],
+                    "interaction": None,
+                })
+        elif event_type == "unit_attacked":
+            for cargo_id in (event.get("attacker_id"), event.get("defender_id")):
+                if cargo_id in landings:
+                    invasion_cargo.add(cargo_id)
+                    for item in evidence:
+                        if item["cargo_id"] == cargo_id and item["interaction"] is None:
+                            role = "attacker" if event.get("attacker_id") == cargo_id else "defender"
+                            item["interaction"] = f"attack:{role}@T{event.get('turn')}"
+        elif event_type == "property_capture_progressed":
+            cargo_id = event.get("unit_id")
+            if cargo_id in landings:
+                invasion_cargo.add(cargo_id)
+                for item in evidence:
+                    if item["cargo_id"] == cargo_id and item["interaction"] is None:
+                        status = "completed" if event.get("completed") else "started"
+                        item["interaction"] = f"capture:{status}@T{event.get('turn')}"
+
+    safety_violations = []
+    stall_state = {}
+    reported_stalls = set()
+    for record in game.get("transport_history", []):
+        if record.get("player_id") != subject_player:
+            continue
+        for squad in record.get("squads", []):
+            if squad.get("player_id") != subject_player:
+                continue
+            transport_id = squad.get("transport_id")
+            planned = tuple(squad.get("planned_cargo_ids", []))
+            loaded = tuple(squad.get("loaded_cargo_ids", []))
+            phase = squad.get("phase")
+            if phase == "Return" and (planned or loaded):
+                safety_violations.append(
+                    f"transport {transport_id} entered Return with cargo planned={planned} loaded={loaded}"
+                )
+            if phase not in ("Transit", "Drop"):
+                stall_state.pop(transport_id, None)
+                continue
+            signature = (phase, squad.get("x"), squad.get("y"), planned, loaded)
+            previous_signature, count = stall_state.get(transport_id, (None, 0))
+            count = count + 1 if signature == previous_signature else 1
+            stall_state[transport_id] = (signature, count)
+            if count >= stall_turns and transport_id not in reported_stalls:
+                safety_violations.append(
+                    f"transport {transport_id} stalled in {phase} for {count} subject turns"
+                )
+                reported_stalls.add(transport_id)
+
+    return {
+        "map": game.get("map"),
+        "order": order,
+        "subject_player": subject_player,
+        "landing": bool(landings),
+        "invasion": bool(invasion_cargo),
+        "safety_violations": safety_violations,
+        "evidence": evidence,
+    }
+
+
+def judge_issue54_criteria(results, subject="V3", stall_turns=5):
+    """#54の合否を手番別に集約する。勝率・経済・決着ターンは使用しない。"""
+    analyses = [
+        analysis
+        for analysis in (
+            analyze_issue54_game(game, subject, stall_turns) for game in results
+        )
+        if analysis is not None
+    ]
+    buckets = defaultdict(lambda: {"games": 0, "landings": 0, "invasions": 0, "violations": []})
+    for analysis in analyses:
+        bucket = buckets[(analysis["map"], analysis["order"])]
+        bucket["games"] += 1
+        bucket["landings"] += int(analysis["landing"])
+        bucket["invasions"] += int(analysis["invasion"])
+        bucket["violations"].extend(analysis["safety_violations"])
+
+    rows = []
+    for (map_name, order), bucket in sorted(buckets.items()):
+        passed = (
+            bucket["landings"] >= 1
+            and bucket["invasions"] >= 1
+            and not bucket["violations"]
+        )
+        rows.append({"map": map_name, "order": order, "passed": passed, **bucket})
+
+    maps = {game.get("map") for game in results}
+    expected = {(map_name, order) for map_name in maps for order in ("先攻", "後攻")}
+    observed = set(buckets)
+    overall = expected == observed and bool(rows) and all(row["passed"] for row in rows)
+    return overall, rows, analyses
+
+
+def generate_issue54_report(results, subject="V3", baseline="V2", seed=None, stall_turns=5):
+    overall, rows, analyses = judge_issue54_criteria(results, subject, stall_turns)
+    report = [
+        "# Issue #54 島嶼侵攻評価レポート",
+        "",
+        "## 合否判定",
+        "",
+        "敵初期島への上陸と、同一カーゴによる攻撃・被攻撃・占領開始/完了のみを判定します。",
+        "勝率、経済指標、最終スコア、30ターン以内の決着は参考情報であり、合否には使用しません。",
+        f"- 対象AI: {subject} / 比較AI: {baseline}",
+        f"- seed: {seed if seed is not None else '未指定'}",
+        f"- 停滞閾値: {stall_turns} 自軍ターン",
+        "",
+        "| マップ | 手番 | 試合数 | 敵初期島上陸 | 侵攻成立 | 安全性違反 | 判定 |",
+        "| :--- | :--- | ---: | ---: | ---: | ---: | :--- |",
+    ]
+    for row in rows:
+        report.append(
+            f"| {row['map']} | {row['order']} | {row['games']} | {row['landings']} | "
+            f"{row['invasions']} | {len(row['violations'])} | "
+            f"{'**PASS**' if row['passed'] else '**FAIL**'} |"
+        )
+    report.extend(["", f"**全体判定: {'PASS' if overall else 'FAIL'}**", "", "## 試合別証跡", ""])
+    for index, (game, analysis) in enumerate(zip(results, analyses), start=1):
+        report.append(
+            f"### Game {index}: {game.get('map')} P1({game.get('p1')}) vs P2({game.get('p2')})"
+        )
+        report.append(f"- 結果（参考）: {game.get('result')} / {game.get('turns')}ターン")
+        report.append(f"- {subject}手番: {analysis['order']}")
+        if analysis["evidence"]:
+            for item in analysis["evidence"]:
+                report.append(
+                    f"- cargo {item['cargo_id']} / transport {item['transport_id']}: "
+                    f"Load T{item['load_turn']} → Unload T{item['unload_turn']} "
+                    f"at {tuple(item['unload_position'])} → {item['interaction'] or 'interactionなし'}"
+                )
+        else:
+            report.append("- 敵初期島への上陸証跡なし")
+        for violation in analysis["safety_violations"]:
+            report.append(f"- 安全性違反: {violation}")
+        report.append("")
+    return "\n".join(report), overall
+
 
 def moving_average(values, window=5):
     """5ターン移動平均（先頭は利用可能な範囲で平均）"""
@@ -472,6 +676,9 @@ def main():
     parser.add_argument("--p2", default="V1", help="Player 2 AI Version")
     parser.add_argument("--games", type=int, default=1, help="Number of games per matchup")
     parser.add_argument("--max-turns", type=int, default=30, help="Maximum turns per game")
+    parser.add_argument("--criteria", choices=["objective", "issue54"], default="objective", help="Acceptance criteria used for the final report")
+    parser.add_argument("--seed", type=int, default=None, help="Deterministic game RNG seed")
+    parser.add_argument("--stall-turns", type=int, default=5, help="Subject turns before an unchanged transport is considered stalled")
     parser.add_argument("--output", default="matchup_report.md", help="Output file for the final report")
     args = parser.parse_args()
 
@@ -511,6 +718,7 @@ def main():
             print(json.dumps({"type": "metrics", "data": m}))
             
     maps = [mn.strip() for mn in args.map.split(",") if mn.strip()]
+    criteria_pass = True
 
     try:
         if args.mode == "tui" and HAS_RICH:
@@ -527,13 +735,13 @@ def main():
             with Live(layout, refresh_per_second=4) as live:
                 for map_name in maps:
                     for i in range(args.games):
-                        res = run_single_game(map_name, args.p1, args.p2, args.max_turns, lambda e: ui_callback_tui(e, layout, live))
+                        res = run_single_game(map_name, args.p1, args.p2, args.max_turns, args.seed, lambda e: ui_callback_tui(e, layout, live))
                         res["map"] = map_name
                         res["p1"] = args.p1
                         res["p2"] = args.p2
                         all_results.append(res)
 
-                        res2 = run_single_game(map_name, args.p2, args.p1, args.max_turns, lambda e: ui_callback_tui(e, layout, live))
+                        res2 = run_single_game(map_name, args.p2, args.p1, args.max_turns, args.seed, lambda e: ui_callback_tui(e, layout, live))
                         res2["map"] = map_name
                         res2["p1"] = args.p2
                         res2["p2"] = args.p1
@@ -542,21 +750,30 @@ def main():
             print(json.dumps({"type": "info", "msg": f"Starting batch run: {args.p1} vs {args.p2} on {maps} ({args.games} games x 2 orders per map)"}))
             for map_name in maps:
                 for i in range(args.games):
-                    res = run_single_game(map_name, args.p1, args.p2, args.max_turns, ui_callback_batch)
+                    res = run_single_game(map_name, args.p1, args.p2, args.max_turns, args.seed, ui_callback_batch)
                     res["map"] = map_name
                     res["p1"] = args.p1
                     res["p2"] = args.p2
                     all_results.append(res)
-                    print(json.dumps({"type": "result", "data": {k: v for k, v in res.items() if k != "metrics" and k != "final_state"}}))
+                    print(json.dumps({"type": "result", "data": {k: v for k, v in res.items() if k not in {"metrics", "final_state", "initial_state", "invasion_events", "transport_history"}}}))
 
-                    res2 = run_single_game(map_name, args.p2, args.p1, args.max_turns, ui_callback_batch)
+                    res2 = run_single_game(map_name, args.p2, args.p1, args.max_turns, args.seed, ui_callback_batch)
                     res2["map"] = map_name
                     res2["p1"] = args.p2
                     res2["p2"] = args.p1
                     all_results.append(res2)
-                    print(json.dumps({"type": "result", "data": {k: v for k, v in res2.items() if k != "metrics" and k != "final_state"}}))
+                    print(json.dumps({"type": "result", "data": {k: v for k, v in res2.items() if k not in {"metrics", "final_state", "initial_state", "invasion_events", "transport_history"}}}))
                 
-        report = generate_report(all_results, subject=args.p1, baseline=args.p2)
+        if args.criteria == "issue54":
+            report, criteria_pass = generate_issue54_report(
+                all_results,
+                subject=args.p1,
+                baseline=args.p2,
+                seed=args.seed,
+                stall_turns=args.stall_turns,
+            )
+        else:
+            report = generate_report(all_results, subject=args.p1, baseline=args.p2)
         with open(args.output, "w", encoding="utf-8") as f:
             f.write(report)
             
@@ -567,6 +784,9 @@ def main():
         if p:
             p.stdin.close()
             p.wait()
+
+    if args.mode == "batch" and args.criteria == "issue54" and not criteria_pass:
+        raise SystemExit(1)
 
 if __name__ == "__main__":
     main()

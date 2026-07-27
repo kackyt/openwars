@@ -105,6 +105,17 @@ pub struct PropertyCapturedEvent {
     pub new_owner: Option<PlayerId>,
 }
 
+/// 敵・中立拠点に対する占領処理が実際に進行したことを通知します。
+#[derive(Event, Debug, Clone)]
+pub struct PropertyCaptureProgressedEvent {
+    pub unit: Entity,
+    pub x: usize,
+    pub y: usize,
+    pub previous_capture_points: u32,
+    pub remaining_capture_points: u32,
+    pub completed: bool,
+}
+
 #[derive(Event, Debug, Clone)]
 pub struct GamePhaseChangedEvent {
     pub new_phase: crate::resources::Phase,

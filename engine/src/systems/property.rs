@@ -48,6 +48,7 @@ pub fn get_capturable_property(world: &mut World, unit: Entity) -> Option<Entity
 pub fn capture_property_system(
     mut capture_events: EventReader<CapturePropertyCommand>,
     mut captured_events: EventWriter<PropertyCapturedEvent>,
+    mut capture_progressed_events: EventWriter<PropertyCaptureProgressedEvent>,
     mut q_units: Query<(
         Entity,
         &GridPosition,
@@ -68,7 +69,8 @@ pub fn capture_property_system(
     let active_player_id = players.0[match_state.active_player_index.0].id;
 
     for event in capture_events.read() {
-        let Ok((_, pos, faction, hp, stats, mut action)) = q_units.get_mut(event.unit_entity)
+        let Ok((unit_entity, pos, faction, hp, stats, mut action)) =
+            q_units.get_mut(event.unit_entity)
         else {
             continue;
         };
@@ -95,17 +97,29 @@ pub fn capture_property_system(
                     prop.capture_points =
                         std::cmp::min(prop.capture_points + action_power, max_points);
                 } else {
-                    // 敵軍・中立拠点の場合は占領を進行
+                    // 敵軍・中立拠点の場合は占領を進行し、実行ユニット付きの結果を通知する
+                    let previous_capture_points = prop.capture_points;
+                    let remaining_capture_points;
                     if prop.capture_points <= action_power {
                         // 占領完了
                         prop.owner_id = Some(active_player_id);
                         prop.capture_points = max_points;
+                        remaining_capture_points = 0;
                         captured = true;
                         new_owner = Some(active_player_id);
                     } else {
                         // 耐久値を減らす
                         prop.capture_points -= action_power;
+                        remaining_capture_points = prop.capture_points;
                     }
+                    capture_progressed_events.send(PropertyCaptureProgressedEvent {
+                        unit: unit_entity,
+                        x: pos.x,
+                        y: pos.y,
+                        previous_capture_points,
+                        remaining_capture_points,
+                        completed: captured,
+                    });
                 }
                 action.0 = true;
                 break;
@@ -220,6 +234,7 @@ mod tests {
         world.insert_resource(Map::new(5, 5, Terrain::Plains, GridTopology::Square));
         world.insert_resource(Events::<CapturePropertyCommand>::default());
         world.insert_resource(Events::<PropertyCapturedEvent>::default());
+        world.insert_resource(Events::<PropertyCaptureProgressedEvent>::default());
 
         let unit_entity = world
             .spawn((
@@ -458,6 +473,7 @@ mod tests {
         world.insert_resource(Map::new(5, 5, Terrain::Plains, GridTopology::Square));
         world.init_resource::<Events<CapturePropertyCommand>>();
         world.init_resource::<Events<PropertyCapturedEvent>>();
+        world.init_resource::<Events<PropertyCaptureProgressedEvent>>();
 
         let unit_entity = world
             .spawn((

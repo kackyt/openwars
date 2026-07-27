@@ -2,6 +2,8 @@ pub mod ai_version;
 pub mod demand;
 pub mod engine;
 pub mod eval;
+#[cfg(test)]
+mod island_invasion_tests;
 pub mod islands;
 pub mod missions;
 pub mod objectives;
