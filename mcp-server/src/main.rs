@@ -318,10 +318,19 @@ impl OpenWarsAiServer {
         let mut state_lock = self.state.lock().await;
         if let Some(state) = state_lock.as_mut() {
             let world = &mut state.world;
-            let island_map = world.resource::<engine::ai::islands::IslandMap>().clone();
+            let mut prop_query = world.query::<(Entity, &GridPosition, &Property)>();
+            let mut unit_query = world.query::<(
+                Entity,
+                &GridPosition,
+                &Faction,
+                &UnitStats,
+                &Health,
+                Option<&Transporting>,
+                Option<&CargoCapacity>,
+            )>();
+            let island_map = world.resource::<engine::ai::islands::IslandMap>();
 
             let mut properties = vec![];
-            let mut prop_query = world.query::<(Entity, &GridPosition, &Property)>();
             for (entity, pos, prop) in prop_query.iter(world) {
                 properties.push(serde_json::json!({
                     "entity_id": entity.to_bits(),
@@ -337,15 +346,6 @@ impl OpenWarsAiServer {
             }
 
             let mut units = vec![];
-            let mut unit_query = world.query::<(
-                Entity,
-                &GridPosition,
-                &Faction,
-                &UnitStats,
-                &Health,
-                Option<&Transporting>,
-                Option<&CargoCapacity>,
-            )>();
             for (entity, pos, faction, stats, health, transporting, cargo) in unit_query.iter(world)
             {
                 let mut cargo_ids: Vec<_> = cargo

@@ -207,15 +207,20 @@ fn v3_invasion_reaches_combat_or_capture_after_landing() {
                     }
                 }
 
-                if let Some(manager) = world.get_resource::<crate::ai::squad::SquadManager>()
-                    && let Some(squad) = manager.squads.iter().find(|squad| {
-                        squad.transport_entity == Some(transport)
-                            && squad.mission_type == crate::ai::squad::MissionType::Transport
+                if let Some(squad) = world
+                    .get_resource::<crate::ai::squad::SquadManager>()
+                    .and_then(|manager| {
+                        manager.squads.iter().find(|squad| {
+                            squad.transport_entity == Some(transport)
+                                && squad.mission_type == crate::ai::squad::MissionType::Transport
+                        })
                     })
-                    && squad.phase
-                        == crate::ai::squad::MissionPhase::Transport(
-                            crate::ai::squad::TransportPhase::Return,
-                        )
+                    .filter(|squad| {
+                        squad.phase
+                            == crate::ai::squad::MissionPhase::Transport(
+                                crate::ai::squad::TransportPhase::Return,
+                            )
+                    })
                 {
                     assert!(squad.cargo_entities.is_empty());
                     assert!(

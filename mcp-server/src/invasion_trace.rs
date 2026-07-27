@@ -87,6 +87,7 @@ impl InvasionTraceCollector {
         }
     }
 
+    /// 各シミュレーションステップにおける侵攻関連イベント（乗車、降車、攻撃、占領進行）を収集します。
     pub fn collect_step(
         &mut self,
         world: &World,
@@ -98,6 +99,7 @@ impl InvasionTraceCollector {
         let mut result = Vec::new();
         let island_map = world.resource::<IslandMap>();
 
+        // 積載（乗車）イベントの処理
         for event in self
             .loaded_cursor
             .read(world.resource::<Events<UnitLoadedEvent>>())
@@ -118,6 +120,7 @@ impl InvasionTraceCollector {
                 }),
             });
         }
+        // 降車イベントの処理
         for event in self
             .unloaded_cursor
             .read(world.resource::<Events<UnitUnloadedEvent>>())
@@ -139,6 +142,7 @@ impl InvasionTraceCollector {
                     .map(|island| island.id.0),
             });
         }
+        // 攻撃イベントの処理
         for event in self
             .attacked_cursor
             .read(world.resource::<Events<UnitAttackedEvent>>())
@@ -151,6 +155,7 @@ impl InvasionTraceCollector {
                 defender_id: event.defender.to_bits(),
             });
         }
+        // 拠点占領進行イベントの処理
         for event in self
             .capture_cursor
             .read(world.resource::<Events<PropertyCaptureProgressedEvent>>())
