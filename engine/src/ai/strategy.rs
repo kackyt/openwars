@@ -3,6 +3,10 @@
 use crate::ai::demand::{
     DemandMatrix, average_attack_expectation, compute_demand, compute_unit_affinity,
 };
+use crate::ai::island_campaign::{
+    IslandCampaignDiagnostics, IslandCampaignPortfolio, IslandCampaignShortfall,
+};
+use crate::ai::island_campaign_analysis::analyze_island_campaign;
 use crate::ai::turn_distance::{TerrainConnectivity, TurnDistanceCache, calculate_turn_distance};
 use crate::components::{Faction, GridPosition, PlayerId, Property, UnitStats};
 use crate::resources::{Map, MovementType, Terrain, UnitType, master_data::MasterDataRegistry};
@@ -51,8 +55,10 @@ pub struct ProductionStrategy {
     pub existing_transport_count: usize,
     /// 敵地上ユニットが存在しない平和な島にあるプロパティの座標セット
     pub peaceful_properties: std::collections::HashSet<GridPosition>,
-    /// V3 が現在優先する、地上移動では到達できない敵島の侵攻目標。
-    pub invasion_target: Option<crate::ai::objectives::InvasionTarget>,
+    /// V3が毎ターン盤面から再構築する島嶼キャンペーン全体。
+    pub campaign_portfolio: IslandCampaignPortfolio,
+    /// 完全packageごとの予約額と不足カテゴリをproductionが優先順に消費する行。
+    pub campaign_shortfalls: Vec<IslandCampaignShortfall>,
 }
 
 /// 複数ターンにまたがる生産計画。
@@ -68,6 +74,20 @@ pub struct ProductionPlan {
 
 fn is_ground_movement(movement_type: MovementType) -> bool {
     !matches!(movement_type, MovementType::Air | MovementType::Ship)
+}
+
+/// V3の島嶼作戦で海を越えられる輸送枠だけを返します。
+/// 地上輸送車のcargo枠は同一島内では有効でも、海上輸送需要を満たしません。
+pub(crate) fn sea_transport_capacity(unit_type: UnitType, stats: &UnitStats) -> (u32, u32) {
+    sea_transport_capacity_from_slots(unit_type, stats.max_cargo)
+}
+
+pub(crate) fn sea_transport_capacity_from_slots(unit_type: UnitType, max_cargo: u32) -> (u32, u32) {
+    match unit_type {
+        UnitType::TransportHelicopter => (max_cargo, 0),
+        UnitType::Lander => (max_cargo, max_cargo),
+        _ => (0, 0),
+    }
 }
 
 /// 2ユニットを戦略上の近距離交戦候補として扱えるかを判定します。
@@ -164,6 +184,22 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
         .get_resource::<crate::ai::ai_version::PlayerAiSettings>()
         .map(|settings| settings.get_version(player_id).uses_v3_tactics())
         .unwrap_or(false);
+    if is_v3 {
+        // V3のキャンペーン分析はこの呼び出しだけで再構築し、以降は同じ結果を共有する。
+        strategy.campaign_portfolio = analyze_island_campaign(world, player_id);
+        // 診断Resourceは意思決定に戻さず、最後の分析結果だけをプレイヤー別に上書きする。
+        if let Some(mut diagnostics) = world.get_resource_mut::<IslandCampaignDiagnostics>() {
+            diagnostics
+                .by_player
+                .insert(player_id, strategy.campaign_portfolio.clone());
+        } else {
+            let mut diagnostics = IslandCampaignDiagnostics::default();
+            diagnostics
+                .by_player
+                .insert(player_id, strategy.campaign_portfolio.clone());
+            world.insert_resource(diagnostics);
+        }
+    }
     let mut turn_cache = TurnDistanceCache::default();
     let mut unit_positions = HashMap::new();
     let mut q_all_units = world.query::<(&Faction, &GridPosition, &UnitStats)>();
@@ -255,87 +291,6 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
     }
 
     let mut terrain_connectivity = TerrainConnectivity::default();
-
-    // V3 は進行中の侵攻島を、敵所有拠点が残る間は維持する。
-    if is_v3 {
-        let active_island = world
-            .get_resource::<crate::ai::squad::SquadManager>()
-            .and_then(|manager| {
-                manager.squads.iter().find_map(|squad| {
-                    let belongs_to_player = squad
-                        .transport_entity
-                        .and_then(|entity| world.get::<Faction>(entity))
-                        .or_else(|| {
-                            squad
-                                .members
-                                .iter()
-                                .find_map(|entity| world.get::<Faction>(*entity))
-                        })
-                        .is_some_and(|faction| faction.0 == player_id);
-                    belongs_to_player.then_some(squad.target_island).flatten()
-                })
-            });
-        if let Some(active_island) = active_island {
-            let mut active_targets: Vec<_> = enemy_properties
-                .iter()
-                .filter(|target| {
-                    island_map
-                        .get_island_at(target)
-                        .is_some_and(|island| island.id == active_island)
-                })
-                .copied()
-                .collect();
-            active_targets.sort_by_key(|target| (target.y, target.x));
-            if let Some(target_position) = active_targets.first().copied() {
-                strategy.invasion_target = Some(crate::ai::objectives::InvasionTarget {
-                    target_island: active_island,
-                    target_position,
-                });
-            }
-        }
-    }
-
-    // 新規侵攻では、地上移動だけでは到達できない敵所有拠点から1島を選ぶ。
-    if is_v3 && strategy.invasion_target.is_none() {
-        let mut invasion_candidates = Vec::new();
-        for target in &enemy_properties {
-            let Some(island) = island_map.get_island_at(target) else {
-                continue;
-            };
-            let reachable_by_ground = my_units.iter().any(|(pos, stats)| {
-                is_ground_movement(stats.movement_type)
-                    && terrain_connectivity.is_reachable(
-                        &map,
-                        &master_data,
-                        (pos.x, pos.y),
-                        (target.x, target.y),
-                        stats.movement_type,
-                    )
-            });
-            if reachable_by_ground {
-                continue;
-            }
-
-            let terrain_rank = if map.get_terrain(target.x, target.y) == Some(Terrain::Capital) {
-                0u8
-            } else {
-                1u8
-            };
-            invasion_candidates.push((
-                island.id.0,
-                terrain_rank,
-                target.y,
-                target.x,
-                crate::ai::objectives::InvasionTarget {
-                    target_island: island.id,
-                    target_position: *target,
-                },
-            ));
-        }
-        invasion_candidates
-            .sort_by_key(|candidate| (candidate.0, candidate.1, candidate.2, candidate.3));
-        strategy.invasion_target = invasion_candidates.first().map(|candidate| candidate.4);
-    }
 
     // 交戦可能性の判定。地上部隊同士は、海や進入不能地形で分断された組を除外する。
     let mut min_enemy_dist = 999;
@@ -545,14 +500,11 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
             );
 
             // 輸送が必要なユニット（停滞ユニット）的抽出。
-            // V3 は選択済みの敵島侵攻目標だけを使い、複数島への需要分散を防ぐ。
+            // V3はallocatorが確定した全攻勢を、割当優先順位どおりの輸送先として共有する。
             let map = world.resource::<crate::resources::Map>();
             let normalization_scale = average_attack_expectation(&chart, &registry);
             let transport_targets = if is_v3 {
-                strategy
-                    .invasion_target
-                    .map(|target| vec![target.target_position])
-                    .unwrap_or_else(|| strategy.priority_targets.clone())
+                strategy.campaign_portfolio.offensive_target_positions()
             } else {
                 strategy.priority_targets.clone()
             };
@@ -639,21 +591,45 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                 }
             }
 
-            let current_light_capacity: u32 = my_units
-                .iter()
-                .filter(|(_, s)| s.loadable_unit_types.contains(&UnitType::Infantry))
-                .map(|(_, s)| s.max_cargo)
-                .sum();
+            let (current_light_capacity, current_heavy_capacity) = if is_v3 {
+                my_units
+                    .iter()
+                    .fold((0_u32, 0_u32), |capacity, (_, stats)| {
+                        let sea_capacity = sea_transport_capacity(stats.unit_type, stats);
+                        (
+                            capacity.0.saturating_add(sea_capacity.0),
+                            capacity.1.saturating_add(sea_capacity.1),
+                        )
+                    })
+            } else {
+                let light = my_units
+                    .iter()
+                    .filter(|(_, stats)| stats.loadable_unit_types.contains(&UnitType::Infantry))
+                    .map(|(_, stats)| stats.max_cargo)
+                    .sum();
+                let heavy = my_units
+                    .iter()
+                    .filter(|(_, stats)| stats.loadable_unit_types.contains(&UnitType::Tank))
+                    .map(|(_, stats)| stats.max_cargo)
+                    .sum();
+                (light, heavy)
+            };
 
-            let current_heavy_capacity: u32 = my_units
-                .iter()
-                .filter(|(_, s)| s.loadable_unit_types.contains(&UnitType::Tank))
-                .map(|(_, s)| s.max_cargo)
-                .sum();
-
-            // 輸送需要については、輸送能力を持つ全ユニット（海軍・空軍）をカウントする
-            strategy.existing_transport_count =
-                my_units.iter().filter(|(_, s)| s.max_cargo > 0).count();
+            // V3では海を越えられる輸送だけを数え、地上輸送車による需要減衰を防ぐ。
+            strategy.existing_transport_count = if is_v3 {
+                my_units
+                    .iter()
+                    .filter(|(_, stats)| {
+                        let capacity = sea_transport_capacity(stats.unit_type, stats);
+                        capacity.0 > 0 || capacity.1 > 0
+                    })
+                    .count()
+            } else {
+                my_units
+                    .iter()
+                    .filter(|(_, stats)| stats.max_cargo > 0)
+                    .count()
+            };
 
             // 軽ユニット（歩兵・バズーカ）と重ユニット（車両）の待機数をカウント
             let light_candidates = strategy
@@ -688,7 +664,7 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
 
             // 海を越えた島への侵攻需要（Base Invasion Demand）の計算
             let has_sea_bound_target = if is_v3 {
-                strategy.invasion_target.is_some()
+                !strategy.campaign_portfolio.active_offensives.is_empty()
             } else {
                 strategy.priority_targets.iter().any(|target| {
                     get_island_id(target).is_some_and(|target_island_id| {
@@ -712,6 +688,27 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
                 strategy.demand.anti_ground = strategy.demand.anti_ground.max(0.5);
             }
         }
+    }
+
+    if is_v3 {
+        let shortfalls = strategy.campaign_portfolio.aggregate_missing_requirements();
+        let mut capture_demand = 0_u32;
+        let mut light_transport_demand = 0_u32;
+        let mut heavy_transport_demand = 0_u32;
+
+        // helperが保証するpriority rank・島ID順をfieldにも保持し、productionで順次消費する。
+        for shortfall in &shortfalls {
+            capture_demand = capture_demand.saturating_add(shortfall.capture_units);
+            light_transport_demand =
+                light_transport_demand.saturating_add(shortfall.light_transport_slots);
+            heavy_transport_demand =
+                heavy_transport_demand.saturating_add(shortfall.heavy_transport_slots);
+        }
+
+        strategy.capture_demand = capture_demand;
+        strategy.light_transport_demand = light_transport_demand;
+        strategy.heavy_transport_demand = heavy_transport_demand;
+        strategy.campaign_shortfalls = shortfalls;
     }
 
     // 平和な拠点（敵ユニットから十分に離れており、脅かされていない拠点）の分析
@@ -754,6 +751,32 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
 mod tests {
     use super::*;
     use crate::resources::{GridTopology, Map, Terrain};
+
+    #[test]
+    fn v3_sea_transport_capacity_excludes_ground_carriers() {
+        let recon = UnitStats {
+            unit_type: UnitType::Recon,
+            max_cargo: 1,
+            ..UnitStats::mock()
+        };
+        let helicopter = UnitStats {
+            unit_type: UnitType::TransportHelicopter,
+            max_cargo: 2,
+            ..UnitStats::mock()
+        };
+        let lander = UnitStats {
+            unit_type: UnitType::Lander,
+            max_cargo: 2,
+            ..UnitStats::mock()
+        };
+
+        assert_eq!(sea_transport_capacity(UnitType::Recon, &recon), (0, 0));
+        assert_eq!(
+            sea_transport_capacity(UnitType::TransportHelicopter, &helicopter),
+            (2, 0)
+        );
+        assert_eq!(sea_transport_capacity(UnitType::Lander, &lander), (2, 2));
+    }
 
     #[test]
     fn test_analyze_strategy_expansion() {
@@ -1050,103 +1073,214 @@ mod tests {
         );
     }
 
-    #[test]
-    fn v3_selects_one_deterministic_enemy_island() {
-        let build_world = |reverse_spawn: bool| {
-            let mut world = World::new();
-            let master_data = MasterDataRegistry::load().unwrap();
-            let mut map = Map::new(7, 1, Terrain::Sea, GridTopology::Square);
-            for x in [0, 3, 6] {
-                map.set_terrain(x, 0, Terrain::Plains).unwrap();
-            }
-            world.insert_resource(map.clone());
-            world.insert_resource(master_data);
-            world.insert_resource(crate::ai::islands::IslandMap::analyze(&map));
-            let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
-            settings.set_version(PlayerId(1), crate::ai::ai_version::AiVersion::V3);
-            world.insert_resource(settings);
+    fn setup_v3_portfolio_world(reverse_spawn: bool, funds: u32) -> World {
+        let mut world = World::new();
+        let master_data = MasterDataRegistry::load().unwrap();
+        let mut map = Map::new(7, 1, Terrain::Sea, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Airport).unwrap();
+        map.set_terrain(3, 0, Terrain::Factory).unwrap();
+        map.set_terrain(6, 0, Terrain::Capital).unwrap();
+        world.insert_resource(map.clone());
+        world.insert_resource(master_data);
+        world.insert_resource(crate::ai::islands::IslandMap::analyze(&map));
+        world.insert_resource(crate::resources::Players(vec![crate::resources::Player {
+            id: PlayerId(1),
+            name: "P1".to_owned(),
+            funds,
+        }]));
+        let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
+        settings.set_version(PlayerId(1), crate::ai::ai_version::AiVersion::V3);
+        world.insert_resource(settings);
 
-            world.spawn((
+        let properties = [
+            (
                 GridPosition { x: 0, y: 0 },
-                Property::new(Terrain::Capital, Some(PlayerId(1)), 100),
-            ));
-            let enemy_properties = [
-                (GridPosition { x: 3, y: 0 }, Terrain::City),
-                (GridPosition { x: 6, y: 0 }, Terrain::Capital),
-            ];
-            let order: Vec<_> = if reverse_spawn {
-                enemy_properties.into_iter().rev().collect()
-            } else {
-                enemy_properties.into_iter().collect()
-            };
-            for (position, terrain) in order {
-                world.spawn((position, Property::new(terrain, Some(PlayerId(2)), 100)));
+                Property::new(Terrain::Airport, Some(PlayerId(1)), 100),
+            ),
+            (
+                GridPosition { x: 3, y: 0 },
+                Property::new(Terrain::Factory, None, 100),
+            ),
+            (
+                GridPosition { x: 6, y: 0 },
+                Property::new(Terrain::Capital, Some(PlayerId(2)), 100),
+            ),
+        ];
+        if reverse_spawn {
+            for property in properties.into_iter().rev() {
+                world.spawn(property);
             }
-            world
-        };
+        } else {
+            for property in properties {
+                world.spawn(property);
+            }
+        }
+        world
+    }
 
-        let mut normal = build_world(false);
-        let mut reversed = build_world(true);
-        let normal_target = analyze_strategy(&mut normal, PlayerId(1)).invasion_target;
-        let reversed_target = analyze_strategy(&mut reversed, PlayerId(1)).invasion_target;
-        assert_eq!(normal_target, reversed_target);
+    fn install_strategy_scoring_resources(world: &mut World) {
+        let master_data = world.resource::<MasterDataRegistry>().clone();
+        let mut damage_chart = crate::resources::DamageChart::new();
+        let mut unit_registry = std::collections::HashMap::new();
+        for (name, record) in &master_data.units {
+            let unit_type = master_data.unit_type_for_name(&name.0).unwrap();
+            let stats = master_data.create_unit_stats(name).unwrap();
+            unit_registry.insert(unit_type, stats);
+            for weapon_name in [&record.weapon1, &record.weapon2].into_iter().flatten() {
+                let weapon = master_data
+                    .weapons
+                    .get(&crate::resources::master_data::UnitName(
+                        weapon_name.clone(),
+                    ))
+                    .unwrap();
+                for (defender_name, damage) in &weapon.damages {
+                    let defender_type = master_data.unit_type_for_name(defender_name).unwrap();
+                    damage_chart.insert_damage(unit_type, defender_type, *damage);
+                }
+            }
+        }
+        world.insert_resource(damage_chart);
+        world.insert_resource(crate::resources::UnitRegistry(unit_registry));
+    }
+
+    #[test]
+    fn v3_recon_does_not_satisfy_sea_transport_demand() {
+        let mut world = setup_v3_portfolio_world(false, 6_000);
+        install_strategy_scoring_resources(&mut world);
+        let recon = world
+            .resource::<MasterDataRegistry>()
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::Recon.as_str().to_owned(),
+            ))
+            .unwrap();
+        assert!(
+            recon.max_cargo > 0,
+            "fixture must reproduce the ground-carrier bug"
+        );
+        world.spawn((
+            Faction(PlayerId(1)),
+            GridPosition { x: 0, y: 0 },
+            recon,
+            crate::components::Health {
+                current: 100,
+                max: 100,
+            },
+        ));
+
+        let strategy = analyze_strategy(&mut world, PlayerId(1));
+
+        assert_eq!(strategy.existing_transport_count, 0);
+        assert_eq!(strategy.light_transport_demand, 2);
+    }
+
+    #[test]
+    fn v3_strategy_assesses_every_island() {
+        let mut world = setup_v3_portfolio_world(false, 6_000);
+        let island_count = world
+            .resource::<crate::ai::islands::IslandMap>()
+            .islands
+            .len();
+
+        let strategy = analyze_strategy(&mut world, PlayerId(1));
+
+        assert_eq!(strategy.campaign_portfolio.islands.len(), island_count);
+    }
+
+    #[test]
+    fn v3_strategy_updates_only_active_players_campaign_diagnostics() {
+        let mut world = setup_v3_portfolio_world(false, 6_000);
+        let preserved = IslandCampaignPortfolio::default();
+        let mut diagnostics = IslandCampaignDiagnostics::default();
+        diagnostics.by_player.insert(PlayerId(2), preserved.clone());
+        world.insert_resource(diagnostics);
+
+        let strategy = analyze_strategy(&mut world, PlayerId(1));
+        let diagnostics = world.resource::<IslandCampaignDiagnostics>();
+
         assert_eq!(
-            normal_target.unwrap().target_position,
-            GridPosition { x: 3, y: 0 }
+            diagnostics.by_player.get(&PlayerId(1)),
+            Some(&strategy.campaign_portfolio)
+        );
+        assert_eq!(diagnostics.by_player.get(&PlayerId(2)), Some(&preserved));
+    }
+
+    #[test]
+    fn v3_portfolio_is_independent_of_spawn_order() {
+        let mut normal = setup_v3_portfolio_world(false, 6_000);
+        let mut reversed = setup_v3_portfolio_world(true, 6_000);
+
+        let normal_portfolio = analyze_strategy(&mut normal, PlayerId(1)).campaign_portfolio;
+        let reversed_portfolio = analyze_strategy(&mut reversed, PlayerId(1)).campaign_portfolio;
+        let normal_assignment_ids: Vec<_> = normal_portfolio
+            .active_offensives
+            .iter()
+            .map(|assignment| assignment.island_id)
+            .collect();
+        let reversed_assignment_ids: Vec<_> = reversed_portfolio
+            .active_offensives
+            .iter()
+            .map(|assignment| assignment.island_id)
+            .collect();
+
+        assert_eq!(normal_portfolio.islands, reversed_portfolio.islands);
+        assert_eq!(normal_assignment_ids, reversed_assignment_ids);
+    }
+
+    #[test]
+    fn v3_funds_open_neutral_before_unaffordable_enemy_assault() {
+        let mut world = setup_v3_portfolio_world(false, 6_000);
+        let island_map = world.resource::<crate::ai::islands::IslandMap>().clone();
+        let neutral_island = island_map
+            .get_island_at(&GridPosition { x: 3, y: 0 })
+            .unwrap()
+            .id;
+        let enemy_island = island_map
+            .get_island_at(&GridPosition { x: 6, y: 0 })
+            .unwrap()
+            .id;
+
+        let strategy = analyze_strategy(&mut world, PlayerId(1));
+        let portfolio = &strategy.campaign_portfolio;
+
+        assert_eq!(strategy.capture_demand, 2);
+        assert_eq!(strategy.light_transport_demand, 2);
+        assert_eq!(strategy.heavy_transport_demand, 0);
+        assert_eq!(
+            portfolio
+                .assignment_for(neutral_island)
+                .map(|assignment| assignment.decision),
+            Some(crate::ai::island_campaign::IslandCampaignDecision::Expand)
+        );
+        assert_eq!(
+            portfolio
+                .islands
+                .iter()
+                .find(|assessment| assessment.island_id == enemy_island)
+                .map(|assessment| assessment.decision),
+            Some(crate::ai::island_campaign::IslandCampaignDecision::Observe)
         );
     }
 
     #[test]
-    fn active_invasion_persists_after_combat_unit_lands() {
-        let mut world = World::new();
-        let master_data = MasterDataRegistry::load().unwrap();
-        let mut map = Map::new(4, 1, Terrain::Sea, GridTopology::Square);
-        map.set_terrain(0, 0, Terrain::Plains).unwrap();
-        map.set_terrain(3, 0, Terrain::Plains).unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
-        let target_island = island_map
-            .get_island_at(&GridPosition { x: 3, y: 0 })
+    fn v3_enemy_held_below_minimum_budget_remains_observe() {
+        let mut world = setup_v3_portfolio_world(false, 32_699);
+        let island_map = world.resource::<crate::ai::islands::IslandMap>().clone();
+        let enemy_island = island_map
+            .get_island_at(&GridPosition { x: 6, y: 0 })
             .unwrap()
             .id;
-        world.insert_resource(map);
-        world.insert_resource(master_data);
-        world.insert_resource(island_map);
-        let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
-        settings.set_version(PlayerId(1), crate::ai::ai_version::AiVersion::V3);
-        world.insert_resource(settings);
-        world.spawn((
-            GridPosition { x: 0, y: 0 },
-            Property::new(Terrain::Capital, Some(PlayerId(1)), 100),
-        ));
-        world.spawn((
-            GridPosition { x: 3, y: 0 },
-            Property::new(Terrain::City, Some(PlayerId(2)), 100),
-        ));
-        let landed_tank = world
-            .spawn((
-                GridPosition { x: 3, y: 0 },
-                Faction(PlayerId(1)),
-                UnitStats {
-                    unit_type: UnitType::Tank,
-                    movement_type: MovementType::Tank,
-                    max_movement: 6,
-                    ..UnitStats::mock()
-                },
-            ))
-            .id();
-        let mut manager = crate::ai::squad::SquadManager::new();
-        let squad = manager.create_squad(crate::ai::squad::MissionType::Attack);
-        squad.members.insert(landed_tank);
-        squad.target_island = Some(target_island);
-        squad.target = Some(GridPosition { x: 3, y: 0 });
-        world.insert_resource(manager);
+
+        let portfolio = analyze_strategy(&mut world, PlayerId(1)).campaign_portfolio;
+        let assessment = portfolio
+            .islands
+            .iter()
+            .find(|assessment| assessment.island_id == enemy_island)
+            .unwrap();
 
         assert_eq!(
-            analyze_strategy(&mut world, PlayerId(1)).invasion_target,
-            Some(crate::ai::objectives::InvasionTarget {
-                target_island,
-                target_position: GridPosition { x: 3, y: 0 },
-            })
+            assessment.decision,
+            crate::ai::island_campaign::IslandCampaignDecision::Observe
         );
+        assert!(portfolio.assignment_for(enemy_island).is_none());
     }
 }

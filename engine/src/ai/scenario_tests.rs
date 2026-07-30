@@ -251,7 +251,8 @@ mod tests {
 
         world.spawn((
             GridPosition { x: 1, y: 1 },
-            Property::new(Terrain::Factory, Some(p1), 100),
+            // 生産可能なcombat unit costをshortfallへ正規化できる有効Capital。
+            Property::new(Terrain::Capital, Some(p1), 100),
         ));
 
         world.spawn((
@@ -680,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v3_partially_loaded_transport_fills_remaining_capacity() {
+    fn test_v3_unassigned_partial_load_uses_targetless_safe_drop() {
         let p1 = PlayerId(1);
         let mut world = setup_transport_invasion();
         let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
@@ -736,12 +737,13 @@ mod tests {
             .iter()
             .find(|squad| squad.mission_type == crate::ai::squad::MissionType::Transport)
             .unwrap();
-        assert_eq!(transport.cargo_entities.len(), 2);
-        assert!(transport.cargo_entities.contains(&infantry));
-        assert!(transport.cargo_entities.contains(&tank));
+        assert_eq!(transport.cargo_entities, vec![infantry]);
+        assert!(!transport.cargo_entities.contains(&tank));
+        assert_eq!(transport.target_island, None);
+        assert_eq!(transport.target, None);
         assert_eq!(
             transport.phase,
-            crate::ai::squad::MissionPhase::Transport(crate::ai::squad::TransportPhase::Pickup)
+            crate::ai::squad::MissionPhase::Transport(crate::ai::squad::TransportPhase::Drop)
         );
     }
 
@@ -762,6 +764,46 @@ mod tests {
             .get_mut::<Property>(neutral_property)
             .unwrap()
             .owner_id = None;
+        let transport = world
+            .query::<(Entity, &UnitStats)>()
+            .iter(&world)
+            .find(|(_, stats)| stats.unit_type == UnitType::Lander)
+            .map(|(entity, _)| entity)
+            .unwrap();
+        {
+            let mut stats = world.get_mut::<UnitStats>(transport).unwrap();
+            stats.unit_type = UnitType::TransportHelicopter;
+            stats.movement_type = MovementType::Air;
+            stats.loadable_unit_types = vec![UnitType::Infantry, UnitType::Mech];
+        }
+        world.spawn((
+            p1,
+            Faction(p1),
+            HasMoved(false),
+            ActionCompleted(false),
+            UnitStats {
+                unit_type: UnitType::Infantry,
+                movement_type: MovementType::Infantry,
+                max_movement: 3,
+                can_capture: true,
+                ..UnitStats::mock()
+            },
+            GridPosition { x: 1, y: 1 },
+            Health {
+                current: 100,
+                max: 100,
+            },
+            Fuel {
+                current: 99,
+                max: 99,
+            },
+            Ammo {
+                ammo1: 0,
+                ammo2: 0,
+                max_ammo1: 0,
+                max_ammo2: 0,
+            },
+        ));
 
         crate::ai::squad::plan_squads(&mut world, p1);
         assert!(

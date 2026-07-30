@@ -365,6 +365,14 @@ impl OpenWarsAiServer {
                     "player_id": faction.0.0,
                     "unit_type": stats.unit_type.as_str(),
                     "hp": health.current,
+                    "cost": stats.cost,
+                    "can_capture": stats.can_capture,
+                    "max_cargo": stats.max_cargo,
+                    "loadable_unit_types": stats
+                        .loadable_unit_types
+                        .iter()
+                        .map(|unit_type| unit_type.as_str())
+                        .collect::<Vec<_>>(),
                     "island_id": island_map.get_island_at(pos).map(|island| island.id.0),
                     "transporting_by": transporting.map(|transporting| transporting.0.to_bits()),
                     "cargo_ids": cargo_ids
@@ -476,18 +484,18 @@ impl OpenWarsAiServer {
             let mut step = 0usize;
             loop {
                 let turn = state.world.resource::<MatchState>().current_turn_number.0;
-                let positions_before = invasion_trace::snapshot_unit_positions(&mut state.world);
+                let units_before = invasion_trace::snapshot_units(&mut state.world);
                 let action_taken =
                     engine::ai::engine::execute_ai_turn(&mut state.world, active_player_id);
 
                 // イベント処理後に、実行済みの侵攻イベントだけを構造化して収集する。
                 state.schedule.run(&mut state.world);
                 invasion_events.extend(state.invasion_trace.collect_step(
-                    &state.world,
+                    &mut state.world,
                     turn,
                     active_player_id.0,
                     step,
-                    &positions_before,
+                    &units_before,
                 ));
                 step += 1;
 
@@ -498,6 +506,9 @@ impl OpenWarsAiServer {
                 }
             }
             let transport_squads = invasion_trace::snapshot_transport_squads(&state.world);
+            // V3の直近分析が存在する場合だけ島別診断を返し、V1ではnullを維持する。
+            let island_campaign =
+                invasion_trace::snapshot_island_campaign_for_player(&state.world, active_player_id);
 
             let after_metrics = engine::ai::eval::evaluate_board_with_metrics(
                 &mut state.world,
@@ -509,6 +520,7 @@ impl OpenWarsAiServer {
                 "actions_taken": actions_taken,
                 "invasion_events": invasion_events,
                 "transport_squads": transport_squads,
+                "island_campaign": island_campaign,
                 "player_id": active_player_id.0,
                 "player_index": active_player_index.0,
                 "before_score": before_metrics.total_score,

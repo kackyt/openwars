@@ -71,9 +71,10 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
     let active_squads: Vec<Squad> = manager
         .squads
         .iter()
-        // 輸送部隊は複数ターンのフェーズと侵攻島を保持するため、
-        // 単ターンの Beam Search で目標を上書きしない。
+        // active playerのgeneric責務だけを探索し、輸送および島別campaign責務の目標を上書きしない。
+        .filter(|s| s.owner_id == Some(perspective_player))
         .filter(|s| !s.members.is_empty() && s.mission_type != MissionType::Transport)
+        .filter(|s| s.target_island.is_none())
         .cloned()
         .collect();
 
@@ -453,6 +454,7 @@ mod tests {
 
         let mut squad = Squad {
             id: crate::ai::squad::SquadId(1),
+            owner_id: Some(p1),
             members: HashSet::new(),
             mission_type: MissionType::Attack,
             target: None,
@@ -485,6 +487,127 @@ mod tests {
             manager.squads[0].phase,
             crate::ai::squad::MissionPhase::MovingToTarget
         );
+    }
+
+    #[test]
+    fn beam_search_preserves_foreign_owned_squad() {
+        let mut world = setup_test_world();
+        let player_a = PlayerId(1);
+        let player_b = PlayerId(2);
+        let player_c = PlayerId(3);
+        world.spawn((
+            Faction(player_c),
+            GridPosition { x: 8, y: 8 },
+            UnitStats {
+                unit_type: UnitType::Tank,
+                movement_type: MovementType::Tank,
+                max_movement: 6,
+                ..UnitStats::mock()
+            },
+        ));
+        let unit_a = world
+            .spawn((
+                Faction(player_a),
+                GridPosition { x: 2, y: 2 },
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Tank,
+                    max_movement: 6,
+                    ..UnitStats::mock()
+                },
+            ))
+            .id();
+        let unit_b = world
+            .spawn((
+                Faction(player_b),
+                GridPosition { x: 7, y: 7 },
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Tank,
+                    max_movement: 6,
+                    ..UnitStats::mock()
+                },
+            ))
+            .id();
+        let mut manager = SquadManager::new();
+        let own = manager.create_owned_squad(MissionType::Attack, player_a);
+        own.members.insert(unit_a);
+        let foreign = manager.create_owned_squad(MissionType::Attack, player_b);
+        foreign.members.insert(unit_b);
+        foreign.target = Some(GridPosition { x: 1, y: 1 });
+        foreign.phase = crate::ai::squad::MissionPhase::Executing;
+        let foreign_id = foreign.id;
+        world.insert_resource(manager);
+
+        run_squad_beam_search(&mut world, player_a);
+
+        let manager = world.resource::<SquadManager>();
+        let foreign = manager
+            .squads
+            .iter()
+            .find(|squad| squad.id == foreign_id)
+            .unwrap();
+        assert_eq!(foreign.owner_id, Some(player_b));
+        assert_eq!(foreign.target, Some(GridPosition { x: 1, y: 1 }));
+        assert_eq!(foreign.phase, crate::ai::squad::MissionPhase::Executing);
+        assert_eq!(foreign.members, HashSet::from([unit_b]));
+    }
+
+    #[test]
+    fn beam_search_preserves_campaign_managed_local_target_and_phase() {
+        let mut world = setup_test_world();
+        let player = PlayerId(1);
+        let exact_target = GridPosition { x: 4, y: 4 };
+        let map = world.resource::<Map>().clone();
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_id = island_map.get_island_at(&exact_target).unwrap().id;
+        world.insert_resource(island_map);
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(player), 100),
+        ));
+        world.spawn((
+            Faction(PlayerId(2)),
+            GridPosition { x: 8, y: 8 },
+            UnitStats {
+                unit_type: UnitType::Tank,
+                movement_type: MovementType::Tank,
+                max_movement: 6,
+                ..UnitStats::mock()
+            },
+        ));
+        let defender = world
+            .spawn((
+                Faction(player),
+                GridPosition { x: 3, y: 4 },
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Tank,
+                    max_movement: 6,
+                    ..UnitStats::mock()
+                },
+            ))
+            .id();
+        let mut manager = SquadManager::new();
+        let squad = manager.create_owned_squad(MissionType::Defense, player);
+        squad.members.insert(defender);
+        squad.target = Some(exact_target);
+        squad.target_island = Some(island_id);
+        squad.phase = crate::ai::squad::MissionPhase::Executing;
+        let squad_id = squad.id;
+        world.insert_resource(manager);
+
+        run_squad_beam_search(&mut world, player);
+
+        let manager = world.resource::<SquadManager>();
+        let squad = manager
+            .squads
+            .iter()
+            .find(|squad| squad.id == squad_id)
+            .unwrap();
+        assert_eq!(squad.target, Some(exact_target));
+        assert_eq!(squad.target_island, Some(island_id));
+        assert_eq!(squad.phase, crate::ai::squad::MissionPhase::Executing);
     }
 
     #[test]

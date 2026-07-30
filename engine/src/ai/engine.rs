@@ -1112,7 +1112,10 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     let mut transport_action = None;
     if let Some(mut manager) = world.remove_resource::<crate::ai::squad::SquadManager>() {
         for squad in &mut manager.squads {
-            if squad.mission_type == crate::ai::squad::MissionType::Transport {
+            if squad.mission_type == crate::ai::squad::MissionType::Transport
+                && squad.owner_id == Some(active_player)
+                && crate::ai::squad::squad_is_mutable_by_player(world, squad, active_player)
+            {
                 let is_transport_cooldown = squad
                     .transport_entity
                     .is_none_or(|entity| skip_entities.contains(&entity));
@@ -3339,6 +3342,161 @@ mod tests {
         world
     }
 
+    #[test]
+    fn v2_v3_transport_executor_skips_foreign_owned_squads() {
+        for version in [
+            crate::ai::ai_version::AiVersion::V2,
+            crate::ai::ai_version::AiVersion::V3,
+        ] {
+            let mut world = setup_v3_test_world(5, version);
+            let map = world.resource::<Map>().clone();
+            world.insert_resource(crate::ai::islands::IslandMap::analyze(&map));
+            world.insert_resource(Events::<crate::events::WaitUnitCommand>::default());
+            world.insert_resource(Events::<crate::events::MoveUnitCommand>::default());
+            let player_a = PlayerId(1);
+            let player_b = PlayerId(2);
+            let property_a = GridPosition { x: 1, y: 0 };
+            let property_b = GridPosition { x: 3, y: 0 };
+            world.spawn((
+                property_a,
+                Property::new(Terrain::City, Some(player_a), 100),
+            ));
+            world.spawn((
+                property_b,
+                Property::new(Terrain::City, Some(player_b), 100),
+            ));
+            let transport_stats = UnitStats {
+                unit_type: UnitType::TransportHelicopter,
+                movement_type: crate::resources::MovementType::Air,
+                max_movement: 6,
+                max_cargo: 2,
+                ..UnitStats::mock()
+            };
+            let transport_a = world
+                .spawn((
+                    Faction(player_a),
+                    GridPosition { x: 0, y: 0 },
+                    transport_stats.clone(),
+                    crate::components::Fuel {
+                        current: 99,
+                        max: 99,
+                    },
+                    crate::components::CargoCapacity {
+                        max: 2,
+                        loaded: Vec::new(),
+                    },
+                ))
+                .id();
+            let ownerless_transport = world
+                .spawn((
+                    Faction(player_b),
+                    GridPosition { x: 2, y: 0 },
+                    transport_stats.clone(),
+                    crate::components::Fuel {
+                        current: 99,
+                        max: 99,
+                    },
+                    crate::components::CargoCapacity {
+                        max: 2,
+                        loaded: Vec::new(),
+                    },
+                ))
+                .id();
+            let transport_b = world
+                .spawn((
+                    Faction(player_b),
+                    GridPosition { x: 4, y: 0 },
+                    transport_stats,
+                    crate::components::Fuel {
+                        current: 99,
+                        max: 99,
+                    },
+                    crate::components::CargoCapacity {
+                        max: 2,
+                        loaded: Vec::new(),
+                    },
+                ))
+                .id();
+            let (foreign_id, foreign_snapshot) = {
+                let mut manager = crate::ai::squad::SquadManager::new();
+                let foreign =
+                    manager.create_owned_squad(crate::ai::squad::MissionType::Transport, player_a);
+                foreign.members.insert(transport_a);
+                foreign.transport_entity = Some(transport_a);
+                foreign.phase = crate::ai::squad::MissionPhase::Transport(
+                    crate::ai::squad::TransportPhase::Return,
+                );
+                let snapshot = (
+                    foreign.owner_id,
+                    foreign.members.clone(),
+                    foreign.transport_entity,
+                    foreign.cargo_entities.clone(),
+                    foreign.delivered_cargo.clone(),
+                    foreign.target_island,
+                    foreign.target,
+                    foreign.phase.clone(),
+                    foreign.pickup_position,
+                    foreign.drop_position,
+                );
+                let id = foreign.id;
+                let ownerless = manager.create_squad(crate::ai::squad::MissionType::Transport);
+                ownerless.members.insert(ownerless_transport);
+                ownerless.transport_entity = Some(ownerless_transport);
+                ownerless.phase = crate::ai::squad::MissionPhase::Transport(
+                    crate::ai::squad::TransportPhase::Return,
+                );
+                let own =
+                    manager.create_owned_squad(crate::ai::squad::MissionType::Transport, player_b);
+                own.members.insert(transport_b);
+                own.transport_entity = Some(transport_b);
+                own.phase = crate::ai::squad::MissionPhase::Transport(
+                    crate::ai::squad::TransportPhase::Return,
+                );
+                world.insert_resource(manager);
+                (id, snapshot)
+            };
+            let sentinel = world.spawn_empty().id();
+            world.insert_resource(AiActionCooldown(HashSet::from([sentinel])));
+
+            let result_b = execute_ai_turn(&mut world, player_b);
+            assert!(result_b.is_some());
+            let manager = world.resource::<crate::ai::squad::SquadManager>();
+            let foreign = manager
+                .squads
+                .iter()
+                .find(|squad| squad.id == foreign_id)
+                .unwrap();
+            assert_eq!(
+                (
+                    foreign.owner_id,
+                    foreign.members.clone(),
+                    foreign.transport_entity,
+                    foreign.cargo_entities.clone(),
+                    foreign.delivered_cargo.clone(),
+                    foreign.target_island,
+                    foreign.target,
+                    foreign.phase.clone(),
+                    foreign.pickup_position,
+                    foreign.drop_position,
+                ),
+                foreign_snapshot
+            );
+            let cooldown = world.resource::<AiActionCooldown>();
+            assert!(!cooldown.0.contains(&transport_a));
+            assert!(!cooldown.0.contains(&ownerless_transport));
+            assert!(cooldown.0.contains(&transport_b));
+
+            let result_a = execute_ai_turn(&mut world, player_a);
+            assert!(result_a.is_some());
+            assert!(
+                world
+                    .resource::<AiActionCooldown>()
+                    .0
+                    .contains(&transport_a)
+            );
+        }
+    }
+
     /// 移動可能な自軍ユニットをスポーンするヘルパー
     fn spawn_v3_test_unit(
         world: &mut World,
@@ -3373,6 +3531,7 @@ mod tests {
         members.insert(member);
         manager.squads.push(crate::ai::squad::Squad {
             id: crate::ai::squad::SquadId(1),
+            owner_id: None,
             members,
             mission_type: crate::ai::squad::MissionType::Attack,
             target: Some(target),
