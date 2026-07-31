@@ -538,14 +538,25 @@ def analyze_issue58_player(
     analysis = _analyze_issue58_player_metrics(game, player_number)
     records = _campaign_records(game, player_number)
     expected_islands = _expected_island_ids(game, records)
+    initial_owners_by_island: defaultdict[int, set[int | None]] = defaultdict(set)
+    for prop in (game.get("initial_state") or {}).get("properties", []):
+        if prop.get("island_id") is not None:
+            initial_owners_by_island[int(prop["island_id"])].add(prop.get("owner"))
+    initial_unit_islands = {
+        int(unit["island_id"])
+        for unit in (game.get("initial_state") or {}).get("units", [])
+        if unit.get("island_id") is not None
+    }
     initial_neutral_islands = {
-        int(prop["island_id"])
-        for prop in (game.get("initial_state") or {}).get("properties", [])
-        if prop.get("owner") is None and prop.get("island_id") is not None
+        island_id
+        for island_id, owners in initial_owners_by_island.items()
+        if owners == {None} and island_id not in initial_unit_islands
     }
     hard_failures = []
     max_offensives = 0
     first_offensive = None
+    first_offensive_set = []
+    first_offensive_islands = []
     contested_reason_present = False
     secured_after_enemy_removal = False
     continued_secure = False
@@ -602,27 +613,50 @@ def analyze_issue58_player(
                 record,
             )
         if first_offensive is None and active_offensives:
-            assignment = active_offensives[0]
-            island_id = assignment.get("island_id")
-            assessment = assessments.get(int(island_id)) if island_id is not None else None
-            first_offensive = {
-                "round": record.get("round"),
-                "turn": record.get("turn"),
-                "island_id": island_id,
-                "decision": assignment.get("decision"),
-                "state": None if assessment is None else assessment.get("state"),
-                "preferred_transport": (assignment.get("requirement") or {}).get(
-                    "preferred_transport"
-                ),
-                "capture_units": (assignment.get("requirement") or {}).get(
-                    "capture_units", 0
-                ),
-                "expansion_payback_turns": (
-                    None
-                    if assessment is None
-                    else assessment.get("expansion_payback_turns")
-                ),
-            }
+            first_offensive_islands = islands
+            for assignment in active_offensives:
+                island_id = assignment.get("island_id")
+                assessment = (
+                    assessments.get(int(island_id))
+                    if island_id is not None
+                    else None
+                )
+                first_offensive_set.append(
+                    {
+                        "round": record.get("round"),
+                        "turn": record.get("turn"),
+                        "island_id": island_id,
+                        "decision": assignment.get("decision"),
+                        "state": None if assessment is None else assessment.get("state"),
+                        "preferred_transport": (
+                            assignment.get("requirement") or {}
+                        ).get("preferred_transport"),
+                        "capture_units": (assignment.get("requirement") or {}).get(
+                            "capture_units", 0
+                        ),
+                        "roi_production_sites": (
+                            0
+                            if assessment is None
+                            else assessment.get("roi_production_sites", 0)
+                        ),
+                        "neutral_properties": (
+                            0
+                            if assessment is None
+                            else assessment.get("neutral_properties", 0)
+                        ),
+                        "transport_eta": (
+                            None
+                            if assessment is None
+                            else assessment.get("transport_eta")
+                        ),
+                        "expansion_payback_turns": (
+                            None
+                            if assessment is None
+                            else assessment.get("expansion_payback_turns")
+                        ),
+                    }
+                )
+            first_offensive = first_offensive_set[0]
 
         assignments = [*defenses, *active_offensives]
         entity_assignment: dict[int, int] = {}
@@ -690,12 +724,12 @@ def analyze_issue58_player(
                     )
         previous_offensive_count = len(offensive_ids)
 
-    first_campaign_islands = (
+    initial_campaign_islands = (
         records[0].get("campaign", {}).get("islands", []) if records else []
     )
     first_states = {
         int(island["island_id"]): island.get("state")
-        for island in first_campaign_islands
+        for island in initial_campaign_islands
         if island.get("island_id") is not None
     }
     initial_neutral_open = all(
@@ -707,21 +741,38 @@ def analyze_issue58_player(
         and first_offensive.get("state") == "OpenNeutral"
         and first_offensive.get("decision") == "Expand"
     )
-    neutral_paybacks = [
-        int(island["expansion_payback_turns"])
-        for island in first_campaign_islands
-        if island.get("state") == "OpenNeutral"
-        and island.get("expansion_payback_turns") is not None
-    ]
-    first_offensive_roi_ranked = bool(
-        first_offensive_open_neutral
-        and first_offensive.get("expansion_payback_turns") is not None
-        and (
-            not neutral_paybacks
-            or int(first_offensive["expansion_payback_turns"])
-            == min(neutral_paybacks)
-        )
+    ranked_open_neutral = sorted(
+        (
+            island
+            for island in first_offensive_islands
+            if island.get("state") == "OpenNeutral"
+            and island.get("decision") == "Expand"
+            and island.get("expansion_payback_turns") is not None
+        ),
+        key=lambda island: (
+            int(island["expansion_payback_turns"]),
+            -int(island.get("roi_production_sites", 0)),
+            -int(island.get("neutral_properties", 0)),
+            (
+                int(island["transport_eta"])
+                if island.get("transport_eta") is not None
+                else float("inf")
+            ),
+            int(island["island_id"]),
+        ),
     )
+    expected_first_open_neutral_island_id = (
+        int(ranked_open_neutral[0]["island_id"]) if ranked_open_neutral else None
+    )
+    first_offensive_roi_ranked = bool(
+        first_offensive
+        and first_offensive.get("state") == "OpenNeutral"
+        and first_offensive.get("decision") == "Expand"
+        and first_offensive.get("island_id") is not None
+        and int(first_offensive["island_id"])
+        == expected_first_open_neutral_island_id
+    )
+    first_roi_offensive = first_offensive if first_offensive_roi_ranked else None
 
     analysis.update(
         {
@@ -730,6 +781,9 @@ def analyze_issue58_player(
             "expected_island_ids": sorted(expected_islands),
             "initial_neutral_open": initial_neutral_open,
             "first_offensive": first_offensive,
+            "first_offensive_set": first_offensive_set,
+            "expected_first_open_neutral_island_id": expected_first_open_neutral_island_id,
+            "first_roi_offensive": first_roi_offensive,
             "first_offensive_open_neutral": first_offensive_open_neutral,
             "first_offensive_roi_ranked": first_offensive_roi_ranked,
             "max_simultaneous_offensives": max_offensives,
@@ -891,9 +945,9 @@ def judge_issue58_criteria(
         )
         first_expansion_pass = all(
             analysis.get("first_offensive_roi_ranked")
-            and (analysis.get("first_offensive") or {}).get("preferred_transport")
+            and (analysis.get("first_roi_offensive") or {}).get("preferred_transport")
             == "TransportHelicopter"
-            and int((analysis.get("first_offensive") or {}).get("capture_units", 0))
+            and int((analysis.get("first_roi_offensive") or {}).get("capture_units", 0))
             >= 2
             for analysis in bucket
         )

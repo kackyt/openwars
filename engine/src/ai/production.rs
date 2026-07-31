@@ -1,6 +1,7 @@
 use crate::ai::island_campaign::{IslandCampaignShortfall, campaign_unit_type_rank};
 use crate::ai::strategy::{
-    ProductionPlan, ProductionStrategy, analyze_strategy, sea_transport_capacity_from_slots,
+    ProductionPlan, ProductionStrategy, analyze_strategy_for_turn,
+    sea_transport_capacity_from_slots,
 };
 use crate::components::{Faction, GridPosition, PlayerId, Property, UnitStats};
 use crate::events::ProduceUnitCommand;
@@ -248,7 +249,7 @@ fn plan_campaign_shortfall_production(
 pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceUnitCommand> {
     let mut commands = Vec::new();
 
-    let strategy = analyze_strategy(world, player_id);
+    let strategy = analyze_strategy_for_turn(world, player_id);
     let map = world.resource::<crate::resources::Map>().clone();
 
     // V3 の生産拡張 (対編成カウンター効率) を有効にするかどうか
@@ -474,26 +475,55 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
         .collect();
 
     // --- 3. V3 campaign予約行をpriority rank・島ID順に先行消費 ---
-    let campaign_outcome = if is_v3 && !strategy.campaign_shortfalls.is_empty() {
-        plan_campaign_shortfall_production(
-            player_id,
-            &strategy.campaign_shortfalls,
-            &my_facilities,
-            &available_types,
-            &master_data,
-            available_funds,
-        )
-    } else {
-        CampaignProductionOutcome {
-            commands: Vec::new(),
-            remaining_funds: available_funds,
-            used_facilities: std::collections::HashSet::new(),
-            completed_all_rows: true,
-        }
+    let mut campaign_outcome = CampaignProductionOutcome {
+        commands: Vec::new(),
+        remaining_funds: available_funds,
+        used_facilities: std::collections::HashSet::new(),
+        completed_all_rows: true,
     };
-    commands.extend(campaign_outcome.commands);
-    if !campaign_outcome.completed_all_rows {
-        return commands;
+    if is_v3 && !strategy.campaign_shortfalls.is_empty() {
+        let campaign_plan_exists = world
+            .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .is_some_and(|cache| cache.campaign_production_planned(player_id));
+        if campaign_plan_exists {
+            // 最初の完全package計画を1commandずつ消費し、同じshortfallの重複生産を防ぐ。
+            let mut cache = world
+                .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+                .unwrap_or_default();
+            let next_command = cache.take_campaign_production_command(player_id);
+            let blocks_generic = cache.campaign_production_blocks_generic(player_id);
+            world.insert_resource(cache);
+            if let Some(command) = next_command {
+                return vec![command];
+            }
+            if blocks_generic {
+                return commands;
+            }
+        } else {
+            campaign_outcome = plan_campaign_shortfall_production(
+                player_id,
+                &strategy.campaign_shortfalls,
+                &my_facilities,
+                &available_types,
+                &master_data,
+                available_funds,
+            );
+            let completed_all_rows = campaign_outcome.completed_all_rows;
+            let campaign_commands = std::mem::take(&mut campaign_outcome.commands);
+            let mut cache = world
+                .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+                .unwrap_or_default();
+            cache.set_campaign_production_plan(player_id, campaign_commands, completed_all_rows);
+            let next_command = cache.take_campaign_production_command(player_id);
+            let blocks_generic = cache.campaign_production_blocks_generic(player_id);
+            world.insert_resource(cache);
+            if let Some(command) = next_command {
+                return vec![command];
+            }
+            if blocks_generic {
+                return commands;
+            }
+        }
     }
 
     // --- 4. campaign完了後だけgeneric需要を予算と施設重複込みで評価 ---

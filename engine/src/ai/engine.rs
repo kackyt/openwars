@@ -12,14 +12,101 @@ use crate::resources::{Map, Terrain};
 use crate::systems::combat::get_expected_damage;
 use crate::systems::movement::{OccupantInfo, calculate_reachable_tiles};
 use bevy_ecs::prelude::*;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Resource, Default)]
 pub struct AiActionCooldown(pub HashSet<Entity>);
 
 #[derive(Resource, Default)]
 pub struct AiProductionCooldown(pub HashSet<(usize, usize)>);
+
+/// V3が同一ターンの部隊計画と島嶼キャンペーン分析を再実行しないための一時cache。
+/// 次フェーズでResourceごと削除し、キャンペーンの永続状態としては扱わない。
+#[derive(Resource, Default)]
+pub struct AiTurnStrategyCache {
+    player_id: Option<PlayerId>,
+    squads_planned: bool,
+    campaign_portfolio: Option<crate::ai::island_campaign::IslandCampaignPortfolio>,
+    campaign_production_planned: bool,
+    campaign_production_commands: VecDeque<crate::events::ProduceUnitCommand>,
+    campaign_production_blocks_generic: bool,
+}
+
+impl AiTurnStrategyCache {
+    pub(crate) fn set_campaign_portfolio(
+        &mut self,
+        player_id: PlayerId,
+        portfolio: crate::ai::island_campaign::IslandCampaignPortfolio,
+    ) {
+        if self.player_id != Some(player_id) {
+            self.clear();
+            self.player_id = Some(player_id);
+        }
+        self.campaign_portfolio = Some(portfolio);
+    }
+
+    pub(crate) fn campaign_portfolio(
+        &self,
+        player_id: PlayerId,
+    ) -> Option<&crate::ai::island_campaign::IslandCampaignPortfolio> {
+        (self.player_id == Some(player_id))
+            .then_some(self.campaign_portfolio.as_ref())
+            .flatten()
+    }
+
+    pub(crate) fn mark_squads_planned(&mut self, player_id: PlayerId) {
+        if self.player_id != Some(player_id) {
+            self.clear();
+            self.player_id = Some(player_id);
+        }
+        self.squads_planned = true;
+    }
+
+    fn squads_planned(&self, player_id: PlayerId) -> bool {
+        self.player_id == Some(player_id) && self.squads_planned
+    }
+
+    pub(crate) fn set_campaign_production_plan(
+        &mut self,
+        player_id: PlayerId,
+        commands: Vec<crate::events::ProduceUnitCommand>,
+        completed_all_rows: bool,
+    ) {
+        if self.player_id != Some(player_id) {
+            self.clear();
+            self.player_id = Some(player_id);
+        }
+        self.campaign_production_planned = true;
+        self.campaign_production_commands = VecDeque::from(commands);
+        self.campaign_production_blocks_generic = !completed_all_rows;
+    }
+
+    pub(crate) fn campaign_production_planned(&self, player_id: PlayerId) -> bool {
+        self.player_id == Some(player_id) && self.campaign_production_planned
+    }
+
+    pub(crate) fn take_campaign_production_command(
+        &mut self,
+        player_id: PlayerId,
+    ) -> Option<crate::events::ProduceUnitCommand> {
+        (self.player_id == Some(player_id))
+            .then(|| self.campaign_production_commands.pop_front())
+            .flatten()
+    }
+
+    pub(crate) fn campaign_production_blocks_generic(&self, player_id: PlayerId) -> bool {
+        self.player_id == Some(player_id) && self.campaign_production_blocks_generic
+    }
+
+    fn clear(&mut self) {
+        self.player_id = None;
+        self.squads_planned = false;
+        self.campaign_portfolio = None;
+        self.campaign_production_planned = false;
+        self.campaign_production_commands.clear();
+        self.campaign_production_blocks_generic = false;
+    }
+}
 
 /// ターン開始時にAIの冷却リストをクリアするシステム。
 pub fn clear_ai_cooldowns_system(
@@ -1079,8 +1166,18 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
         skip_entities = res.0.clone();
     }
 
-    // 今ターン最初のステップの時に、部隊編成と目標のビーム探索を一括実行・キャッシュ
-    if skip_entities.is_empty() {
+    let uses_v3 = world
+        .get_resource::<crate::ai::ai_version::PlayerAiSettings>()
+        .map(|settings| settings.get_version(active_player).uses_v3_tactics())
+        .unwrap_or(false);
+    let should_plan_squads = skip_entities.is_empty()
+        && (!uses_v3
+            || !world
+                .get_resource::<AiTurnStrategyCache>()
+                .is_some_and(|cache| cache.squads_planned(active_player)));
+
+    // V3は行動可能ユニットがなくても同一ターンの再計画を避け、V1/V2は従来条件を維持する。
+    if should_plan_squads {
         crate::ai::squad::plan_squads(world, active_player);
         crate::ai::beam_search::run_squad_beam_search(world, active_player);
     } else {
@@ -1187,6 +1284,7 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     }
 
     // 3. 生産行動
+    // 生産内容は盤面・資金の変化ごとに従来通り再計画し、V3の島分析だけを同一ターンで共有する。
     let prod_commands = super::production::decide_production(world, active_player);
 
     let cooldown_set = if let Some(res) = world.get_resource::<AiProductionCooldown>() {
@@ -2131,6 +2229,72 @@ mod tests {
     use super::*;
     use crate::components::{Faction, Health, PlayerId, Property, UnitStats};
     use crate::resources::{DamageChart, UnitType};
+
+    #[test]
+    fn v3_turn_cache_marks_squad_plan_until_cleared() {
+        let player = PlayerId(1);
+        let mut cache = AiTurnStrategyCache::default();
+
+        assert!(!cache.squads_planned(player));
+        cache.mark_squads_planned(player);
+        assert!(cache.squads_planned(player));
+
+        cache.clear();
+        assert!(!cache.squads_planned(player));
+    }
+
+    #[test]
+    fn v3_campaign_production_plan_consumes_each_command_once() {
+        let player = PlayerId(1);
+        let first = crate::events::ProduceUnitCommand {
+            player_id: player,
+            target_x: 1,
+            target_y: 2,
+            unit_type: UnitType::Infantry,
+        };
+        let second = crate::events::ProduceUnitCommand {
+            player_id: player,
+            target_x: 3,
+            target_y: 4,
+            unit_type: UnitType::Mech,
+        };
+        let mut cache = AiTurnStrategyCache::default();
+
+        cache.set_campaign_production_plan(player, vec![first, second], true);
+
+        assert!(cache.campaign_production_planned(player));
+        let actual_first = cache.take_campaign_production_command(player).unwrap();
+        let actual_second = cache.take_campaign_production_command(player).unwrap();
+        assert_eq!(
+            (
+                actual_first.target_x,
+                actual_first.target_y,
+                actual_first.unit_type,
+            ),
+            (1, 2, UnitType::Infantry)
+        );
+        assert_eq!(
+            (
+                actual_second.target_x,
+                actual_second.target_y,
+                actual_second.unit_type,
+            ),
+            (3, 4, UnitType::Mech)
+        );
+        assert!(cache.take_campaign_production_command(player).is_none());
+        assert!(!cache.campaign_production_blocks_generic(player));
+    }
+
+    #[test]
+    fn incomplete_v3_campaign_production_plan_blocks_generic_fallback() {
+        let player = PlayerId(1);
+        let mut cache = AiTurnStrategyCache::default();
+
+        cache.set_campaign_production_plan(player, Vec::new(), false);
+
+        assert!(cache.campaign_production_planned(player));
+        assert!(cache.campaign_production_blocks_generic(player));
+    }
 
     #[test]
     fn test_decide_ai_action_no_units() {

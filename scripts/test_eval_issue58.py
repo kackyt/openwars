@@ -1,3 +1,4 @@
+import copy
 import json
 import unittest
 from pathlib import Path
@@ -300,6 +301,8 @@ def campaign_assessment(
     required_budget=0,
     allocated_budget=0,
     enemy_arrival_eta=None,
+    roi_production_sites=0,
+    transport_eta=None,
 ):
     return {
         "island_id": island_id,
@@ -316,6 +319,8 @@ def campaign_assessment(
         "enemy_arrival_eta": enemy_arrival_eta,
         "friendly_capture_eta": 2,
         "enemy_capture_eta": None,
+        "roi_production_sites": roi_production_sites,
+        "transport_eta": transport_eta,
         "expansion_payback_turns": 5 if state == "OpenNeutral" else None,
         "required_budget": required_budget,
         "allocated_budget": allocated_budget,
@@ -444,6 +449,113 @@ class Issue58PortfolioAnalysisTests(unittest.TestCase):
         self.assertTrue(analysis["first_offensive_roi_ranked"])
         self.assertEqual(1, analysis["max_simultaneous_offensives"])
         self.assertEqual(1, analysis["external_properties_gained"])
+
+    def test_neutral_property_on_starting_island_is_not_a_neutral_island(self):
+        game = make_portfolio_game("v3-v1")
+        game["initial_state"]["properties"].append(
+            {"owner": None, "island_id": 0}
+        )
+        analysis = analyze_issue58_player(game, 1, "v3-v1")
+        self.assertTrue(analysis["initial_neutral_open"])
+
+    def test_initial_enemy_unit_excludes_property_only_island_from_open_neutral_check(self):
+        game = make_portfolio_game("v3-v1")
+        game["initial_state"]["units"] = [
+            {"unit_id": 202, "player_id": 2, "island_id": 1}
+        ]
+        campaign = game["island_campaign_history"][0]["campaign"]
+        campaign["islands"][1] = campaign_assessment(1, "EnemyHeld", "Observe")
+
+        analysis = analyze_issue58_player(game, 1, "v3-v1")
+
+        self.assertTrue(analysis["initial_neutral_open"])
+
+    def test_enemy_assault_before_open_neutral_fails_first_expansion_check(self):
+        game = make_portfolio_game("v3-v1")
+        record = game["island_campaign_history"][0]
+        record["available_funds"] = 20000
+        campaign = record["campaign"]
+        campaign["islands"][2].update(
+            {"decision": "Assault", "required_budget": 10000, "allocated_budget": 10000}
+        )
+        campaign["active_offensives"] = [
+            campaign_assignment(2, decision="Assault", allocated_budget=10000),
+            campaign_assignment(1),
+        ]
+
+        analysis = analyze_issue58_player(game, 1, "v3-v1")
+
+        self.assertFalse(analysis["first_offensive_roi_ranked"])
+        self.assertIsNone(analysis["first_roi_offensive"])
+
+    def test_equal_payback_uses_production_site_tie_break(self):
+        game = make_portfolio_game("v3-v1")
+        game["initial_state"]["properties"][2]["owner"] = None
+        campaign = game["island_campaign_history"][0]["campaign"]
+        campaign["islands"][1] = campaign_assessment(
+            1, "OpenNeutral", "Expand", roi_production_sites=0, transport_eta=1
+        )
+        campaign["islands"][2] = campaign_assessment(
+            2, "OpenNeutral", "Expand", roi_production_sites=1, transport_eta=2
+        )
+        campaign["active_offensives"] = [
+            campaign_assignment(1),
+            campaign_assignment(2),
+        ]
+
+        analysis = analyze_issue58_player(game, 1, "v3-v1")
+
+        self.assertFalse(analysis["first_offensive_roi_ranked"])
+        self.assertEqual(2, analysis["expected_first_open_neutral_island_id"])
+
+    def test_roi_check_accepts_ranked_open_neutral_as_first_assignment(self):
+        game = make_portfolio_game("v3-v1")
+        game["initial_state"]["properties"][2]["owner"] = None
+        campaign = game["island_campaign_history"][0]["campaign"]
+        campaign["islands"][1] = campaign_assessment(
+            1, "OpenNeutral", "Expand", roi_production_sites=0, transport_eta=1
+        )
+        campaign["islands"][2] = campaign_assessment(
+            2, "OpenNeutral", "Expand", roi_production_sites=1, transport_eta=2
+        )
+        campaign["active_offensives"] = [
+            campaign_assignment(2),
+            campaign_assignment(1),
+        ]
+
+        analysis = analyze_issue58_player(game, 1, "v3-v1")
+
+        self.assertTrue(analysis["first_offensive_roi_ranked"])
+        self.assertEqual(2, analysis["first_roi_offensive"]["island_id"])
+
+    def test_delayed_first_offensive_uses_launch_turn_roi_ranking(self):
+        game = make_portfolio_game("v3-v1")
+        game["initial_state"]["properties"][2]["owner"] = None
+        first_record = game["island_campaign_history"][0]
+        first_campaign = first_record["campaign"]
+        first_campaign["islands"][1] = campaign_assessment(
+            1, "OpenNeutral", "Expand", roi_production_sites=1, transport_eta=1
+        )
+        first_campaign["islands"][1]["expansion_payback_turns"] = 4
+        first_campaign["islands"][2] = campaign_assessment(
+            2, "OpenNeutral", "Expand", roi_production_sites=1, transport_eta=2
+        )
+        first_campaign["islands"][2]["expansion_payback_turns"] = 6
+        first_campaign["active_offensives"] = []
+
+        launch_record = copy.deepcopy(first_record)
+        launch_record.update({"round": 2, "turn": 2})
+        launch_campaign = launch_record["campaign"]
+        launch_campaign["islands"][1]["expansion_payback_turns"] = 5
+        launch_campaign["islands"][2]["expansion_payback_turns"] = 3
+        launch_campaign["active_offensives"] = [campaign_assignment(2)]
+        game["island_campaign_history"] = [first_record, launch_record]
+
+        analysis = analyze_issue58_player(game, 1, "v3-v1")
+
+        self.assertTrue(analysis["first_offensive_roi_ranked"])
+        self.assertEqual(2, analysis["expected_first_open_neutral_island_id"])
+        self.assertEqual(2, analysis["first_offensive"]["round"])
 
     def test_selfplay_analyzes_both_players(self):
         analyses = analyze_issue58_game(make_portfolio_game(), "v3-selfplay")

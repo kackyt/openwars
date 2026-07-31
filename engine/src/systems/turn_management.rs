@@ -113,6 +113,7 @@ pub fn advance_next_phase(world: &mut World) {
     commands.remove_resource::<PendingMove>();
     commands.remove_resource::<crate::ai::engine::AiActionCooldown>();
     commands.remove_resource::<crate::ai::engine::AiProductionCooldown>();
+    commands.remove_resource::<crate::ai::engine::AiTurnStrategyCache>();
 
     // 3. プレイヤーの切り替え
     match_state.active_player_index.0 += 1;
@@ -581,6 +582,7 @@ mod tests {
         world.insert_resource(crate::ai::engine::AiProductionCooldown(
             [(5, 5)].into_iter().collect(),
         ));
+        world.insert_resource(crate::ai::engine::AiTurnStrategyCache::default());
 
         // ターン終了 -> P2へ
         world.send_event(NextPhaseCommand);
@@ -595,6 +597,11 @@ mod tests {
         assert!(
             world
                 .get_resource::<crate::ai::engine::AiProductionCooldown>()
+                .is_none()
+        );
+        assert!(
+            world
+                .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
                 .is_none()
         );
     }

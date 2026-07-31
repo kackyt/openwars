@@ -163,6 +163,8 @@ pub struct IslandCampaignAssessmentSnapshot {
     pub enemy_arrival_eta: Option<u32>,
     pub friendly_capture_eta: Option<u32>,
     pub enemy_capture_eta: Option<u32>,
+    pub roi_production_sites: u32,
+    pub transport_eta: Option<u32>,
     pub expansion_payback_turns: Option<u32>,
     pub required_budget: u32,
     pub allocated_budget: u32,
@@ -422,6 +424,8 @@ fn snapshot_campaign_assessment(
         enemy_arrival_eta: assessment.enemy_arrival_eta,
         friendly_capture_eta: assessment.friendly_capture_eta,
         enemy_capture_eta: assessment.enemy_capture_eta,
+        roi_production_sites: assessment.roi_production_sites,
+        transport_eta: assessment.transport_eta,
         expansion_payback_turns: assessment.expansion_payback_turns,
         required_budget: assessment.required_budget,
         allocated_budget: assessment.allocated_budget,
@@ -490,19 +494,18 @@ pub fn snapshot_island_campaign(
         .iter()
         .map(snapshot_campaign_assessment)
         .collect();
-    let mut active_offensives: Vec<_> = portfolio
+    // assignment列はallocatorの優先順位そのものなので、島IDで並べ替えず保持する。
+    let active_offensives: Vec<_> = portfolio
         .active_offensives
         .iter()
         .map(snapshot_campaign_assignment)
         .collect();
-    let mut defenses: Vec<_> = portfolio
+    let defenses: Vec<_> = portfolio
         .defenses
         .iter()
         .map(snapshot_campaign_assignment)
         .collect();
     islands.sort_by_key(|island| island.island_id);
-    active_offensives.sort_by_key(|assignment| assignment.island_id);
-    defenses.sort_by_key(|assignment| assignment.island_id);
 
     IslandCampaignSnapshot {
         player_id: player_id.0,
@@ -639,6 +642,8 @@ mod tests {
             enemy_arrival_eta: None,
             friendly_capture_eta: Some(4),
             enemy_capture_eta: None,
+            roi_production_sites: 2,
+            transport_eta: Some(1),
             expansion_payback_turns: Some(6),
             required_budget: 6_000,
             allocated_budget: 5_000,
@@ -671,9 +676,11 @@ mod tests {
             operation_ready: false,
             continued_from_existing_squad: true,
         };
+        let mut lower_priority_assignment = assignment.clone();
+        lower_priority_assignment.island_id = IslandId(1);
         let portfolio = IslandCampaignPortfolio {
             islands: vec![assessment],
-            active_offensives: vec![assignment],
+            active_offensives: vec![assignment, lower_priority_assignment],
             defenses: Vec::new(),
         };
 
@@ -695,6 +702,8 @@ mod tests {
             "enemy_arrival_eta",
             "friendly_capture_eta",
             "enemy_capture_eta",
+            "roi_production_sites",
+            "transport_eta",
             "expansion_payback_turns",
             "required_budget",
             "allocated_budget",
@@ -703,7 +712,11 @@ mod tests {
         }
         assert_eq!(island["state"], "OpenNeutral");
         assert_eq!(island["decision"], "Expand");
+        assert_eq!(island["roi_production_sites"], 2);
+        assert_eq!(island["transport_eta"], 1);
 
+        assert_eq!(value["active_offensives"][0]["island_id"], 3);
+        assert_eq!(value["active_offensives"][1]["island_id"], 1);
         let assignment = &value["active_offensives"][0];
         for key in [
             "island_id",

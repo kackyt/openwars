@@ -76,6 +76,8 @@ pub struct IslandCampaignAssessment {
     pub enemy_arrival_eta: Option<u32>,
     pub friendly_capture_eta: Option<u32>,
     pub enemy_capture_eta: Option<u32>,
+    pub roi_production_sites: u32,
+    pub transport_eta: Option<u32>,
     pub expansion_payback_turns: Option<u32>,
     pub required_budget: u32,
     pub allocated_budget: u32,
@@ -1335,6 +1337,8 @@ pub fn assess_island(facts: &IslandCampaignFacts) -> IslandCampaignAssessment {
         enemy_arrival_eta: facts.enemy_arrival_eta,
         friendly_capture_eta: facts.friendly_capture_eta,
         enemy_capture_eta: facts.enemy_capture_eta,
+        roi_production_sites: facts.roi_production_sites,
+        transport_eta: facts.transport_eta,
         expansion_payback_turns,
         required_budget,
         allocated_budget: 0,
@@ -1579,11 +1583,14 @@ mod tests {
 
         let mut open = facts_for_empty_neutral_island();
         open.transport_eta = Some(2);
+        open.roi_production_sites = 2;
         open.capture_turns = 3;
         open.missing_expansion_package_cost = 6_001;
         let expansion = assess_island(&open);
         assert_eq!(expansion.state, IslandCampaignState::OpenNeutral);
         assert_eq!(expansion.decision, IslandCampaignDecision::Expand);
+        assert_eq!(expansion.roi_production_sites, 2);
+        assert_eq!(expansion.transport_eta, Some(2));
         assert_eq!(expansion.expansion_payback_turns, Some(12));
         assert_eq!(
             expansion.decision_reason,
@@ -1659,6 +1666,8 @@ mod tests {
             enemy_arrival_eta: None,
             friendly_capture_eta: None,
             enemy_capture_eta: None,
+            roi_production_sites: 0,
+            transport_eta: None,
             expansion_payback_turns: None,
             required_budget: 0,
             allocated_budget: 0,

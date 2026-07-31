@@ -166,6 +166,27 @@ fn enemy_threatens_property(
 
 /// 現在のマップ状況を分析し、最適な戦略を決定します。
 pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStrategy {
+    analyze_strategy_internal(world, player_id, None)
+}
+
+/// 同一ターンのSquad計画が保存したV3キャンペーンを後続の判断へ再利用する。
+/// 一時cacheがない独立呼び出しでは通常分析へfallbackする。
+pub(crate) fn analyze_strategy_for_turn(
+    world: &mut World,
+    player_id: PlayerId,
+) -> ProductionStrategy {
+    let cached_campaign = world
+        .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+        .and_then(|cache| cache.campaign_portfolio(player_id))
+        .cloned();
+    analyze_strategy_internal(world, player_id, cached_campaign)
+}
+
+fn analyze_strategy_internal(
+    world: &mut World,
+    player_id: PlayerId,
+    cached_campaign: Option<IslandCampaignPortfolio>,
+) -> ProductionStrategy {
     let mut strategy = ProductionStrategy::default();
 
     let mut unowned_properties = Vec::new();
@@ -185,19 +206,23 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
         .map(|settings| settings.get_version(player_id).uses_v3_tactics())
         .unwrap_or(false);
     if is_v3 {
-        // V3のキャンペーン分析はこの呼び出しだけで再構築し、以降は同じ結果を共有する。
-        strategy.campaign_portfolio = analyze_island_campaign(world, player_id);
-        // 診断Resourceは意思決定に戻さず、最後の分析結果だけをプレイヤー別に上書きする。
-        if let Some(mut diagnostics) = world.get_resource_mut::<IslandCampaignDiagnostics>() {
-            diagnostics
-                .by_player
-                .insert(player_id, strategy.campaign_portfolio.clone());
+        if let Some(cached) = cached_campaign {
+            strategy.campaign_portfolio = cached;
         } else {
-            let mut diagnostics = IslandCampaignDiagnostics::default();
-            diagnostics
-                .by_player
-                .insert(player_id, strategy.campaign_portfolio.clone());
-            world.insert_resource(diagnostics);
+            // 通常分析では盤面から再構築し、同じ呼び出し内と診断出力で共有する。
+            strategy.campaign_portfolio = analyze_island_campaign(world, player_id);
+            // 診断Resourceは意思決定に戻さず、最後の分析結果だけをプレイヤー別に上書きする。
+            if let Some(mut diagnostics) = world.get_resource_mut::<IslandCampaignDiagnostics>() {
+                diagnostics
+                    .by_player
+                    .insert(player_id, strategy.campaign_portfolio.clone());
+            } else {
+                let mut diagnostics = IslandCampaignDiagnostics::default();
+                diagnostics
+                    .by_player
+                    .insert(player_id, strategy.campaign_portfolio.clone());
+                world.insert_resource(diagnostics);
+            }
         }
     }
     let mut turn_cache = TurnDistanceCache::default();
@@ -1202,6 +1227,19 @@ mod tests {
             Some(&strategy.campaign_portfolio)
         );
         assert_eq!(diagnostics.by_player.get(&PlayerId(2)), Some(&preserved));
+    }
+
+    #[test]
+    fn v3_turn_strategy_reuses_campaign_cache() {
+        let mut world = setup_v3_portfolio_world(false, 6_000);
+        let cached = IslandCampaignPortfolio::default();
+        let mut cache = crate::ai::engine::AiTurnStrategyCache::default();
+        cache.set_campaign_portfolio(PlayerId(1), cached.clone());
+        world.insert_resource(cache);
+
+        let strategy = analyze_strategy_for_turn(&mut world, PlayerId(1));
+
+        assert_eq!(strategy.campaign_portfolio, cached);
     }
 
     #[test]

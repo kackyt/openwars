@@ -1924,6 +1924,14 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         .get_resource::<crate::ai::ai_version::PlayerAiSettings>()
         .map(|s| s.get_version(perspective_player).uses_v3_tactics())
         .unwrap_or(false);
+    if is_v3 {
+        let mut cache = world
+            .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .unwrap_or_default();
+        cache.set_campaign_portfolio(perspective_player, strategy.campaign_portfolio.clone());
+        cache.mark_squads_planned(perspective_player);
+        world.insert_resource(cache);
+    }
     let paused_campaign_islands = if is_v3 {
         campaign_paused_islands(&strategy.campaign_portfolio)
     } else {
@@ -6289,6 +6297,8 @@ mod tests {
                 enemy_arrival_eta: None,
                 friendly_capture_eta: Some(1),
                 enemy_capture_eta: None,
+                roi_production_sites: 0,
+                transport_eta: None,
                 expansion_payback_turns: None,
                 required_budget: 0,
                 allocated_budget: 0,
@@ -6474,6 +6484,8 @@ mod tests {
                 enemy_arrival_eta: None,
                 friendly_capture_eta: None,
                 enemy_capture_eta: None,
+                roi_production_sites: 0,
+                transport_eta: Some(1),
                 expansion_payback_turns: Some(1),
                 required_budget: 0,
                 allocated_budget: 0,
