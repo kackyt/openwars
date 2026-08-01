@@ -847,27 +847,35 @@ pub fn calculate_unit_score_at(
         }
     }
     // 輸送ユニットの評価（期待状態価値の向上分に基づく）
-    if stats.max_cargo > 0 && !strategy.transport_candidates.is_empty() {
-        let transport_targets = if is_v3 {
-            strategy.campaign_portfolio.offensive_target_positions()
-        } else {
-            strategy.priority_targets.clone()
-        };
+    let transport_targets = if is_v3 {
+        strategy.campaign_portfolio.offensive_target_positions()
+    } else {
+        strategy.priority_targets.clone()
+    };
+    let transport_utility_eligible = if is_v3 {
+        let capacity = sea_transport_capacity_from_slots(unit_type, stats.max_cargo);
+        capacity.0 > 0 || capacity.1 > 0
+    } else {
+        stats.max_cargo > 0
+    };
+    // V3は島嶼攻勢の実目標と海上輸送能力がそろう場合だけutilityを評価する。
+    if transport_utility_eligible
+        && !strategy.transport_candidates.is_empty()
+        && !transport_targets.is_empty()
+    {
         let mut transport_utility: f32 = 0.0;
         for (c_pos, c_stats, c_value) in &strategy.transport_candidates {
             // この輸送ユニットが搭載可能かチェック
             if stats.loadable_unit_types.contains(&c_stats.unit_type) {
-                // 候補ユニットにとっての最寄りのターゲットを特定
-                let mut min_dist_to_target = 999;
-                let mut best_target = GridPosition { x: 0, y: 0 };
-                for target in &transport_targets {
-                    let d = (c_pos.x as i32 - target.x as i32).abs()
-                        + (c_pos.y as i32 - target.y as i32).abs();
-                    if d < min_dist_to_target {
-                        min_dist_to_target = d;
-                        best_target = *target;
-                    }
-                }
+                // 候補ユニットにとっての最寄りの実在ターゲットだけをETA計算へ渡す。
+                let Some(best_target) = transport_targets.iter().min_by_key(|target| {
+                    (c_pos.x as i32 - target.x as i32).abs()
+                        + (c_pos.y as i32 - target.y as i32).abs()
+                }) else {
+                    continue;
+                };
+                let min_dist_to_target = (c_pos.x as i32 - best_target.x as i32).abs()
+                    + (c_pos.y as i32 - best_target.y as i32).abs();
 
                 // 自力ETAの見積もり（海越えなら大きなペナルティ）
                 let mut is_blocked = false;
@@ -1135,7 +1143,7 @@ mod additional_tests {
     use super::*;
     use crate::ai::strategy;
     use crate::components::Health;
-    use crate::resources::{Map, Terrain};
+    use crate::resources::{GridTopology, Map, Terrain};
 
     fn campaign_test_types(master_data: &MasterDataRegistry) -> Vec<(UnitType, UnitStats)> {
         master_data
@@ -1196,6 +1204,140 @@ mod additional_tests {
         assert_eq!(
             select_best_production_candidate(&candidates).unwrap().cost,
             1_000
+        );
+    }
+
+    fn transport_score(
+        unit_type: UnitType,
+        strategy: &ProductionStrategy,
+        map: &Map,
+        is_v3: bool,
+    ) -> u32 {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let stats = master_data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                unit_type.as_str().to_owned(),
+            ))
+            .unwrap();
+        let damage_chart = DamageChart::new();
+        let unit_registry = UnitRegistry(std::collections::HashMap::new());
+        calculate_unit_score_at(
+            unit_type,
+            &stats,
+            GridPosition { x: 0, y: 0 },
+            strategy,
+            &[],
+            &[],
+            &damage_chart,
+            &master_data,
+            map,
+            &unit_registry,
+            Terrain::Factory,
+            0.0,
+            is_v3,
+        )
+    }
+
+    fn transport_test_candidate() -> (GridPosition, UnitStats, f32) {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let infantry = master_data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::Infantry.as_str().to_owned(),
+            ))
+            .unwrap();
+        (GridPosition { x: 0, y: 0 }, infantry, 10_000.0)
+    }
+
+    fn offshore_test_portfolio(
+        target: GridPosition,
+    ) -> crate::ai::island_campaign::IslandCampaignPortfolio {
+        let empty_requirement = crate::ai::island_campaign::IslandCampaignRequirement {
+            preferred_transport: None,
+            transport_slots: 0,
+            capture_units: 0,
+            combat_budget: 0,
+            total_budget: 0,
+        };
+        crate::ai::island_campaign::IslandCampaignPortfolio {
+            islands: Vec::new(),
+            active_offensives: vec![crate::ai::island_campaign::IslandCampaignAssignment {
+                island_id: crate::ai::islands::IslandId(0),
+                decision: crate::ai::island_campaign::IslandCampaignDecision::Expand,
+                target_position: target,
+                requirement: empty_requirement.clone(),
+                purchase_shortfall: empty_requirement,
+                allocated_budget: 0,
+                transport_entities: Vec::new(),
+                capture_entities: Vec::new(),
+                combat_entities: Vec::new(),
+                operation_ready: true,
+                continued_from_existing_squad: false,
+            }],
+            defenses: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn targetless_candidate_does_not_inflate_recon_score() {
+        let map = Map::new(5, 1, Terrain::Plains, GridTopology::Square);
+        let strategy = ProductionStrategy {
+            light_transport_demand: 1,
+            transport_candidates: vec![transport_test_candidate()],
+            ..ProductionStrategy::default()
+        };
+        let mut control = strategy.clone();
+        control.transport_candidates.clear();
+
+        assert_eq!(
+            transport_score(UnitType::Recon, &strategy, &map, true),
+            transport_score(UnitType::Recon, &control, &map, true)
+        );
+    }
+
+    #[test]
+    fn v3_offshore_transport_utility_excludes_ground_carriers() {
+        let target = GridPosition { x: 4, y: 0 };
+        let map = Map::new(5, 1, Terrain::Sea, GridTopology::Square);
+        let strategy = ProductionStrategy {
+            light_transport_demand: 1,
+            heavy_transport_demand: 1,
+            transport_candidates: vec![transport_test_candidate()],
+            campaign_portfolio: offshore_test_portfolio(target),
+            ..ProductionStrategy::default()
+        };
+        let mut control = strategy.clone();
+        control.transport_candidates.clear();
+
+        assert!(
+            transport_score(UnitType::TransportHelicopter, &strategy, &map, true)
+                > transport_score(UnitType::TransportHelicopter, &control, &map, true)
+        );
+        assert!(
+            transport_score(UnitType::Lander, &strategy, &map, true)
+                > transport_score(UnitType::Lander, &control, &map, true)
+        );
+        assert_eq!(
+            transport_score(UnitType::Recon, &strategy, &map, true),
+            transport_score(UnitType::Recon, &control, &map, true)
+        );
+    }
+
+    #[test]
+    fn v1_recon_keeps_ground_transport_utility() {
+        let target = GridPosition { x: 4, y: 0 };
+        let map = Map::new(5, 1, Terrain::Plains, GridTopology::Square);
+        let strategy = ProductionStrategy {
+            priority_targets: vec![target],
+            light_transport_demand: 1,
+            transport_candidates: vec![transport_test_candidate()],
+            ..ProductionStrategy::default()
+        };
+        let mut control = strategy.clone();
+        control.transport_candidates.clear();
+
+        assert!(
+            transport_score(UnitType::Recon, &strategy, &map, false)
+                > transport_score(UnitType::Recon, &control, &map, false)
         );
     }
 

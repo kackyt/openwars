@@ -543,55 +543,48 @@ fn analyze_strategy_internal(
                         | MovementType::Artillery
                 ) && stats.max_cargo == 0
                 {
-                    // 最寄りのターゲットへの距離と「海による遮断」を判定
-                    let mut min_dist = 999;
-                    let mut blocked_by_sea = false;
+                    // 実在する最寄り目標がある場合だけ輸送候補を評価し、目標なしを遠距離扱いしない。
+                    let nearest_target = transport_targets
+                        .iter()
+                        .filter(|target| {
+                            // V2 は既存の侵攻許可を維持する。V3 はallocator確定済み目標を使う。
+                            is_v3
+                                || island_map
+                                    .get_island_at(target)
+                                    .map(|island| {
+                                        allowed_islands.get(&island.id).copied().unwrap_or(true)
+                                    })
+                                    .unwrap_or(true)
+                        })
+                        .map(|target| {
+                            let distance = (pos.x as i32 - target.x as i32).abs()
+                                + (pos.y as i32 - target.y as i32).abs();
+                            (distance, *target)
+                        })
+                        .min_by_key(|(distance, _)| *distance);
+                    let Some((min_dist, nearest_target)) = nearest_target else {
+                        continue;
+                    };
 
-                    for target in &transport_targets {
-                        // V2 は既存の侵攻許可を維持する。V3 は決定済みの単一侵攻目標を使うため、
-                        // 旧ゲートで再度除外して生産と実行を不一致にしない。
-                        if !is_v3
-                            && let Some(target_island_id) =
-                                island_map.get_island_at(target).map(|i| i.id)
-                        {
-                            let allowed = allowed_islands
-                                .get(&target_island_id)
-                                .cloned()
-                                .unwrap_or(true);
-                            if !allowed {
-                                continue;
-                            }
-                        }
-
-                        let dist = (pos.x as i32 - target.x as i32).abs()
-                            + (pos.y as i32 - target.y as i32).abs();
-                        if dist < min_dist {
-                            min_dist = dist;
-
-                            // IslandMap を使って異なる島かどうかを判定（海で遮断されているとみなす）
-                            blocked_by_sea = false;
-                            let my_island_id = get_island_id(pos);
-                            let target_island_id = get_island_id(target);
-                            if my_island_id.is_some()
-                                && target_island_id.is_some()
-                                && my_island_id != target_island_id
+                    // IslandMap を使って異なる島かどうかを判定（海で遮断されているとみなす）
+                    let my_island_id = get_island_id(pos);
+                    let target_island_id = get_island_id(&nearest_target);
+                    let mut blocked_by_sea = my_island_id.is_some()
+                        && target_island_id.is_some()
+                        && my_island_id != target_island_id;
+                    if !blocked_by_sea {
+                        // 同一島IDがない場合（海の上など）や判定できない場合は簡易パスサンプリングでフォールバック
+                        let steps = 4;
+                        for i in 1..steps {
+                            let check_x =
+                                pos.x as i32 + (nearest_target.x as i32 - pos.x as i32) * i / steps;
+                            let check_y =
+                                pos.y as i32 + (nearest_target.y as i32 - pos.y as i32) * i / steps;
+                            if let Some(Terrain::Sea | Terrain::Shoal) =
+                                map.get_terrain(check_x as usize, check_y as usize)
                             {
                                 blocked_by_sea = true;
-                            } else {
-                                // 同一島IDがない場合（海の上など）や判定できない場合は簡易パスサンプリングでフォールバック
-                                let steps = 4;
-                                for i in 1..steps {
-                                    let check_x =
-                                        pos.x as i32 + (target.x as i32 - pos.x as i32) * i / steps;
-                                    let check_y =
-                                        pos.y as i32 + (target.y as i32 - pos.y as i32) * i / steps;
-                                    if let Some(Terrain::Sea | Terrain::Shoal) =
-                                        map.get_terrain(check_x as usize, check_y as usize)
-                                    {
-                                        blocked_by_sea = true;
-                                        break;
-                                    }
-                                }
+                                break;
                             }
                         }
                     }
@@ -716,6 +709,8 @@ fn analyze_strategy_internal(
     }
 
     if is_v3 {
+        let campaign_owns_role_demand = !strategy.campaign_portfolio.defenses.is_empty()
+            || !strategy.campaign_portfolio.active_offensives.is_empty();
         let shortfalls = strategy.campaign_portfolio.aggregate_missing_requirements();
         let mut capture_demand = 0_u32;
         let mut light_transport_demand = 0_u32;
@@ -730,9 +725,13 @@ fn analyze_strategy_internal(
                 heavy_transport_demand.saturating_add(shortfall.heavy_transport_slots);
         }
 
-        strategy.capture_demand = capture_demand;
-        strategy.light_transport_demand = light_transport_demand;
-        strategy.heavy_transport_demand = heavy_transport_demand;
+        // assignmentが存在する間はcampaign側が役割需要を所有する。完全編成済みでshortfallが
+        // 0の場合もgeneric需要へ戻さず、同じ役割の重複生産を防ぐ。
+        if campaign_owns_role_demand {
+            strategy.capture_demand = capture_demand;
+            strategy.light_transport_demand = light_transport_demand;
+            strategy.heavy_transport_demand = heavy_transport_demand;
+        }
         strategy.campaign_shortfalls = shortfalls;
     }
 
@@ -1240,6 +1239,106 @@ mod tests {
         let strategy = analyze_strategy_for_turn(&mut world, PlayerId(1));
 
         assert_eq!(strategy.campaign_portfolio, cached);
+    }
+
+    #[test]
+    fn v3_turn_strategy_preserves_generic_capture_demand_without_campaign_assignments() {
+        let mut world = setup_v3_portfolio_world(false, 6_000);
+        let cached = IslandCampaignPortfolio::default();
+        let mut cache = crate::ai::engine::AiTurnStrategyCache::default();
+        cache.set_campaign_portfolio(PlayerId(1), cached);
+        world.insert_resource(cache);
+
+        let strategy = analyze_strategy_for_turn(&mut world, PlayerId(1));
+
+        assert!(strategy.campaign_portfolio.active_offensives.is_empty());
+        assert!(strategy.campaign_portfolio.defenses.is_empty());
+        assert!(strategy.campaign_shortfalls.is_empty());
+        assert_eq!(strategy.capture_demand, 3);
+    }
+
+    #[test]
+    fn v3_cached_empty_portfolio_does_not_create_targetless_transport_demand() {
+        let mut world = setup_v3_portfolio_world(false, 6_000);
+        install_strategy_scoring_resources(&mut world);
+        let infantry = world
+            .resource::<MasterDataRegistry>()
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::Infantry.as_str().to_owned(),
+            ))
+            .unwrap();
+        world.spawn((Faction(PlayerId(1)), GridPosition { x: 0, y: 0 }, infantry));
+        let cached = IslandCampaignPortfolio::default();
+        let mut cache = crate::ai::engine::AiTurnStrategyCache::default();
+        cache.set_campaign_portfolio(PlayerId(1), cached);
+        world.insert_resource(cache);
+
+        let strategy = analyze_strategy_for_turn(&mut world, PlayerId(1));
+
+        assert!(
+            strategy
+                .campaign_portfolio
+                .offensive_target_positions()
+                .is_empty()
+        );
+        assert!(strategy.transport_candidates.is_empty());
+        assert_eq!(strategy.light_transport_demand, 0);
+        assert_eq!(strategy.heavy_transport_demand, 0);
+        assert_eq!(strategy.capture_demand, 2);
+    }
+
+    #[test]
+    fn v3_turn_strategy_zeroes_generic_demands_for_fully_staffed_campaign() {
+        let mut world = setup_v3_portfolio_world(false, 6_000);
+        install_strategy_scoring_resources(&mut world);
+        let infantry = world
+            .resource::<MasterDataRegistry>()
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::Infantry.as_str().to_owned(),
+            ))
+            .unwrap();
+        world.spawn((Faction(PlayerId(1)), GridPosition { x: 0, y: 0 }, infantry));
+        let target = GridPosition { x: 3, y: 0 };
+        let island_id = world
+            .resource::<crate::ai::islands::IslandMap>()
+            .get_island_at(&target)
+            .unwrap()
+            .id;
+        let empty_requirement = crate::ai::island_campaign::IslandCampaignRequirement {
+            preferred_transport: None,
+            transport_slots: 0,
+            capture_units: 0,
+            combat_budget: 0,
+            total_budget: 0,
+        };
+        let assignment = crate::ai::island_campaign::IslandCampaignAssignment {
+            island_id,
+            decision: crate::ai::island_campaign::IslandCampaignDecision::Expand,
+            target_position: target,
+            requirement: empty_requirement.clone(),
+            purchase_shortfall: empty_requirement,
+            allocated_budget: 0,
+            transport_entities: Vec::new(),
+            capture_entities: Vec::new(),
+            combat_entities: Vec::new(),
+            operation_ready: true,
+            continued_from_existing_squad: false,
+        };
+        let cached = IslandCampaignPortfolio {
+            islands: Vec::new(),
+            active_offensives: vec![assignment],
+            defenses: Vec::new(),
+        };
+        let mut cache = crate::ai::engine::AiTurnStrategyCache::default();
+        cache.set_campaign_portfolio(PlayerId(1), cached);
+        world.insert_resource(cache);
+
+        let strategy = analyze_strategy_for_turn(&mut world, PlayerId(1));
+
+        assert!(strategy.campaign_shortfalls.is_empty());
+        assert_eq!(strategy.capture_demand, 0);
+        assert_eq!(strategy.light_transport_demand, 0);
+        assert_eq!(strategy.heavy_transport_demand, 0);
     }
 
     #[test]
