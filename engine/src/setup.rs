@@ -13,6 +13,7 @@ pub fn create_world() -> (World, Schedule) {
     // Register resources
     world.init_resource::<crate::ai::engine::AiActionCooldown>();
     world.init_resource::<crate::ai::engine::AiProductionCooldown>();
+    world.init_resource::<crate::ai::PlayerAiSettings>();
     world.init_resource::<CombatLedger>();
 
     // Register events
@@ -232,4 +233,20 @@ pub fn initialize_world_from_master_data_with_topology(
     crate::systems::turn_management::advance_next_phase(&mut world);
 
     Ok((world, schedule))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_world_initializes_player_ai_settings() {
+        let (world, _schedule) = create_world();
+
+        assert!(world.contains_resource::<crate::ai::PlayerAiSettings>());
+        assert_eq!(
+            crate::ai::resolve_player_ai_version(&world, PlayerId(1)),
+            crate::ai::AiVersion::V3
+        );
+    }
 }

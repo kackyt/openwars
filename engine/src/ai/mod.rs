@@ -25,4 +25,4 @@ pub mod squad;
 pub mod threat;
 pub mod turn_distance;
 
-pub use ai_version::{AiVersion, PlayerAiSettings};
+pub use ai_version::{AiVersion, PlayerAiSettings, resolve_player_ai_version};

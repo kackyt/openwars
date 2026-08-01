@@ -52,44 +52,20 @@
 
 import * as Comlink from "comlink";
 import { create } from "zustand";
-import { PHASE_P1, PHASE_P2 } from "../constants/mappings";
+import type { PropertyData, TurnInfo, UnitData } from "../types/game";
+import {
+  createDefaultPlayerSettings,
+  isAiPhase,
+  mergeLoadedAiVersions,
+  type PlayerSettings,
+  toWorkerPlayerAiVersions,
+} from "../types/player";
 import type { EngineWorker } from "../worker/engineWorker";
+
+export type { PropertyData, TurnInfo, UnitData } from "../types/game";
 
 /** AIの思考ターンで無限ループに陥らないための最大ループ回数ガード */
 const MAX_AI_ACTION_LOOPS = 100;
-
-/** 現在のフェーズがAIプレイヤーの手番かを判定する */
-const isAiPhase = (phase: string | undefined, p1IsAi: boolean, p2IsAi: boolean): boolean =>
-  (phase === PHASE_P1 && p1IsAi) || (phase === PHASE_P2 && p2IsAi);
-
-export interface UnitData {
-  id: string;
-  type: string;
-  faction: string;
-  x: number;
-  y: number;
-  hp: number;
-  is_loaded: boolean;
-  is_exhausted: boolean;
-  has_moved?: boolean;
-  fuel: { current: number; max: number };
-  weapons: { name: string; ammo: number; max_ammo: number; min_range: number; max_range: number }[];
-}
-
-export interface TurnInfo {
-  turn: number;
-  phase: string;
-  funds: number;
-}
-
-export interface PropertyData {
-  x: number;
-  y: number;
-  type: string;
-  owner: string;
-  capture_points: number;
-  max_capture_points: number;
-}
 
 export interface ActionMenuState {
   x: number;
@@ -113,8 +89,7 @@ export interface ProduceMenuState {
 export interface GameState {
   appState: "menu" | "playing";
   topology: "square" | "hex";
-  p1IsAi: boolean;
-  p2IsAi: boolean;
+  playerSettings: PlayerSettings;
   isEngineReady: boolean;
   engineWorker: Comlink.Remote<EngineWorker> | null;
   mapData: string[][];
@@ -150,12 +125,8 @@ export interface GameState {
   actionMenu: ActionMenuState | null;
 
   // Actions
-  initEngine: (
-    mapName: string,
-    topology: string,
-    p1IsAi: boolean,
-    p2IsAi: boolean,
-  ) => Promise<void>;
+  initEngine: (mapName: string, topology: string, playerSettings: PlayerSettings) => Promise<void>;
+  setPlayerSettings: (playerSettings: PlayerSettings) => void;
   syncGameState: (additionalState?: Partial<GameState>) => Promise<void>;
   tickAiTurn: () => Promise<void>;
   setHoveredCell: (x: number, y: number) => void;
@@ -198,8 +169,7 @@ export interface GameState {
 export const useGameStore = create<GameState>((set, get) => ({
   appState: "menu",
   topology: "square",
-  p1IsAi: false,
-  p2IsAi: false,
+  playerSettings: createDefaultPlayerSettings(),
   isEngineReady: false,
   engineWorker: null,
   mapData: [],
@@ -229,14 +199,18 @@ export const useGameStore = create<GameState>((set, get) => ({
     set({ recentlyDestroyedUnitIds: [] });
   },
 
-  initEngine: async (mapName, topology, p1IsAi, p2IsAi) => {
+  setPlayerSettings: (playerSettings) => {
+    set({ playerSettings });
+  },
+
+  initEngine: async (mapName, topology, playerSettings) => {
     try {
       const worker = new Worker(new URL("../worker/engineWorker.ts", import.meta.url), {
         type: "module",
       });
       const engineClass = Comlink.wrap<typeof EngineWorker>(worker);
       const engineWorker = await new engineClass();
-      await engineWorker.init(mapName, topology);
+      await engineWorker.init(mapName, topology, toWorkerPlayerAiVersions(playerSettings));
 
       // topology パラメータは 'square' | 'hex' のいずれかであることが前提
       // ドメイン上の安全性のため、型アサーションを行っています。
@@ -245,17 +219,13 @@ export const useGameStore = create<GameState>((set, get) => ({
         isEngineReady: true,
         appState: "playing",
         topology: topology as "square" | "hex",
-        p1IsAi,
-        p2IsAi,
+        playerSettings,
       });
       await get().syncGameState();
 
-      const { turnInfo, p1IsAi: isP1Ai, p2IsAi: isP2Ai } = get();
-      if (turnInfo) {
-        const isAiTurn = isAiPhase(turnInfo.phase, isP1Ai, isP2Ai);
-        if (isAiTurn) {
-          await get().tickAiTurn();
-        }
+      const { turnInfo, playerSettings: currentPlayerSettings } = get();
+      if (turnInfo && isAiPhase(turnInfo.phase, currentPlayerSettings)) {
+        await get().tickAiTurn();
       }
     } catch (e) {
       console.error("Failed to initialize engine:", e);
@@ -314,11 +284,11 @@ export const useGameStore = create<GameState>((set, get) => ({
   },
 
   selectUnit: async (unitId: string) => {
-    const { engineWorker, unitData, turnInfo, p1IsAi, p2IsAi } = get();
+    const { engineWorker, unitData, turnInfo, playerSettings } = get();
     if (!engineWorker) return;
     try {
       // AIプレイヤーの手番中はプレイヤー入力を受け付けない
-      if (isAiPhase(turnInfo?.phase, p1IsAi, p2IsAi)) return;
+      if (isAiPhase(turnInfo?.phase, playerSettings)) return;
 
       // 勢力・行動済み・搭載中などのゲームルールは engine の判定を利用する
       if (!(await engineWorker.isUnitSelectable(unitId))) return;
@@ -481,11 +451,11 @@ export const useGameStore = create<GameState>((set, get) => ({
   },
 
   openProduceMenu: async (x: number, y: number, screenX?: number, screenY?: number) => {
-    const { engineWorker, turnInfo, p1IsAi, p2IsAi } = get();
+    const { engineWorker, turnInfo, playerSettings } = get();
     if (!engineWorker) return;
     try {
       // AIプレイヤーの手番中はプレイヤー入力を受け付けない
-      if (isAiPhase(turnInfo?.phase, p1IsAi, p2IsAi)) return;
+      if (isAiPhase(turnInfo?.phase, playerSettings)) return;
 
       // 所有者・地形・占有・生産範囲などは engine が返す生産可能一覧に集約する
       const units = await engineWorker.getProducibleUnits(x, y);
@@ -604,9 +574,9 @@ export const useGameStore = create<GameState>((set, get) => ({
       }
 
       // AIターンはWasm内部でNextPhaseCommandが処理されて終了しているため、直接次のターンの状態を確認する
-      const { turnInfo, p1IsAi, p2IsAi } = get();
+      const { turnInfo, playerSettings } = get();
       if (turnInfo) {
-        const isNextAiTurn = isAiPhase(turnInfo.phase, p1IsAi, p2IsAi);
+        const isNextAiTurn = isAiPhase(turnInfo.phase, playerSettings);
         if (isNextAiTurn) {
           await get().tickAiTurn();
         } else {
@@ -630,9 +600,9 @@ export const useGameStore = create<GameState>((set, get) => ({
       await engineWorker.endTurn();
       await get().syncGameState();
 
-      const { turnInfo, p1IsAi, p2IsAi } = get();
+      const { turnInfo, playerSettings } = get();
       if (turnInfo) {
-        const isAiTurn = isAiPhase(turnInfo.phase, p1IsAi, p2IsAi);
+        const isAiTurn = isAiPhase(turnInfo.phase, playerSettings);
         if (isAiTurn) {
           await get().tickAiTurn();
         } else {
@@ -652,38 +622,28 @@ export const useGameStore = create<GameState>((set, get) => ({
       });
       const engineClass = Comlink.wrap<typeof EngineWorker>(worker);
       const engineWorker = await new engineClass();
+      const currentPlayerSettings = get().playerSettings;
 
-      // Wasmエンジン側で初期化を行ってからインポート
-      await engineWorker.init("map_1", "square");
+      // Wasmエンジン側で初期化を行ってからインポートする。
+      await engineWorker.init("map_1", "square", toWorkerPlayerAiVersions(currentPlayerSettings));
       await engineWorker.importSaveData(saveStr);
-
-      let topology: "square" | "hex" = "square";
-      const parts = saveStr.split(".");
-      if (parts.length === 3 && parts[0] === "OPWS1") {
-        const decoded = JSON.parse(
-          new TextDecoder().decode(
-            new Uint8Array(
-              atob(parts[1])
-                .split("")
-                .map((c) => c.charCodeAt(0)),
-            ),
-          ),
-        );
-        if (decoded.map_topology === "Hex") {
-          topology = "hex";
-        }
-      }
+      const normalizedVersions = await engineWorker.reapplyNormalizedPlayerAiVersions();
+      const playerSettings = mergeLoadedAiVersions(currentPlayerSettings, normalizedVersions);
 
       set({
         engineWorker,
         isEngineReady: true,
         appState: "playing",
-        topology,
-        p1IsAi: false,
-        p2IsAi: true,
+        topology: parseSaveTopology(saveStr),
+        // 操作モードはタイトル画面の既定値を維持し、AIバージョンだけをセーブから復元する。
+        playerSettings,
       });
 
       await get().syncGameState();
+      const { turnInfo } = get();
+      if (turnInfo && isAiPhase(turnInfo.phase, playerSettings)) {
+        await get().tickAiTurn();
+      }
     } catch (e) {
       console.error("initAndLoadSaveString failed:", e);
       throw e;
@@ -708,8 +668,17 @@ export const useGameStore = create<GameState>((set, get) => ({
       const saveStr = localStorage.getItem(`openwars_save_slot_${slotIndex}`);
       if (!saveStr) throw new Error("指定されたスロットにセーブデータがありません。");
       if (engineWorker) {
+        const currentPlayerSettings = get().playerSettings;
         await engineWorker.importSaveData(saveStr);
+        const normalizedVersions = await engineWorker.reapplyNormalizedPlayerAiVersions();
+        const playerSettings = mergeLoadedAiVersions(currentPlayerSettings, normalizedVersions);
+        get().cancelInteraction();
+        set({ playerSettings, topology: parseSaveTopology(saveStr) });
         await get().syncGameState();
+        const { turnInfo } = get();
+        if (turnInfo && isAiPhase(turnInfo.phase, playerSettings)) {
+          await get().tickAiTurn();
+        }
       } else {
         await get().initAndLoadSaveString(saveStr);
       }
@@ -743,8 +712,17 @@ export const useGameStore = create<GameState>((set, get) => ({
     try {
       const saveStr = await file.text();
       if (engineWorker) {
+        const currentPlayerSettings = get().playerSettings;
         await engineWorker.importSaveData(saveStr);
+        const normalizedVersions = await engineWorker.reapplyNormalizedPlayerAiVersions();
+        const playerSettings = mergeLoadedAiVersions(currentPlayerSettings, normalizedVersions);
+        get().cancelInteraction();
+        set({ playerSettings, topology: parseSaveTopology(saveStr) });
         await get().syncGameState();
+        const { turnInfo } = get();
+        if (turnInfo && isAiPhase(turnInfo.phase, playerSettings)) {
+          await get().tickAiTurn();
+        }
       } else {
         await get().initAndLoadSaveString(saveStr);
       }
@@ -783,26 +761,40 @@ interface SaveHeader {
   activePlayer: string;
 }
 
-function parseSaveHeader(saveStr: string): SaveHeader | null {
+interface SavePayload {
+  map_name?: string;
+  map_topology?: string;
+  match_state?: {
+    current_turn_number?: number;
+    active_player_index?: number;
+  };
+  players?: { name?: string }[];
+}
+
+function parseSavePayload(saveStr: string): SavePayload | null {
   try {
     const parts = saveStr.split(".");
     if (parts.length !== 3 || parts[0] !== "OPWS1") return null;
-    const base64Data = parts[1];
-    const binary = atob(base64Data);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    const jsonStr = new TextDecoder().decode(bytes);
-    const val = JSON.parse(jsonStr);
-
-    const mapName = val.map_name || "不明";
-    const turn = val.match_state?.current_turn_number || 0;
-    const activeIdx = val.match_state?.active_player_index || 0;
-    const activePlayer = val.players?.[activeIdx]?.name || "不明";
-
-    return { mapName, turn, activePlayer };
+    const binary = atob(parts[1]);
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    return JSON.parse(new TextDecoder().decode(bytes)) as SavePayload;
   } catch {
     return null;
   }
+}
+
+function parseSaveTopology(saveStr: string): "square" | "hex" {
+  return parseSavePayload(saveStr)?.map_topology === "Hex" ? "hex" : "square";
+}
+
+function parseSaveHeader(saveStr: string): SaveHeader | null {
+  const payload = parseSavePayload(saveStr);
+  if (!payload) return null;
+
+  const mapName = payload.map_name || "不明";
+  const turn = payload.match_state?.current_turn_number || 0;
+  const activeIdx = payload.match_state?.active_player_index || 0;
+  const activePlayer = payload.players?.[activeIdx]?.name || "不明";
+
+  return { mapName, turn, activePlayer };
 }

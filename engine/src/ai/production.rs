@@ -261,10 +261,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
     let map = world.resource::<crate::resources::Map>().clone();
 
     // V3 の生産拡張 (対編成カウンター効率) を有効にするかどうか
-    let is_v3 = world
-        .get_resource::<crate::ai::ai_version::PlayerAiSettings>()
-        .map(|s| s.get_version(player_id).uses_v3_tactics())
-        .unwrap_or(false);
+    let is_v3 = crate::ai::resolve_player_ai_version(world, player_id).uses_v3_tactics();
 
     let (unit_registry, damage_chart, master_data) = {
         let ur = world.get_resource::<UnitRegistry>().cloned();

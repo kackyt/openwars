@@ -519,8 +519,7 @@ pub fn snapshot_island_campaign_for_player(
     world: &World,
     player_id: PlayerId,
 ) -> Option<IslandCampaignSnapshot> {
-    let settings = world.get_resource::<engine::ai::PlayerAiSettings>()?;
-    if !settings.get_version(player_id).uses_v3_tactics() {
+    if !engine::ai::resolve_player_ai_version(world, player_id).uses_v3_tactics() {
         return None;
     }
     world
@@ -769,6 +768,7 @@ mod tests {
         world.insert_resource(diagnostics);
 
         assert!(snapshot_island_campaign_for_player(&world, PlayerId(1)).is_none());
+        assert!(snapshot_island_campaign_for_player(&world, PlayerId(2)).is_some());
 
         let mut settings = engine::ai::PlayerAiSettings::new();
         settings.set_version(PlayerId(2), engine::ai::AiVersion::V1);

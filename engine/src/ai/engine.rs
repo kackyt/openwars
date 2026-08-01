@@ -965,12 +965,7 @@ pub fn execute_ai_command(world: &mut World, unit_entity: Entity, command: AiCom
 /// 何らかの行動を実行した場合はその行動内容（文字列）を `Some` で返し、ターンが終了した場合は `None` を返します。
 /// AIのメイン実行エントリーポイント。
 pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> Option<String> {
-    let ai_version = {
-        let settings = world.get_resource::<crate::ai::ai_version::PlayerAiSettings>();
-        settings
-            .map(|s| s.get_version(active_player))
-            .unwrap_or(crate::ai::ai_version::AiVersion::V3)
-    };
+    let ai_version = crate::ai::resolve_player_ai_version(world, active_player);
 
     match ai_version {
         crate::ai::ai_version::AiVersion::V1 => execute_ai_turn_v1(world, active_player),
@@ -1166,10 +1161,7 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
         skip_entities = res.0.clone();
     }
 
-    let uses_v3 = world
-        .get_resource::<crate::ai::ai_version::PlayerAiSettings>()
-        .map(|settings| settings.get_version(active_player).uses_v3_tactics())
-        .unwrap_or(false);
+    let uses_v3 = crate::ai::resolve_player_ai_version(world, active_player).uses_v3_tactics();
     let should_plan_squads = skip_entities.is_empty()
         && (!uses_v3
             || !world
@@ -1365,10 +1357,7 @@ pub fn decide_ai_action_v2(
     skip_entities: &std::collections::HashSet<Entity>,
 ) -> Option<(Entity, AiCommand)> {
     // V3 の戦術評価 (#44/#45/#50) を有効にするかどうか
-    let is_v3 = world
-        .get_resource::<crate::ai::ai_version::PlayerAiSettings>()
-        .map(|s| s.get_version(player_id).uses_v3_tactics())
-        .unwrap_or(false);
+    let is_v3 = crate::ai::resolve_player_ai_version(world, player_id).uses_v3_tactics();
 
     // 1. 行動可能なユニットを収集
     let mut movable_units = Vec::new();

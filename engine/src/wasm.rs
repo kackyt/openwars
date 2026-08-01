@@ -1,8 +1,12 @@
+use std::collections::BTreeMap;
+
 use bevy_ecs::prelude::*;
 use wasm_bindgen::prelude::*;
 
+use crate::ai::{AiVersion, PlayerAiSettings, resolve_player_ai_version};
 use crate::components::{
-    ActionCompleted, Ammo, CargoCapacity, Faction, Fuel, GridPosition, Health, Property, UnitStats,
+    ActionCompleted, Ammo, CargoCapacity, Faction, Fuel, GridPosition, Health, PlayerId, Property,
+    UnitStats,
 };
 use crate::resources::master_data::MasterDataRegistry;
 use crate::resources::{Map, MatchState, Phase, Players, Terrain};
@@ -33,6 +37,69 @@ impl WasmEngine {
         .map_err(|e| JsValue::from_str(&format!("Failed to init world: {:?}", e)))?;
 
         Ok(WasmEngine { world, schedule })
+    }
+
+    /// フロントエンドから選択可能な公開バージョンはV1/V3に限定します。
+    /// V2は旧セーブの読み込み互換性のためgetterでは返しますが、新規設定は拒否します。
+    pub fn set_player_ai_version(
+        &mut self,
+        player_id: u32,
+        version_str: &str,
+    ) -> Result<(), JsValue> {
+        let version = match version_str {
+            "V1" => AiVersion::V1,
+            "V3" => AiVersion::V3,
+            "V2" => {
+                return Err(JsValue::from_str(
+                    "AI version V2 is load-only and cannot be selected",
+                ));
+            }
+            _ => {
+                return Err(JsValue::from_str(
+                    "Invalid AI version. Expected 'V1' or 'V3'",
+                ));
+            }
+        };
+
+        let player_exists = self
+            .world
+            .get_resource::<Players>()
+            .is_some_and(|players| players.0.iter().any(|player| player.id.0 == player_id));
+        if !player_exists {
+            return Err(JsValue::from_str(&format!(
+                "Player {player_id} does not exist"
+            )));
+        }
+
+        if !self.world.contains_resource::<PlayerAiSettings>() {
+            self.world.insert_resource(PlayerAiSettings::default());
+        }
+        self.world
+            .resource_mut::<PlayerAiSettings>()
+            .set_version(PlayerId(player_id), version);
+        Ok(())
+    }
+
+    /// 全プレイヤーの実効AIバージョンをプレイヤーID順のJSONオブジェクトで返します。
+    pub fn get_player_ai_versions(&self) -> Result<String, JsValue> {
+        let players = self
+            .world
+            .get_resource::<Players>()
+            .ok_or_else(|| JsValue::from_str("Players resource is missing"))?;
+        let versions = players
+            .0
+            .iter()
+            .map(|player| {
+                (
+                    player.id.0,
+                    resolve_player_ai_version(&self.world, player.id),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        serde_json::to_string(&versions).map_err(|error| {
+            JsValue::from_str(&format!("Failed to serialize AI versions: {error}"))
+        })
     }
 
     pub fn get_turn_info(&self) -> JsValue {

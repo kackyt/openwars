@@ -1,7 +1,9 @@
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::clone_on_copy)]
 
-use crate::ai::ai_version::{AiVersion, PlayerAiSettings};
+#[cfg(test)]
+use crate::ai::ai_version::PlayerAiSettings;
+use crate::ai::ai_version::{AiVersion, resolve_player_ai_version};
 
 use crate::components::{Ammo, Faction, GridPosition, Health, PlayerId, Property, UnitStats};
 use crate::resources::{Map, Terrain, master_data::MasterDataRegistry};
@@ -230,12 +232,7 @@ pub fn evaluate_board_with_metrics(
     perspective_player: PlayerId,
     cache: Option<&mut crate::ai::turn_distance::AiTurnCache>,
 ) -> BoardMetrics {
-    let ai_version = {
-        let settings = world.get_resource::<PlayerAiSettings>();
-        settings
-            .map(|s| s.get_version(perspective_player))
-            .unwrap_or(AiVersion::V1)
-    };
+    let ai_version = resolve_player_ai_version(world, perspective_player);
 
     match ai_version {
         AiVersion::V1 => evaluate_board_v1(world, perspective_player),

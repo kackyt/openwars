@@ -1,5 +1,6 @@
 import type { Remote } from "comlink";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createDefaultPlayerSettings } from "../types/player";
 import type { EngineWorker } from "../worker/engineWorker";
 import { useGameStore } from "./gameStore";
 
@@ -14,8 +15,7 @@ describe("gameStore", () => {
       unitData: [],
       propertyData: [],
       turnInfo: null,
-      p1IsAi: false,
-      p2IsAi: false,
+      playerSettings: createDefaultPlayerSettings(),
     });
     useGameStore.getState().cancelInteraction();
   });
@@ -180,7 +180,10 @@ describe("gameStore", () => {
       ]);
       useGameStore.setState({
         turnInfo: { turn: 1, phase: "P1", funds: 1000 },
-        p1IsAi: true,
+        playerSettings: {
+          1: { controlMode: "ai", aiVersion: "V3" },
+          2: { controlMode: "human", aiVersion: "V3" },
+        },
         engineWorker: asEngineWorker({ isUnitSelectable, getProducibleUnits }),
         unitData: [units[1]],
       });
@@ -237,6 +240,46 @@ describe("gameStore", () => {
       expect(state.loadedUnits).toEqual(remainingLoaded);
       expect(state.dropCargoId).toBeNull();
       expect(state.reachableCells).toEqual([]);
+    });
+  });
+
+  describe("save import settings", () => {
+    it("restores normalized AI versions, preserves modes, and resumes an active AI", async () => {
+      const importSaveData = vi.fn(async () => undefined);
+      const reapplyNormalizedPlayerAiVersions = vi.fn(async () => ({
+        1: "V1" as const,
+        2: "V3" as const,
+      }));
+      const tickAiTurn = vi.fn(async () => undefined);
+      const syncGameState = vi.fn(async () => {
+        useGameStore.setState({ turnInfo: { turn: 3, phase: "P2", funds: 2000 } });
+      });
+      const savePayload = btoa(JSON.stringify({ map_topology: "Hex" }));
+      localStorage.setItem("openwars_save_slot_1", `OPWS1.${savePayload}.signature`);
+
+      useGameStore.setState({
+        engineWorker: asEngineWorker({
+          importSaveData,
+          reapplyNormalizedPlayerAiVersions,
+        }),
+        playerSettings: {
+          1: { controlMode: "human", aiVersion: "V3" },
+          2: { controlMode: "ai", aiVersion: "V1" },
+        },
+        syncGameState,
+        tickAiTurn,
+      });
+
+      await useGameStore.getState().loadGame(1);
+
+      expect(importSaveData).toHaveBeenCalledWith(`OPWS1.${savePayload}.signature`);
+      expect(reapplyNormalizedPlayerAiVersions).toHaveBeenCalledOnce();
+      expect(useGameStore.getState().playerSettings).toEqual({
+        1: { controlMode: "human", aiVersion: "V1" },
+        2: { controlMode: "ai", aiVersion: "V3" },
+      });
+      expect(useGameStore.getState().topology).toBe("hex");
+      expect(tickAiTurn).toHaveBeenCalledOnce();
     });
   });
 });

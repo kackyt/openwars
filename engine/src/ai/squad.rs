@@ -1920,10 +1920,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     let enemy_clusters = detect_enemy_clusters(world, perspective_player);
 
     // V3 の戦略拡張 (#53: 敵拠点の奪取目標化) を有効にするかどうか
-    let is_v3 = world
-        .get_resource::<crate::ai::ai_version::PlayerAiSettings>()
-        .map(|s| s.get_version(perspective_player).uses_v3_tactics())
-        .unwrap_or(false);
+    let is_v3 = crate::ai::resolve_player_ai_version(world, perspective_player).uses_v3_tactics();
     if is_v3 {
         let mut cache = world
             .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()

@@ -1,5 +1,11 @@
 import * as Comlink from "comlink";
-import type { PropertyData, TurnInfo, UnitData } from "../store/gameStore";
+import type { PropertyData, TurnInfo, UnitData } from "../types/game";
+import {
+  type LoadedPlayerAiVersionsDto,
+  normalizeLoadedPlayerAiVersions,
+  PLAYER_IDS,
+  type WorkerPlayerAiVersionsDto,
+} from "../types/player";
 import { default as initWasm, WasmEngine } from "../wasm/engine.js";
 import wasmUrl from "../wasm/engine_bg.wasm?url";
 
@@ -16,10 +22,40 @@ export class EngineWorker {
    * Wasm ゲームエンジンを初期化します。
    * @param mapName マップ名
    * @param topology グリッド形式
+   * @param aiVersions プレイヤーごとのAIバージョン
    */
-  async init(mapName: string, topology: string): Promise<void> {
+  async init(
+    mapName: string,
+    topology: string,
+    aiVersions: WorkerPlayerAiVersionsDto,
+  ): Promise<void> {
     await initWasm(wasmUrl);
     this.engine = new WasmEngine(mapName, topology);
+    await this.applyPlayerAiVersions(aiVersions);
+  }
+
+  /** プレイヤーごとのAIバージョンをWasmへ反映します。 */
+  async applyPlayerAiVersions(aiVersions: WorkerPlayerAiVersionsDto): Promise<void> {
+    if (!this.engine) throw new Error("Engine not initialized");
+    for (const playerId of PLAYER_IDS) {
+      this.engine.set_player_ai_version(playerId, aiVersions[playerId]);
+    }
+  }
+
+  /** セーブデータから復元されたAIバージョンを取得します。 */
+  async getPlayerAiVersions(): Promise<LoadedPlayerAiVersionsDto> {
+    if (!this.engine) throw new Error("Engine not initialized");
+    const jsonStr = this.engine.get_player_ai_versions();
+    return JSON.parse(jsonStr as string) as LoadedPlayerAiVersionsDto;
+  }
+
+  /**
+   * 旧セーブのV2をV3へ正規化し、選択可能なバージョンだけをWasmへ再設定します。
+   */
+  async reapplyNormalizedPlayerAiVersions(): Promise<WorkerPlayerAiVersionsDto> {
+    const normalizedVersions = normalizeLoadedPlayerAiVersions(await this.getPlayerAiVersions());
+    await this.applyPlayerAiVersions(normalizedVersions);
+    return normalizedVersions;
   }
 
   /**

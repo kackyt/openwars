@@ -201,10 +201,7 @@ fn analyze_strategy_internal(
             crate::resources::master_data::MasterDataRegistry::load().unwrap_or_default()
         });
     let map = world.resource::<crate::resources::Map>().clone();
-    let is_v3 = world
-        .get_resource::<crate::ai::ai_version::PlayerAiSettings>()
-        .map(|settings| settings.get_version(player_id).uses_v3_tactics())
-        .unwrap_or(false);
+    let is_v3 = crate::ai::resolve_player_ai_version(world, player_id).uses_v3_tactics();
     if is_v3 {
         if let Some(cached) = cached_campaign {
             strategy.campaign_portfolio = cached;
@@ -966,6 +963,10 @@ mod tests {
         world.insert_resource(island_map);
 
         let p1 = PlayerId(1);
+        // このテストはV2の汎用的な海越え需要を検証するため、バージョンを明示します。
+        let mut settings = crate::ai::PlayerAiSettings::default();
+        settings.set_version(p1, crate::ai::AiVersion::V2);
+        world.insert_resource(settings);
 
         // 島Aに自軍の首都を配置
         world.spawn((

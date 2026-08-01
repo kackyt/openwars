@@ -1,10 +1,11 @@
+use crate::ai::{AiVersion, PlayerAiSettings, resolve_player_ai_version};
 use crate::components::*;
 use crate::resources::*;
 use base64::prelude::*;
 use bevy_ecs::prelude::*;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -112,6 +113,12 @@ pub struct CombatLedgerSave {
     pub records: HashMap<u32, CombatRecordSave>,
 }
 
+/// プレイヤーIDをプリミティブ値で保持し、ECSの値オブジェクトをセーブ形式へ漏らさないDTO。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+pub struct PlayerAiVersionsSave {
+    pub by_player: BTreeMap<u32, AiVersion>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct SaveState {
     pub map_name: String,
@@ -127,6 +134,8 @@ pub struct SaveState {
     pub combat_ledger: CombatLedgerSave,
     pub ai_action_cooldown: Vec<uuid::Uuid>,
     pub ai_production_cooldown: Vec<(usize, usize)>,
+    #[serde(default)]
+    pub player_ai_versions: PlayerAiVersionsSave,
 }
 
 /// ワールドの状態を HMAC 署名付きの Base64 文字列（OPWS1.base64.signature）にエクスポートします。
@@ -170,6 +179,19 @@ pub fn export_save_data(world: &mut World, map_name: &str) -> Result<String, Sav
                 funds: p.funds,
             })
             .collect::<Vec<_>>()
+    };
+
+    let player_ai_versions = {
+        let players_res = world
+            .get_resource::<Players>()
+            .ok_or_else(|| SaveError::ResourceNotFound("Players".to_string()))?;
+        // BTreeMapに集約し、プレイヤーID順で安定したセーブ出力にする。
+        let by_player = players_res
+            .0
+            .iter()
+            .map(|player| (player.id.0, resolve_player_ai_version(world, player.id)))
+            .collect::<BTreeMap<_, _>>();
+        PlayerAiVersionsSave { by_player }
     };
 
     let rng_seed = {
@@ -316,6 +338,7 @@ pub fn export_save_data(world: &mut World, map_name: &str) -> Result<String, Sav
         combat_ledger,
         ai_action_cooldown,
         ai_production_cooldown,
+        player_ai_versions,
     };
 
     // 3. JSON シリアライズと Base64 エンコード
@@ -447,6 +470,13 @@ pub fn import_save_data(
         })
         .collect::<Vec<_>>();
     world.insert_resource(Players(players));
+
+    // 旧セーブでは空DTOになり、resolverの既定値V3がそのまま有効になる。
+    let mut player_ai_settings = PlayerAiSettings::default();
+    for (&player_id, &version) in &save_state.player_ai_versions.by_player {
+        player_ai_settings.set_version(PlayerId(player_id), version);
+    }
+    world.insert_resource(player_ai_settings);
 
     // MatchState の復元
     let match_state = MatchState {
@@ -653,6 +683,26 @@ mod tests {
     use super::*;
     use crate::resources::master_data::MasterDataRegistry;
 
+    fn remove_ai_versions_and_resign(save_str: &str) -> String {
+        let parts = save_str.split('.').collect::<Vec<_>>();
+        let decoded = BASE64_STANDARD
+            .decode(parts[1].as_bytes())
+            .expect("セーブJSONをデコードできること");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&decoded).expect("セーブJSONを解析できること");
+        value
+            .as_object_mut()
+            .expect("セーブJSONがオブジェクトであること")
+            .remove("player_ai_versions");
+
+        let legacy_json = serde_json::to_vec(&value).expect("旧形式JSONを生成できること");
+        let base64_data = BASE64_STANDARD.encode(legacy_json);
+        let mut mac = HmacSha256::new_from_slice(get_hmac_key()).expect("HMACを初期化できること");
+        mac.update(base64_data.as_bytes());
+        let signature = BASE64_STANDARD.encode(mac.finalize().into_bytes());
+        format!("OPWS1.{base64_data}.{signature}")
+    }
+
     #[test]
     fn test_save_load_loop() {
         let master_data = MasterDataRegistry::load().expect("Failed to load master data");
@@ -731,6 +781,85 @@ mod tests {
         assert_eq!(imp_pos.x, 1);
         assert_eq!(imp_pos.y, 1);
         assert_eq!(imp_hp.current, 95);
+    }
+
+    #[test]
+    fn player_ai_versions_round_trip_in_player_id_order() {
+        let master_data = MasterDataRegistry::load().expect("Failed to load master data");
+        let (mut world, _schedule) =
+            crate::setup::initialize_world_from_master_data(&master_data, "map_1")
+                .expect("Failed to initialize world");
+
+        world.resource_mut::<Players>().0.extend([
+            Player::new(4, "Player 4".to_string()),
+            Player::new(3, "Player 3".to_string()),
+        ]);
+        let mut settings = PlayerAiSettings::default();
+        settings.set_version(PlayerId(1), AiVersion::V1);
+        settings.set_version(PlayerId(2), AiVersion::V2);
+        settings.set_version(PlayerId(3), AiVersion::V3);
+        world.insert_resource(settings);
+
+        let exported = export_save_data(&mut world, "map_1").expect("Export failed");
+        let encoded = exported.split('.').nth(1).expect("Base64部分があること");
+        let decoded = BASE64_STANDARD
+            .decode(encoded.as_bytes())
+            .expect("セーブJSONをデコードできること");
+        let save_state: SaveState =
+            serde_json::from_slice(&decoded).expect("セーブDTOを解析できること");
+        assert_eq!(
+            save_state
+                .player_ai_versions
+                .by_player
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(save_state.player_ai_versions.by_player[&1], AiVersion::V1);
+        assert_eq!(save_state.player_ai_versions.by_player[&2], AiVersion::V2);
+        assert_eq!(save_state.player_ai_versions.by_player[&3], AiVersion::V3);
+        assert_eq!(save_state.player_ai_versions.by_player[&4], AiVersion::V3);
+
+        let (imported_world, _schedule) =
+            import_save_data(&exported, &master_data).expect("Import failed");
+        assert_eq!(
+            resolve_player_ai_version(&imported_world, PlayerId(1)),
+            AiVersion::V1
+        );
+        assert_eq!(
+            resolve_player_ai_version(&imported_world, PlayerId(2)),
+            AiVersion::V2
+        );
+        assert_eq!(
+            resolve_player_ai_version(&imported_world, PlayerId(3)),
+            AiVersion::V3
+        );
+        assert_eq!(
+            resolve_player_ai_version(&imported_world, PlayerId(4)),
+            AiVersion::V3
+        );
+    }
+
+    #[test]
+    fn legacy_save_without_ai_versions_defaults_to_v3() {
+        let master_data = MasterDataRegistry::load().expect("Failed to load master data");
+        let (mut world, _schedule) =
+            crate::setup::initialize_world_from_master_data(&master_data, "map_1")
+                .expect("Failed to initialize world");
+        let exported = export_save_data(&mut world, "map_1").expect("Export failed");
+        let legacy_save = remove_ai_versions_and_resign(&exported);
+
+        let (imported_world, _schedule) =
+            import_save_data(&legacy_save, &master_data).expect("Legacy import failed");
+        assert_eq!(
+            resolve_player_ai_version(&imported_world, PlayerId(1)),
+            AiVersion::V3
+        );
+        assert_eq!(
+            resolve_player_ai_version(&imported_world, PlayerId(2)),
+            AiVersion::V3
+        );
     }
 
     #[test]
