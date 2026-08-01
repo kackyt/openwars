@@ -1406,6 +1406,19 @@ fn contested_is_competitive(facts: &IslandCampaignFacts) -> bool {
         })
 }
 
+/// 占領対象を持つ陸塊が1つだけなら、通常の地上戦略へ委譲すべき主陸塊として返す。
+fn sole_capturable_landmass_id(facts: &[IslandCampaignFacts]) -> Option<IslandId> {
+    let mut capturable_landmasses = facts
+        .iter()
+        .filter(|facts| facts.capturable_properties > 0)
+        .map(|facts| facts.island_id);
+    let sole_landmass = capturable_landmasses.next()?;
+    capturable_landmasses
+        .next()
+        .is_none()
+        .then_some(sole_landmass)
+}
+
 fn requirement_for_assessment(
     facts: &IslandCampaignFacts,
     assessment: &mut crate::ai::island_campaign::IslandCampaignAssessment,
@@ -1801,6 +1814,7 @@ pub fn analyze_island_campaign(world: &mut World, player_id: PlayerId) -> Island
         available_funds,
     );
 
+    let sole_capturable_landmass = sole_capturable_landmass_id(&facts);
     let facts_by_island: HashMap<_, _> = facts
         .iter()
         .map(|island_facts| (island_facts.island_id, island_facts))
@@ -1813,7 +1827,25 @@ pub fn analyze_island_campaign(world: &mut World, player_id: PlayerId) -> Island
             continue;
         };
         let mut assessment = assess_island(island_facts);
-        let requirement = requirement_for_assessment(island_facts, &mut assessment);
+        let requirement = if sole_capturable_landmass == Some(island.id)
+            && assessment.state == IslandCampaignState::Contested
+        {
+            // 単一の主陸塊で起きる通常戦闘は島嶼作戦へ資源を予約せず、地上戦略へ委譲する。
+            assessment.decision = IslandCampaignDecision::Observe;
+            assessment.decision_reason =
+                "単一の占領対象陸塊は通常の地上戦略で処理するため監視する".to_owned();
+            assessment.required_budget = 0;
+            assessment.allocated_budget = 0;
+            IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 0,
+                combat_budget: 0,
+                total_budget: 0,
+            }
+        } else {
+            requirement_for_assessment(island_facts, &mut assessment)
+        };
         let existing_operation = operations_by_island.get(&island.id).cloned();
         let Some(target_position) =
             candidate_target_position(&island, &properties, player_id, existing_operation.as_ref())
@@ -1971,6 +2003,78 @@ mod tests {
         );
         assert!(portfolio.active_offensives.len() <= 3);
         assert!(portfolio.defenses.is_empty());
+    }
+
+    #[test]
+    fn sole_mainland_contested_is_observed_without_campaign_allocation() {
+        let master_data = MasterDataRegistry::load().expect("master data should load");
+        let (mut world, _schedule) =
+            crate::setup::initialize_world_from_master_data(&master_data, "map_1")
+                .expect("test world should initialize");
+        let entities: Vec<Entity> = world.query::<Entity>().iter(&world).collect();
+        for entity in entities {
+            world.despawn(entity);
+        }
+
+        let player = PlayerId(1);
+        let enemy = PlayerId(2);
+        let own_position = GridPosition { x: 1, y: 1 };
+        let center = GridPosition { x: 2, y: 1 };
+        let enemy_position = GridPosition { x: 3, y: 1 };
+        let mut map = Map::new(5, 3, Terrain::Sea, GridTopology::Square);
+        map.set_terrain(own_position.x, own_position.y, Terrain::Capital)
+            .unwrap();
+        map.set_terrain(center.x, center.y, Terrain::Plains)
+            .unwrap();
+        map.set_terrain(enemy_position.x, enemy_position.y, Terrain::City)
+            .unwrap();
+        let island_map = IslandMap::analyze(&map);
+        let mainland = island_map.get_island_at(&own_position).unwrap().id;
+        world.insert_resource(map);
+        world.insert_resource(island_map);
+        world.insert_resource(GameRng::new(TEST_SEED));
+        world.insert_resource(MatchState::default());
+
+        world.spawn((
+            own_position,
+            Property::new(Terrain::Capital, Some(player), 100),
+        ));
+        world.spawn((
+            enemy_position,
+            Property::new(Terrain::City, Some(enemy), 100),
+        ));
+        let infantry = master_data
+            .create_unit_stats(&UnitName(UnitType::Infantry.as_str().to_owned()))
+            .expect("infantry stats should exist");
+        let tank = master_data
+            .create_unit_stats(&UnitName(UnitType::Tank.as_str().to_owned()))
+            .expect("tank stats should exist");
+        spawn_test_unit(&mut world, player, own_position, infantry);
+        spawn_test_unit(&mut world, enemy, enemy_position, tank);
+
+        let facts = collect_island_campaign_facts(&mut world, player);
+        assert_eq!(sole_capturable_landmass_id(&facts), Some(mainland));
+        let mainland_facts = facts
+            .iter()
+            .find(|facts| facts.island_id == mainland)
+            .expect("mainland facts should exist");
+        assert!(mainland_facts.enemy_combat_value > mainland_facts.friendly_combat_value);
+
+        let portfolio = analyze_island_campaign(&mut world, player);
+        let assessment = portfolio
+            .islands
+            .iter()
+            .find(|assessment| assessment.island_id == mainland)
+            .expect("mainland assessment should remain visible");
+
+        assert_eq!(assessment.state, IslandCampaignState::Contested);
+        assert_eq!(assessment.decision, IslandCampaignDecision::Observe);
+        assert_eq!(assessment.required_budget, 0);
+        assert_eq!(assessment.allocated_budget, 0);
+        assert!(portfolio.assignment_for(mainland).is_none());
+        assert!(portfolio.active_offensives.is_empty());
+        assert!(portfolio.defenses.is_empty());
+        assert!(portfolio.aggregate_missing_requirements().is_empty());
     }
 
     #[test]

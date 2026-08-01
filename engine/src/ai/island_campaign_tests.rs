@@ -662,9 +662,12 @@ fn secure_does_not_assign_a_disconnected_capture_unit() {
 fn contest_assigns_distinct_local_capture_and_attack_responsibilities() {
     let (mut world, master_data, player) = empty_v3_world();
     let opponent = PlayerId(2);
+    let home = GridPosition { x: 0, y: 0 };
     let neutral = GridPosition { x: 1, y: 1 };
     let staging = GridPosition { x: 2, y: 1 };
     let mut map = Map::new(4, 3, Terrain::Sea, GridTopology::Square);
+    // Contest責務は複数の占領対象陸塊がある島嶼マップでのみ有効であることを明示する。
+    map.set_terrain(home.x, home.y, Terrain::City).unwrap();
     map.set_terrain(neutral.x, neutral.y, Terrain::City)
         .unwrap();
     map.set_terrain(staging.x, staging.y, Terrain::Plains)
@@ -673,6 +676,7 @@ fn contest_assigns_distinct_local_capture_and_attack_responsibilities() {
     let island = island_map.get_island_at(&neutral).unwrap().id;
     world.insert_resource(map);
     world.insert_resource(island_map);
+    world.spawn((home, Property::new(Terrain::City, Some(player), 100)));
     world.spawn((neutral, Property::new(Terrain::City, None, 100)));
     let capture = spawn_master_unit(
         &mut world,
