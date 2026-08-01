@@ -1,4 +1,5 @@
 use bevy_ecs::prelude::*;
+use engine::ai::{AiVersion, PlayerAiSettings, resolve_player_ai_version};
 use engine::components::{
     ActionCompleted, CargoCapacity, Faction, Fuel, GridPosition, HasMoved, Property, Transporting,
     UnitStats,
@@ -115,6 +116,37 @@ pub enum PlayerControlType {
     Ai,
 }
 
+/// CLIで選択可能なAIバージョン。V2は互換用としてエンジン内に残し、画面には公開しません。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliAiVersion {
+    V1,
+    V3,
+}
+
+impl CliAiVersion {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::V1 => "V1",
+            Self::V3 => "V3",
+        }
+    }
+
+    fn to_engine(self) -> AiVersion {
+        match self {
+            Self::V1 => AiVersion::V1,
+            Self::V3 => AiVersion::V3,
+        }
+    }
+
+    /// V2セーブをCLIで開いた場合は、選択肢に存在する最新系列のV3へ正規化します。
+    fn from_engine(version: AiVersion) -> Self {
+        match version {
+            AiVersion::V1 => Self::V1,
+            AiVersion::V2 | AiVersion::V3 => Self::V3,
+        }
+    }
+}
+
 pub struct UiState {
     pub current_screen: CurrentScreen,
     pub in_game_state: InGameState,
@@ -124,6 +156,8 @@ pub struct UiState {
     pub selected_topology: GridTopology,
     // In-game state
     pub player_controls: std::collections::HashMap<u32, PlayerControlType>,
+    /// Humanへ切り替えた後も、次に使用するAIバージョンを保持します。
+    pub player_ai_versions: std::collections::HashMap<u32, CliAiVersion>,
     pub cursor_pos: (usize, usize),
     pub log_messages: Vec<String>,
 }
@@ -134,6 +168,10 @@ impl UiState {
         controls.insert(1, PlayerControlType::Human);
         controls.insert(2, PlayerControlType::Ai);
 
+        let mut ai_versions = std::collections::HashMap::new();
+        ai_versions.insert(1, CliAiVersion::V3);
+        ai_versions.insert(2, CliAiVersion::V3);
+
         Self {
             current_screen: CurrentScreen::MapSelection,
             in_game_state: InGameState::Normal,
@@ -141,6 +179,7 @@ impl UiState {
             available_maps: maps,
             selected_topology: GridTopology::Square,
             player_controls: controls,
+            player_ai_versions: ai_versions,
             cursor_pos: (0, 0),
             log_messages: Vec::new(),
         }
@@ -167,6 +206,109 @@ impl UiState {
         self.player_controls
             .values()
             .any(|v| *v == PlayerControlType::Human)
+    }
+
+    pub fn ai_version(&self, player_id: u32) -> CliAiVersion {
+        self.player_ai_versions
+            .get(&player_id)
+            .copied()
+            .unwrap_or(CliAiVersion::V3)
+    }
+
+    pub fn control_label(&self, player_id: u32) -> String {
+        if self.is_human(player_id) {
+            "Human".to_string()
+        } else {
+            format!("AI({})", self.ai_version(player_id).label())
+        }
+    }
+
+    /// マップ選択画面ではHuman、V1、V3の順で操作主体とバージョンをまとめて切り替えます。
+    fn cycle_player_setup(&mut self, player_id: u32) {
+        let control = self
+            .player_controls
+            .get(&player_id)
+            .copied()
+            .unwrap_or(PlayerControlType::Human);
+        let version = self.ai_version(player_id);
+
+        match (control, version) {
+            (PlayerControlType::Human, _) => {
+                self.player_controls
+                    .insert(player_id, PlayerControlType::Ai);
+                self.player_ai_versions.insert(player_id, CliAiVersion::V1);
+            }
+            (PlayerControlType::Ai, CliAiVersion::V1) => {
+                self.player_ai_versions.insert(player_id, CliAiVersion::V3);
+            }
+            (PlayerControlType::Ai, CliAiVersion::V3) => {
+                self.player_controls
+                    .insert(player_id, PlayerControlType::Human);
+            }
+        }
+    }
+
+    /// インゲームの切り替えでは、選択済みAIバージョンを変更しません。
+    fn toggle_player_control(&mut self, player_id: u32) -> PlayerControlType {
+        let next = if self.is_human(player_id) {
+            PlayerControlType::Ai
+        } else {
+            PlayerControlType::Human
+        };
+        self.player_controls.insert(player_id, next);
+        self.player_ai_versions
+            .entry(player_id)
+            .or_insert(CliAiVersion::V3);
+        next
+    }
+
+    /// CLIで記憶している全プレイヤーのバージョンをECSリソースへ反映します。
+    fn apply_ai_versions_to_world(&self, world: &mut World) {
+        let player_ids = world
+            .get_resource::<Players>()
+            .map(|players| {
+                players
+                    .0
+                    .iter()
+                    .map(|player| player.id.0)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        if !world.contains_resource::<PlayerAiSettings>() {
+            world.insert_resource(PlayerAiSettings::default());
+        }
+        let mut settings = world.resource_mut::<PlayerAiSettings>();
+        for player_id in player_ids {
+            settings.set_version(
+                engine::components::PlayerId(player_id),
+                self.ai_version(player_id).to_engine(),
+            );
+        }
+    }
+
+    /// セーブから復元した実効バージョンをCLI状態へ取り込み、V2だけはV3へ正規化します。
+    fn adopt_ai_versions_from_world(&mut self, world: &mut World) {
+        let versions = world
+            .get_resource::<Players>()
+            .map(|players| {
+                players
+                    .0
+                    .iter()
+                    .map(|player| {
+                        (
+                            player.id.0,
+                            CliAiVersion::from_engine(resolve_player_ai_version(world, player.id)),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        for (player_id, version) in versions {
+            self.player_ai_versions.insert(player_id, version);
+        }
+        self.apply_ai_versions_to_world(world);
     }
 }
 
@@ -226,36 +368,8 @@ impl App {
                 self.ui_state.selected_map_index += 1;
             }
             KeyCode::Down | KeyCode::Char('j') => {}
-            KeyCode::Char('1') => {
-                let current = self
-                    .ui_state
-                    .player_controls
-                    .get(&1)
-                    .copied()
-                    .unwrap_or(PlayerControlType::Human);
-                self.ui_state.player_controls.insert(
-                    1,
-                    match current {
-                        PlayerControlType::Human => PlayerControlType::Ai,
-                        PlayerControlType::Ai => PlayerControlType::Human,
-                    },
-                );
-            }
-            KeyCode::Char('2') => {
-                let current = self
-                    .ui_state
-                    .player_controls
-                    .get(&2)
-                    .copied()
-                    .unwrap_or(PlayerControlType::Ai);
-                self.ui_state.player_controls.insert(
-                    2,
-                    match current {
-                        PlayerControlType::Human => PlayerControlType::Ai,
-                        PlayerControlType::Ai => PlayerControlType::Human,
-                    },
-                );
-            }
+            KeyCode::Char('1') => self.ui_state.cycle_player_setup(1),
+            KeyCode::Char('2') => self.ui_state.cycle_player_setup(2),
             // グリッド形状（スクエア/ヘックス）の切り替え
             KeyCode::Char('t') => {
                 self.ui_state.selected_topology = match self.ui_state.selected_topology {
@@ -361,12 +475,14 @@ impl App {
 
     pub fn load_game_from_file(&mut self, path: &str) -> anyhow::Result<()> {
         let save_str = std::fs::read_to_string(path)?;
-        let (world, schedule) = engine::serialize::import_save_data(&save_str, &self.master_data)?;
+        let (mut world, schedule) =
+            engine::serialize::import_save_data(&save_str, &self.master_data)?;
 
-        // 読み込んだマップのトポロジーを App の UI 状態に同期する
+        // 読み込んだマップのトポロジーとAIバージョンをAppのUI状態に同期する
         if let Some(map) = world.get_resource::<engine::resources::Map>() {
             self.ui_state.selected_topology = map.topology;
         }
+        self.ui_state.adopt_ai_versions_from_world(&mut world);
 
         self.world = Some(world);
         self.schedule = Some(schedule);
@@ -1395,19 +1511,21 @@ impl App {
             && let Some(active_player) = players.0.get(match_state.active_player_index.0)
         {
             let pid = active_player.id.0;
-            let ctrl = self
-                .ui_state
-                .player_controls
-                .entry(pid)
-                .or_insert(PlayerControlType::Human);
-            *ctrl = match *ctrl {
-                PlayerControlType::Human => PlayerControlType::Ai,
-                PlayerControlType::Ai => PlayerControlType::Human,
-            };
-            let new_ctrl = *ctrl;
+            let new_ctrl = self.ui_state.toggle_player_control(pid);
+            if let Some(world) = &mut self.world {
+                self.ui_state.apply_ai_versions_to_world(world);
+            }
 
-            self.ui_state
-                .add_log(format!("Player {} is now {:?}", pid, new_ctrl));
+            self.ui_state.add_log(format!(
+                "Player {} is now {}",
+                pid,
+                match new_ctrl {
+                    PlayerControlType::Human => "Human".to_string(),
+                    PlayerControlType::Ai => {
+                        format!("AI({})", self.ui_state.ai_version(pid).label())
+                    }
+                }
+            ));
         }
 
         match self.ui_state.current_screen {
@@ -1451,11 +1569,12 @@ impl App {
         // Add game logic systems (order is managed by engine)
         add_main_game_systems(&mut schedule);
 
-        let (world, schedule) = initialize_world_from_master_data_with_topology(
+        let (mut world, schedule) = initialize_world_from_master_data_with_topology(
             &self.master_data,
             &map_name,
             self.ui_state.selected_topology,
         )?;
+        self.ui_state.apply_ai_versions_to_world(&mut world);
 
         self.world = Some(world);
         self.schedule = Some(schedule);
@@ -1468,5 +1587,88 @@ impl App {
         self.ui_state.current_screen = CurrentScreen::MapSelection;
         self.ui_state.in_game_state = InGameState::Normal;
         self.ui_state.cursor_pos = (0, 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engine::resources::Player;
+
+    #[test]
+    fn default_player_setup_is_human_and_v3_ai() {
+        let state = UiState::new(vec!["map_1".to_string()]);
+
+        assert!(state.is_human(1));
+        assert!(!state.is_human(2));
+        assert_eq!(state.ai_version(1), CliAiVersion::V3);
+        assert_eq!(state.ai_version(2), CliAiVersion::V3);
+        assert_eq!(state.control_label(2), "AI(V3)");
+    }
+
+    #[test]
+    fn map_selection_cycles_human_v1_v3() {
+        let mut state = UiState::new(vec![]);
+
+        state.cycle_player_setup(1);
+        assert!(!state.is_human(1));
+        assert_eq!(state.ai_version(1), CliAiVersion::V1);
+
+        state.cycle_player_setup(1);
+        assert!(!state.is_human(1));
+        assert_eq!(state.ai_version(1), CliAiVersion::V3);
+
+        state.cycle_player_setup(1);
+        assert!(state.is_human(1));
+    }
+
+    #[test]
+    fn in_game_toggle_preserves_selected_version() {
+        let mut state = UiState::new(vec![]);
+        state.cycle_player_setup(1);
+
+        assert_eq!(state.toggle_player_control(1), PlayerControlType::Human);
+        assert_eq!(state.toggle_player_control(1), PlayerControlType::Ai);
+        assert_eq!(state.ai_version(1), CliAiVersion::V1);
+    }
+
+    #[test]
+    fn ui_versions_are_applied_to_world() {
+        let mut state = UiState::new(vec![]);
+        state.cycle_player_setup(1);
+        let mut world = World::new();
+        world.insert_resource(Players(vec![
+            Player::new(1, "Player 1".to_string()),
+            Player::new(2, "Player 2".to_string()),
+        ]));
+
+        state.apply_ai_versions_to_world(&mut world);
+
+        assert_eq!(
+            resolve_player_ai_version(&world, engine::components::PlayerId(1)),
+            AiVersion::V1
+        );
+        assert_eq!(
+            resolve_player_ai_version(&world, engine::components::PlayerId(2)),
+            AiVersion::V3
+        );
+    }
+
+    #[test]
+    fn loaded_v2_is_normalized_to_v3_for_cli() {
+        let mut state = UiState::new(vec![]);
+        let mut world = World::new();
+        world.insert_resource(Players(vec![Player::new(2, "Player 2".to_string())]));
+        let mut settings = PlayerAiSettings::default();
+        settings.set_version(engine::components::PlayerId(2), AiVersion::V2);
+        world.insert_resource(settings);
+
+        state.adopt_ai_versions_from_world(&mut world);
+
+        assert_eq!(state.ai_version(2), CliAiVersion::V3);
+        assert_eq!(
+            resolve_player_ai_version(&world, engine::components::PlayerId(2)),
+            AiVersion::V3
+        );
     }
 }

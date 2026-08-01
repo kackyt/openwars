@@ -16,13 +16,6 @@ pub struct Objective {
     pub needed_infantry: InfantryCount, // この島を制圧するために必要な歩兵の数
 }
 
-/// V3 が同時に1つだけ保持する敵島侵攻の戦略目標。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InvasionTarget {
-    pub target_island: IslandId,
-    pub target_position: GridPosition,
-}
-
 use crate::resources::master_data::MasterDataRegistry;
 
 impl Objective {

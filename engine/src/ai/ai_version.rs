@@ -53,3 +53,61 @@ impl PlayerAiSettings {
             .unwrap_or(AiVersion::V3)
     }
 }
+
+/// World上の設定リソースとプレイヤー個別設定の有無を吸収し、有効なAIバージョンを返します。
+/// 古いセーブや最小構成のテストWorldでも、未設定時は一貫してV3として扱います。
+pub fn resolve_player_ai_version(world: &World, player_id: PlayerId) -> AiVersion {
+    world
+        .get_resource::<PlayerAiSettings>()
+        .map(|settings| settings.get_version(player_id))
+        .unwrap_or(AiVersion::V3)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolver_defaults_to_v3_without_resource() {
+        let world = World::new();
+
+        assert_eq!(
+            resolve_player_ai_version(&world, PlayerId(1)),
+            AiVersion::V3
+        );
+    }
+
+    #[test]
+    fn resolver_defaults_to_v3_for_empty_settings() {
+        let mut world = World::new();
+        world.insert_resource(PlayerAiSettings::default());
+
+        assert_eq!(
+            resolve_player_ai_version(&world, PlayerId(1)),
+            AiVersion::V3
+        );
+    }
+
+    #[test]
+    fn resolver_preserves_explicit_versions() {
+        let mut world = World::new();
+        let mut settings = PlayerAiSettings::default();
+        settings.set_version(PlayerId(1), AiVersion::V1);
+        settings.set_version(PlayerId(2), AiVersion::V2);
+        settings.set_version(PlayerId(3), AiVersion::V3);
+        world.insert_resource(settings);
+
+        assert_eq!(
+            resolve_player_ai_version(&world, PlayerId(1)),
+            AiVersion::V1
+        );
+        assert_eq!(
+            resolve_player_ai_version(&world, PlayerId(2)),
+            AiVersion::V2
+        );
+        assert_eq!(
+            resolve_player_ai_version(&world, PlayerId(3)),
+            AiVersion::V3
+        );
+    }
+}

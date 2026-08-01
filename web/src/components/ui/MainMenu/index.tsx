@@ -2,6 +2,13 @@ import { Button, Container, Group, Paper, Select, Stack, Title } from "@mantine/
 import { useState } from "react";
 import { MAIN_MENU_MARGIN_TOP } from "../../../constants/rendering";
 import { useGameStore } from "../../../store/gameStore";
+import {
+  applyPlayerMenuValue,
+  PLAYER_MENU_OPTIONS,
+  type PlayerId,
+  type PlayerMenuValue,
+  toPlayerMenuValue,
+} from "../../../types/player";
 import { SaveLoadModal } from "../SaveLoadModal";
 
 /**
@@ -11,18 +18,26 @@ import { SaveLoadModal } from "../SaveLoadModal";
 export const MainMenu = () => {
   // Zustand のセレクタを用いて initEngine のみを取得する
   const initEngine = useGameStore((state) => state.initEngine);
+  const playerSettings = useGameStore((state) => state.playerSettings);
+  const setPlayerSettings = useGameStore((state) => state.setPlayerSettings);
 
   const [mapName, setMapName] = useState("map_1");
   const [topology, setTopology] = useState("square");
-  const [p1Type, setP1Type] = useState("player");
-  const [p2Type, setP2Type] = useState("ai");
   const [isLoading, setIsLoading] = useState(false);
   const [loadOpened, setLoadOpened] = useState(false);
+
+  const updatePlayerSelection = (playerId: PlayerId, value: string | null) => {
+    const menuValue = (value || "Human") as PlayerMenuValue;
+    setPlayerSettings({
+      ...playerSettings,
+      [playerId]: applyPlayerMenuValue(playerSettings[playerId], menuValue),
+    });
+  };
 
   /** ゲームを開始する */
   const handleStart = async () => {
     setIsLoading(true);
-    await initEngine(mapName, topology, p1Type === "ai", p2Type === "ai");
+    await initEngine(mapName, topology, playerSettings);
     setIsLoading(false);
   };
 
@@ -54,21 +69,17 @@ export const MainMenu = () => {
           <Group grow>
             <Select
               label="Player 1 (Green)"
-              data={[
-                { value: "player", label: "Human" },
-                { value: "ai", label: "AI" },
-              ]}
-              value={p1Type}
-              onChange={(val) => setP1Type(val || "player")}
+              data={[...PLAYER_MENU_OPTIONS]}
+              value={toPlayerMenuValue(playerSettings[1])}
+              onChange={(value) => updatePlayerSelection(1, value)}
+              allowDeselect={false}
             />
             <Select
               label="Player 2 (Blue)"
-              data={[
-                { value: "player", label: "Human" },
-                { value: "ai", label: "AI" },
-              ]}
-              value={p2Type}
-              onChange={(val) => setP2Type(val || "player")}
+              data={[...PLAYER_MENU_OPTIONS]}
+              value={toPlayerMenuValue(playerSettings[2])}
+              onChange={(value) => updatePlayerSelection(2, value)}
+              allowDeselect={false}
             />
           </Group>
 

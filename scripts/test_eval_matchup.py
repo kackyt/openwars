@@ -1,6 +1,18 @@
+import json
+import subprocess
+import sys
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
-from scripts.eval_matchup import analyze_issue54_game, judge_issue54_criteria
+from scripts import eval_issue58, eval_matchup
+from scripts.eval_matchup import (
+    analyze_issue54_game,
+    build_match_specs,
+    judge_issue54_criteria,
+    run_single_game,
+)
 
 
 def make_game(p1="V3", p2="V2", events=None, history=None):
@@ -123,6 +135,422 @@ class Issue54EvaluatorTests(unittest.TestCase):
         overall, rows, _ = judge_issue54_criteria([first, second])
         self.assertTrue(overall)
         self.assertEqual({"先攻", "後攻"}, {row["order"] for row in rows})
+
+
+class MatchSchedulingTests(unittest.TestCase):
+    def test_build_match_specs_runs_each_seed_in_both_orders(self):
+        specs = build_match_specs(("map_3",), "V3", "V2", (11, 22))
+        self.assertEqual(
+            [
+                {"map": "map_3", "p1": "V3", "p2": "V2", "seed": 11},
+                {"map": "map_3", "p1": "V2", "p2": "V3", "seed": 11},
+                {"map": "map_3", "p1": "V3", "p2": "V2", "seed": 22},
+                {"map": "map_3", "p1": "V2", "p2": "V3", "seed": 22},
+            ],
+            specs,
+        )
+
+
+class Issue58PortfolioSchedulingTests(unittest.TestCase):
+    def test_v3_v1_protocol_builds_24_games_in_both_orders(self):
+        specs = eval_matchup.build_issue58_match_specs(
+            "v3-v1",
+            ("map_1", "map_2", "map_3"),
+            (58001, 58002, 58003, 58004),
+        )
+
+        self.assertEqual(len(specs), 24)
+        self.assertEqual(
+            specs[:2],
+            [
+                {"map": "map_1", "p1": "V3", "p2": "V1", "seed": 58001},
+                {"map": "map_1", "p1": "V1", "p2": "V3", "seed": 58001},
+            ],
+        )
+
+    def test_v3_selfplay_protocol_builds_one_game_per_seed(self):
+        specs = eval_matchup.build_issue58_match_specs(
+            "v3-selfplay",
+            ("map_3",),
+            (58001, 58002, 58003, 58004),
+        )
+
+        self.assertEqual(len(specs), 4)
+        self.assertTrue(all(spec["p1"] == spec["p2"] == "V3" for spec in specs))
+        self.assertEqual(
+            [spec["seed"] for spec in specs],
+            [58001, 58002, 58003, 58004],
+        )
+
+    def test_selfplay_rejects_maps_other_than_map_3(self):
+        with self.assertRaisesRegex(ValueError, "map_3 only"):
+            eval_issue58.validate_issue58_run(
+                "v3-selfplay",
+                "baseline",
+                ("map_1", "map_3"),
+                "V3",
+                "V3",
+                30,
+                (58001, 58002, 58003, 58004),
+                "selfplay.md",
+                "selfplay.json",
+            )
+
+
+class Issue58CliTests(unittest.TestCase):
+    def run_issue58_main(
+        self,
+        directory,
+        protocol="v3-v1",
+        artifact_stage="baseline",
+        runtime_error=None,
+        criteria_pass=False,
+        criteria_complete=False,
+    ):
+        maps = "map_1,map_2,map_3" if protocol == "v3-v1" else "map_3"
+        baseline = "V1" if protocol == "v3-v1" else "V3"
+        markdown_path = Path(directory) / f"{protocol}-{artifact_stage}.md"
+        json_path = Path(directory) / f"{protocol}-{artifact_stage}.json"
+        baseline_path = Path(directory) / f"{protocol}-baseline-source.json"
+        if artifact_stage == "result":
+            baseline_path.write_text(
+                json.dumps(
+                    {
+                        "metadata": {
+                            "protocol": protocol,
+                            "artifact_stage": "baseline",
+                            "seeds": [58001, 58002, 58003, 58004],
+                            "expected_games": 24 if protocol == "v3-v1" else 4,
+                            "commit_sha": "baseline-sha",
+                            "artifact_path": str(baseline_path.resolve()),
+                            "evaluator_sha256": "e" * 64,
+                            "mcp_sha256": "m" * 64,
+                        },
+                        "analyses": [
+                            {
+                                "map": "map_3",
+                                "order": "先攻",
+                                "thinking_ms": [10.0],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+        argv = [
+            "scripts/eval_matchup.py",
+            "--mode",
+            "batch",
+            "--map",
+            maps,
+            "--p1",
+            "V3",
+            "--p2",
+            baseline,
+            "--criteria",
+            "issue58",
+            "--issue58-protocol",
+            protocol,
+            "--artifact-stage",
+            artifact_stage,
+            "--seeds",
+            "58001,58002,58003,58004",
+            "--max-turns",
+            "30",
+            "--json-output",
+            str(json_path),
+            "--output",
+            str(markdown_path),
+        ]
+        if artifact_stage == "result":
+            argv.extend(["--baseline-json", str(baseline_path)])
+        fake_result = {
+            "result": "Draw_MaxTurns",
+            "turns": 30,
+            "error": runtime_error,
+        }
+        criteria_rows = [{"complete": criteria_complete}]
+        eval_matchup.p = None
+        with (
+            patch.object(sys, "argv", argv),
+            patch("builtins.print"),
+            patch.object(eval_matchup, "init_mcp_server"),
+            patch.object(eval_matchup, "run_single_game", return_value=fake_result.copy()),
+            patch.object(
+                eval_matchup,
+                "analyze_issue58_game",
+                return_value=[
+                    {
+                        "map": "map_3",
+                        "order": "先攻",
+                        "thinking_ms": [10.0],
+                    }
+                ],
+            ),
+            patch.object(
+                eval_matchup,
+                "judge_issue58_criteria",
+                return_value=(criteria_pass, criteria_rows, []),
+            ),
+            patch.object(eval_matchup, "generate_issue58_report", return_value="report"),
+            patch.object(
+                eval_matchup,
+                "collect_run_metadata",
+                return_value={
+                    "commit_sha": "abc123",
+                    "working_tree_dirty": True,
+                    "command": argv,
+                    "seeds": [58001, 58002, 58003, 58004],
+                    "games_per_order": 4,
+                    "evaluator_sha256": "e" * 64,
+                    "mcp_sha256": "m" * 64,
+                },
+            ),
+        ):
+            eval_matchup.main()
+        return markdown_path, json_path
+
+    def test_baseline_writes_v3_v1_artifacts_when_future_criteria_fail(self):
+        with TemporaryDirectory() as directory:
+            markdown_path, json_path = self.run_issue58_main(directory)
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+
+            self.assertTrue(markdown_path.exists())
+            self.assertEqual(24, len(payload["results"]))
+            self.assertEqual(
+                {
+                    "protocol": "v3-v1",
+                    "artifact_stage": "baseline",
+                    "expected_games": 24,
+                    "games_per_seed": 6,
+                    "subject": "V3",
+                    "baseline": "V1",
+                },
+                {
+                    key: payload["metadata"][key]
+                    for key in (
+                        "protocol",
+                        "artifact_stage",
+                        "expected_games",
+                        "games_per_seed",
+                        "subject",
+                        "baseline",
+                    )
+                },
+            )
+
+    def test_selfplay_baseline_writes_one_game_per_seed(self):
+        with TemporaryDirectory() as directory:
+            _, json_path = self.run_issue58_main(
+                directory,
+                protocol="v3-selfplay",
+            )
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(4, payload["metadata"]["expected_games"])
+            self.assertEqual(1, payload["metadata"]["games_per_seed"])
+            self.assertEqual(4, len(payload["results"]))
+
+    def test_baseline_runtime_error_writes_artifacts_then_exits_two(self):
+        with TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(SystemExit, "2"):
+                self.run_issue58_main(directory, runtime_error="MCP failed")
+
+            self.assertTrue(Path(directory, "v3-v1-baseline.md").exists())
+            self.assertTrue(Path(directory, "v3-v1-baseline.json").exists())
+
+    def test_result_acceptance_failure_exits_one_when_execution_is_complete(self):
+        with TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(SystemExit, "1"):
+                self.run_issue58_main(
+                    directory,
+                    artifact_stage="result",
+                    criteria_complete=True,
+                )
+
+    def test_result_incomplete_criteria_exits_two(self):
+        with TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(SystemExit, "2"):
+                self.run_issue58_main(directory, artifact_stage="result")
+
+
+class DirectExecutionImportTests(unittest.TestCase):
+    def test_direct_script_uses_sibling_issue58_evaluator(self):
+        repository_root = Path(__file__).resolve().parent.parent
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(repository_root / "scripts" / "eval_matchup.py"),
+                "--mode",
+                "batch",
+                "--map",
+                "map_3",
+                "--p1",
+                "V3",
+                "--p2",
+                "V3",
+                "--criteria",
+                "issue58",
+                "--issue58-protocol",
+                "v3-selfplay",
+                "--artifact-stage",
+                "baseline",
+                "--seeds",
+                "58001,58002,58003,58004",
+                "--max-turns",
+                "29",
+                "--json-output",
+                "invalid.json",
+                "--output",
+                "invalid.md",
+            ],
+            cwd=repository_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(2, completed.returncode)
+        self.assertIn("Issue #58 requires max_turns=30", completed.stderr)
+        self.assertNotIn("TypeError", completed.stderr)
+
+
+class IslandCampaignCollectionTests(unittest.TestCase):
+    def test_run_single_game_collects_player_tagged_campaign_snapshots(self):
+        active_index = 0
+        campaigns = {
+            1: {"player_id": 1, "islands": [{"island_id": 1}]},
+            2: {"player_id": 2, "islands": [{"island_id": 2}]},
+        }
+
+        def tool(name, arguments=None, req_id=1):
+            nonlocal active_index
+            if name in {"load_map", "set_player_ai_version"}:
+                return {}
+            if name == "get_board_state":
+                return {
+                    "turn": 1,
+                    "active_player_index": active_index,
+                    "players": [
+                        {
+                            "player_id": 1,
+                            "property_count": 1,
+                            "unit_cost": 1000,
+                            "funds": 6000,
+                        },
+                        {
+                            "player_id": 2,
+                            "property_count": 1,
+                            "unit_cost": 1000,
+                            "funds": 7000,
+                        },
+                    ],
+                    "properties": [],
+                    "units": [],
+                    "game_over": None,
+                }
+            if name == "evaluate_board":
+                return {
+                    "score": 0,
+                    "subjective_metrics": {},
+                    "objective_metrics": {},
+                }
+            if name == "simulate_ai_turn":
+                player_id = active_index + 1
+                response = {
+                    "player_id": player_id,
+                    "actions_taken": [],
+                    "invasion_events": [],
+                    "transport_squads": [],
+                    "island_campaign": campaigns[player_id],
+                }
+                active_index = 1 - active_index
+                return response
+            raise AssertionError(name)
+
+        result = run_single_game(
+            "map_3", "V3", "V3", 1, seed=58001, tool_caller=tool
+        )
+
+        self.assertEqual(
+            [
+                {
+                    "round": 1,
+                    "turn": 1,
+                    "player_id": 1,
+                    "available_funds": 6000,
+                    "units": [],
+                    "campaign": campaigns[1],
+                },
+                {
+                    "round": 1,
+                    "turn": 1,
+                    "player_id": 2,
+                    "available_funds": 7000,
+                    "units": [],
+                    "campaign": campaigns[2],
+                },
+            ],
+            result["island_campaign_history"],
+        )
+
+
+class CompletedRoundTests(unittest.TestCase):
+    def test_t30_snapshot_is_taken_after_both_players_finish(self):
+        active_index = 0
+        completed_actions = 0
+
+        def tool(name, arguments=None, req_id=1):
+            nonlocal active_index, completed_actions
+            if name in {"load_map", "set_player_ai_version"}:
+                return {}
+            if name == "get_board_state":
+                return {
+                    "active_player_index": active_index,
+                    "players": [
+                        {
+                            "player_id": 1,
+                            "property_count": 1,
+                            "unit_cost": 1000,
+                            "funds": 0,
+                        },
+                        {
+                            "player_id": 2,
+                            "property_count": 1,
+                            "unit_cost": 1000,
+                            "funds": 0,
+                        },
+                    ],
+                    "properties": [],
+                    "units": [],
+                    "game_over": None,
+                }
+            if name == "evaluate_board":
+                return {
+                    "score": 0,
+                    "subjective_metrics": {},
+                    "objective_metrics": {
+                        "zoc_area": completed_actions,
+                        "income_per_turn": 1000,
+                        "owned_properties": 1,
+                    },
+                }
+            if name == "simulate_ai_turn":
+                completed_actions += 1
+                active_index = 1 - active_index
+                return {
+                    "actions_taken": [],
+                    "invasion_events": [],
+                    "transport_squads": [],
+                }
+            raise AssertionError(name)
+
+        result = run_single_game(
+            "map_3", "V3", "V2", 30, seed=7, tool_caller=tool
+        )
+        self.assertEqual(30, len(result["metrics"]))
+        self.assertEqual(60, result["metrics"][-1]["p1_obj"]["zoc_area"])
+        self.assertEqual(60, completed_actions)
 
 
 if __name__ == "__main__":

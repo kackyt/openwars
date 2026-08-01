@@ -1,4 +1,8 @@
-use crate::ai::strategy::{ProductionPlan, ProductionStrategy, analyze_strategy};
+use crate::ai::island_campaign::{IslandCampaignShortfall, campaign_unit_type_rank};
+use crate::ai::strategy::{
+    ProductionPlan, ProductionStrategy, analyze_strategy_for_turn,
+    sea_transport_capacity_from_slots,
+};
 use crate::components::{Faction, GridPosition, PlayerId, Property, UnitStats};
 use crate::events::ProduceUnitCommand;
 use crate::resources::master_data::MasterDataRegistry;
@@ -6,6 +10,244 @@ use crate::resources::{DamageChart, MovementType, Players, Terrain, UnitRegistry
 use bevy_ecs::prelude::*;
 
 use super::strategy::GamePhase;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CampaignProductionRequirement {
+    HeavyTransport,
+    LightTransport,
+    Capture,
+    Combat,
+}
+
+#[derive(Debug)]
+struct CampaignProductionOutcome {
+    commands: Vec<ProduceUnitCommand>,
+    remaining_funds: u32,
+    used_facilities: std::collections::HashSet<GridPosition>,
+    completed_all_rows: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProductionCandidate {
+    score: u32,
+    facility_position: GridPosition,
+    unit_type: UnitType,
+    cost: u32,
+    max_cargo: u32,
+    can_capture: bool,
+}
+
+fn compare_production_candidates(
+    left: &ProductionCandidate,
+    right: &ProductionCandidate,
+) -> std::cmp::Ordering {
+    right
+        .score
+        .cmp(&left.score)
+        .then_with(|| left.facility_position.y.cmp(&right.facility_position.y))
+        .then_with(|| left.facility_position.x.cmp(&right.facility_position.x))
+        .then_with(|| {
+            campaign_unit_type_rank(left.unit_type).cmp(&campaign_unit_type_rank(right.unit_type))
+        })
+        .then_with(|| left.cost.cmp(&right.cost))
+}
+
+fn select_best_production_candidate(
+    candidates: &[ProductionCandidate],
+) -> Option<&ProductionCandidate> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.score > 0)
+        .min_by(|left, right| compare_production_candidates(left, right))
+}
+
+fn next_campaign_requirement(
+    shortfall: &IslandCampaignShortfall,
+) -> Option<CampaignProductionRequirement> {
+    if shortfall.heavy_transport_slots > 0 {
+        Some(CampaignProductionRequirement::HeavyTransport)
+    } else if shortfall.light_transport_slots > 0 {
+        Some(CampaignProductionRequirement::LightTransport)
+    } else if shortfall.capture_units > 0 {
+        Some(CampaignProductionRequirement::Capture)
+    } else if shortfall.combat_budget > 0 {
+        Some(CampaignProductionRequirement::Combat)
+    } else {
+        None
+    }
+}
+
+fn campaign_candidate_matches(
+    requirement: CampaignProductionRequirement,
+    unit_type: UnitType,
+    stats: &UnitStats,
+) -> bool {
+    // 要求量を減らせない不正なマスターデータは候補から除外し、計画を確実に前進させる。
+    match requirement {
+        CampaignProductionRequirement::HeavyTransport => {
+            unit_type == UnitType::Lander && stats.max_cargo > 0
+        }
+        CampaignProductionRequirement::LightTransport => {
+            unit_type == UnitType::TransportHelicopter && stats.max_cargo > 0
+        }
+        CampaignProductionRequirement::Capture => stats.can_capture,
+        CampaignProductionRequirement::Combat => {
+            stats.cost > 0
+                && !matches!(
+                    unit_type,
+                    UnitType::TransportHelicopter | UnitType::Lander | UnitType::SupplyTruck
+                )
+        }
+    }
+}
+
+fn consume_transport_demand_after_production(
+    strategy: &mut ProductionStrategy,
+    unit_type: UnitType,
+    max_cargo: u32,
+    is_v3: bool,
+) {
+    if is_v3 {
+        let (light_slots, heavy_slots) = sea_transport_capacity_from_slots(unit_type, max_cargo);
+        match unit_type {
+            UnitType::TransportHelicopter => {
+                strategy.light_transport_demand =
+                    strategy.light_transport_demand.saturating_sub(light_slots);
+            }
+            UnitType::Lander if strategy.heavy_transport_demand > 0 => {
+                strategy.heavy_transport_demand =
+                    strategy.heavy_transport_demand.saturating_sub(heavy_slots);
+            }
+            UnitType::Lander => {
+                strategy.light_transport_demand =
+                    strategy.light_transport_demand.saturating_sub(light_slots);
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // V1は従来どおり、Lander以外のcargo枠を軽輸送需要へ計上する。
+    if max_cargo == 0 {
+        return;
+    }
+    if unit_type == UnitType::Lander && strategy.heavy_transport_demand > 0 {
+        strategy.heavy_transport_demand = strategy.heavy_transport_demand.saturating_sub(max_cargo);
+    } else {
+        strategy.light_transport_demand = strategy.light_transport_demand.saturating_sub(max_cargo);
+    }
+}
+
+fn consume_campaign_candidate(
+    shortfall: &mut IslandCampaignShortfall,
+    requirement: CampaignProductionRequirement,
+    stats: &UnitStats,
+) {
+    match requirement {
+        CampaignProductionRequirement::HeavyTransport => {
+            shortfall.heavy_transport_slots = shortfall
+                .heavy_transport_slots
+                .saturating_sub(stats.max_cargo);
+        }
+        CampaignProductionRequirement::LightTransport => {
+            shortfall.light_transport_slots = shortfall
+                .light_transport_slots
+                .saturating_sub(stats.max_cargo);
+        }
+        CampaignProductionRequirement::Capture => {
+            shortfall.capture_units = shortfall.capture_units.saturating_sub(1);
+        }
+        CampaignProductionRequirement::Combat => {
+            shortfall.combat_budget = shortfall.combat_budget.saturating_sub(stats.cost);
+        }
+    }
+    shortfall.reserved_budget = shortfall.reserved_budget.saturating_sub(stats.cost);
+}
+
+fn plan_campaign_shortfall_production(
+    player_id: PlayerId,
+    shortfalls: &[IslandCampaignShortfall],
+    facilities: &[(GridPosition, Terrain)],
+    available_types: &[(UnitType, UnitStats)],
+    master_data: &MasterDataRegistry,
+    available_funds: u32,
+) -> CampaignProductionOutcome {
+    let mut rows = shortfalls.to_vec();
+    rows.sort_by_key(|row| (row.priority_rank, row.island_id.0));
+    let mut sorted_facilities = facilities.to_vec();
+    sorted_facilities.sort_by_key(|(position, _)| (position.y, position.x));
+    let mut sorted_types = available_types.to_vec();
+    sorted_types
+        .sort_by_key(|(unit_type, stats)| (campaign_unit_type_rank(*unit_type), stats.cost));
+
+    let mut outcome = CampaignProductionOutcome {
+        commands: Vec::new(),
+        remaining_funds: available_funds,
+        used_facilities: std::collections::HashSet::new(),
+        completed_all_rows: true,
+    };
+
+    for row in &mut rows {
+        while let Some(requirement) = next_campaign_requirement(row) {
+            let mut candidates = Vec::new();
+            for (facility_position, terrain) in &sorted_facilities {
+                if outcome.used_facilities.contains(facility_position) {
+                    continue;
+                }
+                for (unit_type, stats) in &sorted_types {
+                    if !master_data.can_produce_unit(terrain.as_str(), *unit_type)
+                        || !campaign_candidate_matches(requirement, *unit_type, stats)
+                        || stats.cost > outcome.remaining_funds
+                        || stats.cost > row.reserved_budget
+                    {
+                        continue;
+                    }
+                    let combat_coverage = if requirement == CampaignProductionRequirement::Combat {
+                        stats.cost.min(row.combat_budget)
+                    } else {
+                        0
+                    };
+                    candidates.push((
+                        std::cmp::Reverse(combat_coverage),
+                        stats.cost,
+                        campaign_unit_type_rank(*unit_type),
+                        facility_position.y,
+                        facility_position.x,
+                        *facility_position,
+                        *unit_type,
+                        stats,
+                    ));
+                }
+            }
+            candidates.sort_by_key(|candidate| {
+                (
+                    candidate.0,
+                    candidate.1,
+                    candidate.2,
+                    candidate.3,
+                    candidate.4,
+                )
+            });
+            let Some((_, _, _, _, _, position, unit_type, stats)) = candidates.first() else {
+                // 高優先rowを今ターン完了できない場合、予約資源を下位rowやgeneric需要へ流さない。
+                outcome.completed_all_rows = false;
+                return outcome;
+            };
+
+            outcome.commands.push(ProduceUnitCommand {
+                player_id,
+                target_x: position.x,
+                target_y: position.y,
+                unit_type: *unit_type,
+            });
+            outcome.remaining_funds = outcome.remaining_funds.saturating_sub(stats.cost);
+            outcome.used_facilities.insert(*position);
+            consume_campaign_candidate(row, requirement, stats);
+        }
+    }
+
+    outcome
+}
 
 /// 生産AI。
 /// 以下のロジックで生産計画を立てます。
@@ -15,14 +257,11 @@ use super::strategy::GamePhase;
 pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceUnitCommand> {
     let mut commands = Vec::new();
 
-    let strategy = analyze_strategy(world, player_id);
+    let strategy = analyze_strategy_for_turn(world, player_id);
     let map = world.resource::<crate::resources::Map>().clone();
 
     // V3 の生産拡張 (対編成カウンター効率) を有効にするかどうか
-    let is_v3 = world
-        .get_resource::<crate::ai::ai_version::PlayerAiSettings>()
-        .map(|s| s.get_version(player_id).uses_v3_tactics())
-        .unwrap_or(false);
+    let is_v3 = crate::ai::resolve_player_ai_version(world, player_id).uses_v3_tactics();
 
     let (unit_registry, damage_chart, master_data) = {
         let ur = world.get_resource::<UnitRegistry>().cloned();
@@ -138,21 +377,27 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
     }
 
     let mut plan = world.get_resource_mut::<ProductionPlan>().unwrap();
-    if strategy.phase == GamePhase::Defense {
+    if strategy.phase == GamePhase::Defense || (is_v3 && !strategy.campaign_shortfalls.is_empty()) {
+        // campaign allocatorが完全package資金を予約済みのため、generic貯金で二重に差し引かない。
         plan.reserves.insert(player_id.0, 0);
     } else {
         reserves = *plan.reserves.get(&player_id.0).unwrap_or(&0);
 
         // 欲しいユニット（一番スコアが高いもの）が買えない場合、貯金を検討
         // ただし、現在持っている施設で生産可能なものに限定する
-        let mut best_unit = None;
-        let mut max_score = 0;
-        let score_ref_pos = capital_pos.unwrap_or(GridPosition { x: 0, y: 0 });
+        let mut saving_candidates = Vec::new();
 
         for (ut, stats) in &unit_registry.0 {
             if !producible_types.contains(ut) {
                 continue;
             }
+            let Some((facility_position, facility_terrain)) = my_facilities
+                .iter()
+                .filter(|(_, terrain)| master_data.can_produce_unit(terrain.as_str(), *ut))
+                .min_by_key(|(position, _)| (position.y, position.x))
+            else {
+                continue;
+            };
 
             let current_ratio = if !my_units.is_empty() {
                 my_units.iter().filter(|(_, s)| s.unit_type == *ut).count() as f32
@@ -163,18 +408,10 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
             let ratio_diff =
                 strategy.ideal_composition.get(ut).copied().unwrap_or(0.0) - current_ratio;
 
-            let prod_facility_terrain = if stats.movement_type == MovementType::Ship {
-                Terrain::Port
-            } else if stats.movement_type == MovementType::Air {
-                Terrain::Airport
-            } else {
-                Terrain::Factory
-            };
-
             let score = calculate_unit_score_at(
                 *ut,
                 stats,
-                score_ref_pos,
+                *facility_position,
                 &strategy,
                 &enemy_units,
                 &my_empty_transports,
@@ -182,25 +419,33 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                 &master_data,
                 &map,
                 &unit_registry,
-                prod_facility_terrain, // 適切な施設タイプを渡す
+                *facility_terrain,
                 ratio_diff,
                 is_v3,
             );
-            if score > max_score {
-                max_score = score;
-                best_unit = Some((*ut, stats.cost));
-            }
+            saving_candidates.push(ProductionCandidate {
+                score,
+                facility_position: *facility_position,
+                unit_type: *ut,
+                cost: stats.cost,
+                max_cargo: stats.max_cargo,
+                can_capture: stats.can_capture,
+            });
         }
 
-        if let Some((ut, cost)) = best_unit
-            && cost > current_funds
-            && cost > reserves
+        let best_unit = select_best_production_candidate(&saving_candidates).copied();
+        if let Some(candidate) = best_unit
+            && candidate.cost > current_funds
+            && candidate.cost > reserves
         {
-            plan.reserves.insert(player_id.0, cost);
-            plan.reservations.entry(player_id.0).or_default().push(ut);
-            reserves = cost;
-        } else if let Some((_, cost)) = best_unit
-            && cost <= current_funds
+            plan.reserves.insert(player_id.0, candidate.cost);
+            plan.reservations
+                .entry(player_id.0)
+                .or_default()
+                .push(candidate.unit_type);
+            reserves = candidate.cost;
+        } else if let Some(candidate) = best_unit
+            && candidate.cost <= current_funds
         {
             // 買えるユニットがベストなら、貯金目標をリセット（または達成済みとする）
             if reserves > 0 && current_funds >= reserves {
@@ -234,14 +479,70 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
         .map(|(ut, s)| (*ut, s.clone()))
         .collect();
 
-    // --- 4. 予算と施設重複を考慮して生産決定 (Greedy selection with dynamic re-scoring) ---
-    let mut remaining_funds = available_funds;
+    // --- 3. V3 campaign予約行をpriority rank・島ID順に先行消費 ---
+    let mut campaign_outcome = CampaignProductionOutcome {
+        commands: Vec::new(),
+        remaining_funds: available_funds,
+        used_facilities: std::collections::HashSet::new(),
+        completed_all_rows: true,
+    };
+    if is_v3 && !strategy.campaign_shortfalls.is_empty() {
+        let campaign_plan_exists = world
+            .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .is_some_and(|cache| cache.campaign_production_planned(player_id));
+        if campaign_plan_exists {
+            // 最初の完全package計画を1commandずつ消費し、同じshortfallの重複生産を防ぐ。
+            let mut cache = world
+                .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+                .unwrap_or_default();
+            let next_command = cache.take_campaign_production_command(player_id);
+            let blocks_generic = cache.campaign_production_blocks_generic(player_id);
+            world.insert_resource(cache);
+            if let Some(command) = next_command {
+                return vec![command];
+            }
+            if blocks_generic {
+                return commands;
+            }
+        } else {
+            campaign_outcome = plan_campaign_shortfall_production(
+                player_id,
+                &strategy.campaign_shortfalls,
+                &my_facilities,
+                &available_types,
+                &master_data,
+                available_funds,
+            );
+            let completed_all_rows = campaign_outcome.completed_all_rows;
+            let campaign_commands = std::mem::take(&mut campaign_outcome.commands);
+            let mut cache = world
+                .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+                .unwrap_or_default();
+            cache.set_campaign_production_plan(player_id, campaign_commands, completed_all_rows);
+            let next_command = cache.take_campaign_production_command(player_id);
+            let blocks_generic = cache.campaign_production_blocks_generic(player_id);
+            world.insert_resource(cache);
+            if let Some(command) = next_command {
+                return vec![command];
+            }
+            if blocks_generic {
+                return commands;
+            }
+        }
+    }
+
+    // --- 4. campaign完了後だけgeneric需要を予算と施設重複込みで評価 ---
+    let mut remaining_funds = campaign_outcome.remaining_funds;
     let mut current_strategy = strategy.clone();
-    let mut used_facilities = std::collections::HashSet::new();
+    if is_v3 && !current_strategy.campaign_shortfalls.is_empty() {
+        current_strategy.capture_demand = 0;
+        current_strategy.light_transport_demand = 0;
+        current_strategy.heavy_transport_demand = 0;
+    }
+    let mut used_facilities = campaign_outcome.used_facilities;
 
     loop {
-        let mut best_candidate = None;
-        let mut best_score = 0u32;
+        let mut production_candidates = Vec::new();
 
         for (facility_pos, terrain) in &my_facilities {
             if used_facilities.contains(facility_pos) {
@@ -290,49 +591,37 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                     is_v3,
                 );
 
-                if score > best_score && score > 0 {
-                    best_score = score;
-                    best_candidate = Some((
-                        *facility_pos,
-                        *ut,
-                        stats.cost,
-                        stats.max_cargo,
-                        stats.can_capture,
-                    ));
-                }
+                production_candidates.push(ProductionCandidate {
+                    score,
+                    facility_position: *facility_pos,
+                    unit_type: *ut,
+                    cost: stats.cost,
+                    max_cargo: stats.max_cargo,
+                    can_capture: stats.can_capture,
+                });
             }
         }
 
-        if let Some((pos, ut, cost, cargo, can_capture)) = best_candidate {
+        if let Some(candidate) = select_best_production_candidate(&production_candidates).copied() {
             // 生産決定
             commands.push(ProduceUnitCommand {
                 player_id,
-                target_x: pos.x,
-                target_y: pos.y,
-                unit_type: ut,
+                target_x: candidate.facility_position.x,
+                target_y: candidate.facility_position.y,
+                unit_type: candidate.unit_type,
             });
-            remaining_funds = remaining_funds.saturating_sub(cost);
-            used_facilities.insert(pos);
+            remaining_funds = remaining_funds.saturating_sub(candidate.cost);
+            used_facilities.insert(candidate.facility_position);
 
-            // 需要を動的に減衰させる（次の候補評価に反映）
-            if cargo > 0 {
-                if ut == UnitType::Lander {
-                    if current_strategy.heavy_transport_demand > 0 {
-                        current_strategy.heavy_transport_demand = current_strategy
-                            .heavy_transport_demand
-                            .saturating_sub(cargo);
-                    } else {
-                        current_strategy.light_transport_demand = current_strategy
-                            .light_transport_demand
-                            .saturating_sub(cargo);
-                    }
-                } else {
-                    current_strategy.light_transport_demand = current_strategy
-                        .light_transport_demand
-                        .saturating_sub(cargo);
-                }
-            }
-            if can_capture {
+            // 需要を動的に減衰させる（次の候補評価に反映）。
+            // V3では海を越えられる輸送種別だけがoffshore需要を消費する。
+            consume_transport_demand_after_production(
+                &mut current_strategy,
+                candidate.unit_type,
+                candidate.max_cargo,
+                is_v3,
+            );
+            if candidate.can_capture {
                 current_strategy.capture_demand = current_strategy.capture_demand.saturating_sub(1);
             }
         } else {
@@ -555,30 +844,35 @@ pub fn calculate_unit_score_at(
         }
     }
     // 輸送ユニットの評価（期待状態価値の向上分に基づく）
-    if stats.max_cargo > 0 && !strategy.transport_candidates.is_empty() {
-        let transport_targets = if is_v3 {
-            strategy
-                .invasion_target
-                .map(|target| vec![target.target_position])
-                .unwrap_or_else(|| strategy.priority_targets.clone())
-        } else {
-            strategy.priority_targets.clone()
-        };
+    let transport_targets = if is_v3 {
+        strategy.campaign_portfolio.offensive_target_positions()
+    } else {
+        strategy.priority_targets.clone()
+    };
+    let transport_utility_eligible = if is_v3 {
+        let capacity = sea_transport_capacity_from_slots(unit_type, stats.max_cargo);
+        capacity.0 > 0 || capacity.1 > 0
+    } else {
+        stats.max_cargo > 0
+    };
+    // V3は島嶼攻勢の実目標と海上輸送能力がそろう場合だけutilityを評価する。
+    if transport_utility_eligible
+        && !strategy.transport_candidates.is_empty()
+        && !transport_targets.is_empty()
+    {
         let mut transport_utility: f32 = 0.0;
         for (c_pos, c_stats, c_value) in &strategy.transport_candidates {
             // この輸送ユニットが搭載可能かチェック
             if stats.loadable_unit_types.contains(&c_stats.unit_type) {
-                // 候補ユニットにとっての最寄りのターゲットを特定
-                let mut min_dist_to_target = 999;
-                let mut best_target = GridPosition { x: 0, y: 0 };
-                for target in &transport_targets {
-                    let d = (c_pos.x as i32 - target.x as i32).abs()
-                        + (c_pos.y as i32 - target.y as i32).abs();
-                    if d < min_dist_to_target {
-                        min_dist_to_target = d;
-                        best_target = *target;
-                    }
-                }
+                // 候補ユニットにとっての最寄りの実在ターゲットだけをETA計算へ渡す。
+                let Some(best_target) = transport_targets.iter().min_by_key(|target| {
+                    (c_pos.x as i32 - target.x as i32).abs()
+                        + (c_pos.y as i32 - target.y as i32).abs()
+                }) else {
+                    continue;
+                };
+                let min_dist_to_target = (c_pos.x as i32 - best_target.x as i32).abs()
+                    + (c_pos.y as i32 - best_target.y as i32).abs();
 
                 // 自力ETAの見積もり（海越えなら大きなペナルティ）
                 let mut is_blocked = false;
@@ -846,7 +1140,499 @@ mod additional_tests {
     use super::*;
     use crate::ai::strategy;
     use crate::components::Health;
-    use crate::resources::{Map, Terrain};
+    use crate::resources::{GridTopology, Map, Terrain};
+
+    fn campaign_test_types(master_data: &MasterDataRegistry) -> Vec<(UnitType, UnitStats)> {
+        master_data
+            .unit_order
+            .iter()
+            .filter_map(|name| master_data.create_unit_stats(name).ok())
+            .map(|stats| (stats.unit_type, stats))
+            .collect()
+    }
+
+    fn selection_candidate(
+        score: u32,
+        position: GridPosition,
+        unit_type: UnitType,
+        cost: u32,
+    ) -> ProductionCandidate {
+        ProductionCandidate {
+            score,
+            facility_position: position,
+            unit_type,
+            cost,
+            max_cargo: 0,
+            can_capture: unit_type == UnitType::Infantry,
+        }
+    }
+
+    #[test]
+    fn equal_score_selection_is_insertion_order_independent() {
+        let candidates = vec![
+            selection_candidate(100, GridPosition { x: 1, y: 0 }, UnitType::Infantry, 1_000),
+            selection_candidate(100, GridPosition { x: 0, y: 0 }, UnitType::Mech, 3_000),
+            selection_candidate(100, GridPosition { x: 0, y: 0 }, UnitType::Infantry, 1_000),
+        ];
+        let mut reversed = candidates.clone();
+        reversed.reverse();
+
+        let selected = select_best_production_candidate(&candidates).unwrap();
+        let reversed_selected = select_best_production_candidate(&reversed).unwrap();
+
+        assert_eq!(selected.facility_position, GridPosition { x: 0, y: 0 });
+        assert_eq!(selected.unit_type, UnitType::Infantry);
+        assert_eq!(
+            (
+                reversed_selected.facility_position,
+                reversed_selected.unit_type
+            ),
+            (selected.facility_position, selected.unit_type)
+        );
+    }
+
+    #[test]
+    fn equal_score_selection_uses_cost_after_type_rank() {
+        let candidates = vec![
+            selection_candidate(100, GridPosition { x: 0, y: 0 }, UnitType::Infantry, 1_001),
+            selection_candidate(100, GridPosition { x: 0, y: 0 }, UnitType::Infantry, 1_000),
+        ];
+
+        assert_eq!(
+            select_best_production_candidate(&candidates).unwrap().cost,
+            1_000
+        );
+    }
+
+    fn transport_score(
+        unit_type: UnitType,
+        strategy: &ProductionStrategy,
+        map: &Map,
+        is_v3: bool,
+    ) -> u32 {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let stats = master_data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                unit_type.as_str().to_owned(),
+            ))
+            .unwrap();
+        let damage_chart = DamageChart::new();
+        let unit_registry = UnitRegistry(std::collections::HashMap::new());
+        calculate_unit_score_at(
+            unit_type,
+            &stats,
+            GridPosition { x: 0, y: 0 },
+            strategy,
+            &[],
+            &[],
+            &damage_chart,
+            &master_data,
+            map,
+            &unit_registry,
+            Terrain::Factory,
+            0.0,
+            is_v3,
+        )
+    }
+
+    fn transport_test_candidate() -> (GridPosition, UnitStats, f32) {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let infantry = master_data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::Infantry.as_str().to_owned(),
+            ))
+            .unwrap();
+        (GridPosition { x: 0, y: 0 }, infantry, 10_000.0)
+    }
+
+    fn offshore_test_portfolio(
+        target: GridPosition,
+    ) -> crate::ai::island_campaign::IslandCampaignPortfolio {
+        let empty_requirement = crate::ai::island_campaign::IslandCampaignRequirement {
+            preferred_transport: None,
+            transport_slots: 0,
+            capture_units: 0,
+            combat_budget: 0,
+            total_budget: 0,
+        };
+        crate::ai::island_campaign::IslandCampaignPortfolio {
+            islands: Vec::new(),
+            active_offensives: vec![crate::ai::island_campaign::IslandCampaignAssignment {
+                island_id: crate::ai::islands::IslandId(0),
+                decision: crate::ai::island_campaign::IslandCampaignDecision::Expand,
+                target_position: target,
+                requirement: empty_requirement.clone(),
+                purchase_shortfall: empty_requirement,
+                allocated_budget: 0,
+                transport_entities: Vec::new(),
+                capture_entities: Vec::new(),
+                combat_entities: Vec::new(),
+                operation_ready: true,
+                continued_from_existing_squad: false,
+            }],
+            defenses: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn targetless_candidate_does_not_inflate_recon_score() {
+        let map = Map::new(5, 1, Terrain::Plains, GridTopology::Square);
+        let strategy = ProductionStrategy {
+            light_transport_demand: 1,
+            transport_candidates: vec![transport_test_candidate()],
+            ..ProductionStrategy::default()
+        };
+        let mut control = strategy.clone();
+        control.transport_candidates.clear();
+
+        assert_eq!(
+            transport_score(UnitType::Recon, &strategy, &map, true),
+            transport_score(UnitType::Recon, &control, &map, true)
+        );
+    }
+
+    #[test]
+    fn v3_offshore_transport_utility_excludes_ground_carriers() {
+        let target = GridPosition { x: 4, y: 0 };
+        let map = Map::new(5, 1, Terrain::Sea, GridTopology::Square);
+        let strategy = ProductionStrategy {
+            light_transport_demand: 1,
+            heavy_transport_demand: 1,
+            transport_candidates: vec![transport_test_candidate()],
+            campaign_portfolio: offshore_test_portfolio(target),
+            ..ProductionStrategy::default()
+        };
+        let mut control = strategy.clone();
+        control.transport_candidates.clear();
+
+        assert!(
+            transport_score(UnitType::TransportHelicopter, &strategy, &map, true)
+                > transport_score(UnitType::TransportHelicopter, &control, &map, true)
+        );
+        assert!(
+            transport_score(UnitType::Lander, &strategy, &map, true)
+                > transport_score(UnitType::Lander, &control, &map, true)
+        );
+        assert_eq!(
+            transport_score(UnitType::Recon, &strategy, &map, true),
+            transport_score(UnitType::Recon, &control, &map, true)
+        );
+    }
+
+    #[test]
+    fn v1_recon_keeps_ground_transport_utility() {
+        let target = GridPosition { x: 4, y: 0 };
+        let map = Map::new(5, 1, Terrain::Plains, GridTopology::Square);
+        let strategy = ProductionStrategy {
+            priority_targets: vec![target],
+            light_transport_demand: 1,
+            transport_candidates: vec![transport_test_candidate()],
+            ..ProductionStrategy::default()
+        };
+        let mut control = strategy.clone();
+        control.transport_candidates.clear();
+
+        assert!(
+            transport_score(UnitType::Recon, &strategy, &map, false)
+                > transport_score(UnitType::Recon, &control, &map, false)
+        );
+    }
+
+    #[test]
+    fn v3_transport_demand_consumption_uses_offshore_types_only() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let stats = |unit_type: UnitType| {
+            master_data
+                .create_unit_stats(&crate::resources::master_data::UnitName(
+                    unit_type.as_str().to_owned(),
+                ))
+                .unwrap()
+        };
+
+        let mut recon_strategy = ProductionStrategy {
+            light_transport_demand: 2,
+            heavy_transport_demand: 1,
+            ..ProductionStrategy::default()
+        };
+        let recon = stats(UnitType::Recon);
+        consume_transport_demand_after_production(
+            &mut recon_strategy,
+            UnitType::Recon,
+            recon.max_cargo,
+            true,
+        );
+        assert_eq!(recon_strategy.light_transport_demand, 2);
+        assert_eq!(recon_strategy.heavy_transport_demand, 1);
+
+        let mut helicopter_strategy = recon_strategy.clone();
+        let helicopter = stats(UnitType::TransportHelicopter);
+        consume_transport_demand_after_production(
+            &mut helicopter_strategy,
+            UnitType::TransportHelicopter,
+            helicopter.max_cargo,
+            true,
+        );
+        assert_eq!(helicopter_strategy.light_transport_demand, 0);
+        assert_eq!(helicopter_strategy.heavy_transport_demand, 1);
+
+        let mut heavy_lander_strategy = recon_strategy.clone();
+        let lander = stats(UnitType::Lander);
+        consume_transport_demand_after_production(
+            &mut heavy_lander_strategy,
+            UnitType::Lander,
+            lander.max_cargo,
+            true,
+        );
+        assert_eq!(heavy_lander_strategy.light_transport_demand, 2);
+        assert_eq!(heavy_lander_strategy.heavy_transport_demand, 0);
+
+        let mut light_lander_strategy = ProductionStrategy {
+            light_transport_demand: 2,
+            heavy_transport_demand: 0,
+            ..ProductionStrategy::default()
+        };
+        consume_transport_demand_after_production(
+            &mut light_lander_strategy,
+            UnitType::Lander,
+            lander.max_cargo,
+            true,
+        );
+        assert_eq!(light_lander_strategy.light_transport_demand, 0);
+    }
+
+    #[test]
+    fn v1_ground_carrier_keeps_legacy_transport_demand_consumption() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let recon = master_data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::Recon.as_str().to_owned(),
+            ))
+            .unwrap();
+        let mut strategy = ProductionStrategy {
+            light_transport_demand: 2,
+            ..ProductionStrategy::default()
+        };
+
+        consume_transport_demand_after_production(
+            &mut strategy,
+            UnitType::Recon,
+            recon.max_cargo,
+            false,
+        );
+
+        assert_eq!(strategy.light_transport_demand, 1);
+    }
+
+    #[test]
+    fn campaign_production_rejects_zero_capacity_transport() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let mut helicopter = master_data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::TransportHelicopter.as_str().to_owned(),
+            ))
+            .unwrap();
+        helicopter.max_cargo = 0;
+        let rows = vec![crate::ai::island_campaign::IslandCampaignShortfall {
+            island_id: crate::ai::islands::IslandId(0),
+            decision: crate::ai::island_campaign::IslandCampaignDecision::Expand,
+            light_transport_slots: 1,
+            heavy_transport_slots: 0,
+            capture_units: 0,
+            combat_budget: 0,
+            reserved_budget: helicopter.cost,
+            priority_rank: 0,
+        }];
+
+        let outcome = plan_campaign_shortfall_production(
+            PlayerId(1),
+            &rows,
+            &[(GridPosition { x: 0, y: 0 }, Terrain::Airport)],
+            &[(UnitType::TransportHelicopter, helicopter)],
+            &master_data,
+            u32::MAX,
+        );
+
+        assert!(outcome.commands.is_empty());
+        assert!(!outcome.completed_all_rows);
+    }
+
+    #[test]
+    fn campaign_production_rejects_zero_cost_combat_unit() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let mut infantry = master_data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::Infantry.as_str().to_owned(),
+            ))
+            .unwrap();
+        infantry.cost = 0;
+        let rows = vec![crate::ai::island_campaign::IslandCampaignShortfall {
+            island_id: crate::ai::islands::IslandId(0),
+            decision: crate::ai::island_campaign::IslandCampaignDecision::Defend,
+            light_transport_slots: 0,
+            heavy_transport_slots: 0,
+            capture_units: 0,
+            combat_budget: 1,
+            reserved_budget: 1,
+            priority_rank: 0,
+        }];
+
+        let outcome = plan_campaign_shortfall_production(
+            PlayerId(1),
+            &rows,
+            &[(GridPosition { x: 0, y: 0 }, Terrain::Factory)],
+            &[(UnitType::Infantry, infantry)],
+            &master_data,
+            1,
+        );
+
+        assert!(outcome.commands.is_empty());
+        assert!(!outcome.completed_all_rows);
+    }
+
+    #[test]
+    fn campaign_production_services_higher_priority_row_before_lower_rows() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let available_types = campaign_test_types(&master_data);
+        let rows = vec![
+            crate::ai::island_campaign::IslandCampaignShortfall {
+                island_id: crate::ai::islands::IslandId(0),
+                decision: crate::ai::island_campaign::IslandCampaignDecision::Defend,
+                light_transport_slots: 0,
+                heavy_transport_slots: 0,
+                capture_units: 0,
+                combat_budget: 7_000,
+                reserved_budget: 7_000,
+                priority_rank: 0,
+            },
+            crate::ai::island_campaign::IslandCampaignShortfall {
+                island_id: crate::ai::islands::IslandId(1),
+                decision: crate::ai::island_campaign::IslandCampaignDecision::Expand,
+                light_transport_slots: 2,
+                heavy_transport_slots: 0,
+                capture_units: 2,
+                combat_budget: 0,
+                reserved_budget: 6_000,
+                priority_rank: 2,
+            },
+            crate::ai::island_campaign::IslandCampaignShortfall {
+                island_id: crate::ai::islands::IslandId(2),
+                decision: crate::ai::island_campaign::IslandCampaignDecision::Assault,
+                light_transport_slots: 2,
+                heavy_transport_slots: 2,
+                capture_units: 2,
+                combat_budget: 10_200,
+                reserved_budget: 32_700,
+                priority_rank: 4,
+            },
+        ];
+        let facilities = vec![
+            (GridPosition { x: 0, y: 0 }, Terrain::Factory),
+            (GridPosition { x: 1, y: 0 }, Terrain::Airport),
+        ];
+
+        let outcome = plan_campaign_shortfall_production(
+            PlayerId(1),
+            &rows,
+            &facilities,
+            &available_types,
+            &master_data,
+            7_000,
+        );
+
+        assert_eq!(outcome.commands.len(), 1);
+        let produced_stats = available_types
+            .iter()
+            .find(|(unit_type, _)| *unit_type == outcome.commands[0].unit_type)
+            .map(|(_, stats)| stats)
+            .unwrap();
+        assert!(produced_stats.cost <= 7_000);
+        assert!(!produced_stats.can_capture);
+        assert!(!matches!(
+            outcome.commands[0].unit_type,
+            UnitType::Lander | UnitType::TransportHelicopter | UnitType::SupplyTruck
+        ));
+        assert!(!outcome.completed_all_rows);
+    }
+
+    #[test]
+    fn campaign_combat_remainder_uses_reserved_real_unit_cost() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let available_types = campaign_test_types(&master_data);
+        let facilities = vec![(GridPosition { x: 0, y: 0 }, Terrain::Factory)];
+        let row =
+            |combat_budget, reserved_budget| crate::ai::island_campaign::IslandCampaignShortfall {
+                island_id: crate::ai::islands::IslandId(0),
+                decision: crate::ai::island_campaign::IslandCampaignDecision::Defend,
+                light_transport_slots: 0,
+                heavy_transport_slots: 0,
+                capture_units: 0,
+                combat_budget,
+                reserved_budget,
+                priority_rank: 0,
+            };
+
+        let small_remainder = plan_campaign_shortfall_production(
+            PlayerId(1),
+            &[row(80, 1_000)],
+            &facilities,
+            &available_types,
+            &master_data,
+            1_000,
+        );
+        let large = plan_campaign_shortfall_production(
+            PlayerId(1),
+            &[row(30_000, 30_000)],
+            &facilities,
+            &available_types,
+            &master_data,
+            30_000,
+        );
+
+        assert_eq!(small_remainder.commands.len(), 1);
+        assert!(small_remainder.completed_all_rows);
+        assert_eq!(large.commands.len(), 1);
+        assert!(!large.completed_all_rows);
+    }
+
+    #[test]
+    fn campaign_assault_production_requires_lander_and_helicopter() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let available_types = campaign_test_types(&master_data);
+        let rows = vec![crate::ai::island_campaign::IslandCampaignShortfall {
+            island_id: crate::ai::islands::IslandId(0),
+            decision: crate::ai::island_campaign::IslandCampaignDecision::Assault,
+            light_transport_slots: 2,
+            heavy_transport_slots: 2,
+            capture_units: 0,
+            combat_budget: 0,
+            reserved_budget: 20_500,
+            priority_rank: 4,
+        }];
+        let facilities = vec![
+            (GridPosition { x: 0, y: 0 }, Terrain::Port),
+            (GridPosition { x: 1, y: 0 }, Terrain::Airport),
+        ];
+
+        let outcome = plan_campaign_shortfall_production(
+            PlayerId(1),
+            &rows,
+            &facilities,
+            &available_types,
+            &master_data,
+            20_500,
+        );
+        let produced: std::collections::HashSet<_> = outcome
+            .commands
+            .iter()
+            .map(|command| command.unit_type)
+            .collect();
+
+        assert_eq!(
+            produced,
+            std::collections::HashSet::from([UnitType::Lander, UnitType::TransportHelicopter,])
+        );
+        assert!(outcome.completed_all_rows);
+    }
 
     /// #53/#55 (V3): 対編成カウンター効率スコアの検証。
     /// ロケラン主体の敵編成に対して、それをアウトレンジできる重自走砲が

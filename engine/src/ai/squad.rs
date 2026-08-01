@@ -50,6 +50,8 @@ pub struct SquadId(pub u32);
 #[derive(Debug, Clone)]
 pub struct Squad {
     pub id: SquadId,
+    /// Entityがまだ無いFormingもplayer間で共有しない、Squad自身の明示所有者。
+    pub owner_id: Option<PlayerId>,
     pub members: HashSet<Entity>,
     pub mission_type: MissionType,
     pub target: Option<GridPosition>, // 攻撃・防衛・占領の目標座標
@@ -83,6 +85,7 @@ impl SquadManager {
     pub fn create_squad(&mut self, mission_type: MissionType) -> &mut Squad {
         let squad = Squad {
             id: SquadId(self.next_id),
+            owner_id: None,
             members: HashSet::new(),
             mission_type,
             target: None,
@@ -97,6 +100,16 @@ impl SquadManager {
         self.next_id += 1;
         self.squads.push(squad);
         self.squads.last_mut().unwrap()
+    }
+
+    pub fn create_owned_squad(
+        &mut self,
+        mission_type: MissionType,
+        owner_id: PlayerId,
+    ) -> &mut Squad {
+        let squad = self.create_squad(mission_type);
+        squad.owner_id = Some(owner_id);
+        squad
     }
 
     pub fn remove_squad(&mut self, id: SquadId) {
@@ -339,38 +352,107 @@ fn escort_is_eligible(
     true
 }
 
+fn inferred_squad_owner(world: &World, squad: &Squad) -> Result<Option<PlayerId>, ()> {
+    let mut owner = None;
+    for entity in squad
+        .transport_entity
+        .into_iter()
+        .chain(squad.members.iter().copied())
+        .chain(squad.cargo_entities.iter().copied())
+        .chain(squad.delivered_cargo.iter().copied())
+    {
+        let Some(faction) = world.get::<Faction>(entity) else {
+            continue;
+        };
+        if owner.is_some_and(|owner| owner != faction.0) {
+            return Err(());
+        }
+        owner = Some(faction.0);
+    }
+    Ok(owner)
+}
+
+pub(crate) fn squad_is_mutable_by_player(
+    world: &World,
+    squad: &Squad,
+    player_id: PlayerId,
+) -> bool {
+    let Ok(inferred_owner) = inferred_squad_owner(world, squad) else {
+        return false;
+    };
+    match squad.owner_id {
+        Some(owner) => {
+            owner == player_id && inferred_owner.is_none_or(|inferred| inferred == owner)
+        }
+        // ownerless legacy Squadは既知Factionが一意な場合だけ安全に扱い、空Squadは誰にも開放しない。
+        None => inferred_owner == Some(player_id),
+    }
+}
+
+fn adopt_legacy_squad_owners(world: &World, manager: &mut SquadManager) {
+    let mut squads: Vec<_> = manager.squads.iter_mut().collect();
+    squads.sort_by_key(|squad| squad.id.0);
+    for squad in squads {
+        if squad.owner_id.is_none() {
+            if let Ok(Some(owner)) = inferred_squad_owner(world, squad) {
+                // 一意なlive Factionを持つlegacy Squadだけを決定的に移行する。
+                squad.owner_id = Some(owner);
+            }
+        }
+    }
+}
+
+fn is_purchase_campaign_placeholder(squad: &Squad, player_id: PlayerId) -> bool {
+    squad.owner_id == Some(player_id)
+        && squad.mission_type == MissionType::Transport
+        && squad.phase == MissionPhase::Forming
+        && squad.transport_entity.is_none()
+        && squad.members.is_empty()
+        && squad.cargo_entities.is_empty()
+        && squad.delivered_cargo.is_empty()
+        && squad.target_island.is_some()
+        && squad.target.is_some()
+}
+
 /// 毎ターンの部隊の再編成と SoloFallback の判定を行います。
 pub fn update_squads(world: &mut World, perspective_player: PlayerId) {
     let mut manager = world.remove_resource::<SquadManager>().unwrap_or_default();
+    adopt_legacy_squad_owners(world, &mut manager);
 
     // 存在しなくなったエンティティの削除
     let mut existing_entities = HashSet::new();
     let mut units_needing_fallback = Vec::new();
     let mut units_recovered = Vec::new();
 
-    let mut query = world.query::<(Entity, &Faction, &Health, Option<&Ammo>)>();
-    for (entity, faction, health, ammo_opt) in query.iter(world) {
-        if faction.0 == perspective_player {
-            existing_entities.insert(entity);
+    let mut faction_query = world.query::<(Entity, &Faction)>();
+    for (entity, _) in faction_query.iter(world) {
+        existing_entities.insert(entity);
+    }
+    let mut status_query = world.query::<(Entity, &Faction, &Health, Option<&Ammo>)>();
+    for (entity, faction, health, ammo_opt) in status_query.iter(world) {
+        if faction.0 != perspective_player {
+            continue;
+        }
+        // SoloFallback の判定 (HP < 60 または 弾薬切れ)
+        let mut no_ammo = false;
+        if let Some(ammo) = ammo_opt {
+            no_ammo =
+                (ammo.max_ammo1 > 0 && ammo.ammo1 == 0) && (ammo.max_ammo2 > 0 && ammo.ammo2 == 0);
+        }
 
-            // SoloFallback の判定 (HP < 60 または 弾薬切れ)
-            let mut no_ammo = false;
-            if let Some(ammo) = ammo_opt {
-                no_ammo = (ammo.max_ammo1 > 0 && ammo.ammo1 == 0)
-                    && (ammo.max_ammo2 > 0 && ammo.ammo2 == 0);
-            }
-
-            if health.current < 60 || no_ammo {
-                units_needing_fallback.push(entity);
-            } else if health.current >= 70 && !no_ammo {
-                // 回復条件を満たした
-                units_recovered.push(entity);
-            }
+        if health.current < 60 || no_ammo {
+            units_needing_fallback.push(entity);
+        } else if health.current >= 70 && !no_ammo {
+            // 回復条件を満たした
+            units_recovered.push(entity);
         }
     }
 
-    // 生存エンティティのみ残す
+    // perspective player所有または実体所有者のないSquadだけをcleanupする。
     for squad in &mut manager.squads {
+        if !squad_is_mutable_by_player(world, squad, perspective_player) {
+            continue;
+        }
         squad.members.retain(|e| existing_entities.contains(e));
         squad
             .cargo_entities
@@ -393,9 +475,11 @@ pub fn update_squads(world: &mut World, perspective_player: PlayerId) {
 
     for e in units_needing_fallback {
         manager.solo_fallbacks.insert(e);
-        // Squad から外す
+        // 所有者が一致するSquadだけから外し、foreign/mixed Squadは変更しない。
         for squad in &mut manager.squads {
-            squad.members.remove(&e);
+            if squad_is_mutable_by_player(world, squad, perspective_player) {
+                squad.members.remove(&e);
+            }
         }
     }
 
@@ -403,20 +487,41 @@ pub fn update_squads(world: &mut World, perspective_player: PlayerId) {
         manager.solo_fallbacks.remove(&e);
     }
 
+    // 所有者を推定できない空Formingは購入作戦のidentityとして扱わず、任意playerへ継承しない。
+    manager.squads.retain(|squad| {
+        squad.owner_id.is_some()
+            || squad.mission_type != MissionType::Transport
+            || squad.phase != MissionPhase::Forming
+            || squad.transport_entity.is_some()
+            || !squad.members.is_empty()
+            || !squad.cargo_entities.is_empty()
+            || !squad.delivered_cargo.is_empty()
+            || squad.target_island.is_none()
+            || squad.target.is_none()
+    });
+
     // 輸送部隊のフェーズ更新と完了判定
     let mut delivered_units = Vec::new();
     let mut i = 0;
     while i < manager.squads.len() {
-        if manager.squads[i].mission_type == MissionType::Transport {
+        if manager.squads[i].mission_type == MissionType::Transport
+            && squad_is_mutable_by_player(world, &manager.squads[i], perspective_player)
+        {
             let mut squad = manager.squads[i].clone();
+            let preserve_purchase_placeholder =
+                is_purchase_campaign_placeholder(&squad, perspective_player);
             let should_remove = update_transport_squad_phase(world, &mut squad);
+            let preserve_targetless_delivery = squad.transport_entity.is_none()
+                && squad.target_island.is_none()
+                && squad.target.is_none()
+                && !squad.delivered_cargo.is_empty();
             delivered_units.extend(
                 squad
                     .delivered_cargo
                     .drain(..)
-                    .map(|cargo| (cargo, squad.target_island, squad.target)),
+                    .map(|cargo| (squad.id, cargo, squad.target_island, squad.target)),
             );
-            if should_remove {
+            if should_remove && !preserve_targetless_delivery && !preserve_purchase_placeholder {
                 manager.squads.remove(i);
             } else {
                 manager.squads[i] = squad;
@@ -428,8 +533,8 @@ pub fn update_squads(world: &mut World, perspective_player: PlayerId) {
     }
 
     // 降車したユニットを輸送部隊から解放し、通常の占領・攻撃部隊へ引き渡す。
-    for (cargo, target_island, preferred_target) in delivered_units {
-        handoff_delivered_cargo(
+    for (source_id, cargo, target_island, preferred_target) in delivered_units {
+        let handed_off = handoff_delivered_cargo(
             world,
             &mut manager,
             perspective_player,
@@ -437,6 +542,45 @@ pub fn update_squads(world: &mut World, perspective_player: PlayerId) {
             target_island,
             preferred_target,
         );
+        if !handed_off && target_island.is_none() {
+            let source_index = manager
+                .squads
+                .iter()
+                .position(|squad| squad.id == source_id);
+            let hold_index = source_index.or_else(|| {
+                manager.squads.iter().position(|squad| {
+                    squad.mission_type == MissionType::Transport
+                        && squad.transport_entity.is_none()
+                        && squad.members.is_empty()
+                        && squad.target_island.is_none()
+                        && squad.target.is_none()
+                        && squad.phase == MissionPhase::Forming
+                        && squad_is_mutable_by_player(world, squad, perspective_player)
+                })
+            });
+            let hold = if let Some(index) = hold_index {
+                &mut manager.squads[index]
+            } else {
+                // 帰還済み輸送から切り離した、現地cargo専用の一時holdをSquad派生状態で表す。
+                manager.create_owned_squad(MissionType::Transport, perspective_player)
+            };
+            if hold.transport_entity.is_none() {
+                // source輸送が消失済みでもcleanupで落ちない、輸送非依存の安全な派生状態へ正規化する。
+                hold.owner_id = Some(perspective_player);
+                hold.mission_type = MissionType::Transport;
+                hold.members.clear();
+                hold.cargo_entities.clear();
+                hold.target_island = None;
+                hold.target = None;
+                hold.pickup_position = None;
+                hold.drop_position = None;
+                hold.phase = MissionPhase::Forming;
+            }
+            if !hold.delivered_cargo.contains(&cargo) {
+                hold.delivered_cargo.push(cargo);
+                hold.delivered_cargo.sort_by_key(|entity| entity.to_bits());
+            }
+        }
     }
 
     // 占領完了した Capture 部隊の解散
@@ -449,7 +593,9 @@ pub fn update_squads(world: &mut World, perspective_player: PlayerId) {
     }
 
     manager.squads.retain(|squad| {
-        if squad.mission_type == MissionType::Capture {
+        if squad_is_mutable_by_player(world, squad, perspective_player)
+            && squad.mission_type == MissionType::Capture
+        {
             if let Some(target_pos) = squad.target {
                 if properties_ownership.get(&target_pos) == Some(&Some(perspective_player)) {
                     // 自軍の所有になったので解散
@@ -482,12 +628,14 @@ pub fn update_squads(world: &mut World, perspective_player: PlayerId) {
             }
         }
         for squad in &mut manager.squads {
-            if matches!(
-                squad.mission_type,
-                MissionType::Attack | MissionType::Defense
-            ) && squad
-                .target_island
-                .is_some_and(|island| !active_islands.contains(&island))
+            if squad_is_mutable_by_player(world, squad, perspective_player)
+                && matches!(
+                    squad.mission_type,
+                    MissionType::Attack | MissionType::Defense
+                )
+                && squad
+                    .target_island
+                    .is_some_and(|island| !active_islands.contains(&island))
             {
                 squad.target_island = None;
             }
@@ -499,9 +647,1267 @@ pub fn update_squads(world: &mut World, perspective_player: PlayerId) {
         !s.members.is_empty()
             || s.phase == MissionPhase::Completed
             || s.phase == MissionPhase::Forming
+                && (s.transport_entity.is_some()
+                    || !s.cargo_entities.is_empty()
+                    || !s.delivered_cargo.is_empty()
+                    || s.target_island.is_some()
+                    || s.target.is_some())
     });
 
     world.insert_resource(manager);
+}
+
+#[derive(Clone)]
+struct CampaignTransportCandidate {
+    entity: Entity,
+    position: GridPosition,
+    stats: UnitStats,
+    capacity: usize,
+    loaded: Vec<Entity>,
+}
+
+struct CampaignTransportPartition {
+    transport: Entity,
+    cargo: Vec<Entity>,
+    pickup_position: GridPosition,
+    all_loaded: bool,
+}
+
+fn search_ready_campaign_transport_partition(
+    world: &World,
+    transports: &[CampaignTransportCandidate],
+    cargo_entities: &[Entity],
+    cargo_index: usize,
+    assigned: &mut [Vec<Entity>],
+) -> Option<Vec<CampaignTransportPartition>> {
+    if cargo_index < cargo_entities.len() {
+        let cargo = cargo_entities[cargo_index];
+        let cargo_type = world.get::<UnitStats>(cargo)?.unit_type;
+        for (transport_index, transport) in transports.iter().enumerate() {
+            if assigned[transport_index].len() >= transport.capacity
+                || !transport.stats.loadable_unit_types.contains(&cargo_type)
+            {
+                continue;
+            }
+            assigned[transport_index].push(cargo);
+            if let Some(partition) = search_ready_campaign_transport_partition(
+                world,
+                transports,
+                cargo_entities,
+                cargo_index + 1,
+                assigned,
+            ) {
+                return Some(partition);
+            }
+            assigned[transport_index].pop();
+        }
+        return None;
+    }
+
+    // packageが予約した各輸送役を実行Squadへ接続し、空輸送だけの部分発進を避ける。
+    if assigned.iter().any(Vec::is_empty) {
+        return None;
+    }
+
+    let mut partitions = Vec::with_capacity(transports.len());
+    let mut connectivity = TerrainConnectivity::default();
+    for (transport, cargo) in transports.iter().zip(assigned.iter()) {
+        let unloaded: Vec<_> = cargo
+            .iter()
+            .filter(|entity| !transport.loaded.contains(entity))
+            .copied()
+            .collect();
+        let pickup_position = if unloaded.is_empty() {
+            transport.position
+        } else {
+            select_pickup_position(
+                world,
+                transport.position,
+                &transport.stats,
+                &unloaded,
+                &mut connectivity,
+            )?
+        };
+        let mut ordered_cargo = cargo.clone();
+        ordered_cargo.sort_by_key(|entity| {
+            let capture_rank = world
+                .get::<UnitStats>(*entity)
+                .map_or(1u8, |stats| if stats.can_capture { 0 } else { 1 });
+            (capture_rank, entity.to_bits())
+        });
+        let all_loaded = ordered_cargo
+            .iter()
+            .all(|entity| transport.loaded.contains(entity));
+        partitions.push(CampaignTransportPartition {
+            transport: transport.entity,
+            cargo: ordered_cargo,
+            pickup_position,
+            all_loaded,
+        });
+    }
+    Some(partitions)
+}
+
+fn build_ready_campaign_transport_partitions(
+    world: &World,
+    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    advanced_live_transports: &HashSet<Entity>,
+) -> Option<Vec<CampaignTransportPartition>> {
+    let mut transport_entities = assignment.transport_entities.clone();
+    transport_entities.sort_by_key(|entity| entity.to_bits());
+    transport_entities.dedup();
+    if transport_entities.is_empty() {
+        return None;
+    }
+    let transport_set: HashSet<_> = transport_entities.iter().copied().collect();
+
+    let island_map = world.get_resource::<crate::ai::islands::IslandMap>();
+    let mut requested_cargo: Vec<_> = assignment
+        .capture_entities
+        .iter()
+        .chain(assignment.combat_entities.iter())
+        .copied()
+        .filter(|cargo| {
+            // 既に対象島へ上陸して通常部隊へ引き渡されたEntityは、再輸送候補へ戻さない。
+            world
+                .get::<crate::components::Transporting>(*cargo)
+                .is_some()
+                || world.get::<GridPosition>(*cargo).is_none_or(|position| {
+                    island_map
+                        .and_then(|map| map.get_island_at(position))
+                        .is_none_or(|island| island.id != assignment.island_id)
+                })
+        })
+        .collect();
+    requested_cargo.sort_by_key(|entity| entity.to_bits());
+    requested_cargo.dedup();
+    if requested_cargo
+        .iter()
+        .any(|cargo| transport_set.contains(cargo))
+    {
+        return None;
+    }
+
+    let mut loaded_owner = HashMap::new();
+    let mut transports = Vec::with_capacity(transport_entities.len());
+    for transport in transport_entities {
+        let position = world.get::<GridPosition>(transport).copied()?;
+        let stats = world.get::<UnitStats>(transport)?.clone();
+        let cargo_capacity = world.get::<crate::components::CargoCapacity>(transport)?;
+        let mut loaded = cargo_capacity.loaded.clone();
+        loaded.sort_by_key(|entity| entity.to_bits());
+        loaded.dedup();
+        if loaded.len() > cargo_capacity.max as usize {
+            return None;
+        }
+        // Transit/Drop中の輸送役へ未搭載cargoを追加するとPickupへ逆行するため、実搭載分を上限に固定する。
+        let capacity = if advanced_live_transports.contains(&transport) {
+            loaded.len()
+        } else {
+            cargo_capacity.max as usize
+        };
+        for cargo in &loaded {
+            if transport_set.contains(cargo)
+                || world
+                    .get::<crate::components::Transporting>(*cargo)
+                    .is_none_or(|transporting| transporting.0 != transport)
+            {
+                return None;
+            }
+            let cargo_type = world.get::<UnitStats>(*cargo)?.unit_type;
+            if !stats.loadable_unit_types.contains(&cargo_type)
+                || loaded_owner.insert(*cargo, transport).is_some()
+            {
+                return None;
+            }
+            if !requested_cargo.contains(cargo) {
+                // Forming以前から実搭載されていたcargoも、実際の輸送役との関係を保持する。
+                requested_cargo.push(*cargo);
+            }
+        }
+        transports.push(CampaignTransportCandidate {
+            entity: transport,
+            position,
+            stats,
+            capacity,
+            loaded,
+        });
+    }
+
+    for cargo in &requested_cargo {
+        if let Some(transporting) = world.get::<crate::components::Transporting>(*cargo)
+            && loaded_owner.get(cargo) != Some(&transporting.0)
+        {
+            return None;
+        }
+    }
+
+    let mut remaining_cargo: Vec<_> = requested_cargo
+        .into_iter()
+        .filter(|cargo| !loaded_owner.contains_key(cargo))
+        .collect();
+    // 選択肢の少ないcargoから探索するが、行き止まりでは必ず巻き戻して完全partitionを優先する。
+    remaining_cargo.sort_by_key(|cargo| {
+        let cargo_stats = world.get::<UnitStats>(*cargo);
+        let compatible_count = cargo_stats.map_or(usize::MAX, |cargo_stats| {
+            transports
+                .iter()
+                .filter(|transport| {
+                    transport.loaded.len() < transport.capacity
+                        && transport
+                            .stats
+                            .loadable_unit_types
+                            .contains(&cargo_stats.unit_type)
+                })
+                .count()
+        });
+        let capture_rank = cargo_stats.map_or(1u8, |stats| if stats.can_capture { 0 } else { 1 });
+        (compatible_count, capture_rank, cargo.to_bits())
+    });
+    if remaining_cargo
+        .iter()
+        .any(|cargo| world.get::<UnitStats>(*cargo).is_none())
+    {
+        return None;
+    }
+
+    let mut assigned: Vec<Vec<Entity>> = transports
+        .iter()
+        .map(|transport| transport.loaded.clone())
+        .collect();
+    search_ready_campaign_transport_partition(
+        world,
+        &transports,
+        &remaining_cargo,
+        0,
+        &mut assigned,
+    )
+}
+
+/// readyになった既存作戦を、輸送役ごとの実行Squadへ決定的に再調整する。
+fn reconcile_ready_forming_campaign_squad(
+    world: &World,
+    manager: &mut SquadManager,
+    player_id: PlayerId,
+    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+) -> bool {
+    if !assignment.operation_ready {
+        return false;
+    }
+    let has_target_forming = manager.squads.iter().any(|squad| {
+        squad_is_mutable_by_player(world, squad, player_id)
+            && squad.mission_type == MissionType::Transport
+            && squad.phase == MissionPhase::Forming
+            && squad.target_island == Some(assignment.island_id)
+    });
+    if !has_target_forming {
+        // 通常のlive作戦だけになった後は再partitionせず、実行フェーズの進行をそのまま維持する。
+        return false;
+    }
+
+    let assignment_transports: HashSet<_> = assignment.transport_entities.iter().copied().collect();
+    let mut candidate_squads = Vec::new();
+    manager.squads.retain(|squad| {
+        let is_target_forming = squad_is_mutable_by_player(world, squad, player_id)
+            && squad.mission_type == MissionType::Transport
+            && squad.phase == MissionPhase::Forming
+            && squad.target_island == Some(assignment.island_id);
+        let is_target_live = squad_is_mutable_by_player(world, squad, player_id)
+            && squad.mission_type == MissionType::Transport
+            && squad.target_island == Some(assignment.island_id)
+            && squad
+                .transport_entity
+                .is_some_and(|transport| assignment_transports.contains(&transport))
+            && matches!(
+                squad.phase,
+                MissionPhase::Transport(
+                    TransportPhase::Pickup | TransportPhase::Transit | TransportPhase::Drop
+                )
+            );
+        if is_target_forming || is_target_live {
+            candidate_squads.push(squad.clone());
+        }
+        !(is_target_forming || is_target_live)
+    });
+    if candidate_squads.is_empty() {
+        return false;
+    }
+    candidate_squads.sort_by_key(|squad| squad.id.0);
+
+    // Transit/Dropの輸送役は実搭載cargoだけで作戦を継続し、再計画でPickupへ戻さない。
+    let advanced_live_transports: HashSet<_> = candidate_squads
+        .iter()
+        .filter(|squad| {
+            matches!(
+                squad.phase,
+                MissionPhase::Transport(TransportPhase::Transit | TransportPhase::Drop)
+            )
+        })
+        .filter_map(|squad| squad.transport_entity)
+        .collect();
+    let Some(mut partitions) =
+        build_ready_campaign_transport_partitions(world, assignment, &advanced_live_transports)
+    else {
+        // 完全なcapacity/loadability/rendezvousが成立しない場合は元の作戦群を保つ。
+        manager.squads.extend(candidate_squads);
+        manager.squads.sort_by_key(|squad| squad.id.0);
+        return true;
+    };
+    partitions.sort_by_key(|partition| partition.transport.to_bits());
+    let incorporated_cargo_by_transport: HashMap<_, HashSet<_>> = partitions
+        .iter()
+        .map(|partition| {
+            (
+                partition.transport,
+                partition.cargo.iter().copied().collect(),
+            )
+        })
+        .collect();
+
+    let has_unincorporated_loaded_state = |squad: &Squad| {
+        let transport_loaded_is_unique = squad.transport_entity.is_some_and(|transport| {
+            world
+                .get::<crate::components::CargoCapacity>(transport)
+                .is_some_and(|capacity| {
+                    capacity.loaded.iter().any(|cargo| {
+                        incorporated_cargo_by_transport
+                            .get(&transport)
+                            .is_none_or(|incorporated| !incorporated.contains(cargo))
+                    })
+                })
+        });
+        transport_loaded_is_unique
+            || squad.cargo_entities.iter().any(|cargo| {
+                world
+                    .get::<crate::components::Transporting>(*cargo)
+                    .is_some_and(|transporting| {
+                        incorporated_cargo_by_transport
+                            .get(&transporting.0)
+                            .is_none_or(|incorporated| !incorporated.contains(cargo))
+                    })
+            })
+    };
+
+    let mut owned_entities: HashSet<_> = assignment.transport_entities.iter().copied().collect();
+    for partition in &partitions {
+        owned_entities.extend(partition.cargo.iter().copied());
+    }
+    for squad in &mut manager.squads {
+        if !squad_is_mutable_by_player(world, squad, player_id) {
+            continue;
+        }
+        squad
+            .members
+            .retain(|entity| !owned_entities.contains(entity));
+        squad
+            .cargo_entities
+            .retain(|entity| !owned_entities.contains(entity));
+        squad
+            .delivered_cargo
+            .retain(|entity| !owned_entities.contains(entity));
+        if squad
+            .transport_entity
+            .is_some_and(|transport| owned_entities.contains(&transport))
+        {
+            squad.transport_entity = None;
+        }
+    }
+
+    let live_state_is_compatible = |squad: &Squad, partition: &CampaignTransportPartition| {
+        if squad.transport_entity != Some(partition.transport)
+            || !squad.members.contains(&partition.transport)
+            || squad.cargo_entities.is_empty()
+            || !squad
+                .cargo_entities
+                .iter()
+                .all(|cargo| partition.cargo.contains(cargo))
+        {
+            return false;
+        }
+        match squad.phase {
+            MissionPhase::Transport(TransportPhase::Drop | TransportPhase::Transit) => {
+                partition.all_loaded
+            }
+            MissionPhase::Transport(TransportPhase::Pickup) => {
+                !partition.all_loaded && squad.pickup_position == Some(partition.pickup_position)
+            }
+            _ => false,
+        }
+    };
+
+    // assignment輸送役との完全一致を最優先し、進行中live、Forming、非互換liveの順で再利用する。
+    let mut selected_squads = vec![None; partitions.len()];
+    for (partition_index, partition) in partitions.iter().enumerate() {
+        let best = candidate_squads
+            .iter()
+            .enumerate()
+            .filter(|(_, squad)| squad.transport_entity == Some(partition.transport))
+            .min_by_key(|(_, squad)| {
+                let phase_rank = if live_state_is_compatible(squad, partition) {
+                    match squad.phase {
+                        MissionPhase::Transport(TransportPhase::Drop) => 0u8,
+                        MissionPhase::Transport(TransportPhase::Transit) => 1u8,
+                        MissionPhase::Transport(TransportPhase::Pickup) => 2u8,
+                        _ => 5u8,
+                    }
+                } else if squad.phase == MissionPhase::Forming {
+                    3u8
+                } else {
+                    4u8
+                };
+                (phase_rank, squad.id.0)
+            })
+            .map(|(index, squad)| (index, live_state_is_compatible(squad, partition)));
+        if let Some((index, preserve_live_state)) = best {
+            selected_squads[partition_index] =
+                Some((candidate_squads.remove(index), preserve_live_state));
+        }
+    }
+    for selected in &mut selected_squads {
+        if selected.is_none() {
+            // transport不一致のfallbackは、固有の実搭載状態を持たないFormingだけに限定する。
+            let fallback = candidate_squads.iter().position(|squad| {
+                squad.phase == MissionPhase::Forming && !has_unincorporated_loaded_state(squad)
+            });
+            *selected = if let Some(index) = fallback {
+                Some((candidate_squads.remove(index), false))
+            } else {
+                manager.create_owned_squad(MissionType::Transport, player_id);
+                Some((manager.squads.pop().unwrap(), false))
+            };
+        }
+    }
+
+    let mut reconciled = Vec::with_capacity(partitions.len());
+    for (partition, selected) in partitions.into_iter().zip(selected_squads) {
+        let (mut squad, preserve_live_state) = selected.unwrap();
+        squad.members.clear();
+        squad.members.insert(partition.transport);
+        squad.transport_entity = Some(partition.transport);
+        squad.cargo_entities = partition.cargo;
+        squad.target_island = Some(assignment.island_id);
+        squad.target = Some(assignment.target_position);
+        squad.delivered_cargo.clear();
+        if !preserve_live_state {
+            squad.pickup_position = Some(partition.pickup_position);
+            squad.drop_position = None;
+            // 新規またはForming Squadは、自身の全cargoが実搭載済みの場合だけTransitを許可する。
+            squad.phase = MissionPhase::Transport(if partition.all_loaded {
+                TransportPhase::Transit
+            } else {
+                TransportPhase::Pickup
+            });
+        }
+        reconciled.push(squad);
+    }
+
+    // assignmentへ組み込まれていない実搭載関係を持つFormingだけは残し、live duplicateは残さない。
+    let preserved_loaded_squads = candidate_squads
+        .into_iter()
+        .filter(|squad| squad.phase == MissionPhase::Forming)
+        .filter(has_unincorporated_loaded_state);
+
+    // 空の重複候補は破棄し、assignment輸送役ごとに1 Squadだけを残す。
+    manager.squads.extend(reconciled);
+    manager.squads.extend(preserved_loaded_squads);
+    manager.squads.sort_by_key(|squad| squad.id.0);
+    false
+}
+
+fn campaign_assignment_priority(
+    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+) -> (u8, usize) {
+    use crate::ai::island_campaign::IslandCampaignDecision;
+
+    let rank = match assignment.decision {
+        IslandCampaignDecision::Defend => 0,
+        _ if assignment.continued_from_existing_squad => 1,
+        IslandCampaignDecision::Expand => 2,
+        IslandCampaignDecision::Contest | IslandCampaignDecision::Reinforce => 3,
+        IslandCampaignDecision::Assault => 4,
+        _ => 5,
+    };
+    (rank, assignment.island_id.0)
+}
+
+fn cargo_is_landed_on_assignment_island(
+    world: &World,
+    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    cargo: Entity,
+) -> bool {
+    if world
+        .get::<crate::components::Transporting>(cargo)
+        .is_some()
+    {
+        return false;
+    }
+    let Some(position) = world.get::<GridPosition>(cargo) else {
+        return false;
+    };
+    world
+        .get_resource::<crate::ai::islands::IslandMap>()
+        .and_then(|map| map.get_island_at(position))
+        .is_some_and(|island| island.id == assignment.island_id)
+}
+
+/// portfolio assignmentごとにFormingを復元し、readyなら既存の安全なpartitionへ接続する。
+fn prepare_campaign_transport_assignment(
+    world: &World,
+    manager: &mut SquadManager,
+    player_id: PlayerId,
+    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+) -> bool {
+    adopt_legacy_squad_owners(world, manager);
+    if assignment.transport_entities.is_empty() && assignment.operation_ready {
+        return false;
+    }
+
+    let assignment_transports: HashSet<_> = assignment.transport_entities.iter().copied().collect();
+    let covered_transports: HashSet<_> = manager
+        .squads
+        .iter()
+        .filter(|squad| squad_is_mutable_by_player(world, squad, player_id))
+        .filter(|squad| squad.mission_type == MissionType::Transport)
+        .filter(|squad| squad.target_island == Some(assignment.island_id))
+        .filter_map(|squad| squad.transport_entity)
+        .filter(|transport| assignment_transports.contains(transport))
+        .collect();
+    let has_forming = manager.squads.iter().any(|squad| {
+        squad_is_mutable_by_player(world, squad, player_id)
+            && squad.mission_type == MissionType::Transport
+            && squad.target_island == Some(assignment.island_id)
+            && squad.phase == MissionPhase::Forming
+    });
+    let needs_forming = !has_forming
+        && (!assignment.operation_ready
+            || assignment
+                .transport_entities
+                .iter()
+                .any(|transport| !covered_transports.contains(transport)));
+
+    if needs_forming {
+        let already_owned: HashSet<_> = manager
+            .squads
+            .iter()
+            .filter(|squad| squad_is_mutable_by_player(world, squad, player_id))
+            .filter(|squad| squad.target_island == Some(assignment.island_id))
+            .flat_map(|squad| {
+                squad
+                    .members
+                    .iter()
+                    .chain(squad.cargo_entities.iter())
+                    .chain(squad.delivered_cargo.iter())
+                    .copied()
+            })
+            .collect();
+        let mut forming_cargo: Vec<_> = assignment
+            .capture_entities
+            .iter()
+            .chain(assignment.combat_entities.iter())
+            .copied()
+            .filter(|cargo| !already_owned.contains(cargo))
+            .filter(|cargo| !cargo_is_landed_on_assignment_island(world, assignment, *cargo))
+            .collect();
+        for transport in assignment
+            .transport_entities
+            .iter()
+            .filter(|transport| !covered_transports.contains(transport))
+        {
+            if let Some(capacity) = world.get::<crate::components::CargoCapacity>(*transport) {
+                forming_cargo.extend(
+                    capacity
+                        .loaded
+                        .iter()
+                        .filter(|cargo| !already_owned.contains(cargo))
+                        .copied(),
+                );
+            }
+        }
+        forming_cargo.sort_by_key(|entity| entity.to_bits());
+        forming_cargo.dedup();
+
+        let squad = manager.create_owned_squad(MissionType::Transport, player_id);
+        squad.members.extend(
+            assignment
+                .transport_entities
+                .iter()
+                .filter(|transport| !covered_transports.contains(transport))
+                .copied(),
+        );
+        squad.transport_entity = squad
+            .members
+            .iter()
+            .min_by_key(|entity| entity.to_bits())
+            .copied();
+        squad.cargo_entities = forming_cargo;
+        squad.target_island = Some(assignment.island_id);
+        squad.target = Some(assignment.target_position);
+        squad.phase = MissionPhase::Forming;
+    }
+
+    if assignment.operation_ready {
+        reconcile_ready_forming_campaign_squad(world, manager, player_id, assignment)
+    } else {
+        false
+    }
+}
+
+fn nearest_campaign_property_target(
+    world: &World,
+    player_id: PlayerId,
+    island_id: crate::ai::islands::IslandId,
+    members: &[Entity],
+) -> Option<GridPosition> {
+    let island_map = world.get_resource::<crate::ai::islands::IslandMap>()?;
+    let map = world.get_resource::<Map>()?;
+    let registry = world.get_resource::<MasterDataRegistry>()?;
+    world
+        .iter_entities()
+        .filter_map(|entity| {
+            let target = entity.get::<GridPosition>().copied()?;
+            let property = entity.get::<Property>()?;
+            if property.owner_id == Some(player_id)
+                || island_map
+                    .get_island_at(&target)
+                    .is_none_or(|island| island.id != island_id)
+            {
+                return None;
+            }
+            let distance = members
+                .iter()
+                .filter_map(|member| {
+                    let position = world.get::<GridPosition>(*member)?;
+                    let stats = world.get::<UnitStats>(*member)?;
+                    is_terrain_reachable(
+                        map,
+                        registry,
+                        (position.x, position.y),
+                        (target.x, target.y),
+                        stats.movement_type,
+                    )
+                    .then_some(position.x.abs_diff(target.x) + position.y.abs_diff(target.y))
+                })
+                .min()?;
+            Some((distance, target.y, target.x, target))
+        })
+        .min_by_key(|candidate| (candidate.0, candidate.1, candidate.2))
+        .map(|candidate| candidate.3)
+}
+
+fn campaign_member_distance_to_position(
+    world: &World,
+    member: Entity,
+    target: GridPosition,
+) -> Option<usize> {
+    let position = world.get::<GridPosition>(member)?;
+    let stats = world.get::<UnitStats>(member)?;
+    let map = world.get_resource::<Map>()?;
+    let registry = world.get_resource::<MasterDataRegistry>()?;
+    is_terrain_reachable(
+        map,
+        registry,
+        (position.x, position.y),
+        (target.x, target.y),
+        stats.movement_type,
+    )
+    .then_some(position.x.abs_diff(target.x) + position.y.abs_diff(target.y))
+}
+
+fn campaign_member_attack_distance(
+    world: &World,
+    member: Entity,
+    enemy: Entity,
+    enemy_position: GridPosition,
+) -> Option<usize> {
+    let member_position = world.get::<GridPosition>(member)?;
+    let member_stats = world.get::<UnitStats>(member)?;
+    let ammo = world.get::<Ammo>(member)?;
+    let enemy_stats = world.get::<UnitStats>(enemy)?;
+    let map = world.get_resource::<Map>()?;
+    let registry = world.get_resource::<MasterDataRegistry>()?;
+    let mut firing_positions = Vec::new();
+    for y in 0..map.height {
+        for x in 0..map.width {
+            let terrain = map.get_terrain(x, y)?;
+            if crate::systems::movement::get_valid_movement_cost(
+                registry,
+                member_stats.movement_type,
+                terrain,
+            )
+            .is_none()
+                || !is_terrain_reachable(
+                    map,
+                    registry,
+                    (member_position.x, member_position.y),
+                    (x, y),
+                    member_stats.movement_type,
+                )
+            {
+                continue;
+            }
+            let firing_distance = map.distance(x, y, enemy_position.x, enemy_position.y);
+            if crate::systems::combat::select_weapon(
+                ammo.ammo1,
+                ammo.ammo2,
+                member_stats.unit_type.as_str(),
+                enemy_stats.unit_type.as_str(),
+                firing_distance,
+                registry,
+            )
+            .is_none()
+            {
+                continue;
+            }
+            firing_positions.push((
+                map.distance(member_position.x, member_position.y, x, y) as usize,
+                y,
+                x,
+            ));
+        }
+    }
+    firing_positions.sort_unstable();
+    firing_positions.first().map(|position| position.0)
+}
+
+#[derive(Clone)]
+struct CampaignResponsibility {
+    mission_type: MissionType,
+    target: GridPosition,
+    members: Vec<Entity>,
+}
+
+fn campaign_combat_responsibilities(
+    world: &World,
+    player_id: PlayerId,
+    island_id: crate::ai::islands::IslandId,
+    members: &[Entity],
+) -> Vec<CampaignResponsibility> {
+    let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() else {
+        return Vec::new();
+    };
+    let mut enemies: Vec<_> = world
+        .iter_entities()
+        .filter_map(|entity| {
+            let target = entity.get::<GridPosition>().copied()?;
+            let faction = entity.get::<Faction>()?;
+            (faction.0 != player_id
+                && island_map
+                    .get_island_at(&target)
+                    .is_some_and(|island| island.id == island_id))
+            .then_some((entity.id(), target))
+        })
+        .collect();
+    enemies.sort_by_key(|(entity, target)| (target.y, target.x, entity.to_bits()));
+
+    let mut remaining = members.to_vec();
+    remaining.sort_by_key(|entity| entity.to_bits());
+    remaining.dedup();
+    let mut responsibilities = Vec::new();
+
+    while !remaining.is_empty() {
+        let mut candidates: Vec<_> = enemies
+            .iter()
+            .filter_map(|(enemy, target)| {
+                let reachable: Vec<_> = remaining
+                    .iter()
+                    .filter_map(|member| {
+                        campaign_member_attack_distance(world, *member, *enemy, *target)
+                            .map(|distance| (*member, distance))
+                    })
+                    .collect();
+                if reachable.is_empty() {
+                    return None;
+                }
+                let total_distance = reachable.iter().fold(0usize, |total, (_, distance)| {
+                    total.saturating_add(*distance)
+                });
+                Some((*enemy, *target, reachable, total_distance))
+            })
+            .collect();
+        if candidates.is_empty() {
+            break;
+        }
+        // 全員が到達できる共通敵を最優先し、無ければ最多memberを受け持つ局所目標を選ぶ。
+        candidates.sort_by_key(|(enemy, target, reachable, total_distance)| {
+            (
+                usize::MAX - reachable.len(),
+                *total_distance,
+                target.y,
+                target.x,
+                enemy.to_bits(),
+            )
+        });
+        let (_, target, reachable, _) = candidates.remove(0);
+        let assigned: Vec<_> = reachable.iter().map(|(member, _)| *member).collect();
+        let assigned_set: HashSet<_> = assigned.iter().copied().collect();
+        remaining.retain(|member| !assigned_set.contains(member));
+        responsibilities.push(CampaignResponsibility {
+            mission_type: MissionType::Attack,
+            target,
+            members: assigned,
+        });
+    }
+
+    // 敵へ到達できないmemberは、全員が到達できるmember位置ごとに決定的に現地防御へまとめる。
+    while !remaining.is_empty() {
+        let mut hold_candidates: Vec<_> = remaining
+            .iter()
+            .filter_map(|source| {
+                let target = world.get::<GridPosition>(*source).copied()?;
+                let reachable: Vec<_> = remaining
+                    .iter()
+                    .filter_map(|member| {
+                        campaign_member_distance_to_position(world, *member, target)
+                            .map(|distance| (*member, distance))
+                    })
+                    .collect();
+                let total_distance = reachable.iter().fold(0usize, |total, (_, distance)| {
+                    total.saturating_add(*distance)
+                });
+                Some((*source, target, reachable, total_distance))
+            })
+            .collect();
+        hold_candidates.sort_by_key(|(source, target, reachable, total_distance)| {
+            (
+                usize::MAX - reachable.len(),
+                *total_distance,
+                target.y,
+                target.x,
+                source.to_bits(),
+            )
+        });
+        let Some((_, target, reachable, _)) = hold_candidates.into_iter().next() else {
+            break;
+        };
+        let assigned: Vec<_> = reachable.iter().map(|(member, _)| *member).collect();
+        let assigned_set: HashSet<_> = assigned.iter().copied().collect();
+        remaining.retain(|member| !assigned_set.contains(member));
+        responsibilities.push(CampaignResponsibility {
+            mission_type: MissionType::Defense,
+            target,
+            members: assigned,
+        });
+    }
+
+    responsibilities.sort_by_key(|responsibility| {
+        let mission_rank = match responsibility.mission_type {
+            MissionType::Attack => 0,
+            MissionType::Defense => 1,
+            MissionType::Capture => 2,
+            MissionType::Transport => 3,
+        };
+        (
+            mission_rank,
+            responsibility.target.y,
+            responsibility.target.x,
+            responsibility
+                .members
+                .iter()
+                .map(|entity| entity.to_bits())
+                .min()
+                .unwrap_or(u64::MAX),
+        )
+    });
+    responsibilities
+}
+
+fn assign_campaign_responsibilities(
+    world: &World,
+    manager: &mut SquadManager,
+    player_id: PlayerId,
+    island_id: crate::ai::islands::IslandId,
+    mut responsibilities: Vec<CampaignResponsibility>,
+    managed_missions: &[MissionType],
+) {
+    for responsibility in &mut responsibilities {
+        responsibility
+            .members
+            .sort_by_key(|entity| entity.to_bits());
+        responsibility.members.dedup();
+    }
+    responsibilities.retain(|responsibility| !responsibility.members.is_empty());
+
+    let all_members: HashSet<_> = responsibilities
+        .iter()
+        .flat_map(|responsibility| responsibility.members.iter().copied())
+        .collect();
+    let mut selected_ids = Vec::with_capacity(responsibilities.len());
+    let mut used_ids = HashSet::new();
+    for responsibility in &responsibilities {
+        let member_set: HashSet<_> = responsibility.members.iter().copied().collect();
+        let existing_id = manager
+            .squads
+            .iter()
+            .filter(|squad| !used_ids.contains(&squad.id))
+            .filter(|squad| squad_is_mutable_by_player(world, squad, player_id))
+            .filter(|squad| squad.mission_type == responsibility.mission_type)
+            .filter(|squad| squad.target_island == Some(island_id))
+            .min_by_key(|squad| {
+                let compatibility = if squad.target == Some(responsibility.target) {
+                    0
+                } else if squad
+                    .members
+                    .iter()
+                    .any(|member| member_set.contains(member))
+                {
+                    1
+                } else {
+                    2
+                };
+                (compatibility, squad.id.0)
+            })
+            .map(|squad| squad.id);
+        let selected_id = existing_id.unwrap_or_else(|| {
+            manager
+                .create_owned_squad(responsibility.mission_type.clone(), player_id)
+                .id
+        });
+        used_ids.insert(selected_id);
+        selected_ids.push(selected_id);
+    }
+
+    // assignment memberを他責務・輸送cargoから先に外し、各partitionへ一度だけ所属させる。
+    for squad in &mut manager.squads {
+        if !squad_is_mutable_by_player(world, squad, player_id) {
+            continue;
+        }
+        squad.members.retain(|entity| !all_members.contains(entity));
+        squad
+            .cargo_entities
+            .retain(|entity| !all_members.contains(entity));
+        squad
+            .delivered_cargo
+            .retain(|entity| !all_members.contains(entity));
+    }
+    for (responsibility, selected_id) in responsibilities.iter().zip(&selected_ids) {
+        let squad = manager
+            .squads
+            .iter_mut()
+            .find(|squad| squad.id == *selected_id)
+            .unwrap();
+        squad.members = responsibility.members.iter().copied().collect();
+        squad.mission_type = responsibility.mission_type.clone();
+        squad.target_island = Some(island_id);
+        squad.target = Some(responsibility.target);
+        if squad.phase == MissionPhase::Completed {
+            squad.phase = MissionPhase::Forming;
+        }
+    }
+    let selected_set: HashSet<_> = selected_ids.into_iter().collect();
+    manager.squads.retain(|squad| {
+        selected_set.contains(&squad.id)
+            || !squad_is_mutable_by_player(world, squad, player_id)
+            || squad.target_island != Some(island_id)
+            || !managed_missions.contains(&squad.mission_type)
+    });
+    manager.squads.sort_by_key(|squad| squad.id.0);
+}
+
+fn assign_campaign_members(
+    world: &World,
+    manager: &mut SquadManager,
+    player_id: PlayerId,
+    mission_type: MissionType,
+    island_id: crate::ai::islands::IslandId,
+    target: GridPosition,
+    members: Vec<Entity>,
+) {
+    if members.is_empty() {
+        return;
+    }
+    assign_campaign_responsibilities(
+        world,
+        manager,
+        player_id,
+        island_id,
+        vec![CampaignResponsibility {
+            mission_type: mission_type.clone(),
+            target,
+            members,
+        }],
+        &[mission_type],
+    );
+}
+
+fn prepare_campaign_local_assignment(
+    world: &World,
+    manager: &mut SquadManager,
+    player_id: PlayerId,
+    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+) {
+    use crate::ai::island_campaign::IslandCampaignDecision;
+
+    let local_entities = |entities: &[Entity]| {
+        entities
+            .iter()
+            .copied()
+            .filter(|entity| cargo_is_landed_on_assignment_island(world, assignment, *entity))
+            .collect::<Vec<_>>()
+    };
+    match assignment.decision {
+        IslandCampaignDecision::Defend => {
+            let members: Vec<_> = assignment
+                .capture_entities
+                .iter()
+                .chain(assignment.combat_entities.iter())
+                .copied()
+                .filter(|entity| {
+                    if world
+                        .get::<crate::components::Transporting>(*entity)
+                        .is_some()
+                    {
+                        return false;
+                    }
+                    let (Some(position), Some(stats), Some(map), Some(registry)) = (
+                        world.get::<GridPosition>(*entity),
+                        world.get::<UnitStats>(*entity),
+                        world.get_resource::<Map>(),
+                        world.get_resource::<MasterDataRegistry>(),
+                    ) else {
+                        return false;
+                    };
+                    is_terrain_reachable(
+                        map,
+                        registry,
+                        (position.x, position.y),
+                        (assignment.target_position.x, assignment.target_position.y),
+                        stats.movement_type,
+                    )
+                })
+                .collect();
+            assign_campaign_members(
+                world,
+                manager,
+                player_id,
+                MissionType::Defense,
+                assignment.island_id,
+                assignment.target_position,
+                members,
+            );
+        }
+        IslandCampaignDecision::Expand
+        | IslandCampaignDecision::Assault
+        | IslandCampaignDecision::Contest
+        | IslandCampaignDecision::Reinforce => {
+            let capture = local_entities(&assignment.capture_entities);
+            if let Some(target) =
+                nearest_campaign_property_target(world, player_id, assignment.island_id, &capture)
+            {
+                assign_campaign_members(
+                    world,
+                    manager,
+                    player_id,
+                    MissionType::Capture,
+                    assignment.island_id,
+                    target,
+                    capture,
+                );
+            }
+            let combat = local_entities(&assignment.combat_entities);
+            let responsibilities =
+                campaign_combat_responsibilities(world, player_id, assignment.island_id, &combat);
+            assign_campaign_responsibilities(
+                world,
+                manager,
+                player_id,
+                assignment.island_id,
+                responsibilities,
+                &[MissionType::Attack, MissionType::Defense],
+            );
+        }
+        _ => {}
+    }
+}
+
+fn prepare_secure_local_captures(
+    world: &World,
+    manager: &mut SquadManager,
+    player_id: PlayerId,
+    portfolio: &crate::ai::island_campaign::IslandCampaignPortfolio,
+) -> HashSet<Entity> {
+    use crate::ai::island_campaign::{IslandCampaignDecision, campaign_unit_type_rank};
+
+    let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() else {
+        return HashSet::new();
+    };
+    let mut secure_islands: Vec<_> = portfolio
+        .islands
+        .iter()
+        .filter(|assessment| assessment.decision == IslandCampaignDecision::Secure)
+        .map(|assessment| assessment.island_id)
+        .collect();
+    secure_islands.sort_by_key(|island| island.0);
+    secure_islands.dedup();
+    let mut protected = HashSet::new();
+    for island_id in secure_islands {
+        let mut candidates: Vec<_> = world
+            .iter_entities()
+            .filter_map(|entity_ref| {
+                let entity = entity_ref.id();
+                let faction = entity_ref.get::<Faction>()?;
+                let position = entity_ref.get::<GridPosition>()?;
+                let stats = entity_ref.get::<UnitStats>()?;
+                if faction.0 != player_id
+                    || !stats.can_capture
+                    || entity_ref
+                        .get::<crate::components::Transporting>()
+                        .is_some()
+                    || island_map
+                        .get_island_at(position)
+                        .is_none_or(|island| island.id != island_id)
+                    || manager.squads.iter().any(|squad| {
+                        (squad.members.contains(&entity)
+                            || squad.cargo_entities.contains(&entity)
+                            || squad.delivered_cargo.contains(&entity))
+                            && !squad_is_mutable_by_player(world, squad, player_id)
+                    })
+                {
+                    return None;
+                }
+                let target =
+                    nearest_campaign_property_target(world, player_id, island_id, &[entity]);
+                Some((
+                    stats.cost,
+                    campaign_unit_type_rank(stats.unit_type),
+                    entity.to_bits(),
+                    entity,
+                    target,
+                ))
+            })
+            .collect();
+        candidates.sort_by_key(|candidate| (candidate.0, candidate.1, candidate.2));
+        let selected = candidates
+            .iter()
+            .find(|candidate| candidate.4.is_some())
+            .or_else(|| candidates.first())
+            .copied();
+        if let Some((_, _, _, entity, target)) = selected {
+            // 到達可否とは独立にallocator選択Entityを保護し、他島輸送へ戻さない。
+            protected.insert(entity);
+            if let Some(target) = target {
+                assign_campaign_members(
+                    world,
+                    manager,
+                    player_id,
+                    MissionType::Capture,
+                    island_id,
+                    target,
+                    vec![entity],
+                );
+            } else {
+                for squad in &mut manager.squads {
+                    if !squad_is_mutable_by_player(world, squad, player_id) {
+                        continue;
+                    }
+                    squad.members.remove(&entity);
+                    squad.cargo_entities.retain(|cargo| *cargo != entity);
+                    squad.delivered_cargo.retain(|cargo| *cargo != entity);
+                    if squad.transport_entity == Some(entity) {
+                        squad.transport_entity = None;
+                    }
+                }
+            }
+        }
+    }
+    protected
+}
+
+fn campaign_paused_islands(
+    portfolio: &crate::ai::island_campaign::IslandCampaignPortfolio,
+) -> HashSet<crate::ai::islands::IslandId> {
+    use crate::ai::island_campaign::IslandCampaignDecision;
+
+    portfolio
+        .islands
+        .iter()
+        .filter(|assessment| {
+            assessment.decision == IslandCampaignDecision::Withdraw
+                || assessment.pause_cause.is_some()
+        })
+        .map(|assessment| assessment.island_id)
+        .collect()
+}
+
+fn remove_abandoned_campaign_placeholders(
+    world: &World,
+    manager: &mut SquadManager,
+    player_id: PlayerId,
+    active_islands: &HashSet<crate::ai::islands::IslandId>,
+) {
+    manager.squads.retain(|squad| {
+        let is_empty_placeholder = squad.owner_id == Some(player_id)
+            && squad.mission_type == MissionType::Transport
+            && squad.phase == MissionPhase::Forming
+            && squad.transport_entity.is_none()
+            && squad.members.is_empty()
+            && squad.cargo_entities.is_empty()
+            && squad.delivered_cargo.is_empty()
+            && squad.target_island.is_some();
+        !is_empty_placeholder
+            || !squad_is_mutable_by_player(world, squad, player_id)
+            || squad
+                .target_island
+                .is_some_and(|island| active_islands.contains(&island))
+    });
+}
+
+fn apply_campaign_pauses(
+    world: &World,
+    manager: &mut SquadManager,
+    player_id: PlayerId,
+    paused_islands: &HashSet<crate::ai::islands::IslandId>,
+) {
+    if paused_islands.is_empty() {
+        return;
+    }
+
+    manager.squads.retain_mut(|squad| {
+        if !squad_is_mutable_by_player(world, squad, player_id)
+            || squad.mission_type != MissionType::Transport
+            || squad
+                .target_island
+                .is_none_or(|island| !paused_islands.contains(&island))
+        {
+            return true;
+        }
+        let Some(transport) = squad.transport_entity else {
+            // 輸送役を特定できないidle Formingは解放し、現地通常部隊には触れない。
+            return squad.phase != MissionPhase::Forming;
+        };
+        if world
+            .get::<Faction>(transport)
+            .is_none_or(|faction| faction.0 != player_id)
+        {
+            return true;
+        }
+
+        match squad.phase {
+            MissionPhase::Forming | MissionPhase::Transport(TransportPhase::Pickup) => {
+                let mut loaded = world
+                    .get::<crate::components::CargoCapacity>(transport)
+                    .map(|capacity| capacity.loaded.clone())
+                    .unwrap_or_default();
+                loaded.sort_by_key(|entity| entity.to_bits());
+                loaded.dedup();
+                if loaded.is_empty() {
+                    // 未搭載の輸送役・待機unitはSquad所有から解放し、逆向きのPickupを作らない。
+                    return false;
+                }
+                squad.members.clear();
+                squad.members.insert(transport);
+                squad.cargo_entities = loaded;
+                squad.target_island = None;
+                squad.target = None;
+                squad.pickup_position = None;
+                squad.drop_position = None;
+                squad.phase = MissionPhase::Transport(TransportPhase::Drop);
+                true
+            }
+            MissionPhase::Transport(TransportPhase::Return) | MissionPhase::Completed => false,
+            MissionPhase::Transport(TransportPhase::Transit | TransportPhase::Drop) => true,
+            MissionPhase::MovingToTarget | MissionPhase::Executing => true,
+        }
+    });
 }
 
 /// ゲームの戦略状況に基づいて、自動的に部隊の構築と新規メンバーの割り当てを行います。
@@ -514,10 +1920,82 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     let enemy_clusters = detect_enemy_clusters(world, perspective_player);
 
     // V3 の戦略拡張 (#53: 敵拠点の奪取目標化) を有効にするかどうか
-    let is_v3 = world
-        .get_resource::<crate::ai::ai_version::PlayerAiSettings>()
-        .map(|s| s.get_version(perspective_player).uses_v3_tactics())
-        .unwrap_or(false);
+    let is_v3 = crate::ai::resolve_player_ai_version(world, perspective_player).uses_v3_tactics();
+    if is_v3 {
+        let mut cache = world
+            .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .unwrap_or_default();
+        cache.set_campaign_portfolio(perspective_player, strategy.campaign_portfolio.clone());
+        cache.mark_squads_planned(perspective_player);
+        world.insert_resource(cache);
+    }
+    let paused_campaign_islands = if is_v3 {
+        campaign_paused_islands(&strategy.campaign_portfolio)
+    } else {
+        HashSet::new()
+    };
+    let secure_reserved_entities = if is_v3 {
+        apply_campaign_pauses(
+            world,
+            &mut manager,
+            perspective_player,
+            &paused_campaign_islands,
+        );
+        prepare_secure_local_captures(
+            world,
+            &mut manager,
+            perspective_player,
+            &strategy.campaign_portfolio,
+        )
+    } else {
+        HashSet::new()
+    };
+    let mut campaign_assignments: Vec<_> = if is_v3 {
+        strategy
+            .campaign_portfolio
+            .defenses
+            .iter()
+            .chain(strategy.campaign_portfolio.active_offensives.iter())
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    campaign_assignments.sort_by_key(campaign_assignment_priority);
+    let active_campaign_islands: HashSet<_> = campaign_assignments
+        .iter()
+        .map(|assignment| assignment.island_id)
+        .collect();
+    remove_abandoned_campaign_placeholders(
+        world,
+        &mut manager,
+        perspective_player,
+        &active_campaign_islands,
+    );
+    let mut all_campaign_reserved_entities: HashSet<_> = campaign_assignments
+        .iter()
+        .flat_map(|assignment| {
+            assignment
+                .transport_entities
+                .iter()
+                .chain(assignment.capture_entities.iter())
+                .chain(assignment.combat_entities.iter())
+        })
+        .copied()
+        .collect();
+    all_campaign_reserved_entities.extend(secure_reserved_entities);
+    let mut blocked_campaign_islands = HashSet::new();
+    for assignment in &campaign_assignments {
+        if prepare_campaign_transport_assignment(
+            world,
+            &mut manager,
+            perspective_player,
+            assignment,
+        ) {
+            blocked_campaign_islands.insert(assignment.island_id);
+        }
+        prepare_campaign_local_assignment(world, &mut manager, perspective_player, assignment);
+    }
 
     // #53 (V3): メンバーが全滅した占領部隊を解散する。
     // 残しておくと「そのターゲットには部隊が存在する」と誤判定され続け
@@ -545,6 +2023,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
             busy_entities.insert(member);
         }
         busy_entities.extend(squad.cargo_entities.iter().copied());
+        busy_entities.extend(squad.delivered_cargo.iter().copied());
     }
 
     // 占有情報（経路探索用）
@@ -554,8 +2033,9 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         &GridPosition,
         &UnitStats,
         Option<&crate::components::Transporting>,
+        Option<&crate::components::CargoCapacity>,
     )>();
-    for (faction, pos, stats, transporting) in q_all_units.iter(world) {
+    for (faction, pos, stats, transporting, cargo) in q_all_units.iter(world) {
         if transporting.is_some() {
             continue;
         }
@@ -566,7 +2046,9 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                 is_transport: stats.max_cargo > 0,
                 unit_type: stats.unit_type,
                 loadable_types: stats.loadable_unit_types.clone(),
-                free_slots: stats.max_cargo,
+                free_slots: cargo
+                    .map(|capacity| capacity.max.saturating_sub(capacity.loaded.len() as u32))
+                    .unwrap_or(0),
             },
         );
     }
@@ -587,10 +2069,12 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         &UnitStats,
         Option<&crate::components::Transporting>,
         Option<&crate::components::Fuel>,
+        Option<&crate::components::CargoCapacity>,
     )>();
-    for (entity, faction, pos, stats, transporting, fuel) in q_my_units.iter(world) {
+    for (entity, faction, pos, stats, transporting, fuel, cargo) in q_my_units.iter(world) {
         if faction.0 == perspective_player
             && !busy_entities.contains(&entity)
+            && !all_campaign_reserved_entities.contains(&entity)
             && !manager.solo_fallbacks.contains(&entity)
             && transporting.is_none()
             && fuel.is_none_or(|fuel| fuel.current > 0)
@@ -601,7 +2085,9 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                 stats.unit_type == UnitType::Infantry || stats.unit_type == UnitType::Mech;
 
             if is_transport {
-                free_transports.push((entity, *pos, stats.clone()));
+                if cargo.is_some_and(|capacity| capacity.max > 0) {
+                    free_transports.push((entity, *pos, stats.clone()));
+                }
             } else if is_infantry {
                 free_infantry.push((entity, *pos, stats.clone()));
             } else {
@@ -719,14 +2205,19 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         objectives.push(objective);
     }
 
-    // V3 の敵島侵攻は戦略レイヤーで選択した1島だけを対象とする。
     if is_v3 {
-        if let Some(invasion_target) = strategy.invasion_target {
-            objectives.retain(|objective| objective.target_island == invasion_target.target_island);
-        } else {
-            // 敵島侵攻が無い間は、中立島への通常拡張を従来どおり継続する。
-            objectives.retain(|objective| !enemy_owned_islands.contains(&objective.target_island));
-        }
+        let assigned_islands: HashSet<_> = campaign_assignments
+            .iter()
+            .map(|assignment| assignment.island_id)
+            .collect();
+        // portfolio assignmentは上の島別bridgeだけが所有し、旧経路は未予約の島内目標に限定する。
+        objectives.retain(|objective| {
+            !assigned_islands.contains(&objective.target_island)
+                && !blocked_campaign_islands.contains(&objective.target_island)
+                && !paused_campaign_islands.contains(&objective.target_island)
+                && base_islands.contains(&objective.target_island)
+                && !enemy_owned_islands.contains(&objective.target_island)
+        });
     }
 
     // スコア降順ソート（海を渡る必要がある別島を最優先）。
@@ -770,9 +2261,9 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
 
         let mut to_assign = objective.needed_infantry.0;
         let target_position = strategy
-            .invasion_target
-            .filter(|target| target.target_island == objective.target_island)
-            .map(|target| target.target_position)
+            .campaign_portfolio
+            .assignment_for(objective.target_island)
+            .map(|assignment| assignment.target_position)
             .or_else(|| {
                 island_props_map
                     .get(&objective.target_island)
@@ -807,7 +2298,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
             let capacity = world
                 .get::<crate::components::CargoCapacity>(transport_entity)
                 .map(|cargo| cargo.max as usize)
-                .unwrap_or(transport_stats.max_cargo as usize);
+                .unwrap_or(0);
             if capacity == 0 {
                 continue;
             }
@@ -819,7 +2310,6 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
             cargo_entities.sort_by_key(|entity| entity.to_bits());
             cargo_entities.dedup();
             cargo_entities.truncate(capacity);
-
             let initially_loaded_count = cargo_entities.len();
             let mut assigned_capture_count = cargo_entities
                 .iter()
@@ -948,7 +2438,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                 pickup_position = Some(transport_position);
             }
 
-            let squad = manager.create_squad(MissionType::Transport);
+            let squad = manager.create_owned_squad(MissionType::Transport, perspective_player);
             squad.members.insert(transport_entity);
             squad.transport_entity = Some(transport_entity);
             squad.cargo_entities = cargo_entities;
@@ -966,10 +2456,9 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         }
     }
 
-    // pop() で取り出した分だけ逆順になっているため、元の昇順（座標と Entity ID 順）へ戻す。
-    free_transports.reverse();
+    free_transports.sort_by_key(|(entity, position, _)| (position.y, position.x, entity.to_bits()));
 
-    // 割り当てられなかった搭載済み輸送機は、全カーゴを追跡して安全に降ろす。
+    // campaignへ予約されていない搭載済み輸送機は、別assignmentへ転用せず安全に降ろす。
     let mut i = 0;
     while i < free_transports.len() {
         let (transport_entity, transport_position, _) = free_transports[i].clone();
@@ -981,20 +2470,14 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         cargo_entities.dedup();
 
         if !cargo_entities.is_empty() {
-            let squad = manager.create_squad(MissionType::Transport);
+            let squad = manager.create_owned_squad(MissionType::Transport, perspective_player);
             squad.members.insert(transport_entity);
             squad.transport_entity = Some(transport_entity);
             squad.cargo_entities = cargo_entities;
             squad.pickup_position = Some(transport_position);
-            squad.target_island = strategy.invasion_target.map(|target| target.target_island);
-            squad.target = strategy
-                .invasion_target
-                .map(|target| target.target_position);
-            squad.phase = MissionPhase::Transport(if squad.target_island.is_some() {
-                TransportPhase::Transit
-            } else {
-                TransportPhase::Drop
-            });
+            squad.target_island = None;
+            squad.target = None;
+            squad.phase = MissionPhase::Transport(TransportPhase::Drop);
             free_transports.remove(i);
         } else {
             i += 1;
@@ -1029,11 +2512,14 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
             if turn_dist.turns <= 5 {
                 // すでにこのクラスターを防衛目標としている部隊があるか
                 let exists = manager.squads.iter().any(|s| {
-                    s.mission_type == MissionType::Defense && s.target == Some(cluster.center)
+                    squad_is_mutable_by_player(world, s, perspective_player)
+                        && s.mission_type == MissionType::Defense
+                        && s.target == Some(cluster.center)
                 });
 
                 if !exists {
-                    let squad = manager.create_squad(MissionType::Defense);
+                    let squad =
+                        manager.create_owned_squad(MissionType::Defense, perspective_player);
                     squad.target = Some(cluster.center);
                     squad.phase = MissionPhase::Forming;
 
@@ -1071,6 +2557,11 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         strategy.unowned_properties.iter().cloned().collect();
     if is_v3 {
         capture_targets.extend(strategy.enemy_properties.iter().cloned());
+        capture_targets.retain(|target| {
+            island_map
+                .get_island_at(target)
+                .is_none_or(|island| !paused_campaign_islands.contains(&island.id))
+        });
     }
     // 最寄りのフリー歩兵から近い順に割り当てる (HashSet 順の非決定性も排除し、
     // 限られた歩兵を近い目標へ優先的に振り分ける)。
@@ -1094,7 +2585,8 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         .squads
         .iter()
         .filter(|s| {
-            s.mission_type == MissionType::Capture
+            squad_is_mutable_by_player(world, s, perspective_player)
+                && s.mission_type == MissionType::Capture
                 && !s.members.is_empty()
                 && s.target.as_ref().is_some_and(&is_enemy_facility)
         })
@@ -1139,27 +2631,36 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         let is_on_base_island = base_islands.contains(&target_island.id);
 
         // この未占領拠点と同じ島にいるフリーの歩兵を探す
-        let inf_on_same_island_idx = free_infantry.iter().position(|(_, pos, _)| {
+        let inf_on_same_island_idx = free_infantry.iter().position(|(_, pos, stats)| {
             island_map
                 .get_island_at(pos)
-                .map_or(false, |i| i.id == target_island.id)
+                .is_some_and(|island| island.id == target_island.id)
+                && is_terrain_reachable(
+                    &map,
+                    &registry,
+                    (pos.x, pos.y),
+                    (unowned_pos.x, unowned_pos.y),
+                    stats.movement_type,
+                )
         });
 
-        // 占領部隊を立ち上げられる条件：
-        // 1. その島にフリーの歩兵がすでにいる
-        // 2. または、自軍の初期島（Base Island）であり、フリーの歩兵が（どの島でもいいから）存在する
-        let can_capture =
-            inf_on_same_island_idx.is_some() || (is_on_base_island && !free_infantry.is_empty());
+        // V3の洋上移動はportfolio transportだけが担当し、generic Captureは到達可能な現地要員に限定する。
+        let can_capture = inf_on_same_island_idx.is_some()
+            || !is_v3 && is_on_base_island && !free_infantry.is_empty();
 
         if can_capture {
-            let exists = manager
-                .squads
-                .iter()
-                .any(|s| s.mission_type == MissionType::Capture && s.target == Some(*unowned_pos));
+            let exists = manager.squads.iter().any(|s| {
+                squad_is_mutable_by_player(world, s, perspective_player)
+                    && s.mission_type == MissionType::Capture
+                    && s.target == Some(*unowned_pos)
+            });
 
             if !exists {
-                let squad = manager.create_squad(MissionType::Capture);
+                let squad = manager.create_owned_squad(MissionType::Capture, perspective_player);
                 squad.target = Some(*unowned_pos);
+                if is_v3 {
+                    squad.target_island = Some(target_island.id);
+                }
                 squad.phase = MissionPhase::Forming;
 
                 // 割り当てる歩兵の選択：
@@ -1223,13 +2724,14 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
             break;
         }
 
-        let exists = manager
-            .squads
-            .iter()
-            .any(|s| s.mission_type == MissionType::Attack && s.target == Some(cluster.center));
+        let exists = manager.squads.iter().any(|s| {
+            squad_is_mutable_by_player(world, s, perspective_player)
+                && s.mission_type == MissionType::Attack
+                && s.target == Some(cluster.center)
+        });
 
         if !exists {
-            let squad = manager.create_squad(MissionType::Attack);
+            let squad = manager.create_owned_squad(MissionType::Attack, perspective_player);
             squad.target = Some(cluster.center);
             squad.phase = MissionPhase::Forming;
 
@@ -1273,8 +2775,9 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         };
 
         for (idx, squad) in manager.squads.iter().enumerate() {
-            if (squad.mission_type == MissionType::Attack
-                || squad.mission_type == MissionType::Defense)
+            if squad_is_mutable_by_player(world, squad, perspective_player)
+                && (squad.mission_type == MissionType::Attack
+                    || squad.mission_type == MissionType::Defense)
                 && squad.members.len() < MAX_SQUAD_SIZE
             {
                 if let Some(target) = squad.target {
@@ -1352,7 +2855,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
 
             if let Some(target) = final_target {
                 // 新規部隊を立ち上げて1体目のメンバーとして割り当てる
-                let new_squad = manager.create_squad(MissionType::Attack);
+                let new_squad = manager.create_owned_squad(MissionType::Attack, perspective_player);
                 new_squad.target = Some(target);
                 new_squad.phase = MissionPhase::Forming;
                 new_squad.members.insert(ent);
@@ -1372,7 +2875,7 @@ fn handoff_delivered_cargo(
     cargo: Entity,
     target_island: Option<crate::ai::islands::IslandId>,
     preferred_target: Option<GridPosition>,
-) {
+) -> bool {
     if world
         .get::<crate::components::Transporting>(cargo)
         .is_some()
@@ -1381,17 +2884,44 @@ fn handoff_delivered_cargo(
             .iter()
             .any(|squad| squad.members.contains(&cargo))
     {
-        return;
+        return false;
     }
     let (Some(position), Some(stats)) = (
         world.get::<GridPosition>(cargo).copied(),
         world.get::<UnitStats>(cargo).cloned(),
     ) else {
-        return;
+        return false;
     };
     let island_map = world
         .get_resource::<crate::ai::islands::IslandMap>()
         .cloned();
+    let Some(map) = world.get_resource::<Map>().cloned() else {
+        return false;
+    };
+    let Some(registry) = world.get_resource::<MasterDataRegistry>().cloned() else {
+        return false;
+    };
+    let landing_island = island_map
+        .as_ref()
+        .and_then(|map| map.get_island_at(&position))
+        .map(|island| island.id)
+        .or(target_island);
+    let Some(local_island) = landing_island else {
+        return false;
+    };
+    let is_reachable_local_target = |target: GridPosition| {
+        island_map
+            .as_ref()
+            .and_then(|map| map.get_island_at(&target))
+            .is_some_and(|island| island.id == local_island)
+            && is_terrain_reachable(
+                &map,
+                &registry,
+                (position.x, position.y),
+                (target.x, target.y),
+                stats.movement_type,
+            )
+    };
 
     if stats.can_capture {
         let mut targets = Vec::new();
@@ -1400,12 +2930,7 @@ fn handoff_delivered_cargo(
             if property.owner_id == Some(player_id) {
                 continue;
             }
-            if target_island.is_some_and(|island_id| {
-                island_map
-                    .as_ref()
-                    .and_then(|map| map.get_island_at(target))
-                    .is_none_or(|island| island.id != island_id)
-            }) {
+            if !is_reachable_local_target(*target) {
                 continue;
             }
             let preferred_rank = if Some(*target) == preferred_target {
@@ -1423,12 +2948,12 @@ fn handoff_delivered_cargo(
         }
         targets.sort_by_key(|target| (target.0, target.1, target.2, target.3));
         if let Some((_, _, _, _, target)) = targets.first().copied() {
-            let squad = manager.create_squad(MissionType::Capture);
+            let squad = manager.create_owned_squad(MissionType::Capture, player_id);
             squad.members.insert(cargo);
             squad.target = Some(target);
-            squad.target_island = target_island;
+            squad.target_island = Some(local_island);
             squad.phase = MissionPhase::MovingToTarget;
-            return;
+            return true;
         }
     }
 
@@ -1438,12 +2963,7 @@ fn handoff_delivered_cargo(
         if faction.0 == player_id {
             continue;
         }
-        if target_island.is_some_and(|island_id| {
-            island_map
-                .as_ref()
-                .and_then(|map| map.get_island_at(target))
-                .is_none_or(|island| island.id != island_id)
-        }) {
+        if !is_reachable_local_target(*target) {
             continue;
         }
         enemy_targets.push((
@@ -1457,13 +2977,16 @@ fn handoff_delivered_cargo(
     if let Some(target) = enemy_targets
         .first()
         .map(|target| target.3)
-        .or(preferred_target)
+        .or_else(|| preferred_target.filter(|target| is_reachable_local_target(*target)))
     {
-        let squad = manager.create_squad(MissionType::Attack);
+        let squad = manager.create_owned_squad(MissionType::Attack, player_id);
         squad.members.insert(cargo);
         squad.target = Some(target);
-        squad.target_island = target_island;
+        squad.target_island = Some(local_island);
         squad.phase = MissionPhase::MovingToTarget;
+        true
+    } else {
+        false
     }
 }
 
@@ -2691,6 +4214,1412 @@ mod tests {
         );
     }
 
+    #[test]
+    fn v3_primary_campaign_uses_only_its_reserved_entities() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (mut world, _) =
+            crate::setup::initialize_world_from_master_data(&master_data, "map_1").unwrap();
+        let entities: Vec<Entity> = world.query::<Entity>().iter(&world).collect();
+        for entity in entities {
+            world.despawn(entity);
+        }
+
+        let player = PlayerId(1);
+        let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
+        settings.set_version(player, crate::ai::ai_version::AiVersion::V3);
+        world.insert_resource(settings);
+        for entry in &mut world.resource_mut::<Players>().0 {
+            entry.funds = 0;
+        }
+
+        let mut map = Map::new(7, 3, Terrain::Sea, GridTopology::Square);
+        for x in 0..=2 {
+            map.set_terrain(x, 1, Terrain::Plains).unwrap();
+        }
+        map.set_terrain(1, 1, Terrain::Airport).unwrap();
+        map.set_terrain(4, 1, Terrain::City).unwrap();
+        map.set_terrain(6, 1, Terrain::City).unwrap();
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        world.insert_resource(map);
+        world.insert_resource(island_map);
+        world.insert_resource(SquadManager::new());
+        world.spawn((
+            GridPosition { x: 1, y: 1 },
+            Property::new(Terrain::Airport, Some(player), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 4, y: 1 },
+            Property::new(Terrain::City, None, 100),
+        ));
+        world.spawn((
+            GridPosition { x: 6, y: 1 },
+            Property::new(Terrain::City, None, 100),
+        ));
+
+        let helicopter_stats = master_data
+            .create_unit_stats(&UnitName(UnitType::TransportHelicopter.as_str().to_owned()))
+            .unwrap();
+        let _primary_transport = world
+            .spawn((
+                player,
+                Faction(player),
+                GridPosition { x: 2, y: 1 },
+                helicopter_stats.clone(),
+                CargoCapacity {
+                    max: helicopter_stats.max_cargo,
+                    loaded: Vec::new(),
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let _secondary_transport = world
+            .spawn((
+                player,
+                Faction(player),
+                GridPosition { x: 0, y: 1 },
+                helicopter_stats.clone(),
+                CargoCapacity {
+                    max: helicopter_stats.max_cargo,
+                    loaded: Vec::new(),
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let infantry_stats = master_data
+            .create_unit_stats(&UnitName(UnitType::Infantry.as_str().to_owned()))
+            .unwrap();
+        let mut primary_capture = Vec::new();
+        let mut secondary_capture = Vec::new();
+        for _ in 0..2 {
+            primary_capture.push(
+                world
+                    .spawn((
+                        player,
+                        Faction(player),
+                        GridPosition { x: 2, y: 1 },
+                        infantry_stats.clone(),
+                        Health {
+                            current: 100,
+                            max: 100,
+                        },
+                    ))
+                    .id(),
+            );
+        }
+        for _ in 0..2 {
+            secondary_capture.push(
+                world
+                    .spawn((
+                        player,
+                        Faction(player),
+                        GridPosition { x: 0, y: 1 },
+                        infantry_stats.clone(),
+                        Health {
+                            current: 100,
+                            max: 100,
+                        },
+                    ))
+                    .id(),
+            );
+        }
+
+        let strategy = analyze_strategy(&mut world, player);
+        assert_eq!(strategy.campaign_portfolio.active_offensives.len(), 2);
+        let primary = &strategy.campaign_portfolio.active_offensives[0];
+        let secondary = &strategy.campaign_portfolio.active_offensives[1];
+        assert!(primary.operation_ready);
+        assert!(secondary.operation_ready);
+        let primary_reserved_transport = primary.transport_entities[0];
+        let secondary_reserved_transport = secondary.transport_entities[0];
+        assert_ne!(primary_reserved_transport, secondary_reserved_transport);
+        *world
+            .get_mut::<GridPosition>(primary_reserved_transport)
+            .unwrap() = GridPosition { x: 2, y: 1 };
+        *world
+            .get_mut::<GridPosition>(secondary_reserved_transport)
+            .unwrap() = GridPosition { x: 0, y: 1 };
+
+        plan_squads(&mut world, player);
+
+        let manager = world.resource::<SquadManager>();
+        let squad = manager
+            .squads
+            .iter()
+            .find(|squad| squad.target_island == Some(primary.island_id))
+            .unwrap();
+        assert_eq!(squad.transport_entity, Some(primary_reserved_transport));
+        assert!(
+            squad
+                .cargo_entities
+                .iter()
+                .all(|entity| primary.capture_entities.contains(entity))
+        );
+        assert!(
+            !squad
+                .cargo_entities
+                .contains(&secondary.capture_entities[0])
+        );
+        assert!(manager.squads.iter().all(|squad| {
+            squad.transport_entity != Some(secondary_reserved_transport)
+                || squad.target_island == Some(secondary.island_id)
+        }));
+    }
+
+    #[test]
+    fn v3_unreserved_loaded_transport_uses_safe_drop_without_primary_target() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (mut world, _) =
+            crate::setup::initialize_world_from_master_data(&master_data, "map_1").unwrap();
+        let entities: Vec<Entity> = world.query::<Entity>().iter(&world).collect();
+        for entity in entities {
+            world.despawn(entity);
+        }
+
+        let player = PlayerId(1);
+        let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
+        settings.set_version(player, crate::ai::ai_version::AiVersion::V3);
+        world.insert_resource(settings);
+        for entry in &mut world.resource_mut::<Players>().0 {
+            entry.funds = 0;
+        }
+
+        let mut map = Map::new(5, 3, Terrain::Sea, GridTopology::Square);
+        for x in 0..=2 {
+            map.set_terrain(x, 1, Terrain::Plains).unwrap();
+        }
+        map.set_terrain(1, 1, Terrain::Airport).unwrap();
+        map.set_terrain(4, 1, Terrain::City).unwrap();
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        world.insert_resource(map);
+        world.insert_resource(island_map);
+        world.insert_resource(SquadManager::new());
+        world.spawn((
+            GridPosition { x: 1, y: 1 },
+            Property::new(Terrain::Airport, Some(player), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 4, y: 1 },
+            Property::new(Terrain::City, None, 100),
+        ));
+
+        let helicopter_stats = master_data
+            .create_unit_stats(&UnitName(UnitType::TransportHelicopter.as_str().to_owned()))
+            .unwrap();
+        let helicopter = world
+            .spawn((
+                player,
+                Faction(player),
+                GridPosition { x: 2, y: 1 },
+                helicopter_stats.clone(),
+                CargoCapacity {
+                    max: helicopter_stats.max_cargo,
+                    loaded: Vec::new(),
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let infantry_stats = master_data
+            .create_unit_stats(&UnitName(UnitType::Infantry.as_str().to_owned()))
+            .unwrap();
+        for _ in 0..2 {
+            world.spawn((
+                player,
+                Faction(player),
+                GridPosition { x: 2, y: 1 },
+                infantry_stats.clone(),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ));
+        }
+
+        let tank_stats = master_data
+            .create_unit_stats(&UnitName(UnitType::Tank.as_str().to_owned()))
+            .unwrap();
+        let tank = world
+            .spawn((
+                player,
+                Faction(player),
+                GridPosition { x: 9_999, y: 9_999 },
+                tank_stats,
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let lander_stats = master_data
+            .create_unit_stats(&UnitName(UnitType::Lander.as_str().to_owned()))
+            .unwrap();
+        let lander = world
+            .spawn((
+                player,
+                Faction(player),
+                GridPosition { x: 0, y: 1 },
+                lander_stats.clone(),
+                CargoCapacity {
+                    max: lander_stats.max_cargo,
+                    loaded: vec![tank],
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        world.entity_mut(tank).insert(Transporting(lander));
+
+        let strategy = analyze_strategy(&mut world, player);
+        let primary = strategy
+            .campaign_portfolio
+            .active_offensives
+            .first()
+            .unwrap();
+        assert!(primary.operation_ready);
+        assert!(primary.transport_entities.contains(&helicopter));
+        assert!(!primary.transport_entities.contains(&lander));
+
+        plan_squads(&mut world, player);
+
+        let manager = world.resource::<SquadManager>();
+        let drop_squad = manager
+            .squads
+            .iter()
+            .find(|squad| squad.transport_entity == Some(lander))
+            .expect("unreserved loaded transport must receive a safe Drop squad");
+        assert_eq!(
+            drop_squad.phase,
+            MissionPhase::Transport(TransportPhase::Drop)
+        );
+        assert_eq!(drop_squad.target_island, None);
+        assert_eq!(drop_squad.target, None);
+        assert_eq!(drop_squad.cargo_entities, vec![tank]);
+    }
+
+    #[test]
+    fn v3_non_ready_campaign_assignment_does_not_launch_transport() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (mut world, _) =
+            crate::setup::initialize_world_from_master_data(&master_data, "map_1").unwrap();
+        let entities: Vec<Entity> = world.query::<Entity>().iter(&world).collect();
+        for entity in entities {
+            world.despawn(entity);
+        }
+
+        let player = PlayerId(1);
+        let opponent = PlayerId(2);
+        let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
+        settings.set_version(player, crate::ai::ai_version::AiVersion::V3);
+        world.insert_resource(settings);
+        for entry in &mut world.resource_mut::<Players>().0 {
+            entry.funds = if entry.id == player { 32_700 } else { 0 };
+        }
+
+        let origin = GridPosition { x: 0, y: 1 };
+        let target = GridPosition { x: 4, y: 1 };
+        let mut map = Map::new(5, 3, Terrain::Sea, GridTopology::Square);
+        map.set_terrain(origin.x, origin.y, Terrain::Port).unwrap();
+        map.set_terrain(3, 1, Terrain::Shoal).unwrap();
+        map.set_terrain(target.x, target.y, Terrain::Capital)
+            .unwrap();
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        world.insert_resource(map);
+        world.insert_resource(island_map);
+        world.insert_resource(SquadManager::new());
+        world.spawn((origin, Property::new(Terrain::Capital, Some(player), 100)));
+        world.spawn((target, Property::new(Terrain::Capital, Some(opponent), 100)));
+
+        let infantry_stats = master_data
+            .create_unit_stats(&UnitName(UnitType::Infantry.as_str().to_owned()))
+            .unwrap();
+        let infantry = world
+            .spawn((
+                player,
+                Faction(player),
+                origin,
+                infantry_stats,
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let tank_stats = master_data
+            .create_unit_stats(&UnitName(UnitType::Tank.as_str().to_owned()))
+            .unwrap();
+        let tank = world
+            .spawn((
+                player,
+                Faction(player),
+                origin,
+                tank_stats,
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let lander_stats = master_data
+            .create_unit_stats(&UnitName(UnitType::Lander.as_str().to_owned()))
+            .unwrap();
+        let lander = world
+            .spawn((
+                player,
+                Faction(player),
+                origin,
+                lander_stats.clone(),
+                CargoCapacity {
+                    max: lander_stats.max_cargo,
+                    loaded: Vec::new(),
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+
+        let strategy = analyze_strategy(&mut world, player);
+        let assignment = strategy
+            .campaign_portfolio
+            .active_offensives
+            .first()
+            .unwrap();
+        assert!(!assignment.operation_ready);
+        assert!(assignment.transport_entities.contains(&lander));
+
+        plan_squads(&mut world, player);
+
+        let (forming_id, target_island, forming_cargo) = {
+            let manager = world.resource::<SquadManager>();
+            let forming = manager
+                .squads
+                .iter()
+                .find(|squad| squad.transport_entity == Some(lander))
+                .unwrap();
+            assert_eq!(forming.phase, MissionPhase::Forming);
+            (
+                forming.id,
+                forming.target_island.unwrap(),
+                forming.cargo_entities.clone(),
+            )
+        };
+
+        let repeated = analyze_strategy(&mut world, player);
+        let repeated_assignment = repeated
+            .campaign_portfolio
+            .assignment_for(target_island)
+            .unwrap();
+        assert!(!repeated_assignment.operation_ready);
+        assert!(repeated_assignment.transport_entities.contains(&lander));
+
+        plan_squads(&mut world, player);
+
+        {
+            let manager = world.resource::<SquadManager>();
+            let forming: Vec<_> = manager
+                .squads
+                .iter()
+                .filter(|squad| {
+                    squad.target_island == Some(target_island)
+                        && squad.phase == MissionPhase::Forming
+                })
+                .collect();
+            assert_eq!(forming.len(), 1);
+            assert_eq!(forming[0].transport_entity, Some(lander));
+            assert_eq!(forming[0].cargo_entities, forming_cargo);
+        }
+
+        let second_infantry_stats = master_data
+            .create_unit_stats(&UnitName(UnitType::Infantry.as_str().to_owned()))
+            .unwrap();
+        let second_infantry = world
+            .spawn((
+                player,
+                Faction(player),
+                origin,
+                second_infantry_stats,
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let artillery_stats = master_data
+            .create_unit_stats(&UnitName(UnitType::Artillery.as_str().to_owned()))
+            .unwrap();
+        let artillery = world
+            .spawn((
+                player,
+                Faction(player),
+                origin,
+                artillery_stats,
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let helicopter_stats = master_data
+            .create_unit_stats(&UnitName(UnitType::TransportHelicopter.as_str().to_owned()))
+            .unwrap();
+        let helicopter = world
+            .spawn((
+                player,
+                Faction(player),
+                origin,
+                helicopter_stats.clone(),
+                CargoCapacity {
+                    max: helicopter_stats.max_cargo,
+                    loaded: Vec::new(),
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+
+        let ready = analyze_strategy(&mut world, player);
+        let ready_assignment = ready
+            .campaign_portfolio
+            .assignment_for(target_island)
+            .unwrap()
+            .clone();
+        assert!(ready_assignment.operation_ready);
+        assert!(ready_assignment.transport_entities.contains(&lander));
+        assert!(ready_assignment.transport_entities.contains(&helicopter));
+        assert!(ready_assignment.capture_entities.contains(&infantry));
+        assert!(ready_assignment.capture_entities.contains(&second_infantry));
+        assert!(
+            ready_assignment.combat_entities.contains(&tank)
+                || ready_assignment.capture_entities.contains(&tank)
+        );
+        assert!(
+            ready_assignment.combat_entities.contains(&artillery)
+                || ready_assignment.capture_entities.contains(&artillery)
+        );
+
+        plan_squads(&mut world, player);
+
+        let assert_ready_operation = |world: &World| {
+            let manager = world.resource::<SquadManager>();
+            let operations: Vec<_> = manager
+                .squads
+                .iter()
+                .filter(|squad| squad.target_island == Some(target_island))
+                .collect();
+            assert_eq!(operations.len(), ready_assignment.transport_entities.len());
+            let original = operations
+                .iter()
+                .find(|squad| squad.id == forming_id)
+                .unwrap();
+            assert_eq!(original.transport_entity, Some(lander));
+
+            let mut owned = Vec::new();
+            for operation in &operations {
+                let transport = operation.transport_entity.unwrap();
+                assert_eq!(operation.members, HashSet::from([transport]));
+                assert_eq!(operation.target, Some(ready_assignment.target_position));
+                assert_eq!(
+                    operation.phase,
+                    MissionPhase::Transport(TransportPhase::Pickup)
+                );
+                let capacity = world.get::<CargoCapacity>(transport).unwrap();
+                let transport_stats = world.get::<UnitStats>(transport).unwrap();
+                assert!(operation.cargo_entities.len() <= capacity.max as usize);
+                assert!(operation.cargo_entities.iter().all(|cargo| {
+                    world.get::<UnitStats>(*cargo).is_some_and(|cargo_stats| {
+                        transport_stats
+                            .loadable_unit_types
+                            .contains(&cargo_stats.unit_type)
+                    })
+                }));
+                owned.extend(operation.members.iter().copied());
+                owned.extend(operation.cargo_entities.iter().copied());
+            }
+            let unique: HashSet<_> = owned.iter().copied().collect();
+            assert_eq!(owned.len(), unique.len());
+            for entity in ready_assignment
+                .transport_entities
+                .iter()
+                .chain(ready_assignment.capture_entities.iter())
+                .chain(ready_assignment.combat_entities.iter())
+            {
+                assert!(unique.contains(entity));
+                let squad_owners = manager
+                    .squads
+                    .iter()
+                    .filter(|squad| {
+                        squad.members.contains(entity) || squad.cargo_entities.contains(entity)
+                    })
+                    .count();
+                assert_eq!(squad_owners, 1);
+            }
+        };
+        assert_ready_operation(&world);
+
+        plan_squads(&mut world, player);
+        assert_ready_operation(&world);
+    }
+
+    struct ReadyAssaultFixture {
+        world: World,
+        load_schedule: Schedule,
+        target_island: crate::ai::islands::IslandId,
+        lander: Entity,
+        helicopter: Entity,
+        cargo: [Entity; 4],
+    }
+
+    fn setup_ready_assault_reconciliation_world() -> ReadyAssaultFixture {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (mut world, _) =
+            crate::setup::initialize_world_from_master_data(&master_data, "map_1").unwrap();
+        let entities: Vec<Entity> = world.query::<Entity>().iter(&world).collect();
+        for entity in entities {
+            world.despawn(entity);
+        }
+
+        let player = PlayerId(1);
+        let opponent = PlayerId(2);
+        let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
+        settings.set_version(player, crate::ai::ai_version::AiVersion::V3);
+        world.insert_resource(settings);
+        world.resource_mut::<MatchState>().current_phase = Phase::Main;
+        for entry in &mut world.resource_mut::<Players>().0 {
+            entry.funds = 0;
+        }
+
+        let port = GridPosition { x: 0, y: 1 };
+        let base = GridPosition { x: 1, y: 1 };
+        let target = GridPosition { x: 4, y: 1 };
+        let mut map = Map::new(5, 3, Terrain::Sea, GridTopology::Square);
+        map.set_terrain(port.x, port.y, Terrain::Port).unwrap();
+        map.set_terrain(base.x, base.y, Terrain::Capital).unwrap();
+        map.set_terrain(3, 1, Terrain::Shoal).unwrap();
+        map.set_terrain(target.x, target.y, Terrain::Capital)
+            .unwrap();
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let target_island = island_map.get_island_at(&target).unwrap().id;
+        world.insert_resource(map);
+        world.insert_resource(island_map);
+        world.spawn((base, Property::new(Terrain::Capital, Some(player), 100)));
+        world.spawn((target, Property::new(Terrain::Capital, Some(opponent), 100)));
+
+        let lander = world
+            .spawn((
+                player,
+                Faction(player),
+                port,
+                UnitStats {
+                    unit_type: UnitType::Lander,
+                    movement_type: MovementType::Ship,
+                    max_movement: 5,
+                    max_cargo: 2,
+                    loadable_unit_types: vec![
+                        UnitType::Infantry,
+                        UnitType::Tank,
+                        UnitType::Artillery,
+                    ],
+                    cost: 16_500,
+                    ..UnitStats::mock()
+                },
+                CargoCapacity {
+                    max: 2,
+                    loaded: Vec::new(),
+                },
+                HasMoved(false),
+                ActionCompleted(false),
+                Fuel {
+                    current: 90,
+                    max: 90,
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let helicopter = world
+            .spawn((
+                player,
+                Faction(player),
+                base,
+                UnitStats {
+                    unit_type: UnitType::TransportHelicopter,
+                    movement_type: MovementType::Air,
+                    max_movement: 7,
+                    max_cargo: 2,
+                    loadable_unit_types: vec![UnitType::Infantry],
+                    cost: 4_000,
+                    ..UnitStats::mock()
+                },
+                CargoCapacity {
+                    max: 2,
+                    loaded: Vec::new(),
+                },
+                HasMoved(false),
+                ActionCompleted(false),
+                Fuel {
+                    current: 60,
+                    max: 60,
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+
+        let spawn_cargo = |world: &mut World,
+                           position: GridPosition,
+                           unit_type: UnitType,
+                           movement_type: MovementType,
+                           can_capture: bool,
+                           cost: u32| {
+            world
+                .spawn((
+                    player,
+                    Faction(player),
+                    position,
+                    UnitStats {
+                        unit_type,
+                        movement_type,
+                        max_movement: 5,
+                        can_capture,
+                        cost,
+                        ..UnitStats::mock()
+                    },
+                    HasMoved(false),
+                    ActionCompleted(false),
+                    Fuel {
+                        current: 70,
+                        max: 70,
+                    },
+                    Health {
+                        current: 100,
+                        max: 100,
+                    },
+                ))
+                .id()
+        };
+        let loaded_infantry = spawn_cargo(
+            &mut world,
+            GridPosition { x: 9_999, y: 9_999 },
+            UnitType::Infantry,
+            MovementType::Infantry,
+            true,
+            1_000,
+        );
+        let waiting_infantry = spawn_cargo(
+            &mut world,
+            base,
+            UnitType::Infantry,
+            MovementType::Infantry,
+            true,
+            1_000,
+        );
+        let tank = spawn_cargo(
+            &mut world,
+            port,
+            UnitType::Tank,
+            MovementType::Tank,
+            false,
+            7_000,
+        );
+        let artillery = spawn_cargo(
+            &mut world,
+            port,
+            UnitType::Artillery,
+            MovementType::Artillery,
+            false,
+            6_200,
+        );
+        world
+            .get_mut::<CargoCapacity>(helicopter)
+            .unwrap()
+            .loaded
+            .push(loaded_infantry);
+        world
+            .entity_mut(loaded_infantry)
+            .insert(Transporting(helicopter));
+
+        // 同一島の既存Formingを輸送役ごとに分け、さらに空の重複Squadも混在させる。
+        let mut manager = SquadManager::new();
+        let lander_squad = manager.create_owned_squad(MissionType::Transport, player);
+        lander_squad.members.insert(lander);
+        lander_squad.transport_entity = Some(lander);
+        lander_squad.cargo_entities = vec![tank, artillery];
+        lander_squad.target_island = Some(target_island);
+        lander_squad.target = Some(target);
+        let helicopter_squad = manager.create_owned_squad(MissionType::Transport, player);
+        helicopter_squad.members.insert(helicopter);
+        helicopter_squad.transport_entity = Some(helicopter);
+        helicopter_squad.cargo_entities = vec![loaded_infantry, waiting_infantry];
+        helicopter_squad.target_island = Some(target_island);
+        helicopter_squad.target = Some(target);
+        let duplicate = manager.create_owned_squad(MissionType::Transport, player);
+        duplicate.target_island = Some(target_island);
+        duplicate.target = Some(target);
+        world.insert_resource(manager);
+
+        let mut load_schedule = Schedule::default();
+        load_schedule.add_systems(crate::systems::transport::load_unit_system);
+        ReadyAssaultFixture {
+            world,
+            load_schedule,
+            target_island,
+            lander,
+            helicopter,
+            cargo: [loaded_infantry, waiting_infantry, tank, artillery],
+        }
+    }
+
+    fn reset_transport_actions(world: &mut World) {
+        let mut query = world.query::<(&mut ActionCompleted, &mut HasMoved)>();
+        for (mut action, mut moved) in query.iter_mut(world) {
+            action.0 = false;
+            moved.0 = false;
+        }
+    }
+
+    #[test]
+    fn ready_assault_partitions_all_cargo_across_compatible_transports_and_loads() {
+        let mut fixture = setup_ready_assault_reconciliation_world();
+        let player = PlayerId(1);
+        let strategy = analyze_strategy(&mut fixture.world, player);
+        let assignment = strategy
+            .campaign_portfolio
+            .assignment_for(fixture.target_island)
+            .unwrap()
+            .clone();
+        assert!(assignment.operation_ready);
+        assert_eq!(assignment.transport_entities.len(), 2);
+        assert_eq!(assignment.capture_entities.len(), 2);
+        assert_eq!(assignment.combat_entities.len(), 2);
+
+        plan_squads(&mut fixture.world, player);
+
+        {
+            let manager = fixture.world.resource::<SquadManager>();
+            let transport_squads: Vec<_> = manager
+                .squads
+                .iter()
+                .filter(|squad| squad.target_island == Some(fixture.target_island))
+                .collect();
+            assert_eq!(transport_squads.len(), 2);
+            for squad in &transport_squads {
+                let transport = squad.transport_entity.unwrap();
+                let capacity = fixture.world.get::<CargoCapacity>(transport).unwrap();
+                let stats = fixture.world.get::<UnitStats>(transport).unwrap();
+                assert_eq!(squad.members, HashSet::from([transport]));
+                assert!(squad.cargo_entities.len() <= capacity.max as usize);
+                assert!(squad.cargo_entities.iter().all(|cargo| {
+                    fixture
+                        .world
+                        .get::<UnitStats>(*cargo)
+                        .is_some_and(|cargo_stats| {
+                            stats.loadable_unit_types.contains(&cargo_stats.unit_type)
+                        })
+                }));
+            }
+            let helicopter_squad = transport_squads
+                .iter()
+                .find(|squad| squad.transport_entity == Some(fixture.helicopter))
+                .unwrap();
+            assert!(helicopter_squad.cargo_entities.contains(&fixture.cargo[0]));
+
+            for entity in assignment
+                .transport_entities
+                .iter()
+                .chain(assignment.capture_entities.iter())
+                .chain(assignment.combat_entities.iter())
+            {
+                let owners = transport_squads
+                    .iter()
+                    .filter(|squad| {
+                        squad.members.contains(entity) || squad.cargo_entities.contains(entity)
+                    })
+                    .count();
+                assert_eq!(
+                    owners, 1,
+                    "reserved Entity must have exactly one Squad owner"
+                );
+            }
+        }
+
+        // 既存Pickup意思決定とLoad systemを実行し、両輸送役が実搭載完了後に進めることを確認する。
+        for _ in 0..4 {
+            reset_transport_actions(&mut fixture.world);
+            let pickup_ids: Vec<_> = fixture
+                .world
+                .resource::<SquadManager>()
+                .squads
+                .iter()
+                .filter(|squad| {
+                    squad.target_island == Some(fixture.target_island)
+                        && squad.phase == MissionPhase::Transport(TransportPhase::Pickup)
+                })
+                .map(|squad| squad.id)
+                .collect();
+            for squad_id in pickup_ids {
+                let mut manager = fixture.world.remove_resource::<SquadManager>().unwrap();
+                let squad = manager
+                    .squads
+                    .iter_mut()
+                    .find(|squad| squad.id == squad_id)
+                    .unwrap();
+                let (entity, command) =
+                    execute_transport_squad_step(&mut fixture.world, squad, &HashSet::new())
+                        .expect("Pickup squad must produce a load command");
+                assert!(matches!(command, crate::ai::engine::AiCommand::Load { .. }));
+                fixture.world.insert_resource(manager);
+                crate::ai::engine::execute_ai_command(&mut fixture.world, entity, command);
+                fixture.load_schedule.run(&mut fixture.world);
+            }
+            update_squads(&mut fixture.world, player);
+            let all_ready = fixture
+                .world
+                .resource::<SquadManager>()
+                .squads
+                .iter()
+                .filter(|squad| squad.target_island == Some(fixture.target_island))
+                .all(|squad| {
+                    matches!(
+                        squad.phase,
+                        MissionPhase::Transport(TransportPhase::Transit | TransportPhase::Drop)
+                    )
+                });
+            if all_ready {
+                break;
+            }
+        }
+
+        let manager = fixture.world.resource::<SquadManager>();
+        let transport_squads: Vec<_> = manager
+            .squads
+            .iter()
+            .filter(|squad| squad.target_island == Some(fixture.target_island))
+            .collect();
+        assert_eq!(transport_squads.len(), 2);
+        assert!(transport_squads.iter().all(|squad| matches!(
+            squad.phase,
+            MissionPhase::Transport(TransportPhase::Transit | TransportPhase::Drop)
+        )));
+        for squad in transport_squads {
+            let transport = squad.transport_entity.unwrap();
+            let capacity = fixture.world.get::<CargoCapacity>(transport).unwrap();
+            assert_eq!(capacity.loaded.len(), squad.cargo_entities.len());
+            assert!(capacity.loaded.len() <= capacity.max as usize);
+            assert!(capacity.loaded.iter().all(|cargo| {
+                fixture
+                    .world
+                    .get::<Transporting>(*cargo)
+                    .is_some_and(|transporting| transporting.0 == transport)
+            }));
+        }
+    }
+
+    #[test]
+    fn ready_assault_preserves_loaded_drop_squad_while_reconciling_forming_transport() {
+        let mut fixture = setup_ready_assault_reconciliation_world();
+        let player = PlayerId(1);
+        let drop_position = GridPosition { x: 4, y: 1 };
+
+        // Lander側は既に上陸地点まで到達済み、Helicopter側だけがFormingの混在状態を作る。
+        fixture
+            .world
+            .get_mut::<CargoCapacity>(fixture.lander)
+            .unwrap()
+            .loaded = vec![fixture.cargo[2], fixture.cargo[3]];
+        for cargo in [fixture.cargo[2], fixture.cargo[3]] {
+            fixture
+                .world
+                .entity_mut(cargo)
+                .insert(Transporting(fixture.lander));
+        }
+        {
+            let mut manager = fixture.world.remove_resource::<SquadManager>().unwrap();
+            manager.squads.retain(|squad| squad.id != SquadId(2));
+            let lander_squad = manager
+                .squads
+                .iter_mut()
+                .find(|squad| squad.transport_entity == Some(fixture.lander))
+                .unwrap();
+            lander_squad.phase = MissionPhase::Transport(TransportPhase::Drop);
+            lander_squad.pickup_position = Some(GridPosition { x: 0, y: 1 });
+            lander_squad.drop_position = Some(drop_position);
+            fixture.world.insert_resource(manager);
+        }
+
+        let assignment = analyze_strategy(&mut fixture.world, player)
+            .campaign_portfolio
+            .assignment_for(fixture.target_island)
+            .unwrap()
+            .clone();
+        assert!(assignment.operation_ready);
+        assert!(assignment.transport_entities.contains(&fixture.lander));
+        assert!(assignment.transport_entities.contains(&fixture.helicopter));
+
+        plan_squads(&mut fixture.world, player);
+        let snapshot = {
+            let manager = fixture.world.resource::<SquadManager>();
+            let mut squads: Vec<_> = manager
+                .squads
+                .iter()
+                .filter(|squad| squad.target_island == Some(fixture.target_island))
+                .map(|squad| {
+                    (
+                        squad.id,
+                        squad.transport_entity,
+                        squad.members.clone(),
+                        squad.cargo_entities.clone(),
+                        squad.phase.clone(),
+                        squad.pickup_position,
+                        squad.drop_position,
+                    )
+                })
+                .collect();
+            squads.sort_by_key(|squad| squad.0.0);
+            assert_eq!(squads.len(), 2, "空のlive輸送Squadを残さない");
+
+            let lander = squads
+                .iter()
+                .find(|squad| squad.1 == Some(fixture.lander))
+                .expect("既存Lander Squadをtransport一致で再利用する");
+            assert_eq!(lander.0, SquadId(0));
+            assert_eq!(
+                lander.4,
+                MissionPhase::Transport(TransportPhase::Drop),
+                "実搭載済みDropをTransitへ後退させない"
+            );
+            assert_eq!(lander.6, Some(drop_position));
+            assert_eq!(lander.2, HashSet::from([fixture.lander]));
+            assert_eq!(
+                lander.3.iter().copied().collect::<HashSet<_>>(),
+                HashSet::from([fixture.cargo[2], fixture.cargo[3]])
+            );
+
+            let helicopter = squads
+                .iter()
+                .find(|squad| squad.1 == Some(fixture.helicopter))
+                .expect("Forming Helicopterを別partition Squadとして再利用する");
+            assert_eq!(helicopter.0, SquadId(1));
+            assert_eq!(
+                helicopter.4,
+                MissionPhase::Transport(TransportPhase::Pickup)
+            );
+            squads
+        };
+
+        plan_squads(&mut fixture.world, player);
+        let manager = fixture.world.resource::<SquadManager>();
+        let mut repeated: Vec<_> = manager
+            .squads
+            .iter()
+            .filter(|squad| squad.target_island == Some(fixture.target_island))
+            .map(|squad| {
+                (
+                    squad.id,
+                    squad.transport_entity,
+                    squad.members.clone(),
+                    squad.cargo_entities.clone(),
+                    squad.phase.clone(),
+                    squad.pickup_position,
+                    squad.drop_position,
+                )
+            })
+            .collect();
+        repeated.sort_by_key(|squad| squad.0.0);
+        assert_eq!(repeated, snapshot);
+    }
+
+    #[test]
+    fn ready_assault_does_not_reverse_load_landed_handoff_during_drop_forming_replan() {
+        let mut fixture = setup_ready_assault_reconciliation_world();
+        let player = PlayerId(1);
+        let target = GridPosition { x: 4, y: 1 };
+        let loaded_cargo = fixture.cargo[3];
+        let landed_cargo = fixture.cargo[1];
+        let waiting_cargo = fixture.cargo[2];
+        {
+            let mut stats = fixture.world.get_mut::<UnitStats>(waiting_cargo).unwrap();
+            stats.unit_type = UnitType::Infantry;
+            stats.movement_type = MovementType::Infantry;
+            stats.can_capture = true;
+        }
+
+        fixture
+            .world
+            .get_mut::<CargoCapacity>(fixture.lander)
+            .unwrap()
+            .loaded = vec![loaded_cargo];
+        fixture
+            .world
+            .entity_mut(loaded_cargo)
+            .insert(Transporting(fixture.lander));
+        *fixture.world.get_mut::<GridPosition>(landed_cargo).unwrap() = target;
+        fixture
+            .world
+            .entity_mut(landed_cargo)
+            .remove::<Transporting>();
+        fixture.world.spawn((
+            PlayerId(2),
+            Faction(PlayerId(2)),
+            target,
+            UnitStats {
+                unit_type: UnitType::Infantry,
+                movement_type: MovementType::Infantry,
+                max_movement: 3,
+                can_capture: true,
+                cost: 1_000,
+                ..UnitStats::mock()
+            },
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ));
+
+        let (drop_id, local_id) = {
+            let mut manager = fixture.world.remove_resource::<SquadManager>().unwrap();
+            manager.squads.retain(|squad| squad.id != SquadId(2));
+            let lander_squad = manager
+                .squads
+                .iter_mut()
+                .find(|squad| squad.transport_entity == Some(fixture.lander))
+                .unwrap();
+            lander_squad.cargo_entities = vec![loaded_cargo];
+            lander_squad.phase = MissionPhase::Transport(TransportPhase::Drop);
+            lander_squad.drop_position = Some(target);
+            let drop_id = lander_squad.id;
+
+            let local = manager.create_squad(MissionType::Capture);
+            local.members.insert(landed_cargo);
+            local.target_island = Some(fixture.target_island);
+            local.target = Some(target);
+            local.phase = MissionPhase::MovingToTarget;
+            let local_id = local.id;
+            fixture.world.insert_resource(manager);
+            (drop_id, local_id)
+        };
+
+        let assignment = analyze_strategy(&mut fixture.world, player)
+            .campaign_portfolio
+            .assignment_for(fixture.target_island)
+            .unwrap()
+            .clone();
+        assert!(assignment.operation_ready);
+        assert!(assignment.capture_entities.contains(&landed_cargo));
+
+        plan_squads(&mut fixture.world, player);
+        let snapshot = {
+            let manager = fixture.world.resource::<SquadManager>();
+            let drop = manager
+                .squads
+                .iter()
+                .find(|squad| squad.id == drop_id)
+                .expect("Drop Squadを維持する");
+            assert_eq!(drop.phase, MissionPhase::Transport(TransportPhase::Drop));
+            assert_eq!(drop.cargo_entities, vec![loaded_cargo]);
+            assert_eq!(drop.drop_position, Some(target));
+
+            let local = manager
+                .squads
+                .iter()
+                .find(|squad| squad.id == local_id)
+                .expect("上陸済み戦闘Entityの通常Squadを維持する");
+            assert_eq!(local.mission_type, MissionType::Capture);
+            assert!(local.members.contains(&landed_cargo));
+            assert_eq!(local.target_island, Some(fixture.target_island));
+
+            let forming_transport = manager
+                .squads
+                .iter()
+                .find(|squad| squad.transport_entity == Some(fixture.helicopter))
+                .expect("残る洋上cargoだけを別輸送役へ割り当てる");
+            assert!(!forming_transport.cargo_entities.contains(&landed_cargo));
+            assert!(
+                forming_transport.cargo_entities.iter().all(|cargo| [
+                    fixture.cargo[0],
+                    waiting_cargo
+                ]
+                .contains(cargo))
+            );
+            assert!(manager.squads.iter().all(|squad| {
+                squad.mission_type != MissionType::Transport
+                    || !squad.cargo_entities.contains(&landed_cargo)
+            }));
+
+            manager
+                .squads
+                .iter()
+                .map(|squad| {
+                    (
+                        squad.id,
+                        squad.mission_type.clone(),
+                        squad.members.clone(),
+                        squad.transport_entity,
+                        squad.cargo_entities.clone(),
+                        squad.target_island,
+                        squad.target,
+                        squad.phase.clone(),
+                        squad.pickup_position,
+                        squad.drop_position,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        plan_squads(&mut fixture.world, player);
+        let manager = fixture.world.resource::<SquadManager>();
+        let repeated = manager
+            .squads
+            .iter()
+            .map(|squad| {
+                (
+                    squad.id,
+                    squad.mission_type.clone(),
+                    squad.members.clone(),
+                    squad.transport_entity,
+                    squad.cargo_entities.clone(),
+                    squad.target_island,
+                    squad.target,
+                    squad.phase.clone(),
+                    squad.pickup_position,
+                    squad.drop_position,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(repeated, snapshot);
+    }
+
+    #[test]
+    fn ready_assault_without_complete_rendezvous_keeps_every_transport_forming() {
+        let mut fixture = setup_ready_assault_reconciliation_world();
+        let player = PlayerId(1);
+        fixture
+            .world
+            .get_mut::<CargoCapacity>(fixture.helicopter)
+            .unwrap()
+            .loaded
+            .clear();
+        fixture
+            .world
+            .entity_mut(fixture.cargo[0])
+            .remove::<Transporting>();
+        *fixture
+            .world
+            .get_mut::<GridPosition>(fixture.cargo[0])
+            .unwrap() = GridPosition { x: 1, y: 1 };
+        // Artilleryを通行不能なSeaへ置き、Landerとの合流だけを不成立にする。
+        *fixture
+            .world
+            .get_mut::<GridPosition>(fixture.cargo[3])
+            .unwrap() = GridPosition { x: 2, y: 1 };
+
+        // 既存FormingはLanderだけを保持し、新しいHelicopterはfree poolに残る状況を作る。
+        let target = GridPosition { x: 4, y: 1 };
+        let target_island = fixture.target_island;
+        let mut manager = SquadManager::new();
+        let forming = manager.create_squad(MissionType::Transport);
+        forming.members.insert(fixture.lander);
+        forming.transport_entity = Some(fixture.lander);
+        forming.cargo_entities = vec![fixture.cargo[2]];
+        forming.target_island = Some(target_island);
+        forming.target = Some(target);
+        fixture.world.insert_resource(manager);
+
+        let strategy = analyze_strategy(&mut fixture.world, player);
+        let assignment = strategy
+            .campaign_portfolio
+            .assignment_for(target_island)
+            .unwrap();
+        assert!(assignment.operation_ready);
+        assert!(assignment.transport_entities.contains(&fixture.lander));
+        assert!(assignment.transport_entities.contains(&fixture.helicopter));
+        assert!(assignment.combat_entities.contains(&fixture.cargo[3]));
+
+        plan_squads(&mut fixture.world, player);
+
+        let manager = fixture.world.resource::<SquadManager>();
+        let operation_squads: Vec<_> = manager
+            .squads
+            .iter()
+            .filter(|squad| squad.target_island == Some(target_island))
+            .collect();
+        assert!(!operation_squads.is_empty());
+        assert!(
+            operation_squads
+                .iter()
+                .all(|squad| squad.phase == MissionPhase::Forming),
+            "complete rendezvousが無いready packageから部分Pickupを発進させない"
+        );
+    }
+
+    #[test]
+    fn ready_assault_preserves_unincorporated_loaded_forming_squad() {
+        let mut fixture = setup_ready_assault_reconciliation_world();
+        let player = PlayerId(1);
+        let assignment = analyze_strategy(&mut fixture.world, player)
+            .campaign_portfolio
+            .assignment_for(fixture.target_island)
+            .unwrap()
+            .clone();
+        assert!(assignment.operation_ready);
+
+        let extra_cargo = fixture
+            .world
+            .spawn((
+                player,
+                Faction(player),
+                GridPosition { x: 9_999, y: 9_999 },
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Tank,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let extra_transport = fixture
+            .world
+            .spawn((
+                player,
+                Faction(player),
+                GridPosition { x: 0, y: 1 },
+                UnitStats {
+                    unit_type: UnitType::Lander,
+                    movement_type: MovementType::Ship,
+                    max_cargo: 2,
+                    loadable_unit_types: vec![UnitType::Tank],
+                    ..UnitStats::mock()
+                },
+                CargoCapacity {
+                    max: 2,
+                    loaded: vec![extra_cargo],
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        fixture
+            .world
+            .entity_mut(extra_cargo)
+            .insert(Transporting(extra_transport));
+        {
+            let mut manager = fixture.world.remove_resource::<SquadManager>().unwrap();
+            let extra = manager.create_squad(MissionType::Transport);
+            extra.members.insert(extra_transport);
+            extra.transport_entity = Some(extra_transport);
+            extra.cargo_entities = vec![extra_cargo];
+            extra.target_island = Some(fixture.target_island);
+            extra.target = Some(assignment.target_position);
+            fixture.world.insert_resource(manager);
+        }
+
+        let mut manager = fixture.world.remove_resource::<SquadManager>().unwrap();
+        assert!(!reconcile_ready_forming_campaign_squad(
+            &fixture.world,
+            &mut manager,
+            player,
+            &assignment,
+        ));
+        let preserved = manager
+            .squads
+            .iter()
+            .find(|squad| squad.transport_entity == Some(extra_transport))
+            .expect("assignment外transportの実搭載状態を持つForming Squadは削除しない");
+        assert_eq!(preserved.phase, MissionPhase::Forming);
+        assert_eq!(preserved.cargo_entities, vec![extra_cargo]);
+    }
+
+    #[test]
+    fn ready_assault_removes_duplicate_forming_squads_idempotently() {
+        let mut fixture = setup_ready_assault_reconciliation_world();
+        let player = PlayerId(1);
+        let strategy = analyze_strategy(&mut fixture.world, player);
+        assert!(
+            strategy
+                .campaign_portfolio
+                .assignment_for(fixture.target_island)
+                .is_some_and(|assignment| assignment.operation_ready)
+        );
+
+        plan_squads(&mut fixture.world, player);
+        let snapshot = {
+            let manager = fixture.world.resource::<SquadManager>();
+            let mut squads: Vec<_> = manager
+                .squads
+                .iter()
+                .filter(|squad| squad.target_island == Some(fixture.target_island))
+                .map(|squad| {
+                    (
+                        squad.id,
+                        squad.transport_entity,
+                        squad.members.clone(),
+                        squad.cargo_entities.clone(),
+                        squad.phase.clone(),
+                        squad.pickup_position,
+                    )
+                })
+                .collect();
+            squads.sort_by_key(|squad| squad.0.0);
+            assert_eq!(squads.len(), 2);
+            assert_eq!(squads[0].0, SquadId(0));
+            assert_eq!(squads[1].0, SquadId(1));
+            assert!(squads.iter().all(|squad| !squad.2.is_empty()));
+            squads
+        };
+
+        plan_squads(&mut fixture.world, player);
+        let manager = fixture.world.resource::<SquadManager>();
+        let mut repeated: Vec<_> = manager
+            .squads
+            .iter()
+            .filter(|squad| squad.target_island == Some(fixture.target_island))
+            .map(|squad| {
+                (
+                    squad.id,
+                    squad.transport_entity,
+                    squad.members.clone(),
+                    squad.cargo_entities.clone(),
+                    squad.phase.clone(),
+                    squad.pickup_position,
+                )
+            })
+            .collect();
+        repeated.sort_by_key(|squad| squad.0.0);
+        assert_eq!(repeated, snapshot);
+        assert!(manager.squads.iter().all(|squad| {
+            squad.target_island != Some(fixture.target_island)
+                || !squad.members.is_empty()
+                || squad.mission_type != MissionType::Transport
+        }));
+        assert!(repeated.iter().any(|squad| squad.1 == Some(fixture.lander)));
+        assert!(
+            repeated
+                .iter()
+                .any(|squad| squad.1 == Some(fixture.helicopter))
+        );
+    }
+
     fn setup_transport_phase_world() -> (World, Entity, Entity, Entity, crate::ai::islands::IslandId)
     {
         let mut world = World::new();
@@ -2873,6 +5802,218 @@ mod tests {
     }
 
     #[test]
+    fn targetless_safe_drop_handoff_does_not_create_cross_sea_duty() {
+        let mut world = World::new();
+        let registry = MasterDataRegistry::load().unwrap();
+        let mut map = Map::new(3, 1, Terrain::Sea, GridTopology::Square);
+        let landing = GridPosition { x: 0, y: 0 };
+        let remote = GridPosition { x: 2, y: 0 };
+        map.set_terrain(landing.x, landing.y, Terrain::City)
+            .unwrap();
+        map.set_terrain(remote.x, remote.y, Terrain::City).unwrap();
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        world.insert_resource(map);
+        world.insert_resource(registry);
+        world.insert_resource(island_map);
+
+        let player = PlayerId(1);
+        world.spawn((landing, Property::new(Terrain::City, Some(player), 100)));
+        world.spawn((remote, Property::new(Terrain::City, None, 100)));
+        let cargo = world
+            .spawn((
+                Faction(player),
+                GridPosition { x: 9_999, y: 9_999 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    movement_type: MovementType::Infantry,
+                    max_movement: 3,
+                    can_capture: true,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let transport = world
+            .spawn((
+                Faction(player),
+                landing,
+                UnitStats {
+                    unit_type: UnitType::TransportHelicopter,
+                    movement_type: MovementType::Air,
+                    max_movement: 7,
+                    max_cargo: 2,
+                    loadable_unit_types: vec![UnitType::Infantry],
+                    ..UnitStats::mock()
+                },
+                CargoCapacity {
+                    max: 2,
+                    loaded: vec![cargo],
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        world.entity_mut(cargo).insert(Transporting(transport));
+
+        let mut manager = SquadManager::new();
+        let safe_drop = manager.create_squad(MissionType::Transport);
+        safe_drop.members.insert(transport);
+        safe_drop.transport_entity = Some(transport);
+        safe_drop.cargo_entities = vec![cargo];
+        safe_drop.target_island = None;
+        safe_drop.target = None;
+        safe_drop.phase = MissionPhase::Transport(TransportPhase::Drop);
+        world.insert_resource(manager);
+
+        world
+            .get_mut::<CargoCapacity>(transport)
+            .unwrap()
+            .loaded
+            .clear();
+        world.entity_mut(cargo).remove::<Transporting>();
+        *world.get_mut::<GridPosition>(cargo).unwrap() = landing;
+        update_squads(&mut world, player);
+
+        let manager = world.resource::<SquadManager>();
+        assert!(manager.squads.iter().all(|squad| {
+            squad.mission_type == MissionType::Transport || !squad.members.contains(&cargo)
+        }));
+    }
+
+    #[test]
+    fn targetless_safe_drop_handoff_uses_reachable_duty_on_actual_landing_island() {
+        let mut world = World::new();
+        let registry = MasterDataRegistry::load().unwrap();
+        let landing = GridPosition { x: 0, y: 0 };
+        let local_target = GridPosition { x: 1, y: 0 };
+        let mut map = Map::new(2, 1, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(landing.x, landing.y, Terrain::City)
+            .unwrap();
+        map.set_terrain(local_target.x, local_target.y, Terrain::City)
+            .unwrap();
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let landing_island = island_map.get_island_at(&landing).unwrap().id;
+        world.insert_resource(map);
+        world.insert_resource(registry);
+        world.insert_resource(island_map);
+        let player = PlayerId(1);
+        world.spawn((landing, Property::new(Terrain::City, Some(player), 100)));
+        world.spawn((local_target, Property::new(Terrain::City, None, 100)));
+        let cargo = world
+            .spawn((
+                Faction(player),
+                landing,
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    movement_type: MovementType::Infantry,
+                    max_movement: 3,
+                    can_capture: true,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let mut manager = SquadManager::new();
+
+        handoff_delivered_cargo(&mut world, &mut manager, player, cargo, None, None);
+
+        let capture = manager
+            .squads
+            .iter()
+            .find(|squad| squad.members.contains(&cargo))
+            .expect("landed cargo must receive a reachable local duty");
+        assert_eq!(capture.mission_type, MissionType::Capture);
+        assert_eq!(capture.target_island, Some(landing_island));
+        assert_eq!(capture.target, Some(local_target));
+    }
+
+    #[test]
+    fn targetless_safe_drop_attack_handoff_records_actual_landing_island() {
+        let mut world = World::new();
+        let registry = MasterDataRegistry::load().unwrap();
+        let landing = GridPosition { x: 0, y: 0 };
+        let enemy_position = GridPosition { x: 1, y: 0 };
+        let mut map = Map::new(2, 1, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(landing.x, landing.y, Terrain::City)
+            .unwrap();
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let landing_island = island_map.get_island_at(&landing).unwrap().id;
+        world.insert_resource(map);
+        world.insert_resource(registry);
+        world.insert_resource(island_map);
+        let player = PlayerId(1);
+        let cargo = world
+            .spawn((
+                Faction(player),
+                landing,
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Tank,
+                    max_movement: 6,
+                    can_capture: false,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        world.spawn((
+            Faction(PlayerId(2)),
+            enemy_position,
+            UnitStats {
+                unit_type: UnitType::Tank,
+                movement_type: MovementType::Tank,
+                ..UnitStats::mock()
+            },
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ));
+        let mut manager = SquadManager::new();
+
+        handoff_delivered_cargo(&mut world, &mut manager, player, cargo, None, None);
+
+        let attack = manager
+            .squads
+            .iter()
+            .find(|squad| squad.members.contains(&cargo))
+            .expect("landed combat cargo must receive a reachable local attack duty");
+        assert_eq!(attack.mission_type, MissionType::Attack);
+        assert_eq!(attack.target, Some(enemy_position));
+        assert_eq!(attack.target_island, Some(landing_island));
+        world.insert_resource(manager);
+        update_squads(&mut world, player);
+        let manager = world.resource::<SquadManager>();
+        assert_eq!(
+            manager
+                .squads
+                .iter()
+                .filter(|squad| squad.members.contains(&cargo))
+                .count(),
+            1
+        );
+        assert_eq!(
+            manager
+                .squads
+                .iter()
+                .find(|squad| squad.members.contains(&cargo))
+                .and_then(|squad| squad.target_island),
+            Some(landing_island)
+        );
+    }
+
+    #[test]
     fn landing_prefers_tile_outside_indirect_fire_range() {
         let mut world = World::new();
         let registry = MasterDataRegistry::load().unwrap();
@@ -3018,6 +6159,1292 @@ mod tests {
             ),
             Some(0)
         );
+    }
+
+    #[test]
+    fn secure_replaces_unreachable_stale_capture_with_allocator_selected_reachable_unit() {
+        use crate::ai::island_campaign::{
+            IslandCampaignAssessment, IslandCampaignDecision, IslandCampaignPortfolio,
+            IslandCampaignState,
+        };
+
+        let mut world = World::new();
+        let registry = MasterDataRegistry::load().unwrap();
+        let owned_port = GridPosition { x: 0, y: 0 };
+        let bridge = GridPosition { x: 1, y: 0 };
+        let neutral_city = GridPosition { x: 2, y: 0 };
+        let mut map = Map::new(3, 1, Terrain::Sea, GridTopology::Square);
+        map.set_terrain(owned_port.x, owned_port.y, Terrain::Port)
+            .unwrap();
+        map.set_terrain(bridge.x, bridge.y, Terrain::Plains)
+            .unwrap();
+        map.set_terrain(neutral_city.x, neutral_city.y, Terrain::City)
+            .unwrap();
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_id = island_map.get_island_at(&owned_port).unwrap().id;
+        world.insert_resource(map);
+        world.insert_resource(registry);
+        world.insert_resource(island_map);
+        world.spawn((
+            owned_port,
+            Property::new(Terrain::Port, Some(PlayerId(1)), 100),
+        ));
+        world.spawn((neutral_city, Property::new(Terrain::City, None, 100)));
+
+        let player = PlayerId(1);
+        let disconnected = world
+            .spawn((
+                Faction(player),
+                owned_port,
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    movement_type: MovementType::Ship,
+                    max_movement: 5,
+                    can_capture: true,
+                    cost: 500,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let reachable = world
+            .spawn((
+                Faction(player),
+                bridge,
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    movement_type: MovementType::Infantry,
+                    max_movement: 3,
+                    can_capture: true,
+                    cost: 1_000,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let stale_duplicate = world
+            .spawn((
+                Faction(player),
+                bridge,
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Tank,
+                    can_capture: false,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let legacy_member = world
+            .spawn((
+                Faction(player),
+                bridge,
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Tank,
+                    can_capture: false,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let mut manager = SquadManager::new();
+        let stale = manager.create_squad(MissionType::Capture);
+        stale.members.insert(disconnected);
+        stale.target_island = Some(island_id);
+        stale.target = Some(neutral_city);
+        stale.phase = MissionPhase::MovingToTarget;
+        let duplicate = manager.create_squad(MissionType::Capture);
+        duplicate.members.insert(stale_duplicate);
+        duplicate.target_island = Some(island_id);
+        duplicate.target = Some(neutral_city);
+        duplicate.phase = MissionPhase::MovingToTarget;
+        let legacy = manager.create_squad(MissionType::Capture);
+        legacy.members.insert(legacy_member);
+        legacy.target_island = None;
+        legacy.target = Some(neutral_city);
+        legacy.phase = MissionPhase::MovingToTarget;
+        let legacy_id = legacy.id;
+        let portfolio = IslandCampaignPortfolio {
+            islands: vec![IslandCampaignAssessment {
+                island_id,
+                state: IslandCampaignState::Secured,
+                decision: IslandCampaignDecision::Secure,
+                state_reason: "友軍が足場を確保している島である".to_owned(),
+                decision_reason: "未所有の拠点を確保する".to_owned(),
+                pause_cause: None,
+                neutral_properties: 1,
+                friendly_properties: 1,
+                enemy_properties: 0,
+                friendly_combat_value: 0,
+                enemy_combat_value: 0,
+                friendly_arrival_eta: Some(0),
+                enemy_arrival_eta: None,
+                friendly_capture_eta: Some(1),
+                enemy_capture_eta: None,
+                roi_production_sites: 0,
+                transport_eta: None,
+                expansion_payback_turns: None,
+                required_budget: 0,
+                allocated_budget: 0,
+            }],
+            active_offensives: Vec::new(),
+            defenses: Vec::new(),
+        };
+
+        let protected = prepare_secure_local_captures(&world, &mut manager, player, &portfolio);
+
+        assert_eq!(protected, HashSet::from([reachable]));
+        let capture = manager
+            .squads
+            .iter()
+            .find(|squad| squad.members.contains(&reachable))
+            .expect("reachable Secure capture unit must own the local duty");
+        assert_eq!(capture.target_island, Some(island_id));
+        assert_eq!(capture.target, Some(neutral_city));
+        assert_eq!(capture.members, HashSet::from([reachable]));
+        assert_eq!(
+            manager
+                .squads
+                .iter()
+                .filter(|squad| {
+                    squad.mission_type == MissionType::Capture
+                        && squad.target_island == Some(island_id)
+                })
+                .count(),
+            1
+        );
+        assert!(manager.squads.iter().all(|squad| {
+            !squad.members.contains(&disconnected)
+                && !squad.members.contains(&stale_duplicate)
+                && !squad.cargo_entities.contains(&disconnected)
+                && !squad.delivered_cargo.contains(&disconnected)
+        }));
+        let legacy = manager
+            .squads
+            .iter()
+            .find(|squad| squad.id == legacy_id)
+            .expect("legacy-local duty without campaign island must remain");
+        assert_eq!(legacy.members, HashSet::from([legacy_member]));
+        let snapshot: Vec<_> = manager
+            .squads
+            .iter()
+            .map(|squad| {
+                (
+                    squad.id,
+                    squad.mission_type.clone(),
+                    squad.members.clone(),
+                    squad.target_island,
+                    squad.target,
+                )
+            })
+            .collect();
+        prepare_secure_local_captures(&world, &mut manager, player, &portfolio);
+        let repeated: Vec<_> = manager
+            .squads
+            .iter()
+            .map(|squad| {
+                (
+                    squad.id,
+                    squad.mission_type.clone(),
+                    squad.members.clone(),
+                    squad.target_island,
+                    squad.target,
+                )
+            })
+            .collect();
+        assert_eq!(repeated, snapshot);
+    }
+
+    #[test]
+    fn update_squads_leaves_mixed_owner_squad_byte_for_byte_unchanged() {
+        let mut world = setup_test_world();
+        let player_a = PlayerId(1);
+        let player_b = PlayerId(2);
+        let member_a = world
+            .spawn((
+                Faction(player_a),
+                GridPosition { x: 0, y: 0 },
+                UnitStats::mock(),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let member_b = world
+            .spawn((
+                Faction(player_b),
+                GridPosition { x: 1, y: 0 },
+                UnitStats::mock(),
+                Health {
+                    current: 50,
+                    max: 100,
+                },
+            ))
+            .id();
+        let mut manager = SquadManager::new();
+        let mixed = manager.create_squad(MissionType::Attack);
+        mixed.members = HashSet::from([member_a, member_b]);
+        mixed.target = Some(GridPosition { x: 3, y: 3 });
+        mixed.target_island = Some(crate::ai::islands::IslandId(0));
+        mixed.phase = MissionPhase::MovingToTarget;
+        let snapshot = mixed.clone();
+        world.insert_resource(manager);
+
+        update_squads(&mut world, player_b);
+
+        let retained = &world.resource::<SquadManager>().squads[0];
+        assert_eq!(retained.id, snapshot.id);
+        assert_eq!(retained.owner_id, snapshot.owner_id);
+        assert_eq!(retained.mission_type, snapshot.mission_type);
+        assert_eq!(retained.members, snapshot.members);
+        assert_eq!(retained.target, snapshot.target);
+        assert_eq!(retained.target_island, snapshot.target_island);
+        assert_eq!(retained.phase, snapshot.phase);
+        assert_eq!(retained.transport_entity, snapshot.transport_entity);
+        assert_eq!(retained.cargo_entities, snapshot.cargo_entities);
+        assert_eq!(retained.delivered_cargo, snapshot.delivered_cargo);
+        assert_eq!(retained.pickup_position, snapshot.pickup_position);
+        assert_eq!(retained.drop_position, snapshot.drop_position);
+    }
+
+    #[test]
+    fn defense_preempted_observe_island_releases_stale_forming_operation() {
+        use crate::ai::island_campaign::{
+            IslandCampaignAssessment, IslandCampaignDecision, IslandCampaignPauseCause,
+            IslandCampaignPortfolio, IslandCampaignState,
+        };
+
+        let mut world = setup_test_world();
+        let player = PlayerId(1);
+        let transport = world
+            .spawn((
+                Faction(player),
+                GridPosition { x: 0, y: 0 },
+                UnitStats {
+                    unit_type: UnitType::TransportHelicopter,
+                    movement_type: MovementType::Air,
+                    max_cargo: 2,
+                    ..UnitStats::mock()
+                },
+                CargoCapacity {
+                    max: 2,
+                    loaded: Vec::new(),
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let island_id = crate::ai::islands::IslandId(0);
+        let mut manager = SquadManager::new();
+        let stale = manager.create_squad(MissionType::Transport);
+        stale.members.insert(transport);
+        stale.transport_entity = Some(transport);
+        stale.target_island = Some(island_id);
+        stale.target = Some(GridPosition { x: 3, y: 3 });
+        stale.phase = MissionPhase::Forming;
+        let stale_id = stale.id;
+        let placeholder = manager.create_owned_squad(MissionType::Transport, player);
+        placeholder.target_island = Some(island_id);
+        placeholder.target = Some(GridPosition { x: 3, y: 3 });
+        placeholder.phase = MissionPhase::Forming;
+        let placeholder_id = placeholder.id;
+        let portfolio = IslandCampaignPortfolio {
+            islands: vec![IslandCampaignAssessment {
+                island_id,
+                state: IslandCampaignState::OpenNeutral,
+                decision: IslandCampaignDecision::Observe,
+                state_reason: "未占領の中立島である".to_owned(),
+                decision_reason: "診断表示の文言は制御に使わない".to_owned(),
+                pause_cause: Some(IslandCampaignPauseCause::DefensePreemption),
+                neutral_properties: 1,
+                friendly_properties: 0,
+                enemy_properties: 0,
+                friendly_combat_value: 0,
+                enemy_combat_value: 0,
+                friendly_arrival_eta: None,
+                enemy_arrival_eta: None,
+                friendly_capture_eta: None,
+                enemy_capture_eta: None,
+                roi_production_sites: 0,
+                transport_eta: Some(1),
+                expansion_payback_turns: Some(1),
+                required_budget: 0,
+                allocated_budget: 0,
+            }],
+            active_offensives: Vec::new(),
+            defenses: Vec::new(),
+        };
+
+        let paused = campaign_paused_islands(&portfolio);
+        apply_campaign_pauses(&world, &mut manager, player, &paused);
+        assert!(manager.squads.iter().all(|squad| squad.id != stale_id));
+        assert!(
+            manager
+                .squads
+                .iter()
+                .all(|squad| squad.id != placeholder_id)
+        );
+        assert!(paused.contains(&island_id));
+    }
+
+    #[test]
+    fn defend_does_not_assign_transported_or_unreachable_reserved_entities() {
+        use crate::ai::island_campaign::{
+            IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
+        };
+
+        let mut world = setup_test_world();
+        let player = PlayerId(1);
+        let mut map = Map::new(3, 1, Terrain::Sea, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::City).unwrap();
+        map.set_terrain(2, 0, Terrain::Plains).unwrap();
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let defended_island = island_map
+            .get_island_at(&GridPosition { x: 0, y: 0 })
+            .unwrap()
+            .id;
+        world.insert_resource(map);
+        world.insert_resource(island_map);
+        let unreachable = world
+            .spawn((
+                Faction(player),
+                GridPosition { x: 2, y: 0 },
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Tank,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let transported = world
+            .spawn((
+                Faction(player),
+                GridPosition { x: 9_999, y: 9_999 },
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Tank,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let carrier = world.spawn((Faction(player),)).id();
+        world.entity_mut(transported).insert(Transporting(carrier));
+        let requirement = IslandCampaignRequirement {
+            preferred_transport: None,
+            transport_slots: 0,
+            capture_units: 0,
+            combat_budget: 2_000,
+            total_budget: 2_000,
+        };
+        let assignment = IslandCampaignAssignment {
+            island_id: defended_island,
+            decision: IslandCampaignDecision::Defend,
+            target_position: GridPosition { x: 0, y: 0 },
+            requirement: requirement.clone(),
+            purchase_shortfall: IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 0,
+                combat_budget: 0,
+                total_budget: 0,
+            },
+            allocated_budget: 2_000,
+            transport_entities: Vec::new(),
+            capture_entities: Vec::new(),
+            combat_entities: vec![unreachable, transported],
+            operation_ready: true,
+            continued_from_existing_squad: false,
+        };
+        let mut manager = SquadManager::new();
+
+        prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
+        assert!(manager.squads.iter().all(|squad| {
+            squad.mission_type != MissionType::Defense
+                || !squad.members.contains(&unreachable) && !squad.members.contains(&transported)
+        }));
+    }
+
+    #[test]
+    fn campaign_attack_uses_a_reachable_ranged_firing_position() {
+        use crate::ai::island_campaign::{
+            IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
+        };
+
+        let mut world = World::new();
+        let registry = MasterDataRegistry::load().unwrap();
+        let firing_position = GridPosition { x: 0, y: 0 };
+        let bridge = GridPosition { x: 1, y: 0 };
+        let enemy_position = GridPosition { x: 2, y: 0 };
+        let mut map = Map::new(3, 1, Terrain::Sea, GridTopology::Square);
+        map.set_terrain(firing_position.x, firing_position.y, Terrain::Port)
+            .unwrap();
+        map.set_terrain(bridge.x, bridge.y, Terrain::Plains)
+            .unwrap();
+        map.set_terrain(enemy_position.x, enemy_position.y, Terrain::City)
+            .unwrap();
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_id = island_map.get_island_at(&enemy_position).unwrap().id;
+        let battleship_stats = registry
+            .create_unit_stats(&UnitName(UnitType::Battleship.as_str().to_owned()))
+            .unwrap();
+        let enemy_stats = registry
+            .create_unit_stats(&UnitName(UnitType::Infantry.as_str().to_owned()))
+            .unwrap();
+        world.insert_resource(map);
+        world.insert_resource(registry);
+        world.insert_resource(island_map);
+        let player = PlayerId(1);
+        let combat = world
+            .spawn((
+                Faction(player),
+                firing_position,
+                battleship_stats.clone(),
+                Ammo {
+                    ammo1: battleship_stats.max_ammo1,
+                    max_ammo1: battleship_stats.max_ammo1,
+                    ammo2: battleship_stats.max_ammo2,
+                    max_ammo2: battleship_stats.max_ammo2,
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        world.spawn((
+            Faction(PlayerId(2)),
+            enemy_position,
+            enemy_stats,
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ));
+        let requirement = IslandCampaignRequirement {
+            preferred_transport: None,
+            transport_slots: 0,
+            capture_units: 0,
+            combat_budget: battleship_stats.cost,
+            total_budget: battleship_stats.cost,
+        };
+        let assignment = IslandCampaignAssignment {
+            island_id,
+            decision: IslandCampaignDecision::Contest,
+            target_position: enemy_position,
+            requirement: requirement.clone(),
+            purchase_shortfall: IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 0,
+                combat_budget: 0,
+                total_budget: 0,
+            },
+            allocated_budget: battleship_stats.cost,
+            transport_entities: Vec::new(),
+            capture_entities: Vec::new(),
+            combat_entities: vec![combat],
+            operation_ready: true,
+            continued_from_existing_squad: false,
+        };
+        let mut manager = SquadManager::new();
+
+        prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
+
+        let attack = manager
+            .squads
+            .iter()
+            .find(|squad| squad.members.contains(&combat))
+            .expect("armed ranged member must keep a local responsibility");
+        assert_eq!(attack.mission_type, MissionType::Attack);
+        assert_eq!(attack.target_island, Some(island_id));
+        assert_eq!(attack.target, Some(enemy_position));
+    }
+
+    #[test]
+    fn campaign_attack_uses_local_hold_when_same_island_enemy_is_unreachable() {
+        use crate::ai::island_campaign::{
+            IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
+        };
+
+        let mut world = World::new();
+        let registry = MasterDataRegistry::load().unwrap();
+        let hold_position = GridPosition { x: 0, y: 0 };
+        let bridge = GridPosition { x: 1, y: 0 };
+        let enemy_position = GridPosition { x: 2, y: 0 };
+        let mut map = Map::new(3, 1, Terrain::Sea, GridTopology::Square);
+        map.set_terrain(hold_position.x, hold_position.y, Terrain::Port)
+            .unwrap();
+        map.set_terrain(bridge.x, bridge.y, Terrain::Plains)
+            .unwrap();
+        map.set_terrain(enemy_position.x, enemy_position.y, Terrain::City)
+            .unwrap();
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_id = island_map.get_island_at(&enemy_position).unwrap().id;
+        world.insert_resource(map);
+        world.insert_resource(registry);
+        world.insert_resource(island_map);
+        let player = PlayerId(1);
+        let combat = world
+            .spawn((
+                Faction(player),
+                hold_position,
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Ship,
+                    cost: 7_000,
+                    ..UnitStats::mock()
+                },
+                Ammo {
+                    ammo1: 9,
+                    max_ammo1: 9,
+                    ammo2: 9,
+                    max_ammo2: 9,
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        world.spawn((
+            Faction(PlayerId(2)),
+            enemy_position,
+            UnitStats {
+                unit_type: UnitType::Tank,
+                movement_type: MovementType::Tank,
+                ..UnitStats::mock()
+            },
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ));
+        let requirement = IslandCampaignRequirement {
+            preferred_transport: None,
+            transport_slots: 0,
+            capture_units: 0,
+            combat_budget: 7_000,
+            total_budget: 7_000,
+        };
+        let assignment = IslandCampaignAssignment {
+            island_id,
+            decision: IslandCampaignDecision::Contest,
+            target_position: enemy_position,
+            requirement: requirement.clone(),
+            purchase_shortfall: IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 0,
+                combat_budget: 0,
+                total_budget: 0,
+            },
+            allocated_budget: 7_000,
+            transport_entities: Vec::new(),
+            capture_entities: Vec::new(),
+            combat_entities: vec![combat],
+            operation_ready: true,
+            continued_from_existing_squad: false,
+        };
+        let mut manager = SquadManager::new();
+
+        prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
+
+        assert!(manager.squads.iter().all(|squad| {
+            squad.mission_type != MissionType::Attack || !squad.members.contains(&combat)
+        }));
+        let local_hold = manager
+            .squads
+            .iter()
+            .find(|squad| squad.members.contains(&combat))
+            .expect("unreachable local combat must remain protected by a local responsibility");
+        assert_eq!(local_hold.mission_type, MissionType::Defense);
+        assert_eq!(local_hold.target_island, Some(island_id));
+        assert_eq!(local_hold.target, Some(hold_position));
+    }
+
+    #[test]
+    fn campaign_combat_partitions_unreachable_members_into_stable_local_duties() {
+        use crate::ai::island_campaign::{
+            IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
+        };
+
+        let mut world = World::new();
+        let registry = MasterDataRegistry::load().unwrap();
+        let ship_hold = GridPosition { x: 0, y: 0 };
+        let land_position = GridPosition { x: 1, y: 0 };
+        let enemy_position = GridPosition { x: 2, y: 0 };
+        let mut map = Map::new(3, 1, Terrain::Sea, GridTopology::Square);
+        map.set_terrain(ship_hold.x, ship_hold.y, Terrain::Port)
+            .unwrap();
+        map.set_terrain(land_position.x, land_position.y, Terrain::Plains)
+            .unwrap();
+        map.set_terrain(enemy_position.x, enemy_position.y, Terrain::City)
+            .unwrap();
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_id = island_map.get_island_at(&enemy_position).unwrap().id;
+        world.insert_resource(map);
+        world.insert_resource(registry);
+        world.insert_resource(island_map);
+        let player = PlayerId(1);
+        let ship_member = world
+            .spawn((
+                Faction(player),
+                ship_hold,
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Ship,
+                    cost: 7_000,
+                    ..UnitStats::mock()
+                },
+                Ammo {
+                    ammo1: 9,
+                    max_ammo1: 9,
+                    ammo2: 9,
+                    max_ammo2: 9,
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let land_member = world
+            .spawn((
+                Faction(player),
+                land_position,
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Tank,
+                    cost: 7_000,
+                    ..UnitStats::mock()
+                },
+                Ammo {
+                    ammo1: 9,
+                    max_ammo1: 9,
+                    ammo2: 9,
+                    max_ammo2: 9,
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        world.spawn((
+            Faction(PlayerId(2)),
+            enemy_position,
+            UnitStats {
+                unit_type: UnitType::Tank,
+                movement_type: MovementType::Tank,
+                ..UnitStats::mock()
+            },
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ));
+        let requirement = IslandCampaignRequirement {
+            preferred_transport: None,
+            transport_slots: 0,
+            capture_units: 0,
+            combat_budget: 14_000,
+            total_budget: 14_000,
+        };
+        let assignment = IslandCampaignAssignment {
+            island_id,
+            decision: IslandCampaignDecision::Contest,
+            target_position: enemy_position,
+            requirement: requirement.clone(),
+            purchase_shortfall: IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 0,
+                combat_budget: 0,
+                total_budget: 0,
+            },
+            allocated_budget: 14_000,
+            transport_entities: Vec::new(),
+            capture_entities: Vec::new(),
+            combat_entities: vec![ship_member, land_member],
+            operation_ready: true,
+            continued_from_existing_squad: false,
+        };
+        let mut manager = SquadManager::new();
+
+        prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
+        let snapshot: Vec<_> = manager
+            .squads
+            .iter()
+            .map(|squad| {
+                (
+                    squad.id,
+                    squad.mission_type.clone(),
+                    squad.target_island,
+                    squad.target,
+                    squad.members.clone(),
+                )
+            })
+            .collect();
+        let attack = manager
+            .squads
+            .iter()
+            .find(|squad| squad.mission_type == MissionType::Attack)
+            .expect("reachable land member must receive an Attack duty");
+        assert_eq!(attack.target, Some(enemy_position));
+        assert_eq!(attack.members, HashSet::from([land_member]));
+        let defense = manager
+            .squads
+            .iter()
+            .find(|squad| squad.mission_type == MissionType::Defense)
+            .expect("unreachable ship member must receive a local Defense hold");
+        assert_eq!(defense.target, Some(ship_hold));
+        assert_eq!(defense.members, HashSet::from([ship_member]));
+        assert_eq!(
+            manager
+                .squads
+                .iter()
+                .filter(|squad| squad.members.contains(&ship_member))
+                .count(),
+            1
+        );
+        assert_eq!(
+            manager
+                .squads
+                .iter()
+                .filter(|squad| squad.members.contains(&land_member))
+                .count(),
+            1
+        );
+
+        prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
+        let repeated: Vec<_> = manager
+            .squads
+            .iter()
+            .map(|squad| {
+                (
+                    squad.id,
+                    squad.mission_type.clone(),
+                    squad.target_island,
+                    squad.target,
+                    squad.members.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(repeated, snapshot);
+    }
+
+    #[test]
+    fn campaign_combat_uses_one_attack_squad_for_a_common_reachable_enemy() {
+        use crate::ai::island_campaign::{
+            IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
+        };
+
+        let mut world = World::new();
+        let registry = MasterDataRegistry::load().unwrap();
+        let positions = [GridPosition { x: 0, y: 0 }, GridPosition { x: 1, y: 0 }];
+        let enemy_position = GridPosition { x: 2, y: 0 };
+        let mut map = Map::new(3, 1, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(enemy_position.x, enemy_position.y, Terrain::City)
+            .unwrap();
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_id = island_map.get_island_at(&enemy_position).unwrap().id;
+        world.insert_resource(map);
+        world.insert_resource(registry);
+        world.insert_resource(island_map);
+        let player = PlayerId(1);
+        let members: Vec<_> = positions
+            .iter()
+            .map(|position| {
+                world
+                    .spawn((
+                        Faction(player),
+                        *position,
+                        UnitStats {
+                            unit_type: UnitType::Tank,
+                            movement_type: MovementType::Tank,
+                            cost: 7_000,
+                            ..UnitStats::mock()
+                        },
+                        Ammo {
+                            ammo1: 9,
+                            max_ammo1: 9,
+                            ammo2: 9,
+                            max_ammo2: 9,
+                        },
+                        Health {
+                            current: 100,
+                            max: 100,
+                        },
+                    ))
+                    .id()
+            })
+            .collect();
+        world.spawn((
+            Faction(PlayerId(2)),
+            enemy_position,
+            UnitStats {
+                unit_type: UnitType::Tank,
+                movement_type: MovementType::Tank,
+                ..UnitStats::mock()
+            },
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ));
+        let requirement = IslandCampaignRequirement {
+            preferred_transport: None,
+            transport_slots: 0,
+            capture_units: 0,
+            combat_budget: 14_000,
+            total_budget: 14_000,
+        };
+        let assignment = IslandCampaignAssignment {
+            island_id,
+            decision: IslandCampaignDecision::Contest,
+            target_position: enemy_position,
+            requirement: requirement.clone(),
+            purchase_shortfall: IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 0,
+                combat_budget: 0,
+                total_budget: 0,
+            },
+            allocated_budget: 14_000,
+            transport_entities: Vec::new(),
+            capture_entities: Vec::new(),
+            combat_entities: members.clone(),
+            operation_ready: true,
+            continued_from_existing_squad: false,
+        };
+        let mut manager = SquadManager::new();
+
+        prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
+
+        let attack_squads: Vec<_> = manager
+            .squads
+            .iter()
+            .filter(|squad| squad.mission_type == MissionType::Attack)
+            .collect();
+        assert_eq!(attack_squads.len(), 1);
+        assert_eq!(attack_squads[0].target, Some(enemy_position));
+        assert_eq!(
+            attack_squads[0].members,
+            members.iter().copied().collect::<HashSet<_>>()
+        );
+        assert!(
+            manager
+                .squads
+                .iter()
+                .all(|squad| squad.mission_type != MissionType::Defense)
+        );
+    }
+
+    #[test]
+    fn campaign_attack_selects_reachable_same_island_enemy() {
+        use crate::ai::island_campaign::{
+            IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
+        };
+
+        let mut world = World::new();
+        let registry = MasterDataRegistry::load().unwrap();
+        let combat_position = GridPosition { x: 0, y: 0 };
+        let enemy_position = GridPosition { x: 2, y: 0 };
+        let mut map = Map::new(3, 1, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(enemy_position.x, enemy_position.y, Terrain::City)
+            .unwrap();
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_id = island_map.get_island_at(&enemy_position).unwrap().id;
+        world.insert_resource(map);
+        world.insert_resource(registry);
+        world.insert_resource(island_map);
+        let player = PlayerId(1);
+        let combat = world
+            .spawn((
+                Faction(player),
+                combat_position,
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Tank,
+                    cost: 7_000,
+                    ..UnitStats::mock()
+                },
+                Ammo {
+                    ammo1: 9,
+                    max_ammo1: 9,
+                    ammo2: 9,
+                    max_ammo2: 9,
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        world.spawn((
+            Faction(PlayerId(2)),
+            enemy_position,
+            UnitStats {
+                unit_type: UnitType::Tank,
+                movement_type: MovementType::Tank,
+                ..UnitStats::mock()
+            },
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ));
+        let requirement = IslandCampaignRequirement {
+            preferred_transport: None,
+            transport_slots: 0,
+            capture_units: 0,
+            combat_budget: 7_000,
+            total_budget: 7_000,
+        };
+        let assignment = IslandCampaignAssignment {
+            island_id,
+            decision: IslandCampaignDecision::Contest,
+            target_position: enemy_position,
+            requirement: requirement.clone(),
+            purchase_shortfall: IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 0,
+                combat_budget: 0,
+                total_budget: 0,
+            },
+            allocated_budget: 7_000,
+            transport_entities: Vec::new(),
+            capture_entities: Vec::new(),
+            combat_entities: vec![combat],
+            operation_ready: true,
+            continued_from_existing_squad: false,
+        };
+        let mut manager = SquadManager::new();
+
+        prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
+
+        let attack = manager
+            .squads
+            .iter()
+            .find(|squad| squad.members.contains(&combat))
+            .expect("reachable local combat must receive an Attack responsibility");
+        assert_eq!(attack.mission_type, MissionType::Attack);
+        assert_eq!(attack.target_island, Some(island_id));
+        assert_eq!(attack.target, Some(enemy_position));
+    }
+
+    #[test]
+    fn purchase_only_assignment_keeps_forming_placeholder_across_replans() {
+        use crate::ai::island_campaign::{
+            IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
+        };
+
+        let world = setup_test_world();
+        let player = PlayerId(1);
+        let island_id = world
+            .resource::<crate::ai::islands::IslandMap>()
+            .get_island_at(&GridPosition { x: 2, y: 2 })
+            .unwrap()
+            .id;
+        let requirement = IslandCampaignRequirement {
+            preferred_transport: Some(UnitType::TransportHelicopter),
+            transport_slots: 2,
+            capture_units: 2,
+            combat_budget: 0,
+            total_budget: 4_000,
+        };
+        let assignment = IslandCampaignAssignment {
+            island_id,
+            decision: IslandCampaignDecision::Expand,
+            target_position: GridPosition { x: 2, y: 2 },
+            requirement: requirement.clone(),
+            purchase_shortfall: requirement,
+            allocated_budget: 4_000,
+            transport_entities: Vec::new(),
+            capture_entities: Vec::new(),
+            combat_entities: Vec::new(),
+            operation_ready: false,
+            continued_from_existing_squad: false,
+        };
+        let mut manager = SquadManager::new();
+
+        prepare_campaign_transport_assignment(&world, &mut manager, player, &assignment);
+        let placeholder = manager
+            .squads
+            .iter()
+            .find(|squad| squad.target_island == Some(island_id))
+            .expect("funded purchase-only operation must retain a Forming identity");
+        assert_eq!(placeholder.phase, MissionPhase::Forming);
+        assert_eq!(placeholder.target, Some(assignment.target_position));
+        assert!(placeholder.members.is_empty());
+        assert!(placeholder.transport_entity.is_none());
+        let placeholder_id = placeholder.id;
+
+        prepare_campaign_transport_assignment(&world, &mut manager, player, &assignment);
+        assert_eq!(
+            manager
+                .squads
+                .iter()
+                .filter(|squad| squad.target_island == Some(island_id))
+                .count(),
+            1
+        );
+        assert_eq!(
+            manager
+                .squads
+                .iter()
+                .find(|squad| squad.target_island == Some(island_id))
+                .map(|squad| squad.id),
+            Some(placeholder_id)
+        );
+    }
+
+    #[test]
+    fn empty_forming_placeholders_are_isolated_by_explicit_player_owner() {
+        use crate::ai::island_campaign::{
+            IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
+        };
+
+        let world = setup_test_world();
+        let player_a = PlayerId(1);
+        let player_b = PlayerId(2);
+        let island_id = world
+            .resource::<crate::ai::islands::IslandMap>()
+            .get_island_at(&GridPosition { x: 3, y: 3 })
+            .unwrap()
+            .id;
+        let requirement = IslandCampaignRequirement {
+            preferred_transport: Some(UnitType::TransportHelicopter),
+            transport_slots: 2,
+            capture_units: 2,
+            combat_budget: 0,
+            total_budget: 4_000,
+        };
+        let assignment = IslandCampaignAssignment {
+            island_id,
+            decision: IslandCampaignDecision::Expand,
+            target_position: GridPosition { x: 3, y: 3 },
+            requirement: requirement.clone(),
+            purchase_shortfall: requirement,
+            allocated_budget: 4_000,
+            transport_entities: Vec::new(),
+            capture_entities: Vec::new(),
+            combat_entities: Vec::new(),
+            operation_ready: false,
+            continued_from_existing_squad: false,
+        };
+        let mut manager = SquadManager::new();
+
+        prepare_campaign_transport_assignment(&world, &mut manager, player_a, &assignment);
+        prepare_campaign_transport_assignment(&world, &mut manager, player_b, &assignment);
+        prepare_campaign_transport_assignment(&world, &mut manager, player_a, &assignment);
+
+        let player_a_placeholders: Vec<_> = manager
+            .squads
+            .iter()
+            .filter(|squad| squad.owner_id == Some(player_a))
+            .collect();
+        let player_b_placeholders: Vec<_> = manager
+            .squads
+            .iter()
+            .filter(|squad| squad.owner_id == Some(player_b))
+            .collect();
+        assert_eq!(player_a_placeholders.len(), 1);
+        assert_eq!(player_b_placeholders.len(), 1);
+        assert_ne!(player_a_placeholders[0].id, player_b_placeholders[0].id);
+        assert_eq!(player_a_placeholders[0].target_island, Some(island_id));
+        assert_eq!(player_b_placeholders[0].target_island, Some(island_id));
+    }
+
+    #[test]
+    fn defend_replaces_same_island_unreachable_stale_member_with_exact_reachable_set() {
+        use crate::ai::island_campaign::{
+            IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
+        };
+
+        let mut world = World::new();
+        let registry = MasterDataRegistry::load().unwrap();
+        let port = GridPosition { x: 0, y: 0 };
+        let bridge = GridPosition { x: 1, y: 0 };
+        let defended = GridPosition { x: 2, y: 0 };
+        let mut map = Map::new(3, 1, Terrain::Sea, GridTopology::Square);
+        map.set_terrain(port.x, port.y, Terrain::Port).unwrap();
+        map.set_terrain(bridge.x, bridge.y, Terrain::Plains)
+            .unwrap();
+        map.set_terrain(defended.x, defended.y, Terrain::City)
+            .unwrap();
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_id = island_map.get_island_at(&defended).unwrap().id;
+        world.insert_resource(map);
+        world.insert_resource(registry);
+        world.insert_resource(island_map);
+
+        let player = PlayerId(1);
+        let stale = world
+            .spawn((
+                Faction(player),
+                port,
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Ship,
+                    cost: 7_000,
+                    ..UnitStats::mock()
+                },
+                Ammo {
+                    ammo1: 9,
+                    max_ammo1: 9,
+                    ammo2: 9,
+                    max_ammo2: 9,
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let stale_duplicate = world
+            .spawn((
+                Faction(player),
+                port,
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Ship,
+                    cost: 7_000,
+                    ..UnitStats::mock()
+                },
+                Ammo {
+                    ammo1: 9,
+                    max_ammo1: 9,
+                    ammo2: 9,
+                    max_ammo2: 9,
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let reachable = world
+            .spawn((
+                Faction(player),
+                bridge,
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Tank,
+                    cost: 7_000,
+                    ..UnitStats::mock()
+                },
+                Ammo {
+                    ammo1: 9,
+                    max_ammo1: 9,
+                    ammo2: 9,
+                    max_ammo2: 9,
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let requirement = IslandCampaignRequirement {
+            preferred_transport: None,
+            transport_slots: 0,
+            capture_units: 0,
+            combat_budget: 7_000,
+            total_budget: 7_000,
+        };
+        let assignment = IslandCampaignAssignment {
+            island_id,
+            decision: IslandCampaignDecision::Defend,
+            target_position: defended,
+            requirement: requirement.clone(),
+            purchase_shortfall: IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 0,
+                combat_budget: 0,
+                total_budget: 0,
+            },
+            allocated_budget: 7_000,
+            transport_entities: Vec::new(),
+            capture_entities: Vec::new(),
+            combat_entities: vec![reachable],
+            operation_ready: true,
+            continued_from_existing_squad: true,
+        };
+        let mut manager = SquadManager::new();
+        let defense = manager.create_squad(MissionType::Defense);
+        defense.members.insert(stale);
+        defense.target_island = Some(island_id);
+        defense.target = Some(defended);
+        defense.phase = MissionPhase::MovingToTarget;
+        let duplicate = manager.create_squad(MissionType::Defense);
+        duplicate.members.insert(stale_duplicate);
+        duplicate.target_island = Some(island_id);
+        duplicate.target = Some(defended);
+        duplicate.phase = MissionPhase::MovingToTarget;
+
+        prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
+
+        let defense = manager
+            .squads
+            .iter()
+            .find(|squad| squad.mission_type == MissionType::Defense)
+            .unwrap();
+        assert_eq!(defense.members, HashSet::from([reachable]));
+        assert_eq!(defense.target_island, Some(island_id));
+        assert_eq!(defense.target, Some(defended));
+        assert_eq!(
+            manager
+                .squads
+                .iter()
+                .filter(|squad| {
+                    squad.mission_type == MissionType::Defense
+                        && squad.target_island == Some(island_id)
+                })
+                .count(),
+            1
+        );
+        assert!(manager.squads.iter().all(|squad| {
+            !squad.members.contains(&stale) && !squad.members.contains(&stale_duplicate)
+        }));
+        let snapshot = manager.squads.clone();
+        prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
+        assert_eq!(manager.squads.len(), snapshot.len());
+        for (actual, expected) in manager.squads.iter().zip(snapshot.iter()) {
+            assert_eq!(actual.id, expected.id);
+            assert_eq!(actual.mission_type, expected.mission_type);
+            assert_eq!(actual.members, expected.members);
+            assert_eq!(actual.target_island, expected.target_island);
+            assert_eq!(actual.target, expected.target);
+            assert_eq!(actual.phase, expected.phase);
+        }
     }
 
     #[test]

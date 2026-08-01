@@ -2,6 +2,10 @@ pub mod ai_version;
 pub mod demand;
 pub mod engine;
 pub mod eval;
+pub mod island_campaign;
+pub mod island_campaign_analysis;
+#[cfg(test)]
+mod island_campaign_tests;
 #[cfg(test)]
 mod island_invasion_tests;
 pub mod islands;
@@ -21,4 +25,4 @@ pub mod squad;
 pub mod threat;
 pub mod turn_distance;
 
-pub use ai_version::{AiVersion, PlayerAiSettings};
+pub use ai_version::{AiVersion, PlayerAiSettings, resolve_player_ai_version};

@@ -12,14 +12,101 @@ use crate::resources::{Map, Terrain};
 use crate::systems::combat::get_expected_damage;
 use crate::systems::movement::{OccupantInfo, calculate_reachable_tiles};
 use bevy_ecs::prelude::*;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Resource, Default)]
 pub struct AiActionCooldown(pub HashSet<Entity>);
 
 #[derive(Resource, Default)]
 pub struct AiProductionCooldown(pub HashSet<(usize, usize)>);
+
+/// V3が同一ターンの部隊計画と島嶼キャンペーン分析を再実行しないための一時cache。
+/// 次フェーズでResourceごと削除し、キャンペーンの永続状態としては扱わない。
+#[derive(Resource, Default)]
+pub struct AiTurnStrategyCache {
+    player_id: Option<PlayerId>,
+    squads_planned: bool,
+    campaign_portfolio: Option<crate::ai::island_campaign::IslandCampaignPortfolio>,
+    campaign_production_planned: bool,
+    campaign_production_commands: VecDeque<crate::events::ProduceUnitCommand>,
+    campaign_production_blocks_generic: bool,
+}
+
+impl AiTurnStrategyCache {
+    pub(crate) fn set_campaign_portfolio(
+        &mut self,
+        player_id: PlayerId,
+        portfolio: crate::ai::island_campaign::IslandCampaignPortfolio,
+    ) {
+        if self.player_id != Some(player_id) {
+            self.clear();
+            self.player_id = Some(player_id);
+        }
+        self.campaign_portfolio = Some(portfolio);
+    }
+
+    pub(crate) fn campaign_portfolio(
+        &self,
+        player_id: PlayerId,
+    ) -> Option<&crate::ai::island_campaign::IslandCampaignPortfolio> {
+        (self.player_id == Some(player_id))
+            .then_some(self.campaign_portfolio.as_ref())
+            .flatten()
+    }
+
+    pub(crate) fn mark_squads_planned(&mut self, player_id: PlayerId) {
+        if self.player_id != Some(player_id) {
+            self.clear();
+            self.player_id = Some(player_id);
+        }
+        self.squads_planned = true;
+    }
+
+    fn squads_planned(&self, player_id: PlayerId) -> bool {
+        self.player_id == Some(player_id) && self.squads_planned
+    }
+
+    pub(crate) fn set_campaign_production_plan(
+        &mut self,
+        player_id: PlayerId,
+        commands: Vec<crate::events::ProduceUnitCommand>,
+        completed_all_rows: bool,
+    ) {
+        if self.player_id != Some(player_id) {
+            self.clear();
+            self.player_id = Some(player_id);
+        }
+        self.campaign_production_planned = true;
+        self.campaign_production_commands = VecDeque::from(commands);
+        self.campaign_production_blocks_generic = !completed_all_rows;
+    }
+
+    pub(crate) fn campaign_production_planned(&self, player_id: PlayerId) -> bool {
+        self.player_id == Some(player_id) && self.campaign_production_planned
+    }
+
+    pub(crate) fn take_campaign_production_command(
+        &mut self,
+        player_id: PlayerId,
+    ) -> Option<crate::events::ProduceUnitCommand> {
+        (self.player_id == Some(player_id))
+            .then(|| self.campaign_production_commands.pop_front())
+            .flatten()
+    }
+
+    pub(crate) fn campaign_production_blocks_generic(&self, player_id: PlayerId) -> bool {
+        self.player_id == Some(player_id) && self.campaign_production_blocks_generic
+    }
+
+    fn clear(&mut self) {
+        self.player_id = None;
+        self.squads_planned = false;
+        self.campaign_portfolio = None;
+        self.campaign_production_planned = false;
+        self.campaign_production_commands.clear();
+        self.campaign_production_blocks_generic = false;
+    }
+}
 
 /// ターン開始時にAIの冷却リストをクリアするシステム。
 pub fn clear_ai_cooldowns_system(
@@ -878,12 +965,7 @@ pub fn execute_ai_command(world: &mut World, unit_entity: Entity, command: AiCom
 /// 何らかの行動を実行した場合はその行動内容（文字列）を `Some` で返し、ターンが終了した場合は `None` を返します。
 /// AIのメイン実行エントリーポイント。
 pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> Option<String> {
-    let ai_version = {
-        let settings = world.get_resource::<crate::ai::ai_version::PlayerAiSettings>();
-        settings
-            .map(|s| s.get_version(active_player))
-            .unwrap_or(crate::ai::ai_version::AiVersion::V3)
-    };
+    let ai_version = crate::ai::resolve_player_ai_version(world, active_player);
 
     match ai_version {
         crate::ai::ai_version::AiVersion::V1 => execute_ai_turn_v1(world, active_player),
@@ -1079,8 +1161,15 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
         skip_entities = res.0.clone();
     }
 
-    // 今ターン最初のステップの時に、部隊編成と目標のビーム探索を一括実行・キャッシュ
-    if skip_entities.is_empty() {
+    let uses_v3 = crate::ai::resolve_player_ai_version(world, active_player).uses_v3_tactics();
+    let should_plan_squads = skip_entities.is_empty()
+        && (!uses_v3
+            || !world
+                .get_resource::<AiTurnStrategyCache>()
+                .is_some_and(|cache| cache.squads_planned(active_player)));
+
+    // V3は行動可能ユニットがなくても同一ターンの再計画を避け、V1/V2は従来条件を維持する。
+    if should_plan_squads {
         crate::ai::squad::plan_squads(world, active_player);
         crate::ai::beam_search::run_squad_beam_search(world, active_player);
     } else {
@@ -1112,7 +1201,10 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     let mut transport_action = None;
     if let Some(mut manager) = world.remove_resource::<crate::ai::squad::SquadManager>() {
         for squad in &mut manager.squads {
-            if squad.mission_type == crate::ai::squad::MissionType::Transport {
+            if squad.mission_type == crate::ai::squad::MissionType::Transport
+                && squad.owner_id == Some(active_player)
+                && crate::ai::squad::squad_is_mutable_by_player(world, squad, active_player)
+            {
                 let is_transport_cooldown = squad
                     .transport_entity
                     .is_none_or(|entity| skip_entities.contains(&entity));
@@ -1184,6 +1276,7 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     }
 
     // 3. 生産行動
+    // 生産内容は盤面・資金の変化ごとに従来通り再計画し、V3の島分析だけを同一ターンで共有する。
     let prod_commands = super::production::decide_production(world, active_player);
 
     let cooldown_set = if let Some(res) = world.get_resource::<AiProductionCooldown>() {
@@ -1264,10 +1357,7 @@ pub fn decide_ai_action_v2(
     skip_entities: &std::collections::HashSet<Entity>,
 ) -> Option<(Entity, AiCommand)> {
     // V3 の戦術評価 (#44/#45/#50) を有効にするかどうか
-    let is_v3 = world
-        .get_resource::<crate::ai::ai_version::PlayerAiSettings>()
-        .map(|s| s.get_version(player_id).uses_v3_tactics())
-        .unwrap_or(false);
+    let is_v3 = crate::ai::resolve_player_ai_version(world, player_id).uses_v3_tactics();
 
     // 1. 行動可能なユニットを収集
     let mut movable_units = Vec::new();
@@ -2128,6 +2218,93 @@ mod tests {
     use super::*;
     use crate::components::{Faction, Health, PlayerId, Property, UnitStats};
     use crate::resources::{DamageChart, UnitType};
+
+    #[test]
+    fn v3_turn_cache_marks_squad_plan_until_cleared() {
+        let player = PlayerId(1);
+        let mut cache = AiTurnStrategyCache::default();
+
+        assert!(!cache.squads_planned(player));
+        cache.mark_squads_planned(player);
+        assert!(cache.squads_planned(player));
+
+        cache.clear();
+        assert!(!cache.squads_planned(player));
+    }
+
+    #[test]
+    fn plan_squads_populates_v3_turn_strategy_cache() {
+        let master_data = crate::resources::master_data::MasterDataRegistry::load().unwrap();
+        let (mut world, _) =
+            crate::setup::initialize_world_from_master_data(&master_data, "map_1").unwrap();
+        let entities: Vec<Entity> = world.query::<Entity>().iter(&world).collect();
+        for entity in entities {
+            world.despawn(entity);
+        }
+        let player = PlayerId(1);
+        let mut settings = crate::ai::PlayerAiSettings::default();
+        settings.set_version(player, crate::ai::AiVersion::V3);
+        world.insert_resource(settings);
+
+        crate::ai::squad::plan_squads(&mut world, player);
+
+        let cache = world.resource::<AiTurnStrategyCache>();
+        assert!(cache.squads_planned(player));
+        assert!(cache.campaign_portfolio(player).is_some());
+    }
+
+    #[test]
+    fn v3_campaign_production_plan_consumes_each_command_once() {
+        let player = PlayerId(1);
+        let first = crate::events::ProduceUnitCommand {
+            player_id: player,
+            target_x: 1,
+            target_y: 2,
+            unit_type: UnitType::Infantry,
+        };
+        let second = crate::events::ProduceUnitCommand {
+            player_id: player,
+            target_x: 3,
+            target_y: 4,
+            unit_type: UnitType::Mech,
+        };
+        let mut cache = AiTurnStrategyCache::default();
+
+        cache.set_campaign_production_plan(player, vec![first, second], true);
+
+        assert!(cache.campaign_production_planned(player));
+        let actual_first = cache.take_campaign_production_command(player).unwrap();
+        let actual_second = cache.take_campaign_production_command(player).unwrap();
+        assert_eq!(
+            (
+                actual_first.target_x,
+                actual_first.target_y,
+                actual_first.unit_type,
+            ),
+            (1, 2, UnitType::Infantry)
+        );
+        assert_eq!(
+            (
+                actual_second.target_x,
+                actual_second.target_y,
+                actual_second.unit_type,
+            ),
+            (3, 4, UnitType::Mech)
+        );
+        assert!(cache.take_campaign_production_command(player).is_none());
+        assert!(!cache.campaign_production_blocks_generic(player));
+    }
+
+    #[test]
+    fn incomplete_v3_campaign_production_plan_blocks_generic_fallback() {
+        let player = PlayerId(1);
+        let mut cache = AiTurnStrategyCache::default();
+
+        cache.set_campaign_production_plan(player, Vec::new(), false);
+
+        assert!(cache.campaign_production_planned(player));
+        assert!(cache.campaign_production_blocks_generic(player));
+    }
 
     #[test]
     fn test_decide_ai_action_no_units() {
@@ -3339,6 +3516,161 @@ mod tests {
         world
     }
 
+    #[test]
+    fn v2_v3_transport_executor_skips_foreign_owned_squads() {
+        for version in [
+            crate::ai::ai_version::AiVersion::V2,
+            crate::ai::ai_version::AiVersion::V3,
+        ] {
+            let mut world = setup_v3_test_world(5, version);
+            let map = world.resource::<Map>().clone();
+            world.insert_resource(crate::ai::islands::IslandMap::analyze(&map));
+            world.insert_resource(Events::<crate::events::WaitUnitCommand>::default());
+            world.insert_resource(Events::<crate::events::MoveUnitCommand>::default());
+            let player_a = PlayerId(1);
+            let player_b = PlayerId(2);
+            let property_a = GridPosition { x: 1, y: 0 };
+            let property_b = GridPosition { x: 3, y: 0 };
+            world.spawn((
+                property_a,
+                Property::new(Terrain::City, Some(player_a), 100),
+            ));
+            world.spawn((
+                property_b,
+                Property::new(Terrain::City, Some(player_b), 100),
+            ));
+            let transport_stats = UnitStats {
+                unit_type: UnitType::TransportHelicopter,
+                movement_type: crate::resources::MovementType::Air,
+                max_movement: 6,
+                max_cargo: 2,
+                ..UnitStats::mock()
+            };
+            let transport_a = world
+                .spawn((
+                    Faction(player_a),
+                    GridPosition { x: 0, y: 0 },
+                    transport_stats.clone(),
+                    crate::components::Fuel {
+                        current: 99,
+                        max: 99,
+                    },
+                    crate::components::CargoCapacity {
+                        max: 2,
+                        loaded: Vec::new(),
+                    },
+                ))
+                .id();
+            let ownerless_transport = world
+                .spawn((
+                    Faction(player_b),
+                    GridPosition { x: 2, y: 0 },
+                    transport_stats.clone(),
+                    crate::components::Fuel {
+                        current: 99,
+                        max: 99,
+                    },
+                    crate::components::CargoCapacity {
+                        max: 2,
+                        loaded: Vec::new(),
+                    },
+                ))
+                .id();
+            let transport_b = world
+                .spawn((
+                    Faction(player_b),
+                    GridPosition { x: 4, y: 0 },
+                    transport_stats,
+                    crate::components::Fuel {
+                        current: 99,
+                        max: 99,
+                    },
+                    crate::components::CargoCapacity {
+                        max: 2,
+                        loaded: Vec::new(),
+                    },
+                ))
+                .id();
+            let (foreign_id, foreign_snapshot) = {
+                let mut manager = crate::ai::squad::SquadManager::new();
+                let foreign =
+                    manager.create_owned_squad(crate::ai::squad::MissionType::Transport, player_a);
+                foreign.members.insert(transport_a);
+                foreign.transport_entity = Some(transport_a);
+                foreign.phase = crate::ai::squad::MissionPhase::Transport(
+                    crate::ai::squad::TransportPhase::Return,
+                );
+                let snapshot = (
+                    foreign.owner_id,
+                    foreign.members.clone(),
+                    foreign.transport_entity,
+                    foreign.cargo_entities.clone(),
+                    foreign.delivered_cargo.clone(),
+                    foreign.target_island,
+                    foreign.target,
+                    foreign.phase.clone(),
+                    foreign.pickup_position,
+                    foreign.drop_position,
+                );
+                let id = foreign.id;
+                let ownerless = manager.create_squad(crate::ai::squad::MissionType::Transport);
+                ownerless.members.insert(ownerless_transport);
+                ownerless.transport_entity = Some(ownerless_transport);
+                ownerless.phase = crate::ai::squad::MissionPhase::Transport(
+                    crate::ai::squad::TransportPhase::Return,
+                );
+                let own =
+                    manager.create_owned_squad(crate::ai::squad::MissionType::Transport, player_b);
+                own.members.insert(transport_b);
+                own.transport_entity = Some(transport_b);
+                own.phase = crate::ai::squad::MissionPhase::Transport(
+                    crate::ai::squad::TransportPhase::Return,
+                );
+                world.insert_resource(manager);
+                (id, snapshot)
+            };
+            let sentinel = world.spawn_empty().id();
+            world.insert_resource(AiActionCooldown(HashSet::from([sentinel])));
+
+            let result_b = execute_ai_turn(&mut world, player_b);
+            assert!(result_b.is_some());
+            let manager = world.resource::<crate::ai::squad::SquadManager>();
+            let foreign = manager
+                .squads
+                .iter()
+                .find(|squad| squad.id == foreign_id)
+                .unwrap();
+            assert_eq!(
+                (
+                    foreign.owner_id,
+                    foreign.members.clone(),
+                    foreign.transport_entity,
+                    foreign.cargo_entities.clone(),
+                    foreign.delivered_cargo.clone(),
+                    foreign.target_island,
+                    foreign.target,
+                    foreign.phase.clone(),
+                    foreign.pickup_position,
+                    foreign.drop_position,
+                ),
+                foreign_snapshot
+            );
+            let cooldown = world.resource::<AiActionCooldown>();
+            assert!(!cooldown.0.contains(&transport_a));
+            assert!(!cooldown.0.contains(&ownerless_transport));
+            assert!(cooldown.0.contains(&transport_b));
+
+            let result_a = execute_ai_turn(&mut world, player_a);
+            assert!(result_a.is_some());
+            assert!(
+                world
+                    .resource::<AiActionCooldown>()
+                    .0
+                    .contains(&transport_a)
+            );
+        }
+    }
+
     /// 移動可能な自軍ユニットをスポーンするヘルパー
     fn spawn_v3_test_unit(
         world: &mut World,
@@ -3373,6 +3705,7 @@ mod tests {
         members.insert(member);
         manager.squads.push(crate::ai::squad::Squad {
             id: crate::ai::squad::SquadId(1),
+            owner_id: None,
             members,
             mission_type: crate::ai::squad::MissionType::Attack,
             target: Some(target),

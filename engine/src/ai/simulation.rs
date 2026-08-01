@@ -348,6 +348,7 @@ mod tests {
 
         let mut squad = Squad {
             id: SquadId(1),
+            owner_id: Some(p1),
             members: HashSet::new(),
             mission_type: MissionType::Attack,
             target: Some(GridPosition { x: 1, y: 8 }),

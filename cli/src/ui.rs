@@ -44,7 +44,7 @@ fn draw_map_selection(f: &mut Frame, app: &mut App) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(0),
-            Constraint::Length(3),
+            Constraint::Length(4),
         ])
         .split(f.size());
 
@@ -78,20 +78,20 @@ fn draw_map_selection(f: &mut Frame, app: &mut App) {
     f.render_widget(maps_list, chunks[1]);
 
     // Player controls section
-    let mut controls_text = String::from("Toggles: ");
+    let mut controls_text = String::new();
     let mut sorted_pids: Vec<_> = app.ui_state.player_controls.keys().cloned().collect();
     sorted_pids.sort();
     for pid in sorted_pids {
-        let mode = if app.ui_state.is_human(pid) {
-            "Human"
-        } else {
-            "AI"
-        };
-        controls_text.push_str(&format!("P{}('{}'): {}  ", pid, pid, mode));
+        controls_text.push_str(&format!(
+            "P{}('{}'): {}  ",
+            pid,
+            pid,
+            app.ui_state.control_label(pid)
+        ));
     }
 
     let footer_text = format!(
-        "方向キー(↑/↓)で選択、Enterで決定、qで終了 | t: グリッド切替 [{}] | {}",
+        "↑/↓: マップ  Enter: 開始  1/2: Human→AI(V1)→AI(V3)  t: グリッド [{}]\nl: ロード  q: 終了  {}",
         topology_label(app.ui_state.selected_topology),
         controls_text
     );
@@ -923,6 +923,25 @@ mod tests {
         assert_eq!(app.ui_state.selected_topology, GridTopology::Hex);
         app.handle_map_selection_key(key);
         assert_eq!(app.ui_state.selected_topology, GridTopology::Square);
+    }
+
+    #[test]
+    fn test_map_selection_shows_v1_v3_without_v2() {
+        let mut app = App::new().expect("Failed to create App");
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        let initial = buffer_to_string(terminal.backend().buffer());
+        assert!(initial.contains("P1('1'): Human"));
+        assert!(initial.contains("P2('2'): AI(V3)"));
+        assert!(!initial.contains("AI(V2)"));
+
+        let key = crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('1'));
+        app.handle_map_selection_key(key);
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        let v1 = buffer_to_string(terminal.backend().buffer());
+        assert!(v1.contains("P1('1'): AI(V1)"));
     }
 
     /// ヘックスモードで奇数行が半マス（2文字）右にずれて描画されることの確認。

@@ -6,6 +6,35 @@ import sys
 import time
 import re
 from collections import defaultdict
+from pathlib import Path
+
+if __package__:
+    from scripts.eval_issue58 import (
+        analyze_issue58_game,
+        check_no_decline,
+        collect_run_metadata,
+        compare_issue58_baseline,
+        generate_issue58_report,
+        judge_issue58_criteria,
+        parse_seed_list,
+        validate_issue58_run,
+        write_json_atomic,
+        write_text_atomic,
+    )
+else:
+    # 直接実行時は別 checkout の scripts パッケージではなく同階層を読む。
+    from eval_issue58 import (
+        analyze_issue58_game,
+        check_no_decline,
+        collect_run_metadata,
+        compare_issue58_baseline,
+        generate_issue58_report,
+        judge_issue58_criteria,
+        parse_seed_list,
+        validate_issue58_run,
+        write_json_atomic,
+        write_text_atomic,
+    )
 
 try:
     from rich.live import Live
@@ -92,29 +121,138 @@ def call_tool(name, arguments=None, req_id=1):
     except json.JSONDecodeError:
         return content
 
-def run_single_game(map_name, p1_ver, p2_ver, max_turns, seed=None, ui_callback=None):
+
+ISSUE58_V3_V1 = "v3-v1"
+ISSUE58_V3_SELFPLAY = "v3-selfplay"
+
+
+def build_match_specs(maps, subject, baseline, seeds):
+    """各 seed を両方の手番へ決定的な順序で割り当てる。"""
+    specs = []
+    for map_name in maps:
+        for seed in seeds:
+            specs.append({"map": map_name, "p1": subject, "p2": baseline, "seed": seed})
+            specs.append({"map": map_name, "p1": baseline, "p2": subject, "seed": seed})
+    return specs
+
+
+def build_issue58_match_specs(protocol, maps, seeds):
+    """Issue #58の固定評価プロトコルを決定的な順序で構築する。"""
+    if protocol == ISSUE58_V3_V1:
+        return build_match_specs(maps, "V3", "V1", seeds)
+    if protocol == ISSUE58_V3_SELFPLAY:
+        return [
+            {"map": map_name, "p1": "V3", "p2": "V3", "seed": seed}
+            for map_name in maps
+            for seed in seeds
+        ]
+    raise ValueError(f"unknown Issue #58 protocol: {protocol}")
+
+
+def collect_round_metrics(tool, state, round_number):
+    """両プレイヤーの行動が完了したラウンド末盤面を評価する。"""
+    metric = {
+        "turn": round_number,
+        "p1_props": 0,
+        "p2_props": 0,
+        "p1_units": 0,
+        "p2_units": 0,
+        "p1_funds": 0,
+        "p2_funds": 0,
+        "p1_score": 0,
+        "p2_score": 0,
+    }
+    for player_id, side in ((1, "p1"), (2, "p2")):
+        evaluation = tool("evaluate_board", {"player_id": player_id})
+        if not isinstance(evaluation, dict):
+            evaluation = {}
+        metric[f"{side}_score"] = evaluation.get("score", 0)
+        metric[f"{side}_subj"] = evaluation.get("subjective_metrics", {})
+        metric[f"{side}_obj"] = evaluation.get("objective_metrics", {})
+    for player in state.get("players", []):
+        player_id = player.get("player_id")
+        if player_id not in (1, 2):
+            continue
+        side = "p1" if player_id == 1 else "p2"
+        metric[f"{side}_props"] = player.get("property_count", 0)
+        metric[f"{side}_units"] = player.get("unit_cost", 0)
+        metric[f"{side}_funds"] = player.get("funds", 0)
+        metric[f"{side}_abs_score"] = (
+            metric[f"{side}_props"] * 20000 + metric[f"{side}_units"]
+        )
+    return metric
+
+
+def run_single_game(
+    map_name,
+    p1_ver,
+    p2_ver,
+    max_turns,
+    seed=None,
+    ui_callback=None,
+    tool_caller=None,
+):
+    tool = tool_caller or call_tool
     if ui_callback: ui_callback({"type": "log", "msg": f"Match started: P1({p1_ver}) vs P2({p2_ver}) on {map_name}"})
     
     load_args = {"map_name": map_name}
     if seed is not None:
         load_args["seed"] = seed
-    call_tool("load_map", load_args)
-    call_tool("set_player_ai_version", {"player_id": 1, "version": p1_ver})
-    call_tool("set_player_ai_version", {"player_id": 2, "version": p2_ver})
+    tool("load_map", load_args)
+    tool("set_player_ai_version", {"player_id": 1, "version": p1_ver})
+    tool("set_player_ai_version", {"player_id": 2, "version": p2_ver})
 
     thinking_times = {1: [], 2: []}
     action_counts = {1: defaultdict(int), 2: defaultdict(int)}
     metrics = []
     invasion_events = []
     transport_history = []
+    strategic_history = []
+    island_campaign_history = []
     initial_state = None
+    error = None
+
+    def finish_game(result, turns, final_state):
+        return {
+            "result": result,
+            "turns": turns,
+            "seed": seed,
+            "thinking_times": thinking_times,
+            "action_counts": action_counts,
+            "metrics": metrics,
+            "final_state": final_state,
+            "initial_state": initial_state,
+            "invasion_events": invasion_events,
+            "transport_history": transport_history,
+            "strategic_history": strategic_history,
+            "island_campaign_history": island_campaign_history,
+            "error": error,
+        }
+
+    def record_round_state(round_state, round_number):
+        metric = collect_round_metrics(tool, round_state, round_number)
+        metrics.append(metric)
+        strategic_history.append({
+            "turn": round_number,
+            "properties": round_state.get("properties", []),
+            "units": round_state.get("units", []),
+            "transport_squads": round_state.get("transport_squads", []),
+        })
+        if ui_callback:
+            ui_callback({
+                "type": "status_update",
+                "metrics": metric,
+                "p1_ver": p1_ver,
+                "p2_ver": p2_ver,
+            })
 
     turn = 1
     while turn <= max_turns:
         
-        state = call_tool("get_board_state")
+        state = tool("get_board_state")
         if isinstance(state, dict) and state.get("error"):
-            if ui_callback: ui_callback({"type": "log", "msg": f"Error: {state['error']}"})
+            error = str(state["error"])
+            if ui_callback: ui_callback({"type": "log", "msg": f"Error: {error}"})
             break
         if initial_state is None:
             initial_state = state
@@ -126,65 +264,10 @@ def run_single_game(map_name, p1_ver, p2_ver, max_turns, seed=None, ui_callback=
                 winner_id = game_over.get("winner_id")
                 winner_ver = p1_ver if winner_id == 1 else p2_ver
                 if ui_callback: ui_callback({"type": "log", "msg": f"Game Finished! Winner: P{winner_id} ({winner_ver})"})
-                return {
-                    "result": f"P{winner_id}_Win",
-                    "turns": turn,
-                    "thinking_times": thinking_times,
-                    "action_counts": action_counts,
-                    "metrics": metrics,
-                    "final_state": state,
-                    "initial_state": initial_state,
-                    "invasion_events": invasion_events,
-                    "transport_history": transport_history
-                }
+                return finish_game(f"P{winner_id}_Win", turn, state)
             elif status == "draw":
                 if ui_callback: ui_callback({"type": "log", "msg": f"Game Finished! Draw"})
-                return {
-                    "result": "Draw",
-                    "turns": turn,
-                    "thinking_times": thinking_times,
-                    "action_counts": action_counts,
-                    "metrics": metrics,
-                    "final_state": state,
-                    "initial_state": initial_state,
-                    "invasion_events": invasion_events,
-                    "transport_history": transport_history
-                }
-
-        # ターンごとのメトリクス収集
-        p_info = state.get("players", [])
-        m = {"turn": turn, "p1_props": 0, "p2_props": 0, "p1_units": 0, "p2_units": 0, "p1_funds": 0, "p2_funds": 0, "p1_score": 0, "p2_score": 0}
-        # 主観的評価値の取得（AIバージョンによって異なる、AIが現在考えている有利不利）
-        s1 = call_tool("evaluate_board", {"player_id": 1})
-        s2 = call_tool("evaluate_board", {"player_id": 2})
-        m["p1_score"] = s1.get("score", 0) if isinstance(s1, dict) else 0
-        m["p2_score"] = s2.get("score", 0) if isinstance(s2, dict) else 0
-        # 主観メトリクス（AIバージョン依存の評価内訳。形勢認識の分析用）
-        m["p1_subj"] = s1.get("subjective_metrics", {}) if isinstance(s1, dict) else {}
-        m["p2_subj"] = s2.get("subjective_metrics", {}) if isinstance(s2, dict) else {}
-        # 客観メトリクス（バージョン非依存。合否判定・ジリ貧分析用）
-        m["p1_obj"] = s1.get("objective_metrics", {}) if isinstance(s1, dict) else {}
-        m["p2_obj"] = s2.get("objective_metrics", {}) if isinstance(s2, dict) else {}
-
-        for player in p_info:
-            pid = player.get("player_id")
-            if pid == 1:
-                p1_props = player.get("property_count", 0)
-                p1_units = player.get("unit_cost", 0)
-                m["p1_props"] = p1_props
-                m["p1_units"] = p1_units
-                m["p1_funds"] = player.get("funds", 0)
-                m["p1_abs_score"] = p1_props * 20000 + p1_units
-            elif pid == 2:
-                p2_props = player.get("property_count", 0)
-                p2_units = player.get("unit_cost", 0)
-                m["p2_props"] = p2_props
-                m["p2_units"] = p2_units
-                m["p2_funds"] = player.get("funds", 0)
-                m["p2_abs_score"] = p2_props * 20000 + p2_units
-        metrics.append(m)
-        # 入れ替え戦でもTUIのラベルが実際の対戦カードを示すよう、AIバージョンをイベントに含める
-        if ui_callback: ui_callback({"type": "status_update", "metrics": m, "p1_ver": p1_ver, "p2_ver": p2_ver})
+                return finish_game("Draw", turn, state)
 
         active_idx = state.get("active_player_index", 0)
         if ui_callback and active_idx == 0:
@@ -193,15 +276,42 @@ def run_single_game(map_name, p1_ver, p2_ver, max_turns, seed=None, ui_callback=
         current_player = state["players"][active_idx]["player_id"]
         
         t0 = time.time()
-        ai_result = call_tool("simulate_ai_turn")
+        ai_result = tool("simulate_ai_turn")
         t1 = time.time()
         
         thinking_ms = (t1 - t0) * 1000
         thinking_times[current_player].append(thinking_ms)
         
         if isinstance(ai_result, dict) and ai_result.get("error"):
-            if ui_callback: ui_callback({"type": "log", "msg": f"AI Error: {ai_result['error']}"})
+            error = str(ai_result["error"])
+            if ui_callback: ui_callback({"type": "log", "msg": f"AI Error: {error}"})
             break
+
+        campaign = ai_result.get("island_campaign")
+        if campaign is not None:
+            player_state = next(
+                (
+                    player
+                    for player in state.get("players", [])
+                    if player.get("player_id") == current_player
+                ),
+                {},
+            )
+            # 予算検証に必要な手番開始時の資金と自軍assetを診断snapshotへ添える。
+            island_campaign_history.append(
+                {
+                    "round": turn,
+                    "turn": state.get("turn"),
+                    "player_id": ai_result.get("player_id", current_player),
+                    "available_funds": player_state.get("funds", 0),
+                    "units": [
+                        unit
+                        for unit in state.get("units", [])
+                        if unit.get("player_id") == current_player
+                    ],
+                    "campaign": campaign,
+                }
+            )
 
         invasion_events.extend(ai_result.get("invasion_events", []))
         transport_history.append({
@@ -254,7 +364,21 @@ def run_single_game(map_name, p1_ver, p2_ver, max_turns, seed=None, ui_callback=
             act_str = ", ".join([f"{k}({v})" for k, v in acts_dict.items()])
             ui_callback({"type": "log", "msg": f"P{current_player} T{turn}: {act_str}"})
 
+        post_action_state = tool("get_board_state")
+        post_game_over = post_action_state.get("game_over")
+        if post_game_over:
+            # 決着時は手番の途中でも、その行動が反映された盤面を最終値にする。
+            record_round_state(post_action_state, turn)
+            status = post_game_over.get("status")
+            if status == "winner":
+                winner_id = post_game_over.get("winner_id")
+                return finish_game(f"P{winner_id}_Win", turn, post_action_state)
+            return finish_game("Draw", turn, post_action_state)
+
         if active_idx == 1:
+            # P1/P2 の双方が行動した後だけ、同じラウンド番号の盤面を保存する。
+            state = post_action_state
+            record_round_state(state, turn)
             turn += 1
 
     if ui_callback: ui_callback({"type": "log", "msg": "Max turns reached. Calculating state value decision..."})
@@ -279,17 +403,7 @@ def run_single_game(map_name, p1_ver, p2_ver, max_turns, seed=None, ui_callback=
         else:
             ui_callback({"type": "log", "msg": f"Game Finished! Draw (Absolute Score: {p1_final} vs {p2_final})"})
 
-    return {
-        "result": result_str,
-        "turns": max_turns,
-        "thinking_times": thinking_times,
-        "action_counts": action_counts,
-        "metrics": metrics,
-        "final_state": state,
-        "initial_state": initial_state,
-        "invasion_events": invasion_events,
-        "transport_history": transport_history
-    }
+    return finish_game(result_str, max_turns, state)
 
 def analyze_issue54_game(game, subject="V3", stall_turns=5):
     """同一カーゴの搭載・敵初期島上陸・侵攻成立と輸送停滞を判定する。"""
@@ -470,25 +584,6 @@ def generate_issue54_report(results, subject="V3", baseline="V2", seed=None, sta
             report.append(f"- 安全性違反: {violation}")
         report.append("")
     return "\n".join(report), overall
-
-
-def moving_average(values, window=5):
-    """5ターン移動平均（先頭は利用可能な範囲で平均）"""
-    out = []
-    for i in range(len(values)):
-        w = values[max(0, i - window + 1):i + 1]
-        out.append(sum(w) / len(w))
-    return out
-
-
-def check_no_decline(series, start_turn=15):
-    """5ターン移動平均が start_turn 以降に減少トレンドへ転じていないか。
-    判定: 最終時点の移動平均が start_turn 時点の移動平均以上であること。
-    start_turn 未満で決着したゲームはジリ貧とは見なさない。"""
-    if len(series) < start_turn:
-        return True
-    ma = moving_average(series)
-    return ma[-1] >= ma[start_turn - 1]
 
 
 def judge_objective_criteria(results, subject="V2", baseline="V1"):
@@ -676,11 +771,122 @@ def main():
     parser.add_argument("--p2", default="V1", help="Player 2 AI Version")
     parser.add_argument("--games", type=int, default=1, help="Number of games per matchup")
     parser.add_argument("--max-turns", type=int, default=30, help="Maximum turns per game")
-    parser.add_argument("--criteria", choices=["objective", "issue54"], default="objective", help="Acceptance criteria used for the final report")
+    parser.add_argument("--criteria", choices=["objective", "issue54", "issue58"], default="objective", help="Acceptance criteria used for the final report")
+    parser.add_argument(
+        "--issue58-protocol",
+        choices=[ISSUE58_V3_V1, ISSUE58_V3_SELFPLAY],
+        help="Fixed Issue #58 evaluation protocol",
+    )
+    parser.add_argument(
+        "--artifact-stage",
+        choices=["baseline", "result"],
+        help="Whether this run captures the pre-change baseline or post-change result",
+    )
     parser.add_argument("--seed", type=int, default=None, help="Deterministic game RNG seed")
+    parser.add_argument("--seeds", default=None, help="Comma-separated deterministic seed set")
+    parser.add_argument("--json-output", default=None, help="Raw JSON output path")
+    parser.add_argument(
+        "--baseline-json",
+        default=None,
+        help="Baseline JSON artifact required for Issue #58 result runs",
+    )
     parser.add_argument("--stall-turns", type=int, default=5, help="Subject turns before an unchanged transport is considered stalled")
     parser.add_argument("--output", default="matchup_report.md", help="Output file for the final report")
     args = parser.parse_args()
+
+    maps = tuple(mn.strip() for mn in args.map.split(",") if mn.strip())
+    issue58_metadata = None
+    baseline_payload = None
+    if args.criteria == "issue58":
+        if not args.issue58_protocol:
+            parser.error("Issue #58 requires --issue58-protocol")
+        if not args.artifact_stage:
+            parser.error("Issue #58 requires --artifact-stage")
+        if not args.seeds:
+            parser.error("Issue #58 requires --seeds")
+        if not args.json_output:
+            parser.error("Issue #58 requires --json-output")
+        try:
+            seeds = parse_seed_list(args.seeds)
+            validate_issue58_run(
+                args.issue58_protocol,
+                args.artifact_stage,
+                maps,
+                args.p1,
+                args.p2,
+                args.max_turns,
+                seeds,
+                args.output,
+                args.json_output,
+                args.baseline_json,
+            )
+            match_specs = build_issue58_match_specs(
+                args.issue58_protocol,
+                maps,
+                seeds,
+            )
+        except ValueError as error:
+            parser.error(str(error))
+        issue58_metadata = collect_run_metadata(
+            sys.argv.copy(),
+            seeds,
+            ("scripts/eval_matchup.py", "scripts/eval_issue58.py"),
+            ("mcp-server/src/main.rs", "mcp-server/src/invasion_trace.rs"),
+        )
+        # 固定プロトコルの再現性を成果物だけで検証できるように記録する。
+        issue58_metadata.update(
+            {
+                "protocol": args.issue58_protocol,
+                "artifact_stage": args.artifact_stage,
+                "expected_games": len(match_specs),
+                "games_per_seed": len(match_specs) // len(seeds),
+                "subject": args.p1,
+                "baseline": args.p2,
+                "artifact_path": str(Path(args.json_output).resolve()),
+                "baseline_artifact_path": (
+                    str(Path(args.baseline_json).resolve())
+                    if args.baseline_json
+                    else None
+                ),
+            }
+        )
+        if args.artifact_stage == "result":
+            try:
+                baseline_path = Path(args.baseline_json).resolve()
+                baseline_payload = json.loads(
+                    baseline_path.read_text(encoding="utf-8")
+                )
+                baseline_metadata = baseline_payload.setdefault("metadata", {})
+                # Task 1 artifactはartifact_path追加前に取得済みのため、指定した実ファイルを
+                # in-memory metadataへ補い、原本JSON自体は変更しない。
+                baseline_metadata.setdefault("artifact_path", str(baseline_path))
+                recorded_baseline_path = Path(
+                    baseline_metadata.get("artifact_path", "")
+                ).resolve()
+                if recorded_baseline_path != baseline_path:
+                    raise ValueError(
+                        "baseline artifact_path does not match --baseline-json"
+                    )
+                if baseline_payload.get("results"):
+                    # 旧self-play baselineの単側analysisをraw resultsから両側へ再計算し、
+                    # 同じmap/player-orderのthinking-time分布を比較可能にする。
+                    baseline_payload["analyses"] = [
+                        analysis
+                        for result in baseline_payload["results"]
+                        for analysis in analyze_issue58_game(
+                            result, args.issue58_protocol
+                        )
+                    ]
+                # 試合を開始する前にprotocol・seed・hash・成果物識別子の不一致を拒否する。
+                compare_issue58_baseline(
+                    {"metadata": issue58_metadata, "analyses": []},
+                    baseline_payload,
+                )
+            except (OSError, json.JSONDecodeError, ValueError) as error:
+                parser.error(str(error))
+    else:
+        seeds = tuple(args.seed for _ in range(args.games))
+        match_specs = build_match_specs(maps, args.p1, args.p2, seeds)
 
     init_mcp_server()
     all_results = []
@@ -717,8 +923,8 @@ def main():
             m = event["metrics"]
             print(json.dumps({"type": "metrics", "data": m}))
             
-    maps = [mn.strip() for mn in args.map.split(",") if mn.strip()]
     criteria_pass = True
+    execution_incomplete = False
 
     try:
         if args.mode == "tui" and HAS_RICH:
@@ -733,38 +939,97 @@ def main():
             layout["log"].update(Panel("Logs will appear here..."))
 
             with Live(layout, refresh_per_second=4) as live:
-                for map_name in maps:
-                    for i in range(args.games):
-                        res = run_single_game(map_name, args.p1, args.p2, args.max_turns, args.seed, lambda e: ui_callback_tui(e, layout, live))
-                        res["map"] = map_name
-                        res["p1"] = args.p1
-                        res["p2"] = args.p2
-                        all_results.append(res)
-
-                        res2 = run_single_game(map_name, args.p2, args.p1, args.max_turns, args.seed, lambda e: ui_callback_tui(e, layout, live))
-                        res2["map"] = map_name
-                        res2["p1"] = args.p2
-                        res2["p2"] = args.p1
-                        all_results.append(res2)
+                for spec in match_specs:
+                    result = run_single_game(
+                        spec["map"],
+                        spec["p1"],
+                        spec["p2"],
+                        args.max_turns,
+                        spec["seed"],
+                        lambda e: ui_callback_tui(e, layout, live),
+                    )
+                    result.update(spec)
+                    all_results.append(result)
         else:
             print(json.dumps({"type": "info", "msg": f"Starting batch run: {args.p1} vs {args.p2} on {maps} ({args.games} games x 2 orders per map)"}))
-            for map_name in maps:
-                for i in range(args.games):
-                    res = run_single_game(map_name, args.p1, args.p2, args.max_turns, args.seed, ui_callback_batch)
-                    res["map"] = map_name
-                    res["p1"] = args.p1
-                    res["p2"] = args.p2
-                    all_results.append(res)
-                    print(json.dumps({"type": "result", "data": {k: v for k, v in res.items() if k not in {"metrics", "final_state", "initial_state", "invasion_events", "transport_history"}}}))
-
-                    res2 = run_single_game(map_name, args.p2, args.p1, args.max_turns, args.seed, ui_callback_batch)
-                    res2["map"] = map_name
-                    res2["p1"] = args.p2
-                    res2["p2"] = args.p1
-                    all_results.append(res2)
-                    print(json.dumps({"type": "result", "data": {k: v for k, v in res2.items() if k not in {"metrics", "final_state", "initial_state", "invasion_events", "transport_history"}}}))
+            for spec in match_specs:
+                result = run_single_game(
+                    spec["map"],
+                    spec["p1"],
+                    spec["p2"],
+                    args.max_turns,
+                    spec["seed"],
+                    ui_callback_batch,
+                )
+                result.update(spec)
+                all_results.append(result)
+                print(json.dumps({
+                    "type": "result",
+                    "data": {
+                        key: value
+                        for key, value in result.items()
+                        if key not in {
+                            "metrics",
+                            "final_state",
+                            "initial_state",
+                            "invasion_events",
+                            "transport_history",
+                            "strategic_history",
+                            "island_campaign_history",
+                        }
+                    },
+                }))
                 
-        if args.criteria == "issue54":
+        if args.criteria == "issue58":
+            analyses = [
+                analysis
+                for result in all_results
+                for analysis in analyze_issue58_game(
+                    result, args.issue58_protocol
+                )
+            ]
+            criteria_pass, criteria_rows, summaries = judge_issue58_criteria(
+                all_results,
+                protocol=args.issue58_protocol,
+            )
+            baseline_comparison = []
+            payload = {
+                "metadata": issue58_metadata,
+                "overall_pass": criteria_pass,
+                "criteria_rows": criteria_rows,
+                "summaries": summaries,
+                "analyses": analyses,
+                "baseline_comparison": baseline_comparison,
+                "results": all_results,
+            }
+            if baseline_payload is not None:
+                baseline_comparison = compare_issue58_baseline(payload, baseline_payload)
+                payload["baseline_comparison"] = baseline_comparison
+                criteria_pass = criteria_pass and all(
+                    row.get("thinking_time_pass") for row in baseline_comparison
+                )
+                payload["overall_pass"] = criteria_pass
+
+            # 実行失敗と受け入れ基準を分離し、baseline は基準未達でも必ず保存する。
+            runtime_incomplete = (
+                len(all_results) != len(match_specs)
+                or any(result.get("error") for result in all_results)
+            )
+            expected_analysis_count = len(match_specs) * (
+                2 if args.issue58_protocol == ISSUE58_V3_SELFPLAY else 1
+            )
+            criteria_incomplete = (
+                len(analyses) != expected_analysis_count
+                or any(not row.get("complete") for row in criteria_rows)
+            )
+            execution_incomplete = runtime_incomplete or (
+                args.artifact_stage == "result" and criteria_incomplete
+            )
+            report = generate_issue58_report(payload)
+            # JSON を原本として先に確定し、同じ payload から Markdown を生成する。
+            write_json_atomic(args.json_output, payload)
+            write_text_atomic(args.output, report)
+        elif args.criteria == "issue54":
             report, criteria_pass = generate_issue54_report(
                 all_results,
                 subject=args.p1,
@@ -772,11 +1037,13 @@ def main():
                 seed=args.seed,
                 stall_turns=args.stall_turns,
             )
+            with open(args.output, "w", encoding="utf-8") as file:
+                file.write(report)
         else:
             report = generate_report(all_results, subject=args.p1, baseline=args.p2)
-        with open(args.output, "w", encoding="utf-8") as f:
-            f.write(report)
-            
+            with open(args.output, "w", encoding="utf-8") as file:
+                file.write(report)
+
         if args.mode == "batch":
             print(json.dumps({"type": "info", "msg": f"Report generated at {args.output}"}))
 
@@ -785,6 +1052,11 @@ def main():
             p.stdin.close()
             p.wait()
 
+    if args.mode == "batch" and args.criteria == "issue58":
+        if execution_incomplete:
+            raise SystemExit(2)
+        if args.artifact_stage == "result" and not criteria_pass:
+            raise SystemExit(1)
     if args.mode == "batch" and args.criteria == "issue54" and not criteria_pass:
         raise SystemExit(1)
 
