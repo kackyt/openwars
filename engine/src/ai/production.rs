@@ -82,14 +82,22 @@ fn campaign_candidate_matches(
     unit_type: UnitType,
     stats: &UnitStats,
 ) -> bool {
+    // 要求量を減らせない不正なマスターデータは候補から除外し、計画を確実に前進させる。
     match requirement {
-        CampaignProductionRequirement::HeavyTransport => unit_type == UnitType::Lander,
-        CampaignProductionRequirement::LightTransport => unit_type == UnitType::TransportHelicopter,
+        CampaignProductionRequirement::HeavyTransport => {
+            unit_type == UnitType::Lander && stats.max_cargo > 0
+        }
+        CampaignProductionRequirement::LightTransport => {
+            unit_type == UnitType::TransportHelicopter && stats.max_cargo > 0
+        }
         CampaignProductionRequirement::Capture => stats.can_capture,
-        CampaignProductionRequirement::Combat => !matches!(
-            unit_type,
-            UnitType::TransportHelicopter | UnitType::Lander | UnitType::SupplyTruck
-        ),
+        CampaignProductionRequirement::Combat => {
+            stats.cost > 0
+                && !matches!(
+                    unit_type,
+                    UnitType::TransportHelicopter | UnitType::Lander | UnitType::SupplyTruck
+                )
+        }
     }
 }
 
@@ -1274,6 +1282,72 @@ mod additional_tests {
         );
 
         assert_eq!(strategy.light_transport_demand, 1);
+    }
+
+    #[test]
+    fn campaign_production_rejects_zero_capacity_transport() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let mut helicopter = master_data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::TransportHelicopter.as_str().to_owned(),
+            ))
+            .unwrap();
+        helicopter.max_cargo = 0;
+        let rows = vec![crate::ai::island_campaign::IslandCampaignShortfall {
+            island_id: crate::ai::islands::IslandId(0),
+            decision: crate::ai::island_campaign::IslandCampaignDecision::Expand,
+            light_transport_slots: 1,
+            heavy_transport_slots: 0,
+            capture_units: 0,
+            combat_budget: 0,
+            reserved_budget: helicopter.cost,
+            priority_rank: 0,
+        }];
+
+        let outcome = plan_campaign_shortfall_production(
+            PlayerId(1),
+            &rows,
+            &[(GridPosition { x: 0, y: 0 }, Terrain::Airport)],
+            &[(UnitType::TransportHelicopter, helicopter)],
+            &master_data,
+            u32::MAX,
+        );
+
+        assert!(outcome.commands.is_empty());
+        assert!(!outcome.completed_all_rows);
+    }
+
+    #[test]
+    fn campaign_production_rejects_zero_cost_combat_unit() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let mut infantry = master_data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::Infantry.as_str().to_owned(),
+            ))
+            .unwrap();
+        infantry.cost = 0;
+        let rows = vec![crate::ai::island_campaign::IslandCampaignShortfall {
+            island_id: crate::ai::islands::IslandId(0),
+            decision: crate::ai::island_campaign::IslandCampaignDecision::Defend,
+            light_transport_slots: 0,
+            heavy_transport_slots: 0,
+            capture_units: 0,
+            combat_budget: 1,
+            reserved_budget: 1,
+            priority_rank: 0,
+        }];
+
+        let outcome = plan_campaign_shortfall_production(
+            PlayerId(1),
+            &rows,
+            &[(GridPosition { x: 0, y: 0 }, Terrain::Factory)],
+            &[(UnitType::Infantry, infantry)],
+            &master_data,
+            1,
+        );
+
+        assert!(outcome.commands.is_empty());
+        assert!(!outcome.completed_all_rows);
     }
 
     #[test]

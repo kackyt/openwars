@@ -2244,6 +2244,27 @@ mod tests {
     }
 
     #[test]
+    fn plan_squads_populates_v3_turn_strategy_cache() {
+        let master_data = crate::resources::master_data::MasterDataRegistry::load().unwrap();
+        let (mut world, _) =
+            crate::setup::initialize_world_from_master_data(&master_data, "map_1").unwrap();
+        let entities: Vec<Entity> = world.query::<Entity>().iter(&world).collect();
+        for entity in entities {
+            world.despawn(entity);
+        }
+        let player = PlayerId(1);
+        let mut settings = crate::ai::PlayerAiSettings::default();
+        settings.set_version(player, crate::ai::AiVersion::V3);
+        world.insert_resource(settings);
+
+        crate::ai::squad::plan_squads(&mut world, player);
+
+        let cache = world.resource::<AiTurnStrategyCache>();
+        assert!(cache.squads_planned(player));
+        assert!(cache.campaign_portfolio(player).is_some());
+    }
+
+    #[test]
     fn v3_campaign_production_plan_consumes_each_command_once() {
         let player = PlayerId(1);
         let first = crate::events::ProduceUnitCommand {
