@@ -16,14 +16,15 @@ fn calculate_repair_cost(unit_cost: u32, repaired_hp: u32) -> u32 {
 
 /// 残資金で購入可能な最大のHP回復量と費用を返します。
 fn calculate_affordable_repair(unit_cost: u32, desired_repair: u32, funds: u32) -> (u32, u32) {
-    for repaired_hp in (0..=desired_repair).rev() {
-        let cost = calculate_repair_cost(unit_cost, repaired_hp);
-        if cost <= funds {
-            return (repaired_hp, cost);
-        }
-    }
+    debug_assert!(unit_cost > 0, "unit_cost must be greater than zero");
 
-    (0, 0)
+    // floor(unit_cost * repaired_hp / 100) <= funds を満たす最大値を直接求めます。
+    let maximum_repair_numerator = (u64::from(funds) + 1) * REPAIR_COST_DENOMINATOR - 1;
+    let repaired_hp =
+        (maximum_repair_numerator / u64::from(unit_cost)).min(u64::from(desired_repair)) as u32;
+    let cost = calculate_repair_cost(unit_cost, repaired_hp);
+
+    (repaired_hp, cost)
 }
 
 fn apply_daily_updates_for_unit(
@@ -436,6 +437,15 @@ mod tests {
         schedule.add_systems(next_phase_system);
 
         (world, schedule)
+    }
+
+    #[test]
+    fn test_affordable_repair_uses_floor_cost_boundary() {
+        // 150Gユニットは内部HP 1の修理費が floor(150 / 100) = 1G です。
+        let (repaired_hp, cost) = calculate_affordable_repair(150, 20, 1);
+
+        assert_eq!(repaired_hp, 1);
+        assert_eq!(cost, 1);
     }
 
     #[test]
