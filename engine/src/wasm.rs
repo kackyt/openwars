@@ -718,6 +718,41 @@ impl WasmEngine {
         JsValue::from_str(&json)
     }
 
+    /// 指定した移動先から補給可能な対象ユニット一覧を取得します。
+    pub fn get_suppliable_targets(
+        &mut self,
+        unit_id_str: &str,
+        dest_x: i32,
+        dest_y: i32,
+    ) -> JsValue {
+        let unit_entity_bits = unit_id_str.parse::<u64>().unwrap_or(0);
+        let unit_entity = Entity::from_bits(unit_entity_bits);
+        let destination = GridPosition {
+            x: dest_x as usize,
+            y: dest_y as usize,
+        };
+        let targets = crate::systems::supply::get_suppliable_targets_at(
+            &mut self.world,
+            unit_entity,
+            destination,
+        );
+
+        let target_list: Vec<_> = targets
+            .into_iter()
+            .filter_map(|target| {
+                self.world.get::<GridPosition>(target).map(|position| {
+                    format!(
+                        r#"{{"id": "{}", "x": {}, "y": {}}}"#,
+                        target.to_bits(),
+                        position.x,
+                        position.y
+                    )
+                })
+            })
+            .collect();
+        JsValue::from_str(&format!("[{}]", target_list.join(",")))
+    }
+
     pub fn submit_move_command(&mut self, unit_id_str: &str, x: i32, y: i32) -> JsValue {
         let unit_entity_bits = unit_id_str.parse::<u64>().unwrap_or(0);
         let unit_entity = Entity::from_bits(unit_entity_bits);
@@ -783,6 +818,25 @@ impl WasmEngine {
 
         let json = format!(r#"["{}"]"#, destroyed.join(r#"",""#));
         JsValue::from_str(&if json == r#"[""]"# { "[]" } else { &json })
+    }
+
+    /// 補給輸送車から指定ユニットへの補給コマンドを送信します。
+    pub fn submit_supply_command(&mut self, supplier_id_str: &str, target_id_str: &str) -> JsValue {
+        let supplier_entity = Entity::from_bits(supplier_id_str.parse::<u64>().unwrap_or(0));
+        let target_entity = Entity::from_bits(target_id_str.parse::<u64>().unwrap_or(0));
+
+        if let Some(mut events) = self
+            .world
+            .get_resource_mut::<Events<crate::events::SupplyUnitCommand>>()
+        {
+            events.send(crate::events::SupplyUnitCommand {
+                supplier_entity,
+                target_entity,
+            });
+        }
+        self.schedule.run(&mut self.world);
+        crate::setup::update_all_events(&mut self.world);
+        JsValue::from_str("{}")
     }
 
     pub fn submit_capture_command(&mut self, unit_id_str: &str) -> JsValue {

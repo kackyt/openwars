@@ -168,6 +168,22 @@ export class EngineWorker {
   }
 
   /**
+   * 指定位置の補給輸送車が補給可能なターゲット一覧を取得します。
+   * @param unitId 補給者ユニットID
+   * @param destX 移動先X
+   * @param destY 移動先Y
+   */
+  async getSuppliableTargets(
+    unitId: string,
+    destX: number,
+    destY: number,
+  ): Promise<{ id: string; x: number; y: number }[]> {
+    if (!this.engine) throw new Error("Engine not initialized");
+    const jsonStr = this.engine.get_suppliable_targets(unitId, destX, destY);
+    return JSON.parse(jsonStr as string);
+  }
+
+  /**
    * 指定座標の拠点で生産可能なユニット種別一覧を取得します。
    * @param x 拠点座標X
    * @param y 拠点座標Y
@@ -211,6 +227,16 @@ export class EngineWorker {
     if (!this.engine) throw new Error("Engine not initialized");
     const jsonStr = this.engine.submit_attack_command(unitId, targetId);
     return JSON.parse(jsonStr as string);
+  }
+
+  /**
+   * 補給輸送車から指定ユニットへの補給コマンドを送信します。
+   * @param supplierId 補給輸送車ID
+   * @param targetId 補給対象ユニットID
+   */
+  async submitSupplyCommand(supplierId: string, targetId: string): Promise<void> {
+    if (!this.engine) throw new Error("Engine not initialized");
+    this.engine.submit_supply_command(supplierId, targetId);
   }
 
   /**

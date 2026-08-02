@@ -3,13 +3,65 @@ use crate::events::*;
 use crate::resources::*;
 use bevy_ecs::prelude::*;
 
+/// 補給輸送車が補給できるユニット種別かを判定します。
+///
+/// 地上ユニット全般と軽戦闘機だけを補給対象とし、艦船およびその他の航空ユニットは対象外です。
+fn is_suppliable_unit_type(unit_type: UnitType) -> bool {
+    matches!(
+        unit_type,
+        UnitType::Infantry
+            | UnitType::Mech
+            | UnitType::Recon
+            | UnitType::Tank
+            | UnitType::MdTank
+            | UnitType::TankZ
+            | UnitType::Artillery
+            | UnitType::LightSpGun
+            | UnitType::HeavySpGun
+            | UnitType::Rockets
+            | UnitType::AntiAir
+            | UnitType::Missiles
+            | UnitType::SupplyTruck
+            | UnitType::Fighter
+    )
+}
+
+/// 補給対象が補給者の指定位置から合法かを判定します。
+///
+/// 対象候補の表示とコマンド実行時の検証で同じ条件を使用し、UI と engine の判定を一致させます。
+#[allow(clippy::too_many_arguments)]
+fn is_valid_supply_target(
+    supplier: Entity,
+    supplier_faction: PlayerId,
+    supplier_position: GridPosition,
+    target: Entity,
+    target_position: GridPosition,
+    target_faction: PlayerId,
+    target_stats: &UnitStats,
+    target_health: Health,
+    target_action_completed: bool,
+    target_is_transporting: bool,
+    topology: GridTopology,
+) -> bool {
+    supplier != target
+        && supplier_faction == target_faction
+        && !target_health.is_destroyed()
+        && !target_action_completed
+        && !target_is_transporting
+        && is_suppliable_unit_type(target_stats.unit_type)
+        && topology.distance(
+            (supplier_position.x, supplier_position.y),
+            (target_position.x, target_position.y),
+        ) == 1
+}
+
 /// 補給車などによる隣接ユニットへの補給コマンド(`SupplyUnitCommand`)を処理するシステム。
 ///
 /// 【処理の流れ】
 /// 1. 補給者(`supplier_entity`)が自軍であり、行動済みでなく、補給能力(`can_supply`)を持つことを確認します。
-/// 2. 補給対象(`target_entity`)が自軍であり、補給者と隣接（距離が1）していることを確認します。
-/// 3. 対象の燃料(`Fuel`)と弾薬(`Ammo`)を最大値まで回復(`resupply`)させます。
-/// 4. 補給者の `ActionCompleted` を true に設定します。
+/// 2. 補給対象(`target_entity`)が未行動の自軍ユニットであり、補給対象種別かつ隣接していることを確認します。
+/// 3. 対象の燃料(`Fuel`)と弾薬(`Ammo`)を最大値まで回復させます。
+/// 4. 補給者の `ActionCompleted` を true に設定します。対象の HP・行動状態・移動状態は変更しません。
 ///
 pub fn get_suppliable_targets(world: &mut World, supplier: Entity) -> Vec<Entity> {
     let Some(s_pos) = world.get::<GridPosition>(supplier).cloned() else {
@@ -22,34 +74,84 @@ pub fn get_suppliable_targets(world: &mut World, supplier: Entity) -> Vec<Entity
 pub fn get_suppliable_targets_at(
     world: &mut World,
     supplier: Entity,
-    s_pos: GridPosition,
+    supplier_position: GridPosition,
 ) -> Vec<Entity> {
     let mut targets = vec![];
-    let (unit_faction, can_supply) = {
-        let mut q_supplier = world.query::<(&UnitStats, &Faction)>();
-        let Ok((s_stats, s_faction)) = q_supplier.get(world, supplier) else {
+    let (
+        supplier_faction,
+        supplier_can_supply,
+        supplier_is_alive,
+        supplier_is_unacted,
+        supplier_is_transporting,
+    ) = {
+        let mut query = world.query::<(
+            &Faction,
+            &UnitStats,
+            &Health,
+            &ActionCompleted,
+            Option<&Transporting>,
+        )>();
+        let Ok((faction, stats, health, action_completed, transporting)) =
+            query.get(world, supplier)
+        else {
             return targets;
         };
-        (s_faction.0, s_stats.can_supply)
+        (
+            faction.0,
+            stats.can_supply,
+            !health.is_destroyed(),
+            !action_completed.0,
+            transporting.is_some(),
+        )
     };
 
-    if !can_supply {
+    if !supplier_can_supply
+        || !supplier_is_alive
+        || !supplier_is_unacted
+        || supplier_is_transporting
+    {
         return targets;
     }
 
     // マップのトポロジー（スクエア/ヘックス）に応じた距離で隣接判定する
     let topology = world
         .get_resource::<Map>()
-        .map(|m| m.topology)
+        .map(|map| map.topology)
         .unwrap_or(GridTopology::Square);
 
-    let mut q_targets = world.query_filtered::<(Entity, &GridPosition, &Faction), With<Faction>>();
-    for (t_ent, t_pos, t_faction) in q_targets.iter(world) {
-        if t_ent != supplier && t_faction.0 == unit_faction {
-            let dist = topology.distance((s_pos.x, s_pos.y), (t_pos.x, t_pos.y));
-            if dist == 1 {
-                targets.push(t_ent);
-            }
+    let mut query = world.query::<(
+        Entity,
+        &GridPosition,
+        &Faction,
+        &UnitStats,
+        &Health,
+        &ActionCompleted,
+        Option<&Transporting>,
+    )>();
+    for (
+        target,
+        target_position,
+        target_faction,
+        target_stats,
+        target_health,
+        target_action,
+        transporting,
+    ) in query.iter(world)
+    {
+        if is_valid_supply_target(
+            supplier,
+            supplier_faction,
+            supplier_position,
+            target,
+            *target_position,
+            target_faction.0,
+            target_stats,
+            *target_health,
+            target_action.0,
+            transporting.is_some(),
+            topology,
+        ) {
+            targets.push(target);
         }
     }
 
@@ -60,7 +162,7 @@ pub fn get_suppliable_targets_at(
 pub fn supply_unit_system(
     mut supply_events: EventReader<SupplyUnitCommand>,
     mut supplied_writer: EventWriter<UnitSuppliedEvent>,
-    mut q_units: Query<(
+    mut query_units: Query<(
         Entity,
         &GridPosition,
         &Faction,
@@ -69,6 +171,7 @@ pub fn supply_unit_system(
         &mut ActionCompleted,
         Option<&mut Fuel>,
         Option<&mut Ammo>,
+        Option<&Transporting>,
     )>,
     match_state: Res<MatchState>,
     players: Res<Players>,
@@ -79,62 +182,91 @@ pub fn supply_unit_system(
         return;
     }
     let active_player_id = players.0[match_state.active_player_index.0].id;
+    let topology = map
+        .as_ref()
+        .map(|map| map.topology)
+        .unwrap_or(GridTopology::Square);
 
     for event in supply_events.read() {
-        let (sup_pos, sup_faction, sup_stats, sup_hp, sup_action) =
-            match q_units.get_mut(event.supplier_entity) {
-                Ok((_, p, f, s, h, a, _, _)) => (*p, f.0, s.clone(), *h, a),
-                _ => continue,
-            };
-
-        if sup_faction != active_player_id
-            || sup_action.0
-            || sup_hp.is_destroyed()
-            || !sup_stats.can_supply
-        {
-            continue;
-        }
-
-        let (tar_pos, tar_faction, tar_hp) = match q_units.get(event.target_entity) {
-            Ok((_, p, f, _, h, _, _, _)) => (*p, f.0, *h),
-            _ => continue,
+        let (
+            supplier_position,
+            supplier_faction,
+            supplier_stats,
+            supplier_health,
+            supplier_action,
+            supplier_is_transporting,
+        ) = match query_units.get_mut(event.supplier_entity) {
+            Ok((_, position, faction, stats, health, action, _, _, transporting)) => (
+                *position,
+                faction.0,
+                stats.clone(),
+                *health,
+                action.0,
+                transporting.is_some(),
+            ),
+            Err(_) => continue,
         };
 
-        if tar_faction != active_player_id || tar_hp.is_destroyed() {
-            continue;
-        }
-
-        // マップのトポロジー（スクエア/ヘックス）に応じた距離で隣接判定する
-        let topology = map
-            .as_ref()
-            .map(|m| m.topology)
-            .unwrap_or(GridTopology::Square);
-
-        let dist = topology.distance((sup_pos.x, sup_pos.y), (tar_pos.x, tar_pos.y));
-
-        if dist != 1 {
-            continue;
-        }
-
-        // Apply supply using get_many_mut
-        if let Ok([supplier, target]) =
-            q_units.get_many_mut([event.supplier_entity, event.target_entity])
+        if supplier_faction != active_player_id
+            || supplier_action
+            || supplier_health.is_destroyed()
+            || !supplier_stats.can_supply
+            || supplier_is_transporting
         {
-            let (_, _, _, _, _, mut sup_action, _, _) = supplier;
-            let (_, _, _, tar_stats, _, _, tar_fuel_opt, tar_ammo_opt) = target;
+            continue;
+        }
 
-            sup_action.0 = true; // 補給者は行動完了状態になる
+        let (
+            target_position,
+            target_faction,
+            target_stats,
+            target_health,
+            target_action,
+            target_is_transporting,
+        ) = match query_units.get(event.target_entity) {
+            Ok((_, position, faction, stats, health, action, _, _, transporting)) => (
+                *position,
+                faction.0,
+                stats.clone(),
+                *health,
+                action.0,
+                transporting.is_some(),
+            ),
+            Err(_) => continue,
+        };
 
-            let max_fuel = tar_stats.max_fuel;
-            if let Some(mut fuel) = tar_fuel_opt {
-                fuel.current = max_fuel; // 燃料を最大値まで回復
+        if !is_valid_supply_target(
+            event.supplier_entity,
+            supplier_faction,
+            supplier_position,
+            event.target_entity,
+            target_position,
+            target_faction,
+            &target_stats,
+            target_health,
+            target_action,
+            target_is_transporting,
+            topology,
+        ) {
+            continue;
+        }
+
+        // すべての検証を通過してから、補給者と選択対象だけを更新する
+        if let Ok([supplier, target]) =
+            query_units.get_many_mut([event.supplier_entity, event.target_entity])
+        {
+            let (_, _, _, _, _, mut supplier_action, _, _, _) = supplier;
+            let (_, _, _, target_stats, _, _, target_fuel, target_ammo, _) = target;
+
+            supplier_action.0 = true; // 補給者は行動完了状態になる
+
+            if let Some(mut fuel) = target_fuel {
+                fuel.current = target_stats.max_fuel; // 燃料を最大値まで回復
             }
 
-            let max_a1 = tar_stats.max_ammo1;
-            let max_a2 = tar_stats.max_ammo2;
-            if let Some(mut ammo) = tar_ammo_opt {
-                ammo.ammo1 = max_a1; // 主武器と副武器の弾薬を最大値まで回復
-                ammo.ammo2 = max_a2;
+            if let Some(mut ammo) = target_ammo {
+                ammo.ammo1 = target_stats.max_ammo1; // 主武器と副武器の弾薬を最大値まで回復
+                ammo.ammo2 = target_stats.max_ammo2;
             }
 
             // 補給完了イベントを送出
@@ -153,24 +285,33 @@ pub fn supply_unit_system(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_supply_unit_system() {
+    fn setup_world() -> World {
         let mut world = World::new();
-
-        let ms = MatchState {
+        world.insert_resource(MatchState {
             current_phase: Phase::Main,
             ..Default::default()
-        };
-        world.insert_resource(ms);
+        });
         world.insert_resource(Players(vec![
             Player::new(1, "P1".to_string()),
             Player::new(2, "P2".to_string()),
         ]));
-
         world.insert_resource(Events::<SupplyUnitCommand>::default());
         world.insert_resource(Events::<UnitSuppliedEvent>::default());
+        world
+    }
 
-        let supplier_entity = world
+    fn unit_stats(unit_type: UnitType) -> UnitStats {
+        UnitStats {
+            unit_type,
+            max_fuel: 99,
+            max_ammo1: 9,
+            max_ammo2: 6,
+            ..UnitStats::mock()
+        }
+    }
+
+    fn spawn_supplier(world: &mut World) -> Entity {
+        world
             .spawn((
                 GridPosition { x: 2, y: 2 },
                 Faction(PlayerId(1)),
@@ -180,30 +321,33 @@ mod tests {
                 },
                 UnitStats {
                     unit_type: UnitType::SupplyTruck,
-                    max_fuel: 99,
                     can_supply: true,
-                    ..UnitStats::mock()
+                    ..unit_stats(UnitType::SupplyTruck)
                 },
                 ActionCompleted(false),
+                HasMoved(true),
             ))
-            .id();
+            .id()
+    }
 
-        let target_entity = world
+    fn spawn_target(
+        world: &mut World,
+        unit_type: UnitType,
+        faction: PlayerId,
+        position: GridPosition,
+        action_completed: bool,
+    ) -> Entity {
+        world
             .spawn((
-                GridPosition { x: 3, y: 2 },
-                Faction(PlayerId(1)),
+                position,
+                Faction(faction),
                 Health {
-                    current: 100,
+                    current: 70,
                     max: 100,
                 },
-                UnitStats {
-                    unit_type: UnitType::Infantry,
-                    max_fuel: 99,
-                    max_ammo1: 9,
-                    can_capture: true,
-                    ..UnitStats::mock()
-                },
-                ActionCompleted(false),
+                unit_stats(unit_type),
+                ActionCompleted(action_completed),
+                HasMoved(true),
                 Fuel {
                     current: 10,
                     max: 99,
@@ -211,154 +355,228 @@ mod tests {
                 Ammo {
                     ammo1: 1,
                     max_ammo1: 9,
-                    ammo2: 0,
-                    max_ammo2: 0,
+                    ammo2: 2,
+                    max_ammo2: 6,
                 },
             ))
-            .id();
+            .id()
+    }
 
-        // モックのPendingMoveを挿入
+    fn run_supply_system(world: &mut World) {
+        let mut schedule = Schedule::default();
+        schedule.add_systems(supply_unit_system);
+        schedule.run(world);
+    }
+
+    #[test]
+    fn test_supply_unit_system_supplies_only_selected_target_and_preserves_target_state() {
+        let mut world = setup_world();
+        let supplier = spawn_supplier(&mut world);
+        let selected_target = spawn_target(
+            &mut world,
+            UnitType::Infantry,
+            PlayerId(1),
+            GridPosition { x: 3, y: 2 },
+            false,
+        );
+        let unselected_target = spawn_target(
+            &mut world,
+            UnitType::Fighter,
+            PlayerId(1),
+            GridPosition { x: 2, y: 3 },
+            false,
+        );
         world.insert_resource(PendingMove {
-            unit_entity: supplier_entity,
+            unit_entity: supplier,
             original_pos: GridPosition { x: 2, y: 1 },
             original_fuel: Fuel {
                 current: 20,
                 max: 99,
             },
         });
-
         world.send_event(SupplyUnitCommand {
-            supplier_entity,
-            target_entity,
+            supplier_entity: supplier,
+            target_entity: selected_target,
         });
 
-        let mut schedule = Schedule::default();
-        schedule.add_systems(supply_unit_system);
-        schedule.run(&mut world);
+        run_supply_system(&mut world);
 
-        // Check if supplier used its action
-        let act1 = world.get::<ActionCompleted>(supplier_entity).unwrap();
-        assert!(act1.0);
-
-        // Check if target was supplied
-        let fuel = world.get::<Fuel>(target_entity).unwrap();
-        assert_eq!(fuel.current, 99);
-
-        let ammo = world.get::<Ammo>(target_entity).unwrap();
-        assert_eq!(ammo.ammo1, 9);
-
-        // PendingMove should be removed
+        assert!(world.get::<ActionCompleted>(supplier).unwrap().0);
+        assert_eq!(world.get::<Fuel>(selected_target).unwrap().current, 99);
+        let selected_ammo = world.get::<Ammo>(selected_target).unwrap();
+        assert_eq!(selected_ammo.ammo1, 9);
+        assert_eq!(selected_ammo.ammo2, 6);
+        assert_eq!(world.get::<Health>(selected_target).unwrap().current, 70);
+        assert!(!world.get::<ActionCompleted>(selected_target).unwrap().0);
+        assert!(world.get::<HasMoved>(selected_target).unwrap().0);
+        assert_eq!(world.get::<Fuel>(unselected_target).unwrap().current, 10);
+        assert_eq!(world.get::<Ammo>(unselected_target).unwrap().ammo1, 1);
         assert!(world.get_resource::<PendingMove>().is_none());
     }
 
     #[test]
-    fn test_get_suppliable_targets() {
-        let mut world = World::new();
+    fn test_supply_unit_system_rejects_invalid_direct_commands() {
+        let mut world = setup_world();
+        let supplier = spawn_supplier(&mut world);
+        let acted_target = spawn_target(
+            &mut world,
+            UnitType::Infantry,
+            PlayerId(1),
+            GridPosition { x: 3, y: 2 },
+            true,
+        );
+        let ineligible_target = spawn_target(
+            &mut world,
+            UnitType::HeavyFighter,
+            PlayerId(1),
+            GridPosition { x: 2, y: 3 },
+            false,
+        );
+        world.insert_resource(PendingMove {
+            unit_entity: supplier,
+            original_pos: GridPosition { x: 2, y: 1 },
+            original_fuel: Fuel {
+                current: 20,
+                max: 99,
+            },
+        });
+        world.send_event(SupplyUnitCommand {
+            supplier_entity: supplier,
+            target_entity: acted_target,
+        });
+        world.send_event(SupplyUnitCommand {
+            supplier_entity: supplier,
+            target_entity: ineligible_target,
+        });
 
-        let inf_stats = UnitStats {
-            unit_type: UnitType::Infantry,
-            max_fuel: 99,
-            max_ammo1: 9,
-            can_capture: true,
-            ..UnitStats::mock()
-        };
+        run_supply_system(&mut world);
 
-        // Supplier (Supply Truck)
-        let supplier = world
-            .spawn((
-                GridPosition { x: 5, y: 5 },
-                Faction(PlayerId(1)),
-                UnitStats {
-                    unit_type: UnitType::SupplyTruck,
-                    can_supply: true,
-                    ..inf_stats.clone()
-                },
-            ))
-            .id();
+        assert!(!world.get::<ActionCompleted>(supplier).unwrap().0);
+        assert_eq!(world.get::<Fuel>(acted_target).unwrap().current, 10);
+        assert_eq!(world.get::<Fuel>(ineligible_target).unwrap().current, 10);
+        assert!(world.get_resource::<PendingMove>().is_some());
+    }
 
-        // Valid target (Adjacent, same faction)
-        let target_ok = world
-            .spawn((
-                GridPosition { x: 5, y: 6 },
-                Faction(PlayerId(1)),
-                inf_stats.clone(),
-            ))
-            .id();
-
-        // Invalid: Too far
-        let _target_far = world
-            .spawn((
-                GridPosition { x: 5, y: 7 },
-                Faction(PlayerId(1)),
-                inf_stats.clone(),
-            ))
-            .id();
-
-        // Invalid: Different faction
-        let _target_enemy = world
-            .spawn((
-                GridPosition { x: 6, y: 5 },
-                Faction(PlayerId(2)),
-                inf_stats.clone(),
-            ))
-            .id();
+    #[test]
+    fn test_get_suppliable_targets_filters_by_issue_70_eligibility() {
+        let mut world = setup_world();
+        let supplier = spawn_supplier(&mut world);
+        let allowed_types = [
+            UnitType::Infantry,
+            UnitType::Mech,
+            UnitType::Recon,
+            UnitType::Tank,
+            UnitType::MdTank,
+            UnitType::TankZ,
+            UnitType::Artillery,
+            UnitType::LightSpGun,
+            UnitType::HeavySpGun,
+            UnitType::Rockets,
+            UnitType::AntiAir,
+            UnitType::Missiles,
+            UnitType::SupplyTruck,
+            UnitType::Fighter,
+        ];
+        let allowed_targets: Vec<_> = allowed_types
+            .into_iter()
+            .map(|unit_type| {
+                spawn_target(
+                    &mut world,
+                    unit_type,
+                    PlayerId(1),
+                    GridPosition { x: 3, y: 2 },
+                    false,
+                )
+            })
+            .collect();
+        for unit_type in [
+            UnitType::HeavyFighter,
+            UnitType::Bomber,
+            UnitType::Bcopters,
+            UnitType::TransportHelicopter,
+            UnitType::Battleship,
+            UnitType::Carrier,
+            UnitType::Lander,
+        ] {
+            spawn_target(
+                &mut world,
+                unit_type,
+                PlayerId(1),
+                GridPosition { x: 3, y: 2 },
+                false,
+            );
+        }
+        let _acted = spawn_target(
+            &mut world,
+            UnitType::Infantry,
+            PlayerId(1),
+            GridPosition { x: 3, y: 2 },
+            true,
+        );
+        let _enemy = spawn_target(
+            &mut world,
+            UnitType::Infantry,
+            PlayerId(2),
+            GridPosition { x: 3, y: 2 },
+            false,
+        );
+        let dead = spawn_target(
+            &mut world,
+            UnitType::Infantry,
+            PlayerId(1),
+            GridPosition { x: 3, y: 2 },
+            false,
+        );
+        world.get_mut::<Health>(dead).unwrap().current = 0;
+        let transported = spawn_target(
+            &mut world,
+            UnitType::Infantry,
+            PlayerId(1),
+            GridPosition { x: 3, y: 2 },
+            false,
+        );
+        world.entity_mut(transported).insert(Transporting(supplier));
+        let _far = spawn_target(
+            &mut world,
+            UnitType::Infantry,
+            PlayerId(1),
+            GridPosition { x: 4, y: 2 },
+            false,
+        );
 
         let targets = get_suppliable_targets(&mut world, supplier);
-        assert_eq!(targets.len(), 1);
-        assert!(targets.contains(&target_ok));
 
-        // Test with can_supply = false
-        world.get_mut::<UnitStats>(supplier).unwrap().can_supply = false;
-        let targets_none = get_suppliable_targets(&mut world, supplier);
-        assert!(targets_none.is_empty());
+        assert_eq!(targets.len(), allowed_targets.len());
+        for target in allowed_targets {
+            assert!(targets.contains(&target));
+        }
     }
 
     /// ヘックスモードでは斜め方向の隣接ユニットにも補給できることの確認
     #[test]
     fn test_get_suppliable_targets_hex() {
-        let mut world = World::new();
+        let mut world = setup_world();
         world.insert_resource(Map::new(10, 10, Terrain::Plains, GridTopology::Hex));
-
-        let inf_stats = UnitStats {
-            unit_type: UnitType::Infantry,
-            max_fuel: 99,
-            max_ammo1: 9,
-            ..UnitStats::mock()
-        };
-
-        // 補給車を奇数行 (5,5) に配置
-        let supplier = world
-            .spawn((
-                GridPosition { x: 5, y: 5 },
-                Faction(PlayerId(1)),
-                UnitStats {
-                    unit_type: UnitType::SupplyTruck,
-                    can_supply: true,
-                    ..inf_stats.clone()
-                },
-            ))
-            .id();
-
-        // (6,6) は奇数行の斜め隣接（ヘックス距離1、マンハッタン距離2）
-        let target_diag = world
-            .spawn((
-                GridPosition { x: 6, y: 6 },
-                Faction(PlayerId(1)),
-                inf_stats.clone(),
-            ))
-            .id();
-
-        // (4,4) はヘックスでは隣接しない（マンハッタン距離2）
-        let _target_not_adjacent = world
-            .spawn((
-                GridPosition { x: 4, y: 4 },
-                Faction(PlayerId(1)),
-                inf_stats.clone(),
-            ))
-            .id();
+        let supplier = spawn_supplier(&mut world);
+        world.get_mut::<GridPosition>(supplier).unwrap().x = 5;
+        world.get_mut::<GridPosition>(supplier).unwrap().y = 5;
+        let target_diag = spawn_target(
+            &mut world,
+            UnitType::Infantry,
+            PlayerId(1),
+            GridPosition { x: 6, y: 6 },
+            false,
+        );
+        let _target_not_adjacent = spawn_target(
+            &mut world,
+            UnitType::Infantry,
+            PlayerId(1),
+            GridPosition { x: 4, y: 4 },
+            false,
+        );
 
         let targets = get_suppliable_targets(&mut world, supplier);
-        assert_eq!(targets.len(), 1);
-        assert!(targets.contains(&target_diag));
+
+        assert_eq!(targets, vec![target_diag]);
     }
 }
