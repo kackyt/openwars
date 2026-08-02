@@ -6,12 +6,14 @@ use crate::ai::demand::{
 use crate::ai::island_campaign::{
     IslandCampaignDiagnostics, IslandCampaignPortfolio, IslandCampaignShortfall,
 };
-use crate::ai::island_campaign_analysis::analyze_island_campaign;
+use crate::ai::island_campaign_analysis::{
+    analyze_island_campaign, analyze_island_campaign_excluding,
+};
 use crate::ai::turn_distance::{TerrainConnectivity, TurnDistanceCache, calculate_turn_distance};
 use crate::components::{Faction, GridPosition, PlayerId, Property, UnitStats};
 use crate::resources::{Map, MovementType, Terrain, UnitType, master_data::MasterDataRegistry};
 use bevy_ecs::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// ゲームの戦略的フェーズ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -166,7 +168,16 @@ fn enemy_threatens_property(
 
 /// 現在のマップ状況を分析し、最適な戦略を決定します。
 pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStrategy {
-    analyze_strategy_internal(world, player_id, None)
+    analyze_strategy_internal(world, player_id, None, &HashSet::new())
+}
+
+/// 緊急ミッションへ予約したEntityを島嶼キャンペーンから除外して戦略を分析します。
+pub(crate) fn analyze_strategy_with_reserved_entities(
+    world: &mut World,
+    player_id: PlayerId,
+    reserved_entities: &HashSet<Entity>,
+) -> ProductionStrategy {
+    analyze_strategy_internal(world, player_id, None, reserved_entities)
 }
 
 /// 同一ターンのSquad計画が保存したV3キャンペーンを後続の判断へ再利用する。
@@ -179,13 +190,14 @@ pub(crate) fn analyze_strategy_for_turn(
         .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
         .and_then(|cache| cache.campaign_portfolio(player_id))
         .cloned();
-    analyze_strategy_internal(world, player_id, cached_campaign)
+    analyze_strategy_internal(world, player_id, cached_campaign, &HashSet::new())
 }
 
 fn analyze_strategy_internal(
     world: &mut World,
     player_id: PlayerId,
     cached_campaign: Option<IslandCampaignPortfolio>,
+    reserved_entities: &HashSet<Entity>,
 ) -> ProductionStrategy {
     let mut strategy = ProductionStrategy::default();
 
@@ -207,7 +219,11 @@ fn analyze_strategy_internal(
             strategy.campaign_portfolio = cached;
         } else {
             // 通常分析では盤面から再構築し、同じ呼び出し内と診断出力で共有する。
-            strategy.campaign_portfolio = analyze_island_campaign(world, player_id);
+            strategy.campaign_portfolio = if reserved_entities.is_empty() {
+                analyze_island_campaign(world, player_id)
+            } else {
+                analyze_island_campaign_excluding(world, player_id, reserved_entities)
+            };
             // 診断Resourceは意思決定に戻さず、最後の分析結果だけをプレイヤー別に上書きする。
             if let Some(mut diagnostics) = world.get_resource_mut::<IslandCampaignDiagnostics>() {
                 diagnostics

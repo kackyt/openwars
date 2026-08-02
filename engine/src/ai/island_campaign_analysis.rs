@@ -1770,6 +1770,15 @@ fn collect_campaign_resource_pool(
 
 /// 全島評価と現在の共有資源を毎回盤面から再構築し、純粋allocatorへ一括で渡す。
 pub fn analyze_island_campaign(world: &mut World, player_id: PlayerId) -> IslandCampaignPortfolio {
+    analyze_island_campaign_excluding(world, player_id, &HashSet::new())
+}
+
+/// 緊急ミッションへ予約済みのEntityを共有資源から除外して島嶼作戦を分析します。
+pub fn analyze_island_campaign_excluding(
+    world: &mut World,
+    player_id: PlayerId,
+    reserved_entities: &HashSet<Entity>,
+) -> IslandCampaignPortfolio {
     let facts = collect_island_campaign_facts(world, player_id);
     let map = world.resource::<Map>().clone();
     let island_map = world
@@ -1800,7 +1809,8 @@ pub fn analyze_island_campaign(world: &mut World, player_id: PlayerId) -> Island
         .get_resource::<Players>()
         .and_then(|players| players.0.iter().find(|player| player.id == player_id))
         .map_or(0, |player| player.funds);
-    let unavailable_entities = unavailable_campaign_entities(&manager, &units, player_id);
+    let mut unavailable_entities = unavailable_campaign_entities(&manager, &units, player_id);
+    unavailable_entities.extend(reserved_entities.iter().copied());
     let pool = collect_campaign_resource_pool(
         player_id,
         &map,

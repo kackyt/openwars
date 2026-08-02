@@ -133,6 +133,7 @@ impl AiSimulationState {
                             }
                         }
                         crate::ai::squad::MissionType::Capture => 0,
+                        crate::ai::squad::MissionType::Interception(_) => stats.max_range.max(1),
                         crate::ai::squad::MissionType::Transport => 1,
                     };
 

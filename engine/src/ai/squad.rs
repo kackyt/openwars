@@ -4,7 +4,7 @@
 #![allow(clippy::unnecessary_map_or)]
 
 use crate::ai::cluster::detect_enemy_clusters;
-use crate::ai::strategy::analyze_strategy;
+use crate::ai::strategy::{analyze_strategy, analyze_strategy_with_reserved_entities};
 use crate::ai::turn_distance::{
     TerrainConnectivity, TurnDistanceCache, calculate_all_turn_distances, calculate_turn_distance,
     is_terrain_reachable,
@@ -22,6 +22,7 @@ pub enum MissionType {
     Capture,
     Defense,
     Transport,
+    Interception(crate::ai::emergency::EmergencyMissionId),
 }
 
 /// 輸送ミッションの各フェーズ
@@ -1495,6 +1496,7 @@ fn campaign_combat_responsibilities(
             MissionType::Defense => 1,
             MissionType::Capture => 2,
             MissionType::Transport => 3,
+            MissionType::Interception(_) => 4,
         };
         (
             mission_rank,
@@ -1756,10 +1758,12 @@ fn prepare_secure_local_captures(
                         .get_island_at(position)
                         .is_none_or(|island| island.id != island_id)
                     || manager.squads.iter().any(|squad| {
-                        (squad.members.contains(&entity)
+                        let references_entity = squad.members.contains(&entity)
                             || squad.cargo_entities.contains(&entity)
-                            || squad.delivered_cargo.contains(&entity))
-                            && !squad_is_mutable_by_player(world, squad, player_id)
+                            || squad.delivered_cargo.contains(&entity);
+                        references_entity
+                            && (matches!(squad.mission_type, MissionType::Interception(_))
+                                || !squad_is_mutable_by_player(world, squad, player_id))
                     })
                 {
                     return None;
@@ -1910,17 +1914,95 @@ fn apply_campaign_pauses(
     });
 }
 
+fn interception_unavailable_entities(
+    manager: &SquadManager,
+    perspective_player: PlayerId,
+) -> HashSet<Entity> {
+    let mut unavailable = manager.solo_fallbacks.clone();
+    for squad in &manager.squads {
+        if squad.owner_id != Some(perspective_player)
+            || squad.mission_type == MissionType::Transport
+        {
+            unavailable.extend(squad.members.iter().copied());
+            unavailable.extend(squad.cargo_entities.iter().copied());
+            unavailable.extend(squad.delivered_cargo.iter().copied());
+            unavailable.extend(squad.transport_entity);
+        }
+    }
+    unavailable
+}
+
+fn detach_interception_members(
+    manager: &mut SquadManager,
+    perspective_player: PlayerId,
+    reserved_entities: &HashSet<Entity>,
+) {
+    for squad in &mut manager.squads {
+        if squad.owner_id == Some(perspective_player)
+            && squad.mission_type != MissionType::Transport
+        {
+            squad
+                .members
+                .retain(|entity| !reserved_entities.contains(entity));
+        }
+    }
+    manager.squads.retain(|squad| {
+        !squad.members.is_empty()
+            || squad.mission_type == MissionType::Transport
+            || squad.owner_id != Some(perspective_player)
+    });
+}
+
+fn apply_interception_squads(
+    manager: &mut SquadManager,
+    perspective_player: PlayerId,
+    plan: &crate::ai::emergency::EmergencyMissionPlan,
+) {
+    for mission in &plan.missions {
+        let squad =
+            manager.create_owned_squad(MissionType::Interception(mission.id), perspective_player);
+        squad.members.insert(mission.assigned_entity);
+        squad.target = Some(mission.target_position);
+        squad.phase = MissionPhase::MovingToTarget;
+    }
+}
+
 /// ゲームの戦略状況に基づいて、自動的に部隊の構築と新規メンバーの割り当てを行います。
 pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     // 1. まず既存部隊のクリーンアップと SoloFallback 判定を実行
     update_squads(world, perspective_player);
 
-    let strategy = analyze_strategy(world, perspective_player);
-    let mut manager = world.remove_resource::<SquadManager>().unwrap_or_default();
-    let enemy_clusters = detect_enemy_clusters(world, perspective_player);
-
     // V3 の戦略拡張 (#53: 敵拠点の奪取目標化) を有効にするかどうか
     let is_v3 = crate::ai::resolve_player_ai_version(world, perspective_player).uses_v3_tactics();
+    let mut manager = world.remove_resource::<SquadManager>().unwrap_or_default();
+    let strategy = if is_v3 {
+        // 緊急ミッションは盤面から毎ターン再構築し、通常部隊より先に担当Entityを予約する。
+        manager.squads.retain(|squad| {
+            squad.owner_id != Some(perspective_player)
+                || !matches!(squad.mission_type, MissionType::Interception(_))
+        });
+        let unavailable = interception_unavailable_entities(&manager, perspective_player);
+        let emergency_plan =
+            crate::ai::emergency::analyze_interceptions(world, perspective_player, &unavailable);
+        let reserved_entities = emergency_plan.reserved_entities();
+        detach_interception_members(&mut manager, perspective_player, &reserved_entities);
+
+        // 島嶼キャンペーン分析が緊急担当Entityを再予約しないよう、更新済みManagerを一時的に戻す。
+        world.insert_resource(manager);
+        let strategy =
+            analyze_strategy_with_reserved_entities(world, perspective_player, &reserved_entities);
+        manager = world.remove_resource::<SquadManager>().unwrap_or_default();
+        apply_interception_squads(&mut manager, perspective_player, &emergency_plan);
+        world.insert_resource(emergency_plan);
+        strategy
+    } else {
+        world.remove_resource::<crate::ai::emergency::EmergencyMissionPlan>();
+        world.insert_resource(manager);
+        let strategy = analyze_strategy(world, perspective_player);
+        manager = world.remove_resource::<SquadManager>().unwrap_or_default();
+        strategy
+    };
+    let enemy_clusters = detect_enemy_clusters(world, perspective_player);
     if is_v3 {
         let mut cache = world
             .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()

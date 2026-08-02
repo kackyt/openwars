@@ -1346,6 +1346,58 @@ const AMBUSH_TOO_CLOSE_PENALTY: i32 = 3000;
 /// #45 (V3): 待ち受けゾーンとみなす最大射程からのマージン (敵の接近を想定)
 const AMBUSH_APPROACH_MARGIN: u32 = 2;
 
+/// 通常スコアとは別軸で緊急行動を比較する優先度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ActionPriority {
+    Normal,
+    EmergencyAdvance,
+    EmergencyRouteBlock,
+    EmergencySiteOccupation,
+    EmergencyNeutralization,
+}
+
+fn emergency_position_priority(
+    mission: Option<&crate::ai::emergency::EmergencyMission>,
+    origin: GridPosition,
+    candidate: GridPosition,
+    map: &Map,
+) -> ActionPriority {
+    let Some(mission) = mission else {
+        return ActionPriority::Normal;
+    };
+    if candidate == mission.target_position {
+        return match mission.response {
+            crate::ai::emergency::EmergencyResponse::EliminateThreat => {
+                ActionPriority::EmergencyAdvance
+            }
+            crate::ai::emergency::EmergencyResponse::OccupySite => {
+                ActionPriority::EmergencySiteOccupation
+            }
+            crate::ai::emergency::EmergencyResponse::BlockRoute => {
+                ActionPriority::EmergencyRouteBlock
+            }
+        };
+    }
+
+    let original_distance = map.distance(
+        origin.x,
+        origin.y,
+        mission.target_position.x,
+        mission.target_position.y,
+    );
+    let candidate_distance = map.distance(
+        candidate.x,
+        candidate.y,
+        mission.target_position.x,
+        mission.target_position.y,
+    );
+    if candidate_distance < original_distance {
+        ActionPriority::EmergencyAdvance
+    } else {
+        ActionPriority::Normal
+    }
+}
+
 /// 新しいAI (V2/V3) 用の行動意思決定エンジン。
 /// 各ユニットの所属部隊の割り当て目標（squad.target）に向かう接近スコアをベースに行動を決定します。
 /// V3 の場合は #44 (低HP時の地形防御優先)・#45 (間接攻撃の待ち伏せ)・
@@ -1468,9 +1520,13 @@ pub fn decide_ai_action_v2(
             .collect()
     };
     let damage_chart = world.resource::<crate::resources::DamageChart>().clone();
+    let emergency_plan = world
+        .get_resource::<crate::ai::emergency::EmergencyMissionPlan>()
+        .cloned()
+        .unwrap_or_default();
 
     let mut turn_cache = TurnDistanceCache::default();
-    let mut best_overall_score = i32::MIN;
+    let mut best_overall_rank = (ActionPriority::Normal, i32::MIN);
     let mut best_overall_choice: Option<(Entity, AiCommand)> = None;
 
     for unit_entity in movable_units {
@@ -1499,6 +1555,9 @@ pub fn decide_ai_action_v2(
         };
 
         let is_combat_ineffective = atk_hp < 70 || (stats.max_ammo1 > 0 && atk_ammo.0 == 0);
+        let planned_emergency = emergency_plan.mission_for_entity(unit_entity);
+        let emergency_mission = planned_emergency
+            .filter(|mission| world.get_entity(mission.threat.threat_entity).is_ok());
 
         // #44 (V3): 敵の脅威がこのユニットの近傍にあるか (森・山への退避を
         // 意味のある局面に限定するためのゲート)。敵の攻撃到達圏 (移動+射程) を
@@ -1520,12 +1579,17 @@ pub fn decide_ai_action_v2(
             &registry,
         );
 
-        let squad_target = unit_squad_targets.get(&unit_entity).copied();
+        let squad_target = if planned_emergency.is_some() && emergency_mission.is_none() {
+            // 同一ターン中に対象が消失した場合は、古い迎撃座標のSquad加点を無効化する。
+            None
+        } else {
+            unit_squad_targets.get(&unit_entity).copied()
+        };
         let initial_is_solo = solo_fallbacks.contains(&unit_entity) || squad_target.is_none();
 
         // 評価ロジック（is_solo: initial_is_solo を直接使う）
         let is_solo = initial_is_solo;
-        let mut best_unit_score = i32::MIN;
+        let mut best_unit_rank = (ActionPriority::Normal, i32::MIN);
         let mut best_unit_choice: Option<AiCommand> = None;
 
         for target_tile in &reachable {
@@ -1977,8 +2041,12 @@ pub fn decide_ai_action_v2(
             // (A) Capture
             if actions.can_capture {
                 let score = base_tile_score + 10000;
-                if score > best_unit_score {
-                    best_unit_score = score;
+                let rank = (
+                    emergency_position_priority(emergency_mission, pos, current_grid, &map),
+                    score,
+                );
+                if rank > best_unit_rank {
+                    best_unit_rank = rank;
                     best_unit_choice = Some(AiCommand::Capture {
                         target_pos: current_grid,
                     });
@@ -2047,8 +2115,16 @@ pub fn decide_ai_action_v2(
                         }
 
                         let score = base_tile_score + attack_score;
-                        if score > best_unit_score {
-                            best_unit_score = score;
+                        let priority = if emergency_mission
+                            .is_some_and(|mission| mission.threat.threat_entity == target_entity)
+                        {
+                            ActionPriority::EmergencyNeutralization
+                        } else {
+                            ActionPriority::Normal
+                        };
+                        let rank = (priority, score);
+                        if rank > best_unit_rank {
+                            best_unit_rank = rank;
                             best_unit_choice = Some(AiCommand::Attack {
                                 target_pos: current_grid,
                                 target_entity,
@@ -2087,8 +2163,12 @@ pub fn decide_ai_action_v2(
                     score -= 5000;
                 }
 
-                if score > best_unit_score {
-                    best_unit_score = score;
+                let rank = (
+                    emergency_position_priority(emergency_mission, pos, current_grid, &map),
+                    score,
+                );
+                if rank > best_unit_rank {
+                    best_unit_rank = rank;
                     best_unit_choice = Some(AiCommand::Wait {
                         target_pos: current_grid,
                     });
@@ -2121,8 +2201,9 @@ pub fn decide_ai_action_v2(
                         }
 
                         let score = base_tile_score + merge_score;
-                        if score > best_unit_score {
-                            best_unit_score = score;
+                        let rank = (ActionPriority::Normal, score);
+                        if rank > best_unit_rank {
+                            best_unit_rank = rank;
                             best_unit_choice = Some(AiCommand::Merge {
                                 target_pos: current_grid,
                                 target_entity,
@@ -2134,8 +2215,8 @@ pub fn decide_ai_action_v2(
         }
 
         if let Some(choice) = best_unit_choice {
-            if best_unit_score > best_overall_score {
-                best_overall_score = best_unit_score;
+            if best_unit_rank > best_overall_rank {
+                best_overall_rank = best_unit_rank;
                 best_overall_choice = Some((unit_entity, choice));
             }
         }
@@ -2163,7 +2244,7 @@ pub fn decide_ai_action_v2(
                 entity,
                 mission_type,
                 action_type: format!("{:?}", command),
-                score: best_overall_score,
+                score: best_overall_rank.1,
             });
         }
     }

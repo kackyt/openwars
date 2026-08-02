@@ -73,7 +73,13 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
         .iter()
         // active playerのgeneric責務だけを探索し、輸送および島別campaign責務の目標を上書きしない。
         .filter(|s| s.owner_id == Some(perspective_player))
-        .filter(|s| !s.members.is_empty() && s.mission_type != MissionType::Transport)
+        .filter(|s| {
+            !s.members.is_empty()
+                && !matches!(
+                    s.mission_type,
+                    MissionType::Transport | MissionType::Interception(_)
+                )
+        })
         .filter(|s| s.target_island.is_none())
         .cloned()
         .collect();
@@ -116,6 +122,12 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                     valid_targets.push(cap);
                 }
                 valid_targets.extend(&target_enemies);
+            }
+            MissionType::Interception(_) => {
+                // 緊急ミッションの目標は盤面分析で確定済みのため、ビーム探索で上書きしない。
+                if let Some(target) = squad.target {
+                    valid_targets.push(target);
+                }
             }
             MissionType::Transport => {
                 // squad.rs の段階ですでに戦略的価値に基づく target_island が設定されているはず
@@ -306,6 +318,7 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                                         }
                                     }
                                     MissionType::Capture => 0,
+                                    MissionType::Interception(_) => stats.max_range.max(1),
                                     MissionType::Transport => 1,
                                 };
 

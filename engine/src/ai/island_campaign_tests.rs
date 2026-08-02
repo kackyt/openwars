@@ -659,7 +659,7 @@ fn secure_does_not_assign_a_disconnected_capture_unit() {
 }
 
 #[test]
-fn contest_assigns_distinct_local_capture_and_attack_responsibilities() {
+fn contest_preserves_capture_while_combat_intercepts_capture_threat() {
     let (mut world, master_data, player) = empty_v3_world();
     let opponent = PlayerId(2);
     let home = GridPosition { x: 0, y: 0 };
@@ -715,18 +715,21 @@ fn contest_assigns_distinct_local_capture_and_attack_responsibilities() {
     assert_eq!(capture_squad.target_island, Some(island));
     assert_eq!(capture_squad.target, Some(neutral));
 
-    let attack_squad = manager
+    let interception_squad = manager
         .squads
         .iter()
         .find(|squad| squad.members.contains(&combat))
-        .expect("Contest combat Entity must keep an attack duty");
-    assert_eq!(attack_squad.mission_type, MissionType::Attack);
-    assert_eq!(attack_squad.target_island, Some(island));
+        .expect("Contest combat Entity must intercept the immediate capture threat");
+    assert!(matches!(
+        interception_squad.mission_type,
+        MissionType::Interception(_)
+    ));
+    assert_eq!(interception_squad.target_island, None);
     assert_eq!(
-        attack_squad.target,
+        interception_squad.target,
         world.get::<GridPosition>(enemy).copied()
     );
-    assert!(!attack_squad.members.contains(&capture));
+    assert!(!interception_squad.members.contains(&capture));
     assert!(!capture_squad.members.contains(&combat));
 }
 

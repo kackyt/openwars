@@ -1,5 +1,6 @@
 pub mod ai_version;
 pub mod demand;
+pub mod emergency;
 pub mod engine;
 pub mod eval;
 pub mod island_campaign;
