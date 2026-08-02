@@ -328,6 +328,54 @@ mod tests {
     }
 
     #[test]
+    fn test_supply_availability_uses_legal_targets_at_destination() {
+        let mut world = World::new();
+        let supplier = world
+            .spawn((
+                GridPosition { x: 0, y: 0 },
+                Faction(PlayerId(1)),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                ActionCompleted(false),
+                UnitStats {
+                    unit_type: UnitType::SupplyTruck,
+                    can_supply: true,
+                    ..UnitStats::mock()
+                },
+            ))
+            .id();
+        let target = world
+            .spawn((
+                GridPosition { x: 2, y: 0 },
+                Faction(PlayerId(1)),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                ActionCompleted(false),
+                UnitStats {
+                    unit_type: UnitType::Fighter,
+                    ..UnitStats::mock()
+                },
+            ))
+            .id();
+
+        let destination = GridPosition { x: 1, y: 0 };
+        assert!(get_available_actions_at(&mut world, supplier, destination, true).can_supply);
+
+        // 行動済みの対象だけでは補給アクションを表示しない
+        world.get_mut::<ActionCompleted>(target).unwrap().0 = true;
+        assert!(!get_available_actions_at(&mut world, supplier, destination, true).can_supply);
+
+        // 補給対象外の航空ユニットも補給アクションを表示しない
+        world.get_mut::<ActionCompleted>(target).unwrap().0 = false;
+        world.get_mut::<UnitStats>(target).unwrap().unit_type = UnitType::Bomber;
+        assert!(!get_available_actions_at(&mut world, supplier, destination, true).can_supply);
+    }
+
+    #[test]
     fn test_cannot_wait_on_occupied_tile() {
         let mut world = World::new();
         let p1 = PlayerId(1);

@@ -28,7 +28,8 @@ export const GameCanvas = () => {
   const unitData = useGameStore((state) => state.unitData);
   const interactionState = useGameStore((state) => state.interactionState);
   const reachableCells = useGameStore((state) => state.reachableCells);
-  const attackableTargets = useGameStore((state) => state.attackableTargets);
+  const targetableUnits = useGameStore((state) => state.targetableUnits);
+  const pendingTargetAction = useGameStore((state) => state.pendingTargetAction);
   const topology = useGameStore((state) => state.topology);
   const setHoveredCell = useGameStore((state) => state.setHoveredCell);
   const selectUnit = useGameStore((state) => state.selectUnit);
@@ -199,10 +200,12 @@ export const GameCanvas = () => {
           cancelInteraction();
         }
       } else if (interactionState === "target_selection") {
-        const target = attackableTargets.find((t) => t.x === gridX && t.y === gridY);
-        if (target) {
-          // 攻撃可能ターゲットを選択したら攻撃実行
-          executeAction("Attack", target.id);
+        const target = targetableUnits.find(
+          (candidate) => candidate.x === gridX && candidate.y === gridY,
+        );
+        if (target && pendingTargetAction) {
+          // engine が返した対象だけに、選択中のアクションを実行する
+          executeAction(pendingTargetAction, target.id);
         } else {
           cancelInteraction();
         }

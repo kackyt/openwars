@@ -282,4 +282,58 @@ describe("gameStore", () => {
       expect(tickAiTurn).toHaveBeenCalledOnce();
     });
   });
+
+  describe("Supply target selection", () => {
+    it("queries legal supply targets without committing movement", async () => {
+      const getSuppliableTargets = vi.fn(async () => [{ id: "target-1", x: 3, y: 2 }]);
+      const submitMoveCommand = vi.fn(async () => undefined);
+      useGameStore.setState({
+        engineWorker: asEngineWorker({ getSuppliableTargets, submitMoveCommand }),
+        selectedUnitId: "supplier-1",
+        selectedTargetPos: { x: 2, y: 2 },
+        interactionState: "action_menu",
+        actionMenu: { x: 2, y: 2, unitId: "supplier-1", actions: ["Supply"] },
+      });
+
+      await useGameStore.getState().executeAction("Supply");
+
+      expect(getSuppliableTargets).toHaveBeenCalledWith("supplier-1", 2, 2);
+      expect(submitMoveCommand).not.toHaveBeenCalled();
+      const state = useGameStore.getState();
+      expect(state.interactionState).toBe("target_selection");
+      expect(state.targetableUnits).toEqual([{ id: "target-1", x: 3, y: 2 }]);
+      expect(state.pendingTargetAction).toBe("Supply");
+      expect(state.actionMenu).toBeNull();
+    });
+
+    it("commits movement then supplies exactly the chosen target", async () => {
+      const submitMoveCommand = vi.fn(async () => undefined);
+      const submitSupplyCommand = vi.fn(async () => undefined);
+      const syncGameState = vi.fn(async () => undefined);
+      useGameStore.setState({
+        engineWorker: asEngineWorker({ submitMoveCommand, submitSupplyCommand }),
+        selectedUnitId: "supplier-1",
+        selectedTargetPos: { x: 2, y: 2 },
+        targetableUnits: [
+          { id: "target-1", x: 3, y: 2 },
+          { id: "target-2", x: 2, y: 3 },
+        ],
+        pendingTargetAction: "Supply",
+        interactionState: "target_selection",
+        syncGameState,
+      });
+
+      await useGameStore.getState().executeAction("Supply", "target-2");
+
+      expect(submitMoveCommand).toHaveBeenCalledOnce();
+      expect(submitMoveCommand).toHaveBeenCalledWith("supplier-1", 2, 2);
+      expect(submitSupplyCommand).toHaveBeenCalledOnce();
+      expect(submitSupplyCommand).toHaveBeenCalledWith("supplier-1", "target-2");
+      expect(syncGameState).toHaveBeenCalledOnce();
+      const state = useGameStore.getState();
+      expect(state.interactionState).toBe("idle");
+      expect(state.targetableUnits).toEqual([]);
+      expect(state.pendingTargetAction).toBeNull();
+    });
+  });
 });

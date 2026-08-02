@@ -19,12 +19,12 @@ interface ReachableLayerProps {
 
 /**
  * 到達可能範囲レイヤーコンポーネント
- * ユニットの移動可能範囲（青色）や攻撃可能対象セル（赤色）のハイライトを描画します。
+ * ユニットの移動可能範囲（青色）やアクション対象セル（赤色）のハイライトを描画します。
  */
 export const ReachableLayer = ({ tileSize }: ReachableLayerProps) => {
   // Zustand のセレクタを用いて必要な値のみを個別に取得する
   const reachableCells = useGameStore((state) => state.reachableCells);
-  const attackableTargets = useGameStore((state) => state.attackableTargets);
+  const targetableUnits = useGameStore((state) => state.targetableUnits);
   const topology = useGameStore((state) => state.topology);
   const interactionState = useGameStore((state) => state.interactionState);
 
@@ -50,11 +50,11 @@ export const ReachableLayer = ({ tileSize }: ReachableLayerProps) => {
         g.endFill();
       }
 
-      // 攻撃対象の選択可能セルを描画する
+      // 攻撃・補給対象の選択可能セルを描画する
       if (interactionState === "target_selection") {
         g.beginFill(TARGET_CELL_COLOR, TARGET_CELL_ALPHA);
         g.lineStyle(2, TARGET_BORDER_COLOR, TARGET_BORDER_ALPHA);
-        for (const target of attackableTargets) {
+        for (const target of targetableUnits) {
           const isHexOddRow = topology === "hex" && target.y % 2 !== 0;
           const offsetX = isHexOddRow ? tileSize / 2 : 0;
           const px = target.x * tileSize + offsetX;
@@ -64,7 +64,7 @@ export const ReachableLayer = ({ tileSize }: ReachableLayerProps) => {
         g.endFill();
       }
     },
-    [reachableCells, attackableTargets, topology, tileSize, interactionState],
+    [reachableCells, targetableUnits, topology, tileSize, interactionState],
   );
 
   return <Graphics draw={draw} />;

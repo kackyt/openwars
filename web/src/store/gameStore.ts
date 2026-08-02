@@ -111,7 +111,10 @@ export interface GameState {
     | "ai_thinking";
   selectedUnitId: string | null;
   reachableCells: { x: number; y: number }[];
-  attackableTargets: { id: string; x: number; y: number }[];
+  // 攻撃・補給で共用する選択可能な対象ユニット一覧
+  targetableUnits: { id: string; x: number; y: number }[];
+  // 対象選択中に実行するアクションを保持する
+  pendingTargetAction: "Attack" | "Supply" | null;
   selectedTargetPos: { x: number; y: number } | null;
   produceMenu: ProduceMenuState | null;
   // 降車フロー用: 積載ユニット一覧と選択されたユニットIDを保持する
@@ -182,7 +185,8 @@ export const useGameStore = create<GameState>((set, get) => ({
   interactionState: "idle",
   selectedUnitId: null,
   reachableCells: [],
-  attackableTargets: [],
+  targetableUnits: [],
+  pendingTargetAction: null,
   selectedTargetPos: null,
   produceMenu: null,
   loadedUnits: [],
@@ -346,7 +350,8 @@ export const useGameStore = create<GameState>((set, get) => ({
       interactionState: "idle",
       selectedUnitId: null,
       reachableCells: [],
-      attackableTargets: [],
+      targetableUnits: [],
+      pendingTargetAction: null,
       selectedTargetPos: null,
       produceMenu: null,
       actionMenu: null,
@@ -376,7 +381,8 @@ export const useGameStore = create<GameState>((set, get) => ({
           );
           set({
             interactionState: "target_selection",
-            attackableTargets: targets,
+            targetableUnits: targets,
+            pendingTargetAction: "Attack",
             actionMenu: null,
           });
           return;
@@ -390,6 +396,27 @@ export const useGameStore = create<GameState>((set, get) => ({
         get().cancelInteraction();
         await get().syncGameState({ recentlyDestroyedUnitIds: destroyedIds });
         return;
+      } else if (actionType === "Supply") {
+        if (!targetId) {
+          const targets = await engineWorker.getSuppliableTargets(
+            selectedUnitId,
+            selectedTargetPos.x,
+            selectedTargetPos.y,
+          );
+          set({
+            interactionState: "target_selection",
+            targetableUnits: targets,
+            pendingTargetAction: "Supply",
+            actionMenu: null,
+          });
+          return;
+        }
+        await engineWorker.submitMoveCommand(
+          selectedUnitId,
+          selectedTargetPos.x,
+          selectedTargetPos.y,
+        );
+        await engineWorker.submitSupplyCommand(selectedUnitId, targetId);
       } else if (actionType === "Capture") {
         await engineWorker.submitMoveCommand(
           selectedUnitId,
