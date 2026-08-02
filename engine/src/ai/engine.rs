@@ -790,19 +790,18 @@ pub fn decide_ai_action(
                         world.get::<Health>(target_entity),
                         world.get::<UnitStats>(target_entity),
                     ) {
-                        // フルHP同士の合流は無意味なのでスコアを0にする
+                        if crate::ai::pruning::is_overflow_merge_without_refund(atk_hp, *t_health) {
+                            continue;
+                        }
+
                         let total_hp = atk_hp + t_health.current;
-                        if total_hp > 100 {
-                            merge_score = 0;
-                        } else {
-                            // 自身または相手のHPが低い場合、合流の価値を高める
-                            if is_combat_ineffective || t_health.current < 40 {
-                                merge_score += 4000;
-                            }
-                            // 合流後のHPが無駄にならないなら加点
-                            if total_hp <= 100 {
-                                merge_score += 1000;
-                            }
+                        // 自身または相手のHPが低い場合、合流の価値を高める
+                        if is_combat_ineffective || t_health.current < 40 {
+                            merge_score += 4000;
+                        }
+                        // 合流後のHPが無駄にならないなら加点
+                        if total_hp <= t_health.max {
+                            merge_score += 1000;
                         }
 
                         let score = base_tile_score + merge_score;
@@ -2109,16 +2108,16 @@ pub fn decide_ai_action_v2(
                         world.get::<Health>(target_entity),
                         world.get::<UnitStats>(target_entity),
                     ) {
+                        if crate::ai::pruning::is_overflow_merge_without_refund(atk_hp, *t_health) {
+                            continue;
+                        }
+
                         let total_hp = atk_hp + t_health.current;
-                        if total_hp > 100 {
-                            merge_score = 0;
-                        } else {
-                            if is_combat_ineffective || t_health.current < 40 {
-                                merge_score += 4000;
-                            }
-                            if total_hp <= 100 {
-                                merge_score += 1000;
-                            }
+                        if is_combat_ineffective || t_health.current < 40 {
+                            merge_score += 4000;
+                        }
+                        if total_hp <= t_health.max {
+                            merge_score += 1000;
                         }
 
                         let score = base_tile_score + merge_score;
@@ -3087,6 +3086,120 @@ mod tests {
         } else {
             panic!("Expected Merge command, got {:?}", action);
         }
+    }
+
+    #[test]
+    fn issue73_v1_overflow_merge_is_not_selected() {
+        let mut world = World::new();
+        world.insert_resource(DamageChart::new());
+        world.insert_resource(Map {
+            width: 3,
+            height: 1,
+            tiles: vec![Terrain::Plains, Terrain::Forest, Terrain::Plains],
+            topology: crate::resources::GridTopology::Square,
+        });
+        crate::resources::master_data::MasterDataRegistry::load()
+            .map(|master_data| world.insert_resource(master_data))
+            .unwrap();
+
+        let player = PlayerId(1);
+        world.spawn((
+            player,
+            Faction(player),
+            HasMoved(false),
+            ActionCompleted(false),
+            GridPosition { x: 0, y: 0 },
+            UnitStats {
+                unit_type: UnitType::Infantry,
+                max_movement: 3,
+                movement_type: crate::resources::MovementType::Infantry,
+                ..UnitStats::mock()
+            },
+            Health {
+                current: 100,
+                max: 100,
+            },
+            crate::components::Fuel {
+                current: 99,
+                max: 99,
+            },
+        ));
+        let target = world
+            .spawn((
+                player,
+                Faction(player),
+                HasMoved(true),
+                ActionCompleted(true),
+                GridPosition { x: 1, y: 0 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    max_movement: 3,
+                    movement_type: crate::resources::MovementType::Infantry,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 34,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+            ))
+            .id();
+
+        let action = decide_ai_action(&mut world, player, &std::collections::HashSet::new());
+
+        assert!(
+            !matches!(
+                action,
+                Some((_, AiCommand::Merge { target_entity, .. })) if target_entity == target
+            ),
+            "HP上限を超えるMergeはV1の候補から除外されること"
+        );
+    }
+
+    #[test]
+    fn issue73_v3_position_score_does_not_revive_overflow_merge() {
+        let mut world = setup_v3_test_world(3, crate::ai::AiVersion::V3);
+        world.insert_resource(DamageChart::new());
+        let player = PlayerId(1);
+        let stats = UnitStats {
+            unit_type: UnitType::Infantry,
+            max_movement: 3,
+            movement_type: crate::resources::MovementType::Infantry,
+            ..UnitStats::mock()
+        };
+        let source = spawn_v3_test_unit(&mut world, player, 0, 100, stats.clone());
+        let target = world
+            .spawn((
+                Faction(player),
+                HasMoved(true),
+                ActionCompleted(true),
+                GridPosition { x: 1, y: 0 },
+                stats,
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+            ))
+            .id();
+        insert_single_unit_squad(&mut world, source, GridPosition { x: 1, y: 0 });
+
+        let action = decide_ai_action_v2(&mut world, player, &std::collections::HashSet::new());
+
+        assert!(
+            !matches!(
+                action,
+                Some((entity, AiCommand::Merge { target_entity, .. }))
+                    if entity == source && target_entity == target
+            ),
+            "部隊目標による大きな位置スコアがあってもHP超過Mergeを復活させないこと"
+        );
     }
 
     #[test]
