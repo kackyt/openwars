@@ -1,7 +1,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::ai::demand::{
-    DemandMatrix, average_attack_expectation, compute_demand, compute_unit_affinity,
+    AirDefenseAssessment, CombatCapabilitySnapshot, DemandMatrix, assess_air_defense,
+    average_attack_expectation, compute_demand, compute_unit_affinity,
 };
 use crate::ai::island_campaign::{
     IslandCampaignDiagnostics, IslandCampaignPortfolio, IslandCampaignShortfall,
@@ -10,7 +11,7 @@ use crate::ai::island_campaign_analysis::{
     analyze_island_campaign, analyze_island_campaign_excluding,
 };
 use crate::ai::turn_distance::{TerrainConnectivity, TurnDistanceCache, calculate_turn_distance};
-use crate::components::{Faction, GridPosition, PlayerId, Property, UnitStats};
+use crate::components::{Ammo, Faction, Fuel, GridPosition, Health, PlayerId, Property, UnitStats};
 use crate::resources::{Map, MovementType, Terrain, UnitType, master_data::MasterDataRegistry};
 use bevy_ecs::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -51,6 +52,8 @@ pub struct ProductionStrategy {
     pub capture_demand: u32,
     /// 包括的需要マトリクス（各戦闘カテゴリの脅威ギャップと占領脅威）。
     pub demand: DemandMatrix,
+    /// 航空脅威と、期限内に交戦可能な対空戦力の不足状況。
+    pub air_defense: AirDefenseAssessment,
     /// 輸送を必要としている既存ユニットのリスト（位置、ステータス、基本価値）。
     pub transport_candidates: Vec<(GridPosition, UnitStats, f32)>,
     /// 現在保有している輸送ユニットの数
@@ -63,6 +66,13 @@ pub struct ProductionStrategy {
     pub campaign_shortfalls: Vec<IslandCampaignShortfall>,
 }
 
+/// 航空脅威が残る間だけ保持する緊急対空の貯金先。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmergencyAntiAirReservation {
+    pub unit_type: UnitType,
+    pub cost: u32,
+}
+
 /// 複数ターンにまたがる生産計画。
 /// 貯金や次ターンの生産予約を管理するリソース。
 #[derive(Resource, Debug, Clone, Default)]
@@ -72,6 +82,8 @@ pub struct ProductionPlan {
     pub reserves: HashMap<u32, u32>,
     /// 勢力ごとの次ターン生産予約ユニット。
     pub reservations: HashMap<u32, Vec<UnitType>>,
+    /// 通常の生産予約を上書きせず、航空脅威が消えた時だけ解除する緊急対空予約。
+    pub emergency_anti_air_reservations: HashMap<u32, EmergencyAntiAirReservation>,
 }
 
 fn is_ground_movement(movement_type: MovementType) -> bool {
@@ -318,6 +330,42 @@ fn analyze_strategy_internal(
         }
     }
 
+    let capability_units = {
+        let mut query = world.query::<(
+            &GridPosition,
+            &Faction,
+            &UnitStats,
+            &Health,
+            Option<&Ammo>,
+            Option<&Fuel>,
+            Option<&crate::components::Transporting>,
+        )>();
+        query
+            .iter(world)
+            .filter(|(position, _, _, health, _, _, transporting)| {
+                position.x < 9999 && health.current > 0 && transporting.is_none()
+            })
+            .map(
+                |(position, faction, stats, health, ammo, fuel, _)| CombatCapabilitySnapshot {
+                    faction: faction.0,
+                    position: *position,
+                    unit_type: stats.unit_type,
+                    movement_type: stats.movement_type,
+                    hp: health.current,
+                    cost: stats.cost,
+                    max_movement: stats.max_movement,
+                    min_range: stats.min_range,
+                    max_range: stats.max_range,
+                    ammo1: ammo.map_or(99, |ammo| ammo.ammo1),
+                    max_ammo1: stats.max_ammo1,
+                    ammo2: ammo.map_or(99, |ammo| ammo.ammo2),
+                    max_ammo2: stats.max_ammo2,
+                    fuel: fuel.map_or(u32::MAX, |fuel| fuel.current),
+                },
+            )
+            .collect::<Vec<_>>()
+    };
+
     // 自軍の歩兵が存在する島IDも収集対象に加える
     for (pos, stats) in &my_units {
         #[allow(clippy::collapsible_if)]
@@ -536,6 +584,32 @@ fn analyze_strategy_internal(
                 &chart,
                 &registry,
             );
+            if is_v3 {
+                let critical_sites = my_props_for_demand
+                    .iter()
+                    .filter(|(_, terrain)| {
+                        matches!(
+                            terrain,
+                            Terrain::Capital
+                                | Terrain::Factory
+                                | Terrain::Airport
+                                | Terrain::Port
+                                | Terrain::City
+                        )
+                    })
+                    .map(|(position, _)| *position)
+                    .collect::<Vec<_>>();
+                strategy.air_defense = assess_air_defense(
+                    player_id,
+                    &capability_units,
+                    &critical_sites,
+                    &map,
+                    &master_data,
+                    &unit_positions,
+                    &chart,
+                );
+                strategy.demand.anti_air = strategy.air_defense.shortage_ratio;
+            }
 
             // 輸送が必要なユニット（停滞ユニット）的抽出。
             // V3はallocatorが確定した全攻勢を、割当優先順位どおりの輸送先として共有する。

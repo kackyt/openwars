@@ -2641,7 +2641,7 @@ mod tests {
         squad.phase = MissionPhase::Transport(TransportPhase::Pickup);
         world.insert_resource(manager);
 
-        let cache_key = (0, 0, 0, 0, MovementType::Air, 1, 0, player);
+        let cache_key = (0, 0, 0, 0, MovementType::Air, 1, 0, 0, player);
         let sentinel = crate::ai::turn_distance::TurnDistance {
             turns: 77,
             used_mp: 88,
