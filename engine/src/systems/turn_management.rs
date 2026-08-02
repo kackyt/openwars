@@ -4,6 +4,28 @@ use crate::resources::*;
 use bevy_ecs::prelude::*;
 use std::collections::HashSet;
 
+/// 空母がターン開始時に搭載ユニットへ提供できる内部HP回復量です。
+const MAX_CARRIER_CARGO_REPAIR_HP: u32 = 20;
+const REPAIR_COST_DENOMINATOR: u64 = 100;
+
+/// 指定した内部HP回復量に対応する修理費を計算します。
+fn calculate_repair_cost(unit_cost: u32, repaired_hp: u32) -> u32 {
+    ((u64::from(unit_cost) * u64::from(repaired_hp)) / REPAIR_COST_DENOMINATOR)
+        .min(u64::from(u32::MAX)) as u32
+}
+
+/// 残資金で購入可能な最大のHP回復量と費用を返します。
+fn calculate_affordable_repair(unit_cost: u32, desired_repair: u32, funds: u32) -> (u32, u32) {
+    for repaired_hp in (0..=desired_repair).rev() {
+        let cost = calculate_repair_cost(unit_cost, repaired_hp);
+        if cost <= funds {
+            return (repaired_hp, cost);
+        }
+    }
+
+    (0, 0)
+}
+
 fn apply_daily_updates_for_unit(
     stats: &UnitStats,
     pos: &GridPosition,
@@ -39,11 +61,15 @@ fn run_daily_update_for_all(
         &mut Ammo,
         &mut Health,
         &GridPosition,
+        Option<&Transporting>,
     )>,
     map: &Map,
 ) {
-    for (_, _, _, _, stats, mut fuel, _, mut hp, pos) in q_units.iter_mut() {
-        apply_daily_updates_for_unit(stats, pos, map, &mut fuel, &mut hp);
+    for (_, _, _, _, stats, mut fuel, _, mut hp, pos, transporting) in q_units.iter_mut() {
+        // 搭載中の航空ユニットは空母の格納庫で保護されるため、日次燃料消費と墜落判定を行いません。
+        if transporting.is_none() {
+            apply_daily_updates_for_unit(stats, pos, map, &mut fuel, &mut hp);
+        }
     }
 }
 
@@ -78,6 +104,7 @@ pub fn advance_next_phase(world: &mut World) {
             &mut Ammo,
             &mut Health,
             &GridPosition,
+            Option<&Transporting>,
         )>,
         ResMut<Players>,
         Query<(&GridPosition, &Property)>,
@@ -104,7 +131,7 @@ pub fn advance_next_phase(world: &mut World) {
     }
 
     // 1. 全ユニットの状態をリセット
-    for (_, mut has_moved, mut action_completed, _, _, _, _, _, _) in q_units.iter_mut() {
+    for (_, mut has_moved, mut action_completed, _, _, _, _, _, _, _) in q_units.iter_mut() {
         has_moved.0 = false;
         action_completed.0 = false;
     }
@@ -150,6 +177,9 @@ pub fn advance_next_phase(world: &mut World) {
 
     // 変更をワールドに適用（Commandsの実行など）
     system_state.apply(world);
+
+    // 物件補給の後に、空母を洋上の移動補給拠点として搭載ユニットをサービスします。
+    apply_carrier_cargo_service(world, active_player_id);
 }
 
 /// プレイヤーの所有物件に基づいて資金を増加させます。
@@ -182,6 +212,102 @@ fn apply_income(
     }
 }
 
+/// 自軍ターン開始時に空母へ搭載されたユニットを修理・補給します。
+fn apply_carrier_cargo_service(world: &mut World, active_player_id: PlayerId) {
+    let Some(mut remaining_funds) = world
+        .get_resource::<Players>()
+        .and_then(|players| {
+            players
+                .0
+                .iter()
+                .find(|player| player.id == active_player_id)
+        })
+        .map(|player| player.funds)
+    else {
+        return;
+    };
+
+    // 資金配分を決定的にするため、空母はEntity ID順、搭載ユニットは搭載順で処理します。
+    let mut carriers: Vec<(Entity, Vec<Entity>)> = {
+        let mut query = world.query_filtered::<
+            (Entity, &Faction, &UnitStats, &Health, &CargoCapacity),
+            Without<Transporting>,
+        >();
+        query
+            .iter(world)
+            .filter(|(_, faction, stats, health, _)| {
+                faction.0 == active_player_id
+                    && stats.unit_type == UnitType::Carrier
+                    && !health.is_destroyed()
+            })
+            .map(|(entity, _, _, _, cargo)| (entity, cargo.loaded.clone()))
+            .collect()
+    };
+    carriers.sort_by_key(|(entity, _)| entity.to_bits());
+
+    let mut processed_cargo = HashSet::new();
+    for (carrier, cargo_entities) in carriers {
+        for cargo in cargo_entities {
+            if !processed_cargo.insert(cargo) {
+                continue;
+            }
+
+            let Some(transporting) = world.get::<Transporting>(cargo) else {
+                continue;
+            };
+            if transporting.0 != carrier {
+                continue;
+            }
+
+            let (unit_cost, desired_repair) = {
+                let (Some(faction), Some(stats), Some(health)) = (
+                    world.get::<Faction>(cargo),
+                    world.get::<UnitStats>(cargo),
+                    world.get::<Health>(cargo),
+                ) else {
+                    continue;
+                };
+                if faction.0 != active_player_id || health.is_destroyed() {
+                    continue;
+                }
+
+                (
+                    stats.cost,
+                    MAX_CARRIER_CARGO_REPAIR_HP.min(health.max.saturating_sub(health.current)),
+                )
+            };
+
+            let (repaired_hp, repair_cost) =
+                calculate_affordable_repair(unit_cost, desired_repair, remaining_funds);
+            remaining_funds -= repair_cost;
+
+            let mut cargo_entity = world.entity_mut(cargo);
+            if repaired_hp > 0 {
+                let mut health = cargo_entity
+                    .get_mut::<Health>()
+                    .expect("validated cargo must retain Health");
+                health.current = (health.current + repaired_hp).min(health.max);
+            }
+            // 空母の補給はHP修理だけを課金し、燃料と弾薬は資金に関係なく最大化します。
+            if let Some(mut fuel) = cargo_entity.get_mut::<Fuel>() {
+                fuel.resupply();
+            }
+            if let Some(mut ammo) = cargo_entity.get_mut::<Ammo>() {
+                ammo.resupply();
+            }
+        }
+    }
+
+    if let Some(player) = world
+        .resource_mut::<Players>()
+        .0
+        .iter_mut()
+        .find(|player| player.id == active_player_id)
+    {
+        player.funds = remaining_funds;
+    }
+}
+
 /// プレイヤーの所有物件に滞在しているユニットの補給（燃料・弾薬・HP回復）を行います。
 #[allow(clippy::type_complexity)]
 fn apply_unit_resupply(
@@ -198,6 +324,7 @@ fn apply_unit_resupply(
         &mut Ammo,
         &mut Health,
         &GridPosition,
+        Option<&Transporting>,
     )>,
 ) {
     // 補給可能な物件の座標を収集
@@ -221,7 +348,7 @@ fn apply_unit_resupply(
         .unwrap();
 
     // 物件補給の実行
-    for (_, _, _, faction, stats, mut fuel, mut ammo, mut hp, pos) in q_units.iter_mut() {
+    for (_, _, _, faction, stats, mut fuel, mut ammo, mut hp, pos, _) in q_units.iter_mut() {
         if faction.0 == active_player_id {
             if hp.is_destroyed() {
                 continue;
@@ -604,5 +731,160 @@ mod tests {
                 .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
                 .is_none()
         );
+    }
+
+    fn spawn_carrier_with_cargo(
+        world: &mut World,
+        cargo_health: u32,
+        cargo_fuel: u32,
+        funds: u32,
+    ) -> (Entity, Entity) {
+        world.resource_mut::<Players>().0[0].funds = funds;
+
+        let carrier = world
+            .spawn((
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::Carrier,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 40,
+                    max: 100,
+                },
+                CargoCapacity {
+                    max: 2,
+                    loaded: vec![],
+                },
+            ))
+            .id();
+        let cargo = world
+            .spawn((
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::Fighter,
+                    cost: 16_000,
+                    movement_type: MovementType::Air,
+                    daily_fuel_consumption: 5,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: cargo_health,
+                    max: 100,
+                },
+                Fuel {
+                    current: cargo_fuel,
+                    max: 50,
+                },
+                Ammo {
+                    ammo1: 1,
+                    max_ammo1: 6,
+                    ammo2: 0,
+                    max_ammo2: 2,
+                },
+                Transporting(carrier),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 9999, y: 9999 },
+            ))
+            .id();
+        world
+            .get_mut::<CargoCapacity>(carrier)
+            .unwrap()
+            .loaded
+            .push(cargo);
+
+        (carrier, cargo)
+    }
+
+    #[test]
+    fn test_carrier_cargo_service_repairs_and_resupplies_at_turn_start() {
+        let (mut world, mut schedule) = setup_world();
+        let (_, cargo) = spawn_carrier_with_cargo(&mut world, 80, 10, 5_000);
+
+        // P1 -> P2 -> P1 と進め、自軍ターン開始時のサービスを確認します。
+        world.send_event(NextPhaseCommand);
+        schedule.run(&mut world);
+        world.send_event(NextPhaseCommand);
+        schedule.run(&mut world);
+
+        assert_eq!(world.get::<Health>(cargo).unwrap().current, 100);
+        assert_eq!(world.get::<Fuel>(cargo).unwrap().current, 50);
+        let ammo = world.get::<Ammo>(cargo).unwrap();
+        assert_eq!((ammo.ammo1, ammo.ammo2), (6, 2));
+        assert_eq!(world.resource::<Players>().0[0].funds, 1_800);
+    }
+
+    #[test]
+    fn test_carrier_cargo_service_repairs_partially_but_resupplies_for_free() {
+        let (mut world, _) = setup_world();
+        let (_, cargo) = spawn_carrier_with_cargo(&mut world, 80, 0, 1_500);
+
+        apply_carrier_cargo_service(&mut world, PlayerId(1));
+
+        // 16,000Gのユニットは内部HP 9回復で1,440Gとなり、残り60Gでは次の1HPを購入できません。
+        assert_eq!(world.get::<Health>(cargo).unwrap().current, 89);
+        assert_eq!(world.resource::<Players>().0[0].funds, 60);
+        assert_eq!(world.get::<Fuel>(cargo).unwrap().current, 50);
+        let ammo = world.get::<Ammo>(cargo).unwrap();
+        assert_eq!((ammo.ammo1, ammo.ammo2), (6, 2));
+    }
+
+    #[test]
+    fn test_carrier_cargo_service_uses_load_order_for_limited_funds() {
+        let (mut world, _) = setup_world();
+        let (carrier, first_cargo) = spawn_carrier_with_cargo(&mut world, 80, 0, 4_000);
+        let second_cargo = world
+            .spawn((
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::Fighter,
+                    cost: 16_000,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 80,
+                    max: 100,
+                },
+                Fuel {
+                    current: 0,
+                    max: 50,
+                },
+                Ammo {
+                    ammo1: 0,
+                    max_ammo1: 6,
+                    ammo2: 0,
+                    max_ammo2: 2,
+                },
+                Transporting(carrier),
+            ))
+            .id();
+        world
+            .get_mut::<CargoCapacity>(carrier)
+            .unwrap()
+            .loaded
+            .push(second_cargo);
+
+        apply_carrier_cargo_service(&mut world, PlayerId(1));
+
+        // 搭載順の先頭が20HP、残り800Gを次の搭載ユニットが5HP分使用します。
+        assert_eq!(world.get::<Health>(first_cargo).unwrap().current, 100);
+        assert_eq!(world.get::<Health>(second_cargo).unwrap().current, 85);
+        assert_eq!(world.resource::<Players>().0[0].funds, 0);
+    }
+
+    #[test]
+    fn test_transported_aircraft_is_not_destroyed_before_carrier_service() {
+        let (mut world, mut schedule) = setup_world();
+        let (_, cargo) = spawn_carrier_with_cargo(&mut world, 100, 0, 0);
+
+        // ラウンド切替時でも搭載中は墜落せず、空母が燃料を補給します。
+        world.send_event(NextPhaseCommand);
+        schedule.run(&mut world);
+        world.send_event(NextPhaseCommand);
+        schedule.run(&mut world);
+
+        assert_eq!(world.get::<Health>(cargo).unwrap().current, 100);
+        assert_eq!(world.get::<Fuel>(cargo).unwrap().current, 50);
     }
 }

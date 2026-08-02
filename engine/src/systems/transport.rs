@@ -2,6 +2,7 @@ use crate::components::*;
 use crate::events::*;
 use crate::resources::*;
 use bevy_ecs::prelude::*;
+use std::collections::HashSet;
 
 /// 輸送ユニットが現在地の地形から積載ユニットを降ろせるかを判定します。
 pub fn can_unload_from_terrain(
@@ -412,38 +413,45 @@ pub fn unload_unit_system(
     }
 }
 
-/// 輸送ユニットのHPが減少した際、搭載されているユニットのHPを輸送ユニットのHP以下に同期させます。
-/// (cargo_hp = min(cargo_hp, transport_hp))
+/// 輸送ユニットが新たに被弾した際、搭載ユニットのHPを輸送ユニットのHP以下に同期させます。
+///
+/// 平時に常時同期すると、損傷した空母によるターン開始時の修理まで取り消してしまうため、
+/// 攻撃イベントでHP減少が確認できた輸送ユニットだけを対象にします。
 #[allow(clippy::type_complexity)]
 pub fn sync_cargo_health_system(
+    mut attacked_events: EventReader<UnitAttackedEvent>,
     mut set: ParamSet<(
-        Query<(&Transporting, Entity)>,
-        Query<&mut Health>,
-        Query<&Health>,
+        Query<(Entity, &Health, &CargoCapacity)>,
+        Query<(&Transporting, &mut Health)>,
     )>,
 ) {
-    let mut updates = Vec::new();
-
-    // 1. 更新が必要な積載ユニットを特定
-    {
-        let links: Vec<(Entity, Entity)> = set.p0().iter().map(|(t, c)| (c, t.0)).collect();
-        let q_health = set.p2();
-
-        for (cargo_ent, transport_ent) in links {
-            if let Ok(c_hp) = q_health.get(cargo_ent)
-                && let Ok(t_hp) = q_health.get(transport_ent)
-                && c_hp.current > t_hp.current
-            {
-                updates.push((cargo_ent, t_hp.current));
-            }
+    let mut damaged_transports = HashSet::new();
+    for event in attacked_events.read() {
+        if event.defender_hp_after < event.defender_hp_before {
+            damaged_transports.insert(event.defender);
+        }
+        if event.attacker_hp_after < event.attacker_hp_before {
+            damaged_transports.insert(event.attacker);
         }
     }
 
-    // 2. HPの更新を適用
-    let mut q_health_mut = set.p1();
-    for (ent, new_hp) in updates {
-        if let Ok(mut hp) = q_health_mut.get_mut(ent) {
-            hp.current = new_hp;
+    // 攻撃イベントを伴わない撃破でも、既存どおり搭載ユニットを撃破状態にします。
+    let updates: Vec<(Entity, u32, Vec<Entity>)> = set
+        .p0()
+        .iter()
+        .filter(|(entity, health, _)| damaged_transports.contains(entity) || health.is_destroyed())
+        .map(|(entity, health, cargo)| (entity, health.current, cargo.loaded.clone()))
+        .collect();
+
+    let mut cargo_query = set.p1();
+    for (transport, transport_hp, cargo_entities) in updates {
+        for cargo in cargo_entities {
+            if let Ok((transporting, mut cargo_hp)) = cargo_query.get_mut(cargo)
+                && transporting.0 == transport
+                && cargo_hp.current > transport_hp
+            {
+                cargo_hp.current = transport_hp;
+            }
         }
     }
 }
@@ -824,6 +832,7 @@ mod tests {
     #[test]
     fn test_cargo_health_sync_on_damage() {
         let mut world = World::new();
+        world.init_resource::<Events<UnitAttackedEvent>>();
 
         // 輸送ユニット (HP 100)
         let transport_entity = world
@@ -871,6 +880,16 @@ mod tests {
 
         // 1. 輸送ユニットにダメージ (HP 100 -> 60)
         world.get_mut::<Health>(transport_entity).unwrap().current = 60;
+        world.send_event(UnitAttackedEvent {
+            attacker: Entity::PLACEHOLDER,
+            defender: transport_entity,
+            damage_dealt: 40,
+            counter_damage_dealt: None,
+            attacker_hp_before: 100,
+            attacker_hp_after: 100,
+            defender_hp_before: 100,
+            defender_hp_after: 60,
+        });
         schedule.run(&mut world);
 
         // cargo1 は 60 になるはず
@@ -885,6 +904,42 @@ mod tests {
         // 両方 0 になるはず
         assert_eq!(world.get::<Health>(cargo1_entity).unwrap().current, 0);
         assert_eq!(world.get::<Health>(cargo2_entity).unwrap().current, 0);
+    }
+
+    #[test]
+    fn test_cargo_health_is_not_clamped_without_new_transport_damage() {
+        let mut world = World::new();
+        world.init_resource::<Events<UnitAttackedEvent>>();
+
+        let transport = world
+            .spawn((
+                Health {
+                    current: 40,
+                    max: 100,
+                },
+                CargoCapacity {
+                    max: 1,
+                    loaded: vec![],
+                },
+            ))
+            .id();
+        let cargo = world
+            .spawn((
+                Health {
+                    current: 60,
+                    max: 100,
+                },
+                Transporting(transport),
+            ))
+            .id();
+        world.get_mut::<CargoCapacity>(transport).unwrap().loaded = vec![cargo];
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(sync_cargo_health_system);
+        schedule.run(&mut world);
+
+        // 損傷済み空母がサービスした搭載機のHPは、新たな被弾があるまで維持します。
+        assert_eq!(world.get::<Health>(cargo).unwrap().current, 60);
     }
 
     #[test]
