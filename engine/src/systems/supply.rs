@@ -37,7 +37,7 @@ fn is_valid_supply_target(
     target: Entity,
     target_position: GridPosition,
     target_faction: PlayerId,
-    target_stats: &UnitStats,
+    target_unit_type: UnitType,
     target_health: Health,
     target_action_completed: bool,
     target_is_transporting: bool,
@@ -48,7 +48,7 @@ fn is_valid_supply_target(
         && !target_health.is_destroyed()
         && !target_action_completed
         && !target_is_transporting
-        && is_suppliable_unit_type(target_stats.unit_type)
+        && is_suppliable_unit_type(target_unit_type)
         && topology.distance(
             (supplier_position.x, supplier_position.y),
             (target_position.x, target_position.y),
@@ -145,7 +145,7 @@ pub fn get_suppliable_targets_at(
             target,
             *target_position,
             target_faction.0,
-            target_stats,
+            target_stats.unit_type,
             *target_health,
             target_action.0,
             transporting.is_some(),
@@ -191,7 +191,7 @@ pub fn supply_unit_system(
         let (
             supplier_position,
             supplier_faction,
-            supplier_stats,
+            supplier_can_supply,
             supplier_health,
             supplier_action,
             supplier_is_transporting,
@@ -199,7 +199,7 @@ pub fn supply_unit_system(
             Ok((_, position, faction, stats, health, action, _, _, transporting)) => (
                 *position,
                 faction.0,
-                stats.clone(),
+                stats.can_supply,
                 *health,
                 action.0,
                 transporting.is_some(),
@@ -210,7 +210,7 @@ pub fn supply_unit_system(
         if supplier_faction != active_player_id
             || supplier_action
             || supplier_health.is_destroyed()
-            || !supplier_stats.can_supply
+            || !supplier_can_supply
             || supplier_is_transporting
         {
             continue;
@@ -219,7 +219,7 @@ pub fn supply_unit_system(
         let (
             target_position,
             target_faction,
-            target_stats,
+            target_unit_type,
             target_health,
             target_action,
             target_is_transporting,
@@ -227,7 +227,7 @@ pub fn supply_unit_system(
             Ok((_, position, faction, stats, health, action, _, _, transporting)) => (
                 *position,
                 faction.0,
-                stats.clone(),
+                stats.unit_type,
                 *health,
                 action.0,
                 transporting.is_some(),
@@ -242,7 +242,7 @@ pub fn supply_unit_system(
             event.target_entity,
             target_position,
             target_faction,
-            &target_stats,
+            target_unit_type,
             target_health,
             target_action,
             target_is_transporting,
