@@ -1,11 +1,11 @@
 ---
 title: "PLAYBOOK"
-version: "1.13.0"
+version: "1.14.0"
 status: "approved"
 created: "2026-06-06"
 updated: "2026-08-02"
 owner: "@t_kak"
-ace_entry_count: 31
+ace_entry_count: 33
 tags: [ace, playbook, knowledge-management]
 references:
   - docs/ACE_FRAMEWORK.md
@@ -767,6 +767,44 @@ Playbook が 800 行を超えた場合、以下のように分割する：
 **Context**: PR #92 のコードレビューにて、空母搭載ユニットの部分修理における費用計算ロジック（残資金で購入可能な最大内部HPの算出）で、ループによる段階的算出から O(1) の代数的算術計算式への最適化が提案・導入された。その際、ゼロコスト（単価0）や無効なユニット単価の事前バリデーションを適用する重要性が確認された。
 
 **Action**: 資金や容量を分配する計算処理では、ループによる段階的加算ではなく `repaired_hp = Math.min(max_affordable, needed_hp)` のような O(1) 算術計算式を用い、計算前にゼロ割や境界値チェックのバリデーションを完了させておく。
+
+<a id="ace-93-1"></a>
+
+### ACE-93-1: 候補取得とアクション実行で共有する判定関数による不整合防止と安全拒否
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | architecture |
+| Origin     | PR #93 |
+| Date       | 2026-08-02 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: アクションの「対象候補取得（例：`get_suppliable_targets`）」と「コマンド実行バリデーション（例：`submit_supply_command`）」で異なる判定条件を使うと UI 表示とエンジン状態の不整合を生む。共通の predicate 関数を engine 内で共有し、不正コマンド送信時は安全に no-op 処理することで高い整合性と堅牢性を確保できる。
+
+**Context**: PR #93 にて補給輸送車の単体補給機能を実装した際、未行動・生存中・非搭載の自軍地上ユニットおよび軽戦闘機という補給対象条件の判定ロジックを `engine` 内の共通関数へ集約した。これにより UI の対象選択候補とコマンド実行時の適用結果が常に一致し、万一の不正コマンド入力も safe reject (no-op) でパニックを防ぐ構成とした。
+
+**Action**: 対象選択を伴うコマンド（攻撃、補給、搭載等）を新設する際は、候補列挙 API と実行時バリデーションの両方から参照される共通の判定関数（predicate）を engine レイヤーに実装する。また、不正入力や競合入力に対してはエンジン側で安全に拒否（no-op 処理）する安全境界を設ける。
+
+<a id="ace-93-2"></a>
+
+### ACE-93-2: vi.hoisted と vi.mock を用いた Web Worker / WASM ブリッジ層のモックテスト
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | testing |
+| Origin     | PR #93 |
+| Date       | 2026-08-02 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: WebAssembly や Web Worker を統合したフロントエンドのブリッジ層（`EngineWorker` 等）をテストする際、`vi.hoisted` とモッククラスで WASM エンジンの内部 API をシミュレートすることで、実際の WASM バイナリや Worker 環境に依存せず API 呼び出しとデータ変換のテストを高速かつ安定して実施できる。
+
+**Context**: PR #93 において `engineWorker.ts` に補給 API を追加する際、Vitest の `vi.hoisted` を利用して WASM Engine インスタンスのモックメソッドと `WasmEngine` モッククラスを宣言し、`engineWorker.test.ts` にて WASM モジュールへのパラメータ伝達やレスポンス JSON のパース動作を完全に検証した。
+
+**Action**: Worker や WASM モジュールと通信するブリッジ層のテストを構築する場合は、`vi.hoisted` でモック関数群を事前定義し、`vi.mock` を用いて疑似モジュールとして注入することで、ブラウザ特有のバイナリロードやインスタンス化の依存を切り離してブリッジロジックを分離テストする。
 
 ## Changelog
 
