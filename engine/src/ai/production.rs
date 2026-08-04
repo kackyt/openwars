@@ -1,10 +1,16 @@
-use crate::ai::demand::candidate_air_coverage;
+use crate::ai::demand::{
+    AirCoverageContribution, AirDefenseAssessment, CombatCapabilitySnapshot,
+    air_coverage_with_timing, candidate_air_coverage, candidate_air_coverage_with_delay,
+    candidate_air_coverage_with_timing,
+};
 use crate::ai::island_campaign::{IslandCampaignShortfall, campaign_unit_type_rank};
 use crate::ai::strategy::{
     EmergencyAntiAirReservation, ProductionPlan, ProductionStrategy, analyze_strategy_for_turn,
     sea_transport_capacity_from_slots,
 };
-use crate::components::{Faction, GridPosition, PlayerId, Property, UnitStats};
+use crate::components::{
+    ActionCompleted, Ammo, Faction, Fuel, GridPosition, Health, PlayerId, Property, UnitStats,
+};
 use crate::events::ProduceUnitCommand;
 use crate::resources::master_data::MasterDataRegistry;
 use crate::resources::{DamageChart, MovementType, Players, Terrain, UnitRegistry, UnitType};
@@ -44,9 +50,202 @@ struct EmergencyAntiAirCandidate {
     unit_type: UnitType,
     cost: u32,
     coverage: f32,
+    protected_asset_value: f32,
     meets_deadline: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct AirResponseEconomics {
+    coverage_value: f32,
+    protected_asset_value: f32,
+}
+
+const AIR_DEFENSE_VALUE_PREMIUM: f32 = 1.25;
+const AIR_CONTAINMENT_GRACE_TURNS: u32 = 2;
+
+/// 候補1体が減らせる脅威割合を、HP補正済みの敵航空資産価値へ換算します。
+fn air_response_economics(
+    assessment: &AirDefenseAssessment,
+    contribution: &AirCoverageContribution,
+) -> AirResponseEconomics {
+    let protected_asset_value = contribution
+        .by_target
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, added)| {
+            let remaining_threat = assessment.remaining_threat_value(index);
+            if remaining_threat <= AirDefenseAssessment::COVERAGE_EPSILON {
+                return 0.0;
+            }
+            let protected_fraction = (added / remaining_threat).clamp(0.0, 1.0);
+            assessment.remaining_air_asset_value(index) * protected_fraction
+        })
+        .sum();
+    AirResponseEconomics {
+        coverage_value: contribution.total,
+        protected_asset_value,
+    }
+}
+
+fn is_economically_justified_air_response(cost: u32, economics: AirResponseEconomics) -> bool {
+    economics.coverage_value + AirDefenseAssessment::COVERAGE_EPSILON >= cost as f32
+        && cost as f32
+            <= economics.protected_asset_value * AIR_DEFENSE_VALUE_PREMIUM
+                + AirDefenseAssessment::COVERAGE_EPSILON
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_air_containment_assessment(
+    strategy: &ProductionStrategy,
+    existing_units: &[CombatCapabilitySnapshot],
+    master_data: &MasterDataRegistry,
+    map: &crate::resources::Map,
+    unit_positions: &std::collections::HashMap<
+        (usize, usize),
+        crate::systems::movement::OccupantInfo,
+    >,
+    damage_chart: &DamageChart,
+) -> AirDefenseAssessment {
+    let mut containment = strategy.air_defense.uncovered_emergency_targets_only();
+    let capable_units = existing_units
+        .iter()
+        .copied()
+        .filter(|unit| {
+            containment.targets.iter().any(|target| {
+                damage_chart
+                    .get_base_damage(unit.unit_type, target.unit_type)
+                    .unwrap_or(0)
+                    .max(
+                        damage_chart
+                            .get_base_damage_secondary(unit.unit_type, target.unit_type)
+                            .unwrap_or(0),
+                    )
+                    > 0
+            })
+        })
+        .collect::<Vec<_>>();
+    let contribution = air_coverage_with_timing(
+        &capable_units,
+        &containment,
+        map,
+        master_data,
+        unit_positions,
+        damage_chart,
+        AIR_CONTAINMENT_GRACE_TURNS,
+    );
+    containment.apply_coverage(&contribution);
+    containment
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_emergency_anti_air_candidate_with_existing(
+    facilities: &[(GridPosition, Terrain)],
+    available_types: &[(UnitType, UnitStats)],
+    existing_units: &[CombatCapabilitySnapshot],
+    player_id: PlayerId,
+    strategy: &ProductionStrategy,
+    master_data: &MasterDataRegistry,
+    map: &crate::resources::Map,
+    unit_positions: &std::collections::HashMap<
+        (usize, usize),
+        crate::systems::movement::OccupantInfo,
+    >,
+    damage_chart: &DamageChart,
+    current_funds: u32,
+) -> Option<EmergencyAntiAirCandidate> {
+    let emergency_assessment = strategy.air_defense.emergency_targets_only();
+    let containment_assessment = build_air_containment_assessment(
+        strategy,
+        existing_units,
+        master_data,
+        map,
+        unit_positions,
+        damage_chart,
+    );
+    let mut candidates = Vec::new();
+    for (facility_position, terrain) in facilities {
+        for (unit_type, stats) in available_types {
+            if stats.cost == 0 || !master_data.can_produce_unit(terrain.as_str(), *unit_type) {
+                continue;
+            }
+            let strict_coverage = candidate_air_coverage(
+                stats,
+                *facility_position,
+                player_id,
+                &emergency_assessment,
+                map,
+                master_data,
+                unit_positions,
+                damage_chart,
+            );
+            let containment_coverage = candidate_air_coverage_with_timing(
+                stats,
+                *facility_position,
+                player_id,
+                &containment_assessment,
+                map,
+                master_data,
+                unit_positions,
+                damage_chart,
+                1,
+                AIR_CONTAINMENT_GRACE_TURNS,
+            );
+            // 期限内射撃を最優先しつつ、期限後2ターン以内に封じ込められる対処は
+            // 敵航空資産価値に見合う1回限りの戦略対応として許可する。
+            let economics = air_response_economics(&containment_assessment, &containment_coverage);
+            if containment_coverage.total > AirDefenseAssessment::COVERAGE_EPSILON
+                && is_economically_justified_air_response(stats.cost, economics)
+            {
+                candidates.push(EmergencyAntiAirCandidate {
+                    facility_position: *facility_position,
+                    unit_type: *unit_type,
+                    cost: stats.cost,
+                    coverage: containment_coverage.total,
+                    protected_asset_value: economics.protected_asset_value,
+                    meets_deadline: strict_coverage.total > AirDefenseAssessment::COVERAGE_EPSILON,
+                });
+            }
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        let left_affordable = left.cost <= current_funds;
+        let right_affordable = right.cost <= current_funds;
+        right_affordable
+            .cmp(&left_affordable)
+            .then_with(|| {
+                if !left_affordable && !right_affordable {
+                    // 購入不能候補は、貯金期間を短くするため最安を優先する。
+                    left.cost
+                        .cmp(&right.cost)
+                        .then_with(|| right.meets_deadline.cmp(&left.meets_deadline))
+                        .then_with(|| {
+                            right
+                                .protected_asset_value
+                                .total_cmp(&left.protected_asset_value)
+                        })
+                } else {
+                    right
+                        .meets_deadline
+                        .cmp(&left.meets_deadline)
+                        .then_with(|| {
+                            right
+                                .protected_asset_value
+                                .total_cmp(&left.protected_asset_value)
+                        })
+                        .then_with(|| right.coverage.total_cmp(&left.coverage))
+                        .then_with(|| left.cost.cmp(&right.cost))
+                }
+            })
+            .then_with(|| left.facility_position.y.cmp(&right.facility_position.y))
+            .then_with(|| left.facility_position.x.cmp(&right.facility_position.x))
+            .then_with(|| left.unit_type.as_str().cmp(right.unit_type.as_str()))
+    });
+    candidates.into_iter().next()
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn select_emergency_anti_air_candidate(
     facilities: &[(GridPosition, Terrain)],
@@ -62,105 +261,18 @@ fn select_emergency_anti_air_candidate(
     damage_chart: &DamageChart,
     current_funds: u32,
 ) -> Option<EmergencyAntiAirCandidate> {
-    let emergency_assessment = strategy.air_defense.emergency_targets_only();
-    let mut candidates = Vec::new();
-    for (facility_position, terrain) in facilities {
-        for (unit_type, stats) in available_types {
-            if stats.cost == 0 || !master_data.can_produce_unit(terrain.as_str(), *unit_type) {
-                continue;
-            }
-            let coverage = candidate_air_coverage(
-                stats,
-                *facility_position,
-                player_id,
-                &emergency_assessment,
-                map,
-                master_data,
-                unit_positions,
-                damage_chart,
-            );
-            // 緊急ゲートを発生させている未カバー航空機へ届く分だけを候補比較に使う。
-            let emergency_coverage = coverage
-                .by_target
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| {
-                    strategy
-                        .air_defense
-                        .coverage_by_target
-                        .get(*index)
-                        .copied()
-                        .unwrap_or(0.0)
-                        <= 0.001
-                })
-                .map(|(_, added)| *added)
-                .sum::<f32>();
-            let fallback_damage = strategy
-                .air_defense
-                .targets
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| {
-                    strategy
-                        .air_defense
-                        .coverage_by_target
-                        .get(*index)
-                        .copied()
-                        .unwrap_or(0.0)
-                        <= 0.001
-                })
-                .map(|(_, target)| {
-                    damage_chart
-                        .get_base_damage(*unit_type, target.unit_type)
-                        .unwrap_or(0)
-                        .max(
-                            damage_chart
-                                .get_base_damage_secondary(*unit_type, target.unit_type)
-                                .unwrap_or(0),
-                        )
-                })
-                .sum::<u32>() as f32;
-            if emergency_coverage > 0.001 || fallback_damage > 0.0 {
-                candidates.push(EmergencyAntiAirCandidate {
-                    facility_position: *facility_position,
-                    unit_type: *unit_type,
-                    cost: stats.cost,
-                    coverage: if emergency_coverage > 0.001 {
-                        emergency_coverage
-                    } else {
-                        fallback_damage
-                    },
-                    meets_deadline: emergency_coverage > 0.001,
-                });
-            }
-        }
-    }
-
-    candidates.sort_by(|left, right| {
-        let left_affordable = left.cost <= current_funds;
-        let right_affordable = right.cost <= current_funds;
-        right_affordable
-            .cmp(&left_affordable)
-            .then_with(|| {
-                if !left_affordable && !right_affordable {
-                    // 今ターン購入不能なら、最短で緊急ゲートを解消できる最安候補へ貯金する。
-                    left.cost
-                        .cmp(&right.cost)
-                        .then_with(|| right.meets_deadline.cmp(&left.meets_deadline))
-                        .then_with(|| right.coverage.total_cmp(&left.coverage))
-                } else {
-                    right
-                        .meets_deadline
-                        .cmp(&left.meets_deadline)
-                        .then_with(|| right.coverage.total_cmp(&left.coverage))
-                        .then_with(|| left.cost.cmp(&right.cost))
-                }
-            })
-            .then_with(|| left.facility_position.y.cmp(&right.facility_position.y))
-            .then_with(|| left.facility_position.x.cmp(&right.facility_position.x))
-            .then_with(|| left.unit_type.as_str().cmp(right.unit_type.as_str()))
-    });
-    candidates.into_iter().next()
+    select_emergency_anti_air_candidate_with_existing(
+        facilities,
+        available_types,
+        &[],
+        player_id,
+        strategy,
+        master_data,
+        map,
+        unit_positions,
+        damage_chart,
+        current_funds,
+    )
 }
 
 fn compare_production_candidates(
@@ -415,6 +527,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
     let mut unit_positions = std::collections::HashMap::new();
     let mut enemy_units = Vec::new();
     let mut my_units = Vec::new();
+    let mut my_capability_units = Vec::new();
     let mut my_empty_transports = Vec::new();
 
     {
@@ -423,10 +536,26 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
             &GridPosition,
             &Faction,
             &UnitStats,
+            Option<&Health>,
+            Option<&Ammo>,
+            Option<&Fuel>,
+            Option<&ActionCompleted>,
             Option<&crate::components::CargoCapacity>,
             Option<&crate::components::Transporting>,
         )>();
-        for (_entity, pos, faction, stats, cargo_opt, transporting_opt) in q_units.iter(world) {
+        for (
+            _entity,
+            pos,
+            faction,
+            stats,
+            health,
+            ammo,
+            fuel,
+            action_completed,
+            cargo_opt,
+            transporting_opt,
+        ) in q_units.iter(world)
+        {
             if transporting_opt.is_some() {
                 continue;
             }
@@ -445,6 +574,23 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
             );
             if faction.0 == player_id {
                 my_units.push((*pos, stats.clone()));
+                my_capability_units.push(CombatCapabilitySnapshot {
+                    faction: faction.0,
+                    position: *pos,
+                    unit_type: stats.unit_type,
+                    movement_type: stats.movement_type,
+                    hp: health.map_or(100, |health| health.current),
+                    cost: stats.cost,
+                    max_movement: stats.max_movement,
+                    min_range: stats.min_range,
+                    max_range: stats.max_range,
+                    ammo1: ammo.map_or(stats.max_ammo1, |ammo| ammo.ammo1),
+                    max_ammo1: stats.max_ammo1,
+                    ammo2: ammo.map_or(stats.max_ammo2, |ammo| ammo.ammo2),
+                    max_ammo2: stats.max_ammo2,
+                    fuel: fuel.map_or(stats.max_fuel, |fuel| fuel.current),
+                    action_delay: u32::from(action_completed.is_none_or(|completed| completed.0)),
+                });
                 if let Some(cargo) = cargo_opt
                     && cargo.loaded.is_empty()
                     && stats.max_cargo > 0
@@ -460,6 +606,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
     let mut capital_pos = None;
     let mut my_facilities = Vec::new();
     let mut producible_types = std::collections::HashSet::new();
+    let mut income_per_turn = 0u32;
 
     // 生産範囲判定に使うマップのトポロジー（スクエア/ヘックス）
     let topology = world
@@ -477,8 +624,12 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
             }
         }
 
-        // 生産施設を収集し、生産可能なユニットタイプを特定
+        // 生産施設を収集し、生産可能なユニットタイプと次ターン収入を特定
         for (pos, prop) in q_props.iter(world) {
+            if prop.owner_id == Some(player_id) {
+                income_per_turn = income_per_turn
+                    .saturating_add(master_data.landscape_income(prop.terrain.as_str()));
+            }
             if prop.owner_id == Some(player_id)
                 && master_data.is_production_facility(prop.terrain.as_str())
                 && !occupied_positions.contains(pos)
@@ -522,9 +673,10 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
     }
 
     let emergency_candidate = if is_v3 && strategy.air_defense.requires_emergency_production() {
-        select_emergency_anti_air_candidate(
+        select_emergency_anti_air_candidate_with_existing(
             &my_facilities,
             &available_types,
+            &my_capability_units,
             player_id,
             &strategy,
             &master_data,
@@ -547,17 +699,46 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                 unit_type: candidate.unit_type,
             }];
         }
-        // 通常の構成比・キャンペーン予約を壊さず、緊急対空だけを独立して記録する。
-        plan.emergency_anti_air_reservations.insert(
-            player_id.0,
-            EmergencyAntiAirReservation {
-                unit_type: candidate.unit_type,
-                cost: candidate.cost,
-            },
-        );
-        return commands;
+        let turns_to_afford = if income_per_turn == 0 {
+            None
+        } else {
+            let deficit = candidate.cost.saturating_sub(current_funds);
+            Some(deficit.div_ceil(income_per_turn))
+        };
+        let remains_effective = turns_to_afford.is_some_and(|wait_turns| {
+            let Some(stats) = unit_registry.0.get(&candidate.unit_type) else {
+                return false;
+            };
+            let future_coverage = candidate_air_coverage_with_delay(
+                stats,
+                candidate.facility_position,
+                player_id,
+                &strategy.air_defense.emergency_targets_only(),
+                &map,
+                &master_data,
+                &unit_positions,
+                &damage_chart,
+                1u32.saturating_add(wait_turns),
+            );
+            future_coverage.total > AirDefenseAssessment::COVERAGE_EPSILON
+                && is_economically_justified_air_response(
+                    candidate.cost,
+                    air_response_economics(&strategy.air_defense, &future_coverage),
+                )
+        });
+        if remains_effective {
+            // 購入できる時点でも期限内に有効な場合だけ、通常計画と独立して貯金する。
+            plan.emergency_anti_air_reservations.insert(
+                player_id.0,
+                EmergencyAntiAirReservation {
+                    unit_type: candidate.unit_type,
+                    cost: candidate.cost,
+                },
+            );
+            return commands;
+        }
     }
-    // 航空脅威または有効候補が消えたら、緊急対空予約だけを解除する。
+    // 航空脅威または購入時点で有効な候補が消えたら、緊急対空予約だけを解除する。
     plan.emergency_anti_air_reservations.remove(&player_id.0);
 
     if strategy.phase == GamePhase::Defense || (is_v3 && !strategy.campaign_shortfalls.is_empty()) {
@@ -853,15 +1034,36 @@ fn engagement_factor(attacker: &UnitStats, defender: &UnitStats) -> f32 {
 ///   受ける価値 = dmg(e→U) × cost_U × 交戦成立率(e,U)
 /// の差を取り、敵軍の平均を返す。敵の主力構成に対して効率よく価値を刈り取れる
 /// ユニット (例: ロケラン主体の敵にはそれをアウトレンジする自走砲) が高評価になる。
-pub(crate) fn counter_efficiency_score(
+#[derive(Debug, Clone, Copy, Default)]
+struct CounterEfficiencyComponents {
+    non_air_net: i64,
+    air_net: i64,
+    non_air_count: u32,
+    air_count: u32,
+}
+
+impl CounterEfficiencyComponents {
+    fn score_with_air_shortage(self, air_shortage: f32) -> i32 {
+        let air_weight = air_shortage.clamp(0.0, 1.0);
+        let active_count = if air_weight <= f32::EPSILON {
+            self.non_air_count
+        } else {
+            self.non_air_count + self.air_count
+        };
+        if active_count == 0 {
+            return 0;
+        }
+        let weighted_air = self.air_net as f32 * air_weight;
+        ((self.non_air_net as f32 + weighted_air) / active_count as f32) as i32
+    }
+}
+
+fn counter_efficiency_components(
     unit_stats: &UnitStats,
     enemy_units: &[(GridPosition, UnitStats)],
     damage_chart: &DamageChart,
-) -> i32 {
-    if enemy_units.is_empty() {
-        return 0;
-    }
-    let mut total_net = 0i64;
+) -> CounterEfficiencyComponents {
+    let mut components = CounterEfficiencyComponents::default();
     for (_, e_stats) in enemy_units {
         // 与える価値 (主武器・副武器の高い方)
         let dmg_out = damage_chart
@@ -885,9 +1087,26 @@ pub(crate) fn counter_efficiency_score(
             dmg_out as f32 * e_stats.cost as f32 / 100.0 * engagement_factor(unit_stats, e_stats);
         let value_in =
             dmg_in as f32 * unit_stats.cost as f32 / 100.0 * engagement_factor(e_stats, unit_stats);
-        total_net += (value_out - value_in) as i64;
+        let net = (value_out - value_in) as i64;
+        if e_stats.movement_type == MovementType::Air {
+            components.air_net += net;
+            components.air_count += 1;
+        } else {
+            components.non_air_net += net;
+            components.non_air_count += 1;
+        }
     }
-    (total_net / enemy_units.len() as i64) as i32
+    components
+}
+
+#[cfg(test)]
+pub(crate) fn counter_efficiency_score(
+    unit_stats: &UnitStats,
+    enemy_units: &[(GridPosition, UnitStats)],
+    damage_chart: &DamageChart,
+) -> i32 {
+    counter_efficiency_components(unit_stats, enemy_units, damage_chart)
+        .score_with_air_shortage(1.0)
 }
 
 /// 指定した地点で特定のユニットを生産した場合の期待スコアを算出します。
@@ -1200,13 +1419,37 @@ pub fn calculate_unit_score_at(
         }
     }
 
+    let air_response_economics = if is_v3 && !strategy.air_defense.targets.is_empty() {
+        let air_coverage = candidate_air_coverage(
+            stats,
+            pos,
+            player_id,
+            &strategy.air_defense,
+            map,
+            master_data,
+            unit_positions,
+            damage_chart,
+        );
+        Some(air_response_economics(&strategy.air_defense, &air_coverage))
+    } else {
+        None
+    };
+    let air_response_is_justified = air_response_economics
+        .is_some_and(|economics| is_economically_justified_air_response(stats.cost, economics));
+
     // 3. アンチ性能ボーナス
     if is_v3 {
         // #53/#55 (V3): 対編成カウンター効率。敵軍の実構成に対する価値交換の
         // 期待値 (射程・機動の相性込み) で生産を適応させる。
         // 敵がロケラン主体ならそれをアウトレンジする自走砲、航空主体なら対空、
         // のように敵の主力へのカウンターが自動的に浮上する
-        let counter = counter_efficiency_score(stats, enemy_units, damage_chart);
+        let air_shortage = if air_response_is_justified {
+            strategy.air_defense.shortage_ratio
+        } else {
+            0.0
+        };
+        let counter = counter_efficiency_components(stats, enemy_units, damage_chart)
+            .score_with_air_shortage(air_shortage);
         let mut scaled = (counter * 3).clamp(-4000, 8000);
         // 拡張期 (未交戦) はカウンター生産よりも経済 (歩兵・輸送) を優先する。
         // 敵が別の島にいて届かない段階でカウンターユニットを量産しても
@@ -1307,24 +1550,41 @@ pub fn calculate_unit_score_at(
     }
 
     // 5. DemandMatrixの対空不足を、候補が実際に追加できるカバレッジへ接続する。
-    if is_v3 && !strategy.air_defense.targets.is_empty() {
-        let air_coverage = candidate_air_coverage(
-            stats,
-            pos,
-            player_id,
-            &strategy.air_defense,
-            map,
-            master_data,
-            unit_positions,
-            damage_chart,
-        );
-        if strategy.air_defense.shortage_ratio > 0.0 {
-            let bonus = (air_coverage.total * strategy.air_defense.shortage_ratio * 0.25)
-                .min(6_000.0) as u32;
-            score = score.saturating_add(bonus);
-        } else if air_coverage.total > 0.0 {
-            // 十分な対空戦力を確保した後は、対空だけを連続生産しない。
-            score = score.saturating_sub(1_500);
+    if strategy.air_defense.shortage_ratio > 0.0
+        && air_response_is_justified
+        && let Some(economics) = air_response_economics
+    {
+        let bonus = (economics.protected_asset_value * strategy.air_defense.shortage_ratio * 0.5)
+            .min(6_000.0) as u32;
+        score = score.saturating_add(bonus);
+    }
+    // 十分なカバレッジ後は航空分のcounter効率と追加需要がともに0へ減衰する。
+    // 地上・海上への価値や通常構成比は残すため、多用途ユニットを一律禁止しない。
+
+    // 5.5. (V3) 盤面の敵編成へ一切ダメージを与えられない純戦闘ユニットは死に駒として除外する。
+    // 対空砲・地対空ミサイルは地上/艦船ユニットへ0ダメージのため、空港のないmap_1のように
+    // 敵航空戦力が存在しない盤面では戦闘価値が完全に0になる。
+    // それでも下の「コストが高いほど加点」ボーナス (cost/10) だけは残るため、
+    // 他候補のスコアが最低値へ潰れた局面で最も高価な対空ユニットが選ばれてしまっていた。
+    // 占領・輸送・補給といった非戦闘の役割も持たない場合に限り、最低スコアへ落として生産候補から外す。
+    if is_v3
+        && !enemy_units.is_empty()
+        && !stats.can_capture
+        && stats.max_cargo == 0
+        && !stats.can_supply
+    {
+        let can_damage_any_enemy = enemy_units.iter().any(|(_, e_stats)| {
+            damage_chart
+                .get_base_damage(unit_type, e_stats.unit_type)
+                .unwrap_or(0)
+                > 0
+                || damage_chart
+                    .get_base_damage_secondary(unit_type, e_stats.unit_type)
+                    .unwrap_or(0)
+                    > 0
+        });
+        if !can_damage_any_enemy {
+            return 1;
         }
     }
 
@@ -1385,6 +1645,30 @@ mod additional_tests {
             cost,
             max_cargo: 0,
             can_capture: unit_type == UnitType::Infantry,
+        }
+    }
+
+    fn completed_capability(
+        player_id: PlayerId,
+        position: GridPosition,
+        stats: &UnitStats,
+    ) -> CombatCapabilitySnapshot {
+        CombatCapabilitySnapshot {
+            faction: player_id,
+            position,
+            unit_type: stats.unit_type,
+            movement_type: stats.movement_type,
+            hp: 100,
+            cost: stats.cost,
+            max_movement: stats.max_movement,
+            min_range: stats.min_range,
+            max_range: stats.max_range,
+            ammo1: stats.max_ammo1,
+            max_ammo1: stats.max_ammo1,
+            ammo2: stats.max_ammo2,
+            max_ammo2: stats.max_ammo2,
+            fuel: stats.max_fuel,
+            action_delay: 1,
         }
     }
 
@@ -1459,6 +1743,268 @@ mod additional_tests {
     }
 
     #[test]
+    fn issue75_low_value_transport_does_not_justify_emergency_purchase() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let map = Map::new(4, 1, Terrain::Plains, GridTopology::Square);
+        let mut chart = DamageChart::new();
+        chart.insert_damage(UnitType::AntiAir, UnitType::TransportHelicopter, 65);
+        let strategy = ProductionStrategy {
+            air_defense: AirDefenseAssessment {
+                targets: vec![AirThreatTarget {
+                    position: GridPosition { x: 2, y: 0 },
+                    unit_type: UnitType::TransportHelicopter,
+                    hp: 100,
+                    cost: 4_000,
+                    attack_power: 100,
+                    deadline_turns: 2,
+                }],
+                coverage_by_target: vec![0.0],
+                required_coverage: 6_000.0,
+                current_coverage: 0.0,
+                shortage_ratio: 1.0,
+                has_effective_coverage: false,
+            },
+            ..ProductionStrategy::default()
+        };
+        let available_types = vec![(
+            UnitType::AntiAir,
+            UnitStats {
+                unit_type: UnitType::AntiAir,
+                cost: 5_500,
+                movement_type: MovementType::Tank,
+                max_movement: 5,
+                max_fuel: 99,
+                min_range: 1,
+                max_range: 1,
+                ..UnitStats::mock()
+            },
+        )];
+
+        let candidate = select_emergency_anti_air_candidate(
+            &[(GridPosition { x: 0, y: 0 }, Terrain::Factory)],
+            &available_types,
+            PlayerId(1),
+            &strategy,
+            &master_data,
+            &map,
+            &std::collections::HashMap::new(),
+            &chart,
+            20_000,
+        );
+
+        assert!(candidate.is_none());
+    }
+
+    #[test]
+    fn issue75_spawned_counter_prevents_repeated_bcopters_response() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let map = Map::new(5, 1, Terrain::Plains, GridTopology::Square);
+        let mut chart = DamageChart::new();
+        chart.insert_damage(UnitType::AntiAir, UnitType::Bcopters, 65);
+        let strategy = ProductionStrategy {
+            air_defense: AirDefenseAssessment {
+                targets: vec![AirThreatTarget {
+                    position: GridPosition { x: 3, y: 0 },
+                    unit_type: UnitType::Bcopters,
+                    hp: 100,
+                    cost: 7_500,
+                    attack_power: 100,
+                    deadline_turns: 1,
+                }],
+                coverage_by_target: vec![0.0],
+                required_coverage: 15_000.0,
+                current_coverage: 0.0,
+                shortage_ratio: 1.0,
+                has_effective_coverage: false,
+            },
+            ..ProductionStrategy::default()
+        };
+        let anti_air = UnitStats {
+            unit_type: UnitType::AntiAir,
+            cost: 5_500,
+            movement_type: MovementType::Tank,
+            max_movement: 5,
+            max_fuel: 99,
+            max_ammo1: 1,
+            min_range: 1,
+            max_range: 1,
+            ..UnitStats::mock()
+        };
+        let available_types = vec![(UnitType::AntiAir, anti_air.clone())];
+        let existing_units = vec![completed_capability(
+            PlayerId(1),
+            GridPosition { x: 0, y: 0 },
+            &anti_air,
+        )];
+
+        let candidate = select_emergency_anti_air_candidate_with_existing(
+            &[(GridPosition { x: 1, y: 0 }, Terrain::Factory)],
+            &available_types,
+            &existing_units,
+            PlayerId(1),
+            &strategy,
+            &master_data,
+            &map,
+            &std::collections::HashMap::new(),
+            &chart,
+            20_000,
+        );
+
+        assert!(candidate.is_none());
+
+        let mut depleted_units = existing_units;
+        depleted_units[0].ammo1 = 0;
+        assert!(
+            select_emergency_anti_air_candidate_with_existing(
+                &[(GridPosition { x: 1, y: 0 }, Terrain::Factory)],
+                &available_types,
+                &depleted_units,
+                PlayerId(1),
+                &strategy,
+                &master_data,
+                &map,
+                &std::collections::HashMap::new(),
+                &chart,
+                20_000,
+            )
+            .is_some(),
+            "弾切れ対空を満タン扱いして追加生産を抑止してはならない"
+        );
+    }
+
+    #[test]
+    fn issue75_bomber_response_stops_when_marginal_value_is_exhausted() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let map = Map::new(6, 1, Terrain::Plains, GridTopology::Square);
+        let mut chart = DamageChart::new();
+        chart.insert_damage(UnitType::AntiAir, UnitType::Bomber, 68);
+        let strategy = ProductionStrategy {
+            air_defense: AirDefenseAssessment {
+                targets: vec![AirThreatTarget {
+                    position: GridPosition { x: 4, y: 0 },
+                    unit_type: UnitType::Bomber,
+                    hp: 100,
+                    cost: 22_000,
+                    attack_power: 100,
+                    deadline_turns: 1,
+                }],
+                coverage_by_target: vec![0.0],
+                required_coverage: 44_000.0,
+                current_coverage: 0.0,
+                shortage_ratio: 1.0,
+                has_effective_coverage: false,
+            },
+            ..ProductionStrategy::default()
+        };
+        let anti_air = UnitStats {
+            unit_type: UnitType::AntiAir,
+            cost: 5_500,
+            movement_type: MovementType::Tank,
+            max_movement: 5,
+            max_fuel: 99,
+            max_ammo1: 1,
+            min_range: 1,
+            max_range: 1,
+            ..UnitStats::mock()
+        };
+        let available_types = vec![(UnitType::AntiAir, anti_air.clone())];
+        let one_counter = vec![completed_capability(
+            PlayerId(1),
+            GridPosition { x: 0, y: 0 },
+            &anti_air,
+        )];
+        let two_counters = vec![
+            completed_capability(PlayerId(1), GridPosition { x: 0, y: 0 }, &anti_air),
+            completed_capability(PlayerId(1), GridPosition { x: 1, y: 0 }, &anti_air),
+        ];
+        let facilities = [(GridPosition { x: 2, y: 0 }, Terrain::Factory)];
+
+        assert!(
+            select_emergency_anti_air_candidate_with_existing(
+                &facilities,
+                &available_types,
+                &one_counter,
+                PlayerId(1),
+                &strategy,
+                &master_data,
+                &map,
+                &std::collections::HashMap::new(),
+                &chart,
+                20_000,
+            )
+            .is_some()
+        );
+        assert!(
+            select_emergency_anti_air_candidate_with_existing(
+                &facilities,
+                &available_types,
+                &two_counters,
+                PlayerId(1),
+                &strategy,
+                &master_data,
+                &map,
+                &std::collections::HashMap::new(),
+                &chart,
+                20_000,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn issue75_deadline_invalid_counter_is_not_an_emergency_purchase() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let map = Map::new(6, 1, Terrain::Plains, GridTopology::Square);
+        let mut chart = DamageChart::new();
+        chart.insert_damage(UnitType::AntiAir, UnitType::Bomber, 100);
+        let strategy = ProductionStrategy {
+            air_defense: AirDefenseAssessment {
+                targets: vec![AirThreatTarget {
+                    position: GridPosition { x: 5, y: 0 },
+                    unit_type: UnitType::Bomber,
+                    hp: 100,
+                    cost: 20_000,
+                    attack_power: 100,
+                    deadline_turns: 1,
+                }],
+                coverage_by_target: vec![0.0],
+                required_coverage: 40_000.0,
+                current_coverage: 0.0,
+                shortage_ratio: 1.0,
+                has_effective_coverage: false,
+            },
+            ..ProductionStrategy::default()
+        };
+        let available_types = vec![(
+            UnitType::AntiAir,
+            UnitStats {
+                unit_type: UnitType::AntiAir,
+                cost: 5_500,
+                movement_type: MovementType::Tank,
+                max_movement: 1,
+                max_fuel: 99,
+                min_range: 1,
+                max_range: 1,
+                ..UnitStats::mock()
+            },
+        )];
+
+        let candidate = select_emergency_anti_air_candidate(
+            &[(GridPosition { x: 0, y: 0 }, Terrain::Factory)],
+            &available_types,
+            PlayerId(1),
+            &strategy,
+            &master_data,
+            &map,
+            &std::collections::HashMap::new(),
+            &chart,
+            20_000,
+        );
+
+        assert!(candidate.is_none());
+    }
+
+    #[test]
     fn issue75_emergency_candidate_targets_zero_coverage_aircraft() {
         let master_data = MasterDataRegistry::load().unwrap();
         let map = Map::new(6, 1, Terrain::Plains, GridTopology::Square);
@@ -1521,8 +2067,8 @@ mod additional_tests {
         )
         .unwrap();
 
-        assert!(candidate.meets_deadline);
         assert_eq!(candidate.coverage, 30_000.0);
+        assert_eq!(candidate.protected_asset_value, 20_000.0);
     }
 
     #[test]
@@ -1577,9 +2123,9 @@ mod additional_tests {
     }
 
     #[test]
-    fn issue75_unaffordable_air_defense_reserves_funds_without_other_production() {
+    fn issue75_unaffordable_immediate_threat_does_not_create_stale_reservation() {
         let master_data = MasterDataRegistry::load().unwrap();
-        let (mut world, _) =
+        let (mut world, mut schedule) =
             crate::setup::initialize_world_from_master_data(&master_data, "map_1").unwrap();
         let player_id = PlayerId(1);
         let bomber = world
@@ -1685,22 +2231,16 @@ mod additional_tests {
         .expect("生産可能な有効対空候補が必要");
 
         let commands = decide_production(&mut world, player_id);
-        assert!(
-            commands.is_empty(),
-            "購入不能時は他生産を止めて貯金する必要がある: {:?}",
-            commands
-        );
+        assert!(commands.is_empty());
         {
             let plan = world.resource::<ProductionPlan>();
-            let emergency = plan
-                .emergency_anti_air_reservations
-                .get(&player_id.0)
-                .expect("緊急対空予約が必要");
-
-            assert!(commands.is_empty());
-            assert_eq!(emergency.unit_type, candidate.unit_type);
-            assert_eq!(emergency.cost, candidate.cost);
-            assert_eq!(plan.reserves.get(&player_id.0), Some(&3_000));
+            assert!(
+                !plan
+                    .emergency_anti_air_reservations
+                    .contains_key(&player_id.0),
+                "購入待ち中に期限を超える対空候補を予約してはならない"
+            );
+            assert_eq!(plan.reserves.get(&player_id.0), Some(&0));
             assert_eq!(
                 plan.reservations.get(&player_id.0),
                 Some(&vec![UnitType::Infantry])
@@ -1721,6 +2261,18 @@ mod additional_tests {
                 .resource::<ProductionPlan>()
                 .emergency_anti_air_reservations
                 .contains_key(&player_id.0)
+        );
+
+        world.send_event(affordable_commands[0].clone());
+        schedule.run(&mut world);
+        let follow_up = decide_production(&mut world, player_id);
+        assert!(
+            follow_up.iter().all(|command| !matches!(
+                command.unit_type,
+                UnitType::AntiAir | UnitType::Missiles
+            )),
+            "生産済み対空を封じ込め投資として数え、同じ脅威へ連続投入しない: {:?}",
+            follow_up
         );
     }
 
@@ -1773,7 +2325,7 @@ mod additional_tests {
     }
 
     #[test]
-    fn issue75_map2_turn7_snapshot_produces_effective_counter() {
+    fn issue75_map2_turn7_snapshot_does_not_buy_unreachable_ground_counter() {
         #[derive(Clone, Copy)]
         struct SnapshotUnit {
             player: u32,
@@ -2074,12 +2626,96 @@ mod additional_tests {
 
         assert!(!commands.is_empty());
         assert!(
-            matches!(
-                commands[0].unit_type,
+            commands.iter().all(|command| !matches!(
+                command.unit_type,
                 UnitType::AntiAir | UnitType::Missiles
-            ),
-            "最初の対空応答は対空戦車または対空ミサイルである必要がある: {:?}",
+            )),
+            "期限内に島を越えられない地上対空へ投資してはならない: {:?}",
             commands
+        );
+        assert!(
+            !world
+                .resource::<ProductionPlan>()
+                .emergency_anti_air_reservations
+                .contains_key(&player_id.0),
+            "期限に間に合わない高価な対空候補へ貯金してはならない"
+        );
+    }
+
+    /// 敵航空戦力が存在しない盤面で、地上へ0ダメージの対空ユニットが
+    /// 「コストが高いほど加点」ボーナスだけで選ばれてしまう退行を防ぐ。
+    /// map_1 のように空港がないマップでは対空戦車は完全な死に駒になる。
+    fn no_air_threat_score(unit_type: UnitType, cost: u32, is_v3: bool) -> u32 {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let map = Map::new(6, 1, Terrain::Plains, GridTopology::Square);
+        let mut chart = DamageChart::new();
+        // 対空ユニットは航空機にしかダメージを与えられない
+        chart.insert_damage(UnitType::AntiAir, UnitType::Bomber, 80);
+        // 戦車は地上の敵戦車を撃破できる
+        chart.insert_damage(UnitType::Tank, UnitType::Tank, 55);
+        let stats = UnitStats {
+            unit_type,
+            cost,
+            max_movement: 6,
+            max_fuel: 99,
+            min_range: 1,
+            max_range: 1,
+            ..UnitStats::mock()
+        };
+        let enemy_tank = UnitStats {
+            unit_type: UnitType::Tank,
+            cost: 7_000,
+            max_movement: 6,
+            max_fuel: 99,
+            min_range: 1,
+            max_range: 1,
+            ..UnitStats::mock()
+        };
+        // 航空脅威なし = air_defense.targets が空のデフォルト戦略
+        let strategy = ProductionStrategy::default();
+        calculate_unit_score_at(
+            unit_type,
+            &stats,
+            GridPosition { x: 0, y: 0 },
+            PlayerId(1),
+            &strategy,
+            &[(GridPosition { x: 5, y: 0 }, enemy_tank)],
+            &[],
+            &chart,
+            &master_data,
+            &map,
+            &std::collections::HashMap::new(),
+            &UnitRegistry(std::collections::HashMap::new()),
+            Terrain::Factory,
+            0.0,
+            is_v3,
+        )
+    }
+
+    #[test]
+    fn issue75_v3_rejects_anti_air_without_any_enemy_air() {
+        // 対空戦車は敵地上戦車へ0ダメージなので最低スコアへ落ちる
+        let anti_air = no_air_threat_score(UnitType::AntiAir, 5_500, true);
+        // 戦車は敵地上戦車を撃破できるので通常評価される
+        let tank = no_air_threat_score(UnitType::Tank, 7_000, true);
+
+        assert_eq!(
+            anti_air, 1,
+            "航空脅威が無い盤面の対空ユニットは死に駒として最低スコアにする"
+        );
+        assert!(
+            tank > anti_air,
+            "有効打を持つ戦車が対空ユニットより高く評価される必要がある: tank={tank}, anti_air={anti_air}"
+        );
+    }
+
+    #[test]
+    fn issue75_v2_keeps_legacy_anti_air_score_without_enemy_air() {
+        // V1/V2 は評価の基準線として従来挙動のまま維持する
+        let anti_air = no_air_threat_score(UnitType::AntiAir, 5_500, false);
+        assert!(
+            anti_air > 1,
+            "V2の従来スコアリングを変更してはならない: anti_air={anti_air}"
         );
     }
 
@@ -2146,6 +2782,83 @@ mod additional_tests {
 
         assert!(score_with_shortage > score_after_coverage);
         assert!(!covered.air_defense.requires_emergency_production());
+    }
+
+    #[test]
+    fn issue75_uneconomic_air_target_does_not_feed_generic_counter_score() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let map = Map::new(6, 1, Terrain::Plains, GridTopology::Square);
+        let mut chart = DamageChart::new();
+        chart.insert_damage(UnitType::Missiles, UnitType::Bcopters, 100);
+        let missiles = UnitStats {
+            unit_type: UnitType::Missiles,
+            movement_type: MovementType::Tank,
+            cost: 12_000,
+            max_movement: 4,
+            max_fuel: 99,
+            max_ammo1: 1,
+            min_range: 2,
+            max_range: 5,
+            ..UnitStats::mock()
+        };
+        let enemy_bcopters = UnitStats {
+            unit_type: UnitType::Bcopters,
+            movement_type: MovementType::Air,
+            cost: 7_500,
+            max_movement: 6,
+            max_range: 1,
+            ..UnitStats::mock()
+        };
+        let target = AirThreatTarget {
+            position: GridPosition { x: 5, y: 0 },
+            unit_type: UnitType::Bcopters,
+            hp: 100,
+            cost: 7_500,
+            attack_power: 100,
+            deadline_turns: 2,
+        };
+        let required_coverage = 11_250.0;
+        let shortage = ProductionStrategy {
+            air_defense: AirDefenseAssessment {
+                targets: vec![target],
+                coverage_by_target: vec![0.0],
+                required_coverage,
+                current_coverage: 0.0,
+                shortage_ratio: 1.0,
+                has_effective_coverage: false,
+            },
+            ..ProductionStrategy::default()
+        };
+        let mut covered = shortage.clone();
+        covered
+            .air_defense
+            .apply_coverage(&AirCoverageContribution {
+                by_target: vec![required_coverage],
+                total: required_coverage,
+            });
+        let enemy_units = vec![(GridPosition { x: 5, y: 0 }, enemy_bcopters)];
+        let registry = UnitRegistry(std::collections::HashMap::new());
+        let score = |strategy: &ProductionStrategy| {
+            calculate_unit_score_at(
+                UnitType::Missiles,
+                &missiles,
+                GridPosition { x: 0, y: 0 },
+                PlayerId(1),
+                strategy,
+                &enemy_units,
+                &[],
+                &chart,
+                &master_data,
+                &map,
+                &std::collections::HashMap::new(),
+                &registry,
+                Terrain::Factory,
+                0.0,
+                true,
+            )
+        };
+
+        assert_eq!(score(&shortage), score(&covered));
     }
 
     #[test]
@@ -2617,6 +3330,46 @@ mod additional_tests {
         assert!(outcome.completed_all_rows);
     }
 
+    #[test]
+    fn issue75_air_counter_efficiency_decays_with_remaining_shortage() {
+        let mut chart = DamageChart::new();
+        chart.insert_damage(UnitType::AntiAir, UnitType::Bomber, 100);
+        let anti_air = UnitStats {
+            unit_type: UnitType::AntiAir,
+            movement_type: MovementType::Tank,
+            cost: 5_500,
+            max_movement: 5,
+            max_range: 1,
+            ..UnitStats::mock()
+        };
+        let bomber = UnitStats {
+            unit_type: UnitType::Bomber,
+            movement_type: MovementType::Air,
+            cost: 22_000,
+            max_movement: 7,
+            max_range: 1,
+            ..UnitStats::mock()
+        };
+        let enemy_units = vec![(GridPosition { x: 0, y: 0 }, bomber)];
+        let components = counter_efficiency_components(&anti_air, &enemy_units, &chart);
+
+        assert!(components.score_with_air_shortage(1.0) > 0);
+        assert_eq!(components.score_with_air_shortage(0.0), 0);
+        assert!(components.score_with_air_shortage(0.5) < components.score_with_air_shortage(1.0));
+    }
+
+    #[test]
+    fn issue75_fully_covered_air_does_not_dilute_ground_counter_score() {
+        let components = CounterEfficiencyComponents {
+            non_air_net: 10_000,
+            air_net: 90_000,
+            non_air_count: 1,
+            air_count: 9,
+        };
+
+        assert_eq!(components.score_with_air_shortage(0.0), 10_000);
+    }
+
     /// #53/#55 (V3): 対編成カウンター効率スコアの検証。
     /// ロケラン主体の敵編成に対して、それをアウトレンジできる重自走砲が
     /// ロケラン同型や歩兵より高評価になること
@@ -2910,6 +3663,7 @@ mod additional_tests {
         for e in entities {
             world.despawn(e);
         }
+        world.insert_resource(Map::new(6, 1, Terrain::Plains, GridTopology::Square));
         world.spawn((
             GridPosition { x: 0, y: 0 },
             Property::new(Terrain::Capital, Some(p1), 100),
@@ -2918,17 +3672,34 @@ mod additional_tests {
             GridPosition { x: 1, y: 0 },
             Property::new(Terrain::Factory, Some(p1), 100),
         ));
+        let infantry = world
+            .resource::<UnitRegistry>()
+            .get_stats(UnitType::Infantry)
+            .unwrap()
+            .clone();
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Faction(p1),
+            infantry,
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ));
 
         // 敵のヘリ
         for i in 0..2 {
             world.spawn((
-                GridPosition { x: 4 + i, y: 0 },
+                GridPosition { x: 3 + i, y: 0 },
                 Faction(PlayerId(2)),
                 UnitStats {
                     unit_type: UnitType::Bcopters,
                     cost: 9000,
                     max_movement: 6,
                     movement_type: MovementType::Air,
+                    max_fuel: 99,
+                    min_range: 1,
+                    max_range: 1,
                     ..UnitStats::mock()
                 },
                 Health {

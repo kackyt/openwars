@@ -715,7 +715,12 @@ impl ServerHandler for OpenWarsAiServer {
     }
 }
 
-#[tokio::main]
+// AI思考は HashMap の反復順に依存する箇所が残っており、
+// マルチスレッドランタイムだとツール呼び出しごとに別ワーカースレッドへ載る。
+// HashMap の RandomState はスレッドローカルな種を使うため、
+// ターンごとに生成されるマップの反復順が変わり、同一seedでも結果が再現しなくなる。
+// ターン制ゲームの進行は本質的に逐次処理なので、単一スレッドランタイムに固定して再現性を確保する。
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use rmcp::serve_server;
     use rmcp::transport::io::stdio;

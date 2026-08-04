@@ -248,7 +248,7 @@ mod tests {
     use crate::ai::squad::{MissionPhase, MissionType, SquadId};
     use crate::components::{Faction, GridPosition, Health, PlayerId, Property, UnitStats};
     use crate::resources::{GridTopology, Map, Terrain, master_data::MasterDataRegistry};
-    use std::collections::HashSet;
+    use std::collections::BTreeSet;
 
     fn setup_test_world() -> World {
         let master_data = MasterDataRegistry::load().unwrap();
@@ -350,7 +350,7 @@ mod tests {
         let mut squad = Squad {
             id: SquadId(1),
             owner_id: Some(p1),
-            members: HashSet::new(),
+            members: BTreeSet::new(),
             mission_type: MissionType::Attack,
             target: Some(GridPosition { x: 1, y: 8 }),
             target_island: None,

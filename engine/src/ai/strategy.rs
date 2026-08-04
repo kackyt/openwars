@@ -11,7 +11,9 @@ use crate::ai::island_campaign_analysis::{
     analyze_island_campaign, analyze_island_campaign_excluding,
 };
 use crate::ai::turn_distance::{TerrainConnectivity, TurnDistanceCache, calculate_turn_distance};
-use crate::components::{Ammo, Faction, Fuel, GridPosition, Health, PlayerId, Property, UnitStats};
+use crate::components::{
+    ActionCompleted, Ammo, Faction, Fuel, GridPosition, Health, PlayerId, Property, UnitStats,
+};
 use crate::resources::{Map, MovementType, Terrain, UnitType, master_data::MasterDataRegistry};
 use bevy_ecs::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -338,29 +340,35 @@ fn analyze_strategy_internal(
             &Health,
             Option<&Ammo>,
             Option<&Fuel>,
+            Option<&ActionCompleted>,
             Option<&crate::components::Transporting>,
         )>();
         query
             .iter(world)
-            .filter(|(position, _, _, health, _, _, transporting)| {
+            .filter(|(position, _, _, health, _, _, _, transporting)| {
                 position.x < 9999 && health.current > 0 && transporting.is_none()
             })
             .map(
-                |(position, faction, stats, health, ammo, fuel, _)| CombatCapabilitySnapshot {
-                    faction: faction.0,
-                    position: *position,
-                    unit_type: stats.unit_type,
-                    movement_type: stats.movement_type,
-                    hp: health.current,
-                    cost: stats.cost,
-                    max_movement: stats.max_movement,
-                    min_range: stats.min_range,
-                    max_range: stats.max_range,
-                    ammo1: ammo.map_or(99, |ammo| ammo.ammo1),
-                    max_ammo1: stats.max_ammo1,
-                    ammo2: ammo.map_or(99, |ammo| ammo.ammo2),
-                    max_ammo2: stats.max_ammo2,
-                    fuel: fuel.map_or(u32::MAX, |fuel| fuel.current),
+                |(position, faction, stats, health, ammo, fuel, action_completed, _)| {
+                    CombatCapabilitySnapshot {
+                        faction: faction.0,
+                        position: *position,
+                        unit_type: stats.unit_type,
+                        movement_type: stats.movement_type,
+                        hp: health.current,
+                        cost: stats.cost,
+                        max_movement: stats.max_movement,
+                        min_range: stats.min_range,
+                        max_range: stats.max_range,
+                        ammo1: ammo.map_or(99, |ammo| ammo.ammo1),
+                        max_ammo1: stats.max_ammo1,
+                        ammo2: ammo.map_or(99, |ammo| ammo.ammo2),
+                        max_ammo2: stats.max_ammo2,
+                        fuel: fuel.map_or(u32::MAX, |fuel| fuel.current),
+                        action_delay: u32::from(
+                            action_completed.is_some_and(|completed| completed.0),
+                        ),
+                    }
                 },
             )
             .collect::<Vec<_>>()
@@ -532,8 +540,22 @@ fn analyze_strategy_internal(
         }
         GamePhase::Defense => {
             strategy.ideal_composition.insert(UnitType::Infantry, 0.5);
-            strategy.ideal_composition.insert(UnitType::Tank, 0.3);
-            strategy.ideal_composition.insert(UnitType::AntiAir, 0.2);
+
+            // 対空の理想構成は「敵に航空戦力が実在する」ことを条件とする（V3限定）。
+            // 対空砲・地対空ミサイルは地上ユニットへ一切ダメージを与えられないため、
+            // 空港のないマップ（例: map_1）で対空需要を立てると死に駒を量産し、
+            // 占領・機動地上戦力の生産枠と予算を奪って自軍を弱体化させる。
+            // V1/V2 は評価の基準線として従来挙動のまま維持する。
+            let enemy_has_air = enemy_units
+                .iter()
+                .any(|(_, stats)| stats.movement_type == MovementType::Air);
+            if !is_v3 || enemy_has_air {
+                strategy.ideal_composition.insert(UnitType::Tank, 0.3);
+                strategy.ideal_composition.insert(UnitType::AntiAir, 0.2);
+            } else {
+                // 対空へ割り当てるはずだった需要は、防衛の主力である戦車へ振り替える
+                strategy.ideal_composition.insert(UnitType::Tank, 0.5);
+            }
         }
     }
 
@@ -989,6 +1011,105 @@ mod tests {
             strategy.phase,
             GamePhase::Defense,
             "首都が脅かされている場合は、中立拠点があっても Defense フェーズが優先されるべき"
+        );
+    }
+
+    /// Defense フェーズの理想構成テスト用ワールド。
+    /// 首都のすぐ隣に敵戦車を置いて Defense フェーズを成立させ、
+    /// `enemy_has_air` が真のときだけ敵の航空ユニットを追加する。
+    fn setup_defense_phase_world(
+        ai_version: crate::ai::ai_version::AiVersion,
+        enemy_has_air: bool,
+    ) -> World {
+        let mut world = World::new();
+        world.insert_resource(Map::new(15, 15, Terrain::Plains, GridTopology::Square));
+        world.insert_resource(crate::resources::MasterDataRegistry::load().unwrap());
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+
+        let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
+        settings.set_version(p1, ai_version);
+        world.insert_resource(settings);
+
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(p1), 100),
+        ));
+
+        // 首都のすぐそばに敵地上ユニット（Defense フェーズのトリガー）
+        world.spawn((
+            GridPosition { x: 1, y: 1 },
+            Faction(p2),
+            UnitStats {
+                unit_type: UnitType::Tank,
+                max_movement: 6,
+                movement_type: crate::resources::MovementType::Tank,
+                ..UnitStats::mock()
+            },
+        ));
+
+        if enemy_has_air {
+            world.spawn((
+                GridPosition { x: 5, y: 5 },
+                Faction(p2),
+                UnitStats {
+                    unit_type: UnitType::Bcopters,
+                    max_movement: 6,
+                    movement_type: crate::resources::MovementType::Air,
+                    ..UnitStats::mock()
+                },
+            ));
+        }
+
+        world
+    }
+
+    /// 敵に航空戦力が1機も存在しない場合、Defense フェーズでも対空を理想構成へ要求しないこと。
+    /// map_1 のように空港のないマップでは、対空ユニットは地上戦力へ一切ダメージを与えられず
+    /// 純粋な死に駒になるため、脅威がないのに需要を立ててはならない。
+    #[test]
+    fn v3_defense_composition_omits_anti_air_without_enemy_air() {
+        let mut world = setup_defense_phase_world(crate::ai::ai_version::AiVersion::V3, false);
+        let strategy = analyze_strategy(&mut world, PlayerId(1));
+
+        assert_eq!(strategy.phase, GamePhase::Defense);
+        assert!(
+            !strategy.ideal_composition.contains_key(&UnitType::AntiAir),
+            "敵に航空戦力がない場合、対空を理想構成へ含めてはならない: {:?}",
+            strategy.ideal_composition
+        );
+    }
+
+    /// 敵に航空戦力が存在する場合は、従来どおり Defense フェーズで対空需要を立てること。
+    #[test]
+    fn v3_defense_composition_demands_anti_air_against_enemy_air() {
+        let mut world = setup_defense_phase_world(crate::ai::ai_version::AiVersion::V3, true);
+        let strategy = analyze_strategy(&mut world, PlayerId(1));
+
+        assert_eq!(strategy.phase, GamePhase::Defense);
+        assert!(
+            strategy
+                .ideal_composition
+                .get(&UnitType::AntiAir)
+                .copied()
+                .unwrap_or(0.0)
+                > 0.0,
+            "敵航空戦力が実在する場合は対空需要を立てるべき: {:?}",
+            strategy.ideal_composition
+        );
+    }
+
+    /// V1/V2 は評価の基準線として従来挙動を維持する（今回の是正は V3 限定）。
+    #[test]
+    fn v1_defense_composition_keeps_legacy_anti_air_demand() {
+        let mut world = setup_defense_phase_world(crate::ai::ai_version::AiVersion::V1, false);
+        let strategy = analyze_strategy(&mut world, PlayerId(1));
+
+        assert_eq!(strategy.phase, GamePhase::Defense);
+        assert_eq!(
+            strategy.ideal_composition.get(&UnitType::AntiAir).copied(),
+            Some(0.2),
+            "V1 の理想構成は変更しない"
         );
     }
 

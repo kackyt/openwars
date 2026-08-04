@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use bevy_ecs::prelude::*;
 
@@ -785,7 +785,7 @@ fn defend_uses_reserved_combat_entities_and_assignment_target() {
             .all(|entity| [tank_a, tank_b].contains(entity))
     );
     let expected_target = defense.target_position;
-    let expected_members: HashSet<_> = defense.combat_entities.iter().copied().collect();
+    let expected_members: BTreeSet<_> = defense.combat_entities.iter().copied().collect();
 
     plan_squads(&mut world, player);
 
@@ -1799,7 +1799,7 @@ fn mixed_owner_squad_entities_are_unavailable_to_both_players_campaign_planning(
             },
         ));
     }
-    let mixed_set: HashSet<_> = mixed_entities.iter().copied().collect();
+    let mixed_set: BTreeSet<_> = mixed_entities.iter().copied().collect();
     let (mixed_id, snapshot) = {
         let mut manager = world.remove_resource::<SquadManager>().unwrap();
         let mixed = manager.create_squad(MissionType::Capture);
@@ -2094,7 +2094,7 @@ fn generic_planning_never_appends_units_to_a_foreign_same_target_squad() {
         .iter()
         .find(|squad| squad.id == foreign_id)
         .expect("player A must continue its original Squad");
-    assert_eq!(foreign.members, HashSet::from([foreign_member]));
+    assert_eq!(foreign.members, BTreeSet::from([foreign_member]));
 }
 
 #[test]

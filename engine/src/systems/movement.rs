@@ -2,7 +2,7 @@ use crate::components::*;
 use crate::events::*;
 use crate::resources::*;
 use bevy_ecs::prelude::*;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeSet, BinaryHeap, HashMap};
 
 #[derive(Clone)]
 pub struct OccupantInfo {
@@ -78,7 +78,7 @@ pub fn calculate_reachable_tiles(
     player_id: PlayerId,
     moving_unit_type: UnitType,
     master_data: &crate::resources::master_data::MasterDataRegistry,
-) -> HashSet<(usize, usize)> {
+) -> BTreeSet<(usize, usize)> {
     #[derive(Copy, Clone, Eq, PartialEq)]
     struct State {
         cost: u32,
@@ -100,7 +100,10 @@ pub fn calculate_reachable_tiles(
         }
     }
 
-    let mut reachable = HashSet::new();
+    // 到達可能タイルは AI が「同点候補のうち最初に見つかったもの」を選ぶため、
+    // 反復順が結果を左右する。HashSet はプロセスごとに反復順が変わり同一seedでも
+    // 再現しないため、座標順で安定する BTreeSet を用いる。
+    let mut reachable = BTreeSet::new();
     let mut heap = BinaryHeap::new();
     let mut min_cost: HashMap<(usize, usize), u32> = HashMap::new();
 

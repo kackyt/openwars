@@ -58,7 +58,7 @@ pub enum InGameState {
     UnitSelected {
         unit_entity: Entity,
         start_pos: (usize, usize),
-        reachable_tiles: std::collections::HashSet<(usize, usize)>,
+        reachable_tiles: std::collections::BTreeSet<(usize, usize)>,
     },
     ActionMenu {
         unit_entity: Option<Entity>,
@@ -913,7 +913,7 @@ impl App {
                 }
 
                 if let Some(entity) = selected_unit {
-                    let mut reachable = std::collections::HashSet::new();
+                    let mut reachable = std::collections::BTreeSet::new();
                     let mut u_stats = None;
                     let mut fuel_cur = 0;
 
@@ -1398,7 +1398,7 @@ impl App {
         &mut self,
         unit_entity: Entity,
         _start_pos: (usize, usize),
-        reachable_tiles: std::collections::HashSet<(usize, usize)>,
+        reachable_tiles: std::collections::BTreeSet<(usize, usize)>,
     ) {
         let cx = self.ui_state.cursor_pos.0;
         let cy = self.ui_state.cursor_pos.1;

@@ -13,7 +13,7 @@ use crate::components::{Ammo, Faction, GridPosition, Health, PlayerId, Property,
 use crate::resources::{Map, Terrain, UnitType, master_data::MasterDataRegistry};
 use crate::systems::movement::calculate_reachable_tiles;
 use bevy_ecs::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// ミッションの種別
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +53,10 @@ pub struct Squad {
     pub id: SquadId,
     /// Entityがまだ無いFormingもplayer間で共有しない、Squad自身の明示所有者。
     pub owner_id: Option<PlayerId>,
-    pub members: HashSet<Entity>,
+    /// 部隊メンバー。HashSet はプロセス・スレッドごとに反復順が変わり、
+    /// 「先頭メンバーの位置」を基準にする探索が同一seedでも再現しなくなるため、
+    /// Entity 順で安定する BTreeSet を用いる。
+    pub members: BTreeSet<Entity>,
     pub mission_type: MissionType,
     pub target: Option<GridPosition>, // 攻撃・防衛・占領の目標座標
     pub target_island: Option<crate::ai::islands::IslandId>, // 輸送ターゲットの島
@@ -87,7 +90,7 @@ impl SquadManager {
         let squad = Squad {
             id: SquadId(self.next_id),
             owner_id: None,
-            members: HashSet::new(),
+            members: BTreeSet::new(),
             mission_type,
             target: None,
             target_island: None,
@@ -3127,7 +3130,7 @@ fn select_landing_candidate(
     transport_entity: Entity,
     cargo_entity: Entity,
     transport_position: GridPosition,
-    reachable: &HashSet<(usize, usize)>,
+    reachable: &std::collections::BTreeSet<(usize, usize)>,
     target_island: Option<crate::ai::islands::IslandId>,
     target_position: Option<GridPosition>,
 ) -> Option<(GridPosition, GridPosition)> {
@@ -4811,7 +4814,7 @@ mod tests {
             let mut owned = Vec::new();
             for operation in &operations {
                 let transport = operation.transport_entity.unwrap();
-                assert_eq!(operation.members, HashSet::from([transport]));
+                assert_eq!(operation.members, BTreeSet::from([transport]));
                 assert_eq!(operation.target, Some(ready_assignment.target_position));
                 assert_eq!(
                     operation.phase,
@@ -5105,7 +5108,7 @@ mod tests {
                 let transport = squad.transport_entity.unwrap();
                 let capacity = fixture.world.get::<CargoCapacity>(transport).unwrap();
                 let stats = fixture.world.get::<UnitStats>(transport).unwrap();
-                assert_eq!(squad.members, HashSet::from([transport]));
+                assert_eq!(squad.members, BTreeSet::from([transport]));
                 assert!(squad.cargo_entities.len() <= capacity.max as usize);
                 assert!(squad.cargo_entities.iter().all(|cargo| {
                     fixture
@@ -5287,7 +5290,7 @@ mod tests {
                 "実搭載済みDropをTransitへ後退させない"
             );
             assert_eq!(lander.6, Some(drop_position));
-            assert_eq!(lander.2, HashSet::from([fixture.lander]));
+            assert_eq!(lander.2, BTreeSet::from([fixture.lander]));
             assert_eq!(
                 lander.3.iter().copied().collect::<HashSet<_>>(),
                 HashSet::from([fixture.cargo[2], fixture.cargo[3]])
@@ -6176,7 +6179,8 @@ mod tests {
             },
         ));
 
-        let reachable = HashSet::from([(1, 1), (3, 1)]);
+        // 到達可能タイルは決定性確保のため BTreeSet で扱う
+        let reachable = std::collections::BTreeSet::from([(1, 1), (3, 1)]);
         let selected = select_landing_candidate(
             &mut world,
             transport,
@@ -6396,7 +6400,7 @@ mod tests {
             .expect("reachable Secure capture unit must own the local duty");
         assert_eq!(capture.target_island, Some(island_id));
         assert_eq!(capture.target, Some(neutral_city));
-        assert_eq!(capture.members, HashSet::from([reachable]));
+        assert_eq!(capture.members, BTreeSet::from([reachable]));
         assert_eq!(
             manager
                 .squads
@@ -6419,7 +6423,7 @@ mod tests {
             .iter()
             .find(|squad| squad.id == legacy_id)
             .expect("legacy-local duty without campaign island must remain");
-        assert_eq!(legacy.members, HashSet::from([legacy_member]));
+        assert_eq!(legacy.members, BTreeSet::from([legacy_member]));
         let snapshot: Vec<_> = manager
             .squads
             .iter()
@@ -6479,7 +6483,7 @@ mod tests {
             .id();
         let mut manager = SquadManager::new();
         let mixed = manager.create_squad(MissionType::Attack);
-        mixed.members = HashSet::from([member_a, member_b]);
+        mixed.members = BTreeSet::from([member_a, member_b]);
         mixed.target = Some(GridPosition { x: 3, y: 3 });
         mixed.target_island = Some(crate::ai::islands::IslandId(0));
         mixed.phase = MissionPhase::MovingToTarget;
@@ -6997,14 +7001,14 @@ mod tests {
             .find(|squad| squad.mission_type == MissionType::Attack)
             .expect("reachable land member must receive an Attack duty");
         assert_eq!(attack.target, Some(enemy_position));
-        assert_eq!(attack.members, HashSet::from([land_member]));
+        assert_eq!(attack.members, BTreeSet::from([land_member]));
         let defense = manager
             .squads
             .iter()
             .find(|squad| squad.mission_type == MissionType::Defense)
             .expect("unreachable ship member must receive a local Defense hold");
         assert_eq!(defense.target, Some(ship_hold));
-        assert_eq!(defense.members, HashSet::from([ship_member]));
+        assert_eq!(defense.members, BTreeSet::from([ship_member]));
         assert_eq!(
             manager
                 .squads
@@ -7137,7 +7141,7 @@ mod tests {
         assert_eq!(attack_squads[0].target, Some(enemy_position));
         assert_eq!(
             attack_squads[0].members,
-            members.iter().copied().collect::<HashSet<_>>()
+            members.iter().copied().collect::<BTreeSet<_>>()
         );
         assert!(
             manager
@@ -7499,7 +7503,7 @@ mod tests {
             .iter()
             .find(|squad| squad.mission_type == MissionType::Defense)
             .unwrap();
-        assert_eq!(defense.members, HashSet::from([reachable]));
+        assert_eq!(defense.members, BTreeSet::from([reachable]));
         assert_eq!(defense.target_island, Some(island_id));
         assert_eq!(defense.target, Some(defended));
         assert_eq!(

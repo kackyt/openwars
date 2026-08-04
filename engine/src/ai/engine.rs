@@ -3895,7 +3895,7 @@ mod tests {
     /// 指定ユニット1体のみからなる部隊 (目標つき) を登録するヘルパー
     fn insert_single_unit_squad(world: &mut World, member: Entity, target: GridPosition) {
         let mut manager = crate::ai::squad::SquadManager::default();
-        let mut members = std::collections::HashSet::new();
+        let mut members = std::collections::BTreeSet::new();
         members.insert(member);
         manager.squads.push(crate::ai::squad::Squad {
             id: crate::ai::squad::SquadId(1),

@@ -81,6 +81,8 @@ pub struct CombatCapabilitySnapshot {
     pub ammo2: u32,
     pub max_ammo2: u32,
     pub fuel: u32,
+    /// 現在の行動完了状態によって次に射撃できるまで待つ自軍ターン数。
+    pub action_delay: u32,
 }
 
 /// 生産候補が対応すべき個別の航空脅威。
@@ -116,42 +118,93 @@ pub struct AirCoverageContribution {
 }
 
 impl AirDefenseAssessment {
-    pub fn requires_emergency_production(&self) -> bool {
-        const COVERAGE_EPSILON: f32 = 0.001;
+    pub(crate) const COVERAGE_EPSILON: f32 = 0.001;
+    const EMERGENCY_COVERAGE_FLOOR: f32 = 0.5;
+    const EMERGENCY_MAX_DEADLINE_TURNS: u32 = 2;
 
-        !self.targets.is_empty()
-            && (self.coverage_by_target.len() != self.targets.len()
-                || self
-                    .targets
-                    .iter()
-                    .zip(&self.coverage_by_target)
-                    .any(|(target, coverage)| {
-                        target_threat_value(target) > COVERAGE_EPSILON
-                            && *coverage <= COVERAGE_EPSILON
-                    }))
+    fn refresh_coverage_summary(&mut self) {
+        self.current_coverage = self.coverage_by_target.iter().sum();
+        self.shortage_ratio = if self.required_coverage > 0.0 {
+            ((self.required_coverage - self.current_coverage) / self.required_coverage)
+                .clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.has_effective_coverage = self.current_coverage > 0.0;
     }
 
-    /// 緊急ゲートを発生させている未カバー航空機だけを候補評価へ残します。
-    pub(crate) fn emergency_targets_only(&self) -> Self {
-        const COVERAGE_EPSILON: f32 = 0.001;
+    /// 対象ごとの期限内カバレッジ率を返します。
+    pub(crate) fn target_coverage_ratio(&self, index: usize) -> f32 {
+        let Some(target) = self.targets.get(index) else {
+            return 1.0;
+        };
+        let target_value = target_threat_value(target);
+        if target_value <= Self::COVERAGE_EPSILON {
+            return 1.0;
+        }
+        (self.coverage_by_target.get(index).copied().unwrap_or(0.0) / target_value).clamp(0.0, 1.0)
+    }
 
+    pub(crate) fn target_threat_value_at(&self, index: usize) -> f32 {
+        self.targets
+            .get(index)
+            .map(target_threat_value)
+            .unwrap_or(0.0)
+    }
+
+    pub(crate) fn remaining_threat_value(&self, index: usize) -> f32 {
+        self.target_threat_value_at(index) * (1.0 - self.target_coverage_ratio(index))
+    }
+
+    /// 既存カバレッジでまだ抑止できていない敵航空機のHP補正済み資産価値を返します。
+    /// ETA緊急度は含めず、生産費が敵機価格の何倍にも膨らむことを防ぎます。
+    pub(crate) fn remaining_air_asset_value(&self, index: usize) -> f32 {
+        let Some(target) = self.targets.get(index) else {
+            return 0.0;
+        };
+        target.cost as f32 * target.hp as f32 / 100.0 * (1.0 - self.target_coverage_ratio(index))
+    }
+
+    pub(crate) fn is_emergency_target(&self, index: usize) -> bool {
+        self.targets.get(index).is_some_and(|target| {
+            let coverage = self.coverage_by_target.get(index).copied().unwrap_or(0.0);
+            target_threat_value(target) > Self::COVERAGE_EPSILON
+                && (coverage <= Self::COVERAGE_EPSILON
+                    || (target.deadline_turns <= Self::EMERGENCY_MAX_DEADLINE_TURNS
+                        && self.target_coverage_ratio(index) < Self::EMERGENCY_COVERAGE_FLOOR))
+        })
+    }
+
+    pub fn requires_emergency_production(&self) -> bool {
+        (0..self.targets.len()).any(|index| self.is_emergency_target(index))
+    }
+
+    /// 緊急条件を満たす航空機だけを候補評価へ残します。
+    pub(crate) fn emergency_targets_only(&self) -> Self {
         let mut focused = self.clone();
         if focused.coverage_by_target.len() != focused.targets.len() {
             focused.coverage_by_target = vec![0.0; focused.targets.len()];
         }
         for (index, target) in focused.targets.iter().enumerate() {
-            if self.coverage_by_target.get(index).copied().unwrap_or(0.0) > COVERAGE_EPSILON {
+            if !self.is_emergency_target(index) {
                 focused.coverage_by_target[index] = target_threat_value(target);
             }
         }
-        focused.current_coverage = focused.coverage_by_target.iter().sum();
-        focused.shortage_ratio = if focused.required_coverage > 0.0 {
-            ((focused.required_coverage - focused.current_coverage) / focused.required_coverage)
-                .clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        focused.has_effective_coverage = focused.current_coverage > COVERAGE_EPSILON;
+        focused.refresh_coverage_summary();
+        focused.has_effective_coverage = focused.current_coverage > Self::COVERAGE_EPSILON;
+        focused
+    }
+
+    /// 緊急対象だけを未割当へ戻し、既存戦力から封じ込め投資を再構築できる状態にします。
+    pub(crate) fn uncovered_emergency_targets_only(&self) -> Self {
+        let mut focused = self.emergency_targets_only();
+        for index in 0..focused.targets.len() {
+            if self.is_emergency_target(index) {
+                focused.coverage_by_target[index] = 0.0;
+            }
+        }
+        focused.refresh_coverage_summary();
+        focused.has_effective_coverage = focused.current_coverage > Self::COVERAGE_EPSILON;
         focused
     }
 
@@ -167,14 +220,7 @@ impl AirDefenseAssessment {
             self.coverage_by_target[index] =
                 (self.coverage_by_target[index] + added).min(target_value);
         }
-        self.current_coverage = self.coverage_by_target.iter().sum::<f32>();
-        self.shortage_ratio = if self.required_coverage > 0.0 {
-            ((self.required_coverage - self.current_coverage) / self.required_coverage)
-                .clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        self.has_effective_coverage = self.current_coverage > 0.0;
+        self.refresh_coverage_summary();
     }
 }
 
@@ -469,7 +515,6 @@ fn allocate_air_coverage(
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
     damage_chart: &DamageChart,
     coverage_by_target: &mut [f32],
-    action_delay: u32,
 ) {
     let mut states = units
         .iter()
@@ -500,7 +545,8 @@ fn allocate_air_coverage(
                 ready_turns: arrivals
                     .iter()
                     .map(|arrival| {
-                        arrival.map(|distance| distance.turns.max(1).saturating_add(action_delay))
+                        arrival
+                            .map(|distance| distance.turns.max(1).saturating_add(unit.action_delay))
                     })
                     .collect(),
                 requires_movement: arrivals
@@ -723,7 +769,6 @@ pub fn assess_air_defense(
         unit_positions,
         damage_chart,
         &mut coverage_by_target,
-        0,
     );
     let current_coverage = coverage_by_target.iter().sum::<f32>();
     let has_effective_coverage = current_coverage > 0.0;
@@ -754,6 +799,32 @@ pub fn candidate_air_coverage(
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
     damage_chart: &DamageChart,
 ) -> AirCoverageContribution {
+    candidate_air_coverage_with_delay(
+        stats,
+        production_position,
+        player_id,
+        assessment,
+        map,
+        registry,
+        unit_positions,
+        damage_chart,
+        1,
+    )
+}
+
+/// 購入待ちを含む行動遅延を指定し、生産候補の限界カバレッジを算出します。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn candidate_air_coverage_with_delay(
+    stats: &UnitStats,
+    production_position: GridPosition,
+    player_id: PlayerId,
+    assessment: &AirDefenseAssessment,
+    map: &Map,
+    registry: &MasterDataRegistry,
+    unit_positions: &HashMap<(usize, usize), OccupantInfo>,
+    damage_chart: &DamageChart,
+    action_delay: u32,
+) -> AirCoverageContribution {
     let candidate = CombatCapabilitySnapshot {
         faction: player_id,
         position: production_position,
@@ -769,6 +840,7 @@ pub fn candidate_air_coverage(
         ammo2: stats.max_ammo2,
         max_ammo2: stats.max_ammo2,
         fuel: stats.max_fuel,
+        action_delay,
     };
     let mut combined_coverage = if assessment.coverage_by_target.len() == assessment.targets.len() {
         assessment.coverage_by_target.clone()
@@ -784,7 +856,6 @@ pub fn candidate_air_coverage(
         unit_positions,
         damage_chart,
         &mut combined_coverage,
-        1,
     );
     let by_target = combined_coverage
         .iter()
@@ -793,6 +864,106 @@ pub fn candidate_air_coverage(
         .collect::<Vec<_>>();
     let total = by_target.iter().sum();
     AirCoverageContribution { by_target, total }
+}
+
+/// 複数の実戦力を一括割当し、限定ターン内の封じ込めカバレッジを元の脅威尺度で返します。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn air_coverage_with_timing(
+    units: &[CombatCapabilitySnapshot],
+    assessment: &AirDefenseAssessment,
+    map: &Map,
+    registry: &MasterDataRegistry,
+    unit_positions: &HashMap<(usize, usize), OccupantInfo>,
+    damage_chart: &DamageChart,
+    deadline_grace: u32,
+) -> AirCoverageContribution {
+    let original_ratios = (0..assessment.targets.len())
+        .map(|index| assessment.target_coverage_ratio(index))
+        .collect::<Vec<_>>();
+    let mut relaxed = assessment.clone();
+    for target in &mut relaxed.targets {
+        target.deadline_turns = target.deadline_turns.saturating_add(deadline_grace);
+    }
+    relaxed.required_coverage = (0..relaxed.targets.len())
+        .map(|index| relaxed.target_threat_value_at(index))
+        .sum();
+    relaxed.coverage_by_target = original_ratios
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, ratio)| relaxed.target_threat_value_at(index) * ratio)
+        .collect();
+    relaxed.apply_coverage(&AirCoverageContribution::default());
+
+    let mut combined_coverage = relaxed.coverage_by_target.clone();
+    let baseline = combined_coverage.clone();
+    allocate_air_coverage(
+        units,
+        &relaxed.targets,
+        map,
+        registry,
+        unit_positions,
+        damage_chart,
+        &mut combined_coverage,
+    );
+    let by_target = combined_coverage
+        .iter()
+        .zip(baseline)
+        .enumerate()
+        .map(|(index, (combined, existing))| {
+            let relaxed_value = relaxed.target_threat_value_at(index);
+            if relaxed_value <= AirDefenseAssessment::COVERAGE_EPSILON {
+                0.0
+            } else {
+                let added = (combined - existing).max(0.0);
+                assessment.target_threat_value_at(index) * (added / relaxed_value)
+            }
+        })
+        .collect::<Vec<_>>();
+    let total = by_target.iter().sum();
+    AirCoverageContribution { by_target, total }
+}
+
+/// 緊急期限後も限定ターン内に封じ込められるかを、元の脅威尺度へ正規化して返します。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn candidate_air_coverage_with_timing(
+    stats: &UnitStats,
+    production_position: GridPosition,
+    player_id: PlayerId,
+    assessment: &AirDefenseAssessment,
+    map: &Map,
+    registry: &MasterDataRegistry,
+    unit_positions: &HashMap<(usize, usize), OccupantInfo>,
+    damage_chart: &DamageChart,
+    action_delay: u32,
+    deadline_grace: u32,
+) -> AirCoverageContribution {
+    let candidate = CombatCapabilitySnapshot {
+        faction: player_id,
+        position: production_position,
+        unit_type: stats.unit_type,
+        movement_type: stats.movement_type,
+        hp: 100,
+        cost: stats.cost,
+        max_movement: stats.max_movement,
+        min_range: stats.min_range,
+        max_range: stats.max_range,
+        ammo1: stats.max_ammo1,
+        max_ammo1: stats.max_ammo1,
+        ammo2: stats.max_ammo2,
+        max_ammo2: stats.max_ammo2,
+        fuel: stats.max_fuel,
+        action_delay,
+    };
+    air_coverage_with_timing(
+        &[candidate],
+        assessment,
+        map,
+        registry,
+        unit_positions,
+        damage_chart,
+        deadline_grace,
+    )
 }
 
 /// 自軍・敵軍の状況から需要マトリクスを計算します。
@@ -985,6 +1156,7 @@ mod tests {
             ammo2: 9,
             max_ammo2: 9,
             fuel: 99,
+            action_delay: 0,
         }
     }
 
@@ -1099,6 +1271,55 @@ mod tests {
         assert!(assessment.has_effective_coverage);
         assert!(!assessment.requires_emergency_production());
         assert!(assessment.shortage_ratio < 1.0);
+    }
+
+    #[test]
+    fn issue75_action_completed_counter_keeps_its_next_turn_delay() {
+        let map = Map::new(
+            10,
+            1,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        let registry = MasterDataRegistry::load().unwrap();
+        let mut chart = DamageChart::new();
+        chart.insert_damage(UnitType::AntiAir, UnitType::Bomber, 80);
+        chart.insert_damage(UnitType::Bomber, UnitType::AntiAir, 100);
+        let mut completed_counter = capability(
+            PlayerId(1),
+            GridPosition { x: 1, y: 0 },
+            UnitType::AntiAir,
+            MovementType::Tank,
+            6,
+            1,
+            8_000,
+        );
+        completed_counter.action_delay = 1;
+        let units = vec![
+            capability(
+                PlayerId(2),
+                GridPosition { x: 6, y: 0 },
+                UnitType::Bomber,
+                MovementType::Air,
+                6,
+                1,
+                20_000,
+            ),
+            completed_counter,
+        ];
+
+        let assessment = assess_air_defense(
+            PlayerId(1),
+            &units,
+            &[GridPosition { x: 0, y: 0 }],
+            &map,
+            &registry,
+            &HashMap::new(),
+            &chart,
+        );
+
+        assert_eq!(assessment.current_coverage, 0.0);
+        assert!(assessment.requires_emergency_production());
     }
 
     #[test]
@@ -1496,7 +1717,6 @@ mod tests {
             &HashMap::new(),
             &chart,
             &mut coverage,
-            0,
         );
 
         assert_eq!(coverage, vec![18_000.0, 30_000.0]);
@@ -1569,7 +1789,6 @@ mod tests {
             &HashMap::new(),
             &chart,
             &mut coverage,
-            0,
         );
 
         assert_eq!(coverage, vec![19_800.0, 30_000.0]);
@@ -1624,7 +1843,6 @@ mod tests {
             &HashMap::new(),
             &chart,
             &mut coverage,
-            0,
         );
 
         assert_eq!(coverage, vec![19_800.0, 30_000.0, 30_000.0]);
@@ -1781,8 +1999,38 @@ mod tests {
         });
 
         assert!(assessment.has_effective_coverage);
-        assert!(!assessment.requires_emergency_production());
+        assert!(assessment.requires_emergency_production());
         assert_eq!(assessment.shortage_ratio, 0.875);
+
+        assessment.apply_coverage(&AirCoverageContribution {
+            by_target: vec![15_000.0],
+            total: 15_000.0,
+        });
+
+        assert!(!assessment.requires_emergency_production());
+        assert_eq!(assessment.shortage_ratio, 0.5);
+    }
+
+    #[test]
+    fn issue75_distant_zero_coverage_air_threat_starts_preparation_early() {
+        let target = AirThreatTarget {
+            position: GridPosition { x: 6, y: 0 },
+            unit_type: UnitType::Bomber,
+            hp: 100,
+            cost: 20_000,
+            attack_power: 100,
+            deadline_turns: 3,
+        };
+        let assessment = AirDefenseAssessment {
+            targets: vec![target],
+            coverage_by_target: vec![0.0],
+            required_coverage: target_threat_value(&target),
+            current_coverage: 0.0,
+            shortage_ratio: 1.0,
+            has_effective_coverage: false,
+        };
+
+        assert!(assessment.requires_emergency_production());
     }
 
     #[test]
@@ -1820,7 +2068,7 @@ mod tests {
             total: 1.0,
         });
 
-        assert!(!assessment.requires_emergency_production());
+        assert!(assessment.requires_emergency_production());
     }
 
     #[test]

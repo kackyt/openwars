@@ -401,7 +401,7 @@ mod tests {
     use crate::components::*;
     use crate::resources::master_data::*;
     use crate::resources::*;
-    use std::collections::HashSet;
+    use std::collections::BTreeSet;
 
     fn setup_test_world() -> World {
         let master_data = MasterDataRegistry::load().unwrap();
@@ -468,7 +468,7 @@ mod tests {
         let mut squad = Squad {
             id: crate::ai::squad::SquadId(1),
             owner_id: Some(p1),
-            members: HashSet::new(),
+            members: BTreeSet::new(),
             mission_type: MissionType::Attack,
             target: None,
             target_island: None,
@@ -563,7 +563,7 @@ mod tests {
         assert_eq!(foreign.owner_id, Some(player_b));
         assert_eq!(foreign.target, Some(GridPosition { x: 1, y: 1 }));
         assert_eq!(foreign.phase, crate::ai::squad::MissionPhase::Executing);
-        assert_eq!(foreign.members, HashSet::from([unit_b]));
+        assert_eq!(foreign.members, BTreeSet::from([unit_b]));
     }
 
     #[test]
