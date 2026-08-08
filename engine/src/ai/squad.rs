@@ -4854,10 +4854,9 @@ mod tests {
             ready_assignment.combat_entities.contains(&tank)
                 || ready_assignment.capture_entities.contains(&tank)
         );
-        assert!(
-            ready_assignment.combat_entities.contains(&artillery)
-                || ready_assignment.capture_entities.contains(&artillery)
-        );
+        // Forming開始後に追加された戦闘cargoは既存の侵攻波へ追加入隊させない。
+        assert!(!ready_assignment.combat_entities.contains(&artillery));
+        assert!(!ready_assignment.capture_entities.contains(&artillery));
 
         plan_squads(&mut world, player);
 
@@ -5555,7 +5554,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_assault_without_complete_rendezvous_keeps_every_transport_forming() {
+    fn ready_assault_ignores_late_unreachable_combat_and_launches_structural_wave() {
         let mut fixture = setup_ready_assault_reconciliation_world();
         let player = PlayerId(1);
         fixture
@@ -5598,7 +5597,8 @@ mod tests {
         assert!(assignment.operation_ready);
         assert!(assignment.transport_entities.contains(&fixture.lander));
         assert!(assignment.transport_entities.contains(&fixture.helicopter));
-        assert!(assignment.combat_entities.contains(&fixture.cargo[3]));
+        // 既存Formingへ遅れて現れた戦闘cargoを追加せず、構造パッケージだけを維持する。
+        assert!(!assignment.combat_entities.contains(&fixture.cargo[3]));
 
         plan_squads(&mut fixture.world, player);
 
@@ -5612,8 +5612,8 @@ mod tests {
         assert!(
             operation_squads
                 .iter()
-                .all(|squad| squad.phase == MissionPhase::Forming),
-            "complete rendezvousが無いready packageから部分Pickupを発進させない"
+                .all(|squad| { squad.phase == MissionPhase::Transport(TransportPhase::Pickup) }),
+            "到達不能な後続戦闘cargoを除外した構造パッケージは一斉にPickupへ進む"
         );
     }
 

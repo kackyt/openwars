@@ -3,7 +3,9 @@ use crate::ai::demand::{
     air_coverage_with_timing, candidate_air_coverage, candidate_air_coverage_with_delay,
     candidate_air_coverage_with_timing,
 };
-use crate::ai::island_campaign::{IslandCampaignShortfall, campaign_unit_type_rank};
+use crate::ai::island_campaign::{
+    IslandCampaignDecision, IslandCampaignShortfall, campaign_unit_type_rank,
+};
 use crate::ai::strategy::{
     EmergencyAntiAirReservation, ProductionPlan, ProductionStrategy, analyze_strategy_for_turn,
     sea_transport_capacity_from_slots,
@@ -299,20 +301,23 @@ fn select_best_production_candidate(
         .min_by(|left, right| compare_production_candidates(left, right))
 }
 
-fn next_campaign_requirement(
+fn remaining_campaign_requirements(
     shortfall: &IslandCampaignShortfall,
-) -> Option<CampaignProductionRequirement> {
+) -> Vec<CampaignProductionRequirement> {
+    let mut requirements = Vec::new();
     if shortfall.heavy_transport_slots > 0 {
-        Some(CampaignProductionRequirement::HeavyTransport)
-    } else if shortfall.light_transport_slots > 0 {
-        Some(CampaignProductionRequirement::LightTransport)
-    } else if shortfall.capture_units > 0 {
-        Some(CampaignProductionRequirement::Capture)
-    } else if shortfall.combat_budget > 0 {
-        Some(CampaignProductionRequirement::Combat)
-    } else {
-        None
+        requirements.push(CampaignProductionRequirement::HeavyTransport);
     }
+    if shortfall.light_transport_slots > 0 {
+        requirements.push(CampaignProductionRequirement::LightTransport);
+    }
+    if shortfall.capture_units > 0 {
+        requirements.push(CampaignProductionRequirement::Capture);
+    }
+    if shortfall.combat_budget > 0 {
+        requirements.push(CampaignProductionRequirement::Combat);
+    }
+    requirements
 }
 
 fn campaign_candidate_matches(
@@ -426,47 +431,78 @@ pub(crate) fn plan_campaign_shortfall_production(
     };
 
     for row in &mut rows {
-        while let Some(requirement) = next_campaign_requirement(row) {
-            let mut candidates = Vec::new();
-            for (facility_position, terrain) in &sorted_facilities {
-                if outcome.used_facilities.contains(facility_position) {
-                    continue;
-                }
-                for (unit_type, stats) in &sorted_types {
-                    if !master_data.can_produce_unit(terrain.as_str(), *unit_type)
-                        || !campaign_candidate_matches(requirement, *unit_type, stats)
-                        || stats.cost > outcome.remaining_funds
-                        || stats.cost > row.reserved_budget
-                    {
+        let mut produced_structural_assault_unit = false;
+        loop {
+            let requirements = remaining_campaign_requirements(row);
+            if requirements.is_empty() {
+                break;
+            }
+            if row.decision == IslandCampaignDecision::Assault
+                && produced_structural_assault_unit
+                && requirements == [CampaignProductionRequirement::Combat]
+            {
+                // 初回上陸便へ後続支援まで詰め込むとPickupが遅れる。輸送役と占領兵を
+                // この手番のバッチ境界とし、戦闘支援は次ターン以降に生産する。
+                outcome.completed_all_rows = false;
+                return outcome;
+            }
+            let mut selected = None;
+            for (requirement_index, requirement) in requirements.into_iter().enumerate() {
+                let mut candidates = Vec::new();
+                for (facility_position, terrain) in &sorted_facilities {
+                    if outcome.used_facilities.contains(facility_position) {
                         continue;
                     }
-                    let combat_coverage = if requirement == CampaignProductionRequirement::Combat {
-                        stats.cost.min(row.combat_budget)
-                    } else {
-                        0
-                    };
-                    candidates.push((
-                        std::cmp::Reverse(combat_coverage),
-                        stats.cost,
-                        campaign_unit_type_rank(*unit_type),
-                        facility_position.y,
-                        facility_position.x,
-                        *facility_position,
-                        *unit_type,
+                    for (unit_type, stats) in &sorted_types {
+                        if !master_data.can_produce_unit(terrain.as_str(), *unit_type)
+                            || !campaign_candidate_matches(requirement, *unit_type, stats)
+                            || stats.cost > outcome.remaining_funds
+                            || stats.cost > row.reserved_budget
+                        {
+                            continue;
+                        }
+                        let combat_coverage =
+                            if requirement == CampaignProductionRequirement::Combat {
+                                stats.cost.min(row.combat_budget)
+                            } else {
+                                0
+                            };
+                        candidates.push((
+                            std::cmp::Reverse(combat_coverage),
+                            stats.cost,
+                            campaign_unit_type_rank(*unit_type),
+                            facility_position.y,
+                            facility_position.x,
+                            *facility_position,
+                            *unit_type,
+                            stats.clone(),
+                        ));
+                    }
+                }
+                candidates.sort_by_key(|candidate| {
+                    (
+                        candidate.0,
+                        candidate.1,
+                        candidate.2,
+                        candidate.3,
+                        candidate.4,
+                    )
+                });
+                if let Some((_, _, _, _, _, position, unit_type, stats)) =
+                    candidates.into_iter().next()
+                {
+                    selected = Some((
+                        requirement_index > 0,
+                        requirement,
+                        position,
+                        unit_type,
                         stats,
                     ));
+                    break;
                 }
             }
-            candidates.sort_by_key(|candidate| {
-                (
-                    candidate.0,
-                    candidate.1,
-                    candidate.2,
-                    candidate.3,
-                    candidate.4,
-                )
-            });
-            let Some((_, _, _, _, _, position, unit_type, stats)) = candidates.first() else {
+            let Some((used_lower_requirement, requirement, position, unit_type, stats)) = selected
+            else {
                 // 高優先rowを今ターン完了できない場合、予約資源を下位rowやgeneric需要へ流さない。
                 outcome.completed_all_rows = false;
                 return outcome;
@@ -476,11 +512,22 @@ pub(crate) fn plan_campaign_shortfall_production(
                 player_id,
                 target_x: position.x,
                 target_y: position.y,
-                unit_type: *unit_type,
+                unit_type,
             });
             outcome.remaining_funds = outcome.remaining_funds.saturating_sub(stats.cost);
-            outcome.used_facilities.insert(*position);
-            consume_campaign_candidate(row, requirement, stats);
+            outcome.used_facilities.insert(position);
+            consume_campaign_candidate(row, requirement, &stats);
+            if row.decision == IslandCampaignDecision::Assault
+                && requirement != CampaignProductionRequirement::Combat
+            {
+                produced_structural_assault_unit = true;
+            }
+            if used_lower_requirement {
+                // 最優先要件の購入資金を次ターンへ残すため、同じパッケージ内の
+                // 安価な前提要素を1件だけ先行購入してこの手番の計画を止める。
+                outcome.completed_all_rows = false;
+                return outcome;
+            }
         }
     }
 
@@ -3333,6 +3380,95 @@ mod additional_tests {
             std::collections::HashSet::from([UnitType::Lander, UnitType::TransportHelicopter,])
         );
         assert!(outcome.completed_all_rows);
+    }
+
+    #[test]
+    fn campaign_assault_defers_combat_support_after_building_the_first_landing_wave() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let available_types = campaign_test_types(&master_data);
+        let rows = vec![crate::ai::island_campaign::IslandCampaignShortfall {
+            island_id: crate::ai::islands::IslandId(0),
+            decision: crate::ai::island_campaign::IslandCampaignDecision::Assault,
+            light_transport_slots: 4,
+            heavy_transport_slots: 0,
+            capture_units: 2,
+            combat_budget: 10_200,
+            reserved_budget: 20_200,
+            priority_rank: 2,
+        }];
+        let facilities = vec![
+            (GridPosition { x: 0, y: 0 }, Terrain::Airport),
+            (GridPosition { x: 1, y: 0 }, Terrain::Airport),
+            (GridPosition { x: 2, y: 0 }, Terrain::Factory),
+            (GridPosition { x: 3, y: 0 }, Terrain::Factory),
+            (GridPosition { x: 4, y: 0 }, Terrain::Factory),
+        ];
+
+        let outcome = plan_campaign_shortfall_production(
+            PlayerId(1),
+            &rows,
+            &facilities,
+            &available_types,
+            &master_data,
+            20_200,
+        );
+
+        assert_eq!(outcome.commands.len(), 4);
+        assert_eq!(
+            outcome
+                .commands
+                .iter()
+                .filter(|command| command.unit_type == UnitType::TransportHelicopter)
+                .count(),
+            2
+        );
+        assert_eq!(
+            outcome
+                .commands
+                .iter()
+                .filter(|command| command.unit_type == UnitType::Infantry)
+                .count(),
+            2
+        );
+        assert_eq!(outcome.remaining_funds, 10_200);
+        assert!(!outcome.completed_all_rows);
+    }
+
+    /// Lander資金が足りない初手でも同じパッケージの輸送ヘリを1件だけ先行し、
+    /// 残金を次ターンのLander購入へ温存する。
+    #[test]
+    fn campaign_assault_produces_one_affordable_prerequisite_while_saving_for_lander() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let available_types = campaign_test_types(&master_data);
+        let rows = vec![crate::ai::island_campaign::IslandCampaignShortfall {
+            island_id: crate::ai::islands::IslandId(0),
+            decision: crate::ai::island_campaign::IslandCampaignDecision::Assault,
+            light_transport_slots: 2,
+            heavy_transport_slots: 2,
+            capture_units: 2,
+            combat_budget: 10_200,
+            reserved_budget: 32_700,
+            priority_rank: 2,
+        }];
+        let facilities = vec![
+            (GridPosition { x: 0, y: 0 }, Terrain::Port),
+            (GridPosition { x: 1, y: 0 }, Terrain::Airport),
+            (GridPosition { x: 2, y: 0 }, Terrain::Factory),
+        ];
+
+        let outcome = plan_campaign_shortfall_production(
+            PlayerId(1),
+            &rows,
+            &facilities,
+            &available_types,
+            &master_data,
+            14_000,
+        );
+
+        assert_eq!(outcome.commands.len(), 1);
+        assert_eq!(outcome.commands[0].unit_type, UnitType::TransportHelicopter);
+        assert_eq!(outcome.remaining_funds, 10_000);
+        assert!(!outcome.completed_all_rows);
     }
 
     #[test]

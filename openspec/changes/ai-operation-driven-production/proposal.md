@@ -77,6 +77,9 @@
   - 最優先パッケージが未完成なら汎用生産を止め、輸送手段・占領要員・戦闘戦力の部分投入を防ぐ
   - 洋上 Reinforce は、実 cargo の出発島と積載可能兵種に適合する輸送手段が無い場合も作戦を消さず、生産可能な輸送手段を shortfall として要求する
   - 自力で目標へ展開できる航空戦力を輸送 cargo から分離し、Pickup は先頭以外の行動可能 cargo も同一手番に前進させる
+  - 既存作戦を新規作戦より先に継続し、新規作戦は Assault、Expand、Contest、Reinforce の順に選ぶ。高価値の敵島 Assault は同時作戦数上限の外へ押し出さない
+  - Assault の輸送編成は固定の Lander + TransportHelicopter とせず、同一出発島の生産圏で実際に生産できる輸送種別から必要容量を満たす最小費用パッケージを選ぶ
+  - Assault は輸送手段と占領要員からなる初動上陸波が完成した時点で発進し、戦闘支援は後続作戦へ委譲する。発進後の侵攻波へ輸送容量を超える cargo や遅れて生産した戦闘要員を追加しない
 
 - **改善**: 撃破・迎撃候補の容量付き限界価値評価
   - 敵1体を最寄り作戦1件へ一意に帰属させ、HP補正済み残存戦力と戦略優先度を別フィールドで管理する
@@ -103,13 +106,13 @@
 
 ## Impact
 
-生産選定は `AiVersion::V4` として独立している。一方、Stage 2 の洋上 Reinforce と Squad 実行の修正は V3/V4 共有の島嶼キャンペーン層へ入るため、V3にも改善方向の挙動変更がある。
+生産選定は `AiVersion::V4` として独立している。一方、Stage 2 の洋上 Reinforce、Stage 3 の Assault と Squad 実行の修正は V3/V4 共有の島嶼キャンペーン層へ入るため、V3にも改善方向の挙動変更がある。
 
 - `engine/src/ai/v4/operation.rs`（新規）: 5 枠（占領 / 撃破 / 護衛 / 輸送 / 迎撃）の状況導出。`OperationFacts` → `OperationSlots` の純粋関数として実装し、マップ名・ユニット名・トポロジ前提を持ち込まない
 - `engine/src/ai/v4/mod.rs`（新規）: 盤面スキャン、拠点クラスタからの作戦構築、移動タイプ別の到達可能性判定、空き生産枠からの「1 枠あたり予算」算出（`systems/production.rs` の `PRODUCTION_RANGE` / `is_within_production_range` を利用）、枠消費ベースの候補選定、見送り購入、作戦ゼロ時のフォールバック
 - `engine/src/ai/mod.rs`: `pub mod v4;` の追加のみ
 - `engine/src/ai/production.rs`: V4 委譲に加え、既存のキャンペーン不足計画関数をV4から再利用できる可視性へ変更。V1/V2/V3の生産選定ロジックは未変更
-- `engine/src/ai/island_campaign.rs` / `island_campaign_analysis.rs`: 洋上 Reinforce の実 cargo と生産可能輸送手段を出発島・積載可能兵種込みで照合し、輸送不足を shortfall として保持
+- `engine/src/ai/island_campaign.rs` / `island_campaign_analysis.rs`: 洋上 Reinforce の実 cargo と生産可能輸送手段を出発島・積載可能兵種込みで照合し、輸送不足を shortfall として保持。Assault は作戦優先度、将来予算予約、生産可能経路別の輸送編成、初動上陸波の容量を同じ作戦状態で管理する
 - `engine/src/ai/squad.rs`: 自力展開戦力と輸送 cargo の分離、複数 cargo の Pickup 進行
 - `engine/src/ai/engine.rs`: Drop に参加した輸送役と cargo の双方を当該ターンの行動済みとして記録
 - `strategy.rs` / `resources/`: Stage 2では変更しない。新しい予約台帳 Resource も追加しない

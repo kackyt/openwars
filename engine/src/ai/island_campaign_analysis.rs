@@ -1493,6 +1493,76 @@ fn requirement_for_assessment(
     }
 }
 
+/// 同じ出発島の生産圏内施設だけで組める最小の強襲輸送パッケージを返す。
+/// 港と空港の両方が使える島では従来どおり各1体、片方しか使えない島では
+/// 同種2体で4 cargo枠を確保し、生産不能な輸送役を待ち続けない。
+fn producible_assault_transport_package(
+    blueprints: &[CampaignTransportBlueprint],
+) -> Option<(Vec<UnitType>, u32, u32)> {
+    let mut source_islands: Vec<_> = blueprints
+        .iter()
+        .map(|blueprint| blueprint.source_island)
+        .collect();
+    source_islands.sort_unstable_by_key(|island| island.0);
+    source_islands.dedup();
+
+    let mut packages = Vec::new();
+    for source_island in source_islands {
+        let lander = blueprints.iter().find(|blueprint| {
+            blueprint.source_island == source_island && blueprint.unit_type == UnitType::Lander
+        });
+        let helicopter = blueprints.iter().find(|blueprint| {
+            blueprint.source_island == source_island
+                && blueprint.unit_type == UnitType::TransportHelicopter
+        });
+        let selected = match (lander, helicopter) {
+            (Some(lander), Some(helicopter)) => vec![lander, helicopter],
+            (Some(lander), None) => vec![lander, lander],
+            (None, Some(helicopter)) => vec![helicopter, helicopter],
+            (None, None) => continue,
+        };
+        let unit_types = selected
+            .iter()
+            .map(|blueprint| blueprint.unit_type)
+            .collect();
+        let cost = selected.iter().fold(0_u32, |total, blueprint| {
+            total.saturating_add(blueprint.cost)
+        });
+        let slots = selected.iter().fold(0_u32, |total, blueprint| {
+            total.saturating_add(blueprint.cargo_slots)
+        });
+        packages.push((cost, source_island.0, unit_types, slots));
+    }
+    packages.sort_by_key(|(cost, island, _, _)| (*cost, *island));
+    packages
+        .into_iter()
+        .next()
+        .map(|(cost, _, unit_types, slots)| (unit_types, cost, slots))
+}
+
+fn adapt_assault_requirement_to_production_route(
+    assessment: &mut crate::ai::island_campaign::IslandCampaignAssessment,
+    requirement: &mut IslandCampaignRequirement,
+    blueprints: &[CampaignTransportBlueprint],
+) -> Vec<UnitType> {
+    if assessment.decision != IslandCampaignDecision::Assault {
+        return Vec::new();
+    }
+    let Some((unit_types, transport_cost, transport_slots)) =
+        producible_assault_transport_package(blueprints)
+    else {
+        // 生産拠点を失った一時局面では、既存輸送を再利用できる従来編成を維持する。
+        return vec![UnitType::Lander, UnitType::TransportHelicopter];
+    };
+    requirement.preferred_transport = unit_types.first().copied();
+    requirement.transport_slots = transport_slots;
+    requirement.total_budget = transport_cost
+        .saturating_add(requirement.capture_units.saturating_mul(1_000))
+        .saturating_add(requirement.combat_budget);
+    assessment.required_budget = requirement.total_budget;
+    unit_types
+}
+
 fn minimum_producible_campaign_combat_cost(
     map: &Map,
     registry: &MasterDataRegistry,
@@ -1903,7 +1973,7 @@ pub fn analyze_island_campaign_excluding(
             continue;
         };
         let mut assessment = assess_island(island_facts);
-        let requirement = if sole_capturable_landmass == Some(island.id)
+        let mut requirement = if sole_capturable_landmass == Some(island.id)
             && assessment.state == IslandCampaignState::Contested
         {
             // 単一の主陸塊で起きる通常戦闘は島嶼作戦へ資源を予約せず、地上戦略へ委譲する。
@@ -1922,6 +1992,11 @@ pub fn analyze_island_campaign_excluding(
         } else {
             requirement_for_assessment(island_facts, &mut assessment)
         };
+        let assault_transport_types = adapt_assault_requirement_to_production_route(
+            &mut assessment,
+            &mut requirement,
+            &producible_transports,
+        );
         let existing_operation = operations_by_island.get(&island.id).cloned();
         let Some(target_position) =
             candidate_target_position(&island, &properties, player_id, existing_operation.as_ref())
@@ -1934,6 +2009,7 @@ pub fn analyze_island_campaign_excluding(
             roi_production_sites: island_facts.roi_production_sites,
             transport_eta: island_facts.transport_eta,
             requirement,
+            assault_transport_types,
             minimum_combat_purchase_cost,
             producible_transports: producible_transports.clone(),
             existing_operation,
@@ -1956,6 +2032,59 @@ mod tests {
     use bevy_ecs::prelude::{Entity, World};
 
     const TEST_SEED: u64 = 42;
+
+    #[test]
+    fn assault_transport_package_uses_two_helicopters_when_only_airport_is_producible() {
+        let blueprints = vec![CampaignTransportBlueprint {
+            unit_type: UnitType::TransportHelicopter,
+            cost: 4_000,
+            cargo_slots: 2,
+            loadable_unit_types: vec![UnitType::Infantry],
+            source_island: IslandId(7),
+        }];
+
+        let package = producible_assault_transport_package(&blueprints);
+
+        assert_eq!(
+            package,
+            Some((
+                vec![UnitType::TransportHelicopter, UnitType::TransportHelicopter,],
+                8_000,
+                4,
+            ))
+        );
+    }
+
+    #[test]
+    fn assault_transport_package_does_not_mix_different_source_islands() {
+        let blueprints = vec![
+            CampaignTransportBlueprint {
+                unit_type: UnitType::Lander,
+                cost: 16_500,
+                cargo_slots: 2,
+                loadable_unit_types: vec![UnitType::Infantry],
+                source_island: IslandId(1),
+            },
+            CampaignTransportBlueprint {
+                unit_type: UnitType::TransportHelicopter,
+                cost: 4_000,
+                cargo_slots: 2,
+                loadable_unit_types: vec![UnitType::Infantry],
+                source_island: IslandId(2),
+            },
+        ];
+
+        let package = producible_assault_transport_package(&blueprints);
+
+        assert_eq!(
+            package,
+            Some((
+                vec![UnitType::TransportHelicopter, UnitType::TransportHelicopter,],
+                8_000,
+                4,
+            ))
+        );
+    }
 
     fn spawn_test_unit(
         world: &mut World,
