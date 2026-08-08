@@ -493,6 +493,11 @@ fn plan_campaign_shortfall_production(
 /// - その他のユニットは戦略（フェーズ）、アンチ性能、到達ターン数（ETA）に基づき多角的に評価
 /// - 予算（貯金を差し引いた仮想予算）内で最も評価が高くなるよう動的計画法（ナップサック問題）で生産を決定
 pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceUnitCommand> {
+    // V4 は作戦駆動生産へ委譲する。V1/V2/V3 の経路は以下そのまま。
+    if crate::ai::resolve_player_ai_version(world, player_id).uses_operation_driven_production() {
+        return crate::ai::v4::decide_production_v4(world, player_id);
+    }
+
     let mut commands = Vec::new();
 
     let strategy = analyze_strategy_for_turn(world, player_id);

@@ -126,6 +126,16 @@ ISSUE58_V3_V1 = "v3-v1"
 ISSUE58_V3_SELFPLAY = "v3-selfplay"
 
 
+def normalize_ai_version(version):
+    """CLI で許容する AI バージョン表記を MCP が受け取る正規表記へ揃える。"""
+    normalized = version.strip().upper()
+    if normalized not in {"V1", "V2", "V3", "V4"}:
+        raise ValueError(
+            f"Invalid AI version: {version}. Expected one of V1, V2, V3 or V4"
+        )
+    return normalized
+
+
 def build_match_specs(maps, subject, baseline, seeds):
     """各 seed を両方の手番へ決定的な順序で割り当てる。"""
     specs = []
@@ -147,6 +157,55 @@ def build_issue58_match_specs(protocol, maps, seeds):
             for seed in seeds
         ]
     raise ValueError(f"unknown Issue #58 protocol: {protocol}")
+
+
+def write_trace_jsonl(path, results):
+    """遊兵計測と生産トレースを「1手番1行」の JSONL として書き出す。
+
+    集計も判定もここでは行わない。engine が出した値をそのまま残すだけで、
+    遊兵数の推移や「同一ユニットが全施設へ発注される」現象は
+    この生ログを後から読み解いて確認する。
+    """
+    lines = []
+    for game_index, result in enumerate(results):
+        header = {
+            "game_index": game_index,
+            "map": result.get("map"),
+            "p1": result.get("p1"),
+            "p2": result.get("p2"),
+            "seed": result.get("seed"),
+        }
+        # 1ラウンドにP1/P2の2手番が入るので (ラウンド, プレイヤー) で1行にまとめる。
+        records = {}
+
+        def record_for(entry):
+            key = (entry.get("round"), entry.get("player_id"))
+            record = records.get(key)
+            if record is None:
+                record = dict(header)
+                record["round"] = entry.get("round")
+                record["turn"] = entry.get("turn")
+                record["player_id"] = entry.get("player_id")
+                records[key] = record
+            return record
+
+        for entry in result.get("idle_audit_history", []):
+            record_for(entry)["idle_audit"] = entry.get("audit")
+        for entry in result.get("production_plan_history", []):
+            record_for(entry)["production_plan"] = entry.get("plan")
+
+        # 欠測（V1〜V3 は生産トレースを持たない）を挟んでも順序が崩れないよう -1 で埋める。
+        for key in sorted(
+            records,
+            key=lambda k: (
+                k[0] if k[0] is not None else -1,
+                k[1] if k[1] is not None else -1,
+            ),
+        ):
+            lines.append(json.dumps(records[key], ensure_ascii=False))
+
+    # 親ディレクトリ作成と置換は write_text_atomic 側が担保する。
+    write_text_atomic(path, "".join(f"{line}\n" for line in lines))
 
 
 def collect_round_metrics(tool, state, round_number):
@@ -192,6 +251,9 @@ def run_single_game(
     ui_callback=None,
     tool_caller=None,
 ):
+    # 計画書の `--p1 v4` のような小文字指定も、MCP の受け付ける大文字表記へ正規化する。
+    p1_ver = normalize_ai_version(p1_ver)
+    p2_ver = normalize_ai_version(p2_ver)
     tool = tool_caller or call_tool
     if ui_callback: ui_callback({"type": "log", "msg": f"Match started: P1({p1_ver}) vs P2({p2_ver}) on {map_name}"})
     
@@ -209,6 +271,10 @@ def run_single_game(
     transport_history = []
     strategic_history = []
     island_campaign_history = []
+    # 遊兵（任務なし・任務があるのに動けない）と生産判断の内訳をターン別に保持する。
+    # どちらも engine 側が判定済みの結果で、ここでは記録だけを行う。
+    idle_audit_history = []
+    production_plan_history = []
     initial_state = None
     error = None
 
@@ -226,6 +292,8 @@ def run_single_game(
             "transport_history": transport_history,
             "strategic_history": strategic_history,
             "island_campaign_history": island_campaign_history,
+            "idle_audit_history": idle_audit_history,
+            "production_plan_history": production_plan_history,
             "error": error,
         }
 
@@ -310,6 +378,29 @@ def run_single_game(
                         if unit.get("player_id") == current_player
                     ],
                     "campaign": campaign,
+                }
+            )
+
+        # 1ラウンドにP1/P2の2手番が入るため、必ずplayer_idを添えて区別する。
+        idle_audit = ai_result.get("idle_audit")
+        if idle_audit is not None:
+            idle_audit_history.append(
+                {
+                    "round": turn,
+                    "turn": state.get("turn"),
+                    "player_id": ai_result.get("player_id", current_player),
+                    "audit": idle_audit,
+                }
+            )
+
+        production_plan = ai_result.get("production_plan")
+        if production_plan is not None:
+            production_plan_history.append(
+                {
+                    "round": turn,
+                    "turn": state.get("turn"),
+                    "player_id": ai_result.get("player_id", current_player),
+                    "plan": production_plan,
                 }
             )
 
@@ -786,6 +877,11 @@ def main():
     parser.add_argument("--seeds", default=None, help="Comma-separated deterministic seed set")
     parser.add_argument("--json-output", default=None, help="Raw JSON output path")
     parser.add_argument(
+        "--trace-output",
+        default=None,
+        help="JSONL path for per-turn idle-unit and production traces",
+    )
+    parser.add_argument(
         "--baseline-json",
         default=None,
         help="Baseline JSON artifact required for Issue #58 result runs",
@@ -976,10 +1072,17 @@ def main():
                             "transport_history",
                             "strategic_history",
                             "island_campaign_history",
+                            "idle_audit_history",
+                            "production_plan_history",
                         }
                     },
                 }))
-                
+
+        if args.trace_output:
+            write_trace_jsonl(args.trace_output, all_results)
+            if args.mode == "batch":
+                print(json.dumps({"type": "info", "msg": f"Trace written to {args.trace_output}"}))
+
         if args.criteria == "issue58":
             analyses = [
                 analysis

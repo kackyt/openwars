@@ -968,11 +968,12 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> Option<Str
 
     match ai_version {
         crate::ai::ai_version::AiVersion::V1 => execute_ai_turn_v1(world, active_player),
-        // V3 は V2 と同じ部隊編成・ビーム探索パイプラインを共有し、
+        // V3/V4 は V2 と同じ部隊編成・ビーム探索パイプラインを共有し、
         // タイル評価 (decide_ai_action_v2) と盤面評価の中でバージョン別の強化を行う
-        crate::ai::ai_version::AiVersion::V2 | crate::ai::ai_version::AiVersion::V3 => {
-            execute_ai_turn_v2(world, active_player)
-        }
+        // （V4 の差分は生産判断のみで、行動決定パイプラインは V3 と同一）
+        crate::ai::ai_version::AiVersion::V2
+        | crate::ai::ai_version::AiVersion::V3
+        | crate::ai::ai_version::AiVersion::V4 => execute_ai_turn_v2(world, active_player),
     }
 }
 
@@ -1329,6 +1330,23 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     }
 
     // 4. 全行動完了 -> ターン終了
+    // ターン終了直前は「このターン結局何が動かなかったか」が確定する唯一の点。
+    // AiActionCooldown はターン境界で破棄されるため、ここで遊兵を計上しておく。
+    let acted_entities = world
+        .get_resource::<AiActionCooldown>()
+        .map(|res| res.0.clone())
+        .unwrap_or_default();
+    let idle_audit = crate::ai::idle_audit::audit_idle_units(world, active_player, &acted_entities);
+    if let Some(mut diagnostics) =
+        world.get_resource_mut::<crate::ai::idle_audit::IdleAuditDiagnostics>()
+    {
+        diagnostics.record(idle_audit);
+    } else {
+        let mut diagnostics = crate::ai::idle_audit::IdleAuditDiagnostics::default();
+        diagnostics.record(idle_audit);
+        world.insert_resource(diagnostics);
+    }
+
     if let Some(mut end_events) =
         world.get_resource_mut::<Events<crate::events::NextPhaseCommand>>()
     {
