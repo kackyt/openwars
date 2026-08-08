@@ -191,6 +191,10 @@ def write_trace_jsonl(path, results):
 
         for entry in result.get("idle_audit_history", []):
             record_for(entry)["idle_audit"] = entry.get("audit")
+        for entry in result.get("island_campaign_history", []):
+            record = record_for(entry)
+            record["available_funds"] = entry.get("available_funds")
+            record["island_campaign"] = entry.get("campaign")
         for entry in result.get("production_plan_history", []):
             record_for(entry)["production_plan"] = entry.get("plan")
 

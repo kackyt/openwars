@@ -1,8 +1,8 @@
 use crate::ai::island_campaign::{
-    CampaignResourcePool, CampaignUnitCandidate, ExistingCampaignOperation,
-    IslandCampaignCandidate, IslandCampaignDecision, IslandCampaignFacts, IslandCampaignPortfolio,
-    IslandCampaignRequirement, IslandCampaignState, allocate_campaign_portfolio, assess_island,
-    campaign_unit_type_rank, required_assault_budget,
+    CampaignResourcePool, CampaignTransportBlueprint, CampaignUnitCandidate,
+    ExistingCampaignOperation, IslandCampaignCandidate, IslandCampaignDecision,
+    IslandCampaignFacts, IslandCampaignPortfolio, IslandCampaignRequirement, IslandCampaignState,
+    allocate_campaign_portfolio, assess_island, campaign_unit_type_rank, required_assault_budget,
 };
 use crate::ai::islands::{Island, IslandId, IslandMap};
 use crate::ai::squad::{MissionPhase, MissionType, SquadManager, TransportPhase};
@@ -1536,6 +1536,70 @@ fn minimum_producible_campaign_combat_cost(
         .min()
 }
 
+/// 自軍の実生産拠点ごとに、増援作戦が要求できる輸送手段の諸元を構築する。
+fn producible_campaign_transports(
+    map: &Map,
+    registry: &MasterDataRegistry,
+    island_map: &IslandMap,
+    properties: &[PropertySnapshot],
+    player_id: PlayerId,
+) -> Vec<CampaignTransportBlueprint> {
+    let capital_positions: Vec<_> = properties
+        .iter()
+        .filter(|property| {
+            property.property.owner_id == Some(player_id)
+                && property.property.terrain == Terrain::Capital
+        })
+        .map(|property| property.position)
+        .collect();
+    let mut blueprints = Vec::new();
+    for property in properties
+        .iter()
+        .filter(|property| property.property.owner_id == Some(player_id))
+    {
+        if !crate::systems::production::is_within_production_range(
+            &capital_positions,
+            property.position.x,
+            property.position.y,
+            map.topology,
+        ) {
+            continue;
+        }
+        let Some(source_island) = island_map
+            .get_island_at(&property.position)
+            .map(|island| island.id)
+        else {
+            continue;
+        };
+        for unit_type in [UnitType::TransportHelicopter, UnitType::Lander] {
+            if !registry.can_produce_unit(property.property.terrain.as_str(), unit_type) {
+                continue;
+            }
+            let Some(stats) = unit_stats_for_type(registry, unit_type) else {
+                continue;
+            };
+            let blueprint = CampaignTransportBlueprint {
+                unit_type,
+                cost: stats.cost,
+                cargo_slots: stats.max_cargo,
+                loadable_unit_types: stats.loadable_unit_types,
+                source_island,
+            };
+            if !blueprints.iter().any(|existing| existing == &blueprint) {
+                blueprints.push(blueprint);
+            }
+        }
+    }
+    blueprints.sort_by_key(|blueprint| {
+        (
+            blueprint.source_island.0,
+            campaign_unit_type_rank(blueprint.unit_type),
+            blueprint.cost,
+        )
+    });
+    blueprints
+}
+
 fn candidate_target_position(
     island: &Island,
     properties: &[PropertySnapshot],
@@ -1796,6 +1860,8 @@ pub fn analyze_island_campaign_excluding(
     let properties = collect_property_snapshots(world);
     let minimum_combat_purchase_cost =
         minimum_producible_campaign_combat_cost(&map, &registry, &properties, player_id);
+    let producible_transports =
+        producible_campaign_transports(&map, &registry, &island_map, &properties, player_id);
     let factions = collect_faction_snapshots(world);
     let units = campaign_unit_snapshots(&manager, collect_unit_snapshots(world), &factions);
     let assigned_transport_phases = collect_assigned_transport_phases(&manager, &units, player_id);
@@ -1869,6 +1935,7 @@ pub fn analyze_island_campaign_excluding(
             transport_eta: island_facts.transport_eta,
             requirement,
             minimum_combat_purchase_cost,
+            producible_transports: producible_transports.clone(),
             existing_operation,
         });
     }

@@ -220,6 +220,16 @@ pub(crate) struct CampaignResourcePool {
     pub(crate) units: Vec<CampaignUnitCandidate>,
 }
 
+/// キャンペーンが不足輸送を生産要求へ変換するための、実際に生産可能な輸送諸元。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CampaignTransportBlueprint {
+    pub(crate) unit_type: UnitType,
+    pub(crate) cost: u32,
+    pub(crate) cargo_slots: u32,
+    pub(crate) loadable_unit_types: Vec<UnitType>,
+    pub(crate) source_island: IslandId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IslandCampaignCandidate {
     pub(crate) assessment: IslandCampaignAssessment,
@@ -229,6 +239,8 @@ pub(crate) struct IslandCampaignCandidate {
     pub(crate) requirement: IslandCampaignRequirement,
     /// combat power不足が正の場合に予約すべき最小の実購入unit cost。
     pub(crate) minimum_combat_purchase_cost: Option<u32>,
+    /// 自軍拠点で実際に生産できる輸送手段。Reinforceの不足を盤面依存で導出する。
+    pub(crate) producible_transports: Vec<CampaignTransportBlueprint>,
     pub(crate) existing_operation: Option<ExistingCampaignOperation>,
 }
 
@@ -501,6 +513,105 @@ fn campaign_transport_package_covers(
     search_campaign_transport_coverage(&cargo, &transports, 0, &mut assigned_counts)
 }
 
+/// 現在予約済みの輸送役が、指定cargoのうち最大何体を同時に運べるか。
+/// 完全被覆だけでなく不足スロット数を生産へ返すため、同じ二部マッチングを最大化する。
+fn campaign_transport_covered_count(
+    cargo_entities: &[Entity],
+    transport_entities: &[Entity],
+    catalog: &HashMap<Entity, CampaignUnitCandidate>,
+) -> usize {
+    let cargo: Vec<_> = cargo_entities
+        .iter()
+        .filter_map(|entity| catalog.get(entity))
+        .collect();
+    let transports: Vec<_> = transport_entities
+        .iter()
+        .filter_map(|entity| catalog.get(entity))
+        .collect();
+    if cargo.len() != cargo_entities.len() || transports.is_empty() {
+        return 0;
+    }
+
+    fn search(
+        cargo: &[&CampaignUnitCandidate],
+        transports: &[&CampaignUnitCandidate],
+        index: usize,
+        assigned: &mut [u32],
+    ) -> usize {
+        if index == cargo.len() {
+            return 0;
+        }
+        let unit = cargo[index];
+        let mut best = search(cargo, transports, index.saturating_add(1), assigned);
+        for (transport_index, transport) in transports.iter().enumerate() {
+            if assigned[transport_index] >= transport.available_cargo_slots
+                || transport.island_id != unit.island_id
+                || !transport.loadable_unit_types.contains(&unit.unit_type)
+            {
+                continue;
+            }
+            assigned[transport_index] = assigned[transport_index].saturating_add(1);
+            best = best.max(1 + search(cargo, transports, index.saturating_add(1), assigned));
+            assigned[transport_index] = assigned[transport_index].saturating_sub(1);
+        }
+        best
+    }
+
+    search(&cargo, &transports, 0, &mut vec![0; transports.len()])
+}
+
+/// 洋上展開で不足する輸送スロットと、最小費用で全cargoを積める輸送種別を返す。
+fn remote_transport_shortfall(
+    cargo_entities: &[Entity],
+    transport_entities: &[Entity],
+    catalog: &HashMap<Entity, CampaignUnitCandidate>,
+    blueprints: &[CampaignTransportBlueprint],
+) -> Option<(UnitType, u32, u32)> {
+    let covered = campaign_transport_covered_count(cargo_entities, transport_entities, catalog);
+    let missing_slots = u32::try_from(cargo_entities.len().saturating_sub(covered)).ok()?;
+    if missing_slots == 0 {
+        return None;
+    }
+
+    let mut cargo_by_island: HashMap<IslandId, Vec<UnitType>> = HashMap::new();
+    for entity in cargo_entities {
+        let cargo = catalog.get(entity)?;
+        cargo_by_island
+            .entry(cargo.island_id?)
+            .or_default()
+            .push(cargo.unit_type);
+    }
+
+    let mut candidates = Vec::new();
+    for unit_type in [UnitType::TransportHelicopter, UnitType::Lander] {
+        let mut total_cost = 0_u32;
+        let mut possible = true;
+        for (source_island, cargo_types) in &cargo_by_island {
+            let Some(blueprint) = blueprints.iter().find(|blueprint| {
+                blueprint.unit_type == unit_type
+                    && blueprint.source_island == *source_island
+                    && cargo_types
+                        .iter()
+                        .all(|cargo_type| blueprint.loadable_unit_types.contains(cargo_type))
+            }) else {
+                possible = false;
+                break;
+            };
+            let units = u32::try_from(cargo_types.len())
+                .unwrap_or(u32::MAX)
+                .div_ceil(blueprint.cargo_slots.max(1));
+            total_cost = total_cost.saturating_add(units.saturating_mul(blueprint.cost));
+        }
+        if possible {
+            candidates.push((total_cost, campaign_unit_type_rank(unit_type), unit_type));
+        }
+    }
+    candidates.sort_unstable_by_key(|(cost, rank, _)| (*cost, *rank));
+    candidates
+        .first()
+        .map(|(cost, _, unit_type)| (*unit_type, missing_slots, *cost))
+}
+
 fn minimum_purchase_floor(
     decision: IslandCampaignDecision,
     missing_transport_slots: u32,
@@ -537,6 +648,7 @@ fn reserve_candidate(
     let mut combat_entities = Vec::new();
     let mut reserved_entity_value = 0_u32;
     let mut requirement_credit = 0_u32;
+    let mut remote_transport_demand = None;
     let existing = candidate.existing_operation.as_ref();
 
     if let Some(operation) = existing {
@@ -749,16 +861,20 @@ fn reserve_candidate(
             .chain(combat_entities.iter())
             .copied()
             .filter(|entity| {
-                catalog
-                    .get(entity)
-                    .is_some_and(|unit| !unit.is_transporting && unit.island_id != Some(island_id))
+                catalog.get(entity).is_some_and(|unit| {
+                    !unit.is_transporting
+                        && unit.island_id != Some(island_id)
+                        && !unit
+                            .reachable_positions
+                            .contains(&candidate.target_position)
+                })
             })
             .collect();
         if !remote_cargo.is_empty() {
-            // 洋上補強は、予約cargoと同じ出発島にいて全cargoを実搭載可能な輸送役も同時予約する。
+            // 後続波も総輸送枠だけでreadyにせず、cargoと同じ出発島から実搭載できることを確認する。
             available = sorted_pool_units(&provisional, island_id);
             while !campaign_transport_package_covers(&remote_cargo, &transport_entities, catalog) {
-                let index = available.iter().position(|transport| {
+                let Some(index) = available.iter().position(|transport| {
                     is_offshore_transport(transport.unit_type)
                         && remote_cargo.iter().any(|cargo| {
                             catalog.get(cargo).is_some_and(|cargo| {
@@ -766,11 +882,24 @@ fn reserve_candidate(
                                     && transport.loadable_unit_types.contains(&cargo.unit_type)
                             })
                         })
-                })?;
+                }) else {
+                    // 既存輸送が無くても作戦を消さない。不足量を後段のpurchase_shortfallへ上げる。
+                    break;
+                };
                 let transport = available.remove(index);
                 push_unique_entity(&mut transport_entities, transport.entity);
                 reserved_entity_value = reserved_entity_value.saturating_add(transport.cost);
                 remove_entity(&mut provisional, transport.entity);
+            }
+            if !campaign_transport_package_covers(&remote_cargo, &transport_entities, catalog) {
+                // 生産可能な輸送手段が無ければ、安全に完全パッケージを作れない。
+                let demand = remote_transport_shortfall(
+                    &remote_cargo,
+                    &transport_entities,
+                    catalog,
+                    &candidate.producible_transports,
+                )?;
+                remote_transport_demand = Some(demand);
             }
         }
     }
@@ -796,15 +925,23 @@ fn reserve_candidate(
         remaining_combat_budget,
     )
     .max(combat_purchase_floor);
-    let purchase_budget = requirement
+    let base_purchase_budget = requirement
         .total_budget
         .saturating_sub(requirement_credit)
         .max(structural_floor);
+    // Reinforceの元要求は戦闘予算だけなので、実際のremote cargoから判明した輸送費を加算する。
+    let reinforcement_transport_budget = remote_transport_demand
+        .map(|(_, _, cost)| cost)
+        .unwrap_or(0);
+    let purchase_budget = base_purchase_budget.saturating_add(reinforcement_transport_budget);
     if provisional.available_funds < purchase_budget {
         return None;
     }
     provisional.available_funds = provisional.available_funds.saturating_sub(purchase_budget);
 
+    if let Some((_, slots, _)) = remote_transport_demand {
+        remaining_transport_slots = remaining_transport_slots.max(slots);
+    }
     let preferred_transport = if candidate.assessment.decision == IslandCampaignDecision::Assault {
         if missing_lander {
             Some(UnitType::Lander)
@@ -813,6 +950,8 @@ fn reserve_candidate(
         } else {
             None
         }
+    } else if let Some((unit_type, _, _)) = remote_transport_demand {
+        Some(unit_type)
     } else if remaining_transport_slots > 0 {
         requirement.preferred_transport
     } else {
@@ -1694,8 +1833,39 @@ mod tests {
                 total_budget: 6_000,
             },
             minimum_combat_purchase_cost: Some(1_000),
+            producible_transports: test_transport_blueprints(),
             existing_operation: None,
         }
+    }
+
+    fn test_transport_blueprints() -> Vec<CampaignTransportBlueprint> {
+        (0..=16)
+            .flat_map(|source_island| {
+                [
+                    CampaignTransportBlueprint {
+                        unit_type: UnitType::TransportHelicopter,
+                        cost: 4_000,
+                        cargo_slots: 2,
+                        loadable_unit_types: vec![UnitType::Infantry, UnitType::Mech],
+                        source_island: IslandId(source_island),
+                    },
+                    CampaignTransportBlueprint {
+                        unit_type: UnitType::Lander,
+                        cost: 16_500,
+                        cargo_slots: 2,
+                        loadable_unit_types: vec![
+                            UnitType::Infantry,
+                            UnitType::Mech,
+                            UnitType::Recon,
+                            UnitType::Tank,
+                            UnitType::MdTank,
+                            UnitType::Artillery,
+                        ],
+                        source_island: IslandId(source_island),
+                    },
+                ]
+            })
+            .collect()
     }
 
     fn unit_candidate(
@@ -1832,6 +2002,7 @@ mod tests {
                 total_budget: 0,
             },
             minimum_combat_purchase_cost: Some(1_000),
+            producible_transports: test_transport_blueprints(),
             existing_operation: None,
         }
     }
@@ -1859,6 +2030,7 @@ mod tests {
                 total_budget: 0,
             },
             minimum_combat_purchase_cost: Some(1_000),
+            producible_transports: test_transport_blueprints(),
             existing_operation: None,
         }
     }
@@ -1884,6 +2056,7 @@ mod tests {
                 total_budget: required_power,
             },
             minimum_combat_purchase_cost: Some(1_000),
+            producible_transports: test_transport_blueprints(),
             existing_operation: None,
         }
     }
@@ -1909,6 +2082,7 @@ mod tests {
                 total_budget: 32_700,
             },
             minimum_combat_purchase_cost: Some(1_000),
+            producible_transports: test_transport_blueprints(),
             existing_operation: None,
         }
     }
@@ -1938,6 +2112,7 @@ mod tests {
                 total_budget: enemy_value,
             },
             minimum_combat_purchase_cost: Some(1_000),
+            producible_transports: test_transport_blueprints(),
             existing_operation: None,
         }
     }
@@ -2327,6 +2502,58 @@ mod tests {
         assert!(assignment.combat_entities.is_empty());
         assert_eq!(assignment.purchase_shortfall.combat_budget, 0);
         assert_eq!(assignment.purchase_shortfall.total_budget, 0);
+        assert!(assignment.operation_ready);
+    }
+
+    /// 別島の増援戦力に輸送役が無い場合も作戦を消さず、Lander不足として生産へ返す。
+    #[test]
+    fn reinforcement_without_transport_reports_heavy_transport_shortfall() {
+        let tank = Entity::from_raw(142);
+        let candidate = reinforcement_candidate(0, 7_000);
+        let mut remote_tank = unit_candidate(142, UnitType::Tank, 7_000, false, 0);
+        remote_tank.island_id = Some(IslandId(1));
+        remote_tank.reachable_positions.clear();
+
+        let portfolio = allocate_campaign_portfolio(
+            vec![candidate],
+            CampaignResourcePool {
+                available_funds: 16_500,
+                units: vec![remote_tank],
+            },
+        );
+
+        let assignment = &portfolio.active_offensives[0];
+        assert_eq!(assignment.decision, IslandCampaignDecision::Reinforce);
+        assert_eq!(assignment.combat_entities, vec![tank]);
+        assert_eq!(
+            assignment.purchase_shortfall.preferred_transport,
+            Some(UnitType::Lander)
+        );
+        assert_eq!(assignment.purchase_shortfall.transport_slots, 1);
+        assert_eq!(assignment.purchase_shortfall.total_budget, 16_500);
+        assert!(!assignment.operation_ready);
+    }
+
+    /// 目標島にいる増援は陸路で合流できるため、輸送shortfallを立てない。
+    #[test]
+    fn local_reinforcement_does_not_request_transport() {
+        let tank = Entity::from_raw(143);
+        let candidate = reinforcement_candidate(0, 7_000);
+        let mut local_tank = unit_candidate(143, UnitType::Tank, 7_000, false, 0);
+        local_tank.island_id = Some(IslandId(0));
+
+        let portfolio = allocate_campaign_portfolio(
+            vec![candidate],
+            CampaignResourcePool {
+                available_funds: 0,
+                units: vec![local_tank],
+            },
+        );
+
+        let assignment = &portfolio.active_offensives[0];
+        assert_eq!(assignment.combat_entities, vec![tank]);
+        assert_eq!(assignment.purchase_shortfall.transport_slots, 0);
+        assert_eq!(assignment.purchase_shortfall.preferred_transport, None);
         assert!(assignment.operation_ready);
     }
 
@@ -2752,6 +2979,7 @@ mod tests {
                 total_budget: 32_700,
             },
             minimum_combat_purchase_cost: Some(1_000),
+            producible_transports: test_transport_blueprints(),
             existing_operation: None,
         };
 

@@ -15,6 +15,7 @@
 pub mod operation;
 pub mod trace;
 
+use crate::ai::production::plan_campaign_shortfall_production;
 use operation::{
     AcquisitionMode, OperationFacts, OperationKind, OperationSlots, RESERVATION_PATIENCE_TURNS,
     SLOT_PRIORITY, SlotKind, SlotTier, acquisition_mode, derive_slots,
@@ -148,6 +149,16 @@ struct V4ProductionTurnPlan {
     commands: VecDeque<ProduceUnitCommand>,
 }
 
+/// 島嶼キャンペーンの完全パッケージをV4の汎用作戦より先に処理した結果。
+enum CampaignProductionControl {
+    /// 今回の呼び出しで発行するキャンペーン生産命令。
+    Command(ProduceUnitCommand),
+    /// 高優先作戦を完成できないため、汎用生産へ予算を流さず終了する。
+    BlockGeneric,
+    /// キャンペーン要求が無いか全行を完成済みなので、V4汎用生産へ進める。
+    Continue,
+}
+
 /// 生産候補 1 件。
 #[derive(Debug, Clone, Copy)]
 struct SlotCandidate {
@@ -163,6 +174,12 @@ struct SlotCandidate {
 /// `decide_production` から `AiVersion::uses_operation_driven_production()` が
 /// true のときだけ委譲される。V1/V2/V3 の経路には一切影響しない。
 pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<ProduceUnitCommand> {
+    match decide_campaign_production_v4(world, player_id) {
+        CampaignProductionControl::Command(command) => return vec![command],
+        CampaignProductionControl::BlockGeneric => return Vec::new(),
+        CampaignProductionControl::Continue => {}
+    }
+
     let turn = world
         .get_resource::<crate::resources::MatchState>()
         .map_or(0, |state| state.current_turn_number.0);
@@ -196,6 +213,69 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
     let next = turn_plan.commands.pop_front();
     world.insert_resource(turn_plan);
     next.into_iter().collect()
+}
+
+/// 戦術層が組んだ島嶼キャンペーンの不足を、V4固有の汎用作戦より先に生産する。
+///
+/// `AiTurnStrategyCache` は行動計画時に同じプレイヤーのportfolioを保持している。
+/// 生産APIは1命令ごとに呼ばれるため、V3と同じcache queueへ完全パッケージを保存し、
+/// shortfallの再計算による二重発注を防ぐ。高優先行を完成できないときはgenericを
+/// blockし、輸送・積荷・戦闘戦力の一部だけを逐次投入しない。
+fn decide_campaign_production_v4(
+    world: &mut World,
+    player_id: PlayerId,
+) -> CampaignProductionControl {
+    let plan_exists = world
+        .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+        .is_some_and(|cache| cache.campaign_production_planned(player_id));
+    if plan_exists {
+        let mut cache = world
+            .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .unwrap_or_default();
+        let next = cache.take_campaign_production_command(player_id);
+        let blocks_generic = cache.campaign_production_blocks_generic(player_id);
+        world.insert_resource(cache);
+        return match next {
+            Some(command) => CampaignProductionControl::Command(command),
+            None if blocks_generic => CampaignProductionControl::BlockGeneric,
+            None => CampaignProductionControl::Continue,
+        };
+    }
+
+    let shortfalls = world
+        .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+        .and_then(|cache| cache.campaign_portfolio(player_id))
+        .map(|portfolio| portfolio.aggregate_missing_requirements())
+        .unwrap_or_default();
+    if shortfalls.is_empty() {
+        return CampaignProductionControl::Continue;
+    }
+
+    let Some(scan) = BoardScan::collect(world, player_id) else {
+        return CampaignProductionControl::BlockGeneric;
+    };
+    let outcome = plan_campaign_shortfall_production(
+        player_id,
+        &shortfalls,
+        &scan.free_facilities,
+        &scan.available_types,
+        &scan.master_data,
+        scan.funds,
+    );
+    let completed_all_rows = outcome.completed_all_rows;
+    let mut cache = world
+        .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+        .unwrap_or_default();
+    cache.set_campaign_production_plan(player_id, outcome.commands, completed_all_rows);
+    let next = cache.take_campaign_production_command(player_id);
+    let blocks_generic = cache.campaign_production_blocks_generic(player_id);
+    world.insert_resource(cache);
+
+    match next {
+        Some(command) => CampaignProductionControl::Command(command),
+        None if blocks_generic => CampaignProductionControl::BlockGeneric,
+        None => CampaignProductionControl::Continue,
+    }
 }
 
 /// 盤面から生産判断に必要な観測量をすべて取り出したもの。
@@ -2533,5 +2613,79 @@ mod tests {
         ];
 
         assert_eq!(most_starved_slot(&ops), Some((1, SlotKind::Combat)));
+    }
+
+    /// 島作戦の不足はV4汎用作戦より先に発注し、不完全なパッケージの途中で
+    /// 余った施設を汎用生産へ開放しない。
+    #[test]
+    fn v4_prioritizes_campaign_package_and_blocks_generic_when_incomplete() {
+        use crate::ai::engine::AiTurnStrategyCache;
+        use crate::ai::island_campaign::{
+            IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignPortfolio,
+            IslandCampaignRequirement,
+        };
+        use crate::ai::islands::IslandId;
+        use crate::resources::Players;
+        use crate::resources::master_data::MasterDataRegistry;
+
+        let master_data = MasterDataRegistry::load().expect("master data should load");
+        let (mut world, _schedule) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master_data,
+            "map_3",
+            GridTopology::Hex,
+        )
+        .expect("map_3 should initialize");
+        let player_id = PlayerId(1);
+
+        // 輸送船だけは買えるが、同時必須の占領要員までは買えない資金に固定する。
+        world
+            .resource_mut::<Players>()
+            .0
+            .iter_mut()
+            .find(|player| player.id == player_id)
+            .expect("player 1 should exist")
+            .funds = 16_500;
+
+        let requirement = IslandCampaignRequirement {
+            preferred_transport: Some(UnitType::Lander),
+            transport_slots: 2,
+            capture_units: 1,
+            combat_budget: 0,
+            total_budget: 17_500,
+        };
+        let assignment = IslandCampaignAssignment {
+            island_id: IslandId(1),
+            decision: IslandCampaignDecision::Reinforce,
+            target_position: pos(23, 24),
+            requirement: requirement.clone(),
+            purchase_shortfall: requirement,
+            allocated_budget: 0,
+            transport_entities: Vec::new(),
+            capture_entities: Vec::new(),
+            combat_entities: Vec::new(),
+            operation_ready: false,
+            continued_from_existing_squad: false,
+        };
+        let mut cache = AiTurnStrategyCache::default();
+        cache.set_campaign_portfolio(
+            player_id,
+            IslandCampaignPortfolio {
+                active_offensives: vec![assignment],
+                ..IslandCampaignPortfolio::default()
+            },
+        );
+        world.insert_resource(cache);
+
+        let first = decide_production_v4(&mut world, player_id);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].unit_type, UnitType::Lander);
+
+        // 同一手番の次呼び出しでは、不足した占領要員を無視してgenericを出さない。
+        assert!(decide_production_v4(&mut world, player_id).is_empty());
+        assert!(
+            world
+                .resource::<AiTurnStrategyCache>()
+                .campaign_production_blocks_generic(player_id)
+        );
     }
 }

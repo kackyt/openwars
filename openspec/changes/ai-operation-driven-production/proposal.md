@@ -72,6 +72,12 @@
   - `strategy.rs:820-845` のスカラー合算を廃止し、優先度順の `Vec<OperationShortfall>` のまま生産ループへ渡す
   - 生産ループは 1 ユニット購入ごとに「どの作戦のどの枠を埋めたか」を記録して消費する
 
+- **改善**: V4 と既存島嶼キャンペーンの実行接続
+  - V4 は既存の `IslandCampaignShortfall` を汎用作戦へ再変換せず、キャンペーン生産を先に1手番分計画して既存キャッシュから順次発行する
+  - 最優先パッケージが未完成なら汎用生産を止め、輸送手段・占領要員・戦闘戦力の部分投入を防ぐ
+  - 洋上 Reinforce は、実 cargo の出発島と積載可能兵種に適合する輸送手段が無い場合も作戦を消さず、生産可能な輸送手段を shortfall として要求する
+  - 自力で目標へ展開できる航空戦力を輸送 cargo から分離し、Pickup は先頭以外の行動可能 cargo も同一手番に前進させる
+
 - **改善**: 撃破・迎撃候補の容量付き限界価値評価
   - 敵1体を最寄り作戦1件へ一意に帰属させ、HP補正済み残存戦力と戦略優先度を別フィールドで管理する
   - 既存戦力、候補採点、購入確定で同じ到達可能性判定と容量付き被覆関数を使用する
@@ -97,11 +103,14 @@
 
 ## Impact
 
-実装は `AiVersion::V4` として独立させたため、既存 AI（V1/V2/V3）のファイルは実質的に無改修で済んでいる。
+生産選定は `AiVersion::V4` として独立している。一方、Stage 2 の洋上 Reinforce と Squad 実行の修正は V3/V4 共有の島嶼キャンペーン層へ入るため、V3にも改善方向の挙動変更がある。
 
 - `engine/src/ai/v4/operation.rs`（新規）: 5 枠（占領 / 撃破 / 護衛 / 輸送 / 迎撃）の状況導出。`OperationFacts` → `OperationSlots` の純粋関数として実装し、マップ名・ユニット名・トポロジ前提を持ち込まない
 - `engine/src/ai/v4/mod.rs`（新規）: 盤面スキャン、拠点クラスタからの作戦構築、移動タイプ別の到達可能性判定、空き生産枠からの「1 枠あたり予算」算出（`systems/production.rs` の `PRODUCTION_RANGE` / `is_within_production_range` を利用）、枠消費ベースの候補選定、見送り購入、作戦ゼロ時のフォールバック
 - `engine/src/ai/mod.rs`: `pub mod v4;` の追加のみ
-- `engine/src/ai/production.rs`: 冒頭に V4 委譲の分岐を 1 箇所追加するのみ。V1/V2/V3 の生産ロジックは未変更
-- `engine/src/ai/island_campaign*.rs` / `strategy.rs` / `squad.rs` / `resources/`: **改修不要**（V4 は独自経路のため）。予約台帳 Resource も、要求を毎ターン観測量から再導出する方式（design.md Decision 10）により不要となった
+- `engine/src/ai/production.rs`: V4 委譲に加え、既存のキャンペーン不足計画関数をV4から再利用できる可視性へ変更。V1/V2/V3の生産選定ロジックは未変更
+- `engine/src/ai/island_campaign.rs` / `island_campaign_analysis.rs`: 洋上 Reinforce の実 cargo と生産可能輸送手段を出発島・積載可能兵種込みで照合し、輸送不足を shortfall として保持
+- `engine/src/ai/squad.rs`: 自力展開戦力と輸送 cargo の分離、複数 cargo の Pickup 進行
+- `engine/src/ai/engine.rs`: Drop に参加した輸送役と cargo の双方を当該ターンの行動済みとして記録
+- `strategy.rs` / `resources/`: Stage 2では変更しない。新しい予約台帳 Resource も追加しない
 - 対戦評価: `scripts/eval_matchup.py` による V4 vs V3 / V4 vs V1 の勝率・ZOC 支配面積・ターン収入の比較検証が必須

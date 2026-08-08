@@ -1,6 +1,6 @@
 ---
 title: V4 生産AI 修正計画（map_3 渡洋作戦の成立）
-version: 1.0.0
+version: 1.1.0
 status: draft
 owner: kackyt
 created: 2026-08-07
@@ -119,9 +119,9 @@ required_assault_budget = 22,500 + max(10,200, 敵戦力 × 1.2)
 
 > **注記（本計画の対象外・別途整理）**: [decide_contested](engine/src/ai/island_campaign.rs#L1215)（Contest / Reinforce / Withdraw の精緻化）は **`#[cfg(test)]` からしか呼ばれていない**（呼び出しは 1550/1559/1563/1567/1571、tests 開始は [1348](engine/src/ai/island_campaign.rs#L1348)）。本番の分岐は上表の analysis.rs 側だけであり、`Withdraw` は本番で生成されない。本件の修正対象ではないが、二重定義として整理対象に残す。
 
-**懸念（Stage 2 で必ず検証する）**: `Contest` 分岐は `combat_budget = 0` なので、`contested_is_competitive` の判定が甘いと第2波が出ず**逐次投入**になる。「なるべく一気に戦力を投入した方が被害が少なく早く撃破できる」という方針に直結するため、上陸直後のターンで Contest / Reinforce のどちらに落ちたかをトレースで確認する。
+**懸念（Stage 3 で検証する）**: `Contest` 分岐は `combat_budget = 0` なので、`contested_is_competitive` の判定が甘いと第2波が出ず**逐次投入**になる。「なるべく一気に戦力を投入した方が被害が少なく早く撃破できる」という方針に直結するため、敵島上陸を成立させる Stage 3 で Contest / Reinforce の遷移をトレースする。
 
-### 3.5. (b-4) 増援（Reinforce）の送り先は決まるが、**運ぶ船が要求されない**（→ RC-4）
+### 3.5. (b-4) Stage 2 修正前は、増援（Reinforce）の送り先は決まるが、**運ぶ船が要求されなかった**（RC-4）
 
 「Assault が外れた後、増援をどこへ送るか」は3層で決まっており、迷子にはならない。
 
@@ -256,16 +256,17 @@ if resolve_player_ai_version(world, player_id).uses_operation_driven_production(
 
 **V1 の `planner.rs` / `missions.rs` には触れない**（V4 は通らない）。V3 が既に持っている接続を V4 でも成立させる。
 
-1. **`decide_production_v4` の冒頭でキャンペーン不足分を先行消費する。** V3 の [production.rs:854-897](engine/src/ai/production.rs#L854-L897) と同じ手順を使う。
-   - [plan_campaign_shortfall_production](engine/src/ai/production.rs#L405) は `(player_id, shortfalls, facilities, available_types, master_data, available_funds)` だけを取る**純粋関数**で world に触らないため、そのまま再利用できる（可視性を `pub(crate)` へ広げるのみ）。
-   - 1ターン内の重複発注は既存の [AiTurnStrategyCache::set_campaign_production_plan / take_campaign_production_command](engine/src/ai/engine.rs#L69) キューで防ぐ。**新しい永続状態を足さない。**
-   - `campaign_production_blocks_generic` が true の間は V4 の汎用枠を走らせない（完全パッケージ優先＝逐次投入の禁止）。
-2. **`campaign_shortfalls` を V4 の枠導出にも反映する。** `BoardScan` にキャンペーン要求（輸送枠 / 占領ユニット / 戦闘予算 / 目標島）を載せ、`derive_slots` の `transport_slots` / `capture_units` が**キャンペーンの要求を下回らない**ようにする。これにより「買う側（V4）」と「運ぶ側（squad）」が同一の島集合を共有する。
-3. **予算の二重取り防止。** V3 が [production.rs:749](engine/src/ai/production.rs#L749) でやっているのと同様、キャンペーンが予約した資金を V4 の `full_commitment` から差し引く。要求額は絞らないが、同じ金を二度当てにしない。
-4. **RC-4: 増援に輸送枠を持たせる（共有層 `island_campaign*.rs` の修正）。** 上の 1〜3 は「V4 が要求を読む」側の修正であり、**要求そのものが出ていない**この穴は別途塞ぐ必要がある。
-   - [requirement_for_assessment](engine/src/ai/island_campaign_analysis.rs#L1465) の `Reinforce` 分岐で、**目標島に自軍の陸路が無い（＝洋上増援になる）場合に限り** `transport_slots` / `preferred_transport` を立てる。判定は既存の足がかり判定（[analysis.rs:1343-1383](engine/src/ai/island_campaign_analysis.rs#L1343) の `has_foothold` / `transport_options_for_island`）を再利用し、新しい距離計算を作らない。
-   - [reserve_candidate](engine/src/ai/island_campaign.rs#L746) の Reinforce ブロックで、輸送役が見つからず [769](engine/src/ai/island_campaign.rs#L769) の `?` に落ちる経路を、**「作戦ごと消す」から「不足を `purchase_shortfall.transport_slots` に積んで次ターン以降に繋ぐ」へ変える**。Assault が既に `remaining_transport_slots`（[778](engine/src/ai/island_campaign.rs#L778)）でやっていることを Reinforce にも適用する形にし、分岐を増やさず共通化する。
-   - **既存の安全側の性質は壊さない**: 積みきれない cargo を海に出さない（`campaign_transport_package_covers` を満たすまで出発しない）ことは維持する。変えるのは「黙って諦める」を「生産へ要求を上げる」に置き換える点だけ。
+Stage 1 後の実測から、問題は「V4 の汎用枠へキャンペーン需要を足せばよい」ではなく、**島嶼キャンペーンを要求・生産・割当の唯一の契約として先に完結させること**だと判明した。Stage 2 の契約を以下に固定する。
+
+1. **キャンペーン不足を V4 汎用作戦より先に生産する。** `decide_production_v4` の冒頭で `plan_campaign_shortfall_production` を呼び、優先度順の shortfall を消費する。この純粋関数は V3 と共有し、可視性だけを `pub(crate)` へ広げる。
+2. **同一 shortfall を V4 汎用枠へ重ねて変換しない。** キャンペーン要求はキャンペーン生産キューだけが所有する。`BoardScan` や `derive_slots` へ同じ需要を複写すると、予算・枠・帰属の二重管理になるため採用しない。
+3. **1手番1計画を守る。** 全キャンペーン生産命令を既存の `AiTurnStrategyCache` に保存し、生産APIの呼び出しごとに1件ずつ返す。高優先パッケージを当該手番で完成できない場合は `campaign_production_blocks_generic` を立て、余った施設・資金を汎用生産へ流さない。
+4. **生産した構成要素は次ターンの盤面再分析で同じ作戦へ予約する。** 新しい永続予約台帳は増やさない。`collect_existing_operations` と `reserve_candidate` が Entity 単位の実在戦力を再構築し、不足分だけを翌手番に再要求する。
+5. **洋上 Reinforce の輸送不足を作戦消滅ではなく shortfall にする。** 別島にいる実 cargo について、総スロット数だけでなく「同じ出発島」「積載可能兵種」を二部マッチングで検査する。不足時は、生産圏内の実拠点で生産可能な Lander / TransportHelicopter のうち、全 cargo を運べる最小費用の種別・不足枠・費用を `purchase_shortfall` へ返す。目標島にいる、または目標へ自力到達できる戦力には輸送を要求しない。
+6. **輸送 cargo と自力展開戦力を分離する。** Bomber など目標島へ自力到達できる戦力は Transport/Forming へ入れず、島外から直接 Attack / Defense Squad へ割り当てる。輸送役が積載できる地上戦力だけを cargo とする。
+7. **Pickup 中は行動可能な cargo を順に進める。** 先頭 cargo が行動済みでも後続 cargo の合流移動を止めない。Drop は輸送役と降車 cargo の双方が参加した行動として `AiActionCooldown` に記録し、監査上の偽陽性を除く。
+
+Stage 2 は「作戦を組んだユニットが生産・合流・輸送の責務を持ち、遊兵を減らす」段階である。**どの敵島をいつ優先するかは Stage 3** とし、14ターン以内の敵初期島上陸を Stage 2 の必須条件にはしない。この境界を混ぜると、接続の不具合と作戦順位の不具合を区別できない。
 
 **テスト**（`engine` 単体。既存の [island_campaign_analysis.rs](engine/src/ai/island_campaign_analysis.rs) と [squad.rs のフェーズ遷移テスト](engine/src/ai/squad.rs#L6011) の書式を踏襲する）
 
@@ -277,10 +278,18 @@ if resolve_player_ai_version(world, player_id).uses_operation_driven_production(
 - **RC-4**: 目標島に自軍の陸路がある増援では輸送枠を要求しないこと（過剰生産の防止）
 - **RC-4**: 修正後、洋上増援の輸送役に `MissionType::Transport` の Squad が実際に付き、`pickup_position` が設定されること（＝「任務ゼロで滞留する輸送船」が出ないことの回帰テスト）
 
+**実測結果（2026-08-08、map_3 / seed 42 / 14ターン / V4先後各1局）**:
+
+- Stage 1 の A/B/C=`92/54/29` に対し、Stage 2 は **`61/50/19`**。
+- 主要な排他的分類 A+B は `146 → 111`（35件、約24%減）、3指標合計は `175 → 130`（45件、約26%減）。A/B/Cのすべてが悪化せず減少した。
+- 関連単体テストは island campaign 36件、squad 37件が通過。進行中 Assault を「追加輸送を生産できない」という理由で消す試案は既存作戦を破壊したため棄却し、動的な輸送不足導出は Reinforce に限定した。
+- Issue #54 の敵初期島上陸は両手番とも14ターン内では未達。これは中立島を先に埋める作戦順位・同時攻勢上限の問題であり、Stage 3へ引き継ぐ。
+
 ### 5.4. Stage 3: 作戦カバレッジ（遠方の高価値島を落とさない）
 
 - 占領作戦の順位を `facility_lead_time` 単独ではなく **経済価値 ÷ リードタイム** にする。価値算出は既存の [Objective::evaluate](engine/src/ai/objectives.rs#L24)（収入・距離・敵生産拠点ペナルティ）を再利用し、二重実装しない。
 - `MAX_OPERATIONS` の定数 4 を、**同時に補給できる作戦数＝生産施設数**から導出する。根拠のないマジックナンバーを残さない。
+- Issue #54 の主ゲート（敵初期島の選定 → 上陸 → 同一 cargo による攻撃・被攻撃・占領）をこの Stage で判定する。Stage 2 の A/B/C を悪化させず、敵初期島が同時攻勢上限から恒常的に漏れないことを確認する。
 
 ---
 
@@ -291,11 +300,13 @@ if resolve_player_ai_version(world, player_id).uses_operation_driven_production(
 | `engine/src/ai/idle_audit.rs`（新規） | **遊兵カウンタ**。`audit_idle_units(world, player_id, cooldown) -> IdleAudit`（純粋関数）と分類 A/B/C の定義 |
 | `engine/src/ai/engine.rs` | `execute_ai_turn_v2` のターン終了直前（[1332](engine/src/ai/engine.rs#L1332)）で `audit_idle_units` を呼び per-turn リソースへ格納 |
 | `mcp-server/src/invasion_trace.rs` | `IdleAudit` のスナップショットを既存レコードに1フィールド追加。D（停滞 Squad）はターン間差分で算出 |
-| `engine/src/ai/v4/mod.rs` | `slot_fitness` の限界価値化、残存脅威の減衰、キャンペーン不足分の先行消費、`BoardScan` へのキャンペーン要求取り込み、`build_operations` の順位付けと作戦数、トレース |
-| `engine/src/ai/v4/operation.rs` | 残存脅威を `Operation` / `OperationFacts` に載せる。`transport_slots` / `capture_units` のキャンペーン下限。予約分の控除（`full_commitment` の式自体は変更しない） |
+| `engine/src/ai/v4/mod.rs` | `slot_fitness` の限界価値化、残存脅威の減衰、キャンペーン不足分の先行消費と同一手番キュー、未完成時の汎用生産ブロック、トレース |
+| `engine/src/ai/v4/operation.rs` | 残存脅威を `Operation` / `OperationFacts` に載せる |
 | `engine/src/ai/production.rs` | `plan_campaign_shortfall_production` の可視性のみ（ロジック不変。V1/V2/V3 の経路は一切変更しない） |
-| `engine/src/ai/island_campaign_analysis.rs` | **RC-4**: `requirement_for_assessment` の `Reinforce` 分岐に、洋上増援時のみ `transport_slots` / `preferred_transport` を立てる |
-| `engine/src/ai/island_campaign.rs` | **RC-4**: `reserve_candidate` の Reinforce 輸送予約が、船不足で作戦ごと消えるのではなく `purchase_shortfall.transport_slots` として要求を上げる |
+| `engine/src/ai/island_campaign_analysis.rs` | **RC-4**: 生産圏内の実拠点から、生産可能な輸送種別・積載能力・出発島を導出する |
+| `engine/src/ai/island_campaign.rs` | **RC-4**: Reinforce の実 cargo と輸送役を出発島・積載可能兵種込みで照合し、不足輸送を `purchase_shortfall` へ上げる |
+| `engine/src/ai/squad.rs` | 自力展開戦力を輸送 cargo から除外して直接任務へ割り当て、Pickup 中は次の行動可能 cargo を進める |
+| `scripts/eval_matchup.py` | 同一 JSONL レコードへ資金と島嶼キャンペーンの要求・不足・割当を出力する |
 
 `planner.rs` / `missions.rs` は **V1 専用のため変更しない**。
 
@@ -332,19 +343,19 @@ cargo test
 - 遊兵Aの累計と終盤3ターン合計がStage 0より悪化しないこと。Stage 1は生産内訳の修正であり任務接続はStage 2の責務なので、A=0とB/C改善はStage 1単独の必須条件にしない
 - B/Cが悪化した場合は兵種・MissionType・phase別に原因を記録し、Stage 2の未完了ゲートに追加すること
 
-**Stage 2 の合格条件（渡洋の連鎖 = 最優先）**
+**Stage 2 の合格条件（生産・作戦・輸送の接続）**
 
 - `scripts/eval_matchup.py --mode batch --map map_3 --p1 v4 --p2 v3 --criteria issue54 --max-turns 14`（先攻・後攻の両席、各1ゲームで足りる）
-- 単なる生産数ではなく、**目標島の選定 → 積載 → 輸送 → 合法地点（港・浅瀬）で降車 → 上陸部隊が島内の敵／拠点へ前進 → 撃破**の全連鎖がトレース上で追えること。1つでも切れていれば不合格。
-- **上陸で作戦が途切れないこと**（3.4 の懸念）。上陸が起きたターンの前後で以下を確認する。
-  - 輸送中の Squad がフェーズを保ったまま同じ島の作戦に再予約されること（`preserve_live_state` が効いていること）
-  - `continued_from_existing_squad` が立ち、そのターンの資金が継続中の作戦に先に回ること
-  - 上陸直後に `Contest`（予算0）へ落ちて第2波が止まっていないこと。止まっているなら `contested_is_competitive` の判定が甘い側の欠陥として別途扱う
-- **輸送船の遊兵がゼロになること**（観測事象の直接的な合否）。修正前は分類 A に計上されていた「港でうろつく Lander」が、修正後は Transport Squad を持ち（A から外れ）、かつ実際に毎ターン行動する（B にも入らない）こと。
-- **第2波が海を渡ること**（RC-4）。上陸ターン以降のトレースで、`Reinforce` が輸送枠の shortfall を出し、輸送船が発注／再割当され、増援が同じ `target_position` へ到達するところまで追えること。第1波を降ろした Lander が Return/Completed でプールから外れても連鎖が切れないこと。
+- Stage 1 と同一条件で、A/B/Cをすべて再計測する。合格条件は **A+BがStage 1より減少し、A/B/CのいずれもStage 1より悪化しないこと**。
+- キャンペーン shortfall の命令を同一手番に重複発注せず、未完成の最優先パッケージを無視してV4汎用生産へ流れないこと。
+- 洋上 Reinforce で輸送役が無い場合も作戦が消えず、実 cargo を積載できる生産可能な輸送種別が `purchase_shortfall` に現れること。陸路・自力展開可能な戦力には不要な輸送要求を出さないこと。
+- 既存の上陸・引き渡し・進行中作戦保持テストを維持し、Stage 2の共有層変更がready済みAssaultやTransit/Dropを破壊しないこと。
+- **輸送船の遊兵が減ること**（観測事象の直接的な合否）。修正前は分類 A に計上されていた輸送役が Transport Squad を持ち、行動可能な cargo があるのに先頭 cargo の cooldown だけで Pickup 全体が止まらないこと。
+- Issue #54 の敵初期島上陸は参考値として併記するが、目標選定・同時攻勢上限を扱う Stage 3 の合格ゲートとする。
 
 **Stage 3 以降**
 
+- map_3 の両手番で Issue #54 の敵初期島上陸と侵攻成立を確認すること
 - map_3 で V3・V1 に勝ち越すこと（決定的に）
 - 遊兵 A が終盤 0、B・D が Stage 2 時点から悪化していないこと（作戦枠を広げた副作用で「立てたが動かない作戦」が増えていないことの確認）
 - map_1 / map_2 の回帰確認（V4 席）
@@ -360,6 +371,13 @@ cargo test
 ---
 
 ## Changelog
+
+### [1.1.0] - 2026-08-08
+
+#### 変更
+
+- Stage 2を「島嶼キャンペーンshortfallの優先生産、洋上Reinforceの輸送不足化、自力展開戦力とcargoの分離、Pickup進行」の実装可能な契約へ再定義。
+- Stage 2の実測 A/B/C=`61/50/19` を記録し、Issue #54の敵初期島侵攻を作戦順位を扱うStage 3へ移管。
 
 ### [1.0.0] - 2026-08-07
 

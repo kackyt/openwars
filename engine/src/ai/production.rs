@@ -27,11 +27,11 @@ enum CampaignProductionRequirement {
 }
 
 #[derive(Debug)]
-struct CampaignProductionOutcome {
-    commands: Vec<ProduceUnitCommand>,
-    remaining_funds: u32,
-    used_facilities: std::collections::HashSet<GridPosition>,
-    completed_all_rows: bool,
+pub(crate) struct CampaignProductionOutcome {
+    pub(crate) commands: Vec<ProduceUnitCommand>,
+    pub(crate) remaining_funds: u32,
+    pub(crate) used_facilities: std::collections::HashSet<GridPosition>,
+    pub(crate) completed_all_rows: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -402,7 +402,7 @@ fn consume_campaign_candidate(
     shortfall.reserved_budget = shortfall.reserved_budget.saturating_sub(stats.cost);
 }
 
-fn plan_campaign_shortfall_production(
+pub(crate) fn plan_campaign_shortfall_production(
     player_id: PlayerId,
     shortfalls: &[IslandCampaignShortfall],
     facilities: &[(GridPosition, Terrain)],

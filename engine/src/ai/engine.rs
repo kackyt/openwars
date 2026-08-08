@@ -1233,13 +1233,25 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     }
 
     if let Some((entity, cmd)) = transport_action {
+        // Drop は輸送役だけでなく、降車したcargoもそのターンの行動を消費する。
+        // 両者を記録し、実際には行動済みのcargoを遊兵として数えないようにする。
+        let affected_cargo = match &cmd {
+            AiCommand::Drop { cargo_entity, .. } => Some(*cargo_entity),
+            _ => None,
+        };
         let cmd_str = format!("{:?}", cmd);
         execute_ai_command(world, entity, cmd);
         if let Some(mut res) = world.get_resource_mut::<AiActionCooldown>() {
             res.0.insert(entity);
+            if let Some(cargo_entity) = affected_cargo {
+                res.0.insert(cargo_entity);
+            }
         } else {
             let mut set = std::collections::HashSet::new();
             set.insert(entity);
+            if let Some(cargo_entity) = affected_cargo {
+                set.insert(cargo_entity);
+            }
             world.insert_resource(AiActionCooldown(set));
         }
         return Some(cmd_str);
