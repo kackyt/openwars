@@ -1,11 +1,11 @@
 ---
 title: "PLAYBOOK"
-version: "1.14.0"
+version: "1.15.0"
 status: "approved"
 created: "2026-06-06"
-updated: "2026-08-02"
+updated: "2026-08-09"
 owner: "@t_kak"
-ace_entry_count: 33
+ace_entry_count: 35
 tags: [ace, playbook, knowledge-management]
 references:
   - docs/ACE_FRAMEWORK.md
@@ -805,6 +805,44 @@ Playbook が 800 行を超えた場合、以下のように分割する：
 **Context**: PR #93 において `engineWorker.ts` に補給 API を追加する際、Vitest の `vi.hoisted` を利用して WASM Engine インスタンスのモックメソッドと `WasmEngine` モッククラスを宣言し、`engineWorker.test.ts` にて WASM モジュールへのパラメータ伝達やレスポンス JSON のパース動作を完全に検証した。
 
 **Action**: Worker や WASM モジュールと通信するブリッジ層のテストを構築する場合は、`vi.hoisted` でモック関数群を事前定義し、`vi.mock` を用いて疑似モジュールとして注入することで、ブラウザ特有のバイナリロードやインスタンス化の依存を切り離してブリッジロジックを分離テストする。
+
+<a id="ace-94-1"></a>
+
+### ACE-94-1: ユニット標的価値算出における搭載物および短期的経済阻害効果の複合評価
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | coding |
+| Origin     | PR #94 |
+| Date       | 2026-08-09 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: 敵ユニットの標的価値評価では、単体コストだけでなく、輸送中 cargo のコストや直近の占領・経済阻害効果を合算した「複合価値」で評価することで、全 AI バージョン共通で即効性のある適切な優先度判定が可能になる。
+
+**Context**: PR #94 にて V4 生産 AI の標的評価を改修する際、ユニット本体のコスト評価に加えて cargo コストと直近の占領収入・阻害分を加算するロジックを実装し、それを V1〜V4 の共通戦術評価層（`engine/src/ai/eval.rs` / `squad.rs`）へ横展開した。
+
+**Action**: 戦術 AI の目標判定・優先度評価では、`target_value = unit_cost + cargo_cost + immediate_capture_income` のように波及効果や内部状態の価値を複合評価する関数を実装し、全戦術層で共通利用する。
+
+<a id="ace-94-2"></a>
+
+### ACE-94-2: 客観的ゲームルール依存評価の共通戦術層への集約と個別意思決定の分離
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | architecture |
+| Origin     | PR #94 |
+| Date       | 2026-08-09 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: 複数バージョンの AI（V1〜V4）を並行運用・評価する設計において、ゲームルールから一義的に定まる客観的評価ロジック（標的価値算出など）は共通戦術層に集約し、各バージョン固有の思考（作戦選定・要求編成など）のみをバージョン毎のモジュールに閉じることで、メンテナンス性の向上と評価のベースライン底上げを同時に実現できる。
+
+**Context**: PR #94 において V4 専用として開発された要求判定や標的評価のうち、純粋にルール依存で客観的な標的評価（cargo/占領価値の評価）を切り出して共通戦略・戦術モジュールへ移設し、全 AI に共有させた。
+
+**Action**: AI の機能追加や改良を行う際は、「ゲームルールに基づき一義的に評価できる客観的評価」と「バージョン固有の試行錯誤・計画アルゴリズム」を分離し、前者を共通層に配置して既存 AI も恩恵を受けられる構造にする。
 
 ## Changelog
 
