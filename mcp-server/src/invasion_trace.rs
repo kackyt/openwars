@@ -217,6 +217,8 @@ pub struct ProductionOperationSnapshot {
     pub intercept_budget: u32,
     pub requires_transport: bool,
     pub enemy_combat_value: u32,
+    pub enemy_reinforcement_budget: u32,
+    pub minimum_combat_unit_cost: u32,
     pub friendly_combat_value_committed: u32,
     pub deploy_lead_time: u32,
 }
@@ -701,6 +703,8 @@ pub fn snapshot_production_plan_for_player(
             intercept_budget: op.slots.intercept_budget,
             requires_transport: op.requires_transport,
             enemy_combat_value: op.enemy_combat_value,
+            enemy_reinforcement_budget: op.enemy_reinforcement_budget,
+            minimum_combat_unit_cost: op.minimum_combat_unit_cost,
             friendly_combat_value_committed: op.friendly_combat_value_committed,
             deploy_lead_time: op.deploy_lead_time,
         })
@@ -875,6 +879,7 @@ mod tests {
             island_id: IslandId(3),
             decision: IslandCampaignDecision::Expand,
             target_position: GridPosition { x: 8, y: 4 },
+            capture_target_positions: vec![GridPosition { x: 8, y: 4 }],
             requirement: IslandCampaignRequirement {
                 preferred_transport: Some(UnitType::TransportHelicopter),
                 transport_slots: 2,

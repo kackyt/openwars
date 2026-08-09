@@ -29,6 +29,26 @@ MUST: AIは1つの目標に対して、適切な数のユニットを連携さ�
 - **WHEN** Pickup中の先頭cargoが行動済みで、同じ輸送Squadに未行動の後続cargoが存在するとき
 - **THEN** 先頭cargoだけを見てPickupを停止せず、後続の行動可能cargoを合法な合流地点へ前進させる
 
+#### Scenario: 同一輸送役から複数cargoを同一手番に降車させる
+
+- **WHEN** Drop中の輸送役に複数の行動可能cargoがあり、各cargoに合法な降車地点が存在するとき
+- **THEN** 1体目のDrop後も輸送役を当該手番の処理対象に残し、残るcargoを同一手番に降車させる
+
+#### Scenario: 空の輸送ヘリで軽歩兵から着陸地点を確保する
+
+- **WHEN** TransportHelicopterが全cargoを降車し、目標島の着陸地点をInfantryまたはMechだけが妨害しているとき
+- **THEN** 輸送Squadを終了または帰還させる前に、当該TransportHelicopterへ敵軽歩兵を対象とするAttack責務を与える
+
+#### Scenario: 局地護衛を終えた輸送ヘリを再利用する
+
+- **WHEN** 一時Attack責務を持つTransportHelicopterの目標島から敵軽歩兵がいなくなったとき
+- **THEN** 同じ機体とSquad identityをTransport/Returnへ戻し、Attack完了による遊兵として残さない
+
+#### Scenario: 複数占領兵で島内施設を分担する
+
+- **WHEN** 1つの作戦に占領兵2体と、両者が到達可能な未所有施設2か所以上が割り当てられているとき
+- **THEN** 各占領兵へ異なる施設座標のCapture責務を1件ずつ与え、同じ主目標へ重複集中させない
+
 #### Scenario: 強襲cargoを輸送容量内に制限する
 
 - **WHEN** 自力展開できない占領要員と戦闘要員をAssaultの初動上陸波へ予約するとき

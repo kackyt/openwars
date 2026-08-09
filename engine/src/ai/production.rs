@@ -3009,6 +3009,7 @@ mod additional_tests {
                 island_id: crate::ai::islands::IslandId(0),
                 decision: crate::ai::island_campaign::IslandCampaignDecision::Expand,
                 target_position: target,
+                capture_target_positions: vec![target],
                 requirement: empty_requirement.clone(),
                 purchase_shortfall: empty_requirement,
                 allocated_budget: 0,

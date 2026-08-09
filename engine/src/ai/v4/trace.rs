@@ -54,6 +54,10 @@ pub struct ProductionOperationTrace {
     pub slots: OperationSlots,
     pub requires_transport: bool,
     pub enemy_combat_value: u32,
+    /// 作戦期限までにこの前線へ到着できる敵生産分だけを数えた増援予算。
+    pub enemy_reinforcement_budget: u32,
+    /// 固定倍率の代わりに優越余裕として用いた、実在する最安対抗unitのcost。
+    pub minimum_combat_unit_cost: u32,
     pub friendly_combat_value_committed: u32,
     pub deploy_lead_time: u32,
 }

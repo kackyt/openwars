@@ -10,15 +10,13 @@
 //! ここに現れるのは「拠点数」「敵戦力価値」「収入」「ETA」「搭載スロット」といった
 //! 盤面から観測できる量だけであり、`GamePhase` による一律の理想構成は使用しない。
 
+use crate::ai::island_campaign::combat_overmatch_requirement;
+
 /// 展開リードタイムがこのターン数以下なら「逐次補充」で足りると判断する閾値。
 pub const SHORT_LEAD_TIME_TURNS: u32 = 2;
 
 /// 見送り購入（資金を貯めて上位ユニットを買う）の最大待機ターン数。
 pub const RESERVATION_PATIENCE_TURNS: u32 = 5;
-
-/// 撃破枠に掛ける安全率（1.2 倍）を整数演算で表現したもの。
-const DESTROY_MARGIN_NUM: u32 = 12;
-const DESTROY_MARGIN_DEN: u32 = 10;
 
 /// 1 作戦あたりの占領枠の上限。面で取る性質上大きめだが、無限には広げない。
 const MAX_CAPTURE_SLOTS: u32 = 8;
@@ -112,14 +110,12 @@ pub struct OperationFacts {
     pub friendly_intercept_value_committed: u32,
     /// 展開リードタイム内に自軍が接敵しうる敵戦力価値（HP補正済み）
     pub enemy_combat_value: u32,
-    /// 敵の毎ターン収入
-    pub enemy_income: u32,
-    /// 敵の生産枠数（生産施設数）
-    pub enemy_production_slots: u32,
-    /// 敵ユニットの平均コスト（増援見積りの1体あたり単価）
-    pub enemy_average_unit_cost: u32,
-    /// 全作戦のうち、この前線に敵が割り振ると見込む比率 (0.0..=1.0)
-    pub frontline_share: f32,
+    /// 占領完了期限までに、この前線へ実際に到着できる敵生産分の予算。
+    pub enemy_reinforcement_budget: u32,
+    /// この前線へ投入でき、観測済みの敵へ有効な最小戦闘unitのcost。
+    pub minimum_combat_unit_cost: u32,
+    /// 通常戦力が届かない脅威へ自力到達できる最小迎撃unitのcost。
+    pub minimum_intercept_unit_cost: u32,
     /// 生産施設からこの作戦の代表地点までの展開リードタイム（ターン）
     pub deploy_lead_time: u32,
     /// 敵がこの作戦地点へ到達するまでのターン数
@@ -132,9 +128,6 @@ pub struct OperationFacts {
     pub available_free_cargo_slots: u32,
     /// 自軍の通常戦力が到達できない位置にいる脅威の価値（HP補正済み）
     pub unreachable_threat_value: u32,
-    /// 展開リードタイムの間にこちらが投入しうる資金（現在資金＋その間の収入）。
-    /// 「どれだけ敵がいるか」ではなく「どれだけ投入できるか」で要求を立てるために使う。
-    pub friendly_spendable_funds: u32,
 }
 
 /// 観測量から調達モードを決める。フェーズではなく展開リードタイムと輸送要否だけで決まる。
@@ -157,42 +150,15 @@ pub fn derive_slots(facts: &OperationFacts) -> OperationSlots {
         .saturating_sub(facts.friendly_capture_units_committed)
         .min(MAX_CAPTURE_SLOTS);
 
-    // --- 撃破枠：現在の敵戦力 + 展開リードタイム中に敵が投入しうる増援 ---
-    // 増援は「敵の収入」と「敵の生産枠数 × 平均単価」の小さい方で頭打ちにする。
-    let enemy_output_per_turn = if facts.enemy_production_slots == 0 {
-        0
-    } else {
-        facts.enemy_income.min(
-            facts
-                .enemy_production_slots
-                .saturating_mul(facts.enemy_average_unit_cost.max(1)),
-        )
-    };
-    let share = facts.frontline_share.clamp(0.0, 1.0);
-    let reinforcement =
-        (enemy_output_per_turn as f32 * facts.deploy_lead_time as f32 * share).round() as u32;
-    let gross_threat = facts
+    // --- 撃破枠：現在の局地敵戦力 + 占領完了前に到着できる敵増援 ---
+    let projected_threat = facts
         .enemy_combat_value
-        .saturating_add(reinforcement)
-        .saturating_mul(DESTROY_MARGIN_NUM)
-        / DESTROY_MARGIN_DEN;
+        .saturating_add(facts.enemy_reinforcement_budget);
+    let required_overmatch =
+        combat_overmatch_requirement(projected_threat, facts.minimum_combat_unit_cost);
     // 撃破枠は「これから買い足すべき資金量」なので、既に前線へ張り付いている
     // 自軍戦力価値を差し引く。ここを引かないと毎ターン満額の要求が立ち続ける。
-    let parity_gap = gross_threat.saturating_sub(facts.friendly_combat_value_committed);
-
-    // ただし敵の規模で要求を頭打ちにすると、要求は必ず「敵と釣り合う量」へ収束する。
-    // 釣り合った戦力同士の消耗戦は自軍損害が最大になり、しかも決着がつかない。
-    // 投入戦力が大きいほど自軍損害は小さく撃破は早くなる（＝戦力の集中投入）ため、
-    // 「敵がどれだけいるか」ではなく「こちらがどれだけ投入できるか」で要求を立てる。
-    // 敵がこの前線で戦力を持つか、生産で戦力を出し続ける限り、投入可能な資金を
-    // 下回らない要求を残す。敵が戦力も生産手段も失っていれば要求は 0 に戻る。
-    let enemy_still_fights = facts.enemy_combat_value > 0 || enemy_output_per_turn > 0;
-    let full_commitment = if enemy_still_fights {
-        (facts.friendly_spendable_funds as f32 * share).round() as u32
-    } else {
-        0
-    };
-    let destroy_budget = parity_gap.max(full_commitment);
+    let destroy_budget = required_overmatch.saturating_sub(facts.friendly_combat_value_committed);
 
     // 作戦地点へ張り付けるべき占領要員の総数（既に手元にいる分＋これから買う分）
     let capture_presence = capture_units.saturating_add(facts.friendly_capture_units_committed);
@@ -228,10 +194,10 @@ pub fn derive_slots(facts: &OperationFacts) -> OperationSlots {
     // 撃破枠と同様に、既に保有している対抗要員の価値を差し引く。
     // これを引かないと脅威が減らない限り毎ターン同じ要求が満額で立ち続け、
     // 対空ユニットを買い増し続けるラチェットになる。
-    let gross_intercept = facts
-        .unreachable_threat_value
-        .saturating_mul(DESTROY_MARGIN_NUM)
-        / DESTROY_MARGIN_DEN;
+    let gross_intercept = combat_overmatch_requirement(
+        facts.unreachable_threat_value,
+        facts.minimum_intercept_unit_cost,
+    );
     let intercept_budget = gross_intercept.saturating_sub(facts.friendly_intercept_value_committed);
 
     OperationSlots {
@@ -319,8 +285,8 @@ mod tests {
     fn base_facts() -> OperationFacts {
         OperationFacts {
             target_property_count: 4,
-            enemy_average_unit_cost: 1000,
-            frontline_share: 1.0,
+            minimum_combat_unit_cost: 1000,
+            minimum_intercept_unit_cost: 1000,
             deploy_lead_time: 2,
             enemy_contact_eta: 2,
             transport_round_trip_turns: 4,
@@ -341,46 +307,33 @@ mod tests {
         assert_eq!(derive_slots(&facts).capture_units, 0);
     }
 
-    /// 敵が居ない初期盤面でも、敵の増援見込みによって撃破枠がゼロにならない
+    /// 期限内に到着できる敵増援だけを局地脅威へ加える
     #[test]
     fn destroy_budget_accounts_for_enemy_reinforcement() {
         let mut facts = base_facts();
         facts.enemy_combat_value = 0;
-        facts.enemy_income = 3000;
-        facts.enemy_production_slots = 2;
-        facts.enemy_average_unit_cost = 1000;
-        facts.deploy_lead_time = 2;
-        facts.frontline_share = 0.5;
+        facts.enemy_reinforcement_budget = 2000;
 
-        // 敵の産出/ターン = min(3000, 2 * 1000) = 2000
-        // 増援 = 2000 * 2ターン * 0.5 = 2000 → 撃破枠 = 2000 * 1.2 = 2400
-        assert_eq!(derive_slots(&facts).destroy_budget, 2400);
+        assert_eq!(derive_slots(&facts).destroy_budget, 3000);
     }
 
-    /// 敵と釣り合う戦力を揃えた後も、敵が戦う限り撃破枠は投入可能資金まで立つ。
-    /// 釣り合いで要求が止まると消耗戦になり、損害が最大化して決着もつかない。
+    /// 局地優越を満たした後は、余剰資金を理由に戦闘要求を増やさない。
     #[test]
-    fn destroy_budget_commits_available_funds_while_enemy_fights() {
+    fn destroy_budget_stops_after_local_overmatch_is_filled() {
         let mut facts = base_facts();
         facts.enemy_combat_value = 5000;
-        facts.frontline_share = 1.0;
-        // 釣り合い分の要求は 0 になるほど自軍が展開済み
-        facts.friendly_combat_value_committed = 100_000;
-        facts.friendly_spendable_funds = 40_000;
+        facts.friendly_combat_value_committed = 6000;
 
-        assert_eq!(derive_slots(&facts).destroy_budget, 40_000);
+        assert_eq!(derive_slots(&facts).destroy_budget, 0);
     }
 
-    /// 前線が複数あるときは、投入可能資金をその前線の配分率で割り当てる
+    /// 資金量が局地脅威を上回っても要求量には影響しない。
     #[test]
-    fn full_commitment_is_split_by_frontline_share() {
+    fn destroy_budget_is_independent_of_available_funds() {
         let mut facts = base_facts();
         facts.enemy_combat_value = 5000;
-        facts.friendly_combat_value_committed = 100_000;
-        facts.friendly_spendable_funds = 40_000;
-        facts.frontline_share = 0.25;
 
-        assert_eq!(derive_slots(&facts).destroy_budget, 10_000);
+        assert_eq!(derive_slots(&facts).destroy_budget, 6000);
     }
 
     /// 敵が戦力も生産手段も失っていれば、撃破枠は 0 に戻る
@@ -388,9 +341,6 @@ mod tests {
     fn destroy_budget_returns_to_zero_when_enemy_is_spent() {
         let mut facts = base_facts();
         facts.enemy_combat_value = 0;
-        facts.enemy_income = 0;
-        facts.enemy_production_slots = 0;
-        facts.friendly_spendable_funds = 40_000;
 
         assert_eq!(derive_slots(&facts).destroy_budget, 0);
     }
@@ -401,7 +351,7 @@ mod tests {
         let mut facts = base_facts();
         facts.enemy_combat_value = 5000;
         facts.friendly_combat_value_committed = 4000;
-        // 5000 * 1.2 - 4000 = 2000
+        // 敵5,000 + 最小戦闘unit 1,000 - 配備済み4,000 = 2,000
         assert_eq!(derive_slots(&facts).destroy_budget, 2000);
     }
 

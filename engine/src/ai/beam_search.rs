@@ -478,6 +478,7 @@ mod tests {
             pickup_position: None,
             drop_position: None,
             delivered_cargo: Vec::new(),
+            return_after_combat: false,
         };
         squad.members.insert(u1);
 

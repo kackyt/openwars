@@ -17,6 +17,23 @@ use std::collections::{HashMap, HashSet, VecDeque};
 #[derive(Resource, Default)]
 pub struct AiActionCooldown(pub HashSet<Entity>);
 
+fn transport_has_other_actionable_cargo(
+    world: &World,
+    transport: Entity,
+    current_cargo: Entity,
+) -> bool {
+    world
+        .get::<crate::components::CargoCapacity>(transport)
+        .is_some_and(|capacity| {
+            capacity.loaded.iter().any(|loaded| {
+                *loaded != current_cargo
+                    && world
+                        .get::<crate::components::ActionCompleted>(*loaded)
+                        .is_some_and(|action| !action.0)
+            })
+        })
+}
+
 #[derive(Resource, Default)]
 pub struct AiProductionCooldown(pub HashSet<(usize, usize)>);
 
@@ -1178,7 +1195,7 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
             .get_resource::<crate::ai::squad::SquadManager>()
             .is_some_and(|manager| {
                 manager.squads.iter().any(|squad| {
-                    matches!(
+                    let delivered_cargo = matches!(
                         squad.phase,
                         crate::ai::squad::MissionPhase::Transport(
                             crate::ai::squad::TransportPhase::Transit
@@ -1189,7 +1206,21 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
                             .get::<crate::components::Transporting>(*cargo)
                             .is_none()
                             && world.get::<GridPosition>(*cargo).is_some()
-                    })
+                    });
+                    let pickup_completed = matches!(
+                        squad.phase,
+                        crate::ai::squad::MissionPhase::Transport(
+                            crate::ai::squad::TransportPhase::Pickup
+                        )
+                    ) && !squad.cargo_entities.is_empty()
+                        && squad.cargo_entities.iter().all(|cargo| {
+                            squad.transport_entity.is_some_and(|transport| {
+                                world
+                                    .get::<crate::components::Transporting>(*cargo)
+                                    .is_some_and(|transporting| transporting.0 == transport)
+                            })
+                        });
+                    delivered_cargo || pickup_completed
                 })
             });
         if needs_transport_reconcile {
@@ -1239,16 +1270,28 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
             AiCommand::Drop { cargo_entity, .. } => Some(*cargo_entity),
             _ => None,
         };
+        // Unload systemは未行動cargoが残る間、輸送役を行動完了にしない。
+        // AI側も同じ契約に合わせ、最後のcargoを降ろすまで輸送役をcooldownしない。
+        let transport_can_continue_drop = match &cmd {
+            AiCommand::Drop { cargo_entity, .. } => {
+                transport_has_other_actionable_cargo(world, entity, *cargo_entity)
+            }
+            _ => false,
+        };
         let cmd_str = format!("{:?}", cmd);
         execute_ai_command(world, entity, cmd);
         if let Some(mut res) = world.get_resource_mut::<AiActionCooldown>() {
-            res.0.insert(entity);
+            if !transport_can_continue_drop {
+                res.0.insert(entity);
+            }
             if let Some(cargo_entity) = affected_cargo {
                 res.0.insert(cargo_entity);
             }
         } else {
             let mut set = std::collections::HashSet::new();
-            set.insert(entity);
+            if !transport_can_continue_drop {
+                set.insert(entity);
+            }
             if let Some(cargo_entity) = affected_cargo {
                 set.insert(cargo_entity);
             }
@@ -2328,6 +2371,30 @@ mod tests {
     use super::*;
     use crate::components::{Faction, Health, PlayerId, Property, UnitStats};
     use crate::resources::{DamageChart, UnitType};
+
+    #[test]
+    fn drop_keeps_transport_actionable_until_last_ready_cargo() {
+        let mut world = World::new();
+        let first = world.spawn(crate::components::ActionCompleted(false)).id();
+        let second = world.spawn(crate::components::ActionCompleted(false)).id();
+        let transport = world
+            .spawn(crate::components::CargoCapacity {
+                max: 2,
+                loaded: vec![first, second],
+            })
+            .id();
+
+        assert!(transport_has_other_actionable_cargo(
+            &world, transport, first
+        ));
+        world
+            .get_mut::<crate::components::ActionCompleted>(second)
+            .unwrap()
+            .0 = true;
+        assert!(!transport_has_other_actionable_cargo(
+            &world, transport, first
+        ));
+    }
 
     #[test]
     fn v3_turn_cache_marks_squad_plan_until_cleared() {
@@ -3940,6 +4007,7 @@ mod tests {
             pickup_position: None,
             drop_position: None,
             delivered_cargo: Vec::new(),
+            return_after_combat: false,
         });
         world.insert_resource(manager);
     }

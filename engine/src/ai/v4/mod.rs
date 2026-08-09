@@ -73,6 +73,9 @@ const MAX_OPERATIONS: usize = 4;
 /// 敵がこのターン数以内に到達できる自軍拠点は防衛作戦の対象とする。
 const DEFENSE_THREAT_ETA: u32 = 2;
 
+/// 占領開始後に拠点を確保し切るまでに必要な最小手番数。
+const CAPTURE_COMPLETION_TURNS: u32 = 2;
+
 /// 敵の「拡張装置」（占領可能ユニットと、それを運ぶ輸送）に掛ける脅威の倍率。
 /// これらはコスト以上に盤面の収入を動かすため、素のコスト価値で数えると
 /// 撃破枠が立たず、局地戦で勝ちながら territory を明け渡すことになる。
@@ -85,6 +88,13 @@ struct UnitSnapshot {
     stats: UnitStats,
     hp: u32,
     free_cargo: u32,
+}
+
+/// 敵が実際に生産へ使える施設。所有者の首都から生産範囲内にある施設だけを保持する。
+#[derive(Debug, Clone, Copy)]
+struct EnemyFacilitySnapshot {
+    pos: GridPosition,
+    terrain: Terrain,
 }
 
 impl UnitSnapshot {
@@ -294,6 +304,7 @@ struct BoardScan {
     open_properties: Vec<GridPosition>,
     enemy_income: u32,
     enemy_production_slots: u32,
+    enemy_facilities: Vec<EnemyFacilitySnapshot>,
     my_income: u32,
 }
 
@@ -358,12 +369,18 @@ impl BoardScan {
         let mut facilities = Vec::new();
         let mut enemy_income = 0u32;
         let mut enemy_production_slots = 0u32;
+        let mut enemy_facilities = Vec::new();
         let mut my_income = 0u32;
         {
             let mut q = world.query::<(&GridPosition, &Property)>();
+            let mut enemy_capitals = HashMap::new();
             for (pos, prop) in q.iter(world) {
                 if prop.owner_id == Some(player_id) && prop.terrain == Terrain::Capital {
                     capital_pos = Some(*pos);
+                } else if let Some(owner) = prop.owner_id
+                    && prop.terrain == Terrain::Capital
+                {
+                    enemy_capitals.insert(owner, *pos);
                 }
             }
             for (pos, prop) in q.iter(world) {
@@ -387,10 +404,23 @@ impl BoardScan {
                             facilities.push((*pos, prop.terrain));
                         }
                     }
-                    Some(_) => {
+                    Some(owner) => {
                         enemy_income = enemy_income.saturating_add(income);
-                        if is_facility {
+                        let is_usable_enemy_facility = is_facility
+                            && enemy_capitals.get(&owner).is_some_and(|capital| {
+                                crate::systems::production::is_within_production_range(
+                                    std::slice::from_ref(capital),
+                                    pos.x,
+                                    pos.y,
+                                    map.topology,
+                                )
+                            });
+                        if is_usable_enemy_facility {
                             enemy_production_slots += 1;
+                            enemy_facilities.push(EnemyFacilitySnapshot {
+                                pos: *pos,
+                                terrain: prop.terrain,
+                            });
                         }
                         open_properties.push(*pos);
                     }
@@ -422,6 +452,7 @@ impl BoardScan {
             open_properties,
             enemy_income,
             enemy_production_slots,
+            enemy_facilities,
             my_income,
         })
     }
@@ -584,10 +615,13 @@ fn build_operations(scan: &BoardScan, ctx: &mut ReachCtx) -> Vec<Operation> {
         scored.push(capture);
     }
 
-    let operation_count = scored.len().max(1) as f32;
     let anchors: Vec<GridPosition> = scored
         .iter()
         .map(|(_, _, cluster)| anchor_of(cluster, scan))
+        .collect();
+    let horizons: Vec<u32> = scored
+        .iter()
+        .map(|(lead, kind, _)| operation_threat_horizon(*kind, *lead))
         .collect();
 
     scored
@@ -596,15 +630,7 @@ fn build_operations(scan: &BoardScan, ctx: &mut ReachCtx) -> Vec<Operation> {
         .map(|(index, (lead, kind, cluster))| {
             let anchor = anchors[index];
             build_operation(
-                scan,
-                ctx,
-                &reference,
-                kind,
-                anchor,
-                &anchors,
-                &cluster,
-                lead,
-                1.0 / operation_count,
+                scan, ctx, &reference, kind, anchor, &anchors, &horizons, &cluster, lead,
             )
         })
         .collect()
@@ -634,18 +660,115 @@ fn facility_lead_time(scan: &BoardScan, anchor: &GridPosition, movement: u32) ->
         .unwrap_or(u32::MAX)
 }
 
-/// 敵を最寄りの作戦へ一意に帰属させる。同距離なら anchor の並び順で決める。
-fn nearest_anchor_index(
-    map: &Map,
+fn operation_threat_horizon(kind: OperationKind, deploy_lead_time: u32) -> u32 {
+    match kind {
+        OperationKind::Defense => DEFENSE_THREAT_ETA,
+        OperationKind::Capture => deploy_lead_time.saturating_add(CAPTURE_COMPLETION_TURNS),
+    }
+}
+
+/// 敵が期限内に自力到着できる作戦だけを比較し、その中で最短の1件へ帰属させる。
+fn nearest_relevant_anchor_index(
+    scan: &BoardScan,
+    ctx: &mut ReachCtx,
     pos: &GridPosition,
-    movement: u32,
+    movement: MovementType,
+    max_movement: u32,
     anchors: &[GridPosition],
+    horizons: &[u32],
 ) -> Option<usize> {
     anchors
         .iter()
         .enumerate()
-        .min_by_key(|(index, anchor)| (eta_turns(map, pos, anchor, movement), *index))
-        .map(|(index, _)| index)
+        .filter_map(|(index, anchor)| {
+            if !ctx.is_reachable(
+                &scan.map,
+                &scan.master_data,
+                (pos.x, pos.y),
+                (anchor.x, anchor.y),
+                movement,
+            ) {
+                return None;
+            }
+            let eta = eta_turns(&scan.map, pos, anchor, max_movement);
+            (eta <= horizons.get(index).copied().unwrap_or(0)).then_some((eta, index))
+        })
+        .min()
+        .map(|(_, index)| index)
+}
+
+fn enemy_facility_arrival(
+    scan: &BoardScan,
+    ctx: &mut ReachCtx,
+    facility: EnemyFacilitySnapshot,
+    anchor: GridPosition,
+) -> Option<(u32, u32)> {
+    scan.available_types
+        .iter()
+        .filter(|(unit_type, stats)| {
+            stats.max_cargo == 0 && scan.can_produce(facility.terrain, *unit_type)
+        })
+        .filter_map(|(_, stats)| {
+            ctx.is_reachable(
+                &scan.map,
+                &scan.master_data,
+                (facility.pos.x, facility.pos.y),
+                (anchor.x, anchor.y),
+                stats.movement_type,
+            )
+            .then_some((
+                eta_turns(&scan.map, &facility.pos, &anchor, stats.max_movement),
+                stats.cost,
+            ))
+        })
+        .min_by_key(|(eta, cost)| (*eta, *cost))
+}
+
+/// 敵施設も期限内に到着できる最寄り作戦へ一意に割り当て、全収入の重複計上を防ぐ。
+fn projected_enemy_reinforcement_budget(
+    scan: &BoardScan,
+    ctx: &mut ReachCtx,
+    anchors: &[GridPosition],
+    horizons: &[u32],
+    anchor_index: usize,
+) -> u32 {
+    if scan.enemy_production_slots == 0 {
+        return 0;
+    }
+    let mut local_slots = 0_u32;
+    let mut production_capacity = 0_u32;
+    for facility in &scan.enemy_facilities {
+        let assignment = anchors
+            .iter()
+            .enumerate()
+            .filter_map(|(index, anchor)| {
+                let (eta, cost) = enemy_facility_arrival(scan, ctx, *facility, *anchor)?;
+                (eta <= horizons.get(index).copied().unwrap_or(0)).then_some((eta, index, cost))
+            })
+            .min_by_key(|(eta, index, _)| (*eta, *index));
+        let Some((eta, assigned_index, unit_cost)) = assignment else {
+            continue;
+        };
+        if assigned_index != anchor_index {
+            continue;
+        }
+        let production_turns = horizons[anchor_index].saturating_sub(eta);
+        if production_turns == 0 {
+            continue;
+        }
+        local_slots = local_slots.saturating_add(1);
+        production_capacity =
+            production_capacity.saturating_add(unit_cost.saturating_mul(production_turns));
+    }
+    if local_slots == 0 {
+        return 0;
+    }
+    let allocated_income_per_turn = u64::from(scan.enemy_income)
+        .saturating_mul(u64::from(local_slots))
+        / u64::from(scan.enemy_production_slots.max(1));
+    let income_capacity =
+        allocated_income_per_turn.saturating_mul(u64::from(horizons[anchor_index]));
+    production_capacity.min(u32::try_from(income_capacity).unwrap_or(u32::MAX))
 }
 
 /// 1 つの作戦について観測量を集め、枠を導出する。
@@ -657,17 +780,13 @@ fn build_operation(
     kind: OperationKind,
     anchor: GridPosition,
     anchors: &[GridPosition],
+    horizons: &[u32],
     cluster: &[GridPosition],
     deploy_lead_time: u32,
-    frontline_share: f32,
 ) -> Operation {
     // この作戦を「最寄りの作戦」とするユニットだけを、この作戦の担当として数える。
     // これにより 1 体のユニットが複数作戦に二重計上されない。
     let anchor_index = anchors.iter().position(|candidate| *candidate == anchor);
-    let is_nearest = |pos: &GridPosition, movement: u32| -> bool {
-        anchor_index.is_some()
-            && nearest_anchor_index(&scan.map, pos, movement, anchors) == anchor_index
-    };
 
     // 基準占領ユニットが自力で到達できるかどうかで輸送要否が決まる。
     // 「島だから輸送が要る」ではなく「地形的に繋がっていないから要る」と判定する。
@@ -710,9 +829,17 @@ fn build_operation(
     let mut enemy_combat_value = 0u32;
     let mut unreachable_threat_value = 0u32;
     let mut enemy_contact_eta = u32::MAX;
-    let mut enemy_cost_total = 0u32;
     for enemy in &scan.enemy_units {
-        if !is_nearest(&enemy.pos, enemy.stats.max_movement) {
+        if nearest_relevant_anchor_index(
+            scan,
+            ctx,
+            &enemy.pos,
+            enemy.stats.movement_type,
+            enemy.stats.max_movement,
+            anchors,
+            horizons,
+        ) != anchor_index
+        {
             continue;
         }
         let i_can_reach = producible_movement_types.iter().any(|movement_type| {
@@ -731,10 +858,7 @@ fn build_operation(
             (anchor.x, anchor.y),
             enemy.stats.movement_type,
         );
-        if !i_can_reach && !it_can_reach_me {
-            // 交戦が成立しない敵。増援見積もりの母数からも外す。
-            continue;
-        }
+        debug_assert!(it_can_reach_me, "期限付き帰属で敵の到達可能性を確認済み");
         if it_can_reach_me {
             enemy_contact_eta = enemy_contact_eta.min(eta_turns(
                 &scan.map,
@@ -743,7 +867,6 @@ fn build_operation(
                 enemy.stats.max_movement,
             ));
         }
-        enemy_cost_total = enemy_cost_total.saturating_add(enemy.stats.cost);
         if i_can_reach {
             let threat = threat_value(enemy, expansion_race_live);
             enemy_combat_value = enemy_combat_value.saturating_add(threat);
@@ -754,8 +877,6 @@ fn build_operation(
             unreachable_threats.push(ThreatTarget::from_snapshot(enemy, expansion_race_live));
         }
     }
-    let committed_enemy_count = (reachable_threats.len() + unreachable_threats.len()) as u32;
-
     // --- 自軍戦力の仕分け ---
     // 敵の仕分けが済んでから数える。
     //
@@ -883,17 +1004,65 @@ fn build_operation(
         }
     }
 
-    let enemy_average_unit_cost = enemy_cost_total
-        .checked_div(committed_enemy_count)
-        .unwrap_or_else(|| {
-            // 敵ユニットが観測できないうちは、自軍が生産しうるユニットの平均コストで代用する
-            let total: u32 = scan
-                .available_types
-                .iter()
-                .map(|(_, stats)| stats.cost)
-                .sum();
-            total / (scan.available_types.len().max(1) as u32)
-        });
+    // 必要戦力を丸い比率で水増しせず、実際にこの作戦へ参加できる最安の
+    // 対抗ユニット単位へ切り上げる。候補採用と同じ条件を通すことで、
+    // 要求額だけ存在して埋められない枠を作らない。
+    let mut minimum_combat_unit_cost = u32::MAX;
+    let mut minimum_intercept_unit_cost = u32::MAX;
+    let unreachable_indices: Vec<usize> = (0..unreachable_threats.len()).collect();
+    for (facility, terrain) in &scan.free_facilities {
+        for (unit_type, stats) in &scan.available_types {
+            if stats.can_capture
+                || stats.max_cargo > 0
+                || stats.cost == 0
+                || !scan.can_produce(*terrain, *unit_type)
+            {
+                continue;
+            }
+
+            let self_deployable = ctx.is_reachable(
+                &scan.map,
+                &scan.master_data,
+                (facility.x, facility.y),
+                (anchor.x, anchor.y),
+                stats.movement_type,
+            );
+            if self_deployable
+                && threats_have_counter(
+                    stats,
+                    &unreachable_threats,
+                    &unreachable_indices,
+                    &scan.damage_chart,
+                )
+            {
+                minimum_intercept_unit_cost = minimum_intercept_unit_cost.min(stats.cost);
+            }
+
+            if !can_join_operation(scan, ctx, &anchor, requires_transport, facility, stats) {
+                continue;
+            }
+            let origin = if self_deployable { *facility } else { anchor };
+            let indices = reachable_threat_indices(scan, ctx, &reachable_threats, origin, stats);
+            if reachable_threats.is_empty()
+                || threats_have_counter(stats, &reachable_threats, &indices, &scan.damage_chart)
+            {
+                minimum_combat_unit_cost = minimum_combat_unit_cost.min(stats.cost);
+            }
+        }
+    }
+    let minimum_combat_unit_cost = if minimum_combat_unit_cost != u32::MAX {
+        minimum_combat_unit_cost
+    } else {
+        0
+    };
+    let minimum_intercept_unit_cost = if minimum_intercept_unit_cost != u32::MAX {
+        minimum_intercept_unit_cost
+    } else {
+        0
+    };
+    let enemy_reinforcement_budget = anchor_index.map_or(0, |index| {
+        projected_enemy_reinforcement_budget(scan, ctx, anchors, horizons, index)
+    });
 
     // 輸送 1 往復にかかるターン数（片道リードタイムの 2 倍）
     let transport_round_trip_turns = deploy_lead_time.saturating_mul(2).max(1);
@@ -904,10 +1073,9 @@ fn build_operation(
         friendly_combat_value_committed,
         friendly_intercept_value_committed,
         enemy_combat_value,
-        enemy_income: scan.enemy_income,
-        enemy_production_slots: scan.enemy_production_slots,
-        enemy_average_unit_cost,
-        frontline_share,
+        enemy_reinforcement_budget,
+        minimum_combat_unit_cost,
+        minimum_intercept_unit_cost,
         deploy_lead_time,
         enemy_contact_eta: if enemy_contact_eta == u32::MAX {
             u32::MAX
@@ -918,11 +1086,6 @@ fn build_operation(
         transport_round_trip_turns,
         available_free_cargo_slots,
         unreachable_threat_value,
-        // 展開リードタイムの間に投入しうる資金。今ある資金だけで測ると、
-        // 収入が大きい局面でも要求が現在資金に張り付いてしまう。
-        friendly_spendable_funds: scan
-            .funds
-            .saturating_add(scan.my_income.saturating_mul(deploy_lead_time)),
     };
 
     Operation {
@@ -962,6 +1125,8 @@ fn plan_production(
             slots: op.slots,
             requires_transport: op.facts.requires_transport,
             enemy_combat_value: op.facts.enemy_combat_value,
+            enemy_reinforcement_budget: op.facts.enemy_reinforcement_budget,
+            minimum_combat_unit_cost: op.facts.minimum_combat_unit_cost,
             friendly_combat_value_committed: op.facts.friendly_combat_value_committed,
             deploy_lead_time: op.facts.deploy_lead_time,
         })
@@ -1886,12 +2051,71 @@ mod tests {
         assert_eq!(eta_turns(&map, &pos(0, 0), &pos(2, 0), 0), 2);
     }
 
-    /// 等距離の敵も複数作戦へ重複計上せず、決定的に1作戦へ帰属する。
+    /// 期限までに来られない敵は、単なる最寄り作戦へ押し込まない。
     #[test]
-    fn equidistant_enemy_belongs_to_exactly_one_operation() {
-        let map = flat_map(5, 3);
-        let anchors = vec![pos(0, 1), pos(4, 1)];
-        assert_eq!(nearest_anchor_index(&map, &pos(2, 1), 1, &anchors), Some(0));
+    fn enemy_is_assigned_only_when_it_can_arrive_before_an_objective_deadline() {
+        let scan = multi_factory_scan();
+        let mut ctx = ReachCtx::default();
+        let anchors = vec![pos(1, 2), pos(8, 2)];
+        let enemy = pos(4, 2);
+
+        // 近い側でも1ターンかかるため、今ターン完了の作戦には無関係。
+        assert_eq!(
+            nearest_relevant_anchor_index(
+                &scan,
+                &mut ctx,
+                &enemy,
+                MovementType::Infantry,
+                3,
+                &anchors,
+                &[0, 1],
+            ),
+            None
+        );
+        // 期限内なら最短の1作戦だけへ決定的に帰属する。
+        assert_eq!(
+            nearest_relevant_anchor_index(
+                &scan,
+                &mut ctx,
+                &enemy,
+                MovementType::Infantry,
+                3,
+                &anchors,
+                &[1, 1],
+            ),
+            Some(0)
+        );
+    }
+
+    /// 敵施設の生産余力も、期限内に到着できる最寄りの1作戦だけへ計上する。
+    #[test]
+    fn enemy_reinforcement_budget_is_local_unique_and_deadline_bounded() {
+        let mut scan = multi_factory_scan();
+        scan.enemy_income = 6000;
+        scan.enemy_production_slots = 1;
+        scan.enemy_facilities = vec![EnemyFacilitySnapshot {
+            pos: pos(8, 2),
+            terrain: Terrain::Factory,
+        }];
+        let anchors = vec![pos(6, 2), pos(0, 2)];
+        let horizons = vec![4, 4];
+        let mut ctx = ReachCtx::default();
+
+        // 最安の歩兵は1ターンで到着し、残る3生産ターン分だけを局地予算にする。
+        assert_eq!(
+            projected_enemy_reinforcement_budget(&scan, &mut ctx, &anchors, &horizons, 0),
+            3000
+        );
+        assert_eq!(
+            projected_enemy_reinforcement_budget(&scan, &mut ctx, &anchors, &horizons, 1),
+            0
+        );
+
+        // 到着期限が0なら、この施設はどの作戦の脅威にもならない。
+        assert_eq!(
+            projected_enemy_reinforcement_budget(&scan, &mut ctx, &anchors, &[0, 0], 0),
+            0
+        );
     }
 
     /// テスト用のユニット諸元。射程はすべて 0 なので `engagement_factor` は 1.0 になる
@@ -2265,6 +2489,7 @@ mod tests {
             open_properties: vec![pos(8, 1)],
             enemy_income: 0,
             enemy_production_slots: 0,
+            enemy_facilities: Vec::new(),
             my_income: 1000,
         }
     }
@@ -2285,6 +2510,7 @@ mod tests {
         };
         // 母港側と対岸側、2 つの作戦地点がある盤面
         let anchors = vec![pos(0, 1), pos(8, 1)];
+        let horizons = vec![5; anchors.len()];
 
         // 前提: 母港の輸送艦は距離では母港側の作戦が最寄りである
         assert!(
@@ -2299,9 +2525,9 @@ mod tests {
             OperationKind::Capture,
             anchors[1],
             &anchors,
+            &horizons,
             &[anchors[1]],
             3,
-            0.5,
         );
 
         // それでも「対岸へ積荷を届けられる」以上、渡洋作戦の台帳に載らねばならない
@@ -2340,6 +2566,7 @@ mod tests {
             open_properties: vec![pos(6, 2)],
             enemy_income: 0,
             enemy_production_slots: 0,
+            enemy_facilities: Vec::new(),
             my_income: 1000,
         }
     }
@@ -2402,6 +2629,7 @@ mod tests {
             open_properties: vec![pos(6, 2)],
             enemy_income: 0,
             enemy_production_slots: 0,
+            enemy_facilities: Vec::new(),
             my_income: 1000,
         }
     }
@@ -2507,6 +2735,7 @@ mod tests {
             ..stats(UnitType::Infantry, 1000)
         };
         let anchors = vec![pos(0, 1), pos(8, 1)];
+        let horizons = vec![5; anchors.len()];
 
         let overseas = build_operation(
             &scan,
@@ -2515,9 +2744,9 @@ mod tests {
             OperationKind::Capture,
             anchors[1],
             &anchors,
+            &horizons,
             &[anchors[1]],
             3,
-            0.5,
         );
 
         assert_eq!(overseas.facts.available_free_cargo_slots, 0);
@@ -2657,6 +2886,7 @@ mod tests {
             island_id: IslandId(1),
             decision: IslandCampaignDecision::Reinforce,
             target_position: pos(23, 24),
+            capture_target_positions: vec![pos(23, 24)],
             requirement: requirement.clone(),
             purchase_shortfall: requirement,
             allocated_budget: 0,

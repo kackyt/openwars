@@ -1,8 +1,9 @@
 use crate::ai::island_campaign::{
-    CampaignResourcePool, CampaignTransportBlueprint, CampaignUnitCandidate,
-    ExistingCampaignOperation, IslandCampaignCandidate, IslandCampaignDecision,
-    IslandCampaignFacts, IslandCampaignPortfolio, IslandCampaignRequirement, IslandCampaignState,
-    allocate_campaign_portfolio, assess_island, campaign_unit_type_rank, required_assault_budget,
+    CampaignResourcePool, CampaignSustainmentCoverage, CampaignSustainmentTargets,
+    CampaignTransportBlueprint, CampaignUnitCandidate, ExistingCampaignOperation,
+    IslandCampaignCandidate, IslandCampaignDecision, IslandCampaignFacts, IslandCampaignPortfolio,
+    IslandCampaignRequirement, IslandCampaignState, allocate_campaign_portfolio, assess_island,
+    campaign_unit_type_rank, combat_overmatch_requirement, promote_logistics_prerequisite,
 };
 use crate::ai::islands::{Island, IslandId, IslandMap};
 use crate::ai::squad::{MissionPhase, MissionType, SquadManager, TransportPhase};
@@ -766,6 +767,59 @@ fn is_roi_site(terrain: Terrain) -> bool {
     matches!(terrain, Terrain::Factory | Terrain::Port | Terrain::Airport)
 }
 
+fn sustainment_site_counts(island: &Island, properties: &[PropertySnapshot]) -> (u32, u32, u32) {
+    let mut ground = 0_u32;
+    let mut air = 0_u32;
+    let mut sea = 0_u32;
+    for snapshot in properties
+        .iter()
+        .filter(|snapshot| island.tiles.contains(&snapshot.position))
+        .filter(|snapshot| snapshot.property.max_capture_points > 0)
+    {
+        match snapshot.property.terrain {
+            Terrain::Capital | Terrain::City | Terrain::Factory => {
+                ground = ground.saturating_add(1)
+            }
+            Terrain::Airport => air = air.saturating_add(1),
+            Terrain::Port => sea = sea.saturating_add(1),
+            _ => {}
+        }
+    }
+    (ground, air, sea)
+}
+
+fn sustainment_targets(
+    island: &Island,
+    properties: &[PropertySnapshot],
+    player_id: PlayerId,
+) -> CampaignSustainmentTargets {
+    let mut targets = CampaignSustainmentTargets::default();
+    let mut snapshots: Vec<_> = properties
+        .iter()
+        .filter(|snapshot| island.tiles.contains(&snapshot.position))
+        .filter(|snapshot| {
+            snapshot.property.max_capture_points > 0
+                && snapshot.property.owner_id != Some(player_id)
+        })
+        .collect();
+    snapshots.sort_by_key(|snapshot| (snapshot.position.y, snapshot.position.x));
+    for snapshot in snapshots {
+        match snapshot.property.terrain {
+            Terrain::Capital | Terrain::City | Terrain::Factory => {
+                targets.ground.get_or_insert(snapshot.position);
+            }
+            Terrain::Airport => {
+                targets.air.get_or_insert(snapshot.position);
+            }
+            Terrain::Port => {
+                targets.sea.get_or_insert(snapshot.position);
+            }
+            _ => {}
+        }
+    }
+    targets
+}
+
 #[allow(clippy::too_many_arguments)]
 fn transport_options_for_island(
     map: &Map,
@@ -1388,14 +1442,6 @@ pub fn collect_island_campaign_facts(
         .collect()
 }
 
-fn scaled_combat_requirement(enemy_combat_value: u32) -> u32 {
-    let scaled = u64::from(enemy_combat_value)
-        .saturating_mul(12)
-        .saturating_add(9)
-        / 10;
-    u32::try_from(scaled).unwrap_or(u32::MAX)
-}
-
 fn contested_is_competitive(facts: &IslandCampaignFacts) -> bool {
     facts
         .friendly_capture_eta
@@ -1422,6 +1468,7 @@ fn sole_capturable_landmass_id(facts: &[IslandCampaignFacts]) -> Option<IslandId
 fn requirement_for_assessment(
     facts: &IslandCampaignFacts,
     assessment: &mut crate::ai::island_campaign::IslandCampaignAssessment,
+    reserve_unit_cost: u32,
 ) -> IslandCampaignRequirement {
     match assessment.state {
         IslandCampaignState::OpenNeutral
@@ -1458,9 +1505,11 @@ fn requirement_for_assessment(
             }
         }
         IslandCampaignState::Contested => {
-            let required_power = scaled_combat_requirement(facts.enemy_combat_value);
+            let required_power =
+                combat_overmatch_requirement(facts.enemy_combat_value, reserve_unit_cost);
             assessment.decision = IslandCampaignDecision::Reinforce;
-            assessment.decision_reason = "敵戦力の120%へ到達する完全増援を暫定要求する".to_owned();
+            assessment.decision_reason =
+                "敵戦力を上回り最小戦闘unit 1体分の損耗余裕を持つ増援を要求する".to_owned();
             assessment.required_budget = required_power;
             IslandCampaignRequirement {
                 preferred_transport: None,
@@ -1471,8 +1520,12 @@ fn requirement_for_assessment(
             }
         }
         IslandCampaignState::EnemyHeld => {
-            let combat_budget = 10_200_u32.max(scaled_combat_requirement(facts.enemy_combat_value));
-            let total_budget = required_assault_budget(facts.enemy_combat_value);
+            let combat_budget = 10_200_u32.max(combat_overmatch_requirement(
+                facts.enemy_combat_value,
+                reserve_unit_cost,
+            ));
+            // 戦闘部分と同じ実生産単位を総予算にも反映し、既定1,000への逆戻りを防ぐ。
+            let total_budget = 22_500_u32.saturating_add(combat_budget);
             assessment.required_budget = total_budget;
             IslandCampaignRequirement {
                 preferred_transport: Some(UnitType::Lander),
@@ -1691,6 +1744,32 @@ fn candidate_target_position(
         .or_else(|| sorted_island_tiles(island).first().copied())
 }
 
+fn candidate_capture_target_positions(
+    island: &Island,
+    properties: &[PropertySnapshot],
+    player_id: PlayerId,
+    primary_target: GridPosition,
+) -> Vec<GridPosition> {
+    let mut targets: Vec<_> = properties
+        .iter()
+        .filter(|snapshot| island.tiles.contains(&snapshot.position))
+        .filter(|snapshot| {
+            snapshot.property.max_capture_points > 0
+                && snapshot.property.owner_id != Some(player_id)
+        })
+        .map(|snapshot| snapshot.position)
+        .collect();
+    targets.sort_by_key(|position| (position.y, position.x));
+    if let Some(index) = targets
+        .iter()
+        .position(|position| *position == primary_target)
+    {
+        targets.remove(index);
+        targets.insert(0, primary_target);
+    }
+    targets
+}
+
 fn operation_has_live_capability(operation: &ExistingCampaignOperation) -> bool {
     ((operation.is_forming
         || operation
@@ -1699,6 +1778,85 @@ fn operation_has_live_capability(operation: &ExistingCampaignOperation) -> bool 
         && !operation.transport_entities.is_empty())
         || !operation.capture_entities.is_empty()
         || !operation.combat_entities.is_empty()
+}
+
+fn logistics_security_requirement(
+    enemy_combat_value: u32,
+    reserve_unit_cost: u32,
+    self_defense_credit: u32,
+) -> u32 {
+    combat_overmatch_requirement(enemy_combat_value, reserve_unit_cost)
+        .saturating_sub(self_defense_credit)
+}
+
+fn apply_logistics_security_requirements(
+    candidates: &mut [IslandCampaignCandidate],
+    units: &[UnitSnapshot],
+    island_map: &IslandMap,
+    player_id: PlayerId,
+) {
+    let units_by_entity: HashMap<_, _> = units.iter().map(|unit| (unit.entity, unit)).collect();
+    for candidate in candidates
+        .iter_mut()
+        .filter(|candidate| candidate.logistics_prerequisite)
+    {
+        let enemy_units: Vec<_> = units
+            .iter()
+            .filter(|unit| unit.faction != player_id && unit.transporting.is_none())
+            .filter(|unit| !is_support_only(unit.stats.unit_type))
+            .filter(|unit| {
+                island_map
+                    .get_island_at(&unit.position)
+                    .is_some_and(|island| island.id == candidate.assessment.island_id)
+            })
+            .collect();
+        if enemy_units.is_empty() {
+            continue;
+        }
+
+        // 輸送ヘリの機銃Eは軽・重歩兵に有効だが、対空兵器や重装甲へは護衛の
+        // 代替にならない。敵編成が歩兵だけの場合に限り、実在するヘリのHP加重費用を
+        // 自衛戦力として控除する。机上の生産予定機は戦力へ数えない。
+        let enemies_are_light_infantry = enemy_units
+            .iter()
+            .all(|unit| matches!(unit.stats.unit_type, UnitType::Infantry | UnitType::Mech));
+        let self_defense_credit = if enemies_are_light_infantry {
+            candidate
+                .existing_operation
+                .iter()
+                .flat_map(|operation| operation.transport_entities.iter())
+                .filter_map(|entity| units_by_entity.get(entity))
+                .filter(|unit| unit.stats.unit_type == UnitType::TransportHelicopter)
+                .fold(0_u32, |total, unit| {
+                    let value = unit
+                        .stats
+                        .cost
+                        .saturating_mul(unit.health.current)
+                        .checked_div(unit.health.max)
+                        .unwrap_or(0);
+                    total.saturating_add(value)
+                })
+        } else {
+            0
+        };
+        let reserve_unit_cost = candidate.minimum_combat_purchase_cost.unwrap_or(1_000);
+        let required_combat = logistics_security_requirement(
+            candidate.assessment.enemy_combat_value,
+            reserve_unit_cost,
+            self_defense_credit,
+        );
+        let structural_budget = candidate
+            .requirement
+            .total_budget
+            .saturating_sub(candidate.requirement.combat_budget);
+        candidate.requirement.combat_budget = required_combat;
+        candidate.requirement.total_budget = structural_budget.saturating_add(required_combat);
+        candidate.assessment.required_budget = candidate.requirement.total_budget;
+        candidate.assessment.decision_reason = format!(
+            "{}。敵を上回り最小戦闘unit 1体分の損耗余裕を確保し、対歩兵では輸送ヘリの実自衛力を控除する",
+            candidate.assessment.decision_reason
+        );
+    }
 }
 
 fn unavailable_campaign_entities(
@@ -1928,6 +2086,46 @@ pub fn analyze_island_campaign_excluding(
         .cloned()
         .unwrap_or_default();
     let properties = collect_property_snapshots(world);
+    let (friendly_income_per_turn, enemy_income_per_turn) = properties.iter().fold(
+        (0_u32, 0_u32),
+        |(friendly_income, enemy_income), snapshot| {
+            let income = registry.landscape_income(snapshot.property.terrain.as_str());
+            match snapshot.property.owner_id {
+                Some(owner) if owner == player_id => {
+                    (friendly_income.saturating_add(income), enemy_income)
+                }
+                Some(_) => (friendly_income, enemy_income.saturating_add(income)),
+                None => (friendly_income, enemy_income),
+            }
+        },
+    );
+    let home_property = properties.iter().find(|snapshot| {
+        snapshot.property.owner_id == Some(player_id)
+            && snapshot.property.terrain == Terrain::Capital
+    });
+    let home_position = home_property.map(|snapshot| snapshot.position);
+    let home_island = home_property
+        .and_then(|snapshot| island_map.get_island_at(&snapshot.position))
+        .map(|island| island.id);
+    let mut forward_sustainment_coverage = CampaignSustainmentCoverage::default();
+    if let Some(home_island) = home_island {
+        for snapshot in properties.iter().filter(|snapshot| {
+            snapshot.property.owner_id == Some(player_id)
+                && snapshot.property.max_capture_points > 0
+                && island_map
+                    .get_island_at(&snapshot.position)
+                    .is_some_and(|island| island.id != home_island)
+        }) {
+            match snapshot.property.terrain {
+                Terrain::Capital | Terrain::City | Terrain::Factory => {
+                    forward_sustainment_coverage.ground = true
+                }
+                Terrain::Airport => forward_sustainment_coverage.air = true,
+                Terrain::Port => forward_sustainment_coverage.sea = true,
+                _ => {}
+            }
+        }
+    }
     let minimum_combat_purchase_cost =
         minimum_producible_campaign_combat_cost(&map, &registry, &properties, player_id);
     let producible_transports =
@@ -1990,7 +2188,11 @@ pub fn analyze_island_campaign_excluding(
                 total_budget: 0,
             }
         } else {
-            requirement_for_assessment(island_facts, &mut assessment)
+            requirement_for_assessment(
+                island_facts,
+                &mut assessment,
+                minimum_combat_purchase_cost.unwrap_or(1_000),
+            )
         };
         let assault_transport_types = adapt_assault_requirement_to_production_route(
             &mut assessment,
@@ -2003,11 +2205,27 @@ pub fn analyze_island_campaign_excluding(
         else {
             continue;
         };
+        let capture_target_positions =
+            candidate_capture_target_positions(&island, &properties, player_id, target_position);
+        let (ground_sustainment_sites, air_sustainment_sites, sea_sustainment_sites) =
+            sustainment_site_counts(&island, &properties);
+        let sustainment_targets = if Some(island.id) == home_island {
+            CampaignSustainmentTargets::default()
+        } else {
+            sustainment_targets(&island, &properties, player_id)
+        };
         candidates.push(IslandCampaignCandidate {
             assessment,
             target_position,
+            capture_target_positions,
             roi_production_sites: island_facts.roi_production_sites,
             transport_eta: island_facts.transport_eta,
+            ground_sustainment_sites,
+            air_sustainment_sites,
+            sea_sustainment_sites,
+            sustainment_targets,
+            island_income_per_turn: island_facts.island_income_per_turn,
+            logistics_prerequisite: false,
             requirement,
             assault_transport_types,
             minimum_combat_purchase_cost,
@@ -2015,6 +2233,15 @@ pub fn analyze_island_campaign_excluding(
             existing_operation,
         });
     }
+    promote_logistics_prerequisite(
+        &mut candidates,
+        &map,
+        friendly_income_per_turn,
+        enemy_income_per_turn,
+        forward_sustainment_coverage,
+        home_position,
+    );
+    apply_logistics_security_requirements(&mut candidates, &units, &island_map, player_id);
     allocate_campaign_portfolio(candidates, pool)
 }
 
@@ -3402,7 +3629,8 @@ mod tests {
             has_unowned_properties: false,
         };
         let mut defense = assess_island(&threatened_facts);
-        let defense_requirement = requirement_for_assessment(&threatened_facts, &mut defense);
+        let defense_requirement =
+            requirement_for_assessment(&threatened_facts, &mut defense, 1_000);
         assert_eq!(defense_requirement.combat_budget, 10_000);
 
         threatened_facts.friendly_units = 1;
@@ -3412,9 +3640,30 @@ mod tests {
         threatened_facts.enemy_capture_eta = Some(2);
         let mut reinforcement = assess_island(&threatened_facts);
         let reinforcement_requirement =
-            requirement_for_assessment(&threatened_facts, &mut reinforcement);
+            requirement_for_assessment(&threatened_facts, &mut reinforcement, 1_000);
         assert_eq!(reinforcement.decision, IslandCampaignDecision::Reinforce);
-        assert_eq!(reinforcement_requirement.combat_budget, 12_000);
+        assert_eq!(reinforcement_requirement.combat_budget, 11_000);
+
+        threatened_facts.friendly_units = 0;
+        threatened_facts.enemy_units = 1;
+        threatened_facts.enemy_properties = 1;
+        threatened_facts.friendly_capture_eta = None;
+        threatened_facts.enemy_capture_eta = None;
+        let mut assault = assess_island(&threatened_facts);
+        let assault_requirement =
+            requirement_for_assessment(&threatened_facts, &mut assault, 2_000);
+        assert_eq!(assault.decision, IslandCampaignDecision::Assault);
+        assert_eq!(assault_requirement.combat_budget, 12_000);
+        assert_eq!(assault_requirement.total_budget, 34_500);
+    }
+
+    #[test]
+    fn logistics_security_uses_discrete_reserve_and_transport_self_defense() {
+        // 敵1体分と最小増援1体分を輸送ヘリの自衛力が上回るなら、護衛追加は不要。
+        assert_eq!(logistics_security_requirement(1_000, 1_000, 4_000), 0);
+        // 自衛力が通用しない相手には固定比率でなく、敵を最小unit 1体分上回る量を要求する。
+        assert_eq!(logistics_security_requirement(10_000, 1_000, 0), 11_000);
+        assert_eq!(logistics_security_requirement(50_000, 1_000, 0), 51_000);
     }
 
     #[test]
