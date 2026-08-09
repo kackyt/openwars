@@ -125,6 +125,9 @@
 - [x] B-67. 残存施設別の占領要求、Secureの攻勢枠非消費、遠隔Secureの輸送不足、Assaultの完全戦力ゲート、生産施設退避を単体テストで固定する
 - [x] B-68. release版map_3 / seed 42 / 12ターン / 両手番でT1からSecure＋Expand、T3以降Secure＋最大3攻勢、生産増加、無人敵領への占領発進、守備中敵領への戦闘不足待機を確認する
 - [ ] B-69. 盤上unit数が増えた長期戦の探索性能を改善し、map_3 / 30ターン / 複数seedで島争奪後の敵領Assault、収入、ZOC、勝敗を検証する
+- [x] B-70. 進行中作戦の割当済みEntityを維持しつつ、未割当資源と生産不足を兵站前提・防衛、Secure、Contest、Reinforce、Expand、Assaultの順に配分し、Forming Assaultによる島作戦の飢餓を防ぐ
+- [x] B-71. Pickup cargoが輸送役の座標へ到達可能なら同一手番にLoadし、別unitとの同一マス占有を残すWaitをエンジンで拒否して当該PendingMoveを巻き戻す
+- [x] B-72. 作戦優先度と違法Waitの単体・全体回帰テスト、およびrelease版map_3 / seed 42 / 16ターン / 両手番の輸送・継続作戦追試を実行する
 
 ## Phase C: 陸上前線への一般化・到達可能性・生産枠
 

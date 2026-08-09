@@ -29,6 +29,11 @@ MUST: AIは1つの目標に対して、適切な数のユニットを連携さ�
 - **WHEN** Pickup中の先頭cargoが行動済みで、同じ輸送Squadに未行動の後続cargoが存在するとき
 - **THEN** 先頭cargoだけを見てPickupを停止せず、後続の行動可能cargoを合法な合流地点へ前進させる
 
+#### Scenario: 輸送役へ到達したcargoを直ちに積載する
+
+- **WHEN** Pickup中の未行動cargoが現在の行動範囲で輸送役の座標へ到達できるとき
+- **THEN** cargoを輸送役と同じマスでWaitさせず、移動と積載を同じLoadコマンドで確定する。同一マス占有を残すWaitが発行された場合、エンジンは待機を拒否し、当該cargoの直前の移動を巻き戻す
+
 #### Scenario: 同一輸送役から複数cargoを同一手番に降車させる
 
 - **WHEN** Drop中の輸送役に複数の行動可能cargoがあり、各cargoに合法な降車地点が存在するとき

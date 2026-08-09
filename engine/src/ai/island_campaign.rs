@@ -200,13 +200,17 @@ impl IslandCampaignPortfolio {
             {
                 continue;
             }
+            // 既存Assaultの完成待ちで、残存施設のSecureや進行中の島争奪を
+            // 飢餓させない。作戦種別を先に比較し、同種内だけ継続作戦を優先する。
+            let existing_offset = u8::from(!assignment.continued_from_existing_squad);
             let priority_rank = match assignment.decision {
                 IslandCampaignDecision::Defend => 0,
-                _ if assignment.continued_from_existing_squad => 1,
-                IslandCampaignDecision::Secure => 2,
-                IslandCampaignDecision::Contest | IslandCampaignDecision::Reinforce => 3,
-                IslandCampaignDecision::Expand => 4,
-                IslandCampaignDecision::Assault => 5,
+                IslandCampaignDecision::Secure => 1 + existing_offset,
+                IslandCampaignDecision::Contest | IslandCampaignDecision::Reinforce => {
+                    3 + existing_offset
+                }
+                IslandCampaignDecision::Expand => 5 + existing_offset,
+                IslandCampaignDecision::Assault => 7 + existing_offset,
                 _ => continue,
             };
             let (light_transport_slots, heavy_transport_slots) = match missing.preferred_transport {
@@ -367,8 +371,8 @@ type OffensivePriorityKey = (
 
 /// decisionごとの固定keyへ正規化し、HashMapや入力順に依存しない攻勢優先順位を作る。
 fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePriorityKey {
-    // 一度編成を始めた作戦は決定種別が変わっても最優先で継続し、
-    // 新規作戦への切替で輸送中・合流中の戦力を遊兵化させない。
+    // 進行中作戦の専属Entityはassigned_islandで保持する。一方、未割当資源まで
+    // 既存Assaultが先取りすると島内Secureが停止するため、作戦種別を先に比較する。
     let existing_rank = u8::from(candidate.existing_operation.is_none());
     let decision_rank = match candidate.assessment.decision {
         _ if candidate.logistics_prerequisite => 0,
@@ -381,8 +385,8 @@ fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePrior
     };
     match candidate.assessment.decision {
         IslandCampaignDecision::Expand | IslandCampaignDecision::Secure => (
-            existing_rank,
             decision_rank,
+            existing_rank,
             candidate
                 .assessment
                 .expansion_payback_turns
@@ -396,8 +400,8 @@ fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePrior
             candidate.assessment.island_id.0,
         ),
         IslandCampaignDecision::Contest | IslandCampaignDecision::Reinforce => (
-            existing_rank,
             decision_rank,
+            existing_rank,
             0,
             Reverse(0),
             Reverse(0),
@@ -411,8 +415,8 @@ fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePrior
             candidate.assessment.island_id.0,
         ),
         IslandCampaignDecision::Assault => (
-            existing_rank,
             decision_rank,
+            existing_rank,
             0,
             Reverse(candidate.roi_production_sites),
             Reverse(candidate.assessment.enemy_properties),
@@ -423,8 +427,8 @@ fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePrior
             candidate.assessment.island_id.0,
         ),
         _ => (
-            existing_rank,
             decision_rank,
+            existing_rank,
             0,
             Reverse(0),
             Reverse(0),
@@ -1524,9 +1528,13 @@ pub(crate) fn allocate_campaign_portfolio(
             IslandCampaignDecision::Secure
                 | IslandCampaignDecision::Contest
                 | IslandCampaignDecision::Reinforce
-        ) || active_offensives.is_empty()
-            && (candidate.assessment.decision == IslandCampaignDecision::Assault
-                || candidate.logistics_prerequisite);
+        ) || candidate
+            .existing_operation
+            .as_ref()
+            .is_some_and(|operation| operation.is_forming)
+            || active_offensives.is_empty()
+                && (candidate.assessment.decision == IslandCampaignDecision::Assault
+                    || candidate.logistics_prerequisite);
         if let Some((assignment, provisional)) =
             reserve_candidate(&candidate, &pool, &catalog, allow_future_budget_reservation)
         {
@@ -2334,7 +2342,7 @@ mod tests {
 
         assert!(candidates[0].logistics_prerequisite);
         assert_eq!(candidates[0].target_position, GridPosition { x: 5, y: 1 });
-        assert_eq!(offensive_priority_key(&candidates[0]).1, 0);
+        assert_eq!(offensive_priority_key(&candidates[0]).0, 0);
     }
 
     #[test]
@@ -2589,6 +2597,64 @@ mod tests {
         assert_eq!(assignment.purchase_shortfall.transport_slots, 1);
         assert_eq!(assignment.purchase_shortfall.total_budget, 4_000);
         assert!(!assignment.operation_ready);
+    }
+
+    #[test]
+    fn secure_uses_new_resources_before_a_forming_assault_adds_reinforcements() {
+        let capture = Entity::from_raw(151);
+        let transport = Entity::from_raw(152);
+        let assault_guard = Entity::from_raw(153);
+
+        let mut secure = secure_candidate(2);
+        secure.requirement.capture_units = 1;
+        secure.requirement.total_budget = 1_000;
+        secure.assessment.neutral_properties = 1;
+
+        let mut forming_assault = assault_candidate(9);
+        forming_assault.requirement.transport_slots = 2;
+        forming_assault.requirement.capture_units = 1;
+        forming_assault.requirement.total_budget = 15_200;
+        forming_assault.assault_transport_types = vec![UnitType::TransportHelicopter];
+        forming_assault.existing_operation = Some(ExistingCampaignOperation {
+            island_id: IslandId(9),
+            target_position: forming_assault.target_position,
+            transport_phase: None,
+            is_forming: true,
+            transport_entities: Vec::new(),
+            capture_entities: Vec::new(),
+            combat_entities: vec![assault_guard],
+        });
+
+        let mut remote_capture = unit_candidate(151, UnitType::Infantry, 1_000, true, 0);
+        remote_capture.island_id = Some(IslandId(0));
+        remote_capture.reachable_positions.clear();
+        let mut free_transport =
+            unit_candidate(152, UnitType::TransportHelicopter, 4_000, false, 2);
+        free_transport.island_id = Some(IslandId(0));
+        let mut assigned_guard = unit_candidate(153, UnitType::Tank, 10_000, false, 0);
+        assigned_guard.island_id = Some(IslandId(0));
+        assigned_guard.assigned_island = Some(IslandId(9));
+
+        let portfolio = allocate_campaign_portfolio(
+            vec![forming_assault, secure],
+            CampaignResourcePool {
+                available_funds: 0,
+                units: vec![remote_capture, free_transport, assigned_guard],
+            },
+        );
+
+        let secure_assignment = portfolio.assignment_for(IslandId(2)).unwrap();
+        assert_eq!(secure_assignment.capture_entities, vec![capture]);
+        assert_eq!(secure_assignment.transport_entities, vec![transport]);
+        assert!(secure_assignment.operation_ready);
+
+        let assault_assignment = portfolio
+            .assignment_for(IslandId(9))
+            .expect("forming assault keeps its dedicated entities and future shortfall");
+        assert_eq!(assault_assignment.combat_entities, vec![assault_guard]);
+        assert!(!assault_assignment.capture_entities.contains(&capture));
+        assert!(!assault_assignment.transport_entities.contains(&transport));
+        assert!(!assault_assignment.operation_ready);
     }
 
     /// 未着手の敵本土よりも、投資回収可能な中立島の争奪を先に進める。
@@ -3703,6 +3769,12 @@ mod tests {
             islands: Vec::new(),
             active_offensives: vec![
                 assignment_with_shortfall(
+                    5,
+                    IslandCampaignDecision::Secure,
+                    false,
+                    GridPosition { x: 5, y: 0 },
+                ),
+                assignment_with_shortfall(
                     4,
                     IslandCampaignDecision::Assault,
                     false,
@@ -3743,10 +3815,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 (0, IslandId(0)),
-                (1, IslandId(1)),
-                (3, IslandId(3)),
-                (4, IslandId(2)),
-                (5, IslandId(4)),
+                (2, IslandId(5)),
+                (4, IslandId(3)),
+                (6, IslandId(2)),
+                (7, IslandId(1)),
+                (8, IslandId(4)),
             ]
         );
     }

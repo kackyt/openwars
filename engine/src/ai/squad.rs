@@ -3848,6 +3848,18 @@ pub fn execute_transport_squad_step(
                     )
                 };
 
+                // 合流地点までこの手番に到達できるなら、同じ座標でWaitして翌手番に
+                // Loadし直さず、移動と積載を1つのコマンドとして確定する。
+                if cargo_reachable.contains(&(t_pos.x, t_pos.y)) {
+                    return Some((
+                        cargo_entity,
+                        crate::ai::engine::AiCommand::Load {
+                            transport_entity,
+                            target_pos: t_pos,
+                        },
+                    ));
+                }
+
                 let mut best_tile = cargo_pos;
                 let mut min_score = None;
 
@@ -6208,9 +6220,9 @@ mod tests {
         ));
     }
 
-    /// 先頭cargoが行動済みでも、後続の未行動cargoを同じ手番に合流点へ動かす。
+    /// 先頭cargoが行動済みでも、到達可能な後続cargoを同じ手番に積載する。
     #[test]
-    fn transport_pickup_advances_next_actionable_cargo_in_same_turn() {
+    fn transport_pickup_loads_reachable_next_cargo_in_same_turn() {
         let mut world = World::new();
         let registry = MasterDataRegistry::load().unwrap();
         world.insert_resource(Map::new(4, 1, Terrain::Plains, GridTopology::Square));
@@ -6278,9 +6290,15 @@ mod tests {
 
         let (entity, command) =
             execute_transport_squad_step(&mut world, &mut squad, &HashSet::new())
-                .expect("second cargo should advance");
+                .expect("second cargo should load without a staging wait");
         assert_eq!(entity, actionable);
-        assert!(matches!(command, crate::ai::engine::AiCommand::Wait { .. }));
+        assert!(matches!(
+            command,
+            crate::ai::engine::AiCommand::Load {
+                transport_entity,
+                target_pos: GridPosition { x: 0, y: 0 },
+            } if transport_entity == transport
+        ));
     }
 
     #[test]
