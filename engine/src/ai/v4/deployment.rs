@@ -359,9 +359,6 @@ fn local_retarget(
     connectivity: &mut TerrainConnectivity,
     deployment: &AssignedDeployment,
 ) -> Option<Entity> {
-    let map = world.get_resource::<Map>()?.clone();
-    let master_data = world.get_resource::<MasterDataRegistry>()?.clone();
-    let mut candidates = Vec::new();
     let mut enemies = world.query::<(
         Entity,
         &Faction,
@@ -369,6 +366,9 @@ fn local_retarget(
         &UnitStats,
         Option<&Transporting>,
     )>();
+    let map = world.get_resource::<Map>()?;
+    let master_data = world.get_resource::<MasterDataRegistry>()?;
+    let mut candidates = Vec::new();
     for (entity, faction, position, stats, transporting) in enemies.iter(world) {
         if faction.0 == deployment.intent.player_id || transporting.is_some() {
             continue;
@@ -383,8 +383,8 @@ fn local_retarget(
             .div_ceil(stats.max_movement.max(1));
         if eta > deployment.intent.threat_horizon
             || !connectivity.is_reachable(
-                &map,
-                &master_data,
+                map,
+                master_data,
                 (position.x, position.y),
                 (deployment.intent.anchor.x, deployment.intent.anchor.y),
                 stats.movement_type,

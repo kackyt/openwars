@@ -2238,8 +2238,8 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
 
         // 島嶼キャンペーン分析が緊急担当EntityとV4局地任務Entityを再予約しないようにする。
         // deploymentは生産目的が解消されるまで、汎用free poolより先に確保する。
-        let mut strategy_reserved_entities = reserved_entities.clone();
-        strategy_reserved_entities.extend(deployment_entities);
+        let mut strategy_reserved_entities = deployment_entities;
+        strategy_reserved_entities.extend(reserved_entities.iter().copied());
 
         // 更新済みManagerを一時的に戻して、予約済みEntityを除外した戦略分析を行う。
         world.insert_resource(manager);
