@@ -475,7 +475,7 @@ pub(crate) fn plan_campaign_shortfall_production(
                             facility_position.x,
                             *facility_position,
                             *unit_type,
-                            stats.clone(),
+                            stats,
                         ));
                     }
                 }
@@ -516,7 +516,7 @@ pub(crate) fn plan_campaign_shortfall_production(
             });
             outcome.remaining_funds = outcome.remaining_funds.saturating_sub(stats.cost);
             outcome.used_facilities.insert(position);
-            consume_campaign_candidate(row, requirement, &stats);
+            consume_campaign_candidate(row, requirement, stats);
             if row.decision == IslandCampaignDecision::Assault
                 && requirement != CampaignProductionRequirement::Combat
             {

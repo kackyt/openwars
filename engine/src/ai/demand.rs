@@ -316,6 +316,8 @@ enum WeaponSlot {
     Secondary,
 }
 
+/// 残弾がある主・副武器から対象へ最も高い基礎ダメージを与える武器を選ぶ。
+/// 弾数上限が0の武器は弾薬を消費しない武器として常に使用可能とみなす。
 fn available_weapon_against(
     unit: &CombatCapabilitySnapshot,
     defender: UnitType,

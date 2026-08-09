@@ -767,6 +767,8 @@ fn is_roi_site(terrain: Terrain) -> bool {
     matches!(terrain, Terrain::Factory | Terrain::Port | Terrain::Airport)
 }
 
+/// 島内の占領可能施設を、地上・航空・海上ユニットの補給カテゴリ別に集計する。
+/// 首都・都市・工場は地上、空港は航空、港は海上の継戦拠点として扱う。
 fn sustainment_site_counts(island: &Island, properties: &[PropertySnapshot]) -> (u32, u32, u32) {
     let mut ground = 0_u32;
     let mut air = 0_u32;

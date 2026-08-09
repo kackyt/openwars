@@ -462,6 +462,8 @@ fn preferred_logistics_target(
         .flatten()
 }
 
+/// 候補島が地上兵と強襲輸送役に提供できる補給カテゴリ数を返す。
+/// 強襲で実際に使う輸送種別だけを数え、同じ輸送種別の重複要求は1カテゴリにまとめる。
 fn logistics_coverage(
     candidate: &IslandCampaignCandidate,
     assault: &IslandCampaignCandidate,

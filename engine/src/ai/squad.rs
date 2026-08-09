@@ -421,6 +421,8 @@ fn is_purchase_campaign_placeholder(squad: &Squad, player_id: PlayerId) -> bool 
         && squad.target.is_some()
 }
 
+/// 輸送ヘリが着陸地点を確保するため、目標島内で攻撃可能な最寄りの軽歩兵を選ぶ。
+/// 距離が同じ場合は座標とEntity IDで順序を固定し、再計画時の目標揺れを防ぐ。
 fn light_infantry_target_for_transport(
     world: &World,
     transport: Entity,

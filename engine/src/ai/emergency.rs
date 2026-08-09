@@ -126,6 +126,8 @@ fn required_capture_turns(capture_points: u32, capture_power: u32) -> u32 {
     capture_points.div_ceil(capture_power)
 }
 
+/// 重要拠点の占領完了ETAまでに敵を撃破するか、占領完了を遅延できる迎撃役を選ぶ。
+/// 占領可能兵は温存し、撃破可否・遅延可否・到着ターン・与ダメージの順で優先する。
 fn select_eliminator(
     candidates: &[UnitSnapshot],
     enemy: &UnitSnapshot,
