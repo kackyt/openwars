@@ -2207,7 +2207,10 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
 
     // V3 の戦略拡張 (#53: 敵拠点の奪取目標化) を有効にするかどうか
     let is_v3 = crate::ai::resolve_player_ai_version(world, perspective_player).uses_v3_tactics();
+    let is_v4 = crate::ai::resolve_player_ai_version(world, perspective_player)
+        .uses_operation_driven_production();
     let mut manager = world.remove_resource::<SquadManager>().unwrap_or_default();
+    let mut tactical_reserved_entities = HashSet::new();
     let strategy = if is_v3 {
         // 緊急ミッションは盤面から毎ターン再構築し、通常部隊より先に担当Entityを予約する。
         manager.squads.retain(|squad| {
@@ -2215,15 +2218,36 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                 || !matches!(squad.mission_type, MissionType::Interception(_))
         });
         let unavailable = interception_unavailable_entities(&manager, perspective_player);
-        let emergency_plan =
-            crate::ai::emergency::analyze_interceptions(world, perspective_player, &unavailable);
+        let deployment_entities = if is_v4 {
+            world
+                .get_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>()
+                .map(|deployments| deployments.active_entities(perspective_player))
+                .unwrap_or_default()
+        } else {
+            HashSet::new()
+        };
+        let emergency_plan = crate::ai::emergency::analyze_interceptions_with_protected(
+            world,
+            perspective_player,
+            &unavailable,
+            &deployment_entities,
+        );
         let reserved_entities = emergency_plan.reserved_entities();
+        tactical_reserved_entities.extend(reserved_entities.iter().copied());
         detach_interception_members(&mut manager, perspective_player, &reserved_entities);
 
-        // 島嶼キャンペーン分析が緊急担当Entityを再予約しないよう、更新済みManagerを一時的に戻す。
+        // 島嶼キャンペーン分析が緊急担当EntityとV4局地任務Entityを再予約しないようにする。
+        // deploymentは生産目的が解消されるまで、汎用free poolより先に確保する。
+        let mut strategy_reserved_entities = reserved_entities.clone();
+        strategy_reserved_entities.extend(deployment_entities);
+
+        // 更新済みManagerを一時的に戻して、予約済みEntityを除外した戦略分析を行う。
         world.insert_resource(manager);
-        let strategy =
-            analyze_strategy_with_reserved_entities(world, perspective_player, &reserved_entities);
+        let strategy = analyze_strategy_with_reserved_entities(
+            world,
+            perspective_player,
+            &strategy_reserved_entities,
+        );
         manager = world.remove_resource::<SquadManager>().unwrap_or_default();
         apply_interception_squads(&mut manager, perspective_player, &emergency_plan);
         world.insert_resource(emergency_plan);
@@ -2310,6 +2334,19 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
             blocked_campaign_islands.insert(assignment.island_id);
         }
         prepare_campaign_local_assignment(world, &mut manager, perspective_player, assignment);
+    }
+
+    // V4のCombat/Intercept枠で生産した実Entityは、緊急迎撃の次、
+    // campaign再配分とgeneric free poolより前に要求元の局地Attack任務へ予約する。
+    // 既存campaign assignmentへ残っていても、明示的な生産目的を優先して切り離す。
+    if is_v4 {
+        let deployment_reserved = crate::ai::v4::deployment::prepare_deployment_squads(
+            world,
+            &mut manager,
+            perspective_player,
+            &tactical_reserved_entities,
+        );
+        all_campaign_reserved_entities.extend(deployment_reserved);
     }
 
     // #53 (V3): メンバーが全滅した占領部隊を解散する。

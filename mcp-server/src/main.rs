@@ -516,6 +516,13 @@ impl OpenWarsAiServer {
             // V4の生産判断内訳。V1〜V3は記録が無いためnullになる。
             let production_plan =
                 invasion_trace::snapshot_production_plan_for_player(&state.world, active_player_id);
+            // 生産意図から実Entityの任務・攻撃まで接続された実績。V4以外は空になる。
+            let deployment_audit = invasion_trace::snapshot_deployment_audit_for_player(
+                &state.world,
+                active_player_id,
+            );
+            let emergency_plan =
+                invasion_trace::snapshot_emergency_plan_for_player(&state.world, active_player_id);
 
             let after_metrics = engine::ai::eval::evaluate_board_with_metrics(
                 &mut state.world,
@@ -530,6 +537,8 @@ impl OpenWarsAiServer {
                 "island_campaign": island_campaign,
                 "idle_audit": idle_audit,
                 "production_plan": production_plan,
+                "deployment_audit": deployment_audit,
+                "emergency_plan": emergency_plan,
                 "player_id": active_player_id.0,
                 "player_index": active_player_index.0,
                 "before_score": before_metrics.total_score,

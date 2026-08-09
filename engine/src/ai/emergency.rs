@@ -33,6 +33,7 @@ pub struct CriticalSiteThreat {
     pub site_position: GridPosition,
     pub site_terrain: Terrain,
     pub site_capture_points: u32,
+    pub site_owner_id: Option<PlayerId>,
     pub eta: u32,
     pub priority: SitePriorityScore,
 }
@@ -355,6 +356,16 @@ pub fn analyze_interceptions(
     player_id: PlayerId,
     unavailable_entities: &HashSet<Entity>,
 ) -> EmergencyMissionPlan {
+    analyze_interceptions_with_protected(world, player_id, unavailable_entities, &HashSet::new())
+}
+
+/// V4の作戦遂行中Entityを中立拠点レースでは横取りせず、自領危機だけpreempt可能にする。
+pub(crate) fn analyze_interceptions_with_protected(
+    world: &mut World,
+    player_id: PlayerId,
+    unavailable_entities: &HashSet<Entity>,
+    neutral_site_protected_entities: &HashSet<Entity>,
+) -> EmergencyMissionPlan {
     let map = world.resource::<Map>().clone();
     let registry = world
         .get_resource::<MasterDataRegistry>()
@@ -445,6 +456,7 @@ pub fn analyze_interceptions(
                 site_position: *site_position,
                 site_terrain: property.terrain,
                 site_capture_points: property.capture_points,
+                site_owner_id: property.owner_id,
                 eta: distance.turns,
                 priority,
             });
@@ -474,7 +486,12 @@ pub fn analyze_interceptions(
         };
         let mut candidates = units
             .iter()
-            .filter(|unit| unit.faction == player_id && !reserved.contains(&unit.entity))
+            .filter(|unit| {
+                unit.faction == player_id
+                    && !reserved.contains(&unit.entity)
+                    && (threat.site_owner_id == Some(player_id)
+                        || !neutral_site_protected_entities.contains(&unit.entity))
+            })
             .cloned()
             .collect::<Vec<_>>();
         candidates.sort_by_key(|candidate| {
@@ -702,6 +719,69 @@ mod tests {
         assert_eq!(plan.missions[0].assigned_entity, defender);
         assert_eq!(plan.missions[0].response, EmergencyResponse::OccupySite);
         assert_eq!(plan.missions[0].target_position, site);
+    }
+
+    #[test]
+    fn issue95_neutral_race_does_not_preempt_protected_deployment() {
+        let mut world = setup_world(6, 1);
+        let player = PlayerId(1);
+        let site = GridPosition { x: 2, y: 0 };
+        world.spawn((site, Property::new(Terrain::Airport, None, 100)));
+        spawn_unit(
+            &mut world,
+            player.opposite(),
+            GridPosition { x: 5, y: 0 },
+            infantry_stats(3),
+            100,
+        );
+        let deployment = spawn_unit(
+            &mut world,
+            player,
+            GridPosition { x: 0, y: 0 },
+            blocker_stats(3),
+            100,
+        );
+
+        let plan = analyze_interceptions_with_protected(
+            &mut world,
+            player,
+            &HashSet::new(),
+            &HashSet::from([deployment]),
+        );
+
+        assert!(plan.missions.is_empty());
+    }
+
+    #[test]
+    fn issue95_owned_site_can_preempt_protected_deployment() {
+        let mut world = setup_world(6, 1);
+        let player = PlayerId(1);
+        let site = GridPosition { x: 2, y: 0 };
+        world.spawn((site, Property::new(Terrain::Airport, Some(player), 100)));
+        spawn_unit(
+            &mut world,
+            player.opposite(),
+            GridPosition { x: 5, y: 0 },
+            infantry_stats(3),
+            100,
+        );
+        let deployment = spawn_unit(
+            &mut world,
+            player,
+            GridPosition { x: 0, y: 0 },
+            blocker_stats(3),
+            100,
+        );
+
+        let plan = analyze_interceptions_with_protected(
+            &mut world,
+            player,
+            &HashSet::new(),
+            &HashSet::from([deployment]),
+        );
+
+        assert_eq!(plan.missions.len(), 1);
+        assert_eq!(plan.missions[0].assigned_entity, deployment);
     }
 
     #[test]

@@ -68,11 +68,17 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
     }
 
     // 2. 割り当てが必要な部隊（Squad）を収集
+    let protected_squads = world
+        .get_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>()
+        .map(|registry| registry.protected_squads(perspective_player))
+        .unwrap_or_default();
     let active_squads: Vec<Squad> = manager
         .squads
         .iter()
         // active playerのgeneric責務だけを探索し、輸送および島別campaign責務の目標を上書きしない。
         .filter(|s| s.owner_id == Some(perspective_player))
+        // V4の生産目的を持つ局地任務は、優先敵が有効な間は別前線へ上書きしない。
+        .filter(|s| !protected_squads.contains(&s.id))
         .filter(|s| {
             !s.members.is_empty()
                 && !matches!(

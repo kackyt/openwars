@@ -422,6 +422,14 @@ class IslandCampaignCollectionTests(unittest.TestCase):
             1: {"player_id": 1, "islands": [{"island_id": 1}]},
             2: {"player_id": 2, "islands": [{"island_id": 2}]},
         }
+        deployment_audits = {
+            1: {"player_id": 1, "assigned_count": 1, "records": []},
+            2: {"player_id": 2, "assigned_count": 2, "records": []},
+        }
+        emergency_plans = {
+            1: {"player_id": 1, "missions": [{"eta": 1}]},
+            2: {"player_id": 2, "missions": []},
+        }
 
         def tool(name, arguments=None, req_id=1):
             nonlocal active_index
@@ -463,6 +471,8 @@ class IslandCampaignCollectionTests(unittest.TestCase):
                     "invasion_events": [],
                     "transport_squads": [],
                     "island_campaign": campaigns[player_id],
+                    "deployment_audit": deployment_audits[player_id],
+                    "emergency_plan": emergency_plans[player_id],
                 }
                 active_index = 1 - active_index
                 return response
@@ -493,6 +503,40 @@ class IslandCampaignCollectionTests(unittest.TestCase):
             ],
             result["island_campaign_history"],
         )
+        self.assertEqual(
+            [
+                {
+                    "round": 1,
+                    "turn": 1,
+                    "player_id": 1,
+                    "audit": deployment_audits[1],
+                },
+                {
+                    "round": 1,
+                    "turn": 1,
+                    "player_id": 2,
+                    "audit": deployment_audits[2],
+                },
+            ],
+            result["deployment_audit_history"],
+        )
+        self.assertEqual(
+            [emergency_plans[1], emergency_plans[2]],
+            [entry["plan"] for entry in result["emergency_plan_history"]],
+        )
+
+        with TemporaryDirectory() as directory:
+            trace_path = Path(directory) / "trace.jsonl"
+            result.update({"map": "map_3", "p1": "V4", "p2": "V3"})
+            eval_matchup.write_trace_jsonl(trace_path, [result])
+            lines = [
+                json.loads(line)
+                for line in trace_path.read_text(encoding="utf-8").splitlines()
+            ]
+        self.assertEqual(deployment_audits[1], lines[0]["deployment_audit"])
+        self.assertEqual(deployment_audits[2], lines[1]["deployment_audit"])
+        self.assertEqual(emergency_plans[1], lines[0]["emergency_plan"])
+        self.assertEqual(emergency_plans[2], lines[1]["emergency_plan"])
 
 
 class CompletedRoundTests(unittest.TestCase):
