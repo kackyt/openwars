@@ -1327,6 +1327,22 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
         }
     }
 
+    // 未完成の島嶼輸送パッケージが生産施設上でFormingすると、不足している次の
+    // 輸送役を自分で生産不能にする。任務所属は維持したまま隣接待機地へ一歩だけ退避する。
+    if uses_v3
+        && let Some((entity, command)) =
+            decide_forming_campaign_site_relief(world, active_player, &skip_entities)
+    {
+        let command_text = format!("{:?}", command);
+        execute_ai_command(world, entity, command);
+        if let Some(mut cooldown) = world.get_resource_mut::<AiActionCooldown>() {
+            cooldown.0.insert(entity);
+        } else {
+            world.insert_resource(AiActionCooldown(HashSet::from([entity])));
+        }
+        return Some(command_text);
+    }
+
     // 1. 輸送部隊の優先実行
     let mut transport_action = None;
     if let Some(mut manager) = world.remove_resource::<crate::ai::squad::SquadManager>() {
@@ -1505,6 +1521,168 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
         world.get_resource_mut::<Events<crate::events::NextPhaseCommand>>()
     {
         end_events.send(crate::events::NextPhaseCommand);
+    }
+    None
+}
+
+/// 非readyのForming輸送隊が自軍生産施設を塞いだ場合だけ、任務を壊さず隣へ退避する。
+fn decide_forming_campaign_site_relief(
+    world: &mut World,
+    player_id: PlayerId,
+    skip_entities: &HashSet<Entity>,
+) -> Option<(Entity, AiCommand)> {
+    use crate::ai::squad::{MissionPhase, MissionType, SquadManager};
+
+    let map = world.get_resource::<Map>()?.clone();
+    let registry = world.get_resource::<MasterDataRegistry>()?.clone();
+    let capital_positions: Vec<_> = world
+        .query::<(&GridPosition, &Property)>()
+        .iter(world)
+        .filter_map(|(position, property)| {
+            (property.owner_id == Some(player_id) && property.terrain == Terrain::Capital)
+                .then_some(*position)
+        })
+        .collect();
+    let production_positions: HashSet<_> = world
+        .query::<(&GridPosition, &Property)>()
+        .iter(world)
+        .filter_map(|(position, property)| {
+            (property.owner_id == Some(player_id)
+                && registry.is_production_facility(property.terrain.as_str())
+                && crate::systems::production::is_within_production_range(
+                    &capital_positions,
+                    position.x,
+                    position.y,
+                    map.topology,
+                ))
+            .then_some((position.x, position.y))
+        })
+        .collect();
+    if production_positions.is_empty() {
+        return None;
+    }
+
+    let manager = world.get_resource::<SquadManager>()?;
+    let mut forming_groups: Vec<Vec<Entity>> = manager
+        .squads
+        .iter()
+        .filter(|squad| {
+            squad.owner_id == Some(player_id)
+                && squad.mission_type == MissionType::Transport
+                && squad.phase == MissionPhase::Forming
+        })
+        .map(|squad| {
+            let mut entities: Vec<_> = squad
+                .transport_entity
+                .iter()
+                .chain(squad.cargo_entities.iter())
+                .copied()
+                .collect();
+            entities.sort_by_key(|entity| entity.to_bits());
+            entities.dedup();
+            entities
+        })
+        .collect();
+    forming_groups
+        .sort_by_key(|entities| entities.first().map_or(u64::MAX, |entity| entity.to_bits()));
+
+    let mut occupied = HashSet::new();
+    let mut unit_positions = HashMap::new();
+    for entity_ref in world.iter_entities() {
+        if entity_ref
+            .get::<crate::components::Transporting>()
+            .is_some()
+        {
+            continue;
+        }
+        let (Some(position), Some(faction), Some(stats)) = (
+            entity_ref.get::<GridPosition>(),
+            entity_ref.get::<Faction>(),
+            entity_ref.get::<UnitStats>(),
+        ) else {
+            continue;
+        };
+        let free_slots = entity_ref
+            .get::<crate::components::CargoCapacity>()
+            .map(|capacity| {
+                capacity
+                    .max
+                    .saturating_sub(u32::try_from(capacity.loaded.len()).unwrap_or(u32::MAX))
+            })
+            .unwrap_or(0);
+        occupied.insert((position.x, position.y));
+        unit_positions.insert(
+            (position.x, position.y),
+            OccupantInfo {
+                player_id: faction.0,
+                is_transport: stats.max_cargo > 0,
+                unit_type: stats.unit_type,
+                loadable_types: stats.loadable_unit_types.clone(),
+                free_slots,
+            },
+        );
+    }
+
+    for group in forming_groups {
+        let group_positions: Vec<_> = group
+            .iter()
+            .filter_map(|entity| world.get::<GridPosition>(*entity).copied())
+            .collect();
+        for entity in &group {
+            if skip_entities.contains(entity)
+                || world
+                    .get::<Faction>(*entity)
+                    .is_none_or(|faction| faction.0 != player_id)
+                || world.get::<HasMoved>(*entity).is_none_or(|moved| moved.0)
+                || world
+                    .get::<ActionCompleted>(*entity)
+                    .is_none_or(|action| action.0)
+                || world
+                    .get::<crate::components::Transporting>(*entity)
+                    .is_some()
+            {
+                continue;
+            }
+            let position = *world.get::<GridPosition>(*entity)?;
+            if !production_positions.contains(&(position.x, position.y)) {
+                continue;
+            }
+            let stats = world.get::<UnitStats>(*entity)?;
+            let fuel = world
+                .get::<crate::components::Fuel>(*entity)
+                .map_or(u32::MAX, |fuel| fuel.current);
+            let reachable = calculate_reachable_tiles(
+                &map,
+                &unit_positions,
+                (position.x, position.y),
+                stats.movement_type,
+                stats.max_movement,
+                fuel,
+                player_id,
+                stats.unit_type,
+                &registry,
+            );
+            let destination = map
+                .get_adjacent(position.x, position.y)
+                .into_iter()
+                .filter(|tile| reachable.contains(tile))
+                .filter(|tile| !occupied.contains(tile))
+                .filter(|tile| !production_positions.contains(tile))
+                .min_by_key(|(x, y)| {
+                    let group_distance = group_positions.iter().fold(0_u32, |total, member| {
+                        total.saturating_add(map.distance(*x, *y, member.x, member.y))
+                    });
+                    (group_distance, *y, *x)
+                });
+            if let Some((x, y)) = destination {
+                return Some((
+                    *entity,
+                    AiCommand::Wait {
+                        target_pos: GridPosition { x, y },
+                    },
+                ));
+            }
+        }
     }
     None
 }
@@ -2600,6 +2778,82 @@ mod tests {
             ),
             1000
         );
+    }
+
+    #[test]
+    fn forming_campaign_transport_vacates_owned_production_site() {
+        let player = PlayerId(1);
+        let mut world = setup_v3_test_world(3, crate::ai::ai_version::AiVersion::V3);
+        world.insert_resource(Map {
+            width: 3,
+            height: 2,
+            tiles: vec![
+                Terrain::Capital,
+                Terrain::Airport,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+            ],
+            topology: crate::resources::GridTopology::Square,
+        });
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(player), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Property::new(Terrain::Airport, Some(player), 100),
+        ));
+        let stats = world
+            .resource::<MasterDataRegistry>()
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::TransportHelicopter.as_str().to_owned(),
+            ))
+            .unwrap();
+        let transport = world
+            .spawn((
+                Faction(player),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 1, y: 0 },
+                stats.clone(),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: stats.max_fuel,
+                    max: stats.max_fuel,
+                },
+                crate::components::CargoCapacity {
+                    max: stats.max_cargo,
+                    loaded: Vec::new(),
+                },
+            ))
+            .id();
+        let mut manager = crate::ai::squad::SquadManager::new();
+        let squad = manager.create_owned_squad(crate::ai::squad::MissionType::Transport, player);
+        squad.members.insert(transport);
+        squad.transport_entity = Some(transport);
+        squad.target_island = Some(crate::ai::islands::IslandId(1));
+        squad.phase = crate::ai::squad::MissionPhase::Forming;
+        world.insert_resource(manager);
+
+        let (entity, command) =
+            decide_forming_campaign_site_relief(&mut world, player, &HashSet::new())
+                .expect("Forming transport must vacate the airport while waiting");
+        assert_eq!(entity, transport);
+        let AiCommand::Wait { target_pos } = command else {
+            panic!("production site relief must issue a movement wait");
+        };
+        assert_ne!(target_pos, GridPosition { x: 1, y: 0 });
+        assert!(!matches!(
+            world
+                .resource::<Map>()
+                .get_terrain(target_pos.x, target_pos.y),
+            Some(Terrain::Capital | Terrain::Airport)
+        ));
     }
 
     #[test]

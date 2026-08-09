@@ -203,9 +203,10 @@ impl IslandCampaignPortfolio {
             let priority_rank = match assignment.decision {
                 IslandCampaignDecision::Defend => 0,
                 _ if assignment.continued_from_existing_squad => 1,
-                IslandCampaignDecision::Assault => 2,
-                IslandCampaignDecision::Expand => 3,
-                IslandCampaignDecision::Contest | IslandCampaignDecision::Reinforce => 4,
+                IslandCampaignDecision::Secure => 2,
+                IslandCampaignDecision::Contest | IslandCampaignDecision::Reinforce => 3,
+                IslandCampaignDecision::Expand => 4,
+                IslandCampaignDecision::Assault => 5,
                 _ => continue,
             };
             let (light_transport_slots, heavy_transport_slots) = match missing.preferred_transport {
@@ -371,14 +372,15 @@ fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePrior
     let existing_rank = u8::from(candidate.existing_operation.is_none());
     let decision_rank = match candidate.assessment.decision {
         _ if candidate.logistics_prerequisite => 0,
-        IslandCampaignDecision::Assault => 1,
-        IslandCampaignDecision::Expand => 2,
-        IslandCampaignDecision::Contest => 3,
-        IslandCampaignDecision::Reinforce => 4,
+        IslandCampaignDecision::Secure => 1,
+        IslandCampaignDecision::Contest => 2,
+        IslandCampaignDecision::Reinforce => 3,
+        IslandCampaignDecision::Expand => 4,
+        IslandCampaignDecision::Assault => 5,
         _ => u8::MAX,
     };
     match candidate.assessment.decision {
-        IslandCampaignDecision::Expand => (
+        IslandCampaignDecision::Expand | IslandCampaignDecision::Secure => (
             existing_rank,
             decision_rank,
             candidate
@@ -1078,9 +1080,8 @@ fn reserve_candidate(
         }
     }
     let assault_wave_is_frozen = candidate.assessment.decision == IslandCampaignDecision::Assault
-        && existing.is_some_and(|operation| {
-            operation.is_forming || is_live_campaign_transport_phase(operation.transport_phase)
-        });
+        && existing
+            .is_some_and(|operation| is_live_campaign_transport_phase(operation.transport_phase));
     available = sorted_pool_units(&provisional, island_id);
     while remaining_combat_budget > 0 && !assault_wave_is_frozen {
         let Some(index) = available.iter().position(|unit| {
@@ -1131,7 +1132,13 @@ fn reserve_candidate(
         remove_entity(&mut provisional, unit.entity);
     }
 
-    if candidate.assessment.decision == IslandCampaignDecision::Reinforce {
+    if matches!(
+        candidate.assessment.decision,
+        IslandCampaignDecision::Expand
+            | IslandCampaignDecision::Secure
+            | IslandCampaignDecision::Contest
+            | IslandCampaignDecision::Reinforce
+    ) {
         let remote_cargo: Vec<_> = capture_entities
             .iter()
             .chain(combat_entities.iter())
@@ -1139,7 +1146,9 @@ fn reserve_candidate(
             .filter(|entity| {
                 catalog.get(entity).is_some_and(|unit| {
                     !unit.is_transporting
-                        && unit.island_id != Some(island_id)
+                        && unit
+                            .island_id
+                            .is_some_and(|source_island| source_island != island_id)
                         && !unit
                             .reachable_positions
                             .contains(&candidate.target_position)
@@ -1203,11 +1212,11 @@ fn reserve_candidate(
         .total_budget
         .saturating_sub(requirement_credit)
         .max(structural_floor);
-    // Reinforceの元要求は戦闘予算だけなので、実際のremote cargoから判明した輸送費を加算する。
-    let reinforcement_transport_budget = remote_transport_demand
+    // 現地要員は輸送不要なため、実際のremote cargoから判明した輸送費だけを加算する。
+    let remote_transport_budget = remote_transport_demand
         .map(|(_, _, cost)| cost)
         .unwrap_or(0);
-    let purchase_budget = base_purchase_budget.saturating_add(reinforcement_transport_budget);
+    let purchase_budget = base_purchase_budget.saturating_add(remote_transport_budget);
     if provisional.available_funds < purchase_budget && !allow_future_budget_reservation {
         return None;
     }
@@ -1235,15 +1244,15 @@ fn reserve_candidate(
         combat_budget: remaining_combat_budget,
         total_budget: purchase_budget,
     };
-    let structural_package_ready =
-        purchase_shortfall.transport_slots == 0 && purchase_shortfall.capture_units == 0;
-    // 強襲と兵站確保は上陸可能な輸送役と占領兵が揃った時点で出航する。
-    // 敵を上回り最小戦闘unit 1体分の損耗余裕を持つ護衛予算は維持するが、
-    // その調達待ちで橋頭堡到着を遅らせず、
-    // 利用可能な護衛を同行させながら不足分を後続増援として並行調達する。
+    let capture_package_ready = purchase_shortfall.capture_units == 0
+        || candidate.assessment.decision == IslandCampaignDecision::Reinforce
+            && !capture_entities.is_empty();
+    let structural_package_ready = purchase_shortfall.transport_slots == 0 && capture_package_ready;
+    // 中立の兵站前提だけは構造パッケージ完成時点で先行できる。
+    // 敵領Assaultは敵戦力を上回る離散的な損耗余裕まで揃わなければ出航させない。
     let operation_ready = structural_package_ready
-        && (candidate.assessment.decision == IslandCampaignDecision::Assault
-            || candidate.logistics_prerequisite
+        && ((candidate.logistics_prerequisite
+            && candidate.assessment.decision != IslandCampaignDecision::Assault)
             || purchase_shortfall.combat_budget == 0);
     transport_entities.sort_by_key(|entity| entity.to_bits());
     capture_entities.sort_by_key(|entity| entity.to_bits());
@@ -1384,7 +1393,7 @@ fn reserve_secure_capture_units(
             .or_else(|| local_capture_units.first())
             .map(|unit| unit.entity);
         if let Some(entity) = entity {
-            // Secureは攻勢枠を使わないが、現地占領要員1体だけは他島へ流用しない。
+            // assignmentを持たない旧来のSecureだけは、現地占領要員1体を他島へ流用しない。
             remove_entity(pool, entity);
         }
     }
@@ -1433,6 +1442,9 @@ pub(crate) fn allocate_campaign_portfolio(
     let logistics_prerequisite_pending = candidates
         .iter()
         .any(|candidate| candidate.logistics_prerequisite);
+    let has_expansion_candidate = candidates
+        .iter()
+        .any(|candidate| candidate.assessment.decision == IslandCampaignDecision::Expand);
     let catalog: HashMap<_, _> = pool
         .units
         .iter()
@@ -1440,7 +1452,14 @@ pub(crate) fn allocate_campaign_portfolio(
         .map(|unit| (unit.entity, unit))
         .collect();
     let mut contest_protections = protect_contest_assets(&candidates, &mut pool);
-    reserve_secure_capture_units(&candidates, &mut pool);
+    reserve_secure_capture_units(
+        &candidates
+            .iter()
+            .filter(|candidate| candidate.requirement.capture_units == 0)
+            .cloned()
+            .collect::<Vec<_>>(),
+        &mut pool,
+    );
     let mut assessments: Vec<_> = candidates
         .iter()
         .map(|candidate| candidate.assessment.clone())
@@ -1451,16 +1470,19 @@ pub(crate) fn allocate_campaign_portfolio(
             matches!(
                 candidate.assessment.decision,
                 IslandCampaignDecision::Expand
+                    | IslandCampaignDecision::Secure
                     | IslandCampaignDecision::Contest
                     | IslandCampaignDecision::Reinforce
                     | IslandCampaignDecision::Assault
-            ) || candidate.assessment.decision == IslandCampaignDecision::Secure
-                && candidate.logistics_prerequisite
+            ) && (candidate.assessment.decision != IslandCampaignDecision::Secure
+                || candidate.requirement.capture_units > 0
+                || candidate.existing_operation.is_some())
         })
         .cloned()
         .collect();
     offenses.sort_by_key(offensive_priority_key);
     let mut active_offensives = Vec::new();
+    let mut active_offensive_count = 0_usize;
     for candidate in offenses {
         if logistics_prerequisite_pending
             && !candidate.logistics_prerequisite
@@ -1476,7 +1498,9 @@ pub(crate) fn allocate_campaign_portfolio(
             );
             continue;
         }
-        if active_offensives.len() == MAX_ACTIVE_OFFENSIVES {
+        let consumes_offensive_slot =
+            candidate.assessment.decision != IslandCampaignDecision::Secure;
+        if consumes_offensive_slot && active_offensive_count == MAX_ACTIVE_OFFENSIVES {
             if candidate.assessment.decision == IslandCampaignDecision::Contest {
                 restore_contest_assets(
                     candidate.assessment.island_id,
@@ -1495,7 +1519,12 @@ pub(crate) fn allocate_campaign_portfolio(
         }
         // 最上位の新規Assaultは全額がまだ無くても作戦として保持し、現在資金を
         // 下位Expandへ流さず複数ターンで完全パッケージを調達する。
-        let allow_future_budget_reservation = active_offensives.is_empty()
+        let allow_future_budget_reservation = matches!(
+            candidate.assessment.decision,
+            IslandCampaignDecision::Secure
+                | IslandCampaignDecision::Contest
+                | IslandCampaignDecision::Reinforce
+        ) || active_offensives.is_empty()
             && (candidate.assessment.decision == IslandCampaignDecision::Assault
                 || candidate.logistics_prerequisite);
         if let Some((assignment, provisional)) =
@@ -1507,6 +1536,8 @@ pub(crate) fn allocate_campaign_portfolio(
             }
             update_assessment_for_assignment(&mut assessments, &assignment);
             active_offensives.push(assignment);
+            active_offensive_count =
+                active_offensive_count.saturating_add(usize::from(consumes_offensive_slot));
         } else {
             if candidate.assessment.decision == IslandCampaignDecision::Contest {
                 restore_contest_assets(
@@ -1520,7 +1551,7 @@ pub(crate) fn allocate_campaign_portfolio(
                 .any(|assignment| assignment.decision == IslandCampaignDecision::Expand);
             let (decision, reason) = if candidate.assessment.decision
                 == IslandCampaignDecision::Reinforce
-                && has_active_expansion
+                && (has_active_expansion || has_expansion_candidate)
             {
                 (
                     IslandCampaignDecision::Withdraw,
@@ -2494,9 +2525,75 @@ mod tests {
         assert!(portfolio.assignment_for(IslandId(3)).is_none());
     }
 
-    /// 敵拠点を持つ島を中立拡張だけで攻勢上限から押し出さない。
     #[test]
-    fn allocates_assault_before_new_neutral_expansions() {
+    fn secure_cleanup_is_assigned_without_consuming_the_three_offensive_slots() {
+        let mut secure = secure_candidate(4);
+        secure.requirement.capture_units = 2;
+        secure.requirement.total_budget = 2_000;
+        secure.assessment.neutral_properties = 2;
+        let portfolio = allocate_campaign_portfolio(
+            vec![
+                expansion_candidate(0, 4),
+                expansion_candidate(1, 5),
+                expansion_candidate(2, 6),
+                expansion_candidate(3, 7),
+                secure,
+            ],
+            CampaignResourcePool {
+                available_funds: 20_000,
+                units: Vec::new(),
+            },
+        );
+
+        let secure = portfolio
+            .assignment_for(IslandId(4))
+            .expect("Secure cleanup must remain an actionable assignment");
+        assert_eq!(secure.decision, IslandCampaignDecision::Secure);
+        assert_eq!(secure.purchase_shortfall.capture_units, 2);
+        assert_eq!(
+            portfolio
+                .active_offensives
+                .iter()
+                .filter(|assignment| assignment.decision != IslandCampaignDecision::Secure)
+                .count(),
+            MAX_ACTIVE_OFFENSIVES
+        );
+        assert!(portfolio.assignment_for(IslandId(3)).is_none());
+    }
+
+    #[test]
+    fn secure_remote_capture_unit_requests_compatible_transport() {
+        let capture = Entity::from_raw(151);
+        let mut secure = secure_candidate(0);
+        secure.requirement.capture_units = 1;
+        secure.requirement.total_budget = 1_000;
+        secure.assessment.neutral_properties = 1;
+        let mut remote_capture = unit_candidate(151, UnitType::Infantry, 1_000, true, 0);
+        remote_capture.island_id = Some(IslandId(1));
+        remote_capture.reachable_positions.clear();
+
+        let portfolio = allocate_campaign_portfolio(
+            vec![secure],
+            CampaignResourcePool {
+                available_funds: 4_000,
+                units: vec![remote_capture],
+            },
+        );
+
+        let assignment = portfolio.assignment_for(IslandId(0)).unwrap();
+        assert_eq!(assignment.capture_entities, vec![capture]);
+        assert_eq!(
+            assignment.purchase_shortfall.preferred_transport,
+            Some(UnitType::TransportHelicopter)
+        );
+        assert_eq!(assignment.purchase_shortfall.transport_slots, 1);
+        assert_eq!(assignment.purchase_shortfall.total_budget, 4_000);
+        assert!(!assignment.operation_ready);
+    }
+
+    /// 未着手の敵本土よりも、投資回収可能な中立島の争奪を先に進める。
+    #[test]
+    fn allocates_neutral_expansions_before_new_assault() {
         let portfolio = allocate_campaign_portfolio(
             vec![
                 expansion_candidate(2, 6),
@@ -2516,19 +2613,14 @@ mod tests {
                 .iter()
                 .map(|assignment| assignment.island_id)
                 .collect::<Vec<_>>(),
-            vec![IslandId(9), IslandId(0), IslandId(1)]
+            vec![IslandId(0), IslandId(1), IslandId(2)]
         );
-        assert_eq!(
-            portfolio
-                .assignment_for(IslandId(9))
-                .map(|assignment| assignment.decision),
-            Some(IslandCampaignDecision::Assault)
-        );
+        assert!(portfolio.assignment_for(IslandId(9)).is_none());
     }
 
-    /// 最上位Assaultは全額が貯まる前から保持し、現在資金を中立拡張へ流さない。
+    /// 未着手Assaultの積立より、回収可能な中立島パッケージを先に完成させる。
     #[test]
-    fn underfunded_primary_assault_reserves_current_funds_across_turns() {
+    fn underfunded_new_assault_does_not_starve_neutral_expansions() {
         let portfolio = allocate_campaign_portfolio(
             vec![
                 expansion_candidate(1, 5),
@@ -2541,13 +2633,16 @@ mod tests {
             },
         );
 
-        assert_eq!(portfolio.active_offensives.len(), 1);
-        let assault = &portfolio.active_offensives[0];
-        assert_eq!(assault.island_id, IslandId(9));
-        assert_eq!(assault.decision, IslandCampaignDecision::Assault);
-        assert_eq!(assault.allocated_budget, 14_000);
-        assert_eq!(assault.purchase_shortfall.total_budget, 32_700);
-        assert!(!assault.operation_ready);
+        assert_eq!(portfolio.active_offensives.len(), 2);
+        assert_eq!(
+            portfolio
+                .active_offensives
+                .iter()
+                .map(|assignment| assignment.island_id)
+                .collect::<Vec<_>>(),
+            vec![IslandId(0), IslandId(1)]
+        );
+        assert!(portfolio.assignment_for(IslandId(9)).is_none());
     }
 
     /// 未積立分まで返金するphantom fundsを作らず、防衛preempt後も実資金以上を配らない。
@@ -3270,8 +3365,7 @@ mod tests {
     }
 
     #[test]
-    fn allocates_capped_contest_asset_to_defense_without_preempting_offensives() {
-        let defender = Entity::from_raw(52);
+    fn prioritizes_live_contest_then_preempts_expansion_for_defense() {
         let mut contest_asset = unit_candidate(52, UnitType::Tank, 10_000, false, 0);
         contest_asset.island_id = Some(IslandId(3));
         let candidates = vec![
@@ -3296,18 +3390,18 @@ mod tests {
                 .iter()
                 .map(|assignment| assignment.island_id)
                 .collect::<Vec<_>>(),
-            vec![IslandId(0), IslandId(1), IslandId(2)]
+            vec![IslandId(3), IslandId(0)]
         );
-        let capped_contest = portfolio
+        let contest = portfolio
             .islands
             .iter()
             .find(|assessment| assessment.island_id == IslandId(3))
             .unwrap();
-        assert_eq!(capped_contest.decision, IslandCampaignDecision::Observe);
+        assert_eq!(contest.decision, IslandCampaignDecision::Contest);
         let defense = &portfolio.defenses[0];
-        assert_eq!(defense.combat_entities, vec![defender]);
-        assert_eq!(defense.purchase_shortfall.total_budget, 0);
-        assert!(defense.operation_ready);
+        assert!(defense.combat_entities.is_empty());
+        assert_eq!(defense.purchase_shortfall.total_budget, 10_000);
+        assert!(!defense.operation_ready);
     }
 
     #[test]
@@ -3424,7 +3518,7 @@ mod tests {
             underfunded_assignment.purchase_shortfall.combat_budget,
             10_200
         );
-        assert!(underfunded_assignment.operation_ready);
+        assert!(!underfunded_assignment.operation_ready);
 
         let funded = allocate_campaign_portfolio(
             vec![candidate],
@@ -3440,7 +3534,7 @@ mod tests {
         assert_eq!(assignment.purchase_shortfall.combat_budget, 10_200);
         assert_eq!(assignment.purchase_shortfall.total_budget, 10_200);
         assert_eq!(assignment.allocated_budget, 32_700);
-        assert!(assignment.operation_ready);
+        assert!(!assignment.operation_ready);
     }
 
     #[test]
@@ -3470,7 +3564,7 @@ mod tests {
         assert_eq!(assignment.capture_entities.len(), 2);
         assert_eq!(assignment.combat_entities.len(), 2);
         assert_eq!(assignment.purchase_shortfall.combat_budget, 4_200);
-        assert!(assignment.operation_ready);
+        assert!(!assignment.operation_ready);
     }
 
     #[test]
@@ -3513,7 +3607,7 @@ mod tests {
         let assignment = &portfolio.active_offensives[0];
         assert!(assignment.combat_entities.is_empty());
         assert_eq!(assignment.purchase_shortfall.combat_budget, 10_200);
-        assert!(assignment.operation_ready);
+        assert!(!assignment.operation_ready);
     }
 
     #[test]
@@ -3650,9 +3744,9 @@ mod tests {
             vec![
                 (0, IslandId(0)),
                 (1, IslandId(1)),
-                (2, IslandId(4)),
-                (3, IslandId(2)),
-                (4, IslandId(3)),
+                (3, IslandId(3)),
+                (4, IslandId(2)),
+                (5, IslandId(4)),
             ]
         );
     }

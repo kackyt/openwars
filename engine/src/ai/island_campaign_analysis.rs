@@ -1078,6 +1078,7 @@ fn missing_expansion_package_cost(
     transport: Option<TransportOption>,
     operation: Option<&ExistingCampaignOperation>,
     units: &[UnitSnapshot],
+    required_capture_units: u32,
 ) -> u32 {
     let capture_cost = [UnitType::Infantry, UnitType::Mech]
         .into_iter()
@@ -1085,11 +1086,18 @@ fn missing_expansion_package_cost(
         .map(|stats| stats.cost)
         .min()
         .unwrap_or(0);
-    let transport_purchase_cost = transport
-        .filter(|transport| matches!(transport.source, TransportSource::Producible(_)))
-        .map(|transport| transport.cost)
-        .unwrap_or(0);
-    let mut missing = transport_purchase_cost.saturating_add(capture_cost.saturating_mul(2));
+    let transport_purchase_cost = transport.map_or(0, |transport| {
+        let cargo_slots = unit_stats_for_type(registry, transport.unit_type)
+            .map(|stats| stats.max_cargo.max(1))
+            .unwrap_or(1);
+        let required_transports = required_capture_units.div_ceil(cargo_slots);
+        let held_transports = u32::from(matches!(transport.source, TransportSource::Held(_)));
+        required_transports
+            .saturating_sub(held_transports)
+            .saturating_mul(transport.cost)
+    });
+    let mut missing =
+        transport_purchase_cost.saturating_add(capture_cost.saturating_mul(required_capture_units));
     let Some(operation) = operation else {
         return missing;
     };
@@ -1100,17 +1108,20 @@ fn missing_expansion_package_cost(
     {
         return missing;
     }
-    let continued_transport_cost = match transport {
-        Some(transport)
-            if !operation.transport_entities.is_empty()
-                && matches!(transport.source, TransportSource::Producible(_)) =>
-        {
-            transport.cost
+    let continued_transport_cost = transport.map_or(0, |transport| {
+        if matches!(transport.source, TransportSource::Held(_)) {
+            return 0;
         }
-        _ => 0,
-    };
+        u32::try_from(operation.transport_entities.len())
+            .unwrap_or(u32::MAX)
+            .saturating_mul(transport.cost)
+    });
     missing = missing.saturating_sub(continued_transport_cost);
-    for entity in operation.capture_entities.iter().take(2) {
+    for entity in operation
+        .capture_entities
+        .iter()
+        .take(usize::try_from(required_capture_units).unwrap_or(usize::MAX))
+    {
         if let Some(unit) = units.iter().find(|unit| unit.entity == *entity) {
             missing = missing.saturating_sub(unit.stats.cost.min(capture_cost));
         }
@@ -1434,6 +1445,10 @@ pub fn collect_island_campaign_facts(
                 selected,
                 operations_by_island.get(&island.id).copied(),
                 &units,
+                facts
+                    .neutral_properties
+                    .saturating_add(facts.enemy_properties)
+                    .max(2),
             );
         }
     }
@@ -1472,16 +1487,37 @@ fn requirement_for_assessment(
     assessment: &mut crate::ai::island_campaign::IslandCampaignAssessment,
     reserve_unit_cost: u32,
 ) -> IslandCampaignRequirement {
+    // 未所有施設は互いに独立した占領対象なので、残数に応じて並行投入する。
+    let remaining_properties = facts
+        .neutral_properties
+        .saturating_add(facts.enemy_properties);
+    // 上陸・交戦中は1体撃破だけで占領能力を失わない最小2体を維持する。
+    let expedition_capture_units = remaining_properties.max(2);
     match assessment.state {
         IslandCampaignState::OpenNeutral
             if assessment.decision == IslandCampaignDecision::Expand =>
         {
+            let capture_budget = expedition_capture_units.saturating_mul(1_000);
+            let transport_units = expedition_capture_units.div_ceil(2);
+            let transport_budget = transport_units.saturating_mul(4_000);
             IslandCampaignRequirement {
                 preferred_transport: Some(UnitType::TransportHelicopter),
-                transport_slots: 2,
-                capture_units: 2,
+                transport_slots: expedition_capture_units,
+                capture_units: expedition_capture_units,
                 combat_budget: 0,
-                total_budget: 6_000,
+                total_budget: capture_budget.saturating_add(transport_budget),
+            }
+        }
+        IslandCampaignState::Secured if assessment.decision == IslandCampaignDecision::Secure => {
+            let capture_budget = remaining_properties.saturating_mul(1_000);
+            assessment.required_budget = capture_budget;
+            IslandCampaignRequirement {
+                // 現地要員は輸送不要。allocatorが遠隔要員を選んだ場合だけ実cargoから輸送を要求する。
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: remaining_properties,
+                combat_budget: 0,
+                total_budget: capture_budget,
             }
         }
         IslandCampaignState::Threatened => {
@@ -1495,18 +1531,20 @@ fn requirement_for_assessment(
             }
         }
         IslandCampaignState::Contested if contested_is_competitive(facts) => {
+            let capture_budget = expedition_capture_units.saturating_mul(1_000);
             assessment.decision = IslandCampaignDecision::Contest;
             assessment.decision_reason =
                 "占領競争と現地戦力が競争可能なため作戦を継続する".to_owned();
             IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
-                capture_units: 0,
+                capture_units: expedition_capture_units,
                 combat_budget: 0,
-                total_budget: 0,
+                total_budget: capture_budget,
             }
         }
         IslandCampaignState::Contested => {
+            let capture_budget = expedition_capture_units.saturating_mul(1_000);
             let required_power =
                 combat_overmatch_requirement(facts.enemy_combat_value, reserve_unit_cost);
             assessment.decision = IslandCampaignDecision::Reinforce;
@@ -1516,9 +1554,9 @@ fn requirement_for_assessment(
             IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
-                capture_units: 0,
+                capture_units: expedition_capture_units,
                 combat_budget: required_power,
-                total_budget: required_power,
+                total_budget: required_power.saturating_add(capture_budget),
             }
         }
         IslandCampaignState::EnemyHeld => {
@@ -3657,6 +3695,48 @@ mod tests {
         assert_eq!(assault.decision, IslandCampaignDecision::Assault);
         assert_eq!(assault_requirement.combat_budget, 12_000);
         assert_eq!(assault_requirement.total_budget, 34_500);
+    }
+
+    #[test]
+    fn campaign_requirements_keep_one_parallel_capturer_per_unowned_property() {
+        let mut secured_facts = IslandCampaignFacts {
+            island_id: IslandId(0),
+            capturable_properties: 4,
+            strategic_production_sites: 0,
+            roi_production_sites: 0,
+            neutral_properties: 3,
+            friendly_properties: 1,
+            enemy_properties: 0,
+            friendly_units: 1,
+            enemy_units: 0,
+            friendly_combat_value: 1_000,
+            enemy_combat_value: 0,
+            friendly_arrival_eta: Some(0),
+            enemy_arrival_eta: None,
+            friendly_capture_eta: Some(1),
+            enemy_capture_eta: None,
+            transport_eta: Some(0),
+            capture_turns: 1,
+            island_income_per_turn: 4_000,
+            missing_expansion_package_cost: 0,
+            reachable: true,
+            has_unowned_properties: true,
+        };
+        let mut secure = assess_island(&secured_facts);
+        let secure_requirement = requirement_for_assessment(&secured_facts, &mut secure, 1_000);
+        assert_eq!(secure.decision, IslandCampaignDecision::Secure);
+        assert_eq!(secure_requirement.capture_units, 3);
+        assert_eq!(secure_requirement.total_budget, 3_000);
+
+        secured_facts.enemy_units = 1;
+        secured_facts.friendly_combat_value = 3_000;
+        secured_facts.enemy_combat_value = 2_000;
+        secured_facts.enemy_capture_eta = Some(2);
+        let mut contest = assess_island(&secured_facts);
+        let contest_requirement = requirement_for_assessment(&secured_facts, &mut contest, 1_000);
+        assert_eq!(contest.decision, IslandCampaignDecision::Contest);
+        assert_eq!(contest_requirement.capture_units, 3);
+        assert_eq!(contest_requirement.total_budget, 3_000);
     }
 
     #[test]

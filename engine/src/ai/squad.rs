@@ -5094,8 +5094,8 @@ mod tests {
             ready_assignment.combat_entities.contains(&tank)
                 || ready_assignment.capture_entities.contains(&tank)
         );
-        // Forming開始後に追加された戦闘cargoは既存の侵攻波へ追加入隊させない。
-        assert!(!ready_assignment.combat_entities.contains(&artillery));
+        // Forming中は必要戦力が揃うまで再編可能とし、戦闘予算を満たすcargoを追加する。
+        assert!(ready_assignment.combat_entities.contains(&artillery));
         assert!(!ready_assignment.capture_entities.contains(&artillery));
 
         plan_squads(&mut world, player);
@@ -5794,7 +5794,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_assault_ignores_late_unreachable_combat_and_launches_structural_wave() {
+    fn assault_waits_when_late_combat_cannot_join_the_forming_wave() {
         let mut fixture = setup_ready_assault_reconciliation_world();
         let player = PlayerId(1);
         fixture
@@ -5834,10 +5834,10 @@ mod tests {
             .campaign_portfolio
             .assignment_for(target_island)
             .unwrap();
-        assert!(assignment.operation_ready);
+        assert!(!assignment.operation_ready);
         assert!(assignment.transport_entities.contains(&fixture.lander));
         assert!(assignment.transport_entities.contains(&fixture.helicopter));
-        // 既存Formingへ遅れて現れた戦闘cargoを追加せず、構造パッケージだけを維持する。
+        // 合流不能な戦闘cargoは予約せず、必要戦力不足のまま出航もしない。
         assert!(!assignment.combat_entities.contains(&fixture.cargo[3]));
 
         plan_squads(&mut fixture.world, player);
@@ -5852,8 +5852,8 @@ mod tests {
         assert!(
             operation_squads
                 .iter()
-                .all(|squad| { squad.phase == MissionPhase::Transport(TransportPhase::Pickup) }),
-            "到達不能な後続戦闘cargoを除外した構造パッケージは一斉にPickupへ進む"
+                .all(|squad| { squad.phase == MissionPhase::Forming }),
+            "必要戦力へ合流できない間はFormingで待機する"
         );
     }
 
