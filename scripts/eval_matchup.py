@@ -160,7 +160,7 @@ def build_issue58_match_specs(protocol, maps, seeds):
 
 
 def write_trace_jsonl(path, results):
-    """遊兵計測と生産トレースを「1手番1行」の JSONL として書き出す。
+    """遊兵・生産・封鎖解除トレースを「1手番1行」の JSONL として書き出す。
 
     集計も判定もここでは行わない。engine が出した値をそのまま残すだけで、
     遊兵数の推移や「同一ユニットが全施設へ発注される」現象は
@@ -201,6 +201,8 @@ def write_trace_jsonl(path, results):
             record_for(entry)["deployment_audit"] = entry.get("audit")
         for entry in result.get("emergency_plan_history", []):
             record_for(entry)["emergency_plan"] = entry.get("plan")
+        for entry in result.get("factory_relief_history", []):
+            record_for(entry)["factory_relief"] = entry.get("missions")
 
         # 欠測（V1〜V3 は生産トレースを持たない）を挟んでも順序が崩れないよう -1 で埋める。
         for key in sorted(
@@ -285,6 +287,7 @@ def run_single_game(
     production_plan_history = []
     deployment_audit_history = []
     emergency_plan_history = []
+    factory_relief_history = []
     initial_state = None
     error = None
 
@@ -306,6 +309,7 @@ def run_single_game(
             "production_plan_history": production_plan_history,
             "deployment_audit_history": deployment_audit_history,
             "emergency_plan_history": emergency_plan_history,
+            "factory_relief_history": factory_relief_history,
             "error": error,
         }
 
@@ -435,6 +439,17 @@ def run_single_game(
                     "turn": state.get("turn"),
                     "player_id": ai_result.get("player_id", current_player),
                     "plan": emergency_plan,
+                }
+            )
+
+        factory_relief = ai_result.get("factory_relief")
+        if factory_relief:
+            factory_relief_history.append(
+                {
+                    "round": turn,
+                    "turn": state.get("turn"),
+                    "player_id": ai_result.get("player_id", current_player),
+                    "missions": factory_relief,
                 }
             )
 
@@ -1110,6 +1125,7 @@ def main():
                             "production_plan_history",
                             "deployment_audit_history",
                             "emergency_plan_history",
+                            "factory_relief_history",
                         }
                     },
                 }))

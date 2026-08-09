@@ -1158,6 +1158,34 @@ pub fn execute_ai_turn_v1(world: &mut World, active_player: PlayerId) -> Option<
     let mut decide_skip_entities = skip_entities.clone();
     decide_skip_entities.extend(mission_entities);
 
+    // #76: 生産口の直接封鎖はAI世代に依存しないルール上の危機として扱う。
+    // V1の輸送任務は維持し、未予約戦力から選んだ解除担当だけを共通の戦術評価へ渡す。
+    let factory_relief =
+        crate::ai::emergency::analyze_factory_relief(world, active_player, &decide_skip_entities);
+    let relief_entities = factory_relief.reserved_entities();
+    world.insert_resource(factory_relief);
+    if !relief_entities.is_empty() {
+        let mut relief_skip_entities = decide_skip_entities.clone();
+        let mut query = world.query::<(Entity, &Faction)>();
+        for (entity, faction) in query.iter(world) {
+            if faction.0 == active_player && !relief_entities.contains(&entity) {
+                relief_skip_entities.insert(entity);
+            }
+        }
+        if let Some((entity, command)) =
+            decide_ai_action_v2(world, active_player, &relief_skip_entities)
+        {
+            let cmd_str = format!("{:?}", command);
+            execute_ai_command(world, entity, command);
+            if let Some(mut res) = world.get_resource_mut::<AiActionCooldown>() {
+                res.0.insert(entity);
+            } else {
+                world.insert_resource(AiActionCooldown(HashSet::from([entity])));
+            }
+            return Some(cmd_str);
+        }
+    }
+
     if let Some((entity, command)) = decide_ai_action(world, active_player, &decide_skip_entities) {
         let cmd_str = format!("{:?}", command);
         execute_ai_command(world, entity, command);
