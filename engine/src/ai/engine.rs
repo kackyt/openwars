@@ -1494,6 +1494,8 @@ const AMBUSH_APPROACH_MARGIN: u32 = 2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ActionPriority {
     Normal,
+    /// V4の生産目的から接続された局地任務の敵を、通常の好機標的より先に攻撃する。
+    DeploymentTargetNeutralization,
     EmergencyAdvance,
     EmergencyRouteBlock,
     EmergencySiteOccupation,
@@ -1727,6 +1729,9 @@ pub fn decide_ai_action_v2(
         let planned_emergency = emergency_plan.mission_for_entity(unit_entity);
         let emergency_mission = planned_emergency
             .filter(|mission| world.get_entity(mission.threat.threat_entity).is_ok());
+        let deployment_target = world
+            .get_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>()
+            .and_then(|registry| registry.attack_target(unit_entity));
 
         // #44 (V3): 敵の脅威がこのユニットの近傍にあるか (森・山への退避を
         // 意味のある局面に限定するためのゲート)。敵の攻撃到達圏 (移動+射程) を
@@ -2298,6 +2303,8 @@ pub fn decide_ai_action_v2(
                             .is_some_and(|mission| mission.threat.threat_entity == target_entity)
                         {
                             ActionPriority::EmergencyNeutralization
+                        } else if deployment_target == Some(target_entity) {
+                            ActionPriority::DeploymentTargetNeutralization
                         } else {
                             ActionPriority::Normal
                         };
@@ -3979,7 +3986,7 @@ mod tests {
     }
 
     /// 同条件の輸送ヘリから、搭載兵を持つ高価値目標を選ぶか検証するワールドを作る。
-    fn setup_strategic_target_selection_world() -> (World, Entity) {
+    fn setup_strategic_target_selection_world() -> (World, Entity, Entity, Entity) {
         let mut world = setup_v3_test_world(3, crate::ai::ai_version::AiVersion::V3);
         let mut damage_chart = DamageChart::new();
         damage_chart.insert_damage(UnitType::Fighter, UnitType::TransportHelicopter, 80);
@@ -3988,37 +3995,39 @@ mod tests {
 
         let player = PlayerId(1);
         let enemy = PlayerId(2);
-        world.spawn((
-            Faction(player),
-            HasMoved(false),
-            ActionCompleted(false),
-            GridPosition { x: 1, y: 0 },
-            UnitStats {
-                unit_type: UnitType::Fighter,
-                cost: 14000,
-                movement_type: crate::resources::MovementType::Air,
-                max_movement: 0,
-                min_range: 1,
-                max_range: 1,
-                max_ammo1: 10,
-                max_fuel: 99,
-                ..UnitStats::mock()
-            },
-            Health {
-                current: 100,
-                max: 100,
-            },
-            crate::components::Ammo {
-                ammo1: 10,
-                max_ammo1: 10,
-                ammo2: 0,
-                max_ammo2: 0,
-            },
-            crate::components::Fuel {
-                current: 99,
-                max: 99,
-            },
-        ));
+        let attacker = world
+            .spawn((
+                Faction(player),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 1, y: 0 },
+                UnitStats {
+                    unit_type: UnitType::Fighter,
+                    cost: 14000,
+                    movement_type: crate::resources::MovementType::Air,
+                    max_movement: 0,
+                    min_range: 1,
+                    max_range: 1,
+                    max_ammo1: 10,
+                    max_fuel: 99,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Ammo {
+                    ammo1: 10,
+                    max_ammo1: 10,
+                    ammo2: 0,
+                    max_ammo2: 0,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+            ))
+            .id();
 
         let transport_stats = UnitStats {
             unit_type: UnitType::TransportHelicopter,
@@ -4027,19 +4036,21 @@ mod tests {
             max_cargo: 2,
             ..UnitStats::mock()
         };
-        world.spawn((
-            Faction(enemy),
-            GridPosition { x: 0, y: 0 },
-            transport_stats.clone(),
-            Health {
-                current: 100,
-                max: 100,
-            },
-            crate::components::CargoCapacity {
-                max: 2,
-                loaded: Vec::new(),
-            },
-        ));
+        let empty_transport = world
+            .spawn((
+                Faction(enemy),
+                GridPosition { x: 0, y: 0 },
+                transport_stats.clone(),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::CargoCapacity {
+                    max: 2,
+                    loaded: Vec::new(),
+                },
+            ))
+            .id();
 
         let cargo = world
             .spawn((
@@ -4077,12 +4088,12 @@ mod tests {
             .entity_mut(cargo)
             .insert(crate::components::Transporting(loaded_transport));
 
-        (world, loaded_transport)
+        (world, attacker, empty_transport, loaded_transport)
     }
 
     #[test]
     fn v1_prioritizes_transport_with_loaded_combat_value() {
-        let (mut world, loaded_transport) = setup_strategic_target_selection_world();
+        let (mut world, _, _, loaded_transport) = setup_strategic_target_selection_world();
 
         let (_, action) = decide_ai_action(&mut world, PlayerId(1), &HashSet::new())
             .expect("V1が攻撃行動を選ぶこと");
@@ -4095,7 +4106,7 @@ mod tests {
 
     #[test]
     fn v3_prioritizes_transport_with_loaded_combat_value() {
-        let (mut world, loaded_transport) = setup_strategic_target_selection_world();
+        let (mut world, _, _, loaded_transport) = setup_strategic_target_selection_world();
 
         let (_, action) = decide_ai_action_v2(&mut world, PlayerId(1), &HashSet::new())
             .expect("V3が攻撃行動を選ぶこと");
@@ -4103,6 +4114,24 @@ mod tests {
         assert!(matches!(
             action,
             AiCommand::Attack { target_entity, .. } if target_entity == loaded_transport
+        ));
+    }
+
+    #[test]
+    fn issue95_v4_deployment_target_precedes_generic_high_value_target() {
+        let (mut world, attacker, assigned_target, generic_high_value_target) =
+            setup_strategic_target_selection_world();
+        let mut deployments = crate::ai::v4::deployment::V4DeploymentRegistry::default();
+        deployments.assign_target_for_test(PlayerId(1), attacker, assigned_target);
+        world.insert_resource(deployments);
+
+        let (_, action) = decide_ai_action_v2(&mut world, PlayerId(1), &HashSet::new())
+            .expect("V4の局地任務ユニットが攻撃行動を選ぶこと");
+
+        assert!(matches!(
+            action,
+            AiCommand::Attack { target_entity, .. }
+                if target_entity == assigned_target && target_entity != generic_high_value_target
         ));
     }
 

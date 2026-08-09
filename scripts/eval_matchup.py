@@ -197,6 +197,10 @@ def write_trace_jsonl(path, results):
             record["island_campaign"] = entry.get("campaign")
         for entry in result.get("production_plan_history", []):
             record_for(entry)["production_plan"] = entry.get("plan")
+        for entry in result.get("deployment_audit_history", []):
+            record_for(entry)["deployment_audit"] = entry.get("audit")
+        for entry in result.get("emergency_plan_history", []):
+            record_for(entry)["emergency_plan"] = entry.get("plan")
 
         # 欠測（V1〜V3 は生産トレースを持たない）を挟んでも順序が崩れないよう -1 で埋める。
         for key in sorted(
@@ -275,10 +279,12 @@ def run_single_game(
     transport_history = []
     strategic_history = []
     island_campaign_history = []
-    # 遊兵（任務なし・任務があるのに動けない）と生産判断の内訳をターン別に保持する。
-    # どちらも engine 側が判定済みの結果で、ここでは記録だけを行う。
+    # 遊兵・生産判断・生産Entityの任務実績をターン別に保持する。
+    # いずれも engine 側が判定済みの結果で、ここでは記録だけを行う。
     idle_audit_history = []
     production_plan_history = []
+    deployment_audit_history = []
+    emergency_plan_history = []
     initial_state = None
     error = None
 
@@ -298,6 +304,8 @@ def run_single_game(
             "island_campaign_history": island_campaign_history,
             "idle_audit_history": idle_audit_history,
             "production_plan_history": production_plan_history,
+            "deployment_audit_history": deployment_audit_history,
+            "emergency_plan_history": emergency_plan_history,
             "error": error,
         }
 
@@ -405,6 +413,28 @@ def run_single_game(
                     "turn": state.get("turn"),
                     "player_id": ai_result.get("player_id", current_player),
                     "plan": production_plan,
+                }
+            )
+
+        deployment_audit = ai_result.get("deployment_audit")
+        if deployment_audit is not None:
+            deployment_audit_history.append(
+                {
+                    "round": turn,
+                    "turn": state.get("turn"),
+                    "player_id": ai_result.get("player_id", current_player),
+                    "audit": deployment_audit,
+                }
+            )
+
+        emergency_plan = ai_result.get("emergency_plan")
+        if emergency_plan is not None:
+            emergency_plan_history.append(
+                {
+                    "round": turn,
+                    "turn": state.get("turn"),
+                    "player_id": ai_result.get("player_id", current_player),
+                    "plan": emergency_plan,
                 }
             )
 
@@ -1078,6 +1108,8 @@ def main():
                             "island_campaign_history",
                             "idle_audit_history",
                             "production_plan_history",
+                            "deployment_audit_history",
+                            "emergency_plan_history",
                         }
                     },
                 }))

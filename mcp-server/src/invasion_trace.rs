@@ -4,6 +4,7 @@ use bevy_ecs::event::EventCursor;
 use bevy_ecs::prelude::*;
 use serde::Serialize;
 
+use engine::ai::emergency::EmergencyMissionPlan;
 use engine::ai::idle_audit::IdleAuditDiagnostics;
 use engine::ai::island_campaign::{
     IslandCampaignAssessment, IslandCampaignAssignment, IslandCampaignDecision,
@@ -12,6 +13,7 @@ use engine::ai::island_campaign::{
 };
 use engine::ai::islands::IslandMap;
 use engine::ai::squad::{MissionPhase, MissionType, SquadManager};
+use engine::ai::v4::deployment::V4DeploymentRegistry;
 use engine::ai::v4::trace::{ProductionDecision, ProductionTraceDiagnostics};
 use engine::components::{CargoCapacity, Faction, GridPosition, Health, PlayerId, UnitStats};
 use engine::events::{
@@ -235,6 +237,62 @@ pub struct ProductionPlanSnapshot {
     pub leftover_funds: u32,
     pub operations: Vec<ProductionOperationSnapshot>,
     pub steps: Vec<ProductionStepSnapshot>,
+}
+
+/// 生産意図から実Entityへ接続された局地任務の実行実績。
+#[derive(Debug, Serialize)]
+pub struct DeploymentAuditSnapshot {
+    pub player_id: u32,
+    pub pending_count: usize,
+    pub assigned_count: usize,
+    pub active_count: usize,
+    pub attacked_count: usize,
+    pub records: Vec<DeploymentAuditRecordSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeploymentAuditRecordSnapshot {
+    pub entity_id: u64,
+    pub unit_type: UnitType,
+    pub slot_kind: String,
+    pub anchor_x: usize,
+    pub anchor_y: usize,
+    pub priority_enemy_ids: Vec<u64>,
+    pub squad_id: Option<u32>,
+    pub current_target_id: Option<u64>,
+    pub active: bool,
+    pub assigned_turn: u32,
+    pub attack_count: u32,
+    pub priority_attack_count: u32,
+    pub mission_target_attack_count: u32,
+    pub capture_unit_attack_count: u32,
+    pub transport_unit_attack_count: u32,
+    pub kill_count: u32,
+    pub first_attack_turn: Option<u32>,
+    pub first_attack_eta: Option<u32>,
+}
+
+/// 緊急迎撃が何を守るために、どの戦力をpreemptしたかを示す診断。
+#[derive(Debug, Serialize)]
+pub struct EmergencyPlanSnapshot {
+    pub player_id: u32,
+    pub missions: Vec<EmergencyMissionSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmergencyMissionSnapshot {
+    pub assigned_entity_id: u64,
+    pub assigned_unit_type: Option<UnitType>,
+    pub threat_entity_id: u64,
+    pub threat_unit_type: Option<UnitType>,
+    pub threat_x: usize,
+    pub threat_y: usize,
+    pub site_x: usize,
+    pub site_y: usize,
+    pub site_terrain: String,
+    pub site_owner_id: Option<u32>,
+    pub eta: u32,
+    pub response: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -751,6 +809,90 @@ pub fn snapshot_production_plan_for_player(
         leftover_funds: plan.leftover_funds,
         operations,
         steps,
+    })
+}
+
+/// V4の発注意図が実Entityへ接続され、攻撃まで進んだかを写し取る。
+pub fn snapshot_deployment_audit_for_player(
+    world: &World,
+    player_id: PlayerId,
+) -> Option<DeploymentAuditSnapshot> {
+    let registry = world.get_resource::<V4DeploymentRegistry>()?;
+    let records = registry
+        .audit_records(player_id)
+        .into_iter()
+        .map(|record| DeploymentAuditRecordSnapshot {
+            entity_id: record.entity.to_bits(),
+            unit_type: record.unit_type,
+            slot_kind: format!("{:?}", record.slot_kind),
+            anchor_x: record.anchor.x,
+            anchor_y: record.anchor.y,
+            priority_enemy_ids: record
+                .priority_enemies
+                .into_iter()
+                .map(Entity::to_bits)
+                .collect(),
+            squad_id: record.squad_id.map(|id| id.0),
+            current_target_id: record.current_target.map(Entity::to_bits),
+            active: record.active,
+            assigned_turn: record.assigned_turn,
+            attack_count: record.attack_count,
+            priority_attack_count: record.priority_attack_count,
+            mission_target_attack_count: record.mission_target_attack_count,
+            capture_unit_attack_count: record.capture_unit_attack_count,
+            transport_unit_attack_count: record.transport_unit_attack_count,
+            kill_count: record.kill_count,
+            first_attack_turn: record.first_attack_turn,
+            first_attack_eta: record
+                .first_attack_turn
+                .map(|turn| turn.saturating_sub(record.assigned_turn)),
+        })
+        .collect::<Vec<_>>();
+    Some(DeploymentAuditSnapshot {
+        player_id: player_id.0,
+        pending_count: registry.pending_count(player_id),
+        assigned_count: records.len(),
+        active_count: records.iter().filter(|record| record.active).count(),
+        attacked_count: records
+            .iter()
+            .filter(|record| record.attack_count > 0)
+            .count(),
+        records,
+    })
+}
+
+/// 現在手番の緊急迎撃について、対象拠点の所有者も含めて写し取る。
+pub fn snapshot_emergency_plan_for_player(
+    world: &World,
+    player_id: PlayerId,
+) -> Option<EmergencyPlanSnapshot> {
+    let plan = world.get_resource::<EmergencyMissionPlan>()?;
+    let missions = plan
+        .missions
+        .iter()
+        .filter(|mission| mission.owner_id == player_id)
+        .map(|mission| EmergencyMissionSnapshot {
+            assigned_entity_id: mission.assigned_entity.to_bits(),
+            assigned_unit_type: world
+                .get::<UnitStats>(mission.assigned_entity)
+                .map(|stats| stats.unit_type),
+            threat_entity_id: mission.threat.threat_entity.to_bits(),
+            threat_unit_type: world
+                .get::<UnitStats>(mission.threat.threat_entity)
+                .map(|stats| stats.unit_type),
+            threat_x: mission.threat.threat_position.x,
+            threat_y: mission.threat.threat_position.y,
+            site_x: mission.threat.site_position.x,
+            site_y: mission.threat.site_position.y,
+            site_terrain: format!("{:?}", mission.threat.site_terrain),
+            site_owner_id: mission.threat.site_owner_id.map(|owner| owner.0),
+            eta: mission.threat.eta,
+            response: format!("{:?}", mission.response),
+        })
+        .collect();
+    Some(EmergencyPlanSnapshot {
+        player_id: player_id.0,
+        missions,
     })
 }
 

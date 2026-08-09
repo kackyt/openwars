@@ -60,9 +60,12 @@
   - 編成方針の状態切り替えを持たず、毎ターン目標を引き継いだまま要求編成を再導出することで編成を変化させる
   - 観測量は「占領レース速度差 / 消耗率 / 収入トレンド / 脅威カテゴリ別の敵戦力と所在地 / 枠の充足 / 自軍拠点への奪還脅威 / 空き枠と資金の乖離」の 7 つ
   - 自軍拠点が敵占領ユニットの脅威下に入ったことを検知して `priority_rank = 0` の防衛作戦を生成し、他作戦の予約を preempt する
-- **未実装**: 撃破枠の生産意図から実行任務への引き渡し
+- **実装**: 撃破枠の生産意図から実行任務への引き渡し
   - Combat/Intercept枠の作戦anchorと優先敵Entityを生産された実Entityへ対応付け、V4所有の局地Attack/Interception任務として保持する
   - 優先敵が生存・到達可能な間は汎用beam searchの再目標化から保護し、消滅後だけ同一前線の占領unit、輸送unit、その他戦闘unitへ再目標化する
+  - 同一施設・同一unit種別の複数発注は、手番・施設・unit種別・発注順で `UnitProducedEvent` と決定的に照合する
+  - 中立拠点レースのInterceptionは継続するが、V4の局地任務Entityをpreemptしない。自軍所有拠点への脅威だけは局地任務より優先できる
+  - E2E traceへ任務付与、現在標的、初回攻撃ETA、占領／輸送unitへの攻撃、撃破、緊急迎撃の拠点所有者とETAを記録する
 
 - **改善**: V4で得た戦略標的価値をV1〜V4の共通戦術層へ横展開
   - 攻撃と接近の標的価値を敵unit本体のcostだけでなく、輸送中cargoのcostと、敵占領unitが他勢力拠点上にいる場合の1ターン分の収入損失まで含めて評価する
@@ -131,7 +134,9 @@
 - `engine/src/ai/production.rs`: V4 委譲に加え、既存のキャンペーン不足計画関数をV4から再利用できる可視性へ変更。V1/V2/V3の生産選定ロジックは未変更
 - `engine/src/ai/island_campaign.rs` / `island_campaign_analysis.rs`: 洋上 Reinforce の実 cargo と生産可能輸送手段を出発島・積載可能兵種込みで照合し、輸送不足を shortfall として保持。Assault は作戦優先度、将来予算予約、生産可能経路別の輸送編成、初動上陸波の容量を同じ作戦状態で管理する
 - `engine/src/ai/island_campaign.rs` / `island_campaign_analysis.rs`: 加えて、相対収入と地上／航空／海上の前進補給網から兵站前提作戦を導出し、新規Assaultとの依存関係を管理する
-- `engine/src/ai/squad.rs`: 自力展開戦力と輸送 cargo の分離、複数 cargo の Pickup 進行
-- `engine/src/ai/engine.rs`: Drop に参加した輸送役と cargo の双方を当該ターンの行動済みとして記録。加えてV1〜V4共通の攻撃・接近評価へ、搭載兵力と占領阻止を含む戦略標的価値を導入し、輸送中cargoの独立追跡を除外
+- `engine/src/ai/v4/deployment.rs`: V4のpending deployment、実Entity照合、局地標的追跡、fallback、攻撃実績監査を保持
+- `engine/src/ai/squad.rs`: 自力展開戦力と輸送 cargo の分離、複数 cargo の Pickup 進行。加えてV4局地任務をcampaign再配分とgeneric free poolより先に予約する
+- `engine/src/ai/engine.rs`: Drop に参加した輸送役と cargo の双方を当該ターンの行動済みとして記録。加えてV1〜V4共通の攻撃・接近評価へ、搭載兵力と占領阻止を含む戦略標的価値を導入し、V4では局地任務の現在標的Entityを通常標的より優先する
+- `engine/src/ai/emergency.rs`: 中立拠点InterceptionはV4局地任務Entityをpreemptせず、自軍所有拠点への脅威だけがpreemptできる責務境界を追加
 - `strategy.rs` / `resources/`: Stage 2では変更しない。新しい予約台帳 Resource も追加しない
 - 対戦評価: `scripts/eval_matchup.py` による V4 vs V3 / V4 vs V1 の勝率・ZOC 支配面積・ターン収入の比較検証が必須

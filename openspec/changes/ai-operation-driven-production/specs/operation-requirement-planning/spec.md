@@ -234,6 +234,26 @@ MUST: AIは、CombatまたはIntercept枠で生産したunitに、要求を発�
 - **WHEN** pending deploymentが保持する優先敵がすべて消滅または到達不能になったとき
 - **THEN** 同じ作戦anchor周辺の占領unit、輸送unit、その他戦闘unitの順に再目標化し、局地脅威が無ければ汎用poolへ解放する
 
+#### Scenario: 同型の複数発注を実Entityへ決定的に照合する
+
+- **WHEN** 同じ手番に同一施設・同一unit種別のCombatまたはIntercept枠発注が複数存在するとき
+- **THEN** 手番・施設・unit種別・発注順で `UnitProducedEvent` と照合し、各実Entityへ異なる発注意図を決定的に割り当てる
+
+#### Scenario: 任務標的を通常の好機標的より優先する
+
+- **WHEN** 局地任務の優先敵と、戦術評価上より高価値な別の敵が同時に攻撃可能で、いずれも無謀攻撃ではないとき
+- **THEN** 当該局地任務Entityは優先敵を攻撃する
+
+#### Scenario: 中立拠点レースで局地任務をpreemptしない
+
+- **WHEN** 敵占領unitが中立拠点へ2ターン以内に到達可能で、V4局地任務Entityが存在するとき
+- **THEN** Interceptionは当該局地任務Entityを横取りせず、他の利用可能戦力で中立拠点レースへの対応を試みる
+
+#### Scenario: 自軍所有拠点の危機は局地任務をpreemptできる
+
+- **WHEN** 敵占領unitが自軍所有の重要拠点へ2ターン以内に到達可能で、他に拒絶可能な戦力がないとき
+- **THEN** InterceptionはV4局地任務Entityをpreemptして自軍拠点の占領阻止へ割り当ててよい
+
 ### Requirement: 兵站前提の補給カテゴリ導出
 
 MUST: AIは、長距離Assaultの構造パッケージに含まれる地上cargoと輸送役から、前進拠点に必要な補給カテゴリを導出しなければならない。拠点数だけで兵站完成と判定してはならない。

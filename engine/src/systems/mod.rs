@@ -31,8 +31,10 @@ pub fn add_main_game_systems(schedule: &mut Schedule) {
         (
             crate::ai::engine::clear_ai_cooldowns_system,
             produce_unit_system,
+            crate::ai::v4::deployment::reconcile_pending_deployments_system,
             move_unit_system,
             attack_unit_system,
+            crate::ai::v4::deployment::audit_deployment_attacks_system,
             sync_cargo_health_system,
             remove_destroyed_units_system,
             capture_property_system,

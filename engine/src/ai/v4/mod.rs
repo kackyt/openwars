@@ -12,6 +12,7 @@
 //! 「敵を減らす」と「占領する」は別フェーズではなく同一作戦の別枠として
 //! 同時に立つため、倒してから占領するのではなく並行して進む。
 
+pub mod deployment;
 pub mod operation;
 pub mod trace;
 
@@ -84,6 +85,8 @@ const EXPANSION_THREAT_WEIGHT: u32 = 2;
 /// 盤面から取り出したユニット 1 体分の情報。
 #[derive(Debug, Clone)]
 struct UnitSnapshot {
+    /// 盤面上の実Entity。純粋関数テストの合成snapshotではNoneを許容する。
+    entity: Option<Entity>,
     pos: GridPosition,
     stats: UnitStats,
     hp: u32,
@@ -111,6 +114,7 @@ impl UnitSnapshot {
 /// 誤った需要になるため、両者を別の次元として保持する。
 #[derive(Debug, Clone)]
 struct ThreatTarget {
+    entity: Option<Entity>,
     stats: UnitStats,
     position: GridPosition,
     remaining_value: f32,
@@ -126,6 +130,7 @@ impl ThreatTarget {
                 1.0
             };
         Self {
+            entity: unit.entity,
             stats: unit.stats.clone(),
             position: unit.pos,
             remaining_value: unit.value() as f32,
@@ -140,6 +145,8 @@ struct Operation {
     kind: OperationKind,
     /// 作戦の代表地点（距離計算の基準）
     anchor: GridPosition,
+    /// この作戦へ局地敵を帰属させる期限。
+    threat_horizon: u32,
     facts: OperationFacts,
     slots: OperationSlots,
     /// この生産計画の中で既に購入した分
@@ -179,6 +186,30 @@ struct SlotCandidate {
     fitness: f32,
 }
 
+/// 生産命令と、その命令だけが持つV4作戦意図。
+#[derive(Debug)]
+struct PlannedProduction {
+    command: ProduceUnitCommand,
+    deployment: Option<PlannedDeployment>,
+}
+
+/// Combat / Intercept枠からpending deploymentへ渡す情報。
+#[derive(Debug)]
+struct PlannedDeployment {
+    anchor: GridPosition,
+    slot_kind: SlotKind,
+    priority_enemies: Vec<Entity>,
+    threat_horizon: u32,
+}
+
+impl std::ops::Deref for PlannedProduction {
+    type Target = ProduceUnitCommand;
+
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
+}
+
 /// V4 の生産意思決定エントリポイント。
 ///
 /// `decide_production` から `AiVersion::uses_operation_driven_production()` が
@@ -206,7 +237,39 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
         world.insert_resource(turn_plan);
         return Vec::new();
     };
-    let (commands, plan_trace) = plan_production(&scan, player_id);
+    let (planned, plan_trace) = plan_production(&scan, player_id);
+
+    // 診断traceとは別に、生産完了イベントと照合する作戦意図を永続化する。
+    let pending = planned
+        .iter()
+        .enumerate()
+        .filter_map(|(order, planned)| {
+            let deployment = planned.deployment.as_ref()?;
+            Some(deployment::PendingDeployment {
+                player_id,
+                turn,
+                order: u32::try_from(order).unwrap_or(u32::MAX),
+                facility: GridPosition {
+                    x: planned.command.target_x,
+                    y: planned.command.target_y,
+                },
+                unit_type: planned.command.unit_type,
+                anchor: deployment.anchor,
+                slot_kind: deployment.slot_kind,
+                priority_enemies: deployment.priority_enemies.clone(),
+                threat_horizon: deployment.threat_horizon,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut deployment_registry = world
+        .remove_resource::<deployment::V4DeploymentRegistry>()
+        .unwrap_or_default();
+    deployment_registry.replace_turn_orders(player_id, turn, pending);
+    world.insert_resource(deployment_registry);
+    let commands = planned
+        .into_iter()
+        .map(|planned| planned.command)
+        .collect::<Vec<_>>();
 
     // 生産判断の内訳を診断リソースへ残す（判定は行わず記録のみ）。
     if let Some(mut diagnostics) = world.get_resource_mut::<ProductionTraceDiagnostics>() {
@@ -333,6 +396,7 @@ impl BoardScan {
         let mut enemy_units = Vec::new();
         {
             let mut q = world.query::<(
+                Entity,
                 &GridPosition,
                 &Faction,
                 &UnitStats,
@@ -340,13 +404,14 @@ impl BoardScan {
                 Option<&CargoCapacity>,
                 Option<&Transporting>,
             )>();
-            for (pos, faction, stats, health, cargo, transporting) in q.iter(world) {
+            for (entity, pos, faction, stats, health, cargo, transporting) in q.iter(world) {
                 // 輸送中のユニットは盤面を占有しない
                 if transporting.is_some() {
                     continue;
                 }
                 occupied.insert(*pos);
                 let snapshot = UnitSnapshot {
+                    entity: Some(entity),
                     pos: *pos,
                     hp: health.map_or(100, |h| h.current),
                     free_cargo: cargo.map_or(stats.max_cargo, |c| {
@@ -1091,6 +1156,9 @@ fn build_operation(
     Operation {
         kind,
         anchor,
+        threat_horizon: anchor_index
+            .and_then(|index| horizons.get(index).copied())
+            .unwrap_or(0),
         slots: derive_slots(&facts),
         facts,
         filled: OperationSlots::default(),
@@ -1103,7 +1171,7 @@ fn build_operation(
 fn plan_production(
     scan: &BoardScan,
     player_id: PlayerId,
-) -> (Vec<ProduceUnitCommand>, ProductionPlanTrace) {
+) -> (Vec<PlannedProduction>, ProductionPlanTrace) {
     let mut ctx = ReachCtx::default();
     let mut operations = build_operations(scan, &mut ctx);
     let mut plan_trace =
@@ -1111,7 +1179,16 @@ fn plan_production(
 
     if operations.is_empty() {
         plan_trace.fallback = true;
-        return (fallback_production(scan, player_id), plan_trace);
+        return (
+            fallback_production(scan, player_id)
+                .into_iter()
+                .map(|command| PlannedProduction {
+                    command,
+                    deployment: None,
+                })
+                .collect(),
+            plan_trace,
+        );
     }
 
     // 同格の作戦は「敵の到達が早い順」に処理する
@@ -1213,6 +1290,8 @@ fn plan_production(
 
         remaining_funds = remaining_funds.saturating_sub(candidate.cost);
         used_facilities.insert(candidate.facility);
+        let deployment =
+            planned_deployment(scan, &mut ctx, &operations[op_index], slot_kind, &candidate);
         record_fill(
             scan,
             &mut ctx,
@@ -1236,16 +1315,87 @@ fn plan_production(
                 facility: candidate.facility,
             },
         });
-        commands.push(ProduceUnitCommand {
-            player_id,
-            target_x: candidate.facility.x,
-            target_y: candidate.facility.y,
-            unit_type: candidate.unit_type,
+        commands.push(PlannedProduction {
+            command: ProduceUnitCommand {
+                player_id,
+                target_x: candidate.facility.x,
+                target_y: candidate.facility.y,
+                unit_type: candidate.unit_type,
+            },
+            deployment,
         });
     }
 
     plan_trace.leftover_funds = remaining_funds;
     (commands, plan_trace)
+}
+
+/// 候補が限界被覆を与える局地敵を、生産採点と同じ重要度×相性の順に保持する。
+fn planned_deployment(
+    scan: &BoardScan,
+    ctx: &mut ReachCtx,
+    op: &Operation,
+    slot_kind: SlotKind,
+    candidate: &SlotCandidate,
+) -> Option<PlannedDeployment> {
+    let stats = candidate_stats(scan, candidate);
+    let (threats, eligible): (&[ThreatTarget], Vec<usize>) = match slot_kind {
+        SlotKind::Intercept => (
+            &op.unreachable_threats,
+            (0..op.unreachable_threats.len()).collect(),
+        ),
+        SlotKind::Combat => {
+            let self_deployable = ctx.is_reachable(
+                &scan.map,
+                &scan.master_data,
+                (candidate.facility.x, candidate.facility.y),
+                (op.anchor.x, op.anchor.y),
+                stats.movement_type,
+            );
+            let origin = if self_deployable {
+                candidate.facility
+            } else {
+                op.anchor
+            };
+            (
+                &op.reachable_threats,
+                reachable_threat_indices(scan, ctx, &op.reachable_threats, origin, stats),
+            )
+        }
+        SlotKind::Capture | SlotKind::Transport => return None,
+    };
+    let mut targets = eligible
+        .into_iter()
+        .filter_map(|index| {
+            let threat = &threats[index];
+            let entity = threat.entity?;
+            let efficiency = coverage_efficiency(stats, &threat.stats, &scan.damage_chart);
+            (threat.remaining_value > 0.0 && efficiency > 0.0).then_some((
+                efficiency * threat.priority_weight,
+                threat.priority_weight,
+                threat.position.x,
+                threat.position.y,
+                entity.to_bits(),
+                entity,
+            ))
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| right.1.total_cmp(&left.1))
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.3.cmp(&right.3))
+            .then_with(|| left.4.cmp(&right.4))
+    });
+    let priority_enemies = targets.into_iter().map(|target| target.5).collect();
+    Some(PlannedDeployment {
+        anchor: op.anchor,
+        slot_kind,
+        priority_enemies,
+        threat_horizon: op.threat_horizon,
+    })
 }
 
 /// 次に埋めるべき枠を返す。
@@ -2129,6 +2279,7 @@ mod tests {
 
     fn snapshot(stats: UnitStats, hp: u32) -> UnitSnapshot {
         UnitSnapshot {
+            entity: None,
             pos: pos(0, 0),
             stats,
             hp,
@@ -2351,12 +2502,14 @@ mod tests {
         let tank = stats(UnitType::Tank, 7000);
         let mut threats = vec![
             ThreatTarget {
+                entity: None,
                 stats: stats(UnitType::Bcopters, 8000),
                 position: pos(1, 0),
                 remaining_value: 8000.0,
                 priority_weight: 1.0,
             },
             ThreatTarget {
+                entity: None,
                 stats: stats(UnitType::Infantry, 7000),
                 position: pos(2, 0),
                 remaining_value: 7000.0,
@@ -2387,6 +2540,7 @@ mod tests {
         chart.insert_damage(UnitType::TransportHelicopter, UnitType::AntiAir, 0);
         let anti_air = stats(UnitType::AntiAir, 8000);
         let mut threats = vec![ThreatTarget {
+            entity: None,
             stats: stats(UnitType::TransportHelicopter, 8000),
             position: pos(1, 0),
             remaining_value: 8000.0,
@@ -2408,6 +2562,7 @@ mod tests {
         Operation {
             kind,
             anchor: pos(0, 0),
+            threat_horizon: 0,
             facts: OperationFacts::default(),
             slots,
             filled,
@@ -2479,6 +2634,7 @@ mod tests {
             ],
             // 母港 (1,1) に停泊したままの輸送艦。空き搭載スロット 2。
             my_units: vec![UnitSnapshot {
+                entity: None,
                 pos: pos(1, 1),
                 stats: lander,
                 hp: 100,
@@ -2613,12 +2769,14 @@ mod tests {
             my_units: Vec::new(),
             enemy_units: vec![
                 UnitSnapshot {
+                    entity: Some(Entity::from_raw(101)),
                     pos: pos(6, 1),
                     stats: stats(UnitType::Bcopters, 8000),
                     hp: 100,
                     free_cargo: 0,
                 },
                 UnitSnapshot {
+                    entity: Some(Entity::from_raw(102)),
                     pos: pos(6, 3),
                     stats: infantry,
                     hp: 100,
