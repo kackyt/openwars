@@ -1,11 +1,11 @@
 ---
 title: "PLAYBOOK"
-version: "1.15.0"
+version: "1.16.0"
 status: "approved"
 created: "2026-06-06"
 updated: "2026-08-09"
 owner: "@t_kak"
-ace_entry_count: 35
+ace_entry_count: 37
 tags: [ace, playbook, knowledge-management]
 references:
   - docs/ACE_FRAMEWORK.md
@@ -843,6 +843,44 @@ Playbook が 800 行を超えた場合、以下のように分割する：
 **Context**: PR #94 において V4 専用として開発された要求判定や標的評価のうち、純粋にルール依存で客観的な標的評価（cargo/占領価値の評価）を切り出して共通戦略・戦術モジュールへ移設し、全 AI に共有させた。
 
 **Action**: AI の機能追加や改良を行う際は、「ゲームルールに基づき一義的に評価できる客観的評価」と「バージョン固有の試行錯誤・計画アルゴリズム」を分離し、前者を共通層に配置して既存 AI も恩恵を受けられる構造にする。
+
+<a id="ace-98-1"></a>
+
+### ACE-98-1: 生産口封鎖（ProductionBlockade）検知と多角的 NPV に基づく全 AI 共通緊急任務解除
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | architecture |
+| Origin     | PR #98 / Issue #76 |
+| Date       | 2026-08-09 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: 敵による自軍生産拠点（Factory, Airport, Port, Capital）の占有は、非占領ユニットであっても次ターン以降の戦力供給を遮断する致命的な攻撃となる。拠点価値（収入、修理価値、生産枠価値、敵の利得）に基づく NPV 評価を行い、通常の攻撃行動より優先度の高い緊急任務（Emergency Mission）として全 AI 世代で共通解除することで、生産ラインの不全を防ぐ。
+
+**Context**: 敵の戦車などが自軍の工場の上に居座った場合、拠点を「占領」しているわけではないため従来の防衛・占領 AI では優先度が上がらず、自軍の生産が長時間封鎖される問題があった（Issue #76）。
+
+**Action**: 首都生産圏内の生産施設に対する敵ユニットの占有を `ProductionBlockade` として検知する独立モジュールを構築し、2ターン以内に到達可能な解除担当ユニットを割り当てる緊急任務を発行する。都市（City）や生産圏外の兵站施設は除外し、評価ロジックは全 AI バージョンで共通利用する。
+
+<a id="ace-98-2"></a>
+
+### ACE-98-2: 動的緊急ミッション・配備計画の対戦 JSONL トレース記録による AI 検証可能性の確保
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | tooling |
+| Origin     | PR #98 |
+| Date       | 2026-08-09 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: AIが手番中に動的に生成・消滅させる緊急介入計画や配備の整合性チェック（Deployment Audit, Emergency Plan, Factory Relief Missions）の履歴を、対戦ログ（JSONL）の構造化ストリームとして記録・エクスポートすることで、ブラックボックス化しがちな緊急思考プロセスの透明性と検証可能性を担保する。
+
+**Context**: PR #98 にて生産口封鎖解除や配備追跡を導入した際、AI内部で正しく封鎖解除ミッションが発動しているかをバッチシミュレーションや Python テストスクリプト（`test_eval_matchup.py`）から確認できるよう、`factory_relief_history` や `emergency_plan_history` 等を対戦トレースログへ追加した。
+
+**Action**: AIが内部状態（緊急計画、配備追跡、部隊評価など）に基づいて動的制御を行う場合は、その計画・監査情報を手番ごとの対戦トレース（JSONL）にエクスポートする出力インターフェースを整備し、評価ツールやテストから判定可能にする。
 
 ## Changelog
 
