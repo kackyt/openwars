@@ -17,6 +17,59 @@ use std::collections::{HashMap, HashSet, VecDeque};
 #[derive(Resource, Default)]
 pub struct AiActionCooldown(pub HashSet<Entity>);
 
+fn transport_has_other_actionable_cargo(
+    world: &World,
+    transport: Entity,
+    current_cargo: Entity,
+) -> bool {
+    world
+        .get::<crate::components::CargoCapacity>(transport)
+        .is_some_and(|capacity| {
+            capacity.loaded.iter().any(|loaded| {
+                *loaded != current_cargo
+                    && world
+                        .get::<crate::components::ActionCompleted>(*loaded)
+                        .is_some_and(|action| !action.0)
+            })
+        })
+}
+
+/// 標的本体だけでなく、輸送中の兵力と目前の占領による収入損失も含めた戦略価値を返す。
+/// 輸送ユニットへのダメージは搭載ユニットにも同期されるため、搭載兵の価格を同率で評価する。
+fn strategic_target_value(
+    stats: &UnitStats,
+    position: GridPosition,
+    owner: PlayerId,
+    cargo: Option<&crate::components::CargoCapacity>,
+    unit_costs: &HashMap<Entity, u32>,
+    properties: &[(GridPosition, Terrain, Option<PlayerId>)],
+    registry: &MasterDataRegistry,
+) -> u32 {
+    let cargo_value = cargo
+        .into_iter()
+        .flat_map(|capacity| capacity.loaded.iter())
+        .filter_map(|entity| unit_costs.get(entity))
+        .fold(0_u32, |total, cost| total.saturating_add(*cost));
+
+    // 占領可能ユニットが他勢力の物件上にいれば、次に失い得る1ターン分の収入を加える。
+    let capture_risk = if stats.can_capture {
+        properties
+            .iter()
+            .find(|(property_position, _, property_owner)| {
+                *property_position == position && *property_owner != Some(owner)
+            })
+            .map(|(_, terrain, _)| registry.landscape_income(terrain.as_str()))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    stats
+        .cost
+        .saturating_add(cargo_value)
+        .saturating_add(capture_risk)
+}
+
 #[derive(Resource, Default)]
 pub struct AiProductionCooldown(pub HashSet<(usize, usize)>);
 
@@ -229,6 +282,13 @@ pub fn decide_ai_action(
     let mut best_overall_choice: Option<(Entity, AiCommand)> = None;
 
     let mut turn_cache = crate::ai::turn_distance::AiTurnCache::default();
+    let unit_costs: HashMap<Entity, u32> = {
+        let mut query = world.query::<(Entity, &UnitStats)>();
+        query
+            .iter(world)
+            .map(|(entity, stats)| (entity, stats.cost))
+            .collect()
+    };
 
     for unit_entity in movable_units {
         let (stats, pos, fuel, atk_hp, atk_ammo) = {
@@ -293,14 +353,32 @@ pub fn decide_ai_action(
             u32,
             u32,
         )> = {
-            let mut q = world.query::<(&GridPosition, &Faction, &UnitStats, &Health)>();
+            let mut q = world.query::<(
+                &GridPosition,
+                &Faction,
+                &UnitStats,
+                &Health,
+                Option<&crate::components::CargoCapacity>,
+                Option<&crate::components::Transporting>,
+            )>();
             q.iter(world)
-                .filter(|(_, f, _, h)| f.0 != player_id && h.current > 0)
-                .map(|(p, _, s, h)| {
+                // 輸送中の兵は盤外座標の実体なので、独立した追跡対象にはしない。
+                .filter(|(_, f, _, h, _, transporting)| {
+                    f.0 != player_id && h.current > 0 && transporting.is_none()
+                })
+                .map(|(p, faction, s, h, cargo, _)| {
                     (
                         *p,
                         s.unit_type,
-                        s.cost,
+                        strategic_target_value(
+                            s,
+                            *p,
+                            faction.0,
+                            cargo,
+                            &unit_costs,
+                            &properties,
+                            &registry,
+                        ),
                         h.current,
                         s.min_range,
                         s.max_range,
@@ -680,10 +758,11 @@ pub fn decide_ai_action(
                     }
 
                     // ターゲットの詳細を取得してスコアを加点
-                    if let (Some(t_stats), Some(t_health), Some(t_pos)) = (
+                    if let (Some(t_stats), Some(t_health), Some(t_pos), Some(t_faction)) = (
                         world.get::<UnitStats>(target_entity),
                         world.get::<Health>(target_entity),
                         world.get::<GridPosition>(target_entity),
+                        world.get::<Faction>(target_entity),
                     ) {
                         // 撃破判定・ダメージ期待値の算出: 攻撃側HP、弾薬、距離、および地形防御ボーナスを考慮
                         let t_terrain = map
@@ -714,9 +793,18 @@ pub fn decide_ai_action(
                         let mut attack_score = 2000;
 
                         // 与えるダメージ量に応じた加点 (0 ~ 10000程度)
-                        // ダメージ量 * 敵のコスト / 100
+                        // ダメージ量 * 敵本体・搭載兵・占領阻止の戦略価値 / 100
                         // 100%時のダメージ(base_dmg)ではなく、現在のHPや弾薬を考慮した期待ダメージ(expected_actual_damage)を使用する
-                        let damage_val = (expected_actual_damage * t_stats.cost) / 100;
+                        let target_value = strategic_target_value(
+                            t_stats,
+                            *t_pos,
+                            t_faction.0,
+                            world.get::<crate::components::CargoCapacity>(target_entity),
+                            &unit_costs,
+                            &properties,
+                            &registry,
+                        );
+                        let damage_val = expected_actual_damage.saturating_mul(target_value) / 100;
                         attack_score += damage_val as i32;
 
                         // 戦闘不能時は攻撃を躊躇させる（撃破できない限り）
@@ -790,19 +878,18 @@ pub fn decide_ai_action(
                         world.get::<Health>(target_entity),
                         world.get::<UnitStats>(target_entity),
                     ) {
-                        // フルHP同士の合流は無意味なのでスコアを0にする
+                        if crate::ai::pruning::is_overflow_merge_without_refund(atk_hp, *t_health) {
+                            continue;
+                        }
+
                         let total_hp = atk_hp + t_health.current;
-                        if total_hp > 100 {
-                            merge_score = 0;
-                        } else {
-                            // 自身または相手のHPが低い場合、合流の価値を高める
-                            if is_combat_ineffective || t_health.current < 40 {
-                                merge_score += 4000;
-                            }
-                            // 合流後のHPが無駄にならないなら加点
-                            if total_hp <= 100 {
-                                merge_score += 1000;
-                            }
+                        // 自身または相手のHPが低い場合、合流の価値を高める
+                        if is_combat_ineffective || t_health.current < 40 {
+                            merge_score += 4000;
+                        }
+                        // 合流後のHPが無駄にならないなら加点
+                        if total_hp <= t_health.max {
+                            merge_score += 1000;
                         }
 
                         let score = base_tile_score + merge_score;
@@ -969,11 +1056,12 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> Option<Str
 
     match ai_version {
         crate::ai::ai_version::AiVersion::V1 => execute_ai_turn_v1(world, active_player),
-        // V3 は V2 と同じ部隊編成・ビーム探索パイプラインを共有し、
+        // V3/V4 は V2 と同じ部隊編成・ビーム探索パイプラインを共有し、
         // タイル評価 (decide_ai_action_v2) と盤面評価の中でバージョン別の強化を行う
-        crate::ai::ai_version::AiVersion::V2 | crate::ai::ai_version::AiVersion::V3 => {
-            execute_ai_turn_v2(world, active_player)
-        }
+        // （V4 の差分は生産判断のみで、行動決定パイプラインは V3 と同一）
+        crate::ai::ai_version::AiVersion::V2
+        | crate::ai::ai_version::AiVersion::V3
+        | crate::ai::ai_version::AiVersion::V4 => execute_ai_turn_v2(world, active_player),
     }
 }
 
@@ -1178,7 +1266,7 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
             .get_resource::<crate::ai::squad::SquadManager>()
             .is_some_and(|manager| {
                 manager.squads.iter().any(|squad| {
-                    matches!(
+                    let delivered_cargo = matches!(
                         squad.phase,
                         crate::ai::squad::MissionPhase::Transport(
                             crate::ai::squad::TransportPhase::Transit
@@ -1189,7 +1277,21 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
                             .get::<crate::components::Transporting>(*cargo)
                             .is_none()
                             && world.get::<GridPosition>(*cargo).is_some()
-                    })
+                    });
+                    let pickup_completed = matches!(
+                        squad.phase,
+                        crate::ai::squad::MissionPhase::Transport(
+                            crate::ai::squad::TransportPhase::Pickup
+                        )
+                    ) && !squad.cargo_entities.is_empty()
+                        && squad.cargo_entities.iter().all(|cargo| {
+                            squad.transport_entity.is_some_and(|transport| {
+                                world
+                                    .get::<crate::components::Transporting>(*cargo)
+                                    .is_some_and(|transporting| transporting.0 == transport)
+                            })
+                        });
+                    delivered_cargo || pickup_completed
                 })
             });
         if needs_transport_reconcile {
@@ -1233,13 +1335,37 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     }
 
     if let Some((entity, cmd)) = transport_action {
+        // Drop は輸送役だけでなく、降車したcargoもそのターンの行動を消費する。
+        // 両者を記録し、実際には行動済みのcargoを遊兵として数えないようにする。
+        let affected_cargo = match &cmd {
+            AiCommand::Drop { cargo_entity, .. } => Some(*cargo_entity),
+            _ => None,
+        };
+        // Unload systemは未行動cargoが残る間、輸送役を行動完了にしない。
+        // AI側も同じ契約に合わせ、最後のcargoを降ろすまで輸送役をcooldownしない。
+        let transport_can_continue_drop = match &cmd {
+            AiCommand::Drop { cargo_entity, .. } => {
+                transport_has_other_actionable_cargo(world, entity, *cargo_entity)
+            }
+            _ => false,
+        };
         let cmd_str = format!("{:?}", cmd);
         execute_ai_command(world, entity, cmd);
         if let Some(mut res) = world.get_resource_mut::<AiActionCooldown>() {
-            res.0.insert(entity);
+            if !transport_can_continue_drop {
+                res.0.insert(entity);
+            }
+            if let Some(cargo_entity) = affected_cargo {
+                res.0.insert(cargo_entity);
+            }
         } else {
             let mut set = std::collections::HashSet::new();
-            set.insert(entity);
+            if !transport_can_continue_drop {
+                set.insert(entity);
+            }
+            if let Some(cargo_entity) = affected_cargo {
+                set.insert(cargo_entity);
+            }
             world.insert_resource(AiActionCooldown(set));
         }
         return Some(cmd_str);
@@ -1330,6 +1456,23 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     }
 
     // 4. 全行動完了 -> ターン終了
+    // ターン終了直前は「このターン結局何が動かなかったか」が確定する唯一の点。
+    // AiActionCooldown はターン境界で破棄されるため、ここで遊兵を計上しておく。
+    let acted_entities = world
+        .get_resource::<AiActionCooldown>()
+        .map(|res| res.0.clone())
+        .unwrap_or_default();
+    let idle_audit = crate::ai::idle_audit::audit_idle_units(world, active_player, &acted_entities);
+    if let Some(mut diagnostics) =
+        world.get_resource_mut::<crate::ai::idle_audit::IdleAuditDiagnostics>()
+    {
+        diagnostics.record(idle_audit);
+    } else {
+        let mut diagnostics = crate::ai::idle_audit::IdleAuditDiagnostics::default();
+        diagnostics.record(idle_audit);
+        world.insert_resource(diagnostics);
+    }
+
     if let Some(mut end_events) =
         world.get_resource_mut::<Events<crate::events::NextPhaseCommand>>()
     {
@@ -1346,6 +1489,58 @@ const AMBUSH_NEAR_RANGE_BONUS: i32 = 2000;
 const AMBUSH_TOO_CLOSE_PENALTY: i32 = 3000;
 /// #45 (V3): 待ち受けゾーンとみなす最大射程からのマージン (敵の接近を想定)
 const AMBUSH_APPROACH_MARGIN: u32 = 2;
+
+/// 通常スコアとは別軸で緊急行動を比較する優先度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ActionPriority {
+    Normal,
+    EmergencyAdvance,
+    EmergencyRouteBlock,
+    EmergencySiteOccupation,
+    EmergencyNeutralization,
+}
+
+fn emergency_position_priority(
+    mission: Option<&crate::ai::emergency::EmergencyMission>,
+    origin: GridPosition,
+    candidate: GridPosition,
+    map: &Map,
+) -> ActionPriority {
+    let Some(mission) = mission else {
+        return ActionPriority::Normal;
+    };
+    if candidate == mission.target_position {
+        return match mission.response {
+            crate::ai::emergency::EmergencyResponse::EliminateThreat => {
+                ActionPriority::EmergencyAdvance
+            }
+            crate::ai::emergency::EmergencyResponse::OccupySite => {
+                ActionPriority::EmergencySiteOccupation
+            }
+            crate::ai::emergency::EmergencyResponse::BlockRoute => {
+                ActionPriority::EmergencyRouteBlock
+            }
+        };
+    }
+
+    let original_distance = map.distance(
+        origin.x,
+        origin.y,
+        mission.target_position.x,
+        mission.target_position.y,
+    );
+    let candidate_distance = map.distance(
+        candidate.x,
+        candidate.y,
+        mission.target_position.x,
+        mission.target_position.y,
+    );
+    if candidate_distance < original_distance {
+        ActionPriority::EmergencyAdvance
+    } else {
+        ActionPriority::Normal
+    }
+}
 
 /// 新しいAI (V2/V3) 用の行動意思決定エンジン。
 /// 各ユニットの所属部隊の割り当て目標（squad.target）に向かう接近スコアをベースに行動を決定します。
@@ -1443,6 +1638,13 @@ pub fn decide_ai_action_v2(
             .map(|(p, prop)| (*p, prop.terrain, prop.owner_id))
             .collect()
     };
+    let unit_costs: HashMap<Entity, u32> = {
+        let mut query = world.query::<(Entity, &UnitStats)>();
+        query
+            .iter(world)
+            .map(|(entity, stats)| (entity, stats.cost))
+            .collect()
+    };
     let enemy_units: Vec<(
         GridPosition,
         crate::resources::UnitType,
@@ -1452,14 +1654,32 @@ pub fn decide_ai_action_v2(
         u32,
         u32,
     )> = {
-        let mut q = world.query::<(&GridPosition, &Faction, &UnitStats, &Health)>();
+        let mut q = world.query::<(
+            &GridPosition,
+            &Faction,
+            &UnitStats,
+            &Health,
+            Option<&crate::components::CargoCapacity>,
+            Option<&crate::components::Transporting>,
+        )>();
         q.iter(world)
-            .filter(|(_, f, _, h)| f.0 != player_id && h.current > 0)
-            .map(|(p, _, s, h)| {
+            // 輸送中の兵は輸送ユニットの価値へ畳み込み、盤外の独立標的にはしない。
+            .filter(|(_, f, _, h, _, transporting)| {
+                f.0 != player_id && h.current > 0 && transporting.is_none()
+            })
+            .map(|(p, faction, s, h, cargo, _)| {
                 (
                     *p,
                     s.unit_type,
-                    s.cost,
+                    strategic_target_value(
+                        s,
+                        *p,
+                        faction.0,
+                        cargo,
+                        &unit_costs,
+                        &properties,
+                        &registry,
+                    ),
                     h.current,
                     s.min_range,
                     s.max_range,
@@ -1469,9 +1689,13 @@ pub fn decide_ai_action_v2(
             .collect()
     };
     let damage_chart = world.resource::<crate::resources::DamageChart>().clone();
+    let emergency_plan = world
+        .get_resource::<crate::ai::emergency::EmergencyMissionPlan>()
+        .cloned()
+        .unwrap_or_default();
 
     let mut turn_cache = TurnDistanceCache::default();
-    let mut best_overall_score = i32::MIN;
+    let mut best_overall_rank = (ActionPriority::Normal, i32::MIN);
     let mut best_overall_choice: Option<(Entity, AiCommand)> = None;
 
     for unit_entity in movable_units {
@@ -1500,6 +1724,9 @@ pub fn decide_ai_action_v2(
         };
 
         let is_combat_ineffective = atk_hp < 70 || (stats.max_ammo1 > 0 && atk_ammo.0 == 0);
+        let planned_emergency = emergency_plan.mission_for_entity(unit_entity);
+        let emergency_mission = planned_emergency
+            .filter(|mission| world.get_entity(mission.threat.threat_entity).is_ok());
 
         // #44 (V3): 敵の脅威がこのユニットの近傍にあるか (森・山への退避を
         // 意味のある局面に限定するためのゲート)。敵の攻撃到達圏 (移動+射程) を
@@ -1521,12 +1748,17 @@ pub fn decide_ai_action_v2(
             &registry,
         );
 
-        let squad_target = unit_squad_targets.get(&unit_entity).copied();
+        let squad_target = if planned_emergency.is_some() && emergency_mission.is_none() {
+            // 同一ターン中に対象が消失した場合は、古い迎撃座標のSquad加点を無効化する。
+            None
+        } else {
+            unit_squad_targets.get(&unit_entity).copied()
+        };
         let initial_is_solo = solo_fallbacks.contains(&unit_entity) || squad_target.is_none();
 
         // 評価ロジック（is_solo: initial_is_solo を直接使う）
         let is_solo = initial_is_solo;
-        let mut best_unit_score = i32::MIN;
+        let mut best_unit_rank = (ActionPriority::Normal, i32::MIN);
         let mut best_unit_choice: Option<AiCommand> = None;
 
         for target_tile in &reachable {
@@ -1978,8 +2210,12 @@ pub fn decide_ai_action_v2(
             // (A) Capture
             if actions.can_capture {
                 let score = base_tile_score + 10000;
-                if score > best_unit_score {
-                    best_unit_score = score;
+                let rank = (
+                    emergency_position_priority(emergency_mission, pos, current_grid, &map),
+                    score,
+                );
+                if rank > best_unit_rank {
+                    best_unit_rank = rank;
                     best_unit_choice = Some(AiCommand::Capture {
                         target_pos: current_grid,
                     });
@@ -2005,10 +2241,11 @@ pub fn decide_ai_action_v2(
                     }
 
                     // ターゲットの詳細を取得してスコアを加点
-                    if let (Some(t_stats), Some(t_health), Some(t_pos)) = (
+                    if let (Some(t_stats), Some(t_health), Some(t_pos), Some(t_faction)) = (
                         world.get::<UnitStats>(target_entity),
                         world.get::<Health>(target_entity),
                         world.get::<GridPosition>(target_entity),
+                        world.get::<Faction>(target_entity),
                     ) {
                         // 撃破判定・ダメージ期待値の算出
                         let t_terrain = map
@@ -2036,7 +2273,16 @@ pub fn decide_ai_action_v2(
                         }
 
                         let mut attack_score = 2000;
-                        let damage_val = (expected_actual_damage * t_stats.cost) / 100;
+                        let target_value = strategic_target_value(
+                            t_stats,
+                            *t_pos,
+                            t_faction.0,
+                            world.get::<crate::components::CargoCapacity>(target_entity),
+                            &unit_costs,
+                            &properties,
+                            &registry,
+                        );
+                        let damage_val = expected_actual_damage.saturating_mul(target_value) / 100;
                         attack_score += damage_val as i32;
 
                         if is_combat_ineffective && expected_actual_damage < t_health.current {
@@ -2048,8 +2294,16 @@ pub fn decide_ai_action_v2(
                         }
 
                         let score = base_tile_score + attack_score;
-                        if score > best_unit_score {
-                            best_unit_score = score;
+                        let priority = if emergency_mission
+                            .is_some_and(|mission| mission.threat.threat_entity == target_entity)
+                        {
+                            ActionPriority::EmergencyNeutralization
+                        } else {
+                            ActionPriority::Normal
+                        };
+                        let rank = (priority, score);
+                        if rank > best_unit_rank {
+                            best_unit_rank = rank;
                             best_unit_choice = Some(AiCommand::Attack {
                                 target_pos: current_grid,
                                 target_entity,
@@ -2088,8 +2342,12 @@ pub fn decide_ai_action_v2(
                     score -= 5000;
                 }
 
-                if score > best_unit_score {
-                    best_unit_score = score;
+                let rank = (
+                    emergency_position_priority(emergency_mission, pos, current_grid, &map),
+                    score,
+                );
+                if rank > best_unit_rank {
+                    best_unit_rank = rank;
                     best_unit_choice = Some(AiCommand::Wait {
                         target_pos: current_grid,
                     });
@@ -2109,21 +2367,22 @@ pub fn decide_ai_action_v2(
                         world.get::<Health>(target_entity),
                         world.get::<UnitStats>(target_entity),
                     ) {
+                        if crate::ai::pruning::is_overflow_merge_without_refund(atk_hp, *t_health) {
+                            continue;
+                        }
+
                         let total_hp = atk_hp + t_health.current;
-                        if total_hp > 100 {
-                            merge_score = 0;
-                        } else {
-                            if is_combat_ineffective || t_health.current < 40 {
-                                merge_score += 4000;
-                            }
-                            if total_hp <= 100 {
-                                merge_score += 1000;
-                            }
+                        if is_combat_ineffective || t_health.current < 40 {
+                            merge_score += 4000;
+                        }
+                        if total_hp <= t_health.max {
+                            merge_score += 1000;
                         }
 
                         let score = base_tile_score + merge_score;
-                        if score > best_unit_score {
-                            best_unit_score = score;
+                        let rank = (ActionPriority::Normal, score);
+                        if rank > best_unit_rank {
+                            best_unit_rank = rank;
                             best_unit_choice = Some(AiCommand::Merge {
                                 target_pos: current_grid,
                                 target_entity,
@@ -2135,8 +2394,8 @@ pub fn decide_ai_action_v2(
         }
 
         if let Some(choice) = best_unit_choice {
-            if best_unit_score > best_overall_score {
-                best_overall_score = best_unit_score;
+            if best_unit_rank > best_overall_rank {
+                best_overall_rank = best_unit_rank;
                 best_overall_choice = Some((unit_entity, choice));
             }
         }
@@ -2164,7 +2423,7 @@ pub fn decide_ai_action_v2(
                 entity,
                 mission_type,
                 action_type: format!("{:?}", command),
-                score: best_overall_score,
+                score: best_overall_rank.1,
             });
         }
     }
@@ -2218,6 +2477,95 @@ mod tests {
     use super::*;
     use crate::components::{Faction, Health, PlayerId, Property, UnitStats};
     use crate::resources::{DamageChart, UnitType};
+
+    #[test]
+    fn drop_keeps_transport_actionable_until_last_ready_cargo() {
+        let mut world = World::new();
+        let first = world.spawn(crate::components::ActionCompleted(false)).id();
+        let second = world.spawn(crate::components::ActionCompleted(false)).id();
+        let transport = world
+            .spawn(crate::components::CargoCapacity {
+                max: 2,
+                loaded: vec![first, second],
+            })
+            .id();
+
+        assert!(transport_has_other_actionable_cargo(
+            &world, transport, first
+        ));
+        world
+            .get_mut::<crate::components::ActionCompleted>(second)
+            .unwrap()
+            .0 = true;
+        assert!(!transport_has_other_actionable_cargo(
+            &world, transport, first
+        ));
+    }
+
+    #[test]
+    fn strategic_target_value_includes_cargo_and_immediate_capture_risk() {
+        let mut world = World::new();
+        let first_cargo = world.spawn_empty().id();
+        let second_cargo = world.spawn_empty().id();
+        let unit_costs = HashMap::from([(first_cargo, 1000), (second_cargo, 3000)]);
+        let cargo = crate::components::CargoCapacity {
+            max: 2,
+            loaded: vec![first_cargo, second_cargo],
+        };
+        let registry = MasterDataRegistry::load().unwrap();
+        let enemy = PlayerId(2);
+        let position = GridPosition { x: 2, y: 3 };
+        let properties = vec![(position, Terrain::City, Some(PlayerId(1)))];
+
+        let transport = UnitStats {
+            cost: 4000,
+            ..UnitStats::mock()
+        };
+        assert_eq!(
+            strategic_target_value(
+                &transport,
+                position,
+                enemy,
+                Some(&cargo),
+                &unit_costs,
+                &properties,
+                &registry,
+            ),
+            8000
+        );
+
+        let occupier = UnitStats {
+            cost: 1000,
+            can_capture: true,
+            ..UnitStats::mock()
+        };
+        assert_eq!(
+            strategic_target_value(
+                &occupier,
+                position,
+                enemy,
+                None,
+                &unit_costs,
+                &properties,
+                &registry,
+            ),
+            1000 + registry.landscape_income(Terrain::City.as_str())
+        );
+
+        let owned_properties = vec![(position, Terrain::City, Some(enemy))];
+        assert_eq!(
+            strategic_target_value(
+                &occupier,
+                position,
+                enemy,
+                None,
+                &unit_costs,
+                &owned_properties,
+                &registry,
+            ),
+            1000
+        );
+    }
 
     #[test]
     fn v3_turn_cache_marks_squad_plan_until_cleared() {
@@ -3090,6 +3438,120 @@ mod tests {
     }
 
     #[test]
+    fn issue73_v1_overflow_merge_is_not_selected() {
+        let mut world = World::new();
+        world.insert_resource(DamageChart::new());
+        world.insert_resource(Map {
+            width: 3,
+            height: 1,
+            tiles: vec![Terrain::Plains, Terrain::Forest, Terrain::Plains],
+            topology: crate::resources::GridTopology::Square,
+        });
+        crate::resources::master_data::MasterDataRegistry::load()
+            .map(|master_data| world.insert_resource(master_data))
+            .unwrap();
+
+        let player = PlayerId(1);
+        world.spawn((
+            player,
+            Faction(player),
+            HasMoved(false),
+            ActionCompleted(false),
+            GridPosition { x: 0, y: 0 },
+            UnitStats {
+                unit_type: UnitType::Infantry,
+                max_movement: 3,
+                movement_type: crate::resources::MovementType::Infantry,
+                ..UnitStats::mock()
+            },
+            Health {
+                current: 100,
+                max: 100,
+            },
+            crate::components::Fuel {
+                current: 99,
+                max: 99,
+            },
+        ));
+        let target = world
+            .spawn((
+                player,
+                Faction(player),
+                HasMoved(true),
+                ActionCompleted(true),
+                GridPosition { x: 1, y: 0 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    max_movement: 3,
+                    movement_type: crate::resources::MovementType::Infantry,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 34,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+            ))
+            .id();
+
+        let action = decide_ai_action(&mut world, player, &std::collections::HashSet::new());
+
+        assert!(
+            !matches!(
+                action,
+                Some((_, AiCommand::Merge { target_entity, .. })) if target_entity == target
+            ),
+            "HP上限を超えるMergeはV1の候補から除外されること"
+        );
+    }
+
+    #[test]
+    fn issue73_v3_position_score_does_not_revive_overflow_merge() {
+        let mut world = setup_v3_test_world(3, crate::ai::AiVersion::V3);
+        world.insert_resource(DamageChart::new());
+        let player = PlayerId(1);
+        let stats = UnitStats {
+            unit_type: UnitType::Infantry,
+            max_movement: 3,
+            movement_type: crate::resources::MovementType::Infantry,
+            ..UnitStats::mock()
+        };
+        let source = spawn_v3_test_unit(&mut world, player, 0, 100, stats.clone());
+        let target = world
+            .spawn((
+                Faction(player),
+                HasMoved(true),
+                ActionCompleted(true),
+                GridPosition { x: 1, y: 0 },
+                stats,
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: 99,
+                    max: 99,
+                },
+            ))
+            .id();
+        insert_single_unit_squad(&mut world, source, GridPosition { x: 1, y: 0 });
+
+        let action = decide_ai_action_v2(&mut world, player, &std::collections::HashSet::new());
+
+        assert!(
+            !matches!(
+                action,
+                Some((entity, AiCommand::Merge { target_entity, .. }))
+                    if entity == source && target_entity == target
+            ),
+            "部隊目標による大きな位置スコアがあってもHP超過Mergeを復活させないこと"
+        );
+    }
+
+    #[test]
     fn test_decide_ai_action_retreat_no_ammo() {
         let mut world = World::new();
         world.insert_resource(DamageChart::new());
@@ -3516,6 +3978,134 @@ mod tests {
         world
     }
 
+    /// 同条件の輸送ヘリから、搭載兵を持つ高価値目標を選ぶか検証するワールドを作る。
+    fn setup_strategic_target_selection_world() -> (World, Entity) {
+        let mut world = setup_v3_test_world(3, crate::ai::ai_version::AiVersion::V3);
+        let mut damage_chart = DamageChart::new();
+        damage_chart.insert_damage(UnitType::Fighter, UnitType::TransportHelicopter, 80);
+        damage_chart.insert_damage(UnitType::TransportHelicopter, UnitType::Fighter, 0);
+        world.insert_resource(damage_chart);
+
+        let player = PlayerId(1);
+        let enemy = PlayerId(2);
+        world.spawn((
+            Faction(player),
+            HasMoved(false),
+            ActionCompleted(false),
+            GridPosition { x: 1, y: 0 },
+            UnitStats {
+                unit_type: UnitType::Fighter,
+                cost: 14000,
+                movement_type: crate::resources::MovementType::Air,
+                max_movement: 0,
+                min_range: 1,
+                max_range: 1,
+                max_ammo1: 10,
+                max_fuel: 99,
+                ..UnitStats::mock()
+            },
+            Health {
+                current: 100,
+                max: 100,
+            },
+            crate::components::Ammo {
+                ammo1: 10,
+                max_ammo1: 10,
+                ammo2: 0,
+                max_ammo2: 0,
+            },
+            crate::components::Fuel {
+                current: 99,
+                max: 99,
+            },
+        ));
+
+        let transport_stats = UnitStats {
+            unit_type: UnitType::TransportHelicopter,
+            cost: 4000,
+            movement_type: crate::resources::MovementType::Air,
+            max_cargo: 2,
+            ..UnitStats::mock()
+        };
+        world.spawn((
+            Faction(enemy),
+            GridPosition { x: 0, y: 0 },
+            transport_stats.clone(),
+            Health {
+                current: 100,
+                max: 100,
+            },
+            crate::components::CargoCapacity {
+                max: 2,
+                loaded: Vec::new(),
+            },
+        ));
+
+        let cargo = world
+            .spawn((
+                Faction(enemy),
+                GridPosition { x: 99, y: 99 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    cost: 12000,
+                    can_capture: true,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Transporting(Entity::from_raw(0)),
+            ))
+            .id();
+        let loaded_transport = world
+            .spawn((
+                Faction(enemy),
+                GridPosition { x: 2, y: 0 },
+                transport_stats,
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::CargoCapacity {
+                    max: 2,
+                    loaded: vec![cargo],
+                },
+            ))
+            .id();
+        world
+            .entity_mut(cargo)
+            .insert(crate::components::Transporting(loaded_transport));
+
+        (world, loaded_transport)
+    }
+
+    #[test]
+    fn v1_prioritizes_transport_with_loaded_combat_value() {
+        let (mut world, loaded_transport) = setup_strategic_target_selection_world();
+
+        let (_, action) = decide_ai_action(&mut world, PlayerId(1), &HashSet::new())
+            .expect("V1が攻撃行動を選ぶこと");
+
+        assert!(matches!(
+            action,
+            AiCommand::Attack { target_entity, .. } if target_entity == loaded_transport
+        ));
+    }
+
+    #[test]
+    fn v3_prioritizes_transport_with_loaded_combat_value() {
+        let (mut world, loaded_transport) = setup_strategic_target_selection_world();
+
+        let (_, action) = decide_ai_action_v2(&mut world, PlayerId(1), &HashSet::new())
+            .expect("V3が攻撃行動を選ぶこと");
+
+        assert!(matches!(
+            action,
+            AiCommand::Attack { target_entity, .. } if target_entity == loaded_transport
+        ));
+    }
+
     #[test]
     fn v2_v3_transport_executor_skips_foreign_owned_squads() {
         for version in [
@@ -3701,7 +4291,7 @@ mod tests {
     /// 指定ユニット1体のみからなる部隊 (目標つき) を登録するヘルパー
     fn insert_single_unit_squad(world: &mut World, member: Entity, target: GridPosition) {
         let mut manager = crate::ai::squad::SquadManager::default();
-        let mut members = std::collections::HashSet::new();
+        let mut members = std::collections::BTreeSet::new();
         members.insert(member);
         manager.squads.push(crate::ai::squad::Squad {
             id: crate::ai::squad::SquadId(1),
@@ -3716,6 +4306,7 @@ mod tests {
             pickup_position: None,
             drop_position: None,
             delivered_cargo: Vec::new(),
+            return_after_combat: false,
         });
         world.insert_resource(manager);
     }

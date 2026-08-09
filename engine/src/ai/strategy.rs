@@ -1,17 +1,22 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::ai::demand::{
-    DemandMatrix, average_attack_expectation, compute_demand, compute_unit_affinity,
+    AirDefenseAssessment, CombatCapabilitySnapshot, DemandMatrix, assess_air_defense,
+    average_attack_expectation, compute_demand, compute_unit_affinity,
 };
 use crate::ai::island_campaign::{
     IslandCampaignDiagnostics, IslandCampaignPortfolio, IslandCampaignShortfall,
 };
-use crate::ai::island_campaign_analysis::analyze_island_campaign;
+use crate::ai::island_campaign_analysis::{
+    analyze_island_campaign, analyze_island_campaign_excluding,
+};
 use crate::ai::turn_distance::{TerrainConnectivity, TurnDistanceCache, calculate_turn_distance};
-use crate::components::{Faction, GridPosition, PlayerId, Property, UnitStats};
+use crate::components::{
+    ActionCompleted, Ammo, Faction, Fuel, GridPosition, Health, PlayerId, Property, UnitStats,
+};
 use crate::resources::{Map, MovementType, Terrain, UnitType, master_data::MasterDataRegistry};
 use bevy_ecs::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// ゲームの戦略的フェーズ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -49,6 +54,8 @@ pub struct ProductionStrategy {
     pub capture_demand: u32,
     /// 包括的需要マトリクス（各戦闘カテゴリの脅威ギャップと占領脅威）。
     pub demand: DemandMatrix,
+    /// 航空脅威と、期限内に交戦可能な対空戦力の不足状況。
+    pub air_defense: AirDefenseAssessment,
     /// 輸送を必要としている既存ユニットのリスト（位置、ステータス、基本価値）。
     pub transport_candidates: Vec<(GridPosition, UnitStats, f32)>,
     /// 現在保有している輸送ユニットの数
@@ -61,6 +68,13 @@ pub struct ProductionStrategy {
     pub campaign_shortfalls: Vec<IslandCampaignShortfall>,
 }
 
+/// 航空脅威が残る間だけ保持する緊急対空の貯金先。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmergencyAntiAirReservation {
+    pub unit_type: UnitType,
+    pub cost: u32,
+}
+
 /// 複数ターンにまたがる生産計画。
 /// 貯金や次ターンの生産予約を管理するリソース。
 #[derive(Resource, Debug, Clone, Default)]
@@ -70,6 +84,8 @@ pub struct ProductionPlan {
     pub reserves: HashMap<u32, u32>,
     /// 勢力ごとの次ターン生産予約ユニット。
     pub reservations: HashMap<u32, Vec<UnitType>>,
+    /// 通常の生産予約を上書きせず、航空脅威が消えた時だけ解除する緊急対空予約。
+    pub emergency_anti_air_reservations: HashMap<u32, EmergencyAntiAirReservation>,
 }
 
 fn is_ground_movement(movement_type: MovementType) -> bool {
@@ -166,7 +182,16 @@ fn enemy_threatens_property(
 
 /// 現在のマップ状況を分析し、最適な戦略を決定します。
 pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStrategy {
-    analyze_strategy_internal(world, player_id, None)
+    analyze_strategy_internal(world, player_id, None, &HashSet::new())
+}
+
+/// 緊急ミッションへ予約したEntityを島嶼キャンペーンから除外して戦略を分析します。
+pub(crate) fn analyze_strategy_with_reserved_entities(
+    world: &mut World,
+    player_id: PlayerId,
+    reserved_entities: &HashSet<Entity>,
+) -> ProductionStrategy {
+    analyze_strategy_internal(world, player_id, None, reserved_entities)
 }
 
 /// 同一ターンのSquad計画が保存したV3キャンペーンを後続の判断へ再利用する。
@@ -179,13 +204,14 @@ pub(crate) fn analyze_strategy_for_turn(
         .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
         .and_then(|cache| cache.campaign_portfolio(player_id))
         .cloned();
-    analyze_strategy_internal(world, player_id, cached_campaign)
+    analyze_strategy_internal(world, player_id, cached_campaign, &HashSet::new())
 }
 
 fn analyze_strategy_internal(
     world: &mut World,
     player_id: PlayerId,
     cached_campaign: Option<IslandCampaignPortfolio>,
+    reserved_entities: &HashSet<Entity>,
 ) -> ProductionStrategy {
     let mut strategy = ProductionStrategy::default();
 
@@ -207,7 +233,11 @@ fn analyze_strategy_internal(
             strategy.campaign_portfolio = cached;
         } else {
             // 通常分析では盤面から再構築し、同じ呼び出し内と診断出力で共有する。
-            strategy.campaign_portfolio = analyze_island_campaign(world, player_id);
+            strategy.campaign_portfolio = if reserved_entities.is_empty() {
+                analyze_island_campaign(world, player_id)
+            } else {
+                analyze_island_campaign_excluding(world, player_id, reserved_entities)
+            };
             // 診断Resourceは意思決定に戻さず、最後の分析結果だけをプレイヤー別に上書きする。
             if let Some(mut diagnostics) = world.get_resource_mut::<IslandCampaignDiagnostics>() {
                 diagnostics
@@ -301,6 +331,48 @@ fn analyze_strategy_internal(
             }
         }
     }
+
+    let capability_units = {
+        let mut query = world.query::<(
+            &GridPosition,
+            &Faction,
+            &UnitStats,
+            &Health,
+            Option<&Ammo>,
+            Option<&Fuel>,
+            Option<&ActionCompleted>,
+            Option<&crate::components::Transporting>,
+        )>();
+        query
+            .iter(world)
+            .filter(|(position, _, _, health, _, _, _, transporting)| {
+                position.x < 9999 && health.current > 0 && transporting.is_none()
+            })
+            .map(
+                |(position, faction, stats, health, ammo, fuel, action_completed, _)| {
+                    CombatCapabilitySnapshot {
+                        faction: faction.0,
+                        position: *position,
+                        unit_type: stats.unit_type,
+                        movement_type: stats.movement_type,
+                        hp: health.current,
+                        cost: stats.cost,
+                        max_movement: stats.max_movement,
+                        min_range: stats.min_range,
+                        max_range: stats.max_range,
+                        ammo1: ammo.map_or(99, |ammo| ammo.ammo1),
+                        max_ammo1: stats.max_ammo1,
+                        ammo2: ammo.map_or(99, |ammo| ammo.ammo2),
+                        max_ammo2: stats.max_ammo2,
+                        fuel: fuel.map_or(u32::MAX, |fuel| fuel.current),
+                        action_delay: u32::from(
+                            action_completed.is_some_and(|completed| completed.0),
+                        ),
+                    }
+                },
+            )
+            .collect::<Vec<_>>()
+    };
 
     // 自軍の歩兵が存在する島IDも収集対象に加える
     for (pos, stats) in &my_units {
@@ -468,8 +540,22 @@ fn analyze_strategy_internal(
         }
         GamePhase::Defense => {
             strategy.ideal_composition.insert(UnitType::Infantry, 0.5);
-            strategy.ideal_composition.insert(UnitType::Tank, 0.3);
-            strategy.ideal_composition.insert(UnitType::AntiAir, 0.2);
+
+            // 対空の理想構成は「敵に航空戦力が実在する」ことを条件とする（V3限定）。
+            // 対空砲・地対空ミサイルは地上ユニットへ一切ダメージを与えられないため、
+            // 空港のないマップ（例: map_1）で対空需要を立てると死に駒を量産し、
+            // 占領・機動地上戦力の生産枠と予算を奪って自軍を弱体化させる。
+            // V1/V2 は評価の基準線として従来挙動のまま維持する。
+            let enemy_has_air = enemy_units
+                .iter()
+                .any(|(_, stats)| stats.movement_type == MovementType::Air);
+            if !is_v3 || enemy_has_air {
+                strategy.ideal_composition.insert(UnitType::Tank, 0.3);
+                strategy.ideal_composition.insert(UnitType::AntiAir, 0.2);
+            } else {
+                // 対空へ割り当てるはずだった需要は、防衛の主力である戦車へ振り替える
+                strategy.ideal_composition.insert(UnitType::Tank, 0.5);
+            }
         }
     }
 
@@ -520,6 +606,32 @@ fn analyze_strategy_internal(
                 &chart,
                 &registry,
             );
+            if is_v3 {
+                let critical_sites = my_props_for_demand
+                    .iter()
+                    .filter(|(_, terrain)| {
+                        matches!(
+                            terrain,
+                            Terrain::Capital
+                                | Terrain::Factory
+                                | Terrain::Airport
+                                | Terrain::Port
+                                | Terrain::City
+                        )
+                    })
+                    .map(|(position, _)| *position)
+                    .collect::<Vec<_>>();
+                strategy.air_defense = assess_air_defense(
+                    player_id,
+                    &capability_units,
+                    &critical_sites,
+                    &map,
+                    &master_data,
+                    &unit_positions,
+                    &chart,
+                );
+                strategy.demand.anti_air = strategy.air_defense.shortage_ratio;
+            }
 
             // 輸送が必要なユニット（停滞ユニット）的抽出。
             // V3はallocatorが確定した全攻勢を、割当優先順位どおりの輸送先として共有する。
@@ -899,6 +1011,105 @@ mod tests {
             strategy.phase,
             GamePhase::Defense,
             "首都が脅かされている場合は、中立拠点があっても Defense フェーズが優先されるべき"
+        );
+    }
+
+    /// Defense フェーズの理想構成テスト用ワールド。
+    /// 首都のすぐ隣に敵戦車を置いて Defense フェーズを成立させ、
+    /// `enemy_has_air` が真のときだけ敵の航空ユニットを追加する。
+    fn setup_defense_phase_world(
+        ai_version: crate::ai::ai_version::AiVersion,
+        enemy_has_air: bool,
+    ) -> World {
+        let mut world = World::new();
+        world.insert_resource(Map::new(15, 15, Terrain::Plains, GridTopology::Square));
+        world.insert_resource(crate::resources::MasterDataRegistry::load().unwrap());
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+
+        let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
+        settings.set_version(p1, ai_version);
+        world.insert_resource(settings);
+
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(p1), 100),
+        ));
+
+        // 首都のすぐそばに敵地上ユニット（Defense フェーズのトリガー）
+        world.spawn((
+            GridPosition { x: 1, y: 1 },
+            Faction(p2),
+            UnitStats {
+                unit_type: UnitType::Tank,
+                max_movement: 6,
+                movement_type: crate::resources::MovementType::Tank,
+                ..UnitStats::mock()
+            },
+        ));
+
+        if enemy_has_air {
+            world.spawn((
+                GridPosition { x: 5, y: 5 },
+                Faction(p2),
+                UnitStats {
+                    unit_type: UnitType::Bcopters,
+                    max_movement: 6,
+                    movement_type: crate::resources::MovementType::Air,
+                    ..UnitStats::mock()
+                },
+            ));
+        }
+
+        world
+    }
+
+    /// 敵に航空戦力が1機も存在しない場合、Defense フェーズでも対空を理想構成へ要求しないこと。
+    /// map_1 のように空港のないマップでは、対空ユニットは地上戦力へ一切ダメージを与えられず
+    /// 純粋な死に駒になるため、脅威がないのに需要を立ててはならない。
+    #[test]
+    fn v3_defense_composition_omits_anti_air_without_enemy_air() {
+        let mut world = setup_defense_phase_world(crate::ai::ai_version::AiVersion::V3, false);
+        let strategy = analyze_strategy(&mut world, PlayerId(1));
+
+        assert_eq!(strategy.phase, GamePhase::Defense);
+        assert!(
+            !strategy.ideal_composition.contains_key(&UnitType::AntiAir),
+            "敵に航空戦力がない場合、対空を理想構成へ含めてはならない: {:?}",
+            strategy.ideal_composition
+        );
+    }
+
+    /// 敵に航空戦力が存在する場合は、従来どおり Defense フェーズで対空需要を立てること。
+    #[test]
+    fn v3_defense_composition_demands_anti_air_against_enemy_air() {
+        let mut world = setup_defense_phase_world(crate::ai::ai_version::AiVersion::V3, true);
+        let strategy = analyze_strategy(&mut world, PlayerId(1));
+
+        assert_eq!(strategy.phase, GamePhase::Defense);
+        assert!(
+            strategy
+                .ideal_composition
+                .get(&UnitType::AntiAir)
+                .copied()
+                .unwrap_or(0.0)
+                > 0.0,
+            "敵航空戦力が実在する場合は対空需要を立てるべき: {:?}",
+            strategy.ideal_composition
+        );
+    }
+
+    /// V1/V2 は評価の基準線として従来挙動を維持する（今回の是正は V3 限定）。
+    #[test]
+    fn v1_defense_composition_keeps_legacy_anti_air_demand() {
+        let mut world = setup_defense_phase_world(crate::ai::ai_version::AiVersion::V1, false);
+        let strategy = analyze_strategy(&mut world, PlayerId(1));
+
+        assert_eq!(strategy.phase, GamePhase::Defense);
+        assert_eq!(
+            strategy.ideal_composition.get(&UnitType::AntiAir).copied(),
+            Some(0.2),
+            "V1 の理想構成は変更しない"
         );
     }
 
@@ -1316,6 +1527,7 @@ mod tests {
             island_id,
             decision: crate::ai::island_campaign::IslandCampaignDecision::Expand,
             target_position: target,
+            capture_target_positions: vec![target],
             requirement: empty_requirement.clone(),
             purchase_shortfall: empty_requirement,
             allocated_budget: 0,

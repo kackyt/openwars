@@ -16,12 +16,24 @@ pub enum AiVersion {
     /// - #49: 回復インフラ（拠点）の条件付き価値評価
     /// - #50: 敵間接攻撃の脅威マップによる露出ペナルティ
     V3,
+    /// V3 の戦術評価を引き継ぎつつ、生産判断を作戦（Operation）駆動へ置き換えた AI (Phase 4)。
+    /// - `GamePhase` 別の理想構成ハードコードを使わない
+    /// - 前線ごとに占領枠・撃破枠・護衛枠・輸送枠・迎撃枠を状況から導出する
+    /// - 到達可能性で候補を絞り、生産枠あたり予算で価格帯を決め、埋まらない枠は購入を見送る
+    V4,
 }
 
 impl AiVersion {
-    /// V3 系の戦術評価（地形防御・待ち伏せ・脅威マップ・回復インフラ）を使うかどうか
+    /// V3 系の戦術評価（地形防御・待ち伏せ・脅威マップ・回復インフラ）を使うかどうか。
+    /// V4 は V3 の戦術評価をそのまま継承し、生産判断だけを差し替える。
     pub fn uses_v3_tactics(&self) -> bool {
-        matches!(self, AiVersion::V3)
+        matches!(self, AiVersion::V3 | AiVersion::V4)
+    }
+
+    /// 作戦駆動の生産計画（V4）を使うかどうか。
+    /// V1/V2/V3 はベースラインとして従来の生産ロジックを維持する。
+    pub fn uses_operation_driven_production(&self) -> bool {
+        matches!(self, AiVersion::V4)
     }
 }
 
@@ -108,6 +120,31 @@ mod tests {
         assert_eq!(
             resolve_player_ai_version(&world, PlayerId(3)),
             AiVersion::V3
+        );
+    }
+
+    #[test]
+    fn v4_inherits_v3_tactics_and_owns_operation_production() {
+        // V4 は戦術評価を V3 から継承し、生産だけを作戦駆動へ差し替える。
+        assert!(AiVersion::V4.uses_v3_tactics());
+        assert!(AiVersion::V4.uses_operation_driven_production());
+        // 過去バージョンは作戦駆動生産を使わないベースラインのまま。
+        assert!(!AiVersion::V3.uses_operation_driven_production());
+        assert!(!AiVersion::V2.uses_operation_driven_production());
+        assert!(!AiVersion::V1.uses_operation_driven_production());
+        assert!(!AiVersion::V1.uses_v3_tactics());
+    }
+
+    #[test]
+    fn resolver_preserves_v4() {
+        let mut world = World::new();
+        let mut settings = PlayerAiSettings::default();
+        settings.set_version(PlayerId(4), AiVersion::V4);
+        world.insert_resource(settings);
+
+        assert_eq!(
+            resolve_player_ai_version(&world, PlayerId(4)),
+            AiVersion::V4
         );
     }
 }

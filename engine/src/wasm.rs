@@ -39,7 +39,7 @@ impl WasmEngine {
         Ok(WasmEngine { world, schedule })
     }
 
-    /// フロントエンドから選択可能な公開バージョンはV1/V3に限定します。
+    /// フロントエンドから選択可能な公開バージョンはV1/V3/V4に限定します。
     /// V2は旧セーブの読み込み互換性のためgetterでは返しますが、新規設定は拒否します。
     pub fn set_player_ai_version(
         &mut self,
@@ -49,6 +49,7 @@ impl WasmEngine {
         let version = match version_str {
             "V1" => AiVersion::V1,
             "V3" => AiVersion::V3,
+            "V4" => AiVersion::V4,
             "V2" => {
                 return Err(JsValue::from_str(
                     "AI version V2 is load-only and cannot be selected",
@@ -56,7 +57,7 @@ impl WasmEngine {
             }
             _ => {
                 return Err(JsValue::from_str(
-                    "Invalid AI version. Expected 'V1' or 'V3'",
+                    "Invalid AI version. Expected 'V1', 'V3' or 'V4'",
                 ));
             }
         };

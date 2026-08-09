@@ -1,10 +1,33 @@
 use crate::ai::islands::IslandId;
 use crate::ai::squad::TransportPhase;
 use crate::components::{GridPosition, PlayerId};
-use crate::resources::UnitType;
+use crate::resources::{Map, UnitType};
 use bevy_ecs::prelude::{Entity, Resource};
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// 戦力分散を避けるために同時維持する攻勢作戦数。
+const MAX_ACTIVE_OFFENSIVES: usize = 3;
+
+/// これ以上の輸送ETAを持つ敵島は、直行前に前進兵站拠点を必要とする長距離目標とみなす。
+const LONG_RANGE_ASSAULT_ETA: u32 = 4;
+/// 輸送役が既に前進してETAが短く見えても、補給線が必要とみなす首都からの距離。
+const LONG_RANGE_ASSAULT_DISTANCE: u32 = 12;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CampaignSustainmentCoverage {
+    pub(crate) ground: bool,
+    pub(crate) air: bool,
+    pub(crate) sea: bool,
+}
+
+/// 兵站作戦が島全体ではなく、補給カテゴリに対応する施設を直接狙うための候補座標。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CampaignSustainmentTargets {
+    pub(crate) ground: Option<GridPosition>,
+    pub(crate) air: Option<GridPosition>,
+    pub(crate) sea: Option<GridPosition>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IslandCampaignState {
@@ -96,7 +119,10 @@ pub struct IslandCampaignRequirement {
 pub struct IslandCampaignAssignment {
     pub island_id: IslandId,
     pub decision: IslandCampaignDecision,
+    /// 作戦の主目標。輸送・戦闘部隊の進出基準として使う。
     pub target_position: GridPosition,
+    /// 占領要員ごとに分担できる、優先順付きの未所有施設目標。
+    pub capture_target_positions: Vec<GridPosition>,
     pub requirement: IslandCampaignRequirement,
     pub purchase_shortfall: IslandCampaignRequirement,
     pub allocated_budget: u32,
@@ -155,19 +181,31 @@ impl IslandCampaignPortfolio {
         let mut shortfalls = Vec::new();
         for assignment in self.defenses.iter().chain(self.active_offensives.iter()) {
             let missing = &assignment.purchase_shortfall;
-            if missing.total_budget == 0
+            // 出航可能になった強襲の戦闘支援は汎用戦闘作戦へ戻す。実行中の便へ
+            // 後からcargoを追加できないため、専用生産を継続すると任務なし兵が増える。
+            let combat_budget = if assignment.decision == IslandCampaignDecision::Assault
+                && assignment.operation_ready
+            {
+                0
+            } else {
+                missing.combat_budget
+            };
+            let reserved_budget = missing
+                .total_budget
+                .saturating_sub(missing.combat_budget.saturating_sub(combat_budget));
+            if reserved_budget == 0
                 && missing.transport_slots == 0
                 && missing.capture_units == 0
-                && missing.combat_budget == 0
+                && combat_budget == 0
             {
                 continue;
             }
             let priority_rank = match assignment.decision {
                 IslandCampaignDecision::Defend => 0,
                 _ if assignment.continued_from_existing_squad => 1,
-                IslandCampaignDecision::Expand => 2,
-                IslandCampaignDecision::Contest | IslandCampaignDecision::Reinforce => 3,
-                IslandCampaignDecision::Assault => 4,
+                IslandCampaignDecision::Assault => 2,
+                IslandCampaignDecision::Expand => 3,
+                IslandCampaignDecision::Contest | IslandCampaignDecision::Reinforce => 4,
                 _ => continue,
             };
             let (light_transport_slots, heavy_transport_slots) = match missing.preferred_transport {
@@ -188,8 +226,8 @@ impl IslandCampaignPortfolio {
                 light_transport_slots,
                 heavy_transport_slots,
                 capture_units: missing.capture_units,
-                combat_budget: missing.combat_budget,
-                reserved_budget: missing.total_budget,
+                combat_budget,
+                reserved_budget,
                 priority_rank,
             });
         }
@@ -220,15 +258,38 @@ pub(crate) struct CampaignResourcePool {
     pub(crate) units: Vec<CampaignUnitCandidate>,
 }
 
+/// キャンペーンが不足輸送を生産要求へ変換するための、実際に生産可能な輸送諸元。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CampaignTransportBlueprint {
+    pub(crate) unit_type: UnitType,
+    pub(crate) cost: u32,
+    pub(crate) cargo_slots: u32,
+    pub(crate) loadable_unit_types: Vec<UnitType>,
+    pub(crate) source_island: IslandId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IslandCampaignCandidate {
     pub(crate) assessment: IslandCampaignAssessment,
     pub(crate) target_position: GridPosition,
+    pub(crate) capture_target_positions: Vec<GridPosition>,
     pub(crate) roi_production_sites: u32,
     pub(crate) transport_eta: Option<u32>,
+    /// 所有するとターン開始補給・修理に使える地上／航空／海上拠点の数。
+    pub(crate) ground_sustainment_sites: u32,
+    pub(crate) air_sustainment_sites: u32,
+    pub(crate) sea_sustainment_sites: u32,
+    pub(crate) sustainment_targets: CampaignSustainmentTargets,
+    pub(crate) island_income_per_turn: u32,
+    /// 最終攻勢を始める前に確保すべき、収入と継戦能力を担う橋頭堡。
+    pub(crate) logistics_prerequisite: bool,
     pub(crate) requirement: IslandCampaignRequirement,
+    /// Assaultで必須とする輸送役の構成。生産圏内の実拠点から組める編成だけを保持する。
+    pub(crate) assault_transport_types: Vec<UnitType>,
     /// combat power不足が正の場合に予約すべき最小の実購入unit cost。
     pub(crate) minimum_combat_purchase_cost: Option<u32>,
+    /// 自軍拠点で実際に生産できる輸送手段。Reinforceの不足を盤面依存で導出する。
+    pub(crate) producible_transports: Vec<CampaignTransportBlueprint>,
     pub(crate) existing_operation: Option<ExistingCampaignOperation>,
 }
 
@@ -305,18 +366,21 @@ type OffensivePriorityKey = (
 
 /// decisionごとの固定keyへ正規化し、HashMapや入力順に依存しない攻勢優先順位を作る。
 fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePriorityKey {
+    // 一度編成を始めた作戦は決定種別が変わっても最優先で継続し、
+    // 新規作戦への切替で輸送中・合流中の戦力を遊兵化させない。
+    let existing_rank = u8::from(candidate.existing_operation.is_none());
     let decision_rank = match candidate.assessment.decision {
-        IslandCampaignDecision::Expand => 0,
-        IslandCampaignDecision::Contest => 1,
-        IslandCampaignDecision::Reinforce => 2,
-        IslandCampaignDecision::Assault => 3,
+        _ if candidate.logistics_prerequisite => 0,
+        IslandCampaignDecision::Assault => 1,
+        IslandCampaignDecision::Expand => 2,
+        IslandCampaignDecision::Contest => 3,
+        IslandCampaignDecision::Reinforce => 4,
         _ => u8::MAX,
     };
-    let existing_rank = u8::from(candidate.existing_operation.is_none());
     match candidate.assessment.decision {
         IslandCampaignDecision::Expand => (
-            decision_rank,
             existing_rank,
+            decision_rank,
             candidate
                 .assessment
                 .expansion_payback_turns
@@ -330,8 +394,8 @@ fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePrior
             candidate.assessment.island_id.0,
         ),
         IslandCampaignDecision::Contest | IslandCampaignDecision::Reinforce => (
-            decision_rank,
             existing_rank,
+            decision_rank,
             0,
             Reverse(0),
             Reverse(0),
@@ -345,20 +409,20 @@ fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePrior
             candidate.assessment.island_id.0,
         ),
         IslandCampaignDecision::Assault => (
-            decision_rank,
             existing_rank,
+            decision_rank,
             0,
-            Reverse(0),
-            Reverse(0),
-            0,
+            Reverse(candidate.roi_production_sites),
+            Reverse(candidate.assessment.enemy_properties),
+            candidate.transport_eta.unwrap_or(u32::MAX),
             candidate.assessment.required_budget,
             candidate.assessment.enemy_combat_value,
             0,
             candidate.assessment.island_id.0,
         ),
         _ => (
-            decision_rank,
             existing_rank,
+            decision_rank,
             0,
             Reverse(0),
             Reverse(0),
@@ -368,6 +432,199 @@ fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePrior
             0,
             candidate.assessment.island_id.0,
         ),
+    }
+}
+
+fn preferred_logistics_target(
+    candidate: &IslandCampaignCandidate,
+    assault: &IslandCampaignCandidate,
+    coverage: CampaignSustainmentCoverage,
+) -> Option<GridPosition> {
+    // 作戦に使う輸送役の補給施設を先に確保し、その後で地上兵の修理拠点を確保する。
+    // 同じカテゴリ内の座標は分析側で決定的に選択済みである。
+    for unit_type in &assault.assault_transport_types {
+        match unit_type {
+            UnitType::TransportHelicopter if !coverage.air => {
+                if let Some(target) = candidate.sustainment_targets.air {
+                    return Some(target);
+                }
+            }
+            UnitType::Lander if !coverage.sea => {
+                if let Some(target) = candidate.sustainment_targets.sea {
+                    return Some(target);
+                }
+            }
+            _ => {}
+        }
+    }
+    (!coverage.ground)
+        .then_some(candidate.sustainment_targets.ground)
+        .flatten()
+}
+
+/// 候補島が地上兵と強襲輸送役に提供できる補給カテゴリ数を返す。
+/// 強襲で実際に使う輸送種別だけを数え、同じ輸送種別の重複要求は1カテゴリにまとめる。
+fn logistics_coverage(
+    candidate: &IslandCampaignCandidate,
+    assault: &IslandCampaignCandidate,
+) -> u32 {
+    let mut coverage = u32::from(candidate.ground_sustainment_sites > 0);
+    let mut required_transport_types = assault.assault_transport_types.clone();
+    required_transport_types.sort_by_key(|unit_type| campaign_unit_type_rank(*unit_type));
+    required_transport_types.dedup();
+    for unit_type in required_transport_types {
+        coverage = coverage.saturating_add(match unit_type {
+            UnitType::TransportHelicopter => u32::from(candidate.air_sustainment_sites > 0),
+            UnitType::Lander => u32::from(candidate.sea_sustainment_sites > 0),
+            _ => 0,
+        });
+    }
+    coverage
+}
+
+fn sustainment_network_covers_assault(
+    coverage: CampaignSustainmentCoverage,
+    assault: &IslandCampaignCandidate,
+) -> bool {
+    if !coverage.ground {
+        return false;
+    }
+    assault
+        .assault_transport_types
+        .iter()
+        .all(|unit_type| match unit_type {
+            UnitType::TransportHelicopter => coverage.air,
+            UnitType::Lander => coverage.sea,
+            _ => true,
+        })
+}
+
+/// 収入競争または長距離強襲に備える必要があるとき、最も有効な中間島を兵站前提へ昇格する。
+/// マップ名ではなく、収入差・既存の前進拠点・輸送ETA・補給種別・目標距離だけを使う。
+pub(crate) fn promote_logistics_prerequisite(
+    candidates: &mut [IslandCampaignCandidate],
+    map: &Map,
+    friendly_income_per_turn: u32,
+    enemy_income_per_turn: u32,
+    forward_sustainment_coverage: CampaignSustainmentCoverage,
+    home_position: Option<GridPosition>,
+) {
+    for candidate in candidates.iter_mut() {
+        candidate.logistics_prerequisite = false;
+    }
+
+    let Some(primary_assault_index) = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate.assessment.decision == IslandCampaignDecision::Assault
+                && candidate.existing_operation.is_none()
+        })
+        .min_by_key(|(_, candidate)| offensive_priority_key(candidate))
+        .map(|(index, _)| index)
+    else {
+        return;
+    };
+    let assault = &candidates[primary_assault_index];
+    let assault_eta = assault.transport_eta.unwrap_or(u32::MAX);
+    let economy_under_pressure = friendly_income_per_turn < enemy_income_per_turn;
+    let direct_distance = home_position.map_or(0, |home| {
+        map.distance(
+            home.x,
+            home.y,
+            assault.target_position.x,
+            assault.target_position.y,
+        )
+    });
+    let is_long_range =
+        assault_eta >= LONG_RANGE_ASSAULT_ETA || direct_distance >= LONG_RANGE_ASSAULT_DISTANCE;
+    let needs_forward_base =
+        is_long_range && !sustainment_network_covers_assault(forward_sustainment_coverage, assault);
+    if !economy_under_pressure && !needs_forward_base {
+        return;
+    }
+
+    let assault_target = assault.target_position;
+    let best_index = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            (matches!(
+                candidate.assessment.decision,
+                IslandCampaignDecision::Expand
+                    | IslandCampaignDecision::Secure
+                    | IslandCampaignDecision::Contest
+                    | IslandCampaignDecision::Reinforce
+            ) || (candidate.assessment.decision == IslandCampaignDecision::Assault
+                && candidate.existing_operation.is_some()))
+                && candidate
+                    .ground_sustainment_sites
+                    .saturating_add(candidate.air_sustainment_sites)
+                    .saturating_add(candidate.sea_sustainment_sites)
+                    > 0
+                && preferred_logistics_target(candidate, assault, forward_sustainment_coverage)
+                    .is_some()
+                && candidate
+                    .transport_eta
+                    .is_some_and(|eta| eta <= assault_eta)
+        })
+        .min_by_key(|(_, candidate)| {
+            (
+                u8::from(candidate.existing_operation.is_none()),
+                u8::from(candidate.assessment.decision != IslandCampaignDecision::Secure),
+                Reverse(logistics_coverage(candidate, assault)),
+                map.distance(
+                    candidate.target_position.x,
+                    candidate.target_position.y,
+                    assault_target.x,
+                    assault_target.y,
+                ),
+                candidate
+                    .assessment
+                    .expansion_payback_turns
+                    .unwrap_or(u32::MAX),
+                Reverse(candidate.island_income_per_turn),
+                candidate.transport_eta.unwrap_or(u32::MAX),
+                candidate.assessment.island_id.0,
+            )
+        })
+        .map(|(index, _)| index);
+
+    if let Some(index) = best_index {
+        let target =
+            preferred_logistics_target(&candidates[index], assault, forward_sustainment_coverage)
+                .expect("候補抽出時に兵站施設座標を確認済み");
+        let candidate = &mut candidates[index];
+        candidate.logistics_prerequisite = true;
+        candidate.target_position = target;
+        // 兵站カテゴリの主施設を先頭にしつつ、残る占領兵は別施設を並行確保できるよう残す。
+        candidate
+            .capture_target_positions
+            .retain(|position| *position != target);
+        candidate.capture_target_positions.insert(0, target);
+        if candidate.assessment.decision == IslandCampaignDecision::Assault
+            && candidate.existing_operation.is_some()
+        {
+            // 先遣隊の上陸後に敵が到着しても、通常強襲の4枠編成へ組み替えて作戦を止めない。
+            // 構造要件は進行中の軽量輸送隊を維持し、敵戦力分だけを後段で加算する。
+            candidate.requirement.preferred_transport = Some(UnitType::TransportHelicopter);
+            candidate.requirement.transport_slots = 2;
+            candidate.requirement.capture_units = 2;
+            candidate.requirement.combat_budget = 0;
+            candidate.requirement.total_budget = 6_000;
+            candidate.assault_transport_types.clear();
+            candidate.assessment.required_budget = candidate.requirement.total_budget;
+        }
+        if candidate.assessment.decision == IslandCampaignDecision::Secure
+            && candidate.requirement.capture_units == 0
+        {
+            candidate.requirement.capture_units = 1;
+            candidate.requirement.total_budget =
+                candidate.requirement.total_budget.saturating_add(1_000);
+            candidate.assessment.required_budget = candidate.requirement.total_budget;
+        }
+        candidate.assessment.decision_reason =
+            "収入均衡と修理・燃料・弾薬の前進補給を確保してから敵本拠地を強襲する".to_owned();
     }
 }
 
@@ -501,6 +758,105 @@ fn campaign_transport_package_covers(
     search_campaign_transport_coverage(&cargo, &transports, 0, &mut assigned_counts)
 }
 
+/// 現在予約済みの輸送役が、指定cargoのうち最大何体を同時に運べるか。
+/// 完全被覆だけでなく不足スロット数を生産へ返すため、同じ二部マッチングを最大化する。
+fn campaign_transport_covered_count(
+    cargo_entities: &[Entity],
+    transport_entities: &[Entity],
+    catalog: &HashMap<Entity, CampaignUnitCandidate>,
+) -> usize {
+    let cargo: Vec<_> = cargo_entities
+        .iter()
+        .filter_map(|entity| catalog.get(entity))
+        .collect();
+    let transports: Vec<_> = transport_entities
+        .iter()
+        .filter_map(|entity| catalog.get(entity))
+        .collect();
+    if cargo.len() != cargo_entities.len() || transports.is_empty() {
+        return 0;
+    }
+
+    fn search(
+        cargo: &[&CampaignUnitCandidate],
+        transports: &[&CampaignUnitCandidate],
+        index: usize,
+        assigned: &mut [u32],
+    ) -> usize {
+        if index == cargo.len() {
+            return 0;
+        }
+        let unit = cargo[index];
+        let mut best = search(cargo, transports, index.saturating_add(1), assigned);
+        for (transport_index, transport) in transports.iter().enumerate() {
+            if assigned[transport_index] >= transport.available_cargo_slots
+                || transport.island_id != unit.island_id
+                || !transport.loadable_unit_types.contains(&unit.unit_type)
+            {
+                continue;
+            }
+            assigned[transport_index] = assigned[transport_index].saturating_add(1);
+            best = best.max(1 + search(cargo, transports, index.saturating_add(1), assigned));
+            assigned[transport_index] = assigned[transport_index].saturating_sub(1);
+        }
+        best
+    }
+
+    search(&cargo, &transports, 0, &mut vec![0; transports.len()])
+}
+
+/// 洋上展開で不足する輸送スロットと、最小費用で全cargoを積める輸送種別を返す。
+fn remote_transport_shortfall(
+    cargo_entities: &[Entity],
+    transport_entities: &[Entity],
+    catalog: &HashMap<Entity, CampaignUnitCandidate>,
+    blueprints: &[CampaignTransportBlueprint],
+) -> Option<(UnitType, u32, u32)> {
+    let covered = campaign_transport_covered_count(cargo_entities, transport_entities, catalog);
+    let missing_slots = u32::try_from(cargo_entities.len().saturating_sub(covered)).ok()?;
+    if missing_slots == 0 {
+        return None;
+    }
+
+    let mut cargo_by_island: HashMap<IslandId, Vec<UnitType>> = HashMap::new();
+    for entity in cargo_entities {
+        let cargo = catalog.get(entity)?;
+        cargo_by_island
+            .entry(cargo.island_id?)
+            .or_default()
+            .push(cargo.unit_type);
+    }
+
+    let mut candidates = Vec::new();
+    for unit_type in [UnitType::TransportHelicopter, UnitType::Lander] {
+        let mut total_cost = 0_u32;
+        let mut possible = true;
+        for (source_island, cargo_types) in &cargo_by_island {
+            let Some(blueprint) = blueprints.iter().find(|blueprint| {
+                blueprint.unit_type == unit_type
+                    && blueprint.source_island == *source_island
+                    && cargo_types
+                        .iter()
+                        .all(|cargo_type| blueprint.loadable_unit_types.contains(cargo_type))
+            }) else {
+                possible = false;
+                break;
+            };
+            let units = u32::try_from(cargo_types.len())
+                .unwrap_or(u32::MAX)
+                .div_ceil(blueprint.cargo_slots.max(1));
+            total_cost = total_cost.saturating_add(units.saturating_mul(blueprint.cost));
+        }
+        if possible {
+            candidates.push((total_cost, campaign_unit_type_rank(unit_type), unit_type));
+        }
+    }
+    candidates.sort_unstable_by_key(|(cost, rank, _)| (*cost, *rank));
+    candidates
+        .first()
+        .map(|(cost, _, unit_type)| (*unit_type, missing_slots, *cost))
+}
+
 fn minimum_purchase_floor(
     decision: IslandCampaignDecision,
     missing_transport_slots: u32,
@@ -527,6 +883,7 @@ fn reserve_candidate(
     candidate: &IslandCampaignCandidate,
     pool: &CampaignResourcePool,
     catalog: &HashMap<Entity, CampaignUnitCandidate>,
+    allow_future_budget_reservation: bool,
 ) -> Option<(IslandCampaignAssignment, CampaignResourcePool)> {
     // 候補ごとのcloneへ全予約を適用し、完全編成を賄えない場合は元poolを一切変更しない。
     let mut provisional = pool.clone();
@@ -537,6 +894,7 @@ fn reserve_candidate(
     let mut combat_entities = Vec::new();
     let mut reserved_entity_value = 0_u32;
     let mut requirement_credit = 0_u32;
+    let mut remote_transport_demand = None;
     let existing = candidate.existing_operation.as_ref();
 
     if let Some(operation) = existing {
@@ -604,19 +962,21 @@ fn reserve_candidate(
     }
 
     let mut remaining_transport_slots = requirement.transport_slots;
-    let mut missing_lander = candidate.assessment.decision == IslandCampaignDecision::Assault;
-    let mut missing_helicopter = matches!(
-        candidate.assessment.decision,
-        IslandCampaignDecision::Expand | IslandCampaignDecision::Assault
-    );
+    let mut missing_assault_transports = candidate.assault_transport_types.clone();
+    let mut missing_helicopter = candidate.assessment.decision == IslandCampaignDecision::Expand;
     for entity in &transport_entities {
         let Some(unit) = catalog.get(entity) else {
             continue;
         };
-        if unit.unit_type == UnitType::Lander {
-            missing_lander = false;
+        if let Some(index) = missing_assault_transports
+            .iter()
+            .position(|required| *required == unit.unit_type)
+        {
+            missing_assault_transports.remove(index);
         }
-        if unit.unit_type == UnitType::TransportHelicopter {
+        if candidate.assessment.decision == IslandCampaignDecision::Expand
+            && unit.unit_type == UnitType::TransportHelicopter
+        {
             missing_helicopter = false;
         }
         let satisfies_transport_requirement = match candidate.assessment.decision {
@@ -632,14 +992,8 @@ fn reserve_candidate(
 
     let mut available = sorted_pool_units(&provisional, island_id);
     if candidate.assessment.decision == IslandCampaignDecision::Assault {
-        for required_type in [UnitType::Lander, UnitType::TransportHelicopter] {
-            let already_present = transport_entities
-                .iter()
-                .filter_map(|entity| catalog.get(entity))
-                .any(|unit| unit.unit_type == required_type);
-            if already_present {
-                continue;
-            }
+        let required_types = missing_assault_transports.clone();
+        for required_type in required_types {
             if let Some(index) = available.iter().position(|unit| {
                 unit.unit_type == required_type && is_offshore_transport(unit.unit_type)
             }) {
@@ -650,10 +1004,11 @@ fn reserve_candidate(
                 requirement_credit = requirement_credit.saturating_add(unit.cost);
                 reserved_entity_value = reserved_entity_value.saturating_add(unit.cost);
                 remove_entity(&mut provisional, unit.entity);
-                if required_type == UnitType::Lander {
-                    missing_lander = false;
-                } else {
-                    missing_helicopter = false;
+                if let Some(index) = missing_assault_transports
+                    .iter()
+                    .position(|missing| *missing == required_type)
+                {
+                    missing_assault_transports.remove(index);
                 }
             }
         }
@@ -722,15 +1077,48 @@ fn reserve_candidate(
             requirement_credit = requirement_credit.saturating_add(credited);
         }
     }
+    let assault_wave_is_frozen = candidate.assessment.decision == IslandCampaignDecision::Assault
+        && existing.is_some_and(|operation| {
+            operation.is_forming || is_live_campaign_transport_phase(operation.transport_phase)
+        });
     available = sorted_pool_units(&provisional, island_id);
-    while remaining_combat_budget > 0 {
+    while remaining_combat_budget > 0 && !assault_wave_is_frozen {
         let Some(index) = available.iter().position(|unit| {
-            !is_campaign_support_unit(unit.unit_type)
-                && (candidate.assessment.decision != IslandCampaignDecision::Defend
-                    || !unit.is_transporting
-                        && unit
-                            .reachable_positions
-                            .contains(&candidate.target_position))
+            if is_campaign_support_unit(unit.unit_type) {
+                return false;
+            }
+            if candidate.assessment.decision == IslandCampaignDecision::Defend {
+                return !unit.is_transporting
+                    && unit
+                        .reachable_positions
+                        .contains(&candidate.target_position);
+            }
+            if candidate.assessment.decision != IslandCampaignDecision::Assault
+                || unit.island_id == Some(island_id)
+                || unit
+                    .reachable_positions
+                    .contains(&candidate.target_position)
+            {
+                return true;
+            }
+
+            // 自力展開できない強襲支援は、現在の輸送役へcapture cargoと同時に
+            // 完全搭載できる分だけ予約する。容量超過をFormingへ積むと永続停滞する。
+            let mut remote_cargo: Vec<_> = capture_entities
+                .iter()
+                .chain(combat_entities.iter())
+                .copied()
+                .filter(|entity| {
+                    catalog.get(entity).is_some_and(|cargo| {
+                        cargo.island_id != Some(island_id)
+                            && !cargo
+                                .reachable_positions
+                                .contains(&candidate.target_position)
+                    })
+                })
+                .collect();
+            remote_cargo.push(unit.entity);
+            campaign_transport_package_covers(&remote_cargo, &transport_entities, catalog)
         }) else {
             break;
         };
@@ -749,16 +1137,20 @@ fn reserve_candidate(
             .chain(combat_entities.iter())
             .copied()
             .filter(|entity| {
-                catalog
-                    .get(entity)
-                    .is_some_and(|unit| !unit.is_transporting && unit.island_id != Some(island_id))
+                catalog.get(entity).is_some_and(|unit| {
+                    !unit.is_transporting
+                        && unit.island_id != Some(island_id)
+                        && !unit
+                            .reachable_positions
+                            .contains(&candidate.target_position)
+                })
             })
             .collect();
         if !remote_cargo.is_empty() {
-            // 洋上補強は、予約cargoと同じ出発島にいて全cargoを実搭載可能な輸送役も同時予約する。
+            // 後続波も総輸送枠だけでreadyにせず、cargoと同じ出発島から実搭載できることを確認する。
             available = sorted_pool_units(&provisional, island_id);
             while !campaign_transport_package_covers(&remote_cargo, &transport_entities, catalog) {
-                let index = available.iter().position(|transport| {
+                let Some(index) = available.iter().position(|transport| {
                     is_offshore_transport(transport.unit_type)
                         && remote_cargo.iter().any(|cargo| {
                             catalog.get(cargo).is_some_and(|cargo| {
@@ -766,20 +1158,31 @@ fn reserve_candidate(
                                     && transport.loadable_unit_types.contains(&cargo.unit_type)
                             })
                         })
-                })?;
+                }) else {
+                    // 既存輸送が無くても作戦を消さない。不足量を後段のpurchase_shortfallへ上げる。
+                    break;
+                };
                 let transport = available.remove(index);
                 push_unique_entity(&mut transport_entities, transport.entity);
                 reserved_entity_value = reserved_entity_value.saturating_add(transport.cost);
                 remove_entity(&mut provisional, transport.entity);
             }
+            if !campaign_transport_package_covers(&remote_cargo, &transport_entities, catalog) {
+                // 生産可能な輸送手段が無ければ、安全に完全パッケージを作れない。
+                let demand = remote_transport_shortfall(
+                    &remote_cargo,
+                    &transport_entities,
+                    catalog,
+                    &candidate.producible_transports,
+                )?;
+                remote_transport_demand = Some(demand);
+            }
         }
     }
 
-    if candidate.assessment.decision == IslandCampaignDecision::Assault {
-        remaining_transport_slots = u32::from(missing_lander)
-            .saturating_mul(2)
-            .saturating_add(u32::from(missing_helicopter).saturating_mul(2));
-    }
+    let missing_lander = missing_assault_transports.contains(&UnitType::Lander);
+    let missing_helicopter =
+        missing_helicopter || missing_assault_transports.contains(&UnitType::TransportHelicopter);
     let combat_purchase_floor = if remaining_combat_budget > 0 {
         // combat powerの端数も、実際に購入可能な最小unit 1体分を予約できなければ受理しない。
         candidate.minimum_combat_purchase_cost?
@@ -796,23 +1199,30 @@ fn reserve_candidate(
         remaining_combat_budget,
     )
     .max(combat_purchase_floor);
-    let purchase_budget = requirement
+    let base_purchase_budget = requirement
         .total_budget
         .saturating_sub(requirement_credit)
         .max(structural_floor);
-    if provisional.available_funds < purchase_budget {
+    // Reinforceの元要求は戦闘予算だけなので、実際のremote cargoから判明した輸送費を加算する。
+    let reinforcement_transport_budget = remote_transport_demand
+        .map(|(_, _, cost)| cost)
+        .unwrap_or(0);
+    let purchase_budget = base_purchase_budget.saturating_add(reinforcement_transport_budget);
+    if provisional.available_funds < purchase_budget && !allow_future_budget_reservation {
         return None;
     }
-    provisional.available_funds = provisional.available_funds.saturating_sub(purchase_budget);
+    // 最上位Assaultだけは現在資金を全額予約し、未達分を次ターンへ持ち越す。
+    // shortfallには必要総額を残し、allocated_budgetには実際に拘束した現金だけを記録する。
+    let reserved_funds = provisional.available_funds.min(purchase_budget);
+    provisional.available_funds = provisional.available_funds.saturating_sub(reserved_funds);
 
+    if let Some((_, slots, _)) = remote_transport_demand {
+        remaining_transport_slots = remaining_transport_slots.max(slots);
+    }
     let preferred_transport = if candidate.assessment.decision == IslandCampaignDecision::Assault {
-        if missing_lander {
-            Some(UnitType::Lander)
-        } else if missing_helicopter {
-            Some(UnitType::TransportHelicopter)
-        } else {
-            None
-        }
+        missing_assault_transports.first().copied()
+    } else if let Some((unit_type, _, _)) = remote_transport_demand {
+        Some(unit_type)
     } else if remaining_transport_slots > 0 {
         requirement.preferred_transport
     } else {
@@ -825,9 +1235,16 @@ fn reserve_candidate(
         combat_budget: remaining_combat_budget,
         total_budget: purchase_budget,
     };
-    let operation_ready = purchase_shortfall.transport_slots == 0
-        && purchase_shortfall.capture_units == 0
-        && purchase_shortfall.combat_budget == 0;
+    let structural_package_ready =
+        purchase_shortfall.transport_slots == 0 && purchase_shortfall.capture_units == 0;
+    // 強襲と兵站確保は上陸可能な輸送役と占領兵が揃った時点で出航する。
+    // 敵を上回り最小戦闘unit 1体分の損耗余裕を持つ護衛予算は維持するが、
+    // その調達待ちで橋頭堡到着を遅らせず、
+    // 利用可能な護衛を同行させながら不足分を後続増援として並行調達する。
+    let operation_ready = structural_package_ready
+        && (candidate.assessment.decision == IslandCampaignDecision::Assault
+            || candidate.logistics_prerequisite
+            || purchase_shortfall.combat_budget == 0);
     transport_entities.sort_by_key(|entity| entity.to_bits());
     capture_entities.sort_by_key(|entity| entity.to_bits());
     combat_entities.sort_by_key(|entity| entity.to_bits());
@@ -837,9 +1254,10 @@ fn reserve_candidate(
             island_id,
             decision: candidate.assessment.decision,
             target_position: candidate.target_position,
+            capture_target_positions: candidate.capture_target_positions.clone(),
             requirement: requirement.clone(),
             purchase_shortfall,
-            allocated_budget: reserved_entity_value.saturating_add(purchase_budget),
+            allocated_budget: reserved_entity_value.saturating_add(reserved_funds),
             transport_entities,
             capture_entities,
             combat_entities,
@@ -936,7 +1354,10 @@ fn reserve_secure_capture_units(
 ) {
     let mut secure_islands: Vec<_> = candidates
         .iter()
-        .filter(|candidate| candidate.assessment.decision == IslandCampaignDecision::Secure)
+        .filter(|candidate| {
+            candidate.assessment.decision == IslandCampaignDecision::Secure
+                && !candidate.logistics_prerequisite
+        })
         .map(|candidate| candidate.assessment.island_id)
         .collect();
     secure_islands.sort_by_key(|island_id| island_id.0);
@@ -974,9 +1395,19 @@ fn release_assignment(
     pool: &mut CampaignResourcePool,
     catalog: &HashMap<Entity, CampaignUnitCandidate>,
 ) {
-    pool.available_funds = pool
-        .available_funds
-        .saturating_add(assignment.purchase_shortfall.total_budget);
+    let mut assigned_entities = HashSet::new();
+    let assigned_entity_value = assignment
+        .transport_entities
+        .iter()
+        .chain(assignment.capture_entities.iter())
+        .chain(assignment.combat_entities.iter())
+        .filter(|entity| assigned_entities.insert(**entity))
+        .filter_map(|entity| catalog.get(entity))
+        .fold(0_u32, |total, unit| total.saturating_add(unit.cost));
+    let reserved_funds = assignment
+        .allocated_budget
+        .saturating_sub(assigned_entity_value);
+    pool.available_funds = pool.available_funds.saturating_add(reserved_funds);
     for entity in assignment
         .transport_entities
         .iter()
@@ -999,6 +1430,9 @@ pub(crate) fn allocate_campaign_portfolio(
     candidates: Vec<IslandCampaignCandidate>,
     mut pool: CampaignResourcePool,
 ) -> IslandCampaignPortfolio {
+    let logistics_prerequisite_pending = candidates
+        .iter()
+        .any(|candidate| candidate.logistics_prerequisite);
     let catalog: HashMap<_, _> = pool
         .units
         .iter()
@@ -1020,14 +1454,29 @@ pub(crate) fn allocate_campaign_portfolio(
                     | IslandCampaignDecision::Contest
                     | IslandCampaignDecision::Reinforce
                     | IslandCampaignDecision::Assault
-            )
+            ) || candidate.assessment.decision == IslandCampaignDecision::Secure
+                && candidate.logistics_prerequisite
         })
         .cloned()
         .collect();
     offenses.sort_by_key(offensive_priority_key);
     let mut active_offensives = Vec::new();
     for candidate in offenses {
-        if active_offensives.len() == 3 {
+        if logistics_prerequisite_pending
+            && !candidate.logistics_prerequisite
+            && candidate.existing_operation.is_none()
+            && candidate.assessment.decision == IslandCampaignDecision::Assault
+        {
+            mark_unallocated(
+                &mut assessments,
+                candidate.assessment.island_id,
+                IslandCampaignDecision::Observe,
+                "前進兵站拠点の確保まで新規強襲を待機する",
+                None,
+            );
+            continue;
+        }
+        if active_offensives.len() == MAX_ACTIVE_OFFENSIVES {
             if candidate.assessment.decision == IslandCampaignDecision::Contest {
                 restore_contest_assets(
                     candidate.assessment.island_id,
@@ -1044,7 +1493,14 @@ pub(crate) fn allocate_campaign_portfolio(
             );
             continue;
         }
-        if let Some((assignment, provisional)) = reserve_candidate(&candidate, &pool, &catalog) {
+        // 最上位の新規Assaultは全額がまだ無くても作戦として保持し、現在資金を
+        // 下位Expandへ流さず複数ターンで完全パッケージを調達する。
+        let allow_future_budget_reservation = active_offensives.is_empty()
+            && (candidate.assessment.decision == IslandCampaignDecision::Assault
+                || candidate.logistics_prerequisite);
+        if let Some((assignment, provisional)) =
+            reserve_candidate(&candidate, &pool, &catalog, allow_future_budget_reservation)
+        {
             pool = provisional;
             if candidate.assessment.decision == IslandCampaignDecision::Contest {
                 contest_protections.remove(&candidate.assessment.island_id);
@@ -1099,7 +1555,8 @@ pub(crate) fn allocate_campaign_portfolio(
     let mut defenses = Vec::new();
     for candidate in defense_candidates {
         loop {
-            if let Some((assignment, provisional)) = reserve_candidate(&candidate, &pool, &catalog)
+            if let Some((assignment, provisional)) =
+                reserve_candidate(&candidate, &pool, &catalog, false)
             {
                 pool = provisional;
                 update_assessment_for_assignment(&mut assessments, &assignment);
@@ -1175,9 +1632,13 @@ fn ceil_div(numerator: u32, denominator: u32) -> u32 {
     numerator / denominator + u32::from(!numerator.is_multiple_of(denominator))
 }
 
-/// u64へ拡張してから敵戦力の120%を切り上げ計算し、u32の乗算オーバーフローを防ぐ。
-fn ceil_scale_to_120_percent(value: u32) -> u64 {
-    u64::from(value).saturating_mul(12).saturating_add(9) / 10
+/// 敵戦力を厳密に上回り、さらに実配備可能な最小戦闘unit 1体分を損耗余裕として持つ。
+/// 固定比率を使わないため、小規模戦では過剰投入を避け、大規模戦では余裕率が自然に縮む。
+pub(crate) fn combat_overmatch_requirement(enemy_combat_value: u32, reserve_unit_cost: u32) -> u32 {
+    if enemy_combat_value == 0 {
+        return 0;
+    }
+    enemy_combat_value.saturating_add(reserve_unit_cost.max(1))
 }
 
 /// 輸送・占領・不足パッケージ回収を合わせた投資回収ターン数を計算する。
@@ -1199,14 +1660,14 @@ pub fn calculate_expansion_payback_turns(
     )
 }
 
-/// 固定費と敵戦力の120%を合算し、最低侵攻予算を下回らない値を返す。
+/// 固定費と「敵戦力＋最小戦闘unit 1体」を合算し、最低侵攻予算を下回らない値を返す。
 pub fn required_assault_budget(enemy_combat_value: u32) -> u32 {
     const FIXED_COST: u64 = 22_500;
     const COMBAT_FLOOR: u64 = 10_200;
 
     // 合計がu32上限を超える場合だけ最終結果を飽和させる。
-    let scaled_enemy_value = ceil_scale_to_120_percent(enemy_combat_value);
-    let total = FIXED_COST.saturating_add(COMBAT_FLOOR.max(scaled_enemy_value));
+    let overmatch = u64::from(combat_overmatch_requirement(enemy_combat_value, 1_000));
+    let total = FIXED_COST.saturating_add(COMBAT_FLOOR.max(overmatch));
 
     u32::try_from(total).unwrap_or(u32::MAX)
 }
@@ -1229,11 +1690,9 @@ pub fn decide_contested(
         return IslandCampaignDecision::Contest;
     }
 
-    // 補強後戦力は敵戦力の120%に届く完全パッケージの場合だけ採用する。
-    let required_reinforced_power = ceil_scale_to_120_percent(facts.enemy_combat_value);
-    if can_allocate_reinforcement
-        && u64::from(reinforced_friendly_power) >= required_reinforced_power
-    {
+    // 補強後戦力は同数で止めず、最小戦闘unit 1体分だけ上回る場合に採用する。
+    let required_reinforced_power = combat_overmatch_requirement(facts.enemy_combat_value, 1_000);
+    if can_allocate_reinforcement && reinforced_friendly_power >= required_reinforced_power {
         return IslandCampaignDecision::Reinforce;
     }
     if has_better_open_neutral {
@@ -1349,6 +1808,7 @@ pub fn assess_island(facts: &IslandCampaignFacts) -> IslandCampaignAssessment {
 mod tests {
     use super::*;
     use crate::ai::islands::IslandId;
+    use crate::resources::{GridTopology, Terrain};
     use std::collections::HashSet;
 
     fn facts_for_empty_neutral_island() -> IslandCampaignFacts {
@@ -1537,10 +1997,10 @@ mod tests {
     }
 
     #[test]
-    fn calculates_enemy_held_budget_floor_and_scaled_budget() {
+    fn calculates_enemy_held_budget_floor_and_discrete_overmatch_budget() {
         assert_eq!(required_assault_budget(0), 32_700);
         assert_eq!(required_assault_budget(8_500), 32_700);
-        assert_eq!(required_assault_budget(10_000), 34_500);
+        assert_eq!(required_assault_budget(10_000), 33_500);
         assert_eq!(required_assault_budget(u32::MAX), u32::MAX);
     }
 
@@ -1564,7 +2024,7 @@ mod tests {
             IslandCampaignDecision::Withdraw,
         );
         assert_eq!(
-            decide_contested(&facts_with_power(8_000, 10_000), 11_999, true, true),
+            decide_contested(&facts_with_power(8_000, 10_000), 10_999, true, true),
             IslandCampaignDecision::Withdraw,
         );
         assert_eq!(
@@ -1637,7 +2097,7 @@ mod tests {
         let enemy_held = assess_island(&enemy_held_facts);
         assert_eq!(enemy_held.state, IslandCampaignState::EnemyHeld);
         assert_eq!(enemy_held.decision, IslandCampaignDecision::Assault);
-        assert_eq!(enemy_held.required_budget, 34_500);
+        assert_eq!(enemy_held.required_budget, 33_500);
         assert_eq!(enemy_held.allocated_budget, 0);
         assert_eq!(
             enemy_held.decision_reason,
@@ -1684,8 +2144,18 @@ mod tests {
         IslandCampaignCandidate {
             assessment,
             target_position: GridPosition { x: island, y: 0 },
+            capture_target_positions: vec![GridPosition { x: island, y: 0 }],
             roi_production_sites: 0,
             transport_eta: Some(1),
+            ground_sustainment_sites: 1,
+            air_sustainment_sites: 0,
+            sea_sustainment_sites: 0,
+            sustainment_targets: CampaignSustainmentTargets {
+                ground: Some(GridPosition { x: island, y: 0 }),
+                ..CampaignSustainmentTargets::default()
+            },
+            island_income_per_turn: 1_000,
+            logistics_prerequisite: false,
             requirement: IslandCampaignRequirement {
                 preferred_transport: Some(UnitType::TransportHelicopter),
                 transport_slots: 2,
@@ -1693,9 +2163,258 @@ mod tests {
                 combat_budget: 0,
                 total_budget: 6_000,
             },
+            assault_transport_types: Vec::new(),
             minimum_combat_purchase_cost: Some(1_000),
+            producible_transports: test_transport_blueprints(),
             existing_operation: None,
         }
+    }
+
+    fn test_transport_blueprints() -> Vec<CampaignTransportBlueprint> {
+        (0..=16)
+            .flat_map(|source_island| {
+                [
+                    CampaignTransportBlueprint {
+                        unit_type: UnitType::TransportHelicopter,
+                        cost: 4_000,
+                        cargo_slots: 2,
+                        loadable_unit_types: vec![UnitType::Infantry, UnitType::Mech],
+                        source_island: IslandId(source_island),
+                    },
+                    CampaignTransportBlueprint {
+                        unit_type: UnitType::Lander,
+                        cost: 16_500,
+                        cargo_slots: 2,
+                        loadable_unit_types: vec![
+                            UnitType::Infantry,
+                            UnitType::Mech,
+                            UnitType::Recon,
+                            UnitType::Tank,
+                            UnitType::MdTank,
+                            UnitType::Artillery,
+                        ],
+                        source_island: IslandId(source_island),
+                    },
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn promotes_matching_forward_airfield_allows_parallel_expansion_and_blocks_assault() {
+        let map = Map::new(12, 3, Terrain::Sea, GridTopology::Square);
+        let mut airfield = expansion_candidate(1, 6);
+        airfield.target_position = GridPosition { x: 4, y: 1 };
+        airfield.transport_eta = Some(2);
+        airfield.air_sustainment_sites = 1;
+        airfield.sustainment_targets.air = Some(GridPosition { x: 4, y: 1 });
+        airfield.island_income_per_turn = 3_000;
+
+        // 敵に近い都市だけの島より、侵攻波の輸送ヘリも再補給できる空港島を選ぶ。
+        let mut city_only = expansion_candidate(2, 4);
+        city_only.target_position = GridPosition { x: 8, y: 1 };
+        city_only.transport_eta = Some(2);
+        city_only.island_income_per_turn = 4_000;
+
+        let mut assault = assault_candidate(9);
+        assault.target_position = GridPosition { x: 10, y: 1 };
+        assault.transport_eta = Some(5);
+        assault.assault_transport_types = vec![UnitType::TransportHelicopter];
+
+        let mut candidates = vec![city_only, assault, airfield];
+        promote_logistics_prerequisite(
+            &mut candidates,
+            &map,
+            14_000,
+            14_000,
+            CampaignSustainmentCoverage::default(),
+            Some(GridPosition { x: 0, y: 1 }),
+        );
+
+        assert!(candidates[2].logistics_prerequisite);
+        assert!(!candidates[0].logistics_prerequisite);
+        assert_eq!(candidates[2].target_position, GridPosition { x: 4, y: 1 });
+        let portfolio = allocate_campaign_portfolio(
+            candidates,
+            CampaignResourcePool {
+                available_funds: 12_000,
+                units: Vec::new(),
+            },
+        );
+        let active_islands: Vec<_> = portfolio
+            .active_offensives
+            .iter()
+            .map(|assignment| assignment.island_id)
+            .collect();
+        assert_eq!(active_islands, vec![IslandId(1), IslandId(2)]);
+        let assault_assessment = portfolio
+            .islands
+            .iter()
+            .find(|assessment| assessment.island_id == IslandId(9))
+            .unwrap();
+        assert_eq!(assault_assessment.decision, IslandCampaignDecision::Observe);
+        assert_eq!(
+            assault_assessment.decision_reason,
+            "前進兵站拠点の確保まで新規強襲を待機する"
+        );
+    }
+
+    #[test]
+    fn contested_logistics_operation_stays_prioritized_and_advances_to_ground_facility() {
+        let map = Map::new(12, 3, Terrain::Sea, GridTopology::Square);
+        let mut bridgehead = expansion_candidate(1, 6);
+        bridgehead.assessment.state = IslandCampaignState::Contested;
+        bridgehead.assessment.decision = IslandCampaignDecision::Contest;
+        bridgehead.assessment.friendly_properties = 1;
+        bridgehead.target_position = GridPosition { x: 4, y: 1 };
+        bridgehead.air_sustainment_sites = 1;
+        bridgehead.sustainment_targets = CampaignSustainmentTargets {
+            ground: Some(GridPosition { x: 5, y: 1 }),
+            air: None,
+            sea: None,
+        };
+        bridgehead.existing_operation = Some(ExistingCampaignOperation {
+            island_id: IslandId(1),
+            target_position: GridPosition { x: 4, y: 1 },
+            transport_phase: Some(TransportPhase::Drop),
+            is_forming: false,
+            transport_entities: Vec::new(),
+            capture_entities: Vec::new(),
+            combat_entities: Vec::new(),
+        });
+        let mut assault = assault_candidate(9);
+        assault.target_position = GridPosition { x: 10, y: 1 };
+        assault.transport_eta = Some(5);
+        assault.assault_transport_types = vec![UnitType::TransportHelicopter];
+        let mut candidates = vec![bridgehead, assault];
+
+        promote_logistics_prerequisite(
+            &mut candidates,
+            &map,
+            14_000,
+            16_000,
+            CampaignSustainmentCoverage {
+                ground: false,
+                air: true,
+                sea: false,
+            },
+            Some(GridPosition { x: 0, y: 1 }),
+        );
+
+        assert!(candidates[0].logistics_prerequisite);
+        assert_eq!(candidates[0].target_position, GridPosition { x: 5, y: 1 });
+        assert_eq!(offensive_priority_key(&candidates[0]).1, 0);
+    }
+
+    #[test]
+    fn landed_logistics_assault_keeps_lightweight_structural_package() {
+        let map = Map::new(12, 3, Terrain::Sea, GridTopology::Square);
+        let mut bridgehead = assault_candidate(1);
+        bridgehead.target_position = GridPosition { x: 4, y: 1 };
+        bridgehead.air_sustainment_sites = 1;
+        bridgehead.sustainment_targets = CampaignSustainmentTargets {
+            ground: Some(GridPosition { x: 5, y: 1 }),
+            air: None,
+            sea: None,
+        };
+        bridgehead.existing_operation = Some(ExistingCampaignOperation {
+            island_id: IslandId(1),
+            target_position: GridPosition { x: 4, y: 1 },
+            transport_phase: Some(TransportPhase::Drop),
+            is_forming: false,
+            transport_entities: Vec::new(),
+            capture_entities: Vec::new(),
+            combat_entities: Vec::new(),
+        });
+        let mut enemy_home = assault_candidate(9);
+        enemy_home.target_position = GridPosition { x: 10, y: 1 };
+        enemy_home.transport_eta = Some(5);
+        enemy_home.assault_transport_types = vec![UnitType::TransportHelicopter];
+        let mut candidates = vec![bridgehead, enemy_home];
+
+        promote_logistics_prerequisite(
+            &mut candidates,
+            &map,
+            14_000,
+            16_000,
+            CampaignSustainmentCoverage {
+                ground: false,
+                air: true,
+                sea: false,
+            },
+            Some(GridPosition { x: 0, y: 1 }),
+        );
+
+        let bridgehead = &candidates[0];
+        assert!(bridgehead.logistics_prerequisite);
+        assert_eq!(bridgehead.target_position, GridPosition { x: 5, y: 1 });
+        assert_eq!(
+            bridgehead.requirement.preferred_transport,
+            Some(UnitType::TransportHelicopter)
+        );
+        assert_eq!(bridgehead.requirement.transport_slots, 2);
+        assert_eq!(bridgehead.requirement.capture_units, 2);
+        assert_eq!(bridgehead.requirement.combat_budget, 0);
+        assert_eq!(bridgehead.requirement.total_budget, 6_000);
+        assert!(bridgehead.assault_transport_types.is_empty());
+    }
+
+    #[test]
+    fn skips_logistics_prerequisite_after_income_parity_and_forward_base() {
+        let map = Map::new(12, 3, Terrain::Sea, GridTopology::Square);
+        let mut expansion = expansion_candidate(1, 6);
+        expansion.air_sustainment_sites = 1;
+        let mut assault = assault_candidate(9);
+        assault.transport_eta = Some(5);
+        assault.assault_transport_types = vec![UnitType::TransportHelicopter];
+        let mut candidates = vec![expansion, assault];
+
+        promote_logistics_prerequisite(
+            &mut candidates,
+            &map,
+            14_000,
+            14_000,
+            CampaignSustainmentCoverage {
+                ground: true,
+                air: true,
+                sea: false,
+            },
+            Some(GridPosition { x: 0, y: 1 }),
+        );
+
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| !candidate.logistics_prerequisite)
+        );
+    }
+
+    #[test]
+    fn does_not_mistake_home_island_cleanup_for_a_forward_logistics_base() {
+        let map = Map::new(12, 3, Terrain::Sea, GridTopology::Square);
+        let mut home_cleanup = secure_candidate(0);
+        home_cleanup.assessment.friendly_properties = 8;
+        home_cleanup.ground_sustainment_sites = 6;
+        home_cleanup.air_sustainment_sites = 2;
+        home_cleanup.sustainment_targets = CampaignSustainmentTargets::default();
+        let mut forward_airfield = expansion_candidate(3, 8);
+        forward_airfield.air_sustainment_sites = 1;
+        let mut assault = assault_candidate(9);
+        assault.transport_eta = Some(5);
+        assault.assault_transport_types = vec![UnitType::TransportHelicopter];
+        let mut candidates = vec![home_cleanup, forward_airfield, assault];
+
+        promote_logistics_prerequisite(
+            &mut candidates,
+            &map,
+            14_000,
+            14_000,
+            CampaignSustainmentCoverage::default(),
+            Some(GridPosition { x: 0, y: 1 }),
+        );
+
+        assert!(!candidates[0].logistics_prerequisite);
+        assert!(candidates[1].logistics_prerequisite);
     }
 
     fn unit_candidate(
@@ -1775,6 +2494,91 @@ mod tests {
         assert!(portfolio.assignment_for(IslandId(3)).is_none());
     }
 
+    /// 敵拠点を持つ島を中立拡張だけで攻勢上限から押し出さない。
+    #[test]
+    fn allocates_assault_before_new_neutral_expansions() {
+        let portfolio = allocate_campaign_portfolio(
+            vec![
+                expansion_candidate(2, 6),
+                expansion_candidate(1, 5),
+                assault_candidate(9),
+                expansion_candidate(0, 4),
+            ],
+            CampaignResourcePool {
+                available_funds: 45_000,
+                units: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            portfolio
+                .active_offensives
+                .iter()
+                .map(|assignment| assignment.island_id)
+                .collect::<Vec<_>>(),
+            vec![IslandId(9), IslandId(0), IslandId(1)]
+        );
+        assert_eq!(
+            portfolio
+                .assignment_for(IslandId(9))
+                .map(|assignment| assignment.decision),
+            Some(IslandCampaignDecision::Assault)
+        );
+    }
+
+    /// 最上位Assaultは全額が貯まる前から保持し、現在資金を中立拡張へ流さない。
+    #[test]
+    fn underfunded_primary_assault_reserves_current_funds_across_turns() {
+        let portfolio = allocate_campaign_portfolio(
+            vec![
+                expansion_candidate(1, 5),
+                assault_candidate(9),
+                expansion_candidate(0, 4),
+            ],
+            CampaignResourcePool {
+                available_funds: 14_000,
+                units: Vec::new(),
+            },
+        );
+
+        assert_eq!(portfolio.active_offensives.len(), 1);
+        let assault = &portfolio.active_offensives[0];
+        assert_eq!(assault.island_id, IslandId(9));
+        assert_eq!(assault.decision, IslandCampaignDecision::Assault);
+        assert_eq!(assault.allocated_budget, 14_000);
+        assert_eq!(assault.purchase_shortfall.total_budget, 32_700);
+        assert!(!assault.operation_ready);
+    }
+
+    /// 未積立分まで返金するphantom fundsを作らず、防衛preempt後も実資金以上を配らない。
+    #[test]
+    fn defense_preemption_refunds_only_funds_reserved_for_underfunded_assault() {
+        let portfolio = allocate_campaign_portfolio(
+            vec![
+                assault_candidate(9),
+                defense_candidate(10, 1, 10_000),
+                defense_candidate(11, 1, 10_000),
+            ],
+            CampaignResourcePool {
+                available_funds: 14_000,
+                units: Vec::new(),
+            },
+        );
+
+        assert!(portfolio.active_offensives.is_empty());
+        assert_eq!(portfolio.defenses.len(), 1);
+        assert_eq!(portfolio.defenses[0].island_id, IslandId(10));
+        assert_eq!(portfolio.defenses[0].allocated_budget, 10_000);
+        assert_eq!(
+            portfolio
+                .islands
+                .iter()
+                .find(|assessment| assessment.island_id == IslandId(9))
+                .and_then(|assessment| assessment.pause_cause),
+            Some(IslandCampaignPauseCause::DefensePreemption)
+        );
+    }
+
     #[test]
     fn allocates_each_transport_entity_to_only_one_island() {
         let candidates = vec![expansion_candidate(0, 4), expansion_candidate(1, 5)];
@@ -1822,8 +2626,15 @@ mod tests {
                 IslandCampaignDecision::Secure,
             ),
             target_position: GridPosition { x: island, y: 0 },
+            capture_target_positions: vec![GridPosition { x: island, y: 0 }],
             roi_production_sites: 0,
             transport_eta: Some(0),
+            ground_sustainment_sites: 1,
+            air_sustainment_sites: 0,
+            sea_sustainment_sites: 0,
+            sustainment_targets: CampaignSustainmentTargets::default(),
+            island_income_per_turn: 1_000,
+            logistics_prerequisite: false,
             requirement: IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
@@ -1831,7 +2642,9 @@ mod tests {
                 combat_budget: 0,
                 total_budget: 0,
             },
+            assault_transport_types: Vec::new(),
             minimum_combat_purchase_cost: Some(1_000),
+            producible_transports: test_transport_blueprints(),
             existing_operation: None,
         }
     }
@@ -1849,8 +2662,15 @@ mod tests {
         IslandCampaignCandidate {
             assessment,
             target_position: GridPosition { x: island, y: 1 },
+            capture_target_positions: vec![GridPosition { x: island, y: 1 }],
             roi_production_sites: 0,
             transport_eta: Some(0),
+            ground_sustainment_sites: 0,
+            air_sustainment_sites: 0,
+            sea_sustainment_sites: 0,
+            sustainment_targets: CampaignSustainmentTargets::default(),
+            island_income_per_turn: 0,
+            logistics_prerequisite: false,
             requirement: IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
@@ -1858,7 +2678,9 @@ mod tests {
                 combat_budget: 0,
                 total_budget: 0,
             },
+            assault_transport_types: Vec::new(),
             minimum_combat_purchase_cost: Some(1_000),
+            producible_transports: test_transport_blueprints(),
             existing_operation: None,
         }
     }
@@ -1874,8 +2696,15 @@ mod tests {
         IslandCampaignCandidate {
             assessment,
             target_position: GridPosition { x: island, y: 1 },
+            capture_target_positions: vec![GridPosition { x: island, y: 1 }],
             roi_production_sites: 0,
             transport_eta: Some(0),
+            ground_sustainment_sites: 0,
+            air_sustainment_sites: 0,
+            sea_sustainment_sites: 0,
+            sustainment_targets: CampaignSustainmentTargets::default(),
+            island_income_per_turn: 0,
+            logistics_prerequisite: false,
             requirement: IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
@@ -1883,7 +2712,9 @@ mod tests {
                 combat_budget: required_power,
                 total_budget: required_power,
             },
+            assault_transport_types: Vec::new(),
             minimum_combat_purchase_cost: Some(1_000),
+            producible_transports: test_transport_blueprints(),
             existing_operation: None,
         }
     }
@@ -1899,8 +2730,15 @@ mod tests {
         IslandCampaignCandidate {
             assessment,
             target_position: GridPosition { x: island, y: 1 },
+            capture_target_positions: vec![GridPosition { x: island, y: 1 }],
             roi_production_sites: 0,
             transport_eta: Some(2),
+            ground_sustainment_sites: 1,
+            air_sustainment_sites: 0,
+            sea_sustainment_sites: 0,
+            sustainment_targets: CampaignSustainmentTargets::default(),
+            island_income_per_turn: 1_000,
+            logistics_prerequisite: false,
             requirement: IslandCampaignRequirement {
                 preferred_transport: Some(UnitType::Lander),
                 transport_slots: 4,
@@ -1908,7 +2746,9 @@ mod tests {
                 combat_budget: 10_200,
                 total_budget: 32_700,
             },
+            assault_transport_types: vec![UnitType::Lander, UnitType::TransportHelicopter],
             minimum_combat_purchase_cost: Some(1_000),
+            producible_transports: test_transport_blueprints(),
             existing_operation: None,
         }
     }
@@ -1928,8 +2768,15 @@ mod tests {
         IslandCampaignCandidate {
             assessment,
             target_position: GridPosition { x: island, y: 1 },
+            capture_target_positions: vec![GridPosition { x: island, y: 1 }],
             roi_production_sites: 0,
             transport_eta: None,
+            ground_sustainment_sites: 1,
+            air_sustainment_sites: 0,
+            sea_sustainment_sites: 0,
+            sustainment_targets: CampaignSustainmentTargets::default(),
+            island_income_per_turn: 1_000,
+            logistics_prerequisite: false,
             requirement: IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
@@ -1937,7 +2784,9 @@ mod tests {
                 combat_budget: enemy_value,
                 total_budget: enemy_value,
             },
+            assault_transport_types: Vec::new(),
             minimum_combat_purchase_cost: Some(1_000),
+            producible_transports: test_transport_blueprints(),
             existing_operation: None,
         }
     }
@@ -2330,6 +3179,58 @@ mod tests {
         assert!(assignment.operation_ready);
     }
 
+    /// 別島の増援戦力に輸送役が無い場合も作戦を消さず、Lander不足として生産へ返す。
+    #[test]
+    fn reinforcement_without_transport_reports_heavy_transport_shortfall() {
+        let tank = Entity::from_raw(142);
+        let candidate = reinforcement_candidate(0, 7_000);
+        let mut remote_tank = unit_candidate(142, UnitType::Tank, 7_000, false, 0);
+        remote_tank.island_id = Some(IslandId(1));
+        remote_tank.reachable_positions.clear();
+
+        let portfolio = allocate_campaign_portfolio(
+            vec![candidate],
+            CampaignResourcePool {
+                available_funds: 16_500,
+                units: vec![remote_tank],
+            },
+        );
+
+        let assignment = &portfolio.active_offensives[0];
+        assert_eq!(assignment.decision, IslandCampaignDecision::Reinforce);
+        assert_eq!(assignment.combat_entities, vec![tank]);
+        assert_eq!(
+            assignment.purchase_shortfall.preferred_transport,
+            Some(UnitType::Lander)
+        );
+        assert_eq!(assignment.purchase_shortfall.transport_slots, 1);
+        assert_eq!(assignment.purchase_shortfall.total_budget, 16_500);
+        assert!(!assignment.operation_ready);
+    }
+
+    /// 目標島にいる増援は陸路で合流できるため、輸送shortfallを立てない。
+    #[test]
+    fn local_reinforcement_does_not_request_transport() {
+        let tank = Entity::from_raw(143);
+        let candidate = reinforcement_candidate(0, 7_000);
+        let mut local_tank = unit_candidate(143, UnitType::Tank, 7_000, false, 0);
+        local_tank.island_id = Some(IslandId(0));
+
+        let portfolio = allocate_campaign_portfolio(
+            vec![candidate],
+            CampaignResourcePool {
+                available_funds: 0,
+                units: vec![local_tank],
+            },
+        );
+
+        let assignment = &portfolio.active_offensives[0];
+        assert_eq!(assignment.combat_entities, vec![tank]);
+        assert_eq!(assignment.purchase_shortfall.transport_slots, 0);
+        assert_eq!(assignment.purchase_shortfall.preferred_transport, None);
+        assert!(assignment.operation_ready);
+    }
+
     #[test]
     fn allocates_competitive_contest_assets_before_expand_can_consume_them() {
         let contested_infantry = Entity::from_raw(43);
@@ -2513,11 +3414,17 @@ mod tests {
                 units: units.clone(),
             },
         );
-        assert!(underfunded.active_offensives.is_empty());
+        let underfunded_assignment = &underfunded.active_offensives[0];
         assert_eq!(
-            underfunded.islands[0].decision,
-            IslandCampaignDecision::Observe
+            underfunded_assignment.decision,
+            IslandCampaignDecision::Assault
         );
+        assert_eq!(underfunded_assignment.allocated_budget, 30_700);
+        assert_eq!(
+            underfunded_assignment.purchase_shortfall.combat_budget,
+            10_200
+        );
+        assert!(underfunded_assignment.operation_ready);
 
         let funded = allocate_campaign_portfolio(
             vec![candidate],
@@ -2533,7 +3440,80 @@ mod tests {
         assert_eq!(assignment.purchase_shortfall.combat_budget, 10_200);
         assert_eq!(assignment.purchase_shortfall.total_budget, 10_200);
         assert_eq!(assignment.allocated_budget, 32_700);
-        assert!(!assignment.operation_ready);
+        assert!(assignment.operation_ready);
+    }
+
+    #[test]
+    fn assault_reserves_only_remote_combat_that_fits_with_capture_cargo() {
+        let mut units = vec![
+            unit_candidate(60, UnitType::Lander, 16_500, false, 2),
+            unit_candidate(61, UnitType::TransportHelicopter, 4_000, false, 2),
+            unit_candidate(62, UnitType::Infantry, 1_000, true, 0),
+            unit_candidate(63, UnitType::Infantry, 1_000, true, 0),
+        ];
+        units
+            .extend((64..69).map(|entity| unit_candidate(entity, UnitType::Mech, 3_000, false, 0)));
+        for unit in &mut units {
+            unit.island_id = Some(IslandId(0));
+            unit.reachable_positions.clear();
+        }
+
+        let portfolio = allocate_campaign_portfolio(
+            vec![assault_candidate(9)],
+            CampaignResourcePool {
+                available_funds: 10_200,
+                units,
+            },
+        );
+
+        let assignment = &portfolio.active_offensives[0];
+        assert_eq!(assignment.capture_entities.len(), 2);
+        assert_eq!(assignment.combat_entities.len(), 2);
+        assert_eq!(assignment.purchase_shortfall.combat_budget, 4_200);
+        assert!(assignment.operation_ready);
+    }
+
+    #[test]
+    fn live_assault_wave_does_not_add_late_combat_cargo() {
+        let lander = Entity::from_raw(70);
+        let helicopter = Entity::from_raw(71);
+        let capture_a = Entity::from_raw(72);
+        let capture_b = Entity::from_raw(73);
+        let mut candidate = assault_candidate(9);
+        candidate.existing_operation = Some(ExistingCampaignOperation {
+            island_id: IslandId(9),
+            target_position: candidate.target_position,
+            transport_phase: Some(TransportPhase::Pickup),
+            is_forming: false,
+            transport_entities: vec![lander, helicopter],
+            capture_entities: vec![capture_a, capture_b],
+            combat_entities: Vec::new(),
+        });
+        let mut units = vec![
+            unit_candidate(70, UnitType::Lander, 16_500, false, 2),
+            unit_candidate(71, UnitType::TransportHelicopter, 4_000, false, 2),
+            unit_candidate(72, UnitType::Infantry, 1_000, true, 0),
+            unit_candidate(73, UnitType::Infantry, 1_000, true, 0),
+            unit_candidate(74, UnitType::Mech, 3_000, false, 0),
+        ];
+        for unit in &mut units {
+            unit.island_id = Some(IslandId(0));
+            unit.assigned_island = Some(IslandId(9));
+            unit.reachable_positions.clear();
+        }
+
+        let portfolio = allocate_campaign_portfolio(
+            vec![candidate],
+            CampaignResourcePool {
+                available_funds: 10_200,
+                units,
+            },
+        );
+
+        let assignment = &portfolio.active_offensives[0];
+        assert!(assignment.combat_entities.is_empty());
+        assert_eq!(assignment.purchase_shortfall.combat_budget, 10_200);
+        assert!(assignment.operation_ready);
     }
 
     #[test]
@@ -2599,6 +3579,7 @@ mod tests {
             island_id: IslandId(island),
             decision,
             target_position,
+            capture_target_positions: vec![target_position],
             requirement: IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
@@ -2669,11 +3650,29 @@ mod tests {
             vec![
                 (0, IslandId(0)),
                 (1, IslandId(1)),
-                (2, IslandId(2)),
-                (3, IslandId(3)),
-                (4, IslandId(4)),
+                (2, IslandId(4)),
+                (3, IslandId(2)),
+                (4, IslandId(3)),
             ]
         );
+    }
+
+    #[test]
+    fn ready_assault_delegates_remaining_combat_to_generic_operations() {
+        let mut assault = assignment_with_shortfall(
+            4,
+            IslandCampaignDecision::Assault,
+            true,
+            GridPosition { x: 4, y: 0 },
+        );
+        assault.operation_ready = true;
+        let portfolio = IslandCampaignPortfolio {
+            islands: Vec::new(),
+            active_offensives: vec![assault],
+            defenses: Vec::new(),
+        };
+
+        assert!(portfolio.aggregate_missing_requirements().is_empty());
     }
 
     #[test]
@@ -2742,8 +3741,15 @@ mod tests {
         let candidate = IslandCampaignCandidate {
             assessment,
             target_position: GridPosition { x: 0, y: 0 },
+            capture_target_positions: vec![GridPosition { x: 0, y: 0 }],
             roi_production_sites: 0,
             transport_eta: Some(2),
+            ground_sustainment_sites: 1,
+            air_sustainment_sites: 0,
+            sea_sustainment_sites: 0,
+            sustainment_targets: CampaignSustainmentTargets::default(),
+            island_income_per_turn: 1_000,
+            logistics_prerequisite: false,
             requirement: IslandCampaignRequirement {
                 preferred_transport: Some(UnitType::Lander),
                 transport_slots: 4,
@@ -2751,7 +3757,9 @@ mod tests {
                 combat_budget: 10_200,
                 total_budget: 32_700,
             },
+            assault_transport_types: vec![UnitType::Lander, UnitType::TransportHelicopter],
             minimum_combat_purchase_cost: Some(1_000),
+            producible_transports: test_transport_blueprints(),
             existing_operation: None,
         };
 

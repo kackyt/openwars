@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use bevy_ecs::prelude::*;
 
@@ -659,7 +659,7 @@ fn secure_does_not_assign_a_disconnected_capture_unit() {
 }
 
 #[test]
-fn contest_assigns_distinct_local_capture_and_attack_responsibilities() {
+fn contest_preserves_capture_while_combat_intercepts_capture_threat() {
     let (mut world, master_data, player) = empty_v3_world();
     let opponent = PlayerId(2);
     let home = GridPosition { x: 0, y: 0 };
@@ -715,18 +715,21 @@ fn contest_assigns_distinct_local_capture_and_attack_responsibilities() {
     assert_eq!(capture_squad.target_island, Some(island));
     assert_eq!(capture_squad.target, Some(neutral));
 
-    let attack_squad = manager
+    let interception_squad = manager
         .squads
         .iter()
         .find(|squad| squad.members.contains(&combat))
-        .expect("Contest combat Entity must keep an attack duty");
-    assert_eq!(attack_squad.mission_type, MissionType::Attack);
-    assert_eq!(attack_squad.target_island, Some(island));
+        .expect("Contest combat Entity must intercept the immediate capture threat");
+    assert!(matches!(
+        interception_squad.mission_type,
+        MissionType::Interception(_)
+    ));
+    assert_eq!(interception_squad.target_island, None);
     assert_eq!(
-        attack_squad.target,
+        interception_squad.target,
         world.get::<GridPosition>(enemy).copied()
     );
-    assert!(!attack_squad.members.contains(&capture));
+    assert!(!interception_squad.members.contains(&capture));
     assert!(!capture_squad.members.contains(&combat));
 }
 
@@ -782,7 +785,7 @@ fn defend_uses_reserved_combat_entities_and_assignment_target() {
             .all(|entity| [tank_a, tank_b].contains(entity))
     );
     let expected_target = defense.target_position;
-    let expected_members: HashSet<_> = defense.combat_entities.iter().copied().collect();
+    let expected_members: BTreeSet<_> = defense.combat_entities.iter().copied().collect();
 
     plan_squads(&mut world, player);
 
@@ -1796,7 +1799,7 @@ fn mixed_owner_squad_entities_are_unavailable_to_both_players_campaign_planning(
             },
         ));
     }
-    let mixed_set: HashSet<_> = mixed_entities.iter().copied().collect();
+    let mixed_set: BTreeSet<_> = mixed_entities.iter().copied().collect();
     let (mixed_id, snapshot) = {
         let mut manager = world.remove_resource::<SquadManager>().unwrap();
         let mixed = manager.create_squad(MissionType::Capture);
@@ -2091,7 +2094,7 @@ fn generic_planning_never_appends_units_to_a_foreign_same_target_squad() {
         .iter()
         .find(|squad| squad.id == foreign_id)
         .expect("player A must continue its original Squad");
-    assert_eq!(foreign.members, HashSet::from([foreign_member]));
+    assert_eq!(foreign.members, BTreeSet::from([foreign_member]));
 }
 
 #[test]

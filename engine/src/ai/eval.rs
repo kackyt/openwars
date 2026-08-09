@@ -236,8 +236,8 @@ pub fn evaluate_board_with_metrics(
 
     match ai_version {
         AiVersion::V1 => evaluate_board_v1(world, perspective_player),
-        // V3 は V2 の評価をベースに、#49 の回復インフラ評価項を追加する
-        AiVersion::V2 | AiVersion::V3 => evaluate_board_v2(
+        // V3/V4 は V2 の評価をベースに、#49 の回復インフラ評価項を追加する
+        AiVersion::V2 | AiVersion::V3 | AiVersion::V4 => evaluate_board_v2(
             world,
             perspective_player,
             cache,

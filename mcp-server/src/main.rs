@@ -178,9 +178,10 @@ impl OpenWarsAiServer {
                 "V1" => engine::ai::AiVersion::V1,
                 "V2" => engine::ai::AiVersion::V2,
                 "V3" => engine::ai::AiVersion::V3,
+                "V4" => engine::ai::AiVersion::V4,
                 _ => {
                     return Err(format!(
-                        "Invalid AI version: {}. Must be 'V1', 'V2' or 'V3'",
+                        "Invalid AI version: {}. Must be 'V1', 'V2', 'V3' or 'V4'",
                         args.version
                     ));
                 }
@@ -509,6 +510,12 @@ impl OpenWarsAiServer {
             // V3の直近分析が存在する場合だけ島別診断を返し、V1ではnullを維持する。
             let island_campaign =
                 invasion_trace::snapshot_island_campaign_for_player(&state.world, active_player_id);
+            // 遊兵（任務なし・任務があるのに動けない）の計測結果。engine側がターン終了直前に記録する。
+            let idle_audit =
+                invasion_trace::snapshot_idle_audit_for_player(&state.world, active_player_id);
+            // V4の生産判断内訳。V1〜V3は記録が無いためnullになる。
+            let production_plan =
+                invasion_trace::snapshot_production_plan_for_player(&state.world, active_player_id);
 
             let after_metrics = engine::ai::eval::evaluate_board_with_metrics(
                 &mut state.world,
@@ -521,6 +528,8 @@ impl OpenWarsAiServer {
                 "invasion_events": invasion_events,
                 "transport_squads": transport_squads,
                 "island_campaign": island_campaign,
+                "idle_audit": idle_audit,
+                "production_plan": production_plan,
                 "player_id": active_player_id.0,
                 "player_index": active_player_index.0,
                 "before_score": before_metrics.total_score,
@@ -715,7 +724,12 @@ impl ServerHandler for OpenWarsAiServer {
     }
 }
 
-#[tokio::main]
+// AI思考は HashMap の反復順に依存する箇所が残っており、
+// マルチスレッドランタイムだとツール呼び出しごとに別ワーカースレッドへ載る。
+// HashMap の RandomState はスレッドローカルな種を使うため、
+// ターンごとに生成されるマップの反復順が変わり、同一seedでも結果が再現しなくなる。
+// ターン制ゲームの進行は本質的に逐次処理なので、単一スレッドランタイムに固定して再現性を確保する。
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use rmcp::serve_server;
     use rmcp::transport::io::stdio;

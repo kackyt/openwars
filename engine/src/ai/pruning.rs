@@ -3,6 +3,12 @@ use crate::resources::{DamageChart, Map, master_data::MasterDataRegistry};
 use crate::systems::combat::get_detailed_expected_damage;
 use bevy_ecs::prelude::*;
 
+/// 合流後にHP上限を超え、返金されないHPが発生するかを判定します。
+/// 現行の合流処理は余剰HPを資金へ変換しないため、該当候補はAIの評価前に除外します。
+pub fn is_overflow_merge_without_refund(source_current: u32, target: Health) -> bool {
+    source_current.saturating_add(target.current) > target.max
+}
+
 /// 攻撃行動が無謀（カミカゼアタック）かどうかを判定します。
 /// 敵に与える被害価値よりも、反撃で受ける被害価値のほうが大きければ無謀とみなします。
 pub fn is_suicidal_attack(
@@ -125,6 +131,35 @@ pub fn is_suicidal_attack(
 mod tests {
     use super::*;
     use crate::resources::UnitType;
+
+    #[test]
+    fn issue73_overflow_merge_is_pruned() {
+        let full = Health {
+            current: 100,
+            max: 100,
+        };
+        let damaged = Health {
+            current: 34,
+            max: 100,
+        };
+
+        assert!(is_overflow_merge_without_refund(full.current, full));
+        assert!(is_overflow_merge_without_refund(full.current, damaged));
+    }
+
+    #[test]
+    fn issue73_lossless_merge_is_not_pruned() {
+        let source = Health {
+            current: 40,
+            max: 100,
+        };
+        let target = Health {
+            current: 50,
+            max: 100,
+        };
+
+        assert!(!is_overflow_merge_without_refund(source.current, target));
+    }
 
     #[test]
     fn test_is_suicidal_attack() {

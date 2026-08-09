@@ -237,7 +237,10 @@ mod tests {
             ));
         }
 
-        // 生産ロジックはV1/V2共通のため一回だけ呼ぶ
+        // V1/V2共有ロジックの契約を検証するため、既定値のV3に依存させない。
+        world
+            .resource_mut::<crate::ai::ai_version::PlayerAiSettings>()
+            .set_version(p1, crate::ai::AiVersion::V1);
         let prod_commands = crate::ai::production::decide_production(&mut world, p1);
         let is_anti_tank = prod_commands.iter().any(|cmd| {
             matches!(
@@ -245,7 +248,10 @@ mod tests {
                 UnitType::Mech | UnitType::MdTank | UnitType::Artillery | UnitType::TankZ
             )
         });
-        assert!(is_anti_tank, "Shared AI should produce anti-tank units");
+        assert!(
+            is_anti_tank,
+            "Shared AI should produce anti-tank units: {prod_commands:?}"
+        );
     }
 
     /// 4. 輸送連携 (Transport Invasion)

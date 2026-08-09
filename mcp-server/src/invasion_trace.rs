@@ -4,6 +4,7 @@ use bevy_ecs::event::EventCursor;
 use bevy_ecs::prelude::*;
 use serde::Serialize;
 
+use engine::ai::idle_audit::IdleAuditDiagnostics;
 use engine::ai::island_campaign::{
     IslandCampaignAssessment, IslandCampaignAssignment, IslandCampaignDecision,
     IslandCampaignDiagnostics, IslandCampaignPortfolio, IslandCampaignRequirement,
@@ -11,6 +12,7 @@ use engine::ai::island_campaign::{
 };
 use engine::ai::islands::IslandMap;
 use engine::ai::squad::{MissionPhase, MissionType, SquadManager};
+use engine::ai::v4::trace::{ProductionDecision, ProductionTraceDiagnostics};
 use engine::components::{CargoCapacity, Faction, GridPosition, Health, PlayerId, UnitStats};
 use engine::events::{
     PropertyCaptureProgressedEvent, UnitAttackedEvent, UnitLoadedEvent, UnitProducedEvent,
@@ -137,6 +139,102 @@ pub struct TransportSquadSnapshot {
     pub target_island_id: Option<usize>,
     pub planned_cargo_ids: Vec<u64>,
     pub loaded_cargo_ids: Vec<u64>,
+}
+
+/// 遊兵1体分の記録。分類は排他ではない（actionable は no_mission / mission_stalled の上位集合）。
+#[derive(Debug, Serialize)]
+pub struct IdleUnitSnapshot {
+    pub unit_id: u64,
+    pub unit_type: UnitType,
+    pub x: usize,
+    pub y: usize,
+    pub squad_id: Option<u32>,
+    /// 分類A: どのSquadにも属さない。
+    pub no_mission: bool,
+    /// 分類B: Squadには属するがそのターン一度も行動しなかった。
+    pub mission_stalled: bool,
+    /// 分類C: 行動可能なままターンを終えた。
+    pub actionable: bool,
+}
+
+/// Squad 単位のダイジェスト。分類D（停滞Squad）はこの列のターン間差分で判定する。
+#[derive(Debug, Serialize)]
+pub struct IdleSquadSnapshot {
+    pub squad_id: u32,
+    pub mission_type: String,
+    pub phase: String,
+    pub target_x: Option<usize>,
+    pub target_y: Option<usize>,
+    pub target_island_id: Option<usize>,
+    pub member_count: usize,
+    pub acted_count: usize,
+}
+
+/// 「遊兵ゼロ」指標のターン単位スナップショット。
+#[derive(Debug, Serialize)]
+pub struct IdleAuditSnapshot {
+    pub player_id: u32,
+    /// 母数（盤上に実体がある自軍ユニット数）。
+    pub total_units: usize,
+    /// 分類A: 任務なし。
+    pub no_mission_count: usize,
+    /// 分類B: 任務はあるが命令が出ない。
+    pub mission_stalled_count: usize,
+    /// 分類C: 行動可能なまま終了。
+    pub actionable_count: usize,
+    pub units: Vec<IdleUnitSnapshot>,
+    pub squads: Vec<IdleSquadSnapshot>,
+}
+
+/// 生産ループ1反復分。`decision` が "produced" 以外なら unit_type/cost は補助情報。
+#[derive(Debug, Serialize)]
+pub struct ProductionStepSnapshot {
+    pub operation_kind: String,
+    pub anchor_x: usize,
+    pub anchor_y: usize,
+    pub slot_kind: String,
+    pub deficit_before: f32,
+    pub deficit_after: f32,
+    pub remaining_funds_before: u32,
+    /// "produced" | "slot_cleared" | "deferred"
+    pub decision: String,
+    pub unit_type: Option<UnitType>,
+    pub cost: Option<u32>,
+    pub facility_x: Option<usize>,
+    pub facility_y: Option<usize>,
+}
+
+/// 作戦1件が要求していた枠。どの枠が発注を駆動したかの突き合わせに使う。
+#[derive(Debug, Serialize)]
+pub struct ProductionOperationSnapshot {
+    pub kind: String,
+    pub anchor_x: usize,
+    pub anchor_y: usize,
+    pub capture_units: u32,
+    pub escort_units: u32,
+    pub destroy_budget: u32,
+    pub transport_slots: u32,
+    pub intercept_budget: u32,
+    pub requires_transport: bool,
+    pub enemy_combat_value: u32,
+    pub enemy_reinforcement_budget: u32,
+    pub minimum_combat_unit_cost: u32,
+    pub friendly_combat_value_committed: u32,
+    pub deploy_lead_time: u32,
+}
+
+/// V4 生産判断のターン単位スナップショット。
+#[derive(Debug, Serialize)]
+pub struct ProductionPlanSnapshot {
+    pub player_id: u32,
+    pub funds: u32,
+    pub free_facility_count: usize,
+    /// 作戦が立たず fallback に落ちたか
+    pub fallback: bool,
+    /// 使い切れずに残った資金
+    pub leftover_funds: u32,
+    pub operations: Vec<ProductionOperationSnapshot>,
+    pub steps: Vec<ProductionStepSnapshot>,
 }
 
 #[derive(Debug, Serialize)]
@@ -529,6 +627,133 @@ pub fn snapshot_island_campaign_for_player(
         .map(|portfolio| snapshot_island_campaign(player_id, portfolio))
 }
 
+/// 直近ターンの遊兵計測結果（engine 側の `IdleAuditDiagnostics`）をトレース用に写し取る。
+/// 判定ロジックは engine に閉じており、ここでは形式変換だけを行う。
+pub fn snapshot_idle_audit_for_player(
+    world: &World,
+    player_id: PlayerId,
+) -> Option<IdleAuditSnapshot> {
+    let audit = world
+        .get_resource::<IdleAuditDiagnostics>()?
+        .by_player
+        .get(&player_id)?;
+
+    let units = audit
+        .records
+        .iter()
+        .map(|record| IdleUnitSnapshot {
+            unit_id: record.entity.to_bits(),
+            unit_type: record.unit_type,
+            x: record.position.x,
+            y: record.position.y,
+            squad_id: record.squad_id.map(|id| id.0),
+            no_mission: record.no_mission,
+            mission_stalled: record.mission_stalled,
+            actionable: record.actionable,
+        })
+        .collect();
+
+    let squads = audit
+        .squads
+        .iter()
+        .map(|digest| IdleSquadSnapshot {
+            squad_id: digest.squad_id.0,
+            mission_type: format!("{:?}", digest.mission_type),
+            phase: format!("{:?}", digest.phase),
+            target_x: digest.target.map(|target| target.x),
+            target_y: digest.target.map(|target| target.y),
+            target_island_id: digest.target_island.map(|island| island.0),
+            member_count: digest.member_count,
+            acted_count: digest.acted_count,
+        })
+        .collect();
+
+    Some(IdleAuditSnapshot {
+        player_id: audit.player_id.0,
+        total_units: audit.total_units,
+        no_mission_count: audit.no_mission_count(),
+        mission_stalled_count: audit.mission_stalled_count(),
+        actionable_count: audit.actionable_count(),
+        units,
+        squads,
+    })
+}
+
+/// 直近ターンの V4 生産判断トレースを写し取る。V1〜V3 では記録が無いため None を返す。
+pub fn snapshot_production_plan_for_player(
+    world: &World,
+    player_id: PlayerId,
+) -> Option<ProductionPlanSnapshot> {
+    let plan = world
+        .get_resource::<ProductionTraceDiagnostics>()?
+        .by_player
+        .get(&player_id)?;
+
+    let operations = plan
+        .operations
+        .iter()
+        .map(|op| ProductionOperationSnapshot {
+            kind: format!("{:?}", op.kind),
+            anchor_x: op.anchor.x,
+            anchor_y: op.anchor.y,
+            capture_units: op.slots.capture_units,
+            escort_units: op.slots.escort_units,
+            destroy_budget: op.slots.destroy_budget,
+            transport_slots: op.slots.transport_slots,
+            intercept_budget: op.slots.intercept_budget,
+            requires_transport: op.requires_transport,
+            enemy_combat_value: op.enemy_combat_value,
+            enemy_reinforcement_budget: op.enemy_reinforcement_budget,
+            minimum_combat_unit_cost: op.minimum_combat_unit_cost,
+            friendly_combat_value_committed: op.friendly_combat_value_committed,
+            deploy_lead_time: op.deploy_lead_time,
+        })
+        .collect();
+
+    let steps = plan
+        .steps
+        .iter()
+        .map(|step| {
+            // 結末ごとに埋まるフィールドが違うため、ここで平坦化する。
+            let (decision, unit_type, cost, facility) = match &step.decision {
+                ProductionDecision::Produced {
+                    unit_type,
+                    cost,
+                    facility,
+                } => ("produced", Some(*unit_type), Some(*cost), Some(*facility)),
+                ProductionDecision::SlotCleared => ("slot_cleared", None, None, None),
+                ProductionDecision::Deferred { unit_type, cost } => {
+                    ("deferred", Some(*unit_type), Some(*cost), None)
+                }
+            };
+            ProductionStepSnapshot {
+                operation_kind: format!("{:?}", step.operation_kind),
+                anchor_x: step.operation_anchor.x,
+                anchor_y: step.operation_anchor.y,
+                slot_kind: format!("{:?}", step.slot_kind),
+                deficit_before: step.deficit_before,
+                deficit_after: step.deficit_after,
+                remaining_funds_before: step.remaining_funds_before,
+                decision: decision.to_string(),
+                unit_type,
+                cost,
+                facility_x: facility.map(|pos| pos.x),
+                facility_y: facility.map(|pos| pos.y),
+            }
+        })
+        .collect();
+
+    Some(ProductionPlanSnapshot {
+        player_id: plan.player_id.0,
+        funds: plan.funds,
+        free_facility_count: plan.free_facility_count,
+        fallback: plan.fallback,
+        leftover_funds: plan.leftover_funds,
+        operations,
+        steps,
+    })
+}
+
 pub fn snapshot_transport_squads(world: &World) -> Vec<TransportSquadSnapshot> {
     let Some(manager) = world.get_resource::<SquadManager>() else {
         return Vec::new();
@@ -654,6 +879,7 @@ mod tests {
             island_id: IslandId(3),
             decision: IslandCampaignDecision::Expand,
             target_position: GridPosition { x: 8, y: 4 },
+            capture_target_positions: vec![GridPosition { x: 8, y: 4 }],
             requirement: IslandCampaignRequirement {
                 preferred_transport: Some(UnitType::TransportHelicopter),
                 transport_slots: 2,

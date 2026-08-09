@@ -58,7 +58,7 @@ pub enum InGameState {
     UnitSelected {
         unit_entity: Entity,
         start_pos: (usize, usize),
-        reachable_tiles: std::collections::HashSet<(usize, usize)>,
+        reachable_tiles: std::collections::BTreeSet<(usize, usize)>,
     },
     ActionMenu {
         unit_entity: Option<Entity>,
@@ -121,6 +121,7 @@ pub enum PlayerControlType {
 pub enum CliAiVersion {
     V1,
     V3,
+    V4,
 }
 
 impl CliAiVersion {
@@ -128,6 +129,7 @@ impl CliAiVersion {
         match self {
             Self::V1 => "V1",
             Self::V3 => "V3",
+            Self::V4 => "V4",
         }
     }
 
@@ -135,6 +137,7 @@ impl CliAiVersion {
         match self {
             Self::V1 => AiVersion::V1,
             Self::V3 => AiVersion::V3,
+            Self::V4 => AiVersion::V4,
         }
     }
 
@@ -143,6 +146,7 @@ impl CliAiVersion {
         match version {
             AiVersion::V1 => Self::V1,
             AiVersion::V2 | AiVersion::V3 => Self::V3,
+            AiVersion::V4 => Self::V4,
         }
     }
 }
@@ -223,7 +227,7 @@ impl UiState {
         }
     }
 
-    /// マップ選択画面ではHuman、V1、V3の順で操作主体とバージョンをまとめて切り替えます。
+    /// マップ選択画面ではHuman、V1、V3、V4の順で操作主体とバージョンをまとめて切り替えます。
     fn cycle_player_setup(&mut self, player_id: u32) {
         let control = self
             .player_controls
@@ -242,6 +246,9 @@ impl UiState {
                 self.player_ai_versions.insert(player_id, CliAiVersion::V3);
             }
             (PlayerControlType::Ai, CliAiVersion::V3) => {
+                self.player_ai_versions.insert(player_id, CliAiVersion::V4);
+            }
+            (PlayerControlType::Ai, CliAiVersion::V4) => {
                 self.player_controls
                     .insert(player_id, PlayerControlType::Human);
             }
@@ -913,7 +920,7 @@ impl App {
                 }
 
                 if let Some(entity) = selected_unit {
-                    let mut reachable = std::collections::HashSet::new();
+                    let mut reachable = std::collections::BTreeSet::new();
                     let mut u_stats = None;
                     let mut fuel_cur = 0;
 
@@ -1398,7 +1405,7 @@ impl App {
         &mut self,
         unit_entity: Entity,
         _start_pos: (usize, usize),
-        reachable_tiles: std::collections::HashSet<(usize, usize)>,
+        reachable_tiles: std::collections::BTreeSet<(usize, usize)>,
     ) {
         let cx = self.ui_state.cursor_pos.0;
         let cy = self.ui_state.cursor_pos.1;
@@ -1607,7 +1614,7 @@ mod tests {
     }
 
     #[test]
-    fn map_selection_cycles_human_v1_v3() {
+    fn map_selection_cycles_human_v1_v3_v4() {
         let mut state = UiState::new(vec![]);
 
         state.cycle_player_setup(1);
@@ -1617,6 +1624,10 @@ mod tests {
         state.cycle_player_setup(1);
         assert!(!state.is_human(1));
         assert_eq!(state.ai_version(1), CliAiVersion::V3);
+
+        state.cycle_player_setup(1);
+        assert!(!state.is_human(1));
+        assert_eq!(state.ai_version(1), CliAiVersion::V4);
 
         state.cycle_player_setup(1);
         assert!(state.is_human(1));

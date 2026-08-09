@@ -9,7 +9,12 @@ use std::collections::{HashMap, HashSet};
 /// 敵本島（敵生産拠点がある島）への侵攻が許可されているか判定する。
 ///
 /// - すでにその島に、自軍の戦闘ユニット（歩兵・重歩兵・輸送機・輸送船・補給車以外の、戦車や対空戦車など）が1基以上展開している（護衛の存在）
-/// - または、自軍の戦闘ユニット総数が、敵の戦闘ユニット総数に対して圧倒的優勢（味方戦闘ユニット数 >= 敵戦闘ユニット数 * 1.2 + 2）である（圧倒的戦力優勢）
+/// - または、自軍の戦闘ユニット総数が、目標島の守備隊に対して優勢（味方戦闘ユニット数 >= 守備隊数 * 1.2 + 2）である
+///
+/// 比較対象を「敵の総兵力」ではなく「目標島の守備隊」に限定しているのが要点。
+/// 総兵力と比較すると、彼我の収入が拮抗している対戦では相手の増産に要求値が
+/// 際限なく追随してしまい、必要兵力に永久に到達できない（＝侵攻が一度も起きない）。
+/// 島を奪うために打ち破る必要があるのは、敵の全軍ではなくその島を守る部隊である。
 pub fn is_invasion_allowed(
     world: &mut World,
     player_id: PlayerId,
@@ -18,7 +23,7 @@ pub fn is_invasion_allowed(
 ) -> bool {
     let mut own_escort_present = false;
     let mut own_combat_total = 0;
-    let mut enemy_combat_total = 0;
+    let mut garrison_total = 0;
 
     let mut query = world.query::<(
         &GridPosition,
@@ -41,16 +46,20 @@ pub fn is_invasion_allowed(
                 | UnitType::SupplyTruck
         );
 
-        if is_combat_unit {
-            if faction.0 == player_id {
-                own_combat_total += 1;
-                // 目標の島にいるかチェック
-                if island.tiles.contains(pos) {
-                    own_escort_present = true;
-                }
-            } else {
-                enemy_combat_total += 1;
+        if !is_combat_unit {
+            continue;
+        }
+
+        if faction.0 == player_id {
+            own_combat_total += 1;
+            // 目標の島にいるかチェック
+            if island.tiles.contains(pos) {
+                own_escort_present = true;
             }
+        } else if island.tiles.contains(pos) {
+            // 上陸を直接阻むのは目標島に展開している敵部隊のみ。
+            // 他島・海上・輸送中の敵はこの判定の母数に含めない。
+            garrison_total += 1;
         }
     }
 
@@ -58,8 +67,8 @@ pub fn is_invasion_allowed(
         return true;
     }
 
-    // 圧倒的優勢判定: 自軍戦闘ユニット総数 >= 敵軍戦闘ユニット総数 * 1.2 + 2
-    let threshold = (enemy_combat_total as f64 * 1.2).ceil() as u32 + 2;
+    // 優勢判定: 自軍戦闘ユニット総数 >= 目標島の守備隊数 * 1.2 + 2
+    let threshold = (garrison_total as f64 * 1.2).ceil() as u32 + 2;
     if own_combat_total >= threshold {
         return true;
     }
@@ -827,5 +836,126 @@ mod tests {
         // 圧倒的優勢であるため、侵攻ミッションが割り当てられるはず
         let manager = world.get_resource::<TransportMissionManager>().unwrap();
         assert_eq!(manager.missions.len(), 1);
+    }
+
+    /// 侵攻可否は「敵の総兵力」ではなく「目標島の守備隊」と比較しなければならない。
+    ///
+    /// 収入が拮抗した対戦では彼我の兵力もほぼ同数で推移するため、総兵力比で
+    /// 判定すると要求値が相手の増産に永久に追随し、侵攻が一度も成立しない。
+    /// その結果、輸送機と歩兵を生産しても任務が与えられず遊兵化し、
+    /// 余った資金が撃破枠に流れ続けるという膠着ループに陥る。
+    #[test]
+    fn invasion_gate_compares_against_island_garrison_not_total_enemy_army() {
+        let mut world = World::new();
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+
+        world.insert_resource(TransportMissionManager::default());
+
+        // 島0: 自軍基地島 / 島1: 敵本島（敵生産拠点あり）
+        let base_island_tiles: HashSet<GridPosition> = (0..4)
+            .map(|y| GridPosition { x: 0, y })
+            .collect::<HashSet<_>>();
+        let enemy_island_tiles: HashSet<GridPosition> = (0..4)
+            .map(|y| GridPosition { x: 10, y })
+            .collect::<HashSet<_>>();
+
+        world.insert_resource(IslandMap {
+            islands: vec![
+                Island {
+                    id: IslandId(0),
+                    tiles: base_island_tiles,
+                },
+                Island {
+                    id: IslandId(1),
+                    tiles: enemy_island_tiles,
+                },
+            ],
+        });
+        world.insert_resource(crate::resources::MasterDataRegistry::load().unwrap());
+
+        // 自軍の生産拠点（島0）と、敵の生産拠点（島1）
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Factory, Some(p1), 200),
+        ));
+        world.spawn((
+            GridPosition { x: 10, y: 0 },
+            Property::new(Terrain::Factory, Some(p2), 200),
+        ));
+
+        // 侵攻用の輸送ヘリと歩兵（自軍基地島に待機）
+        world.spawn((
+            p1,
+            Faction(p1),
+            GridPosition { x: 0, y: 0 },
+            UnitStats {
+                unit_type: UnitType::TransportHelicopter,
+                ..UnitStats::mock()
+            },
+            CargoCapacity {
+                max: 1,
+                loaded: vec![],
+            },
+        ));
+        world.spawn((
+            p1,
+            Faction(p1),
+            GridPosition { x: 0, y: 0 },
+            UnitStats {
+                unit_type: UnitType::Infantry,
+                ..UnitStats::mock()
+            },
+        ));
+
+        // 自軍戦闘ユニット6両（すべて自軍基地島）
+        for y in 0..6 {
+            world.spawn((
+                p1,
+                Faction(p1),
+                GridPosition { x: 0, y: y % 4 },
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    ..UnitStats::mock()
+                },
+            ));
+        }
+
+        // 敵戦闘ユニットは合計7両だが、うち5両は自軍島へ出撃中で本島を留守にしている。
+        // 目標島（島1）の守備隊は2両のみ。
+        for y in 0..2 {
+            world.spawn((
+                p2,
+                Faction(p2),
+                GridPosition { x: 10, y },
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    ..UnitStats::mock()
+                },
+            ));
+        }
+        for y in 0..5 {
+            world.spawn((
+                p2,
+                Faction(p2),
+                GridPosition { x: 0, y: y % 4 },
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    ..UnitStats::mock()
+                },
+            ));
+        }
+
+        // 総兵力比(6 >= 7*1.2+2 = 11)では不成立だが、
+        // 守備隊比(6 >= 2*1.2+2 = 5)では成立するため、侵攻が許可されなければならない。
+        assign_test_transport_mission(&mut world, p1);
+
+        let manager = world.get_resource::<TransportMissionManager>().unwrap();
+        assert_eq!(
+            manager.missions.len(),
+            1,
+            "守備隊が手薄な敵本島に対して侵攻ミッションが割り当てられるべき"
+        );
+        assert_eq!(manager.missions[0].target_island, Some(IslandId(1)));
     }
 }
