@@ -32,7 +32,22 @@ MUST: AIは1つの目標に対して、適切な数のユニットを連携さ�
 #### Scenario: 輸送役へ到達したcargoを直ちに積載する
 
 - **WHEN** Pickup中の未行動cargoが現在の行動範囲で輸送役の座標へ到達できるとき
-- **THEN** cargoを輸送役と同じマスでWaitさせず、移動と積載を同じLoadコマンドで確定する。同一マス占有を残すWaitが発行された場合、エンジンは待機を拒否し、当該cargoの直前の移動を巻き戻す
+- **THEN** 輸送役自身の移動より先にcargoを選び、cargoの移動と積載を同じLoadコマンドで確定する。同一マス占有を残すWaitが発行された場合、エンジンは待機を拒否し、当該cargoの直前の移動を巻き戻す
+
+#### Scenario: 兵站便を遠い2体目のcargo待ちで停止させない
+
+- **WHEN** Expand、Secure、ContestまたはReinforceのPickup便が1体以上を搭載済みで、残る割当cargoが現在の手番に同じ輸送役へ到達できないとき
+- **THEN** 搭載済みcargoを運ぶ便をTransitへ進め、未搭載cargoは同じ目標島の後続Formingへ戻す。Assaultではこの部分発進を行わず、輸送役ごとの完全manifestを待つ
+
+#### Scenario: 島全体の要求完成前に実行可能な兵站便を発進させる
+
+- **WHEN** Expand、Secure、ContestまたはReinforceの島全体要求は未完成だが、Formingに実輸送役とその容量内の互換cargoが存在するとき
+- **THEN** 容量内のcargoを輸送役ごとのPickupへ昇格し、容量外のcargoと未使用輸送役は同じ島の後続Formingに保持する。Assaultでは全要求が完成するまでこの昇格を行わない
+
+#### Scenario: 購入待ちplaceholderへ生産済みEntityを接続する
+
+- **WHEN** 空のForming placeholderが存在する島作戦へ、後の手番で輸送役またはremote cargoが割り当てられたとき
+- **THEN** 新しいEntityを同じplaceholderへ追加入隊させ、代表輸送役だけでなく輸送Squadの全membersとcargoを汎用行動および緊急迎撃から除外する
 
 #### Scenario: 同一輸送役から複数cargoを同一手番に降車させる
 
@@ -78,6 +93,16 @@ MUST: AIは1つの目標に対して、適切な数のユニットを連携さ�
 
 - **WHEN** 敵戦力が残る島へのAssaultで輸送手段と占領要員は揃ったが、局地敵戦力を最小生産戦闘unit 1体分だけ上回る戦闘予算が未充足のとき
 - **THEN** 作戦をFormingに保ち、戦闘不足を満たす要員を同じ侵攻波へ追加できるようにし、Pickupへ遷移させない
+
+#### Scenario: Pickupで生産施設を搭載地点にしない
+
+- **WHEN** Pickup中の輸送役が首都の生産圏内にある自軍生産施設上にいて、到達可能な非生産合流点が存在するとき
+- **THEN** 即時Loadより先に輸送役を非生産合流点へ移動し、同じ手番の後続行動でcargoを移動Loadして次の生産フェーズまでに施設を空ける
+
+#### Scenario: 航空任務は帰投燃料を残す
+
+- **WHEN** 航空unitが攻撃対象またはSquad目標へ向かう候補タイルを評価するとき
+- **THEN** 候補までの移動後燃料で、最寄りの自軍空港までの距離と帰投中の日次燃料消費を支払えないタイルを行動候補から除外する
 
 ### Requirement: Strategic Target Valuation
 

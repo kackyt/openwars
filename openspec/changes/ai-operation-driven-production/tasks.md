@@ -128,6 +128,19 @@
 - [x] B-70. 進行中作戦の割当済みEntityを維持しつつ、未割当資源と生産不足を兵站前提・防衛、Secure、Contest、Reinforce、Expand、Assaultの順に配分し、Forming Assaultによる島作戦の飢餓を防ぐ
 - [x] B-71. Pickup cargoが輸送役の座標へ到達可能なら同一手番にLoadし、別unitとの同一マス占有を残すWaitをエンジンで拒否して当該PendingMoveを巻き戻す
 - [x] B-72. 作戦優先度と違法Waitの単体・全体回帰テスト、およびrelease版map_3 / seed 42 / 16ターン / 両手番の輸送・継続作戦追試を実行する
+- [x] B-73. Pickupの行動順を即時搭載可能cargo、輸送役の移動、cargoの接近の順へ変更し、現在の輸送役へ届く歩兵を先にLoadする
+- [x] B-74. 中立島・兵站島の部分搭載便をTransitへ進め、同一手番に搭載不能な残存cargoを同じ島の後続Formingへ戻す。Assaultは完全manifest待ちを維持する
+- [x] B-75. V4後攻ログのEntity 80・91で複数ターンの搭載済みPickup待ちを再現し、単体テスト・全回帰テスト・release版map_3 8ターン追試で修正を検証する
+- [x] B-76. 高優先島作戦の残予算を保護しつつ、競合しない施設種別を下位島作戦へ開放し、map_3 Hex後攻のT1に歩兵と輸送ヘリを並行生産する
+- [x] B-77. 空Forming placeholderへ後の手番で割り当てられた輸送役・cargoを追加入隊させ、輸送Squadの全membersを汎用beam searchと緊急迎撃から保護する
+- [x] B-78. 中立島・兵站島では島全体要求の完成前でも容量内の便をPickupへ昇格し、残存Entityを同じ島の後続Formingへ保持する。Assaultは完全編成待ちを維持する
+- [x] B-79. map_3 / Hex / V3先攻対V4後攻をT3まで実行し、T1ヘリ生産、T2の歩兵2体連続Load、T3の中立島方向Dropおよび後続PickupをEntity単位で確認する
+- [x] B-80. Pickup地点の選択で生産圏内の自軍施設を最後順位とし、輸送役が非生産合流点へ退避した同じ手番にcargoをLoadできるようにする
+- [x] B-81. 全campaign不足の残予約額を保護し、それを超える現金だけをV4汎用Combat/Interceptへ渡す。余剰経路ではCapture/Transport枠を無効化する
+- [x] B-82. campaign余剰生産では自力展開できない地上戦力を候補から除外し、海峡越しの敵歩兵に対して海外へ渡れないTankではなく自力到達可能な対敵unitを選ぶテストを追加する
+- [x] B-83. V1〜V4共通の航空行動候補へ、最寄り自軍空港までの帰投距離と帰投ターン中の日次燃料消費の予約を追加する
+- [ ] B-84. map_3 / Hex / V3先攻対V4後攻の長期追試で、空港上Loadの消滅、航空戦闘生産、敵占領・輸送unitへの攻撃、航空unitの燃料切れ0件をEntity単位で確認する
+- [x] B-85. V3/V4共通campaign Combat不足へtarget positionの実到達性を接続し、海越えできないTankZを生産せず航空戦力を選ぶ回帰テストとmap_3 12ターン追試を追加する
 
 ## Phase C: 陸上前線への一般化・到達可能性・生産枠
 

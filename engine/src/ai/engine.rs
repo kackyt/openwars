@@ -83,6 +83,7 @@ pub struct AiTurnStrategyCache {
     campaign_production_planned: bool,
     campaign_production_commands: VecDeque<crate::events::ProduceUnitCommand>,
     campaign_production_blocks_generic: bool,
+    campaign_production_generic_budget: Option<u32>,
 }
 
 impl AiTurnStrategyCache {
@@ -132,6 +133,24 @@ impl AiTurnStrategyCache {
         self.campaign_production_planned = true;
         self.campaign_production_commands = VecDeque::from(commands);
         self.campaign_production_blocks_generic = !completed_all_rows;
+        self.campaign_production_generic_budget = None;
+    }
+
+    /// V4の島嶼予約を保護しつつ、超過資金だけを汎用戦闘生産へ渡す。
+    pub(crate) fn set_v4_campaign_production_plan(
+        &mut self,
+        player_id: PlayerId,
+        commands: Vec<crate::events::ProduceUnitCommand>,
+        generic_budget: u32,
+    ) {
+        if self.player_id != Some(player_id) {
+            self.clear();
+            self.player_id = Some(player_id);
+        }
+        self.campaign_production_planned = true;
+        self.campaign_production_commands = VecDeque::from(commands);
+        self.campaign_production_blocks_generic = generic_budget == 0;
+        self.campaign_production_generic_budget = Some(generic_budget);
     }
 
     pub(crate) fn campaign_production_planned(&self, player_id: PlayerId) -> bool {
@@ -151,6 +170,12 @@ impl AiTurnStrategyCache {
         self.player_id == Some(player_id) && self.campaign_production_blocks_generic
     }
 
+    pub(crate) fn campaign_production_generic_budget(&self, player_id: PlayerId) -> Option<u32> {
+        (self.player_id == Some(player_id))
+            .then_some(self.campaign_production_generic_budget)
+            .flatten()
+    }
+
     fn clear(&mut self) {
         self.player_id = None;
         self.squads_planned = false;
@@ -158,6 +183,7 @@ impl AiTurnStrategyCache {
         self.campaign_production_planned = false;
         self.campaign_production_commands.clear();
         self.campaign_production_blocks_generic = false;
+        self.campaign_production_generic_budget = None;
     }
 }
 
@@ -209,6 +235,50 @@ pub enum AiCommand {
         target_pos: GridPosition,
         target_entity: Entity,
     },
+}
+
+/// 航空ユニットが候補タイルへ移動した後も、自軍空港へ帰投できる燃料を残すか。
+///
+/// 移動燃料だけでなく、空港外で迎える各ラウンドの日次消費も予約する。攻撃加点や
+/// Squad接近加点より前に候補自体を除外するため、任務持ち航空機も燃料切れになるまで
+/// 前線を徘徊できない。
+fn air_move_preserves_return_fuel(
+    map: &Map,
+    properties: &[(GridPosition, Terrain, Option<PlayerId>)],
+    player_id: PlayerId,
+    stats: &UnitStats,
+    origin: GridPosition,
+    candidate: GridPosition,
+    current_fuel: u32,
+) -> bool {
+    if stats.movement_type != crate::resources::MovementType::Air {
+        return true;
+    }
+    let airports: Vec<_> = properties
+        .iter()
+        .filter_map(|(position, terrain, owner)| {
+            (*owner == Some(player_id) && *terrain == Terrain::Airport).then_some(*position)
+        })
+        .collect();
+    if airports.is_empty() {
+        // 最小テストfixtureや空港喪失後の既存unitには帰投先を導出できない。
+        // ここで全行動を停止させず、空港を観測できる通常局面だけ安全圏を強制する。
+        return true;
+    }
+    let movement_cost = map.distance(origin.x, origin.y, candidate.x, candidate.y);
+    let remaining_fuel = current_fuel.saturating_sub(movement_cost);
+    if airports.contains(&candidate) {
+        return true;
+    }
+    let return_distance = airports
+        .iter()
+        .map(|airport| map.distance(candidate.x, candidate.y, airport.x, airport.y))
+        .min()
+        .unwrap_or(u32::MAX);
+    let return_turns = return_distance.div_ceil(stats.max_movement.max(1));
+    let required_fuel =
+        return_distance.saturating_add(stats.daily_fuel_consumption.saturating_mul(return_turns));
+    remaining_fuel >= required_fuel
 }
 
 /// AIの思考エンジン。未行動のユニットに対して最も評価の高いコマンドを決定します。
@@ -399,6 +469,17 @@ pub fn decide_ai_action(
                 x: target_tile.0,
                 y: target_tile.1,
             };
+            if !air_move_preserves_return_fuel(
+                &map,
+                &properties,
+                player_id,
+                &stats,
+                pos,
+                current_grid,
+                fuel,
+            ) {
+                continue;
+            }
             let is_stationary = current_grid.x == pos.x && current_grid.y == pos.y;
 
             let actions = crate::systems::action::get_available_actions_at(
@@ -1420,6 +1501,9 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     if let Some(manager) = world.get_resource::<crate::ai::squad::SquadManager>() {
         for squad in &manager.squads {
             if squad.mission_type == crate::ai::squad::MissionType::Transport {
+                // Forming中は複数の輸送役をmembersへ束ねる。代表transport_entityだけを
+                // 除外すると残りが汎用beam searchへ漏れ、空荷で前線へ進んでしまう。
+                decide_skip_entities.extend(squad.members.iter().copied());
                 if let Some(transport_entity) = squad.transport_entity {
                     decide_skip_entities.insert(transport_entity);
                 }
@@ -1977,6 +2061,17 @@ pub fn decide_ai_action_v2(
                 x: target_tile.0,
                 y: target_tile.1,
             };
+            if !air_move_preserves_return_fuel(
+                &map,
+                &properties,
+                player_id,
+                &stats,
+                pos,
+                current_grid,
+                fuel,
+            ) {
+                continue;
+            }
             let is_stationary = current_grid.x == pos.x && current_grid.y == pos.y;
 
             let actions = crate::systems::action::get_available_actions_at(
@@ -2948,6 +3043,52 @@ mod tests {
         let mut world = World::new();
         let skips = std::collections::HashSet::new();
         assert!(decide_ai_action(&mut world, PlayerId(1), &skips).is_none());
+    }
+
+    #[test]
+    fn air_movement_reserves_distance_and_daily_fuel_for_return() {
+        let map = Map::new(
+            20,
+            1,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        let player = PlayerId(1);
+        let properties = vec![(GridPosition { x: 0, y: 0 }, Terrain::Airport, Some(player))];
+        let stats = UnitStats {
+            movement_type: crate::resources::MovementType::Air,
+            max_movement: 8,
+            daily_fuel_consumption: 5,
+            ..UnitStats::mock()
+        };
+
+        assert!(air_move_preserves_return_fuel(
+            &map,
+            &properties,
+            player,
+            &stats,
+            GridPosition { x: 8, y: 0 },
+            GridPosition { x: 7, y: 0 },
+            20,
+        ));
+        assert!(!air_move_preserves_return_fuel(
+            &map,
+            &properties,
+            player,
+            &stats,
+            GridPosition { x: 8, y: 0 },
+            GridPosition { x: 10, y: 0 },
+            20,
+        ));
+        assert!(air_move_preserves_return_fuel(
+            &map,
+            &properties,
+            player,
+            &stats,
+            GridPosition { x: 1, y: 0 },
+            GridPosition { x: 0, y: 0 },
+            1,
+        ));
     }
 
     #[test]
@@ -4617,6 +4758,7 @@ mod tests {
             pickup_position: None,
             drop_position: None,
             delivered_cargo: Vec::new(),
+            allow_partial_departure: false,
             return_after_combat: false,
         });
         world.insert_resource(manager);

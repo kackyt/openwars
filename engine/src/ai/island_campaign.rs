@@ -137,6 +137,9 @@ pub struct IslandCampaignAssignment {
 pub struct IslandCampaignShortfall {
     pub island_id: IslandId,
     pub decision: IslandCampaignDecision,
+    /// 不足戦力を投入する作戦地点。生産施設から自力到達できない地上戦力を
+    /// 「将来輸送できるはず」と見なして遊兵化させないために使う。
+    pub target_position: GridPosition,
     pub light_transport_slots: u32,
     pub heavy_transport_slots: u32,
     pub capture_units: u32,
@@ -228,6 +231,7 @@ impl IslandCampaignPortfolio {
             shortfalls.push(IslandCampaignShortfall {
                 island_id: assignment.island_id,
                 decision: assignment.decision,
+                target_position: assignment.target_position,
                 light_transport_slots,
                 heavy_transport_slots,
                 capture_units: missing.capture_units,

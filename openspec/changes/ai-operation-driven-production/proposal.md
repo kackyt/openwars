@@ -89,15 +89,19 @@
   - assignmentへ島内の複数施設目標を保持し、複数の占領兵を到達可能な別施設へ分担させる
   - 島の未所有施設数を毎ターン再計測し、未所有施設1か所につき占領兵1体を要求する。上陸・争奪中は損耗で占領能力を失わない最低2体を維持し、初回便の有無を作戦終了条件にしない
   - 進行中作戦へ割当済みのEntityは維持する一方、未割当資源と生産不足は作戦種別の優先度で配分し、編成中の敵領Assaultが兵站前提・防衛・残存施設のSecure・Contest・Reinforceを飢餓させない
-  - Pickup中のcargoが輸送役の座標へ到達可能なら同一コマンドでLoadし、同一マスを占有したままWaitする違法状態はエンジン境界でも拒否して直前の移動を巻き戻す
+  - Pickupでは輸送役を動かす前に、現在位置へ到達可能なcargoを同一コマンドでLoadする。同一マスを占有したままWaitする違法状態はエンジン境界でも拒否して直前の移動を巻き戻す
+  - 中立島・兵站島の便は島全体の要求完成を待たず、実輸送役と搭載可能cargoが揃った便からPickupへ進める。1体以上を搭載済みで、残るcargoが同一手番に搭載不能なら先行発進し、未搭載cargoを同じ島の後続Formingへ戻す。敵領Assaultは戦力分断を避けて完全manifest待ちを維持する
   - `Secure`、`Contest`、`Reinforce`にも残存占領枠を持たせ、別島の占領兵を使う場合は実cargoに適合する輸送不足を導出する。安全な自島内の`Secure`は3件の攻勢上限を消費しない
   - 同一輸送役の複数cargoを同一手番にLoad/Dropし、対軽歩兵では輸送ヘリ自身の実戦力を活用した後、輸送任務へ復帰させる
   - `Forming`中の輸送隊が自軍生産施設を塞いだ場合は、任務所属を維持したまま隣接待機地へ退避し、後続の占領兵・輸送役を生産可能にする
+  - 購入待ちで作成した空Forming placeholderへ後の手番で生産された輸送役・cargoを追加入隊させ、輸送Squadの全membersを汎用行動と緊急迎撃から保護する
+  - 上位島作戦の残予算を保護しつつ、その作戦が使用できない別種の生産施設を下位島作戦へ開放し、Factory不足でAirportまで停止する直列化を避ける
+  - Pickup合流点は生産圏内の自軍施設を避け、輸送役を先に非生産タイルへ動かした同じ手番にcargoをLoadして、搭載待ちによる空港・港の自己封鎖を防ぐ
   - 生産ループは 1 ユニット購入ごとに「どの作戦のどの枠を埋めたか」を記録して消費する
 
 - **改善**: V4 と既存島嶼キャンペーンの実行接続
   - V4 は既存の `IslandCampaignShortfall` を汎用作戦へ再変換せず、キャンペーン生産を先に1手番分計画して既存キャッシュから順次発行する
-  - 最優先パッケージが未完成なら汎用生産を止め、輸送手段・占領要員・戦闘戦力の部分投入を防ぐ
+  - 全campaign不足の残予約額は保護し、その超過資金だけを観測敵へのCombat/Interceptへ開放する。余剰経路とcampaign専用Combatの双方で、作戦地点へ自力展開できない海外地上戦力を購入しない
   - 洋上 Reinforce は、実 cargo の出発島と積載可能兵種に適合する輸送手段が無い場合も作戦を消さず、生産可能な輸送手段を shortfall として要求する
   - 自力で目標へ展開できる航空戦力を輸送 cargo から分離し、Pickup は先頭以外の行動可能 cargo も同一手番に前進させる
   - 既存作戦を新規作戦より先に継続し、未所有施設が残る`Secure`と進行中の`Contest` / `Reinforce`を新規`Expand`より先に処理する。投資回収可能な中立島を確保してから新規`Assault`へ移る
@@ -136,12 +140,13 @@
 - `engine/src/ai/v4/operation.rs`（新規）: 5 枠（占領 / 撃破 / 護衛 / 輸送 / 迎撃）の状況導出。`OperationFacts` → `OperationSlots` の純粋関数として実装し、マップ名・ユニット名・トポロジ前提を持ち込まない
 - `engine/src/ai/v4/mod.rs`（新規）: 盤面スキャン、拠点クラスタからの作戦構築、移動タイプ別の到達可能性判定、空き生産枠からの「1 枠あたり予算」算出（`systems/production.rs` の `PRODUCTION_RANGE` / `is_within_production_range` を利用）、枠消費ベースの候補選定、見送り購入、作戦ゼロ時のフォールバック
 - `engine/src/ai/mod.rs`: `pub mod v4;` の追加のみ
-- `engine/src/ai/production.rs`: V4 委譲に加え、既存のキャンペーン不足計画関数をV4から再利用できる可視性へ変更。V1/V2/V3の生産選定ロジックは未変更
+- `engine/src/ai/production.rs`: V4 委譲に加え、既存のキャンペーン不足計画関数をV4から再利用できる可視性へ変更。V3/V4共通campaign Combatには作戦地点への自力到達性を要求し、輸送任務未接続の海外地上戦力を除外する。通常のV1/V2/V3生産選定ロジックは未変更
 - `engine/src/ai/island_campaign.rs` / `island_campaign_analysis.rs`: 洋上 Reinforce の実 cargo と生産可能輸送手段を出発島・積載可能兵種込みで照合し、輸送不足を shortfall として保持。Assault は作戦優先度、将来予算予約、生産可能経路別の輸送編成、初動上陸波の容量を同じ作戦状態で管理する
 - `engine/src/ai/island_campaign.rs` / `island_campaign_analysis.rs`: 加えて、相対収入と地上／航空／海上の前進補給網から兵站前提作戦を導出し、新規Assaultとの依存関係を管理する
 - `engine/src/ai/v4/deployment.rs`: V4のpending deployment、実Entity照合、局地標的追跡、fallback、攻撃実績監査を保持
 - `engine/src/ai/squad.rs`: 自力展開戦力と輸送 cargo の分離、複数 cargo の Pickup 進行。加えてV4局地任務をcampaign再配分とgeneric free poolより先に予約する
 - `engine/src/ai/engine.rs`: Drop に参加した輸送役と cargo の双方を当該ターンの行動済みとして記録。加えてV1〜V4共通の攻撃・接近評価へ、搭載兵力と占領阻止を含む戦略標的価値を導入し、V4では局地任務の現在標的Entityを通常標的より優先する
+- `engine/src/ai/engine.rs`: 航空unitの候補移動を、移動後も最寄りの自軍空港へ日次消費込みで帰投可能な範囲へ制限する
 - `engine/src/ai/emergency.rs`: 中立拠点InterceptionはV4局地任務Entityをpreemptせず、自軍所有拠点への脅威だけがpreemptできる責務境界を追加
 - `strategy.rs` / `resources/`: Stage 2では変更しない。新しい予約台帳 Resource も追加しない
 - 対戦評価: `scripts/eval_matchup.py` による V4 vs V3 / V4 vs V1 の勝率・ZOC 支配面積・ターン収入の比較検証が必須

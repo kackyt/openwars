@@ -172,6 +172,8 @@ enum CampaignProductionControl {
     Command(ProduceUnitCommand),
     /// 高優先作戦を完成できないため、汎用生産へ予算を流さず終了する。
     BlockGeneric,
+    /// 島嶼作戦の予約額を除いた余剰だけで、迎撃・戦闘枠を生産する。
+    ContinueWithSurplus(u32),
     /// キャンペーン要求が無いか全行を完成済みなので、V4汎用生産へ進める。
     Continue,
 }
@@ -184,6 +186,13 @@ struct SlotCandidate {
     facility: GridPosition,
     /// 枠への適合度。大きいほど良い。
     fitness: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CandidateConstraints {
+    remaining_funds: u32,
+    per_slot_budget: u32,
+    require_self_deployment: bool,
 }
 
 /// 生産命令と、その命令だけが持つV4作戦意図。
@@ -215,11 +224,12 @@ impl std::ops::Deref for PlannedProduction {
 /// `decide_production` から `AiVersion::uses_operation_driven_production()` が
 /// true のときだけ委譲される。V1/V2/V3 の経路には一切影響しない。
 pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<ProduceUnitCommand> {
-    match decide_campaign_production_v4(world, player_id) {
+    let campaign_surplus = match decide_campaign_production_v4(world, player_id) {
         CampaignProductionControl::Command(command) => return vec![command],
         CampaignProductionControl::BlockGeneric => return Vec::new(),
-        CampaignProductionControl::Continue => {}
-    }
+        CampaignProductionControl::ContinueWithSurplus(budget) => Some(budget),
+        CampaignProductionControl::Continue => None,
+    };
 
     let turn = world
         .get_resource::<crate::resources::MatchState>()
@@ -233,11 +243,14 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
         return next.into_iter().collect();
     }
 
-    let Some(scan) = BoardScan::collect(world, player_id) else {
+    let Some(mut scan) = BoardScan::collect(world, player_id) else {
         world.insert_resource(turn_plan);
         return Vec::new();
     };
-    let (planned, plan_trace) = plan_production(&scan, player_id);
+    if let Some(budget) = campaign_surplus {
+        scan.funds = scan.funds.min(budget);
+    }
+    let (planned, plan_trace) = plan_production(&scan, player_id, campaign_surplus.is_none());
 
     // 診断traceとは別に、生産完了イベントと照合する作戦意図を永続化する。
     let pending = planned
@@ -307,10 +320,14 @@ fn decide_campaign_production_v4(
             .unwrap_or_default();
         let next = cache.take_campaign_production_command(player_id);
         let blocks_generic = cache.campaign_production_blocks_generic(player_id);
+        let generic_budget = cache.campaign_production_generic_budget(player_id);
         world.insert_resource(cache);
         return match next {
             Some(command) => CampaignProductionControl::Command(command),
             None if blocks_generic => CampaignProductionControl::BlockGeneric,
+            None if generic_budget.is_some_and(|budget| budget > 0) => {
+                CampaignProductionControl::ContinueWithSurplus(generic_budget.unwrap_or(0))
+            }
             None => CampaignProductionControl::Continue,
         };
     }
@@ -332,21 +349,26 @@ fn decide_campaign_production_v4(
         &shortfalls,
         &scan.free_facilities,
         &scan.available_types,
+        &scan.map,
         &scan.master_data,
         scan.funds,
     );
-    let completed_all_rows = outcome.completed_all_rows;
+    let generic_budget = outcome.generic_funds;
     let mut cache = world
         .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
         .unwrap_or_default();
-    cache.set_campaign_production_plan(player_id, outcome.commands, completed_all_rows);
+    cache.set_v4_campaign_production_plan(player_id, outcome.commands, generic_budget);
     let next = cache.take_campaign_production_command(player_id);
     let blocks_generic = cache.campaign_production_blocks_generic(player_id);
+    let generic_budget = cache.campaign_production_generic_budget(player_id);
     world.insert_resource(cache);
 
     match next {
         Some(command) => CampaignProductionControl::Command(command),
         None if blocks_generic => CampaignProductionControl::BlockGeneric,
+        None if generic_budget.is_some_and(|budget| budget > 0) => {
+            CampaignProductionControl::ContinueWithSurplus(generic_budget.unwrap_or(0))
+        }
         None => CampaignProductionControl::Continue,
     }
 }
@@ -1171,6 +1193,7 @@ fn build_operation(
 fn plan_production(
     scan: &BoardScan,
     player_id: PlayerId,
+    allow_structural_slots: bool,
 ) -> (Vec<PlannedProduction>, ProductionPlanTrace) {
     let mut ctx = ReachCtx::default();
     let mut operations = build_operations(scan, &mut ctx);
@@ -1179,6 +1202,9 @@ fn plan_production(
 
     if operations.is_empty() {
         plan_trace.fallback = true;
+        if !allow_structural_slots {
+            return (Vec::new(), plan_trace);
+        }
         return (
             fallback_production(scan, player_id)
                 .into_iter()
@@ -1193,6 +1219,14 @@ fn plan_production(
 
     // 同格の作戦は「敵の到達が早い順」に処理する
     operations.sort_by_key(|op| (op.kind.priority_rank(), op.facts.enemy_contact_eta));
+    if !allow_structural_slots {
+        // 占領要員と輸送役は島嶼キャンペーン側で予約済み。余剰予算を同じ役割へ
+        // 二重投入せず、観測済みの敵に対する迎撃・護衛・撃破だけへ使う。
+        for operation in &mut operations {
+            operation.slots.capture_units = 0;
+            operation.slots.transport_slots = 0;
+        }
+    }
 
     plan_trace.operations = operations
         .iter()
@@ -1244,8 +1278,11 @@ fn plan_production(
             &operations[op_index],
             slot_kind,
             &used_facilities,
-            remaining_funds,
-            per_slot_budget,
+            CandidateConstraints {
+                remaining_funds,
+                per_slot_budget,
+                require_self_deployment: !allow_structural_slots,
+            },
         );
 
         let Some(candidate) = candidate else {
@@ -1272,6 +1309,7 @@ fn plan_production(
             slot_kind,
             remaining_funds,
             candidate.cost,
+            !allow_structural_slots,
         ) {
             plan_trace.steps.push(ProductionStepTrace {
                 operation_kind,
@@ -1625,8 +1663,7 @@ fn select_candidate(
     op: &Operation,
     kind: SlotKind,
     used_facilities: &HashSet<GridPosition>,
-    remaining_funds: u32,
-    per_slot_budget: u32,
+    constraints: CandidateConstraints,
 ) -> Option<SlotCandidate> {
     let mut best: Option<SlotCandidate> = None;
     let mut best_over_budget: Option<SlotCandidate> = None;
@@ -1639,10 +1676,18 @@ fn select_candidate(
             if !scan.can_produce(*terrain, *unit_type) {
                 continue;
             }
-            let Some(fitness) = slot_fitness(scan, ctx, op, kind, facility, stats) else {
+            let Some(fitness) = slot_fitness(
+                scan,
+                ctx,
+                op,
+                kind,
+                facility,
+                stats,
+                constraints.require_self_deployment,
+            ) else {
                 continue;
             };
-            if stats.cost == 0 || stats.cost > remaining_funds {
+            if stats.cost == 0 || stats.cost > constraints.remaining_funds {
                 continue;
             }
             // 枠の要求単位は種別ごとに違う（`OperationSlots::requirement` 参照）ので、
@@ -1658,7 +1703,7 @@ fn select_candidate(
             let opportunity_cost = if count_denominated {
                 stats.cost
             } else {
-                stats.cost.max(per_slot_budget)
+                stats.cost.max(constraints.per_slot_budget)
             }
             .max(1);
             let candidate = SlotCandidate {
@@ -1670,7 +1715,7 @@ fn select_candidate(
             // 予算内／予算超過の階層分けも体数系の枠にだけ残す。資金系の枠でこれを
             // やると、どれほど弱くても予算内の候補が常に強い候補に勝ってしまい、
             // 資金が潤沢でも安いユニットしか買わなくなる（＝戦力の逐次投入）。
-            let slot = if count_denominated && stats.cost > per_slot_budget.max(1) {
+            let slot = if count_denominated && stats.cost > constraints.per_slot_budget.max(1) {
                 &mut best_over_budget
             } else {
                 &mut best
@@ -1830,6 +1875,7 @@ fn slot_fitness(
     kind: SlotKind,
     facility: &GridPosition,
     stats: &UnitStats,
+    require_self_deployment: bool,
 ) -> Option<f32> {
     // 施設から作戦地点まで自力で到達できるか
     let self_deployable = ctx.is_reachable(
@@ -1914,6 +1960,11 @@ fn slot_fitness(
         }
         SlotKind::Combat => {
             if stats.can_capture || stats.max_cargo > 0 {
+                return None;
+            }
+            // キャンペーン予約を超えた余剰購入では、別便の輸送を暗黙に期待しない。
+            // これにより海外前線へ渡れない戦車を「いつか運べる」として買わない。
+            if require_self_deployment && !self_deployable {
                 return None;
             }
             // 自力で行けないなら、実際に運べる輸送手段が存在することが前提。
@@ -2047,6 +2098,7 @@ fn should_defer_purchase(
     kind: SlotKind,
     remaining_funds: u32,
     affordable_cost: u32,
+    require_self_deployment: bool,
 ) -> bool {
     if acquisition_mode(&op.facts) != AcquisitionMode::SquadPackage {
         return false;
@@ -2061,7 +2113,15 @@ fn should_defer_purchase(
             if !scan.can_produce(*terrain, *unit_type) || stats.cost <= remaining_funds {
                 continue;
             }
-            let Some(fitness) = slot_fitness(scan, ctx, op, kind, facility, stats) else {
+            let Some(fitness) = slot_fitness(
+                scan,
+                ctx,
+                op,
+                kind,
+                facility,
+                stats,
+                require_self_deployment,
+            ) else {
                 continue;
             };
             let scaled = fitness * 1000.0 / stats.cost as f32;
@@ -2083,8 +2143,16 @@ fn should_defer_purchase(
                 if !scan.can_produce(*terrain, stats.unit_type) {
                     return None;
                 }
-                slot_fitness(scan, ctx, op, kind, facility, stats)
-                    .map(|f| f * 1000.0 / stats.cost as f32)
+                slot_fitness(
+                    scan,
+                    ctx,
+                    op,
+                    kind,
+                    facility,
+                    stats,
+                    require_self_deployment,
+                )
+                .map(|f| f * 1000.0 / stats.cost as f32)
             })
         })
         .fold(0.0f32, f32::max);
@@ -2792,11 +2860,87 @@ mod tests {
         }
     }
 
+    /// キャンペーンの予約超過分は、構造枠を二重購入せず、自力展開可能な対敵戦力へ使う。
+    #[test]
+    fn campaign_surplus_targets_enemy_infantry_without_buying_stranded_tank() {
+        let mut map = flat_map(9, 3);
+        for y in 0..map.height {
+            map.set_terrain(4, y, Terrain::Sea).unwrap();
+        }
+        let infantry = UnitStats {
+            can_capture: true,
+            max_movement: 3,
+            ..stats(UnitType::Infantry, 1_000)
+        };
+        let tank = UnitStats {
+            movement_type: MovementType::Tank,
+            max_movement: 6,
+            ..stats(UnitType::Tank, 6_000)
+        };
+        let fighter = UnitStats {
+            movement_type: MovementType::Air,
+            max_movement: 8,
+            max_fuel: 70,
+            daily_fuel_consumption: 5,
+            ..stats(UnitType::Fighter, 16_000)
+        };
+        let transport = UnitStats {
+            movement_type: MovementType::Air,
+            max_movement: 7,
+            max_cargo: 2,
+            loadable_unit_types: vec![UnitType::Infantry],
+            ..stats(UnitType::TransportHelicopter, 4_000)
+        };
+        let mut damage_chart = DamageChart::new();
+        damage_chart.insert_damage(UnitType::Fighter, UnitType::Infantry, 80);
+        damage_chart.insert_damage(UnitType::Infantry, UnitType::Fighter, 0);
+        damage_chart.insert_damage(UnitType::Tank, UnitType::Infantry, 90);
+        damage_chart.insert_damage(UnitType::Infantry, UnitType::Tank, 0);
+        let scan = BoardScan {
+            map,
+            master_data: MasterDataRegistry::load().unwrap(),
+            damage_chart,
+            funds: 20_000,
+            free_facilities: vec![(pos(1, 1), Terrain::Factory), (pos(2, 1), Terrain::Airport)],
+            available_types: vec![
+                (UnitType::Infantry, infantry.clone()),
+                (UnitType::Tank, tank),
+                (UnitType::Fighter, fighter),
+                (UnitType::TransportHelicopter, transport),
+            ],
+            my_units: Vec::new(),
+            enemy_units: vec![UnitSnapshot {
+                entity: Some(Entity::from_raw(901)),
+                pos: pos(7, 1),
+                stats: infantry,
+                hp: 100,
+                free_cargo: 0,
+            }],
+            my_properties: vec![pos(1, 1), pos(2, 1)],
+            open_properties: vec![pos(7, 1)],
+            enemy_income: 0,
+            enemy_production_slots: 0,
+            enemy_facilities: Vec::new(),
+            my_income: 5_000,
+        };
+
+        let (commands, trace) = plan_production(&scan, PlayerId(1), false);
+
+        assert_eq!(commands.len(), 1, "commands={commands:?}, trace={trace:?}");
+        assert_eq!(commands[0].unit_type, UnitType::Fighter);
+        assert!(commands.iter().all(|command| {
+            !matches!(
+                command.unit_type,
+                UnitType::Infantry | UnitType::TransportHelicopter | UnitType::Tank
+            )
+        }));
+    }
+
     /// 同一手番の全施設を同じ残存脅威台帳で計画し、対空の次に地上対抗へ切り替える。
     #[test]
     fn multi_factory_plan_switches_after_air_threat_is_covered() {
         let scan = mixed_threat_multi_factory_scan();
-        let (commands, trace) = plan_production(&scan, PlayerId(0));
+        let (commands, trace) = plan_production(&scan, PlayerId(0), true);
         let combat_types: Vec<UnitType> = commands
             .iter()
             .map(|command| command.unit_type)
@@ -2817,7 +2961,7 @@ mod tests {
         scan.enemy_income = 10_000;
         scan.enemy_production_slots = 1;
 
-        let (commands, trace) = plan_production(&scan, PlayerId(0));
+        let (commands, trace) = plan_production(&scan, PlayerId(0), true);
 
         assert!(
             commands
@@ -2838,7 +2982,7 @@ mod tests {
     #[test]
     fn production_trace_attributes_every_command_to_a_slot() {
         let scan = multi_factory_scan();
-        let (commands, trace) = plan_production(&scan, PlayerId(0));
+        let (commands, trace) = plan_production(&scan, PlayerId(0), true);
 
         // 作戦が立つ盤面なので fallback には落ちない
         assert!(!trace.fallback);
