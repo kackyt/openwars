@@ -151,6 +151,12 @@ impl CliAiVersion {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RightPanelMode {
+    Info,
+    Stats,
+}
+
 pub struct UiState {
     pub current_screen: CurrentScreen,
     pub in_game_state: InGameState,
@@ -164,6 +170,7 @@ pub struct UiState {
     pub player_ai_versions: std::collections::HashMap<u32, CliAiVersion>,
     pub cursor_pos: (usize, usize),
     pub log_messages: Vec<String>,
+    pub right_panel_mode: RightPanelMode,
 }
 
 impl UiState {
@@ -186,7 +193,15 @@ impl UiState {
             player_ai_versions: ai_versions,
             cursor_pos: (0, 0),
             log_messages: Vec::new(),
+            right_panel_mode: RightPanelMode::Info,
         }
+    }
+
+    pub fn toggle_right_panel_mode(&mut self) {
+        self.right_panel_mode = match self.right_panel_mode {
+            RightPanelMode::Info => RightPanelMode::Stats,
+            RightPanelMode::Stats => RightPanelMode::Info,
+        };
     }
 
     pub fn add_log(&mut self, msg: String) {
@@ -643,7 +658,7 @@ impl App {
             _ => {}
         }
 
-        // AIターンの場合は一部のキー（終了など）以外は無視する
+        // AIターンの場合は一部のキー（終了、スタッツ表示切替）以外は無視する
         if let Some(world) = &self.world
             && let Some(match_state) = world.get_resource::<MatchState>()
             && let Some(players) = world.get_resource::<Players>()
@@ -654,7 +669,10 @@ impl App {
         {
             match key.code {
                 crossterm::event::KeyCode::Char('q') => self.should_quit = true,
-                _ => return, // AIターン中は他の入力を無視
+                crossterm::event::KeyCode::Tab | crossterm::event::KeyCode::Char('s') => {
+                    self.ui_state.toggle_right_panel_mode();
+                }
+                _ => return, // AIターン中は移動等のゲーム操作キー入力を無視
             }
         }
 
@@ -662,6 +680,7 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Tab | KeyCode::Char('s') => self.ui_state.toggle_right_panel_mode(),
             KeyCode::Esc => self.return_to_map_selection(),
             KeyCode::Up
             | KeyCode::Char('k')
