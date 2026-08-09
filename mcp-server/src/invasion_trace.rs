@@ -4,7 +4,7 @@ use bevy_ecs::event::EventCursor;
 use bevy_ecs::prelude::*;
 use serde::Serialize;
 
-use engine::ai::emergency::EmergencyMissionPlan;
+use engine::ai::emergency::{CriticalSiteThreatKind, EmergencyMissionPlan, EmergencyResponse};
 use engine::ai::idle_audit::IdleAuditDiagnostics;
 use engine::ai::island_campaign::{
     IslandCampaignAssessment, IslandCampaignAssignment, IslandCampaignDecision,
@@ -157,6 +157,46 @@ pub struct IdleUnitSnapshot {
     pub mission_stalled: bool,
     /// 分類C: 行動可能なままターンを終えた。
     pub actionable: bool,
+}
+
+/// #76: 生産口封鎖に対して実際に割り当てられた解除任務。
+#[derive(Debug, Serialize)]
+pub struct FactoryReliefMissionSnapshot {
+    pub assigned_entity: u64,
+    pub threat_entity: u64,
+    pub site_x: usize,
+    pub site_y: usize,
+    pub site_terrain: String,
+    pub response: String,
+}
+
+pub fn snapshot_factory_relief_plan(
+    world: &World,
+    player_id: PlayerId,
+) -> Vec<FactoryReliefMissionSnapshot> {
+    let Some(plan) = world.get_resource::<EmergencyMissionPlan>() else {
+        return Vec::new();
+    };
+    plan.missions
+        .iter()
+        .filter(|mission| {
+            mission.owner_id == player_id
+                && mission.threat.kind == CriticalSiteThreatKind::ProductionBlockade
+        })
+        .map(|mission| FactoryReliefMissionSnapshot {
+            assigned_entity: mission.assigned_entity.to_bits(),
+            threat_entity: mission.threat.threat_entity.to_bits(),
+            site_x: mission.threat.site_position.x,
+            site_y: mission.threat.site_position.y,
+            site_terrain: mission.threat.site_terrain.as_str().to_string(),
+            response: match mission.response {
+                EmergencyResponse::EliminateThreat => "eliminate",
+                EmergencyResponse::OccupySite => "occupy",
+                EmergencyResponse::BlockRoute => "block_route",
+            }
+            .to_string(),
+        })
+        .collect()
 }
 
 /// Squad 単位のダイジェスト。分類D（停滞Squad）はこの列のターン間差分で判定する。

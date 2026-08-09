@@ -597,5 +597,41 @@ class CompletedRoundTests(unittest.TestCase):
         self.assertEqual(60, completed_actions)
 
 
+class FactoryReliefTraceTests(unittest.TestCase):
+    def test_write_trace_jsonl_persists_factory_relief_missions(self):
+        mission = {
+            "assigned_entity": 10,
+            "threat_entity": 20,
+            "site_x": 5,
+            "site_y": 3,
+            "site_terrain": "工場",
+            "response": "eliminate",
+        }
+        results = [
+            {
+                "map": "map_1",
+                "p1": "V4",
+                "p2": "V3",
+                "seed": 42,
+                "factory_relief_history": [
+                    {
+                        "round": 9,
+                        "turn": 9,
+                        "player_id": 1,
+                        "missions": [mission],
+                    }
+                ],
+            }
+        ]
+
+        with TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "trace.jsonl"
+            eval_matchup.write_trace_jsonl(output, results)
+            records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual([mission], records[0]["factory_relief"])
+        self.assertEqual(1, records[0]["player_id"])
+
+
 if __name__ == "__main__":
     unittest.main()
