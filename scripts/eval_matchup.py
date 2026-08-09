@@ -136,23 +136,41 @@ def normalize_ai_version(version):
     return normalized
 
 
-def build_match_specs(maps, subject, baseline, seeds):
+def build_match_specs(maps, subject, baseline, seeds, grid_type="hex"):
     """各 seed を両方の手番へ決定的な順序で割り当てる。"""
     specs = []
     for map_name in maps:
         for seed in seeds:
-            specs.append({"map": map_name, "p1": subject, "p2": baseline, "seed": seed})
-            specs.append({"map": map_name, "p1": baseline, "p2": subject, "seed": seed})
+            specs.append({
+                "map": map_name,
+                "p1": subject,
+                "p2": baseline,
+                "seed": seed,
+                "grid_type": grid_type,
+            })
+            specs.append({
+                "map": map_name,
+                "p1": baseline,
+                "p2": subject,
+                "seed": seed,
+                "grid_type": grid_type,
+            })
     return specs
 
 
-def build_issue58_match_specs(protocol, maps, seeds):
+def build_issue58_match_specs(protocol, maps, seeds, grid_type="hex"):
     """Issue #58の固定評価プロトコルを決定的な順序で構築する。"""
     if protocol == ISSUE58_V3_V1:
-        return build_match_specs(maps, "V3", "V1", seeds)
+        return build_match_specs(maps, "V3", "V1", seeds, grid_type=grid_type)
     if protocol == ISSUE58_V3_SELFPLAY:
         return [
-            {"map": map_name, "p1": "V3", "p2": "V3", "seed": seed}
+            {
+                "map": map_name,
+                "p1": "V3",
+                "p2": "V3",
+                "seed": seed,
+                "grid_type": grid_type,
+            }
             for map_name in maps
             for seed in seeds
         ]
@@ -258,6 +276,7 @@ def run_single_game(
     p2_ver,
     max_turns,
     seed=None,
+    grid_type="hex",
     ui_callback=None,
     tool_caller=None,
 ):
@@ -265,9 +284,9 @@ def run_single_game(
     p1_ver = normalize_ai_version(p1_ver)
     p2_ver = normalize_ai_version(p2_ver)
     tool = tool_caller or call_tool
-    if ui_callback: ui_callback({"type": "log", "msg": f"Match started: P1({p1_ver}) vs P2({p2_ver}) on {map_name}"})
+    if ui_callback: ui_callback({"type": "log", "msg": f"Match started: P1({p1_ver}) vs P2({p2_ver}) on {map_name} ({grid_type})"})
     
-    load_args = {"map_name": map_name}
+    load_args = {"map_name": map_name, "grid_type": grid_type}
     if seed is not None:
         load_args["seed"] = seed
     tool("load_map", load_args)
@@ -296,6 +315,7 @@ def run_single_game(
             "result": result,
             "turns": turns,
             "seed": seed,
+            "grid_type": grid_type,
             "thinking_times": thinking_times,
             "action_counts": action_counts,
             "metrics": metrics,
@@ -935,6 +955,13 @@ def main():
         default=None,
         help="Baseline JSON artifact required for Issue #58 result runs",
     )
+    parser.add_argument(
+        "--grid-type",
+        "--map-type",
+        choices=["square", "hex"],
+        default="hex",
+        help="Grid topology for maps (square or hex, default: hex)",
+    )
     parser.add_argument("--stall-turns", type=int, default=5, help="Subject turns before an unchanged transport is considered stalled")
     parser.add_argument("--output", default="matchup_report.md", help="Output file for the final report")
     args = parser.parse_args()
@@ -969,6 +996,7 @@ def main():
                 args.issue58_protocol,
                 maps,
                 seeds,
+                grid_type=args.grid_type,
             )
         except ValueError as error:
             parser.error(str(error))
@@ -1031,7 +1059,7 @@ def main():
                 parser.error(str(error))
     else:
         seeds = tuple(args.seed for _ in range(args.games))
-        match_specs = build_match_specs(maps, args.p1, args.p2, seeds)
+        match_specs = build_match_specs(maps, args.p1, args.p2, seeds, grid_type=args.grid_type)
 
     init_mcp_server()
     all_results = []
@@ -1090,8 +1118,9 @@ def main():
                         spec["p1"],
                         spec["p2"],
                         args.max_turns,
-                        spec["seed"],
-                        lambda e: ui_callback_tui(e, layout, live),
+                        seed=spec["seed"],
+                        grid_type=spec.get("grid_type", args.grid_type),
+                        ui_callback=lambda e: ui_callback_tui(e, layout, live),
                     )
                     result.update(spec)
                     all_results.append(result)
@@ -1103,8 +1132,9 @@ def main():
                     spec["p1"],
                     spec["p2"],
                     args.max_turns,
-                    spec["seed"],
-                    ui_callback_batch,
+                    seed=spec["seed"],
+                    grid_type=spec.get("grid_type", args.grid_type),
+                    ui_callback=ui_callback_batch,
                 )
                 result.update(spec)
                 all_results.append(result)

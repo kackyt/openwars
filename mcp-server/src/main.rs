@@ -25,8 +25,8 @@ use engine::components::{
     UnitStats,
 };
 use engine::resources::master_data::MasterDataRegistry;
-use engine::resources::{MatchState, Players};
-use engine::setup::initialize_world_from_master_data;
+use engine::resources::{GridTopology, MatchState, Players};
+use engine::setup::initialize_world_from_master_data_with_topology;
 
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -46,6 +46,7 @@ fn parse_player_id(value: u64) -> Result<PlayerId, String> {
 pub struct LoadMapArgs {
     pub map_name: String,
     pub seed: Option<u64>,
+    pub grid_type: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -102,8 +103,26 @@ impl OpenWarsAiServer {
         let registry =
             MasterDataRegistry::load().map_err(|e| format!("Failed to load master data: {}", e))?;
 
-        let (mut world, schedule) = initialize_world_from_master_data(&registry, &args.map_name)
-            .map_err(|e| format!("Initialization failed: {}", e))?;
+        let topology = match args
+            .grid_type
+            .as_deref()
+            .unwrap_or("hex")
+            .to_lowercase()
+            .as_str()
+        {
+            "square" => GridTopology::Square,
+            "hex" => GridTopology::Hex,
+            other => {
+                return Err(format!(
+                    "Unknown grid_type: {}. Expected 'square' or 'hex'",
+                    other
+                ));
+            }
+        };
+
+        let (mut world, schedule) =
+            initialize_world_from_master_data_with_topology(&registry, &args.map_name, topology)
+                .map_err(|e| format!("Initialization failed: {}", e))?;
         if let Some(seed) = args.seed {
             world.insert_resource(engine::resources::GameRng::new(seed));
         }
