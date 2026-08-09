@@ -64,6 +64,11 @@
   - Combat/Intercept枠の作戦anchorと優先敵Entityを生産された実Entityへ対応付け、V4所有の局地Attack/Interception任務として保持する
   - 優先敵が生存・到達可能な間は汎用beam searchの再目標化から保護し、消滅後だけ同一前線の占領unit、輸送unit、その他戦闘unitへ再目標化する
 
+- **改善**: V4で得た戦略標的価値をV1〜V4の共通戦術層へ横展開
+  - 攻撃と接近の標的価値を敵unit本体のcostだけでなく、輸送中cargoのcostと、敵占領unitが他勢力拠点上にいる場合の1ターン分の収入損失まで含めて評価する
+  - 輸送中cargoは輸送役の価値へ畳み込み、盤外座標を持つ独立した敵として追跡しない
+  - この共通評価はV4固有の生産選定をV1へ移植せず、V1の単体行動系とV2/V3/V4のSquad行動系の双方へ適用する
+
 - **新規**: 2つの調達モードと自動選択
   - `Replenishment`（逐次補充）: 不足を毎ターン単発購入し即座に前線へ送る。展開リードタイムが短く輸送不要な作戦向け
   - `SquadPackage`（一括編成）: 完全パッケージが揃うまで予算を予約し、揃ってから発進する。輸送必須または長リードタイムの作戦向け
@@ -127,6 +132,6 @@
 - `engine/src/ai/island_campaign.rs` / `island_campaign_analysis.rs`: 洋上 Reinforce の実 cargo と生産可能輸送手段を出発島・積載可能兵種込みで照合し、輸送不足を shortfall として保持。Assault は作戦優先度、将来予算予約、生産可能経路別の輸送編成、初動上陸波の容量を同じ作戦状態で管理する
 - `engine/src/ai/island_campaign.rs` / `island_campaign_analysis.rs`: 加えて、相対収入と地上／航空／海上の前進補給網から兵站前提作戦を導出し、新規Assaultとの依存関係を管理する
 - `engine/src/ai/squad.rs`: 自力展開戦力と輸送 cargo の分離、複数 cargo の Pickup 進行
-- `engine/src/ai/engine.rs`: Drop に参加した輸送役と cargo の双方を当該ターンの行動済みとして記録
+- `engine/src/ai/engine.rs`: Drop に参加した輸送役と cargo の双方を当該ターンの行動済みとして記録。加えてV1〜V4共通の攻撃・接近評価へ、搭載兵力と占領阻止を含む戦略標的価値を導入し、輸送中cargoの独立追跡を除外
 - `strategy.rs` / `resources/`: Stage 2では変更しない。新しい予約台帳 Resource も追加しない
 - 対戦評価: `scripts/eval_matchup.py` による V4 vs V3 / V4 vs V1 の勝率・ZOC 支配面積・ターン収入の比較検証が必須

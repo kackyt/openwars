@@ -1,6 +1,6 @@
 ---
 title: V4 生産AI 修正計画（map_3 渡洋作戦の成立）
-version: 1.5.0
+version: 1.6.0
 status: draft
 owner: kackyt
 created: 2026-08-07
@@ -21,7 +21,7 @@ V4 は「ハードコードされた理想割合をやめ、戦況に応じて�
 
 コードを追った結果、これらは別々の不具合ではなく **2つの構造欠陥** に集約される（副次要因を含め RC-1〜RC-4）。上限値の追加では直らない（上限で塞がない／敵の増援分で頭打ちにしない）。本計画は要求額を絞らず、**同じ予算の使い道（編成）を戦況に追従させる**方向で直す。
 
-> **前版からの訂正**: 旧 RC-2 / Stage 2 は `planner.rs` / `missions.rs` の輸送ミッションを対象にしていた。しかしこの2ファイルは [execute_ai_turn_v1](engine/src/ai/engine.rs#L981) からのみ呼ばれる **V1 専用**であり、V4 は1行も通らない。V3/V4 が共有する戦術層は `squad.rs` + `island_campaign*.rs` + `beam_search.rs` である。したがって「共用層 `planner.rs` を全AI共通で拡張する」という当初の選択肢は前提ごと成立しない（V1 には触れない）。実際の欠陥は下記 RC-2 に差し替える。
+> **前版からの訂正**: 旧 RC-2 / Stage 2 は `planner.rs` / `missions.rs` の輸送ミッションを対象にしていた。しかしこの2ファイルは [execute_ai_turn_v1](engine/src/ai/engine.rs#L981) からのみ呼ばれる **V1 専用**であり、V4 は1行も通らない。V3/V4 が共有する戦術層は `squad.rs` + `island_campaign*.rs` + `beam_search.rs` である。したがって「共用層 `planner.rs` を全AI共通で拡張する」という当初の選択肢は前提ごと成立しない（Stage 2ではV1に触れない）。実際の欠陥は下記 RC-2 に差し替える。Stage 4完了後の横展開では、V4生産モデルではなくゲームルールから導ける標的価値だけをV1にも共有する。
 
 ---
 
@@ -358,7 +358,7 @@ Stage 3は敵初期島への直行を成立させたが、`logs/battle_map3.json
 | ファイル | 内容 |
 |---|---|
 | `engine/src/ai/idle_audit.rs`（新規） | **遊兵カウンタ**。`audit_idle_units(world, player_id, cooldown) -> IdleAudit`（純粋関数）と分類 A/B/C の定義 |
-| `engine/src/ai/engine.rs` | `execute_ai_turn_v2` のターン終了直前（[1332](engine/src/ai/engine.rs#L1332)）で `audit_idle_units` を呼び per-turn リソースへ格納 |
+| `engine/src/ai/engine.rs` | `execute_ai_turn_v2` のターン終了直前（[1332](engine/src/ai/engine.rs#L1332)）で `audit_idle_units` を呼び per-turn リソースへ格納。加えてV1〜V4共通の攻撃・接近評価へ搭載cargoと占領阻止を含む標的価値を導入 |
 | `mcp-server/src/invasion_trace.rs` | `IdleAudit` のスナップショットを既存レコードに1フィールド追加。D（停滞 Squad）はターン間差分で算出 |
 | `engine/src/ai/v4/mod.rs` | `slot_fitness` の限界価値化、残存脅威の減衰、キャンペーン不足分の先行消費と同一手番キュー、未完成時の汎用生産ブロック、トレース |
 | `engine/src/ai/v4/operation.rs` | 残存脅威を `Operation` / `OperationFacts` に載せる |
@@ -370,7 +370,7 @@ Stage 3は敵初期島への直行を成立させたが、`logs/battle_map3.json
 
 `planner.rs` / `missions.rs` は **V1 専用のため変更しない**。
 
-**回帰の範囲について**: Stage 0〜3 のうち RC-1／RC-2／RC-3 の修正は `v4/` 配下に閉じるため V1/V2/V3 に影響しない。一方 **RC-4 は共有層（`island_campaign*.rs`）の修正なので V3 の挙動も変わる**（改善方向だが、変わることは事実）。したがって V3 側の回帰確認を検証に含める。
+**回帰の範囲について**: Stage 0〜3 のうち RC-1／RC-2／RC-3 の修正は `v4/` 配下に閉じるため V1/V2/V3 に影響しない。一方 **RC-4 は共有層（`island_campaign*.rs`）の修正なので V3 の挙動も変わる**（改善方向だが、変わることは事実）。さらにStage 4完了後の戦略標的価値は `engine.rs` のV1系・V2系双方へ入るためV1〜V4へ影響する。したがって V3対V1を3マップ・両席で回帰確認する。
 
 CLAUDE.md 準拠: ゲームルールの判定は `engine` 内に閉じ、`cli` / `gui` には出さない。コメントは日本語。
 
@@ -433,6 +433,15 @@ Stage 4の複数目標修正後12ターン単一seed評価では、拠点・収�
 ---
 
 ## Changelog
+
+### [1.6.0] - 2026-08-09
+
+#### 変更
+
+- 敵unit本体costに搭載cargo costと目前の占領による1ターン収入を加える戦略標的価値を、V1〜V4の共通攻撃・接近評価へ横展開。
+- `Transporting`中のcargoを盤外座標の独立敵として追跡せず、搭載元輸送unitの価値へ畳み込むよう修正。
+- V1/V3の搭載済み輸送優先テストを追加し、workspace 471件成功・1件ignored、OpenSpec 46/46、fmt/clippy成功を確認。
+- release版12ターン評価ではV3対V1が3マップ・両席で3勝3敗。map_3はV3が両席ともV1を収入・拠点数で上回った。V4対V3は0勝2敗で、Decision 19の任務接続と余剰資金再投資を未完了ゲートとして維持。
 
 ### [1.5.0] - 2026-08-09
 

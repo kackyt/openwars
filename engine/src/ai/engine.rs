@@ -34,6 +34,42 @@ fn transport_has_other_actionable_cargo(
         })
 }
 
+/// 標的本体だけでなく、輸送中の兵力と目前の占領による収入損失も含めた戦略価値を返す。
+/// 輸送ユニットへのダメージは搭載ユニットにも同期されるため、搭載兵の価格を同率で評価する。
+fn strategic_target_value(
+    stats: &UnitStats,
+    position: GridPosition,
+    owner: PlayerId,
+    cargo: Option<&crate::components::CargoCapacity>,
+    unit_costs: &HashMap<Entity, u32>,
+    properties: &[(GridPosition, Terrain, Option<PlayerId>)],
+    registry: &MasterDataRegistry,
+) -> u32 {
+    let cargo_value = cargo
+        .into_iter()
+        .flat_map(|capacity| capacity.loaded.iter())
+        .filter_map(|entity| unit_costs.get(entity))
+        .fold(0_u32, |total, cost| total.saturating_add(*cost));
+
+    // 占領可能ユニットが他勢力の物件上にいれば、次に失い得る1ターン分の収入を加える。
+    let capture_risk = if stats.can_capture {
+        properties
+            .iter()
+            .find(|(property_position, _, property_owner)| {
+                *property_position == position && *property_owner != Some(owner)
+            })
+            .map(|(_, terrain, _)| registry.landscape_income(terrain.as_str()))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    stats
+        .cost
+        .saturating_add(cargo_value)
+        .saturating_add(capture_risk)
+}
+
 #[derive(Resource, Default)]
 pub struct AiProductionCooldown(pub HashSet<(usize, usize)>);
 
@@ -246,6 +282,13 @@ pub fn decide_ai_action(
     let mut best_overall_choice: Option<(Entity, AiCommand)> = None;
 
     let mut turn_cache = crate::ai::turn_distance::AiTurnCache::default();
+    let unit_costs: HashMap<Entity, u32> = {
+        let mut query = world.query::<(Entity, &UnitStats)>();
+        query
+            .iter(world)
+            .map(|(entity, stats)| (entity, stats.cost))
+            .collect()
+    };
 
     for unit_entity in movable_units {
         let (stats, pos, fuel, atk_hp, atk_ammo) = {
@@ -310,14 +353,32 @@ pub fn decide_ai_action(
             u32,
             u32,
         )> = {
-            let mut q = world.query::<(&GridPosition, &Faction, &UnitStats, &Health)>();
+            let mut q = world.query::<(
+                &GridPosition,
+                &Faction,
+                &UnitStats,
+                &Health,
+                Option<&crate::components::CargoCapacity>,
+                Option<&crate::components::Transporting>,
+            )>();
             q.iter(world)
-                .filter(|(_, f, _, h)| f.0 != player_id && h.current > 0)
-                .map(|(p, _, s, h)| {
+                // 輸送中の兵は盤外座標の実体なので、独立した追跡対象にはしない。
+                .filter(|(_, f, _, h, _, transporting)| {
+                    f.0 != player_id && h.current > 0 && transporting.is_none()
+                })
+                .map(|(p, faction, s, h, cargo, _)| {
                     (
                         *p,
                         s.unit_type,
-                        s.cost,
+                        strategic_target_value(
+                            s,
+                            *p,
+                            faction.0,
+                            cargo,
+                            &unit_costs,
+                            &properties,
+                            &registry,
+                        ),
                         h.current,
                         s.min_range,
                         s.max_range,
@@ -697,10 +758,11 @@ pub fn decide_ai_action(
                     }
 
                     // ターゲットの詳細を取得してスコアを加点
-                    if let (Some(t_stats), Some(t_health), Some(t_pos)) = (
+                    if let (Some(t_stats), Some(t_health), Some(t_pos), Some(t_faction)) = (
                         world.get::<UnitStats>(target_entity),
                         world.get::<Health>(target_entity),
                         world.get::<GridPosition>(target_entity),
+                        world.get::<Faction>(target_entity),
                     ) {
                         // 撃破判定・ダメージ期待値の算出: 攻撃側HP、弾薬、距離、および地形防御ボーナスを考慮
                         let t_terrain = map
@@ -731,9 +793,18 @@ pub fn decide_ai_action(
                         let mut attack_score = 2000;
 
                         // 与えるダメージ量に応じた加点 (0 ~ 10000程度)
-                        // ダメージ量 * 敵のコスト / 100
+                        // ダメージ量 * 敵本体・搭載兵・占領阻止の戦略価値 / 100
                         // 100%時のダメージ(base_dmg)ではなく、現在のHPや弾薬を考慮した期待ダメージ(expected_actual_damage)を使用する
-                        let damage_val = (expected_actual_damage * t_stats.cost) / 100;
+                        let target_value = strategic_target_value(
+                            t_stats,
+                            *t_pos,
+                            t_faction.0,
+                            world.get::<crate::components::CargoCapacity>(target_entity),
+                            &unit_costs,
+                            &properties,
+                            &registry,
+                        );
+                        let damage_val = expected_actual_damage.saturating_mul(target_value) / 100;
                         attack_score += damage_val as i32;
 
                         // 戦闘不能時は攻撃を躊躇させる（撃破できない限り）
@@ -1567,6 +1638,13 @@ pub fn decide_ai_action_v2(
             .map(|(p, prop)| (*p, prop.terrain, prop.owner_id))
             .collect()
     };
+    let unit_costs: HashMap<Entity, u32> = {
+        let mut query = world.query::<(Entity, &UnitStats)>();
+        query
+            .iter(world)
+            .map(|(entity, stats)| (entity, stats.cost))
+            .collect()
+    };
     let enemy_units: Vec<(
         GridPosition,
         crate::resources::UnitType,
@@ -1576,14 +1654,32 @@ pub fn decide_ai_action_v2(
         u32,
         u32,
     )> = {
-        let mut q = world.query::<(&GridPosition, &Faction, &UnitStats, &Health)>();
+        let mut q = world.query::<(
+            &GridPosition,
+            &Faction,
+            &UnitStats,
+            &Health,
+            Option<&crate::components::CargoCapacity>,
+            Option<&crate::components::Transporting>,
+        )>();
         q.iter(world)
-            .filter(|(_, f, _, h)| f.0 != player_id && h.current > 0)
-            .map(|(p, _, s, h)| {
+            // 輸送中の兵は輸送ユニットの価値へ畳み込み、盤外の独立標的にはしない。
+            .filter(|(_, f, _, h, _, transporting)| {
+                f.0 != player_id && h.current > 0 && transporting.is_none()
+            })
+            .map(|(p, faction, s, h, cargo, _)| {
                 (
                     *p,
                     s.unit_type,
-                    s.cost,
+                    strategic_target_value(
+                        s,
+                        *p,
+                        faction.0,
+                        cargo,
+                        &unit_costs,
+                        &properties,
+                        &registry,
+                    ),
                     h.current,
                     s.min_range,
                     s.max_range,
@@ -2145,10 +2241,11 @@ pub fn decide_ai_action_v2(
                     }
 
                     // ターゲットの詳細を取得してスコアを加点
-                    if let (Some(t_stats), Some(t_health), Some(t_pos)) = (
+                    if let (Some(t_stats), Some(t_health), Some(t_pos), Some(t_faction)) = (
                         world.get::<UnitStats>(target_entity),
                         world.get::<Health>(target_entity),
                         world.get::<GridPosition>(target_entity),
+                        world.get::<Faction>(target_entity),
                     ) {
                         // 撃破判定・ダメージ期待値の算出
                         let t_terrain = map
@@ -2176,7 +2273,16 @@ pub fn decide_ai_action_v2(
                         }
 
                         let mut attack_score = 2000;
-                        let damage_val = (expected_actual_damage * t_stats.cost) / 100;
+                        let target_value = strategic_target_value(
+                            t_stats,
+                            *t_pos,
+                            t_faction.0,
+                            world.get::<crate::components::CargoCapacity>(target_entity),
+                            &unit_costs,
+                            &properties,
+                            &registry,
+                        );
+                        let damage_val = expected_actual_damage.saturating_mul(target_value) / 100;
                         attack_score += damage_val as i32;
 
                         if is_combat_ineffective && expected_actual_damage < t_health.current {
@@ -2394,6 +2500,71 @@ mod tests {
         assert!(!transport_has_other_actionable_cargo(
             &world, transport, first
         ));
+    }
+
+    #[test]
+    fn strategic_target_value_includes_cargo_and_immediate_capture_risk() {
+        let mut world = World::new();
+        let first_cargo = world.spawn_empty().id();
+        let second_cargo = world.spawn_empty().id();
+        let unit_costs = HashMap::from([(first_cargo, 1000), (second_cargo, 3000)]);
+        let cargo = crate::components::CargoCapacity {
+            max: 2,
+            loaded: vec![first_cargo, second_cargo],
+        };
+        let registry = MasterDataRegistry::load().unwrap();
+        let enemy = PlayerId(2);
+        let position = GridPosition { x: 2, y: 3 };
+        let properties = vec![(position, Terrain::City, Some(PlayerId(1)))];
+
+        let transport = UnitStats {
+            cost: 4000,
+            ..UnitStats::mock()
+        };
+        assert_eq!(
+            strategic_target_value(
+                &transport,
+                position,
+                enemy,
+                Some(&cargo),
+                &unit_costs,
+                &properties,
+                &registry,
+            ),
+            8000
+        );
+
+        let occupier = UnitStats {
+            cost: 1000,
+            can_capture: true,
+            ..UnitStats::mock()
+        };
+        assert_eq!(
+            strategic_target_value(
+                &occupier,
+                position,
+                enemy,
+                None,
+                &unit_costs,
+                &properties,
+                &registry,
+            ),
+            1000 + registry.landscape_income(Terrain::City.as_str())
+        );
+
+        let owned_properties = vec![(position, Terrain::City, Some(enemy))];
+        assert_eq!(
+            strategic_target_value(
+                &occupier,
+                position,
+                enemy,
+                None,
+                &unit_costs,
+                &owned_properties,
+                &registry,
+            ),
+            1000
+        );
     }
 
     #[test]
@@ -3805,6 +3976,134 @@ mod tests {
         settings.set_version(PlayerId(2), version);
         world.insert_resource(settings);
         world
+    }
+
+    /// 同条件の輸送ヘリから、搭載兵を持つ高価値目標を選ぶか検証するワールドを作る。
+    fn setup_strategic_target_selection_world() -> (World, Entity) {
+        let mut world = setup_v3_test_world(3, crate::ai::ai_version::AiVersion::V3);
+        let mut damage_chart = DamageChart::new();
+        damage_chart.insert_damage(UnitType::Fighter, UnitType::TransportHelicopter, 80);
+        damage_chart.insert_damage(UnitType::TransportHelicopter, UnitType::Fighter, 0);
+        world.insert_resource(damage_chart);
+
+        let player = PlayerId(1);
+        let enemy = PlayerId(2);
+        world.spawn((
+            Faction(player),
+            HasMoved(false),
+            ActionCompleted(false),
+            GridPosition { x: 1, y: 0 },
+            UnitStats {
+                unit_type: UnitType::Fighter,
+                cost: 14000,
+                movement_type: crate::resources::MovementType::Air,
+                max_movement: 0,
+                min_range: 1,
+                max_range: 1,
+                max_ammo1: 10,
+                max_fuel: 99,
+                ..UnitStats::mock()
+            },
+            Health {
+                current: 100,
+                max: 100,
+            },
+            crate::components::Ammo {
+                ammo1: 10,
+                max_ammo1: 10,
+                ammo2: 0,
+                max_ammo2: 0,
+            },
+            crate::components::Fuel {
+                current: 99,
+                max: 99,
+            },
+        ));
+
+        let transport_stats = UnitStats {
+            unit_type: UnitType::TransportHelicopter,
+            cost: 4000,
+            movement_type: crate::resources::MovementType::Air,
+            max_cargo: 2,
+            ..UnitStats::mock()
+        };
+        world.spawn((
+            Faction(enemy),
+            GridPosition { x: 0, y: 0 },
+            transport_stats.clone(),
+            Health {
+                current: 100,
+                max: 100,
+            },
+            crate::components::CargoCapacity {
+                max: 2,
+                loaded: Vec::new(),
+            },
+        ));
+
+        let cargo = world
+            .spawn((
+                Faction(enemy),
+                GridPosition { x: 99, y: 99 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    cost: 12000,
+                    can_capture: true,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Transporting(Entity::from_raw(0)),
+            ))
+            .id();
+        let loaded_transport = world
+            .spawn((
+                Faction(enemy),
+                GridPosition { x: 2, y: 0 },
+                transport_stats,
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::CargoCapacity {
+                    max: 2,
+                    loaded: vec![cargo],
+                },
+            ))
+            .id();
+        world
+            .entity_mut(cargo)
+            .insert(crate::components::Transporting(loaded_transport));
+
+        (world, loaded_transport)
+    }
+
+    #[test]
+    fn v1_prioritizes_transport_with_loaded_combat_value() {
+        let (mut world, loaded_transport) = setup_strategic_target_selection_world();
+
+        let (_, action) = decide_ai_action(&mut world, PlayerId(1), &HashSet::new())
+            .expect("V1が攻撃行動を選ぶこと");
+
+        assert!(matches!(
+            action,
+            AiCommand::Attack { target_entity, .. } if target_entity == loaded_transport
+        ));
+    }
+
+    #[test]
+    fn v3_prioritizes_transport_with_loaded_combat_value() {
+        let (mut world, loaded_transport) = setup_strategic_target_selection_world();
+
+        let (_, action) = decide_ai_action_v2(&mut world, PlayerId(1), &HashSet::new())
+            .expect("V3が攻撃行動を選ぶこと");
+
+        assert!(matches!(
+            action,
+            AiCommand::Attack { target_entity, .. } if target_entity == loaded_transport
+        ));
     }
 
     #[test]

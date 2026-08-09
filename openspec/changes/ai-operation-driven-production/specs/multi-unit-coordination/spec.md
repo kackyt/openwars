@@ -58,3 +58,22 @@ MUST: AIは1つの目標に対して、適切な数のユニットを連携さ�
 
 - **WHEN** AssaultがForming、Pickup、TransitまたはDropへ遷移した後に追加の戦闘要員が利用可能になったとき
 - **THEN** 追加戦闘要員を進行中の侵攻波へ追加入隊させず、既存波のPickupと輸送を継続する
+
+### Requirement: Strategic Target Valuation
+
+MUST: V1〜V4の戦術行動は、敵unit本体だけでなく、そのunitが運ぶ兵力と目前の占領による経済損失を含む戦略標的価値で攻撃対象と接近対象を評価しなければならない。
+
+#### Scenario: 搭載済み輸送を空輸送より優先する
+
+- **WHEN** 同距離・同HP・同unit種の敵輸送unitが複数あり、一方だけがcargoを搭載しているとき
+- **THEN** 輸送unit本体のcostへ搭載cargoのunit costを加え、同じ期待損害なら搭載済み輸送を優先する
+
+#### Scenario: 目前の拠点占領を阻止する
+
+- **WHEN** 敵の占領可能unitが敵自身の所有ではない収入拠点上にいるとき
+- **THEN** 当該unitの標的価値へその拠点の1ターン分の実収入を加える。敵自身の所有拠点上では加えない
+
+#### Scenario: 輸送中cargoを独立標的として追跡しない
+
+- **WHEN** 敵cargoが`Transporting`状態で盤外座標を保持しているとき
+- **THEN** cargoを独立した接近対象から除外し、そのunit costを搭載元輸送unitの標的価値へ含める
