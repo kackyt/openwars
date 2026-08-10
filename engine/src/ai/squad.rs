@@ -323,8 +323,12 @@ fn select_pickup_position(
                 continue;
             }
 
-            let mut max_distance = map.distance(transport_position.x, transport_position.y, x, y);
-            let mut total_distance = max_distance;
+            let transport_distance = map.distance(transport_position.x, transport_position.y, x, y);
+            let transport_turns = transport_distance.div_ceil(transport_stats.max_movement.max(1));
+            let mut max_turns = transport_turns;
+            let mut total_turns = transport_turns;
+            let mut max_distance = transport_distance;
+            let mut total_distance = transport_distance;
             let all_cargo_can_board = cargo_data.iter().all(|(position, stats)| {
                 let boarding_distance = if terrain == Terrain::Shoal
                     && transport_stats.movement_type == crate::resources::MovementType::Ship
@@ -365,6 +369,9 @@ fn select_pickup_position(
                     None
                 };
                 if let Some(distance) = boarding_distance {
+                    let cargo_turns = distance.div_ceil(stats.max_movement.max(1));
+                    max_turns = max_turns.max(cargo_turns);
+                    total_turns = total_turns.saturating_add(cargo_turns);
                     max_distance = max_distance.max(distance);
                     total_distance += distance;
                     true
@@ -383,6 +390,11 @@ fn select_pickup_position(
             };
             let score = (
                 production_rank,
+                // 現在地に居座ることより、全員が揃う推定手番を優先する。
+                // 輸送ヘリと歩兵では移動力が違うため、生距離だけでなく各自の
+                // 移動力で切り上げた最大ETAを便の搭載所要時間として比較する。
+                max_turns,
+                total_turns,
                 current_rank,
                 max_distance,
                 total_distance,
@@ -395,6 +407,48 @@ fn select_pickup_position(
         }
     }
     best.map(|(position, _)| position)
+}
+
+/// 1体のcargoと輸送役が最適なPickup地点へ合流する推定手番。
+///
+/// 複数輸送役へcargoを分配するときにEntity ID順を使うと、近いcargoを別便へ渡し、
+/// 空の輸送役が遠いcargoを数ターン待つ。最適合流点を単体でも評価し、最大ETA、
+/// 合計ETA、距離、Entity IDの順で安定して近い組を作る。
+fn cargo_pickup_rank(
+    world: &World,
+    player_id: PlayerId,
+    transport_position: GridPosition,
+    transport_stats: &UnitStats,
+    cargo: Entity,
+    connectivity: &mut TerrainConnectivity,
+) -> Option<(u32, u32, u32, u64)> {
+    let cargo_position = *world.get::<GridPosition>(cargo)?;
+    let cargo_stats = world.get::<UnitStats>(cargo)?;
+    let pickup = select_pickup_position(
+        world,
+        player_id,
+        transport_position,
+        transport_stats,
+        &[cargo],
+        connectivity,
+    )?;
+    let map = world.resource::<Map>();
+    let transport_turns = map
+        .distance(
+            transport_position.x,
+            transport_position.y,
+            pickup.x,
+            pickup.y,
+        )
+        .div_ceil(transport_stats.max_movement.max(1));
+    let cargo_distance = map.distance(cargo_position.x, cargo_position.y, pickup.x, pickup.y);
+    let cargo_turns = cargo_distance.div_ceil(cargo_stats.max_movement.max(1));
+    Some((
+        transport_turns.max(cargo_turns),
+        transport_turns.saturating_add(cargo_turns),
+        cargo_distance,
+        cargo.to_bits(),
+    ))
 }
 
 /// cargoが現在の手番に輸送役へ移動し、そのままLoadできるかをゲームの移動規則で判定する。
@@ -1546,19 +1600,34 @@ fn promote_partial_campaign_transport_wave(
             .collect();
         let free_slots = (capacity.max as usize).saturating_sub(cargo.len());
         let already_selected: HashSet<_> = cargo.iter().copied().collect();
+        let mut pickup_candidates: Vec<_> = remaining_cargo
+            .iter()
+            .filter(|candidate| !already_selected.contains(candidate))
+            .filter(|candidate| {
+                world
+                    .get::<UnitStats>(**candidate)
+                    .is_some_and(|cargo_stats| {
+                        stats.loadable_unit_types.contains(&cargo_stats.unit_type)
+                    })
+            })
+            .filter_map(|candidate| {
+                cargo_pickup_rank(
+                    world,
+                    player_id,
+                    position,
+                    stats,
+                    *candidate,
+                    &mut connectivity,
+                )
+                .map(|rank| (rank, *candidate))
+            })
+            .collect();
+        pickup_candidates.sort_by_key(|(rank, _)| *rank);
         cargo.extend(
-            remaining_cargo
-                .iter()
-                .filter(|candidate| !already_selected.contains(candidate))
-                .filter(|candidate| {
-                    world
-                        .get::<UnitStats>(**candidate)
-                        .is_some_and(|cargo_stats| {
-                            stats.loadable_unit_types.contains(&cargo_stats.unit_type)
-                        })
-                })
+            pickup_candidates
+                .into_iter()
                 .take(free_slots)
-                .copied(),
+                .map(|(_, candidate)| candidate),
         );
         if cargo.is_empty() {
             continue;
@@ -6977,6 +7046,102 @@ mod tests {
                 target_pos: load_pos,
             } if transport_entity == transport && load_pos == target_pos
         ));
+    }
+
+    #[test]
+    fn pickup_prefers_a_faster_rendezvous_over_the_transport_current_position() {
+        let mut world = World::new();
+        world.insert_resource(Map::new(8, 1, Terrain::Plains, GridTopology::Square));
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+        let player = PlayerId(1);
+        let cargo = world
+            .spawn((
+                Faction(player),
+                GridPosition { x: 7, y: 0 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    movement_type: MovementType::Infantry,
+                    max_movement: 3,
+                    ..UnitStats::mock()
+                },
+            ))
+            .id();
+        let transport_stats = UnitStats {
+            unit_type: UnitType::TransportHelicopter,
+            movement_type: MovementType::Air,
+            max_movement: 3,
+            loadable_unit_types: vec![UnitType::Infantry],
+            ..UnitStats::mock()
+        };
+
+        let pickup = select_pickup_position(
+            &world,
+            player,
+            GridPosition { x: 0, y: 0 },
+            &transport_stats,
+            &[cargo],
+            &mut TerrainConnectivity::default(),
+        )
+        .unwrap();
+
+        assert_ne!(pickup, GridPosition { x: 0, y: 0 });
+        let map = world.resource::<Map>();
+        let transport_turns = map.distance(0, 0, pickup.x, pickup.y).div_ceil(3);
+        let cargo_turns = map.distance(7, 0, pickup.x, pickup.y).div_ceil(3);
+        assert_eq!(transport_turns.max(cargo_turns), 2);
+    }
+
+    #[test]
+    fn pickup_pairing_prefers_near_cargo_even_when_it_has_a_later_entity_id() {
+        let mut world = World::new();
+        world.insert_resource(Map::new(8, 1, Terrain::Plains, GridTopology::Square));
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+        let player = PlayerId(1);
+        let spawn_cargo = |world: &mut World, x| {
+            world
+                .spawn((
+                    Faction(player),
+                    GridPosition { x, y: 0 },
+                    UnitStats {
+                        unit_type: UnitType::Infantry,
+                        movement_type: MovementType::Infantry,
+                        max_movement: 3,
+                        ..UnitStats::mock()
+                    },
+                ))
+                .id()
+        };
+        let far = spawn_cargo(&mut world, 7);
+        let near = spawn_cargo(&mut world, 1);
+        let transport_stats = UnitStats {
+            unit_type: UnitType::TransportHelicopter,
+            movement_type: MovementType::Air,
+            max_movement: 7,
+            loadable_unit_types: vec![UnitType::Infantry],
+            ..UnitStats::mock()
+        };
+        let mut connectivity = TerrainConnectivity::default();
+
+        let far_rank = cargo_pickup_rank(
+            &world,
+            player,
+            GridPosition { x: 0, y: 0 },
+            &transport_stats,
+            far,
+            &mut connectivity,
+        )
+        .unwrap();
+        let near_rank = cargo_pickup_rank(
+            &world,
+            player,
+            GridPosition { x: 0, y: 0 },
+            &transport_stats,
+            near,
+            &mut connectivity,
+        )
+        .unwrap();
+
+        assert!(near_rank < far_rank);
     }
 
     #[test]

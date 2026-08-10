@@ -16,7 +16,7 @@ pub mod deployment;
 pub mod operation;
 pub mod trace;
 
-use crate::ai::production::plan_campaign_shortfall_production;
+use crate::ai::production::plan_campaign_with_expansion_denial_reserve;
 use operation::{
     AcquisitionMode, OperationFacts, OperationKind, OperationSlots, RESERVATION_PATIENCE_TURNS,
     SLOT_PRIORITY, SlotKind, SlotTier, acquisition_mode, derive_slots,
@@ -137,6 +137,13 @@ impl ThreatTarget {
             priority_weight,
         }
     }
+}
+
+/// 中立・敵拠点の確保を直接妨げる、地上戦力または輸送戦力であるか。
+fn is_territory_control_threat(stats: &UnitStats) -> bool {
+    !matches!(stats.movement_type, MovementType::Air | MovementType::Ship)
+        || stats.can_capture
+        || stats.max_cargo > 0
 }
 
 /// 1 つの作戦。対象拠点のまとまりと、そこから導出された枠を保持する。
@@ -344,11 +351,19 @@ fn decide_campaign_production_v4(
     let Some(scan) = BoardScan::collect(world, player_id) else {
         return CampaignProductionControl::BlockGeneric;
     };
-    let outcome = plan_campaign_shortfall_production(
+    let enemy_stats: Vec<_> = scan
+        .enemy_units
+        .iter()
+        .map(|unit| unit.stats.clone())
+        .collect();
+    let outcome = plan_campaign_with_expansion_denial_reserve(
         player_id,
         &shortfalls,
         &scan.free_facilities,
+        scan.owned_airport_count,
         &scan.available_types,
+        &enemy_stats,
+        &scan.damage_chart,
         &scan.map,
         &scan.master_data,
         scan.funds,
@@ -357,7 +372,11 @@ fn decide_campaign_production_v4(
     let mut cache = world
         .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
         .unwrap_or_default();
-    cache.set_v4_campaign_production_plan(player_id, outcome.commands, generic_budget);
+    cache.set_campaign_production_plan_with_generic_budget(
+        player_id,
+        outcome.commands,
+        generic_budget,
+    );
     let next = cache.take_campaign_production_command(player_id);
     let blocks_generic = cache.campaign_production_blocks_generic(player_id);
     let generic_budget = cache.campaign_production_generic_budget(player_id);
@@ -385,6 +404,8 @@ struct BoardScan {
     my_units: Vec<UnitSnapshot>,
     enemy_units: Vec<UnitSnapshot>,
     my_properties: Vec<GridPosition>,
+    /// 首都の生産範囲内にある所有空港総数（占有中を含む）
+    owned_airport_count: u32,
     /// 自軍が保有していない拠点（中立・敵）
     open_properties: Vec<GridPosition>,
     enemy_income: u32,
@@ -458,6 +479,7 @@ impl BoardScan {
         let mut enemy_production_slots = 0u32;
         let mut enemy_facilities = Vec::new();
         let mut my_income = 0u32;
+        let mut owned_airport_count = 0u32;
         {
             let mut q = world.query::<(&GridPosition, &Property)>();
             let mut enemy_capitals = HashMap::new();
@@ -477,6 +499,16 @@ impl BoardScan {
                     Some(owner) if owner == player_id => {
                         my_income = my_income.saturating_add(income);
                         my_properties.push(*pos);
+                        if prop.terrain == Terrain::Airport
+                            && crate::systems::production::is_within_production_range(
+                                capital_pos.as_slice(),
+                                pos.x,
+                                pos.y,
+                                map.topology,
+                            )
+                        {
+                            owned_airport_count = owned_airport_count.saturating_add(1);
+                        }
                         // 首都・都市を含む生産施設のうち、生産範囲内かつ空いているもの
                         if is_facility
                             && !occupied.contains(pos)
@@ -536,6 +568,7 @@ impl BoardScan {
             my_units,
             enemy_units,
             my_properties,
+            owned_airport_count,
             open_properties,
             enemy_income,
             enemy_production_slots,
@@ -914,6 +947,7 @@ fn build_operation(
     let mut reachable_threats = Vec::new();
     let mut unreachable_threats = Vec::new();
     let mut enemy_combat_value = 0u32;
+    let mut territory_control_threat_units = 0u32;
     let mut unreachable_threat_value = 0u32;
     let mut enemy_contact_eta = u32::MAX;
     for enemy in &scan.enemy_units {
@@ -957,6 +991,9 @@ fn build_operation(
         if i_can_reach {
             let threat = threat_value(enemy, expansion_race_live);
             enemy_combat_value = enemy_combat_value.saturating_add(threat);
+            if expansion_race_live && is_territory_control_threat(&enemy.stats) {
+                territory_control_threat_units = territory_control_threat_units.saturating_add(1);
+            }
             reachable_threats.push(ThreatTarget::from_snapshot(enemy, expansion_race_live));
         } else {
             let threat = threat_value(enemy, expansion_race_live);
@@ -981,6 +1018,7 @@ fn build_operation(
     // 「既に持っている分」を差し引く役割は担っていない。差し引きはこの台帳の仕事。
     let mut friendly_capture_units_committed = 0u32;
     let mut friendly_combat_value_committed = 0u32;
+    let mut friendly_territory_control_units = 0u32;
     let mut friendly_intercept_value_committed = 0u32;
     let mut available_free_cargo_slots = 0u32;
     for unit in &scan.my_units {
@@ -1047,15 +1085,40 @@ fn build_operation(
                     &scan.damage_chart,
                 );
             if combat_eligible {
-                friendly_combat_value_committed =
-                    friendly_combat_value_committed.saturating_add(unit.value());
-                apply_coverage(
+                // 1体が同じ手番に攻撃できる作戦は1つだけである。unit価格による
+                // 戦力価値もsortie体数も、期限内に到着できる最寄り作戦へ排他的に
+                // 帰属させ、全前線で同じ1体を重複控除しない。
+                let belongs_to_control_operation = nearest_relevant_anchor_index(
+                    scan,
+                    ctx,
+                    &unit.pos,
+                    unit.stats.movement_type,
+                    unit.stats.max_movement,
+                    anchors,
+                    horizons,
+                ) == anchor_index;
+                if !belongs_to_control_operation {
+                    continue;
+                }
+                if engageable.iter().any(|index| {
+                    let threat = &reachable_threats[*index];
+                    is_territory_control_threat(&threat.stats)
+                        && coverage_efficiency(&unit.stats, &threat.stats, &scan.damage_chart) > 0.0
+                }) {
+                    friendly_territory_control_units =
+                        friendly_territory_control_units.saturating_add(1);
+                }
+                // 購入価格は撃破済み価値ではない。作戦期限までに残存敵へ実際に
+                // 与えられる期待交換価値だけを、撃破要求の充足として控除する。
+                let expected_return = apply_sortie_return(
                     &unit.stats,
-                    unit.value() as f32,
+                    CAPTURE_COMPLETION_TURNS,
                     &mut reachable_threats,
                     &engageable,
                     &scan.damage_chart,
                 );
+                friendly_combat_value_committed =
+                    friendly_combat_value_committed.saturating_add(return_budget(expected_return));
             }
         }
     }
@@ -1162,6 +1225,9 @@ fn build_operation(
         enemy_combat_value,
         enemy_reinforcement_budget,
         minimum_combat_unit_cost,
+        territory_control_threat_units,
+        friendly_territory_control_units,
+        territory_control_window_turns: CAPTURE_COMPLETION_TURNS,
         minimum_intercept_unit_cost,
         deploy_lead_time,
         enemy_contact_eta: if enemy_contact_eta == u32::MAX {
@@ -1520,9 +1586,9 @@ fn record_fill(
         }
         SlotKind::Capture => op.filled.capture_units += 1,
         SlotKind::Combat => {
-            // 戦闘ユニットの購入は護衛枠（体数）と撃破枠（資金）を同時に満たす
+            // 戦闘ユニットの購入は護衛枠（体数）を1つ満たす。一方、撃破枠を
+            // 満たす量は価格ではなく、作戦期限までの期待交換価値である。
             op.filled.escort_units += 1;
-            op.filled.destroy_budget = op.filled.destroy_budget.saturating_add(candidate.cost);
             let stats = candidate_stats(scan, candidate);
             let self_deployable = ctx.is_reachable(
                 &scan.map,
@@ -1537,13 +1603,17 @@ fn record_fill(
                 op.anchor
             };
             let indices = reachable_threat_indices(scan, ctx, &op.reachable_threats, origin, stats);
-            apply_coverage(
+            let expected_return = apply_sortie_return(
                 stats,
-                candidate.cost as f32,
+                op.facts.territory_control_window_turns,
                 &mut op.reachable_threats,
                 &indices,
                 &scan.damage_chart,
             );
+            op.filled.destroy_budget = op
+                .filled
+                .destroy_budget
+                .saturating_add(return_budget(expected_return));
         }
     }
 }
@@ -1656,6 +1726,107 @@ fn marginal_coverage(
     apply_coverage(unit, capacity, &mut projected, eligible_indices, chart)
 }
 
+/// 作戦期限までに1体が実行できる攻撃回数を上限として、期待交換価値を脅威へ割り当てる。
+///
+/// unit価格を処理能力として使うと、高価な戦闘機1機が同じ手番に複数目標を撃破できる
+/// 扱いになる。実際の制約である「1体1手番1攻撃」に合わせ、各sortieで期待交換価値が
+/// 最大の未処理目標を1件だけ減らす。
+fn apply_sortie_return(
+    unit: &UnitStats,
+    max_sorties: u32,
+    threats: &mut [ThreatTarget],
+    eligible_indices: &[usize],
+    chart: &DamageChart,
+) -> f32 {
+    let mut weighted_return = 0.0;
+    for _ in 0..max_sorties.max(1) {
+        let Some((index, expected_return)) = eligible_indices
+            .iter()
+            .filter_map(|index| {
+                let threat = &threats[*index];
+                if threat.remaining_value <= 0.0 {
+                    return None;
+                }
+                let expected_return = pair_value(unit, &threat.stats, chart)
+                    .max(0.0)
+                    .min(threat.remaining_value);
+                (expected_return > 0.0).then_some((*index, expected_return))
+            })
+            .max_by(|(left_index, left_return), (right_index, right_return)| {
+                let left = *left_return * threats[*left_index].priority_weight;
+                let right = *right_return * threats[*right_index].priority_weight;
+                left.total_cmp(&right)
+                    .then_with(|| right_index.cmp(left_index))
+            })
+        else {
+            break;
+        };
+        threats[index].remaining_value -= expected_return;
+        weighted_return += expected_return * threats[index].priority_weight;
+    }
+    weighted_return
+}
+
+fn marginal_sortie_return(
+    unit: &UnitStats,
+    max_sorties: u32,
+    threats: &[ThreatTarget],
+    eligible_indices: &[usize],
+    chart: &DamageChart,
+) -> f32 {
+    let mut projected = threats.to_vec();
+    apply_sortie_return(unit, max_sorties, &mut projected, eligible_indices, chart)
+}
+
+/// 浮動小数の期待交換価値を、撃破要求と同じ資金価値単位へ切り上げる。
+fn return_budget(expected_return: f32) -> u32 {
+    expected_return.max(0.0).ceil().min(u32::MAX as f32) as u32
+}
+
+/// 敵の地上・占領・輸送unitへ攻撃機会を作るためのsortie適合度。
+///
+/// `remaining_value`は高価な既存unitの価値被覆で0になりうるが、1体が同じ手番に
+/// 複数目標を攻撃できるわけではない。護衛体数枠を埋める間は元の敵costと相性から、
+/// 追加の攻撃bodyが作戦期限までに生む価値を評価する。
+fn territory_control_sortie_value(
+    unit: &UnitStats,
+    max_sorties: u32,
+    threats: &[ThreatTarget],
+    eligible_indices: &[usize],
+    chart: &DamageChart,
+) -> f32 {
+    let mut returns: Vec<_> = eligible_indices
+        .iter()
+        .map(|index| &threats[*index])
+        .filter(|threat| is_territory_control_threat(&threat.stats))
+        .map(|threat| pair_value(unit, &threat.stats, chart).max(0.0) * threat.priority_weight)
+        .filter(|value| *value > 0.0)
+        .collect();
+    returns.sort_by(|left, right| right.total_cmp(left));
+    returns.into_iter().take(max_sorties.max(1) as usize).sum()
+}
+
+/// 枠への生の期待収益を、現在の資金と生産枠の制約に合わせて比較可能にする。
+///
+/// Combatは単純な最安優先ではない。1枠あたり予算を下回る候補は同じ機会費用で比較し、
+/// 資金潤沢時は高価でも絶対戦果が大きい候補を選べる。予算が厳しい場合だけ実価格が
+/// 分母になり、戦果/費用の良い候補が優位になる。
+fn normalized_candidate_fitness(
+    kind: SlotKind,
+    raw_fitness: f32,
+    cost: u32,
+    per_slot_budget: u32,
+) -> f32 {
+    let count_denominated = matches!(kind, SlotKind::Capture | SlotKind::Transport);
+    let opportunity_cost = if count_denominated {
+        cost
+    } else {
+        cost.max(per_slot_budget)
+    }
+    .max(1);
+    raw_fitness * 1000.0 / opportunity_cost as f32
+}
+
 /// 指定の枠を満たす最良の候補を選ぶ。
 fn select_candidate(
     scan: &BoardScan,
@@ -1700,17 +1871,16 @@ fn select_candidate(
             //   安く済ませても余剰はその枠では使えず割引にならない。よって分母は
             //   cost と per_slot_budget の大きい方を取り、枠あたり戦力で比較する。
             let count_denominated = matches!(kind, SlotKind::Capture | SlotKind::Transport);
-            let opportunity_cost = if count_denominated {
-                stats.cost
-            } else {
-                stats.cost.max(constraints.per_slot_budget)
-            }
-            .max(1);
             let candidate = SlotCandidate {
                 unit_type: *unit_type,
                 cost: stats.cost,
                 facility: *facility,
-                fitness: fitness * 1000.0 / opportunity_cost as f32,
+                fitness: normalized_candidate_fitness(
+                    kind,
+                    fitness,
+                    stats.cost,
+                    constraints.per_slot_budget,
+                ),
             };
             // 予算内／予算超過の階層分けも体数系の枠にだけ残す。資金系の枠でこれを
             // やると、どれほど弱くても予算内の候補が常に強い候補に勝ってしまい、
@@ -2003,14 +2173,27 @@ fn slot_fitness(
             if engageable.is_empty() {
                 return None;
             }
-            let value = marginal_coverage(
+            let value = marginal_sortie_return(
                 stats,
-                stats.cost as f32,
+                op.facts.territory_control_window_turns,
                 &op.reachable_threats,
                 &engageable,
                 &scan.damage_chart,
             );
-            if value <= 0.0 { None } else { Some(value) }
+            if value > 0.0 {
+                Some(value)
+            } else if op.filled.escort_units < op.slots.escort_units {
+                let sortie_value = territory_control_sortie_value(
+                    stats,
+                    op.facts.territory_control_window_turns,
+                    &op.reachable_threats,
+                    &engageable,
+                    &scan.damage_chart,
+                );
+                (sortie_value > 0.0).then_some(sortie_value)
+            } else {
+                None
+            }
         }
     }
 }
@@ -2303,6 +2486,92 @@ mod tests {
             ),
             Some(0)
         );
+    }
+
+    /// 既存Combat 1体を複数前線の撃破要求から同時に控除してはならない。
+    #[test]
+    fn existing_combat_sorties_are_committed_to_only_one_operation() {
+        let infantry = UnitStats {
+            can_capture: true,
+            movement_type: MovementType::Infantry,
+            max_movement: 3,
+            ..stats(UnitType::Infantry, 1_000)
+        };
+        let helicopter = UnitStats {
+            movement_type: MovementType::Air,
+            max_movement: 8,
+            ..stats(UnitType::Bcopters, 7_500)
+        };
+        let mut damage_chart = DamageChart::new();
+        damage_chart.insert_damage(UnitType::Bcopters, UnitType::Infantry, 65);
+        damage_chart.insert_damage(UnitType::Infantry, UnitType::Bcopters, 0);
+        let anchors = vec![pos(5, 1), pos(15, 1)];
+        let horizons = vec![5, 5];
+        let scan = BoardScan {
+            map: flat_map(20, 3),
+            master_data: MasterDataRegistry::load().unwrap(),
+            damage_chart,
+            funds: 20_000,
+            free_facilities: vec![
+                (pos(0, 1), Terrain::Factory),
+                (pos(1, 1), Terrain::Airport),
+            ],
+            available_types: vec![
+                (UnitType::Infantry, infantry.clone()),
+                (UnitType::Bcopters, helicopter.clone()),
+            ],
+            my_units: vec![UnitSnapshot {
+                entity: Some(Entity::from_raw(900)),
+                pos: pos(3, 1),
+                stats: helicopter,
+                hp: 100,
+                free_cargo: 0,
+            }],
+            enemy_units: anchors
+                .iter()
+                .enumerate()
+                .map(|(index, position)| UnitSnapshot {
+                    entity: Some(Entity::from_raw(910 + index as u32)),
+                    pos: *position,
+                    stats: infantry.clone(),
+                    hp: 100,
+                    free_cargo: 0,
+                })
+                .collect(),
+            my_properties: vec![pos(0, 1), pos(1, 1)],
+            owned_airport_count: 1,
+            open_properties: anchors.clone(),
+            enemy_income: 0,
+            enemy_production_slots: 0,
+            enemy_facilities: Vec::new(),
+            my_income: 5_000,
+        };
+        let mut ctx = ReachCtx::default();
+        let near = build_operation(
+            &scan,
+            &mut ctx,
+            &infantry,
+            OperationKind::Capture,
+            anchors[0],
+            &anchors,
+            &horizons,
+            &[anchors[0]],
+            2,
+        );
+        let far = build_operation(
+            &scan,
+            &mut ctx,
+            &infantry,
+            OperationKind::Capture,
+            anchors[1],
+            &anchors,
+            &horizons,
+            &[anchors[1]],
+            5,
+        );
+
+        assert!(near.facts.friendly_combat_value_committed > 0);
+        assert_eq!(far.facts.friendly_combat_value_committed, 0);
     }
 
     /// 敵施設の生産余力も、期限内に到着できる最寄りの1作戦だけへ計上する。
@@ -2625,6 +2894,139 @@ mod tests {
         );
     }
 
+    /// 価格ベースの被覆を使い切っても、敵拡張unitを処理する攻撃回数は残る。
+    #[test]
+    fn territory_control_sortie_keeps_a_counter_candidate_after_value_is_covered() {
+        let mut chart = DamageChart::new();
+        chart.insert_damage(UnitType::Bcopters, UnitType::Infantry, 65);
+        let helicopter = stats(UnitType::Bcopters, 7500);
+        let threats = vec![ThreatTarget {
+            entity: None,
+            stats: stats(UnitType::Infantry, 1000),
+            position: pos(1, 0),
+            remaining_value: 0.0,
+            priority_weight: 2.0,
+        }];
+
+        assert_eq!(
+            marginal_coverage(&helicopter, 7500.0, &threats, &[0], &chart),
+            0.0
+        );
+        assert!(territory_control_sortie_value(&helicopter, 2, &threats, &[0], &chart) > 0.0);
+    }
+
+    /// Combatは資金難なら費用効率、資金潤沢なら生産枠あたり戦果を優先する。
+    #[test]
+    fn combat_roi_can_choose_expensive_ground_attack_when_budget_is_abundant() {
+        let mut chart = DamageChart::new();
+        chart.insert_damage(UnitType::Bcopters, UnitType::Rockets, 45);
+        chart.insert_damage(UnitType::Bomber, UnitType::Rockets, 95);
+        let helicopter = stats(UnitType::Bcopters, 7_500);
+        let bomber = stats(UnitType::Bomber, 22_000);
+        let threats = vec![
+            ThreatTarget {
+                entity: None,
+                stats: stats(UnitType::Rockets, 6_000),
+                position: pos(1, 0),
+                remaining_value: 6_000.0,
+                priority_weight: 1.0,
+            },
+            ThreatTarget {
+                entity: None,
+                stats: stats(UnitType::Rockets, 6_000),
+                position: pos(2, 0),
+                remaining_value: 6_000.0,
+                priority_weight: 1.0,
+            },
+        ];
+        let helicopter_return = marginal_sortie_return(&helicopter, 2, &threats, &[0, 1], &chart);
+        let bomber_return = marginal_sortie_return(&bomber, 2, &threats, &[0, 1], &chart);
+
+        assert!(bomber_return > helicopter_return);
+        assert!(
+            normalized_candidate_fitness(
+                SlotKind::Combat,
+                helicopter_return,
+                helicopter.cost,
+                30_000,
+            ) < normalized_candidate_fitness(SlotKind::Combat, bomber_return, bomber.cost, 30_000,)
+        );
+        assert!(
+            normalized_candidate_fitness(
+                SlotKind::Combat,
+                helicopter_return,
+                helicopter.cost,
+                8_000,
+            ) > normalized_candidate_fitness(SlotKind::Combat, bomber_return, bomber.cost, 8_000,)
+        );
+    }
+
+    /// Combat枠は購入価格ではなく、期限内に敵へ与えられる期待交換価値で充足する。
+    #[test]
+    fn combat_plan_does_not_treat_purchase_price_as_destroyed_enemy_value() {
+        let infantry = UnitStats {
+            can_capture: true,
+            movement_type: MovementType::Infantry,
+            max_movement: 3,
+            ..stats(UnitType::Infantry, 1_000)
+        };
+        let helicopter = UnitStats {
+            movement_type: MovementType::Air,
+            max_movement: 8,
+            ..stats(UnitType::Bcopters, 7_500)
+        };
+        let mut damage_chart = DamageChart::new();
+        damage_chart.insert_damage(UnitType::Bcopters, UnitType::Infantry, 65);
+        damage_chart.insert_damage(UnitType::Infantry, UnitType::Bcopters, 0);
+        let enemy_positions = [pos(8, 0), pos(8, 1), pos(8, 2)];
+        let scan = BoardScan {
+            map: flat_map(10, 3),
+            master_data: MasterDataRegistry::load().unwrap(),
+            damage_chart,
+            funds: 22_500,
+            free_facilities: vec![
+                (pos(0, 1), Terrain::Factory),
+                (pos(1, 0), Terrain::Airport),
+                (pos(1, 1), Terrain::Airport),
+                (pos(1, 2), Terrain::Airport),
+            ],
+            available_types: vec![
+                (UnitType::Infantry, infantry.clone()),
+                (UnitType::Bcopters, helicopter),
+            ],
+            my_units: Vec::new(),
+            enemy_units: enemy_positions
+                .iter()
+                .enumerate()
+                .map(|(index, position)| UnitSnapshot {
+                    entity: Some(Entity::from_raw(1_000 + index as u32)),
+                    pos: *position,
+                    stats: infantry.clone(),
+                    hp: 100,
+                    free_cargo: 0,
+                })
+                .collect(),
+            my_properties: vec![pos(1, 1)],
+            owned_airport_count: 3,
+            open_properties: enemy_positions.to_vec(),
+            enemy_income: 0,
+            enemy_production_slots: 0,
+            enemy_facilities: Vec::new(),
+            my_income: 5_000,
+        };
+
+        let (commands, trace) = plan_production(&scan, PlayerId(1), false);
+
+        // 旧実装は7,500の購入価格をそのまま撃破済み価値へ足し、2機で要求を
+        // 消していた。65%攻撃を2回ずつ行う期待値では3機とも必要になる。
+        assert_eq!(commands.len(), 3, "commands={commands:?}, trace={trace:?}");
+        assert!(
+            commands
+                .iter()
+                .all(|command| command.unit_type == UnitType::Bcopters)
+        );
+    }
+
     /// テスト用の作戦。枠の充足状況だけを見たいので敵情報は空にしておく。
     fn operation(kind: OperationKind, slots: OperationSlots, filled: OperationSlots) -> Operation {
         Operation {
@@ -2710,6 +3112,7 @@ mod tests {
             }],
             enemy_units: Vec::new(),
             my_properties: vec![pos(1, 1)],
+            owned_airport_count: 0,
             open_properties: vec![pos(8, 1)],
             enemy_income: 0,
             enemy_production_slots: 0,
@@ -2787,6 +3190,7 @@ mod tests {
             my_units: Vec::new(),
             enemy_units: Vec::new(),
             my_properties: vec![pos(1, 2)],
+            owned_airport_count: 0,
             open_properties: vec![pos(6, 2)],
             enemy_income: 0,
             enemy_production_slots: 0,
@@ -2852,6 +3256,7 @@ mod tests {
                 },
             ],
             my_properties: vec![pos(1, 2)],
+            owned_airport_count: 0,
             open_properties: vec![pos(6, 2)],
             enemy_income: 0,
             enemy_production_slots: 0,
@@ -2917,6 +3322,7 @@ mod tests {
                 free_cargo: 0,
             }],
             my_properties: vec![pos(1, 1), pos(2, 1)],
+            owned_airport_count: 1,
             open_properties: vec![pos(7, 1)],
             enemy_income: 0,
             enemy_production_slots: 0,

@@ -120,6 +120,7 @@ impl AiTurnStrategyCache {
         self.player_id == Some(player_id) && self.squads_planned
     }
 
+    #[cfg(test)]
     pub(crate) fn set_campaign_production_plan(
         &mut self,
         player_id: PlayerId,
@@ -137,7 +138,7 @@ impl AiTurnStrategyCache {
     }
 
     /// V4の島嶼予約を保護しつつ、超過資金だけを汎用戦闘生産へ渡す。
-    pub(crate) fn set_v4_campaign_production_plan(
+    pub(crate) fn set_campaign_production_plan_with_generic_budget(
         &mut self,
         player_id: PlayerId,
         commands: Vec<crate::events::ProduceUnitCommand>,
@@ -2625,6 +2626,7 @@ pub fn decide_ai_action_v2(
             if actions.can_wait {
                 let mut score = base_tile_score;
                 let mut is_on_recovery_property = false;
+                let mut is_on_production_site = false;
                 for (p_pos, p_terrain, p_owner) in &properties {
                     if p_pos.x == current_grid.x
                         && p_pos.y == current_grid.y
@@ -2632,6 +2634,8 @@ pub fn decide_ai_action_v2(
                         && registry.can_repair_on_terrain(stats.unit_type, *p_terrain)
                     {
                         is_on_recovery_property = true;
+                        is_on_production_site =
+                            registry.is_production_facility(p_terrain.as_str());
                         break;
                     }
                 }
@@ -2641,9 +2645,12 @@ pub fn decide_ai_action_v2(
                         score += 8000;
                     } else if atk_hp < 100 || atk_ammo.0 < stats.max_ammo1 {
                         score += 1000;
+                    } else if is_on_production_site {
+                        // 回復も攻撃も不要なのに空港・工場上で待機すると、次の生産を
+                        // 物理的に封鎖する。別タイルへ移動するWaitを十分に優先させる。
+                        score -= 20_000;
                     } else {
-                        // 回復の必要がないのに生産施設や回復施設の上にいる場合は、
-                        // 施設の生産ラインを塞がないようにペナルティを与えてどかせる
+                        // 生産施設ではない回復拠点も、用がなければ占有し続けない。
                         score -= 2000;
                     }
                 } else if is_combat_ineffective {
@@ -2949,6 +2956,60 @@ mod tests {
                 .get_terrain(target_pos.x, target_pos.y),
             Some(Terrain::Capital | Terrain::Airport)
         ));
+    }
+
+    #[test]
+    fn ready_combat_aircraft_does_not_wait_on_owned_airport() {
+        let player = PlayerId(1);
+        let mut world = setup_v3_test_world(3, crate::ai::ai_version::AiVersion::V4);
+        world.insert_resource(Map {
+            width: 3,
+            height: 1,
+            tiles: vec![Terrain::Plains, Terrain::Airport, Terrain::Plains],
+            topology: crate::resources::GridTopology::Square,
+        });
+        world.insert_resource(DamageChart::new());
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Property::new(Terrain::Airport, Some(player), 100),
+        ));
+        let stats = world
+            .resource::<MasterDataRegistry>()
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::Bcopters.as_str().to_owned(),
+            ))
+            .unwrap();
+        let aircraft = world
+            .spawn((
+                Faction(player),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 1, y: 0 },
+                stats.clone(),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Ammo {
+                    ammo1: stats.max_ammo1,
+                    max_ammo1: stats.max_ammo1,
+                    ammo2: stats.max_ammo2,
+                    max_ammo2: stats.max_ammo2,
+                },
+                crate::components::Fuel {
+                    current: stats.max_fuel,
+                    max: stats.max_fuel,
+                },
+            ))
+            .id();
+
+        let (entity, command) =
+            decide_ai_action_v2(&mut world, player, &HashSet::new()).expect("行動を選ぶこと");
+        assert_eq!(entity, aircraft);
+        let AiCommand::Wait { target_pos } = command else {
+            panic!("敵がいないため移動Waitを選ぶこと");
+        };
+        assert_ne!(target_pos, GridPosition { x: 1, y: 0 });
     }
 
     #[test]

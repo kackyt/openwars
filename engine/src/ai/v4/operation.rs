@@ -114,6 +114,12 @@ pub struct OperationFacts {
     pub enemy_reinforcement_budget: u32,
     /// この前線へ投入でき、観測済みの敵へ有効な最小戦闘unitのcost。
     pub minimum_combat_unit_cost: u32,
+    /// この作戦へ帰属し、支配領域の拡大を妨げる敵地上・輸送unit数。
+    pub territory_control_threat_units: u32,
+    /// 当該unitへ到達して有効打を与えられる既存戦闘unit数。
+    pub friendly_territory_control_units: u32,
+    /// 敵の支配行動を阻止するまでに許される攻撃手番数。
+    pub territory_control_window_turns: u32,
     /// 通常戦力が届かない脅威へ自力到達できる最小迎撃unitのcost。
     pub minimum_intercept_unit_cost: u32,
     /// 生産施設からこの作戦の代表地点までの展開リードタイム（ターン）
@@ -164,12 +170,22 @@ pub fn derive_slots(facts: &OperationFacts) -> OperationSlots {
     let capture_presence = capture_units.saturating_add(facts.friendly_capture_units_committed);
 
     // --- 護衛枠：接敵ETAが展開リードタイムより遅ければ、護衛は不要（ゼロになりうる） ---
-    let escort_units = if facts.enemy_contact_eta > facts.deploy_lead_time {
+    let base_escort_units = if facts.enemy_contact_eta > facts.deploy_lead_time {
         0
     } else {
         // 面で取る占領部隊に対し、半数を目安に護衛を付ける
         capture_presence.div_ceil(2)
     };
+    // --- 拡張阻止sortie枠：価格ではなく1手番1攻撃の処理能力で数える ---
+    // 高価な航空機1機をcost分の歩兵へ即時対応できると見なすと、敵が複数島へ
+    // 占領兵を送り続ける局面でも追加生産が止まる。阻止期限までに1機が実行できる
+    // 攻撃回数を上限とし、敵拡張unit数を処理できる実体数の不足を求める。
+    let required_denial_units = facts
+        .territory_control_threat_units
+        .div_ceil(facts.territory_control_window_turns.max(1));
+    let denial_shortage =
+        required_denial_units.saturating_sub(facts.friendly_territory_control_units);
+    let escort_units = base_escort_units.max(denial_shortage);
 
     // --- 輸送枠：占領＋護衛を運ぶのに必要な搭載スロット ---
     let transport_slots = if !facts.requires_transport {
@@ -365,6 +381,20 @@ mod tests {
 
         facts.enemy_contact_eta = 2;
         // 占領4体に対して護衛2体
+        assert_eq!(derive_slots(&facts).escort_units, 2);
+    }
+
+    #[test]
+    fn territory_control_uses_attack_bodies_instead_of_unit_price() {
+        let mut facts = base_facts();
+        facts.enemy_contact_eta = 9;
+        facts.deploy_lead_time = 2;
+        facts.territory_control_threat_units = 5;
+        facts.friendly_territory_control_units = 1;
+        facts.territory_control_window_turns = 2;
+
+        // 5目標を2手番で阻止するには3機必要で、既存1機を引いた2機が不足する。
+        // unit価格やenemy_combat_valueには依存しない。
         assert_eq!(derive_slots(&facts).escort_units, 2);
     }
 
