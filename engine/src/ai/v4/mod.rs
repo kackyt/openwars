@@ -14,6 +14,7 @@
 
 pub mod deployment;
 pub mod operation;
+pub mod rolling_plan;
 pub mod trace;
 
 use crate::ai::production::plan_campaign_with_expansion_denial_reserve;
@@ -21,9 +22,13 @@ use operation::{
     AcquisitionMode, OperationFacts, OperationKind, OperationSlots, RESERVATION_PATIENCE_TURNS,
     SLOT_PRIORITY, SlotKind, SlotTier, acquisition_mode, derive_slots,
 };
+use rolling_plan::{
+    EnemyPlanUnit, ForcePackagePlan, FriendlyPlanUnit, RollingPlanInput, plan_force_package,
+    production_options,
+};
 use trace::{
     ProductionDecision, ProductionOperationTrace, ProductionPlanTrace, ProductionStepTrace,
-    ProductionTraceDiagnostics,
+    ProductionTraceDiagnostics, RollingCombatPlanTrace, RollingPurchaseTrace, RollingTargetTrace,
 };
 
 use crate::ai::turn_distance::TerrainConnectivity;
@@ -117,6 +122,8 @@ struct ThreatTarget {
     entity: Option<Entity>,
     stats: UnitStats,
     position: GridPosition,
+    /// 金額被覆で変形させない、実盤面の残HP。
+    current_hp: u32,
     remaining_value: f32,
     priority_weight: f32,
 }
@@ -133,6 +140,7 @@ impl ThreatTarget {
             entity: unit.entity,
             stats: unit.stats.clone(),
             position: unit.pos,
+            current_hp: unit.hp,
             remaining_value: unit.value() as f32,
             priority_weight,
         }
@@ -152,7 +160,8 @@ struct Operation {
     kind: OperationKind,
     /// 作戦の代表地点（距離計算の基準）
     anchor: GridPosition,
-    /// この作戦へ局地敵を帰属させる期限。
+    /// 防衛の硬い期限と、旧枠の診断にだけ使う作戦時間幅。
+    /// 敵を作戦へ帰属させる条件には使わない。
     threat_horizon: u32,
     facts: OperationFacts,
     slots: OperationSlots,
@@ -216,6 +225,7 @@ struct PlannedDeployment {
     slot_kind: SlotKind,
     priority_enemies: Vec<Entity>,
     threat_horizon: u32,
+    forecast: deployment::DeploymentForecast,
 }
 
 impl std::ops::Deref for PlannedProduction {
@@ -257,7 +267,18 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
     if let Some(budget) = campaign_surplus {
         scan.funds = scan.funds.min(budget);
     }
-    let (planned, plan_trace) = plan_production(&scan, player_id, campaign_surplus.is_none());
+    // 既存戦力として見積へ入れるのは、実際にV4 Combat任務へ接続済みのEntityだけ。
+    // 占領・輸送など別任務中のunitを「倒せるはず」と二重計上しない。
+    let committed_combat_assignments = world
+        .get_resource::<deployment::V4DeploymentRegistry>()
+        .map(|registry| registry.active_target_assignments(player_id))
+        .unwrap_or_default();
+    let (planned, plan_trace) = plan_production(
+        &scan,
+        player_id,
+        campaign_surplus.is_none(),
+        &committed_combat_assignments,
+    );
 
     // 診断traceとは別に、生産完了イベントと照合する作戦意図を永続化する。
     let pending = planned
@@ -278,6 +299,7 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
                 slot_kind: deployment.slot_kind,
                 priority_enemies: deployment.priority_enemies.clone(),
                 threat_horizon: deployment.threat_horizon,
+                forecast: deployment.forecast,
             })
         })
         .collect::<Vec<_>>();
@@ -339,13 +361,23 @@ fn decide_campaign_production_v4(
         };
     }
 
-    let shortfalls = world
+    let mut shortfalls = world
         .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
         .and_then(|cache| cache.campaign_portfolio(player_id))
         .map(|portfolio| portfolio.aggregate_missing_requirements())
         .unwrap_or_default();
     if shortfalls.is_empty() {
         return CampaignProductionControl::Continue;
+    }
+
+    // V4のCombatは金額shortfallをunit価格で消費せず、後段のローリング計画器が
+    // 敵Entityを排除できる混成編成として決める。campaign側には輸送・占領という
+    // 構造要求だけを残し、旧combat_budget分の予約も解放する。
+    for shortfall in &mut shortfalls {
+        shortfall.reserved_budget = shortfall
+            .reserved_budget
+            .saturating_sub(shortfall.combat_budget);
+        shortfall.combat_budget = 0;
     }
 
     let Some(scan) = BoardScan::collect(world, player_id) else {
@@ -400,6 +432,8 @@ struct BoardScan {
     funds: u32,
     /// 生産可能な施設（未占有・生産範囲内・クールダウン対象外）
     free_facilities: Vec<(GridPosition, Terrain)>,
+    /// 次ターン以降に空くことを見込める、生産範囲内の全所有施設。
+    production_facilities: Vec<(GridPosition, Terrain)>,
     available_types: Vec<(UnitType, UnitStats)>,
     my_units: Vec<UnitSnapshot>,
     enemy_units: Vec<UnitSnapshot>,
@@ -475,6 +509,7 @@ impl BoardScan {
         let mut my_properties = Vec::new();
         let mut open_properties = Vec::new();
         let mut facilities = Vec::new();
+        let mut production_facilities = Vec::new();
         let mut enemy_income = 0u32;
         let mut enemy_production_slots = 0u32;
         let mut enemy_facilities = Vec::new();
@@ -509,16 +544,20 @@ impl BoardScan {
                         {
                             owned_airport_count = owned_airport_count.saturating_add(1);
                         }
-                        // 首都・都市を含む生産施設のうち、生産範囲内かつ空いているもの
-                        if is_facility
-                            && !occupied.contains(pos)
-                            && !cooldown.contains(&(pos.x, pos.y))
+                        let is_in_production_range = is_facility
                             && crate::systems::production::is_within_production_range(
                                 capital_pos.as_slice(),
                                 pos.x,
                                 pos.y,
                                 map.topology,
-                            )
+                            );
+                        if is_in_production_range {
+                            production_facilities.push((*pos, prop.terrain));
+                        }
+                        // 現在手番に命令できるのは、全生産施設のうち空いているものだけ。
+                        if is_in_production_range
+                            && !occupied.contains(pos)
+                            && !cooldown.contains(&(pos.x, pos.y))
                         {
                             facilities.push((*pos, prop.terrain));
                         }
@@ -564,6 +603,7 @@ impl BoardScan {
             damage_chart,
             funds,
             free_facilities: facilities,
+            production_facilities,
             available_types,
             my_units,
             enemy_units,
@@ -591,7 +631,7 @@ impl BoardScan {
             .filter(|(unit_type, stats)| {
                 stats.can_capture
                     && self
-                        .free_facilities
+                        .production_facilities
                         .iter()
                         .any(|(_, terrain)| self.can_produce(*terrain, *unit_type))
             })
@@ -817,6 +857,35 @@ fn nearest_relevant_anchor_index(
         .map(|(_, index)| index)
 }
 
+/// 敵を、地形的に到達できる最寄りの作戦へ一意に帰属させる。
+///
+/// 作戦の期限は毎ターン変化する予測値であり、敵が局地目標から遠いという理由で
+/// Combat計画の入力から消してはならない。期限は防衛案の比較にだけ用いる。
+fn nearest_reachable_anchor_index(
+    scan: &BoardScan,
+    ctx: &mut ReachCtx,
+    pos: &GridPosition,
+    movement: MovementType,
+    max_movement: u32,
+    anchors: &[GridPosition],
+) -> Option<usize> {
+    anchors
+        .iter()
+        .enumerate()
+        .filter_map(|(index, anchor)| {
+            ctx.is_reachable(
+                &scan.map,
+                &scan.master_data,
+                (pos.x, pos.y),
+                (anchor.x, anchor.y),
+                movement,
+            )
+            .then_some((eta_turns(&scan.map, pos, anchor, max_movement), index))
+        })
+        .min()
+        .map(|(_, index)| index)
+}
+
 fn enemy_facility_arrival(
     scan: &BoardScan,
     ctx: &mut ReachCtx,
@@ -951,14 +1020,13 @@ fn build_operation(
     let mut unreachable_threat_value = 0u32;
     let mut enemy_contact_eta = u32::MAX;
     for enemy in &scan.enemy_units {
-        if nearest_relevant_anchor_index(
+        if nearest_reachable_anchor_index(
             scan,
             ctx,
             &enemy.pos,
             enemy.stats.movement_type,
             enemy.stats.max_movement,
             anchors,
-            horizons,
         ) != anchor_index
         {
             continue;
@@ -979,7 +1047,7 @@ fn build_operation(
             (anchor.x, anchor.y),
             enemy.stats.movement_type,
         );
-        debug_assert!(it_can_reach_me, "期限付き帰属で敵の到達可能性を確認済み");
+        debug_assert!(it_can_reach_me, "到達可能な最寄り作戦へ敵を帰属済み");
         if it_can_reach_me {
             enemy_contact_eta = enemy_contact_eta.min(eta_turns(
                 &scan.map,
@@ -1241,13 +1309,18 @@ fn build_operation(
         unreachable_threat_value,
     };
 
+    let mut slots = derive_slots(&facts);
+    // Combat枠は金額の差分ではなく、観測敵が残っていることだけで計画器を起動する。
+    // 必要数と完了判定はrolling plannerのHPシミュレーションが決める。
+    slots.destroy_budget = u32::from(!reachable_threats.is_empty());
+
     Operation {
         kind,
         anchor,
         threat_horizon: anchor_index
             .and_then(|index| horizons.get(index).copied())
             .unwrap_or(0),
-        slots: derive_slots(&facts),
+        slots,
         facts,
         filled: OperationSlots::default(),
         unreachable_threats,
@@ -1260,6 +1333,7 @@ fn plan_production(
     scan: &BoardScan,
     player_id: PlayerId,
     allow_structural_slots: bool,
+    committed_combat_assignments: &HashMap<Entity, HashSet<Entity>>,
 ) -> (Vec<PlannedProduction>, ProductionPlanTrace) {
     let mut ctx = ReachCtx::default();
     let mut operations = build_operations(scan, &mut ctx);
@@ -1309,7 +1383,49 @@ fn plan_production(
         })
         .collect();
 
+    // 1体は1手番に1作戦しか遂行できない。過去のpriority enemyが移動して複数作戦へ
+    // 分散しても、現在位置から最も近い1作戦だけへ既存Combat Entityを帰属させる。
+    let mut committed_by_operation: HashMap<usize, HashSet<Entity>> = HashMap::new();
+    for (&entity, assigned_targets) in committed_combat_assignments {
+        let Some(unit) = scan
+            .my_units
+            .iter()
+            .find(|unit| unit.entity == Some(entity))
+        else {
+            continue;
+        };
+        let assigned_operation = operations
+            .iter()
+            .enumerate()
+            .filter(|(_, operation)| {
+                operation.reachable_threats.iter().any(|threat| {
+                    threat
+                        .entity
+                        .is_some_and(|enemy| assigned_targets.contains(&enemy))
+                })
+            })
+            .min_by_key(|(_, operation)| {
+                scan.map.distance(
+                    unit.pos.x,
+                    unit.pos.y,
+                    operation.anchor.x,
+                    operation.anchor.y,
+                )
+            })
+            .map(|(index, _)| index);
+        if let Some(index) = assigned_operation {
+            committed_by_operation
+                .entry(index)
+                .or_default()
+                .insert(entity);
+        }
+    }
+
     let mut used_facilities: HashSet<GridPosition> = HashSet::new();
+    // rolling plannerは1作戦につき1回だけ実行し、その混成パッケージの当手番分を
+    // 施設ごとに順次消費する。施設を1つ埋めるたびに同じbeam searchをやり直さない。
+    let mut rolling_plans: HashMap<usize, ForcePackagePlan> = HashMap::new();
+    let empty_committed_entities = HashSet::new();
     let mut remaining_funds = scan.funds;
     let mut commands = Vec::new();
 
@@ -1338,18 +1454,90 @@ fn plan_production(
             .deficit_ratio(slot_kind, &operations[op_index].filled);
         let remaining_funds_before = remaining_funds;
 
-        let candidate = select_candidate(
-            scan,
-            &mut ctx,
-            &operations[op_index],
-            slot_kind,
-            &used_facilities,
-            CandidateConstraints {
+        if slot_kind == SlotKind::Combat && !rolling_plans.contains_key(&op_index) {
+            let rolling_plan = plan_combat_package(
+                scan,
+                &mut ctx,
+                &operations[op_index],
+                &used_facilities,
+                committed_by_operation
+                    .get(&op_index)
+                    .unwrap_or(&empty_committed_entities),
                 remaining_funds,
-                per_slot_budget,
-                require_self_deployment: !allow_structural_slots,
-            },
-        );
+                !allow_structural_slots,
+            );
+            if let Some(plan) = rolling_plan {
+                plan_trace.rolling_combat_plans.retain(|current| {
+                    current.operation_kind != operation_kind || current.anchor != operation_anchor
+                });
+                plan_trace
+                    .rolling_combat_plans
+                    .push(RollingCombatPlanTrace {
+                        operation_kind,
+                        anchor: operation_anchor,
+                        feasible: plan.feasible,
+                        purchases: plan
+                            .purchases
+                            .iter()
+                            .copied()
+                            .map(|purchase| RollingPurchaseTrace {
+                                unit_type: purchase.unit_type,
+                                facility: purchase.facility,
+                                build_turn: purchase.build_turn,
+                                cost: purchase.cost,
+                            })
+                            .collect(),
+                        targets: plan
+                            .target_forecasts
+                            .iter()
+                            .map(|target| RollingTargetTrace {
+                                entity: target.entity,
+                                unit_type: target.unit_type,
+                                initial_hp: target.initial_hp,
+                                remaining_hp: target.remaining_hp,
+                                destroyed_turn: target.destroyed_turn,
+                            })
+                            .collect(),
+                        first_attack_turn: plan.first_attack_turn,
+                        elimination_turn: plan.elimination_turn,
+                        occupation_turn: plan.occupation_turn,
+                        production_cost: plan.production_cost,
+                        expected_loss: plan.expected_loss,
+                        candidates_considered: plan.candidates_considered,
+                        search_truncated: plan.search_truncated,
+                    });
+                rolling_plans.insert(op_index, plan);
+            }
+        }
+        let rolling_plan = rolling_plans.get(&op_index);
+        let candidate = if slot_kind == SlotKind::Combat {
+            rolling_plan.and_then(|plan| {
+                plan.current_purchases()
+                    .find(|purchase| {
+                        !used_facilities.contains(&purchase.facility)
+                            && purchase.cost <= remaining_funds
+                    })
+                    .map(|purchase| SlotCandidate {
+                        unit_type: purchase.unit_type,
+                        cost: purchase.cost,
+                        facility: purchase.facility,
+                        fitness: 1.0,
+                    })
+            })
+        } else {
+            select_candidate(
+                scan,
+                &mut ctx,
+                &operations[op_index],
+                slot_kind,
+                &used_facilities,
+                CandidateConstraints {
+                    remaining_funds,
+                    per_slot_budget,
+                    require_self_deployment: !allow_structural_slots,
+                },
+            )
+        };
 
         let Some(candidate) = candidate else {
             // この枠を満たせる候補が無い場合は、枠の要求を落として次を探す
@@ -1394,15 +1582,33 @@ fn plan_production(
 
         remaining_funds = remaining_funds.saturating_sub(candidate.cost);
         used_facilities.insert(candidate.facility);
-        let deployment =
+        let mut deployment =
             planned_deployment(scan, &mut ctx, &operations[op_index], slot_kind, &candidate);
-        record_fill(
-            scan,
-            &mut ctx,
-            &mut operations[op_index],
-            slot_kind,
-            &candidate,
-        );
+        if slot_kind == SlotKind::Combat
+            && let (Some(deployment), Some(plan)) = (deployment.as_mut(), rolling_plan)
+        {
+            deployment.forecast = deployment::DeploymentForecast {
+                first_attack_turn: plan.first_attack_turn,
+                elimination_turn: plan.elimination_turn,
+                occupation_turn: plan.occupation_turn,
+                package_cost: plan.production_cost,
+                package_size: u32::try_from(plan.purchases.len()).unwrap_or(u32::MAX),
+            };
+        }
+        if slot_kind == SlotKind::Combat {
+            // 同じパッケージの未使用current purchaseは次の反復で選ばれる。
+            // 全て消費した後は候補なしとなり、この手番のCombat枠を完了する。
+            operations[op_index].filled.escort_units =
+                operations[op_index].filled.escort_units.saturating_add(1);
+        } else {
+            record_fill(
+                scan,
+                &mut ctx,
+                &mut operations[op_index],
+                slot_kind,
+                &candidate,
+            );
+        }
         plan_trace.steps.push(ProductionStepTrace {
             operation_kind,
             operation_anchor,
@@ -1432,6 +1638,165 @@ fn plan_production(
 
     plan_trace.leftover_funds = remaining_funds;
     (commands, plan_trace)
+}
+
+/// 観測敵を実際に排除できる混成パッケージを、現在の空き施設と将来2手番から計画する。
+///
+/// `destroy_budget`は呼び出し条件にだけ残し、候補数・生産停止・完了判定には使わない。
+/// 既存unitと同じ手番に発注済みのunitを初期編成へ入れ、敵EntityのHPが0になるまで
+/// ターン単位で攻撃を進めた結果から必要な購入だけを返す。
+#[allow(clippy::too_many_arguments)]
+fn plan_combat_package(
+    scan: &BoardScan,
+    ctx: &mut ReachCtx,
+    op: &Operation,
+    used_facilities: &HashSet<GridPosition>,
+    committed_combat_entities: &HashSet<Entity>,
+    remaining_funds: u32,
+    require_self_deployment: bool,
+) -> Option<ForcePackagePlan> {
+    let enemies: Vec<_> = op
+        .reachable_threats
+        .iter()
+        .filter(|threat| threat.current_hp > 0)
+        .map(|threat| {
+            let terrain = scan
+                .map
+                .get_terrain(threat.position.x, threat.position.y)
+                .unwrap_or(Terrain::Plains);
+            EnemyPlanUnit {
+                entity: threat.entity,
+                stats: threat.stats.clone(),
+                position: threat.position,
+                hp: threat.current_hp,
+                defense_bonus: scan.master_data.get_terrain_defense_bonus(terrain),
+            }
+        })
+        .collect();
+    if enemies.is_empty() {
+        return None;
+    }
+
+    let mut existing_units = Vec::new();
+    for unit in &scan.my_units {
+        if unit.stats.can_capture || unit.stats.max_cargo > 0 {
+            continue;
+        }
+        if !unit
+            .entity
+            .is_some_and(|entity| committed_combat_entities.contains(&entity))
+        {
+            continue;
+        }
+        let engageable_enemy_indices = enemies
+            .iter()
+            .enumerate()
+            .filter_map(|(index, enemy)| {
+                (best_damage(
+                    &scan.damage_chart,
+                    unit.stats.unit_type,
+                    enemy.stats.unit_type,
+                ) > 0
+                    && ctx.is_reachable(
+                        &scan.map,
+                        &scan.master_data,
+                        (unit.pos.x, unit.pos.y),
+                        (enemy.position.x, enemy.position.y),
+                        unit.stats.movement_type,
+                    ))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if engageable_enemy_indices.is_empty() {
+            continue;
+        }
+        existing_units.push(FriendlyPlanUnit {
+            stats: unit.stats.clone(),
+            position: unit.pos,
+            hp: unit.hp,
+            available_turn: 0,
+            engageable_enemy_indices,
+        });
+    }
+
+    let mut options = production_options(
+        &scan.free_facilities,
+        &scan.production_facilities,
+        &scan.available_types,
+        &scan.master_data,
+        |facility, stats| {
+            let self_deployable = ctx.is_reachable(
+                &scan.map,
+                &scan.master_data,
+                (facility.x, facility.y),
+                (op.anchor.x, op.anchor.y),
+                stats.movement_type,
+            );
+            if require_self_deployment && !self_deployable {
+                return false;
+            }
+            can_join_operation(
+                scan,
+                ctx,
+                &op.anchor,
+                op.facts.requires_transport,
+                &facility,
+                stats,
+            ) && enemies.iter().any(|enemy| {
+                best_damage(&scan.damage_chart, stats.unit_type, enemy.stats.unit_type) > 0
+                    && ctx.is_reachable(
+                        &scan.map,
+                        &scan.master_data,
+                        (facility.x, facility.y),
+                        (enemy.position.x, enemy.position.y),
+                        stats.movement_type,
+                    )
+            })
+        },
+    );
+    // この手番に既に使った施設は将来手番には再利用できるが、build_turn=0では使えない。
+    options.retain(|option| {
+        option.purchase.build_turn > 0 || !used_facilities.contains(&option.purchase.facility)
+    });
+    for option in &mut options {
+        option.engageable_enemy_indices = enemies
+            .iter()
+            .enumerate()
+            .filter_map(|(index, enemy)| {
+                (best_damage(
+                    &scan.damage_chart,
+                    option.stats.unit_type,
+                    enemy.stats.unit_type,
+                ) > 0
+                    && ctx.is_reachable(
+                        &scan.map,
+                        &scan.master_data,
+                        (option.purchase.facility.x, option.purchase.facility.y),
+                        (enemy.position.x, enemy.position.y),
+                        option.stats.movement_type,
+                    ))
+                .then_some(index)
+            })
+            .collect();
+    }
+
+    let hard_deadline =
+        if op.kind == OperationKind::Defense && op.facts.enemy_contact_eta != u32::MAX {
+            Some(op.facts.enemy_contact_eta.max(1))
+        } else {
+            None
+        };
+    plan_force_package(&RollingPlanInput {
+        map: scan.map.clone(),
+        damage_chart: scan.damage_chart.clone(),
+        existing_units,
+        enemies,
+        production_options: options,
+        current_funds: remaining_funds,
+        income_per_turn: scan.my_income,
+        hard_deadline,
+        delay_cost_per_turn: op.facts.target_property_count.max(1).saturating_mul(1_000),
+    })
 }
 
 /// 候補が限界被覆を与える局地敵を、生産採点と同じ重要度×相性の順に保持する。
@@ -1499,6 +1864,7 @@ fn planned_deployment(
         slot_kind,
         priority_enemies,
         threat_horizon: op.threat_horizon,
+        forecast: deployment::DeploymentForecast::default(),
     })
 }
 
@@ -2512,7 +2878,8 @@ mod tests {
             master_data: MasterDataRegistry::load().unwrap(),
             damage_chart,
             funds: 20_000,
-            free_facilities: vec![
+            free_facilities: vec![(pos(0, 1), Terrain::Factory), (pos(1, 1), Terrain::Airport)],
+            production_facilities: vec![
                 (pos(0, 1), Terrain::Factory),
                 (pos(1, 1), Terrain::Airport),
             ],
@@ -2842,6 +3209,7 @@ mod tests {
                 entity: None,
                 stats: stats(UnitType::Bcopters, 8000),
                 position: pos(1, 0),
+                current_hp: 100,
                 remaining_value: 8000.0,
                 priority_weight: 1.0,
             },
@@ -2849,6 +3217,7 @@ mod tests {
                 entity: None,
                 stats: stats(UnitType::Infantry, 7000),
                 position: pos(2, 0),
+                current_hp: 100,
                 remaining_value: 7000.0,
                 priority_weight: 1.0,
             },
@@ -2880,6 +3249,7 @@ mod tests {
             entity: None,
             stats: stats(UnitType::TransportHelicopter, 8000),
             position: pos(1, 0),
+            current_hp: 100,
             remaining_value: 8000.0,
             priority_weight: 2.0,
         }];
@@ -2904,6 +3274,7 @@ mod tests {
             entity: None,
             stats: stats(UnitType::Infantry, 1000),
             position: pos(1, 0),
+            current_hp: 100,
             remaining_value: 0.0,
             priority_weight: 2.0,
         }];
@@ -2928,6 +3299,7 @@ mod tests {
                 entity: None,
                 stats: stats(UnitType::Rockets, 6_000),
                 position: pos(1, 0),
+                current_hp: 100,
                 remaining_value: 6_000.0,
                 priority_weight: 1.0,
             },
@@ -2935,6 +3307,7 @@ mod tests {
                 entity: None,
                 stats: stats(UnitType::Rockets, 6_000),
                 position: pos(2, 0),
+                current_hp: 100,
                 remaining_value: 6_000.0,
                 priority_weight: 1.0,
             },
@@ -2990,6 +3363,12 @@ mod tests {
                 (pos(1, 1), Terrain::Airport),
                 (pos(1, 2), Terrain::Airport),
             ],
+            production_facilities: vec![
+                (pos(0, 1), Terrain::Factory),
+                (pos(1, 0), Terrain::Airport),
+                (pos(1, 1), Terrain::Airport),
+                (pos(1, 2), Terrain::Airport),
+            ],
             available_types: vec![
                 (UnitType::Infantry, infantry.clone()),
                 (UnitType::Bcopters, helicopter),
@@ -3015,7 +3394,7 @@ mod tests {
             my_income: 5_000,
         };
 
-        let (commands, trace) = plan_production(&scan, PlayerId(1), false);
+        let (commands, trace) = plan_production(&scan, PlayerId(1), false, &HashMap::new());
 
         // 旧実装は7,500の購入価格をそのまま撃破済み価値へ足し、2機で要求を
         // 消していた。65%攻撃を2回ずつ行う期待値では3機とも必要になる。
@@ -3098,6 +3477,7 @@ mod tests {
             damage_chart: DamageChart::new(),
             funds: 20000,
             free_facilities: vec![(pos(1, 1), Terrain::Port)],
+            production_facilities: vec![(pos(1, 1), Terrain::Port)],
             available_types: vec![
                 (UnitType::Infantry, infantry),
                 (UnitType::Lander, lander.clone()),
@@ -3186,6 +3566,11 @@ mod tests {
                 (pos(1, 2), Terrain::Factory),
                 (pos(1, 3), Terrain::Factory),
             ],
+            production_facilities: vec![
+                (pos(1, 1), Terrain::Factory),
+                (pos(1, 2), Terrain::Factory),
+                (pos(1, 3), Terrain::Factory),
+            ],
             available_types: vec![(UnitType::Infantry, infantry), (UnitType::Tank, tank)],
             my_units: Vec::new(),
             enemy_units: Vec::new(),
@@ -3228,6 +3613,12 @@ mod tests {
             damage_chart,
             funds: 17000,
             free_facilities: vec![
+                (pos(1, 0), Terrain::Factory),
+                (pos(1, 1), Terrain::Factory),
+                (pos(1, 2), Terrain::Factory),
+                (pos(1, 3), Terrain::Factory),
+            ],
+            production_facilities: vec![
                 (pos(1, 0), Terrain::Factory),
                 (pos(1, 1), Terrain::Factory),
                 (pos(1, 2), Terrain::Factory),
@@ -3307,6 +3698,10 @@ mod tests {
             damage_chart,
             funds: 20_000,
             free_facilities: vec![(pos(1, 1), Terrain::Factory), (pos(2, 1), Terrain::Airport)],
+            production_facilities: vec![
+                (pos(1, 1), Terrain::Factory),
+                (pos(2, 1), Terrain::Airport),
+            ],
             available_types: vec![
                 (UnitType::Infantry, infantry.clone()),
                 (UnitType::Tank, tank),
@@ -3330,7 +3725,7 @@ mod tests {
             my_income: 5_000,
         };
 
-        let (commands, trace) = plan_production(&scan, PlayerId(1), false);
+        let (commands, trace) = plan_production(&scan, PlayerId(1), false, &HashMap::new());
 
         assert_eq!(commands.len(), 1, "commands={commands:?}, trace={trace:?}");
         assert_eq!(commands[0].unit_type, UnitType::Fighter);
@@ -3342,11 +3737,11 @@ mod tests {
         }));
     }
 
-    /// 同一手番の全施設を同じ残存脅威台帳で計画し、対空の次に地上対抗へ切り替える。
+    /// 同一手番の混成パッケージに、航空・地上の両脅威へ有効なunitを含める。
     #[test]
     fn multi_factory_plan_switches_after_air_threat_is_covered() {
         let scan = mixed_threat_multi_factory_scan();
-        let (commands, trace) = plan_production(&scan, PlayerId(0), true);
+        let (commands, trace) = plan_production(&scan, PlayerId(0), true, &HashMap::new());
         let combat_types: Vec<UnitType> = commands
             .iter()
             .map(|command| command.unit_type)
@@ -3354,10 +3749,12 @@ mod tests {
             .collect();
 
         assert_eq!(
-            combat_types,
-            vec![UnitType::AntiAir, UnitType::Tank],
+            combat_types.len(),
+            2,
             "commands={commands:?}, trace={trace:?}"
         );
+        assert!(combat_types.contains(&UnitType::AntiAir));
+        assert!(combat_types.contains(&UnitType::Tank));
     }
 
     /// 増援予算だけでは敵兵種を特定できないため、敵未観測の撃破枠から汎用兵を作らない。
@@ -3367,7 +3764,7 @@ mod tests {
         scan.enemy_income = 10_000;
         scan.enemy_production_slots = 1;
 
-        let (commands, trace) = plan_production(&scan, PlayerId(0), true);
+        let (commands, trace) = plan_production(&scan, PlayerId(0), true, &HashMap::new());
 
         assert!(
             commands
@@ -3388,7 +3785,7 @@ mod tests {
     #[test]
     fn production_trace_attributes_every_command_to_a_slot() {
         let scan = multi_factory_scan();
-        let (commands, trace) = plan_production(&scan, PlayerId(0), true);
+        let (commands, trace) = plan_production(&scan, PlayerId(0), true, &HashMap::new());
 
         // 作戦が立つ盤面なので fallback には落ちない
         assert!(!trace.fallback);

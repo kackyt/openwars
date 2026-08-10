@@ -277,6 +277,42 @@ pub struct ProductionPlanSnapshot {
     pub leftover_funds: u32,
     pub operations: Vec<ProductionOperationSnapshot>,
     pub steps: Vec<ProductionStepSnapshot>,
+    pub rolling_combat_plans: Vec<RollingCombatPlanSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RollingCombatPlanSnapshot {
+    pub operation_kind: String,
+    pub anchor_x: usize,
+    pub anchor_y: usize,
+    pub feasible: bool,
+    pub purchases: Vec<RollingPurchaseSnapshot>,
+    pub targets: Vec<RollingTargetSnapshot>,
+    pub first_attack_turn: Option<u32>,
+    pub elimination_turn: Option<u32>,
+    pub occupation_turn: Option<u32>,
+    pub production_cost: u32,
+    pub expected_loss: u32,
+    pub candidates_considered: usize,
+    pub search_truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RollingPurchaseSnapshot {
+    pub unit_type: UnitType,
+    pub facility_x: usize,
+    pub facility_y: usize,
+    pub build_turn: u32,
+    pub cost: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RollingTargetSnapshot {
+    pub entity_id: Option<u64>,
+    pub unit_type: UnitType,
+    pub initial_hp: u32,
+    pub remaining_hp: u32,
+    pub destroyed_turn: Option<u32>,
 }
 
 /// 生産意図から実Entityへ接続された局地任務の実行実績。
@@ -308,8 +344,17 @@ pub struct DeploymentAuditRecordSnapshot {
     pub capture_unit_attack_count: u32,
     pub transport_unit_attack_count: u32,
     pub kill_count: u32,
+    pub damage_value_dealt: u32,
+    pub counter_value_received: u32,
+    pub destroyed_value: u32,
     pub first_attack_turn: Option<u32>,
     pub first_attack_eta: Option<u32>,
+    pub forecast_first_attack_eta: Option<u32>,
+    pub forecast_elimination_eta: Option<u32>,
+    pub forecast_occupation_eta: Option<u32>,
+    pub forecast_package_cost: u32,
+    pub forecast_package_size: u32,
+    pub first_attack_eta_delta: Option<i64>,
 }
 
 /// 緊急迎撃が何を守るために、どの戦力をpreemptしたかを示す診断。
@@ -841,6 +886,46 @@ pub fn snapshot_production_plan_for_player(
         })
         .collect();
 
+    let rolling_combat_plans = plan
+        .rolling_combat_plans
+        .iter()
+        .map(|rolling| RollingCombatPlanSnapshot {
+            operation_kind: format!("{:?}", rolling.operation_kind),
+            anchor_x: rolling.anchor.x,
+            anchor_y: rolling.anchor.y,
+            feasible: rolling.feasible,
+            purchases: rolling
+                .purchases
+                .iter()
+                .map(|purchase| RollingPurchaseSnapshot {
+                    unit_type: purchase.unit_type,
+                    facility_x: purchase.facility.x,
+                    facility_y: purchase.facility.y,
+                    build_turn: purchase.build_turn,
+                    cost: purchase.cost,
+                })
+                .collect(),
+            targets: rolling
+                .targets
+                .iter()
+                .map(|target| RollingTargetSnapshot {
+                    entity_id: target.entity.map(Entity::to_bits),
+                    unit_type: target.unit_type,
+                    initial_hp: target.initial_hp,
+                    remaining_hp: target.remaining_hp,
+                    destroyed_turn: target.destroyed_turn,
+                })
+                .collect(),
+            first_attack_turn: rolling.first_attack_turn,
+            elimination_turn: rolling.elimination_turn,
+            occupation_turn: rolling.occupation_turn,
+            production_cost: rolling.production_cost,
+            expected_loss: rolling.expected_loss,
+            candidates_considered: rolling.candidates_considered,
+            search_truncated: rolling.search_truncated,
+        })
+        .collect();
+
     Some(ProductionPlanSnapshot {
         player_id: plan.player_id.0,
         funds: plan.funds,
@@ -849,6 +934,7 @@ pub fn snapshot_production_plan_for_player(
         leftover_funds: plan.leftover_funds,
         operations,
         steps,
+        rolling_combat_plans,
     })
 }
 
@@ -882,10 +968,23 @@ pub fn snapshot_deployment_audit_for_player(
             capture_unit_attack_count: record.capture_unit_attack_count,
             transport_unit_attack_count: record.transport_unit_attack_count,
             kill_count: record.kill_count,
+            damage_value_dealt: record.damage_value_dealt,
+            counter_value_received: record.counter_value_received,
+            destroyed_value: record.destroyed_value,
             first_attack_turn: record.first_attack_turn,
             first_attack_eta: record
                 .first_attack_turn
                 .map(|turn| turn.saturating_sub(record.assigned_turn)),
+            forecast_first_attack_eta: record.forecast.first_attack_turn,
+            forecast_elimination_eta: record.forecast.elimination_turn,
+            forecast_occupation_eta: record.forecast.occupation_turn,
+            forecast_package_cost: record.forecast.package_cost,
+            forecast_package_size: record.forecast.package_size,
+            first_attack_eta_delta: record.first_attack_turn.and_then(|turn| {
+                record.forecast.first_attack_turn.map(|forecast| {
+                    i64::from(turn.saturating_sub(record.assigned_turn)) - i64::from(forecast)
+                })
+            }),
         })
         .collect::<Vec<_>>();
     Some(DeploymentAuditSnapshot {

@@ -7,12 +7,32 @@
 use crate::ai::squad::{MissionPhase, MissionType, SquadId, SquadManager};
 use crate::ai::turn_distance::TerrainConnectivity;
 use crate::ai::v4::operation::SlotKind;
-use crate::components::{Ammo, Faction, GridPosition, PlayerId, Transporting, UnitStats};
+use crate::components::{Ammo, Faction, GridPosition, Health, PlayerId, Transporting, UnitStats};
 use crate::events::{UnitAttackedEvent, UnitProducedEvent};
 use crate::resources::{DamageChart, Map, MatchState, UnitType, master_data::MasterDataRegistry};
 use bevy_ecs::event::EventReader;
 use bevy_ecs::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
+
+/// 生産時の混成パッケージ予測。実績auditと同じEntityへ保持する。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeploymentForecast {
+    pub first_attack_turn: Option<u32>,
+    pub elimination_turn: Option<u32>,
+    pub occupation_turn: Option<u32>,
+    pub package_cost: u32,
+    pub package_size: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DeploymentAttackAudit {
+    defender_can_capture: bool,
+    defender_is_transport: bool,
+    destroyed: bool,
+    damage_value_dealt: u32,
+    counter_value_received: u32,
+    destroyed_value: u32,
+}
 
 /// 生産命令と作戦意図を照合するための発注情報。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +46,7 @@ pub(crate) struct PendingDeployment {
     pub slot_kind: SlotKind,
     pub priority_enemies: Vec<Entity>,
     pub threat_horizon: u32,
+    pub forecast: DeploymentForecast,
 }
 
 /// 生産済みEntityへ結び付いた作戦意図。
@@ -43,6 +64,9 @@ struct AssignedDeployment {
     capture_unit_attack_count: u32,
     transport_unit_attack_count: u32,
     kill_count: u32,
+    damage_value_dealt: u32,
+    counter_value_received: u32,
+    destroyed_value: u32,
     first_attack_turn: Option<u32>,
 }
 
@@ -64,7 +88,11 @@ pub struct DeploymentAuditRecord {
     pub capture_unit_attack_count: u32,
     pub transport_unit_attack_count: u32,
     pub kill_count: u32,
+    pub damage_value_dealt: u32,
+    pub counter_value_received: u32,
+    pub destroyed_value: u32,
     pub first_attack_turn: Option<u32>,
+    pub forecast: DeploymentForecast,
 }
 
 /// V4の未照合発注と、生産済みEntityの局地任務を保持するリソース。
@@ -117,6 +145,9 @@ impl V4DeploymentRegistry {
                 capture_unit_attack_count: 0,
                 transport_unit_attack_count: 0,
                 kill_count: 0,
+                damage_value_dealt: 0,
+                counter_value_received: 0,
+                destroyed_value: 0,
                 first_attack_turn: None,
             },
         );
@@ -137,6 +168,30 @@ impl V4DeploymentRegistry {
             .values()
             .filter(|deployment| deployment.intent.player_id == player_id && deployment.active)
             .map(|deployment| deployment.entity)
+            .collect()
+    }
+
+    /// Combat見積で既存戦力として数えてよいEntityと、その実任務の対象を返す。
+    ///
+    /// Entityだけを返すと、1機を複数の島作戦へ同時に計上できてしまう。生産時の
+    /// 優先敵と現在の再目標を併せて返し、対象敵が属する1作戦だけへ参加させる。
+    pub(crate) fn active_target_assignments(
+        &self,
+        player_id: PlayerId,
+    ) -> HashMap<Entity, HashSet<Entity>> {
+        self.assigned
+            .values()
+            .filter(|deployment| deployment.intent.player_id == player_id && deployment.active)
+            .map(|deployment| {
+                let mut targets = deployment
+                    .intent
+                    .priority_enemies
+                    .iter()
+                    .copied()
+                    .collect::<HashSet<_>>();
+                targets.extend(deployment.current_target);
+                (deployment.entity, targets)
+            })
             .collect()
     }
 
@@ -162,7 +217,11 @@ impl V4DeploymentRegistry {
                 capture_unit_attack_count: deployment.capture_unit_attack_count,
                 transport_unit_attack_count: deployment.transport_unit_attack_count,
                 kill_count: deployment.kill_count,
+                damage_value_dealt: deployment.damage_value_dealt,
+                counter_value_received: deployment.counter_value_received,
+                destroyed_value: deployment.destroyed_value,
                 first_attack_turn: deployment.first_attack_turn,
+                forecast: deployment.intent.forecast,
             })
             .collect::<Vec<_>>();
         records.sort_unstable_by_key(|record| record.entity.to_bits());
@@ -190,9 +249,7 @@ impl V4DeploymentRegistry {
         attacker: Entity,
         defender: Entity,
         turn: u32,
-        defender_can_capture: bool,
-        defender_is_transport: bool,
-        destroyed: bool,
+        audit: DeploymentAttackAudit,
     ) {
         let Some(deployment) = self.assigned.get_mut(&attacker) else {
             return;
@@ -203,17 +260,26 @@ impl V4DeploymentRegistry {
             deployment.mission_target_attack_count =
                 deployment.mission_target_attack_count.saturating_add(1);
         }
-        if defender_can_capture {
+        if audit.defender_can_capture {
             deployment.capture_unit_attack_count =
                 deployment.capture_unit_attack_count.saturating_add(1);
         }
-        if defender_is_transport {
+        if audit.defender_is_transport {
             deployment.transport_unit_attack_count =
                 deployment.transport_unit_attack_count.saturating_add(1);
         }
-        if destroyed {
+        if audit.destroyed {
             deployment.kill_count = deployment.kill_count.saturating_add(1);
         }
+        deployment.damage_value_dealt = deployment
+            .damage_value_dealt
+            .saturating_add(audit.damage_value_dealt);
+        deployment.counter_value_received = deployment
+            .counter_value_received
+            .saturating_add(audit.counter_value_received);
+        deployment.destroyed_value = deployment
+            .destroyed_value
+            .saturating_add(audit.destroyed_value);
         if deployment.intent.priority_enemies.contains(&defender) {
             deployment.priority_attack_count = deployment.priority_attack_count.saturating_add(1);
         }
@@ -240,6 +306,7 @@ impl V4DeploymentRegistry {
                     slot_kind: SlotKind::Combat,
                     priority_enemies: vec![target],
                     threat_horizon: 1,
+                    forecast: DeploymentForecast::default(),
                 },
                 squad_id: None,
                 current_target: Some(target),
@@ -251,6 +318,9 @@ impl V4DeploymentRegistry {
                 capture_unit_attack_count: 0,
                 transport_unit_attack_count: 0,
                 kill_count: 0,
+                damage_value_dealt: 0,
+                counter_value_received: 0,
+                destroyed_value: 0,
                 first_attack_turn: None,
             },
         );
@@ -275,19 +345,42 @@ pub fn reconcile_pending_deployments_system(
 pub fn audit_deployment_attacks_system(
     mut events: EventReader<UnitAttackedEvent>,
     match_state: Res<MatchState>,
-    stats: Query<&UnitStats>,
+    units: Query<(&UnitStats, &Health)>,
     mut registry: ResMut<V4DeploymentRegistry>,
 ) {
     let turn = match_state.current_turn_number.0;
     for event in events.read() {
-        let defender_stats = stats.get(event.defender).ok();
+        let defender = units.get(event.defender).ok();
+        let attacker = units.get(event.attacker).ok();
+        let damage_value_dealt = defender.map_or(0, |(stats, health)| {
+            stats.cost.saturating_mul(
+                event
+                    .defender_hp_before
+                    .saturating_sub(event.defender_hp_after),
+            ) / health.max.max(1)
+        });
+        let counter_value_received = attacker.map_or(0, |(stats, health)| {
+            stats.cost.saturating_mul(
+                event
+                    .attacker_hp_before
+                    .saturating_sub(event.attacker_hp_after),
+            ) / health.max.max(1)
+        });
+        let destroyed_value = defender
+            .filter(|_| event.defender_hp_after == 0)
+            .map_or(0, |(stats, _)| stats.cost);
         registry.record_attack(
             event.attacker,
             event.defender,
             turn,
-            defender_stats.is_some_and(|stats| stats.can_capture),
-            defender_stats.is_some_and(|stats| stats.max_cargo > 0),
-            event.defender_hp_after == 0,
+            DeploymentAttackAudit {
+                defender_can_capture: defender.is_some_and(|(stats, _)| stats.can_capture),
+                defender_is_transport: defender.is_some_and(|(stats, _)| stats.max_cargo > 0),
+                destroyed: event.defender_hp_after == 0,
+                damage_value_dealt,
+                counter_value_received,
+                destroyed_value,
+            },
         );
     }
 }
@@ -546,6 +639,7 @@ mod tests {
             slot_kind: SlotKind::Combat,
             priority_enemies: vec![Entity::from_raw(order + 10)],
             threat_horizon: 4,
+            forecast: DeploymentForecast::default(),
         }
     }
 
@@ -608,8 +702,29 @@ mod tests {
             3,
         );
 
-        registry.record_attack(attacker, priority, 5, true, false, false);
-        registry.record_attack(attacker, Entity::from_raw(99), 6, false, true, true);
+        registry.record_attack(
+            attacker,
+            priority,
+            5,
+            DeploymentAttackAudit {
+                defender_can_capture: true,
+                damage_value_dealt: 400,
+                counter_value_received: 100,
+                ..DeploymentAttackAudit::default()
+            },
+        );
+        registry.record_attack(
+            attacker,
+            Entity::from_raw(99),
+            6,
+            DeploymentAttackAudit {
+                defender_is_transport: true,
+                destroyed: true,
+                damage_value_dealt: 600,
+                destroyed_value: 5_000,
+                ..DeploymentAttackAudit::default()
+            },
+        );
 
         let record = registry.audit_records(PlayerId(1)).pop().unwrap();
         assert_eq!(record.attack_count, 2);
@@ -618,6 +733,9 @@ mod tests {
         assert_eq!(record.capture_unit_attack_count, 1);
         assert_eq!(record.transport_unit_attack_count, 1);
         assert_eq!(record.kill_count, 1);
+        assert_eq!(record.damage_value_dealt, 1_000);
+        assert_eq!(record.counter_value_received, 100);
+        assert_eq!(record.destroyed_value, 5_000);
     }
 
     fn combat_stats(unit_type: UnitType, can_capture: bool, max_cargo: u32) -> UnitStats {
@@ -691,6 +809,7 @@ mod tests {
                     slot_kind: SlotKind::Combat,
                     priority_enemies: vec![priority],
                     threat_horizon: 3,
+                    forecast: DeploymentForecast::default(),
                 },
                 squad_id: None,
                 current_target: None,
@@ -702,6 +821,9 @@ mod tests {
                 capture_unit_attack_count: 0,
                 transport_unit_attack_count: 0,
                 kill_count: 0,
+                damage_value_dealt: 0,
+                counter_value_received: 0,
+                destroyed_value: 0,
                 first_attack_turn: None,
             },
         );

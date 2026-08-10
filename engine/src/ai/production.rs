@@ -3591,7 +3591,8 @@ mod additional_tests {
 
         assert_eq!(outcome.commands.len(), 1);
         assert_eq!(outcome.commands[0].unit_type, UnitType::TransportHelicopter);
-        assert_eq!(outcome.generic_funds, 12_000);
+        // 現在手番に実際に残った現金は、空けた第2空港のCombat計画へ使える。
+        assert_eq!(outcome.generic_funds, 16_000);
     }
 
     #[test]

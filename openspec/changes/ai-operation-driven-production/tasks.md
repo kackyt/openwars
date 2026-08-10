@@ -149,7 +149,7 @@
 
 固定sortie期待収益から必要戦力を推定するB-86〜B-88の方式は、敵排除の実行可能性を保証しないことが判明した。旧方式をshadow診断へ降格し、以下をStage 2の完了条件として先に実装する。
 
-- [ ] B-89. `destroy_budget`、`friendly_combat_value_committed`、固定`territory_control_window_turns`をCombatの生産停止・充足・作戦完了判定から外し、旧計算は比較診断に限定する
+- [x] B-89. `destroy_budget`、`friendly_combat_value_committed`、固定`territory_control_window_turns`をCombatの生産停止・充足・作戦完了判定から外し、旧計算は比較診断に限定する
 - [ ] B-90. `OperationSnapshot`、`RollingOperationPlan`、`PlanRevision`、`ForcePackageCandidate`、`PlannedStep`、`ForecastDelta`、`ReplanReason`の値オブジェクトを追加する
 - [ ] B-91. 本番ルールと共有する純粋な作戦予測器を追加し、生産、移動、射程、攻撃、反撃、HP、弾薬、燃料、Load/Drop、補給、Captureをターン単位で進める
 - [ ] B-92. 乱数ボーナスなしの悲観ダメージで敵排除可否を判定し、通常予測との損耗範囲を併記する単体テストを追加する
@@ -168,6 +168,14 @@
 - [ ] B-105. E2E traceへ候補編成、棄却理由、採用理由、初攻撃、敵別撃破、占領完了、予想／実損耗、revision差、再計画理由を出力する
 - [ ] B-106. map_3 / Hex / 複数seed / V4両席で、計画対実績をEntity単位に比較し、敵残存数、占領完了ターン、遊兵、燃料切れ、資金滞留、思考時間を旧方式と比較する
 - [ ] B-107. V4で予実差と戦果が改善した後、作戦予測器と計画器をV3へ共通化して同条件を再評価する。V1への適用はSquad非依存部分だけを別判定する
+- [x] B-108. 既存V4を維持し、Combat生産だけを敵EntityのHP全滅を実行可能条件とする純粋`rolling_plan`へ置換する
+- [x] B-109. 現在空き施設と、占有中を含む将来2手番の全所有生産施設を分離し、資金・収入・1施設1手番1生産の制約下で混成パッケージを探索する
+- [x] B-110. V4 Combat任務へ接続済みの既存Entityだけを見積へ入れ、各Entityを現在の最寄り1作戦へ排他的に帰属させて、占領／輸送unitと複数前線への二重計上を除く
+- [x] B-111. 作戦ごとの探索を1手番1回へキャッシュし、beam幅24・最大5unit・`search_truncated`で同一手番の重複探索を抑える
+- [x] B-112. 生産予測をPendingDeploymentへ保持し、初攻撃・優先敵攻撃・撃破・与被害・反撃損耗の実績とEntity単位でtraceへ出力する
+- [x] B-113. release版map_3 / Hex / seed 42 / 9ターン / V4対V3両席で追試し、V4戦闘ROI 1.15／1.09、生産Combat機7体すべての実攻撃、6機による優先敵攻撃7回、撃破5件を確認する。両席敗北と資金滞留は未達として残す
+- [ ] B-114. Load/Drop、補給、Capture、逐次位置、通常／悲観予測、PlanRevision／step_id、不適格理由、反復深化をDecision 23どおり実装する
+- [ ] B-115. map_3 / Hex / 複数seed / 12ターン以上で旧方式と比較し、資金滞留・敵残存・占領完了・遊兵が改善するまでV3/V1へ共通化しない
 
 ## Phase C: 陸上前線への一般化・到達可能性・生産枠
 

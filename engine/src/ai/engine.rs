@@ -2634,8 +2634,7 @@ pub fn decide_ai_action_v2(
                         && registry.can_repair_on_terrain(stats.unit_type, *p_terrain)
                     {
                         is_on_recovery_property = true;
-                        is_on_production_site =
-                            registry.is_production_facility(p_terrain.as_str());
+                        is_on_production_site = registry.is_production_facility(p_terrain.as_str());
                         break;
                     }
                 }

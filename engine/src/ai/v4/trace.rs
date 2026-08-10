@@ -62,6 +62,42 @@ pub struct ProductionOperationTrace {
     pub deploy_lead_time: u32,
 }
 
+/// ローリングCombat計画で選んだ生産1件。
+#[derive(Debug, Clone)]
+pub struct RollingPurchaseTrace {
+    pub unit_type: UnitType,
+    pub facility: GridPosition,
+    pub build_turn: u32,
+    pub cost: u32,
+}
+
+/// 敵Entityごとの撃破予測。
+#[derive(Debug, Clone)]
+pub struct RollingTargetTrace {
+    pub entity: Option<Entity>,
+    pub unit_type: UnitType,
+    pub initial_hp: u32,
+    pub remaining_hp: u32,
+    pub destroyed_turn: Option<u32>,
+}
+
+/// 金額充足ではなく、実行可能な混成編成として選択したCombat計画。
+#[derive(Debug, Clone)]
+pub struct RollingCombatPlanTrace {
+    pub operation_kind: OperationKind,
+    pub anchor: GridPosition,
+    pub feasible: bool,
+    pub purchases: Vec<RollingPurchaseTrace>,
+    pub targets: Vec<RollingTargetTrace>,
+    pub first_attack_turn: Option<u32>,
+    pub elimination_turn: Option<u32>,
+    pub occupation_turn: Option<u32>,
+    pub production_cost: u32,
+    pub expected_loss: u32,
+    pub candidates_considered: usize,
+    pub search_truncated: bool,
+}
+
 /// 1 ターン・1 プレイヤー分の生産計画トレース。
 #[derive(Debug, Clone)]
 pub struct ProductionPlanTrace {
@@ -74,6 +110,8 @@ pub struct ProductionPlanTrace {
     pub fallback: bool,
     pub operations: Vec<ProductionOperationTrace>,
     pub steps: Vec<ProductionStepTrace>,
+    /// 島ごとの実行可能な混成Combat計画。anchorごとに最終revisionだけを保持する。
+    pub rolling_combat_plans: Vec<RollingCombatPlanTrace>,
     /// 使い切れずに残った資金（余剰資金の積み上がりを検出する）
     pub leftover_funds: u32,
 }
@@ -88,6 +126,7 @@ impl ProductionPlanTrace {
             fallback: false,
             operations: Vec::new(),
             steps: Vec::new(),
+            rolling_combat_plans: Vec::new(),
             leftover_funds: funds,
         }
     }
@@ -127,6 +166,13 @@ impl ProductionTraceDiagnostics {
             // 最初の盤面スナップショットを保持し、実際に辿った全判断だけを追記する。
             existing.fallback |= trace.fallback;
             existing.steps.extend(trace.steps);
+            for rolling in trace.rolling_combat_plans {
+                existing.rolling_combat_plans.retain(|current| {
+                    current.operation_kind != rolling.operation_kind
+                        || current.anchor != rolling.anchor
+                });
+                existing.rolling_combat_plans.push(rolling);
+            }
             existing.leftover_funds = trace.leftover_funds;
             return;
         }
