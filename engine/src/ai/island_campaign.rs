@@ -68,8 +68,8 @@ pub struct IslandCampaignFacts {
     pub enemy_properties: u32,
     pub friendly_units: u32,
     pub enemy_units: u32,
-    pub friendly_combat_value: u32,
-    pub enemy_combat_value: u32,
+    pub friendly_combat_units: u32,
+    pub enemy_combat_units: u32,
     pub friendly_arrival_eta: Option<u32>,
     pub enemy_arrival_eta: Option<u32>,
     pub friendly_capture_eta: Option<u32>,
@@ -93,8 +93,8 @@ pub struct IslandCampaignAssessment {
     pub neutral_properties: u32,
     pub friendly_properties: u32,
     pub enemy_properties: u32,
-    pub friendly_combat_value: u32,
-    pub enemy_combat_value: u32,
+    pub friendly_combat_units: u32,
+    pub enemy_combat_units: u32,
     pub friendly_arrival_eta: Option<u32>,
     pub enemy_arrival_eta: Option<u32>,
     pub friendly_capture_eta: Option<u32>,
@@ -113,7 +113,8 @@ pub struct IslandCampaignRequirement {
     pub capture_units: u32,
     /// 敵領へ一度に揚陸させる地上戦闘unit数。
     pub ground_combat_units: u32,
-    pub combat_budget: u32,
+    /// 作戦へ追加で割り当てる戦闘Entity数。戦闘能力や価格の代用品ではない。
+    pub combat_units: u32,
     pub total_budget: u32,
 }
 
@@ -148,7 +149,8 @@ pub struct IslandCampaignShortfall {
     pub heavy_transport_slots: u32,
     pub capture_units: u32,
     pub ground_combat_units: u32,
-    pub combat_budget: u32,
+    /// まだ実Entityまたは生産計画へ接続できていない戦闘Entity数。
+    pub combat_units: u32,
     pub priority_enemy_types: Vec<UnitType>,
     pub reserved_budget: u32,
     pub priority_rank: u8,
@@ -192,21 +194,19 @@ impl IslandCampaignPortfolio {
             let missing = &assignment.purchase_shortfall;
             // 出航可能になった強襲の戦闘支援は汎用戦闘作戦へ戻す。実行中の便へ
             // 後からcargoを追加できないため、専用生産を継続すると任務なし兵が増える。
-            let combat_budget = if assignment.decision == IslandCampaignDecision::Assault
+            let combat_units = if assignment.decision == IslandCampaignDecision::Assault
                 && assignment.operation_ready
             {
                 0
             } else {
-                missing.combat_budget
+                missing.combat_units
             };
-            let reserved_budget = missing
-                .total_budget
-                .saturating_sub(missing.combat_budget.saturating_sub(combat_budget));
+            let reserved_budget = missing.total_budget;
             if reserved_budget == 0
                 && missing.transport_slots == 0
                 && missing.capture_units == 0
                 && missing.ground_combat_units == 0
-                && combat_budget == 0
+                && combat_units == 0
             {
                 continue;
             }
@@ -243,7 +243,7 @@ impl IslandCampaignPortfolio {
                 heavy_transport_slots,
                 capture_units: missing.capture_units,
                 ground_combat_units: missing.ground_combat_units,
-                combat_budget,
+                combat_units,
                 priority_enemy_types: assignment.priority_enemy_types.clone(),
                 reserved_budget,
                 priority_rank,
@@ -307,8 +307,6 @@ pub(crate) struct IslandCampaignCandidate {
     pub(crate) requirement: IslandCampaignRequirement,
     /// Assaultで必須とする輸送役の構成。生産圏内の実拠点から組める編成だけを保持する。
     pub(crate) assault_transport_types: Vec<UnitType>,
-    /// combat power不足が正の場合に予約すべき最小の実購入unit cost。
-    pub(crate) minimum_combat_purchase_cost: Option<u32>,
     /// 自軍拠点で実際に生産できる輸送手段。Reinforceの不足を盤面依存で導出する。
     pub(crate) producible_transports: Vec<CampaignTransportBlueprint>,
     pub(crate) existing_operation: Option<ExistingCampaignOperation>,
@@ -429,7 +427,7 @@ fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePrior
                 .assessment
                 .friendly_capture_eta
                 .unwrap_or(u32::MAX),
-            candidate.assessment.enemy_combat_value,
+            candidate.assessment.enemy_combat_units,
             0,
             0,
             candidate.assessment.island_id.0,
@@ -443,7 +441,7 @@ fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePrior
             Reverse(candidate.assessment.enemy_properties),
             candidate.transport_eta.unwrap_or(u32::MAX),
             candidate.assessment.required_budget,
-            candidate.assessment.enemy_combat_value,
+            candidate.assessment.enemy_combat_units,
             0,
             candidate.assessment.island_id.0,
         ),
@@ -640,7 +638,7 @@ pub(crate) fn promote_logistics_prerequisite(
             candidate.requirement.preferred_transport = Some(UnitType::TransportHelicopter);
             candidate.requirement.transport_slots = 2;
             candidate.requirement.capture_units = 2;
-            candidate.requirement.combat_budget = 0;
+            candidate.requirement.combat_units = 0;
             candidate.requirement.total_budget = 6_000;
             candidate.assault_transport_types.clear();
             candidate.assessment.required_budget = candidate.requirement.total_budget;
@@ -661,7 +659,7 @@ pub(crate) fn promote_logistics_prerequisite(
 fn defense_priority_key(candidate: &IslandCampaignCandidate) -> (u32, Reverse<u32>, usize) {
     (
         candidate.assessment.enemy_arrival_eta.unwrap_or(u32::MAX),
-        Reverse(candidate.assessment.enemy_combat_value),
+        Reverse(candidate.assessment.enemy_combat_units),
         candidate.assessment.island_id.0,
     )
 }
@@ -893,7 +891,6 @@ fn minimum_purchase_floor(
     missing_lander: bool,
     missing_helicopter: bool,
     missing_capture_units: u32,
-    missing_combat_budget: u32,
 ) -> u32 {
     let transport_floor = match decision {
         IslandCampaignDecision::Expand => {
@@ -904,9 +901,7 @@ fn minimum_purchase_floor(
             .saturating_add(u32::from(missing_helicopter).saturating_mul(4_000)),
         _ => 0,
     };
-    transport_floor
-        .saturating_add(missing_capture_units.saturating_mul(1_000))
-        .saturating_add(missing_combat_budget)
+    transport_floor.saturating_add(missing_capture_units.saturating_mul(1_000))
 }
 
 fn reserve_candidate(
@@ -1091,27 +1086,26 @@ fn reserve_candidate(
         remove_entity(&mut provisional, unit.entity);
     }
 
-    let mut remaining_combat_budget = requirement.combat_budget;
+    let mut remaining_combat_units = requirement.combat_units;
     for entity in capture_entities
         .iter()
         .skip(capture_entities_used_for_capture)
         .chain(combat_entities.iter())
     {
-        if remaining_combat_budget == 0 {
+        if remaining_combat_units == 0 {
             break;
         }
-        if let Some(unit) = catalog.get(entity) {
-            // capture枠へ使わなかった既存歩兵は戦闘価値へ一度だけ充当する。
-            let credited = remaining_combat_budget.min(unit.cost);
-            remaining_combat_budget = remaining_combat_budget.saturating_sub(credited);
-            requirement_credit = requirement_credit.saturating_add(credited);
+        if catalog.contains_key(entity) {
+            // capture枠へ使わなかった実Entityを、戦闘参加者として一体だけ充当する。
+            remaining_combat_units = remaining_combat_units.saturating_sub(1);
+            // 戦闘Entityの価格で輸送・占領の構造予算を相殺してはならない。
         }
     }
     let assault_wave_is_frozen = candidate.assessment.decision == IslandCampaignDecision::Assault
         && existing
             .is_some_and(|operation| is_live_campaign_transport_phase(operation.transport_phase));
     available = sorted_pool_units(&provisional, island_id);
-    while remaining_combat_budget > 0 && !assault_wave_is_frozen {
+    while remaining_combat_units > 0 && !assault_wave_is_frozen {
         let Some(index) = available.iter().position(|unit| {
             if is_campaign_support_unit(unit.unit_type) {
                 return false;
@@ -1153,9 +1147,7 @@ fn reserve_candidate(
         };
         let unit = available.remove(index);
         push_unique_entity(&mut combat_entities, unit.entity);
-        let credited = remaining_combat_budget.min(unit.cost);
-        remaining_combat_budget = remaining_combat_budget.saturating_sub(credited);
-        requirement_credit = requirement_credit.saturating_add(credited);
+        remaining_combat_units = remaining_combat_units.saturating_sub(1);
         reserved_entity_value = reserved_entity_value.saturating_add(unit.cost);
         remove_entity(&mut provisional, unit.entity);
     }
@@ -1219,12 +1211,6 @@ fn reserve_candidate(
     let missing_lander = missing_assault_transports.contains(&UnitType::Lander);
     let missing_helicopter =
         missing_helicopter || missing_assault_transports.contains(&UnitType::TransportHelicopter);
-    let combat_purchase_floor = if remaining_combat_budget > 0 {
-        // combat powerの端数も、実際に購入可能な最小unit 1体分を予約できなければ受理しない。
-        candidate.minimum_combat_purchase_cost?
-    } else {
-        0
-    };
     // 高価な既存unitのcreditで輸送・占領など必須カテゴリの購入費が消えないよう下限を戻す。
     let structural_floor = minimum_purchase_floor(
         candidate.assessment.decision,
@@ -1232,9 +1218,7 @@ fn reserve_candidate(
         missing_lander,
         missing_helicopter,
         remaining_capture_units,
-        remaining_combat_budget,
-    )
-    .max(combat_purchase_floor);
+    );
     let base_purchase_budget = requirement
         .total_budget
         .saturating_sub(requirement_credit)
@@ -1270,7 +1254,7 @@ fn reserve_candidate(
         capture_units: remaining_capture_units,
         // 敵領戦闘力は時系列planの結果であり、島campaignの固定台数要求にしない。
         ground_combat_units: 0,
-        combat_budget: remaining_combat_budget,
+        combat_units: remaining_combat_units,
         total_budget: purchase_budget,
     };
     let capture_package_ready = purchase_shortfall.capture_units == 0
@@ -1282,7 +1266,7 @@ fn reserve_candidate(
     let operation_ready = structural_package_ready
         && ((candidate.logistics_prerequisite
             && candidate.assessment.decision != IslandCampaignDecision::Assault)
-            || purchase_shortfall.combat_budget == 0);
+            || purchase_shortfall.combat_units == 0);
     transport_entities.sort_by_key(|entity| entity.to_bits());
     capture_entities.sort_by_key(|entity| entity.to_bits());
     combat_entities.sort_by_key(|entity| entity.to_bits());
@@ -1697,15 +1681,6 @@ fn ceil_div(numerator: u32, denominator: u32) -> u32 {
     numerator / denominator + u32::from(!numerator.is_multiple_of(denominator))
 }
 
-/// 敵戦力を厳密に上回り、さらに実配備可能な最小戦闘unit 1体分を損耗余裕として持つ。
-/// 固定比率を使わないため、小規模戦では過剰投入を避け、大規模戦では余裕率が自然に縮む。
-pub(crate) fn combat_overmatch_requirement(enemy_combat_value: u32, reserve_unit_cost: u32) -> u32 {
-    if enemy_combat_value == 0 {
-        return 0;
-    }
-    enemy_combat_value.saturating_add(reserve_unit_cost.max(1))
-}
-
 /// 輸送・占領・不足パッケージ回収を合わせた投資回収ターン数を計算する。
 pub fn calculate_expansion_payback_turns(
     transport_eta: Option<u32>,
@@ -1725,39 +1700,24 @@ pub fn calculate_expansion_payback_turns(
     )
 }
 
-/// 固定費と「敵戦力＋最小戦闘unit 1体」を合算し、最低侵攻予算を下回らない値を返す。
-pub fn required_assault_budget(enemy_combat_value: u32) -> u32 {
-    const FIXED_COST: u64 = 22_500;
-    const COMBAT_FLOOR: u64 = 10_200;
-
-    // 合計がu32上限を超える場合だけ最終結果を飽和させる。
-    let overmatch = u64::from(combat_overmatch_requirement(enemy_combat_value, 1_000));
-    let total = FIXED_COST.saturating_add(COMBAT_FLOOR.max(overmatch));
-
-    u32::try_from(total).unwrap_or(u32::MAX)
-}
-
 /// 交戦中の島について、共有資源配分側から渡された補強可否と代替投資有無で判断する。
 pub fn decide_contested(
     facts: &IslandCampaignFacts,
-    reinforced_friendly_power: u32,
+    _reinforced_friendly_units: u32,
     can_allocate_reinforcement: bool,
     has_better_open_neutral: bool,
 ) -> IslandCampaignDecision {
     let capture_race_is_competitive = facts
         .friendly_capture_eta
         .zip(facts.enemy_capture_eta)
-        .is_some_and(|(friendly_eta, enemy_eta)| {
-            friendly_eta <= enemy_eta.saturating_add(1)
-                && facts.friendly_combat_value >= facts.enemy_combat_value
-        });
+        .is_some_and(|(friendly_eta, enemy_eta)| friendly_eta <= enemy_eta.saturating_add(1));
     if capture_race_is_competitive {
         return IslandCampaignDecision::Contest;
     }
 
-    // 補強後戦力は同数で止めず、最小戦闘unit 1体分だけ上回る場合に採用する。
-    let required_reinforced_power = combat_overmatch_requirement(facts.enemy_combat_value, 1_000);
-    if can_allocate_reinforcement && reinforced_friendly_power >= required_reinforced_power {
+    // 撃破可否をEntity数の単純比較では決めない。補強packageを割り当てられるなら
+    // 作戦を継続し、必要編成の可否はターン別戦闘計画器へ委譲する。
+    if can_allocate_reinforcement {
         return IslandCampaignDecision::Reinforce;
     }
     if has_better_open_neutral {
@@ -1840,8 +1800,8 @@ pub fn assess_island(facts: &IslandCampaignFacts) -> IslandCampaignAssessment {
         IslandCampaignState::EnemyHeld => (
             IslandCampaignDecision::Assault,
             "敵軍が支配している島である",
-            "必要侵攻予算を算出し暫定的に強襲候補とする",
-            required_assault_budget(facts.enemy_combat_value),
+            "敵Entityを排除できる実行計画を探索する強襲候補とする",
+            0,
         ),
     };
 
@@ -1855,8 +1815,8 @@ pub fn assess_island(facts: &IslandCampaignFacts) -> IslandCampaignAssessment {
         neutral_properties: facts.neutral_properties,
         friendly_properties: facts.friendly_properties,
         enemy_properties: facts.enemy_properties,
-        friendly_combat_value: facts.friendly_combat_value,
-        enemy_combat_value: facts.enemy_combat_value,
+        friendly_combat_units: facts.friendly_combat_units,
+        enemy_combat_units: facts.enemy_combat_units,
         friendly_arrival_eta: facts.friendly_arrival_eta,
         enemy_arrival_eta: facts.enemy_arrival_eta,
         friendly_capture_eta: facts.friendly_capture_eta,
@@ -1887,8 +1847,8 @@ mod tests {
             enemy_properties: 0,
             friendly_units: 0,
             enemy_units: 0,
-            friendly_combat_value: 0,
-            enemy_combat_value: 0,
+            friendly_combat_units: 0,
+            enemy_combat_units: 0,
             friendly_arrival_eta: None,
             enemy_arrival_eta: None,
             friendly_capture_eta: None,
@@ -1946,20 +1906,20 @@ mod tests {
         enemy_capture_eta: Option<u32>,
     ) -> IslandCampaignFacts {
         let mut facts = facts_with_both_armies_present();
-        facts.friendly_combat_value = 10_000;
-        facts.enemy_combat_value = 10_000;
+        facts.friendly_combat_units = 1;
+        facts.enemy_combat_units = 1;
         facts.friendly_capture_eta = friendly_capture_eta;
         facts.enemy_capture_eta = enemy_capture_eta;
         facts
     }
 
     fn facts_with_power(
-        friendly_combat_value: u32,
-        enemy_combat_value: u32,
+        friendly_combat_units: u32,
+        enemy_combat_units: u32,
     ) -> IslandCampaignFacts {
         let mut facts = facts_with_both_armies_present();
-        facts.friendly_combat_value = friendly_combat_value;
-        facts.enemy_combat_value = enemy_combat_value;
+        facts.friendly_combat_units = friendly_combat_units;
+        facts.enemy_combat_units = enemy_combat_units;
         facts
     }
 
@@ -2062,14 +2022,6 @@ mod tests {
     }
 
     #[test]
-    fn calculates_enemy_held_budget_floor_and_discrete_overmatch_budget() {
-        assert_eq!(required_assault_budget(0), 32_700);
-        assert_eq!(required_assault_budget(8_500), 32_700);
-        assert_eq!(required_assault_budget(10_000), 33_500);
-        assert_eq!(required_assault_budget(u32::MAX), u32::MAX);
-    }
-
-    #[test]
     fn decides_contested_action_from_capture_race_and_complete_reinforcement() {
         assert_eq!(
             decide_contested(
@@ -2090,7 +2042,7 @@ mod tests {
         );
         assert_eq!(
             decide_contested(&facts_with_power(8_000, 10_000), 10_999, true, true),
-            IslandCampaignDecision::Withdraw,
+            IslandCampaignDecision::Reinforce,
         );
         assert_eq!(
             decide_contested(&facts_with_power(8_000, 10_000), 8_000, false, false),
@@ -2158,15 +2110,15 @@ mod tests {
         );
 
         let mut enemy_held_facts = facts_for_enemy_foothold();
-        enemy_held_facts.enemy_combat_value = 10_000;
+        enemy_held_facts.enemy_combat_units = 1;
         let enemy_held = assess_island(&enemy_held_facts);
         assert_eq!(enemy_held.state, IslandCampaignState::EnemyHeld);
         assert_eq!(enemy_held.decision, IslandCampaignDecision::Assault);
-        assert_eq!(enemy_held.required_budget, 33_500);
+        assert_eq!(enemy_held.required_budget, 0);
         assert_eq!(enemy_held.allocated_budget, 0);
         assert_eq!(
             enemy_held.decision_reason,
-            "必要侵攻予算を算出し暫定的に強襲候補とする"
+            "敵Entityを排除できる実行計画を探索する強襲候補とする"
         );
     }
 
@@ -2185,8 +2137,8 @@ mod tests {
             neutral_properties: u32::from(state == IslandCampaignState::OpenNeutral),
             friendly_properties: u32::from(state == IslandCampaignState::Threatened),
             enemy_properties: u32::from(state == IslandCampaignState::EnemyHeld),
-            friendly_combat_value: 0,
-            enemy_combat_value: 0,
+            friendly_combat_units: 0,
+            enemy_combat_units: 0,
             friendly_arrival_eta: None,
             enemy_arrival_eta: None,
             friendly_capture_eta: None,
@@ -2228,11 +2180,10 @@ mod tests {
                 transport_slots: 2,
                 capture_units: 2,
                 ground_combat_units: 0,
-                combat_budget: 0,
+                combat_units: 0,
                 total_budget: 6_000,
             },
             assault_transport_types: Vec::new(),
-            minimum_combat_purchase_cost: Some(1_000),
             producible_transports: test_transport_blueprints(),
             existing_operation: None,
         }
@@ -2443,7 +2394,7 @@ mod tests {
         );
         assert_eq!(bridgehead.requirement.transport_slots, 2);
         assert_eq!(bridgehead.requirement.capture_units, 2);
-        assert_eq!(bridgehead.requirement.combat_budget, 0);
+        assert_eq!(bridgehead.requirement.combat_units, 0);
         assert_eq!(bridgehead.requirement.total_budget, 6_000);
         assert!(bridgehead.assault_transport_types.is_empty());
     }
@@ -2761,14 +2712,14 @@ mod tests {
         assert!(portfolio.assignment_for(IslandId(9)).is_none());
     }
 
-    /// 未積立分まで返金するphantom fundsを作らず、防衛preempt後も実資金以上を配らない。
+    /// Combatだけを要求する防衛は価格予約を作らず、兵站作戦の構造予算を奪わない。
     #[test]
-    fn defense_preemption_refunds_only_funds_reserved_for_underfunded_assault() {
+    fn combat_only_defense_does_not_preempt_structural_campaign_funds() {
         let portfolio = allocate_campaign_portfolio(
             vec![
                 assault_candidate(9),
-                defense_candidate(10, 1, 10_000),
-                defense_candidate(11, 1, 10_000),
+                defense_candidate(10, 1, 1),
+                defense_candidate(11, 1, 1),
             ],
             CampaignResourcePool {
                 available_funds: 14_000,
@@ -2776,18 +2727,29 @@ mod tests {
             },
         );
 
-        assert!(portfolio.active_offensives.is_empty());
-        assert_eq!(portfolio.defenses.len(), 1);
+        assert_eq!(portfolio.active_offensives.len(), 1);
+        assert_eq!(portfolio.defenses.len(), 2);
         assert_eq!(portfolio.defenses[0].island_id, IslandId(10));
-        assert_eq!(portfolio.defenses[0].allocated_budget, 10_000);
-        assert_eq!(
-            portfolio
-                .islands
-                .iter()
-                .find(|assessment| assessment.island_id == IslandId(9))
-                .and_then(|assessment| assessment.pause_cause),
-            Some(IslandCampaignPauseCause::DefensePreemption)
+        assert_eq!(portfolio.defenses[0].allocated_budget, 0);
+    }
+
+    #[test]
+    fn combat_entity_price_does_not_credit_missing_transport_or_capture_structure() {
+        let combat = unit_candidate(99, UnitType::Tank, 7_000, false, 0);
+        let portfolio = allocate_campaign_portfolio(
+            vec![assault_candidate(9)],
+            CampaignResourcePool {
+                available_funds: 22_500,
+                units: vec![combat],
+            },
         );
+
+        let assignment = &portfolio.active_offensives[0];
+        assert_eq!(assignment.combat_entities, vec![Entity::from_raw(99)]);
+        assert_eq!(assignment.purchase_shortfall.combat_units, 1);
+        assert_eq!(assignment.purchase_shortfall.transport_slots, 4);
+        assert_eq!(assignment.purchase_shortfall.capture_units, 2);
+        assert_eq!(assignment.purchase_shortfall.total_budget, 22_500);
     }
 
     #[test]
@@ -2853,24 +2815,23 @@ mod tests {
                 transport_slots: 0,
                 capture_units: 0,
                 ground_combat_units: 0,
-                combat_budget: 0,
+                combat_units: 0,
                 total_budget: 0,
             },
             assault_transport_types: Vec::new(),
-            minimum_combat_purchase_cost: Some(1_000),
             producible_transports: test_transport_blueprints(),
             existing_operation: None,
         }
     }
 
-    fn contest_candidate(island: usize, friendly_value: u32) -> IslandCampaignCandidate {
+    fn contest_candidate(island: usize, friendly_units: u32) -> IslandCampaignCandidate {
         let mut assessment = allocation_assessment(
             island,
             IslandCampaignState::Contested,
             IslandCampaignDecision::Contest,
         );
-        assessment.friendly_combat_value = friendly_value;
-        assessment.enemy_combat_value = friendly_value;
+        assessment.friendly_combat_units = friendly_units;
+        assessment.enemy_combat_units = friendly_units;
         assessment.friendly_capture_eta = Some(1);
         assessment.enemy_capture_eta = Some(1);
         IslandCampaignCandidate {
@@ -2892,24 +2853,23 @@ mod tests {
                 transport_slots: 0,
                 capture_units: 0,
                 ground_combat_units: 0,
-                combat_budget: 0,
+                combat_units: 0,
                 total_budget: 0,
             },
             assault_transport_types: Vec::new(),
-            minimum_combat_purchase_cost: Some(1_000),
             producible_transports: test_transport_blueprints(),
             existing_operation: None,
         }
     }
 
-    fn reinforcement_candidate(island: usize, required_power: u32) -> IslandCampaignCandidate {
+    fn reinforcement_candidate(island: usize, required_units: u32) -> IslandCampaignCandidate {
         let mut assessment = allocation_assessment(
             island,
             IslandCampaignState::Contested,
             IslandCampaignDecision::Reinforce,
         );
-        assessment.enemy_combat_value = required_power;
-        assessment.required_budget = required_power;
+        assessment.enemy_combat_units = required_units;
+        assessment.required_budget = 0;
         IslandCampaignCandidate {
             assessment,
             target_position: GridPosition { x: island, y: 1 },
@@ -2929,11 +2889,10 @@ mod tests {
                 transport_slots: 0,
                 capture_units: 0,
                 ground_combat_units: 0,
-                combat_budget: required_power,
-                total_budget: required_power,
+                combat_units: required_units,
+                total_budget: 0,
             },
             assault_transport_types: Vec::new(),
-            minimum_combat_purchase_cost: Some(1_000),
             producible_transports: test_transport_blueprints(),
             existing_operation: None,
         }
@@ -2945,8 +2904,8 @@ mod tests {
             IslandCampaignState::EnemyHeld,
             IslandCampaignDecision::Assault,
         );
-        assessment.enemy_combat_value = 8_500;
-        assessment.required_budget = 32_700;
+        assessment.enemy_combat_units = 1;
+        assessment.required_budget = 22_500;
         IslandCampaignCandidate {
             assessment,
             target_position: GridPosition { x: island, y: 1 },
@@ -2966,11 +2925,11 @@ mod tests {
                 transport_slots: 4,
                 capture_units: 2,
                 ground_combat_units: 2,
-                combat_budget: 10_200,
-                total_budget: 32_700,
+                combat_units: 2,
+                // Lander 1 + TransportHelicopter 1 + Infantry 2 の構造費だけを予約する。
+                total_budget: 22_500,
             },
             assault_transport_types: vec![UnitType::Lander, UnitType::TransportHelicopter],
-            minimum_combat_purchase_cost: Some(1_000),
             producible_transports: test_transport_blueprints(),
             existing_operation: None,
         }
@@ -2979,7 +2938,7 @@ mod tests {
     fn defense_candidate(
         island: usize,
         enemy_eta: u32,
-        enemy_value: u32,
+        enemy_units: u32,
     ) -> IslandCampaignCandidate {
         let mut assessment = allocation_assessment(
             island,
@@ -2987,7 +2946,7 @@ mod tests {
             IslandCampaignDecision::Defend,
         );
         assessment.enemy_arrival_eta = Some(enemy_eta);
-        assessment.enemy_combat_value = enemy_value;
+        assessment.enemy_combat_units = enemy_units;
         IslandCampaignCandidate {
             assessment,
             target_position: GridPosition { x: island, y: 1 },
@@ -3007,11 +2966,11 @@ mod tests {
                 transport_slots: 0,
                 capture_units: 0,
                 ground_combat_units: 0,
-                combat_budget: enemy_value,
-                total_budget: enemy_value,
+                combat_units: enemy_units,
+                // 戦闘編成費は具体的なRollingPlanが算出する。島要求へ価格を載せない。
+                total_budget: 0,
             },
             assault_transport_types: Vec::new(),
-            minimum_combat_purchase_cost: Some(1_000),
             producible_transports: test_transport_blueprints(),
             existing_operation: None,
         }
@@ -3029,23 +2988,17 @@ mod tests {
         transported.is_transporting = true;
 
         let portfolio = allocate_campaign_portfolio(
-            vec![defense_candidate(0, 1, 7_000)],
+            vec![defense_candidate(0, 1, 1)],
             CampaignResourcePool {
                 available_funds: 0,
                 units: vec![unreachable, transported],
             },
         );
 
-        assert!(portfolio.defenses.is_empty());
-        assert_eq!(
-            portfolio
-                .islands
-                .iter()
-                .find(|assessment| assessment.island_id == IslandId(0))
-                .unwrap()
-                .decision,
-            IslandCampaignDecision::Observe
-        );
+        let assignment = &portfolio.defenses[0];
+        assert!(assignment.combat_entities.is_empty());
+        assert_eq!(assignment.purchase_shortfall.combat_units, 1);
+        assert!(!assignment.operation_ready);
     }
 
     #[test]
@@ -3056,7 +3009,7 @@ mod tests {
         reachable.reachable_positions = vec![GridPosition { x: 0, y: 1 }];
 
         let portfolio = allocate_campaign_portfolio(
-            vec![defense_candidate(0, 1, 7_000)],
+            vec![defense_candidate(0, 1, 1)],
             CampaignResourcePool {
                 available_funds: 0,
                 units: vec![reachable],
@@ -3097,11 +3050,11 @@ mod tests {
     }
 
     #[test]
-    fn allocates_threatened_defense_by_preempting_the_lowest_priority_offensive() {
+    fn combat_only_defense_keeps_parallel_funded_expansions() {
         let candidates = vec![
             expansion_candidate(0, 4),
             expansion_candidate(1, 5),
-            defense_candidate(2, 1, 6_000),
+            defense_candidate(2, 1, 1),
         ];
 
         let portfolio = allocate_campaign_portfolio(
@@ -3112,25 +3065,11 @@ mod tests {
             },
         );
 
-        assert_eq!(portfolio.active_offensives.len(), 1);
+        assert_eq!(portfolio.active_offensives.len(), 2);
         assert_eq!(portfolio.active_offensives[0].island_id, IslandId(0));
         assert_eq!(portfolio.defenses.len(), 1);
         assert_eq!(portfolio.defenses[0].island_id, IslandId(2));
-        assert_eq!(portfolio.defenses[0].purchase_shortfall.total_budget, 6_000);
-        let preempted = portfolio
-            .islands
-            .iter()
-            .find(|assessment| assessment.island_id == IslandId(1))
-            .unwrap();
-        assert_eq!(preempted.decision, IslandCampaignDecision::Observe);
-        assert_eq!(
-            preempted.pause_cause,
-            Some(IslandCampaignPauseCause::DefensePreemption)
-        );
-        assert_eq!(
-            preempted.decision_reason,
-            "Threatened島防衛のため攻勢を一時停止"
-        );
+        assert_eq!(portfolio.defenses[0].purchase_shortfall.total_budget, 0);
     }
 
     #[test]
@@ -3287,9 +3226,9 @@ mod tests {
     }
 
     #[test]
-    fn allocates_existing_capture_member_as_defense_combat_value() {
+    fn allocates_existing_capture_member_as_defense_combat_unit() {
         let infantry = Entity::from_raw(41);
-        let mut candidate = defense_candidate(0, 1, 1_000);
+        let mut candidate = defense_candidate(0, 1, 1);
         candidate.existing_operation = Some(ExistingCampaignOperation {
             island_id: IslandId(0),
             target_position: candidate.target_position,
@@ -3314,7 +3253,7 @@ mod tests {
         let assignment = &portfolio.defenses[0];
         assert_eq!(assignment.capture_entities, vec![infantry]);
         assert!(assignment.combat_entities.is_empty());
-        assert_eq!(assignment.purchase_shortfall.combat_budget, 0);
+        assert_eq!(assignment.purchase_shortfall.combat_units, 0);
         assert_eq!(assignment.purchase_shortfall.total_budget, 0);
         assert!(assignment.operation_ready);
     }
@@ -3322,7 +3261,7 @@ mod tests {
     #[test]
     fn allocates_small_combat_remainder_with_a_real_unit_purchase_budget() {
         let infantry = Entity::from_raw(45);
-        let mut candidate = defense_candidate(0, 1, 1_080);
+        let mut candidate = defense_candidate(0, 1, 2);
         candidate.existing_operation = Some(ExistingCampaignOperation {
             island_id: IslandId(0),
             target_position: candidate.target_position,
@@ -3345,15 +3284,14 @@ mod tests {
         );
 
         let assignment = &portfolio.defenses[0];
-        assert_eq!(assignment.purchase_shortfall.combat_budget, 80);
-        assert_eq!(assignment.purchase_shortfall.total_budget, 1_000);
+        assert_eq!(assignment.purchase_shortfall.combat_units, 1);
+        assert_eq!(assignment.purchase_shortfall.total_budget, 0);
         assert!(!assignment.operation_ready);
     }
 
     #[test]
     fn rejects_combat_purchase_when_no_eligible_unit_is_producible() {
-        let mut candidate = defense_candidate(0, 1, 1_080);
-        candidate.minimum_combat_purchase_cost = None;
+        let candidate = defense_candidate(0, 1, 1);
 
         let portfolio = allocate_campaign_portfolio(
             vec![candidate],
@@ -3363,18 +3301,16 @@ mod tests {
             },
         );
 
-        assert!(portfolio.defenses.is_empty());
-        assert!(portfolio.assignment_for(IslandId(0)).is_none());
-        assert_eq!(
-            portfolio.islands[0].decision,
-            IslandCampaignDecision::Observe
-        );
+        let assignment = &portfolio.defenses[0];
+        assert_eq!(assignment.purchase_shortfall.combat_units, 1);
+        assert_eq!(assignment.purchase_shortfall.total_budget, 0);
+        assert!(!assignment.operation_ready);
     }
 
     #[test]
-    fn allocates_existing_capture_member_as_reinforcement_combat_value() {
+    fn allocates_existing_capture_member_as_reinforcement_combat_unit() {
         let infantry = Entity::from_raw(42);
-        let mut candidate = reinforcement_candidate(0, 1_000);
+        let mut candidate = reinforcement_candidate(0, 1);
         candidate.existing_operation = Some(ExistingCampaignOperation {
             island_id: IslandId(0),
             target_position: candidate.target_position,
@@ -3400,7 +3336,7 @@ mod tests {
         assert_eq!(assignment.decision, IslandCampaignDecision::Reinforce);
         assert_eq!(assignment.capture_entities, vec![infantry]);
         assert!(assignment.combat_entities.is_empty());
-        assert_eq!(assignment.purchase_shortfall.combat_budget, 0);
+        assert_eq!(assignment.purchase_shortfall.combat_units, 0);
         assert_eq!(assignment.purchase_shortfall.total_budget, 0);
         assert!(assignment.operation_ready);
     }
@@ -3409,7 +3345,7 @@ mod tests {
     #[test]
     fn reinforcement_without_transport_reports_heavy_transport_shortfall() {
         let tank = Entity::from_raw(142);
-        let candidate = reinforcement_candidate(0, 7_000);
+        let candidate = reinforcement_candidate(0, 1);
         let mut remote_tank = unit_candidate(142, UnitType::Tank, 7_000, false, 0);
         remote_tank.island_id = Some(IslandId(1));
         remote_tank.reachable_positions.clear();
@@ -3438,7 +3374,7 @@ mod tests {
     #[test]
     fn local_reinforcement_does_not_request_transport() {
         let tank = Entity::from_raw(143);
-        let candidate = reinforcement_candidate(0, 7_000);
+        let candidate = reinforcement_candidate(0, 1);
         let mut local_tank = unit_candidate(143, UnitType::Tank, 7_000, false, 0);
         local_tank.island_id = Some(IslandId(0));
 
@@ -3463,7 +3399,7 @@ mod tests {
         let mut infantry = unit_candidate(43, UnitType::Infantry, 1_000, true, 0);
         infantry.island_id = Some(IslandId(1));
 
-        let candidates = vec![expansion_candidate(0, 4), contest_candidate(1, 1_000)];
+        let candidates = vec![expansion_candidate(0, 4), contest_candidate(1, 1)];
         let units = vec![
             unit_candidate(44, UnitType::TransportHelicopter, 4_000, false, 2),
             infantry,
@@ -3503,8 +3439,8 @@ mod tests {
             expansion_candidate(0, 4),
             expansion_candidate(1, 5),
             expansion_candidate(2, 6),
-            contest_candidate(3, 10_000),
-            defense_candidate(4, 1, 10_000),
+            contest_candidate(3, 1),
+            defense_candidate(4, 1, 1),
         ];
 
         let portfolio = allocate_campaign_portfolio(
@@ -3521,7 +3457,7 @@ mod tests {
                 .iter()
                 .map(|assignment| assignment.island_id)
                 .collect::<Vec<_>>(),
-            vec![IslandId(3), IslandId(0)]
+            vec![IslandId(3), IslandId(0), IslandId(1)]
         );
         let contest = portfolio
             .islands
@@ -3531,36 +3467,42 @@ mod tests {
         assert_eq!(contest.decision, IslandCampaignDecision::Contest);
         let defense = &portfolio.defenses[0];
         assert!(defense.combat_entities.is_empty());
-        assert_eq!(defense.purchase_shortfall.total_budget, 10_000);
+        assert_eq!(defense.purchase_shortfall.total_budget, 0);
         assert!(!defense.operation_ready);
     }
 
     #[test]
-    fn allocates_failed_contest_asset_to_defense_after_rollback() {
-        let defender = Entity::from_raw(53);
-        let mut contest = contest_candidate(0, 1_000);
-        contest.requirement.combat_budget = 2_000;
-        contest.requirement.total_budget = 2_000;
+    fn keeps_understrength_contest_for_rolling_plan_reinforcement() {
+        let mut contest = contest_candidate(0, 1);
+        contest.requirement.combat_units = 2;
+        contest.requirement.total_budget = 0;
         let mut contest_asset = unit_candidate(53, UnitType::Infantry, 1_000, true, 0);
         contest_asset.island_id = Some(IslandId(0));
 
         let portfolio = allocate_campaign_portfolio(
-            vec![contest, defense_candidate(1, 1, 1_000)],
+            vec![contest, defense_candidate(1, 1, 1)],
             CampaignResourcePool {
                 available_funds: 0,
                 units: vec![contest_asset],
             },
         );
 
-        assert!(portfolio.active_offensives.is_empty());
+        assert_eq!(portfolio.active_offensives.len(), 1);
         assert_eq!(
             portfolio.islands[0].decision,
-            IslandCampaignDecision::Observe
+            IslandCampaignDecision::Contest
         );
         let defense = &portfolio.defenses[0];
-        assert_eq!(defense.combat_entities, vec![defender]);
+        assert!(defense.combat_entities.is_empty());
+        assert!(portfolio.active_offensives[0].combat_entities.is_empty());
+        assert_eq!(
+            portfolio.active_offensives[0]
+                .purchase_shortfall
+                .combat_units,
+            1
+        );
         assert_eq!(defense.purchase_shortfall.total_budget, 0);
-        assert!(defense.operation_ready);
+        assert!(!defense.operation_ready);
     }
 
     #[test]
@@ -3605,7 +3547,7 @@ mod tests {
     }
 
     #[test]
-    fn allocates_assault_capture_units_without_double_crediting_combat_budget() {
+    fn allocates_assault_capture_units_without_double_crediting_combat_units() {
         let lander = Entity::from_raw(48);
         let helicopter = Entity::from_raw(49);
         let capture_a = Entity::from_raw(50);
@@ -3644,11 +3586,8 @@ mod tests {
             underfunded_assignment.decision,
             IslandCampaignDecision::Assault
         );
-        assert_eq!(underfunded_assignment.allocated_budget, 30_700);
-        assert_eq!(
-            underfunded_assignment.purchase_shortfall.combat_budget,
-            10_200
-        );
+        assert_eq!(underfunded_assignment.allocated_budget, 22_500);
+        assert_eq!(underfunded_assignment.purchase_shortfall.combat_units, 2);
         assert!(!underfunded_assignment.operation_ready);
 
         let funded = allocate_campaign_portfolio(
@@ -3662,9 +3601,9 @@ mod tests {
         assert_eq!(assignment.capture_entities, vec![capture_a, capture_b]);
         assert!(assignment.combat_entities.is_empty());
         assert_eq!(assignment.purchase_shortfall.capture_units, 0);
-        assert_eq!(assignment.purchase_shortfall.combat_budget, 10_200);
-        assert_eq!(assignment.purchase_shortfall.total_budget, 10_200);
-        assert_eq!(assignment.allocated_budget, 32_700);
+        assert_eq!(assignment.purchase_shortfall.combat_units, 2);
+        assert_eq!(assignment.purchase_shortfall.total_budget, 0);
+        assert_eq!(assignment.allocated_budget, 22_500);
         assert!(!assignment.operation_ready);
     }
 
@@ -3695,8 +3634,8 @@ mod tests {
         assert_eq!(assignment.capture_entities.len(), 2);
         assert_eq!(assignment.combat_entities.len(), 2);
         assert_eq!(assignment.purchase_shortfall.ground_combat_units, 0);
-        assert_eq!(assignment.purchase_shortfall.combat_budget, 4_200);
-        assert!(!assignment.operation_ready);
+        assert_eq!(assignment.purchase_shortfall.combat_units, 0);
+        assert!(assignment.operation_ready);
     }
 
     #[test]
@@ -3739,7 +3678,7 @@ mod tests {
         let assignment = &portfolio.active_offensives[0];
         assert!(assignment.combat_entities.is_empty());
         assert_eq!(assignment.purchase_shortfall.ground_combat_units, 0);
-        assert_eq!(assignment.purchase_shortfall.combat_budget, 10_200);
+        assert_eq!(assignment.purchase_shortfall.combat_units, 2);
         assert!(!assignment.operation_ready);
     }
 
@@ -3780,20 +3719,19 @@ mod tests {
     }
 
     #[test]
-    fn allocates_no_defense_combat_value_from_support_trucks() {
+    fn allocates_no_defense_combat_unit_from_support_trucks() {
         let portfolio = allocate_campaign_portfolio(
-            vec![defense_candidate(0, 1, 5_000)],
+            vec![defense_candidate(0, 1, 1)],
             CampaignResourcePool {
                 available_funds: 0,
                 units: vec![unit_candidate(40, UnitType::SupplyTruck, 5_000, false, 1)],
             },
         );
 
-        assert!(portfolio.defenses.is_empty());
-        assert_eq!(
-            portfolio.islands[0].decision,
-            IslandCampaignDecision::Observe
-        );
+        let assignment = &portfolio.defenses[0];
+        assert!(assignment.combat_entities.is_empty());
+        assert_eq!(assignment.purchase_shortfall.combat_units, 1);
+        assert!(!assignment.operation_ready);
     }
 
     fn assignment_with_shortfall(
@@ -3813,18 +3751,18 @@ mod tests {
                 transport_slots: 0,
                 capture_units: 0,
                 ground_combat_units: 0,
-                combat_budget: 1_000,
-                total_budget: 1_000,
+                combat_units: 1,
+                total_budget: 0,
             },
             purchase_shortfall: IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
                 capture_units: 0,
                 ground_combat_units: 0,
-                combat_budget: 1_000,
-                total_budget: 1_000,
+                combat_units: 1,
+                total_budget: 0,
             },
-            allocated_budget: 1_000,
+            allocated_budget: 0,
             transport_entities: Vec::new(),
             capture_entities: Vec::new(),
             combat_entities: Vec::new(),
@@ -3923,8 +3861,8 @@ mod tests {
         assault.purchase_shortfall.preferred_transport = Some(UnitType::Lander);
         assault.purchase_shortfall.transport_slots = 4;
         assault.purchase_shortfall.capture_units = 2;
-        assault.purchase_shortfall.combat_budget = 10_200;
-        assault.purchase_shortfall.total_budget = 32_700;
+        assault.purchase_shortfall.combat_units = 2;
+        assault.purchase_shortfall.total_budget = 22_500;
         let portfolio = IslandCampaignPortfolio {
             islands: Vec::new(),
             active_offensives: vec![assault],
@@ -3935,7 +3873,7 @@ mod tests {
 
         assert_eq!(shortfall.light_transport_slots, 2);
         assert_eq!(shortfall.heavy_transport_slots, 2);
-        assert_eq!(shortfall.reserved_budget, 32_700);
+        assert_eq!(shortfall.reserved_budget, 22_500);
     }
 
     #[test]
@@ -3973,8 +3911,8 @@ mod tests {
             IslandCampaignState::EnemyHeld,
             IslandCampaignDecision::Assault,
         );
-        assessment.enemy_combat_value = 8_500;
-        assessment.required_budget = 32_700;
+        assessment.enemy_combat_units = 2;
+        assessment.required_budget = 22_500;
         let candidate = IslandCampaignCandidate {
             assessment,
             target_position: GridPosition { x: 0, y: 0 },
@@ -3994,11 +3932,10 @@ mod tests {
                 transport_slots: 4,
                 capture_units: 2,
                 ground_combat_units: 2,
-                combat_budget: 10_200,
-                total_budget: 32_700,
+                combat_units: 2,
+                total_budget: 22_500,
             },
             assault_transport_types: vec![UnitType::Lander, UnitType::TransportHelicopter],
-            minimum_combat_purchase_cost: Some(1_000),
             producible_transports: test_transport_blueprints(),
             existing_operation: None,
         };
@@ -4006,7 +3943,7 @@ mod tests {
         let portfolio = allocate_campaign_portfolio(
             vec![candidate],
             CampaignResourcePool {
-                available_funds: 32_700,
+                available_funds: 22_500,
                 units: Vec::new(),
             },
         );
@@ -4019,8 +3956,8 @@ mod tests {
         assert_eq!(assignment.purchase_shortfall.transport_slots, 4);
         assert_eq!(assignment.purchase_shortfall.capture_units, 2);
         assert_eq!(assignment.purchase_shortfall.ground_combat_units, 0);
-        assert_eq!(assignment.purchase_shortfall.combat_budget, 10_200);
-        assert_eq!(assignment.purchase_shortfall.total_budget, 32_700);
+        assert_eq!(assignment.purchase_shortfall.combat_units, 2);
+        assert_eq!(assignment.purchase_shortfall.total_budget, 22_500);
         assert!(!assignment.operation_ready);
     }
 }

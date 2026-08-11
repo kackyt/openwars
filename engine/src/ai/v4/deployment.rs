@@ -641,6 +641,15 @@ fn resolve_target(
     connectivity: &mut TerrainConnectivity,
     deployment: &AssignedDeployment,
 ) -> Option<(Entity, GridPosition)> {
+    // 毎手番priority listの先頭へ戻すと、複数の敵へダメージを散らして撃破できない。
+    // 現在標的が生存して交戦可能な限り固定し、撃破・到達不能時だけ次へ進む。
+    if let Some(enemy) = deployment.current_target
+        && deployment.intent.priority_enemies.contains(&enemy)
+        && can_engage(world, connectivity, deployment.entity, enemy)
+        && let Some(position) = world.get::<GridPosition>(enemy)
+    {
+        return Some((enemy, *position));
+    }
     for &enemy in &deployment.intent.priority_enemies {
         if can_engage(world, connectivity, deployment.entity, enemy)
             && let Some(position) = world.get::<GridPosition>(enemy)
@@ -1075,6 +1084,34 @@ mod tests {
             .find(|squad| squad.id == squad_id)
             .unwrap();
         assert_eq!(squad.target, Some(GridPosition { x: 6, y: 0 }));
+    }
+
+    #[test]
+    fn current_target_is_kept_until_destroyed_or_unreachable() {
+        let (mut world, attacker, priority, transport, _) = deployment_world();
+        {
+            let mut registry = world.resource_mut::<V4DeploymentRegistry>();
+            let deployment = registry.assigned.get_mut(&attacker).unwrap();
+            // priority listの先頭が変わっても、生存中の攻撃対象へ火力を集中する。
+            deployment.intent.priority_enemies = vec![transport, priority];
+            deployment.current_target = Some(priority);
+        }
+        let mut manager = SquadManager::default();
+
+        prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::new());
+
+        assert_eq!(
+            world
+                .resource::<V4DeploymentRegistry>()
+                .attack_target(attacker),
+            Some(priority)
+        );
+        let squad = manager
+            .squads
+            .iter()
+            .find(|squad| squad.members.contains(&attacker))
+            .unwrap();
+        assert_eq!(squad.target, Some(GridPosition { x: 3, y: 0 }));
     }
 
     #[test]

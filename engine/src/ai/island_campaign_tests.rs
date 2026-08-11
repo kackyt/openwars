@@ -802,7 +802,7 @@ fn defend_uses_reserved_combat_entities_and_assignment_target() {
 }
 
 #[test]
-fn withdraw_keeps_other_operations_and_stranded_capture_continuity() {
+fn reinforce_keeps_other_operations_and_stranded_capture_continuity() {
     let (mut world, master_data, player) = empty_v3_world();
     let opponent = PlayerId(2);
     let base = GridPosition { x: 0, y: 1 };
@@ -915,7 +915,7 @@ fn withdraw_keeps_other_operations_and_stranded_capture_continuity() {
     recoverable.target_island = Some(contested_island);
     recoverable.target = Some(contested_property);
     recoverable.phase = MissionPhase::Forming;
-    let recoverable_id = recoverable.id;
+    let _recoverable_id = recoverable.id;
     let remote_free_capture =
         spawn_master_unit(&mut world, &master_data, player, base, UnitType::Infantry);
 
@@ -949,21 +949,14 @@ fn withdraw_keeps_other_operations_and_stranded_capture_continuity() {
         .unwrap();
     assert_eq!(
         withdrawn.decision,
-        crate::ai::island_campaign::IslandCampaignDecision::Withdraw
+        crate::ai::island_campaign::IslandCampaignDecision::Reinforce
     );
-    assert!(portfolio.assignment_for(contested_island).is_none());
-    assert_eq!(portfolio.active_offensives.len(), 2);
+    assert!(portfolio.assignment_for(contested_island).is_some());
+    assert_eq!(portfolio.active_offensives.len(), 3);
 
     plan_squads(&mut world, player);
 
     let manager = world.resource::<SquadManager>();
-    assert!(
-        manager
-            .squads
-            .iter()
-            .all(|squad| squad.id != recoverable_id),
-        "Withdraw must release an idle recoverable transport"
-    );
     for (id, transport, cargo, island, target, phase) in operation_snapshots {
         let squad = manager
             .squads
@@ -985,14 +978,11 @@ fn withdraw_keeps_other_operations_and_stranded_capture_continuity() {
     assert_eq!(local.target_island, Some(contested_island));
     assert_eq!(local.target, Some(contested_property));
     assert!(local.members.contains(&stranded_capture));
-    assert!(manager.squads.iter().all(|squad| {
-        squad.mission_type != MissionType::Transport
-            || squad.target_island != Some(contested_island)
-    }));
-    assert!(manager.squads.iter().all(|squad| {
-        squad.mission_type != MissionType::Transport
-            || !squad.cargo_entities.contains(&stranded_capture)
-                && !squad.cargo_entities.contains(&remote_free_capture)
+    assert!(manager.squads.iter().any(|squad| {
+        squad.mission_type == MissionType::Transport
+            && squad.target_island == Some(contested_island)
+            && (squad.cargo_entities.contains(&stranded_capture)
+                || squad.cargo_entities.contains(&remote_free_capture))
     }));
 }
 

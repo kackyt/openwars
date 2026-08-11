@@ -87,11 +87,6 @@ const DEFENSE_THREAT_ETA: u32 = 2;
 /// 占領開始後に拠点を確保し切るまでに必要な最小手番数。
 const CAPTURE_COMPLETION_TURNS: u32 = 2;
 
-/// 敵の「拡張装置」（占領可能ユニットと、それを運ぶ輸送）に掛ける脅威の倍率。
-/// これらはコスト以上に盤面の収入を動かすため、素のコスト価値で数えると
-/// 撃破枠が立たず、局地戦で勝ちながら territory を明け渡すことになる。
-const EXPANSION_THREAT_WEIGHT: u32 = 2;
-
 /// 盤面から取り出したユニット 1 体分の情報。
 #[derive(Debug, Clone)]
 struct UnitSnapshot {
@@ -110,56 +105,30 @@ struct EnemyFacilitySnapshot {
     terrain: Terrain,
 }
 
-impl UnitSnapshot {
-    /// HP を加味した戦力価値。
-    fn value(&self) -> u32 {
-        self.stats.cost.saturating_mul(self.hp) / 100
-    }
-}
-
-/// 1体の敵に対する未対処戦力。
+/// 1体の敵に対する実盤面情報。
 ///
-/// `remaining_value` はHP補正済みの実戦力、`priority_weight` は倒す順序にだけ使う。
-/// 占領・輸送能力の戦略的重要度を実戦力へ掛けると「重要だから2体必要」という
-/// 誤った需要になるため、両者を別の次元として保持する。
+/// 戦力を購入価格へ換算しない。必要戦力はRollingPlanがHP・与ダメージ・移動・
+/// 攻撃可能回数を手番ごとにシミュレーションして決める。
 #[derive(Debug, Clone)]
 struct ThreatTarget {
     entity: Option<Entity>,
     stats: UnitStats,
     position: GridPosition,
-    /// 金額被覆で変形させない、実盤面の残HP。
     current_hp: u32,
-    remaining_value: f32,
-    priority_weight: f32,
     /// 0は現在の局地敵。1以上はanchorへ到着してから交戦可能になる観測済み増援。
     available_turn: u32,
 }
 
 impl ThreatTarget {
-    fn from_snapshot(unit: &UnitSnapshot, expansion_race_live: bool) -> Self {
-        let priority_weight =
-            if expansion_race_live && (unit.stats.can_capture || unit.stats.max_cargo > 0) {
-                EXPANSION_THREAT_WEIGHT as f32
-            } else {
-                1.0
-            };
+    fn from_snapshot(unit: &UnitSnapshot) -> Self {
         Self {
             entity: unit.entity,
             stats: unit.stats.clone(),
             position: unit.pos,
             current_hp: unit.hp,
-            remaining_value: unit.value() as f32,
-            priority_weight,
             available_turn: 0,
         }
     }
-}
-
-/// 中立・敵拠点の確保を直接妨げる、地上戦力または輸送戦力であるか。
-fn is_territory_control_threat(stats: &UnitStats) -> bool {
-    !matches!(stats.movement_type, MovementType::Air | MovementType::Ship)
-        || stats.can_capture
-        || stats.max_cargo > 0
 }
 
 /// 1 つの作戦。対象拠点のまとまりと、そこから導出された枠を保持する。
@@ -222,7 +191,6 @@ struct SlotCandidate {
 struct CandidateConstraints {
     remaining_funds: u32,
     per_slot_budget: u32,
-    require_self_deployment: bool,
 }
 
 /// 生産命令と、その命令だけが持つV4作戦意図。
@@ -562,10 +530,7 @@ fn decide_campaign_production_v4(
         if shortfall.decision != crate::ai::island_campaign::IslandCampaignDecision::Assault
             || shortfall.ground_combat_units == 0
         {
-            shortfall.reserved_budget = shortfall
-                .reserved_budget
-                .saturating_sub(shortfall.combat_budget);
-            shortfall.combat_budget = 0;
+            shortfall.combat_units = 0;
         }
     }
 
@@ -1328,7 +1293,7 @@ fn enemy_facility_arrival(
 }
 
 /// 敵施設も期限内に到着できる最寄り作戦へ一意に割り当て、全収入の重複計上を防ぐ。
-fn projected_enemy_reinforcement_budget(
+fn projected_enemy_reinforcement_funds(
     scan: &BoardScan,
     ctx: &mut ReachCtx,
     anchors: &[GridPosition],
@@ -1424,15 +1389,8 @@ fn build_operation(
             .collect()
     };
 
-    // 未取得の拠点が残っている限り、占領レースは進行中である。
-    // その間、敵の拡張装置は素のコスト以上の脅威として数える。
-    let expansion_race_live = !scan.open_properties.is_empty();
-
     let mut reachable_threats = Vec::new();
     let mut unreachable_threats = Vec::new();
-    let mut enemy_combat_value = 0u32;
-    let mut territory_control_threat_units = 0u32;
-    let mut unreachable_threat_value = 0u32;
     let mut enemy_contact_eta = u32::MAX;
     let island_map = crate::ai::islands::IslandMap::analyze(&scan.map);
     let anchor_island = island_map.get_island_at(&anchor).map(|island| island.id);
@@ -1479,16 +1437,9 @@ fn build_operation(
         let enemy_island = island_map.get_island_at(&enemy.pos).map(|island| island.id);
         let local_contact = enemy_island == anchor_island || arrival_eta == 0;
         if i_can_reach && local_contact {
-            let threat = threat_value(enemy, expansion_race_live);
-            enemy_combat_value = enemy_combat_value.saturating_add(threat);
-            if expansion_race_live && is_territory_control_threat(&enemy.stats) {
-                territory_control_threat_units = territory_control_threat_units.saturating_add(1);
-            }
-            reachable_threats.push(ThreatTarget::from_snapshot(enemy, expansion_race_live));
+            reachable_threats.push(ThreatTarget::from_snapshot(enemy));
         } else if !i_can_reach && local_contact {
-            let threat = threat_value(enemy, expansion_race_live);
-            unreachable_threat_value = unreachable_threat_value.saturating_add(threat);
-            unreachable_threats.push(ThreatTarget::from_snapshot(enemy, expansion_race_live));
+            unreachable_threats.push(ThreatTarget::from_snapshot(enemy));
         } else if it_can_reach_me
             // 空の輸送unitは単独では占領も攻撃もできない。全ての中立前線で
             // 「将来来る輸送ヘリ」として対空購入を発生させず、実cargoを搭載して
@@ -1501,15 +1452,15 @@ fn build_operation(
                     .unwrap_or(0)
         {
             // 具体Entityを追わせず、到着後にだけ攻撃可能な増援として保持する。
-            let mut incoming = ThreatTarget::from_snapshot(enemy, expansion_race_live);
+            let mut incoming = ThreatTarget::from_snapshot(enemy);
             incoming.entity = None;
             incoming.position = anchor;
             incoming.available_turn = arrival_eta.max(1);
-            enemy_combat_value =
-                enemy_combat_value.saturating_add(threat_value(enemy, expansion_race_live));
             reachable_threats.push(incoming);
         }
     }
+    let enemy_combat_units = u32::try_from(reachable_threats.len()).unwrap_or(u32::MAX);
+    let unreachable_threat_units = u32::try_from(unreachable_threats.len()).unwrap_or(u32::MAX);
     // --- 自軍戦力の仕分け ---
     // 敵の仕分けが済んでから数える。
     //
@@ -1526,9 +1477,8 @@ fn build_operation(
     // 上限（`MAX_CAPTURE_SLOTS` 等）はあくまで 1 波の規模であって、
     // 「既に持っている分」を差し引く役割は担っていない。差し引きはこの台帳の仕事。
     let mut friendly_capture_units_committed = 0u32;
-    let mut friendly_combat_value_committed = 0u32;
-    let mut friendly_territory_control_units = 0u32;
-    let mut friendly_intercept_value_committed = 0u32;
+    let mut friendly_combat_units_committed = 0u32;
+    let mut friendly_intercept_units_committed = 0u32;
     let mut available_free_cargo_slots = 0u32;
     for unit in &scan.my_units {
         if unit.stats.can_capture {
@@ -1560,16 +1510,8 @@ fn build_operation(
                     &scan.damage_chart,
                 )
             {
-                friendly_intercept_value_committed =
-                    friendly_intercept_value_committed.saturating_add(unit.value());
-                let indices: Vec<usize> = (0..unreachable_threats.len()).collect();
-                apply_coverage(
-                    &unit.stats,
-                    unit.value() as f32,
-                    &mut unreachable_threats,
-                    &indices,
-                    &scan.damage_chart,
-                );
+                friendly_intercept_units_committed =
+                    friendly_intercept_units_committed.saturating_add(1);
             }
             // 撃破枠の条件：現地へ行けて、自分が実際に届く敵に対して有効打を持つ。
             // 敵が観測できない段階では誰でも採用されうるので、台帳側も同様に全員を数える。
@@ -1609,25 +1551,7 @@ fn build_operation(
                 if !belongs_to_control_operation {
                     continue;
                 }
-                if engageable.iter().any(|index| {
-                    let threat = &reachable_threats[*index];
-                    is_territory_control_threat(&threat.stats)
-                        && coverage_efficiency(&unit.stats, &threat.stats, &scan.damage_chart) > 0.0
-                }) {
-                    friendly_territory_control_units =
-                        friendly_territory_control_units.saturating_add(1);
-                }
-                // 購入価格は撃破済み価値ではない。作戦期限までに残存敵へ実際に
-                // 与えられる期待交換価値だけを、撃破要求の充足として控除する。
-                let expected_return = apply_sortie_return(
-                    &unit.stats,
-                    CAPTURE_COMPLETION_TURNS,
-                    &mut reachable_threats,
-                    &engageable,
-                    &scan.damage_chart,
-                );
-                friendly_combat_value_committed =
-                    friendly_combat_value_committed.saturating_add(return_budget(expected_return));
+                friendly_combat_units_committed = friendly_combat_units_committed.saturating_add(1);
             }
         }
     }
@@ -1663,64 +1587,8 @@ fn build_operation(
         }
     }
 
-    // 必要戦力を丸い比率で水増しせず、実際にこの作戦へ参加できる最安の
-    // 対抗ユニット単位へ切り上げる。候補採用と同じ条件を通すことで、
-    // 要求額だけ存在して埋められない枠を作らない。
-    let mut minimum_combat_unit_cost = u32::MAX;
-    let mut minimum_intercept_unit_cost = u32::MAX;
-    let unreachable_indices: Vec<usize> = (0..unreachable_threats.len()).collect();
-    for (facility, terrain) in &scan.free_facilities {
-        for (unit_type, stats) in &scan.available_types {
-            if stats.can_capture
-                || stats.max_cargo > 0
-                || stats.cost == 0
-                || !scan.can_produce(*terrain, *unit_type)
-            {
-                continue;
-            }
-
-            let self_deployable = ctx.is_reachable(
-                &scan.map,
-                &scan.master_data,
-                (facility.x, facility.y),
-                (anchor.x, anchor.y),
-                stats.movement_type,
-            );
-            if self_deployable
-                && threats_have_counter(
-                    stats,
-                    &unreachable_threats,
-                    &unreachable_indices,
-                    &scan.damage_chart,
-                )
-            {
-                minimum_intercept_unit_cost = minimum_intercept_unit_cost.min(stats.cost);
-            }
-
-            if !can_join_operation(scan, ctx, &anchor, requires_transport, facility, stats) {
-                continue;
-            }
-            let origin = if self_deployable { *facility } else { anchor };
-            let indices = reachable_threat_indices(scan, ctx, &reachable_threats, origin, stats);
-            if reachable_threats.is_empty()
-                || threats_have_counter(stats, &reachable_threats, &indices, &scan.damage_chart)
-            {
-                minimum_combat_unit_cost = minimum_combat_unit_cost.min(stats.cost);
-            }
-        }
-    }
-    let minimum_combat_unit_cost = if minimum_combat_unit_cost != u32::MAX {
-        minimum_combat_unit_cost
-    } else {
-        0
-    };
-    let minimum_intercept_unit_cost = if minimum_intercept_unit_cost != u32::MAX {
-        minimum_intercept_unit_cost
-    } else {
-        0
-    };
-    let enemy_reinforcement_budget = anchor_index.map_or(0, |index| {
-        projected_enemy_reinforcement_budget(scan, ctx, anchors, horizons, index)
+    let enemy_reinforcement_funds = anchor_index.map_or(0, |index| {
+        projected_enemy_reinforcement_funds(scan, ctx, anchors, horizons, index)
     });
 
     // 輸送 1 往復にかかるターン数（片道リードタイムの 2 倍）
@@ -1729,15 +1597,10 @@ fn build_operation(
     let facts = OperationFacts {
         target_property_count: cluster.len() as u32,
         friendly_capture_units_committed,
-        friendly_combat_value_committed,
-        friendly_intercept_value_committed,
-        enemy_combat_value,
-        enemy_reinforcement_budget,
-        minimum_combat_unit_cost,
-        territory_control_threat_units,
-        friendly_territory_control_units,
-        territory_control_window_turns: CAPTURE_COMPLETION_TURNS,
-        minimum_intercept_unit_cost,
+        enemy_combat_units,
+        friendly_combat_units_committed,
+        enemy_reinforcement_funds,
+        friendly_intercept_units_committed,
         deploy_lead_time,
         enemy_contact_eta: if enemy_contact_eta == u32::MAX {
             u32::MAX
@@ -1747,23 +1610,22 @@ fn build_operation(
         requires_transport,
         transport_round_trip_turns,
         available_free_cargo_slots,
-        unreachable_threat_value,
+        unreachable_threat_units,
     };
 
     let mut slots = derive_slots(&facts);
     // Combat枠は金額の差分ではなく、観測敵が残っていることだけで計画器を起動する。
     // 必要数と完了判定はrolling plannerのHPシミュレーションが決める。
-    slots.destroy_budget = u32::from(
+    slots.combat_plan_required = u32::from(
         !reachable_threats.is_empty()
-            || (kind == OperationKind::AssaultCapital && enemy_reinforcement_budget > 0),
+            || (kind == OperationKind::AssaultCapital && enemy_reinforcement_funds > 0),
     );
     if kind == OperationKind::AssaultCapital {
         // 首都準備段階では戦闘編成だけを形成する。占領兵と輸送は兵站路確保後に
         // IslandCampaignが実行可能な波として組み、ここで汎用任務へ流さない。
         slots.capture_units = 0;
         slots.transport_slots = 0;
-        slots.intercept_budget = 0;
-        slots.escort_units = 0;
+        slots.intercept_units = 0;
     }
 
     Operation {
@@ -1818,19 +1680,9 @@ fn plan_production_with_registry(
 
     if operations.is_empty() {
         plan_trace.fallback = true;
-        if !allow_structural_slots {
-            return (Vec::new(), plan_trace);
-        }
-        return (
-            fallback_production(scan, player_id)
-                .into_iter()
-                .map(|command| PlannedProduction {
-                    command,
-                    deployment: None,
-                })
-                .collect(),
-            plan_trace,
-        );
+        // 作戦に接続されない汎用戦闘生産は行わない。戦力が必要なら、兵站確保・
+        // 防衛・首都攻略のいずれかを先にOperationとして成立させる。
+        return (Vec::new(), plan_trace);
     }
 
     // campaignと切り離した汎用clusterが、固定兵站工程のCombat予算を先取りしない。
@@ -1864,10 +1716,8 @@ fn plan_production_with_registry(
             anchor: op.anchor,
             slots: op.slots,
             requires_transport: op.facts.requires_transport,
-            enemy_combat_value: op.facts.enemy_combat_value,
-            enemy_reinforcement_budget: op.facts.enemy_reinforcement_budget,
-            minimum_combat_unit_cost: op.facts.minimum_combat_unit_cost,
-            friendly_combat_value_committed: op.facts.friendly_combat_value_committed,
+            enemy_combat_units: op.facts.enemy_combat_units,
+            enemy_reinforcement_funds: op.facts.enemy_reinforcement_funds,
             deploy_lead_time: op.facts.deploy_lead_time,
         })
         .collect();
@@ -2146,7 +1996,6 @@ fn plan_production_with_registry(
                 CandidateConstraints {
                     remaining_funds,
                     per_slot_budget,
-                    require_self_deployment: !allow_structural_slots,
                 },
             )
         };
@@ -2193,7 +2042,6 @@ fn plan_production_with_registry(
                 slot_kind,
                 remaining_funds,
                 candidate.cost,
-                !allow_structural_slots,
             )
         {
             plan_trace.steps.push(ProductionStepTrace {
@@ -2234,12 +2082,9 @@ fn plan_production_with_registry(
                     plan_registry.current_step_ref(plan_id, revision, turn, purchase)
                 });
         }
-        if slot_kind == SlotKind::Combat {
-            // 同じパッケージの未使用current purchaseは次の反復で選ばれる。
-            // 全て消費した後は候補なしとなり、この手番のCombat枠を完了する。
-            operations[op_index].filled.escort_units =
-                operations[op_index].filled.escort_units.saturating_add(1);
-        } else {
+        // Combatは同じパッケージの未使用current purchaseを次の反復で選ぶ。
+        // 全て消費した後は候補なしとなり、この手番のCombat枠を完了する。
+        if slot_kind != SlotKind::Combat {
             record_fill(
                 scan,
                 &mut ctx,
@@ -2315,7 +2160,7 @@ fn enemy_reinforcement_scenario(
     op: &Operation,
     horizon: u32,
 ) -> Vec<EnemyPlanUnit> {
-    let scenario_budget = op.facts.enemy_reinforcement_budget;
+    let scenario_budget = op.facts.enemy_reinforcement_funds;
     if scenario_budget == 0 {
         return Vec::new();
     }
@@ -2403,7 +2248,7 @@ fn enemy_reinforcement_scenario(
 
 /// 観測敵と到着しうる増援を排除できる混成生産列を、探索期間の全生産slotから計画する。
 ///
-/// `destroy_budget`は呼び出し条件にだけ残し、候補数・生産停止・完了判定には使わない。
+/// `combat_plan_required`は呼び出し条件にだけ残し、候補数・生産停止・完了判定には使わない。
 /// 既存unitと同じ手番に発注済みのunitを初期編成へ入れ、敵EntityのHPが0になるまで
 /// ターン単位で攻撃を進めた結果から必要な購入だけを返す。
 #[allow(clippy::too_many_arguments)]
@@ -2579,7 +2424,10 @@ fn combat_plan_input(
     })
 }
 
-/// 候補が限界被覆を与える局地敵を、生産採点と同じ重要度×相性の順に保持する。
+/// 生産された戦闘Entityへ、実HPと与ダメージから撃破順を与える。
+///
+/// 価格は敵の硬さでも攻撃能力でもないため使わない。占領・輸送能力を持つ敵を先にし、
+/// 同分類では必要攻撃回数が少ない敵から集中撃破する。
 fn planned_deployment(
     scan: &BoardScan,
     ctx: &mut ReachCtx,
@@ -2618,10 +2466,18 @@ fn planned_deployment(
         .filter_map(|index| {
             let threat = &threats[index];
             let entity = threat.entity?;
-            let efficiency = coverage_efficiency(stats, &threat.stats, &scan.damage_chart);
-            (threat.remaining_value > 0.0 && efficiency > 0.0).then_some((
-                efficiency * threat.priority_weight,
-                threat.priority_weight,
+            let damage = best_damage(&scan.damage_chart, stats.unit_type, threat.stats.unit_type);
+            let attacks_to_destroy = threat.current_hp.div_ceil(damage.max(1));
+            let strategic_class = if threat.stats.can_capture {
+                0
+            } else if threat.stats.max_cargo > 0 {
+                1
+            } else {
+                2
+            };
+            (damage > 0 && threat.current_hp > 0).then_some((
+                strategic_class,
+                attacks_to_destroy,
                 threat.position.x,
                 threat.position.y,
                 entity.to_bits(),
@@ -2629,15 +2485,7 @@ fn planned_deployment(
             ))
         })
         .collect::<Vec<_>>();
-    targets.sort_by(|left, right| {
-        right
-            .0
-            .total_cmp(&left.0)
-            .then_with(|| right.1.total_cmp(&left.1))
-            .then_with(|| left.2.cmp(&right.2))
-            .then_with(|| left.3.cmp(&right.3))
-            .then_with(|| left.4.cmp(&right.4))
-    });
+    targets.sort_unstable_by_key(|target| (target.0, target.1, target.2, target.3, target.4));
     let priority_enemies = targets.into_iter().map(|target| target.5).collect();
     Some(PlannedDeployment {
         anchor: op.anchor,
@@ -2698,12 +2546,11 @@ fn most_starved_in_tier(operations: &[Operation], tier: SlotTier) -> Option<(usi
 /// 満たせないと判明した枠の要求を消す（無限ループ防止）。
 fn clear_slot(op: &mut Operation, kind: SlotKind) {
     match kind {
-        SlotKind::Intercept => op.slots.intercept_budget = 0,
+        SlotKind::Intercept => op.slots.intercept_units = 0,
         SlotKind::Transport => op.slots.transport_slots = 0,
         SlotKind::Capture => op.slots.capture_units = 0,
         SlotKind::Combat => {
-            op.slots.escort_units = 0;
-            op.slots.destroy_budget = 0;
+            op.slots.combat_plan_required = 0;
         }
     }
 }
@@ -2711,7 +2558,7 @@ fn clear_slot(op: &mut Operation, kind: SlotKind) {
 /// 購入した 1 体分を充足量へ反映する。
 fn record_fill(
     scan: &BoardScan,
-    ctx: &mut ReachCtx,
+    _ctx: &mut ReachCtx,
     op: &mut Operation,
     kind: SlotKind,
     candidate: &SlotCandidate,
@@ -2724,50 +2571,13 @@ fn record_fill(
         .unwrap_or(0);
     match kind {
         SlotKind::Intercept => {
-            op.filled.intercept_budget = op.filled.intercept_budget.saturating_add(candidate.cost);
-            let indices: Vec<usize> = (0..op.unreachable_threats.len()).collect();
-            apply_coverage(
-                candidate_stats(scan, candidate),
-                candidate.cost as f32,
-                &mut op.unreachable_threats,
-                &indices,
-                &scan.damage_chart,
-            );
+            op.filled.intercept_units = op.filled.intercept_units.saturating_add(1);
         }
         SlotKind::Transport => {
             op.filled.transport_slots = op.filled.transport_slots.saturating_add(cargo.max(1))
         }
         SlotKind::Capture => op.filled.capture_units += 1,
-        SlotKind::Combat => {
-            // 戦闘ユニットの購入は護衛枠（体数）を1つ満たす。一方、撃破枠を
-            // 満たす量は価格ではなく、作戦期限までの期待交換価値である。
-            op.filled.escort_units += 1;
-            let stats = candidate_stats(scan, candidate);
-            let self_deployable = ctx.is_reachable(
-                &scan.map,
-                &scan.master_data,
-                (candidate.facility.x, candidate.facility.y),
-                (op.anchor.x, op.anchor.y),
-                stats.movement_type,
-            );
-            let origin = if self_deployable {
-                candidate.facility
-            } else {
-                op.anchor
-            };
-            let indices = reachable_threat_indices(scan, ctx, &op.reachable_threats, origin, stats);
-            let expected_return = apply_sortie_return(
-                stats,
-                op.facts.territory_control_window_turns,
-                &mut op.reachable_threats,
-                &indices,
-                &scan.damage_chart,
-            );
-            op.filled.destroy_budget = op
-                .filled
-                .destroy_budget
-                .saturating_add(return_budget(expected_return));
-        }
+        SlotKind::Combat => unreachable!("Combat購入はRollingPlan経路だけで処理する"),
     }
 }
 
@@ -2812,171 +2622,19 @@ fn threats_have_counter(
 ) -> bool {
     eligible_indices
         .iter()
-        .any(|index| coverage_efficiency(unit, &threats[*index].stats, chart) > 0.0)
+        .any(|index| best_damage(chart, unit.unit_type, threats[*index].stats.unit_type) > 0)
 }
 
-/// 価値交換効率を、脅威被覆に使う 0.0..=1.0 の効率へ変換する。
-fn coverage_efficiency(unit: &UnitStats, enemy: &UnitStats, chart: &DamageChart) -> f32 {
-    if enemy.cost == 0 {
-        return 0.0;
-    }
-    (pair_value(unit, enemy, chart).max(0.0) / enemy.cost as f32).clamp(0.0, 1.0)
-}
-
-/// 1体の対抗ユニットを、重要度×相性が高い未対処脅威から順に割り当てる。
-/// 戻り値は戦略的重要度を掛けた被覆増分で、候補採点と実台帳更新が同じ関数を通る。
-fn apply_coverage(
-    unit: &UnitStats,
-    capacity: f32,
-    threats: &mut [ThreatTarget],
-    eligible_indices: &[usize],
-    chart: &DamageChart,
-) -> f32 {
-    let mut remaining_capacity = capacity.max(0.0);
-    let mut weighted_coverage = 0.0;
-    while remaining_capacity > 0.0 {
-        let Some((index, efficiency)) = eligible_indices
-            .iter()
-            .map(|index| {
-                let threat = &threats[*index];
-                (*index, coverage_efficiency(unit, &threat.stats, chart))
-            })
-            .filter(|(index, efficiency)| {
-                threats[*index].remaining_value > 0.0 && *efficiency > 0.0
-            })
-            .max_by(
-                |(left_index, left_efficiency), (right_index, right_efficiency)| {
-                    let left = *left_efficiency * threats[*left_index].priority_weight;
-                    let right = *right_efficiency * threats[*right_index].priority_weight;
-                    left.total_cmp(&right)
-                        .then_with(|| right_index.cmp(left_index))
-                },
-            )
-        else {
-            break;
-        };
-        let effective_capacity = remaining_capacity * efficiency;
-        let covered = threats[index].remaining_value.min(effective_capacity);
-        if covered <= 0.0 {
-            break;
-        }
-        threats[index].remaining_value -= covered;
-        remaining_capacity -= covered / efficiency;
-        weighted_coverage += covered * threats[index].priority_weight;
-    }
-    weighted_coverage
-}
-
-/// 残存脅威へ新たに与えられる被覆量。候補の比較は平均相性ではなくこの増分で行う。
-fn marginal_coverage(
-    unit: &UnitStats,
-    capacity: f32,
-    threats: &[ThreatTarget],
-    eligible_indices: &[usize],
-    chart: &DamageChart,
-) -> f32 {
-    let mut projected = threats.to_vec();
-    apply_coverage(unit, capacity, &mut projected, eligible_indices, chart)
-}
-
-/// 作戦期限までに1体が実行できる攻撃回数を上限として、期待交換価値を脅威へ割り当てる。
-///
-/// unit価格を処理能力として使うと、高価な戦闘機1機が同じ手番に複数目標を撃破できる
-/// 扱いになる。実際の制約である「1体1手番1攻撃」に合わせ、各sortieで期待交換価値が
-/// 最大の未処理目標を1件だけ減らす。
-fn apply_sortie_return(
-    unit: &UnitStats,
-    max_sorties: u32,
-    threats: &mut [ThreatTarget],
-    eligible_indices: &[usize],
-    chart: &DamageChart,
-) -> f32 {
-    let mut weighted_return = 0.0;
-    for _ in 0..max_sorties.max(1) {
-        let Some((index, expected_return)) = eligible_indices
-            .iter()
-            .filter_map(|index| {
-                let threat = &threats[*index];
-                if threat.remaining_value <= 0.0 {
-                    return None;
-                }
-                let expected_return = pair_value(unit, &threat.stats, chart)
-                    .max(0.0)
-                    .min(threat.remaining_value);
-                (expected_return > 0.0).then_some((*index, expected_return))
-            })
-            .max_by(|(left_index, left_return), (right_index, right_return)| {
-                let left = *left_return * threats[*left_index].priority_weight;
-                let right = *right_return * threats[*right_index].priority_weight;
-                left.total_cmp(&right)
-                    .then_with(|| right_index.cmp(left_index))
-            })
-        else {
-            break;
-        };
-        threats[index].remaining_value -= expected_return;
-        weighted_return += expected_return * threats[index].priority_weight;
-    }
-    weighted_return
-}
-
-fn marginal_sortie_return(
-    unit: &UnitStats,
-    max_sorties: u32,
-    threats: &[ThreatTarget],
-    eligible_indices: &[usize],
-    chart: &DamageChart,
-) -> f32 {
-    let mut projected = threats.to_vec();
-    apply_sortie_return(unit, max_sorties, &mut projected, eligible_indices, chart)
-}
-
-/// 浮動小数の期待交換価値を、撃破要求と同じ資金価値単位へ切り上げる。
-fn return_budget(expected_return: f32) -> u32 {
-    expected_return.max(0.0).ceil().min(u32::MAX as f32) as u32
-}
-
-/// 敵の地上・占領・輸送unitへ攻撃機会を作るためのsortie適合度。
-///
-/// `remaining_value`は高価な既存unitの価値被覆で0になりうるが、1体が同じ手番に
-/// 複数目標を攻撃できるわけではない。護衛体数枠を埋める間は元の敵costと相性から、
-/// 追加の攻撃bodyが作戦期限までに生む価値を評価する。
-fn territory_control_sortie_value(
-    unit: &UnitStats,
-    max_sorties: u32,
-    threats: &[ThreatTarget],
-    eligible_indices: &[usize],
-    chart: &DamageChart,
-) -> f32 {
-    let mut returns: Vec<_> = eligible_indices
-        .iter()
-        .map(|index| &threats[*index])
-        .filter(|threat| is_territory_control_threat(&threat.stats))
-        .map(|threat| pair_value(unit, &threat.stats, chart).max(0.0) * threat.priority_weight)
-        .filter(|value| *value > 0.0)
-        .collect();
-    returns.sort_by(|left, right| right.total_cmp(left));
-    returns.into_iter().take(max_sorties.max(1) as usize).sum()
-}
-
-/// 枠への生の期待収益を、現在の資金と生産枠の制約に合わせて比較可能にする。
-///
-/// Combatは単純な最安優先ではない。1枠あたり予算を下回る候補は同じ機会費用で比較し、
-/// 資金潤沢時は高価でも絶対戦果が大きい候補を選べる。予算が厳しい場合だけ実価格が
-/// 分母になり、戦果/費用の良い候補が優位になる。
+/// 構造枠・迎撃枠の候補を、実能力と購入費のROIで比較する。
+/// Combatはこの関数を通らず、RollingPlanが具体的な戦闘scheduleを比較する。
 fn normalized_candidate_fitness(
     kind: SlotKind,
     raw_fitness: f32,
     cost: u32,
     per_slot_budget: u32,
 ) -> f32 {
-    let count_denominated = matches!(kind, SlotKind::Capture | SlotKind::Transport);
-    let opportunity_cost = if count_denominated {
-        cost
-    } else {
-        cost.max(per_slot_budget)
-    }
-    .max(1);
+    let _ = (kind, per_slot_budget);
+    let opportunity_cost = cost.max(1);
     raw_fitness * 1000.0 / opportunity_cost as f32
 }
 
@@ -3000,30 +2658,15 @@ fn select_candidate(
             if !scan.can_produce(*terrain, *unit_type) {
                 continue;
             }
-            let Some(fitness) = slot_fitness(
-                scan,
-                ctx,
-                op,
-                kind,
-                facility,
-                stats,
-                constraints.require_self_deployment,
-            ) else {
+            let Some(fitness) = slot_fitness(scan, ctx, op, kind, facility, stats) else {
                 continue;
             };
             if stats.cost == 0 || stats.cost > constraints.remaining_funds {
                 continue;
             }
-            // 枠の要求単位は種別ごとに違う（`OperationSlots::requirement` 参照）ので、
-            // 1 購入あたりの機会費用も種別で変える。
-            // - 占領枠／輸送枠は要求が「体数」「スロット数」。1 購入で満たせる要求は
-            //   価格に関わらず 1 でしかないため、高い候補を買うほど同じ要求を満たす
-            //   総額が膨らむ。ここは支払額そのものが機会費用になる。
-            // - 撃破枠／迎撃枠は要求が「資金」。1 ターンに使える生産枠数は固定なので、
-            //   投入戦力を増やす唯一の手段は 1 枠あたりの戦力を上げることであり、
-            //   安く済ませても余剰はその枠では使えず割引にならない。よって分母は
-            //   cost と per_slot_budget の大きい方を取り、枠あたり戦力で比較する。
-            let count_denominated = matches!(kind, SlotKind::Capture | SlotKind::Transport);
+            // CombatはRollingPlan専用で、この候補選定へ入らない。残る枠はいずれも
+            // 体数・輸送容量なので、同じ実能力なら安い方を選ぶ。
+            let count_denominated = true;
             let candidate = SlotCandidate {
                 unit_type: *unit_type,
                 cost: stats.cost,
@@ -3035,9 +2678,6 @@ fn select_candidate(
                     constraints.per_slot_budget,
                 ),
             };
-            // 予算内／予算超過の階層分けも体数系の枠にだけ残す。資金系の枠でこれを
-            // やると、どれほど弱くても予算内の候補が常に強い候補に勝ってしまい、
-            // 資金が潤沢でも安いユニットしか買わなくなる（＝戦力の逐次投入）。
             let slot = if count_denominated && stats.cost > constraints.per_slot_budget.max(1) {
                 &mut best_over_budget
             } else {
@@ -3198,7 +2838,6 @@ fn slot_fitness(
     kind: SlotKind,
     facility: &GridPosition,
     stats: &UnitStats,
-    require_self_deployment: bool,
 ) -> Option<f32> {
     // 施設から作戦地点まで自力で到達できるか
     let self_deployable = ctx.is_reachable(
@@ -3271,134 +2910,19 @@ fn slot_fitness(
             if !self_deployable {
                 return None;
             }
-            let indices: Vec<usize> = (0..op.unreachable_threats.len()).collect();
-            let value = marginal_coverage(
-                stats,
-                stats.cost as f32,
-                &op.unreachable_threats,
-                &indices,
-                &scan.damage_chart,
-            );
+            // 価格ではなく、次の一撃で実際に削れるHPを適合度にする。
+            let value = op
+                .unreachable_threats
+                .iter()
+                .map(|threat| {
+                    best_damage(&scan.damage_chart, stats.unit_type, threat.stats.unit_type)
+                        .min(threat.current_hp) as f32
+                })
+                .sum::<f32>();
             if value <= 0.0 { None } else { Some(value) }
         }
-        SlotKind::Combat => {
-            if stats.can_capture || stats.max_cargo > 0 {
-                return None;
-            }
-            // キャンペーン予約を超えた余剰購入では、別便の輸送を暗黙に期待しない。
-            // これにより海外前線へ渡れない戦車を「いつか運べる」として買わない。
-            if require_self_deployment && !self_deployable {
-                return None;
-            }
-            // 自力で行けないなら、実際に運べる輸送手段が存在することが前提。
-            // 台帳（`build_operation` の自軍仕分け）と同じ関数を通すこと。
-            if !can_join_operation(
-                scan,
-                ctx,
-                &op.anchor,
-                op.facts.requires_transport,
-                facility,
-                stats,
-            ) {
-                return None;
-            }
-            // 増援予測は撃破予算の上限には使えるが、未観測の敵兵種までは決められない。
-            // ここで機動力などの汎用点へ退避すると、敵が0体の作戦が同じ兵種を全施設へ
-            // 発注し続ける。具体的な残存脅威が無ければ限界価値も0として購入を止める。
-            if op.reachable_threats.is_empty() {
-                return None;
-            }
-            // 採点対象は「このユニットが実際に殴りに行ける敵」だけに限る。
-            // 届かない敵まで含めた平均で採点すると、相性表の上でだけ強い
-            // ユニット（海を渡れない対空戦車など）が延々と選ばれ、
-            // 生産拠点に張り付いたまま敵の占領部隊を素通しにしてしまう。
-            //
-            // ただし揚陸される部隊は「上陸地点から殴りに行けるか」で採点する。
-            // 施設からの到達性で採点すると、船で運べば戦える陸戦部隊が
-            // すべて不適合となり、渡洋作戦の戦力が航空ユニットだけになる。
-            let origin = if self_deployable {
-                *facility
-            } else {
-                op.anchor
-            };
-            let engageable =
-                reachable_threat_indices(scan, ctx, &op.reachable_threats, origin, stats);
-            if engageable.is_empty() {
-                return None;
-            }
-            let value = marginal_sortie_return(
-                stats,
-                op.facts.territory_control_window_turns,
-                &op.reachable_threats,
-                &engageable,
-                &scan.damage_chart,
-            );
-            if value > 0.0 {
-                Some(value)
-            } else if op.filled.escort_units < op.slots.escort_units {
-                let sortie_value = territory_control_sortie_value(
-                    stats,
-                    op.facts.territory_control_window_turns,
-                    &op.reachable_threats,
-                    &engageable,
-                    &scan.damage_chart,
-                );
-                (sortie_value > 0.0).then_some(sortie_value)
-            } else {
-                None
-            }
-        }
+        SlotKind::Combat => None,
     }
-}
-
-/// 敵 1 体を撃破枠の見積もりへ算入するときの重み付き価値。
-///
-/// 占領レースが進行中（未取得の拠点が残っている）の間は、敵の「拡張装置」＝
-/// 自力で拠点を取れるユニットと、それを運べる輸送ユニットを素のコスト価値より重く数える。
-/// これらは撃破しなければ盤面の収入を動かし続けるため、コストどおりに数えると
-/// 撃破枠が立たず、局地戦の交換比で勝ちながら領地を明け渡すことになる。
-/// 判定はユニット名ではなく能力（`can_capture` / `max_cargo`）で行うため、
-/// マップやユニット構成に依存しない。
-fn threat_value(unit: &UnitSnapshot, expansion_race_live: bool) -> u32 {
-    if expansion_race_live && (unit.stats.can_capture || unit.stats.max_cargo > 0) {
-        unit.value().saturating_mul(EXPANSION_THREAT_WEIGHT)
-    } else {
-        unit.value()
-    }
-}
-
-/// 敵 1 体に対する対抗効率（与える価値 − 受ける価値）。
-fn pair_value(unit: &UnitStats, enemy: &UnitStats, chart: &DamageChart) -> f32 {
-    let dmg_out = best_damage(chart, unit.unit_type, enemy.unit_type);
-    let dmg_in = best_damage(chart, enemy.unit_type, unit.unit_type);
-    let out = dmg_out as f32 * enemy.cost as f32 / 100.0 * engagement_factor(unit, enemy);
-    let inc = dmg_in as f32 * unit.cost as f32 / 100.0 * engagement_factor(enemy, unit);
-    out - inc
-}
-
-/// 敵編成に対する対抗効率の平均。
-fn counter_value(unit: &UnitStats, enemies: &[UnitStats], chart: &DamageChart) -> f32 {
-    if enemies.is_empty() {
-        return 0.0;
-    }
-    let total: f32 = enemies
-        .iter()
-        .map(|enemy| pair_value(unit, enemy, chart))
-        .sum();
-    total / enemies.len() as f32
-}
-
-/// `counter_value` の参照スライス版。到達可能な敵だけを抜き出して採点する用途で使う。
-#[cfg(test)]
-fn counter_value_refs(unit: &UnitStats, enemies: &[&UnitStats], chart: &DamageChart) -> f32 {
-    if enemies.is_empty() {
-        return 0.0;
-    }
-    let total: f32 = enemies
-        .iter()
-        .map(|enemy| pair_value(unit, enemy, chart))
-        .sum();
-    total / enemies.len() as f32
 }
 
 /// 主武器・副武器のうち有効な方のダメージ。
@@ -3408,19 +2932,6 @@ fn best_damage(chart: &DamageChart, attacker: UnitType, defender: UnitType) -> u
             .get_base_damage_secondary(attacker, defender)
             .unwrap_or(0),
     )
-}
-
-/// 射程と機動力の関係から、実際に交戦できる度合いを補正する係数。
-fn engagement_factor(attacker: &UnitStats, defender: &UnitStats) -> f32 {
-    let att_reach = attacker.max_movement + attacker.max_range;
-    let def_reach = defender.max_movement + defender.max_range;
-    if attacker.max_range > defender.max_range {
-        if att_reach >= def_reach { 1.0 } else { 0.8 }
-    } else if attacker.max_range < defender.max_range {
-        0.5
-    } else {
-        1.0
-    }
 }
 
 /// 見送り購入（資金を貯めて上位の候補を買う）を行うべきか。
@@ -3434,7 +2945,6 @@ fn should_defer_purchase(
     kind: SlotKind,
     remaining_funds: u32,
     affordable_cost: u32,
-    require_self_deployment: bool,
 ) -> bool {
     if acquisition_mode(&op.facts) != AcquisitionMode::SquadPackage {
         return false;
@@ -3449,15 +2959,7 @@ fn should_defer_purchase(
             if !scan.can_produce(*terrain, *unit_type) || stats.cost <= remaining_funds {
                 continue;
             }
-            let Some(fitness) = slot_fitness(
-                scan,
-                ctx,
-                op,
-                kind,
-                facility,
-                stats,
-                require_self_deployment,
-            ) else {
+            let Some(fitness) = slot_fitness(scan, ctx, op, kind, facility, stats) else {
                 continue;
             };
             let scaled = fitness * 1000.0 / stats.cost as f32;
@@ -3479,16 +2981,8 @@ fn should_defer_purchase(
                 if !scan.can_produce(*terrain, stats.unit_type) {
                     return None;
                 }
-                slot_fitness(
-                    scan,
-                    ctx,
-                    op,
-                    kind,
-                    facility,
-                    stats,
-                    require_self_deployment,
-                )
-                .map(|f| f * 1000.0 / stats.cost as f32)
+                slot_fitness(scan, ctx, op, kind, facility, stats)
+                    .map(|f| f * 1000.0 / stats.cost as f32)
             })
         })
         .fold(0.0f32, f32::max);
@@ -3499,60 +2993,6 @@ fn should_defer_purchase(
     let shortfall = future_cost.saturating_sub(remaining_funds);
     let turns_to_afford = shortfall.div_ceil(scan.my_income.max(1));
     turns_to_afford <= RESERVATION_PATIENCE_TURNS
-}
-
-/// 作戦が 1 つも立たない平時のフォールバック。
-///
-/// `GamePhase` ごとの理想構成は使わず、敵編成に対する対抗効率のみで選ぶ。
-fn fallback_production(scan: &BoardScan, player_id: PlayerId) -> Vec<ProduceUnitCommand> {
-    let cheapest = scan
-        .available_types
-        .iter()
-        .map(|(_, stats)| stats.cost)
-        .filter(|cost| *cost > 0)
-        .min()
-        .unwrap_or(u32::MAX);
-    // 資金に余裕がないうちは温存する
-    if scan.funds < cheapest.saturating_mul(2) {
-        return Vec::new();
-    }
-
-    let enemies: Vec<UnitStats> = scan
-        .enemy_units
-        .iter()
-        .map(|unit| unit.stats.clone())
-        .collect();
-
-    let mut best: Option<(f32, GridPosition, UnitType)> = None;
-    for (facility, terrain) in &scan.free_facilities {
-        for (unit_type, stats) in &scan.available_types {
-            if !scan.can_produce(*terrain, *unit_type) || stats.cost > scan.funds || stats.cost == 0
-            {
-                continue;
-            }
-            let base = if enemies.is_empty() {
-                1.0
-            } else {
-                counter_value(stats, &enemies, &scan.damage_chart)
-            };
-            if base <= 0.0 {
-                continue;
-            }
-            let score = base * 1000.0 / stats.cost as f32;
-            if best.is_none_or(|(current, _, _)| score > current) {
-                best = Some((score, *facility, *unit_type));
-            }
-        }
-    }
-
-    best.map(|(_, facility, unit_type)| ProduceUnitCommand {
-        player_id,
-        target_x: facility.x,
-        target_y: facility.y,
-        unit_type,
-    })
-    .into_iter()
-    .collect()
 }
 
 #[cfg(test)]
@@ -3744,8 +3184,8 @@ mod tests {
             5,
         );
 
-        assert!(near.facts.friendly_combat_value_committed > 0);
-        assert_eq!(far.facts.friendly_combat_value_committed, 0);
+        assert!(near.facts.friendly_combat_units_committed > 0);
+        assert_eq!(far.facts.friendly_combat_units_committed, 0);
     }
 
     #[test]
@@ -3772,7 +3212,7 @@ mod tests {
 
     /// 敵施設の生産余力も、期限内に到着できる最寄りの1作戦だけへ計上する。
     #[test]
-    fn enemy_reinforcement_budget_is_local_unique_and_deadline_bounded() {
+    fn enemy_reinforcement_funds_is_local_unique_and_deadline_bounded() {
         let mut scan = multi_factory_scan();
         scan.enemy_income = 6000;
         scan.enemy_production_slots = 1;
@@ -3786,17 +3226,17 @@ mod tests {
 
         // 最安の歩兵は1ターンで到着し、残る3生産ターン分だけを局地予算にする。
         assert_eq!(
-            projected_enemy_reinforcement_budget(&scan, &mut ctx, &anchors, &horizons, 0),
+            projected_enemy_reinforcement_funds(&scan, &mut ctx, &anchors, &horizons, 0),
             3000
         );
         assert_eq!(
-            projected_enemy_reinforcement_budget(&scan, &mut ctx, &anchors, &horizons, 1),
+            projected_enemy_reinforcement_funds(&scan, &mut ctx, &anchors, &horizons, 1),
             0
         );
 
         // 到着期限が0なら、この施設はどの作戦の脅威にもならない。
         assert_eq!(
-            projected_enemy_reinforcement_budget(&scan, &mut ctx, &anchors, &[0, 0], 0),
+            projected_enemy_reinforcement_funds(&scan, &mut ctx, &anchors, &[0, 0], 0),
             0
         );
     }
@@ -3820,7 +3260,7 @@ mod tests {
             OperationSlots::default(),
         );
         op.anchor = pos(6, 2);
-        op.facts.enemy_reinforcement_budget = 3_000;
+        op.facts.enemy_reinforcement_funds = 3_000;
 
         let reinforcements = enemy_reinforcement_scenario(&scan, &mut ReachCtx::default(), &op, 5);
 
@@ -3839,55 +3279,13 @@ mod tests {
         );
     }
 
-    /// テスト用のユニット諸元。射程はすべて 0 なので `engagement_factor` は 1.0 になる
+    /// テスト用のユニット諸元。
     fn stats(unit_type: UnitType, cost: u32) -> UnitStats {
         UnitStats {
             unit_type,
             cost,
             ..UnitStats::mock()
         }
-    }
-
-    fn snapshot(stats: UnitStats, hp: u32) -> UnitSnapshot {
-        UnitSnapshot {
-            entity: None,
-            pos: pos(0, 0),
-            stats,
-            hp,
-            free_cargo: 0,
-        }
-    }
-
-    /// 占領レース中は、敵の占領ユニットと輸送ユニットを素のコスト価値より重く数える
-    #[test]
-    fn expansion_units_are_weighted_while_the_capture_race_is_live() {
-        let capturer = snapshot(
-            UnitStats {
-                can_capture: true,
-                ..stats(UnitType::Infantry, 1000)
-            },
-            100,
-        );
-        let transport = snapshot(
-            UnitStats {
-                max_cargo: 1,
-                ..stats(UnitType::TransportHelicopter, 5000)
-            },
-            100,
-        );
-
-        assert_eq!(
-            threat_value(&capturer, true),
-            1000 * EXPANSION_THREAT_WEIGHT
-        );
-        assert_eq!(
-            threat_value(&transport, true),
-            5000 * EXPANSION_THREAT_WEIGHT
-        );
-
-        // 取れる拠点が尽きて占領レースが終われば、重み付けもなくなる
-        assert_eq!(threat_value(&capturer, false), 1000);
-        assert_eq!(threat_value(&transport, false), 5000);
     }
 
     /// 揚陸判定用のマップを組み立てる。
@@ -4000,214 +3398,7 @@ mod tests {
         ));
     }
 
-    /// 占領も輸送もできない戦闘ユニットは、レース中でも重み付けされない
-    #[test]
-    fn plain_combat_units_are_never_weighted() {
-        let tank = snapshot(stats(UnitType::Tank, 7000), 100);
-        assert_eq!(threat_value(&tank, true), 7000);
-        assert_eq!(threat_value(&tank, false), 7000);
-    }
-
-    /// 脅威価値は HP を加味した残存戦力で数える
-    #[test]
-    fn threat_value_scales_with_remaining_hp() {
-        let half_dead = snapshot(
-            UnitStats {
-                can_capture: true,
-                ..stats(UnitType::Infantry, 1000)
-            },
-            50,
-        );
-        assert_eq!(half_dead.value(), 500);
-        assert_eq!(
-            threat_value(&half_dead, true),
-            500 * EXPANSION_THREAT_WEIGHT
-        );
-    }
-
-    /// 撃破枠の採点は「そのユニットが実際に殴りに行ける敵」だけで行わないと、
-    /// 届かない敵まで含めた平均のせいで、盤面に触れられないユニットが候補として残る。
-    #[test]
-    fn counter_value_ignores_enemies_the_unit_cannot_reach() {
-        let mut chart = DamageChart::new();
-        // 対空ユニットは航空ユニットに滅法強く、歩兵にはほとんど通らない
-        chart.insert_damage(UnitType::AntiAir, UnitType::Bcopters, 120);
-        chart.insert_damage(UnitType::Bcopters, UnitType::AntiAir, 10);
-        chart.insert_damage(UnitType::AntiAir, UnitType::Infantry, 0);
-        chart.insert_damage(UnitType::Infantry, UnitType::AntiAir, 5);
-
-        let anti_air = stats(UnitType::AntiAir, 8000);
-        let bcopter = stats(UnitType::Bcopters, 9000);
-        let infantry = stats(UnitType::Infantry, 1000);
-
-        // 海の向こうのヘリまで平均に混ぜると正の値になり、候補として生き残ってしまう
-        let with_unreachable = counter_value(&anti_air, &[bcopter, infantry.clone()], &chart);
-        assert!(with_unreachable > 0.0);
-
-        // 実際に届く相手（上陸してくる歩兵）だけで採点すれば有効打がなく脱落する
-        let engageable_only = counter_value_refs(&anti_air, &[&infantry], &chart);
-        assert!(engageable_only <= 0.0);
-    }
-
-    /// 到達できる敵が 1 体もいなければ採点対象がなく、枠を埋める資格もない
-    #[test]
-    fn counter_value_of_an_empty_engageable_set_is_zero() {
-        let chart = DamageChart::new();
-        let anti_air = stats(UnitType::AntiAir, 8000);
-        assert_eq!(counter_value_refs(&anti_air, &[], &chart), 0.0);
-    }
-
-    /// 同じ航空脅威を覆い切った後は、次の対空ユニットより未対処の地上脅威への
-    /// 対抗ユニットが優先される。平均相性のままではこの切替が起きない。
-    #[test]
-    fn marginal_coverage_moves_from_covered_air_threat_to_ground_threat() {
-        let mut chart = DamageChart::new();
-        chart.insert_damage(UnitType::AntiAir, UnitType::Bcopters, 120);
-        chart.insert_damage(UnitType::Bcopters, UnitType::AntiAir, 10);
-        chart.insert_damage(UnitType::AntiAir, UnitType::Infantry, 0);
-        chart.insert_damage(UnitType::Infantry, UnitType::AntiAir, 20);
-        chart.insert_damage(UnitType::Tank, UnitType::Infantry, 90);
-        chart.insert_damage(UnitType::Infantry, UnitType::Tank, 0);
-
-        let anti_air = stats(UnitType::AntiAir, 8000);
-        let tank = stats(UnitType::Tank, 7000);
-        let mut threats = vec![
-            ThreatTarget {
-                entity: None,
-                stats: stats(UnitType::Bcopters, 8000),
-                position: pos(1, 0),
-                current_hp: 100,
-                remaining_value: 8000.0,
-                priority_weight: 1.0,
-                available_turn: 0,
-            },
-            ThreatTarget {
-                entity: None,
-                stats: stats(UnitType::Infantry, 7000),
-                position: pos(2, 0),
-                current_hp: 100,
-                remaining_value: 7000.0,
-                priority_weight: 1.0,
-                available_turn: 0,
-            },
-        ];
-        let indices = vec![0, 1];
-
-        assert!(
-            marginal_coverage(&anti_air, 8000.0, &threats, &indices, &chart)
-                > marginal_coverage(&tank, 7000.0, &threats, &indices, &chart)
-        );
-        apply_coverage(&anti_air, 8000.0, &mut threats, &indices, &chart);
-
-        assert_eq!(threats[0].remaining_value, 0.0);
-        assert_eq!(
-            marginal_coverage(&anti_air, 8000.0, &threats, &indices, &chart),
-            0.0
-        );
-        assert!(marginal_coverage(&tank, 7000.0, &threats, &indices, &chart) > 0.0);
-    }
-
-    /// 戦略的重要度は候補の優先順位だけを上げ、必要な対抗戦力を水増ししない。
-    #[test]
-    fn strategic_weight_does_not_multiply_remaining_combat_value() {
-        let mut chart = DamageChart::new();
-        chart.insert_damage(UnitType::AntiAir, UnitType::TransportHelicopter, 120);
-        chart.insert_damage(UnitType::TransportHelicopter, UnitType::AntiAir, 0);
-        let anti_air = stats(UnitType::AntiAir, 8000);
-        let mut threats = vec![ThreatTarget {
-            entity: None,
-            stats: stats(UnitType::TransportHelicopter, 8000),
-            position: pos(1, 0),
-            current_hp: 100,
-            remaining_value: 8000.0,
-            priority_weight: 2.0,
-            available_turn: 0,
-        }];
-
-        let covered = apply_coverage(&anti_air, 8000.0, &mut threats, &[0], &chart);
-
-        assert_eq!(covered, 16000.0);
-        assert_eq!(threats[0].remaining_value, 0.0);
-        assert_eq!(
-            marginal_coverage(&anti_air, 8000.0, &threats, &[0], &chart),
-            0.0
-        );
-    }
-
-    /// 価格ベースの被覆を使い切っても、敵拡張unitを処理する攻撃回数は残る。
-    #[test]
-    fn territory_control_sortie_keeps_a_counter_candidate_after_value_is_covered() {
-        let mut chart = DamageChart::new();
-        chart.insert_damage(UnitType::Bcopters, UnitType::Infantry, 65);
-        let helicopter = stats(UnitType::Bcopters, 7500);
-        let threats = vec![ThreatTarget {
-            entity: None,
-            stats: stats(UnitType::Infantry, 1000),
-            position: pos(1, 0),
-            current_hp: 100,
-            remaining_value: 0.0,
-            priority_weight: 2.0,
-            available_turn: 0,
-        }];
-
-        assert_eq!(
-            marginal_coverage(&helicopter, 7500.0, &threats, &[0], &chart),
-            0.0
-        );
-        assert!(territory_control_sortie_value(&helicopter, 2, &threats, &[0], &chart) > 0.0);
-    }
-
-    /// Combatは資金難なら費用効率、資金潤沢なら生産枠あたり戦果を優先する。
-    #[test]
-    fn combat_roi_can_choose_expensive_ground_attack_when_budget_is_abundant() {
-        let mut chart = DamageChart::new();
-        chart.insert_damage(UnitType::Bcopters, UnitType::Rockets, 45);
-        chart.insert_damage(UnitType::Bomber, UnitType::Rockets, 95);
-        let helicopter = stats(UnitType::Bcopters, 7_500);
-        let bomber = stats(UnitType::Bomber, 22_000);
-        let threats = vec![
-            ThreatTarget {
-                entity: None,
-                stats: stats(UnitType::Rockets, 6_000),
-                position: pos(1, 0),
-                current_hp: 100,
-                remaining_value: 6_000.0,
-                priority_weight: 1.0,
-                available_turn: 0,
-            },
-            ThreatTarget {
-                entity: None,
-                stats: stats(UnitType::Rockets, 6_000),
-                position: pos(2, 0),
-                current_hp: 100,
-                remaining_value: 6_000.0,
-                priority_weight: 1.0,
-                available_turn: 0,
-            },
-        ];
-        let helicopter_return = marginal_sortie_return(&helicopter, 2, &threats, &[0, 1], &chart);
-        let bomber_return = marginal_sortie_return(&bomber, 2, &threats, &[0, 1], &chart);
-
-        assert!(bomber_return > helicopter_return);
-        assert!(
-            normalized_candidate_fitness(
-                SlotKind::Combat,
-                helicopter_return,
-                helicopter.cost,
-                30_000,
-            ) < normalized_candidate_fitness(SlotKind::Combat, bomber_return, bomber.cost, 30_000,)
-        );
-        assert!(
-            normalized_candidate_fitness(
-                SlotKind::Combat,
-                helicopter_return,
-                helicopter.cost,
-                8_000,
-            ) > normalized_candidate_fitness(SlotKind::Combat, bomber_return, bomber.cost, 8_000,)
-        );
-    }
-
-    /// Combat枠は購入価格ではなく、期限内に敵へ与えられる期待交換価値で充足する。
+    /// Combat計画は購入価格ではなく、期限内の具体的な攻撃列で充足する。
     #[test]
     fn combat_plan_does_not_treat_purchase_price_as_destroyed_enemy_value() {
         let infantry = UnitStats {
@@ -4271,8 +3462,8 @@ mod tests {
 
         let (commands, trace) = plan_production(&scan, PlayerId(1), false, &HashMap::new());
 
-        // 旧実装は7,500の購入価格をそのまま撃破済み価値へ足し、2機で要求を
-        // 消していた。65%攻撃を2回ずつ行う期待値では3機とも必要になる。
+        // 65%攻撃を何回実行できるかをシミュレーションするため、価格に関係なく
+        // 3目標を期限内に処理できる3機が編成される。
         assert_eq!(commands.len(), 3, "commands={commands:?}, trace={trace:?}");
         assert!(
             commands
@@ -4345,40 +3536,6 @@ mod tests {
             unreachable_threats: Vec::new(),
             reachable_threats: Vec::new(),
         }
-    }
-
-    /// 要求が青天井の撃破枠は、上限を持つ前提条件の枠を飢えさせてはならない
-    ///
-    /// 撃破枠の要求は「自軍が投入できる資金」そのものなので、資金の何倍にもなる。
-    /// 未充足率は要求量で正規化されるため、何体買っても 1.0 からほとんど下がらない。
-    /// 未充足率を枠の優先順位より先に見ると、撃破枠が恒久的に「最も飢えた枠」となり、
-    /// 半分埋まった輸送枠（＝揚陸の足回り）へは 2 度と資金が回らなくなる。
-    #[test]
-    fn an_unbounded_slot_does_not_starve_bounded_prerequisite_slots() {
-        // 輸送枠は半分充足（未充足率 0.5）、撃破枠は資金規模の要求でほぼ未充足（≒1.0）
-        let ops = vec![operation(
-            OperationKind::Capture,
-            OperationSlots {
-                transport_slots: 4,
-                destroy_budget: 150_000,
-                ..OperationSlots::default()
-            },
-            OperationSlots {
-                transport_slots: 2,
-                destroy_budget: 8_000,
-                ..OperationSlots::default()
-            },
-        )];
-
-        // 未充足率だけで選ぶと撃破枠が勝ってしまうことを、前提として確かめておく
-        assert!(
-            ops[0].slots.deficit_ratio(SlotKind::Combat, &ops[0].filled)
-                > ops[0]
-                    .slots
-                    .deficit_ratio(SlotKind::Transport, &ops[0].filled)
-        );
-
-        assert_eq!(most_starved_slot(&ops), Some((0, SlotKind::Transport)));
     }
 
     /// 海峡マップ上に、母港の輸送艦 1 隻だけを置いた盤面を作る。
@@ -4888,12 +4045,11 @@ mod tests {
                 },
                 OperationSlots::default(),
             ),
-            // 防衛作戦の護衛枠（枠としては最後だが、作戦が最優先）。
-            // 護衛は「敵の接触までに要る体数」で有限なので前提条件側に属する。
+            // 防衛作戦の戦闘計画（枠としては最後だが、作戦が最優先）。
             operation(
                 OperationKind::Defense,
                 OperationSlots {
-                    escort_units: 2,
+                    combat_plan_required: 1,
                     ..OperationSlots::default()
                 },
                 OperationSlots::default(),
@@ -4903,19 +4059,14 @@ mod tests {
         assert_eq!(most_starved_slot(&ops), Some((1, SlotKind::Combat)));
     }
 
-    /// 最優先作戦の撃破枠が、後回し作戦の前提条件を飢えさせてはならない
-    ///
-    /// 撃破枠の要求は青天井なので、作戦優先度で先に見てしまうと自陣の防衛作戦が
-    /// 全額を吸い、渡洋作戦には輸送も占領要員も 1 体も回らない（＝引きこもる）。
-    /// 前提条件は作戦をまたいで先に満たす。
+    /// 具体的な敵を持つ最優先防衛作戦は、後順位の輸送より先に計画する。
     #[test]
-    fn a_top_priority_destroy_budget_does_not_starve_a_lower_priority_prerequisite() {
+    fn a_top_priority_combat_plan_precedes_a_lower_priority_transport() {
         let ops = vec![
-            // 自陣の防衛作戦。撃破枠は資金規模の青天井要求。
             operation(
                 OperationKind::Defense,
                 OperationSlots {
-                    destroy_budget: 150_000,
+                    combat_plan_required: 1,
                     ..OperationSlots::default()
                 },
                 OperationSlots::default(),
@@ -4931,40 +4082,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(most_starved_slot(&ops), Some((1, SlotKind::Transport)));
-    }
-
-    /// 余剰の配分は作戦の優先度ではなく未充足率で決める
-    ///
-    /// 撃破要求は既に前線ごとの分担比で割ってあるので、未充足率で選び続ければ
-    /// 資金は各前線の分担比どおりに配分される。
-    #[test]
-    fn residual_funds_follow_the_deficit_not_the_operation_rank() {
-        let ops = vec![
-            // 最優先の防衛作戦。撃破枠はほぼ充足済み。
-            operation(
-                OperationKind::Defense,
-                OperationSlots {
-                    destroy_budget: 10_000,
-                    ..OperationSlots::default()
-                },
-                OperationSlots {
-                    destroy_budget: 9_000,
-                    ..OperationSlots::default()
-                },
-            ),
-            // 後回しの占領作戦。撃破枠は手つかず。
-            operation(
-                OperationKind::Capture,
-                OperationSlots {
-                    destroy_budget: 10_000,
-                    ..OperationSlots::default()
-                },
-                OperationSlots::default(),
-            ),
-        ];
-
-        assert_eq!(most_starved_slot(&ops), Some((1, SlotKind::Combat)));
+        assert_eq!(most_starved_slot(&ops), Some((0, SlotKind::Combat)));
     }
 
     /// 島作戦の不足はV4汎用作戦より先に発注し、不完全なパッケージの途中で
@@ -5003,7 +4121,7 @@ mod tests {
             transport_slots: 2,
             capture_units: 1,
             ground_combat_units: 0,
-            combat_budget: 0,
+            combat_units: 0,
             total_budget: 17_500,
         };
         let assignment = IslandCampaignAssignment {

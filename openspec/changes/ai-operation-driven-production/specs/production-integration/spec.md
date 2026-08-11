@@ -37,16 +37,21 @@ SHALL: AIは目標達成に必要なユニットが不足している場合、�
 #### Scenario: 未完成パッケージの予約額だけを汎用生産から保護する
 
 - **WHEN** 島嶼キャンペーンパッケージを当該手番の生産枠で完成できず、全不足行の残予約額を超える現金と空き施設が残るとき
-- **THEN** 全campaign予約額を保護したうえで超過額だけをV4汎用生産へ渡し、Capture/Transportを二重購入せず観測敵へのCombat/Interceptだけを評価する。超過額がなければ汎用生産を停止する
+- **THEN** 全campaign予約額を保護したうえで、観測敵を持つ永続Combat/Intercept Planの具体購入列だけを評価する。作戦に属さない汎用価格fallbackは生成しない
+
+#### Scenario: Combat価格で構造パッケージを充足しない
+
+- **WHEN** 作戦へ高価な既存Combat Entityが割り当て済みだが、輸送役または占領cargoが不足しているとき
+- **THEN** Combat Entityの価格を構造予算から控除せず、不足する輸送役・占領cargoをそのまま生産要求へ残す
 
 #### Scenario: 余剰予算で海外へ渡れない地上戦力を買わない
 
 - **WHEN** campaign予約超過分で海外前線の敵占領unitへ対抗するが、候補地上unitが作戦地点へ自力到達できないとき
 - **THEN** 暗黙の将来輸送を理由に当該unitを余剰購入せず、自力到達可能かつ有効打を持つCombat/Intercept候補だけを選ぶ
 
-#### Scenario: campaign専用Combat不足でも未接続の海外地上戦力を買わない
+#### Scenario: V3 campaign専用Combat不足でも未接続の海外地上戦力を買わない
 
-- **WHEN** V3またはV4の島嶼campaignにCombat不足が残り、候補地上unitの生産施設と作戦target positionが海で分断されているとき
+- **WHEN** V3の島嶼campaignにCombat不足が残り、候補地上unitの生産施設と作戦target positionが海で分断されているとき
 - **THEN** 生産可能な輸送unitがマスターデータ上に存在することだけを根拠に候補を採用せず、作戦地点へ自力到達可能なCombat候補だけで不足を満たす
 
 #### Scenario: 洋上増援の輸送不足を生産要求へ戻す
@@ -54,10 +59,10 @@ SHALL: AIは目標達成に必要なユニットが不足している場合、�
 - **WHEN** Reinforce作戦へ予約したcargoが別島にあり、同じ出発島から全cargoを積載できる既存輸送役が不足しているとき
 - **THEN** 生産圏内の実拠点で生産可能かつcargo兵種を積載可能な輸送手段を選び、作戦を消さずに不足枠と費用をpurchase shortfallへ計上する
 
-#### Scenario: 敵領強襲の完全編成まで支援生産を続ける
+#### Scenario: V4敵領強襲は具体的な排除計画が成立するまで支援生産を続ける
 
-- **WHEN** Assaultに必要な輸送手段と占領要員が揃っているが、局地敵戦力に対する優越戦闘予算が不足しているとき
-- **THEN** 戦闘不足を作戦shortfallとして維持し、Forming中の侵攻波へ追加できる戦闘要員を生産する。戦闘不足が0になるまで作戦を発進可能としない
+- **WHEN** Assaultに必要な輸送手段と占領要員が揃っているが、局地敵Entityを排除して占領役を生存させる合法な行動列が成立しないとき
+- **THEN** Rolling Planが導出した具体的な混成購入列を同じPlanIdで生産し、実行可能な排除・占領scheduleが成立するまで作戦を発進可能としない
 
 #### Scenario: 編成中Assaultより残存施設の確保を優先する
 

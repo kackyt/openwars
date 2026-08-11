@@ -638,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v3_transport_wave_contains_capture_and_combat_cargo() {
+    fn test_v3_empty_island_transport_wave_does_not_add_unneeded_combat_cargo() {
         let p1 = PlayerId(1);
         let mut world = setup_transport_invasion();
         let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
@@ -697,11 +697,8 @@ mod tests {
             .find(|squad| squad.mission_type == crate::ai::squad::MissionType::Transport)
             .expect("V3 should create one invasion transport squad");
         assert_eq!(transport.transport_entity, Some(lander));
-        assert_eq!(transport.cargo_entities.len(), 2);
-        assert!(
-            transport.cargo_entities.contains(&tank),
-            "侵攻波には戦闘要員を含める"
-        );
+        assert_eq!(transport.cargo_entities.len(), 1);
+        assert!(!transport.cargo_entities.contains(&tank));
         assert!(transport.cargo_entities.iter().any(|entity| {
             world
                 .get::<UnitStats>(*entity)

@@ -1051,12 +1051,10 @@ impl V4RollingPlanRegistry {
             };
         }
         // 発注イベントを実Entityへ照合できなかった1stepだけを理由に、形成済み戦力と
-        // PlanIdを全て捨てない。残編成を現在の生産枠へ載せ直せる場合は、未完了stepを
+        // PlanIdを全て捨てない。この契約は首都攻略だけでなく、中央島のCapture/Defense
+        // にも必要である。残編成を現在の生産枠へ載せ直せる場合は、未完了stepだけを
         // Plannedへ戻して同じ計画内で再発注する。
-        if kind == OperationKind::AssaultCapital
-            && previous.production_failed
-            && continuation_error.is_none()
-        {
+        if previous.production_failed && continuation_error.is_none() {
             let plan = evaluated.expect("再発注可能な固定編成が評価済み");
             let stored = &mut self.active[previous.index];
             for step in &mut stored.steps {
@@ -1647,73 +1645,63 @@ mod tests {
     }
 
     #[test]
-    fn capital_unmatched_issue_retries_the_step_without_replacing_the_plan() {
-        let player = PlayerId(1);
-        let enemy = Entity::from_raw(10);
-        let anchor = GridPosition { x: 9, y: 9 };
-        let enemies = HashSet::from([enemy]);
-        let mut registry = V4RollingPlanRegistry::default();
-        let created = registry.select(
-            player,
-            3,
-            OperationKind::AssaultCapital,
-            anchor,
-            vec![anchor],
-            enemies.clone(),
-            None,
-            feasible_plan(0),
-            None,
-            HashSet::new(),
-        );
-        let purchase = created.plan.purchases[0];
-        let step = registry
-            .current_step_ref(
-                created.plan_id.unwrap(),
-                created.revision.unwrap(),
+    fn unmatched_issue_retries_the_step_for_every_operation_kind() {
+        for kind in [OperationKind::Capture, OperationKind::AssaultCapital] {
+            let player = PlayerId(1);
+            let enemy = Entity::from_raw(10);
+            let anchor = GridPosition { x: 9, y: 9 };
+            let enemies = HashSet::from([enemy]);
+            let mut registry = V4RollingPlanRegistry::default();
+            let created = registry.select(
+                player,
                 3,
-                purchase,
-            )
-            .unwrap();
-        registry.mark_issued(step, 3);
-        let continuation = registry
-            .continuation(
+                kind,
+                anchor,
+                vec![anchor],
+                enemies.clone(),
+                None,
+                feasible_plan(0),
+                None,
+                HashSet::new(),
+            );
+            let purchase = created.plan.purchases[0];
+            let step = registry
+                .current_step_ref(
+                    created.plan_id.unwrap(),
+                    created.revision.unwrap(),
+                    3,
+                    purchase,
+                )
+                .unwrap();
+            registry.mark_issued(step, 3);
+            let continuation = registry
+                .continuation(player, 4, kind, &[anchor], &enemies)
+                .unwrap();
+            assert!(continuation.production_failed);
+            assert_eq!(continuation.purchases.len(), 1);
+
+            let selected = registry.select(
                 player,
                 4,
-                OperationKind::AssaultCapital,
-                &[anchor],
-                &enemies,
-            )
-            .unwrap();
-        assert!(continuation.production_failed);
-        assert_eq!(continuation.purchases.len(), 1);
+                kind,
+                anchor,
+                vec![anchor],
+                enemies.clone(),
+                Some((continuation, Ok(feasible_plan(0)))),
+                feasible_plan(0),
+                None,
+                HashSet::new(),
+            );
 
-        let selected = registry.select(
-            player,
-            4,
-            OperationKind::AssaultCapital,
-            anchor,
-            vec![anchor],
-            enemies.clone(),
-            Some((continuation, Ok(feasible_plan(0)))),
-            feasible_plan(0),
-            None,
-            HashSet::new(),
-        );
-
-        assert_eq!(selected.plan_id, created.plan_id);
-        assert_eq!(selected.disposition, PlanDisposition::Continued);
-        assert_eq!(selected.reason, Some(ReplanReason::ProductionStepFailed));
-        let retried = registry
-            .continuation(
-                player,
-                4,
-                OperationKind::AssaultCapital,
-                &[anchor],
-                &enemies,
-            )
-            .unwrap();
-        assert!(!retried.production_failed);
-        assert_eq!(retried.purchases[0].build_turn, 0);
+            assert_eq!(selected.plan_id, created.plan_id);
+            assert_eq!(selected.disposition, PlanDisposition::Continued);
+            assert_eq!(selected.reason, Some(ReplanReason::ProductionStepFailed));
+            let retried = registry
+                .continuation(player, 4, kind, &[anchor], &enemies)
+                .unwrap();
+            assert!(!retried.production_failed);
+            assert_eq!(retried.purchases[0].build_turn, 0);
+        }
     }
 
     #[test]

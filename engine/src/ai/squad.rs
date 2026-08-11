@@ -5567,7 +5567,12 @@ mod tests {
                 .collect();
             assert_eq!(forming.len(), 1);
             assert_eq!(forming[0].transport_entity, Some(lander));
-            assert_eq!(forming[0].cargo_entities, forming_cargo);
+            assert!(
+                forming_cargo
+                    .iter()
+                    .all(|entity| forming[0].cargo_entities.contains(entity)),
+                "再分析で既存cargoを失わず、空き容量へ同じ作戦の要員を追加する"
+            );
         }
 
         let second_infantry_stats = master_data
@@ -5635,8 +5640,8 @@ mod tests {
             ready_assignment.combat_entities.contains(&tank)
                 || ready_assignment.capture_entities.contains(&tank)
         );
-        // Forming中は必要戦力が揃うまで再編可能とし、戦闘予算を満たすcargoを追加する。
-        assert!(ready_assignment.combat_entities.contains(&artillery));
+        // 必要Entity数を満たした後は、高価だからという理由だけで追加cargoを要求しない。
+        assert!(!ready_assignment.combat_entities.contains(&artillery));
         assert!(!ready_assignment.capture_entities.contains(&artillery));
 
         plan_squads(&mut world, player);
@@ -6370,7 +6375,7 @@ mod tests {
     }
 
     #[test]
-    fn assault_waits_when_late_combat_cannot_join_the_forming_wave() {
+    fn assault_uses_ready_package_without_waiting_for_unreachable_extra_combat() {
         let mut fixture = setup_ready_assault_reconciliation_world();
         let player = PlayerId(1);
         fixture
@@ -6410,10 +6415,10 @@ mod tests {
             .campaign_portfolio
             .assignment_for(target_island)
             .unwrap();
-        assert!(!assignment.operation_ready);
+        assert!(assignment.operation_ready);
         assert!(assignment.transport_entities.contains(&fixture.lander));
         assert!(assignment.transport_entities.contains(&fixture.helicopter));
-        // 合流不能な戦闘cargoは予約せず、必要戦力不足のまま出航もしない。
+        // 合流不能な追加戦闘cargoは予約せず、到達可能な完成packageだけで出航する。
         assert!(!assignment.combat_entities.contains(&fixture.cargo[3]));
 
         plan_squads(&mut fixture.world, player);
@@ -6428,8 +6433,7 @@ mod tests {
         assert!(
             operation_squads
                 .iter()
-                .all(|squad| { squad.phase == MissionPhase::Forming }),
-            "必要戦力へ合流できない間はFormingで待機する"
+                .any(|squad| squad.phase != MissionPhase::Forming)
         );
     }
 
@@ -6759,7 +6763,7 @@ mod tests {
             transport_slots: 2,
             capture_units: 1,
             ground_combat_units: 0,
-            combat_budget: 0,
+            combat_units: 0,
             total_budget: 5_000,
         };
         let assignment = crate::ai::island_campaign::IslandCampaignAssignment {
@@ -8023,8 +8027,8 @@ mod tests {
                 neutral_properties: 1,
                 friendly_properties: 1,
                 enemy_properties: 0,
-                friendly_combat_value: 0,
-                enemy_combat_value: 0,
+                friendly_combat_units: 0,
+                enemy_combat_units: 0,
                 friendly_arrival_eta: Some(0),
                 enemy_arrival_eta: None,
                 friendly_capture_eta: Some(1),
@@ -8210,8 +8214,8 @@ mod tests {
                 neutral_properties: 1,
                 friendly_properties: 0,
                 enemy_properties: 0,
-                friendly_combat_value: 0,
-                enemy_combat_value: 0,
+                friendly_combat_units: 0,
+                enemy_combat_units: 0,
                 friendly_arrival_eta: None,
                 enemy_arrival_eta: None,
                 friendly_capture_eta: None,
@@ -8293,7 +8297,7 @@ mod tests {
             transport_slots: 0,
             capture_units: 0,
             ground_combat_units: 0,
-            combat_budget: 2_000,
+            combat_units: 2,
             total_budget: 2_000,
         };
         let assignment = IslandCampaignAssignment {
@@ -8308,7 +8312,7 @@ mod tests {
                 transport_slots: 0,
                 capture_units: 0,
                 ground_combat_units: 0,
-                combat_budget: 0,
+                combat_units: 0,
                 total_budget: 0,
             },
             allocated_budget: 2_000,
@@ -8388,7 +8392,7 @@ mod tests {
             transport_slots: 0,
             capture_units: 0,
             ground_combat_units: 0,
-            combat_budget: battleship_stats.cost,
+            combat_units: 1,
             total_budget: battleship_stats.cost,
         };
         let assignment = IslandCampaignAssignment {
@@ -8403,7 +8407,7 @@ mod tests {
                 transport_slots: 0,
                 capture_units: 0,
                 ground_combat_units: 0,
-                combat_budget: 0,
+                combat_units: 0,
                 total_budget: 0,
             },
             allocated_budget: battleship_stats.cost,
@@ -8491,7 +8495,7 @@ mod tests {
             transport_slots: 0,
             capture_units: 0,
             ground_combat_units: 0,
-            combat_budget: 7_000,
+            combat_units: 1,
             total_budget: 7_000,
         };
         let assignment = IslandCampaignAssignment {
@@ -8506,7 +8510,7 @@ mod tests {
                 transport_slots: 0,
                 capture_units: 0,
                 ground_combat_units: 0,
-                combat_budget: 0,
+                combat_units: 0,
                 total_budget: 0,
             },
             allocated_budget: 7_000,
@@ -8619,7 +8623,7 @@ mod tests {
             transport_slots: 0,
             capture_units: 0,
             ground_combat_units: 0,
-            combat_budget: 14_000,
+            combat_units: 2,
             total_budget: 14_000,
         };
         let assignment = IslandCampaignAssignment {
@@ -8634,7 +8638,7 @@ mod tests {
                 transport_slots: 0,
                 capture_units: 0,
                 ground_combat_units: 0,
-                combat_budget: 0,
+                combat_units: 0,
                 total_budget: 0,
             },
             allocated_budget: 14_000,
@@ -8754,7 +8758,7 @@ mod tests {
             transport_slots: 0,
             capture_units: 2,
             ground_combat_units: 0,
-            combat_budget: 0,
+            combat_units: 0,
             total_budget: 2_000,
         };
         let assignment = IslandCampaignAssignment {
@@ -8769,7 +8773,7 @@ mod tests {
                 transport_slots: 0,
                 capture_units: 0,
                 ground_combat_units: 0,
-                combat_budget: 0,
+                combat_units: 0,
                 total_budget: 0,
             },
             allocated_budget: 2_000,
@@ -8867,7 +8871,7 @@ mod tests {
             transport_slots: 0,
             capture_units: 0,
             ground_combat_units: 0,
-            combat_budget: 14_000,
+            combat_units: 2,
             total_budget: 14_000,
         };
         let assignment = IslandCampaignAssignment {
@@ -8882,7 +8886,7 @@ mod tests {
                 transport_slots: 0,
                 capture_units: 0,
                 ground_combat_units: 0,
-                combat_budget: 0,
+                combat_units: 0,
                 total_budget: 0,
             },
             allocated_budget: 14_000,
@@ -8974,7 +8978,7 @@ mod tests {
             transport_slots: 0,
             capture_units: 0,
             ground_combat_units: 0,
-            combat_budget: 7_000,
+            combat_units: 1,
             total_budget: 7_000,
         };
         let assignment = IslandCampaignAssignment {
@@ -8989,7 +8993,7 @@ mod tests {
                 transport_slots: 0,
                 capture_units: 0,
                 ground_combat_units: 0,
-                combat_budget: 0,
+                combat_units: 0,
                 total_budget: 0,
             },
             allocated_budget: 7_000,
@@ -9031,7 +9035,7 @@ mod tests {
             transport_slots: 2,
             capture_units: 2,
             ground_combat_units: 0,
-            combat_budget: 0,
+            combat_units: 0,
             total_budget: 4_000,
         };
         let assignment = IslandCampaignAssignment {
@@ -9144,7 +9148,7 @@ mod tests {
             transport_slots: 2,
             capture_units: 1,
             ground_combat_units: 0,
-            combat_budget: bomber_stats.cost,
+            combat_units: 1,
             total_budget: bomber_stats.cost.saturating_add(5_000),
         };
         let assignment = IslandCampaignAssignment {
@@ -9159,7 +9163,7 @@ mod tests {
                 transport_slots: 0,
                 capture_units: 1,
                 ground_combat_units: 0,
-                combat_budget: 0,
+                combat_units: 0,
                 total_budget: 1_000,
             },
             allocated_budget: bomber_stats.cost.saturating_add(4_000),
@@ -9209,7 +9213,7 @@ mod tests {
             transport_slots: 2,
             capture_units: 2,
             ground_combat_units: 0,
-            combat_budget: 0,
+            combat_units: 0,
             total_budget: 4_000,
         };
         let assignment = IslandCampaignAssignment {
@@ -9345,7 +9349,7 @@ mod tests {
             transport_slots: 0,
             capture_units: 0,
             ground_combat_units: 0,
-            combat_budget: 7_000,
+            combat_units: 1,
             total_budget: 7_000,
         };
         let assignment = IslandCampaignAssignment {
@@ -9360,7 +9364,7 @@ mod tests {
                 transport_slots: 0,
                 capture_units: 0,
                 ground_combat_units: 0,
-                combat_budget: 0,
+                combat_units: 0,
                 total_budget: 0,
             },
             allocated_budget: 7_000,

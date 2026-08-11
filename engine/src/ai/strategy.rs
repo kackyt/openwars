@@ -1521,7 +1521,7 @@ mod tests {
             transport_slots: 0,
             capture_units: 0,
             ground_combat_units: 0,
-            combat_budget: 0,
+            combat_units: 0,
             total_budget: 0,
         };
         let assignment = crate::ai::island_campaign::IslandCampaignAssignment {

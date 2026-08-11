@@ -352,7 +352,7 @@ fn candidate_options(
                     .enemy_arrival_eta
                     .is_some_and(|enemy_eta| enemy_eta <= transport_and_deployment),
             )
-            .saturating_add(u32::from(candidate.assessment.enemy_combat_value > 0));
+            .saturating_add(u32::from(candidate.assessment.enemy_combat_units > 0));
             LogisticsOption {
                 island_id: candidate.assessment.island_id,
                 capital_distance: map.distance(

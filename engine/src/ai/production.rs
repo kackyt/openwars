@@ -317,7 +317,7 @@ fn remaining_campaign_requirements(
     if shortfall.capture_units > 0 {
         requirements.push(CampaignProductionRequirement::Capture);
     }
-    if shortfall.combat_budget > 0 {
+    if shortfall.combat_units > 0 {
         requirements.push(CampaignProductionRequirement::Combat);
     }
     requirements
@@ -339,6 +339,7 @@ fn campaign_candidate_matches(
         CampaignProductionRequirement::Capture => stats.can_capture,
         CampaignProductionRequirement::Combat => {
             stats.cost > 0
+                && !stats.can_capture
                 && !matches!(
                     unit_type,
                     UnitType::TransportHelicopter | UnitType::Lander | UnitType::SupplyTruck
@@ -519,7 +520,7 @@ fn consume_campaign_candidate(
             shortfall.capture_units = shortfall.capture_units.saturating_sub(1);
         }
         CampaignProductionRequirement::Combat => {
-            shortfall.combat_budget = shortfall.combat_budget.saturating_sub(stats.cost);
+            shortfall.combat_units = shortfall.combat_units.saturating_sub(1);
         }
     }
     shortfall.reserved_budget = shortfall.reserved_budget.saturating_sub(stats.cost);
@@ -625,11 +626,7 @@ fn plan_campaign_shortfall_production_with_damage(
                             continue;
                         }
                         let combat_coverage =
-                            if requirement == CampaignProductionRequirement::Combat {
-                                stats.cost.min(row.combat_budget)
-                            } else {
-                                0
-                            };
+                            u32::from(requirement == CampaignProductionRequirement::Combat);
                         let (covered_enemy_types, total_expected_damage) =
                             damage_chart.map_or((0_u32, 0_u32), |chart| {
                                 row.priority_enemy_types.iter().fold(
@@ -3255,7 +3252,7 @@ mod additional_tests {
             transport_slots: 0,
             capture_units: 0,
             ground_combat_units: 0,
-            combat_budget: 0,
+            combat_units: 0,
             total_budget: 0,
         };
         crate::ai::island_campaign::IslandCampaignPortfolio {
@@ -3445,7 +3442,7 @@ mod additional_tests {
             heavy_transport_slots: 0,
             capture_units: 0,
             ground_combat_units: 0,
-            combat_budget: 0,
+            combat_units: 0,
             reserved_budget: helicopter.cost,
             priority_rank: 0,
             priority_enemy_types: Vec::new(),
@@ -3481,7 +3478,7 @@ mod additional_tests {
             heavy_transport_slots: 0,
             capture_units: 0,
             ground_combat_units: 0,
-            combat_budget: 1,
+            combat_units: 1,
             reserved_budget: 1,
             priority_rank: 0,
             priority_enemy_types: Vec::new(),
@@ -3521,7 +3518,7 @@ mod additional_tests {
             heavy_transport_slots: 0,
             capture_units: 0,
             ground_combat_units: 0,
-            combat_budget: tank.cost,
+            combat_units: 1,
             reserved_budget: tank.cost,
             priority_rank: 0,
             priority_enemy_types: Vec::new(),
@@ -3622,7 +3619,7 @@ mod additional_tests {
             heavy_transport_slots: 0,
             capture_units: 0,
             ground_combat_units: 0,
-            combat_budget: 0,
+            combat_units: 0,
             reserved_budget: 8_000,
             priority_rank: 0,
             priority_enemy_types: Vec::new(),
@@ -3683,7 +3680,7 @@ mod additional_tests {
             heavy_transport_slots: 0,
             capture_units: 0,
             ground_combat_units: 0,
-            combat_budget: 0,
+            combat_units: 0,
             reserved_budget: 16_000,
             priority_rank: 0,
             priority_enemy_types: Vec::new(),
@@ -3721,7 +3718,7 @@ mod additional_tests {
     }
 
     #[test]
-    fn campaign_production_services_higher_priority_row_before_lower_rows() {
+    fn campaign_combat_never_substitutes_a_cheaper_capture_unit() {
         let master_data = MasterDataRegistry::load().unwrap();
         let available_types = campaign_test_types(&master_data);
         let rows = vec![
@@ -3733,7 +3730,7 @@ mod additional_tests {
                 heavy_transport_slots: 0,
                 capture_units: 0,
                 ground_combat_units: 0,
-                combat_budget: 7_000,
+                combat_units: 1,
                 reserved_budget: 7_000,
                 priority_rank: 0,
                 priority_enemy_types: Vec::new(),
@@ -3746,7 +3743,7 @@ mod additional_tests {
                 heavy_transport_slots: 0,
                 capture_units: 2,
                 ground_combat_units: 0,
-                combat_budget: 0,
+                combat_units: 0,
                 reserved_budget: 6_000,
                 priority_rank: 2,
                 priority_enemy_types: Vec::new(),
@@ -3759,8 +3756,8 @@ mod additional_tests {
                 heavy_transport_slots: 2,
                 capture_units: 2,
                 ground_combat_units: 0,
-                combat_budget: 10_200,
-                reserved_budget: 32_700,
+                combat_units: 2,
+                reserved_budget: 22_500,
                 priority_rank: 4,
                 priority_enemy_types: Vec::new(),
             },
@@ -3780,17 +3777,24 @@ mod additional_tests {
         );
 
         assert_eq!(outcome.commands.len(), 1);
-        let produced_stats = available_types
+        let produced_stats = outcome
+            .commands
             .iter()
-            .find(|(unit_type, _)| *unit_type == outcome.commands[0].unit_type)
-            .map(|(_, stats)| stats)
-            .unwrap();
+            .find_map(|command| {
+                available_types
+                    .iter()
+                    .find(|(unit_type, _)| *unit_type == command.unit_type)
+                    .map(|(_, stats)| stats)
+                    .filter(|stats| !stats.can_capture)
+            })
+            .expect("上位防衛行のCombatには非占領戦闘unitを生産する");
         assert!(produced_stats.cost <= 7_000);
         assert!(!produced_stats.can_capture);
         assert!(!matches!(
-            outcome.commands[0].unit_type,
+            produced_stats.unit_type,
             UnitType::Lander | UnitType::TransportHelicopter | UnitType::SupplyTruck
         ));
+        assert_eq!(outcome.remaining_funds, 7_000 - produced_stats.cost);
         assert!(!outcome.completed_all_rows);
     }
 
@@ -3807,7 +3811,7 @@ mod additional_tests {
                 heavy_transport_slots: 0,
                 capture_units: 7,
                 ground_combat_units: 0,
-                combat_budget: 0,
+                combat_units: 0,
                 reserved_budget: 7_000,
                 priority_rank: 2,
                 priority_enemy_types: Vec::new(),
@@ -3820,7 +3824,7 @@ mod additional_tests {
                 heavy_transport_slots: 0,
                 capture_units: 5,
                 ground_combat_units: 0,
-                combat_budget: 0,
+                combat_units: 0,
                 reserved_budget: 17_000,
                 priority_rank: 6,
                 priority_enemy_types: Vec::new(),
@@ -3874,7 +3878,7 @@ mod additional_tests {
             heavy_transport_slots: 0,
             capture_units: 1,
             ground_combat_units: 0,
-            combat_budget: 0,
+            combat_units: 0,
             reserved_budget: 1_000,
             priority_rank: 1,
             priority_enemy_types: Vec::new(),
@@ -3901,12 +3905,12 @@ mod additional_tests {
     }
 
     #[test]
-    fn campaign_combat_remainder_uses_reserved_real_unit_cost() {
+    fn campaign_combat_requires_an_affordable_non_capture_unit() {
         let master_data = MasterDataRegistry::load().unwrap();
         let available_types = campaign_test_types(&master_data);
         let facilities = vec![(GridPosition { x: 0, y: 0 }, Terrain::Factory)];
         let row =
-            |combat_budget, reserved_budget| crate::ai::island_campaign::IslandCampaignShortfall {
+            |combat_units, reserved_budget| crate::ai::island_campaign::IslandCampaignShortfall {
                 island_id: crate::ai::islands::IslandId(0),
                 decision: crate::ai::island_campaign::IslandCampaignDecision::Defend,
                 target_position: GridPosition { x: 0, y: 0 },
@@ -3914,7 +3918,7 @@ mod additional_tests {
                 heavy_transport_slots: 0,
                 capture_units: 0,
                 ground_combat_units: 0,
-                combat_budget,
+                combat_units,
                 reserved_budget,
                 priority_rank: 0,
                 priority_enemy_types: Vec::new(),
@@ -3922,7 +3926,7 @@ mod additional_tests {
 
         let small_remainder = plan_campaign_shortfall_production(
             PlayerId(1),
-            &[row(80, 1_000)],
+            &[row(1, 1_000)],
             &facilities,
             &available_types,
             &master_data,
@@ -3930,15 +3934,15 @@ mod additional_tests {
         );
         let large = plan_campaign_shortfall_production(
             PlayerId(1),
-            &[row(30_000, 30_000)],
+            &[row(2, 30_000)],
             &facilities,
             &available_types,
             &master_data,
             30_000,
         );
 
-        assert_eq!(small_remainder.commands.len(), 1);
-        assert!(small_remainder.completed_all_rows);
+        assert!(small_remainder.commands.is_empty());
+        assert!(!small_remainder.completed_all_rows);
         assert_eq!(large.commands.len(), 1);
         assert!(!large.completed_all_rows);
     }
@@ -3955,7 +3959,7 @@ mod additional_tests {
             heavy_transport_slots: 2,
             capture_units: 0,
             ground_combat_units: 0,
-            combat_budget: 0,
+            combat_units: 0,
             reserved_budget: 20_500,
             priority_rank: 4,
             priority_enemy_types: Vec::new(),
@@ -3998,8 +4002,8 @@ mod additional_tests {
             heavy_transport_slots: 0,
             capture_units: 2,
             ground_combat_units: 0,
-            combat_budget: 10_200,
-            reserved_budget: 20_200,
+            combat_units: 2,
+            reserved_budget: 10_000,
             priority_rank: 2,
             priority_enemy_types: Vec::new(),
         }];
@@ -4062,7 +4066,7 @@ mod additional_tests {
             heavy_transport_slots: 0,
             capture_units: 0,
             ground_combat_units: 1,
-            combat_budget: tank_cost,
+            combat_units: 1,
             reserved_budget: tank_cost,
             priority_rank: 0,
             priority_enemy_types: vec![UnitType::Infantry],
@@ -4102,8 +4106,8 @@ mod additional_tests {
             heavy_transport_slots: 2,
             capture_units: 2,
             ground_combat_units: 0,
-            combat_budget: 10_200,
-            reserved_budget: 32_700,
+            combat_units: 2,
+            reserved_budget: 22_500,
             priority_rank: 2,
             priority_enemy_types: Vec::new(),
         }];

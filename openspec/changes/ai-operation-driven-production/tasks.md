@@ -30,7 +30,7 @@
 - [ ] A-3. 敵の占領競争 ETA（敵占領ユニットの目標到達 ETA）を算出し、自軍より先着する見込みの場合に占領要員を上積みするロジックを追加する
 - [ ] A-4. `capture_units` を A-2 / A-3 の導出結果へ置換する（クラスタ規模から導出し、拠点数と 1 対 1 対応させない）
 - [ ] A-5. 確定した戦闘戦力と占領要員の搭載枠から、`ceil(搭載スロット合計 × 往復ターン数 ÷ 許容展開ターン数)` により必要輸送枠を逆算する関数を追加し、`transport_slots` を軽/重の内訳込みで置換する
-- [ ] A-6. `combat_budget` を「撃破枠」と「護衛枠」の 2 フィールドへ分離する
+- [x] A-6. `combat_budget`の撃破枠・護衛枠への分離案をDecision 28で撤回し、V4 Combatから価格換算field自体を削除する
 - [ ] A-7. 護衛枠を「接敵 ETA > 展開リードタイム ならゼロ、それ以外は前線幅と敵の対占領要員火力の関数」として導出する（下限補正を設けない）
 - [x] A-8. 撃破枠の導出に、作戦期限までに到着できる局地敵施設の増援予測を組み込む（施設は最短ETAの1作戦へ一意帰属し、局地施設能力と敵収入配分で頭打ち）
 - [ ] A-9. 導出順序（目標 → 敵戦力 → 占領要員 → 輸送）を関数の呼び出し順として固定し、逆順依存が生じないことをコメントで明示する
@@ -147,9 +147,9 @@
 
 ### Phase B-R: Combat要求のローリング混成部隊計画への置換
 
-固定sortie期待収益から必要戦力を推定するB-86〜B-88の方式は、敵排除の実行可能性を保証しないことが判明した。旧方式をshadow診断へ降格し、以下をStage 2の完了条件として先に実装する。
+固定sortie期待収益から必要戦力を推定するB-86〜B-88の方式は、敵排除の実行可能性を保証しないことが判明した。旧方式を全面撤去し、以下をStage 2の完了条件として先に実装する。
 
-- [x] B-89. `destroy_budget`、`friendly_combat_value_committed`、固定`territory_control_window_turns`をCombatの生産停止・充足・作戦完了判定から外し、旧計算は比較診断に限定する
+- [x] B-89. `destroy_budget`、`friendly_combat_value_committed`、固定`territory_control_window_turns`をCombatの生産停止・充足・作戦完了判定、比較診断、traceから削除する
 - [ ] B-90. `OperationSnapshot`、`RollingOperationPlan`、`PlanRevision`、`ForcePackageCandidate`、`PlannedStep`、`ForecastDelta`、`ReplanReason`の値オブジェクトを追加する
 - [ ] B-91. 本番ルールと共有する純粋な作戦予測器を追加し、生産、移動、射程、攻撃、反撃、HP、弾薬、燃料、Load/Drop、補給、Captureをターン単位で進める
 - [ ] B-92. 乱数ボーナスなしの悲観ダメージで敵排除可否を判定し、通常予測との損耗範囲を併記する単体テストを追加する
@@ -218,6 +218,12 @@
 - [x] B-158. 上位防衛・兵站作戦による施設／予算preempt時にPlanIdを維持し、競合施設の未生産列を相対順序ごと繰り下げる。新規空港へ同一編成を前倒し再配置し、同一施設・同一手番の重複を禁止する
 - [x] B-159. 未照合の発注stepを残編成の再評価へ戻し、現在盤面で再配置可能なら同じPlanIdで再発注する単体テストを追加する
 - [x] B-160. map_3 / Hex / seed 42 / V3先攻対V4後攻を10ターン追試し、Plan 1のT2–T10継続、戦闘ヘリ9機・67,500G形成、攻撃3回、T2–T9未割当0を確認する。爆撃機・重戦闘機はT10時点T+1、中央島未制圧、首都攻撃通常T24／悲観T29を未達として残す
+- [x] B-161. V4 Combatから敵価格、HP補正価格、最小unit価格加算、護衛credit、固定sortie、汎用価格fallbackと旧trace fieldを削除し、観測敵Entityの存在だけをRolling Plan起動条件にする
+- [x] B-162. 島campaignの構造予算を輸送役・占領cargoだけへ限定し、既存または新規Combat Entityの価格が輸送・占領shortfallを相殺しないようにする
+- [x] B-163. Concreteな敵別HP・到達・実ダメージ・攻撃手番・反撃・損耗を持つRolling PlanだけをV4 Combatの必要編成・生産停止・完了判定の正本にする
+- [x] B-164. 現在標的を撃破または到達不能まで維持し、未照合生産stepをCaptureを含む全OperationKindで同じPlanIdへ再発注する回帰テストを追加する
+- [x] B-165. engine全テスト、workspace test、fmt、clippy、OpenSpec strict validationを実行する
+- [x] B-166. map_3 / Hex / seed 42 / V3先攻対V4後攻を10ターン追試した。中央島Plan 2は戦闘ヘリ3機・22,500Gを生産し、T7初攻撃、7攻撃・1撃破・残敵1、同一標的へ2機で集中した。一方、中央島3拠点の所有は0、`capture Entity ... has no transport`、V4の残資金67,077、最大手番判定敗北であり、価格換算撤去は確認したが輸送接続・占領完了は未達として残す
 - [x] B-138. Combat plannerの固定最大5生産を撤回し、探索期間内のfacility-turn数から探索深さを導出する。敵増援へ生産手番・移動ETA由来の`available_turn`を与え、手番別の敵到着HP・敵HP除去・自軍HP損耗・攻撃回数をtraceへ出す
 - [x] B-139. map_3 / Hex / seed 42 / 5ターンをV3/V4両席で短期追試し、V4が両席14拠点・収入23,000、T3–5に戦闘機／戦闘ヘリ生産、予測増援の計画算入を確認する。V3両席勝利とV4平均思考2,146msは未達として残す
 - [x] B-140. 固定`排除+2ターン`の占領予測を撤回し、実campaignのPickup/Transit/Drop、cargo位置、Capture距離から得た`friendly_capture_eta`をCombat planへ接続する。輸送編成が無い場合は`occupation_turn = None`として未実行の占領を完了予測しない
