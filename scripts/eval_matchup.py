@@ -136,25 +136,29 @@ def normalize_ai_version(version):
     return normalized
 
 
-def build_match_specs(maps, subject, baseline, seeds, grid_type="hex"):
+def build_match_specs(
+    maps, subject, baseline, seeds, grid_type="hex", player_order="both"
+):
     """各 seed を両方の手番へ決定的な順序で割り当てる。"""
     specs = []
     for map_name in maps:
         for seed in seeds:
-            specs.append({
-                "map": map_name,
-                "p1": subject,
-                "p2": baseline,
-                "seed": seed,
-                "grid_type": grid_type,
-            })
-            specs.append({
-                "map": map_name,
-                "p1": baseline,
-                "p2": subject,
-                "seed": seed,
-                "grid_type": grid_type,
-            })
+            if player_order in {"both", "as-given"}:
+                specs.append({
+                    "map": map_name,
+                    "p1": subject,
+                    "p2": baseline,
+                    "seed": seed,
+                    "grid_type": grid_type,
+                })
+            if player_order in {"both", "swapped"}:
+                specs.append({
+                    "map": map_name,
+                    "p1": baseline,
+                    "p2": subject,
+                    "seed": seed,
+                    "grid_type": grid_type,
+                })
     return specs
 
 
@@ -223,6 +227,8 @@ def write_trace_jsonl(path, results):
             record_for(entry)["plan_executions"] = entry.get("executions")
         for entry in result.get("victory_roadmap_history", []):
             record_for(entry)["victory_roadmap"] = entry.get("roadmap")
+        for entry in result.get("logistics_plan_history", []):
+            record_for(entry)["logistics_plan"] = entry.get("plan")
         for entry in result.get("emergency_plan_history", []):
             record_for(entry)["emergency_plan"] = entry.get("plan")
         for entry in result.get("factory_relief_history", []):
@@ -314,6 +320,7 @@ def run_single_game(
     plan_revision_history = []
     plan_execution_history = []
     victory_roadmap_history = []
+    logistics_plan_history = []
     emergency_plan_history = []
     factory_relief_history = []
     initial_state = None
@@ -340,6 +347,7 @@ def run_single_game(
             "plan_revision_history": plan_revision_history,
             "plan_execution_history": plan_execution_history,
             "victory_roadmap_history": victory_roadmap_history,
+            "logistics_plan_history": logistics_plan_history,
             "emergency_plan_history": emergency_plan_history,
             "factory_relief_history": factory_relief_history,
             "error": error,
@@ -493,6 +501,17 @@ def run_single_game(
                     "turn": state.get("turn"),
                     "player_id": ai_result.get("player_id", current_player),
                     "roadmap": victory_roadmap,
+                }
+            )
+
+        logistics_plan = ai_result.get("logistics_plan")
+        if logistics_plan is not None:
+            logistics_plan_history.append(
+                {
+                    "round": turn,
+                    "turn": state.get("turn"),
+                    "player_id": ai_result.get("player_id", current_player),
+                    "plan": logistics_plan,
                 }
             )
 
@@ -975,6 +994,12 @@ def main():
     parser.add_argument("--p1", default="V2", help="Player 1 AI Version")
     parser.add_argument("--p2", default="V1", help="Player 2 AI Version")
     parser.add_argument("--games", type=int, default=1, help="Number of games per matchup")
+    parser.add_argument(
+        "--player-order",
+        choices=["both", "as-given", "swapped"],
+        default="both",
+        help="Run both player orders or only one order (default: both)",
+    )
     parser.add_argument("--max-turns", type=int, default=30, help="Maximum turns per game")
     parser.add_argument("--criteria", choices=["objective", "issue54", "issue58"], default="objective", help="Acceptance criteria used for the final report")
     parser.add_argument(
@@ -1015,6 +1040,8 @@ def main():
     issue58_metadata = None
     baseline_payload = None
     if args.criteria == "issue58":
+        if args.player_order != "both":
+            parser.error("Issue #58 fixed protocol requires --player-order both")
         if not args.issue58_protocol:
             parser.error("Issue #58 requires --issue58-protocol")
         if not args.artifact_stage:
@@ -1104,7 +1131,14 @@ def main():
                 parser.error(str(error))
     else:
         seeds = tuple(args.seed for _ in range(args.games))
-        match_specs = build_match_specs(maps, args.p1, args.p2, seeds, grid_type=args.grid_type)
+        match_specs = build_match_specs(
+            maps,
+            args.p1,
+            args.p2,
+            seeds,
+            grid_type=args.grid_type,
+            player_order=args.player_order,
+        )
 
     init_mcp_server()
     all_results = []
@@ -1170,7 +1204,7 @@ def main():
                     result.update(spec)
                     all_results.append(result)
         else:
-            print(json.dumps({"type": "info", "msg": f"Starting batch run: {args.p1} vs {args.p2} on {maps} ({args.games} games x 2 orders per map)"}))
+            print(json.dumps({"type": "info", "msg": f"Starting batch run: {args.p1} vs {args.p2} on {maps} ({len(match_specs)} matches, order={args.player_order})"}))
             for spec in match_specs:
                 result = run_single_game(
                     spec["map"],

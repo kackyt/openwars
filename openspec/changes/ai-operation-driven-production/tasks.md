@@ -208,6 +208,16 @@
 - [ ] B-148. map_3で人間ログ同様に中央・隣接島の確保後、本拠地へのProduce→Load→Drop→Suppress→Captureが同一roadmap_idで継続し、敵増援時にも実績差から補充・replanされることを15ターン以上で検証する
 - [x] B-149. 局地portfolioに首都強襲が無い間もblockedな`AssaultCapital`子作戦を親roadmapへ常在させ、`Rejected / NoFeasibleReplacement`のPlanIdなし候補から生産命令を発行しない
 - [x] B-150. 別島の敵輸送unitは実cargo搭載時だけ将来到着scenarioへ入れ、空輸送ヘリによる全島一律の対空Combat要求を禁止する
+- [x] B-151. V4兵站計画へ固定`route_islands`と未完了`selected_islands`を分離して保持し、現在資金・収入差・敵増援・輸送ETAによる別経路への毎手番切替を廃止する
+- [x] B-152. 地形、施設カテゴリ、恒久収入、両首都からの距離だけで初期兵站経路と地理順を決め、動的な予算・収入・ETAを変えても経路identityが変わらない単体テストを追加する
+- [x] B-153. 予定超過と工程達成では同じ`plan_id / route_islands`の工程・期限だけをrevisionし、逐次増援の完全排除を待たず全施設を所有して兵站利用可能になった島を残工程から除く
+- [ ] B-154. map_3 / Hex / seed 42でV4の`route_island_ids`が対戦中に固定され、`selected_island_ids`が達成時だけ減ること、およびV3との占領・収入・遊兵差をtrace検証する
+- [x] B-155. 汎用clusterを余剰予算の生産要求源から除き、敵首都を目的とする常在`AssaultCapital`へ局地campaign・防衛後の形成予算を所有させる
+- [x] B-156. 最終排除未達の具体購入列を`Forming` trancheとして永続化し、兵站gate・全step生産・`execution_ready`成立まではstaging anchorのDefense任務へ保持する
+- [x] B-157. `leftover_funds / reserved_funds / uncommitted_funds`をtraceへ分離し、首都形成の当日施設・購入費を局地campaignから保護する
+- [x] B-158. 上位防衛・兵站作戦による施設／予算preempt時にPlanIdを維持し、競合施設の未生産列を相対順序ごと繰り下げる。新規空港へ同一編成を前倒し再配置し、同一施設・同一手番の重複を禁止する
+- [x] B-159. 未照合の発注stepを残編成の再評価へ戻し、現在盤面で再配置可能なら同じPlanIdで再発注する単体テストを追加する
+- [x] B-160. map_3 / Hex / seed 42 / V3先攻対V4後攻を10ターン追試し、Plan 1のT2–T10継続、戦闘ヘリ9機・67,500G形成、攻撃3回、T2–T9未割当0を確認する。爆撃機・重戦闘機はT10時点T+1、中央島未制圧、首都攻撃通常T24／悲観T29を未達として残す
 - [x] B-138. Combat plannerの固定最大5生産を撤回し、探索期間内のfacility-turn数から探索深さを導出する。敵増援へ生産手番・移動ETA由来の`available_turn`を与え、手番別の敵到着HP・敵HP除去・自軍HP損耗・攻撃回数をtraceへ出す
 - [x] B-139. map_3 / Hex / seed 42 / 5ターンをV3/V4両席で短期追試し、V4が両席14拠点・収入23,000、T3–5に戦闘機／戦闘ヘリ生産、予測増援の計画算入を確認する。V3両席勝利とV4平均思考2,146msは未達として残す
 - [x] B-140. 固定`排除+2ターン`の占領予測を撤回し、実campaignのPickup/Transit/Drop、cargo位置、Capture距離から得た`friendly_capture_eta`をCombat planへ接続する。輸送編成が無い場合は`occupation_turn = None`として未実行の占領を完了予測しない

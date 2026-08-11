@@ -13,6 +13,7 @@
 //! 同時に立つため、倒してから占領するのではなく並行して進む。
 
 pub mod deployment;
+pub mod logistics_plan;
 pub mod operation;
 pub mod plan_revision;
 pub mod rolling_plan;
@@ -76,9 +77,6 @@ impl ReachCtx {
             .is_reachable(map, registry, start, target, movement_type)
     }
 }
-
-/// 拠点をひとつの作戦にまとめる距離の閾値。
-const OPERATION_CLUSTER_RADIUS: u32 = 3;
 
 /// 同時に抱える作戦の最大数。多すぎると戦力が分散するため制限する。
 const MAX_OPERATIONS: usize = 4;
@@ -170,6 +168,10 @@ struct Operation {
     kind: OperationKind,
     /// 作戦の代表地点（距離計算の基準）
     anchor: GridPosition,
+    /// 編成中の戦力を逐次投入せず集結させる、自軍側の安全な地点。
+    staging_anchor: GridPosition,
+    /// falseの首都作戦は生産だけ進め、攻撃任務へ切り替えない。
+    execution_authorized: bool,
     /// anchorが所有権変化で動いても同じ目的を照合するための拠点集合。
     objective_properties: Vec<GridPosition>,
     /// 防衛の硬い期限と、旧枠の診断にだけ使う作戦時間幅。
@@ -234,6 +236,8 @@ struct PlannedProduction {
 #[derive(Debug)]
 struct PlannedDeployment {
     anchor: GridPosition,
+    staging_anchor: GridPosition,
+    posture: deployment::DeploymentPosture,
     slot_kind: SlotKind,
     priority_enemies: Vec<Entity>,
     threat_horizon: u32,
@@ -319,7 +323,11 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
         })
         .map(|audit| audit.plan_id)
         .collect::<HashSet<_>>();
-    let active_plan_intents = rolling_registry.active_deployment_intents(player_id);
+    let active_plan_intents = rolling_registry.active_deployment_intents(
+        player_id,
+        scan.capital_assault_authorized,
+        scan.capital_staging_anchor,
+    );
     world.insert_resource(rolling_registry);
 
     // 診断traceとは別に、生産完了イベントと照合する作戦意図を永続化する。
@@ -338,6 +346,8 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
                 },
                 unit_type: planned.command.unit_type,
                 anchor: deployment.anchor,
+                staging_anchor: deployment.staging_anchor,
+                posture: deployment.posture,
                 slot_kind: deployment.slot_kind,
                 priority_enemies: deployment.priority_enemies.clone(),
                 threat_horizon: deployment.threat_horizon,
@@ -477,6 +487,21 @@ fn decide_campaign_production_v4(
     world: &mut World,
     player_id: PlayerId,
 ) -> CampaignProductionControl {
+    let turn = world
+        .get_resource::<crate::resources::MatchState>()
+        .map_or(0, |state| state.current_turn_number.0);
+    let due_capital_purchases = world
+        .get_resource::<V4RollingPlanRegistry>()
+        .map(|registry| registry.capital_due_purchases(player_id, turn))
+        .unwrap_or_default();
+    let reserved_capital_facilities = due_capital_purchases
+        .iter()
+        .map(|(facility, _)| *facility)
+        .collect::<HashSet<_>>();
+    let reserved_capital_budget = due_capital_purchases
+        .iter()
+        .map(|(_, cost)| *cost)
+        .fold(0_u32, u32::saturating_add);
     let plan_exists = world
         .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
         .is_some_and(|cache| cache.campaign_production_planned(player_id));
@@ -484,12 +509,31 @@ fn decide_campaign_production_v4(
         let mut cache = world
             .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
             .unwrap_or_default();
-        let next = cache.take_campaign_production_command(player_id);
+        let next = loop {
+            let next = cache.take_campaign_production_command(player_id);
+            match next {
+                Some(command)
+                    if reserved_capital_facilities.contains(&GridPosition {
+                        x: command.target_x,
+                        y: command.target_y,
+                    }) =>
+                {
+                    // 首都編成が今手番に使う施設は、局地購入から外す。
+                    continue;
+                }
+                other => break other,
+            }
+        };
         let blocks_generic = cache.campaign_production_blocks_generic(player_id);
         let generic_budget = cache.campaign_production_generic_budget(player_id);
         world.insert_resource(cache);
         return match next {
             Some(command) => CampaignProductionControl::Command(command),
+            None if reserved_capital_budget > 0 => CampaignProductionControl::ContinueWithSurplus(
+                generic_budget
+                    .unwrap_or(0)
+                    .saturating_add(reserved_capital_budget),
+            ),
             None if blocks_generic => CampaignProductionControl::BlockGeneric,
             None if generic_budget.is_some_and(|budget| budget > 0) => {
                 CampaignProductionControl::ContinueWithSurplus(generic_budget.unwrap_or(0))
@@ -504,7 +548,11 @@ fn decide_campaign_production_v4(
         .map(|portfolio| portfolio.aggregate_missing_requirements())
         .unwrap_or_default();
     if shortfalls.is_empty() {
-        return CampaignProductionControl::Continue;
+        return if reserved_capital_budget > 0 {
+            CampaignProductionControl::ContinueWithSurplus(reserved_capital_budget)
+        } else {
+            CampaignProductionControl::Continue
+        };
     }
 
     // 航空掃討は後段のrolling planへ委譲する。一方、敵領Assaultで輸送・配置枠まで
@@ -529,17 +577,23 @@ fn decide_campaign_production_v4(
         .iter()
         .map(|unit| unit.stats.clone())
         .collect();
+    let campaign_facilities = scan
+        .free_facilities
+        .iter()
+        .filter(|(facility, _)| !reserved_capital_facilities.contains(facility))
+        .copied()
+        .collect::<Vec<_>>();
     let outcome = plan_campaign_with_expansion_denial_reserve(
         player_id,
         &shortfalls,
-        &scan.free_facilities,
+        &campaign_facilities,
         scan.owned_airport_count,
         &scan.available_types,
         &enemy_stats,
         &scan.damage_chart,
         &scan.map,
         &scan.master_data,
-        scan.funds,
+        scan.funds.saturating_sub(reserved_capital_budget),
     );
     let generic_budget = outcome.generic_funds;
     let mut cache = world
@@ -550,13 +604,31 @@ fn decide_campaign_production_v4(
         outcome.commands,
         generic_budget,
     );
-    let next = cache.take_campaign_production_command(player_id);
+    let next = loop {
+        let next = cache.take_campaign_production_command(player_id);
+        match next {
+            Some(command)
+                if reserved_capital_facilities.contains(&GridPosition {
+                    x: command.target_x,
+                    y: command.target_y,
+                }) =>
+            {
+                continue;
+            }
+            other => break other,
+        }
+    };
     let blocks_generic = cache.campaign_production_blocks_generic(player_id);
     let generic_budget = cache.campaign_production_generic_budget(player_id);
     world.insert_resource(cache);
 
     match next {
         Some(command) => CampaignProductionControl::Command(command),
+        None if reserved_capital_budget > 0 => CampaignProductionControl::ContinueWithSurplus(
+            generic_budget
+                .unwrap_or(0)
+                .saturating_add(reserved_capital_budget),
+        ),
         None if blocks_generic => CampaignProductionControl::BlockGeneric,
         None if generic_budget.is_some_and(|budget| budget > 0) => {
             CampaignProductionControl::ContinueWithSurplus(generic_budget.unwrap_or(0))
@@ -578,7 +650,6 @@ struct BoardScan {
     available_types: Vec<(UnitType, UnitStats)>,
     my_units: Vec<UnitSnapshot>,
     enemy_units: Vec<UnitSnapshot>,
-    my_properties: Vec<GridPosition>,
     /// 首都の生産範囲内にある所有空港総数（占有中を含む）
     owned_airport_count: u32,
     /// 自軍が保有していない拠点（中立・敵）
@@ -587,8 +658,29 @@ struct BoardScan {
     enemy_production_slots: u32,
     enemy_facilities: Vec<EnemyFacilitySnapshot>,
     my_income: u32,
-    /// 実campaignの輸送phaseとcargo位置から得た、作戦目標ごとの占領完了ETA。
-    campaign_capture_forecasts: Vec<(GridPosition, Option<u32>)>,
+    /// 島campaignが実行を決めた作戦。汎用clusterへ事後照合せず、このanchorと
+    /// IslandIdをCombat生産計画の入力としてそのまま使う。
+    campaign_objectives: Vec<CampaignPlanningObjective>,
+    /// 首都攻略部隊を前進させてよいのは、固定兵站経路の確保後だけである。
+    capital_assault_authorized: bool,
+    /// 編成中の首都攻略部隊を、生産施設から退避させて集結する自軍拠点。
+    capital_staging_anchor: Option<GridPosition>,
+}
+
+#[derive(Debug, Clone)]
+struct CampaignPlanningObjective {
+    island_id: crate::ai::islands::IslandId,
+    kind: OperationKind,
+    anchor: GridPosition,
+    capture_eta: Option<u32>,
+    /// 固定兵站経路内の工程順。経路外campaignはNone。
+    logistics_rank: Option<u32>,
+    /// 同じ島の敵を別前線へ分配せず、この戦略作戦へ所属させる。
+    forced_target_enemies: HashSet<Entity>,
+    /// 編成中は目的地へ逐次投入せず、ここへ集結させる。
+    staging_anchor: GridPosition,
+    /// falseなら生産は行うが、作戦地点への攻撃任務はまだ発行しない。
+    execution_authorized: bool,
 }
 
 impl BoardScan {
@@ -603,20 +695,50 @@ impl BoardScan {
             .iter()
             .find(|p| p.id == player_id)
             .map(|p| p.funds)?;
-        let campaign_capture_forecasts = world
+        let logistics_plan = world
+            .get_resource::<logistics_plan::V4LogisticsPlanRegistry>()
+            .and_then(|registry| registry.plan(player_id))
+            .cloned();
+        let logistics_ranks = logistics_plan
+            .as_ref()
+            .map(|plan| {
+                plan.route_islands
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, island)| (*island, u32::try_from(rank).unwrap_or(u32::MAX)))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let mut campaign_objectives: Vec<CampaignPlanningObjective> = world
             .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
             .and_then(|cache| cache.campaign_portfolio(player_id))
             .map(|portfolio| {
                 portfolio
-                    .active_offensives
+                    .defenses
                     .iter()
+                    .chain(portfolio.active_offensives.iter())
                     .map(|assignment| {
                         let eta = portfolio
                             .islands
                             .iter()
                             .find(|assessment| assessment.island_id == assignment.island_id)
                             .and_then(|assessment| assessment.friendly_capture_eta);
-                        (assignment.target_position, eta)
+                        CampaignPlanningObjective {
+                            island_id: assignment.island_id,
+                            kind: if assignment.decision
+                                == crate::ai::island_campaign::IslandCampaignDecision::Defend
+                            {
+                                OperationKind::Defense
+                            } else {
+                                OperationKind::Capture
+                            },
+                            anchor: assignment.target_position,
+                            capture_eta: eta,
+                            logistics_rank: logistics_ranks.get(&assignment.island_id).copied(),
+                            forced_target_enemies: HashSet::new(),
+                            staging_anchor: assignment.target_position,
+                            execution_authorized: true,
+                        }
                     })
                     .collect()
             })
@@ -667,7 +789,6 @@ impl BoardScan {
 
         // --- 拠点の走査 ---
         let mut capital_pos = None;
-        let mut my_properties = Vec::new();
         let mut open_properties = Vec::new();
         let mut facilities = Vec::new();
         let mut production_facilities = Vec::new();
@@ -676,6 +797,11 @@ impl BoardScan {
         let mut enemy_facilities = Vec::new();
         let mut my_income = 0u32;
         let mut owned_airport_count = 0u32;
+        let mut owned_properties = Vec::new();
+        let mut enemy_capital = world
+            .get_resource::<victory_roadmap::VictoryRoadmapRegistry>()
+            .and_then(|registry| registry.roadmap(player_id))
+            .and_then(|roadmap| roadmap.enemy_capital);
         {
             let mut q = world.query::<(&GridPosition, &Property)>();
             let mut enemy_capitals = HashMap::new();
@@ -686,6 +812,7 @@ impl BoardScan {
                     && prop.terrain == Terrain::Capital
                 {
                     enemy_capitals.insert(owner, *pos);
+                    enemy_capital.get_or_insert(*pos);
                 }
             }
             for (pos, prop) in q.iter(world) {
@@ -694,7 +821,7 @@ impl BoardScan {
                 match prop.owner_id {
                     Some(owner) if owner == player_id => {
                         my_income = my_income.saturating_add(income);
-                        my_properties.push(*pos);
+                        owned_properties.push((*pos, prop.terrain));
                         if prop.terrain == Terrain::Airport
                             && crate::systems::production::is_within_production_range(
                                 capital_pos.as_slice(),
@@ -758,6 +885,78 @@ impl BoardScan {
             .map(|(unit_type, stats)| (*unit_type, stats.clone()))
             .collect();
 
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let enemy_capital_island = enemy_capital
+            .and_then(|position| island_map.get_island_at(&position))
+            .map(|island| island.id);
+        let home_island = capital_pos
+            .and_then(|position| island_map.get_island_at(&position))
+            .map(|island| island.id);
+        let completed_route_island = logistics_plan.as_ref().and_then(|plan| {
+            plan.route_islands
+                .iter()
+                .rev()
+                .copied()
+                .find(|island| !plan.selected_islands.contains(island))
+        });
+        let staging_anchor = enemy_capital.and_then(|capital| {
+            owned_properties
+                .iter()
+                .filter(|(position, terrain)| {
+                    !master_data.is_production_facility(terrain.as_str())
+                        && completed_route_island.is_none_or(|expected| {
+                            island_map
+                                .get_island_at(position)
+                                .is_some_and(|island| island.id == expected)
+                        })
+                })
+                .min_by_key(|(position, _)| {
+                    map.distance(position.x, position.y, capital.x, capital.y)
+                })
+                .or_else(|| {
+                    owned_properties
+                        .iter()
+                        .filter(|(_, terrain)| {
+                            !master_data.is_production_facility(terrain.as_str())
+                        })
+                        .min_by_key(|(position, _)| {
+                            map.distance(position.x, position.y, capital.x, capital.y)
+                        })
+                })
+                .or_else(|| owned_properties.first())
+                .map(|(position, _)| *position)
+        });
+        let capital_assault_authorized = enemy_capital_island.is_some_and(|capital_island| {
+            home_island == Some(capital_island)
+                || logistics_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.selected_islands.is_empty())
+        });
+        if let (Some(capital), Some(capital_island), Some(staging_anchor)) =
+            (enemy_capital, enemy_capital_island, staging_anchor)
+        {
+            let forced_target_enemies = enemy_units
+                .iter()
+                .filter_map(|enemy| {
+                    island_map
+                        .get_island_at(&enemy.pos)
+                        .is_some_and(|island| island.id == capital_island)
+                        .then_some(enemy.entity)
+                        .flatten()
+                })
+                .collect();
+            campaign_objectives.push(CampaignPlanningObjective {
+                island_id: capital_island,
+                kind: OperationKind::AssaultCapital,
+                anchor: capital,
+                capture_eta: None,
+                logistics_rank: None,
+                forced_target_enemies,
+                staging_anchor,
+                execution_authorized: capital_assault_authorized,
+            });
+        }
+
         Some(BoardScan {
             map,
             master_data,
@@ -768,14 +967,15 @@ impl BoardScan {
             available_types,
             my_units,
             enemy_units,
-            my_properties,
             owned_airport_count,
             open_properties,
             enemy_income,
             enemy_production_slots,
             enemy_facilities,
             my_income,
-            campaign_capture_forecasts,
+            campaign_objectives,
+            capital_assault_authorized,
+            capital_staging_anchor: staging_anchor,
         })
     }
 
@@ -808,47 +1008,6 @@ fn eta_turns(map: &Map, from: &GridPosition, to: &GridPosition, movement: u32) -
     distance.div_ceil(movement.max(1))
 }
 
-/// 位置の集合を、距離 `radius` 以内で連なるまとまりに分割する。
-///
-/// トポロジ依存の隣接判定は `Map::distance` に委譲しているため、
-/// スクエア／ヘックスのどちらでも同じコードで動作する。
-fn cluster_positions(positions: &[GridPosition], map: &Map, radius: u32) -> Vec<Vec<GridPosition>> {
-    // 決定性のために座標順へ整列してから処理する
-    let mut sorted = positions.to_vec();
-    sorted.sort_by_key(|p| (p.x, p.y));
-
-    let mut clusters: Vec<Vec<GridPosition>> = Vec::new();
-    for pos in sorted {
-        // 既存クラスタのいずれかの要素と radius 以内なら合流する
-        let hit = clusters.iter().position(|cluster| {
-            cluster
-                .iter()
-                .any(|member| map.distance(member.x, member.y, pos.x, pos.y) <= radius)
-        });
-        match hit {
-            Some(index) => clusters[index].push(pos),
-            None => clusters.push(vec![pos]),
-        }
-    }
-
-    // 合流により隣接するようになったクラスタ同士を併合する
-    let mut merged: Vec<Vec<GridPosition>> = Vec::new();
-    for cluster in clusters {
-        let hit = merged.iter().position(|existing| {
-            existing.iter().any(|a| {
-                cluster
-                    .iter()
-                    .any(|b| map.distance(a.x, a.y, b.x, b.y) <= radius)
-            })
-        });
-        match hit {
-            Some(index) => merged[index].extend(cluster),
-            None => merged.push(cluster),
-        }
-    }
-    merged
-}
-
 /// 盤面から作戦の一覧を組み立てる。
 fn build_operations(
     scan: &BoardScan,
@@ -859,71 +1018,74 @@ fn build_operations(
         return Vec::new();
     };
 
-    // --- 防衛作戦: 敵が DEFENSE_THREAT_ETA 以内に「実際に到達しうる」自軍拠点 ---
-    // 直線距離だけで脅威と見なすと、海を渡れない敵地上軍まで脅威に数えてしまい、
-    // 盤面中の拠点が防衛作戦に化けて占領作戦を truncate で押し出してしまう。
-    // 脅威かどうかも到達可能性で判定する。
-    let mut threatened: Vec<GridPosition> = Vec::new();
-    for pos in &scan.my_properties {
-        let is_threatened = scan.enemy_units.iter().any(|enemy| {
-            eta_turns(&scan.map, &enemy.pos, pos, enemy.stats.max_movement) <= DEFENSE_THREAT_ETA
-        });
-        if !is_threatened {
-            continue;
-        }
-        // ETA を満たす敵のうち、地形的にもその拠点へ到達できる敵が一体でもいるか
-        let reachable = scan.enemy_units.iter().any(|enemy| {
-            eta_turns(&scan.map, &enemy.pos, pos, enemy.stats.max_movement) <= DEFENSE_THREAT_ETA
-                && ctx.is_reachable(
-                    &scan.map,
-                    &scan.master_data,
-                    (enemy.pos.x, enemy.pos.y),
-                    (pos.x, pos.y),
-                    enemy.stats.movement_type,
-                )
-        });
-        if reachable {
-            threatened.push(*pos);
-        }
-    }
+    // V4の作戦源は、島campaignが選んだCapture/Defenseと、既に実行を始めた
+    // Combat planだけに限定する。全未所有拠点を距離で束ねる第二の目標選定器を
+    // 併用すると、勝利ロードマップ外の前線へ生産予算が流れるためである。
+    let mut raw = active_objectives
+        .iter()
+        .filter(|objective| !objective.properties.is_empty())
+        .map(|objective| (objective.kind, objective.properties.clone()))
+        .collect::<Vec<_>>();
 
-    let mut raw: Vec<(OperationKind, Vec<GridPosition>)> =
-        cluster_positions(&threatened, &scan.map, OPERATION_CLUSTER_RADIUS)
-            .into_iter()
-            .map(|cluster| (OperationKind::Defense, cluster))
-            .collect();
-
-    // --- 占領作戦: 自軍が保有していない拠点のまとまり ---
-    raw.extend(
-        cluster_positions(&scan.open_properties, &scan.map, OPERATION_CLUSTER_RADIUS)
-            .into_iter()
-            .map(|cluster| (OperationKind::Capture, cluster)),
-    );
-
-    // 作戦候補の再クラスタリングだけで進行中計画を消さない。新しい大きなclusterへ
-    // 複数の現行計画を併合すると片方しか継続照合できないため、重なる新規clusterは
-    // いったん除外し、現行計画をそれぞれ独立した目的集合として復元する。
-    raw.retain(|(kind, cluster)| {
-        !active_objectives.iter().any(|objective| {
-            objective.kind == *kind
-                && cluster
+    let island_map = crate::ai::islands::IslandMap::analyze(&scan.map);
+    let campaign_clusters = scan
+        .campaign_objectives
+        .iter()
+        .map(|objective| {
+            let mut properties = if objective.kind == OperationKind::Defense {
+                vec![objective.anchor]
+            } else {
+                scan.open_properties
                     .iter()
-                    .any(|property| objective.properties.contains(property))
+                    .filter(|position| {
+                        island_map
+                            .get_island_at(position)
+                            .is_some_and(|island| island.id == objective.island_id)
+                    })
+                    .copied()
+                    .collect::<Vec<_>>()
+            };
+            if properties.is_empty() {
+                // 全施設取得後のContest/Reinforceも、残敵への保持・掃討作戦として残す。
+                properties.push(objective.anchor);
+            }
+            properties.sort_unstable_by_key(|position| (position.y, position.x));
+            (objective, properties)
+        })
+        .collect::<Vec<_>>();
+    raw.retain(|(kind, cluster)| {
+        !campaign_clusters.iter().any(|(objective, _)| {
+            objective.kind == *kind
+                && cluster.iter().any(|property| {
+                    island_map
+                        .get_island_at(property)
+                        .is_some_and(|island| island.id == objective.island_id)
+                })
         })
     });
     raw.extend(
-        active_objectives
+        campaign_clusters
             .iter()
-            .filter(|objective| !objective.properties.is_empty())
-            .map(|objective| (objective.kind, objective.properties.clone())),
+            .map(|(objective, cluster)| (objective.kind, cluster.clone())),
     );
+
+    let campaign_for_cluster = |kind: OperationKind, cluster: &[GridPosition]| {
+        campaign_clusters
+            .iter()
+            .find_map(|(objective, properties)| {
+                (objective.kind == kind
+                    && cluster.iter().any(|property| properties.contains(property)))
+                .then_some(*objective)
+            })
+    };
 
     // 生産施設から近い作戦を優先して MAX_OPERATIONS 件に絞る
     let mut scored: Vec<(bool, u32, OperationKind, Vec<GridPosition>)> = raw
         .into_iter()
         .filter(|(_, cluster)| !cluster.is_empty())
         .map(|(kind, cluster)| {
-            let anchor = anchor_of(&cluster, scan);
+            let anchor = campaign_for_cluster(kind, &cluster)
+                .map_or_else(|| anchor_of(&cluster, scan), |objective| objective.anchor);
             let lead = facility_lead_time(scan, &anchor, reference.max_movement);
             let continuing = active_objectives.iter().any(|objective| {
                 objective.kind == kind
@@ -935,8 +1097,12 @@ fn build_operations(
         })
         .collect();
     scored.sort_by_key(|(continuing, lead, kind, cluster)| {
+        let logistics_rank = campaign_for_cluster(*kind, cluster)
+            .and_then(|objective| objective.logistics_rank)
+            .unwrap_or(u32::MAX);
         (
             kind.priority_rank(),
+            logistics_rank,
             !*continuing,
             *lead,
             // 同条件なら拠点数の多い（面が広い）作戦を優先
@@ -965,10 +1131,39 @@ fn build_operations(
         }
         scored.push(capture);
     }
+    // 首都作戦は局地作戦より優先度が低いが、候補集合から消してはならない。
+    // 消えると兵站作戦後の資金が勝利条件へ一切予約されなくなる。
+    let rescued_assault = if scored
+        .iter()
+        .any(|(_, _, kind, _)| *kind == OperationKind::AssaultCapital)
+    {
+        None
+    } else {
+        scan.campaign_objectives
+            .iter()
+            .find(|objective| objective.kind == OperationKind::AssaultCapital)
+            .and_then(|objective| {
+                let cluster = campaign_clusters
+                    .iter()
+                    .find(|(candidate, _)| candidate.kind == OperationKind::AssaultCapital)
+                    .map(|(_, properties)| properties.clone())?;
+                let lead = facility_lead_time(scan, &objective.anchor, reference.max_movement);
+                Some((false, lead, OperationKind::AssaultCapital, cluster))
+            })
+    };
+    if let Some(assault) = rescued_assault {
+        if scored.len() >= MAX_OPERATIONS {
+            scored.pop();
+        }
+        scored.push(assault);
+    }
 
     let anchors: Vec<GridPosition> = scored
         .iter()
-        .map(|(_, _, _, cluster)| anchor_of(cluster, scan))
+        .map(|(_, _, kind, cluster)| {
+            campaign_for_cluster(*kind, cluster)
+                .map_or_else(|| anchor_of(cluster, scan), |objective| objective.anchor)
+        })
         .collect();
     let horizons: Vec<u32> = scored
         .iter()
@@ -981,12 +1176,17 @@ fn build_operations(
         .enumerate()
         .map(|(index, (_, lead, kind, cluster))| {
             let anchor = anchors[index];
-            let forced_target_enemies = active_objectives
-                .iter()
-                .find(|objective| objective.kind == kind && objective.properties == cluster)
-                .map(|objective| &objective.target_enemies)
+            let planning_objective = campaign_for_cluster(kind, &cluster);
+            let forced_target_enemies = planning_objective
+                .map(|objective| &objective.forced_target_enemies)
+                .or_else(|| {
+                    active_objectives
+                        .iter()
+                        .find(|objective| objective.kind == kind && objective.properties == cluster)
+                        .map(|objective| &objective.target_enemies)
+                })
                 .unwrap_or(&empty_entity_set);
-            build_operation(
+            let mut operation = build_operation(
                 scan,
                 ctx,
                 &reference,
@@ -997,7 +1197,12 @@ fn build_operations(
                 &cluster,
                 forced_target_enemies,
                 lead,
-            )
+            );
+            if let Some(objective) = planning_objective {
+                operation.staging_anchor = objective.staging_anchor;
+                operation.execution_authorized = objective.execution_authorized;
+            }
+            operation
         })
         .collect()
 }
@@ -1030,6 +1235,9 @@ fn operation_threat_horizon(kind: OperationKind, deploy_lead_time: u32) -> u32 {
     match kind {
         OperationKind::Defense => DEFENSE_THREAT_ETA,
         OperationKind::Capture => deploy_lead_time.saturating_add(CAPTURE_COMPLETION_TURNS),
+        OperationKind::AssaultCapital => {
+            deploy_lead_time.saturating_add(rolling_plan::DEFAULT_SEARCH_TURNS)
+        }
     }
 }
 
@@ -1545,11 +1753,24 @@ fn build_operation(
     let mut slots = derive_slots(&facts);
     // Combat枠は金額の差分ではなく、観測敵が残っていることだけで計画器を起動する。
     // 必要数と完了判定はrolling plannerのHPシミュレーションが決める。
-    slots.destroy_budget = u32::from(!reachable_threats.is_empty());
+    slots.destroy_budget = u32::from(
+        !reachable_threats.is_empty()
+            || (kind == OperationKind::AssaultCapital && enemy_reinforcement_budget > 0),
+    );
+    if kind == OperationKind::AssaultCapital {
+        // 首都準備段階では戦闘編成だけを形成する。占領兵と輸送は兵站路確保後に
+        // IslandCampaignが実行可能な波として組み、ここで汎用任務へ流さない。
+        slots.capture_units = 0;
+        slots.transport_slots = 0;
+        slots.intercept_budget = 0;
+        slots.escort_units = 0;
+    }
 
     Operation {
         kind,
         anchor,
+        staging_anchor: anchor,
+        execution_authorized: true,
         objective_properties: cluster.to_vec(),
         threat_horizon: anchor_index
             .and_then(|index| horizons.get(index).copied())
@@ -1612,8 +1833,21 @@ fn plan_production_with_registry(
         );
     }
 
-    // 同格の作戦は「敵の到達が早い順」に処理する
-    operations.sort_by_key(|op| (op.kind.priority_rank(), op.facts.enemy_contact_eta));
+    // campaignと切り離した汎用clusterが、固定兵站工程のCombat予算を先取りしない。
+    // 防衛を最上位に保ちつつ、Capture同士では兵站工程順、その後に敵接触ETAで並べる。
+    operations.sort_by_key(|op| {
+        let logistics_rank = scan
+            .campaign_objectives
+            .iter()
+            .find(|objective| objective.anchor == op.anchor)
+            .and_then(|objective| objective.logistics_rank)
+            .unwrap_or(u32::MAX);
+        (
+            op.kind.priority_rank(),
+            logistics_rank,
+            op.facts.enemy_contact_eta,
+        )
+    });
     if !allow_structural_slots {
         // 占領要員と輸送役は島嶼キャンペーン側で予約済み。余剰予算を同じ役割へ
         // 二重投入せず、観測済みの敵に対する迎撃・護衛・撃破だけへ使う。
@@ -1754,16 +1988,53 @@ fn plan_production_with_registry(
                     let evaluated = evaluate_fixed_package(&input, &previous.purchases);
                     (previous, evaluated)
                 });
-                let defense_preempted = operation_kind == OperationKind::Capture
-                    && evaluated_continuation
-                        .as_ref()
-                        .is_some_and(|(previous, _)| {
-                            previous.purchases.iter().any(|purchase| {
-                                purchase.build_turn == 0
-                                    && facility_owners.get(&purchase.facility)
-                                        == Some(&OperationKind::Defense)
-                            })
+                let preempted_facilities = evaluated_continuation
+                    .as_ref()
+                    .map(|(previous, evaluated)| {
+                        if evaluated.is_ok() {
+                            return HashSet::new();
+                        }
+                        let mut due = previous
+                            .purchases
+                            .iter()
+                            .filter(|purchase| purchase.build_turn == 0)
+                            .copied()
+                            .collect::<Vec<_>>();
+                        due.sort_unstable_by_key(|purchase| {
+                            (purchase.facility.y, purchase.facility.x, purchase.cost)
                         });
+                        let mut affordable_funds = input.current_funds;
+                        let mut preempted = HashSet::new();
+                        for purchase in due {
+                            let locally_preempted = facility_owners
+                                .get(&purchase.facility)
+                                .is_some_and(|owner| {
+                                    owner.priority_rank() < operation_kind.priority_rank()
+                                });
+                            let campaign_preempted = scan
+                                .production_facilities
+                                .iter()
+                                .any(|(facility, _)| *facility == purchase.facility)
+                                && !scan
+                                    .free_facilities
+                                    .iter()
+                                    .any(|(facility, _)| *facility == purchase.facility);
+                            if locally_preempted || campaign_preempted {
+                                preempted.insert(purchase.facility);
+                            } else if operation_kind == OperationKind::AssaultCapital {
+                                if purchase.cost <= affordable_funds {
+                                    affordable_funds =
+                                        affordable_funds.saturating_sub(purchase.cost);
+                                } else {
+                                    // 上位作戦が当手番の現金を使った場合も、失敗ではなく
+                                    // 当該施設の首都編成列を次手番以降へ繰り下げる。
+                                    preempted.insert(purchase.facility);
+                                }
+                            }
+                        }
+                        preempted
+                    })
+                    .unwrap_or_default();
                 let selected = plan_registry.select(
                     player_id,
                     turn,
@@ -1774,7 +2045,7 @@ fn plan_production_with_registry(
                     evaluated_continuation,
                     candidate_plan,
                     input.hard_deadline,
-                    defense_preempted,
+                    preempted_facilities,
                 );
                 if let Some(plan_id) = selected.plan_id {
                     seen_plan_ids.insert(plan_id);
@@ -2013,6 +2284,9 @@ fn plan_production_with_registry(
 
     plan_registry.reconcile_unseen_plans(player_id, turn, &seen_plan_ids);
     plan_trace.leftover_funds = remaining_funds;
+    plan_trace.reserved_funds =
+        remaining_funds.min(plan_registry.reserved_purchase_cost(player_id));
+    plan_trace.uncommitted_funds = remaining_funds.saturating_sub(plan_trace.reserved_funds);
     (commands, plan_trace)
 }
 
@@ -2168,10 +2442,12 @@ fn combat_plan_input(
             None
         };
     let capture_completion_turn = scan
-        .campaign_capture_forecasts
+        .campaign_objectives
         .iter()
-        .filter(|(target, _)| op.objective_properties.contains(target))
-        .filter_map(|(_, eta)| *eta)
+        .filter(|objective| {
+            objective.anchor == op.anchor || op.objective_properties.contains(&objective.anchor)
+        })
+        .filter_map(|objective| objective.capture_eta)
         .min();
     let planning_horizon = hard_deadline.unwrap_or(DEFAULT_SEARCH_TURNS).max(1);
     let mut enemies = enemies;
@@ -2365,6 +2641,12 @@ fn planned_deployment(
     let priority_enemies = targets.into_iter().map(|target| target.5).collect();
     Some(PlannedDeployment {
         anchor: op.anchor,
+        staging_anchor: op.staging_anchor,
+        posture: if op.kind == OperationKind::AssaultCapital {
+            deployment::DeploymentPosture::Forming
+        } else {
+            deployment::DeploymentPosture::Execute
+        },
         slot_kind,
         priority_enemies,
         threat_horizon: op.threat_horizon,
@@ -3291,26 +3573,42 @@ mod tests {
         GridPosition { x, y }
     }
 
-    /// 近接する拠点は 1 つの作戦にまとまり、離れた拠点は別作戦になる
-    #[test]
-    fn clusters_split_distant_property_groups() {
-        let map = flat_map(20, 5);
-        let positions = vec![pos(1, 1), pos(2, 1), pos(3, 2), pos(15, 1), pos(16, 2)];
-        let clusters = cluster_positions(&positions, &map, OPERATION_CLUSTER_RADIUS);
-        assert_eq!(clusters.len(), 2);
-        let mut sizes: Vec<usize> = clusters.iter().map(|c| c.len()).collect();
-        sizes.sort_unstable();
-        assert_eq!(sizes, vec![2, 3]);
+    fn capture_objective(anchor: GridPosition) -> Vec<CampaignPlanningObjective> {
+        vec![CampaignPlanningObjective {
+            island_id: crate::ai::islands::IslandId(0),
+            kind: OperationKind::Capture,
+            anchor,
+            capture_eta: None,
+            logistics_rank: Some(0),
+            forced_target_enemies: HashSet::new(),
+            staging_anchor: anchor,
+            execution_authorized: true,
+        }]
     }
 
-    /// 距離が閾値以内で連なっていれば、両端が離れていても 1 つの作戦になる
     #[test]
-    fn clusters_chain_through_intermediate_properties() {
-        let map = flat_map(20, 5);
-        let positions = vec![pos(1, 1), pos(4, 1), pos(7, 1), pos(10, 1)];
-        let clusters = cluster_positions(&positions, &map, OPERATION_CLUSTER_RADIUS);
-        assert_eq!(clusters.len(), 1);
-        assert_eq!(clusters[0].len(), 4);
+    fn campaign_objective_is_the_only_capture_source_and_keeps_exact_anchor() {
+        let mut scan = multi_factory_scan();
+        let campaign_anchor = pos(8, 2);
+        scan.campaign_objectives = vec![CampaignPlanningObjective {
+            island_id: crate::ai::islands::IslandId(0),
+            kind: OperationKind::Capture,
+            anchor: campaign_anchor,
+            capture_eta: Some(3),
+            logistics_rank: Some(0),
+            forced_target_enemies: HashSet::new(),
+            staging_anchor: campaign_anchor,
+            execution_authorized: true,
+        }];
+
+        let operations = build_operations(&scan, &mut ReachCtx::default(), &[]);
+        let captures = operations
+            .iter()
+            .filter(|operation| operation.kind == OperationKind::Capture)
+            .collect::<Vec<_>>();
+
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0].anchor, campaign_anchor);
     }
 
     /// 到達ターン数は距離を移動力で割り上げた値になる
@@ -3410,14 +3708,15 @@ mod tests {
                     free_cargo: 0,
                 })
                 .collect(),
-            my_properties: vec![pos(0, 1), pos(1, 1)],
             owned_airport_count: 1,
             open_properties: anchors.clone(),
             enemy_income: 0,
             enemy_production_slots: 0,
             enemy_facilities: Vec::new(),
             my_income: 5_000,
-            campaign_capture_forecasts: Vec::new(),
+            campaign_objectives: Vec::new(),
+            capital_assault_authorized: false,
+            capital_staging_anchor: None,
         };
         let mut ctx = ReachCtx::default();
         let near = build_operation(
@@ -3959,14 +4258,15 @@ mod tests {
                     free_cargo: 0,
                 })
                 .collect(),
-            my_properties: vec![pos(1, 1)],
             owned_airport_count: 3,
             open_properties: enemy_positions.to_vec(),
             enemy_income: 0,
             enemy_production_slots: 0,
             enemy_facilities: Vec::new(),
             my_income: 5_000,
-            campaign_capture_forecasts: Vec::new(),
+            campaign_objectives: capture_objective(enemy_positions[0]),
+            capital_assault_authorized: false,
+            capital_staging_anchor: None,
         };
 
         let (commands, trace) = plan_production(&scan, PlayerId(1), false, &HashMap::new());
@@ -4035,6 +4335,8 @@ mod tests {
         Operation {
             kind,
             anchor: pos(0, 0),
+            staging_anchor: pos(0, 0),
+            execution_authorized: true,
             objective_properties: vec![pos(0, 0)],
             threat_horizon: 0,
             facts: OperationFacts::default(),
@@ -4116,14 +4418,15 @@ mod tests {
                 free_cargo: 2,
             }],
             enemy_units: Vec::new(),
-            my_properties: vec![pos(1, 1)],
             owned_airport_count: 0,
             open_properties: vec![pos(8, 1)],
             enemy_income: 0,
             enemy_production_slots: 0,
             enemy_facilities: Vec::new(),
             my_income: 1000,
-            campaign_capture_forecasts: Vec::new(),
+            campaign_objectives: Vec::new(),
+            capital_assault_authorized: false,
+            capital_staging_anchor: None,
         }
     }
 
@@ -4282,14 +4585,15 @@ mod tests {
             available_types: vec![(UnitType::Infantry, infantry), (UnitType::Tank, tank)],
             my_units: Vec::new(),
             enemy_units: Vec::new(),
-            my_properties: vec![pos(1, 2)],
             owned_airport_count: 0,
             open_properties: vec![pos(6, 2)],
             enemy_income: 0,
             enemy_production_slots: 0,
             enemy_facilities: Vec::new(),
             my_income: 1000,
-            campaign_capture_forecasts: Vec::new(),
+            campaign_objectives: capture_objective(pos(6, 2)),
+            capital_assault_authorized: false,
+            capital_staging_anchor: None,
         }
     }
 
@@ -4355,14 +4659,15 @@ mod tests {
                     free_cargo: 0,
                 },
             ],
-            my_properties: vec![pos(1, 2)],
             owned_airport_count: 0,
             open_properties: vec![pos(6, 2)],
             enemy_income: 0,
             enemy_production_slots: 0,
             enemy_facilities: Vec::new(),
             my_income: 1000,
-            campaign_capture_forecasts: Vec::new(),
+            campaign_objectives: capture_objective(pos(6, 2)),
+            capital_assault_authorized: false,
+            capital_staging_anchor: None,
         }
     }
 
@@ -4426,14 +4731,15 @@ mod tests {
                 hp: 100,
                 free_cargo: 0,
             }],
-            my_properties: vec![pos(1, 1), pos(2, 1)],
             owned_airport_count: 1,
             open_properties: vec![pos(7, 1)],
             enemy_income: 0,
             enemy_production_slots: 0,
             enemy_facilities: Vec::new(),
             my_income: 5_000,
-            campaign_capture_forecasts: Vec::new(),
+            campaign_objectives: capture_objective(pos(7, 1)),
+            capital_assault_authorized: false,
+            capital_staging_anchor: None,
         };
 
         let (commands, trace) = plan_production(&scan, PlayerId(1), false, &HashMap::new());

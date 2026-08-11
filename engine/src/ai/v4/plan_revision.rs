@@ -70,11 +70,22 @@ pub struct PlanMetrics {
 }
 
 impl PlanMetrics {
-    fn from_plan(plan: &ForcePackagePlan) -> Self {
+    fn from_plan(plan: &ForcePackagePlan, kind: OperationKind) -> Self {
+        let formation_turn = (kind == OperationKind::AssaultCapital)
+            .then(|| {
+                plan.purchases
+                    .iter()
+                    .map(|purchase| purchase.build_turn.saturating_add(1))
+                    .max()
+            })
+            .flatten();
         Self {
             // Load/Drop/Capture未接続の移行期間は、固定占領ETAを捏造せず残敵排除ETAで
             // Combat revisionの実行可能性を比較する。作戦完了自体は実施設所有で判定する。
-            completion_turn: plan.occupation_turn.or(plan.elimination_turn),
+            completion_turn: plan
+                .occupation_turn
+                .or(plan.elimination_turn)
+                .or(formation_turn),
             production_cost: plan.production_cost,
             expected_loss: plan.expected_loss,
         }
@@ -83,6 +94,19 @@ impl PlanMetrics {
     fn feasible(self) -> bool {
         self.completion_turn.is_some()
     }
+}
+
+/// 首都の最終撃破へ未到達でも、具体的な購入列が敵HPを減らすなら編成工程として実行できる。
+fn executable_plan(kind: OperationKind, plan: &ForcePackagePlan) -> bool {
+    if plan.feasible {
+        return true;
+    }
+    kind == OperationKind::AssaultCapital
+        && !plan.purchases.is_empty()
+        && plan
+            .target_forecasts
+            .iter()
+            .any(|target| target.remaining_hp < target.initial_hp)
 }
 
 /// 現行計画と新規候補を比較するための、盤面から導出済みの事実。
@@ -220,6 +244,80 @@ struct ScheduledPurchase {
     unit_type: UnitType,
     cost: u32,
     status: PurchaseStatus,
+}
+
+/// 上位作戦が現在の生産枠を使ったとき、未生産列の相対間隔を保ったまま繰り下げる。
+/// 今手番分だけを次手番へ動かすと、元から次手番だった購入と同じ施設で衝突する。
+fn defer_remaining_schedule(
+    steps: &mut [ScheduledPurchase],
+    turn: u32,
+    preempted_facilities: &HashSet<GridPosition>,
+) {
+    for facility in preempted_facilities {
+        let Some(first_pending_turn) = steps
+            .iter()
+            .filter(|step| step.status != PurchaseStatus::Produced && step.facility == *facility)
+            .map(|step| step.scheduled_turn)
+            .min()
+        else {
+            continue;
+        };
+        let delay = turn
+            .saturating_add(1)
+            .saturating_sub(first_pending_turn)
+            .max(1);
+        for step in steps
+            .iter_mut()
+            .filter(|step| step.status != PurchaseStatus::Produced && step.facility == *facility)
+        {
+            step.scheduled_turn = step.scheduled_turn.saturating_add(delay);
+            if matches!(step.status, PurchaseStatus::Issued { .. }) {
+                step.status = PurchaseStatus::Planned;
+            }
+        }
+    }
+}
+
+/// 再評価で前倒しされた同一編成を、PlanId/StepIdを保ったまま永続予定へ反映する。
+fn apply_rescheduled_purchases(
+    steps: &mut [ScheduledPurchase],
+    turn: u32,
+    purchases: &[PlannedPurchase],
+) {
+    let mut available_steps = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| step.status == PurchaseStatus::Planned)
+        .map(|(index, step)| (index, step.step.step_id.0))
+        .collect::<Vec<_>>();
+    available_steps.sort_unstable_by_key(|(_, step_id)| *step_id);
+
+    let mut ordered_purchases = purchases.to_vec();
+    ordered_purchases.sort_unstable_by_key(|purchase| {
+        (
+            purchase.build_turn,
+            purchase.facility.y,
+            purchase.facility.x,
+        )
+    });
+    assert_eq!(
+        available_steps.len(),
+        ordered_purchases.len(),
+        "固定編成の再配置で購入step数が変化してはならない"
+    );
+    for purchase in ordered_purchases {
+        let position = available_steps
+            .iter()
+            .position(|(index, _)| {
+                let step = &steps[*index];
+                step.unit_type == purchase.unit_type && step.cost == purchase.cost
+            })
+            .expect("固定編成の再配置で兵種または費用が変化してはならない");
+        let (step_index, _) = available_steps.remove(position);
+        let step = &mut steps[step_index];
+        step.facility = purchase.facility;
+        step.scheduled_turn = turn.saturating_add(purchase.build_turn);
+    }
 }
 
 /// 生産済みEntityからPlanへ戻す、当該手番の実績snapshot。
@@ -543,6 +641,8 @@ struct StoredPlan {
     target_enemies: HashSet<Entity>,
     steps: Vec<ScheduledPurchase>,
     forecast: PlanMetrics,
+    /// 敵増援を含む最終撃破が実行可能で、兵站gate後に攻撃へ移してよいか。
+    execution_ready: bool,
     last_evaluated_turn: u32,
     execution: PlanExecutionLedger,
 }
@@ -596,8 +696,10 @@ pub(crate) struct ActiveCombatPlanSummary {
 pub(crate) struct ActiveDeploymentIntent {
     pub plan_id: PlanId,
     pub anchor: GridPosition,
+    pub staging_anchor: GridPosition,
     pub priority_enemies: Vec<Entity>,
     pub threat_horizon: u32,
+    pub posture: super::deployment::DeploymentPosture,
 }
 
 /// 選択された実行計画と、永続台帳上の識別情報。
@@ -689,6 +791,8 @@ impl V4RollingPlanRegistry {
     pub(crate) fn active_deployment_intents(
         &self,
         player_id: PlayerId,
+        capital_assault_authorized: bool,
+        capital_staging_anchor: Option<GridPosition>,
     ) -> Vec<ActiveDeploymentIntent> {
         self.active
             .iter()
@@ -696,9 +800,21 @@ impl V4RollingPlanRegistry {
             .map(|plan| {
                 let mut priority_enemies = plan.target_enemies.iter().copied().collect::<Vec<_>>();
                 priority_enemies.sort_unstable_by_key(|entity| entity.to_bits());
+                let formation_complete = plan
+                    .steps
+                    .iter()
+                    .all(|step| step.status == PurchaseStatus::Produced);
+                let posture = if plan.kind != OperationKind::AssaultCapital
+                    || (capital_assault_authorized && formation_complete && plan.execution_ready)
+                {
+                    super::deployment::DeploymentPosture::Execute
+                } else {
+                    super::deployment::DeploymentPosture::Forming
+                };
                 ActiveDeploymentIntent {
                     plan_id: plan.plan_id,
                     anchor: plan.anchor,
+                    staging_anchor: capital_staging_anchor.unwrap_or(plan.anchor),
                     priority_enemies,
                     threat_horizon: plan
                         .execution
@@ -707,8 +823,37 @@ impl V4RollingPlanRegistry {
                         .unwrap_or(plan.last_evaluated_turn)
                         .saturating_sub(plan.last_evaluated_turn)
                         .max(1),
+                    posture,
                 }
             })
+            .collect()
+    }
+
+    /// 現在残高から確保すべき、発行前の永続購入列の総額。
+    pub(crate) fn reserved_purchase_cost(&self, player_id: PlayerId) -> u32 {
+        self.active
+            .iter()
+            .filter(|plan| plan.player_id == player_id)
+            .flat_map(|plan| plan.steps.iter())
+            .filter(|step| step.status == PurchaseStatus::Planned)
+            .map(|step| step.cost)
+            .fold(0_u32, u32::saturating_add)
+    }
+
+    /// 当手番に実行すべき首都編成購入の施設と金額。局地生産が先に枠を埋めないために使う。
+    pub(crate) fn capital_due_purchases(
+        &self,
+        player_id: PlayerId,
+        turn: u32,
+    ) -> Vec<(GridPosition, u32)> {
+        self.active
+            .iter()
+            .filter(|plan| {
+                plan.player_id == player_id && plan.kind == OperationKind::AssaultCapital
+            })
+            .flat_map(|plan| plan.steps.iter())
+            .filter(|step| step.status == PurchaseStatus::Planned && step.scheduled_turn <= turn)
+            .map(|step| (step.facility, step.cost))
             .collect()
     }
 
@@ -761,11 +906,12 @@ impl V4RollingPlanRegistry {
         let purchases = plan
             .steps
             .iter()
-            .filter(|step| step.status == PurchaseStatus::Planned)
-            .filter(|step| step.scheduled_turn >= turn)
+            .filter(|step| step.status != PurchaseStatus::Produced)
             .map(|step| PlannedPurchase {
                 facility: step.facility,
                 unit_type: step.unit_type,
+                // 未照合の発注や期限超過stepも固定編成から落とさず、今手番の
+                // 再配置候補として評価する。
                 build_turn: step.scheduled_turn.saturating_sub(turn),
                 cost: step.cost,
             })
@@ -795,13 +941,14 @@ impl V4RollingPlanRegistry {
         )>,
         candidate: ForcePackagePlan,
         hard_deadline: Option<u32>,
-        higher_priority_defense: bool,
+        preempted_facilities: HashSet<GridPosition>,
     ) -> SelectedPlan {
-        let candidate_metrics = candidate
-            .feasible
-            .then(|| PlanMetrics::from_plan(&candidate));
+        let higher_priority_defense = !preempted_facilities.is_empty();
+        let candidate_executable = executable_plan(kind, &candidate);
+        let candidate_metrics =
+            candidate_executable.then(|| PlanMetrics::from_plan(&candidate, kind));
         let Some((previous, evaluated)) = continuation else {
-            if !candidate.feasible {
+            if !candidate_executable {
                 return SelectedPlan {
                     plan: candidate,
                     plan_id: None,
@@ -837,19 +984,126 @@ impl V4RollingPlanRegistry {
         };
 
         let continuation_error = evaluated.as_ref().err().copied();
-        let continuation_metrics = evaluated.as_ref().ok().map(PlanMetrics::from_plan);
+        let continuation_metrics = evaluated
+            .as_ref()
+            .ok()
+            .map(|plan| PlanMetrics::from_plan(plan, kind));
         let stored = &self.active[previous.index];
-        let enemy_reinforced = target_enemies
-            .difference(&stored.target_enemies)
-            .next()
-            .is_some();
+        let formation_in_progress = kind == OperationKind::AssaultCapital
+            && stored
+                .steps
+                .iter()
+                .any(|step| step.status != PurchaseStatus::Produced);
+        let enemy_reinforced = !formation_in_progress
+            && target_enemies
+                .difference(&stored.target_enemies)
+                .next()
+                .is_some();
         let execution_delay = stored.execution.delay_reason(turn);
+
+        // 兵站・防衛生産が当手番の施設を先に使っただけなら、首都編成を撤回しない。
+        // 実在する同じ施設の購入を次手番へずらし、購入列とPlanIdを維持する。
+        if kind == OperationKind::AssaultCapital
+            && higher_priority_defense
+            && matches!(
+                continuation_error,
+                Some(
+                    FixedPackageError::ProductionSlotUnavailable
+                        | FixedPackageError::FundingUnavailable
+                )
+            )
+        {
+            let (plan_id, revision, purchases) = {
+                let stored = &mut self.active[previous.index];
+                defer_remaining_schedule(&mut stored.steps, turn, &preempted_facilities);
+                stored.target_enemies = target_enemies;
+                stored.last_evaluated_turn = turn;
+                let purchases = stored
+                    .steps
+                    .iter()
+                    .filter(|step| step.status == PurchaseStatus::Planned)
+                    .map(|step| PlannedPurchase {
+                        facility: step.facility,
+                        unit_type: step.unit_type,
+                        build_turn: step.scheduled_turn.saturating_sub(turn),
+                        cost: step.cost,
+                    })
+                    .collect::<Vec<_>>();
+                (stored.plan_id, stored.revision, purchases)
+            };
+            self.record_audit(
+                player_id,
+                turn,
+                plan_id,
+                revision,
+                PlanDisposition::Continued,
+                Some(ReplanReason::HigherPriorityDefense),
+            );
+            let mut deferred = candidate;
+            deferred.production_cost = purchases.iter().map(|purchase| purchase.cost).sum();
+            deferred.purchases = purchases;
+            return SelectedPlan {
+                plan: deferred,
+                plan_id: Some(plan_id),
+                revision: Some(revision),
+                disposition: PlanDisposition::Continued,
+                reason: Some(ReplanReason::HigherPriorityDefense),
+            };
+        }
+        // 発注イベントを実Entityへ照合できなかった1stepだけを理由に、形成済み戦力と
+        // PlanIdを全て捨てない。残編成を現在の生産枠へ載せ直せる場合は、未完了stepを
+        // Plannedへ戻して同じ計画内で再発注する。
+        if kind == OperationKind::AssaultCapital
+            && previous.production_failed
+            && continuation_error.is_none()
+        {
+            let plan = evaluated.expect("再発注可能な固定編成が評価済み");
+            let stored = &mut self.active[previous.index];
+            for step in &mut stored.steps {
+                let failed = match step.status {
+                    PurchaseStatus::Planned => step.scheduled_turn < turn,
+                    PurchaseStatus::Issued { turn: issued_turn } => issued_turn < turn,
+                    PurchaseStatus::Produced => false,
+                };
+                if failed {
+                    step.status = PurchaseStatus::Planned;
+                    step.scheduled_turn = turn;
+                }
+            }
+            apply_rescheduled_purchases(&mut stored.steps, turn, &plan.purchases);
+            stored.anchor = anchor;
+            stored.objective_properties = objective_properties;
+            stored.target_enemies = target_enemies;
+            stored.forecast = PlanMetrics::from_plan(&plan, kind);
+            stored.execution_ready = plan.feasible;
+            stored.last_evaluated_turn = turn;
+            stored.execution.observe_targets(&stored.target_enemies);
+            self.record_audit(
+                player_id,
+                turn,
+                previous.plan_id,
+                previous.revision,
+                PlanDisposition::Continued,
+                Some(ReplanReason::ProductionStepFailed),
+            );
+            return SelectedPlan {
+                plan,
+                plan_id: Some(previous.plan_id),
+                revision: Some(previous.revision),
+                disposition: PlanDisposition::Continued,
+                reason: Some(ReplanReason::ProductionStepFailed),
+            };
+        }
         let decision = decide_lifecycle(ReplanAssessment {
             objective_complete: target_enemies.is_empty() && stored.execution.objectives_secured(),
             production_failed: previous.production_failed,
             continuation_error,
             continuation: continuation_metrics,
-            candidate: candidate_metrics,
+            // 編成trancheの途中は敵が毎ターン増えても購入列を捨てない。生産失敗など
+            // 硬い実行不能だけを先に処理し、完了後に次tranche/最終案を比較する。
+            candidate: (!formation_in_progress)
+                .then_some(candidate_metrics)
+                .flatten(),
             hard_deadline,
             higher_priority_defense,
             enemy_reinforced,
@@ -864,10 +1118,12 @@ impl V4RollingPlanRegistry {
             PlanDisposition::Continued => {
                 let plan = evaluated.expect("継続判定には実行可能な現行案がある");
                 let stored = &mut self.active[previous.index];
+                apply_rescheduled_purchases(&mut stored.steps, turn, &plan.purchases);
                 stored.anchor = anchor;
                 stored.objective_properties = objective_properties;
                 stored.target_enemies = target_enemies;
-                stored.forecast = PlanMetrics::from_plan(&plan);
+                stored.forecast = PlanMetrics::from_plan(&plan, kind);
+                stored.execution_ready = plan.feasible;
                 stored.last_evaluated_turn = turn;
                 stored.execution.observe_targets(&stored.target_enemies);
                 self.record_audit(
@@ -886,7 +1142,7 @@ impl V4RollingPlanRegistry {
                     reason: decision.reason,
                 }
             }
-            PlanDisposition::Revised if candidate.feasible => {
+            PlanDisposition::Revised if candidate_executable => {
                 let revision = PlanRevision(previous.revision.0.saturating_add(1));
                 self.replace_plan(
                     previous.index,
@@ -1103,7 +1359,8 @@ impl V4RollingPlanRegistry {
             objective_properties,
             target_enemies,
             steps: scheduled_steps(plan_id, revision, turn, plan),
-            forecast: PlanMetrics::from_plan(plan),
+            forecast: PlanMetrics::from_plan(plan, kind),
+            execution_ready: plan.feasible,
             last_evaluated_turn: turn,
             execution,
         });
@@ -1129,7 +1386,8 @@ impl V4RollingPlanRegistry {
         stored.objective_properties = objective_properties;
         stored.target_enemies = target_enemies;
         stored.steps = scheduled_steps(stored.plan_id, revision, turn, plan);
-        stored.forecast = PlanMetrics::from_plan(plan);
+        stored.forecast = PlanMetrics::from_plan(plan, stored.kind);
+        stored.execution_ready = plan.feasible;
         stored.last_evaluated_turn = turn;
         stored.execution.observe_targets(&stored.target_enemies);
         stored.execution.update_forecast(turn, plan);
@@ -1229,6 +1487,233 @@ mod tests {
             switch_cost: 0,
             switch_delay: 0,
         }
+    }
+
+    #[test]
+    fn capital_preemption_defers_only_the_affected_facility_without_slot_collision() {
+        let facility = GridPosition { x: 3, y: 4 };
+        let mut steps = vec![
+            ScheduledPurchase {
+                step: PlanStepRef {
+                    plan_id: PlanId(1),
+                    revision: PlanRevision(0),
+                    step_id: PlanStepId(0),
+                },
+                scheduled_turn: 10,
+                facility,
+                unit_type: UnitType::Bomber,
+                cost: 22_000,
+                status: PurchaseStatus::Issued { turn: 9 },
+            },
+            ScheduledPurchase {
+                step: PlanStepRef {
+                    plan_id: PlanId(1),
+                    revision: PlanRevision(0),
+                    step_id: PlanStepId(1),
+                },
+                scheduled_turn: 11,
+                facility,
+                unit_type: UnitType::Bcopters,
+                cost: 7_500,
+                status: PurchaseStatus::Planned,
+            },
+            ScheduledPurchase {
+                step: PlanStepRef {
+                    plan_id: PlanId(1),
+                    revision: PlanRevision(0),
+                    step_id: PlanStepId(2),
+                },
+                scheduled_turn: 9,
+                facility,
+                unit_type: UnitType::Fighter,
+                cost: 16_000,
+                status: PurchaseStatus::Produced,
+            },
+            ScheduledPurchase {
+                step: PlanStepRef {
+                    plan_id: PlanId(1),
+                    revision: PlanRevision(0),
+                    step_id: PlanStepId(3),
+                },
+                scheduled_turn: 10,
+                facility: GridPosition { x: 7, y: 8 },
+                unit_type: UnitType::Bomber,
+                cost: 22_000,
+                status: PurchaseStatus::Planned,
+            },
+        ];
+
+        defer_remaining_schedule(&mut steps, 10, &HashSet::from([facility]));
+
+        assert_eq!(steps[0].scheduled_turn, 11);
+        assert_eq!(steps[0].status, PurchaseStatus::Planned);
+        assert_eq!(steps[1].scheduled_turn, 12);
+        assert_eq!(steps[2].scheduled_turn, 9);
+        assert_eq!(steps[2].status, PurchaseStatus::Produced);
+        assert_eq!(steps[3].scheduled_turn, 10);
+        assert_eq!(steps[3].status, PurchaseStatus::Planned);
+    }
+
+    #[test]
+    fn continued_plan_persists_the_rescheduled_facility_and_turn() {
+        let old_facility = GridPosition { x: 3, y: 4 };
+        let new_facility = GridPosition { x: 7, y: 8 };
+        let mut steps = vec![ScheduledPurchase {
+            step: PlanStepRef {
+                plan_id: PlanId(1),
+                revision: PlanRevision(0),
+                step_id: PlanStepId(0),
+            },
+            scheduled_turn: 12,
+            facility: old_facility,
+            unit_type: UnitType::Bomber,
+            cost: 22_000,
+            status: PurchaseStatus::Planned,
+        }];
+
+        apply_rescheduled_purchases(
+            &mut steps,
+            10,
+            &[PlannedPurchase {
+                facility: new_facility,
+                unit_type: UnitType::Bomber,
+                build_turn: 0,
+                cost: 22_000,
+            }],
+        );
+
+        assert_eq!(steps[0].facility, new_facility);
+        assert_eq!(steps[0].scheduled_turn, 10);
+        assert_eq!(steps[0].step.step_id, PlanStepId(0));
+    }
+
+    #[test]
+    fn capital_budget_preemption_defers_instead_of_withdrawing_the_plan() {
+        let player = PlayerId(1);
+        let enemy = Entity::from_raw(10);
+        let anchor = GridPosition { x: 9, y: 9 };
+        let enemies = HashSet::from([enemy]);
+        let mut registry = V4RollingPlanRegistry::default();
+        let created = registry.select(
+            player,
+            3,
+            OperationKind::AssaultCapital,
+            anchor,
+            vec![anchor],
+            enemies.clone(),
+            None,
+            feasible_plan(0),
+            None,
+            HashSet::new(),
+        );
+        let continuation = registry
+            .continuation(
+                player,
+                3,
+                OperationKind::AssaultCapital,
+                &[anchor],
+                &enemies,
+            )
+            .unwrap();
+        let facility = created.plan.purchases[0].facility;
+
+        let selected = registry.select(
+            player,
+            3,
+            OperationKind::AssaultCapital,
+            anchor,
+            vec![anchor],
+            enemies.clone(),
+            Some((continuation, Err(FixedPackageError::FundingUnavailable))),
+            feasible_plan(0),
+            None,
+            HashSet::from([facility]),
+        );
+
+        assert_eq!(selected.plan_id, created.plan_id);
+        assert_eq!(selected.disposition, PlanDisposition::Continued);
+        assert_eq!(selected.reason, Some(ReplanReason::HigherPriorityDefense));
+        let deferred = registry
+            .continuation(
+                player,
+                4,
+                OperationKind::AssaultCapital,
+                &[anchor],
+                &enemies,
+            )
+            .unwrap();
+        assert!(!deferred.production_failed);
+        assert_eq!(deferred.purchases[0].build_turn, 0);
+    }
+
+    #[test]
+    fn capital_unmatched_issue_retries_the_step_without_replacing_the_plan() {
+        let player = PlayerId(1);
+        let enemy = Entity::from_raw(10);
+        let anchor = GridPosition { x: 9, y: 9 };
+        let enemies = HashSet::from([enemy]);
+        let mut registry = V4RollingPlanRegistry::default();
+        let created = registry.select(
+            player,
+            3,
+            OperationKind::AssaultCapital,
+            anchor,
+            vec![anchor],
+            enemies.clone(),
+            None,
+            feasible_plan(0),
+            None,
+            HashSet::new(),
+        );
+        let purchase = created.plan.purchases[0];
+        let step = registry
+            .current_step_ref(
+                created.plan_id.unwrap(),
+                created.revision.unwrap(),
+                3,
+                purchase,
+            )
+            .unwrap();
+        registry.mark_issued(step, 3);
+        let continuation = registry
+            .continuation(
+                player,
+                4,
+                OperationKind::AssaultCapital,
+                &[anchor],
+                &enemies,
+            )
+            .unwrap();
+        assert!(continuation.production_failed);
+        assert_eq!(continuation.purchases.len(), 1);
+
+        let selected = registry.select(
+            player,
+            4,
+            OperationKind::AssaultCapital,
+            anchor,
+            vec![anchor],
+            enemies.clone(),
+            Some((continuation, Ok(feasible_plan(0)))),
+            feasible_plan(0),
+            None,
+            HashSet::new(),
+        );
+
+        assert_eq!(selected.plan_id, created.plan_id);
+        assert_eq!(selected.disposition, PlanDisposition::Continued);
+        assert_eq!(selected.reason, Some(ReplanReason::ProductionStepFailed));
+        let retried = registry
+            .continuation(
+                player,
+                4,
+                OperationKind::AssaultCapital,
+                &[anchor],
+                &enemies,
+            )
+            .unwrap();
+        assert!(!retried.production_failed);
+        assert_eq!(retried.purchases[0].build_turn, 0);
     }
 
     #[test]
@@ -1346,7 +1831,7 @@ mod tests {
             None,
             feasible_plan(1),
             None,
-            false,
+            HashSet::new(),
         );
         assert_eq!(selected.disposition, PlanDisposition::Created);
         let created_audit = registry
@@ -1389,7 +1874,7 @@ mod tests {
             None,
             feasible_plan(1),
             None,
-            false,
+            HashSet::new(),
         );
 
         assert!(
@@ -1435,7 +1920,7 @@ mod tests {
             None,
             feasible_plan(1),
             None,
-            false,
+            HashSet::new(),
         );
         let plan_id = selected.plan_id.expect("実行可能な計画は永続化される");
 
@@ -1478,7 +1963,7 @@ mod tests {
             None,
             feasible_plan(0),
             None,
-            false,
+            HashSet::new(),
         );
         let purchase = selected.plan.purchases[0];
         let step = registry
@@ -1521,7 +2006,7 @@ mod tests {
             None,
             impossible,
             None,
-            false,
+            HashSet::new(),
         );
         assert_eq!(selected.disposition, PlanDisposition::Rejected);
         assert!(selected.plan_id.is_none());
@@ -1536,6 +2021,51 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    #[test]
+    fn capital_progress_package_is_persisted_as_formation_not_attack() {
+        let player = PlayerId(1);
+        let enemy = Entity::from_raw(10);
+        let mut registry = V4RollingPlanRegistry::default();
+        let mut tranche = feasible_plan(2);
+        tranche.feasible = false;
+        tranche.elimination_turn = None;
+        tranche.occupation_turn = None;
+        tranche.target_forecasts = vec![super::super::rolling_plan::TargetForecast {
+            entity: Some(enemy),
+            unit_type: UnitType::Infantry,
+            available_turn: 0,
+            initial_hp: 100,
+            remaining_hp: 40,
+            destroyed_turn: None,
+        }];
+
+        let selected = registry.select(
+            player,
+            3,
+            OperationKind::AssaultCapital,
+            GridPosition { x: 9, y: 9 },
+            vec![GridPosition { x: 9, y: 9 }],
+            HashSet::from([enemy]),
+            None,
+            tranche,
+            None,
+            HashSet::new(),
+        );
+
+        assert_eq!(selected.disposition, PlanDisposition::Created);
+        assert!(selected.plan_id.is_some());
+        assert_eq!(registry.reserved_purchase_cost(player), 7_500);
+        let intent = registry
+            .active_deployment_intents(player, true, Some(GridPosition { x: 2, y: 2 }))
+            .pop()
+            .unwrap();
+        assert_eq!(
+            intent.posture,
+            super::super::deployment::DeploymentPosture::Forming
+        );
+        assert_eq!(intent.staging_anchor, GridPosition { x: 2, y: 2 });
     }
 
     #[test]
@@ -1627,7 +2157,7 @@ mod tests {
             None,
             feasible_plan(1),
             None,
-            false,
+            HashSet::new(),
         );
         let plan_id = selected.plan_id.expect("永続plan");
 

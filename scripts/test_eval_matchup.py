@@ -150,6 +150,28 @@ class MatchSchedulingTests(unittest.TestCase):
             specs,
         )
 
+    def test_build_match_specs_can_run_only_the_given_player_order(self):
+        specs = build_match_specs(
+            ("map_3",),
+            "V3",
+            "V4",
+            (42,),
+            player_order="as-given",
+        )
+
+        self.assertEqual(
+            [
+                {
+                    "map": "map_3",
+                    "p1": "V3",
+                    "p2": "V4",
+                    "seed": 42,
+                    "grid_type": "hex",
+                }
+            ],
+            specs,
+        )
+
 
 class Issue58PortfolioSchedulingTests(unittest.TestCase):
     def test_v3_v1_protocol_builds_24_games_in_both_orders(self):
@@ -674,4 +696,3 @@ class GridTypeOptionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

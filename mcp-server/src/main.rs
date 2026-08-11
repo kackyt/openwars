@@ -561,6 +561,8 @@ impl OpenWarsAiServer {
             // 勝利条件から島作戦・担当Entity・実行Eventまでを同じIDで追跡する。
             let victory_roadmap =
                 invasion_trace::snapshot_victory_roadmap_for_player(&state.world, active_player_id);
+            let logistics_plan =
+                invasion_trace::snapshot_logistics_plan_for_player(&state.world, active_player_id);
             let emergency_plan =
                 invasion_trace::snapshot_emergency_plan_for_player(&state.world, active_player_id);
             let after_metrics = engine::ai::eval::evaluate_board_with_metrics(
@@ -580,6 +582,7 @@ impl OpenWarsAiServer {
                 "plan_revisions": plan_revisions,
                 "plan_executions": plan_executions,
                 "victory_roadmap": victory_roadmap,
+                "logistics_plan": logistics_plan,
                 "emergency_plan": emergency_plan,
                 "factory_relief": factory_relief,
                 "player_id": active_player_id.0,

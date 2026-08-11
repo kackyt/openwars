@@ -14,7 +14,7 @@ use crate::components::{
     CargoCapacity, Faction, Fuel, GridPosition, Health, PlayerId, Property, Transporting, UnitStats,
 };
 use crate::resources::master_data::{MasterDataRegistry, UnitName};
-use crate::resources::{Map, MovementType, Players, Terrain, UnitType};
+use crate::resources::{Map, MatchState, MovementType, Players, Terrain, UnitType};
 use crate::systems::movement::{OccupantInfo, get_valid_movement_cost};
 use bevy_ecs::prelude::{Entity, World};
 use std::collections::{HashMap, HashSet};
@@ -2164,6 +2164,17 @@ pub fn analyze_island_campaign_excluding(
     let home_island = home_property
         .and_then(|snapshot| island_map.get_island_at(&snapshot.position))
         .map(|island| island.id);
+    let enemy_capital = properties
+        .iter()
+        .find(|snapshot| {
+            snapshot.property.terrain == Terrain::Capital
+                && snapshot.property.owner_id != Some(player_id)
+        })
+        .and_then(|snapshot| {
+            island_map
+                .get_island_at(&snapshot.position)
+                .map(|island| (island.id, snapshot.position))
+        });
     let mut forward_sustainment_coverage = CampaignSustainmentCoverage::default();
     if let Some(home_island) = home_island {
         for snapshot in properties.iter().filter(|snapshot| {
@@ -2357,6 +2368,7 @@ pub fn analyze_island_campaign_excluding(
             sustainment_targets,
             island_income_per_turn: island_facts.island_income_per_turn,
             logistics_prerequisite: false,
+            logistics_priority_rank: None,
             requirement,
             assault_transport_types,
             minimum_combat_purchase_cost,
@@ -2364,14 +2376,37 @@ pub fn analyze_island_campaign_excluding(
             existing_operation,
         });
     }
-    promote_logistics_prerequisite(
-        &mut candidates,
-        &map,
-        friendly_income_per_turn,
-        enemy_income_per_turn,
-        forward_sustainment_coverage,
-        home_position,
-    );
+    if crate::ai::resolve_player_ai_version(world, player_id).uses_operation_driven_production() {
+        let turn = world
+            .get_resource::<MatchState>()
+            .map_or(0, |state| state.current_turn_number.0);
+        let mut logistics_registry = world
+            .remove_resource::<crate::ai::v4::logistics_plan::V4LogisticsPlanRegistry>()
+            .unwrap_or_default();
+        crate::ai::v4::logistics_plan::apply_persistent_logistics_plan(
+            &mut logistics_registry,
+            player_id,
+            turn,
+            &mut candidates,
+            &map,
+            friendly_income_per_turn,
+            enemy_income_per_turn,
+            available_funds,
+            forward_sustainment_coverage,
+            home_position,
+            enemy_capital,
+        );
+        world.insert_resource(logistics_registry);
+    } else {
+        promote_logistics_prerequisite(
+            &mut candidates,
+            &map,
+            friendly_income_per_turn,
+            enemy_income_per_turn,
+            forward_sustainment_coverage,
+            home_position,
+        );
+    }
     apply_logistics_security_requirements(&mut candidates, &units, &island_map, player_id);
     allocate_campaign_portfolio(candidates, pool)
 }

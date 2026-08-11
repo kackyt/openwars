@@ -14,6 +14,7 @@ use engine::ai::island_campaign::{
 use engine::ai::islands::IslandMap;
 use engine::ai::squad::{MissionPhase, MissionType, SquadManager};
 use engine::ai::v4::deployment::V4DeploymentRegistry;
+use engine::ai::v4::logistics_plan::{LogisticsRouteMetrics, V4LogisticsPlanRegistry};
 use engine::ai::v4::plan_revision::{PlanExecutionSnapshot, V4RollingPlanRegistry};
 use engine::ai::v4::trace::{ProductionDecision, ProductionTraceDiagnostics};
 use engine::ai::v4::victory_roadmap::VictoryRoadmapRegistry;
@@ -275,8 +276,12 @@ pub struct ProductionPlanSnapshot {
     pub free_facility_count: usize,
     /// 作戦が立たず fallback に落ちたか
     pub fallback: bool,
-    /// 使い切れずに残った資金
+    /// 生産後の現金残高
     pub leftover_funds: u32,
+    /// 永続作戦の将来購入へ予約済みの現金
+    pub reserved_funds: u32,
+    /// どの作戦にも帰属していない現金
+    pub uncommitted_funds: u32,
     pub operations: Vec<ProductionOperationSnapshot>,
     pub steps: Vec<ProductionStepSnapshot>,
     pub rolling_combat_plans: Vec<RollingCombatPlanSnapshot>,
@@ -418,6 +423,42 @@ pub struct VictoryRoadmapSnapshot {
     pub initial_enemy_unit_count: usize,
     pub current_enemy_unit_count: usize,
     pub operations: Vec<StrategicOperationSnapshot>,
+}
+
+/// 首都攻略開始を早めるために選択・維持している兵站経路と、その比較根拠。
+#[derive(Debug, Serialize)]
+pub struct LogisticsPlanSnapshot {
+    pub plan_id: u64,
+    pub player_id: u32,
+    pub created_turn: u32,
+    pub revised_turn: u32,
+    pub last_observed_turn: u32,
+    pub revision: u32,
+    pub replan_reason: String,
+    /// 作成後は動的な戦況評価で変更しない、地理的な経路identity。
+    pub route_island_ids: Vec<usize>,
+    /// 固定経路のうち、まだ確保を要する島。
+    pub selected_island_ids: Vec<usize>,
+    pub stages: Vec<LogisticsStageSnapshot>,
+    pub direct: LogisticsRouteMetricsSnapshot,
+    pub selected: LogisticsRouteMetricsSnapshot,
+    pub current_forecast: LogisticsRouteMetricsSnapshot,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LogisticsStageSnapshot {
+    pub island_id: usize,
+    pub planned_completion_turn: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LogisticsRouteMetricsSnapshot {
+    pub normal_assault_ready_turn: u32,
+    pub pessimistic_assault_ready_turn: u32,
+    pub projected_income_per_turn: u32,
+    pub acquisition_cost: u32,
+    pub staging_distance: u32,
+    pub unsupported_categories: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -1101,6 +1142,8 @@ pub fn snapshot_production_plan_for_player(
         free_facility_count: plan.free_facility_count,
         fallback: plan.fallback,
         leftover_funds: plan.leftover_funds,
+        reserved_funds: plan.reserved_funds,
+        uncommitted_funds: plan.uncommitted_funds,
         operations,
         steps,
         rolling_combat_plans,
@@ -1310,6 +1353,52 @@ pub fn snapshot_victory_roadmap_for_player(
         initial_enemy_unit_count: roadmap.initial_enemy_unit_count,
         current_enemy_unit_count: roadmap.current_enemy_unit_count,
         operations,
+    })
+}
+
+fn logistics_metrics_snapshot(metrics: LogisticsRouteMetrics) -> LogisticsRouteMetricsSnapshot {
+    LogisticsRouteMetricsSnapshot {
+        normal_assault_ready_turn: metrics.normal_assault_ready_turn,
+        pessimistic_assault_ready_turn: metrics.pessimistic_assault_ready_turn,
+        projected_income_per_turn: metrics.projected_income_per_turn,
+        acquisition_cost: metrics.acquisition_cost,
+        staging_distance: metrics.staging_distance,
+        unsupported_categories: metrics.unsupported_categories,
+    }
+}
+
+pub fn snapshot_logistics_plan_for_player(
+    world: &World,
+    player_id: PlayerId,
+) -> Option<LogisticsPlanSnapshot> {
+    let plan = world
+        .get_resource::<V4LogisticsPlanRegistry>()?
+        .plan(player_id)?;
+    Some(LogisticsPlanSnapshot {
+        plan_id: plan.plan_id,
+        player_id: plan.player_id.0,
+        created_turn: plan.created_turn,
+        revised_turn: plan.revised_turn,
+        last_observed_turn: plan.last_observed_turn,
+        revision: plan.revision,
+        replan_reason: format!("{:?}", plan.replan_reason),
+        route_island_ids: plan.route_islands.iter().map(|island| island.0).collect(),
+        selected_island_ids: plan
+            .selected_islands
+            .iter()
+            .map(|island| island.0)
+            .collect(),
+        stages: plan
+            .stages
+            .iter()
+            .map(|stage| LogisticsStageSnapshot {
+                island_id: stage.island_id.0,
+                planned_completion_turn: stage.planned_completion_turn,
+            })
+            .collect(),
+        direct: logistics_metrics_snapshot(plan.direct_metrics),
+        selected: logistics_metrics_snapshot(plan.selected_metrics),
+        current_forecast: logistics_metrics_snapshot(plan.current_forecast_metrics),
     })
 }
 

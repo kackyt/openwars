@@ -302,6 +302,8 @@ pub(crate) struct IslandCampaignCandidate {
     pub(crate) island_income_per_turn: u32,
     /// 最終攻勢を始める前に確保すべき、収入と継戦能力を担う橋頭堡。
     pub(crate) logistics_prerequisite: bool,
+    /// 永続兵站経路内の工程順。単にROIが高い別島が先行して中核工程を遅らせない。
+    pub(crate) logistics_priority_rank: Option<u32>,
     pub(crate) requirement: IslandCampaignRequirement,
     /// Assaultで必須とする輸送役の構成。生産圏内の実拠点から組める編成だけを保持する。
     pub(crate) assault_transport_types: Vec<UnitType>,
@@ -374,6 +376,7 @@ type OffensivePriorityKey = (
     u8,
     u8,
     u32,
+    u32,
     Reverse<u32>,
     Reverse<u32>,
     u32,
@@ -388,6 +391,7 @@ fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePrior
     // 進行中作戦の専属Entityはassigned_islandで保持する。一方、未割当資源まで
     // 既存Assaultが先取りすると島内Secureが停止するため、作戦種別を先に比較する。
     let existing_rank = u8::from(candidate.existing_operation.is_none());
+    let logistics_rank = candidate.logistics_priority_rank.unwrap_or(u32::MAX);
     let decision_rank = match candidate.assessment.decision {
         _ if candidate.logistics_prerequisite => 0,
         IslandCampaignDecision::Secure => 1,
@@ -401,6 +405,7 @@ fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePrior
         IslandCampaignDecision::Expand | IslandCampaignDecision::Secure => (
             decision_rank,
             existing_rank,
+            logistics_rank,
             candidate
                 .assessment
                 .expansion_payback_turns
@@ -416,6 +421,7 @@ fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePrior
         IslandCampaignDecision::Contest | IslandCampaignDecision::Reinforce => (
             decision_rank,
             existing_rank,
+            logistics_rank,
             0,
             Reverse(0),
             Reverse(0),
@@ -431,6 +437,7 @@ fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePrior
         IslandCampaignDecision::Assault => (
             decision_rank,
             existing_rank,
+            logistics_rank,
             0,
             Reverse(candidate.roi_production_sites),
             Reverse(candidate.assessment.enemy_properties),
@@ -443,6 +450,7 @@ fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePrior
         _ => (
             decision_rank,
             existing_rank,
+            logistics_rank,
             0,
             Reverse(0),
             Reverse(0),
@@ -455,7 +463,7 @@ fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePrior
     }
 }
 
-fn preferred_logistics_target(
+pub(crate) fn preferred_logistics_target(
     candidate: &IslandCampaignCandidate,
     assault: &IslandCampaignCandidate,
     coverage: CampaignSustainmentCoverage,
@@ -531,6 +539,7 @@ pub(crate) fn promote_logistics_prerequisite(
 ) {
     for candidate in candidates.iter_mut() {
         candidate.logistics_prerequisite = false;
+        candidate.logistics_priority_rank = None;
     }
 
     let Some(primary_assault_index) = candidates
@@ -616,6 +625,7 @@ pub(crate) fn promote_logistics_prerequisite(
                 .expect("候補抽出時に兵站施設座標を確認済み");
         let candidate = &mut candidates[index];
         candidate.logistics_prerequisite = true;
+        candidate.logistics_priority_rank = Some(0);
         candidate.target_position = target;
         // 兵站カテゴリの主施設を先頭にしつつ、残る占領兵は別施設を並行確保できるよう残す。
         candidate
@@ -2211,6 +2221,7 @@ mod tests {
             },
             island_income_per_turn: 1_000,
             logistics_prerequisite: false,
+            logistics_priority_rank: None,
             priority_enemy_types: Vec::new(),
             requirement: IslandCampaignRequirement {
                 preferred_transport: Some(UnitType::TransportHelicopter),
@@ -2255,6 +2266,27 @@ mod tests {
                 ]
             })
             .collect()
+    }
+
+    #[test]
+    fn logistics_stage_rank_precedes_local_payback_order() {
+        let mut later_high_roi = expansion_candidate(2, 1);
+        later_high_roi.logistics_prerequisite = true;
+        later_high_roi.logistics_priority_rank = Some(1);
+        let mut first_core_stage = expansion_candidate(3, 9);
+        first_core_stage.logistics_prerequisite = true;
+        first_core_stage.logistics_priority_rank = Some(0);
+
+        let portfolio = allocate_campaign_portfolio(
+            vec![later_high_roi, first_core_stage],
+            CampaignResourcePool {
+                available_funds: 6_000,
+                units: Vec::new(),
+            },
+        );
+
+        assert_eq!(portfolio.active_offensives.len(), 1);
+        assert_eq!(portfolio.active_offensives[0].island_id, IslandId(3));
     }
 
     #[test]
@@ -2814,6 +2846,7 @@ mod tests {
             sustainment_targets: CampaignSustainmentTargets::default(),
             island_income_per_turn: 1_000,
             logistics_prerequisite: false,
+            logistics_priority_rank: None,
             priority_enemy_types: Vec::new(),
             requirement: IslandCampaignRequirement {
                 preferred_transport: None,
@@ -2852,6 +2885,7 @@ mod tests {
             sustainment_targets: CampaignSustainmentTargets::default(),
             island_income_per_turn: 0,
             logistics_prerequisite: false,
+            logistics_priority_rank: None,
             priority_enemy_types: Vec::new(),
             requirement: IslandCampaignRequirement {
                 preferred_transport: None,
@@ -2888,6 +2922,7 @@ mod tests {
             sustainment_targets: CampaignSustainmentTargets::default(),
             island_income_per_turn: 0,
             logistics_prerequisite: false,
+            logistics_priority_rank: None,
             priority_enemy_types: Vec::new(),
             requirement: IslandCampaignRequirement {
                 preferred_transport: None,
@@ -2924,6 +2959,7 @@ mod tests {
             sustainment_targets: CampaignSustainmentTargets::default(),
             island_income_per_turn: 1_000,
             logistics_prerequisite: false,
+            logistics_priority_rank: None,
             priority_enemy_types: vec![UnitType::Infantry],
             requirement: IslandCampaignRequirement {
                 preferred_transport: Some(UnitType::Lander),
@@ -2964,6 +3000,7 @@ mod tests {
             sustainment_targets: CampaignSustainmentTargets::default(),
             island_income_per_turn: 1_000,
             logistics_prerequisite: false,
+            logistics_priority_rank: None,
             priority_enemy_types: Vec::new(),
             requirement: IslandCampaignRequirement {
                 preferred_transport: None,
@@ -3950,6 +3987,7 @@ mod tests {
             sustainment_targets: CampaignSustainmentTargets::default(),
             island_income_per_turn: 1_000,
             logistics_prerequisite: false,
+            logistics_priority_rank: None,
             priority_enemy_types: vec![UnitType::Infantry],
             requirement: IslandCampaignRequirement {
                 preferred_transport: Some(UnitType::Lander),

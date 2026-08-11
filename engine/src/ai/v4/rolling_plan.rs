@@ -8,9 +8,11 @@ use crate::components::{GridPosition, UnitStats};
 use crate::resources::{DamageChart, Map, Terrain, UnitType};
 use crate::systems::combat::calculate_damage_formula;
 use bevy_ecs::prelude::Entity;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-const SEARCH_BEAM_WIDTH: usize = 24;
+// 1施設手番ごとの候補を順に展開するため、同手番に複数施設を使う混成案が
+// beamから落ちない幅を確保する。候補全体の直積を走査する旧方式には戻さない。
+const SEARCH_BEAM_WIDTH: usize = 64;
 pub(crate) const DEFAULT_SEARCH_TURNS: u32 = 12;
 
 #[derive(Debug, Clone)]
@@ -193,42 +195,32 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
     let mut considered = 0_usize;
     let mut truncated = false;
 
-    // 必要unit数を固定上限から逆算しない。探索期間内に実在する生産facility-turnを
-    // 最大深さとし、何体必要かは敵増援を含む実行可能scheduleの結果として得る。
-    let max_new_units = input
-        .production_options
-        .iter()
-        .map(|option| {
-            (
+    // 実在するfacility-turnを1枠ずつ処理する。同じ枠の全兵種を深さごとに
+    // 再展開すると、首都攻略のような長い購入列で同じ組合せを大量に作る。
+    // 「作らない」または「この枠で1兵種を作る」を一度だけ分岐すれば、探索対象を
+    // 減らさずにゲームルールの1施設1生産へ一致させられる。
+    let mut options_by_slot: HashMap<(usize, usize, u32), Vec<usize>> = HashMap::new();
+    for (index, option) in input.production_options.iter().enumerate() {
+        options_by_slot
+            .entry((
                 option.purchase.facility.x,
                 option.purchase.facility.y,
                 option.purchase.build_turn,
-            )
-        })
-        .collect::<HashSet<_>>()
-        .len();
-    for depth in 0..=max_new_units {
+            ))
+            .or_default()
+            .push(index);
+    }
+    let mut slots = options_by_slot.into_iter().collect::<Vec<_>>();
+    slots.sort_unstable_by_key(|((x, y, build_turn), _)| (*build_turn, *y, *x));
+
+    for (slot, option_indices) in slots {
         let mut next = Vec::new();
         for state in &frontier {
-            let mut plan = simulate_state(input, state, search_turns);
-            considered = considered.saturating_add(1);
-            plan.candidates_considered = considered;
-            evaluated.push(plan);
-            if depth == max_new_units {
-                continue;
-            }
-
-            let start_index = state.option_indices.last().map_or(0, |index| index + 1);
-            for option_index in start_index..input.production_options.len() {
-                let option = &input.production_options[option_index];
-                let slot = (
-                    option.purchase.facility.x,
-                    option.purchase.facility.y,
-                    option.purchase.build_turn,
-                );
-                if state.used_slots.contains(&slot) {
-                    continue;
-                }
+            // この枠を使わない案も残す。高額兵種のための現金予約や、将来の別施設を
+            // 選ぶ案を、安い現在購入で強制的に上書きしないためである。
+            next.push(state.clone());
+            for option_index in &option_indices {
+                let option = &input.production_options[*option_index];
                 let next_cost = state.cost.saturating_add(option.purchase.cost);
                 let available_by_build_turn = input.current_funds.saturating_add(
                     input
@@ -239,13 +231,19 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
                     continue;
                 }
                 let mut child = state.clone();
-                child.option_indices.push(option_index);
+                child.option_indices.push(*option_index);
                 child.used_slots.insert(slot);
                 child.cost = next_cost;
                 next.push(child);
             }
         }
 
+        for state in &next {
+            let mut plan = simulate_state(input, state, search_turns);
+            considered = considered.saturating_add(1);
+            plan.candidates_considered = considered;
+            evaluated.push(plan);
+        }
         if next.len() > SEARCH_BEAM_WIDTH {
             truncated = true;
             next.sort_by_key(|state| {
@@ -301,9 +299,127 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
                 )
             })
         })?;
+    // 同じ施設・同じ兵種を後の手番に置く理由がなく、資金も足りるなら最早枠へ寄せる。
+    // beam探索では将来収入で複数機を買う枝が残りやすいため、編成を変えずに
+    // 生産だけを前倒しして「計画はあるのに今手番の施設が遊ぶ」状態を除く。
+    let shifted_purchases = left_shift_purchases(input, &selected.purchases);
+    if shifted_purchases != selected.purchases
+        && let Ok(mut shifted) = evaluate_fixed_package(input, &shifted_purchases)
+    {
+        shifted.candidates_considered = considered;
+        shifted.search_truncated = truncated;
+        selected = shifted;
+    }
     selected.candidates_considered = considered;
     selected.search_truncated = truncated;
     Some(selected)
+}
+
+/// 選ばれた編成を変えず、各購入を最も早い実行可能枠へ移す。
+///
+/// 候補は作戦地点へ交戦可能な施設・兵種だけに絞り込み済みなので、新たに確保した
+/// 生産施設も利用する。仮置きするたび全手番の累積資金を確認し、将来収入の先食いは
+/// 許さない。
+fn left_shift_purchases(
+    input: &RollingPlanInput,
+    purchases: &[PlannedPurchase],
+) -> Vec<PlannedPurchase> {
+    let mut ordered = purchases.to_vec();
+    ordered.sort_unstable_by_key(|purchase| {
+        (
+            purchase.build_turn,
+            purchase.facility.y,
+            purchase.facility.x,
+        )
+    });
+
+    let mut shifted = Vec::with_capacity(ordered.len());
+    let mut used_slots = HashSet::new();
+    // まだ処理していない購入の元予定枠は先に確保する。前倒し先がその枠を奪うと、
+    // 後続購入が元へ戻ったときに同一施設・同一手番の重複が発生する。
+    let mut reserved_original_slots = ordered
+        .iter()
+        .map(|purchase| {
+            (
+                purchase.facility.x,
+                purchase.facility.y,
+                purchase.build_turn,
+            )
+        })
+        .collect::<HashSet<_>>();
+    for purchase in ordered {
+        let original_slot = (
+            purchase.facility.x,
+            purchase.facility.y,
+            purchase.build_turn,
+        );
+        reserved_original_slots.remove(&original_slot);
+        let mut candidates = input
+            .production_options
+            .iter()
+            .map(|option| option.purchase)
+            .filter(|candidate| {
+                candidate.unit_type == purchase.unit_type
+                    && candidate.build_turn <= purchase.build_turn
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|candidate| {
+            (
+                candidate.build_turn,
+                candidate.facility != purchase.facility,
+                candidate.facility.y,
+                candidate.facility.x,
+            )
+        });
+
+        let replacement = candidates.into_iter().find(|candidate| {
+            let slot = (
+                candidate.facility.x,
+                candidate.facility.y,
+                candidate.build_turn,
+            );
+            if used_slots.contains(&slot) || reserved_original_slots.contains(&slot) {
+                return false;
+            }
+            let mut tentative = shifted.clone();
+            tentative.push(*candidate);
+            funding_suffices(input, &tentative)
+        });
+        let selected = replacement.unwrap_or(purchase);
+        used_slots.insert((
+            selected.facility.x,
+            selected.facility.y,
+            selected.build_turn,
+        ));
+        shifted.push(selected);
+    }
+    shifted.sort_unstable_by_key(|purchase| {
+        (
+            purchase.build_turn,
+            purchase.facility.y,
+            purchase.facility.x,
+        )
+    });
+    shifted
+}
+
+fn funding_suffices(input: &RollingPlanInput, purchases: &[PlannedPurchase]) -> bool {
+    let last_turn = purchases
+        .iter()
+        .map(|purchase| purchase.build_turn)
+        .max()
+        .unwrap_or(0);
+    (0..=last_turn).all(|turn| {
+        let required: u32 = purchases
+            .iter()
+            .filter(|purchase| purchase.build_turn <= turn)
+            .map(|purchase| purchase.cost)
+            .sum();
+        let available = input
+            .current_funds
+            .saturating_add(input.income_per_turn.saturating_mul(turn));
+        required <= available
+    })
 }
 
 /// 前revisionの未実行購入列を、現在盤面の生産候補と資金へ載せ直して再評価する。
@@ -314,7 +430,10 @@ pub(crate) fn evaluate_fixed_package(
     input: &RollingPlanInput,
     purchases: &[PlannedPurchase],
 ) -> Result<ForcePackagePlan, FixedPackageError> {
-    let mut indexed = purchases
+    // 編成は固定したまま、現在利用できる新しい施設を含めて最早枠へ載せ直す。
+    // 同じ兵種が同じ時点で前線へ参加できるなら、古い施設座標に計画を縛らない。
+    let scheduled = left_shift_purchases(input, purchases);
+    let mut indexed = scheduled
         .iter()
         .map(|purchase| {
             input
@@ -802,6 +921,105 @@ mod tests {
 
         assert!(!options.is_empty());
         assert!(options.iter().all(|option| option.purchase.build_turn > 0));
+    }
+
+    #[test]
+    fn fixed_formation_uses_a_new_free_facility_without_changing_composition() {
+        let mut input = input();
+        let old_facility = GridPosition { x: 0, y: 0 };
+        let new_facility = GridPosition { x: 2, y: 0 };
+        input.production_options = vec![
+            ProductionPlanOption {
+                purchase: PlannedPurchase {
+                    facility: new_facility,
+                    unit_type: UnitType::Bcopters,
+                    build_turn: 0,
+                    cost: 7_500,
+                },
+                stats: stats(UnitType::Bcopters, 7_500, 6),
+                engageable_enemy_indices: vec![0],
+            },
+            ProductionPlanOption {
+                purchase: PlannedPurchase {
+                    facility: old_facility,
+                    unit_type: UnitType::Bcopters,
+                    build_turn: 1,
+                    cost: 7_500,
+                },
+                stats: stats(UnitType::Bcopters, 7_500, 6),
+                engageable_enemy_indices: vec![0],
+            },
+        ];
+
+        let plan = evaluate_fixed_package(
+            &input,
+            &[PlannedPurchase {
+                facility: old_facility,
+                unit_type: UnitType::Bcopters,
+                build_turn: 1,
+                cost: 7_500,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(plan.purchases.len(), 1);
+        assert_eq!(plan.purchases[0].facility, new_facility);
+        assert_eq!(plan.purchases[0].build_turn, 0);
+        assert_eq!(plan.purchases[0].unit_type, UnitType::Bcopters);
+    }
+
+    #[test]
+    fn schedule_compaction_does_not_steal_an_unprocessed_original_slot() {
+        let mut input = input();
+        let facility = GridPosition { x: 0, y: 0 };
+        input.production_options = vec![
+            ProductionPlanOption {
+                purchase: PlannedPurchase {
+                    facility,
+                    unit_type: UnitType::Bcopters,
+                    build_turn: 1,
+                    cost: 7_500,
+                },
+                stats: stats(UnitType::Bcopters, 7_500, 6),
+                engageable_enemy_indices: vec![0],
+            },
+            ProductionPlanOption {
+                purchase: PlannedPurchase {
+                    facility,
+                    unit_type: UnitType::Bomber,
+                    build_turn: 1,
+                    cost: 20_000,
+                },
+                stats: stats(UnitType::Bomber, 20_000, 6),
+                engageable_enemy_indices: vec![0],
+            },
+        ];
+        let original = vec![
+            PlannedPurchase {
+                facility,
+                unit_type: UnitType::Bcopters,
+                build_turn: 0,
+                cost: 7_500,
+            },
+            PlannedPurchase {
+                facility,
+                unit_type: UnitType::Bomber,
+                build_turn: 1,
+                cost: 20_000,
+            },
+        ];
+
+        let shifted = left_shift_purchases(&input, &original);
+        let slots = shifted
+            .iter()
+            .map(|purchase| (purchase.facility, purchase.build_turn))
+            .collect::<HashSet<_>>();
+
+        assert_eq!(slots.len(), shifted.len());
+        assert!(matches!(
+            evaluate_fixed_package(&input, &original),
+            Err(FixedPackageError::ProductionSlotUnavailable)
+        ));
     }
 
     #[test]

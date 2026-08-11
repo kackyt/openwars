@@ -135,8 +135,12 @@ pub struct ProductionPlanTrace {
     pub steps: Vec<ProductionStepTrace>,
     /// 島ごとの実行可能な混成Combat計画。anchorごとに最終revisionだけを保持する。
     pub rolling_combat_plans: Vec<RollingCombatPlanTrace>,
-    /// 使い切れずに残った資金（余剰資金の積み上がりを検出する）
+    /// 生産後の現金残高。予約済みと無所属を含むため、単独では浪費判定に使わない。
     pub leftover_funds: u32,
+    /// 永続作戦の将来購入へ既に帰属している現金。
+    pub reserved_funds: u32,
+    /// どの作戦・購入列にも帰属していない、真の余剰資金。
+    pub uncommitted_funds: u32,
 }
 
 impl ProductionPlanTrace {
@@ -151,6 +155,8 @@ impl ProductionPlanTrace {
             steps: Vec::new(),
             rolling_combat_plans: Vec::new(),
             leftover_funds: funds,
+            reserved_funds: 0,
+            uncommitted_funds: funds,
         }
     }
 
@@ -197,6 +203,8 @@ impl ProductionTraceDiagnostics {
                 existing.rolling_combat_plans.push(rolling);
             }
             existing.leftover_funds = trace.leftover_funds;
+            existing.reserved_funds = trace.reserved_funds;
+            existing.uncommitted_funds = trace.uncommitted_funds;
             return;
         }
 

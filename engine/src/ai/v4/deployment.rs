@@ -16,6 +16,13 @@ use bevy_ecs::event::EventReader;
 use bevy_ecs::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// 生産済み戦力を作戦地点へ投入するか、編成完了まで集結させるか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeploymentPosture {
+    Execute,
+    Forming,
+}
+
 /// 生産時の混成パッケージ予測。実績auditと同じEntityへ保持する。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeploymentForecast {
@@ -45,6 +52,8 @@ pub(crate) struct PendingDeployment {
     pub facility: GridPosition,
     pub unit_type: UnitType,
     pub anchor: GridPosition,
+    pub staging_anchor: GridPosition,
+    pub posture: DeploymentPosture,
     pub slot_kind: SlotKind,
     pub priority_enemies: Vec<Entity>,
     pub threat_horizon: u32,
@@ -302,6 +311,8 @@ impl V4DeploymentRegistry {
                 continue;
             };
             pending.anchor = intent.anchor;
+            pending.staging_anchor = intent.staging_anchor;
+            pending.posture = intent.posture;
             pending.priority_enemies = intent.priority_enemies.clone();
             pending.threat_horizon = intent.threat_horizon;
         }
@@ -313,6 +324,8 @@ impl V4DeploymentRegistry {
                 continue;
             };
             deployment.intent.anchor = intent.anchor;
+            deployment.intent.staging_anchor = intent.staging_anchor;
+            deployment.intent.posture = intent.posture;
             deployment.intent.priority_enemies = intent.priority_enemies.clone();
             deployment.intent.threat_horizon = intent.threat_horizon;
             if deployment
@@ -393,6 +406,8 @@ impl V4DeploymentRegistry {
                     facility: GridPosition { x: 0, y: 0 },
                     unit_type: UnitType::Fighter,
                     anchor: GridPosition { x: 0, y: 0 },
+                    staging_anchor: GridPosition { x: 0, y: 0 },
+                    posture: DeploymentPosture::Execute,
                     slot_kind: SlotKind::Combat,
                     priority_enemies: vec![target],
                     threat_horizon: 1,
@@ -678,19 +693,28 @@ pub(crate) fn prepare_deployment_squads(
             }
             continue;
         }
-        let (target_entity, target, mission_type) =
-            match resolve_target(world, &mut connectivity, &snapshot) {
-                Some((target_entity, target)) => (Some(target_entity), target, MissionType::Attack),
-                // Combat排除後も対象拠点の占領完了まではPlanを閉じない。
-                // 生産戦力をfree poolへ返さず、anchorで反撃増援を待ち受ける。
-                None if snapshot.intent.plan_step.is_some() => {
-                    (None, snapshot.intent.anchor, MissionType::Defense)
+        let (target_entity, target, mission_type) = match snapshot.intent.posture {
+            // 首都攻略パッケージが揃う前は、個々の生産Entityを敵地へ逐次投入しない。
+            DeploymentPosture::Forming => {
+                (None, snapshot.intent.staging_anchor, MissionType::Defense)
+            }
+            DeploymentPosture::Execute => {
+                match resolve_target(world, &mut connectivity, &snapshot) {
+                    Some((target_entity, target)) => {
+                        (Some(target_entity), target, MissionType::Attack)
+                    }
+                    // Combat排除後も対象拠点の占領完了まではPlanを閉じない。
+                    // 生産戦力をfree poolへ返さず、anchorで反撃増援を待ち受ける。
+                    None if snapshot.intent.plan_step.is_some() => {
+                        (None, snapshot.intent.anchor, MissionType::Defense)
+                    }
+                    None => {
+                        releases.push((entity, snapshot.squad_id));
+                        continue;
+                    }
                 }
-                None => {
-                    releases.push((entity, snapshot.squad_id));
-                    continue;
-                }
-            };
+            }
+        };
 
         // 過去の汎用Squadへ混入していた場合は、このEntityだけを切り離す。
         for squad in &mut manager.squads {
@@ -751,6 +775,8 @@ mod tests {
             facility: GridPosition { x: 2, y: 4 },
             unit_type: UnitType::Fighter,
             anchor: GridPosition { x: 8, y: 8 },
+            staging_anchor: GridPosition { x: 2, y: 4 },
+            posture: DeploymentPosture::Execute,
             slot_kind: SlotKind::Combat,
             priority_enemies: vec![Entity::from_raw(order + 10)],
             threat_horizon: 4,
@@ -954,6 +980,8 @@ mod tests {
                     facility: GridPosition { x: 0, y: 0 },
                     unit_type: UnitType::Tank,
                     anchor: GridPosition { x: 5, y: 0 },
+                    staging_anchor: GridPosition { x: 0, y: 0 },
+                    posture: DeploymentPosture::Execute,
                     slot_kind: SlotKind::Combat,
                     priority_enemies: vec![priority],
                     threat_horizon: 3,
@@ -978,6 +1006,32 @@ mod tests {
         );
         world.insert_resource(registry);
         (world, attacker, priority, transport, capture)
+    }
+
+    #[test]
+    fn capital_formation_waits_at_staging_without_targeting_the_enemy() {
+        let (mut world, attacker, priority, _, _) = deployment_world();
+        {
+            let mut registry = world.resource_mut::<V4DeploymentRegistry>();
+            let deployment = registry.assigned.get_mut(&attacker).unwrap();
+            deployment.intent.posture = DeploymentPosture::Forming;
+            deployment.intent.staging_anchor = GridPosition { x: 1, y: 0 };
+        }
+        let mut manager = SquadManager::default();
+
+        let reserved =
+            prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::new());
+
+        assert!(reserved.contains(&attacker));
+        let squad = manager
+            .squads
+            .iter()
+            .find(|squad| squad.members.contains(&attacker))
+            .unwrap();
+        assert_eq!(squad.mission_type, MissionType::Defense);
+        assert_eq!(squad.target, Some(GridPosition { x: 1, y: 0 }));
+        let registry = world.resource::<V4DeploymentRegistry>();
+        assert_ne!(registry.assigned[&attacker].current_target, Some(priority));
     }
 
     #[test]
@@ -1098,6 +1152,8 @@ mod tests {
                 facility: GridPosition { x: 5, y: 0 },
                 unit_type: UnitType::Bcopters,
                 anchor: GridPosition { x: 5, y: 0 },
+                staging_anchor: GridPosition { x: 5, y: 0 },
+                posture: DeploymentPosture::Execute,
                 slot_kind: SlotKind::Combat,
                 priority_enemies: Vec::new(),
                 threat_horizon: 4,

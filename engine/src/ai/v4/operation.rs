@@ -35,6 +35,8 @@ pub enum OperationKind {
     Defense,
     /// 未保有（中立・敵）拠点を面で獲りにいく前線
     Capture,
+    /// 勝利条件へ接続する敵首都攻略。兵站作戦と並行して戦力を形成する。
+    AssaultCapital,
 }
 
 impl OperationKind {
@@ -43,6 +45,7 @@ impl OperationKind {
         match self {
             OperationKind::Defense => 0,
             OperationKind::Capture => 1,
+            OperationKind::AssaultCapital => 2,
         }
     }
 }
