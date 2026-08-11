@@ -11,6 +11,7 @@
 //! 判定は行わない。値の記録だけを行う純粋なデータ構造である。
 
 use super::operation::{OperationKind, OperationSlots, SlotKind};
+use super::plan_revision::{PlanDisposition, PlanId, PlanRevision, ReplanReason};
 use crate::components::{GridPosition, PlayerId};
 use crate::resources::UnitType;
 use bevy_ecs::prelude::*;
@@ -29,6 +30,12 @@ pub enum ProductionDecision {
     SlotCleared,
     /// 見送り購入（資金を貯めるためループを打ち切った）
     Deferred { unit_type: UnitType, cost: u32 },
+    /// 永続計画に将来手番の購入を予約し、当手番は実行対象がない。
+    Reserved {
+        unit_type: UnitType,
+        cost: u32,
+        build_turn: u32,
+    },
 }
 
 /// 生産ループ 1 反復分の記録。
@@ -76,19 +83,35 @@ pub struct RollingPurchaseTrace {
 pub struct RollingTargetTrace {
     pub entity: Option<Entity>,
     pub unit_type: UnitType,
+    /// 0は観測済み。1以上は敵生産・移動scenarioから予測した前線到着turn。
+    pub available_turn: u32,
     pub initial_hp: u32,
     pub remaining_hp: u32,
     pub destroyed_turn: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CampaignTurnForecastTrace {
+    pub turn: u32,
+    pub enemy_arrival_hp: u32,
+    pub enemy_hp_removed: u32,
+    pub friendly_hp_lost: u32,
+    pub attack_count: u32,
+}
+
 /// 金額充足ではなく、実行可能な混成編成として選択したCombat計画。
 #[derive(Debug, Clone)]
 pub struct RollingCombatPlanTrace {
+    pub plan_id: Option<PlanId>,
+    pub revision: Option<PlanRevision>,
+    pub disposition: PlanDisposition,
+    pub replan_reason: Option<ReplanReason>,
     pub operation_kind: OperationKind,
     pub anchor: GridPosition,
     pub feasible: bool,
     pub purchases: Vec<RollingPurchaseTrace>,
     pub targets: Vec<RollingTargetTrace>,
+    pub turn_forecasts: Vec<CampaignTurnForecastTrace>,
     pub first_attack_turn: Option<u32>,
     pub elimination_turn: Option<u32>,
     pub occupation_turn: Option<u32>,

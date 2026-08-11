@@ -43,6 +43,7 @@ pub fn add_main_game_systems(schedule: &mut Schedule) {
             load_unit_system,
             unload_unit_system,
             wait_unit_system,
+            crate::ai::v4::victory_roadmap::audit_victory_roadmap_system,
             undo_move_system,
             next_phase_system,
             victory_check_system,

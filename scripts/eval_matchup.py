@@ -217,6 +217,12 @@ def write_trace_jsonl(path, results):
             record_for(entry)["production_plan"] = entry.get("plan")
         for entry in result.get("deployment_audit_history", []):
             record_for(entry)["deployment_audit"] = entry.get("audit")
+        for entry in result.get("plan_revision_history", []):
+            record_for(entry)["plan_revisions"] = entry.get("revisions")
+        for entry in result.get("plan_execution_history", []):
+            record_for(entry)["plan_executions"] = entry.get("executions")
+        for entry in result.get("victory_roadmap_history", []):
+            record_for(entry)["victory_roadmap"] = entry.get("roadmap")
         for entry in result.get("emergency_plan_history", []):
             record_for(entry)["emergency_plan"] = entry.get("plan")
         for entry in result.get("factory_relief_history", []):
@@ -305,6 +311,9 @@ def run_single_game(
     idle_audit_history = []
     production_plan_history = []
     deployment_audit_history = []
+    plan_revision_history = []
+    plan_execution_history = []
+    victory_roadmap_history = []
     emergency_plan_history = []
     factory_relief_history = []
     initial_state = None
@@ -328,6 +337,9 @@ def run_single_game(
             "idle_audit_history": idle_audit_history,
             "production_plan_history": production_plan_history,
             "deployment_audit_history": deployment_audit_history,
+            "plan_revision_history": plan_revision_history,
+            "plan_execution_history": plan_execution_history,
+            "victory_roadmap_history": victory_roadmap_history,
             "emergency_plan_history": emergency_plan_history,
             "factory_relief_history": factory_relief_history,
             "error": error,
@@ -448,6 +460,39 @@ def run_single_game(
                     "turn": state.get("turn"),
                     "player_id": ai_result.get("player_id", current_player),
                     "audit": deployment_audit,
+                }
+            )
+
+        plan_revisions = ai_result.get("plan_revisions")
+        if plan_revisions is not None:
+            plan_revision_history.append(
+                {
+                    "round": turn,
+                    "turn": state.get("turn"),
+                    "player_id": ai_result.get("player_id", current_player),
+                    "revisions": plan_revisions,
+                }
+            )
+
+        plan_executions = ai_result.get("plan_executions")
+        if plan_executions is not None:
+            plan_execution_history.append(
+                {
+                    "round": turn,
+                    "turn": state.get("turn"),
+                    "player_id": ai_result.get("player_id", current_player),
+                    "executions": plan_executions,
+                }
+            )
+
+        victory_roadmap = ai_result.get("victory_roadmap")
+        if victory_roadmap is not None:
+            victory_roadmap_history.append(
+                {
+                    "round": turn,
+                    "turn": state.get("turn"),
+                    "player_id": ai_result.get("player_id", current_player),
+                    "roadmap": victory_roadmap,
                 }
             )
 
@@ -1154,6 +1199,8 @@ def main():
                             "idle_audit_history",
                             "production_plan_history",
                             "deployment_audit_history",
+                            "plan_revision_history",
+                            "plan_execution_history",
                             "emergency_plan_history",
                             "factory_relief_history",
                         }

@@ -11,10 +11,7 @@ use bevy_ecs::prelude::Entity;
 use std::collections::HashSet;
 
 const SEARCH_BEAM_WIDTH: usize = 24;
-const MAX_NEW_UNITS: usize = 5;
-const FUTURE_PRODUCTION_TURNS: u32 = 2;
-const DEFAULT_SEARCH_TURNS: u32 = 12;
-const CAPTURE_COMPLETION_TURNS: u32 = 2;
+pub(crate) const DEFAULT_SEARCH_TURNS: u32 = 12;
 
 #[derive(Debug, Clone)]
 pub(crate) struct FriendlyPlanUnit {
@@ -34,6 +31,8 @@ pub(crate) struct EnemyPlanUnit {
     pub position: GridPosition,
     pub hp: u32,
     pub defense_bonus: u32,
+    /// 0は現在盤面の敵。1以上は敵施設から前線へ到着する悲観scenarioの増援。
+    pub available_turn: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -64,6 +63,8 @@ pub(crate) struct RollingPlanInput {
     pub income_per_turn: u32,
     /// 観測可能な盤面イベントから導出した硬い期限。なければNone。
     pub hard_deadline: Option<u32>,
+    /// 実在するcampaign cargoと輸送phaseから予測した占領完了turn。未編成ならNone。
+    pub capture_completion_turn: Option<u32>,
     /// 占領が1ターン遅れる機会損失。実行可能案同士の比較にだけ用いる。
     pub delay_cost_per_turn: u32,
 }
@@ -72,15 +73,27 @@ pub(crate) struct RollingPlanInput {
 pub(crate) struct TargetForecast {
     pub entity: Option<Entity>,
     pub unit_type: UnitType,
+    pub available_turn: u32,
     pub initial_hp: u32,
     pub remaining_hp: u32,
     pub destroyed_turn: Option<u32>,
+}
+
+/// 作戦の各手番で、前線へ入る敵HPと実際に除去できるHPを比較する予測。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CampaignTurnForecast {
+    pub turn: u32,
+    pub enemy_arrival_hp: u32,
+    pub enemy_hp_removed: u32,
+    pub friendly_hp_lost: u32,
+    pub attack_count: u32,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ForcePackagePlan {
     pub purchases: Vec<PlannedPurchase>,
     pub target_forecasts: Vec<TargetForecast>,
+    pub turn_forecasts: Vec<CampaignTurnForecast>,
     pub feasible: bool,
     pub first_attack_turn: Option<u32>,
     pub elimination_turn: Option<u32>,
@@ -89,6 +102,17 @@ pub(crate) struct ForcePackagePlan {
     pub expected_loss: u32,
     pub candidates_considered: usize,
     pub search_truncated: bool,
+}
+
+/// 永続化した生産列を現在盤面へ載せ直せない理由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FixedPackageError {
+    /// 施設喪失・兵種制約・到達性変化により、予定していた生産slotが消えた。
+    ProductionSlotUnavailable,
+    /// 同じ施設・同じ手番を複数の生産へ割り当てている。
+    DuplicateProductionSlot,
+    /// 予定手番までの所持金と収入では購入列を実行できない。
+    FundingUnavailable,
 }
 
 impl ForcePackagePlan {
@@ -107,7 +131,9 @@ impl ForcePackagePlan {
     }
 
     fn completion_for_ordering(&self) -> u32 {
-        self.occupation_turn.unwrap_or(u32::MAX)
+        self.occupation_turn
+            .or(self.elimination_turn)
+            .unwrap_or(u32::MAX)
     }
 
     fn utility_cost(&self, delay_cost_per_turn: u32) -> u64 {
@@ -149,10 +175,11 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
         return Some(ForcePackagePlan {
             purchases: Vec::new(),
             target_forecasts: Vec::new(),
+            turn_forecasts: Vec::new(),
             feasible: true,
             first_attack_turn: None,
             elimination_turn: Some(0),
-            occupation_turn: Some(CAPTURE_COMPLETION_TURNS),
+            occupation_turn: input.capture_completion_turn,
             production_cost: 0,
             expected_loss: 0,
             candidates_considered: 1,
@@ -166,14 +193,28 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
     let mut considered = 0_usize;
     let mut truncated = false;
 
-    for depth in 0..=MAX_NEW_UNITS {
+    // 必要unit数を固定上限から逆算しない。探索期間内に実在する生産facility-turnを
+    // 最大深さとし、何体必要かは敵増援を含む実行可能scheduleの結果として得る。
+    let max_new_units = input
+        .production_options
+        .iter()
+        .map(|option| {
+            (
+                option.purchase.facility.x,
+                option.purchase.facility.y,
+                option.purchase.build_turn,
+            )
+        })
+        .collect::<HashSet<_>>()
+        .len();
+    for depth in 0..=max_new_units {
         let mut next = Vec::new();
         for state in &frontier {
             let mut plan = simulate_state(input, state, search_turns);
             considered = considered.saturating_add(1);
             plan.candidates_considered = considered;
             evaluated.push(plan);
-            if depth == MAX_NEW_UNITS {
+            if depth == max_new_units {
                 continue;
             }
 
@@ -265,6 +306,52 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
     Some(selected)
 }
 
+/// 前revisionの未実行購入列を、現在盤面の生産候補と資金へ載せ直して再評価する。
+///
+/// 新しい最適案を探す関数とは分離し、現行案を候補集合から消さずに比較できるようにする。
+/// ここで失敗した計画だけが「実行不能」として撤回候補になる。
+pub(crate) fn evaluate_fixed_package(
+    input: &RollingPlanInput,
+    purchases: &[PlannedPurchase],
+) -> Result<ForcePackagePlan, FixedPackageError> {
+    let mut indexed = purchases
+        .iter()
+        .map(|purchase| {
+            input
+                .production_options
+                .iter()
+                .position(|option| option.purchase == *purchase)
+                .map(|index| (purchase.build_turn, index))
+                .ok_or(FixedPackageError::ProductionSlotUnavailable)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    indexed.sort_unstable_by_key(|(build_turn, _)| *build_turn);
+
+    let mut state = SearchState::default();
+    for (build_turn, option_index) in indexed {
+        let option = &input.production_options[option_index];
+        let slot = (
+            option.purchase.facility.x,
+            option.purchase.facility.y,
+            build_turn,
+        );
+        if !state.used_slots.insert(slot) {
+            return Err(FixedPackageError::DuplicateProductionSlot);
+        }
+        state.cost = state.cost.saturating_add(option.purchase.cost);
+        let available = input
+            .current_funds
+            .saturating_add(input.income_per_turn.saturating_mul(build_turn));
+        if state.cost > available {
+            return Err(FixedPackageError::FundingUnavailable);
+        }
+        state.option_indices.push(option_index);
+    }
+
+    let search_turns = input.hard_deadline.unwrap_or(DEFAULT_SEARCH_TURNS).max(1);
+    Ok(simulate_state(input, &state, search_turns))
+}
+
 fn remove_dominated(plans: &mut Vec<ForcePackagePlan>) {
     let snapshot = plans.clone();
     plans.retain(|candidate| {
@@ -317,8 +404,21 @@ fn simulate_state(
         })
         .collect();
     let mut first_attack_turn = None;
+    let mut turn_forecasts = Vec::new();
 
     for turn in 1..=search_turns {
+        let enemy_arrival_hp = enemies
+            .iter()
+            .filter(|enemy| enemy.source.available_turn == turn)
+            .map(|enemy| enemy.source.hp)
+            .sum();
+        let enemy_hp_before: u32 = enemies
+            .iter()
+            .filter(|enemy| enemy.source.available_turn <= turn)
+            .map(|enemy| enemy.hp)
+            .sum();
+        let friendly_hp_before: u32 = friendlies.iter().map(|friendly| friendly.hp).sum();
+        let mut attack_count = 0_u32;
         for friendly in &mut friendlies {
             if friendly.hp == 0 || friendly.attacks_left == 0 || turn < friendly.available_turn {
                 continue;
@@ -342,6 +442,7 @@ fn simulate_state(
                 continue;
             }
             first_attack_turn.get_or_insert(turn);
+            attack_count = attack_count.saturating_add(1);
             target.hp = target.hp.saturating_sub(damage);
             friendly.attacks_left = friendly.attacks_left.saturating_sub(1);
             if target.hp == 0 {
@@ -363,6 +464,19 @@ fn simulate_state(
                 }
             }
         }
+        let enemy_hp_after: u32 = enemies
+            .iter()
+            .filter(|enemy| enemy.source.available_turn <= turn)
+            .map(|enemy| enemy.hp)
+            .sum();
+        let friendly_hp_after: u32 = friendlies.iter().map(|friendly| friendly.hp).sum();
+        turn_forecasts.push(CampaignTurnForecast {
+            turn,
+            enemy_arrival_hp,
+            enemy_hp_removed: enemy_hp_before.saturating_sub(enemy_hp_after),
+            friendly_hp_lost: friendly_hp_before.saturating_sub(friendly_hp_after),
+            attack_count,
+        });
         if enemies.iter().all(|enemy| enemy.hp == 0) {
             break;
         }
@@ -373,8 +487,11 @@ fn simulate_state(
         .map(|enemy| enemy.destroyed_turn)
         .collect::<Option<Vec<_>>>()
         .and_then(|turns| turns.into_iter().max());
-    let occupation_turn =
-        elimination_turn.map(|turn| turn.saturating_add(CAPTURE_COMPLETION_TURNS));
+    // 固定2ターンを足さず、実campaignのPickup/Transit/Drop/Capture ETAと残敵排除の
+    // 遅い方を採る。輸送編成がまだ存在しない場合は占領完了を予測しない。
+    let occupation_turn = elimination_turn
+        .zip(input.capture_completion_turn)
+        .map(|(elimination, capture)| elimination.max(capture));
     let expected_loss = friendlies.iter().fold(0_u32, |total, unit| {
         let lost_hp = unit.initial_hp.saturating_sub(unit.hp);
         total.saturating_add(unit.stats.cost.saturating_mul(lost_hp) / 100)
@@ -386,11 +503,13 @@ fn simulate_state(
             .map(|enemy| TargetForecast {
                 entity: enemy.source.entity,
                 unit_type: enemy.source.stats.unit_type,
+                available_turn: enemy.source.available_turn,
                 initial_hp: enemy.source.hp,
                 remaining_hp: enemy.hp,
                 destroyed_turn: enemy.destroyed_turn,
             })
             .collect(),
+        turn_forecasts,
         feasible: elimination_turn.is_some(),
         first_attack_turn,
         elimination_turn,
@@ -434,6 +553,7 @@ fn select_target(
         .iter()
         .enumerate()
         .filter(|(_, enemy)| enemy.hp > 0)
+        .filter(|(_, enemy)| turn >= enemy.source.available_turn)
         .filter_map(|(index, enemy)| {
             if !friendly.engageable_enemy_indices.contains(&index) {
                 return None;
@@ -485,10 +605,11 @@ pub(crate) fn production_options(
     future_facilities: &[(GridPosition, Terrain)],
     available_types: &[(UnitType, UnitStats)],
     master_data: &crate::resources::master_data::MasterDataRegistry,
+    future_turns: u32,
     mut can_reach: impl FnMut(GridPosition, &UnitStats) -> bool,
 ) -> Vec<ProductionPlanOption> {
     let mut options = Vec::new();
-    for build_turn in 0..=FUTURE_PRODUCTION_TURNS {
+    for build_turn in 0..future_turns {
         let facilities = if build_turn == 0 {
             current_facilities
         } else {
@@ -569,6 +690,7 @@ mod tests {
                 position: GridPosition { x: 8, y: 0 },
                 hp: 100,
                 defense_bonus: 0,
+                available_turn: 0,
             }],
             production_options: vec![
                 ProductionPlanOption {
@@ -595,6 +717,7 @@ mod tests {
             current_funds: 30_000,
             income_per_turn: 0,
             hard_deadline: None,
+            capture_completion_turn: None,
             delay_cost_per_turn: 5_000,
         }
     }
@@ -617,6 +740,17 @@ mod tests {
     }
 
     #[test]
+    fn occupation_uses_live_campaign_eta_instead_of_a_fixed_delay() {
+        let mut input = input();
+        input.capture_completion_turn = Some(7);
+
+        let plan = plan_force_package(&input).unwrap();
+
+        assert!(plan.elimination_turn.is_some_and(|turn| turn <= 7));
+        assert_eq!(plan.occupation_turn, Some(7));
+    }
+
+    #[test]
     fn mixed_package_is_selected_when_one_type_cannot_clear_all_targets() {
         let mut input = input();
         input
@@ -634,6 +768,7 @@ mod tests {
             position: GridPosition { x: 8, y: 0 },
             hp: 100,
             defense_bonus: 0,
+            available_turn: 0,
         });
         for option in &mut input.production_options {
             option.engageable_enemy_indices = vec![0, 1];
@@ -661,10 +796,72 @@ mod tests {
             &[(airport, Terrain::Airport)],
             &[(UnitType::Bcopters, stats(UnitType::Bcopters, 7_500, 6))],
             &registry,
+            3,
             |_, _| true,
         );
 
         assert!(!options.is_empty());
         assert!(options.iter().all(|option| option.purchase.build_turn > 0));
+    }
+
+    #[test]
+    fn future_enemy_must_be_removed_before_plan_is_feasible() {
+        let mut input = input();
+        input.enemies.push(EnemyPlanUnit {
+            entity: None,
+            stats: UnitStats {
+                unit_type: UnitType::Infantry,
+                cost: 1_000,
+                can_capture: true,
+                ..UnitStats::mock()
+            },
+            position: GridPosition { x: 8, y: 0 },
+            hp: 100,
+            defense_bonus: 0,
+            available_turn: 5,
+        });
+        for option in &mut input.production_options {
+            option.engageable_enemy_indices = vec![0, 1];
+        }
+
+        let plan = plan_force_package(&input).unwrap();
+
+        assert!(plan.feasible);
+        assert!(plan.elimination_turn.is_some_and(|turn| turn >= 5));
+        assert_eq!(plan.target_forecasts.len(), 2);
+        assert_eq!(
+            plan.turn_forecasts
+                .iter()
+                .find(|forecast| forecast.turn == 5)
+                .map(|forecast| forecast.enemy_arrival_hp),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn search_depth_comes_from_facility_turns_not_a_fixed_unit_cap() {
+        let mut input = input();
+        input
+            .damage_chart
+            .insert_damage(UnitType::Bcopters, UnitType::Infantry, 100);
+        input.production_options.truncate(1);
+        input.production_options[0].stats.max_ammo1 = 1;
+        input.production_options[0].engageable_enemy_indices = (0..6).collect();
+        for build_turn in 1..6 {
+            let mut option = input.production_options[0].clone();
+            option.purchase.build_turn = build_turn;
+            input.production_options.push(option);
+        }
+        for raw in 8..13 {
+            let mut enemy = input.enemies[0].clone();
+            enemy.entity = Some(Entity::from_raw(raw));
+            input.enemies.push(enemy);
+        }
+        input.current_funds = 45_000;
+
+        let plan = plan_force_package(&input).unwrap();
+
+        assert!(plan.feasible);
+        assert_eq!(plan.purchases.len(), 6);
     }
 }

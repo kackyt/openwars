@@ -1520,6 +1520,7 @@ mod tests {
             preferred_transport: None,
             transport_slots: 0,
             capture_units: 0,
+            ground_combat_units: 0,
             combat_budget: 0,
             total_budget: 0,
         };
@@ -1528,6 +1529,7 @@ mod tests {
             decision: crate::ai::island_campaign::IslandCampaignDecision::Expand,
             target_position: target,
             capture_target_positions: vec![target],
+            priority_enemy_types: Vec::new(),
             requirement: empty_requirement.clone(),
             purchase_shortfall: empty_requirement,
             allocated_budget: 0,

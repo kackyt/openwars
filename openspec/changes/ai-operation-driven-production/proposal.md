@@ -120,6 +120,11 @@
   - 初期実装は既存V4の占領・輸送キャンペーンを維持し、Combat生産だけを純粋な混成パッケージ探索へ置換する。現在空き施設と、占有中を含む将来2手番の全所有生産施設を別slotとして扱う
   - 既存Combat戦力はV4局地Attack任務へ接続済みのEntityだけを数え、各手番で最寄りの1作戦へ排他的に帰属させる。占領・輸送任務中unitや同一unitの複数前線への二重計上を禁止する
   - 生産時の敵別HP・初攻撃・撃破・占領完了・費用・損耗予測を、実Entityの攻撃・撃破・与被害実績と同じtraceへ出力する
+  - 実行可能と判定したCombat生産列は`plan_id / revision / step_id`付きで手番間に保持し、将来手番の購入を翌手番の再探索だけで破棄しない。各手番で前revisionの未実行列を現在の施設・資金・敵HPへ載せ直し、違法・生産失敗、硬い期限逸脱、目的達成、切替損失込みのPareto優越、上位防衛preemptの場合だけ撤回またはrevision更新する
+  - 実行不能な候補は永続台帳へ登録せず、現行案も代替案も実行不能なら理由付きで撤回する。完了・撤回した`plan_id`の局地任務保護を解除し、既存Entityを上位防衛または汎用任務へ返す
+  - `PlanExecutionLedger`へ累計承認／実生産費、配属・稼働Entity、初攻撃、敵別HP・撃破、損耗、対象施設所有、増援を毎ターン集約し、初攻撃・排除・占領の予定超過と敵増援を明示的なrevision理由へ戻す
+  - Combat作戦の完了を「初期対象1体の消滅」ではなく、現行の優先敵集合の排除と対象施設の所有完了の両方で判定する。排除後・占領前の戦力はanchor防衛へ残し、増援時は同じPlanの全配属Entityへ新しい敵集合を再配布する
+  - 既存Combat Entityの見積計上には最寄り作戦だけでなく`plan_id`の一致も要求し、別Planの戦力を借りた購入0の架空計画を禁止する
 
 - **撤回・診断限定**: 撃破・迎撃候補の攻撃回数付き限界収益評価
   - 敵1体を最寄り作戦1件へ一意に帰属させ、HP補正済み残存戦力と戦略優先度を別フィールドで管理する
@@ -159,10 +164,12 @@
 - `engine/src/ai/island_campaign.rs` / `island_campaign_analysis.rs`: 加えて、相対収入と地上／航空／海上の前進補給網から兵站前提作戦を導出し、新規Assaultとの依存関係を管理する
 - `engine/src/ai/v4/deployment.rs`: V4のpending deployment、実Entity照合、局地標的追跡、fallback、攻撃実績監査を保持
 - `engine/src/ai/v4/rolling_plan.rs`（新規）: 島作戦snapshot、混成編成候補、計画revision、Pareto前線、予実差、再計画理由を保持する純粋な計画器
+- `engine/src/ai/v4/plan_revision.rs`（新規）: 実行可能なCombat生産列を手番間で保持し、固定列再評価、step実績照合、Plan単位の予実台帳、増援・遅延判定、盤面事実による継続・revision・完了・撤回を管理する
 - `engine/src/ai/operation_simulation.rs`（新規）: 本番ルールと共有する移動・戦闘・輸送・占領のターン単位予測を提供し、V4検証後にV3からも再利用する
 - `engine/src/ai/squad.rs`: 自力展開戦力と輸送 cargo の分離、複数 cargo の Pickup 進行。加えてV4局地任務をcampaign再配分とgeneric free poolより先に予約する
 - `engine/src/ai/engine.rs`: Drop に参加した輸送役と cargo の双方を当該ターンの行動済みとして記録。加えてV1〜V4共通の攻撃・接近評価へ、搭載兵力と占領阻止を含む戦略標的価値を導入し、V4では局地任務の現在標的Entityを通常標的より優先する
-- `engine/src/ai/engine.rs`: 航空unitの候補移動を、移動後も最寄りの自軍空港へ日次消費込みで帰投可能な範囲へ制限する
+- `engine/src/ai/engine.rs`: 航空unitの候補移動を、移動後も最寄りの自軍空港へ日次消費込みで帰投可能な範囲へ制限する。空港喪失などで既に安全圏外なら、帰還不足を悪化させず空港距離を縮める回復移動を許す
 - `engine/src/ai/emergency.rs`: 中立拠点InterceptionはV4局地任務Entityをpreemptせず、自軍所有拠点への脅威だけがpreemptできる責務境界を追加
 - `strategy.rs` / `resources/`: Stage 2では変更しない。新しい予約台帳 Resource も追加しない
 - 対戦評価: `scripts/eval_matchup.py` による V4 vs V3 / V4 vs V1 の勝率・ZOC 支配面積・ターン収入の比較検証が必須
+- `mcp-server/src/invasion_trace.rs` / `scripts/eval_matchup.py`: `plan_id / revision / step_id`、継続・撤回理由、残step・残費用に加え、生産・稼働・初攻撃・敵別HP／撃破・損耗・占領のPlan予実をターンJSONLへ保持する

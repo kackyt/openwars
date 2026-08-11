@@ -3670,6 +3670,14 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         }
     }
 
+    if is_v4 {
+        crate::ai::v4::victory_roadmap::reconcile_campaign_roadmap(
+            world,
+            perspective_player,
+            &strategy.campaign_portfolio,
+            &manager,
+        );
+    }
     world.insert_resource(manager);
 }
 
@@ -6750,6 +6758,7 @@ mod tests {
             preferred_transport: Some(UnitType::TransportHelicopter),
             transport_slots: 2,
             capture_units: 1,
+            ground_combat_units: 0,
             combat_budget: 0,
             total_budget: 5_000,
         };
@@ -6758,6 +6767,7 @@ mod tests {
             decision: crate::ai::island_campaign::IslandCampaignDecision::Expand,
             target_position: GridPosition { x: 2, y: 0 },
             capture_target_positions: vec![GridPosition { x: 2, y: 0 }],
+            priority_enemy_types: Vec::new(),
             requirement: requirement.clone(),
             purchase_shortfall: requirement,
             allocated_budget: 5_000,
@@ -8282,6 +8292,7 @@ mod tests {
             preferred_transport: None,
             transport_slots: 0,
             capture_units: 0,
+            ground_combat_units: 0,
             combat_budget: 2_000,
             total_budget: 2_000,
         };
@@ -8290,11 +8301,13 @@ mod tests {
             decision: IslandCampaignDecision::Defend,
             target_position: GridPosition { x: 0, y: 0 },
             capture_target_positions: vec![GridPosition { x: 0, y: 0 }],
+            priority_enemy_types: Vec::new(),
             requirement: requirement.clone(),
             purchase_shortfall: IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
                 capture_units: 0,
+                ground_combat_units: 0,
                 combat_budget: 0,
                 total_budget: 0,
             },
@@ -8374,6 +8387,7 @@ mod tests {
             preferred_transport: None,
             transport_slots: 0,
             capture_units: 0,
+            ground_combat_units: 0,
             combat_budget: battleship_stats.cost,
             total_budget: battleship_stats.cost,
         };
@@ -8382,11 +8396,13 @@ mod tests {
             decision: IslandCampaignDecision::Contest,
             target_position: enemy_position,
             capture_target_positions: vec![enemy_position],
+            priority_enemy_types: Vec::new(),
             requirement: requirement.clone(),
             purchase_shortfall: IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
                 capture_units: 0,
+                ground_combat_units: 0,
                 combat_budget: 0,
                 total_budget: 0,
             },
@@ -8474,6 +8490,7 @@ mod tests {
             preferred_transport: None,
             transport_slots: 0,
             capture_units: 0,
+            ground_combat_units: 0,
             combat_budget: 7_000,
             total_budget: 7_000,
         };
@@ -8482,11 +8499,13 @@ mod tests {
             decision: IslandCampaignDecision::Contest,
             target_position: enemy_position,
             capture_target_positions: vec![enemy_position],
+            priority_enemy_types: Vec::new(),
             requirement: requirement.clone(),
             purchase_shortfall: IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
                 capture_units: 0,
+                ground_combat_units: 0,
                 combat_budget: 0,
                 total_budget: 0,
             },
@@ -8599,6 +8618,7 @@ mod tests {
             preferred_transport: None,
             transport_slots: 0,
             capture_units: 0,
+            ground_combat_units: 0,
             combat_budget: 14_000,
             total_budget: 14_000,
         };
@@ -8607,11 +8627,13 @@ mod tests {
             decision: IslandCampaignDecision::Contest,
             target_position: enemy_position,
             capture_target_positions: vec![enemy_position],
+            priority_enemy_types: Vec::new(),
             requirement: requirement.clone(),
             purchase_shortfall: IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
                 capture_units: 0,
+                ground_combat_units: 0,
                 combat_budget: 0,
                 total_budget: 0,
             },
@@ -8731,6 +8753,7 @@ mod tests {
             preferred_transport: None,
             transport_slots: 0,
             capture_units: 2,
+            ground_combat_units: 0,
             combat_budget: 0,
             total_budget: 2_000,
         };
@@ -8739,11 +8762,13 @@ mod tests {
             decision: IslandCampaignDecision::Contest,
             target_position: assigned_airport,
             capture_target_positions: vec![assigned_airport, nearby_city],
+            priority_enemy_types: Vec::new(),
             requirement: requirement.clone(),
             purchase_shortfall: IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
                 capture_units: 0,
+                ground_combat_units: 0,
                 combat_budget: 0,
                 total_budget: 0,
             },
@@ -8841,6 +8866,7 @@ mod tests {
             preferred_transport: None,
             transport_slots: 0,
             capture_units: 0,
+            ground_combat_units: 0,
             combat_budget: 14_000,
             total_budget: 14_000,
         };
@@ -8849,11 +8875,13 @@ mod tests {
             decision: IslandCampaignDecision::Contest,
             target_position: enemy_position,
             capture_target_positions: vec![enemy_position],
+            priority_enemy_types: Vec::new(),
             requirement: requirement.clone(),
             purchase_shortfall: IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
                 capture_units: 0,
+                ground_combat_units: 0,
                 combat_budget: 0,
                 total_budget: 0,
             },
@@ -8945,6 +8973,7 @@ mod tests {
             preferred_transport: None,
             transport_slots: 0,
             capture_units: 0,
+            ground_combat_units: 0,
             combat_budget: 7_000,
             total_budget: 7_000,
         };
@@ -8953,11 +8982,13 @@ mod tests {
             decision: IslandCampaignDecision::Contest,
             target_position: enemy_position,
             capture_target_positions: vec![enemy_position],
+            priority_enemy_types: Vec::new(),
             requirement: requirement.clone(),
             purchase_shortfall: IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
                 capture_units: 0,
+                ground_combat_units: 0,
                 combat_budget: 0,
                 total_budget: 0,
             },
@@ -8999,6 +9030,7 @@ mod tests {
             preferred_transport: Some(UnitType::TransportHelicopter),
             transport_slots: 2,
             capture_units: 2,
+            ground_combat_units: 0,
             combat_budget: 0,
             total_budget: 4_000,
         };
@@ -9007,6 +9039,7 @@ mod tests {
             decision: IslandCampaignDecision::Expand,
             target_position: GridPosition { x: 2, y: 2 },
             capture_target_positions: vec![GridPosition { x: 2, y: 2 }],
+            priority_enemy_types: Vec::new(),
             requirement: requirement.clone(),
             purchase_shortfall: requirement,
             allocated_budget: 4_000,
@@ -9110,6 +9143,7 @@ mod tests {
             preferred_transport: Some(UnitType::TransportHelicopter),
             transport_slots: 2,
             capture_units: 1,
+            ground_combat_units: 0,
             combat_budget: bomber_stats.cost,
             total_budget: bomber_stats.cost.saturating_add(5_000),
         };
@@ -9118,11 +9152,13 @@ mod tests {
             decision: IslandCampaignDecision::Assault,
             target_position: target,
             capture_target_positions: vec![target],
+            priority_enemy_types: vec![UnitType::Infantry],
             requirement: requirement.clone(),
             purchase_shortfall: IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
                 capture_units: 1,
+                ground_combat_units: 0,
                 combat_budget: 0,
                 total_budget: 1_000,
             },
@@ -9172,6 +9208,7 @@ mod tests {
             preferred_transport: Some(UnitType::TransportHelicopter),
             transport_slots: 2,
             capture_units: 2,
+            ground_combat_units: 0,
             combat_budget: 0,
             total_budget: 4_000,
         };
@@ -9180,6 +9217,7 @@ mod tests {
             decision: IslandCampaignDecision::Expand,
             target_position: GridPosition { x: 3, y: 3 },
             capture_target_positions: vec![GridPosition { x: 3, y: 3 }],
+            priority_enemy_types: Vec::new(),
             requirement: requirement.clone(),
             purchase_shortfall: requirement,
             allocated_budget: 4_000,
@@ -9306,6 +9344,7 @@ mod tests {
             preferred_transport: None,
             transport_slots: 0,
             capture_units: 0,
+            ground_combat_units: 0,
             combat_budget: 7_000,
             total_budget: 7_000,
         };
@@ -9314,11 +9353,13 @@ mod tests {
             decision: IslandCampaignDecision::Defend,
             target_position: defended,
             capture_target_positions: vec![defended],
+            priority_enemy_types: Vec::new(),
             requirement: requirement.clone(),
             purchase_shortfall: IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
                 capture_units: 0,
+                ground_combat_units: 0,
                 combat_budget: 0,
                 total_budget: 0,
             },

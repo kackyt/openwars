@@ -554,6 +554,13 @@ impl OpenWarsAiServer {
                 &state.world,
                 active_player_id,
             );
+            let plan_revisions =
+                invasion_trace::snapshot_plan_revisions_for_player(&state.world, active_player_id);
+            let plan_executions =
+                invasion_trace::snapshot_plan_executions_for_player(&state.world, active_player_id);
+            // 勝利条件から島作戦・担当Entity・実行Eventまでを同じIDで追跡する。
+            let victory_roadmap =
+                invasion_trace::snapshot_victory_roadmap_for_player(&state.world, active_player_id);
             let emergency_plan =
                 invasion_trace::snapshot_emergency_plan_for_player(&state.world, active_player_id);
             let after_metrics = engine::ai::eval::evaluate_board_with_metrics(
@@ -570,6 +577,9 @@ impl OpenWarsAiServer {
                 "idle_audit": idle_audit,
                 "production_plan": production_plan,
                 "deployment_audit": deployment_audit,
+                "plan_revisions": plan_revisions,
+                "plan_executions": plan_executions,
+                "victory_roadmap": victory_roadmap,
                 "emergency_plan": emergency_plan,
                 "factory_relief": factory_relief,
                 "player_id": active_player_id.0,

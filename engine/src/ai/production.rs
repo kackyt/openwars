@@ -418,7 +418,7 @@ pub(crate) fn plan_campaign_with_expansion_denial_reserve(
     master_data: &MasterDataRegistry,
     available_funds: u32,
 ) -> CampaignProductionOutcome {
-    let mut outcome = plan_campaign_shortfall_production(
+    let mut outcome = plan_campaign_shortfall_production_with_damage(
         player_id,
         shortfalls,
         facilities,
@@ -426,6 +426,7 @@ pub(crate) fn plan_campaign_with_expansion_denial_reserve(
         map,
         master_data,
         available_funds,
+        Some(damage_chart),
     );
     let Some(reserved_airport) = select_expansion_denial_airport(
         facilities,
@@ -444,7 +445,7 @@ pub(crate) fn plan_campaign_with_expansion_denial_reserve(
         .filter(|(position, _)| *position != reserved_airport)
         .copied()
         .collect();
-    outcome = plan_campaign_shortfall_production(
+    outcome = plan_campaign_shortfall_production_with_damage(
         player_id,
         shortfalls,
         &campaign_facilities,
@@ -452,6 +453,7 @@ pub(crate) fn plan_campaign_with_expansion_denial_reserve(
         map,
         master_data,
         available_funds,
+        Some(damage_chart),
     );
     // 将来ターン向けのcampaign予約が現在の空き空港と現金まで完全に遮断すると、
     // 敵が増産中でも輸送だけを買い続けて掃討戦力が立ち上がらない。現在手番の
@@ -523,6 +525,7 @@ fn consume_campaign_candidate(
     shortfall.reserved_budget = shortfall.reserved_budget.saturating_sub(stats.cost);
 }
 
+#[cfg(test)]
 pub(crate) fn plan_campaign_shortfall_production(
     player_id: PlayerId,
     shortfalls: &[IslandCampaignShortfall],
@@ -531,6 +534,29 @@ pub(crate) fn plan_campaign_shortfall_production(
     map: &crate::resources::Map,
     master_data: &MasterDataRegistry,
     available_funds: u32,
+) -> CampaignProductionOutcome {
+    plan_campaign_shortfall_production_with_damage(
+        player_id,
+        shortfalls,
+        facilities,
+        available_types,
+        map,
+        master_data,
+        available_funds,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_campaign_shortfall_production_with_damage(
+    player_id: PlayerId,
+    shortfalls: &[IslandCampaignShortfall],
+    facilities: &[(GridPosition, Terrain)],
+    available_types: &[(UnitType, UnitStats)],
+    map: &crate::resources::Map,
+    master_data: &MasterDataRegistry,
+    available_funds: u32,
+    damage_chart: Option<&DamageChart>,
 ) -> CampaignProductionOutcome {
     let mut rows = shortfalls.to_vec();
     rows.sort_by_key(|row| (row.priority_rank, row.island_id.0));
@@ -563,8 +589,7 @@ pub(crate) fn plan_campaign_shortfall_production(
                 && produced_structural_assault_unit
                 && requirements == [CampaignProductionRequirement::Combat]
             {
-                // 初回上陸便へ後続支援まで詰め込むとPickupが遅れる。輸送役と占領兵を
-                // この手番のバッチ境界とし、戦闘支援は次ターン以降に生産する。
+                // 金額だけのCombat端数は輸送量を保証できないため、構造便へ後付けしない。
                 outcome.completed_all_rows = false;
                 break 'rows;
             }
@@ -605,7 +630,32 @@ pub(crate) fn plan_campaign_shortfall_production(
                             } else {
                                 0
                             };
+                        let (covered_enemy_types, total_expected_damage) =
+                            damage_chart.map_or((0_u32, 0_u32), |chart| {
+                                row.priority_enemy_types.iter().fold(
+                                    (0_u32, 0_u32),
+                                    |(covered, total), enemy_type| {
+                                        let damage = chart
+                                            .get_base_damage(*unit_type, *enemy_type)
+                                            .unwrap_or_default()
+                                            .max(
+                                                chart
+                                                    .get_base_damage_secondary(
+                                                        *unit_type,
+                                                        *enemy_type,
+                                                    )
+                                                    .unwrap_or_default(),
+                                            );
+                                        (
+                                            covered + u32::from(damage > 0),
+                                            total.saturating_add(damage),
+                                        )
+                                    },
+                                )
+                            });
                         candidates.push((
+                            std::cmp::Reverse(covered_enemy_types),
+                            std::cmp::Reverse(total_expected_damage),
                             std::cmp::Reverse(combat_coverage),
                             stats.cost,
                             campaign_unit_type_rank(*unit_type),
@@ -624,9 +674,11 @@ pub(crate) fn plan_campaign_shortfall_production(
                         candidate.2,
                         candidate.3,
                         candidate.4,
+                        candidate.5,
+                        candidate.6,
                     )
                 });
-                if let Some((_, _, _, _, _, position, unit_type, stats)) =
+                if let Some((_, _, _, _, _, _, _, position, unit_type, stats)) =
                     candidates.into_iter().next()
                 {
                     selected = Some((
@@ -3202,6 +3254,7 @@ mod additional_tests {
             preferred_transport: None,
             transport_slots: 0,
             capture_units: 0,
+            ground_combat_units: 0,
             combat_budget: 0,
             total_budget: 0,
         };
@@ -3212,6 +3265,7 @@ mod additional_tests {
                 decision: crate::ai::island_campaign::IslandCampaignDecision::Expand,
                 target_position: target,
                 capture_target_positions: vec![target],
+                priority_enemy_types: Vec::new(),
                 requirement: empty_requirement.clone(),
                 purchase_shortfall: empty_requirement,
                 allocated_budget: 0,
@@ -3390,9 +3444,11 @@ mod additional_tests {
             light_transport_slots: 1,
             heavy_transport_slots: 0,
             capture_units: 0,
+            ground_combat_units: 0,
             combat_budget: 0,
             reserved_budget: helicopter.cost,
             priority_rank: 0,
+            priority_enemy_types: Vec::new(),
         }];
 
         let outcome = plan_campaign_shortfall_production(
@@ -3424,9 +3480,11 @@ mod additional_tests {
             light_transport_slots: 0,
             heavy_transport_slots: 0,
             capture_units: 0,
+            ground_combat_units: 0,
             combat_budget: 1,
             reserved_budget: 1,
             priority_rank: 0,
+            priority_enemy_types: Vec::new(),
         }];
 
         let outcome = plan_campaign_shortfall_production(
@@ -3462,9 +3520,11 @@ mod additional_tests {
             light_transport_slots: 0,
             heavy_transport_slots: 0,
             capture_units: 0,
+            ground_combat_units: 0,
             combat_budget: tank.cost,
             reserved_budget: tank.cost,
             priority_rank: 0,
+            priority_enemy_types: Vec::new(),
         }];
         let facilities = vec![
             (GridPosition { x: 0, y: 0 }, Terrain::Factory),
@@ -3561,9 +3621,11 @@ mod additional_tests {
             light_transport_slots: 4,
             heavy_transport_slots: 0,
             capture_units: 0,
+            ground_combat_units: 0,
             combat_budget: 0,
             reserved_budget: 8_000,
             priority_rank: 0,
+            priority_enemy_types: Vec::new(),
         }];
         let airports = vec![
             (GridPosition { x: 1, y: 0 }, Terrain::Airport),
@@ -3620,9 +3682,11 @@ mod additional_tests {
             light_transport_slots: 8,
             heavy_transport_slots: 0,
             capture_units: 0,
+            ground_combat_units: 0,
             combat_budget: 0,
             reserved_budget: 16_000,
             priority_rank: 0,
+            priority_enemy_types: Vec::new(),
         }];
         let airports = vec![
             (GridPosition { x: 1, y: 0 }, Terrain::Airport),
@@ -3668,9 +3732,11 @@ mod additional_tests {
                 light_transport_slots: 0,
                 heavy_transport_slots: 0,
                 capture_units: 0,
+                ground_combat_units: 0,
                 combat_budget: 7_000,
                 reserved_budget: 7_000,
                 priority_rank: 0,
+                priority_enemy_types: Vec::new(),
             },
             crate::ai::island_campaign::IslandCampaignShortfall {
                 island_id: crate::ai::islands::IslandId(1),
@@ -3679,9 +3745,11 @@ mod additional_tests {
                 light_transport_slots: 2,
                 heavy_transport_slots: 0,
                 capture_units: 2,
+                ground_combat_units: 0,
                 combat_budget: 0,
                 reserved_budget: 6_000,
                 priority_rank: 2,
+                priority_enemy_types: Vec::new(),
             },
             crate::ai::island_campaign::IslandCampaignShortfall {
                 island_id: crate::ai::islands::IslandId(2),
@@ -3690,9 +3758,11 @@ mod additional_tests {
                 light_transport_slots: 2,
                 heavy_transport_slots: 2,
                 capture_units: 2,
+                ground_combat_units: 0,
                 combat_budget: 10_200,
                 reserved_budget: 32_700,
                 priority_rank: 4,
+                priority_enemy_types: Vec::new(),
             },
         ];
         let facilities = vec![
@@ -3736,9 +3806,11 @@ mod additional_tests {
                 light_transport_slots: 0,
                 heavy_transport_slots: 0,
                 capture_units: 7,
+                ground_combat_units: 0,
                 combat_budget: 0,
                 reserved_budget: 7_000,
                 priority_rank: 2,
+                priority_enemy_types: Vec::new(),
             },
             crate::ai::island_campaign::IslandCampaignShortfall {
                 island_id: crate::ai::islands::IslandId(2),
@@ -3747,9 +3819,11 @@ mod additional_tests {
                 light_transport_slots: 5,
                 heavy_transport_slots: 0,
                 capture_units: 5,
+                ground_combat_units: 0,
                 combat_budget: 0,
                 reserved_budget: 17_000,
                 priority_rank: 6,
+                priority_enemy_types: Vec::new(),
             },
         ];
         let mut facilities = (0..5)
@@ -3799,9 +3873,11 @@ mod additional_tests {
             light_transport_slots: 0,
             heavy_transport_slots: 0,
             capture_units: 1,
+            ground_combat_units: 0,
             combat_budget: 0,
             reserved_budget: 1_000,
             priority_rank: 1,
+            priority_enemy_types: Vec::new(),
         }];
         let facilities = vec![
             (GridPosition { x: 0, y: 0 }, Terrain::Factory),
@@ -3837,9 +3913,11 @@ mod additional_tests {
                 light_transport_slots: 0,
                 heavy_transport_slots: 0,
                 capture_units: 0,
+                ground_combat_units: 0,
                 combat_budget,
                 reserved_budget,
                 priority_rank: 0,
+                priority_enemy_types: Vec::new(),
             };
 
         let small_remainder = plan_campaign_shortfall_production(
@@ -3876,9 +3954,11 @@ mod additional_tests {
             light_transport_slots: 2,
             heavy_transport_slots: 2,
             capture_units: 0,
+            ground_combat_units: 0,
             combat_budget: 0,
             reserved_budget: 20_500,
             priority_rank: 4,
+            priority_enemy_types: Vec::new(),
         }];
         let facilities = vec![
             (GridPosition { x: 0, y: 0 }, Terrain::Port),
@@ -3917,9 +3997,11 @@ mod additional_tests {
             light_transport_slots: 4,
             heavy_transport_slots: 0,
             capture_units: 2,
+            ground_combat_units: 0,
             combat_budget: 10_200,
             reserved_budget: 20_200,
             priority_rank: 2,
+            priority_enemy_types: Vec::new(),
         }];
         let facilities = vec![
             (GridPosition { x: 0, y: 0 }, Terrain::Airport),
@@ -3959,6 +4041,53 @@ mod additional_tests {
         assert!(!outcome.completed_all_rows);
     }
 
+    #[test]
+    fn campaign_ground_wave_selects_the_unit_with_more_damage_against_observed_enemy() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let stats = |unit_type: UnitType| {
+            master_data
+                .create_unit_stats(&crate::resources::master_data::UnitName(
+                    unit_type.as_str().to_owned(),
+                ))
+                .unwrap()
+        };
+        let infantry = stats(UnitType::Infantry);
+        let tank = stats(UnitType::Tank);
+        let tank_cost = tank.cost;
+        let rows = vec![IslandCampaignShortfall {
+            island_id: crate::ai::islands::IslandId(0),
+            decision: IslandCampaignDecision::Assault,
+            target_position: GridPosition { x: 4, y: 0 },
+            light_transport_slots: 0,
+            heavy_transport_slots: 0,
+            capture_units: 0,
+            ground_combat_units: 1,
+            combat_budget: tank_cost,
+            reserved_budget: tank_cost,
+            priority_rank: 0,
+            priority_enemy_types: vec![UnitType::Infantry],
+        }];
+        let mut damage_chart = DamageChart::new();
+        damage_chart.insert_damage(UnitType::Infantry, UnitType::Infantry, 20);
+        damage_chart.insert_damage(UnitType::Tank, UnitType::Infantry, 100);
+        let map = Map::new(5, 1, Terrain::Plains, GridTopology::Square);
+
+        let outcome = plan_campaign_shortfall_production_with_damage(
+            PlayerId(1),
+            &rows,
+            &[(GridPosition { x: 0, y: 0 }, Terrain::Factory)],
+            &[(UnitType::Infantry, infantry), (UnitType::Tank, tank)],
+            &map,
+            &master_data,
+            tank_cost,
+            Some(&damage_chart),
+        );
+
+        assert_eq!(outcome.commands.len(), 1);
+        assert_eq!(outcome.commands[0].unit_type, UnitType::Tank);
+        assert!(outcome.completed_all_rows);
+    }
+
     /// Lander資金が足りない初手でも同じパッケージの輸送ヘリを1件だけ先行し、
     /// 残金を次ターンのLander購入へ温存する。
     #[test]
@@ -3972,9 +4101,11 @@ mod additional_tests {
             light_transport_slots: 2,
             heavy_transport_slots: 2,
             capture_units: 2,
+            ground_combat_units: 0,
             combat_budget: 10_200,
             reserved_budget: 32_700,
             priority_rank: 2,
+            priority_enemy_types: Vec::new(),
         }];
         let facilities = vec![
             (GridPosition { x: 0, y: 0 }, Terrain::Port),

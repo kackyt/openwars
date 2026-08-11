@@ -176,6 +176,41 @@
 - [x] B-113. release版map_3 / Hex / seed 42 / 9ターン / V4対V3両席で追試し、V4戦闘ROI 1.15／1.09、生産Combat機7体すべての実攻撃、6機による優先敵攻撃7回、撃破5件を確認する。両席敗北と資金滞留は未達として残す
 - [ ] B-114. Load/Drop、補給、Capture、逐次位置、通常／悲観予測、PlanRevision／step_id、不適格理由、反復深化をDecision 23どおり実装する
 - [ ] B-115. map_3 / Hex / 複数seed / 12ターン以上で旧方式と比較し、資金滞留・敵残存・占領完了・遊兵が改善するまでV3/V1へ共通化しない
+- [x] B-116. `PlanId`、`PlanRevision`、`PlanStepId`と`V4RollingPlanRegistry`を追加し、実行可能な将来Combat購入を絶対手番のstepとして保持する
+- [x] B-117. 前revisionの未実行購入列を現在の生産slot・資金・収入へ載せ直す固定パッケージ評価を追加し、生産失敗、slot消滅、資金不成立、排除不能、期限逸脱、目的達成、Pareto優越、防衛preemptを撤回・revision理由として分離する
+- [x] B-118. `PendingDeployment`と`UnitProducedEvent`を`PlanStepRef`で照合し、発行済み未生産stepを次手番に生産失敗として検出する。将来予約だけの手番を`reserved`としてtraceへ出す
+- [x] B-119. 完了・撤回した`plan_id`の局地任務保護を解除し、revision継続時は生産済みEntityを維持して未発注stepだけを置換する
+- [x] B-120. 盤面変化だけでは継続、不可能案のrevision／撤回、不可能候補の非永続化、期限逸脱、目的完了、切替コスト込みPareto比較、将来購入の次手番実行を単体・統合テストで固定する
+- [x] B-121. 進行中計画の目的拠点・優先敵を新規候補より先に独立作戦として復帰し、予定step超過を`ProductionStepFailed`として閉じる。防衛preemptを同一施設・手番の実競合へ限定し、map_3 / Hex / seed 42 / 5ターン両席で2計画の翌手番再評価、生産Entity照合、根拠のない`HigherPriorityDefense`／候補脱落由来`ProductionStepFailed`撤回0件を確認する
+- [x] B-122. `PlanExecutionLedger`を追加し、Plan単位の累計承認／commit／実生産費、配属・稼働Entity、初攻撃、攻撃・撃破・損耗、敵別HP・中立化、増援、目的施設所有を毎ターン集約する
+- [x] B-123. 初攻撃・敵排除・施設占領の予定超過と敵増援をrevision理由へ接続し、敵排除と目的施設所有の両方を作戦完了条件にする
+- [x] B-124. 敵排除後・占領前のPlan戦力をanchor Defenseへ保持し、増援時はpendingと全生産済みEntityへ最新の優先敵集合を再配布する
+- [x] B-125. 既存Combat Entityの`plan_id`所有権を見積入力まで保持し、同一Planの継続案だけへ計上して別Plan戦力による購入0・配属0の架空計画を禁止する
+- [x] B-126. 航空機が手番開始時点で帰還安全圏外の場合、帰還不足を悪化させず自軍空港距離を縮める回復移動を許可する
+- [x] B-127. MCP／JSONLへPlan予実、敵別予定／実HP、増援、初攻撃・排除・占領差、累計予算、稼働Entity数を出力する
+- [x] B-128. Plan予実集約、予定超過、排除後未占領、施設所有後完了、Plan所有権排他、航空回復移動を単体テストで固定し、全回帰・fmt・clippyを通す
+- [x] B-129. map_3 / Hex / seed 42 / 12ターンで両席を追跡し、発見したPlan所有権漏れと航空停止を修正する。V4先攻の再試合で購入0Plan・帰還不能航空遊兵0件、Combat実生産102,500、攻撃14回、撃破4件、unit価値151,500、ZOC 174、最大手番判定勝利を確認する
+- [ ] B-130. Plan予実集計とは独立した全unit行動探索の11秒級ピークと、12ターン終了時103,099の資金滞留を改善し、複数seed・両席で再評価する
+- [x] B-131. `battle_map3.jsonl`の後攻人間プレイから、輸送ヘリ・揚陸艦の再利用、段階的な重戦力投入、損耗補充、有効攻撃rateの実績を抽出し、固定台数・一波上限をDecision 24で撤回する
+- [ ] B-132. 敵領Assaultの`ground_combat_units`、島空きマス上限、一手番輸送生産枠上限を削除し、既存の金額shortfall／完全manifestを作戦開始条件から外す
+- [ ] B-133. `TimeExpandedCampaignPlan`へ既存／新規輸送unitの位置・cargo・再利用可能手番と、Load/Move/Dropの合法なstepを追加する
+- [ ] B-134. 観測敵に加え、敵資金・生産slot・兵種・移動ETAから通常／counter優先の増援scenarioを生成し、前線到着HP rateと敵HP除去rateを予測する
+- [ ] B-135. 生産、輸送、攻撃、補給、Captureを同一時間軸で探索し、勝利条件を満たしたscheduleの結果として必要unit数・費用・完了手番・損耗を出力する
+- [ ] B-136. Plan予実台帳へLoad/Drop、前線到着数、有効攻撃回数、手番別HP除去rate、敵増援rate、Capture進捗を追加し、工程遅延・rate逆転・経路喪失をreplanへ接続する
+- [ ] B-137. map_3 / Hexで短期の生産→Load→Drop→攻撃→占領と輸送再利用をtrace検証し、その後に長期戦で首都攻略または全滅への収束、資金滞留、遊兵、複数seedを評価する
+- [x] B-141. map_3 / Hex / seed 42 / 15ターンのV4両席で、島別の次拠点ETAと全島取得実績、敵本拠地所有、敵残存数、Plan標的Entity、投入費・攻撃・撃破を照合し、局地anchorと遠方輸送ヘリ標的の混線および勝利条件への直接進捗0を記録する
+- [x] B-142. Plan継続identityを同一OperationKindかつ同一objective propertiesへ限定し、敵Entity重複による別島へのPlanId移植を禁止する
+- [ ] B-143. `VictoryRoadmapId`、`StrategicOperationId`、勝利経路、固定IslandId／objective properties、工程依存、勝利予定手番を保持する親子作戦Resourceを追加する
+- [ ] B-144. Produce、Move、Load、Drop、Attack、Capture、Holdの予定stepを実Entityと各実行Eventへ照合し、対応Eventなしの行動を進捗に数えず`StepBlocked`としてreplanへ返す
+- [ ] B-145. 計画Entityの行動候補を同一作戦stepまたは目的を前進させる合法代替へ限定し、別島・別前線・期限後の敵への汎用再目標化を禁止する
+- [x] B-146. 全objective propertiesの最後の取得手番を、輸送・移動・Capture HP・敵妨害込みで予測する`planned_island_completion_turn`と、所有者変更Event由来の実績手番を実装する
+- [ ] B-147. 通常／悲観scenarioで首都占領または敵全滅まで完走するroadmap候補を比較し、中立島・敵生産拠点・本拠地強襲を勝利予定短縮量で選ぶ
+- [ ] B-148. map_3で人間ログ同様に中央・隣接島の確保後、本拠地へのProduce→Load→Drop→Suppress→Captureが同一roadmap_idで継続し、敵増援時にも実績差から補充・replanされることを15ターン以上で検証する
+- [x] B-149. 局地portfolioに首都強襲が無い間もblockedな`AssaultCapital`子作戦を親roadmapへ常在させ、`Rejected / NoFeasibleReplacement`のPlanIdなし候補から生産命令を発行しない
+- [x] B-150. 別島の敵輸送unitは実cargo搭載時だけ将来到着scenarioへ入れ、空輸送ヘリによる全島一律の対空Combat要求を禁止する
+- [x] B-138. Combat plannerの固定最大5生産を撤回し、探索期間内のfacility-turn数から探索深さを導出する。敵増援へ生産手番・移動ETA由来の`available_turn`を与え、手番別の敵到着HP・敵HP除去・自軍HP損耗・攻撃回数をtraceへ出す
+- [x] B-139. map_3 / Hex / seed 42 / 5ターンをV3/V4両席で短期追試し、V4が両席14拠点・収入23,000、T3–5に戦闘機／戦闘ヘリ生産、予測増援の計画算入を確認する。V3両席勝利とV4平均思考2,146msは未達として残す
+- [x] B-140. 固定`排除+2ターン`の占領予測を撤回し、実campaignのPickup/Transit/Drop、cargo位置、Capture距離から得た`friendly_capture_eta`をCombat planへ接続する。輸送編成が無い場合は`occupation_turn = None`として未実行の占領を完了予測しない
 
 ## Phase C: 陸上前線への一般化・到達可能性・生産枠
 

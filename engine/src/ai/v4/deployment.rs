@@ -4,9 +4,11 @@
 //! 「何のために買ったか」が失われる。このモジュールは発注を生産完了イベントへ照合し、
 //! 優先敵が有効な間だけ汎用目標探索から保護する。
 
+use crate::ai::islands::IslandMap;
 use crate::ai::squad::{MissionPhase, MissionType, SquadId, SquadManager};
 use crate::ai::turn_distance::TerrainConnectivity;
 use crate::ai::v4::operation::SlotKind;
+use crate::ai::v4::plan_revision::{ActiveDeploymentIntent, PlanId, PlanStepRef};
 use crate::components::{Ammo, Faction, GridPosition, Health, PlayerId, Transporting, UnitStats};
 use crate::events::{UnitAttackedEvent, UnitProducedEvent};
 use crate::resources::{DamageChart, Map, MatchState, UnitType, master_data::MasterDataRegistry};
@@ -47,6 +49,7 @@ pub(crate) struct PendingDeployment {
     pub priority_enemies: Vec<Entity>,
     pub threat_horizon: u32,
     pub forecast: DeploymentForecast,
+    pub plan_step: Option<PlanStepRef>,
 }
 
 /// 生産済みEntityへ結び付いた作戦意図。
@@ -93,6 +96,14 @@ pub struct DeploymentAuditRecord {
     pub destroyed_value: u32,
     pub first_attack_turn: Option<u32>,
     pub forecast: DeploymentForecast,
+    pub plan_step: Option<PlanStepRef>,
+}
+
+/// Combat見積へ渡す、既存EntityのPlan所有権と現在の対象集合。
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveTargetAssignment {
+    pub plan_id: Option<PlanId>,
+    pub targets: HashSet<Entity>,
 }
 
 /// V4の未照合発注と、生産済みEntityの局地任務を保持するリソース。
@@ -178,7 +189,7 @@ impl V4DeploymentRegistry {
     pub(crate) fn active_target_assignments(
         &self,
         player_id: PlayerId,
-    ) -> HashMap<Entity, HashSet<Entity>> {
+    ) -> HashMap<Entity, ActiveTargetAssignment> {
         self.assigned
             .values()
             .filter(|deployment| deployment.intent.player_id == player_id && deployment.active)
@@ -190,7 +201,13 @@ impl V4DeploymentRegistry {
                     .copied()
                     .collect::<HashSet<_>>();
                 targets.extend(deployment.current_target);
-                (deployment.entity, targets)
+                (
+                    deployment.entity,
+                    ActiveTargetAssignment {
+                        plan_id: deployment.intent.plan_step.map(|step| step.plan_id),
+                        targets,
+                    },
+                )
             })
             .collect()
     }
@@ -222,6 +239,7 @@ impl V4DeploymentRegistry {
                 destroyed_value: deployment.destroyed_value,
                 first_attack_turn: deployment.first_attack_turn,
                 forecast: deployment.intent.forecast,
+                plan_step: deployment.intent.plan_step,
             })
             .collect::<Vec<_>>();
         records.sort_unstable_by_key(|record| record.entity.to_bits());
@@ -234,6 +252,78 @@ impl V4DeploymentRegistry {
             .iter()
             .filter(|pending| pending.player_id == player_id)
             .count()
+    }
+
+    /// 実Entityへ照合できた永続計画stepを返す。次手番の予実突合に使用する。
+    pub(crate) fn produced_plan_steps(&self, player_id: PlayerId) -> HashSet<PlanStepRef> {
+        self.assigned
+            .values()
+            .filter(|deployment| deployment.intent.player_id == player_id)
+            .filter_map(|deployment| deployment.intent.plan_step)
+            .collect()
+    }
+
+    /// 完了・撤回された計画の局地任務保護を解除し、上位防衛や汎用任務へ返す。
+    pub(crate) fn release_closed_plans(
+        &mut self,
+        plan_ids: &HashSet<super::plan_revision::PlanId>,
+    ) {
+        if plan_ids.is_empty() {
+            return;
+        }
+        self.pending.retain(|pending| {
+            pending
+                .plan_step
+                .is_none_or(|step| !plan_ids.contains(&step.plan_id))
+        });
+        for deployment in self.assigned.values_mut() {
+            if deployment
+                .intent
+                .plan_step
+                .is_some_and(|step| plan_ids.contains(&step.plan_id))
+            {
+                deployment.active = false;
+                deployment.current_target = None;
+            }
+        }
+    }
+
+    /// 現行Planの増援・移動済み敵を、生産済みEntityと未照合発注の双方へ反映する。
+    pub(crate) fn refresh_plan_intents(&mut self, intents: &[ActiveDeploymentIntent]) {
+        let by_plan = intents
+            .iter()
+            .map(|intent| (intent.plan_id, intent))
+            .collect::<HashMap<_, _>>();
+        for pending in &mut self.pending {
+            let Some(step) = pending.plan_step else {
+                continue;
+            };
+            let Some(intent) = by_plan.get(&step.plan_id) else {
+                continue;
+            };
+            pending.anchor = intent.anchor;
+            pending.priority_enemies = intent.priority_enemies.clone();
+            pending.threat_horizon = intent.threat_horizon;
+        }
+        for deployment in self.assigned.values_mut() {
+            let Some(step) = deployment.intent.plan_step else {
+                continue;
+            };
+            let Some(intent) = by_plan.get(&step.plan_id) else {
+                continue;
+            };
+            deployment.intent.anchor = intent.anchor;
+            deployment.intent.priority_enemies = intent.priority_enemies.clone();
+            deployment.intent.threat_horizon = intent.threat_horizon;
+            if deployment
+                .current_target
+                .is_some_and(|target| !intent.priority_enemies.contains(&target))
+            {
+                deployment.current_target = None;
+            }
+            // 一時的に敵が消えて待機へ移ったEntityも、増援追加時には同じPlanへ復帰させる。
+            deployment.active = true;
+        }
     }
 
     /// 行動評価で最優先する、現在有効な局地任務の敵Entityを返す。
@@ -307,6 +397,7 @@ impl V4DeploymentRegistry {
                     priority_enemies: vec![target],
                     threat_horizon: 1,
                     forecast: DeploymentForecast::default(),
+                    plan_step: None,
                 },
                 squad_id: None,
                 current_target: Some(target),
@@ -461,9 +552,24 @@ fn local_retarget(
     )>();
     let map = world.get_resource::<Map>()?;
     let master_data = world.get_resource::<MasterDataRegistry>()?;
+    let island_map = world
+        .get_resource::<IslandMap>()
+        .cloned()
+        .unwrap_or_else(|| IslandMap::analyze(map));
+    let operation_island = island_map
+        .get_island_at(&deployment.intent.anchor)
+        .map(|island| island.id);
     let mut candidates = Vec::new();
     for (entity, faction, position, stats, transporting) in enemies.iter(world) {
         if faction.0 == deployment.intent.player_id || transporting.is_some() {
+            continue;
+        }
+        // 局地fallbackは作戦対象島の敵だけを選ぶ。別島の敵を追って作戦Entityが
+        // 前線を離れると、島作戦の実行契約そのものが崩れる。海上・航空中の敵は
+        // 島に属さないため、従来通りETAと到達可能性で局地性を判定する。
+        let enemy_island = island_map.get_island_at(position).map(|island| island.id);
+        if operation_island.is_some() && enemy_island.is_some() && enemy_island != operation_island
+        {
             continue;
         }
         let eta = map
@@ -572,11 +678,19 @@ pub(crate) fn prepare_deployment_squads(
             }
             continue;
         }
-        let Some((target_entity, target)) = resolve_target(world, &mut connectivity, &snapshot)
-        else {
-            releases.push((entity, snapshot.squad_id));
-            continue;
-        };
+        let (target_entity, target, mission_type) =
+            match resolve_target(world, &mut connectivity, &snapshot) {
+                Some((target_entity, target)) => (Some(target_entity), target, MissionType::Attack),
+                // Combat排除後も対象拠点の占領完了まではPlanを閉じない。
+                // 生産戦力をfree poolへ返さず、anchorで反撃増援を待ち受ける。
+                None if snapshot.intent.plan_step.is_some() => {
+                    (None, snapshot.intent.anchor, MissionType::Defense)
+                }
+                None => {
+                    releases.push((entity, snapshot.squad_id));
+                    continue;
+                }
+            };
 
         // 過去の汎用Squadへ混入していた場合は、このEntityだけを切り離す。
         for squad in &mut manager.squads {
@@ -597,14 +711,14 @@ pub(crate) fn prepare_deployment_squads(
         };
         squad.members.clear();
         squad.members.insert(entity);
-        squad.mission_type = MissionType::Attack;
+        squad.mission_type = mission_type;
         squad.target = Some(target);
         squad.target_island = None;
         squad.phase = MissionPhase::MovingToTarget;
         let squad_id = squad.id;
         if let Some(deployment) = registry.assigned.get_mut(&entity) {
             deployment.squad_id = Some(squad_id);
-            deployment.current_target = Some(target_entity);
+            deployment.current_target = target_entity;
         }
         reserved.insert(entity);
     }
@@ -626,6 +740,7 @@ pub(crate) fn prepare_deployment_squads(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::islands::IslandMap;
     use crate::resources::{GridTopology, MovementType, Terrain};
 
     fn pending(order: u32) -> PendingDeployment {
@@ -640,6 +755,7 @@ mod tests {
             priority_enemies: vec![Entity::from_raw(order + 10)],
             threat_horizon: 4,
             forecast: DeploymentForecast::default(),
+            plan_step: None,
         }
     }
 
@@ -665,6 +781,38 @@ mod tests {
         assert_eq!(registry.assigned[&first].intent.order, 0);
         assert_eq!(registry.assigned[&second].intent.order, 1);
         assert!(registry.pending.is_empty());
+    }
+
+    #[test]
+    fn closed_plan_releases_assigned_entity_from_mission_protection() {
+        use crate::ai::v4::plan_revision::{PlanId, PlanRevision, PlanStepId};
+
+        let mut registry = V4DeploymentRegistry::default();
+        let mut order = pending(0);
+        let plan_id = PlanId(7);
+        order.plan_step = Some(PlanStepRef {
+            plan_id,
+            revision: PlanRevision(2),
+            step_id: PlanStepId(0),
+        });
+        registry.replace_turn_orders(PlayerId(1), 3, [order]);
+        let entity = Entity::from_raw(100);
+        registry.assign_produced(
+            &UnitProducedEvent {
+                player_id: PlayerId(1),
+                target_x: 2,
+                target_y: 4,
+                unit_type: UnitType::Fighter,
+                entity,
+            },
+            3,
+        );
+        assert!(registry.active_entities(PlayerId(1)).contains(&entity));
+
+        registry.release_closed_plans(&HashSet::from([plan_id]));
+
+        assert!(!registry.active_entities(PlayerId(1)).contains(&entity));
+        assert!(!registry.assigned[&entity].active);
     }
 
     #[test]
@@ -810,6 +958,7 @@ mod tests {
                     priority_enemies: vec![priority],
                     threat_horizon: 3,
                     forecast: DeploymentForecast::default(),
+                    plan_step: None,
                 },
                 squad_id: None,
                 current_target: None,
@@ -905,6 +1054,76 @@ mod tests {
                 .squads
                 .iter()
                 .all(|squad| !squad.members.contains(&attacker))
+        );
+    }
+
+    #[test]
+    fn local_retarget_does_not_leave_the_operation_island() {
+        let mut world = World::new();
+        let mut map = Map::new(7, 1, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(2, 0, Terrain::Sea).unwrap();
+        world.insert_resource(IslandMap::analyze(&map));
+        world.insert_resource(map);
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+        let mut chart = DamageChart::new();
+        chart.insert_damage(UnitType::Bcopters, UnitType::Infantry, 60);
+        world.insert_resource(chart);
+        let mut attacker_stats = combat_stats(UnitType::Bcopters, false, 0);
+        attacker_stats.movement_type = MovementType::Air;
+        attacker_stats.max_movement = 6;
+        let attacker = world
+            .spawn((
+                Faction(PlayerId(1)),
+                GridPosition { x: 5, y: 0 },
+                attacker_stats,
+                Ammo {
+                    ammo1: 9,
+                    max_ammo1: 9,
+                    ammo2: 0,
+                    max_ammo2: 0,
+                },
+            ))
+            .id();
+        world.spawn((
+            Faction(PlayerId(2)),
+            GridPosition { x: 1, y: 0 },
+            combat_stats(UnitType::Infantry, true, 0),
+        ));
+        let deployment = AssignedDeployment {
+            entity: attacker,
+            intent: PendingDeployment {
+                player_id: PlayerId(1),
+                turn: 3,
+                order: 0,
+                facility: GridPosition { x: 5, y: 0 },
+                unit_type: UnitType::Bcopters,
+                anchor: GridPosition { x: 5, y: 0 },
+                slot_kind: SlotKind::Combat,
+                priority_enemies: Vec::new(),
+                threat_horizon: 4,
+                forecast: DeploymentForecast::default(),
+                plan_step: None,
+            },
+            squad_id: None,
+            current_target: None,
+            active: true,
+            assigned_turn: 3,
+            attack_count: 0,
+            priority_attack_count: 0,
+            mission_target_attack_count: 0,
+            capture_unit_attack_count: 0,
+            transport_unit_attack_count: 0,
+            kill_count: 0,
+            damage_value_dealt: 0,
+            counter_value_received: 0,
+            destroyed_value: 0,
+            first_attack_turn: None,
+        };
+
+        assert_eq!(
+            local_retarget(&mut world, &mut TerrainConnectivity::default(), &deployment),
+            None,
+            "別島の敵を局地fallbackで追跡してはならない"
         );
     }
 }

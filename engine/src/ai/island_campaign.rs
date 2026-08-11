@@ -111,6 +111,8 @@ pub struct IslandCampaignRequirement {
     pub preferred_transport: Option<UnitType>,
     pub transport_slots: u32,
     pub capture_units: u32,
+    /// 敵領へ一度に揚陸させる地上戦闘unit数。
+    pub ground_combat_units: u32,
     pub combat_budget: u32,
     pub total_budget: u32,
 }
@@ -123,6 +125,8 @@ pub struct IslandCampaignAssignment {
     pub target_position: GridPosition,
     /// 占領要員ごとに分担できる、優先順付きの未所有施設目標。
     pub capture_target_positions: Vec<GridPosition>,
+    /// 現在の波が優先して処理する敵兵種。
+    pub priority_enemy_types: Vec<UnitType>,
     pub requirement: IslandCampaignRequirement,
     pub purchase_shortfall: IslandCampaignRequirement,
     pub allocated_budget: u32,
@@ -143,7 +147,9 @@ pub struct IslandCampaignShortfall {
     pub light_transport_slots: u32,
     pub heavy_transport_slots: u32,
     pub capture_units: u32,
+    pub ground_combat_units: u32,
     pub combat_budget: u32,
+    pub priority_enemy_types: Vec<UnitType>,
     pub reserved_budget: u32,
     pub priority_rank: u8,
 }
@@ -199,6 +205,7 @@ impl IslandCampaignPortfolio {
             if reserved_budget == 0
                 && missing.transport_slots == 0
                 && missing.capture_units == 0
+                && missing.ground_combat_units == 0
                 && combat_budget == 0
             {
                 continue;
@@ -235,7 +242,9 @@ impl IslandCampaignPortfolio {
                 light_transport_slots,
                 heavy_transport_slots,
                 capture_units: missing.capture_units,
+                ground_combat_units: missing.ground_combat_units,
                 combat_budget,
+                priority_enemy_types: assignment.priority_enemy_types.clone(),
                 reserved_budget,
                 priority_rank,
             });
@@ -282,6 +291,7 @@ pub(crate) struct IslandCampaignCandidate {
     pub(crate) assessment: IslandCampaignAssessment,
     pub(crate) target_position: GridPosition,
     pub(crate) capture_target_positions: Vec<GridPosition>,
+    pub(crate) priority_enemy_types: Vec<UnitType>,
     pub(crate) roi_production_sites: u32,
     pub(crate) transport_eta: Option<u32>,
     /// 所有するとターン開始補給・修理に使える地上／航空／海上拠点の数。
@@ -1139,7 +1149,6 @@ fn reserve_candidate(
         reserved_entity_value = reserved_entity_value.saturating_add(unit.cost);
         remove_entity(&mut provisional, unit.entity);
     }
-
     if matches!(
         candidate.assessment.decision,
         IslandCampaignDecision::Expand
@@ -1249,6 +1258,8 @@ fn reserve_candidate(
         preferred_transport,
         transport_slots: remaining_transport_slots,
         capture_units: remaining_capture_units,
+        // 敵領戦闘力は時系列planの結果であり、島campaignの固定台数要求にしない。
+        ground_combat_units: 0,
         combat_budget: remaining_combat_budget,
         total_budget: purchase_budget,
     };
@@ -1272,6 +1283,7 @@ fn reserve_candidate(
             decision: candidate.assessment.decision,
             target_position: candidate.target_position,
             capture_target_positions: candidate.capture_target_positions.clone(),
+            priority_enemy_types: candidate.priority_enemy_types.clone(),
             requirement: requirement.clone(),
             purchase_shortfall,
             allocated_budget: reserved_entity_value.saturating_add(reserved_funds),
@@ -2199,10 +2211,12 @@ mod tests {
             },
             island_income_per_turn: 1_000,
             logistics_prerequisite: false,
+            priority_enemy_types: Vec::new(),
             requirement: IslandCampaignRequirement {
                 preferred_transport: Some(UnitType::TransportHelicopter),
                 transport_slots: 2,
                 capture_units: 2,
+                ground_combat_units: 0,
                 combat_budget: 0,
                 total_budget: 6_000,
             },
@@ -2800,10 +2814,12 @@ mod tests {
             sustainment_targets: CampaignSustainmentTargets::default(),
             island_income_per_turn: 1_000,
             logistics_prerequisite: false,
+            priority_enemy_types: Vec::new(),
             requirement: IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
                 capture_units: 0,
+                ground_combat_units: 0,
                 combat_budget: 0,
                 total_budget: 0,
             },
@@ -2836,10 +2852,12 @@ mod tests {
             sustainment_targets: CampaignSustainmentTargets::default(),
             island_income_per_turn: 0,
             logistics_prerequisite: false,
+            priority_enemy_types: Vec::new(),
             requirement: IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
                 capture_units: 0,
+                ground_combat_units: 0,
                 combat_budget: 0,
                 total_budget: 0,
             },
@@ -2870,10 +2888,12 @@ mod tests {
             sustainment_targets: CampaignSustainmentTargets::default(),
             island_income_per_turn: 0,
             logistics_prerequisite: false,
+            priority_enemy_types: Vec::new(),
             requirement: IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
                 capture_units: 0,
+                ground_combat_units: 0,
                 combat_budget: required_power,
                 total_budget: required_power,
             },
@@ -2904,10 +2924,12 @@ mod tests {
             sustainment_targets: CampaignSustainmentTargets::default(),
             island_income_per_turn: 1_000,
             logistics_prerequisite: false,
+            priority_enemy_types: vec![UnitType::Infantry],
             requirement: IslandCampaignRequirement {
                 preferred_transport: Some(UnitType::Lander),
                 transport_slots: 4,
                 capture_units: 2,
+                ground_combat_units: 2,
                 combat_budget: 10_200,
                 total_budget: 32_700,
             },
@@ -2942,10 +2964,12 @@ mod tests {
             sustainment_targets: CampaignSustainmentTargets::default(),
             island_income_per_turn: 1_000,
             logistics_prerequisite: false,
+            priority_enemy_types: Vec::new(),
             requirement: IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
                 capture_units: 0,
+                ground_combat_units: 0,
                 combat_budget: enemy_value,
                 total_budget: enemy_value,
             },
@@ -3633,6 +3657,7 @@ mod tests {
         let assignment = &portfolio.active_offensives[0];
         assert_eq!(assignment.capture_entities.len(), 2);
         assert_eq!(assignment.combat_entities.len(), 2);
+        assert_eq!(assignment.purchase_shortfall.ground_combat_units, 0);
         assert_eq!(assignment.purchase_shortfall.combat_budget, 4_200);
         assert!(!assignment.operation_ready);
     }
@@ -3676,6 +3701,7 @@ mod tests {
 
         let assignment = &portfolio.active_offensives[0];
         assert!(assignment.combat_entities.is_empty());
+        assert_eq!(assignment.purchase_shortfall.ground_combat_units, 0);
         assert_eq!(assignment.purchase_shortfall.combat_budget, 10_200);
         assert!(!assignment.operation_ready);
     }
@@ -3744,10 +3770,12 @@ mod tests {
             decision,
             target_position,
             capture_target_positions: vec![target_position],
+            priority_enemy_types: Vec::new(),
             requirement: IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
                 capture_units: 0,
+                ground_combat_units: 0,
                 combat_budget: 1_000,
                 total_budget: 1_000,
             },
@@ -3755,6 +3783,7 @@ mod tests {
                 preferred_transport: None,
                 transport_slots: 0,
                 capture_units: 0,
+                ground_combat_units: 0,
                 combat_budget: 1_000,
                 total_budget: 1_000,
             },
@@ -3921,10 +3950,12 @@ mod tests {
             sustainment_targets: CampaignSustainmentTargets::default(),
             island_income_per_turn: 1_000,
             logistics_prerequisite: false,
+            priority_enemy_types: vec![UnitType::Infantry],
             requirement: IslandCampaignRequirement {
                 preferred_transport: Some(UnitType::Lander),
                 transport_slots: 4,
                 capture_units: 2,
+                ground_combat_units: 2,
                 combat_budget: 10_200,
                 total_budget: 32_700,
             },
@@ -3949,6 +3980,7 @@ mod tests {
         );
         assert_eq!(assignment.purchase_shortfall.transport_slots, 4);
         assert_eq!(assignment.purchase_shortfall.capture_units, 2);
+        assert_eq!(assignment.purchase_shortfall.ground_combat_units, 0);
         assert_eq!(assignment.purchase_shortfall.combat_budget, 10_200);
         assert_eq!(assignment.purchase_shortfall.total_budget, 32_700);
         assert!(!assignment.operation_ready);
