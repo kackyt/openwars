@@ -12,6 +12,7 @@
 //! 「敵を減らす」と「占領する」は別フェーズではなく同一作戦の別枠として
 //! 同時に立つため、倒してから占領するのではなく並行して進む。
 
+pub mod campaign_execution;
 pub mod deployment;
 pub mod logistics_plan;
 pub mod operation;
@@ -470,6 +471,22 @@ fn decide_campaign_production_v4(
         .iter()
         .map(|(_, cost)| *cost)
         .fold(0_u32, u32::saturating_add);
+    let campaign_preempts_capital = world
+        .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+        .and_then(|cache| cache.campaign_portfolio(player_id))
+        .is_some_and(|portfolio| {
+            portfolio
+                .defenses
+                .iter()
+                .chain(portfolio.active_offensives.iter())
+                .any(|assignment| {
+                    let structural_shortfall = assignment.purchase_shortfall.transport_slots > 0
+                        || assignment.purchase_shortfall.capture_units > 0;
+                    assignment.decision
+                        == crate::ai::island_campaign::IslandCampaignDecision::Defend
+                        || assignment.continued_from_existing_squad && structural_shortfall
+                })
+        });
     let plan_exists = world
         .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
         .is_some_and(|cache| cache.campaign_production_planned(player_id));
@@ -481,10 +498,11 @@ fn decide_campaign_production_v4(
             let next = cache.take_campaign_production_command(player_id);
             match next {
                 Some(command)
-                    if reserved_capital_facilities.contains(&GridPosition {
-                        x: command.target_x,
-                        y: command.target_y,
-                    }) =>
+                    if !campaign_preempts_capital
+                        && reserved_capital_facilities.contains(&GridPosition {
+                            x: command.target_x,
+                            y: command.target_y,
+                        }) =>
                 {
                     // 首都編成が今手番に使う施設は、局地購入から外す。
                     continue;
@@ -496,12 +514,17 @@ fn decide_campaign_production_v4(
         let generic_budget = cache.campaign_production_generic_budget(player_id);
         world.insert_resource(cache);
         return match next {
-            Some(command) => CampaignProductionControl::Command(command),
-            None if reserved_capital_budget > 0 => CampaignProductionControl::ContinueWithSurplus(
-                generic_budget
-                    .unwrap_or(0)
-                    .saturating_add(reserved_capital_budget),
-            ),
+            Some(command) => {
+                mark_campaign_production_issued(world, player_id, turn, &command);
+                CampaignProductionControl::Command(command)
+            }
+            None if reserved_capital_budget > 0 && !campaign_preempts_capital => {
+                CampaignProductionControl::ContinueWithSurplus(
+                    generic_budget
+                        .unwrap_or(0)
+                        .saturating_add(reserved_capital_budget),
+                )
+            }
             None if blocks_generic => CampaignProductionControl::BlockGeneric,
             None if generic_budget.is_some_and(|budget| budget > 0) => {
                 CampaignProductionControl::ContinueWithSurplus(generic_budget.unwrap_or(0))
@@ -545,7 +568,9 @@ fn decide_campaign_production_v4(
     let campaign_facilities = scan
         .free_facilities
         .iter()
-        .filter(|(facility, _)| !reserved_capital_facilities.contains(facility))
+        .filter(|(facility, _)| {
+            campaign_preempts_capital || !reserved_capital_facilities.contains(facility)
+        })
         .copied()
         .collect::<Vec<_>>();
     let outcome = plan_campaign_with_expansion_denial_reserve(
@@ -558,8 +583,16 @@ fn decide_campaign_production_v4(
         &scan.damage_chart,
         &scan.map,
         &scan.master_data,
-        scan.funds.saturating_sub(reserved_capital_budget),
+        scan.funds.saturating_sub(if !campaign_preempts_capital {
+            reserved_capital_budget
+        } else {
+            0
+        }),
     );
+    world.init_resource::<campaign_execution::V4CampaignExecutionRegistry>();
+    world
+        .resource_mut::<campaign_execution::V4CampaignExecutionRegistry>()
+        .replace_turn_intents(player_id, turn, &outcome.intents);
     let generic_budget = outcome.generic_funds;
     let mut cache = world
         .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
@@ -573,10 +606,11 @@ fn decide_campaign_production_v4(
         let next = cache.take_campaign_production_command(player_id);
         match next {
             Some(command)
-                if reserved_capital_facilities.contains(&GridPosition {
-                    x: command.target_x,
-                    y: command.target_y,
-                }) =>
+                if !campaign_preempts_capital
+                    && reserved_capital_facilities.contains(&GridPosition {
+                        x: command.target_x,
+                        y: command.target_y,
+                    }) =>
             {
                 continue;
             }
@@ -588,17 +622,35 @@ fn decide_campaign_production_v4(
     world.insert_resource(cache);
 
     match next {
-        Some(command) => CampaignProductionControl::Command(command),
-        None if reserved_capital_budget > 0 => CampaignProductionControl::ContinueWithSurplus(
-            generic_budget
-                .unwrap_or(0)
-                .saturating_add(reserved_capital_budget),
-        ),
+        Some(command) => {
+            mark_campaign_production_issued(world, player_id, turn, &command);
+            CampaignProductionControl::Command(command)
+        }
+        None if reserved_capital_budget > 0 && !campaign_preempts_capital => {
+            CampaignProductionControl::ContinueWithSurplus(
+                generic_budget
+                    .unwrap_or(0)
+                    .saturating_add(reserved_capital_budget),
+            )
+        }
         None if blocks_generic => CampaignProductionControl::BlockGeneric,
         None if generic_budget.is_some_and(|budget| budget > 0) => {
             CampaignProductionControl::ContinueWithSurplus(generic_budget.unwrap_or(0))
         }
         None => CampaignProductionControl::Continue,
+    }
+}
+
+fn mark_campaign_production_issued(
+    world: &mut World,
+    player_id: PlayerId,
+    turn: u32,
+    command: &ProduceUnitCommand,
+) {
+    if let Some(mut registry) =
+        world.get_resource_mut::<campaign_execution::V4CampaignExecutionRegistry>()
+    {
+        registry.mark_issued(player_id, turn, command);
     }
 }
 

@@ -546,6 +546,10 @@ impl OpenWarsAiServer {
             // 遊兵（任務なし・任務があるのに動けない）の計測結果。engine側がターン終了直前に記録する。
             let idle_audit =
                 invasion_trace::snapshot_idle_audit_for_player(&state.world, active_player_id);
+            let operation_assignments = invasion_trace::snapshot_operation_assignments_for_player(
+                &state.world,
+                active_player_id,
+            );
             // V4の生産判断内訳。V1〜V3は記録が無いためnullになる。
             let production_plan =
                 invasion_trace::snapshot_production_plan_for_player(&state.world, active_player_id);
@@ -577,6 +581,7 @@ impl OpenWarsAiServer {
                 "transport_squads": transport_squads,
                 "island_campaign": island_campaign,
                 "idle_audit": idle_audit,
+                "operation_assignments": operation_assignments,
                 "production_plan": production_plan,
                 "deployment_audit": deployment_audit,
                 "plan_revisions": plan_revisions,

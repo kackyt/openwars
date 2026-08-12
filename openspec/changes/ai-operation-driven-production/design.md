@@ -858,6 +858,32 @@ Decision 2 / 3 / 5 / 6 / 14 / 18a / 21 / 22にある金額撃破枠、護衛価�
 
 ただし中央島の目的3拠点はT10時点で所有0、作戦は`capture Entity ... has no transport`で停止し、5体がmission stalled、残資金67,077、V4は最大手番判定で敗北した。また首都Planは資金不成立でT10に撤回され、形成済み6機の攻撃実績は0だった。したがってDecision 28は旧価格換算の撤去とCombat任務接続の検証であり、輸送接続、中央島占領完了、首都形成Planの継続、資金滞留の解決証明ではない。
 
+### Decision 29: 島作戦の未完理由をEntity単位で分類し、検知と復旧実績を分離する
+
+**問題**: `StrategicOperation`が未完であることだけでは、生産命令が未実行なのか、生産済みEntityがSquadへ接続されなかったのか、輸送役が不足したのか、輸送役と搭載cargoが撃破されたのかを区別できなかった。部分発進後に輸送役を持たない後続Formingからcargoだけが残ると、翌手番の`collect_existing_operations`が作戦を復元せず、その占領兵と後続輸送機が別島へ再配分された。さらに原因を検知した時点で`replan_count`を増やしたため、実際に再発注・再割当を行ったかをtraceから証明できなかった。
+
+**選択**: V4島作戦の各生産命令へ`island_id`と`Transport / Capture / Combat`の役割を付け、`Planned -> Issued -> Produced -> Assigned`を実`UnitProducedEvent`まで追跡する。前手番の未照合命令は`Delayed`、照合済みEntityの消滅は`Lost`とする。`Produced` EntityはSquadへ接続されるまで発注元の島へ排他的に予約し、現在Squad、前手番の`VictoryRoadmap` Entity binding、生産直後の発注意図の順に所有権を上書きする。最新の発注意図を最優先とし、直前に確定したRoadmap bindingより古い別島Squadが新規Entityを横取りしてはならない。
+
+輸送役を失った後続Formingでもcargoが生存する限り同じ島の既存作戦として復元する。生産・輸送・占領の構造不足を持つ継続作戦は、まだ実行時期に達していない首都形成購入より当手番の施設と予算を優先し、不足輸送または占領兵を再要求する。作戦bindingは一時的にSquadから消えた生存Entityの所有先として次手番へ渡し、別島への転用ではなく元作戦への再接続を試みる。
+
+未完理由は`AwaitingProduction / ProductionDelayed / ProducedEntityUnassigned / AssignmentLost / TransportUnassigned / TransportDestroyed / CapturerDestroyed / CombatUnitDestroyed / CargoLostWithTransport`へ分類する。輸送撃破時はLoad/Drop eventから維持したmanifestを使い、輸送役本体と搭載cargoの損失を別記録にする。移動逸脱は、Entityが実際に目的島上から島外へ移動した場合だけ記録し、搭載前の出発島内移動を逸脱としない。
+
+原因検知だけでは再計画実績に数えない。後続手番で`RetryProduction / RestoreAssignment / AssignTransport / RequestReplacement`のいずれかを実際の生産record、Squad、assignmentから確認した場合だけ`replan_count`と`last_replan_turn`を更新し、`recovery_history`へ原因と応答の組を残す。MCP traceは現在原因、原因履歴件数、当手番の復旧行動、復旧履歴件数を別々に出力する。
+
+**map_3短期予実**: Hex / seed 42 / V3先攻対V4後攻の5ターン追試で、中央島3はT2に輸送ヘリ1機、T3に占領兵3体と輸送ヘリ2機を同じ作戦へ保持し、Load累計6、T5にDrop累計6まで進んだ。以前の部分発進後に残存占領兵が別島へ消える事象は再現しなかった。別島7の生産済み占領兵は同島へ帰属し、輸送未接続を`TransportUnassigned`として保持した。T5時点では中央島の占領完了前であり、長期の占領達成または損耗後の実再発注を証明する評価ではない。
+
+### Decision 30: Entityごとの作戦所有権を単一の正本へ正規化する
+
+**問題**: campaign portfolio、前手番のRoadmap binding、生産時意図、緊急迎撃、deployment、汎用Squadがそれぞれ独立したEntity集合を持ち、各生成処理が局所的な予約集合だけを見ていた。同じEntityが別島のDefenseとOffense、または輸送SquadとAttack Squadへ同時に残り、後段の優先順位追加では別経路から再発した。作戦・行動ごとに全Squadを走査して重複を防ぐ方式は、行動候補数と作戦数の積で思考時間を増やす。
+
+**選択**: `UnitOperationRegistry`をEntity割当の唯一の正本とし、`Entity -> UnitOperationAssignment`のHashMapと、`OperationOwner -> Entity集合`の逆引きを同時に保持する。`OperationOwner`は島campaign、緊急任務、独立した戦術Squadを区別し、assignmentは実行Squad、役割、割当手番を保持する。1つのcampaignが輸送・占領・戦闘の複数Squadを持つことは許すが、1つのEntityが所属できる作戦ownerと具体Squadはそれぞれ1件だけとする。
+
+割当の変更はregistryの`assign`だけで行い、新ownerへの登録と旧owner逆引きからの除去を同時に行う。portfolio再計画は優先度順の先頭候補を明示的な移管先とし、同じplanning pass内の後続候補による横取りを拒否する。物理的に搭載中のcargoと有効な緊急迎撃は通常作戦より優先する。単なる古いSquadへの重複混入はcampaign間移管の根拠にしない。終了したcampaignは逆引きから所属EntityだけをO(k)で解放し、消滅Entityは生存Entity集合との照合で除去する。
+
+`plan_squads`は手番開始時に前手番の重複を1回、全任務構築後に当手番の重複を1回だけ正規化する。各正規化は自軍unitの生存確認O(U)、Squad参照の収集と不要参照除去O(R)であり、作戦数・行動候補数ごとの再走査を行わない。以後の所有者照会は平均O(1)、作戦終了時解放は当該作戦の所属数O(k)とする。traceには正本の割当Entity数、拒否した競合累計、直近正規化で訪問したSquad参照数を出し、一意性と計算量を監査可能にする。
+
+**map_3検証**: Hex / seed 42 / V3先攻対V4後攻を5ターン追試した。T5のV4ではSquad参照19件に対して一意割当18件、競合検知累計1件となり、重複1件を行動選択前に除去した。正規化後のcampaign portfolioとVictoryRoadmapを全手番・両playerで集計し、Entityの複数作戦所属はいずれも0件だった。訪問参照数は各手番の一意割当数と同程度（最大V3 24、V4 19）で、作戦数や行動候補数との積には増えていない。対戦全体のV4思考時間はRolling Plan探索が依然支配的であり、この変更はその探索時間の改善を主張するものではない。
+
 ## Risks / Trade-offs
 
 | リスク | 影響 | 軽減策 |

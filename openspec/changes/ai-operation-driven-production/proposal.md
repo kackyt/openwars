@@ -163,10 +163,13 @@
 - `engine/src/ai/island_campaign.rs` / `island_campaign_analysis.rs`: 洋上 Reinforce の実 cargo と生産可能輸送手段を出発島・積載可能兵種込みで照合し、輸送不足を shortfall として保持。Assault は作戦優先度、将来予算予約、生産可能経路別の輸送編成、初動上陸波の容量を同じ作戦状態で管理する
 - `engine/src/ai/island_campaign.rs` / `island_campaign_analysis.rs`: 加えて、相対収入と地上／航空／海上の前進補給網から兵站前提作戦を導出し、新規Assaultとの依存関係を管理する
 - `engine/src/ai/v4/deployment.rs`: V4のpending deployment、実Entity照合、局地標的追跡、fallback、攻撃実績監査を保持
+- `engine/src/ai/v4/campaign_execution.rs`（新規）: 島作戦の生産命令をIslandId・役割・施設・unit種別で実Entityへ照合し、生産遅延、割当、損耗と次手番の排他的な作戦所有権を保持する
+- `engine/src/ai/operation_assignment.rs`（新規）: Entityごとの唯一の作戦owner／実行Squad／役割を保持する正本とowner逆引きを提供し、平均O(1)照会、原子的移管、所属数O(k)の作戦解放を保証する
+- `engine/src/ai/v4/victory_roadmap.rs`: 未完原因と復旧行動を別履歴へ記録し、輸送manifestから輸送役・cargo損失を区別する。原因検知ではなく実際の再発注・再割当・輸送付与・補充確認だけを再計画実績とする
 - `engine/src/ai/v4/rolling_plan.rs`（新規）: 島作戦snapshot、混成編成候補、計画revision、Pareto前線、予実差、再計画理由を保持する純粋な計画器
 - `engine/src/ai/v4/plan_revision.rs`（新規）: 実行可能なCombat生産列を手番間で保持し、固定列再評価、step実績照合、Plan単位の予実台帳、増援・遅延判定、盤面事実による継続・revision・完了・撤回を管理する
 - `engine/src/ai/operation_simulation.rs`（新規）: 本番ルールと共有する移動・戦闘・輸送・占領のターン単位予測を提供し、V4検証後にV3からも再利用する
-- `engine/src/ai/squad.rs`: 自力展開戦力と輸送 cargo の分離、複数 cargo の Pickup 進行。加えてV4局地任務をcampaign再配分とgeneric free poolより先に予約する
+- `engine/src/ai/squad.rs`: 自力展開戦力と輸送 cargo の分離、複数 cargo の Pickup 進行。加えて手番境界のO(U+R)正規化でcampaign、緊急任務、deployment、汎用Squadの重複参照を唯一owner／Squadへ収束させる
 - `engine/src/ai/engine.rs`: Drop に参加した輸送役と cargo の双方を当該ターンの行動済みとして記録。加えてV1〜V4共通の攻撃・接近評価へ、搭載兵力と占領阻止を含む戦略標的価値を導入し、V4では局地任務の現在標的Entityを通常標的より優先する
 - `engine/src/ai/engine.rs`: 航空unitの候補移動を、移動後も最寄りの自軍空港へ日次消費込みで帰投可能な範囲へ制限する。空港喪失などで既に安全圏外なら、帰還不足を悪化させず空港距離を縮める回復移動を許す
 - `engine/src/ai/emergency.rs`: 中立拠点InterceptionはV4局地任務Entityをpreemptせず、自軍所有拠点への脅威だけがpreemptできる責務境界を追加

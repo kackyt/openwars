@@ -122,3 +122,27 @@ MUST: V1〜V4の戦術行動は、敵unit本体だけでなく、そのunitが�
 
 - **WHEN** 敵cargoが`Transporting`状態で盤外座標を保持しているとき
 - **THEN** cargoを独立した接近対象から除外し、そのunit costを搭載元輸送unitの標的価値へ含める
+
+### Requirement: Entity単位の一意な作戦所有権
+
+MUST: AIは各自軍Entityを同時に1つの作戦ownerおよび1つの具体Squadだけへ所属させなければならない。作戦所有権の正本はEntityをキーとする単一registryとし、Squad、campaign、Roadmap、生産意図が独立した正本を持ってはならない。
+
+#### Scenario: 別島作戦への重複混入を正規化する
+
+- **WHEN** 同じEntityが異なる島を対象とする複数Squadへ混入したとき
+- **THEN** 明示的なportfolio再計画、生産時意図、物理搭載、緊急任務の規則で1作戦だけを選び、他のSquadのmembers、cargo、delivered参照から同じ手番の行動選択前に除去する
+
+#### Scenario: 作戦再計画で所有権を排他的に移管する
+
+- **WHEN** portfolio再計画が既存Entityを別作戦の優先候補として選んだとき
+- **THEN** 新作戦への登録と旧作戦の逆引きからの除去を原子的に行い、同じplanning passの下位候補には再割当しない
+
+#### Scenario: 作戦終了時に所属Entityだけを解放する
+
+- **WHEN** campaignが完了または撤回され、現行portfolioから消えたとき
+- **THEN** 全Entityまたは全作戦を走査せず、作戦ownerの逆引きに属するEntityだけを解放する
+
+#### Scenario: 行動候補ごとの重複走査を行わない
+
+- **WHEN** 1手番のSquad計画と行動選択を行うとき
+- **THEN** 一意性検証はplanning境界のO(U+R)正規化に限定し、以後のowner照会はEntityキーの平均O(1) lookupを使用する

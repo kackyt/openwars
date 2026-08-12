@@ -12,6 +12,7 @@ use engine::ai::island_campaign::{
     IslandCampaignState,
 };
 use engine::ai::islands::IslandMap;
+use engine::ai::operation_assignment::UnitOperationRegistry;
 use engine::ai::squad::{MissionPhase, MissionType, SquadManager};
 use engine::ai::v4::deployment::V4DeploymentRegistry;
 use engine::ai::v4::logistics_plan::{LogisticsRouteMetrics, V4LogisticsPlanRegistry};
@@ -489,6 +490,12 @@ pub struct StrategicOperationSnapshot {
     pub last_step: Option<String>,
     pub last_progress_turn: Option<u32>,
     pub blocked_reason: Option<String>,
+    pub current_issues: Vec<String>,
+    pub issue_history_count: usize,
+    pub latest_recoveries: Vec<String>,
+    pub recovery_history_count: usize,
+    pub replan_count: u32,
+    pub last_replan_turn: Option<u32>,
     pub active: bool,
 }
 
@@ -616,6 +623,28 @@ pub struct IslandCampaignRequirementSnapshot {
     pub ground_combat_units: u32,
     pub combat_units: u32,
     pub total_budget: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OperationAssignmentSnapshot {
+    pub player_id: u32,
+    pub assigned_entity_count: usize,
+    pub rejected_conflict_count: u64,
+    /// 直近の境界reconcileで訪問したSquad参照数。行動数との積にはならない。
+    pub reconcile_reference_visits: usize,
+}
+
+pub fn snapshot_operation_assignments_for_player(
+    world: &World,
+    player_id: PlayerId,
+) -> Option<OperationAssignmentSnapshot> {
+    let registry = world.get_resource::<UnitOperationRegistry>()?;
+    Some(OperationAssignmentSnapshot {
+        player_id: player_id.0,
+        assigned_entity_count: registry.assigned_count(player_id),
+        rejected_conflict_count: registry.rejected_conflicts(),
+        reconcile_reference_visits: registry.last_reconcile_visits(),
+    })
 }
 
 pub struct InvasionTraceCollector {
@@ -1329,6 +1358,37 @@ pub fn snapshot_victory_roadmap_for_player(
                 last_step: operation.last_step.map(|step| format!("{step:?}")),
                 last_progress_turn: operation.last_progress_turn,
                 blocked_reason: operation.blocked_reason.clone(),
+                current_issues: operation
+                    .current_issues
+                    .iter()
+                    .map(|issue| {
+                        format!(
+                            "{:?}:{}",
+                            issue.kind,
+                            issue.entity.map_or_else(
+                                || "none".to_owned(),
+                                |entity| entity.to_bits().to_string()
+                            )
+                        )
+                    })
+                    .collect(),
+                issue_history_count: operation.issue_history.len(),
+                latest_recoveries: operation
+                    .recovery_history
+                    .iter()
+                    .filter(|recovery| recovery.completed_turn == operation.last_observed_turn)
+                    .map(|recovery| {
+                        format!(
+                            "{:?}:{:?}:{}",
+                            recovery.kind,
+                            recovery.cause,
+                            recovery.entity.map_or(0, Entity::to_bits)
+                        )
+                    })
+                    .collect(),
+                recovery_history_count: operation.recovery_history.len(),
+                replan_count: operation.replan_count,
+                last_replan_turn: operation.last_replan_turn,
                 active: operation.active,
             }
         })

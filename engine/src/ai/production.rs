@@ -29,9 +29,12 @@ enum CampaignProductionRequirement {
     Combat,
 }
 
+use crate::ai::v4::campaign_execution::{CampaignProductionIntent, CampaignProductionRole};
+
 #[derive(Debug)]
 pub(crate) struct CampaignProductionOutcome {
     pub(crate) commands: Vec<ProduceUnitCommand>,
+    pub(crate) intents: Vec<CampaignProductionIntent>,
     pub(crate) remaining_funds: u32,
     /// 全キャンペーン不足の予約額を残した後、汎用の迎撃・戦闘へ使ってよい額。
     pub(crate) generic_funds: u32,
@@ -569,6 +572,7 @@ fn plan_campaign_shortfall_production_with_damage(
 
     let mut outcome = CampaignProductionOutcome {
         commands: Vec::new(),
+        intents: Vec::new(),
         remaining_funds: available_funds,
         generic_funds: 0,
         used_facilities: std::collections::HashSet::new(),
@@ -701,12 +705,26 @@ fn plan_campaign_shortfall_production_with_damage(
                 break;
             };
 
-            outcome.commands.push(ProduceUnitCommand {
+            let command = ProduceUnitCommand {
                 player_id,
                 target_x: position.x,
                 target_y: position.y,
                 unit_type,
+            };
+            let role = match requirement {
+                CampaignProductionRequirement::HeavyTransport
+                | CampaignProductionRequirement::LightTransport => {
+                    CampaignProductionRole::Transport
+                }
+                CampaignProductionRequirement::Capture => CampaignProductionRole::Capture,
+                CampaignProductionRequirement::Combat => CampaignProductionRole::Combat,
+            };
+            outcome.intents.push(CampaignProductionIntent {
+                command: command.clone(),
+                island_id: row.island_id,
+                role,
             });
+            outcome.commands.push(command);
             outcome.remaining_funds = outcome.remaining_funds.saturating_sub(stats.cost);
             outcome.used_facilities.insert(position);
             consume_campaign_candidate(row, requirement, stats);
@@ -1107,6 +1125,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
     // --- 3. V3 campaign予約行をpriority rank・島ID順に先行消費 ---
     let mut campaign_outcome = CampaignProductionOutcome {
         commands: Vec::new(),
+        intents: Vec::new(),
         remaining_funds: available_funds,
         generic_funds: 0,
         used_facilities: std::collections::HashSet::new(),

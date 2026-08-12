@@ -213,6 +213,8 @@ def write_trace_jsonl(path, results):
 
         for entry in result.get("idle_audit_history", []):
             record_for(entry)["idle_audit"] = entry.get("audit")
+        for entry in result.get("operation_assignment_history", []):
+            record_for(entry)["operation_assignments"] = entry.get("assignments")
         for entry in result.get("island_campaign_history", []):
             record = record_for(entry)
             record["available_funds"] = entry.get("available_funds")
@@ -315,6 +317,7 @@ def run_single_game(
     # 遊兵・生産判断・生産Entityの任務実績をターン別に保持する。
     # いずれも engine 側が判定済みの結果で、ここでは記録だけを行う。
     idle_audit_history = []
+    operation_assignment_history = []
     production_plan_history = []
     deployment_audit_history = []
     plan_revision_history = []
@@ -342,6 +345,7 @@ def run_single_game(
             "strategic_history": strategic_history,
             "island_campaign_history": island_campaign_history,
             "idle_audit_history": idle_audit_history,
+            "operation_assignment_history": operation_assignment_history,
             "production_plan_history": production_plan_history,
             "deployment_audit_history": deployment_audit_history,
             "plan_revision_history": plan_revision_history,
@@ -446,6 +450,17 @@ def run_single_game(
                     "turn": state.get("turn"),
                     "player_id": ai_result.get("player_id", current_player),
                     "audit": idle_audit,
+                }
+            )
+
+        operation_assignments = ai_result.get("operation_assignments")
+        if operation_assignments is not None:
+            operation_assignment_history.append(
+                {
+                    "round": turn,
+                    "turn": state.get("turn"),
+                    "player_id": ai_result.get("player_id", current_player),
+                    "assignments": operation_assignments,
                 }
             )
 
@@ -1231,6 +1246,7 @@ def main():
                             "strategic_history",
                             "island_campaign_history",
                             "idle_audit_history",
+                            "operation_assignment_history",
                             "production_plan_history",
                             "deployment_audit_history",
                             "plan_revision_history",

@@ -4,6 +4,9 @@
 #![allow(clippy::unnecessary_map_or)]
 
 use crate::ai::cluster::detect_enemy_clusters;
+use crate::ai::operation_assignment::{
+    OperationOwner, OperationUnitRole, UnitOperationAssignment, UnitOperationRegistry,
+};
 use crate::ai::strategy::{analyze_strategy, analyze_strategy_with_reserved_entities};
 use crate::ai::turn_distance::{
     TerrainConnectivity, TurnDistanceCache, calculate_all_turn_distances, calculate_turn_distance,
@@ -126,6 +129,396 @@ impl SquadManager {
     pub fn remove_squad(&mut self, id: SquadId) {
         self.squads.retain(|s| s.id != id);
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SquadAssignmentCandidate {
+    squad_id: SquadId,
+    owner: OperationOwner,
+    role: OperationUnitRole,
+    physically_loaded: bool,
+    arrived_at_campaign: bool,
+    mission_rank: u8,
+}
+
+fn operation_owner_for_squad(squad: &Squad, player_id: PlayerId) -> OperationOwner {
+    if let MissionType::Interception(mission_id) = squad.mission_type {
+        OperationOwner::Emergency {
+            player_id,
+            mission_id,
+        }
+    } else if let Some(island_id) = squad.target_island {
+        OperationOwner::Campaign {
+            player_id,
+            island_id,
+        }
+    } else {
+        OperationOwner::TacticalSquad {
+            player_id,
+            squad_id: squad.id,
+        }
+    }
+}
+
+fn assignment_mission_rank(mission: &MissionType) -> u8 {
+    match mission {
+        MissionType::Interception(_) => 0,
+        MissionType::Transport => 1,
+        MissionType::Capture => 2,
+        MissionType::Attack => 3,
+        MissionType::Defense => 4,
+    }
+}
+
+fn assignment_candidate_key(
+    candidate: &SquadAssignmentCandidate,
+    existing: Option<UnitOperationAssignment>,
+) -> Option<(u8, u8, u32)> {
+    if candidate.physically_loaded {
+        return Some((0, candidate.mission_rank, candidate.squad_id.0));
+    }
+    if matches!(candidate.owner, OperationOwner::Emergency { .. }) {
+        return Some((1, candidate.mission_rank, candidate.squad_id.0));
+    }
+    if candidate.arrived_at_campaign {
+        // 実際に目的島へ到達したEntityの現地Squadは、生産時予約や旧島bindingからの
+        // 正式handoffとみなす。座標事実を伴わない重複Squadには適用しない。
+        let arrived_role_rank = match candidate.role {
+            OperationUnitRole::Member => 0,
+            OperationUnitRole::Transport => 1,
+            OperationUnitRole::DeliveredCargo => 2,
+            OperationUnitRole::Cargo => 3,
+        };
+        return Some((2, arrived_role_rank, candidate.squad_id.0));
+    }
+    if existing.is_some_and(|assignment| {
+        assignment.owner == candidate.owner && assignment.squad_id == Some(candidate.squad_id)
+    }) {
+        // 同一作戦に複数の実行Squadがある場合も、正式handoffが無い限り
+        // 前手番の具体Squadを維持する。
+        return Some((3, candidate.mission_rank, candidate.squad_id.0));
+    }
+    match existing.map(|assignment| assignment.owner) {
+        Some(OperationOwner::Campaign { .. }) if existing.unwrap().owner != candidate.owner => {
+            // campaign間の移管は作戦plannerが明示する。Squadの重複だけでは横取りしない。
+            None
+        }
+        Some(owner) if owner == candidate.owner => {
+            Some((4, candidate.mission_rank, candidate.squad_id.0))
+        }
+        Some(OperationOwner::TacticalSquad { .. })
+            if matches!(candidate.owner, OperationOwner::Campaign { .. }) =>
+        {
+            Some((5, candidate.mission_rank, candidate.squad_id.0))
+        }
+        Some(OperationOwner::Emergency { .. }) => {
+            // 前手番の緊急任務が消えた後は、現在存在する通常作戦へ解放する。
+            Some((6, candidate.mission_rank, candidate.squad_id.0))
+        }
+        Some(_) => Some((7, candidate.mission_rank, candidate.squad_id.0)),
+        None if matches!(candidate.owner, OperationOwner::Campaign { .. }) => {
+            Some((5, candidate.mission_rank, candidate.squad_id.0))
+        }
+        None => Some((7, candidate.mission_rank, candidate.squad_id.0)),
+    }
+}
+
+/// 全Squadを手番の境界で一度だけ線形走査し、Entityごとに唯一の作戦・Squadを確定する。
+/// 以降の所有者照会はUnitOperationRegistryのHashMapから平均O(1)で行う。
+fn reconcile_unique_operation_assignments(
+    world: &mut World,
+    manager: &mut SquadManager,
+    player_id: PlayerId,
+) {
+    let turn = world
+        .get_resource::<crate::resources::MatchState>()
+        .map_or(0, |state| state.current_turn_number.0);
+    let (all_live_entities, live_entities) = {
+        let mut query = world.query::<(Entity, &Faction)>();
+        let all = query.iter(world).collect::<Vec<_>>();
+        (
+            all.iter()
+                .map(|(entity, _)| *entity)
+                .collect::<HashSet<_>>(),
+            all.iter()
+                .filter_map(|(entity, faction)| (faction.0 == player_id).then_some(*entity))
+                .collect::<HashSet<_>>(),
+        )
+    };
+    let transported_by = {
+        let mut query = world.query::<(Entity, &crate::components::Transporting)>();
+        query
+            .iter(world)
+            .map(|(cargo, transporting)| (cargo, transporting.0))
+            .collect::<HashMap<_, _>>()
+    };
+    let island_map = world
+        .get_resource::<crate::ai::islands::IslandMap>()
+        .cloned();
+    let entity_islands = world
+        .iter_entities()
+        .filter_map(|entity| {
+            let position = entity.get::<GridPosition>()?;
+            let island = island_map.as_ref()?.get_island_at(position)?;
+            Some((entity.id(), island.id))
+        })
+        .collect::<HashMap<_, _>>();
+    let arrived_at_campaign = |entity: Entity, owner: OperationOwner| {
+        let OperationOwner::Campaign { island_id, .. } = owner else {
+            return false;
+        };
+        entity_islands.get(&entity) == Some(&island_id)
+    };
+    let mut registry = world
+        .remove_resource::<UnitOperationRegistry>()
+        .unwrap_or_default();
+    registry.retain_live_entities(&all_live_entities);
+    // 生産直後の作戦意図は、まだSquadが無くても最初から唯一ownerとして登録する。
+    if let Some(produced) = world
+        .get_resource::<crate::ai::v4::campaign_execution::V4CampaignExecutionRegistry>()
+        .map(|execution| execution.produced_entity_assignments(player_id))
+    {
+        for (entity, island_id) in produced {
+            if live_entities.contains(&entity) {
+                let owner = OperationOwner::Campaign {
+                    player_id,
+                    island_id,
+                };
+                // 同じ作戦で既に実Squadへ接続済みなら、生産時意図で未接続へ戻さない。
+                if registry
+                    .assignment(entity)
+                    .is_some_and(|assignment| assignment.owner == owner)
+                {
+                    continue;
+                }
+                registry.assign(
+                    entity,
+                    UnitOperationAssignment {
+                        owner,
+                        squad_id: None,
+                        role: OperationUnitRole::Member,
+                        assigned_turn: turn,
+                    },
+                );
+            }
+        }
+    }
+    let existing = registry.player_assignments(player_id);
+    let mut candidates: HashMap<Entity, Vec<SquadAssignmentCandidate>> = HashMap::new();
+    let mut visits = 0usize;
+    for squad in manager
+        .squads
+        .iter()
+        .filter(|squad| squad.owner_id == Some(player_id))
+    {
+        let owner = operation_owner_for_squad(squad, player_id);
+        let mission_rank = assignment_mission_rank(&squad.mission_type);
+        for entity in &squad.members {
+            if !live_entities.contains(entity) {
+                continue;
+            }
+            visits = visits.saturating_add(1);
+            let role = if squad.transport_entity == Some(*entity) {
+                OperationUnitRole::Transport
+            } else {
+                OperationUnitRole::Member
+            };
+            candidates
+                .entry(*entity)
+                .or_default()
+                .push(SquadAssignmentCandidate {
+                    squad_id: squad.id,
+                    owner,
+                    role,
+                    physically_loaded: false,
+                    arrived_at_campaign: arrived_at_campaign(*entity, owner),
+                    mission_rank,
+                });
+        }
+        for (entities, role) in [
+            (&squad.cargo_entities, OperationUnitRole::Cargo),
+            (&squad.delivered_cargo, OperationUnitRole::DeliveredCargo),
+        ] {
+            for entity in entities {
+                if !live_entities.contains(entity) {
+                    continue;
+                }
+                visits = visits.saturating_add(1);
+                candidates
+                    .entry(*entity)
+                    .or_default()
+                    .push(SquadAssignmentCandidate {
+                        squad_id: squad.id,
+                        owner,
+                        role,
+                        physically_loaded: squad.transport_entity.is_some_and(|transport| {
+                            transported_by.get(entity) == Some(&transport)
+                        }),
+                        arrived_at_campaign: arrived_at_campaign(*entity, owner),
+                        mission_rank,
+                    });
+            }
+        }
+    }
+
+    let mut winners = HashMap::new();
+    for (entity, entity_candidates) in &candidates {
+        let prior = existing.get(entity).copied();
+        let winner = entity_candidates
+            .iter()
+            .filter_map(|candidate| {
+                assignment_candidate_key(candidate, prior).map(|key| (key, *candidate))
+            })
+            .min_by_key(|(key, _)| *key)
+            .map(|(_, candidate)| candidate);
+        if entity_candidates.len() > 1 {
+            registry.note_rejected_conflict();
+        }
+        if let Some(winner) = winner {
+            winners.insert(*entity, winner);
+        }
+    }
+
+    // 勝者以外の参照を一括除去する。作戦・行動ごとの全走査は行わない。
+    for squad in manager
+        .squads
+        .iter_mut()
+        .filter(|squad| squad.owner_id == Some(player_id))
+    {
+        squad.members.retain(|entity| {
+            if all_live_entities.contains(entity) && !live_entities.contains(entity) {
+                // owner/Factionが矛盾するSquadはどちらのplayer planningでも変更しない。
+                return true;
+            }
+            winners
+                .get(entity)
+                .is_some_and(|winner| winner.squad_id == squad.id)
+        });
+        squad.cargo_entities.retain(|entity| {
+            if all_live_entities.contains(entity) && !live_entities.contains(entity) {
+                return true;
+            }
+            winners.get(entity).is_some_and(|winner| {
+                winner.squad_id == squad.id && winner.role == OperationUnitRole::Cargo
+            })
+        });
+        squad.delivered_cargo.retain(|entity| {
+            if all_live_entities.contains(entity) && !live_entities.contains(entity) {
+                return true;
+            }
+            winners.get(entity).is_some_and(|winner| {
+                winner.squad_id == squad.id && winner.role == OperationUnitRole::DeliveredCargo
+            })
+        });
+        if squad
+            .transport_entity
+            .is_some_and(|entity| !squad.members.contains(&entity))
+        {
+            squad.transport_entity = None;
+        }
+    }
+
+    for (entity, winner) in &winners {
+        registry.assign(
+            *entity,
+            UnitOperationAssignment {
+                owner: winner.owner,
+                squad_id: Some(winner.squad_id),
+                role: winner.role,
+                assigned_turn: turn,
+            },
+        );
+    }
+    // campaignはSquadが一時的に消えても作戦所有権を維持する。他は実Squad消滅で解放する。
+    for (entity, assignment) in existing {
+        if !winners.contains_key(&entity)
+            && !matches!(assignment.owner, OperationOwner::Campaign { .. })
+        {
+            registry.release_entity(entity);
+        }
+    }
+    registry.note_reconcile_visits(visits);
+    world.insert_resource(registry);
+}
+
+/// allocatorの出力を優先度順に正規台帳へ予約する。同じEntityが複数assignmentに
+/// 混入しても最初のownerだけが成立し、後段はHashMap照会で排除される。
+fn claim_campaign_portfolio_assignments(
+    world: &mut World,
+    player_id: PlayerId,
+    portfolio: &crate::ai::island_campaign::IslandCampaignPortfolio,
+) {
+    let turn = world
+        .get_resource::<crate::resources::MatchState>()
+        .map_or(0, |state| state.current_turn_number.0);
+    let mut assignments = portfolio
+        .defenses
+        .iter()
+        .chain(portfolio.active_offensives.iter())
+        .collect::<Vec<_>>();
+    assignments.sort_by_key(|assignment| campaign_assignment_priority(assignment));
+    let mut registry = world
+        .remove_resource::<UnitOperationRegistry>()
+        .unwrap_or_default();
+    let active_owners = assignments
+        .iter()
+        .map(|assignment| OperationOwner::Campaign {
+            player_id,
+            island_id: assignment.island_id,
+        })
+        .collect::<HashSet<_>>();
+    for owner in registry.campaign_owners(player_id) {
+        if !active_owners.contains(&owner) {
+            registry.release_operation(owner);
+        }
+    }
+    let mut claimed_entities = HashMap::new();
+    for assignment in assignments {
+        let owner = OperationOwner::Campaign {
+            player_id,
+            island_id: assignment.island_id,
+        };
+        for (entities, role) in [
+            (&assignment.transport_entities, OperationUnitRole::Transport),
+            (&assignment.capture_entities, OperationUnitRole::Cargo),
+            (&assignment.combat_entities, OperationUnitRole::Member),
+        ] {
+            for entity in entities {
+                if let Some(claimed_owner) = claimed_entities.get(entity) {
+                    if *claimed_owner != owner {
+                        registry.note_rejected_conflict();
+                    }
+                    continue;
+                }
+                let existing = registry.assignment(*entity);
+                if let Some(current) = existing {
+                    if current.owner == owner {
+                        claimed_entities.insert(*entity, owner);
+                        // 実Squadへ接続済みの割当をportfolio上の予約で弱めない。
+                        continue;
+                    }
+                    if matches!(current.owner, OperationOwner::Emergency { .. }) {
+                        // 緊急任務中のEntityは通常campaign plannerから横取りしない。
+                        registry.note_rejected_conflict();
+                        continue;
+                    }
+                }
+                // portfolio再計画の先頭候補を明示的な移管先とする。旧campaignの
+                // 逆引きはassignが同時に外すため、別途全作戦を走査しない。
+                registry.assign(
+                    *entity,
+                    UnitOperationAssignment {
+                        owner,
+                        squad_id: None,
+                        role,
+                        assigned_turn: turn,
+                    },
+                );
+                claimed_entities.insert(*entity, owner);
+            }
+        }
+    }
+    world.insert_resource(registry);
 }
 
 /// #53 (V3): 敵生産施設への奪取部隊の護衛として適格かを判定する。
@@ -2662,6 +3055,8 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     let is_v4 = crate::ai::resolve_player_ai_version(world, perspective_player)
         .uses_operation_driven_production();
     let mut manager = world.remove_resource::<SquadManager>().unwrap_or_default();
+    // 前手番の作戦所有権を使って古い重複Squadを一度だけ正規化してから分析する。
+    reconcile_unique_operation_assignments(world, &mut manager, perspective_player);
     let mut tactical_reserved_entities = HashSet::new();
     let strategy = if is_v3 {
         // 緊急ミッションは盤面から毎ターン再構築し、通常部隊より先に担当Entityを予約する。
@@ -2719,6 +3114,11 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         cache.set_campaign_portfolio(perspective_player, strategy.campaign_portfolio.clone());
         cache.mark_squads_planned(perspective_player);
         world.insert_resource(cache);
+        claim_campaign_portfolio_assignments(
+            world,
+            perspective_player,
+            &strategy.campaign_portfolio,
+        );
     }
     let paused_campaign_islands = if is_v3 {
         campaign_paused_islands(&strategy.campaign_portfolio)
@@ -3678,6 +4078,9 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
             &manager,
         );
     }
+    // campaign・deployment・汎用任務をすべて構築した後に一度だけ正規化する。
+    // これ以降の行動選択は重複Squadを見ず、所有者照会も平均O(1)になる。
+    reconcile_unique_operation_assignments(world, &mut manager, perspective_player);
     world.insert_resource(manager);
 }
 
@@ -4774,6 +5177,161 @@ mod tests {
         world.insert_resource(crate::ai::islands::IslandMap::analyze(&map));
         world.insert_resource(SquadManager::new());
         world
+    }
+
+    #[test]
+    fn unique_operation_registry_keeps_one_campaign_owner_with_linear_reconcile() {
+        let mut world = setup_test_world();
+        let player = PlayerId(1);
+        let entity = world
+            .spawn((
+                Faction(player),
+                GridPosition { x: 0, y: 0 },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let intended_island = crate::ai::islands::IslandId(7);
+        let stale_island = crate::ai::islands::IslandId(5);
+        let mut registry = UnitOperationRegistry::default();
+        registry.assign(
+            entity,
+            UnitOperationAssignment {
+                owner: OperationOwner::Campaign {
+                    player_id: player,
+                    island_id: intended_island,
+                },
+                squad_id: None,
+                role: OperationUnitRole::Member,
+                assigned_turn: 1,
+            },
+        );
+        world.insert_resource(registry);
+        let mut manager = SquadManager::new();
+        let stale = manager.create_owned_squad(MissionType::Defense, player);
+        let stale_id = stale.id;
+        stale.target_island = Some(stale_island);
+        stale.members.insert(entity);
+        let intended = manager.create_owned_squad(MissionType::Capture, player);
+        let intended_id = intended.id;
+        intended.target_island = Some(intended_island);
+        intended.members.insert(entity);
+
+        reconcile_unique_operation_assignments(&mut world, &mut manager, player);
+
+        assert!(
+            !manager
+                .squads
+                .iter()
+                .find(|squad| squad.id == stale_id)
+                .unwrap()
+                .members
+                .contains(&entity)
+        );
+        assert!(
+            manager
+                .squads
+                .iter()
+                .find(|squad| squad.id == intended_id)
+                .unwrap()
+                .members
+                .contains(&entity)
+        );
+        let registry = world.resource::<UnitOperationRegistry>();
+        let assignment = registry.assignment(entity).expect("unique assignment");
+        assert_eq!(
+            assignment.owner,
+            OperationOwner::Campaign {
+                player_id: player,
+                island_id: intended_island,
+            }
+        );
+        assert_eq!(assignment.squad_id, Some(intended_id));
+        assert_eq!(registry.last_reconcile_visits(), 2);
+        assert_eq!(registry.rejected_conflicts(), 1);
+    }
+
+    #[test]
+    fn campaign_claim_preempts_generic_squad_without_scanning_per_action() {
+        let mut world = setup_test_world();
+        let player = PlayerId(1);
+        let entity = world
+            .spawn((
+                Faction(player),
+                GridPosition { x: 0, y: 0 },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let island = crate::ai::islands::IslandId(3);
+        let mut manager = SquadManager::new();
+        let generic = manager.create_owned_squad(MissionType::Defense, player);
+        generic.members.insert(entity);
+        let campaign = manager.create_owned_squad(MissionType::Capture, player);
+        let campaign_id = campaign.id;
+        campaign.target_island = Some(island);
+        campaign.members.insert(entity);
+
+        reconcile_unique_operation_assignments(&mut world, &mut manager, player);
+
+        assert_eq!(
+            world.resource::<UnitOperationRegistry>().assignment(entity),
+            Some(UnitOperationAssignment {
+                owner: OperationOwner::Campaign {
+                    player_id: player,
+                    island_id: island,
+                },
+                squad_id: Some(campaign_id),
+                role: OperationUnitRole::Member,
+                assigned_turn: world.resource::<MatchState>().current_turn_number.0,
+            })
+        );
+    }
+
+    #[test]
+    fn one_campaign_can_have_multiple_squads_but_entity_has_one_concrete_squad() {
+        let mut world = setup_test_world();
+        let player = PlayerId(1);
+        let entity = world
+            .spawn((
+                Faction(player),
+                GridPosition { x: 0, y: 0 },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let island = crate::ai::islands::IslandId(3);
+        let mut manager = SquadManager::new();
+        let first = manager.create_owned_squad(MissionType::Transport, player);
+        let first_id = first.id;
+        first.target_island = Some(island);
+        first.members.insert(entity);
+        let second = manager.create_owned_squad(MissionType::Defense, player);
+        second.target_island = Some(island);
+        second.members.insert(entity);
+
+        reconcile_unique_operation_assignments(&mut world, &mut manager, player);
+
+        let containing_squads = manager
+            .squads
+            .iter()
+            .filter(|squad| squad.members.contains(&entity))
+            .map(|squad| squad.id)
+            .collect::<Vec<_>>();
+        assert_eq!(containing_squads, vec![first_id]);
+        assert_eq!(
+            world
+                .resource::<UnitOperationRegistry>()
+                .assignment(entity)
+                .and_then(|assignment| assignment.squad_id),
+            Some(first_id)
+        );
     }
 
     #[test]

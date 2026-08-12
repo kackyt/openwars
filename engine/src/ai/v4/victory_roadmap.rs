@@ -10,8 +10,8 @@ use crate::components::{
     CargoCapacity, Faction, GridPosition, Health, PlayerId, Property, Transporting, UnitStats,
 };
 use crate::events::{
-    PropertyCaptureProgressedEvent, PropertyCapturedEvent, UnitAttackedEvent, UnitLoadedEvent,
-    UnitMovedEvent, UnitSuppliedEvent, UnitUnloadedEvent, UnitWaitedEvent,
+    PropertyCaptureProgressedEvent, PropertyCapturedEvent, UnitAttackedEvent, UnitDestroyedEvent,
+    UnitLoadedEvent, UnitMovedEvent, UnitSuppliedEvent, UnitUnloadedEvent, UnitWaitedEvent,
 };
 use crate::resources::{Map, MatchState, Terrain, master_data::MasterDataRegistry};
 use crate::systems::movement::OccupantInfo;
@@ -73,6 +73,47 @@ pub enum OperationEntityRole {
     Combat,
 }
 
+/// 未完工程の直接原因。単なる「未完」から、再計画で取るべき行動を分離する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OperationIssueKind {
+    AwaitingProduction,
+    ProductionDelayed,
+    ProducedEntityUnassigned,
+    AssignmentLost,
+    TransportUnassigned,
+    TransportDestroyed,
+    CapturerDestroyed,
+    CombatUnitDestroyed,
+    CargoLostWithTransport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationIssue {
+    pub kind: OperationIssueKind,
+    pub detected_turn: u32,
+    pub entity: Option<Entity>,
+    pub related_entity: Option<Entity>,
+    pub detail: String,
+}
+
+/// 検知した原因に対して実際に確認できた復旧行動。原因検知だけを再計画実績に数えない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OperationRecoveryKind {
+    RetryProduction,
+    RestoreAssignment,
+    AssignTransport,
+    RequestReplacement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationRecoveryAction {
+    pub kind: OperationRecoveryKind,
+    pub cause: OperationIssueKind,
+    pub completed_turn: u32,
+    pub entity: Option<Entity>,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StepExecutionTotals {
     pub moves: u32,
@@ -111,6 +152,11 @@ pub struct StrategicOperation {
     pub last_step: Option<CampaignStepKind>,
     pub last_progress_turn: Option<u32>,
     pub blocked_reason: Option<String>,
+    pub current_issues: Vec<OperationIssue>,
+    pub issue_history: Vec<OperationIssue>,
+    pub recovery_history: Vec<OperationRecoveryAction>,
+    pub replan_count: u32,
+    pub last_replan_turn: Option<u32>,
     pub active: bool,
 }
 
@@ -145,6 +191,7 @@ pub struct VictoryRoadmapRegistry {
     operations: HashMap<StrategicOperationId, StrategicOperation>,
     operation_keys: HashMap<(PlayerId, IslandId, StrategicPurpose), StrategicOperationId>,
     entity_bindings: HashMap<Entity, EntityOperationBinding>,
+    transport_manifests: HashMap<Entity, HashSet<Entity>>,
 }
 
 impl VictoryRoadmapRegistry {
@@ -246,6 +293,11 @@ impl VictoryRoadmapRegistry {
                     blocked_reason: Some(
                         "no executable capital assault schedule has been selected".to_owned(),
                     ),
+                    current_issues: Vec::new(),
+                    issue_history: Vec::new(),
+                    recovery_history: Vec::new(),
+                    replan_count: 0,
+                    last_replan_turn: None,
                     active: true,
                 },
             );
@@ -324,6 +376,11 @@ impl VictoryRoadmapRegistry {
                     last_step: None,
                     last_progress_turn: None,
                     blocked_reason: None,
+                    current_issues: Vec::new(),
+                    issue_history: Vec::new(),
+                    recovery_history: Vec::new(),
+                    replan_count: 0,
+                    last_replan_turn: None,
                     active: true,
                 },
             );
@@ -366,31 +423,150 @@ impl VictoryRoadmapRegistry {
         assignment: &IslandCampaignAssignment,
     ) {
         for entity in &assignment.transport_entities {
-            self.entity_bindings.insert(
-                *entity,
-                EntityOperationBinding {
-                    operation_id,
-                    role: OperationEntityRole::Transport,
-                },
-            );
+            self.bind_entity_exclusive(operation_id, *entity, OperationEntityRole::Transport);
         }
         for entity in &assignment.capture_entities {
-            self.entity_bindings.insert(
-                *entity,
-                EntityOperationBinding {
-                    operation_id,
-                    role: OperationEntityRole::Capture,
-                },
-            );
+            self.bind_entity_exclusive(operation_id, *entity, OperationEntityRole::Capture);
         }
         for entity in &assignment.combat_entities {
-            self.entity_bindings.insert(
-                *entity,
-                EntityOperationBinding {
-                    operation_id,
-                    role: OperationEntityRole::Combat,
-                },
-            );
+            self.bind_entity_exclusive(operation_id, *entity, OperationEntityRole::Combat);
+        }
+    }
+
+    /// Roadmap監査側もEntityを複数作戦へ残さない。旧作戦の逆集合から同時に除去する。
+    fn bind_entity_exclusive(
+        &mut self,
+        operation_id: StrategicOperationId,
+        entity: Entity,
+        role: OperationEntityRole,
+    ) {
+        if let Some(previous) = self.entity_bindings.get(&entity).copied()
+            && previous.operation_id != operation_id
+            && let Some(operation) = self.operations.get_mut(&previous.operation_id)
+        {
+            operation.assigned_transports.remove(&entity);
+            operation.assigned_capturers.remove(&entity);
+            operation.assigned_combat.remove(&entity);
+        }
+        if let Some(operation) = self.operations.get_mut(&operation_id) {
+            operation.assigned_transports.remove(&entity);
+            operation.assigned_capturers.remove(&entity);
+            operation.assigned_combat.remove(&entity);
+            match role {
+                OperationEntityRole::Transport => {
+                    operation.assigned_transports.insert(entity);
+                }
+                OperationEntityRole::Capture => {
+                    operation.assigned_capturers.insert(entity);
+                }
+                OperationEntityRole::Combat => {
+                    operation.assigned_combat.insert(entity);
+                }
+            }
+        }
+        self.entity_bindings
+            .insert(entity, EntityOperationBinding { operation_id, role });
+    }
+
+    /// inactive作戦は実績履歴だけを残し、現在のEntity割当を所有し続けない。
+    fn release_inactive_assignments(&mut self, player_id: PlayerId) {
+        for operation in self
+            .operations
+            .values_mut()
+            .filter(|operation| operation.player_id == player_id && !operation.active)
+        {
+            operation.assigned_transports.clear();
+            operation.assigned_capturers.clear();
+            operation.assigned_combat.clear();
+        }
+        self.entity_bindings.retain(|_, binding| {
+            self.operations
+                .get(&binding.operation_id)
+                .is_some_and(|operation| operation.active || operation.player_id != player_id)
+        });
+    }
+
+    fn replace_operation_issues(
+        &mut self,
+        operation_id: StrategicOperationId,
+        issues: Vec<OperationIssue>,
+        recoveries: Vec<OperationRecoveryAction>,
+    ) {
+        let Some(operation) = self.operations.get_mut(&operation_id) else {
+            return;
+        };
+        for issue in &issues {
+            let already_recorded = operation.issue_history.iter().any(|recorded| {
+                recorded.kind == issue.kind
+                    && recorded.detected_turn == issue.detected_turn
+                    && recorded.entity == issue.entity
+                    && recorded.related_entity == issue.related_entity
+            });
+            if !already_recorded {
+                operation.issue_history.push(issue.clone());
+            }
+        }
+        for recovery in recoveries {
+            let already_recorded = operation.recovery_history.iter().any(|recorded| {
+                recorded.kind == recovery.kind
+                    && recorded.cause == recovery.cause
+                    && recorded.completed_turn == recovery.completed_turn
+                    && recorded.entity == recovery.entity
+            });
+            if !already_recorded {
+                operation.replan_count = operation.replan_count.saturating_add(1);
+                operation.last_replan_turn = Some(recovery.completed_turn);
+                operation.recovery_history.push(recovery);
+            }
+        }
+        operation.current_issues = issues;
+    }
+
+    fn record_destroyed_entity(&mut self, entity: Entity, turn: u32) {
+        let Some(binding) = self.entity_bindings.get(&entity).copied() else {
+            return;
+        };
+        let kind = match binding.role {
+            OperationEntityRole::Transport => OperationIssueKind::TransportDestroyed,
+            OperationEntityRole::Capture => OperationIssueKind::CapturerDestroyed,
+            OperationEntityRole::Combat => OperationIssueKind::CombatUnitDestroyed,
+        };
+        let issue = OperationIssue {
+            kind,
+            detected_turn: turn,
+            entity: Some(entity),
+            related_entity: None,
+            detail: format!(
+                "assigned {:?} Entity {} was destroyed",
+                binding.role,
+                entity.to_bits()
+            ),
+        };
+        if let Some(operation) = self.operations.get_mut(&binding.operation_id) {
+            operation.current_issues.push(issue.clone());
+            operation.issue_history.push(issue);
+            operation.phase = OperationPhase::Blocked;
+        }
+
+        if binding.role == OperationEntityRole::Transport {
+            let cargo = self.transport_manifests.remove(&entity).unwrap_or_default();
+            for cargo_entity in cargo {
+                let cargo_issue = OperationIssue {
+                    kind: OperationIssueKind::CargoLostWithTransport,
+                    detected_turn: turn,
+                    entity: Some(cargo_entity),
+                    related_entity: Some(entity),
+                    detail: format!(
+                        "cargo Entity {} was lost with transport Entity {}",
+                        cargo_entity.to_bits(),
+                        entity.to_bits()
+                    ),
+                };
+                if let Some(operation) = self.operations.get_mut(&binding.operation_id) {
+                    operation.current_issues.push(cargo_issue.clone());
+                    operation.issue_history.push(cargo_issue);
+                }
+            }
         }
     }
 
@@ -429,23 +605,24 @@ impl VictoryRoadmapRegistry {
         }
     }
 
-    fn record_move(&mut self, entity: Entity, to: GridPosition, turn: u32, island_map: &IslandMap) {
+    fn record_move(
+        &mut self,
+        entity: Entity,
+        from: GridPosition,
+        to: GridPosition,
+        turn: u32,
+        island_map: &IslandMap,
+    ) {
         let Some(binding) = self.entity_bindings.get(&entity).copied() else {
             return;
         };
+        let source_island = island_map.get_island_at(&from).map(|island| island.id);
         let destination_island = island_map.get_island_at(&to).map(|island| island.id);
         if let Some(operation) = self.operations.get_mut(&binding.operation_id)
             && binding.role != OperationEntityRole::Transport
-            // Forming/Pickup中は出発島で搭載地点へ寄るMoveが予定工程である。
-            // 降車開始後に目的島を離れたMoveだけを作戦逸脱として扱う。
-            && matches!(
-                operation.phase,
-                OperationPhase::Drop
-                    | OperationPhase::Suppress
-                    | OperationPhase::Capture
-                    | OperationPhase::Hold
-                    | OperationPhase::Completed
-            )
+            // 出発島で搭載地点へ寄る移動は逸脱ではない。実際に目的島上にいたEntityが
+            // 目的島外へ出た場合だけを逸脱とし、作戦全体のphaseで推測しない。
+            && source_island == Some(operation.island_id)
             && destination_island.is_some_and(|island| island != operation.island_id)
         {
             operation.execution.deviations = operation.execution.deviations.saturating_add(1);
@@ -474,7 +651,319 @@ fn purpose_for(
     }
 }
 
+fn operation_entity_is_alive(world: &World, entity: Entity) -> bool {
+    world.get_entity(entity).is_ok()
+}
+
+fn entity_is_owned_by_island_squad(
+    manager: &SquadManager,
+    player_id: PlayerId,
+    island_id: IslandId,
+    entity: Entity,
+) -> bool {
+    manager.squads.iter().any(|squad| {
+        squad.owner_id == Some(player_id)
+            && squad.target_island == Some(island_id)
+            && (squad.members.contains(&entity)
+                || squad.cargo_entities.contains(&entity)
+                || squad.delivered_cargo.contains(&entity))
+    })
+}
+
+fn diagnose_operation_execution(
+    world: &World,
+    manager: &SquadManager,
+    player_id: PlayerId,
+    turn: u32,
+    assignment: &IslandCampaignAssignment,
+    previous_entities: &[(Entity, OperationEntityRole)],
+    production_records: &[crate::ai::v4::campaign_execution::CampaignProductionRecord],
+) -> Vec<OperationIssue> {
+    use crate::ai::v4::campaign_execution::{CampaignProductionRole, CampaignProductionStatus};
+
+    let current_entities = assignment
+        .transport_entities
+        .iter()
+        .chain(assignment.capture_entities.iter())
+        .chain(assignment.combat_entities.iter())
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut issues = Vec::new();
+
+    for (entity, role) in previous_entities {
+        if !operation_entity_is_alive(world, *entity) {
+            let kind = match role {
+                OperationEntityRole::Transport => OperationIssueKind::TransportDestroyed,
+                OperationEntityRole::Capture => OperationIssueKind::CapturerDestroyed,
+                OperationEntityRole::Combat => OperationIssueKind::CombatUnitDestroyed,
+            };
+            issues.push(OperationIssue {
+                kind,
+                detected_turn: turn,
+                entity: Some(*entity),
+                related_entity: None,
+                detail: format!(
+                    "previously assigned {:?} Entity {} no longer exists",
+                    role,
+                    entity.to_bits()
+                ),
+            });
+        } else if !current_entities.contains(entity)
+            && !entity_is_owned_by_island_squad(manager, player_id, assignment.island_id, *entity)
+        {
+            issues.push(OperationIssue {
+                kind: OperationIssueKind::AssignmentLost,
+                detected_turn: turn,
+                entity: Some(*entity),
+                related_entity: None,
+                detail: format!(
+                    "live {:?} Entity {} disappeared from the operation assignment",
+                    role,
+                    entity.to_bits()
+                ),
+            });
+        }
+    }
+
+    let island_map = world.get_resource::<IslandMap>();
+    for entity in &assignment.capture_entities {
+        if !operation_entity_is_alive(world, *entity) {
+            continue;
+        }
+        let landed = world.get::<GridPosition>(*entity).is_some_and(|position| {
+            island_map
+                .and_then(|map| map.get_island_at(position))
+                .is_some_and(|island| island.id == assignment.island_id)
+        });
+        if landed || world.get::<Transporting>(*entity).is_some() {
+            continue;
+        }
+        let assigned_transport = manager.squads.iter().any(|squad| {
+            squad.owner_id == Some(player_id)
+                && squad.target_island == Some(assignment.island_id)
+                && squad.cargo_entities.contains(entity)
+                && squad.transport_entity.is_some()
+        });
+        if !assigned_transport {
+            issues.push(OperationIssue {
+                kind: OperationIssueKind::TransportUnassigned,
+                detected_turn: turn,
+                entity: Some(*entity),
+                related_entity: None,
+                detail: format!(
+                    "capture Entity {} is alive but has no transport for island {}",
+                    entity.to_bits(),
+                    assignment.island_id.0
+                ),
+            });
+        }
+    }
+
+    // 同じ役割の再発注がある場合、過去の遅延ではなく最新の発注状態を現在原因にする。
+    for role in [
+        CampaignProductionRole::Transport,
+        CampaignProductionRole::Capture,
+        CampaignProductionRole::Combat,
+    ] {
+        let Some(record) = production_records
+            .iter()
+            .filter(|record| record.role == role)
+            .max_by_key(|record| record.planned_turn)
+        else {
+            continue;
+        };
+        let issue = match record.status {
+            CampaignProductionStatus::Planned | CampaignProductionStatus::Issued => {
+                Some((OperationIssueKind::AwaitingProduction, None))
+            }
+            CampaignProductionStatus::Delayed => {
+                Some((OperationIssueKind::ProductionDelayed, None))
+            }
+            CampaignProductionStatus::Produced => {
+                let entity = record.entity;
+                entity
+                    .filter(|entity| {
+                        !current_entities.contains(entity)
+                            && !entity_is_owned_by_island_squad(
+                                manager,
+                                player_id,
+                                assignment.island_id,
+                                *entity,
+                            )
+                    })
+                    .map(|entity| (OperationIssueKind::ProducedEntityUnassigned, Some(entity)))
+            }
+            CampaignProductionStatus::Lost | CampaignProductionStatus::Assigned => None,
+        };
+        if let Some((kind, entity)) = issue {
+            issues.push(OperationIssue {
+                kind,
+                detected_turn: turn,
+                entity,
+                related_entity: None,
+                detail: format!(
+                    "campaign {:?} production at ({},{}) is {:?}",
+                    role, record.facility_x, record.facility_y, record.status
+                ),
+            });
+        }
+    }
+
+    issues.sort_by_key(|issue| {
+        (
+            format!("{:?}", issue.kind),
+            issue.entity.map_or(u64::MAX, Entity::to_bits),
+        )
+    });
+    issues.dedup_by(|left, right| {
+        left.kind == right.kind
+            && left.entity == right.entity
+            && left.related_entity == right.related_entity
+    });
+    issues
+}
+
+fn diagnose_operation_recoveries(
+    world: &World,
+    manager: &SquadManager,
+    player_id: PlayerId,
+    turn: u32,
+    assignment: &IslandCampaignAssignment,
+    previous_issues: &[OperationIssue],
+    production_records: &[crate::ai::v4::campaign_execution::CampaignProductionRecord],
+) -> Vec<OperationRecoveryAction> {
+    use crate::ai::v4::campaign_execution::{CampaignProductionRole, CampaignProductionStatus};
+
+    let assigned_entities = assignment
+        .transport_entities
+        .iter()
+        .chain(assignment.capture_entities.iter())
+        .chain(assignment.combat_entities.iter())
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut recoveries = Vec::new();
+    for issue in previous_issues {
+        let recovery = match issue.kind {
+            OperationIssueKind::AwaitingProduction => None,
+            OperationIssueKind::ProductionDelayed => production_records
+                .iter()
+                .filter(|record| record.planned_turn >= issue.detected_turn)
+                .filter(|record| {
+                    matches!(
+                        record.status,
+                        CampaignProductionStatus::Planned
+                            | CampaignProductionStatus::Issued
+                            | CampaignProductionStatus::Produced
+                            | CampaignProductionStatus::Assigned
+                    )
+                })
+                .max_by_key(|record| record.planned_turn)
+                .map(|record| OperationRecoveryAction {
+                    kind: OperationRecoveryKind::RetryProduction,
+                    cause: issue.kind,
+                    completed_turn: turn,
+                    entity: record.entity,
+                    detail: format!(
+                        "retried {:?} production for island {} on turn {}",
+                        record.role, assignment.island_id.0, record.planned_turn
+                    ),
+                }),
+            OperationIssueKind::ProducedEntityUnassigned | OperationIssueKind::AssignmentLost => {
+                issue.entity.and_then(|entity| {
+                    (assigned_entities.contains(&entity)
+                        || entity_is_owned_by_island_squad(
+                            manager,
+                            player_id,
+                            assignment.island_id,
+                            entity,
+                        ))
+                    .then(|| OperationRecoveryAction {
+                        kind: OperationRecoveryKind::RestoreAssignment,
+                        cause: issue.kind,
+                        completed_turn: turn,
+                        entity: Some(entity),
+                        detail: format!(
+                            "restored Entity {} to island {} operation",
+                            entity.to_bits(),
+                            assignment.island_id.0
+                        ),
+                    })
+                })
+            }
+            OperationIssueKind::TransportUnassigned => issue.entity.and_then(|entity| {
+                let loaded = world.get::<Transporting>(entity).is_some();
+                let assigned_transport = manager.squads.iter().any(|squad| {
+                    squad.owner_id == Some(player_id)
+                        && squad.target_island == Some(assignment.island_id)
+                        && squad.cargo_entities.contains(&entity)
+                        && squad.transport_entity.is_some()
+                });
+                (loaded || assigned_transport).then(|| OperationRecoveryAction {
+                    kind: OperationRecoveryKind::AssignTransport,
+                    cause: issue.kind,
+                    completed_turn: turn,
+                    entity: Some(entity),
+                    detail: format!(
+                        "assigned transport to capture Entity {} for island {}",
+                        entity.to_bits(),
+                        assignment.island_id.0
+                    ),
+                })
+            }),
+            OperationIssueKind::TransportDestroyed
+            | OperationIssueKind::CapturerDestroyed
+            | OperationIssueKind::CombatUnitDestroyed
+            | OperationIssueKind::CargoLostWithTransport => {
+                let role = match issue.kind {
+                    OperationIssueKind::TransportDestroyed => CampaignProductionRole::Transport,
+                    OperationIssueKind::CombatUnitDestroyed => CampaignProductionRole::Combat,
+                    OperationIssueKind::CapturerDestroyed
+                    | OperationIssueKind::CargoLostWithTransport => CampaignProductionRole::Capture,
+                    _ => unreachable!(),
+                };
+                production_records
+                    .iter()
+                    .filter(|record| record.role == role)
+                    .filter(|record| record.planned_turn >= issue.detected_turn)
+                    .filter(|record| {
+                        !matches!(
+                            record.status,
+                            CampaignProductionStatus::Delayed | CampaignProductionStatus::Lost
+                        )
+                    })
+                    .max_by_key(|record| record.planned_turn)
+                    .map(|record| OperationRecoveryAction {
+                        kind: OperationRecoveryKind::RequestReplacement,
+                        cause: issue.kind,
+                        completed_turn: turn,
+                        entity: record.entity,
+                        detail: format!(
+                            "requested replacement {:?} for island {} on turn {}",
+                            role, assignment.island_id.0, record.planned_turn
+                        ),
+                    })
+            }
+        };
+        if let Some(recovery) = recovery {
+            recoveries.push(recovery);
+        }
+    }
+    recoveries.sort_by_key(|recovery| {
+        (
+            format!("{:?}", recovery.kind),
+            format!("{:?}", recovery.cause),
+            recovery.entity.map_or(u64::MAX, Entity::to_bits),
+        )
+    });
+    recoveries.dedup_by(|left, right| {
+        left.kind == right.kind && left.cause == right.cause && left.entity == right.entity
+    });
+    recoveries
+}
+
 fn operation_phase(
+    world: &World,
+    island_map: &IslandMap,
     assignment: &IslandCampaignAssignment,
     manager: &SquadManager,
     player_id: PlayerId,
@@ -492,13 +981,22 @@ fn operation_phase(
             _ => None,
         })
         .next();
+    let entity_is_deployed = |entity: &Entity| {
+        world.get::<Transporting>(*entity).is_none()
+            && world.get::<GridPosition>(*entity).is_some_and(|position| {
+                island_map
+                    .get_island_at(position)
+                    .is_some_and(|island| island.id == assignment.island_id)
+            })
+    };
+    let combat_is_deployed = assignment.combat_entities.iter().any(&entity_is_deployed);
+    let capturer_is_deployed = assignment.capture_entities.iter().any(entity_is_deployed);
     match transport_phase {
         Some(TransportPhase::Pickup) => OperationPhase::Pickup,
         Some(TransportPhase::Transit) | Some(TransportPhase::Return) => OperationPhase::Transit,
         Some(TransportPhase::Drop) => OperationPhase::Drop,
-        None if !assignment.combat_entities.is_empty() => OperationPhase::Suppress,
-        None if !assignment.capture_entities.is_empty() => OperationPhase::Capture,
-        None if assignment.operation_ready => OperationPhase::Hold,
+        None if combat_is_deployed => OperationPhase::Suppress,
+        None if capturer_is_deployed => OperationPhase::Capture,
         None => OperationPhase::Forming,
     }
 }
@@ -871,6 +1369,46 @@ pub(crate) fn reconcile_campaign_roadmap(
         .chain(portfolio.active_offensives.iter())
     {
         let purpose = purpose_for(assignment, enemy_capital_island);
+        let previous_entities = registry
+            .operation_keys
+            .get(&(player_id, assignment.island_id, purpose))
+            .and_then(|operation_id| registry.operations.get(operation_id))
+            .map(|operation| {
+                operation
+                    .assigned_transports
+                    .iter()
+                    .map(|entity| (*entity, OperationEntityRole::Transport))
+                    .chain(
+                        operation
+                            .assigned_capturers
+                            .iter()
+                            .map(|entity| (*entity, OperationEntityRole::Capture)),
+                    )
+                    .chain(
+                        operation
+                            .assigned_combat
+                            .iter()
+                            .map(|entity| (*entity, OperationEntityRole::Combat)),
+                    )
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let previous_issues = registry
+            .operation_keys
+            .get(&(player_id, assignment.island_id, purpose))
+            .and_then(|operation_id| registry.operations.get(operation_id))
+            .map(|operation| operation.current_issues.clone())
+            .unwrap_or_default();
+        let production_records = world
+            .get_resource::<crate::ai::v4::campaign_execution::V4CampaignExecutionRegistry>()
+            .map(|execution| {
+                execution
+                    .records_for(player_id, assignment.island_id)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let objectives = if purpose == StrategicPurpose::AssaultCapital {
             enemy_capital.into_iter().collect::<Vec<_>>()
         } else {
@@ -886,7 +1424,7 @@ pub(crate) fn reconcile_campaign_roadmap(
             positions.sort_unstable_by_key(|position| (position.y, position.x));
             positions
         };
-        let phase = operation_phase(assignment, manager, player_id);
+        let phase = operation_phase(world, &island_map, assignment, manager, player_id);
         let matching_combat_plans = combat_plan_summaries
             .iter()
             .filter(|plan| {
@@ -970,17 +1508,34 @@ pub(crate) fn reconcile_campaign_roadmap(
                 }
             }
         }
+        let issues = diagnose_operation_execution(
+            world,
+            manager,
+            player_id,
+            turn,
+            assignment,
+            &previous_entities,
+            &production_records,
+        );
+        let recoveries = diagnose_operation_recoveries(
+            world,
+            manager,
+            player_id,
+            turn,
+            assignment,
+            &previous_issues,
+            &production_records,
+        );
+        registry.replace_operation_issues(operation_id, issues, recoveries);
         registry.bind_assignment_entities(operation_id, assignment);
         for squad in manager.squads.iter().filter(|squad| {
             squad.owner_id == Some(player_id) && squad.target_island == Some(assignment.island_id)
         }) {
             if let Some(transport) = squad.transport_entity {
-                registry.entity_bindings.insert(
+                registry.bind_entity_exclusive(
+                    operation_id,
                     transport,
-                    EntityOperationBinding {
-                        operation_id,
-                        role: OperationEntityRole::Transport,
-                    },
+                    OperationEntityRole::Transport,
                 );
             }
             for cargo in squad
@@ -996,9 +1551,7 @@ pub(crate) fn reconcile_campaign_roadmap(
                 } else {
                     OperationEntityRole::Combat
                 };
-                registry
-                    .entity_bindings
-                    .insert(*cargo, EntityOperationBinding { operation_id, role });
+                registry.bind_entity_exclusive(operation_id, *cargo, role);
             }
         }
     }
@@ -1020,17 +1573,11 @@ pub(crate) fn reconcile_campaign_roadmap(
         }) else {
             continue;
         };
-        if let Some(operation) = registry.operations.get_mut(&operation_id) {
-            operation.assigned_combat.insert(record.entity);
-        }
-        registry.entity_bindings.insert(
-            record.entity,
-            EntityOperationBinding {
-                operation_id,
-                role: OperationEntityRole::Combat,
-            },
-        );
+        registry.bind_entity_exclusive(operation_id, record.entity, OperationEntityRole::Combat);
     }
+
+    // 完了・撤回済み作戦は履歴として残すが、Entity集合を第二の割当正本にしない。
+    registry.release_inactive_assignments(player_id);
 
     if let Some(roadmap) = registry.roadmaps.get_mut(&player_id) {
         roadmap.planned_victory_turn = enemy_capital_island.and_then(|capital_island| {
@@ -1048,7 +1595,27 @@ pub(crate) fn reconcile_campaign_roadmap(
             roadmap.actual_victory_turn.get_or_insert(turn);
         }
     }
+    let assigned_campaign_entities = registry
+        .operations
+        .values()
+        .filter(|operation| operation.player_id == player_id && operation.active)
+        .flat_map(|operation| {
+            operation
+                .assigned_transports
+                .iter()
+                .chain(operation.assigned_capturers.iter())
+                .chain(operation.assigned_combat.iter())
+                .map(move |entity| (*entity, operation.island_id))
+        })
+        .collect::<Vec<_>>();
     world.insert_resource(registry);
+    if let Some(mut execution) =
+        world.get_resource_mut::<crate::ai::v4::campaign_execution::V4CampaignExecutionRegistry>()
+    {
+        for (entity, island_id) in assigned_campaign_entities {
+            execution.mark_assigned(entity, island_id, turn);
+        }
+    }
 }
 
 /// action result Eventを、担当EntityのStrategicOperationへ照合する。
@@ -1064,12 +1631,17 @@ pub fn audit_victory_roadmap_system(
     mut captured: EventReader<PropertyCapturedEvent>,
     mut supplied: EventReader<UnitSuppliedEvent>,
     mut waited: EventReader<UnitWaitedEvent>,
+    mut destroyed: EventReader<UnitDestroyedEvent>,
     mut registry: ResMut<VictoryRoadmapRegistry>,
+    campaign_execution: Option<
+        ResMut<crate::ai::v4::campaign_execution::V4CampaignExecutionRegistry>,
+    >,
+    operation_assignments: Option<ResMut<crate::ai::operation_assignment::UnitOperationRegistry>>,
 ) {
     let turn = match_state.current_turn_number.0;
     for event in moved.read() {
         if let Some(island_map) = island_map.as_deref() {
-            registry.record_move(event.entity, event.to, turn, island_map);
+            registry.record_move(event.entity, event.from, event.to, turn, island_map);
         } else {
             registry.record_entity_step(event.entity, turn, CampaignStepKind::Move);
         }
@@ -1078,10 +1650,18 @@ pub fn audit_victory_roadmap_system(
         registry.record_entity_step(event.attacker, turn, CampaignStepKind::Attack);
     }
     for event in loaded.read() {
+        registry
+            .transport_manifests
+            .entry(event.transport)
+            .or_default()
+            .insert(event.cargo);
         registry.record_entity_step(event.transport, turn, CampaignStepKind::Load);
         registry.record_entity_step(event.cargo, turn, CampaignStepKind::Load);
     }
     for event in unloaded.read() {
+        if let Some(manifest) = registry.transport_manifests.get_mut(&event.transport) {
+            manifest.remove(&event.cargo);
+        }
         registry.record_entity_step(event.transport, turn, CampaignStepKind::Drop);
         registry.record_entity_step(event.cargo, turn, CampaignStepKind::Drop);
     }
@@ -1113,6 +1693,17 @@ pub fn audit_victory_roadmap_system(
     }
     for event in waited.read() {
         registry.record_entity_step(event.entity, turn, CampaignStepKind::Wait);
+    }
+    let mut campaign_execution = campaign_execution;
+    let mut operation_assignments = operation_assignments;
+    for event in destroyed.read() {
+        if let Some(execution) = campaign_execution.as_deref_mut() {
+            execution.mark_destroyed(event.entity, turn);
+        }
+        if let Some(assignments) = operation_assignments.as_deref_mut() {
+            assignments.release_entity(event.entity);
+        }
+        registry.record_destroyed_entity(event.entity, turn);
     }
 }
 
@@ -1187,6 +1778,260 @@ mod tests {
             "毎ターンのanchor変化で目的拠点を差し替えない"
         );
         assert_eq!(operation.tactical_anchor, GridPosition { x: 12, y: 11 });
+    }
+
+    #[test]
+    fn roadmap_binding_moves_entity_out_of_previous_operation_atomically() {
+        let player = PlayerId(1);
+        let entity = Entity::from_raw(42);
+        let assignment = |island_id: IslandId| IslandCampaignAssignment {
+            island_id,
+            decision: IslandCampaignDecision::Expand,
+            target_position: GridPosition {
+                x: island_id.0,
+                y: 0,
+            },
+            capture_target_positions: vec![GridPosition {
+                x: island_id.0,
+                y: 0,
+            }],
+            priority_enemy_types: Vec::new(),
+            requirement: crate::ai::island_campaign::IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 1,
+                ground_combat_units: 0,
+                combat_units: 0,
+                total_budget: 1_000,
+            },
+            purchase_shortfall: crate::ai::island_campaign::IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 0,
+                ground_combat_units: 0,
+                combat_units: 0,
+                total_budget: 0,
+            },
+            allocated_budget: 1_000,
+            transport_entities: Vec::new(),
+            capture_entities: vec![entity],
+            combat_entities: Vec::new(),
+            operation_ready: true,
+            continued_from_existing_squad: false,
+        };
+        let first_assignment = assignment(IslandId(2));
+        let second_assignment = assignment(IslandId(3));
+        let mut registry = VictoryRoadmapRegistry::default();
+        let roadmap = registry.ensure_roadmap(player, 1, None, None, 1);
+        let first = registry.reconcile_assignment(
+            roadmap,
+            player,
+            1,
+            &first_assignment,
+            StrategicPurpose::CaptureIsland,
+            first_assignment.capture_target_positions.clone(),
+            &HashSet::new(),
+            OperationPhase::Forming,
+        );
+        registry.bind_assignment_entities(first, &first_assignment);
+        let second = registry.reconcile_assignment(
+            roadmap,
+            player,
+            1,
+            &second_assignment,
+            StrategicPurpose::CaptureIsland,
+            second_assignment.capture_target_positions.clone(),
+            &HashSet::new(),
+            OperationPhase::Forming,
+        );
+        registry.bind_assignment_entities(second, &second_assignment);
+
+        assert!(
+            !registry.operations[&first]
+                .assigned_capturers
+                .contains(&entity)
+        );
+        assert!(
+            registry.operations[&second]
+                .assigned_capturers
+                .contains(&entity)
+        );
+        assert_eq!(registry.entity_bindings[&entity].operation_id, second);
+
+        registry.operations.get_mut(&second).unwrap().active = false;
+        registry.release_inactive_assignments(player);
+        assert!(registry.operations[&second].assigned_capturers.is_empty());
+        assert!(!registry.entity_bindings.contains_key(&entity));
+    }
+
+    #[test]
+    fn issue_detection_is_not_counted_as_replanning_until_recovery_occurs() {
+        let player = PlayerId(1);
+        let island = IslandId(2);
+        let entity = Entity::from_raw(42);
+        let assignment = IslandCampaignAssignment {
+            island_id: island,
+            decision: IslandCampaignDecision::Expand,
+            target_position: GridPosition { x: 3, y: 4 },
+            capture_target_positions: vec![GridPosition { x: 3, y: 4 }],
+            priority_enemy_types: Vec::new(),
+            requirement: crate::ai::island_campaign::IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 1,
+                ground_combat_units: 0,
+                combat_units: 0,
+                total_budget: 1_000,
+            },
+            purchase_shortfall: crate::ai::island_campaign::IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 0,
+                ground_combat_units: 0,
+                combat_units: 0,
+                total_budget: 0,
+            },
+            allocated_budget: 1_000,
+            transport_entities: Vec::new(),
+            capture_entities: vec![entity],
+            combat_entities: Vec::new(),
+            operation_ready: true,
+            continued_from_existing_squad: false,
+        };
+        let mut registry = VictoryRoadmapRegistry::default();
+        let roadmap = registry.ensure_roadmap(player, 1, None, None, 1);
+        let operation_id = registry.reconcile_assignment(
+            roadmap,
+            player,
+            1,
+            &assignment,
+            StrategicPurpose::CaptureIsland,
+            assignment.capture_target_positions.clone(),
+            &HashSet::new(),
+            OperationPhase::Forming,
+        );
+        registry.bind_assignment_entities(operation_id, &assignment);
+        let issue = OperationIssue {
+            kind: OperationIssueKind::AssignmentLost,
+            detected_turn: 2,
+            entity: Some(entity),
+            related_entity: None,
+            detail: "assignment disappeared".to_owned(),
+        };
+
+        registry.replace_operation_issues(operation_id, vec![issue.clone()], Vec::new());
+        assert_eq!(registry.operations[&operation_id].replan_count, 0);
+        assert_eq!(
+            registry
+                .entity_bindings
+                .get(&entity)
+                .and_then(|binding| registry.operations.get(&binding.operation_id))
+                .map(|operation| operation.island_id),
+            Some(island),
+            "Roadmap監査でもEntityの作戦bindingを保持する"
+        );
+        let island_map = IslandMap {
+            islands: vec![
+                crate::ai::islands::Island {
+                    id: IslandId(1),
+                    tiles: HashSet::from([
+                        GridPosition { x: 0, y: 0 },
+                        GridPosition { x: 1, y: 0 },
+                    ]),
+                },
+                crate::ai::islands::Island {
+                    id: island,
+                    tiles: HashSet::from([GridPosition { x: 3, y: 4 }]),
+                },
+            ],
+        };
+        registry.record_move(
+            entity,
+            GridPosition { x: 0, y: 0 },
+            GridPosition { x: 1, y: 0 },
+            2,
+            &island_map,
+        );
+        assert_eq!(
+            registry.operations[&operation_id].execution.deviations, 0,
+            "搭載前の出発島内移動は逸脱ではない"
+        );
+
+        registry.replace_operation_issues(
+            operation_id,
+            Vec::new(),
+            vec![OperationRecoveryAction {
+                kind: OperationRecoveryKind::RestoreAssignment,
+                cause: issue.kind,
+                completed_turn: 3,
+                entity: Some(entity),
+                detail: "restored assignment".to_owned(),
+            }],
+        );
+        let operation = &registry.operations[&operation_id];
+        assert_eq!(operation.replan_count, 1);
+        assert_eq!(operation.last_replan_turn, Some(3));
+        assert_eq!(operation.recovery_history.len(), 1);
+    }
+
+    #[test]
+    fn capturer_waiting_on_source_island_keeps_operation_forming() {
+        let player = PlayerId(1);
+        let target_island = IslandId(2);
+        let mut world = World::new();
+        let capturer = world.spawn(GridPosition { x: 0, y: 0 }).id();
+        let island_map = IslandMap {
+            islands: vec![
+                crate::ai::islands::Island {
+                    id: IslandId(1),
+                    tiles: HashSet::from([GridPosition { x: 0, y: 0 }]),
+                },
+                crate::ai::islands::Island {
+                    id: target_island,
+                    tiles: HashSet::from([GridPosition { x: 3, y: 4 }]),
+                },
+            ],
+        };
+        let assignment = IslandCampaignAssignment {
+            island_id: target_island,
+            decision: IslandCampaignDecision::Expand,
+            target_position: GridPosition { x: 3, y: 4 },
+            capture_target_positions: vec![GridPosition { x: 3, y: 4 }],
+            priority_enemy_types: Vec::new(),
+            requirement: crate::ai::island_campaign::IslandCampaignRequirement {
+                preferred_transport: Some(crate::resources::UnitType::TransportHelicopter),
+                transport_slots: 1,
+                capture_units: 1,
+                ground_combat_units: 0,
+                combat_units: 0,
+                total_budget: 6_000,
+            },
+            purchase_shortfall: crate::ai::island_campaign::IslandCampaignRequirement {
+                preferred_transport: Some(crate::resources::UnitType::TransportHelicopter),
+                transport_slots: 1,
+                capture_units: 0,
+                ground_combat_units: 0,
+                combat_units: 0,
+                total_budget: 5_000,
+            },
+            allocated_budget: 1_000,
+            transport_entities: Vec::new(),
+            capture_entities: vec![capturer],
+            combat_entities: Vec::new(),
+            operation_ready: false,
+            continued_from_existing_squad: true,
+        };
+
+        assert_eq!(
+            operation_phase(
+                &world,
+                &island_map,
+                &assignment,
+                &SquadManager::default(),
+                player,
+            ),
+            OperationPhase::Forming
+        );
     }
 
     #[test]
@@ -1284,5 +2129,75 @@ mod tests {
         assert_eq!(operation.objective_properties, vec![capital]);
         assert_eq!(operation.planned_completion_turn, None);
         assert!(operation.blocked_reason.is_some());
+    }
+
+    #[test]
+    fn destroyed_transport_classifies_carrier_and_loaded_cargo_separately() {
+        let player = PlayerId(2);
+        let island = IslandId(3);
+        let transport = Entity::from_raw(40);
+        let cargo = Entity::from_raw(41);
+        let assignment = IslandCampaignAssignment {
+            island_id: island,
+            decision: IslandCampaignDecision::Expand,
+            target_position: GridPosition { x: 10, y: 10 },
+            capture_target_positions: vec![GridPosition { x: 10, y: 10 }],
+            priority_enemy_types: Vec::new(),
+            requirement: crate::ai::island_campaign::IslandCampaignRequirement {
+                preferred_transport: Some(crate::resources::UnitType::TransportHelicopter),
+                transport_slots: 1,
+                capture_units: 1,
+                ground_combat_units: 0,
+                combat_units: 0,
+                total_budget: 5_000,
+            },
+            purchase_shortfall: crate::ai::island_campaign::IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 0,
+                ground_combat_units: 0,
+                combat_units: 0,
+                total_budget: 0,
+            },
+            allocated_budget: 5_000,
+            transport_entities: vec![transport],
+            capture_entities: vec![cargo],
+            combat_entities: Vec::new(),
+            operation_ready: true,
+            continued_from_existing_squad: false,
+        };
+        let mut registry = VictoryRoadmapRegistry::default();
+        let roadmap = registry.ensure_roadmap(player, 1, None, None, 3);
+        let operation_id = registry.reconcile_assignment(
+            roadmap,
+            player,
+            1,
+            &assignment,
+            StrategicPurpose::CaptureIsland,
+            assignment.capture_target_positions.clone(),
+            &HashSet::new(),
+            OperationPhase::Transit,
+        );
+        registry.bind_assignment_entities(operation_id, &assignment);
+        registry
+            .transport_manifests
+            .entry(transport)
+            .or_default()
+            .insert(cargo);
+
+        registry.record_destroyed_entity(transport, 2);
+
+        let operation = registry.operations.get(&operation_id).unwrap();
+        assert!(operation.current_issues.iter().any(|issue| {
+            issue.kind == OperationIssueKind::TransportDestroyed && issue.entity == Some(transport)
+        }));
+        assert!(operation.current_issues.iter().any(|issue| {
+            issue.kind == OperationIssueKind::CargoLostWithTransport
+                && issue.entity == Some(cargo)
+                && issue.related_entity == Some(transport)
+        }));
+        assert_eq!(operation.last_replan_turn, None);
+        assert_eq!(operation.replan_count, 0, "損耗検知だけを再計画扱いしない");
+        assert!(operation.recovery_history.is_empty());
     }
 }

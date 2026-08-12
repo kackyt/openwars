@@ -581,6 +581,17 @@ fn collect_existing_operations(
                 transport_cargo_is_associated(&squad.phase, transport, *cargo, &unit_by_entity)
                     .then_some(*cargo)
             }));
+        } else if squad.mission_type == MissionType::Transport
+            && squad.phase == MissionPhase::Forming
+        {
+            // 部分出航後に残った「cargoだけの後続便」も作戦継続の正本である。
+            // transportが未調達だからとここで捨てると、次手番に別島へ再予約される。
+            owned_assigned_entities.extend(squad.cargo_entities.iter().filter_map(|cargo| {
+                unit_by_entity
+                    .get(cargo)
+                    .is_some_and(|unit| unit.faction == player_id)
+                    .then_some(*cargo)
+            }));
         }
         owned_assigned_entities.extend(squad.delivered_cargo.iter().filter_map(|cargo| {
             unit_by_entity
@@ -619,9 +630,8 @@ fn collect_existing_operations(
             (MissionPhase::Transport(phase), Some(_)) => Some(*phase),
             _ => None,
         };
-        let squad_is_forming = squad.mission_type == MissionType::Transport
-            && squad.phase == MissionPhase::Forming
-            && owned_transport.is_some();
+        let squad_is_forming =
+            squad.mission_type == MissionType::Transport && squad.phase == MissionPhase::Forming;
         let operation = operations
             .entry(island_id)
             .or_insert_with(|| ExistingCampaignOperation {
@@ -1835,29 +1845,21 @@ fn collect_campaign_resource_pool(
     properties: &[PropertySnapshot],
     units: &[UnitSnapshot],
     operations: &[ExistingCampaignOperation],
+    produced_assignments: &HashMap<Entity, IslandId>,
+    roadmap_assignments: &HashMap<Entity, IslandId>,
     assigned_transport_phases: &HashMap<Entity, AssignedTransportState>,
     unavailable_entities: &HashSet<Entity>,
     available_funds: u32,
 ) -> CampaignResourcePool {
     let unit_by_entity: HashMap<_, _> = units.iter().map(|unit| (unit.entity, unit)).collect();
-    let mut assigned_by_entity = HashMap::new();
+    let assigned_by_entity =
+        merge_campaign_assignment_sources(roadmap_assignments, operations, produced_assignments);
     let mut assigned_entities_by_island: HashMap<IslandId, HashSet<Entity>> = HashMap::new();
-    for operation in operations
-        .iter()
-        .filter(|operation| operation_has_live_capability(operation))
-    {
-        for entity in operation
-            .transport_entities
-            .iter()
-            .chain(operation.capture_entities.iter())
-            .chain(operation.combat_entities.iter())
-        {
-            assigned_by_entity.insert(*entity, operation.island_id);
-            assigned_entities_by_island
-                .entry(operation.island_id)
-                .or_default()
-                .insert(*entity);
-        }
+    for (entity, island_id) in &assigned_by_entity {
+        assigned_entities_by_island
+            .entry(*island_id)
+            .or_default()
+            .insert(*entity);
     }
 
     let mut candidates = Vec::new();
@@ -1979,6 +1981,41 @@ fn collect_campaign_resource_pool(
     }
 }
 
+fn merge_campaign_assignment_sources(
+    roadmap_assignments: &HashMap<Entity, IslandId>,
+    operations: &[ExistingCampaignOperation],
+    produced_assignments: &HashMap<Entity, IslandId>,
+) -> HashMap<Entity, IslandId> {
+    // 現在Squadを土台に、前手番Roadmapの確定binding、生産直後の発注意図の順で
+    // 上書きする。最新の発注意図と直前の確定作戦を優先することで、同じEntityを
+    // 防衛Squadと遠隔島作戦が同時に所有する矛盾を次手番へ持ち越さない。
+    let mut assigned_by_entity = HashMap::new();
+    for operation in operations
+        .iter()
+        .filter(|operation| operation_has_live_capability(operation))
+    {
+        for entity in operation
+            .transport_entities
+            .iter()
+            .chain(operation.capture_entities.iter())
+            .chain(operation.combat_entities.iter())
+        {
+            assigned_by_entity.insert(*entity, operation.island_id);
+        }
+    }
+    assigned_by_entity.extend(
+        roadmap_assignments
+            .iter()
+            .map(|(entity, island_id)| (*entity, *island_id)),
+    );
+    assigned_by_entity.extend(
+        produced_assignments
+            .iter()
+            .map(|(entity, island_id)| (*entity, *island_id)),
+    );
+    assigned_by_entity
+}
+
 /// 全島評価と現在の共有資源を毎回盤面から再構築し、純粋allocatorへ一括で渡す。
 pub fn analyze_island_campaign(world: &mut World, player_id: PlayerId) -> IslandCampaignPortfolio {
     analyze_island_campaign_excluding(world, player_id, &HashSet::new())
@@ -2071,6 +2108,14 @@ pub fn analyze_island_campaign_excluding(
         .get_resource::<Players>()
         .and_then(|players| players.0.iter().find(|player| player.id == player_id))
         .map_or(0, |player| player.funds);
+    let produced_assignments = world
+        .get_resource::<crate::ai::v4::campaign_execution::V4CampaignExecutionRegistry>()
+        .map(|registry| registry.produced_entity_assignments(player_id))
+        .unwrap_or_default();
+    let roadmap_assignments = world
+        .get_resource::<crate::ai::operation_assignment::UnitOperationRegistry>()
+        .map(|registry| registry.campaign_entity_assignments(player_id))
+        .unwrap_or_default();
     let mut unavailable_entities = unavailable_campaign_entities(&manager, &units, player_id);
     unavailable_entities.extend(reserved_entities.iter().copied());
     let pool = collect_campaign_resource_pool(
@@ -2081,6 +2126,8 @@ pub fn analyze_island_campaign_excluding(
         &properties,
         &units,
         &operations,
+        &produced_assignments,
+        &roadmap_assignments,
         &assigned_transport_phases,
         &unavailable_entities,
         available_funds,
@@ -2274,6 +2321,79 @@ mod tests {
     use bevy_ecs::prelude::{Entity, World};
 
     const TEST_SEED: u64 = 42;
+
+    #[test]
+    fn produced_intent_then_roadmap_override_stale_squad_assignment() {
+        let entity = Entity::from_raw(42);
+        let roadmap_island = IslandId(1);
+        let squad_island = IslandId(2);
+        let intended_island = IslandId(3);
+        let roadmap = HashMap::from([(entity, roadmap_island)]);
+        let operations = vec![ExistingCampaignOperation {
+            island_id: squad_island,
+            target_position: GridPosition { x: 2, y: 2 },
+            transport_phase: None,
+            is_forming: true,
+            transport_entities: vec![entity],
+            capture_entities: Vec::new(),
+            combat_entities: Vec::new(),
+        }];
+        let produced = HashMap::from([(entity, intended_island)]);
+
+        let assignments = merge_campaign_assignment_sources(&roadmap, &operations, &produced);
+
+        assert_eq!(assignments.get(&entity), Some(&intended_island));
+
+        let assignments = merge_campaign_assignment_sources(
+            &HashMap::from([(entity, roadmap_island)]),
+            &operations,
+            &HashMap::new(),
+        );
+        assert_eq!(
+            assignments.get(&entity),
+            Some(&roadmap_island),
+            "直前に確定したRoadmap bindingは古いSquadより優先する"
+        );
+    }
+
+    #[test]
+    fn transportless_forming_cargo_remains_an_existing_operation() {
+        let player = PlayerId(2);
+        let map = Map::new(4, 1, Terrain::Plains, GridTopology::Square);
+        let island_map = IslandMap::analyze(&map);
+        let island_id = island_map.islands[0].id;
+        let cargo = Entity::from_raw(42);
+        let mut manager = SquadManager::default();
+        let placeholder = manager.create_owned_squad(MissionType::Transport, player);
+        placeholder.target_island = Some(island_id);
+        placeholder.target = Some(GridPosition { x: 3, y: 0 });
+        placeholder.phase = MissionPhase::Forming;
+        placeholder.cargo_entities.push(cargo);
+        let units = vec![UnitSnapshot {
+            entity: cargo,
+            faction: player,
+            position: GridPosition { x: 0, y: 0 },
+            stats: UnitStats {
+                can_capture: true,
+                ..UnitStats::mock()
+            },
+            health: Health {
+                current: 100,
+                max: 100,
+            },
+            fuel: None,
+            transporting: None,
+            free_cargo_slots: 0,
+            loaded_cargo_entities: Vec::new(),
+        }];
+
+        let (operations, _) = collect_existing_operations(&island_map, &manager, &units, player);
+
+        assert_eq!(operations.len(), 1);
+        assert!(operations[0].is_forming);
+        assert!(operations[0].transport_entities.is_empty());
+        assert_eq!(operations[0].capture_entities, vec![cargo]);
+    }
 
     #[test]
     fn assault_transport_package_uses_each_real_airport_once() {

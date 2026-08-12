@@ -925,7 +925,9 @@ fn reserve_candidate(
     if let Some(operation) = existing {
         if operation.is_forming || is_live_campaign_transport_phase(operation.transport_phase) {
             for entity in &operation.transport_entities {
-                if let Some(unit) = catalog.get(entity) {
+                if let Some(unit) = catalog.get(entity)
+                    && (unit.assigned_island.is_none() || unit.assigned_island == Some(island_id))
+                {
                     push_unique_entity(&mut transport_entities, *entity);
                     reserved_entity_value = reserved_entity_value.saturating_add(unit.cost);
                     remove_entity(&mut provisional, *entity);
@@ -939,6 +941,7 @@ fn reserve_candidate(
         }
         for entity in &operation.capture_entities {
             if let Some(unit) = catalog.get(entity)
+                && (unit.assigned_island.is_none() || unit.assigned_island == Some(island_id))
                 && (candidate.assessment.decision != IslandCampaignDecision::Defend
                     || !unit.is_transporting
                         && unit
@@ -952,6 +955,7 @@ fn reserve_candidate(
         }
         for entity in &operation.combat_entities {
             if let Some(unit) = catalog.get(entity)
+                && (unit.assigned_island.is_none() || unit.assigned_island == Some(island_id))
                 && (candidate.assessment.decision != IslandCampaignDecision::Defend
                     || !unit.is_transporting
                         && unit

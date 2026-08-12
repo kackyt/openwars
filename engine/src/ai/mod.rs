@@ -14,6 +14,7 @@ mod island_invasion_tests;
 pub mod islands;
 pub mod missions;
 pub mod objectives;
+pub mod operation_assignment;
 pub mod planner;
 pub mod production;
 pub mod pruning;
