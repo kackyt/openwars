@@ -169,6 +169,37 @@ impl UnitOperationRegistry {
         }
     }
 
+    /// 現在のportfolioにも永続deploymentにも含まれないcampaign予約を解放する。
+    ///
+    /// owner単位の逆引きだけを走査するため、盤面Entityや作戦ごとの全なめを行わない。
+    pub(crate) fn release_unclaimed_campaign_entities(
+        &mut self,
+        player_id: PlayerId,
+        claimed_entities: &HashSet<Entity>,
+        protected_entities: &HashSet<Entity>,
+    ) {
+        let stale = self
+            .entities_by_owner
+            .iter()
+            .filter(|(owner, _)| {
+                matches!(
+                    owner,
+                    OperationOwner::Campaign {
+                        player_id: owner_player,
+                        ..
+                    } if *owner_player == player_id
+                )
+            })
+            .flat_map(|(_, entities)| entities.iter().copied())
+            .filter(|entity| {
+                !claimed_entities.contains(entity) && !protected_entities.contains(entity)
+            })
+            .collect::<Vec<_>>();
+        for entity in stale {
+            self.release_entity(entity);
+        }
+    }
+
     pub(crate) fn retain_live_entities(&mut self, live_entities: &HashSet<Entity>) {
         let stale = self
             .by_entity
@@ -223,5 +254,46 @@ mod tests {
         assert_eq!(registry.assignment(entity).unwrap().owner, new);
         registry.release_operation(new);
         assert!(registry.assignment(entity).is_none());
+    }
+
+    #[test]
+    fn campaign_cleanup_releases_only_unclaimed_entities_for_the_player() {
+        let player = PlayerId(1);
+        let other_player = PlayerId(2);
+        let claimed = Entity::from_raw(1);
+        let protected = Entity::from_raw(2);
+        let stale = Entity::from_raw(3);
+        let foreign = Entity::from_raw(4);
+        let mut registry = UnitOperationRegistry::default();
+        for (entity, owner_player) in [
+            (claimed, player),
+            (protected, player),
+            (stale, player),
+            (foreign, other_player),
+        ] {
+            registry.assign(
+                entity,
+                UnitOperationAssignment {
+                    owner: OperationOwner::Campaign {
+                        player_id: owner_player,
+                        island_id: IslandId(3),
+                    },
+                    squad_id: None,
+                    role: OperationUnitRole::Member,
+                    assigned_turn: 1,
+                },
+            );
+        }
+
+        registry.release_unclaimed_campaign_entities(
+            player,
+            &HashSet::from([claimed]),
+            &HashSet::from([protected]),
+        );
+
+        assert!(registry.assignment(claimed).is_some());
+        assert!(registry.assignment(protected).is_some());
+        assert!(registry.assignment(stale).is_none());
+        assert!(registry.assignment(foreign).is_some());
     }
 }

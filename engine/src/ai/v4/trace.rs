@@ -114,6 +114,9 @@ pub struct RollingCombatPlanTrace {
     pub occupation_turn: Option<u32>,
     pub production_cost: u32,
     pub expected_loss: u32,
+    pub protected_unit_count: usize,
+    pub protected_survivor_count: usize,
+    pub required_capture_survivor_count: usize,
     pub candidates_considered: usize,
     pub search_truncated: bool,
 }

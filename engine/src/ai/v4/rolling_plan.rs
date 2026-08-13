@@ -59,6 +59,8 @@ pub(crate) struct RollingPlanInput {
     pub map: Map,
     pub damage_chart: DamageChart,
     pub existing_units: Vec<FriendlyPlanUnit>,
+    /// 戦闘部隊とは別に、占領完了まで生存させる必要がある実在の占領兵。
+    pub protected_units: Vec<FriendlyPlanUnit>,
     pub enemies: Vec<EnemyPlanUnit>,
     pub production_options: Vec<ProductionPlanOption>,
     pub current_funds: u32,
@@ -67,6 +69,8 @@ pub(crate) struct RollingPlanInput {
     pub hard_deadline: Option<u32>,
     /// 実在するcampaign cargoと輸送phaseから予測した占領完了turn。未編成ならNone。
     pub capture_completion_turn: Option<u32>,
+    /// 占領予定時点に必要な生存占領兵数。未所有の作戦対象施設数から導く。
+    pub required_capture_survivors: usize,
     /// 占領が1ターン遅れる機会損失。実行可能案同士の比較にだけ用いる。
     pub delay_cost_per_turn: u32,
 }
@@ -102,6 +106,12 @@ pub(crate) struct ForcePackagePlan {
     pub occupation_turn: Option<u32>,
     pub production_cost: u32,
     pub expected_loss: u32,
+    /// 占領工程へ接続済みで、敵行動シミュレーションの保護対象にした兵数。
+    pub protected_unit_count: usize,
+    /// 占領予定時点まで生存すると予測した保護対象兵数。
+    pub protected_survivor_count: usize,
+    /// 未所有の作戦対象施設を占領するため、予定時点に必要な生存兵数。
+    pub required_capture_survivor_count: usize,
     pub candidates_considered: usize,
     pub search_truncated: bool,
 }
@@ -162,6 +172,7 @@ struct SimEnemy {
     source: EnemyPlanUnit,
     hp: u32,
     destroyed_turn: Option<u32>,
+    attacks_left: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -174,24 +185,30 @@ struct SearchState {
 /// 現在観測した敵を排除できる混成パッケージを探索する。
 pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackagePlan> {
     if input.enemies.is_empty() {
-        return Some(ForcePackagePlan {
-            purchases: Vec::new(),
-            target_forecasts: Vec::new(),
-            turn_forecasts: Vec::new(),
-            feasible: true,
-            first_attack_turn: None,
-            elimination_turn: Some(0),
-            occupation_turn: input.capture_completion_turn,
-            production_cost: 0,
-            expected_loss: 0,
-            candidates_considered: 1,
-            search_truncated: false,
-        });
+        let search_turns = input
+            .hard_deadline
+            .or(input.capture_completion_turn)
+            .unwrap_or(1)
+            .max(1);
+        let mut plan = simulate_state(input, &SearchState::default(), search_turns);
+        plan.candidates_considered = 1;
+        return Some(plan);
     }
 
     let search_turns = input.hard_deadline.unwrap_or(DEFAULT_SEARCH_TURNS).max(1);
+    if input.production_options.is_empty() {
+        // 空き生産枠が無い手番でも、既存編成だけで任務を継続できるかは評価する。
+        // ここでNoneにすると永続Planの実行・予実監視まで途切れてしまう。
+        let mut plan = simulate_state(input, &SearchState::default(), search_turns);
+        plan.candidates_considered = 1;
+        return Some(plan);
+    }
     let mut frontier = vec![SearchState::default()];
-    let mut evaluated = Vec::new();
+    // 全中間案の敵別forecastを保持すると長期戦でメモリと比較時間が膨張する。
+    // 最終選択に必要な3案だけを逐次更新し、各候補のsimulateも1回に限定する。
+    let mut best_within_deadline: Option<ForcePackagePlan> = None;
+    let mut best_feasible: Option<ForcePackagePlan> = None;
+    let mut best_effort: Option<ForcePackagePlan> = None;
     let mut considered = 0_usize;
     let mut truncated = false;
 
@@ -238,67 +255,48 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
             }
         }
 
-        for state in &next {
-            let mut plan = simulate_state(input, state, search_turns);
+        let mut evaluated_next = Vec::with_capacity(next.len());
+        for state in next {
+            let mut plan = simulate_state(input, &state, search_turns);
             considered = considered.saturating_add(1);
             plan.candidates_considered = considered;
-            evaluated.push(plan);
+            if plan.feasible {
+                update_best_feasible(&mut best_feasible, &plan, input.delay_cost_per_turn);
+                if input.hard_deadline.is_some_and(|deadline| {
+                    plan.elimination_turn.is_some_and(|turn| turn <= deadline)
+                }) {
+                    update_best_feasible(
+                        &mut best_within_deadline,
+                        &plan,
+                        input.delay_cost_per_turn,
+                    );
+                }
+            }
+            update_best_effort(&mut best_effort, &plan);
+            evaluated_next.push((state, plan));
         }
-        if next.len() > SEARCH_BEAM_WIDTH {
+        if evaluated_next.len() > SEARCH_BEAM_WIDTH {
             truncated = true;
-            next.sort_by_key(|state| {
-                let plan = simulate_state(input, state, search_turns);
+            evaluated_next.sort_by_key(|(_, plan)| {
                 (
                     plan.remaining_hp(),
+                    plan.expected_loss,
                     plan.completion_for_ordering(),
                     plan.production_cost,
                 )
             });
-            next.truncate(SEARCH_BEAM_WIDTH);
+            evaluated_next.truncate(SEARCH_BEAM_WIDTH);
         }
-        frontier = next;
+        frontier = evaluated_next.into_iter().map(|(state, _)| state).collect();
         if frontier.is_empty() {
             break;
         }
     }
 
-    let mut feasible: Vec<_> = evaluated
-        .iter()
-        .filter(|plan| plan.feasible)
-        .cloned()
-        .collect();
-    if let Some(deadline) = input.hard_deadline {
-        let within_deadline: Vec<_> = feasible
-            .iter()
-            .filter(|plan| plan.elimination_turn.is_some_and(|turn| turn <= deadline))
-            .cloned()
-            .collect();
-        if !within_deadline.is_empty() {
-            feasible = within_deadline;
-        }
-    }
-    remove_dominated(&mut feasible);
-
-    let mut selected = feasible
-        .into_iter()
-        .min_by_key(|plan| {
-            (
-                plan.utility_cost(input.delay_cost_per_turn),
-                plan.completion_for_ordering(),
-                plan.production_cost,
-            )
-        })
-        .or_else(|| {
-            // 期限内に全滅できる案が無くても、何も作らず停止しない。
-            // 探索済み候補のうち残HPを最も減らす案を次revisionへのbest effortとする。
-            evaluated.into_iter().min_by_key(|plan| {
-                (
-                    plan.remaining_hp(),
-                    plan.first_attack_turn.unwrap_or(u32::MAX),
-                    plan.production_cost,
-                )
-            })
-        })?;
+    let mut selected = best_within_deadline
+        .or(best_feasible)
+        // 期限内に全滅できる案が無くても、何も作らず停止しない。
+        .or(best_effort)?;
     // 同じ施設・同じ兵種を後の手番に置く理由がなく、資金も足りるなら最早枠へ寄せる。
     // beam探索では将来収入で複数機を買う枝が残りやすいため、編成を変えずに
     // 生産だけを前倒しして「計画はあるのに今手番の施設が遊ぶ」状態を除く。
@@ -313,6 +311,48 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
     selected.candidates_considered = considered;
     selected.search_truncated = truncated;
     Some(selected)
+}
+
+fn update_best_feasible(
+    best: &mut Option<ForcePackagePlan>,
+    candidate: &ForcePackagePlan,
+    delay_cost_per_turn: u32,
+) {
+    let candidate_key = (
+        candidate.utility_cost(delay_cost_per_turn),
+        candidate.completion_for_ordering(),
+        candidate.production_cost,
+    );
+    if best.as_ref().is_none_or(|current| {
+        candidate_key
+            < (
+                current.utility_cost(delay_cost_per_turn),
+                current.completion_for_ordering(),
+                current.production_cost,
+            )
+    }) {
+        *best = Some(candidate.clone());
+    }
+}
+
+fn update_best_effort(best: &mut Option<ForcePackagePlan>, candidate: &ForcePackagePlan) {
+    let candidate_key = (
+        candidate.remaining_hp(),
+        candidate.expected_loss,
+        candidate.first_attack_turn.unwrap_or(u32::MAX),
+        candidate.production_cost,
+    );
+    if best.as_ref().is_none_or(|current| {
+        candidate_key
+            < (
+                current.remaining_hp(),
+                current.expected_loss,
+                current.first_attack_turn.unwrap_or(u32::MAX),
+                current.production_cost,
+            )
+    }) {
+        *best = Some(candidate.clone());
+    }
 }
 
 /// 選ばれた編成を変えず、各購入を最も早い実行可能枠へ移す。
@@ -471,22 +511,6 @@ pub(crate) fn evaluate_fixed_package(
     Ok(simulate_state(input, &state, search_turns))
 }
 
-fn remove_dominated(plans: &mut Vec<ForcePackagePlan>) {
-    let snapshot = plans.clone();
-    plans.retain(|candidate| {
-        !snapshot.iter().any(|other| {
-            let no_worse = other.completion_for_ordering() <= candidate.completion_for_ordering()
-                && other.production_cost <= candidate.production_cost
-                && other.expected_loss <= candidate.expected_loss;
-            let strictly_better = other.completion_for_ordering()
-                < candidate.completion_for_ordering()
-                || other.production_cost < candidate.production_cost
-                || other.expected_loss < candidate.expected_loss;
-            no_worse && strictly_better
-        })
-    });
-}
-
 fn simulate_state(
     input: &RollingPlanInput,
     state: &SearchState,
@@ -512,12 +536,18 @@ fn simulate_state(
             })
         }))
         .collect();
+    let mut protected_units: Vec<_> = input.protected_units.iter().map(sim_friendly).collect();
     let mut enemies: Vec<_> = input
         .enemies
         .iter()
         .cloned()
         .map(|source| SimEnemy {
             hp: source.hp,
+            attacks_left: source
+                .stats
+                .max_ammo1
+                .saturating_add(source.stats.max_ammo2)
+                .max(1),
             source,
             destroyed_turn: None,
         })
@@ -536,7 +566,11 @@ fn simulate_state(
             .filter(|enemy| enemy.source.available_turn <= turn)
             .map(|enemy| enemy.hp)
             .sum();
-        let friendly_hp_before: u32 = friendlies.iter().map(|friendly| friendly.hp).sum();
+        let friendly_hp_before: u32 = friendlies
+            .iter()
+            .chain(protected_units.iter())
+            .map(|friendly| friendly.hp)
+            .sum();
         let mut attack_count = 0_u32;
         for friendly in &mut friendlies {
             if friendly.hp == 0 || friendly.attacks_left == 0 || turn < friendly.available_turn {
@@ -583,12 +617,63 @@ fn simulate_state(
                 }
             }
         }
+        // 占領兵は「戦闘部隊が最終的に敵を全滅させる」だけでは守れない。
+        // 敵が占領完了前に到達できるなら、各敵の手番で実際に占領兵へ攻撃させ、
+        // 生存数を作戦の実行可能性へ反映する。価格から予備兵数を足す処理は行わない。
+        for enemy in &mut enemies {
+            if enemy.hp == 0 || enemy.attacks_left == 0 || turn < enemy.source.available_turn {
+                continue;
+            }
+            let Some((target_index, damage)) = protected_units
+                .iter()
+                .enumerate()
+                .filter(|(_, target)| target.hp > 0 && turn >= target.available_turn)
+                .filter_map(|(index, target)| {
+                    let base_damage = best_damage(
+                        &input.damage_chart,
+                        enemy.source.stats.unit_type,
+                        target.stats.unit_type,
+                    );
+                    if base_damage == 0 {
+                        return None;
+                    }
+                    let distance = input.map.distance(
+                        enemy.source.position.x,
+                        enemy.source.position.y,
+                        target.position.x,
+                        target.position.y,
+                    );
+                    let travel = distance
+                        .saturating_sub(enemy.source.stats.max_range.max(1))
+                        .div_ceil(enemy.source.stats.max_movement.max(1));
+                    if turn < enemy.source.available_turn.saturating_add(travel) {
+                        return None;
+                    }
+                    let damage =
+                        calculate_damage_formula(base_damage, enemy.hp, 0, true).saturating_add(10);
+                    Some((index, damage))
+                })
+                // 最も大きな損害を与えられる占領兵を狙う悲観側の敵行動を採る。
+                .max_by_key(|(index, damage)| {
+                    (*damage, 100_u32.saturating_sub(protected_units[*index].hp))
+                })
+            else {
+                continue;
+            };
+            protected_units[target_index].hp =
+                protected_units[target_index].hp.saturating_sub(damage);
+            enemy.attacks_left = enemy.attacks_left.saturating_sub(1);
+        }
         let enemy_hp_after: u32 = enemies
             .iter()
             .filter(|enemy| enemy.source.available_turn <= turn)
             .map(|enemy| enemy.hp)
             .sum();
-        let friendly_hp_after: u32 = friendlies.iter().map(|friendly| friendly.hp).sum();
+        let friendly_hp_after: u32 = friendlies
+            .iter()
+            .chain(protected_units.iter())
+            .map(|friendly| friendly.hp)
+            .sum();
         turn_forecasts.push(CampaignTurnForecast {
             turn,
             enemy_arrival_hp,
@@ -596,25 +681,41 @@ fn simulate_state(
             friendly_hp_lost: friendly_hp_before.saturating_sub(friendly_hp_after),
             attack_count,
         });
-        if enemies.iter().all(|enemy| enemy.hp == 0) {
+        if enemies.iter().all(|enemy| enemy.hp == 0)
+            && input
+                .capture_completion_turn
+                .is_none_or(|capture_turn| turn >= capture_turn)
+        {
             break;
         }
     }
 
-    let elimination_turn = enemies
-        .iter()
-        .map(|enemy| enemy.destroyed_turn)
-        .collect::<Option<Vec<_>>>()
-        .and_then(|turns| turns.into_iter().max());
+    let elimination_turn = if enemies.is_empty() {
+        Some(0)
+    } else {
+        enemies
+            .iter()
+            .map(|enemy| enemy.destroyed_turn)
+            .collect::<Option<Vec<_>>>()
+            .and_then(|turns| turns.into_iter().max())
+    };
+    let protected_survivor_count = protected_units.iter().filter(|unit| unit.hp > 0).count();
+    let protected_force_survives = input.capture_completion_turn.is_none()
+        || protected_survivor_count >= input.required_capture_survivors.max(1);
     // 固定2ターンを足さず、実campaignのPickup/Transit/Drop/Capture ETAと残敵排除の
     // 遅い方を採る。輸送編成がまだ存在しない場合は占領完了を予測しない。
     let occupation_turn = elimination_turn
         .zip(input.capture_completion_turn)
+        .filter(|_| protected_force_survives)
         .map(|(elimination, capture)| elimination.max(capture));
-    let expected_loss = friendlies.iter().fold(0_u32, |total, unit| {
-        let lost_hp = unit.initial_hp.saturating_sub(unit.hp);
-        total.saturating_add(unit.stats.cost.saturating_mul(lost_hp) / 100)
-    });
+    let expected_loss =
+        friendlies
+            .iter()
+            .chain(protected_units.iter())
+            .fold(0_u32, |total, unit| {
+                let lost_hp = unit.initial_hp.saturating_sub(unit.hp);
+                total.saturating_add(unit.stats.cost.saturating_mul(lost_hp) / 100)
+            });
     ForcePackagePlan {
         purchases,
         target_forecasts: enemies
@@ -629,12 +730,15 @@ fn simulate_state(
             })
             .collect(),
         turn_forecasts,
-        feasible: elimination_turn.is_some(),
+        feasible: elimination_turn.is_some() && protected_force_survives,
         first_attack_turn,
         elimination_turn,
         occupation_turn,
         production_cost: state.cost,
         expected_loss,
+        protected_unit_count: input.protected_units.len(),
+        protected_survivor_count,
+        required_capture_survivor_count: input.required_capture_survivors,
         candidates_considered: 0,
         search_truncated: false,
     }
@@ -798,6 +902,7 @@ mod tests {
             map,
             damage_chart: chart,
             existing_units: Vec::new(),
+            protected_units: Vec::new(),
             enemies: vec![EnemyPlanUnit {
                 entity: Some(Entity::from_raw(7)),
                 stats: UnitStats {
@@ -837,6 +942,7 @@ mod tests {
             income_per_turn: 0,
             hard_deadline: None,
             capture_completion_turn: None,
+            required_capture_survivors: 0,
             delay_cost_per_turn: 5_000,
         }
     }
@@ -851,6 +957,24 @@ mod tests {
     }
 
     #[test]
+    fn best_effort_prefers_lower_loss_when_enemy_progress_is_equal() {
+        let mut high_loss = plan_force_package(&input()).unwrap();
+        high_loss.feasible = false;
+        high_loss.expected_loss = 20_000;
+        high_loss.first_attack_turn = Some(1);
+        high_loss.target_forecasts[0].remaining_hp = 20;
+        let mut low_loss = high_loss.clone();
+        low_loss.expected_loss = 2_000;
+        low_loss.first_attack_turn = Some(2);
+        let mut selected = None;
+
+        update_best_effort(&mut selected, &high_loss);
+        update_best_effort(&mut selected, &low_loss);
+
+        assert_eq!(selected.unwrap().expected_loss, 2_000);
+    }
+
+    #[test]
     fn production_unit_cannot_attack_before_travel_finishes() {
         let mut input = input();
         input.production_options.truncate(1);
@@ -862,11 +986,63 @@ mod tests {
     fn occupation_uses_live_campaign_eta_instead_of_a_fixed_delay() {
         let mut input = input();
         input.capture_completion_turn = Some(7);
+        input.required_capture_survivors = 1;
+        input.protected_units.push(FriendlyPlanUnit {
+            stats: UnitStats {
+                unit_type: UnitType::Infantry,
+                can_capture: true,
+                ..UnitStats::mock()
+            },
+            position: GridPosition { x: 8, y: 0 },
+            hp: 100,
+            available_turn: 0,
+            engageable_enemy_indices: Vec::new(),
+        });
 
         let plan = plan_force_package(&input).unwrap();
 
         assert!(plan.elimination_turn.is_some_and(|turn| turn <= 7));
         assert_eq!(plan.occupation_turn, Some(7));
+    }
+
+    #[test]
+    fn losing_one_of_two_required_capturers_makes_the_plan_infeasible() {
+        let mut input = input();
+        input.production_options.clear();
+        input
+            .damage_chart
+            .insert_damage(UnitType::Infantry, UnitType::Infantry, 100);
+        input.existing_units.push(FriendlyPlanUnit {
+            stats: stats(UnitType::Bomber, 20_000, 6),
+            position: GridPosition { x: 8, y: 0 },
+            hp: 100,
+            // 敵を最終的には倒せるが、占領兵が先に損耗する状況を作る。
+            available_turn: 3,
+            engageable_enemy_indices: vec![0],
+        });
+        let capturer = FriendlyPlanUnit {
+            stats: UnitStats {
+                unit_type: UnitType::Infantry,
+                can_capture: true,
+                ..UnitStats::mock()
+            },
+            position: GridPosition { x: 8, y: 0 },
+            hp: 100,
+            available_turn: 0,
+            engageable_enemy_indices: Vec::new(),
+        };
+        input.protected_units = vec![capturer.clone(), capturer];
+        input.capture_completion_turn = Some(3);
+        input.required_capture_survivors = 2;
+
+        let plan = plan_force_package(&input).unwrap();
+
+        assert_eq!(plan.elimination_turn, Some(3));
+        assert_eq!(plan.protected_unit_count, 2);
+        assert_eq!(plan.protected_survivor_count, 1);
+        assert_eq!(plan.required_capture_survivor_count, 2);
+        assert!(!plan.feasible);
+        assert_eq!(plan.occupation_turn, None);
     }
 
     #[test]

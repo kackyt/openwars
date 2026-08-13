@@ -666,7 +666,13 @@ fn collect_existing_operations(
         }
 
         let squad_has_live_continuity = if squad.mission_type == MissionType::Transport {
-            squad_is_forming || squad_transport_phase.is_some_and(is_live_transport_phase)
+            let reusable_empty_return = squad_transport_phase == Some(TransportPhase::Return)
+                && owned_transport
+                    .and_then(|transport| unit_by_entity.get(&transport))
+                    .is_some_and(|unit| unit.loaded_cargo_entities.is_empty());
+            squad_is_forming
+                || squad_transport_phase.is_some_and(is_live_transport_phase)
+                || reusable_empty_return
         } else {
             squad.phase != MissionPhase::Completed
         };
@@ -1105,7 +1111,7 @@ fn missing_expansion_package_cost(
     if !operation.is_forming
         && !operation
             .transport_phase
-            .is_some_and(is_live_transport_phase)
+            .is_some_and(|phase| is_live_transport_phase(phase) || phase == TransportPhase::Return)
     {
         return missing;
     }
@@ -1522,14 +1528,17 @@ fn requirement_for_assessment(
         }
         IslandCampaignState::Threatened => {
             let combat_units = facts.enemy_combat_units;
-            assessment.required_budget = 0;
+            let capture_budget = remaining_properties.saturating_mul(1_000);
+            assessment.required_budget = capture_budget;
             IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
-                capture_units: 0,
+                // 接近脅威は未所有施設を放棄する理由ではない。既着の占領兵を
+                // assignmentへ残し、戦闘Entityとは独立して施設確保を続行する。
+                capture_units: remaining_properties,
                 ground_combat_units: 0,
                 combat_units,
-                total_budget: 0,
+                total_budget: capture_budget,
             }
         }
         IslandCampaignState::Contested if contested_is_competitive(facts) => {
@@ -1780,9 +1789,9 @@ fn candidate_capture_target_positions(
 
 fn operation_has_live_capability(operation: &ExistingCampaignOperation) -> bool {
     ((operation.is_forming
-        || operation
-            .transport_phase
-            .is_some_and(is_live_transport_phase))
+        || operation.transport_phase.is_some_and(|phase| {
+            is_live_transport_phase(phase) || phase == TransportPhase::Return
+        }))
         && !operation.transport_entities.is_empty())
         || !operation.capture_entities.is_empty()
         || !operation.combat_entities.is_empty()
@@ -1810,7 +1819,16 @@ fn unavailable_campaign_entities(
                     .get(transport)
                     .is_some_and(|unit| unit.faction == player_id)
             }) {
-                unavailable.insert(transport);
+                // 空のReturn輸送役は、帰投完了を待たず同じ／次の補充便へ再予約できる。
+                // cargoが残るReturn（実際にはDropへ戻すべき状態）とCompletedは保護する。
+                let reusable_empty_return =
+                    matches!(squad.phase, MissionPhase::Transport(TransportPhase::Return))
+                        && unit_by_entity
+                            .get(&transport)
+                            .is_some_and(|unit| unit.loaded_cargo_entities.is_empty());
+                if !reusable_empty_return {
+                    unavailable.insert(transport);
+                }
             }
             unavailable.extend(
                 squad
@@ -1887,11 +1905,12 @@ fn collect_campaign_resource_pool(
                     && loaded_cargo_is_assignment_owned
             }
             Some(AssignedTransportState::Phase(phase, target, cargo_is_assigned)) => {
-                is_live_transport_phase(*phase)
+                (is_live_transport_phase(*phase)
+                    || (*phase == TransportPhase::Return && unit.loaded_cargo_entities.is_empty()))
                     && target.is_some()
                     && *target == assigned_island
-                    && *cargo_is_assigned
-                    && loaded_cargo_is_assignment_owned
+                    && ((*phase == TransportPhase::Return && unit.loaded_cargo_entities.is_empty())
+                        || (*cargo_is_assigned && loaded_cargo_is_assignment_owned))
             }
             Some(AssignedTransportState::Other) => false,
         };
@@ -1907,7 +1926,8 @@ fn collect_campaign_resource_pool(
         let available_cargo_slots = unit
             .free_cargo_slots
             .saturating_add(loaded_cargo_entities.len() as u32);
-        // targetless safe Drop、Return/Completed、関連外cargo、実capacity無しの輸送役は再予約しない。
+        // targetless safe Drop、Completed、関連外cargo、実capacity無しの輸送役は再予約しない。
+        // 空Returnだけは次便のpickupへ直接向け直し、帰投だけの空走を挟まない。
         if unavailable_entities.contains(&unit.entity)
             || is_offshore_transport && unit.fuel.is_some_and(|fuel| fuel == 0)
             || is_offshore_transport && (!transport_is_available || available_cargo_slots == 0)
@@ -3620,7 +3640,7 @@ mod tests {
     }
 
     #[test]
-    fn return_phase_assets_do_not_reduce_target_package_cost() {
+    fn empty_return_transport_is_reused_but_loaded_return_is_not() {
         let master_data = MasterDataRegistry::load().expect("master data should load");
         let (mut world, _schedule) =
             crate::setup::initialize_world_from_master_data(&master_data, "map_1")
@@ -3664,6 +3684,11 @@ mod tests {
             max: helicopter.max_cargo,
             loaded: Vec::new(),
         });
+        let reusable_return = spawn_test_unit(&mut world, player, origin, helicopter.clone());
+        world.entity_mut(reusable_return).insert(CargoCapacity {
+            max: helicopter.max_cargo,
+            loaded: Vec::new(),
+        });
 
         let mut manager = SquadManager::new();
         let squad = manager.create_squad(MissionType::Transport);
@@ -3673,6 +3698,12 @@ mod tests {
         squad.target_island = Some(target_island);
         squad.target = Some(target);
         squad.phase = MissionPhase::Transport(TransportPhase::Return);
+        let reusable_squad = manager.create_squad(MissionType::Transport);
+        reusable_squad.members.insert(reusable_return);
+        reusable_squad.transport_entity = Some(reusable_return);
+        reusable_squad.target_island = Some(target_island);
+        reusable_squad.target = Some(target);
+        reusable_squad.phase = MissionPhase::Transport(TransportPhase::Return);
         let active_squad = manager.create_squad(MissionType::Transport);
         active_squad.members.insert(active_transport);
         active_squad.transport_entity = Some(active_transport);
@@ -3688,6 +3719,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(target.missing_expansion_package_cost, 2_000);
+        let portfolio = analyze_island_campaign(&mut world, player);
+        let assignment = portfolio.assignment_for(target_island).unwrap();
+        assert!(assignment.transport_entities.contains(&reusable_return));
+        assert!(!assignment.transport_entities.contains(&transport));
     }
 
     #[test]
@@ -3856,6 +3891,13 @@ mod tests {
         assert_eq!(secure.decision, IslandCampaignDecision::Secure);
         assert_eq!(secure_requirement.capture_units, 3);
         assert_eq!(secure_requirement.total_budget, 3_000);
+
+        secured_facts.enemy_arrival_eta = Some(1);
+        let mut threatened = assess_island(&secured_facts);
+        let threatened_requirement = requirement_for_assessment(&secured_facts, &mut threatened);
+        assert_eq!(threatened.decision, IslandCampaignDecision::Defend);
+        assert_eq!(threatened_requirement.capture_units, 3);
+        assert_eq!(threatened_requirement.total_budget, 3_000);
 
         secured_facts.enemy_units = 1;
         secured_facts.friendly_combat_units = 3;

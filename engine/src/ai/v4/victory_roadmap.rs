@@ -1,3 +1,4 @@
+use crate::ai::engine::AiCommand;
 use crate::ai::island_campaign::{
     IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignPortfolio,
 };
@@ -85,6 +86,8 @@ pub enum OperationIssueKind {
     CapturerDestroyed,
     CombatUnitDestroyed,
     CargoLostWithTransport,
+    /// 命令として発行した作戦stepに対応する完了Eventが手番内に届かなかった。
+    StepBlocked,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +106,7 @@ pub enum OperationRecoveryKind {
     RestoreAssignment,
     AssignTransport,
     RequestReplacement,
+    ReplanStep,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +120,9 @@ pub struct OperationRecoveryAction {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StepExecutionTotals {
+    pub planned: u32,
+    pub completed: u32,
+    pub blocked: u32,
     pub moves: u32,
     pub loads: u32,
     pub drops: u32,
@@ -125,6 +132,34 @@ pub struct StepExecutionTotals {
     pub supplies: u32,
     pub waits: u32,
     pub deviations: u32,
+}
+
+/// 命令発行から結果Eventまでを結ぶ、Entity単位の未完作戦step。
+///
+/// 1 Entity 1作戦の正本と同じキーを使うため、照合は平均O(1)であり、
+/// 作戦や行動種別ごとに全Entityを走査しない。
+#[derive(Debug, Clone)]
+struct PendingOperationStep {
+    operation_id: StrategicOperationId,
+    planned_turn: u32,
+    step: CampaignStepKind,
+    terminal_event: CampaignStepKind,
+    target_position: Option<GridPosition>,
+    target_entity: Option<Entity>,
+    movement_observed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct OperationStepRecord {
+    pub operation_id: StrategicOperationId,
+    pub entity: Entity,
+    pub planned_turn: u32,
+    pub resolved_turn: Option<u32>,
+    pub step: CampaignStepKind,
+    pub target_position: Option<GridPosition>,
+    pub target_entity: Option<Entity>,
+    pub completed: bool,
+    pub blocked_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -189,9 +224,13 @@ pub struct VictoryRoadmapRegistry {
     next_operation_id: u64,
     roadmaps: HashMap<PlayerId, VictoryRoadmap>,
     operations: HashMap<StrategicOperationId, StrategicOperation>,
-    operation_keys: HashMap<(PlayerId, IslandId, StrategicPurpose), StrategicOperationId>,
+    // 作戦のidentityは「誰が、どの島を攻略するか」で固定する。
+    // 攻勢・防衛は戦況で変わる状態であり、keyへ含めると予実履歴が分断される。
+    operation_keys: HashMap<(PlayerId, IslandId), StrategicOperationId>,
     entity_bindings: HashMap<Entity, EntityOperationBinding>,
     transport_manifests: HashMap<Entity, HashSet<Entity>>,
+    pending_steps: HashMap<Entity, PendingOperationStep>,
+    step_history: Vec<OperationStepRecord>,
 }
 
 impl VictoryRoadmapRegistry {
@@ -207,6 +246,221 @@ impl VictoryRoadmapRegistry {
             .collect::<Vec<_>>();
         operations.sort_unstable_by_key(|operation| operation.id.0);
         operations
+    }
+
+    pub fn step_history_for(&self, player_id: PlayerId) -> Vec<&OperationStepRecord> {
+        self.step_history
+            .iter()
+            .filter(|record| {
+                self.operations
+                    .get(&record.operation_id)
+                    .is_some_and(|operation| operation.player_id == player_id)
+            })
+            .collect()
+    }
+
+    fn plan_entity_step(
+        &mut self,
+        entity: Entity,
+        turn: u32,
+        step: CampaignStepKind,
+        terminal_event: CampaignStepKind,
+        target_position: Option<GridPosition>,
+        target_entity: Option<Entity>,
+    ) {
+        let Some(binding) = self.entity_bindings.get(&entity).copied() else {
+            return;
+        };
+        if let Some(previous) = self.pending_steps.remove(&entity) {
+            self.block_pending_step(entity, previous, turn, "superseded before completion");
+        }
+        if let Some(operation) = self.operations.get_mut(&binding.operation_id) {
+            operation.execution.planned = operation.execution.planned.saturating_add(1);
+            if operation.current_issues.iter().any(|issue| {
+                issue.kind == OperationIssueKind::StepBlocked && issue.entity == Some(entity)
+            }) {
+                let recovery = OperationRecoveryAction {
+                    kind: OperationRecoveryKind::ReplanStep,
+                    cause: OperationIssueKind::StepBlocked,
+                    completed_turn: turn,
+                    entity: Some(entity),
+                    detail: format!(
+                        "replanned Entity {} from blocked step to {:?}",
+                        entity.to_bits(),
+                        step
+                    ),
+                };
+                operation.replan_count = operation.replan_count.saturating_add(1);
+                operation.last_replan_turn = Some(turn);
+                operation.recovery_history.push(recovery);
+            }
+        }
+        self.pending_steps.insert(
+            entity,
+            PendingOperationStep {
+                operation_id: binding.operation_id,
+                planned_turn: turn,
+                step,
+                terminal_event,
+                target_position,
+                target_entity,
+                movement_observed: false,
+            },
+        );
+        self.step_history.push(OperationStepRecord {
+            operation_id: binding.operation_id,
+            entity,
+            planned_turn: turn,
+            resolved_turn: None,
+            step,
+            target_position,
+            target_entity,
+            completed: false,
+            blocked_reason: None,
+        });
+    }
+
+    fn observe_planned_move(&mut self, entity: Entity, to: GridPosition, turn: u32) -> bool {
+        let Some(pending) = self.pending_steps.get_mut(&entity) else {
+            return false;
+        };
+        if pending.planned_turn != turn || pending.target_position != Some(to) {
+            return false;
+        }
+        pending.movement_observed = true;
+        if let Some(operation) = self.operations.get_mut(&pending.operation_id) {
+            operation.execution.moves = operation.execution.moves.saturating_add(1);
+        }
+        true
+    }
+
+    fn complete_planned_step(
+        &mut self,
+        entity: Entity,
+        turn: u32,
+        event_step: CampaignStepKind,
+        position: Option<GridPosition>,
+        related_entity: Option<Entity>,
+    ) -> bool {
+        let Some(pending) = self.pending_steps.get(&entity) else {
+            return false;
+        };
+        let position_matches = pending.target_position.is_none()
+            || position.is_none()
+            || pending.target_position == position;
+        let entity_matches = pending.target_entity.is_none()
+            || related_entity.is_none()
+            || pending.target_entity == related_entity;
+        if pending.planned_turn != turn
+            || pending.terminal_event != event_step
+            || !position_matches
+            || !entity_matches
+        {
+            return false;
+        }
+
+        let pending = self.pending_steps.remove(&entity).unwrap();
+        if let Some(operation) = self.operations.get_mut(&pending.operation_id) {
+            operation.execution.completed = operation.execution.completed.saturating_add(1);
+            operation.last_step = Some(pending.step);
+            operation.last_progress_turn = Some(turn);
+            match pending.step {
+                CampaignStepKind::Move | CampaignStepKind::Transit => {
+                    // 実移動が無い同位置Waitは進捗に数えず、Holdとしてのみ完了させる。
+                    if !pending.movement_observed {
+                        operation.execution.waits = operation.execution.waits.saturating_add(1);
+                    }
+                }
+                CampaignStepKind::Load => {
+                    operation.execution.loads = operation.execution.loads.saturating_add(1);
+                }
+                CampaignStepKind::Drop => {
+                    operation.execution.drops = operation.execution.drops.saturating_add(1);
+                }
+                CampaignStepKind::Attack => {
+                    operation.execution.attacks = operation.execution.attacks.saturating_add(1);
+                }
+                CampaignStepKind::Capture => {
+                    operation.execution.captures = operation.execution.captures.saturating_add(1);
+                }
+                CampaignStepKind::Supply => {
+                    operation.execution.supplies = operation.execution.supplies.saturating_add(1);
+                }
+                CampaignStepKind::Wait | CampaignStepKind::Hold => {
+                    operation.execution.waits = operation.execution.waits.saturating_add(1);
+                }
+                CampaignStepKind::Produce => {}
+            }
+        }
+        if let Some(record) = self.step_history.iter_mut().rev().find(|record| {
+            record.entity == entity
+                && record.operation_id == pending.operation_id
+                && record.planned_turn == pending.planned_turn
+                && record.resolved_turn.is_none()
+        }) {
+            record.resolved_turn = Some(turn);
+            record.completed = true;
+        }
+        true
+    }
+
+    fn block_pending_step(
+        &mut self,
+        entity: Entity,
+        pending: PendingOperationStep,
+        turn: u32,
+        reason: &str,
+    ) {
+        let detail = format!(
+            "planned {:?} for Entity {} at turn {} was not completed: {}",
+            pending.step,
+            entity.to_bits(),
+            pending.planned_turn,
+            reason
+        );
+        if let Some(operation) = self.operations.get_mut(&pending.operation_id) {
+            operation.execution.blocked = operation.execution.blocked.saturating_add(1);
+            operation.execution.deviations = operation.execution.deviations.saturating_add(1);
+            operation.phase = OperationPhase::Blocked;
+            operation.blocked_reason = Some(detail.clone());
+            let issue = OperationIssue {
+                kind: OperationIssueKind::StepBlocked,
+                detected_turn: turn,
+                entity: Some(entity),
+                related_entity: pending.target_entity,
+                detail: detail.clone(),
+            };
+            operation.current_issues.push(issue.clone());
+            operation.issue_history.push(issue);
+        }
+        if let Some(record) = self.step_history.iter_mut().rev().find(|record| {
+            record.entity == entity
+                && record.operation_id == pending.operation_id
+                && record.planned_turn == pending.planned_turn
+                && record.resolved_turn.is_none()
+        }) {
+            record.resolved_turn = Some(turn);
+            record.blocked_reason = Some(detail);
+        }
+    }
+
+    fn expire_pending_steps(&mut self, player_id: PlayerId, turn: u32) {
+        let expired = self
+            .pending_steps
+            .iter()
+            .filter(|(_, pending)| {
+                pending.planned_turn < turn
+                    && self
+                        .operations
+                        .get(&pending.operation_id)
+                        .is_some_and(|operation| operation.player_id == player_id)
+            })
+            .map(|(entity, pending)| (*entity, pending.clone()))
+            .collect::<Vec<_>>();
+        for (entity, pending) in expired {
+            self.pending_steps.remove(&entity);
+            self.block_pending_step(entity, pending, turn, "no matching result Event");
+        }
     }
 
     fn ensure_roadmap(
@@ -259,7 +513,7 @@ impl VictoryRoadmapRegistry {
         capital: GridPosition,
         owned: bool,
     ) -> StrategicOperationId {
-        let key = (player_id, island_id, StrategicPurpose::AssaultCapital);
+        let key = (player_id, island_id);
         let operation_id = if let Some(id) = self.operation_keys.get(&key).copied() {
             id
         } else {
@@ -310,6 +564,7 @@ impl VictoryRoadmapRegistry {
             .operations
             .get_mut(&operation_id)
             .expect("作成済み首都作戦");
+        operation.purpose = StrategicPurpose::AssaultCapital;
         operation.last_observed_turn = turn;
         operation.tactical_anchor = capital;
         operation.owned_objective_count = usize::from(owned);
@@ -344,7 +599,7 @@ impl VictoryRoadmapRegistry {
         owned_properties: &HashSet<GridPosition>,
         phase: OperationPhase,
     ) -> StrategicOperationId {
-        let key = (player_id, assignment.island_id, purpose);
+        let key = (player_id, assignment.island_id);
         let operation_id = if let Some(id) = self.operation_keys.get(&key).copied() {
             id
         } else {
@@ -394,6 +649,8 @@ impl VictoryRoadmapRegistry {
             .operations
             .get_mut(&operation_id)
             .expect("作成済みStrategicOperation");
+        // purposeは作戦identityではなく、同じ作戦内の可変な戦術状態として更新する。
+        operation.purpose = purpose;
         operation.last_observed_turn = turn;
         operation.tactical_anchor = assignment.target_position;
         operation.owned_objective_count = operation
@@ -570,41 +827,6 @@ impl VictoryRoadmapRegistry {
         }
     }
 
-    fn record_entity_step(&mut self, entity: Entity, turn: u32, step: CampaignStepKind) {
-        let Some(binding) = self.entity_bindings.get(&entity).copied() else {
-            return;
-        };
-        let Some(operation) = self.operations.get_mut(&binding.operation_id) else {
-            return;
-        };
-        operation.last_step = Some(step);
-        operation.last_progress_turn = Some(turn);
-        match step {
-            CampaignStepKind::Move | CampaignStepKind::Transit => {
-                operation.execution.moves = operation.execution.moves.saturating_add(1);
-            }
-            CampaignStepKind::Load => {
-                operation.execution.loads = operation.execution.loads.saturating_add(1);
-            }
-            CampaignStepKind::Drop => {
-                operation.execution.drops = operation.execution.drops.saturating_add(1);
-            }
-            CampaignStepKind::Attack => {
-                operation.execution.attacks = operation.execution.attacks.saturating_add(1);
-            }
-            CampaignStepKind::Capture => {
-                operation.execution.captures = operation.execution.captures.saturating_add(1);
-            }
-            CampaignStepKind::Supply => {
-                operation.execution.supplies = operation.execution.supplies.saturating_add(1);
-            }
-            CampaignStepKind::Wait => {
-                operation.execution.waits = operation.execution.waits.saturating_add(1);
-            }
-            CampaignStepKind::Produce | CampaignStepKind::Hold => {}
-        }
-    }
-
     fn record_move(
         &mut self,
         entity: Entity,
@@ -616,6 +838,8 @@ impl VictoryRoadmapRegistry {
         let Some(binding) = self.entity_bindings.get(&entity).copied() else {
             return;
         };
+        let had_pending_step = self.pending_steps.contains_key(&entity);
+        let planned_move = self.observe_planned_move(entity, to, turn);
         let source_island = island_map.get_island_at(&from).map(|island| island.id);
         let destination_island = island_map.get_island_at(&to).map(|island| island.id);
         if let Some(operation) = self.operations.get_mut(&binding.operation_id)
@@ -634,7 +858,109 @@ impl VictoryRoadmapRegistry {
                 operation.island_id.0
             ));
         }
-        self.record_entity_step(entity, turn, CampaignStepKind::Move);
+        if had_pending_step
+            && !planned_move
+            && let Some(operation) = self.operations.get_mut(&binding.operation_id)
+        {
+            operation.execution.deviations = operation.execution.deviations.saturating_add(1);
+        }
+    }
+}
+
+/// 実際に発行するAI命令を、担当StrategicOperationの予定stepとして先に登録する。
+/// 結果Eventは同じEntityキーで照合し、命令を出しただけでは作戦進捗にしない。
+pub(crate) fn record_operation_command(world: &mut World, entity: Entity, command: &AiCommand) {
+    let turn = world
+        .get_resource::<MatchState>()
+        .map_or(0, |state| state.current_turn_number.0);
+    let origin = world.get::<GridPosition>(entity).copied();
+    let transport_phase = world
+        .get_resource::<SquadManager>()
+        .and_then(|manager| {
+            manager.squads.iter().find(|squad| {
+                squad.members.contains(&entity)
+                    || squad.transport_entity == Some(entity)
+                    || squad.cargo_entities.contains(&entity)
+            })
+        })
+        .and_then(|squad| match squad.phase {
+            MissionPhase::Transport(phase) => Some(phase),
+            _ => None,
+        });
+    let specification = match command {
+        AiCommand::Attack {
+            target_pos,
+            target_entity,
+        } => Some((
+            CampaignStepKind::Attack,
+            CampaignStepKind::Attack,
+            Some(*target_pos),
+            Some(*target_entity),
+        )),
+        AiCommand::Capture { target_pos } => Some((
+            CampaignStepKind::Capture,
+            CampaignStepKind::Capture,
+            Some(*target_pos),
+            None,
+        )),
+        AiCommand::Wait { target_pos } => {
+            let moved = origin.is_some_and(|position| position != *target_pos);
+            let step = if moved
+                && matches!(
+                    transport_phase,
+                    Some(TransportPhase::Transit | TransportPhase::Drop)
+                ) {
+                CampaignStepKind::Transit
+            } else if moved {
+                CampaignStepKind::Move
+            } else {
+                CampaignStepKind::Hold
+            };
+            Some((step, CampaignStepKind::Wait, Some(*target_pos), None))
+        }
+        AiCommand::Load {
+            target_pos,
+            transport_entity,
+        } => Some((
+            CampaignStepKind::Load,
+            CampaignStepKind::Load,
+            Some(*target_pos),
+            Some(*transport_entity),
+        )),
+        AiCommand::Drop {
+            transport_target_pos,
+            cargo_entity,
+            ..
+        } => Some((
+            CampaignStepKind::Drop,
+            CampaignStepKind::Drop,
+            Some(*transport_target_pos),
+            Some(*cargo_entity),
+        )),
+        AiCommand::Supply {
+            target_pos,
+            target_entity,
+        } => Some((
+            CampaignStepKind::Supply,
+            CampaignStepKind::Supply,
+            Some(*target_pos),
+            Some(*target_entity),
+        )),
+        // Mergeは作戦工程ではなく損耗unitの統合であり、予定進捗に数えない。
+        AiCommand::Merge { .. } => None,
+    };
+    let Some((step, terminal_event, target_position, target_entity)) = specification else {
+        return;
+    };
+    if let Some(mut registry) = world.get_resource_mut::<VictoryRoadmapRegistry>() {
+        registry.plan_entity_step(
+            entity,
+            turn,
+            step,
+            terminal_event,
+            target_position,
+            target_entity,
+        );
     }
 }
 
@@ -670,6 +996,7 @@ fn entity_is_owned_by_island_squad(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn diagnose_operation_execution(
     world: &World,
     manager: &SquadManager,
@@ -677,6 +1004,7 @@ fn diagnose_operation_execution(
     turn: u32,
     assignment: &IslandCampaignAssignment,
     previous_entities: &[(Entity, OperationEntityRole)],
+    persistent_combat_entities: &HashSet<Entity>,
     production_records: &[crate::ai::v4::campaign_execution::CampaignProductionRecord],
 ) -> Vec<OperationIssue> {
     use crate::ai::v4::campaign_execution::{CampaignProductionRole, CampaignProductionStatus};
@@ -686,6 +1014,7 @@ fn diagnose_operation_execution(
         .iter()
         .chain(assignment.capture_entities.iter())
         .chain(assignment.combat_entities.iter())
+        .chain(persistent_combat_entities.iter())
         .copied()
         .collect::<HashSet<_>>();
     let mut issues = Vec::new();
@@ -823,6 +1152,7 @@ fn diagnose_operation_execution(
     issues
 }
 
+#[allow(clippy::too_many_arguments)]
 fn diagnose_operation_recoveries(
     world: &World,
     manager: &SquadManager,
@@ -830,6 +1160,7 @@ fn diagnose_operation_recoveries(
     turn: u32,
     assignment: &IslandCampaignAssignment,
     previous_issues: &[OperationIssue],
+    persistent_combat_entities: &HashSet<Entity>,
     production_records: &[crate::ai::v4::campaign_execution::CampaignProductionRecord],
 ) -> Vec<OperationRecoveryAction> {
     use crate::ai::v4::campaign_execution::{CampaignProductionRole, CampaignProductionStatus};
@@ -839,12 +1170,15 @@ fn diagnose_operation_recoveries(
         .iter()
         .chain(assignment.capture_entities.iter())
         .chain(assignment.combat_entities.iter())
+        .chain(persistent_combat_entities.iter())
         .copied()
         .collect::<HashSet<_>>();
     let mut recoveries = Vec::new();
     for issue in previous_issues {
         let recovery = match issue.kind {
             OperationIssueKind::AwaitingProduction => None,
+            // 新しい命令を実際に発行した時点でplan_entity_stepがReplanStepを記録する。
+            OperationIssueKind::StepBlocked => None,
             OperationIssueKind::ProductionDelayed => production_records
                 .iter()
                 .filter(|record| record.planned_turn >= issue.detected_turn)
@@ -1329,6 +1663,9 @@ pub(crate) fn reconcile_campaign_roadmap(
     let mut registry = world
         .remove_resource::<VictoryRoadmapRegistry>()
         .unwrap_or_default();
+    // 前手番に発行した命令の結果Eventが無ければ、再構築で黙って消さず
+    // StepBlockedとして同じRoadmapの原因別再計画へ返す。
+    registry.expire_pending_steps(player_id, turn);
     let roadmap_id = registry.ensure_roadmap(
         player_id,
         turn,
@@ -1371,7 +1708,7 @@ pub(crate) fn reconcile_campaign_roadmap(
         let purpose = purpose_for(assignment, enemy_capital_island);
         let previous_entities = registry
             .operation_keys
-            .get(&(player_id, assignment.island_id, purpose))
+            .get(&(player_id, assignment.island_id))
             .and_then(|operation_id| registry.operations.get(operation_id))
             .map(|operation| {
                 operation
@@ -1395,7 +1732,7 @@ pub(crate) fn reconcile_campaign_roadmap(
             .unwrap_or_default();
         let previous_issues = registry
             .operation_keys
-            .get(&(player_id, assignment.island_id, purpose))
+            .get(&(player_id, assignment.island_id))
             .and_then(|operation_id| registry.operations.get(operation_id))
             .map(|operation| operation.current_issues.clone())
             .unwrap_or_default();
@@ -1491,11 +1828,22 @@ pub(crate) fn reconcile_campaign_roadmap(
             &owned_properties,
             phase,
         );
+        let matching_plan_ids = matching_combat_plans
+            .iter()
+            .map(|plan| plan.plan_id)
+            .collect::<HashSet<_>>();
+        let persistent_combat_entities = deployment_records
+            .iter()
+            .filter(|record| record.active)
+            .filter(|record| {
+                record
+                    .plan_step
+                    .is_some_and(|step| matching_plan_ids.contains(&step.plan_id))
+            })
+            .map(|record| record.entity)
+            .collect::<HashSet<_>>();
         if let Some(operation) = registry.operations.get_mut(&operation_id) {
-            operation.combat_plan_ids = matching_combat_plans
-                .iter()
-                .map(|plan| plan.plan_id)
-                .collect();
+            operation.combat_plan_ids = matching_plan_ids;
             operation.planned_suppression_turn = suppression_turn;
             match completion_forecast {
                 Ok(completion_turn) => {
@@ -1515,6 +1863,7 @@ pub(crate) fn reconcile_campaign_roadmap(
             turn,
             assignment,
             &previous_entities,
+            &persistent_combat_entities,
             &production_records,
         );
         let recoveries = diagnose_operation_recoveries(
@@ -1524,6 +1873,7 @@ pub(crate) fn reconcile_campaign_roadmap(
             turn,
             assignment,
             &previous_issues,
+            &persistent_combat_entities,
             &production_records,
         );
         registry.replace_operation_issues(operation_id, issues, recoveries);
@@ -1552,6 +1902,54 @@ pub(crate) fn reconcile_campaign_roadmap(
                     OperationEntityRole::Combat
                 };
                 registry.bind_entity_exclusive(operation_id, *cargo, role);
+            }
+        }
+    }
+
+    // 首都強襲は兵站gate未達の間、局地portfolioへ現れなくても形成を続ける。
+    // その期間もRolling Planと生産済みEntityを常在AssaultCapitalへ結び、
+    // 予実履歴を「作ったが所属作戦なし」にしない。
+    if let Some(capital_island) = enemy_capital_island
+        && let Some(operation_id) = registry
+            .operation_keys
+            .get(&(player_id, capital_island))
+            .copied()
+    {
+        let capital_plans = combat_plan_summaries
+            .iter()
+            .filter(|plan| {
+                island_map
+                    .get_island_at(&plan.anchor)
+                    .is_some_and(|island| island.id == capital_island)
+                    || plan.objective_properties.iter().any(|position| {
+                        island_map
+                            .get_island_at(position)
+                            .is_some_and(|island| island.id == capital_island)
+                    })
+            })
+            .collect::<Vec<_>>();
+        if let Some(operation) = registry.operations.get_mut(&operation_id) {
+            operation.combat_plan_ids = capital_plans.iter().map(|plan| plan.plan_id).collect();
+            operation.planned_suppression_turn = if capital_plans.is_empty() {
+                None
+            } else if capital_plans
+                .iter()
+                .all(|plan| plan.remaining_target_count == 0)
+            {
+                Some(turn)
+            } else {
+                capital_plans
+                    .iter()
+                    .filter(|plan| plan.remaining_target_count > 0)
+                    .filter_map(|plan| plan.planned_elimination_turn)
+                    .max()
+            };
+            if !capital_plans.is_empty() {
+                operation.blocked_reason =
+                    operation.planned_suppression_turn.is_none().then(|| {
+                        "capital combat plan is forming but has no executable suppression turn"
+                            .to_owned()
+                    });
             }
         }
     }
@@ -1643,11 +2041,17 @@ pub fn audit_victory_roadmap_system(
         if let Some(island_map) = island_map.as_deref() {
             registry.record_move(event.entity, event.from, event.to, turn, island_map);
         } else {
-            registry.record_entity_step(event.entity, turn, CampaignStepKind::Move);
+            registry.observe_planned_move(event.entity, event.to, turn);
         }
     }
     for event in attacked.read() {
-        registry.record_entity_step(event.attacker, turn, CampaignStepKind::Attack);
+        registry.complete_planned_step(
+            event.attacker,
+            turn,
+            CampaignStepKind::Attack,
+            None,
+            Some(event.defender),
+        );
     }
     for event in loaded.read() {
         registry
@@ -1655,19 +2059,55 @@ pub fn audit_victory_roadmap_system(
             .entry(event.transport)
             .or_default()
             .insert(event.cargo);
-        registry.record_entity_step(event.transport, turn, CampaignStepKind::Load);
-        registry.record_entity_step(event.cargo, turn, CampaignStepKind::Load);
+        if !registry.complete_planned_step(
+            event.cargo,
+            turn,
+            CampaignStepKind::Load,
+            None,
+            Some(event.transport),
+        ) {
+            registry.complete_planned_step(
+                event.transport,
+                turn,
+                CampaignStepKind::Load,
+                None,
+                Some(event.cargo),
+            );
+        }
     }
     for event in unloaded.read() {
         if let Some(manifest) = registry.transport_manifests.get_mut(&event.transport) {
             manifest.remove(&event.cargo);
         }
-        registry.record_entity_step(event.transport, turn, CampaignStepKind::Drop);
-        registry.record_entity_step(event.cargo, turn, CampaignStepKind::Drop);
+        if !registry.complete_planned_step(
+            event.transport,
+            turn,
+            CampaignStepKind::Drop,
+            None,
+            Some(event.cargo),
+        ) {
+            registry.complete_planned_step(
+                event.cargo,
+                turn,
+                CampaignStepKind::Drop,
+                None,
+                Some(event.transport),
+            );
+        }
     }
     for event in capture_progressed.read() {
-        registry.record_entity_step(event.unit, turn, CampaignStepKind::Capture);
-        if event.completed
+        let matched = registry.complete_planned_step(
+            event.unit,
+            turn,
+            CampaignStepKind::Capture,
+            Some(GridPosition {
+                x: event.x,
+                y: event.y,
+            }),
+            None,
+        );
+        if matched
+            && event.completed
             && let Some(binding) = registry.entity_bindings.get(&event.unit).copied()
             && let Some(operation) = registry.operations.get_mut(&binding.operation_id)
         {
@@ -1680,19 +2120,23 @@ pub fn audit_victory_roadmap_system(
             x: event.x,
             y: event.y,
         };
-        for operation in registry.operations.values_mut().filter(|operation| {
+        // PropertyCapturedEventには実行Entityが無いため、これ単独では作戦進捗にしない。
+        // 対応するPropertyCaptureProgressedEventを照合済みの場合だけ所有数の再計測で反映する。
+        let _belongs_to_active_operation = registry.operations.values().any(|operation| {
             operation.active && operation.objective_properties.contains(&position)
-        }) {
-            operation.last_progress_turn = Some(turn);
-            operation.last_step = Some(CampaignStepKind::Capture);
-        }
+        });
     }
     for event in supplied.read() {
-        registry.record_entity_step(event.supplier, turn, CampaignStepKind::Supply);
-        registry.record_entity_step(event.target, turn, CampaignStepKind::Supply);
+        registry.complete_planned_step(
+            event.supplier,
+            turn,
+            CampaignStepKind::Supply,
+            None,
+            Some(event.target),
+        );
     }
     for event in waited.read() {
-        registry.record_entity_step(event.entity, turn, CampaignStepKind::Wait);
+        registry.complete_planned_step(event.entity, turn, CampaignStepKind::Wait, None, None);
     }
     let mut campaign_execution = campaign_execution;
     let mut operation_assignments = operation_assignments;
@@ -1711,6 +2155,141 @@ pub fn audit_victory_roadmap_system(
 mod tests {
     use super::*;
     use crate::resources::{GridTopology, MovementType};
+
+    fn operation_with_entity(
+        registry: &mut VictoryRoadmapRegistry,
+        player: PlayerId,
+        island: IslandId,
+        entity: Entity,
+        role: OperationEntityRole,
+    ) -> StrategicOperationId {
+        let roadmap = registry.ensure_roadmap(player, 1, None, None, 1);
+        let operation = StrategicOperationId(999);
+        registry.operations.insert(
+            operation,
+            StrategicOperation {
+                id: operation,
+                roadmap_id: roadmap,
+                player_id: player,
+                island_id: island,
+                purpose: StrategicPurpose::CaptureIsland,
+                created_turn: 1,
+                last_observed_turn: 1,
+                tactical_anchor: GridPosition { x: 3, y: 3 },
+                objective_properties: vec![GridPosition { x: 3, y: 3 }],
+                owned_objective_count: 0,
+                phase: OperationPhase::Forming,
+                planned_completion_turn: None,
+                actual_completion_turn: None,
+                assigned_transports: HashSet::new(),
+                assigned_capturers: HashSet::new(),
+                assigned_combat: HashSet::new(),
+                combat_plan_ids: HashSet::new(),
+                planned_suppression_turn: None,
+                execution: StepExecutionTotals::default(),
+                last_step: None,
+                last_progress_turn: None,
+                blocked_reason: None,
+                current_issues: Vec::new(),
+                issue_history: Vec::new(),
+                recovery_history: Vec::new(),
+                replan_count: 0,
+                last_replan_turn: None,
+                active: true,
+            },
+        );
+        registry.bind_entity_exclusive(operation, entity, role);
+        operation
+    }
+
+    #[test]
+    fn planned_step_counts_only_a_matching_result_event() {
+        let player = PlayerId(1);
+        let entity = Entity::from_raw(42);
+        let target = Entity::from_raw(84);
+        let mut registry = VictoryRoadmapRegistry::default();
+        let operation = operation_with_entity(
+            &mut registry,
+            player,
+            IslandId(2),
+            entity,
+            OperationEntityRole::Combat,
+        );
+        registry.plan_entity_step(
+            entity,
+            3,
+            CampaignStepKind::Attack,
+            CampaignStepKind::Attack,
+            Some(GridPosition { x: 3, y: 3 }),
+            Some(target),
+        );
+
+        assert!(!registry.complete_planned_step(
+            entity,
+            3,
+            CampaignStepKind::Attack,
+            None,
+            Some(Entity::from_raw(85)),
+        ));
+        assert_eq!(registry.operations[&operation].execution.attacks, 0);
+        assert!(registry.complete_planned_step(
+            entity,
+            3,
+            CampaignStepKind::Attack,
+            None,
+            Some(target),
+        ));
+        assert_eq!(registry.operations[&operation].execution.planned, 1);
+        assert_eq!(registry.operations[&operation].execution.completed, 1);
+        assert_eq!(registry.operations[&operation].execution.attacks, 1);
+    }
+
+    #[test]
+    fn missing_result_event_becomes_step_blocked_and_replan_is_actual_command() {
+        let player = PlayerId(1);
+        let entity = Entity::from_raw(42);
+        let mut registry = VictoryRoadmapRegistry::default();
+        let operation = operation_with_entity(
+            &mut registry,
+            player,
+            IslandId(2),
+            entity,
+            OperationEntityRole::Capture,
+        );
+        registry.plan_entity_step(
+            entity,
+            3,
+            CampaignStepKind::Capture,
+            CampaignStepKind::Capture,
+            Some(GridPosition { x: 3, y: 3 }),
+            None,
+        );
+        registry.expire_pending_steps(player, 4);
+
+        let blocked = &registry.operations[&operation];
+        assert_eq!(blocked.execution.blocked, 1);
+        assert_eq!(blocked.replan_count, 0, "検知だけを再計画実績にしない");
+        assert!(blocked.current_issues.iter().any(|issue| {
+            issue.kind == OperationIssueKind::StepBlocked && issue.entity == Some(entity)
+        }));
+
+        registry.plan_entity_step(
+            entity,
+            4,
+            CampaignStepKind::Capture,
+            CampaignStepKind::Capture,
+            Some(GridPosition { x: 3, y: 3 }),
+            None,
+        );
+        let replanned = &registry.operations[&operation];
+        assert_eq!(replanned.replan_count, 1);
+        assert!(
+            replanned
+                .recovery_history
+                .iter()
+                .any(|recovery| recovery.kind == OperationRecoveryKind::ReplanStep)
+        );
+    }
 
     #[test]
     fn operation_identity_does_not_depend_on_enemy_entity_or_anchor() {
@@ -1778,6 +2357,83 @@ mod tests {
             "毎ターンのanchor変化で目的拠点を差し替えない"
         );
         assert_eq!(operation.tactical_anchor, GridPosition { x: 12, y: 11 });
+    }
+
+    #[test]
+    fn operation_identity_and_actuals_survive_capture_to_defense_revision() {
+        let player = PlayerId(1);
+        let island = IslandId(2);
+        let assignment = IslandCampaignAssignment {
+            island_id: island,
+            decision: IslandCampaignDecision::Expand,
+            target_position: GridPosition { x: 10, y: 10 },
+            capture_target_positions: vec![GridPosition { x: 10, y: 10 }],
+            priority_enemy_types: Vec::new(),
+            requirement: crate::ai::island_campaign::IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 0,
+                ground_combat_units: 0,
+                combat_units: 0,
+                total_budget: 0,
+            },
+            purchase_shortfall: crate::ai::island_campaign::IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 0,
+                ground_combat_units: 0,
+                combat_units: 0,
+                total_budget: 0,
+            },
+            allocated_budget: 0,
+            transport_entities: Vec::new(),
+            capture_entities: Vec::new(),
+            combat_entities: Vec::new(),
+            operation_ready: false,
+            continued_from_existing_squad: false,
+        };
+        let mut registry = VictoryRoadmapRegistry::default();
+        let roadmap = registry.ensure_roadmap(player, 1, None, None, 3);
+        let operation_id = registry.reconcile_assignment(
+            roadmap,
+            player,
+            1,
+            &assignment,
+            StrategicPurpose::CaptureIsland,
+            assignment.capture_target_positions.clone(),
+            &HashSet::new(),
+            OperationPhase::Capture,
+        );
+        let operation = registry.operations.get_mut(&operation_id).unwrap();
+        operation.execution.planned = 4;
+        operation.execution.completed = 3;
+        operation.issue_history.push(OperationIssue {
+            kind: OperationIssueKind::CombatUnitDestroyed,
+            detected_turn: 1,
+            entity: None,
+            related_entity: None,
+            detail: "capturer lost".to_owned(),
+        });
+
+        let revised_id = registry.reconcile_assignment(
+            roadmap,
+            player,
+            2,
+            &assignment,
+            StrategicPurpose::DefendIsland,
+            assignment.capture_target_positions.clone(),
+            &HashSet::new(),
+            OperationPhase::Blocked,
+        );
+
+        assert_eq!(revised_id, operation_id);
+        let operation = &registry.operations[&operation_id];
+        assert_eq!(operation.created_turn, 1);
+        assert_eq!(operation.purpose, StrategicPurpose::DefendIsland);
+        assert_eq!(operation.execution.planned, 4);
+        assert_eq!(operation.execution.completed, 3);
+        assert_eq!(operation.issue_history.len(), 1);
+        assert_eq!(registry.roadmaps[&player].operation_ids, vec![operation_id]);
     }
 
     #[test]
@@ -1862,6 +2518,61 @@ mod tests {
         registry.release_inactive_assignments(player);
         assert!(registry.operations[&second].assigned_capturers.is_empty());
         assert!(!registry.entity_bindings.contains_key(&entity));
+    }
+
+    #[test]
+    fn persistent_combat_deployment_is_not_reported_as_assignment_lost() {
+        let mut world = World::new();
+        let entity = world.spawn_empty().id();
+        let player = PlayerId(1);
+        let assignment = IslandCampaignAssignment {
+            island_id: IslandId(2),
+            decision: IslandCampaignDecision::Contest,
+            target_position: GridPosition { x: 3, y: 4 },
+            capture_target_positions: Vec::new(),
+            priority_enemy_types: Vec::new(),
+            requirement: crate::ai::island_campaign::IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 0,
+                ground_combat_units: 0,
+                combat_units: 1,
+                total_budget: 0,
+            },
+            purchase_shortfall: crate::ai::island_campaign::IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 0,
+                ground_combat_units: 0,
+                combat_units: 0,
+                total_budget: 0,
+            },
+            allocated_budget: 0,
+            transport_entities: Vec::new(),
+            capture_entities: Vec::new(),
+            combat_entities: Vec::new(),
+            operation_ready: true,
+            continued_from_existing_squad: true,
+        };
+        let manager = SquadManager::new();
+
+        let issues = diagnose_operation_execution(
+            &world,
+            &manager,
+            player,
+            3,
+            &assignment,
+            &[(entity, OperationEntityRole::Combat)],
+            &HashSet::from([entity]),
+            &[],
+        );
+
+        assert!(
+            issues
+                .iter()
+                .all(|issue| issue.kind != OperationIssueKind::AssignmentLost),
+            "rolling planの永続Combat deploymentは島assignment外でも作戦所属である"
+        );
     }
 
     #[test]

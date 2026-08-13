@@ -303,6 +303,9 @@ pub struct RollingCombatPlanSnapshot {
     pub occupation_turn: Option<u32>,
     pub production_cost: u32,
     pub expected_loss: u32,
+    pub protected_unit_count: usize,
+    pub protected_survivor_count: usize,
+    pub required_capture_survivor_count: usize,
     pub candidates_considered: usize,
     pub search_truncated: bool,
 }
@@ -421,6 +424,21 @@ pub struct VictoryRoadmapSnapshot {
     pub initial_enemy_unit_count: usize,
     pub current_enemy_unit_count: usize,
     pub operations: Vec<StrategicOperationSnapshot>,
+    pub recent_steps: Vec<OperationStepSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OperationStepSnapshot {
+    pub operation_id: u64,
+    pub entity_id: u64,
+    pub planned_turn: u32,
+    pub resolved_turn: Option<u32>,
+    pub step: String,
+    pub target_x: Option<usize>,
+    pub target_y: Option<usize>,
+    pub target_entity_id: Option<u64>,
+    pub completed: bool,
+    pub blocked_reason: Option<String>,
 }
 
 /// 首都攻略開始を早めるために選択・維持している兵站経路と、その比較根拠。
@@ -478,6 +496,9 @@ pub struct StrategicOperationSnapshot {
     pub transport_entity_ids: Vec<u64>,
     pub capture_entity_ids: Vec<u64>,
     pub combat_entity_ids: Vec<u64>,
+    pub planned_steps: u32,
+    pub completed_steps: u32,
+    pub blocked_steps: u32,
     pub moves: u32,
     pub loads: u32,
     pub drops: u32,
@@ -491,6 +512,7 @@ pub struct StrategicOperationSnapshot {
     pub last_progress_turn: Option<u32>,
     pub blocked_reason: Option<String>,
     pub current_issues: Vec<String>,
+    pub latest_issue_history: Vec<String>,
     pub issue_history_count: usize,
     pub latest_recoveries: Vec<String>,
     pub recovery_history_count: usize,
@@ -1154,6 +1176,9 @@ pub fn snapshot_production_plan_for_player(
             occupation_turn: rolling.occupation_turn,
             production_cost: rolling.production_cost,
             expected_loss: rolling.expected_loss,
+            protected_unit_count: rolling.protected_unit_count,
+            protected_survivor_count: rolling.protected_survivor_count,
+            required_capture_survivor_count: rolling.required_capture_survivor_count,
             candidates_considered: rolling.candidates_considered,
             search_truncated: rolling.search_truncated,
         })
@@ -1346,6 +1371,9 @@ pub fn snapshot_victory_roadmap_for_player(
                 transport_entity_ids,
                 capture_entity_ids,
                 combat_entity_ids,
+                planned_steps: operation.execution.planned,
+                completed_steps: operation.execution.completed,
+                blocked_steps: operation.execution.blocked,
                 moves: operation.execution.moves,
                 loads: operation.execution.loads,
                 drops: operation.execution.drops,
@@ -1372,6 +1400,21 @@ pub fn snapshot_victory_roadmap_for_player(
                         )
                     })
                     .collect(),
+                latest_issue_history: operation
+                    .issue_history
+                    .iter()
+                    .rev()
+                    .take(16)
+                    .map(|issue| {
+                        format!(
+                            "T{}:{:?}:{}:{}",
+                            issue.detected_turn,
+                            issue.kind,
+                            issue.entity.map_or(0, Entity::to_bits),
+                            issue.detail
+                        )
+                    })
+                    .collect(),
                 issue_history_count: operation.issue_history.len(),
                 latest_recoveries: operation
                     .recovery_history
@@ -1393,6 +1436,24 @@ pub fn snapshot_victory_roadmap_for_player(
             }
         })
         .collect();
+    let recent_steps = registry
+        .step_history_for(player_id)
+        .into_iter()
+        .rev()
+        .take(64)
+        .map(|record| OperationStepSnapshot {
+            operation_id: record.operation_id.0,
+            entity_id: record.entity.to_bits(),
+            planned_turn: record.planned_turn,
+            resolved_turn: record.resolved_turn,
+            step: format!("{:?}", record.step),
+            target_x: record.target_position.map(|position| position.x),
+            target_y: record.target_position.map(|position| position.y),
+            target_entity_id: record.target_entity.map(Entity::to_bits),
+            completed: record.completed,
+            blocked_reason: record.blocked_reason.clone(),
+        })
+        .collect();
     Some(VictoryRoadmapSnapshot {
         roadmap_id: roadmap.id.0,
         player_id: roadmap.player_id.0,
@@ -1407,6 +1468,7 @@ pub fn snapshot_victory_roadmap_for_player(
         initial_enemy_unit_count: roadmap.initial_enemy_unit_count,
         current_enemy_unit_count: roadmap.current_enemy_unit_count,
         operations,
+        recent_steps,
     })
 }
 

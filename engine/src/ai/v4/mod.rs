@@ -142,6 +142,8 @@ struct Operation {
     staging_anchor: GridPosition,
     /// falseの首都作戦は生産だけ進め、攻撃任務へ切り替えない。
     execution_authorized: bool,
+    /// 占領完了まで敵の攻撃から生存させる必要があるcampaign占領Entity。
+    protected_capture_entities: HashSet<Entity>,
     /// anchorが所有権変化で動いても同じ目的を照合するための拠点集合。
     objective_properties: Vec<GridPosition>,
     /// 防衛の硬い期限と、旧枠の診断にだけ使う作戦時間幅。
@@ -421,13 +423,15 @@ fn observe_plan_execution(world: &mut World, player_id: PlayerId, turn: u32) {
                 // 実行中の戦力として数えない。Defense待機はSquadを持つため残る。
                 mission_active: alive && record.active && record.squad_id.is_some(),
                 current_loss_value,
-                first_attack_turn: record.first_attack_turn,
-                attack_count: record.attack_count,
+                // 上位作戦へ一時転用中の戦闘を、このPlanの攻撃・損耗実績へ
+                // 混入させない。現在のPlan任務targetに対する実績だけを戻す。
+                first_attack_turn: record.mission_target_first_attack_turn,
+                attack_count: record.mission_target_attack_count,
                 priority_attack_count: record.priority_attack_count,
-                kill_count: record.kill_count,
-                damage_value_dealt: record.damage_value_dealt,
-                counter_value_received: record.counter_value_received,
-                destroyed_value: record.destroyed_value,
+                kill_count: record.mission_target_kill_count,
+                damage_value_dealt: record.mission_target_damage_value_dealt,
+                counter_value_received: record.mission_target_counter_value_received,
+                destroyed_value: record.mission_target_destroyed_value,
             })
         })
         .collect::<Vec<_>>();
@@ -459,34 +463,6 @@ fn decide_campaign_production_v4(
     let turn = world
         .get_resource::<crate::resources::MatchState>()
         .map_or(0, |state| state.current_turn_number.0);
-    let due_capital_purchases = world
-        .get_resource::<V4RollingPlanRegistry>()
-        .map(|registry| registry.capital_due_purchases(player_id, turn))
-        .unwrap_or_default();
-    let reserved_capital_facilities = due_capital_purchases
-        .iter()
-        .map(|(facility, _)| *facility)
-        .collect::<HashSet<_>>();
-    let reserved_capital_budget = due_capital_purchases
-        .iter()
-        .map(|(_, cost)| *cost)
-        .fold(0_u32, u32::saturating_add);
-    let campaign_preempts_capital = world
-        .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
-        .and_then(|cache| cache.campaign_portfolio(player_id))
-        .is_some_and(|portfolio| {
-            portfolio
-                .defenses
-                .iter()
-                .chain(portfolio.active_offensives.iter())
-                .any(|assignment| {
-                    let structural_shortfall = assignment.purchase_shortfall.transport_slots > 0
-                        || assignment.purchase_shortfall.capture_units > 0;
-                    assignment.decision
-                        == crate::ai::island_campaign::IslandCampaignDecision::Defend
-                        || assignment.continued_from_existing_squad && structural_shortfall
-                })
-        });
     let plan_exists = world
         .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
         .is_some_and(|cache| cache.campaign_production_planned(player_id));
@@ -494,22 +470,7 @@ fn decide_campaign_production_v4(
         let mut cache = world
             .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
             .unwrap_or_default();
-        let next = loop {
-            let next = cache.take_campaign_production_command(player_id);
-            match next {
-                Some(command)
-                    if !campaign_preempts_capital
-                        && reserved_capital_facilities.contains(&GridPosition {
-                            x: command.target_x,
-                            y: command.target_y,
-                        }) =>
-                {
-                    // 首都編成が今手番に使う施設は、局地購入から外す。
-                    continue;
-                }
-                other => break other,
-            }
-        };
+        let next = cache.take_campaign_production_command(player_id);
         let blocks_generic = cache.campaign_production_blocks_generic(player_id);
         let generic_budget = cache.campaign_production_generic_budget(player_id);
         world.insert_resource(cache);
@@ -517,13 +478,6 @@ fn decide_campaign_production_v4(
             Some(command) => {
                 mark_campaign_production_issued(world, player_id, turn, &command);
                 CampaignProductionControl::Command(command)
-            }
-            None if reserved_capital_budget > 0 && !campaign_preempts_capital => {
-                CampaignProductionControl::ContinueWithSurplus(
-                    generic_budget
-                        .unwrap_or(0)
-                        .saturating_add(reserved_capital_budget),
-                )
             }
             None if blocks_generic => CampaignProductionControl::BlockGeneric,
             None if generic_budget.is_some_and(|budget| budget > 0) => {
@@ -539,11 +493,7 @@ fn decide_campaign_production_v4(
         .map(|portfolio| portfolio.aggregate_missing_requirements())
         .unwrap_or_default();
     if shortfalls.is_empty() {
-        return if reserved_capital_budget > 0 {
-            CampaignProductionControl::ContinueWithSurplus(reserved_capital_budget)
-        } else {
-            CampaignProductionControl::Continue
-        };
+        return CampaignProductionControl::Continue;
     }
 
     // 航空掃討は後段のrolling planへ委譲する。一方、敵領Assaultで輸送・配置枠まで
@@ -565,29 +515,17 @@ fn decide_campaign_production_v4(
         .iter()
         .map(|unit| unit.stats.clone())
         .collect();
-    let campaign_facilities = scan
-        .free_facilities
-        .iter()
-        .filter(|(facility, _)| {
-            campaign_preempts_capital || !reserved_capital_facilities.contains(facility)
-        })
-        .copied()
-        .collect::<Vec<_>>();
     let outcome = plan_campaign_with_expansion_denial_reserve(
         player_id,
         &shortfalls,
-        &campaign_facilities,
+        &scan.free_facilities,
         scan.owned_airport_count,
         &scan.available_types,
         &enemy_stats,
         &scan.damage_chart,
         &scan.map,
         &scan.master_data,
-        scan.funds.saturating_sub(if !campaign_preempts_capital {
-            reserved_capital_budget
-        } else {
-            0
-        }),
+        scan.funds,
     );
     world.init_resource::<campaign_execution::V4CampaignExecutionRegistry>();
     world
@@ -602,21 +540,7 @@ fn decide_campaign_production_v4(
         outcome.commands,
         generic_budget,
     );
-    let next = loop {
-        let next = cache.take_campaign_production_command(player_id);
-        match next {
-            Some(command)
-                if !campaign_preempts_capital
-                    && reserved_capital_facilities.contains(&GridPosition {
-                        x: command.target_x,
-                        y: command.target_y,
-                    }) =>
-            {
-                continue;
-            }
-            other => break other,
-        }
-    };
+    let next = cache.take_campaign_production_command(player_id);
     let blocks_generic = cache.campaign_production_blocks_generic(player_id);
     let generic_budget = cache.campaign_production_generic_budget(player_id);
     world.insert_resource(cache);
@@ -625,13 +549,6 @@ fn decide_campaign_production_v4(
         Some(command) => {
             mark_campaign_production_issued(world, player_id, turn, &command);
             CampaignProductionControl::Command(command)
-        }
-        None if reserved_capital_budget > 0 && !campaign_preempts_capital => {
-            CampaignProductionControl::ContinueWithSurplus(
-                generic_budget
-                    .unwrap_or(0)
-                    .saturating_add(reserved_capital_budget),
-            )
         }
         None if blocks_generic => CampaignProductionControl::BlockGeneric,
         None if generic_budget.is_some_and(|budget| budget > 0) => {
@@ -690,10 +607,14 @@ struct CampaignPlanningObjective {
     kind: OperationKind,
     anchor: GridPosition,
     capture_eta: Option<u32>,
+    /// anchorの局所clusterではなく、島作戦本体が要求する占領完了時の生存兵数。
+    required_capture_survivors: usize,
     /// 固定兵站経路内の工程順。経路外campaignはNone。
     logistics_rank: Option<u32>,
     /// 同じ島の敵を別前線へ分配せず、この戦略作戦へ所属させる。
     forced_target_enemies: HashSet<Entity>,
+    /// 施設数だけでなく、実際の占領兵が完了時点まで生存する案を評価する。
+    protected_capture_entities: HashSet<Entity>,
     /// 編成中は目的地へ逐次投入せず、ここへ集結させる。
     staging_anchor: GridPosition,
     /// falseなら生産は行うが、作戦地点への攻撃任務はまだ発行しない。
@@ -751,8 +672,17 @@ impl BoardScan {
                             },
                             anchor: assignment.target_position,
                             capture_eta: eta,
+                            required_capture_survivors: usize::try_from(
+                                assignment.requirement.capture_units,
+                            )
+                            .unwrap_or(usize::MAX),
                             logistics_rank: logistics_ranks.get(&assignment.island_id).copied(),
                             forced_target_enemies: HashSet::new(),
+                            protected_capture_entities: assignment
+                                .capture_entities
+                                .iter()
+                                .copied()
+                                .collect(),
                             staging_anchor: assignment.target_position,
                             execution_authorized: true,
                         }
@@ -967,8 +897,10 @@ impl BoardScan {
                 kind: OperationKind::AssaultCapital,
                 anchor: capital,
                 capture_eta: None,
+                required_capture_survivors: 0,
                 logistics_rank: None,
                 forced_target_enemies,
+                protected_capture_entities: HashSet::new(),
                 staging_anchor,
                 execution_authorized: capital_assault_authorized,
             });
@@ -1218,6 +1150,7 @@ fn build_operations(
             if let Some(objective) = planning_objective {
                 operation.staging_anchor = objective.staging_anchor;
                 operation.execution_authorized = objective.execution_authorized;
+                operation.protected_capture_entities = objective.protected_capture_entities.clone();
             }
             operation
         })
@@ -1362,6 +1295,20 @@ fn projected_enemy_reinforcement_funds(
             .iter()
             .enumerate()
             .filter_map(|(index, anchor)| {
+                // 編成中でまだ前進を許可していない首都攻略は、敵増援の配分先ではない。
+                // ここへ距離0で全枠を吸わせると、実際に占領中の中央島を「増援なし」と
+                // 誤認して占領兵だけを送り続けるため、実行中の局地作戦を先に評価する。
+                let is_unauthorized_capital_formation = scan
+                    .campaign_objectives
+                    .iter()
+                    .find(|objective| objective.anchor == *anchor)
+                    .is_some_and(|objective| {
+                        objective.kind == OperationKind::AssaultCapital
+                            && !objective.execution_authorized
+                    });
+                if is_unauthorized_capital_formation {
+                    return None;
+                }
                 let (eta, cost) = enemy_facility_arrival(scan, ctx, *facility, *anchor)?;
                 (eta <= horizons.get(index).copied().unwrap_or(0)).then_some((eta, index, cost))
             })
@@ -1685,6 +1632,7 @@ fn build_operation(
         anchor,
         staging_anchor: anchor,
         execution_authorized: true,
+        protected_capture_entities: HashSet::new(),
         objective_properties: cluster.to_vec(),
         threat_horizon: anchor_index
             .and_then(|index| horizons.get(index).copied())
@@ -1890,7 +1838,7 @@ fn plan_production_with_registry(
                     let evaluated = evaluate_fixed_package(&input, &previous.purchases);
                     (previous, evaluated)
                 });
-                let preempted_facilities = evaluated_continuation
+                let conflicted_facilities = evaluated_continuation
                     .as_ref()
                     .map(|(previous, evaluated)| {
                         if evaluated.is_ok() {
@@ -1906,14 +1854,14 @@ fn plan_production_with_registry(
                             (purchase.facility.y, purchase.facility.x, purchase.cost)
                         });
                         let mut affordable_funds = input.current_funds;
-                        let mut preempted = HashSet::new();
+                        let mut conflicts = HashSet::new();
                         for purchase in due {
-                            let locally_preempted = facility_owners
+                            let claimed_by_higher_priority = facility_owners
                                 .get(&purchase.facility)
                                 .is_some_and(|owner| {
                                     owner.priority_rank() < operation_kind.priority_rank()
                                 });
-                            let campaign_preempted = scan
+                            let claimed_by_campaign = scan
                                 .production_facilities
                                 .iter()
                                 .any(|(facility, _)| *facility == purchase.facility)
@@ -1921,8 +1869,8 @@ fn plan_production_with_registry(
                                     .free_facilities
                                     .iter()
                                     .any(|(facility, _)| *facility == purchase.facility);
-                            if locally_preempted || campaign_preempted {
-                                preempted.insert(purchase.facility);
+                            if claimed_by_higher_priority || claimed_by_campaign {
+                                conflicts.insert(purchase.facility);
                             } else if operation_kind == OperationKind::AssaultCapital {
                                 if purchase.cost <= affordable_funds {
                                     affordable_funds =
@@ -1930,11 +1878,11 @@ fn plan_production_with_registry(
                                 } else {
                                     // 上位作戦が当手番の現金を使った場合も、失敗ではなく
                                     // 当該施設の首都編成列を次手番以降へ繰り下げる。
-                                    preempted.insert(purchase.facility);
+                                    conflicts.insert(purchase.facility);
                                 }
                             }
                         }
-                        preempted
+                        conflicts
                     })
                     .unwrap_or_default();
                 let selected = plan_registry.select(
@@ -1947,7 +1895,7 @@ fn plan_production_with_registry(
                     evaluated_continuation,
                     candidate_plan,
                     input.hard_deadline,
-                    preempted_facilities,
+                    conflicted_facilities,
                 );
                 if let Some(plan_id) = selected.plan_id {
                     seen_plan_ids.insert(plan_id);
@@ -2005,6 +1953,9 @@ fn plan_production_with_registry(
                         occupation_turn: plan.occupation_turn,
                         production_cost: plan.production_cost,
                         expected_loss: plan.expected_loss,
+                        protected_unit_count: plan.protected_unit_count,
+                        protected_survivor_count: plan.protected_survivor_count,
+                        required_capture_survivor_count: plan.required_capture_survivor_count,
                         candidates_considered: plan.candidates_considered,
                         search_truncated: plan.search_truncated,
                     });
@@ -2338,14 +2289,19 @@ fn combat_plan_input(
         } else {
             None
         };
-    let capture_completion_turn = scan
-        .campaign_objectives
-        .iter()
-        .filter(|objective| {
-            objective.anchor == op.anchor || op.objective_properties.contains(&objective.anchor)
-        })
-        .filter_map(|objective| objective.capture_eta)
-        .min();
+    let campaign_objective = scan.campaign_objectives.iter().find(|objective| {
+        objective.anchor == op.anchor || op.objective_properties.contains(&objective.anchor)
+    });
+    let capture_completion_turn = campaign_objective.and_then(|objective| objective.capture_eta);
+    let required_capture_survivors = campaign_objective.map_or_else(
+        || {
+            op.objective_properties
+                .iter()
+                .filter(|property| scan.open_properties.contains(property))
+                .count()
+        },
+        |objective| objective.required_capture_survivors,
+    );
     let planning_horizon = hard_deadline.unwrap_or(DEFAULT_SEARCH_TURNS).max(1);
     let mut enemies = enemies;
     enemies.extend(enemy_reinforcement_scenario(
@@ -2399,6 +2355,22 @@ fn combat_plan_input(
             engageable_enemy_indices,
         });
     }
+    let protected_units = scan
+        .my_units
+        .iter()
+        .filter(|unit| {
+            unit.entity
+                .is_some_and(|entity| op.protected_capture_entities.contains(&entity))
+        })
+        .map(|unit| FriendlyPlanUnit {
+            stats: unit.stats.clone(),
+            position: unit.pos,
+            hp: unit.hp,
+            available_turn: 0,
+            // 保護対象は攻撃要員として二重計上しないため空にする。
+            engageable_enemy_indices: Vec::new(),
+        })
+        .collect();
 
     let mut options = production_options(
         &scan.free_facilities,
@@ -2466,12 +2438,14 @@ fn combat_plan_input(
         map: scan.map.clone(),
         damage_chart: scan.damage_chart.clone(),
         existing_units,
+        protected_units,
         enemies,
         production_options: options,
         current_funds: remaining_funds,
         income_per_turn: scan.my_income,
         hard_deadline,
         capture_completion_turn,
+        required_capture_survivors,
         delay_cost_per_turn: op.facts.target_property_count.max(1).saturating_mul(1_000),
     })
 }
@@ -3071,8 +3045,10 @@ mod tests {
             kind: OperationKind::Capture,
             anchor,
             capture_eta: None,
+            required_capture_survivors: 0,
             logistics_rank: Some(0),
             forced_target_enemies: HashSet::new(),
+            protected_capture_entities: HashSet::new(),
             staging_anchor: anchor,
             execution_authorized: true,
         }]
@@ -3087,8 +3063,10 @@ mod tests {
             kind: OperationKind::Capture,
             anchor: campaign_anchor,
             capture_eta: Some(3),
+            required_capture_survivors: 1,
             logistics_rank: Some(0),
             forced_target_enemies: HashSet::new(),
+            protected_capture_entities: HashSet::new(),
             staging_anchor: campaign_anchor,
             execution_authorized: true,
         }];
@@ -3291,6 +3269,54 @@ mod tests {
             projected_enemy_reinforcement_funds(&scan, &mut ctx, &anchors, &[0, 0], 0),
             0
         );
+    }
+
+    #[test]
+    fn unauthorized_capital_formation_does_not_hide_reinforcements_from_capture() {
+        let mut scan = multi_factory_scan();
+        scan.enemy_income = 6_000;
+        scan.enemy_production_slots = 1;
+        scan.enemy_facilities = vec![EnemyFacilitySnapshot {
+            pos: pos(8, 2),
+            terrain: Terrain::Factory,
+        }];
+        let capital = pos(8, 2);
+        let capture = pos(6, 2);
+        scan.campaign_objectives = vec![
+            CampaignPlanningObjective {
+                island_id: crate::ai::islands::IslandId(1),
+                kind: OperationKind::AssaultCapital,
+                anchor: capital,
+                capture_eta: None,
+                required_capture_survivors: 0,
+                logistics_rank: None,
+                forced_target_enemies: HashSet::new(),
+                protected_capture_entities: HashSet::new(),
+                staging_anchor: pos(0, 2),
+                execution_authorized: false,
+            },
+            CampaignPlanningObjective {
+                island_id: crate::ai::islands::IslandId(2),
+                kind: OperationKind::Capture,
+                anchor: capture,
+                capture_eta: Some(4),
+                required_capture_survivors: 3,
+                logistics_rank: Some(0),
+                forced_target_enemies: HashSet::new(),
+                protected_capture_entities: HashSet::new(),
+                staging_anchor: capture,
+                execution_authorized: true,
+            },
+        ];
+        let anchors = vec![capital, capture];
+        let horizons = vec![12, 4];
+        let mut ctx = ReachCtx::default();
+
+        assert_eq!(
+            projected_enemy_reinforcement_funds(&scan, &mut ctx, &anchors, &horizons, 0),
+            0
+        );
+        assert!(projected_enemy_reinforcement_funds(&scan, &mut ctx, &anchors, &horizons, 1) > 0);
     }
 
     #[test]
@@ -3580,6 +3606,7 @@ mod tests {
             anchor: pos(0, 0),
             staging_anchor: pos(0, 0),
             execution_authorized: true,
+            protected_capture_entities: HashSet::new(),
             objective_properties: vec![pos(0, 0)],
             threat_horizon: 0,
             facts: OperationFacts::default(),

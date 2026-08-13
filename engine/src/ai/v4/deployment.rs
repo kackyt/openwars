@@ -73,6 +73,11 @@ struct AssignedDeployment {
     attack_count: u32,
     priority_attack_count: u32,
     mission_target_attack_count: u32,
+    mission_target_kill_count: u32,
+    mission_target_damage_value_dealt: u32,
+    mission_target_counter_value_received: u32,
+    mission_target_destroyed_value: u32,
+    mission_target_first_attack_turn: Option<u32>,
     capture_unit_attack_count: u32,
     transport_unit_attack_count: u32,
     kill_count: u32,
@@ -97,6 +102,11 @@ pub struct DeploymentAuditRecord {
     pub attack_count: u32,
     pub priority_attack_count: u32,
     pub mission_target_attack_count: u32,
+    pub mission_target_kill_count: u32,
+    pub mission_target_damage_value_dealt: u32,
+    pub mission_target_counter_value_received: u32,
+    pub mission_target_destroyed_value: u32,
+    pub mission_target_first_attack_turn: Option<u32>,
     pub capture_unit_attack_count: u32,
     pub transport_unit_attack_count: u32,
     pub kill_count: u32,
@@ -162,6 +172,11 @@ impl V4DeploymentRegistry {
                 attack_count: 0,
                 priority_attack_count: 0,
                 mission_target_attack_count: 0,
+                mission_target_kill_count: 0,
+                mission_target_damage_value_dealt: 0,
+                mission_target_counter_value_received: 0,
+                mission_target_destroyed_value: 0,
+                mission_target_first_attack_turn: None,
                 capture_unit_attack_count: 0,
                 transport_unit_attack_count: 0,
                 kill_count: 0,
@@ -240,6 +255,12 @@ impl V4DeploymentRegistry {
                 attack_count: deployment.attack_count,
                 priority_attack_count: deployment.priority_attack_count,
                 mission_target_attack_count: deployment.mission_target_attack_count,
+                mission_target_kill_count: deployment.mission_target_kill_count,
+                mission_target_damage_value_dealt: deployment.mission_target_damage_value_dealt,
+                mission_target_counter_value_received: deployment
+                    .mission_target_counter_value_received,
+                mission_target_destroyed_value: deployment.mission_target_destroyed_value,
+                mission_target_first_attack_turn: deployment.mission_target_first_attack_turn,
                 capture_unit_attack_count: deployment.capture_unit_attack_count,
                 transport_unit_attack_count: deployment.transport_unit_attack_count,
                 kill_count: deployment.kill_count,
@@ -359,9 +380,27 @@ impl V4DeploymentRegistry {
         };
         deployment.attack_count = deployment.attack_count.saturating_add(1);
         deployment.first_attack_turn.get_or_insert(turn);
-        if deployment.current_target == Some(defender) {
+        if deployment.current_target == Some(defender)
+            || deployment.intent.priority_enemies.contains(&defender)
+        {
             deployment.mission_target_attack_count =
                 deployment.mission_target_attack_count.saturating_add(1);
+            deployment
+                .mission_target_first_attack_turn
+                .get_or_insert(turn);
+            deployment.mission_target_damage_value_dealt = deployment
+                .mission_target_damage_value_dealt
+                .saturating_add(audit.damage_value_dealt);
+            deployment.mission_target_counter_value_received = deployment
+                .mission_target_counter_value_received
+                .saturating_add(audit.counter_value_received);
+            deployment.mission_target_destroyed_value = deployment
+                .mission_target_destroyed_value
+                .saturating_add(audit.destroyed_value);
+            if audit.destroyed {
+                deployment.mission_target_kill_count =
+                    deployment.mission_target_kill_count.saturating_add(1);
+            }
         }
         if audit.defender_can_capture {
             deployment.capture_unit_attack_count =
@@ -421,6 +460,11 @@ impl V4DeploymentRegistry {
                 attack_count: 0,
                 priority_attack_count: 0,
                 mission_target_attack_count: 0,
+                mission_target_kill_count: 0,
+                mission_target_damage_value_dealt: 0,
+                mission_target_counter_value_received: 0,
+                mission_target_destroyed_value: 0,
+                mission_target_first_attack_turn: None,
                 capture_unit_attack_count: 0,
                 transport_unit_attack_count: 0,
                 kill_count: 0,
@@ -635,6 +679,40 @@ fn local_retarget(
     candidates.first().map(|candidate| candidate.5)
 }
 
+/// 生産時に選んだ敵が移動しても、別の陸塊まで追跡して作戦島を離れない。
+/// 海空上の目標は島IDを持たないため、作戦horizon内にいる場合だけ継続する。
+fn target_within_operation(world: &World, deployment: &AssignedDeployment, enemy: Entity) -> bool {
+    let (Some(enemy_position), Some(enemy_stats), Some(map)) = (
+        world.get::<GridPosition>(enemy),
+        world.get::<UnitStats>(enemy),
+        world.get_resource::<Map>(),
+    ) else {
+        return false;
+    };
+    let island_map = world
+        .get_resource::<IslandMap>()
+        .cloned()
+        .unwrap_or_else(|| IslandMap::analyze(map));
+    let operation_island = island_map
+        .get_island_at(&deployment.intent.anchor)
+        .map(|island| island.id);
+    let enemy_island = island_map
+        .get_island_at(enemy_position)
+        .map(|island| island.id);
+    if operation_island.is_some() && enemy_island.is_some() && enemy_island != operation_island {
+        return false;
+    }
+    let eta = map
+        .distance(
+            enemy_position.x,
+            enemy_position.y,
+            deployment.intent.anchor.x,
+            deployment.intent.anchor.y,
+        )
+        .div_ceil(enemy_stats.max_movement.max(1));
+    eta <= deployment.intent.threat_horizon.max(1)
+}
+
 /// 優先敵の現在位置を追跡し、消滅・到達不能時だけ局地敵へ再目標化する。
 fn resolve_target(
     world: &mut World,
@@ -645,13 +723,15 @@ fn resolve_target(
     // 現在標的が生存して交戦可能な限り固定し、撃破・到達不能時だけ次へ進む。
     if let Some(enemy) = deployment.current_target
         && deployment.intent.priority_enemies.contains(&enemy)
+        && target_within_operation(world, deployment, enemy)
         && can_engage(world, connectivity, deployment.entity, enemy)
         && let Some(position) = world.get::<GridPosition>(enemy)
     {
         return Some((enemy, *position));
     }
     for &enemy in &deployment.intent.priority_enemies {
-        if can_engage(world, connectivity, deployment.entity, enemy)
+        if target_within_operation(world, deployment, enemy)
+            && can_engage(world, connectivity, deployment.entity, enemy)
             && let Some(position) = world.get::<GridPosition>(enemy)
         {
             return Some((enemy, *position));
@@ -680,6 +760,10 @@ pub(crate) fn prepare_deployment_squads(
     let mut connectivity = TerrainConnectivity::default();
     let mut reserved = HashSet::new();
     let mut releases = Vec::new();
+    let island_map = world
+        .get_resource::<IslandMap>()
+        .cloned()
+        .or_else(|| world.get_resource::<Map>().map(IslandMap::analyze));
     let mut entities: Vec<_> = registry
         .assigned
         .iter()
@@ -746,7 +830,12 @@ pub(crate) fn prepare_deployment_squads(
         squad.members.insert(entity);
         squad.mission_type = mission_type;
         squad.target = Some(target);
-        squad.target_island = None;
+        // 生産時Planと同じ島campaign ownerをSquadにも持たせる。Noneの汎用Squadに
+        // すると排他reconcileで正本campaign ownerと競合し、任務が断続的に消える。
+        squad.target_island = island_map
+            .as_ref()
+            .and_then(|islands| islands.get_island_at(&snapshot.intent.anchor))
+            .map(|island| island.id);
         squad.phase = MissionPhase::MovingToTarget;
         let squad_id = squad.id;
         if let Some(deployment) = registry.assigned.get_mut(&entity) {
@@ -912,6 +1001,12 @@ mod tests {
         let record = registry.audit_records(PlayerId(1)).pop().unwrap();
         assert_eq!(record.attack_count, 2);
         assert_eq!(record.priority_attack_count, 1);
+        assert_eq!(record.mission_target_attack_count, 1);
+        assert_eq!(record.mission_target_kill_count, 0);
+        assert_eq!(record.mission_target_damage_value_dealt, 400);
+        assert_eq!(record.mission_target_counter_value_received, 100);
+        assert_eq!(record.mission_target_destroyed_value, 0);
+        assert_eq!(record.mission_target_first_attack_turn, Some(5));
         assert_eq!(record.first_attack_turn, Some(5));
         assert_eq!(record.capture_unit_attack_count, 1);
         assert_eq!(record.transport_unit_attack_count, 1);
@@ -1004,6 +1099,11 @@ mod tests {
                 attack_count: 0,
                 priority_attack_count: 0,
                 mission_target_attack_count: 0,
+                mission_target_kill_count: 0,
+                mission_target_damage_value_dealt: 0,
+                mission_target_counter_value_received: 0,
+                mission_target_destroyed_value: 0,
+                mission_target_first_attack_turn: None,
                 capture_unit_attack_count: 0,
                 transport_unit_attack_count: 0,
                 kill_count: 0,
@@ -1039,6 +1139,13 @@ mod tests {
             .unwrap();
         assert_eq!(squad.mission_type, MissionType::Defense);
         assert_eq!(squad.target, Some(GridPosition { x: 1, y: 0 }));
+        assert_eq!(
+            squad.target_island,
+            IslandMap::analyze(world.resource::<Map>())
+                .get_island_at(&GridPosition { x: 5, y: 0 })
+                .map(|island| island.id),
+            "deployment Squadは生産Planと同じcampaign ownerを持つ"
+        );
         let registry = world.resource::<V4DeploymentRegistry>();
         assert_ne!(registry.assigned[&attacker].current_target, Some(priority));
     }
@@ -1175,12 +1282,14 @@ mod tests {
                 },
             ))
             .id();
-        world.spawn((
-            Faction(PlayerId(2)),
-            GridPosition { x: 1, y: 0 },
-            combat_stats(UnitType::Infantry, true, 0),
-        ));
-        let deployment = AssignedDeployment {
+        let remote_enemy = world
+            .spawn((
+                Faction(PlayerId(2)),
+                GridPosition { x: 1, y: 0 },
+                combat_stats(UnitType::Infantry, true, 0),
+            ))
+            .id();
+        let mut deployment = AssignedDeployment {
             entity: attacker,
             intent: PendingDeployment {
                 player_id: PlayerId(1),
@@ -1204,6 +1313,11 @@ mod tests {
             attack_count: 0,
             priority_attack_count: 0,
             mission_target_attack_count: 0,
+            mission_target_kill_count: 0,
+            mission_target_damage_value_dealt: 0,
+            mission_target_counter_value_received: 0,
+            mission_target_destroyed_value: 0,
+            mission_target_first_attack_turn: None,
             capture_unit_attack_count: 0,
             transport_unit_attack_count: 0,
             kill_count: 0,
@@ -1217,6 +1331,22 @@ mod tests {
             local_retarget(&mut world, &mut TerrainConnectivity::default(), &deployment),
             None,
             "別島の敵を局地fallbackで追跡してはならない"
+        );
+
+        let local_enemy = world
+            .spawn((
+                Faction(PlayerId(2)),
+                GridPosition { x: 6, y: 0 },
+                combat_stats(UnitType::Infantry, true, 0),
+            ))
+            .id();
+        deployment.intent.priority_enemies = vec![remote_enemy];
+        deployment.current_target = Some(remote_enemy);
+        assert_eq!(
+            resolve_target(&mut world, &mut TerrainConnectivity::default(), &deployment)
+                .map(|target| target.0),
+            Some(local_enemy),
+            "生産時の優先敵が別島へ移動したら同じ島の敵へ再目標化する"
         );
     }
 }
