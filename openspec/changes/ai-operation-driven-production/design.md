@@ -884,6 +884,36 @@ Decision 2 / 3 / 5 / 6 / 14 / 18a / 21 / 22にある金額撃破枠、護衛価�
 
 **map_3検証**: Hex / seed 42 / V3先攻対V4後攻を5ターン追試した。T5のV4ではSquad参照19件に対して一意割当18件、競合検知累計1件となり、重複1件を行動選択前に除去した。正規化後のcampaign portfolioとVictoryRoadmapを全手番・両playerで集計し、Entityの複数作戦所属はいずれも0件だった。訪問参照数は各手番の一意割当数と同程度（最大V3 24、V4 19）で、作戦数や行動候補数との積には増えていない。対戦全体のV4思考時間はRolling Plan探索が依然支配的であり、この変更はその探索時間の改善を主張するものではない。
 
+### Decision 31: 島を作戦identityとし、増援を到着期限付きcontingencyへ分離する
+
+**問題**: 中央島campaignは同じ勝利ロードマップ工程であるにもかかわらず、盤面状態が`Expand -> Contest -> Reinforce -> Defend`へ変わるたびに作戦種別、anchor、未所有施設集合、敵Entity集合が変わった。これらをPlan照合キーにすると、生産・配属・攻撃・損耗の実績を持つPlanが別物へ分裂し、作戦数上限から一時的に外れた場合も継続不能になった。また、敵施設が将来生産できる全増援を現在の撃破対象へ加えると無限防衛を要求し、逆に無視すると逐次投入へ追いつけなかった。
+
+**identityと排他性**: 島campaignの論理identityは`player_id + IslandId`とする。`OperationKind`、anchor、現在の未所有施設、現在敵はrevision可能な観測値であり照合キーにしない。同一島へ局地campaignと`AssaultCapital`が同時に現れた場合は勝利条件である`AssaultCapital`を正本とし、1島1戦略作戦に統合する。最大作戦数へCaptureまたはAssaultCapitalを救済挿入するときは、もう一方の必須作戦を押し出さず、低優先のDefense等を除く。
+
+敵増援または一時的な生存不足で現在revisionが完遂不能でも、目的島は消えていないためPlanを撤回しない。同じPlanIdで盤面を再評価し、増援対応または補充へrevisionする。生産失敗、施設喪失、資金不成立など、現在編成を合法なscheduleへ再配置できない硬い実行不能だけを撤回条件とする。遠隔Combat Entityは、対象へ自力到達できる、既存輸送へ積載済み、または現在の生産圏で具体的な輸送routeを調達できる場合だけ編成へ数える。到達不能な戦車等が1体あることでcampaign全体を生成不能にしてはならない。
+
+**増援の計算**: 仮想敵`e`の作戦地点への接触手番を次で求める。
+
+`enemy_contact(e) = enemy_build_turn(e) + 1 + enemy_travel_eta(e)`
+
+対抗候補`c`は、実際に所有施設で生産可能、敵へ正のdamageを与え、作戦地点へ到達可能なunitに限定する。候補ごとに本番damageから`attacks_required(c,e)`を求め、次の辞書順で最速案を選ぶ。
+
+`(counter_contact, attacks_required, cost, facility_position)`
+
+`counter_contact(c) = counter_build_turn(c) + 1 + counter_travel_eta(c)`
+
+`counter_contact <= enemy_contact`なら、その敵は現在のrolling撃破対象へ加えず、`enemy_type / enemy_contact_turn / counter_type / facility / counter_build_turn / counter_contact_turn / attacks_required / reserve_cost`を持つcontingencyとする。間に合う対抗案が無い敵だけを`unavoidable_reinforcements`として現在の混成scheduleへ加え、その排除と占領役生存を実行可能性へ要求する。価格は必要戦力を表さず、具体的な対抗案を買えるかの制約にだけ使う。
+
+期限`d`までに必要なcontingency累計費用を`C(d)`、手番収入を`I`とすると、現在確保すべき額は次とする。
+
+`contingency_reserve = max_d(max(0, C(d) - I * d))`
+
+これにより将来収入で間に合う費用まで現金で凍結せず、上位作戦のreserveだけを下位作戦のspendable fundsから差し引く。各contingencyの具体兵種と時刻、および合計reserveをtraceへ出す。
+
+**島全体の予実**: Planの戦術上の未所有施設集合は毎手番縮退してよいが、実績台帳の目的施設集合は同じ島作戦で一度でも対象となった施設の和集合とする。よって中央島が残り1施設になっても`0/1`へリセットせず`2/3`と記録し、全対象敵排除と`3/3`所有の両方でのみ完了する。
+
+**map_3予実**: Hex / seed 42 / V3先攻対V4後攻を17ターン追試した。中央島のPlan 2はT4作成後、状態がCapture／Contest／Reinforceへ変わっても同一PlanIdを維持した。T12は2/3施設、残敵2、累計生産64,500G、稼働5体、攻撃8、撃破1、与Damage 4,870、被Damage 13,330だった。T14に敵排除、T15に3/3占領を実測し、T14 revisionの予測（排除T18・占領T18）よりそれぞれ4・3手番早かった。T16に敵1体が再侵入したため島所有を維持したまま新しいReinforceへ移った。V4はT17時点で27施設・収入39,000、V3は25施設・37,000だったが、戦闘ROIはV4 0.61対V3 1.63、最大手番判定はV3勝利であり、中央島攻略の計算・実行・完了は確認した一方、最終的な戦闘効率と勝利は未達である。平均思考時間もV4 8,420.7msで、長期探索の性能改善を別課題として残す。
+
 ## Risks / Trade-offs
 
 | リスク | 影響 | 軽減策 |

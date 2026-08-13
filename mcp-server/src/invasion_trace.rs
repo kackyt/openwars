@@ -263,7 +263,22 @@ pub struct ProductionOperationSnapshot {
     pub requires_transport: bool,
     pub enemy_combat_units: u32,
     pub enemy_reinforcement_funds: u32,
+    pub contingency_reserve_funds: u32,
+    pub reinforcement_contingencies: Vec<ReinforcementContingencySnapshot>,
     pub deploy_lead_time: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReinforcementContingencySnapshot {
+    pub enemy_type: UnitType,
+    pub enemy_contact_turn: u32,
+    pub counter_type: UnitType,
+    pub counter_facility_x: usize,
+    pub counter_facility_y: usize,
+    pub counter_build_turn: u32,
+    pub counter_contact_turn: u32,
+    pub attacks_required: u32,
+    pub reserve_cost: u32,
 }
 
 /// V4 生産判断のターン単位スナップショット。
@@ -1085,6 +1100,22 @@ pub fn snapshot_production_plan_for_player(
             requires_transport: op.requires_transport,
             enemy_combat_units: op.enemy_combat_units,
             enemy_reinforcement_funds: op.enemy_reinforcement_funds,
+            contingency_reserve_funds: op.contingency_reserve_funds,
+            reinforcement_contingencies: op
+                .reinforcement_contingencies
+                .iter()
+                .map(|contingency| ReinforcementContingencySnapshot {
+                    enemy_type: contingency.enemy_type,
+                    enemy_contact_turn: contingency.enemy_contact_turn,
+                    counter_type: contingency.counter_type,
+                    counter_facility_x: contingency.counter_facility.x,
+                    counter_facility_y: contingency.counter_facility.y,
+                    counter_build_turn: contingency.counter_build_turn,
+                    counter_contact_turn: contingency.counter_contact_turn,
+                    attacks_required: contingency.attacks_required,
+                    reserve_cost: contingency.reserve_cost,
+                })
+                .collect(),
             deploy_lead_time: op.deploy_lead_time,
         })
         .collect();

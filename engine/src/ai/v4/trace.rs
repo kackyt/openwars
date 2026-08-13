@@ -63,7 +63,23 @@ pub struct ProductionOperationTrace {
     pub enemy_combat_units: u32,
     /// 作戦期限までにこの前線へ到着できる敵生産分だけを数えた増援予算。
     pub enemy_reinforcement_funds: u32,
+    /// 観測後に間に合う具体的counter生産列の現在必要な予約額。
+    pub contingency_reserve_funds: u32,
+    pub reinforcement_contingencies: Vec<ReinforcementContingencyTrace>,
     pub deploy_lead_time: u32,
+}
+
+/// 仮想敵を現在編成へ混ぜず、観測後に発動する条件付きcounter計画。
+#[derive(Debug, Clone, Copy)]
+pub struct ReinforcementContingencyTrace {
+    pub enemy_type: UnitType,
+    pub enemy_contact_turn: u32,
+    pub counter_type: UnitType,
+    pub counter_facility: GridPosition,
+    pub counter_build_turn: u32,
+    pub counter_contact_turn: u32,
+    pub attacks_required: u32,
+    pub reserve_cost: u32,
 }
 
 /// ローリングCombat計画で選んだ生産1件。

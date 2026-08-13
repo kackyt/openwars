@@ -6,6 +6,7 @@
 
 use super::operation::OperationKind;
 use super::rolling_plan::{FixedPackageError, ForcePackagePlan, PlannedPurchase};
+use crate::ai::islands::IslandId;
 use crate::components::{GridPosition, PlayerId};
 use crate::resources::UnitType;
 use bevy_ecs::prelude::*;
@@ -631,10 +632,15 @@ fn delay_against_forecast(
 #[derive(Debug, Clone)]
 struct StoredPlan {
     player_id: PlayerId,
+    /// 島campaignはanchor・未所有施設・作戦種別が変わっても同じ目的を継続する。
+    island_id: Option<IslandId>,
     plan_id: PlanId,
     revision: PlanRevision,
     kind: OperationKind,
     anchor: GridPosition,
+    /// 作戦開始後に一度でも目的へ含まれた施設。現在の未所有施設だけへ縮退させず、
+    /// 島全体の占領予実を同じ分母で追跡する。
+    tracked_objective_properties: Vec<GridPosition>,
     objective_properties: Vec<GridPosition>,
     target_enemies: HashSet<Entity>,
     steps: Vec<ScheduledPurchase>,
@@ -643,6 +649,15 @@ struct StoredPlan {
     execution_ready: bool,
     last_evaluated_turn: u32,
     execution: PlanExecutionLedger,
+}
+
+/// 現在の目的集合が縮退・再拡張しても、予実の分母を島作戦の全施設で維持する。
+fn extend_objective_history(stored: &mut StoredPlan, objectives: &[GridPosition]) {
+    for objective in objectives {
+        if !stored.tracked_objective_properties.contains(objective) {
+            stored.tracked_objective_properties.push(*objective);
+        }
+    }
 }
 
 /// E2E traceへ公開するrevision判断。
@@ -675,6 +690,7 @@ pub(crate) struct PlanContinuation {
 #[derive(Debug, Clone)]
 pub(crate) struct ActivePlanObjective {
     pub kind: OperationKind,
+    pub island_id: Option<IslandId>,
     pub properties: Vec<GridPosition>,
     pub target_enemies: HashSet<Entity>,
 }
@@ -726,6 +742,7 @@ impl V4RollingPlanRegistry {
             .filter(|plan| plan.player_id == player_id)
             .map(|plan| ActivePlanObjective {
                 kind: plan.kind,
+                island_id: plan.island_id,
                 properties: plan.objective_properties.clone(),
                 target_enemies: plan.target_enemies.clone(),
             })
@@ -771,7 +788,7 @@ impl V4RollingPlanRegistry {
             plan.execution.observe(
                 turn,
                 &plan.target_enemies,
-                &plan.objective_properties,
+                &plan.tracked_objective_properties,
                 owned_properties,
                 enemy_health,
                 &plan_deployments,
@@ -869,6 +886,7 @@ impl V4RollingPlanRegistry {
     }
 
     /// 対象拠点または敵Entityが重なる同種作戦を、前revisionの継続候補として取得する。
+    #[cfg(test)]
     pub(crate) fn continuation(
         &self,
         player_id: PlayerId,
@@ -877,7 +895,33 @@ impl V4RollingPlanRegistry {
         objective_properties: &[GridPosition],
         target_enemies: &HashSet<Entity>,
     ) -> Option<PlanContinuation> {
-        let index = self.matching_index(player_id, kind, objective_properties, target_enemies)?;
+        self.continuation_for_operation(
+            player_id,
+            turn,
+            kind,
+            None,
+            objective_properties,
+            target_enemies,
+        )
+    }
+
+    /// 島IDを作戦の正本として、目標座標や敵集合の変化を同一Planのrevisionへ束ねる。
+    pub(crate) fn continuation_for_operation(
+        &self,
+        player_id: PlayerId,
+        turn: u32,
+        kind: OperationKind,
+        island_id: Option<IslandId>,
+        objective_properties: &[GridPosition],
+        target_enemies: &HashSet<Entity>,
+    ) -> Option<PlanContinuation> {
+        let index = self.matching_index(
+            player_id,
+            kind,
+            island_id,
+            objective_properties,
+            target_enemies,
+        )?;
         let plan = &self.active[index];
         let production_failed = plan.steps.iter().any(|step| match step.status {
             PurchaseStatus::Planned => step.scheduled_turn < turn,
@@ -907,12 +951,47 @@ impl V4RollingPlanRegistry {
     }
 
     /// 現行案と新案を比較し、実行するrevisionを返す。不可能な案は永続化しない。
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn select(
         &mut self,
         player_id: PlayerId,
         turn: u32,
         kind: OperationKind,
+        anchor: GridPosition,
+        objective_properties: Vec<GridPosition>,
+        target_enemies: HashSet<Entity>,
+        continuation: Option<(
+            PlanContinuation,
+            Result<ForcePackagePlan, FixedPackageError>,
+        )>,
+        candidate: ForcePackagePlan,
+        hard_deadline: Option<u32>,
+        conflicted_facilities: HashSet<GridPosition>,
+    ) -> SelectedPlan {
+        self.select_for_operation(
+            player_id,
+            turn,
+            kind,
+            None,
+            anchor,
+            objective_properties,
+            target_enemies,
+            continuation,
+            candidate,
+            hard_deadline,
+            conflicted_facilities,
+        )
+    }
+
+    /// 島campaign向け選択。`island_id`が同じ限りPlanIdと実績台帳を維持する。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn select_for_operation(
+        &mut self,
+        player_id: PlayerId,
+        turn: u32,
+        kind: OperationKind,
+        island_id: Option<IslandId>,
         anchor: GridPosition,
         objective_properties: Vec<GridPosition>,
         target_enemies: HashSet<Entity>,
@@ -942,6 +1021,7 @@ impl V4RollingPlanRegistry {
                 player_id,
                 turn,
                 kind,
+                island_id,
                 anchor,
                 objective_properties,
                 target_enemies,
@@ -997,6 +1077,11 @@ impl V4RollingPlanRegistry {
             let (plan_id, revision, purchases) = {
                 let stored = &mut self.active[previous.index];
                 defer_remaining_schedule(&mut stored.steps, turn, &conflicted_facilities);
+                stored.kind = kind;
+                stored.island_id = island_id;
+                stored.anchor = anchor;
+                extend_objective_history(stored, &objective_properties);
+                stored.objective_properties = objective_properties;
                 stored.target_enemies = target_enemies;
                 stored.last_evaluated_turn = turn;
                 let purchases = stored
@@ -1051,6 +1136,9 @@ impl V4RollingPlanRegistry {
             }
             apply_rescheduled_purchases(&mut stored.steps, turn, &plan.purchases);
             stored.anchor = anchor;
+            stored.kind = kind;
+            stored.island_id = island_id;
+            extend_objective_history(stored, &objective_properties);
             stored.objective_properties = objective_properties;
             stored.target_enemies = target_enemies;
             stored.forecast = PlanMetrics::from_plan(&plan, kind);
@@ -1099,6 +1187,9 @@ impl V4RollingPlanRegistry {
                 let stored = &mut self.active[previous.index];
                 apply_rescheduled_purchases(&mut stored.steps, turn, &plan.purchases);
                 stored.anchor = anchor;
+                stored.kind = kind;
+                stored.island_id = island_id;
+                extend_objective_history(stored, &objective_properties);
                 stored.objective_properties = objective_properties;
                 stored.target_enemies = target_enemies;
                 stored.forecast = PlanMetrics::from_plan(&plan, kind);
@@ -1127,6 +1218,8 @@ impl V4RollingPlanRegistry {
                     previous.index,
                     turn,
                     revision,
+                    kind,
+                    island_id,
                     anchor,
                     objective_properties,
                     target_enemies,
@@ -1145,6 +1238,43 @@ impl V4RollingPlanRegistry {
                     plan_id: Some(previous.plan_id),
                     revision: Some(revision),
                     disposition: decision.disposition,
+                    reason: decision.reason,
+                }
+            }
+            PlanDisposition::Withdrawn
+                if island_id.is_some()
+                    && !previous.production_failed
+                    && continuation_error.is_none() =>
+            {
+                // 島campaignは敵増援や一時的な生存不足で「今すぐ完遂不能」に
+                // なっても論理目的が消えたわけではない。評価済みの現編成を保持し、
+                // 次手番の盤面で同じPlanIdを再計画する。
+                let plan = evaluated.expect("硬い実行不能でなければ現編成を再評価済み");
+                let stored = &mut self.active[previous.index];
+                apply_rescheduled_purchases(&mut stored.steps, turn, &plan.purchases);
+                stored.kind = kind;
+                stored.island_id = island_id;
+                stored.anchor = anchor;
+                extend_objective_history(stored, &objective_properties);
+                stored.objective_properties = objective_properties;
+                stored.target_enemies = target_enemies;
+                stored.forecast = PlanMetrics::from_plan(&plan, kind);
+                stored.execution_ready = plan.feasible;
+                stored.last_evaluated_turn = turn;
+                stored.execution.observe_targets(&stored.target_enemies);
+                self.record_audit(
+                    player_id,
+                    turn,
+                    previous.plan_id,
+                    previous.revision,
+                    PlanDisposition::Continued,
+                    decision.reason,
+                );
+                SelectedPlan {
+                    plan,
+                    plan_id: Some(previous.plan_id),
+                    revision: Some(previous.revision),
+                    disposition: PlanDisposition::Continued,
                     reason: decision.reason,
                 }
             }
@@ -1294,17 +1424,23 @@ impl V4RollingPlanRegistry {
         &self,
         player_id: PlayerId,
         kind: OperationKind,
+        island_id: Option<IslandId>,
         objective_properties: &[GridPosition],
         _target_enemies: &HashSet<Entity>,
     ) -> Option<usize> {
         self.active
             .iter()
             .enumerate()
-            .filter(|(_, plan)| plan.player_id == player_id && plan.kind == kind)
+            .filter(|(_, plan)| plan.player_id == player_id)
             .find_map(|(index, plan)| {
+                if let Some(island_id) = island_id {
+                    return (plan.island_id == Some(island_id)).then_some(index);
+                }
                 // 敵Entityは移動して別の島へ渡るため、敵の重複をPlan identityに使わない。
                 // 同じ目的拠点集合だけを同一作戦のrevisionとして扱い、別島への変質を禁止する。
-                (plan.objective_properties.len() == objective_properties.len()
+                (plan.island_id.is_none()
+                    && plan.kind == kind
+                    && plan.objective_properties.len() == objective_properties.len()
                     && plan
                         .objective_properties
                         .iter()
@@ -1319,6 +1455,7 @@ impl V4RollingPlanRegistry {
         player_id: PlayerId,
         turn: u32,
         kind: OperationKind,
+        island_id: Option<IslandId>,
         anchor: GridPosition,
         objective_properties: Vec<GridPosition>,
         target_enemies: HashSet<Entity>,
@@ -1331,10 +1468,12 @@ impl V4RollingPlanRegistry {
             PlanExecutionLedger::new(turn, &target_enemies, &objective_properties, plan);
         self.active.push(StoredPlan {
             player_id,
+            island_id,
             plan_id,
             revision,
             kind,
             anchor,
+            tracked_objective_properties: objective_properties.clone(),
             objective_properties,
             target_enemies,
             steps: scheduled_steps(plan_id, revision, turn, plan),
@@ -1352,6 +1491,8 @@ impl V4RollingPlanRegistry {
         index: usize,
         turn: u32,
         revision: PlanRevision,
+        kind: OperationKind,
+        island_id: Option<IslandId>,
         anchor: GridPosition,
         objective_properties: Vec<GridPosition>,
         target_enemies: HashSet<Entity>,
@@ -1361,11 +1502,14 @@ impl V4RollingPlanRegistry {
         let released_cost = remaining_unissued_cost(&stored.steps);
         stored.execution.note_released_cost(released_cost);
         stored.revision = revision;
+        stored.kind = kind;
+        stored.island_id = island_id;
         stored.anchor = anchor;
+        extend_objective_history(stored, &objective_properties);
         stored.objective_properties = objective_properties;
         stored.target_enemies = target_enemies;
         stored.steps = scheduled_steps(stored.plan_id, revision, turn, plan);
-        stored.forecast = PlanMetrics::from_plan(plan, stored.kind);
+        stored.forecast = PlanMetrics::from_plan(plan, kind);
         stored.execution_ready = plan.feasible;
         stored.last_evaluated_turn = turn;
         stored.execution.observe_targets(&stored.target_enemies);
@@ -1790,6 +1934,115 @@ mod tests {
     }
 
     #[test]
+    fn island_identity_survives_kind_anchor_property_and_enemy_changes() {
+        let player = PlayerId(1);
+        let island = IslandId(3);
+        let first_anchor = GridPosition { x: 14, y: 15 };
+        let remaining_city = GridPosition { x: 12, y: 16 };
+        let other_island = IslandId(4);
+        let enemy = Entity::from_raw(10);
+        let reinforcement = Entity::from_raw(11);
+        let mut registry = V4RollingPlanRegistry::default();
+
+        let created = registry.select_for_operation(
+            player,
+            3,
+            OperationKind::Capture,
+            Some(island),
+            first_anchor,
+            vec![first_anchor, remaining_city],
+            HashSet::from([enemy]),
+            None,
+            feasible_plan(0),
+            None,
+            HashSet::new(),
+        );
+        let plan_id = created.plan_id.expect("島campaignは永続Planを持つ");
+
+        let continuation = registry
+            .continuation_for_operation(
+                player,
+                4,
+                OperationKind::Defense,
+                Some(island),
+                &[remaining_city],
+                &HashSet::from([reinforcement]),
+            )
+            .expect("同じ島なら作戦種別・anchor・残施設・敵が変わっても継続する");
+        assert_eq!(continuation.plan_id, plan_id);
+        assert!(
+            registry
+                .continuation_for_operation(
+                    player,
+                    4,
+                    OperationKind::Capture,
+                    Some(other_island),
+                    &[remaining_city],
+                    &HashSet::from([enemy]),
+                )
+                .is_none(),
+            "座標が偶然重なっても別島へPlanを流用しない"
+        );
+    }
+
+    #[test]
+    fn island_plan_is_retained_when_reinforcement_is_temporarily_infeasible() {
+        let player = PlayerId(1);
+        let island = IslandId(3);
+        let anchor = GridPosition { x: 14, y: 15 };
+        let first_enemy = Entity::from_raw(10);
+        let reinforcement = Entity::from_raw(11);
+        let mut registry = V4RollingPlanRegistry::default();
+        let created = registry.select_for_operation(
+            player,
+            3,
+            OperationKind::Capture,
+            Some(island),
+            anchor,
+            vec![anchor],
+            HashSet::from([first_enemy]),
+            None,
+            feasible_plan(1),
+            None,
+            HashSet::new(),
+        );
+        let plan_id = created.plan_id.expect("作成済みPlan");
+        let continuation = registry
+            .continuation_for_operation(
+                player,
+                4,
+                OperationKind::Capture,
+                Some(island),
+                &[anchor],
+                &HashSet::from([first_enemy, reinforcement]),
+            )
+            .expect("同じ島の継続");
+        let mut stalled = feasible_plan(0);
+        stalled.feasible = false;
+        stalled.elimination_turn = None;
+        stalled.occupation_turn = None;
+        stalled.target_forecasts.clear();
+
+        let selected = registry.select_for_operation(
+            player,
+            4,
+            OperationKind::Capture,
+            Some(island),
+            anchor,
+            vec![anchor],
+            HashSet::from([first_enemy, reinforcement]),
+            Some((continuation, Ok(stalled.clone()))),
+            stalled,
+            None,
+            HashSet::new(),
+        );
+
+        assert_eq!(selected.plan_id, Some(plan_id));
+        assert_eq!(selected.disposition, PlanDisposition::Continued);
+        assert_eq!(selected.reason, Some(ReplanReason::EnemyReinforced));
+    }
+
+    #[test]
     fn future_purchase_survives_until_its_scheduled_turn() {
         let player = PlayerId(1);
         let mut registry = V4RollingPlanRegistry::default();
@@ -2204,6 +2457,45 @@ mod tests {
             .expect("排除と占領の両方を満たした完了監査");
         assert_eq!(audit.execution.actual_elimination_turn, Some(4));
         assert_eq!(audit.execution.actual_occupation_turn, Some(4));
+    }
+
+    #[test]
+    fn island_execution_keeps_all_objectives_after_remaining_set_shrinks() {
+        let player = PlayerId(1);
+        let objectives = [
+            GridPosition { x: 5, y: 5 },
+            GridPosition { x: 6, y: 5 },
+            GridPosition { x: 7, y: 5 },
+        ];
+        let mut registry = V4RollingPlanRegistry::default();
+        registry.select_for_operation(
+            player,
+            3,
+            OperationKind::Capture,
+            Some(IslandId(3)),
+            objectives[0],
+            objectives.to_vec(),
+            HashSet::new(),
+            None,
+            feasible_plan(1),
+            None,
+            HashSet::new(),
+        );
+
+        // 現在の戦術目的が最後の1施設へ縮んでも、予実は島全体3施設を分母にする。
+        registry.active[0].objective_properties = vec![objectives[2]];
+        registry.observe_execution(
+            player,
+            4,
+            &HashSet::from([objectives[0], objectives[1]]),
+            &HashMap::new(),
+            &[],
+        );
+
+        let execution = &registry.active[0].execution.snapshot;
+        assert_eq!(execution.objective_property_count, 3);
+        assert_eq!(execution.owned_objective_property_count, 2);
+        assert_eq!(execution.actual_occupation_turn, None);
     }
 
     #[test]

@@ -285,3 +285,46 @@ MUST: AIは局地campaignと明示的防衛で当手番に使用しない資金�
 
 - **WHEN** 当手番の生産判断をtraceへ記録するとき
 - **THEN** 実生産後現金、永続Plan予約額、未割当額を`leftover_funds / reserved_funds / uncommitted_funds`として別々に出力する
+
+### Requirement: 島作戦identityと占領予実の継続
+
+MUST: AIは島campaignを`player_id + IslandId`で識別し、作戦種別、anchor、現在の未所有施設、現在敵の変化ではPlanIdを変更してはならない。また、同じ島に複数の戦略作戦を同時生成してはならない。
+
+#### Scenario: 中立島が争奪島へ変わる
+
+- **WHEN** 同じ島の状態がExpandからContest、Reinforce、Defenseへ変化し、anchorと敵Entity集合も変わるとき
+- **THEN** 同じPlanIdと累計生産・攻撃・損耗実績を維持し、現在盤面に対するrevisionとして扱う
+
+#### Scenario: 首都作戦と局地作戦が同じ島を指す
+
+- **WHEN** 敵首都島へ局地Capture／AssaultとAssaultCapitalの双方が生成されるとき
+- **THEN** 勝利条件であるAssaultCapitalを正本として1作戦へ統合し、同じEntity・施設・予算を別Planへ二重配賦しない
+
+#### Scenario: 現在の未所有施設が減る
+
+- **WHEN** 3施設を目的として開始した島作戦で2施設を所有し、現在の戦術目的が残り1施設へ縮むとき
+- **THEN** 予実台帳は目的施設数3・所有数2を保持し、残り1施設だけを分母とする新しい実績へリセットしない
+
+### Requirement: 敵増援の期限付きcontingency分離
+
+MUST: AIは将来生産される敵ごとに生産手番と作戦地点への移動ETAから敵接触手番を求め、実際に生産可能な対抗unitの生産・移動・必要攻撃回数を同じ時間軸で比較しなければならない。
+
+#### Scenario: 対抗unitが敵到着までに間に合う
+
+- **WHEN** `counter_build_turn + 1 + counter_travel_eta <= enemy_build_turn + 1 + enemy_travel_eta`を満たす正のdamageを持つ対抗unitがあるとき
+- **THEN** 当該増援を現在の撃破対象へ加えず、敵兵種、敵接触手番、対抗兵種、施設、生産手番、対抗接触手番、必要攻撃回数、費用を持つcontingencyとして記録する
+
+#### Scenario: 対抗unitが敵到着までに間に合わない
+
+- **WHEN** 敵接触手番までに到達できる合法な対抗unitが存在しないとき
+- **THEN** 当該増援をunavoidable reinforcementとして現在のRolling Planへ追加し、その撃破と占領役生存まで含むscheduleだけを実行可能とする
+
+#### Scenario: 将来収入で対抗費用を賄える
+
+- **WHEN** 期限ごとのcontingency累計費用が、その期限までの予測収入で全額賄えるとき
+- **THEN** 現在資金を予約せず、予約額を`max(0, 累計対抗費用 - 手番収入 × 期限)`の全期限に対する最大値とする
+
+#### Scenario: 一時的に実行可能案が消える
+
+- **WHEN** 敵増援または損耗で島Planの現revisionが一時的に完遂不能だが、生産失敗・施設喪失・資金不成立などの硬い実行不能はないとき
+- **THEN** Planを撤回せず同じPlanIdで補充・増援対応を再計算し、次手番の候補上限外になっても目的を保持する

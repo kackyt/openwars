@@ -36,8 +36,8 @@ use rolling_plan::{
 };
 use trace::{
     CampaignTurnForecastTrace, ProductionDecision, ProductionOperationTrace, ProductionPlanTrace,
-    ProductionStepTrace, ProductionTraceDiagnostics, RollingCombatPlanTrace, RollingPurchaseTrace,
-    RollingTargetTrace,
+    ProductionStepTrace, ProductionTraceDiagnostics, ReinforcementContingencyTrace,
+    RollingCombatPlanTrace, RollingPurchaseTrace, RollingTargetTrace,
 };
 
 use crate::ai::turn_distance::TerrainConnectivity;
@@ -88,6 +88,23 @@ const DEFENSE_THREAT_ETA: u32 = 2;
 /// 占領開始後に拠点を確保し切るまでに必要な最小手番数。
 const CAPTURE_COMPLETION_TURNS: u32 = 2;
 
+type ScoredOperation = (bool, u32, OperationKind, Vec<GridPosition>);
+
+/// 必須作戦を差し込む際、もう一方の勝利ロードマップ必須作戦を追い出さない。
+fn required_operation_eviction_index(scored: &[ScoredOperation], required: OperationKind) -> usize {
+    scored
+        .iter()
+        .rposition(|(_, _, kind, _)| {
+            *kind != required
+                && !matches!(
+                    (required, *kind),
+                    (OperationKind::Capture, OperationKind::AssaultCapital)
+                        | (OperationKind::AssaultCapital, OperationKind::Capture)
+                )
+        })
+        .unwrap_or(scored.len() - 1)
+}
+
 /// 盤面から取り出したユニット 1 体分の情報。
 #[derive(Debug, Clone)]
 struct UnitSnapshot {
@@ -136,6 +153,8 @@ impl ThreatTarget {
 #[derive(Debug)]
 struct Operation {
     kind: OperationKind,
+    /// 島campaignの永続identity。anchorや未所有施設集合が変わっても維持する。
+    island_id: Option<crate::ai::islands::IslandId>,
     /// 作戦の代表地点（距離計算の基準）
     anchor: GridPosition,
     /// 編成中の戦力を逐次投入せず集結させる、自軍側の安全な地点。
@@ -157,6 +176,23 @@ struct Operation {
     unreachable_threats: Vec<ThreatTarget>,
     /// 自軍が生産しうるいずれかの移動タイプで到達できる位置にいる敵（＝殴りに行ける敵）
     reachable_threats: Vec<ThreatTarget>,
+    /// 観測後のcounterでは接触前に止められない将来増援だけを現在編成へ含める。
+    unavoidable_reinforcements: Vec<EnemyPlanUnit>,
+    /// 観測後に間に合うため、具体的counterと生産slotだけを予約する条件付き計画。
+    reinforcement_contingencies: Vec<ReinforcementContingency>,
+    contingency_reserve_funds: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReinforcementContingency {
+    enemy_type: UnitType,
+    enemy_contact_turn: u32,
+    counter_type: UnitType,
+    counter_facility: GridPosition,
+    counter_build_turn: u32,
+    counter_contact_turn: u32,
+    attacks_required: u32,
+    reserve_cost: u32,
 }
 
 /// 1手番の全施設について一度だけ作ったV4生産計画。
@@ -977,7 +1013,7 @@ fn build_operations(
         .collect::<Vec<_>>();
 
     let island_map = crate::ai::islands::IslandMap::analyze(&scan.map);
-    let campaign_clusters = scan
+    let mut campaign_clusters = scan
         .campaign_objectives
         .iter()
         .map(|objective| {
@@ -1002,14 +1038,23 @@ fn build_operations(
             (objective, properties)
         })
         .collect::<Vec<_>>();
-    raw.retain(|(kind, cluster)| {
+    // 1島に通常campaignと首都攻略を同時生成しない。首都島では勝利条件を表す
+    // AssaultCapitalを正本とし、同じ島の局地Captureを別Planとして並走させない。
+    campaign_clusters.sort_by_key(|(objective, _)| {
+        (
+            objective.island_id.0,
+            u8::from(objective.kind != OperationKind::AssaultCapital),
+            objective.kind.priority_rank(),
+        )
+    });
+    campaign_clusters.dedup_by_key(|(objective, _)| objective.island_id);
+    raw.retain(|(_, cluster)| {
         !campaign_clusters.iter().any(|(objective, _)| {
-            objective.kind == *kind
-                && cluster.iter().any(|property| {
-                    island_map
-                        .get_island_at(property)
-                        .is_some_and(|island| island.id == objective.island_id)
-                })
+            cluster.iter().any(|property| {
+                island_map
+                    .get_island_at(property)
+                    .is_some_and(|island| island.id == objective.island_id)
+            })
         })
     });
     raw.extend(
@@ -1026,10 +1071,23 @@ fn build_operations(
                     && cluster.iter().any(|property| properties.contains(property)))
                 .then_some(*objective)
             })
+            .or_else(|| {
+                // Capture→Defense/Contestの遷移でも、島そのものが同じなら同一campaign。
+                campaign_clusters.iter().find_map(|(objective, _)| {
+                    cluster
+                        .iter()
+                        .any(|property| {
+                            island_map
+                                .get_island_at(property)
+                                .is_some_and(|island| island.id == objective.island_id)
+                        })
+                        .then_some(*objective)
+                })
+            })
     };
 
     // 生産施設から近い作戦を優先して MAX_OPERATIONS 件に絞る
-    let mut scored: Vec<(bool, u32, OperationKind, Vec<GridPosition>)> = raw
+    let mut scored: Vec<ScoredOperation> = raw
         .into_iter()
         .filter(|(_, cluster)| !cluster.is_empty())
         .map(|(kind, cluster)| {
@@ -1037,10 +1095,13 @@ fn build_operations(
                 .map_or_else(|| anchor_of(&cluster, scan), |objective| objective.anchor);
             let lead = facility_lead_time(scan, &anchor, reference.max_movement);
             let continuing = active_objectives.iter().any(|objective| {
-                objective.kind == kind
-                    && cluster
-                        .iter()
-                        .any(|property| objective.properties.contains(property))
+                campaign_for_cluster(kind, &cluster)
+                    .is_some_and(|campaign| objective.island_id == Some(campaign.island_id))
+                    || (objective.island_id.is_none()
+                        && objective.kind == kind
+                        && cluster
+                            .iter()
+                            .any(|property| objective.properties.contains(property)))
             });
             (continuing, lead, kind, cluster)
         })
@@ -1076,7 +1137,8 @@ fn build_operations(
     if let Some(capture) = rescued_capture {
         // 最も優先度の低い枠を明け渡して占領作戦を差し込む
         if scored.len() >= MAX_OPERATIONS {
-            scored.pop();
+            let removable = required_operation_eviction_index(&scored, OperationKind::Capture);
+            scored.remove(removable);
         }
         scored.push(capture);
     }
@@ -1102,7 +1164,11 @@ fn build_operations(
     };
     if let Some(assault) = rescued_assault {
         if scored.len() >= MAX_OPERATIONS {
-            scored.pop();
+            // 末尾には救済した進行中Captureが入ることがある。これを再び落とさず、
+            // Capture/首都以外で最も低位の作戦を1件だけ外す。
+            let removable =
+                required_operation_eviction_index(&scored, OperationKind::AssaultCapital);
+            scored.remove(removable);
         }
         scored.push(assault);
     }
@@ -1131,7 +1197,13 @@ fn build_operations(
                 .or_else(|| {
                     active_objectives
                         .iter()
-                        .find(|objective| objective.kind == kind && objective.properties == cluster)
+                        .find(|objective| {
+                            planning_objective.is_some_and(|campaign| {
+                                objective.island_id == Some(campaign.island_id)
+                            }) || (objective.island_id.is_none()
+                                && objective.kind == kind
+                                && objective.properties == cluster)
+                        })
                         .map(|objective| &objective.target_enemies)
                 })
                 .unwrap_or(&empty_entity_set);
@@ -1148,9 +1220,17 @@ fn build_operations(
                 lead,
             );
             if let Some(objective) = planning_objective {
+                operation.island_id = Some(objective.island_id);
                 operation.staging_anchor = objective.staging_anchor;
                 operation.execution_authorized = objective.execution_authorized;
                 operation.protected_capture_entities = objective.protected_capture_entities.clone();
+            } else if let Some(active) = active_objectives
+                .iter()
+                .find(|objective| objective.kind == kind && objective.properties == cluster)
+            {
+                // portfolioがObserveへ一時遷移しても、active Plan由来のOperationは
+                // 島identityを失わない。敵やanchorの変化で新Planへ分裂させない。
+                operation.island_id = active.island_id;
             }
             operation
         })
@@ -1627,8 +1707,9 @@ fn build_operation(
         slots.intercept_units = 0;
     }
 
-    Operation {
+    let mut operation = Operation {
         kind,
+        island_id: None,
         anchor,
         staging_anchor: anchor,
         execution_authorized: true,
@@ -1642,7 +1723,20 @@ fn build_operation(
         filled: OperationSlots::default(),
         unreachable_threats,
         reachable_threats,
+        unavoidable_reinforcements: Vec::new(),
+        reinforcement_contingencies: Vec::new(),
+        contingency_reserve_funds: 0,
+    };
+    let assessment =
+        enemy_reinforcement_assessment(scan, ctx, &operation, operation.threat_horizon.max(1));
+    operation.unavoidable_reinforcements = assessment.unavoidable;
+    operation.reinforcement_contingencies = assessment.contingencies;
+    operation.contingency_reserve_funds =
+        contingency_reserve_now(&operation.reinforcement_contingencies, scan.my_income);
+    if !operation.unavoidable_reinforcements.is_empty() {
+        operation.slots.combat_plan_required = 1;
     }
+    operation
 }
 
 /// 作戦一覧と資金から、この生産フェーズで発行する生産命令を組み立てる。
@@ -1718,6 +1812,21 @@ fn plan_production_with_registry(
             requires_transport: op.facts.requires_transport,
             enemy_combat_units: op.facts.enemy_combat_units,
             enemy_reinforcement_funds: op.facts.enemy_reinforcement_funds,
+            contingency_reserve_funds: op.contingency_reserve_funds,
+            reinforcement_contingencies: op
+                .reinforcement_contingencies
+                .iter()
+                .map(|contingency| ReinforcementContingencyTrace {
+                    enemy_type: contingency.enemy_type,
+                    enemy_contact_turn: contingency.enemy_contact_turn,
+                    counter_type: contingency.counter_type,
+                    counter_facility: contingency.counter_facility,
+                    counter_build_turn: contingency.counter_build_turn,
+                    counter_contact_turn: contingency.counter_contact_turn,
+                    attacks_required: contingency.attacks_required,
+                    reserve_cost: contingency.reserve_cost,
+                })
+                .collect(),
             deploy_lead_time: op.facts.deploy_lead_time,
         })
         .collect();
@@ -1782,13 +1891,20 @@ fn plan_production_with_registry(
         if free_slots == 0 {
             break;
         }
-        // 1 枠あたり予算。高価なユニットで枠を食い潰さないためのソフト上限。
-        let per_slot_budget = remaining_funds / free_slots as u32;
-
         // 最も不足している枠を持つ作戦から順に見ていく
         let Some((op_index, slot_kind)) = most_starved_slot(&operations) else {
             break;
         };
+
+        // 先に並ぶ作戦の観測後counterを発動できる現金は、下位作戦へ流さない。
+        // 自作戦の予約は現在の確定脅威を処理するために使ってよい。
+        let higher_priority_contingency_reserve = operations[..op_index]
+            .iter()
+            .map(|operation| operation.contingency_reserve_funds)
+            .fold(0_u32, u32::saturating_add);
+        let spendable_funds = remaining_funds.saturating_sub(higher_priority_contingency_reserve);
+        // 1 枠あたり予算。高価なユニットで枠を食い潰さないためのソフト上限。
+        let per_slot_budget = spendable_funds / free_slots as u32;
 
         // トレース用に、選定前の未充足率と作戦の識別情報を控えておく。
         let operation_kind = operations[op_index].kind;
@@ -1804,10 +1920,11 @@ fn plan_production_with_registry(
                 .iter()
                 .filter_map(|threat| threat.entity)
                 .collect::<HashSet<_>>();
-            let continuation = plan_registry.continuation(
+            let continuation = plan_registry.continuation_for_operation(
                 player_id,
                 turn,
                 operation_kind,
+                operations[op_index].island_id,
                 &operations[op_index].objective_properties,
                 &target_enemies,
             );
@@ -1828,7 +1945,7 @@ fn plan_production_with_registry(
                 } else {
                     &committed_for_plan
                 },
-                remaining_funds,
+                spendable_funds,
                 !allow_structural_slots,
             );
             if let Some(input) = rolling_input
@@ -1885,10 +2002,11 @@ fn plan_production_with_registry(
                         conflicts
                     })
                     .unwrap_or_default();
-                let selected = plan_registry.select(
+                let selected = plan_registry.select_for_operation(
                     player_id,
                     turn,
                     operation_kind,
+                    operations[op_index].island_id,
                     operation_anchor,
                     operations[op_index].objective_properties.clone(),
                     target_enemies,
@@ -1977,7 +2095,7 @@ fn plan_production_with_registry(
                     .current_purchases()
                     .find(|purchase| {
                         !used_facilities.contains(&purchase.facility)
-                            && purchase.cost <= remaining_funds
+                            && purchase.cost <= spendable_funds
                     })
                     .map(|purchase| {
                         planned_purchase = Some(purchase);
@@ -1997,7 +2115,7 @@ fn plan_production_with_registry(
                 slot_kind,
                 &used_facilities,
                 CandidateConstraints {
-                    remaining_funds,
+                    remaining_funds: spendable_funds,
                     per_slot_budget,
                 },
             )
@@ -2043,7 +2161,7 @@ fn plan_production_with_registry(
                 &mut ctx,
                 &operations[op_index],
                 slot_kind,
-                remaining_funds,
+                spendable_funds,
                 candidate.cost,
             )
         {
@@ -2132,8 +2250,15 @@ fn plan_production_with_registry(
 
     plan_registry.reconcile_unseen_plans(player_id, turn, &seen_plan_ids);
     plan_trace.leftover_funds = remaining_funds;
-    plan_trace.reserved_funds =
-        remaining_funds.min(plan_registry.reserved_purchase_cost(player_id));
+    let contingency_reserve = operations
+        .iter()
+        .map(|operation| operation.contingency_reserve_funds)
+        .fold(0_u32, u32::saturating_add);
+    plan_trace.reserved_funds = remaining_funds.min(
+        plan_registry
+            .reserved_purchase_cost(player_id)
+            .saturating_add(contingency_reserve),
+    );
     plan_trace.uncommitted_funds = remaining_funds.saturating_sub(plan_trace.reserved_funds);
     (commands, plan_trace)
 }
@@ -2157,19 +2282,28 @@ fn committed_entities_for_plan(
 /// 現在数へ固定値を足すのではなく、各手番の資金、facility slot、生産可能兵種、移動ETAを
 /// 同じ時間軸へ置く。敵の現在資金は非公開なので0から始め、将来収入だけを使う悲観scenario
 /// とする。これは実際の敵命令の予言ではなく、成立しない甘い計画を弾くstress testである。
-fn enemy_reinforcement_scenario(
+#[derive(Debug, Default)]
+struct ReinforcementAssessment {
+    unavoidable: Vec<EnemyPlanUnit>,
+    contingencies: Vec<ReinforcementContingency>,
+}
+
+/// 敵増援ごとに接触turnと、観測後に生産する最速counterの接触turnを比較する。
+/// counterが間に合う仮説は現在の撃破対象へ混ぜず、条件付き予約として保持する。
+fn enemy_reinforcement_assessment(
     scan: &BoardScan,
     ctx: &mut ReachCtx,
     op: &Operation,
     horizon: u32,
-) -> Vec<EnemyPlanUnit> {
+) -> ReinforcementAssessment {
     let scenario_budget = op.facts.enemy_reinforcement_funds;
     if scenario_budget == 0 {
-        return Vec::new();
+        return ReinforcementAssessment::default();
     }
     let mut budget = 0_u32;
     let mut funded = 0_u32;
-    let mut reinforcements = Vec::new();
+    let mut assessment = ReinforcementAssessment::default();
+    let mut reserved_counter_slots = HashSet::new();
     let friendly_combat_types = scan
         .available_types
         .iter()
@@ -2230,7 +2364,7 @@ fn enemy_reinforcement_scenario(
                 continue;
             };
             budget = budget.saturating_sub(stats.cost);
-            reinforcements.push(EnemyPlanUnit {
+            let reinforcement = EnemyPlanUnit {
                 entity: None,
                 stats: stats.clone(),
                 // ETA到達後は作戦anchorに接触するものとして交戦時間を見積もる。
@@ -2243,10 +2377,112 @@ fn enemy_reinforcement_scenario(
                         scan.master_data.get_terrain_defense_bonus(terrain)
                     }),
                 available_turn,
-            });
+            };
+            if let Some(contingency) = fastest_observed_counter(
+                scan,
+                ctx,
+                op.anchor,
+                stats,
+                build_turn,
+                available_turn,
+                &reserved_counter_slots,
+            ) {
+                reserved_counter_slots
+                    .insert((contingency.counter_build_turn, contingency.counter_facility));
+                assessment.contingencies.push(contingency);
+            } else {
+                assessment.unavoidable.push(reinforcement);
+            }
         }
     }
-    reinforcements
+    assessment
+}
+
+/// 観測した敵1体へ、生産slot・移動・与ダメージを満たす最速counterを返す。
+fn fastest_observed_counter(
+    scan: &BoardScan,
+    ctx: &mut ReachCtx,
+    anchor: GridPosition,
+    enemy: &UnitStats,
+    counter_build_turn: u32,
+    enemy_contact_turn: u32,
+    reserved_slots: &HashSet<(u32, GridPosition)>,
+) -> Option<ReinforcementContingency> {
+    scan.production_facilities
+        .iter()
+        .flat_map(|(facility, terrain)| {
+            scan.available_types
+                .iter()
+                .filter(move |(unit_type, stats)| {
+                    !stats.can_capture
+                        && stats.max_cargo == 0
+                        && scan.can_produce(*terrain, *unit_type)
+                })
+                .map(move |(_, stats)| (*facility, stats))
+        })
+        .filter(|(facility, stats)| {
+            !reserved_slots.contains(&(counter_build_turn, *facility))
+                && best_damage(&scan.damage_chart, stats.unit_type, enemy.unit_type) > 0
+                && ctx.is_reachable(
+                    &scan.map,
+                    &scan.master_data,
+                    (facility.x, facility.y),
+                    (anchor.x, anchor.y),
+                    stats.movement_type,
+                )
+        })
+        .filter_map(|(facility, stats)| {
+            let damage = best_damage(&scan.damage_chart, stats.unit_type, enemy.unit_type);
+            let attacks_required = 100_u32.div_ceil(damage.max(1));
+            let counter_contact_turn = counter_build_turn
+                .saturating_add(1)
+                .saturating_add(eta_turns(&scan.map, &facility, &anchor, stats.max_movement));
+            (counter_contact_turn <= enemy_contact_turn).then_some((
+                counter_contact_turn,
+                attacks_required,
+                stats.cost,
+                facility,
+                stats,
+            ))
+        })
+        .min_by_key(|(contact, attacks, cost, facility, _)| {
+            (*contact, *attacks, *cost, facility.y, facility.x)
+        })
+        .map(
+            |(counter_contact_turn, attacks_required, reserve_cost, facility, stats)| {
+                ReinforcementContingency {
+                    enemy_type: enemy.unit_type,
+                    enemy_contact_turn,
+                    counter_type: stats.unit_type,
+                    counter_facility: facility,
+                    counter_build_turn,
+                    counter_contact_turn,
+                    attacks_required,
+                    reserve_cost,
+                }
+            },
+        )
+}
+
+/// 将来収入で賄えない累積counter費用だけを、現在残高から予約する。
+fn contingency_reserve_now(
+    contingencies: &[ReinforcementContingency],
+    income_per_turn: u32,
+) -> u32 {
+    let mut due_by_turn = HashMap::<u32, u32>::new();
+    for contingency in contingencies {
+        due_by_turn
+            .entry(contingency.counter_build_turn)
+            .and_modify(|cost| *cost = cost.saturating_add(contingency.reserve_cost))
+            .or_insert(contingency.reserve_cost);
+    }
+    let mut turns = due_by_turn.keys().copied().collect::<Vec<_>>();
+    turns.sort_unstable();
+    let mut cumulative_cost = 0_u32;
+    turns.into_iter().fold(0_u32, |required_now, turn| {
+        cumulative_cost = cumulative_cost.saturating_add(due_by_turn[&turn]);
+        required_now.max(cumulative_cost.saturating_sub(income_per_turn.saturating_mul(turn)))
+    })
 }
 
 /// 観測敵と到着しうる増援を排除できる混成生産列を、探索期間の全生産slotから計画する。
@@ -2304,12 +2540,7 @@ fn combat_plan_input(
     );
     let planning_horizon = hard_deadline.unwrap_or(DEFAULT_SEARCH_TURNS).max(1);
     let mut enemies = enemies;
-    enemies.extend(enemy_reinforcement_scenario(
-        scan,
-        ctx,
-        op,
-        planning_horizon,
-    ));
+    enemies.extend(op.unavoidable_reinforcements.iter().cloned());
     if enemies.is_empty() {
         return None;
     }
@@ -3081,6 +3312,63 @@ mod tests {
         assert_eq!(captures[0].anchor, campaign_anchor);
     }
 
+    #[test]
+    fn capital_objective_replaces_local_campaign_on_the_same_island() {
+        let mut scan = multi_factory_scan();
+        let local_anchor = pos(6, 2);
+        let capital = pos(8, 2);
+        let island_id = crate::ai::islands::IslandId(0);
+        scan.campaign_objectives = vec![
+            CampaignPlanningObjective {
+                island_id,
+                kind: OperationKind::Capture,
+                anchor: local_anchor,
+                capture_eta: Some(3),
+                required_capture_survivors: 1,
+                logistics_rank: Some(0),
+                forced_target_enemies: HashSet::new(),
+                protected_capture_entities: HashSet::new(),
+                staging_anchor: local_anchor,
+                execution_authorized: true,
+            },
+            CampaignPlanningObjective {
+                island_id,
+                kind: OperationKind::AssaultCapital,
+                anchor: capital,
+                capture_eta: None,
+                required_capture_survivors: 0,
+                logistics_rank: None,
+                forced_target_enemies: HashSet::new(),
+                protected_capture_entities: HashSet::new(),
+                staging_anchor: local_anchor,
+                execution_authorized: false,
+            },
+        ];
+
+        let operations = build_operations(&scan, &mut ReachCtx::default(), &[]);
+        let same_island = operations
+            .iter()
+            .filter(|operation| operation.island_id == Some(island_id))
+            .collect::<Vec<_>>();
+        assert_eq!(same_island.len(), 1);
+        assert_eq!(same_island[0].kind, OperationKind::AssaultCapital);
+        assert_eq!(same_island[0].anchor, capital);
+    }
+
+    #[test]
+    fn capital_rescue_evicts_defense_instead_of_the_required_capture() {
+        let scored = vec![
+            (true, 1, OperationKind::Defense, vec![pos(0, 0)]),
+            (true, 2, OperationKind::Defense, vec![pos(1, 0)]),
+            (true, 3, OperationKind::Defense, vec![pos(2, 0)]),
+            (true, 4, OperationKind::Capture, vec![pos(3, 0)]),
+        ];
+
+        let removed = required_operation_eviction_index(&scored, OperationKind::AssaultCapital);
+        assert_eq!(scored[removed].2, OperationKind::Defense);
+        assert_ne!(scored[removed].2, OperationKind::Capture);
+    }
+
     /// 到達ターン数は距離を移動力で割り上げた値になる
     #[test]
     fn eta_is_distance_divided_by_movement() {
@@ -3320,7 +3608,7 @@ mod tests {
     }
 
     #[test]
-    fn enemy_reinforcement_scenario_places_each_purchase_on_the_time_axis() {
+    fn enemy_reinforcement_assessment_places_each_purchase_on_the_time_axis() {
         let mut scan = multi_factory_scan();
         scan.enemy_income = 1_000;
         scan.enemy_production_slots = 1;
@@ -3340,21 +3628,59 @@ mod tests {
         op.anchor = pos(6, 2);
         op.facts.enemy_reinforcement_funds = 3_000;
 
-        let reinforcements = enemy_reinforcement_scenario(&scan, &mut ReachCtx::default(), &op, 5);
+        let assessment = enemy_reinforcement_assessment(&scan, &mut ReachCtx::default(), &op, 5);
+        let mut arrivals = assessment
+            .unavoidable
+            .iter()
+            .map(|enemy| (enemy.available_turn, enemy.stats.unit_type))
+            .chain(
+                assessment
+                    .contingencies
+                    .iter()
+                    .map(|plan| (plan.enemy_contact_turn, plan.enemy_type)),
+            )
+            .collect::<Vec<_>>();
+        arrivals.sort_unstable_by_key(|(turn, _)| *turn);
 
-        assert_eq!(reinforcements.len(), 3);
+        assert_eq!(arrivals.len(), 3);
         assert_eq!(
-            reinforcements
-                .iter()
-                .map(|enemy| enemy.available_turn)
-                .collect::<Vec<_>>(),
+            arrivals.iter().map(|(turn, _)| *turn).collect::<Vec<_>>(),
             vec![3, 4, 5]
         );
         assert!(
-            reinforcements
+            arrivals
                 .iter()
-                .all(|enemy| enemy.stats.unit_type == UnitType::Infantry)
+                .all(|(_, unit_type)| *unit_type == UnitType::Infantry)
         );
+    }
+
+    #[test]
+    fn contingency_reserves_only_the_funding_gap_before_future_income() {
+        let plans = vec![
+            ReinforcementContingency {
+                enemy_type: UnitType::Infantry,
+                enemy_contact_turn: 3,
+                counter_type: UnitType::Bcopters,
+                counter_facility: pos(1, 1),
+                counter_build_turn: 1,
+                counter_contact_turn: 3,
+                attacks_required: 2,
+                reserve_cost: 7_500,
+            },
+            ReinforcementContingency {
+                enemy_type: UnitType::Infantry,
+                enemy_contact_turn: 4,
+                counter_type: UnitType::Bcopters,
+                counter_facility: pos(2, 1),
+                counter_build_turn: 2,
+                counter_contact_turn: 4,
+                attacks_required: 2,
+                reserve_cost: 7_500,
+            },
+        ];
+
+        assert_eq!(contingency_reserve_now(&plans, 5_000), 5_000);
+        assert_eq!(contingency_reserve_now(&plans, 8_000), 0);
     }
 
     /// テスト用のユニット諸元。
@@ -3603,6 +3929,7 @@ mod tests {
     fn operation(kind: OperationKind, slots: OperationSlots, filled: OperationSlots) -> Operation {
         Operation {
             kind,
+            island_id: None,
             anchor: pos(0, 0),
             staging_anchor: pos(0, 0),
             execution_authorized: true,
@@ -3614,6 +3941,9 @@ mod tests {
             filled,
             unreachable_threats: Vec::new(),
             reachable_threats: Vec::new(),
+            unavoidable_reinforcements: Vec::new(),
+            reinforcement_contingencies: Vec::new(),
+            contingency_reserve_funds: 0,
         }
     }
 

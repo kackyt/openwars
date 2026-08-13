@@ -386,9 +386,18 @@ type OffensivePriorityKey = (
 
 /// decisionごとの固定keyへ正規化し、HashMapや入力順に依存しない攻勢優先順位を作る。
 fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePriorityKey {
-    // 進行中作戦の専属Entityはassigned_islandで保持する。一方、未割当資源まで
-    // 既存Assaultが先取りすると島内Secureが停止するため、作戦種別を先に比較する。
-    let existing_rank = u8::from(candidate.existing_operation.is_none());
+    // 進行中作戦は同時攻勢上限より先に枠を確保する。毎ターン再評価されるdecisionを
+    // 先にすると、新規候補3件だけで上限が埋まり、占領途中の島作戦が消えてしまう。
+    let continuity_rank = if candidate.logistics_prerequisite
+        || candidate.assessment.decision == IslandCampaignDecision::Secure
+    {
+        // 自島・確保済み島の未所有施設は、新規資源を使って短く閉じる。
+        0
+    } else if candidate.existing_operation.is_some() {
+        1
+    } else {
+        2
+    };
     let logistics_rank = candidate.logistics_priority_rank.unwrap_or(u32::MAX);
     let decision_rank = match candidate.assessment.decision {
         _ if candidate.logistics_prerequisite => 0,
@@ -401,8 +410,8 @@ fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePrior
     };
     match candidate.assessment.decision {
         IslandCampaignDecision::Expand | IslandCampaignDecision::Secure => (
+            continuity_rank,
             decision_rank,
-            existing_rank,
             logistics_rank,
             candidate
                 .assessment
@@ -417,8 +426,8 @@ fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePrior
             candidate.assessment.island_id.0,
         ),
         IslandCampaignDecision::Contest | IslandCampaignDecision::Reinforce => (
+            continuity_rank,
             decision_rank,
-            existing_rank,
             logistics_rank,
             0,
             Reverse(0),
@@ -433,8 +442,8 @@ fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePrior
             candidate.assessment.island_id.0,
         ),
         IslandCampaignDecision::Assault => (
+            continuity_rank,
             decision_rank,
-            existing_rank,
             logistics_rank,
             0,
             Reverse(candidate.roi_production_sites),
@@ -446,8 +455,8 @@ fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePrior
             candidate.assessment.island_id.0,
         ),
         _ => (
+            continuity_rank,
             decision_rank,
-            existing_rank,
             logistics_rank,
             0,
             Reverse(0),
@@ -1109,6 +1118,14 @@ fn reserve_candidate(
         && existing
             .is_some_and(|operation| is_live_campaign_transport_phase(operation.transport_phase));
     available = sorted_pool_units(&provisional, island_id);
+    // Combat候補ごとにpool全体を再走査しない。既に選択済みと、この段階で予約可能な
+    // 輸送役を一度だけまとめ、各cargo追加時の二部マッチングへ再利用する。
+    let mut route_transports = transport_entities.clone();
+    for transport in &available {
+        if is_offshore_transport(transport.unit_type) {
+            push_unique_entity(&mut route_transports, transport.entity);
+        }
+    }
     while remaining_combat_units > 0 && !assault_wave_is_frozen {
         let Some(index) = available.iter().position(|unit| {
             if is_campaign_support_unit(unit.unit_type) {
@@ -1120,8 +1137,7 @@ fn reserve_candidate(
                         .reachable_positions
                         .contains(&candidate.target_position);
             }
-            if candidate.assessment.decision != IslandCampaignDecision::Assault
-                || unit.island_id == Some(island_id)
+            if unit.island_id == Some(island_id)
                 || unit
                     .reachable_positions
                     .contains(&candidate.target_position)
@@ -1129,8 +1145,9 @@ fn reserve_candidate(
                 return true;
             }
 
-            // 自力展開できない強襲支援は、現在の輸送役へcapture cargoと同時に
-            // 完全搭載できる分だけ予約する。容量超過をFormingへ積むと永続停滞する。
+            // 自力展開できない渡洋支援は、現在の輸送役または生産可能な輸送手段で
+            // 実際に運べる場合だけ選ぶ。Contest/Reinforceを無条件で通すと、戦車など
+            // 積載不能Entityが完全編成へ混ざり、後段で島作戦全体が消える。
             let mut remote_cargo: Vec<_> = capture_entities
                 .iter()
                 .chain(combat_entities.iter())
@@ -1145,7 +1162,17 @@ fn reserve_candidate(
                 })
                 .collect();
             remote_cargo.push(unit.entity);
-            campaign_transport_package_covers(&remote_cargo, &transport_entities, catalog)
+            // transport_slotsが0のReinforceでも、pool内に完成済み輸送役があれば
+            // 後段でその実Entityを予約できる。先に選択済みの輸送役だけを見ると、
+            // 合法なLander付き編成まで「輸送経路なし」として落としてしまう。
+            campaign_transport_package_covers(&remote_cargo, &route_transports, catalog)
+                || remote_transport_shortfall(
+                    &remote_cargo,
+                    &route_transports,
+                    catalog,
+                    &candidate.producible_transports,
+                )
+                .is_some()
         }) else {
             break;
         };
@@ -3507,6 +3534,30 @@ mod tests {
         );
         assert_eq!(defense.purchase_shortfall.total_budget, 0);
         assert!(!defense.operation_ready);
+    }
+
+    #[test]
+    fn contest_ignores_remote_combat_entity_without_a_transport_route() {
+        let mut contest = contest_candidate(0, 1);
+        contest.requirement.combat_units = 1;
+        contest.producible_transports.clear();
+        let mut stranded_tank = unit_candidate(90, UnitType::Tank, 7_000, false, 0);
+        stranded_tank.island_id = Some(IslandId(1));
+        stranded_tank.reachable_positions.clear();
+
+        let portfolio = allocate_campaign_portfolio(
+            vec![contest],
+            CampaignResourcePool {
+                available_funds: 20_000,
+                units: vec![stranded_tank],
+            },
+        );
+
+        let assignment = portfolio
+            .assignment_for(IslandId(0))
+            .expect("積載不能Entityだけを理由に継続中Contestを消さない");
+        assert!(assignment.combat_entities.is_empty());
+        assert_eq!(assignment.purchase_shortfall.combat_units, 1);
     }
 
     #[test]
