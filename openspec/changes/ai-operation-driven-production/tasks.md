@@ -21,7 +21,7 @@
 - 空き生産枠数 × ターン の累計、および最大保有資金
 - 自軍の占領数（map_1 / map_2 の現行 V3 はいずれも 0 件）
 
-## 現在地と完成ゲート（2026-08-14、B-199完了時点）
+## 現在地と完成ゲート（2026-08-14、B-203完了時点）
 
 現在は「要求を作って生産する」段階を越え、永続Roadmap、局地Combat Plan、島作戦の生産予実、未完原因別の復旧、一意なunit作戦所有まで実装済みである。ただし、**計画した全工程を実行命令へ拘束し、実績差から同じ勝利Roadmapを修正しながら勝利条件へ収束するところまでは完成していない**。
 
@@ -273,6 +273,10 @@
 - [x] B-197. V4のReserveを通常planningと手番末でfree poolへ戻し、現行Campaign、deployment、島portfolio、首都Forming、輸送波へ最大3回の線形固定点で再接続してからcatch-allする。輸送未配備でも既存占領兵をForming cargoへ接続し、ETA超過を候補除外に使わない
 - [x] B-198. 生産時anchorによるowner注入を未割当Entityの初期seedに限定し、明示的な別作戦移管を旧anchorへ巻き戻さない。首都Forming Squadを常在AssaultCapitalへbindし、activeなEntityを局地portfolioの未claim解放から保護する
 - [x] B-199. map_3 / Hex / seed 42 / V3先攻・V4後攻を10ターン追試し、V4の全手番Unassigned 0、Reserve最大1、期限超過Reserve最大0を確認する。T10 Reserve 1体はage 0、AssaultCapital/Formingへ占領兵8体が接続された。T10資金55,364G・任務停滞4件のため、資金滞留・生産枠利用・長期勝利・複数seedは未達として完成ゲート6・7へ残す
+- [x] B-200. 攻撃交換評価を敵Entityと候補移動後座標へ分離し、Map topologyによる距離、射程、反撃、攻撃側地形からHP損耗率と監査用損害価値を算出する。V1〜V3の枝刈りも移動後位置を使う
+- [x] B-201. V4の攻撃候補を「有利な作戦対象、有利な同一作戦圏内対象、有利対象が無い場合の必要な作戦対象」の順にし、金額ROIを一律禁止条件にせず悪相性への固執を避ける回帰テストを追加する。V2/V3のAttack/Capture/Transport Squadにも必要攻撃の例外を適用し、上陸再編順に依存せず攻撃／占領回帰を維持する
+- [x] B-202. Plan予実をmission target限定累計からPlanId付き生産Entityの全戦闘累計へ修正し、局地対象切替とrevision前後を含む攻撃・撃破・与損害・反撃損害をDeployment合計と一致させる
+- [x] B-203. map_3 / Hex / seed 42 / V3先攻・V4後攻を10ターン追試する。V4配備戦力は7攻撃・0撃破・与4,440／反撃11,160から、最終安定版の単戦で10攻撃・4撃破・与9,260／反撃12,575へ改善し、Plan 2予実も同値へ一致した。現在任務対象外への局地切替は4回、全体ROIは0.56から0.78へ改善したがV3の1.29には未達。V4のT10は16施設・収入26,000・ZOC 127で、戦闘効率を経済・領域進捗へ接続する課題は残る
 - [x] B-138. Combat plannerの固定最大5生産を撤回し、探索期間内のfacility-turn数から探索深さを導出する。敵増援へ生産手番・移動ETA由来の`available_turn`を与え、手番別の敵到着HP・敵HP除去・自軍HP損耗・攻撃回数をtraceへ出す
 - [x] B-139. map_3 / Hex / seed 42 / 5ターンをV3/V4両席で短期追試し、V4が両席14拠点・収入23,000、T3–5に戦闘機／戦闘ヘリ生産、予測増援の計画算入を確認する。V3両席勝利とV4平均思考2,146msは未達として残す
 - [x] B-140. 固定`排除+2ターン`の占領予測を撤回し、実campaignのPickup/Transit/Drop、cargo位置、Capture距離から得た`friendly_capture_eta`をCombat planへ接続する。輸送編成が無い場合は`occupation_turn = None`として未実行の占領を完了予測しない

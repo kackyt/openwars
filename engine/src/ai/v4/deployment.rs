@@ -118,6 +118,33 @@ pub struct DeploymentAuditRecord {
     pub plan_step: Option<PlanStepRef>,
 }
 
+/// PlanId単位の予実へ戻す、当該生産Entityの全戦闘実績。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PlanCombatActuals {
+    pub first_attack_turn: Option<u32>,
+    pub attack_count: u32,
+    pub priority_attack_count: u32,
+    pub kill_count: u32,
+    pub damage_value_dealt: u32,
+    pub counter_value_received: u32,
+    pub destroyed_value: u32,
+}
+
+impl DeploymentAuditRecord {
+    /// 現在標的だけでなく、同一作戦圏内で切り替えた標的への攻撃も予実へ含める。
+    pub(crate) fn plan_combat_actuals(&self) -> PlanCombatActuals {
+        PlanCombatActuals {
+            first_attack_turn: self.first_attack_turn,
+            attack_count: self.attack_count,
+            priority_attack_count: self.priority_attack_count,
+            kill_count: self.kill_count,
+            damage_value_dealt: self.damage_value_dealt,
+            counter_value_received: self.counter_value_received,
+            destroyed_value: self.destroyed_value,
+        }
+    }
+}
+
 /// Combat見積へ渡す、既存EntityのPlan所有権と現在の対象集合。
 #[derive(Debug, Clone)]
 pub(crate) struct ActiveTargetAssignment {
@@ -1014,6 +1041,19 @@ mod tests {
         assert_eq!(record.damage_value_dealt, 1_000);
         assert_eq!(record.counter_value_received, 100);
         assert_eq!(record.destroyed_value, 5_000);
+        assert_eq!(
+            record.plan_combat_actuals(),
+            PlanCombatActuals {
+                first_attack_turn: Some(5),
+                attack_count: 2,
+                priority_attack_count: 1,
+                kill_count: 1,
+                damage_value_dealt: 1_000,
+                counter_value_received: 100,
+                destroyed_value: 5_000,
+            },
+            "Plan予実は現在標的以外へ切り替えた2回目の攻撃も含む"
+        );
     }
 
     fn combat_stats(unit_type: UnitType, can_capture: bool, max_cargo: u32) -> UnitStats {

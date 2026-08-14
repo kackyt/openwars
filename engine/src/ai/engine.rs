@@ -855,10 +855,11 @@ pub fn decide_ai_action(
                 );
                 for target_entity in targets {
                     // カミカゼアタック（無謀な攻撃）の回避
-                    if crate::ai::pruning::is_suicidal_attack(
+                    if crate::ai::pruning::is_suicidal_attack_at(
                         world,
                         unit_entity,
                         target_entity,
+                        current_grid,
                         &damage_chart,
                     ) {
                         continue;
@@ -876,8 +877,7 @@ pub fn decide_ai_action(
                             .get_terrain(t_pos.x, t_pos.y)
                             .unwrap_or(crate::resources::Terrain::Plains);
                         let def_bonus = registry.get_terrain_defense_bonus(t_terrain);
-                        let dist = (current_grid.x as i64 - t_pos.x as i64).unsigned_abs() as u32
-                            + (current_grid.y as i64 - t_pos.y as i64).unsigned_abs() as u32;
+                        let dist = map.distance(current_grid.x, current_grid.y, t_pos.x, t_pos.y);
 
                         // ターゲットへのダメージ予測
                         let expected_actual_damage = get_expected_damage(
@@ -1851,12 +1851,16 @@ const AMBUSH_TOO_CLOSE_PENALTY: i32 = 3000;
 /// #45 (V3): 待ち受けゾーンとみなす最大射程からのマージン (敵の接近を想定)
 const AMBUSH_APPROACH_MARGIN: u32 = 2;
 
-/// 通常スコアとは別軸で、生産目的から接続された攻撃だけを優先する。
+/// 通常スコアとは別軸で、作戦上必要な不利交換と戦術的に有利な攻撃を順序付ける。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ActionPriority {
     Normal,
-    /// V4の生産目的から接続された局地任務の敵を、通常の好機標的より先に攻撃する。
-    DeploymentTargetNeutralization,
+    /// 作戦パッケージが実行段階にあり、他に有利な局地標的がない場合の必要攻撃。
+    StrategicTargetFallback,
+    /// 同じ作戦圏内で見つけた、現在兵種と相性のよい敵への攻撃。
+    FavorableLocalTarget,
+    /// 作戦対象そのものとの相性もよい攻撃。
+    FavorableStrategicTarget,
 }
 
 #[derive(Debug, Clone)]
@@ -1992,10 +1996,12 @@ pub fn decide_ai_action_v2(
         .cloned()
         .unwrap_or_default();
     let mut unit_squad_targets = HashMap::new();
+    let mut unit_squad_missions = HashMap::new();
     let mut solo_fallbacks = HashSet::new();
 
     for squad in &manager.squads {
         for &member in &squad.members {
+            unit_squad_missions.insert(member, squad.mission_type.clone());
             if let Some(target) = squad.target {
                 unit_squad_targets.insert(member, target);
             }
@@ -2126,6 +2132,16 @@ pub fn decide_ai_action_v2(
         );
 
         let squad_target = unit_squad_targets.get(&unit_entity).copied();
+        let has_offensive_mission = unit_squad_missions
+            .get(&unit_entity)
+            .is_some_and(|mission| {
+                matches!(
+                    mission,
+                    crate::ai::squad::MissionType::Attack
+                        | crate::ai::squad::MissionType::Capture
+                        | crate::ai::squad::MissionType::Transport
+                )
+            });
         let initial_is_solo = solo_fallbacks.contains(&unit_entity) || squad_target.is_none();
 
         // 評価ロジック（is_solo: initial_is_solo を直接使う）
@@ -2626,14 +2642,15 @@ pub fn decide_ai_action_v2(
                     }) {
                         continue;
                     }
-                    if crate::ai::pruning::is_suicidal_attack(
+                    let Some(exchange) = crate::ai::pruning::evaluate_attack_exchange(
                         world,
                         unit_entity,
                         target_entity,
+                        current_grid,
                         &damage_chart,
-                    ) {
+                    ) else {
                         continue;
-                    }
+                    };
 
                     // ターゲットの詳細を取得してスコアを加点
                     if let (Some(t_stats), Some(t_health), Some(t_pos), Some(t_faction)) = (
@@ -2642,25 +2659,8 @@ pub fn decide_ai_action_v2(
                         world.get::<GridPosition>(target_entity),
                         world.get::<Faction>(target_entity),
                     ) {
-                        // 撃破判定・ダメージ期待値の算出
-                        let t_terrain = map
-                            .get_terrain(t_pos.x, t_pos.y)
-                            .unwrap_or(crate::resources::Terrain::Plains);
-                        let def_bonus = registry.get_terrain_defense_bonus(t_terrain);
-                        let dist = (current_grid.x as i64 - t_pos.x as i64).unsigned_abs() as u32
-                            + (current_grid.y as i64 - t_pos.y as i64).unsigned_abs() as u32;
-
-                        let expected_actual_damage = crate::systems::combat::get_expected_damage(
-                            &stats,
-                            atk_hp,
-                            atk_ammo,
-                            t_stats,
-                            def_bonus,
-                            dist,
-                            &registry,
-                            &damage_chart,
-                            false,
-                        );
+                        // 撃破判定・ダメージ期待値は、移動後位置を渡した交換予測を正本とする。
+                        let expected_actual_damage = exchange.expected_damage;
 
                         // 期待ダメージが0の場合は攻撃候補から外す
                         if expected_actual_damage == 0 {
@@ -2679,6 +2679,9 @@ pub fn decide_ai_action_v2(
                         );
                         let damage_val = expected_actual_damage.saturating_mul(target_value) / 100;
                         attack_score += damage_val as i32;
+                        // 金額ROIを禁止条件にはしない。同じ作戦島で複数の敵を撃てる場合だけ、
+                        // 双方のHP損耗率差を使って相性のよい対象へ戦術的に切り替える。
+                        attack_score += exchange.matchup_margin() / 2;
 
                         if is_combat_ineffective && expected_actual_damage < t_health.current {
                             attack_score -= 3000;
@@ -2689,10 +2692,26 @@ pub fn decide_ai_action_v2(
                         }
 
                         let score = base_tile_score + attack_score;
-                        let priority = if deployment_target == Some(target_entity) {
-                            ActionPriority::DeploymentTargetNeutralization
-                        } else {
-                            ActionPriority::Normal
+                        // V4はEntity単位のdeployment target、V2/V3は攻勢Squad自体を
+                        // 戦略上の必要性として扱う。上陸cargoはSquad再編の境界でCapture、
+                        // Transport、Attackのいずれにもなり得るため、その差で必要攻撃を
+                        // 非決定的に枝刈りしてはならない。
+                        let is_strategic_target = deployment_target
+                            .map_or(has_offensive_mission, |target| target == target_entity);
+                        let has_strategic_mission =
+                            deployment_target.is_some() || has_offensive_mission;
+                        let priority = match (is_strategic_target, exchange.is_favorable_matchup())
+                        {
+                            (true, true) => ActionPriority::FavorableStrategicTarget,
+                            (false, true) if has_strategic_mission => {
+                                ActionPriority::FavorableLocalTarget
+                            }
+                            // 生産・集結を終えてExecuteとなった作戦Entityは、他に有利な敵が
+                            // いない場合だけ不利交換も受容する。ROIだけで戦略を停止しない。
+                            (true, false) => ActionPriority::StrategicTargetFallback,
+                            // 作戦上の必要性がない不利交換は、従来どおり候補外とする。
+                            (false, false) => continue,
+                            (false, true) => ActionPriority::Normal,
                         };
                         let rank = (priority, score);
                         if rank > best_unit_rank {
@@ -4802,6 +4821,82 @@ mod tests {
             action,
             AiCommand::Attack { target_entity, .. }
                 if target_entity == assigned_target && target_entity != generic_high_value_target
+        ));
+    }
+
+    #[test]
+    fn v4_switches_from_bad_mission_matchup_to_favorable_local_target() {
+        let (mut world, attacker, bad_mission_target, favorable_local_target) =
+            setup_strategic_target_selection_world();
+        let mut damage_chart = DamageChart::new();
+        damage_chart.insert_damage(UnitType::Fighter, UnitType::TransportHelicopter, 10);
+        damage_chart.insert_secondary_damage(UnitType::Fighter, UnitType::TransportHelicopter, 10);
+        damage_chart.insert_damage(UnitType::TransportHelicopter, UnitType::Fighter, 90);
+        damage_chart.insert_secondary_damage(UnitType::TransportHelicopter, UnitType::Fighter, 90);
+        damage_chart.insert_damage(UnitType::Fighter, UnitType::Bcopters, 80);
+        damage_chart.insert_secondary_damage(UnitType::Fighter, UnitType::Bcopters, 80);
+        damage_chart.insert_damage(UnitType::Bcopters, UnitType::Fighter, 0);
+        damage_chart.insert_secondary_damage(UnitType::Bcopters, UnitType::Fighter, 0);
+        world.insert_resource(damage_chart);
+        world
+            .get_mut::<UnitStats>(favorable_local_target)
+            .expect("局地標的の能力")
+            .unit_type = UnitType::Bcopters;
+
+        let mut deployments = crate::ai::v4::deployment::V4DeploymentRegistry::default();
+        deployments.assign_target_for_test(PlayerId(1), attacker, bad_mission_target);
+        world.insert_resource(deployments);
+
+        let (_, action) = decide_ai_action_v2(&mut world, PlayerId(1), &HashSet::new())
+            .expect("V4の局地任務ユニットが攻撃行動を選ぶこと");
+
+        assert!(
+            matches!(
+                action,
+                AiCommand::Attack { target_entity, .. }
+                    if target_entity == favorable_local_target
+                        && target_entity != bad_mission_target
+            ),
+            "選択={action:?}, bad={:?}, favorable={:?}",
+            crate::ai::pruning::evaluate_attack_exchange(
+                &world,
+                attacker,
+                bad_mission_target,
+                GridPosition { x: 1, y: 0 },
+                world.resource::<DamageChart>(),
+            ),
+            crate::ai::pruning::evaluate_attack_exchange(
+                &world,
+                attacker,
+                favorable_local_target,
+                GridPosition { x: 1, y: 0 },
+                world.resource::<DamageChart>(),
+            )
+        );
+    }
+
+    #[test]
+    fn v4_keeps_necessary_bad_exchange_when_no_favorable_target_exists() {
+        let (mut world, attacker, bad_mission_target, other_target) =
+            setup_strategic_target_selection_world();
+        world.despawn(other_target);
+        let mut damage_chart = DamageChart::new();
+        damage_chart.insert_damage(UnitType::Fighter, UnitType::TransportHelicopter, 10);
+        damage_chart.insert_secondary_damage(UnitType::Fighter, UnitType::TransportHelicopter, 10);
+        damage_chart.insert_damage(UnitType::TransportHelicopter, UnitType::Fighter, 90);
+        damage_chart.insert_secondary_damage(UnitType::TransportHelicopter, UnitType::Fighter, 90);
+        world.insert_resource(damage_chart);
+
+        let mut deployments = crate::ai::v4::deployment::V4DeploymentRegistry::default();
+        deployments.assign_target_for_test(PlayerId(1), attacker, bad_mission_target);
+        world.insert_resource(deployments);
+
+        let (_, action) = decide_ai_action_v2(&mut world, PlayerId(1), &HashSet::new())
+            .expect("実行段階の作戦対象には必要攻撃を選ぶこと");
+
+        assert!(matches!(
+            action,
+            AiCommand::Attack { target_entity, .. } if target_entity == bad_mission_target
         ));
     }
 

@@ -9,47 +9,88 @@ pub fn is_overflow_merge_without_refund(source_current: u32, target: Health) -> 
     source_current.saturating_add(target.current) > target.max
 }
 
-/// 攻撃行動が無謀（カミカゼアタック）かどうかを判定します。
-/// 敵に与える被害価値よりも、反撃で受ける被害価値のほうが大きければ無謀とみなします。
-pub fn is_suicidal_attack(
-    world: &mut World,
+/// 移動後の射撃位置から求めた、1回の攻撃交換予測。
+///
+/// 金額価値は予実監査用であり、攻撃を一律禁止する条件には使わない。戦術的な相性は
+/// 双方の最大HPに対する損耗率で比較し、高価な戦略兵器を必要な攻撃から排除しない。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AttackExchange {
+    pub expected_damage: u32,
+    pub expected_counter_damage: u32,
+    pub damage_value_dealt: u32,
+    pub counter_value_received: u32,
+    pub enemy_loss_permyriad: u32,
+    pub friendly_loss_permyriad: u32,
+}
+
+impl AttackExchange {
+    /// 対象の損耗率が自軍の反撃損耗率以上なら、当該兵種の相性は不利ではない。
+    pub fn is_favorable_matchup(self) -> bool {
+        self.enemy_loss_permyriad >= self.friendly_loss_permyriad
+    }
+
+    /// 行動スコアへ加える相性差。±10,000へ収まるため、戦略価値とは別軸で扱える。
+    pub fn matchup_margin(self) -> i32 {
+        self.enemy_loss_permyriad as i32 - self.friendly_loss_permyriad as i32
+    }
+
+    /// 旧AIが用いる保守的な交換価値判定。V4の作戦Entityには一律禁止として使わない。
+    pub fn loses_more_value_than_it_deals(self) -> bool {
+        self.counter_value_received > self.damage_value_dealt
+    }
+}
+
+/// 敵Entityに対する攻撃を、候補となる移動後位置から評価する。
+///
+/// 攻撃対象は常にEntityであり、`attacker_position` は射程・反撃・攻撃側地形を
+/// 正しく求めるためだけに渡す。これによりmove-and-attackを移動前座標で誤判定しない。
+pub fn evaluate_attack_exchange(
+    world: &World,
     attacker_entity: Entity,
     defender_entity: Entity,
+    attacker_position: GridPosition,
     damage_chart: &DamageChart,
-) -> bool {
-    let mut expected_damage_value = 0;
-    let mut expected_self_damage_value = 0;
-
-    let map = world.resource::<Map>().clone();
-    let registry = world.resource::<MasterDataRegistry>().clone();
+) -> Option<AttackExchange> {
+    let map = world.get_resource::<Map>()?;
+    let registry = world.get_resource::<MasterDataRegistry>()?;
 
     if let (
-        Some((atk_hp, atk_max, atk_stats, atk_pos, atk_ammo)),
+        Some((atk_hp, atk_max, atk_stats, atk_ammo)),
         Some((def_hp, def_max, def_stats, def_pos, def_ammo)),
-    ) = {
-        let mut query = world.query::<(&Health, &UnitStats, &GridPosition, Option<&Ammo>)>();
-        let atk = query.get(world, attacker_entity).ok().map(|(h, s, p, a)| {
-            (
-                h.current,
-                h.max,
-                s.clone(),
-                *p,
-                a.map(|am| (am.ammo1, am.ammo2)).unwrap_or((99, 99)),
-            )
-        });
-        let def = query.get(world, defender_entity).ok().map(|(h, s, p, a)| {
-            (
-                h.current,
-                h.max,
-                s.clone(),
-                *p,
-                a.map(|am| (am.ammo1, am.ammo2)).unwrap_or((99, 99)),
-            )
-        });
-        (atk, def)
-    } {
+    ) = (
+        world
+            .get::<Health>(attacker_entity)
+            .zip(world.get::<UnitStats>(attacker_entity))
+            .map(|(h, s)| {
+                (
+                    h.current,
+                    h.max,
+                    s.clone(),
+                    world
+                        .get::<Ammo>(attacker_entity)
+                        .map(|ammo| (ammo.ammo1, ammo.ammo2))
+                        .unwrap_or((99, 99)),
+                )
+            }),
+        world
+            .get::<Health>(defender_entity)
+            .zip(world.get::<UnitStats>(defender_entity))
+            .zip(world.get::<GridPosition>(defender_entity))
+            .map(|((h, s), p)| {
+                (
+                    h.current,
+                    h.max,
+                    s.clone(),
+                    *p,
+                    world
+                        .get::<Ammo>(defender_entity)
+                        .map(|ammo| (ammo.ammo1, ammo.ammo2))
+                        .unwrap_or((99, 99)),
+                )
+            }),
+    ) {
         if def_max == 0 || atk_max == 0 {
-            return false;
+            return None;
         }
 
         // 地形防御ボーナスの取得
@@ -58,12 +99,16 @@ pub fn is_suicidal_attack(
             .unwrap_or(crate::resources::Terrain::Plains);
         let def_bonus = registry.get_terrain_defense_bonus(def_terrain);
         let atk_terrain = map
-            .get_terrain(atk_pos.x, atk_pos.y)
+            .get_terrain(attacker_position.x, attacker_position.y)
             .unwrap_or(crate::resources::Terrain::Plains);
         let atk_bonus = registry.get_terrain_defense_bonus(atk_terrain);
 
-        let dist = (atk_pos.x as i64 - def_pos.x as i64).unsigned_abs() as u32
-            + (atk_pos.y as i64 - def_pos.y as i64).unsigned_abs() as u32;
+        let dist = map.distance(
+            attacker_position.x,
+            attacker_position.y,
+            def_pos.x,
+            def_pos.y,
+        );
 
         // 与えるダメージの予測 (+5 は乱数期待値)
         let expected_damage_to_enemy = get_detailed_expected_damage(
@@ -73,7 +118,7 @@ pub fn is_suicidal_attack(
             &def_stats,
             def_bonus,
             dist,
-            &registry,
+            registry,
             damage_chart,
             false,
         )
@@ -82,8 +127,7 @@ pub fn is_suicidal_attack(
         let actual_damage_to_enemy = std::cmp::min(expected_damage_to_enemy, def_hp);
 
         // 与える被害価値
-        expected_damage_value =
-            (actual_damage_to_enemy as i32 * def_stats.cost as i32) / def_max as i32;
+        let expected_damage_value = actual_damage_to_enemy.saturating_mul(def_stats.cost) / def_max;
 
         // 反撃ダメージの予測（戦闘は同時解決のため撃破予定でも反撃する）
         // 反撃判定: 攻撃側が間接攻撃武器を選択していない場合のみ反撃が発生する
@@ -94,7 +138,7 @@ pub fn is_suicidal_attack(
             &def_stats,
             def_bonus,
             dist,
-            &registry,
+            registry,
             damage_chart,
             false,
         );
@@ -108,7 +152,7 @@ pub fn is_suicidal_attack(
                 &atk_stats,
                 atk_bonus,
                 dist,
-                &registry,
+                registry,
                 damage_chart,
                 true,
             )
@@ -117,14 +161,47 @@ pub fn is_suicidal_attack(
             let actual_counter_damage = std::cmp::min(expected_counter_damage, atk_hp);
 
             // 受ける被害価値
-            expected_self_damage_value =
-                (actual_counter_damage as i32 * atk_stats.cost as i32) / atk_max as i32;
+            let expected_self_damage_value =
+                actual_counter_damage.saturating_mul(atk_stats.cost) / atk_max;
+            return Some(AttackExchange {
+                expected_damage: actual_damage_to_enemy,
+                expected_counter_damage: actual_counter_damage,
+                damage_value_dealt: expected_damage_value,
+                counter_value_received: expected_self_damage_value,
+                enemy_loss_permyriad: actual_damage_to_enemy.saturating_mul(10_000) / def_max,
+                friendly_loss_permyriad: actual_counter_damage.saturating_mul(10_000) / atk_max,
+            });
         }
+
+        return Some(AttackExchange {
+            expected_damage: actual_damage_to_enemy,
+            expected_counter_damage: 0,
+            damage_value_dealt: expected_damage_value,
+            counter_value_received: 0,
+            enemy_loss_permyriad: actual_damage_to_enemy.saturating_mul(10_000) / def_max,
+            friendly_loss_permyriad: 0,
+        });
     }
 
-    // 被害価値の比較。
-    // 仕様書に基づき、敵へ与える被害価値よりも、反撃で受ける被害価値のほうが大きい場合に無謀と判定します。
-    expected_self_damage_value > expected_damage_value
+    None
+}
+
+/// 旧AI向けの保守的な枝刈り。移動後位置を必ず明示する。
+pub fn is_suicidal_attack_at(
+    world: &World,
+    attacker_entity: Entity,
+    defender_entity: Entity,
+    attacker_position: GridPosition,
+    damage_chart: &DamageChart,
+) -> bool {
+    evaluate_attack_exchange(
+        world,
+        attacker_entity,
+        defender_entity,
+        attacker_position,
+        damage_chart,
+    )
+    .is_some_and(AttackExchange::loses_more_value_than_it_deals)
 }
 
 #[cfg(test)]
@@ -230,17 +307,41 @@ mod tests {
         let dc = world.resource::<DamageChart>().clone();
 
         // 1. Infantry attacking Tank is suicidal
-        assert!(is_suicidal_attack(&mut world, infantry, tank, &dc));
+        assert!(is_suicidal_attack_at(
+            &world,
+            infantry,
+            tank,
+            GridPosition { x: 0, y: 0 },
+            &dc
+        ));
 
         // 2. Artillery attacking Tank is NOT suicidal
-        assert!(!is_suicidal_attack(&mut world, artillery, tank, &dc));
+        assert!(!is_suicidal_attack_at(
+            &world,
+            artillery,
+            tank,
+            GridPosition { x: 2, y: 0 },
+            &dc
+        ));
 
         // 3. Tank attacking Infantry is NOT suicidal
-        assert!(!is_suicidal_attack(&mut world, tank, infantry, &dc));
+        assert!(!is_suicidal_attack_at(
+            &world,
+            tank,
+            infantry,
+            GridPosition { x: 1, y: 0 },
+            &dc
+        ));
 
         // 4. Missing components -> not suicidal (returns false gracefully)
         let empty_entity = world.spawn_empty().id();
-        assert!(!is_suicidal_attack(&mut world, empty_entity, tank, &dc));
+        assert!(!is_suicidal_attack_at(
+            &world,
+            empty_entity,
+            tank,
+            GridPosition { x: 0, y: 0 },
+            &dc
+        ));
 
         // 5. Zero max hp -> safely ignored (returns false)
         let bugged_unit = world
@@ -258,6 +359,73 @@ mod tests {
                 GridPosition { x: 0, y: 1 },
             ))
             .id();
-        assert!(!is_suicidal_attack(&mut world, bugged_unit, tank, &dc));
+        assert!(!is_suicidal_attack_at(
+            &world,
+            bugged_unit,
+            tank,
+            GridPosition { x: 0, y: 1 },
+            &dc
+        ));
+    }
+
+    #[test]
+    fn exchange_uses_hex_distance_from_post_move_position() {
+        let mut world = World::new();
+        let mut damage_chart = DamageChart::new();
+        damage_chart.insert_damage(UnitType::Tank, UnitType::Infantry, 50);
+        damage_chart.insert_damage(UnitType::Infantry, UnitType::Tank, 0);
+        world.insert_resource(Map {
+            width: 4,
+            height: 4,
+            tiles: vec![crate::resources::Terrain::Plains; 16],
+            topology: crate::resources::GridTopology::Hex,
+        });
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+        let attacker = world
+            .spawn((
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    cost: 7_000,
+                    min_range: 1,
+                    max_range: 1,
+                    ..UnitStats::mock()
+                },
+                // 実Entityはまだ移動前。交換予測はこの座標を参照してはならない。
+                GridPosition { x: 0, y: 0 },
+            ))
+            .id();
+        let defender = world
+            .spawn((
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    cost: 1_000,
+                    min_range: 1,
+                    max_range: 1,
+                    ..UnitStats::mock()
+                },
+                GridPosition { x: 1, y: 2 },
+            ))
+            .id();
+
+        let exchange = evaluate_attack_exchange(
+            &world,
+            attacker,
+            defender,
+            GridPosition { x: 0, y: 1 },
+            &damage_chart,
+        )
+        .expect("hexでは(0,1)と(1,2)が隣接し、移動後攻撃を評価できること");
+
+        assert!(exchange.expected_damage > 0);
+        // combat期待値は乱数期待の+5を含むため、基礎ダメージ0の反撃は5に留まる。
+        assert_eq!(exchange.expected_counter_damage, 5);
     }
 }

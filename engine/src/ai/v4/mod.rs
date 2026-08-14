@@ -478,6 +478,7 @@ fn observe_plan_execution(world: &mut World, player_id: PlayerId, turn: u32) {
         .into_iter()
         .filter_map(|record| {
             let plan_step = record.plan_step?;
+            let combat_actuals = record.plan_combat_actuals();
             let unit_cost = unit_costs.get(&record.unit_type).copied().unwrap_or(0);
             let health = world.get::<Health>(record.entity).copied();
             let alive =
@@ -495,15 +496,16 @@ fn observe_plan_execution(world: &mut World, player_id: PlayerId, turn: u32) {
                 // 実行中の戦力として数えない。Defense待機はSquadを持つため残る。
                 mission_active: alive && record.active && record.squad_id.is_some(),
                 current_loss_value,
-                // 上位作戦へ一時転用中の戦闘を、このPlanの攻撃・損耗実績へ
-                // 混入させない。現在のPlan任務targetに対する実績だけを戻す。
-                first_attack_turn: record.mission_target_first_attack_turn,
-                attack_count: record.mission_target_attack_count,
-                priority_attack_count: record.priority_attack_count,
-                kill_count: record.mission_target_kill_count,
-                damage_value_dealt: record.mission_target_damage_value_dealt,
-                counter_value_received: record.mission_target_counter_value_received,
-                destroyed_value: record.mission_target_destroyed_value,
+                // PlanIdを持つ生産Entityの全戦闘を、そのPlanの実績へ一度だけ戻す。
+                // 「現在標的だけ」に絞ると、同一作戦圏内の好機標的へ切り替えた攻撃や、
+                // revisionで標的が変わる前の戦闘が予実から欠落する。
+                first_attack_turn: combat_actuals.first_attack_turn,
+                attack_count: combat_actuals.attack_count,
+                priority_attack_count: combat_actuals.priority_attack_count,
+                kill_count: combat_actuals.kill_count,
+                damage_value_dealt: combat_actuals.damage_value_dealt,
+                counter_value_received: combat_actuals.counter_value_received,
+                destroyed_value: combat_actuals.destroyed_value,
             })
         })
         .collect::<Vec<_>>();
