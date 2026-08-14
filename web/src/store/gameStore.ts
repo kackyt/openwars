@@ -171,7 +171,7 @@ export interface GameState {
 
 export const useGameStore = create<GameState>((set, get) => ({
   appState: "menu",
-  topology: "square",
+  topology: "hex",
   playerSettings: createDefaultPlayerSettings(),
   isEngineReady: false,
   engineWorker: null,

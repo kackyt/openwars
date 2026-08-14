@@ -49,24 +49,24 @@ describe("EngineWorker player AI versions", () => {
   it("applies both player versions immediately after construction", async () => {
     const worker = new EngineWorker();
 
-    await worker.init("map_1", "square", { 1: "V1", 2: "V3" });
+    await worker.init("map_1", "square", { 1: "V1", 2: "V4" });
 
     expect(wasmMocks.constructor).toHaveBeenCalledWith("map_1", "square");
     expect(wasmMocks.setPlayerAiVersion).toHaveBeenNthCalledWith(1, 1, "V1");
-    expect(wasmMocks.setPlayerAiVersion).toHaveBeenNthCalledWith(2, 2, "V3");
+    expect(wasmMocks.setPlayerAiVersion).toHaveBeenNthCalledWith(2, 2, "V4");
   });
 
-  it("normalizes a loaded V2 and reapplies selectable versions", async () => {
+  it("normalizes a loaded V2 and reapplies selectable versions including V4", async () => {
     const worker = new EngineWorker();
     await worker.init("map_1", "square", { 1: "V3", 2: "V3" });
     wasmMocks.setPlayerAiVersion.mockClear();
-    wasmMocks.getPlayerAiVersions.mockReturnValue(JSON.stringify({ 1: "V2", 2: "V1" }));
+    wasmMocks.getPlayerAiVersions.mockReturnValue(JSON.stringify({ 1: "V2", 2: "V4" }));
 
     const versions = await worker.reapplyNormalizedPlayerAiVersions();
 
-    expect(versions).toEqual({ 1: "V3", 2: "V1" });
+    expect(versions).toEqual({ 1: "V3", 2: "V4" });
     expect(wasmMocks.setPlayerAiVersion).toHaveBeenNthCalledWith(1, 1, "V3");
-    expect(wasmMocks.setPlayerAiVersion).toHaveBeenNthCalledWith(2, 2, "V1");
+    expect(wasmMocks.setPlayerAiVersion).toHaveBeenNthCalledWith(2, 2, "V4");
   });
 });
 

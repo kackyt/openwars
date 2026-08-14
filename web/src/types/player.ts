@@ -1,10 +1,10 @@
 import { PHASE_P1, PHASE_P2 } from "../constants/mappings";
 
 export type PlayerId = 1 | 2;
-export type WebAiVersion = "V1" | "V3";
+export type WebAiVersion = "V1" | "V3" | "V4";
 export type LoadedAiVersion = WebAiVersion | "V2";
 export type PlayerControlMode = "human" | "ai";
-export type PlayerMenuValue = "Human" | "AI V1" | "AI V3";
+export type PlayerMenuValue = "Human" | "AI V1" | "AI V3" | "AI V4";
 
 export interface PlayerSetting {
   controlMode: PlayerControlMode;
@@ -17,11 +17,11 @@ export type WorkerPlayerAiVersionsDto = Record<PlayerId, WebAiVersion>;
 export type LoadedPlayerAiVersionsDto = Record<string, LoadedAiVersion | undefined>;
 
 export const PLAYER_IDS: readonly PlayerId[] = [1, 2];
-export const PLAYER_MENU_OPTIONS: readonly PlayerMenuValue[] = ["Human", "AI V1", "AI V3"];
+export const PLAYER_MENU_OPTIONS: readonly PlayerMenuValue[] = ["Human", "AI V1", "AI V3", "AI V4"];
 
 export const createDefaultPlayerSettings = (): PlayerSettings => ({
-  1: { controlMode: "human", aiVersion: "V3" },
-  2: { controlMode: "ai", aiVersion: "V3" },
+  1: { controlMode: "human", aiVersion: "V4" },
+  2: { controlMode: "ai", aiVersion: "V4" },
 });
 
 export const toWorkerPlayerAiVersions = (
@@ -31,8 +31,11 @@ export const toWorkerPlayerAiVersions = (
   2: playerSettings[2].aiVersion,
 });
 
-export const normalizeLoadedAiVersion = (version: LoadedAiVersion | undefined): WebAiVersion =>
-  version === "V1" ? "V1" : "V3";
+export const normalizeLoadedAiVersion = (version: LoadedAiVersion | undefined): WebAiVersion => {
+  if (version === "V1") return "V1";
+  if (version === "V4") return "V4";
+  return "V3";
+};
 
 export const normalizeLoadedPlayerAiVersions = (
   versions: LoadedPlayerAiVersionsDto,
@@ -55,7 +58,9 @@ export const isAiPhase = (phase: string | undefined, playerSettings: PlayerSetti
 
 export const toPlayerMenuValue = (setting: PlayerSetting): PlayerMenuValue => {
   if (setting.controlMode === "human") return "Human";
-  return setting.aiVersion === "V1" ? "AI V1" : "AI V3";
+  if (setting.aiVersion === "V1") return "AI V1";
+  if (setting.aiVersion === "V4") return "AI V4";
+  return "AI V3";
 };
 
 export const applyPlayerMenuValue = (
@@ -66,8 +71,11 @@ export const applyPlayerMenuValue = (
     // Humanへ切り替えても、最後に選んだAIバージョンは忘れない。
     return { ...current, controlMode: "human" };
   }
+  let aiVersion: WebAiVersion = "V3";
+  if (value === "AI V1") aiVersion = "V1";
+  else if (value === "AI V4") aiVersion = "V4";
   return {
     controlMode: "ai",
-    aiVersion: value === "AI V1" ? "V1" : "V3",
+    aiVersion,
   };
 };
