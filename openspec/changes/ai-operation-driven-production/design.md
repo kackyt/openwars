@@ -487,7 +487,7 @@ Assaultの輸送要求は固定の `Lander + TransportHelicopter` ではなく�
 
 `Expand` / `Secure` / `Contest` / `Reinforce`の輸送便は逐次発進を許可する。島全体の`operation_ready`が未達でも、Formingに実輸送役と互換cargoが揃った時点で、輸送容量ごとの実行可能な便を`Pickup`へ昇格する。容量外のcargoと未使用輸送役は同じ島の後続`Forming`に残す。1体以上を実搭載済みで、残る割当cargoが現在の手番に同じ輸送役へ到達できない場合も、搭載済みcargoだけを`Transit`へ進め、未搭載cargoを後続`Forming`へ切り離す。後続は次のportfolio再評価で別の空輸送役または追加生産便へ再partitionする。`Assault`は作戦全体の優越戦力を分散到着させると各個撃破されるため、この部分発進を許可せず、輸送役ごとの完全manifestを待つ。
 
-購入不足を表す空`Forming` placeholderは作戦identityであり、存在確認だけで新しい割当を抑止してはならない。後の手番でportfolioへ割り当てられた輸送役とremote cargoを同じplaceholderへ追加入隊させる。Formingは複数輸送役を`members`へ保持し得るため、代表`transport_entity`だけでなく全members・cargoを汎用beam searchと緊急迎撃の候補から除外する。
+購入不足を表す空`Forming` placeholderは作戦identityであり、存在確認だけで新しい割当を抑止してはならない。後の手番でportfolioへ割り当てられた輸送役とremote cargoを同じplaceholderへ追加入隊させる。Formingは複数輸送役を`members`へ保持し得るため、代表`transport_entity`だけでなく全members・cargoを汎用beam searchと別作戦の重複割当候補から除外する。
 
 campaign shortfallの生産順序は作戦優先度を維持するが、高優先行を同一手番で完成できない理由が使用可能施設の欠如である場合、その残予算だけを保護して次の行を評価する。これにより、Secure用Factoryが埋まってもExpand用Airportは使用できる。一方、高優先行の未購入分に必要な資金は下位行へ流用せず、generic生産も従来どおりblockする。
 
@@ -510,13 +510,13 @@ campaign shortfallの生産順序は作戦優先度を維持するが、高優�
 
 ### Decision 19: 撃破枠の生産意図を実EntityのAttack任務まで保持する
 
-**選択**: V4汎用作戦のCombat/Intercept枠で生産を決めた時点に、作戦anchor、枠種別、および要求を発生させた優先敵Entity群をpending deploymentとして保持する。`UnitProducedEvent` の実Entityと生産施設・unit種別・発注順で照合し、次回のSquad計画では当該Entityを汎用 `free_combat_units` より先に予約する。優先敵が生存して到達可能なら、その現在位置を目標とするV4所有のAttack/Interception任務へ割り当てる。優先敵が消滅・到達不能になった場合だけ、同じ作戦anchor周辺の占領unit、輸送unit、その他戦闘unitの順に再目標化し、局地脅威が無ければpendingを解放する。
+**選択**: V4汎用作戦のCombat/Intercept枠で生産を決めた時点に、作戦anchor、枠種別、および要求を発生させた優先敵Entity群をpending deploymentとして保持する。`UnitProducedEvent` の実Entityと生産施設・unit種別・発注順で照合し、次回のSquad計画では当該Entityを汎用 `free_combat_units` より先に予約する。優先敵が生存して到達可能なら、その現在位置を目標とするV4所有のAttack任務へ割り当てる。Interceptionという別任務は生成しない。優先敵が消滅・到達不能になった場合だけ、同じ作戦anchor周辺の占領unit、輸送unit、その他戦闘unitの順に再目標化し、局地脅威が無ければpendingを解放する。
 
 この任務はbeam searchの汎用目標再選択から保護する一方、敵Entityの移動には現在位置を毎ターン再解決して追随する。生産時の相性判定と同じ到達可能性・有効打判定を任務側でも使用し、海を渡る前提で買った地上戦力には実輸送予約が無い限り自力到達任務を与えない。
 
 **実装**: `V4DeploymentRegistry` が手番・施設・unit種別・発注順を含むpending deploymentを保持し、`UnitProducedEvent` の実Entityへ決定的に照合する。Squad計画では局地任務Entityをcampaign再配分とgeneric free poolより先に予約し、beam searchからSquad IDを保護する。行動評価は座標だけでなく台帳の現在標的Entityを参照し、無謀攻撃の除外を維持したうえで通常の好機標的より優先する。優先敵が無効になった場合は作戦期限内の占領unit、輸送unit、その他敵の順にfallbackし、局地敵がなければ通常再編成へ解放する。
 
-**緊急迎撃との境界**: #74の中立拠点Interception自体は維持するが、中立拠点レースを理由にV4局地任務Entityをpreemptしてはならない。対象が自軍所有拠点である場合だけ、緊急迎撃が局地任務をpreemptできる。map_3の診断では、修正前に局地任務をpreemptした7件がすべて中立拠点（Airport 6件、City 1件、敵ETA 0〜2）で、自領危機は0件だったため、この境界を導入した。
+**防衛との境界（Decision 33で置換）**: 中立拠点レースはContest/Capture、所有拠点の防衛はDefenseとして同じcampaign portfolioへ入れる。局地Attackとは別にInterceptionを生成してEntityを横取りする方式は廃止する。
 
 **理由**: 現在の `ProductionStepTrace` は診断情報にすぎず、購入Entityへ作戦帰属を渡さない。生産された戦闘unitは次ターンにV3共通戦術の `free_combat_units` へ入り、最寄り敵cluster単位のAttack Squadへ最大3体ずつまとめられ、その後beam searchが敵全般・未所有拠点・敵首都から目標を再選択する。この経路では、V4生産が占領unit／輸送unitへ付けた戦略優先度が消える。
 
@@ -874,11 +874,11 @@ Decision 2 / 3 / 5 / 6 / 14 / 18a / 21 / 22にある金額撃破枠、護衛価�
 
 ### Decision 30: Entityごとの作戦所有権を単一の正本へ正規化する
 
-**問題**: campaign portfolio、前手番のRoadmap binding、生産時意図、緊急迎撃、deployment、汎用Squadがそれぞれ独立したEntity集合を持ち、各生成処理が局所的な予約集合だけを見ていた。同じEntityが別島のDefenseとOffense、または輸送SquadとAttack Squadへ同時に残り、後段の優先順位追加では別経路から再発した。作戦・行動ごとに全Squadを走査して重複を防ぐ方式は、行動候補数と作戦数の積で思考時間を増やす。
+**問題**: campaign portfolio、前手番のRoadmap binding、生産時意図、deployment、汎用Squadがそれぞれ独立したEntity集合を持ち、各生成処理が局所的な予約集合だけを見ていた。同じEntityが別島のDefenseとOffense、または輸送SquadとAttack Squadへ同時に残り、後段の優先順位追加では別経路から再発した。作戦・行動ごとに全Squadを走査して重複を防ぐ方式は、行動候補数と作戦数の積で思考時間を増やす。
 
-**選択**: `UnitOperationRegistry`をEntity割当の唯一の正本とし、`Entity -> UnitOperationAssignment`のHashMapと、`OperationOwner -> Entity集合`の逆引きを同時に保持する。`OperationOwner`は島campaign、緊急任務、独立した戦術Squadを区別し、assignmentは実行Squad、役割、割当手番を保持する。1つのcampaignが輸送・占領・戦闘の複数Squadを持つことは許すが、1つのEntityが所属できる作戦ownerと具体Squadはそれぞれ1件だけとする。
+**選択**: `UnitOperationRegistry`をEntity割当の唯一の正本とし、`Entity -> UnitOperationAssignment`のHashMapと、`OperationOwner -> Entity集合`の逆引きを同時に保持する。`OperationOwner`は島campaignと独立した戦術Squadを区別し、assignmentは実行Squad、役割、割当手番を保持する。1つのcampaignが輸送・占領・戦闘の複数Squadを持つことは許すが、1つのEntityが所属できる作戦ownerと具体Squadはそれぞれ1件だけとする。
 
-割当の変更はregistryの`assign`だけで行い、新ownerへの登録と旧owner逆引きからの除去を同時に行う。portfolio再計画は優先度順の先頭候補を明示的な移管先とし、同じplanning pass内の後続候補による横取りを拒否する。物理的に搭載中のcargoと有効な緊急迎撃は通常作戦より優先する。単なる古いSquadへの重複混入はcampaign間移管の根拠にしない。終了したcampaignは逆引きから所属EntityだけをO(k)で解放し、消滅Entityは生存Entity集合との照合で除去する。
+割当の変更はregistryの`assign`だけで行い、新ownerへの登録と旧owner逆引きからの除去を同時に行う。portfolio再計画は優先度順の先頭候補を明示的な移管先とし、同じplanning pass内の後続候補による横取りを拒否する。物理的に搭載中のcargoは通常の再割当候補から除外する。単なる古いSquadへの重複混入はcampaign間移管の根拠にしない。終了したcampaignは逆引きから所属EntityだけをO(k)で解放し、消滅Entityは生存Entity集合との照合で除去する。
 
 `plan_squads`は手番開始時に前手番の重複を1回、全任務構築後に当手番の重複を1回だけ正規化する。各正規化は自軍unitの生存確認O(U)、Squad参照の収集と不要参照除去O(R)であり、作戦数・行動候補数ごとの再走査を行わない。以後の所有者照会は平均O(1)、作戦終了時解放は当該作戦の所属数O(k)とする。traceには正本の割当Entity数、拒否した競合累計、直近正規化で訪問したSquad参照数を出し、一意性と計算量を監査可能にする。
 
@@ -913,6 +913,44 @@ Decision 2 / 3 / 5 / 6 / 14 / 18a / 21 / 22にある金額撃破枠、護衛価�
 **島全体の予実**: Planの戦術上の未所有施設集合は毎手番縮退してよいが、実績台帳の目的施設集合は同じ島作戦で一度でも対象となった施設の和集合とする。よって中央島が残り1施設になっても`0/1`へリセットせず`2/3`と記録し、全対象敵排除と`3/3`所有の両方でのみ完了する。
 
 **map_3予実**: Hex / seed 42 / V3先攻対V4後攻を17ターン追試した。中央島のPlan 2はT4作成後、状態がCapture／Contest／Reinforceへ変わっても同一PlanIdを維持した。T12は2/3施設、残敵2、累計生産64,500G、稼働5体、攻撃8、撃破1、与Damage 4,870、被Damage 13,330だった。T14に敵排除、T15に3/3占領を実測し、T14 revisionの予測（排除T18・占領T18）よりそれぞれ4・3手番早かった。T16に敵1体が再侵入したため島所有を維持したまま新しいReinforceへ移った。V4はT17時点で27施設・収入39,000、V3は25施設・37,000だったが、戦闘ROIはV4 0.61対V3 1.63、最大手番判定はV3勝利であり、中央島攻略の計算・実行・完了は確認した一方、最終的な戦闘効率と勝利は未達である。平均思考時間もV4 8,420.7msで、長期探索の性能改善を別課題として残す。
+
+### Decision 32: 兵站成立を首都攻略の認可遷移とし、局所的に集結・撤退する
+
+**問題**: 中央・右側の兵站島を確保しても、`AssaultCapital`は固定優先度最下位のまま局地Captureへ生産枠を譲り続けた。さらに首都Planは`Forming`中であることを理由に敵増援と実行期限超過を無視し、施設競合を毎手番`ProductionSlotDeferred`として繰り下げた。その結果、T15までPlan revision 0のまま3機しか生産せず、39残敵と60観測増援を持つ現在盤面に対して形成開始時の計画が残った。
+
+**認可遷移と再計画**: `StoredPlan`へ前回の`execution_authorized`を保持する。固定兵站Planの`selected_islands`が空になって認可がfalseからtrueへ変わった手番は、単なる継続判定をせず、現在の敵HP、増援、既存配属Entity、資金、生産施設から同じPlanIdのrevisionを必ず作る。形成中でも予定初攻撃・排除・占領時刻を超えた場合は`formation_must_replan`とし、敵増援と候補案を比較対象へ戻す。期限超過時は施設競合の繰り下げ分岐よりrevision判定を優先する。
+
+**実効優先度**: 生産枠の優先順位は固定`OperationKind`だけでなく作戦状態から求める。別種の緊急作戦は作らず、すべて同じ作戦集合で比較する。Defenseは接敵ETAが自軍展開リードタイム以内なら認可済みAssaultCapitalより上位、間に合うならその下位とする。Defenseは必要枠だけを取得し、首都Planや他作戦の要求を消去しない。これにより兵站喪失時の防衛を可能にしつつ、遠い脅威一つによる全攻勢停止を防ぐ。
+
+**第一波と発進gate**: 敵首都島の施設総数を第一波の占領役数へ直結させない。構造波は`min(未所有施設数, 3)`の並行占領役に、観測敵がいる場合だけ損耗交代1体を加える。戦闘戦力は価格やこの人数ではなくRolling Combat Planが決める。島assignmentの`operation_ready`は、固定兵站経路完了かつ認可後revisionの全生産step完了かつ戦闘計画実行可能の積で開く。いずれかが崩れた場合は首都assignmentだけを`Forming`へ戻し、局地CaptureとDefenseの命令は維持する。
+
+首都の構造波は兵站gate前からForming assignmentを持つため、兵站経路更新時の首都候補抽出から`existing_operation`を除外条件にしてはならない。この条件が残るとassignment成立後に兵站台帳の`last_observed_turn`が停止し、実際には全施設を所有しても`selected_islands`が永久に残る。既存assignmentの有無は作戦identityとして利用するが、固定経路の完了観測を止める理由にはしない。
+
+**検証**: 認可falseからtrueで同一PlanIdのrevisionが増え現在増援を取り込むこと、形成中の初攻撃期限超過が無期限deferではなくrevisionになること、認可済み首都攻略とDefenseが盤面由来の実効優先度で比較されること、全認可step生産後だけ発進gateが開くこと、首都第一波が最大3並行目的と交代1体になること、既存首都形成後も兵站観測候補に残ることを単体テストで固定した。
+
+map_3 / Hex / seed 42 / V3先攻・V4後攻を16ターン完走した。修正前は首都Forming成立後のT13で兵站観測が停止し、T16に島3を3/3、島6を5/5所有しても`selected_islands=[3,6]`だった。修正後は`last_observed_turn=16`まで進み、5/5所有の島6を経路から除外した。島3は敵の再占領により2/3、V4戦闘Entity 9対敵1でContest中だったため`selected_islands=[3]`、首都`operation_ready=false`を維持した。これは一時的な兵站崩壊で首都作戦だけを保留する設計どおりである。V4は27施設・収入39,000、V3は25施設・37,000だったが、最大手番判定はV3勝利、戦闘ROIはV4 0.52対V3 1.94、V4平均思考7,573msだった。中央島再確保後の`AssaultAuthorized`実戦発火と首都第一波発進は次の長期検証へ残す。
+
+### Decision 33: 緊急防衛を別作戦にせず、通常Defenseの優先度として扱う
+
+**問題**: `EmergencyMissionPlan`、Interception Squad、`OperationOwner::Emergency`がcampaign portfolioとは別にEntityを予約し、後から通常作戦を上書きしていた。これは「何を守るか」という通常のDefense判断と、「どの作戦を先に実行するか」という優先度判断を別システムへ重複実装していた。中立拠点向け迎撃が輸送役を横取りし、Load済みcargoだけを残す再現もあった。
+
+**選択**: 中立拠点の争奪はContest/Capture、自軍拠点の防衛はDefenseとしてcampaign portfolioへ一度だけ生成する。Entity所有者はCampaignまたはTacticalSquadのみとし、防衛担当も`UnitOperationRegistry`の通常Campaign ownerへ接続する。生産枠では、同じ作戦集合の中で敵接触ETAと展開リードタイムからDefenseの実効優先度を求める。優先度上昇は競合枠の選択だけに使い、他作戦の要求削除や全Entityの一括再割当を行わない。生産口を敵が占有した場合も別計画を生成せず、通常の攻撃対象・施設評価で処理する。
+
+**削除範囲**: `engine/src/ai/emergency.rs`、`MissionType::Interception`、`OperationOwner::Emergency`、緊急行動優先度、V1専用の封鎖解除計画、およびMCPの`emergency_plan`/`factory_relief`出力を削除する。過去の評価スクリプトが旧ログを読める互換コードは実行AIの概念には含めない。
+
+**検証**: 通常Defense Squadの全Entityが同一島のCampaign ownerと具体Squadへ一意に接続される単体テストを追加し、engine 549件中548成功・1 ignored、mcp-server 5件成功を確認した。map_3 / Hex / seed 42 / V3先攻・V4後攻10ターンでは緊急計画fieldとInterception Squadは全手番0、V4のT10は未所属0・行動可能残0だった。一方、35体中Reserve 12（行動済み7）、任務停滞6、V4のZOC 154・収入28,000・ROI 0.65に対しV3は172・30,000・1.54であり、別枠防衛による横取りは除去したがReserve過多と戦闘効率は未達である。T10の16,113Gは未コミット資金ではなく既存Plan予約だった。
+
+### Decision 34: Reserveを1手番以内の再割当待ちに限定し、生産時anchorを初期seedとして扱う
+
+**定義と目標**: 遊兵は`Unassigned + Reserve`と定義する。`Unassigned`はplanning境界と手番末の双方で0件を必須とする。`Reserve`は合法な行動を持つ通常任務ではなく、現在の作戦へ再接続できなかったことを明示する一時状態である。Reserveへ入った自軍手番をage 0、次の自軍手番にも残った状態をage 1とし、`age >= 1`を期限超過として0件を目標にする。
+
+**再割当順序**: V4は既存Reserve Squadを毎手番free poolへ戻し、(1) UnitOperationRegistryに残る現行Campaign owner、(2) active deployment、(3) 現在の島portfolio、(4) 兵站gate前も常在するAssaultCapital、(5) 未充足の輸送波、の順で具体Squadへ再接続する。局地作戦の占領深度を満たした後の占領兵は、敵首都攻略のForming cargoへ接続する。輸送役が未配備でもcargoだけのForming Squadを許し、次回の不足計算が占領兵を再生産せず輸送役だけを要求できるようにする。これらを排他正規化と組み合わせ、未割当Entity集合が不変になるか空になるまで最大3回の線形パスを行い、最後に残ったEntityだけをReserveへ置く。個数が同じでもEntityが入れ替わった場合は収束とみなさない。
+
+**ETAの扱い**: 作戦の予定到着手番は予実差と再計画理由には使うが、既存Entityの適格性を落とすhard limitにはしない。1手番遅い既存戦力は不在より有用であり、再生産には生産手番と移動手番が追加されるためである。既存Entityと新規生産案を比較できる場合は、到着差、追加費用、生産枠消費を比較して選ぶ。
+
+**anchorと現在配属の分離**: 生産時anchorは`UnitProducedEvent`を発注元作戦へ照合する初期seedであり、Entityをその島へ永久拘束する所有権ではない。既に`UnitOperationRegistry`へ現在ownerがある場合、生産記録はownerを上書きしない。別作戦へ再配置された時点で生産照合はAssignedとして完了し、現在配属と以後の行動実績はUnitOperationRegistryとVictoryRoadmapを正本にする。兵站gate前の首都Forming Squadも実Entityを常在AssaultCapitalへbindし、activeな間は局地portfolioの未claim解放から保護する。
+
+**計測と検証**: Idle traceへ`mission_type / reserve / reserve_age`と、手番集計の`reserve_count / idle_count / overdue_reserve_count`を追加した。map_3 / Hex / seed 42 / V3先攻・V4後攻10ターンの修正前はT10に35体中Reserve 12だった。最終追試では全手番でUnassigned 0、Reserve最大1、期限超過Reserve最大0となり、T10のReserve 1体もage 0だった。首都AssaultCapital/Formingには占領兵8体が継続接続された。一方、T10資金55,364Gと任務停滞4件は残り、生産枠利用・資金滞留・長期勝利はこのDecisionの達成条件には含めずB-130/B-191/完成ゲート6・7へ残す。
 
 ## Risks / Trade-offs
 

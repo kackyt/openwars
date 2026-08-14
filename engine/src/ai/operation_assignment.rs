@@ -1,4 +1,3 @@
-use crate::ai::emergency::EmergencyMissionId;
 use crate::ai::islands::IslandId;
 use crate::ai::squad::SquadId;
 use crate::components::PlayerId;
@@ -15,10 +14,6 @@ pub enum OperationOwner {
         player_id: PlayerId,
         island_id: IslandId,
     },
-    Emergency {
-        player_id: PlayerId,
-        mission_id: EmergencyMissionId,
-    },
     TacticalSquad {
         player_id: PlayerId,
         squad_id: SquadId,
@@ -28,9 +23,7 @@ pub enum OperationOwner {
 impl OperationOwner {
     pub fn player_id(self) -> PlayerId {
         match self {
-            Self::Campaign { player_id, .. }
-            | Self::Emergency { player_id, .. }
-            | Self::TacticalSquad { player_id, .. } => player_id,
+            Self::Campaign { player_id, .. } | Self::TacticalSquad { player_id, .. } => player_id,
         }
     }
 }

@@ -133,8 +133,8 @@ impl AiSimulationState {
                             }
                         }
                         crate::ai::squad::MissionType::Capture => 0,
-                        crate::ai::squad::MissionType::Interception(_) => stats.max_range.max(1),
-                        crate::ai::squad::MissionType::Transport => 1,
+                        crate::ai::squad::MissionType::Transport
+                        | crate::ai::squad::MissionType::Reserve => 1,
                     };
 
                     // 目標からの SSSP 最短距離テーブルをキャッシュを利用して取得 (O(1)再利用)
@@ -361,6 +361,7 @@ mod tests {
             drop_position: None,
             delivered_cargo: Vec::new(),
             allow_partial_departure: false,
+            departure_authorized: true,
             return_after_combat: false,
         };
         squad.members.insert(unit_entity);

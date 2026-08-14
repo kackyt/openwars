@@ -747,7 +747,7 @@ fn resolve_target(
 
 /// 生産済みEntityを汎用free poolより先にV4局地Attack任務へ予約する。
 ///
-/// 緊急迎撃・島嶼キャンペーンで既に予約されたEntityは上位責務を優先し、次ターン再試行する。
+/// 島嶼キャンペーンで既に予約されたEntityは既存作戦を優先し、次ターン再試行する。
 pub(crate) fn prepare_deployment_squads(
     world: &mut World,
     manager: &mut SquadManager,

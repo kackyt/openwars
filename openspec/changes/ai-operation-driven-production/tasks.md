@@ -21,11 +21,11 @@
 - 空き生産枠数 × ターン の累計、および最大保有資金
 - 自軍の占領数（map_1 / map_2 の現行 V3 はいずれも 0 件）
 
-## 現在地と完成ゲート（2026-08-14、B-183完了時点）
+## 現在地と完成ゲート（2026-08-14、B-199完了時点）
 
 現在は「要求を作って生産する」段階を越え、永続Roadmap、局地Combat Plan、島作戦の生産予実、未完原因別の復旧、一意なunit作戦所有まで実装済みである。ただし、**計画した全工程を実行命令へ拘束し、実績差から同じ勝利Roadmapを修正しながら勝利条件へ収束するところまでは完成していない**。
 
-- [x] 完成ゲート1: `UnitOperationRegistry`を正本として、1 Entityが同時に複数作戦／複数Squadへ所属しないことをO(1)参照と手番境界O(U+R)正規化で保証する（B-172〜B-176）
+- [x] 完成ゲート1: `UnitOperationRegistry`を正本として、1 Entityが同時に複数作戦／複数Squadへ所属しないことをO(1)参照と手番境界O(U+R)正規化で保証し、Unassigned 0・期限超過Reserve 0を単一seedで確認する（B-172〜B-176、B-196〜B-199）
 - [x] 完成ゲート2: 生産意図を実Entityへ照合し、未完を生産待ち・遅延・未割当・割当喪失・輸送不足・損耗へ分類して、実際の再発注／再割当／輸送付与／補充要求を記録する（B-167〜B-171）
 - [ ] **P0 完成ゲート3**: Produce / Move / Load / Drop / Attack / Capture / Holdの各予定stepを作戦owner付きEntityと実Eventへ1対1で照合し、別作戦の行動を進捗に数えず、未実行を`StepBlocked`として原因別replanへ返す（B-144、B-145）
 - [ ] **P0 完成ゲート4**: 既存輸送の再利用、合法なLoad/Move/Drop、敵増援、反撃・損耗、補給、Captureを同一時間軸で比較し、固定台数や価格換算ではなく、実行可能scheduleから必要unit数・費用・完了手番を導く（B-132〜B-136）
@@ -126,7 +126,7 @@
 - [x] B-54. Combat/Intercept枠のpending deploymentを実生産Entityへ照合し、要求を発生させた局地敵Entityと作戦anchorをAttack/Interception任務へ引き渡す
 - [x] B-55. V4所有の局地撃破任務を汎用beam searchの再目標化から保護し、敵消滅時だけ占領unit→輸送unit→その他局地敵の順で再目標化する
 - [x] B-56. 撃破枠購入Entityについて、任務付与率・初回攻撃ETA・占領／輸送unitへの攻撃率・撃破率を両席で計測し、攻撃0回の購入を解消する
-- [x] B-56a. 中立拠点Interceptionによる局地任務preemptを診断し、中立拠点では保護、自軍所有拠点の危機だけpreempt可能とする優先境界を固定する
+- [x] B-56a. 中立拠点Interceptionによる局地任務preemptを診断した。境界追加案はB-192 / Decision 33で撤回し、Interception自体を削除した
 - [ ] B-57. 解放された余剰資金を正の限界価値を持つ占領・補給・局地戦闘へ変換し、map_3の収入・ZOC・勝敗ゲートを満たす
 - [x] B-58. 標的unit cost・搭載cargo cost・目前の占領による1ターン収入損失を合算する戦略標的価値を実装し、V1〜V4の攻撃・接近評価で共有する
 - [x] B-59. `Transporting`を持つcargoを独立した敵追跡対象から除外し、輸送役の戦略標的価値へ畳み込む
@@ -147,7 +147,7 @@
 - [x] B-74. 中立島・兵站島の部分搭載便をTransitへ進め、同一手番に搭載不能な残存cargoを同じ島の後続Formingへ戻す。Assaultは完全manifest待ちを維持する
 - [x] B-75. V4後攻ログのEntity 80・91で複数ターンの搭載済みPickup待ちを再現し、単体テスト・全回帰テスト・release版map_3 8ターン追試で修正を検証する
 - [x] B-76. 高優先島作戦の残予算を保護しつつ、競合しない施設種別を下位島作戦へ開放し、map_3 Hex後攻のT1に歩兵と輸送ヘリを並行生産する
-- [x] B-77. 空Forming placeholderへ後の手番で割り当てられた輸送役・cargoを追加入隊させ、輸送Squadの全membersを汎用beam searchと緊急迎撃から保護する
+- [x] B-77. 空Forming placeholderへ後の手番で割り当てられた輸送役・cargoを追加入隊させ、輸送Squadの全membersを汎用beam searchと別作戦の重複割当から保護する
 - [x] B-78. 中立島・兵站島では島全体要求の完成前でも容量内の便をPickupへ昇格し、残存Entityを同じ島の後続Formingへ保持する。Assaultは完全編成待ちを維持する
 - [x] B-79. map_3 / Hex / V3先攻対V4後攻をT3まで実行し、T1ヘリ生産、T2の歩兵2体連続Load、T3の中立島方向Dropおよび後続PickupをEntity単位で確認する
 - [x] B-80. Pickup地点の選択で生産圏内の自軍施設を最後順位とし、輸送役が非生産合流点へ退避した同じ手番にcargoをLoadできるようにする
@@ -246,7 +246,7 @@
 - [x] B-170. 継続島作戦の輸送・占領構造不足が首都形成の将来購入をpreemptし、不足枠を次の生産要求へ戻す。搭載前の出発島内移動を作戦逸脱へ数えない回帰テストを追加する
 - [x] B-171. map_3 / Hex / seed 42 / V3先攻対V4後攻を5ターン追試し、中央島作戦がT2輸送確保、T3占領兵3体Load、T5全3体Dropまで継続すること、および別島の未輸送兵をTransportUnassignedとして保持することを確認する。中央島の占領完了と損耗後の実補充は未達として残す
 - [x] B-172. `UnitOperationRegistry`へEntity→唯一の作戦owner／Squad／役割とowner→Entity集合の双方向索引を追加し、排他的移管と作戦単位解放を実装する
-- [x] B-173. Squad、campaign portfolio、Roadmap、生産時意図を正本へ接続し、campaign間再計画、緊急任務preempt、物理搭載cargoを明示的な移管として扱う
+- [x] B-173. Squad、campaign portfolio、Roadmap、生産時意図を正本へ接続し、campaign間再計画と物理搭載cargoを明示的な移管として扱う。緊急ownerはB-192で削除した
 - [x] B-174. 手番開始と全任務構築後だけO(U+R)でSquad参照を正規化し、勝者以外のmembers／cargo／delivered参照を一括除去する。作戦・行動ごとの全走査を禁止する
 - [x] B-175. 重複Squadから一意owner／具体Squadだけが残ること、owner移管時に旧逆引きが消えること、campaignが汎用Squadをpreemptすることの単体テストを追加する
 - [x] B-176. map_3 / Hex / seed 42を5ターン追試し、T5 V4の参照19／一意割当18／競合検知1、全手番・両playerのcampaign／Roadmap重複0を確認する。訪問数は最大V3 24・V4 19で割当数と同程度だった。V4全体の思考時間はRolling Plan探索が支配的なままで、本変更は行動・作戦ごとの重複走査を追加していないことの検証に限定する
@@ -257,6 +257,22 @@
 - [x] B-181. 自力到達・既存輸送・具体的な調達可能輸送のいずれも持たない遠隔Combat Entityを編成から除き、孤立Entityがcampaign全体を生成不能にしない回帰テストを追加する
 - [x] B-182. Plan実績の目的施設を島作戦中の和集合として保持し、現在の残施設集合が縮退しても占領予実の分母を変えない単体テストを追加する
 - [x] B-183. map_3 / Hex / seed 42 / V3先攻対V4後攻を17ターン追試し、中央島Plan 2がT4から継続、T14敵排除、T15に3/3占領したことを確認する。T14予測T18に対し排除4・占領3手番前倒し。T16の再侵入後はReinforceへ移行。T17はV4収入39,000対V3 37,000だが戦闘ROI 0.61対1.63、最大手番判定V3勝利、V4平均思考8,420.7msのため、首都攻略・戦闘効率・性能は未達として残す
+- [x] B-184. 固定兵站経路の完了を首都攻略認可遷移としてPlanへ保持し、falseからtrueへ変わった手番に同じPlanIdの現在盤面revisionを作る
+- [x] B-185. 形成中でも予定初攻撃・排除・占領期限を超えた首都Planは施設競合の無期限繰り下げをせず、敵増援を含む現在盤面から再計画する
+- [x] B-186. Defenseと認可済みAssaultCapitalを同じ作戦集合で比較し、敵接触ETAが展開リードタイム以内のDefenseだけを競合枠で上位にする。他作戦要求を消去しない単体テストを追加する
+- [x] B-187. 首都第一波の構造要員を最大3施設の並行占領役と観測敵がいる場合の交代1体へ限定し、戦闘必要量を価格・施設数から分離する
+- [x] B-188. 固定兵站経路と認可後Combat Planの全生産stepが揃うまで首都assignmentだけを集結状態にし、兵站崩壊時も他のCapture・Defenseを停止しない発進gateを接続する
+- [x] B-189. engine全561テスト（560成功、1 ignored）とmap_3 / Hex / seed 42 / V3先攻・V4後攻4ターンを実行し、V4の13施設・収入20,000、生産Infantry 12 / TransportHelicopter 4 / Bcopters 1、生産・輸送・占領接続を確認する
+- [x] B-190. 首都Forming assignment成立後も兵站台帳の観測を継続する。map_3の修正前T16では観測T13・経路[3,6]のままだったが、修正後は観測T16、5/5所有の島6を除外し、敵に1施設を再占領された島3だけを経路へ維持することを確認する
+- [ ] B-191. map_3で中央島3/3再確保後まで長期評価し、`AssaultAuthorized` revision、全生産step完了、集結解除、首都島への集中移動・攻撃・降車・占領をtraceで確認する。T16は島3が2/3のため、首都発進保留が正しい状態で終了した
+- [x] B-192. 別枠の`EmergencyMissionPlan`、Interception Squad、`OperationOwner::Emergency`、緊急行動優先度、V1封鎖解除計画、MCP緊急トレースを削除し、中立争奪をContest/Capture、所有拠点防衛を通常Defenseへ一本化する
+- [x] B-193. V4手番末に作戦ownerだけ残ったEntityをReserveへ再接続し、輸送役と占領役を現行campaignの輸送波へ固定点再編する。船舶は陸上anchor到達ではなく射程圏到達で参加可否を判定する
+- [x] B-194. Idle traceへReserveを含むSquad構成兵種を追加し、通常DefenseのEntityがCampaign ownerと具体Squadへ一意に接続される回帰テストを追加する。engine 549件中548成功・1 ignored、mcp-server 5件成功を確認する
+- [x] B-195. map_3 / Hex / seed 42 / V3先攻・V4後攻を10ターン再評価した。V4は緊急計画field・Interception Squad 0、T10の未所属0・行動可能残0。35体中Reserve 12（行動済み7）、停滞6はいずれも行動不能だった。生産はInfantry 21 / TransportHelicopter 11 / Bcopters 5 / Fighter 1 / Bomber 1 / Missiles 1 / HeavyFighter 1 / Mech 2。T10生産計画は23,613G中7,500Gを生産、16,113Gを既存Planへ予約、未コミット0。V4はZOC 154・収入28,000・ROI 0.65でV3の172・30,000・1.54に負けたため、Reserve過多、停滞輸送、戦闘効率、長期勝利は未達として残す
+- [x] B-196. Idle auditへReserveを行動済みでも遊兵として数える定義、Entity別`reserve_age`、集計`reserve_count / idle_count / overdue_reserve_count`を追加し、次の自軍手番まで残る`age >= 1`を期限超過として監査する
+- [x] B-197. V4のReserveを通常planningと手番末でfree poolへ戻し、現行Campaign、deployment、島portfolio、首都Forming、輸送波へ最大3回の線形固定点で再接続してからcatch-allする。輸送未配備でも既存占領兵をForming cargoへ接続し、ETA超過を候補除外に使わない
+- [x] B-198. 生産時anchorによるowner注入を未割当Entityの初期seedに限定し、明示的な別作戦移管を旧anchorへ巻き戻さない。首都Forming Squadを常在AssaultCapitalへbindし、activeなEntityを局地portfolioの未claim解放から保護する
+- [x] B-199. map_3 / Hex / seed 42 / V3先攻・V4後攻を10ターン追試し、V4の全手番Unassigned 0、Reserve最大1、期限超過Reserve最大0を確認する。T10 Reserve 1体はage 0、AssaultCapital/Formingへ占領兵8体が接続された。T10資金55,364G・任務停滞4件のため、資金滞留・生産枠利用・長期勝利・複数seedは未達として完成ゲート6・7へ残す
 - [x] B-138. Combat plannerの固定最大5生産を撤回し、探索期間内のfacility-turn数から探索深さを導出する。敵増援へ生産手番・移動ETA由来の`available_turn`を与え、手番別の敵到着HP・敵HP除去・自軍HP損耗・攻撃回数をtraceへ出す
 - [x] B-139. map_3 / Hex / seed 42 / 5ターンをV3/V4両席で短期追試し、V4が両席14拠点・収入23,000、T3–5に戦闘機／戦闘ヘリ生産、予測増援の計画算入を確認する。V3両席勝利とV4平均思考2,146msは未達として残す
 - [x] B-140. 固定`排除+2ターン`の占領予測を撤回し、実campaignのPickup/Transit/Drop、cargo位置、Capture距離から得た`friendly_capture_eta`をCombat planへ接続する。輸送編成が無い場合は`occupation_turn = None`として未実行の占領を完了予測しない

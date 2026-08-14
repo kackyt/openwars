@@ -264,15 +264,15 @@ MUST: AIは、CombatまたはIntercept枠で生産したunitに、要求を発�
 - **WHEN** 局地任務の優先敵と、戦術評価上より高価値な別の敵が同時に攻撃可能で、いずれも無謀攻撃ではないとき
 - **THEN** 当該局地任務Entityは優先敵を攻撃する
 
-#### Scenario: 中立拠点レースで局地任務をpreemptしない
+#### Scenario: 中立拠点レースを通常作戦として扱う
 
 - **WHEN** 敵占領unitが中立拠点へ2ターン以内に到達可能で、V4局地任務Entityが存在するとき
-- **THEN** Interceptionは当該局地任務Entityを横取りせず、他の利用可能戦力で中立拠点レースへの対応を試みる
+- **THEN** ContestまたはCaptureを通常portfolioへ生成し、別枠のInterceptionで当該局地任務Entityを横取りしてはならない
 
-#### Scenario: 自軍所有拠点の危機は局地任務をpreemptできる
+#### Scenario: 自軍所有拠点の防衛も通常の優先度付き作戦にする
 
 - **WHEN** 敵占領unitが自軍所有の重要拠点へ2ターン以内に到達可能で、他に拒絶可能な戦力がないとき
-- **THEN** InterceptionはV4局地任務Entityをpreemptして自軍拠点の占領阻止へ割り当ててよい
+- **THEN** 通常のDefenseを生成し、敵接触ETAと展開リードタイムから他作戦との優先度を決め、同じEntityを複数作戦へ所属させてはならない
 
 ### Requirement: 兵站前提の補給カテゴリ導出
 

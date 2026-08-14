@@ -60,11 +60,11 @@
   - 観測量は「占領レース速度差 / 消耗率 / 収入トレンド / 脅威カテゴリ別の敵戦力と所在地 / 枠の充足 / 自軍拠点への奪還脅威 / 空き枠と資金の乖離」の 7 つ
   - 自軍拠点が敵占領ユニットの脅威下に入ったことを検知して `priority_rank = 0` の防衛作戦を生成し、他作戦の予約を preempt する
 - **実装**: 撃破枠の生産意図から実行任務への引き渡し
-  - Combat/Intercept枠の作戦anchorと優先敵Entityを生産された実Entityへ対応付け、V4所有の局地Attack/Interception任務として保持する
+  - Combat/Intercept枠の作戦anchorと優先敵Entityを生産された実Entityへ対応付け、V4所有の局地Attack任務として保持する。Interceptionという別任務は生成しない
   - 優先敵が生存・到達可能な間は汎用beam searchの再目標化から保護し、消滅後だけ同一前線の占領unit、輸送unit、その他戦闘unitへ再目標化する
   - 同一施設・同一unit種別の複数発注は、手番・施設・unit種別・発注順で `UnitProducedEvent` と決定的に照合する
-  - 中立拠点レースのInterceptionは継続するが、V4の局地任務Entityをpreemptしない。自軍所有拠点への脅威だけは局地任務より優先できる
-  - E2E traceへ任務付与、現在標的、初回攻撃ETA、占領／輸送unitへの攻撃、撃破、緊急迎撃の拠点所有者とETAを記録する
+  - 中立拠点レースは通常のContest/Capture、所有拠点の防衛は通常のDefenseとして同じportfolioで比較し、別枠のInterception計画を生成しない
+  - E2E traceへ任務付与、現在標的、初回攻撃ETA、占領／輸送unitへの攻撃、撃破を記録する
 
 - **改善**: V4で得た戦略標的価値をV1〜V4の共通戦術層へ横展開
   - 攻撃と接近の標的価値を敵unit本体のcostだけでなく、輸送中cargoのcostと、敵占領unitが他勢力拠点上にいる場合の1ターン分の収入損失まで含めて評価する
@@ -93,7 +93,7 @@
   - `Secure`、`Contest`、`Reinforce`にも残存占領枠を持たせ、別島の占領兵を使う場合は実cargoに適合する輸送不足を導出する。安全な自島内の`Secure`は3件の攻勢上限を消費しない
   - 同一輸送役の複数cargoを同一手番にLoad/Dropし、対軽歩兵では輸送ヘリ自身の実戦力を活用した後、輸送任務へ復帰させる
   - `Forming`中の輸送隊が自軍生産施設を塞いだ場合は、任務所属を維持したまま隣接待機地へ退避し、後続の占領兵・輸送役を生産可能にする
-  - 購入待ちで作成した空Forming placeholderへ後の手番で生産された輸送役・cargoを追加入隊させ、輸送Squadの全membersを汎用行動と緊急迎撃から保護する
+  - 購入待ちで作成した空Forming placeholderへ後の手番で生産された輸送役・cargoを追加入隊させ、輸送Squadの全membersを汎用行動と別作戦の重複割当から保護する
   - 上位島作戦の残予算を保護しつつ、その作戦が使用できない別種の生産施設を下位島作戦へ開放し、Factory不足でAirportまで停止する直列化を避ける
   - Pickup合流点は生産圏内の自軍施設を避け、輸送役を先に非生産タイルへ動かした同じ手番にcargoをLoadして、搭載待ちによる空港・港の自己封鎖を防ぐ
   - 生産ループは 1 ユニット購入ごとに「どの作戦のどの枠を埋めたか」を記録して消費する
@@ -128,6 +128,10 @@
   - 島作戦のidentityを`player_id + IslandId`とし、Capture／Contest／Reinforce／Defenseへの状態変化、anchor移動、残施設・敵Entity集合の増減ではPlanIdを変えない。同じ島の首都攻略と局地作戦は1つへ統合する
   - 将来敵生産を敵到着手番と最速対抗unitの接触手番で分け、間に合わない増援だけを現編成の撃破対象へ、間に合う増援は具体的な兵種・施設・生産手番・必要攻撃回数・費用を持つcontingencyへ置く。予約額は期限までの収入を差し引いた資金不足分だけとする
   - Plan予実の目的施設集合を作戦中に一度でも対象となった島施設の和集合として保持し、未所有施設だけへ縮退させず、同じ分母で占領進捗と完了を監査する
+  - 固定兵站経路が完了した瞬間に首都Planを現在盤面から同じPlanIdの新revisionへ組み直す。認可済み首都攻略とDefenseを同じ優先度付き作戦集合で比較し、Defenseは敵接触ETAが展開リードタイム以内のときだけ競合生産枠で上位になる
+  - 敵首都の全施設数を第一波の人数へ直結させず、最大3施設の並行占領役と観測敵がいる場合の交代要員だけを構造波とする。戦闘戦力は時系列Combat Planが決定し、兵站経路と全生産stepの双方が完成するまで首都作戦だけを集結状態に保つ
+  - 形成中でも予定初攻撃・排除・占領期限を超過したPlanは、施設競合による無期限繰り下げをせず現在の敵・資金・施設枠からrevisionする。兵站が崩壊した場合は首都作戦だけを停止し、他のCapture・Defense任務を全停止しない
+  - 首都の構造波が兵站gate前からForming assignmentを持っていても兵站台帳の観測を継続し、完了した経路島を`selected_islands`から除く。既存assignmentを理由に観測更新を早期returnしない
 
 - **撤回・削除**: 撃破候補の価格・固定sortie限界収益評価
   - 敵1体を最寄り作戦1件へ一意に帰属させ、HP補正済み残存戦力と戦略優先度を別フィールドで管理する
@@ -166,16 +170,16 @@
 - `engine/src/ai/island_campaign.rs` / `island_campaign_analysis.rs`: 洋上 Reinforce の実 cargo と生産可能輸送手段を出発島・積載可能兵種込みで照合し、輸送不足を shortfall として保持。Assault は作戦優先度、将来予算予約、生産可能経路別の輸送編成、初動上陸波の容量を同じ作戦状態で管理する
 - `engine/src/ai/island_campaign.rs` / `island_campaign_analysis.rs`: 加えて、相対収入と地上／航空／海上の前進補給網から兵站前提作戦を導出し、新規Assaultとの依存関係を管理する
 - `engine/src/ai/v4/deployment.rs`: V4のpending deployment、実Entity照合、局地標的追跡、fallback、攻撃実績監査を保持
-- `engine/src/ai/v4/campaign_execution.rs`（新規）: 島作戦の生産命令をIslandId・役割・施設・unit種別で実Entityへ照合し、生産遅延、割当、損耗と次手番の排他的な作戦所有権を保持する
+- `engine/src/ai/v4/campaign_execution.rs`（新規）: 島作戦の生産命令をIslandId・役割・施設・unit種別で実Entityへ照合する。生産時anchorは未割当Entityの初期seedに限定し、別作戦への明示移管後は現在ownerを上書きしない
 - `engine/src/ai/operation_assignment.rs`（新規）: Entityごとの唯一の作戦owner／実行Squad／役割を保持する正本とowner逆引きを提供し、平均O(1)照会、原子的移管、所属数O(k)の作戦解放を保証する
 - `engine/src/ai/v4/victory_roadmap.rs`: 未完原因と復旧行動を別履歴へ記録し、輸送manifestから輸送役・cargo損失を区別する。原因検知ではなく実際の再発注・再割当・輸送付与・補充確認だけを再計画実績とする
 - `engine/src/ai/v4/rolling_plan.rs`（新規）: 島作戦snapshot、混成編成候補、計画revision、Pareto前線、予実差、再計画理由を保持する純粋な計画器
 - `engine/src/ai/v4/plan_revision.rs`（新規）: 実行可能なCombat生産列を手番間で保持し、固定列再評価、step実績照合、Plan単位の予実台帳、増援・遅延判定、盤面事実による継続・revision・完了・撤回を管理する
 - `engine/src/ai/operation_simulation.rs`（新規）: 本番ルールと共有する移動・戦闘・輸送・占領のターン単位予測を提供し、V4検証後にV3からも再利用する
-- `engine/src/ai/squad.rs`: 自力展開戦力と輸送 cargo の分離、複数 cargo の Pickup 進行。加えて手番境界のO(U+R)正規化でcampaign、緊急任務、deployment、汎用Squadの重複参照を唯一owner／Squadへ収束させる
+- `engine/src/ai/squad.rs`: 自力展開戦力と輸送 cargo の分離、複数 cargo の Pickup 進行。加えて手番境界のO(U+R)正規化でcampaign、deployment、汎用Squadの重複参照を唯一owner／Squadへ収束させ、Reserveを現行作戦へ再接続して期限超過を防ぐ
 - `engine/src/ai/engine.rs`: Drop に参加した輸送役と cargo の双方を当該ターンの行動済みとして記録。加えてV1〜V4共通の攻撃・接近評価へ、搭載兵力と占領阻止を含む戦略標的価値を導入し、V4では局地任務の現在標的Entityを通常標的より優先する
 - `engine/src/ai/engine.rs`: 航空unitの候補移動を、移動後も最寄りの自軍空港へ日次消費込みで帰投可能な範囲へ制限する。空港喪失などで既に安全圏外なら、帰還不足を悪化させず空港距離を縮める回復移動を許す
-- `engine/src/ai/emergency.rs`: 中立拠点InterceptionはV4局地任務Entityをpreemptせず、自軍所有拠点への脅威だけがpreemptできる責務境界を追加
+- 別枠の`EmergencyMissionPlan`、Interception owner、緊急行動優先度、緊急トレースは廃止する。防衛は通常のCampaign/Defense ownerだけで実行する
 - `strategy.rs` / `resources/`: Stage 2では変更しない。新しい予約台帳 Resource も追加しない
 - 対戦評価: `scripts/eval_matchup.py` による V4 vs V3 / V4 vs V1 の勝率・ZOC 支配面積・ターン収入の比較検証が必須
-- `mcp-server/src/invasion_trace.rs` / `scripts/eval_matchup.py`: `plan_id / revision / step_id`、継続・撤回理由、残step・残費用に加え、生産・稼働・初攻撃・敵別HP／撃破・損耗・占領のPlan予実をターンJSONLへ保持する
+- `mcp-server/src/invasion_trace.rs` / `scripts/eval_matchup.py`: `plan_id / revision / step_id`、継続・撤回理由、残step・残費用に加え、生産・稼働・初攻撃・敵別HP／撃破・損耗・占領のPlan予実、およびEntity別Reserve年齢と期限超過数をターンJSONLへ保持する

@@ -139,11 +139,11 @@ impl V4CampaignExecutionRegistry {
         }
     }
 
-    pub(crate) fn mark_assigned(&mut self, entity: Entity, island_id: IslandId, turn: u32) {
+    /// 生産時anchorと異なる作戦へ再配置された場合も、生産命令から実Entityへの照合は完了する。
+    /// 現在の配属先はVictoryRoadmap/UnitOperationRegistryを正本とし、旧anchorを永久拘束にしない。
+    pub(crate) fn mark_assigned(&mut self, entity: Entity, turn: u32) {
         for record in self.records.iter_mut().filter(|record| {
-            record.entity == Some(entity)
-                && record.island_id == island_id
-                && record.status == CampaignProductionStatus::Produced
+            record.entity == Some(entity) && record.status == CampaignProductionStatus::Produced
         }) {
             record.status = CampaignProductionStatus::Assigned;
             record.resolved_turn = Some(turn);
@@ -232,7 +232,7 @@ mod tests {
             registry.produced_entity_assignments(player).get(&entity),
             Some(&island)
         );
-        registry.mark_assigned(entity, island, 3);
+        registry.mark_assigned(entity, 3);
         assert!(
             !registry
                 .produced_entity_assignments(player)

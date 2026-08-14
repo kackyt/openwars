@@ -1,6 +1,5 @@
 pub mod ai_version;
 pub mod demand;
-pub mod emergency;
 pub mod engine;
 pub mod eval;
 /// 遊兵（任務なし・任務があるのに動けないユニット）の計測

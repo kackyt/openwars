@@ -48,6 +48,8 @@ pub enum ReplanReason {
     EliminationDelayed,
     OccupationDelayed,
     ProductionSlotDeferred,
+    /// 必要な兵站路が成立し、形成中の首都攻略を現在盤面から組み直した。
+    AssaultAuthorized,
     NoFeasibleReplacement,
 }
 
@@ -647,6 +649,8 @@ struct StoredPlan {
     forecast: PlanMetrics,
     /// 敵増援を含む最終撃破が実行可能で、兵站gate後に攻撃へ移してよいか。
     execution_ready: bool,
+    /// 前回評価時点で、兵站条件から首都攻略の実行が許可されていたか。
+    execution_authorized: bool,
     last_evaluated_turn: u32,
     execution: PlanExecutionLedger,
 }
@@ -764,6 +768,21 @@ impl V4RollingPlanRegistry {
                 remaining_target_count: plan.execution.snapshot.remaining_target_count,
             })
             .collect()
+    }
+
+    /// 現在盤面で組み直した首都計画が、全生産を終えて一波として発進可能かを返す。
+    pub(crate) fn operation_launch_ready(&self, player_id: PlayerId, island_id: IslandId) -> bool {
+        self.active.iter().any(|plan| {
+            plan.player_id == player_id
+                && plan.kind == OperationKind::AssaultCapital
+                && plan.island_id == Some(island_id)
+                && plan.execution_authorized
+                && plan.execution_ready
+                && plan
+                    .steps
+                    .iter()
+                    .all(|step| step.status == PurchaseStatus::Produced)
+        })
     }
 
     /// 盤面と生産済みEntityの実績を、各Planへ一度だけ線形集約する。
@@ -977,6 +996,7 @@ impl V4RollingPlanRegistry {
             anchor,
             objective_properties,
             target_enemies,
+            true,
             continuation,
             candidate,
             hard_deadline,
@@ -995,6 +1015,7 @@ impl V4RollingPlanRegistry {
         anchor: GridPosition,
         objective_properties: Vec<GridPosition>,
         target_enemies: HashSet<Entity>,
+        execution_authorized: bool,
         continuation: Option<(
             PlanContinuation,
             Result<ForcePackagePlan, FixedPackageError>,
@@ -1025,6 +1046,7 @@ impl V4RollingPlanRegistry {
                 anchor,
                 objective_properties,
                 target_enemies,
+                execution_authorized,
                 &candidate,
             );
             self.record_audit(
@@ -1050,21 +1072,62 @@ impl V4RollingPlanRegistry {
             .ok()
             .map(|plan| PlanMetrics::from_plan(plan, kind));
         let stored = &self.active[previous.index];
+        let authorization_activated = kind == OperationKind::AssaultCapital
+            && execution_authorized
+            && !stored.execution_authorized;
         let formation_in_progress = kind == OperationKind::AssaultCapital
             && stored
                 .steps
                 .iter()
                 .any(|step| step.status != PurchaseStatus::Produced);
-        let enemy_reinforced = !formation_in_progress
+        let execution_delay = stored.execution.delay_reason(turn);
+        // 編成中でも既に予測攻撃時刻を過ぎていれば、古い購入列を守る段階ではない。
+        // 現在の敵・資金・施設枠から編成全体を作り直す。
+        let formation_must_replan = formation_in_progress && execution_delay.is_some();
+        let enemy_reinforced = (!formation_in_progress || formation_must_replan)
             && target_enemies
                 .difference(&stored.target_enemies)
                 .next()
                 .is_some();
-        let execution_delay = stored.execution.delay_reason(turn);
+
+        // 兵站路が成立した瞬間は、形成開始時の古い敵編成をそのまま実行しない。
+        // 同じPlanIdのrevisionを現在盤面へ更新し、既に配属済みのEntityは維持する。
+        if authorization_activated && candidate_executable {
+            let revision = PlanRevision(previous.revision.0.saturating_add(1));
+            self.replace_plan(
+                previous.index,
+                turn,
+                revision,
+                kind,
+                island_id,
+                anchor,
+                objective_properties,
+                target_enemies,
+                execution_authorized,
+                &candidate,
+            );
+            self.record_audit(
+                player_id,
+                turn,
+                previous.plan_id,
+                revision,
+                PlanDisposition::Revised,
+                Some(ReplanReason::AssaultAuthorized),
+            );
+            return SelectedPlan {
+                plan: candidate,
+                plan_id: Some(previous.plan_id),
+                revision: Some(revision),
+                disposition: PlanDisposition::Revised,
+                reason: Some(ReplanReason::AssaultAuthorized),
+            };
+        }
 
         // 兵站・防衛生産が当手番の施設を先に使っただけなら、首都編成を撤回しない。
         // 実在する同じ施設の購入を次手番へずらし、購入列とPlanIdを維持する。
         if kind == OperationKind::AssaultCapital
+            && !formation_must_replan
+            && !authorization_activated
             && production_slot_deferred
             && matches!(
                 continuation_error,
@@ -1083,6 +1146,7 @@ impl V4RollingPlanRegistry {
                 extend_objective_history(stored, &objective_properties);
                 stored.objective_properties = objective_properties;
                 stored.target_enemies = target_enemies;
+                stored.execution_authorized = execution_authorized;
                 stored.last_evaluated_turn = turn;
                 let purchases = stored
                     .steps
@@ -1141,6 +1205,7 @@ impl V4RollingPlanRegistry {
             extend_objective_history(stored, &objective_properties);
             stored.objective_properties = objective_properties;
             stored.target_enemies = target_enemies;
+            stored.execution_authorized = execution_authorized;
             stored.forecast = PlanMetrics::from_plan(&plan, kind);
             stored.execution_ready = plan.feasible;
             stored.last_evaluated_turn = turn;
@@ -1168,7 +1233,7 @@ impl V4RollingPlanRegistry {
             continuation: continuation_metrics,
             // 編成trancheの途中は敵が毎ターン増えても購入列を捨てない。生産失敗など
             // 硬い実行不能だけを先に処理し、完了後に次tranche/最終案を比較する。
-            candidate: (!formation_in_progress)
+            candidate: (!formation_in_progress || formation_must_replan)
                 .then_some(candidate_metrics)
                 .flatten(),
             hard_deadline,
@@ -1192,6 +1257,7 @@ impl V4RollingPlanRegistry {
                 extend_objective_history(stored, &objective_properties);
                 stored.objective_properties = objective_properties;
                 stored.target_enemies = target_enemies;
+                stored.execution_authorized = execution_authorized;
                 stored.forecast = PlanMetrics::from_plan(&plan, kind);
                 stored.execution_ready = plan.feasible;
                 stored.last_evaluated_turn = turn;
@@ -1223,6 +1289,7 @@ impl V4RollingPlanRegistry {
                     anchor,
                     objective_properties,
                     target_enemies,
+                    execution_authorized,
                     &candidate,
                 );
                 self.record_audit(
@@ -1258,6 +1325,7 @@ impl V4RollingPlanRegistry {
                 extend_objective_history(stored, &objective_properties);
                 stored.objective_properties = objective_properties;
                 stored.target_enemies = target_enemies;
+                stored.execution_authorized = execution_authorized;
                 stored.forecast = PlanMetrics::from_plan(&plan, kind);
                 stored.execution_ready = plan.feasible;
                 stored.last_evaluated_turn = turn;
@@ -1459,6 +1527,7 @@ impl V4RollingPlanRegistry {
         anchor: GridPosition,
         objective_properties: Vec<GridPosition>,
         target_enemies: HashSet<Entity>,
+        execution_authorized: bool,
         plan: &ForcePackagePlan,
     ) -> (PlanId, PlanRevision) {
         self.next_plan_id = self.next_plan_id.saturating_add(1);
@@ -1479,6 +1548,7 @@ impl V4RollingPlanRegistry {
             steps: scheduled_steps(plan_id, revision, turn, plan),
             forecast: PlanMetrics::from_plan(plan, kind),
             execution_ready: plan.feasible,
+            execution_authorized,
             last_evaluated_turn: turn,
             execution,
         });
@@ -1496,6 +1566,7 @@ impl V4RollingPlanRegistry {
         anchor: GridPosition,
         objective_properties: Vec<GridPosition>,
         target_enemies: HashSet<Entity>,
+        execution_authorized: bool,
         plan: &ForcePackagePlan,
     ) {
         let stored = &mut self.active[index];
@@ -1511,6 +1582,7 @@ impl V4RollingPlanRegistry {
         stored.steps = scheduled_steps(stored.plan_id, revision, turn, plan);
         stored.forecast = PlanMetrics::from_plan(plan, kind);
         stored.execution_ready = plan.feasible;
+        stored.execution_authorized = execution_authorized;
         stored.last_evaluated_turn = turn;
         stored.execution.observe_targets(&stored.target_enemies);
         stored.execution.update_forecast(turn, plan);
@@ -1934,6 +2006,156 @@ mod tests {
     }
 
     #[test]
+    fn capital_authorization_rebuilds_the_same_plan_from_current_board() {
+        let player = PlayerId(1);
+        let island = IslandId(7);
+        let anchor = GridPosition { x: 20, y: 10 };
+        let enemy = Entity::from_raw(10);
+        let reinforcement = Entity::from_raw(11);
+        let mut registry = V4RollingPlanRegistry::default();
+        let created = registry.select_for_operation(
+            player,
+            3,
+            OperationKind::AssaultCapital,
+            Some(island),
+            anchor,
+            vec![anchor],
+            HashSet::from([enemy]),
+            false,
+            None,
+            feasible_plan(0),
+            None,
+            HashSet::new(),
+        );
+        let plan_id = created.plan_id.expect("形成中の首都計画");
+        let continuation = registry
+            .continuation_for_operation(
+                player,
+                3,
+                OperationKind::AssaultCapital,
+                Some(island),
+                &[anchor],
+                &HashSet::from([enemy, reinforcement]),
+            )
+            .expect("同じ首都作戦を再評価する");
+
+        let revised = registry.select_for_operation(
+            player,
+            3,
+            OperationKind::AssaultCapital,
+            Some(island),
+            anchor,
+            vec![anchor],
+            HashSet::from([enemy, reinforcement]),
+            true,
+            Some((continuation, Ok(feasible_plan(0)))),
+            feasible_plan(1),
+            None,
+            HashSet::new(),
+        );
+
+        assert_eq!(revised.plan_id, Some(plan_id));
+        assert_eq!(revised.revision, Some(PlanRevision(1)));
+        assert_eq!(revised.disposition, PlanDisposition::Revised);
+        assert_eq!(revised.reason, Some(ReplanReason::AssaultAuthorized));
+        assert!(registry.active[0].target_enemies.contains(&reinforcement));
+        assert!(registry.active[0].execution_authorized);
+    }
+
+    #[test]
+    fn capital_launch_gate_opens_only_after_every_authorized_step_is_produced() {
+        let player = PlayerId(1);
+        let island = IslandId(7);
+        let anchor = GridPosition { x: 20, y: 10 };
+        let enemy = Entity::from_raw(10);
+        let mut registry = V4RollingPlanRegistry::default();
+        let selected = registry.select_for_operation(
+            player,
+            3,
+            OperationKind::AssaultCapital,
+            Some(island),
+            anchor,
+            vec![anchor],
+            HashSet::from([enemy]),
+            true,
+            None,
+            feasible_plan(0),
+            None,
+            HashSet::new(),
+        );
+        assert!(!registry.operation_launch_ready(player, island));
+
+        let step = registry
+            .current_step_ref(
+                selected.plan_id.expect("首都Plan"),
+                selected.revision.expect("revision"),
+                3,
+                selected.plan.purchases[0],
+            )
+            .expect("当手番の生産step");
+        registry.reconcile_produced_steps(player, &HashSet::from([step]));
+
+        assert!(registry.operation_launch_ready(player, island));
+    }
+
+    #[test]
+    fn delayed_capital_formation_is_replanned_instead_of_deferred_forever() {
+        let player = PlayerId(1);
+        let island = IslandId(7);
+        let anchor = GridPosition { x: 20, y: 10 };
+        let enemy = Entity::from_raw(10);
+        let mut registry = V4RollingPlanRegistry::default();
+        registry.select_for_operation(
+            player,
+            1,
+            OperationKind::AssaultCapital,
+            Some(island),
+            anchor,
+            vec![anchor],
+            HashSet::from([enemy]),
+            true,
+            None,
+            feasible_plan(0),
+            None,
+            HashSet::new(),
+        );
+        registry.active[0].steps[0].status = PurchaseStatus::Issued { turn: 3 };
+        registry.active[0]
+            .execution
+            .snapshot
+            .planned_first_attack_turn = Some(1);
+        let continuation = registry
+            .continuation_for_operation(
+                player,
+                3,
+                OperationKind::AssaultCapital,
+                Some(island),
+                &[anchor],
+                &HashSet::from([enemy]),
+            )
+            .expect("形成中計画");
+
+        let revised = registry.select_for_operation(
+            player,
+            3,
+            OperationKind::AssaultCapital,
+            Some(island),
+            anchor,
+            vec![anchor],
+            HashSet::from([enemy]),
+            true,
+            Some((continuation, Ok(feasible_plan(0)))),
+            feasible_plan(1),
+            None,
+            HashSet::new(),
+        );
+
+        assert_eq!(revised.disposition, PlanDisposition::Revised);
+        assert_eq!(revised.reason, Some(ReplanReason::FirstAttackDelayed));
+        assert_eq!(revised.revision, Some(PlanRevision(1)));
+    }
+
+    #[test]
     fn island_identity_survives_kind_anchor_property_and_enemy_changes() {
         let player = PlayerId(1);
         let island = IslandId(3);
@@ -1952,6 +2174,7 @@ mod tests {
             first_anchor,
             vec![first_anchor, remaining_city],
             HashSet::from([enemy]),
+            true,
             None,
             feasible_plan(0),
             None,
@@ -2001,6 +2224,7 @@ mod tests {
             anchor,
             vec![anchor],
             HashSet::from([first_enemy]),
+            true,
             None,
             feasible_plan(1),
             None,
@@ -2031,6 +2255,7 @@ mod tests {
             anchor,
             vec![anchor],
             HashSet::from([first_enemy, reinforcement]),
+            true,
             Some((continuation, Ok(stalled.clone()))),
             stalled,
             None,
@@ -2476,6 +2701,7 @@ mod tests {
             objectives[0],
             objectives.to_vec(),
             HashSet::new(),
+            true,
             None,
             feasible_plan(1),
             None,

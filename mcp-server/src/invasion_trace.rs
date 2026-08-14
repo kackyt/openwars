@@ -4,7 +4,6 @@ use bevy_ecs::event::EventCursor;
 use bevy_ecs::prelude::*;
 use serde::Serialize;
 
-use engine::ai::emergency::{CriticalSiteThreatKind, EmergencyMissionPlan, EmergencyResponse};
 use engine::ai::idle_audit::IdleAuditDiagnostics;
 use engine::ai::island_campaign::{
     IslandCampaignAssessment, IslandCampaignAssignment, IslandCampaignDecision,
@@ -155,52 +154,17 @@ pub struct IdleUnitSnapshot {
     pub x: usize,
     pub y: usize,
     pub squad_id: Option<u32>,
+    pub mission_type: Option<String>,
     /// 分類A: どのSquadにも属さない。
     pub no_mission: bool,
     /// 分類B: Squadには属するがそのターン一度も行動しなかった。
     pub mission_stalled: bool,
     /// 分類C: 行動可能なままターンを終えた。
     pub actionable: bool,
-}
-
-/// #76: 生産口封鎖に対して実際に割り当てられた解除任務。
-#[derive(Debug, Serialize)]
-pub struct FactoryReliefMissionSnapshot {
-    pub assigned_entity: u64,
-    pub threat_entity: u64,
-    pub site_x: usize,
-    pub site_y: usize,
-    pub site_terrain: String,
-    pub response: String,
-}
-
-pub fn snapshot_factory_relief_plan(
-    world: &World,
-    player_id: PlayerId,
-) -> Vec<FactoryReliefMissionSnapshot> {
-    let Some(plan) = world.get_resource::<EmergencyMissionPlan>() else {
-        return Vec::new();
-    };
-    plan.missions
-        .iter()
-        .filter(|mission| {
-            mission.owner_id == player_id
-                && mission.threat.kind == CriticalSiteThreatKind::ProductionBlockade
-        })
-        .map(|mission| FactoryReliefMissionSnapshot {
-            assigned_entity: mission.assigned_entity.to_bits(),
-            threat_entity: mission.threat.threat_entity.to_bits(),
-            site_x: mission.threat.site_position.x,
-            site_y: mission.threat.site_position.y,
-            site_terrain: mission.threat.site_terrain.as_str().to_string(),
-            response: match mission.response {
-                EmergencyResponse::EliminateThreat => "eliminate",
-                EmergencyResponse::OccupySite => "occupy",
-                EmergencyResponse::BlockRoute => "block_route",
-            }
-            .to_string(),
-        })
-        .collect()
+    /// Reserveは通常任務ではなく、明示的に管理された遊兵として数える。
+    pub reserve: bool,
+    /// Reserve入場手番を0とする経過手番数。
+    pub reserve_age: Option<u32>,
 }
 
 /// Squad 単位のダイジェスト。分類D（停滞Squad）はこの列のターン間差分で判定する。
@@ -214,6 +178,8 @@ pub struct IdleSquadSnapshot {
     pub target_island_id: Option<usize>,
     pub member_count: usize,
     pub acted_count: usize,
+    /// Reserveを含む実行Squadの構成兵種。member_countとの予実監査に使う。
+    pub member_unit_types: Vec<UnitType>,
 }
 
 /// 「遊兵ゼロ」指標のターン単位スナップショット。
@@ -228,6 +194,12 @@ pub struct IdleAuditSnapshot {
     pub mission_stalled_count: usize,
     /// 分類C: 行動可能なまま終了。
     pub actionable_count: usize,
+    /// 明示的な遊兵（Reserve）。
+    pub reserve_count: usize,
+    /// Unassigned + Reserve。
+    pub idle_count: usize,
+    /// 次の自軍手番にもReserveだったEntity数。
+    pub overdue_reserve_count: usize,
     pub units: Vec<IdleUnitSnapshot>,
     pub squads: Vec<IdleSquadSnapshot>,
 }
@@ -579,29 +551,6 @@ pub struct DeploymentAuditRecordSnapshot {
     pub forecast_package_cost: u32,
     pub forecast_package_size: u32,
     pub first_attack_eta_delta: Option<i64>,
-}
-
-/// 緊急迎撃が何を守るために、どの戦力をpreemptしたかを示す診断。
-#[derive(Debug, Serialize)]
-pub struct EmergencyPlanSnapshot {
-    pub player_id: u32,
-    pub missions: Vec<EmergencyMissionSnapshot>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct EmergencyMissionSnapshot {
-    pub assigned_entity_id: u64,
-    pub assigned_unit_type: Option<UnitType>,
-    pub threat_entity_id: u64,
-    pub threat_unit_type: Option<UnitType>,
-    pub threat_x: usize,
-    pub threat_y: usize,
-    pub site_x: usize,
-    pub site_y: usize,
-    pub site_terrain: String,
-    pub site_owner_id: Option<u32>,
-    pub eta: u32,
-    pub response: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1044,9 +993,15 @@ pub fn snapshot_idle_audit_for_player(
             x: record.position.x,
             y: record.position.y,
             squad_id: record.squad_id.map(|id| id.0),
+            mission_type: record
+                .mission_type
+                .as_ref()
+                .map(|mission| format!("{mission:?}")),
             no_mission: record.no_mission,
             mission_stalled: record.mission_stalled,
             actionable: record.actionable,
+            reserve: record.reserve,
+            reserve_age: record.reserve_age,
         })
         .collect();
 
@@ -1062,6 +1017,7 @@ pub fn snapshot_idle_audit_for_player(
             target_island_id: digest.target_island.map(|island| island.0),
             member_count: digest.member_count,
             acted_count: digest.acted_count,
+            member_unit_types: digest.member_unit_types.clone(),
         })
         .collect();
 
@@ -1071,6 +1027,9 @@ pub fn snapshot_idle_audit_for_player(
         no_mission_count: audit.no_mission_count(),
         mission_stalled_count: audit.mission_stalled_count(),
         actionable_count: audit.actionable_count(),
+        reserve_count: audit.reserve_count(),
+        idle_count: audit.idle_count(),
+        overdue_reserve_count: audit.overdue_reserve_count(),
         units,
         squads,
     })
@@ -1593,41 +1552,6 @@ fn plan_execution_snapshot(execution: &PlanExecutionSnapshot) -> PlanExecutionAu
             })
             .collect(),
     }
-}
-
-/// 現在手番の緊急迎撃について、対象拠点の所有者も含めて写し取る。
-pub fn snapshot_emergency_plan_for_player(
-    world: &World,
-    player_id: PlayerId,
-) -> Option<EmergencyPlanSnapshot> {
-    let plan = world.get_resource::<EmergencyMissionPlan>()?;
-    let missions = plan
-        .missions
-        .iter()
-        .filter(|mission| mission.owner_id == player_id)
-        .map(|mission| EmergencyMissionSnapshot {
-            assigned_entity_id: mission.assigned_entity.to_bits(),
-            assigned_unit_type: world
-                .get::<UnitStats>(mission.assigned_entity)
-                .map(|stats| stats.unit_type),
-            threat_entity_id: mission.threat.threat_entity.to_bits(),
-            threat_unit_type: world
-                .get::<UnitStats>(mission.threat.threat_entity)
-                .map(|stats| stats.unit_type),
-            threat_x: mission.threat.threat_position.x,
-            threat_y: mission.threat.threat_position.y,
-            site_x: mission.threat.site_position.x,
-            site_y: mission.threat.site_position.y,
-            site_terrain: format!("{:?}", mission.threat.site_terrain),
-            site_owner_id: mission.threat.site_owner_id.map(|owner| owner.0),
-            eta: mission.threat.eta,
-            response: format!("{:?}", mission.response),
-        })
-        .collect();
-    Some(EmergencyPlanSnapshot {
-        player_id: player_id.0,
-        missions,
-    })
 }
 
 pub fn snapshot_transport_squads(world: &World) -> Vec<TransportSquadSnapshot> {

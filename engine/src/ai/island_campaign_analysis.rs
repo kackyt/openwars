@@ -557,6 +557,11 @@ fn collect_existing_operations(
     let mut cargo_assignments = HashMap::new();
 
     for squad in squads {
+        // Reserveは次作戦へ再徴用できる待機配置であり、島作戦へcommit済みの
+        // 戦力として不足数やoperation_readyへ数えてはならない。
+        if squad.mission_type == MissionType::Reserve {
+            continue;
+        }
         let owned_transport = squad.transport_entity.filter(|transport| {
             unit_by_entity
                 .get(transport)
@@ -1597,6 +1602,84 @@ fn requirement_for_assessment(
     }
 }
 
+/// 敵首都の全施設数を、そのまま第一波の同時占領人数へ変換しない。
+/// 第一波は最大3施設を並行占領し、観測敵が残る場合は損耗交代要員を1体加える。
+/// 敵撃破に必要な戦力は価格や施設数ではなくV4の時系列Combat Planが別途決める。
+fn prepare_capital_assault_wave(candidate: &mut IslandCampaignCandidate) {
+    if candidate.assessment.decision != IslandCampaignDecision::Assault
+        || candidate
+            .existing_operation
+            .as_ref()
+            .is_some_and(|operation| {
+                matches!(
+                    operation.transport_phase,
+                    Some(TransportPhase::Pickup | TransportPhase::Transit | TransportPhase::Drop)
+                )
+            })
+    {
+        return;
+    }
+    let remaining_properties = candidate
+        .assessment
+        .neutral_properties
+        .saturating_add(candidate.assessment.enemy_properties);
+    if remaining_properties == 0 {
+        return;
+    }
+    let capture_units = capital_assault_capture_units(
+        remaining_properties,
+        candidate.assessment.enemy_combat_units,
+    );
+    candidate.requirement.capture_units = capture_units;
+    candidate.requirement.transport_slots = capture_units;
+    candidate.requirement.ground_combat_units = 0;
+    candidate.requirement.combat_units = 0;
+    candidate.requirement.total_budget = capture_units.saturating_mul(1_000);
+    candidate.assessment.required_budget = candidate.requirement.total_budget;
+    candidate.assault_transport_types = adapt_assault_requirement_to_production_route(
+        &mut candidate.assessment,
+        &mut candidate.requirement,
+        &candidate.producible_transports,
+    );
+}
+
+fn capital_assault_capture_units(remaining_properties: u32, enemy_combat_units: u32) -> u32 {
+    remaining_properties
+        .min(3)
+        .saturating_add(u32::from(enemy_combat_units > 0))
+}
+
+/// 首都作戦だけを集結状態へ戻す。局地Captureや防衛assignmentは変更しないため、
+/// 兵站の一時崩壊で全軍の命令が停止することはない。
+fn gate_capital_assault_launch(
+    portfolio: &mut IslandCampaignPortfolio,
+    capital_island: IslandId,
+    logistics_ready: bool,
+    combat_plan_ready: bool,
+) {
+    if logistics_ready && combat_plan_ready {
+        return;
+    }
+    if let Some(assignment) = portfolio
+        .active_offensives
+        .iter_mut()
+        .find(|assignment| assignment.island_id == capital_island)
+    {
+        assignment.operation_ready = false;
+    }
+    if let Some(assessment) = portfolio
+        .islands
+        .iter_mut()
+        .find(|assessment| assessment.island_id == capital_island)
+    {
+        assessment.decision_reason = if !logistics_ready {
+            "選択兵站路が未完了または崩壊したため、首都第一波だけを集結状態に戻す".to_owned()
+        } else {
+            "現在盤面から再計算した首都戦闘計画が未完成のため、第一波を集結させる".to_owned()
+        };
+    }
+}
+
 /// 同じ出発島で生産できる輸送手段から、占領要員を運べる暫定編成を返す。
 ///
 /// これは中立島向けの初便を止めないための互換経路であり、敵領Assaultの必要総数や
@@ -2006,10 +2089,9 @@ fn merge_campaign_assignment_sources(
     operations: &[ExistingCampaignOperation],
     produced_assignments: &HashMap<Entity, IslandId>,
 ) -> HashMap<Entity, IslandId> {
-    // 現在Squadを土台に、前手番Roadmapの確定binding、生産直後の発注意図の順で
-    // 上書きする。最新の発注意図と直前の確定作戦を優先することで、同じEntityを
-    // 防衛Squadと遠隔島作戦が同時に所有する矛盾を次手番へ持ち越さない。
-    let mut assigned_by_entity = HashMap::new();
+    // 生産直後の発注意図は未配属Entityの初期seedに限る。現在Squad、前手番Roadmapの
+    // 確定bindingの順で上書きし、再配置済みEntityを旧anchorへ巻き戻さない。
+    let mut assigned_by_entity = produced_assignments.clone();
     for operation in operations
         .iter()
         .filter(|operation| operation_has_live_capability(operation))
@@ -2028,11 +2110,6 @@ fn merge_campaign_assignment_sources(
             .iter()
             .map(|(entity, island_id)| (*entity, *island_id)),
     );
-    assigned_by_entity.extend(
-        produced_assignments
-            .iter()
-            .map(|(entity, island_id)| (*entity, *island_id)),
-    );
     assigned_by_entity
 }
 
@@ -2041,7 +2118,7 @@ pub fn analyze_island_campaign(world: &mut World, player_id: PlayerId) -> Island
     analyze_island_campaign_excluding(world, player_id, &HashSet::new())
 }
 
-/// 緊急ミッションへ予約済みのEntityを共有資源から除外して島嶼作戦を分析します。
+/// 既存の実行任務へ予約済みのEntityを共有資源から除外して島嶼作戦を分析します。
 pub fn analyze_island_campaign_excluding(
     world: &mut World,
     player_id: PlayerId,
@@ -2293,7 +2370,10 @@ pub fn analyze_island_campaign_excluding(
             existing_operation,
         });
     }
-    if crate::ai::resolve_player_ai_version(world, player_id).uses_operation_driven_production() {
+    let uses_operation_driven_production =
+        crate::ai::resolve_player_ai_version(world, player_id).uses_operation_driven_production();
+    let mut capital_launch_gate = None;
+    if uses_operation_driven_production {
         let turn = world
             .get_resource::<MatchState>()
             .map_or(0, |state| state.current_turn_number.0);
@@ -2313,6 +2393,21 @@ pub fn analyze_island_campaign_excluding(
             home_position,
             enemy_capital,
         );
+        let logistics_ready = logistics_registry
+            .plan(player_id)
+            .is_some_and(|plan| plan.selected_islands.is_empty());
+        if let Some((capital_island, _)) = enemy_capital {
+            if let Some(candidate) = candidates
+                .iter_mut()
+                .find(|candidate| candidate.assessment.island_id == capital_island)
+            {
+                prepare_capital_assault_wave(candidate);
+            }
+            let combat_plan_ready = world
+                .get_resource::<crate::ai::v4::plan_revision::V4RollingPlanRegistry>()
+                .is_some_and(|registry| registry.operation_launch_ready(player_id, capital_island));
+            capital_launch_gate = Some((capital_island, logistics_ready, combat_plan_ready));
+        }
         world.insert_resource(logistics_registry);
     } else {
         promote_logistics_prerequisite(
@@ -2324,7 +2419,16 @@ pub fn analyze_island_campaign_excluding(
             home_position,
         );
     }
-    allocate_campaign_portfolio(candidates, pool)
+    let mut portfolio = allocate_campaign_portfolio(candidates, pool);
+    if let Some((capital_island, logistics_ready, combat_plan_ready)) = capital_launch_gate {
+        gate_capital_assault_launch(
+            &mut portfolio,
+            capital_island,
+            logistics_ready,
+            combat_plan_ready,
+        );
+    }
+    portfolio
 }
 
 #[cfg(test)]
@@ -2343,7 +2447,14 @@ mod tests {
     const TEST_SEED: u64 = 42;
 
     #[test]
-    fn produced_intent_then_roadmap_override_stale_squad_assignment() {
+    fn capital_first_wave_uses_parallel_objectives_plus_one_casualty_replacement() {
+        assert_eq!(capital_assault_capture_units(15, 33), 4);
+        assert_eq!(capital_assault_capture_units(2, 1), 3);
+        assert_eq!(capital_assault_capture_units(2, 0), 2);
+    }
+
+    #[test]
+    fn roadmap_then_live_squad_override_produced_anchor() {
         let entity = Entity::from_raw(42);
         let roadmap_island = IslandId(1);
         let squad_island = IslandId(2);
@@ -2362,7 +2473,11 @@ mod tests {
 
         let assignments = merge_campaign_assignment_sources(&roadmap, &operations, &produced);
 
-        assert_eq!(assignments.get(&entity), Some(&intended_island));
+        assert_eq!(
+            assignments.get(&entity),
+            Some(&roadmap_island),
+            "生産時anchorは現在Roadmap bindingを上書きしない"
+        );
 
         let assignments = merge_campaign_assignment_sources(
             &HashMap::from([(entity, roadmap_island)]),

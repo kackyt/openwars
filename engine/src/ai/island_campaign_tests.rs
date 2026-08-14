@@ -659,7 +659,7 @@ fn secure_does_not_assign_a_disconnected_capture_unit() {
 }
 
 #[test]
-fn contest_preserves_capture_while_combat_intercepts_capture_threat() {
+fn contest_preserves_capture_while_combat_uses_campaign_attack() {
     let (mut world, master_data, player) = empty_v3_world();
     let opponent = PlayerId(2);
     let home = GridPosition { x: 0, y: 0 };
@@ -715,21 +715,18 @@ fn contest_preserves_capture_while_combat_intercepts_capture_threat() {
     assert_eq!(capture_squad.target_island, Some(island));
     assert_eq!(capture_squad.target, Some(neutral));
 
-    let interception_squad = manager
+    let attack_squad = manager
         .squads
         .iter()
         .find(|squad| squad.members.contains(&combat))
-        .expect("Contest combat Entity must intercept the immediate capture threat");
-    assert!(matches!(
-        interception_squad.mission_type,
-        MissionType::Interception(_)
-    ));
-    assert_eq!(interception_squad.target_island, None);
+        .expect("Contest combat Entity must receive a campaign attack duty");
+    assert_eq!(attack_squad.mission_type, MissionType::Attack);
+    assert_eq!(attack_squad.target_island, Some(island));
     assert_eq!(
-        interception_squad.target,
+        attack_squad.target,
         world.get::<GridPosition>(enemy).copied()
     );
-    assert!(!interception_squad.members.contains(&capture));
+    assert!(!attack_squad.members.contains(&capture));
     assert!(!capture_squad.members.contains(&combat));
 }
 
@@ -799,6 +796,20 @@ fn defend_uses_reserved_combat_entities_and_assignment_target() {
         .expect("Defend assignment must create a Defense Squad");
     assert_eq!(squad.target, Some(expected_target));
     assert_eq!(squad.members, expected_members);
+    let registry = world.resource::<crate::ai::operation_assignment::UnitOperationRegistry>();
+    for entity in &squad.members {
+        let assignment = registry
+            .assignment(*entity)
+            .expect("防衛担当も通常campaignの一意ownerへ接続されること");
+        assert_eq!(
+            assignment.owner,
+            crate::ai::operation_assignment::OperationOwner::Campaign {
+                player_id: player,
+                island_id: island,
+            }
+        );
+        assert_eq!(assignment.squad_id, Some(squad.id));
+    }
 }
 
 #[test]

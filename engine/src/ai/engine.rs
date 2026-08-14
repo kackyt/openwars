@@ -120,6 +120,8 @@ impl AiTurnStrategyCache {
         self.player_id == Some(player_id) && self.squads_planned
     }
 
+    /// 輸送完了・占領完了で手番途中にSquadを失ったEntityの再配置を、
+    /// 全通常行動が尽きた時点で1回だけ許可する。
     #[cfg(test)]
     pub(crate) fn set_campaign_production_plan(
         &mut self,
@@ -1266,34 +1268,6 @@ pub fn execute_ai_turn_v1(world: &mut World, active_player: PlayerId) -> Option<
     let mut decide_skip_entities = skip_entities.clone();
     decide_skip_entities.extend(mission_entities);
 
-    // #76: 生産口の直接封鎖はAI世代に依存しないルール上の危機として扱う。
-    // V1の輸送任務は維持し、未予約戦力から選んだ解除担当だけを共通の戦術評価へ渡す。
-    let factory_relief =
-        crate::ai::emergency::analyze_factory_relief(world, active_player, &decide_skip_entities);
-    let relief_entities = factory_relief.reserved_entities();
-    world.insert_resource(factory_relief);
-    if !relief_entities.is_empty() {
-        let mut relief_skip_entities = decide_skip_entities.clone();
-        let mut query = world.query::<(Entity, &Faction)>();
-        for (entity, faction) in query.iter(world) {
-            if faction.0 == active_player && !relief_entities.contains(&entity) {
-                relief_skip_entities.insert(entity);
-            }
-        }
-        if let Some((entity, command)) =
-            decide_ai_action_v2(world, active_player, &relief_skip_entities)
-        {
-            let cmd_str = format!("{:?}", command);
-            execute_ai_command(world, entity, command);
-            if let Some(mut res) = world.get_resource_mut::<AiActionCooldown>() {
-                res.0.insert(entity);
-            } else {
-                world.insert_resource(AiActionCooldown(HashSet::from([entity])));
-            }
-            return Some(cmd_str);
-        }
-    }
-
     if let Some((entity, command)) = decide_ai_action(world, active_player, &decide_skip_entities) {
         let cmd_str = format!("{:?}", command);
         execute_ai_command(world, entity, command);
@@ -1567,6 +1541,26 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
         return Some(cmd_str);
     }
 
+    // Drop/Capture/作戦完了で手番途中にSquadを失ったV4 Entityを、全通常行動が
+    // 尽きた時点で1度だけ再接続する。従来は次手番までownerだけが残り、
+    // 行動可能な歩兵・輸送役が生産拠点付近で遊兵化していた。
+    // Reserve行動そのものが目標到達でSquadを完了させる場合もあるため、一度で打ち切らず、
+    // 通常行動が尽きるたびに固定点を取り直す。行動候補が無ければそのまま生産へ進む。
+    let should_reassign_idle = is_v4;
+    if should_reassign_idle {
+        crate::ai::squad::reconcile_v4_end_turn_reserves(world, active_player);
+        if let Some((entity, command)) = decide_ai_action_v2(world, active_player, &skip_entities) {
+            let command_text = format!("{:?}", command);
+            execute_ai_command(world, entity, command);
+            if let Some(mut cooldown) = world.get_resource_mut::<AiActionCooldown>() {
+                cooldown.0.insert(entity);
+            } else {
+                world.insert_resource(AiActionCooldown(HashSet::from([entity])));
+            }
+            return Some(command_text);
+        }
+    }
+
     // 3. 生産行動
     // 生産内容は盤面・資金の変化ごとに従来通り再計画し、V3の島分析だけを同一ターンで共有する。
     let prod_commands = super::production::decide_production(world, active_player);
@@ -1629,13 +1623,16 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
         .map(|res| res.0.clone())
         .unwrap_or_default();
     let idle_audit = crate::ai::idle_audit::audit_idle_units(world, active_player, &acted_entities);
+    let idle_audit_turn = world
+        .get_resource::<crate::resources::MatchState>()
+        .map_or(0, |state| state.current_turn_number.0);
     if let Some(mut diagnostics) =
         world.get_resource_mut::<crate::ai::idle_audit::IdleAuditDiagnostics>()
     {
-        diagnostics.record(idle_audit);
+        diagnostics.record(idle_audit_turn, idle_audit);
     } else {
         let mut diagnostics = crate::ai::idle_audit::IdleAuditDiagnostics::default();
-        diagnostics.record(idle_audit);
+        diagnostics.record(idle_audit_turn, idle_audit);
         world.insert_resource(diagnostics);
     }
 
@@ -1854,16 +1851,12 @@ const AMBUSH_TOO_CLOSE_PENALTY: i32 = 3000;
 /// #45 (V3): 待ち受けゾーンとみなす最大射程からのマージン (敵の接近を想定)
 const AMBUSH_APPROACH_MARGIN: u32 = 2;
 
-/// 通常スコアとは別軸で緊急行動を比較する優先度。
+/// 通常スコアとは別軸で、生産目的から接続された攻撃だけを優先する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ActionPriority {
     Normal,
     /// V4の生産目的から接続された局地任務の敵を、通常の好機標的より先に攻撃する。
     DeploymentTargetNeutralization,
-    EmergencyAdvance,
-    EmergencyRouteBlock,
-    EmergencySiteOccupation,
-    EmergencyNeutralization,
 }
 
 #[derive(Debug, Clone)]
@@ -1922,48 +1915,6 @@ fn campaign_position_is_on_target_island(
         .get_resource::<crate::ai::islands::IslandMap>()
         .and_then(|islands| islands.get_island_at(&position))
         .is_some_and(|island| island.id == context.island_id)
-}
-
-fn emergency_position_priority(
-    mission: Option<&crate::ai::emergency::EmergencyMission>,
-    origin: GridPosition,
-    candidate: GridPosition,
-    map: &Map,
-) -> ActionPriority {
-    let Some(mission) = mission else {
-        return ActionPriority::Normal;
-    };
-    if candidate == mission.target_position {
-        return match mission.response {
-            crate::ai::emergency::EmergencyResponse::EliminateThreat => {
-                ActionPriority::EmergencyAdvance
-            }
-            crate::ai::emergency::EmergencyResponse::OccupySite => {
-                ActionPriority::EmergencySiteOccupation
-            }
-            crate::ai::emergency::EmergencyResponse::BlockRoute => {
-                ActionPriority::EmergencyRouteBlock
-            }
-        };
-    }
-
-    let original_distance = map.distance(
-        origin.x,
-        origin.y,
-        mission.target_position.x,
-        mission.target_position.y,
-    );
-    let candidate_distance = map.distance(
-        candidate.x,
-        candidate.y,
-        mission.target_position.x,
-        mission.target_position.y,
-    );
-    if candidate_distance < original_distance {
-        ActionPriority::EmergencyAdvance
-    } else {
-        ActionPriority::Normal
-    }
 }
 
 /// 新しいAI (V2/V3) 用の行動意思決定エンジン。
@@ -2113,11 +2064,6 @@ pub fn decide_ai_action_v2(
             .collect()
     };
     let damage_chart = world.resource::<crate::resources::DamageChart>().clone();
-    let emergency_plan = world
-        .get_resource::<crate::ai::emergency::EmergencyMissionPlan>()
-        .cloned()
-        .unwrap_or_default();
-
     let mut turn_cache = TurnDistanceCache::default();
     let mut best_overall_rank = (ActionPriority::Normal, i32::MIN);
     let mut best_overall_choice: Option<(Entity, AiCommand)> = None;
@@ -2148,9 +2094,6 @@ pub fn decide_ai_action_v2(
         };
 
         let is_combat_ineffective = atk_hp < 70 || (stats.max_ammo1 > 0 && atk_ammo.0 == 0);
-        let planned_emergency = emergency_plan.mission_for_entity(unit_entity);
-        let emergency_mission = planned_emergency
-            .filter(|mission| world.get_entity(mission.threat.threat_entity).is_ok());
         let deployment_target = world
             .get_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>()
             .and_then(|registry| registry.attack_target(unit_entity));
@@ -2182,12 +2125,7 @@ pub fn decide_ai_action_v2(
             &registry,
         );
 
-        let squad_target = if planned_emergency.is_some() && emergency_mission.is_none() {
-            // 同一ターン中に対象が消失した場合は、古い迎撃座標のSquad加点を無効化する。
-            None
-        } else {
-            unit_squad_targets.get(&unit_entity).copied()
-        };
+        let squad_target = unit_squad_targets.get(&unit_entity).copied();
         let initial_is_solo = solo_fallbacks.contains(&unit_entity) || squad_target.is_none();
 
         // 評価ロジック（is_solo: initial_is_solo を直接使う）
@@ -2660,10 +2598,7 @@ pub fn decide_ai_action_v2(
                 })
             {
                 let score = base_tile_score + 10000;
-                let rank = (
-                    emergency_position_priority(emergency_mission, pos, current_grid, &map),
-                    score,
-                );
+                let rank = (ActionPriority::Normal, score);
                 if rank > best_unit_rank {
                     best_unit_rank = rank;
                     best_unit_choice = Some(AiCommand::Capture {
@@ -2754,11 +2689,7 @@ pub fn decide_ai_action_v2(
                         }
 
                         let score = base_tile_score + attack_score;
-                        let priority = if emergency_mission
-                            .is_some_and(|mission| mission.threat.threat_entity == target_entity)
-                        {
-                            ActionPriority::EmergencyNeutralization
-                        } else if deployment_target == Some(target_entity) {
+                        let priority = if deployment_target == Some(target_entity) {
                             ActionPriority::DeploymentTargetNeutralization
                         } else {
                             ActionPriority::Normal
@@ -2820,10 +2751,7 @@ pub fn decide_ai_action_v2(
                 });
 
                 if !violates_campaign_step {
-                    let rank = (
-                        emergency_position_priority(emergency_mission, pos, current_grid, &map),
-                        score,
-                    );
+                    let rank = (ActionPriority::Normal, score);
                     if rank > best_unit_rank {
                         best_unit_rank = rank;
                         best_unit_choice = Some(AiCommand::Wait {
@@ -5078,6 +5006,7 @@ mod tests {
             drop_position: None,
             delivered_cargo: Vec::new(),
             allow_partial_departure: false,
+            departure_authorized: true,
             return_after_combat: false,
         });
         world.insert_resource(manager);

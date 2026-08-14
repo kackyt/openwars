@@ -53,6 +53,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 /// 揚陸可否キャッシュのキー：(輸送の移動タイプ, 積荷の移動タイプ, 出発地, 目標)
 type DeliveryKey = (MovementType, MovementType, (usize, usize), (usize, usize));
+type EngagementKey = (MovementType, (usize, usize), (usize, usize), u32);
 
 /// 到達性まわりの計算結果を、1 回の生産判断のあいだだけ再利用するためのコンテキスト。
 ///
@@ -62,6 +63,7 @@ type DeliveryKey = (MovementType, MovementType, (usize, usize), (usize, usize));
 struct ReachCtx {
     terrain: TerrainConnectivity,
     delivery: HashMap<DeliveryKey, bool>,
+    engagement: HashMap<EngagementKey, bool>,
 }
 
 impl ReachCtx {
@@ -76,6 +78,40 @@ impl ReachCtx {
     ) -> bool {
         self.terrain
             .is_reachable(map, registry, start, target, movement_type)
+    }
+
+    /// 標的位置そのものではなく、射程内の合法地形へ到達できるかを判定する。
+    /// 艦船の遠距離射撃を「陸上座標へ入れない」という理由で候補外にしない。
+    fn can_reach_engagement_envelope(
+        &mut self,
+        map: &Map,
+        registry: &MasterDataRegistry,
+        start: (usize, usize),
+        target: (usize, usize),
+        movement_type: MovementType,
+        max_range: u32,
+    ) -> bool {
+        let key = (movement_type, start, target, max_range.max(1));
+        if let Some(cached) = self.engagement.get(&key) {
+            return *cached;
+        }
+        let range = max_range.max(1);
+        let reachable = (0..map.height).any(|y| {
+            (0..map.width).any(|x| {
+                map.distance(x, y, target.0, target.1) <= range
+                    && map.get_terrain(x, y).is_some_and(|terrain| {
+                        crate::systems::movement::get_valid_movement_cost(
+                            registry,
+                            movement_type,
+                            terrain,
+                        )
+                        .is_some()
+                    })
+                    && self.is_reachable(map, registry, start, (x, y), movement_type)
+            })
+        });
+        self.engagement.insert(key, reachable);
+        reachable
     }
 }
 
@@ -1789,7 +1825,7 @@ fn plan_production_with_registry(
             .and_then(|objective| objective.logistics_rank)
             .unwrap_or(u32::MAX);
         (
-            op.kind.priority_rank(),
+            operation_priority_rank(op),
             logistics_rank,
             op.facts.enemy_contact_eta,
         )
@@ -1873,7 +1909,7 @@ fn plan_production_with_registry(
     let mut used_facilities: HashSet<GridPosition> = HashSet::new();
     // 占有済みという事実だけでなく、どの作戦が枠を使ったかも保持する。
     // これにより占領作戦同士の競合を「上位防衛による中断」と誤認しない。
-    let mut facility_owners: HashMap<GridPosition, OperationKind> = HashMap::new();
+    let mut facility_owners: HashMap<GridPosition, u32> = HashMap::new();
     // rolling plannerは1作戦につき1回だけ実行し、その混成パッケージの当手番分を
     // 施設ごとに順次消費する。施設を1つ埋めるたびに同じbeam searchをやり直さない。
     let mut rolling_plans: HashMap<usize, SelectedPlan> = HashMap::new();
@@ -1976,7 +2012,7 @@ fn plan_production_with_registry(
                             let claimed_by_higher_priority = facility_owners
                                 .get(&purchase.facility)
                                 .is_some_and(|owner| {
-                                    owner.priority_rank() < operation_kind.priority_rank()
+                                    *owner < operation_priority_rank(&operations[op_index])
                                 });
                             let claimed_by_campaign = scan
                                 .production_facilities
@@ -2010,6 +2046,7 @@ fn plan_production_with_registry(
                     operation_anchor,
                     operations[op_index].objective_properties.clone(),
                     target_enemies,
+                    operations[op_index].execution_authorized,
                     evaluated_continuation,
                     candidate_plan,
                     input.hard_deadline,
@@ -2182,7 +2219,10 @@ fn plan_production_with_registry(
 
         remaining_funds = remaining_funds.saturating_sub(candidate.cost);
         used_facilities.insert(candidate.facility);
-        facility_owners.insert(candidate.facility, operation_kind);
+        facility_owners.insert(
+            candidate.facility,
+            operation_priority_rank(&operations[op_index]),
+        );
         let mut deployment =
             planned_deployment(scan, &mut ctx, &operations[op_index], slot_kind, &candidate);
         if slot_kind == SlotKind::Combat
@@ -2565,12 +2605,13 @@ fn combat_plan_input(
                     unit.stats.unit_type,
                     enemy.stats.unit_type,
                 ) > 0
-                    && ctx.is_reachable(
+                    && ctx.can_reach_engagement_envelope(
                         &scan.map,
                         &scan.master_data,
                         (unit.pos.x, unit.pos.y),
                         (enemy.position.x, enemy.position.y),
                         unit.stats.movement_type,
+                        unit.stats.max_range,
                     ))
                 .then_some(index)
             })
@@ -2610,33 +2651,29 @@ fn combat_plan_input(
         &scan.master_data,
         planning_horizon,
         |facility, stats| {
-            let self_deployable = ctx.is_reachable(
-                &scan.map,
-                &scan.master_data,
-                (facility.x, facility.y),
-                (op.anchor.x, op.anchor.y),
-                stats.movement_type,
-            );
-            if require_self_deployment && !self_deployable {
-                return false;
-            }
-            can_join_operation(
-                scan,
-                ctx,
-                &op.anchor,
-                op.facts.requires_transport,
-                &facility,
-                stats,
-            ) && enemies.iter().any(|enemy| {
+            let can_engage = enemies.iter().any(|enemy| {
                 best_damage(&scan.damage_chart, stats.unit_type, enemy.stats.unit_type) > 0
-                    && ctx.is_reachable(
+                    && ctx.can_reach_engagement_envelope(
                         &scan.map,
                         &scan.master_data,
                         (facility.x, facility.y),
                         (enemy.position.x, enemy.position.y),
                         stats.movement_type,
+                        stats.max_range,
                     )
-            })
+            });
+            if require_self_deployment {
+                return can_engage;
+            }
+            can_engage
+                || can_join_operation(
+                    scan,
+                    ctx,
+                    &op.anchor,
+                    op.facts.requires_transport,
+                    &facility,
+                    stats,
+                )
         },
     );
     // この手番に既に使った施設は将来手番には再利用できるが、build_turn=0では使えない。
@@ -2653,12 +2690,13 @@ fn combat_plan_input(
                     option.stats.unit_type,
                     enemy.stats.unit_type,
                 ) > 0
-                    && ctx.is_reachable(
+                    && ctx.can_reach_engagement_envelope(
                         &scan.map,
                         &scan.master_data,
                         (option.purchase.facility.x, option.purchase.facility.y),
                         (enemy.position.x, enemy.position.y),
                         option.stats.movement_type,
+                        option.stats.max_range,
                     ))
                 .then_some(index)
             })
@@ -2699,18 +2737,9 @@ fn planned_deployment(
             (0..op.unreachable_threats.len()).collect(),
         ),
         SlotKind::Combat => {
-            let self_deployable = ctx.is_reachable(
-                &scan.map,
-                &scan.master_data,
-                (candidate.facility.x, candidate.facility.y),
-                (op.anchor.x, op.anchor.y),
-                stats.movement_type,
-            );
-            let origin = if self_deployable {
-                candidate.facility
-            } else {
-                op.anchor
-            };
+            // Combatは標的位置ではなく射撃圏へ自力展開する。艦船を陸上anchorへ
+            // 仮置きすると到達判定が再び失敗するため、生産施設を常に起点とする。
+            let origin = candidate.facility;
             (
                 &op.reachable_threats,
                 reachable_threat_indices(scan, ctx, &op.reachable_threats, origin, stats),
@@ -2770,6 +2799,26 @@ fn most_starved_slot(operations: &[Operation]) -> Option<(usize, SlotKind)> {
         .or_else(|| most_starved_in_tier(operations, SlotTier::Residual))
 }
 
+/// 生産枠の実効優先度。すべて同じ作戦集合で比較し、別枠の緊急作戦は作らない。
+/// Defenseは敵接触ETAと展開リードタイムから優先度を上げるが、必要枠だけを取得する。
+fn operation_priority_rank(operation: &Operation) -> u32 {
+    let defense_cannot_wait = operation.kind == OperationKind::Defense
+        && operation.facts.enemy_combat_units > 0
+        && operation.facts.enemy_contact_eta
+            <= operation.facts.deploy_lead_time.max(1).saturating_add(1);
+    match (
+        operation.kind,
+        operation.execution_authorized,
+        defense_cannot_wait,
+    ) {
+        (OperationKind::Defense, _, true) => 0,
+        (OperationKind::AssaultCapital, true, _) => 1,
+        (OperationKind::Defense, _, false) => 2,
+        (OperationKind::Capture, _, _) => 3,
+        (OperationKind::AssaultCapital, false, _) => 4,
+    }
+}
+
 /// 指定した段階の中で最も飢えた枠を返す。
 fn most_starved_in_tier(operations: &[Operation], tier: SlotTier) -> Option<(usize, SlotKind)> {
     let mut best: Option<(usize, SlotKind, (u32, usize, f32))> = None;
@@ -2783,7 +2832,7 @@ fn most_starved_in_tier(operations: &[Operation], tier: SlotTier) -> Option<(usi
                 // 前提条件は「どの作戦を先に成立させるか」で並べる。
                 // 作戦の優先度 → 枠の固定優先順位（SLOT_PRIORITY は作戦遂行の
                 // 前提から順に並んでいる）→ 未充足率。
-                SlotTier::Prerequisite => (op.kind.priority_rank(), priority, -deficit),
+                SlotTier::Prerequisite => (operation_priority_rank(op), priority, -deficit),
                 // 余剰は作戦の別なく、未充足率だけで配る。
                 // ここで作戦優先度を先に見てはならない。撃破枠の要求は青天井なので、
                 // 最優先の作戦（＝自陣の防衛）が全額を吸い、渡洋作戦には 1 円も
@@ -2859,12 +2908,13 @@ fn reachable_threat_indices(
         .iter()
         .enumerate()
         .filter(|(_, threat)| {
-            ctx.is_reachable(
+            ctx.can_reach_engagement_envelope(
                 &scan.map,
                 &scan.master_data,
                 (origin.x, origin.y),
                 (threat.position.x, threat.position.y),
                 stats.movement_type,
+                stats.max_range,
             )
         })
         .map(|(index, _)| index)
@@ -3766,6 +3816,23 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn ranged_ship_can_join_land_assault_from_reachable_firing_envelope() {
+        let registry = MasterDataRegistry::load().unwrap();
+        let map = strait_map(None);
+        let mut ctx = ReachCtx::default();
+
+        assert!(!ctx.is_reachable(&map, &registry, (1, 1), (8, 1), MovementType::Ship,));
+        assert!(ctx.can_reach_engagement_envelope(
+            &map,
+            &registry,
+            (1, 1),
+            (8, 1),
+            MovementType::Ship,
+            3,
+        ));
+    }
+
     /// 自陣側の港からでも、自陣の陸地が目標なら当然届けられる（退行検出用）
     #[test]
     fn ship_can_deliver_cargo_back_to_its_own_shore() {
@@ -4492,6 +4559,72 @@ mod tests {
         ];
 
         assert_eq!(most_starved_slot(&ops), Some((0, SlotKind::Combat)));
+    }
+
+    #[test]
+    fn authorized_capital_outranks_non_imminent_local_operations_only() {
+        let mut capture = operation(
+            OperationKind::Capture,
+            OperationSlots {
+                transport_slots: 1,
+                ..OperationSlots::default()
+            },
+            OperationSlots::default(),
+        );
+        capture.execution_authorized = true;
+        let mut capital = operation(
+            OperationKind::AssaultCapital,
+            OperationSlots {
+                combat_plan_required: 1,
+                ..OperationSlots::default()
+            },
+            OperationSlots::default(),
+        );
+        capital.execution_authorized = true;
+        let mut distant_defense = operation(
+            OperationKind::Defense,
+            OperationSlots {
+                combat_plan_required: 1,
+                ..OperationSlots::default()
+            },
+            OperationSlots::default(),
+        );
+        distant_defense.facts.enemy_combat_units = 1;
+        distant_defense.facts.enemy_contact_eta = 6;
+        distant_defense.facts.deploy_lead_time = 1;
+
+        let ops = vec![capture, distant_defense, capital];
+        assert_eq!(most_starved_slot(&ops), Some((2, SlotKind::Combat)));
+    }
+
+    #[test]
+    fn defense_urgency_raises_normal_operation_priority_without_deleting_capital() {
+        let mut capital = operation(
+            OperationKind::AssaultCapital,
+            OperationSlots {
+                combat_plan_required: 1,
+                ..OperationSlots::default()
+            },
+            OperationSlots::default(),
+        );
+        capital.execution_authorized = true;
+        let mut defense = operation(
+            OperationKind::Defense,
+            OperationSlots {
+                combat_plan_required: 1,
+                ..OperationSlots::default()
+            },
+            OperationSlots::default(),
+        );
+        defense.facts.enemy_combat_units = 1;
+        defense.facts.enemy_contact_eta = 1;
+        defense.facts.deploy_lead_time = 2;
+
+        let ops = vec![capital, defense];
+        assert_eq!(operation_priority_rank(&ops[0]), 1);
+        assert_eq!(operation_priority_rank(&ops[1]), 0);
+        assert_eq!(most_starved_slot(&ops), Some((1, SlotKind::Combat)));
+        assert_eq!(ops[0].slots.combat_plan_required, 1);
     }
 
     /// 島作戦の不足はV4汎用作戦より先に発注し、不完全なパッケージの途中で

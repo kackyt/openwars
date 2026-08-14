@@ -501,27 +501,12 @@ impl OpenWarsAiServer {
 
             let mut actions_taken = vec![];
             let mut invasion_events = vec![];
-            let mut factory_relief = vec![];
             let mut step = 0usize;
             loop {
                 let turn = state.world.resource::<MatchState>().current_turn_number.0;
                 let units_before = invasion_trace::snapshot_units(&mut state.world);
                 let action_taken =
                     engine::ai::engine::execute_ai_turn(&mut state.world, active_player_id);
-                // 解除攻撃で対象が消える前に、この手番中に一度でも生成された計画を保持する。
-                for mission in
-                    invasion_trace::snapshot_factory_relief_plan(&state.world, active_player_id)
-                {
-                    if !factory_relief.iter().any(
-                        |existing: &invasion_trace::FactoryReliefMissionSnapshot| {
-                            existing.assigned_entity == mission.assigned_entity
-                                && existing.threat_entity == mission.threat_entity
-                        },
-                    ) {
-                        factory_relief.push(mission);
-                    }
-                }
-
                 // イベント処理後に、実行済みの侵攻イベントだけを構造化して収集する。
                 state.schedule.run(&mut state.world);
                 invasion_events.extend(state.invasion_trace.collect_step(
@@ -567,8 +552,6 @@ impl OpenWarsAiServer {
                 invasion_trace::snapshot_victory_roadmap_for_player(&state.world, active_player_id);
             let logistics_plan =
                 invasion_trace::snapshot_logistics_plan_for_player(&state.world, active_player_id);
-            let emergency_plan =
-                invasion_trace::snapshot_emergency_plan_for_player(&state.world, active_player_id);
             let after_metrics = engine::ai::eval::evaluate_board_with_metrics(
                 &mut state.world,
                 active_player_id,
@@ -588,8 +571,6 @@ impl OpenWarsAiServer {
                 "plan_executions": plan_executions,
                 "victory_roadmap": victory_roadmap,
                 "logistics_plan": logistics_plan,
-                "emergency_plan": emergency_plan,
-                "factory_relief": factory_relief,
                 "player_id": active_player_id.0,
                 "player_index": active_player_index.0,
                 "before_score": before_metrics.total_score,

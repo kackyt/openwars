@@ -402,6 +402,27 @@ fn selected_evaluation(
     )
 }
 
+fn capital_assault_index(
+    candidates: &[IslandCampaignCandidate],
+    enemy_capital_island: IslandId,
+) -> Option<usize> {
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate.assessment.decision == IslandCampaignDecision::Assault
+                && candidate.assessment.island_id == enemy_capital_island
+        })
+        .min_by_key(|(_, candidate)| {
+            (
+                candidate.transport_eta.unwrap_or(u32::MAX),
+                candidate.assessment.required_budget,
+                candidate.assessment.island_id.0,
+            )
+        })
+        .map(|(index, _)| index)
+}
+
 /// 現在盤面の候補を比較し、コミット済み経路を維持または明示的に改訂したうえで
 /// 選択島を兵站前提へ昇格する。
 #[allow(clippy::too_many_arguments)]
@@ -425,25 +446,12 @@ pub(crate) fn apply_persistent_logistics_plan(
     let Some((enemy_capital_island, enemy_capital_position)) = enemy_capital else {
         return;
     };
-    let Some(assault_index) = candidates
-        .iter()
-        .enumerate()
-        .filter(|(_, candidate)| {
-            candidate.assessment.decision == IslandCampaignDecision::Assault
-                && candidate.existing_operation.is_none()
-                && candidate.assessment.island_id == enemy_capital_island
-        })
-        .min_by_key(|(_, candidate)| {
-            (
-                candidate.transport_eta.unwrap_or(u32::MAX),
-                candidate.assessment.required_budget,
-                candidate.assessment.island_id.0,
-            )
-        })
-        .map(|(index, _)| index)
-    else {
+    let Some(assault_index) = capital_assault_index(candidates, enemy_capital_island) else {
         return;
     };
+    // 首都の構造波は兵站gate前からForming assignmentを持ち得る。
+    // existing_operationを理由にここで返すと、その後は固定経路の完了を二度と観測できず、
+    // selected_islandsが永久に残って首都攻略認可が開かない。
     let assault = candidates[assault_index].clone();
     let Some(home) = home_position else {
         return;
@@ -647,6 +655,11 @@ pub(crate) fn apply_persistent_logistics_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::island_campaign::{
+        CampaignSustainmentTargets, ExistingCampaignOperation, IslandCampaignAssessment,
+        IslandCampaignRequirement, IslandCampaignState,
+    };
+    use crate::ai::squad::TransportPhase;
 
     fn option(
         id: usize,
@@ -685,6 +698,72 @@ mod tests {
             require_air: true,
             require_sea: false,
         }
+    }
+
+    fn capital_candidate_with_existing_operation() -> IslandCampaignCandidate {
+        let island_id = IslandId(7);
+        let target = GridPosition { x: 20, y: 1 };
+        IslandCampaignCandidate {
+            assessment: IslandCampaignAssessment {
+                island_id,
+                state: IslandCampaignState::EnemyHeld,
+                decision: IslandCampaignDecision::Assault,
+                state_reason: String::new(),
+                decision_reason: String::new(),
+                pause_cause: None,
+                neutral_properties: 0,
+                friendly_properties: 0,
+                enemy_properties: 15,
+                friendly_combat_units: 0,
+                enemy_combat_units: 10,
+                friendly_arrival_eta: None,
+                enemy_arrival_eta: None,
+                friendly_capture_eta: None,
+                enemy_capture_eta: None,
+                roi_production_sites: 3,
+                transport_eta: Some(4),
+                expansion_payback_turns: None,
+                required_budget: 12_000,
+                allocated_budget: 12_000,
+            },
+            target_position: target,
+            capture_target_positions: vec![target],
+            priority_enemy_types: Vec::new(),
+            roi_production_sites: 3,
+            transport_eta: Some(4),
+            ground_sustainment_sites: 1,
+            air_sustainment_sites: 1,
+            sea_sustainment_sites: 1,
+            sustainment_targets: CampaignSustainmentTargets::default(),
+            island_income_per_turn: 10_000,
+            logistics_prerequisite: false,
+            logistics_priority_rank: None,
+            requirement: IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 4,
+                capture_units: 4,
+                ground_combat_units: 0,
+                combat_units: 0,
+                total_budget: 12_000,
+            },
+            assault_transport_types: Vec::new(),
+            producible_transports: Vec::new(),
+            existing_operation: Some(ExistingCampaignOperation {
+                island_id,
+                target_position: target,
+                transport_phase: Some(TransportPhase::Pickup),
+                is_forming: true,
+                transport_entities: Vec::new(),
+                capture_entities: Vec::new(),
+                combat_entities: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn existing_capital_formation_remains_the_logistics_observation_target() {
+        let candidate = capital_candidate_with_existing_operation();
+        assert_eq!(capital_assault_index(&[candidate], IslandId(7)), Some(0));
     }
 
     #[test]

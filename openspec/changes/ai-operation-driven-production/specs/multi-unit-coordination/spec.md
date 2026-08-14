@@ -47,7 +47,7 @@ MUST: AIは1つの目標に対して、適切な数のユニットを連携さ�
 #### Scenario: 購入待ちplaceholderへ生産済みEntityを接続する
 
 - **WHEN** 空のForming placeholderが存在する島作戦へ、後の手番で輸送役またはremote cargoが割り当てられたとき
-- **THEN** 新しいEntityを同じplaceholderへ追加入隊させ、代表輸送役だけでなく輸送Squadの全membersとcargoを汎用行動および緊急迎撃から除外する
+- **THEN** 新しいEntityを同じplaceholderへ追加入隊させ、代表輸送役だけでなく輸送Squadの全membersとcargoを汎用行動および別作戦の重複割当から除外する
 
 #### Scenario: 同一輸送役から複数cargoを同一手番に降車させる
 
@@ -130,7 +130,7 @@ MUST: AIは各自軍Entityを同時に1つの作戦ownerおよび1つの具体Sq
 #### Scenario: 別島作戦への重複混入を正規化する
 
 - **WHEN** 同じEntityが異なる島を対象とする複数Squadへ混入したとき
-- **THEN** 明示的なportfolio再計画、生産時意図、物理搭載、緊急任務の規則で1作戦だけを選び、他のSquadのmembers、cargo、delivered参照から同じ手番の行動選択前に除去する
+- **THEN** 明示的なportfolio再計画、生産時意図、物理搭載の規則で1作戦だけを選び、他のSquadのmembers、cargo、delivered参照から同じ手番の行動選択前に除去する
 
 #### Scenario: 作戦再計画で所有権を排他的に移管する
 
@@ -146,3 +146,32 @@ MUST: AIは各自軍Entityを同時に1つの作戦ownerおよび1つの具体Sq
 
 - **WHEN** 1手番のSquad計画と行動選択を行うとき
 - **THEN** 一意性検証はplanning境界のO(U+R)正規化に限定し、以後のowner照会はEntityキーの平均O(1) lookupを使用する
+
+### Requirement: 遊兵の有界再割当
+
+MUST: V4は`Unassigned + Reserve`を遊兵として監査し、Unassignedをplanning境界で0件にし、Reserveを次の自軍手番までに通常作戦へ再割当しなければならない。
+
+#### Scenario: Reserveを次手番の再割当入力に戻す
+
+- **WHEN** 前の自軍手番末にReserveへ入った生存Entityが次の自軍手番を迎えたとき
+- **THEN** Reserve Squadを外して現行Campaign、deployment、島portfolio、首都Forming、輸送波の順に再接続し、同じEntityを理由なく再びReserveへ残さない
+
+#### Scenario: 未配備輸送を待つ既存占領兵を作戦へ保持する
+
+- **WHEN** 海外作戦に既存の占領兵がいるが、同じ手番に適合する輸送役が存在しないとき
+- **THEN** 占領兵を当該CampaignのTransport/Forming cargoへ接続し、Reserveへ落として同型占領兵を再生産しない
+
+#### Scenario: 到着期限をsoft limitとして扱う
+
+- **WHEN** 既存Entityの予想到着が予定手番を超えるが、合法に作戦へ到達でき、新規生産より早いか安いとき
+- **THEN** 期限超過だけで候補から除外せず、遅延を予実差として記録して作戦へ割り当てる
+
+#### Scenario: 生産時anchorから別作戦へ再配置する
+
+- **WHEN** 生産時anchorへ照合済みのEntityを現在のportfolioまたは勝利Roadmapが別作戦へ明示移管したとき
+- **THEN** 生産記録を照合完了にし、旧anchorで現在ownerを上書きせず、新作戦の具体SquadとRoadmap実績へ接続する
+
+#### Scenario: Reserve期限超過を計測する
+
+- **WHEN** EntityがReserveへ入った手番と次の自軍手番を監査するとき
+- **THEN** 入った手番をage 0、次の自軍手番にもReserveならage 1として出力し、`age >= 1`を期限超過件数へ含める。行動済みでもReserveから除外しない

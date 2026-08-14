@@ -234,6 +234,45 @@ pub struct VictoryRoadmapRegistry {
 }
 
 impl VictoryRoadmapRegistry {
+    /// 局地portfolioが兵站gate待ちで首都作戦をまだ公開していない期間も、
+    /// 勝利条件から消えない常在AssaultCapitalの島とanchorを返す。
+    pub(crate) fn active_capital_objective(
+        &self,
+        player_id: PlayerId,
+    ) -> Option<(IslandId, GridPosition)> {
+        self.operations
+            .values()
+            .filter(|operation| {
+                operation.player_id == player_id
+                    && operation.active
+                    && operation.purpose == StrategicPurpose::AssaultCapital
+            })
+            .min_by_key(|operation| operation.id.0)
+            .map(|operation| (operation.island_id, operation.tactical_anchor))
+    }
+
+    /// 局地portfolioのgate外でも形成を続けている首都強襲Entityを返す。
+    /// 次ターンのportfolio更新が「未claim」と誤認して作戦所有権を外さないための集合で、
+    /// inactive化した作戦は対象に含めない。
+    pub(crate) fn active_capital_entities(&self, player_id: PlayerId) -> HashSet<Entity> {
+        self.operations
+            .values()
+            .filter(|operation| {
+                operation.player_id == player_id
+                    && operation.active
+                    && operation.purpose == StrategicPurpose::AssaultCapital
+            })
+            .flat_map(|operation| {
+                operation
+                    .assigned_transports
+                    .iter()
+                    .chain(operation.assigned_capturers.iter())
+                    .chain(operation.assigned_combat.iter())
+                    .copied()
+            })
+            .collect()
+    }
+
     pub fn roadmap(&self, player_id: PlayerId) -> Option<&VictoryRoadmap> {
         self.roadmaps.get(&player_id)
     }
@@ -1952,6 +1991,35 @@ pub(crate) fn reconcile_campaign_roadmap(
                     });
             }
         }
+        // 兵站gateが開く前に既存戦力を首都攻略の後続波へ回した場合も、
+        // 局地portfolioと同じくSquadから実Entityを拾う。これがないと毎ターン
+        // Campaign→Reserve→Campaignを循環して、形成済み戦力の予実が分断される。
+        for squad in manager.squads.iter().filter(|squad| {
+            squad.owner_id == Some(player_id) && squad.target_island == Some(capital_island)
+        }) {
+            if let Some(transport) = squad.transport_entity {
+                registry.bind_entity_exclusive(
+                    operation_id,
+                    transport,
+                    OperationEntityRole::Transport,
+                );
+            }
+            for cargo in squad
+                .cargo_entities
+                .iter()
+                .chain(squad.delivered_cargo.iter())
+            {
+                let role = if world
+                    .get::<crate::components::UnitStats>(*cargo)
+                    .is_some_and(|stats| stats.can_capture)
+                {
+                    OperationEntityRole::Capture
+                } else {
+                    OperationEntityRole::Combat
+                };
+                registry.bind_entity_exclusive(operation_id, *cargo, role);
+            }
+        }
     }
 
     // Combat枠で生産されたEntityはIslandCampaignAssignmentとは別台帳にいる。
@@ -2003,15 +2071,15 @@ pub(crate) fn reconcile_campaign_roadmap(
                 .iter()
                 .chain(operation.assigned_capturers.iter())
                 .chain(operation.assigned_combat.iter())
-                .map(move |entity| (*entity, operation.island_id))
+                .copied()
         })
         .collect::<Vec<_>>();
     world.insert_resource(registry);
     if let Some(mut execution) =
         world.get_resource_mut::<crate::ai::v4::campaign_execution::V4CampaignExecutionRegistry>()
     {
-        for (entity, island_id) in assigned_campaign_entities {
-            execution.mark_assigned(entity, island_id, turn);
+        for entity in assigned_campaign_entities {
+            execution.mark_assigned(entity, turn);
         }
     }
 }
