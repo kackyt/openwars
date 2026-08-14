@@ -502,11 +502,45 @@ impl OpenWarsAiServer {
             let mut actions_taken = vec![];
             let mut invasion_events = vec![];
             let mut step = 0usize;
+            // 1手番の正常な行動数は、盤上Entityと生産施設数に対して線形である。
+            // Cooldown漏れなどで同一Entityが再選択され続けた場合にstdio応答を永久に
+            // 返さない状態を避け、末尾の実行手を診断可能なエラーとして返す。
+            let unit_count = state
+                .world
+                .query::<&engine::components::Faction>()
+                .iter(&state.world)
+                .count();
+            let max_steps = unit_count.saturating_mul(4).saturating_add(64);
+            let trace_ai_steps = std::env::var_os("OPENWARS_TRACE_AI_STEPS").is_some();
             loop {
+                if step >= max_steps {
+                    let recent_actions = actions_taken
+                        .iter()
+                        .rev()
+                        .take(8)
+                        .rev()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    return Err(format!(
+                        "AI turn exceeded {max_steps} steps (units={unit_count}, recent_actions={recent_actions:?})"
+                    ));
+                }
                 let turn = state.world.resource::<MatchState>().current_turn_number.0;
+                if trace_ai_steps {
+                    eprintln!(
+                        "simulate_ai_turn begin player={} turn={} step={}",
+                        active_player_id.0, turn, step
+                    );
+                }
                 let units_before = invasion_trace::snapshot_units(&mut state.world);
                 let action_taken =
                     engine::ai::engine::execute_ai_turn(&mut state.world, active_player_id);
+                if trace_ai_steps {
+                    eprintln!(
+                        "simulate_ai_turn decided player={} turn={} step={} action={:?}",
+                        active_player_id.0, turn, step, action_taken
+                    );
+                }
                 // イベント処理後に、実行済みの侵攻イベントだけを構造化して収集する。
                 state.schedule.run(&mut state.world);
                 invasion_events.extend(state.invasion_trace.collect_step(

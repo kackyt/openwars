@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 // 1施設手番ごとの候補を順に展開するため、同手番に複数施設を使う混成案が
 // beamから落ちない幅を確保する。候補全体の直積を走査する旧方式には戻さない。
-const SEARCH_BEAM_WIDTH: usize = 64;
+pub(crate) const SEARCH_BEAM_WIDTH: usize = 64;
 pub(crate) const DEFAULT_SEARCH_TURNS: u32 = 12;
 
 #[derive(Debug, Clone)]
@@ -73,6 +73,8 @@ pub(crate) struct RollingPlanInput {
     pub required_capture_survivors: usize,
     /// 占領が1ターン遅れる機会損失。実行可能案同士の比較にだけ用いる。
     pub delay_cost_per_turn: u32,
+    /// 作戦規模ごとのbeam幅。局地作戦は毎手番再評価するため、首都本隊より小さくできる。
+    pub search_beam_width: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,7 +277,8 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
             update_best_effort(&mut best_effort, &plan);
             evaluated_next.push((state, plan));
         }
-        if evaluated_next.len() > SEARCH_BEAM_WIDTH {
+        let beam_width = input.search_beam_width.clamp(1, SEARCH_BEAM_WIDTH);
+        if evaluated_next.len() > beam_width {
             truncated = true;
             evaluated_next.sort_by_key(|(_, plan)| {
                 (
@@ -285,7 +288,7 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
                     plan.production_cost,
                 )
             });
-            evaluated_next.truncate(SEARCH_BEAM_WIDTH);
+            evaluated_next.truncate(beam_width);
         }
         frontier = evaluated_next.into_iter().map(|(state, _)| state).collect();
         if frontier.is_empty() {
@@ -297,6 +300,12 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
         .or(best_feasible)
         // 期限内に全滅できる案が無くても、何も作らず停止しない。
         .or(best_effort)?;
+    if !selected.feasible {
+        // 実行不能な将来列のために現在の空き施設と現金を寝かせない。今出せる
+        // 直接戦闘要員を前線screenとして加え、資金が競合する最も遅い予定から
+        // 次revisionへ送り返す。実行可能案の高価な必須counter予約には触れない。
+        selected = fill_best_effort_current_screen(input, selected, search_turns);
+    }
     // 同じ施設・同じ兵種を後の手番に置く理由がなく、資金も足りるなら最早枠へ寄せる。
     // beam探索では将来収入で複数機を買う枝が残りやすいため、編成を変えずに
     // 生産だけを前倒しして「計画はあるのに今手番の施設が遊ぶ」状態を除く。
@@ -311,6 +320,136 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
     selected.candidates_considered = considered;
     selected.search_truncated = truncated;
     Some(selected)
+}
+
+/// best-effort案の未使用current slotを、即時投入できる直接戦闘unitで埋める。
+fn fill_best_effort_current_screen(
+    input: &RollingPlanInput,
+    selected: ForcePackagePlan,
+    search_turns: u32,
+) -> ForcePackagePlan {
+    let mut purchases = selected.purchases.clone();
+    let mut used_current_facilities = purchases
+        .iter()
+        .filter(|purchase| purchase.build_turn == 0)
+        .map(|purchase| purchase.facility)
+        .collect::<HashSet<_>>();
+    let mut current_cost = purchases
+        .iter()
+        .filter(|purchase| purchase.build_turn == 0)
+        .map(|purchase| purchase.cost)
+        .fold(0_u32, u32::saturating_add);
+    let current_budget = input.current_funds;
+    let mut facilities = input
+        .production_options
+        .iter()
+        .filter(|option| option.purchase.build_turn == 0)
+        .map(|option| option.purchase.facility)
+        .collect::<Vec<_>>();
+    facilities.sort_unstable_by_key(|facility| (facility.y, facility.x));
+    facilities.dedup();
+
+    for facility in facilities {
+        if used_current_facilities.contains(&facility) {
+            continue;
+        }
+        let affordable = current_budget.saturating_sub(current_cost);
+        let candidate = input
+            .production_options
+            .iter()
+            .filter(|option| {
+                option.purchase.build_turn == 0
+                    && option.purchase.facility == facility
+                    && option.purchase.cost <= affordable
+                    && option.stats.min_range <= 1
+                    && !option.engageable_enemy_indices.is_empty()
+            })
+            .max_by_key(|option| {
+                let outgoing = option
+                    .engageable_enemy_indices
+                    .iter()
+                    .map(|index| {
+                        best_damage(
+                            &input.damage_chart,
+                            option.stats.unit_type,
+                            input.enemies[*index].stats.unit_type,
+                        )
+                    })
+                    .max()
+                    .unwrap_or_default();
+                let incoming = input
+                    .enemies
+                    .iter()
+                    .map(|enemy| {
+                        best_damage(
+                            &input.damage_chart,
+                            enemy.stats.unit_type,
+                            option.stats.unit_type,
+                        )
+                    })
+                    .max()
+                    .unwrap_or_default();
+                let exchange = outgoing.saturating_mul(100) / incoming.saturating_add(1);
+                (
+                    exchange,
+                    outgoing,
+                    std::cmp::Reverse(incoming),
+                    std::cmp::Reverse(option.purchase.cost),
+                )
+            });
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        purchases.push(candidate.purchase);
+        used_current_facilities.insert(facility);
+        current_cost = current_cost.saturating_add(candidate.purchase.cost);
+    }
+
+    // 即時screenを優先した結果、将来収入で払えなくなった最遠の予定だけを外す。
+    while !funding_suffices(input, &purchases) {
+        let Some((index, _)) = purchases
+            .iter()
+            .enumerate()
+            .filter(|(_, purchase)| purchase.build_turn > 0)
+            .max_by_key(|(_, purchase)| purchase.build_turn)
+        else {
+            return selected;
+        };
+        purchases.remove(index);
+    }
+
+    let mut indexed = Vec::with_capacity(purchases.len());
+    for purchase in &purchases {
+        let Some(index) = input
+            .production_options
+            .iter()
+            .position(|option| option.purchase == *purchase)
+        else {
+            return selected;
+        };
+        indexed.push(index);
+    }
+    let state = SearchState {
+        option_indices: indexed,
+        used_slots: purchases
+            .iter()
+            .map(|purchase| {
+                (
+                    purchase.facility.x,
+                    purchase.facility.y,
+                    purchase.build_turn,
+                )
+            })
+            .collect(),
+        cost: purchases
+            .iter()
+            .map(|purchase| purchase.cost)
+            .fold(0_u32, u32::saturating_add),
+    };
+    let mut augmented = simulate_state(input, &state, search_turns);
+    augmented.candidates_considered = selected.candidates_considered;
+    augmented.search_truncated = selected.search_truncated;
+    augmented
 }
 
 fn update_best_feasible(
@@ -617,14 +756,14 @@ fn simulate_state(
                 }
             }
         }
-        // 占領兵は「戦闘部隊が最終的に敵を全滅させる」だけでは守れない。
-        // 敵が占領完了前に到達できるなら、各敵の手番で実際に占領兵へ攻撃させ、
-        // 生存数を作戦の実行可能性へ反映する。価格から予備兵数を足す処理は行わない。
+        // 敵砲兵・直接戦闘unitも手番ごとに最も有利な友軍を攻撃する。
+        // 占領兵だけを損耗対象にすると、射程へ入った護衛砲台が無傷という予測になり、
+        // 間接火力だけの脆い編成を過大評価する。
         for enemy in &mut enemies {
             if enemy.hp == 0 || enemy.attacks_left == 0 || turn < enemy.source.available_turn {
                 continue;
             }
-            let Some((target_index, damage)) = protected_units
+            let combat_target = friendlies
                 .iter()
                 .enumerate()
                 .filter(|(_, target)| target.hp > 0 && turn >= target.available_turn)
@@ -643,9 +782,45 @@ fn simulate_state(
                         target.position.x,
                         target.position.y,
                     );
-                    let travel = distance
+                    let enemy_travel = attack_readiness_turns(distance, &enemy.source.stats);
+                    let friendly_travel = distance
                         .saturating_sub(enemy.source.stats.max_range.max(1))
-                        .div_ceil(enemy.source.stats.max_movement.max(1));
+                        .div_ceil(target.stats.max_movement.max(1));
+                    let contact_turn = enemy
+                        .source
+                        .available_turn
+                        .saturating_add(enemy_travel)
+                        .min(target.available_turn.saturating_add(friendly_travel));
+                    if turn < contact_turn {
+                        return None;
+                    }
+                    let damage =
+                        calculate_damage_formula(base_damage, enemy.hp, 0, true).saturating_add(10);
+                    Some((index, damage))
+                })
+                .max_by_key(|(index, damage)| {
+                    (*damage, 100_u32.saturating_sub(friendlies[*index].hp))
+                });
+            let protected_target = protected_units
+                .iter()
+                .enumerate()
+                .filter(|(_, target)| target.hp > 0 && turn >= target.available_turn)
+                .filter_map(|(index, target)| {
+                    let base_damage = best_damage(
+                        &input.damage_chart,
+                        enemy.source.stats.unit_type,
+                        target.stats.unit_type,
+                    );
+                    if base_damage == 0 {
+                        return None;
+                    }
+                    let distance = input.map.distance(
+                        enemy.source.position.x,
+                        enemy.source.position.y,
+                        target.position.x,
+                        target.position.y,
+                    );
+                    let travel = attack_readiness_turns(distance, &enemy.source.stats);
                     if turn < enemy.source.available_turn.saturating_add(travel) {
                         return None;
                     }
@@ -653,15 +828,30 @@ fn simulate_state(
                         calculate_damage_formula(base_damage, enemy.hp, 0, true).saturating_add(10);
                     Some((index, damage))
                 })
-                // 最も大きな損害を与えられる占領兵を狙う悲観側の敵行動を採る。
                 .max_by_key(|(index, damage)| {
                     (*damage, 100_u32.saturating_sub(protected_units[*index].hp))
-                })
-            else {
-                continue;
+                });
+            let target = match (combat_target, protected_target) {
+                (Some((_index, damage)), Some((protected_index, protected_damage)))
+                    if protected_damage > damage =>
+                {
+                    (true, protected_index, protected_damage)
+                }
+                (Some((index, damage)), _) => (false, index, damage),
+                (None, Some((index, damage))) => (true, index, damage),
+                (None, None) => {
+                    continue;
+                }
             };
-            protected_units[target_index].hp =
-                protected_units[target_index].hp.saturating_sub(damage);
+            if target.0 {
+                protected_units[target.1].hp =
+                    protected_units[target.1].hp.saturating_sub(target.2);
+            } else {
+                friendlies[target.1].hp = friendlies[target.1].hp.saturating_sub(target.2);
+            }
+            if target.2 == 0 {
+                continue;
+            }
             enemy.attacks_left = enemy.attacks_left.saturating_sub(1);
         }
         let enemy_hp_after: u32 = enemies
@@ -699,7 +889,13 @@ fn simulate_state(
             .collect::<Option<Vec<_>>>()
             .and_then(|turns| turns.into_iter().max())
     };
-    let protected_survivor_count = protected_units.iter().filter(|unit| unit.hp > 0).count();
+    // Combat枠の歩兵・重歩兵も、生き残ればそのまま前線施設を占領できる。
+    // 専任Captureとして同数を二重要求せず、作戦パッケージ全体の占領能力を数える。
+    let protected_survivor_count = protected_units
+        .iter()
+        .chain(friendlies.iter().filter(|unit| unit.stats.can_capture))
+        .filter(|unit| unit.hp > 0)
+        .count();
     let protected_force_survives = input.capture_completion_turn.is_none()
         || protected_survivor_count >= input.required_capture_survivors.max(1);
     // 固定2ターンを足さず、実campaignのPickup/Transit/Drop/Capture ETAと残敵排除の
@@ -795,9 +991,7 @@ fn select_target(
                 enemy.source.position.x,
                 enemy.source.position.y,
             );
-            let travel = distance
-                .saturating_sub(friendly.stats.max_range.max(1))
-                .div_ceil(friendly.stats.max_movement.max(1));
+            let travel = attack_readiness_turns(distance, &friendly.stats);
             if turn < friendly.available_turn.saturating_add(travel) {
                 return None;
             }
@@ -808,10 +1002,34 @@ fn select_target(
             } else {
                 2
             };
-            Some((strategic_rank, enemy.hp, index))
+            // 占領能力だけで標的順を固定すると、後方の砲兵を放置したまま前衛へ
+            // 損耗を重ねる。自分へ返せる最大与ダメージを先に比較し、同程度なら
+            // 勝利条件へ直結する占領・輸送能力と残HPで集中撃破先を決める。
+            let incoming_damage = best_damage(
+                &input.damage_chart,
+                enemy.source.stats.unit_type,
+                friendly.stats.unit_type,
+            );
+            Some((
+                std::cmp::Reverse(incoming_damage),
+                strategic_rank,
+                enemy.hp,
+                index,
+            ))
         })
         .min()
-        .map(|(_, _, index)| index)
+        .map(|(_, _, _, index)| index)
+}
+
+/// 現在位置から射撃可能になるまでの移動手番数。
+///
+/// 直接戦闘unitは移動後に攻撃できるが、間接砲は移動した手番に射撃できない。
+/// 射程内なら追加待機は不要で、射程へ入るために動いた場合だけ展開1手番を加える。
+fn attack_readiness_turns(distance: u32, stats: &UnitStats) -> u32 {
+    let travel = distance
+        .saturating_sub(stats.max_range.max(1))
+        .div_ceil(stats.max_movement.max(1));
+    travel.saturating_add(u32::from(travel > 0 && stats.min_range > 1))
 }
 
 fn best_damage(chart: &DamageChart, attacker: UnitType, defender: UnitType) -> u32 {
@@ -841,7 +1059,6 @@ pub(crate) fn production_options(
         for (facility, terrain) in facilities {
             for (unit_type, stats) in available_types {
                 if stats.cost == 0
-                    || stats.can_capture
                     || stats.max_cargo > 0
                     || !master_data.can_produce_unit(terrain.as_str(), *unit_type)
                     || !can_reach(*facility, stats)
@@ -944,6 +1161,7 @@ mod tests {
             capture_completion_turn: None,
             required_capture_survivors: 0,
             delay_cost_per_turn: 5_000,
+            search_beam_width: SEARCH_BEAM_WIDTH,
         }
     }
 
@@ -954,6 +1172,82 @@ mod tests {
         assert_eq!(plan.purchases.len(), 1);
         assert_eq!(plan.purchases[0].unit_type, UnitType::Bomber);
         assert_eq!(plan.elimination_turn, Some(2));
+    }
+
+    #[test]
+    fn current_combat_purchase_is_not_blocked_by_a_hypothetical_future_capturer() {
+        let mut input = input();
+        input.current_funds = 8_000;
+        input.income_per_turn = 10_000;
+        let escort_now = PlannedPurchase {
+            facility: GridPosition { x: 0, y: 0 },
+            unit_type: UnitType::Bcopters,
+            build_turn: 0,
+            cost: 7_500,
+        };
+        let second_escort = PlannedPurchase {
+            facility: GridPosition { x: 1, y: 0 },
+            unit_type: UnitType::Bcopters,
+            build_turn: 1,
+            cost: 7_500,
+        };
+
+        assert!(funding_suffices(&input, &[escort_now]));
+        assert!(funding_suffices(&input, &[escort_now, second_escort]));
+    }
+
+    #[test]
+    fn infeasible_plan_spends_an_idle_current_slot_before_late_purchases() {
+        let mut input = input();
+        input.current_funds = 8_500;
+        input
+            .damage_chart
+            .insert_damage(UnitType::Infantry, UnitType::Infantry, 55);
+        input
+            .damage_chart
+            .insert_damage(UnitType::Infantry, UnitType::Bcopters, 10);
+        input.production_options.push(ProductionPlanOption {
+            purchase: PlannedPurchase {
+                facility: GridPosition { x: 1, y: 0 },
+                unit_type: UnitType::Infantry,
+                build_turn: 0,
+                cost: 1_000,
+            },
+            stats: UnitStats {
+                unit_type: UnitType::Infantry,
+                cost: 1_000,
+                can_capture: true,
+                max_movement: 3,
+                movement_type: MovementType::Infantry,
+                max_fuel: 99,
+                max_ammo1: 9,
+                min_range: 1,
+                max_range: 1,
+                ..UnitStats::mock()
+            },
+            engageable_enemy_indices: vec![0],
+        });
+        let state = SearchState {
+            option_indices: vec![0],
+            used_slots: HashSet::from([(0, 0, 0)]),
+            cost: 7_500,
+        };
+        let mut selected = simulate_state(&input, &state, DEFAULT_SEARCH_TURNS);
+        selected.feasible = false;
+
+        let augmented = fill_best_effort_current_screen(&input, selected, DEFAULT_SEARCH_TURNS);
+
+        assert!(augmented.purchases.iter().any(|purchase| {
+            purchase.build_turn == 0 && purchase.unit_type == UnitType::Infantry
+        }));
+        assert_eq!(
+            augmented
+                .purchases
+                .iter()
+                .filter(|purchase| purchase.build_turn == 0)
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -983,6 +1277,19 @@ mod tests {
     }
 
     #[test]
+    fn indirect_unit_needs_a_setup_turn_after_moving_into_range() {
+        let stats = UnitStats {
+            min_range: 2,
+            max_range: 3,
+            max_movement: 3,
+            ..UnitStats::mock()
+        };
+
+        assert_eq!(attack_readiness_turns(3, &stats), 0);
+        assert_eq!(attack_readiness_turns(6, &stats), 2);
+    }
+
+    #[test]
     fn occupation_uses_live_campaign_eta_instead_of_a_fixed_delay() {
         let mut input = input();
         input.capture_completion_turn = Some(7);
@@ -1003,6 +1310,42 @@ mod tests {
 
         assert!(plan.elimination_turn.is_some_and(|turn| turn <= 7));
         assert_eq!(plan.occupation_turn, Some(7));
+    }
+
+    #[test]
+    fn combat_capturer_counts_once_as_a_surviving_occupation_unit() {
+        let mut input = input();
+        input.production_options.clear();
+        input.existing_units = vec![FriendlyPlanUnit {
+            stats: UnitStats {
+                unit_type: UnitType::Infantry,
+                cost: 1_000,
+                can_capture: true,
+                max_ammo1: 9,
+                max_fuel: 99,
+                max_movement: 3,
+                movement_type: MovementType::Infantry,
+                min_range: 1,
+                max_range: 1,
+                ..UnitStats::mock()
+            },
+            position: GridPosition { x: 8, y: 0 },
+            hp: 100,
+            available_turn: 0,
+            engageable_enemy_indices: vec![0],
+        }];
+        input
+            .damage_chart
+            .insert_damage(UnitType::Infantry, UnitType::Infantry, 100);
+        input.capture_completion_turn = Some(2);
+        input.required_capture_survivors = 1;
+
+        let plan = plan_force_package(&input).expect("歩兵だけで撃破と占領を継続できる");
+
+        assert!(plan.feasible);
+        assert_eq!(plan.protected_unit_count, 0);
+        assert_eq!(plan.protected_survivor_count, 1);
+        assert_eq!(plan.occupation_turn, Some(2));
     }
 
     #[test]

@@ -1805,15 +1805,21 @@ fn producible_campaign_transports(
 }
 
 fn candidate_target_position(
+    map: &Map,
+    registry: &MasterDataRegistry,
     island: &Island,
     properties: &[PropertySnapshot],
+    units: &[UnitSnapshot],
     player_id: PlayerId,
     existing_operation: Option<&ExistingCampaignOperation>,
 ) -> Option<GridPosition> {
-    if let Some(operation) = existing_operation {
-        return Some(operation.target_position);
-    }
-    properties
+    let origins = properties
+        .iter()
+        .filter(|snapshot| island.tiles.contains(&snapshot.position))
+        .filter(|snapshot| snapshot.property.owner_id == Some(player_id))
+        .map(|snapshot| snapshot.position)
+        .collect::<Vec<_>>();
+    let mut targets = properties
         .iter()
         .filter(|snapshot| island.tiles.contains(&snapshot.position))
         .filter(|snapshot| {
@@ -1821,16 +1827,46 @@ fn candidate_target_position(
                 && snapshot.property.owner_id != Some(player_id)
         })
         .map(|snapshot| snapshot.position)
-        .min_by_key(|position| (position.y, position.x))
-        .or_else(|| sorted_island_tiles(island).first().copied())
+        .collect::<Vec<_>>();
+    let target_priority = |position: GridPosition| {
+        capture_front_priority(
+            map, registry, island, properties, units, player_id, &origins, position,
+        )
+    };
+    targets.sort_unstable_by_key(|position| target_priority(*position));
+    let nearest = targets.first().copied();
+
+    // 進行中目標も無条件には固定しない。より近い前線より2手以上遠くなった目標は
+    // 敵の再占領や担当損耗で前提が崩れたものとして、現在の最短前線へ戻す。
+    if let (Some(operation), Some(nearest)) = (existing_operation, nearest)
+        && targets.contains(&operation.target_position)
+    {
+        let distance_from_front = |position: GridPosition| target_priority(position).1;
+        if origins.is_empty()
+            || distance_from_front(operation.target_position)
+                <= distance_from_front(nearest).saturating_add(2)
+        {
+            return Some(operation.target_position);
+        }
+    }
+    nearest.or_else(|| sorted_island_tiles(island).first().copied())
 }
 
 fn candidate_capture_target_positions(
+    map: &Map,
+    registry: &MasterDataRegistry,
     island: &Island,
     properties: &[PropertySnapshot],
+    units: &[UnitSnapshot],
     player_id: PlayerId,
     primary_target: GridPosition,
 ) -> Vec<GridPosition> {
+    let origins = properties
+        .iter()
+        .filter(|snapshot| island.tiles.contains(&snapshot.position))
+        .filter(|snapshot| snapshot.property.owner_id == Some(player_id))
+        .map(|snapshot| snapshot.position)
+        .collect::<Vec<_>>();
     let mut targets: Vec<_> = properties
         .iter()
         .filter(|snapshot| island.tiles.contains(&snapshot.position))
@@ -1840,7 +1876,21 @@ fn candidate_capture_target_positions(
         })
         .map(|snapshot| snapshot.position)
         .collect();
-    targets.sort_by_key(|position| (position.y, position.x));
+    let target_priority = |position: GridPosition| {
+        capture_front_priority(
+            map, registry, island, properties, units, player_id, &origins, position,
+        )
+    };
+    targets.sort_by_key(|position| target_priority(*position));
+
+    // 既に足場がある陸塊では、最短前線とその隣接帯だけを同時実行対象にする。
+    // 全未所有施設は毎手番再観測するため捨てず、前線取得後に次の帯へ昇格する。
+    // 足場のない島は輸送波の目的一覧を縮めると再上陸が遅れるため従来どおり保持する。
+    if !origins.is_empty()
+        && let Some(nearest_distance) = targets.first().map(|target| target_priority(*target).1)
+    {
+        targets.retain(|target| target_priority(*target).1 <= nearest_distance.saturating_add(2));
+    }
     if let Some(index) = targets
         .iter()
         .position(|position| *position == primary_target)
@@ -1849,6 +1899,50 @@ fn candidate_capture_target_positions(
         targets.insert(0, primary_target);
     }
     targets
+}
+
+/// 自軍前線からの占領ETAを第一基準、敵占領兵の到着ETAを同距離帯の競争優先度にする。
+/// 座標は決定論的な最終tie-breakにだけ使うため、鏡像mapでも前線側を選択できる。
+#[allow(clippy::too_many_arguments)]
+fn capture_front_priority(
+    map: &Map,
+    registry: &MasterDataRegistry,
+    island: &Island,
+    properties: &[PropertySnapshot],
+    units: &[UnitSnapshot],
+    player_id: PlayerId,
+    friendly_origins: &[GridPosition],
+    target: GridPosition,
+) -> (u32, u32, u32, usize, usize) {
+    let friendly_movement = [UnitType::Infantry, UnitType::Mech]
+        .into_iter()
+        .filter_map(|unit_type| unit_stats_for_type(registry, unit_type))
+        .min_by_key(|stats| stats.cost)
+        .map_or(1, |stats| stats.max_movement.max(1));
+    let occupation_turns = properties
+        .iter()
+        .find(|snapshot| snapshot.position == target)
+        .map_or(1, |snapshot| default_capture_turns(&snapshot.property));
+    let front_distance = friendly_origins
+        .iter()
+        .map(|origin| map.distance(origin.x, origin.y, target.x, target.y))
+        .min()
+        .unwrap_or(u32::MAX);
+    let friendly_eta = front_distance
+        .div_ceil(friendly_movement)
+        .saturating_add(occupation_turns);
+    let enemy_eta = units
+        .iter()
+        .filter(|unit| unit.faction != player_id && unit.stats.can_capture)
+        .filter(|unit| unit.transporting.is_none() && island.tiles.contains(&unit.position))
+        .map(|unit| {
+            map.distance(unit.position.x, unit.position.y, target.x, target.y)
+                .div_ceil(unit.stats.max_movement.max(1))
+                .saturating_add(occupation_turns)
+        })
+        .min()
+        .unwrap_or(u32::MAX);
+    (friendly_eta, front_distance, enemy_eta, target.y, target.x)
 }
 
 fn operation_has_live_capability(operation: &ExistingCampaignOperation) -> bool {
@@ -2299,13 +2393,46 @@ pub fn analyze_island_campaign_excluding(
             .collect::<Vec<_>>();
         priority_enemy_types.sort_by_key(|unit_type| campaign_unit_type_rank(*unit_type));
         priority_enemy_types.dedup();
-        let Some(target_position) =
-            candidate_target_position(&island, &properties, player_id, existing_operation.as_ref())
-        else {
+        let Some(target_position) = candidate_target_position(
+            &map,
+            &registry,
+            &island,
+            &properties,
+            &units,
+            player_id,
+            existing_operation.as_ref(),
+        ) else {
             continue;
         };
-        let capture_target_positions =
-            candidate_capture_target_positions(&island, &properties, player_id, target_position);
+        let capture_target_positions = candidate_capture_target_positions(
+            &map,
+            &registry,
+            &island,
+            &properties,
+            &units,
+            player_id,
+            target_position,
+        );
+        let has_foothold = properties.iter().any(|property| {
+            island.tiles.contains(&property.position)
+                && property.property.owner_id == Some(player_id)
+        });
+        if has_foothold {
+            // 同一陸塊の全未所有施設ではなく、今手番に選んだ前線帯だけを同時要求する。
+            // 後方の施設は前線取得後に毎手番再評価するため、将来分の占領兵費用を
+            // 現在作戦へ先取りしない。
+            let active_capture_units =
+                u32::try_from(capture_target_positions.len()).unwrap_or(u32::MAX);
+            let released_capture_units = requirement
+                .capture_units
+                .saturating_sub(active_capture_units);
+            requirement.capture_units = active_capture_units;
+            requirement.transport_slots = requirement.transport_slots.min(active_capture_units);
+            requirement.total_budget = requirement
+                .total_budget
+                .saturating_sub(released_capture_units.saturating_mul(1_000));
+            assessment.required_budget = requirement.total_budget;
+        }
         let (ground_sustainment_sites, air_sustainment_sites, sea_sustainment_sites) =
             sustainment_site_counts(&island, &properties);
         let sustainment_targets = if Some(island.id) == home_island {
@@ -2408,6 +2535,63 @@ mod tests {
     use bevy_ecs::prelude::{Entity, World};
 
     const TEST_SEED: u64 = 42;
+
+    #[test]
+    fn mirrored_land_fronts_choose_the_nearest_property_instead_of_coordinate_order() {
+        let master_data = MasterDataRegistry::load().expect("master data should load");
+        let map = Map::new(11, 1, Terrain::Plains, GridTopology::Square);
+        let island = IslandMap::analyze(&map).islands.remove(0);
+        let player = PlayerId(1);
+        let enemy = PlayerId(2);
+        let property = |x, owner| PropertySnapshot {
+            position: GridPosition { x, y: 0 },
+            property: Property::new(Terrain::City, owner, 200),
+        };
+
+        let left_properties = vec![
+            property(0, Some(player)),
+            property(2, Some(enemy)),
+            property(8, Some(enemy)),
+        ];
+        let left_target = candidate_target_position(
+            &map,
+            &master_data,
+            &island,
+            &left_properties,
+            &[],
+            player,
+            None,
+        );
+        assert_eq!(left_target, Some(GridPosition { x: 2, y: 0 }));
+
+        let right_properties = vec![
+            property(10, Some(player)),
+            property(2, Some(enemy)),
+            property(8, Some(enemy)),
+        ];
+        let right_target = candidate_target_position(
+            &map,
+            &master_data,
+            &island,
+            &right_properties,
+            &[],
+            player,
+            None,
+        );
+        assert_eq!(right_target, Some(GridPosition { x: 8, y: 0 }));
+        assert_eq!(
+            candidate_capture_target_positions(
+                &map,
+                &master_data,
+                &island,
+                &right_properties,
+                &[],
+                player,
+                right_target.expect("右側前線"),
+            ),
+            vec![GridPosition { x: 8, y: 0 }]
+        );
+    }
 
     #[test]
     fn roadmap_then_live_squad_override_produced_anchor() {

@@ -2842,6 +2842,164 @@ fn prepare_campaign_local_assignment(
         }
         _ => {}
     }
+    synchronize_local_capture_departure(world, manager, player_id, assignment);
+}
+
+/// 局地Captureは首都本隊の完全編成を待たない。ただし占領完了前に接触できる敵が
+/// 実在する場合だけ、各敵へ有効打を持つ護衛が占領兵の到着から1手番以内に合流できる
+/// ことを出発条件にする。安全な目標は占領兵単独で即時実行する。
+fn synchronize_local_capture_departure(
+    world: &World,
+    manager: &mut SquadManager,
+    player_id: PlayerId,
+    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+) {
+    if crate::ai::resolve_player_ai_version(world, player_id)
+        != crate::ai::ai_version::AiVersion::V4
+    {
+        return;
+    }
+    let Some(map) = world.get_resource::<Map>() else {
+        return;
+    };
+    let Some(registry) = world.get_resource::<MasterDataRegistry>() else {
+        return;
+    };
+    let Some(damage_chart) = world.get_resource::<crate::resources::DamageChart>() else {
+        return;
+    };
+    let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() else {
+        return;
+    };
+    let enemies = world
+        .iter_entities()
+        .filter_map(|entity| {
+            let faction = entity.get::<Faction>()?;
+            let position = entity.get::<GridPosition>()?;
+            let stats = entity.get::<UnitStats>()?;
+            (faction.0 != player_id
+                && entity.get::<crate::components::Transporting>().is_none()
+                && island_map
+                    .get_island_at(position)
+                    .is_some_and(|island| island.id == assignment.island_id))
+            .then_some((*position, stats.clone()))
+        })
+        .collect::<Vec<_>>();
+    let property_capture_points = world
+        .iter_entities()
+        .filter_map(|entity| {
+            Some((
+                *entity.get::<GridPosition>()?,
+                entity.get::<Property>()?.capture_points,
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+
+    for squad in &mut manager.squads {
+        if squad.owner_id != Some(player_id)
+            || squad.mission_type != MissionType::Capture
+            || squad.target_island != Some(assignment.island_id)
+        {
+            continue;
+        }
+        let Some(target) = squad.target else {
+            squad.departure_authorized = false;
+            continue;
+        };
+        squad.departure_authorized = squad.members.iter().all(|capturer| {
+            let Some(capturer_position) = world.get::<GridPosition>(*capturer) else {
+                return false;
+            };
+            let Some(capturer_stats) = world.get::<UnitStats>(*capturer) else {
+                return false;
+            };
+            let capturer_hp = world
+                .get::<Health>(*capturer)
+                .map_or(100, |health| health.current);
+            let capture_arrival = map
+                .distance(capturer_position.x, capturer_position.y, target.x, target.y)
+                .div_ceil(capturer_stats.max_movement.max(1));
+            let occupation_turns =
+                property_capture_points
+                    .get(&target)
+                    .map_or(2, |capture_points| {
+                        let capture_power = capturer_hp.saturating_add(9) / 10 * 10;
+                        capture_points.div_ceil(capture_power.max(1))
+                    });
+            let capture_completion = capture_arrival.saturating_add(occupation_turns);
+            let threats = enemies
+                .iter()
+                .filter(|(enemy_position, enemy_stats)| {
+                    let damage = damage_chart
+                        .get_base_damage(enemy_stats.unit_type, capturer_stats.unit_type)
+                        .unwrap_or(0)
+                        .max(
+                            damage_chart
+                                .get_base_damage_secondary(
+                                    enemy_stats.unit_type,
+                                    capturer_stats.unit_type,
+                                )
+                                .unwrap_or(0),
+                        );
+                    if damage == 0
+                        || !is_terrain_reachable(
+                            map,
+                            registry,
+                            (enemy_position.x, enemy_position.y),
+                            (target.x, target.y),
+                            enemy_stats.movement_type,
+                        )
+                    {
+                        return false;
+                    }
+                    let contact_eta = map
+                        .distance(enemy_position.x, enemy_position.y, target.x, target.y)
+                        .saturating_sub(enemy_stats.max_range.max(1))
+                        .div_ceil(enemy_stats.max_movement.max(1));
+                    contact_eta <= capture_completion
+                })
+                .collect::<Vec<_>>();
+            threats.is_empty()
+                || threats.iter().all(|(_, enemy_stats)| {
+                    assignment.combat_entities.iter().any(|escort| {
+                        let (Some(position), Some(stats)) = (
+                            world.get::<GridPosition>(*escort),
+                            world.get::<UnitStats>(*escort),
+                        ) else {
+                            return false;
+                        };
+                        if world
+                            .get::<crate::components::Transporting>(*escort)
+                            .is_some()
+                            || !is_terrain_reachable(
+                                map,
+                                registry,
+                                (position.x, position.y),
+                                (target.x, target.y),
+                                stats.movement_type,
+                            )
+                        {
+                            return false;
+                        }
+                        let damage = damage_chart
+                            .get_base_damage(stats.unit_type, enemy_stats.unit_type)
+                            .unwrap_or(0)
+                            .max(
+                                damage_chart
+                                    .get_base_damage_secondary(
+                                        stats.unit_type,
+                                        enemy_stats.unit_type,
+                                    )
+                                    .unwrap_or(0),
+                            );
+                        let escort_eta = map
+                            .distance(position.x, position.y, target.x, target.y)
+                            .div_ceil(stats.max_movement.max(1));
+                        damage > 0 && escort_eta <= capture_arrival.saturating_add(1)
+                    })
+                })
+        });
+    }
 }
 
 fn prepare_secure_local_captures(
@@ -11393,6 +11551,124 @@ mod tests {
         assert!(manager.squads.iter().all(|squad| {
             !(squad.members.contains(&capturer) && squad.members.contains(&defender))
         }));
+    }
+
+    #[test]
+    fn v4_local_capture_launches_only_when_intercepting_enemy_has_timely_escort() {
+        use crate::ai::island_campaign::{
+            IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
+        };
+
+        let mut world = World::new();
+        let registry = MasterDataRegistry::load().unwrap();
+        let map = Map::new(5, 1, Terrain::Plains, GridTopology::Square);
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let target = GridPosition { x: 3, y: 0 };
+        let island_id = island_map.get_island_at(&target).unwrap().id;
+        let player = PlayerId(1);
+        let enemy = PlayerId(2);
+        let mut settings = crate::ai::ai_version::PlayerAiSettings::new();
+        settings.set_version(player, crate::ai::ai_version::AiVersion::V4);
+        let mut damage_chart = crate::resources::DamageChart::new();
+        damage_chart.insert_damage(UnitType::Infantry, UnitType::Infantry, 50);
+        damage_chart.insert_damage(UnitType::Bcopters, UnitType::Infantry, 70);
+        world.insert_resource(map);
+        world.insert_resource(island_map);
+        world.insert_resource(registry);
+        world.insert_resource(settings);
+        world.insert_resource(damage_chart);
+        world.spawn((target, Property::new(Terrain::City, None, 100)));
+        let capturer = world
+            .spawn((
+                Faction(player),
+                GridPosition { x: 0, y: 0 },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    movement_type: MovementType::Infantry,
+                    max_movement: 3,
+                    can_capture: true,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        world.spawn((
+            Faction(enemy),
+            GridPosition { x: 2, y: 0 },
+            UnitStats {
+                unit_type: UnitType::Infantry,
+                movement_type: MovementType::Infantry,
+                max_movement: 3,
+                max_range: 1,
+                can_capture: true,
+                ..UnitStats::mock()
+            },
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ));
+        let escort = world
+            .spawn((
+                Faction(player),
+                GridPosition { x: 0, y: 0 },
+                UnitStats {
+                    unit_type: UnitType::Bcopters,
+                    movement_type: MovementType::Air,
+                    max_movement: 8,
+                    max_range: 1,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let requirement = IslandCampaignRequirement {
+            preferred_transport: None,
+            transport_slots: 0,
+            capture_units: 1,
+            ground_combat_units: 0,
+            combat_units: 1,
+            total_budget: 8_500,
+        };
+        let mut assignment = IslandCampaignAssignment {
+            island_id,
+            decision: IslandCampaignDecision::Contest,
+            target_position: target,
+            capture_target_positions: vec![target],
+            priority_enemy_types: vec![UnitType::Infantry],
+            requirement: requirement.clone(),
+            purchase_shortfall: requirement,
+            allocated_budget: 8_500,
+            transport_entities: Vec::new(),
+            capture_entities: vec![capturer],
+            combat_entities: Vec::new(),
+            operation_ready: false,
+            continued_from_existing_squad: false,
+        };
+        let mut manager = SquadManager::new();
+
+        prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
+        let capture = manager
+            .squads
+            .iter()
+            .find(|squad| squad.mission_type == MissionType::Capture)
+            .expect("局地Capture");
+        assert!(!capture.departure_authorized);
+
+        assignment.combat_entities.push(escort);
+        prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
+        let capture = manager
+            .squads
+            .iter()
+            .find(|squad| squad.mission_type == MissionType::Capture)
+            .expect("護衛合流後の局地Capture");
+        assert!(capture.departure_authorized);
     }
 
     #[test]

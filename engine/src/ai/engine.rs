@@ -1415,7 +1415,7 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     // 輸送役を自分で生産不能にする。任務所属は維持したまま隣接待機地へ一歩だけ退避する。
     if uses_v3
         && let Some((entity, command)) =
-            decide_forming_campaign_site_relief(world, active_player, &skip_entities)
+            decide_forming_campaign_site_relief(world, active_player, &skip_entities, is_v4)
     {
         let command_text = format!("{:?}", command);
         execute_ai_command(world, entity, command);
@@ -1561,6 +1561,22 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
         }
     }
 
+    // 通常の作戦行動で進めなかった任務所属unitも、生産施設だけは塞ぎ続けない。
+    // 先に通常行動を試した後のfallbackなので、前線へ進めるunitの移動距離は奪わない。
+    if is_v4
+        && let Some((entity, command)) =
+            decide_forming_campaign_site_relief(world, active_player, &skip_entities, true)
+    {
+        let command_text = format!("{:?}", command);
+        execute_ai_command(world, entity, command);
+        if let Some(mut cooldown) = world.get_resource_mut::<AiActionCooldown>() {
+            cooldown.0.insert(entity);
+        } else {
+            world.insert_resource(AiActionCooldown(HashSet::from([entity])));
+        }
+        return Some(command_text);
+    }
+
     // 3. 生産行動
     // 生産内容は盤面・資金の変化ごとに従来通り再計画し、V3の島分析だけを同一ターンで共有する。
     let prod_commands = super::production::decide_production(world, active_player);
@@ -1649,6 +1665,7 @@ fn decide_forming_campaign_site_relief(
     world: &mut World,
     player_id: PlayerId,
     skip_entities: &HashSet<Entity>,
+    include_active_missions: bool,
 ) -> Option<(Entity, AiCommand)> {
     use crate::ai::squad::{MissionPhase, MissionType, SquadManager};
 
@@ -1682,7 +1699,7 @@ fn decide_forming_campaign_site_relief(
     }
 
     let manager = world.get_resource::<SquadManager>()?;
-    let mut forming_groups: Vec<Vec<Entity>> = manager
+    let mut forming_groups: Vec<(Vec<Entity>, Option<GridPosition>)> = manager
         .squads
         .iter()
         .filter(|squad| {
@@ -1699,9 +1716,46 @@ fn decide_forming_campaign_site_relief(
                 .collect();
             entities.sort_by_key(|entity| entity.to_bits());
             entities.dedup();
-            entities
+            (entities, squad.target)
         })
         .collect();
+    // 局地護衛待ちの占領兵も、生産施設上では待たせない。任務目標へは進めず、
+    // 隣接する非生産マスへ1歩退避して、次手番の護衛生産枠を開ける。
+    forming_groups.extend(
+        manager
+            .squads
+            .iter()
+            .filter(|squad| {
+                squad.owner_id == Some(player_id)
+                    && squad.mission_type == MissionType::Capture
+                    && !squad.departure_authorized
+            })
+            .map(|squad| {
+                (
+                    squad.members.iter().copied().collect::<Vec<_>>(),
+                    squad.target,
+                )
+            }),
+    );
+    if include_active_missions {
+        forming_groups.extend(
+            manager
+                .squads
+                .iter()
+                .filter(|squad| {
+                    squad.owner_id == Some(player_id)
+                        && squad.mission_type != MissionType::Transport
+                        && (squad.mission_type != MissionType::Capture
+                            || squad.departure_authorized)
+                })
+                .map(|squad| {
+                    (
+                        squad.members.iter().copied().collect::<Vec<_>>(),
+                        squad.target,
+                    )
+                }),
+        );
+    }
     let squad_entities = manager
         .squads
         .iter()
@@ -1737,9 +1791,13 @@ fn decide_forming_campaign_site_relief(
         })
         .collect::<Vec<_>>();
     unassigned_blockers.sort_by_key(|entity| entity.to_bits());
-    forming_groups.extend(unassigned_blockers.into_iter().map(|entity| vec![entity]));
+    forming_groups.extend(
+        unassigned_blockers
+            .into_iter()
+            .map(|entity| (vec![entity], None)),
+    );
     forming_groups
-        .sort_by_key(|entities| entities.first().map_or(u64::MAX, |entity| entity.to_bits()));
+        .sort_by_key(|(entities, _)| entities.first().map_or(u64::MAX, |entity| entity.to_bits()));
 
     let mut occupied = HashSet::new();
     let mut unit_positions = HashMap::new();
@@ -1778,7 +1836,7 @@ fn decide_forming_campaign_site_relief(
         );
     }
 
-    for group in forming_groups {
+    for (group, mission_target) in forming_groups {
         let group_positions: Vec<_> = group
             .iter()
             .filter_map(|entity| world.get::<GridPosition>(*entity).copied())
@@ -1817,17 +1875,19 @@ fn decide_forming_campaign_site_relief(
                 stats.unit_type,
                 &registry,
             );
-            let destination = map
-                .get_adjacent(position.x, position.y)
-                .into_iter()
-                .filter(|tile| reachable.contains(tile))
+            let destination = reachable
+                .iter()
+                .copied()
+                .filter(|tile| *tile != (position.x, position.y))
                 .filter(|tile| !occupied.contains(tile))
                 .filter(|tile| !production_positions.contains(tile))
                 .min_by_key(|(x, y)| {
+                    let target_distance =
+                        mission_target.map_or(0, |target| map.distance(*x, *y, target.x, target.y));
                     let group_distance = group_positions.iter().fold(0_u32, |total, member| {
                         total.saturating_add(map.distance(*x, *y, member.x, member.y))
                     });
-                    (group_distance, *y, *x)
+                    (target_distance, group_distance, *y, *x)
                 });
             if let Some((x, y)) = destination {
                 return Some((
@@ -1869,6 +1929,8 @@ struct CampaignActionContext {
     island_id: crate::ai::islands::IslandId,
     mission_type: crate::ai::squad::MissionType,
     target: Option<GridPosition>,
+    /// 局地Captureの最小護衛が合流可能か。falseでも現在位置での反撃は許可する。
+    departure_authorized: bool,
 }
 
 /// V4のEntityは正本registryが指す具体Squadだけから行動方針を受け取る。
@@ -1907,6 +1969,7 @@ fn campaign_action_context(
         island_id,
         mission_type: squad.mission_type.clone(),
         target: squad.target,
+        departure_authorized: squad.departure_authorized,
     }))
 }
 
@@ -1919,6 +1982,15 @@ fn campaign_position_is_on_target_island(
         .get_resource::<crate::ai::islands::IslandMap>()
         .and_then(|islands| islands.get_island_at(&position))
         .is_some_and(|island| island.id == context.island_id)
+}
+
+/// 同じcampaignに属する占領可能unitが施設取得へ役割を切り替えてよい任務。
+/// Attack歩兵も敵を押し退けた後は同一作戦島を占領し、ZOC優位を収入へ接続する。
+fn campaign_mission_allows_capture(mission: &crate::ai::squad::MissionType) -> bool {
+    matches!(
+        mission,
+        crate::ai::squad::MissionType::Capture | crate::ai::squad::MissionType::Attack
+    )
 }
 
 /// 新しいAI (V2/V3) 用の行動意思決定エンジン。
@@ -2119,17 +2191,26 @@ pub fn decide_ai_action_v2(
             (e_pos.x.abs_diff(pos.x) + e_pos.y.abs_diff(pos.y)) as u32 <= THREAT_PROXIMITY_RADIUS
         });
 
-        let reachable = calculate_reachable_tiles(
-            &map,
-            &unit_positions,
-            (pos.x, pos.y),
-            stats.movement_type,
-            stats.max_movement,
-            fuel,
-            player_id,
-            stats.unit_type,
-            &registry,
-        );
+        let capture_waits_for_local_escort = campaign_context.as_ref().is_some_and(|context| {
+            context.mission_type == crate::ai::squad::MissionType::Capture
+                && !context.departure_authorized
+        });
+        let reachable = if capture_waits_for_local_escort {
+            // 現在位置での攻撃・占領・Waitは残すが、護衛を待つ1手番に単独前進しない。
+            std::iter::once((pos.x, pos.y)).collect()
+        } else {
+            calculate_reachable_tiles(
+                &map,
+                &unit_positions,
+                (pos.x, pos.y),
+                stats.movement_type,
+                stats.max_movement,
+                fuel,
+                player_id,
+                stats.unit_type,
+                &registry,
+            )
+        };
 
         let squad_target = unit_squad_targets.get(&unit_entity).copied();
         let has_offensive_mission = unit_squad_missions
@@ -2609,7 +2690,7 @@ pub fn decide_ai_action_v2(
             // (A) Capture
             if actions.can_capture
                 && !campaign_context.as_ref().is_some_and(|context| {
-                    context.mission_type != crate::ai::squad::MissionType::Capture
+                    !campaign_mission_allows_capture(&context.mission_type)
                         || !campaign_position_is_on_target_island(world, context, current_grid)
                 })
             {
@@ -3063,7 +3144,7 @@ mod tests {
         world.insert_resource(manager);
 
         let (entity, command) =
-            decide_forming_campaign_site_relief(&mut world, player, &HashSet::new())
+            decide_forming_campaign_site_relief(&mut world, player, &HashSet::new(), false)
                 .expect("Forming transport must vacate the airport while waiting");
         assert_eq!(entity, transport);
         let AiCommand::Wait { target_pos } = command else {
@@ -3133,7 +3214,7 @@ mod tests {
         world.insert_resource(crate::ai::squad::SquadManager::new());
 
         let (entity, command) =
-            decide_forming_campaign_site_relief(&mut world, player, &HashSet::new())
+            decide_forming_campaign_site_relief(&mut world, player, &HashSet::new(), false)
                 .expect("未割当の空輸送役も空港を退避する");
 
         assert_eq!(entity, transport);
@@ -3141,6 +3222,89 @@ mod tests {
             panic!("production site relief must issue a movement wait");
         };
         assert_ne!(target_pos, GridPosition { x: 1, y: 0 });
+    }
+
+    #[test]
+    fn stalled_attack_unit_vacates_factory_toward_its_mission() {
+        let player = PlayerId(1);
+        let mut world = setup_v3_test_world(3, crate::ai::ai_version::AiVersion::V4);
+        world.insert_resource(Map {
+            width: 4,
+            height: 2,
+            tiles: vec![
+                Terrain::Capital,
+                Terrain::Factory,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+            ],
+            topology: crate::resources::GridTopology::Square,
+        });
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(player), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Property::new(Terrain::Factory, Some(player), 100),
+        ));
+        let stats = world
+            .resource::<MasterDataRegistry>()
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::Infantry.as_str().to_owned(),
+            ))
+            .unwrap();
+        let attacker = world
+            .spawn((
+                Faction(player),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 1, y: 0 },
+                stats.clone(),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: stats.max_fuel,
+                    max: stats.max_fuel,
+                },
+            ))
+            .id();
+        let mut manager = crate::ai::squad::SquadManager::new();
+        let squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+        squad.members.insert(attacker);
+        squad.target = Some(GridPosition { x: 3, y: 0 });
+        squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+        world.insert_resource(manager);
+
+        assert!(
+            decide_forming_campaign_site_relief(&mut world, player, &HashSet::new(), false)
+                .is_none(),
+            "通常作戦より前の退避処理はAttack任務を奪わない"
+        );
+        let (entity, command) =
+            decide_forming_campaign_site_relief(&mut world, player, &HashSet::new(), true)
+                .expect("通常行動に失敗したAttack unitは工場を退避する");
+
+        assert_eq!(entity, attacker);
+        let AiCommand::Wait { target_pos } = command else {
+            panic!("生産施設からの退避は移動Waitであること");
+        };
+        assert_eq!(target_pos, GridPosition { x: 3, y: 0 });
+    }
+
+    #[test]
+    fn campaign_attack_units_may_capture_but_defense_and_transport_may_not() {
+        use crate::ai::squad::MissionType;
+
+        assert!(campaign_mission_allows_capture(&MissionType::Capture));
+        assert!(campaign_mission_allows_capture(&MissionType::Attack));
+        assert!(!campaign_mission_allows_capture(&MissionType::Defense));
+        assert!(!campaign_mission_allows_capture(&MissionType::Transport));
     }
 
     #[test]

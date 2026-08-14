@@ -301,19 +301,24 @@ fn apply_rescheduled_purchases(
             purchase.facility.x,
         )
     });
-    assert_eq!(
-        available_steps.len(),
-        ordered_purchases.len(),
-        "固定編成の再配置で購入step数が変化してはならない"
-    );
     for purchase in ordered_purchases {
-        let position = available_steps
-            .iter()
-            .position(|(index, _)| {
-                let step = &steps[*index];
-                step.unit_type == purchase.unit_type && step.cost == purchase.cost
-            })
-            .expect("固定編成の再配置で兵種または費用が変化してはならない");
+        let Some(position) = available_steps.iter().position(|(index, _)| {
+            let step = &steps[*index];
+            step.unit_type == purchase.unit_type && step.cost == purchase.cost
+        }) else {
+            // 同一手番に既に発行したstepはPlannedへ戻さない。固定編成評価に
+            // 残っていてもin-flightの同一兵種・費用へ対応済みなら再配置不要である。
+            let in_flight = steps.iter().any(|step| {
+                step.unit_type == purchase.unit_type
+                    && step.cost == purchase.cost
+                    && step.status != PurchaseStatus::Planned
+            });
+            debug_assert!(
+                in_flight,
+                "固定編成の再配置先がない: turn={turn}, steps={steps:?}, purchase={purchase:?}"
+            );
+            continue;
+        };
         let (step_index, _) = available_steps.remove(position);
         let step = &mut steps[step_index];
         step.facility = purchase.facility;
@@ -688,6 +693,30 @@ pub(crate) struct PlanContinuation {
     pub revision: PlanRevision,
     pub purchases: Vec<PlannedPurchase>,
     pub production_failed: bool,
+    /// 首都攻略の一波をまだ生産中か。編成中は毎手番の全探索を避ける判断に使う。
+    pub formation_in_progress: bool,
+    /// 前回評価時点で首都攻略の実行が許可されていたか。
+    pub execution_authorized: bool,
+    /// 予測していた攻撃・占領時刻を既に超過しているか。
+    pub execution_delayed: bool,
+}
+
+impl PlanContinuation {
+    /// 現行購入列の再評価だけでよく、新しい混成案の全探索を省略できるか。
+    ///
+    /// 首都攻略は複数手番を要するため、形成途中の毎手番で同じ探索をやり直さない。
+    /// ただしGo判定が有効化した瞬間、工程失敗、予測遅延では現在盤面から再探索する。
+    pub(crate) fn can_reuse_without_search(
+        &self,
+        kind: OperationKind,
+        execution_authorized: bool,
+    ) -> bool {
+        kind == OperationKind::AssaultCapital
+            && self.formation_in_progress
+            && !self.production_failed
+            && !self.execution_delayed
+            && (!execution_authorized || self.execution_authorized)
+    }
 }
 
 /// 新規作戦の上限で進行中計画を押し出さないため、作戦構築へ返す目的snapshot。
@@ -950,14 +979,21 @@ impl V4RollingPlanRegistry {
         let purchases = plan
             .steps
             .iter()
-            .filter(|step| step.status != PurchaseStatus::Produced)
-            .map(|step| PlannedPurchase {
-                facility: step.facility,
-                unit_type: step.unit_type,
-                // 未照合の発注や期限超過stepも固定編成から落とさず、今手番の
-                // 再配置候補として評価する。
-                build_turn: step.scheduled_turn.saturating_sub(turn),
-                cost: step.cost,
+            .filter_map(|step| {
+                // 今手番に発注済みのstepはschedule適用待ちであり、再発注対象ではない。
+                // 前手番以前のIssuedだけは照合失敗として固定編成へ戻し、下流で
+                // Plannedへ復旧して再配置する。
+                let requires_purchase = match step.status {
+                    PurchaseStatus::Planned => true,
+                    PurchaseStatus::Issued { turn: issued_turn } => issued_turn < turn,
+                    PurchaseStatus::Produced => false,
+                };
+                requires_purchase.then_some(PlannedPurchase {
+                    facility: step.facility,
+                    unit_type: step.unit_type,
+                    build_turn: step.scheduled_turn.saturating_sub(turn),
+                    cost: step.cost,
+                })
             })
             .collect();
         Some(PlanContinuation {
@@ -966,6 +1002,13 @@ impl V4RollingPlanRegistry {
             revision: plan.revision,
             purchases,
             production_failed,
+            formation_in_progress: kind == OperationKind::AssaultCapital
+                && plan
+                    .steps
+                    .iter()
+                    .any(|step| step.status != PurchaseStatus::Produced),
+            execution_authorized: plan.execution_authorized,
+            execution_delayed: plan.execution.delay_reason(turn).is_some(),
         })
     }
 
@@ -1783,6 +1826,36 @@ mod tests {
     }
 
     #[test]
+    fn reschedule_does_not_reissue_an_in_flight_purchase() {
+        let facility = GridPosition { x: 3, y: 4 };
+        let mut steps = vec![ScheduledPurchase {
+            step: PlanStepRef {
+                plan_id: PlanId(1),
+                revision: PlanRevision(0),
+                step_id: PlanStepId(0),
+            },
+            scheduled_turn: 10,
+            facility,
+            unit_type: UnitType::Bomber,
+            cost: 22_000,
+            status: PurchaseStatus::Issued { turn: 10 },
+        }];
+
+        apply_rescheduled_purchases(
+            &mut steps,
+            10,
+            &[PlannedPurchase {
+                facility,
+                unit_type: UnitType::Bomber,
+                build_turn: 0,
+                cost: 22_000,
+            }],
+        );
+
+        assert_eq!(steps[0].status, PurchaseStatus::Issued { turn: 10 });
+    }
+
+    #[test]
     fn capital_budget_conflict_defers_instead_of_withdrawing_the_plan() {
         let player = PlayerId(1);
         let enemy = Entity::from_raw(10);
@@ -2426,6 +2499,21 @@ mod tests {
             .expect("当手番step");
         registry.mark_issued(step, 3);
 
+        let current_turn = registry
+            .continuation(
+                player,
+                3,
+                OperationKind::Capture,
+                &[GridPosition { x: 5, y: 5 }],
+                &HashSet::from([Entity::from_raw(10)]),
+            )
+            .expect("同一手番の発注済みplanを取得する");
+        assert!(!current_turn.production_failed);
+        assert!(
+            current_turn.purchases.is_empty(),
+            "同一手番のIssued stepを二重発注してはならない"
+        );
+
         let continuation = registry
             .continuation(
                 player,
@@ -2436,6 +2524,7 @@ mod tests {
             )
             .expect("失敗理由を付けて再評価するため計画自体は取得する");
         assert!(continuation.production_failed);
+        assert_eq!(continuation.purchases.len(), 1);
     }
 
     #[test]

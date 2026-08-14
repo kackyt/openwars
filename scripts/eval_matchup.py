@@ -63,7 +63,13 @@ def init_mcp_server():
         [exe_path],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL, # エラー出力を無視して画面崩れを防ぐ
+        # 通常評価では画面を崩さない。停止診断時だけ親へ流し、サーバー側で
+        # 最後に開始したAI stepを観測できるようにする。
+        stderr=(
+            None
+            if os.environ.get("OPENWARS_TRACE_AI_STEPS")
+            else subprocess.DEVNULL
+        ),
         text=True,
         encoding='utf-8',
         env=env

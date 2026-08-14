@@ -691,6 +691,12 @@ impl VictoryRoadmapRegistry {
         // purposeは作戦identityではなく、同じ作戦内の可変な戦術状態として更新する。
         operation.purpose = purpose;
         operation.last_observed_turn = turn;
+        if operation.tactical_anchor != assignment.target_position {
+            // 所有権変化・損耗・敵の再占領で最短前線が変わった事実を、同じ作戦IDの
+            // 再計画として記録する。作戦を捨てず、次の局地目標と護衛計画へ差し替える。
+            operation.replan_count = operation.replan_count.saturating_add(1);
+            operation.last_replan_turn = Some(turn);
+        }
         operation.tactical_anchor = assignment.target_position;
         // 毎ターン見つかった前線目標を同じ作戦へ追加する。anchorや局地状態の変化で
         // 既存目標を捨てず、複数の中立・敵施設を並行して前進させる。
