@@ -84,6 +84,9 @@ pub struct AiTurnStrategyCache {
     campaign_production_commands: VecDeque<crate::events::ProduceUnitCommand>,
     campaign_production_blocks_generic: bool,
     campaign_production_generic_budget: Option<u32>,
+    /// 同じ自軍手番中、敵占有マスが変わらない間だけ再利用できる正確なターン距離。
+    action_distance_enemy_positions: Vec<(usize, usize)>,
+    action_distance_cache: TurnDistanceCache,
 }
 
 impl AiTurnStrategyCache {
@@ -179,6 +182,27 @@ impl AiTurnStrategyCache {
             .flatten()
     }
 
+    /// 敵の通行阻害配置が変化した場合だけ距離cacheを破棄して貸し出す。
+    fn take_action_distance_cache(
+        &mut self,
+        player_id: PlayerId,
+        enemy_positions: &[(usize, usize)],
+    ) -> TurnDistanceCache {
+        if self.player_id != Some(player_id) {
+            self.clear();
+            self.player_id = Some(player_id);
+        }
+        if self.action_distance_enemy_positions != enemy_positions {
+            self.action_distance_enemy_positions = enemy_positions.to_vec();
+            self.action_distance_cache.clear();
+        }
+        std::mem::take(&mut self.action_distance_cache)
+    }
+
+    fn put_action_distance_cache(&mut self, cache: TurnDistanceCache) {
+        self.action_distance_cache = cache;
+    }
+
     fn clear(&mut self) {
         self.player_id = None;
         self.squads_planned = false;
@@ -187,6 +211,8 @@ impl AiTurnStrategyCache {
         self.campaign_production_commands.clear();
         self.campaign_production_blocks_generic = false;
         self.campaign_production_generic_budget = None;
+        self.action_distance_enemy_positions.clear();
+        self.action_distance_cache.clear();
     }
 }
 
@@ -2142,7 +2168,18 @@ pub fn decide_ai_action_v2(
             .collect()
     };
     let damage_chart = world.resource::<crate::resources::DamageChart>().clone();
-    let mut turn_cache = TurnDistanceCache::default();
+    // 自軍の移動は距離探索上の通行可否を変えない。敵が撃破されて占有マスが
+    // 変わるまで、同一手番の全ユニットでDijkstra結果を共有する。
+    let mut enemy_blocker_positions = enemy_units
+        .iter()
+        .map(|(position, _, _, _, _, _, _)| (position.x, position.y))
+        .collect::<Vec<_>>();
+    enemy_blocker_positions.sort_unstable();
+    let mut strategy_cache = world
+        .remove_resource::<AiTurnStrategyCache>()
+        .unwrap_or_default();
+    let mut turn_cache =
+        strategy_cache.take_action_distance_cache(player_id, &enemy_blocker_positions);
     let mut best_overall_rank = (ActionPriority::Normal, i32::MIN);
     let mut best_overall_choice: Option<(Entity, AiCommand)> = None;
 
@@ -2944,6 +2981,8 @@ pub fn decide_ai_action_v2(
         }
     }
 
+    strategy_cache.put_action_distance_cache(turn_cache);
+    world.insert_resource(strategy_cache);
     best_overall_choice
 }
 
@@ -2993,6 +3032,42 @@ mod tests {
     use super::*;
     use crate::components::{Faction, Health, PlayerId, Property, UnitStats};
     use crate::resources::{DamageChart, UnitType};
+
+    #[test]
+    fn action_distance_cache_survives_friendly_actions_but_clears_on_enemy_movement() {
+        let player = PlayerId(1);
+        let map = Map::new(
+            4,
+            1,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        let registry = MasterDataRegistry::load().unwrap();
+        let mut strategy_cache = AiTurnStrategyCache::default();
+        let blockers = vec![(3, 0)];
+        let mut distance_cache = strategy_cache.take_action_distance_cache(player, &blockers);
+        let _ = calculate_turn_distance(
+            &map,
+            &registry,
+            &HashMap::new(),
+            (0, 0),
+            (3, 0),
+            crate::resources::MovementType::Infantry,
+            3,
+            1,
+            player,
+            &mut distance_cache,
+        );
+        assert!(!distance_cache.cache.is_empty());
+        strategy_cache.put_action_distance_cache(distance_cache);
+
+        let reused = strategy_cache.take_action_distance_cache(player, &blockers);
+        assert!(!reused.cache.is_empty());
+        strategy_cache.put_action_distance_cache(reused);
+
+        let cleared = strategy_cache.take_action_distance_cache(player, &[(2, 0)]);
+        assert!(cleared.cache.is_empty());
+    }
 
     #[test]
     fn drop_keeps_transport_actionable_until_last_ready_cargo() {

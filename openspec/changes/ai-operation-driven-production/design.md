@@ -997,6 +997,18 @@ map_3 / Hex / seed 81401 / V4先攻対V3後攻 / 6ターンでは、V4がTranspo
 
 **検証**: map_2後攻12ターンでは、補正前のV4編成`Rockets 10 / Bcopters 1`が`Rockets 2 / Bcopters 9`へ変化し、ZOCは41から72、施設は8から9、戦闘ROIは0.50から0.72へ改善した。最終のmap_1 / map_2 / Hex / seed 42 / 両手番12ターンではV4が4戦中3勝し、map_1は両手番で勝利した。map_2後攻は総資産判定でV3勝利だが、V4はZOC 76対59、施設9対9、収入14,000対14,000、ROI 0.90であり、従来の数的不利と砲台偏重は解消した。平均思考時間はV4 1,043msで、map_2後攻の交換負けとともに継続課題である。
 
+### Decision 38: 判断順を維持したnative並列化と手番内経路cacheをV3/V4へ適用する
+
+**問題**: map_1 / map_2だけの12ターン評価ではV4平均1,043msだったが、map_3で盤上unitと作戦候補が増えると、V4のRolling Plan候補simulationとV3/V4共通の全unit行動探索が支配的になった。同一beam層の候補は同じsnapshotを読む独立計算である一方、従来は直列評価していた。また`decide_ai_action_v2`は1unitを行動させるたびに、敵配置が変わっていなくても同じターン距離Dijkstraを空のcacheから再計算していた。単純な並列iteratorへの置換は同点候補の選択順を変え得て、WASM buildはnative thread poolを前提にできない。
+
+**選択**: `deterministic_parallel::map_ordered`を追加し、4件以上の独立候補だけをnativeでRayon評価する。WASMはRayonへ依存せず同じAPIを直列iteratorで実行する。入力`Vec`のindex順で結果を回収し、最良案更新、stable sort、beam truncateは従来どおり単一threadで処理する。適用範囲は、純粋snapshotを読むV4 Rolling Planの同一beam層と、島IDごとに独立したV3/V4共通campaign候補構築に限定する。Bevy `World`のsimulation・Command発行・最良案reductionは順序依存なので並列化しない。
+
+V3/V4共通行動探索では`TurnDistanceCache`を`AiTurnStrategyCache`へ保持し、同じplayerかつ敵占有座標集合が不変な間だけ次のunit行動選択へ貸し戻す。味方unitは距離探索で通過を阻害しないため、味方移動だけでは破棄しない。敵撃破・敵位置変化・player交代・手番終了ではcacheを破棄する。Dijkstra内の射程帯membershipも線形`Vec::contains`から`HashSet`へ置換する。
+
+**WASMと決定性**: `rayon`は`cfg(not(target_arch = "wasm32"))`のtarget依存とし、`wasm32-unknown-unknown`の`cargo check`を必須にする。並列結果の順序を入力順へ戻した後に従来の比較を行うため、thread完了順をtie-breakへ使用しない。
+
+**検証**: map_1 / map_2 / map_3 / Hex / seed 42 / V4対V3 / 両手番 / 12ターンの6試合で、V4平均思考時間は3,009.6msから2,414.1msへ19.8%減少（1.25倍）、V3は3,133.8msから2,386.0msへ23.9%減少（1.31倍）した。6試合の勝敗、生産内訳、ZOC、収入、施設数、NPV、戦闘ROIは変更前後で一致した。engine 566成功・1 ignoredとWASM checkを確認した。絶対値はなお約2.4秒であり、完成ゲート6の性能上限策定とピーク削減は未完了とする。
+
 ## Risks / Trade-offs
 
 | リスク | 影響 | 軽減策 |

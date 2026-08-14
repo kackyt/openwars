@@ -171,6 +171,20 @@ MUST: 候補探索を計算量上限で打ち切った場合、AIはその事実
 - **WHEN** 混成編成候補がbeam幅を超えて一部を探索しなかったとき
 - **THEN** `search_truncated`を真とし、採用案を「探索済み候補内の最良案」として記録する
 
+### Requirement: 決定順序を維持した独立候補の並列評価
+
+MUST: AIは、同じ不変snapshotだけを読む独立候補をnativeで並列評価してよいが、結果を入力順へ復元してから最良案更新と枝刈りを行い、thread完了順によって採用案を変えてはならない。WASMではthreadを要求せず同じ入力順の直列評価を提供しなければならない。
+
+#### Scenario: 同一beam層をnativeで評価する
+
+- **WHEN** 同じRolling Plan snapshotに対する4件以上の候補状態を評価するとき
+- **THEN** 各simulationを並列実行し、入力index順の結果列に戻してから従来と同じ比較・stable sort・beam truncateを行う
+
+#### Scenario: WASMで同じ計画を評価する
+
+- **WHEN** `wasm32-unknown-unknown`向けbuildで同じ候補列を評価するとき
+- **THEN** Rayonまたはnative threadを要求せず直列評価し、nativeと同じ入力順とtie-breakを使用する
+
 ### Requirement: 生産施設と既存戦力の排他的な計上
 
 MUST: AIは、現在手番の生産候補を空き施設から、将来手番の生産候補を一時占有中を含む生産圏内の全所有施設から生成し、既存Combat Entityを同じ手番の複数作戦へ重複計上してはならない。

@@ -257,9 +257,14 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
             }
         }
 
-        let mut evaluated_next = Vec::with_capacity(next.len());
-        for state in next {
-            let mut plan = simulate_state(input, &state, search_turns);
+        // 同じbeam層の各状態はsnapshotだけを読む独立計算である。nativeでは並列評価し、
+        // 結果は入力順へ戻してから従来どおり最良案を逐次更新するため、同点時の選択は不変。
+        let evaluated = crate::ai::deterministic_parallel::map_ordered(next, |state| {
+            let plan = simulate_state(input, &state, search_turns);
+            (state, plan)
+        });
+        let mut evaluated_next = Vec::with_capacity(evaluated.len());
+        for (state, mut plan) in evaluated {
             considered = considered.saturating_add(1);
             plan.candidates_considered = considered;
             if plan.feasible {

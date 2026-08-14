@@ -290,7 +290,8 @@ pub fn calculate_turn_distance_to_range(
     }
 
     // ターゲットから指定射程帯に入る、進入可能な全マスを目標地点とする。
-    let mut effective_targets = Vec::new();
+    // Dijkstraの各展開で射程帯判定を行うため、線形探索ではなく集合で保持する。
+    let mut effective_targets = HashSet::new();
     for dx in -(interaction_max_range as i32)..=(interaction_max_range as i32) {
         for dy in -(interaction_max_range as i32)..=(interaction_max_range as i32) {
             let nx = target.0 as i32 + dx;
@@ -313,7 +314,7 @@ pub fn calculate_turn_distance_to_range(
                             }
                         }
                         if can_enter {
-                            effective_targets.push(pos);
+                            effective_targets.insert(pos);
                         }
                     }
                 }
@@ -335,15 +336,13 @@ pub fn calculate_turn_distance_to_range(
     }
 
     // スタート地点がいずれかの到達目標に一致する場合
-    for &et in &effective_targets {
-        if start == et {
-            let zero = TurnDistance {
-                turns: 0,
-                used_mp: 0,
-            };
-            cache.cache.insert(cache_key, zero);
-            return zero;
-        }
+    if effective_targets.contains(&start) {
+        let zero = TurnDistance {
+            turns: 0,
+            used_mp: 0,
+        };
+        cache.cache.insert(cache_key, zero);
+        return zero;
     }
 
     // ダイクストラ法でスタートから各タイルへの最短移動コストを計算

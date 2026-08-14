@@ -2311,11 +2311,10 @@ pub fn analyze_island_campaign_excluding(
         .collect();
     let mut islands = island_map.islands.clone();
     islands.sort_by_key(|island| island.id.0);
-    let mut candidates = Vec::new();
-    for island in islands {
-        let Some(island_facts) = facts_by_island.get(&island.id).copied() else {
-            continue;
-        };
+    // 島ごとの候補構築は同じ盤面snapshotを読むだけで互いに独立している。
+    // nativeでは並列化し、IslandId順の結果を維持することでV3/V4の判断順を変えない。
+    let mut candidates = crate::ai::deterministic_parallel::map_ordered(islands, |island| {
+        let island_facts = facts_by_island.get(&island.id).copied()?;
         let mut assessment = assess_island(island_facts);
         // 陸塊が1つだけでも島嶼mapと同じ継続campaignとして扱う。違いは
         // `reachable` と輸送routeから輸送工程が必要になるかどうかだけである。
@@ -2393,7 +2392,7 @@ pub fn analyze_island_campaign_excluding(
             .collect::<Vec<_>>();
         priority_enemy_types.sort_by_key(|unit_type| campaign_unit_type_rank(*unit_type));
         priority_enemy_types.dedup();
-        let Some(target_position) = candidate_target_position(
+        let target_position = candidate_target_position(
             &map,
             &registry,
             &island,
@@ -2401,9 +2400,7 @@ pub fn analyze_island_campaign_excluding(
             &units,
             player_id,
             existing_operation.as_ref(),
-        ) else {
-            continue;
-        };
+        )?;
         let capture_target_positions = candidate_capture_target_positions(
             &map,
             &registry,
@@ -2440,7 +2437,7 @@ pub fn analyze_island_campaign_excluding(
         } else {
             sustainment_targets(&island, &properties, player_id)
         };
-        candidates.push(IslandCampaignCandidate {
+        Some(IslandCampaignCandidate {
             assessment,
             target_position,
             capture_target_positions,
@@ -2458,8 +2455,11 @@ pub fn analyze_island_campaign_excluding(
             assault_transport_types,
             producible_transports: producible_transports.clone(),
             existing_operation,
-        });
-    }
+        })
+    })
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
     let uses_operation_driven_production =
         crate::ai::resolve_player_ai_version(world, player_id).uses_operation_driven_production();
     let mut capital_launch_gate = None;

@@ -156,13 +156,13 @@
 
 - `operation-requirement-planning`: 前線（作戦）ごとに必要な編成を状況から導出する。目標クラスタ規模・敵戦力の到達時点予測・占領競争 ETA・接敵 ETA・到達可能性・輸送要否から `OperationRequirement` を組み立て、フェーズ非依存の編成判断を提供する
 - `production-budget-reservation`: 生産枠を制約とした予算配分と、複数ターンにまたがる予約・消費・解除・見送りを管理する。`SquadPackage` モードの作戦が部分購入済みパッケージを保持し、完成見込みに応じて予約を維持・縮小・解除する
-- `rolling-operation-planning`: 島の残敵排除と占領完了までの混成編成・生産順・行動予定を毎ターン再計算し、実行可能案のPareto比較、予実突合、任務変更条件を管理する
+- `rolling-operation-planning`: 島の残敵排除と占領完了までの混成編成・生産順・行動予定を毎ターン再計算し、実行可能案のPareto比較、予実突合、任務変更条件を管理する。独立候補はnativeで入力順を維持して並列評価し、WASMでは同じ判断順の直列評価へ切り替える
 
 ### Modified Capabilities
 
 - `production-strategy-analysis`: `GamePhase` 別の理想ユニット比率ハードコードを廃止し、作戦別要求の集合から生産方針を決定する方式へ変更する。フェーズは目標選定と脅威判定の文脈としてのみ残す。併せて、戦況観測量による毎ターンの作戦再評価と、到達可能性を含む拠点価値評価を追加する
 - `production-integration`: 生産ループが「単発で最高スコアのユニットを選ぶ」方式から「優先度順の作戦枠を埋める」方式へ変更される
-- `multi-unit-coordination`: 島嶼キャンペーン限定だった作戦・割当モデルを陸上前線・防衛前線へ一般化する
+- `multi-unit-coordination`: 島嶼キャンペーン限定だった作戦・割当モデルを陸上前線・防衛前線へ一般化する。V3/V4共通の行動探索では、敵占有マスが不変な間の経路探索結果を手番内で共有する
 
 ## Impact
 
@@ -179,10 +179,11 @@
 - `engine/src/ai/operation_assignment.rs`（新規）: Entityごとの唯一の作戦owner／実行Squad／役割を保持する正本とowner逆引きを提供し、平均O(1)照会、原子的移管、所属数O(k)の作戦解放を保証する
 - `engine/src/ai/v4/victory_roadmap.rs`: 未完原因と復旧行動を別履歴へ記録し、輸送manifestから輸送役・cargo損失を区別する。原因検知ではなく実際の再発注・再割当・輸送付与・補充確認だけを再計画実績とする
 - `engine/src/ai/v4/rolling_plan.rs`（新規）: 島作戦snapshot、混成編成候補、計画revision、Pareto前線、予実差、再計画理由を保持する純粋な計画器
+- `engine/src/ai/deterministic_parallel.rs`（新規）: nativeではRayon、WASMでは直列iteratorを使用し、いずれも入力順の結果列を返す独立候補評価基盤
 - `engine/src/ai/v4/plan_revision.rs`（新規）: 実行可能なCombat生産列を手番間で保持し、固定列再評価、step実績照合、Plan単位の予実台帳、増援・遅延判定、盤面事実による継続・revision・完了・撤回を管理する
 - `engine/src/ai/operation_simulation.rs`（新規）: 本番ルールと共有する移動・戦闘・輸送・占領のターン単位予測を提供し、V4検証後にV3からも再利用する
 - `engine/src/ai/squad.rs`: 自力展開戦力と輸送 cargo の分離、複数 cargo の Pickup 進行。加えて手番境界のO(U+R)正規化でcampaign、deployment、汎用Squadの重複参照を唯一owner／Squadへ収束させ、Reserveを現行作戦へ再接続して期限超過を防ぐ
-- `engine/src/ai/engine.rs`: Drop に参加した輸送役と cargo の双方を当該ターンの行動済みとして記録。加えてV1〜V4共通の攻撃・接近評価へ、搭載兵力と占領阻止を含む戦略標的価値を導入し、V4では局地任務の現在標的Entityを通常標的より優先する
+- `engine/src/ai/engine.rs`: Drop に参加した輸送役と cargo の双方を当該ターンの行動済みとして記録。加えてV1〜V4共通の攻撃・接近評価へ、搭載兵力と占領阻止を含む戦略標的価値を導入し、V4では局地任務の現在標的Entityを通常標的より優先する。V3/V4のターン距離cacheは敵占有座標が不変な間だけ再利用し、敵撃破・移動時に破棄する
 - `engine/src/ai/engine.rs`: 航空unitの候補移動を、移動後も最寄りの自軍空港へ日次消費込みで帰投可能な範囲へ制限する。空港喪失などで既に安全圏外なら、帰還不足を悪化させず空港距離を縮める回復移動を許す
 - 別枠の`EmergencyMissionPlan`、Interception owner、緊急行動優先度、緊急トレースは廃止する。防衛は通常のCampaign/Defense ownerだけで実行する
 - `strategy.rs` / `resources/`: Stage 2では変更しない。新しい予約台帳 Resource も追加しない
