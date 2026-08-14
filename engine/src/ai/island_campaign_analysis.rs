@@ -1479,19 +1479,6 @@ fn contested_is_competitive(facts: &IslandCampaignFacts) -> bool {
         .is_some_and(|(friendly_eta, enemy_eta)| friendly_eta <= enemy_eta.saturating_add(1))
 }
 
-/// 占領対象を持つ陸塊が1つだけなら、通常の地上戦略へ委譲すべき主陸塊として返す。
-fn sole_capturable_landmass_id(facts: &[IslandCampaignFacts]) -> Option<IslandId> {
-    let mut capturable_landmasses = facts
-        .iter()
-        .filter(|facts| facts.capturable_properties > 0)
-        .map(|facts| facts.island_id);
-    let sole_landmass = capturable_landmasses.next()?;
-    capturable_landmasses
-        .next()
-        .is_none()
-        .then_some(sole_landmass)
-}
-
 fn requirement_for_assessment(
     facts: &IslandCampaignFacts,
     assessment: &mut crate::ai::island_campaign::IslandCampaignAssessment,
@@ -1602,9 +1589,12 @@ fn requirement_for_assessment(
     }
 }
 
-/// 敵首都の全施設数を、そのまま第一波の同時占領人数へ変換しない。
-/// 第一波は最大3施設を並行占領し、観測敵が残る場合は損耗交代要員を1体加える。
-/// 敵撃破に必要な戦力は価格や施設数ではなくV4の時系列Combat Planが別途決める。
+/// 敵首都島でも、盤面上の未所有施設をすべて継続目標として保持する。
+///
+/// 同時に動かす占領兵を固定3体などへ切り詰めると、広い陸塊や複数の上陸地点で
+/// 取得機会を失う。必要数は現在の未所有施設数から導き、実際に同時進行できる数は
+/// 生産・輸送・移動scheduleと既存Entityの割当に委ねる。敵撃破戦力は別途V4の
+/// 時系列Combat Planが決めるため、ここでは価格や敵数を占領兵数へ換算しない。
 fn prepare_capital_assault_wave(candidate: &mut IslandCampaignCandidate) {
     if candidate.assessment.decision != IslandCampaignDecision::Assault
         || candidate
@@ -1626,10 +1616,7 @@ fn prepare_capital_assault_wave(candidate: &mut IslandCampaignCandidate) {
     if remaining_properties == 0 {
         return;
     }
-    let capture_units = capital_assault_capture_units(
-        remaining_properties,
-        candidate.assessment.enemy_combat_units,
-    );
+    let capture_units = remaining_properties;
     candidate.requirement.capture_units = capture_units;
     candidate.requirement.transport_slots = capture_units;
     candidate.requirement.ground_combat_units = 0;
@@ -1641,12 +1628,6 @@ fn prepare_capital_assault_wave(candidate: &mut IslandCampaignCandidate) {
         &mut candidate.requirement,
         &candidate.producible_transports,
     );
-}
-
-fn capital_assault_capture_units(remaining_properties: u32, enemy_combat_units: u32) -> u32 {
-    remaining_properties
-        .min(3)
-        .saturating_add(u32::from(enemy_combat_units > 0))
 }
 
 /// 首都作戦だけを集結状態へ戻す。局地Captureや防衛assignmentは変更しないため、
@@ -2230,7 +2211,6 @@ pub fn analyze_island_campaign_excluding(
         available_funds,
     );
 
-    let sole_capturable_landmass = sole_capturable_landmass_id(&facts);
     let facts_by_island: HashMap<_, _> = facts
         .iter()
         .map(|island_facts| (island_facts.island_id, island_facts))
@@ -2243,26 +2223,9 @@ pub fn analyze_island_campaign_excluding(
             continue;
         };
         let mut assessment = assess_island(island_facts);
-        let mut requirement = if sole_capturable_landmass == Some(island.id)
-            && assessment.state == IslandCampaignState::Contested
-        {
-            // 単一の主陸塊で起きる通常戦闘は島嶼作戦へ資源を予約せず、地上戦略へ委譲する。
-            assessment.decision = IslandCampaignDecision::Observe;
-            assessment.decision_reason =
-                "単一の占領対象陸塊は通常の地上戦略で処理するため監視する".to_owned();
-            assessment.required_budget = 0;
-            assessment.allocated_budget = 0;
-            IslandCampaignRequirement {
-                preferred_transport: None,
-                transport_slots: 0,
-                capture_units: 0,
-                ground_combat_units: 0,
-                combat_units: 0,
-                total_budget: 0,
-            }
-        } else {
-            requirement_for_assessment(island_facts, &mut assessment)
-        };
+        // 陸塊が1つだけでも島嶼mapと同じ継続campaignとして扱う。違いは
+        // `reachable` と輸送routeから輸送工程が必要になるかどうかだけである。
+        let mut requirement = requirement_for_assessment(island_facts, &mut assessment);
         let existing_operation = operations_by_island.get(&island.id).cloned();
         let assault_wave_is_live = existing_operation.as_ref().is_some_and(|operation| {
             matches!(
@@ -2445,13 +2408,6 @@ mod tests {
     use bevy_ecs::prelude::{Entity, World};
 
     const TEST_SEED: u64 = 42;
-
-    #[test]
-    fn capital_first_wave_uses_parallel_objectives_plus_one_casualty_replacement() {
-        assert_eq!(capital_assault_capture_units(15, 33), 4);
-        assert_eq!(capital_assault_capture_units(2, 1), 3);
-        assert_eq!(capital_assault_capture_units(2, 0), 2);
-    }
 
     #[test]
     fn roadmap_then_live_squad_override_produced_anchor() {
@@ -2741,7 +2697,7 @@ mod tests {
     }
 
     #[test]
-    fn sole_mainland_contested_is_observed_without_campaign_allocation() {
+    fn sole_mainland_contested_keeps_multi_property_campaign_allocation() {
         let master_data = MasterDataRegistry::load().expect("master data should load");
         let (mut world, _schedule) =
             crate::setup::initialize_world_from_master_data(&master_data, "map_1")
@@ -2788,7 +2744,6 @@ mod tests {
         spawn_test_unit(&mut world, enemy, enemy_position, tank);
 
         let facts = collect_island_campaign_facts(&mut world, player);
-        assert_eq!(sole_capturable_landmass_id(&facts), Some(mainland));
         let mainland_facts = facts
             .iter()
             .find(|facts| facts.island_id == mainland)
@@ -2804,13 +2759,16 @@ mod tests {
             .expect("mainland assessment should remain visible");
 
         assert_eq!(assessment.state, IslandCampaignState::Contested);
-        assert_eq!(assessment.decision, IslandCampaignDecision::Observe);
-        assert_eq!(assessment.required_budget, 0);
-        assert_eq!(assessment.allocated_budget, 0);
-        assert!(portfolio.assignment_for(mainland).is_none());
-        assert!(portfolio.active_offensives.is_empty());
+        assert_ne!(assessment.decision, IslandCampaignDecision::Observe);
+        let assignment = portfolio
+            .assignment_for(mainland)
+            .expect("単一大陸でも継続campaignを生成する");
+        assert_eq!(assignment.capture_target_positions, vec![enemy_position]);
+        assert!(assignment.requirement.capture_units >= 1);
+        assert_eq!(assignment.requirement.transport_slots, 0);
+        assert!(!portfolio.active_offensives.is_empty());
         assert!(portfolio.defenses.is_empty());
-        assert!(portfolio.aggregate_missing_requirements().is_empty());
+        assert!(!portfolio.aggregate_missing_requirements().is_empty());
     }
 
     #[test]

@@ -570,6 +570,21 @@ fn decide_campaign_production_v4(
         return CampaignProductionControl::Continue;
     }
 
+    let Some(scan) = BoardScan::collect(world, player_id) else {
+        return CampaignProductionControl::BlockGeneric;
+    };
+
+    // 陸続きで自力到達できる前線まで島campaign専用生産へ通すと、占領枠を
+    // 全て買い終えるまで時系列Combat Planが起動せず、裸の占領兵を逐次損耗させる。
+    // 専用経路が担当するのは輸送工程を必要とする前線だけとし、陸続きの前線は
+    // 同一Operation内でCaptureとCombatを混成して計画する。目標一覧そのものは
+    // campaign/roadmapに残るため、単一目標へ縮退することはない。
+    let mut reach = ReachCtx::default();
+    shortfalls.retain(|shortfall| !has_direct_capture_route(&scan, &mut reach, shortfall));
+    if shortfalls.is_empty() {
+        return CampaignProductionControl::Continue;
+    }
+
     // 航空掃討は後段のrolling planへ委譲する。一方、敵領Assaultで輸送・配置枠まで
     // 予約済みの地上波はcampaign Squadへ渡さないと港で遊兵になるため、必要実体数と
     // その購入上限だけを残す。
@@ -581,9 +596,6 @@ fn decide_campaign_production_v4(
         }
     }
 
-    let Some(scan) = BoardScan::collect(world, player_id) else {
-        return CampaignProductionControl::BlockGeneric;
-    };
     let enemy_stats: Vec<_> = scan
         .enemy_units
         .iter()
@@ -630,6 +642,32 @@ fn decide_campaign_production_v4(
         }
         None => CampaignProductionControl::Continue,
     }
+}
+
+/// 生産施設から占領可能unitが対象へ自力到達できるかを判定する。
+///
+/// 「島か大陸か」ではなく実際の移動可能地形で判定するため、島map内の陸続き前線も
+/// 単一大陸mapも同じOperation生産へ入り、海峡を越える前線だけ輸送工程へ残る。
+fn has_direct_capture_route(
+    scan: &BoardScan,
+    reach: &mut ReachCtx,
+    shortfall: &crate::ai::island_campaign::IslandCampaignShortfall,
+) -> bool {
+    scan.production_facilities
+        .iter()
+        .any(|(facility, terrain)| {
+            scan.available_types.iter().any(|(unit_type, stats)| {
+                stats.can_capture
+                    && scan.can_produce(*terrain, *unit_type)
+                    && reach.is_reachable(
+                        &scan.map,
+                        &scan.master_data,
+                        (facility.x, facility.y),
+                        (shortfall.target_position.x, shortfall.target_position.y),
+                        stats.movement_type,
+                    )
+            })
+        })
 }
 
 fn mark_campaign_production_issued(
@@ -1737,13 +1775,9 @@ fn build_operation(
         !reachable_threats.is_empty()
             || (kind == OperationKind::AssaultCapital && enemy_reinforcement_funds > 0),
     );
-    if kind == OperationKind::AssaultCapital {
-        // 首都準備段階では戦闘編成だけを形成する。占領兵と輸送は兵站路確保後に
-        // IslandCampaignが実行可能な波として組み、ここで汎用任務へ流さない。
-        slots.capture_units = 0;
-        slots.transport_slots = 0;
-        slots.intercept_units = 0;
-    }
+    // AssaultCapitalも局地Captureと同じ作戦内で複数施設を前進目標として持つ。
+    // 構造生産を島campaignが予約済みの手番は`allow_structural_slots`側で一括して
+    // Capture/Transportを無効化するため、ここで恒久的に0へ落としてはならない。
 
     let mut operation = Operation {
         kind,
@@ -1835,9 +1869,13 @@ fn plan_production_with_registry(
     if !allow_structural_slots {
         // 占領要員と輸送役は島嶼キャンペーン側で予約済み。余剰予算を同じ役割へ
         // 二重投入せず、観測済みの敵に対する迎撃・護衛・撃破だけへ使う。
+        // ただし陸続きの前線はcampaign専用生産の対象外なので、別の渡洋作戦が
+        // 同時に予約中でも構造枠を消してはならない。
         for operation in &mut operations {
-            operation.slots.capture_units = 0;
-            operation.slots.transport_slots = 0;
+            if operation.facts.requires_transport {
+                operation.slots.capture_units = 0;
+                operation.slots.transport_slots = 0;
+            }
         }
     }
 
@@ -2823,32 +2861,34 @@ fn operation_priority_rank(operation: &Operation) -> u32 {
 
 /// 指定した段階の中で最も飢えた枠を返す。
 fn most_starved_in_tier(operations: &[Operation], tier: SlotTier) -> Option<(usize, SlotKind)> {
-    let mut best: Option<(usize, SlotKind, (u32, usize, f32))> = None;
+    let mut best: Option<(usize, SlotKind, u32, f32, usize)> = None;
     for (index, op) in operations.iter().enumerate() {
         for (priority, kind) in SLOT_PRIORITY.iter().enumerate() {
             let deficit = op.slots.tier_deficit(*kind, &op.filled, tier);
             if deficit <= 0.0 {
                 continue;
             }
-            let key = match tier {
-                // 前提条件は「どの作戦を先に成立させるか」で並べる。
-                // 作戦の優先度 → 枠の固定優先順位（SLOT_PRIORITY は作戦遂行の
-                // 前提から順に並んでいる）→ 未充足率。
-                SlotTier::Prerequisite => (operation_priority_rank(op), priority, -deficit),
-                // 余剰は作戦の別なく、未充足率だけで配る。
-                // ここで作戦優先度を先に見てはならない。撃破枠の要求は青天井なので、
-                // 最優先の作戦（＝自陣の防衛）が全額を吸い、渡洋作戦には 1 円も
-                // 回らなくなる＝自陣に引きこもる。撃破要求は既に前線ごとの分担比
-                // (`frontline_share`) で割ってあるので、未充足率で選べば
-                // 資金は自然と各前線の分担比どおりに配分される。
-                SlotTier::Residual => (0, 0, -deficit),
+            let operation_rank = match tier {
+                SlotTier::Prerequisite => operation_priority_rank(op),
+                SlotTier::Residual => 0,
             };
-            if best.is_none_or(|(_, _, best_key)| key < best_key) {
-                best = Some((index, *kind, key));
+            // 同じ作戦優先度なら、固定された役割順で全Captureを埋めるのではなく
+            // 未充足率が最大の枠を選ぶ。最初の占領兵を確保した後はCombat計画が
+            // 先に100%不足となるため、掃討波を形成してから残りの占領前線を広げる。
+            // 未充足率が同じ場合だけ輸送→占領→戦闘という依存順を使う。
+            let better = best.is_none_or(|(_, _, best_rank, best_deficit, best_priority)| {
+                operation_rank < best_rank
+                    || (operation_rank == best_rank
+                        && (deficit.total_cmp(&best_deficit).is_gt()
+                            || (deficit.total_cmp(&best_deficit).is_eq()
+                                && priority < best_priority)))
+            });
+            if better {
+                best = Some((index, *kind, operation_rank, deficit, priority));
             }
         }
     }
-    best.map(|(index, kind, _)| (index, kind))
+    best.map(|(index, kind, _, _, _)| (index, kind))
 }
 
 /// 満たせないと判明した枠の要求を消す（無限ループ防止）。
@@ -3369,7 +3409,9 @@ mod tests {
         let mut scan = multi_factory_scan();
         let local_anchor = pos(6, 2);
         let capital = pos(8, 2);
+        let second_front = pos(7, 1);
         let island_id = crate::ai::islands::IslandId(0);
+        scan.open_properties = vec![local_anchor, second_front, capital];
         scan.campaign_objectives = vec![
             CampaignPlanningObjective {
                 island_id,
@@ -3405,6 +3447,9 @@ mod tests {
         assert_eq!(same_island.len(), 1);
         assert_eq!(same_island[0].kind, OperationKind::AssaultCapital);
         assert_eq!(same_island[0].anchor, capital);
+        assert_eq!(same_island[0].objective_properties.len(), 3);
+        assert_eq!(same_island[0].slots.capture_units, 3);
+        assert!(!same_island[0].facts.requires_transport);
     }
 
     #[test]
@@ -3889,7 +3934,7 @@ mod tests {
         damage_chart.insert_damage(UnitType::Bcopters, UnitType::Infantry, 65);
         damage_chart.insert_damage(UnitType::Infantry, UnitType::Bcopters, 0);
         let enemy_positions = [pos(8, 0), pos(8, 1), pos(8, 2)];
-        let mut scan = BoardScan {
+        let scan = BoardScan {
             map: flat_map(10, 3),
             master_data: MasterDataRegistry::load().unwrap(),
             damage_chart,
@@ -3935,63 +3980,33 @@ mod tests {
 
         let (commands, trace) = plan_production(&scan, PlayerId(1), false, &HashMap::new());
 
-        // 65%攻撃を何回実行できるかをシミュレーションするため、価格に関係なく
-        // 3目標を期限内に処理できる3機が編成される。
+        // 占領役を1体確保してもCombat計画を消さず、65%攻撃を何回実行できるかを
+        // シミュレーションした混成列を保持する。現在資金で買える2機を当手番へ置き、
+        // 残りは将来購入として同じPlanへ残す。
         assert_eq!(commands.len(), 3, "commands={commands:?}, trace={trace:?}");
-        assert!(
+        assert_eq!(
             commands
                 .iter()
-                .all(|command| command.unit_type == UnitType::Bcopters)
+                .filter(|command| command.unit_type == UnitType::Infantry)
+                .count(),
+            1
         );
-
-        // 当手番だけ空港が塞がっていても、将来購入を捨てず次手番に実行する。
-        let helicopter = &mut scan
-            .available_types
-            .iter_mut()
-            .find(|(unit_type, _)| *unit_type == UnitType::Bcopters)
-            .expect("戦闘ヘリfixture")
-            .1;
-        helicopter.max_ammo1 = 9;
-        helicopter.max_fuel = 100;
-        helicopter.daily_fuel_consumption = 1;
-        scan.free_facilities = vec![(pos(0, 1), Terrain::Factory)];
-        let mut registry = V4RollingPlanRegistry::default();
-        let (blocked_commands, blocked_trace) = plan_production_with_registry(
-            &scan,
-            PlayerId(1),
-            false,
-            &HashMap::new(),
-            3,
-            &mut registry,
-        );
-        assert!(blocked_commands.is_empty());
-        let initial_plan_id = blocked_trace.rolling_combat_plans[0]
-            .plan_id
-            .unwrap_or_else(|| panic!("実行可能な将来計画は永続化される: {blocked_trace:?}"));
-        assert!(
-            blocked_trace
-                .steps
+        assert_eq!(
+            commands
                 .iter()
-                .any(|step| matches!(step.decision, ProductionDecision::Reserved { .. }))
+                .filter(|command| command.unit_type == UnitType::Bcopters)
+                .count(),
+            2
         );
-
-        scan.free_facilities = scan.production_facilities.clone();
-        let (next_commands, next_trace) = plan_production_with_registry(
-            &scan,
-            PlayerId(1),
-            false,
-            &HashMap::new(),
-            4,
-            &mut registry,
-        );
-        assert!(!next_commands.is_empty(), "trace={next_trace:?}");
+        let combat_plan = &trace.rolling_combat_plans[0];
+        assert_eq!(combat_plan.targets.len(), 3);
         assert!(
-            next_trace
-                .rolling_combat_plans
+            combat_plan
+                .targets
                 .iter()
-                .any(|plan| plan.plan_id == Some(initial_plan_id)),
-            "同じplan_idの残りstepを実行する: {next_trace:?}"
+                .all(|target| target.remaining_hp == 0)
         );
+        assert!(combat_plan.purchases.len() >= 3);
     }
 
     /// テスト用の作戦。枠の充足状況だけを見たいので敵情報は空にしておく。
@@ -4535,6 +4550,71 @@ mod tests {
         ];
 
         assert_eq!(most_starved_slot(&ops), Some((1, SlotKind::Combat)));
+    }
+
+    /// 同一前線では占領兵を全数先買いせず、最初の占領兵に続いて掃討計画を起動する。
+    #[test]
+    fn combat_plan_follows_first_capture_before_remaining_fronts_expand() {
+        let slots = OperationSlots {
+            capture_units: 8,
+            combat_plan_required: 1,
+            ..OperationSlots::default()
+        };
+        let empty = operation(OperationKind::Capture, slots, OperationSlots::default());
+        assert_eq!(most_starved_slot(&[empty]), Some((0, SlotKind::Capture)));
+
+        let first_capture_ready = operation(
+            OperationKind::Capture,
+            slots,
+            OperationSlots {
+                capture_units: 1,
+                ..OperationSlots::default()
+            },
+        );
+        assert_eq!(
+            most_starved_slot(&[first_capture_ready]),
+            Some((0, SlotKind::Combat))
+        );
+    }
+
+    /// 前線の分類はmap名ではなく、占領可能unitの実到達性だけで決める。
+    #[test]
+    fn direct_front_uses_operation_production_while_strait_keeps_transport_campaign() {
+        use crate::ai::island_campaign::{IslandCampaignDecision, IslandCampaignShortfall};
+        use crate::ai::islands::IslandId;
+
+        let shortfall = |target_position| IslandCampaignShortfall {
+            island_id: IslandId(0),
+            decision: IslandCampaignDecision::Assault,
+            target_position,
+            light_transport_slots: 0,
+            heavy_transport_slots: 0,
+            capture_units: 4,
+            ground_combat_units: 0,
+            combat_units: 0,
+            priority_enemy_types: Vec::new(),
+            reserved_budget: 4_000,
+            priority_rank: 0,
+        };
+
+        let mut mainland = strait_scan();
+        mainland.map = flat_map(10, 3);
+        mainland.production_facilities = vec![(pos(1, 1), Terrain::Factory)];
+        mainland.free_facilities = mainland.production_facilities.clone();
+        let mut reach = ReachCtx::default();
+        assert!(has_direct_capture_route(
+            &mainland,
+            &mut reach,
+            &shortfall(pos(8, 1))
+        ));
+
+        let overseas = strait_scan();
+        let mut reach = ReachCtx::default();
+        assert!(!has_direct_capture_route(
+            &overseas,
+            &mut reach,
+            &shortfall(pos(8, 1))
+        ));
     }
 
     /// 具体的な敵を持つ最優先防衛作戦は、後順位の輸送より先に計画する。

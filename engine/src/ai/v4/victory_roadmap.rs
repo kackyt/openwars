@@ -656,7 +656,7 @@ impl VictoryRoadmapRegistry {
                     created_turn: turn,
                     last_observed_turn: turn,
                     tactical_anchor: assignment.target_position,
-                    objective_properties: objectives,
+                    objective_properties: objectives.clone(),
                     owned_objective_count: 0,
                     phase: OperationPhase::Forming,
                     planned_completion_turn: None,
@@ -692,6 +692,13 @@ impl VictoryRoadmapRegistry {
         operation.purpose = purpose;
         operation.last_observed_turn = turn;
         operation.tactical_anchor = assignment.target_position;
+        // 毎ターン見つかった前線目標を同じ作戦へ追加する。anchorや局地状態の変化で
+        // 既存目標を捨てず、複数の中立・敵施設を並行して前進させる。
+        for objective in objectives {
+            if !operation.objective_properties.contains(&objective) {
+                operation.objective_properties.push(objective);
+            }
+        }
         operation.owned_objective_count = operation
             .objective_properties
             .iter()
@@ -1786,7 +1793,15 @@ pub(crate) fn reconcile_campaign_roadmap(
             })
             .unwrap_or_default();
         let objectives = if purpose == StrategicPurpose::AssaultCapital {
-            enemy_capital.into_iter().collect::<Vec<_>>()
+            // 首都島でも首都1点だけへ縮約しない。IslandCampaignが観測した全未所有
+            // 施設を同じ勝利作戦の前線目標として保持し、首都は終端目標として補う。
+            let mut positions = assignment.capture_target_positions.clone();
+            if let Some(capital) = enemy_capital
+                && !positions.contains(&capital)
+            {
+                positions.push(capital);
+            }
+            positions
         } else {
             let mut positions = property_snapshots
                 .iter()
@@ -2421,8 +2436,8 @@ mod tests {
         let operation = registry.operations.get(&first).expect("作戦");
         assert_eq!(
             operation.objective_properties,
-            vec![GridPosition { x: 10, y: 10 }],
-            "毎ターンのanchor変化で目的拠点を差し替えない"
+            vec![GridPosition { x: 10, y: 10 }, GridPosition { x: 12, y: 11 }],
+            "anchor変化で既存目標を捨てず、新しい前線目標を同じ作戦へ追加する"
         );
         assert_eq!(operation.tactical_anchor, GridPosition { x: 12, y: 11 });
     }

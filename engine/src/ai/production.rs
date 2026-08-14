@@ -10,7 +10,7 @@ use crate::ai::strategy::{
     EmergencyAntiAirReservation, ProductionPlan, ProductionStrategy, analyze_strategy_for_turn,
     sea_transport_capacity_from_slots,
 };
-use crate::ai::turn_distance::TerrainConnectivity;
+use crate::ai::turn_distance::{TerrainConnectivity, TurnDistanceCache, calculate_turn_distance};
 use crate::components::{
     ActionCompleted, Ammo, Faction, Fuel, GridPosition, Health, PlayerId, Property, UnitStats,
 };
@@ -582,6 +582,8 @@ fn plan_campaign_shortfall_production_with_damage(
     // 競合しない施設（例: SecureのFactoryに対するExpandのAirport）を下位作戦へ使う。
     let mut protected_higher_priority_funds = 0_u32;
     let mut combat_connectivity = TerrainConnectivity::default();
+    let unit_positions = std::collections::HashMap::new();
+    let mut turn_distance_cache = TurnDistanceCache::default();
 
     'rows: for row in &mut rows {
         let mut produced_structural_assault_unit = false;
@@ -631,30 +633,56 @@ fn plan_campaign_shortfall_production_with_damage(
                         }
                         let combat_coverage =
                             u32::from(requirement == CampaignProductionRequirement::Combat);
-                        let (covered_enemy_types, total_expected_damage) =
-                            damage_chart.map_or((0_u32, 0_u32), |chart| {
-                                row.priority_enemy_types.iter().fold(
-                                    (0_u32, 0_u32),
-                                    |(covered, total), enemy_type| {
-                                        let damage = chart
-                                            .get_base_damage(*unit_type, *enemy_type)
-                                            .unwrap_or_default()
-                                            .max(
-                                                chart
-                                                    .get_base_damage_secondary(
-                                                        *unit_type,
-                                                        *enemy_type,
-                                                    )
-                                                    .unwrap_or_default(),
-                                            );
-                                        (
-                                            covered + u32::from(damage > 0),
-                                            total.saturating_add(damage),
-                                        )
-                                    },
+                        // Capture枠は戦闘火力で選ばない。対象へ到着してCaptureを完了する
+                        // 手番を優先し、同着なら安い候補を選ぶ。火力は別のCombat計画が担う。
+                        let capture_completion_turn =
+                            if requirement == CampaignProductionRequirement::Capture {
+                                calculate_turn_distance(
+                                    map,
+                                    master_data,
+                                    &unit_positions,
+                                    (facility_position.x, facility_position.y),
+                                    (row.target_position.x, row.target_position.y),
+                                    stats.movement_type,
+                                    stats.max_movement,
+                                    0,
+                                    player_id,
+                                    &mut turn_distance_cache,
                                 )
-                            });
+                                .turns
+                                .saturating_add(2)
+                            } else {
+                                0
+                            };
+                        let (covered_enemy_types, total_expected_damage) =
+                            if requirement == CampaignProductionRequirement::Capture {
+                                (0, 0)
+                            } else {
+                                damage_chart.map_or((0_u32, 0_u32), |chart| {
+                                    row.priority_enemy_types.iter().fold(
+                                        (0_u32, 0_u32),
+                                        |(covered, total), enemy_type| {
+                                            let damage = chart
+                                                .get_base_damage(*unit_type, *enemy_type)
+                                                .unwrap_or_default()
+                                                .max(
+                                                    chart
+                                                        .get_base_damage_secondary(
+                                                            *unit_type,
+                                                            *enemy_type,
+                                                        )
+                                                        .unwrap_or_default(),
+                                                );
+                                            (
+                                                covered + u32::from(damage > 0),
+                                                total.saturating_add(damage),
+                                            )
+                                        },
+                                    )
+                                })
+                            };
                         candidates.push((
+                            capture_completion_turn,
                             std::cmp::Reverse(covered_enemy_types),
                             std::cmp::Reverse(total_expected_damage),
                             std::cmp::Reverse(combat_coverage),
@@ -677,9 +705,10 @@ fn plan_campaign_shortfall_production_with_damage(
                         candidate.4,
                         candidate.5,
                         candidate.6,
+                        candidate.7,
                     )
                 });
-                if let Some((_, _, _, _, _, _, _, position, unit_type, stats)) =
+                if let Some((_, _, _, _, _, _, _, _, position, unit_type, stats)) =
                     candidates.into_iter().next()
                 {
                     selected = Some((
@@ -4109,6 +4138,51 @@ mod additional_tests {
         assert_eq!(outcome.commands.len(), 1);
         assert_eq!(outcome.commands[0].unit_type, UnitType::Tank);
         assert!(outcome.completed_all_rows);
+    }
+
+    #[test]
+    fn campaign_capture_prefers_earlier_cheaper_capture_over_damage() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let stats = |unit_type: UnitType| {
+            master_data
+                .create_unit_stats(&crate::resources::master_data::UnitName(
+                    unit_type.as_str().to_owned(),
+                ))
+                .unwrap()
+        };
+        let infantry = stats(UnitType::Infantry);
+        let mech = stats(UnitType::Mech);
+        let rows = vec![IslandCampaignShortfall {
+            island_id: crate::ai::islands::IslandId(0),
+            decision: IslandCampaignDecision::Contest,
+            target_position: GridPosition { x: 4, y: 0 },
+            light_transport_slots: 0,
+            heavy_transport_slots: 0,
+            capture_units: 1,
+            ground_combat_units: 0,
+            combat_units: 0,
+            reserved_budget: mech.cost,
+            priority_rank: 0,
+            priority_enemy_types: vec![UnitType::Infantry],
+        }];
+        let mut damage_chart = DamageChart::new();
+        damage_chart.insert_damage(UnitType::Infantry, UnitType::Infantry, 20);
+        damage_chart.insert_damage(UnitType::Mech, UnitType::Infantry, 80);
+        let map = Map::new(5, 1, Terrain::Plains, GridTopology::Square);
+
+        let outcome = plan_campaign_shortfall_production_with_damage(
+            PlayerId(1),
+            &rows,
+            &[(GridPosition { x: 0, y: 0 }, Terrain::Factory)],
+            &[(UnitType::Infantry, infantry), (UnitType::Mech, mech)],
+            &map,
+            &master_data,
+            rows[0].reserved_budget,
+            Some(&damage_chart),
+        );
+
+        assert_eq!(outcome.commands.len(), 1);
+        assert_eq!(outcome.commands[0].unit_type, UnitType::Infantry);
     }
 
     /// Lander資金が足りない初手でも同じパッケージの輸送ヘリを1件だけ先行し、
