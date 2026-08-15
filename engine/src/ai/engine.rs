@@ -291,6 +291,65 @@ struct AiProductionCommandQueue {
     commands: VecDeque<crate::events::ProduceUnitCommand>,
 }
 
+/// 現在手番の一括生産計画から、まだ試行していない次の命令だけを取り出す。
+/// 生産済みunitは同じ手番に行動できないため、キューが残っている間は通常行動を
+/// 再探索せずとも、前回の「全行動候補なし」という判定を安全に引き継げる。
+fn take_next_queued_production_command(
+    world: &mut World,
+    player_id: PlayerId,
+    turn: u32,
+) -> Option<crate::events::ProduceUnitCommand> {
+    let cooldown = world
+        .get_resource::<AiProductionCooldown>()
+        .map(|resource| resource.0.clone())
+        .unwrap_or_default();
+    let (last_error, last_event) = world
+        .get_resource::<crate::resources::ProductionDiagnostic>()
+        .map(|diagnostic| (diagnostic.last_error.clone(), diagnostic.last_event.clone()))
+        .unwrap_or_default();
+    let mut queue = world
+        .remove_resource::<AiProductionCommandQueue>()
+        .unwrap_or_default();
+    if queue.player_id != Some(player_id) || queue.turn != turn {
+        queue.player_id = Some(player_id);
+        queue.turn = turn;
+        queue.commands.clear();
+    }
+
+    let mut command = None;
+    while let Some(candidate) = queue.commands.pop_front() {
+        let candidate_text = format!("{:?}", candidate);
+        if cooldown.contains(&(candidate.target_x, candidate.target_y))
+            || last_error.is_some() && last_event.as_deref() == Some(candidate_text.as_str())
+        {
+            continue;
+        }
+        command = Some(candidate);
+        break;
+    }
+    world.insert_resource(queue);
+    command
+}
+
+fn issue_production_command(
+    world: &mut World,
+    command: crate::events::ProduceUnitCommand,
+) -> Option<String> {
+    let command_text = format!("{:?}", command);
+    if let Some(mut cooldown) = world.get_resource_mut::<AiProductionCooldown>() {
+        cooldown.0.insert((command.target_x, command.target_y));
+    } else {
+        world.insert_resource(AiProductionCooldown(HashSet::from([(
+            command.target_x,
+            command.target_y,
+        )])));
+    }
+    world
+        .get_resource_mut::<Events<crate::events::ProduceUnitCommand>>()?
+        .send(command);
+    Some(command_text)
+}
+
 /// V3が同一ターンの部隊計画と島嶼キャンペーン分析を再実行しないための一時cache。
 /// 次フェーズでResourceごと削除し、キャンペーンの永続状態としては扱わない。
 #[derive(Resource, Default)]
@@ -1611,6 +1670,21 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     let ai_version = crate::ai::resolve_player_ai_version(world, active_player);
     let uses_v3 = ai_version.uses_v3_tactics();
     let is_v4 = ai_version == crate::ai::ai_version::AiVersion::V4;
+    let turn = world
+        .get_resource::<crate::resources::MatchState>()
+        .map_or(0, |state| state.current_turn_number.0);
+    let has_queued_production = world
+        .get_resource::<AiProductionCommandQueue>()
+        .is_some_and(|queue| {
+            queue.player_id == Some(active_player)
+                && queue.turn == turn
+                && !queue.commands.is_empty()
+        });
+    if has_queued_production
+        && let Some(command) = take_next_queued_production_command(world, active_player, turn)
+    {
+        return issue_production_command(world, command);
+    }
     let should_plan_squads = skip_entities.is_empty()
         && (!uses_v3
             || !world
@@ -1659,7 +1733,6 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
             crate::ai::squad::update_squads(world, active_player);
         }
     }
-
     // 未完成の島嶼輸送パッケージが生産施設上でFormingすると、不足している次の
     // 輸送役を自分で生産不能にする。任務所属は維持したまま隣接待機地へ一歩だけ退避する。
     if uses_v3 {
@@ -1676,7 +1749,6 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
             return Some(command_text);
         }
     }
-
     // 1. 輸送部隊の優先実行
     let mut transport_action = None;
     if let Some(mut manager) = world.remove_resource::<crate::ai::squad::SquadManager>() {
@@ -1757,7 +1829,6 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
         }
         return Some(cmd_str);
     }
-
     // 通常の意思決定を行う際には、輸送中のEntity（輸送機と歩兵）を通常AIのスキップ対象に追加する
     let mut decide_skip_entities = skip_entities.clone();
     if let Some(manager) = world.get_resource::<crate::ai::squad::SquadManager>() {
@@ -1790,7 +1861,6 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
         }
         return Some(cmd_str);
     }
-
     // Drop/Capture/作戦完了で手番途中にSquadを失ったV4 Entityを、全通常行動が
     // 尽きた時点で1度だけ再接続する。従来は次手番までownerだけが残り、
     // 行動可能な歩兵・輸送役が生産拠点付近で遊兵化していた。
@@ -1810,7 +1880,6 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
             return Some(command_text);
         }
     }
-
     // 通常の作戦行動で進めなかった任務所属unitも、生産施設だけは塞ぎ続けない。
     // 先に通常行動を試した後のfallbackなので、前線へ進めるunitの移動距離は奪わない。
     if is_v4 {
@@ -1827,7 +1896,6 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
             return Some(command_text);
         }
     }
-
     // 3. 生産行動
     let cooldown_set = if let Some(res) = world.get_resource::<AiProductionCooldown>() {
         res.0.clone()
@@ -1842,9 +1910,6 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
             (None, None)
         };
 
-    let turn = world
-        .get_resource::<crate::resources::MatchState>()
-        .map_or(0, |state| state.current_turn_number.0);
     let mut production_queue = world
         .remove_resource::<AiProductionCommandQueue>()
         .unwrap_or_default();
@@ -3285,6 +3350,42 @@ mod tests {
     use super::*;
     use crate::components::{Faction, Health, PlayerId, Property, UnitStats};
     use crate::resources::{DamageChart, UnitType};
+
+    #[test]
+    fn queued_production_keeps_later_commands_for_the_fast_path() {
+        let mut world = World::new();
+        let player = PlayerId(1);
+        let first = crate::events::ProduceUnitCommand {
+            player_id: player,
+            target_x: 1,
+            target_y: 2,
+            unit_type: UnitType::Infantry,
+        };
+        let second = crate::events::ProduceUnitCommand {
+            player_id: player,
+            target_x: 3,
+            target_y: 4,
+            unit_type: UnitType::Bcopters,
+        };
+        world.insert_resource(AiProductionCommandQueue {
+            player_id: Some(player),
+            turn: 7,
+            commands: VecDeque::from([first, second]),
+        });
+
+        let selected = take_next_queued_production_command(&mut world, player, 7)
+            .expect("先頭の生産命令を取得する");
+        assert_eq!((selected.target_x, selected.target_y), (1, 2));
+        let remaining = world.resource::<AiProductionCommandQueue>();
+        assert_eq!(remaining.commands.len(), 1);
+        assert_eq!(
+            remaining
+                .commands
+                .front()
+                .map(|command| (command.target_x, command.target_y)),
+            Some((3, 4))
+        );
+    }
 
     #[test]
     fn action_distance_cache_survives_friendly_actions_but_clears_on_enemy_movement() {

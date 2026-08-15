@@ -156,7 +156,7 @@
 
 - `operation-requirement-planning`: 前線（作戦）ごとに必要な編成を状況から導出する。目標クラスタ規模・敵戦力の到達時点予測・占領競争 ETA・接敵 ETA・到達可能性・輸送要否から `OperationRequirement` を組み立て、フェーズ非依存の編成判断を提供する
 - `production-budget-reservation`: 生産枠を制約とした予算配分と、複数ターンにまたがる予約・消費・解除・見送りを管理する。`SquadPackage` モードの作戦が部分購入済みパッケージを保持し、完成見込みに応じて予約を維持・縮小・解除する
-- `rolling-operation-planning`: 島の残敵排除と占領完了までの混成編成・生産順・行動予定を毎ターン再計算し、実行可能案のPareto比較、予実突合、任務変更条件を管理する。独立候補はnativeで入力順を維持して並列評価し、WASMでは同じ判断順の直列評価へ切り替える。同一盤面・同一移動条件の経路探索と作戦再構築は手番内snapshotおよび到達性cacheを共有し、同値判断を再計算しない
+- `rolling-operation-planning`: 島の残敵排除と占領完了までの混成編成・生産順・行動予定を毎ターン再計算し、実行可能案のPareto比較、予実突合、任務変更条件を管理する。独立候補はnativeで入力順を維持して並列評価し、WASMでは同じ判断順の直列評価へ切り替える。同一盤面・同一移動条件の経路探索と作戦再構築は手番内snapshotおよび到達性cacheを共有し、同じRolling Plan入力に対する距離・交戦可否・与反撃damage・接触turnも全beam候補で共有して同値判断を再計算しない
 
 ### Modified Capabilities
 

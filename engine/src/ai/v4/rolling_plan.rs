@@ -9,6 +9,7 @@ use crate::resources::{DamageChart, Map, Terrain, UnitType};
 use crate::systems::combat::calculate_damage_formula;
 use bevy_ecs::prelude::Entity;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 // 1施設手番ごとの候補を順に展開するため、同手番に複数施設を使う混成案が
 // beamから落ちない幅を確保する。候補全体の直積を走査する旧方式には戻さない。
@@ -161,12 +162,27 @@ impl ForcePackagePlan {
 #[derive(Debug, Clone)]
 struct SimFriendly {
     stats: UnitStats,
-    position: GridPosition,
     hp: u32,
     initial_hp: u32,
     available_turn: u32,
     attacks_left: u32,
-    engageable_enemy_indices: Vec<usize>,
+    /// 友軍から各敵へ攻撃するときの不変条件。敵indexと同じ添字で参照する。
+    attack_profiles: Arc<[Option<FriendlyAttackProfile>]>,
+    /// 各敵がこの友軍を攻撃するときの不変条件。敵indexと同じ添字で参照する。
+    enemy_attack_profiles: Arc<[Option<EnemyAttackProfile>]>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FriendlyAttackProfile {
+    base_damage: u32,
+    incoming_damage: u32,
+    ready_turn: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EnemyAttackProfile {
+    base_damage: u32,
+    contact_turn: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -184,15 +200,78 @@ struct SearchState {
     cost: u32,
 }
 
+/// 1回のRolling Plan入力で不変な交戦関係を全beam候補から共有する。
+struct SimulationCatalog {
+    existing_units: Vec<SimFriendly>,
+    protected_units: Vec<SimFriendly>,
+    production_units: Vec<SimFriendly>,
+    enemies: Vec<SimEnemy>,
+}
+
+impl SimulationCatalog {
+    fn new(input: &RollingPlanInput) -> Self {
+        let existing_units = input
+            .existing_units
+            .iter()
+            .map(|source| sim_friendly(input, source, true))
+            .collect();
+        let protected_units = input
+            .protected_units
+            .iter()
+            .map(|source| sim_friendly(input, source, false))
+            .collect();
+        let production_units = input
+            .production_options
+            .iter()
+            .map(|option| {
+                sim_friendly(
+                    input,
+                    &FriendlyPlanUnit {
+                        stats: option.stats.clone(),
+                        position: option.purchase.facility,
+                        hp: 100,
+                        available_turn: option.purchase.build_turn.saturating_add(1),
+                        engageable_enemy_indices: option.engageable_enemy_indices.clone(),
+                    },
+                    true,
+                )
+            })
+            .collect();
+        let enemies = input
+            .enemies
+            .iter()
+            .cloned()
+            .map(|source| SimEnemy {
+                hp: source.hp,
+                attacks_left: source
+                    .stats
+                    .max_ammo1
+                    .saturating_add(source.stats.max_ammo2)
+                    .max(1),
+                source,
+                destroyed_turn: None,
+            })
+            .collect();
+        Self {
+            existing_units,
+            protected_units,
+            production_units,
+            enemies,
+        }
+    }
+}
+
 /// 現在観測した敵を排除できる混成パッケージを探索する。
 pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackagePlan> {
+    let catalog = SimulationCatalog::new(input);
     if input.enemies.is_empty() {
         let search_turns = input
             .hard_deadline
             .or(input.capture_completion_turn)
             .unwrap_or(1)
             .max(1);
-        let mut plan = simulate_state(input, &SearchState::default(), search_turns);
+        let mut plan =
+            simulate_state_with_catalog(input, &catalog, &SearchState::default(), search_turns);
         plan.candidates_considered = 1;
         return Some(plan);
     }
@@ -201,7 +280,8 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
     if input.production_options.is_empty() {
         // 空き生産枠が無い手番でも、既存編成だけで任務を継続できるかは評価する。
         // ここでNoneにすると永続Planの実行・予実監視まで途切れてしまう。
-        let mut plan = simulate_state(input, &SearchState::default(), search_turns);
+        let mut plan =
+            simulate_state_with_catalog(input, &catalog, &SearchState::default(), search_turns);
         plan.candidates_considered = 1;
         return Some(plan);
     }
@@ -260,7 +340,7 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
         // 同じbeam層の各状態はsnapshotだけを読む独立計算である。nativeでは並列評価し、
         // 結果は入力順へ戻してから従来どおり最良案を逐次更新するため、同点時の選択は不変。
         let evaluated = crate::ai::deterministic_parallel::map_ordered(next, |state| {
-            let plan = simulate_state(input, &state, search_turns);
+            let plan = simulate_state_with_catalog(input, &catalog, &state, search_turns);
             (state, plan)
         });
         let mut evaluated_next = Vec::with_capacity(evaluated.len());
@@ -309,7 +389,7 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
         // 実行不能な将来列のために現在の空き施設と現金を寝かせない。今出せる
         // 直接戦闘要員を前線screenとして加え、資金が競合する最も遅い予定から
         // 次revisionへ送り返す。実行可能案の高価な必須counter予約には触れない。
-        selected = fill_best_effort_current_screen(input, selected, search_turns);
+        selected = fill_best_effort_current_screen(input, &catalog, selected, search_turns);
     }
     // 同じ施設・同じ兵種を後の手番に置く理由がなく、資金も足りるなら最早枠へ寄せる。
     // beam探索では将来収入で複数機を買う枝が残りやすいため、編成を変えずに
@@ -330,6 +410,7 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
 /// best-effort案の未使用current slotを、即時投入できる直接戦闘unitで埋める。
 fn fill_best_effort_current_screen(
     input: &RollingPlanInput,
+    catalog: &SimulationCatalog,
     selected: ForcePackagePlan,
     search_turns: u32,
 ) -> ForcePackagePlan {
@@ -451,7 +532,7 @@ fn fill_best_effort_current_screen(
             .map(|purchase| purchase.cost)
             .fold(0_u32, u32::saturating_add),
     };
-    let mut augmented = simulate_state(input, &state, search_turns);
+    let mut augmented = simulate_state_with_catalog(input, catalog, &state, search_turns);
     augmented.candidates_considered = selected.candidates_considered;
     augmented.search_truncated = selected.search_truncated;
     augmented
@@ -652,11 +733,28 @@ pub(crate) fn evaluate_fixed_package(
     }
 
     let search_turns = input.hard_deadline.unwrap_or(DEFAULT_SEARCH_TURNS).max(1);
-    Ok(simulate_state(input, &state, search_turns))
+    let catalog = SimulationCatalog::new(input);
+    Ok(simulate_state_with_catalog(
+        input,
+        &catalog,
+        &state,
+        search_turns,
+    ))
 }
 
+#[cfg(test)]
 fn simulate_state(
     input: &RollingPlanInput,
+    state: &SearchState,
+    search_turns: u32,
+) -> ForcePackagePlan {
+    let catalog = SimulationCatalog::new(input);
+    simulate_state_with_catalog(input, &catalog, state, search_turns)
+}
+
+fn simulate_state_with_catalog(
+    input: &RollingPlanInput,
+    catalog: &SimulationCatalog,
     state: &SearchState,
     search_turns: u32,
 ) -> ForcePackagePlan {
@@ -665,37 +763,15 @@ fn simulate_state(
         .iter()
         .map(|index| input.production_options[*index].purchase)
         .collect();
-    let mut friendlies: Vec<_> = input
-        .existing_units
-        .iter()
-        .map(sim_friendly)
-        .chain(state.option_indices.iter().map(|index| {
-            let option = &input.production_options[*index];
-            sim_friendly(&FriendlyPlanUnit {
-                stats: option.stats.clone(),
-                position: option.purchase.facility,
-                hp: 100,
-                available_turn: option.purchase.build_turn.saturating_add(1),
-                engageable_enemy_indices: option.engageable_enemy_indices.clone(),
-            })
-        }))
-        .collect();
-    let mut protected_units: Vec<_> = input.protected_units.iter().map(sim_friendly).collect();
-    let mut enemies: Vec<_> = input
-        .enemies
-        .iter()
-        .cloned()
-        .map(|source| SimEnemy {
-            hp: source.hp,
-            attacks_left: source
-                .stats
-                .max_ammo1
-                .saturating_add(source.stats.max_ammo2)
-                .max(1),
-            source,
-            destroyed_turn: None,
-        })
-        .collect();
+    let mut friendlies = catalog.existing_units.clone();
+    friendlies.extend(
+        state
+            .option_indices
+            .iter()
+            .map(|index| catalog.production_units[*index].clone()),
+    );
+    let mut protected_units = catalog.protected_units.clone();
+    let mut enemies = catalog.enemies.clone();
     let mut first_attack_turn = None;
     let mut turn_forecasts = Vec::new();
 
@@ -720,17 +796,13 @@ fn simulate_state(
             if friendly.hp == 0 || friendly.attacks_left == 0 || turn < friendly.available_turn {
                 continue;
             }
-            let Some(target_index) = select_target(input, friendly, &enemies, turn) else {
+            let Some((target_index, attack_profile)) = select_target(friendly, &enemies, turn)
+            else {
                 continue;
             };
             let target = &mut enemies[target_index];
-            let base_damage = best_damage(
-                &input.damage_chart,
-                friendly.stats.unit_type,
-                target.source.stats.unit_type,
-            );
             let damage = calculate_damage_formula(
-                base_damage,
+                attack_profile.base_damage,
                 friendly.hp,
                 target.source.defense_bonus,
                 false,
@@ -749,11 +821,7 @@ fn simulate_state(
 
             // 直接戦闘だけは反撃を受ける。悲観側では乱数ボーナス最大を加える。
             if friendly.stats.max_range <= 1 {
-                let counter_base = best_damage(
-                    &input.damage_chart,
-                    target.source.stats.unit_type,
-                    friendly.stats.unit_type,
-                );
+                let counter_base = attack_profile.incoming_damage;
                 if counter_base > 0 {
                     let counter = calculate_damage_formula(counter_base, target.hp, 0, true)
                         .saturating_add(10);
@@ -764,7 +832,7 @@ fn simulate_state(
         // 敵砲兵・直接戦闘unitも手番ごとに最も有利な友軍を攻撃する。
         // 占領兵だけを損耗対象にすると、射程へ入った護衛砲台が無傷という予測になり、
         // 間接火力だけの脆い編成を過大評価する。
-        for enemy in &mut enemies {
+        for (enemy_index, enemy) in enemies.iter_mut().enumerate() {
             if enemy.hp == 0 || enemy.attacks_left == 0 || turn < enemy.source.available_turn {
                 continue;
             }
@@ -773,34 +841,12 @@ fn simulate_state(
                 .enumerate()
                 .filter(|(_, target)| target.hp > 0 && turn >= target.available_turn)
                 .filter_map(|(index, target)| {
-                    let base_damage = best_damage(
-                        &input.damage_chart,
-                        enemy.source.stats.unit_type,
-                        target.stats.unit_type,
-                    );
-                    if base_damage == 0 {
+                    let profile = target.enemy_attack_profiles[enemy_index]?;
+                    if turn < profile.contact_turn {
                         return None;
                     }
-                    let distance = input.map.distance(
-                        enemy.source.position.x,
-                        enemy.source.position.y,
-                        target.position.x,
-                        target.position.y,
-                    );
-                    let enemy_travel = attack_readiness_turns(distance, &enemy.source.stats);
-                    let friendly_travel = distance
-                        .saturating_sub(enemy.source.stats.max_range.max(1))
-                        .div_ceil(target.stats.max_movement.max(1));
-                    let contact_turn = enemy
-                        .source
-                        .available_turn
-                        .saturating_add(enemy_travel)
-                        .min(target.available_turn.saturating_add(friendly_travel));
-                    if turn < contact_turn {
-                        return None;
-                    }
-                    let damage =
-                        calculate_damage_formula(base_damage, enemy.hp, 0, true).saturating_add(10);
+                    let damage = calculate_damage_formula(profile.base_damage, enemy.hp, 0, true)
+                        .saturating_add(10);
                     Some((index, damage))
                 })
                 .max_by_key(|(index, damage)| {
@@ -811,26 +857,12 @@ fn simulate_state(
                 .enumerate()
                 .filter(|(_, target)| target.hp > 0 && turn >= target.available_turn)
                 .filter_map(|(index, target)| {
-                    let base_damage = best_damage(
-                        &input.damage_chart,
-                        enemy.source.stats.unit_type,
-                        target.stats.unit_type,
-                    );
-                    if base_damage == 0 {
+                    let profile = target.enemy_attack_profiles[enemy_index]?;
+                    if turn < profile.contact_turn {
                         return None;
                     }
-                    let distance = input.map.distance(
-                        enemy.source.position.x,
-                        enemy.source.position.y,
-                        target.position.x,
-                        target.position.y,
-                    );
-                    let travel = attack_readiness_turns(distance, &enemy.source.stats);
-                    if turn < enemy.source.available_turn.saturating_add(travel) {
-                        return None;
-                    }
-                    let damage =
-                        calculate_damage_formula(base_damage, enemy.hp, 0, true).saturating_add(10);
+                    let damage = calculate_damage_formula(profile.base_damage, enemy.hp, 0, true)
+                        .saturating_add(10);
                     Some((index, damage))
                 })
                 .max_by_key(|(index, damage)| {
@@ -945,7 +977,11 @@ fn simulate_state(
     }
 }
 
-fn sim_friendly(source: &FriendlyPlanUnit) -> SimFriendly {
+fn sim_friendly(
+    input: &RollingPlanInput,
+    source: &FriendlyPlanUnit,
+    can_advance_to_enemy: bool,
+) -> SimFriendly {
     let total_ammo = source
         .stats
         .max_ammo1
@@ -956,48 +992,92 @@ fn sim_friendly(source: &FriendlyPlanUnit) -> SimFriendly {
         .max_fuel
         .checked_div(source.stats.daily_fuel_consumption)
         .unwrap_or(u32::MAX);
+    // 敵・友軍位置と兵種は1回のRolling Plan探索中は不変である。同じbeam内の
+    // 数千候補で距離・相性・接触turnを再計算せず、敵indexに対応する表へ固定する。
+    debug_assert!(
+        source
+            .engageable_enemy_indices
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]),
+        "交戦可能敵indexは盤面走査順の昇順で保持する"
+    );
+    let mut attack_profiles = Vec::with_capacity(input.enemies.len());
+    let mut enemy_attack_profiles = Vec::with_capacity(input.enemies.len());
+    for (enemy_index, enemy) in input.enemies.iter().enumerate() {
+        let distance = input.map.distance(
+            source.position.x,
+            source.position.y,
+            enemy.position.x,
+            enemy.position.y,
+        );
+        let base_damage = best_damage(
+            &input.damage_chart,
+            source.stats.unit_type,
+            enemy.stats.unit_type,
+        );
+        let can_attack = source
+            .engageable_enemy_indices
+            .binary_search(&enemy_index)
+            .is_ok()
+            && base_damage > 0;
+        attack_profiles.push(can_attack.then(|| {
+            FriendlyAttackProfile {
+                base_damage,
+                incoming_damage: best_damage(
+                    &input.damage_chart,
+                    enemy.stats.unit_type,
+                    source.stats.unit_type,
+                ),
+                ready_turn: source
+                    .available_turn
+                    .saturating_add(attack_readiness_turns(distance, &source.stats)),
+            }
+        }));
+
+        let enemy_base_damage = best_damage(
+            &input.damage_chart,
+            enemy.stats.unit_type,
+            source.stats.unit_type,
+        );
+        let enemy_travel = attack_readiness_turns(distance, &enemy.stats);
+        let friendly_travel = distance
+            .saturating_sub(enemy.stats.max_range.max(1))
+            .div_ceil(source.stats.max_movement.max(1));
+        let enemy_contact_turn = enemy.available_turn.saturating_add(enemy_travel);
+        let contact_turn = if can_advance_to_enemy {
+            enemy_contact_turn.min(source.available_turn.saturating_add(friendly_travel))
+        } else {
+            enemy_contact_turn
+        };
+        enemy_attack_profiles.push((enemy_base_damage > 0).then_some(EnemyAttackProfile {
+            base_damage: enemy_base_damage,
+            contact_turn,
+        }));
+    }
     SimFriendly {
         stats: source.stats.clone(),
-        position: source.position,
         hp: source.hp,
         initial_hp: source.hp,
         available_turn: source.available_turn,
         attacks_left: total_ammo.min(fuel_turns.max(1)),
-        engageable_enemy_indices: source.engageable_enemy_indices.clone(),
+        attack_profiles: attack_profiles.into(),
+        enemy_attack_profiles: enemy_attack_profiles.into(),
     }
 }
 
 fn select_target(
-    input: &RollingPlanInput,
     friendly: &SimFriendly,
     enemies: &[SimEnemy],
     turn: u32,
-) -> Option<usize> {
+) -> Option<(usize, FriendlyAttackProfile)> {
     enemies
         .iter()
         .enumerate()
         .filter(|(_, enemy)| enemy.hp > 0)
         .filter(|(_, enemy)| turn >= enemy.source.available_turn)
         .filter_map(|(index, enemy)| {
-            if !friendly.engageable_enemy_indices.contains(&index) {
-                return None;
-            }
-            let base_damage = best_damage(
-                &input.damage_chart,
-                friendly.stats.unit_type,
-                enemy.source.stats.unit_type,
-            );
-            if base_damage == 0 {
-                return None;
-            }
-            let distance = input.map.distance(
-                friendly.position.x,
-                friendly.position.y,
-                enemy.source.position.x,
-                enemy.source.position.y,
-            );
-            let travel = attack_readiness_turns(distance, &friendly.stats);
-            if turn < friendly.available_turn.saturating_add(travel) {
+            let profile = friendly.attack_profiles[index]?;
+            if turn < profile.ready_turn {
                 return None;
             }
             let strategic_rank = if enemy.source.stats.can_capture {
@@ -1010,20 +1090,18 @@ fn select_target(
             // 占領能力だけで標的順を固定すると、後方の砲兵を放置したまま前衛へ
             // 損耗を重ねる。自分へ返せる最大与ダメージを先に比較し、同程度なら
             // 勝利条件へ直結する占領・輸送能力と残HPで集中撃破先を決める。
-            let incoming_damage = best_damage(
-                &input.damage_chart,
-                enemy.source.stats.unit_type,
-                friendly.stats.unit_type,
-            );
             Some((
-                std::cmp::Reverse(incoming_damage),
-                strategic_rank,
-                enemy.hp,
-                index,
+                (
+                    std::cmp::Reverse(profile.incoming_damage),
+                    strategic_rank,
+                    enemy.hp,
+                    index,
+                ),
+                profile,
             ))
         })
-        .min()
-        .map(|(_, _, _, index)| index)
+        .min_by_key(|(key, _)| *key)
+        .map(|((_, _, _, index), profile)| (index, profile))
 }
 
 /// 現在位置から射撃可能になるまでの移動手番数。
@@ -1240,7 +1318,9 @@ mod tests {
         let mut selected = simulate_state(&input, &state, DEFAULT_SEARCH_TURNS);
         selected.feasible = false;
 
-        let augmented = fill_best_effort_current_screen(&input, selected, DEFAULT_SEARCH_TURNS);
+        let catalog = SimulationCatalog::new(&input);
+        let augmented =
+            fill_best_effort_current_screen(&input, &catalog, selected, DEFAULT_SEARCH_TURNS);
 
         assert!(augmented.purchases.iter().any(|purchase| {
             purchase.build_turn == 0 && purchase.unit_type == UnitType::Infantry

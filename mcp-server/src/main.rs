@@ -533,12 +533,17 @@ impl OpenWarsAiServer {
                     );
                 }
                 let units_before = invasion_trace::snapshot_units(&mut state.world);
+                let decision_started = std::time::Instant::now();
                 let action_taken =
                     engine::ai::engine::execute_ai_turn(&mut state.world, active_player_id);
                 if trace_ai_steps {
                     eprintln!(
-                        "simulate_ai_turn decided player={} turn={} step={} action={:?}",
-                        active_player_id.0, turn, step, action_taken
+                        "simulate_ai_turn decided player={} turn={} step={} elapsed_us={} action={:?}",
+                        active_player_id.0,
+                        turn,
+                        step,
+                        decision_started.elapsed().as_micros(),
+                        action_taken
                     );
                 }
                 // イベント処理後に、実行済みの侵攻イベントだけを構造化して収集する。

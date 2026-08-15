@@ -185,6 +185,30 @@ MUST: AIは、同じ不変snapshotだけを読む独立候補をnativeで並列�
 - **WHEN** `wasm32-unknown-unknown`向けbuildで同じ候補列を評価するとき
 - **THEN** Rayonまたはnative threadを要求せず直列評価し、nativeと同じ入力順とtie-breakを使用する
 
+### Requirement: 同一Rolling Plan入力の不変交戦条件共有
+
+MUST: AIは、同じRolling Plan入力から展開した全beam候補について、敵・既存戦力・保護対象・生産候補の位置と兵種から決まる交戦可否、初撃turn、基礎damage、反撃damage、敵接触turnを1回だけ計算して共有しなければならない。共有によって敵集合、生産候補、時系列、beam幅、比較順、tie-breakを変更してはならない。
+
+#### Scenario: 首都作戦で多数の敵と購入列を比較する
+
+- **WHEN** 同一の首都作戦snapshotから多数の購入列をbeam展開し、各列を同じ敵集合へsimulationするとき
+- **THEN** 各候補はHP、弾薬、撃破turn等の可変状態だけを独立保持し、距離・相性・接触時刻の不変表を再計算せず参照する
+
+#### Scenario: 単一Mainフェーズで生産後に合法行動が発生する
+
+- **WHEN** 生産命令の実行後に、未行動unitへ新しい合法行動または作戦再接続が生じたとき
+- **THEN** 高速化を理由に行動フェーズを終了せず、従来どおり候補を評価する
+
+#### Scenario: 輸送機内のcargoが実行Squad外に見える
+
+- **WHEN** `Transporting`を持つcargoが一時的にSquadのmember集合へ現れず、盤上の通常行動が尽きたとき
+- **THEN** 独立行動もReserve割当もできないcargoを手番内の未割当再接続トリガーにせず、輸送Squadの進行または次手番の全体計画で整合する
+
+#### Scenario: 輸送役が当手番の行動を完了している
+
+- **WHEN** Transit、Drop、Return中の輸送役が`ActionCompleted`または手番内cooldownに含まれるとき
+- **THEN** 当該stepでは盤面占有表と到達範囲を再構築せず、別の行動可能Entityの評価へ進む
+
 ### Requirement: 生産施設と既存戦力の排他的な計上
 
 MUST: AIは、現在手番の生産候補を空き施設から、将来手番の生産候補を一時占有中を含む生産圏内の全所有施設から生成し、既存Combat Entityを同じ手番の複数作戦へ重複計上してはならない。

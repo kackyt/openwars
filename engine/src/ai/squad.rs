@@ -3444,6 +3444,9 @@ fn assign_explicit_reserve_squads(
     }
     owned_properties.sort_by_key(|(position, _)| (position.y, position.x));
 
+    // 地形連結成分は盤面と移動種別だけで決まる。Reserve候補・敵・目標ごとに
+    // flood fillを作り直さず、この再配置パス全体で移動種別別の索引を共有する。
+    let mut connectivity = TerrainConnectivity::default();
     for (entity, position, stats) in units {
         let campaign_binding = campaign_by_entity.get(&entity).copied();
 
@@ -3479,7 +3482,7 @@ fn assign_explicit_reserve_squads(
                                 )
                                 .is_none()
                             })
-                            || !is_terrain_reachable(
+                            || !connectivity.is_reachable(
                                 &map,
                                 &registry,
                                 (position.x, position.y),
@@ -3500,7 +3503,7 @@ fn assign_explicit_reserve_squads(
         }
 
         let campaign_target = campaign_binding.map(|(_, target)| target).filter(|target| {
-            is_terrain_reachable(
+            connectivity.is_reachable(
                 &map,
                 &registry,
                 (position.x, position.y),
@@ -3511,7 +3514,7 @@ fn assign_explicit_reserve_squads(
         let active_target = campaign_assignments
             .iter()
             .filter(|assignment| {
-                is_terrain_reachable(
+                connectivity.is_reachable(
                     &map,
                     &registry,
                     (position.x, position.y),
@@ -3535,7 +3538,7 @@ fn assign_explicit_reserve_squads(
             .iter()
             .filter(|(_, terrain)| registry.can_repair_on_terrain(stats.unit_type, *terrain))
             .filter(|(target, _)| {
-                is_terrain_reachable(
+                connectivity.is_reachable(
                     &map,
                     &registry,
                     (position.x, position.y),
@@ -4128,6 +4131,12 @@ fn unassigned_entity_ids(
             entity_ref
                 .get::<Faction>()
                 .is_some_and(|faction| faction.0 == player_id)
+                // 搭載中cargoは盤上で独立行動できず、輸送Squad以外へも再割当できない。
+                // これを未割当と数えると、解消不能な同じcargoを理由に各AI stepで
+                // campaign固定点を再実行し続ける。
+                && entity_ref
+                    .get::<crate::components::Transporting>()
+                    .is_none()
                 && !assigned.contains(&entity_ref.id())
         })
         .map(|entity_ref| entity_ref.id())
@@ -5915,6 +5924,18 @@ pub fn execute_transport_squad_step(
                 crate::ai::engine::AiCommand::Wait { target_pos: t_pos },
             ));
         }
+    }
+    // Transit / Drop / Return で命令を出す主体は輸送役だけである。
+    // 行動済み輸送役について盤面全Entityの占有表と到達範囲を組み直しても、呼び出し側で
+    // 同じEntityがcooldown除外されるだけなので、重い経路探索へ入る前に終了する。
+    // Drop中にまだcargoが残る場合はActionCompletedがfalseのため、連続降車を妨げない。
+    if phase != TransportPhase::Pickup
+        && (skip_entities.contains(&transport_entity)
+            || world
+                .get::<crate::components::ActionCompleted>(transport_entity)
+                .is_some_and(|action| action.0))
+    {
+        return None;
     }
     let must_vacate_production_site = phase == TransportPhase::Pickup
         && squad.pickup_position.is_some_and(|pickup| pickup != t_pos)
@@ -8796,6 +8817,37 @@ mod tests {
     }
 
     #[test]
+    fn transported_cargo_does_not_trigger_end_turn_reassignment() {
+        let mut world = World::new();
+        let player = PlayerId(1);
+        let transport = world
+            .spawn((
+                Faction(player),
+                GridPosition { x: 0, y: 0 },
+                UnitStats::mock(),
+            ))
+            .id();
+        let cargo = world
+            .spawn((
+                Faction(player),
+                GridPosition { x: 0, y: 0 },
+                UnitStats::mock(),
+                Transporting(transport),
+            ))
+            .id();
+        let mut manager = SquadManager::new();
+        manager
+            .create_owned_squad(MissionType::Reserve, player)
+            .members
+            .insert(transport);
+
+        let unassigned = unassigned_entity_ids(&world, &manager, player);
+
+        assert!(!unassigned.contains(&cargo));
+        assert!(unassigned.is_empty());
+    }
+
+    #[test]
     fn campaign_owner_without_squad_is_reconnected_to_live_campaign_before_reserve() {
         let mut world = World::new();
         let map = Map::new(3, 1, Terrain::Plains, GridTopology::Square);
@@ -9069,6 +9121,45 @@ mod tests {
                 ..
             } if transport_entity == transport
         ));
+    }
+
+    #[test]
+    fn exhausted_return_transport_has_no_second_command() {
+        let mut world = World::new();
+        world.insert_resource(Map::new(2, 1, Terrain::Plains, GridTopology::Square));
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+        let player = PlayerId(1);
+        let transport = world
+            .spawn((
+                Faction(player),
+                GridPosition { x: 0, y: 0 },
+                UnitStats {
+                    unit_type: UnitType::TransportHelicopter,
+                    movement_type: MovementType::Air,
+                    max_movement: 7,
+                    ..UnitStats::mock()
+                },
+                Fuel {
+                    current: 60,
+                    max: 60,
+                },
+                CargoCapacity {
+                    max: 2,
+                    loaded: Vec::new(),
+                },
+                HasMoved(true),
+                ActionCompleted(true),
+            ))
+            .id();
+        let mut manager = SquadManager::new();
+        let mut squad = manager
+            .create_owned_squad(MissionType::Transport, player)
+            .clone();
+        squad.members.insert(transport);
+        squad.transport_entity = Some(transport);
+        squad.phase = MissionPhase::Transport(TransportPhase::Return);
+
+        assert!(execute_transport_squad_step(&mut world, &mut squad, &HashSet::new()).is_none());
     }
 
     #[test]
