@@ -7,12 +7,220 @@ use crate::components::{
     ActionCompleted, Faction, GridPosition, HasMoved, Health, PlayerId, Property, UnitStats,
 };
 use crate::events::{AttackUnitCommand, CapturePropertyCommand, MoveUnitCommand, WaitUnitCommand};
-use crate::resources::master_data::MasterDataRegistry;
-use crate::resources::{Map, Terrain};
+use crate::resources::master_data::{MasterDataRegistry, UnitName, WeaponRecord};
+use crate::resources::{GridTopology, Map, Terrain, UnitType};
 use crate::systems::combat::get_expected_damage;
 use crate::systems::movement::{OccupantInfo, calculate_reachable_tiles};
 use bevy_ecs::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
+
+#[derive(Debug, Clone, Copy)]
+struct TacticalSnapshotUnit {
+    entity: Entity,
+    position: GridPosition,
+    faction: PlayerId,
+    unit_type: UnitType,
+    ammo1: u32,
+    ammo2: u32,
+    is_transporting: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TacticalSnapshotProperty {
+    owner: Option<PlayerId>,
+    capture_points: u32,
+    max_capture_points: u32,
+}
+
+/// 1回の行動選択中に不変な盤面情報を索引化し、移動候補ごとの ECS 全走査を避けます。
+struct AiTacticalSnapshot {
+    topology: GridTopology,
+    units: Vec<TacticalSnapshotUnit>,
+    unit_indices: HashMap<Entity, usize>,
+    units_by_position: HashMap<(usize, usize), Vec<usize>>,
+    properties: HashMap<(usize, usize), TacticalSnapshotProperty>,
+    weapons: HashMap<UnitType, (Option<WeaponRecord>, Option<WeaponRecord>)>,
+}
+
+impl AiTacticalSnapshot {
+    fn from_world(
+        world: &mut World,
+        registry: &MasterDataRegistry,
+        topology: GridTopology,
+    ) -> Self {
+        let mut units = Vec::new();
+        let mut unit_indices = HashMap::new();
+        let mut units_by_position: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+        {
+            let mut query = world.query::<(
+                Entity,
+                &GridPosition,
+                &Faction,
+                &UnitStats,
+                Option<&crate::components::Ammo>,
+                Option<&crate::components::Transporting>,
+            )>();
+            for (entity, position, faction, stats, ammo, transporting) in query.iter(world) {
+                let index = units.len();
+                units.push(TacticalSnapshotUnit {
+                    entity,
+                    position: *position,
+                    faction: faction.0,
+                    unit_type: stats.unit_type,
+                    ammo1: ammo.map_or(0, |value| value.ammo1),
+                    ammo2: ammo.map_or(0, |value| value.ammo2),
+                    is_transporting: transporting.is_some(),
+                });
+                unit_indices.insert(entity, index);
+                units_by_position
+                    .entry((position.x, position.y))
+                    .or_default()
+                    .push(index);
+            }
+        }
+
+        let properties = {
+            let mut query = world.query::<(&GridPosition, &Property)>();
+            query
+                .iter(world)
+                .map(|(position, property)| {
+                    (
+                        (position.x, position.y),
+                        TacticalSnapshotProperty {
+                            owner: property.owner_id,
+                            capture_points: property.capture_points,
+                            max_capture_points: property.max_capture_points,
+                        },
+                    )
+                })
+                .collect()
+        };
+
+        let weapons = units
+            .iter()
+            .map(|unit| unit.unit_type)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|unit_type| {
+                let unit_record = registry.get_unit(&UnitName(unit_type.as_str().to_string()));
+                let pair = unit_record.map_or((None, None), |record| {
+                    let primary = record
+                        .weapon1
+                        .as_ref()
+                        .and_then(|name| registry.weapons.get(&UnitName(name.clone())))
+                        .cloned();
+                    let secondary = record
+                        .weapon2
+                        .as_ref()
+                        .and_then(|name| registry.weapons.get(&UnitName(name.clone())))
+                        .cloned();
+                    (primary, secondary)
+                });
+                (unit_type, pair)
+            })
+            .collect();
+
+        Self {
+            topology,
+            units,
+            unit_indices,
+            units_by_position,
+            properties,
+            weapons,
+        }
+    }
+
+    fn action_targets_at(
+        &self,
+        attacker: Entity,
+        stats: &UnitStats,
+        position: GridPosition,
+        is_moved: bool,
+    ) -> crate::systems::action::TacticalActionTargets {
+        let Some(&attacker_index) = self.unit_indices.get(&attacker) else {
+            return crate::systems::action::TacticalActionTargets::default();
+        };
+        let attacker_unit = self.units[attacker_index];
+        let position_indices = self
+            .units_by_position
+            .get(&(position.x, position.y))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let is_occupied_by_other = position_indices.iter().any(|&index| {
+            let unit = self.units[index];
+            unit.entity != attacker && !unit.is_transporting
+        });
+
+        let mergeable_targets = position_indices
+            .iter()
+            .filter_map(|&index| {
+                let target = self.units[index];
+                (target.entity != attacker
+                    && target.faction == attacker_unit.faction
+                    && target.unit_type == stats.unit_type)
+                    .then_some(target.entity)
+            })
+            .collect();
+
+        let (can_capture, can_repair) = self
+            .properties
+            .get(&(position.x, position.y))
+            .filter(|property| stats.can_capture && property.max_capture_points > 0)
+            .map_or((false, false), |property| {
+                if property.owner == Some(attacker_unit.faction) {
+                    (false, property.capture_points < property.max_capture_points)
+                } else {
+                    (true, false)
+                }
+            });
+
+        let attackable_targets = if is_occupied_by_other {
+            Vec::new()
+        } else {
+            let (primary, secondary) = self
+                .weapons
+                .get(&stats.unit_type)
+                .map(|(primary, secondary)| (primary.as_ref(), secondary.as_ref()))
+                .unwrap_or((None, None));
+            self.units
+                .iter()
+                .filter_map(|target| {
+                    if target.entity == attacker || target.faction == attacker_unit.faction {
+                        return None;
+                    }
+                    let distance = self.topology.distance(
+                        (position.x, position.y),
+                        (target.position.x, target.position.y),
+                    );
+                    let weapon_can_attack = |weapon: &WeaponRecord, ammo: u32| {
+                        weapon
+                            .damages
+                            .get(target.unit_type.as_str())
+                            .copied()
+                            .unwrap_or(0)
+                            > 0
+                            && ammo > 0
+                            && (distance <= 1 || !is_moved)
+                            && distance >= weapon.range_min
+                            && distance <= weapon.range_max
+                    };
+                    (primary.is_some_and(|weapon| weapon_can_attack(weapon, attacker_unit.ammo1))
+                        || secondary
+                            .is_some_and(|weapon| weapon_can_attack(weapon, attacker_unit.ammo2)))
+                    .then_some(target.entity)
+                })
+                .collect()
+        };
+
+        crate::systems::action::TacticalActionTargets {
+            attackable_targets,
+            mergeable_targets,
+            can_capture: !is_occupied_by_other && can_capture,
+            can_repair: !is_occupied_by_other && can_repair,
+            can_wait: !is_occupied_by_other || !is_moved,
+        }
+    }
+}
 
 #[derive(Resource, Default)]
 pub struct AiActionCooldown(pub HashSet<Entity>);
@@ -73,6 +281,16 @@ fn strategic_target_value(
 #[derive(Resource, Default)]
 pub struct AiProductionCooldown(pub HashSet<(usize, usize)>);
 
+/// 同じ手番に一度作った複数施設分の生産命令を順番に発行します。
+/// 生産計画は予算と使用施設を全命令分シミュレート済みなので、1体ごとに盤面分析から
+/// やり直さず、敵が行動しない同一生産フェーズでは計画列をそのまま消費します。
+#[derive(Resource, Default)]
+struct AiProductionCommandQueue {
+    player_id: Option<PlayerId>,
+    turn: u32,
+    commands: VecDeque<crate::events::ProduceUnitCommand>,
+}
+
 /// V3が同一ターンの部隊計画と島嶼キャンペーン分析を再実行しないための一時cache。
 /// 次フェーズでResourceごと削除し、キャンペーンの永続状態としては扱わない。
 #[derive(Resource, Default)]
@@ -84,6 +302,8 @@ pub struct AiTurnStrategyCache {
     campaign_production_commands: VecDeque<crate::events::ProduceUnitCommand>,
     campaign_production_blocks_generic: bool,
     campaign_production_generic_budget: Option<u32>,
+    /// 生産フェーズの全施設分を一括計画済み。後続呼び出しは再分析せず終了する。
+    production_batch_planned: bool,
     /// 同じ自軍手番中、敵占有マスが変わらない間だけ再利用できる正確なターン距離。
     action_distance_enemy_positions: Vec<(usize, usize)>,
     action_distance_cache: TurnDistanceCache,
@@ -182,6 +402,18 @@ impl AiTurnStrategyCache {
             .flatten()
     }
 
+    pub(crate) fn mark_production_batch_planned(&mut self, player_id: PlayerId) {
+        if self.player_id != Some(player_id) {
+            self.clear();
+            self.player_id = Some(player_id);
+        }
+        self.production_batch_planned = true;
+    }
+
+    pub(crate) fn production_batch_planned(&self, player_id: PlayerId) -> bool {
+        self.player_id == Some(player_id) && self.production_batch_planned
+    }
+
     /// 敵の通行阻害配置が変化した場合だけ距離cacheを破棄して貸し出す。
     fn take_action_distance_cache(
         &mut self,
@@ -211,6 +443,7 @@ impl AiTurnStrategyCache {
         self.campaign_production_commands.clear();
         self.campaign_production_blocks_generic = false;
         self.campaign_production_generic_budget = None;
+        self.production_batch_planned = false;
         self.action_distance_enemy_positions.clear();
         self.action_distance_cache.clear();
     }
@@ -443,6 +676,7 @@ pub fn decide_ai_action(
 
         let map = world.resource::<Map>().clone();
         let registry = world.resource::<MasterDataRegistry>().clone();
+        let tactical_snapshot = AiTacticalSnapshot::from_world(world, &registry, map.topology);
 
         // 3. 到達可能タイルを算出
         let reachable = calculate_reachable_tiles(
@@ -534,9 +768,9 @@ pub fn decide_ai_action(
             }
             let is_stationary = current_grid.x == pos.x && current_grid.y == pos.y;
 
-            let actions = crate::systems::action::get_available_actions_at(
-                world,
+            let actions = tactical_snapshot.action_targets_at(
                 unit_entity,
+                &stats,
                 current_grid,
                 !is_stationary,
             );
@@ -872,14 +1106,8 @@ pub fn decide_ai_action(
             }
 
             // (B) Attack
-            if actions.can_attack {
-                let targets = crate::systems::combat::get_attackable_targets_at(
-                    world,
-                    unit_entity,
-                    current_grid,
-                    is_stationary,
-                );
-                for target_entity in targets {
+            if !actions.attackable_targets.is_empty() {
+                for target_entity in actions.attackable_targets.iter().copied() {
                     // カミカゼアタック（無謀な攻撃）の回避
                     if crate::ai::pruning::is_suicidal_attack_at(
                         world,
@@ -999,13 +1227,8 @@ pub fn decide_ai_action(
             }
 
             // (F) Merge
-            if actions.can_merge {
-                let targets = crate::systems::merge::get_mergable_targets_at(
-                    world,
-                    unit_entity,
-                    current_grid,
-                );
-                for target_entity in targets {
+            if !actions.mergeable_targets.is_empty() {
+                for target_entity in actions.mergeable_targets.iter().copied() {
                     let mut merge_score = 3000;
                     if let (Some(t_health), Some(_t_stats)) = (
                         world.get::<Health>(target_entity),
@@ -1439,18 +1662,19 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
 
     // 未完成の島嶼輸送パッケージが生産施設上でFormingすると、不足している次の
     // 輸送役を自分で生産不能にする。任務所属は維持したまま隣接待機地へ一歩だけ退避する。
-    if uses_v3
-        && let Some((entity, command)) =
-            decide_forming_campaign_site_relief(world, active_player, &skip_entities, is_v4)
-    {
-        let command_text = format!("{:?}", command);
-        execute_ai_command(world, entity, command);
-        if let Some(mut cooldown) = world.get_resource_mut::<AiActionCooldown>() {
-            cooldown.0.insert(entity);
-        } else {
-            world.insert_resource(AiActionCooldown(HashSet::from([entity])));
+    if uses_v3 {
+        let relief =
+            decide_forming_campaign_site_relief(world, active_player, &skip_entities, is_v4);
+        if let Some((entity, command)) = relief {
+            let command_text = format!("{:?}", command);
+            execute_ai_command(world, entity, command);
+            if let Some(mut cooldown) = world.get_resource_mut::<AiActionCooldown>() {
+                cooldown.0.insert(entity);
+            } else {
+                world.insert_resource(AiActionCooldown(HashSet::from([entity])));
+            }
+            return Some(command_text);
         }
-        return Some(command_text);
     }
 
     // 1. 輸送部隊の優先実行
@@ -1589,24 +1813,22 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
 
     // 通常の作戦行動で進めなかった任務所属unitも、生産施設だけは塞ぎ続けない。
     // 先に通常行動を試した後のfallbackなので、前線へ進めるunitの移動距離は奪わない。
-    if is_v4
-        && let Some((entity, command)) =
-            decide_forming_campaign_site_relief(world, active_player, &skip_entities, true)
-    {
-        let command_text = format!("{:?}", command);
-        execute_ai_command(world, entity, command);
-        if let Some(mut cooldown) = world.get_resource_mut::<AiActionCooldown>() {
-            cooldown.0.insert(entity);
-        } else {
-            world.insert_resource(AiActionCooldown(HashSet::from([entity])));
+    if is_v4 {
+        let relief =
+            decide_forming_campaign_site_relief(world, active_player, &skip_entities, true);
+        if let Some((entity, command)) = relief {
+            let command_text = format!("{:?}", command);
+            execute_ai_command(world, entity, command);
+            if let Some(mut cooldown) = world.get_resource_mut::<AiActionCooldown>() {
+                cooldown.0.insert(entity);
+            } else {
+                world.insert_resource(AiActionCooldown(HashSet::from([entity])));
+            }
+            return Some(command_text);
         }
-        return Some(command_text);
     }
 
     // 3. 生産行動
-    // 生産内容は盤面・資金の変化ごとに従来通り再計画し、V3の島分析だけを同一ターンで共有する。
-    let prod_commands = super::production::decide_production(world, active_player);
-
     let cooldown_set = if let Some(res) = world.get_resource::<AiProductionCooldown>() {
         res.0.clone()
     } else {
@@ -1620,7 +1842,48 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
             (None, None)
         };
 
-    for cmd in prod_commands {
+    let turn = world
+        .get_resource::<crate::resources::MatchState>()
+        .map_or(0, |state| state.current_turn_number.0);
+    let mut production_queue = world
+        .remove_resource::<AiProductionCommandQueue>()
+        .unwrap_or_default();
+    if production_queue.player_id != Some(active_player) || production_queue.turn != turn {
+        production_queue.player_id = Some(active_player);
+        production_queue.turn = turn;
+        production_queue.commands.clear();
+    }
+
+    // 直前の計画に残る別施設の命令を、重い戦略分析を再実行せず先に消費する。
+    while let Some(cmd) = production_queue.commands.pop_front() {
+        if cooldown_set.contains(&(cmd.target_x, cmd.target_y)) {
+            continue;
+        }
+        let cmd_str = format!("{:?}", cmd);
+        if last_error.is_some() && last_event_str.as_deref() == Some(&cmd_str) {
+            continue;
+        }
+        world.insert_resource(production_queue);
+        if let Some(mut cooldown) = world.get_resource_mut::<AiProductionCooldown>() {
+            cooldown.0.insert((cmd.target_x, cmd.target_y));
+        } else {
+            world.insert_resource(AiProductionCooldown(HashSet::from([(
+                cmd.target_x,
+                cmd.target_y,
+            )])));
+        }
+        if let Some(mut events) =
+            world.get_resource_mut::<Events<crate::events::ProduceUnitCommand>>()
+        {
+            events.send(cmd);
+            return Some(cmd_str);
+        }
+        return None;
+    }
+
+    // 敵が行動しない同一生産フェーズでは、全施設分を一度だけ計画する。
+    let mut prod_commands = super::production::decide_production(world, active_player).into_iter();
+    while let Some(cmd) = prod_commands.next() {
         if cooldown_set.contains(&(cmd.target_x, cmd.target_y)) {
             continue;
         }
@@ -1634,7 +1897,6 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
             continue;
         }
 
-        let mut sent = false;
         {
             if let Some(mut res) = world.get_resource_mut::<AiProductionCooldown>() {
                 res.0.insert((cmd.target_x, cmd.target_y));
@@ -1645,17 +1907,17 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
             }
         }
 
+        production_queue.commands.extend(prod_commands);
+        world.insert_resource(production_queue);
         if let Some(mut events) =
             world.get_resource_mut::<Events<crate::events::ProduceUnitCommand>>()
         {
             events.send(cmd);
-            sent = true;
-        }
-
-        if sent {
             return Some(cmd_str);
         }
+        return None;
     }
+    world.insert_resource(production_queue);
 
     // 4. 全行動完了 -> ターン終了
     // ターン終了直前は「このターン結局何が動かなかったか」が確定する唯一の点。
@@ -2111,6 +2373,7 @@ pub fn decide_ai_action_v2(
 
     let map = world.resource::<Map>().clone();
     let registry = world.resource::<MasterDataRegistry>().clone();
+    let tactical_snapshot = AiTacticalSnapshot::from_world(world, &registry, map.topology);
     let properties: Vec<(GridPosition, Terrain, Option<PlayerId>)> = {
         let mut q = world.query::<(&GridPosition, &Property)>();
         q.iter(world)
@@ -2285,9 +2548,9 @@ pub fn decide_ai_action_v2(
             }
             let is_stationary = current_grid.x == pos.x && current_grid.y == pos.y;
 
-            let actions = crate::systems::action::get_available_actions_at(
-                world,
+            let actions = tactical_snapshot.action_targets_at(
                 unit_entity,
+                &stats,
                 current_grid,
                 !is_stationary,
             );
@@ -2742,14 +3005,8 @@ pub fn decide_ai_action_v2(
             }
 
             // (B) Attack
-            if actions.can_attack {
-                let targets = crate::systems::combat::get_attackable_targets_at(
-                    world,
-                    unit_entity,
-                    current_grid,
-                    is_stationary,
-                );
-                for target_entity in targets {
+            if !actions.attackable_targets.is_empty() {
+                for target_entity in actions.attackable_targets.iter().copied() {
                     if campaign_context.as_ref().is_some_and(|context| {
                         let target_position = world.get::<GridPosition>(target_entity).copied();
                         context.mission_type == crate::ai::squad::MissionType::Transport
@@ -2899,13 +3156,8 @@ pub fn decide_ai_action_v2(
             }
 
             // (D) Merge
-            if actions.can_merge {
-                let targets = crate::systems::merge::get_mergable_targets_at(
-                    world,
-                    unit_entity,
-                    current_grid,
-                );
-                for target_entity in targets {
+            if !actions.mergeable_targets.is_empty() {
+                for target_entity in actions.mergeable_targets.iter().copied() {
                     if campaign_context.as_ref().is_some_and(|context| {
                         world
                             .get_resource::<crate::ai::operation_assignment::UnitOperationRegistry>(
@@ -2983,6 +3235,7 @@ pub fn decide_ai_action_v2(
 
     strategy_cache.put_action_distance_cache(turn_cache);
     world.insert_resource(strategy_cache);
+
     best_overall_choice
 }
 

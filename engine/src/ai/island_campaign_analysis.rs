@@ -7,8 +7,10 @@ use crate::ai::island_campaign::{
 };
 use crate::ai::islands::{Island, IslandId, IslandMap};
 use crate::ai::squad::{MissionPhase, MissionType, SquadManager, TransportPhase};
+#[cfg(test)]
+use crate::ai::turn_distance::TurnDistanceCache;
 use crate::ai::turn_distance::{
-    TerrainConnectivity, TurnDistanceCache, calculate_turn_distance, is_terrain_reachable,
+    SourceTurnDistanceCache, TerrainConnectivity, calculate_source_turn_distances_cached,
 };
 use crate::components::{
     CargoCapacity, Faction, Fuel, GridPosition, Health, PlayerId, Property, Transporting, UnitStats,
@@ -163,8 +165,7 @@ fn eta_between(
     map: &Map,
     registry: &MasterDataRegistry,
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
-    connectivity: &mut TerrainConnectivity,
-    cache: &mut TurnDistanceCache,
+    cache: &mut SourceTurnDistanceCache,
     player_id: PlayerId,
     start: GridPosition,
     target: GridPosition,
@@ -173,28 +174,18 @@ fn eta_between(
     if start.x >= map.width || start.y >= map.height {
         return None;
     }
-    if !connectivity.is_reachable(
-        map,
-        registry,
-        (start.x, start.y),
-        (target.x, target.y),
-        stats.movement_type,
-    ) {
-        return None;
-    }
-    let distance = calculate_turn_distance(
+    calculate_source_turn_distances_cached(
         map,
         registry,
         unit_positions,
         (start.x, start.y),
-        (target.x, target.y),
         stats.movement_type,
         stats.max_movement,
-        0,
         player_id,
         cache,
-    );
-    (distance.used_mp != u32::MAX).then_some(distance.turns)
+    )
+    .get(&target)
+    .map(|distance| distance.turns)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -202,8 +193,7 @@ fn unit_eta_to_island(
     map: &Map,
     registry: &MasterDataRegistry,
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
-    connectivity: &mut TerrainConnectivity,
-    cache: &mut TurnDistanceCache,
+    cache: &mut SourceTurnDistanceCache,
     unit: &UnitSnapshot,
     island: &Island,
 ) -> Option<u32> {
@@ -217,7 +207,6 @@ fn unit_eta_to_island(
                 map,
                 registry,
                 unit_positions,
-                connectivity,
                 cache,
                 unit.faction,
                 unit.position,
@@ -233,8 +222,7 @@ fn unit_eta_to_drop(
     map: &Map,
     registry: &MasterDataRegistry,
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
-    connectivity: &mut TerrainConnectivity,
-    cache: &mut TurnDistanceCache,
+    cache: &mut SourceTurnDistanceCache,
     unit: &UnitSnapshot,
     drop_position: GridPosition,
 ) -> Option<u32> {
@@ -268,7 +256,6 @@ fn unit_eta_to_drop(
                 map,
                 registry,
                 unit_positions,
-                connectivity,
                 cache,
                 unit.faction,
                 unit.position,
@@ -284,8 +271,7 @@ fn capture_eta_from_position(
     map: &Map,
     registry: &MasterDataRegistry,
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
-    connectivity: &mut TerrainConnectivity,
-    cache: &mut TurnDistanceCache,
+    cache: &mut SourceTurnDistanceCache,
     unit: &UnitSnapshot,
     start: GridPosition,
     properties: &[PropertySnapshot],
@@ -301,7 +287,6 @@ fn capture_eta_from_position(
                 map,
                 registry,
                 unit_positions,
-                connectivity,
                 cache,
                 unit.faction,
                 start,
@@ -318,8 +303,7 @@ fn conservative_capture_eta_from_island(
     map: &Map,
     registry: &MasterDataRegistry,
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
-    connectivity: &mut TerrainConnectivity,
-    cache: &mut TurnDistanceCache,
+    cache: &mut SourceTurnDistanceCache,
     unit: &UnitSnapshot,
     island: &Island,
     properties: &[PropertySnapshot],
@@ -340,7 +324,6 @@ fn conservative_capture_eta_from_island(
             map,
             registry,
             unit_positions,
-            connectivity,
             cache,
             unit,
             landing,
@@ -839,8 +822,7 @@ fn transport_options_for_island(
     map: &Map,
     registry: &MasterDataRegistry,
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
-    connectivity: &mut TerrainConnectivity,
-    cache: &mut TurnDistanceCache,
+    cache: &mut SourceTurnDistanceCache,
     player_id: PlayerId,
     island: &Island,
     units: &[UnitSnapshot],
@@ -871,15 +853,7 @@ fn transport_options_for_island(
                 UnitType::TransportHelicopter | UnitType::Lander
             )
     }) {
-        if let Some(eta) = unit_eta_to_island(
-            map,
-            registry,
-            unit_positions,
-            connectivity,
-            cache,
-            unit,
-            island,
-        ) {
+        if let Some(eta) = unit_eta_to_island(map, registry, unit_positions, cache, unit, island) {
             options.push(TransportOption {
                 unit_type: unit.stats.unit_type,
                 cost: unit.stats.cost,
@@ -914,7 +888,6 @@ fn transport_options_for_island(
                 map,
                 registry,
                 unit_positions,
-                connectivity,
                 cache,
                 &production_unit,
                 island,
@@ -985,8 +958,7 @@ fn operation_transport_eta(
     map: &Map,
     registry: &MasterDataRegistry,
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
-    connectivity: &mut TerrainConnectivity,
-    cache: &mut TurnDistanceCache,
+    cache: &mut SourceTurnDistanceCache,
     island: &Island,
 ) -> Option<u32> {
     if assignment.phase == TransportPhase::Return {
@@ -1004,7 +976,6 @@ fn operation_transport_eta(
             map,
             registry,
             unit_positions,
-            connectivity,
             cache,
             transport.faction,
             transport.position,
@@ -1021,7 +992,6 @@ fn operation_transport_eta(
                     map,
                     registry,
                     unit_positions,
-                    connectivity,
                     cache,
                     cargo.faction,
                     cargo.position,
@@ -1038,21 +1008,12 @@ fn operation_transport_eta(
                 map,
                 registry,
                 unit_positions,
-                connectivity,
                 cache,
                 &after_pickup,
                 drop_position,
             )
         } else {
-            unit_eta_to_island(
-                map,
-                registry,
-                unit_positions,
-                connectivity,
-                cache,
-                &after_pickup,
-                island,
-            )
+            unit_eta_to_island(map, registry, unit_positions, cache, &after_pickup, island)
         }?;
         // transportとcargoの遅い側が合流するまで待ち、搭載後に目標へ向かう。
         return Some(
@@ -1067,21 +1028,12 @@ fn operation_transport_eta(
             map,
             registry,
             unit_positions,
-            connectivity,
             cache,
             transport,
             drop_position,
         )
     } else {
-        unit_eta_to_island(
-            map,
-            registry,
-            unit_positions,
-            connectivity,
-            cache,
-            transport,
-            island,
-        )
+        unit_eta_to_island(map, registry, unit_positions, cache, transport, island)
     }
 }
 
@@ -1287,8 +1239,7 @@ pub fn collect_island_campaign_facts(
     }
 
     // 共有cacheは占有情報をkeyに含めないため触らず、分析呼び出し専用の空cacheを使う。
-    let mut cache = TurnDistanceCache::default();
-    let mut connectivity = TerrainConnectivity::default();
+    let mut cache = SourceTurnDistanceCache::default();
 
     for unit in &units {
         if cargo_assignments.contains_key(&unit.entity) || unit.transporting.is_some() {
@@ -1321,15 +1272,8 @@ pub fn collect_island_campaign_facts(
             let Some(&index) = accumulator_index.get(&island.id) else {
                 continue;
             };
-            let eta = unit_eta_to_island(
-                &map,
-                &registry,
-                &unit_positions,
-                &mut connectivity,
-                &mut cache,
-                unit,
-                island,
-            );
+            let eta =
+                unit_eta_to_island(&map, &registry, &unit_positions, &mut cache, unit, island);
             let accumulator = &mut accumulators[index];
             if unit.faction == player_id {
                 accumulator.facts.friendly_arrival_eta =
@@ -1342,7 +1286,6 @@ pub fn collect_island_campaign_facts(
                 &map,
                 &registry,
                 &unit_positions,
-                &mut connectivity,
                 &mut cache,
                 unit,
                 unit.position,
@@ -1377,7 +1320,6 @@ pub fn collect_island_campaign_facts(
             &map,
             &registry,
             &unit_positions,
-            &mut connectivity,
             &mut cache,
             island,
         );
@@ -1395,7 +1337,6 @@ pub fn collect_island_campaign_facts(
                     &map,
                     &registry,
                     &unit_positions,
-                    &mut connectivity,
                     &mut cache,
                     unit,
                     landing_position,
@@ -1406,7 +1347,6 @@ pub fn collect_island_campaign_facts(
                     &map,
                     &registry,
                     &unit_positions,
-                    &mut connectivity,
                     &mut cache,
                     unit,
                     island,
@@ -1437,7 +1377,6 @@ pub fn collect_island_campaign_facts(
                 &map,
                 &registry,
                 &unit_positions,
-                &mut connectivity,
                 &mut cache,
                 player_id,
                 island,
@@ -2039,6 +1978,9 @@ fn collect_campaign_resource_pool(
     }
 
     let mut candidates = Vec::new();
+    // 地形連結成分は移動種別ごとに1回だけ構築する。候補マスごとに再構築すると、
+    // ユニット数×全島タイル数だけマップ全走査が発生する。
+    let mut terrain_connectivity = TerrainConnectivity::default();
     for unit in units.iter().filter(|unit| unit.faction == player_id) {
         let assigned_island = assigned_by_entity.get(&unit.entity).copied();
         let transport_state = assigned_transport_phases.get(&unit.entity);
@@ -2104,7 +2046,7 @@ fn collect_campaign_resource_pool(
                         && island_map
                             .get_island_at(&snapshot.position)
                             .is_some_and(|island| island.id == island_id)
-                        && is_terrain_reachable(
+                        && terrain_connectivity.is_reachable(
                             map,
                             registry,
                             (unit.position.x, unit.position.y),
@@ -2118,7 +2060,7 @@ fn collect_campaign_resource_pool(
             .iter()
             .flat_map(|island| island.tiles.iter())
             .filter(|target| {
-                is_terrain_reachable(
+                terrain_connectivity.is_reachable(
                     map,
                     registry,
                     (unit.position.x, unit.position.y),

@@ -518,11 +518,34 @@ fn allocate_air_coverage(
     damage_chart: &DamageChart,
     coverage_by_target: &mut [f32],
 ) {
+    let mut distance_cache = ActionTurnDistanceCache::default();
+    allocate_air_coverage_cached(
+        units,
+        targets,
+        map,
+        registry,
+        unit_positions,
+        damage_chart,
+        coverage_by_target,
+        &mut distance_cache,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn allocate_air_coverage_cached(
+    units: &[CombatCapabilitySnapshot],
+    targets: &[AirThreatTarget],
+    map: &Map,
+    registry: &MasterDataRegistry,
+    unit_positions: &HashMap<(usize, usize), OccupantInfo>,
+    damage_chart: &DamageChart,
+    coverage_by_target: &mut [f32],
+    distance_cache: &mut ActionTurnDistanceCache,
+) {
     let mut states = units
         .iter()
         .copied()
         .map(|unit| {
-            let mut cache = ActionTurnDistanceCache::default();
             let arrivals = targets
                 .iter()
                 .map(|target| {
@@ -538,7 +561,7 @@ fn allocate_air_coverage(
                         unit.min_range,
                         unit.max_range.max(unit.min_range),
                         unit.faction,
-                        &mut cache,
+                        distance_cache,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -801,7 +824,34 @@ pub fn candidate_air_coverage(
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
     damage_chart: &DamageChart,
 ) -> AirCoverageContribution {
-    candidate_air_coverage_with_delay(
+    let mut distance_cache = ActionTurnDistanceCache::default();
+    candidate_air_coverage_with_cache(
+        stats,
+        production_position,
+        player_id,
+        assessment,
+        map,
+        registry,
+        unit_positions,
+        damage_chart,
+        &mut distance_cache,
+    )
+}
+
+/// 同一生産計画の候補間で対空到達距離を共有して限界カバレッジを算出する。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn candidate_air_coverage_with_cache(
+    stats: &UnitStats,
+    production_position: GridPosition,
+    player_id: PlayerId,
+    assessment: &AirDefenseAssessment,
+    map: &Map,
+    registry: &MasterDataRegistry,
+    unit_positions: &HashMap<(usize, usize), OccupantInfo>,
+    damage_chart: &DamageChart,
+    distance_cache: &mut ActionTurnDistanceCache,
+) -> AirCoverageContribution {
+    candidate_air_coverage_with_delay_internal(
         stats,
         production_position,
         player_id,
@@ -811,6 +861,7 @@ pub fn candidate_air_coverage(
         unit_positions,
         damage_chart,
         1,
+        Some(distance_cache),
     )
 }
 
@@ -826,6 +877,33 @@ pub(crate) fn candidate_air_coverage_with_delay(
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
     damage_chart: &DamageChart,
     action_delay: u32,
+) -> AirCoverageContribution {
+    candidate_air_coverage_with_delay_internal(
+        stats,
+        production_position,
+        player_id,
+        assessment,
+        map,
+        registry,
+        unit_positions,
+        damage_chart,
+        action_delay,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn candidate_air_coverage_with_delay_internal(
+    stats: &UnitStats,
+    production_position: GridPosition,
+    player_id: PlayerId,
+    assessment: &AirDefenseAssessment,
+    map: &Map,
+    registry: &MasterDataRegistry,
+    unit_positions: &HashMap<(usize, usize), OccupantInfo>,
+    damage_chart: &DamageChart,
+    action_delay: u32,
+    distance_cache: Option<&mut ActionTurnDistanceCache>,
 ) -> AirCoverageContribution {
     let candidate = CombatCapabilitySnapshot {
         faction: player_id,
@@ -850,7 +928,8 @@ pub(crate) fn candidate_air_coverage_with_delay(
         vec![0.0; assessment.targets.len()]
     };
     let baseline = combined_coverage.clone();
-    allocate_air_coverage(
+    let mut local_distance_cache = ActionTurnDistanceCache::default();
+    allocate_air_coverage_cached(
         &[candidate],
         &assessment.targets,
         map,
@@ -858,6 +937,7 @@ pub(crate) fn candidate_air_coverage_with_delay(
         unit_positions,
         damage_chart,
         &mut combined_coverage,
+        distance_cache.unwrap_or(&mut local_distance_cache),
     );
     let by_target = combined_coverage
         .iter()

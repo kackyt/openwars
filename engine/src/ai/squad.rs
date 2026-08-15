@@ -1911,6 +1911,20 @@ fn entity_can_self_deploy_to_assignment(
     assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
     entity: Entity,
 ) -> bool {
+    entity_can_self_deploy_to_assignment_with_connectivity(
+        world,
+        assignment,
+        entity,
+        &mut TerrainConnectivity::default(),
+    )
+}
+
+fn entity_can_self_deploy_to_assignment_with_connectivity(
+    world: &World,
+    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    entity: Entity,
+    connectivity: &mut TerrainConnectivity,
+) -> bool {
     if world
         .get::<crate::components::Transporting>(entity)
         .is_some()
@@ -1925,7 +1939,7 @@ fn entity_can_self_deploy_to_assignment(
     ) else {
         return false;
     };
-    is_terrain_reachable(
+    connectivity.is_reachable(
         map,
         registry,
         (position.x, position.y),
@@ -2122,11 +2136,28 @@ fn promote_partial_campaign_transport_wave(
 }
 
 /// portfolio assignmentごとにFormingを復元し、readyなら既存の安全なpartitionへ接続する。
+#[cfg(test)]
 fn prepare_campaign_transport_assignment(
     world: &World,
     manager: &mut SquadManager,
     player_id: PlayerId,
     assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+) -> bool {
+    prepare_campaign_transport_assignment_with_connectivity(
+        world,
+        manager,
+        player_id,
+        assignment,
+        &mut TerrainConnectivity::default(),
+    )
+}
+
+fn prepare_campaign_transport_assignment_with_connectivity(
+    world: &World,
+    manager: &mut SquadManager,
+    player_id: PlayerId,
+    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    connectivity: &mut TerrainConnectivity,
 ) -> bool {
     adopt_legacy_squad_owners(world, manager);
     for squad in manager.squads.iter_mut().filter(|squad| {
@@ -2197,7 +2228,14 @@ fn prepare_campaign_transport_assignment(
         .copied()
         .filter(|cargo| !already_owned.contains(cargo))
         .filter(|cargo| !cargo_is_landed_on_assignment_island(world, assignment, *cargo))
-        .filter(|cargo| !entity_can_self_deploy_to_assignment(world, assignment, *cargo))
+        .filter(|cargo| {
+            !entity_can_self_deploy_to_assignment_with_connectivity(
+                world,
+                assignment,
+                *cargo,
+                connectivity,
+            )
+        })
         .collect();
     for transport in &uncovered_transports {
         if let Some(capacity) = world.get::<crate::components::CargoCapacity>(*transport) {
@@ -2272,6 +2310,22 @@ fn nearest_campaign_property_target(
     island_id: crate::ai::islands::IslandId,
     members: &[Entity],
 ) -> Option<GridPosition> {
+    nearest_campaign_property_target_with_connectivity(
+        world,
+        player_id,
+        island_id,
+        members,
+        &mut TerrainConnectivity::default(),
+    )
+}
+
+fn nearest_campaign_property_target_with_connectivity(
+    world: &World,
+    player_id: PlayerId,
+    island_id: crate::ai::islands::IslandId,
+    members: &[Entity],
+    connectivity: &mut TerrainConnectivity,
+) -> Option<GridPosition> {
     let island_map = world.get_resource::<crate::ai::islands::IslandMap>()?;
     let map = world.get_resource::<Map>()?;
     let registry = world.get_resource::<MasterDataRegistry>()?;
@@ -2292,14 +2346,15 @@ fn nearest_campaign_property_target(
                 .filter_map(|member| {
                     let position = world.get::<GridPosition>(*member)?;
                     let stats = world.get::<UnitStats>(*member)?;
-                    is_terrain_reachable(
-                        map,
-                        registry,
-                        (position.x, position.y),
-                        (target.x, target.y),
-                        stats.movement_type,
-                    )
-                    .then_some(position.x.abs_diff(target.x) + position.y.abs_diff(target.y))
+                    connectivity
+                        .is_reachable(
+                            map,
+                            registry,
+                            (position.x, position.y),
+                            (target.x, target.y),
+                            stats.movement_type,
+                        )
+                        .then_some(position.x.abs_diff(target.x) + position.y.abs_diff(target.y))
                 })
                 .min()?;
             Some((distance, target.y, target.x, target))
@@ -2313,6 +2368,7 @@ fn campaign_assignment_capture_responsibilities(
     player_id: PlayerId,
     assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
     members: &[Entity],
+    connectivity: &mut TerrainConnectivity,
 ) -> Vec<CampaignResponsibility> {
     let mut targets: Vec<_> = assignment
         .capture_target_positions
@@ -2328,8 +2384,13 @@ fn campaign_assignment_capture_responsibilities(
         })
         .collect();
     if targets.is_empty()
-        && let Some(target) =
-            nearest_campaign_property_target(world, player_id, assignment.island_id, members)
+        && let Some(target) = nearest_campaign_property_target_with_connectivity(
+            world,
+            player_id,
+            assignment.island_id,
+            members,
+            connectivity,
+        )
     {
         targets.push(target);
     }
@@ -2342,7 +2403,7 @@ fn campaign_assignment_capture_responsibilities(
             .iter()
             .enumerate()
             .filter_map(|(index, member)| {
-                campaign_member_distance_to_position(world, *member, target)
+                campaign_member_distance_to_position(world, *member, target, connectivity)
                     .map(|distance| (index, (distance, member.to_bits())))
             })
             .min_by_key(|(_, score)| *score)
@@ -2362,9 +2423,13 @@ fn campaign_assignment_capture_responsibilities(
 
     // 施設数より占領要員が多い場合も遊兵化させず、島内の到達可能な未所有施設へ予備を送る。
     for member in remaining {
-        if let Some(target) =
-            nearest_campaign_property_target(world, player_id, assignment.island_id, &[member])
-        {
+        if let Some(target) = nearest_campaign_property_target_with_connectivity(
+            world,
+            player_id,
+            assignment.island_id,
+            &[member],
+            connectivity,
+        ) {
             responsibilities.push(CampaignResponsibility {
                 mission_type: MissionType::Capture,
                 target,
@@ -2379,19 +2444,21 @@ fn campaign_member_distance_to_position(
     world: &World,
     member: Entity,
     target: GridPosition,
+    connectivity: &mut TerrainConnectivity,
 ) -> Option<usize> {
     let position = world.get::<GridPosition>(member)?;
     let stats = world.get::<UnitStats>(member)?;
     let map = world.get_resource::<Map>()?;
     let registry = world.get_resource::<MasterDataRegistry>()?;
-    is_terrain_reachable(
-        map,
-        registry,
-        (position.x, position.y),
-        (target.x, target.y),
-        stats.movement_type,
-    )
-    .then_some(position.x.abs_diff(target.x) + position.y.abs_diff(target.y))
+    connectivity
+        .is_reachable(
+            map,
+            registry,
+            (position.x, position.y),
+            (target.x, target.y),
+            stats.movement_type,
+        )
+        .then_some(position.x.abs_diff(target.x) + position.y.abs_diff(target.y))
 }
 
 fn campaign_member_attack_distance(
@@ -2399,6 +2466,22 @@ fn campaign_member_attack_distance(
     member: Entity,
     enemy: Entity,
     enemy_position: GridPosition,
+) -> Option<usize> {
+    campaign_member_attack_distance_with_connectivity(
+        world,
+        member,
+        enemy,
+        enemy_position,
+        &mut TerrainConnectivity::default(),
+    )
+}
+
+fn campaign_member_attack_distance_with_connectivity(
+    world: &World,
+    member: Entity,
+    enemy: Entity,
+    enemy_position: GridPosition,
+    connectivity: &mut TerrainConnectivity,
 ) -> Option<usize> {
     let member_position = world.get::<GridPosition>(member)?;
     let member_stats = world.get::<UnitStats>(member)?;
@@ -2416,7 +2499,7 @@ fn campaign_member_attack_distance(
                 terrain,
             )
             .is_none()
-                || !is_terrain_reachable(
+                || !connectivity.is_reachable(
                     map,
                     registry,
                     (member_position.x, member_position.y),
@@ -2462,6 +2545,7 @@ fn campaign_combat_responsibilities(
     player_id: PlayerId,
     island_id: crate::ai::islands::IslandId,
     members: &[Entity],
+    connectivity: &mut TerrainConnectivity,
 ) -> Vec<CampaignResponsibility> {
     let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() else {
         return Vec::new();
@@ -2492,8 +2576,14 @@ fn campaign_combat_responsibilities(
                 let reachable: Vec<_> = remaining
                     .iter()
                     .filter_map(|member| {
-                        campaign_member_attack_distance(world, *member, *enemy, *target)
-                            .map(|distance| (*member, distance))
+                        campaign_member_attack_distance_with_connectivity(
+                            world,
+                            *member,
+                            *enemy,
+                            *target,
+                            connectivity,
+                        )
+                        .map(|distance| (*member, distance))
                     })
                     .collect();
                 if reachable.is_empty() {
@@ -2538,7 +2628,7 @@ fn campaign_combat_responsibilities(
                 let reachable: Vec<_> = remaining
                     .iter()
                     .filter_map(|member| {
-                        campaign_member_distance_to_position(world, *member, target)
+                        campaign_member_distance_to_position(world, *member, target, connectivity)
                             .map(|distance| (*member, distance))
                     })
                     .collect();
@@ -2712,11 +2802,28 @@ fn assign_campaign_members(
     );
 }
 
+#[cfg(test)]
 fn prepare_campaign_local_assignment(
     world: &World,
     manager: &mut SquadManager,
     player_id: PlayerId,
     assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+) {
+    prepare_campaign_local_assignment_with_connectivity(
+        world,
+        manager,
+        player_id,
+        assignment,
+        &mut TerrainConnectivity::default(),
+    );
+}
+
+fn prepare_campaign_local_assignment_with_connectivity(
+    world: &World,
+    manager: &mut SquadManager,
+    player_id: PlayerId,
+    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    connectivity: &mut TerrainConnectivity,
 ) {
     use crate::ai::island_campaign::IslandCampaignDecision;
 
@@ -2733,7 +2840,11 @@ fn prepare_campaign_local_assignment(
             // Capture責務へ固定し、残りを局地敵の排除または拠点防衛へ分割する。
             let capture = local_entities(&assignment.capture_entities);
             let capture_responsibilities = campaign_assignment_capture_responsibilities(
-                world, player_id, assignment, &capture,
+                world,
+                player_id,
+                assignment,
+                &capture,
+                connectivity,
             );
             let assigned_capture: HashSet<_> = capture_responsibilities
                 .iter()
@@ -2759,13 +2870,23 @@ fn prepare_campaign_local_assignment(
                         .get::<crate::components::Transporting>(*entity)
                         .is_none()
                         && (cargo_is_landed_on_assignment_island(world, assignment, *entity)
-                            || entity_can_self_deploy_to_assignment(world, assignment, *entity))
+                            || entity_can_self_deploy_to_assignment_with_connectivity(
+                                world,
+                                assignment,
+                                *entity,
+                                connectivity,
+                            ))
                 })
                 .collect();
             combat.sort_by_key(|entity| entity.to_bits());
             combat.dedup();
-            let mut combat_responsibilities =
-                campaign_combat_responsibilities(world, player_id, assignment.island_id, &combat);
+            let mut combat_responsibilities = campaign_combat_responsibilities(
+                world,
+                player_id,
+                assignment.island_id,
+                &combat,
+                connectivity,
+            );
             if !combat.is_empty()
                 && combat_responsibilities
                     .iter()
@@ -2791,7 +2912,11 @@ fn prepare_campaign_local_assignment(
         IslandCampaignDecision::Secure => {
             let capture = local_entities(&assignment.capture_entities);
             let responsibilities = campaign_assignment_capture_responsibilities(
-                world, player_id, assignment, &capture,
+                world,
+                player_id,
+                assignment,
+                &capture,
+                connectivity,
             );
             assign_campaign_responsibilities(
                 world,
@@ -2808,7 +2933,11 @@ fn prepare_campaign_local_assignment(
         | IslandCampaignDecision::Reinforce => {
             let capture = local_entities(&assignment.capture_entities);
             let capture_responsibilities = campaign_assignment_capture_responsibilities(
-                world, player_id, assignment, &capture,
+                world,
+                player_id,
+                assignment,
+                &capture,
+                connectivity,
             );
             assign_campaign_responsibilities(
                 world,
@@ -2826,11 +2955,21 @@ fn prepare_campaign_local_assignment(
                 .copied()
                 .filter(|entity| {
                     cargo_is_landed_on_assignment_island(world, assignment, *entity)
-                        || entity_can_self_deploy_to_assignment(world, assignment, *entity)
+                        || entity_can_self_deploy_to_assignment_with_connectivity(
+                            world,
+                            assignment,
+                            *entity,
+                            connectivity,
+                        )
                 })
                 .collect::<Vec<_>>();
-            let responsibilities =
-                campaign_combat_responsibilities(world, player_id, assignment.island_id, &combat);
+            let responsibilities = campaign_combat_responsibilities(
+                world,
+                player_id,
+                assignment.island_id,
+                &combat,
+                connectivity,
+            );
             assign_campaign_responsibilities(
                 world,
                 manager,
@@ -3944,9 +4083,22 @@ fn reconnect_current_v4_operations(
             .sort_by_key(|entity| entity.to_bits());
         assignment.combat_entities.dedup();
     }
+    let mut connectivity = TerrainConnectivity::default();
     for assignment in &effective_assignments {
-        prepare_campaign_transport_assignment(world, manager, player_id, assignment);
-        prepare_campaign_local_assignment(world, manager, player_id, assignment);
+        prepare_campaign_transport_assignment_with_connectivity(
+            world,
+            manager,
+            player_id,
+            assignment,
+            &mut connectivity,
+        );
+        prepare_campaign_local_assignment_with_connectivity(
+            world,
+            manager,
+            player_id,
+            assignment,
+            &mut connectivity,
+        );
     }
     // 生産目的を持つEntityも、対象消滅やSquad完了後に汎用Reserveへ落とさず、
     // 永続PlanのForming/Executeへ再接続する。
@@ -3956,12 +4108,6 @@ fn reconnect_current_v4_operations(
         player_id,
         &HashSet::new(),
     );
-}
-
-fn remove_player_reserve_squads(manager: &mut SquadManager, player_id: PlayerId) {
-    manager.squads.retain(|squad| {
-        squad.owner_id != Some(player_id) || squad.mission_type != MissionType::Reserve
-    });
 }
 
 fn unassigned_entity_ids(
@@ -3986,6 +4132,12 @@ fn unassigned_entity_ids(
         })
         .map(|entity_ref| entity_ref.id())
         .collect()
+}
+
+fn remove_player_reserve_squads(manager: &mut SquadManager, player_id: PlayerId) {
+    manager.squads.retain(|squad| {
+        squad.owner_id != Some(player_id) || squad.mission_type != MissionType::Reserve
+    });
 }
 
 /// ある作戦の再構築が別SquadからEntityを解放する場合があるため、1回だけでは
@@ -4033,6 +4185,13 @@ pub(crate) fn reconcile_v4_end_turn_reserves(world: &mut World, player_id: Playe
         })
         .unwrap_or_default();
     let mut manager = world.remove_resource::<SquadManager>().unwrap_or_default();
+    // Reserveはこの手番の再割当をすでに試した明示待機である。Drop/Capture/撃破などで
+    // 新たにSquad参照を失ったEntityがいない限り、同じportfolioへ全Reserveを何度も
+    // 戻して再構築しても結果は変わらない。通常行動1件ごとの全campaign再走査を防ぐ。
+    if unassigned_entity_ids(world, &manager, player_id).is_empty() {
+        world.insert_resource(manager);
+        return;
+    }
     // Reserveは再割当の入力であり、再割当を試す前の所有先ではない。
     remove_player_reserve_squads(&mut manager, player_id);
     reconcile_unique_operation_assignments(world, &mut manager, player_id);
@@ -4163,16 +4322,24 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         .collect();
     all_campaign_reserved_entities.extend(secure_reserved_entities);
     let mut blocked_campaign_islands = HashSet::new();
+    let mut campaign_connectivity = TerrainConnectivity::default();
     for assignment in &campaign_assignments {
-        if prepare_campaign_transport_assignment(
+        if prepare_campaign_transport_assignment_with_connectivity(
             world,
             &mut manager,
             perspective_player,
             assignment,
+            &mut campaign_connectivity,
         ) {
             blocked_campaign_islands.insert(assignment.island_id);
         }
-        prepare_campaign_local_assignment(world, &mut manager, perspective_player, assignment);
+        prepare_campaign_local_assignment_with_connectivity(
+            world,
+            &mut manager,
+            perspective_player,
+            assignment,
+            &mut campaign_connectivity,
+        );
     }
 
     // V4のCombat枠で生産した実Entityは、campaign再配分とgeneric free poolより前に
@@ -8591,6 +8758,41 @@ mod tests {
             !manager.solo_fallbacks.contains(&transport),
             "旧SoloFallbackを残して実行任務ありと誤認しない"
         );
+    }
+
+    #[test]
+    fn end_turn_reconcile_keeps_existing_reserve_without_new_unassigned_entity() {
+        let mut world = World::new();
+        let player = PlayerId(1);
+        let mut ai_settings = crate::ai::PlayerAiSettings::new();
+        ai_settings.set_version(player, crate::ai::AiVersion::V4);
+        world.insert_resource(ai_settings);
+        let unit = world
+            .spawn((
+                Faction(player),
+                GridPosition { x: 0, y: 0 },
+                UnitStats::mock(),
+            ))
+            .id();
+        let mut manager = SquadManager::new();
+        let reserve_id = {
+            let reserve = manager.create_owned_squad(MissionType::Reserve, player);
+            reserve.members.insert(unit);
+            reserve.target = Some(GridPosition { x: 1, y: 0 });
+            reserve.id
+        };
+        world.insert_resource(manager);
+
+        reconcile_v4_end_turn_reserves(&mut world, player);
+
+        let manager = world.resource::<SquadManager>();
+        let reserve = manager
+            .squads
+            .iter()
+            .find(|squad| squad.members.contains(&unit))
+            .expect("新規未割当がなければ既存Reserveを同一手番中に解体しない");
+        assert_eq!(reserve.id, reserve_id);
+        assert_eq!(reserve.mission_type, MissionType::Reserve);
     }
 
     #[test]

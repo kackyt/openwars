@@ -240,6 +240,13 @@ struct V4ProductionTurnPlan {
     commands: VecDeque<PlannedProduction>,
 }
 
+/// 生産命令を施設ごとに返す間も、作戦実績の盤面scanは1手番に一度だけ行います。
+#[derive(Resource, Debug, Default)]
+struct V4ProductionObservationCache {
+    player_id: Option<PlayerId>,
+    turn: u32,
+}
+
 /// 計画済み列から実際に返す1命令だけをIssuedへ進める。
 fn issue_planned_production(
     world: &mut World,
@@ -326,8 +333,17 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
         .get_resource::<crate::resources::MatchState>()
         .map_or(0, |state| state.current_turn_number.0);
     // 島嶼キャンペーン生産だけでreturnする手番も含め、作戦の実績は毎ターン観測する。
-    // beam searchの内側ではなくPlan/Entityを一度ずつ走査するため、探索量を増やさない。
-    observe_plan_execution(world, player_id, turn);
+    // 生産APIは施設ごとに呼ばれるため、同じ手番の2体目以降では再走査しない。
+    let already_observed = world
+        .get_resource::<V4ProductionObservationCache>()
+        .is_some_and(|cache| cache.player_id == Some(player_id) && cache.turn == turn);
+    if !already_observed {
+        observe_plan_execution(world, player_id, turn);
+        world.insert_resource(V4ProductionObservationCache {
+            player_id: Some(player_id),
+            turn,
+        });
+    }
 
     let campaign_surplus = match decide_campaign_production_v4(world, player_id) {
         CampaignProductionControl::Command(command) => return vec![command],

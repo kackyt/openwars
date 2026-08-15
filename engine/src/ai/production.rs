@@ -1,7 +1,7 @@
 use crate::ai::demand::{
     AirCoverageContribution, AirDefenseAssessment, CombatCapabilitySnapshot,
-    air_coverage_with_timing, candidate_air_coverage, candidate_air_coverage_with_delay,
-    candidate_air_coverage_with_timing,
+    air_coverage_with_timing, candidate_air_coverage, candidate_air_coverage_with_cache,
+    candidate_air_coverage_with_delay, candidate_air_coverage_with_timing,
 };
 use crate::ai::island_campaign::{
     IslandCampaignDecision, IslandCampaignShortfall, campaign_unit_type_rank,
@@ -10,7 +10,9 @@ use crate::ai::strategy::{
     EmergencyAntiAirReservation, ProductionPlan, ProductionStrategy, analyze_strategy_for_turn,
     sea_transport_capacity_from_slots,
 };
-use crate::ai::turn_distance::{TerrainConnectivity, TurnDistanceCache, calculate_turn_distance};
+use crate::ai::turn_distance::{
+    ActionTurnDistanceCache, TerrainConnectivity, TurnDistanceCache, calculate_turn_distance,
+};
 use crate::components::{
     ActionCompleted, Ammo, Faction, Fuel, GridPosition, Health, PlayerId, Property, UnitStats,
 };
@@ -790,18 +792,51 @@ fn plan_campaign_shortfall_production_with_damage(
 /// - 予算（貯金を差し引いた仮想予算）内で最も評価が高くなるよう動的計画法（ナップサック問題）で生産を決定
 pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceUnitCommand> {
     // V4 は作戦駆動生産へ委譲する。V1/V2/V3 の経路は以下そのまま。
-    if crate::ai::resolve_player_ai_version(world, player_id).uses_operation_driven_production() {
+    let ai_version = crate::ai::resolve_player_ai_version(world, player_id);
+    if ai_version.uses_operation_driven_production() {
         return crate::ai::v4::decide_production_v4(world, player_id);
     }
 
+    let is_v3 = ai_version.uses_v3_tactics();
     let mut commands = Vec::new();
 
+    if is_v3
+        && world
+            .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .is_some_and(|cache| cache.production_batch_planned(player_id))
+    {
+        // 同じ生産フェーズ中は敵・収入・所有施設が変わらない。全施設分をすでに
+        // queueへ渡した後は、最終確認で戦略分析を再実行せず手番を終了する。
+        return commands;
+    }
+
     let strategy = analyze_strategy_for_turn(world, player_id);
+    let mut air_distance_cache = ActionTurnDistanceCache::default();
     let map = world.resource::<crate::resources::Map>().clone();
 
-    // V3 の生産拡張 (対編成カウンター効率) を有効にするかどうか
-    let is_v3 = crate::ai::resolve_player_ai_version(world, player_id).uses_v3_tactics();
+    if is_v3
+        && !strategy.air_defense.requires_emergency_production()
+        && world
+            .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .is_some_and(|cache| cache.campaign_production_planned(player_id))
+    {
+        // 緊急対空の再判定だけは毎回優先する。平時の完全packageは初回計画時に
+        // 予算・施設重複を検証済みなので、残り命令を全候補scoreより先に消費する。
+        let mut cache = world
+            .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .unwrap_or_default();
+        let next_command = cache.take_campaign_production_command(player_id);
+        let blocks_generic = cache.campaign_production_blocks_generic(player_id);
+        world.insert_resource(cache);
+        if let Some(command) = next_command {
+            return vec![command];
+        }
+        if blocks_generic {
+            return Vec::new();
+        }
+    }
 
+    // V3 の生産拡張 (対編成カウンター効率) を有効にするかどうか
     let (unit_registry, damage_chart, master_data) = {
         let ur = world.get_resource::<UnitRegistry>().cloned();
         let dc = world.get_resource::<DamageChart>().cloned();
@@ -1084,7 +1119,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
             let ratio_diff =
                 strategy.ideal_composition.get(ut).copied().unwrap_or(0.0) - current_ratio;
 
-            let score = calculate_unit_score_at(
+            let score = calculate_unit_score_at_cached(
                 *ut,
                 stats,
                 *facility_position,
@@ -1100,6 +1135,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                 *facility_terrain,
                 ratio_diff,
                 is_v3,
+                &mut air_distance_cache,
             );
             saving_candidates.push(ProductionCandidate {
                 score,
@@ -1199,21 +1235,25 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
             );
             let generic_budget = campaign_outcome.generic_funds;
             let campaign_commands = std::mem::take(&mut campaign_outcome.commands);
+            commands.extend(campaign_commands);
             let mut cache = world
                 .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
                 .unwrap_or_default();
             cache.set_campaign_production_plan_with_generic_budget(
                 player_id,
-                campaign_commands,
+                Vec::new(),
                 generic_budget,
             );
-            let next_command = cache.take_campaign_production_command(player_id);
             let blocks_generic = cache.campaign_production_blocks_generic(player_id);
             world.insert_resource(cache);
-            if let Some(command) = next_command {
-                return vec![command];
-            }
             if blocks_generic {
+                if !strategy.air_defense.requires_emergency_production() {
+                    let mut cache = world
+                        .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+                        .unwrap_or_default();
+                    cache.mark_production_batch_planned(player_id);
+                    world.insert_resource(cache);
+                }
                 return commands;
             }
             campaign_outcome.remaining_funds = generic_budget;
@@ -1264,7 +1304,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                     - current_ratio;
 
                 // 現在の戦略（減衰後）でスコアを計算
-                let score = calculate_unit_score_at(
+                let score = calculate_unit_score_at_cached(
                     *ut,
                     stats,
                     *facility_pos,
@@ -1280,6 +1320,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                     *terrain,
                     ratio_diff,
                     is_v3,
+                    &mut air_distance_cache,
                 );
 
                 production_candidates.push(ProductionCandidate {
@@ -1316,7 +1357,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                 current_strategy.capture_demand = current_strategy.capture_demand.saturating_sub(1);
             }
             if is_v3 && let Some(stats) = unit_registry.0.get(&candidate.unit_type) {
-                let coverage = candidate_air_coverage(
+                let coverage = candidate_air_coverage_with_cache(
                     stats,
                     candidate.facility_position,
                     player_id,
@@ -1325,6 +1366,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
                     &master_data,
                     &unit_positions,
                     &damage_chart,
+                    &mut air_distance_cache,
                 );
                 current_strategy.air_defense.apply_coverage(&coverage);
                 current_strategy.demand.anti_air = current_strategy.air_defense.shortage_ratio;
@@ -1335,6 +1377,13 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
         }
     }
 
+    if is_v3 && !strategy.air_defense.requires_emergency_production() {
+        let mut cache = world
+            .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .unwrap_or_default();
+        cache.mark_production_batch_planned(player_id);
+        world.insert_resource(cache);
+    }
     commands
 }
 
@@ -1460,6 +1509,49 @@ pub fn calculate_unit_score_at(
     ratio_diff: f32,
     // V3 のみ true。対編成カウンター効率スコアで生産を敵構成に適応させる
     is_v3: bool,
+) -> u32 {
+    let mut air_distance_cache = ActionTurnDistanceCache::default();
+    calculate_unit_score_at_cached(
+        unit_type,
+        stats,
+        pos,
+        player_id,
+        strategy,
+        enemy_units,
+        my_empty_transports,
+        damage_chart,
+        master_data,
+        map,
+        unit_positions,
+        _unit_registry,
+        produced_at,
+        ratio_diff,
+        is_v3,
+        &mut air_distance_cache,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn calculate_unit_score_at_cached(
+    unit_type: UnitType,
+    stats: &UnitStats,
+    pos: GridPosition,
+    player_id: PlayerId,
+    strategy: &ProductionStrategy,
+    enemy_units: &[(GridPosition, UnitStats)],
+    my_empty_transports: &[(GridPosition, UnitStats)],
+    damage_chart: &DamageChart,
+    master_data: &MasterDataRegistry,
+    map: &crate::resources::Map,
+    unit_positions: &std::collections::HashMap<
+        (usize, usize),
+        crate::systems::movement::OccupantInfo,
+    >,
+    _unit_registry: &UnitRegistry,
+    produced_at: Terrain,
+    ratio_diff: f32,
+    is_v3: bool,
+    air_distance_cache: &mut ActionTurnDistanceCache,
 ) -> u32 {
     // 1. 基本スコア（敵との距離、脅威度）
     let mut min_eta = 99;
@@ -1749,7 +1841,7 @@ pub fn calculate_unit_score_at(
     }
 
     let air_response_economics = if is_v3 && !strategy.air_defense.targets.is_empty() {
-        let air_coverage = candidate_air_coverage(
+        let air_coverage = candidate_air_coverage_with_cache(
             stats,
             pos,
             player_id,
@@ -1758,6 +1850,7 @@ pub fn calculate_unit_score_at(
             master_data,
             unit_positions,
             damage_chart,
+            air_distance_cache,
         );
         Some(air_response_economics(&strategy.air_defense, &air_coverage))
     } else {

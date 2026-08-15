@@ -131,11 +131,32 @@ pub struct TurnDistanceCache {
     /// キー: (出発地x, 出発地y, 目標地x, 目標地y, 移動タイプ, 移動力, 最小射程, 最大射程, 勢力ID)
     /// 値: 到達ターン数と消費移動力を保持する TurnDistance 構造体
     pub cache: HashMap<TurnCacheKey, TurnDistance>,
+    /// 同じ目標・射程帯へ全ての始点から到達する距離。候補マスごとのDijkstraを避ける。
+    #[allow(clippy::type_complexity)]
+    to_target_cache: HashMap<
+        (usize, usize, MovementType, u32, u32, u32, PlayerId),
+        Arc<HashMap<GridPosition, TurnDistance>>,
+    >,
+}
+
+/// 同一盤面スナップショット内で、1つの始点から全到達地点への距離を共有するcache。
+///
+/// 島評価のように「同じユニットから多数の島・拠点まで」を調べる処理で、目的地ごとに
+/// Dijkstraをやり直さないために使う。占有状態はkeyへ含めないため、盤面が変化する前に
+/// 呼び出し側がcacheを破棄する必要がある。
+#[derive(Default)]
+pub struct SourceTurnDistanceCache {
+    #[allow(clippy::type_complexity)]
+    cache: HashMap<
+        (usize, usize, MovementType, u32, PlayerId),
+        Arc<HashMap<GridPosition, TurnDistance>>,
+    >,
 }
 
 impl TurnDistanceCache {
     pub fn clear(&mut self) {
         self.cache.clear();
+        self.to_target_cache.clear();
     }
 }
 
@@ -164,10 +185,24 @@ struct ActionRangeCacheKey {
     player_id: PlayerId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ActionSourceCacheKey {
+    start: (usize, usize),
+    movement_type: MovementType,
+    max_mp: u32,
+    max_fuel: u32,
+    player_id: PlayerId,
+}
+
+type ActionPathCost = (u32, u32, u32, u32);
+type ActionSourceDistances = Arc<HashMap<(usize, usize), ActionPathCost>>;
+
 /// 射程帯への正確な行動ターン距離を同一分析中に再利用するキャッシュ。
 #[derive(Default)]
 pub struct ActionTurnDistanceCache {
     cache: HashMap<ActionRangeCacheKey, Option<ActionTurnDistance>>,
+    /// 同じ攻撃者から多数の防衛対象へ到達判定するとき、盤面Dijkstraを1回にする。
+    source_cache: HashMap<ActionSourceCacheKey, ActionSourceDistances>,
 }
 
 /// 実ターン境界を考慮する Dijkstra の状態。
@@ -251,6 +286,84 @@ pub fn calculate_turn_distance(
     )
 }
 
+/// 始点から全ての到達可能マスへの距離を1回のDijkstraで計算して共有する。
+///
+/// 敵占有マスは目的地としては到達可能だが、その先へは通過できない。これは
+/// `calculate_turn_distance(..., interaction_max_range = 0)` を各目的地へ個別実行した
+/// 場合と同じ占有ルールである。
+#[allow(clippy::too_many_arguments)]
+pub fn calculate_source_turn_distances_cached(
+    map: &Map,
+    registry: &MasterDataRegistry,
+    unit_positions: &HashMap<(usize, usize), OccupantInfo>,
+    start: (usize, usize),
+    movement_type: MovementType,
+    max_mp: u32,
+    player_id: PlayerId,
+    cache: &mut SourceTurnDistanceCache,
+) -> Arc<HashMap<GridPosition, TurnDistance>> {
+    let key = (start.0, start.1, movement_type, max_mp, player_id);
+    if let Some(cached) = cache.cache.get(&key) {
+        return Arc::clone(cached);
+    }
+
+    let mut costs = HashMap::new();
+    let mut heap = BinaryHeap::new();
+    if max_mp > 0 && start.0 < map.width && start.1 < map.height {
+        costs.insert(start, 0_u32);
+        heap.push(State {
+            cost: 0,
+            position: start,
+        });
+    }
+
+    while let Some(State { cost, position }) = heap.pop() {
+        if cost > *costs.get(&position).unwrap_or(&u32::MAX) {
+            continue;
+        }
+        // 敵占有マスへは攻撃・接触目的で入れるが、そこを経由した経路は作らない。
+        if position != start
+            && unit_positions
+                .get(&position)
+                .is_some_and(|occupant| occupant.player_id != player_id)
+        {
+            continue;
+        }
+        for next_position in map.get_adjacent(position.0, position.1) {
+            let Some(terrain) = map.get_terrain(next_position.0, next_position.1) else {
+                continue;
+            };
+            let Some(move_cost) = get_valid_movement_cost(registry, movement_type, terrain) else {
+                continue;
+            };
+            let next_cost = cost.saturating_add(move_cost);
+            if next_cost < *costs.get(&next_position).unwrap_or(&u32::MAX) {
+                costs.insert(next_position, next_cost);
+                heap.push(State {
+                    cost: next_cost,
+                    position: next_position,
+                });
+            }
+        }
+    }
+
+    let distances = costs
+        .into_iter()
+        .map(|((x, y), used_mp)| {
+            (
+                GridPosition { x, y },
+                TurnDistance {
+                    turns: used_mp.div_ceil(max_mp),
+                    used_mp,
+                },
+            )
+        })
+        .collect();
+    let shared = Arc::new(distances);
+    cache.cache.insert(key, Arc::clone(&shared));
+    shared
+}
+
 /// ターゲットから最小〜最大射程内にある合法な行動位置までのターン数を計算します。
 /// 間接攻撃の死角を含めて評価する必要がある対空カバレッジ計算で使用します。
 #[allow(clippy::too_many_arguments)]
@@ -289,130 +402,43 @@ pub fn calculate_turn_distance_to_range(
         return dist;
     }
 
-    // ターゲットから指定射程帯に入る、進入可能な全マスを目標地点とする。
-    // Dijkstraの各展開で射程帯判定を行うため、線形探索ではなく集合で保持する。
-    let mut effective_targets = HashSet::new();
-    for dx in -(interaction_max_range as i32)..=(interaction_max_range as i32) {
-        for dy in -(interaction_max_range as i32)..=(interaction_max_range as i32) {
-            let nx = target.0 as i32 + dx;
-            let ny = target.1 as i32 + dy;
-            if nx >= 0 && nx < map.width as i32 && ny >= 0 && ny < map.height as i32 {
-                let pos = (nx as usize, ny as usize);
-                let range = map.distance(pos.0, pos.1, target.0, target.1);
-                if range < interaction_min_range || range > interaction_max_range {
-                    continue;
-                }
-                if let Some(terrain) = map.get_terrain(pos.0, pos.1) {
-                    if get_valid_movement_cost(registry, movement_type, terrain).is_some() {
-                        let mut can_enter = true;
-                        // 目標地点そのもの以外で、敵がいる場合は到達不可
-                        if pos != target {
-                            if let Some(occupant) = unit_positions.get(&pos) {
-                                if occupant.player_id != player_id {
-                                    can_enter = false;
-                                }
-                            }
-                        }
-                        if can_enter {
-                            effective_targets.insert(pos);
-                        }
-                    }
-                }
-            }
-        }
+    let target_cache_key = (
+        target.0,
+        target.1,
+        movement_type,
+        max_mp,
+        interaction_min_range,
+        interaction_max_range,
+        player_id,
+    );
+    let all_distances = if let Some(cached) = cache.to_target_cache.get(&target_cache_key) {
+        Arc::clone(cached)
+    } else {
+        let calculated = Arc::new(calculate_all_turn_distances_to_range(
+            map,
+            registry,
+            unit_positions,
+            target,
+            movement_type,
+            max_mp,
+            interaction_min_range,
+            interaction_max_range,
+            player_id,
+        ));
+        cache
+            .to_target_cache
+            .insert(target_cache_key, Arc::clone(&calculated));
+        calculated
+    };
+    if let Some(distance) = all_distances.get(&GridPosition {
+        x: start.0,
+        y: start.1,
+    }) {
+        cache.cache.insert(cache_key, *distance);
+        return *distance;
     }
 
-    if effective_targets.is_empty() {
-        // ターゲットに隣接する進入可能タイルが存在しない → 到達不可
-        let dx = (start.0 as i32 - target.0 as i32).abs();
-        let dy = (start.1 as i32 - target.1 as i32).abs();
-        let approx = 50 + ((dx + dy) as u32 / 4);
-        let approx_encoded = TurnDistance {
-            turns: approx,
-            used_mp: 0xFFFFFFFF,
-        };
-        cache.cache.insert(cache_key, approx_encoded);
-        return approx_encoded;
-    }
-
-    // スタート地点がいずれかの到達目標に一致する場合
-    if effective_targets.contains(&start) {
-        let zero = TurnDistance {
-            turns: 0,
-            used_mp: 0,
-        };
-        cache.cache.insert(cache_key, zero);
-        return zero;
-    }
-
-    // ダイクストラ法でスタートから各タイルへの最短移動コストを計算
-    let mut dist = HashMap::new();
-    let mut heap = BinaryHeap::new();
-
-    dist.insert(start, 0u32);
-    heap.push(State {
-        cost: 0,
-        position: start,
-    });
-
-    while let Some(State { cost, position }) = heap.pop() {
-        // いずれかの到達目標に到達した
-        if effective_targets.contains(&position) {
-            let turns = if max_mp == 0 {
-                TurnDistance {
-                    turns: u32::MAX,
-                    used_mp: u32::MAX,
-                }
-            } else {
-                let base_turns = (cost + max_mp - 1) / max_mp; // ceil(cost / max_mp)
-                TurnDistance {
-                    turns: base_turns,
-                    used_mp: cost,
-                }
-            };
-            cache.cache.insert(cache_key, turns);
-            return turns;
-        }
-
-        if cost > *dist.get(&position).unwrap_or(&u32::MAX) {
-            continue;
-        }
-
-        for next_pos in map.get_adjacent(position.0, position.1) {
-            let Some(next_terrain) = map.get_terrain(next_pos.0, next_pos.1) else {
-                continue;
-            };
-
-            let Some(move_cost) = get_valid_movement_cost(registry, movement_type, next_terrain)
-            else {
-                continue;
-            };
-
-            // 敵ユニットによるゾック（通行不可）判定
-            // ただし目標地点に敵がいる場合は攻撃可能なので通行可能とみなす
-            if !effective_targets.contains(&next_pos) {
-                if let Some(occupant) = unit_positions.get(&next_pos) {
-                    if occupant.player_id != player_id {
-                        continue; // 敵がいるマスは通過不可
-                    }
-                }
-            }
-
-            let next_cost = cost + move_cost;
-            let current_best = *dist.get(&next_pos).unwrap_or(&u32::MAX);
-
-            if next_cost < current_best {
-                dist.insert(next_pos, next_cost);
-                heap.push(State {
-                    cost: next_cost,
-                    position: next_pos,
-                });
-            }
-        }
-    }
-
-    // 完全に到達不可な場合でも、マンハッタン距離ベースの近似値を返す
-    // 遠すぎる値にするとスコア計算で差分が出なくなるため、50 + 距離/4 程度に留める
+    // 完全に到達不可な場合でも従来と同じ近似値を返し、評価値の飽和を避ける。
     let dx = (start.0 as i32 - target.0 as i32).abs();
     let dy = (start.1 as i32 - target.1 as i32).abs();
     let approx = 50 + ((dx + dy) as u32 / 4);
@@ -511,41 +537,104 @@ pub fn calculate_action_distance_to_range(
         return None;
     }
 
-    let mut heap = BinaryHeap::new();
-    let mut best_by_position = HashMap::new();
-    let start_state = ActionState {
-        turns: 0,
-        mp_in_turn: 0,
-        total_mp: 0,
-        used_fuel: 0,
-        position: start,
+    let source_key = ActionSourceCacheKey {
+        start,
+        movement_type,
+        max_mp,
+        max_fuel,
+        player_id,
     };
-    heap.push(start_state);
-    best_by_position.insert(start, (0, 0, 0, 0));
-    let mut best_result: Option<ActionTurnDistance> = None;
+    let best_by_position = if let Some(cached) = cache.source_cache.get(&source_key) {
+        Arc::clone(cached)
+    } else {
+        let mut heap = BinaryHeap::new();
+        let mut best_by_position = HashMap::new();
+        let start_state = ActionState {
+            turns: 0,
+            mp_in_turn: 0,
+            total_mp: 0,
+            used_fuel: 0,
+            position: start,
+        };
+        heap.push(start_state);
+        best_by_position.insert(start, (0, 0, 0, 0));
 
-    while let Some(state) = heap.pop() {
-        let state_cost = (
-            state.turns,
-            state.mp_in_turn,
-            state.total_mp,
-            state.used_fuel,
-        );
-        if best_by_position
-            .get(&state.position)
-            .is_some_and(|best| state_cost > *best)
-        {
-            continue;
+        while let Some(state) = heap.pop() {
+            let state_cost = (
+                state.turns,
+                state.mp_in_turn,
+                state.total_mp,
+                state.used_fuel,
+            );
+            if best_by_position
+                .get(&state.position)
+                .is_some_and(|best| state_cost > *best)
+            {
+                continue;
+            }
+
+            for next_position in map.get_adjacent(state.position.0, state.position.1) {
+                if unit_positions
+                    .get(&next_position)
+                    .is_some_and(|occupant| occupant.player_id != player_id)
+                {
+                    continue;
+                }
+                let Some(move_cost) = map
+                    .get_terrain(next_position.0, next_position.1)
+                    .and_then(|terrain| get_valid_movement_cost(registry, movement_type, terrain))
+                else {
+                    continue;
+                };
+                if move_cost > max_mp || state.used_fuel >= max_fuel {
+                    continue;
+                }
+
+                let (next_turns, next_mp_in_turn) = if state.turns == 0 {
+                    (1, move_cost)
+                } else if state.mp_in_turn.saturating_add(move_cost) <= max_mp {
+                    (state.turns, state.mp_in_turn + move_cost)
+                } else {
+                    (state.turns.saturating_add(1), move_cost)
+                };
+                let next_state = ActionState {
+                    turns: next_turns,
+                    mp_in_turn: next_mp_in_turn,
+                    total_mp: state.total_mp.saturating_add(move_cost),
+                    used_fuel: state.used_fuel + 1,
+                    position: next_position,
+                };
+                let next_cost = (
+                    next_state.turns,
+                    next_state.mp_in_turn,
+                    next_state.total_mp,
+                    next_state.used_fuel,
+                );
+                if best_by_position
+                    .get(&next_position)
+                    .is_none_or(|current| next_cost < *current)
+                {
+                    best_by_position.insert(next_position, next_cost);
+                    heap.push(next_state);
+                }
+            }
         }
-
-        if firing_positions.contains(&state.position) {
+        let calculated = Arc::new(best_by_position);
+        cache
+            .source_cache
+            .insert(source_key, Arc::clone(&calculated));
+        calculated
+    };
+    let mut best_result: Option<ActionTurnDistance> = None;
+    for firing_position in firing_positions {
+        if let Some((turns, _, total_mp, used_fuel)) = best_by_position.get(&firing_position) {
             let firing_distance =
-                map.distance(state.position.0, state.position.1, target.0, target.1);
-            let indirect_setup = u32::from(state.turns > 0 && firing_distance > 1);
+                map.distance(firing_position.0, firing_position.1, target.0, target.1);
+            let indirect_setup = u32::from(*turns > 0 && firing_distance > 1);
             let candidate = ActionTurnDistance {
-                turns: state.turns.saturating_add(indirect_setup),
-                used_mp: state.total_mp,
-                used_fuel: state.used_fuel,
+                turns: turns.saturating_add(indirect_setup),
+                used_mp: *total_mp,
+                used_fuel: *used_fuel,
                 requires_movement: true,
             };
             let replace = best_result.is_none_or(|current| {
@@ -554,52 +643,6 @@ pub fn calculate_action_distance_to_range(
             });
             if replace {
                 best_result = Some(candidate);
-            }
-        }
-
-        for next_position in map.get_adjacent(state.position.0, state.position.1) {
-            if unit_positions
-                .get(&next_position)
-                .is_some_and(|occupant| occupant.player_id != player_id)
-            {
-                continue;
-            }
-            let Some(move_cost) = map
-                .get_terrain(next_position.0, next_position.1)
-                .and_then(|terrain| get_valid_movement_cost(registry, movement_type, terrain))
-            else {
-                continue;
-            };
-            if move_cost > max_mp || state.used_fuel >= max_fuel {
-                continue;
-            }
-
-            let (next_turns, next_mp_in_turn) = if state.turns == 0 {
-                (1, move_cost)
-            } else if state.mp_in_turn.saturating_add(move_cost) <= max_mp {
-                (state.turns, state.mp_in_turn + move_cost)
-            } else {
-                (state.turns.saturating_add(1), move_cost)
-            };
-            let next_state = ActionState {
-                turns: next_turns,
-                mp_in_turn: next_mp_in_turn,
-                total_mp: state.total_mp.saturating_add(move_cost),
-                used_fuel: state.used_fuel + 1,
-                position: next_position,
-            };
-            let next_cost = (
-                next_state.turns,
-                next_state.mp_in_turn,
-                next_state.total_mp,
-                next_state.used_fuel,
-            );
-            if best_by_position
-                .get(&next_position)
-                .is_none_or(|current| next_cost < *current)
-            {
-                best_by_position.insert(next_position, next_cost);
-                heap.push(next_state);
             }
         }
     }
@@ -620,6 +663,31 @@ pub fn calculate_all_turn_distances(
     interaction_max_range: u32,
     player_id: PlayerId,
 ) -> HashMap<GridPosition, TurnDistance> {
+    calculate_all_turn_distances_to_range(
+        map,
+        registry,
+        unit_positions,
+        target,
+        movement_type,
+        max_mp,
+        0,
+        interaction_max_range,
+        player_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn calculate_all_turn_distances_to_range(
+    map: &Map,
+    registry: &MasterDataRegistry,
+    unit_positions: &HashMap<(usize, usize), OccupantInfo>,
+    target: (usize, usize),
+    movement_type: MovementType,
+    max_mp: u32,
+    interaction_min_range: u32,
+    interaction_max_range: u32,
+    player_id: PlayerId,
+) -> HashMap<GridPosition, TurnDistance> {
     let mut dist = HashMap::new();
     let mut heap = BinaryHeap::new();
     let mut turns_map = HashMap::new();
@@ -631,15 +699,14 @@ pub fn calculate_all_turn_distances(
     // ターゲットからインタラクション可能な（射程内の）全ての進入可能タイルを始点として登録
     for dx in -(interaction_max_range as i32)..=(interaction_max_range as i32) {
         for dy in -(interaction_max_range as i32)..=(interaction_max_range as i32) {
-            let m_dist = dx.abs() + dy.abs();
-            if m_dist > interaction_max_range as i32 {
-                continue;
-            }
-
             let nx = target.0 as i32 + dx;
             let ny = target.1 as i32 + dy;
             if nx >= 0 && nx < map.width as i32 && ny >= 0 && ny < map.height as i32 {
                 let pos = (nx as usize, ny as usize);
+                let range = map.distance(pos.0, pos.1, target.0, target.1);
+                if range < interaction_min_range || range > interaction_max_range {
+                    continue;
+                }
                 if let Some(terrain) = map.get_terrain(pos.0, pos.1) {
                     if get_valid_movement_cost(registry, movement_type, terrain).is_some() {
                         let mut can_enter = true;
@@ -850,6 +917,70 @@ mod tests {
     }
 
     #[test]
+    fn turn_distance_reuses_one_reverse_search_for_multiple_starts() {
+        let map = Map::new(
+            6,
+            1,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        let registry = MasterDataRegistry::load().unwrap_or_default();
+        let mut cache = TurnDistanceCache::default();
+        for start_x in [0, 2] {
+            let distance = calculate_turn_distance(
+                &map,
+                &registry,
+                &HashMap::new(),
+                (start_x, 0),
+                (5, 0),
+                MovementType::Infantry,
+                3,
+                0,
+                PlayerId(1),
+                &mut cache,
+            );
+            assert_eq!(distance.used_mp, 5 - start_x as u32);
+        }
+        assert_eq!(cache.to_target_cache.len(), 1);
+    }
+
+    #[test]
+    fn source_distance_allows_enemy_destination_but_not_enemy_transit() {
+        let map = Map::new(
+            4,
+            1,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        let registry = MasterDataRegistry::load().unwrap_or_default();
+        let enemy = OccupantInfo {
+            player_id: PlayerId(2),
+            unit_type: crate::resources::UnitType::Infantry,
+            is_transport: false,
+            free_slots: 0,
+            loadable_types: Vec::new(),
+        };
+        let positions = HashMap::from([((2, 0), enemy)]);
+        let mut cache = SourceTurnDistanceCache::default();
+        let distances = calculate_source_turn_distances_cached(
+            &map,
+            &registry,
+            &positions,
+            (0, 0),
+            MovementType::Infantry,
+            3,
+            PlayerId(1),
+            &mut cache,
+        );
+
+        assert_eq!(
+            distances.get(&GridPosition { x: 2, y: 0 }).unwrap().turns,
+            1
+        );
+        assert!(!distances.contains_key(&GridPosition { x: 3, y: 0 }));
+    }
+
+    #[test]
     fn turn_distance_to_range_excludes_minimum_range_dead_zone() {
         let map = Map::new(
             5,
@@ -999,6 +1130,53 @@ mod tests {
 
         assert_eq!(distance.turns, 2);
         assert_eq!(distance.used_fuel, 1);
+    }
+
+    #[test]
+    fn action_distance_reuses_one_source_search_for_multiple_targets() {
+        let map = Map::new(
+            7,
+            1,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        let registry = MasterDataRegistry::load().unwrap_or_default();
+        let mut cache = ActionTurnDistanceCache::default();
+
+        let first = calculate_action_distance_to_range(
+            &map,
+            &registry,
+            &HashMap::new(),
+            (0, 0),
+            (4, 0),
+            MovementType::Tank,
+            3,
+            99,
+            1,
+            1,
+            PlayerId(1),
+            &mut cache,
+        )
+        .unwrap();
+        let second = calculate_action_distance_to_range(
+            &map,
+            &registry,
+            &HashMap::new(),
+            (0, 0),
+            (6, 0),
+            MovementType::Tank,
+            3,
+            99,
+            1,
+            1,
+            PlayerId(1),
+            &mut cache,
+        )
+        .unwrap();
+
+        assert_eq!(first.turns, 1);
+        assert_eq!(second.turns, 2);
+        assert_eq!(cache.source_cache.len(), 1);
     }
 
     #[test]
