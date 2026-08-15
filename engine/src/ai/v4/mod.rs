@@ -13,9 +13,11 @@
 //! 同時に立つため、倒してから占領するのではなく並行して進む。
 
 pub mod campaign_execution;
+mod combat_profile;
 pub mod deployment;
 pub mod logistics_plan;
 pub mod operation;
+mod operation_selection;
 pub mod plan_revision;
 pub mod rolling_plan;
 pub mod trace;
@@ -26,6 +28,7 @@ use operation::{
     AcquisitionMode, OperationFacts, OperationKind, OperationSlots, RESERVATION_PATIENCE_TURNS,
     SLOT_PRIORITY, SlotKind, SlotTier, acquisition_mode, derive_slots,
 };
+use operation_selection::{OperationCandidate, select_operation_candidates};
 use plan_revision::{
     ActivePlanObjective, DeploymentExecutionObservation, PlanDisposition, PlanStepRef,
     SelectedPlan, V4RollingPlanRegistry,
@@ -50,10 +53,27 @@ use crate::resources::{DamageChart, Map, MovementType, Players, Terrain, UnitReg
 use crate::systems::transport::can_unload_from_terrain;
 use bevy_ecs::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
-/// 揚陸可否キャッシュのキー：(輸送の移動タイプ, 積荷の移動タイプ, 出発地, 目標)
-type DeliveryKey = (MovementType, MovementType, (usize, usize), (usize, usize));
-type EngagementKey = (MovementType, (usize, usize), (usize, usize), u32);
+/// 揚陸可否キャッシュのキー。
+///
+/// 移動種別と座標を生タプルの順番で取り違えないよう、用途ごとの値オブジェクトにする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DeliveryKey {
+    transport_movement: MovementType,
+    cargo_movement: MovementType,
+    start: GridPosition,
+    target: GridPosition,
+}
+
+/// 射程内への到達可否キャッシュのキー。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct EngagementKey {
+    movement_type: MovementType,
+    start: GridPosition,
+    target: GridPosition,
+    range: u32,
+}
 
 /// 到達性まわりの計算結果を、1 回の生産判断のあいだだけ再利用するためのコンテキスト。
 ///
@@ -91,7 +111,18 @@ impl ReachCtx {
         movement_type: MovementType,
         max_range: u32,
     ) -> bool {
-        let key = (movement_type, start, target, max_range.max(1));
+        let key = EngagementKey {
+            movement_type,
+            start: GridPosition {
+                x: start.0,
+                y: start.1,
+            },
+            target: GridPosition {
+                x: target.0,
+                y: target.1,
+            },
+            range: max_range.max(1),
+        };
         if let Some(cached) = self.engagement.get(&key) {
             return *cached;
         }
@@ -115,31 +146,11 @@ impl ReachCtx {
     }
 }
 
-/// 同時に抱える作戦の最大数。多すぎると戦力が分散するため制限する。
-const MAX_OPERATIONS: usize = 4;
-
 /// 敵がこのターン数以内に到達できる自軍拠点は防衛作戦の対象とする。
 const DEFENSE_THREAT_ETA: u32 = 2;
 
 /// 占領開始後に拠点を確保し切るまでに必要な最小手番数。
 const CAPTURE_COMPLETION_TURNS: u32 = 2;
-
-type ScoredOperation = (bool, u32, OperationKind, Vec<GridPosition>);
-
-/// 必須作戦を差し込む際、もう一方の勝利ロードマップ必須作戦を追い出さない。
-fn required_operation_eviction_index(scored: &[ScoredOperation], required: OperationKind) -> usize {
-    scored
-        .iter()
-        .rposition(|(_, _, kind, _)| {
-            *kind != required
-                && !matches!(
-                    (required, *kind),
-                    (OperationKind::Capture, OperationKind::AssaultCapital)
-                        | (OperationKind::AssaultCapital, OperationKind::Capture)
-                )
-        })
-        .unwrap_or(scored.len() - 1)
-}
 
 /// 盤面から取り出したユニット 1 体分の情報。
 #[derive(Debug, Clone)]
@@ -716,9 +727,10 @@ fn mark_campaign_production_issued(
 
 /// 盤面から生産判断に必要な観測量をすべて取り出したもの。
 struct BoardScan {
-    map: Map,
-    master_data: MasterDataRegistry,
-    damage_chart: DamageChart,
+    /// 同じ手番の複数作戦へ渡す不変盤面。作戦ごとの全量cloneを避ける。
+    map: Arc<Map>,
+    master_data: Arc<MasterDataRegistry>,
+    damage_chart: Arc<DamageChart>,
     funds: u32,
     /// 生産可能な施設（未占有・生産範囲内・クールダウン対象外）
     free_facilities: Vec<(GridPosition, Terrain)>,
@@ -768,10 +780,10 @@ struct CampaignPlanningObjective {
 
 impl BoardScan {
     fn collect(world: &mut World, player_id: PlayerId) -> Option<Self> {
-        let map = world.get_resource::<Map>()?.clone();
+        let map = Arc::new(world.get_resource::<Map>()?.clone());
         let unit_registry = world.get_resource::<UnitRegistry>()?.clone();
-        let damage_chart = world.get_resource::<DamageChart>()?.clone();
-        let master_data = world.get_resource::<MasterDataRegistry>()?.clone();
+        let damage_chart = Arc::new(world.get_resource::<DamageChart>()?.clone());
+        let master_data = Arc::new(world.get_resource::<MasterDataRegistry>()?.clone());
         let funds = world
             .get_resource::<Players>()?
             .0
@@ -1250,13 +1262,15 @@ fn build_operations(
             })
     };
 
-    // 生産施設から近い作戦を優先して MAX_OPERATIONS 件に絞る
-    let mut scored: Vec<ScoredOperation> = raw
+    // 上位campaignと永続Planが所有する作戦を必須として識別し、追加の局地候補だけを
+    // 同時実行容量へ収める。固定4件で第5の戦略作戦を消してはならない。
+    let mut scored: Vec<OperationCandidate> = raw
         .into_iter()
         .filter(|(_, cluster)| !cluster.is_empty())
         .map(|(kind, cluster)| {
-            let anchor = campaign_for_cluster(kind, &cluster)
-                .map_or_else(|| anchor_of(&cluster, scan), |objective| objective.anchor);
+            let campaign = campaign_for_cluster(kind, &cluster);
+            let anchor =
+                campaign.map_or_else(|| anchor_of(&cluster, scan), |objective| objective.anchor);
             let lead = facility_lead_time(scan, &anchor, reference.max_movement);
             let continuing = active_objectives.iter().any(|objective| {
                 campaign_for_cluster(kind, &cluster)
@@ -1267,91 +1281,47 @@ fn build_operations(
                             .iter()
                             .any(|property| objective.properties.contains(property)))
             });
-            (continuing, lead, kind, cluster)
+            OperationCandidate {
+                continuing,
+                lead,
+                kind,
+                cluster,
+                required: continuing || campaign.is_some(),
+            }
         })
         .collect();
-    scored.sort_by_key(|(continuing, lead, kind, cluster)| {
-        let logistics_rank = campaign_for_cluster(*kind, cluster)
+    scored.sort_by_key(|candidate| {
+        let logistics_rank = campaign_for_cluster(candidate.kind, &candidate.cluster)
             .and_then(|objective| objective.logistics_rank)
             .unwrap_or(u32::MAX);
         (
-            kind.priority_rank(),
+            candidate.kind.priority_rank(),
             logistics_rank,
-            !*continuing,
-            *lead,
+            !candidate.continuing,
+            candidate.lead,
             // 同条件なら拠点数の多い（面が広い）作戦を優先
-            usize::MAX - cluster.len(),
+            usize::MAX - candidate.cluster.len(),
         )
     });
-    // 防衛作戦は priority_rank が最上位なので、素直に truncate すると防衛だけで枠が埋まり、
-    // 占領作戦が 1 つも残らずに拡張が完全停止する（＝ジリ貧）ことがある。
-    // 占領目標が残っている限り、最良の占領作戦を 1 枠だけ確保する。
-    let rescued_capture = if scored[..scored.len().min(MAX_OPERATIONS)]
-        .iter()
-        .any(|(_, _, kind, _)| *kind == OperationKind::Capture)
-    {
-        None
-    } else {
-        scored
-            .iter()
-            .position(|(_, _, kind, _)| *kind == OperationKind::Capture)
-            .map(|index| scored.remove(index))
-    };
-    scored.truncate(MAX_OPERATIONS);
-    if let Some(capture) = rescued_capture {
-        // 最も優先度の低い枠を明け渡して占領作戦を差し込む
-        if scored.len() >= MAX_OPERATIONS {
-            let removable = required_operation_eviction_index(&scored, OperationKind::Capture);
-            scored.remove(removable);
-        }
-        scored.push(capture);
-    }
-    // 首都作戦は局地作戦より優先度が低いが、候補集合から消してはならない。
-    // 消えると兵站作戦後の資金が勝利条件へ一切予約されなくなる。
-    let rescued_assault = if scored
-        .iter()
-        .any(|(_, _, kind, _)| *kind == OperationKind::AssaultCapital)
-    {
-        None
-    } else {
-        scan.campaign_objectives
-            .iter()
-            .find(|objective| objective.kind == OperationKind::AssaultCapital)
-            .and_then(|objective| {
-                let cluster = campaign_clusters
-                    .iter()
-                    .find(|(candidate, _)| candidate.kind == OperationKind::AssaultCapital)
-                    .map(|(_, properties)| properties.clone())?;
-                let lead = facility_lead_time(scan, &objective.anchor, reference.max_movement);
-                Some((false, lead, OperationKind::AssaultCapital, cluster))
-            })
-    };
-    if let Some(assault) = rescued_assault {
-        if scored.len() >= MAX_OPERATIONS {
-            // 末尾には救済した進行中Captureが入ることがある。これを再び落とさず、
-            // Capture/首都以外で最も低位の作戦を1件だけ外す。
-            let removable =
-                required_operation_eviction_index(&scored, OperationKind::AssaultCapital);
-            scored.remove(removable);
-        }
-        scored.push(assault);
-    }
+    let scored = select_operation_candidates(scored);
 
     let anchors: Vec<GridPosition> = scored
         .iter()
-        .map(|(_, _, kind, cluster)| {
-            campaign_for_cluster(*kind, cluster)
-                .map_or_else(|| anchor_of(cluster, scan), |objective| objective.anchor)
+        .map(|candidate| {
+            campaign_for_cluster(candidate.kind, &candidate.cluster).map_or_else(
+                || anchor_of(&candidate.cluster, scan),
+                |objective| objective.anchor,
+            )
         })
         .collect();
     let horizons: Vec<u32> = scored
         .iter()
-        .map(|(_, lead, kind, _)| operation_threat_horizon(*kind, *lead))
+        .map(|candidate| operation_threat_horizon(candidate.kind, candidate.lead))
         .collect();
     let assignment_enabled = scored
         .iter()
-        .map(|(_, _, kind, cluster)| {
-            campaign_for_cluster(*kind, cluster).is_none_or(|objective| {
+        .map(|candidate| {
+            campaign_for_cluster(candidate.kind, &candidate.cluster).is_none_or(|objective| {
                 objective.kind != OperationKind::AssaultCapital || objective.execution_authorized
             })
         })
@@ -1361,7 +1331,13 @@ fn build_operations(
     scored
         .into_iter()
         .enumerate()
-        .map(|(index, (_, lead, kind, cluster))| {
+        .map(|(index, candidate)| {
+            let OperationCandidate {
+                lead,
+                kind,
+                cluster,
+                ..
+            } = candidate;
             let anchor = anchors[index];
             let planning_objective = campaign_for_cluster(kind, &cluster);
             let forced_target_enemies = planning_objective
@@ -2966,6 +2942,7 @@ fn combat_plan_input(
 
     Some(RollingPlanInput {
         map: scan.map.clone(),
+        master_data: scan.master_data.clone(),
         damage_chart: scan.damage_chart.clone(),
         existing_units,
         protected_units,
@@ -3303,12 +3280,12 @@ fn can_deliver_cargo(
     transport_movement: MovementType,
     cargo_movement: MovementType,
 ) -> bool {
-    let key = (
+    let key = DeliveryKey {
         transport_movement,
         cargo_movement,
-        (from.x, from.y),
-        (anchor.x, anchor.y),
-    );
+        start: *from,
+        target: *anchor,
+    };
     if let Some(cached) = ctx.delivery.get(&key) {
         return *cached;
     }
@@ -3699,20 +3676,6 @@ mod tests {
         assert!(!assault.execution_authorized);
     }
 
-    #[test]
-    fn capital_rescue_evicts_defense_instead_of_the_required_capture() {
-        let scored = vec![
-            (true, 1, OperationKind::Defense, vec![pos(0, 0)]),
-            (true, 2, OperationKind::Defense, vec![pos(1, 0)]),
-            (true, 3, OperationKind::Defense, vec![pos(2, 0)]),
-            (true, 4, OperationKind::Capture, vec![pos(3, 0)]),
-        ];
-
-        let removed = required_operation_eviction_index(&scored, OperationKind::AssaultCapital);
-        assert_eq!(scored[removed].2, OperationKind::Defense);
-        assert_ne!(scored[removed].2, OperationKind::Capture);
-    }
-
     /// 到達ターン数は距離を移動力で割り上げた値になる
     #[test]
     fn eta_is_distance_divided_by_movement() {
@@ -3796,9 +3759,9 @@ mod tests {
         let anchors = vec![pos(5, 1), pos(15, 1)];
         let horizons = vec![5, 5];
         let scan = BoardScan {
-            map: flat_map(20, 3),
-            master_data: MasterDataRegistry::load().unwrap(),
-            damage_chart,
+            map: flat_map(20, 3).into(),
+            master_data: MasterDataRegistry::load().unwrap().into(),
+            damage_chart: damage_chart.into(),
             funds: 20_000,
             free_facilities: vec![(pos(0, 1), Terrain::Factory), (pos(1, 1), Terrain::Airport)],
             production_facilities: vec![
@@ -4034,10 +3997,8 @@ mod tests {
             pos: pos(8, 2),
             terrain: Terrain::Factory,
         }];
-        scan.damage_chart
-            .insert_damage(UnitType::Infantry, UnitType::Tank, 20);
-        scan.damage_chart
-            .insert_damage(UnitType::Tank, UnitType::Infantry, 80);
+        Arc::make_mut(&mut scan.damage_chart).insert_damage(UnitType::Infantry, UnitType::Tank, 20);
+        Arc::make_mut(&mut scan.damage_chart).insert_damage(UnitType::Tank, UnitType::Infantry, 80);
         let mut op = operation(
             OperationKind::Capture,
             OperationSlots::default(),
@@ -4103,9 +4064,19 @@ mod tests {
 
     /// テスト用のユニット諸元。
     fn stats(unit_type: UnitType, cost: u32) -> UnitStats {
+        let master = MasterDataRegistry::load().unwrap();
+        let weapon_stats = master
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                unit_type.as_str().to_owned(),
+            ))
+            .unwrap();
         UnitStats {
             unit_type,
             cost,
+            max_ammo1: weapon_stats.max_ammo1,
+            max_ammo2: weapon_stats.max_ammo2,
+            min_range: weapon_stats.min_range,
+            max_range: weapon_stats.max_range,
             ..UnitStats::mock()
         }
     }
@@ -4256,9 +4227,9 @@ mod tests {
         damage_chart.insert_damage(UnitType::Infantry, UnitType::Bcopters, 0);
         let enemy_positions = [pos(8, 0), pos(8, 1), pos(8, 2)];
         let scan = BoardScan {
-            map: flat_map(10, 3),
-            master_data: MasterDataRegistry::load().unwrap(),
-            damage_chart,
+            map: flat_map(10, 3).into(),
+            master_data: MasterDataRegistry::load().unwrap().into(),
+            damage_chart: damage_chart.into(),
             funds: 22_500,
             free_facilities: vec![
                 (pos(0, 1), Terrain::Factory),
@@ -4302,9 +4273,9 @@ mod tests {
         let (commands, trace) = plan_production(&scan, PlayerId(1), false, &HashMap::new());
 
         // 占領役を1体確保してもCombat計画を消さず、65%攻撃を何回実行できるかを
-        // シミュレーションした混成列を保持する。現在資金で買える2機を当手番へ置き、
-        // 残りは将来購入として同じPlanへ残す。
-        assert_eq!(commands.len(), 3, "commands={commands:?}, trace={trace:?}");
+        // シミュレーションした攻撃列を保持する。実弾薬では1機が6回攻撃して
+        // 3体を排除できるため、価格を敵価値へ換算せず必要な1機だけを生産する。
+        assert_eq!(commands.len(), 2, "commands={commands:?}, trace={trace:?}");
         assert_eq!(
             commands
                 .iter()
@@ -4317,7 +4288,7 @@ mod tests {
                 .iter()
                 .filter(|command| command.unit_type == UnitType::Bcopters)
                 .count(),
-            2
+            1
         );
         let combat_plan = &trace.rolling_combat_plans[0];
         assert_eq!(combat_plan.targets.len(), 3);
@@ -4328,7 +4299,7 @@ mod tests {
                 .all(|target| target.remaining_hp == 0),
             "combat_plan={combat_plan:?}"
         );
-        assert!(combat_plan.purchases.len() >= 3);
+        assert_eq!(combat_plan.purchases.len(), 1);
     }
 
     /// テスト用の作戦。枠の充足状況だけを見たいので敵情報は空にしておく。
@@ -4371,9 +4342,9 @@ mod tests {
         };
 
         BoardScan {
-            map: strait_map(Some(Terrain::Shoal)),
-            master_data: MasterDataRegistry::load().unwrap(),
-            damage_chart: DamageChart::new(),
+            map: strait_map(Some(Terrain::Shoal)).into(),
+            master_data: MasterDataRegistry::load().unwrap().into(),
+            damage_chart: DamageChart::new().into(),
             funds: 20000,
             free_facilities: vec![(pos(1, 1), Terrain::Port)],
             production_facilities: vec![(pos(1, 1), Terrain::Port)],
@@ -4546,9 +4517,9 @@ mod tests {
         };
 
         BoardScan {
-            map: flat_map(9, 5),
-            master_data: MasterDataRegistry::load().unwrap(),
-            damage_chart: DamageChart::new(),
+            map: flat_map(9, 5).into(),
+            master_data: MasterDataRegistry::load().unwrap().into(),
+            damage_chart: DamageChart::new().into(),
             funds: 20000,
             free_facilities: vec![
                 (pos(1, 1), Terrain::Factory),
@@ -4599,9 +4570,9 @@ mod tests {
         damage_chart.insert_damage(UnitType::Infantry, UnitType::Tank, 0);
 
         BoardScan {
-            map: flat_map(9, 5),
-            master_data: MasterDataRegistry::load().unwrap(),
-            damage_chart,
+            map: flat_map(9, 5).into(),
+            master_data: MasterDataRegistry::load().unwrap().into(),
+            damage_chart: damage_chart.into(),
             funds: 17000,
             free_facilities: vec![
                 (pos(1, 0), Terrain::Factory),
@@ -4686,9 +4657,9 @@ mod tests {
         damage_chart.insert_damage(UnitType::Tank, UnitType::Infantry, 90);
         damage_chart.insert_damage(UnitType::Infantry, UnitType::Tank, 0);
         let scan = BoardScan {
-            map,
-            master_data: MasterDataRegistry::load().unwrap(),
-            damage_chart,
+            map: map.into(),
+            master_data: MasterDataRegistry::load().unwrap().into(),
+            damage_chart: damage_chart.into(),
             funds: 20_000,
             free_facilities: vec![(pos(1, 1), Terrain::Factory), (pos(2, 1), Terrain::Airport)],
             production_facilities: vec![
@@ -4827,7 +4798,7 @@ mod tests {
     fn transports_are_not_ledgered_for_unreachable_anchors() {
         let mut scan = strait_scan();
         // 接岸できる地形を消すと、艦船は対岸へ陸上ユニットを降ろせなくなる
-        scan.map = strait_map(None);
+        scan.map = strait_map(None).into();
         let mut ctx = ReachCtx::default();
         let reference = UnitStats {
             can_capture: true,
@@ -4928,7 +4899,7 @@ mod tests {
         };
 
         let mut mainland = strait_scan();
-        mainland.map = flat_map(10, 3);
+        mainland.map = flat_map(10, 3).into();
         mainland.production_facilities = vec![(pos(1, 1), Terrain::Factory)];
         mainland.free_facilities = mainland.production_facilities.clone();
         let mut reach = ReachCtx::default();

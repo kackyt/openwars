@@ -156,7 +156,7 @@
 
 - `operation-requirement-planning`: 前線（作戦）ごとに必要な編成を状況から導出する。目標クラスタ規模・敵戦力の到達時点予測・占領競争 ETA・接敵 ETA・到達可能性・輸送要否から `OperationRequirement` を組み立て、フェーズ非依存の編成判断を提供する
 - `production-budget-reservation`: 生産枠を制約とした予算配分と、複数ターンにまたがる予約・消費・解除・見送りを管理する。`SquadPackage` モードの作戦が部分購入済みパッケージを保持し、完成見込みに応じて予約を維持・縮小・解除する
-- `rolling-operation-planning`: 島の残敵排除と占領完了までの混成編成・生産順・行動予定を毎ターン再計算し、実行可能案のPareto比較、予実突合、任務変更条件を管理する。独立候補はnativeで入力順を維持して並列評価し、WASMでは同じ判断順の直列評価へ切り替える。同一盤面・同一移動条件の経路探索と作戦再構築は手番内snapshotおよび到達性cacheを共有し、同じRolling Plan入力に対する距離・交戦可否・与反撃damage・接触turnも全beam候補で共有して同値判断を再計算しない
+- `rolling-operation-planning`: 島の残敵排除と占領完了までの混成編成・生産順・行動予定を毎ターン再計算し、実行可能案のPareto比較、予実突合、任務変更条件を管理する。独立候補はnativeで入力順を維持して並列評価し、WASMでは同じ判断順の直列評価へ切り替える。同一盤面・同一移動条件の経路探索と作戦再構築は手番内snapshotおよび到達性cacheを共有する。Rolling Planの反撃可否と反撃damageは計画上の交戦距離で本番と同じ武器選択から導き、既存の与damage・初撃turnモデルを別目的の変更で置換しない。campaign／継続Planが所有する作戦は局地候補の固定上限で破棄しない
 
 ### Modified Capabilities
 
@@ -179,6 +179,8 @@
 - `engine/src/ai/operation_assignment.rs`（新規）: Entityごとの唯一の作戦owner／実行Squad／役割を保持する正本とowner逆引きを提供し、平均O(1)照会、原子的移管、所属数O(k)の作戦解放を保証する
 - `engine/src/ai/v4/victory_roadmap.rs`: 未完原因と復旧行動を別履歴へ記録し、輸送manifestから輸送役・cargo損失を区別する。原因検知ではなく実際の再発注・再割当・輸送付与・補充確認だけを再計画実績とする
 - `engine/src/ai/v4/rolling_plan.rs`（新規）: 島作戦snapshot、混成編成候補、計画revision、Pareto前線、予実差、再計画理由を保持する純粋な計画器
+- `engine/src/ai/v4/combat_profile.rs`（新規）: 計画上の交戦距離で本番と同じ主副兵装を選択し、Rolling Planの合法な反撃可否と反撃damageだけを導出する
+- `engine/src/ai/v4/operation_selection.rs`（新規）: campaign／継続Plan所有作戦を全件保持し、追加の局地作戦だけを基準容量へ収める
 - `engine/src/ai/deterministic_parallel.rs`（新規）: nativeではRayon、WASMでは直列iteratorを使用し、いずれも入力順の結果列を返す独立候補評価基盤
 - `engine/src/ai/v4/plan_revision.rs`（新規）: 実行可能なCombat生産列を手番間で保持し、固定列再評価、step実績照合、Plan単位の予実台帳、増援・遅延判定、盤面事実による継続・revision・完了・撤回を管理する
 - `engine/src/ai/operation_simulation.rs`（新規）: 本番ルールと共有する移動・戦闘・輸送・占領のターン単位予測を提供し、V4検証後にV3からも再利用する

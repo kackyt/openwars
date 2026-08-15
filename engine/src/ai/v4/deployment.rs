@@ -658,6 +658,13 @@ fn local_retarget(
         {
             continue;
         }
+        // 島IDを持たない海空目標は敵側ETAだけで局地扱いしない。配属unit自身が
+        // 作戦horizon内に交戦距離へ入れなければ、遠ざかる目標を追跡しない。
+        if enemy_island.is_none()
+            && !assigned_unit_can_intercept_within_horizon(world, deployment, position)
+        {
+            continue;
+        }
         let eta = map
             .distance(
                 position.x,
@@ -729,6 +736,11 @@ fn target_within_operation(world: &World, deployment: &AssignedDeployment, enemy
     if operation_island.is_some() && enemy_island.is_some() && enemy_island != operation_island {
         return false;
     }
+    if enemy_island.is_none()
+        && !assigned_unit_can_intercept_within_horizon(world, deployment, enemy_position)
+    {
+        return false;
+    }
     let eta = map
         .distance(
             enemy_position.x,
@@ -738,6 +750,26 @@ fn target_within_operation(world: &World, deployment: &AssignedDeployment, enemy
         )
         .div_ceil(enemy_stats.max_movement.max(1));
     eta <= deployment.intent.threat_horizon.max(1)
+}
+
+/// 海空目標までの距離を、配属unit自身の移動力と最大射程で手番換算する。
+fn assigned_unit_can_intercept_within_horizon(
+    world: &World,
+    deployment: &AssignedDeployment,
+    target: &GridPosition,
+) -> bool {
+    let (Some(position), Some(stats), Some(map)) = (
+        world.get::<GridPosition>(deployment.entity),
+        world.get::<UnitStats>(deployment.entity),
+        world.get_resource::<Map>(),
+    ) else {
+        return false;
+    };
+    let travel_distance = map
+        .distance(position.x, position.y, target.x, target.y)
+        .saturating_sub(stats.max_range.max(1));
+    let intercept_eta = travel_distance.div_ceil(stats.max_movement.max(1));
+    intercept_eta <= deployment.intent.threat_horizon.max(1)
 }
 
 /// 優先敵の現在位置を追跡し、消滅・到達不能時だけ局地敵へ再目標化する。
@@ -1387,6 +1419,98 @@ mod tests {
                 .map(|target| target.0),
             Some(local_enemy),
             "生産時の優先敵が別島へ移動したら同じ島の敵へ再目標化する"
+        );
+    }
+
+    #[test]
+    fn islandless_target_must_be_interceptable_by_the_assigned_unit() {
+        let mut world = World::new();
+        let mut map = Map::new(7, 1, Terrain::Plains, GridTopology::Square);
+        for x in 2..7 {
+            map.set_terrain(x, 0, Terrain::Sea).unwrap();
+        }
+        world.insert_resource(IslandMap::analyze(&map));
+        world.insert_resource(map);
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+        let mut chart = DamageChart::new();
+        chart.insert_damage(UnitType::Bcopters, UnitType::Bcopters, 40);
+        world.insert_resource(chart);
+
+        let mut attacker_stats = combat_stats(UnitType::Bcopters, false, 0);
+        attacker_stats.movement_type = MovementType::Air;
+        attacker_stats.max_movement = 1;
+        attacker_stats.max_range = 1;
+        let attacker = world
+            .spawn((
+                Faction(PlayerId(1)),
+                GridPosition { x: 0, y: 0 },
+                attacker_stats,
+            ))
+            .id();
+        let mut enemy_stats = combat_stats(UnitType::Bcopters, false, 0);
+        enemy_stats.movement_type = MovementType::Air;
+        enemy_stats.max_movement = 6;
+        let remote_enemy = world
+            .spawn((
+                Faction(PlayerId(2)),
+                GridPosition { x: 6, y: 0 },
+                enemy_stats.clone(),
+            ))
+            .id();
+        let deployment = AssignedDeployment {
+            entity: attacker,
+            intent: PendingDeployment {
+                player_id: PlayerId(1),
+                turn: 3,
+                order: 0,
+                facility: GridPosition { x: 0, y: 0 },
+                unit_type: UnitType::Bcopters,
+                anchor: GridPosition { x: 0, y: 0 },
+                staging_anchor: GridPosition { x: 0, y: 0 },
+                posture: DeploymentPosture::Execute,
+                slot_kind: SlotKind::Combat,
+                priority_enemies: vec![remote_enemy],
+                threat_horizon: 2,
+                forecast: DeploymentForecast::default(),
+                plan_step: None,
+            },
+            squad_id: None,
+            current_target: Some(remote_enemy),
+            active: true,
+            assigned_turn: 3,
+            attack_count: 0,
+            priority_attack_count: 0,
+            mission_target_attack_count: 0,
+            mission_target_kill_count: 0,
+            mission_target_damage_value_dealt: 0,
+            mission_target_counter_value_received: 0,
+            mission_target_destroyed_value: 0,
+            mission_target_first_attack_turn: None,
+            capture_unit_attack_count: 0,
+            transport_unit_attack_count: 0,
+            kill_count: 0,
+            damage_value_dealt: 0,
+            counter_value_received: 0,
+            destroyed_value: 0,
+            first_attack_turn: None,
+        };
+
+        assert!(!target_within_operation(&world, &deployment, remote_enemy));
+        assert_eq!(
+            local_retarget(&mut world, &mut TerrainConnectivity::default(), &deployment),
+            None
+        );
+
+        let nearby_enemy = world
+            .spawn((
+                Faction(PlayerId(2)),
+                GridPosition { x: 2, y: 0 },
+                enemy_stats,
+            ))
+            .id();
+        assert_eq!(
+            local_retarget(&mut world, &mut TerrainConnectivity::default(), &deployment),
+            Some(nearby_enemy)
         );
     }
 }

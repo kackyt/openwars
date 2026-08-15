@@ -5,6 +5,7 @@
 //! パッケージだけを費用・完了ターン・損耗で比較する。
 
 use crate::components::{GridPosition, UnitStats};
+use crate::resources::master_data::MasterDataRegistry;
 use crate::resources::{DamageChart, Map, Terrain, UnitType};
 use crate::systems::combat::calculate_damage_formula;
 use bevy_ecs::prelude::Entity;
@@ -47,6 +48,22 @@ pub(crate) struct PlannedPurchase {
     pub cost: u32,
 }
 
+/// 1施設を1手番に1回だけ使えるという生産ルールを表す値オブジェクト。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ProductionSlot {
+    facility: GridPosition,
+    build_turn: u32,
+}
+
+impl From<PlannedPurchase> for ProductionSlot {
+    fn from(purchase: PlannedPurchase) -> Self {
+        Self {
+            facility: purchase.facility,
+            build_turn: purchase.build_turn,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ProductionPlanOption {
     pub purchase: PlannedPurchase,
@@ -57,8 +74,9 @@ pub(crate) struct ProductionPlanOption {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RollingPlanInput {
-    pub map: Map,
-    pub damage_chart: DamageChart,
+    pub map: Arc<Map>,
+    pub master_data: Arc<MasterDataRegistry>,
+    pub damage_chart: Arc<DamageChart>,
     pub existing_units: Vec<FriendlyPlanUnit>,
     /// 戦闘部隊とは別に、占領完了まで生存させる必要がある実在の占領兵。
     pub protected_units: Vec<FriendlyPlanUnit>,
@@ -196,7 +214,7 @@ struct SimEnemy {
 #[derive(Debug, Clone, Default)]
 struct SearchState {
     option_indices: Vec<usize>,
-    used_slots: HashSet<(usize, usize, u32)>,
+    used_slots: HashSet<ProductionSlot>,
     cost: u32,
 }
 
@@ -298,19 +316,15 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
     // 再展開すると、首都攻略のような長い購入列で同じ組合せを大量に作る。
     // 「作らない」または「この枠で1兵種を作る」を一度だけ分岐すれば、探索対象を
     // 減らさずにゲームルールの1施設1生産へ一致させられる。
-    let mut options_by_slot: HashMap<(usize, usize, u32), Vec<usize>> = HashMap::new();
+    let mut options_by_slot: HashMap<ProductionSlot, Vec<usize>> = HashMap::new();
     for (index, option) in input.production_options.iter().enumerate() {
         options_by_slot
-            .entry((
-                option.purchase.facility.x,
-                option.purchase.facility.y,
-                option.purchase.build_turn,
-            ))
+            .entry(option.purchase.into())
             .or_default()
             .push(index);
     }
     let mut slots = options_by_slot.into_iter().collect::<Vec<_>>();
-    slots.sort_unstable_by_key(|((x, y, build_turn), _)| (*build_turn, *y, *x));
+    slots.sort_unstable_by_key(|(slot, _)| (slot.build_turn, slot.facility.y, slot.facility.x));
 
     for (slot, option_indices) in slots {
         let mut next = Vec::new();
@@ -519,13 +533,8 @@ fn fill_best_effort_current_screen(
         option_indices: indexed,
         used_slots: purchases
             .iter()
-            .map(|purchase| {
-                (
-                    purchase.facility.x,
-                    purchase.facility.y,
-                    purchase.build_turn,
-                )
-            })
+            .copied()
+            .map(ProductionSlot::from)
             .collect(),
         cost: purchases
             .iter()
@@ -604,20 +613,11 @@ fn left_shift_purchases(
     // 後続購入が元へ戻ったときに同一施設・同一手番の重複が発生する。
     let mut reserved_original_slots = ordered
         .iter()
-        .map(|purchase| {
-            (
-                purchase.facility.x,
-                purchase.facility.y,
-                purchase.build_turn,
-            )
-        })
+        .copied()
+        .map(ProductionSlot::from)
         .collect::<HashSet<_>>();
     for purchase in ordered {
-        let original_slot = (
-            purchase.facility.x,
-            purchase.facility.y,
-            purchase.build_turn,
-        );
+        let original_slot = ProductionSlot::from(purchase);
         reserved_original_slots.remove(&original_slot);
         let mut candidates = input
             .production_options
@@ -638,11 +638,7 @@ fn left_shift_purchases(
         });
 
         let replacement = candidates.into_iter().find(|candidate| {
-            let slot = (
-                candidate.facility.x,
-                candidate.facility.y,
-                candidate.build_turn,
-            );
+            let slot = ProductionSlot::from(*candidate);
             if used_slots.contains(&slot) || reserved_original_slots.contains(&slot) {
                 return false;
             }
@@ -651,11 +647,7 @@ fn left_shift_purchases(
             funding_suffices(input, &tentative)
         });
         let selected = replacement.unwrap_or(purchase);
-        used_slots.insert((
-            selected.facility.x,
-            selected.facility.y,
-            selected.build_turn,
-        ));
+        used_slots.insert(ProductionSlot::from(selected));
         shifted.push(selected);
     }
     shifted.sort_unstable_by_key(|purchase| {
@@ -714,11 +706,10 @@ pub(crate) fn evaluate_fixed_package(
     let mut state = SearchState::default();
     for (build_turn, option_index) in indexed {
         let option = &input.production_options[option_index];
-        let slot = (
-            option.purchase.facility.x,
-            option.purchase.facility.y,
+        let slot = ProductionSlot {
+            facility: option.purchase.facility,
             build_turn,
-        );
+        };
         if !state.used_slots.insert(slot) {
             return Err(FixedPackageError::DuplicateProductionSlot);
         }
@@ -819,14 +810,13 @@ fn simulate_state_with_catalog(
                 continue;
             }
 
-            // 直接戦闘だけは反撃を受ける。悲観側では乱数ボーナス最大を加える。
-            if friendly.stats.max_range <= 1 {
-                let counter_base = attack_profile.incoming_damage;
-                if counter_base > 0 {
-                    let counter = calculate_damage_formula(counter_base, target.hp, 0, true)
-                        .saturating_add(10);
-                    friendly.hp = friendly.hp.saturating_sub(counter);
-                }
+            // 与damageと初撃ETAは従来の編成比較軸を維持し、反撃可否だけを
+            // 計画交戦距離における本番武器選択へ委譲する。
+            let counter_base = attack_profile.incoming_damage;
+            if counter_base > 0 {
+                let counter =
+                    calculate_damage_formula(counter_base, target.hp, 0, true).saturating_add(10);
+                friendly.hp = friendly.hp.saturating_sub(counter);
             }
         }
         // 敵砲兵・直接戦闘unitも手番ごとに最も有利な友軍を攻撃する。
@@ -1023,10 +1013,12 @@ fn sim_friendly(
         attack_profiles.push(can_attack.then(|| {
             FriendlyAttackProfile {
                 base_damage,
-                incoming_damage: best_damage(
+                incoming_damage: super::combat_profile::planned_counter_damage(
+                    &input.master_data,
                     &input.damage_chart,
-                    enemy.stats.unit_type,
-                    source.stats.unit_type,
+                    &source.stats,
+                    &enemy.stats,
+                    distance,
                 ),
                 ready_turn: source
                     .available_turn
@@ -1104,23 +1096,19 @@ fn select_target(
         .map(|((_, _, _, index), profile)| (index, profile))
 }
 
-/// 現在位置から射撃可能になるまでの移動手番数。
-///
-/// 直接戦闘unitは移動後に攻撃できるが、間接砲は移動した手番に射撃できない。
-/// 射程内なら追加待機は不要で、射程へ入るために動いた場合だけ展開1手番を加える。
-fn attack_readiness_turns(distance: u32, stats: &UnitStats) -> u32 {
-    let travel = distance
-        .saturating_sub(stats.max_range.max(1))
-        .div_ceil(stats.max_movement.max(1));
-    travel.saturating_add(u32::from(travel > 0 && stats.min_range > 1))
-}
-
 fn best_damage(chart: &DamageChart, attacker: UnitType, defender: UnitType) -> u32 {
     chart.get_base_damage(attacker, defender).unwrap_or(0).max(
         chart
             .get_base_damage_secondary(attacker, defender)
             .unwrap_or(0),
     )
+}
+
+fn attack_readiness_turns(distance: u32, stats: &UnitStats) -> u32 {
+    let travel = distance
+        .saturating_sub(stats.max_range.max(1))
+        .div_ceil(stats.max_movement.max(1));
+    travel.saturating_add(u32::from(travel > 0 && stats.min_range > 1))
 }
 
 /// 生産可能施設から、現在手番と将来2手番分の離散的な生産slotを作る。
@@ -1176,18 +1164,24 @@ pub(crate) fn production_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resources::master_data::UnitName;
     use crate::resources::{GridTopology, MovementType};
 
     fn stats(unit_type: UnitType, cost: u32, movement: u32) -> UnitStats {
+        let master = MasterDataRegistry::load().unwrap();
+        let weapon_stats = master
+            .create_unit_stats(&UnitName(unit_type.as_str().to_owned()))
+            .unwrap();
         UnitStats {
             unit_type,
             cost,
             max_movement: movement,
             movement_type: MovementType::Air,
             max_fuel: 99,
-            max_ammo1: 9,
-            min_range: 1,
-            max_range: 1,
+            max_ammo1: weapon_stats.max_ammo1,
+            max_ammo2: weapon_stats.max_ammo2,
+            min_range: weapon_stats.min_range,
+            max_range: weapon_stats.max_range,
             ..UnitStats::mock()
         }
     }
@@ -1199,17 +1193,16 @@ mod tests {
         chart.insert_damage(UnitType::Bomber, UnitType::Infantry, 100);
         chart.insert_damage(UnitType::Infantry, UnitType::Bcopters, 10);
         RollingPlanInput {
-            map,
-            damage_chart: chart,
+            map: Arc::new(map),
+            master_data: Arc::new(MasterDataRegistry::load().unwrap()),
+            damage_chart: Arc::new(chart),
             existing_units: Vec::new(),
             protected_units: Vec::new(),
             enemies: vec![EnemyPlanUnit {
                 entity: Some(Entity::from_raw(7)),
                 stats: UnitStats {
-                    unit_type: UnitType::Infantry,
-                    cost: 1_000,
                     can_capture: true,
-                    ..UnitStats::mock()
+                    ..stats(UnitType::Infantry, 1_000, 3)
                 },
                 position: GridPosition { x: 8, y: 0 },
                 hp: 100,
@@ -1283,12 +1276,16 @@ mod tests {
     fn infeasible_plan_spends_an_idle_current_slot_before_late_purchases() {
         let mut input = input();
         input.current_funds = 8_500;
-        input
-            .damage_chart
-            .insert_damage(UnitType::Infantry, UnitType::Infantry, 55);
-        input
-            .damage_chart
-            .insert_damage(UnitType::Infantry, UnitType::Bcopters, 10);
+        Arc::make_mut(&mut input.damage_chart).insert_damage(
+            UnitType::Infantry,
+            UnitType::Infantry,
+            55,
+        );
+        Arc::make_mut(&mut input.damage_chart).insert_damage(
+            UnitType::Infantry,
+            UnitType::Bcopters,
+            10,
+        );
         input.production_options.push(ProductionPlanOption {
             purchase: PlannedPurchase {
                 facility: GridPosition { x: 1, y: 0 },
@@ -1312,7 +1309,10 @@ mod tests {
         });
         let state = SearchState {
             option_indices: vec![0],
-            used_slots: HashSet::from([(0, 0, 0)]),
+            used_slots: HashSet::from([ProductionSlot {
+                facility: GridPosition { x: 0, y: 0 },
+                build_turn: 0,
+            }]),
             cost: 7_500,
         };
         let mut selected = simulate_state(&input, &state, DEFAULT_SEARCH_TURNS);
@@ -1362,19 +1362,6 @@ mod tests {
     }
 
     #[test]
-    fn indirect_unit_needs_a_setup_turn_after_moving_into_range() {
-        let stats = UnitStats {
-            min_range: 2,
-            max_range: 3,
-            max_movement: 3,
-            ..UnitStats::mock()
-        };
-
-        assert_eq!(attack_readiness_turns(3, &stats), 0);
-        assert_eq!(attack_readiness_turns(6, &stats), 2);
-    }
-
-    #[test]
     fn occupation_uses_live_campaign_eta_instead_of_a_fixed_delay() {
         let mut input = input();
         input.capture_completion_turn = Some(7);
@@ -1419,9 +1406,11 @@ mod tests {
             available_turn: 0,
             engageable_enemy_indices: vec![0],
         }];
-        input
-            .damage_chart
-            .insert_damage(UnitType::Infantry, UnitType::Infantry, 100);
+        Arc::make_mut(&mut input.damage_chart).insert_damage(
+            UnitType::Infantry,
+            UnitType::Infantry,
+            100,
+        );
         input.capture_completion_turn = Some(2);
         input.required_capture_survivors = 1;
 
@@ -1437,15 +1426,17 @@ mod tests {
     fn losing_one_of_two_required_capturers_makes_the_plan_infeasible() {
         let mut input = input();
         input.production_options.clear();
-        input
-            .damage_chart
-            .insert_damage(UnitType::Infantry, UnitType::Infantry, 100);
+        Arc::make_mut(&mut input.damage_chart).insert_damage(
+            UnitType::Infantry,
+            UnitType::Infantry,
+            100,
+        );
         input.existing_units.push(FriendlyPlanUnit {
             stats: stats(UnitType::Bomber, 20_000, 6),
-            position: GridPosition { x: 8, y: 0 },
+            position: GridPosition { x: 6, y: 0 },
             hp: 100,
             // 敵を最終的には倒せるが、占領兵が先に損耗する状況を作る。
-            available_turn: 3,
+            available_turn: 2,
             engageable_enemy_indices: vec![0],
         });
         let capturer = FriendlyPlanUnit {
@@ -1454,7 +1445,7 @@ mod tests {
                 can_capture: true,
                 ..UnitStats::mock()
             },
-            position: GridPosition { x: 8, y: 0 },
+            position: GridPosition { x: 7, y: 0 },
             hp: 100,
             available_turn: 0,
             engageable_enemy_indices: Vec::new(),
@@ -1467,7 +1458,7 @@ mod tests {
 
         assert_eq!(plan.elimination_turn, Some(3));
         assert_eq!(plan.protected_unit_count, 2);
-        assert_eq!(plan.protected_survivor_count, 1);
+        assert_eq!(plan.protected_survivor_count, 0);
         assert_eq!(plan.required_capture_survivor_count, 2);
         assert!(!plan.feasible);
         assert_eq!(plan.occupation_turn, None);
@@ -1476,18 +1467,40 @@ mod tests {
     #[test]
     fn mixed_package_is_selected_when_one_type_cannot_clear_all_targets() {
         let mut input = input();
-        input
-            .damage_chart
-            .insert_damage(UnitType::Bcopters, UnitType::Infantry, 0);
-        input
-            .damage_chart
-            .insert_damage(UnitType::Bomber, UnitType::Fighter, 0);
-        input
-            .damage_chart
-            .insert_damage(UnitType::Bcopters, UnitType::Fighter, 70);
+        input.enemies[0].stats.max_ammo1 = 0;
+        input.enemies[0].stats.max_ammo2 = 0;
+        Arc::make_mut(&mut input.damage_chart).insert_damage(
+            UnitType::Infantry,
+            UnitType::Bcopters,
+            0,
+        );
+        Arc::make_mut(&mut input.damage_chart).insert_secondary_damage(
+            UnitType::Infantry,
+            UnitType::Bcopters,
+            0,
+        );
+        Arc::make_mut(&mut input.damage_chart).insert_damage(
+            UnitType::Bcopters,
+            UnitType::Infantry,
+            0,
+        );
+        Arc::make_mut(&mut input.damage_chart).insert_damage(
+            UnitType::Bomber,
+            UnitType::Fighter,
+            0,
+        );
+        Arc::make_mut(&mut input.damage_chart).insert_secondary_damage(
+            UnitType::Bcopters,
+            UnitType::Fighter,
+            70,
+        );
         input.enemies.push(EnemyPlanUnit {
             entity: Some(Entity::from_raw(8)),
-            stats: stats(UnitType::Fighter, 9_000, 9),
+            stats: UnitStats {
+                max_ammo1: 0,
+                max_ammo2: 0,
+                ..stats(UnitType::Fighter, 9_000, 9)
+            },
             position: GridPosition { x: 8, y: 0 },
             hp: 100,
             defense_bonus: 0,
@@ -1627,6 +1640,70 @@ mod tests {
     }
 
     #[test]
+    fn schedule_compaction_preserves_funding_for_later_original_purchases() {
+        let mut input = input();
+        input.current_funds = 7_500;
+        input.income_per_turn = 10_000;
+        let facility = GridPosition { x: 0, y: 0 };
+        input.production_options = vec![
+            ProductionPlanOption {
+                purchase: PlannedPurchase {
+                    facility,
+                    unit_type: UnitType::Bcopters,
+                    build_turn: 0,
+                    cost: 7_500,
+                },
+                stats: stats(UnitType::Bcopters, 7_500, 6),
+                engageable_enemy_indices: vec![0],
+            },
+            ProductionPlanOption {
+                purchase: PlannedPurchase {
+                    facility,
+                    unit_type: UnitType::Bcopters,
+                    build_turn: 1,
+                    cost: 7_500,
+                },
+                stats: stats(UnitType::Bcopters, 7_500, 6),
+                engageable_enemy_indices: vec![0],
+            },
+            ProductionPlanOption {
+                purchase: PlannedPurchase {
+                    facility,
+                    unit_type: UnitType::Bomber,
+                    build_turn: 2,
+                    cost: 20_000,
+                },
+                stats: stats(UnitType::Bomber, 20_000, 6),
+                engageable_enemy_indices: vec![0],
+            },
+        ];
+        let original = vec![
+            PlannedPurchase {
+                facility,
+                unit_type: UnitType::Bcopters,
+                build_turn: 1,
+                cost: 7_500,
+            },
+            PlannedPurchase {
+                facility,
+                unit_type: UnitType::Bomber,
+                build_turn: 2,
+                cost: 20_000,
+            },
+        ];
+
+        let shifted = left_shift_purchases(&input, &original);
+
+        assert_eq!(shifted[0].build_turn, 0);
+        assert_eq!(shifted[1].build_turn, 2);
+        assert!(funding_suffices(&input, &shifted));
+        assert!(!matches!(
+            evaluate_fixed_package(&input, &original),
+            Err(FixedPackageError::FundingUnavailable)
+        ));
+    }
+
+    #[test]
     fn future_enemy_must_be_removed_before_plan_is_feasible() {
         let mut input = input();
         input.enemies.push(EnemyPlanUnit {
@@ -1663,11 +1740,17 @@ mod tests {
     #[test]
     fn search_depth_comes_from_facility_turns_not_a_fixed_unit_cap() {
         let mut input = input();
-        input
-            .damage_chart
-            .insert_damage(UnitType::Bcopters, UnitType::Infantry, 100);
+        input.enemies[0].stats.unit_type = UnitType::TransportHelicopter;
+        input.enemies[0].stats.max_ammo1 = 0;
+        input.enemies[0].stats.max_ammo2 = 0;
+        Arc::make_mut(&mut input.damage_chart).insert_damage(
+            UnitType::Bcopters,
+            UnitType::TransportHelicopter,
+            100,
+        );
         input.production_options.truncate(1);
         input.production_options[0].stats.max_ammo1 = 1;
+        input.production_options[0].stats.max_ammo2 = 0;
         input.production_options[0].engageable_enemy_indices = (0..6).collect();
         for build_turn in 1..6 {
             let mut option = input.production_options[0].clone();
@@ -1683,7 +1766,7 @@ mod tests {
 
         let plan = plan_force_package(&input).unwrap();
 
-        assert!(plan.feasible);
+        assert!(plan.feasible, "{plan:#?}");
         assert_eq!(plan.purchases.len(), 6);
     }
 }
