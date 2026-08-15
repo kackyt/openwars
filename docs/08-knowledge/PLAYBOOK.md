@@ -1,6 +1,6 @@
 ---
 title: "PLAYBOOK"
-version: "1.17.0"
+version: "1.18.0"
 status: "approved"
 created: "2026-06-06"
 updated: "2026-08-15"
@@ -155,795 +155,84 @@ Playbook が 800 行を超えた場合、以下のように分割する：
 
 ---
 
-## エントリ一覧
-
-<!-- ここから下にエントリを追記してください。最新のエントリが末尾になるように追記します。 -->
-<!-- 追記例:
-<a id="ace-XXX"></a>
-
-### ACE-XXX: N+1クエリの発生パターンと防止策
-
-| フィールド | 値 |
-|-----------|---|
-| Category | performance |
-| Origin | PR #42 |
-| Date | 2026-03-15 |
-| Helpful | 0 |
-| Harmful | 0 |
-| Status | active |
-
-**Insight**: User モデルの関連を eager loading せずに一覧取得すると N+1 クエリが発生する。
-
-**Context**: PR #42 のレビューで、ユーザー一覧APIのレスポンスタイムが3秒超になっていた。原因は各ユーザーの所属組織を個別クエリで取得していたこと。
-
-**Action**: 一覧取得時は `include` オプションで関連を一括取得する。`findMany({ include: { organization: true } })`
--->
-
-<a id="ace-47-1"></a>
-
-### ACE-47-1: AIの部隊管理におけるユニットの解放忘れと再搭乗ループ防止
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | architecture |
-| Origin     | PR #47 |
-| Date       | 2026-06-08 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: AIの部隊（Squad）ロジックにおいて、任務完了後に部隊を明示的に解散（解放）しないと、所属ユニットがフリー状態と認識されず、次の行動（占領や帰還など）に移行できなくなる。また、ピストン輸送の際は「すでに目標地点にいるユニット」を対象から除外しないと無限ループに陥る。
-
-**Context**: V2 AIの輸送ロジックにおいて、歩兵を降ろした後も輸送部隊が解散されなかったため、歩兵が占領行動に移らず、空の輸送ヘリも帰還しない不具合が発生した。さらに、降ろした歩兵を再度拾ってしまう問題があった。
-
-**Action**: 任務完了時（例：輸送のDropフェーズ完了時）に即座に部隊を解散（`return true;`などで解放）し、個々のユニットが自律的な次のタスク評価（タクシー帰りや占領など）を受けられるようにする。輸送対象の探索時には「すでに目標地点にいるか」のフィルタリング処理を必ず実装する。
-
-<a id="ace-47-2"></a>
-
-### ACE-47-2: ECSクエリのループ内呼び出しによるオーバーヘッド回避
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | performance |
-| Origin     | PR #47 |
-| Date       | 2026-06-08 |
-| Helpful    | 1 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: `width * height` のような大規模なループ内で変化しないエンティティのコンポーネント（`UnitStats` など）を毎回 `world.get::<T>` で取得すると、ECSのクエリオフセットが累積してパフォーマンス低下を招く。
-
-**Context**: AIの輸送待ち合わせタイルの計算時、マップ全域のループ（`width * height`）内で、対象となる輸送貨物（カーゴ）の `UnitStats` を毎ループ取得していたため無駄な処理が発生していた。
-
-**Action**: ループ内で変化しない ECS コンポーネントへのアクセスは、必ずループの外で1度だけ取得し、変数にキャッシュして再利用する。
-
-<a id="ace-47-3"></a>
-
-### ACE-47-3: 探索アルゴリズム内の Vec::contains によるパフォーマンス低下の回避
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | performance |
-| Origin     | PR #47 |
-| Date       | 2026-06-08 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: ダイクストラ法などの経路探索アルゴリズムのループ内で `Vec::contains` を多用すると、線形探索（O(N)）となり重大なパフォーマンスのボトルネックになる。
-
-**Context**: AIの距離計算（`calculate_turn_distance`）において、有効なターゲット一覧を `Vec` で保持し、探索ループ内で毎回 `effective_targets.contains(&position)` を呼び出していたため計算量が増大していた。
-
-**Action**: 探索のルックアップ対象となるコレクションは `std::collections::HashSet` を使用し、判定を O(1) に高速化する。
-
-<a id="ace-52-1"></a>
-
-### ACE-52-1: AI評価における主観メトリクスと客観メトリクスの分離
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | testing |
-| Origin     | PR #52 |
-| Date       | 2026-06-13 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: AIの評価において、主観的メトリクス（AI内部の計算式に依存）と客観的メトリクス（バージョン非依存）を分離することで、AIの強さを定量的かつ客観的に比較・検証可能にする。
-
-**Context**: PR #52 でAIの評価関数を更新した際、新旧AIの性能を定量的に比較するために、AI内部のスコア内訳（主観）と、支配面積・ターン収入・拠点数といったバージョンに依存しないメトリクス（客観）を分離して出力する基盤を構築した。
-
-**Action**: AIの性能向上を検証する基盤を設計する際は、AI自身が計算するスコアに頼るのではなく、支配面積や収入などバージョン非依存の客観的指標（Objective Metrics）を定義し、それで合否や優劣を判定する。
-
-<a id="ace-52-2"></a>
-
-### ACE-52-2: ROI等の蓄積指標と盤面評価（スコア）の二重計上防止と分離
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | architecture |
-| Origin     | PR #52 |
-| Date       | 2026-06-13 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: 戦闘の効率や損益（ROI）などの蓄積指標を盤面の評価スコアに直接加算すると、現在盤面におけるユニットHPやユニット数などの静的評価と二重計上になり、評価が歪む原因となる。
-
-**Context**: PR #52 で与/被ダメージのゴールド換算価値を累積するROI計測を導入した際、`CombatLedger` というリソースに計測用として分離し、盤面評価スコアには加算しない設計とした。
-
-**Action**: 戦闘結果や累積損益（ROI）のような履歴・蓄積データは、盤面の直接評価には組み込まず、専用の計測リソース（`CombatLedger` 等）として分離する。これにより、純粋な計測用途や上位の戦略判断の材料として利用できるようにする。
-
-<a id="ace-57-1"></a>
-
-### ACE-57-1: O(N) オーバーヘッドを回避する Vec の pop() による要素取り出し
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | performance |
-| Origin     | PR #57 |
-| Date       | 2026-07-11 |
-| Helpful    | 1 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: ベクター（Vec）から条件に合う要素を取り出す際、先頭から `remove(0)` などで取り出すと要素のシフトによる O(N) のコストが発生する。
-
-**Context**: PR #57 のレビューにおいて、部隊割り当ての処理で戦闘ユニットをリストから割り当てる際、ベクターの先頭からの削除が O(N) のシフトを伴い非効率であることが指摘された。
-
-**Action**: 要素を評価値などの「低い順」や「不要な順」に逆順ソート（reverse）し、末尾（最も必要な要素）から `pop()` で取り出すことで、O(1) のコストで効率的に要素を取り出して割り当てる。
-
-<a id="ace-57-2"></a>
-
-### ACE-57-2: 部隊（Squad）全滅時の解散漏れによる目標リソースの永久予約バグの防止
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | architecture |
-| Origin     | PR #57 |
-| Date       | 2026-07-11 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: 占領目標などを予約している部隊（Squad）に所属する全ユニットが破壊された場合、部隊自体を解散させないと、目標が「幽霊部隊」によって永久に予約されたままになる。
-
-**Context**: PR #57 において、占領部隊が敵の攻撃で全滅したにもかかわらず部隊データが残り、対象の拠点が「他の部隊が向かっている」と判定されて再アサインされなくなるバグが解消された。
-
-**Action**: ターン開始時や部隊状態の評価時に、部隊に所属するエンティティがまだ存在するかを確認し、有効なユニットが 0 になった部隊は直ちに解散（削除）して、予約していた目標リソースを解放する。
-
-<a id="ace-57-3"></a>
-
-### ACE-57-3: 価値交換と交戦成立率に基づく動的なカウンター生産評価
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | architecture |
-| Origin     | PR #57 |
-| Date       | 2026-07-11 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: 敵の編成に対するカウンター生産の評価を、単純なユニット頭数や相性テーブルではなく、「与えるダメージ価値」から「受けるダメージ価値」を引いた「価値交換ベース」で行い、機動力や射程による「交戦成立率」で割り引くことで、状況に応じた動的なカウンターを導出できる。
-
-**Context**: PR #57 にて、AI V3 の生産評価ロジックが改善された。従来の頭数加算から、ユニット間の相対的な価値交換に基づくモデルに置換したことで、例えば「対ロケットランチャーには射程外から攻撃できる重自走砲」といったカウンターが自動的に選択されるようになった。
-
-**Action**: AI の生産やターゲティング評価において、固定のメタ（例: AはBに強い）をハードコードするのではなく、「予想されるダメージ交換の価値」と「接敵する確率（射程や移動力）」を掛け合わせた期待値計算を実装する。
-
-<a id="ace-59-1"></a>
-
-### ACE-59-1: Hot pathでの動的ディスパッチ（dyn Trait）回避によるパフォーマンス改善
-
-| フィールド | 値           |
-| ---------- | ------------ |
-| Category   | performance  |
-| Origin     | PR #59       |
-| Date       | 2026-07-12   |
-| Helpful    | 0            |
-| Harmful    | 0            |
-| Status     | active       |
-
-**Insight**: 距離計算や隣接判定などの頻繁に呼ばれる hot path において、`dyn Trait` による動的ディスパッチを避けることでパフォーマンスのボトルネックを解消できる。
-
-**Context**: PR #59 のヘックスグリッド対応にて、グリッド形状の抽象化に `dyn GridGeometry` を用いたが、レビューにてパフォーマンス懸念が指摘された。解決策として、`GridTopology` enum 内の `match self` によって各構造体に処理を委譲する静的ディスパッチ方式に変更された。
-
-**Action**: ゲームループ内の hot path ではポリモーフィズムの実現に `dyn Trait`（動的ディスパッチ）を避け、列挙型（enum）による `match` 分岐（静的ディスパッチ）を採用する。
-
-<a id="ace-63-1"></a>
-
-### ACE-63-1: Zustandストア設計での不要な再レンダリング防止（Zustand Selectors）
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | performance |
-| Origin     | PR #63 |
-| Date       | 2026-07-16 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: React × Zustand 構成において、コンポーネントがストアの全体オブジェクトを分割代入するのではなく、個別の `state => state.xxx` をセレクタ経由で購読するように変更し、不要な再描画を抑制する。
-
-**Context**: PR #63 にて、フロントエンドのパフォーマンス改善のため、ストア全体を分割代入して購読していたコンポーネントを、Zustand のセレクタ（例: `const currentTurn = useGameStore(state => state.currentTurn)`）を使用する形にリファクタリングした。これによって、関連のない状態変更時に無駄な再レンダリングが走るのを防いだ。
-
-**Action**: Zustand を使用する場合は、`const { a, b } = useStore()` ではなく、`const a = useStore(s => s.a); const b = useStore(s => s.b)` のように個々のセレクタを使用して状態を購読することを徹底する。
-
-<a id="ace-63-2"></a>
-
-### ACE-63-2: WebAssembly / Web Worker での安全なエラー境界 (ErrorBoundary) の適用
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | architecture |
-| Origin     | PR #63 |
-| Date       | 2026-07-16 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: Rust (WASM) や Web Worker のようにメインスレッド外で動作する重いゲームロジックがクラッシュした際に、アプリケーション全体が真っ白になるのを防ぐため、WASM / Worker 連携部の直上に React の ErrorBoundary を設置して安全なフォールバックと回復手段を提供する。
-
-**Context**: PR #63 にて、WASM 統合に伴い `ErrorBoundary` コンポーネントを新規実装し、ゲームキャンバスやコントロールパネルを含むゲーム領域全体を包むことで、WASMエンジンやWorkerでの不測のパニック・クラッシュから回復し、安全なエラー画面の提示と再起動を可能にした。
-
-**Action**: Rust / WASM を React アプリケーションに統合する際は、WASM エンジンを使用するコンポーネントの最上位層に必ず `ErrorBoundary` を配置し、例外発生時にクラッシュをキャッチしてユーザーに適切なフィードバックと再試行手段を提供する。
-
-<a id="ace-63-3"></a>
-
-### ACE-63-3: RustのWASMバインディングにおけるヒープアロケーション削減（std::slice::from_ref）
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | performance |
-| Origin     | PR #63 |
-| Date       | 2026-07-16 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: Rust/WASMバインディング層で単一の要素をスライスとして渡す際、`vec![item]` などの動的アロケーションを伴う Vec を構築するのではなく、`std::slice::from_ref(&item)` を使用することで、ヒープアロケーションを回避し、高頻度で実行されるWASM-JS間ブリッジ処理のパフォーマンスを大幅に向上できる。
-
-**Context**: PR #63 のコードレビューにおいて、WasmEngine バインディング層で単一の要素を一時的な Vec に包んで渡していた箇所が指摘された。これを `std::slice::from_ref` による参照のスライス化、および `MasterDataRegistry` などの巨大な読み取り専用データを参照渡し (`&MasterDataRegistry`) に変更することで、アロケーション回数を劇的に削減した。
-
-**Action**: WASM バインディング層やゲームループの Hot path で単一要素をスライス（`&[T]`）として要求する関数に渡す場合は、`vec![x]` や配列アロケーションを避け、`std::slice::from_ref(&x)` を使用してスタック上の参照からスライスを作成する。また、読み取り専用のマスターデータ等は値コピーを避け、必ず参照で引き回す。
-
-<a id="ace-64-1"></a>
-
-### ACE-64-1: セーブ・ロードにおける空の輸送コンポーネント復元漏れバグの防止
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | architecture |
-| Origin     | PR #64 |
-| Date       | 2026-07-18 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: セーブデータから ECS コンポーネントを復元する際、「現在中身が空（例：積載数ゼロ）」という理由でコンポーネント（`CargoCapacity` など）の生成・アタッチをスキップすると、ロード後にそのユニットの本来の機能（積載機能など）が失われる。
-
-**Context**: 輸送ユニットの積載リストが空（`loaded_ids: []`）の場合に `CargoCapacity` を復元しなかったため、ロード後にユニットが「積載容量ゼロ」と判定され、新規積載ができなくなるバグが発生した。
-
-**Action**: 復元ロジックでは、リストが空であっても統計情報（`max_cargo > 0`）からその機能を持つべきと判定できる場合は、必ず空のコンポーネントを初期化してアタッチする。また、テストコードには「空の状態で保存→ロードされた後に本来の機能が正常動作するか」の検証を含める。
-
-<a id="ace-64-2"></a>
-
-### ACE-64-2: コアゲームエンジンにおける anyhow 依存排除と thiserror による型安全なエラー境界
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | architecture |
-| Origin     | PR #64 |
-| Date       | 2026-07-18 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: コアエンジン層（ドメインやシリアライズ等のインフラに近いレイヤー）のパブリックAPIで `anyhow` を使用すると、上位層（Tauri/WASMバインディングやGUI/CLI）がエラー原因（署名不一致、フォーマット不正など）を型安全に識別・処理することが不可能になり、エラーの隠蔽や UI でのフォールバック失敗を招く。
-
-**Context**: `engine` クレートがセーブデータのインポート処理などで `anyhow::Result` を返していたため、呼び出し側の React (WASM経由) や CLI がロード失敗の詳細原因を区別できず、一律で UI モーダルを閉じる等の不適切なハンドリングが起きていた。
-
-**Action**: コア層・インフラ層では `thiserror` を用いて詳細なカスタムエラー型（例：`SaveError`）を定義し、呼び出し側がエラーバリアントを識別できるようにする。UIやバインディング層などの「エラーの境界」においてのみ、表示用メッセージへの変換や `anyhow` への集約を行う。
-
-<a id="ace-64-3"></a>
-
-### ACE-64-3: useCallback を用いた React ライフサイクル関数の安定化とリンター警告解消
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | tooling |
-| Origin     | PR #64 |
-| Date       | 2026-07-18 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: React の `useEffect` 内でストア操作やリフレッシュ用のコールバック関数を呼び出す際、依存配列にその関数を含めないと Biome 等のリンターで `useExhaustiveDependencies` 警告（エラー）が発生し、状態の同期バグを誘発する。
-
-**Context**: `SaveLoadModal` の `useEffect` 内で、スロットの更新処理 `refreshSlots` を呼んでいたが、依存配列に含まれていなかったため Biome リンターによるビルドエラーが発生した。
-
-**Action**: `useEffect` から参照される外部関数は、親コンポーネント側で `useCallback` を用いてメモ化（参照を安定化）した上で、効果の依存配列（dependency array）に明示的に含める。
-
-<a id="ace-65-1"></a>
-
-### ACE-65-1: スナップショットとイベントストリームを分離した軽量対戦ログ設計
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | architecture |
-| Origin     | PR #65 |
-| Date       | 2026-07-20 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: ゲーム対戦ログの記録において、毎アクションごとに全盤面状態をダンプするのではなく、ターン開始時の状態スナップショット（State Snapshot）と離散的な行動イベント（Event Stream）を分離して単一の JSONL ストリームに出力することで、ログ容量を最小限に抑えつつ戦況と意思決定を完全に再構成可能にする。
-
-**Context**: PR #65 にて CLI 対戦時のログ収集を実装。盤面全体データ（Snapshots）と移動・生産・補給・AI評価等の各イベント（Events）を分離した JSONL フォーマットを採用したことで、軽量なログ出力と詳細な事後解析スクリプト（Python/スキル）の両立を実現した。
-
-**Action**: 対戦ログやシミュレーション結果の記録基盤を設計する際は、状態のフルダンプを避け、定期的なアンカー（スナップショット）と各システムから発行される標準化イベントの組み合わせによる JSONL ストリーム構造を採用する。
-
-<a id="ace-65-2"></a>
-
-### ACE-65-2: AI思考評価ログの可視化とLLMエージェントによる自律敗因分析
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | tooling |
-| Origin     | PR #65 |
-| Date       | 2026-07-20 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: AIの内部評価スコアや行動選択肢を対戦ログのイベントとして出力し、専用のパーススクリプトおよび分析スキルを整備することで、勝敗結果だけでなく「なぜそのターンに不合理な判断をしたか」を LLM/AI エージェントが自律的にデバッグ・評価改善できる。
-
-**Context**: PR #65 では `cli/src/logger.rs` と `scripts/analyze_battle_log.py` に加え、`.rulesync/skills/openwars-battle-analyzer` スキルを追加。AIが対戦ログから特定のターンにおける評価関数の失敗や期待値計算の誤りを自律的に検出・レポーティングできる基盤を確立した。
-
-**Action**: AIゲームエンジンの思考ロジックを開発・検証する際は、結果（勝率）のみを記録するのではなく、AI内部の選択肢評価イベント（`AiEvaluationEvent` 等）を対戦ログに記録し、LLM/AIエージェントが直接ログを分析して改善策を立案できる分析ツールチェーンとスキルを併せて提供する。
-
-<a id="ace-67-1"></a>
-
-### ACE-67-1: マスターデータの定義順（ロード順）保持によるUI一覧順序の全環境統一
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | architecture |
-| Origin     | PR #67 / Issue #66 |
-| Date       | 2026-07-20 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: CSV や設定ファイルから読み込まれるマスターデータを HashMap や BTreeMap などのキー順コレクションのみで保持すると定義順が失われ、UIごとの表示順が不一致になる。登録時にロード順（`Vec<Id>` 等）を保持し、パブリック一覧 API でその順序にソートして返すことで全フロントエンド（CLI/Web）での一貫性を保証できる。
-
-**Context**: PR #67 (Issue #66) において、生産可能ユニットの並び順が CLI と Web (WASM) で異なったりマスターデータ変更が反映されない問題が発生したため、`MasterDataRegistry` に `unit_order` を追加してロード順を統制した。
-
-**Action**: マスターデータを保持するリソースやレジストリを設計する際は、単なる Map 格納だけでなく定義順を記録する Vec (`unit_order` 等) を保持し、データ取得用 API ではその定義順に基づいてソートしてリストを返す設計とする。
-
-<a id="ace-67-2"></a>
-
-### ACE-67-2: 固定UIパネルによるマップ遮蔽を防ぐカメラパディング制御
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | coding |
-| Origin     | PR #67 / Issue #66 |
-| Date       | 2026-07-20 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: 画面端や四隅に固定表示されるUIパネル（ターン表示、ユニット情報パネル等）が存在するキャンバス/マップビューでは、単にマップ外周にカメラをクランプするとマップ端のセルが固定UIに隠れて操作不能になる。カメラ座標クランプ処理にUIサイズに応じた可逆なパディング（スクロール余白）を設定することで、すべてのセルを安全域までスクロール可能にする。
-
-**Context**: PR #67 において、Web版で画面右上の TurnIndicator や左下の UnitInfoPanel にマップ端のヘックスが被り、ドラッグ/スクロールを行ってもクリック・操作が困難になる現象が発生したため、`clampCameraPosition` に `CAMERA_PADDING_*` を組み込んで解剖・解決した。
-
-**Action**: ビューポート上にオーバーレイ UI を配置するマップビューやゲームビューのカメラクランプ関数を実装する際は、単にビューポート枠 `[0, mapSize - windowSize]` にクランプするのではなく、固定UIの占有エリアに応じたカメラパディング（`CAMERA_PADDING_TOP` 等）を境界値に加算・減算してスクロール移動範囲を拡張する。
-
-<a id="ace-71-1"></a>
-
-### ACE-71-1: プレゼンテーション層の操作可否判定を engine へ集約する
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | architecture |
-| Origin     | PR #71 |
-| Date       | 2026-07-25 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: ユニット選択・再移動・生産などの操作可否をフロントエンドが ECS 状態から独自に再現すると、engine のルール変更と乖離して敵軍選択や不正な再移動表示を許しやすい。操作可否は engine の意味的な問い合わせ API に集約し、UI は結果に従って表示と遷移だけを行う。
-
-**Context**: PR #71 では Web 版が `is_exhausted` や拠点所有情報を使って操作可否を部分的に判断していたため、相手軍ユニットを選択できる、搭載・降車後の輸送ユニットを再移動できるように表示する、といった不整合が発生した。`is_unit_selectable`、`can_unit_move`、`is_unit_moved_at` を engine に追加し、WASM / Worker 経由で React ストアから利用する構成へ変更した。
-
-**Action**: 新しい UI 操作を追加するときは、まず engine に `is_*` / `can_*` または候補一覧を返す問い合わせ API を実装し、WASM・Worker には薄い委譲だけを置く。engine の状態組み合わせを検証する単体テストと、その返値に応じた UI 状態遷移のテストを対にして追加し、フロントエンドで同じゲームルールを再実装しない。
-
-<a id="ace-71-2"></a>
-
-### ACE-71-2: 条件付きルールの共通 predicate を候補列挙・探索・実行で再利用する
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | architecture |
-| Origin     | PR #71 |
-| Date       | 2026-07-25 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: 「通常は不可能だが特定条件では可能」というルールを、候補表示・経路探索・コマンド実行の各処理へ別々に記述すると判定がずれる。条件を共通 predicate に抽出して全経路で再利用し、搭載先のように到達した時点で行動が確定するマスは経路探索の終端として扱う。
-
-**Context**: PR #71 の浅瀬搭載では、自軍輸送船・空き容量・搭載可能タイプ・浅瀬という条件を満たす場合だけ陸上ユニットの移動コストを 1 にする必要があった。`is_boardable_shoal_transport` を到達可能範囲と A* の双方で利用し、搭載先から先へ探索を拡張しないようにした。また、輸送船の降車可能地形は `can_unload_from_terrain` を候補列挙と実行時検証で共有した。
-
-**Action**: 条件付き例外を実装するときは、地形・所有者・容量・対象タイプなど必要条件を一つの純粋な predicate にまとめ、プレビュー、到達可能範囲、経路探索、実行時バリデーションのすべてから呼び出す。例外マスが行動の終点なら探索をそこから拡張せず、A* でも目的地の場合だけ進入可能にする。敵軍・満載・対象外タイプ・通常地形・例外マス通過の境界テストを揃える。
-
-<a id="ace-71-3"></a>
-
-### ACE-71-3: 行動種別は静的能力ではなく実際の実行文脈で判定する
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | coding |
-| Origin     | PR #71 |
-| Date       | 2026-07-25 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: 行動の性質が距離や位置によって変わる場合、マスターデータの静的属性だけで分類してはならない。射程 1〜3 の武器は距離 1 では直接攻撃、距離 2 以上では間接攻撃になるため、移動後制限は実際の攻撃距離から判定する必要がある。
-
-**Context**: PR #71 では間接攻撃を `weapon.range_min > 1` で判定していたため、最小射程 1 の重戦車が移動後でも距離 2 以上へ攻撃できた。`is_indirect_attack(distance)` に置き換え、攻撃可否判定、攻撃対象列挙、武器選択のすべてで実距離に基づく分類へ統一した。
-
-**Action**: 行動種別や制約がランタイム条件で変化する場合は、実際の距離・目的地・状態を受け取る純粋関数へ分類ロジックを抽出し、候補列挙・事前検証・実行・結果計算の全経路で共有する。境界値を挟むテスト（距離 1 / 2、移動前 / 移動後）と、複合射程ユニット・間接専用ユニットの双方を追加する。
-
-<a id="ace-81-1"></a>
-
-### ACE-81-1: 輸送部隊の状態遷移マシン化と複数カーゴの明示的フェーズ管理
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | architecture |
-| Origin     | PR #81 |
-| Date       | 2026-07-27 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: 複合的な協力行動（海を跨ぐ上陸・輸送）を単一ステップや暗黙のパラメータで処理するとデッドロックや不整合を起こしやすい。`Pickup → Load → Transit → Drop → Return` の明確な状態遷移と役割分担をステートマシンとしてモデル化し、フェーズ完了時に次の部隊・タスクへ安全に引き渡す。
-
-**Context**: PR #81 にて、従来の単一カーゴ・暗黙的な集合管理から、複数カーゴを明示的に扱い、状態で安全域や上陸・降車地点を判定する設計に変更したことで、上陸から拠点占領・攻撃部隊への円滑な引き渡しを実現した。
-
-**Action**: 複数ユニットが協調する複雑なミッション（輸送・護衛・包囲等）を実装する際は、明示的な状態（Phase / State Enum）を定義し、各フェーズごとの不変条件（Guard）と完了時のタスク引き渡しロジックをカプセル化する。
-
-<a id="ace-81-2"></a>
-
-### ACE-81-2: 間接攻撃脅威評価の独立モジュール化と危険地帯評価の共有
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | architecture |
-| Origin     | PR #81 |
-| Date       | 2026-07-27 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: 移動・上陸・防衛などの各評価ロジックが独自に被ダメージ（間接攻撃の射程・火力）を個別計算すると、過剰回避や計算式のブレ、バグ（HPキャップ二重適用等）の原因となる。脅威評価を独立モジュールへ抽出し、各評価関数から同一の計算ロジックを参照させる。
-
-**Context**: PR #81 において、上陸地点の安全評価と通常移動での危険度評価が個別に実装・重複していたため、間接攻撃の被害予測ロジックを `threat.rs` へ一括抽出し共通利用することで計算の一貫性を保ちつつ二重計算バグを防いだ。
-
-**Action**: 敵からの被攻撃リスクや脅威度計算が複数箇所（移動評価、拠点選定、上陸地点評価等）に及ぶ場合は、単一の脅威評価モジュール（`threat.rs` 等）に計算をカプセル化し、各評価関数はこれを参照して安全度を評価する設計とする。
-
-<a id="ace-82-1"></a>
-
-### ACE-82-1: エンティティID追跡による複合行動パイプラインのシーケンス成立検証
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | testing |
-| Origin     | PR #82 |
-| Date       | 2026-07-27 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: 勝敗やスコアなどのマクロな結果指標ではなく、エンティティIDをキーにしたイベントトレース（Load → Unload → Attack/Capture）を収集し、特定の行動シーケンスが一定ターン内に成立したかを判定基準とすることで、複合AIパイプラインを決定的に検証できる。
-
-**Context**: PR #82 にて島嶼侵攻AIの性能検証を行う際、ゲームの勝敗や最終スコアは相手の挙動や盤面全体に左右されるため合否判定から除外し、`InvasionTraceCollector` により「同一カーゴIDの搭載・敵島上陸・攻撃/被攻撃/占領開始」という一連のライフサイクルが達成されたか否かを判定基準（Criteria）として評価・テストした。
-
-**Action**: 勝敗や全体スコアでは検証しづらい多段階の行動・協力パイプライン（例: ピストン輸送〜敵地展開〜拠点攻撃）を検証する際は、構成ユニットの Entity ID で関連イベントを相関させるトレース収集メカニズムを実装し、その状態遷移シーケンスの成否を明示的な評価基準として定義する。
-
-<a id="ace-82-2"></a>
-
-### ACE-82-2: Rust テストコードにおける nightly 機能 (let_chains) 回避による stable 互換性維持
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | coding |
-| Origin     | PR #82 |
-| Date       | 2026-07-27 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: テストコード内であっても `let_chains` (`if let ... && let ...`) のような Rust の nightly 限定の実験的構文を使用すると、標準の stable ツールチェーン環境でコンパイルエラーを引き起こす原因となる。
-
-**Context**: PR #82 のテストコード実装時に `if let` の連鎖条件構文を使用したところ、コードレビューにおいて stable Rust で非互換となる nightly機能 (`let_chains`) の使用が指摘され、ネストした `if let` または `match` 構文へ修正された。
-
-**Action**: テストコードを含めすべての Rust コードにおいて nightly 限定機能のうっかり使用を避け、stable ツールチェーンで通過する標準的な構文（ネストされた `if let` や `match` またはパターンマッチの平坦化）を使用する。
-
-<a id="ace-83-1"></a>
-
-### ACE-83-1: 特殊戦略需要による汎用需要の無条件上書きと生産ブロッキングの防止
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | architecture |
-| Origin     | PR #83 |
-| Date       | 2026-08-01 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: ドメイン特有の特殊戦術需要（例：島嶼キャンペーン需要）でゲーム全体の汎用需要（占領・戦力生産など）を無条件で上書きしたり、未達成要求によってターン全体の汎用生産を全面ブロックすると、地続きマップや資源不足時に汎用行動が停止し重大な回帰を引き起こす。
-
-**Context**: PR #83 にて V3 AI に島嶼キャンペーン・ポートフォリオを導入した際、キャンペーン集計値で全体の汎用需要を上書きし、かつ要求未達成時に汎用生産を全面ブロックしていたため、地続きマップ（map_1/map_2）で後攻の戦力生産と占領需要が消失し、ZOCが急落する回帰が発生した。
-
-**Action**: 戦略AIの需要評価において、特殊戦術需要と汎用需要は `max` や加算などのフォールバック合成を行い、高優先要求が今ターン内に完了できなくても、残余予算と施設で汎用生産へフォールバックする安全な防御構造を設ける。
-
-<a id="ace-83-2"></a>
-
-### ACE-83-2: ドメイン概念の判定範囲を本来の前提条件（海上輸送を要する別陸塊）へ限定する境界設計
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | architecture |
-| Origin     | PR #83 |
-| Date       | 2026-08-01 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: グラフ探索やフラッドフィル等による幾何学的なエリア抽出結果を、そのままドメイン概念（例：島嶼判定）として扱うと、単一の大陸を「島」と誤認して過剰な戦略要求を生成してしまう。
-
-**Context**: PR #83 において `IslandMap::analyze` でSea以外のセルをフラッドフィルした際、地続きの単一主要陸塊も `Island` として抽出されたため、敵味方が混在する通常陸上戦が `Contested island` と判定され、マップ全体の敵戦力に基づく過大な `Reinforce` 要求が発生した。
-
-**Action**: ドメイン概念の分類関数（`classify_island` 等）では、幾何学的分割に加えて「実際に海上輸送を必要とする離脱陸地か」といったドメイン本来の前提条件でフィルタリングし、不要なドメインロジックへの巻き込みを防ぐ。
-
-<a id="ace-83-3"></a>
-
-### ACE-83-3: ターン限定キャッシュにおける状態更新（mark/set）の呼び出しと実効性検証
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | testing |
-| Origin     | PR #83 |
-| Date       | 2026-08-01 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: ターン内限定のキャッシュ構造体（`TurnScopedCache` 等）を追加した際、キャッシュの参照（get/check）処理のみを実装し、状態更新（set/mark）メソッドの呼び出しを忘れると、キャッシュが無効化されて重い計算が繰り返し実行される。
-
-**Context**: PR #83 の初期コードレビューにて、ターン内キャッシュ `AiTurnStrategyCache` を参照する処理は追加されたものの、`mark_squads_planned` や `set_campaign_portfolio` の呼び出しが抜け落ちており、キャッシュの恩恵が得られないバグが指摘された。
-
-**Action**: キャッシュ機構を導入する際は、更新メソッドの呼出確認を行うとともに、「同一ターン内の2回目以降の呼び出しで重い計算がスキップされるか」を検証する単体テストを必ず追加する。
-
-<a id="ace-92-1"></a>
-
-### ACE-92-1: 従属エンティティの被弾イベント駆動による状態同期と旧状態への上書き防止
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | architecture |
-| Origin     | PR #92 |
-| Date       | 2026-08-02 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: 従属エンティティ（例：搭載ユニット）の状態（HP等）を親エンティティ（例：輸送ユニット）に自動同期する際、毎フレームの無条件同期ではなく「親が新しくダメージを受けたイベント」をトリガーにして同期することで、補給や修理など独立して適用された状態変化が次のフレームで巻き戻されるのを防止できる。
-
-**Context**: PR #92 において、空母の搭載ユニット修復（ターン開始時サービス）機能を導入した際、既存の毎フレーム無条件HP同期システムが原因で、補給・修復された搭載ユニットのHPが次のフレームで即座に損傷中の空母の低いHPへ上書き（平時巻き戻し）されてしまう不具合が発生したため、同期ロジックを被弾イベント発生時のみへ変更した。
-
-**Action**: エンティティ間の従属状態同期（親の損傷を子に伝播させるなど）を設計する際は、毎フレームの無条件判定を避け、「親が新規ダメージを受けた」などの離散的なイベント発生時のみ同期するイベント駆動方式を採用する。
-
-<a id="ace-92-2"></a>
-
-### ACE-92-2: 段階的ループ処理から O(1) 直接算術計算への最適化と事前バリデーション
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | performance |
-| Origin     | PR #92 |
-| Date       | 2026-08-02 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: 資金や資源に応じた段階的アロケーション処理を、ループ（O(N)）から算術式による O(1) 計算へ最適化する際、選択フェーズで 0 コストや無効値を事前に検証・フィルタリングしておくことで、除算エラーを防ぎつつパフォーマンスとロジックの安全性を確保できる。
-
-**Context**: PR #92 のコードレビューにて、空母搭載ユニットの部分修理における費用計算ロジック（残資金で購入可能な最大内部HPの算出）で、ループによる段階的算出から O(1) の代数的算術計算式への最適化が提案・導入された。その際、ゼロコスト（単価0）や無効なユニット単価の事前バリデーションを適用する重要性が確認された。
-
-**Action**: 資金や容量を分配する計算処理では、ループによる段階的加算ではなく `repaired_hp = Math.min(max_affordable, needed_hp)` のような O(1) 算術計算式を用い、計算前にゼロ割や境界値チェックのバリデーションを完了させておく。
-
-<a id="ace-93-1"></a>
-
-### ACE-93-1: 候補取得とアクション実行で共有する判定関数による不整合防止と安全拒否
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | architecture |
-| Origin     | PR #93 |
-| Date       | 2026-08-02 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: アクションの「対象候補取得（例：`get_suppliable_targets`）」と「コマンド実行バリデーション（例：`submit_supply_command`）」で異なる判定条件を使うと UI 表示とエンジン状態の不整合を生む。共通の predicate 関数を engine 内で共有し、不正コマンド送信時は安全に no-op 処理することで高い整合性と堅牢性を確保できる。
-
-**Context**: PR #93 にて補給輸送車の単体補給機能を実装した際、未行動・生存中・非搭載の自軍地上ユニットおよび軽戦闘機という補給対象条件の判定ロジックを `engine` 内の共通関数へ集約した。これにより UI の対象選択候補とコマンド実行時の適用結果が常に一致し、万一の不正コマンド入力も safe reject (no-op) でパニックを防ぐ構成とした。
-
-**Action**: 対象選択を伴うコマンド（攻撃、補給、搭載等）を新設する際は、候補列挙 API と実行時バリデーションの両方から参照される共通の判定関数（predicate）を engine レイヤーに実装する。また、不正入力や競合入力に対してはエンジン側で安全に拒否（no-op 処理）する安全境界を設ける。
-
-<a id="ace-93-2"></a>
-
-### ACE-93-2: vi.hoisted と vi.mock を用いた Web Worker / WASM ブリッジ層のモックテスト
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | testing |
-| Origin     | PR #93 |
-| Date       | 2026-08-02 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: WebAssembly や Web Worker を統合したフロントエンドのブリッジ層（`EngineWorker` 等）をテストする際、`vi.hoisted` とモッククラスで WASM エンジンの内部 API をシミュレートすることで、実際の WASM バイナリや Worker 環境に依存せず API 呼び出しとデータ変換のテストを高速かつ安定して実施できる。
-
-**Context**: PR #93 において `engineWorker.ts` に補給 API を追加する際、Vitest の `vi.hoisted` を利用して WASM Engine インスタンスのモックメソッドと `WasmEngine` モッククラスを宣言し、`engineWorker.test.ts` にて WASM モジュールへのパラメータ伝達やレスポンス JSON のパース動作を完全に検証した。
-
-**Action**: Worker や WASM モジュールと通信するブリッジ層のテストを構築する場合は、`vi.hoisted` でモック関数群を事前定義し、`vi.mock` を用いて疑似モジュールとして注入することで、ブラウザ特有のバイナリロードやインスタンス化の依存を切り離してブリッジロジックを分離テストする。
-
-<a id="ace-94-1"></a>
-
-### ACE-94-1: ユニット標的価値算出における搭載物および短期的経済阻害効果の複合評価
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | coding |
-| Origin     | PR #94 |
-| Date       | 2026-08-09 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: 敵ユニットの標的価値評価では、単体コストだけでなく、輸送中 cargo のコストや直近の占領・経済阻害効果を合算した「複合価値」で評価することで、全 AI バージョン共通で即効性のある適切な優先度判定が可能になる。
-
-**Context**: PR #94 にて V4 生産 AI の標的評価を改修する際、ユニット本体のコスト評価に加えて cargo コストと直近の占領収入・阻害分を加算するロジックを実装し、それを V1〜V4 の共通戦術評価層（`engine/src/ai/eval.rs` / `squad.rs`）へ横展開した。
-
-**Action**: 戦術 AI の目標判定・優先度評価では、`target_value = unit_cost + cargo_cost + immediate_capture_income` のように波及効果や内部状態の価値を複合評価する関数を実装し、全戦術層で共通利用する。
-
-<a id="ace-94-2"></a>
-
-### ACE-94-2: 客観的ゲームルール依存評価の共通戦術層への集約と個別意思決定の分離
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | architecture |
-| Origin     | PR #94 |
-| Date       | 2026-08-09 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: 複数バージョンの AI（V1〜V4）を並行運用・評価する設計において、ゲームルールから一義的に定まる客観的評価ロジック（標的価値算出など）は共通戦術層に集約し、各バージョン固有の思考（作戦選定・要求編成など）のみをバージョン毎のモジュールに閉じることで、メンテナンス性の向上と評価のベースライン底上げを同時に実現できる。
-
-**Context**: PR #94 において V4 専用として開発された要求判定や標的評価のうち、純粋にルール依存で客観的な標的評価（cargo/占領価値の評価）を切り出して共通戦略・戦術モジュールへ移設し、全 AI に共有させた。
-
-**Action**: AI の機能追加や改良を行う際は、「ゲームルールに基づき一義的に評価できる客観的評価」と「バージョン固有の試行錯誤・計画アルゴリズム」を分離し、前者を共通層に配置して既存 AI も恩恵を受けられる構造にする。
-
-<a id="ace-98-1"></a>
-
-### ACE-98-1: 生産口封鎖（ProductionBlockade）検知と多角的 NPV に基づく全 AI 共通緊急任務解除
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | architecture |
-| Origin     | PR #98 / Issue #76 |
-| Date       | 2026-08-09 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: 敵による自軍生産拠点（Factory, Airport, Port, Capital）の占有は、非占領ユニットであっても次ターン以降の戦力供給を遮断する致命的な攻撃となる。拠点価値（収入、修理価値、生産枠価値、敵の利得）に基づく NPV 評価を行い、通常の攻撃行動より優先度の高い緊急任務（Emergency Mission）として全 AI 世代で共通解除することで、生産ラインの不全を防ぐ。
-
-**Context**: 敵の戦車などが自軍の工場の上に居座った場合、拠点を「占領」しているわけではないため従来の防衛・占領 AI では優先度が上がらず、自軍の生産が長時間封鎖される問題があった（Issue #76）。
-
-**Action**: 首都生産圏内の生産施設に対する敵ユニットの占有を `ProductionBlockade` として検知する独立モジュールを構築し、2ターン以内に到達可能な解除担当ユニットを割り当てる緊急任務を発行する。都市（City）や生産圏外の兵站施設は除外し、評価ロジックは全 AI バージョンで共通利用する。
-
-<a id="ace-98-2"></a>
-
-### ACE-98-2: 動的緊急ミッション・配備計画の対戦 JSONL トレース記録による AI 検証可能性の確保
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | tooling |
-| Origin     | PR #98 |
-| Date       | 2026-08-09 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: AIが手番中に動的に生成・消滅させる緊急介入計画や配備の整合性チェック（Deployment Audit, Emergency Plan, Factory Relief Missions）の履歴を、対戦ログ（JSONL）の構造化ストリームとして記録・エクスポートすることで、ブラックボックス化しがちな緊急思考プロセスの透明性と検証可能性を担保する。
-
-**Context**: PR #98 にて生産口封鎖解除や配備追跡を導入した際、AI内部で正しく封鎖解除ミッションが発動しているかをバッチシミュレーションや Python テストスクリプト（`test_eval_matchup.py`）から確認できるよう、`factory_relief_history` や `emergency_plan_history` 等を対戦トレースログへ追加した。
-
-**Action**: AIが内部状態（緊急計画、配備追跡、部隊評価など）に基づいて動的制御を行う場合は、その計画・監査情報を手番ごとの対戦トレース（JSONL）にエクスポートする出力インターフェースを整備し、評価ツールやテストから判定可能にする。
-
-<a id="ace-99-1"></a>
-
-### ACE-99-1: Native/WASM 共通の順序保持並列化基盤（map_ordered）と決定論的再現性の担保
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | performance |
-| Origin     | PR #99 |
-| Date       | 2026-08-15 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: 並列計算（Rayon 等）を導入する際、WASM（シングルスレッド）と Native（マルチスレッド）の双方で同一インターフェースを持ち、かつ評価結果のインデックス順（入力順序）を完全に保持するマッピング基盤を抽象化することで、タイブレークやスコア同点時における AI の意思決定の決定論的再現性（Determinism）をプラットフォーム間で 100% 維持できる。
-
-**Context**: PR #99 において、AI V4 の候補評価（島嶼作戦やビームサーチ、ターン距離計算など）を並列化する際、マルチスレッド環境とブラウザ（WASM）環境で AI の行動が乖離するのを防ぐため、`deterministic_parallel::map_ordered` を導入した。また、候補数が少ない場合（`items.len() < 4`）はスレッドプールへのディスパッチオーバーヘッドを避けるため直列実行へフォールバックする閾値制御を組み込んだ。
-
-**Action**: マルチプラットフォーム対応かつ決定論が求められるシミュレーション・AI エンジンでは、プラットフォーム差分を吸収する順序保証マッピング関数（`map_ordered`）を設計し、候補数が閾値（例: 4件）未満の場合は直列にフォールバックする制御を組み込む。
-
-<a id="ace-99-2"></a>
-
-### ACE-99-2: 作戦所有権（OperationOwner）の正本レジストリと双方向 O(1) 逆引きによる遊兵化・二重予約防止
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | architecture |
-| Origin     | PR #99 |
-| Date       | 2026-08-15 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: 複数ターンにわたる複合作戦（島嶼侵攻、拠点攻略、戦術部隊など）において、Entity の所属を各部隊（Squad）や個別ステートに分散保持せず、`Entity -> OperationOwner` の正本レジストリ（`UnitOperationRegistry`）に集約し、双方向マップ（Owner ごとの所属 Entity 集合）を O(1) で同期・逆引き可能にすることで、作戦完了時のユニット解放漏れ（O(k) 解放）、遊兵化、および複数作戦による同一 Entity の競合アサイン（二重予約）を完全に排除できる。
-
-**Context**: PR #99 において、AI V4 の導入に伴い、島作戦や戦術部隊のライフサイクルが長大化・複雑化し、作戦終了時のユニット解放漏れや同一ユニットの複数作戦アサインが問題となったため、`UnitOperationRegistry` を導入して一元管理した。
-
-**Action**: エンティティが長期間・複数段階の作戦にアサインされるシステムでは、所有権の正本レジストリを設計し、`Entity -> Owner` と `Owner -> Set<Entity>` の双方向マップを内部で同期させる。作戦解放はオーナー逆引きから O(k) で行い、未請求エンティティのクリーンアップ機構（`release_unclaimed_*`）を備える。
-
-<a id="ace-99-3"></a>
-
-### ACE-99-3: 長期ターン進行時の戦術スナップショット再利用と再割り当てループの排除
-
-| フィールド | 値 |
-| ---------- | --- |
-| Category   | performance |
-| Origin     | PR #99 |
-| Date       | 2026-08-15 |
-| Helpful    | 0 |
-| Harmful    | 0 |
-| Status     | active |
-
-**Insight**: ユニット数が増大するゲーム後半（40+ターン）において、AI の行動ステップごとに盤面全体の戦術スナップショットや距離マップを再計算したり、変化のないユニットに対して部隊再割り当て（Reassignment）を毎ステップ実行すると計算量が爆発的に増大する（O(N^2)〜O(N^3)）。同一ターン内での戦術スナップショットのキャッシュ・再利用と、すでに有効な任務を持つユニットの再評価スキップ（早期離脱）を徹底することで、後半ターンの思考時間を 1/10 以下（12秒 → 1秒）に短縮できる。
-
-**Context**: PR #99 の map_3 長期戦（40+ターン）において、終盤ターンの思考時間が 12 秒以上に達していた。原因は、ユニット行動ごとに戦術評価と距離マップを全件再構築していたこと、および部隊再割り当てループが毎ステップ走っていたことであった（コミット `81ee354`, `9941ffc`）。
-
-**Action**: AI のターン内意思決定ループでは、行動によって変化しない戦術状況（敵の脅威分布、大域距離マップなど）をスナップショットとしてキャッシュ・共有し、すでにアサイン済みの安定ユニットに対する再評価ループを抑制するガード条件を設ける。
+---
+
+## カテゴリ別サブファイル一覧
+
+800行超過ルールに基づき、エントリ本体は各カテゴリ別サブファイルに分割・管理されています。
+新規知見の追記は、該当するカテゴリのサブファイル末尾に行ってください。
+
+| カテゴリ | サブファイル | エントリ数 | 主な内容 |
+| -------- | ------------ | ---------- | -------- |
+| `architecture` | [Architecture](./playbook/architecture.md) | 20 件 | 設計判断、構造上の決定事項、状態管理 |
+| `performance` | [Performance](./playbook/performance.md) | 9 件 | パフォーマンス最適化、キャッシュ、計算量削減 |
+| `coding` | [Coding](./playbook/coding.md) | 4 件 | コーディングパターン、言語固有・型安全のベストプラクティス |
+| `testing` | [Testing](./playbook/testing.md) | 4 件 | テスト戦略、テストパターン、モック・シミュレーション設計 |
+| `tooling` | [Tooling](./playbook/tooling.md) | 3 件 | ツール設定、ログ出力・可視化、開発環境・スキル |
+| `security` | [Security](./playbook/security.md) | 0 件 | セキュリティ対策、脆弱性防止、入力検証 |
+| `devops` | [Devops](./playbook/devops.md) | 0 件 | CI/CD、デプロイ、ビルドパイプライン |
+| `process` | [Process](./playbook/process.md) | 0 件 | 開発プロセス、ワークフロー改善、タスク管理 |
+
+---
+
+## 全エントリ索引（Index）
+
+| エントリID | タイトル | カテゴリ | Origin | Status | 参照先 |
+| ---------- | -------- | -------- | ------ | ------ | ------ |
+| [ACE-47-1](./playbook/architecture.md#ace-47-1) | AIの部隊管理におけるユニットの解放忘れと再搭乗ループ防止 | `architecture` | PR #47 | `active` | [詳細](./playbook/architecture.md#ace-47-1) |
+| [ACE-47-2](./playbook/performance.md#ace-47-2) | ECSクエリのループ内呼び出しによるオーバーヘッド回避 | `performance` | PR #47 | `active` | [詳細](./playbook/performance.md#ace-47-2) |
+| [ACE-47-3](./playbook/performance.md#ace-47-3) | 探索アルゴリズム内の Vec::contains によるパフォーマンス低下の回避 | `performance` | PR #47 | `active` | [詳細](./playbook/performance.md#ace-47-3) |
+| [ACE-52-1](./playbook/testing.md#ace-52-1) | AI評価における主観メトリクスと客観メトリクスの分離 | `testing` | PR #52 | `active` | [詳細](./playbook/testing.md#ace-52-1) |
+| [ACE-52-2](./playbook/architecture.md#ace-52-2) | ROI等の蓄積指標と盤面評価（スコア）の二重計上防止と分離 | `architecture` | PR #52 | `active` | [詳細](./playbook/architecture.md#ace-52-2) |
+| [ACE-57-1](./playbook/performance.md#ace-57-1) | O(N) オーバーヘッドを回避する Vec の pop() による要素取り出し | `performance` | PR #57 | `active` | [詳細](./playbook/performance.md#ace-57-1) |
+| [ACE-57-2](./playbook/architecture.md#ace-57-2) | 部隊（Squad）全滅時の解散漏れによる目標リソースの永久予約バグの防止 | `architecture` | PR #57 | `active` | [詳細](./playbook/architecture.md#ace-57-2) |
+| [ACE-57-3](./playbook/architecture.md#ace-57-3) | 価値交換と交戦成立率に基づく動的なカウンター生産評価 | `architecture` | PR #57 | `active` | [詳細](./playbook/architecture.md#ace-57-3) |
+| [ACE-59-1](./playbook/performance.md#ace-59-1) | Hot pathでの動的ディスパッチ（dyn Trait）回避によるパフォーマンス改善 | `performance` | PR #59 | `active` | [詳細](./playbook/performance.md#ace-59-1) |
+| [ACE-63-1](./playbook/performance.md#ace-63-1) | Zustandストア設計での不要な再レンダリング防止（Zustand Selectors） | `performance` | PR #63 | `active` | [詳細](./playbook/performance.md#ace-63-1) |
+| [ACE-63-2](./playbook/architecture.md#ace-63-2) | WebAssembly / Web Worker での安全なエラー境界 (ErrorBoundary) の適用 | `architecture` | PR #63 | `active` | [詳細](./playbook/architecture.md#ace-63-2) |
+| [ACE-63-3](./playbook/performance.md#ace-63-3) | RustのWASMバインディングにおけるヒープアロケーション削減（std::slice::from_ref） | `performance` | PR #63 | `active` | [詳細](./playbook/performance.md#ace-63-3) |
+| [ACE-64-1](./playbook/architecture.md#ace-64-1) | セーブ・ロードにおける空の輸送コンポーネント復元漏れバグの防止 | `architecture` | PR #64 | `active` | [詳細](./playbook/architecture.md#ace-64-1) |
+| [ACE-64-2](./playbook/architecture.md#ace-64-2) | コアゲームエンジンにおける anyhow 依存排除と thiserror による型安全なエラー境界 | `architecture` | PR #64 | `active` | [詳細](./playbook/architecture.md#ace-64-2) |
+| [ACE-64-3](./playbook/tooling.md#ace-64-3) | useCallback を用いた React ライフサイクル関数の安定化とリンター警告解消 | `tooling` | PR #64 | `active` | [詳細](./playbook/tooling.md#ace-64-3) |
+| [ACE-65-1](./playbook/architecture.md#ace-65-1) | スナップショットとイベントストリームを分離した軽量対戦ログ設計 | `architecture` | PR #65 | `active` | [詳細](./playbook/architecture.md#ace-65-1) |
+| [ACE-65-2](./playbook/tooling.md#ace-65-2) | AI思考評価ログの可視化とLLMエージェントによる自律敗因分析 | `tooling` | PR #65 | `active` | [詳細](./playbook/tooling.md#ace-65-2) |
+| [ACE-67-1](./playbook/architecture.md#ace-67-1) | マスターデータの定義順（ロード順）保持によるUI一覧順序の全環境統一 | `architecture` | PR #67 / Issue #66 | `active` | [詳細](./playbook/architecture.md#ace-67-1) |
+| [ACE-67-2](./playbook/coding.md#ace-67-2) | 固定UIパネルによるマップ遮蔽を防ぐカメラパディング制御 | `coding` | PR #67 / Issue #66 | `active` | [詳細](./playbook/coding.md#ace-67-2) |
+| [ACE-71-1](./playbook/architecture.md#ace-71-1) | プレゼンテーション層の操作可否判定を engine へ集約する | `architecture` | PR #71 | `active` | [詳細](./playbook/architecture.md#ace-71-1) |
+| [ACE-71-2](./playbook/architecture.md#ace-71-2) | 条件付きルールの共通 predicate を候補列挙・探索・実行で再利用する | `architecture` | PR #71 | `active` | [詳細](./playbook/architecture.md#ace-71-2) |
+| [ACE-71-3](./playbook/coding.md#ace-71-3) | 行動種別は静的能力ではなく実際の実行文脈で判定する | `coding` | PR #71 | `active` | [詳細](./playbook/coding.md#ace-71-3) |
+| [ACE-81-1](./playbook/architecture.md#ace-81-1) | 輸送部隊の状態遷移マシン化と複数カーゴの明示的フェーズ管理 | `architecture` | PR #81 | `active` | [詳細](./playbook/architecture.md#ace-81-1) |
+| [ACE-81-2](./playbook/architecture.md#ace-81-2) | 間接攻撃脅威評価の独立モジュール化と危険地帯評価の共有 | `architecture` | PR #81 | `active` | [詳細](./playbook/architecture.md#ace-81-2) |
+| [ACE-82-1](./playbook/testing.md#ace-82-1) | エンティティID追跡による複合行動パイプラインのシーケンス成立検証 | `testing` | PR #82 | `active` | [詳細](./playbook/testing.md#ace-82-1) |
+| [ACE-82-2](./playbook/coding.md#ace-82-2) | Rust テストコードにおける nightly 機能 (let_chains) 回避による stable 互換性維持 | `coding` | PR #82 | `active` | [詳細](./playbook/coding.md#ace-82-2) |
+| [ACE-83-1](./playbook/architecture.md#ace-83-1) | 特殊戦略需要による汎用需要の無条件上書きと生産ブロッキングの防止 | `architecture` | PR #83 | `active` | [詳細](./playbook/architecture.md#ace-83-1) |
+| [ACE-83-2](./playbook/architecture.md#ace-83-2) | ドメイン概念の判定範囲を本来の前提条件（海上輸送を要する別陸塊）へ限定する境界設計 | `architecture` | PR #83 | `active` | [詳細](./playbook/architecture.md#ace-83-2) |
+| [ACE-83-3](./playbook/testing.md#ace-83-3) | ターン限定キャッシュにおける状態更新（mark/set）の呼び出しと実効性検証 | `testing` | PR #83 | `active` | [詳細](./playbook/testing.md#ace-83-3) |
+| [ACE-92-1](./playbook/architecture.md#ace-92-1) | 従属エンティティの被弾イベント駆動による状態同期と旧状態への上書き防止 | `architecture` | PR #92 | `active` | [詳細](./playbook/architecture.md#ace-92-1) |
+| [ACE-92-2](./playbook/performance.md#ace-92-2) | 段階的ループ処理から O(1) 直接算術計算への最適化と事前バリデーション | `performance` | PR #92 | `active` | [詳細](./playbook/performance.md#ace-92-2) |
+| [ACE-93-1](./playbook/architecture.md#ace-93-1) | 候補取得とアクション実行で共有する判定関数による不整合防止と安全拒否 | `architecture` | PR #93 | `active` | [詳細](./playbook/architecture.md#ace-93-1) |
+| [ACE-93-2](./playbook/testing.md#ace-93-2) | vi.hoisted と vi.mock を用いた Web Worker / WASM ブリッジ層のモックテスト | `testing` | PR #93 | `active` | [詳細](./playbook/testing.md#ace-93-2) |
+| [ACE-94-1](./playbook/coding.md#ace-94-1) | ユニット標的価値算出における搭載物および短期的経済阻害効果の複合評価 | `coding` | PR #94 | `active` | [詳細](./playbook/coding.md#ace-94-1) |
+| [ACE-94-2](./playbook/architecture.md#ace-94-2) | 客観的ゲームルール依存評価の共通戦術層への集約と個別意思決定の分離 | `architecture` | PR #94 | `active` | [詳細](./playbook/architecture.md#ace-94-2) |
+| [ACE-98-1](./playbook/architecture.md#ace-98-1) | 生産口封鎖（ProductionBlockade）検知と多角的 NPV に基づく全 AI 共通緊急任務解除 | `architecture` | PR #98 / Issue #76 | `active` | [詳細](./playbook/architecture.md#ace-98-1) |
+| [ACE-98-2](./playbook/tooling.md#ace-98-2) | 動的緊急ミッション・配備計画の対戦 JSONL トレース記録による AI 検証可能性の確保 | `tooling` | PR #98 | `active` | [詳細](./playbook/tooling.md#ace-98-2) |
+| [ACE-99-1](./playbook/performance.md#ace-99-1) | Native/WASM 共通の順序保持並列化基盤（map_ordered）と決定論的再現性の担保 | `performance` | PR #99 | `active` | [詳細](./playbook/performance.md#ace-99-1) |
+| [ACE-99-2](./playbook/architecture.md#ace-99-2) | 作戦所有権（OperationOwner）の正本レジストリと双方向 O(1) 逆引きによる遊兵化・二重予約防止 | `architecture` | PR #99 | `active` | [詳細](./playbook/architecture.md#ace-99-2) |
+| [ACE-99-3](./playbook/performance.md#ace-99-3) | 長期ターン進行時の戦術スナップショット再利用と再割り当てループの排除 | `performance` | PR #99 | `active` | [詳細](./playbook/performance.md#ace-99-3) |
+
+---
 
 ## Changelog
+
+### [1.18.0] - 2026-08-15
+
+#### 変更
+
+- 800行超過ルールに基づき、各エントリを `playbook/` サブディレクトリ（8カテゴリ）へ分割移行
+- メインの `PLAYBOOK.md` を運用ルールおよび全エントリ索引テーブル（Index）としてスリム化
 
 ### [1.0.0] - 2026-06-06
 
 #### 追加
 
 - 初版作成
-
