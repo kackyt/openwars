@@ -19,7 +19,7 @@ description: >-
 `scripts/eval_matchup.py` は `target/release/mcp-server` (Windowsの場合は `mcp-server.exe`) を使用して対戦を行うため、評価前に必ず最新のコードを release ビルドしてください。
 
 ```bash
-cargo build --release -p openwars-mcp-server
+cargo build --release -p mcp-server
 ```
 
 ### 2. 評価条件の確認と対戦実行
