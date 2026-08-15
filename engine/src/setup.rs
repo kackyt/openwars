@@ -15,6 +15,9 @@ pub fn create_world() -> (World, Schedule) {
     world.init_resource::<crate::ai::engine::AiProductionCooldown>();
     world.init_resource::<crate::ai::PlayerAiSettings>();
     world.init_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>();
+    world.init_resource::<crate::ai::v4::logistics_plan::V4LogisticsPlanRegistry>();
+    world.init_resource::<crate::ai::v4::plan_revision::V4RollingPlanRegistry>();
+    world.init_resource::<crate::ai::v4::victory_roadmap::VictoryRoadmapRegistry>();
     world.init_resource::<CombatLedger>();
 
     // Register events

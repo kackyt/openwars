@@ -4,7 +4,6 @@ use bevy_ecs::event::EventCursor;
 use bevy_ecs::prelude::*;
 use serde::Serialize;
 
-use engine::ai::emergency::{CriticalSiteThreatKind, EmergencyMissionPlan, EmergencyResponse};
 use engine::ai::idle_audit::IdleAuditDiagnostics;
 use engine::ai::island_campaign::{
     IslandCampaignAssessment, IslandCampaignAssignment, IslandCampaignDecision,
@@ -12,9 +11,13 @@ use engine::ai::island_campaign::{
     IslandCampaignState,
 };
 use engine::ai::islands::IslandMap;
+use engine::ai::operation_assignment::UnitOperationRegistry;
 use engine::ai::squad::{MissionPhase, MissionType, SquadManager};
 use engine::ai::v4::deployment::V4DeploymentRegistry;
+use engine::ai::v4::logistics_plan::{LogisticsRouteMetrics, V4LogisticsPlanRegistry};
+use engine::ai::v4::plan_revision::{PlanExecutionSnapshot, V4RollingPlanRegistry};
 use engine::ai::v4::trace::{ProductionDecision, ProductionTraceDiagnostics};
+use engine::ai::v4::victory_roadmap::VictoryRoadmapRegistry;
 use engine::components::{CargoCapacity, Faction, GridPosition, Health, PlayerId, UnitStats};
 use engine::events::{
     PropertyCaptureProgressedEvent, UnitAttackedEvent, UnitLoadedEvent, UnitProducedEvent,
@@ -151,52 +154,17 @@ pub struct IdleUnitSnapshot {
     pub x: usize,
     pub y: usize,
     pub squad_id: Option<u32>,
+    pub mission_type: Option<String>,
     /// 分類A: どのSquadにも属さない。
     pub no_mission: bool,
     /// 分類B: Squadには属するがそのターン一度も行動しなかった。
     pub mission_stalled: bool,
     /// 分類C: 行動可能なままターンを終えた。
     pub actionable: bool,
-}
-
-/// #76: 生産口封鎖に対して実際に割り当てられた解除任務。
-#[derive(Debug, Serialize)]
-pub struct FactoryReliefMissionSnapshot {
-    pub assigned_entity: u64,
-    pub threat_entity: u64,
-    pub site_x: usize,
-    pub site_y: usize,
-    pub site_terrain: String,
-    pub response: String,
-}
-
-pub fn snapshot_factory_relief_plan(
-    world: &World,
-    player_id: PlayerId,
-) -> Vec<FactoryReliefMissionSnapshot> {
-    let Some(plan) = world.get_resource::<EmergencyMissionPlan>() else {
-        return Vec::new();
-    };
-    plan.missions
-        .iter()
-        .filter(|mission| {
-            mission.owner_id == player_id
-                && mission.threat.kind == CriticalSiteThreatKind::ProductionBlockade
-        })
-        .map(|mission| FactoryReliefMissionSnapshot {
-            assigned_entity: mission.assigned_entity.to_bits(),
-            threat_entity: mission.threat.threat_entity.to_bits(),
-            site_x: mission.threat.site_position.x,
-            site_y: mission.threat.site_position.y,
-            site_terrain: mission.threat.site_terrain.as_str().to_string(),
-            response: match mission.response {
-                EmergencyResponse::EliminateThreat => "eliminate",
-                EmergencyResponse::OccupySite => "occupy",
-                EmergencyResponse::BlockRoute => "block_route",
-            }
-            .to_string(),
-        })
-        .collect()
+    /// Reserveは通常任務ではなく、明示的に管理された遊兵として数える。
+    pub reserve: bool,
+    /// Reserve入場手番を0とする経過手番数。
+    pub reserve_age: Option<u32>,
 }
 
 /// Squad 単位のダイジェスト。分類D（停滞Squad）はこの列のターン間差分で判定する。
@@ -210,6 +178,8 @@ pub struct IdleSquadSnapshot {
     pub target_island_id: Option<usize>,
     pub member_count: usize,
     pub acted_count: usize,
+    /// Reserveを含む実行Squadの構成兵種。member_countとの予実監査に使う。
+    pub member_unit_types: Vec<UnitType>,
 }
 
 /// 「遊兵ゼロ」指標のターン単位スナップショット。
@@ -224,6 +194,12 @@ pub struct IdleAuditSnapshot {
     pub mission_stalled_count: usize,
     /// 分類C: 行動可能なまま終了。
     pub actionable_count: usize,
+    /// 明示的な遊兵（Reserve）。
+    pub reserve_count: usize,
+    /// Unassigned + Reserve。
+    pub idle_count: usize,
+    /// 次の自軍手番にもReserveだったEntity数。
+    pub overdue_reserve_count: usize,
     pub units: Vec<IdleUnitSnapshot>,
     pub squads: Vec<IdleSquadSnapshot>,
 }
@@ -238,7 +214,7 @@ pub struct ProductionStepSnapshot {
     pub deficit_before: f32,
     pub deficit_after: f32,
     pub remaining_funds_before: u32,
-    /// "produced" | "slot_cleared" | "deferred"
+    /// "produced" | "slot_cleared" | "deferred" | "reserved"
     pub decision: String,
     pub unit_type: Option<UnitType>,
     pub cost: Option<u32>,
@@ -253,16 +229,28 @@ pub struct ProductionOperationSnapshot {
     pub anchor_x: usize,
     pub anchor_y: usize,
     pub capture_units: u32,
-    pub escort_units: u32,
-    pub destroy_budget: u32,
+    pub combat_plan_required: u32,
     pub transport_slots: u32,
-    pub intercept_budget: u32,
+    pub intercept_units: u32,
     pub requires_transport: bool,
-    pub enemy_combat_value: u32,
-    pub enemy_reinforcement_budget: u32,
-    pub minimum_combat_unit_cost: u32,
-    pub friendly_combat_value_committed: u32,
+    pub enemy_combat_units: u32,
+    pub enemy_reinforcement_funds: u32,
+    pub contingency_reserve_funds: u32,
+    pub reinforcement_contingencies: Vec<ReinforcementContingencySnapshot>,
     pub deploy_lead_time: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReinforcementContingencySnapshot {
+    pub enemy_type: UnitType,
+    pub enemy_contact_turn: u32,
+    pub counter_type: UnitType,
+    pub counter_facility_x: usize,
+    pub counter_facility_y: usize,
+    pub counter_build_turn: u32,
+    pub counter_contact_turn: u32,
+    pub attacks_required: u32,
+    pub reserve_cost: u32,
 }
 
 /// V4 生産判断のターン単位スナップショット。
@@ -273,10 +261,251 @@ pub struct ProductionPlanSnapshot {
     pub free_facility_count: usize,
     /// 作戦が立たず fallback に落ちたか
     pub fallback: bool,
-    /// 使い切れずに残った資金
+    /// 生産後の現金残高
     pub leftover_funds: u32,
+    /// 永続作戦の将来購入へ予約済みの現金
+    pub reserved_funds: u32,
+    /// どの作戦にも帰属していない現金
+    pub uncommitted_funds: u32,
     pub operations: Vec<ProductionOperationSnapshot>,
     pub steps: Vec<ProductionStepSnapshot>,
+    pub rolling_combat_plans: Vec<RollingCombatPlanSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RollingCombatPlanSnapshot {
+    pub plan_id: Option<u64>,
+    pub revision: Option<u32>,
+    pub disposition: String,
+    pub replan_reason: Option<String>,
+    pub operation_kind: String,
+    pub anchor_x: usize,
+    pub anchor_y: usize,
+    pub feasible: bool,
+    pub purchases: Vec<RollingPurchaseSnapshot>,
+    pub targets: Vec<RollingTargetSnapshot>,
+    pub turn_forecasts: Vec<CampaignTurnForecastSnapshot>,
+    pub first_attack_turn: Option<u32>,
+    pub elimination_turn: Option<u32>,
+    pub occupation_turn: Option<u32>,
+    pub production_cost: u32,
+    pub expected_loss: u32,
+    pub protected_unit_count: usize,
+    pub protected_survivor_count: usize,
+    pub required_capture_survivor_count: usize,
+    pub candidates_considered: usize,
+    pub search_truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RollingPurchaseSnapshot {
+    pub unit_type: UnitType,
+    pub facility_x: usize,
+    pub facility_y: usize,
+    pub build_turn: u32,
+    pub cost: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RollingTargetSnapshot {
+    pub entity_id: Option<u64>,
+    pub unit_type: UnitType,
+    pub available_turn: u32,
+    pub initial_hp: u32,
+    pub remaining_hp: u32,
+    pub destroyed_turn: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CampaignTurnForecastSnapshot {
+    pub turn: u32,
+    pub enemy_arrival_hp: u32,
+    pub enemy_hp_removed: u32,
+    pub friendly_hp_lost: u32,
+    pub attack_count: u32,
+}
+
+/// その手番に行った永続計画の継続・撤回・revision判断。
+#[derive(Debug, Serialize)]
+pub struct PlanRevisionAuditSnapshot {
+    pub turn: u32,
+    pub plan_id: u64,
+    pub revision: u32,
+    pub operation_kind: String,
+    pub anchor_x: usize,
+    pub anchor_y: usize,
+    pub disposition: String,
+    pub reason: Option<String>,
+    pub remaining_steps: usize,
+    pub completion_turn: Option<u32>,
+    pub remaining_production_cost: u32,
+    pub expected_loss: u32,
+    pub execution: PlanExecutionAuditSnapshot,
+}
+
+/// 現在進行中Planの予実。revision監査が発生しない手番にもE2Eへ公開する。
+#[derive(Debug, Serialize)]
+pub struct ActivePlanExecutionSnapshot {
+    pub plan_id: u64,
+    pub revision: u32,
+    pub execution: PlanExecutionAuditSnapshot,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PlanExecutionAuditSnapshot {
+    pub created_turn: u32,
+    pub last_observed_turn: u32,
+    pub planned_production_cost: u32,
+    pub committed_production_cost: u32,
+    pub actual_production_cost: u32,
+    pub released_production_cost: u32,
+    pub produced_step_count: usize,
+    pub assigned_entity_count: usize,
+    pub active_entity_count: usize,
+    pub planned_first_attack_turn: Option<u32>,
+    pub actual_first_attack_turn: Option<u32>,
+    pub first_attack_delay: Option<i64>,
+    pub planned_elimination_turn: Option<u32>,
+    pub actual_elimination_turn: Option<u32>,
+    pub elimination_delay: Option<i64>,
+    pub planned_occupation_turn: Option<u32>,
+    pub actual_occupation_turn: Option<u32>,
+    pub occupation_delay: Option<i64>,
+    pub attack_count: u32,
+    pub priority_attack_count: u32,
+    pub kill_count: u32,
+    pub damage_value_dealt: u32,
+    pub counter_value_received: u32,
+    pub destroyed_value: u32,
+    pub current_force_loss: u32,
+    pub initial_target_count: usize,
+    pub reinforcement_count: usize,
+    pub remaining_target_count: usize,
+    pub objective_property_count: usize,
+    pub owned_objective_property_count: usize,
+    pub targets: Vec<PlanTargetExecutionSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PlanTargetExecutionSnapshot {
+    pub entity_id: u64,
+    pub planned_destroy_turn: Option<u32>,
+    pub actual_hp: Option<u32>,
+    pub neutralized_turn: Option<u32>,
+    pub reinforcement: bool,
+}
+
+/// 勝利条件から逆算した親ロードマップと、島単位の子作戦予実。
+#[derive(Debug, Serialize)]
+pub struct VictoryRoadmapSnapshot {
+    pub roadmap_id: u64,
+    pub player_id: u32,
+    pub route: String,
+    pub created_turn: u32,
+    pub last_observed_turn: u32,
+    pub enemy_capital_x: Option<usize>,
+    pub enemy_capital_y: Option<usize>,
+    pub enemy_capital_island_id: Option<usize>,
+    pub planned_victory_turn: Option<u32>,
+    pub actual_victory_turn: Option<u32>,
+    pub initial_enemy_unit_count: usize,
+    pub current_enemy_unit_count: usize,
+    pub operations: Vec<StrategicOperationSnapshot>,
+    pub recent_steps: Vec<OperationStepSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OperationStepSnapshot {
+    pub operation_id: u64,
+    pub entity_id: u64,
+    pub planned_turn: u32,
+    pub resolved_turn: Option<u32>,
+    pub step: String,
+    pub target_x: Option<usize>,
+    pub target_y: Option<usize>,
+    pub target_entity_id: Option<u64>,
+    pub completed: bool,
+    pub blocked_reason: Option<String>,
+}
+
+/// 首都攻略開始を早めるために選択・維持している兵站経路と、その比較根拠。
+#[derive(Debug, Serialize)]
+pub struct LogisticsPlanSnapshot {
+    pub plan_id: u64,
+    pub player_id: u32,
+    pub created_turn: u32,
+    pub revised_turn: u32,
+    pub last_observed_turn: u32,
+    pub revision: u32,
+    pub replan_reason: String,
+    /// 作成後は動的な戦況評価で変更しない、地理的な経路identity。
+    pub route_island_ids: Vec<usize>,
+    /// 固定経路のうち、まだ確保を要する島。
+    pub selected_island_ids: Vec<usize>,
+    pub stages: Vec<LogisticsStageSnapshot>,
+    pub direct: LogisticsRouteMetricsSnapshot,
+    pub selected: LogisticsRouteMetricsSnapshot,
+    pub current_forecast: LogisticsRouteMetricsSnapshot,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LogisticsStageSnapshot {
+    pub island_id: usize,
+    pub planned_completion_turn: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LogisticsRouteMetricsSnapshot {
+    pub normal_assault_ready_turn: u32,
+    pub pessimistic_assault_ready_turn: u32,
+    pub projected_income_per_turn: u32,
+    pub acquisition_cost: u32,
+    pub staging_distance: u32,
+    pub unsupported_categories: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StrategicOperationSnapshot {
+    pub operation_id: u64,
+    pub island_id: usize,
+    pub purpose: String,
+    pub phase: String,
+    pub created_turn: u32,
+    pub last_observed_turn: u32,
+    pub anchor_x: usize,
+    pub anchor_y: usize,
+    pub objective_property_count: usize,
+    pub owned_objective_property_count: usize,
+    pub planned_completion_turn: Option<u32>,
+    pub actual_completion_turn: Option<u32>,
+    pub combat_plan_ids: Vec<u64>,
+    pub planned_suppression_turn: Option<u32>,
+    pub transport_entity_ids: Vec<u64>,
+    pub capture_entity_ids: Vec<u64>,
+    pub combat_entity_ids: Vec<u64>,
+    pub planned_steps: u32,
+    pub completed_steps: u32,
+    pub blocked_steps: u32,
+    pub moves: u32,
+    pub loads: u32,
+    pub drops: u32,
+    pub attacks: u32,
+    pub captures: u32,
+    pub completed_captures: u32,
+    pub supplies: u32,
+    pub waits: u32,
+    pub deviations: u32,
+    pub last_step: Option<String>,
+    pub last_progress_turn: Option<u32>,
+    pub blocked_reason: Option<String>,
+    pub current_issues: Vec<String>,
+    pub latest_issue_history: Vec<String>,
+    pub issue_history_count: usize,
+    pub latest_recoveries: Vec<String>,
+    pub recovery_history_count: usize,
+    pub replan_count: u32,
+    pub last_replan_turn: Option<u32>,
+    pub active: bool,
 }
 
 /// 生産意図から実Entityへ接続された局地任務の実行実績。
@@ -292,6 +521,9 @@ pub struct DeploymentAuditSnapshot {
 
 #[derive(Debug, Serialize)]
 pub struct DeploymentAuditRecordSnapshot {
+    pub plan_id: Option<u64>,
+    pub plan_revision: Option<u32>,
+    pub plan_step_id: Option<u32>,
     pub entity_id: u64,
     pub unit_type: UnitType,
     pub slot_kind: String,
@@ -308,31 +540,17 @@ pub struct DeploymentAuditRecordSnapshot {
     pub capture_unit_attack_count: u32,
     pub transport_unit_attack_count: u32,
     pub kill_count: u32,
+    pub damage_value_dealt: u32,
+    pub counter_value_received: u32,
+    pub destroyed_value: u32,
     pub first_attack_turn: Option<u32>,
     pub first_attack_eta: Option<u32>,
-}
-
-/// 緊急迎撃が何を守るために、どの戦力をpreemptしたかを示す診断。
-#[derive(Debug, Serialize)]
-pub struct EmergencyPlanSnapshot {
-    pub player_id: u32,
-    pub missions: Vec<EmergencyMissionSnapshot>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct EmergencyMissionSnapshot {
-    pub assigned_entity_id: u64,
-    pub assigned_unit_type: Option<UnitType>,
-    pub threat_entity_id: u64,
-    pub threat_unit_type: Option<UnitType>,
-    pub threat_x: usize,
-    pub threat_y: usize,
-    pub site_x: usize,
-    pub site_y: usize,
-    pub site_terrain: String,
-    pub site_owner_id: Option<u32>,
-    pub eta: u32,
-    pub response: String,
+    pub forecast_first_attack_eta: Option<u32>,
+    pub forecast_elimination_eta: Option<u32>,
+    pub forecast_occupation_eta: Option<u32>,
+    pub forecast_package_cost: u32,
+    pub forecast_package_size: u32,
+    pub first_attack_eta_delta: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -353,8 +571,8 @@ pub struct IslandCampaignAssessmentSnapshot {
     pub neutral_properties: u32,
     pub friendly_properties: u32,
     pub enemy_properties: u32,
-    pub friendly_combat_value: u32,
-    pub enemy_combat_value: u32,
+    pub friendly_combat_units: u32,
+    pub enemy_combat_units: u32,
     pub friendly_arrival_eta: Option<u32>,
     pub enemy_arrival_eta: Option<u32>,
     pub friendly_capture_eta: Option<u32>,
@@ -378,6 +596,7 @@ pub struct IslandCampaignAssignmentSnapshot {
     pub transport_entity_ids: Vec<u64>,
     pub capture_entity_ids: Vec<u64>,
     pub combat_entity_ids: Vec<u64>,
+    pub priority_enemy_types: Vec<String>,
     pub operation_ready: bool,
     pub continued_from_existing_squad: bool,
 }
@@ -387,8 +606,31 @@ pub struct IslandCampaignRequirementSnapshot {
     pub preferred_transport: Option<String>,
     pub transport_slots: u32,
     pub capture_units: u32,
-    pub combat_budget: u32,
+    pub ground_combat_units: u32,
+    pub combat_units: u32,
     pub total_budget: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OperationAssignmentSnapshot {
+    pub player_id: u32,
+    pub assigned_entity_count: usize,
+    pub rejected_conflict_count: u64,
+    /// 直近の境界reconcileで訪問したSquad参照数。行動数との積にはならない。
+    pub reconcile_reference_visits: usize,
+}
+
+pub fn snapshot_operation_assignments_for_player(
+    world: &World,
+    player_id: PlayerId,
+) -> Option<OperationAssignmentSnapshot> {
+    let registry = world.get_resource::<UnitOperationRegistry>()?;
+    Some(OperationAssignmentSnapshot {
+        player_id: player_id.0,
+        assigned_entity_count: registry.assigned_count(player_id),
+        rejected_conflict_count: registry.rejected_conflicts(),
+        reconcile_reference_visits: registry.last_reconcile_visits(),
+    })
 }
 
 pub struct InvasionTraceCollector {
@@ -614,8 +856,8 @@ fn snapshot_campaign_assessment(
         neutral_properties: assessment.neutral_properties,
         friendly_properties: assessment.friendly_properties,
         enemy_properties: assessment.enemy_properties,
-        friendly_combat_value: assessment.friendly_combat_value,
-        enemy_combat_value: assessment.enemy_combat_value,
+        friendly_combat_units: assessment.friendly_combat_units,
+        enemy_combat_units: assessment.enemy_combat_units,
         friendly_arrival_eta: assessment.friendly_arrival_eta,
         enemy_arrival_eta: assessment.enemy_arrival_eta,
         friendly_capture_eta: assessment.friendly_capture_eta,
@@ -637,7 +879,8 @@ fn snapshot_campaign_requirement(
             .map(|unit_type| island_campaign_unit_type_name(unit_type).to_string()),
         transport_slots: requirement.transport_slots,
         capture_units: requirement.capture_units,
-        combat_budget: requirement.combat_budget,
+        ground_combat_units: requirement.ground_combat_units,
+        combat_units: requirement.combat_units,
         total_budget: requirement.total_budget,
     }
 }
@@ -676,6 +919,11 @@ fn snapshot_campaign_assignment(
         transport_entity_ids,
         capture_entity_ids,
         combat_entity_ids,
+        priority_enemy_types: assignment
+            .priority_enemy_types
+            .iter()
+            .map(|unit_type| island_campaign_unit_type_name(*unit_type).to_string())
+            .collect(),
         operation_ready: assignment.operation_ready,
         continued_from_existing_squad: assignment.continued_from_existing_squad,
     }
@@ -745,9 +993,15 @@ pub fn snapshot_idle_audit_for_player(
             x: record.position.x,
             y: record.position.y,
             squad_id: record.squad_id.map(|id| id.0),
+            mission_type: record
+                .mission_type
+                .as_ref()
+                .map(|mission| format!("{mission:?}")),
             no_mission: record.no_mission,
             mission_stalled: record.mission_stalled,
             actionable: record.actionable,
+            reserve: record.reserve,
+            reserve_age: record.reserve_age,
         })
         .collect();
 
@@ -763,6 +1017,7 @@ pub fn snapshot_idle_audit_for_player(
             target_island_id: digest.target_island.map(|island| island.0),
             member_count: digest.member_count,
             acted_count: digest.acted_count,
+            member_unit_types: digest.member_unit_types.clone(),
         })
         .collect();
 
@@ -772,6 +1027,9 @@ pub fn snapshot_idle_audit_for_player(
         no_mission_count: audit.no_mission_count(),
         mission_stalled_count: audit.mission_stalled_count(),
         actionable_count: audit.actionable_count(),
+        reserve_count: audit.reserve_count(),
+        idle_count: audit.idle_count(),
+        overdue_reserve_count: audit.overdue_reserve_count(),
         units,
         squads,
     })
@@ -795,15 +1053,28 @@ pub fn snapshot_production_plan_for_player(
             anchor_x: op.anchor.x,
             anchor_y: op.anchor.y,
             capture_units: op.slots.capture_units,
-            escort_units: op.slots.escort_units,
-            destroy_budget: op.slots.destroy_budget,
+            combat_plan_required: op.slots.combat_plan_required,
             transport_slots: op.slots.transport_slots,
-            intercept_budget: op.slots.intercept_budget,
+            intercept_units: op.slots.intercept_units,
             requires_transport: op.requires_transport,
-            enemy_combat_value: op.enemy_combat_value,
-            enemy_reinforcement_budget: op.enemy_reinforcement_budget,
-            minimum_combat_unit_cost: op.minimum_combat_unit_cost,
-            friendly_combat_value_committed: op.friendly_combat_value_committed,
+            enemy_combat_units: op.enemy_combat_units,
+            enemy_reinforcement_funds: op.enemy_reinforcement_funds,
+            contingency_reserve_funds: op.contingency_reserve_funds,
+            reinforcement_contingencies: op
+                .reinforcement_contingencies
+                .iter()
+                .map(|contingency| ReinforcementContingencySnapshot {
+                    enemy_type: contingency.enemy_type,
+                    enemy_contact_turn: contingency.enemy_contact_turn,
+                    counter_type: contingency.counter_type,
+                    counter_facility_x: contingency.counter_facility.x,
+                    counter_facility_y: contingency.counter_facility.y,
+                    counter_build_turn: contingency.counter_build_turn,
+                    counter_contact_turn: contingency.counter_contact_turn,
+                    attacks_required: contingency.attacks_required,
+                    reserve_cost: contingency.reserve_cost,
+                })
+                .collect(),
             deploy_lead_time: op.deploy_lead_time,
         })
         .collect();
@@ -823,6 +1094,9 @@ pub fn snapshot_production_plan_for_player(
                 ProductionDecision::Deferred { unit_type, cost } => {
                     ("deferred", Some(*unit_type), Some(*cost), None)
                 }
+                ProductionDecision::Reserved {
+                    unit_type, cost, ..
+                } => ("reserved", Some(*unit_type), Some(*cost), None),
             };
             ProductionStepSnapshot {
                 operation_kind: format!("{:?}", step.operation_kind),
@@ -841,14 +1115,76 @@ pub fn snapshot_production_plan_for_player(
         })
         .collect();
 
+    let rolling_combat_plans = plan
+        .rolling_combat_plans
+        .iter()
+        .map(|rolling| RollingCombatPlanSnapshot {
+            plan_id: rolling.plan_id.map(|id| id.0),
+            revision: rolling.revision.map(|revision| revision.0),
+            disposition: format!("{:?}", rolling.disposition),
+            replan_reason: rolling.replan_reason.map(|reason| format!("{reason:?}")),
+            operation_kind: format!("{:?}", rolling.operation_kind),
+            anchor_x: rolling.anchor.x,
+            anchor_y: rolling.anchor.y,
+            feasible: rolling.feasible,
+            purchases: rolling
+                .purchases
+                .iter()
+                .map(|purchase| RollingPurchaseSnapshot {
+                    unit_type: purchase.unit_type,
+                    facility_x: purchase.facility.x,
+                    facility_y: purchase.facility.y,
+                    build_turn: purchase.build_turn,
+                    cost: purchase.cost,
+                })
+                .collect(),
+            targets: rolling
+                .targets
+                .iter()
+                .map(|target| RollingTargetSnapshot {
+                    entity_id: target.entity.map(Entity::to_bits),
+                    unit_type: target.unit_type,
+                    available_turn: target.available_turn,
+                    initial_hp: target.initial_hp,
+                    remaining_hp: target.remaining_hp,
+                    destroyed_turn: target.destroyed_turn,
+                })
+                .collect(),
+            turn_forecasts: rolling
+                .turn_forecasts
+                .iter()
+                .map(|forecast| CampaignTurnForecastSnapshot {
+                    turn: forecast.turn,
+                    enemy_arrival_hp: forecast.enemy_arrival_hp,
+                    enemy_hp_removed: forecast.enemy_hp_removed,
+                    friendly_hp_lost: forecast.friendly_hp_lost,
+                    attack_count: forecast.attack_count,
+                })
+                .collect(),
+            first_attack_turn: rolling.first_attack_turn,
+            elimination_turn: rolling.elimination_turn,
+            occupation_turn: rolling.occupation_turn,
+            production_cost: rolling.production_cost,
+            expected_loss: rolling.expected_loss,
+            protected_unit_count: rolling.protected_unit_count,
+            protected_survivor_count: rolling.protected_survivor_count,
+            required_capture_survivor_count: rolling.required_capture_survivor_count,
+            candidates_considered: rolling.candidates_considered,
+            search_truncated: rolling.search_truncated,
+        })
+        .collect();
+
     Some(ProductionPlanSnapshot {
         player_id: plan.player_id.0,
         funds: plan.funds,
         free_facility_count: plan.free_facility_count,
         fallback: plan.fallback,
         leftover_funds: plan.leftover_funds,
+        reserved_funds: plan.reserved_funds,
+        uncommitted_funds: plan.uncommitted_funds,
         operations,
         steps,
+        rolling_combat_plans,
     })
 }
 
@@ -862,6 +1198,9 @@ pub fn snapshot_deployment_audit_for_player(
         .audit_records(player_id)
         .into_iter()
         .map(|record| DeploymentAuditRecordSnapshot {
+            plan_id: record.plan_step.map(|step| step.plan_id.0),
+            plan_revision: record.plan_step.map(|step| step.revision.0),
+            plan_step_id: record.plan_step.map(|step| step.step_id.0),
             entity_id: record.entity.to_bits(),
             unit_type: record.unit_type,
             slot_kind: format!("{:?}", record.slot_kind),
@@ -882,10 +1221,23 @@ pub fn snapshot_deployment_audit_for_player(
             capture_unit_attack_count: record.capture_unit_attack_count,
             transport_unit_attack_count: record.transport_unit_attack_count,
             kill_count: record.kill_count,
+            damage_value_dealt: record.damage_value_dealt,
+            counter_value_received: record.counter_value_received,
+            destroyed_value: record.destroyed_value,
             first_attack_turn: record.first_attack_turn,
             first_attack_eta: record
                 .first_attack_turn
                 .map(|turn| turn.saturating_sub(record.assigned_turn)),
+            forecast_first_attack_eta: record.forecast.first_attack_turn,
+            forecast_elimination_eta: record.forecast.elimination_turn,
+            forecast_occupation_eta: record.forecast.occupation_turn,
+            forecast_package_cost: record.forecast.package_cost,
+            forecast_package_size: record.forecast.package_size,
+            first_attack_eta_delta: record.first_attack_turn.and_then(|turn| {
+                record.forecast.first_attack_turn.map(|forecast| {
+                    i64::from(turn.saturating_sub(record.assigned_turn)) - i64::from(forecast)
+                })
+            }),
         })
         .collect::<Vec<_>>();
     Some(DeploymentAuditSnapshot {
@@ -901,39 +1253,305 @@ pub fn snapshot_deployment_audit_for_player(
     })
 }
 
-/// 現在手番の緊急迎撃について、対象拠点の所有者も含めて写し取る。
-pub fn snapshot_emergency_plan_for_player(
+pub fn snapshot_plan_revisions_for_player(
     world: &World,
     player_id: PlayerId,
-) -> Option<EmergencyPlanSnapshot> {
-    let plan = world.get_resource::<EmergencyMissionPlan>()?;
-    let missions = plan
-        .missions
-        .iter()
-        .filter(|mission| mission.owner_id == player_id)
-        .map(|mission| EmergencyMissionSnapshot {
-            assigned_entity_id: mission.assigned_entity.to_bits(),
-            assigned_unit_type: world
-                .get::<UnitStats>(mission.assigned_entity)
-                .map(|stats| stats.unit_type),
-            threat_entity_id: mission.threat.threat_entity.to_bits(),
-            threat_unit_type: world
-                .get::<UnitStats>(mission.threat.threat_entity)
-                .map(|stats| stats.unit_type),
-            threat_x: mission.threat.threat_position.x,
-            threat_y: mission.threat.threat_position.y,
-            site_x: mission.threat.site_position.x,
-            site_y: mission.threat.site_position.y,
-            site_terrain: format!("{:?}", mission.threat.site_terrain),
-            site_owner_id: mission.threat.site_owner_id.map(|owner| owner.0),
-            eta: mission.threat.eta,
-            response: format!("{:?}", mission.response),
+) -> Vec<PlanRevisionAuditSnapshot> {
+    world
+        .get_resource::<V4RollingPlanRegistry>()
+        .map(|registry| {
+            let audits = registry.audit_records(player_id);
+            // AI行動の末尾では次プレイヤー・次ラウンドへ遷移済みの場合があるため、
+            // 盤面の現在ターンで再フィルタせず、監査自身の最新手番を採用する。
+            let latest_turn = audits.iter().map(|audit| audit.turn).max();
+            audits
+                .into_iter()
+                .filter(|audit| Some(audit.turn) == latest_turn)
+                .map(|audit| PlanRevisionAuditSnapshot {
+                    turn: audit.turn,
+                    plan_id: audit.plan_id.0,
+                    revision: audit.revision.0,
+                    operation_kind: format!("{:?}", audit.kind),
+                    anchor_x: audit.anchor.x,
+                    anchor_y: audit.anchor.y,
+                    disposition: format!("{:?}", audit.disposition),
+                    reason: audit.reason.map(|reason| format!("{reason:?}")),
+                    remaining_steps: audit.remaining_steps,
+                    completion_turn: audit.forecast.completion_turn,
+                    remaining_production_cost: audit.forecast.production_cost,
+                    expected_loss: audit.forecast.expected_loss,
+                    execution: plan_execution_snapshot(&audit.execution),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn snapshot_plan_executions_for_player(
+    world: &World,
+    player_id: PlayerId,
+) -> Vec<ActivePlanExecutionSnapshot> {
+    world
+        .get_resource::<V4RollingPlanRegistry>()
+        .map(|registry| {
+            registry
+                .execution_records(player_id)
+                .into_iter()
+                .map(
+                    |(plan_id, revision, execution)| ActivePlanExecutionSnapshot {
+                        plan_id: plan_id.0,
+                        revision: revision.0,
+                        execution: plan_execution_snapshot(&execution),
+                    },
+                )
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn snapshot_victory_roadmap_for_player(
+    world: &World,
+    player_id: PlayerId,
+) -> Option<VictoryRoadmapSnapshot> {
+    let registry = world.get_resource::<VictoryRoadmapRegistry>()?;
+    let roadmap = registry.roadmap(player_id)?;
+    let operations = registry
+        .operations_for(player_id)
+        .into_iter()
+        .map(|operation| {
+            let mut transport_entity_ids = operation
+                .assigned_transports
+                .iter()
+                .map(|entity| entity.to_bits())
+                .collect::<Vec<_>>();
+            let mut capture_entity_ids = operation
+                .assigned_capturers
+                .iter()
+                .map(|entity| entity.to_bits())
+                .collect::<Vec<_>>();
+            let mut combat_entity_ids = operation
+                .assigned_combat
+                .iter()
+                .map(|entity| entity.to_bits())
+                .collect::<Vec<_>>();
+            transport_entity_ids.sort_unstable();
+            capture_entity_ids.sort_unstable();
+            combat_entity_ids.sort_unstable();
+            let mut combat_plan_ids = operation
+                .combat_plan_ids
+                .iter()
+                .map(|plan_id| plan_id.0)
+                .collect::<Vec<_>>();
+            combat_plan_ids.sort_unstable();
+            StrategicOperationSnapshot {
+                operation_id: operation.id.0,
+                island_id: operation.island_id.0,
+                purpose: format!("{:?}", operation.purpose),
+                phase: format!("{:?}", operation.phase),
+                created_turn: operation.created_turn,
+                last_observed_turn: operation.last_observed_turn,
+                anchor_x: operation.tactical_anchor.x,
+                anchor_y: operation.tactical_anchor.y,
+                objective_property_count: operation.objective_properties.len(),
+                owned_objective_property_count: operation.owned_objective_count,
+                planned_completion_turn: operation.planned_completion_turn,
+                actual_completion_turn: operation.actual_completion_turn,
+                combat_plan_ids,
+                planned_suppression_turn: operation.planned_suppression_turn,
+                transport_entity_ids,
+                capture_entity_ids,
+                combat_entity_ids,
+                planned_steps: operation.execution.planned,
+                completed_steps: operation.execution.completed,
+                blocked_steps: operation.execution.blocked,
+                moves: operation.execution.moves,
+                loads: operation.execution.loads,
+                drops: operation.execution.drops,
+                attacks: operation.execution.attacks,
+                captures: operation.execution.captures,
+                completed_captures: operation.execution.completed_captures,
+                supplies: operation.execution.supplies,
+                waits: operation.execution.waits,
+                deviations: operation.execution.deviations,
+                last_step: operation.last_step.map(|step| format!("{step:?}")),
+                last_progress_turn: operation.last_progress_turn,
+                blocked_reason: operation.blocked_reason.clone(),
+                current_issues: operation
+                    .current_issues
+                    .iter()
+                    .map(|issue| {
+                        format!(
+                            "{:?}:{}",
+                            issue.kind,
+                            issue.entity.map_or_else(
+                                || "none".to_owned(),
+                                |entity| entity.to_bits().to_string()
+                            )
+                        )
+                    })
+                    .collect(),
+                latest_issue_history: operation
+                    .issue_history
+                    .iter()
+                    .rev()
+                    .take(16)
+                    .map(|issue| {
+                        format!(
+                            "T{}:{:?}:{}:{}",
+                            issue.detected_turn,
+                            issue.kind,
+                            issue.entity.map_or(0, Entity::to_bits),
+                            issue.detail
+                        )
+                    })
+                    .collect(),
+                issue_history_count: operation.issue_history.len(),
+                latest_recoveries: operation
+                    .recovery_history
+                    .iter()
+                    .filter(|recovery| recovery.completed_turn == operation.last_observed_turn)
+                    .map(|recovery| {
+                        format!(
+                            "{:?}:{:?}:{}",
+                            recovery.kind,
+                            recovery.cause,
+                            recovery.entity.map_or(0, Entity::to_bits)
+                        )
+                    })
+                    .collect(),
+                recovery_history_count: operation.recovery_history.len(),
+                replan_count: operation.replan_count,
+                last_replan_turn: operation.last_replan_turn,
+                active: operation.active,
+            }
         })
         .collect();
-    Some(EmergencyPlanSnapshot {
-        player_id: player_id.0,
-        missions,
+    let recent_steps = registry
+        .step_history_for(player_id)
+        .into_iter()
+        .rev()
+        .take(64)
+        .map(|record| OperationStepSnapshot {
+            operation_id: record.operation_id.0,
+            entity_id: record.entity.to_bits(),
+            planned_turn: record.planned_turn,
+            resolved_turn: record.resolved_turn,
+            step: format!("{:?}", record.step),
+            target_x: record.target_position.map(|position| position.x),
+            target_y: record.target_position.map(|position| position.y),
+            target_entity_id: record.target_entity.map(Entity::to_bits),
+            completed: record.completed,
+            blocked_reason: record.blocked_reason.clone(),
+        })
+        .collect();
+    Some(VictoryRoadmapSnapshot {
+        roadmap_id: roadmap.id.0,
+        player_id: roadmap.player_id.0,
+        route: format!("{:?}", roadmap.route),
+        created_turn: roadmap.created_turn,
+        last_observed_turn: roadmap.last_observed_turn,
+        enemy_capital_x: roadmap.enemy_capital.map(|position| position.x),
+        enemy_capital_y: roadmap.enemy_capital.map(|position| position.y),
+        enemy_capital_island_id: roadmap.enemy_capital_island.map(|island| island.0),
+        planned_victory_turn: roadmap.planned_victory_turn,
+        actual_victory_turn: roadmap.actual_victory_turn,
+        initial_enemy_unit_count: roadmap.initial_enemy_unit_count,
+        current_enemy_unit_count: roadmap.current_enemy_unit_count,
+        operations,
+        recent_steps,
     })
+}
+
+fn logistics_metrics_snapshot(metrics: LogisticsRouteMetrics) -> LogisticsRouteMetricsSnapshot {
+    LogisticsRouteMetricsSnapshot {
+        normal_assault_ready_turn: metrics.normal_assault_ready_turn,
+        pessimistic_assault_ready_turn: metrics.pessimistic_assault_ready_turn,
+        projected_income_per_turn: metrics.projected_income_per_turn,
+        acquisition_cost: metrics.acquisition_cost,
+        staging_distance: metrics.staging_distance,
+        unsupported_categories: metrics.unsupported_categories,
+    }
+}
+
+pub fn snapshot_logistics_plan_for_player(
+    world: &World,
+    player_id: PlayerId,
+) -> Option<LogisticsPlanSnapshot> {
+    let plan = world
+        .get_resource::<V4LogisticsPlanRegistry>()?
+        .plan(player_id)?;
+    Some(LogisticsPlanSnapshot {
+        plan_id: plan.plan_id,
+        player_id: plan.player_id.0,
+        created_turn: plan.created_turn,
+        revised_turn: plan.revised_turn,
+        last_observed_turn: plan.last_observed_turn,
+        revision: plan.revision,
+        replan_reason: format!("{:?}", plan.replan_reason),
+        route_island_ids: plan.route_islands.iter().map(|island| island.0).collect(),
+        selected_island_ids: plan
+            .selected_islands
+            .iter()
+            .map(|island| island.0)
+            .collect(),
+        stages: plan
+            .stages
+            .iter()
+            .map(|stage| LogisticsStageSnapshot {
+                island_id: stage.island_id.0,
+                planned_completion_turn: stage.planned_completion_turn,
+            })
+            .collect(),
+        direct: logistics_metrics_snapshot(plan.direct_metrics),
+        selected: logistics_metrics_snapshot(plan.selected_metrics),
+        current_forecast: logistics_metrics_snapshot(plan.current_forecast_metrics),
+    })
+}
+
+fn plan_execution_snapshot(execution: &PlanExecutionSnapshot) -> PlanExecutionAuditSnapshot {
+    PlanExecutionAuditSnapshot {
+        created_turn: execution.created_turn,
+        last_observed_turn: execution.last_observed_turn,
+        planned_production_cost: execution.planned_production_cost,
+        committed_production_cost: execution.committed_production_cost,
+        actual_production_cost: execution.actual_production_cost,
+        released_production_cost: execution.released_production_cost,
+        produced_step_count: execution.produced_step_count,
+        assigned_entity_count: execution.assigned_entity_count,
+        active_entity_count: execution.active_entity_count,
+        planned_first_attack_turn: execution.planned_first_attack_turn,
+        actual_first_attack_turn: execution.actual_first_attack_turn,
+        first_attack_delay: execution.first_attack_delay,
+        planned_elimination_turn: execution.planned_elimination_turn,
+        actual_elimination_turn: execution.actual_elimination_turn,
+        elimination_delay: execution.elimination_delay,
+        planned_occupation_turn: execution.planned_occupation_turn,
+        actual_occupation_turn: execution.actual_occupation_turn,
+        occupation_delay: execution.occupation_delay,
+        attack_count: execution.attack_count,
+        priority_attack_count: execution.priority_attack_count,
+        kill_count: execution.kill_count,
+        damage_value_dealt: execution.damage_value_dealt,
+        counter_value_received: execution.counter_value_received,
+        destroyed_value: execution.destroyed_value,
+        current_force_loss: execution.current_force_loss,
+        initial_target_count: execution.initial_target_count,
+        reinforcement_count: execution.reinforcement_count,
+        remaining_target_count: execution.remaining_target_count,
+        objective_property_count: execution.objective_property_count,
+        owned_objective_property_count: execution.owned_objective_property_count,
+        targets: execution
+            .targets
+            .iter()
+            .map(|target| PlanTargetExecutionSnapshot {
+                entity_id: target.entity.to_bits(),
+                planned_destroy_turn: target.planned_destroy_turn,
+                actual_hp: target.actual_hp,
+                neutralized_turn: target.neutralized_turn,
+                reinforcement: target.reinforcement,
+            })
+            .collect(),
+    }
 }
 
 pub fn snapshot_transport_squads(world: &World) -> Vec<TransportSquadSnapshot> {
@@ -1042,8 +1660,8 @@ mod tests {
             neutral_properties: 2,
             friendly_properties: 1,
             enemy_properties: 0,
-            friendly_combat_value: 4_000,
-            enemy_combat_value: 0,
+            friendly_combat_units: 1,
+            enemy_combat_units: 0,
             friendly_arrival_eta: Some(2),
             enemy_arrival_eta: None,
             friendly_capture_eta: Some(4),
@@ -1062,18 +1680,21 @@ mod tests {
             decision: IslandCampaignDecision::Expand,
             target_position: GridPosition { x: 8, y: 4 },
             capture_target_positions: vec![GridPosition { x: 8, y: 4 }],
+            priority_enemy_types: vec![UnitType::Infantry],
             requirement: IslandCampaignRequirement {
                 preferred_transport: Some(UnitType::TransportHelicopter),
                 transport_slots: 2,
                 capture_units: 2,
-                combat_budget: 0,
+                ground_combat_units: 1,
+                combat_units: 0,
                 total_budget: 6_000,
             },
             purchase_shortfall: IslandCampaignRequirement {
                 preferred_transport: Some(UnitType::TransportHelicopter),
                 transport_slots: 1,
                 capture_units: 1,
-                combat_budget: 0,
+                ground_combat_units: 1,
+                combat_units: 0,
                 total_budget: 3_000,
             },
             allocated_budget: 5_000,
@@ -1103,8 +1724,8 @@ mod tests {
             "neutral_properties",
             "friendly_properties",
             "enemy_properties",
-            "friendly_combat_value",
-            "enemy_combat_value",
+            "friendly_combat_units",
+            "enemy_combat_units",
             "friendly_arrival_eta",
             "enemy_arrival_eta",
             "friendly_capture_eta",
@@ -1132,6 +1753,7 @@ mod tests {
             "transport_entity_ids",
             "capture_entity_ids",
             "combat_entity_ids",
+            "priority_enemy_types",
             "purchase_shortfall",
             "operation_ready",
             "continued_from_existing_squad",
@@ -1150,6 +1772,8 @@ mod tests {
             assignment["purchase_shortfall"]["preferred_transport"],
             "TransportHelicopter"
         );
+        assert_eq!(assignment["requirement"]["ground_combat_units"], 1);
+        assert_eq!(assignment["priority_enemy_types"][0], "Infantry");
         assert_eq!(
             assignment["transport_entity_ids"],
             serde_json::json!(sorted_bits(&transport_entities))

@@ -25,8 +25,8 @@ use engine::components::{
     UnitStats,
 };
 use engine::resources::master_data::MasterDataRegistry;
-use engine::resources::{MatchState, Players};
-use engine::setup::initialize_world_from_master_data;
+use engine::resources::{GridTopology, MatchState, Players};
+use engine::setup::initialize_world_from_master_data_with_topology;
 
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -46,6 +46,7 @@ fn parse_player_id(value: u64) -> Result<PlayerId, String> {
 pub struct LoadMapArgs {
     pub map_name: String,
     pub seed: Option<u64>,
+    pub grid_type: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -102,8 +103,26 @@ impl OpenWarsAiServer {
         let registry =
             MasterDataRegistry::load().map_err(|e| format!("Failed to load master data: {}", e))?;
 
-        let (mut world, schedule) = initialize_world_from_master_data(&registry, &args.map_name)
-            .map_err(|e| format!("Initialization failed: {}", e))?;
+        let topology = match args
+            .grid_type
+            .as_deref()
+            .unwrap_or("hex")
+            .to_lowercase()
+            .as_str()
+        {
+            "square" => GridTopology::Square,
+            "hex" => GridTopology::Hex,
+            other => {
+                return Err(format!(
+                    "Unknown grid_type: {}. Expected 'square' or 'hex'",
+                    other
+                ));
+            }
+        };
+
+        let (mut world, schedule) =
+            initialize_world_from_master_data_with_topology(&registry, &args.map_name, topology)
+                .map_err(|e| format!("Initialization failed: {}", e))?;
         if let Some(seed) = args.seed {
             world.insert_resource(engine::resources::GameRng::new(seed));
         }
@@ -482,27 +501,51 @@ impl OpenWarsAiServer {
 
             let mut actions_taken = vec![];
             let mut invasion_events = vec![];
-            let mut factory_relief = vec![];
             let mut step = 0usize;
+            // 1手番の正常な行動数は、盤上Entityと生産施設数に対して線形である。
+            // Cooldown漏れなどで同一Entityが再選択され続けた場合にstdio応答を永久に
+            // 返さない状態を避け、末尾の実行手を診断可能なエラーとして返す。
+            let unit_count = state
+                .world
+                .query::<&engine::components::Faction>()
+                .iter(&state.world)
+                .count();
+            let max_steps = unit_count.saturating_mul(4).saturating_add(64);
+            let trace_ai_steps = std::env::var_os("OPENWARS_TRACE_AI_STEPS").is_some();
             loop {
+                if step >= max_steps {
+                    let recent_actions = actions_taken
+                        .iter()
+                        .rev()
+                        .take(8)
+                        .rev()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    return Err(format!(
+                        "AI turn exceeded {max_steps} steps (units={unit_count}, recent_actions={recent_actions:?})"
+                    ));
+                }
                 let turn = state.world.resource::<MatchState>().current_turn_number.0;
+                if trace_ai_steps {
+                    eprintln!(
+                        "simulate_ai_turn begin player={} turn={} step={}",
+                        active_player_id.0, turn, step
+                    );
+                }
                 let units_before = invasion_trace::snapshot_units(&mut state.world);
+                let decision_started = std::time::Instant::now();
                 let action_taken =
                     engine::ai::engine::execute_ai_turn(&mut state.world, active_player_id);
-                // 解除攻撃で対象が消える前に、この手番中に一度でも生成された計画を保持する。
-                for mission in
-                    invasion_trace::snapshot_factory_relief_plan(&state.world, active_player_id)
-                {
-                    if !factory_relief.iter().any(
-                        |existing: &invasion_trace::FactoryReliefMissionSnapshot| {
-                            existing.assigned_entity == mission.assigned_entity
-                                && existing.threat_entity == mission.threat_entity
-                        },
-                    ) {
-                        factory_relief.push(mission);
-                    }
+                if trace_ai_steps {
+                    eprintln!(
+                        "simulate_ai_turn decided player={} turn={} step={} elapsed_us={} action={:?}",
+                        active_player_id.0,
+                        turn,
+                        step,
+                        decision_started.elapsed().as_micros(),
+                        action_taken
+                    );
                 }
-
                 // イベント処理後に、実行済みの侵攻イベントだけを構造化して収集する。
                 state.schedule.run(&mut state.world);
                 invasion_events.extend(state.invasion_trace.collect_step(
@@ -527,6 +570,10 @@ impl OpenWarsAiServer {
             // 遊兵（任務なし・任務があるのに動けない）の計測結果。engine側がターン終了直前に記録する。
             let idle_audit =
                 invasion_trace::snapshot_idle_audit_for_player(&state.world, active_player_id);
+            let operation_assignments = invasion_trace::snapshot_operation_assignments_for_player(
+                &state.world,
+                active_player_id,
+            );
             // V4の生産判断内訳。V1〜V3は記録が無いためnullになる。
             let production_plan =
                 invasion_trace::snapshot_production_plan_for_player(&state.world, active_player_id);
@@ -535,8 +582,15 @@ impl OpenWarsAiServer {
                 &state.world,
                 active_player_id,
             );
-            let emergency_plan =
-                invasion_trace::snapshot_emergency_plan_for_player(&state.world, active_player_id);
+            let plan_revisions =
+                invasion_trace::snapshot_plan_revisions_for_player(&state.world, active_player_id);
+            let plan_executions =
+                invasion_trace::snapshot_plan_executions_for_player(&state.world, active_player_id);
+            // 勝利条件から島作戦・担当Entity・実行Eventまでを同じIDで追跡する。
+            let victory_roadmap =
+                invasion_trace::snapshot_victory_roadmap_for_player(&state.world, active_player_id);
+            let logistics_plan =
+                invasion_trace::snapshot_logistics_plan_for_player(&state.world, active_player_id);
             let after_metrics = engine::ai::eval::evaluate_board_with_metrics(
                 &mut state.world,
                 active_player_id,
@@ -549,10 +603,13 @@ impl OpenWarsAiServer {
                 "transport_squads": transport_squads,
                 "island_campaign": island_campaign,
                 "idle_audit": idle_audit,
+                "operation_assignments": operation_assignments,
                 "production_plan": production_plan,
                 "deployment_audit": deployment_audit,
-                "emergency_plan": emergency_plan,
-                "factory_relief": factory_relief,
+                "plan_revisions": plan_revisions,
+                "plan_executions": plan_executions,
+                "victory_roadmap": victory_roadmap,
+                "logistics_plan": logistics_plan,
                 "player_id": active_player_id.0,
                 "player_index": active_player_index.0,
                 "before_score": before_metrics.total_score,

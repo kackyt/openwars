@@ -264,13 +264,42 @@ where
                     let _ = l.process_events(world);
                 }
 
-                if let Some(mut events) = world.get_resource_mut::<Events<UnitAttackedEvent>>() {
-                    for ev in events.drain() {
-                        let a_before_disp = (ev.attacker_hp_before.saturating_add(9)) / 10;
-                        let a_after_disp = (ev.attacker_hp_after.saturating_add(9)) / 10;
-                        let d_before_disp = (ev.defender_hp_before.saturating_add(9)) / 10;
-                        let d_after_disp = (ev.defender_hp_after.saturating_add(9)) / 10;
+                let attacked_evs = if let Some(mut events) =
+                    world.get_resource_mut::<Events<UnitAttackedEvent>>()
+                {
+                    events.drain().collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
 
+                for ev in attacked_evs {
+                    let a_before_disp = (ev.attacker_hp_before.saturating_add(9)) / 10;
+                    let a_after_disp = (ev.attacker_hp_after.saturating_add(9)) / 10;
+                    let d_before_disp = (ev.defender_hp_before.saturating_add(9)) / 10;
+                    let d_after_disp = (ev.defender_hp_after.saturating_add(9)) / 10;
+
+                    let log_text = format!(
+                        "戦闘: 攻撃側 HP {}->{}, 防御側 HP {}->{}",
+                        a_before_disp, a_after_disp, d_before_disp, d_after_disp
+                    );
+                    app.ui_state.add_log(log_text);
+
+                    // 攻撃側・防御側の両方がAIか、または人間プレイヤーが存在しない場合はモーダルを出さない
+                    let mut both_ai = false;
+                    if !app.ui_state.has_human_player() {
+                        both_ai = true;
+                    } else {
+                        let mut q_faction = world.query::<&engine::components::Faction>();
+                        if let Ok(att_f) = q_faction.get(world, ev.attacker)
+                            && let Ok(def_f) = q_faction.get(world, ev.defender)
+                            && !app.ui_state.is_human(att_f.0.0)
+                            && !app.ui_state.is_human(def_f.0.0)
+                        {
+                            both_ai = true;
+                        }
+                    }
+
+                    if !both_ai {
                         let text = format!(
                             "戦闘結果\n攻撃側 HP: {} -> {}\n防御側 HP: {} -> {}",
                             a_before_disp, a_after_disp, d_before_disp, d_after_disp

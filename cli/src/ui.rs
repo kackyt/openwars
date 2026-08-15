@@ -495,195 +495,322 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
     }
 
     // 右側: 情報 & ログの表示準備
-    let mut info_text = String::new();
+    let mut right_panel_text = String::new();
+    let panel_title;
 
-    if let Some(world) = &mut app.world {
-        // プレイヤー情報
-        if let (Some(match_state), Some(players)) = (
-            world.get_resource::<engine::resources::MatchState>(),
-            world.get_resource::<engine::resources::Players>(),
-        ) && !players.0.is_empty()
-        {
-            let active_player = &players.0[match_state.active_player_index.0];
-            let turn = match_state.current_turn_number.0;
-            let name = active_player.name.clone();
-            let id = active_player.id.0;
-            let funds = active_player.funds;
-            let control_mode = if app.ui_state.is_human(id) {
-                "Human"
-            } else {
-                "AI"
-            };
-            info_text.push_str(&format!(
-                "ターン: {} (P{} : {} [{}])\n",
-                turn, id, name, control_mode
-            ));
-            info_text.push_str(&format!("資金: {}\n\n", funds));
-        }
-
-        // ユニット情報
-        for (
-            u_pos,
-            u_faction,
-            u_stats,
-            u_health,
-            u_fuel,
-            u_ammo,
-            transporting,
-            action_completed,
-            has_moved,
-            cargo_capacity,
-        ) in world
-            .query::<(
-                &engine::components::GridPosition,
-                &engine::components::Faction,
-                &engine::components::UnitStats,
-                &engine::components::Health,
-                Option<&engine::components::Fuel>,
-                Option<&engine::components::Ammo>,
-                Option<&engine::components::Transporting>,
-                &engine::components::ActionCompleted,
-                Option<&engine::components::HasMoved>,
-                Option<&engine::components::CargoCapacity>,
-            )>()
-            .iter(world)
-        {
-            if transporting.is_some() {
-                continue;
-            }
-            if u_pos.x == cx && u_pos.y == cy {
-                info_text.push_str("--- ユニット情報 ---\n");
-                info_text.push_str(&format!(
-                    "{} (P{})\n",
-                    u_stats.unit_type.as_str(),
-                    u_faction.0.0
-                ));
-
-                let display_hp = (u_health.current.saturating_add(9)) / 10;
-                let mut hp_fuel = format!("HP: {}/10", display_hp);
-                if let Some(f) = u_fuel {
-                    hp_fuel.push_str(&format!("  燃料: {}/{}", f.current, f.max));
-                }
-                info_text.push_str(&format!("{}\n", hp_fuel));
-
-                if let Some(w) = u_ammo
-                    && (w.max_ammo1 > 0 || w.max_ammo2 > 0)
+    match app.ui_state.right_panel_mode {
+        crate::app::RightPanelMode::Info => {
+            panel_title = " 情報 (Tab:スタッツ) ";
+            if let Some(world) = &mut app.world {
+                // プレイヤー情報
+                if let (Some(match_state), Some(players)) = (
+                    world.get_resource::<engine::resources::MatchState>(),
+                    world.get_resource::<engine::resources::Players>(),
+                ) && !players.0.is_empty()
                 {
-                    let mut ammo_line = String::new();
-                    if w.max_ammo1 > 0 {
-                        let mut w_name = "武器1";
-                        if let Some(record) =
-                            app.master_data
-                                .get_unit(&engine::resources::master_data::UnitName(
-                                    u_stats.unit_type.as_str().to_string(),
-                                ))
-                            && let Some(name) = &record.weapon1
-                        {
-                            w_name = name;
-                        }
-                        ammo_line.push_str(&format!("{}: {}/{}", w_name, w.ammo1, w.max_ammo1));
-                    }
-                    if w.max_ammo2 > 0 {
-                        let mut w_name = "武器2";
-                        if let Some(record) =
-                            app.master_data
-                                .get_unit(&engine::resources::master_data::UnitName(
-                                    u_stats.unit_type.as_str().to_string(),
-                                ))
-                            && let Some(name) = &record.weapon2
-                        {
-                            w_name = name;
-                        }
-                        if !ammo_line.is_empty() {
-                            ammo_line.push_str("  ");
-                        }
-                        ammo_line.push_str(&format!("{}: {}/{}", w_name, w.ammo2, w.max_ammo2));
-                    }
-                    info_text.push_str(&format!("{}\n", ammo_line));
-                }
-
-                let status = if action_completed.0 {
-                    "行動終了"
-                } else if has_moved.map(|h| h.0).unwrap_or(false) {
-                    "移動済み"
-                } else {
-                    "未行動"
-                };
-                let mut status_line = format!("状態: {}", status);
-                if let Some(cargo) = cargo_capacity
-                    && !cargo.loaded.is_empty()
-                {
-                    status_line.push_str(&format!("  搭載: {}体", cargo.loaded.len()));
-                }
-                info_text.push_str(&format!("{}\n", status_line));
-                info_text.push_str("-----------------\n\n");
-                break;
-            }
-        }
-
-        // 地形情報の表示
-        if let Some(map) = world.get_resource::<engine::resources::Map>()
-            && let Some(terrain) = map.get_terrain(cx, cy)
-        {
-            if let Some(master_data) = world.get_resource::<engine::resources::MasterDataRegistry>()
-            {
-                info_text.push_str(&format!(
-                    "{} (防: {})\n",
-                    terrain.as_str(),
-                    master_data.get_terrain_defense_bonus(terrain)
-                ));
-            } else {
-                info_text.push_str(&format!("{}\n", terrain.as_str()));
-            }
-
-            let mut q_prop = world.query::<(
-                &engine::components::GridPosition,
-                &engine::components::Property,
-            )>();
-            for (p_pos, prop) in q_prop.iter(world) {
-                if p_pos.x == cx && p_pos.y == cy {
-                    info_text.push_str(&format!(
-                        "占領: {}/{}\n",
-                        prop.display_capture_points(),
-                        prop.display_max_capture_points()
+                    let active_player = &players.0[match_state.active_player_index.0];
+                    let turn = match_state.current_turn_number.0;
+                    let name = active_player.name.clone();
+                    let id = active_player.id.0;
+                    let funds = active_player.funds;
+                    let control_mode = if app.ui_state.is_human(id) {
+                        "Human"
+                    } else {
+                        "AI"
+                    };
+                    right_panel_text.push_str(&format!(
+                        "ターン: {} (P{} : {} [{}])\n",
+                        turn, id, name, control_mode
                     ));
-                    break;
+                    right_panel_text.push_str(&format!("資金: {}\n\n", funds));
+                }
+
+                // ユニット情報
+                for (
+                    u_pos,
+                    u_faction,
+                    u_stats,
+                    u_health,
+                    u_fuel,
+                    u_ammo,
+                    transporting,
+                    action_completed,
+                    has_moved,
+                    cargo_capacity,
+                ) in world
+                    .query::<(
+                        &engine::components::GridPosition,
+                        &engine::components::Faction,
+                        &engine::components::UnitStats,
+                        &engine::components::Health,
+                        Option<&engine::components::Fuel>,
+                        Option<&engine::components::Ammo>,
+                        Option<&engine::components::Transporting>,
+                        &engine::components::ActionCompleted,
+                        Option<&engine::components::HasMoved>,
+                        Option<&engine::components::CargoCapacity>,
+                    )>()
+                    .iter(world)
+                {
+                    if transporting.is_some() {
+                        continue;
+                    }
+                    if u_pos.x == cx && u_pos.y == cy {
+                        right_panel_text.push_str("--- ユニット情報 ---\n");
+                        right_panel_text.push_str(&format!(
+                            "{} (P{})\n",
+                            u_stats.unit_type.as_str(),
+                            u_faction.0.0
+                        ));
+
+                        let display_hp = (u_health.current.saturating_add(9)) / 10;
+                        let mut hp_fuel = format!("HP: {}/10", display_hp);
+                        if let Some(f) = u_fuel {
+                            hp_fuel.push_str(&format!("  燃料: {}/{}", f.current, f.max));
+                        }
+                        right_panel_text.push_str(&format!("{}\n", hp_fuel));
+
+                        if let Some(w) = u_ammo
+                            && (w.max_ammo1 > 0 || w.max_ammo2 > 0)
+                        {
+                            let mut ammo_line = String::new();
+                            if w.max_ammo1 > 0 {
+                                let mut w_name = "武器1";
+                                if let Some(record) = app.master_data.get_unit(
+                                    &engine::resources::master_data::UnitName(
+                                        u_stats.unit_type.as_str().to_string(),
+                                    ),
+                                ) && let Some(name) = &record.weapon1
+                                {
+                                    w_name = name;
+                                }
+                                ammo_line
+                                    .push_str(&format!("{}: {}/{}", w_name, w.ammo1, w.max_ammo1));
+                            }
+                            if w.max_ammo2 > 0 {
+                                let mut w_name = "武器2";
+                                if let Some(record) = app.master_data.get_unit(
+                                    &engine::resources::master_data::UnitName(
+                                        u_stats.unit_type.as_str().to_string(),
+                                    ),
+                                ) && let Some(name) = &record.weapon2
+                                {
+                                    w_name = name;
+                                }
+                                if !ammo_line.is_empty() {
+                                    ammo_line.push_str("  ");
+                                }
+                                ammo_line
+                                    .push_str(&format!("{}: {}/{}", w_name, w.ammo2, w.max_ammo2));
+                            }
+                            right_panel_text.push_str(&format!("{}\n", ammo_line));
+                        }
+
+                        let status = if action_completed.0 {
+                            "行動終了"
+                        } else if has_moved.map(|h| h.0).unwrap_or(false) {
+                            "移動済み"
+                        } else {
+                            "未行動"
+                        };
+                        let mut status_line = format!("状態: {}", status);
+                        if let Some(cargo) = cargo_capacity
+                            && !cargo.loaded.is_empty()
+                        {
+                            status_line.push_str(&format!("  搭載: {}体", cargo.loaded.len()));
+                        }
+                        right_panel_text.push_str(&format!("{}\n", status_line));
+                        right_panel_text.push_str("-----------------\n\n");
+                        break;
+                    }
+                }
+
+                // 地形情報の表示
+                if let Some(map) = world.get_resource::<engine::resources::Map>()
+                    && let Some(terrain) = map.get_terrain(cx, cy)
+                {
+                    if let Some(master_data) =
+                        world.get_resource::<engine::resources::MasterDataRegistry>()
+                    {
+                        right_panel_text.push_str(&format!(
+                            "{} (防: {})\n",
+                            terrain.as_str(),
+                            master_data.get_terrain_defense_bonus(terrain)
+                        ));
+                    } else {
+                        right_panel_text.push_str(&format!("{}\n", terrain.as_str()));
+                    }
+
+                    let mut q_prop = world.query::<(
+                        &engine::components::GridPosition,
+                        &engine::components::Property,
+                    )>();
+                    for (p_pos, prop) in q_prop.iter(world) {
+                        if p_pos.x == cx && p_pos.y == cy {
+                            right_panel_text.push_str(&format!(
+                                "占領: {}/{}\n",
+                                prop.display_capture_points(),
+                                prop.display_max_capture_points()
+                            ));
+                            break;
+                        }
+                    }
+                    right_panel_text.push_str("-----------------\n\n");
                 }
             }
-            info_text.push_str("-----------------\n\n");
+            right_panel_text.push_str(
+                "q:終了 / Esc:戻る / Tab:スタッツ\n方向キー:移動 / Space:決定\nx:キャンセル",
+            );
+        }
+        crate::app::RightPanelMode::Stats => {
+            panel_title = " 両軍スタッツ (Tab:情報) ";
+            if let Some(world) = &mut app.world {
+                let mut turn_num = 0;
+                let mut player_info_list = Vec::new();
+
+                if let (Some(match_state), Some(players)) = (
+                    world.get_resource::<engine::resources::MatchState>(),
+                    world.get_resource::<engine::resources::Players>(),
+                ) {
+                    turn_num = match_state.current_turn_number.0;
+                    for p in &players.0 {
+                        player_info_list.push((p.id.0, p.name.clone(), p.funds));
+                    }
+                }
+
+                if !player_info_list.is_empty() {
+                    right_panel_text.push_str(&format!("--- ターン {} ---\n\n", turn_num));
+
+                    // 拠点の所有状況と収入の集計
+                    let mut property_counts = std::collections::HashMap::<u32, u32>::new();
+                    let mut income_counts = std::collections::HashMap::<u32, u32>::new();
+
+                    let mut owned_properties = Vec::new();
+                    let mut q_prop = world.query::<(
+                        &engine::components::GridPosition,
+                        &engine::components::Property,
+                    )>();
+                    for (pos, prop) in q_prop.iter(world) {
+                        if let Some(owner) = prop.owner_id {
+                            owned_properties.push(((pos.x, pos.y), owner.0));
+                        }
+                    }
+
+                    if let (Some(map), Some(master_data)) = (
+                        world.get_resource::<engine::resources::Map>(),
+                        world.get_resource::<engine::resources::MasterDataRegistry>(),
+                    ) {
+                        for ((x, y), owner_id) in owned_properties {
+                            *property_counts.entry(owner_id).or_insert(0) += 1;
+                            if let Some(terrain) = map.get_terrain(x, y) {
+                                let inc = master_data.landscape_income(terrain.as_str());
+                                *income_counts.entry(owner_id).or_insert(0) += inc;
+                            }
+                        }
+                    }
+
+                    // ユニットの集計 (種類ごとの数と総数)
+                    let mut unit_counts = std::collections::HashMap::<
+                        u32,
+                        std::collections::BTreeMap<String, u32>,
+                    >::new();
+                    let mut unit_totals = std::collections::HashMap::<u32, u32>::new();
+
+                    let mut q_unit = world
+                        .query::<(&engine::components::Faction, &engine::components::UnitStats)>();
+                    for (faction, stats) in q_unit.iter(world) {
+                        let pid = faction.0.0;
+                        let type_str = stats.unit_type.as_str().to_string();
+                        *unit_counts
+                            .entry(pid)
+                            .or_default()
+                            .entry(type_str)
+                            .or_insert(0) += 1;
+                        *unit_totals.entry(pid).or_insert(0) += 1;
+                    }
+
+                    for (pid, name, funds) in player_info_list {
+                        let control = if app.ui_state.is_human(pid) {
+                            "Human"
+                        } else {
+                            "AI"
+                        };
+                        let props = property_counts.get(&pid).copied().unwrap_or(0);
+                        let income = income_counts.get(&pid).copied().unwrap_or(0);
+                        let total_units = unit_totals.get(&pid).copied().unwrap_or(0);
+
+                        right_panel_text
+                            .push_str(&format!("【P{} : {} [{}]】\n", pid, name, control));
+                        right_panel_text
+                            .push_str(&format!(" 資金: {}  (収入: +{})\n", funds, income));
+                        right_panel_text.push_str(&format!(" 拠点数: {}\n", props));
+                        right_panel_text.push_str(&format!(" ユニット (計 {}体):\n", total_units));
+
+                        if let Some(types) = unit_counts.get(&pid) {
+                            let mut type_line = String::new();
+                            for (u_name, count) in types {
+                                if !type_line.is_empty() {
+                                    type_line.push(' ');
+                                }
+                                type_line.push_str(&format!("{}:{}", u_name, count));
+                                if type_line.len() > 22 {
+                                    right_panel_text.push_str(&format!("  {}\n", type_line));
+                                    type_line.clear();
+                                }
+                            }
+                            if !type_line.is_empty() {
+                                right_panel_text.push_str(&format!("  {}\n", type_line));
+                            }
+                        } else {
+                            right_panel_text.push_str("  (なし)\n");
+                        }
+                        right_panel_text.push('\n');
+                    }
+                }
+            }
+            right_panel_text.push_str("-----------------\nTab / s : 情報へ切替");
         }
     }
-    info_text.push_str("q:終了 / Esc:戻る\n方向キー:移動 / Space:決定\nx:キャンセル");
 
-    // レイアウト計算：表示内容の行数に応じて情報パネルの高さを調整
-    // 行数に上下のボーダー分（+2）と、ある程度の余白を加えて動的に計算
-    let info_height = (info_text.lines().count() as u16).saturating_add(3);
-    let info_height = info_height.max(12); // 最低限の高さを確保
-    let right_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(info_height), Constraint::Min(0)])
-        .split(chunks[1]);
+    match app.ui_state.right_panel_mode {
+        crate::app::RightPanelMode::Info => {
+            // レイアウト計算：表示内容の行数に応じて情報パネルの高さを調整
+            let panel_height = (right_panel_text.lines().count() as u16).saturating_add(3);
+            let panel_height = panel_height.max(12); // 最低限の高さを確保
+            let right_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(panel_height), Constraint::Min(0)])
+                .split(chunks[1]);
 
-    let info_block = Block::default().title(" 情報 ").borders(Borders::ALL);
-    let info_paragraph = Paragraph::new(info_text)
-        .block(info_block)
-        .wrap(Wrap { trim: true });
-    f.render_widget(info_paragraph, right_chunks[0]);
+            let top_panel_block = Block::default().title(panel_title).borders(Borders::ALL);
+            let top_panel_paragraph = Paragraph::new(right_panel_text)
+                .block(top_panel_block)
+                .wrap(Wrap { trim: true });
+            f.render_widget(top_panel_paragraph, right_chunks[0]);
 
-    // ログパネル
-    let logs_block = Block::default().title(" ログ ").borders(Borders::ALL);
-    let logs_text = app
-        .ui_state
-        .log_messages
-        .iter()
-        .rev()
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n");
-    let logs_paragraph = Paragraph::new(logs_text)
-        .block(logs_block)
-        .wrap(Wrap { trim: true });
-    f.render_widget(logs_paragraph, right_chunks[1]);
+            // ログパネル
+            let logs_block = Block::default().title(" ログ ").borders(Borders::ALL);
+            let logs_text = app
+                .ui_state
+                .log_messages
+                .iter()
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
+            let logs_paragraph = Paragraph::new(logs_text)
+                .block(logs_block)
+                .wrap(Wrap { trim: true });
+            f.render_widget(logs_paragraph, right_chunks[1]);
+        }
+        crate::app::RightPanelMode::Stats => {
+            let stats_block = Block::default().title(panel_title).borders(Borders::ALL);
+            let stats_paragraph = Paragraph::new(right_panel_text)
+                .block(stats_block)
+                .wrap(Wrap { trim: true });
+            f.render_widget(stats_paragraph, chunks[1]);
+        }
+    }
 
     match &app.ui_state.in_game_state {
         crate::app::InGameState::EventPopup { message } => {

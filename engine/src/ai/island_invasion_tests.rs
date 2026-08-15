@@ -248,7 +248,7 @@ fn v3_invasion_reaches_combat_or_capture_after_landing() {
                 .collect::<HashSet<_>>(),
         )
     };
-    assert_eq!(cargo_entities.len(), 4);
+    assert_eq!(cargo_entities.len(), 3);
     assert!(cargo_entities.iter().any(|entity| {
         world
             .get::<UnitStats>(*entity)

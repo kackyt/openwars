@@ -7,12 +7,220 @@ use crate::components::{
     ActionCompleted, Faction, GridPosition, HasMoved, Health, PlayerId, Property, UnitStats,
 };
 use crate::events::{AttackUnitCommand, CapturePropertyCommand, MoveUnitCommand, WaitUnitCommand};
-use crate::resources::master_data::MasterDataRegistry;
-use crate::resources::{Map, Terrain};
+use crate::resources::master_data::{MasterDataRegistry, UnitName, WeaponRecord};
+use crate::resources::{GridTopology, Map, Terrain, UnitType};
 use crate::systems::combat::get_expected_damage;
 use crate::systems::movement::{OccupantInfo, calculate_reachable_tiles};
 use bevy_ecs::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
+
+#[derive(Debug, Clone, Copy)]
+struct TacticalSnapshotUnit {
+    entity: Entity,
+    position: GridPosition,
+    faction: PlayerId,
+    unit_type: UnitType,
+    ammo1: u32,
+    ammo2: u32,
+    is_transporting: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TacticalSnapshotProperty {
+    owner: Option<PlayerId>,
+    capture_points: u32,
+    max_capture_points: u32,
+}
+
+/// 1回の行動選択中に不変な盤面情報を索引化し、移動候補ごとの ECS 全走査を避けます。
+struct AiTacticalSnapshot {
+    topology: GridTopology,
+    units: Vec<TacticalSnapshotUnit>,
+    unit_indices: HashMap<Entity, usize>,
+    units_by_position: HashMap<(usize, usize), Vec<usize>>,
+    properties: HashMap<(usize, usize), TacticalSnapshotProperty>,
+    weapons: HashMap<UnitType, (Option<WeaponRecord>, Option<WeaponRecord>)>,
+}
+
+impl AiTacticalSnapshot {
+    fn from_world(
+        world: &mut World,
+        registry: &MasterDataRegistry,
+        topology: GridTopology,
+    ) -> Self {
+        let mut units = Vec::new();
+        let mut unit_indices = HashMap::new();
+        let mut units_by_position: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+        {
+            let mut query = world.query::<(
+                Entity,
+                &GridPosition,
+                &Faction,
+                &UnitStats,
+                Option<&crate::components::Ammo>,
+                Option<&crate::components::Transporting>,
+            )>();
+            for (entity, position, faction, stats, ammo, transporting) in query.iter(world) {
+                let index = units.len();
+                units.push(TacticalSnapshotUnit {
+                    entity,
+                    position: *position,
+                    faction: faction.0,
+                    unit_type: stats.unit_type,
+                    ammo1: ammo.map_or(0, |value| value.ammo1),
+                    ammo2: ammo.map_or(0, |value| value.ammo2),
+                    is_transporting: transporting.is_some(),
+                });
+                unit_indices.insert(entity, index);
+                units_by_position
+                    .entry((position.x, position.y))
+                    .or_default()
+                    .push(index);
+            }
+        }
+
+        let properties = {
+            let mut query = world.query::<(&GridPosition, &Property)>();
+            query
+                .iter(world)
+                .map(|(position, property)| {
+                    (
+                        (position.x, position.y),
+                        TacticalSnapshotProperty {
+                            owner: property.owner_id,
+                            capture_points: property.capture_points,
+                            max_capture_points: property.max_capture_points,
+                        },
+                    )
+                })
+                .collect()
+        };
+
+        let weapons = units
+            .iter()
+            .map(|unit| unit.unit_type)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|unit_type| {
+                let unit_record = registry.get_unit(&UnitName(unit_type.as_str().to_string()));
+                let pair = unit_record.map_or((None, None), |record| {
+                    let primary = record
+                        .weapon1
+                        .as_ref()
+                        .and_then(|name| registry.weapons.get(&UnitName(name.clone())))
+                        .cloned();
+                    let secondary = record
+                        .weapon2
+                        .as_ref()
+                        .and_then(|name| registry.weapons.get(&UnitName(name.clone())))
+                        .cloned();
+                    (primary, secondary)
+                });
+                (unit_type, pair)
+            })
+            .collect();
+
+        Self {
+            topology,
+            units,
+            unit_indices,
+            units_by_position,
+            properties,
+            weapons,
+        }
+    }
+
+    fn action_targets_at(
+        &self,
+        attacker: Entity,
+        stats: &UnitStats,
+        position: GridPosition,
+        is_moved: bool,
+    ) -> crate::systems::action::TacticalActionTargets {
+        let Some(&attacker_index) = self.unit_indices.get(&attacker) else {
+            return crate::systems::action::TacticalActionTargets::default();
+        };
+        let attacker_unit = self.units[attacker_index];
+        let position_indices = self
+            .units_by_position
+            .get(&(position.x, position.y))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let is_occupied_by_other = position_indices.iter().any(|&index| {
+            let unit = self.units[index];
+            unit.entity != attacker && !unit.is_transporting
+        });
+
+        let mergeable_targets = position_indices
+            .iter()
+            .filter_map(|&index| {
+                let target = self.units[index];
+                (target.entity != attacker
+                    && target.faction == attacker_unit.faction
+                    && target.unit_type == stats.unit_type)
+                    .then_some(target.entity)
+            })
+            .collect();
+
+        let (can_capture, can_repair) = self
+            .properties
+            .get(&(position.x, position.y))
+            .filter(|property| stats.can_capture && property.max_capture_points > 0)
+            .map_or((false, false), |property| {
+                if property.owner == Some(attacker_unit.faction) {
+                    (false, property.capture_points < property.max_capture_points)
+                } else {
+                    (true, false)
+                }
+            });
+
+        let attackable_targets = if is_occupied_by_other {
+            Vec::new()
+        } else {
+            let (primary, secondary) = self
+                .weapons
+                .get(&stats.unit_type)
+                .map(|(primary, secondary)| (primary.as_ref(), secondary.as_ref()))
+                .unwrap_or((None, None));
+            self.units
+                .iter()
+                .filter_map(|target| {
+                    if target.entity == attacker || target.faction == attacker_unit.faction {
+                        return None;
+                    }
+                    let distance = self.topology.distance(
+                        (position.x, position.y),
+                        (target.position.x, target.position.y),
+                    );
+                    let weapon_can_attack = |weapon: &WeaponRecord, ammo: u32| {
+                        weapon
+                            .damages
+                            .get(target.unit_type.as_str())
+                            .copied()
+                            .unwrap_or(0)
+                            > 0
+                            && ammo > 0
+                            && (distance <= 1 || !is_moved)
+                            && distance >= weapon.range_min
+                            && distance <= weapon.range_max
+                    };
+                    (primary.is_some_and(|weapon| weapon_can_attack(weapon, attacker_unit.ammo1))
+                        || secondary
+                            .is_some_and(|weapon| weapon_can_attack(weapon, attacker_unit.ammo2)))
+                    .then_some(target.entity)
+                })
+                .collect()
+        };
+
+        crate::systems::action::TacticalActionTargets {
+            attackable_targets,
+            mergeable_targets,
+            can_capture: !is_occupied_by_other && can_capture,
+            can_repair: !is_occupied_by_other && can_repair,
+            can_wait: !is_occupied_by_other || !is_moved,
+        }
+    }
+}
 
 #[derive(Resource, Default)]
 pub struct AiActionCooldown(pub HashSet<Entity>);
@@ -73,6 +281,75 @@ fn strategic_target_value(
 #[derive(Resource, Default)]
 pub struct AiProductionCooldown(pub HashSet<(usize, usize)>);
 
+/// 同じ手番に一度作った複数施設分の生産命令を順番に発行します。
+/// 生産計画は予算と使用施設を全命令分シミュレート済みなので、1体ごとに盤面分析から
+/// やり直さず、敵が行動しない同一生産フェーズでは計画列をそのまま消費します。
+#[derive(Resource, Default)]
+struct AiProductionCommandQueue {
+    player_id: Option<PlayerId>,
+    turn: u32,
+    commands: VecDeque<crate::events::ProduceUnitCommand>,
+}
+
+/// 現在手番の一括生産計画から、まだ試行していない次の命令だけを取り出す。
+/// 生産済みunitは同じ手番に行動できないため、キューが残っている間は通常行動を
+/// 再探索せずとも、前回の「全行動候補なし」という判定を安全に引き継げる。
+fn take_next_queued_production_command(
+    world: &mut World,
+    player_id: PlayerId,
+    turn: u32,
+) -> Option<crate::events::ProduceUnitCommand> {
+    let cooldown = world
+        .get_resource::<AiProductionCooldown>()
+        .map(|resource| resource.0.clone())
+        .unwrap_or_default();
+    let (last_error, last_event) = world
+        .get_resource::<crate::resources::ProductionDiagnostic>()
+        .map(|diagnostic| (diagnostic.last_error.clone(), diagnostic.last_event.clone()))
+        .unwrap_or_default();
+    let mut queue = world
+        .remove_resource::<AiProductionCommandQueue>()
+        .unwrap_or_default();
+    if queue.player_id != Some(player_id) || queue.turn != turn {
+        queue.player_id = Some(player_id);
+        queue.turn = turn;
+        queue.commands.clear();
+    }
+
+    let mut command = None;
+    while let Some(candidate) = queue.commands.pop_front() {
+        let candidate_text = format!("{:?}", candidate);
+        if cooldown.contains(&(candidate.target_x, candidate.target_y))
+            || last_error.is_some() && last_event.as_deref() == Some(candidate_text.as_str())
+        {
+            continue;
+        }
+        command = Some(candidate);
+        break;
+    }
+    world.insert_resource(queue);
+    command
+}
+
+fn issue_production_command(
+    world: &mut World,
+    command: crate::events::ProduceUnitCommand,
+) -> Option<String> {
+    let command_text = format!("{:?}", command);
+    if let Some(mut cooldown) = world.get_resource_mut::<AiProductionCooldown>() {
+        cooldown.0.insert((command.target_x, command.target_y));
+    } else {
+        world.insert_resource(AiProductionCooldown(HashSet::from([(
+            command.target_x,
+            command.target_y,
+        )])));
+    }
+    world
+        .get_resource_mut::<Events<crate::events::ProduceUnitCommand>>()?
+        .send(command);
+    Some(command_text)
+}
+
 /// V3が同一ターンの部隊計画と島嶼キャンペーン分析を再実行しないための一時cache。
 /// 次フェーズでResourceごと削除し、キャンペーンの永続状態としては扱わない。
 #[derive(Resource, Default)]
@@ -83,6 +360,12 @@ pub struct AiTurnStrategyCache {
     campaign_production_planned: bool,
     campaign_production_commands: VecDeque<crate::events::ProduceUnitCommand>,
     campaign_production_blocks_generic: bool,
+    campaign_production_generic_budget: Option<u32>,
+    /// 生産フェーズの全施設分を一括計画済み。後続呼び出しは再分析せず終了する。
+    production_batch_planned: bool,
+    /// 同じ自軍手番中、敵占有マスが変わらない間だけ再利用できる正確なターン距離。
+    action_distance_enemy_positions: Vec<(usize, usize)>,
+    action_distance_cache: TurnDistanceCache,
 }
 
 impl AiTurnStrategyCache {
@@ -119,6 +402,9 @@ impl AiTurnStrategyCache {
         self.player_id == Some(player_id) && self.squads_planned
     }
 
+    /// 輸送完了・占領完了で手番途中にSquadを失ったEntityの再配置を、
+    /// 全通常行動が尽きた時点で1回だけ許可する。
+    #[cfg(test)]
     pub(crate) fn set_campaign_production_plan(
         &mut self,
         player_id: PlayerId,
@@ -132,6 +418,24 @@ impl AiTurnStrategyCache {
         self.campaign_production_planned = true;
         self.campaign_production_commands = VecDeque::from(commands);
         self.campaign_production_blocks_generic = !completed_all_rows;
+        self.campaign_production_generic_budget = None;
+    }
+
+    /// V4の島嶼予約を保護しつつ、超過資金だけを汎用戦闘生産へ渡す。
+    pub(crate) fn set_campaign_production_plan_with_generic_budget(
+        &mut self,
+        player_id: PlayerId,
+        commands: Vec<crate::events::ProduceUnitCommand>,
+        generic_budget: u32,
+    ) {
+        if self.player_id != Some(player_id) {
+            self.clear();
+            self.player_id = Some(player_id);
+        }
+        self.campaign_production_planned = true;
+        self.campaign_production_commands = VecDeque::from(commands);
+        self.campaign_production_blocks_generic = generic_budget == 0;
+        self.campaign_production_generic_budget = Some(generic_budget);
     }
 
     pub(crate) fn campaign_production_planned(&self, player_id: PlayerId) -> bool {
@@ -151,6 +455,45 @@ impl AiTurnStrategyCache {
         self.player_id == Some(player_id) && self.campaign_production_blocks_generic
     }
 
+    pub(crate) fn campaign_production_generic_budget(&self, player_id: PlayerId) -> Option<u32> {
+        (self.player_id == Some(player_id))
+            .then_some(self.campaign_production_generic_budget)
+            .flatten()
+    }
+
+    pub(crate) fn mark_production_batch_planned(&mut self, player_id: PlayerId) {
+        if self.player_id != Some(player_id) {
+            self.clear();
+            self.player_id = Some(player_id);
+        }
+        self.production_batch_planned = true;
+    }
+
+    pub(crate) fn production_batch_planned(&self, player_id: PlayerId) -> bool {
+        self.player_id == Some(player_id) && self.production_batch_planned
+    }
+
+    /// 敵の通行阻害配置が変化した場合だけ距離cacheを破棄して貸し出す。
+    fn take_action_distance_cache(
+        &mut self,
+        player_id: PlayerId,
+        enemy_positions: &[(usize, usize)],
+    ) -> TurnDistanceCache {
+        if self.player_id != Some(player_id) {
+            self.clear();
+            self.player_id = Some(player_id);
+        }
+        if self.action_distance_enemy_positions != enemy_positions {
+            self.action_distance_enemy_positions = enemy_positions.to_vec();
+            self.action_distance_cache.clear();
+        }
+        std::mem::take(&mut self.action_distance_cache)
+    }
+
+    fn put_action_distance_cache(&mut self, cache: TurnDistanceCache) {
+        self.action_distance_cache = cache;
+    }
+
     fn clear(&mut self) {
         self.player_id = None;
         self.squads_planned = false;
@@ -158,6 +501,10 @@ impl AiTurnStrategyCache {
         self.campaign_production_planned = false;
         self.campaign_production_commands.clear();
         self.campaign_production_blocks_generic = false;
+        self.campaign_production_generic_budget = None;
+        self.production_batch_planned = false;
+        self.action_distance_enemy_positions.clear();
+        self.action_distance_cache.clear();
     }
 }
 
@@ -209,6 +556,73 @@ pub enum AiCommand {
         target_pos: GridPosition,
         target_entity: Entity,
     },
+}
+
+/// 航空ユニットが候補タイルへ移動した後も、自軍空港へ帰投できる燃料を残すか。
+///
+/// 移動燃料だけでなく、空港外で迎える各ラウンドの日次消費も予約する。攻撃加点や
+/// Squad接近加点より前に候補自体を除外するため、任務持ち航空機も燃料切れになるまで
+/// 前線を徘徊できない。
+fn air_move_preserves_return_fuel(
+    map: &Map,
+    properties: &[(GridPosition, Terrain, Option<PlayerId>)],
+    player_id: PlayerId,
+    stats: &UnitStats,
+    origin: GridPosition,
+    candidate: GridPosition,
+    current_fuel: u32,
+) -> bool {
+    if stats.movement_type != crate::resources::MovementType::Air {
+        return true;
+    }
+    let airports: Vec<_> = properties
+        .iter()
+        .filter_map(|(position, terrain, owner)| {
+            (*owner == Some(player_id) && *terrain == Terrain::Airport).then_some(*position)
+        })
+        .collect();
+    if airports.is_empty() {
+        // 最小テストfixtureや空港喪失後の既存unitには帰投先を導出できない。
+        // ここで全行動を停止させず、空港を観測できる通常局面だけ安全圏を強制する。
+        return true;
+    }
+    let movement_cost = map.distance(origin.x, origin.y, candidate.x, candidate.y);
+    let remaining_fuel = current_fuel.saturating_sub(movement_cost);
+    if airports.contains(&candidate) {
+        return true;
+    }
+    let return_distance = airports
+        .iter()
+        .map(|airport| map.distance(candidate.x, candidate.y, airport.x, airport.y))
+        .min()
+        .unwrap_or(u32::MAX);
+    let return_turns = return_distance.div_ceil(stats.max_movement.max(1));
+    let required_fuel =
+        return_distance.saturating_add(stats.daily_fuel_consumption.saturating_mul(return_turns));
+    if remaining_fuel >= required_fuel {
+        return true;
+    }
+
+    // 前線空港を敵に奪われるなどして、手番開始時点ですでに完全帰投可能圏の外へ
+    // 出ることがある。この状態で通常の安全条件だけを使うと、空港へ近づく一歩まで
+    // 全候補から消えて航空機が行動可能なまま停止する。燃料不足を増やさず、かつ
+    // 最寄り空港への距離を縮める候補だけを回復移動として許可する。
+    let origin_return_distance = airports
+        .iter()
+        .map(|airport| map.distance(origin.x, origin.y, airport.x, airport.y))
+        .min()
+        .unwrap_or(u32::MAX);
+    let origin_return_turns = origin_return_distance.div_ceil(stats.max_movement.max(1));
+    let origin_required_fuel = origin_return_distance.saturating_add(
+        stats
+            .daily_fuel_consumption
+            .saturating_mul(origin_return_turns),
+    );
+    let origin_deficit = origin_required_fuel.saturating_sub(current_fuel);
+    let candidate_deficit = required_fuel.saturating_sub(remaining_fuel);
+    origin_deficit > 0
+        && return_distance < origin_return_distance
+        && candidate_deficit <= origin_deficit
 }
 
 /// AIの思考エンジン。未行動のユニットに対して最も評価の高いコマンドを決定します。
@@ -321,6 +735,7 @@ pub fn decide_ai_action(
 
         let map = world.resource::<Map>().clone();
         let registry = world.resource::<MasterDataRegistry>().clone();
+        let tactical_snapshot = AiTacticalSnapshot::from_world(world, &registry, map.topology);
 
         // 3. 到達可能タイルを算出
         let reachable = calculate_reachable_tiles(
@@ -399,11 +814,22 @@ pub fn decide_ai_action(
                 x: target_tile.0,
                 y: target_tile.1,
             };
+            if !air_move_preserves_return_fuel(
+                &map,
+                &properties,
+                player_id,
+                &stats,
+                pos,
+                current_grid,
+                fuel,
+            ) {
+                continue;
+            }
             let is_stationary = current_grid.x == pos.x && current_grid.y == pos.y;
 
-            let actions = crate::systems::action::get_available_actions_at(
-                world,
+            let actions = tactical_snapshot.action_targets_at(
                 unit_entity,
+                &stats,
                 current_grid,
                 !is_stationary,
             );
@@ -739,19 +1165,14 @@ pub fn decide_ai_action(
             }
 
             // (B) Attack
-            if actions.can_attack {
-                let targets = crate::systems::combat::get_attackable_targets_at(
-                    world,
-                    unit_entity,
-                    current_grid,
-                    is_stationary,
-                );
-                for target_entity in targets {
+            if !actions.attackable_targets.is_empty() {
+                for target_entity in actions.attackable_targets.iter().copied() {
                     // カミカゼアタック（無謀な攻撃）の回避
-                    if crate::ai::pruning::is_suicidal_attack(
+                    if crate::ai::pruning::is_suicidal_attack_at(
                         world,
                         unit_entity,
                         target_entity,
+                        current_grid,
                         &damage_chart,
                     ) {
                         continue;
@@ -769,8 +1190,7 @@ pub fn decide_ai_action(
                             .get_terrain(t_pos.x, t_pos.y)
                             .unwrap_or(crate::resources::Terrain::Plains);
                         let def_bonus = registry.get_terrain_defense_bonus(t_terrain);
-                        let dist = (current_grid.x as i64 - t_pos.x as i64).unsigned_abs() as u32
-                            + (current_grid.y as i64 - t_pos.y as i64).unsigned_abs() as u32;
+                        let dist = map.distance(current_grid.x, current_grid.y, t_pos.x, t_pos.y);
 
                         // ターゲットへのダメージ予測
                         let expected_actual_damage = get_expected_damage(
@@ -866,13 +1286,8 @@ pub fn decide_ai_action(
             }
 
             // (F) Merge
-            if actions.can_merge {
-                let targets = crate::systems::merge::get_mergable_targets_at(
-                    world,
-                    unit_entity,
-                    current_grid,
-                );
-                for target_entity in targets {
+            if !actions.mergeable_targets.is_empty() {
+                for target_entity in actions.mergeable_targets.iter().copied() {
                     let mut merge_score = 3000;
                     if let (Some(t_health), Some(_t_stats)) = (
                         world.get::<Health>(target_entity),
@@ -918,6 +1333,9 @@ pub fn decide_ai_action(
 }
 
 pub fn execute_ai_command(world: &mut World, unit_entity: Entity, command: AiCommand) {
+    // 命令発行時点で作戦stepを登録し、結果Eventが届くまで進捗扱いしない。
+    // Roadmapへ未所属のV1〜V3 Entityでは何も記録されない。
+    crate::ai::v4::victory_roadmap::record_operation_command(world, unit_entity, &command);
     match command {
         AiCommand::Attack {
             target_pos,
@@ -1158,34 +1576,6 @@ pub fn execute_ai_turn_v1(world: &mut World, active_player: PlayerId) -> Option<
     let mut decide_skip_entities = skip_entities.clone();
     decide_skip_entities.extend(mission_entities);
 
-    // #76: 生産口の直接封鎖はAI世代に依存しないルール上の危機として扱う。
-    // V1の輸送任務は維持し、未予約戦力から選んだ解除担当だけを共通の戦術評価へ渡す。
-    let factory_relief =
-        crate::ai::emergency::analyze_factory_relief(world, active_player, &decide_skip_entities);
-    let relief_entities = factory_relief.reserved_entities();
-    world.insert_resource(factory_relief);
-    if !relief_entities.is_empty() {
-        let mut relief_skip_entities = decide_skip_entities.clone();
-        let mut query = world.query::<(Entity, &Faction)>();
-        for (entity, faction) in query.iter(world) {
-            if faction.0 == active_player && !relief_entities.contains(&entity) {
-                relief_skip_entities.insert(entity);
-            }
-        }
-        if let Some((entity, command)) =
-            decide_ai_action_v2(world, active_player, &relief_skip_entities)
-        {
-            let cmd_str = format!("{:?}", command);
-            execute_ai_command(world, entity, command);
-            if let Some(mut res) = world.get_resource_mut::<AiActionCooldown>() {
-                res.0.insert(entity);
-            } else {
-                world.insert_resource(AiActionCooldown(HashSet::from([entity])));
-            }
-            return Some(cmd_str);
-        }
-    }
-
     if let Some((entity, command)) = decide_ai_action(world, active_player, &decide_skip_entities) {
         let cmd_str = format!("{:?}", command);
         execute_ai_command(world, entity, command);
@@ -1277,7 +1667,24 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
         skip_entities = res.0.clone();
     }
 
-    let uses_v3 = crate::ai::resolve_player_ai_version(world, active_player).uses_v3_tactics();
+    let ai_version = crate::ai::resolve_player_ai_version(world, active_player);
+    let uses_v3 = ai_version.uses_v3_tactics();
+    let is_v4 = ai_version == crate::ai::ai_version::AiVersion::V4;
+    let turn = world
+        .get_resource::<crate::resources::MatchState>()
+        .map_or(0, |state| state.current_turn_number.0);
+    let has_queued_production = world
+        .get_resource::<AiProductionCommandQueue>()
+        .is_some_and(|queue| {
+            queue.player_id == Some(active_player)
+                && queue.turn == turn
+                && !queue.commands.is_empty()
+        });
+    if has_queued_production
+        && let Some(command) = take_next_queued_production_command(world, active_player, turn)
+    {
+        return issue_production_command(world, command);
+    }
     let should_plan_squads = skip_entities.is_empty()
         && (!uses_v3
             || !world
@@ -1326,7 +1733,22 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
             crate::ai::squad::update_squads(world, active_player);
         }
     }
-
+    // 未完成の島嶼輸送パッケージが生産施設上でFormingすると、不足している次の
+    // 輸送役を自分で生産不能にする。任務所属は維持したまま隣接待機地へ一歩だけ退避する。
+    if uses_v3 {
+        let relief =
+            decide_forming_campaign_site_relief(world, active_player, &skip_entities, is_v4);
+        if let Some((entity, command)) = relief {
+            let command_text = format!("{:?}", command);
+            execute_ai_command(world, entity, command);
+            if let Some(mut cooldown) = world.get_resource_mut::<AiActionCooldown>() {
+                cooldown.0.insert(entity);
+            } else {
+                world.insert_resource(AiActionCooldown(HashSet::from([entity])));
+            }
+            return Some(command_text);
+        }
+    }
     // 1. 輸送部隊の優先実行
     let mut transport_action = None;
     if let Some(mut manager) = world.remove_resource::<crate::ai::squad::SquadManager>() {
@@ -1352,6 +1774,15 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
                 let step_res =
                     crate::ai::squad::execute_transport_squad_step(world, squad, &skip_entities);
                 if let Some((entity, cmd)) = step_res {
+                    if is_v4
+                        && !world
+                            .get_resource::<crate::ai::operation_assignment::UnitOperationRegistry>(
+                            )
+                            .and_then(|registry| registry.assignment(entity))
+                            .is_some_and(|assignment| assignment.squad_id == Some(squad.id))
+                    {
+                        continue;
+                    }
                     if !skip_entities.contains(&entity) {
                         transport_action = Some((entity, cmd));
                         break;
@@ -1398,12 +1829,14 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
         }
         return Some(cmd_str);
     }
-
     // 通常の意思決定を行う際には、輸送中のEntity（輸送機と歩兵）を通常AIのスキップ対象に追加する
     let mut decide_skip_entities = skip_entities.clone();
     if let Some(manager) = world.get_resource::<crate::ai::squad::SquadManager>() {
         for squad in &manager.squads {
             if squad.mission_type == crate::ai::squad::MissionType::Transport {
+                // Forming中は複数の輸送役をmembersへ束ねる。代表transport_entityだけを
+                // 除外すると残りが汎用beam searchへ漏れ、空荷で前線へ進んでしまう。
+                decide_skip_entities.extend(squad.members.iter().copied());
                 if let Some(transport_entity) = squad.transport_entity {
                     decide_skip_entities.insert(transport_entity);
                 }
@@ -1428,11 +1861,42 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
         }
         return Some(cmd_str);
     }
-
+    // Drop/Capture/作戦完了で手番途中にSquadを失ったV4 Entityを、全通常行動が
+    // 尽きた時点で1度だけ再接続する。従来は次手番までownerだけが残り、
+    // 行動可能な歩兵・輸送役が生産拠点付近で遊兵化していた。
+    // Reserve行動そのものが目標到達でSquadを完了させる場合もあるため、一度で打ち切らず、
+    // 通常行動が尽きるたびに固定点を取り直す。行動候補が無ければそのまま生産へ進む。
+    let should_reassign_idle = is_v4;
+    if should_reassign_idle {
+        crate::ai::squad::reconcile_v4_end_turn_reserves(world, active_player);
+        if let Some((entity, command)) = decide_ai_action_v2(world, active_player, &skip_entities) {
+            let command_text = format!("{:?}", command);
+            execute_ai_command(world, entity, command);
+            if let Some(mut cooldown) = world.get_resource_mut::<AiActionCooldown>() {
+                cooldown.0.insert(entity);
+            } else {
+                world.insert_resource(AiActionCooldown(HashSet::from([entity])));
+            }
+            return Some(command_text);
+        }
+    }
+    // 通常の作戦行動で進めなかった任務所属unitも、生産施設だけは塞ぎ続けない。
+    // 先に通常行動を試した後のfallbackなので、前線へ進めるunitの移動距離は奪わない。
+    if is_v4 {
+        let relief =
+            decide_forming_campaign_site_relief(world, active_player, &skip_entities, true);
+        if let Some((entity, command)) = relief {
+            let command_text = format!("{:?}", command);
+            execute_ai_command(world, entity, command);
+            if let Some(mut cooldown) = world.get_resource_mut::<AiActionCooldown>() {
+                cooldown.0.insert(entity);
+            } else {
+                world.insert_resource(AiActionCooldown(HashSet::from([entity])));
+            }
+            return Some(command_text);
+        }
+    }
     // 3. 生産行動
-    // 生産内容は盤面・資金の変化ごとに従来通り再計画し、V3の島分析だけを同一ターンで共有する。
-    let prod_commands = super::production::decide_production(world, active_player);
-
     let cooldown_set = if let Some(res) = world.get_resource::<AiProductionCooldown>() {
         res.0.clone()
     } else {
@@ -1446,7 +1910,45 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
             (None, None)
         };
 
-    for cmd in prod_commands {
+    let mut production_queue = world
+        .remove_resource::<AiProductionCommandQueue>()
+        .unwrap_or_default();
+    if production_queue.player_id != Some(active_player) || production_queue.turn != turn {
+        production_queue.player_id = Some(active_player);
+        production_queue.turn = turn;
+        production_queue.commands.clear();
+    }
+
+    // 直前の計画に残る別施設の命令を、重い戦略分析を再実行せず先に消費する。
+    while let Some(cmd) = production_queue.commands.pop_front() {
+        if cooldown_set.contains(&(cmd.target_x, cmd.target_y)) {
+            continue;
+        }
+        let cmd_str = format!("{:?}", cmd);
+        if last_error.is_some() && last_event_str.as_deref() == Some(&cmd_str) {
+            continue;
+        }
+        world.insert_resource(production_queue);
+        if let Some(mut cooldown) = world.get_resource_mut::<AiProductionCooldown>() {
+            cooldown.0.insert((cmd.target_x, cmd.target_y));
+        } else {
+            world.insert_resource(AiProductionCooldown(HashSet::from([(
+                cmd.target_x,
+                cmd.target_y,
+            )])));
+        }
+        if let Some(mut events) =
+            world.get_resource_mut::<Events<crate::events::ProduceUnitCommand>>()
+        {
+            events.send(cmd);
+            return Some(cmd_str);
+        }
+        return None;
+    }
+
+    // 敵が行動しない同一生産フェーズでは、全施設分を一度だけ計画する。
+    let mut prod_commands = super::production::decide_production(world, active_player).into_iter();
+    while let Some(cmd) = prod_commands.next() {
         if cooldown_set.contains(&(cmd.target_x, cmd.target_y)) {
             continue;
         }
@@ -1460,7 +1962,6 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
             continue;
         }
 
-        let mut sent = false;
         {
             if let Some(mut res) = world.get_resource_mut::<AiProductionCooldown>() {
                 res.0.insert((cmd.target_x, cmd.target_y));
@@ -1471,17 +1972,17 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
             }
         }
 
+        production_queue.commands.extend(prod_commands);
+        world.insert_resource(production_queue);
         if let Some(mut events) =
             world.get_resource_mut::<Events<crate::events::ProduceUnitCommand>>()
         {
             events.send(cmd);
-            sent = true;
-        }
-
-        if sent {
             return Some(cmd_str);
         }
+        return None;
     }
+    world.insert_resource(production_queue);
 
     // 4. 全行動完了 -> ターン終了
     // ターン終了直前は「このターン結局何が動かなかったか」が確定する唯一の点。
@@ -1491,13 +1992,16 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
         .map(|res| res.0.clone())
         .unwrap_or_default();
     let idle_audit = crate::ai::idle_audit::audit_idle_units(world, active_player, &acted_entities);
+    let idle_audit_turn = world
+        .get_resource::<crate::resources::MatchState>()
+        .map_or(0, |state| state.current_turn_number.0);
     if let Some(mut diagnostics) =
         world.get_resource_mut::<crate::ai::idle_audit::IdleAuditDiagnostics>()
     {
-        diagnostics.record(idle_audit);
+        diagnostics.record(idle_audit_turn, idle_audit);
     } else {
         let mut diagnostics = crate::ai::idle_audit::IdleAuditDiagnostics::default();
-        diagnostics.record(idle_audit);
+        diagnostics.record(idle_audit_turn, idle_audit);
         world.insert_resource(diagnostics);
     }
 
@@ -1505,6 +2009,248 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
         world.get_resource_mut::<Events<crate::events::NextPhaseCommand>>()
     {
         end_events.send(crate::events::NextPhaseCommand);
+    }
+    None
+}
+
+/// Forming中または割当待ちの空輸送役が自軍生産施設を塞いだ場合、隣へ退避する。
+fn decide_forming_campaign_site_relief(
+    world: &mut World,
+    player_id: PlayerId,
+    skip_entities: &HashSet<Entity>,
+    include_active_missions: bool,
+) -> Option<(Entity, AiCommand)> {
+    use crate::ai::squad::{MissionPhase, MissionType, SquadManager};
+
+    let map = world.get_resource::<Map>()?.clone();
+    let registry = world.get_resource::<MasterDataRegistry>()?.clone();
+    let capital_positions: Vec<_> = world
+        .query::<(&GridPosition, &Property)>()
+        .iter(world)
+        .filter_map(|(position, property)| {
+            (property.owner_id == Some(player_id) && property.terrain == Terrain::Capital)
+                .then_some(*position)
+        })
+        .collect();
+    let production_positions: HashSet<_> = world
+        .query::<(&GridPosition, &Property)>()
+        .iter(world)
+        .filter_map(|(position, property)| {
+            (property.owner_id == Some(player_id)
+                && registry.is_production_facility(property.terrain.as_str())
+                && crate::systems::production::is_within_production_range(
+                    &capital_positions,
+                    position.x,
+                    position.y,
+                    map.topology,
+                ))
+            .then_some((position.x, position.y))
+        })
+        .collect();
+    if production_positions.is_empty() {
+        return None;
+    }
+
+    let manager = world.get_resource::<SquadManager>()?;
+    let mut forming_groups: Vec<(Vec<Entity>, Option<GridPosition>)> = manager
+        .squads
+        .iter()
+        .filter(|squad| {
+            squad.owner_id == Some(player_id)
+                && squad.mission_type == MissionType::Transport
+                && squad.phase == MissionPhase::Forming
+        })
+        .map(|squad| {
+            let mut entities: Vec<_> = squad
+                .transport_entity
+                .iter()
+                .chain(squad.cargo_entities.iter())
+                .copied()
+                .collect();
+            entities.sort_by_key(|entity| entity.to_bits());
+            entities.dedup();
+            (entities, squad.target)
+        })
+        .collect();
+    // 局地護衛待ちの占領兵も、生産施設上では待たせない。任務目標へは進めず、
+    // 隣接する非生産マスへ1歩退避して、次手番の護衛生産枠を開ける。
+    forming_groups.extend(
+        manager
+            .squads
+            .iter()
+            .filter(|squad| {
+                squad.owner_id == Some(player_id)
+                    && squad.mission_type == MissionType::Capture
+                    && !squad.departure_authorized
+            })
+            .map(|squad| {
+                (
+                    squad.members.iter().copied().collect::<Vec<_>>(),
+                    squad.target,
+                )
+            }),
+    );
+    if include_active_missions {
+        forming_groups.extend(
+            manager
+                .squads
+                .iter()
+                .filter(|squad| {
+                    squad.owner_id == Some(player_id)
+                        && squad.mission_type != MissionType::Transport
+                        && (squad.mission_type != MissionType::Capture
+                            || squad.departure_authorized)
+                })
+                .map(|squad| {
+                    (
+                        squad.members.iter().copied().collect::<Vec<_>>(),
+                        squad.target,
+                    )
+                }),
+        );
+    }
+    let squad_entities = manager
+        .squads
+        .iter()
+        .flat_map(|squad| {
+            squad
+                .members
+                .iter()
+                .chain(squad.cargo_entities.iter())
+                .chain(squad.delivered_cargo.iter())
+                .copied()
+        })
+        .collect::<HashSet<_>>();
+    // portfolioから外れた直後など、owner解放とSquad再構築の境界にいる空輸送役も
+    // 空港上で永久停止させない。退避だけなら別前線への任務変更にはならない。
+    let mut unassigned_blockers = world
+        .query::<(
+            Entity,
+            &Faction,
+            &GridPosition,
+            &UnitStats,
+            Option<&crate::components::CargoCapacity>,
+            Option<&crate::components::Transporting>,
+        )>()
+        .iter(world)
+        .filter_map(|(entity, faction, position, stats, cargo, transporting)| {
+            (faction.0 == player_id
+                && stats.max_cargo > 0
+                && transporting.is_none()
+                && cargo.is_some_and(|capacity| capacity.loaded.is_empty())
+                && production_positions.contains(&(position.x, position.y))
+                && !squad_entities.contains(&entity))
+            .then_some(entity)
+        })
+        .collect::<Vec<_>>();
+    unassigned_blockers.sort_by_key(|entity| entity.to_bits());
+    forming_groups.extend(
+        unassigned_blockers
+            .into_iter()
+            .map(|entity| (vec![entity], None)),
+    );
+    forming_groups
+        .sort_by_key(|(entities, _)| entities.first().map_or(u64::MAX, |entity| entity.to_bits()));
+
+    let mut occupied = HashSet::new();
+    let mut unit_positions = HashMap::new();
+    for entity_ref in world.iter_entities() {
+        if entity_ref
+            .get::<crate::components::Transporting>()
+            .is_some()
+        {
+            continue;
+        }
+        let (Some(position), Some(faction), Some(stats)) = (
+            entity_ref.get::<GridPosition>(),
+            entity_ref.get::<Faction>(),
+            entity_ref.get::<UnitStats>(),
+        ) else {
+            continue;
+        };
+        let free_slots = entity_ref
+            .get::<crate::components::CargoCapacity>()
+            .map(|capacity| {
+                capacity
+                    .max
+                    .saturating_sub(u32::try_from(capacity.loaded.len()).unwrap_or(u32::MAX))
+            })
+            .unwrap_or(0);
+        occupied.insert((position.x, position.y));
+        unit_positions.insert(
+            (position.x, position.y),
+            OccupantInfo {
+                player_id: faction.0,
+                is_transport: stats.max_cargo > 0,
+                unit_type: stats.unit_type,
+                loadable_types: stats.loadable_unit_types.clone(),
+                free_slots,
+            },
+        );
+    }
+
+    for (group, mission_target) in forming_groups {
+        let group_positions: Vec<_> = group
+            .iter()
+            .filter_map(|entity| world.get::<GridPosition>(*entity).copied())
+            .collect();
+        for entity in &group {
+            if skip_entities.contains(entity)
+                || world
+                    .get::<Faction>(*entity)
+                    .is_none_or(|faction| faction.0 != player_id)
+                || world.get::<HasMoved>(*entity).is_none_or(|moved| moved.0)
+                || world
+                    .get::<ActionCompleted>(*entity)
+                    .is_none_or(|action| action.0)
+                || world
+                    .get::<crate::components::Transporting>(*entity)
+                    .is_some()
+            {
+                continue;
+            }
+            let position = *world.get::<GridPosition>(*entity)?;
+            if !production_positions.contains(&(position.x, position.y)) {
+                continue;
+            }
+            let stats = world.get::<UnitStats>(*entity)?;
+            let fuel = world
+                .get::<crate::components::Fuel>(*entity)
+                .map_or(u32::MAX, |fuel| fuel.current);
+            let reachable = calculate_reachable_tiles(
+                &map,
+                &unit_positions,
+                (position.x, position.y),
+                stats.movement_type,
+                stats.max_movement,
+                fuel,
+                player_id,
+                stats.unit_type,
+                &registry,
+            );
+            let destination = reachable
+                .iter()
+                .copied()
+                .filter(|tile| *tile != (position.x, position.y))
+                .filter(|tile| !occupied.contains(tile))
+                .filter(|tile| !production_positions.contains(tile))
+                .min_by_key(|(x, y)| {
+                    let target_distance =
+                        mission_target.map_or(0, |target| map.distance(*x, *y, target.x, target.y));
+                    let group_distance = group_positions.iter().fold(0_u32, |total, member| {
+                        total.saturating_add(map.distance(*x, *y, member.x, member.y))
+                    });
+                    (target_distance, group_distance, *y, *x)
+                });
+            if let Some((x, y)) = destination {
+                return Some((
+                    *entity,
+                    AiCommand::Wait {
+                        target_pos: GridPosition { x, y },
+                    },
+                ));
+            }
+        }
     }
     None
 }
@@ -1518,58 +2264,86 @@ const AMBUSH_TOO_CLOSE_PENALTY: i32 = 3000;
 /// #45 (V3): 待ち受けゾーンとみなす最大射程からのマージン (敵の接近を想定)
 const AMBUSH_APPROACH_MARGIN: u32 = 2;
 
-/// 通常スコアとは別軸で緊急行動を比較する優先度。
+/// 通常スコアとは別軸で、作戦上必要な不利交換と戦術的に有利な攻撃を順序付ける。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ActionPriority {
     Normal,
-    /// V4の生産目的から接続された局地任務の敵を、通常の好機標的より先に攻撃する。
-    DeploymentTargetNeutralization,
-    EmergencyAdvance,
-    EmergencyRouteBlock,
-    EmergencySiteOccupation,
-    EmergencyNeutralization,
+    /// 作戦パッケージが実行段階にあり、他に有利な局地標的がない場合の必要攻撃。
+    StrategicTargetFallback,
+    /// 同じ作戦圏内で見つけた、現在兵種と相性のよい敵への攻撃。
+    FavorableLocalTarget,
+    /// 作戦対象そのものとの相性もよい攻撃。
+    FavorableStrategicTarget,
 }
 
-fn emergency_position_priority(
-    mission: Option<&crate::ai::emergency::EmergencyMission>,
-    origin: GridPosition,
-    candidate: GridPosition,
-    map: &Map,
-) -> ActionPriority {
-    let Some(mission) = mission else {
-        return ActionPriority::Normal;
-    };
-    if candidate == mission.target_position {
-        return match mission.response {
-            crate::ai::emergency::EmergencyResponse::EliminateThreat => {
-                ActionPriority::EmergencyAdvance
-            }
-            crate::ai::emergency::EmergencyResponse::OccupySite => {
-                ActionPriority::EmergencySiteOccupation
-            }
-            crate::ai::emergency::EmergencyResponse::BlockRoute => {
-                ActionPriority::EmergencyRouteBlock
-            }
-        };
-    }
+#[derive(Debug, Clone)]
+struct CampaignActionContext {
+    owner: crate::ai::operation_assignment::OperationOwner,
+    island_id: crate::ai::islands::IslandId,
+    mission_type: crate::ai::squad::MissionType,
+    target: Option<GridPosition>,
+    /// 局地Captureの最小護衛が合流可能か。falseでも現在位置での反撃は許可する。
+    departure_authorized: bool,
+}
 
-    let original_distance = map.distance(
-        origin.x,
-        origin.y,
-        mission.target_position.x,
-        mission.target_position.y,
-    );
-    let candidate_distance = map.distance(
-        candidate.x,
-        candidate.y,
-        mission.target_position.x,
-        mission.target_position.y,
-    );
-    if candidate_distance < original_distance {
-        ActionPriority::EmergencyAdvance
-    } else {
-        ActionPriority::Normal
+/// V4のEntityは正本registryが指す具体Squadだけから行動方針を受け取る。
+/// Squad全件を行動候補ごとに走査せず、Entity→割当を平均O(1)で引いた後に
+/// concrete SquadIdを一度だけ解決する。
+fn campaign_action_context(
+    world: &World,
+    player_id: PlayerId,
+    entity: Entity,
+    manager: &crate::ai::squad::SquadManager,
+) -> Result<Option<CampaignActionContext>, ()> {
+    if crate::ai::resolve_player_ai_version(world, player_id)
+        != crate::ai::ai_version::AiVersion::V4
+    {
+        return Ok(None);
     }
+    let Some(assignment) = world
+        .get_resource::<crate::ai::operation_assignment::UnitOperationRegistry>()
+        .and_then(|registry| registry.assignment(entity))
+    else {
+        return Ok(None);
+    };
+    let crate::ai::operation_assignment::OperationOwner::Campaign { island_id, .. } =
+        assignment.owner
+    else {
+        return Ok(None);
+    };
+    let Some(squad_id) = assignment.squad_id else {
+        return Err(());
+    };
+    let Some(squad) = manager.squads.iter().find(|squad| squad.id == squad_id) else {
+        return Err(());
+    };
+    Ok(Some(CampaignActionContext {
+        owner: assignment.owner,
+        island_id,
+        mission_type: squad.mission_type.clone(),
+        target: squad.target,
+        departure_authorized: squad.departure_authorized,
+    }))
+}
+
+fn campaign_position_is_on_target_island(
+    world: &World,
+    context: &CampaignActionContext,
+    position: GridPosition,
+) -> bool {
+    world
+        .get_resource::<crate::ai::islands::IslandMap>()
+        .and_then(|islands| islands.get_island_at(&position))
+        .is_some_and(|island| island.id == context.island_id)
+}
+
+/// 同じcampaignに属する占領可能unitが施設取得へ役割を切り替えてよい任務。
+/// Attack歩兵も敵を押し退けた後は同一作戦島を占領し、ZOC優位を収入へ接続する。
+fn campaign_mission_allows_capture(mission: &crate::ai::squad::MissionType) -> bool {
+    matches!(
+        mission,
+        crate::ai::squad::MissionType::Capture | crate::ai::squad::MissionType::Attack
+    )
 }
 
 /// 新しいAI (V2/V3) 用の行動意思決定エンジン。
@@ -1647,10 +2421,12 @@ pub fn decide_ai_action_v2(
         .cloned()
         .unwrap_or_default();
     let mut unit_squad_targets = HashMap::new();
+    let mut unit_squad_missions = HashMap::new();
     let mut solo_fallbacks = HashSet::new();
 
     for squad in &manager.squads {
         for &member in &squad.members {
+            unit_squad_missions.insert(member, squad.mission_type.clone());
             if let Some(target) = squad.target {
                 unit_squad_targets.insert(member, target);
             }
@@ -1662,6 +2438,7 @@ pub fn decide_ai_action_v2(
 
     let map = world.resource::<Map>().clone();
     let registry = world.resource::<MasterDataRegistry>().clone();
+    let tactical_snapshot = AiTacticalSnapshot::from_world(world, &registry, map.topology);
     let properties: Vec<(GridPosition, Terrain, Option<PlayerId>)> = {
         let mut q = world.query::<(&GridPosition, &Property)>();
         q.iter(world)
@@ -1719,12 +2496,18 @@ pub fn decide_ai_action_v2(
             .collect()
     };
     let damage_chart = world.resource::<crate::resources::DamageChart>().clone();
-    let emergency_plan = world
-        .get_resource::<crate::ai::emergency::EmergencyMissionPlan>()
-        .cloned()
+    // 自軍の移動は距離探索上の通行可否を変えない。敵が撃破されて占有マスが
+    // 変わるまで、同一手番の全ユニットでDijkstra結果を共有する。
+    let mut enemy_blocker_positions = enemy_units
+        .iter()
+        .map(|(position, _, _, _, _, _, _)| (position.x, position.y))
+        .collect::<Vec<_>>();
+    enemy_blocker_positions.sort_unstable();
+    let mut strategy_cache = world
+        .remove_resource::<AiTurnStrategyCache>()
         .unwrap_or_default();
-
-    let mut turn_cache = TurnDistanceCache::default();
+    let mut turn_cache =
+        strategy_cache.take_action_distance_cache(player_id, &enemy_blocker_positions);
     let mut best_overall_rank = (ActionPriority::Normal, i32::MIN);
     let mut best_overall_choice: Option<(Entity, AiCommand)> = None;
 
@@ -1754,12 +2537,16 @@ pub fn decide_ai_action_v2(
         };
 
         let is_combat_ineffective = atk_hp < 70 || (stats.max_ammo1 > 0 && atk_ammo.0 == 0);
-        let planned_emergency = emergency_plan.mission_for_entity(unit_entity);
-        let emergency_mission = planned_emergency
-            .filter(|mission| world.get_entity(mission.threat.threat_entity).is_ok());
         let deployment_target = world
             .get_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>()
             .and_then(|registry| registry.attack_target(unit_entity));
+        let campaign_context =
+            match campaign_action_context(world, player_id, unit_entity, &manager) {
+                Ok(context) => context,
+                // Campaign ownerに具体Squadが無いEntityへ汎用行動を許すと、再び別作戦へ
+                // 漏れるため、この手番は作戦再構築へ戻す。
+                Err(()) => continue,
+            };
 
         // #44 (V3): 敵の脅威がこのユニットの近傍にあるか (森・山への退避を
         // 意味のある局面に限定するためのゲート)。敵の攻撃到達圏 (移動+射程) を
@@ -1769,24 +2556,38 @@ pub fn decide_ai_action_v2(
             (e_pos.x.abs_diff(pos.x) + e_pos.y.abs_diff(pos.y)) as u32 <= THREAT_PROXIMITY_RADIUS
         });
 
-        let reachable = calculate_reachable_tiles(
-            &map,
-            &unit_positions,
-            (pos.x, pos.y),
-            stats.movement_type,
-            stats.max_movement,
-            fuel,
-            player_id,
-            stats.unit_type,
-            &registry,
-        );
-
-        let squad_target = if planned_emergency.is_some() && emergency_mission.is_none() {
-            // 同一ターン中に対象が消失した場合は、古い迎撃座標のSquad加点を無効化する。
-            None
+        let capture_waits_for_local_escort = campaign_context.as_ref().is_some_and(|context| {
+            context.mission_type == crate::ai::squad::MissionType::Capture
+                && !context.departure_authorized
+        });
+        let reachable = if capture_waits_for_local_escort {
+            // 現在位置での攻撃・占領・Waitは残すが、護衛を待つ1手番に単独前進しない。
+            std::iter::once((pos.x, pos.y)).collect()
         } else {
-            unit_squad_targets.get(&unit_entity).copied()
+            calculate_reachable_tiles(
+                &map,
+                &unit_positions,
+                (pos.x, pos.y),
+                stats.movement_type,
+                stats.max_movement,
+                fuel,
+                player_id,
+                stats.unit_type,
+                &registry,
+            )
         };
+
+        let squad_target = unit_squad_targets.get(&unit_entity).copied();
+        let has_offensive_mission = unit_squad_missions
+            .get(&unit_entity)
+            .is_some_and(|mission| {
+                matches!(
+                    mission,
+                    crate::ai::squad::MissionType::Attack
+                        | crate::ai::squad::MissionType::Capture
+                        | crate::ai::squad::MissionType::Transport
+                )
+            });
         let initial_is_solo = solo_fallbacks.contains(&unit_entity) || squad_target.is_none();
 
         // 評価ロジック（is_solo: initial_is_solo を直接使う）
@@ -1799,11 +2600,22 @@ pub fn decide_ai_action_v2(
                 x: target_tile.0,
                 y: target_tile.1,
             };
+            if !air_move_preserves_return_fuel(
+                &map,
+                &properties,
+                player_id,
+                &stats,
+                pos,
+                current_grid,
+                fuel,
+            ) {
+                continue;
+            }
             let is_stationary = current_grid.x == pos.x && current_grid.y == pos.y;
 
-            let actions = crate::systems::action::get_available_actions_at(
-                world,
+            let actions = tactical_snapshot.action_targets_at(
                 unit_entity,
+                &stats,
                 current_grid,
                 !is_stationary,
             );
@@ -2241,12 +3053,14 @@ pub fn decide_ai_action_v2(
             }
 
             // (A) Capture
-            if actions.can_capture {
+            if actions.can_capture
+                && !campaign_context.as_ref().is_some_and(|context| {
+                    !campaign_mission_allows_capture(&context.mission_type)
+                        || !campaign_position_is_on_target_island(world, context, current_grid)
+                })
+            {
                 let score = base_tile_score + 10000;
-                let rank = (
-                    emergency_position_priority(emergency_mission, pos, current_grid, &map),
-                    score,
-                );
+                let rank = (ActionPriority::Normal, score);
                 if rank > best_unit_rank {
                     best_unit_rank = rank;
                     best_unit_choice = Some(AiCommand::Capture {
@@ -2256,22 +3070,27 @@ pub fn decide_ai_action_v2(
             }
 
             // (B) Attack
-            if actions.can_attack {
-                let targets = crate::systems::combat::get_attackable_targets_at(
-                    world,
-                    unit_entity,
-                    current_grid,
-                    is_stationary,
-                );
-                for target_entity in targets {
-                    if crate::ai::pruning::is_suicidal_attack(
+            if !actions.attackable_targets.is_empty() {
+                for target_entity in actions.attackable_targets.iter().copied() {
+                    if campaign_context.as_ref().is_some_and(|context| {
+                        let target_position = world.get::<GridPosition>(target_entity).copied();
+                        context.mission_type == crate::ai::squad::MissionType::Transport
+                            || (deployment_target != Some(target_entity)
+                                && !target_position.is_some_and(|position| {
+                                    campaign_position_is_on_target_island(world, context, position)
+                                }))
+                    }) {
+                        continue;
+                    }
+                    let Some(exchange) = crate::ai::pruning::evaluate_attack_exchange(
                         world,
                         unit_entity,
                         target_entity,
+                        current_grid,
                         &damage_chart,
-                    ) {
+                    ) else {
                         continue;
-                    }
+                    };
 
                     // ターゲットの詳細を取得してスコアを加点
                     if let (Some(t_stats), Some(t_health), Some(t_pos), Some(t_faction)) = (
@@ -2280,25 +3099,8 @@ pub fn decide_ai_action_v2(
                         world.get::<GridPosition>(target_entity),
                         world.get::<Faction>(target_entity),
                     ) {
-                        // 撃破判定・ダメージ期待値の算出
-                        let t_terrain = map
-                            .get_terrain(t_pos.x, t_pos.y)
-                            .unwrap_or(crate::resources::Terrain::Plains);
-                        let def_bonus = registry.get_terrain_defense_bonus(t_terrain);
-                        let dist = (current_grid.x as i64 - t_pos.x as i64).unsigned_abs() as u32
-                            + (current_grid.y as i64 - t_pos.y as i64).unsigned_abs() as u32;
-
-                        let expected_actual_damage = crate::systems::combat::get_expected_damage(
-                            &stats,
-                            atk_hp,
-                            atk_ammo,
-                            t_stats,
-                            def_bonus,
-                            dist,
-                            &registry,
-                            &damage_chart,
-                            false,
-                        );
+                        // 撃破判定・ダメージ期待値は、移動後位置を渡した交換予測を正本とする。
+                        let expected_actual_damage = exchange.expected_damage;
 
                         // 期待ダメージが0の場合は攻撃候補から外す
                         if expected_actual_damage == 0 {
@@ -2317,6 +3119,9 @@ pub fn decide_ai_action_v2(
                         );
                         let damage_val = expected_actual_damage.saturating_mul(target_value) / 100;
                         attack_score += damage_val as i32;
+                        // 金額ROIを禁止条件にはしない。同じ作戦島で複数の敵を撃てる場合だけ、
+                        // 双方のHP損耗率差を使って相性のよい対象へ戦術的に切り替える。
+                        attack_score += exchange.matchup_margin() / 2;
 
                         if is_combat_ineffective && expected_actual_damage < t_health.current {
                             attack_score -= 3000;
@@ -2327,14 +3132,26 @@ pub fn decide_ai_action_v2(
                         }
 
                         let score = base_tile_score + attack_score;
-                        let priority = if emergency_mission
-                            .is_some_and(|mission| mission.threat.threat_entity == target_entity)
+                        // V4はEntity単位のdeployment target、V2/V3は攻勢Squad自体を
+                        // 戦略上の必要性として扱う。上陸cargoはSquad再編の境界でCapture、
+                        // Transport、Attackのいずれにもなり得るため、その差で必要攻撃を
+                        // 非決定的に枝刈りしてはならない。
+                        let is_strategic_target = deployment_target
+                            .map_or(has_offensive_mission, |target| target == target_entity);
+                        let has_strategic_mission =
+                            deployment_target.is_some() || has_offensive_mission;
+                        let priority = match (is_strategic_target, exchange.is_favorable_matchup())
                         {
-                            ActionPriority::EmergencyNeutralization
-                        } else if deployment_target == Some(target_entity) {
-                            ActionPriority::DeploymentTargetNeutralization
-                        } else {
-                            ActionPriority::Normal
+                            (true, true) => ActionPriority::FavorableStrategicTarget,
+                            (false, true) if has_strategic_mission => {
+                                ActionPriority::FavorableLocalTarget
+                            }
+                            // 生産・集結を終えてExecuteとなった作戦Entityは、他に有利な敵が
+                            // いない場合だけ不利交換も受容する。ROIだけで戦略を停止しない。
+                            (true, false) => ActionPriority::StrategicTargetFallback,
+                            // 作戦上の必要性がない不利交換は、従来どおり候補外とする。
+                            (false, false) => continue,
+                            (false, true) => ActionPriority::Normal,
                         };
                         let rank = (priority, score);
                         if rank > best_unit_rank {
@@ -2352,6 +3169,7 @@ pub fn decide_ai_action_v2(
             if actions.can_wait {
                 let mut score = base_tile_score;
                 let mut is_on_recovery_property = false;
+                let mut is_on_production_site = false;
                 for (p_pos, p_terrain, p_owner) in &properties {
                     if p_pos.x == current_grid.x
                         && p_pos.y == current_grid.y
@@ -2359,6 +3177,7 @@ pub fn decide_ai_action_v2(
                         && registry.can_repair_on_terrain(stats.unit_type, *p_terrain)
                     {
                         is_on_recovery_property = true;
+                        is_on_production_site = registry.is_production_facility(p_terrain.as_str());
                         break;
                     }
                 }
@@ -2368,35 +3187,51 @@ pub fn decide_ai_action_v2(
                         score += 8000;
                     } else if atk_hp < 100 || atk_ammo.0 < stats.max_ammo1 {
                         score += 1000;
+                    } else if is_on_production_site {
+                        // 回復も攻撃も不要なのに空港・工場上で待機すると、次の生産を
+                        // 物理的に封鎖する。別タイルへ移動するWaitを十分に優先させる。
+                        score -= 20_000;
                     } else {
-                        // 回復の必要がないのに生産施設や回復施設の上にいる場合は、
-                        // 施設の生産ラインを塞がないようにペナルティを与えてどかせる
+                        // 生産施設ではない回復拠点も、用がなければ占有し続けない。
                         score -= 2000;
                     }
                 } else if is_combat_ineffective {
                     score -= 5000;
                 }
 
-                let rank = (
-                    emergency_position_priority(emergency_mission, pos, current_grid, &map),
-                    score,
-                );
-                if rank > best_unit_rank {
-                    best_unit_rank = rank;
-                    best_unit_choice = Some(AiCommand::Wait {
-                        target_pos: current_grid,
-                    });
+                let violates_campaign_step = campaign_context.as_ref().is_some_and(|context| {
+                    if is_stationary || is_on_recovery_property && is_combat_ineffective {
+                        return false;
+                    }
+                    context.target.is_none_or(|target| {
+                        map.distance(current_grid.x, current_grid.y, target.x, target.y)
+                            > map.distance(pos.x, pos.y, target.x, target.y)
+                    })
+                });
+
+                if !violates_campaign_step {
+                    let rank = (ActionPriority::Normal, score);
+                    if rank > best_unit_rank {
+                        best_unit_rank = rank;
+                        best_unit_choice = Some(AiCommand::Wait {
+                            target_pos: current_grid,
+                        });
+                    }
                 }
             }
 
             // (D) Merge
-            if actions.can_merge {
-                let targets = crate::systems::merge::get_mergable_targets_at(
-                    world,
-                    unit_entity,
-                    current_grid,
-                );
-                for target_entity in targets {
+            if !actions.mergeable_targets.is_empty() {
+                for target_entity in actions.mergeable_targets.iter().copied() {
+                    if campaign_context.as_ref().is_some_and(|context| {
+                        world
+                            .get_resource::<crate::ai::operation_assignment::UnitOperationRegistry>(
+                            )
+                            .and_then(|assignments| assignments.assignment(target_entity))
+                            .is_none_or(|assignment| assignment.owner != context.owner)
+                    }) {
+                        continue;
+                    }
                     let mut merge_score = 3000;
                     if let (Some(t_health), Some(_t_stats)) = (
                         world.get::<Health>(target_entity),
@@ -2463,6 +3298,9 @@ pub fn decide_ai_action_v2(
         }
     }
 
+    strategy_cache.put_action_distance_cache(turn_cache);
+    world.insert_resource(strategy_cache);
+
     best_overall_choice
 }
 
@@ -2512,6 +3350,78 @@ mod tests {
     use super::*;
     use crate::components::{Faction, Health, PlayerId, Property, UnitStats};
     use crate::resources::{DamageChart, UnitType};
+
+    #[test]
+    fn queued_production_keeps_later_commands_for_the_fast_path() {
+        let mut world = World::new();
+        let player = PlayerId(1);
+        let first = crate::events::ProduceUnitCommand {
+            player_id: player,
+            target_x: 1,
+            target_y: 2,
+            unit_type: UnitType::Infantry,
+        };
+        let second = crate::events::ProduceUnitCommand {
+            player_id: player,
+            target_x: 3,
+            target_y: 4,
+            unit_type: UnitType::Bcopters,
+        };
+        world.insert_resource(AiProductionCommandQueue {
+            player_id: Some(player),
+            turn: 7,
+            commands: VecDeque::from([first, second]),
+        });
+
+        let selected = take_next_queued_production_command(&mut world, player, 7)
+            .expect("先頭の生産命令を取得する");
+        assert_eq!((selected.target_x, selected.target_y), (1, 2));
+        let remaining = world.resource::<AiProductionCommandQueue>();
+        assert_eq!(remaining.commands.len(), 1);
+        assert_eq!(
+            remaining
+                .commands
+                .front()
+                .map(|command| (command.target_x, command.target_y)),
+            Some((3, 4))
+        );
+    }
+
+    #[test]
+    fn action_distance_cache_survives_friendly_actions_but_clears_on_enemy_movement() {
+        let player = PlayerId(1);
+        let map = Map::new(
+            4,
+            1,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        let registry = MasterDataRegistry::load().unwrap();
+        let mut strategy_cache = AiTurnStrategyCache::default();
+        let blockers = vec![(3, 0)];
+        let mut distance_cache = strategy_cache.take_action_distance_cache(player, &blockers);
+        let _ = calculate_turn_distance(
+            &map,
+            &registry,
+            &HashMap::new(),
+            (0, 0),
+            (3, 0),
+            crate::resources::MovementType::Infantry,
+            3,
+            1,
+            player,
+            &mut distance_cache,
+        );
+        assert!(!distance_cache.cache.is_empty());
+        strategy_cache.put_action_distance_cache(distance_cache);
+
+        let reused = strategy_cache.take_action_distance_cache(player, &blockers);
+        assert!(!reused.cache.is_empty());
+        strategy_cache.put_action_distance_cache(reused);
+
+        let cleared = strategy_cache.take_action_distance_cache(player, &[(2, 0)]);
+        assert!(cleared.cache.is_empty());
+    }
 
     #[test]
     fn drop_keeps_transport_actionable_until_last_ready_cargo() {
@@ -2600,6 +3510,284 @@ mod tests {
             ),
             1000
         );
+    }
+
+    #[test]
+    fn forming_campaign_transport_vacates_owned_production_site() {
+        let player = PlayerId(1);
+        let mut world = setup_v3_test_world(3, crate::ai::ai_version::AiVersion::V3);
+        world.insert_resource(Map {
+            width: 3,
+            height: 2,
+            tiles: vec![
+                Terrain::Capital,
+                Terrain::Airport,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+            ],
+            topology: crate::resources::GridTopology::Square,
+        });
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(player), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Property::new(Terrain::Airport, Some(player), 100),
+        ));
+        let stats = world
+            .resource::<MasterDataRegistry>()
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::TransportHelicopter.as_str().to_owned(),
+            ))
+            .unwrap();
+        let transport = world
+            .spawn((
+                Faction(player),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 1, y: 0 },
+                stats.clone(),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: stats.max_fuel,
+                    max: stats.max_fuel,
+                },
+                crate::components::CargoCapacity {
+                    max: stats.max_cargo,
+                    loaded: Vec::new(),
+                },
+            ))
+            .id();
+        let mut manager = crate::ai::squad::SquadManager::new();
+        let squad = manager.create_owned_squad(crate::ai::squad::MissionType::Transport, player);
+        squad.members.insert(transport);
+        squad.transport_entity = Some(transport);
+        squad.target_island = Some(crate::ai::islands::IslandId(1));
+        squad.phase = crate::ai::squad::MissionPhase::Forming;
+        world.insert_resource(manager);
+
+        let (entity, command) =
+            decide_forming_campaign_site_relief(&mut world, player, &HashSet::new(), false)
+                .expect("Forming transport must vacate the airport while waiting");
+        assert_eq!(entity, transport);
+        let AiCommand::Wait { target_pos } = command else {
+            panic!("production site relief must issue a movement wait");
+        };
+        assert_ne!(target_pos, GridPosition { x: 1, y: 0 });
+        assert!(!matches!(
+            world
+                .resource::<Map>()
+                .get_terrain(target_pos.x, target_pos.y),
+            Some(Terrain::Capital | Terrain::Airport)
+        ));
+    }
+
+    #[test]
+    fn unassigned_empty_transport_vacates_owned_production_site() {
+        let player = PlayerId(1);
+        let mut world = setup_v3_test_world(3, crate::ai::ai_version::AiVersion::V4);
+        world.insert_resource(Map {
+            width: 3,
+            height: 2,
+            tiles: vec![
+                Terrain::Capital,
+                Terrain::Airport,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+            ],
+            topology: crate::resources::GridTopology::Square,
+        });
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(player), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Property::new(Terrain::Airport, Some(player), 100),
+        ));
+        let stats = world
+            .resource::<MasterDataRegistry>()
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::TransportHelicopter.as_str().to_owned(),
+            ))
+            .unwrap();
+        let transport = world
+            .spawn((
+                Faction(player),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 1, y: 0 },
+                stats.clone(),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: stats.max_fuel,
+                    max: stats.max_fuel,
+                },
+                crate::components::CargoCapacity {
+                    max: stats.max_cargo,
+                    loaded: Vec::new(),
+                },
+            ))
+            .id();
+        world.insert_resource(crate::ai::squad::SquadManager::new());
+
+        let (entity, command) =
+            decide_forming_campaign_site_relief(&mut world, player, &HashSet::new(), false)
+                .expect("未割当の空輸送役も空港を退避する");
+
+        assert_eq!(entity, transport);
+        let AiCommand::Wait { target_pos } = command else {
+            panic!("production site relief must issue a movement wait");
+        };
+        assert_ne!(target_pos, GridPosition { x: 1, y: 0 });
+    }
+
+    #[test]
+    fn stalled_attack_unit_vacates_factory_toward_its_mission() {
+        let player = PlayerId(1);
+        let mut world = setup_v3_test_world(3, crate::ai::ai_version::AiVersion::V4);
+        world.insert_resource(Map {
+            width: 4,
+            height: 2,
+            tiles: vec![
+                Terrain::Capital,
+                Terrain::Factory,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+            ],
+            topology: crate::resources::GridTopology::Square,
+        });
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(player), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Property::new(Terrain::Factory, Some(player), 100),
+        ));
+        let stats = world
+            .resource::<MasterDataRegistry>()
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::Infantry.as_str().to_owned(),
+            ))
+            .unwrap();
+        let attacker = world
+            .spawn((
+                Faction(player),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 1, y: 0 },
+                stats.clone(),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Fuel {
+                    current: stats.max_fuel,
+                    max: stats.max_fuel,
+                },
+            ))
+            .id();
+        let mut manager = crate::ai::squad::SquadManager::new();
+        let squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+        squad.members.insert(attacker);
+        squad.target = Some(GridPosition { x: 3, y: 0 });
+        squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+        world.insert_resource(manager);
+
+        assert!(
+            decide_forming_campaign_site_relief(&mut world, player, &HashSet::new(), false)
+                .is_none(),
+            "通常作戦より前の退避処理はAttack任務を奪わない"
+        );
+        let (entity, command) =
+            decide_forming_campaign_site_relief(&mut world, player, &HashSet::new(), true)
+                .expect("通常行動に失敗したAttack unitは工場を退避する");
+
+        assert_eq!(entity, attacker);
+        let AiCommand::Wait { target_pos } = command else {
+            panic!("生産施設からの退避は移動Waitであること");
+        };
+        assert_eq!(target_pos, GridPosition { x: 3, y: 0 });
+    }
+
+    #[test]
+    fn campaign_attack_units_may_capture_but_defense_and_transport_may_not() {
+        use crate::ai::squad::MissionType;
+
+        assert!(campaign_mission_allows_capture(&MissionType::Capture));
+        assert!(campaign_mission_allows_capture(&MissionType::Attack));
+        assert!(!campaign_mission_allows_capture(&MissionType::Defense));
+        assert!(!campaign_mission_allows_capture(&MissionType::Transport));
+    }
+
+    #[test]
+    fn ready_combat_aircraft_does_not_wait_on_owned_airport() {
+        let player = PlayerId(1);
+        let mut world = setup_v3_test_world(3, crate::ai::ai_version::AiVersion::V4);
+        world.insert_resource(Map {
+            width: 3,
+            height: 1,
+            tiles: vec![Terrain::Plains, Terrain::Airport, Terrain::Plains],
+            topology: crate::resources::GridTopology::Square,
+        });
+        world.insert_resource(DamageChart::new());
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Property::new(Terrain::Airport, Some(player), 100),
+        ));
+        let stats = world
+            .resource::<MasterDataRegistry>()
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::Bcopters.as_str().to_owned(),
+            ))
+            .unwrap();
+        let aircraft = world
+            .spawn((
+                Faction(player),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 1, y: 0 },
+                stats.clone(),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Ammo {
+                    ammo1: stats.max_ammo1,
+                    max_ammo1: stats.max_ammo1,
+                    ammo2: stats.max_ammo2,
+                    max_ammo2: stats.max_ammo2,
+                },
+                crate::components::Fuel {
+                    current: stats.max_fuel,
+                    max: stats.max_fuel,
+                },
+            ))
+            .id();
+
+        let (entity, command) =
+            decide_ai_action_v2(&mut world, player, &HashSet::new()).expect("行動を選ぶこと");
+        assert_eq!(entity, aircraft);
+        let AiCommand::Wait { target_pos } = command else {
+            panic!("敵がいないため移動Waitを選ぶこと");
+        };
+        assert_ne!(target_pos, GridPosition { x: 1, y: 0 });
     }
 
     #[test]
@@ -2694,6 +3882,72 @@ mod tests {
         let mut world = World::new();
         let skips = std::collections::HashSet::new();
         assert!(decide_ai_action(&mut world, PlayerId(1), &skips).is_none());
+    }
+
+    #[test]
+    fn air_movement_reserves_distance_and_daily_fuel_for_return() {
+        let map = Map::new(
+            20,
+            1,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        let player = PlayerId(1);
+        let properties = vec![(GridPosition { x: 0, y: 0 }, Terrain::Airport, Some(player))];
+        let stats = UnitStats {
+            movement_type: crate::resources::MovementType::Air,
+            max_movement: 8,
+            daily_fuel_consumption: 5,
+            ..UnitStats::mock()
+        };
+
+        assert!(air_move_preserves_return_fuel(
+            &map,
+            &properties,
+            player,
+            &stats,
+            GridPosition { x: 8, y: 0 },
+            GridPosition { x: 7, y: 0 },
+            20,
+        ));
+        assert!(!air_move_preserves_return_fuel(
+            &map,
+            &properties,
+            player,
+            &stats,
+            GridPosition { x: 8, y: 0 },
+            GridPosition { x: 10, y: 0 },
+            20,
+        ));
+        assert!(air_move_preserves_return_fuel(
+            &map,
+            &properties,
+            player,
+            &stats,
+            GridPosition { x: 1, y: 0 },
+            GridPosition { x: 0, y: 0 },
+            1,
+        ));
+
+        // 既に安全圏外でも、帰還不足を増やさず空港へ近づく一歩は拒否しない。
+        assert!(air_move_preserves_return_fuel(
+            &map,
+            &properties,
+            player,
+            &stats,
+            GridPosition { x: 8, y: 0 },
+            GridPosition { x: 7, y: 0 },
+            10,
+        ));
+        assert!(!air_move_preserves_return_fuel(
+            &map,
+            &properties,
+            player,
+            &stats,
+            GridPosition { x: 8, y: 0 },
+            GridPosition { x: 9, y: 0 },
+            10,
+        ));
     }
 
     #[test]
@@ -4164,6 +5418,82 @@ mod tests {
     }
 
     #[test]
+    fn v4_switches_from_bad_mission_matchup_to_favorable_local_target() {
+        let (mut world, attacker, bad_mission_target, favorable_local_target) =
+            setup_strategic_target_selection_world();
+        let mut damage_chart = DamageChart::new();
+        damage_chart.insert_damage(UnitType::Fighter, UnitType::TransportHelicopter, 10);
+        damage_chart.insert_secondary_damage(UnitType::Fighter, UnitType::TransportHelicopter, 10);
+        damage_chart.insert_damage(UnitType::TransportHelicopter, UnitType::Fighter, 90);
+        damage_chart.insert_secondary_damage(UnitType::TransportHelicopter, UnitType::Fighter, 90);
+        damage_chart.insert_damage(UnitType::Fighter, UnitType::Bcopters, 80);
+        damage_chart.insert_secondary_damage(UnitType::Fighter, UnitType::Bcopters, 80);
+        damage_chart.insert_damage(UnitType::Bcopters, UnitType::Fighter, 0);
+        damage_chart.insert_secondary_damage(UnitType::Bcopters, UnitType::Fighter, 0);
+        world.insert_resource(damage_chart);
+        world
+            .get_mut::<UnitStats>(favorable_local_target)
+            .expect("局地標的の能力")
+            .unit_type = UnitType::Bcopters;
+
+        let mut deployments = crate::ai::v4::deployment::V4DeploymentRegistry::default();
+        deployments.assign_target_for_test(PlayerId(1), attacker, bad_mission_target);
+        world.insert_resource(deployments);
+
+        let (_, action) = decide_ai_action_v2(&mut world, PlayerId(1), &HashSet::new())
+            .expect("V4の局地任務ユニットが攻撃行動を選ぶこと");
+
+        assert!(
+            matches!(
+                action,
+                AiCommand::Attack { target_entity, .. }
+                    if target_entity == favorable_local_target
+                        && target_entity != bad_mission_target
+            ),
+            "選択={action:?}, bad={:?}, favorable={:?}",
+            crate::ai::pruning::evaluate_attack_exchange(
+                &world,
+                attacker,
+                bad_mission_target,
+                GridPosition { x: 1, y: 0 },
+                world.resource::<DamageChart>(),
+            ),
+            crate::ai::pruning::evaluate_attack_exchange(
+                &world,
+                attacker,
+                favorable_local_target,
+                GridPosition { x: 1, y: 0 },
+                world.resource::<DamageChart>(),
+            )
+        );
+    }
+
+    #[test]
+    fn v4_keeps_necessary_bad_exchange_when_no_favorable_target_exists() {
+        let (mut world, attacker, bad_mission_target, other_target) =
+            setup_strategic_target_selection_world();
+        world.despawn(other_target);
+        let mut damage_chart = DamageChart::new();
+        damage_chart.insert_damage(UnitType::Fighter, UnitType::TransportHelicopter, 10);
+        damage_chart.insert_secondary_damage(UnitType::Fighter, UnitType::TransportHelicopter, 10);
+        damage_chart.insert_damage(UnitType::TransportHelicopter, UnitType::Fighter, 90);
+        damage_chart.insert_secondary_damage(UnitType::TransportHelicopter, UnitType::Fighter, 90);
+        world.insert_resource(damage_chart);
+
+        let mut deployments = crate::ai::v4::deployment::V4DeploymentRegistry::default();
+        deployments.assign_target_for_test(PlayerId(1), attacker, bad_mission_target);
+        world.insert_resource(deployments);
+
+        let (_, action) = decide_ai_action_v2(&mut world, PlayerId(1), &HashSet::new())
+            .expect("実行段階の作戦対象には必要攻撃を選ぶこと");
+
+        assert!(matches!(
+            action,
+            AiCommand::Attack { target_entity, .. } if target_entity == bad_mission_target
+        ));
+    }
+
+    #[test]
     fn v2_v3_transport_executor_skips_foreign_owned_squads() {
         for version in [
             crate::ai::ai_version::AiVersion::V2,
@@ -4363,6 +5693,8 @@ mod tests {
             pickup_position: None,
             drop_position: None,
             delivered_cargo: Vec::new(),
+            allow_partial_departure: false,
+            departure_authorized: true,
             return_after_combat: false,
         });
         world.insert_resource(manager);

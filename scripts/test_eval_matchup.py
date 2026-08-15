@@ -142,10 +142,32 @@ class MatchSchedulingTests(unittest.TestCase):
         specs = build_match_specs(("map_3",), "V3", "V2", (11, 22))
         self.assertEqual(
             [
-                {"map": "map_3", "p1": "V3", "p2": "V2", "seed": 11},
-                {"map": "map_3", "p1": "V2", "p2": "V3", "seed": 11},
-                {"map": "map_3", "p1": "V3", "p2": "V2", "seed": 22},
-                {"map": "map_3", "p1": "V2", "p2": "V3", "seed": 22},
+                {"map": "map_3", "p1": "V3", "p2": "V2", "seed": 11, "grid_type": "hex"},
+                {"map": "map_3", "p1": "V2", "p2": "V3", "seed": 11, "grid_type": "hex"},
+                {"map": "map_3", "p1": "V3", "p2": "V2", "seed": 22, "grid_type": "hex"},
+                {"map": "map_3", "p1": "V2", "p2": "V3", "seed": 22, "grid_type": "hex"},
+            ],
+            specs,
+        )
+
+    def test_build_match_specs_can_run_only_the_given_player_order(self):
+        specs = build_match_specs(
+            ("map_3",),
+            "V3",
+            "V4",
+            (42,),
+            player_order="as-given",
+        )
+
+        self.assertEqual(
+            [
+                {
+                    "map": "map_3",
+                    "p1": "V3",
+                    "p2": "V4",
+                    "seed": 42,
+                    "grid_type": "hex",
+                }
             ],
             specs,
         )
@@ -163,8 +185,8 @@ class Issue58PortfolioSchedulingTests(unittest.TestCase):
         self.assertEqual(
             specs[:2],
             [
-                {"map": "map_1", "p1": "V3", "p2": "V1", "seed": 58001},
-                {"map": "map_1", "p1": "V1", "p2": "V3", "seed": 58001},
+                {"map": "map_1", "p1": "V3", "p2": "V1", "seed": 58001, "grid_type": "hex"},
+                {"map": "map_1", "p1": "V1", "p2": "V3", "seed": 58001, "grid_type": "hex"},
             ],
         )
 
@@ -631,6 +653,45 @@ class FactoryReliefTraceTests(unittest.TestCase):
 
         self.assertEqual([mission], records[0]["factory_relief"])
         self.assertEqual(1, records[0]["player_id"])
+
+
+class GridTypeOptionTests(unittest.TestCase):
+    def test_build_match_specs_defaults_to_hex(self):
+        specs = build_match_specs(["map_1"], "V3", "V2", [42])
+        self.assertEqual("hex", specs[0]["grid_type"])
+        self.assertEqual("hex", specs[1]["grid_type"])
+
+    def test_build_match_specs_accepts_square(self):
+        specs = build_match_specs(["map_1"], "V3", "V2", [42], grid_type="square")
+        self.assertEqual("square", specs[0]["grid_type"])
+        self.assertEqual("square", specs[1]["grid_type"])
+
+    def test_run_single_game_passes_grid_type_to_load_map(self):
+        load_map_calls = []
+
+        def tool(name, arguments=None, req_id=1):
+            if name == "load_map":
+                load_map_calls.append(arguments)
+                return {}
+            if name == "set_player_ai_version":
+                return {}
+            if name == "get_board_state":
+                return {
+                    "turn": 1,
+                    "active_player_index": 0,
+                    "players": [
+                        {"player_id": 1, "property_count": 1, "unit_cost": 1000, "funds": 1000},
+                        {"player_id": 2, "property_count": 1, "unit_cost": 1000, "funds": 1000},
+                    ],
+                    "properties": [],
+                    "units": [],
+                    "game_over": {"status": "winner", "winner_id": 1},
+                }
+            raise AssertionError(name)
+
+        run_single_game("map_1", "V3", "V2", 1, seed=42, grid_type="square", tool_caller=tool)
+        self.assertEqual(1, len(load_map_calls))
+        self.assertEqual({"map_name": "map_1", "grid_type": "square", "seed": 42}, load_map_calls[0])
 
 
 if __name__ == "__main__":

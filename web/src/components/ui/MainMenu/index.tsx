@@ -22,7 +22,7 @@ export const MainMenu = () => {
   const setPlayerSettings = useGameStore((state) => state.setPlayerSettings);
 
   const [mapName, setMapName] = useState("map_1");
-  const [topology, setTopology] = useState("square");
+  const [topology, setTopology] = useState("hex");
   const [isLoading, setIsLoading] = useState(false);
   const [loadOpened, setLoadOpened] = useState(false);
 

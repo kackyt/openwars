@@ -9,8 +9,8 @@
 //! （ターン境界で破棄される per-turn リソース）に溜まるため、
 //! 「そのターンに何が動かなかったか」が確定するのはこの一点だけである。
 //!
-//! ここでは新しい永続状態を持たない。分類 D（停滞 Squad：フェーズが N ターン進まない）は
-//! Squad ダイジェストのターン間差分で求められるよう、判定材料だけを出力に載せる。
+//! Reserve は「明示的な遊兵」として no_mission と別に数える。前回の自軍手番から
+//! Reserve が継続した Entity は1ターン期限超過なので、診断Resourceだけが入場手番を保持する。
 
 use crate::ai::islands::IslandId;
 use crate::ai::squad::{MissionPhase, MissionType, SquadId, SquadManager};
@@ -29,12 +29,18 @@ pub struct IdleUnitRecord {
     pub position: GridPosition,
     /// 所属している Squad（分類 A の場合は None）。
     pub squad_id: Option<SquadId>,
+    /// 所属Squadの任務。Reserveを通常任務として隠さず遊兵へ加算するために保持する。
+    pub mission_type: Option<MissionType>,
     /// 分類A: どの Squad の構成要素でもなく、単独行動の対象にも入っていない。
     pub no_mission: bool,
     /// 分類B: Squad には属しているが、そのターン一度も行動しなかった。
     pub mission_stalled: bool,
     /// 分類C: 行動可能（未移動かつ未行動完了）なままターンを終えた。
     pub actionable: bool,
+    /// 明示待機へ落ちた遊兵。作戦投入予定のForming/Stagingとは区別する。
+    pub reserve: bool,
+    /// Reserveへ入った自軍手番を0とする経過手番数。Reserve以外はNone。
+    pub reserve_age: Option<u32>,
 }
 
 /// Squad 単位のダイジェスト。分類 D はこれのターン間差分で判定する。
@@ -49,6 +55,8 @@ pub struct IdleSquadDigest {
     pub member_count: usize,
     /// そのターンに1回でも行動した構成 Entity 数。0 が続けば停滞している。
     pub acted_count: usize,
+    /// 「Reserveを付けただけ」で過剰兵力を隠さないための構成兵種内訳。
+    pub member_unit_types: Vec<UnitType>,
 }
 
 /// 1プレイヤー・1ターン分の遊兵計測結果。
@@ -78,6 +86,24 @@ impl IdleAudit {
     pub fn actionable_count(&self) -> usize {
         self.records.iter().filter(|r| r.actionable).count()
     }
+
+    /// 明示的な遊兵（Reserve）の数。
+    pub fn reserve_count(&self) -> usize {
+        self.records.iter().filter(|record| record.reserve).count()
+    }
+
+    /// 次の自軍手番にもReserveが継続した、1ターン期限超過の数。
+    pub fn overdue_reserve_count(&self) -> usize {
+        self.records
+            .iter()
+            .filter(|record| record.reserve_age.is_some_and(|age| age >= 1))
+            .count()
+    }
+
+    /// ユーザー定義の遊兵数。UnassignedとReserveは排他的なので単純加算する。
+    pub fn idle_count(&self) -> usize {
+        self.no_mission_count().saturating_add(self.reserve_count())
+    }
 }
 
 /// 直近ターンの計測結果をプレイヤー別に保持する診断用リソース。
@@ -85,10 +111,30 @@ impl IdleAudit {
 #[derive(Resource, Debug, Clone, Default)]
 pub struct IdleAuditDiagnostics {
     pub by_player: HashMap<PlayerId, IdleAudit>,
+    reserve_entered_turn: HashMap<PlayerId, HashMap<Entity, u32>>,
 }
 
 impl IdleAuditDiagnostics {
-    pub fn record(&mut self, audit: IdleAudit) {
+    pub fn record(&mut self, turn: u32, mut audit: IdleAudit) {
+        let reserve_entered = self
+            .reserve_entered_turn
+            .entry(audit.player_id)
+            .or_default();
+        let current_reserves = audit
+            .records
+            .iter()
+            .filter(|record| record.reserve)
+            .map(|record| record.entity)
+            .collect::<HashSet<_>>();
+        reserve_entered.retain(|entity, _| current_reserves.contains(entity));
+        for record in &mut audit.records {
+            if !record.reserve {
+                record.reserve_age = None;
+                continue;
+            }
+            let entered_turn = *reserve_entered.entry(record.entity).or_insert(turn);
+            record.reserve_age = Some(turn.saturating_sub(entered_turn));
+        }
         self.by_player.insert(audit.player_id, audit);
     }
 }
@@ -104,7 +150,7 @@ pub fn audit_idle_units(
 ) -> IdleAudit {
     // 1. Squad 側の情報を所有値へ写し取る。
     //    このあと World へクエリを掛けるためにリソースの借用をここで手放す必要がある。
-    let mut assigned: HashMap<Entity, SquadId> = HashMap::new();
+    let mut assigned: HashMap<Entity, (SquadId, MissionType)> = HashMap::new();
     let mut squad_members: HashMap<SquadId, Vec<Entity>> = HashMap::new();
     // 構成員の集計（member_count / acted_count）はクエリ後に埋めるため、ここでは 0 で作る。
     let mut squad_digests: Vec<IdleSquadDigest> = Vec::new();
@@ -126,7 +172,9 @@ pub fn audit_idle_units(
             for entity in &entities {
                 // ユニットは1勢力にしか属さないため、他プレイヤーの Squad が
                 // 自軍ユニットを含むことはない。所有者での事前フィルタは不要。
-                assigned.entry(*entity).or_insert(squad.id);
+                assigned
+                    .entry(*entity)
+                    .or_insert_with(|| (squad.id, squad.mission_type.clone()));
             }
 
             squad_digests.push(IdleSquadDigest {
@@ -137,6 +185,7 @@ pub fn audit_idle_units(
                 target_island: squad.target_island,
                 member_count: 0,
                 acted_count: 0,
+                member_unit_types: Vec::new(),
             });
             squad_members.insert(squad.id, entities);
         }
@@ -170,7 +219,9 @@ pub fn audit_idle_units(
         total_units += 1;
         own_units.insert(entity);
 
-        let squad_id = assigned.get(&entity).copied();
+        let assignment = assigned.get(&entity);
+        let squad_id = assignment.map(|(squad_id, _)| *squad_id);
+        let mission_type = assignment.map(|(_, mission_type)| mission_type.clone());
         let has_acted = acted.contains(&entity);
 
         // A: どの Squad にも属さず、単独行動の対象にもなっていない。
@@ -179,16 +230,20 @@ pub fn audit_idle_units(
         let mission_stalled = squad_id.is_some() && !has_acted;
         // C: 行動可能なままターンが終わった（A・B の観測可能な上位集合）。
         let actionable = !has_moved.0 && !action_completed.0 && !has_acted;
+        let reserve = mission_type == Some(MissionType::Reserve);
 
-        if no_mission || mission_stalled || actionable {
+        if no_mission || mission_stalled || actionable || reserve {
             records.push(IdleUnitRecord {
                 entity,
                 unit_type: stats.unit_type,
                 position: *position,
                 squad_id,
+                mission_type,
                 no_mission,
                 mission_stalled,
                 actionable,
+                reserve,
+                reserve_age: None,
             });
         }
     }
@@ -208,6 +263,11 @@ pub fn audit_idle_units(
             }
             digest.member_count = owned.len();
             digest.acted_count = owned.iter().filter(|entity| acted.contains(entity)).count();
+            digest.member_unit_types = owned
+                .iter()
+                .filter_map(|entity| world.get::<UnitStats>(*entity))
+                .map(|stats| stats.unit_type)
+                .collect();
             Some(digest)
         })
         .collect();
@@ -336,6 +396,34 @@ mod tests {
         assert_eq!(audit.squads.len(), 1);
         assert_eq!(audit.squads[0].member_count, 2);
         assert_eq!(audit.squads[0].acted_count, 1);
+    }
+
+    #[test]
+    fn reserve_is_idle_even_after_acting_and_becomes_overdue_next_turn() {
+        let mut world = setup_world();
+        let player = PlayerId(1);
+        let entity = spawn_unit(&mut world, player, 1, 1);
+        let mut manager = SquadManager::new();
+        let reserve = manager.create_owned_squad(MissionType::Reserve, player);
+        reserve.members.insert(entity);
+        reserve.target = Some(GridPosition { x: 2, y: 1 });
+        world.insert_resource(manager);
+
+        let acted = HashSet::from([entity]);
+        let mut diagnostics = IdleAuditDiagnostics::default();
+        diagnostics.record(3, audit_idle_units(&mut world, player, &acted));
+        let first = diagnostics.by_player.get(&player).unwrap();
+        assert_eq!(first.no_mission_count(), 0);
+        assert_eq!(first.reserve_count(), 1);
+        assert_eq!(first.idle_count(), 1);
+        assert_eq!(first.overdue_reserve_count(), 0);
+        assert_eq!(first.records[0].reserve_age, Some(0));
+
+        diagnostics.record(4, audit_idle_units(&mut world, player, &acted));
+        let next = diagnostics.by_player.get(&player).unwrap();
+        assert_eq!(next.reserve_count(), 1);
+        assert_eq!(next.overdue_reserve_count(), 1);
+        assert_eq!(next.records[0].reserve_age, Some(1));
     }
 
     /// 輸送中（Transporting）のユニットは自力で動けないため母数から除外する。

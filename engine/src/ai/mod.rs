@@ -1,6 +1,6 @@
 pub mod ai_version;
 pub mod demand;
-pub mod emergency;
+pub(crate) mod deterministic_parallel;
 pub mod engine;
 pub mod eval;
 /// 遊兵（任務なし・任務があるのに動けないユニット）の計測
@@ -14,6 +14,7 @@ mod island_invasion_tests;
 pub mod islands;
 pub mod missions;
 pub mod objectives;
+pub mod operation_assignment;
 pub mod planner;
 pub mod production;
 pub mod pruning;

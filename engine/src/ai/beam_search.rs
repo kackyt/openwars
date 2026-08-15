@@ -79,13 +79,7 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
         .filter(|s| s.owner_id == Some(perspective_player))
         // V4の生産目的を持つ局地任務は、優先敵が有効な間は別前線へ上書きしない。
         .filter(|s| !protected_squads.contains(&s.id))
-        .filter(|s| {
-            !s.members.is_empty()
-                && !matches!(
-                    s.mission_type,
-                    MissionType::Transport | MissionType::Interception(_)
-                )
-        })
+        .filter(|s| !s.members.is_empty() && !matches!(s.mission_type, MissionType::Transport))
         .filter(|s| s.target_island.is_none())
         .cloned()
         .collect();
@@ -129,8 +123,9 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                 }
                 valid_targets.extend(&target_enemies);
             }
-            MissionType::Interception(_) => {
-                // 緊急ミッションの目標は盤面分析で確定済みのため、ビーム探索で上書きしない。
+            MissionType::Reserve => {
+                // 予備配置は作戦計画が選んだ待機地点を維持し、汎用探索で
+                // 別前線へ再目標化しない。
                 if let Some(target) = squad.target {
                     valid_targets.push(target);
                 }
@@ -324,8 +319,7 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                                         }
                                     }
                                     MissionType::Capture => 0,
-                                    MissionType::Interception(_) => stats.max_range.max(1),
-                                    MissionType::Transport => 1,
+                                    MissionType::Transport | MissionType::Reserve => 1,
                                 };
 
                                 let dist_map =
@@ -484,6 +478,8 @@ mod tests {
             pickup_position: None,
             drop_position: None,
             delivered_cargo: Vec::new(),
+            allow_partial_departure: false,
+            departure_authorized: true,
             return_after_combat: false,
         };
         squad.members.insert(u1);

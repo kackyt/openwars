@@ -387,12 +387,18 @@ fn apply_unit_resupply(
 }
 
 /// ユニットの待機コマンドを処理します。
+#[allow(clippy::type_complexity)]
 pub fn wait_unit_system(
     mut wait_events: EventReader<WaitUnitCommand>,
     mut waited_writer: EventWriter<UnitWaitedEvent>,
-    mut q_units: Query<(&Faction, &mut ActionCompleted)>,
+    mut q_units: ParamSet<(
+        Query<(Entity, &GridPosition, &Faction, Option<&Transporting>)>,
+        Query<(&Faction, &mut ActionCompleted)>,
+        Query<(&mut GridPosition, &mut Fuel, &mut HasMoved)>,
+    )>,
     players: Res<Players>,
     match_state: Res<MatchState>,
+    pending_move: Option<Res<PendingMove>>,
     mut commands: Commands,
 ) {
     if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
@@ -401,7 +407,37 @@ pub fn wait_unit_system(
     let active_player = players.0[match_state.active_player_index.0].id;
 
     for ev in wait_events.read() {
-        if let Ok((faction, mut action_comp)) = q_units.get_mut(ev.unit_entity) {
+        let occupied_by_other = {
+            let positions = q_units.p0();
+            let Ok((_, unit_position, faction, _)) = positions.get(ev.unit_entity) else {
+                continue;
+            };
+            if faction.0 != active_player {
+                continue;
+            }
+            positions.iter().any(|(entity, position, _, transporting)| {
+                entity != ev.unit_entity && transporting.is_none() && *position == *unit_position
+            })
+        };
+        if occupied_by_other {
+            // 移動後の占有マスではWaitはルール上選べない。誤った複合コマンドが
+            // 届いても重複配置を確定せず、直前の移動を取り消す。
+            if let Some(pending) = pending_move.as_deref()
+                && pending.unit_entity == ev.unit_entity
+            {
+                if let Ok((mut position, mut fuel, mut has_moved)) =
+                    q_units.p2().get_mut(ev.unit_entity)
+                {
+                    *position = pending.original_pos;
+                    *fuel = pending.original_fuel;
+                    has_moved.0 = false;
+                }
+                commands.remove_resource::<PendingMove>();
+            }
+            continue;
+        }
+
+        if let Ok((faction, mut action_comp)) = q_units.p1().get_mut(ev.unit_entity) {
             if faction.0 != active_player {
                 continue;
             }
@@ -446,6 +482,54 @@ mod tests {
 
         assert_eq!(repaired_hp, 1);
         assert_eq!(cost, 1);
+    }
+
+    #[test]
+    fn wait_on_another_unit_rolls_back_the_illegal_move() {
+        let (mut world, mut schedule) = setup_world();
+        world.init_resource::<Events<WaitUnitCommand>>();
+        world.init_resource::<Events<UnitWaitedEvent>>();
+        schedule.add_systems(wait_unit_system);
+
+        let player = PlayerId(1);
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Faction(player),
+            ActionCompleted(false),
+        ));
+        let cargo = world
+            .spawn((
+                GridPosition { x: 1, y: 0 },
+                Faction(player),
+                ActionCompleted(false),
+                HasMoved(true),
+                Fuel {
+                    current: 98,
+                    max: 99,
+                },
+            ))
+            .id();
+        world.insert_resource(PendingMove {
+            unit_entity: cargo,
+            original_pos: GridPosition { x: 0, y: 0 },
+            original_fuel: Fuel {
+                current: 99,
+                max: 99,
+            },
+        });
+        world.send_event(WaitUnitCommand { unit_entity: cargo });
+
+        schedule.run(&mut world);
+
+        assert_eq!(
+            *world.get::<GridPosition>(cargo).unwrap(),
+            GridPosition { x: 0, y: 0 }
+        );
+        assert_eq!(world.get::<Fuel>(cargo).unwrap().current, 99);
+        assert!(!world.get::<HasMoved>(cargo).unwrap().0);
+        assert!(!world.get::<ActionCompleted>(cargo).unwrap().0);
+        assert!(world.get_resource::<PendingMove>().is_none());
+        assert!(world.resource::<Events<UnitWaitedEvent>>().is_empty());
     }
 
     #[test]

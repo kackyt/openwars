@@ -3,18 +3,20 @@ use crate::ai::island_campaign::{
     CampaignTransportBlueprint, CampaignUnitCandidate, ExistingCampaignOperation,
     IslandCampaignCandidate, IslandCampaignDecision, IslandCampaignFacts, IslandCampaignPortfolio,
     IslandCampaignRequirement, IslandCampaignState, allocate_campaign_portfolio, assess_island,
-    campaign_unit_type_rank, combat_overmatch_requirement, promote_logistics_prerequisite,
+    campaign_unit_type_rank, promote_logistics_prerequisite,
 };
 use crate::ai::islands::{Island, IslandId, IslandMap};
 use crate::ai::squad::{MissionPhase, MissionType, SquadManager, TransportPhase};
+#[cfg(test)]
+use crate::ai::turn_distance::TurnDistanceCache;
 use crate::ai::turn_distance::{
-    TerrainConnectivity, TurnDistanceCache, calculate_turn_distance, is_terrain_reachable,
+    SourceTurnDistanceCache, TerrainConnectivity, calculate_source_turn_distances_cached,
 };
 use crate::components::{
     CargoCapacity, Faction, Fuel, GridPosition, Health, PlayerId, Property, Transporting, UnitStats,
 };
 use crate::resources::master_data::{MasterDataRegistry, UnitName};
-use crate::resources::{Map, MovementType, Players, Terrain, UnitType};
+use crate::resources::{Map, MatchState, MovementType, Players, Terrain, UnitType};
 use crate::systems::movement::{OccupantInfo, get_valid_movement_cost};
 use bevy_ecs::prelude::{Entity, World};
 use std::collections::{HashMap, HashSet};
@@ -110,15 +112,6 @@ fn is_live_transport_phase(phase: TransportPhase) -> bool {
     )
 }
 
-fn hp_weighted_combat_value(stats: &UnitStats, health: Health) -> u32 {
-    if health.max == 0 || is_support_only(stats.unit_type) {
-        return 0;
-    }
-    let weighted =
-        u64::from(stats.cost).saturating_mul(u64::from(health.current)) / u64::from(health.max);
-    u32::try_from(weighted).unwrap_or(u32::MAX)
-}
-
 fn capture_turns(property: &Property, health: Health) -> u32 {
     let display_hp = health.current.saturating_add(9) / 10;
     let capture_power = display_hp.saturating_mul(10);
@@ -172,8 +165,7 @@ fn eta_between(
     map: &Map,
     registry: &MasterDataRegistry,
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
-    connectivity: &mut TerrainConnectivity,
-    cache: &mut TurnDistanceCache,
+    cache: &mut SourceTurnDistanceCache,
     player_id: PlayerId,
     start: GridPosition,
     target: GridPosition,
@@ -182,28 +174,18 @@ fn eta_between(
     if start.x >= map.width || start.y >= map.height {
         return None;
     }
-    if !connectivity.is_reachable(
-        map,
-        registry,
-        (start.x, start.y),
-        (target.x, target.y),
-        stats.movement_type,
-    ) {
-        return None;
-    }
-    let distance = calculate_turn_distance(
+    calculate_source_turn_distances_cached(
         map,
         registry,
         unit_positions,
         (start.x, start.y),
-        (target.x, target.y),
         stats.movement_type,
         stats.max_movement,
-        0,
         player_id,
         cache,
-    );
-    (distance.used_mp != u32::MAX).then_some(distance.turns)
+    )
+    .get(&target)
+    .map(|distance| distance.turns)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -211,8 +193,7 @@ fn unit_eta_to_island(
     map: &Map,
     registry: &MasterDataRegistry,
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
-    connectivity: &mut TerrainConnectivity,
-    cache: &mut TurnDistanceCache,
+    cache: &mut SourceTurnDistanceCache,
     unit: &UnitSnapshot,
     island: &Island,
 ) -> Option<u32> {
@@ -226,7 +207,6 @@ fn unit_eta_to_island(
                 map,
                 registry,
                 unit_positions,
-                connectivity,
                 cache,
                 unit.faction,
                 unit.position,
@@ -242,8 +222,7 @@ fn unit_eta_to_drop(
     map: &Map,
     registry: &MasterDataRegistry,
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
-    connectivity: &mut TerrainConnectivity,
-    cache: &mut TurnDistanceCache,
+    cache: &mut SourceTurnDistanceCache,
     unit: &UnitSnapshot,
     drop_position: GridPosition,
 ) -> Option<u32> {
@@ -277,7 +256,6 @@ fn unit_eta_to_drop(
                 map,
                 registry,
                 unit_positions,
-                connectivity,
                 cache,
                 unit.faction,
                 unit.position,
@@ -293,8 +271,7 @@ fn capture_eta_from_position(
     map: &Map,
     registry: &MasterDataRegistry,
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
-    connectivity: &mut TerrainConnectivity,
-    cache: &mut TurnDistanceCache,
+    cache: &mut SourceTurnDistanceCache,
     unit: &UnitSnapshot,
     start: GridPosition,
     properties: &[PropertySnapshot],
@@ -310,7 +287,6 @@ fn capture_eta_from_position(
                 map,
                 registry,
                 unit_positions,
-                connectivity,
                 cache,
                 unit.faction,
                 start,
@@ -327,8 +303,7 @@ fn conservative_capture_eta_from_island(
     map: &Map,
     registry: &MasterDataRegistry,
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
-    connectivity: &mut TerrainConnectivity,
-    cache: &mut TurnDistanceCache,
+    cache: &mut SourceTurnDistanceCache,
     unit: &UnitSnapshot,
     island: &Island,
     properties: &[PropertySnapshot],
@@ -349,7 +324,6 @@ fn conservative_capture_eta_from_island(
             map,
             registry,
             unit_positions,
-            connectivity,
             cache,
             unit,
             landing,
@@ -566,6 +540,11 @@ fn collect_existing_operations(
     let mut cargo_assignments = HashMap::new();
 
     for squad in squads {
+        // Reserveは次作戦へ再徴用できる待機配置であり、島作戦へcommit済みの
+        // 戦力として不足数やoperation_readyへ数えてはならない。
+        if squad.mission_type == MissionType::Reserve {
+            continue;
+        }
         let owned_transport = squad.transport_entity.filter(|transport| {
             unit_by_entity
                 .get(transport)
@@ -588,6 +567,17 @@ fn collect_existing_operations(
                     .is_some_and(|unit| unit.faction == player_id)
                     .then_some(())?;
                 transport_cargo_is_associated(&squad.phase, transport, *cargo, &unit_by_entity)
+                    .then_some(*cargo)
+            }));
+        } else if squad.mission_type == MissionType::Transport
+            && squad.phase == MissionPhase::Forming
+        {
+            // 部分出航後に残った「cargoだけの後続便」も作戦継続の正本である。
+            // transportが未調達だからとここで捨てると、次手番に別島へ再予約される。
+            owned_assigned_entities.extend(squad.cargo_entities.iter().filter_map(|cargo| {
+                unit_by_entity
+                    .get(cargo)
+                    .is_some_and(|unit| unit.faction == player_id)
                     .then_some(*cargo)
             }));
         }
@@ -628,9 +618,8 @@ fn collect_existing_operations(
             (MissionPhase::Transport(phase), Some(_)) => Some(*phase),
             _ => None,
         };
-        let squad_is_forming = squad.mission_type == MissionType::Transport
-            && squad.phase == MissionPhase::Forming
-            && owned_transport.is_some();
+        let squad_is_forming =
+            squad.mission_type == MissionType::Transport && squad.phase == MissionPhase::Forming;
         let operation = operations
             .entry(island_id)
             .or_insert_with(|| ExistingCampaignOperation {
@@ -665,7 +654,13 @@ fn collect_existing_operations(
         }
 
         let squad_has_live_continuity = if squad.mission_type == MissionType::Transport {
-            squad_is_forming || squad_transport_phase.is_some_and(is_live_transport_phase)
+            let reusable_empty_return = squad_transport_phase == Some(TransportPhase::Return)
+                && owned_transport
+                    .and_then(|transport| unit_by_entity.get(&transport))
+                    .is_some_and(|unit| unit.loaded_cargo_entities.is_empty());
+            squad_is_forming
+                || squad_transport_phase.is_some_and(is_live_transport_phase)
+                || reusable_empty_return
         } else {
             squad.phase != MissionPhase::Completed
         };
@@ -827,8 +822,7 @@ fn transport_options_for_island(
     map: &Map,
     registry: &MasterDataRegistry,
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
-    connectivity: &mut TerrainConnectivity,
-    cache: &mut TurnDistanceCache,
+    cache: &mut SourceTurnDistanceCache,
     player_id: PlayerId,
     island: &Island,
     units: &[UnitSnapshot],
@@ -859,15 +853,7 @@ fn transport_options_for_island(
                 UnitType::TransportHelicopter | UnitType::Lander
             )
     }) {
-        if let Some(eta) = unit_eta_to_island(
-            map,
-            registry,
-            unit_positions,
-            connectivity,
-            cache,
-            unit,
-            island,
-        ) {
+        if let Some(eta) = unit_eta_to_island(map, registry, unit_positions, cache, unit, island) {
             options.push(TransportOption {
                 unit_type: unit.stats.unit_type,
                 cost: unit.stats.cost,
@@ -902,7 +888,6 @@ fn transport_options_for_island(
                 map,
                 registry,
                 unit_positions,
-                connectivity,
                 cache,
                 &production_unit,
                 island,
@@ -973,8 +958,7 @@ fn operation_transport_eta(
     map: &Map,
     registry: &MasterDataRegistry,
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
-    connectivity: &mut TerrainConnectivity,
-    cache: &mut TurnDistanceCache,
+    cache: &mut SourceTurnDistanceCache,
     island: &Island,
 ) -> Option<u32> {
     if assignment.phase == TransportPhase::Return {
@@ -992,7 +976,6 @@ fn operation_transport_eta(
             map,
             registry,
             unit_positions,
-            connectivity,
             cache,
             transport.faction,
             transport.position,
@@ -1009,7 +992,6 @@ fn operation_transport_eta(
                     map,
                     registry,
                     unit_positions,
-                    connectivity,
                     cache,
                     cargo.faction,
                     cargo.position,
@@ -1026,21 +1008,12 @@ fn operation_transport_eta(
                 map,
                 registry,
                 unit_positions,
-                connectivity,
                 cache,
                 &after_pickup,
                 drop_position,
             )
         } else {
-            unit_eta_to_island(
-                map,
-                registry,
-                unit_positions,
-                connectivity,
-                cache,
-                &after_pickup,
-                island,
-            )
+            unit_eta_to_island(map, registry, unit_positions, cache, &after_pickup, island)
         }?;
         // transportとcargoの遅い側が合流するまで待ち、搭載後に目標へ向かう。
         return Some(
@@ -1055,21 +1028,12 @@ fn operation_transport_eta(
             map,
             registry,
             unit_positions,
-            connectivity,
             cache,
             transport,
             drop_position,
         )
     } else {
-        unit_eta_to_island(
-            map,
-            registry,
-            unit_positions,
-            connectivity,
-            cache,
-            transport,
-            island,
-        )
+        unit_eta_to_island(map, registry, unit_positions, cache, transport, island)
     }
 }
 
@@ -1078,6 +1042,7 @@ fn missing_expansion_package_cost(
     transport: Option<TransportOption>,
     operation: Option<&ExistingCampaignOperation>,
     units: &[UnitSnapshot],
+    required_capture_units: u32,
 ) -> u32 {
     let capture_cost = [UnitType::Infantry, UnitType::Mech]
         .into_iter()
@@ -1085,32 +1050,42 @@ fn missing_expansion_package_cost(
         .map(|stats| stats.cost)
         .min()
         .unwrap_or(0);
-    let transport_purchase_cost = transport
-        .filter(|transport| matches!(transport.source, TransportSource::Producible(_)))
-        .map(|transport| transport.cost)
-        .unwrap_or(0);
-    let mut missing = transport_purchase_cost.saturating_add(capture_cost.saturating_mul(2));
+    let transport_purchase_cost = transport.map_or(0, |transport| {
+        let cargo_slots = unit_stats_for_type(registry, transport.unit_type)
+            .map(|stats| stats.max_cargo.max(1))
+            .unwrap_or(1);
+        let required_transports = required_capture_units.div_ceil(cargo_slots);
+        let held_transports = u32::from(matches!(transport.source, TransportSource::Held(_)));
+        required_transports
+            .saturating_sub(held_transports)
+            .saturating_mul(transport.cost)
+    });
+    let mut missing =
+        transport_purchase_cost.saturating_add(capture_cost.saturating_mul(required_capture_units));
     let Some(operation) = operation else {
         return missing;
     };
     if !operation.is_forming
         && !operation
             .transport_phase
-            .is_some_and(is_live_transport_phase)
+            .is_some_and(|phase| is_live_transport_phase(phase) || phase == TransportPhase::Return)
     {
         return missing;
     }
-    let continued_transport_cost = match transport {
-        Some(transport)
-            if !operation.transport_entities.is_empty()
-                && matches!(transport.source, TransportSource::Producible(_)) =>
-        {
-            transport.cost
+    let continued_transport_cost = transport.map_or(0, |transport| {
+        if matches!(transport.source, TransportSource::Held(_)) {
+            return 0;
         }
-        _ => 0,
-    };
+        u32::try_from(operation.transport_entities.len())
+            .unwrap_or(u32::MAX)
+            .saturating_mul(transport.cost)
+    });
     missing = missing.saturating_sub(continued_transport_cost);
-    for entity in operation.capture_entities.iter().take(2) {
+    for entity in operation
+        .capture_entities
+        .iter()
+        .take(usize::try_from(required_capture_units).unwrap_or(usize::MAX))
+    {
         if let Some(unit) = units.iter().find(|unit| unit.entity == *entity) {
             missing = missing.saturating_sub(unit.stats.cost.min(capture_cost));
         }
@@ -1164,8 +1139,8 @@ pub fn collect_island_campaign_facts(
                 enemy_properties: 0,
                 friendly_units: 0,
                 enemy_units: 0,
-                friendly_combat_value: 0,
-                enemy_combat_value: 0,
+                friendly_combat_units: 0,
+                enemy_combat_units: 0,
                 friendly_arrival_eta: None,
                 enemy_arrival_eta: None,
                 friendly_capture_eta: None,
@@ -1264,8 +1239,7 @@ pub fn collect_island_campaign_facts(
     }
 
     // 共有cacheは占有情報をkeyに含めないため触らず、分析呼び出し専用の空cacheを使う。
-    let mut cache = TurnDistanceCache::default();
-    let mut connectivity = TerrainConnectivity::default();
+    let mut cache = SourceTurnDistanceCache::default();
 
     for unit in &units {
         if cargo_assignments.contains_key(&unit.entity) || unit.transporting.is_some() {
@@ -1276,19 +1250,20 @@ pub fn collect_island_campaign_facts(
             .and_then(|island| accumulator_index.get(&island.id).copied());
         if let Some(index) = local_index {
             let accumulator = &mut accumulators[index];
-            let value = hp_weighted_combat_value(&unit.stats, unit.health);
             if unit.faction == player_id {
                 accumulator.facts.friendly_units =
                     accumulator.facts.friendly_units.saturating_add(1);
-                accumulator.facts.friendly_combat_value = accumulator
-                    .facts
-                    .friendly_combat_value
-                    .saturating_add(value);
+                if unit.health.current > 0 && !is_support_only(unit.stats.unit_type) {
+                    accumulator.facts.friendly_combat_units =
+                        accumulator.facts.friendly_combat_units.saturating_add(1);
+                }
                 accumulator.facts.friendly_arrival_eta = Some(0);
             } else {
                 accumulator.facts.enemy_units = accumulator.facts.enemy_units.saturating_add(1);
-                accumulator.facts.enemy_combat_value =
-                    accumulator.facts.enemy_combat_value.saturating_add(value);
+                if unit.health.current > 0 && !is_support_only(unit.stats.unit_type) {
+                    accumulator.facts.enemy_combat_units =
+                        accumulator.facts.enemy_combat_units.saturating_add(1);
+                }
                 accumulator.facts.enemy_arrival_eta = Some(0);
             }
         }
@@ -1297,15 +1272,8 @@ pub fn collect_island_campaign_facts(
             let Some(&index) = accumulator_index.get(&island.id) else {
                 continue;
             };
-            let eta = unit_eta_to_island(
-                &map,
-                &registry,
-                &unit_positions,
-                &mut connectivity,
-                &mut cache,
-                unit,
-                island,
-            );
+            let eta =
+                unit_eta_to_island(&map, &registry, &unit_positions, &mut cache, unit, island);
             let accumulator = &mut accumulators[index];
             if unit.faction == player_id {
                 accumulator.facts.friendly_arrival_eta =
@@ -1318,7 +1286,6 @@ pub fn collect_island_campaign_facts(
                 &map,
                 &registry,
                 &unit_positions,
-                &mut connectivity,
                 &mut cache,
                 unit,
                 unit.position,
@@ -1353,15 +1320,14 @@ pub fn collect_island_campaign_facts(
             &map,
             &registry,
             &unit_positions,
-            &mut connectivity,
             &mut cache,
             island,
         );
         let accumulator = &mut accumulators[index];
-        accumulator.facts.friendly_combat_value = accumulator
-            .facts
-            .friendly_combat_value
-            .saturating_add(hp_weighted_combat_value(&unit.stats, unit.health));
+        if unit.health.current > 0 && !is_support_only(unit.stats.unit_type) {
+            accumulator.facts.friendly_combat_units =
+                accumulator.facts.friendly_combat_units.saturating_add(1);
+        }
         accumulator.facts.friendly_arrival_eta =
             min_option(accumulator.facts.friendly_arrival_eta, arrival_eta);
         if let Some(arrival_eta) = arrival_eta {
@@ -1371,7 +1337,6 @@ pub fn collect_island_campaign_facts(
                     &map,
                     &registry,
                     &unit_positions,
-                    &mut connectivity,
                     &mut cache,
                     unit,
                     landing_position,
@@ -1382,7 +1347,6 @@ pub fn collect_island_campaign_facts(
                     &map,
                     &registry,
                     &unit_positions,
-                    &mut connectivity,
                     &mut cache,
                     unit,
                     island,
@@ -1413,7 +1377,6 @@ pub fn collect_island_campaign_facts(
                 &map,
                 &registry,
                 &unit_positions,
-                &mut connectivity,
                 &mut cache,
                 player_id,
                 island,
@@ -1434,6 +1397,10 @@ pub fn collect_island_campaign_facts(
                 selected,
                 operations_by_island.get(&island.id).copied(),
                 &units,
+                facts
+                    .neutral_properties
+                    .saturating_add(facts.enemy_properties)
+                    .max(2),
             );
         }
     }
@@ -1448,93 +1415,105 @@ fn contested_is_competitive(facts: &IslandCampaignFacts) -> bool {
     facts
         .friendly_capture_eta
         .zip(facts.enemy_capture_eta)
-        .is_some_and(|(friendly_eta, enemy_eta)| {
-            friendly_eta <= enemy_eta.saturating_add(1)
-                && facts.friendly_combat_value >= facts.enemy_combat_value
-        })
-}
-
-/// 占領対象を持つ陸塊が1つだけなら、通常の地上戦略へ委譲すべき主陸塊として返す。
-fn sole_capturable_landmass_id(facts: &[IslandCampaignFacts]) -> Option<IslandId> {
-    let mut capturable_landmasses = facts
-        .iter()
-        .filter(|facts| facts.capturable_properties > 0)
-        .map(|facts| facts.island_id);
-    let sole_landmass = capturable_landmasses.next()?;
-    capturable_landmasses
-        .next()
-        .is_none()
-        .then_some(sole_landmass)
+        .is_some_and(|(friendly_eta, enemy_eta)| friendly_eta <= enemy_eta.saturating_add(1))
 }
 
 fn requirement_for_assessment(
     facts: &IslandCampaignFacts,
     assessment: &mut crate::ai::island_campaign::IslandCampaignAssessment,
-    reserve_unit_cost: u32,
 ) -> IslandCampaignRequirement {
+    // 未所有施設は互いに独立した占領対象なので、残数に応じて並行投入する。
+    let remaining_properties = facts
+        .neutral_properties
+        .saturating_add(facts.enemy_properties);
+    // 上陸・交戦中は1体撃破だけで占領能力を失わない最小2体を維持する。
+    let expedition_capture_units = remaining_properties.max(2);
     match assessment.state {
         IslandCampaignState::OpenNeutral
             if assessment.decision == IslandCampaignDecision::Expand =>
         {
+            let capture_budget = expedition_capture_units.saturating_mul(1_000);
+            let transport_units = expedition_capture_units.div_ceil(2);
+            let transport_budget = transport_units.saturating_mul(4_000);
             IslandCampaignRequirement {
                 preferred_transport: Some(UnitType::TransportHelicopter),
-                transport_slots: 2,
-                capture_units: 2,
-                combat_budget: 0,
-                total_budget: 6_000,
+                transport_slots: expedition_capture_units,
+                capture_units: expedition_capture_units,
+                ground_combat_units: 0,
+                combat_units: 0,
+                total_budget: capture_budget.saturating_add(transport_budget),
+            }
+        }
+        IslandCampaignState::Secured if assessment.decision == IslandCampaignDecision::Secure => {
+            let capture_budget = remaining_properties.saturating_mul(1_000);
+            assessment.required_budget = capture_budget;
+            IslandCampaignRequirement {
+                // 現地要員は輸送不要。allocatorが遠隔要員を選んだ場合だけ実cargoから輸送を要求する。
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: remaining_properties,
+                ground_combat_units: 0,
+                combat_units: 0,
+                total_budget: capture_budget,
             }
         }
         IslandCampaignState::Threatened => {
-            assessment.required_budget = facts.enemy_combat_value;
+            let combat_units = facts.enemy_combat_units;
+            let capture_budget = remaining_properties.saturating_mul(1_000);
+            assessment.required_budget = capture_budget;
             IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
-                capture_units: 0,
-                combat_budget: facts.enemy_combat_value,
-                total_budget: facts.enemy_combat_value,
+                // 接近脅威は未所有施設を放棄する理由ではない。既着の占領兵を
+                // assignmentへ残し、戦闘Entityとは独立して施設確保を続行する。
+                capture_units: remaining_properties,
+                ground_combat_units: 0,
+                combat_units,
+                total_budget: capture_budget,
             }
         }
         IslandCampaignState::Contested if contested_is_competitive(facts) => {
+            let capture_budget = expedition_capture_units.saturating_mul(1_000);
             assessment.decision = IslandCampaignDecision::Contest;
             assessment.decision_reason =
-                "占領競争と現地戦力が競争可能なため作戦を継続する".to_owned();
+                "占領競争の時間内に介入できるため作戦を継続する".to_owned();
             IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
-                capture_units: 0,
-                combat_budget: 0,
-                total_budget: 0,
+                capture_units: expedition_capture_units,
+                ground_combat_units: 0,
+                combat_units: 0,
+                total_budget: capture_budget,
             }
         }
         IslandCampaignState::Contested => {
-            let required_power =
-                combat_overmatch_requirement(facts.enemy_combat_value, reserve_unit_cost);
+            let capture_budget = expedition_capture_units.saturating_mul(1_000);
+            let combat_units = facts.enemy_combat_units;
             assessment.decision = IslandCampaignDecision::Reinforce;
             assessment.decision_reason =
-                "敵戦力を上回り最小戦闘unit 1体分の損耗余裕を持つ増援を要求する".to_owned();
-            assessment.required_budget = required_power;
+                "観測敵Entityを対象にターン別撃破計画を要求する".to_owned();
+            assessment.required_budget = capture_budget;
             IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
-                capture_units: 0,
-                combat_budget: required_power,
-                total_budget: required_power,
+                capture_units: expedition_capture_units,
+                ground_combat_units: 0,
+                combat_units,
+                total_budget: capture_budget,
             }
         }
         IslandCampaignState::EnemyHeld => {
-            let combat_budget = 10_200_u32.max(combat_overmatch_requirement(
-                facts.enemy_combat_value,
-                reserve_unit_cost,
-            ));
-            // 戦闘部分と同じ実生産単位を総予算にも反映し、既定1,000への逆戻りを防ぐ。
-            let total_budget = 22_500_u32.saturating_add(combat_budget);
+            let combat_units = facts.enemy_combat_units;
+            // 敵兵数・生産拠点・配置可能枠は島の実盤面を走査した後で確定する。
+            let capture_budget = expedition_capture_units.saturating_mul(1_000);
+            let total_budget = capture_budget;
             assessment.required_budget = total_budget;
             IslandCampaignRequirement {
                 preferred_transport: Some(UnitType::Lander),
-                // 輸送船と輸送ヘリを各1体要求し、双方の軽歩兵搭載枠を合算する。
-                transport_slots: 4,
-                capture_units: 2,
-                combat_budget,
+                transport_slots: expedition_capture_units,
+                capture_units: expedition_capture_units,
+                ground_combat_units: 0,
+                combat_units,
                 total_budget,
             }
         }
@@ -1542,17 +1521,92 @@ fn requirement_for_assessment(
             preferred_transport: None,
             transport_slots: 0,
             capture_units: 0,
-            combat_budget: 0,
+            ground_combat_units: 0,
+            combat_units: 0,
             total_budget: 0,
         },
     }
 }
 
-/// 同じ出発島の生産圏内施設だけで組める最小の強襲輸送パッケージを返す。
-/// 港と空港の両方が使える島では従来どおり各1体、片方しか使えない島では
-/// 同種2体で4 cargo枠を確保し、生産不能な輸送役を待ち続けない。
+/// 敵首都島でも、盤面上の未所有施設をすべて継続目標として保持する。
+///
+/// 同時に動かす占領兵を固定3体などへ切り詰めると、広い陸塊や複数の上陸地点で
+/// 取得機会を失う。必要数は現在の未所有施設数から導き、実際に同時進行できる数は
+/// 生産・輸送・移動scheduleと既存Entityの割当に委ねる。敵撃破戦力は別途V4の
+/// 時系列Combat Planが決めるため、ここでは価格や敵数を占領兵数へ換算しない。
+fn prepare_capital_assault_wave(candidate: &mut IslandCampaignCandidate) {
+    if candidate.assessment.decision != IslandCampaignDecision::Assault
+        || candidate
+            .existing_operation
+            .as_ref()
+            .is_some_and(|operation| {
+                matches!(
+                    operation.transport_phase,
+                    Some(TransportPhase::Pickup | TransportPhase::Transit | TransportPhase::Drop)
+                )
+            })
+    {
+        return;
+    }
+    let remaining_properties = candidate
+        .assessment
+        .neutral_properties
+        .saturating_add(candidate.assessment.enemy_properties);
+    if remaining_properties == 0 {
+        return;
+    }
+    let capture_units = remaining_properties;
+    candidate.requirement.capture_units = capture_units;
+    candidate.requirement.transport_slots = capture_units;
+    candidate.requirement.ground_combat_units = 0;
+    candidate.requirement.combat_units = 0;
+    candidate.requirement.total_budget = capture_units.saturating_mul(1_000);
+    candidate.assessment.required_budget = candidate.requirement.total_budget;
+    candidate.assault_transport_types = adapt_assault_requirement_to_production_route(
+        &mut candidate.assessment,
+        &mut candidate.requirement,
+        &candidate.producible_transports,
+    );
+}
+
+/// 首都作戦だけを集結状態へ戻す。局地Captureや防衛assignmentは変更しないため、
+/// 兵站の一時崩壊で全軍の命令が停止することはない。
+fn gate_capital_assault_launch(
+    portfolio: &mut IslandCampaignPortfolio,
+    capital_island: IslandId,
+    logistics_ready: bool,
+    combat_plan_ready: bool,
+) {
+    if logistics_ready && combat_plan_ready {
+        return;
+    }
+    if let Some(assignment) = portfolio
+        .active_offensives
+        .iter_mut()
+        .find(|assignment| assignment.island_id == capital_island)
+    {
+        assignment.operation_ready = false;
+    }
+    if let Some(assessment) = portfolio
+        .islands
+        .iter_mut()
+        .find(|assessment| assessment.island_id == capital_island)
+    {
+        assessment.decision_reason = if !logistics_ready {
+            "選択兵站路が未完了または崩壊したため、首都第一波だけを集結状態に戻す".to_owned()
+        } else {
+            "現在盤面から再計算した首都戦闘計画が未完成のため、第一波を集結させる".to_owned()
+        };
+    }
+}
+
+/// 同じ出発島で生産できる輸送手段から、占領要員を運べる暫定編成を返す。
+///
+/// これは中立島向けの初便を止めないための互換経路であり、敵領Assaultの必要総数や
+/// 一波上限ではない。敵領の必要戦力は時系列作戦計画から導出する。
 fn producible_assault_transport_package(
     blueprints: &[CampaignTransportBlueprint],
+    capture_units: u32,
 ) -> Option<(Vec<UnitType>, u32, u32)> {
     let mut source_islands: Vec<_> = blueprints
         .iter()
@@ -1563,19 +1617,27 @@ fn producible_assault_transport_package(
 
     let mut packages = Vec::new();
     for source_island in source_islands {
-        let lander = blueprints.iter().find(|blueprint| {
+        let mut landers = blueprints.iter().filter(|blueprint| {
             blueprint.source_island == source_island && blueprint.unit_type == UnitType::Lander
         });
-        let helicopter = blueprints.iter().find(|blueprint| {
+        let mut helicopters = blueprints.iter().filter(|blueprint| {
             blueprint.source_island == source_island
                 && blueprint.unit_type == UnitType::TransportHelicopter
         });
-        let selected = match (lander, helicopter) {
-            (Some(lander), Some(helicopter)) => vec![lander, helicopter],
-            (Some(lander), None) => vec![lander, lander],
-            (None, Some(helicopter)) => vec![helicopter, helicopter],
-            (None, None) => continue,
-        };
+        let mut selected = Vec::new();
+        let mut remaining_capture_units = capture_units;
+        while remaining_capture_units > 0 {
+            let capture_transport = helicopters.next().or_else(|| landers.next());
+            let Some(capture_transport) = capture_transport else {
+                break;
+            };
+            selected.push(capture_transport);
+            remaining_capture_units =
+                remaining_capture_units.saturating_sub(capture_transport.cargo_slots);
+        }
+        if selected.is_empty() || remaining_capture_units > 0 {
+            continue;
+        }
         let unit_types = selected
             .iter()
             .map(|blueprint| blueprint.unit_type)
@@ -1604,61 +1666,17 @@ fn adapt_assault_requirement_to_production_route(
         return Vec::new();
     }
     let Some((unit_types, transport_cost, transport_slots)) =
-        producible_assault_transport_package(blueprints)
+        producible_assault_transport_package(blueprints, requirement.capture_units)
     else {
         // 生産拠点を失った一時局面では、既存輸送を再利用できる従来編成を維持する。
         return vec![UnitType::Lander, UnitType::TransportHelicopter];
     };
     requirement.preferred_transport = unit_types.first().copied();
     requirement.transport_slots = transport_slots;
-    requirement.total_budget = transport_cost
-        .saturating_add(requirement.capture_units.saturating_mul(1_000))
-        .saturating_add(requirement.combat_budget);
+    requirement.total_budget =
+        transport_cost.saturating_add(requirement.capture_units.saturating_mul(1_000));
     assessment.required_budget = requirement.total_budget;
     unit_types
-}
-
-fn minimum_producible_campaign_combat_cost(
-    map: &Map,
-    registry: &MasterDataRegistry,
-    properties: &[PropertySnapshot],
-    player_id: PlayerId,
-) -> Option<u32> {
-    let capital_positions: Vec<_> = properties
-        .iter()
-        .filter(|snapshot| {
-            snapshot.property.owner_id == Some(player_id)
-                && snapshot.property.terrain == Terrain::Capital
-        })
-        .map(|snapshot| snapshot.position)
-        .collect();
-    let unit_types = all_master_unit_types(registry);
-    properties
-        .iter()
-        .filter(|snapshot| snapshot.property.owner_id == Some(player_id))
-        .filter(|snapshot| {
-            registry.is_production_facility(snapshot.property.terrain.as_str())
-                && crate::systems::production::is_within_production_range(
-                    &capital_positions,
-                    snapshot.position.x,
-                    snapshot.position.y,
-                    map.topology,
-                )
-        })
-        .flat_map(|snapshot| {
-            unit_types.iter().filter_map(move |unit_type| {
-                if !registry.can_produce_unit(snapshot.property.terrain.as_str(), *unit_type)
-                    || matches!(
-                        unit_type,
-                        UnitType::TransportHelicopter | UnitType::Lander | UnitType::SupplyTruck
-                    )
-                {
-                    return None;
-                }
-                unit_stats_for_type(registry, *unit_type).map(|stats| stats.cost)
-            })
-        })
-        .min()
 }
 
 /// 自軍の実生産拠点ごとに、増援作戦が要求できる輸送手段の諸元を構築する。
@@ -1710,9 +1728,9 @@ fn producible_campaign_transports(
                 loadable_unit_types: stats.loadable_unit_types,
                 source_island,
             };
-            if !blueprints.iter().any(|existing| existing == &blueprint) {
-                blueprints.push(blueprint);
-            }
+            // 同型・同島でも施設1つにつき1件を保持する。一波は「1施設が1手番に
+            // 生産できる1機/隻」で上限を決めるため、ここでdedupしてはならない。
+            blueprints.push(blueprint);
         }
     }
     blueprints.sort_by_key(|blueprint| {
@@ -1726,15 +1744,21 @@ fn producible_campaign_transports(
 }
 
 fn candidate_target_position(
+    map: &Map,
+    registry: &MasterDataRegistry,
     island: &Island,
     properties: &[PropertySnapshot],
+    units: &[UnitSnapshot],
     player_id: PlayerId,
     existing_operation: Option<&ExistingCampaignOperation>,
 ) -> Option<GridPosition> {
-    if let Some(operation) = existing_operation {
-        return Some(operation.target_position);
-    }
-    properties
+    let origins = properties
+        .iter()
+        .filter(|snapshot| island.tiles.contains(&snapshot.position))
+        .filter(|snapshot| snapshot.property.owner_id == Some(player_id))
+        .map(|snapshot| snapshot.position)
+        .collect::<Vec<_>>();
+    let mut targets = properties
         .iter()
         .filter(|snapshot| island.tiles.contains(&snapshot.position))
         .filter(|snapshot| {
@@ -1742,16 +1766,46 @@ fn candidate_target_position(
                 && snapshot.property.owner_id != Some(player_id)
         })
         .map(|snapshot| snapshot.position)
-        .min_by_key(|position| (position.y, position.x))
-        .or_else(|| sorted_island_tiles(island).first().copied())
+        .collect::<Vec<_>>();
+    let target_priority = |position: GridPosition| {
+        capture_front_priority(
+            map, registry, island, properties, units, player_id, &origins, position,
+        )
+    };
+    targets.sort_unstable_by_key(|position| target_priority(*position));
+    let nearest = targets.first().copied();
+
+    // 進行中目標も無条件には固定しない。より近い前線より2手以上遠くなった目標は
+    // 敵の再占領や担当損耗で前提が崩れたものとして、現在の最短前線へ戻す。
+    if let (Some(operation), Some(nearest)) = (existing_operation, nearest)
+        && targets.contains(&operation.target_position)
+    {
+        let distance_from_front = |position: GridPosition| target_priority(position).1;
+        if origins.is_empty()
+            || distance_from_front(operation.target_position)
+                <= distance_from_front(nearest).saturating_add(2)
+        {
+            return Some(operation.target_position);
+        }
+    }
+    nearest.or_else(|| sorted_island_tiles(island).first().copied())
 }
 
 fn candidate_capture_target_positions(
+    map: &Map,
+    registry: &MasterDataRegistry,
     island: &Island,
     properties: &[PropertySnapshot],
+    units: &[UnitSnapshot],
     player_id: PlayerId,
     primary_target: GridPosition,
 ) -> Vec<GridPosition> {
+    let origins = properties
+        .iter()
+        .filter(|snapshot| island.tiles.contains(&snapshot.position))
+        .filter(|snapshot| snapshot.property.owner_id == Some(player_id))
+        .map(|snapshot| snapshot.position)
+        .collect::<Vec<_>>();
     let mut targets: Vec<_> = properties
         .iter()
         .filter(|snapshot| island.tiles.contains(&snapshot.position))
@@ -1761,7 +1815,21 @@ fn candidate_capture_target_positions(
         })
         .map(|snapshot| snapshot.position)
         .collect();
-    targets.sort_by_key(|position| (position.y, position.x));
+    let target_priority = |position: GridPosition| {
+        capture_front_priority(
+            map, registry, island, properties, units, player_id, &origins, position,
+        )
+    };
+    targets.sort_by_key(|position| target_priority(*position));
+
+    // 既に足場がある陸塊では、最短前線とその隣接帯だけを同時実行対象にする。
+    // 全未所有施設は毎手番再観測するため捨てず、前線取得後に次の帯へ昇格する。
+    // 足場のない島は輸送波の目的一覧を縮めると再上陸が遅れるため従来どおり保持する。
+    if !origins.is_empty()
+        && let Some(nearest_distance) = targets.first().map(|target| target_priority(*target).1)
+    {
+        targets.retain(|target| target_priority(*target).1 <= nearest_distance.saturating_add(2));
+    }
     if let Some(index) = targets
         .iter()
         .position(|position| *position == primary_target)
@@ -1772,93 +1840,58 @@ fn candidate_capture_target_positions(
     targets
 }
 
+/// 自軍前線からの占領ETAを第一基準、敵占領兵の到着ETAを同距離帯の競争優先度にする。
+/// 座標は決定論的な最終tie-breakにだけ使うため、鏡像mapでも前線側を選択できる。
+#[allow(clippy::too_many_arguments)]
+fn capture_front_priority(
+    map: &Map,
+    registry: &MasterDataRegistry,
+    island: &Island,
+    properties: &[PropertySnapshot],
+    units: &[UnitSnapshot],
+    player_id: PlayerId,
+    friendly_origins: &[GridPosition],
+    target: GridPosition,
+) -> (u32, u32, u32, usize, usize) {
+    let friendly_movement = [UnitType::Infantry, UnitType::Mech]
+        .into_iter()
+        .filter_map(|unit_type| unit_stats_for_type(registry, unit_type))
+        .min_by_key(|stats| stats.cost)
+        .map_or(1, |stats| stats.max_movement.max(1));
+    let occupation_turns = properties
+        .iter()
+        .find(|snapshot| snapshot.position == target)
+        .map_or(1, |snapshot| default_capture_turns(&snapshot.property));
+    let front_distance = friendly_origins
+        .iter()
+        .map(|origin| map.distance(origin.x, origin.y, target.x, target.y))
+        .min()
+        .unwrap_or(u32::MAX);
+    let friendly_eta = front_distance
+        .div_ceil(friendly_movement)
+        .saturating_add(occupation_turns);
+    let enemy_eta = units
+        .iter()
+        .filter(|unit| unit.faction != player_id && unit.stats.can_capture)
+        .filter(|unit| unit.transporting.is_none() && island.tiles.contains(&unit.position))
+        .map(|unit| {
+            map.distance(unit.position.x, unit.position.y, target.x, target.y)
+                .div_ceil(unit.stats.max_movement.max(1))
+                .saturating_add(occupation_turns)
+        })
+        .min()
+        .unwrap_or(u32::MAX);
+    (friendly_eta, front_distance, enemy_eta, target.y, target.x)
+}
+
 fn operation_has_live_capability(operation: &ExistingCampaignOperation) -> bool {
     ((operation.is_forming
-        || operation
-            .transport_phase
-            .is_some_and(is_live_transport_phase))
+        || operation.transport_phase.is_some_and(|phase| {
+            is_live_transport_phase(phase) || phase == TransportPhase::Return
+        }))
         && !operation.transport_entities.is_empty())
         || !operation.capture_entities.is_empty()
         || !operation.combat_entities.is_empty()
-}
-
-fn logistics_security_requirement(
-    enemy_combat_value: u32,
-    reserve_unit_cost: u32,
-    self_defense_credit: u32,
-) -> u32 {
-    combat_overmatch_requirement(enemy_combat_value, reserve_unit_cost)
-        .saturating_sub(self_defense_credit)
-}
-
-fn apply_logistics_security_requirements(
-    candidates: &mut [IslandCampaignCandidate],
-    units: &[UnitSnapshot],
-    island_map: &IslandMap,
-    player_id: PlayerId,
-) {
-    let units_by_entity: HashMap<_, _> = units.iter().map(|unit| (unit.entity, unit)).collect();
-    for candidate in candidates
-        .iter_mut()
-        .filter(|candidate| candidate.logistics_prerequisite)
-    {
-        let enemy_units: Vec<_> = units
-            .iter()
-            .filter(|unit| unit.faction != player_id && unit.transporting.is_none())
-            .filter(|unit| !is_support_only(unit.stats.unit_type))
-            .filter(|unit| {
-                island_map
-                    .get_island_at(&unit.position)
-                    .is_some_and(|island| island.id == candidate.assessment.island_id)
-            })
-            .collect();
-        if enemy_units.is_empty() {
-            continue;
-        }
-
-        // 輸送ヘリの機銃Eは軽・重歩兵に有効だが、対空兵器や重装甲へは護衛の
-        // 代替にならない。敵編成が歩兵だけの場合に限り、実在するヘリのHP加重費用を
-        // 自衛戦力として控除する。机上の生産予定機は戦力へ数えない。
-        let enemies_are_light_infantry = enemy_units
-            .iter()
-            .all(|unit| matches!(unit.stats.unit_type, UnitType::Infantry | UnitType::Mech));
-        let self_defense_credit = if enemies_are_light_infantry {
-            candidate
-                .existing_operation
-                .iter()
-                .flat_map(|operation| operation.transport_entities.iter())
-                .filter_map(|entity| units_by_entity.get(entity))
-                .filter(|unit| unit.stats.unit_type == UnitType::TransportHelicopter)
-                .fold(0_u32, |total, unit| {
-                    let value = unit
-                        .stats
-                        .cost
-                        .saturating_mul(unit.health.current)
-                        .checked_div(unit.health.max)
-                        .unwrap_or(0);
-                    total.saturating_add(value)
-                })
-        } else {
-            0
-        };
-        let reserve_unit_cost = candidate.minimum_combat_purchase_cost.unwrap_or(1_000);
-        let required_combat = logistics_security_requirement(
-            candidate.assessment.enemy_combat_value,
-            reserve_unit_cost,
-            self_defense_credit,
-        );
-        let structural_budget = candidate
-            .requirement
-            .total_budget
-            .saturating_sub(candidate.requirement.combat_budget);
-        candidate.requirement.combat_budget = required_combat;
-        candidate.requirement.total_budget = structural_budget.saturating_add(required_combat);
-        candidate.assessment.required_budget = candidate.requirement.total_budget;
-        candidate.assessment.decision_reason = format!(
-            "{}。敵を上回り最小戦闘unit 1体分の損耗余裕を確保し、対歩兵では輸送ヘリの実自衛力を控除する",
-            candidate.assessment.decision_reason
-        );
-    }
 }
 
 fn unavailable_campaign_entities(
@@ -1883,7 +1916,16 @@ fn unavailable_campaign_entities(
                     .get(transport)
                     .is_some_and(|unit| unit.faction == player_id)
             }) {
-                unavailable.insert(transport);
+                // 空のReturn輸送役は、帰投完了を待たず同じ／次の補充便へ再予約できる。
+                // cargoが残るReturn（実際にはDropへ戻すべき状態）とCompletedは保護する。
+                let reusable_empty_return =
+                    matches!(squad.phase, MissionPhase::Transport(TransportPhase::Return))
+                        && unit_by_entity
+                            .get(&transport)
+                            .is_some_and(|unit| unit.loaded_cargo_entities.is_empty());
+                if !reusable_empty_return {
+                    unavailable.insert(transport);
+                }
             }
             unavailable.extend(
                 squad
@@ -1918,32 +1960,27 @@ fn collect_campaign_resource_pool(
     properties: &[PropertySnapshot],
     units: &[UnitSnapshot],
     operations: &[ExistingCampaignOperation],
+    produced_assignments: &HashMap<Entity, IslandId>,
+    roadmap_assignments: &HashMap<Entity, IslandId>,
     assigned_transport_phases: &HashMap<Entity, AssignedTransportState>,
     unavailable_entities: &HashSet<Entity>,
     available_funds: u32,
 ) -> CampaignResourcePool {
     let unit_by_entity: HashMap<_, _> = units.iter().map(|unit| (unit.entity, unit)).collect();
-    let mut assigned_by_entity = HashMap::new();
+    let assigned_by_entity =
+        merge_campaign_assignment_sources(roadmap_assignments, operations, produced_assignments);
     let mut assigned_entities_by_island: HashMap<IslandId, HashSet<Entity>> = HashMap::new();
-    for operation in operations
-        .iter()
-        .filter(|operation| operation_has_live_capability(operation))
-    {
-        for entity in operation
-            .transport_entities
-            .iter()
-            .chain(operation.capture_entities.iter())
-            .chain(operation.combat_entities.iter())
-        {
-            assigned_by_entity.insert(*entity, operation.island_id);
-            assigned_entities_by_island
-                .entry(operation.island_id)
-                .or_default()
-                .insert(*entity);
-        }
+    for (entity, island_id) in &assigned_by_entity {
+        assigned_entities_by_island
+            .entry(*island_id)
+            .or_default()
+            .insert(*entity);
     }
 
     let mut candidates = Vec::new();
+    // 地形連結成分は移動種別ごとに1回だけ構築する。候補マスごとに再構築すると、
+    // ユニット数×全島タイル数だけマップ全走査が発生する。
+    let mut terrain_connectivity = TerrainConnectivity::default();
     for unit in units.iter().filter(|unit| unit.faction == player_id) {
         let assigned_island = assigned_by_entity.get(&unit.entity).copied();
         let transport_state = assigned_transport_phases.get(&unit.entity);
@@ -1968,11 +2005,12 @@ fn collect_campaign_resource_pool(
                     && loaded_cargo_is_assignment_owned
             }
             Some(AssignedTransportState::Phase(phase, target, cargo_is_assigned)) => {
-                is_live_transport_phase(*phase)
+                (is_live_transport_phase(*phase)
+                    || (*phase == TransportPhase::Return && unit.loaded_cargo_entities.is_empty()))
                     && target.is_some()
                     && *target == assigned_island
-                    && *cargo_is_assigned
-                    && loaded_cargo_is_assignment_owned
+                    && ((*phase == TransportPhase::Return && unit.loaded_cargo_entities.is_empty())
+                        || (*cargo_is_assigned && loaded_cargo_is_assignment_owned))
             }
             Some(AssignedTransportState::Other) => false,
         };
@@ -1988,7 +2026,8 @@ fn collect_campaign_resource_pool(
         let available_cargo_slots = unit
             .free_cargo_slots
             .saturating_add(loaded_cargo_entities.len() as u32);
-        // targetless safe Drop、Return/Completed、関連外cargo、実capacity無しの輸送役は再予約しない。
+        // targetless safe Drop、Completed、関連外cargo、実capacity無しの輸送役は再予約しない。
+        // 空Returnだけは次便のpickupへ直接向け直し、帰投だけの空走を挟まない。
         if unavailable_entities.contains(&unit.entity)
             || is_offshore_transport && unit.fuel.is_some_and(|fuel| fuel == 0)
             || is_offshore_transport && (!transport_is_available || available_cargo_slots == 0)
@@ -2007,7 +2046,7 @@ fn collect_campaign_resource_pool(
                         && island_map
                             .get_island_at(&snapshot.position)
                             .is_some_and(|island| island.id == island_id)
-                        && is_terrain_reachable(
+                        && terrain_connectivity.is_reachable(
                             map,
                             registry,
                             (unit.position.x, unit.position.y),
@@ -2021,7 +2060,7 @@ fn collect_campaign_resource_pool(
             .iter()
             .flat_map(|island| island.tiles.iter())
             .filter(|target| {
-                is_terrain_reachable(
+                terrain_connectivity.is_reachable(
                     map,
                     registry,
                     (unit.position.x, unit.position.y),
@@ -2062,12 +2101,41 @@ fn collect_campaign_resource_pool(
     }
 }
 
+fn merge_campaign_assignment_sources(
+    roadmap_assignments: &HashMap<Entity, IslandId>,
+    operations: &[ExistingCampaignOperation],
+    produced_assignments: &HashMap<Entity, IslandId>,
+) -> HashMap<Entity, IslandId> {
+    // 生産直後の発注意図は未配属Entityの初期seedに限る。現在Squad、前手番Roadmapの
+    // 確定bindingの順で上書きし、再配置済みEntityを旧anchorへ巻き戻さない。
+    let mut assigned_by_entity = produced_assignments.clone();
+    for operation in operations
+        .iter()
+        .filter(|operation| operation_has_live_capability(operation))
+    {
+        for entity in operation
+            .transport_entities
+            .iter()
+            .chain(operation.capture_entities.iter())
+            .chain(operation.combat_entities.iter())
+        {
+            assigned_by_entity.insert(*entity, operation.island_id);
+        }
+    }
+    assigned_by_entity.extend(
+        roadmap_assignments
+            .iter()
+            .map(|(entity, island_id)| (*entity, *island_id)),
+    );
+    assigned_by_entity
+}
+
 /// 全島評価と現在の共有資源を毎回盤面から再構築し、純粋allocatorへ一括で渡す。
 pub fn analyze_island_campaign(world: &mut World, player_id: PlayerId) -> IslandCampaignPortfolio {
     analyze_island_campaign_excluding(world, player_id, &HashSet::new())
 }
 
-/// 緊急ミッションへ予約済みのEntityを共有資源から除外して島嶼作戦を分析します。
+/// 既存の実行任務へ予約済みのEntityを共有資源から除外して島嶼作戦を分析します。
 pub fn analyze_island_campaign_excluding(
     world: &mut World,
     player_id: PlayerId,
@@ -2109,6 +2177,17 @@ pub fn analyze_island_campaign_excluding(
     let home_island = home_property
         .and_then(|snapshot| island_map.get_island_at(&snapshot.position))
         .map(|island| island.id);
+    let enemy_capital = properties
+        .iter()
+        .find(|snapshot| {
+            snapshot.property.terrain == Terrain::Capital
+                && snapshot.property.owner_id != Some(player_id)
+        })
+        .and_then(|snapshot| {
+            island_map
+                .get_island_at(&snapshot.position)
+                .map(|island| (island.id, snapshot.position))
+        });
     let mut forward_sustainment_coverage = CampaignSustainmentCoverage::default();
     if let Some(home_island) = home_island {
         for snapshot in properties.iter().filter(|snapshot| {
@@ -2128,8 +2207,6 @@ pub fn analyze_island_campaign_excluding(
             }
         }
     }
-    let minimum_combat_purchase_cost =
-        minimum_producible_campaign_combat_cost(&map, &registry, &properties, player_id);
     let producible_transports =
         producible_campaign_transports(&map, &registry, &island_map, &properties, player_id);
     let factions = collect_faction_snapshots(world);
@@ -2145,6 +2222,14 @@ pub fn analyze_island_campaign_excluding(
         .get_resource::<Players>()
         .and_then(|players| players.0.iter().find(|player| player.id == player_id))
         .map_or(0, |player| player.funds);
+    let produced_assignments = world
+        .get_resource::<crate::ai::v4::campaign_execution::V4CampaignExecutionRegistry>()
+        .map(|registry| registry.produced_entity_assignments(player_id))
+        .unwrap_or_default();
+    let roadmap_assignments = world
+        .get_resource::<crate::ai::operation_assignment::UnitOperationRegistry>()
+        .map(|registry| registry.campaign_entity_assignments(player_id))
+        .unwrap_or_default();
     let mut unavailable_entities = unavailable_campaign_entities(&manager, &units, player_id);
     unavailable_entities.extend(reserved_entities.iter().copied());
     let pool = collect_campaign_resource_pool(
@@ -2155,60 +2240,138 @@ pub fn analyze_island_campaign_excluding(
         &properties,
         &units,
         &operations,
+        &produced_assignments,
+        &roadmap_assignments,
         &assigned_transport_phases,
         &unavailable_entities,
         available_funds,
     );
 
-    let sole_capturable_landmass = sole_capturable_landmass_id(&facts);
     let facts_by_island: HashMap<_, _> = facts
         .iter()
         .map(|island_facts| (island_facts.island_id, island_facts))
         .collect();
     let mut islands = island_map.islands.clone();
     islands.sort_by_key(|island| island.id.0);
-    let mut candidates = Vec::new();
-    for island in islands {
-        let Some(island_facts) = facts_by_island.get(&island.id).copied() else {
-            continue;
-        };
+    // 島ごとの候補構築は同じ盤面snapshotを読むだけで互いに独立している。
+    // nativeでは並列化し、IslandId順の結果を維持することでV3/V4の判断順を変えない。
+    let mut candidates = crate::ai::deterministic_parallel::map_ordered(islands, |island| {
+        let island_facts = facts_by_island.get(&island.id).copied()?;
         let mut assessment = assess_island(island_facts);
-        let mut requirement = if sole_capturable_landmass == Some(island.id)
-            && assessment.state == IslandCampaignState::Contested
-        {
-            // 単一の主陸塊で起きる通常戦闘は島嶼作戦へ資源を予約せず、地上戦略へ委譲する。
-            assessment.decision = IslandCampaignDecision::Observe;
-            assessment.decision_reason =
-                "単一の占領対象陸塊は通常の地上戦略で処理するため監視する".to_owned();
-            assessment.required_budget = 0;
-            assessment.allocated_budget = 0;
-            IslandCampaignRequirement {
-                preferred_transport: None,
-                transport_slots: 0,
-                capture_units: 0,
-                combat_budget: 0,
-                total_budget: 0,
-            }
-        } else {
-            requirement_for_assessment(
-                island_facts,
-                &mut assessment,
-                minimum_combat_purchase_cost.unwrap_or(1_000),
-            )
-        };
-        let assault_transport_types = adapt_assault_requirement_to_production_route(
-            &mut assessment,
-            &mut requirement,
-            &producible_transports,
-        );
+        // 陸塊が1つだけでも島嶼mapと同じ継続campaignとして扱う。違いは
+        // `reachable` と輸送routeから輸送工程が必要になるかどうかだけである。
+        let mut requirement = requirement_for_assessment(island_facts, &mut assessment);
         let existing_operation = operations_by_island.get(&island.id).cloned();
-        let Some(target_position) =
-            candidate_target_position(&island, &properties, player_id, existing_operation.as_ref())
-        else {
-            continue;
-        };
-        let capture_target_positions =
-            candidate_capture_target_positions(&island, &properties, player_id, target_position);
+        let assault_wave_is_live = existing_operation.as_ref().is_some_and(|operation| {
+            matches!(
+                operation.transport_phase,
+                Some(TransportPhase::Pickup | TransportPhase::Transit | TransportPhase::Drop)
+            )
+        });
+        let assault_transport_types =
+            if assessment.decision == IslandCampaignDecision::Assault && assault_wave_is_live {
+                let operation = existing_operation.as_ref().expect("live operation exists");
+                let mut transport_types = operation
+                    .transport_entities
+                    .iter()
+                    .filter_map(|entity| {
+                        units
+                            .iter()
+                            .find(|unit| unit.entity == *entity)
+                            .map(|unit| unit.stats.unit_type)
+                    })
+                    .collect::<Vec<_>>();
+                transport_types.sort_by_key(|unit_type| campaign_unit_type_rank(*unit_type));
+                let entity_cost = |entity: &Entity| {
+                    units
+                        .iter()
+                        .find(|unit| unit.entity == *entity)
+                        .map_or(0, |unit| unit.stats.cost)
+                };
+                requirement.preferred_transport = transport_types.first().copied();
+                requirement.transport_slots = operation
+                    .transport_entities
+                    .iter()
+                    .filter_map(|entity| units.iter().find(|unit| unit.entity == *entity))
+                    .fold(0_u32, |total, unit| {
+                        total.saturating_add(unit.free_cargo_slots)
+                    });
+                requirement.capture_units =
+                    u32::try_from(operation.capture_entities.len()).unwrap_or(u32::MAX);
+                // Combat必要数は時系列planの出力であり、既存便の台数から再構築しない。
+                requirement.ground_combat_units = 0;
+                requirement.combat_units =
+                    u32::try_from(operation.combat_entities.len()).unwrap_or(u32::MAX);
+                requirement.total_budget = operation
+                    .transport_entities
+                    .iter()
+                    .chain(&operation.capture_entities)
+                    .fold(0_u32, |total, entity| {
+                        total.saturating_add(entity_cost(entity))
+                    });
+                assessment.required_budget = requirement.total_budget;
+                transport_types
+            } else {
+                adapt_assault_requirement_to_production_route(
+                    &mut assessment,
+                    &mut requirement,
+                    &producible_transports,
+                )
+            };
+        let mut priority_enemy_types = units
+            .iter()
+            .filter(|unit| unit.faction != player_id && unit.transporting.is_none())
+            // 地上揚陸波の編成対象だけを渡す。航空・艦船はV4 rolling planが
+            // 別経路で処理し、地上unitに不可能な対空・対艦要件を課さない。
+            .filter(|unit| {
+                !matches!(
+                    unit.stats.movement_type,
+                    MovementType::Air | MovementType::Ship
+                )
+            })
+            .filter(|unit| island.tiles.contains(&unit.position))
+            .map(|unit| unit.stats.unit_type)
+            .collect::<Vec<_>>();
+        priority_enemy_types.sort_by_key(|unit_type| campaign_unit_type_rank(*unit_type));
+        priority_enemy_types.dedup();
+        let target_position = candidate_target_position(
+            &map,
+            &registry,
+            &island,
+            &properties,
+            &units,
+            player_id,
+            existing_operation.as_ref(),
+        )?;
+        let capture_target_positions = candidate_capture_target_positions(
+            &map,
+            &registry,
+            &island,
+            &properties,
+            &units,
+            player_id,
+            target_position,
+        );
+        let has_foothold = properties.iter().any(|property| {
+            island.tiles.contains(&property.position)
+                && property.property.owner_id == Some(player_id)
+        });
+        if has_foothold {
+            // 同一陸塊の全未所有施設ではなく、今手番に選んだ前線帯だけを同時要求する。
+            // 後方の施設は前線取得後に毎手番再評価するため、将来分の占領兵費用を
+            // 現在作戦へ先取りしない。
+            let active_capture_units =
+                u32::try_from(capture_target_positions.len()).unwrap_or(u32::MAX);
+            let released_capture_units = requirement
+                .capture_units
+                .saturating_sub(active_capture_units);
+            requirement.capture_units = active_capture_units;
+            requirement.transport_slots = requirement.transport_slots.min(active_capture_units);
+            requirement.total_budget = requirement
+                .total_budget
+                .saturating_sub(released_capture_units.saturating_mul(1_000));
+            assessment.required_budget = requirement.total_budget;
+        }
         let (ground_sustainment_sites, air_sustainment_sites, sea_sustainment_sites) =
             sustainment_site_counts(&island, &properties);
         let sustainment_targets = if Some(island.id) == home_island {
@@ -2216,10 +2379,11 @@ pub fn analyze_island_campaign_excluding(
         } else {
             sustainment_targets(&island, &properties, player_id)
         };
-        candidates.push(IslandCampaignCandidate {
+        Some(IslandCampaignCandidate {
             assessment,
             target_position,
             capture_target_positions,
+            priority_enemy_types,
             roi_production_sites: island_facts.roi_production_sites,
             transport_eta: island_facts.transport_eta,
             ground_sustainment_sites,
@@ -2228,23 +2392,75 @@ pub fn analyze_island_campaign_excluding(
             sustainment_targets,
             island_income_per_turn: island_facts.island_income_per_turn,
             logistics_prerequisite: false,
+            logistics_priority_rank: None,
             requirement,
             assault_transport_types,
-            minimum_combat_purchase_cost,
             producible_transports: producible_transports.clone(),
             existing_operation,
-        });
+        })
+    })
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let uses_operation_driven_production =
+        crate::ai::resolve_player_ai_version(world, player_id).uses_operation_driven_production();
+    let mut capital_launch_gate = None;
+    if uses_operation_driven_production {
+        let turn = world
+            .get_resource::<MatchState>()
+            .map_or(0, |state| state.current_turn_number.0);
+        let mut logistics_registry = world
+            .remove_resource::<crate::ai::v4::logistics_plan::V4LogisticsPlanRegistry>()
+            .unwrap_or_default();
+        crate::ai::v4::logistics_plan::apply_persistent_logistics_plan(
+            &mut logistics_registry,
+            player_id,
+            turn,
+            &mut candidates,
+            &map,
+            friendly_income_per_turn,
+            enemy_income_per_turn,
+            available_funds,
+            forward_sustainment_coverage,
+            home_position,
+            enemy_capital,
+        );
+        let logistics_ready = logistics_registry
+            .plan(player_id)
+            .is_some_and(|plan| plan.selected_islands.is_empty());
+        if let Some((capital_island, _)) = enemy_capital {
+            if let Some(candidate) = candidates
+                .iter_mut()
+                .find(|candidate| candidate.assessment.island_id == capital_island)
+            {
+                prepare_capital_assault_wave(candidate);
+            }
+            let combat_plan_ready = world
+                .get_resource::<crate::ai::v4::plan_revision::V4RollingPlanRegistry>()
+                .is_some_and(|registry| registry.operation_launch_ready(player_id, capital_island));
+            capital_launch_gate = Some((capital_island, logistics_ready, combat_plan_ready));
+        }
+        world.insert_resource(logistics_registry);
+    } else {
+        promote_logistics_prerequisite(
+            &mut candidates,
+            &map,
+            friendly_income_per_turn,
+            enemy_income_per_turn,
+            forward_sustainment_coverage,
+            home_position,
+        );
     }
-    promote_logistics_prerequisite(
-        &mut candidates,
-        &map,
-        friendly_income_per_turn,
-        enemy_income_per_turn,
-        forward_sustainment_coverage,
-        home_position,
-    );
-    apply_logistics_security_requirements(&mut candidates, &units, &island_map, player_id);
-    allocate_campaign_portfolio(candidates, pool)
+    let mut portfolio = allocate_campaign_portfolio(candidates, pool);
+    if let Some((capital_island, logistics_ready, combat_plan_ready)) = capital_launch_gate {
+        gate_capital_assault_launch(
+            &mut portfolio,
+            capital_island,
+            logistics_ready,
+            combat_plan_ready,
+        );
+    }
+    portfolio
 }
 
 #[cfg(test)]
@@ -2263,24 +2479,163 @@ mod tests {
     const TEST_SEED: u64 = 42;
 
     #[test]
-    fn assault_transport_package_uses_two_helicopters_when_only_airport_is_producible() {
-        let blueprints = vec![CampaignTransportBlueprint {
-            unit_type: UnitType::TransportHelicopter,
-            cost: 4_000,
-            cargo_slots: 2,
-            loadable_unit_types: vec![UnitType::Infantry],
-            source_island: IslandId(7),
+    fn mirrored_land_fronts_choose_the_nearest_property_instead_of_coordinate_order() {
+        let master_data = MasterDataRegistry::load().expect("master data should load");
+        let map = Map::new(11, 1, Terrain::Plains, GridTopology::Square);
+        let island = IslandMap::analyze(&map).islands.remove(0);
+        let player = PlayerId(1);
+        let enemy = PlayerId(2);
+        let property = |x, owner| PropertySnapshot {
+            position: GridPosition { x, y: 0 },
+            property: Property::new(Terrain::City, owner, 200),
+        };
+
+        let left_properties = vec![
+            property(0, Some(player)),
+            property(2, Some(enemy)),
+            property(8, Some(enemy)),
+        ];
+        let left_target = candidate_target_position(
+            &map,
+            &master_data,
+            &island,
+            &left_properties,
+            &[],
+            player,
+            None,
+        );
+        assert_eq!(left_target, Some(GridPosition { x: 2, y: 0 }));
+
+        let right_properties = vec![
+            property(10, Some(player)),
+            property(2, Some(enemy)),
+            property(8, Some(enemy)),
+        ];
+        let right_target = candidate_target_position(
+            &map,
+            &master_data,
+            &island,
+            &right_properties,
+            &[],
+            player,
+            None,
+        );
+        assert_eq!(right_target, Some(GridPosition { x: 8, y: 0 }));
+        assert_eq!(
+            candidate_capture_target_positions(
+                &map,
+                &master_data,
+                &island,
+                &right_properties,
+                &[],
+                player,
+                right_target.expect("右側前線"),
+            ),
+            vec![GridPosition { x: 8, y: 0 }]
+        );
+    }
+
+    #[test]
+    fn roadmap_then_live_squad_override_produced_anchor() {
+        let entity = Entity::from_raw(42);
+        let roadmap_island = IslandId(1);
+        let squad_island = IslandId(2);
+        let intended_island = IslandId(3);
+        let roadmap = HashMap::from([(entity, roadmap_island)]);
+        let operations = vec![ExistingCampaignOperation {
+            island_id: squad_island,
+            target_position: GridPosition { x: 2, y: 2 },
+            transport_phase: None,
+            is_forming: true,
+            transport_entities: vec![entity],
+            capture_entities: Vec::new(),
+            combat_entities: Vec::new(),
+        }];
+        let produced = HashMap::from([(entity, intended_island)]);
+
+        let assignments = merge_campaign_assignment_sources(&roadmap, &operations, &produced);
+
+        assert_eq!(
+            assignments.get(&entity),
+            Some(&roadmap_island),
+            "生産時anchorは現在Roadmap bindingを上書きしない"
+        );
+
+        let assignments = merge_campaign_assignment_sources(
+            &HashMap::from([(entity, roadmap_island)]),
+            &operations,
+            &HashMap::new(),
+        );
+        assert_eq!(
+            assignments.get(&entity),
+            Some(&roadmap_island),
+            "直前に確定したRoadmap bindingは古いSquadより優先する"
+        );
+    }
+
+    #[test]
+    fn transportless_forming_cargo_remains_an_existing_operation() {
+        let player = PlayerId(2);
+        let map = Map::new(4, 1, Terrain::Plains, GridTopology::Square);
+        let island_map = IslandMap::analyze(&map);
+        let island_id = island_map.islands[0].id;
+        let cargo = Entity::from_raw(42);
+        let mut manager = SquadManager::default();
+        let placeholder = manager.create_owned_squad(MissionType::Transport, player);
+        placeholder.target_island = Some(island_id);
+        placeholder.target = Some(GridPosition { x: 3, y: 0 });
+        placeholder.phase = MissionPhase::Forming;
+        placeholder.cargo_entities.push(cargo);
+        let units = vec![UnitSnapshot {
+            entity: cargo,
+            faction: player,
+            position: GridPosition { x: 0, y: 0 },
+            stats: UnitStats {
+                can_capture: true,
+                ..UnitStats::mock()
+            },
+            health: Health {
+                current: 100,
+                max: 100,
+            },
+            fuel: None,
+            transporting: None,
+            free_cargo_slots: 0,
+            loaded_cargo_entities: Vec::new(),
         }];
 
-        let package = producible_assault_transport_package(&blueprints);
+        let (operations, _) = collect_existing_operations(&island_map, &manager, &units, player);
+
+        assert_eq!(operations.len(), 1);
+        assert!(operations[0].is_forming);
+        assert!(operations[0].transport_entities.is_empty());
+        assert_eq!(operations[0].capture_entities, vec![cargo]);
+    }
+
+    #[test]
+    fn assault_transport_package_uses_each_real_airport_once() {
+        let blueprints = vec![
+            CampaignTransportBlueprint {
+                unit_type: UnitType::TransportHelicopter,
+                cost: 4_000,
+                cargo_slots: 2,
+                loadable_unit_types: vec![UnitType::Infantry],
+                source_island: IslandId(7),
+            },
+            CampaignTransportBlueprint {
+                unit_type: UnitType::TransportHelicopter,
+                cost: 4_000,
+                cargo_slots: 2,
+                loadable_unit_types: vec![UnitType::Infantry],
+                source_island: IslandId(7),
+            },
+        ];
+
+        let package = producible_assault_transport_package(&blueprints, 4);
 
         assert_eq!(
             package,
-            Some((
-                vec![UnitType::TransportHelicopter, UnitType::TransportHelicopter,],
-                8_000,
-                4,
-            ))
+            Some((vec![UnitType::TransportHelicopter; 2], 8_000, 4))
         );
     }
 
@@ -2303,15 +2658,42 @@ mod tests {
             },
         ];
 
-        let package = producible_assault_transport_package(&blueprints);
+        let package = producible_assault_transport_package(&blueprints, 4);
+
+        assert_eq!(package, None);
+    }
+
+    #[test]
+    fn assault_transport_package_does_not_reserve_a_ground_combat_wave() {
+        let blueprints = vec![
+            CampaignTransportBlueprint {
+                unit_type: UnitType::Lander,
+                cost: 16_500,
+                cargo_slots: 2,
+                loadable_unit_types: vec![UnitType::Infantry, UnitType::Tank],
+                source_island: IslandId(1),
+            },
+            CampaignTransportBlueprint {
+                unit_type: UnitType::TransportHelicopter,
+                cost: 4_000,
+                cargo_slots: 2,
+                loadable_unit_types: vec![UnitType::Infantry],
+                source_island: IslandId(1),
+            },
+            CampaignTransportBlueprint {
+                unit_type: UnitType::TransportHelicopter,
+                cost: 4_000,
+                cargo_slots: 2,
+                loadable_unit_types: vec![UnitType::Infantry],
+                source_island: IslandId(1),
+            },
+        ];
+
+        let package = producible_assault_transport_package(&blueprints, 4);
 
         assert_eq!(
             package,
-            Some((
-                vec![UnitType::TransportHelicopter, UnitType::TransportHelicopter,],
-                8_000,
-                4,
-            ))
+            Some((vec![UnitType::TransportHelicopter; 2], 8_000, 4))
         );
     }
 
@@ -2441,7 +2823,7 @@ mod tests {
     }
 
     #[test]
-    fn sole_mainland_contested_is_observed_without_campaign_allocation() {
+    fn sole_mainland_contested_keeps_multi_property_campaign_allocation() {
         let master_data = MasterDataRegistry::load().expect("master data should load");
         let (mut world, _schedule) =
             crate::setup::initialize_world_from_master_data(&master_data, "map_1")
@@ -2488,12 +2870,12 @@ mod tests {
         spawn_test_unit(&mut world, enemy, enemy_position, tank);
 
         let facts = collect_island_campaign_facts(&mut world, player);
-        assert_eq!(sole_capturable_landmass_id(&facts), Some(mainland));
         let mainland_facts = facts
             .iter()
             .find(|facts| facts.island_id == mainland)
             .expect("mainland facts should exist");
-        assert!(mainland_facts.enemy_combat_value > mainland_facts.friendly_combat_value);
+        assert_eq!(mainland_facts.enemy_combat_units, 1);
+        assert_eq!(mainland_facts.friendly_combat_units, 1);
 
         let portfolio = analyze_island_campaign(&mut world, player);
         let assessment = portfolio
@@ -2503,17 +2885,20 @@ mod tests {
             .expect("mainland assessment should remain visible");
 
         assert_eq!(assessment.state, IslandCampaignState::Contested);
-        assert_eq!(assessment.decision, IslandCampaignDecision::Observe);
-        assert_eq!(assessment.required_budget, 0);
-        assert_eq!(assessment.allocated_budget, 0);
-        assert!(portfolio.assignment_for(mainland).is_none());
-        assert!(portfolio.active_offensives.is_empty());
+        assert_ne!(assessment.decision, IslandCampaignDecision::Observe);
+        let assignment = portfolio
+            .assignment_for(mainland)
+            .expect("単一大陸でも継続campaignを生成する");
+        assert_eq!(assignment.capture_target_positions, vec![enemy_position]);
+        assert!(assignment.requirement.capture_units >= 1);
+        assert_eq!(assignment.requirement.transport_slots, 0);
+        assert!(!portfolio.active_offensives.is_empty());
         assert!(portfolio.defenses.is_empty());
-        assert!(portfolio.aggregate_missing_requirements().is_empty());
+        assert!(!portfolio.aggregate_missing_requirements().is_empty());
     }
 
     #[test]
-    fn aggregates_hp_weighted_combat_value_without_support_units() {
+    fn counts_combat_entities_without_support_units_or_price_weighting() {
         let master_data = MasterDataRegistry::load().expect("master data should load");
         let (mut world, _schedule) =
             crate::setup::initialize_world_from_master_data(&master_data, "map_1")
@@ -2557,8 +2942,8 @@ mod tests {
 
         assert_eq!(island.friendly_units, 2);
         assert_eq!(island.enemy_units, 1);
-        assert_eq!(island.friendly_combat_value, 500);
-        assert_eq!(island.enemy_combat_value, 1_000);
+        assert_eq!(island.friendly_combat_units, 1);
+        assert_eq!(island.enemy_combat_units, 1);
         assert_eq!(island.friendly_properties, 1);
         assert_eq!(island.strategic_production_sites, 1);
         assert_eq!(island.roi_production_sites, 1);
@@ -2628,9 +3013,9 @@ mod tests {
             .find(|facts| facts.island_id == target_island)
             .unwrap();
 
-        assert_eq!(origin_facts.friendly_combat_value, 0);
+        assert_eq!(origin_facts.friendly_combat_units, 0);
         assert_eq!(target_facts.friendly_units, 0);
-        assert_eq!(target_facts.friendly_combat_value, 1_000);
+        assert_eq!(target_facts.friendly_combat_units, 1);
         assert!(target_facts.friendly_arrival_eta.is_some());
         assert!(target_facts.friendly_capture_eta.is_some());
     }
@@ -2702,7 +3087,7 @@ mod tests {
             .iter()
             .find(|facts| facts.island_id == target_island)
             .unwrap();
-        assert_eq!(target_facts.friendly_combat_value, 0);
+        assert_eq!(target_facts.friendly_combat_units, 0);
         assert_eq!(target_facts.friendly_capture_eta, None);
     }
 
@@ -2771,7 +3156,7 @@ mod tests {
             .unwrap();
         let portfolio = analyze_island_campaign(&mut world, player);
 
-        assert_eq!(target_facts.friendly_combat_value, 0);
+        assert_eq!(target_facts.friendly_combat_units, 0);
         assert_eq!(target_facts.friendly_arrival_eta, None);
         assert_eq!(target_facts.friendly_capture_eta, None);
         assert!(portfolio.assignment_for(target_island).is_none());
@@ -3454,7 +3839,7 @@ mod tests {
     }
 
     #[test]
-    fn return_phase_assets_do_not_reduce_target_package_cost() {
+    fn empty_return_transport_is_reused_but_loaded_return_is_not() {
         let master_data = MasterDataRegistry::load().expect("master data should load");
         let (mut world, _schedule) =
             crate::setup::initialize_world_from_master_data(&master_data, "map_1")
@@ -3498,6 +3883,11 @@ mod tests {
             max: helicopter.max_cargo,
             loaded: Vec::new(),
         });
+        let reusable_return = spawn_test_unit(&mut world, player, origin, helicopter.clone());
+        world.entity_mut(reusable_return).insert(CargoCapacity {
+            max: helicopter.max_cargo,
+            loaded: Vec::new(),
+        });
 
         let mut manager = SquadManager::new();
         let squad = manager.create_squad(MissionType::Transport);
@@ -3507,6 +3897,12 @@ mod tests {
         squad.target_island = Some(target_island);
         squad.target = Some(target);
         squad.phase = MissionPhase::Transport(TransportPhase::Return);
+        let reusable_squad = manager.create_squad(MissionType::Transport);
+        reusable_squad.members.insert(reusable_return);
+        reusable_squad.transport_entity = Some(reusable_return);
+        reusable_squad.target_island = Some(target_island);
+        reusable_squad.target = Some(target);
+        reusable_squad.phase = MissionPhase::Transport(TransportPhase::Return);
         let active_squad = manager.create_squad(MissionType::Transport);
         active_squad.members.insert(active_transport);
         active_squad.transport_entity = Some(active_transport);
@@ -3522,6 +3918,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(target.missing_expansion_package_cost, 2_000);
+        let portfolio = analyze_island_campaign(&mut world, player);
+        let assignment = portfolio.assignment_for(target_island).unwrap();
+        assert!(assignment.transport_entities.contains(&reusable_return));
+        assert!(!assignment.transport_entities.contains(&transport));
     }
 
     #[test]
@@ -3617,8 +4017,8 @@ mod tests {
             enemy_properties: 0,
             friendly_units: 1,
             enemy_units: 0,
-            friendly_combat_value: 4_000,
-            enemy_combat_value: 10_000,
+            friendly_combat_units: 1,
+            enemy_combat_units: 2,
             friendly_arrival_eta: Some(0),
             enemy_arrival_eta: Some(1),
             friendly_capture_eta: None,
@@ -3631,9 +4031,8 @@ mod tests {
             has_unowned_properties: false,
         };
         let mut defense = assess_island(&threatened_facts);
-        let defense_requirement =
-            requirement_for_assessment(&threatened_facts, &mut defense, 1_000);
-        assert_eq!(defense_requirement.combat_budget, 10_000);
+        let defense_requirement = requirement_for_assessment(&threatened_facts, &mut defense);
+        assert_eq!(defense_requirement.combat_units, 2);
 
         threatened_facts.friendly_units = 1;
         threatened_facts.enemy_units = 1;
@@ -3642,9 +4041,9 @@ mod tests {
         threatened_facts.enemy_capture_eta = Some(2);
         let mut reinforcement = assess_island(&threatened_facts);
         let reinforcement_requirement =
-            requirement_for_assessment(&threatened_facts, &mut reinforcement, 1_000);
+            requirement_for_assessment(&threatened_facts, &mut reinforcement);
         assert_eq!(reinforcement.decision, IslandCampaignDecision::Reinforce);
-        assert_eq!(reinforcement_requirement.combat_budget, 11_000);
+        assert_eq!(reinforcement_requirement.combat_units, 2);
 
         threatened_facts.friendly_units = 0;
         threatened_facts.enemy_units = 1;
@@ -3652,20 +4051,62 @@ mod tests {
         threatened_facts.friendly_capture_eta = None;
         threatened_facts.enemy_capture_eta = None;
         let mut assault = assess_island(&threatened_facts);
-        let assault_requirement =
-            requirement_for_assessment(&threatened_facts, &mut assault, 2_000);
+        let assault_requirement = requirement_for_assessment(&threatened_facts, &mut assault);
         assert_eq!(assault.decision, IslandCampaignDecision::Assault);
-        assert_eq!(assault_requirement.combat_budget, 12_000);
-        assert_eq!(assault_requirement.total_budget, 34_500);
+        assert_eq!(assault_requirement.combat_units, 2);
+        // 純粋な状態評価では占領・戦闘だけを積み、輸送費と地上枠は実盤面・生産経路の
+        // 分析後に加える。ここで固定のLander＋helicopter費を先取りしない。
+        assert_eq!(assault_requirement.ground_combat_units, 0);
+        assert_eq!(assault_requirement.total_budget, 2_000);
     }
 
     #[test]
-    fn logistics_security_uses_discrete_reserve_and_transport_self_defense() {
-        // 敵1体分と最小増援1体分を輸送ヘリの自衛力が上回るなら、護衛追加は不要。
-        assert_eq!(logistics_security_requirement(1_000, 1_000, 4_000), 0);
-        // 自衛力が通用しない相手には固定比率でなく、敵を最小unit 1体分上回る量を要求する。
-        assert_eq!(logistics_security_requirement(10_000, 1_000, 0), 11_000);
-        assert_eq!(logistics_security_requirement(50_000, 1_000, 0), 51_000);
+    fn campaign_requirements_keep_one_parallel_capturer_per_unowned_property() {
+        let mut secured_facts = IslandCampaignFacts {
+            island_id: IslandId(0),
+            capturable_properties: 4,
+            strategic_production_sites: 0,
+            roi_production_sites: 0,
+            neutral_properties: 3,
+            friendly_properties: 1,
+            enemy_properties: 0,
+            friendly_units: 1,
+            enemy_units: 0,
+            friendly_combat_units: 1,
+            enemy_combat_units: 0,
+            friendly_arrival_eta: Some(0),
+            enemy_arrival_eta: None,
+            friendly_capture_eta: Some(1),
+            enemy_capture_eta: None,
+            transport_eta: Some(0),
+            capture_turns: 1,
+            island_income_per_turn: 4_000,
+            missing_expansion_package_cost: 0,
+            reachable: true,
+            has_unowned_properties: true,
+        };
+        let mut secure = assess_island(&secured_facts);
+        let secure_requirement = requirement_for_assessment(&secured_facts, &mut secure);
+        assert_eq!(secure.decision, IslandCampaignDecision::Secure);
+        assert_eq!(secure_requirement.capture_units, 3);
+        assert_eq!(secure_requirement.total_budget, 3_000);
+
+        secured_facts.enemy_arrival_eta = Some(1);
+        let mut threatened = assess_island(&secured_facts);
+        let threatened_requirement = requirement_for_assessment(&secured_facts, &mut threatened);
+        assert_eq!(threatened.decision, IslandCampaignDecision::Defend);
+        assert_eq!(threatened_requirement.capture_units, 3);
+        assert_eq!(threatened_requirement.total_budget, 3_000);
+
+        secured_facts.enemy_units = 1;
+        secured_facts.friendly_combat_units = 3;
+        secured_facts.enemy_combat_units = 2;
+        secured_facts.enemy_capture_eta = Some(2);
+        let mut contest = assess_island(&secured_facts);
+        let contest_requirement = requirement_for_assessment(&secured_facts, &mut contest);
+        assert_eq!(contest.decision, IslandCampaignDecision::Contest);
+        assert_eq!(contest_requirement.capture_units, 3);
+        assert_eq!(contest_requirement.total_budget, 3_000);
     }
 
     #[test]

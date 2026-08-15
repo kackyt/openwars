@@ -185,7 +185,7 @@ pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStr
     analyze_strategy_internal(world, player_id, None, &HashSet::new())
 }
 
-/// 緊急ミッションへ予約したEntityを島嶼キャンペーンから除外して戦略を分析します。
+/// 既存の実行任務へ予約したEntityを島嶼キャンペーンから除外して戦略を分析します。
 pub(crate) fn analyze_strategy_with_reserved_entities(
     world: &mut World,
     player_id: PlayerId,
@@ -1520,7 +1520,8 @@ mod tests {
             preferred_transport: None,
             transport_slots: 0,
             capture_units: 0,
-            combat_budget: 0,
+            ground_combat_units: 0,
+            combat_units: 0,
             total_budget: 0,
         };
         let assignment = crate::ai::island_campaign::IslandCampaignAssignment {
@@ -1528,6 +1529,7 @@ mod tests {
             decision: crate::ai::island_campaign::IslandCampaignDecision::Expand,
             target_position: target,
             capture_target_positions: vec![target],
+            priority_enemy_types: Vec::new(),
             requirement: empty_requirement.clone(),
             purchase_shortfall: empty_requirement,
             allocated_budget: 0,

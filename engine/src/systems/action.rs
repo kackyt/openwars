@@ -68,6 +68,20 @@ pub struct AvailableActions {
     pub can_wait: bool,
 }
 
+/// AI の通常行動評価で使用する候補を、一度の合法手走査でまとめて返します。
+///
+/// 搭載・降車・補給は AI 側の専用ルールが先に処理するため、全移動候補でそれらを
+/// 再走査しません。また、攻撃・合流は可否だけでなく対象も返し、可否判定直後の
+/// 同一クエリの再実行を避けます。
+#[derive(Debug, Clone, Default)]
+pub struct TacticalActionTargets {
+    pub attackable_targets: Vec<Entity>,
+    pub mergeable_targets: Vec<Entity>,
+    pub can_capture: bool,
+    pub can_repair: bool,
+    pub can_wait: bool,
+}
+
 /// 指定されたユニットが現在実行可能なアクションを判定して返します。
 pub fn get_available_actions(
     world: &mut World,
@@ -167,6 +181,74 @@ pub fn get_available_actions_at(
         can_merge,
         // 空きマスであるか、移動していない（元の位置に留まる）場合のみ待機可能
         // 搭載や合流が可能なマスであっても、通常の「待機」で重なることは許さない
+        can_wait: !is_occupied_by_other || !is_moved,
+    }
+}
+
+/// 指定位置で AI の通常戦術評価に必要な合法手と対象を返します。
+///
+/// `get_available_actions_at` と同じ合法性を保ちつつ、AI がこの経路では使用しない
+/// 搭載・降車・補給の探索を省きます。攻撃・合流対象は呼び出し側のスコア計算でも
+/// そのまま再利用します。
+pub fn get_tactical_action_targets_at(
+    world: &mut World,
+    unit_entity: Entity,
+    u_pos: GridPosition,
+    is_moved: bool,
+) -> TacticalActionTargets {
+    let mergeable_targets = merge::get_mergable_targets_at(world, unit_entity, u_pos);
+
+    let (can_capture, can_repair) = {
+        let (unit_stats, unit_faction) = {
+            let mut q_unit = world.query::<(&UnitStats, &Faction)>();
+            let Ok((u_stats, u_faction)) = q_unit.get(world, unit_entity) else {
+                return TacticalActionTargets::default();
+            };
+            (u_stats.clone(), u_faction.0)
+        };
+
+        if !unit_stats.can_capture {
+            (false, false)
+        } else {
+            let mut capturable = false;
+            let mut repairable = false;
+            let mut q_properties = world.query::<(&GridPosition, &Property)>();
+            for (p_pos, p_prop) in q_properties.iter(world) {
+                if p_pos.x == u_pos.x && p_pos.y == u_pos.y {
+                    let max_points = p_prop.max_capture_points;
+                    if max_points > 0 {
+                        if p_prop.owner_id == Some(unit_faction) {
+                            if p_prop.capture_points < max_points {
+                                repairable = true;
+                            }
+                        } else {
+                            capturable = true;
+                        }
+                    }
+                    break;
+                }
+            }
+            (capturable, repairable)
+        }
+    };
+
+    let is_occupied_by_other = {
+        let mut q_occupants = world
+            .query_filtered::<(Entity, &GridPosition), (With<Faction>, Without<Transporting>)>();
+        q_occupants
+            .iter(world)
+            .any(|(entity, position)| entity != unit_entity && *position == u_pos)
+    };
+
+    TacticalActionTargets {
+        attackable_targets: if is_occupied_by_other {
+            Vec::new()
+        } else {
+            combat::get_attackable_targets_at(world, unit_entity, u_pos, !is_moved)
+        },
+        mergeable_targets,
+        can_capture: !is_occupied_by_other && can_capture,
+        can_repair: !is_occupied_by_other && can_repair,
         can_wait: !is_occupied_by_other || !is_moved,
     }
 }

@@ -63,7 +63,13 @@ def init_mcp_server():
         [exe_path],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL, # エラー出力を無視して画面崩れを防ぐ
+        # 通常評価では画面を崩さない。停止診断時だけ親へ流し、サーバー側で
+        # 最後に開始したAI stepを観測できるようにする。
+        stderr=(
+            None
+            if os.environ.get("OPENWARS_TRACE_AI_STEPS")
+            else subprocess.DEVNULL
+        ),
         text=True,
         encoding='utf-8',
         env=env
@@ -136,23 +142,45 @@ def normalize_ai_version(version):
     return normalized
 
 
-def build_match_specs(maps, subject, baseline, seeds):
+def build_match_specs(
+    maps, subject, baseline, seeds, grid_type="hex", player_order="both"
+):
     """各 seed を両方の手番へ決定的な順序で割り当てる。"""
     specs = []
     for map_name in maps:
         for seed in seeds:
-            specs.append({"map": map_name, "p1": subject, "p2": baseline, "seed": seed})
-            specs.append({"map": map_name, "p1": baseline, "p2": subject, "seed": seed})
+            if player_order in {"both", "as-given"}:
+                specs.append({
+                    "map": map_name,
+                    "p1": subject,
+                    "p2": baseline,
+                    "seed": seed,
+                    "grid_type": grid_type,
+                })
+            if player_order in {"both", "swapped"}:
+                specs.append({
+                    "map": map_name,
+                    "p1": baseline,
+                    "p2": subject,
+                    "seed": seed,
+                    "grid_type": grid_type,
+                })
     return specs
 
 
-def build_issue58_match_specs(protocol, maps, seeds):
+def build_issue58_match_specs(protocol, maps, seeds, grid_type="hex"):
     """Issue #58の固定評価プロトコルを決定的な順序で構築する。"""
     if protocol == ISSUE58_V3_V1:
-        return build_match_specs(maps, "V3", "V1", seeds)
+        return build_match_specs(maps, "V3", "V1", seeds, grid_type=grid_type)
     if protocol == ISSUE58_V3_SELFPLAY:
         return [
-            {"map": map_name, "p1": "V3", "p2": "V3", "seed": seed}
+            {
+                "map": map_name,
+                "p1": "V3",
+                "p2": "V3",
+                "seed": seed,
+                "grid_type": grid_type,
+            }
             for map_name in maps
             for seed in seeds
         ]
@@ -191,6 +219,8 @@ def write_trace_jsonl(path, results):
 
         for entry in result.get("idle_audit_history", []):
             record_for(entry)["idle_audit"] = entry.get("audit")
+        for entry in result.get("operation_assignment_history", []):
+            record_for(entry)["operation_assignments"] = entry.get("assignments")
         for entry in result.get("island_campaign_history", []):
             record = record_for(entry)
             record["available_funds"] = entry.get("available_funds")
@@ -199,6 +229,14 @@ def write_trace_jsonl(path, results):
             record_for(entry)["production_plan"] = entry.get("plan")
         for entry in result.get("deployment_audit_history", []):
             record_for(entry)["deployment_audit"] = entry.get("audit")
+        for entry in result.get("plan_revision_history", []):
+            record_for(entry)["plan_revisions"] = entry.get("revisions")
+        for entry in result.get("plan_execution_history", []):
+            record_for(entry)["plan_executions"] = entry.get("executions")
+        for entry in result.get("victory_roadmap_history", []):
+            record_for(entry)["victory_roadmap"] = entry.get("roadmap")
+        for entry in result.get("logistics_plan_history", []):
+            record_for(entry)["logistics_plan"] = entry.get("plan")
         for entry in result.get("emergency_plan_history", []):
             record_for(entry)["emergency_plan"] = entry.get("plan")
         for entry in result.get("factory_relief_history", []):
@@ -258,6 +296,7 @@ def run_single_game(
     p2_ver,
     max_turns,
     seed=None,
+    grid_type="hex",
     ui_callback=None,
     tool_caller=None,
 ):
@@ -265,9 +304,9 @@ def run_single_game(
     p1_ver = normalize_ai_version(p1_ver)
     p2_ver = normalize_ai_version(p2_ver)
     tool = tool_caller or call_tool
-    if ui_callback: ui_callback({"type": "log", "msg": f"Match started: P1({p1_ver}) vs P2({p2_ver}) on {map_name}"})
+    if ui_callback: ui_callback({"type": "log", "msg": f"Match started: P1({p1_ver}) vs P2({p2_ver}) on {map_name} ({grid_type})"})
     
-    load_args = {"map_name": map_name}
+    load_args = {"map_name": map_name, "grid_type": grid_type}
     if seed is not None:
         load_args["seed"] = seed
     tool("load_map", load_args)
@@ -284,8 +323,13 @@ def run_single_game(
     # 遊兵・生産判断・生産Entityの任務実績をターン別に保持する。
     # いずれも engine 側が判定済みの結果で、ここでは記録だけを行う。
     idle_audit_history = []
+    operation_assignment_history = []
     production_plan_history = []
     deployment_audit_history = []
+    plan_revision_history = []
+    plan_execution_history = []
+    victory_roadmap_history = []
+    logistics_plan_history = []
     emergency_plan_history = []
     factory_relief_history = []
     initial_state = None
@@ -296,6 +340,7 @@ def run_single_game(
             "result": result,
             "turns": turns,
             "seed": seed,
+            "grid_type": grid_type,
             "thinking_times": thinking_times,
             "action_counts": action_counts,
             "metrics": metrics,
@@ -306,8 +351,13 @@ def run_single_game(
             "strategic_history": strategic_history,
             "island_campaign_history": island_campaign_history,
             "idle_audit_history": idle_audit_history,
+            "operation_assignment_history": operation_assignment_history,
             "production_plan_history": production_plan_history,
             "deployment_audit_history": deployment_audit_history,
+            "plan_revision_history": plan_revision_history,
+            "plan_execution_history": plan_execution_history,
+            "victory_roadmap_history": victory_roadmap_history,
+            "logistics_plan_history": logistics_plan_history,
             "emergency_plan_history": emergency_plan_history,
             "factory_relief_history": factory_relief_history,
             "error": error,
@@ -409,6 +459,17 @@ def run_single_game(
                 }
             )
 
+        operation_assignments = ai_result.get("operation_assignments")
+        if operation_assignments is not None:
+            operation_assignment_history.append(
+                {
+                    "round": turn,
+                    "turn": state.get("turn"),
+                    "player_id": ai_result.get("player_id", current_player),
+                    "assignments": operation_assignments,
+                }
+            )
+
         production_plan = ai_result.get("production_plan")
         if production_plan is not None:
             production_plan_history.append(
@@ -428,6 +489,50 @@ def run_single_game(
                     "turn": state.get("turn"),
                     "player_id": ai_result.get("player_id", current_player),
                     "audit": deployment_audit,
+                }
+            )
+
+        plan_revisions = ai_result.get("plan_revisions")
+        if plan_revisions is not None:
+            plan_revision_history.append(
+                {
+                    "round": turn,
+                    "turn": state.get("turn"),
+                    "player_id": ai_result.get("player_id", current_player),
+                    "revisions": plan_revisions,
+                }
+            )
+
+        plan_executions = ai_result.get("plan_executions")
+        if plan_executions is not None:
+            plan_execution_history.append(
+                {
+                    "round": turn,
+                    "turn": state.get("turn"),
+                    "player_id": ai_result.get("player_id", current_player),
+                    "executions": plan_executions,
+                }
+            )
+
+        victory_roadmap = ai_result.get("victory_roadmap")
+        if victory_roadmap is not None:
+            victory_roadmap_history.append(
+                {
+                    "round": turn,
+                    "turn": state.get("turn"),
+                    "player_id": ai_result.get("player_id", current_player),
+                    "roadmap": victory_roadmap,
+                }
+            )
+
+        logistics_plan = ai_result.get("logistics_plan")
+        if logistics_plan is not None:
+            logistics_plan_history.append(
+                {
+                    "round": turn,
+                    "turn": state.get("turn"),
+                    "player_id": ai_result.get("player_id", current_player),
+                    "plan": logistics_plan,
                 }
             )
 
@@ -910,6 +1015,12 @@ def main():
     parser.add_argument("--p1", default="V2", help="Player 1 AI Version")
     parser.add_argument("--p2", default="V1", help="Player 2 AI Version")
     parser.add_argument("--games", type=int, default=1, help="Number of games per matchup")
+    parser.add_argument(
+        "--player-order",
+        choices=["both", "as-given", "swapped"],
+        default="both",
+        help="Run both player orders or only one order (default: both)",
+    )
     parser.add_argument("--max-turns", type=int, default=30, help="Maximum turns per game")
     parser.add_argument("--criteria", choices=["objective", "issue54", "issue58"], default="objective", help="Acceptance criteria used for the final report")
     parser.add_argument(
@@ -935,6 +1046,13 @@ def main():
         default=None,
         help="Baseline JSON artifact required for Issue #58 result runs",
     )
+    parser.add_argument(
+        "--grid-type",
+        "--map-type",
+        choices=["square", "hex"],
+        default="hex",
+        help="Grid topology for maps (square or hex, default: hex)",
+    )
     parser.add_argument("--stall-turns", type=int, default=5, help="Subject turns before an unchanged transport is considered stalled")
     parser.add_argument("--output", default="matchup_report.md", help="Output file for the final report")
     args = parser.parse_args()
@@ -943,6 +1061,8 @@ def main():
     issue58_metadata = None
     baseline_payload = None
     if args.criteria == "issue58":
+        if args.player_order != "both":
+            parser.error("Issue #58 fixed protocol requires --player-order both")
         if not args.issue58_protocol:
             parser.error("Issue #58 requires --issue58-protocol")
         if not args.artifact_stage:
@@ -969,6 +1089,7 @@ def main():
                 args.issue58_protocol,
                 maps,
                 seeds,
+                grid_type=args.grid_type,
             )
         except ValueError as error:
             parser.error(str(error))
@@ -1031,7 +1152,14 @@ def main():
                 parser.error(str(error))
     else:
         seeds = tuple(args.seed for _ in range(args.games))
-        match_specs = build_match_specs(maps, args.p1, args.p2, seeds)
+        match_specs = build_match_specs(
+            maps,
+            args.p1,
+            args.p2,
+            seeds,
+            grid_type=args.grid_type,
+            player_order=args.player_order,
+        )
 
     init_mcp_server()
     all_results = []
@@ -1090,21 +1218,23 @@ def main():
                         spec["p1"],
                         spec["p2"],
                         args.max_turns,
-                        spec["seed"],
-                        lambda e: ui_callback_tui(e, layout, live),
+                        seed=spec["seed"],
+                        grid_type=spec.get("grid_type", args.grid_type),
+                        ui_callback=lambda e: ui_callback_tui(e, layout, live),
                     )
                     result.update(spec)
                     all_results.append(result)
         else:
-            print(json.dumps({"type": "info", "msg": f"Starting batch run: {args.p1} vs {args.p2} on {maps} ({args.games} games x 2 orders per map)"}))
+            print(json.dumps({"type": "info", "msg": f"Starting batch run: {args.p1} vs {args.p2} on {maps} ({len(match_specs)} matches, order={args.player_order})"}))
             for spec in match_specs:
                 result = run_single_game(
                     spec["map"],
                     spec["p1"],
                     spec["p2"],
                     args.max_turns,
-                    spec["seed"],
-                    ui_callback_batch,
+                    seed=spec["seed"],
+                    grid_type=spec.get("grid_type", args.grid_type),
+                    ui_callback=ui_callback_batch,
                 )
                 result.update(spec)
                 all_results.append(result)
@@ -1122,8 +1252,11 @@ def main():
                             "strategic_history",
                             "island_campaign_history",
                             "idle_audit_history",
+                            "operation_assignment_history",
                             "production_plan_history",
                             "deployment_audit_history",
+                            "plan_revision_history",
+                            "plan_execution_history",
                             "emergency_plan_history",
                             "factory_relief_history",
                         }
