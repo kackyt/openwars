@@ -16,10 +16,10 @@ describe("player settings helpers", () => {
     expect(PLAYER_MENU_OPTIONS.some((option) => option.includes("V2"))).toBe(false);
   });
 
-  it("creates the default P1 Human / P2 AI V3 settings", () => {
+  it("creates the default P1 Human / P2 AI V4 settings", () => {
     expect(createDefaultPlayerSettings()).toEqual({
-      1: { controlMode: "human", aiVersion: "V3" },
-      2: { controlMode: "ai", aiVersion: "V3" },
+      1: { controlMode: "human", aiVersion: "V4" },
+      2: { controlMode: "ai", aiVersion: "V4" },
     });
   });
 

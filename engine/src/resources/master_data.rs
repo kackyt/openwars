@@ -639,10 +639,138 @@ mod tests {
         assert_eq!(map1.width, 10);
         assert_eq!(map1.height, 14);
 
-        // map_2 の確認
-        let map2 = registry.get_map("map_2").expect("map_2 not found");
-        assert!(map2.width > 0);
-        assert!(map2.height > 0);
+        // map_3 の確認
+        let map3 = registry.get_map("map_3").expect("map_3 not found");
+        assert!(map3.width > 0);
+        assert!(map3.height > 0);
+
+        // map_4 の確認（画像解析により追加・調整された 777 マップ）
+        let map4 = registry.get_map("map_4").expect("map_4 not found");
+        assert_eq!(map4.width, 28);
+        assert_eq!(map4.height, 18);
+        // P1首都 (x=4, y=3) -> 101
+        let cell_p1_cap = map4.get_cell(4, 3).unwrap();
+        assert_eq!(cell_p1_cap.player_id, 1);
+        assert_eq!(cell_p1_cap.terrain_id, LandscapeId(1));
+        // P2首都 (x=23, y=12) -> 201
+        let cell_p2_cap = map4.get_cell(23, 12).unwrap();
+        assert_eq!(cell_p2_cap.player_id, 2);
+        assert_eq!(cell_p2_cap.terrain_id, LandscapeId(1));
+        // P1空港 (x=2, y=2) -> 104
+        let cell_p1_air = map4.get_cell(2, 2).unwrap();
+        assert_eq!(cell_p1_air.player_id, 1);
+        assert_eq!(cell_p1_air.terrain_id, LandscapeId(4));
+
+        // map_5 の確認（画像解析により追加・調整された 双子島 / 橋マップ）
+        let map5 = registry.get_map("map_5").expect("map_5 not found");
+        assert_eq!(map5.width, 10);
+        assert_eq!(map5.height, 10);
+        // P1首都 (x=0, y=5) -> 101
+        let cell_p1_cap5 = map5.get_cell(0, 5).unwrap();
+        assert_eq!(cell_p1_cap5.player_id, 1);
+        assert_eq!(cell_p1_cap5.terrain_id, LandscapeId(1));
+        // P2首都 (x=9, y=5) -> 201
+        let cell_p2_cap5 = map5.get_cell(9, 5).unwrap();
+        assert_eq!(cell_p2_cap5.player_id, 2);
+        assert_eq!(cell_p2_cap5.terrain_id, LandscapeId(1));
+        // 橋 (x=2, y=5) -> 7
+        let cell_bridge = map5.get_cell(2, 5).unwrap();
+        assert_eq!(cell_bridge.player_id, 0);
+        assert_eq!(cell_bridge.terrain_id, LandscapeId(7));
+
+        // map_6 の確認（画像解析により追加・調整された シルクロード マップ）
+        let map6 = registry.get_map("map_6").expect("map_6 not found");
+        assert_eq!(map6.width, 30);
+        assert_eq!(map6.height, 22);
+        // P1首都 (x=4, y=16) -> 101
+        let cell_p1_cap6 = map6.get_cell(4, 16).unwrap();
+        assert_eq!(cell_p1_cap6.player_id, 1);
+        assert_eq!(cell_p1_cap6.terrain_id, LandscapeId(1));
+        // P2首都 (x=25, y=5) -> 201
+        let cell_p2_cap6 = map6.get_cell(25, 5).unwrap();
+        assert_eq!(cell_p2_cap6.player_id, 2);
+        assert_eq!(cell_p2_cap6.terrain_id, LandscapeId(1));
+        // 中立空港 (x=14, y=9) -> 4
+        let cell_air6 = map6.get_cell(14, 9).unwrap();
+        assert_eq!(cell_air6.player_id, 0);
+        assert_eq!(cell_air6.terrain_id, LandscapeId(4));
+
+        // map_7 の確認（画像解析により追加・調整された 鬼ヶ島 / クレーター マップ）
+        let map7 = registry.get_map("map_7").expect("map_7 not found");
+        assert_eq!(map7.width, 20);
+        assert_eq!(map7.height, 19);
+        // P1首都 (x=1, y=8) -> 101
+        let cell_p1_cap7 = map7.get_cell(1, 8).unwrap();
+        assert_eq!(cell_p1_cap7.player_id, 1);
+        assert_eq!(cell_p1_cap7.terrain_id, LandscapeId(1));
+        // P2首都 (x=16, y=7) -> 201
+        let cell_p2_cap7 = map7.get_cell(16, 7).unwrap();
+        assert_eq!(cell_p2_cap7.player_id, 2);
+        assert_eq!(cell_p2_cap7.terrain_id, LandscapeId(1));
+        // 中立空港 (x=8, y=8) -> 4
+        let cell_air7 = map7.get_cell(8, 8).unwrap();
+        assert_eq!(cell_air7.player_id, 0);
+        assert_eq!(cell_air7.terrain_id, LandscapeId(4));
+        // 上の橋 (x=6, y=3) -> 7
+        let cell_bridge7 = map7.get_cell(6, 3).unwrap();
+        assert_eq!(cell_bridge7.player_id, 0);
+        assert_eq!(cell_bridge7.terrain_id, LandscapeId(7));
+
+        // map_8 の確認（画像解析により追加・調整された ナガレジマ マップ）
+        let map8 = registry.get_map("map_8").expect("map_8 not found");
+        assert_eq!(map8.width, 22);
+        assert_eq!(map8.height, 19);
+        // P1首都 (x=4, y=9) -> 101
+        let cell_p1_cap8 = map8.get_cell(4, 9).unwrap();
+        assert_eq!(cell_p1_cap8.player_id, 1);
+        assert_eq!(cell_p1_cap8.terrain_id, LandscapeId(1));
+        // P2首都 (x=16, y=10) -> 201
+        let cell_p2_cap8 = map8.get_cell(16, 10).unwrap();
+        assert_eq!(cell_p2_cap8.player_id, 2);
+        assert_eq!(cell_p2_cap8.terrain_id, LandscapeId(1));
+        // 上の橋 (x=11, y=4) -> 7
+        let cell_bridge8_top = map8.get_cell(11, 4).unwrap();
+        assert_eq!(cell_bridge8_top.player_id, 0);
+        assert_eq!(cell_bridge8_top.terrain_id, LandscapeId(7));
+        // 下の橋 (x=10, y=14) -> 7
+        let cell_bridge8_bottom = map8.get_cell(10, 14).unwrap();
+        assert_eq!(cell_bridge8_bottom.player_id, 0);
+        assert_eq!(cell_bridge8_bottom.terrain_id, LandscapeId(7));
+
+        // map_9 の確認（画像解析により追加・調整された インヨウジマ マップ）
+        let map9 = registry.get_map("map_9").expect("map_9 not found");
+        assert_eq!(map9.width, 26);
+        assert_eq!(map9.height, 26);
+        // P1首都 (x=6, y=4) -> 101
+        let cell_p1_cap9 = map9.get_cell(6, 4).unwrap();
+        assert_eq!(cell_p1_cap9.player_id, 1);
+        assert_eq!(cell_p1_cap9.terrain_id, LandscapeId(1));
+
+        // map_10 の確認（画像解析により追加された タマゴジマ / クレーター マップ）
+        let map10 = registry.get_map("map_10").expect("map_10 not found");
+        assert_eq!(map10.width, 30);
+        assert_eq!(map10.height, 30);
+        // P1首都 (x=16, y=13) -> 101
+        let cell_p1_cap10 = map10.get_cell(16, 13).unwrap();
+        assert_eq!(cell_p1_cap10.player_id, 1);
+        assert_eq!(cell_p1_cap10.terrain_id, LandscapeId(1));
+        // P2首都 (x=26, y=26) -> 201
+        let cell_p2_cap10 = map10.get_cell(26, 26).unwrap();
+        assert_eq!(cell_p2_cap10.player_id, 2);
+        assert_eq!(cell_p2_cap10.terrain_id, LandscapeId(1));
+
+        // map_11 の確認（画像解析により追加された チエノワ マップ）
+        let map11 = registry.get_map("map_11").expect("map_11 not found");
+        assert_eq!(map11.width, 30);
+        assert_eq!(map11.height, 30);
+        // P1首都 (x=6, y=6) -> 101
+        let cell_p1_cap11 = map11.get_cell(6, 6).unwrap();
+        assert_eq!(cell_p1_cap11.player_id, 1);
+        assert_eq!(cell_p1_cap11.terrain_id, LandscapeId(1));
+        // P2首都 (x=23, y=23) -> 201
+        let cell_p2_cap11 = map11.get_cell(23, 23).unwrap();
+        assert_eq!(cell_p2_cap11.player_id, 2);
+        assert_eq!(cell_p2_cap11.terrain_id, LandscapeId(1));
 
         // Check decoding at specific known coordinates from the csv output we saw
         // Cell (0, 0) was '12' -> player 0, terrain 12 (海)
