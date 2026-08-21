@@ -28,6 +28,8 @@ pub mod simulation;
 pub mod squad;
 pub mod threat;
 pub mod turn_distance;
+/// V100/V200の独立した逐次AI。
+pub(crate) mod v100;
 /// V4: 作戦駆動生産（V1〜V3 の生産ロジックとは分離した独立実装）
 pub mod v4;
 

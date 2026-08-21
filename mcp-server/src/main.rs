@@ -198,9 +198,11 @@ impl OpenWarsAiServer {
                 "V2" => engine::ai::AiVersion::V2,
                 "V3" => engine::ai::AiVersion::V3,
                 "V4" => engine::ai::AiVersion::V4,
+                "V100" => engine::ai::AiVersion::V100,
+                "V200" => engine::ai::AiVersion::V200,
                 _ => {
                     return Err(format!(
-                        "Invalid AI version: {}. Must be 'V1', 'V2', 'V3' or 'V4'",
+                        "Invalid AI version: {}. Must be 'V1', 'V2', 'V3', 'V4', 'V100' or 'V200'",
                         args.version
                     ));
                 }
