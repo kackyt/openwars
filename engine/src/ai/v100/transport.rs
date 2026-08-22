@@ -4,6 +4,7 @@
 //! 5675で降車可能地点を走査する。この順序をマップ名や絶対座標へ依存せず再現する。
 
 use super::candidate_field::CandidateTile;
+use super::route_field::build_route_field_to_any;
 use crate::ai::AiVersion;
 use crate::ai::engine::AiCommand;
 use crate::ai::islands::IslandMap;
@@ -11,8 +12,10 @@ use crate::components::{
     ActionCompleted, CargoCapacity, Faction, Fuel, GridPosition, HasMoved, Health, PlayerId,
     Property, Transporting, UnitStats,
 };
-use crate::resources::{Map, MasterDataRegistry, Terrain};
-use crate::systems::movement::{OccupantInfo, calculate_reachable_tile_costs};
+use crate::resources::{Map, MasterDataRegistry, MovementType, Terrain};
+use crate::systems::movement::{
+    OccupantInfo, calculate_reachable_tile_costs, get_valid_movement_cost,
+};
 use bevy_ecs::prelude::*;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -223,11 +226,24 @@ fn choose_loaded_action(
     player_id: PlayerId,
 ) -> Option<AiCommand> {
     let map = world.get_resource::<Map>()?.clone();
+    let master_data = world.get_resource::<MasterDataRegistry>()?.clone();
     let island_map = world
         .get_resource::<IslandMap>()
         .cloned()
         .unwrap_or_else(|| IslandMap::analyze(&map));
     let actor_position = *world.get::<GridPosition>(actor)?;
+    let actor_movement_type = world.get::<UnitStats>(actor)?.movement_type;
+    let cargo_views: Vec<_> = cargo
+        .iter()
+        .filter_map(|entity| {
+            world
+                .get::<UnitStats>(*entity)
+                .map(|stats| (*entity, stats.movement_type))
+        })
+        .collect();
+    if cargo_views.is_empty() {
+        return None;
+    }
     let objective = select_transport_objective(
         world,
         actor_position,
@@ -237,55 +253,167 @@ fn choose_loaded_action(
         &island_map,
     )?;
     let target_island = island_map.get_island_at(&objective).map(|island| island.id);
-    let cargo_entity = cargo[0];
 
-    let mut best_drop: Option<DropChoice> = None;
-    for candidate in candidates {
-        for (drop_x, drop_y) in crate::systems::transport::get_droppable_tiles_at(
-            world,
-            actor,
-            cargo_entity,
-            candidate.position,
-        ) {
-            let drop_position = GridPosition {
-                x: drop_x,
-                y: drop_y,
+    // GB版は搭載順に降車可能性を調べる。先頭が降ろせない場合にも、後続の
+    // 搭載ユニットまで走査を続け、合法な候補があれば同じ手番で降車させる。
+    for (cargo_entity, _) in &cargo_views {
+        let mut best_drop: Option<DropChoice> = None;
+        for candidate in candidates {
+            for (drop_x, drop_y) in crate::systems::transport::get_droppable_tiles_at(
+                world,
+                actor,
+                *cargo_entity,
+                candidate.position,
+            ) {
+                let drop_position = GridPosition {
+                    x: drop_x,
+                    y: drop_y,
+                };
+                if target_island.is_some()
+                    && island_map
+                        .get_island_at(&drop_position)
+                        .map(|island| island.id)
+                        != target_island
+                {
+                    continue;
+                }
+                let key = (
+                    map.distance(drop_x, drop_y, objective.x, objective.y),
+                    Reverse(candidate.position.y),
+                    Reverse(candidate.position.x),
+                    drop_y,
+                    drop_x,
+                );
+                if best_drop
+                    .as_ref()
+                    .is_none_or(|(current, _, _)| key < *current)
+                {
+                    best_drop = Some((key, candidate.position, drop_position));
+                }
+            }
+        }
+        if let Some((_, transport_target_pos, cargo_drop_pos)) = best_drop {
+            return Some(AiCommand::Drop {
+                transport_target_pos,
+                cargo_drop_pos,
+                cargo_entity: *cargo_entity,
+            });
+        }
+    }
+
+    let occupied_positions = collect_visible_occupied_positions(world, actor);
+    let landing_origins = collect_landing_origins(
+        &map,
+        &master_data,
+        &island_map,
+        target_island,
+        actor_position,
+        actor_movement_type,
+        &cargo_views,
+        &occupied_positions,
+    );
+    let route_field =
+        build_route_field_to_any(&map, &master_data, &landing_origins, actor_movement_type);
+    Some(AiCommand::Wait {
+        target_pos: select_route_progress_candidate(candidates, &route_field)
+            .or_else(|| select_progress_candidate(candidates, objective, &map))
+            .unwrap_or(actor_position),
+    })
+}
+
+fn collect_visible_occupied_positions(world: &mut World, actor: Entity) -> HashSet<(usize, usize)> {
+    let mut occupied = HashSet::new();
+    let mut query =
+        world.query_filtered::<(Entity, &GridPosition), (With<Faction>, Without<Transporting>)>();
+    for (entity, position) in query.iter(world) {
+        if entity != actor {
+            occupied.insert((position.x, position.y));
+        }
+    }
+    occupied
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_landing_origins(
+    map: &Map,
+    master_data: &MasterDataRegistry,
+    island_map: &IslandMap,
+    target_island: Option<crate::ai::islands::IslandId>,
+    actor_position: GridPosition,
+    actor_movement_type: MovementType,
+    cargo: &[(Entity, MovementType)],
+    occupied_positions: &HashSet<(usize, usize)>,
+) -> Vec<GridPosition> {
+    let mut origins = Vec::new();
+    for y in 0..map.height {
+        for x in 0..map.width {
+            let origin = GridPosition { x, y };
+            if origin != actor_position && occupied_positions.contains(&(x, y)) {
+                continue;
+            }
+            let Some(terrain) = map.get_terrain(x, y) else {
+                continue;
             };
-            if target_island.is_some()
-                && island_map
-                    .get_island_at(&drop_position)
-                    .map(|island| island.id)
-                    != target_island
+            if get_valid_movement_cost(master_data, actor_movement_type, terrain).is_none()
+                || !crate::systems::transport::can_unload_from_terrain(
+                    Some(actor_movement_type),
+                    Some(terrain),
+                )
             {
                 continue;
             }
-            let key = (
-                map.distance(drop_x, drop_y, objective.x, objective.y),
-                Reverse(candidate.position.y),
-                Reverse(candidate.position.x),
-                drop_y,
-                drop_x,
-            );
-            if best_drop
-                .as_ref()
-                .is_none_or(|(current, _, _)| key < *current)
-            {
-                best_drop = Some((key, candidate.position, drop_position));
+
+            let has_drop = map.get_adjacent(x, y).into_iter().any(|(drop_x, drop_y)| {
+                let drop_position = GridPosition {
+                    x: drop_x,
+                    y: drop_y,
+                };
+                if target_island.is_some()
+                    && island_map
+                        .get_island_at(&drop_position)
+                        .map(|island| island.id)
+                        != target_island
+                {
+                    return false;
+                }
+                if occupied_positions.contains(&(drop_x, drop_y)) {
+                    return false;
+                }
+                let Some(drop_terrain) = map.get_terrain(drop_x, drop_y) else {
+                    return false;
+                };
+                cargo.iter().any(|(_, movement_type)| {
+                    get_valid_movement_cost(master_data, *movement_type, drop_terrain).is_some()
+                })
+            });
+            if has_drop {
+                origins.push(origin);
             }
         }
     }
-    if let Some((_, transport_target_pos, cargo_drop_pos)) = best_drop {
-        return Some(AiCommand::Drop {
-            transport_target_pos,
-            cargo_drop_pos,
-            cargo_entity,
-        });
-    }
+    origins
+}
 
-    Some(AiCommand::Wait {
-        target_pos: select_progress_candidate(candidates, objective, &map)
-            .unwrap_or(actor_position),
-    })
+fn select_route_progress_candidate(
+    candidates: &[CandidateTile],
+    route_field: &HashMap<GridPosition, u32>,
+) -> Option<GridPosition> {
+    candidates
+        .iter()
+        .filter_map(|candidate| {
+            route_field.get(&candidate.position).map(|cost| {
+                (
+                    (
+                        *cost,
+                        Reverse(candidate.position.y),
+                        Reverse(candidate.position.x),
+                    ),
+                    candidate.position,
+                )
+            })
+        })
+        .min_by_key(|(key, _)| *key)
+        .map(|(_, position)| position)
 }
 
 fn select_transport_objective(
@@ -316,7 +444,12 @@ fn select_transport_objective(
                 .get_island_at(&position)
                 .is_some_and(|island| Some(island.id) != base_island)
     };
-    if assigned.is_some_and(is_remote) {
+    let assigned_is_owned = assigned.is_some_and(|assigned_position| {
+        properties.iter().any(|(position, property)| {
+            *position == assigned_position && property.owner_id == Some(player_id)
+        })
+    });
+    if assigned.is_some_and(is_remote) && !assigned_is_owned {
         return assigned;
     }
     properties
@@ -438,6 +571,7 @@ fn collect_passengers_and_occupants(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resources::{GridTopology, UnitType};
 
     #[test]
     fn pickup_tie_uses_rom_iq_scan_direction() {
@@ -477,5 +611,140 @@ mod tests {
         assert!(
             transport_objective_rank(Terrain::Port) < transport_objective_rank(Terrain::Capital)
         );
+    }
+
+    #[test]
+    fn loaded_transport_checks_later_cargo_when_first_cannot_drop() {
+        let mut world = World::new();
+        let mut map = Map::new(3, 3, Terrain::Sea, GridTopology::Hex);
+        map.set_terrain(2, 1, Terrain::Mountain).unwrap();
+        world.insert_resource(map);
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+
+        let first_cargo = world
+            .spawn(UnitStats {
+                unit_type: UnitType::MdTank,
+                movement_type: MovementType::Tank,
+                ..UnitStats::mock()
+            })
+            .id();
+        let second_cargo = world
+            .spawn(UnitStats {
+                unit_type: UnitType::Infantry,
+                movement_type: MovementType::Infantry,
+                ..UnitStats::mock()
+            })
+            .id();
+        let actor_position = GridPosition { x: 1, y: 1 };
+        let actor = world
+            .spawn((
+                actor_position,
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::TransportHelicopter,
+                    movement_type: MovementType::Air,
+                    ..UnitStats::mock()
+                },
+                CargoCapacity {
+                    max: 2,
+                    loaded: vec![first_cargo, second_cargo],
+                },
+            ))
+            .id();
+        let candidates = [CandidateTile {
+            position: actor_position,
+            movement_cost: 0,
+        }];
+
+        let command = choose_loaded_action(
+            &mut world,
+            actor,
+            &[first_cargo, second_cargo],
+            &candidates,
+            Some(GridPosition { x: 2, y: 1 }),
+            PlayerId(1),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            command,
+            AiCommand::Drop {
+                cargo_entity,
+                cargo_drop_pos: GridPosition { x: 2, y: 1 },
+                ..
+            } if cargo_entity == second_cargo
+        ));
+    }
+
+    #[test]
+    fn loaded_lander_routes_to_legal_shoal_instead_of_waiting_near_objective() {
+        let mut world = World::new();
+        let mut map = Map::new(9, 7, Terrain::Sea, GridTopology::Hex);
+        // 施設へ直進すると陸壁の手前で止まるが、南端の浅瀬からは降車できる形にする。
+        for y in 0..6 {
+            map.set_terrain(5, y, Terrain::Plains).unwrap();
+        }
+        map.set_terrain(5, 6, Terrain::Shoal).unwrap();
+        map.set_terrain(6, 1, Terrain::City).unwrap();
+        let master_data = MasterDataRegistry::load().unwrap();
+        world.insert_resource(map.clone());
+        world.insert_resource(master_data);
+
+        let cargo = world
+            .spawn(UnitStats {
+                unit_type: UnitType::Infantry,
+                movement_type: MovementType::Infantry,
+                ..UnitStats::mock()
+            })
+            .id();
+        let actor_position = GridPosition { x: 4, y: 1 };
+        let actor = world
+            .spawn((
+                actor_position,
+                Faction(PlayerId(1)),
+                UnitStats {
+                    unit_type: UnitType::Lander,
+                    movement_type: MovementType::Ship,
+                    ..UnitStats::mock()
+                },
+                CargoCapacity {
+                    max: 2,
+                    loaded: vec![cargo],
+                },
+            ))
+            .id();
+        let candidates = [
+            CandidateTile {
+                position: actor_position,
+                movement_cost: 0,
+            },
+            CandidateTile {
+                position: GridPosition { x: 4, y: 2 },
+                movement_cost: 1,
+            },
+        ];
+        let objective = GridPosition { x: 6, y: 1 };
+        assert_eq!(
+            select_progress_candidate(&candidates, objective, &map),
+            Some(actor_position),
+            "施設への直線距離だけなら陸壁手前で停止する再現条件"
+        );
+
+        let command = choose_loaded_action(
+            &mut world,
+            actor,
+            &[cargo],
+            &candidates,
+            Some(objective),
+            PlayerId(1),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            command,
+            AiCommand::Wait {
+                target_pos: GridPosition { x: 4, y: 2 }
+            }
+        ));
     }
 }

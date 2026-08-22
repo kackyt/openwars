@@ -657,6 +657,8 @@ def main() -> None:
     )
     arguments = parser.parse_args()
 
+    if str(arguments.rom) == "decrypted":
+        arguments.rom = next(Path("rom").glob("*-decrypted.GB"))
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     pyboy = PyBoy(str(arguments.rom), window="null", sound_emulated=False)
     try:

@@ -242,7 +242,9 @@ def write_trace_jsonl(path, results):
         for entry in result.get("factory_relief_history", []):
             record_for(entry)["factory_relief"] = entry.get("missions")
         for entry in result.get("action_history", []):
-            record_for(entry)["actions"] = entry.get("actions")
+            record = record_for(entry)
+            record["actions"] = entry.get("actions")
+            record["loaded_transports"] = entry.get("loaded_transports", [])
 
         # 欠測（V1〜V3 は生産トレースを持たない）を挟んでも順序が崩れないよう -1 で埋める。
         for key in sorted(
@@ -576,6 +578,19 @@ def run_single_game(
                 "turn": state.get("turn"),
                 "player_id": current_player,
                 "actions": [str(action) for action in actions],
+                # Waitの主体が積載済み輸送かを、行動前の盤面と照合できるようにする。
+                "loaded_transports": [
+                    {
+                        "unit_id": unit.get("unit_id"),
+                        "unit_type": unit.get("unit_type"),
+                        "x": unit.get("x"),
+                        "y": unit.get("y"),
+                        "cargo_ids": unit.get("cargo_ids", []),
+                    }
+                    for unit in state.get("units", [])
+                    if unit.get("player_id") == current_player
+                    and unit.get("cargo_ids")
+                ],
             }
         )
         acts_dict = defaultdict(int)

@@ -39,16 +39,32 @@ pub(crate) fn build_route_field(
     target: GridPosition,
     movement_type: MovementType,
 ) -> HashMap<GridPosition, u32> {
+    build_route_field_to_any(map, master_data, &[target], movement_type)
+}
+
+/// 複数の合法到達目標から各マスまでの最小地形コストを一度に作る。
+///
+/// 輸送部隊は施設座標そのものではなく、降車可能な港・浅瀬・隣接空域の
+/// いずれかへ到達すればよいため、全候補を同時に始点として探索する。
+pub(crate) fn build_route_field_to_any(
+    map: &Map,
+    master_data: &MasterDataRegistry,
+    targets: &[GridPosition],
+    movement_type: MovementType,
+) -> HashMap<GridPosition, u32> {
     let mut distances = HashMap::new();
     let mut heap = BinaryHeap::new();
-    if target.x >= map.width || target.y >= map.height {
-        return distances;
+    for target in targets {
+        if target.x >= map.width || target.y >= map.height {
+            continue;
+        }
+        if distances.insert(*target, 0_u32).is_none() {
+            heap.push(RouteState {
+                cost: 0,
+                position: (target.x, target.y),
+            });
+        }
     }
-    distances.insert(target, 0_u32);
-    heap.push(RouteState {
-        cost: 0,
-        position: (target.x, target.y),
-    });
 
     while let Some(RouteState { cost, position }) = heap.pop() {
         let grid_position = GridPosition {
