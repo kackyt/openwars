@@ -47,6 +47,17 @@ fn apply_daily_updates_for_unit(
             }
         }
     }
+
+    if stats.movement_type == MovementType::Ship {
+        let terrain = map.get_terrain(pos.x, pos.y);
+        if terrain != Some(Terrain::Port) {
+            if fuel.current == 0 {
+                hp.current = 0; // Destroyed
+            } else {
+                fuel.current = fuel.current.saturating_sub(stats.daily_fuel_consumption);
+            }
+        }
+    }
 }
 
 /// 全ユニットに対して日次更新（燃料消費、墜落判定）を適用します。
