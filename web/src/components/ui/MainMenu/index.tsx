@@ -1,6 +1,7 @@
 import { Button, Container, Group, Paper, Select, Stack, Title } from "@mantine/core";
 import { useState } from "react";
 import { MAIN_MENU_MARGIN_TOP } from "../../../constants/rendering";
+import { MAP_OPTIONS } from "../../../constants/maps";
 import { useGameStore } from "../../../store/gameStore";
 import {
   applyPlayerMenuValue,
@@ -51,7 +52,7 @@ export const MainMenu = () => {
 
           <Select
             label="Map"
-            data={["map_1", "map_2", "map_3", "map_4", "map_5", "map_6", "map_7", "map_8", "map_9", "map_10", "map_11"]}
+            data={MAP_OPTIONS}
             value={mapName}
             onChange={(val) => setMapName(val || "map_1")}
           />

@@ -56,7 +56,7 @@ pub(crate) struct RomScenarioData {
     pub(crate) recon_uses_mission_three: bool,
     strategic_objectives: [[(u8, u8); 2]; 2],
     /// ROMシナリオレコード+0x13の陣営別nibble。値域は0〜3。
-    unit_value_profile: usize,
+    unit_value_profiles: [usize; 2],
     production_limits: [[u8; 24]; 4],
 }
 
@@ -67,20 +67,31 @@ impl From<&RomScenarioRecord> for RomScenarioData {
             opening_limit: record.opening_limit,
             recon_uses_mission_three: record.recon_uses_mission_three,
             strategic_objectives: record.strategic_objectives,
-            unit_value_profile: record.unit_value_profile,
+            unit_value_profiles: record.unit_value_profiles,
             production_limits: record.production_limits,
         }
     }
 }
 
 impl RomScenarioData {
-    pub(crate) fn unit_value(&self, unit_type: UnitType, mode: RomEvaluationMode) -> u32 {
+    pub(crate) fn unit_value(
+        &self,
+        player_id: PlayerId,
+        unit_type: UnitType,
+        mode: RomEvaluationMode,
+    ) -> u32 {
         let index = usize::from(GbUnitKind::production_order(unit_type) / 2);
         let table_offset = match mode {
             RomEvaluationMode::Restricted => 0,
             RomEvaluationMode::Normal => 4,
         };
-        u32::from(UNIT_VALUES[self.unit_value_profile + table_offset][index])
+        let side = usize::try_from(player_id.0.saturating_sub(1)).unwrap_or_default();
+        let profile = self
+            .unit_value_profiles
+            .get(side)
+            .copied()
+            .unwrap_or_default();
+        u32::from(UNIT_VALUES[profile + table_offset][index])
     }
 
     pub(crate) fn production_limit(
@@ -172,7 +183,7 @@ mod tests {
             4
         );
         assert_eq!(
-            scenario.unit_value(UnitType::Bcopters, RomEvaluationMode::Normal),
+            scenario.unit_value(PlayerId(1), UnitType::Bcopters, RomEvaluationMode::Normal),
             30
         );
     }
@@ -193,40 +204,56 @@ mod tests {
         assert_eq!(map1.restricted_radius, 2);
         assert_eq!(map1.opening_limit, 3);
         assert_eq!(
-            map1.unit_value(UnitType::Bomber, RomEvaluationMode::Restricted),
+            map1.unit_value(PlayerId(1), UnitType::Bomber, RomEvaluationMode::Restricted),
             0
         );
         assert_eq!(
-            map1.unit_value(UnitType::Bomber, RomEvaluationMode::Normal),
+            map1.unit_value(PlayerId(1), UnitType::Bomber, RomEvaluationMode::Normal),
             42
         );
         let map6 = scenario_for("map_6");
         assert_eq!(
-            map6.unit_value(UnitType::Missiles, RomEvaluationMode::Restricted),
+            map6.unit_value(
+                PlayerId(1),
+                UnitType::Missiles,
+                RomEvaluationMode::Restricted
+            ),
             40
         );
         assert_eq!(
-            map6.unit_value(UnitType::Missiles, RomEvaluationMode::Normal),
+            map6.unit_value(PlayerId(1), UnitType::Missiles, RomEvaluationMode::Normal),
             37
         );
         assert_eq!(
-            map6.unit_value(UnitType::TransportHelicopter, RomEvaluationMode::Restricted),
+            map6.unit_value(
+                PlayerId(1),
+                UnitType::TransportHelicopter,
+                RomEvaluationMode::Restricted,
+            ),
             13
         );
         let map8 = scenario_for("map_8");
         assert_eq!(
-            map8.unit_value(UnitType::Battleship, RomEvaluationMode::Restricted),
+            map8.unit_value(
+                PlayerId(1),
+                UnitType::Battleship,
+                RomEvaluationMode::Restricted
+            ),
             76
         );
         assert_eq!(
-            map8.unit_value(UnitType::Bomber, RomEvaluationMode::Restricted),
+            map8.unit_value(PlayerId(1), UnitType::Bomber, RomEvaluationMode::Restricted),
             0
         );
         // プロファイル3はROM上で表3と表7が同じアドレスを共有する。
         let map3 = scenario_for("map_3");
         assert_eq!(
-            map3.unit_value(UnitType::Bcopters, RomEvaluationMode::Restricted),
-            map3.unit_value(UnitType::Bcopters, RomEvaluationMode::Normal)
+            map3.unit_value(
+                PlayerId(1),
+                UnitType::Bcopters,
+                RomEvaluationMode::Restricted
+            ),
+            map3.unit_value(PlayerId(1), UnitType::Bcopters, RomEvaluationMode::Normal)
         );
     }
 
@@ -245,5 +272,68 @@ mod tests {
             scenario.production_limit(ProductionStrategy::Opening, UnitType::TransportHelicopter),
             3
         );
+    }
+
+    #[test]
+    fn generated_maps_and_ulysses_activate_rom_scenario_logic() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        for (map_name, opening_limit, opening_infantry) in
+            [("map_9", 3, 12), ("map_10", 3, 12), ("map_11", 2, 6)]
+        {
+            let (world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+                &master_data,
+                map_name,
+                GridTopology::Hex,
+            )
+            .unwrap();
+            let scenario = identify_scenario(world.resource::<Map>(), &master_data)
+                .unwrap_or_else(|| panic!("ROM scenario for {map_name} was not identified"));
+
+            assert_eq!(scenario.restricted_radius, 3);
+            assert_eq!(scenario.opening_limit, opening_limit);
+            assert_eq!(
+                scenario.production_limit(ProductionStrategy::Opening, UnitType::Infantry),
+                opening_infantry
+            );
+        }
+    }
+
+    #[test]
+    fn asymmetric_rom_profiles_are_kept_per_player() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master_data,
+            "map_52",
+            GridTopology::Hex,
+        )
+        .unwrap();
+        let scenario = identify_scenario(world.resource::<Map>(), &master_data).unwrap();
+
+        assert_eq!(
+            scenario.unit_value(PlayerId(1), UnitType::Missiles, RomEvaluationMode::Normal),
+            0
+        );
+        assert_eq!(
+            scenario.unit_value(PlayerId(2), UnitType::Missiles, RomEvaluationMode::Normal),
+            37
+        );
+    }
+
+    #[test]
+    fn every_master_map_activates_its_scenario_data() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        for map_number in 1..=53 {
+            let map_name = format!("map_{map_number}");
+            let (world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+                &master_data,
+                &map_name,
+                GridTopology::Hex,
+            )
+            .unwrap();
+            assert!(
+                identify_scenario(world.resource::<Map>(), &master_data).is_some(),
+                "ROM scenario for {map_name} was not identified"
+            );
+        }
     }
 }

@@ -142,17 +142,20 @@ pub struct LoadRecord {
 #[derive(Debug, Clone)]
 pub struct RomScenarioRecord {
     pub map_name: String,
+    /// `rom`はROM実測値、`generated:model`は未知マップを意味モデルから生成した値。
+    pub source: String,
     pub restricted_radius: u32,
     pub opening_limit: u32,
     pub recon_uses_mission_three: bool,
     pub strategic_objectives: [[(u8, u8); 2]; 2],
-    pub unit_value_profile: usize,
+    pub unit_value_profiles: [usize; 2],
     pub production_limits: [[u8; 24]; 4],
 }
 
 #[derive(Debug, Deserialize)]
 struct RomScenarioCsvRecord {
     map_name: String,
+    source: String,
     restricted_radius: u32,
     opening_limit: u32,
     recon_uses_mission_three: bool,
@@ -164,7 +167,8 @@ struct RomScenarioCsvRecord {
     player2_objective1_y: u8,
     player2_objective2_x: u8,
     player2_objective2_y: u8,
-    unit_value_profile: usize,
+    player1_unit_value_profile: usize,
+    player2_unit_value_profile: usize,
     opening_production_limits: String,
     disadvantage_production_limits: String,
     advantage_production_limits: String,
@@ -175,15 +179,22 @@ impl TryFrom<RomScenarioCsvRecord> for RomScenarioRecord {
     type Error = MasterDataError;
 
     fn try_from(record: RomScenarioCsvRecord) -> Result<Self, Self::Error> {
-        if record.unit_value_profile > 3 {
+        if record.source != "rom" && !record.source.starts_with("generated:") {
             return Err(MasterDataError::InvalidRomScenarioData(format!(
-                "{}: unit_value_profile must be 0..=3",
+                "{}: source must be rom or generated:<kind>",
+                record.map_name
+            )));
+        }
+        if record.player1_unit_value_profile > 3 || record.player2_unit_value_profile > 3 {
+            return Err(MasterDataError::InvalidRomScenarioData(format!(
+                "{}: player unit value profiles must be 0..=3",
                 record.map_name
             )));
         }
 
         Ok(Self {
             map_name: record.map_name.clone(),
+            source: record.source,
             restricted_radius: record.restricted_radius,
             opening_limit: record.opening_limit,
             recon_uses_mission_three: record.recon_uses_mission_three,
@@ -197,7 +208,10 @@ impl TryFrom<RomScenarioCsvRecord> for RomScenarioRecord {
                     (record.player2_objective2_x, record.player2_objective2_y),
                 ],
             ],
-            unit_value_profile: record.unit_value_profile,
+            unit_value_profiles: [
+                record.player1_unit_value_profile,
+                record.player2_unit_value_profile,
+            ],
             production_limits: [
                 parse_rom_production_limits(&record.map_name, &record.opening_production_limits)?,
                 parse_rom_production_limits(
@@ -493,6 +507,13 @@ impl MasterDataRegistry {
         self.maps.get(map_name)
     }
 
+    /// 組み込み済みマップ名を数値順で返す。CLI・MCPの選択肢で共通利用する。
+    pub fn map_names(&self) -> Vec<String> {
+        let mut names = self.maps.keys().cloned().collect::<Vec<_>>();
+        names.sort_by(|left, right| map_name_sort_key(left).cmp(&map_name_sort_key(right)));
+        names
+    }
+
     /// ROM互換AIが利用するマップ固有のシナリオ入力を返す。
     pub fn get_rom_scenario(&self, map_name: &str) -> Option<&RomScenarioRecord> {
         self.rom_scenarios.get(map_name)
@@ -640,6 +661,15 @@ impl MasterDataRegistry {
             loadable_unit_types: loadable,
         })
     }
+}
+
+/// `map_10` を `map_2` より後に並べるための自然順キー。
+fn map_name_sort_key(map_name: &str) -> (u32, &str) {
+    let number = map_name
+        .strip_prefix("map_")
+        .and_then(|suffix| suffix.parse::<u32>().ok())
+        .unwrap_or(u32::MAX);
+    (number, map_name)
 }
 
 fn parse_map(csv_data: &str) -> Result<MapData, MasterDataError> {
@@ -918,15 +948,23 @@ mod tests {
         let registry = MasterDataRegistry::load().unwrap();
 
         // マップ名はAIコードではなくrom_scenario.csvのmap_name列で対応付ける。
-        assert_eq!(registry.rom_scenarios.len(), 8);
-        for map_name in [
-            "map_1", "map_2", "map_3", "map_4", "map_5", "map_6", "map_7", "map_8",
-        ] {
+        assert_eq!(registry.rom_scenarios.len(), 53);
+        let map_names = registry.map_names();
+        assert_eq!(map_names.len(), 53);
+        assert_eq!(map_names.first().map(String::as_str), Some("map_1"));
+        assert_eq!(map_names.last().map(String::as_str), Some("map_53"));
+        for map_number in 1..=53 {
+            let map_name = format!("map_{map_number}");
             let scenario = registry
-                .get_rom_scenario(map_name)
+                .get_rom_scenario(&map_name)
                 .unwrap_or_else(|| panic!("ROM scenario for {map_name} is missing"));
             assert_eq!(scenario.map_name, map_name);
-            assert!(registry.get_map(map_name).is_some());
+            assert!(registry.get_map(&map_name).is_some());
+            if matches!(map_number, 9 | 10) {
+                assert_eq!(scenario.source, "generated:model");
+            } else {
+                assert_eq!(scenario.source, "rom");
+            }
         }
     }
 

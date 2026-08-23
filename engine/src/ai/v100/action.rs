@@ -395,7 +395,7 @@ pub(crate) fn decide_action(
     if evaluation_mode == super::rom_logic::RomEvaluationMode::Restricted {
         let own_capital = own_capital_position(&properties, player_id);
         let scenario = scenario.expect("restricted mode requires ROM scenario data");
-        units.sort_by_key(|unit| restricted_actor_priority(unit, own_capital, scenario));
+        units.sort_by_key(|unit| restricted_actor_priority(unit, own_capital, scenario, player_id));
     } else {
         units.sort_by_key(|unit| {
             actor_priority(
@@ -607,6 +607,7 @@ fn restricted_actor_priority(
     unit: &UnitView,
     own_capital: Option<GridPosition>,
     scenario: super::rom_data::RomScenarioData,
+    player_id: PlayerId,
 ) -> (u8, Reverse<u64>, u32) {
     if own_capital == Some(unit.position) {
         return (0, Reverse(0), unit.record_order);
@@ -618,6 +619,7 @@ fn restricted_actor_priority(
         .saturating_mul(99)
         .saturating_div(u64::from(unit.max_hp.max(1)));
     let value = u64::from(scenario.unit_value(
+        player_id,
         unit.stats.unit_type,
         super::rom_logic::RomEvaluationMode::Restricted,
     ))
@@ -1555,16 +1557,16 @@ mod tests {
         infantry.stats.unit_type = UnitType::Infantry;
 
         assert!(
-            restricted_actor_priority(&on_capital, Some(capital), scenario)
-                < restricted_actor_priority(&indirect, Some(capital), scenario)
+            restricted_actor_priority(&on_capital, Some(capital), scenario, PlayerId(1))
+                < restricted_actor_priority(&indirect, Some(capital), scenario, PlayerId(1))
         );
         assert!(
-            restricted_actor_priority(&indirect, Some(capital), scenario)
-                < restricted_actor_priority(&tank, Some(capital), scenario)
+            restricted_actor_priority(&indirect, Some(capital), scenario, PlayerId(1))
+                < restricted_actor_priority(&tank, Some(capital), scenario, PlayerId(1))
         );
         assert!(
-            restricted_actor_priority(&tank, Some(capital), scenario)
-                < restricted_actor_priority(&infantry, Some(capital), scenario)
+            restricted_actor_priority(&tank, Some(capital), scenario, PlayerId(1))
+                < restricted_actor_priority(&infantry, Some(capital), scenario, PlayerId(1))
         );
     }
 

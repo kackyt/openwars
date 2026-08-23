@@ -57,9 +57,10 @@ pub(crate) fn decide_production(
         for (position, faction, stats, health) in query.iter(world) {
             positions.insert((position.x, position.y));
             // ROM 6317/635Bは5152のシナリオ別兵種価値へレコード+8のHPを掛ける。
-            let force_value = u64::from(scenario.unit_value(stats.unit_type, evaluation_mode))
-                .saturating_mul(u64::from(health.current))
-                / u64::from(health.max.max(1));
+            let force_value =
+                u64::from(scenario.unit_value(faction.0, stats.unit_type, evaluation_mode))
+                    .saturating_mul(u64::from(health.current))
+                    / u64::from(health.max.max(1));
             if faction.0 == player_id {
                 *friendly.entry(stats.unit_type).or_default() += 1;
                 own_value = own_value.saturating_add(force_value);
@@ -242,7 +243,7 @@ pub(crate) fn decide_production(
         } else if strategy == super::rom_logic::ProductionStrategy::Opening {
             // ROM 6367: 5152(kind, 99) × 残り保有枠。
             scenario
-                .unit_value(unit_type, evaluation_mode)
+                .unit_value(player_id, unit_type, evaluation_mode)
                 .saturating_mul(99)
                 .saturating_mul(remaining)
         } else {
@@ -341,7 +342,11 @@ fn restricted_production_score(
         .any(|capital| capital.x == command.target_x && capital.y == command.target_y);
     if produced_at_capital {
         return scenario
-            .unit_value(unit_type, super::rom_logic::RomEvaluationMode::Restricted)
+            .unit_value(
+                command.player_id,
+                unit_type,
+                super::rom_logic::RomEvaluationMode::Restricted,
+            )
             .saturating_mul(99);
     }
     if let Some(target) = restricted_target {
@@ -356,7 +361,11 @@ fn restricted_production_score(
         return damage.saturating_mul(enemy_counts.get(&target).copied().unwrap_or_default() + 1);
     }
     scenario
-        .unit_value(unit_type, super::rom_logic::RomEvaluationMode::Restricted)
+        .unit_value(
+            command.player_id,
+            unit_type,
+            super::rom_logic::RomEvaluationMode::Restricted,
+        )
         .saturating_mul(99)
 }
 

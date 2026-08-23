@@ -361,8 +361,8 @@ pub struct App {
 impl App {
     pub fn new() -> anyhow::Result<Self> {
         let master_data = MasterDataRegistry::load()?;
-        let mut map_names: Vec<String> = master_data.maps.keys().cloned().collect();
-        map_names.sort();
+        // マップ名の列挙は、組み込みマスターデータを唯一の情報源とする。
+        let map_names = master_data.map_names();
 
         Ok(Self {
             master_data,
@@ -1646,6 +1646,21 @@ mod tests {
         assert_eq!(state.ai_version(1), CliAiVersion::V3);
         assert_eq!(state.ai_version(2), CliAiVersion::V3);
         assert_eq!(state.control_label(2), "AI(V3)");
+    }
+
+    #[test]
+    fn cli_exposes_every_embedded_map_through_map_53() {
+        let app = App::new().expect("master data should load");
+
+        assert_eq!(app.ui_state.available_maps.len(), 53);
+        assert_eq!(
+            app.ui_state.available_maps.first().map(String::as_str),
+            Some("map_1")
+        );
+        assert_eq!(
+            app.ui_state.available_maps.last().map(String::as_str),
+            Some("map_53")
+        );
     }
 
     #[test]
