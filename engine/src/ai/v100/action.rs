@@ -232,7 +232,13 @@ pub(crate) fn decide_action(
             );
             if faction.0 == player_id {
                 friendly_by_position.insert((position.x, position.y), entity);
-                if !moved.0 && !completed.0 && !skipped.contains(&entity) {
+                // ROM 5678〜5687の命令08は2つの積荷の降車方向を1バイトへ
+                // 同時に格納する。OpenWarsは1積荷ずつ逐次処理するため、1人目を
+                // 降ろして移動済みでも未完了の積荷が残る輸送役だけは再選択する。
+                let continues_rom_drop = moved.0
+                    && !completed.0
+                    && cargo.is_some_and(|capacity| !capacity.loaded.is_empty());
+                if (!moved.0 || continues_rom_drop) && !completed.0 && !skipped.contains(&entity) {
                     units.push(UnitView {
                         entity,
                         record_order: 0,
@@ -297,14 +303,11 @@ pub(crate) fn decide_action(
             player_id,
         )
     };
-    let mission_assignments = world
-        .get_resource::<ObjectiveAssignmentState>()
-        .and_then(|state| state.mission_by_player.get(&player_id))
-        .cloned()
-        .unwrap_or_default();
-    let mission_three_transports: HashSet<_> = mission_assignments
+    // ROM 553Dは輸送役の目標ではなく、各積荷レコード+13/+14の座標から
+    // 降車用の経路場を個別に作る。積荷は盤外でもレコード目標を保持する。
+    let cargo_objectives: HashMap<_, _> = objective_assignments
         .iter()
-        .filter_map(|(entity, mission)| (mission & 0x03 == 3).then_some(*entity))
+        .filter_map(|(entity, objective)| objective.position().map(|position| (*entity, position)))
         .collect();
     let mut enemies: Vec<_> = {
         let mut query = world.query::<(
@@ -406,20 +409,41 @@ pub(crate) fn decide_action(
             )
         });
     }
+    // ROMでは2積荷の降車が同じ命令08に含まれる。逐次イベントへ写像した
+    // 2人目の降車を他部隊の行動より先に完了し、盤面介入で結果を変えない。
+    units.sort_by_key(|unit| {
+        !world
+            .get::<HasMoved>(unit.entity)
+            .is_some_and(|moved| moved.0)
+    });
 
     if let Some(actor) = units.into_iter().next() {
+        let continues_rom_drop = world
+            .get::<HasMoved>(actor.entity)
+            .is_some_and(|moved| moved.0);
         let actor_objective = restricted_target
             .map(|enemy| enemy.position)
             .or_else(|| movement_objectives.get(&actor.entity).copied());
-        let candidates = build_candidate_field(
-            &map,
-            &occupants,
-            actor.position,
-            &actor.stats,
-            actor.fuel,
-            player_id,
-            &master_data,
-        );
+        let candidates = if world
+            .get::<HasMoved>(actor.entity)
+            .is_some_and(|moved| moved.0)
+        {
+            // 2人目の降車はROMの同一命令内なので、輸送役を再移動させない。
+            vec![CandidateTile {
+                position: actor.position,
+                movement_cost: 0,
+            }]
+        } else {
+            build_candidate_field(
+                &map,
+                &occupants,
+                actor.position,
+                &actor.stats,
+                actor.fuel,
+                player_id,
+                &master_data,
+            )
+        };
 
         // 制限モードは4E55へ直接入り、通常側のCapture/Drop/Load/Mergeを迂回する。
         // 通常時だけ4A1E以降の順序を適用する。
@@ -428,14 +452,13 @@ pub(crate) fn decide_action(
         {
             return Some((actor.entity, command));
         }
-        if evaluation_mode == super::rom_logic::RomEvaluationMode::Normal
+        if (evaluation_mode == super::rom_logic::RomEvaluationMode::Normal || continues_rom_drop)
             && super::compatibility_profile::is_gbw_transport(&actor.stats)
             && let Some(command) = super::transport::choose_transport_action(
                 world,
                 actor.entity,
                 &candidates,
-                actor_objective,
-                mission_assignments.get(&actor.entity).copied(),
+                &cargo_objectives,
                 player_id,
                 version,
             )
@@ -444,13 +467,12 @@ pub(crate) fn decide_action(
         }
         if evaluation_mode == super::rom_logic::RomEvaluationMode::Normal {
             // ROM 51DAは個別目標までの距離C69Eを687Cの兵種別閾値と比較する。
-            // 到達不能値はROMの0x40へ丸め、近距離部隊を輸送需要へ誤算入しない。
+            // 経路場に値がない場合はROMと同じ到達不能番兵0xFFを使う。
             let pickup_distance = objective_route_costs
                 .get(&actor.entity)
-                .copied()
-                .unwrap_or(0x40)
-                .min(0x40);
-            let searches_for_transport = pickup_distance
+                .and_then(|distance| u8::try_from(*distance).ok())
+                .unwrap_or(0xFF);
+            let searches_for_transport = u32::from(pickup_distance)
                 >= super::rom_logic::GbUnitKind::pickup_distance_threshold(actor.stats.unit_type);
             if searches_for_transport
                 && super::rom_logic::GbUnitKind::increments_pickup_counter(actor.stats.unit_type)
@@ -460,11 +482,12 @@ pub(crate) fn decide_action(
                     .get_resource_or_insert_with(super::rom_logic::RomAiState::default)
                     .record_pickup_candidate(player_id);
             }
-            // ROM 51ECで一度bit 5を立てた後、搭載先がなければ52E1で解除する。
-            // 制限モードの51BFは即座に失敗し、このbitには触れない。
+            // ROM 51ECは距離閾値以上ならbit 5を立て、52E1は閾値未満なら解除する。
+            // 搭載先の有無では更新されない。搭載成立時だけ52D7で解除される。
+            // 制限モードの51BFはこのbitに触れない。
             world
                 .get_resource_or_insert_with(super::rom_logic::RomAiState::default)
-                .set_pickup_eligible(player_id, actor.entity, false);
+                .set_pickup_eligible(player_id, actor.entity, searches_for_transport);
             if searches_for_transport {
                 // 通常候補は自軍占有マスを除くため、搭載候補場だけを51BF用に別生成する。
                 let load_candidates = build_load_candidate_field(
@@ -480,9 +503,15 @@ pub(crate) fn decide_action(
                     world,
                     actor.entity,
                     &load_candidates,
-                    &mission_three_transports,
+                    pickup_distance,
                     player_id,
                 ) {
+                    // ROM 52D7は搭載命令0x0Dを発行する直前に乗客のbit 5を解除する。
+                    // 降車処理2C25はこのbitを変更しないため、次手番に先行する空輸送役が
+                    // 直前に降ろした乗客を集合対象へ戻さないためにもこの遷移が必要である。
+                    world
+                        .get_resource_or_insert_with(super::rom_logic::RomAiState::default)
+                        .set_pickup_eligible(player_id, actor.entity, false);
                     return Some((actor.entity, command));
                 }
             }
@@ -1284,8 +1313,23 @@ fn choose_wait(
     let route_distances = fallback_route_distances
         .as_ref()
         .or(normal_route_distances.as_ref());
+    // ROMの港・浅瀬走査は輸送待ち経路の基準点であり、港を占有し続ける指示ではない。
+    // OpenWarsでは占有中の港に艦船を生産できないため、代替経路を使う陸上部隊は
+    // 移動可能な非港マスがある限り港の隣で待ち、生産と次ターンの搭載を両立させる。
+    let keep_production_port_open = used_fallback
+        && actor.stats.movement_type != MovementType::Ship
+        && candidates.iter().any(|candidate| {
+            map.get_terrain(candidate.position.x, candidate.position.y)
+                != Some(crate::resources::Terrain::Port)
+        });
     let mut best: Option<(u32, GridPosition)> = None;
     for candidate in candidates {
+        if keep_production_port_open
+            && map.get_terrain(candidate.position.x, candidate.position.y)
+                == Some(crate::resources::Terrain::Port)
+        {
+            continue;
+        }
         let key = movement_objective.map(|objective| {
             route_distances
                 .and_then(|distances| distances.get(&candidate.position))
@@ -2079,6 +2123,46 @@ mod tests {
                 target_pos: GridPosition { x: 7, y: 5 }
             }
         ));
+    }
+
+    #[test]
+    fn fallback_wait_keeps_port_open_for_transport_production() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let mut map = Map::new(6, 3, Terrain::Sea, crate::resources::GridTopology::Hex);
+        let port = GridPosition { x: 1, y: 1 };
+        map.set_terrain(port.x, port.y, Terrain::Port).unwrap();
+        map.set_terrain(1, 0, Terrain::Plains).unwrap();
+        map.set_terrain(0, 1, Terrain::Plains).unwrap();
+        map.set_terrain(5, 1, Terrain::City).unwrap();
+        let mut actor = unit(0, MovementType::Infantry, port);
+        actor.stats.max_movement = 3;
+        let candidates = build_candidate_field(
+            &map,
+            &HashMap::new(),
+            actor.position,
+            &actor.stats,
+            actor.fuel,
+            PlayerId(1),
+            &master_data,
+        );
+
+        let (command, used_fallback) = choose_wait(
+            &actor,
+            &candidates,
+            Some(GridPosition { x: 5, y: 1 }),
+            &map,
+            &master_data,
+        );
+
+        assert!(used_fallback);
+        let AiCommand::Wait { target_pos } = command else {
+            panic!("輸送待機ではWaitを選ぶ");
+        };
+        assert_ne!(target_pos, port);
+        assert_ne!(
+            map.get_terrain(target_pos.x, target_pos.y),
+            Some(Terrain::Port)
+        );
     }
 
     #[test]

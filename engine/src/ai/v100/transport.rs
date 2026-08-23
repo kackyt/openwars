@@ -37,18 +37,15 @@ pub(crate) fn choose_transport_action(
     world: &mut World,
     actor: Entity,
     candidates: &[CandidateTile],
-    assigned_objective: Option<GridPosition>,
-    mission: Option<u8>,
+    cargo_objectives: &HashMap<Entity, GridPosition>,
     player_id: PlayerId,
     version: AiVersion,
 ) -> Option<AiCommand> {
     let cargo = world.get::<CargoCapacity>(actor)?.loaded.clone();
     let actor_stats = world.get::<UnitStats>(actor)?.clone();
     if cargo.is_empty() {
-        // ROM 532E〜533Aは空輸送部隊の集合移動を任務状態3だけに限定する。
-        if mission.is_none_or(|value| value & 0x03 != 3) {
-            return None;
-        }
+        // ROM 532E〜533Aは任務番号ではなく、部隊レコード+12の行動状態を検査する。
+        // decide_actionが未行動の主体だけを渡すため、ここでは追加の近似状態を持たない。
         // ROM 530Cで乗客へ接近するのは装甲車、レーダー輸送機、輸送ヘリ、輸送船だけ。
         // OpenWarsにレーダー輸送機はない。空母は航空機側からの直接搭載だけを行う。
         if !matches!(
@@ -66,7 +63,7 @@ pub(crate) fn choose_transport_action(
             actor,
             &cargo,
             candidates,
-            assigned_objective,
+            cargo_objectives,
             player_id,
             version,
         )
@@ -78,7 +75,7 @@ pub(crate) fn choose_load(
     world: &mut World,
     actor: Entity,
     candidates: &[CandidateTile],
-    mission_three_transports: &HashSet<Entity>,
+    objective_distance: u8,
     player_id: PlayerId,
 ) -> Option<AiCommand> {
     let actor_type = world.get::<UnitStats>(actor)?.unit_type;
@@ -92,18 +89,38 @@ pub(crate) fn choose_load(
         &GridPosition,
         &Faction,
         &UnitStats,
+        &Health,
+        &HasMoved,
+        &ActionCompleted,
         &CargoCapacity,
         Option<&Transporting>,
     )>();
-    for (entity, position, faction, stats, cargo, transporting) in query.iter(world) {
+    for (entity, position, faction, stats, health, moved, completed, cargo, transporting) in
+        query.iter(world)
+    {
+        let gb_health = health
+            .current
+            .saturating_mul(99)
+            .checked_div(health.max.max(1))
+            .unwrap_or_default();
         if faction.0 == player_id
             && transporting.is_none()
             && super::compatibility_profile::is_gbw_transport(stats)
-            // ROM 524C〜5250は搭載先レコードの任務状態も3に限定する。
-            && mission_three_transports.contains(&entity)
+            // ROM 5240〜5250は搭載先レコード+12のbit 4/6を除外し、
+            // 下位2bitが3（未行動）の輸送役だけを許す。降車済み輸送役への
+            // 同一ターン再搭載をOpenWarsの行動状態へそのまま対応させる。
+            && !moved.0
+            && !completed.0
             && cargo.loaded.len() < cargo.max as usize
             && stats.loadable_unit_types.contains(&actor_type)
             && candidate_positions.contains(&(position.x, position.y))
+            // ROM 5252はHPが0x32未満の輸送部隊を搭載先から除外する。
+            && gb_health >= 0x32
+            // ROM 5284〜529Bでは歩兵系が輸送船へ乗るのは目標場が
+            // 0xFF（陸路到達不能）の場合だけ。単に遠い陸路では船へ戻らない。
+            && !(matches!(actor_type, crate::resources::UnitType::Infantry | crate::resources::UnitType::Mech)
+                && stats.unit_type == crate::resources::UnitType::Lander
+                && objective_distance != 0xFF)
         {
             targets.push((position.y, position.x, entity.index(), entity, *position));
         }
@@ -265,7 +282,7 @@ fn choose_loaded_action(
     actor: Entity,
     cargo: &[Entity],
     candidates: &[CandidateTile],
-    assigned_objective: Option<GridPosition>,
+    cargo_objectives: &HashMap<Entity, GridPosition>,
     _player_id: PlayerId,
     version: AiVersion,
 ) -> Option<AiCommand> {
@@ -275,25 +292,25 @@ fn choose_loaded_action(
     let cargo_views: Vec<_> = cargo
         .iter()
         .filter_map(|entity| {
+            let objective = cargo_objectives.get(entity).copied()?;
             world
                 .get::<UnitStats>(*entity)
-                .map(|stats| (*entity, stats.movement_type))
+                .map(|stats| (*entity, stats.movement_type, objective))
         })
         .collect();
     if cargo_views.is_empty() {
         return None;
     }
-    let objective = assigned_objective?;
     let movement = actor_stats
         .max_movement
         .saturating_sub(super::rom_logic::movement_evaluation_penalty(version))
         .max(2);
     let cargo_route_fields: HashMap<_, _> = cargo_views
         .iter()
-        .map(|(entity, movement_type)| {
+        .map(|(entity, movement_type, objective)| {
             (
                 *entity,
-                build_route_field(&map, &master_data, objective, *movement_type),
+                build_route_field(&map, &master_data, *objective, *movement_type),
             )
         })
         .collect();
@@ -326,7 +343,7 @@ fn choose_loaded_action(
     // GB版は搭載順に降車可能性を調べる。先頭が降ろせない場合にも、後続の
     // 搭載ユニットまで走査を続ける。ただしROM 553D〜5675と同様、通常移動で
     // 目的側の上陸地点へ到達した候補だけを降車対象にする。
-    for (cargo_entity, _) in &cargo_views {
+    for (cargo_entity, _, _) in &cargo_views {
         let route_field = cargo_route_fields.get(cargo_entity)?;
         let mut best_drop: Option<(GridPosition, GridPosition)> = None;
         for candidate in candidates
@@ -364,6 +381,36 @@ fn choose_loaded_action(
                 cargo_drop_pos,
                 cargo_entity: *cargo_entity,
             });
+        }
+    }
+
+    if actor_stats.unit_type == crate::resources::UnitType::Lander {
+        // ROM 4904〜495Bは積荷の目標場を輸送船用の疑似兵種へ変換し、
+        // 積荷が陸路で到達できる港と現在の海域を接続する。陸上目標へ最も
+        // 近い海面へ寄せるだけでは、map_41のような島で港以外へ停滞してしまう。
+        let destination_ports: Vec<_> = (0..map.height)
+            .flat_map(|y| (0..map.width).map(move |x| GridPosition { x, y }))
+            .filter(|position| {
+                map.get_terrain(position.x, position.y) == Some(Terrain::Port)
+                    && cargo_route_fields
+                        .values()
+                        .any(|field| field.get(position).is_some_and(|cost| *cost < 0x40))
+            })
+            .collect();
+        if !destination_ports.is_empty() {
+            let route_field = build_route_field_to_any(
+                &map,
+                &master_data,
+                &destination_ports,
+                actor_stats.movement_type,
+            );
+            let legal_candidates: Vec<_> = candidates
+                .iter()
+                .copied()
+                .filter(|candidate| candidate.movement_cost <= movement)
+                .collect();
+            let target_pos = select_route_progress_candidate(&legal_candidates, &route_field)?;
+            return Some(AiCommand::Wait { target_pos });
         }
     }
 
@@ -568,6 +615,12 @@ mod tests {
                     max: 2,
                     loaded: Vec::new(),
                 },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                HasMoved(true),
+                ActionCompleted(false),
             ))
             .id();
         let candidates = [CandidateTile {
@@ -576,24 +629,12 @@ mod tests {
         }];
 
         assert!(
-            choose_load(
-                &mut world,
-                passenger,
-                &candidates,
-                &HashSet::new(),
-                PlayerId(1),
-            )
-            .is_none(),
-            "任務3ではない輸送先をROM 524Cが拒否する"
+            choose_load(&mut world, passenger, &candidates, 0xFF, PlayerId(1),).is_none(),
+            "移動済みの輸送先をROM 524Cが拒否する"
         );
-        let command = choose_load(
-            &mut world,
-            passenger,
-            &candidates,
-            &HashSet::from([lander]),
-            PlayerId(1),
-        )
-        .unwrap();
+        world.get_mut::<HasMoved>(lander).unwrap().0 = false;
+        world.get_mut::<ActionCompleted>(lander).unwrap().0 = false;
+        let command = choose_load(&mut world, passenger, &candidates, 0xFF, PlayerId(1)).unwrap();
 
         assert!(matches!(
             command,
@@ -602,6 +643,11 @@ mod tests {
                 transport_entity,
             } if target_pos == pickup_port && transport_entity == lander
         ));
+
+        assert!(
+            choose_load(&mut world, passenger, &candidates, 12, PlayerId(1),).is_none(),
+            "ROM 5294は陸路距離が有限の歩兵を輸送船へ再搭載しない"
+        );
     }
 
     #[test]
@@ -647,13 +693,17 @@ mod tests {
             position: actor_position,
             movement_cost: 0,
         }];
+        let cargo_objectives = HashMap::from([
+            (first_cargo, GridPosition { x: 0, y: 0 }),
+            (second_cargo, GridPosition { x: 2, y: 1 }),
+        ]);
 
         let command = choose_loaded_action(
             &mut world,
             actor,
             &[first_cargo, second_cargo],
             &candidates,
-            Some(GridPosition { x: 2, y: 1 }),
+            &cargo_objectives,
             PlayerId(1),
             AiVersion::V100,
         )
@@ -730,13 +780,14 @@ mod tests {
                 movement_cost: 1,
             },
         ];
+        let cargo_objectives = HashMap::from([(cargo, objective)]);
 
         let command = choose_loaded_action(
             &mut world,
             actor,
             &[cargo],
             &candidates,
-            Some(objective),
+            &cargo_objectives,
             PlayerId(1),
             AiVersion::V100,
         )
@@ -752,14 +803,16 @@ mod tests {
     }
 
     #[test]
-    fn loaded_lander_leaves_route_progress_to_normal_movement() {
+    fn loaded_lander_routes_to_port_connected_to_cargo_objective() {
         let mut world = World::new();
         let mut map = Map::new(9, 7, Terrain::Sea, GridTopology::Hex);
-        // 施設へ直進すると陸壁の手前で止まるが、南端の浅瀬からは降車できる形にする。
+        // 施設へ直進すると西岸で止まるが、南端の港からだけ上陸できる形にする。
         for y in 0..6 {
-            map.set_terrain(5, y, Terrain::Plains).unwrap();
+            for x in 5..9 {
+                map.set_terrain(x, y, Terrain::Plains).unwrap();
+            }
         }
-        map.set_terrain(5, 6, Terrain::Shoal).unwrap();
+        map.set_terrain(5, 6, Terrain::Port).unwrap();
         map.set_terrain(6, 1, Terrain::City).unwrap();
         let master_data = MasterDataRegistry::load().unwrap();
         world.insert_resource(map);
@@ -799,17 +852,24 @@ mod tests {
             },
         ];
         let objective = GridPosition { x: 6, y: 1 };
+        let cargo_objectives = HashMap::from([(cargo, objective)]);
 
         let command = choose_loaded_action(
             &mut world,
             actor,
             &[cargo],
             &candidates,
-            Some(objective),
+            &cargo_objectives,
             PlayerId(1),
             AiVersion::V100,
-        );
+        )
+        .unwrap();
 
-        assert!(command.is_none());
+        assert!(matches!(
+            command,
+            AiCommand::Wait {
+                target_pos: GridPosition { x: 4, y: 2 }
+            }
+        ));
     }
 }
