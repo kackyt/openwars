@@ -191,12 +191,25 @@ impl ProductionStrategy {
     }
 }
 
+/// ROM WRAM C6A6が選ぶ兵種価値表の組。
+///
+/// Bank 2 `5179`は通常時にシナリオプロファイルへ4を加えて表4〜7を読み、
+/// 自軍首都へ敵が接近した時だけ加算せず表0〜3を読む。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum RomEvaluationMode {
+    #[default]
+    Normal,
+    Restricted,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct RomPlayerState {
     production_strategy: Option<ProductionStrategy>,
     action_turn: Option<u32>,
     mobility_shortage_count: u8,
     pickup_candidate_count: u8,
+    evaluation_mode: RomEvaluationMode,
+    restricted_target: Option<UnitType>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +286,30 @@ impl RomAiState {
             state.mobility_shortage_count = 0;
             state.pickup_candidate_count = 0;
         }
+    }
+
+    /// ROM 4453〜4475と同じく、行動選択を始めるたびにC6A6相当値を上書きする。
+    pub(crate) fn set_evaluation_mode(
+        &mut self,
+        player_id: PlayerId,
+        mode: RomEvaluationMode,
+        restricted_target: Option<UnitType>,
+    ) {
+        let state = self.by_player.entry(player_id).or_default();
+        state.evaluation_mode = mode;
+        state.restricted_target = restricted_target;
+    }
+
+    pub(crate) fn evaluation_mode_for(&self, player_id: PlayerId) -> RomEvaluationMode {
+        self.by_player
+            .get(&player_id)
+            .map_or(RomEvaluationMode::Normal, |state| state.evaluation_mode)
+    }
+
+    pub(crate) fn restricted_target_for(&self, player_id: PlayerId) -> Option<UnitType> {
+        self.by_player
+            .get(&player_id)
+            .and_then(|state| state.restricted_target)
     }
 
     pub(crate) fn record_pickup_candidate(&mut self, player_id: PlayerId) {
@@ -604,6 +641,23 @@ mod tests {
 
         state.begin_action_turn(player, 3);
         assert_eq!(state.production_counters(player), (0, 0));
+    }
+
+    #[test]
+    fn restricted_mode_keeps_the_rom_target_for_the_following_production_step() {
+        let mut state = RomAiState::default();
+        let player = PlayerId(1);
+        state.set_evaluation_mode(player, RomEvaluationMode::Restricted, Some(UnitType::Recon));
+
+        assert_eq!(
+            state.evaluation_mode_for(player),
+            RomEvaluationMode::Restricted
+        );
+        assert_eq!(state.restricted_target_for(player), Some(UnitType::Recon));
+
+        state.set_evaluation_mode(player, RomEvaluationMode::Normal, None);
+        assert_eq!(state.evaluation_mode_for(player), RomEvaluationMode::Normal);
+        assert_eq!(state.restricted_target_for(player), None);
     }
 
     #[test]

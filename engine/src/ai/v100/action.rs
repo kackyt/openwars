@@ -13,7 +13,7 @@ use crate::components::{
     ActionCompleted, Ammo, Faction, Fuel, GridPosition, HasMoved, Health, PlayerId, Property,
     UnitStats,
 };
-use crate::resources::{DamageChart, Map, MasterDataRegistry, MatchState, MovementType};
+use crate::resources::{DamageChart, Map, MasterDataRegistry, MatchState, MovementType, Terrain};
 use crate::systems::combat::get_expected_damage;
 use crate::systems::movement::OccupantInfo;
 use bevy_ecs::prelude::*;
@@ -157,6 +157,7 @@ pub(crate) fn decide_action(
     let map = world.get_resource::<Map>()?.clone();
     let master_data = world.get_resource::<MasterDataRegistry>()?.clone();
     let damage_chart = world.get_resource::<DamageChart>()?.clone();
+    let scenario = super::rom_data::identify_scenario(&map, &master_data);
     let version = crate::ai::resolve_player_ai_version(world, player_id);
     let turn = world.get_resource::<MatchState>()?.current_turn_number.0;
     world
@@ -330,6 +331,27 @@ pub(crate) fn decide_action(
     };
     // ROM 1F44は敵の固定長レコードを先頭から列挙する。盤面座標順ではない。
     enemies.sort_by_key(|enemy| super::unit_record::record_order(world, enemy.entity));
+    let restricted_target = scenario.and_then(|scenario| {
+        select_restricted_mode_target(
+            &enemies,
+            &properties,
+            &map,
+            player_id,
+            scenario.restricted_radius,
+        )
+    });
+    let evaluation_mode = if restricted_target.is_some() {
+        super::rom_logic::RomEvaluationMode::Restricted
+    } else {
+        super::rom_logic::RomEvaluationMode::Normal
+    };
+    world
+        .get_resource_or_insert_with(super::rom_logic::RomAiState::default)
+        .set_evaluation_mode(
+            player_id,
+            evaluation_mode,
+            restricted_target.map(|enemy| enemy.stats.unit_type),
+        );
     let influence_field = rom_influence_for_turn(world, player_id, turn, &map, &enemies);
     let movement_objectives: HashMap<_, _> = units
         .iter()
@@ -370,16 +392,25 @@ pub(crate) fn decide_action(
             ))
         })
         .collect();
-    units.sort_by_key(|unit| {
-        actor_priority(
-            unit,
-            &property_positions,
-            movement_objectives.get(&unit.entity).copied(),
-            objective_route_costs.get(&unit.entity).copied(),
-        )
-    });
+    if evaluation_mode == super::rom_logic::RomEvaluationMode::Restricted {
+        let own_capital = own_capital_position(&properties, player_id);
+        let scenario = scenario.expect("restricted mode requires ROM scenario data");
+        units.sort_by_key(|unit| restricted_actor_priority(unit, own_capital, scenario));
+    } else {
+        units.sort_by_key(|unit| {
+            actor_priority(
+                unit,
+                &property_positions,
+                movement_objectives.get(&unit.entity).copied(),
+                objective_route_costs.get(&unit.entity).copied(),
+            )
+        });
+    }
 
     if let Some(actor) = units.into_iter().next() {
+        let actor_objective = restricted_target
+            .map(|enemy| enemy.position)
+            .or_else(|| movement_objectives.get(&actor.entity).copied());
         let candidates = build_candidate_field(
             &map,
             &occupants,
@@ -390,17 +421,20 @@ pub(crate) fn decide_action(
             &master_data,
         );
 
-        // ROM 4A1E以降はCapture(58D2)→Drop(553D)→Load/輸送接近(51BF)
-        // →Attack(5690)→Merge(5D36)→通常移動(4B91)の順に試す。
-        if let Some(command) = choose_capture(&actor, &candidates, &properties, player_id) {
+        // 制限モードは4E55へ直接入り、通常側のCapture/Drop/Load/Mergeを迂回する。
+        // 通常時だけ4A1E以降の順序を適用する。
+        if evaluation_mode == super::rom_logic::RomEvaluationMode::Normal
+            && let Some(command) = choose_capture(&actor, &candidates, &properties, player_id)
+        {
             return Some((actor.entity, command));
         }
-        if super::compatibility_profile::is_gbw_transport(&actor.stats)
+        if evaluation_mode == super::rom_logic::RomEvaluationMode::Normal
+            && super::compatibility_profile::is_gbw_transport(&actor.stats)
             && let Some(command) = super::transport::choose_transport_action(
                 world,
                 actor.entity,
                 &candidates,
-                movement_objectives.get(&actor.entity).copied(),
+                actor_objective,
                 mission_assignments.get(&actor.entity).copied(),
                 player_id,
                 version,
@@ -408,47 +442,49 @@ pub(crate) fn decide_action(
         {
             return Some((actor.entity, command));
         }
-        // ROM 51DAは個別目標までの距離C69Eを687Cの兵種別閾値と比較する。
-        // 到達不能値はROMの0x40へ丸め、近距離部隊を輸送需要へ誤算入しない。
-        let pickup_distance = objective_route_costs
-            .get(&actor.entity)
-            .copied()
-            .unwrap_or(0x40)
-            .min(0x40);
-        let searches_for_transport = pickup_distance
-            >= super::rom_logic::GbUnitKind::pickup_distance_threshold(actor.stats.unit_type);
-        if searches_for_transport
-            && super::rom_logic::GbUnitKind::increments_pickup_counter(actor.stats.unit_type)
-        {
-            // ROM 51E1〜51EBでは距離ゲートを通過した歩兵系だけがC6A5を増やす。
+        if evaluation_mode == super::rom_logic::RomEvaluationMode::Normal {
+            // ROM 51DAは個別目標までの距離C69Eを687Cの兵種別閾値と比較する。
+            // 到達不能値はROMの0x40へ丸め、近距離部隊を輸送需要へ誤算入しない。
+            let pickup_distance = objective_route_costs
+                .get(&actor.entity)
+                .copied()
+                .unwrap_or(0x40)
+                .min(0x40);
+            let searches_for_transport = pickup_distance
+                >= super::rom_logic::GbUnitKind::pickup_distance_threshold(actor.stats.unit_type);
+            if searches_for_transport
+                && super::rom_logic::GbUnitKind::increments_pickup_counter(actor.stats.unit_type)
+            {
+                // ROM 51E1〜51EBでは距離ゲートを通過した歩兵系だけがC6A5を増やす。
+                world
+                    .get_resource_or_insert_with(super::rom_logic::RomAiState::default)
+                    .record_pickup_candidate(player_id);
+            }
+            // ROM 51ECで一度bit 5を立てた後、搭載先がなければ52E1で解除する。
+            // 制限モードの51BFは即座に失敗し、このbitには触れない。
             world
                 .get_resource_or_insert_with(super::rom_logic::RomAiState::default)
-                .record_pickup_candidate(player_id);
-        }
-        // ROM 51ECで一度bit 5を立てた後、搭載先がなければ52E1で解除する。
-        // この後の攻撃・合流・通常移動へ進んだ歩兵系は、次の輸送集合計算から外れる。
-        world
-            .get_resource_or_insert_with(super::rom_logic::RomAiState::default)
-            .set_pickup_eligible(player_id, actor.entity, false);
-        if searches_for_transport {
-            // 通常候補は自軍占有マスを除くため、搭載候補場だけを51BF用に別生成する。
-            let load_candidates = build_load_candidate_field(
-                &map,
-                &occupants,
-                actor.position,
-                &actor.stats,
-                actor.fuel,
-                player_id,
-                &master_data,
-            );
-            if let Some(command) = super::transport::choose_load(
-                world,
-                actor.entity,
-                &load_candidates,
-                &mission_three_transports,
-                player_id,
-            ) {
-                return Some((actor.entity, command));
+                .set_pickup_eligible(player_id, actor.entity, false);
+            if searches_for_transport {
+                // 通常候補は自軍占有マスを除くため、搭載候補場だけを51BF用に別生成する。
+                let load_candidates = build_load_candidate_field(
+                    &map,
+                    &occupants,
+                    actor.position,
+                    &actor.stats,
+                    actor.fuel,
+                    player_id,
+                    &master_data,
+                );
+                if let Some(command) = super::transport::choose_load(
+                    world,
+                    actor.entity,
+                    &load_candidates,
+                    &mission_three_transports,
+                    player_id,
+                ) {
+                    return Some((actor.entity, command));
+                }
             }
         }
         if let Some(command) = choose_attack(
@@ -467,7 +503,8 @@ pub(crate) fn decide_action(
             return Some((actor.entity, command));
         }
         // ROM 5D36はIQ200だけが通る同種部隊合流分岐。
-        if version == AiVersion::V200
+        if evaluation_mode == super::rom_logic::RomEvaluationMode::Normal
+            && version == AiVersion::V200
             && let Some(command) = choose_merge(
                 &actor,
                 &map,
@@ -480,21 +517,17 @@ pub(crate) fn decide_action(
         {
             return Some((actor.entity, command));
         }
-        let (command, used_fallback) = choose_wait(
-            &actor,
-            &candidates,
-            movement_objectives.get(&actor.entity).copied(),
-            &map,
-            &master_data,
-        );
-        if used_fallback {
+        let (command, used_fallback) =
+            choose_wait(&actor, &candidates, actor_objective, &map, &master_data);
+        if evaluation_mode == super::rom_logic::RomEvaluationMode::Normal && used_fallback {
             // ROM 4B91の通常経路移動が失敗し、4D86の特殊移動が成立すると4E4Dで
             // bit 5を再設定する。島や遮断地形に残った歩兵が輸送対象へ戻る分岐である。
             world
                 .get_resource_or_insert_with(super::rom_logic::RomAiState::default)
                 .set_pickup_eligible(player_id, actor.entity, true);
         }
-        if used_fallback
+        if evaluation_mode == super::rom_logic::RomEvaluationMode::Normal
+            && used_fallback
             && super::rom_logic::GbUnitKind::increments_mobility_shortage_counter(
                 actor.stats.unit_type,
             )
@@ -530,6 +563,66 @@ fn actor_priority(
     }
     // それ以前の7本は各々レコード0から昇順に走査し、最初の一致で終了する。
     (pass as u8, 0, unit.record_order)
+}
+
+fn own_capital_position(
+    properties: &[(GridPosition, Property)],
+    player_id: PlayerId,
+) -> Option<GridPosition> {
+    properties.iter().find_map(|(position, property)| {
+        (property.terrain == Terrain::Capital && property.owner_id == Some(player_id))
+            .then_some(*position)
+    })
+}
+
+/// ROM 43CC/43E8と4453〜4475のC6A6切り替え。
+///
+/// 自軍首都からの一様疑似hex距離がシナリオ+0x10以下の敵を選ぶ。同距離では
+/// 43E8の`CP`が等値でも更新するため、敵レコード順で後の部隊を残す。
+fn select_restricted_mode_target<'a>(
+    enemies: &'a [EnemyView],
+    properties: &[(GridPosition, Property)],
+    map: &Map,
+    player_id: PlayerId,
+    defense_radius: u32,
+) -> Option<&'a EnemyView> {
+    let capital = own_capital_position(properties, player_id)?;
+    let mut selected = None;
+    let mut selected_distance = u32::MAX;
+    for enemy in enemies {
+        let distance = map.distance(capital.x, capital.y, enemy.position.x, enemy.position.y);
+        if distance <= defense_radius && distance <= selected_distance {
+            selected = Some(enemy);
+            selected_distance = distance;
+        }
+    }
+    selected
+}
+
+/// ROM 50C4〜514Fの制限モード専用部隊選択順。
+///
+/// 首都上の部隊、間接攻撃部隊をレコード昇順で優先し、それらがなければ
+/// UNIT_VALUES_0〜3×現在HPが最大の部隊を選ぶ。最大値の同点は後のレコードが勝つ。
+fn restricted_actor_priority(
+    unit: &UnitView,
+    own_capital: Option<GridPosition>,
+    scenario: super::rom_data::RomScenarioData,
+) -> (u8, Reverse<u64>, u32) {
+    if own_capital == Some(unit.position) {
+        return (0, Reverse(0), unit.record_order);
+    }
+    if unit.stats.min_range > 1 {
+        return (1, Reverse(0), unit.record_order);
+    }
+    let normalized_hp = u64::from(unit.hp)
+        .saturating_mul(99)
+        .saturating_div(u64::from(unit.max_hp.max(1)));
+    let value = u64::from(scenario.unit_value(
+        unit.stats.unit_type,
+        super::rom_logic::RomEvaluationMode::Restricted,
+    ))
+    .saturating_mul(normalized_hp);
+    (2, Reverse(value), u32::MAX - unit.record_order)
 }
 
 /// 部隊レコード順に最寄りの未割当拠点を予約し、GBの個別目標欄に相当する表を作る。
@@ -1363,6 +1456,116 @@ mod tests {
         );
 
         assert!(later_key < earlier_key);
+    }
+
+    #[test]
+    fn restricted_mode_starts_at_the_rom_capital_radius_and_uses_late_enemy_ties() {
+        let map = Map::new(9, 9, Terrain::Plains, crate::resources::GridTopology::Hex);
+        let capital = GridPosition { x: 4, y: 4 };
+        let properties = [(
+            capital,
+            Property::new(Terrain::Capital, Some(PlayerId(1)), 200),
+        )];
+        let enemy = |entity, position| EnemyView {
+            entity: Entity::from_raw(entity),
+            position,
+            stats: UnitStats::mock(),
+            hp: 100,
+        };
+        let enemies = [
+            enemy(0, GridPosition { x: 1, y: 4 }),
+            enemy(1, GridPosition { x: 7, y: 4 }),
+        ];
+
+        let selected =
+            select_restricted_mode_target(&enemies, &properties, &map, PlayerId(1), 3).unwrap();
+        assert_eq!(selected.entity, Entity::from_raw(1));
+        assert!(
+            select_restricted_mode_target(&enemies, &properties, &map, PlayerId(1), 2,).is_none()
+        );
+    }
+
+    #[test]
+    fn decide_action_switches_c6a6_at_map1_radius_two() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master_data,
+            "map_1",
+            crate::resources::GridTopology::Hex,
+        )
+        .unwrap();
+        let player = PlayerId(1);
+        let intruder = world
+            .spawn((
+                GridPosition { x: 6, y: 5 },
+                Faction(PlayerId(2)),
+                UnitStats::mock(),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+
+        let _ = decide_action(&mut world, player, &HashSet::new());
+        let state = world.resource::<super::super::rom_logic::RomAiState>();
+        assert_eq!(
+            state.evaluation_mode_for(player),
+            super::super::rom_logic::RomEvaluationMode::Restricted
+        );
+        assert_eq!(
+            state.restricted_target_for(player),
+            Some(UnitType::Infantry)
+        );
+
+        world
+            .entity_mut(intruder)
+            .get_mut::<GridPosition>()
+            .unwrap()
+            .y = 6;
+        let _ = decide_action(&mut world, player, &HashSet::new());
+        assert_eq!(
+            world
+                .resource::<super::super::rom_logic::RomAiState>()
+                .evaluation_mode_for(player),
+            super::super::rom_logic::RomEvaluationMode::Normal
+        );
+    }
+
+    #[test]
+    fn restricted_actor_selection_uses_capital_indirect_then_profile_value() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master_data,
+            "map_1",
+            crate::resources::GridTopology::Hex,
+        )
+        .unwrap();
+        let scenario =
+            super::super::rom_data::identify_scenario(world.resource::<Map>(), &master_data)
+                .unwrap();
+        let capital = GridPosition { x: 4, y: 4 };
+        let on_capital = unit(4, MovementType::Infantry, capital);
+        let mut indirect = unit(3, MovementType::Artillery, GridPosition { x: 3, y: 4 });
+        indirect.stats.unit_type = UnitType::Rockets;
+        indirect.stats.min_range = 2;
+        let mut tank = unit(1, MovementType::Tank, GridPosition { x: 2, y: 4 });
+        tank.stats.unit_type = UnitType::TankZ;
+        let mut infantry = unit(9, MovementType::Infantry, GridPosition { x: 1, y: 4 });
+        infantry.stats.unit_type = UnitType::Infantry;
+
+        assert!(
+            restricted_actor_priority(&on_capital, Some(capital), scenario)
+                < restricted_actor_priority(&indirect, Some(capital), scenario)
+        );
+        assert!(
+            restricted_actor_priority(&indirect, Some(capital), scenario)
+                < restricted_actor_priority(&tank, Some(capital), scenario)
+        );
+        assert!(
+            restricted_actor_priority(&tank, Some(capital), scenario)
+                < restricted_actor_priority(&infantry, Some(capital), scenario)
+        );
     }
 
     #[test]

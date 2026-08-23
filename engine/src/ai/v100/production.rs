@@ -26,6 +26,17 @@ pub(crate) fn decide_production(
     let damage_chart = world.get_resource::<DamageChart>()?.clone();
     let map = world.get_resource::<Map>()?.clone();
     let scenario = super::rom_data::identify_scenario(&map, &master_data)?;
+    // 行動選択の最終呼出しで設定されたC6A6相当値は、そのまま生産処理へ渡る。
+    let (evaluation_mode, restricted_target) =
+        world.get_resource::<super::rom_logic::RomAiState>().map_or(
+            (super::rom_logic::RomEvaluationMode::Normal, None),
+            |state| {
+                (
+                    state.evaluation_mode_for(player_id),
+                    state.restricted_target_for(player_id),
+                )
+            },
+        );
     let turn = world.get_resource::<MatchState>()?.current_turn_number.0;
     let used = world
         .get_resource::<AiProductionCooldown>()
@@ -46,7 +57,7 @@ pub(crate) fn decide_production(
         for (position, faction, stats, health) in query.iter(world) {
             positions.insert((position.x, position.y));
             // ROM 6317/635Bは5152のシナリオ別兵種価値へレコード+8のHPを掛ける。
-            let force_value = u64::from(scenario.unit_value(stats.unit_type))
+            let force_value = u64::from(scenario.unit_value(stats.unit_type, evaluation_mode))
                 .saturating_mul(u64::from(health.current))
                 / u64::from(health.max.max(1));
             if faction.0 == player_id {
@@ -106,7 +117,14 @@ pub(crate) fn decide_production(
         .count() as u64;
     // ROM 5FA8は序盤期限中だけC6AD=0を保持する。期限を過ぎると、既存のC6ADが
     // 非0でも6317/635Bを毎回呼び、戦力比と拠点比から1〜3を引き直す。
-    let strategy = if turn <= scenario.opening_limit {
+    let strategy = if evaluation_mode == super::rom_logic::RomEvaluationMode::Restricted {
+        // ROM 6174はC6A6が立つと戦力比の再計算をせず644Aへ分岐し、
+        // 陣営ごとに保存されている直前のC6ADを保有上限の選択へ使い続ける。
+        world
+            .get_resource::<super::rom_logic::RomAiState>()
+            .and_then(|state| state.production_strategy_for(player_id))
+            .unwrap_or(super::rom_logic::ProductionStrategy::Opening)
+    } else if turn <= scenario.opening_limit {
         super::rom_logic::ProductionStrategy::Opening
     } else {
         let own_share_percent = combined_force_and_property_share(
@@ -152,7 +170,9 @@ pub(crate) fn decide_production(
     let (mobility_shortages, pickup_candidates) = world
         .get_resource::<super::rom_logic::RomAiState>()
         .map_or((0, 0), |state| state.production_counters(player_id));
-    if strategy != super::rom_logic::ProductionStrategy::Opening {
+    if evaluation_mode == super::rom_logic::RomEvaluationMode::Normal
+        && strategy != super::rom_logic::ProductionStrategy::Opening
+    {
         // ROM 616C/6067は生産命令ごとにカウンタを再評価する。
         // 偵察車などがカウンタを消費した後は、同じ手番でも通常生産へ戻る。
         let special_mode =
@@ -209,10 +229,20 @@ pub(crate) fn decide_production(
         let remaining = scenario
             .production_limit(strategy, unit_type)
             .saturating_sub(friendly_counts.get(&unit_type).copied().unwrap_or_default());
-        let score = if strategy == super::rom_logic::ProductionStrategy::Opening {
+        let score = if evaluation_mode == super::rom_logic::RomEvaluationMode::Restricted {
+            restricted_production_score(
+                unit_type,
+                &command,
+                restricted_target,
+                &enemy_counts,
+                &owned_capitals,
+                &damage_chart,
+                scenario,
+            )
+        } else if strategy == super::rom_logic::ProductionStrategy::Opening {
             // ROM 6367: 5152(kind, 99) × 残り保有枠。
             scenario
-                .unit_value(unit_type)
+                .unit_value(unit_type, evaluation_mode)
                 .saturating_mul(99)
                 .saturating_mul(remaining)
         } else {
@@ -291,6 +321,43 @@ fn command_for_unit(
             target_y: position.y,
             unit_type,
         })
+}
+
+/// ROM 644A〜65B2の首都防衛生産をOpenWarsの兵種・攻撃表へ写像する。
+///
+/// 首都では6562が読むUNIT_VALUES_0〜3を使い、首都以外では43E8が選んだ
+/// 侵入部隊への攻撃相性を優先する。ROM固有兵種は候補列に存在しないため0落ちする。
+fn restricted_production_score(
+    unit_type: UnitType,
+    command: &ProduceUnitCommand,
+    restricted_target: Option<UnitType>,
+    enemy_counts: &HashMap<UnitType, u32>,
+    owned_capitals: &[GridPosition],
+    damage_chart: &DamageChart,
+    scenario: super::rom_data::RomScenarioData,
+) -> u32 {
+    let produced_at_capital = owned_capitals
+        .iter()
+        .any(|capital| capital.x == command.target_x && capital.y == command.target_y);
+    if produced_at_capital {
+        return scenario
+            .unit_value(unit_type, super::rom_logic::RomEvaluationMode::Restricted)
+            .saturating_mul(99);
+    }
+    if let Some(target) = restricted_target {
+        let damage = damage_chart
+            .get_base_damage(unit_type, target)
+            .unwrap_or_default()
+            .max(
+                damage_chart
+                    .get_base_damage_secondary(unit_type, target)
+                    .unwrap_or_default(),
+            );
+        return damage.saturating_mul(enemy_counts.get(&target).copied().unwrap_or_default() + 1);
+    }
+    scenario
+        .unit_value(unit_type, super::rom_logic::RomEvaluationMode::Restricted)
+        .saturating_mul(99)
 }
 
 fn special_production_types(mode: super::rom_logic::SpecialProductionMode) -> Vec<UnitType> {
@@ -509,5 +576,55 @@ mod tests {
         let command = decide_production(&mut world, player_id)
             .expect("特殊兵種が作れなくてもROM 6190の通常生産へ進む");
         assert_ne!(command.unit_type, UnitType::Lander);
+    }
+
+    #[test]
+    fn restricted_production_uses_value_at_capital_and_counter_elsewhere() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master_data,
+            "map_1",
+            crate::resources::GridTopology::Hex,
+        )
+        .unwrap();
+        let scenario =
+            super::super::rom_data::identify_scenario(world.resource::<Map>(), &master_data)
+                .unwrap();
+        let capital = GridPosition { x: 3, y: 11 };
+        let factory = GridPosition { x: 4, y: 10 };
+        let command = |position: GridPosition, unit_type: UnitType| ProduceUnitCommand {
+            player_id: PlayerId(2),
+            target_x: position.x,
+            target_y: position.y,
+            unit_type,
+        };
+        let enemy_counts = HashMap::from([(UnitType::Recon, 4)]);
+        let mut damage_chart = DamageChart::new();
+        damage_chart.insert_damage(UnitType::Tank, UnitType::Recon, 95);
+
+        assert_eq!(
+            restricted_production_score(
+                UnitType::TankZ,
+                &command(capital, UnitType::TankZ),
+                Some(UnitType::Recon),
+                &enemy_counts,
+                &[capital],
+                &damage_chart,
+                scenario,
+            ),
+            57 * 99
+        );
+        assert_eq!(
+            restricted_production_score(
+                UnitType::Tank,
+                &command(factory, UnitType::Tank),
+                Some(UnitType::Recon),
+                &enemy_counts,
+                &[capital],
+                &damage_chart,
+                scenario,
+            ),
+            95 * 5
+        );
     }
 }
