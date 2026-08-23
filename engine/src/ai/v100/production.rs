@@ -153,14 +153,10 @@ pub(crate) fn decide_production(
         .get_resource::<super::rom_logic::RomAiState>()
         .map_or((0, 0), |state| state.production_counters(player_id));
     if strategy != super::rom_logic::ProductionStrategy::Opening {
-        let special_mode = world
-            .get_resource_or_insert_with(super::rom_logic::RomAiState::default)
-            .special_production_mode_for_turn(
-                player_id,
-                turn,
-                mobility_shortages,
-                pickup_candidates,
-            );
+        // ROM 616C/6067は生産命令ごとにカウンタを再評価する。
+        // 偵察車などがカウンタを消費した後は、同じ手番でも通常生産へ戻る。
+        let special_mode =
+            super::rom_logic::special_production_mode(mobility_shortages, pickup_candidates);
         if let Some(mode) = special_mode {
             for unit_type in special_production_types(mode) {
                 if let Some(command) = command_for_unit(
@@ -187,8 +183,9 @@ pub(crate) fn decide_production(
                     return Some(command);
                 }
             }
-            // 特殊生産を選んだ手番は、その候補を作れなくなった時点で終了する。
-            return None;
+            // ROM 6085/610B/6132から40C0へ抜けた場合、C699はFFのままcarryだけを
+            // 解除し、呼出元6188が6190の通常兵種走査へ続ける。上限・資金・施設の
+            // いずれかで特殊兵種を作れなくても、生産フェーズ自体は終了しない。
         }
     }
 
@@ -482,5 +479,35 @@ mod tests {
             special_production_types(super::super::rom_logic::SpecialProductionMode::Mobility),
             vec![UnitType::Lander]
         );
+    }
+
+    #[test]
+    fn unavailable_special_unit_falls_through_to_normal_production_like_rom_6188() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master_data,
+            "map_6",
+            crate::resources::GridTopology::Hex,
+        )
+        .unwrap();
+        let player_id = PlayerId(1);
+        world
+            .resource_mut::<Players>()
+            .0
+            .iter_mut()
+            .find(|player| player.id == player_id)
+            .unwrap()
+            .funds = 100_000;
+        world.resource_mut::<MatchState>().current_turn_number.0 = 4;
+
+        let mut state = super::super::rom_logic::RomAiState::default();
+        state.begin_action_turn(player_id, 4);
+        state.record_mobility_shortage(player_id);
+        state.record_mobility_shortage(player_id);
+        world.insert_resource(state);
+
+        let command = decide_production(&mut world, player_id)
+            .expect("特殊兵種が作れなくてもROM 6190の通常生産へ進む");
+        assert_ne!(command.unit_type, UnitType::Lander);
     }
 }

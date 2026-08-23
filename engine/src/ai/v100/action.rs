@@ -494,11 +494,13 @@ pub(crate) fn decide_action(
                 .get_resource_or_insert_with(super::rom_logic::RomAiState::default)
                 .set_pickup_eligible(player_id, actor.entity, true);
         }
-        if matches!(command, AiCommand::Wait { target_pos } if target_pos == actor.position)
+        if used_fallback
             && super::rom_logic::GbUnitKind::increments_mobility_shortage_counter(
                 actor.stats.unit_type,
             )
         {
+            // ROM 4B91の通常経路が現在地を含まない時だけ、4A4BでC6A4を増やす。
+            // ZOCなどにより合法手が現在地だけでも、目標への地形経路があれば輸送不足ではない。
             world
                 .get_resource_or_insert_with(super::rom_logic::RomAiState::default)
                 .record_mobility_shortage(player_id);

@@ -194,8 +194,6 @@ impl ProductionStrategy {
 #[derive(Debug, Clone, Copy, Default)]
 struct RomPlayerState {
     production_strategy: Option<ProductionStrategy>,
-    production_turn: Option<u32>,
-    special_production_mode: Option<SpecialProductionMode>,
     action_turn: Option<u32>,
     mobility_shortage_count: u8,
     pickup_candidate_count: u8,
@@ -268,28 +266,6 @@ impl RomAiState {
             .production_strategy = Some(strategy);
     }
 
-    /// ROMの特殊輸送生産は、選択された手番中は通常生産へフォールスルーしない。
-    pub(crate) fn special_production_mode_for_turn(
-        &mut self,
-        player_id: PlayerId,
-        turn: u32,
-        mobility_shortages: u8,
-        pickup_candidates: u8,
-    ) -> Option<SpecialProductionMode> {
-        let state = self.by_player.entry(player_id).or_default();
-        if state.production_turn != Some(turn) {
-            state.production_turn = Some(turn);
-            state.special_production_mode = if mobility_shortages >= 2 {
-                Some(SpecialProductionMode::Mobility)
-            } else if pickup_candidates >= 3 {
-                Some(SpecialProductionMode::Pickup)
-            } else {
-                None
-            };
-        }
-        state.special_production_mode
-    }
-
     pub(crate) fn begin_action_turn(&mut self, player_id: PlayerId, turn: u32) {
         let state = self.by_player.entry(player_id).or_default();
         if state.action_turn != Some(turn) {
@@ -332,6 +308,21 @@ impl RomAiState {
         self.by_player
             .get(&player_id)
             .and_then(|state| state.production_strategy)
+    }
+}
+
+/// ROM Bank 2 `6067`は生産処理へ入るたびにC6A4/C6A5を読み直す。
+/// 特殊兵種の生産でカウンタが減った後は、同じ手番でも次の生産判断を通常走査へ戻す。
+pub(crate) fn special_production_mode(
+    mobility_shortages: u8,
+    pickup_candidates: u8,
+) -> Option<SpecialProductionMode> {
+    if mobility_shortages >= 2 {
+        Some(SpecialProductionMode::Mobility)
+    } else if pickup_candidates >= 3 {
+        Some(SpecialProductionMode::Pickup)
+    } else {
+        None
     }
 }
 
@@ -538,20 +529,16 @@ mod tests {
     }
 
     #[test]
-    fn special_production_mode_persists_until_the_next_turn() {
-        let mut state = RomAiState::default();
-
+    fn special_production_mode_is_rechecked_after_each_produced_unit() {
         assert_eq!(
-            state.special_production_mode_for_turn(PlayerId(1), 5, 0, 3),
+            special_production_mode(0, 3),
             Some(SpecialProductionMode::Pickup)
         );
+        // ROM 613D〜614Aは偵察車の生産後にC6A5を2減らすため、次の生産は通常走査へ戻る。
+        assert_eq!(special_production_mode(0, 1), None);
         assert_eq!(
-            state.special_production_mode_for_turn(PlayerId(1), 5, 0, 0),
-            Some(SpecialProductionMode::Pickup)
-        );
-        assert_eq!(
-            state.special_production_mode_for_turn(PlayerId(1), 6, 0, 0),
-            None
+            special_production_mode(2, 3),
+            Some(SpecialProductionMode::Mobility)
         );
     }
 
