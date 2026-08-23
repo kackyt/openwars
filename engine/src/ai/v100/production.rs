@@ -172,6 +172,16 @@ pub(crate) fn decide_production(
             )
         });
     }
+    // ROMの保有上限表をOpenWarsでは1巡分の構成枠として扱う。
+    // 所有施設で作れる全兵種が現在の巡を満たすと、同じ配分で次の巡を開放する。
+    let allocation_round = production_allocation_round(
+        strategy,
+        scenario,
+        &friendly_counts,
+        &all_owned_facilities,
+        &registry,
+        &master_data,
+    );
     let (mobility_shortages, pickup_candidates) = world
         .get_resource::<super::rom_logic::RomAiState>()
         .map_or((0, 0), |state| state.production_counters(player_id));
@@ -190,6 +200,7 @@ pub(crate) fn decide_production(
                     funds,
                     strategy,
                     scenario,
+                    allocation_round,
                     &friendly_counts,
                     &facilities,
                     &registry,
@@ -224,6 +235,7 @@ pub(crate) fn decide_production(
             funds,
             strategy,
             scenario,
+            allocation_round,
             &friendly_counts,
             &facilities,
             &registry,
@@ -231,8 +243,7 @@ pub(crate) fn decide_production(
         ) else {
             continue;
         };
-        let remaining = scenario
-            .production_limit(strategy, unit_type)
+        let remaining = expanded_production_limit(strategy, scenario, unit_type, allocation_round)
             .saturating_sub(friendly_counts.get(&unit_type).copied().unwrap_or_default());
         let score = if evaluation_mode == super::rom_logic::RomEvaluationMode::Restricted {
             restricted_production_score(
@@ -285,6 +296,7 @@ pub(crate) fn decide_production(
             funds,
             strategy,
             scenario,
+            allocation_round,
             &friendly_counts,
             &facilities,
             &registry,
@@ -300,6 +312,46 @@ fn is_rom_production_terrain(terrain: Terrain) -> bool {
     )
 }
 
+/// ROM上限表を何巡満たしたかを、現在所有する生産施設で作れる兵種から求める。
+fn production_allocation_round(
+    strategy: super::rom_logic::ProductionStrategy,
+    scenario: super::rom_data::RomScenarioData,
+    friendly_counts: &HashMap<UnitType, u32>,
+    facilities: &[(GridPosition, Terrain)],
+    registry: &UnitRegistry,
+    master_data: &MasterDataRegistry,
+) -> u32 {
+    registry
+        .0
+        .keys()
+        .filter_map(|unit_type| {
+            let quota = scenario.production_limit(strategy, *unit_type);
+            if quota == 0
+                || !facilities
+                    .iter()
+                    .any(|(_, terrain)| master_data.can_produce_unit(terrain.as_str(), *unit_type))
+            {
+                return None;
+            }
+            let current = friendly_counts.get(unit_type).copied().unwrap_or_default();
+            Some(current / quota)
+        })
+        .min()
+        .unwrap_or_default()
+}
+
+/// ROMの1巡分の上限を、現在の構成巡に応じた累積枠へ拡張する。
+fn expanded_production_limit(
+    strategy: super::rom_logic::ProductionStrategy,
+    scenario: super::rom_data::RomScenarioData,
+    unit_type: UnitType,
+    allocation_round: u32,
+) -> u32 {
+    scenario
+        .production_limit(strategy, unit_type)
+        .saturating_mul(allocation_round.saturating_add(1))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn command_for_unit(
     player_id: PlayerId,
@@ -307,6 +359,7 @@ fn command_for_unit(
     funds: u32,
     strategy: super::rom_logic::ProductionStrategy,
     scenario: super::rom_data::RomScenarioData,
+    allocation_round: u32,
     friendly_counts: &HashMap<UnitType, u32>,
     facilities: &[(GridPosition, Terrain)],
     registry: &UnitRegistry,
@@ -314,7 +367,9 @@ fn command_for_unit(
 ) -> Option<ProduceUnitCommand> {
     let stats = registry.0.get(&unit_type)?;
     let current = friendly_counts.get(&unit_type).copied().unwrap_or_default();
-    if stats.cost > funds || current >= scenario.production_limit(strategy, unit_type) {
+    if stats.cost > funds
+        || current >= expanded_production_limit(strategy, scenario, unit_type, allocation_round)
+    {
         return None;
     }
     facilities
@@ -551,6 +606,167 @@ mod tests {
         assert_eq!(combined_force_and_property_share(60, 40, 8, 2), 70);
         assert_eq!(combined_force_and_property_share(40, 60, 2, 8), 30);
         assert_eq!(combined_force_and_property_share(0, 0, 0, 0), 50);
+    }
+
+    #[test]
+    fn production_limits_repeat_as_composition_rounds() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master_data,
+            "map_1",
+            crate::resources::GridTopology::Hex,
+        )
+        .unwrap();
+        let scenario =
+            super::super::rom_data::identify_scenario(world.resource::<Map>(), &master_data)
+                .unwrap();
+        let registry = world.resource::<UnitRegistry>();
+        let strategy = super::super::rom_logic::ProductionStrategy::Opening;
+        let facilities = [(GridPosition { x: 6, y: 3 }, Terrain::Capital)];
+        let mut friendly_counts = HashMap::from([(UnitType::Infantry, 11), (UnitType::Recon, 4)]);
+
+        let mut allocation_round = production_allocation_round(
+            strategy,
+            scenario,
+            &friendly_counts,
+            &facilities,
+            registry,
+            &master_data,
+        );
+        assert_eq!(allocation_round, 1);
+        assert_eq!(
+            expanded_production_limit(strategy, scenario, UnitType::Infantry, allocation_round,),
+            22
+        );
+        assert!(
+            command_for_unit(
+                PlayerId(1),
+                UnitType::Infantry,
+                100_000,
+                strategy,
+                scenario,
+                allocation_round,
+                &friendly_counts,
+                &facilities,
+                registry,
+                &master_data,
+            )
+            .is_some()
+        );
+
+        // 歩兵だけが2巡目を満たした場合は偵察車を優先して構成比を追いつかせる。
+        friendly_counts.insert(UnitType::Infantry, 22);
+        allocation_round = production_allocation_round(
+            strategy,
+            scenario,
+            &friendly_counts,
+            &facilities,
+            registry,
+            &master_data,
+        );
+        assert_eq!(allocation_round, 1);
+        assert!(
+            command_for_unit(
+                PlayerId(1),
+                UnitType::Infantry,
+                100_000,
+                strategy,
+                scenario,
+                allocation_round,
+                &friendly_counts,
+                &facilities,
+                registry,
+                &master_data,
+            )
+            .is_none()
+        );
+        assert!(
+            command_for_unit(
+                PlayerId(1),
+                UnitType::Recon,
+                100_000,
+                strategy,
+                scenario,
+                allocation_round,
+                &friendly_counts,
+                &facilities,
+                registry,
+                &master_data,
+            )
+            .is_some()
+        );
+
+        friendly_counts.insert(UnitType::Recon, 8);
+        allocation_round = production_allocation_round(
+            strategy,
+            scenario,
+            &friendly_counts,
+            &facilities,
+            registry,
+            &master_data,
+        );
+        assert_eq!(allocation_round, 2);
+        assert_eq!(
+            expanded_production_limit(strategy, scenario, UnitType::Infantry, allocation_round,),
+            33
+        );
+    }
+
+    #[test]
+    fn allocation_round_ignores_unit_types_without_an_owned_facility() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master_data,
+            "map_3",
+            crate::resources::GridTopology::Hex,
+        )
+        .unwrap();
+        let scenario =
+            super::super::rom_data::identify_scenario(world.resource::<Map>(), &master_data)
+                .unwrap();
+        let registry = world.resource::<UnitRegistry>();
+        let strategy = super::super::rom_logic::ProductionStrategy::Opening;
+        let capital_only = [(GridPosition { x: 5, y: 5 }, Terrain::Capital)];
+        let friendly_counts = registry
+            .0
+            .keys()
+            .filter(|unit_type| {
+                master_data.can_produce_unit(Terrain::Capital.as_str(), **unit_type)
+            })
+            .filter_map(|unit_type| {
+                let quota = scenario.production_limit(strategy, *unit_type);
+                (quota > 0).then_some((*unit_type, quota))
+            })
+            .collect();
+
+        assert_eq!(
+            production_allocation_round(
+                strategy,
+                scenario,
+                &friendly_counts,
+                &capital_only,
+                registry,
+                &master_data,
+            ),
+            1
+        );
+
+        // 空港を所有した時点で、未充足の航空枠が構成巡へ参加して追いつき生産になる。
+        let with_airport = [
+            (GridPosition { x: 5, y: 5 }, Terrain::Capital),
+            (GridPosition { x: 6, y: 5 }, Terrain::Airport),
+        ];
+        assert_eq!(
+            production_allocation_round(
+                strategy,
+                scenario,
+                &friendly_counts,
+                &with_airport,
+                registry,
+                &master_data,
+            ),
+            0
+        );
     }
 
     #[test]

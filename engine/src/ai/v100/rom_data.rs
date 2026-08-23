@@ -101,6 +101,8 @@ impl RomScenarioData {
     ) -> u32 {
         let table = &self.production_limits[strategy.index()];
         let index = usize::from(GbUnitKind::production_order(unit_type) / 2);
+        // ここではROMの生の保有上限を返す。OpenWars向けの無制限拡張は
+        // productionモジュールがこの値を1巡分の構成枠として扱って行う。
         // OpenWarsに存在しない兵種の枠は、似た兵種へ合算せずROM表上で捨てる。
         u32::from(table[index])
     }
