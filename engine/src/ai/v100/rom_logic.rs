@@ -97,6 +97,21 @@ impl GbUnitKind {
         }
     }
 
+    /// ROM Bank 2 `6894`の兵種別影響値。
+    ///
+    /// 下位3bitは対空、bit 3〜5は対地・対艦の脅威寄与であり、`4320`は敵部隊の
+    /// 射程内マスへ各成分を7で飽和加算する。ミッション3の通常移動は`4125`で
+    /// 両成分の合計が最大となる到達可能マスを進軍目標に選ぶ。
+    pub(crate) fn influence_weights(unit_type: UnitType) -> (u8, u8) {
+        const TABLE: [u8; 24] = [
+            0x09, 0x09, 0x19, 0x11, 0x10, 0x18, 0x10, 0x08, 0x03, 0x02, 0x08, 0x08, 0x00, 0x0B,
+            0x0A, 0x18, 0x00, 0x10, 0x08, 0x24, 0x1B, 0x03, 0x09, 0x18,
+        ];
+        let kind = Self::production_order(unit_type);
+        let packed = TABLE[usize::from(kind / 2)];
+        (packed & 0x07, (packed >> 3) & 0x07)
+    }
+
     fn is(self, expected: Self) -> bool {
         self == expected
     }
@@ -339,7 +354,7 @@ pub(crate) fn assign_mission_state(
     strategy: ProductionStrategy,
     production_limit: u32,
     same_kind_counts: [u32; 4],
-    scenario_special: bool,
+    recon_uses_mission_three: bool,
 ) -> u8 {
     const MISSION_WEIGHTS: [[u32; 4]; 5] = [
         [4, 4, 4, 1],
@@ -357,7 +372,7 @@ pub(crate) fn assign_mission_state(
         return 3;
     }
     if kind == 0x16 {
-        return u8::from(scenario_special) * 3;
+        return u8::from(recon_uses_mission_three) * 3;
     }
 
     // 62D2〜62E4は装甲車/輸送ヘリだけ表の行を4-C6ADへ反転する。
@@ -497,6 +512,14 @@ mod tests {
         assert_eq!(GbUnitKind::pickup_distance_threshold(UnitType::Rockets), 20);
         assert_eq!(GbUnitKind::pickup_distance_threshold(UnitType::Recon), 20);
         assert_eq!(GbUnitKind::pickup_distance_threshold(UnitType::Tank), 0xFF);
+    }
+
+    #[test]
+    fn influence_weights_decode_the_two_rom_6894_components() {
+        assert_eq!(GbUnitKind::influence_weights(UnitType::Missiles), (3, 0));
+        assert_eq!(GbUnitKind::influence_weights(UnitType::Bomber), (0, 3));
+        assert_eq!(GbUnitKind::influence_weights(UnitType::Battleship), (3, 3));
+        assert_eq!(GbUnitKind::influence_weights(UnitType::SupplyTruck), (0, 0));
     }
 
     #[test]

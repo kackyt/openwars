@@ -26,10 +26,56 @@ use std::collections::{HashMap, HashSet};
 /// 引き直すと、先に動いた部隊の影響で後続部隊の目標が変わってしまう。
 #[derive(Resource, Default)]
 struct ObjectiveAssignmentState {
-    by_player: HashMap<PlayerId, HashMap<Entity, GridPosition>>,
+    by_player: HashMap<PlayerId, HashMap<Entity, RomUnitObjective>>,
     mission_by_player: HashMap<PlayerId, HashMap<Entity, u8>>,
     cargo_loaded_by_player: HashMap<PlayerId, HashMap<Entity, bool>>,
     turn_by_player: HashMap<PlayerId, u32>,
+}
+
+/// ROM部隊レコード+13/+14の個別目標。
+/// `0x40,0x40`は座標ではなく、Bank 2 `40E1`へ動的影響目標を選ばせる番兵値である。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RomUnitObjective {
+    Position(GridPosition),
+    DynamicInfluence,
+}
+
+impl RomUnitObjective {
+    fn position(self) -> Option<GridPosition> {
+        match self {
+            Self::Position(position) => Some(position),
+            Self::DynamicInfluence => None,
+        }
+    }
+}
+
+impl PartialEq<GridPosition> for RomUnitObjective {
+    fn eq(&self, other: &GridPosition) -> bool {
+        self.position() == Some(*other)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RomInfluence {
+    anti_air: u8,
+    anti_surface: u8,
+}
+
+impl RomInfluence {
+    fn add(&mut self, anti_air: u8, anti_surface: u8) {
+        self.anti_air = self.anti_air.saturating_add(anti_air).min(7);
+        self.anti_surface = self.anti_surface.saturating_add(anti_surface).min(7);
+    }
+
+    fn combined(self) -> u8 {
+        self.anti_air + self.anti_surface
+    }
+}
+
+/// ROM `4299`がAI手番開始時に一度だけ構築するD7E4影響盤面の陣営別スナップショット。
+#[derive(Resource, Default)]
+struct RomInfluenceState {
+    by_player: HashMap<PlayerId, (u32, HashMap<GridPosition, RomInfluence>)>,
 }
 
 #[derive(Clone, Copy)]
@@ -39,6 +85,7 @@ struct AssignmentUnit {
     unit_type: crate::resources::UnitType,
     record_order: u32,
     has_cargo: bool,
+    is_transported: bool,
 }
 
 #[derive(Clone)]
@@ -90,6 +137,17 @@ struct StrategicObjectiveContext<'a> {
     reserved: &'a HashSet<GridPosition>,
 }
 
+/// ROMの番兵目標と輸送船の積荷目標を、実際の経路目標へ解決するための参照群。
+struct RomMovementObjectiveContext<'a> {
+    cargo: Option<&'a [Entity]>,
+    assignments: &'a HashMap<Entity, RomUnitObjective>,
+    influence: &'a HashMap<GridPosition, RomInfluence>,
+    properties: &'a [(GridPosition, Property)],
+    map: &'a Map,
+    master_data: &'a MasterDataRegistry,
+    player_id: PlayerId,
+}
+
 /// V100/V200の次の行動を決める。既存V1〜V4の評価器は呼び出さない。
 pub(crate) fn decide_action(
     world: &mut World,
@@ -108,6 +166,7 @@ pub(crate) fn decide_action(
     let mut assignment_units = Vec::new();
     let mut occupants = HashMap::new();
     let mut friendly_by_position = HashMap::new();
+    let mut cargo_by_transport = HashMap::<Entity, Vec<Entity>>::new();
     {
         let mut query = world.query::<(
             Entity,
@@ -136,7 +195,26 @@ pub(crate) fn decide_action(
             transporting,
         ) in query.iter(world)
         {
-            if transporting.is_some() || health.current == 0 {
+            if health.current == 0 {
+                continue;
+            }
+            if faction.0 == player_id {
+                assignment_units.push(AssignmentUnit {
+                    entity,
+                    position: *position,
+                    unit_type: stats.unit_type,
+                    record_order: 0,
+                    has_cargo: cargo.is_some_and(|value| !value.loaded.is_empty()),
+                    is_transported: transporting.is_some(),
+                });
+                if let Some(cargo) = cargo
+                    && !cargo.loaded.is_empty()
+                {
+                    cargo_by_transport.insert(entity, cargo.loaded.clone());
+                }
+            }
+            // ROMの搭載中レコードは個別目標を保持するが、盤上の占有・行動候補には入らない。
+            if transporting.is_some() {
                 continue;
             }
             occupants.insert(
@@ -153,13 +231,6 @@ pub(crate) fn decide_action(
             );
             if faction.0 == player_id {
                 friendly_by_position.insert((position.x, position.y), entity);
-                assignment_units.push(AssignmentUnit {
-                    entity,
-                    position: *position,
-                    unit_type: stats.unit_type,
-                    record_order: 0,
-                    has_cargo: cargo.is_some_and(|value| !value.loaded.is_empty()),
-                });
                 if !moved.0 && !completed.0 && !skipped.contains(&entity) {
                     units.push(UnitView {
                         entity,
@@ -235,29 +306,64 @@ pub(crate) fn decide_action(
         .filter_map(|(entity, mission)| (mission & 0x03 == 3).then_some(*entity))
         .collect();
     let mut enemies: Vec<_> = {
-        let mut query = world.query::<(Entity, &GridPosition, &Faction, &UnitStats, &Health)>();
+        let mut query = world.query::<(
+            Entity,
+            &GridPosition,
+            &Faction,
+            &UnitStats,
+            &Health,
+            Option<&crate::components::Transporting>,
+        )>();
         query
             .iter(world)
-            .filter_map(|(entity, position, faction, stats, health)| {
-                (faction.0 != player_id && health.current > 0).then_some(EnemyView {
-                    entity,
-                    position: *position,
-                    stats: stats.clone(),
-                    hp: health.current,
-                })
+            .filter_map(|(entity, position, faction, stats, health, transporting)| {
+                (faction.0 != player_id && health.current > 0 && transporting.is_none()).then_some(
+                    EnemyView {
+                        entity,
+                        position: *position,
+                        stats: stats.clone(),
+                        hp: health.current,
+                    },
+                )
             })
             .collect()
     };
     // ROM 1F44は敵の固定長レコードを先頭から列挙する。盤面座標順ではない。
     enemies.sort_by_key(|enemy| super::unit_record::record_order(world, enemy.entity));
+    let influence_field = rom_influence_for_turn(world, player_id, turn, &map, &enemies);
+    let movement_objectives: HashMap<_, _> = units
+        .iter()
+        .filter_map(|unit| {
+            let assigned = objective_assignments.get(&unit.entity).copied()?;
+            resolve_rom_movement_objective(
+                unit,
+                assigned,
+                &RomMovementObjectiveContext {
+                    cargo: cargo_by_transport.get(&unit.entity).map(Vec::as_slice),
+                    assignments: &objective_assignments,
+                    influence: &influence_field,
+                    properties: &properties,
+                    map: &map,
+                    master_data: &master_data,
+                    player_id,
+                },
+            )
+            .map(|objective| (unit.entity, objective))
+        })
+        .collect();
 
     // ROM 44BC/45B8は都市・工場上の部隊を先に選び、生産地点を空けてから一般部隊へ進む。
     let objective_route_costs: HashMap<_, _> = units
         .iter()
         .filter_map(|unit| {
-            let objective = objective_assignments.get(&unit.entity).copied()?;
-            let route_field =
-                build_route_field(&map, &master_data, objective, unit.stats.movement_type);
+            let objective = movement_objectives.get(&unit.entity).copied()?;
+            let route_field = build_objective_route_field(
+                &map,
+                &master_data,
+                unit.position,
+                objective,
+                unit.stats.movement_type,
+            );
             Some((
                 unit.entity,
                 route_field.get(&unit.position).copied().unwrap_or(u32::MAX),
@@ -268,7 +374,7 @@ pub(crate) fn decide_action(
         actor_priority(
             unit,
             &property_positions,
-            objective_assignments.get(&unit.entity).copied(),
+            movement_objectives.get(&unit.entity).copied(),
             objective_route_costs.get(&unit.entity).copied(),
         )
     });
@@ -294,7 +400,7 @@ pub(crate) fn decide_action(
                 world,
                 actor.entity,
                 &candidates,
-                objective_assignments.get(&actor.entity).copied(),
+                movement_objectives.get(&actor.entity).copied(),
                 mission_assignments.get(&actor.entity).copied(),
                 player_id,
                 version,
@@ -377,7 +483,7 @@ pub(crate) fn decide_action(
         let (command, used_fallback) = choose_wait(
             &actor,
             &candidates,
-            objective_assignments.get(&actor.entity).copied(),
+            movement_objectives.get(&actor.entity).copied(),
             &map,
             &master_data,
         );
@@ -440,6 +546,7 @@ fn assign_objectives(
             unit_type: crate::resources::UnitType::Infantry,
             record_order: entity.index(),
             has_cargo: false,
+            is_transported: false,
         })
         .collect();
     ordered_units.sort_by_key(|unit| unit.record_order);
@@ -472,7 +579,7 @@ fn update_objective_assignments(
     map: &Map,
     master_data: &MasterDataRegistry,
     player_id: PlayerId,
-) -> HashMap<Entity, GridPosition> {
+) -> HashMap<Entity, RomUnitObjective> {
     let current_turn = world
         .get_resource::<MatchState>()
         .map_or(0, |state| state.current_turn_number.0);
@@ -497,10 +604,7 @@ fn update_objective_assignments(
         .and_then(|state| state.cargo_loaded_by_player.get(&player_id))
         .cloned()
         .unwrap_or_default();
-    let unit_positions: HashMap<_, _> = units
-        .iter()
-        .map(|unit| (unit.entity, unit.position))
-        .collect();
+    let units_by_entity: HashMap<_, _> = units.iter().map(|unit| (unit.entity, *unit)).collect();
     let owned_properties: HashSet<_> = properties
         .iter()
         .filter_map(|(position, property)| {
@@ -510,9 +614,14 @@ fn update_objective_assignments(
     // 他部隊が先に占領した目標はGBの個別目標欄に残る。一方、map_8の実測では
     // 目標を占領した本人は次手番に別目標へ進むため、現在地の達成済み目標だけを外す。
     assignments.retain(|entity, objective| {
+        let Some(unit) = units_by_entity.get(entity) else {
+            return false;
+        };
         alive.contains(entity)
-            && !(unit_positions.get(entity) == Some(objective)
-                && owned_properties.contains(objective))
+            && (unit.is_transported
+                || !objective.position().is_some_and(|position| {
+                    unit.position == position && owned_properties.contains(&position)
+                }))
     });
     missions.retain(|entity, _| alive.contains(entity));
     cargo_loaded.retain(|entity, _| alive.contains(entity));
@@ -537,7 +646,7 @@ fn update_objective_assignments(
     // ROM 485Eは都市・空港・港だけ重複目標を拒否し、首都・工場は共有を許す。
     let mut reserved: HashSet<_> = assignments
         .values()
-        .copied()
+        .filter_map(|objective| objective.position())
         .filter(|position| objective_requires_unique_assignment(*position, properties))
         .collect();
     let mut unassigned: Vec<_> = units
@@ -567,6 +676,7 @@ fn update_objective_assignments(
             crate::resources::UnitType::Infantry | crate::resources::UnitType::Mech
         ) {
             select_rom_capture_objective(&unit, properties, map, master_data, player_id, &reserved)
+                .map(RomUnitObjective::Position)
         } else {
             select_rom_strategic_objective(
                 &unit,
@@ -583,8 +693,10 @@ fn update_objective_assignments(
         };
         missions.insert(unit.entity, mission);
         if let Some(objective) = objective {
-            if objective_requires_unique_assignment(objective, properties) {
-                reserved.insert(objective);
+            if let Some(position) = objective.position()
+                && objective_requires_unique_assignment(position, properties)
+            {
+                reserved.insert(position);
             }
             assignments.insert(unit.entity, objective);
         }
@@ -655,11 +767,11 @@ fn select_rom_strategic_objective(
     unit: &AssignmentUnit,
     mission: u8,
     context: &StrategicObjectiveContext<'_>,
-) -> Option<GridPosition> {
+) -> Option<RomUnitObjective> {
     use crate::resources::UnitType;
 
     if unit.unit_type == UnitType::Artillery {
-        return Some(unit.position);
+        return Some(RomUnitObjective::Position(unit.position));
     }
     if mission & 0x03 == 3
         && matches!(
@@ -677,30 +789,153 @@ fn select_rom_strategic_objective(
                 context.master_data,
                 context.player_id,
                 context.reserved,
-            );
+            )
+            .map(RomUnitObjective::Position);
         }
         return context.properties.iter().find_map(|(position, property)| {
             (property.terrain == crate::resources::Terrain::Capital
                 && property.owner_id == Some(context.player_id))
-            .then_some(*position)
+            .then_some(RomUnitObjective::Position(*position))
         });
     }
     if let Some(objective) = context
         .scenario
         .and_then(|value| value.strategic_objective(context.player_id, mission))
     {
-        return Some(objective);
+        return Some(RomUnitObjective::Position(objective));
     }
     if mission & 0x03 == 3 {
-        // ROM 4836が格納する0x40,0x40を0始まりへ変換した盤外番兵値。
-        // 目標なし(None)にはせず、部隊選択時にも「目標設定済み」として扱う。
-        return Some(GridPosition { x: 63, y: 63 });
+        // ROM 4836の0x40,0x40は盤外座標ではない。Bank 2 40E1/4125はこの値を
+        // 検出すると、敵射程の影響盤面から部隊ごとの到達可能目標を作り直す。
+        return Some(RomUnitObjective::DynamicInfluence);
     }
     // 状態0は敵首都を目標にする。
     context.properties.iter().find_map(|(position, property)| {
         (property.terrain == crate::resources::Terrain::Capital
             && property.owner_id != Some(context.player_id))
-        .then_some(*position)
+        .then_some(RomUnitObjective::Position(*position))
+    })
+}
+
+/// ROM Bank 2 `4299`と同じく、敵部隊の射程内へ兵種別の2成分を飽和加算する。
+fn build_rom_influence_field(
+    map: &Map,
+    enemies: &[EnemyView],
+) -> HashMap<GridPosition, RomInfluence> {
+    let mut influence = HashMap::<GridPosition, RomInfluence>::new();
+    for enemy in enemies {
+        let (anti_air, anti_surface) =
+            super::rom_logic::GbUnitKind::influence_weights(enemy.stats.unit_type);
+        if (anti_air == 0 && anti_surface == 0) || enemy.stats.max_range == 0 {
+            continue;
+        }
+        let min_range = enemy.stats.min_range.max(1);
+        let max_range = enemy.stats.max_range.max(min_range);
+        for y in 0..map.height {
+            for x in 0..map.width {
+                let position = GridPosition { x, y };
+                let distance = map.distance(x, y, enemy.position.x, enemy.position.y);
+                if (min_range..=max_range).contains(&distance) {
+                    influence
+                        .entry(position)
+                        .or_default()
+                        .add(anti_air, anti_surface);
+                }
+            }
+        }
+    }
+    influence
+}
+
+/// ROMはD7E4/D803の影響盤面をAI手番開始時に一度だけ構築し、途中の撃破後も保持する。
+fn rom_influence_for_turn(
+    world: &mut World,
+    player_id: PlayerId,
+    turn: u32,
+    map: &Map,
+    enemies: &[EnemyView],
+) -> HashMap<GridPosition, RomInfluence> {
+    if let Some((cached_turn, cached)) = world
+        .get_resource::<RomInfluenceState>()
+        .and_then(|state| state.by_player.get(&player_id))
+        && *cached_turn == turn
+    {
+        return cached.clone();
+    }
+
+    let influence = build_rom_influence_field(map, enemies);
+    world
+        .get_resource_or_insert_with(RomInfluenceState::default)
+        .by_player
+        .insert(player_id, (turn, influence.clone()));
+    influence
+}
+
+/// ROM `49B6`の輸送船積荷目標と`4125`の影響最大マス選択を実座標へ変換する。
+fn resolve_rom_movement_objective(
+    unit: &UnitView,
+    assigned: RomUnitObjective,
+    context: &RomMovementObjectiveContext<'_>,
+) -> Option<GridPosition> {
+    let effective_assigned = if unit.stats.unit_type == crate::resources::UnitType::Lander {
+        context
+            .cargo
+            .and_then(|cargo| {
+                // 49B6は積荷スロットを順に上書きするため、最後の積荷の目標状態が残る。
+                cargo
+                    .iter()
+                    .rev()
+                    .find_map(|entity| context.assignments.get(entity).copied())
+            })
+            .unwrap_or(assigned)
+    } else {
+        assigned
+    };
+
+    match effective_assigned {
+        RomUnitObjective::Position(position) => Some(position),
+        RomUnitObjective::DynamicInfluence => select_rom_dynamic_influence_objective(unit, context),
+    }
+}
+
+/// ROM `4125`は部隊が到達できるマスだけを行優先で走査し、2成分の合計が最大の
+/// 最初のマスを選ぶ。正の影響値がなければ`416B`どおり敵首都へ戻す。
+fn select_rom_dynamic_influence_objective(
+    unit: &UnitView,
+    context: &RomMovementObjectiveContext<'_>,
+) -> Option<GridPosition> {
+    let reachable = build_route_field(
+        context.map,
+        context.master_data,
+        unit.position,
+        unit.stats.movement_type,
+    );
+    let mut best_score = 0_u8;
+    let mut best = None;
+    for y in 0..context.map.height {
+        for x in 0..context.map.width {
+            let position = GridPosition { x, y };
+            if !reachable.contains_key(&position) {
+                continue;
+            }
+            let score = context
+                .influence
+                .get(&position)
+                .copied()
+                .unwrap_or_default()
+                .combined();
+            if score > best_score {
+                best_score = score;
+                best = Some(position);
+            }
+        }
+    }
+    best.or_else(|| {
+        context.properties.iter().find_map(|(position, property)| {
+            (property.terrain == crate::resources::Terrain::Capital
+                && property.owner_id != Some(context.player_id))
+            .then_some(*position)
+        })
     })
 }
 
@@ -727,7 +962,7 @@ fn initial_rom_mission_state(
         strategy,
         scenario.production_limit(strategy, unit_type),
         same_kind_counts,
-        scenario.has_radar_transport,
+        scenario.recon_uses_mission_three,
     )
 }
 
@@ -917,11 +1152,13 @@ fn choose_wait(
     master_data: &MasterDataRegistry,
 ) -> (AiCommand, bool) {
     let normal_route_distances = objective.map(|objective| {
-        if actor.stats.movement_type == MovementType::Ship {
-            build_ship_approach_route_field(map, master_data, actor.position, objective)
-        } else {
-            build_route_field(map, master_data, objective, actor.stats.movement_type)
-        }
+        build_objective_route_field(
+            map,
+            master_data,
+            actor.position,
+            objective,
+            actor.stats.movement_type,
+        )
     });
     let used_fallback = objective.is_some()
         && normal_route_distances
@@ -972,6 +1209,21 @@ fn choose_wait(
         },
         used_fallback,
     )
+}
+
+/// 固定陸上目標へ向かう艦船だけ接岸可能地点へ写像し、それ以外はROMと同じ目標起点場を作る。
+fn build_objective_route_field(
+    map: &Map,
+    master_data: &MasterDataRegistry,
+    origin: GridPosition,
+    objective: GridPosition,
+    movement_type: MovementType,
+) -> HashMap<GridPosition, u32> {
+    if movement_type == MovementType::Ship {
+        build_ship_approach_route_field(map, master_data, origin, objective)
+    } else {
+        build_route_field(map, master_data, objective, movement_type)
+    }
 }
 
 /// ROM 4D86〜4E4Dの、通常経路が存在しない部隊向け沿岸中継点走査。
@@ -1050,6 +1302,7 @@ mod tests {
             unit_type: UnitType::Infantry,
             record_order: entity.index(),
             has_cargo: false,
+            is_transported: false,
         }
     }
 
@@ -1135,7 +1388,10 @@ mod tests {
         let mut world = World::new();
         let master_data = MasterDataRegistry::load().unwrap();
         world.insert_resource(ObjectiveAssignmentState {
-            by_player: HashMap::from([(player_id, HashMap::from([(entity, captured_port)]))]),
+            by_player: HashMap::from([(
+                player_id,
+                HashMap::from([(entity, RomUnitObjective::Position(captured_port))]),
+            )]),
             ..Default::default()
         });
 
@@ -1176,7 +1432,10 @@ mod tests {
         let mut world = World::new();
         let master_data = MasterDataRegistry::load().unwrap();
         world.insert_resource(ObjectiveAssignmentState {
-            by_player: HashMap::from([(player_id, HashMap::from([(entity, captured_port)]))]),
+            by_player: HashMap::from([(
+                player_id,
+                HashMap::from([(entity, RomUnitObjective::Position(captured_port))]),
+            )]),
             ..Default::default()
         });
 
@@ -1190,6 +1449,45 @@ mod tests {
         );
 
         assert_eq!(assignments[&entity], captured_port);
+    }
+
+    #[test]
+    fn transported_cargo_keeps_its_rom_record_objective() {
+        let player_id = PlayerId(1);
+        let entity = Entity::from_raw(0);
+        let objective = GridPosition { x: 4, y: 1 };
+        let map = Map::new(
+            8,
+            4,
+            crate::resources::Terrain::Plains,
+            crate::resources::GridTopology::Hex,
+        );
+        let properties = [(
+            objective,
+            Property::new(crate::resources::Terrain::City, Some(player_id), 200),
+        )];
+        let mut world = World::new();
+        let master_data = MasterDataRegistry::load().unwrap();
+        world.insert_resource(ObjectiveAssignmentState {
+            by_player: HashMap::from([(
+                player_id,
+                HashMap::from([(entity, RomUnitObjective::Position(objective))]),
+            )]),
+            ..Default::default()
+        });
+        let mut cargo = assignment_unit(entity, objective);
+        cargo.is_transported = true;
+
+        let assignments = update_objective_assignments(
+            &mut world,
+            &[cargo],
+            &properties,
+            &map,
+            &master_data,
+            player_id,
+        );
+
+        assert_eq!(assignments[&entity], objective);
     }
 
     #[test]
@@ -1347,6 +1645,7 @@ mod tests {
                 unit_type: UnitType::Recon,
                 record_order: 5,
                 has_cargo: false,
+                is_transported: false,
             },
             assignment_unit(Entity::from_raw(6), GridPosition { x: 7, y: 4 }),
             assignment_unit(Entity::from_raw(7), GridPosition { x: 6, y: 4 }),
@@ -1356,6 +1655,7 @@ mod tests {
                 unit_type: UnitType::Recon,
                 record_order: 8,
                 has_cargo: false,
+                is_transported: false,
             },
             assignment_unit(Entity::from_raw(9), GridPosition { x: 5, y: 3 }),
         ]);
@@ -1497,6 +1797,7 @@ mod tests {
             unit_type: UnitType::TransportHelicopter,
             record_order: 9,
             has_cargo: false,
+            is_transported: false,
         };
 
         let empty_assignment = update_objective_assignments(
@@ -1717,6 +2018,196 @@ mod tests {
                 target_pos: GridPosition { x: 2, y: 2 }
             }
         ));
+    }
+
+    #[test]
+    fn rom_influence_field_saturates_each_component_at_seven() {
+        let map = Map::new(
+            7,
+            5,
+            crate::resources::Terrain::Sea,
+            crate::resources::GridTopology::Hex,
+        );
+        let stats = UnitStats {
+            unit_type: UnitType::Battleship,
+            min_range: 1,
+            max_range: 1,
+            ..UnitStats::mock()
+        };
+        let enemies: Vec<_> = (0..3)
+            .map(|entity| EnemyView {
+                entity: Entity::from_raw(entity),
+                position: GridPosition { x: 4, y: 2 },
+                stats: stats.clone(),
+                hp: 100,
+            })
+            .collect();
+
+        let influence = build_rom_influence_field(&map, &enemies);
+
+        assert_eq!(
+            influence[&GridPosition { x: 3, y: 1 }],
+            RomInfluence {
+                anti_air: 7,
+                anti_surface: 7,
+            }
+        );
+        assert!(!influence.contains_key(&GridPosition { x: 4, y: 2 }));
+    }
+
+    #[test]
+    fn rom_influence_snapshot_is_kept_until_the_next_turn() {
+        let map = Map::new(
+            7,
+            5,
+            crate::resources::Terrain::Sea,
+            crate::resources::GridTopology::Hex,
+        );
+        let enemy = EnemyView {
+            entity: Entity::from_raw(1),
+            position: GridPosition { x: 4, y: 2 },
+            stats: UnitStats {
+                unit_type: UnitType::Battleship,
+                min_range: 1,
+                max_range: 1,
+                ..UnitStats::mock()
+            },
+            hp: 100,
+        };
+        let mut world = World::new();
+
+        let initial = rom_influence_for_turn(
+            &mut world,
+            PlayerId(1),
+            4,
+            &map,
+            std::slice::from_ref(&enemy),
+        );
+        let after_enemy_removed = rom_influence_for_turn(&mut world, PlayerId(1), 4, &map, &[]);
+        let next_turn = rom_influence_for_turn(&mut world, PlayerId(1), 5, &map, &[]);
+
+        assert_eq!(after_enemy_removed, initial);
+        assert!(next_turn.is_empty());
+    }
+
+    #[test]
+    fn mission_three_selects_first_reachable_influence_maximum_instead_of_map_edge() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let map = Map::new(
+            7,
+            5,
+            crate::resources::Terrain::Sea,
+            crate::resources::GridTopology::Hex,
+        );
+        let mut actor = unit(0, MovementType::Ship, GridPosition { x: 1, y: 2 });
+        actor.stats.unit_type = UnitType::Battleship;
+        let enemy = EnemyView {
+            entity: Entity::from_raw(1),
+            position: GridPosition { x: 4, y: 2 },
+            stats: UnitStats {
+                unit_type: UnitType::Battleship,
+                min_range: 1,
+                max_range: 1,
+                ..UnitStats::mock()
+            },
+            hp: 100,
+        };
+        let influence = build_rom_influence_field(&map, &[enemy]);
+        let assignments = HashMap::new();
+        let properties = [];
+
+        let objective = resolve_rom_movement_objective(
+            &actor,
+            RomUnitObjective::DynamicInfluence,
+            &RomMovementObjectiveContext {
+                cargo: None,
+                assignments: &assignments,
+                influence: &influence,
+                properties: &properties,
+                map: &map,
+                master_data: &master_data,
+                player_id: PlayerId(1),
+            },
+        );
+
+        assert_eq!(objective, Some(GridPosition { x: 3, y: 1 }));
+    }
+
+    #[test]
+    fn mission_three_without_positive_influence_falls_back_to_enemy_capital() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let map = Map::new(
+            7,
+            5,
+            crate::resources::Terrain::Sea,
+            crate::resources::GridTopology::Hex,
+        );
+        let mut actor = unit(0, MovementType::Ship, GridPosition { x: 1, y: 2 });
+        actor.stats.unit_type = UnitType::Battleship;
+        let enemy_capital = GridPosition { x: 5, y: 2 };
+        let properties = [(
+            enemy_capital,
+            Property::new(crate::resources::Terrain::Capital, Some(PlayerId(2)), 200),
+        )];
+        let assignments = HashMap::new();
+        let influence = HashMap::new();
+
+        let objective = resolve_rom_movement_objective(
+            &actor,
+            RomUnitObjective::DynamicInfluence,
+            &RomMovementObjectiveContext {
+                cargo: None,
+                assignments: &assignments,
+                influence: &influence,
+                properties: &properties,
+                map: &map,
+                master_data: &master_data,
+                player_id: PlayerId(1),
+            },
+        );
+
+        assert_eq!(objective, Some(enemy_capital));
+    }
+
+    #[test]
+    fn loaded_lander_uses_the_last_cargo_objective_like_rom_49b6() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let map = Map::new(
+            7,
+            5,
+            crate::resources::Terrain::Sea,
+            crate::resources::GridTopology::Hex,
+        );
+        let mut actor = unit(0, MovementType::Ship, GridPosition { x: 1, y: 2 });
+        actor.stats.unit_type = UnitType::Lander;
+        let first = Entity::from_raw(1);
+        let last = Entity::from_raw(2);
+        let last_objective = GridPosition { x: 5, y: 3 };
+        let assignments = HashMap::from([
+            (
+                first,
+                RomUnitObjective::Position(GridPosition { x: 4, y: 1 }),
+            ),
+            (last, RomUnitObjective::Position(last_objective)),
+        ]);
+        let influence = HashMap::new();
+        let properties = [];
+
+        let objective = resolve_rom_movement_objective(
+            &actor,
+            RomUnitObjective::DynamicInfluence,
+            &RomMovementObjectiveContext {
+                cargo: Some(&[first, last]),
+                assignments: &assignments,
+                influence: &influence,
+                properties: &properties,
+                map: &map,
+                master_data: &master_data,
+                player_id: PlayerId(1),
+            },
+        );
+
+        assert_eq!(objective, Some(last_objective));
     }
 
     #[test]

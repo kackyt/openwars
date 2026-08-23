@@ -24,7 +24,8 @@ const UNIT_VALUES_7: [u8; 24] = [
 #[derive(Clone, Copy)]
 pub(crate) struct RomScenarioData {
     pub(crate) opening_limit: u32,
-    pub(crate) has_radar_transport: bool,
+    /// ROMシナリオレコード+0x12。0以外なら偵察車の任務状態を3へ固定する。
+    pub(crate) recon_uses_mission_three: bool,
     strategic_objectives: [[(u8, u8); 2]; 2],
     unit_values: &'static [u8; 24],
     production_limits: [[u8; 24]; 4],
@@ -39,14 +40,8 @@ impl RomScenarioData {
     pub(crate) fn production_limit(self, strategy: ProductionStrategy, unit_type: UnitType) -> u32 {
         let table = &self.production_limits[strategy.index()];
         let index = usize::from(GbUnitKind::production_order(unit_type) / 2);
-        let mut limit = u32::from(table[index]);
-        // OpenWarsにない輸送機0x20と潜水艦0x2Eは、能力が最も近い既存兵種へ集約する。
-        if unit_type == UnitType::TransportHelicopter {
-            limit = limit.saturating_add(u32::from(table[0x20 / 2]));
-        } else if unit_type == UnitType::Battleship {
-            limit = limit.saturating_add(u32::from(table[0x2E / 2]));
-        }
-        limit
+        // OpenWarsに存在しない兵種の枠は、似た兵種へ合算せずROM表上で捨てる。
+        u32::from(table[index])
     }
 
     /// ROM 0AE9がシナリオレコード+0x90〜+0x97から読む陣営別の固定目標。
@@ -75,7 +70,7 @@ impl RomScenarioData {
 
 const MAP_1: RomScenarioData = RomScenarioData {
     opening_limit: 3,
-    has_radar_transport: false,
+    recon_uses_mission_three: false,
     strategic_objectives: [[(3, 8), (7, 12)], [(8, 8), (5, 5)]],
     unit_values: &UNIT_VALUES_4,
     production_limits: [
@@ -96,7 +91,7 @@ const MAP_1: RomScenarioData = RomScenarioData {
 
 const MAP_2: RomScenarioData = RomScenarioData {
     opening_limit: 2,
-    has_radar_transport: false,
+    recon_uses_mission_three: false,
     strategic_objectives: [[(9, 9), (11, 7)], [(3, 8), (5, 6)]],
     unit_values: &UNIT_VALUES_7,
     production_limits: [
@@ -117,7 +112,7 @@ const MAP_2: RomScenarioData = RomScenarioData {
 
 const MAP_3: RomScenarioData = RomScenarioData {
     opening_limit: 4,
-    has_radar_transport: false,
+    recon_uses_mission_three: false,
     strategic_objectives: [[(22, 12), (7, 19)], [(7, 19), (22, 12)]],
     unit_values: &UNIT_VALUES_7,
     production_limits: [
@@ -138,7 +133,7 @@ const MAP_3: RomScenarioData = RomScenarioData {
 
 const MAP_4: RomScenarioData = RomScenarioData {
     opening_limit: 3,
-    has_radar_transport: false,
+    recon_uses_mission_three: false,
     strategic_objectives: [[(21, 4), (14, 14)], [(13, 4), (6, 12)]],
     unit_values: &UNIT_VALUES_7,
     production_limits: [
@@ -159,7 +154,7 @@ const MAP_4: RomScenarioData = RomScenarioData {
 
 const MAP_5: RomScenarioData = RomScenarioData {
     opening_limit: 2,
-    has_radar_transport: true,
+    recon_uses_mission_three: true,
     strategic_objectives: [[(9, 4), (9, 6)], [(2, 4), (2, 6)]],
     unit_values: &UNIT_VALUES_4,
     production_limits: [
@@ -180,7 +175,7 @@ const MAP_5: RomScenarioData = RomScenarioData {
 
 const MAP_6: RomScenarioData = RomScenarioData {
     opening_limit: 3,
-    has_radar_transport: true,
+    recon_uses_mission_three: true,
     strategic_objectives: [[(17, 7), (23, 17)], [(15, 15), (8, 8)]],
     unit_values: &UNIT_VALUES_5,
     production_limits: [
@@ -201,7 +196,7 @@ const MAP_6: RomScenarioData = RomScenarioData {
 
 const MAP_7: RomScenarioData = RomScenarioData {
     opening_limit: 2,
-    has_radar_transport: false,
+    recon_uses_mission_three: false,
     strategic_objectives: [[(9, 4), (11, 14)], [(9, 14), (9, 4)]],
     unit_values: &UNIT_VALUES_7,
     production_limits: [
@@ -222,7 +217,7 @@ const MAP_7: RomScenarioData = RomScenarioData {
 
 const MAP_8: RomScenarioData = RomScenarioData {
     opening_limit: 3,
-    has_radar_transport: false,
+    recon_uses_mission_three: false,
     strategic_objectives: [[(17, 5), (15, 14)], [(5, 5), (7, 13)]],
     unit_values: &UNIT_VALUES_6,
     production_limits: [
@@ -298,6 +293,11 @@ mod tests {
         assert_eq!(
             scenario.production_limit(ProductionStrategy::Opening, UnitType::TransportHelicopter),
             3
+        );
+        // 潜水艦の上限1は戦艦へ合算せず、戦艦自身の上限4だけを使う。
+        assert_eq!(
+            scenario.production_limit(ProductionStrategy::Advantage, UnitType::Battleship),
+            4
         );
         assert_eq!(scenario.unit_value(UnitType::Bcopters), 30);
     }

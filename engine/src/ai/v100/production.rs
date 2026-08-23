@@ -162,7 +162,7 @@ pub(crate) fn decide_production(
                 pickup_candidates,
             );
         if let Some(mode) = special_mode {
-            for unit_type in special_production_types(mode, scenario.has_radar_transport) {
+            for unit_type in special_production_types(mode) {
                 if let Some(command) = command_for_unit(
                     player_id,
                     unit_type,
@@ -296,19 +296,10 @@ fn command_for_unit(
         })
 }
 
-fn special_production_types(
-    mode: super::rom_logic::SpecialProductionMode,
-    has_radar_transport: bool,
-) -> Vec<UnitType> {
+fn special_production_types(mode: super::rom_logic::SpecialProductionMode) -> Vec<UnitType> {
     match mode {
-        super::rom_logic::SpecialProductionMode::Mobility => {
-            let mut result = vec![UnitType::Lander];
-            if has_radar_transport {
-                // 0x20レーダー輸送機はOpenWarsでは最も近い輸送ヘリへ対応させる。
-                result.push(UnitType::TransportHelicopter);
-            }
-            result
-        }
+        // OpenWarsに存在しないレーダー輸送機は候補から捨て、揚陸艦だけを残す。
+        super::rom_logic::SpecialProductionMode::Mobility => vec![UnitType::Lander],
         super::rom_logic::SpecialProductionMode::Pickup => {
             vec![UnitType::TransportHelicopter, UnitType::Recon]
         }
@@ -483,5 +474,13 @@ mod tests {
         assert_eq!(combined_force_and_property_share(60, 40, 8, 2), 70);
         assert_eq!(combined_force_and_property_share(40, 60, 2, 8), 30);
         assert_eq!(combined_force_and_property_share(0, 0, 0, 0), 50);
+    }
+
+    #[test]
+    fn unsupported_radar_transport_is_not_replaced_with_transport_helicopter() {
+        assert_eq!(
+            special_production_types(super::super::rom_logic::SpecialProductionMode::Mobility),
+            vec![UnitType::Lander]
+        );
     }
 }
