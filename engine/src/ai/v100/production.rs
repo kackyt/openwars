@@ -1,15 +1,14 @@
-//! Gameboy Wars Turboの生産走査を模擬するV100/V200専用実装。
+//! Gameboy Wars Turboの生産状態機械を移植したV100/V200専用実装。
 
-use super::compatibility_profile::{ProductionRole, preferred_production_role, production_role};
 use crate::ai::engine::AiProductionCooldown;
-use crate::components::{Faction, GridPosition, PlayerId, Property};
+use crate::components::{Faction, GridPosition, Health, PlayerId, Property};
 use crate::events::ProduceUnitCommand;
 use crate::resources::{
-    Map, MasterDataRegistry, MovementType, Players, Terrain, UnitRegistry, UnitType,
+    DamageChart, Map, MasterDataRegistry, MatchState, Players, Terrain, UnitRegistry, UnitType,
 };
 use bevy_ecs::prelude::*;
 use std::cmp::Reverse;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// V100/V200専用の単発生産判断。既存V1〜V4の生産計画を使用しない。
 pub(crate) fn decide_production(
@@ -24,37 +23,46 @@ pub(crate) fn decide_production(
         .funds;
     let master_data = world.get_resource::<MasterDataRegistry>()?.clone();
     let registry = world.get_resource::<UnitRegistry>()?.clone();
+    let damage_chart = world.get_resource::<DamageChart>()?.clone();
+    let map = world.get_resource::<Map>()?.clone();
+    let scenario = super::rom_data::identify_scenario(&map, &master_data)?;
+    let turn = world.get_resource::<MatchState>()?.current_turn_number.0;
     let used = world
         .get_resource::<AiProductionCooldown>()
         .map(|value| value.0.clone())
         .unwrap_or_default();
-    let (occupied, friendly_positions, friendly_unit_count, air_unit_count, ship_unit_count): (
-        HashSet<_>,
-        HashSet<_>,
-        usize,
-        usize,
-        usize,
-    ) = {
-        let mut query = world.query::<(&GridPosition, &Faction, &crate::components::UnitStats)>();
+    let (occupied, friendly_counts, enemy_counts, own_force_value, enemy_force_value) = {
+        let mut query = world.query::<(
+            &GridPosition,
+            &Faction,
+            &crate::components::UnitStats,
+            &Health,
+        )>();
         let mut positions = HashSet::new();
-        let mut friendly = HashSet::new();
-        let mut air_units = 0;
-        let mut ship_units = 0;
-        let mut unit_count = 0;
-        for (position, faction, stats) in query.iter(world) {
+        let mut friendly = HashMap::<UnitType, u32>::new();
+        let mut enemy = HashMap::<UnitType, u32>::new();
+        let mut own_value = 0_u64;
+        let mut enemy_value = 0_u64;
+        for (position, faction, stats, health) in query.iter(world) {
             positions.insert((position.x, position.y));
+            // ROM 6317/635Bは5152のシナリオ別兵種価値へレコード+8のHPを掛ける。
+            let force_value = u64::from(scenario.unit_value(stats.unit_type))
+                .saturating_mul(u64::from(health.current))
+                / u64::from(health.max.max(1));
             if faction.0 == player_id {
-                unit_count += 1;
-                friendly.insert((position.x, position.y));
-                if stats.movement_type == MovementType::Air {
-                    air_units += 1;
-                } else if stats.movement_type == MovementType::Ship {
-                    ship_units += 1;
-                }
+                *friendly.entry(stats.unit_type).or_default() += 1;
+                own_value = own_value.saturating_add(force_value);
+            } else {
+                *enemy.entry(stats.unit_type).or_default() += 1;
+                enemy_value = enemy_value.saturating_add(force_value);
             }
         }
-        (positions, friendly, unit_count, air_units, ship_units)
+        (positions, friendly, enemy, own_value, enemy_value)
     };
+    // ROM 5EA1は1陣営40部隊で生産を打ち切る。
+    //if friendly_counts.values().copied().sum::<u32>() >= 40 {
+    //    return None;
+    //}
     let all_properties: Vec<_> = {
         let mut query = world.query::<(&GridPosition, &Property)>();
         query
@@ -62,20 +70,58 @@ pub(crate) fn decide_production(
             .map(|(position, property)| (*position, *property))
             .collect()
     };
+    let owned_capitals: Vec<_> = all_properties
+        .iter()
+        .filter_map(|(position, property)| {
+            (property.owner_id == Some(player_id) && property.terrain == Terrain::Capital)
+                .then_some(*position)
+        })
+        .collect();
     let all_owned_facilities: Vec<_> = all_properties
         .iter()
         .filter_map(|(position, property)| {
             (property.owner_id == Some(player_id)
-                && matches!(
-                    property.terrain,
-                    Terrain::Capital | Terrain::Factory | Terrain::Airport | Terrain::Port
+                && is_rom_production_terrain(property.terrain)
+                // ROM 2259/22C1は自軍首都から疑似hex距離3以内だけを許可する。
+                && crate::systems::production::is_within_production_range(
+                    &owned_capitals,
+                    position.x,
+                    position.y,
+                    map.topology,
                 ))
             .then_some((*position, property.terrain))
         })
         .collect();
-    let map = world.get_resource::<Map>()?.clone();
+    let own_property_count = all_properties
+        .iter()
+        .filter(|(_, property)| property.owner_id == Some(player_id))
+        .count() as u64;
+    let enemy_property_count = all_properties
+        .iter()
+        .filter(|(_, property)| {
+            property
+                .owner_id
+                .is_some_and(|owner_id| owner_id != player_id)
+        })
+        .count() as u64;
+    // ROM 5FA8は序盤期限中だけC6AD=0を保持する。期限を過ぎると、既存のC6ADが
+    // 非0でも6317/635Bを毎回呼び、戦力比と拠点比から1〜3を引き直す。
+    let strategy = if turn <= scenario.opening_limit {
+        super::rom_logic::ProductionStrategy::Opening
+    } else {
+        let own_share_percent = combined_force_and_property_share(
+            own_force_value,
+            enemy_force_value,
+            own_property_count,
+            enemy_property_count,
+        );
+        super::rom_logic::production_strategy(own_share_percent)
+    };
+    world
+        .get_resource_or_insert_with(super::rom_logic::RomAiState::default)
+        .set_production_strategy(player_id, strategy);
 
-    // GB版では都市は補給地点だが生産地点ではない。
+    // ROM 5F2Cは地上部隊について首都0x30、工場0x32、都市0x3Aを順に試す。
     let mut facilities: Vec<_> = all_owned_facilities
         .iter()
         .copied()
@@ -84,281 +130,225 @@ pub(crate) fn decide_production(
                 && !used.contains(&(position.x, position.y))
         })
         .collect();
-    let owned_capital = all_owned_facilities
-        .iter()
-        .find_map(|(position, terrain)| (*terrain == Terrain::Capital).then_some(*position));
     let enemy_capital = all_properties.iter().find_map(|(position, property)| {
         (property.terrain == Terrain::Capital && property.owner_id != Some(player_id))
             .then_some(*position)
     });
-    if let Some(capital) = owned_capital {
-        let forward_y = enemy_capital.map_or(1, |enemy| if enemy.y >= capital.y { 1 } else { -1 });
-        // ROMの施設テーブルは首都を先頭に、敵首都方向の列を右から、同じ行を
-        // 右から左へ並べる。特定マップの座標ではなく、両首都の相対方向から順序を決める。
+    if let Some(enemy_capital) = enemy_capital {
+        // ROM 43CC/5F51は敵首都を起点に疑似hexの一様距離フィールドを作り、値が
+        // 小さい生産施設を選ぶ。同値ならCEA0の施設レコードを後から走査した側が勝つ。
         facilities.sort_by_key(|(position, terrain)| {
-            production_facility_priority(*position, *terrain, capital, forward_y)
+            production_facility_priority(*position, *terrain, enemy_capital, &map)
         });
     } else {
-        facilities.sort_by_key(|(position, _)| (position.y, position.x));
+        facilities.sort_by_key(|(position, terrain)| {
+            (
+                u8::from(*terrain != Terrain::Capital),
+                Reverse(position.y),
+                Reverse(position.x),
+            )
+        });
     }
-    // 初回手番だけ共通フェーズイベントがcooldownを消す場合があるため、すでに
-    // 部隊で埋まった生産施設も発行済みスロットとして数える。
-    let occupied_facility_count = all_owned_facilities
-        .iter()
-        .filter(|(position, _)| friendly_positions.contains(&(position.x, position.y)))
-        .count();
-    let production_slot = used.len().max(occupied_facility_count);
-    if map_requires_mobile_transport(&map, &all_properties, player_id) {
-        if let Some(role) = island_opening_role(friendly_unit_count) {
-            let mut island_facilities = facilities.clone();
-            if let Some(capital) = owned_capital {
-                let advance_right = enemy_capital.is_none_or(|enemy| enemy.x >= capital.x);
-                island_facilities.sort_by_key(|(position, terrain)| {
-                    island_facility_priority(*position, *terrain, capital, advance_right)
-                });
-            }
-            return choose_island_opening_production(IslandOpeningContext {
+    let (mobility_shortages, pickup_candidates) = world
+        .get_resource::<super::rom_logic::RomAiState>()
+        .map_or((0, 0), |state| state.production_counters(player_id));
+    if strategy != super::rom_logic::ProductionStrategy::Opening {
+        let special_mode = world
+            .get_resource_or_insert_with(super::rom_logic::RomAiState::default)
+            .special_production_mode_for_turn(
                 player_id,
-                funds,
-                role,
-                master_data: &master_data,
-                registry: &registry,
-                facilities: &island_facilities,
-            });
-        }
-        if !used.is_empty() {
-            // 初期編成表の末尾へ到達した手番ではそこで生産走査を終える。
-            // 次の手番（cooldownが空）からは盤面編成による通常判断へ移行する。
+                turn,
+                mobility_shortages,
+                pickup_candidates,
+            );
+        if let Some(mode) = special_mode {
+            for unit_type in special_production_types(mode, scenario.has_radar_transport) {
+                if let Some(command) = command_for_unit(
+                    player_id,
+                    unit_type,
+                    funds,
+                    strategy,
+                    scenario,
+                    &friendly_counts,
+                    &facilities,
+                    &registry,
+                    &master_data,
+                ) {
+                    let mut state =
+                        world.get_resource_or_insert_with(super::rom_logic::RomAiState::default);
+                    match unit_type {
+                        UnitType::TransportHelicopter => {
+                            state.consume_pickup_candidates(player_id, 1)
+                        }
+                        UnitType::Recon => state.consume_pickup_candidates(player_id, 2),
+                        UnitType::Lander => state.consume_mobility_shortages(player_id, 2),
+                        _ => {}
+                    }
+                    return Some(command);
+                }
+            }
+            // 特殊生産を選んだ手番は、その候補を作れなくなった時点で終了する。
             return None;
         }
     }
-    // GBの最初の生産手番は5施設すべて歩兵系。全初期部隊が施設上にいる間だけ
-    // 初期配備とみなし、次の手番から観測済みの3兵種周期へ移る。
-    let initial_deployment = friendly_positions.len() == occupied_facility_count;
-    let preferred_role = if initial_deployment {
-        ProductionRole::Capturer
-    } else {
-        preferred_production_role(production_slot)
-    };
 
-    for (position, terrain) in facilities {
-        if matches!(terrain, Terrain::Airport | Terrain::Port) {
-            if let Some(unit_type) = preferred_transport_facility_unit(
-                &registry,
-                &master_data,
-                terrain,
-                funds,
-                if terrain == Terrain::Airport {
-                    air_unit_count
-                } else {
-                    ship_unit_count
-                },
-            ) {
-                return Some(ProduceUnitCommand {
-                    player_id,
-                    target_x: position.x,
-                    target_y: position.y,
-                    unit_type,
-                });
-            }
+    let mut unit_types: Vec<_> = registry.0.keys().copied().collect();
+    unit_types.sort_by_key(|unit_type| super::rom_logic::GbUnitKind::production_order(*unit_type));
+    let mut best: Option<(u32, ProduceUnitCommand)> = None;
+    for unit_type in unit_types {
+        let Some(command) = command_for_unit(
+            player_id,
+            unit_type,
+            funds,
+            strategy,
+            scenario,
+            &friendly_counts,
+            &facilities,
+            &registry,
+            &master_data,
+        ) else {
             continue;
-        }
-        let mut preferred = None;
-        let mut fallback = None;
-        for (unit_type, stats) in &registry.0 {
-            if stats.cost > funds || !master_data.can_produce_unit(terrain.as_str(), *unit_type) {
-                continue;
-            }
-            let key = (stats.cost, *unit_type as u8);
-            if fallback.as_ref().is_none_or(|(current, _)| key < *current) {
-                fallback = Some((key, *unit_type));
-            }
-            if production_role(stats) == Some(preferred_role)
-                && preferred.as_ref().is_none_or(|(current, _)| key < *current)
-            {
-                preferred = Some((key, *unit_type));
-            }
-        }
-        if let Some((_, unit_type)) = preferred.or(fallback) {
-            return Some(ProduceUnitCommand {
-                player_id,
-                target_x: position.x,
-                target_y: position.y,
-                unit_type,
-            });
-        }
-    }
-    None
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IslandOpeningRole {
-    Capturer,
-    MobileCombat,
-    MobileTransport,
-    DirectGround,
-    FastGround,
-}
-
-struct IslandOpeningContext<'a> {
-    player_id: PlayerId,
-    funds: u32,
-    role: IslandOpeningRole,
-    master_data: &'a MasterDataRegistry,
-    registry: &'a UnitRegistry,
-    facilities: &'a [(GridPosition, Terrain)],
-}
-
-/// ROMの初期部隊レコード数に応じた島嶼マップ用の編成表。
-/// 座標やマップ名ではなく、現在生存している編成から次に不足する能力を決める。
-fn island_opening_role(unit_count: usize) -> Option<IslandOpeningRole> {
-    use IslandOpeningRole::{
-        Capturer as I, DirectGround as A, FastGround as R, MobileCombat as B, MobileTransport as T,
-    };
-    const OPENING: [IslandOpeningRole; 20] =
-        [I, I, I, B, I, I, I, B, I, T, I, I, T, A, I, I, B, T, T, R];
-    OPENING.get(unit_count).copied()
-}
-
-fn choose_island_opening_production(
-    context: IslandOpeningContext<'_>,
-) -> Option<ProduceUnitCommand> {
-    for (position, terrain) in context.facilities {
-        let unit_type = context
-            .registry
-            .0
-            .iter()
-            .filter(|(unit_type, stats)| {
-                stats.cost <= context.funds
-                    && context
-                        .master_data
-                        .can_produce_unit(terrain.as_str(), **unit_type)
-                    && island_role_matches(stats, context.role)
-            })
-            .min_by_key(|(unit_type, stats)| (stats.cost, **unit_type as u8))
-            .map(|(unit_type, _)| *unit_type);
-        if let Some(unit_type) = unit_type {
-            return Some(ProduceUnitCommand {
-                player_id: context.player_id,
-                target_x: position.x,
-                target_y: position.y,
-                unit_type,
-            });
+        };
+        let remaining = scenario
+            .production_limit(strategy, unit_type)
+            .saturating_sub(friendly_counts.get(&unit_type).copied().unwrap_or_default());
+        let score = if strategy == super::rom_logic::ProductionStrategy::Opening {
+            // ROM 6367: 5152(kind, 99) × 残り保有枠。
+            scenario
+                .unit_value(unit_type)
+                .saturating_mul(99)
+                .saturating_mul(remaining)
+        } else {
+            // ROM 6190: 候補と敵兵種の各組について、攻撃相性×敵数×残り枠の最大値。
+            enemy_counts
+                .iter()
+                .map(|(enemy_type, count)| {
+                    let damage = damage_chart
+                        .get_base_damage(unit_type, *enemy_type)
+                        .unwrap_or_default()
+                        .max(
+                            damage_chart
+                                .get_base_damage_secondary(unit_type, *enemy_type)
+                                .unwrap_or_default(),
+                        );
+                    damage.saturating_mul(*count).saturating_mul(remaining)
+                })
+                .max()
+                .unwrap_or_default()
+        };
+        // ROM 6205/63C6は厳密に大きい場合だけ更新し、兵種表で先の候補を保持する。
+        if score > best.as_ref().map_or(0, |(best_score, _)| *best_score) {
+            best = Some((score, command));
         }
     }
-    None
-}
-
-fn island_role_matches(stats: &crate::components::UnitStats, role: IslandOpeningRole) -> bool {
-    match role {
-        IslandOpeningRole::Capturer => stats.can_capture,
-        IslandOpeningRole::MobileCombat => {
-            matches!(stats.movement_type, MovementType::Air | MovementType::Ship)
-                && !super::compatibility_profile::is_gbw_transport(stats)
-                && (stats.max_ammo1 > 0 || stats.max_ammo2 > 0)
-        }
-        IslandOpeningRole::MobileTransport => super::compatibility_profile::is_gbw_transport(stats),
-        IslandOpeningRole::DirectGround => {
-            stats.movement_type == MovementType::Tank
-                && stats.max_movement >= 5
-                && stats.min_range <= 1
-                && (stats.max_ammo1 > 0 || stats.max_ammo2 > 0)
-        }
-        IslandOpeningRole::FastGround => production_role(stats) == Some(ProductionRole::FastGround),
+    if let Some((_, command)) = best {
+        return Some(command);
     }
+
+    // ROM 640Cはその生産フェーズでまだ1部隊も作っていない場合だけ歩兵を試す。
+    used.is_empty().then(|| {
+        command_for_unit(
+            player_id,
+            UnitType::Infantry,
+            funds,
+            strategy,
+            scenario,
+            &friendly_counts,
+            &facilities,
+            &registry,
+            &master_data,
+        )
+    })?
 }
 
-fn map_requires_mobile_transport(
-    map: &Map,
-    properties: &[(GridPosition, Property)],
-    player_id: PlayerId,
-) -> bool {
-    let island_map = crate::ai::islands::IslandMap::analyze(map);
-    let base_island = properties
-        .iter()
-        .find(|(_, property)| {
-            property.owner_id == Some(player_id) && property.terrain == Terrain::Capital
-        })
-        .and_then(|(position, _)| island_map.get_island_at(position))
-        .map(|island| island.id);
-    properties.iter().any(|(position, property)| {
-        property.owner_id != Some(player_id)
-            && property.max_capture_points > 0
-            && island_map
-                .get_island_at(position)
-                .is_some_and(|island| Some(island.id) != base_island)
-    })
-}
-
-fn island_facility_priority(
-    position: GridPosition,
-    terrain: Terrain,
-    capital: GridPosition,
-    advance_right: bool,
-) -> (u8, usize, Reverse<usize>, u8) {
-    let capital_rank = u8::from(position != capital || terrain != Terrain::Capital);
-    let horizontal_rank = if advance_right {
-        usize::MAX - position.x
-    } else {
-        position.x
-    };
-    (
-        capital_rank,
-        horizontal_rank,
-        Reverse(position.y),
-        terrain as u8,
+fn is_rom_production_terrain(terrain: Terrain) -> bool {
+    matches!(
+        terrain,
+        Terrain::Capital | Terrain::City | Terrain::Factory | Terrain::Airport | Terrain::Port
     )
 }
 
-/// 空港・港では、ROMで観測した「戦闘輸送輸送」の巡回を能力で対応付ける。
-/// 最初の1機だけ戦闘部隊を先行させ、その後は3機周期で護衛1・輸送2とする。
-fn preferred_transport_facility_unit(
+#[allow(clippy::too_many_arguments)]
+fn command_for_unit(
+    player_id: PlayerId,
+    unit_type: UnitType,
+    funds: u32,
+    strategy: super::rom_logic::ProductionStrategy,
+    scenario: super::rom_data::RomScenarioData,
+    friendly_counts: &HashMap<UnitType, u32>,
+    facilities: &[(GridPosition, Terrain)],
     registry: &UnitRegistry,
     master_data: &MasterDataRegistry,
-    terrain: Terrain,
-    funds: u32,
-    produced_mobile_count: usize,
-) -> Option<UnitType> {
-    let prefer_combat = prefers_combat_mobile(produced_mobile_count);
-    registry
-        .0
+) -> Option<ProduceUnitCommand> {
+    let stats = registry.0.get(&unit_type)?;
+    let current = friendly_counts.get(&unit_type).copied().unwrap_or_default();
+    if stats.cost > funds || current >= scenario.production_limit(strategy, unit_type) {
+        return None;
+    }
+    facilities
         .iter()
-        .filter(|(unit_type, stats)| {
-            stats.cost <= funds
-                && master_data.can_produce_unit(terrain.as_str(), **unit_type)
-                && if prefer_combat {
-                    !super::compatibility_profile::is_gbw_transport(stats)
-                        && (stats.max_ammo1 > 0 || stats.max_ammo2 > 0)
-                } else {
-                    super::compatibility_profile::is_gbw_transport(stats)
-                }
+        .find(|(_, terrain)| master_data.can_produce_unit(terrain.as_str(), unit_type))
+        .map(|(position, _)| ProduceUnitCommand {
+            player_id,
+            target_x: position.x,
+            target_y: position.y,
+            unit_type,
         })
-        .min_by_key(|(unit_type, stats)| (stats.cost, **unit_type as u8))
-        .map(|(unit_type, _)| *unit_type)
 }
 
-fn prefers_combat_mobile(produced_mobile_count: usize) -> bool {
-    produced_mobile_count == 0 || (produced_mobile_count - 1).is_multiple_of(3)
+fn special_production_types(
+    mode: super::rom_logic::SpecialProductionMode,
+    has_radar_transport: bool,
+) -> Vec<UnitType> {
+    match mode {
+        super::rom_logic::SpecialProductionMode::Mobility => {
+            let mut result = vec![UnitType::Lander];
+            if has_radar_transport {
+                // 0x20レーダー輸送機はOpenWarsでは最も近い輸送ヘリへ対応させる。
+                result.push(UnitType::TransportHelicopter);
+            }
+            result
+        }
+        super::rom_logic::SpecialProductionMode::Pickup => {
+            vec![UnitType::TransportHelicopter, UnitType::Recon]
+        }
+    }
 }
 
 fn production_facility_priority(
     position: GridPosition,
     terrain: Terrain,
-    capital: GridPosition,
-    forward_y: i32,
-) -> (u8, u8, Reverse<i32>, Reverse<usize>, usize) {
+    enemy_capital: GridPosition,
+    map: &Map,
+) -> (u8, u32, Reverse<usize>, Reverse<usize>) {
     if terrain == Terrain::Capital {
-        return (0, 0, Reverse(0), Reverse(position.x), position.y);
+        return (0, 0, Reverse(position.y), Reverse(position.x));
     }
-    let progress = (position.y as i32 - capital.y as i32) * forward_y;
-    let band = if progress > 0 {
-        0
-    } else if progress == 0 {
-        1
-    } else {
-        2
-    };
-    (1, band, Reverse(progress), Reverse(position.x), position.y)
+    (
+        1,
+        map.distance(position.x, position.y, enemy_capital.x, enemy_capital.y),
+        Reverse(position.y),
+        Reverse(position.x),
+    )
+}
+
+/// ROM 5FA8〜6026と同じく、戦力比と所有拠点比を百分率にして平均する。
+fn combined_force_and_property_share(
+    own_force: u64,
+    enemy_force: u64,
+    own_properties: u64,
+    enemy_properties: u64,
+) -> u32 {
+    fn share(own: u64, enemy: u64) -> u32 {
+        let total = own.saturating_add(enemy);
+        if total == 0 {
+            50
+        } else {
+            own.saturating_mul(100).saturating_div(total) as u32
+        }
+    }
+
+    (share(own_force, enemy_force) + share(own_properties, enemy_properties)) / 2
 }
 
 #[cfg(test)]
@@ -366,8 +356,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn city_is_a_ground_production_facility_like_rom_5f2c() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let capitals = [GridPosition { x: 0, y: 0 }];
+
+        assert!(is_rom_production_terrain(Terrain::City));
+        assert!(master_data.can_produce_unit(Terrain::City.as_str(), UnitType::Rockets));
+        assert!(crate::systems::production::is_within_production_range(
+            &capitals,
+            3,
+            0,
+            crate::resources::GridTopology::Square,
+        ));
+        assert!(!crate::systems::production::is_within_production_range(
+            &capitals,
+            4,
+            0,
+            crate::resources::GridTopology::Square,
+        ));
+    }
+
+    #[test]
     fn map1_red_facilities_follow_observed_rom_order() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master_data,
+            "map_1",
+            crate::resources::GridTopology::Hex,
+        )
+        .unwrap();
+        let map = world.resource::<Map>();
         let capital = GridPosition { x: 6, y: 3 };
+        let enemy_capital = GridPosition { x: 3, y: 11 };
         let mut facilities = [
             (GridPosition { x: 5, y: 3 }, Terrain::Factory),
             (capital, Terrain::Capital),
@@ -376,7 +396,7 @@ mod tests {
             (GridPosition { x: 7, y: 4 }, Terrain::Factory),
         ];
         facilities.sort_by_key(|(position, terrain)| {
-            production_facility_priority(*position, *terrain, capital, 1)
+            production_facility_priority(*position, *terrain, enemy_capital, map)
         });
 
         assert_eq!(
@@ -393,7 +413,16 @@ mod tests {
 
     #[test]
     fn map1_white_facilities_mirror_the_same_rom_order() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master_data,
+            "map_1",
+            crate::resources::GridTopology::Hex,
+        )
+        .unwrap();
+        let map = world.resource::<Map>();
         let capital = GridPosition { x: 3, y: 11 };
+        let enemy_capital = GridPosition { x: 6, y: 3 };
         let mut facilities = [
             (GridPosition { x: 3, y: 10 }, Terrain::Factory),
             (GridPosition { x: 4, y: 10 }, Terrain::Factory),
@@ -402,7 +431,7 @@ mod tests {
             (GridPosition { x: 4, y: 11 }, Terrain::Factory),
         ];
         facilities.sort_by_key(|(position, terrain)| {
-            production_facility_priority(*position, *terrain, capital, -1)
+            production_facility_priority(*position, *terrain, enemy_capital, map)
         });
 
         assert_eq!(
@@ -418,10 +447,41 @@ mod tests {
     }
 
     #[test]
-    fn mobile_mix_is_derived_from_composition_instead_of_map_or_turn() {
-        let sequence: Vec<_> = (0..7).map(prefers_combat_mobile).collect();
+    fn map3_red_factories_follow_rom_field_values_and_late_ties() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master_data,
+            "map_3",
+            crate::resources::GridTopology::Hex,
+        )
+        .unwrap();
+        let map = world.resource::<Map>();
+        let enemy_capital = GridPosition { x: 23, y: 23 };
+        let mut facilities = [
+            (GridPosition { x: 4, y: 5 }, Terrain::Factory),
+            (GridPosition { x: 6, y: 5 }, Terrain::Factory),
+            (GridPosition { x: 5, y: 6 }, Terrain::Factory),
+            (GridPosition { x: 6, y: 6 }, Terrain::Factory),
+        ];
+        facilities.sort_by_key(|(position, terrain)| {
+            production_facility_priority(*position, *terrain, enemy_capital, map)
+        });
 
-        // 観測した B,B,T,T,B,T,T は、マップ座標ではなく現在編成から得られる。
-        assert_eq!(sequence, vec![true, true, false, false, true, false, false]);
+        assert_eq!(
+            facilities.map(|(position, _)| position),
+            [
+                GridPosition { x: 6, y: 6 },
+                GridPosition { x: 6, y: 5 },
+                GridPosition { x: 5, y: 6 },
+                GridPosition { x: 4, y: 5 },
+            ]
+        );
+    }
+
+    #[test]
+    fn production_strategy_share_averages_force_and_properties_like_rom() {
+        assert_eq!(combined_force_and_property_share(60, 40, 8, 2), 70);
+        assert_eq!(combined_force_and_property_share(40, 60, 2, 8), 30);
+        assert_eq!(combined_force_and_property_share(0, 0, 0, 0), 50);
     }
 }

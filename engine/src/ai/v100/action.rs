@@ -6,14 +6,14 @@
 use super::candidate_field::{
     CandidateTile, build_candidate_field, build_load_candidate_field, build_merge_candidate_field,
 };
-use super::route_field::build_route_field;
+use super::route_field::{build_route_field, build_route_field_to_any};
 use crate::ai::AiVersion;
 use crate::ai::engine::AiCommand;
 use crate::components::{
     ActionCompleted, Ammo, Faction, Fuel, GridPosition, HasMoved, Health, PlayerId, Property,
     UnitStats,
 };
-use crate::resources::{DamageChart, Map, MasterDataRegistry, MovementType};
+use crate::resources::{DamageChart, Map, MasterDataRegistry, MatchState, MovementType};
 use crate::systems::combat::get_expected_damage;
 use crate::systems::movement::OccupantInfo;
 use bevy_ecs::prelude::*;
@@ -27,6 +27,9 @@ use std::collections::{HashMap, HashSet};
 #[derive(Resource, Default)]
 struct ObjectiveAssignmentState {
     by_player: HashMap<PlayerId, HashMap<Entity, GridPosition>>,
+    mission_by_player: HashMap<PlayerId, HashMap<Entity, u8>>,
+    cargo_loaded_by_player: HashMap<PlayerId, HashMap<Entity, bool>>,
+    turn_by_player: HashMap<PlayerId, u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -35,8 +38,7 @@ struct AssignmentUnit {
     position: GridPosition,
     unit_type: crate::resources::UnitType,
     record_order: u32,
-    fast_ground: bool,
-    air_unit: bool,
+    has_cargo: bool,
 }
 
 #[derive(Clone)]
@@ -49,7 +51,6 @@ struct UnitView {
     max_hp: u32,
     fuel: u32,
     ammo: (u32, u32),
-    cargo_count: usize,
 }
 
 #[derive(Clone)]
@@ -79,6 +80,16 @@ struct AttackEvaluationContext<'a> {
     version: AiVersion,
 }
 
+/// ROMの固定目標選択に必要な盤面情報をまとめる。
+struct StrategicObjectiveContext<'a> {
+    scenario: Option<super::rom_data::RomScenarioData>,
+    properties: &'a [(GridPosition, Property)],
+    map: &'a Map,
+    master_data: &'a MasterDataRegistry,
+    player_id: PlayerId,
+    reserved: &'a HashSet<GridPosition>,
+}
+
 /// V100/V200の次の行動を決める。既存V1〜V4の評価器は呼び出さない。
 pub(crate) fn decide_action(
     world: &mut World,
@@ -89,6 +100,10 @@ pub(crate) fn decide_action(
     let master_data = world.get_resource::<MasterDataRegistry>()?.clone();
     let damage_chart = world.get_resource::<DamageChart>()?.clone();
     let version = crate::ai::resolve_player_ai_version(world, player_id);
+    let turn = world.get_resource::<MatchState>()?.current_turn_number.0;
+    world
+        .get_resource_or_insert_with(super::rom_logic::RomAiState::default)
+        .begin_action_turn(player_id, turn);
     let mut units = Vec::new();
     let mut assignment_units = Vec::new();
     let mut occupants = HashMap::new();
@@ -143,9 +158,7 @@ pub(crate) fn decide_action(
                     position: *position,
                     unit_type: stats.unit_type,
                     record_order: 0,
-                    fast_ground: stats.movement_type == MovementType::ArmoredCar
-                        && stats.max_movement >= 6,
-                    air_unit: stats.movement_type == MovementType::Air,
+                    has_cargo: cargo.is_some_and(|value| !value.loaded.is_empty()),
                 });
                 if !moved.0 && !completed.0 && !skipped.contains(&entity) {
                     units.push(UnitView {
@@ -157,7 +170,6 @@ pub(crate) fn decide_action(
                         max_hp: health.max,
                         fuel: fuel.current,
                         ammo: ammo.map_or((0, 0), |value| (value.ammo1, value.ammo2)),
-                        cargo_count: cargo.map_or(0, |value| value.loaded.len()),
                     });
                 }
             }
@@ -181,6 +193,9 @@ pub(crate) fn decide_action(
             .copied()
             .unwrap_or_else(|| unit.entity.index());
     }
+    world
+        .get_resource_or_insert_with(super::rom_logic::RomAiState::default)
+        .observe_units(player_id, assignment_units.iter().map(|unit| unit.entity));
     let properties: Vec<_> = {
         let mut query = world.query::<(&GridPosition, &Property)>();
         query
@@ -201,8 +216,24 @@ pub(crate) fn decide_action(
             .cloned()
             .unwrap_or_default()
     } else {
-        update_objective_assignments(world, &assignment_units, &properties, &map, player_id)
+        update_objective_assignments(
+            world,
+            &assignment_units,
+            &properties,
+            &map,
+            &master_data,
+            player_id,
+        )
     };
+    let mission_assignments = world
+        .get_resource::<ObjectiveAssignmentState>()
+        .and_then(|state| state.mission_by_player.get(&player_id))
+        .cloned()
+        .unwrap_or_default();
+    let mission_three_transports: HashSet<_> = mission_assignments
+        .iter()
+        .filter_map(|(entity, mission)| (mission & 0x03 == 3).then_some(*entity))
+        .collect();
     let mut enemies: Vec<_> = {
         let mut query = world.query::<(Entity, &GridPosition, &Faction, &UnitStats, &Health)>();
         query
@@ -217,7 +248,8 @@ pub(crate) fn decide_action(
             })
             .collect()
     };
-    enemies.sort_by_key(|enemy| (enemy.position.y, enemy.position.x, enemy.entity.index()));
+    // ROM 1F44は敵の固定長レコードを先頭から列挙する。盤面座標順ではない。
+    enemies.sort_by_key(|enemy| super::unit_record::record_order(world, enemy.entity));
 
     // ROM 44BC/45B8は都市・工場上の部隊を先に選び、生産地点を空けてから一般部隊へ進む。
     let objective_route_costs: HashMap<_, _> = units
@@ -252,20 +284,9 @@ pub(crate) fn decide_action(
             &master_data,
         );
 
-        // 歩兵が輸送ユニットのいる候補マスへ入った場合は、通常待機ではなく搭載を確定する。
-        // 輸送ユニットが存在しない盤面では候補が空になるため、通常判断へ影響しない。
-        let load_candidates = build_load_candidate_field(
-            &map,
-            &occupants,
-            actor.position,
-            &actor.stats,
-            actor.fuel,
-            player_id,
-            &master_data,
-        );
-        if let Some(command) =
-            super::transport::choose_load(world, actor.entity, &load_candidates, player_id)
-        {
+        // ROM 4A1E以降はCapture(58D2)→Drop(553D)→Load/輸送接近(51BF)
+        // →Attack(5690)→Merge(5D36)→通常移動(4B91)の順に試す。
+        if let Some(command) = choose_capture(&actor, &candidates, &properties, player_id) {
             return Some((actor.entity, command));
         }
         if super::compatibility_profile::is_gbw_transport(&actor.stats)
@@ -274,21 +295,55 @@ pub(crate) fn decide_action(
                 actor.entity,
                 &candidates,
                 objective_assignments.get(&actor.entity).copied(),
+                mission_assignments.get(&actor.entity).copied(),
                 player_id,
                 version,
             )
         {
             return Some((actor.entity, command));
         }
-        // ROM 49F6の判定表と同じく、占領は通常攻撃より前に確定する。
-        if let Some(command) = choose_capture(
-            &actor,
-            &candidates,
-            &properties,
-            objective_assignments.get(&actor.entity).copied(),
-            player_id,
-        ) {
-            return Some((actor.entity, command));
+        // ROM 51DAは個別目標までの距離C69Eを687Cの兵種別閾値と比較する。
+        // 到達不能値はROMの0x40へ丸め、近距離部隊を輸送需要へ誤算入しない。
+        let pickup_distance = objective_route_costs
+            .get(&actor.entity)
+            .copied()
+            .unwrap_or(0x40)
+            .min(0x40);
+        let searches_for_transport = pickup_distance
+            >= super::rom_logic::GbUnitKind::pickup_distance_threshold(actor.stats.unit_type);
+        if searches_for_transport
+            && super::rom_logic::GbUnitKind::increments_pickup_counter(actor.stats.unit_type)
+        {
+            // ROM 51E1〜51EBでは距離ゲートを通過した歩兵系だけがC6A5を増やす。
+            world
+                .get_resource_or_insert_with(super::rom_logic::RomAiState::default)
+                .record_pickup_candidate(player_id);
+        }
+        // ROM 51ECで一度bit 5を立てた後、搭載先がなければ52E1で解除する。
+        // この後の攻撃・合流・通常移動へ進んだ歩兵系は、次の輸送集合計算から外れる。
+        world
+            .get_resource_or_insert_with(super::rom_logic::RomAiState::default)
+            .set_pickup_eligible(player_id, actor.entity, false);
+        if searches_for_transport {
+            // 通常候補は自軍占有マスを除くため、搭載候補場だけを51BF用に別生成する。
+            let load_candidates = build_load_candidate_field(
+                &map,
+                &occupants,
+                actor.position,
+                &actor.stats,
+                actor.fuel,
+                player_id,
+                &master_data,
+            );
+            if let Some(command) = super::transport::choose_load(
+                world,
+                actor.entity,
+                &load_candidates,
+                &mission_three_transports,
+                player_id,
+            ) {
+                return Some((actor.entity, command));
+            }
         }
         if let Some(command) = choose_attack(
             &actor,
@@ -319,57 +374,54 @@ pub(crate) fn decide_action(
         {
             return Some((actor.entity, command));
         }
-        return Some((
-            actor.entity,
-            choose_wait(
-                &actor,
-                &candidates,
-                objective_assignments.get(&actor.entity).copied(),
-                &map,
-                &master_data,
-            ),
-        ));
+        let (command, used_fallback) = choose_wait(
+            &actor,
+            &candidates,
+            objective_assignments.get(&actor.entity).copied(),
+            &map,
+            &master_data,
+        );
+        if used_fallback {
+            // ROM 4B91の通常経路移動が失敗し、4D86の特殊移動が成立すると4E4Dで
+            // bit 5を再設定する。島や遮断地形に残った歩兵が輸送対象へ戻る分岐である。
+            world
+                .get_resource_or_insert_with(super::rom_logic::RomAiState::default)
+                .set_pickup_eligible(player_id, actor.entity, true);
+        }
+        if matches!(command, AiCommand::Wait { target_pos } if target_pos == actor.position)
+            && super::rom_logic::GbUnitKind::increments_mobility_shortage_counter(
+                actor.stats.unit_type,
+            )
+        {
+            world
+                .get_resource_or_insert_with(super::rom_logic::RomAiState::default)
+                .record_mobility_shortage(player_id);
+        }
+        return Some((actor.entity, command));
     }
     None
 }
 
-/// 既知のGB初期部隊では高速地上系を先に、続いて施設を塞ぐ部隊を処理する。
+/// ROM 447B〜461Eの8段走査を、そのまま比較キーへ変換する。
 fn actor_priority(
     unit: &UnitView,
     property_positions: &HashSet<(usize, usize)>,
     objective: Option<GridPosition>,
     objective_route_cost: Option<u32>,
 ) -> (u8, u32, u32) {
-    if super::compatibility_profile::is_gbw_transport(&unit.stats) && unit.cargo_count == 0 {
-        // ROM 530Cの空輸送分岐は通常の部隊走査より先に搭載候補へ接近する。
-        return (0, 0, unit.record_order);
-    }
     let on_property = property_positions.contains(&(unit.position.x, unit.position.y));
-    let fast_ground =
-        unit.stats.movement_type == MovementType::ArmoredCar && unit.stats.max_movement >= 6;
-    match (
-        unit.stats.min_range > 1,
-        on_property,
-        fast_ground,
-        objective,
-    ) {
-        // ROM 44F4は間接攻撃部隊を施設上の通常部隊より先に走査する。
-        (true, _, _, _) => (1, 0, unit.record_order),
-        // ROMの施設退避走査は部隊レコード昇順。
-        (false, true, true, _) => (2, 0, unit.record_order),
-        (false, true, false, _) => (3, 0, unit.record_order),
-        // ROM 452Cは目標値0xFFの未割当部隊をレコード順に選ぶ。
-        (false, false, _, None) => (4, 0, unit.record_order),
-        (false, false, _, Some(_)) => {
-            // ROM 45E5は部隊レコード+15の目標経路値を最小化し、同値なら後の
-            // レコードを選ぶ。値はhex直線距離ではなく地形コスト込みのDBC6相当値。
-            (
-                5,
-                objective_route_cost.unwrap_or(u32::MAX),
-                u32::MAX - unit.record_order,
-            )
-        }
+    let pass =
+        super::rom_logic::actor_selection_pass(&unit.stats, on_property, objective.is_some());
+    if pass == super::rom_logic::ActorSelectionPass::MinimumObjectiveCost {
+        // ROM 45E5はレコード+15を最小化し、同値なら後のレコードへ更新する。
+        return (
+            pass as u8,
+            objective_route_cost.unwrap_or(u32::MAX),
+            u32::MAX - unit.record_order,
+        );
     }
+    // それ以前の7本は各々レコード0から昇順に走査し、最初の一致で終了する。
+    (pass as u8, 0, unit.record_order)
 }
 
 /// 部隊レコード順に最寄りの未割当拠点を予約し、GBの個別目標欄に相当する表を作る。
@@ -380,17 +432,36 @@ fn assign_objectives(
     map: &Map,
     player_id: PlayerId,
 ) -> HashMap<Entity, GridPosition> {
-    let ordered_units: Vec<_> = units
+    let mut ordered_units: Vec<_> = units
         .iter()
-        .map(|(entity, position)| (*entity, *position, entity.index(), false))
+        .map(|(entity, position)| AssignmentUnit {
+            entity: *entity,
+            position: *position,
+            unit_type: crate::resources::UnitType::Infantry,
+            record_order: entity.index(),
+            has_cargo: false,
+        })
         .collect();
-    assign_unreserved_objectives(
-        &ordered_units,
-        properties,
-        map,
-        player_id,
-        &mut HashSet::new(),
-    )
+    ordered_units.sort_by_key(|unit| unit.record_order);
+    let mut reserved = HashSet::new();
+    let master_data = MasterDataRegistry::load().expect("master data");
+    ordered_units
+        .iter()
+        .filter_map(|unit| {
+            let objective = select_rom_capture_objective(
+                unit,
+                properties,
+                map,
+                &master_data,
+                player_id,
+                &reserved,
+            )?;
+            if objective_requires_unique_assignment(objective, properties) {
+                reserved.insert(objective);
+            }
+            Some((unit.entity, objective))
+        })
+        .collect()
 }
 
 /// 生存部隊の既存目標を保ち、未割当部隊だけへ新しい目標を設定する。
@@ -399,197 +470,271 @@ fn update_objective_assignments(
     units: &[AssignmentUnit],
     properties: &[(GridPosition, Property)],
     map: &Map,
+    master_data: &MasterDataRegistry,
     player_id: PlayerId,
 ) -> HashMap<Entity, GridPosition> {
-    let alive: HashSet<_> = units.iter().map(|unit| unit.entity).collect();
-    let reinforcement_wave = world
+    let current_turn = world
+        .get_resource::<MatchState>()
+        .map_or(0, |state| state.current_turn_number.0);
+    let begins_new_turn = world
         .get_resource::<ObjectiveAssignmentState>()
-        .is_some_and(|state| state.by_player.contains_key(&player_id));
+        .and_then(|state| state.turn_by_player.get(&player_id))
+        .copied()
+        != Some(current_turn);
+    let alive: HashSet<_> = units.iter().map(|unit| unit.entity).collect();
     let mut assignments = world
         .get_resource::<ObjectiveAssignmentState>()
         .and_then(|state| state.by_player.get(&player_id))
         .cloned()
         .unwrap_or_default();
-    // GBの目標座標は他の部隊が先に占領してもレコードから消えない。部隊が生存する
-    // 間は保持し、現在の所有者変化だけを理由に再割当しない。
-    assignments.retain(|entity, _| alive.contains(entity));
+    let mut missions = world
+        .get_resource::<ObjectiveAssignmentState>()
+        .and_then(|state| state.mission_by_player.get(&player_id))
+        .cloned()
+        .unwrap_or_default();
+    let mut cargo_loaded = world
+        .get_resource::<ObjectiveAssignmentState>()
+        .and_then(|state| state.cargo_loaded_by_player.get(&player_id))
+        .cloned()
+        .unwrap_or_default();
+    let unit_positions: HashMap<_, _> = units
+        .iter()
+        .map(|unit| (unit.entity, unit.position))
+        .collect();
+    let owned_properties: HashSet<_> = properties
+        .iter()
+        .filter_map(|(position, property)| {
+            (property.owner_id == Some(player_id)).then_some(*position)
+        })
+        .collect();
+    // 他部隊が先に占領した目標はGBの個別目標欄に残る。一方、map_8の実測では
+    // 目標を占領した本人は次手番に別目標へ進むため、現在地の達成済み目標だけを外す。
+    assignments.retain(|entity, objective| {
+        alive.contains(entity)
+            && !(unit_positions.get(entity) == Some(objective)
+                && owned_properties.contains(objective))
+    });
+    missions.retain(|entity, _| alive.contains(entity));
+    cargo_loaded.retain(|entity, _| alive.contains(entity));
+    for unit in units {
+        if begins_new_turn || !cargo_loaded.contains_key(&unit.entity) {
+            let cargo_state_changed =
+                cargo_loaded.get(&unit.entity).copied() != Some(unit.has_cargo);
+            if cargo_state_changed
+                && unit.unit_type == crate::resources::UnitType::TransportHelicopter
+                && missions
+                    .get(&unit.entity)
+                    .is_some_and(|mission| mission & 0x03 == 3)
+            {
+                // ROM 483Fは次手番に積荷状態を読み、目標を「自軍首都」と
+                // 「搭載歩兵用の未占領施設」の間で引き直す。
+                assignments.remove(&unit.entity);
+            }
+            cargo_loaded.insert(unit.entity, unit.has_cargo);
+        }
+    }
 
-    let mut reserved: HashSet<_> = assignments.values().copied().collect();
-    let unassigned: Vec<_> = units
+    // ROM 485Eは都市・空港・港だけ重複目標を拒否し、首都・工場は共有を許す。
+    let mut reserved: HashSet<_> = assignments
+        .values()
+        .copied()
+        .filter(|position| objective_requires_unique_assignment(*position, properties))
+        .collect();
+    let mut unassigned: Vec<_> = units
         .iter()
         .filter(|unit| !assignments.contains_key(&unit.entity))
         .copied()
         .collect();
-    if reinforcement_wave {
-        assignments.extend(assign_reinforcement_objectives(
-            &unassigned,
-            properties,
-            map,
-            player_id,
-            &mut reserved,
-        ));
-    } else {
-        let unassigned_positions: Vec<_> = unassigned
-            .iter()
-            .map(|unit| (unit.entity, unit.position, unit.record_order, unit.air_unit))
-            .collect();
-        assignments.extend(assign_unreserved_objectives(
-            &unassigned_positions,
-            properties,
-            map,
-            player_id,
-            &mut reserved,
-        ));
+    unassigned.sort_by_key(|unit| unit.record_order);
+    let scenario = super::rom_data::identify_scenario(map, master_data);
+    // 生産は行動フェーズの後に行われるため、ここには直前の生産で使ったC6ADが残る。
+    let production_strategy = world
+        .get_resource::<super::rom_logic::RomAiState>()
+        .and_then(|state| state.production_strategy_for(player_id))
+        .unwrap_or(super::rom_logic::ProductionStrategy::Opening);
+    for unit in unassigned {
+        let mission = missions.get(&unit.entity).copied().unwrap_or_else(|| {
+            initial_rom_mission_state(
+                unit.unit_type,
+                scenario,
+                production_strategy,
+                units,
+                &missions,
+            )
+        });
+        let objective = if matches!(
+            unit.unit_type,
+            crate::resources::UnitType::Infantry | crate::resources::UnitType::Mech
+        ) {
+            select_rom_capture_objective(&unit, properties, map, master_data, player_id, &reserved)
+        } else {
+            select_rom_strategic_objective(
+                &unit,
+                mission,
+                &StrategicObjectiveContext {
+                    scenario,
+                    properties,
+                    map,
+                    master_data,
+                    player_id,
+                    reserved: &reserved,
+                },
+            )
+        };
+        missions.insert(unit.entity, mission);
+        if let Some(objective) = objective {
+            if objective_requires_unique_assignment(objective, properties) {
+                reserved.insert(objective);
+            }
+            assignments.insert(unit.entity, objective);
+        }
     }
 
     let mut state = world.get_resource_or_insert_with(ObjectiveAssignmentState::default);
     state.by_player.insert(player_id, assignments.clone());
+    state.mission_by_player.insert(player_id, missions);
+    state.cargo_loaded_by_player.insert(player_id, cargo_loaded);
+    state.turn_by_player.insert(player_id, current_turn);
     assignments
 }
 
-/// 初期展開後の増援は、ROMで観測した通り役割別に敵本拠地群の同じ目標を共有する。
-fn assign_reinforcement_objectives(
+/// ROM 485E〜48DBの歩兵系目標走査。
+fn select_rom_capture_objective(
+    unit: &AssignmentUnit,
+    properties: &[(GridPosition, Property)],
+    map: &Map,
+    _master_data: &MasterDataRegistry,
+    player_id: PlayerId,
+    reserved: &HashSet<GridPosition>,
+) -> Option<GridPosition> {
+    // ROM 4863は仮想兵種0x30の距離場を現在地から一度だけ作る。実機RAMの値は
+    // 歩兵の地形移動費ではなく疑似HEXの歩数と一致するため、OpenWars側の盤面
+    // トポロジー距離へ写像する。これによりsquareでも同じ目標選択規則を使える。
+    properties
+        .iter()
+        .filter(|(position, property)| {
+            property.max_capture_points > 0
+                && property.owner_id != Some(player_id)
+                // 4899〜48A0は歩兵以外の歩兵系だけ首都を除外する。
+                && (unit.unit_type == crate::resources::UnitType::Infantry
+                    || property.terrain != crate::resources::Terrain::Capital)
+                // 48A2〜48B1は首都・工場以外に限って重複目標を拒否する。
+                && (!objective_requires_unique_assignment(*position, properties)
+                    || !reserved.contains(position))
+        })
+        .min_by_key(|(position, _)| {
+            (
+                if *position == unit.position {
+                    // 4870〜4875は現在地の盤面値を0xFFへ戻して目標候補から外す。
+                    u32::MAX
+                } else {
+                    map.distance(unit.position.x, unit.position.y, position.x, position.y)
+                },
+                Reverse(position.y),
+                Reverse(position.x),
+            )
+        })
+        .map(|(position, _)| *position)
+}
+
+fn objective_requires_unique_assignment(
+    objective: GridPosition,
+    properties: &[(GridPosition, Property)],
+) -> bool {
+    properties.iter().any(|(position, property)| {
+        *position == objective
+            && !matches!(
+                property.terrain,
+                crate::resources::Terrain::Capital | crate::resources::Terrain::Factory
+            )
+    })
+}
+
+/// ROM 481B/483Fと0AE9の固定目標分岐。
+fn select_rom_strategic_objective(
+    unit: &AssignmentUnit,
+    mission: u8,
+    context: &StrategicObjectiveContext<'_>,
+) -> Option<GridPosition> {
+    use crate::resources::UnitType;
+
+    if unit.unit_type == UnitType::Artillery {
+        return Some(unit.position);
+    }
+    if mission & 0x03 == 3
+        && matches!(
+            unit.unit_type,
+            UnitType::Recon | UnitType::TransportHelicopter
+        )
+    {
+        if unit.unit_type == UnitType::TransportHelicopter && unit.has_cargo {
+            // ROM 485Eは仮想兵種0x30の距離場で積荷が向かう未占領施設を選ぶ。
+            // 首都を除く条件は歩兵以外の呼び出し側として残る。
+            return select_rom_capture_objective(
+                unit,
+                context.properties,
+                context.map,
+                context.master_data,
+                context.player_id,
+                context.reserved,
+            );
+        }
+        return context.properties.iter().find_map(|(position, property)| {
+            (property.terrain == crate::resources::Terrain::Capital
+                && property.owner_id == Some(context.player_id))
+            .then_some(*position)
+        });
+    }
+    if let Some(objective) = context
+        .scenario
+        .and_then(|value| value.strategic_objective(context.player_id, mission))
+    {
+        return Some(objective);
+    }
+    if mission & 0x03 == 3 {
+        // ROM 4836が格納する0x40,0x40を0始まりへ変換した盤外番兵値。
+        // 目標なし(None)にはせず、部隊選択時にも「目標設定済み」として扱う。
+        return Some(GridPosition { x: 63, y: 63 });
+    }
+    // 状態0は敵首都を目標にする。
+    context.properties.iter().find_map(|(position, property)| {
+        (property.terrain == crate::resources::Terrain::Capital
+            && property.owner_id != Some(context.player_id))
+        .then_some(*position)
+    })
+}
+
+fn initial_rom_mission_state(
+    unit_type: crate::resources::UnitType,
+    scenario: Option<super::rom_data::RomScenarioData>,
+    strategy: super::rom_logic::ProductionStrategy,
     units: &[AssignmentUnit],
-    properties: &[(GridPosition, Property)],
-    map: &Map,
-    player_id: PlayerId,
-    reserved: &mut HashSet<GridPosition>,
-) -> HashMap<Entity, GridPosition> {
-    let enemy_properties: Vec<_> = properties
-        .iter()
-        .filter(|(_, property)| {
-            property.owner_id.is_some_and(|owner| owner != player_id)
-                && property.max_capture_points > 0
-        })
-        .copied()
-        .collect();
-    let mut result = HashMap::new();
-    let mut ordered_units = units.to_vec();
-    ordered_units.sort_by_key(|unit| unit.record_order);
-    for unit in &ordered_units {
-        if unit.air_unit {
-            // 航空増援は、既存部隊がまだ担当していない拠点へ順に割り当てる。
-            // これはROMの航空部隊・輸送部隊が遠隔島へ個別目標を持つ挙動に対応する。
-            let unreserved_exists = properties.iter().any(|(position, property)| {
-                property.max_capture_points > 0
-                    && property.owner_id != Some(player_id)
-                    && !reserved.contains(position)
-            });
-            let selected = properties
-                .iter()
-                .filter(|(position, property)| {
-                    property.max_capture_points > 0
-                        && property.owner_id != Some(player_id)
-                        && (!unreserved_exists || !reserved.contains(position))
-                })
-                .min_by_key(|(position, property)| {
-                    (
-                        mobile_objective_rank(property.terrain),
-                        map.distance(unit.position.x, unit.position.y, position.x, position.y),
-                        objective_scan_order(*position, player_id).0,
-                        objective_scan_order(*position, player_id).1,
-                    )
-                })
-                .map(|(position, _)| *position);
-            if let Some(position) = selected {
-                reserved.insert(position);
-                result.insert(unit.entity, position);
-            }
-            continue;
-        }
-        let selected = enemy_properties
-            .iter()
-            .min_by_key(|(position, property)| {
-                let role_rank = if unit.fast_ground {
-                    u8::from(property.terrain != crate::resources::Terrain::Capital)
-                } else {
-                    u8::from(property.terrain != crate::resources::Terrain::Factory)
-                };
-                (
-                    role_rank,
-                    map.distance(unit.position.x, unit.position.y, position.x, position.y),
-                    position.y,
-                    Reverse(position.x),
-                )
-            })
-            .map(|(position, _)| *position);
-        if let Some(position) = selected {
-            result.insert(unit.entity, position);
+    missions: &HashMap<Entity, u8>,
+) -> u8 {
+    let Some(scenario) = scenario else {
+        return 0;
+    };
+    let mut same_kind_counts = [0_u32; 4];
+    for unit in units.iter().filter(|unit| unit.unit_type == unit_type) {
+        if let Some(mission) = missions.get(&unit.entity).copied()
+            && let Some(count) = same_kind_counts.get_mut(usize::from(mission & 0x03))
+        {
+            *count = count.saturating_add(1);
         }
     }
-    result
-}
-
-fn assign_unreserved_objectives(
-    units: &[(Entity, GridPosition, u32, bool)],
-    properties: &[(GridPosition, Property)],
-    map: &Map,
-    player_id: PlayerId,
-    reserved: &mut HashSet<GridPosition>,
-) -> HashMap<Entity, GridPosition> {
-    let mut ordered_units = units.to_vec();
-    ordered_units.sort_by_key(|(_, _, record_order, _)| *record_order);
-    let objectives: Vec<_> = properties
-        .iter()
-        .filter(|(_, property)| {
-            property.max_capture_points > 0 && property.owner_id != Some(player_id)
-        })
-        .copied()
-        .collect();
-    let mut result = HashMap::new();
-
-    for (entity, origin, _, air_unit) in ordered_units {
-        let unreserved_exists = objectives
-            .iter()
-            .any(|(position, _)| !reserved.contains(position));
-        let selected = objectives
-            .iter()
-            .filter(|(position, _)| !unreserved_exists || !reserved.contains(position))
-            .min_by_key(|(position, property)| {
-                let distance = map.distance(origin.x, origin.y, position.x, position.y);
-                let scan_order = objective_scan_order(*position, player_id);
-                if air_unit {
-                    // ROMの航空部隊は近隣都市より、輸送路となる港・空港を先に割り当てる。
-                    (
-                        mobile_objective_rank(property.terrain),
-                        distance,
-                        0,
-                        scan_order.0,
-                        scan_order.1,
-                    )
-                } else {
-                    (0, distance, 0, scan_order.0, scan_order.1)
-                }
-            })
-            .map(|(position, _)| *position);
-        if let Some(position) = selected {
-            reserved.insert(position);
-            result.insert(entity, position);
-        }
-    }
-    result
-}
-
-fn mobile_objective_rank(terrain: crate::resources::Terrain) -> u32 {
-    match terrain {
-        crate::resources::Terrain::Port => 0,
-        crate::resources::Terrain::Airport => 1,
-        crate::resources::Terrain::Factory => 2,
-        crate::resources::Terrain::Capital => 3,
-        _ => 4,
-    }
-}
-
-/// ROMは盤面配列を行優先で走査し、同値なら後から現れたマスへ更新する。
-fn objective_scan_order(position: GridPosition, _player_id: PlayerId) -> (usize, usize) {
-    (usize::MAX - position.y, usize::MAX - position.x)
+    super::rom_logic::assign_mission_state(
+        unit_type,
+        strategy,
+        scenario.production_limit(strategy, unit_type),
+        same_kind_counts,
+        scenario.has_radar_transport,
+    )
 }
 
 fn choose_capture(
     actor: &UnitView,
     candidates: &[CandidateTile],
     properties: &[(GridPosition, Property)],
-    assigned_objective: Option<GridPosition>,
     player_id: PlayerId,
 ) -> Option<AiCommand> {
     if !actor.stats.can_capture {
@@ -602,18 +747,6 @@ fn choose_capture(
                 && property.max_capture_points > 0
         })
     };
-    // ROMの個別目標が今手番で到達できる場合は、途中の別拠点へ逸れず目標を占領する。
-    if let Some(objective) = assigned_objective
-        && is_capturable(objective)
-        && candidates
-            .iter()
-            .any(|candidate| candidate.position == objective)
-    {
-        return Some(AiCommand::Capture {
-            target_pos: objective,
-        });
-    }
-
     let mut best: Option<(u32, GridPosition)> = None;
     for candidate in candidates {
         if is_capturable(candidate.position)
@@ -621,7 +754,8 @@ fn choose_capture(
                 .as_ref()
                 .is_none_or(|(cost, _)| candidate.movement_cost <= *cost)
         {
-            // ROM 593Dは同一コストでも後から走査したマスへ更新する。
+            // ROM 593D〜59B9は個別目標を参照せず、到達可能な未占領施設の
+            // 移動費だけを比較する。同一コストでも後から走査したマスへ更新する。
             best = Some((candidate.movement_cost, candidate.position));
         }
     }
@@ -653,6 +787,7 @@ fn choose_attack(
             context.player_id,
             context.version,
         );
+        let mut best_target: Option<(u32, &EnemyView)> = None;
         for enemy in enemies {
             let distance = context.map.distance(
                 candidate.position.x,
@@ -680,8 +815,19 @@ fn choose_attack(
             if damage == 0 {
                 continue;
             }
+            let target_remaining_hp = enemy.hp.saturating_sub(damage);
+            if best_target
+                .as_ref()
+                .is_none_or(|(current, _)| target_remaining_hp < *current)
+            {
+                // ROM 5822は敵レコードを逆順に調べ、同値でも更新するため、最終的に
+                // 最も若い敵レコードが残る。昇順列挙では厳密な改善時だけ更新すれば同値になる。
+                best_target = Some((target_remaining_hp, enemy));
+            }
+        }
+        if let Some((target_remaining_hp, enemy)) = best_target {
             let key = AttackKey {
-                target_remaining_hp: enemy.hp.saturating_sub(damage),
+                target_remaining_hp,
                 defensive_position: Reverse(terrain_defense),
                 target_hp: enemy.hp,
             };
@@ -701,11 +847,10 @@ fn choose_attack(
 }
 
 fn attack_movement_allowance(stats: &UnitStats, version: AiVersion) -> u32 {
-    match version {
-        AiVersion::V100 => stats.max_movement.saturating_sub(1).max(2),
-        AiVersion::V200 => stats.max_movement,
-        _ => unreachable!("V100/V200専用AI以外から攻撃移動力を参照しました"),
-    }
+    stats
+        .max_movement
+        .saturating_sub(super::rom_logic::movement_evaluation_penalty(version))
+        .max(2)
 }
 
 fn attack_position_value(
@@ -770,14 +915,38 @@ fn choose_wait(
     objective: Option<GridPosition>,
     map: &Map,
     master_data: &MasterDataRegistry,
-) -> AiCommand {
-    let route_distances = objective
-        .map(|objective| build_route_field(map, master_data, objective, actor.stats.movement_type));
+) -> (AiCommand, bool) {
+    let normal_route_distances = objective.map(|objective| {
+        if actor.stats.movement_type == MovementType::Ship {
+            build_ship_approach_route_field(map, master_data, actor.position, objective)
+        } else {
+            build_route_field(map, master_data, objective, actor.stats.movement_type)
+        }
+    });
+    let used_fallback = objective.is_some()
+        && normal_route_distances
+            .as_ref()
+            .is_some_and(|distances| !distances.contains_key(&actor.position));
+    let movement_objective = if used_fallback {
+        objective.and_then(|objective| select_rom_fallback_staging(map, objective))
+    } else {
+        objective
+    };
+    let fallback_route_distances = (used_fallback && movement_objective.is_some()).then(|| {
+        build_route_field(
+            map,
+            master_data,
+            movement_objective.expect("checked above"),
+            actor.stats.movement_type,
+        )
+    });
+    let route_distances = fallback_route_distances
+        .as_ref()
+        .or(normal_route_distances.as_ref());
     let mut best: Option<(u32, GridPosition)> = None;
     for candidate in candidates {
-        let key = objective.map(|objective| {
+        let key = movement_objective.map(|objective| {
             route_distances
-                .as_ref()
                 .and_then(|distances| distances.get(&candidate.position))
                 .copied()
                 .unwrap_or_else(|| {
@@ -797,9 +966,58 @@ fn choose_wait(
             best = Some((key, candidate.position));
         }
     }
-    AiCommand::Wait {
-        target_pos: best.map_or(actor.position, |(_, position)| position),
-    }
+    (
+        AiCommand::Wait {
+            target_pos: best.map_or(actor.position, |(_, position)| position),
+        },
+        used_fallback,
+    )
+}
+
+/// ROM 4D86〜4E4Dの、通常経路が存在しない部隊向け沿岸中継点走査。
+/// 内部地形37〜39/44はOpenWarsでは港・浅瀬に相当し、同値時は後の盤面走査を残す。
+fn select_rom_fallback_staging(map: &Map, objective: GridPosition) -> Option<GridPosition> {
+    (0..map.height)
+        .flat_map(|y| (0..map.width).map(move |x| GridPosition { x, y }))
+        .filter(|position| {
+            matches!(
+                map.get_terrain(position.x, position.y),
+                Some(crate::resources::Terrain::Port | crate::resources::Terrain::Shoal)
+            )
+        })
+        .min_by_key(|position| {
+            (
+                map.distance(position.x, position.y, objective.x, objective.y),
+                Reverse(position.y),
+                Reverse(position.x),
+            )
+        })
+}
+
+/// 内陸目標を艦船が直接経路場の始点にすると海へ展開できないため、現在の海域から
+/// 到達可能なマスのうち目標へ最接近できる海上地点を作戦目標として経路場を作る。
+fn build_ship_approach_route_field(
+    map: &Map,
+    master_data: &MasterDataRegistry,
+    origin: GridPosition,
+    objective: GridPosition,
+) -> HashMap<GridPosition, u32> {
+    let reachable = build_route_field(map, master_data, origin, MovementType::Ship);
+    let Some(best_distance) = reachable
+        .keys()
+        .map(|position| map.distance(position.x, position.y, objective.x, objective.y))
+        .min()
+    else {
+        return HashMap::new();
+    };
+    let approach_positions: Vec<_> = reachable
+        .keys()
+        .filter(|position| {
+            map.distance(position.x, position.y, objective.x, objective.y) == best_distance
+        })
+        .copied()
+        .collect();
+    build_route_field_to_any(map, master_data, &approach_positions, MovementType::Ship)
 }
 
 #[cfg(test)]
@@ -822,7 +1040,6 @@ mod tests {
             max_hp: 100,
             fuel: 99,
             ammo: (9, 0),
-            cargo_count: 0,
         }
     }
 
@@ -832,24 +1049,44 @@ mod tests {
             position,
             unit_type: UnitType::Infantry,
             record_order: entity.index(),
-            fast_ground: false,
-            air_unit: false,
+            has_cargo: false,
         }
     }
 
     #[test]
-    fn actor_priority_vacates_fast_ground_then_other_property_units() {
+    fn actor_priority_uses_bank2_selection_passes() {
         let property_positions = HashSet::from([(2, 2), (3, 2)]);
-        let fast = unit(2, MovementType::ArmoredCar, GridPosition { x: 2, y: 2 });
-        let infantry = unit(1, MovementType::Infantry, GridPosition { x: 3, y: 2 });
+        let mut recon = unit(2, MovementType::ArmoredCar, GridPosition { x: 2, y: 2 });
+        recon.stats.unit_type = UnitType::Recon;
+        let unassigned = unit(1, MovementType::Infantry, GridPosition { x: 3, y: 2 });
+        let assigned = unit(3, MovementType::Infantry, GridPosition { x: 4, y: 2 });
         let field = unit(0, MovementType::Infantry, GridPosition { x: 1, y: 1 });
 
-        assert_eq!(actor_priority(&fast, &property_positions, None, None).0, 2);
         assert_eq!(
-            actor_priority(&infantry, &property_positions, None, None).0,
+            actor_priority(
+                &recon,
+                &property_positions,
+                Some(GridPosition { x: 6, y: 2 }),
+                Some(4)
+            )
+            .0,
             3
         );
-        assert_eq!(actor_priority(&field, &property_positions, None, None).0, 4);
+        assert_eq!(
+            actor_priority(&unassigned, &property_positions, None, None).0,
+            4
+        );
+        assert_eq!(actor_priority(&field, &property_positions, None, None).0, 6);
+        assert_eq!(
+            actor_priority(
+                &assigned,
+                &property_positions,
+                Some(GridPosition { x: 6, y: 2 }),
+                Some(4)
+            )
+            .0,
+            7
+        );
     }
 
     #[test]
@@ -871,6 +1108,88 @@ mod tests {
         );
 
         assert!(later_key < earlier_key);
+    }
+
+    #[test]
+    fn unit_that_captured_its_objective_advances_to_a_new_target() {
+        let player_id = PlayerId(1);
+        let entity = Entity::from_raw(0);
+        let captured_port = GridPosition { x: 1, y: 1 };
+        let enemy_factory = GridPosition { x: 6, y: 1 };
+        let map = Map::new(
+            8,
+            4,
+            crate::resources::Terrain::Plains,
+            crate::resources::GridTopology::Hex,
+        );
+        let properties = vec![
+            (
+                captured_port,
+                Property::new(crate::resources::Terrain::Port, Some(player_id), 300),
+            ),
+            (
+                enemy_factory,
+                Property::new(crate::resources::Terrain::Factory, Some(PlayerId(2)), 200),
+            ),
+        ];
+        let mut world = World::new();
+        let master_data = MasterDataRegistry::load().unwrap();
+        world.insert_resource(ObjectiveAssignmentState {
+            by_player: HashMap::from([(player_id, HashMap::from([(entity, captured_port)]))]),
+            ..Default::default()
+        });
+
+        let assignments = update_objective_assignments(
+            &mut world,
+            &[assignment_unit(entity, captured_port)],
+            &properties,
+            &map,
+            &master_data,
+            player_id,
+        );
+
+        assert_eq!(assignments[&entity], enemy_factory);
+    }
+
+    #[test]
+    fn objective_captured_by_another_unit_remains_assigned() {
+        let player_id = PlayerId(1);
+        let entity = Entity::from_raw(0);
+        let captured_port = GridPosition { x: 1, y: 1 };
+        let unit_position = GridPosition { x: 2, y: 1 };
+        let map = Map::new(
+            8,
+            4,
+            crate::resources::Terrain::Plains,
+            crate::resources::GridTopology::Hex,
+        );
+        let properties = vec![
+            (
+                captured_port,
+                Property::new(crate::resources::Terrain::Port, Some(player_id), 300),
+            ),
+            (
+                GridPosition { x: 6, y: 1 },
+                Property::new(crate::resources::Terrain::Factory, Some(PlayerId(2)), 200),
+            ),
+        ];
+        let mut world = World::new();
+        let master_data = MasterDataRegistry::load().unwrap();
+        world.insert_resource(ObjectiveAssignmentState {
+            by_player: HashMap::from([(player_id, HashMap::from([(entity, captured_port)]))]),
+            ..Default::default()
+        });
+
+        let assignments = update_objective_assignments(
+            &mut world,
+            &[assignment_unit(entity, unit_position)],
+            &properties,
+            &map,
+            &master_data,
+            player_id,
+        );
+
+        assert_eq!(assignments[&entity], captured_port);
     }
 
     #[test]
@@ -927,6 +1246,7 @@ mod tests {
 
     #[test]
     fn objectives_remain_stable_while_units_act_sequentially() {
+        let master_data = MasterDataRegistry::load().unwrap();
         let map = Map::new(
             10,
             14,
@@ -954,6 +1274,7 @@ mod tests {
             ],
             &properties,
             &map,
+            &master_data,
             PlayerId(1),
         );
         let after_first_move = update_objective_assignments(
@@ -964,6 +1285,7 @@ mod tests {
             ],
             &properties,
             &map,
+            &master_data,
             PlayerId(1),
         );
 
@@ -979,13 +1301,14 @@ mod tests {
             ],
             &properties,
             &map,
+            &master_data,
             PlayerId(1),
         );
         assert_eq!(after_ally_capture, initial);
     }
 
     #[test]
-    fn map1_second_wave_fifth_infantry_targets_observed_factory() {
+    fn map1_second_wave_uses_rom_virtual_distance_and_later_scan_tie() {
         let master_data = MasterDataRegistry::load().unwrap();
         let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
             &master_data,
@@ -1008,7 +1331,14 @@ mod tests {
             assignment_unit(Entity::from_raw(3), GridPosition { x: 7, y: 3 }),
             assignment_unit(Entity::from_raw(4), GridPosition { x: 5, y: 3 }),
         ];
-        update_objective_assignments(&mut world, &first_wave, &properties, &map, PlayerId(1));
+        update_objective_assignments(
+            &mut world,
+            &first_wave,
+            &properties,
+            &map,
+            &master_data,
+            PlayerId(1),
+        );
         let mut all_units = first_wave.to_vec();
         all_units.extend([
             AssignmentUnit {
@@ -1016,8 +1346,7 @@ mod tests {
                 position: GridPosition { x: 6, y: 3 },
                 unit_type: UnitType::Recon,
                 record_order: 5,
-                fast_ground: true,
-                air_unit: false,
+                has_cargo: false,
             },
             assignment_unit(Entity::from_raw(6), GridPosition { x: 7, y: 4 }),
             assignment_unit(Entity::from_raw(7), GridPosition { x: 6, y: 4 }),
@@ -1026,22 +1355,179 @@ mod tests {
                 position: GridPosition { x: 7, y: 3 },
                 unit_type: UnitType::Recon,
                 record_order: 8,
-                fast_ground: true,
-                air_unit: false,
+                has_cargo: false,
             },
             assignment_unit(Entity::from_raw(9), GridPosition { x: 5, y: 3 }),
         ]);
 
-        let assignments =
-            update_objective_assignments(&mut world, &all_units, &properties, &map, PlayerId(1));
+        let assignments = update_objective_assignments(
+            &mut world,
+            &all_units,
+            &properties,
+            &map,
+            &master_data,
+            PlayerId(1),
+        );
 
         assert_eq!(
             assignments[&Entity::from_raw(9)],
+            // 実機のrecord 9は同距離の生産拠点を後勝ちで選び、raw(5,11)となる。
             GridPosition { x: 4, y: 10 }
         );
         assert_eq!(
             assignments[&Entity::from_raw(5)],
             GridPosition { x: 3, y: 11 }
+        );
+    }
+
+    #[test]
+    fn map3_first_bcopters_receives_rom_mission_two_objective() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master_data,
+            "map_3",
+            crate::resources::GridTopology::Hex,
+        )
+        .unwrap();
+        let map = world.resource::<Map>().clone();
+        let properties: Vec<_> = {
+            let mut query = world.query::<(&GridPosition, &Property)>();
+            query
+                .iter(&world)
+                .map(|(position, property)| (*position, *property))
+                .collect()
+        };
+        let mut units = vec![
+            assignment_unit(Entity::from_raw(0), GridPosition { x: 5, y: 5 }),
+            assignment_unit(Entity::from_raw(1), GridPosition { x: 6, y: 6 }),
+            assignment_unit(Entity::from_raw(2), GridPosition { x: 5, y: 6 }),
+        ];
+        let mut bcopter = assignment_unit(Entity::from_raw(3), GridPosition { x: 6, y: 4 });
+        bcopter.unit_type = UnitType::Bcopters;
+        units.push(bcopter);
+        units.extend([
+            assignment_unit(Entity::from_raw(4), GridPosition { x: 6, y: 5 }),
+            assignment_unit(Entity::from_raw(5), GridPosition { x: 4, y: 5 }),
+        ]);
+
+        let assignments = update_objective_assignments(
+            &mut world,
+            &units,
+            &properties,
+            &map,
+            &master_data,
+            PlayerId(1),
+        );
+
+        // ROMシナリオ+0x94/+0x95の(7,19)を0始まりへ変換した座標。
+        assert_eq!(
+            assignments[&Entity::from_raw(3)],
+            GridPosition { x: 6, y: 18 }
+        );
+    }
+
+    #[test]
+    fn map3_white_first_wave_receives_rom_capture_objectives() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master_data,
+            "map_3",
+            crate::resources::GridTopology::Hex,
+        )
+        .unwrap();
+        let map = world.resource::<Map>().clone();
+        let properties: Vec<_> = {
+            let mut query = world.query::<(&GridPosition, &Property)>();
+            query
+                .iter(&world)
+                .map(|(position, property)| (*position, *property))
+                .collect()
+        };
+        let units = [
+            assignment_unit(Entity::from_raw(0), GridPosition { x: 24, y: 24 }),
+            assignment_unit(Entity::from_raw(1), GridPosition { x: 23, y: 24 }),
+            assignment_unit(Entity::from_raw(2), GridPosition { x: 23, y: 23 }),
+            assignment_unit(Entity::from_raw(4), GridPosition { x: 24, y: 23 }),
+            assignment_unit(Entity::from_raw(5), GridPosition { x: 25, y: 24 }),
+        ];
+
+        let assignments = update_objective_assignments(
+            &mut world,
+            &units,
+            &properties,
+            &map,
+            &master_data,
+            PlayerId(2),
+        );
+        let actual: Vec<_> = units.iter().map(|unit| assignments[&unit.entity]).collect();
+
+        assert_eq!(
+            actual,
+            vec![
+                GridPosition { x: 24, y: 27 },
+                GridPosition { x: 22, y: 26 },
+                GridPosition { x: 22, y: 22 },
+                GridPosition { x: 25, y: 19 },
+                GridPosition { x: 19, y: 25 },
+            ]
+        );
+    }
+
+    #[test]
+    fn map3_transport_helicopter_reassigns_objective_after_loading() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master_data,
+            "map_3",
+            crate::resources::GridTopology::Hex,
+        )
+        .unwrap();
+        let map = world.resource::<Map>().clone();
+        let properties: Vec<_> = {
+            let mut query = world.query::<(&GridPosition, &Property)>();
+            query
+                .iter(&world)
+                .map(|(position, property)| (*position, *property))
+                .collect()
+        };
+        let entity = Entity::from_raw(9);
+        let mut transport = AssignmentUnit {
+            entity,
+            position: GridPosition { x: 5, y: 4 },
+            unit_type: UnitType::TransportHelicopter,
+            record_order: 9,
+            has_cargo: false,
+        };
+
+        let empty_assignment = update_objective_assignments(
+            &mut world,
+            &[transport],
+            &properties,
+            &map,
+            &master_data,
+            PlayerId(1),
+        );
+        assert_eq!(
+            empty_assignment[&entity],
+            GridPosition { x: 5, y: 5 },
+            "ROM 483Fは空の輸送ヘリを自軍首都へ割り当てる"
+        );
+
+        transport.position = GridPosition { x: 7, y: 6 };
+        transport.has_cargo = true;
+        world.resource_mut::<MatchState>().current_turn_number.0 += 1;
+        let loaded_assignment = update_objective_assignments(
+            &mut world,
+            &[transport],
+            &properties,
+            &map,
+            &master_data,
+            PlayerId(1),
+        );
+        assert_eq!(
+            loaded_assignment[&entity],
+            GridPosition { x: 6, y: 8 },
+            "ROM 485Eの歩兵経路フィールドで搭載後の施設目標を選ぶ"
         );
     }
 
@@ -1072,11 +1558,68 @@ mod tests {
                 Some(GridPosition { x: 7, y: 7 }),
                 &map,
                 &MasterDataRegistry::load().unwrap(),
-            ),
+            )
+            .0,
             AiCommand::Wait {
                 target_pos: GridPosition { x: 7, y: 5 }
             }
         ));
+    }
+
+    #[test]
+    fn capture_uses_reachable_movement_cost_instead_of_strategic_objective() {
+        let mut actor = unit(0, MovementType::Infantry, GridPosition { x: 1, y: 1 });
+        actor.stats.can_capture = true;
+        let near = GridPosition { x: 2, y: 1 };
+        let far = GridPosition { x: 4, y: 1 };
+        let candidates = [
+            CandidateTile {
+                position: near,
+                movement_cost: 1,
+            },
+            CandidateTile {
+                position: far,
+                movement_cost: 3,
+            },
+        ];
+        let properties = [
+            (
+                near,
+                Property::new(crate::resources::Terrain::City, None, 200),
+            ),
+            (
+                far,
+                Property::new(crate::resources::Terrain::City, None, 200),
+            ),
+        ];
+
+        assert!(matches!(
+            choose_capture(&actor, &candidates, &properties, PlayerId(1)),
+            Some(AiCommand::Capture { target_pos }) if target_pos == near
+        ));
+    }
+
+    #[test]
+    fn fallback_staging_matches_map3_rom_coastal_scan() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master_data,
+            "map_3",
+            crate::resources::GridTopology::Hex,
+        )
+        .unwrap();
+        let map = world.resource::<Map>();
+
+        // ROM実測ではraw(24,11)に対し、同距離候補の後側raw(22,12)を残す。
+        assert_eq!(
+            select_rom_fallback_staging(map, GridPosition { x: 23, y: 10 }),
+            Some(GridPosition { x: 21, y: 11 })
+        );
+        // 反対岸もraw(6,19)に対してraw(7,19)の港を選ぶ。
+        assert_eq!(
+            select_rom_fallback_staging(map, GridPosition { x: 5, y: 18 }),
+            Some(GridPosition { x: 6, y: 18 })
+        );
     }
 
     #[test]
@@ -1101,7 +1644,7 @@ mod tests {
             &master_data,
         );
 
-        let command = choose_wait(
+        let (command, used_fallback) = choose_wait(
             &actor,
             &candidates,
             Some(GridPosition { x: 6, y: 4 }),
@@ -1128,6 +1671,52 @@ mod tests {
             ),
             "{command:?}"
         );
+        assert!(!used_fallback);
+    }
+
+    #[test]
+    fn ship_routes_around_land_barrier_toward_inland_objective() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let mut map = Map::new(
+            7,
+            5,
+            crate::resources::Terrain::Sea,
+            crate::resources::GridTopology::Hex,
+        );
+        // 内陸目標へ直進すると西岸で止まるが、南側を回れば東岸まで到達できる。
+        for y in 0..4 {
+            map.set_terrain(3, y, crate::resources::Terrain::Plains)
+                .unwrap();
+        }
+        map.set_terrain(4, 1, crate::resources::Terrain::City)
+            .unwrap();
+        let actor_position = GridPosition { x: 2, y: 1 };
+        let actor = unit(0, MovementType::Ship, actor_position);
+        let candidates = vec![
+            CandidateTile {
+                position: actor_position,
+                movement_cost: 0,
+            },
+            CandidateTile {
+                position: GridPosition { x: 2, y: 2 },
+                movement_cost: 1,
+            },
+        ];
+
+        let (command, _) = choose_wait(
+            &actor,
+            &candidates,
+            Some(GridPosition { x: 4, y: 1 }),
+            &map,
+            &master_data,
+        );
+
+        assert!(matches!(
+            command,
+            AiCommand::Wait {
+                target_pos: GridPosition { x: 2, y: 2 }
+            }
+        ));
     }
 
     #[test]

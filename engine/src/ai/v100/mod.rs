@@ -8,6 +8,10 @@ pub(crate) mod compatibility_ai;
 /// V100/V200の能力ベース対応規則。
 pub(crate) mod compatibility_profile;
 pub(crate) mod production;
+/// ROMシナリオレコードから抽出した生産上限・兵種価値表。
+pub(crate) mod rom_data;
+/// Bank 2のAIルーチンをRustの状態機械へ写した判定規則。
+pub(crate) mod rom_logic;
 pub(crate) mod route_field;
 pub(crate) mod transport;
 pub(crate) mod unit_record;

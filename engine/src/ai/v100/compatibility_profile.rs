@@ -4,79 +4,21 @@
 //! 間接射撃というゲーム上の能力から評価する。
 
 use crate::components::UnitStats;
-use crate::resources::MovementType;
 
-/// GB版の能力レコードから対応付けた、初期生産の役割。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProductionRole {
-    Capturer,
-    FastGround,
-}
-
-/// GB版の陣営別ID 0/1（兵種0・歩兵）と22/23（兵種11・装甲車）を、名称ではなく
-/// OpenWars上の能力へ対応付ける。20/21（兵種10・ロケットランチャー）とは区別する。
-pub(crate) fn production_role(stats: &UnitStats) -> Option<ProductionRole> {
-    if stats.can_capture {
-        Some(ProductionRole::Capturer)
-    } else if stats.movement_type == MovementType::ArmoredCar && stats.max_movement >= 6 {
-        Some(ProductionRole::FastGround)
-    } else {
-        None
-    }
-}
-
-/// GB版の輸送分岐530C/5675に対応するOpenWars側の輸送能力かを判定する。
-/// OpenWarsの偵察車は歩兵を搭載できるが、対応するGB兵種22/23は直射戦闘部隊なので除外する。
+/// GB版の輸送分岐51BF/553Dに対応するOpenWars側の輸送能力かを判定する。
+/// ROM兵種表では装甲車0x16も搭載数1を持ち、530Cの接近対象に明記されている。
 pub(crate) fn is_gbw_transport(stats: &UnitStats) -> bool {
-    stats.max_cargo > 0 && matches!(stats.movement_type, MovementType::Air | MovementType::Ship)
-}
-
-/// GB版の初期配備で観測した「高速地上系、歩兵系、歩兵系」の周期を返す。
-///
-/// OpenWarsは同一フェーズの生産命令を先にキューへ積むため、現在の盤上数ではなく
-/// 発行済み生産スロット数を用いて周期を安定させる。
-pub(crate) fn preferred_production_role(production_slot: usize) -> ProductionRole {
-    if production_slot.is_multiple_of(3) {
-        ProductionRole::FastGround
-    } else {
-        ProductionRole::Capturer
-    }
+    stats.max_cargo > 0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::resources::master_data::UnitName;
-    use crate::resources::{MasterDataRegistry, UnitType};
-
-    fn stats() -> UnitStats {
-        UnitStats {
-            unit_type: UnitType::Infantry,
-            movement_type: MovementType::Infantry,
-            ..UnitStats::mock()
-        }
-    }
+    use crate::resources::{MasterDataRegistry, MovementType, UnitType};
 
     #[test]
-    fn production_roles_use_capabilities_not_unit_names() {
-        let mut capturer = stats();
-        capturer.can_capture = true;
-        let mut fast_ground = stats();
-        fast_ground.movement_type = MovementType::ArmoredCar;
-        fast_ground.max_movement = 6;
-
-        assert!(
-            production_role(&capturer) == Some(ProductionRole::Capturer)
-                && production_role(&fast_ground) == Some(ProductionRole::FastGround)
-        );
-        assert_eq!(preferred_production_role(0), ProductionRole::FastGround);
-        assert_eq!(preferred_production_role(1), ProductionRole::Capturer);
-        assert_eq!(preferred_production_role(2), ProductionRole::Capturer);
-        assert_eq!(preferred_production_role(3), ProductionRole::FastGround);
-    }
-
-    #[test]
-    fn gb_transport_mapping_excludes_openwars_recon_extra_ability() {
+    fn gb_transport_mapping_includes_the_rom_armored_car_capacity() {
         let master_data = MasterDataRegistry::load().unwrap();
         let recon = master_data
             .create_unit_stats(&UnitName(UnitType::Recon.as_str().to_owned()))
@@ -86,7 +28,7 @@ mod tests {
             .unwrap();
 
         assert!(recon.max_cargo > 0);
-        assert!(!is_gbw_transport(&recon));
+        assert!(is_gbw_transport(&recon));
         assert!(is_gbw_transport(&transport_helicopter));
     }
 
