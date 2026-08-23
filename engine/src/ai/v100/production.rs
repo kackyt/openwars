@@ -55,6 +55,10 @@ pub(crate) fn decide_production(
         let mut own_value = 0_u64;
         let mut enemy_value = 0_u64;
         for (position, faction, stats, health) in query.iter(world) {
+            // 撃破済みユニットは盤面占有・兵種数・戦力値のいずれにも含めない。
+            if health.current == 0 {
+                continue;
+            }
             positions.insert((position.x, position.y));
             // ROM 6317/635Bは5152のシナリオ別兵種価値へレコード+8のHPを掛ける。
             let force_value =

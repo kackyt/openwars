@@ -1224,9 +1224,16 @@ fn choose_merge(
         master_data,
     );
     for candidate in candidates {
-        let target_entity =
-            *friendly_by_position.get(&(candidate.position.x, candidate.position.y))?;
-        let target_health = world.get::<Health>(target_entity)?;
+        // 候補盤面は行動開始時のスナップショットなので、直前の行動で対象が
+        // 消えた場合でも後続候補の合流判定を続ける。
+        let Some(&target_entity) =
+            friendly_by_position.get(&(candidate.position.x, candidate.position.y))
+        else {
+            continue;
+        };
+        let Some(target_health) = world.get::<Health>(target_entity) else {
+            continue;
+        };
         // GB版は99を満タンとして合計119未満だけを合流候補にする。
         // OpenWarsの100刻みへ換算し、片方も損耗していない無意味な合流は除く。
         if (actor.hp < actor.max_hp || target_health.current < target_health.max)
@@ -2071,6 +2078,47 @@ mod tests {
             AiCommand::Wait {
                 target_pos: GridPosition { x: 7, y: 5 }
             }
+        ));
+    }
+
+    #[test]
+    fn merge_skips_stale_candidate_and_checks_following_target() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let map = Map::new(4, 4, Terrain::Plains, crate::resources::GridTopology::Hex);
+        let actor = unit(0, MovementType::Infantry, GridPosition { x: 1, y: 1 });
+        let mut occupants = HashMap::new();
+        for position in [(2, 1), (1, 2)] {
+            occupants.insert(
+                position,
+                OccupantInfo {
+                    player_id: PlayerId(1),
+                    is_transport: false,
+                    unit_type: UnitType::Infantry,
+                    loadable_types: Vec::new(),
+                    free_slots: 0,
+                },
+            );
+        }
+        let mut world = World::new();
+        let valid_target = world
+            .spawn((Health {
+                current: 10,
+                max: 100,
+            },))
+            .id();
+        let friendly_by_position = HashMap::from([((1, 2), valid_target)]);
+
+        assert!(matches!(
+            choose_merge(
+                &actor,
+                &map,
+                &occupants,
+                &friendly_by_position,
+                &world,
+                PlayerId(1),
+                &master_data,
+            ),
+            Some(AiCommand::Merge { target_entity, .. }) if target_entity == valid_target
         ));
     }
 

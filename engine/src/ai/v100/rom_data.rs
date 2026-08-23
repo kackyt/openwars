@@ -136,7 +136,7 @@ pub(crate) fn identify_scenario(
     master_data: &MasterDataRegistry,
 ) -> Option<RomScenarioData> {
     master_data.rom_scenarios.values().find_map(|record| {
-        let source = master_data.get_map(&record.map_name)?;
+        let source = master_data.get_map(record.map_name.as_str())?;
         if source.width != map.width || source.height != map.height {
             return None;
         }

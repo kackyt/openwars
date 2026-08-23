@@ -49,6 +49,26 @@ pub mod movement_types {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 pub struct UnitName(pub String);
 
+/// ROMシナリオとマップCSVを対応付けるマップ名のNewtype。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MapName(pub String);
+
+impl MapName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// ROMシナリオ値の採取元を表すNewtype。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RomScenarioSource(pub String);
+
+impl RomScenarioSource {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// 地形を識別するためのIDのNewtype
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 pub struct LandscapeId(pub u32);
@@ -141,9 +161,9 @@ pub struct LoadRecord {
 /// シナリオ値を埋め込まず、マスターデータとして差し替えられるように保持する。
 #[derive(Debug, Clone)]
 pub struct RomScenarioRecord {
-    pub map_name: String,
+    pub map_name: MapName,
     /// `rom`はROM実測値、`generated:model`は未知マップを意味モデルから生成した値。
-    pub source: String,
+    pub source: RomScenarioSource,
     pub restricted_radius: u32,
     pub opening_limit: u32,
     pub recon_uses_mission_three: bool,
@@ -193,8 +213,8 @@ impl TryFrom<RomScenarioCsvRecord> for RomScenarioRecord {
         }
 
         Ok(Self {
-            map_name: record.map_name.clone(),
-            source: record.source,
+            map_name: MapName(record.map_name.clone()),
+            source: RomScenarioSource(record.source),
             restricted_radius: record.restricted_radius,
             opening_limit: record.opening_limit,
             recon_uses_mission_three: record.recon_uses_mission_three,
@@ -413,20 +433,21 @@ impl MasterDataRegistry {
         let mut rdr = csv::Reader::from_reader(rom_scenario_csv.as_bytes());
         for result in rdr.deserialize::<RomScenarioCsvRecord>() {
             let record = RomScenarioRecord::try_from(result?)?;
-            if !registry.maps.contains_key(&record.map_name) {
+            let map_name = record.map_name.0.clone();
+            if !registry.maps.contains_key(&map_name) {
                 return Err(MasterDataError::InvalidRomScenarioData(format!(
                     "{}: corresponding map CSV is missing",
-                    record.map_name
+                    map_name
                 )));
             }
             if registry
                 .rom_scenarios
-                .insert(record.map_name.clone(), record)
+                .insert(map_name.clone(), record)
                 .is_some()
             {
-                return Err(MasterDataError::InvalidRomScenarioData(
-                    "duplicate map_name".to_string(),
-                ));
+                return Err(MasterDataError::InvalidRomScenarioData(format!(
+                    "duplicate map_name: {map_name}"
+                )));
             }
         }
 
@@ -709,7 +730,13 @@ fn parse_rom_production_limits(map_name: &str, values: &str) -> Result<[u8; 24],
     let parsed = values
         .split(';')
         .map(str::trim)
-        .map(str::parse::<u8>)
+        .map(|value| {
+            value.parse::<u8>().map_err(|error| {
+                MasterDataError::InvalidRomScenarioData(format!(
+                    "{map_name}: invalid production limit '{value}': {error}"
+                ))
+            })
+        })
         .collect::<Result<Vec<_>, _>>()?;
     parsed.try_into().map_err(|values: Vec<u8>| {
         MasterDataError::InvalidRomScenarioData(format!(
@@ -958,14 +985,23 @@ mod tests {
             let scenario = registry
                 .get_rom_scenario(&map_name)
                 .unwrap_or_else(|| panic!("ROM scenario for {map_name} is missing"));
-            assert_eq!(scenario.map_name, map_name);
+            assert_eq!(scenario.map_name.as_str(), map_name);
             assert!(registry.get_map(&map_name).is_some());
             if matches!(map_number, 9 | 10) {
-                assert_eq!(scenario.source, "generated:model");
+                assert_eq!(scenario.source.as_str(), "generated:model");
             } else {
-                assert_eq!(scenario.source, "rom");
+                assert_eq!(scenario.source.as_str(), "rom");
             }
         }
+    }
+
+    #[test]
+    fn invalid_production_limit_identifies_its_map_and_value() {
+        let error = parse_rom_production_limits("map_test", "1;not-a-number").unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("map_test"));
+        assert!(message.contains("not-a-number"));
     }
 
     #[test]
