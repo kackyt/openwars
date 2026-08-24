@@ -4,9 +4,9 @@ category: "coding"
 version: "1.0.0"
 status: "approved"
 created: "2026-08-15"
-updated: "2026-08-15"
+updated: "2026-08-24"
 owner: "@t_kak"
-ace_entry_count: 4
+ace_entry_count: 5
 tags: [ace, playbook, coding]
 references:
   - docs/08-knowledge/PLAYBOOK.md
@@ -99,3 +99,23 @@ references:
 **Context**: PR #94 にて V4 生産 AI の標的評価を改修する際、ユニット本体のコスト評価に加えて cargo コストと直近の占領収入・阻害分を加算するロジックを実装し、それを V1〜V4 の共通戦術評価層（`engine/src/ai/eval.rs` / `squad.rs`）へ横展開した。
 
 **Action**: 戦術 AI の目標判定・優先度評価では、`target_value = unit_cost + cargo_cost + immediate_capture_income` のように波及効果や内部状態の価値を複合評価する関数を実装し、全戦術層で共通利用する。
+
+<a id="ace-101-1"></a>
+
+### ACE-101-1: コレクション走査中の ? オペレータ誤用による早期終了バグの防止とループ継続ガード
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | coding |
+| Origin     | PR #101 |
+| Date       | 2026-08-24 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: 複数候補をループ走査して最適なアクションを探索する関数内で、個別の候補検証に `?` オペレータを使用すると、1つの無効候補に遭遇しただけで関数全体が即座に早期リターン（`None` / `Err`）し、後続の有効な候補が評価されずに破棄される。ループ内での個別候補の検証・アンラップには `let Some(...) = ... else { continue; }` などの明示的なスキップ制御を用いる必要がある。
+
+**Context**: PR #101 の `choose_merge`（合流アクション選択）において、合流候補タイルの走査中にターゲット探索で `?` を使用していたため、非合流対象タイルにヒットした時点で即座に関数全体が `None` を返して終了し、他に有効な合流先が存在していても合流が行われない不具合が発生した（コミット `734eb37`）。
+
+**Action**: コレクションやグリッドを反復走査して候補を評価・選択する関数では、ループ内の要素個別チェックに `?` を使わず、`let Some(...) = expr else { continue; }` や `match` 式による `continue` ガードを用いて後続候補の走査を確実に継続させる。
+

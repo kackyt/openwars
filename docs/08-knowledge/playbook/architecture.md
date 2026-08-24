@@ -4,9 +4,9 @@ category: "architecture"
 version: "1.0.0"
 status: "approved"
 created: "2026-08-15"
-updated: "2026-08-15"
+updated: "2026-08-24"
 owner: "@t_kak"
-ace_entry_count: 20
+ace_entry_count: 21
 tags: [ace, playbook, architecture]
 references:
   - docs/08-knowledge/PLAYBOOK.md
@@ -403,3 +403,23 @@ references:
 **Context**: PR #99 において、AI V4 の導入に伴い、島作戦や戦術部隊のライフサイクルが長大化・複雑化し、作戦終了時のユニット解放漏れや同一ユニットの複数作戦アサインが問題となったため、`UnitOperationRegistry` を導入して一元管理した。
 
 **Action**: エンティティが長期間・複数段階の作戦にアサインされるシステムでは、所有権の正本レジストリを設計し、`Entity -> Owner` と `Owner -> Set<Entity>` の双方向マップを内部で同期させる。作戦解放はオーナー逆引きから O(k) で行い、未請求エンティティのクリーンアップ機構（`release_unclaimed_*`）を備える。
+
+<a id="ace-101-2"></a>
+
+### ACE-101-2: 盤面集計・生産判定における撃破済みエンティティ（HP 0）の除外ガード
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | architecture |
+| Origin     | PR #101 |
+| Date       | 2026-08-24 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: ECSワールド走査によって拠点の占有状況、所有兵種構成、戦力価値（force value）を算出する際、同一手番内や先行アクションで撃破（HP 0）されたエンティティがワールド内に残存していると、生産マスが「占有中」と誤判定されたり、兵種上限を超過していると誤認して新規生産がブロックされる。集計・計画ループの先頭で `health.current == 0` を明示的に除外する必要がある。
+
+**Context**: PR #101 の `decide_production`（生産決定ロジック）において、ECSクエリでワールド内の全ユニットを走査して生産マス占有判定やシナリオの兵種制限数・戦力バランスを計算していたが、撃破済みユニットがフィルタリングされておらず生産拠点マスを「占有中」とみなして生産が行われなくなる問題が発覚し、`if health.current == 0 { continue; }` ガードを追加した（コミット `734eb37`）。
+
+**Action**: 生産可否判定、兵種数集計、戦力スコア計算など、盤面上の有効戦力をECSクエリで集計するシステムでは、クエリ走査の冒頭で `if health.current == 0 { continue; }` による生存判定を徹底し、未デスポーンの撃破済みエンティティによるゴースト干渉を排除する。
+

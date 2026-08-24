@@ -4,9 +4,9 @@ category: "tooling"
 version: "1.0.0"
 status: "approved"
 created: "2026-08-15"
-updated: "2026-08-15"
+updated: "2026-08-24"
 owner: "@t_kak"
-ace_entry_count: 3
+ace_entry_count: 4
 tags: [ace, playbook, tooling]
 references:
   - docs/08-knowledge/PLAYBOOK.md
@@ -80,3 +80,23 @@ references:
 **Context**: PR #98 にて生産口封鎖解除や配備追跡を導入した際、AI内部で正しく封鎖解除ミッションが発動しているかをバッチシミュレーションや Python テストスクリプト（`test_eval_matchup.py`）から確認できるよう、`factory_relief_history` や `emergency_plan_history` 等を対戦トレースログへ追加した。
 
 **Action**: AIが内部状態（緊急計画、配備追跡、部隊評価など）に基づいて動的制御を行う場合は、その計画・監査情報を手番ごとの対戦トレース（JSONL）にエクスポートする出力インターフェースを整備し、評価ツールやテストから判定可能にする。
+
+<a id="ace-101-3"></a>
+
+### ACE-101-3: 大量マスターデータ検証におけるリソース名・不正値を含めたコンテキスト付きエラー設計
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | tooling |
+| Origin     | PR #101 |
+| Date       | 2026-08-24 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: 多数のシナリオやマップ（53マップ以上等）を一括ロード・パースする際、パース失敗時に単なるフォーマットエラーや定型文を返すのではなく、対象マップ名や不正入力文字列をエラーメッセージ内に埋め込むことで、データ不備の特定と修正作業を劇的に効率化できる。
+
+**Context**: PR #101 において 53 マップ分の ROM シナリオ CSV を導入した際、生産制限パース処理（`parse_rom_production_limits`）やシナリオ登録処理で、エラー時にマップ名と不正値（`format!("{map_name}: invalid production limit '{value}': {error}")`）を含めるよう修正し、大量データ投入時のデバッグ性を向上させた（コミット `734eb37`）。
+
+**Action**: CSV や外部定義から多数のマスターデータを読み込むパーサーでは、パースエラーのバリアントにリソース識別子（ファイル名、マップ名、行番号等）とパース対象の実文字列を含めた詳細なコンテキスト文字列を付与して返し、単体テストでそのエラーメッセージの含有を検証する。
+

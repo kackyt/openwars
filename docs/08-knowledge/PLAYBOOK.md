@@ -1,11 +1,11 @@
 ---
 title: "PLAYBOOK"
-version: "1.18.0"
+version: "1.19.0"
 status: "approved"
 created: "2026-06-06"
-updated: "2026-08-15"
+updated: "2026-08-24"
 owner: "@t_kak"
-ace_entry_count: 40
+ace_entry_count: 43
 tags: [ace, playbook, knowledge-management]
 references:
   - docs/ACE_FRAMEWORK.md
@@ -164,11 +164,11 @@ Playbook が 800 行を超えた場合、以下のように分割する：
 
 | カテゴリ | サブファイル | エントリ数 | 主な内容 |
 | -------- | ------------ | ---------- | -------- |
-| `architecture` | [Architecture](./playbook/architecture.md) | 20 件 | 設計判断、構造上の決定事項、状態管理 |
+| `architecture` | [Architecture](./playbook/architecture.md) | 21 件 | 設計判断、構造上の決定事項、状態管理 |
 | `performance` | [Performance](./playbook/performance.md) | 9 件 | パフォーマンス最適化、キャッシュ、計算量削減 |
-| `coding` | [Coding](./playbook/coding.md) | 4 件 | コーディングパターン、言語固有・型安全のベストプラクティス |
+| `coding` | [Coding](./playbook/coding.md) | 5 件 | コーディングパターン、言語固有・型安全のベストプラクティス |
 | `testing` | [Testing](./playbook/testing.md) | 4 件 | テスト戦略、テストパターン、モック・シミュレーション設計 |
-| `tooling` | [Tooling](./playbook/tooling.md) | 3 件 | ツール設定、ログ出力・可視化、開発環境・スキル |
+| `tooling` | [Tooling](./playbook/tooling.md) | 4 件 | ツール設定、ログ出力・可視化、開発環境・スキル |
 | `security` | [Security](./playbook/security.md) | 0 件 | セキュリティ対策、脆弱性防止、入力検証 |
 | `devops` | [Devops](./playbook/devops.md) | 0 件 | CI/CD、デプロイ、ビルドパイプライン |
 | `process` | [Process](./playbook/process.md) | 0 件 | 開発プロセス、ワークフロー改善、タスク管理 |
@@ -219,10 +219,19 @@ Playbook が 800 行を超えた場合、以下のように分割する：
 | [ACE-99-1](./playbook/performance.md#ace-99-1) | Native/WASM 共通の順序保持並列化基盤（map_ordered）と決定論的再現性の担保 | `performance` | PR #99 | `active` | [詳細](./playbook/performance.md#ace-99-1) |
 | [ACE-99-2](./playbook/architecture.md#ace-99-2) | 作戦所有権（OperationOwner）の正本レジストリと双方向 O(1) 逆引きによる遊兵化・二重予約防止 | `architecture` | PR #99 | `active` | [詳細](./playbook/architecture.md#ace-99-2) |
 | [ACE-99-3](./playbook/performance.md#ace-99-3) | 長期ターン進行時の戦術スナップショット再利用と再割り当てループの排除 | `performance` | PR #99 | `active` | [詳細](./playbook/performance.md#ace-99-3) |
+| [ACE-101-1](./playbook/coding.md#ace-101-1) | コレクション走査中の ? オペレータ誤用による早期終了バグの防止とループ継続ガード | `coding` | PR #101 | `active` | [詳細](./playbook/coding.md#ace-101-1) |
+| [ACE-101-2](./playbook/architecture.md#ace-101-2) | 盤面集計・生産判定における撃破済みエンティティ（HP 0）の除外ガード | `architecture` | PR #101 | `active` | [詳細](./playbook/architecture.md#ace-101-2) |
+| [ACE-101-3](./playbook/tooling.md#ace-101-3) | 大量マスターデータ検証におけるリソース名・不正値を含めたコンテキスト付きエラー設計 | `tooling` | PR #101 | `active` | [詳細](./playbook/tooling.md#ace-101-3) |
 
 ---
 
 ## Changelog
+
+### [1.19.0] - 2026-08-24
+
+#### 追加
+
+- PR #101 より知見抽出: ACE-101-1 (coding), ACE-101-2 (architecture), ACE-101-3 (tooling)
 
 ### [1.18.0] - 2026-08-15
 
