@@ -50,6 +50,9 @@ pub struct LoadMapArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct ListMapsArgs {}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct SpawnUnitArgs {
     pub x: u32,
     pub y: u32,
@@ -98,10 +101,27 @@ pub struct ExecuteActionArgs {
 
 #[tool_router]
 impl OpenWarsAiServer {
-    #[tool(description = "Loads a specific map to evaluate.")]
+    #[tool(description = "Lists every embedded map name, including map_1 through map_53.")]
+    async fn list_maps(
+        &self,
+        Parameters(_args): Parameters<ListMapsArgs>,
+    ) -> Result<String, String> {
+        let registry =
+            MasterDataRegistry::load().map_err(|e| format!("Failed to load master data: {e}"))?;
+        Ok(serde_json::json!({ "maps": registry.map_names() }).to_string())
+    }
+
+    #[tool(description = "Loads a specific embedded map (map_1 through map_53) to evaluate.")]
     async fn load_map(&self, Parameters(args): Parameters<LoadMapArgs>) -> Result<String, String> {
         let registry =
             MasterDataRegistry::load().map_err(|e| format!("Failed to load master data: {}", e))?;
+        if registry.get_map(&args.map_name).is_none() {
+            return Err(format!(
+                "Unknown map '{}'. Available maps: {}",
+                args.map_name,
+                registry.map_names().join(", ")
+            ));
+        }
 
         let topology = match args
             .grid_type
@@ -198,9 +218,11 @@ impl OpenWarsAiServer {
                 "V2" => engine::ai::AiVersion::V2,
                 "V3" => engine::ai::AiVersion::V3,
                 "V4" => engine::ai::AiVersion::V4,
+                "V100" => engine::ai::AiVersion::V100,
+                "V200" => engine::ai::AiVersion::V200,
                 _ => {
                     return Err(format!(
-                        "Invalid AI version: {}. Must be 'V1', 'V2', 'V3' or 'V4'",
+                        "Invalid AI version: {}. Must be 'V1', 'V2', 'V3', 'V4', 'V100' or 'V200'",
                         args.version
                     ));
                 }
@@ -822,4 +844,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     running_service.waiting().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mcp_load_map_accepts_map_53() {
+        let server = OpenWarsAiServer {
+            state: Arc::new(Mutex::new(None)),
+        };
+
+        let result = server
+            .load_map(Parameters(LoadMapArgs {
+                map_name: "map_53".to_string(),
+                seed: Some(53),
+                grid_type: Some("hex".to_string()),
+            }))
+            .await;
+
+        assert_eq!(result.as_deref(), Ok("Loaded map: map_53"));
+    }
 }

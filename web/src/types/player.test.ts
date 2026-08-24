@@ -11,9 +11,9 @@ import {
 } from "./player";
 
 describe("player settings helpers", () => {
-  it("exposes only Human, AI V1, AI V3, and AI V4 in the menu", () => {
-    expect(PLAYER_MENU_OPTIONS).toEqual(["Human", "AI V1", "AI V3", "AI V4"]);
-    expect(PLAYER_MENU_OPTIONS.some((option) => option.includes("V2"))).toBe(false);
+  it("exposes all public AI versions in the menu", () => {
+    expect(PLAYER_MENU_OPTIONS).toEqual(["Human", "AI V1", "AI V3", "AI V4", "AI V100", "AI V200"]);
+    expect((PLAYER_MENU_OPTIONS as readonly string[]).includes("AI V2")).toBe(false);
   });
 
   it("creates the default P1 Human / P2 AI V4 settings", () => {
@@ -40,6 +40,10 @@ describe("player settings helpers", () => {
     expect(normalizeLoadedPlayerAiVersions({ 1: "V4", 2: "V2" })).toEqual({
       1: "V4",
       2: "V3",
+    });
+    expect(normalizeLoadedPlayerAiVersions({ 1: "V100", 2: "V200" })).toEqual({
+      1: "V100",
+      2: "V200",
     });
     expect(normalizeLoadedPlayerAiVersions({})).toEqual({ 1: "V3", 2: "V3" });
   });

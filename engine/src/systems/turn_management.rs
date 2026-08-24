@@ -41,7 +41,20 @@ fn apply_daily_updates_for_unit(
         let terrain = map.get_terrain(pos.x, pos.y);
         if terrain != Some(Terrain::Airport) {
             if fuel.current == 0 {
-                hp.current = 0; // Destroyed
+                // 飛行場外で燃料切れとなった航空ユニットは墜落扱いにする。
+                hp.current = 0;
+            } else {
+                fuel.current = fuel.current.saturating_sub(stats.daily_fuel_consumption);
+            }
+        }
+    }
+
+    if stats.movement_type == MovementType::Ship {
+        let terrain = map.get_terrain(pos.x, pos.y);
+        if terrain != Some(Terrain::Port) {
+            if fuel.current == 0 {
+                // 港外で燃料切れとなった艦船ユニットは航行不能として撃破扱いにする。
+                hp.current = 0;
             } else {
                 fuel.current = fuel.current.saturating_sub(stats.daily_fuel_consumption);
             }

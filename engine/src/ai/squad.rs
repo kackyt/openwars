@@ -5355,10 +5355,9 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                 }
             }
 
-            let final_target;
             // 敵が15ターン以上遠い場合や存在しない場合は、最寄りの拠点（未占領または敵所有）を目標にする
-            if nearest_cluster_dist.turns <= 15 {
-                final_target = nearest_cluster_center;
+            let final_target = if nearest_cluster_dist.turns <= 15 {
+                nearest_cluster_center
             } else {
                 let mut nearest_prop_dist = u32::MAX;
                 let mut nearest_prop_pos = None;
@@ -5373,8 +5372,8 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                         }
                     }
                 }
-                final_target = nearest_prop_pos.or(nearest_cluster_center);
-            }
+                nearest_prop_pos.or(nearest_cluster_center)
+            };
 
             if let Some(target) = final_target {
                 // 新規部隊を立ち上げて1体目のメンバーとして割り当てる

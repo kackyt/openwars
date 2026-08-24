@@ -1474,6 +1474,10 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> Option<Str
 
     match ai_version {
         crate::ai::ai_version::AiVersion::V1 => execute_ai_turn_v1(world, active_player),
+        // V100/V200は既存V1〜V4の決定器を呼ばない独立した逐次決定器を使用する。
+        crate::ai::ai_version::AiVersion::V100 | crate::ai::ai_version::AiVersion::V200 => {
+            crate::ai::v100::execute_turn(world, active_player)
+        }
         // V3/V4 は V2 と同じ部隊編成・ビーム探索パイプラインを共有し、
         // タイル評価 (decide_ai_action_v2) と盤面評価の中でバージョン別の強化を行う
         // （V4 の差分は生産判断のみで、行動決定パイプラインは V3 と同一）

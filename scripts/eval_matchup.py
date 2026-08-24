@@ -135,9 +135,9 @@ ISSUE58_V3_SELFPLAY = "v3-selfplay"
 def normalize_ai_version(version):
     """CLI で許容する AI バージョン表記を MCP が受け取る正規表記へ揃える。"""
     normalized = version.strip().upper()
-    if normalized not in {"V1", "V2", "V3", "V4"}:
+    if normalized not in {"V1", "V2", "V3", "V4", "V100", "V200"}:
         raise ValueError(
-            f"Invalid AI version: {version}. Expected one of V1, V2, V3 or V4"
+            f"Invalid AI version: {version}. Expected one of V1, V2, V3, V4, V100 or V200"
         )
     return normalized
 
@@ -241,6 +241,10 @@ def write_trace_jsonl(path, results):
             record_for(entry)["emergency_plan"] = entry.get("plan")
         for entry in result.get("factory_relief_history", []):
             record_for(entry)["factory_relief"] = entry.get("missions")
+        for entry in result.get("action_history", []):
+            record = record_for(entry)
+            record["actions"] = entry.get("actions")
+            record["loaded_transports"] = entry.get("loaded_transports", [])
 
         # 欠測（V1〜V3 は生産トレースを持たない）を挟んでも順序が崩れないよう -1 で埋める。
         for key in sorted(
@@ -332,6 +336,7 @@ def run_single_game(
     logistics_plan_history = []
     emergency_plan_history = []
     factory_relief_history = []
+    action_history = []
     initial_state = None
     error = None
 
@@ -360,6 +365,7 @@ def run_single_game(
             "logistics_plan_history": logistics_plan_history,
             "emergency_plan_history": emergency_plan_history,
             "factory_relief_history": factory_relief_history,
+            "action_history": action_history,
             "error": error,
         }
 
@@ -565,6 +571,28 @@ def run_single_game(
             "squads": ai_result.get("transport_squads", []),
         })
         actions = ai_result.get("actions_taken", [])
+        # V100/V200のROM行動列と座標単位で比較できるよう、集計前の命令文字列も残す。
+        action_history.append(
+            {
+                "round": turn,
+                "turn": state.get("turn"),
+                "player_id": current_player,
+                "actions": [str(action) for action in actions],
+                # Waitの主体が積載済み輸送かを、行動前の盤面と照合できるようにする。
+                "loaded_transports": [
+                    {
+                        "unit_id": unit.get("unit_id"),
+                        "unit_type": unit.get("unit_type"),
+                        "x": unit.get("x"),
+                        "y": unit.get("y"),
+                        "cargo_ids": unit.get("cargo_ids", []),
+                    }
+                    for unit in state.get("units", [])
+                    if unit.get("player_id") == current_player
+                    and unit.get("cargo_ids")
+                ],
+            }
+        )
         acts_dict = defaultdict(int)
         for action in actions:
             action_str = str(action)

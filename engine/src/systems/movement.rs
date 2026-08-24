@@ -2,7 +2,7 @@ use crate::components::*;
 use crate::events::*;
 use crate::resources::*;
 use bevy_ecs::prelude::*;
-use std::collections::{BTreeSet, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 
 #[derive(Clone)]
 pub struct OccupantInfo {
@@ -66,9 +66,12 @@ fn is_boardable_shoal_transport(
     })
 }
 
-/// 指定された地点から到達可能なすべてのタイルの座標を計算します。ZOCや燃料・移動コストも加味します。
+/// 指定地点から合法的に到達できるタイルと、最小移動コストを返します。
+///
+/// ZOC・燃料・地形・占有の制約を一箇所で適用する。GB版AI移植では、この
+/// コスト付きの候補フィールドを使って後段の行動候補を絞り込む。
 #[allow(clippy::too_many_arguments)]
-pub fn calculate_reachable_tiles(
+pub fn calculate_reachable_tile_costs(
     map: &Map,
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
     start: (usize, usize),
@@ -78,7 +81,7 @@ pub fn calculate_reachable_tiles(
     player_id: PlayerId,
     moving_unit_type: UnitType,
     master_data: &crate::resources::master_data::MasterDataRegistry,
-) -> BTreeSet<(usize, usize)> {
+) -> BTreeMap<(usize, usize), u32> {
     #[derive(Copy, Clone, Eq, PartialEq)]
     struct State {
         cost: u32,
@@ -100,10 +103,9 @@ pub fn calculate_reachable_tiles(
         }
     }
 
-    // 到達可能タイルは AI が「同点候補のうち最初に見つかったもの」を選ぶため、
-    // 反復順が結果を左右する。HashSet はプロセスごとに反復順が変わり同一seedでも
-    // 再現しないため、座標順で安定する BTreeSet を用いる。
-    let mut reachable = BTreeSet::new();
+    // 到達候補は AI が同点候補のうち最初に見つかったものを選ぶため、座標順で
+    // 安定する BTreeMap を用いる。値は移動経路の最小コストである。
+    let mut reachable = BTreeMap::new();
     let mut heap = BinaryHeap::new();
     let mut min_cost: HashMap<(usize, usize), u32> = HashMap::new();
 
@@ -124,7 +126,7 @@ pub fn calculate_reachable_tiles(
             continue;
         }
 
-        reachable.insert(position);
+        reachable.insert(position, cost);
 
         if fuel_used >= max_fuel {
             continue;
@@ -205,7 +207,7 @@ pub fn calculate_reachable_tiles(
         }
     }
 
-    reachable.retain(|&pos| {
+    reachable.retain(|&pos, _| {
         if pos == start {
             true
         } else if let Some(occ) = unit_positions.get(&pos) {
@@ -219,6 +221,37 @@ pub fn calculate_reachable_tiles(
         }
     });
     reachable
+}
+
+/// 指定された地点から到達可能なすべてのタイルの座標を計算します。
+///
+/// 既存のAI・UI向けの互換API。コスト付き候補が必要なAIは
+/// [`calculate_reachable_tile_costs`] を利用する。
+#[allow(clippy::too_many_arguments)]
+pub fn calculate_reachable_tiles(
+    map: &Map,
+    unit_positions: &HashMap<(usize, usize), OccupantInfo>,
+    start: (usize, usize),
+    movement_type: MovementType,
+    max_mp: u32,
+    max_fuel: u32,
+    player_id: PlayerId,
+    moving_unit_type: UnitType,
+    master_data: &crate::resources::master_data::MasterDataRegistry,
+) -> BTreeSet<(usize, usize)> {
+    calculate_reachable_tile_costs(
+        map,
+        unit_positions,
+        start,
+        movement_type,
+        max_mp,
+        max_fuel,
+        player_id,
+        moving_unit_type,
+        master_data,
+    )
+    .into_keys()
+    .collect()
 }
 
 /// A*アルゴリズムを用いて、目的地までの最短経路を探索し、(経路, 消費コスト, 消費燃料) を返します。
@@ -1418,5 +1451,27 @@ mod tests {
             reachable.contains(&(1, 0)),
             "輸送ユニットがいるマスは、搭載可能な場合ハイライト（移動可能）されるべきです"
         );
+    }
+
+    #[test]
+    fn reachable_tile_costs_preserve_minimum_movement_cost() {
+        let map = Map::new(3, 3, Terrain::Plains, GridTopology::Square);
+        let master_data = crate::resources::master_data::MasterDataRegistry::load().unwrap();
+
+        let costs = calculate_reachable_tile_costs(
+            &map,
+            &HashMap::new(),
+            (1, 1),
+            MovementType::Infantry,
+            2,
+            99,
+            PlayerId(1),
+            UnitType::Infantry,
+            &master_data,
+        );
+
+        // 出発地点と平地に一歩進む候補のコストを、AIの候補フィールドへ渡せる。
+        assert_eq!(costs.get(&(1, 1)), Some(&0));
+        assert_eq!(costs.get(&(1, 0)), Some(&1));
     }
 }

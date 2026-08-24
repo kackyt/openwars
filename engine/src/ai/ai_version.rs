@@ -21,6 +21,12 @@ pub enum AiVersion {
     /// - 前線ごとに占領枠・撃破枠・護衛枠・輸送枠・迎撃枠を状況から導出する
     /// - 到達可能性で候補を絞り、生産枠あたり予算で価格帯を決め、埋まらない枠は購入を見送る
     V4,
+    /// IQ 100 相当の互換AI。
+    /// ROM由来の部隊優先・段階行動・生産走査を独立実装する。
+    V100,
+    /// IQ 200 相当の互換AI。
+    /// V100のROM互換段階にIQ200固有の合流などを追加する。
+    V200,
 }
 
 impl AiVersion {
@@ -146,5 +152,26 @@ mod tests {
             resolve_player_ai_version(&world, PlayerId(4)),
             AiVersion::V4
         );
+    }
+
+    #[test]
+    fn resolver_preserves_v100_and_v200() {
+        let mut world = World::new();
+        let mut settings = PlayerAiSettings::default();
+        settings.set_version(PlayerId(100), AiVersion::V100);
+        settings.set_version(PlayerId(200), AiVersion::V200);
+        world.insert_resource(settings);
+
+        assert_eq!(
+            resolve_player_ai_version(&world, PlayerId(100)),
+            AiVersion::V100
+        );
+        assert_eq!(
+            resolve_player_ai_version(&world, PlayerId(200)),
+            AiVersion::V200
+        );
+        // V100/V200は既存V3/V4の生産・地形戦術を暗黙に継承しない。
+        assert!(!AiVersion::V100.uses_v3_tactics());
+        assert!(!AiVersion::V200.uses_operation_driven_production());
     }
 }

@@ -21,6 +21,8 @@ pub enum MasterDataError {
     InvalidCategoryName(String),
     #[error("不明な移動タイプ: {0}")]
     InvalidMovementType(String),
+    #[error("ROMシナリオデータが不正です: {0}")]
+    InvalidRomScenarioData(String),
     #[error("不明なマスターデータ読み込みエラー")]
     Unknown,
 }
@@ -46,6 +48,26 @@ pub mod movement_types {
 /// ユニットや武器などを識別するための名前のNewtype
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 pub struct UnitName(pub String);
+
+/// ROMシナリオとマップCSVを対応付けるマップ名のNewtype。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MapName(pub String);
+
+impl MapName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// ROMシナリオ値の採取元を表すNewtype。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RomScenarioSource(pub String);
+
+impl RomScenarioSource {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 /// 地形を識別するためのIDのNewtype
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
@@ -133,6 +155,96 @@ pub struct LoadRecord {
     pub capacity: u32,
 }
 
+/// Game Boy Wars TurboのROMから抽出した、マップごとのAI入力値。
+///
+/// `map_name` はマップCSVのファイル名（拡張子なし）と対応する。AI実装にマップ名や
+/// シナリオ値を埋め込まず、マスターデータとして差し替えられるように保持する。
+#[derive(Debug, Clone)]
+pub struct RomScenarioRecord {
+    pub map_name: MapName,
+    /// `rom`はROM実測値、`generated:model`は未知マップを意味モデルから生成した値。
+    pub source: RomScenarioSource,
+    pub restricted_radius: u32,
+    pub opening_limit: u32,
+    pub recon_uses_mission_three: bool,
+    pub strategic_objectives: [[(u8, u8); 2]; 2],
+    pub unit_value_profiles: [usize; 2],
+    pub production_limits: [[u8; 24]; 4],
+}
+
+#[derive(Debug, Deserialize)]
+struct RomScenarioCsvRecord {
+    map_name: String,
+    source: String,
+    restricted_radius: u32,
+    opening_limit: u32,
+    recon_uses_mission_three: bool,
+    player1_objective1_x: u8,
+    player1_objective1_y: u8,
+    player1_objective2_x: u8,
+    player1_objective2_y: u8,
+    player2_objective1_x: u8,
+    player2_objective1_y: u8,
+    player2_objective2_x: u8,
+    player2_objective2_y: u8,
+    player1_unit_value_profile: usize,
+    player2_unit_value_profile: usize,
+    opening_production_limits: String,
+    disadvantage_production_limits: String,
+    advantage_production_limits: String,
+    draw_production_limits: String,
+}
+
+impl TryFrom<RomScenarioCsvRecord> for RomScenarioRecord {
+    type Error = MasterDataError;
+
+    fn try_from(record: RomScenarioCsvRecord) -> Result<Self, Self::Error> {
+        if record.source != "rom" && !record.source.starts_with("generated:") {
+            return Err(MasterDataError::InvalidRomScenarioData(format!(
+                "{}: source must be rom or generated:<kind>",
+                record.map_name
+            )));
+        }
+        if record.player1_unit_value_profile > 3 || record.player2_unit_value_profile > 3 {
+            return Err(MasterDataError::InvalidRomScenarioData(format!(
+                "{}: player unit value profiles must be 0..=3",
+                record.map_name
+            )));
+        }
+
+        Ok(Self {
+            map_name: MapName(record.map_name.clone()),
+            source: RomScenarioSource(record.source),
+            restricted_radius: record.restricted_radius,
+            opening_limit: record.opening_limit,
+            recon_uses_mission_three: record.recon_uses_mission_three,
+            strategic_objectives: [
+                [
+                    (record.player1_objective1_x, record.player1_objective1_y),
+                    (record.player1_objective2_x, record.player1_objective2_y),
+                ],
+                [
+                    (record.player2_objective1_x, record.player2_objective1_y),
+                    (record.player2_objective2_x, record.player2_objective2_y),
+                ],
+            ],
+            unit_value_profiles: [
+                record.player1_unit_value_profile,
+                record.player2_unit_value_profile,
+            ],
+            production_limits: [
+                parse_rom_production_limits(&record.map_name, &record.opening_production_limits)?,
+                parse_rom_production_limits(
+                    &record.map_name,
+                    &record.disadvantage_production_limits,
+                )?,
+                parse_rom_production_limits(&record.map_name, &record.advantage_production_limits)?,
+                parse_rom_production_limits(&record.map_name, &record.draw_production_limits)?,
+            ],
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MapCell {
     pub player_id: u32,
@@ -171,6 +283,7 @@ pub struct MasterDataRegistry {
     pub loads: HashMap<String, Vec<LoadRecord>>,
     pub categories: HashMap<String, Vec<crate::resources::UnitType>>,
     pub maps: HashMap<String, MapData>,
+    pub rom_scenarios: HashMap<String, RomScenarioRecord>,
 }
 
 impl MasterDataRegistry {
@@ -314,7 +427,31 @@ impl MasterDataRegistry {
             registry.maps.insert(name.to_string(), map);
         }
 
-        // 8. 整合性バリデーション
+        // 8. ROM由来AIシナリオデータ読み込み
+        // マップ名、戦略目標、生産上限などをAI実装から分離して登録します。
+        let rom_scenario_csv = include_str!("master_data/rom_scenario.csv");
+        let mut rdr = csv::Reader::from_reader(rom_scenario_csv.as_bytes());
+        for result in rdr.deserialize::<RomScenarioCsvRecord>() {
+            let record = RomScenarioRecord::try_from(result?)?;
+            let map_name = record.map_name.0.clone();
+            if !registry.maps.contains_key(&map_name) {
+                return Err(MasterDataError::InvalidRomScenarioData(format!(
+                    "{}: corresponding map CSV is missing",
+                    map_name
+                )));
+            }
+            if registry
+                .rom_scenarios
+                .insert(map_name.clone(), record)
+                .is_some()
+            {
+                return Err(MasterDataError::InvalidRomScenarioData(format!(
+                    "duplicate map_name: {map_name}"
+                )));
+            }
+        }
+
+        // 9. 整合性バリデーション
         // 地形(Landscape)の補給タイプ(supply_type)が、存在するカテゴリまたはユニット種別であるか検証します。
         for landscape in registry.landscapes.values() {
             if let Some(supply_type) = &landscape.supply_type
@@ -389,6 +526,18 @@ impl MasterDataRegistry {
 
     pub fn get_map(&self, map_name: &str) -> Option<&MapData> {
         self.maps.get(map_name)
+    }
+
+    /// 組み込み済みマップ名を数値順で返す。CLI・MCPの選択肢で共通利用する。
+    pub fn map_names(&self) -> Vec<String> {
+        let mut names = self.maps.keys().cloned().collect::<Vec<_>>();
+        names.sort_by(|left, right| map_name_sort_key(left).cmp(&map_name_sort_key(right)));
+        names
+    }
+
+    /// ROM互換AIが利用するマップ固有のシナリオ入力を返す。
+    pub fn get_rom_scenario(&self, map_name: &str) -> Option<&RomScenarioRecord> {
+        self.rom_scenarios.get(map_name)
     }
 
     /// 地形名からターンごとの収入を返す（マスターデータのincomeフィールドを参照）
@@ -535,6 +684,15 @@ impl MasterDataRegistry {
     }
 }
 
+/// `map_10` を `map_2` より後に並べるための自然順キー。
+fn map_name_sort_key(map_name: &str) -> (u32, &str) {
+    let number = map_name
+        .strip_prefix("map_")
+        .and_then(|suffix| suffix.parse::<u32>().ok())
+        .unwrap_or(u32::MAX);
+    (number, map_name)
+}
+
 fn parse_map(csv_data: &str) -> Result<MapData, MasterDataError> {
     let mut cells = Vec::new();
     let mut rdr = csv::ReaderBuilder::new()
@@ -564,6 +722,27 @@ fn parse_map(csv_data: &str) -> Result<MapData, MasterDataError> {
         width,
         height: cells.len(),
         cells,
+    })
+}
+
+/// セミコロン区切りのROM兵種24枠を、ROM上の順序を保ってパースする。
+fn parse_rom_production_limits(map_name: &str, values: &str) -> Result<[u8; 24], MasterDataError> {
+    let parsed = values
+        .split(';')
+        .map(str::trim)
+        .map(|value| {
+            value.parse::<u8>().map_err(|error| {
+                MasterDataError::InvalidRomScenarioData(format!(
+                    "{map_name}: invalid production limit '{value}': {error}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    parsed.try_into().map_err(|values: Vec<u8>| {
+        MasterDataError::InvalidRomScenarioData(format!(
+            "{map_name}: production limit requires 24 values, got {}",
+            values.len()
+        ))
     })
 }
 
@@ -789,6 +968,40 @@ mod tests {
         let cell_capital = map1.get_cell(3, 11).unwrap();
         assert_eq!(cell_capital.player_id, 2);
         assert_eq!(cell_capital.terrain_id, LandscapeId(1));
+    }
+
+    #[test]
+    fn test_load_rom_scenarios_from_csv_with_map_keys() {
+        let registry = MasterDataRegistry::load().unwrap();
+
+        // マップ名はAIコードではなくrom_scenario.csvのmap_name列で対応付ける。
+        assert_eq!(registry.rom_scenarios.len(), 53);
+        let map_names = registry.map_names();
+        assert_eq!(map_names.len(), 53);
+        assert_eq!(map_names.first().map(String::as_str), Some("map_1"));
+        assert_eq!(map_names.last().map(String::as_str), Some("map_53"));
+        for map_number in 1..=53 {
+            let map_name = format!("map_{map_number}");
+            let scenario = registry
+                .get_rom_scenario(&map_name)
+                .unwrap_or_else(|| panic!("ROM scenario for {map_name} is missing"));
+            assert_eq!(scenario.map_name.as_str(), map_name);
+            assert!(registry.get_map(&map_name).is_some());
+            if matches!(map_number, 9 | 10) {
+                assert_eq!(scenario.source.as_str(), "generated:model");
+            } else {
+                assert_eq!(scenario.source.as_str(), "rom");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_production_limit_identifies_its_map_and_value() {
+        let error = parse_rom_production_limits("map_test", "1;not-a-number").unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("map_test"));
+        assert!(message.contains("not-a-number"));
     }
 
     #[test]
