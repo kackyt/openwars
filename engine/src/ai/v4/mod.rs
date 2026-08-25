@@ -50,6 +50,7 @@ use crate::components::{
 use crate::events::ProduceUnitCommand;
 use crate::resources::master_data::MasterDataRegistry;
 use crate::resources::{DamageChart, Map, MovementType, Players, Terrain, UnitRegistry, UnitType};
+use crate::systems::movement::get_valid_movement_cost;
 use crate::systems::transport::can_unload_from_terrain;
 use bevy_ecs::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -778,6 +779,394 @@ struct CampaignPlanningObjective {
     execution_authorized: bool,
 }
 
+/// 同一陸塊の首都攻略本隊を解放できるだけ、勝利ルート上の前線が進んだかを判定する。
+/// 後方・側方の補助目標の所有数は、首都へ向かう主線のGo条件には含めない。
+fn same_land_capital_front_reached(route_distance: u32, forward_distance: u32) -> bool {
+    forward_distance.saturating_mul(2) <= route_distance.max(1)
+}
+
+/// 指定した通行可能マスを連結成分へ分け、座標から成分IDを引けるようにする。
+fn terrain_component_membership(
+    map: &Map,
+    cells: &HashSet<GridPosition>,
+) -> HashMap<GridPosition, usize> {
+    let mut unseen = cells.clone();
+    let mut membership = HashMap::new();
+    let mut component_id = 0;
+    while let Some(start) = unseen
+        .iter()
+        .min_by_key(|position| (position.y, position.x))
+        .copied()
+    {
+        unseen.remove(&start);
+        let mut queue = VecDeque::from([start]);
+        while let Some(position) = queue.pop_front() {
+            membership.insert(position, component_id);
+            for (x, y) in map.get_adjacent(position.x, position.y) {
+                let adjacent = GridPosition { x, y };
+                if unseen.remove(&adjacent) {
+                    queue.push_back(adjacent);
+                }
+            }
+        }
+        component_id += 1;
+    }
+    membership
+}
+
+/// 装甲部隊が首都側の地域から最初に通る橋Gateを抽出する。
+/// 同じ川に橋が3本以上あっても、最も離れた2本を独立した作戦軸として採用する。
+fn armored_entry_bridge_gates(
+    map: &Map,
+    master_data: &MasterDataRegistry,
+    home: GridPosition,
+    enemy_capital: GridPosition,
+) -> Vec<GridPosition> {
+    let armored_cells = (0..map.height)
+        .flat_map(|y| (0..map.width).map(move |x| GridPosition { x, y }))
+        .filter(|position| {
+            map.get_terrain(position.x, position.y)
+                .is_some_and(|terrain| {
+                    get_valid_movement_cost(master_data, MovementType::Tank, terrain).is_some()
+                })
+        })
+        .collect::<HashSet<_>>();
+    if !armored_cells.contains(&home) || !armored_cells.contains(&enemy_capital) {
+        return Vec::new();
+    }
+    let maneuver_cells = armored_cells
+        .iter()
+        .filter(|position| map.get_terrain(position.x, position.y) != Some(Terrain::Bridge))
+        .copied()
+        .collect::<HashSet<_>>();
+    let maneuver_membership = terrain_component_membership(map, &maneuver_cells);
+    let Some(source_component) = maneuver_membership.get(&home).copied() else {
+        return Vec::new();
+    };
+    let bridge_cells = armored_cells
+        .iter()
+        .filter(|position| map.get_terrain(position.x, position.y) == Some(Terrain::Bridge))
+        .copied()
+        .collect::<HashSet<_>>();
+    let bridge_membership = terrain_component_membership(map, &bridge_cells);
+    let mut bridge_groups: HashMap<usize, Vec<GridPosition>> = HashMap::new();
+    for (position, component) in bridge_membership {
+        bridge_groups.entry(component).or_default().push(position);
+    }
+    let mut gates = bridge_groups
+        .into_values()
+        .filter_map(|group| {
+            let adjacent_components = group
+                .iter()
+                .flat_map(|position| map.get_adjacent(position.x, position.y))
+                .filter_map(|(x, y)| maneuver_membership.get(&GridPosition { x, y }).copied())
+                .collect::<HashSet<_>>();
+            (adjacent_components.contains(&source_component) && adjacent_components.len() >= 2)
+                .then(|| {
+                    group
+                        .into_iter()
+                        .min_by_key(|position| (position.y, position.x))
+                        .expect("空でない橋連結成分")
+                })
+        })
+        .collect::<Vec<_>>();
+    gates.sort_unstable_by_key(|position| (position.y, position.x));
+    if gates.len() <= 2 {
+        return gates;
+    }
+    let mut best_pair = (gates[0], gates[1]);
+    let mut best_distance =
+        map.distance(best_pair.0.x, best_pair.0.y, best_pair.1.x, best_pair.1.y);
+    for (index, first) in gates.iter().enumerate() {
+        for second in gates.iter().skip(index + 1) {
+            let distance = map.distance(first.x, first.y, second.x, second.y);
+            if distance > best_distance {
+                best_distance = distance;
+                best_pair = (*first, *second);
+            }
+        }
+    }
+    let mut selected = vec![best_pair.0, best_pair.1];
+    selected.sort_unstable_by_key(|position| (position.y, position.x));
+    selected
+}
+
+/// 指定島が自首都と敵首都をともに含む、陸路主体の首都戦役かを返す。
+/// 海洋作戦では上陸隊を一点へ集める価値があるため、陸上の分散規則を混ぜない。
+pub(crate) fn is_same_land_capital_island(
+    world: &World,
+    player_id: PlayerId,
+    island_id: crate::ai::islands::IslandId,
+) -> bool {
+    let Some(map) = world.get_resource::<Map>() else {
+        return false;
+    };
+    let island_map = world
+        .get_resource::<crate::ai::islands::IslandMap>()
+        .cloned()
+        .unwrap_or_else(|| crate::ai::islands::IslandMap::analyze(map));
+    let mut has_own_capital = false;
+    let mut has_enemy_capital = false;
+    for entity in world.iter_entities() {
+        let (Some(position), Some(property)) =
+            (entity.get::<GridPosition>(), entity.get::<Property>())
+        else {
+            continue;
+        };
+        if property.terrain != Terrain::Capital
+            || island_map
+                .get_island_at(position)
+                .is_none_or(|island| island.id != island_id)
+        {
+            continue;
+        }
+        has_own_capital |= property.owner_id == Some(player_id);
+        has_enemy_capital |= property
+            .owner_id
+            .is_some_and(|owner_id| owner_id != player_id);
+    }
+    has_own_capital && has_enemy_capital
+}
+
+/// 同一陸塊の首都間にある、現在プレイヤー側から見た装甲進出Gateを返す。
+/// 島IDだけでは川・山で分かれた実際の進軍軸を区別できないため、Squad計画とも共有する。
+pub(crate) fn same_land_armored_route_gates(
+    world: &World,
+    player_id: PlayerId,
+    island_id: crate::ai::islands::IslandId,
+) -> Vec<GridPosition> {
+    let Some(map) = world.get_resource::<Map>() else {
+        return Vec::new();
+    };
+    let Some(master_data) = world.get_resource::<MasterDataRegistry>() else {
+        return Vec::new();
+    };
+    let island_map = world
+        .get_resource::<crate::ai::islands::IslandMap>()
+        .cloned()
+        .unwrap_or_else(|| crate::ai::islands::IslandMap::analyze(map));
+    let mut own_capitals = Vec::new();
+    let mut enemy_capitals = Vec::new();
+    for entity in world.iter_entities() {
+        let (Some(position), Some(property)) =
+            (entity.get::<GridPosition>(), entity.get::<Property>())
+        else {
+            continue;
+        };
+        if property.terrain != Terrain::Capital
+            || island_map
+                .get_island_at(position)
+                .is_none_or(|island| island.id != island_id)
+        {
+            continue;
+        }
+        if property.owner_id == Some(player_id) {
+            own_capitals.push(*position);
+        } else if property.owner_id.is_some() {
+            enemy_capitals.push(*position);
+        }
+    }
+    own_capitals.sort_unstable_by_key(|position| (position.y, position.x));
+    enemy_capitals.sort_unstable_by_key(|position| (position.y, position.x));
+    let (Some(home), Some(enemy_capital)) = (own_capitals.first(), enemy_capitals.first()) else {
+        return Vec::new();
+    };
+    armored_entry_bridge_gates(map, master_data, *home, *enemy_capital)
+}
+
+/// 橋で分かれた各進軍軸について、現在位置から次に占領すべき施設を1つずつ選ぶ。
+/// 施設を得た次の手番には次の施設へ進むため、局地目標は成功時に自然消滅して更新される。
+pub(crate) fn refine_same_land_route_milestones(
+    world: &World,
+    player_id: PlayerId,
+    portfolio: &mut crate::ai::island_campaign::IslandCampaignPortfolio,
+) {
+    let Some(map) = world.get_resource::<Map>() else {
+        return;
+    };
+    let island_map = world
+        .get_resource::<crate::ai::islands::IslandMap>()
+        .cloned()
+        .unwrap_or_else(|| crate::ai::islands::IslandMap::analyze(map));
+    let own_capital = world.iter_entities().find_map(|entity| {
+        let position = entity.get::<GridPosition>()?;
+        let property = entity.get::<Property>()?;
+        (property.terrain == Terrain::Capital && property.owner_id == Some(player_id))
+            .then_some(*position)
+    });
+    let Some(own_capital) = own_capital else {
+        return;
+    };
+
+    for assignment in portfolio.active_offensives.iter_mut().filter(|assignment| {
+        assignment.decision != crate::ai::island_campaign::IslandCampaignDecision::Defend
+    }) {
+        let gates = same_land_armored_route_gates(world, player_id, assignment.island_id);
+        if gates.len() < 2 {
+            continue;
+        }
+        let nearest_gate = |position: GridPosition| {
+            gates
+                .iter()
+                .enumerate()
+                .min_by_key(|(index, gate)| {
+                    (map.distance(position.x, position.y, gate.x, gate.y), *index)
+                })
+                .map_or(0, |(index, _)| index)
+        };
+        let mut route_properties = vec![Vec::new(); gates.len()];
+        for entity in world.iter_entities() {
+            let (Some(position), Some(property)) =
+                (entity.get::<GridPosition>(), entity.get::<Property>())
+            else {
+                continue;
+            };
+            if property.owner_id == Some(player_id)
+                || island_map
+                    .get_island_at(position)
+                    .is_none_or(|island| island.id != assignment.island_id)
+            {
+                continue;
+            }
+            route_properties[nearest_gate(*position)].push(*position);
+        }
+        let active_route_count = route_properties
+            .iter()
+            .filter(|properties| !properties.is_empty())
+            .count();
+        let mut remaining_slots = usize::try_from(assignment.requirement.capture_units)
+            .unwrap_or(usize::MAX)
+            .max(active_route_count);
+        let mut remaining_routes = active_route_count;
+        let mut milestones = Vec::new();
+        for mut properties in route_properties {
+            if properties.is_empty() {
+                continue;
+            }
+            // 1施設だけに絞ると残りの占領要員を生産しなくなる。必要数を各ルートへ
+            // 均等配分し、各軸の「現在の波」をMilestoneとしてまとめて進める。
+            let route_slots = remaining_slots.div_ceil(remaining_routes.max(1));
+            properties.sort_unstable_by_key(|position| {
+                (
+                    map.distance(own_capital.x, own_capital.y, position.x, position.y),
+                    position.y,
+                    position.x,
+                )
+            });
+            milestones.extend(properties.into_iter().take(route_slots));
+            remaining_slots = remaining_slots.saturating_sub(route_slots);
+            remaining_routes = remaining_routes.saturating_sub(1);
+        }
+        milestones.sort_unstable_by_key(|position| (position.y, position.x));
+        if milestones.len() >= 2 {
+            assignment.target_position = milestones[0];
+            assignment.capture_target_positions = milestones;
+        }
+    }
+}
+
+/// 橋で分岐する同一陸塊の局地前線を、Gateごとの独立Operationへ分ける。
+/// 必要占領兵と既存所属は一意に配分し、同じEntityを複数ルートへ二重計上しない。
+fn split_bridge_route_objectives(
+    map: &Map,
+    objectives: Vec<CampaignPlanningObjective>,
+    gates: &[GridPosition],
+    my_units: &[UnitSnapshot],
+) -> Vec<CampaignPlanningObjective> {
+    if gates.len() < 2 {
+        return objectives;
+    }
+    let unit_positions = my_units
+        .iter()
+        .filter_map(|unit| unit.entity.map(|entity| (entity, unit.pos)))
+        .collect::<HashMap<_, _>>();
+    let nearest_gate = |position: GridPosition| {
+        gates
+            .iter()
+            .enumerate()
+            .min_by_key(|(index, gate)| {
+                (map.distance(position.x, position.y, gate.x, gate.y), *index)
+            })
+            .map_or(0, |(index, _)| index)
+    };
+    let mut split = Vec::new();
+    for objective in objectives {
+        if objective.kind != OperationKind::Capture || objective.objective_properties.len() < 2 {
+            split.push(objective);
+            continue;
+        }
+        let mut property_groups = vec![Vec::new(); gates.len()];
+        for property in &objective.objective_properties {
+            property_groups[nearest_gate(*property)].push(*property);
+        }
+        let active_groups = property_groups
+            .iter()
+            .enumerate()
+            .filter_map(|(index, properties)| (!properties.is_empty()).then_some(index))
+            .collect::<Vec<_>>();
+        if active_groups.len() < 2 {
+            split.push(objective);
+            continue;
+        }
+        let total_properties = objective.objective_properties.len();
+        let mut allocated_required = 0;
+        for (active_order, group_index) in active_groups.iter().copied().enumerate() {
+            let properties = &property_groups[group_index];
+            let required_capture_survivors = if active_order + 1 == active_groups.len() {
+                objective
+                    .required_capture_survivors
+                    .saturating_sub(allocated_required)
+            } else {
+                objective
+                    .required_capture_survivors
+                    .saturating_mul(properties.len())
+                    / total_properties.max(1)
+            };
+            allocated_required = allocated_required.saturating_add(required_capture_survivors);
+            let anchor = properties
+                .iter()
+                .min_by_key(|position| {
+                    (
+                        map.distance(
+                            position.x,
+                            position.y,
+                            gates[group_index].x,
+                            gates[group_index].y,
+                        ),
+                        position.y,
+                        position.x,
+                    )
+                })
+                .copied()
+                .expect("空でないルート目標群");
+            let protected_capture_entities = objective
+                .protected_capture_entities
+                .iter()
+                .filter(|entity| {
+                    unit_positions
+                        .get(entity)
+                        .is_some_and(|position| nearest_gate(*position) == group_index)
+                })
+                .copied()
+                .collect();
+            split.push(CampaignPlanningObjective {
+                island_id: objective.island_id,
+                kind: objective.kind,
+                anchor,
+                objective_properties: properties.clone(),
+                capture_eta: objective.capture_eta,
+                required_capture_survivors,
+                logistics_rank: objective.logistics_rank,
+                forced_target_enemies: HashSet::new(),
+                protected_capture_entities,
+                staging_anchor: anchor,
+                execution_authorized: objective.execution_authorized,
+            });
+        }
+    }
+    split
+}
+
 impl BoardScan {
     fn collect(world: &mut World, player_id: PlayerId) -> Option<Self> {
         let map = Arc::new(world.get_resource::<Map>()?.clone());
@@ -997,6 +1386,14 @@ impl BoardScan {
         let home_island = capital_pos
             .and_then(|position| island_map.get_island_at(&position))
             .map(|island| island.id);
+        if home_island.is_some()
+            && home_island == enemy_capital_island
+            && let (Some(home), Some(capital)) = (capital_pos, enemy_capital)
+        {
+            let gates = armored_entry_bridge_gates(&map, &master_data, home, capital);
+            campaign_objectives =
+                split_bridge_route_objectives(&map, campaign_objectives, &gates, &my_units);
+        }
         let completed_route_island = logistics_plan.as_ref().and_then(|plan| {
             plan.route_islands
                 .iter()
@@ -1067,22 +1464,6 @@ impl BoardScan {
             let Some(capital) = enemy_capital else {
                 return false;
             };
-            let owned_count = owned_properties
-                .iter()
-                .filter(|(position, _)| {
-                    island_map
-                        .get_island_at(position)
-                        .is_some_and(|island| island.id == capital_island)
-                })
-                .count();
-            let enemy_count = open_properties
-                .iter()
-                .filter(|position| {
-                    island_map
-                        .get_island_at(position)
-                        .is_some_and(|island| island.id == capital_island)
-                })
-                .count();
             let route_distance = map.distance(home.x, home.y, capital.x, capital.y).max(1);
             let forward_distance = owned_properties
                 .iter()
@@ -1094,9 +1475,9 @@ impl BoardScan {
                 .map(|(position, _)| map.distance(position.x, position.y, capital.x, capital.y))
                 .min()
                 .unwrap_or(u32::MAX);
-            // 同一大陸であること自体はGo条件にしない。局地拠点を奪って所有数で
-            // 優位を作り、少なくとも戦線が両首都の中間まで進んだときだけ本隊を解放する。
-            owned_count > enemy_count && forward_distance.saturating_mul(2) <= route_distance
+            // 局地作戦は首都攻略の補助枝であり、逆方向や側方の施設数で主線を止めない。
+            // 無謀な切替は避け、実際の前線が両首都の中間へ届いたことだけは要求する。
+            same_land_capital_front_reached(route_distance, forward_distance)
         });
         if let (Some(capital), Some(capital_island), Some(staging_anchor)) =
             (enemy_capital, enemy_capital_island, staging_anchor)
@@ -3556,6 +3937,140 @@ fn should_defer_purchase(
 mod tests {
     use super::*;
     use crate::resources::GridTopology;
+
+    #[test]
+    fn capital_mainline_depends_on_forward_progress_not_auxiliary_property_count() {
+        assert!(same_land_capital_front_reached(16, 6));
+        assert!(same_land_capital_front_reached(32, 16));
+        assert!(!same_land_capital_front_reached(32, 17));
+    }
+
+    #[test]
+    fn bridge_gates_split_one_island_into_two_active_route_fronts() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let mut map = flat_map(7, 7);
+        for y in 0..map.height {
+            map.set_terrain(3, y, Terrain::River).unwrap();
+        }
+        map.set_terrain(3, 1, Terrain::Bridge).unwrap();
+        map.set_terrain(3, 5, Terrain::Bridge).unwrap();
+        let gates = armored_entry_bridge_gates(&map, &master_data, pos(0, 3), pos(6, 3));
+        assert_eq!(gates, vec![pos(3, 1), pos(3, 5)]);
+
+        let objective = CampaignPlanningObjective {
+            island_id: crate::ai::islands::IslandId(0),
+            kind: OperationKind::Capture,
+            anchor: pos(2, 1),
+            objective_properties: vec![pos(2, 1), pos(4, 1), pos(2, 5), pos(4, 5)],
+            capture_eta: Some(4),
+            required_capture_survivors: 5,
+            logistics_rank: None,
+            forced_target_enemies: HashSet::new(),
+            protected_capture_entities: HashSet::new(),
+            staging_anchor: pos(2, 1),
+            execution_authorized: true,
+        };
+        let routes = split_bridge_route_objectives(&map, vec![objective], &gates, &[]);
+
+        assert_eq!(routes.len(), 2);
+        assert_eq!(
+            routes
+                .iter()
+                .map(|route| route.required_capture_survivors)
+                .sum::<usize>(),
+            5
+        );
+        assert_eq!(routes[0].anchor.y, 1);
+        assert_eq!(routes[1].anchor.y, 5);
+        assert!(
+            routes
+                .iter()
+                .all(|route| route.objective_properties.len() == 2)
+        );
+    }
+
+    #[test]
+    fn route_milestone_closes_after_capture_and_advances_on_each_axis() {
+        use crate::ai::island_campaign::{
+            IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignPortfolio,
+            IslandCampaignRequirement,
+        };
+
+        let master_data = MasterDataRegistry::load().unwrap();
+        let mut map = flat_map(7, 7);
+        for y in 0..map.height {
+            map.set_terrain(3, y, Terrain::River).unwrap();
+        }
+        map.set_terrain(3, 1, Terrain::Bridge).unwrap();
+        map.set_terrain(3, 5, Terrain::Bridge).unwrap();
+        map.set_terrain(0, 3, Terrain::Capital).unwrap();
+        map.set_terrain(6, 3, Terrain::Capital).unwrap();
+        for target in [pos(2, 1), pos(4, 1), pos(2, 5), pos(4, 5)] {
+            map.set_terrain(target.x, target.y, Terrain::City).unwrap();
+        }
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_id = island_map.get_island_at(&pos(0, 3)).unwrap().id;
+        let player = PlayerId(1);
+        let enemy = PlayerId(2);
+        let mut world = World::new();
+        world.insert_resource(map);
+        world.insert_resource(master_data);
+        world.insert_resource(island_map);
+        world.spawn((
+            pos(0, 3),
+            Property::new(Terrain::Capital, Some(player), 100),
+        ));
+        world.spawn((pos(6, 3), Property::new(Terrain::Capital, Some(enemy), 100)));
+        let first_north = world
+            .spawn((pos(2, 1), Property::new(Terrain::City, None, 100)))
+            .id();
+        world.spawn((pos(4, 1), Property::new(Terrain::City, None, 100)));
+        let first_south = world
+            .spawn((pos(2, 5), Property::new(Terrain::City, None, 100)))
+            .id();
+        world.spawn((pos(4, 5), Property::new(Terrain::City, None, 100)));
+        let requirement = IslandCampaignRequirement {
+            preferred_transport: None,
+            transport_slots: 0,
+            capture_units: 2,
+            ground_combat_units: 0,
+            combat_units: 0,
+            total_budget: 2_000,
+        };
+        let mut portfolio = IslandCampaignPortfolio {
+            active_offensives: vec![IslandCampaignAssignment {
+                island_id,
+                decision: IslandCampaignDecision::Contest,
+                target_position: pos(3, 3),
+                capture_target_positions: vec![pos(3, 3)],
+                priority_enemy_types: Vec::new(),
+                requirement: requirement.clone(),
+                purchase_shortfall: requirement,
+                allocated_budget: 0,
+                transport_entities: Vec::new(),
+                capture_entities: Vec::new(),
+                combat_entities: Vec::new(),
+                operation_ready: true,
+                continued_from_existing_squad: false,
+            }],
+            ..IslandCampaignPortfolio::default()
+        };
+
+        refine_same_land_route_milestones(&world, player, &mut portfolio);
+        assert_eq!(
+            portfolio.active_offensives[0].capture_target_positions,
+            vec![pos(2, 1), pos(2, 5)]
+        );
+
+        world.get_mut::<Property>(first_north).unwrap().owner_id = Some(player);
+        world.get_mut::<Property>(first_south).unwrap().owner_id = Some(player);
+        refine_same_land_route_milestones(&world, player, &mut portfolio);
+        assert_eq!(
+            portfolio.active_offensives[0].capture_target_positions,
+            vec![pos(4, 1), pos(4, 5)],
+            "成功済みMilestoneを残さず、両ルートの次段へ進む"
+        );
+    }
 
     fn flat_map(width: usize, height: usize) -> Map {
         Map {

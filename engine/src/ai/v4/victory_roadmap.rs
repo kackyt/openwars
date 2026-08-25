@@ -40,6 +40,23 @@ pub enum StrategicPurpose {
     AssaultCapital,
 }
 
+/// 同じ陸塊でも、局地作戦と勝利条件の首都作戦は別のライフサイクルを持つ。
+/// Capture/Defense間の変更は同じ局地作戦のrevisionとして履歴を引き継ぐ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum StrategicOperationScope {
+    Regional,
+    Capital,
+}
+
+fn operation_scope(purpose: StrategicPurpose) -> StrategicOperationScope {
+    match purpose {
+        StrategicPurpose::CaptureIsland | StrategicPurpose::DefendIsland => {
+            StrategicOperationScope::Regional
+        }
+        StrategicPurpose::AssaultCapital => StrategicOperationScope::Capital,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CampaignStepKind {
     Produce,
@@ -172,7 +189,7 @@ pub struct StrategicOperation {
     pub created_turn: u32,
     pub last_observed_turn: u32,
     pub tactical_anchor: GridPosition,
-    /// 作戦開始時に固定した全目的拠点。revisionで別島の集合へ差し替えない。
+    /// 現在の局地Milestoneが担当する目的拠点。完了済みの旧目標は残さない。
     pub objective_properties: Vec<GridPosition>,
     pub owned_objective_count: usize,
     pub phase: OperationPhase,
@@ -224,9 +241,9 @@ pub struct VictoryRoadmapRegistry {
     next_operation_id: u64,
     roadmaps: HashMap<PlayerId, VictoryRoadmap>,
     operations: HashMap<StrategicOperationId, StrategicOperation>,
-    // 作戦のidentityは「誰が、どの島を攻略するか」で固定する。
-    // 攻勢・防衛は戦況で変わる状態であり、keyへ含めると予実履歴が分断される。
-    operation_keys: HashMap<(PlayerId, IslandId), StrategicOperationId>,
+    // 同一島のCapture/Defenseは局地作戦として連続させる一方、首都作戦は別identityにする。
+    // これにより局地目標のanchor更新が勝利条件の終端目標を上書きしない。
+    operation_keys: HashMap<(PlayerId, IslandId, StrategicOperationScope), StrategicOperationId>,
     entity_bindings: HashMap<Entity, EntityOperationBinding>,
     transport_manifests: HashMap<Entity, HashSet<Entity>>,
     pending_steps: HashMap<Entity, PendingOperationStep>,
@@ -552,7 +569,7 @@ impl VictoryRoadmapRegistry {
         capital: GridPosition,
         owned: bool,
     ) -> StrategicOperationId {
-        let key = (player_id, island_id);
+        let key = (player_id, island_id, StrategicOperationScope::Capital);
         let operation_id = if let Some(id) = self.operation_keys.get(&key).copied() {
             id
         } else {
@@ -638,7 +655,7 @@ impl VictoryRoadmapRegistry {
         owned_properties: &HashSet<GridPosition>,
         phase: OperationPhase,
     ) -> StrategicOperationId {
-        let key = (player_id, assignment.island_id);
+        let key = (player_id, assignment.island_id, operation_scope(purpose));
         let operation_id = if let Some(id) = self.operation_keys.get(&key).copied() {
             id
         } else {
@@ -698,13 +715,9 @@ impl VictoryRoadmapRegistry {
             operation.last_replan_turn = Some(turn);
         }
         operation.tactical_anchor = assignment.target_position;
-        // 毎ターン見つかった前線目標を同じ作戦へ追加する。anchorや局地状態の変化で
-        // 既存目標を捨てず、複数の中立・敵施設を並行して前進させる。
-        for objective in objectives {
-            if !operation.objective_properties.contains(&objective) {
-                operation.objective_properties.push(objective);
-            }
-        }
+        // 作戦identityと実績は維持するが、Milestoneの目標集合は現在の波へ差し替える。
+        // 成功済み施設を永続追加すると局地戦が全島制圧まで閉じないゾンビ作戦になる。
+        operation.objective_properties = objectives;
         operation.owned_objective_count = operation
             .objective_properties
             .iter()
@@ -721,6 +734,7 @@ impl VictoryRoadmapRegistry {
             operation.actual_completion_turn.get_or_insert(turn);
             OperationPhase::Completed
         } else {
+            operation.actual_completion_turn = None;
             phase
         };
         operation_id
@@ -1018,12 +1032,15 @@ pub(crate) fn record_operation_command(world: &mut World, entity: Entity, comman
 
 fn purpose_for(
     assignment: &IslandCampaignAssignment,
-    enemy_capital_island: Option<IslandId>,
+    enemy_capital: Option<GridPosition>,
 ) -> StrategicPurpose {
-    if enemy_capital_island == Some(assignment.island_id) {
-        StrategicPurpose::AssaultCapital
-    } else if assignment.decision == IslandCampaignDecision::Defend {
+    if assignment.decision == IslandCampaignDecision::Defend {
         StrategicPurpose::DefendIsland
+    } else if enemy_capital.is_some_and(|capital| {
+        assignment.target_position == capital
+            || assignment.capture_target_positions.contains(&capital)
+    }) {
+        StrategicPurpose::AssaultCapital
     } else {
         StrategicPurpose::CaptureIsland
     }
@@ -1757,10 +1774,11 @@ pub(crate) fn reconcile_campaign_roadmap(
         .iter()
         .chain(portfolio.active_offensives.iter())
     {
-        let purpose = purpose_for(assignment, enemy_capital_island);
+        let purpose = purpose_for(assignment, enemy_capital);
+        let operation_key = (player_id, assignment.island_id, operation_scope(purpose));
         let previous_entities = registry
             .operation_keys
-            .get(&(player_id, assignment.island_id))
+            .get(&operation_key)
             .and_then(|operation_id| registry.operations.get(operation_id))
             .map(|operation| {
                 operation
@@ -1784,7 +1802,7 @@ pub(crate) fn reconcile_campaign_roadmap(
             .unwrap_or_default();
         let previous_issues = registry
             .operation_keys
-            .get(&(player_id, assignment.island_id))
+            .get(&operation_key)
             .and_then(|operation_id| registry.operations.get(operation_id))
             .map(|operation| operation.current_issues.clone())
             .unwrap_or_default();
@@ -1809,16 +1827,12 @@ pub(crate) fn reconcile_campaign_roadmap(
             }
             positions
         } else {
-            let mut positions = property_snapshots
-                .iter()
-                .filter_map(|(position, _)| {
-                    island_map
-                        .get_island_at(position)
-                        .is_some_and(|island| island.id == assignment.island_id)
-                        .then_some(*position)
-                })
-                .collect::<Vec<_>>();
-            positions.sort_unstable_by_key(|position| (position.y, position.x));
+            // 局地作戦は全島の施設一覧ではなく、portfolioが今選んだMilestoneだけを持つ。
+            // 空集合でも防衛・集結地点を明示し、作戦所属Entityの行き先を失わせない。
+            let mut positions = assignment.capture_target_positions.clone();
+            if positions.is_empty() {
+                positions.push(assignment.target_position);
+            }
             positions
         };
         let phase = operation_phase(world, &island_map, assignment, manager, player_id);
@@ -1972,7 +1986,7 @@ pub(crate) fn reconcile_campaign_roadmap(
     if let Some(capital_island) = enemy_capital_island
         && let Some(operation_id) = registry
             .operation_keys
-            .get(&(player_id, capital_island))
+            .get(&(player_id, capital_island, StrategicOperationScope::Capital))
             .copied()
     {
         let capital_plans = combat_plan_summaries
@@ -2442,8 +2456,8 @@ mod tests {
         let operation = registry.operations.get(&first).expect("作戦");
         assert_eq!(
             operation.objective_properties,
-            vec![GridPosition { x: 10, y: 10 }, GridPosition { x: 12, y: 11 }],
-            "anchor変化で既存目標を捨てず、新しい前線目標を同じ作戦へ追加する"
+            vec![GridPosition { x: 12, y: 11 }],
+            "作戦実績は維持しつつ、成功済みMilestoneを現在目標から除く"
         );
         assert_eq!(operation.tactical_anchor, GridPosition { x: 12, y: 11 });
     }
@@ -2929,6 +2943,73 @@ mod tests {
         assert_eq!(operation.objective_properties, vec![capital]);
         assert_eq!(operation.planned_completion_turn, None);
         assert!(operation.blocked_reason.is_some());
+    }
+
+    #[test]
+    fn regional_milestone_does_not_overwrite_capital_operation_on_the_same_island() {
+        let player = PlayerId(1);
+        let island = IslandId(7);
+        let capital = GridPosition { x: 20, y: 4 };
+        let local_target = GridPosition { x: 10, y: 4 };
+        let assignment = IslandCampaignAssignment {
+            island_id: island,
+            decision: IslandCampaignDecision::Contest,
+            target_position: local_target,
+            capture_target_positions: vec![local_target],
+            priority_enemy_types: Vec::new(),
+            requirement: crate::ai::island_campaign::IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 0,
+                ground_combat_units: 0,
+                combat_units: 0,
+                total_budget: 0,
+            },
+            purchase_shortfall: crate::ai::island_campaign::IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 0,
+                ground_combat_units: 0,
+                combat_units: 0,
+                total_budget: 0,
+            },
+            allocated_budget: 0,
+            transport_entities: Vec::new(),
+            capture_entities: Vec::new(),
+            combat_entities: Vec::new(),
+            operation_ready: false,
+            continued_from_existing_squad: false,
+        };
+        let mut registry = VictoryRoadmapRegistry::default();
+        let roadmap = registry.ensure_roadmap(player, 1, Some(capital), Some(island), 1);
+        let capital_operation =
+            registry.ensure_capital_objective(roadmap, player, 1, island, capital, false);
+
+        assert_eq!(
+            purpose_for(&assignment, Some(capital)),
+            StrategicPurpose::CaptureIsland
+        );
+        let regional_operation = registry.reconcile_assignment(
+            roadmap,
+            player,
+            1,
+            &assignment,
+            purpose_for(&assignment, Some(capital)),
+            assignment.capture_target_positions.clone(),
+            &HashSet::new(),
+            OperationPhase::Forming,
+        );
+
+        assert_ne!(capital_operation, regional_operation);
+        assert_eq!(registry.operations.len(), 2);
+        assert_eq!(
+            registry.operations[&capital_operation].tactical_anchor,
+            capital
+        );
+        assert_eq!(
+            registry.operations[&regional_operation].tactical_anchor,
+            local_target
+        );
     }
 
     #[test]

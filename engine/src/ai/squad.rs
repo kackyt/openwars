@@ -2315,6 +2315,7 @@ fn nearest_campaign_property_target(
         player_id,
         island_id,
         members,
+        &HashSet::new(),
         &mut TerrainConnectivity::default(),
     )
 }
@@ -2324,6 +2325,7 @@ fn nearest_campaign_property_target_with_connectivity(
     player_id: PlayerId,
     island_id: crate::ai::islands::IslandId,
     members: &[Entity],
+    excluded_targets: &HashSet<GridPosition>,
     connectivity: &mut TerrainConnectivity,
 ) -> Option<GridPosition> {
     let island_map = world.get_resource::<crate::ai::islands::IslandMap>()?;
@@ -2335,6 +2337,7 @@ fn nearest_campaign_property_target_with_connectivity(
             let target = entity.get::<GridPosition>().copied()?;
             let property = entity.get::<Property>()?;
             if property.owner_id == Some(player_id)
+                || excluded_targets.contains(&target)
                 || island_map
                     .get_island_at(&target)
                     .is_none_or(|island| island.id != island_id)
@@ -2389,6 +2392,7 @@ fn campaign_assignment_capture_responsibilities(
             player_id,
             assignment.island_id,
             members,
+            &HashSet::new(),
             connectivity,
         )
     {
@@ -2421,20 +2425,51 @@ fn campaign_assignment_capture_responsibilities(
         }
     }
 
-    // 施設数より占領要員が多い場合も遊兵化させず、島内の到達可能な未所有施設へ予備を送る。
+    // 同一陸地の首都戦役では余剰占領兵を別施設へ展開する。海洋戦では上陸点へ
+    // 戦力を集中する必要があるため、従来どおり同じ目標への増援を許す。
+    let spread_over_land_routes =
+        crate::ai::v4::is_same_land_capital_island(world, player_id, assignment.island_id);
+    let mut claimed_targets = responsibilities
+        .iter()
+        .map(|responsibility| responsibility.target)
+        .collect::<HashSet<_>>();
     for member in remaining {
+        let excluded_targets = if spread_over_land_routes {
+            &claimed_targets
+        } else {
+            &HashSet::new()
+        };
         if let Some(target) = nearest_campaign_property_target_with_connectivity(
             world,
             player_id,
             assignment.island_id,
             &[member],
+            excluded_targets,
             connectivity,
         ) {
+            claimed_targets.insert(target);
             responsibilities.push(CampaignResponsibility {
                 mission_type: MissionType::Capture,
                 target,
                 members: vec![member],
             });
+        } else if let Some(responsibility) =
+            responsibilities.iter_mut().min_by_key(|responsibility| {
+                (
+                    campaign_member_distance_to_position(
+                        world,
+                        member,
+                        responsibility.target,
+                        connectivity,
+                    )
+                    .unwrap_or(usize::MAX),
+                    responsibility.target.y,
+                    responsibility.target.x,
+                )
+            })
+        {
+            // 未担当施設が尽きてもEntityを無所属へ落とさず、最寄りの既存責務へ増員する。
+            responsibility.members.push(member);
         }
     }
     responsibilities
@@ -2550,7 +2585,7 @@ fn campaign_combat_responsibilities(
     let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() else {
         return Vec::new();
     };
-    let mut enemies: Vec<_> = world
+    let enemies: Vec<_> = world
         .iter_entities()
         .filter_map(|entity| {
             let target = entity.get::<GridPosition>().copied()?;
@@ -2562,6 +2597,66 @@ fn campaign_combat_responsibilities(
             .then_some((entity.id(), target))
         })
         .collect();
+
+    let gates = crate::ai::v4::same_land_armored_route_gates(world, player_id, island_id);
+    if gates.len() >= 2 {
+        let Some(map) = world.get_resource::<Map>() else {
+            return Vec::new();
+        };
+        let nearest_gate = |position: GridPosition| {
+            gates
+                .iter()
+                .enumerate()
+                .min_by_key(|(index, gate)| {
+                    (map.distance(position.x, position.y, gate.x, gate.y), *index)
+                })
+                .map_or(0, |(index, _)| index)
+        };
+        let mut route_members = vec![Vec::new(); gates.len()];
+        for member in members {
+            let route = world
+                .get::<GridPosition>(*member)
+                .copied()
+                .map_or(0, nearest_gate);
+            route_members[route].push(*member);
+        }
+        let mut route_enemies = vec![Vec::new(); gates.len()];
+        for (enemy, position) in enemies {
+            route_enemies[nearest_gate(position)].push((enemy, position));
+        }
+        let mut responsibilities = Vec::new();
+        for (route, route_members) in route_members.into_iter().enumerate() {
+            if route_members.is_empty() {
+                continue;
+            }
+            if route_enemies[route].is_empty() {
+                // 接敵前のルート戦力も現在地待機にせず、担当Gateまで前進させる。
+                responsibilities.push(CampaignResponsibility {
+                    mission_type: MissionType::Defense,
+                    target: gates[route],
+                    members: route_members,
+                });
+            } else {
+                responsibilities.extend(campaign_combat_responsibilities_for_enemies(
+                    world,
+                    &route_members,
+                    std::mem::take(&mut route_enemies[route]),
+                    connectivity,
+                ));
+            }
+        }
+        return responsibilities;
+    }
+
+    campaign_combat_responsibilities_for_enemies(world, members, enemies, connectivity)
+}
+
+fn campaign_combat_responsibilities_for_enemies(
+    world: &World,
+    members: &[Entity],
+    mut enemies: Vec<(Entity, GridPosition)>,
+    connectivity: &mut TerrainConnectivity,
+) -> Vec<CampaignResponsibility> {
     enemies.sort_by_key(|(entity, target)| (target.y, target.x, entity.to_bits()));
 
     let mut remaining = members.to_vec();
@@ -4235,7 +4330,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     // 前手番の作戦所有権を使って古い重複Squadを一度だけ正規化してから分析する。
     reconcile_unique_operation_assignments(world, &mut manager, perspective_player);
     let tactical_reserved_entities = HashSet::new();
-    let strategy = if is_v3 {
+    let mut strategy = if is_v3 {
         // 防衛もcampaign portfolioの通常優先度・排他割当で扱う。
         let deployment_entities = if is_v4 {
             world
@@ -4261,6 +4356,14 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         manager = world.remove_resource::<SquadManager>().unwrap_or_default();
         strategy
     };
+    if is_v4 {
+        // 生産だけでなく実働Squadと正本roadmapにも同じ2ルートの現行Milestoneを渡す。
+        crate::ai::v4::refine_same_land_route_milestones(
+            world,
+            perspective_player,
+            &mut strategy.campaign_portfolio,
+        );
+    }
     let enemy_clusters = detect_enemy_clusters(world, perspective_player);
     if is_v3 {
         let mut cache = world
@@ -11961,6 +12064,103 @@ mod tests {
             .find(|squad| squad.mission_type == MissionType::Capture)
             .expect("護衛合流後の局地Capture");
         assert!(capture.departure_authorized);
+    }
+
+    #[test]
+    fn surplus_campaign_capturers_receive_distinct_property_responsibilities() {
+        use crate::ai::island_campaign::{
+            IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
+        };
+
+        let mut world = World::new();
+        let mut map = Map::new(6, 1, Terrain::Plains, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Capital).unwrap();
+        map.set_terrain(5, 0, Terrain::Capital).unwrap();
+        for x in 2..=4 {
+            map.set_terrain(x, 0, Terrain::City).unwrap();
+        }
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_id = island_map
+            .get_island_at(&GridPosition { x: 2, y: 0 })
+            .unwrap()
+            .id;
+        world.insert_resource(map);
+        world.insert_resource(island_map);
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+        let player = PlayerId(1);
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(player), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 5, y: 0 },
+            Property::new(Terrain::Capital, Some(PlayerId(2)), 100),
+        ));
+        for x in 2..=4 {
+            world.spawn((
+                GridPosition { x, y: 0 },
+                Property::new(Terrain::City, None, 100),
+            ));
+        }
+        let capturers = (0..3)
+            .map(|x| {
+                world
+                    .spawn((
+                        Faction(player),
+                        GridPosition { x, y: 0 },
+                        UnitStats {
+                            can_capture: true,
+                            movement_type: MovementType::Infantry,
+                            max_movement: 3,
+                            ..UnitStats::mock()
+                        },
+                    ))
+                    .id()
+            })
+            .collect::<Vec<_>>();
+        let requirement = IslandCampaignRequirement {
+            preferred_transport: None,
+            transport_slots: 0,
+            capture_units: 3,
+            ground_combat_units: 0,
+            combat_units: 0,
+            total_budget: 3_000,
+        };
+        let assignment = IslandCampaignAssignment {
+            island_id,
+            decision: IslandCampaignDecision::Secure,
+            target_position: GridPosition { x: 2, y: 0 },
+            // 明示Milestoneが1件でも、余剰2体を同じ施設へ重複させてはならない。
+            capture_target_positions: vec![GridPosition { x: 2, y: 0 }],
+            priority_enemy_types: Vec::new(),
+            requirement: requirement.clone(),
+            purchase_shortfall: requirement,
+            allocated_budget: 3_000,
+            transport_entities: Vec::new(),
+            capture_entities: capturers,
+            combat_entities: Vec::new(),
+            operation_ready: true,
+            continued_from_existing_squad: false,
+        };
+        let mut manager = SquadManager::new();
+
+        prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
+
+        let capture_squads = manager
+            .squads
+            .iter()
+            .filter(|squad| squad.mission_type == MissionType::Capture)
+            .collect::<Vec<_>>();
+        assert_eq!(capture_squads.len(), 3);
+        assert_eq!(
+            capture_squads
+                .iter()
+                .filter_map(|squad| squad.target)
+                .collect::<HashSet<_>>()
+                .len(),
+            3,
+            "占領可能施設が残る限り、1施設1Squadへ排他的に振り分ける"
+        );
     }
 
     #[test]

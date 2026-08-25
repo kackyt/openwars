@@ -1752,12 +1752,7 @@ fn candidate_target_position(
     player_id: PlayerId,
     existing_operation: Option<&ExistingCampaignOperation>,
 ) -> Option<GridPosition> {
-    let origins = properties
-        .iter()
-        .filter(|snapshot| island.tiles.contains(&snapshot.position))
-        .filter(|snapshot| snapshot.property.owner_id == Some(player_id))
-        .map(|snapshot| snapshot.position)
-        .collect::<Vec<_>>();
+    let origins = capture_front_origins(island, properties, units, player_id, existing_operation);
     let mut targets = properties
         .iter()
         .filter(|snapshot| island.tiles.contains(&snapshot.position))
@@ -1791,6 +1786,7 @@ fn candidate_target_position(
     nearest.or_else(|| sorted_island_tiles(island).first().copied())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn candidate_capture_target_positions(
     map: &Map,
     registry: &MasterDataRegistry,
@@ -1799,13 +1795,9 @@ fn candidate_capture_target_positions(
     units: &[UnitSnapshot],
     player_id: PlayerId,
     primary_target: GridPosition,
+    existing_operation: Option<&ExistingCampaignOperation>,
 ) -> Vec<GridPosition> {
-    let origins = properties
-        .iter()
-        .filter(|snapshot| island.tiles.contains(&snapshot.position))
-        .filter(|snapshot| snapshot.property.owner_id == Some(player_id))
-        .map(|snapshot| snapshot.position)
-        .collect::<Vec<_>>();
+    let origins = capture_front_origins(island, properties, units, player_id, existing_operation);
     let mut targets: Vec<_> = properties
         .iter()
         .filter(|snapshot| island.tiles.contains(&snapshot.position))
@@ -1838,6 +1830,54 @@ fn candidate_capture_target_positions(
         targets.insert(0, primary_target);
     }
     targets
+}
+
+/// 局地占領作戦の前線は、所有施設ではなく実際にその作戦へ所属する占領兵から測る。
+/// 担当兵が損耗した場合は同じ島の未所属占領兵へ再評価し、実働兵がいない場合だけ
+/// 揚陸前・再編成中の互換fallbackとして所有施設を用いる。
+fn capture_front_origins(
+    island: &Island,
+    properties: &[PropertySnapshot],
+    units: &[UnitSnapshot],
+    player_id: PlayerId,
+    existing_operation: Option<&ExistingCampaignOperation>,
+) -> Vec<GridPosition> {
+    let live_capture_position = |unit: &&UnitSnapshot| {
+        unit.faction == player_id
+            && unit.stats.can_capture
+            && unit.transporting.is_none()
+            && island.tiles.contains(&unit.position)
+    };
+    if let Some(operation) = existing_operation {
+        let assigned_entities = operation
+            .capture_entities
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let assigned_positions = units
+            .iter()
+            .filter(live_capture_position)
+            .filter(|unit| assigned_entities.contains(&unit.entity))
+            .map(|unit| unit.position)
+            .collect::<Vec<_>>();
+        if !assigned_positions.is_empty() {
+            return assigned_positions;
+        }
+    }
+    let available_positions = units
+        .iter()
+        .filter(live_capture_position)
+        .map(|unit| unit.position)
+        .collect::<Vec<_>>();
+    if !available_positions.is_empty() {
+        return available_positions;
+    }
+    properties
+        .iter()
+        .filter(|snapshot| island.tiles.contains(&snapshot.position))
+        .filter(|snapshot| snapshot.property.owner_id == Some(player_id))
+        .map(|snapshot| snapshot.position)
+        .collect()
 }
 
 /// 自軍前線からの占領ETAを第一基準、敵占領兵の到着ETAを同距離帯の競争優先度にする。
@@ -2351,6 +2391,7 @@ pub fn analyze_island_campaign_excluding(
             &units,
             player_id,
             target_position,
+            existing_operation.as_ref(),
         );
         let has_foothold = properties.iter().any(|property| {
             island.tiles.contains(&property.position)
@@ -2530,6 +2571,83 @@ mod tests {
                 &[],
                 player,
                 right_target.expect("右側前線"),
+                None,
+            ),
+            vec![GridPosition { x: 8, y: 0 }]
+        );
+    }
+
+    #[test]
+    fn local_capture_front_uses_assigned_unit_instead_of_distant_owned_property() {
+        let master_data = MasterDataRegistry::load().expect("master data should load");
+        let map = Map::new(11, 1, Terrain::Plains, GridTopology::Square);
+        let island = IslandMap::analyze(&map).islands.remove(0);
+        let player = PlayerId(1);
+        let enemy = PlayerId(2);
+        let assigned = Entity::from_raw(42);
+        let properties = vec![
+            PropertySnapshot {
+                position: GridPosition { x: 0, y: 0 },
+                property: Property::new(Terrain::City, Some(player), 200),
+            },
+            PropertySnapshot {
+                position: GridPosition { x: 2, y: 0 },
+                property: Property::new(Terrain::City, Some(enemy), 200),
+            },
+            PropertySnapshot {
+                position: GridPosition { x: 8, y: 0 },
+                property: Property::new(Terrain::City, Some(enemy), 200),
+            },
+        ];
+        let units = vec![UnitSnapshot {
+            entity: assigned,
+            faction: player,
+            position: GridPosition { x: 10, y: 0 },
+            stats: UnitStats {
+                can_capture: true,
+                ..UnitStats::mock()
+            },
+            health: Health {
+                current: 100,
+                max: 100,
+            },
+            fuel: None,
+            transporting: None,
+            free_cargo_slots: 0,
+            loaded_cargo_entities: Vec::new(),
+        }];
+        let operation = ExistingCampaignOperation {
+            island_id: island.id,
+            target_position: GridPosition { x: 8, y: 0 },
+            transport_phase: None,
+            is_forming: false,
+            transport_entities: Vec::new(),
+            capture_entities: vec![assigned],
+            combat_entities: Vec::new(),
+        };
+
+        assert_eq!(
+            candidate_target_position(
+                &map,
+                &master_data,
+                &island,
+                &properties,
+                &units,
+                player,
+                Some(&operation),
+            ),
+            Some(GridPosition { x: 8, y: 0 })
+        );
+        assert_eq!(
+            candidate_capture_target_positions(
+                &map,
+                &master_data,
+                &island,
+                &properties,
+                &units,
+                player,
+                GridPosition { x: 8, y: 0 },
+                Some(&operation),
             ),
             vec![GridPosition { x: 8, y: 0 }]
         );
