@@ -370,6 +370,15 @@ fn is_campaign_support_unit(unit_type: UnitType) -> bool {
     )
 }
 
+/// 橋・山で分断された同一陸塊の進軍軸を実際に前進できる装甲戦力かを判定する。
+/// 砲兵など移動力の低い支援unitを、この突破枠の充足と誤認しない。
+fn is_route_armored_unit(unit_type: UnitType) -> bool {
+    matches!(
+        unit_type,
+        UnitType::Tank | UnitType::MdTank | UnitType::TankZ
+    )
+}
+
 type OffensivePriorityKey = (
     u8,
     u8,
@@ -1099,6 +1108,73 @@ fn reserve_candidate(
         remove_entity(&mut provisional, unit.entity);
     }
 
+    // `ground_combat_units` は従来の渡洋Assaultの台数見積りには使わない。同一陸塊で
+    // 地形分断を越える継続campaignだけが、分析済みの橋突破不足として保持する。
+    let maintains_armored_route_campaign = matches!(
+        candidate.assessment.decision,
+        IslandCampaignDecision::Secure
+            | IslandCampaignDecision::Contest
+            | IslandCampaignDecision::Reinforce
+    ) && requirement.ground_combat_units > 0;
+    let mut remaining_ground_combat_units = if maintains_armored_route_campaign {
+        requirement.ground_combat_units
+    } else {
+        0
+    };
+    for entity in &combat_entities {
+        if remaining_ground_combat_units == 0 {
+            break;
+        }
+        if catalog
+            .get(entity)
+            .is_some_and(|unit| is_route_armored_unit(unit.unit_type))
+        {
+            remaining_ground_combat_units = remaining_ground_combat_units.saturating_sub(1);
+            // 橋突破に必要な装甲枠は、既存の実Entityで満たした場合だけ構造予算から控除する。
+            requirement_credit =
+                requirement_credit.saturating_add(catalog.get(entity).map_or(0, |unit| unit.cost));
+        }
+    }
+    available = sorted_pool_units(&provisional, island_id);
+    while remaining_ground_combat_units > 0 {
+        let Some(index) = available.iter().position(|unit| {
+            is_route_armored_unit(unit.unit_type)
+                && (unit.island_id == Some(island_id)
+                    || unit
+                        .reachable_positions
+                        .contains(&candidate.target_position))
+        }) else {
+            break;
+        };
+        let unit = available.remove(index);
+        push_unique_entity(&mut combat_entities, unit.entity);
+        remaining_ground_combat_units = remaining_ground_combat_units.saturating_sub(1);
+        requirement_credit = requirement_credit.saturating_add(unit.cost);
+        reserved_entity_value = reserved_entity_value.saturating_add(unit.cost);
+        remove_entity(&mut provisional, unit.entity);
+    }
+    // 現在手番に橋突破を要する同一陸塊campaignでは、未予約の装甲unitも同じ
+    // campaignへ回収する。必要数のcreditには入れないので、単なる予算相殺にはしない。
+    if maintains_armored_route_campaign {
+        available = sorted_pool_units(&provisional, island_id);
+        let attached_armor = available
+            .iter()
+            .filter(|unit| {
+                is_route_armored_unit(unit.unit_type)
+                    && (unit.island_id == Some(island_id)
+                        || unit
+                            .reachable_positions
+                            .contains(&candidate.target_position))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for unit in attached_armor {
+            push_unique_entity(&mut combat_entities, unit.entity);
+            reserved_entity_value = reserved_entity_value.saturating_add(unit.cost);
+            remove_entity(&mut provisional, unit.entity);
+        }
+    }
+
     let mut remaining_combat_units = requirement.combat_units;
     for entity in capture_entities
         .iter()
@@ -1283,15 +1359,17 @@ fn reserve_candidate(
         preferred_transport,
         transport_slots: remaining_transport_slots,
         capture_units: remaining_capture_units,
-        // 敵領戦闘力は時系列planの結果であり、島campaignの固定台数要求にしない。
-        ground_combat_units: 0,
+        // 地形分断を越える装甲枠だけは、敵数ではなく実際の突破未達から保持する。
+        ground_combat_units: remaining_ground_combat_units,
         combat_units: remaining_combat_units,
         total_budget: purchase_budget,
     };
     let capture_package_ready = purchase_shortfall.capture_units == 0
         || candidate.assessment.decision == IslandCampaignDecision::Reinforce
             && !capture_entities.is_empty();
-    let structural_package_ready = purchase_shortfall.transport_slots == 0 && capture_package_ready;
+    let structural_package_ready = purchase_shortfall.transport_slots == 0
+        && purchase_shortfall.ground_combat_units == 0
+        && capture_package_ready;
     // 中立の兵站前提だけは構造パッケージ完成時点で先行できる。
     // 敵領Assaultは敵戦力を上回る離散的な損耗余裕まで揃わなければ出航させない。
     let operation_ready = structural_package_ready
@@ -1479,10 +1557,31 @@ fn release_assignment(
     }
 }
 
-/// 共有資金とEntity候補を1つの可変poolとして扱い、完全編成だけを決定的に予約する。
+/// 候補から導出した評価だけを使う後方互換のallocator入口。
+///
+/// 実盤面の分析では、行動目標を持たない島も診断・Roadmap入力として残すため、
+/// `allocate_campaign_portfolio_with_assessments` を使用する。
+#[cfg(test)]
 pub(crate) fn allocate_campaign_portfolio(
     candidates: Vec<IslandCampaignCandidate>,
+    pool: CampaignResourcePool,
+) -> IslandCampaignPortfolio {
+    let assessments = candidates
+        .iter()
+        .map(|candidate| candidate.assessment.clone())
+        .collect();
+    allocate_campaign_portfolio_with_assessments(candidates, pool, assessments)
+}
+
+/// 全島評価を保持したまま、行動可能な候補だけへ共有資源を予約する。
+///
+/// `IslandCampaignPortfolio.islands` は作戦候補一覧ではなく盤面の全島評価である。
+/// そのため、目標座標を持たないSecured/Observed島をallocatorから外しても、
+/// その評価自体は捨てない。
+pub(crate) fn allocate_campaign_portfolio_with_assessments(
+    candidates: Vec<IslandCampaignCandidate>,
     mut pool: CampaignResourcePool,
+    mut assessments: Vec<IslandCampaignAssessment>,
 ) -> IslandCampaignPortfolio {
     let logistics_prerequisite_pending = candidates
         .iter()
@@ -1505,10 +1604,18 @@ pub(crate) fn allocate_campaign_portfolio(
             .collect::<Vec<_>>(),
         &mut pool,
     );
-    let mut assessments: Vec<_> = candidates
-        .iter()
-        .map(|candidate| candidate.assessment.clone())
-        .collect();
+    // V4の兵站計画などが候補の評価を更新している場合は、同じ島の全島評価へ
+    // 最新の判断を反映する。候補化されなかった島はここで上書きされない。
+    for candidate in &candidates {
+        if let Some(assessment) = assessments
+            .iter_mut()
+            .find(|assessment| assessment.island_id == candidate.assessment.island_id)
+        {
+            *assessment = candidate.assessment.clone();
+        } else {
+            assessments.push(candidate.assessment.clone());
+        }
+    }
     let mut offenses: Vec<_> = candidates
         .iter()
         .filter(|candidate| {

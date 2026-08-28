@@ -23,6 +23,13 @@ pub(crate) enum DeploymentPosture {
     Forming,
 }
 
+/// 生産命令時点で確保する、実Entityをまだ持たないSquad受入先の値オブジェクト。
+///
+/// Squad IDそのものはSquadManagerだけが発番する。ここでは発注の意図を安定IDで
+/// 予約し、生産完了Eventで実Squadへ一度だけ解決する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct FormingSquadSlotId(u64);
+
 /// 生産時の混成パッケージ予測。実績auditと同じEntityへ保持する。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeploymentForecast {
@@ -59,6 +66,19 @@ pub(crate) struct PendingDeployment {
     pub threat_horizon: u32,
     pub forecast: DeploymentForecast,
     pub plan_step: Option<PlanStepRef>,
+    /// 発注と同時に予約した作戦Squadの受入slot。手書きのテスト入力ではNoneを許容し、
+    /// `replace_turn_orders` が必ず実IDへ正規化する。
+    pub forming_slot: Option<FormingSquadSlotId>,
+}
+
+/// まだ実体が無いSquad slotの予約状態。発注と生産完了のあいだも作戦所有権を保つ。
+#[derive(Debug, Clone)]
+struct FormingSquadReservation {
+    id: FormingSquadSlotId,
+    player_id: PlayerId,
+    turn: u32,
+    squad_id: Option<SquadId>,
+    entity: Option<Entity>,
 }
 
 /// 生産済みEntityへ結び付いた作戦意図。
@@ -149,6 +169,10 @@ impl DeploymentAuditRecord {
 #[derive(Debug, Clone)]
 pub(crate) struct ActiveTargetAssignment {
     pub plan_id: Option<PlanId>,
+    /// Plan購入列由来か、Must後の即時Combat増援かを区別する。
+    /// `None` のPlanIdだけでは旧Intercept等の別任務を混ぜてしまうため、既存戦力
+    /// として再見積してよいのはCombat任務に限る。
+    pub slot_kind: SlotKind,
     pub targets: HashSet<Entity>,
 }
 
@@ -157,6 +181,8 @@ pub(crate) struct ActiveTargetAssignment {
 pub struct V4DeploymentRegistry {
     pending: VecDeque<PendingDeployment>,
     assigned: HashMap<Entity, AssignedDeployment>,
+    forming_slots: HashMap<FormingSquadSlotId, FormingSquadReservation>,
+    next_forming_slot: u64,
 }
 
 impl V4DeploymentRegistry {
@@ -169,24 +195,53 @@ impl V4DeploymentRegistry {
     ) {
         self.pending
             .retain(|pending| pending.player_id != player_id || pending.turn != turn);
-        self.pending.extend(orders);
+        // 同一手番の再計画で未発行slotを残すと、取り消された生産先へ後続Eventを
+        // 誤接続する。その手番の予約はPendingと同じ粒度で置換する。
+        self.forming_slots.retain(|_, reservation| {
+            reservation.player_id != player_id
+                || reservation.turn != turn
+                || reservation.entity.is_some()
+        });
+        let mut normalized = orders.into_iter().collect::<Vec<_>>();
+        normalized.sort_unstable_by_key(|pending| pending.order);
+        for pending in &mut normalized {
+            let slot = pending.forming_slot.unwrap_or_else(|| {
+                let id = FormingSquadSlotId(self.next_forming_slot);
+                self.next_forming_slot = self.next_forming_slot.saturating_add(1);
+                id
+            });
+            pending.forming_slot = Some(slot);
+            self.forming_slots
+                .entry(slot)
+                .or_insert(FormingSquadReservation {
+                    id: slot,
+                    player_id: pending.player_id,
+                    turn: pending.turn,
+                    squad_id: None,
+                    entity: None,
+                });
+        }
+        self.pending.extend(normalized);
     }
 
     /// 生産完了イベントを、同じ手番・施設・兵種の最初の発注へ決定的に照合する。
-    fn assign_produced(&mut self, event: &UnitProducedEvent, turn: u32) {
-        let Some(index) = self.pending.iter().position(|pending| {
+    fn assign_produced(
+        &mut self,
+        event: &UnitProducedEvent,
+        turn: u32,
+    ) -> Option<FormingSquadSlotId> {
+        let index = self.pending.iter().position(|pending| {
             pending.player_id == event.player_id
                 && pending.turn == turn
                 && pending.facility.x == event.target_x
                 && pending.facility.y == event.target_y
                 && pending.unit_type == event.unit_type
-        }) else {
-            return;
-        };
+        })?;
         let intent = self
             .pending
             .remove(index)
             .expect("照合済みpending deploymentが存在する");
+        let forming_slot = intent.forming_slot;
         self.assigned.insert(
             event.entity,
             AssignedDeployment {
@@ -213,6 +268,67 @@ impl V4DeploymentRegistry {
                 first_attack_turn: None,
             },
         );
+        if let Some(slot) = forming_slot
+            && let Some(reservation) = self.forming_slots.get_mut(&slot)
+        {
+            reservation.entity = Some(event.entity);
+        }
+        forming_slot
+    }
+
+    /// 生産完了直後に予約slotを実Squadへ解決する。
+    ///
+    /// 実Entityは生成手番に行動できないが、次の再編まで`None`所属にしない。対象敵の
+    /// 再探索など戦術的な詳細は次手番の`prepare_deployment_squads`が更新する。
+    fn resolve_produced_slot(
+        &mut self,
+        entity: Entity,
+        manager: &mut SquadManager,
+        island_map: Option<&IslandMap>,
+    ) {
+        let Some(snapshot) = self.assigned.get(&entity).cloned() else {
+            return;
+        };
+        let Some(slot) = snapshot.intent.forming_slot else {
+            return;
+        };
+        let existing = self
+            .forming_slots
+            .get(&slot)
+            .and_then(|reservation| reservation.squad_id)
+            .and_then(|squad_id| {
+                manager.squads.iter().position(|squad| {
+                    squad.id == squad_id && squad.owner_id == Some(snapshot.intent.player_id)
+                })
+            });
+        let squad = if let Some(index) = existing {
+            &mut manager.squads[index]
+        } else {
+            manager.create_owned_squad(
+                match snapshot.intent.posture {
+                    DeploymentPosture::Execute => MissionType::Attack,
+                    DeploymentPosture::Forming => MissionType::Defense,
+                },
+                snapshot.intent.player_id,
+            )
+        };
+        squad.members.insert(entity);
+        squad.target = Some(match snapshot.intent.posture {
+            DeploymentPosture::Execute => snapshot.intent.anchor,
+            DeploymentPosture::Forming => snapshot.intent.staging_anchor,
+        });
+        squad.target_island = island_map
+            .and_then(|islands| islands.get_island_at(&snapshot.intent.anchor))
+            .map(|island| island.id);
+        squad.phase = MissionPhase::Forming;
+        let squad_id = squad.id;
+        if let Some(reservation) = self.forming_slots.get_mut(&slot) {
+            debug_assert_eq!(reservation.id, slot);
+            reservation.squad_id = Some(squad_id);
+        }
+        if let Some(deployment) = self.assigned.get_mut(&entity) {
+            deployment.squad_id = Some(squad_id);
+        }
     }
 
     /// 現在playerの局地任務としてbeam searchから保護するSquad IDを返す。
@@ -256,6 +372,7 @@ impl V4DeploymentRegistry {
                     deployment.entity,
                     ActiveTargetAssignment {
                         plan_id: deployment.intent.plan_step.map(|step| step.plan_id),
+                        slot_kind: deployment.intent.slot_kind,
                         targets,
                     },
                 )
@@ -328,10 +445,23 @@ impl V4DeploymentRegistry {
         if plan_ids.is_empty() {
             return;
         }
+        let released_slots = self
+            .pending
+            .iter()
+            .filter(|pending| {
+                pending
+                    .plan_step
+                    .is_some_and(|step| plan_ids.contains(&step.plan_id))
+            })
+            .filter_map(|pending| pending.forming_slot)
+            .collect::<HashSet<_>>();
         self.pending.retain(|pending| {
             pending
                 .plan_step
                 .is_none_or(|step| !plan_ids.contains(&step.plan_id))
+        });
+        self.forming_slots.retain(|slot, reservation| {
+            !released_slots.contains(slot) || reservation.entity.is_some()
         });
         for deployment in self.assigned.values_mut() {
             if deployment
@@ -479,6 +609,7 @@ impl V4DeploymentRegistry {
                     threat_horizon: 1,
                     forecast: DeploymentForecast::default(),
                     plan_step: None,
+                    forming_slot: None,
                 },
                 squad_id: None,
                 current_target: Some(target),
@@ -509,10 +640,18 @@ pub fn reconcile_pending_deployments_system(
     mut events: EventReader<UnitProducedEvent>,
     match_state: Res<MatchState>,
     mut registry: ResMut<V4DeploymentRegistry>,
+    manager: Option<ResMut<SquadManager>>,
+    island_map: Option<Res<IslandMap>>,
 ) {
     let turn = match_state.current_turn_number.0;
+    let mut manager = manager;
     for event in events.read() {
-        registry.assign_produced(event, turn);
+        let slot = registry.assign_produced(event, turn);
+        if slot.is_some()
+            && let Some(manager) = manager.as_deref_mut()
+        {
+            registry.resolve_produced_slot(event.entity, manager, island_map.as_deref());
+        }
     }
     // 失敗した生産命令を翌ターンの同型発注へ誤照合しない。
     registry.pending.retain(|pending| pending.turn >= turn);
@@ -939,6 +1078,7 @@ mod tests {
             threat_horizon: 4,
             forecast: DeploymentForecast::default(),
             plan_step: None,
+            forming_slot: None,
         }
     }
 
@@ -964,6 +1104,41 @@ mod tests {
         assert_eq!(registry.assigned[&first].intent.order, 0);
         assert_eq!(registry.assigned[&second].intent.order, 1);
         assert!(registry.pending.is_empty());
+    }
+
+    #[test]
+    fn produced_entity_resolves_the_forming_squad_slot_immediately() {
+        let player = PlayerId(1);
+        let mut registry = V4DeploymentRegistry::default();
+        registry.replace_turn_orders(player, 3, [pending(0)]);
+        let entity = Entity::from_raw(100);
+        let slot = registry
+            .assign_produced(
+                &UnitProducedEvent {
+                    player_id: player,
+                    target_x: 2,
+                    target_y: 4,
+                    unit_type: UnitType::Fighter,
+                    entity,
+                },
+                3,
+            )
+            .expect("発注時にslotを予約する");
+        let mut manager = SquadManager::default();
+
+        registry.resolve_produced_slot(entity, &mut manager, None);
+
+        let squad_id = registry.assigned[&entity]
+            .squad_id
+            .expect("生産Eventと同じ処理でSquadへ解決する");
+        assert_eq!(registry.forming_slots[&slot].entity, Some(entity));
+        assert_eq!(registry.forming_slots[&slot].squad_id, Some(squad_id));
+        assert!(
+            manager
+                .squads
+                .iter()
+                .any(|squad| squad.id == squad_id && squad.members.contains(&entity))
+        );
     }
 
     #[test]
@@ -1163,6 +1338,7 @@ mod tests {
                     threat_horizon: 3,
                     forecast: DeploymentForecast::default(),
                     plan_step: None,
+                    forming_slot: None,
                 },
                 squad_id: None,
                 current_target: None,
@@ -1377,6 +1553,7 @@ mod tests {
                 threat_horizon: 4,
                 forecast: DeploymentForecast::default(),
                 plan_step: None,
+                forming_slot: None,
             },
             squad_id: None,
             current_target: None,
@@ -1473,6 +1650,7 @@ mod tests {
                 threat_horizon: 2,
                 forecast: DeploymentForecast::default(),
                 plan_step: None,
+                forming_slot: None,
             },
             squad_id: None,
             current_target: Some(remote_enemy),

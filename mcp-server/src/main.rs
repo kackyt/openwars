@@ -613,6 +613,12 @@ impl OpenWarsAiServer {
                 invasion_trace::snapshot_victory_roadmap_for_player(&state.world, active_player_id);
             let logistics_plan =
                 invasion_trace::snapshot_logistics_plan_for_player(&state.world, active_player_id);
+            // 進軍DAGの所属と実位置を返し、枝の選択と経路探索のどちらで停滞したかを
+            // 対戦トレース上で切り分けられるようにする。
+            let capital_routes = engine::ai::v4::capital_route_diagnostics_for_player(
+                &state.world,
+                active_player_id,
+            );
             let after_metrics = engine::ai::eval::evaluate_board_with_metrics(
                 &mut state.world,
                 active_player_id,
@@ -632,6 +638,7 @@ impl OpenWarsAiServer {
                 "plan_executions": plan_executions,
                 "victory_roadmap": victory_roadmap,
                 "logistics_plan": logistics_plan,
+                "capital_routes": capital_routes,
                 "player_id": active_player_id.0,
                 "player_index": active_player_index.0,
                 "before_score": before_metrics.total_score,

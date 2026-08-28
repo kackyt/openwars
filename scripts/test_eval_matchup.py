@@ -561,6 +561,33 @@ class IslandCampaignCollectionTests(unittest.TestCase):
         self.assertEqual(emergency_plans[2], lines[1]["emergency_plan"])
 
 
+class ObjectiveReportTests(unittest.TestCase):
+    def test_objective_report_displays_the_configured_turn_limit(self):
+        result = {
+            "map": "map_1",
+            "p1": "V4",
+            "p2": "V3",
+            "result": "P1_Win_MaxTurns",
+            "turns": 20,
+            "thinking_times": {1: [0.1], 2: [0.1]},
+            "action_counts": {1: {}, 2: {}},
+            "metrics": [
+                {
+                    "turn": 20,
+                    "p1_obj": {"zoc_area": 10, "income_per_turn": 1000},
+                    "p2_obj": {"zoc_area": 9, "income_per_turn": 900},
+                    "p1_units": 1000,
+                    "p2_units": 900,
+                }
+            ],
+        }
+
+        report = eval_matchup.generate_report([result], "V4", "V3", max_turns=20)
+
+        self.assertIn("各戦の20ターン時点", report)
+        self.assertNotIn("各戦の30ターン時点", report)
+
+
 class CompletedRoundTests(unittest.TestCase):
     def test_t30_snapshot_is_taken_after_both_players_finish(self):
         active_index = 0

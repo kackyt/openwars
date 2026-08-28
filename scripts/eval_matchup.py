@@ -237,6 +237,8 @@ def write_trace_jsonl(path, results):
             record_for(entry)["victory_roadmap"] = entry.get("roadmap")
         for entry in result.get("logistics_plan_history", []):
             record_for(entry)["logistics_plan"] = entry.get("plan")
+        for entry in result.get("capital_route_history", []):
+            record_for(entry)["capital_routes"] = entry.get("routes")
         for entry in result.get("emergency_plan_history", []):
             record_for(entry)["emergency_plan"] = entry.get("plan")
         for entry in result.get("factory_relief_history", []):
@@ -244,6 +246,7 @@ def write_trace_jsonl(path, results):
         for entry in result.get("action_history", []):
             record = record_for(entry)
             record["actions"] = entry.get("actions")
+            record["transport_squads"] = entry.get("transport_squads", [])
             record["loaded_transports"] = entry.get("loaded_transports", [])
 
         # 欠測（V1〜V3 は生産トレースを持たない）を挟んでも順序が崩れないよう -1 で埋める。
@@ -334,6 +337,7 @@ def run_single_game(
     plan_execution_history = []
     victory_roadmap_history = []
     logistics_plan_history = []
+    capital_route_history = []
     emergency_plan_history = []
     factory_relief_history = []
     action_history = []
@@ -363,6 +367,7 @@ def run_single_game(
             "plan_execution_history": plan_execution_history,
             "victory_roadmap_history": victory_roadmap_history,
             "logistics_plan_history": logistics_plan_history,
+            "capital_route_history": capital_route_history,
             "emergency_plan_history": emergency_plan_history,
             "factory_relief_history": factory_relief_history,
             "action_history": action_history,
@@ -542,6 +547,17 @@ def run_single_game(
                 }
             )
 
+        capital_routes = ai_result.get("capital_routes")
+        if capital_routes is not None:
+            capital_route_history.append(
+                {
+                    "round": turn,
+                    "turn": state.get("turn"),
+                    "player_id": ai_result.get("player_id", current_player),
+                    "routes": capital_routes,
+                }
+            )
+
         emergency_plan = ai_result.get("emergency_plan")
         if emergency_plan is not None:
             emergency_plan_history.append(
@@ -578,6 +594,10 @@ def run_single_game(
                 "turn": state.get("turn"),
                 "player_id": current_player,
                 "actions": [str(action) for action in actions],
+                # Transit / Drop 中の輸送役が、どの島・座標を目的地として保持しているかを
+                # 行動列と同じ手番に保存する。Dropの有無だけでは目的地誤りと候補不足を
+                # 区別できないため、Squadのphase・cargo・直近drop位置を正本として残す。
+                "transport_squads": ai_result.get("transport_squads", []),
                 # Waitの主体が積載済み輸送かを、行動前の盤面と照合できるようにする。
                 "loaded_transports": [
                     {
@@ -921,7 +941,7 @@ def judge_objective_criteria(results, subject="V2", baseline="V1"):
     return map_pass, overall, detail_rows
 
 
-def generate_report(results, subject="V2", baseline="V1"):
+def generate_report(results, subject="V2", baseline="V1", max_turns=30):
     v2_wins = 0
     v1_wins = 0
     draws = 0
@@ -972,7 +992,9 @@ def generate_report(results, subject="V2", baseline="V1"):
     # 客観メトリクス基準の合否判定 (Issue #48 確定基準)
     map_pass, overall, detail_rows = judge_objective_criteria(results, subject, baseline)
     report.append("## ✅ 合否判定（客観メトリクス基準）")
-    report.append("判定時点 = 各戦の30ターン時点（それ以前に決着した場合は決着時点）。")
+    report.append(
+        f"判定時点 = 各戦の{max_turns}ターン時点（それ以前に決着した場合は決着時点）。"
+    )
     report.append("")
     report.append(f"| マップ | 手番 | 基準1: ZOC支配面積 ({subject} vs {baseline}) | 基準2: ターン収入 ({subject} vs {baseline}) | 基準3: ジリ貧解消 | 判定 |")
     report.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
@@ -1356,9 +1378,33 @@ def main():
             with open(args.output, "w", encoding="utf-8") as file:
                 file.write(report)
         else:
-            report = generate_report(all_results, subject=args.p1, baseline=args.p2)
+            report = generate_report(
+                all_results,
+                subject=args.p1,
+                baseline=args.p2,
+                max_turns=args.max_turns,
+            )
             with open(args.output, "w", encoding="utf-8") as file:
                 file.write(report)
+            if args.json_output:
+                # 指定された場合は、Markdown集計の根拠となる生の対戦結果も保存する。
+                write_json_atomic(
+                    args.json_output,
+                    {
+                        "metadata": {
+                            "criteria": args.criteria,
+                            "maps": maps,
+                            "subject": args.p1,
+                            "baseline": args.p2,
+                            "player_order": args.player_order,
+                            "games_per_order": args.games,
+                            "seed": args.seed,
+                            "max_turns": args.max_turns,
+                            "grid_type": args.grid_type,
+                        },
+                        "results": all_results,
+                    },
+                )
 
         if args.mode == "batch":
             print(json.dumps({"type": "info", "msg": f"Report generated at {args.output}"}))

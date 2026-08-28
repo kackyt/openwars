@@ -1,4 +1,5 @@
 use crate::ai::islands::IslandId;
+use crate::ai::squad::{MissionPhase, MissionType, SquadId, SquadManager};
 use crate::components::PlayerId;
 use crate::events::{ProduceUnitCommand, UnitProducedEvent};
 use crate::resources::UnitType;
@@ -42,6 +43,10 @@ pub(crate) struct CampaignProductionRecord {
     pub(crate) facility_y: usize,
     pub(crate) unit_type: UnitType,
     pub(crate) status: CampaignProductionStatus,
+    /// 発注時に確保したCampaign用Forming Squad slot。Entityが完成したら同じslotの
+    /// Squadへ直ちに入れるため、次手番まで作戦未所属にはしない。
+    pub(crate) forming_slot: u64,
+    pub(crate) squad_id: Option<SquadId>,
     pub(crate) entity: Option<Entity>,
     pub(crate) resolved_turn: Option<u32>,
 }
@@ -49,6 +54,7 @@ pub(crate) struct CampaignProductionRecord {
 #[derive(Resource, Debug, Default)]
 pub struct V4CampaignExecutionRegistry {
     records: Vec<CampaignProductionRecord>,
+    next_forming_slot: u64,
 }
 
 impl V4CampaignExecutionRegistry {
@@ -77,8 +83,10 @@ impl V4CampaignExecutionRegistry {
                     CampaignProductionStatus::Planned | CampaignProductionStatus::Issued
                 )
         });
-        self.records
-            .extend(intents.iter().map(|intent| CampaignProductionRecord {
+        for intent in intents {
+            let forming_slot = self.next_forming_slot;
+            self.next_forming_slot = self.next_forming_slot.saturating_add(1);
+            self.records.push(CampaignProductionRecord {
                 player_id,
                 planned_turn: turn,
                 island_id: intent.island_id,
@@ -87,9 +95,12 @@ impl V4CampaignExecutionRegistry {
                 facility_y: intent.command.target_y,
                 unit_type: intent.command.unit_type,
                 status: CampaignProductionStatus::Planned,
+                forming_slot,
+                squad_id: None,
                 entity: None,
                 resolved_turn: None,
-            }));
+            });
+        }
     }
 
     pub(crate) fn mark_issued(
@@ -126,6 +137,43 @@ impl V4CampaignExecutionRegistry {
             record.entity = Some(event.entity);
             record.resolved_turn = Some(turn);
         }
+    }
+
+    /// Campaign生産の受入slotを、完成Eventと同じ更新で実Squadへ解決する。
+    ///
+    /// 目標座標は次回Roadmap TurnPlanが詳細化するが、島・役割・Forming状態はここで
+    /// 固定する。輸送unitも独立した汎用unitにはせず、明示Transport Squadに残す。
+    fn resolve_produced_slot(&mut self, entity: Entity, manager: &mut SquadManager) {
+        let Some(index) = self.records.iter().position(|record| {
+            record.entity == Some(entity) && record.status == CampaignProductionStatus::Produced
+        }) else {
+            return;
+        };
+        let record = &mut self.records[index];
+        let squad_index = record.squad_id.and_then(|squad_id| {
+            manager
+                .squads
+                .iter()
+                .position(|squad| squad.id == squad_id && squad.owner_id == Some(record.player_id))
+        });
+        let squad = if let Some(index) = squad_index {
+            &mut manager.squads[index]
+        } else {
+            manager.create_owned_squad(
+                match record.role {
+                    CampaignProductionRole::Transport => MissionType::Transport,
+                    CampaignProductionRole::Capture => MissionType::Capture,
+                    CampaignProductionRole::Combat => MissionType::Attack,
+                },
+                record.player_id,
+            )
+        };
+        squad.members.insert(entity);
+        squad.target_island = Some(record.island_id);
+        squad.phase = MissionPhase::Forming;
+        record.squad_id = Some(squad.id);
+        // slotはrecordと同じ寿命を持つ。debug時に発番漏れを検知できるよう利用する。
+        debug_assert!(record.forming_slot < self.next_forming_slot);
     }
 
     pub(crate) fn mark_destroyed(&mut self, entity: Entity, turn: u32) {
@@ -181,13 +229,18 @@ pub fn reconcile_campaign_production_system(
     match_state: Res<crate::resources::MatchState>,
     mut produced: EventReader<UnitProducedEvent>,
     registry: Option<ResMut<V4CampaignExecutionRegistry>>,
+    manager: Option<ResMut<SquadManager>>,
 ) {
     let Some(mut registry) = registry else {
         return;
     };
     let turn = match_state.current_turn_number.0;
+    let mut manager = manager;
     for event in produced.read() {
         registry.assign_produced(event, turn);
+        if let Some(manager) = manager.as_deref_mut() {
+            registry.resolve_produced_slot(event.entity, manager);
+        }
     }
 }
 
@@ -238,6 +291,53 @@ mod tests {
                 .produced_entity_assignments(player)
                 .contains_key(&entity)
         );
+    }
+
+    #[test]
+    fn produced_campaign_entity_resolves_its_forming_squad_slot() {
+        let player = PlayerId(2);
+        let island = IslandId(3);
+        let command = ProduceUnitCommand {
+            player_id: player,
+            target_x: 4,
+            target_y: 5,
+            unit_type: UnitType::Infantry,
+        };
+        let mut registry = V4CampaignExecutionRegistry::default();
+        registry.replace_turn_intents(
+            player,
+            2,
+            &[CampaignProductionIntent {
+                command: command.clone(),
+                island_id: island,
+                role: CampaignProductionRole::Capture,
+            }],
+        );
+        registry.mark_issued(player, 2, &command);
+        let entity = Entity::from_raw(42);
+        registry.assign_produced(
+            &UnitProducedEvent {
+                player_id: player,
+                target_x: 4,
+                target_y: 5,
+                unit_type: UnitType::Infantry,
+                entity,
+            },
+            2,
+        );
+        let mut manager = SquadManager::default();
+
+        registry.resolve_produced_slot(entity, &mut manager);
+
+        let record = registry.records_for(player, island)[0];
+        let squad_id = record.squad_id.expect("Campaign slotをSquadへ解決する");
+        assert!(record.forming_slot < registry.next_forming_slot);
+        assert!(manager.squads.iter().any(|squad| {
+            squad.id == squad_id
+                && squad.mission_type == MissionType::Capture
+                && squad.target_island == Some(island)
+                && squad.members.contains(&entity)
+        }));
     }
 
     #[test]

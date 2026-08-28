@@ -104,7 +104,10 @@ pub struct OperationFacts {
     pub enemy_combat_units: u32,
     /// 同じ作戦へ実際に参加できる既存戦闘Entity数。診断用で、必要編成は計画器が決める。
     pub friendly_combat_units_committed: u32,
-    /// 敵施設が期限内に増援を生産できる資金。増援構成は別途ターン別に展開する。
+    /// 敵施設が次の接触地点までに動員できる上限額。
+    ///
+    /// これは敵の実際の発注額ではない。未知の将来生産を現在の要求量や資金予約へ
+    /// 混ぜないため、診断と次手番の再評価範囲にだけ用いる。
     pub enemy_reinforcement_funds: u32,
     /// 到達不能脅威へ対抗できる既存迎撃Entity数。
     pub friendly_intercept_units_committed: u32,
@@ -143,8 +146,9 @@ pub fn derive_slots(facts: &OperationFacts) -> OperationSlots {
         .min(MAX_CAPTURE_SLOTS);
 
     // --- 戦闘計画：対象Entityがあれば必要編成をrolling plannerへ委譲する ---
-    let combat_plan_required =
-        u32::from(facts.enemy_combat_units > 0 || facts.enemy_reinforcement_funds > 0);
+    // 将来の敵生産上限は「今この手番に倒す敵」ではない。観測済みの敵だけで
+    // Combat計画を起動し、敵ユニットが実際に現れた次手番に改めて見積もる。
+    let combat_plan_required = u32::from(facts.enemy_combat_units > 0);
 
     // 作戦地点へ届ける占領要員の総数（既に手元にいる分＋これから買う分）
     let capture_presence = capture_units.saturating_add(facts.friendly_capture_units_committed);
@@ -261,14 +265,14 @@ mod tests {
         assert_eq!(derive_slots(&facts).capture_units, 0);
     }
 
-    /// 期限内に到着できる敵増援だけを局地脅威へ加える
+    /// 未観測の敵増援余力は、現在Combatの必須要求へ加えない
     #[test]
-    fn combat_plan_required_accounts_for_enemy_reinforcement() {
+    fn combat_plan_required_ignores_unobserved_enemy_reinforcement_capacity() {
         let mut facts = base_facts();
         facts.enemy_combat_units = 0;
         facts.enemy_reinforcement_funds = 2000;
 
-        assert_eq!(derive_slots(&facts).combat_plan_required, 1);
+        assert_eq!(derive_slots(&facts).combat_plan_required, 0);
     }
 
     /// 既存戦力がいても、対象Entityを全滅できるかは計画器で再評価する。

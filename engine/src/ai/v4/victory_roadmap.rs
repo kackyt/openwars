@@ -1,11 +1,13 @@
 use crate::ai::engine::AiCommand;
 use crate::ai::island_campaign::{
-    IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignPortfolio,
+    IslandCampaignAssessment, IslandCampaignAssignment, IslandCampaignDecision,
+    IslandCampaignPortfolio,
 };
 use crate::ai::islands::{IslandId, IslandMap};
 use crate::ai::squad::{MissionPhase, MissionType, SquadManager, TransportPhase};
 use crate::ai::turn_distance::{TurnDistanceCache, calculate_turn_distance};
 use crate::ai::v4::deployment::V4DeploymentRegistry;
+use crate::ai::v4::operation::OperationKind;
 use crate::ai::v4::plan_revision::{ActiveCombatPlanSummary, PlanId, V4RollingPlanRegistry};
 use crate::components::{
     CargoCapacity, Faction, GridPosition, Health, PlayerId, Property, Transporting, UnitStats,
@@ -57,6 +59,18 @@ fn operation_scope(purpose: StrategicPurpose) -> StrategicOperationScope {
     }
 }
 
+/// Roadmap上の子作戦とRolling Combat Planの種別を一意に対応付ける。
+///
+/// 同じ首都島でも、DAGの未確保区間を取るCaptureと終端のAssaultCapitalは別の
+/// 予実台帳を持つ。島IDだけで結び付けると、前段の計画を首都作戦が横取りする。
+fn rolling_operation_kind(purpose: StrategicPurpose) -> OperationKind {
+    match purpose {
+        StrategicPurpose::CaptureIsland => OperationKind::Capture,
+        StrategicPurpose::DefendIsland => OperationKind::Defense,
+        StrategicPurpose::AssaultCapital => OperationKind::AssaultCapital,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CampaignStepKind {
     Produce,
@@ -82,6 +96,40 @@ pub enum OperationPhase {
     Hold,
     Completed,
     Blocked,
+}
+
+/// Roadmap Nodeを盤面へ投影した現在の進行状態。
+///
+/// `OperationPhase` はSquad・輸送の工程、こちらは前提Nodeを解放できるかという
+/// 戦略上の状態を表す。両者を一つのenumへ混ぜると、例えば輸送中であることと
+/// 局地戦で優勢であることを同じ軸で比較してしまう。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoadmapNodeState {
+    Locked,
+    Ready,
+    Contested,
+    Dominant,
+    Capturing,
+    Secured,
+    Blocked,
+}
+
+/// Roadmap上のOperation間にある、実行順序を持つ依存辺。
+///
+/// `Logistics` は島間の兵站経路、`CapitalRoute` は敵首都島で前段Milestoneを
+/// 確保してから首都強襲へ移る関係を表す。いずれも前提が `Dominant` または
+/// `Secured` になった時だけ後続Nodeを解放する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RoadmapDependencyKind {
+    Logistics,
+    CapitalRoute,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RoadmapDependency {
+    pub predecessor: StrategicOperationId,
+    pub successor: StrategicOperationId,
+    pub kind: RoadmapDependencyKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,6 +240,8 @@ pub struct StrategicOperation {
     /// 現在の局地Milestoneが担当する目的拠点。完了済みの旧目標は残さない。
     pub objective_properties: Vec<GridPosition>,
     pub owned_objective_count: usize,
+    /// `VictoryRoadmap` が公開する、Nodeの戦略上の進行状態。
+    pub node_state: RoadmapNodeState,
     pub phase: OperationPhase,
     pub planned_completion_turn: Option<u32>,
     pub actual_completion_turn: Option<u32>,
@@ -226,6 +276,249 @@ pub struct VictoryRoadmap {
     pub initial_enemy_unit_count: usize,
     pub current_enemy_unit_count: usize,
     pub operation_ids: Vec<StrategicOperationId>,
+    /// IslandCampaignと首都攻略を接続する、当該Roadmapの有向非巡回な依存辺。
+    pub dependencies: Vec<RoadmapDependency>,
+}
+
+/// Roadmapがこの手番に実行すると確定したOperationの、Squad投影用要約。
+///
+/// 生産slotの予約と複数戦略案の探索は未決定であるため、ここでは既存の
+/// IslandCampaign analyzerが提案した割当を一手番だけ凍結する。これにより
+/// 後段のSquad再編器が別の島作戦を発明せず、同じ入力を投影できる。
+#[derive(Debug, Clone)]
+pub(crate) struct RoadmapOperationDirective {
+    pub operation_id: StrategicOperationId,
+    pub island_id: IslandId,
+    pub purpose: StrategicPurpose,
+    pub node_state: RoadmapNodeState,
+    pub target: GridPosition,
+    pub squad_ids: Vec<crate::ai::squad::SquadId>,
+}
+
+/// 1 player・1手番のRoadmap決定を保持する不変スナップショット。
+#[derive(Debug, Clone)]
+pub(crate) struct RoadmapTurnPlan {
+    pub player_id: PlayerId,
+    pub turn: u32,
+    pub portfolio: IslandCampaignPortfolio,
+    pub directives: Vec<RoadmapOperationDirective>,
+}
+
+impl RoadmapTurnPlan {
+    /// Roadmapが同じSquadを複数Operationへ同時に投影していないことを検証する。
+    ///
+    /// これは候補選択ではなく、TurnPlanをSquadReconcilerへ渡す直前の整合性検査である。
+    /// 空のSquad集合はForming Operationを表すため許可する。
+    fn is_consistent(&self) -> bool {
+        let mut operation_ids = HashSet::new();
+        let mut objectives = HashSet::new();
+        let mut squad_owners = HashMap::new();
+        self.directives.iter().all(|directive| {
+            let unique_operation = operation_ids.insert(directive.operation_id);
+            let unique_objective =
+                objectives.insert((directive.island_id, directive.purpose, directive.target));
+            let active_node = directive.node_state != RoadmapNodeState::Locked;
+            let squads_are_exclusive = directive.squad_ids.iter().all(|squad_id| {
+                squad_owners
+                    .insert(*squad_id, directive.operation_id)
+                    .is_none_or(|owner| owner == directive.operation_id)
+            });
+            unique_operation && unique_objective && active_node && squads_are_exclusive
+        })
+    }
+}
+
+/// playerごとの当ターンRoadmap指示。Squad編成・行動器はこれを読み、
+/// `IslandCampaignDiagnostics` のような観測専用Resourceを意思決定に使わない。
+#[derive(Resource, Debug, Default, Clone)]
+pub(crate) struct RoadmapTurnPlanRegistry {
+    plans: HashMap<PlayerId, RoadmapTurnPlan>,
+}
+
+/// Roadmapが比較した、攻勢Nodeの資源配分候補の分類。
+///
+/// Defenseは候補間で固定しない。現に脅威がある島を「常に最低限守る」と決め打ちせず、
+/// analyzerが提案したDefenseを全候補で保持したうえで、限られた攻勢資源の配分だけを
+/// 比較する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StrategicCandidateKind {
+    Hold,
+    Focus,
+    Split,
+}
+
+/// 1手番に生成・枝刈りした戦略候補の監査情報。
+#[derive(Debug, Clone)]
+pub(crate) struct StrategicCandidateEvaluation {
+    pub kind: StrategicCandidateKind,
+    pub offensive_islands: Vec<IslandId>,
+    pub score: i64,
+    pub selected: bool,
+}
+
+/// Roadmapの候補生成が、後段のSquad再編へ渡した唯一のPortfolioを検証できるようにする。
+#[derive(Resource, Debug, Default, Clone)]
+pub(crate) struct RoadmapStrategicCandidateRegistry {
+    by_player: HashMap<PlayerId, Vec<StrategicCandidateEvaluation>>,
+}
+
+/// 盤面から得た局地assignmentの価値を、全体候補の比較に使う粗い効用へ正規化する。
+///
+/// RollingPlanが算出した不足費用・既存戦力・実行可否を読み、Roadmapはどの島Nodeを
+/// 同時に進めるかだけを決める。兵種の組合せをここで再探索しない。
+fn local_assignment_merit(assignment: &IslandCampaignAssignment) -> i64 {
+    let decision_value = match assignment.decision {
+        IslandCampaignDecision::Assault => 640,
+        IslandCampaignDecision::Expand => 520,
+        IslandCampaignDecision::Contest => 470,
+        IslandCampaignDecision::Reinforce => 390,
+        IslandCampaignDecision::Secure => 330,
+        IslandCampaignDecision::Defend => 300,
+        IslandCampaignDecision::Observe | IslandCampaignDecision::Withdraw => 0,
+    };
+    let existing_force = assignment
+        .transport_entities
+        .len()
+        .saturating_add(assignment.capture_entities.len())
+        .saturating_add(assignment.combat_entities.len());
+    let continuity = if assignment.continued_from_existing_squad {
+        140
+    } else {
+        0
+    };
+    let ready = if assignment.operation_ready {
+        100
+    } else {
+        -180
+    };
+    // shortfallはRollingPlanの成立性に必要な資金であり、Node価値そのものではない。
+    // これを過大に引くと「歩兵が1体足りない進軍」をHoldが常に棄却してしまうため、
+    // 現有戦力・継続作戦を残したまま比較できる重みに正規化する。
+    let shortfall = i64::from(assignment.purchase_shortfall.total_budget) / 100;
+    decision_value + i64::try_from(existing_force).unwrap_or(i64::MAX) * 35 + continuity + ready
+        - shortfall
+}
+
+/// 最大3攻勢Nodeだけを残して全部分集合を比較する、境界付きの戦略候補探索。
+///
+/// Island allocator自体も同時攻勢を制限しているが、ここで改めて上位3件へ枝刈りし、
+/// 将来allocatorの上限が変わってもRoadmapの組合せ爆発を防ぐ。2^3=8候補であり、
+/// `Focus A`、`Focus B`、`A+B`、全力分散、攻勢保留を同じ評価式で比較できる。
+fn select_strategic_portfolio(
+    portfolio: &IslandCampaignPortfolio,
+) -> (IslandCampaignPortfolio, Vec<StrategicCandidateEvaluation>) {
+    const MAX_BRANCHING_OFFENSIVES: usize = 3;
+    let mut candidates = portfolio.active_offensives.clone();
+    candidates.sort_unstable_by_key(|assignment| {
+        (
+            std::cmp::Reverse(local_assignment_merit(assignment)),
+            assignment.island_id.0,
+        )
+    });
+    candidates.truncate(MAX_BRANCHING_OFFENSIVES);
+    let has_ready_offensive = candidates
+        .iter()
+        .any(|assignment| assignment.operation_ready || assignment.continued_from_existing_squad);
+
+    let mut evaluations = Vec::new();
+    let mut selected_assignments = Vec::new();
+    let mut best_key = None;
+    for mask in 0..(1_usize << candidates.len()) {
+        // 実行可能または継続中の攻勢まで全て停止するのは、資金を貯める明確な撤収判断では
+        // なく、短期shortfallを過大評価した副作用である。最低1Nodeは残し、Roadmapが
+        // 「どこへ集中するか」を決める。
+        if mask == 0 && has_ready_offensive {
+            continue;
+        }
+        let assignments = candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(index, assignment)| ((mask & (1 << index)) != 0).then_some(assignment))
+            .collect::<Vec<_>>();
+        let offensive_islands = assignments
+            .iter()
+            .map(|assignment| assignment.island_id)
+            .collect::<Vec<_>>();
+        let base = assignments
+            .iter()
+            .map(|assignment| local_assignment_merit(assignment))
+            .sum::<i64>();
+        // 複数Nodeを同時に進めると輸送・capturer・生産施設を取り合う。実行中の
+        // assignmentが大きく劣る場合だけ分散を選ぶよう二次ペナルティを置く。
+        let count = i64::try_from(assignments.len()).unwrap_or(i64::MAX);
+        let spread_penalty = count.saturating_sub(1).saturating_pow(2) * 110;
+        let score = base - spread_penalty;
+        let kind = match assignments.len() {
+            0 => StrategicCandidateKind::Hold,
+            1 => StrategicCandidateKind::Focus,
+            _ => StrategicCandidateKind::Split,
+        };
+        // 同点はより少ない同時攻勢、次に島ID順で決める。優劣のない候補の揺れを
+        // Battle評価のノイズにしないための決定規則である。
+        let mut island_order = offensive_islands
+            .iter()
+            .map(|island_id| island_id.0)
+            .collect::<Vec<_>>();
+        island_order.sort_unstable();
+        let key = (
+            score,
+            std::cmp::Reverse(assignments.len()),
+            std::cmp::Reverse(island_order),
+        );
+        if best_key.as_ref().is_none_or(|current| key > *current) {
+            best_key = Some(key);
+            selected_assignments = assignments.into_iter().cloned().collect();
+        }
+        evaluations.push(StrategicCandidateEvaluation {
+            kind,
+            offensive_islands,
+            score,
+            selected: false,
+        });
+    }
+    let selected_islands = selected_assignments
+        .iter()
+        .map(|assignment: &IslandCampaignAssignment| assignment.island_id)
+        .collect::<Vec<_>>();
+    for evaluation in &mut evaluations {
+        evaluation.selected = evaluation.offensive_islands == selected_islands;
+    }
+    let mut selected = portfolio.clone();
+    selected.active_offensives = selected_assignments;
+    (selected, evaluations)
+}
+
+impl RoadmapTurnPlanRegistry {
+    fn replace(&mut self, plan: RoadmapTurnPlan) {
+        self.plans.insert(plan.player_id, plan);
+    }
+
+    fn portfolio_for_turn(
+        &self,
+        player_id: PlayerId,
+        turn: u32,
+    ) -> Option<&IslandCampaignPortfolio> {
+        self.plans
+            .get(&player_id)
+            .filter(|plan| plan.turn == turn)
+            .filter(|plan| plan.is_consistent())
+            .map(|plan| &plan.portfolio)
+    }
+}
+
+/// 当ターンにRoadmapが採用した島作戦を返す。
+///
+/// 戦略案探索は保留中なので、これは既存analyzerの出力をRoadmapが受理した結果である。
+/// 受理後のSquad再編ではこのsnapshotだけを参照し、再度portfolioを分析しない。
+pub(crate) fn current_turn_portfolio(
+    world: &World,
+    player_id: PlayerId,
+    turn: u32,
+) -> Option<IslandCampaignPortfolio> {
+    world
+        .get_resource::<RoadmapTurnPlanRegistry>()
+        .and_then(|plans| plans.portfolio_for_turn(player_id, turn))
+        .cloned()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -263,6 +556,7 @@ impl VictoryRoadmapRegistry {
                 operation.player_id == player_id
                     && operation.active
                     && operation.purpose == StrategicPurpose::AssaultCapital
+                    && operation.node_state != RoadmapNodeState::Locked
             })
             .min_by_key(|operation| operation.id.0)
             .map(|operation| (operation.island_id, operation.tactical_anchor))
@@ -478,6 +772,7 @@ impl VictoryRoadmapRegistry {
             operation.execution.blocked = operation.execution.blocked.saturating_add(1);
             operation.execution.deviations = operation.execution.deviations.saturating_add(1);
             operation.phase = OperationPhase::Blocked;
+            operation.node_state = RoadmapNodeState::Blocked;
             operation.blocked_reason = Some(detail.clone());
             let issue = OperationIssue {
                 kind: OperationIssueKind::StepBlocked,
@@ -555,6 +850,7 @@ impl VictoryRoadmapRegistry {
                 initial_enemy_unit_count: enemy_unit_count,
                 current_enemy_unit_count: enemy_unit_count,
                 operation_ids: Vec::new(),
+                dependencies: Vec::new(),
             },
         );
         id
@@ -589,6 +885,11 @@ impl VictoryRoadmapRegistry {
                     tactical_anchor: capital,
                     objective_properties: vec![capital],
                     owned_objective_count: usize::from(owned),
+                    node_state: if owned {
+                        RoadmapNodeState::Secured
+                    } else {
+                        RoadmapNodeState::Blocked
+                    },
                     phase: OperationPhase::Forming,
                     planned_completion_turn: None,
                     actual_completion_turn: None,
@@ -632,15 +933,138 @@ impl VictoryRoadmapRegistry {
         operation.planned_suppression_turn = None;
         if owned {
             operation.phase = OperationPhase::Completed;
+            operation.node_state = RoadmapNodeState::Secured;
             operation.actual_completion_turn.get_or_insert(turn);
             operation.blocked_reason = None;
         } else {
             operation.phase = OperationPhase::Forming;
+            operation.node_state = RoadmapNodeState::Blocked;
             operation.planned_completion_turn = None;
             operation.blocked_reason =
                 Some("no executable capital assault schedule has been selected".to_owned());
         }
         operation_id
+    }
+
+    /// Regional/CapitalのOperationを同じ島・scopeごとに一度だけ作成する。
+    ///
+    /// 最初に全島評価から観測Nodeを作り、その後に実行assignmentが同じIDを更新する。
+    /// これにより「行動候補に選ばれなかったため、島自体のNodeが消える」ことを防ぐ。
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_operation(
+        &mut self,
+        roadmap_id: VictoryRoadmapId,
+        player_id: PlayerId,
+        turn: u32,
+        island_id: IslandId,
+        purpose: StrategicPurpose,
+        tactical_anchor: GridPosition,
+        objective_properties: Vec<GridPosition>,
+    ) -> StrategicOperationId {
+        let key = (player_id, island_id, operation_scope(purpose));
+        if let Some(operation_id) = self.operation_keys.get(&key).copied() {
+            return operation_id;
+        }
+        self.next_operation_id = self.next_operation_id.saturating_add(1);
+        let operation_id = StrategicOperationId(self.next_operation_id);
+        self.operation_keys.insert(key, operation_id);
+        self.operations.insert(
+            operation_id,
+            StrategicOperation {
+                id: operation_id,
+                roadmap_id,
+                player_id,
+                island_id,
+                purpose,
+                created_turn: turn,
+                last_observed_turn: turn,
+                tactical_anchor,
+                objective_properties,
+                owned_objective_count: 0,
+                node_state: RoadmapNodeState::Locked,
+                phase: OperationPhase::Forming,
+                planned_completion_turn: None,
+                actual_completion_turn: None,
+                assigned_transports: HashSet::new(),
+                assigned_capturers: HashSet::new(),
+                assigned_combat: HashSet::new(),
+                combat_plan_ids: HashSet::new(),
+                planned_suppression_turn: None,
+                execution: StepExecutionTotals::default(),
+                last_step: None,
+                last_progress_turn: None,
+                blocked_reason: None,
+                current_issues: Vec::new(),
+                issue_history: Vec::new(),
+                recovery_history: Vec::new(),
+                replan_count: 0,
+                last_replan_turn: None,
+                active: false,
+            },
+        );
+        if let Some(roadmap) = self.roadmaps.get_mut(&player_id) {
+            roadmap.operation_ids.push(operation_id);
+        }
+        operation_id
+    }
+
+    /// allocatorの実行候補にならない島も、Roadmap上では観測Nodeとして残す。
+    ///
+    /// 観測NodeはEntityを所有せず、未確保ならLocked、全施設を所有していれば
+    /// Securedとなる。実行候補が同じ島に現れた場合は後続の
+    /// `reconcile_assignment` が同じOperation IDをactiveな作戦へ更新する。
+    #[allow(clippy::too_many_arguments)]
+    fn reconcile_observed_island(
+        &mut self,
+        roadmap_id: VictoryRoadmapId,
+        player_id: PlayerId,
+        turn: u32,
+        assessment: &IslandCampaignAssessment,
+        tactical_anchor: GridPosition,
+        objective_properties: Vec<GridPosition>,
+        owned_properties: &HashSet<GridPosition>,
+    ) {
+        let purpose = if assessment.decision == IslandCampaignDecision::Defend {
+            StrategicPurpose::DefendIsland
+        } else {
+            StrategicPurpose::CaptureIsland
+        };
+        let operation_id = self.ensure_operation(
+            roadmap_id,
+            player_id,
+            turn,
+            assessment.island_id,
+            purpose,
+            tactical_anchor,
+            objective_properties.clone(),
+        );
+        let operation = self
+            .operations
+            .get_mut(&operation_id)
+            .expect("作成済み観測Node");
+        operation.purpose = purpose;
+        operation.last_observed_turn = turn;
+        operation.tactical_anchor = tactical_anchor;
+        operation.objective_properties = objective_properties;
+        operation.owned_objective_count = operation
+            .objective_properties
+            .iter()
+            .filter(|position| owned_properties.contains(position))
+            .count();
+        operation.active = false;
+        operation.planned_completion_turn = None;
+        operation.combat_plan_ids.clear();
+        operation.planned_suppression_turn = None;
+        operation.blocked_reason = None;
+        if !operation.objective_properties.is_empty()
+            && operation.owned_objective_count == operation.objective_properties.len()
+        {
+            operation.phase = OperationPhase::Completed;
+            operation.actual_completion_turn.get_or_insert(turn);
+        } else {
+            operation.phase = OperationPhase::Forming;
+            operation.actual_completion_turn = None;
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -655,51 +1079,15 @@ impl VictoryRoadmapRegistry {
         owned_properties: &HashSet<GridPosition>,
         phase: OperationPhase,
     ) -> StrategicOperationId {
-        let key = (player_id, assignment.island_id, operation_scope(purpose));
-        let operation_id = if let Some(id) = self.operation_keys.get(&key).copied() {
-            id
-        } else {
-            self.next_operation_id = self.next_operation_id.saturating_add(1);
-            let id = StrategicOperationId(self.next_operation_id);
-            self.operation_keys.insert(key, id);
-            self.operations.insert(
-                id,
-                StrategicOperation {
-                    id,
-                    roadmap_id,
-                    player_id,
-                    island_id: assignment.island_id,
-                    purpose,
-                    created_turn: turn,
-                    last_observed_turn: turn,
-                    tactical_anchor: assignment.target_position,
-                    objective_properties: objectives.clone(),
-                    owned_objective_count: 0,
-                    phase: OperationPhase::Forming,
-                    planned_completion_turn: None,
-                    actual_completion_turn: None,
-                    assigned_transports: HashSet::new(),
-                    assigned_capturers: HashSet::new(),
-                    assigned_combat: HashSet::new(),
-                    combat_plan_ids: HashSet::new(),
-                    planned_suppression_turn: None,
-                    execution: StepExecutionTotals::default(),
-                    last_step: None,
-                    last_progress_turn: None,
-                    blocked_reason: None,
-                    current_issues: Vec::new(),
-                    issue_history: Vec::new(),
-                    recovery_history: Vec::new(),
-                    replan_count: 0,
-                    last_replan_turn: None,
-                    active: true,
-                },
-            );
-            if let Some(roadmap) = self.roadmaps.get_mut(&player_id) {
-                roadmap.operation_ids.push(id);
-            }
-            id
-        };
+        let operation_id = self.ensure_operation(
+            roadmap_id,
+            player_id,
+            turn,
+            assignment.island_id,
+            purpose,
+            assignment.target_position,
+            objectives.clone(),
+        );
 
         let operation = self
             .operations
@@ -738,6 +1126,237 @@ impl VictoryRoadmapRegistry {
             phase
         };
         operation_id
+    }
+
+    /// 施設所有の変化を、現在portfolioに現れない完了済みNodeにも反映する。
+    ///
+    /// 兵站島を確保した後にportfolioから外れても、そのNodeは後続の前提として
+    /// `Secured` のまま残る。一方で敵に取り返された場合は完了実績を取り消し、
+    /// 当ターンに再提案されていれば `Ready`、されていなければ `Locked` へ戻す。
+    fn refresh_objective_ownership(
+        &mut self,
+        player_id: PlayerId,
+        owned_properties: &HashSet<GridPosition>,
+    ) {
+        for operation in self
+            .operations
+            .values_mut()
+            .filter(|operation| operation.player_id == player_id)
+        {
+            operation.owned_objective_count = operation
+                .objective_properties
+                .iter()
+                .filter(|position| owned_properties.contains(position))
+                .count();
+            let objectives_secured = !operation.objective_properties.is_empty()
+                && operation.owned_objective_count == operation.objective_properties.len();
+            if !objectives_secured && operation.phase == OperationPhase::Completed {
+                operation.phase = OperationPhase::Forming;
+                operation.actual_completion_turn = None;
+            }
+        }
+    }
+
+    /// IslandCampaignと敵首都島の地上DAGを、実際の兵站経路順で接続する。
+    ///
+    /// `V4LogisticsPlan::selected_islands` は自軍側から敵首都側へ並んでいる。各島の
+    /// Regional Operationをその順に結び、最後の兵站島と敵首都島の前段Regional
+    /// Operationを `AssaultCapital` の前提にする。未割当の島はOperationを捏造せず、
+    /// 次回analyzerが公開するまで辺から外す。
+    fn rebuild_dependencies(
+        &mut self,
+        player_id: PlayerId,
+        capital_island: Option<IslandId>,
+        logistics_plan: Option<&crate::ai::v4::logistics_plan::V4LogisticsPlan>,
+    ) {
+        let regional_for = |island_id| {
+            self.operation_keys
+                .get(&(player_id, island_id, StrategicOperationScope::Regional))
+                .copied()
+        };
+        let capital_operation = capital_island.and_then(|island_id| {
+            self.operation_keys
+                .get(&(player_id, island_id, StrategicOperationScope::Capital))
+                .copied()
+        });
+        let mut dependencies = HashSet::new();
+        let mut previous = None;
+        if let Some(plan) = logistics_plan {
+            for island_id in &plan.selected_islands {
+                let Some(current) = regional_for(*island_id) else {
+                    continue;
+                };
+                if let Some(predecessor) = previous
+                    && predecessor != current
+                {
+                    dependencies.insert(RoadmapDependency {
+                        predecessor,
+                        successor: current,
+                        kind: RoadmapDependencyKind::Logistics,
+                    });
+                }
+                previous = Some(current);
+            }
+        }
+        if let (Some(capital_island), Some(capital_operation)) = (capital_island, capital_operation)
+        {
+            if let Some(predecessor) = previous
+                && predecessor != capital_operation
+            {
+                dependencies.insert(RoadmapDependency {
+                    predecessor,
+                    successor: capital_operation,
+                    kind: RoadmapDependencyKind::Logistics,
+                });
+            }
+            if let Some(predecessor) = regional_for(capital_island)
+                && predecessor != capital_operation
+            {
+                dependencies.insert(RoadmapDependency {
+                    predecessor,
+                    successor: capital_operation,
+                    kind: RoadmapDependencyKind::CapitalRoute,
+                });
+            }
+        }
+        let mut dependencies = dependencies.into_iter().collect::<Vec<_>>();
+        dependencies.sort_unstable_by_key(|edge| {
+            (
+                edge.predecessor.0,
+                edge.successor.0,
+                match edge.kind {
+                    RoadmapDependencyKind::Logistics => 0_u8,
+                    RoadmapDependencyKind::CapitalRoute => 1_u8,
+                },
+            )
+        });
+        if let Some(roadmap) = self.roadmaps.get_mut(&player_id) {
+            roadmap.dependencies = dependencies;
+        }
+    }
+
+    /// Operation自身の進捗だけから得られる状態を返す。
+    ///
+    /// 首都作戦の「まだscheduleがない」は、前提Nodeの未解放を意味し得る待機理由で
+    /// あって失敗ではない。実行stepの失敗や到達不能だけを `Blocked` として扱う。
+    fn local_node_state(operation: &StrategicOperation) -> RoadmapNodeState {
+        let objectives_secured = !operation.objective_properties.is_empty()
+            && operation.owned_objective_count == operation.objective_properties.len();
+        if operation.phase == OperationPhase::Completed || objectives_secured {
+            return RoadmapNodeState::Secured;
+        }
+        if !operation.active {
+            return RoadmapNodeState::Locked;
+        }
+        let waiting_for_capital_schedule = operation.purpose == StrategicPurpose::AssaultCapital
+            && operation.phase == OperationPhase::Forming
+            && operation.blocked_reason.as_deref()
+                == Some("no executable capital assault schedule has been selected");
+        if operation.phase == OperationPhase::Blocked
+            || (operation.blocked_reason.is_some() && !waiting_for_capital_schedule)
+        {
+            return RoadmapNodeState::Blocked;
+        }
+        match operation.phase {
+            OperationPhase::Capture => RoadmapNodeState::Capturing,
+            OperationPhase::Suppress => {
+                if !operation.assigned_combat.is_empty()
+                    && operation.planned_suppression_turn.is_some()
+                {
+                    RoadmapNodeState::Dominant
+                } else {
+                    RoadmapNodeState::Contested
+                }
+            }
+            OperationPhase::Forming
+            | OperationPhase::Pickup
+            | OperationPhase::Transit
+            | OperationPhase::Drop
+            | OperationPhase::Hold => RoadmapNodeState::Ready,
+            OperationPhase::Completed | OperationPhase::Blocked => {
+                unreachable!("完了・阻害状態は先に処理済み")
+            }
+        }
+    }
+
+    /// 前提Nodeの状態を適用して、実際に公開する Roadmap Node 状態を更新する。
+    ///
+    /// すべての前提が `Dominant` または `Secured` であるときだけ後続は局地状態を
+    /// 公開できる。分岐の合流は安全側に全前提必須とし、複数前提の意味づけを
+    /// 暗黙に「どれか一つでよい」としない。
+    fn refresh_node_states(&mut self, player_id: PlayerId) {
+        let mut states = self
+            .operations
+            .iter()
+            .filter(|(_, operation)| operation.player_id == player_id)
+            .map(|(id, operation)| (*id, Self::local_node_state(operation)))
+            .collect::<HashMap<_, _>>();
+        let dependencies = self
+            .roadmaps
+            .get(&player_id)
+            .map(|roadmap| roadmap.dependencies.clone())
+            .unwrap_or_default();
+        let mut predecessors = HashMap::<StrategicOperationId, Vec<StrategicOperationId>>::new();
+        for edge in dependencies {
+            predecessors
+                .entry(edge.successor)
+                .or_default()
+                .push(edge.predecessor);
+        }
+        for (successor, requirements) in predecessors {
+            let Some(current) = states.get(&successor).copied() else {
+                continue;
+            };
+            if matches!(
+                current,
+                RoadmapNodeState::Secured | RoadmapNodeState::Blocked
+            ) {
+                continue;
+            }
+            let predecessors_ready = requirements.iter().all(|predecessor| {
+                states.get(predecessor).is_some_and(|state| {
+                    matches!(
+                        state,
+                        RoadmapNodeState::Dominant | RoadmapNodeState::Secured
+                    )
+                })
+            });
+            if !predecessors_ready {
+                states.insert(successor, RoadmapNodeState::Locked);
+            }
+        }
+        for (operation_id, state) in states {
+            if let Some(operation) = self.operations.get_mut(&operation_id) {
+                operation.node_state = state;
+            }
+        }
+    }
+
+    /// 前提未達のNodeを除いた、SquadReconcilerへ渡す当ターンのPortfolioを作る。
+    ///
+    /// analyzerは将来の島作戦を同時に提案できるが、ここでLocked assignmentを落とす
+    /// ことで、前提Nodeが優勢になる前に後続Squadや輸送便が組まれるのを防ぐ。
+    fn approved_portfolio(
+        &self,
+        player_id: PlayerId,
+        enemy_capital: Option<GridPosition>,
+        portfolio: &IslandCampaignPortfolio,
+    ) -> IslandCampaignPortfolio {
+        let assignment_is_unlocked = |assignment: &IslandCampaignAssignment| {
+            let purpose = purpose_for(assignment, enemy_capital);
+            self.operation_keys
+                .get(&(player_id, assignment.island_id, operation_scope(purpose)))
+                .and_then(|operation_id| self.operations.get(operation_id))
+                .is_none_or(|operation| operation.node_state != RoadmapNodeState::Locked)
+        };
+        let mut approved = portfolio.clone();
+        approved
+            .defenses
+            .retain(|assignment| assignment_is_unlocked(assignment));
+        approved
+            .active_offensives
+            .retain(|assignment| assignment_is_unlocked(assignment));
+        approved
     }
 
     fn bind_assignment_entities(
@@ -1681,6 +2300,25 @@ pub(crate) fn reconcile_campaign_roadmap(
     let turn = world
         .get_resource::<MatchState>()
         .map_or(0, |state| state.current_turn_number.0);
+    let (selected_portfolio, candidate_evaluations) = select_strategic_portfolio(portfolio);
+    // analyzerの単一proposalをそのまま受理せず、Roadmapが比較した候補のうち一つだけを
+    // この手番の正本にする。全島assessmentは選択と無関係に保持する。
+    let portfolio = &selected_portfolio;
+    // `selected`が一意で、候補種別・効用が監査可能な値であることをTurnPlan化の境界で
+    // 検証する。候補の詳細は下記Registryに残し、SquadReconcilerは選択済みPortfolioだけを読む。
+    let selected_candidate = candidate_evaluations
+        .iter()
+        .filter(|evaluation| evaluation.selected)
+        .map(|evaluation| (evaluation.kind, evaluation.score))
+        .collect::<Vec<_>>();
+    debug_assert_eq!(selected_candidate.len(), 1);
+    let mut candidate_registry = world
+        .remove_resource::<RoadmapStrategicCandidateRegistry>()
+        .unwrap_or_default();
+    candidate_registry
+        .by_player
+        .insert(player_id, candidate_evaluations);
+    world.insert_resource(candidate_registry);
     let Some(island_map) = world.get_resource::<IslandMap>().cloned() else {
         return;
     };
@@ -1718,6 +2356,10 @@ pub(crate) fn reconcile_campaign_roadmap(
         .get_resource::<V4RollingPlanRegistry>()
         .map(|registry| registry.active_combat_plan_summaries(player_id))
         .unwrap_or_default();
+    let logistics_plan = world
+        .get_resource::<crate::ai::v4::logistics_plan::V4LogisticsPlanRegistry>()
+        .and_then(|registry| registry.plan(player_id))
+        .cloned();
     let deployment_records = world
         .get_resource::<V4DeploymentRegistry>()
         .map(|registry| registry.audit_records(player_id))
@@ -1757,7 +2399,7 @@ pub(crate) fn reconcile_campaign_roadmap(
     });
 
     // 局地portfolioにまだ現れなくても、勝利条件そのものを親計画から消さない。
-    // 実行可能な輸送・掃討・占領scheduleが選ばれるまでは明示的なblocked子作戦とする。
+    // 実行schedule未選択は失敗ではなく、dependencyが満たされるまでLocked/Readyで待つ。
     if let (Some(capital), Some(capital_island)) = (enemy_capital, enemy_capital_island) {
         registry.ensure_capital_objective(
             roadmap_id,
@@ -1768,6 +2410,73 @@ pub(crate) fn reconcile_campaign_roadmap(
             owned_properties.contains(&capital),
         );
     }
+    let assigned_regional_islands = portfolio
+        .defenses
+        .iter()
+        .chain(portfolio.active_offensives.iter())
+        .filter(|assignment| {
+            purpose_for(assignment, enemy_capital) != StrategicPurpose::AssaultCapital
+        })
+        .map(|assignment| assignment.island_id)
+        .collect::<HashSet<_>>();
+    // `portfolio.islands` は作戦候補ではなく全島評価である。ここで全島を観測Nodeへ
+    // 写し、allocatorが今手番にassignmentを作らなかった島もRoadmapから消さない。
+    // 敵首都島は常在AssaultCapital Nodeが担当し、Regional Nodeは実際に前段の
+    // Milestoneが提案されたときだけ同じscopeで追加される。
+    for assessment in &portfolio.islands {
+        if Some(assessment.island_id) == enemy_capital_island
+            || assigned_regional_islands.contains(&assessment.island_id)
+        {
+            continue;
+        }
+        let mut objectives = property_snapshots
+            .iter()
+            .filter(|(position, property)| {
+                property.max_capture_points > 0
+                    && island_map
+                        .get_island_at(position)
+                        .is_some_and(|island| island.id == assessment.island_id)
+            })
+            .map(|(position, _)| *position)
+            .collect::<Vec<_>>();
+        objectives.sort_unstable_by_key(|position| (position.y, position.x));
+        objectives.dedup();
+        let tactical_anchor = objectives.first().copied().or_else(|| {
+            island_map
+                .islands
+                .iter()
+                .find(|island| island.id == assessment.island_id)
+                .and_then(|island| {
+                    let mut tiles = island.tiles.iter().copied().collect::<Vec<_>>();
+                    tiles.sort_unstable_by_key(|position| (position.y, position.x));
+                    tiles.first().copied()
+                })
+        });
+        if let Some(tactical_anchor) = tactical_anchor {
+            registry.reconcile_observed_island(
+                roadmap_id,
+                player_id,
+                turn,
+                assessment,
+                tactical_anchor,
+                objectives,
+                &owned_properties,
+            );
+        }
+    }
+    // 首都親作戦は勝利条件として常在させるが、DAGの先頭未確保区間を取る間は
+    // Regional子作戦が実Entityを所有する。親が島内の全Squadを再束縛すると、
+    // 中間拠点のCombat枠がゼロになり、占領兵だけが敵前で停止する。
+    let capital_has_active_regional_segment = enemy_capital_island.is_some_and(|capital_island| {
+        portfolio
+            .defenses
+            .iter()
+            .chain(portfolio.active_offensives.iter())
+            .any(|assignment| {
+                assignment.island_id == capital_island
+                    && purpose_for(assignment, enemy_capital) != StrategicPurpose::AssaultCapital
+            })
+    });
 
     for assignment in portfolio
         .defenses
@@ -1836,17 +2545,19 @@ pub(crate) fn reconcile_campaign_roadmap(
             positions
         };
         let phase = operation_phase(world, &island_map, assignment, manager, player_id);
+        let expected_plan_kind = rolling_operation_kind(purpose);
         let matching_combat_plans = combat_plan_summaries
             .iter()
             .filter(|plan| {
-                island_map
-                    .get_island_at(&plan.anchor)
-                    .is_some_and(|island| island.id == assignment.island_id)
-                    || plan.objective_properties.iter().any(|position| {
-                        island_map
-                            .get_island_at(position)
-                            .is_some_and(|island| island.id == assignment.island_id)
-                    })
+                plan.kind == expected_plan_kind
+                    && (island_map
+                        .get_island_at(&plan.anchor)
+                        .is_some_and(|island| island.id == assignment.island_id)
+                        || plan.objective_properties.iter().any(|position| {
+                            island_map
+                                .get_island_at(position)
+                                .is_some_and(|island| island.id == assignment.island_id)
+                        }))
             })
             .collect::<Vec<&ActiveCombatPlanSummary>>();
         let local_enemy_count = enemy_positions
@@ -1992,14 +2703,15 @@ pub(crate) fn reconcile_campaign_roadmap(
         let capital_plans = combat_plan_summaries
             .iter()
             .filter(|plan| {
-                island_map
-                    .get_island_at(&plan.anchor)
-                    .is_some_and(|island| island.id == capital_island)
-                    || plan.objective_properties.iter().any(|position| {
-                        island_map
-                            .get_island_at(position)
-                            .is_some_and(|island| island.id == capital_island)
-                    })
+                plan.kind == OperationKind::AssaultCapital
+                    && (island_map
+                        .get_island_at(&plan.anchor)
+                        .is_some_and(|island| island.id == capital_island)
+                        || plan.objective_properties.iter().any(|position| {
+                            island_map
+                                .get_island_at(position)
+                                .is_some_and(|island| island.id == capital_island)
+                        }))
             })
             .collect::<Vec<_>>();
         if let Some(operation) = registry.operations.get_mut(&operation_id) {
@@ -2026,33 +2738,34 @@ pub(crate) fn reconcile_campaign_roadmap(
                     });
             }
         }
-        // 兵站gateが開く前に既存戦力を首都攻略の後続波へ回した場合も、
-        // 局地portfolioと同じくSquadから実Entityを拾う。これがないと毎ターン
-        // Campaign→Reserve→Campaignを循環して、形成済み戦力の予実が分断される。
-        for squad in manager.squads.iter().filter(|squad| {
-            squad.owner_id == Some(player_id) && squad.target_island == Some(capital_island)
-        }) {
-            if let Some(transport) = squad.transport_entity {
-                registry.bind_entity_exclusive(
-                    operation_id,
-                    transport,
-                    OperationEntityRole::Transport,
-                );
-            }
-            for cargo in squad
-                .cargo_entities
-                .iter()
-                .chain(squad.delivered_cargo.iter())
-            {
-                let role = if world
-                    .get::<crate::components::UnitStats>(*cargo)
-                    .is_some_and(|stats| stats.can_capture)
+        if !capital_has_active_regional_segment {
+            // 中間区間が閉じた後は、親作戦がSquadから実Entityを引き継ぐ。これにより
+            // Capitalへ進んだ時点でCampaign→Reserve→Campaignへ分断しない。
+            for squad in manager.squads.iter().filter(|squad| {
+                squad.owner_id == Some(player_id) && squad.target_island == Some(capital_island)
+            }) {
+                if let Some(transport) = squad.transport_entity {
+                    registry.bind_entity_exclusive(
+                        operation_id,
+                        transport,
+                        OperationEntityRole::Transport,
+                    );
+                }
+                for cargo in squad
+                    .cargo_entities
+                    .iter()
+                    .chain(squad.delivered_cargo.iter())
                 {
-                    OperationEntityRole::Capture
-                } else {
-                    OperationEntityRole::Combat
-                };
-                registry.bind_entity_exclusive(operation_id, *cargo, role);
+                    let role = if world
+                        .get::<crate::components::UnitStats>(*cargo)
+                        .is_some_and(|stats| stats.can_capture)
+                    {
+                        OperationEntityRole::Capture
+                    } else {
+                        OperationEntityRole::Combat
+                    };
+                    registry.bind_entity_exclusive(operation_id, *cargo, role);
+                }
             }
         }
     }
@@ -2077,6 +2790,12 @@ pub(crate) fn reconcile_campaign_roadmap(
         registry.bind_entity_exclusive(operation_id, record.entity, OperationEntityRole::Combat);
     }
 
+    // Portfolioから外れた確保済み兵站島も、後続Nodeの前提としては残す。所有権が
+    // 失われた時だけ完了を取り消してLockedへ戻す。
+    registry.refresh_objective_ownership(player_id, &owned_properties);
+    registry.rebuild_dependencies(player_id, enemy_capital_island, logistics_plan.as_ref());
+    registry.refresh_node_states(player_id);
+
     // 完了・撤回済み作戦は履歴として残すが、Entity集合を第二の割当正本にしない。
     registry.release_inactive_assignments(player_id);
 
@@ -2096,6 +2815,7 @@ pub(crate) fn reconcile_campaign_roadmap(
             roadmap.actual_victory_turn.get_or_insert(turn);
         }
     }
+    let approved_portfolio = registry.approved_portfolio(player_id, enemy_capital, portfolio);
     let assigned_campaign_entities = registry
         .operations
         .values()
@@ -2109,6 +2829,58 @@ pub(crate) fn reconcile_campaign_roadmap(
                 .copied()
         })
         .collect::<Vec<_>>();
+    registry.refresh_node_states(player_id);
+    let mut directives = registry
+        .operations
+        .values()
+        .filter(|operation| {
+            operation.player_id == player_id
+                && operation.active
+                && operation.node_state != RoadmapNodeState::Locked
+        })
+        .map(|operation| {
+            let operation_entities = operation
+                .assigned_transports
+                .iter()
+                .chain(operation.assigned_capturers.iter())
+                .chain(operation.assigned_combat.iter())
+                .copied()
+                .collect::<HashSet<_>>();
+            let mut squad_ids = manager
+                .squads
+                .iter()
+                .filter(|squad| squad.owner_id == Some(player_id))
+                .filter(|squad| {
+                    squad
+                        .members
+                        .iter()
+                        .any(|entity| operation_entities.contains(entity))
+                })
+                .map(|squad| squad.id)
+                .collect::<Vec<_>>();
+            squad_ids.sort_unstable_by_key(|squad_id| squad_id.0);
+            squad_ids.dedup();
+            RoadmapOperationDirective {
+                operation_id: operation.id,
+                island_id: operation.island_id,
+                purpose: operation.purpose,
+                node_state: operation.node_state,
+                target: operation.tactical_anchor,
+                squad_ids,
+            }
+        })
+        .collect::<Vec<_>>();
+    directives.sort_unstable_by_key(|directive| directive.operation_id.0);
+    let mut turn_plans = world
+        .remove_resource::<RoadmapTurnPlanRegistry>()
+        .unwrap_or_default();
+    turn_plans.replace(RoadmapTurnPlan {
+        player_id,
+        turn,
+        portfolio: approved_portfolio,
+        directives,
+    });
+    world.insert_resource(turn_plans);
     world.insert_resource(registry);
     if let Some(mut execution) =
         world.get_resource_mut::<crate::ai::v4::campaign_execution::V4CampaignExecutionRegistry>()
@@ -2281,6 +3053,7 @@ mod tests {
                 tactical_anchor: GridPosition { x: 3, y: 3 },
                 objective_properties: vec![GridPosition { x: 3, y: 3 }],
                 owned_objective_count: 0,
+                node_state: RoadmapNodeState::Ready,
                 phase: OperationPhase::Forming,
                 planned_completion_turn: None,
                 actual_completion_turn: None,
@@ -2303,6 +3076,458 @@ mod tests {
         );
         registry.bind_entity_exclusive(operation, entity, role);
         operation
+    }
+
+    fn strategic_assignment(
+        island_id: IslandId,
+        decision: IslandCampaignDecision,
+        shortfall: u32,
+        continued: bool,
+    ) -> IslandCampaignAssignment {
+        IslandCampaignAssignment {
+            island_id,
+            decision,
+            target_position: GridPosition {
+                x: island_id.0,
+                y: 0,
+            },
+            capture_target_positions: Vec::new(),
+            priority_enemy_types: Vec::new(),
+            requirement: crate::ai::island_campaign::IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 0,
+                ground_combat_units: 0,
+                combat_units: 0,
+                total_budget: shortfall,
+            },
+            purchase_shortfall: crate::ai::island_campaign::IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 0,
+                ground_combat_units: 0,
+                combat_units: 0,
+                total_budget: shortfall,
+            },
+            allocated_budget: 0,
+            transport_entities: Vec::new(),
+            capture_entities: Vec::new(),
+            combat_entities: Vec::new(),
+            operation_ready: true,
+            continued_from_existing_squad: continued,
+        }
+    }
+
+    #[test]
+    fn strategy_candidate_search_prunes_to_a_single_best_focus_without_dropping_defense() {
+        let defense = strategic_assignment(IslandId(9), IslandCampaignDecision::Defend, 0, true);
+        let portfolio = IslandCampaignPortfolio {
+            islands: Vec::new(),
+            active_offensives: vec![
+                strategic_assignment(IslandId(1), IslandCampaignDecision::Expand, 100_000, false),
+                strategic_assignment(IslandId(2), IslandCampaignDecision::Assault, 0, true),
+                strategic_assignment(IslandId(3), IslandCampaignDecision::Contest, 100_000, false),
+                // 上位3件だけを分岐対象にする。第4候補は候補爆発を防ぐため除外する。
+                strategic_assignment(IslandId(4), IslandCampaignDecision::Secure, 100_000, false),
+            ],
+            defenses: vec![defense.clone()],
+        };
+
+        let (selected, evaluations) = select_strategic_portfolio(&portfolio);
+
+        assert_eq!(selected.defenses, vec![defense]);
+        assert_eq!(selected.active_offensives.len(), 1);
+        assert_eq!(selected.active_offensives[0].island_id, IslandId(2));
+        assert_eq!(
+            evaluations.len(),
+            7,
+            "実行可能な攻勢があるためHoldを除いた上位3Nodeの候補だけを比較する"
+        );
+        assert_eq!(
+            evaluations
+                .iter()
+                .filter(|evaluation| evaluation.selected)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn node_state_distinguishes_dominance_capture_and_blocked() {
+        let player = PlayerId(1);
+        let combat = Entity::from_raw(42);
+        let mut registry = VictoryRoadmapRegistry::default();
+        let operation = operation_with_entity(
+            &mut registry,
+            player,
+            IslandId(2),
+            combat,
+            OperationEntityRole::Combat,
+        );
+        let current = registry.operations.get_mut(&operation).unwrap();
+        current.phase = OperationPhase::Suppress;
+        current.assigned_combat.insert(combat);
+        current.planned_suppression_turn = Some(3);
+        registry.refresh_node_states(player);
+        assert_eq!(
+            registry.operations[&operation].node_state,
+            RoadmapNodeState::Dominant
+        );
+
+        registry.operations.get_mut(&operation).unwrap().phase = OperationPhase::Capture;
+        registry.refresh_node_states(player);
+        assert_eq!(
+            registry.operations[&operation].node_state,
+            RoadmapNodeState::Capturing
+        );
+
+        let current = registry.operations.get_mut(&operation).unwrap();
+        current.phase = OperationPhase::Blocked;
+        current.blocked_reason = Some("transport destroyed".to_owned());
+        registry.refresh_node_states(player);
+        assert_eq!(
+            registry.operations[&operation].node_state,
+            RoadmapNodeState::Blocked
+        );
+    }
+
+    #[test]
+    fn observed_island_nodes_remain_in_the_roadmap_without_assignments() {
+        let player = PlayerId(1);
+        let mut registry = VictoryRoadmapRegistry::default();
+        let roadmap = registry.ensure_roadmap(player, 1, None, None, 0);
+        let assessment = |island_id, state, decision| IslandCampaignAssessment {
+            island_id,
+            state,
+            decision,
+            state_reason: String::new(),
+            decision_reason: String::new(),
+            pause_cause: None,
+            neutral_properties: 0,
+            friendly_properties: 0,
+            enemy_properties: 0,
+            friendly_combat_units: 0,
+            enemy_combat_units: 0,
+            friendly_arrival_eta: None,
+            enemy_arrival_eta: None,
+            friendly_capture_eta: None,
+            enemy_capture_eta: None,
+            roi_production_sites: 0,
+            transport_eta: None,
+            expansion_payback_turns: None,
+            required_budget: 0,
+            allocated_budget: 0,
+        };
+        let secured = assessment(
+            IslandId(1),
+            crate::ai::island_campaign::IslandCampaignState::Secured,
+            IslandCampaignDecision::Secure,
+        );
+        let pending = assessment(
+            IslandId(2),
+            crate::ai::island_campaign::IslandCampaignState::OpenNeutral,
+            IslandCampaignDecision::Expand,
+        );
+        let secured_anchor = GridPosition { x: 1, y: 1 };
+        let pending_anchor = GridPosition { x: 2, y: 2 };
+        registry.reconcile_observed_island(
+            roadmap,
+            player,
+            1,
+            &secured,
+            secured_anchor,
+            vec![secured_anchor],
+            &HashSet::from([secured_anchor]),
+        );
+        registry.reconcile_observed_island(
+            roadmap,
+            player,
+            1,
+            &pending,
+            pending_anchor,
+            vec![pending_anchor],
+            &HashSet::new(),
+        );
+        registry.refresh_node_states(player);
+
+        let secured_operation = registry
+            .operation_keys
+            .get(&(player, IslandId(1), StrategicOperationScope::Regional))
+            .copied()
+            .expect("確保済み島の観測Node");
+        let pending_operation = registry
+            .operation_keys
+            .get(&(player, IslandId(2), StrategicOperationScope::Regional))
+            .copied()
+            .expect("未着手島の観測Node");
+        assert!(!registry.operations[&secured_operation].active);
+        assert_eq!(
+            registry.operations[&secured_operation].node_state,
+            RoadmapNodeState::Secured
+        );
+        assert!(!registry.operations[&pending_operation].active);
+        assert_eq!(
+            registry.operations[&pending_operation].node_state,
+            RoadmapNodeState::Locked
+        );
+    }
+
+    #[test]
+    fn successor_stays_locked_until_every_predecessor_is_dominant_or_secured() {
+        let player = PlayerId(1);
+        let combat = Entity::from_raw(42);
+        let mut registry = VictoryRoadmapRegistry::default();
+        let predecessor = operation_with_entity(
+            &mut registry,
+            player,
+            IslandId(1),
+            combat,
+            OperationEntityRole::Combat,
+        );
+        let mut second_predecessor = registry.operations[&predecessor].clone();
+        second_predecessor.id = StrategicOperationId(1_000);
+        second_predecessor.island_id = IslandId(2);
+        second_predecessor.assigned_combat.clear();
+        second_predecessor.phase = OperationPhase::Forming;
+        let second_predecessor_id = second_predecessor.id;
+        registry
+            .operations
+            .insert(second_predecessor_id, second_predecessor);
+        let mut successor = registry.operations[&predecessor].clone();
+        successor.id = StrategicOperationId(1_001);
+        successor.island_id = IslandId(3);
+        successor.assigned_combat.clear();
+        successor.phase = OperationPhase::Forming;
+        successor.blocked_reason = None;
+        let successor_id = successor.id;
+        registry.operations.insert(successor_id, successor);
+        registry.roadmaps.get_mut(&player).unwrap().dependencies = vec![
+            RoadmapDependency {
+                predecessor,
+                successor: successor_id,
+                kind: RoadmapDependencyKind::Logistics,
+            },
+            RoadmapDependency {
+                predecessor: second_predecessor_id,
+                successor: successor_id,
+                kind: RoadmapDependencyKind::Logistics,
+            },
+        ];
+
+        registry.refresh_node_states(player);
+        assert_eq!(
+            registry.operations[&successor_id].node_state,
+            RoadmapNodeState::Locked
+        );
+
+        let first = registry.operations.get_mut(&predecessor).unwrap();
+        first.phase = OperationPhase::Suppress;
+        first.assigned_combat.insert(combat);
+        first.planned_suppression_turn = Some(2);
+        registry.refresh_node_states(player);
+        assert_eq!(
+            registry.operations[&successor_id].node_state,
+            RoadmapNodeState::Locked,
+            "合流Nodeは片方の前提だけで解放しない"
+        );
+
+        registry
+            .operations
+            .get_mut(&second_predecessor_id)
+            .unwrap()
+            .phase = OperationPhase::Completed;
+        registry.refresh_node_states(player);
+        assert_eq!(
+            registry.operations[&successor_id].node_state,
+            RoadmapNodeState::Ready
+        );
+    }
+
+    #[test]
+    fn locked_operation_is_not_projected_to_the_squad_turn_plan() {
+        let player = PlayerId(1);
+        let island = IslandId(2);
+        let mut registry = VictoryRoadmapRegistry::default();
+        let operation = operation_with_entity(
+            &mut registry,
+            player,
+            island,
+            Entity::from_raw(42),
+            OperationEntityRole::Capture,
+        );
+        registry.operation_keys.insert(
+            (player, island, StrategicOperationScope::Regional),
+            operation,
+        );
+        let assignment = IslandCampaignAssignment {
+            island_id: island,
+            decision: IslandCampaignDecision::Expand,
+            target_position: GridPosition { x: 3, y: 3 },
+            capture_target_positions: vec![GridPosition { x: 3, y: 3 }],
+            priority_enemy_types: Vec::new(),
+            requirement: crate::ai::island_campaign::IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 1,
+                ground_combat_units: 0,
+                combat_units: 0,
+                total_budget: 1_000,
+            },
+            purchase_shortfall: crate::ai::island_campaign::IslandCampaignRequirement {
+                preferred_transport: None,
+                transport_slots: 0,
+                capture_units: 0,
+                ground_combat_units: 0,
+                combat_units: 0,
+                total_budget: 0,
+            },
+            allocated_budget: 1_000,
+            transport_entities: Vec::new(),
+            capture_entities: Vec::new(),
+            combat_entities: Vec::new(),
+            operation_ready: true,
+            continued_from_existing_squad: false,
+        };
+        let portfolio = IslandCampaignPortfolio {
+            islands: Vec::new(),
+            active_offensives: vec![assignment],
+            defenses: Vec::new(),
+        };
+
+        registry.operations.get_mut(&operation).unwrap().node_state = RoadmapNodeState::Locked;
+        assert!(
+            registry
+                .approved_portfolio(player, None, &portfolio)
+                .active_offensives
+                .is_empty()
+        );
+
+        registry.operations.get_mut(&operation).unwrap().node_state = RoadmapNodeState::Ready;
+        assert_eq!(
+            registry
+                .approved_portfolio(player, None, &portfolio)
+                .active_offensives
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn logistics_route_and_capital_segment_create_deterministic_dependencies() {
+        let player = PlayerId(1);
+        let mut registry = VictoryRoadmapRegistry::default();
+        let first = operation_with_entity(
+            &mut registry,
+            player,
+            IslandId(1),
+            Entity::from_raw(41),
+            OperationEntityRole::Combat,
+        );
+        let mut second_operation = registry.operations[&first].clone();
+        second_operation.id = StrategicOperationId(1_000);
+        second_operation.island_id = IslandId(2);
+        let second = second_operation.id;
+        registry.operations.insert(second, second_operation);
+        let mut capital_regional_operation = registry.operations[&first].clone();
+        capital_regional_operation.id = StrategicOperationId(1_001);
+        capital_regional_operation.island_id = IslandId(3);
+        let capital_regional = capital_regional_operation.id;
+        registry
+            .operations
+            .insert(capital_regional, capital_regional_operation);
+        let mut capital_operation = registry.operations[&first].clone();
+        capital_operation.id = StrategicOperationId(1_002);
+        capital_operation.island_id = IslandId(3);
+        capital_operation.purpose = StrategicPurpose::AssaultCapital;
+        let capital = capital_operation.id;
+        registry.operations.insert(capital, capital_operation);
+        registry.operation_keys.extend([
+            (
+                (player, IslandId(1), StrategicOperationScope::Regional),
+                first,
+            ),
+            (
+                (player, IslandId(2), StrategicOperationScope::Regional),
+                second,
+            ),
+            (
+                (player, IslandId(3), StrategicOperationScope::Regional),
+                capital_regional,
+            ),
+            (
+                (player, IslandId(3), StrategicOperationScope::Capital),
+                capital,
+            ),
+        ]);
+        let logistics_plan = crate::ai::v4::logistics_plan::V4LogisticsPlan {
+            plan_id: 1,
+            player_id: player,
+            created_turn: 1,
+            revised_turn: 1,
+            last_observed_turn: 1,
+            revision: 0,
+            route_islands: vec![IslandId(1), IslandId(2)],
+            selected_islands: vec![IslandId(1), IslandId(2)],
+            stages: Vec::new(),
+            direct_metrics: Default::default(),
+            selected_metrics: Default::default(),
+            current_forecast_metrics: Default::default(),
+            replan_reason: crate::ai::v4::logistics_plan::LogisticsReplanReason::InitialSelection,
+        };
+
+        registry.rebuild_dependencies(player, Some(IslandId(3)), Some(&logistics_plan));
+
+        assert_eq!(
+            registry.roadmap(player).unwrap().dependencies,
+            vec![
+                RoadmapDependency {
+                    predecessor: first,
+                    successor: second,
+                    kind: RoadmapDependencyKind::Logistics,
+                },
+                RoadmapDependency {
+                    predecessor: second,
+                    successor: capital,
+                    kind: RoadmapDependencyKind::Logistics,
+                },
+                RoadmapDependency {
+                    predecessor: capital_regional,
+                    successor: capital,
+                    kind: RoadmapDependencyKind::CapitalRoute,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn turn_plan_rejects_squad_shared_by_multiple_operations() {
+        let player = PlayerId(1);
+        let squad = crate::ai::squad::SquadId(7);
+        let plan = RoadmapTurnPlan {
+            player_id: player,
+            turn: 1,
+            portfolio: IslandCampaignPortfolio::default(),
+            directives: vec![
+                RoadmapOperationDirective {
+                    operation_id: StrategicOperationId(1),
+                    island_id: IslandId(1),
+                    purpose: StrategicPurpose::CaptureIsland,
+                    node_state: RoadmapNodeState::Ready,
+                    target: GridPosition { x: 1, y: 1 },
+                    squad_ids: vec![squad],
+                },
+                RoadmapOperationDirective {
+                    operation_id: StrategicOperationId(2),
+                    island_id: IslandId(2),
+                    purpose: StrategicPurpose::DefendIsland,
+                    node_state: RoadmapNodeState::Ready,
+                    target: GridPosition { x: 2, y: 2 },
+                    squad_ids: vec![squad],
+                },
+            ],
+        };
+
+        assert!(!plan.is_consistent());
     }
 
     #[test]

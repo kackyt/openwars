@@ -142,8 +142,30 @@ pub struct TransportSquadSnapshot {
     pub x: Option<usize>,
     pub y: Option<usize>,
     pub target_island_id: Option<usize>,
+    /// 輸送作戦が指定する到着後の目標座標。島だけでは降車地点の妥当性を判定できない。
+    pub target_x: Option<usize>,
+    pub target_y: Option<usize>,
+    /// Pickup中の輸送役が向かう合流地点。空走がcargo回収なのか誤った前進なのかを区別する。
+    pub pickup_x: Option<usize>,
+    pub pickup_y: Option<usize>,
+    /// Transit / Drop で最後に選ばれたcargoの降車先。
+    pub drop_x: Option<usize>,
+    pub drop_y: Option<usize>,
+    /// 積載済みでも兵站gate待ちなのか、実際にTransitできる状態なのかを区別する。
+    pub departure_authorized: bool,
+    pub allow_partial_departure: bool,
     pub planned_cargo_ids: Vec<u64>,
+    /// 計画に含まれるcargoの現在座標。輸送役だけが移動している事実を検証する。
+    pub planned_cargo_positions: Vec<TransportCargoPositionSnapshot>,
     pub loaded_cargo_ids: Vec<u64>,
+    pub delivered_cargo_ids: Vec<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TransportCargoPositionSnapshot {
+    pub unit_id: u64,
+    pub x: Option<usize>,
+    pub y: Option<usize>,
 }
 
 /// 遊兵1体分の記録。分類は排他ではない（actionable は no_mission / mission_stalled の上位集合）。
@@ -214,7 +236,7 @@ pub struct ProductionStepSnapshot {
     pub deficit_before: f32,
     pub deficit_after: f32,
     pub remaining_funds_before: u32,
-    /// "produced" | "slot_cleared" | "deferred" | "reserved"
+    /// "produced" | "immediate_reinforcement" | "slot_cleared" | "deferred" | "reserved"
     pub decision: String,
     pub unit_type: Option<UnitType>,
     pub cost: Option<u32>,
@@ -267,9 +289,21 @@ pub struct ProductionPlanSnapshot {
     pub reserved_funds: u32,
     /// どの作戦にも帰属していない現金
     pub uncommitted_funds: u32,
+    pub enemy_production_forecast: EnemyProductionForecastSnapshot,
     pub operations: Vec<ProductionOperationSnapshot>,
     pub steps: Vec<ProductionStepSnapshot>,
     pub rolling_combat_plans: Vec<RollingCombatPlanSnapshot>,
+}
+
+/// 敵の実生産履歴に基づく次手番予測と、既済予測の平均絶対誤差。
+#[derive(Debug, Serialize)]
+pub struct EnemyProductionForecastSnapshot {
+    pub expected_units_next_turn: u32,
+    pub expected_cost_next_turn: u32,
+    pub dominant_unit_type: Option<UnitType>,
+    pub evaluated_samples: u32,
+    pub mean_absolute_unit_error: u32,
+    pub mean_absolute_cost_error: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -1090,6 +1124,16 @@ pub fn snapshot_production_plan_for_player(
                     cost,
                     facility,
                 } => ("produced", Some(*unit_type), Some(*cost), Some(*facility)),
+                ProductionDecision::ProducedImmediateReinforcement {
+                    unit_type,
+                    cost,
+                    facility,
+                } => (
+                    "immediate_reinforcement",
+                    Some(*unit_type),
+                    Some(*cost),
+                    Some(*facility),
+                ),
                 ProductionDecision::SlotCleared => ("slot_cleared", None, None, None),
                 ProductionDecision::Deferred { unit_type, cost } => {
                     ("deferred", Some(*unit_type), Some(*cost), None)
@@ -1182,6 +1226,14 @@ pub fn snapshot_production_plan_for_player(
         leftover_funds: plan.leftover_funds,
         reserved_funds: plan.reserved_funds,
         uncommitted_funds: plan.uncommitted_funds,
+        enemy_production_forecast: EnemyProductionForecastSnapshot {
+            expected_units_next_turn: plan.enemy_production_forecast.expected_units_next_turn,
+            expected_cost_next_turn: plan.enemy_production_forecast.expected_cost_next_turn,
+            dominant_unit_type: plan.enemy_production_forecast.dominant_unit_type,
+            evaluated_samples: plan.enemy_production_forecast.evaluated_samples,
+            mean_absolute_unit_error: plan.enemy_production_forecast.mean_absolute_unit_error,
+            mean_absolute_cost_error: plan.enemy_production_forecast.mean_absolute_cost_error,
+        },
         operations,
         steps,
         rolling_combat_plans,
@@ -1577,6 +1629,19 @@ pub fn snapshot_transport_squads(world: &World) -> Vec<TransportSquadSnapshot> {
             .map(|entity| entity.to_bits())
             .collect();
         planned_cargo_ids.sort_unstable();
+        let mut planned_cargo_positions: Vec<_> = squad
+            .cargo_entities
+            .iter()
+            .map(|entity| {
+                let position = world.get::<GridPosition>(*entity).copied();
+                TransportCargoPositionSnapshot {
+                    unit_id: entity.to_bits(),
+                    x: position.map(|position| position.x),
+                    y: position.map(|position| position.y),
+                }
+            })
+            .collect();
+        planned_cargo_positions.sort_by_key(|cargo| cargo.unit_id);
         let mut loaded_cargo_ids: Vec<_> = world
             .get::<CargoCapacity>(transport)
             .map(|capacity| {
@@ -1596,8 +1661,22 @@ pub fn snapshot_transport_squads(world: &World) -> Vec<TransportSquadSnapshot> {
             x: position.map(|position| position.x),
             y: position.map(|position| position.y),
             target_island_id: squad.target_island.map(|island| island.0),
+            target_x: squad.target.map(|position| position.x),
+            target_y: squad.target.map(|position| position.y),
+            pickup_x: squad.pickup_position.map(|position| position.x),
+            pickup_y: squad.pickup_position.map(|position| position.y),
+            drop_x: squad.drop_position.map(|position| position.x),
+            drop_y: squad.drop_position.map(|position| position.y),
+            departure_authorized: squad.departure_authorized,
+            allow_partial_departure: squad.allow_partial_departure,
             planned_cargo_ids,
+            planned_cargo_positions,
             loaded_cargo_ids,
+            delivered_cargo_ids: squad
+                .delivered_cargo
+                .iter()
+                .map(|entity| entity.to_bits())
+                .collect(),
         });
     }
     snapshots.sort_by_key(|snapshot| snapshot.squad_id);

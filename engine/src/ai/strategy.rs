@@ -227,7 +227,9 @@ fn analyze_strategy_internal(
             crate::resources::master_data::MasterDataRegistry::load().unwrap_or_default()
         });
     let map = world.resource::<crate::resources::Map>().clone();
-    let is_v3 = crate::ai::resolve_player_ai_version(world, player_id).uses_v3_tactics();
+    let ai_version = crate::ai::resolve_player_ai_version(world, player_id);
+    let is_v3 = ai_version.uses_v3_tactics();
+    let is_v4 = ai_version.uses_operation_driven_production();
     if is_v3 {
         if let Some(cached) = cached_campaign {
             strategy.campaign_portfolio = cached;
@@ -238,6 +240,17 @@ fn analyze_strategy_internal(
             } else {
                 analyze_island_campaign_excluding(world, player_id, reserved_entities)
             };
+            if is_v4 {
+                // ルートDAGを先に盤面から構築し、生産が参照するcampaign portfolioにも
+                // 次に確保すべき区間の施設列を反映する。Squad計画後の差し替えでは
+                // 生産済みの増援を別の入口へ振り向けられないため、ここが正本となる。
+                crate::ai::v4::prepare_capital_route_topologies(world, player_id);
+                crate::ai::v4::refine_same_land_route_milestones(
+                    world,
+                    player_id,
+                    &mut strategy.campaign_portfolio,
+                );
+            }
             // 診断Resourceは意思決定に戻さず、最後の分析結果だけをプレイヤー別に上書きする。
             if let Some(mut diagnostics) = world.get_resource_mut::<IslandCampaignDiagnostics>() {
                 diagnostics

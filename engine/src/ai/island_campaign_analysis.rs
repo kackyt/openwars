@@ -2,8 +2,8 @@ use crate::ai::island_campaign::{
     CampaignResourcePool, CampaignSustainmentCoverage, CampaignSustainmentTargets,
     CampaignTransportBlueprint, CampaignUnitCandidate, ExistingCampaignOperation,
     IslandCampaignCandidate, IslandCampaignDecision, IslandCampaignFacts, IslandCampaignPortfolio,
-    IslandCampaignRequirement, IslandCampaignState, allocate_campaign_portfolio, assess_island,
-    campaign_unit_type_rank, promote_logistics_prerequisite,
+    IslandCampaignRequirement, IslandCampaignState, allocate_campaign_portfolio_with_assessments,
+    assess_island, campaign_unit_type_rank, promote_logistics_prerequisite,
 };
 use crate::ai::islands::{Island, IslandId, IslandMap};
 use crate::ai::squad::{MissionPhase, MissionType, SquadManager, TransportPhase};
@@ -1474,6 +1474,12 @@ fn requirement_for_assessment(
         }
         IslandCampaignState::Contested if contested_is_competitive(facts) => {
             let capture_budget = expedition_capture_units.saturating_mul(1_000);
+            // `Contest`は占領速度でまだ間に合うという判定であり、敵がいないという
+            // 意味ではない。占領要員だけを割り当てると、DAGの次区間に敵戦闘部隊が
+            // 残っている場合に歩兵だけが詰まり、首都作戦の前段そのものが停止する。
+            // 必要な実際の編成・購入数は下流の時系列Combat Planが盤面の交戦・到達
+            // 時間・損耗で決めるため、ここでは観測済み敵戦闘数を護衛枠として渡す。
+            let combat_units = facts.enemy_combat_units;
             assessment.decision = IslandCampaignDecision::Contest;
             assessment.decision_reason =
                 "占領競争の時間内に介入できるため作戦を継続する".to_owned();
@@ -1482,7 +1488,7 @@ fn requirement_for_assessment(
                 transport_slots: 0,
                 capture_units: expedition_capture_units,
                 ground_combat_units: 0,
-                combat_units: 0,
+                combat_units,
                 total_budget: capture_budget,
             }
         }
@@ -1743,6 +1749,7 @@ fn producible_campaign_transports(
     blueprints
 }
 
+#[allow(clippy::too_many_arguments)]
 fn candidate_target_position(
     map: &Map,
     registry: &MasterDataRegistry,
@@ -1750,6 +1757,7 @@ fn candidate_target_position(
     properties: &[PropertySnapshot],
     units: &[UnitSnapshot],
     player_id: PlayerId,
+    decision: IslandCampaignDecision,
     existing_operation: Option<&ExistingCampaignOperation>,
 ) -> Option<GridPosition> {
     let origins = capture_front_origins(island, properties, units, player_id, existing_operation);
@@ -1770,6 +1778,30 @@ fn candidate_target_position(
     targets.sort_unstable_by_key(|position| target_priority(*position));
     let nearest = targets.first().copied();
 
+    // 防衛作戦のアンカーは、奪取対象ではなく守るべき自軍施設である。敵が航空機だけで
+    // 島外から接近している場合でも、候補自体を失うとThreatened島の防衛編成が作れない。
+    if decision == IslandCampaignDecision::Defend {
+        let mut defensive_targets = properties
+            .iter()
+            .filter(|snapshot| island.tiles.contains(&snapshot.position))
+            .filter(|snapshot| {
+                snapshot.property.max_capture_points > 0
+                    && snapshot.property.owner_id == Some(player_id)
+            })
+            .map(|snapshot| snapshot.position)
+            .collect::<Vec<_>>();
+        defensive_targets.sort_unstable_by_key(|position| target_priority(*position));
+        defensive_targets.dedup();
+        if let Some(operation) = existing_operation
+            && defensive_targets.contains(&operation.target_position)
+        {
+            return Some(operation.target_position);
+        }
+        if let Some(target) = defensive_targets.first().copied() {
+            return Some(target);
+        }
+    }
+
     // 進行中目標も無条件には固定しない。より近い前線より2手以上遠くなった目標は
     // 敵の再占領や担当損耗で前提が崩れたものとして、現在の最短前線へ戻す。
     if let (Some(operation), Some(nearest)) = (existing_operation, nearest)
@@ -1783,7 +1815,41 @@ fn candidate_target_position(
             return Some(operation.target_position);
         }
     }
-    nearest.or_else(|| sorted_island_tiles(island).first().copied())
+    // 未所有の施設がなくなった島へ、任意の島タイルを輸送目標としてはいけない。
+    // とくに島の先頭タイルが浅瀬だと、揚陸艇はcargoを降ろせない浅瀬まで進んで
+    // Drop候補を失う。継続する必要があるのは、実際に残る地上敵への対処だけである。
+    let mut ground_enemy_targets = units
+        .iter()
+        .filter(|unit| unit.faction != player_id && unit.health.current > 0)
+        .filter(|unit| unit.transporting.is_none())
+        .filter(|unit| island.tiles.contains(&unit.position))
+        .filter(|unit| {
+            !matches!(
+                unit.stats.movement_type,
+                MovementType::Air | MovementType::Ship
+            )
+        })
+        // 輸送cargoが上陸できない浅瀬などを、敵の位置だけを理由に目的地へしない。
+        .filter(|unit| {
+            map.get_terrain(unit.position.x, unit.position.y)
+                .and_then(|terrain| {
+                    get_valid_movement_cost(registry, MovementType::Infantry, terrain)
+                })
+                .is_some()
+        })
+        .map(|unit| unit.position)
+        .collect::<Vec<_>>();
+    ground_enemy_targets.sort_unstable_by_key(|position| target_priority(*position));
+    ground_enemy_targets.dedup();
+
+    nearest.or_else(|| {
+        // 進行中の作戦も、現在の地上敵を指している場合だけ継続する。既に消えた
+        // 施設や任意タイルを保持すると、輸送隊だけが残るゾンビ作戦になる。
+        existing_operation
+            .filter(|operation| ground_enemy_targets.contains(&operation.target_position))
+            .map(|operation| operation.target_position)
+            .or_else(|| ground_enemy_targets.first().copied())
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2293,9 +2359,13 @@ pub fn analyze_island_campaign_excluding(
         .collect();
     let mut islands = island_map.islands.clone();
     islands.sort_by_key(|island| island.id.0);
+    let uses_operation_driven_production =
+        crate::ai::resolve_player_ai_version(world, player_id).uses_operation_driven_production();
     // 島ごとの候補構築は同じ盤面snapshotを読むだけで互いに独立している。
     // nativeでは並列化し、IslandId順の結果を維持することでV3/V4の判断順を変えない。
-    let mut candidates = crate::ai::deterministic_parallel::map_ordered(islands, |island| {
+    // 評価と実行候補は別物である。前者は全島の状態をRoadmapと診断へ渡し、後者だけを
+    // allocatorへ渡す。目標がない島を候補から外しても、評価を消してはならない。
+    let evaluated_islands = crate::ai::deterministic_parallel::map_ordered(islands, |island| {
         let island_facts = facts_by_island.get(&island.id).copied()?;
         let mut assessment = assess_island(island_facts);
         // 陸塊が1つだけでも島嶼mapと同じ継続campaignとして扱う。違いは
@@ -2381,8 +2451,12 @@ pub fn analyze_island_campaign_excluding(
             &properties,
             &units,
             player_id,
+            assessment.decision,
             existing_operation.as_ref(),
-        )?;
+        );
+        let Some(target_position) = target_position else {
+            return Some((assessment, None));
+        };
         let capture_target_positions = candidate_capture_target_positions(
             &map,
             &registry,
@@ -2420,31 +2494,40 @@ pub fn analyze_island_campaign_excluding(
         } else {
             sustainment_targets(&island, &properties, player_id)
         };
-        Some(IslandCampaignCandidate {
-            assessment,
-            target_position,
-            capture_target_positions,
-            priority_enemy_types,
-            roi_production_sites: island_facts.roi_production_sites,
-            transport_eta: island_facts.transport_eta,
-            ground_sustainment_sites,
-            air_sustainment_sites,
-            sea_sustainment_sites,
-            sustainment_targets,
-            island_income_per_turn: island_facts.island_income_per_turn,
-            logistics_prerequisite: false,
-            logistics_priority_rank: None,
-            requirement,
-            assault_transport_types,
-            producible_transports: producible_transports.clone(),
-            existing_operation,
-        })
+        Some((
+            assessment.clone(),
+            Some(IslandCampaignCandidate {
+                assessment,
+                target_position,
+                capture_target_positions,
+                priority_enemy_types,
+                roi_production_sites: island_facts.roi_production_sites,
+                transport_eta: island_facts.transport_eta,
+                ground_sustainment_sites,
+                air_sustainment_sites,
+                sea_sustainment_sites,
+                sustainment_targets,
+                island_income_per_turn: island_facts.island_income_per_turn,
+                logistics_prerequisite: false,
+                logistics_priority_rank: None,
+                requirement,
+                assault_transport_types,
+                producible_transports: producible_transports.clone(),
+                existing_operation,
+            }),
+        ))
     })
     .into_iter()
     .flatten()
     .collect::<Vec<_>>();
-    let uses_operation_driven_production =
-        crate::ai::resolve_player_ai_version(world, player_id).uses_operation_driven_production();
+    let assessments = evaluated_islands
+        .iter()
+        .map(|(assessment, _)| assessment.clone())
+        .collect::<Vec<_>>();
+    let mut candidates = evaluated_islands
+        .into_iter()
+        .filter_map(|(_, candidate)| candidate)
+        .collect::<Vec<_>>();
     let mut capital_launch_gate = None;
     if uses_operation_driven_production {
         let turn = world
@@ -2492,7 +2575,7 @@ pub fn analyze_island_campaign_excluding(
             home_position,
         );
     }
-    let mut portfolio = allocate_campaign_portfolio(candidates, pool);
+    let mut portfolio = allocate_campaign_portfolio_with_assessments(candidates, pool, assessments);
     if let Some((capital_island, logistics_ready, combat_plan_ready)) = capital_launch_gate {
         gate_capital_assault_launch(
             &mut portfolio,
@@ -2543,6 +2626,7 @@ mod tests {
             &left_properties,
             &[],
             player,
+            IslandCampaignDecision::Assault,
             None,
         );
         assert_eq!(left_target, Some(GridPosition { x: 2, y: 0 }));
@@ -2559,6 +2643,7 @@ mod tests {
             &right_properties,
             &[],
             player,
+            IslandCampaignDecision::Assault,
             None,
         );
         assert_eq!(right_target, Some(GridPosition { x: 8, y: 0 }));
@@ -2574,6 +2659,69 @@ mod tests {
                 None,
             ),
             vec![GridPosition { x: 8, y: 0 }]
+        );
+    }
+
+    #[test]
+    fn island_without_open_property_targets_only_a_live_ground_enemy() {
+        let master_data = MasterDataRegistry::load().expect("master data should load");
+        let player = PlayerId(1);
+        let enemy = PlayerId(2);
+        let mut map = Map::new(4, 1, Terrain::Sea, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::City).unwrap();
+        map.set_terrain(1, 0, Terrain::Shoal).unwrap();
+        map.set_terrain(2, 0, Terrain::Plains).unwrap();
+        let island = IslandMap::analyze(&map).islands.remove(0);
+        let properties = vec![PropertySnapshot {
+            position: GridPosition { x: 0, y: 0 },
+            property: Property::new(Terrain::City, Some(player), 200),
+        }];
+
+        // 未所有施設も地上敵もない島は、座標順で選ばれるShoalへ輸送してはならない。
+        assert_eq!(
+            candidate_target_position(
+                &map,
+                &master_data,
+                &island,
+                &properties,
+                &[],
+                player,
+                IslandCampaignDecision::Secure,
+                None,
+            ),
+            None
+        );
+
+        let enemy_position = GridPosition { x: 2, y: 0 };
+        let units = vec![UnitSnapshot {
+            entity: Entity::from_raw(42),
+            faction: enemy,
+            position: enemy_position,
+            stats: UnitStats {
+                movement_type: MovementType::Infantry,
+                ..UnitStats::mock()
+            },
+            health: Health {
+                current: 100,
+                max: 100,
+            },
+            fuel: None,
+            transporting: None,
+            free_cargo_slots: 0,
+            loaded_cargo_entities: Vec::new(),
+        }];
+        assert_eq!(
+            candidate_target_position(
+                &map,
+                &master_data,
+                &island,
+                &properties,
+                &units,
+                player,
+                IslandCampaignDecision::Assault,
+                None,
+            ),
+            Some(enemy_position)
         );
     }
 
@@ -2634,6 +2782,7 @@ mod tests {
                 &properties,
                 &units,
                 player,
+                IslandCampaignDecision::Secure,
                 Some(&operation),
             ),
             Some(GridPosition { x: 8, y: 0 })
@@ -2938,6 +3087,19 @@ mod tests {
         );
         assert!(portfolio.active_offensives.len() <= 3);
         assert!(portfolio.defenses.is_empty());
+
+        // V4も同じ全島評価をRoadmapの入力に使う。実行候補がないSecured/Ignored島を
+        // 生産・作戦駆動の有無で診断から消してはならない。
+        let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
+        settings.set_version(player, crate::ai::ai_version::AiVersion::V4);
+        world.insert_resource(settings);
+        let v4_portfolio = analyze_island_campaign(&mut world, player);
+        let v4_states: Vec<_> = v4_portfolio
+            .islands
+            .iter()
+            .map(|assessment| (assessment.island_id, assessment.state))
+            .collect();
+        assert_eq!(v4_states, states);
     }
 
     #[test]
@@ -4224,6 +4386,7 @@ mod tests {
         let contest_requirement = requirement_for_assessment(&secured_facts, &mut contest);
         assert_eq!(contest.decision, IslandCampaignDecision::Contest);
         assert_eq!(contest_requirement.capture_units, 3);
+        assert_eq!(contest_requirement.combat_units, 2);
         assert_eq!(contest_requirement.total_budget, 3_000);
     }
 

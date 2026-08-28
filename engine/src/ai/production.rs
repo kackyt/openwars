@@ -27,6 +27,7 @@ use super::strategy::GamePhase;
 enum CampaignProductionRequirement {
     HeavyTransport,
     LightTransport,
+    GroundCombat,
     Capture,
     Combat,
 }
@@ -319,6 +320,10 @@ fn remaining_campaign_requirements(
     if shortfall.light_transport_slots > 0 {
         requirements.push(CampaignProductionRequirement::LightTransport);
     }
+    if shortfall.ground_combat_units > 0 {
+        // 地形上の突破未達だけを表す構造要求。敵数から固定台数を積むCombatとは分ける。
+        requirements.push(CampaignProductionRequirement::GroundCombat);
+    }
     if shortfall.capture_units > 0 {
         requirements.push(CampaignProductionRequirement::Capture);
     }
@@ -340,6 +345,12 @@ fn campaign_candidate_matches(
         }
         CampaignProductionRequirement::LightTransport => {
             unit_type == UnitType::TransportHelicopter && stats.max_cargo > 0
+        }
+        CampaignProductionRequirement::GroundCombat => {
+            matches!(
+                unit_type,
+                UnitType::Tank | UnitType::MdTank | UnitType::TankZ
+            ) && stats.movement_type == MovementType::Tank
         }
         CampaignProductionRequirement::Capture => stats.can_capture,
         CampaignProductionRequirement::Combat => {
@@ -521,6 +532,12 @@ fn consume_campaign_candidate(
                 .light_transport_slots
                 .saturating_sub(stats.max_cargo);
         }
+        CampaignProductionRequirement::GroundCombat => {
+            // 突破用のTankも通常のCombat一体として使える。同じ購入を次の
+            // Combat枠で再計上すると、構造要求だけで二重生産になってしまう。
+            shortfall.ground_combat_units = shortfall.ground_combat_units.saturating_sub(1);
+            shortfall.combat_units = shortfall.combat_units.saturating_sub(1);
+        }
         CampaignProductionRequirement::Capture => {
             shortfall.capture_units = shortfall.capture_units.saturating_sub(1);
         }
@@ -617,7 +634,11 @@ fn plan_campaign_shortfall_production_with_damage(
                             // 「後で何かが運ぶ」と見込まず、施設から作戦地点へ自力到達
                             // できる候補だけを許す。渡洋支援は航空・艦船、または既に
                             // campaignへ割り当て済みの輸送可能戦力が担当する。
-                            || (requirement == CampaignProductionRequirement::Combat
+                            || (matches!(
+                                requirement,
+                                CampaignProductionRequirement::GroundCombat
+                                    | CampaignProductionRequirement::Combat
+                            )
                                 && !combat_connectivity.is_reachable(
                                     map,
                                     master_data,
@@ -633,8 +654,11 @@ fn plan_campaign_shortfall_production_with_damage(
                         {
                             continue;
                         }
-                        let combat_coverage =
-                            u32::from(requirement == CampaignProductionRequirement::Combat);
+                        let combat_coverage = u32::from(matches!(
+                            requirement,
+                            CampaignProductionRequirement::GroundCombat
+                                | CampaignProductionRequirement::Combat
+                        ));
                         // Capture枠は戦闘火力で選ばない。対象へ到着してCaptureを完了する
                         // 手番を優先し、同着なら安い候補を選ぶ。火力は別のCombat計画が担う。
                         let capture_completion_turn =
@@ -748,7 +772,8 @@ fn plan_campaign_shortfall_production_with_damage(
                     CampaignProductionRole::Transport
                 }
                 CampaignProductionRequirement::Capture => CampaignProductionRole::Capture,
-                CampaignProductionRequirement::Combat => CampaignProductionRole::Combat,
+                CampaignProductionRequirement::GroundCombat
+                | CampaignProductionRequirement::Combat => CampaignProductionRole::Combat,
             };
             outcome.intents.push(CampaignProductionIntent {
                 command: command.clone(),

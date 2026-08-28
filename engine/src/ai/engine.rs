@@ -42,6 +42,15 @@ struct AiTacticalSnapshot {
     weapons: HashMap<UnitType, (Option<WeaponRecord>, Option<WeaponRecord>)>,
 }
 
+/// V4 Squad executorが同じ任務だけを連続実行しないための巡回位置。
+///
+/// Entity単位の全体順位へ戻さず、Squadを命令主体に保ったまま、攻勢・占領・防衛の
+/// 進行を1アクションずつ交互にする。
+#[derive(Resource, Debug, Default)]
+struct V4SquadExecutionCursor {
+    last_squad: HashMap<PlayerId, crate::ai::squad::SquadId>,
+}
+
 impl AiTacticalSnapshot {
     fn from_world(
         world: &mut World,
@@ -1850,9 +1859,12 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     }
 
     // 2. 通常部隊・SoloFallback ユニットの行動決定 (V2意思決定)
-    if let Some((entity, command)) =
+    let normal_action = if is_v4 {
+        decide_squad_action_v4(world, active_player, &decide_skip_entities)
+    } else {
         decide_ai_action_v2(world, active_player, &decide_skip_entities)
-    {
+    };
+    if let Some((entity, command)) = normal_action {
         let cmd_str = format!("{:?}", command);
         execute_ai_command(world, entity, command);
 
@@ -1873,7 +1885,8 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     let should_reassign_idle = is_v4;
     if should_reassign_idle {
         crate::ai::squad::reconcile_v4_end_turn_reserves(world, active_player);
-        if let Some((entity, command)) = decide_ai_action_v2(world, active_player, &skip_entities) {
+        let reassigned_action = decide_squad_action_v4(world, active_player, &skip_entities);
+        if let Some((entity, command)) = reassigned_action {
             let command_text = format!("{:?}", command);
             execute_ai_command(world, entity, command);
             if let Some(mut cooldown) = world.get_resource_mut::<AiActionCooldown>() {
@@ -2272,6 +2285,9 @@ const AMBUSH_APPROACH_MARGIN: u32 = 2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ActionPriority {
     Normal,
+    /// DAG区間のセル列に沿う前進。通常の局地位置取りより優先するが、
+    /// その場で成立する有利な戦闘・占領は妨げない。
+    RouteAdvance,
     /// 作戦パッケージが実行段階にあり、他に有利な局地標的がない場合の必要攻撃。
     StrategicTargetFallback,
     /// 同じ作戦圏内で見つけた、現在兵種と相性のよい敵への攻撃。
@@ -2325,7 +2341,11 @@ fn campaign_action_context(
         owner: assignment.owner,
         island_id,
         mission_type: squad.mission_type.clone(),
-        target: squad.target,
+        // 首都攻略DAGの外側では地域への入口へ進むが、地域内ではControl/Captureの
+        // 指令に従う。`Some(None)`はanchor直行を止めて局地戦術へ任せる明示値であり、
+        // その場合に古いSquad目標へフォールバックしてはならない。
+        target: crate::ai::v4::capital_route_tactical_target(world, player_id, entity)
+            .unwrap_or(squad.target),
         departure_authorized: squad.departure_authorized,
     }))
 }
@@ -2359,6 +2379,20 @@ pub fn decide_ai_action_v2(
     player_id: PlayerId,
     skip_entities: &std::collections::HashSet<Entity>,
 ) -> Option<(Entity, AiCommand)> {
+    decide_ai_action_v2_for_entities(world, player_id, skip_entities, None)
+}
+
+/// Squad executorから渡されたmember集合だけを戦術採点する内部入口。
+///
+/// V2/V3の公開関数は従来どおり全unitを対象にする。V4だけはSquadが選んだ
+/// candidate集合を渡すため、ここは戦略目標を新たに発明せず、Move/Attack/Captureの
+/// 戦術順位だけを決める。
+fn decide_ai_action_v2_for_entities(
+    world: &mut World,
+    player_id: PlayerId,
+    skip_entities: &std::collections::HashSet<Entity>,
+    permitted_entities: Option<&HashSet<Entity>>,
+) -> Option<(Entity, AiCommand)> {
     // V3 の戦術評価 (#44/#45/#50) を有効にするかどうか
     let is_v3 = crate::ai::resolve_player_ai_version(world, player_id).uses_v3_tactics();
 
@@ -2391,7 +2425,8 @@ pub fn decide_ai_action_v2(
                 continue;
             }
 
-            if !skip_entities.contains(&entity)
+            if permitted_entities.is_none_or(|permitted| permitted.contains(&entity))
+                && !skip_entities.contains(&entity)
                 && faction.0 == player_id
                 && !has_moved.0
                 && !action_completed.0
@@ -2419,19 +2454,33 @@ pub fn decide_ai_action_v2(
         return None;
     }
 
-    // 2. SquadManager から各ユニットの所属部隊と目標を取得
+    // 2. 正規化済みの所属を満たすSquadだけから、各unitの目標を取得する。
+    // SquadManagerをそのまま全走査すると、再編途中に残った重複memberが別の目標を
+    // 上書きできてしまう。UnitOperationRegistryの唯一のSquadIdを境界にする。
     let manager = world
         .get_resource::<crate::ai::squad::SquadManager>()
         .cloned()
         .unwrap_or_default();
+    let operation_assignments =
+        world.get_resource::<crate::ai::operation_assignment::UnitOperationRegistry>();
     let mut unit_squad_targets = HashMap::new();
     let mut unit_squad_missions = HashMap::new();
     let mut solo_fallbacks = HashSet::new();
 
     for squad in &manager.squads {
         for &member in &squad.members {
+            if operation_assignments.is_some_and(|assignments| {
+                assignments
+                    .assignment(member)
+                    .is_none_or(|assignment| assignment.squad_id != Some(squad.id))
+            }) {
+                continue;
+            }
             unit_squad_missions.insert(member, squad.mission_type.clone());
-            if let Some(target) = squad.target {
+            if let Some(target) =
+                crate::ai::v4::capital_route_tactical_target(world, player_id, member)
+                    .unwrap_or(squad.target)
+            {
                 unit_squad_targets.insert(member, target);
             }
         }
@@ -2544,11 +2593,20 @@ pub fn decide_ai_action_v2(
         let deployment_target = world
             .get_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>()
             .and_then(|registry| registry.attack_target(unit_entity));
+        // `Some(None)` はDAGのControl地域に入ったことを表す。ここで単なるNoneへ
+        // 潰すと、下の古いSquad目標が再び地域外のanchorを指してしまう。
+        let route_tactical_target =
+            crate::ai::v4::capital_route_tactical_target(world, player_id, unit_entity);
+        let route_target = route_tactical_target.flatten();
+        let route_recovering =
+            crate::ai::v4::capital_route_is_recovering(world, player_id, unit_entity);
         let campaign_context =
             match campaign_action_context(world, player_id, unit_entity, &manager) {
                 Ok(context) => context,
                 // Campaign ownerに具体Squadが無いEntityへ汎用行動を許すと、再び別作戦へ
-                // 漏れるため、この手番は作戦再構築へ戻す。
+                // 漏れるため、この手番は作戦再構築へ戻す。ただしDAGの実行区間を持つ
+                // Entityは、DAG自身が一意の行動先を持つのでここで落とさない。
+                Err(()) if route_tactical_target.is_some() => None,
                 Err(()) => continue,
             };
 
@@ -2580,26 +2638,54 @@ pub fn decide_ai_action_v2(
                 &registry,
             )
         };
+        let route_advance_destination = crate::ai::v4::capital_route_advance_destination(
+            world,
+            player_id,
+            unit_entity,
+            &reachable,
+        );
+        // 進軍役は山を迂回するDAGセル列の次候補と、その場の戦闘・占領だけを比較する。
+        // それ以外の横方向への通常探索を残すと、橋へ近づくスコアだけで経路から外れる。
+        let candidate_tiles = route_advance_destination
+            .map(|destination| {
+                [(pos.x, pos.y), (destination.x, destination.y)]
+                    .into_iter()
+                    .filter(|tile| reachable.contains(tile))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| reachable.iter().copied().collect());
 
-        let squad_target = unit_squad_targets.get(&unit_entity).copied();
-        let has_offensive_mission = unit_squad_missions
-            .get(&unit_entity)
-            .is_some_and(|mission| {
-                matches!(
-                    mission,
-                    crate::ai::squad::MissionType::Attack
-                        | crate::ai::squad::MissionType::Capture
-                        | crate::ai::squad::MissionType::Transport
-                )
-            });
-        let initial_is_solo = solo_fallbacks.contains(&unit_entity) || squad_target.is_none();
+        // 回復中のDAG Entityへ古いSquad目標を渡すと、修理ではなく横の拠点へ戻る。
+        // 所属はDAG Registryに残したまま、ここだけ通常の回復探索を使う。
+        let squad_target = if route_recovering {
+            None
+        } else {
+            route_tactical_target
+                .flatten()
+                .or(unit_squad_targets.get(&unit_entity).copied())
+        };
+        let has_offensive_mission = !route_recovering
+            && (route_tactical_target.is_some()
+                || unit_squad_missions
+                    .get(&unit_entity)
+                    .is_some_and(|mission| {
+                        matches!(
+                            mission,
+                            crate::ai::squad::MissionType::Attack
+                                | crate::ai::squad::MissionType::Capture
+                                | crate::ai::squad::MissionType::Transport
+                        )
+                    }));
+        let initial_is_solo = route_recovering
+            || (solo_fallbacks.contains(&unit_entity) && route_tactical_target.is_none())
+            || squad_target.is_none();
 
         // 評価ロジック（is_solo: initial_is_solo を直接使う）
         let is_solo = initial_is_solo;
         let mut best_unit_rank = (ActionPriority::Normal, i32::MIN);
         let mut best_unit_choice: Option<AiCommand> = None;
 
-        for target_tile in &reachable {
+        for target_tile in &candidate_tiles {
             let current_grid = GridPosition {
                 x: target_tile.0,
                 y: target_tile.1,
@@ -2616,6 +2702,7 @@ pub fn decide_ai_action_v2(
                 continue;
             }
             let is_stationary = current_grid.x == pos.x && current_grid.y == pos.y;
+            let is_route_advance_cell = route_advance_destination == Some(current_grid);
 
             let actions = tactical_snapshot.action_targets_at(
                 unit_entity,
@@ -3058,13 +3145,26 @@ pub fn decide_ai_action_v2(
 
             // (A) Capture
             if actions.can_capture
+                && crate::ai::v4::capital_route_allows_capture_at(
+                    world,
+                    player_id,
+                    unit_entity,
+                    current_grid,
+                )
                 && !campaign_context.as_ref().is_some_and(|context| {
                     !campaign_mission_allows_capture(&context.mission_type)
                         || !campaign_position_is_on_target_island(world, context, current_grid)
                 })
             {
                 let score = base_tile_score + 10000;
-                let rank = (ActionPriority::Normal, score);
+                let rank = (
+                    if is_route_advance_cell {
+                        ActionPriority::RouteAdvance
+                    } else {
+                        ActionPriority::Normal
+                    },
+                    score,
+                );
                 if rank > best_unit_rank {
                     best_unit_rank = rank;
                     best_unit_choice = Some(AiCommand::Capture {
@@ -3207,14 +3307,21 @@ pub fn decide_ai_action_v2(
                     if is_stationary || is_on_recovery_property && is_combat_ineffective {
                         return false;
                     }
-                    context.target.is_none_or(|target| {
+                    route_target.or(context.target).is_none_or(|target| {
                         map.distance(current_grid.x, current_grid.y, target.x, target.y)
                             > map.distance(pos.x, pos.y, target.x, target.y)
                     })
                 });
 
                 if !violates_campaign_step {
-                    let rank = (ActionPriority::Normal, score);
+                    let rank = (
+                        if is_route_advance_cell {
+                            ActionPriority::RouteAdvance
+                        } else {
+                            ActionPriority::Normal
+                        },
+                        score,
+                    );
                     if rank > best_unit_rank {
                         best_unit_rank = rank;
                         best_unit_choice = Some(AiCommand::Wait {
@@ -3306,6 +3413,97 @@ pub fn decide_ai_action_v2(
     world.insert_resource(strategy_cache);
 
     best_overall_choice
+}
+
+/// V4の通常行動を、Squadを命令主体として選ぶ。
+///
+/// 先にRoadmap/Reconcilerが確定した唯一所属Squadを優先順に取り出し、そのmemberだけを
+/// 既存の戦術採点器へ渡す。従ってこの層は別の島・別NodeへEntityを再配分せず、
+/// `AiCommand` がEntity指定であるというエンジン境界だけを最後に解決する。
+pub(crate) fn decide_squad_action_v4(
+    world: &mut World,
+    player_id: PlayerId,
+    skip_entities: &HashSet<Entity>,
+) -> Option<(Entity, AiCommand)> {
+    let manager = world
+        .get_resource::<crate::ai::squad::SquadManager>()
+        .cloned()
+        .unwrap_or_default();
+    let assignments = world
+        .get_resource::<crate::ai::operation_assignment::UnitOperationRegistry>()
+        .map(|registry| registry.player_assignments(player_id));
+    let mut squads = manager
+        .squads
+        .iter()
+        .filter(|squad| {
+            squad.owner_id == Some(player_id)
+                && squad.mission_type != crate::ai::squad::MissionType::Transport
+        })
+        .filter_map(|squad| {
+            let members = squad
+                .members
+                .iter()
+                .copied()
+                .filter(|entity| {
+                    assignments.as_ref().is_none_or(|assignments| {
+                        assignments
+                            .get(entity)
+                            .is_none_or(|assignment| assignment.squad_id == Some(squad.id))
+                    })
+                })
+                .collect::<HashSet<_>>();
+            (!members.is_empty()).then_some((
+                squad_executor_priority(&squad.mission_type),
+                squad.id.0,
+                members,
+            ))
+        })
+        .collect::<Vec<_>>();
+    // 同一任務のSquad間はIDで安定化する。乱数を持たないため、評価試合のseedを跨いで
+    // 意思決定順が揺れない。
+    squads.sort_unstable_by_key(|(priority, squad_id, _)| (*priority, *squad_id));
+    let start = world
+        .get_resource::<V4SquadExecutionCursor>()
+        .and_then(|cursor| cursor.last_squad.get(&player_id).copied())
+        .and_then(|last_squad| {
+            squads
+                .iter()
+                .position(|(_, squad_id, _)| *squad_id == last_squad.0)
+                .map(|index| (index + 1) % squads.len())
+        })
+        .unwrap_or(0);
+    for offset in 0..squads.len() {
+        let index = (start + offset) % squads.len();
+        let (_, squad_id, members) = &squads[index];
+        if let Some(action) =
+            decide_ai_action_v2_for_entities(world, player_id, skip_entities, Some(members))
+        {
+            let mut cursor = world
+                .remove_resource::<V4SquadExecutionCursor>()
+                .unwrap_or_default();
+            cursor
+                .last_squad
+                .insert(player_id, crate::ai::squad::SquadId(*squad_id));
+            world.insert_resource(cursor);
+            return Some(action);
+        }
+    }
+    None
+}
+
+/// 敵前のCapture Squadを単独で先走らせないよう、まずSuppress/Attackを扱い、残りは
+/// Capture・Defense・Reserveの順にする。
+///
+/// これは戦術の点数を置換するものではなく、複数Squadのうちどの命令を次に展開するか
+/// を決めるRoadmap投影順である。
+fn squad_executor_priority(mission: &crate::ai::squad::MissionType) -> u8 {
+    match mission {
+        crate::ai::squad::MissionType::Attack => 0,
+        crate::ai::squad::MissionType::Capture => 1,
+        crate::ai::squad::MissionType::Defense => 2,
+        crate::ai::squad::MissionType::Reserve => 3,
+        crate::ai::squad::MissionType::Transport => u8::MAX,
+    }
 }
 
 fn is_unit_stranded(

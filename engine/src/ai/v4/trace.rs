@@ -17,11 +17,34 @@ use crate::resources::UnitType;
 use bevy_ecs::prelude::*;
 use std::collections::HashMap;
 
+/// 敵の実生産観測から作る、次手番1回分の予測と既済予測の誤差。
+///
+/// 予測は現在の必須戦力や資金予約には使わない。まず対戦ログで誤差を測り、
+/// 予測器が追随できていることを確認するための診断値である。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EnemyProductionForecastTrace {
+    pub expected_units_next_turn: u32,
+    pub expected_cost_next_turn: u32,
+    pub dominant_unit_type: Option<UnitType>,
+    pub evaluated_samples: u32,
+    pub mean_absolute_unit_error: u32,
+    pub mean_absolute_cost_error: u32,
+}
+
 /// 1 枠分の購入判断の結末。
 #[derive(Debug, Clone)]
 pub enum ProductionDecision {
     /// 生産命令を発行した
     Produced {
+        unit_type: UnitType,
+        cost: u32,
+        facility: GridPosition,
+    },
+    /// Must を確保した残額で、観測済み前線へ直ちに寄与する増援を発行した。
+    ///
+    /// 永続Combat計画の購入列ではないため、次手番にそのまま再利用する予約にはしない。
+    /// ただし生産Entityには通常のCombat任務を付けるので、無所属戦力にはならない。
+    ProducedImmediateReinforcement {
         unit_type: UnitType,
         cost: u32,
         facility: GridPosition,
@@ -61,7 +84,8 @@ pub struct ProductionOperationTrace {
     pub slots: OperationSlots,
     pub requires_transport: bool,
     pub enemy_combat_units: u32,
-    /// 作戦期限までにこの前線へ到着できる敵生産分だけを数えた増援予算。
+    /// 実生産履歴を基準に、作戦期限までにこの前線へ到着しうると見積もった増援額。
+    /// 現在の必須戦力・資金予約には使わない診断値である。
     pub enemy_reinforcement_funds: u32,
     /// 観測後に間に合う具体的counter生産列の現在必要な予約額。
     pub contingency_reserve_funds: u32,
@@ -69,7 +93,8 @@ pub struct ProductionOperationTrace {
     pub deploy_lead_time: u32,
 }
 
-/// 仮想敵を現在編成へ混ぜず、観測後に発動する条件付きcounter計画。
+/// 実生産傾向から得た条件付きcounter候補。仮想敵を現在編成へ混ぜず、
+/// 予約も行わない。対応が必要なのは実Entityを観測した次手番である。
 #[derive(Debug, Clone, Copy)]
 pub struct ReinforcementContingencyTrace {
     pub enemy_type: UnitType,
@@ -157,6 +182,8 @@ pub struct ProductionPlanTrace {
     pub reserved_funds: u32,
     /// どの作戦・購入列にも帰属していない、真の余剰資金。
     pub uncommitted_funds: u32,
+    /// 敵の実生産履歴からの次手番予測。要求量・予約額とは独立して記録する。
+    pub enemy_production_forecast: EnemyProductionForecastTrace,
 }
 
 impl ProductionPlanTrace {
@@ -173,6 +200,7 @@ impl ProductionPlanTrace {
             leftover_funds: funds,
             reserved_funds: 0,
             uncommitted_funds: funds,
+            enemy_production_forecast: EnemyProductionForecastTrace::default(),
         }
     }
 
