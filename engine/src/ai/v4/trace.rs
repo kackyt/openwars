@@ -84,9 +84,12 @@ pub struct ProductionOperationTrace {
     pub slots: OperationSlots,
     pub requires_transport: bool,
     pub enemy_combat_units: u32,
-    /// 実生産履歴を基準に、作戦期限までにこの前線へ到着しうると見積もった増援額。
-    /// 現在の必須戦力・資金予約には使わない診断値である。
+    /// 実生産履歴と敵施設の事前分布を基準に、作戦期限までにこの前線へ到着しうる
+    /// 通常増援額。RollingPlanへ仮想敵として渡す継続生産の基準である。
     pub enemy_reinforcement_funds: u32,
+    /// 敵が施設・収入をより強く使った場合の上側見積り。進撃Goは止めず、
+    /// counter候補と次回再計画の診断に使う。
+    pub enemy_stress_reinforcement_funds: u32,
     /// 観測後に間に合う具体的counter生産列の現在必要な予約額。
     pub contingency_reserve_funds: u32,
     pub reinforcement_contingencies: Vec<ReinforcementContingencyTrace>,
@@ -155,10 +158,14 @@ pub struct RollingCombatPlanTrace {
     pub occupation_turn: Option<u32>,
     pub production_cost: u32,
     pub expected_loss: u32,
+    pub surviving_combat_value: u32,
+    pub required_overmatch_value: u32,
+    pub overmatch_ready: bool,
     pub protected_unit_count: usize,
     pub protected_survivor_count: usize,
     pub required_capture_survivor_count: usize,
     pub candidates_considered: usize,
+    pub candidates_pruned: usize,
     pub search_truncated: bool,
 }
 

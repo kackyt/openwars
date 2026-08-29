@@ -1908,6 +1908,33 @@ fn capture_front_origins(
     player_id: PlayerId,
     existing_operation: Option<&ExistingCampaignOperation>,
 ) -> Vec<GridPosition> {
+    let owned_property_positions = || {
+        properties
+            .iter()
+            .filter(|snapshot| island.tiles.contains(&snapshot.position))
+            .filter(|snapshot| snapshot.property.owner_id == Some(player_id))
+            .map(|snapshot| snapshot.position)
+            .collect::<Vec<_>>()
+    };
+    let has_own_capital = properties.iter().any(|snapshot| {
+        island.tiles.contains(&snapshot.position)
+            && snapshot.property.terrain == Terrain::Capital
+            && snapshot.property.owner_id == Some(player_id)
+    });
+    let has_enemy_capital = properties.iter().any(|snapshot| {
+        island.tiles.contains(&snapshot.position)
+            && snapshot.property.terrain == Terrain::Capital
+            && snapshot
+                .property
+                .owner_id
+                .is_some_and(|owner| owner != player_id)
+    });
+    if has_own_capital && has_enemy_capital {
+        // 同一陸塊の首都戦役は、担当歩兵一体の位置で戦略前線を後退させない。
+        // 所有施設群を補給線として測るmainの挙動を維持し、局地CaptureはSquad order、
+        // 首都方向の継続目標はCampaignがそれぞれ担当する。
+        return owned_property_positions();
+    }
     let live_capture_position = |unit: &&UnitSnapshot| {
         unit.faction == player_id
             && unit.stats.can_capture
@@ -1938,12 +1965,7 @@ fn capture_front_origins(
     if !available_positions.is_empty() {
         return available_positions;
     }
-    properties
-        .iter()
-        .filter(|snapshot| island.tiles.contains(&snapshot.position))
-        .filter(|snapshot| snapshot.property.owner_id == Some(player_id))
-        .map(|snapshot| snapshot.position)
-        .collect()
+    owned_property_positions()
 }
 
 /// 自軍前線からの占領ETAを第一基準、敵占領兵の到着ETAを同距離帯の競争優先度にする。
@@ -2799,6 +2821,76 @@ mod tests {
                 Some(&operation),
             ),
             vec![GridPosition { x: 8, y: 0 }]
+        );
+    }
+
+    #[test]
+    fn same_land_capital_front_does_not_retreat_to_the_capturer_position() {
+        let master_data = MasterDataRegistry::load().expect("master data should load");
+        let map = Map::new(11, 1, Terrain::Plains, GridTopology::Square);
+        let island = IslandMap::analyze(&map).islands.remove(0);
+        let player = PlayerId(1);
+        let enemy = PlayerId(2);
+        let assigned = Entity::from_raw(42);
+        let strategic_target = GridPosition { x: 0, y: 0 };
+        let properties = vec![
+            PropertySnapshot {
+                position: strategic_target,
+                property: Property::new(Terrain::Capital, Some(enemy), 200),
+            },
+            PropertySnapshot {
+                position: GridPosition { x: 1, y: 0 },
+                property: Property::new(Terrain::City, Some(player), 200),
+            },
+            PropertySnapshot {
+                position: GridPosition { x: 8, y: 0 },
+                property: Property::new(Terrain::City, None, 200),
+            },
+            PropertySnapshot {
+                position: GridPosition { x: 10, y: 0 },
+                property: Property::new(Terrain::Capital, Some(player), 200),
+            },
+        ];
+        let units = vec![UnitSnapshot {
+            entity: assigned,
+            faction: player,
+            position: GridPosition { x: 10, y: 0 },
+            stats: UnitStats {
+                can_capture: true,
+                ..UnitStats::mock()
+            },
+            health: Health {
+                current: 100,
+                max: 100,
+            },
+            fuel: None,
+            transporting: None,
+            free_cargo_slots: 0,
+            loaded_cargo_entities: Vec::new(),
+        }];
+        let operation = ExistingCampaignOperation {
+            island_id: island.id,
+            target_position: strategic_target,
+            transport_phase: None,
+            is_forming: false,
+            transport_entities: Vec::new(),
+            capture_entities: vec![assigned],
+            combat_entities: Vec::new(),
+        };
+
+        assert_eq!(
+            candidate_target_position(
+                &map,
+                &master_data,
+                &island,
+                &properties,
+                &units,
+                player,
+                IslandCampaignDecision::Contest,
+                Some(&operation),
+            ),
+            Some(strategic_target),
+            "同一陸塊の戦略目標を、後方の担当歩兵に近い中立拠点へ戻さない"
         );
     }
 

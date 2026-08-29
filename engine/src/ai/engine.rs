@@ -2119,9 +2119,14 @@ fn decide_forming_campaign_site_relief(
                             || squad.departure_authorized)
                 })
                 .map(|squad| {
+                    // 通常executorより先に工場を空ける場合も、DAG orderがあれば
+                    // 古いSquad.targetではなく現在Nodeの指令先を使う。
+                    let route_target = squad.members.iter().find_map(|entity| {
+                        crate::ai::v4::capital_route_tactical_target(world, player_id, *entity)
+                    });
                     (
                         squad.members.iter().copied().collect::<Vec<_>>(),
-                        squad.target,
+                        route_target.unwrap_or(squad.target),
                     )
                 }),
         );
@@ -2245,19 +2250,33 @@ fn decide_forming_campaign_site_relief(
                 stats.unit_type,
                 &registry,
             );
-            let destination = reachable
-                .iter()
-                .copied()
-                .filter(|tile| *tile != (position.x, position.y))
-                .filter(|tile| !occupied.contains(tile))
-                .filter(|tile| !production_positions.contains(tile))
-                .min_by_key(|(x, y)| {
-                    let target_distance =
-                        mission_target.map_or(0, |target| map.distance(*x, *y, target.x, target.y));
-                    let group_distance = group_positions.iter().fold(0_u32, |total, member| {
-                        total.saturating_add(map.distance(*x, *y, member.x, member.y))
-                    });
-                    (target_distance, group_distance, *y, *x)
+            // V4のDAG所属unitは、工場退避でも同じセル列を進む。単なる目標距離で
+            // 選ぶと、map_25で敵側Nodeとは逆の旧Squad.targetへ初手だけ逸脱する。
+            let route_destination = crate::ai::v4::capital_route_advance_destination(
+                world, player_id, *entity, &reachable,
+            );
+            let is_valid_destination = |tile: &(usize, usize)| {
+                *tile != (position.x, position.y)
+                    && !occupied.contains(tile)
+                    && !production_positions.contains(tile)
+            };
+            let destination = route_destination
+                .map(|target| (target.x, target.y))
+                .filter(is_valid_destination)
+                .or_else(|| {
+                    reachable
+                        .iter()
+                        .copied()
+                        .filter(is_valid_destination)
+                        .min_by_key(|(x, y)| {
+                            let target_distance = mission_target
+                                .map_or(0, |target| map.distance(*x, *y, target.x, target.y));
+                            let group_distance =
+                                group_positions.iter().fold(0_u32, |total, member| {
+                                    total.saturating_add(map.distance(*x, *y, member.x, member.y))
+                                });
+                            (target_distance, group_distance, *y, *x)
+                        })
                 });
             if let Some((x, y)) = destination {
                 return Some((
@@ -2653,7 +2672,21 @@ fn decide_ai_action_v2_for_entities(
                     .filter(|tile| reachable.contains(tile))
                     .collect::<Vec<_>>()
             })
-            .unwrap_or_else(|| reachable.iter().copied().collect());
+            .unwrap_or_else(|| {
+                reachable
+                    .iter()
+                    .copied()
+                    .filter(|(x, y)| {
+                        crate::ai::v4::capital_route_allows_tactical_position(
+                            world,
+                            player_id,
+                            unit_entity,
+                            GridPosition { x: *x, y: *y },
+                        )
+                        .unwrap_or(true)
+                    })
+                    .collect()
+            });
 
         // 回復中のDAG Entityへ古いSquad目標を渡すと、修理ではなく横の拠点へ戻る。
         // 所属はDAG Registryに残したまま、ここだけ通常の回復探索を使う。

@@ -104,10 +104,10 @@ pub struct OperationFacts {
     pub enemy_combat_units: u32,
     /// 同じ作戦へ実際に参加できる既存戦闘Entity数。診断用で、必要編成は計画器が決める。
     pub friendly_combat_units_committed: u32,
-    /// 敵施設が次の接触地点までに動員できる上限額。
+    /// 敵施設が次の接触地点までに通常動員すると見積もる額。
     ///
-    /// これは敵の実際の発注額ではない。未知の将来生産を現在の要求量や資金予約へ
-    /// 混ぜないため、診断と次手番の再評価範囲にだけ用いる。
+    /// これは敵の実際の発注額ではない。進撃Goには使わず、RollingPlanが継続生産
+    /// すべき混成戦力を作るためのExpected scenarioにだけ用いる。
     pub enemy_reinforcement_funds: u32,
     /// 到達不能脅威へ対抗できる既存迎撃Entity数。
     pub friendly_intercept_units_committed: u32,

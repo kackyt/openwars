@@ -127,6 +127,13 @@ pub(crate) struct ForcePackagePlan {
     pub occupation_turn: Option<u32>,
     pub production_cost: u32,
     pub expected_loss: u32,
+    /// 敵排除時点に残る、戦闘可能な友軍のHP比例コスト。Expected増援の後に
+    /// 前線を保持できるかを測るため、購入額だけでなく実損耗後の価値を使う。
+    pub surviving_combat_value: u32,
+    /// 仮想Expected増援の総価値から導いた、排除後に残したい最低戦闘価値。
+    pub required_overmatch_value: u32,
+    /// Expectedを排除した後も次波へ備える最低価値を満たすか。
+    pub overmatch_ready: bool,
     /// 占領工程へ接続済みで、敵行動シミュレーションの保護対象にした兵数。
     pub protected_unit_count: usize,
     /// 占領予定時点まで生存すると予測した保護対象兵数。
@@ -134,6 +141,8 @@ pub(crate) struct ForcePackagePlan {
     /// 未所有の作戦対象施設を占領するため、予定時点に必要な生存兵数。
     pub required_capture_survivor_count: usize,
     pub candidates_considered: usize,
+    /// 同一生産slot内で相性・価格ともに支配された候補を探索前に除外した数。
+    pub candidates_pruned: usize,
     pub search_truncated: bool,
 }
 
@@ -323,6 +332,26 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
             .or_default()
             .push(index);
     }
+    let mut candidates_pruned = 0_usize;
+    for option_indices in options_by_slot.values_mut() {
+        let original_len = option_indices.len();
+        let retained = option_indices
+            .iter()
+            .copied()
+            .filter(|candidate_index| {
+                !option_indices.iter().copied().any(|other_index| {
+                    other_index != *candidate_index
+                        && production_option_dominates(
+                            input,
+                            &input.production_options[other_index],
+                            &input.production_options[*candidate_index],
+                        )
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates_pruned = candidates_pruned.saturating_add(original_len - retained.len());
+        *option_indices = retained;
+    }
     let mut slots = options_by_slot.into_iter().collect::<Vec<_>>();
     slots.sort_unstable_by_key(|(slot, _)| (slot.build_turn, slot.facility.y, slot.facility.x));
 
@@ -417,8 +446,75 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
         selected = shifted;
     }
     selected.candidates_considered = considered;
+    selected.candidates_pruned = candidates_pruned;
     selected.search_truncated = truncated;
     Some(selected)
+}
+
+/// 同じ工場・同じ手番の候補で、価格・交戦対象・相性の全てで劣る兵種を落とす。
+///
+/// ある敵への打点だけが高い候補を消さないよう、右辺が届く全敵へ左辺も届き、
+/// 与ダメージは同等以上かつ被ダメージは同等以下の場合だけ支配とみなす。
+fn production_option_dominates(
+    input: &RollingPlanInput,
+    left: &ProductionPlanOption,
+    right: &ProductionPlanOption,
+) -> bool {
+    if left.purchase.cost > right.purchase.cost
+        || !right
+            .engageable_enemy_indices
+            .iter()
+            .all(|index| left.engageable_enemy_indices.contains(index))
+    {
+        return false;
+    }
+    let matchup_not_worse = right.engageable_enemy_indices.iter().all(|index| {
+        let enemy = &input.enemies[*index];
+        let left_outgoing = best_damage(
+            &input.damage_chart,
+            left.stats.unit_type,
+            enemy.stats.unit_type,
+        );
+        let right_outgoing = best_damage(
+            &input.damage_chart,
+            right.stats.unit_type,
+            enemy.stats.unit_type,
+        );
+        let left_incoming = best_damage(
+            &input.damage_chart,
+            enemy.stats.unit_type,
+            left.stats.unit_type,
+        );
+        let right_incoming = best_damage(
+            &input.damage_chart,
+            enemy.stats.unit_type,
+            right.stats.unit_type,
+        );
+        left_outgoing >= right_outgoing && left_incoming <= right_incoming
+    });
+    let strictly_better = left.purchase.cost < right.purchase.cost
+        || left.engageable_enemy_indices.len() > right.engageable_enemy_indices.len()
+        || right.engageable_enemy_indices.iter().any(|index| {
+            let enemy = &input.enemies[*index];
+            best_damage(
+                &input.damage_chart,
+                left.stats.unit_type,
+                enemy.stats.unit_type,
+            ) > best_damage(
+                &input.damage_chart,
+                right.stats.unit_type,
+                enemy.stats.unit_type,
+            ) || best_damage(
+                &input.damage_chart,
+                enemy.stats.unit_type,
+                left.stats.unit_type,
+            ) < best_damage(
+                &input.damage_chart,
+                enemy.stats.unit_type,
+                right.stats.unit_type,
+            )
+        });
+    matchup_not_worse && strictly_better
 }
 
 /// best-effort案の未使用current slotを、即時投入できる直接戦闘unitで埋める。
@@ -553,6 +649,7 @@ fn update_best_feasible(
     delay_cost_per_turn: u32,
 ) {
     let candidate_key = (
+        u8::from(!candidate.overmatch_ready),
         candidate.utility_cost(delay_cost_per_turn),
         candidate.completion_for_ordering(),
         candidate.production_cost,
@@ -560,6 +657,7 @@ fn update_best_feasible(
     if best.as_ref().is_none_or(|current| {
         candidate_key
             < (
+                u8::from(!current.overmatch_ready),
                 current.utility_cost(delay_cost_per_turn),
                 current.completion_for_ordering(),
                 current.production_cost,
@@ -939,6 +1037,21 @@ fn simulate_state_with_catalog(
                 let lost_hp = unit.initial_hp.saturating_sub(unit.hp);
                 total.saturating_add(unit.stats.cost.saturating_mul(lost_hp) / 100)
             });
+    // `entity=None` はExpected scenarioとして投入した将来増援である。撃破後に
+    // その半分の戦闘価値を残せる案を優先し、相手を倒した直後に前線が空になる
+    // 最小編成を避ける。ただし達成不能でもfeasibleを偽にしない。
+    let required_overmatch_value = input
+        .enemies
+        .iter()
+        .filter(|enemy| enemy.entity.is_none())
+        .map(|enemy| enemy.stats.cost.saturating_mul(enemy.hp) / 100)
+        .fold(0_u32, u32::saturating_add)
+        / 2;
+    let surviving_combat_value = friendlies
+        .iter()
+        .filter(|unit| unit.hp > 0 && unit.stats.max_cargo == 0)
+        .map(|unit| unit.stats.cost.saturating_mul(unit.hp) / 100)
+        .fold(0_u32, u32::saturating_add);
     ForcePackagePlan {
         purchases,
         target_forecasts: enemies
@@ -959,10 +1072,14 @@ fn simulate_state_with_catalog(
         occupation_turn,
         production_cost: state.cost,
         expected_loss,
+        surviving_combat_value,
+        required_overmatch_value,
+        overmatch_ready: surviving_combat_value >= required_overmatch_value,
         protected_unit_count: input.protected_units.len(),
         protected_survivor_count,
         required_capture_survivor_count: input.required_capture_survivors,
         candidates_considered: 0,
+        candidates_pruned: 0,
         search_truncated: false,
     }
 }
@@ -1351,6 +1468,47 @@ mod tests {
         update_best_effort(&mut selected, &low_loss);
 
         assert_eq!(selected.unwrap().expected_loss, 2_000);
+    }
+
+    #[test]
+    fn feasible_selection_prefers_a_plan_that_keeps_the_expected_overmatch_margin() {
+        let mut without_margin = plan_force_package(&input()).unwrap();
+        without_margin.production_cost = 7_500;
+        without_margin.expected_loss = 0;
+        without_margin.overmatch_ready = false;
+        let mut with_margin = without_margin.clone();
+        with_margin.production_cost = 12_000;
+        with_margin.surviving_combat_value = 6_000;
+        with_margin.required_overmatch_value = 2_000;
+        with_margin.overmatch_ready = true;
+        let mut selected = None;
+
+        update_best_feasible(&mut selected, &without_margin, 0);
+        update_best_feasible(&mut selected, &with_margin, 0);
+
+        assert!(selected.expect("a feasible candidate").overmatch_ready);
+    }
+
+    #[test]
+    fn dominated_candidate_in_the_same_production_slot_is_pruned() {
+        let mut input = input();
+        input.production_options.truncate(1);
+        let dominated = ProductionPlanOption {
+            purchase: PlannedPurchase {
+                facility: GridPosition { x: 0, y: 0 },
+                unit_type: UnitType::Bcopters,
+                build_turn: 0,
+                cost: 8_000,
+            },
+            stats: input.production_options[0].stats.clone(),
+            engageable_enemy_indices: vec![0],
+        };
+        input.production_options.push(dominated);
+
+        let plan = plan_force_package(&input).expect("a plan");
+
+        assert_eq!(plan.candidates_pruned, 1);
+        assert!(plan.purchases.iter().all(|purchase| purchase.cost != 8_000));
     }
 
     #[test]

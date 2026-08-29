@@ -5668,7 +5668,11 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     if is_v4 {
         // 新造・既存を問わず、分岐中の地上Squadへ戦略が選んだDAG入口を束縛する。
         // 合流後は束縛を外し、共有Milestoneへ直接向かわせる。
-        crate::ai::v4::refresh_capital_route_path_commitments(world, perspective_player, &manager);
+        crate::ai::v4::refresh_capital_route_path_commitments(
+            world,
+            perspective_player,
+            &mut manager,
+        );
         // 実際に投影されたSquad構成とNode状態を同じTurnPlanへ反映する。以後の
         // action executorは、ここで更新されたRoadmap orderからだけ目標を読む。
         crate::ai::v4::victory_roadmap::reconcile_campaign_roadmap(

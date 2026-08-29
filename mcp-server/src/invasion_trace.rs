@@ -257,6 +257,7 @@ pub struct ProductionOperationSnapshot {
     pub requires_transport: bool,
     pub enemy_combat_units: u32,
     pub enemy_reinforcement_funds: u32,
+    pub enemy_stress_reinforcement_funds: u32,
     pub contingency_reserve_funds: u32,
     pub reinforcement_contingencies: Vec<ReinforcementContingencySnapshot>,
     pub deploy_lead_time: u32,
@@ -324,10 +325,14 @@ pub struct RollingCombatPlanSnapshot {
     pub occupation_turn: Option<u32>,
     pub production_cost: u32,
     pub expected_loss: u32,
+    pub surviving_combat_value: u32,
+    pub required_overmatch_value: u32,
+    pub overmatch_ready: bool,
     pub protected_unit_count: usize,
     pub protected_survivor_count: usize,
     pub required_capture_survivor_count: usize,
     pub candidates_considered: usize,
+    pub candidates_pruned: usize,
     pub search_truncated: bool,
 }
 
@@ -1093,6 +1098,7 @@ pub fn snapshot_production_plan_for_player(
             requires_transport: op.requires_transport,
             enemy_combat_units: op.enemy_combat_units,
             enemy_reinforcement_funds: op.enemy_reinforcement_funds,
+            enemy_stress_reinforcement_funds: op.enemy_stress_reinforcement_funds,
             contingency_reserve_funds: op.contingency_reserve_funds,
             reinforcement_contingencies: op
                 .reinforcement_contingencies
@@ -1210,10 +1216,14 @@ pub fn snapshot_production_plan_for_player(
             occupation_turn: rolling.occupation_turn,
             production_cost: rolling.production_cost,
             expected_loss: rolling.expected_loss,
+            surviving_combat_value: rolling.surviving_combat_value,
+            required_overmatch_value: rolling.required_overmatch_value,
+            overmatch_ready: rolling.overmatch_ready,
             protected_unit_count: rolling.protected_unit_count,
             protected_survivor_count: rolling.protected_survivor_count,
             required_capture_survivor_count: rolling.required_capture_survivor_count,
             candidates_considered: rolling.candidates_considered,
+            candidates_pruned: rolling.candidates_pruned,
             search_truncated: rolling.search_truncated,
         })
         .collect();

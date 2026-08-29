@@ -219,6 +219,41 @@ struct CapitalRouteNodeOperation {
     assigned_squads: HashSet<SquadId>,
 }
 
+/// Area Nodeを局地戦として観測する半径。
+///
+/// 前後のMilestone座標をそのまま同じ地域へ入れると、map_25のような長い回廊で
+/// 自軍首都・中央戦線・敵首都が一つのAreaになり、後方部隊だけでNodeをDominantと
+/// 誤判定する。拠点をNodeへ対応付ける半径とそろえ、実際の近傍セルだけを扱う。
+const CAPITAL_ROUTE_REGION_RADIUS: u32 = 3;
+
+/// Nodeの戦術地域を、前後Nodeではなくanchor近傍の実セルから構築する。
+fn capital_route_node_control_area(
+    map: &Map,
+    island_map: &crate::ai::islands::IslandMap,
+    island_id: crate::ai::islands::IslandId,
+    anchor: GridPosition,
+    scope: CapitalRouteNodeScope,
+    capture_targets: &[GridPosition],
+) -> Vec<GridPosition> {
+    let mut control_area = match scope {
+        CapitalRouteNodeScope::Point => vec![anchor],
+        CapitalRouteNodeScope::Area => (0..map.height)
+            .flat_map(|y| (0..map.width).map(move |x| GridPosition { x, y }))
+            .filter(|position| {
+                map.distance(anchor.x, anchor.y, position.x, position.y)
+                    <= CAPITAL_ROUTE_REGION_RADIUS
+                    && island_map
+                        .get_island_at(position)
+                        .is_some_and(|island| island.id == island_id)
+            })
+            .collect::<Vec<_>>(),
+    };
+    control_area.extend(capture_targets.iter().copied());
+    control_area.sort_unstable_by_key(|position| (position.y, position.x));
+    control_area.dedup();
+    control_area
+}
+
 #[derive(Resource, Debug, Default)]
 pub(crate) struct CapitalRouteNodeOperationRegistry {
     operations: HashMap<CapitalRouteNodeOperationId, CapitalRouteNodeOperation>,
@@ -287,6 +322,55 @@ fn capital_route_execution_phase(mission: &MissionType) -> CapitalRouteExecution
     }
 }
 
+/// Combat Squadが現在のDAG Nodeを制圧する役かを返す。
+///
+/// 生産時には首都や将来の前線を指していたDefense Squadでも、未完了Nodeより前方を
+/// 目指しているなら、そのNodeを飛び越える権限はない。Roadmapが現在NodeのControl
+/// 役へ再指令し、Capture Squadの出発条件にも使う。本土側を守るDefenseだけはHoldに
+/// 残すため、Nodeより後方だけを指定する場合はControlにしない。
+fn capital_route_controls_active_node(
+    mission: &MissionType,
+    target_is_on_or_beyond_active_node: bool,
+) -> bool {
+    matches!(mission, MissionType::Attack)
+        || (matches!(mission, MissionType::Defense) && target_is_on_or_beyond_active_node)
+}
+
+/// Capture Squadを現在のDAG Nodeへ束縛するかを返す。
+///
+/// 現在Nodeの拠点対象、またはそこまでのDAGセルを明示目標にするCaptureだけを
+/// Roadmapの前衛へ参加させる。DAG外の外周拠点を指すSquadまで、進行度が前方という
+/// 理由だけで中央の最短線へ上書きしない。map_25のように最短線の上下に拠点列がある
+/// マップでは、そのSquad orderを残すことで進路上の施設を継続して占領できる。
+fn capital_route_capture_joins_active_node(
+    mission: &MissionType,
+    has_explicit_target: bool,
+    target_matches_active_route: bool,
+    target_belongs_to_other_capture_node: bool,
+) -> bool {
+    !matches!(mission, MissionType::Capture)
+        || !has_explicit_target
+        || (target_matches_active_route && !target_belongs_to_other_capture_node)
+}
+
+/// 未完了Capture Nodeの施設セルを、占領可能unitのために予約する。
+///
+/// Areaのanchorと実際の施設が離れている場合、Combat unitも同じ局地戦領域を自由に
+/// 動くため、施設上で待機して歩兵を永久に遮断し得る。Node単位の予約にすることで、
+/// 別枝から同じAreaへ入ったSquadにも共通の占領セル境界を適用する。
+fn capital_route_capture_target_is_reserved(
+    operations: &CapitalRouteNodeOperationRegistry,
+    player_id: PlayerId,
+    position: GridPosition,
+) -> bool {
+    operations.operations.values().any(|operation| {
+        operation.id.topology.player_id == player_id
+            && operation.objective == CapitalRouteNodeObjective::Capture
+            && !capital_route_node_exit_satisfied(operation)
+            && operation.capture_targets.contains(&position)
+    })
+}
+
 /// Nodeへ同時に進入させる地上member数を、地理的な収容面積から求める。
 ///
 /// これは「最低防衛数」のような固定戦力ではない。Pointは一点を一体ずつ通すしかなく、
@@ -301,6 +385,73 @@ fn capital_route_node_frontline_capacity(operation: &CapitalRouteNodeOperation) 
             .max(operation.capture_targets.len())
             .max(1),
     }
+}
+
+/// Capture Nodeの前衛枠を、占領役とControl役へ分ける。
+///
+/// Captureを先に一つの共通枠へ入れるだけでは、Pointの容量1を占領兵が使い切り、
+/// 敵がいるときに必要なControl Squadが必ずStageへ落ちて出発gateが開かない。
+/// Areaでは総容量を概ね維持しつつ、Pointでも占領役1体と隣接護衛1体を許可する。
+fn capital_route_role_frontline_capacity(
+    operation: &CapitalRouteNodeOperation,
+    capture_role: bool,
+) -> usize {
+    let total = capital_route_node_frontline_capacity(operation);
+    if operation.objective != CapitalRouteNodeObjective::Capture {
+        return total;
+    }
+    let capture_capacity = operation.capture_targets.len().max(1);
+    if capture_role {
+        capture_capacity
+    } else {
+        total.saturating_sub(capture_capacity).max(1)
+    }
+}
+
+/// Capture Nodeの専用枠を使うSquadかを返す。
+///
+/// 汎用plannerのmission名だけで決めると、遠方で新設されたCapture Squadが唯一の枠を
+/// 占有し、すでに前線へいる歩兵・Mechが占領できない。Capture missionは専用枠で待たせ、
+/// Attack等の占領可能Squadは枠が空いているときだけ占領役へ転用する。
+fn capital_route_uses_capture_lane(
+    operation: &CapitalRouteNodeOperation,
+    mission: &MissionType,
+    capture_member_count: usize,
+    assigned_capture_members: usize,
+) -> bool {
+    if operation.objective != CapitalRouteNodeObjective::Capture {
+        return false;
+    }
+    matches!(mission, MissionType::Capture)
+        || (capture_member_count > 0
+            && assigned_capture_members < capital_route_role_frontline_capacity(operation, true))
+}
+
+/// 前衛枠へ入れるSquadの順位を返す。
+///
+/// Squad IDや任務名を先に見ると、後方で新造された部隊がAdvanceを保持したまま、
+/// すでに接敵線へ到達した予備へStageの後退指令を出してしまう。地上DAG上の実前進度を
+/// 第一基準にし、同じ位置でだけCapture任務・占領能力・安定IDを使う。
+fn capital_route_frontline_sort_key(
+    forward_progress: u32,
+    mission: &MissionType,
+    capture_member_count: usize,
+    frontline_control_value: u64,
+    squad_id: SquadId,
+) -> (
+    std::cmp::Reverse<u32>,
+    bool,
+    bool,
+    std::cmp::Reverse<u64>,
+    u32,
+) {
+    (
+        std::cmp::Reverse(forward_progress),
+        !matches!(mission, MissionType::Capture),
+        capture_member_count == 0,
+        std::cmp::Reverse(frontline_control_value),
+        squad_id.0,
+    )
 }
 
 /// 前衛枠が埋まったSquadの待機線を、同じDAG区間の既通過セルから決める。
@@ -344,12 +495,187 @@ fn capital_route_staging_target(
         .unwrap_or(execution_target)
 }
 
+/// 近接する二次元のCapture群を、一つのArea Operationへ統合する。
+///
+/// 同じ対象集合を複数Nodeへ複製すると、一拠点の奪回で全Nodeが同時に未完了へ戻る。
+/// 先頭Nodeだけへ地域の全対象を持たせ、後続Nodeからは対象を除くことで、複数の
+/// Capture Squadによる並行占領と、単一の完了判定を両立する。一直線の回廊は統合せず、
+/// map_25のように前方へ順番に確保する。
+fn consolidate_nearby_capture_target_regions(
+    map: &Map,
+    node_anchors: &[GridPosition],
+    capture_targets: &mut [Vec<GridPosition>],
+) {
+    let capture_nodes = capture_targets
+        .iter()
+        .enumerate()
+        .filter_map(|(index, targets)| (!targets.is_empty()).then_some(index))
+        .collect::<Vec<_>>();
+    let mut start = 0;
+    while start < capture_nodes.len() {
+        let first_node = capture_nodes[start];
+        let mut end = start + 1;
+        while end < capture_nodes.len()
+            && map.distance(
+                node_anchors[first_node].x,
+                node_anchors[first_node].y,
+                node_anchors[capture_nodes[end]].x,
+                node_anchors[capture_nodes[end]].y,
+            ) <= CAPITAL_ROUTE_REGION_RADIUS
+        {
+            end += 1;
+        }
+        let group = &capture_nodes[start..end];
+        let mut regional_targets = group
+            .iter()
+            .flat_map(|index| capture_targets[*index].iter().copied())
+            .collect::<Vec<_>>();
+        regional_targets.sort_unstable_by_key(|position| (position.y, position.x));
+        regional_targets.dedup();
+        let spans_multiple_columns = regional_targets
+            .iter()
+            .map(|position| position.x)
+            .collect::<HashSet<_>>()
+            .len()
+            > 1;
+        let spans_multiple_rows = regional_targets
+            .iter()
+            .map(|position| position.y)
+            .collect::<HashSet<_>>()
+            .len()
+            > 1;
+        if regional_targets.len() > 1 && spans_multiple_columns && spans_multiple_rows {
+            capture_targets[first_node] = regional_targets;
+            for index in &group[1..] {
+                capture_targets[*index].clear();
+            }
+        }
+        start = end;
+    }
+}
+
 #[derive(Resource, Debug, Default, Clone)]
 pub(crate) struct CapitalRoutePathRegistry {
     /// EntityではなくSquadをキーにする。memberの追加・回復・退却があっても、
     /// Squad orderのidentityとDAG上の担当区間は変わらない。
     commitments: HashMap<SquadId, CapitalRouteCommitment>,
+    /// 再編でSquad IDが変わった場合に、旧Squadのorderを新Squadへ一括移送するための
+    /// 前手番member集合。Entityごとの別命令にはせず、重なる旧Squadが一つの場合だけ
+    /// 新しいSquad全体へ継承する。
+    commitment_members: HashMap<SquadId, BTreeSet<Entity>>,
     assignment_diagnostics: HashMap<CapitalRouteTopologyKey, CapitalRouteAssignmentDiagnostics>,
+}
+
+/// 再編後のSquadへ、前手番の首都戦役orderを継承する。
+///
+/// Squad IDが維持されていれば直接参照する。IDが変わった場合も、memberが重なる旧Squadが
+/// 一つだけなら、そのorderを新Squad全体へ移す。複数の旧Squadを統合した場合はどちらかの
+/// Entityの命令を優先せず、現在の需要からSquad単位で再計画する。
+fn inherited_capital_route_commitment<'a>(
+    registry: &'a CapitalRoutePathRegistry,
+    squad_id: SquadId,
+    members: &BTreeSet<Entity>,
+) -> Option<&'a CapitalRouteCommitment> {
+    if let Some(commitment) = registry.commitments.get(&squad_id) {
+        return Some(commitment);
+    }
+    let mut inherited = None;
+    for (previous_squad_id, previous_members) in &registry.commitment_members {
+        if previous_members.is_disjoint(members) {
+            continue;
+        }
+        let Some(commitment) = registry.commitments.get(previous_squad_id) else {
+            continue;
+        };
+        if inherited.is_some() {
+            return None;
+        }
+        inherited = Some(commitment);
+    }
+    inherited
+}
+
+/// 後方Nodeが再び争奪になっても、すでに先のNodeへ投入した前衛は呼び戻さない。
+///
+/// Roadmapの先頭未完了Nodeは新規・後続Squadの行き先として使う。一方、同じ経路・同じ
+/// 区間目標に対してAdvance/Stage済みのSquadは、担当Nodeが未完了である限り前進を継続する。
+/// これにより前線の小さな戦力変動で全軍が往復することを防ぐ。
+fn capital_route_active_node_for_squad(
+    operation_path_nodes: &[CapitalRouteNodeId],
+    roadmap_active_node: CapitalRouteNodeId,
+    previous: Option<&CapitalRouteCommitment>,
+    operations: &CapitalRouteNodeOperationRegistry,
+    topology_key: CapitalRouteTopologyKey,
+) -> CapitalRouteNodeId {
+    let Some(previous) = previous.filter(|commitment| {
+        matches!(
+            commitment.phase,
+            CapitalRouteExecutionPhase::Advance | CapitalRouteExecutionPhase::Stage
+        )
+    }) else {
+        return roadmap_active_node;
+    };
+    let Some(roadmap_index) = operation_path_nodes
+        .iter()
+        .position(|node| *node == roadmap_active_node)
+    else {
+        return roadmap_active_node;
+    };
+    let Some(previous_index) = operation_path_nodes
+        .iter()
+        .position(|node| *node == previous.target_node)
+    else {
+        return roadmap_active_node;
+    };
+    if previous_index <= roadmap_index {
+        return roadmap_active_node;
+    }
+    let operation_id = CapitalRouteNodeOperationId {
+        topology: topology_key,
+        node: previous.target_node,
+    };
+    if operations
+        .operations
+        .get(&operation_id)
+        .is_some_and(|operation| !capital_route_node_exit_satisfied(operation))
+    {
+        previous.target_node
+    } else {
+        roadmap_active_node
+    }
+}
+
+/// 主力が先へ進んだ後も、未確保拠点が残る優勢Areaへ護衛を一個残すNodeを返す。
+///
+/// `Dominant` は前衛全体を一拠点の奪回で呼び戻さないための解放条件であり、占領完了を
+/// 意味しない。Capture役だけを残すと歩兵が各個撃破されるため、現在Nodeより後方にある
+/// 最も近い未完了AreaへControl分隊を一個だけ残し、`Secured`になるまで占領を援護する。
+fn capital_route_dominant_capture_escort_node(
+    operation_path_nodes: &[CapitalRouteNodeId],
+    active_node: CapitalRouteNodeId,
+    operations: &CapitalRouteNodeOperationRegistry,
+    topology_key: CapitalRouteTopologyKey,
+) -> Option<CapitalRouteNodeId> {
+    let active_index = operation_path_nodes
+        .iter()
+        .position(|node| *node == active_node)?;
+    operation_path_nodes[..active_index]
+        .iter()
+        .rev()
+        .copied()
+        .find(|node| {
+            operations
+                .operations
+                .get(&CapitalRouteNodeOperationId {
+                    topology: topology_key,
+                    node: *node,
+                })
+                .is_some_and(|operation| {
+                    operation.objective == CapitalRouteNodeObjective::Capture
+                        && operation.scope == CapitalRouteNodeScope::Area
+                        && operation.state == victory_roadmap::RoadmapNodeState::Dominant
+                })
+        })
 }
 
 /// 首都戦役DAGの現在区間へ前進している実Entityを、島と区間目標で集計した結果。
@@ -361,9 +687,12 @@ pub(crate) struct CapitalRoutePathRegistry {
 struct AdvancingCapitalRouteEntities {
     by_island: HashMap<crate::ai::islands::IslandId, HashSet<Entity>>,
     by_target: HashMap<(crate::ai::islands::IslandId, GridPosition), HashSet<Entity>>,
-    /// 前衛枠が埋まり待機線へ回ったmember数。生産plannerはこの値を見て、同じ
-    /// Capture作戦への「余剰」Combat生産を止める。
-    staged_by_target: HashMap<(crate::ai::islands::IslandId, GridPosition), usize>,
+    /// 前衛枠が埋まり待機線へ回ったmember。待機中でも作戦に帰属した実戦力であり、
+    /// 生産plannerは前線へ到達するまでの時間を付けて既存戦力へ含める。
+    ///
+    /// 人数だけを持って追加Combatを一律に止めると、plannerは待機部隊を戦力として
+    /// 数えない一方で生産だけを止める矛盾になり、資金が残ったまま前線が崩れる。
+    staged_by_target: HashMap<(crate::ai::islands::IslandId, GridPosition), HashSet<Entity>>,
 }
 
 impl CapitalRoutePathRegistry {
@@ -389,12 +718,11 @@ impl CapitalRoutePathRegistry {
                 continue;
             }
             if commitment.phase == CapitalRouteExecutionPhase::Stage {
-                let staged_members = squad.members.len();
                 let entry = entities
                     .staged_by_target
                     .entry((commitment.island_id, commitment.target))
                     .or_default();
-                *entry = entry.saturating_add(staged_members);
+                entry.extend(squad.members.iter().copied());
                 continue;
             }
             if commitment.phase != CapitalRouteExecutionPhase::Advance {
@@ -510,6 +838,10 @@ const DEFENSE_THREAT_ETA: u32 = 2;
 
 /// 占領開始後に拠点を確保し切るまでに必要な最小手番数。
 const CAPTURE_COMPLETION_TURNS: u32 = 2;
+
+/// Expectedへ入れる敵生産の波数。Expectedは毎ターン再評価する直近波であり、
+/// 作戦期限全体の全生産を一括で仮想敵へ積むStressとは意図的に分ける。
+const EXPECTED_REINFORCEMENT_WAVES: u32 = 1;
 
 /// 傾向推定に残す直近の観測手番数。古い開幕編成を現在の生産傾向に混ぜない。
 const ENEMY_PRODUCTION_HISTORY_TURNS: u32 = 6;
@@ -711,6 +1043,18 @@ struct EnemyFacilitySnapshot {
     terrain: Terrain,
 }
 
+/// 敵施設が作戦地点へ到達させられる将来戦力の、用途別の見積り。
+///
+/// `expected_funds` は継続生産の必要量を作るための通常scenario、
+/// `stress_funds` は敵が施設・収入をより強く使った場合の再計画監視用である。
+/// 最小の進撃Goはこの値を読まない。Goを楽観的に保つことと、増援を作り続けることを
+/// 同じ閾値にしないためである。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct EnemyReinforcementEnvelope {
+    expected_funds: u32,
+    stress_funds: u32,
+}
+
 /// 1体の敵に対する実盤面情報。
 ///
 /// 戦力を購入価格へ換算しない。必要戦力はRollingPlanがHP・与ダメージ・移動・
@@ -764,10 +1108,12 @@ struct Operation {
     unreachable_threats: Vec<ThreatTarget>,
     /// 自軍が生産しうるいずれかの移動タイプで到達できる位置にいる敵（＝殴りに行ける敵）
     reachable_threats: Vec<ThreatTarget>,
-    /// 観測後のcounterでは接触前に止められない将来増援だけを現在編成へ含める。
-    unavoidable_reinforcements: Vec<EnemyPlanUnit>,
+    /// 通常見積りで前線へ到着する将来増援。RollingPlanの仮想敵として含める。
+    expected_reinforcements: Vec<EnemyPlanUnit>,
     /// 観測後に間に合うため、具体的counterと生産slotだけを予約する条件付き計画。
     reinforcement_contingencies: Vec<ReinforcementContingency>,
+    /// Expectedを上回る敵の最大対抗生産額。Goは止めず、次回の再計画理由として記録する。
+    stress_reinforcement_funds: u32,
     contingency_reserve_funds: u32,
 }
 
@@ -815,6 +1161,12 @@ fn issue_planned_production(
         && let Some(mut registry) = world.get_resource_mut::<V4RollingPlanRegistry>()
     {
         registry.mark_issued(step_ref, turn);
+    }
+    if planned.capture_intent.is_some()
+        && let Some(mut registry) =
+            world.get_resource_mut::<campaign_execution::V4CampaignExecutionRegistry>()
+    {
+        registry.mark_issued(planned.command.player_id, turn, &planned.command);
     }
     vec![planned.command]
 }
@@ -872,6 +1224,9 @@ struct CandidateConstraints {
 struct PlannedProduction {
     command: ProduceUnitCommand,
     deployment: Option<PlannedDeployment>,
+    /// Capture枠は完成時点からRoadmapの受入Squadに所属させる。Combat deploymentとは
+    /// 別に保持し、占領歩兵をReserve/Defenseへ落とさない。
+    capture_intent: Option<campaign_execution::CampaignProductionIntent>,
 }
 
 /// Combat / Intercept枠からpending deploymentへ渡す情報。
@@ -975,6 +1330,19 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
         &mut rolling_registry,
     );
     plan_trace.enemy_production_forecast = enemy_production_forecast;
+    // 陸続き前線ではCapture候補の選定を通常plannerへ委ねている。それでも生産完了後の
+    // 受入先はRoadmap NodeのCapture Squadでなければならないため、発注意図だけを
+    // Campaign実行registryへ追記する。
+    let capture_intents = planned
+        .iter()
+        .filter_map(|planned| planned.capture_intent.clone())
+        .collect::<Vec<_>>();
+    if !capture_intents.is_empty() {
+        world.init_resource::<campaign_execution::V4CampaignExecutionRegistry>();
+        world
+            .resource_mut::<campaign_execution::V4CampaignExecutionRegistry>()
+            .append_turn_intents(player_id, turn, &capture_intents);
+    }
     let closed_plan_ids = rolling_registry
         .audit_records(player_id)
         .into_iter()
@@ -2056,7 +2424,6 @@ fn ensure_capital_route_node_operations(world: &mut World, player_id: PlayerId) 
         }
         // Capture Nodeは、回廊から離れすぎた拠点を取り込まない。島全域の占領を
         // 1セルNodeに背負わせず、その地域で意味を持つ周辺拠点だけを出口条件にする。
-        const CAPTURE_REGION_RADIUS: u32 = 3;
         let mut capture_targets = vec![Vec::new(); topology.nodes.len()];
         for (position, _) in &properties {
             if *position == topology.nodes[topology.start_node.0].anchor
@@ -2080,13 +2447,21 @@ fn ensure_capital_route_node_operations(world: &mut World, player_id: PlayerId) 
             else {
                 continue;
             };
-            if distance <= CAPTURE_REGION_RADIUS {
+            if distance <= CAPITAL_ROUTE_REGION_RADIUS {
                 capture_targets[node].push(*position);
             }
         }
         for targets in &mut capture_targets {
             targets.sort_unstable_by_key(|position| (position.y, position.x));
             targets.dedup();
+        }
+        let node_anchors = topology
+            .nodes
+            .iter()
+            .map(|node| node.anchor)
+            .collect::<Vec<_>>();
+        if topology.routes.len() >= 2 {
+            consolidate_nearby_capture_target_regions(&map, &node_anchors, &mut capture_targets);
         }
         // 移動用のセルDAGを、そのまま作戦Nodeにはしない。全セルをNodeにすると、1マス
         // ごとに次手番の状態更新を待ち、開けた地形の代替経路まで全て制圧する誤った
@@ -2177,22 +2552,14 @@ fn ensure_capital_route_node_operations(world: &mut World, player_id: PlayerId) 
             } else {
                 CapitalRouteNodeScope::Area
             };
-            let mut control_area = match scope {
-                CapitalRouteNodeScope::Point => vec![node.anchor],
-                CapitalRouteNodeScope::Area => operation_predecessors[index]
-                    .iter()
-                    .map(|predecessor| topology.nodes[predecessor.0].anchor)
-                    .chain(std::iter::once(node.anchor))
-                    .chain(
-                        operation_successors[index]
-                            .iter()
-                            .map(|successor| topology.nodes[successor.0].anchor),
-                    )
-                    .chain(capture_targets[index].iter().copied())
-                    .collect::<Vec<_>>(),
-            };
-            control_area.sort_unstable_by_key(|position| (position.y, position.x));
-            control_area.dedup();
+            let mut control_area = capital_route_node_control_area(
+                &map,
+                &island_map,
+                key.island_id,
+                node.anchor,
+                scope,
+                &capture_targets[index],
+            );
             if let Some(exit) = crossing_exit
                 && !control_area.contains(&exit)
             {
@@ -2269,8 +2636,8 @@ fn capital_route_crossing_exit(
 
 /// Nodeの出口条件が満たされ、後続Nodeを解放してよいかを返す。
 ///
-/// Capture Nodeは周辺拠点を確保した`Secured`だけが出口であり、敵に優勢なだけの
-/// `Dominant`では後続へ進めない。Control Nodeだけは局地優勢で次の地域を解放できる。
+/// CaptureはPoint/Areaとも、Nodeに対応付けた全対象を所有した`Secured`だけが出口である。
+/// `Dominant`は局地戦況の観測値であって占領完了ではなく、後続Nodeの解放には使わない。
 fn capital_route_node_exit_satisfied(operation: &CapitalRouteNodeOperation) -> bool {
     match operation.objective {
         CapitalRouteNodeObjective::Control => matches!(
@@ -2416,11 +2783,19 @@ fn refresh_capital_route_node_operations(
                 }
             }
 
+            let owned_capture_targets = operation
+                .capture_targets
+                .iter()
+                .filter(|target| properties.get(target) == Some(&Some(player_id)))
+                .count();
             let capture_complete = operation.objective == CapitalRouteNodeObjective::Capture
-                && operation
-                    .capture_targets
-                    .iter()
-                    .all(|target| properties.get(target) == Some(&Some(player_id)));
+                && owned_capture_targets == operation.capture_targets.len();
+            let regional_capture_dominant = operation.objective
+                == CapitalRouteNodeObjective::Capture
+                && operation.scope == CapitalRouteNodeScope::Area
+                && !operation.capture_targets.is_empty()
+                && owned_capture_targets.saturating_mul(3)
+                    >= operation.capture_targets.len().saturating_mul(2);
             let crossed = operation.crossed || friendly_ground_on_exit;
             let state = if capture_complete {
                 victory_roadmap::RoadmapNodeState::Secured
@@ -2436,13 +2811,17 @@ fn refresh_capital_route_node_operations(
                 // 敵が橋頭堡へ再侵入していない限りSecuredを保ち、後段Nodeを再ロック
                 // しない。敵が戻れば下の戦力比較でContestedへ戻して再対応する。
                 victory_roadmap::RoadmapNodeState::Secured
-            } else if capturer_on_target {
-                victory_roadmap::RoadmapNodeState::Capturing
             } else if enemy_power > 0
                 && friendly_power.saturating_mul(4) < enemy_power.saturating_mul(5)
             {
                 // 地域内の敵戦力が同等以上なら、実際の競合としてContestedを維持する。
                 victory_roadmap::RoadmapNodeState::Contested
+            } else if regional_capture_dominant && friendly_power > 0 {
+                // 地域の大半を確保して局地優勢なら前衛を次へ送る。未確保・奪回拠点が
+                // 残るためSecuredとはせず、後続SquadがこのNodeを継続できる状態にする。
+                victory_roadmap::RoadmapNodeState::Dominant
+            } else if capturer_on_target {
+                victory_roadmap::RoadmapNodeState::Capturing
             } else if friendly_power > 0 {
                 victory_roadmap::RoadmapNodeState::Dominant
             } else {
@@ -2621,7 +3000,7 @@ fn capital_route_dag_nodes_for_target(
 pub(crate) fn refresh_capital_route_path_commitments(
     world: &mut World,
     player_id: PlayerId,
-    manager: &crate::ai::squad::SquadManager,
+    manager: &mut crate::ai::squad::SquadManager,
 ) {
     // 前手番の盤面・Squadを先にNode状態へ投影し、敵がいる中間Control Nodeを
     // 先頭未確保施設より優先する。DAGを単なる遠方waypoint列として扱わない。
@@ -2660,7 +3039,11 @@ pub(crate) fn refresh_capital_route_path_commitments(
         id: SquadId,
         mission: MissionType,
         target: Option<GridPosition>,
+        forward_progress: u32,
         ground_member_count: usize,
+        capture_member_count: usize,
+        frontline_control_value: u64,
+        members: BTreeSet<Entity>,
     }
 
     let mut squads_by_island = HashMap::<crate::ai::islands::IslandId, Vec<RouteSquad>>::new();
@@ -2669,6 +3052,8 @@ pub(crate) fn refresh_capital_route_path_commitments(
     }) {
         let mut island_id = None;
         let mut ground_member_count = 0_usize;
+        let mut capture_member_count = 0_usize;
+        let mut frontline_control_value = 0_u64;
         let mut crosses_island_boundary = false;
         for entity in &squad.members {
             let Some(faction) = world.get::<Faction>(*entity) else {
@@ -2699,11 +3084,40 @@ pub(crate) fn refresh_capital_route_path_commitments(
             }
             island_id = Some(member_island);
             ground_member_count = ground_member_count.saturating_add(1);
+            if stats.can_capture {
+                capture_member_count = capture_member_count.saturating_add(1);
+            }
+            // 兵種名には依存せず、前線で損害を受け止められる現在価値を護衛選定に使う。
+            // 間接兵器より直接交戦できる高価・健全な部隊を同じ前進度で先に割り当てる。
+            let health_ratio = world
+                .get::<Health>(*entity)
+                .map(|health| {
+                    u64::from(health.current).saturating_mul(100) / u64::from(health.max.max(1))
+                })
+                .unwrap_or(100);
+            let direct_fire_weight = if stats.min_range <= 1 { 2_u64 } else { 1_u64 };
+            frontline_control_value = frontline_control_value.saturating_add(
+                u64::from(stats.cost)
+                    .saturating_mul(health_ratio)
+                    .saturating_mul(direct_fire_weight),
+            );
         }
         if !crosses_island_boundary
             && let Some(island_id) = island_id
             && ground_member_count > 0
         {
+            let forward_progress = squad
+                .members
+                .iter()
+                .filter_map(|entity| world.get::<GridPosition>(*entity))
+                .filter_map(|position| {
+                    capital_route_topology_for(world, player_id, island_id)?
+                        .from_home
+                        .get(position)
+                        .copied()
+                })
+                .max()
+                .unwrap_or(0);
             squads_by_island
                 .entry(island_id)
                 .or_default()
@@ -2711,21 +3125,39 @@ pub(crate) fn refresh_capital_route_path_commitments(
                     id: squad.id,
                     mission: squad.mission_type.clone(),
                     target: squad.target,
+                    forward_progress,
                     ground_member_count,
+                    capture_member_count,
+                    frontline_control_value,
+                    members: squad.members.clone(),
                 });
         }
     }
 
     let mut commitments = HashMap::new();
     let mut assignment_diagnostics = HashMap::new();
+    // Area Capture Nodeでは、Capture Squadの出発許可を島全体の曖昧な戦力数ではなく
+    // 同じNodeへ割り当てたControl Squadの存在で決める。Capture自身を護衛扱いに
+    // して単独前進を許可することはない。
+    let mut capture_squads_by_operation =
+        HashMap::<CapitalRouteNodeOperationId, Vec<SquadId>>::new();
+    let mut control_squads_by_operation =
+        HashMap::<CapitalRouteNodeOperationId, HashSet<SquadId>>::new();
     for (island_id, mut squads) in squads_by_island {
         let Some(topology) = capital_route_topology_for(world, player_id, island_id) else {
             continue;
         };
-        // Capture役を先に前衛候補へ置く。後続を待機線へ回す場合も、占領役まで
-        // Combat Squadの後ろへ押し込めてNode完了を遅らせないためである。
+        // 前衛枠は任務名や生成順ではなく、現在のDAG前進度で毎ターン交代する。
+        // Capture/Controlの役割枠は後段で別々に数えるため、ここでは到達済みの予備を
+        // 後方の旧Squadより先にAdvanceへ昇格させる。
         squads.sort_unstable_by_key(|squad| {
-            (!matches!(squad.mission, MissionType::Capture), squad.id.0)
+            capital_route_frontline_sort_key(
+                squad.forward_progress,
+                &squad.mission,
+                squad.capture_member_count,
+                squad.frontline_control_value,
+                squad.id,
+            )
         });
         let ground_member_count = squads
             .iter()
@@ -2764,13 +3196,24 @@ pub(crate) fn refresh_capital_route_path_commitments(
         let mut assigned_routes = HashMap::<SquadId, usize>::new();
         // 同じ未完了Nodeへ送った地上member数と、後方待機線の順序をSquad単位で持つ。
         // NodeはEntityの所属を決めず、ここで決めたSquad指令だけが流量を制御する。
-        let mut frontline_members = HashMap::<CapitalRouteNodeOperationId, usize>::new();
+        let mut frontline_members = HashMap::<(CapitalRouteNodeOperationId, bool), usize>::new();
         let mut staged_squads = HashMap::<CapitalRouteNodeOperationId, usize>::new();
+        // Dominantで主力を解放したCapture Areaごとに、占領完了まで残すControl分隊は
+        // 一個だけにする。全軍を足止めせず、歩兵だけを残す状況も避ける。
+        let mut retained_capture_escorts = HashSet::<CapitalRouteNodeOperationId>::new();
+        let inherited_commitments = squads
+            .iter()
+            .filter_map(|squad| {
+                inherited_capital_route_commitment(&existing, squad.id, &squad.members)
+                    .cloned()
+                    .map(|commitment| (squad.id, commitment))
+            })
+            .collect::<HashMap<_, _>>();
 
         // 前手番のSquad orderをまず保持する。Squadのmember数が変化しても、同じ
         // Nodeを実行する限り分岐を変えないため、回復・補充で戦略目標が揺れない。
         for squad in &squads {
-            let Some(commitment) = existing.commitments.get(&squad.id) else {
+            let Some(commitment) = inherited_commitments.get(&squad.id) else {
                 continue;
             };
             let route = commitment.route.0;
@@ -2807,6 +3250,29 @@ pub(crate) fn refresh_capital_route_path_commitments(
                 assigned_counts[route].saturating_add(squad.ground_member_count);
             assigned_routes.insert(squad.id, route);
         }
+
+        // 各進軍枝で、未完了Capture Areaへ残す最良のControl護衛を先に指名する。
+        // 単にloopで最初の候補を取ると、少し先行したReconが戦車より先に護衛枠を
+        // 消費する。残存HP・価格・直接交戦能力を主基準、前進度を副基準にする。
+        let preferred_capture_escort_by_route = (0..topology.routes.len())
+            .map(|route| {
+                squads
+                    .iter()
+                    .filter(|squad| {
+                        assigned_routes.get(&squad.id) == Some(&route)
+                            && squad.capture_member_count == 0
+                            && squad.mission == MissionType::Attack
+                    })
+                    .max_by_key(|squad| {
+                        (
+                            squad.frontline_control_value,
+                            squad.forward_progress,
+                            std::cmp::Reverse(squad.id.0),
+                        )
+                    })
+                    .map(|squad| squad.id)
+            })
+            .collect::<Vec<_>>();
 
         for squad in &squads {
             let Some(route) = assigned_routes.get(&squad.id).copied() else {
@@ -2858,23 +3324,63 @@ pub(crate) fn refresh_capital_route_path_commitments(
             }
             // Nodeの状態名ではなく出口条件を見る。Capture Nodeは`Dominant`でも未完了で、
             // 周辺拠点をSecuredにするまで同じNodeのSquad指令を継続する。
-            let active_node = world
+            let topology_key = CapitalRouteTopologyKey {
+                player_id,
+                island_id,
+            };
+            let mut active_node = world
                 .get_resource::<CapitalRouteNodeOperationRegistry>()
-                .and_then(|registry| {
-                    operation_path_nodes.iter().copied().find(|node| {
-                        registry
-                            .operations
-                            .get(&CapitalRouteNodeOperationId {
-                                topology: CapitalRouteTopologyKey {
-                                    player_id,
-                                    island_id,
-                                },
-                                node: *node,
-                            })
-                            .is_none_or(|operation| !capital_route_node_exit_satisfied(operation))
-                    })
+                .map(|registry| {
+                    let roadmap_active_node = operation_path_nodes
+                        .iter()
+                        .copied()
+                        .find(|node| {
+                            registry
+                                .operations
+                                .get(&CapitalRouteNodeOperationId {
+                                    topology: topology_key,
+                                    node: *node,
+                                })
+                                .is_none_or(|operation| {
+                                    !capital_route_node_exit_satisfied(operation)
+                                })
+                        })
+                        .unwrap_or(target_node);
+                    capital_route_active_node_for_squad(
+                        &operation_path_nodes,
+                        roadmap_active_node,
+                        inherited_commitments.get(&squad.id),
+                        registry,
+                        topology_key,
+                    )
                 })
                 .unwrap_or(target_node);
+            if squad.capture_member_count == 0
+                && squad.mission == MissionType::Attack
+                && preferred_capture_escort_by_route
+                    .get(route)
+                    .copied()
+                    .flatten()
+                    == Some(squad.id)
+                && let Some(escort_node) = world
+                    .get_resource::<CapitalRouteNodeOperationRegistry>()
+                    .and_then(|registry| {
+                        capital_route_dominant_capture_escort_node(
+                            &operation_path_nodes,
+                            active_node,
+                            registry,
+                            topology_key,
+                        )
+                    })
+            {
+                let escort_operation_id = CapitalRouteNodeOperationId {
+                    topology: topology_key,
+                    node: escort_node,
+                };
+                if retained_capture_escorts.insert(escort_operation_id) {
+                    active_node = escort_node;
+                }
+            }
             let node_operation = world
                 .get_resource::<CapitalRouteNodeOperationRegistry>()
                 .and_then(|registry| {
@@ -2893,7 +3399,60 @@ pub(crate) fn refresh_capital_route_path_commitments(
                 path_unavailable_counts[route] = path_unavailable_counts[route].saturating_add(1);
                 continue;
             };
-            let requested_phase = capital_route_execution_phase(&squad.mission);
+            let is_capture_squad = squad.mission == MissionType::Capture;
+            let active_node_progress = topology
+                .from_home
+                .get(&node_operation.anchor)
+                .copied()
+                .unwrap_or(0);
+            // 既存targetが別枝の首都側を指していても、現在Nodeより前方ならControl
+            // Squadである。現在Nodeを飛ばして遠方targetへ行かせず、まずAreaを制圧する。
+            let target_is_on_or_beyond_active_node = squad.target.is_some_and(|target| {
+                path.contains(&target)
+                    || topology
+                        .from_home
+                        .get(&target)
+                        .is_some_and(|progress| *progress >= active_node_progress)
+            });
+            // Captureの明示目標は、単に自首都から遠いだけでは現在Nodeへ
+            // 取り込まない。現在Nodeの拠点、または選択済みDAG経路上の目標だけが
+            // Roadmapに属し、外周の拠点任務はSquad独自の進路を保つ。
+            let capture_target_matches_active_route = squad.target.is_some_and(|target| {
+                path.contains(&target) || node_operation.capture_targets.contains(&target)
+            });
+            let target_belongs_to_other_capture_node = squad.target.is_some_and(|target| {
+                world
+                    .get_resource::<CapitalRouteNodeOperationRegistry>()
+                    .is_some_and(|registry| {
+                        registry.operations.values().any(|operation| {
+                            operation.id.topology.player_id == player_id
+                                && operation.id.topology.island_id == island_id
+                                && operation.id != node_operation.id
+                                && operation.objective == CapitalRouteNodeObjective::Capture
+                                && !capital_route_node_exit_satisfied(operation)
+                                && operation.capture_targets.contains(&target)
+                        })
+                    })
+            });
+            if !capital_route_capture_joins_active_node(
+                &squad.mission,
+                squad.target.is_some(),
+                capture_target_matches_active_route,
+                target_belongs_to_other_capture_node,
+            ) {
+                // 後方・別枝の地域占領はSquad orderを正本とし、DAG commitmentを
+                // 作らない。完了後に前方目標へ変われば、現在Nodeへ再参加する。
+                continue;
+            }
+            let is_control_squad = capital_route_controls_active_node(
+                &squad.mission,
+                target_is_on_or_beyond_active_node,
+            );
+            let requested_phase = if is_capture_squad || is_control_squad {
+                CapitalRouteExecutionPhase::Advance
+            } else {
+                capital_route_execution_phase(&squad.mission)
+            };
             let directive_target = squad.target.filter(|target| path.contains(target));
             let forward_target = match requested_phase {
                 // 橋Nodeはanchor（橋の上）ではなく、向こう岸の出口へ到達するまでを
@@ -2933,12 +3492,26 @@ pub(crate) fn refresh_capital_route_path_commitments(
             };
             let operation_id = node_operation.id;
             let frontline_capacity = capital_route_node_frontline_capacity(&node_operation);
+            let assigned_capture_members = frontline_members
+                .get(&(operation_id, true))
+                .copied()
+                .unwrap_or(0);
+            let uses_capture_lane = capital_route_uses_capture_lane(
+                &node_operation,
+                &squad.mission,
+                squad.capture_member_count,
+                assigned_capture_members,
+            );
+            let role_capacity =
+                capital_route_role_frontline_capacity(&node_operation, uses_capture_lane);
             let (phase, execution_target) =
                 if requested_phase != CapitalRouteExecutionPhase::Advance {
                     (requested_phase, forward_target)
                 } else {
-                    let assigned = frontline_members.entry(operation_id).or_default();
-                    if *assigned < frontline_capacity {
+                    let assigned = frontline_members
+                        .entry((operation_id, uses_capture_lane))
+                        .or_default();
+                    if *assigned < role_capacity {
                         *assigned = assigned.saturating_add(squad.ground_member_count);
                         (CapitalRouteExecutionPhase::Advance, forward_target)
                     } else {
@@ -2954,6 +3527,24 @@ pub(crate) fn refresh_capital_route_path_commitments(
                         (CapitalRouteExecutionPhase::Stage, target)
                     }
                 };
+            if is_capture_squad
+                && node_operation.objective == CapitalRouteNodeObjective::Capture
+                && phase == CapitalRouteExecutionPhase::Advance
+            {
+                capture_squads_by_operation
+                    .entry(operation_id)
+                    .or_default()
+                    .push(squad.id);
+            }
+            if is_control_squad
+                && !uses_capture_lane
+                && phase == CapitalRouteExecutionPhase::Advance
+            {
+                control_squads_by_operation
+                    .entry(operation_id)
+                    .or_default()
+                    .insert(squad.id);
+            }
             committed_counts[route] =
                 committed_counts[route].saturating_add(squad.ground_member_count);
             commitments.insert(
@@ -2991,6 +3582,40 @@ pub(crate) fn refresh_capital_route_path_commitments(
             },
         );
     }
+    let enemy_positions = world
+        .iter_entities()
+        .filter_map(|entity| {
+            let faction = entity.get::<Faction>()?;
+            let position = entity.get::<GridPosition>()?;
+            (faction.0 != player_id).then_some(*position)
+        })
+        .collect::<Vec<_>>();
+    for (operation_id, capture_squads) in capture_squads_by_operation {
+        let has_control_squad = control_squads_by_operation
+            .get(&operation_id)
+            .is_some_and(|squads| !squads.is_empty());
+        for squad_id in capture_squads {
+            let Some(commitment) = commitments.get(&squad_id) else {
+                continue;
+            };
+            let local_enemy_present = enemy_positions
+                .iter()
+                .any(|position| commitment.control_area.contains(position));
+            // 敵がいないAreaはControl Squadの到着待ちで占領を止めない。敵がいるAreaは
+            // 同じNodeへControl Squadを割り当てた場合だけCapture Squadを発進させる。
+            let departure_authorized = !local_enemy_present || has_control_squad;
+            if let Some(squad) = manager
+                .squads
+                .iter_mut()
+                .find(|squad| squad.id == squad_id && squad.owner_id == Some(player_id))
+            {
+                squad.departure_authorized = departure_authorized;
+                if departure_authorized && squad.phase == crate::ai::squad::MissionPhase::Forming {
+                    squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+                }
+            }
+        }
+    }
     let mut registry = world
         .remove_resource::<CapitalRoutePathRegistry>()
         .unwrap_or_default();
@@ -2998,6 +3623,17 @@ pub(crate) fn refresh_capital_route_path_commitments(
         .commitments
         .retain(|_, commitment| commitment.player_id != player_id);
     registry.commitments.extend(commitments);
+    let committed_squad_ids = registry.commitments.keys().copied().collect::<HashSet<_>>();
+    registry
+        .commitment_members
+        .retain(|squad_id, _| committed_squad_ids.contains(squad_id));
+    registry.commitment_members.extend(
+        manager
+            .squads
+            .iter()
+            .filter(|squad| committed_squad_ids.contains(&squad.id))
+            .map(|squad| (squad.id, squad.members.clone())),
+    );
     registry
         .assignment_diagnostics
         .retain(|key, _| key.player_id != player_id);
@@ -3022,6 +3658,41 @@ fn capital_route_region_reached(
         CapitalRouteNodeScope::Area => commitment.control_area.contains(&position),
     };
     reached_scope && (commitment.crossing_exit.is_none() || commitment.crossed)
+}
+
+/// Areaへ到達した後の移動候補を、Roadmapが指示した局地戦領域へ限定する。
+///
+/// `None` はDAG外、到達前、保持・補給、回復中のいずれかであり、呼び出し側の通常の
+/// 候補集合を使う。`Some` の場合だけ、Control/Captureの戦術器が同じNode内で位置を
+/// 選ぶ。これによりanchorへの一点直行を止めても、古いSquad目標へ逸脱しない。
+pub(crate) fn capital_route_allows_tactical_position(
+    world: &World,
+    player_id: PlayerId,
+    entity: Entity,
+    position: GridPosition,
+) -> Option<bool> {
+    if capital_route_is_recovering(world, player_id, entity) {
+        return None;
+    }
+    let commitment = capital_route_commitment_for_entity(world, player_id, entity)?;
+    if commitment.phase != CapitalRouteExecutionPhase::Advance {
+        return None;
+    }
+    let current = world.get::<GridPosition>(entity).copied()?;
+    if !capital_route_region_reached(commitment, current) {
+        return None;
+    }
+    let inside_control_area = commitment.control_area.contains(&position);
+    let can_capture = world
+        .get::<UnitStats>(entity)
+        .is_some_and(|stats| stats.can_capture);
+    let reserved_for_capturer = !can_capture
+        && world
+            .get_resource::<CapitalRouteNodeOperationRegistry>()
+            .is_some_and(|operations| {
+                capital_route_capture_target_is_reserved(operations, player_id, position)
+            });
+    Some(inside_control_area && !reserved_for_capturer)
 }
 
 /// 行動決定側へ、現在の地域作戦の戦術的な目標を返す。
@@ -3310,6 +3981,8 @@ pub fn capital_route_diagnostics_for_player(
                                 squad.target_island,
                                 squad.target,
                                 format!("{:?}", squad.mission_type),
+                                format!("{:?}", squad.phase),
+                                squad.departure_authorized,
                             ),
                         )
                     })
@@ -3343,6 +4016,8 @@ pub fn capital_route_diagnostics_for_player(
                     })
                 })
                 .collect::<Vec<_>>();
+            let mut ground_units = Vec::new();
+            // 旧トレース利用者向けにTankだけの配列も残す。
             let mut tanks = Vec::new();
             let mut ground_unit_count = 0usize;
             let mut committed_ground_unit_count = 0usize;
@@ -3368,26 +4043,39 @@ pub fn capital_route_diagnostics_for_player(
                 ground_unit_count = ground_unit_count.saturating_add(1);
                 let squad_context = squad_contexts.get(&entity.id());
                 let commitment = squad_context
-                    .and_then(|(squad_id, _, _, _)| commitments.get(squad_id))
+                    .and_then(|(squad_id, _, _, _, _, _)| commitments.get(squad_id))
                     .filter(|commitment| {
                         commitment.player_id == player_id && commitment.island_id == key.island_id
                     });
                 if commitment.is_some() {
                     committed_ground_unit_count = committed_ground_unit_count.saturating_add(1);
                 }
-                let squad_id = squad_context.map(|(squad_id, _, _, _)| *squad_id);
-                let squad_target = squad_context.and_then(|(_, _, target, _)| *target);
-                let squad_mission = squad_context.map(|(_, _, _, mission)| mission.clone());
+                let squad_id = squad_context.map(|(squad_id, _, _, _, _, _)| *squad_id);
+                let squad_target =
+                    squad_context.and_then(|(_, _, target, _, _, _)| *target);
+                let squad_mission =
+                    squad_context.map(|(_, _, _, mission, _, _)| mission.clone());
+                let squad_phase = squad_context.map(|(_, _, _, _, phase, _)| phase.clone());
+                let departure_authorized =
+                    squad_context.map(|(_, _, _, _, _, authorized)| *authorized);
+                let operation_squad_id = world
+                    .get_resource::<crate::ai::operation_assignment::UnitOperationRegistry>()
+                    .and_then(|registry| registry.assignment(entity.id()))
+                    .and_then(|assignment| assignment.squad_id);
+                let order_resolved =
+                    capital_route_commitment_for_entity(world, player_id, entity.id()).is_some();
                 let uncommitted_reason = if commitment.is_some() {
                     None
                 } else {
                     Some(
                         match squad_context {
                             None => "no_squad",
-                            Some((_, island_id, _, _)) if *island_id != Some(key.island_id) => {
+                            Some((_, island_id, _, _, _, _))
+                                if *island_id != Some(key.island_id) =>
+                            {
                                 "other_island_squad"
                             }
-                            Some((_, _, None, _)) => "squad_without_target",
+                            Some((_, _, None, _, _, _)) => "squad_without_target",
                             Some(_) => "squad_target_without_dag_commitment",
                         }
                         .to_owned(),
@@ -3398,21 +4086,23 @@ pub fn capital_route_diagnostics_for_player(
                         .entry(reason.clone())
                         .or_default() += 1;
                 }
-                if stats.unit_type != UnitType::Tank {
-                    continue;
-                }
                 let progress = topology.from_home.get(position).copied();
                 let target_progress = commitment
                     .and_then(|commitment| topology.from_home.get(&commitment.target).copied());
-                tanks.push(serde_json::json!({
+                let diagnostic = serde_json::json!({
                     "entity_id": entity.id().to_bits(),
+                    "unit_type": format!("{:?}", stats.unit_type),
                     "x": position.x,
                     "y": position.y,
                     "progress": progress,
                     "squad_id": squad_id.map(|squad_id| squad_id.0),
                     "squad_mission": squad_mission,
+                    "squad_phase": squad_phase,
                     "squad_target_x": squad_target.map(|target| target.x),
                     "squad_target_y": squad_target.map(|target| target.y),
+                    "departure_authorized": departure_authorized,
+                    "operation_squad_id": operation_squad_id.map(|squad_id| squad_id.0),
+                    "order_resolved": order_resolved,
                     "uncommitted_reason": uncommitted_reason,
                     "route_index": commitment.map(|commitment| commitment.route.0),
                     "phase": commitment.map(|commitment| format!("{:?}", commitment.phase)),
@@ -3439,8 +4129,13 @@ pub fn capital_route_diagnostics_for_player(
                         serde_json::json!({ "x": cell.x, "y": cell.y })
                     }).collect::<Vec<_>>()),
                     "before_target": progress.zip(target_progress).map(|(at, target)| at < target),
-                }));
+                });
+                if stats.unit_type == UnitType::Tank {
+                    tanks.push(diagnostic.clone());
+                }
+                ground_units.push(diagnostic);
             }
+            ground_units.sort_by_key(|unit| unit["entity_id"].as_u64().unwrap_or_default());
             tanks.sort_by_key(|tank| tank["entity_id"].as_u64().unwrap_or_default());
             let edge_count = topology
                 .nodes
@@ -3508,6 +4203,7 @@ pub fn capital_route_diagnostics_for_player(
                     "committed_by_route": assignment.committed_by_route,
                     "path_unavailable_by_route": assignment.path_unavailable_by_route,
                 },
+                "ground_units": ground_units,
                 "tanks": tanks,
             }))
         })
@@ -4885,6 +5581,17 @@ fn build_operations(
             })
     };
 
+    // 継続中Planのsnapshotと当ターンRoadmapは、同じ島・同じ目的のOperationを
+    // 同時に提示し得る。両方を別候補として残すと同じAssaultCapitalがCapture枠を
+    // 二重要求し、戦闘生産を毎ターン2体分の歩兵で圧迫する。Plan継続性は後段の
+    // `continuing` で合流できるため、campaign identityごとに一件へ正規化する。
+    let mut seen_campaign_operations = HashSet::new();
+    raw.retain(|(kind, cluster)| {
+        campaign_for_cluster(*kind, cluster).is_none_or(|objective| {
+            seen_campaign_operations.insert((objective.kind.priority_rank(), objective.island_id))
+        })
+    });
+
     // 上位campaignと永続Planが所有する作戦を必須として識別し、追加の局地候補だけを
     // 同時実行容量へ収める。固定4件で第5の戦略作戦を消してはならない。
     let mut scored: Vec<OperationCandidate> = raw
@@ -5140,19 +5847,20 @@ fn enemy_facility_arrival(
 }
 
 /// 敵施設も期限内に到着できる最寄り作戦へ一意に割り当て、全収入の重複計上を防ぐ。
-fn projected_enemy_reinforcement_funds(
+fn projected_enemy_reinforcement_envelope(
     scan: &BoardScan,
     ctx: &mut ReachCtx,
     anchors: &[GridPosition],
     horizons: &[u32],
     anchor_index: usize,
-) -> u32 {
+) -> EnemyReinforcementEnvelope {
     if scan.enemy_production_slots == 0 {
-        return 0;
+        return EnemyReinforcementEnvelope::default();
     }
     let mut local_slots = 0_u32;
     let mut production_capacity = 0_u32;
     let mut available_slot_turns = 0_u32;
+    let mut expected_wave_capacity = 0_u32;
     for facility in &scan.enemy_facilities {
         let assignment = anchors
             .iter()
@@ -5190,24 +5898,38 @@ fn projected_enemy_reinforcement_funds(
         available_slot_turns = available_slot_turns.saturating_add(production_turns);
         production_capacity =
             production_capacity.saturating_add(unit_cost.saturating_mul(production_turns));
+        // Expectedでは将来全turnではなく、次の生産波にこの施設が出せる代表unitの
+        // 価格だけを使う。次波以降は次手番の盤面・観測で再計画する。
+        expected_wave_capacity = expected_wave_capacity.saturating_add(unit_cost);
     }
     if local_slots == 0 {
-        return 0;
+        return EnemyReinforcementEnvelope::default();
     }
     let allocated_income_per_turn = u64::from(scan.enemy_income)
         .saturating_mul(u64::from(local_slots))
         / u64::from(scan.enemy_production_slots.max(1));
     let income_capacity =
         allocated_income_per_turn.saturating_mul(u64::from(horizons[anchor_index]));
-    // 敵工場数×期限は物理上限に過ぎない。実際に観測した生産ペースを超えて
-    // 「敵が毎枠を最大単価で埋める」とは見積もらない。複数前線には敵の推定
-    // 生産額を到達可能slot数に比例配分し、局地ごとの二重計上も避ける。
-    let observed_capacity = u64::from(scan.enemy_production_forecast.expected_cost_next_turn)
-        .saturating_mul(u64::from(available_slot_turns))
+    // 敵工場数×期限は物理上限に過ぎない。収入で賄えない額をstress scenarioへ
+    // 混ぜないよう先に物理・資金両方で上限を固定する。
+    let stress_capacity =
+        production_capacity.min(u32::try_from(income_capacity).unwrap_or(u32::MAX));
+    // 実観測をExpectedへ反映する。一方、初回観測は開幕配置と区別できないため
+    // forecastが0になる。そこで次の生産波の施設価格を事前分布として下限にし、
+    // 未観測=敵が生産しない、という誤った停止を防ぐ。
+    let observed_wave_capacity = u64::from(scan.enemy_production_forecast.expected_cost_next_turn)
+        .saturating_mul(u64::from(local_slots))
         / u64::from(scan.enemy_production_slots.max(1));
-    production_capacity
-        .min(u32::try_from(income_capacity).unwrap_or(u32::MAX))
-        .min(u32::try_from(observed_capacity).unwrap_or(u32::MAX))
+    let prior_wave_capacity =
+        expected_wave_capacity.min(u32::try_from(allocated_income_per_turn).unwrap_or(u32::MAX));
+    let expected_capacity = u32::try_from(observed_wave_capacity)
+        .unwrap_or(u32::MAX)
+        .max(prior_wave_capacity)
+        .min(stress_capacity);
+    EnemyReinforcementEnvelope {
+        expected_funds: expected_capacity,
+        stress_funds: stress_capacity,
+    }
 }
 
 /// 1 つの作戦について観測量を集め、枠を導出する。
@@ -5476,9 +6198,10 @@ fn build_operation(
         }
     }
 
-    let enemy_reinforcement_funds = anchor_index.map_or(0, |index| {
-        projected_enemy_reinforcement_funds(scan, ctx, anchors, horizons, index)
-    });
+    let enemy_reinforcement = anchor_index
+        .map_or_else(EnemyReinforcementEnvelope::default, |index| {
+            projected_enemy_reinforcement_envelope(scan, ctx, anchors, horizons, index)
+        });
 
     // 輸送 1 往復にかかるターン数（片道リードタイムの 2 倍）
     let transport_round_trip_turns = deploy_lead_time.saturating_mul(2).max(1);
@@ -5488,7 +6211,9 @@ fn build_operation(
         friendly_capture_units_committed,
         enemy_combat_units,
         friendly_combat_units_committed,
-        enemy_reinforcement_funds,
+        // OperationFactsの既存フィールドはExpectedを保持する。Go判定には使わず、
+        // RollingPlanへ渡す通常の継続生産scenarioだけに使う。
+        enemy_reinforcement_funds: enemy_reinforcement.expected_funds,
         friendly_intercept_units_committed,
         deploy_lead_time,
         enemy_contact_eta: if enemy_contact_eta == u32::MAX {
@@ -5526,18 +6251,39 @@ fn build_operation(
         filled: OperationSlots::default(),
         unreachable_threats,
         reachable_threats,
-        unavoidable_reinforcements: Vec::new(),
+        expected_reinforcements: Vec::new(),
         reinforcement_contingencies: Vec::new(),
+        stress_reinforcement_funds: enemy_reinforcement.stress_funds,
         contingency_reserve_funds: 0,
     };
-    let assessment =
-        enemy_reinforcement_assessment(scan, ctx, &operation, operation.threat_horizon.max(1));
-    // 仮想増援は観測されるまで現在バッチの敵にしない。実際に生産されたunitは
-    // 次手番のBoardScanでreachable_threatsへ入り、実HP・兵種・位置で再計画される。
-    operation.unavoidable_reinforcements = Vec::new();
-    operation.reinforcement_contingencies = assessment.contingencies;
-    // 未観測の敵生産に対するcounter候補は資金を拘束しない。実体を観測した手番で
-    // その時点の空き施設・到達性・所持金を使って必要額を見積もり直す。
+    let horizon = operation.threat_horizon.max(1);
+    let expected_assessment = enemy_reinforcement_assessment(
+        scan,
+        ctx,
+        &operation,
+        horizon,
+        enemy_reinforcement.expected_funds,
+        ReinforcementScenario::Expected,
+    );
+    let stress_assessment = enemy_reinforcement_assessment(
+        scan,
+        ctx,
+        &operation,
+        horizon,
+        enemy_reinforcement.stress_funds,
+        ReinforcementScenario::Stress,
+    );
+    // Expectedは現在のRollingPlanへ仮想敵として渡す。Go判定とは独立しているため、
+    // 最低限の戦力で進撃を開始しつつ、到達時刻付きの次波へ備えた生産を続けられる。
+    operation.expected_reinforcements = expected_assessment.reinforcements;
+    // 可視敵がいなくても、期限内に前線へ到着するExpectedがあれば継続生産を開始する。
+    // これは戦闘開始のGoではなく、到着予定の敵に対する編成開始である。
+    operation.slots.combat_plan_required = u32::from(
+        !operation.reachable_threats.is_empty() || !operation.expected_reinforcements.is_empty(),
+    );
+    operation.reinforcement_contingencies = stress_assessment.contingencies;
+    // Stressは現在のGoや現金を固定しない。観測時に実兵種・実HPで再計画するための
+    // counter候補として残し、Expected生産を予約資金で止めない。
     operation.contingency_reserve_funds = 0;
     operation
 }
@@ -5622,6 +6368,7 @@ fn plan_production_with_registry(
             requires_transport: op.facts.requires_transport,
             enemy_combat_units: op.facts.enemy_combat_units,
             enemy_reinforcement_funds: op.facts.enemy_reinforcement_funds,
+            enemy_stress_reinforcement_funds: op.stress_reinforcement_funds,
             contingency_reserve_funds: op.contingency_reserve_funds,
             reinforcement_contingencies: op
                 .reinforcement_contingencies
@@ -5754,6 +6501,10 @@ fn plan_production_with_registry(
                 committed_by_operation.get(&op_index),
                 continuation_plan_id,
             );
+            // Stageは前衛ではないが、Roadmapが同じDAG区間へ予約した実Entityである。
+            // 到着予定付きの既存戦力としてRollingPlanへ渡し、人数だけを根拠に
+            // 追加生産を禁止する第二の判定器にはしない。
+            let mut staged_for_plan = HashSet::new();
             if let Some(island_id) = operations[op_index].island_id {
                 match operation_kind {
                     OperationKind::Capture => {
@@ -5764,6 +6515,12 @@ fn plan_production_with_registry(
                             {
                                 committed_for_plan.extend(route_entities.iter().copied());
                             }
+                            if let Some(route_entities) = advancing_route_entities
+                                .staged_by_target
+                                .get(&(island_id, *objective))
+                            {
+                                staged_for_plan.extend(route_entities.iter().copied());
+                            }
                         }
                     }
                     OperationKind::AssaultCapital if operations[op_index].execution_authorized => {
@@ -5771,6 +6528,13 @@ fn plan_production_with_registry(
                             advancing_route_entities.by_island.get(&island_id)
                         {
                             committed_for_plan.extend(route_entities.iter().copied());
+                        }
+                        for ((staged_island, _), route_entities) in
+                            &advancing_route_entities.staged_by_target
+                        {
+                            if *staged_island == island_id {
+                                staged_for_plan.extend(route_entities.iter().copied());
+                            }
                         }
                     }
                     OperationKind::Defense | OperationKind::AssaultCapital => {}
@@ -5786,6 +6550,7 @@ fn plan_production_with_registry(
                 } else {
                     &committed_for_plan
                 },
+                &staged_for_plan,
                 spendable_funds,
                 !allow_structural_slots,
             );
@@ -5931,17 +6696,23 @@ fn plan_production_with_registry(
                         occupation_turn: plan.occupation_turn,
                         production_cost: plan.production_cost,
                         expected_loss: plan.expected_loss,
+                        surviving_combat_value: plan.surviving_combat_value,
+                        required_overmatch_value: plan.required_overmatch_value,
+                        overmatch_ready: plan.overmatch_ready,
                         protected_unit_count: plan.protected_unit_count,
                         protected_survivor_count: plan.protected_survivor_count,
                         required_capture_survivor_count: plan.required_capture_survivor_count,
                         candidates_considered: plan.candidates_considered,
+                        candidates_pruned: plan.candidates_pruned,
                         search_truncated: plan.search_truncated,
                     });
                 if selected.plan_id.is_none() {
-                    // `NoFeasibleReplacement`は診断候補であって実行計画ではない。
-                    // 先頭の購入だけをPlanIdなしで発注すると、次手番に継続も撤回も
-                    // できず汎用任務へ流れるため、この作戦のCombat枠は実行しない。
-                    clear_slot(&mut operations[op_index], SlotKind::Combat);
+                    // 長期Expectedを今の資金で全滅できない場合でも、best-effortは
+                    // 当手番に到達可能なscreenを返している。これを捨てると「敵増援を
+                    // 多く見積もるほど1体も生産しない」逆転が起きる。
+                    // PlanIdなしの購入は永続計画に固定せず、次手番の実敵・資金・
+                    // 生産結果で必ず再評価する即時Combatとして発行する。
+                    rolling_plans.insert(op_index, selected);
                     continue;
                 }
                 rolling_plans.insert(op_index, selected);
@@ -6102,6 +6873,22 @@ fn plan_production_with_registry(
                 facility: candidate.facility,
             },
         });
+        let capture_intent = (slot_kind == SlotKind::Capture)
+            .then(|| {
+                operations[op_index].island_id.map(|island_id| {
+                    campaign_execution::CampaignProductionIntent {
+                        command: ProduceUnitCommand {
+                            player_id,
+                            target_x: candidate.facility.x,
+                            target_y: candidate.facility.y,
+                            unit_type: candidate.unit_type,
+                        },
+                        island_id,
+                        role: campaign_execution::CampaignProductionRole::Capture,
+                    }
+                })
+            })
+            .flatten();
         commands.push(PlannedProduction {
             command: ProduceUnitCommand {
                 player_id,
@@ -6110,6 +6897,7 @@ fn plan_production_with_registry(
                 unit_type: candidate.unit_type,
             },
             deployment,
+            capture_intent,
         });
     }
 
@@ -6128,23 +6916,11 @@ fn plan_production_with_registry(
         remaining_funds.saturating_sub(unissued_plan_reserve.saturating_add(contingency_reserve));
     // 到達性と対敵有効度は、残額を工場へ配るたびに変わらない。候補表をここで一度だけ
     // 作り、以下のループでは資金・使用済み施設だけを更新する。
-    let immediate_combat_options = immediate_combat_options(scan, &mut ctx, &operations, player_id)
-        .into_iter()
-        .filter(|option| {
-            let operation = &operations[option.operation_index];
-            // Mustとして選ばれたRollingPlanは維持するが、前衛枠を超えて待機線へ
-            // 回ったmemberがいるCapture作戦には、余剰Combatをさらに積まない。
-            // これで工場の空きだけを根拠に同一出口へ量産することを防ぐ。
-            operation.kind != OperationKind::Capture
-                || operation.island_id.is_none_or(|island_id| {
-                    !operation.objective_properties.iter().any(|objective| {
-                        advancing_route_entities
-                            .staged_by_target
-                            .contains_key(&(island_id, *objective))
-                    })
-                })
-        })
-        .collect::<Vec<_>>();
+    // 待機線の有無だけで余剰Combatを一律停止しない。Stage戦力は既に
+    // RollingPlanの到着予定付き既存戦力へ入っているため、不足が残るときだけ
+    // ここへ到達する。実在敵への有効打・到着性・HP上限による既存の枝刈りで、
+    // 同一出口への無目的な量産は防ぐ。
+    let immediate_combat_options = immediate_combat_options(scan, &mut ctx, &operations, player_id);
     // 1手番に1体が与えられる攻撃は1回だけなので、同じ敵HPを複数の工場枠で
     // 仮想的に何度も消費しない。ここは経路探索済みの攻撃表への割当だけであり、
     // 「1体追加ごとの将来戦闘シミュレーション」にはしない。
@@ -6226,6 +7002,7 @@ fn plan_production_with_registry(
                 unit_type: candidate.unit_type,
             },
             deployment: Some(deployment),
+            capture_intent: None,
         });
     }
 
@@ -6275,15 +7052,23 @@ fn committed_entities_for_plan(
         .collect()
 }
 
-/// 敵が保持する生産施設と収入から、作戦地点へ期限内に到着できるcounter増援列を作る。
+/// 敵が保持する生産施設と収入から、作戦地点へ期限内に到着できる増援列を作る。
 ///
 /// 現在数へ固定値を足すのではなく、各手番の資金、facility slot、生産可能兵種、移動ETAを
-/// 同じ時間軸へ置く。敵の現在資金は非公開なので0から始め、将来収入だけを使う悲観scenario
-/// とする。これは実際の敵命令の予言ではなく、成立しない甘い計画を弾くstress testである。
+/// 同じ時間軸へ置く。敵の現在資金は非公開なので0から始め、将来収入だけを使う。
+/// Expectedは通常の継続戦力、Stressは観測後counterの再計画対象として用途を分ける。
 #[derive(Debug, Default)]
 struct ReinforcementAssessment {
-    unavoidable: Vec<EnemyPlanUnit>,
+    reinforcements: Vec<EnemyPlanUnit>,
     contingencies: Vec<ReinforcementContingency>,
+}
+
+/// Expectedは継続生産で倒す対象、Stressは予備counterと再計画の対象として扱う。
+/// どちらも進撃Goを決めないため、最小のGo条件を強めずに生産だけを強くできる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReinforcementScenario {
+    Expected,
+    Stress,
 }
 
 /// 敵増援ごとに接触turnと、観測後に生産する最速counterの接触turnを比較する。
@@ -6293,8 +7078,9 @@ fn enemy_reinforcement_assessment(
     ctx: &mut ReachCtx,
     op: &Operation,
     horizon: u32,
+    scenario_budget: u32,
+    scenario: ReinforcementScenario,
 ) -> ReinforcementAssessment {
-    let scenario_budget = op.facts.enemy_reinforcement_funds;
     if scenario_budget == 0 {
         return ReinforcementAssessment::default();
     }
@@ -6313,9 +7099,21 @@ fn enemy_reinforcement_assessment(
         .iter()
         .map(|threat| threat.stats.unit_type)
         .collect::<HashSet<_>>();
-    let forecast_dominant_type = scan.enemy_production_forecast.dominant_unit_type;
+    // 観測済みの局地兵種と直近生産の主兵種をExpectedの候補集合にする。
+    // dominant一種類だけへ絞ると、敵の航空・地上混成を一方の相性だけで見積もり、
+    // 対空や占領阻止を後追いにするため、少なくとも観測兵種の混成を維持する。
+    let mut expected_enemy_types = observed_enemy_types.clone();
+    if let Some(unit_type) = scan.enemy_production_forecast.dominant_unit_type {
+        expected_enemy_types.insert(unit_type);
+    }
 
-    for build_turn in 1..horizon {
+    let last_build_turn = match scenario {
+        ReinforcementScenario::Expected => {
+            EXPECTED_REINFORCEMENT_WAVES.min(horizon.saturating_sub(1))
+        }
+        ReinforcementScenario::Stress => horizon.saturating_sub(1),
+    };
+    for build_turn in 1..=last_build_turn {
         let mut projected_types = HashSet::new();
         let income = scan
             .enemy_income
@@ -6330,9 +7128,12 @@ fn enemy_reinforcement_assessment(
                     stats.max_cargo == 0
                         && stats.cost > 0
                         && stats.cost <= budget
-                        // 未観測の兵種を毎手番最悪ケースへ置換しない。実生産の傾向が
-                        // 取れている間は、その主兵種を条件付き見込みの代表に使う。
-                        && forecast_dominant_type.is_none_or(|unit_type| unit_type == stats.unit_type)
+                        // Expectedは観測済み混成と生産履歴の主兵種を交互に見積もる。
+                        // 観測が無い場合だけ、到達可能な兵種から通常の前線圧を選ぶ。
+                        && (scenario == ReinforcementScenario::Stress
+                            || expected_enemy_types.is_empty()
+                            || expected_enemy_types.contains(&stats.unit_type)
+                            || stats.can_capture)
                         && scan.can_produce(facility.terrain, *unit_type)
                         && ctx.is_reachable(
                             &scan.map,
@@ -6358,7 +7159,10 @@ fn enemy_reinforcement_assessment(
                     let can_be_engaged = friendly_combat_types.iter().any(|friendly| {
                         best_damage(&scan.damage_chart, friendly.unit_type, stats.unit_type) > 0
                     });
-                    can_be_engaged.then_some((
+                    // Expectedでは、現在の自軍カタログに対抗兵種が無いこと自体が
+                    // 生産計画で解くべき不足である。ここで敵候補を捨てると
+                    // 「まだcounterを持たないから敵もいない」と誤認してしまう。
+                    (scenario == ReinforcementScenario::Expected || can_be_engaged).then_some((
                         std::cmp::Reverse(counter_damage),
                         std::cmp::Reverse(u32::from(stats.can_capture)),
                         std::cmp::Reverse(stats.cost),
@@ -6374,7 +7178,7 @@ fn enemy_reinforcement_assessment(
                 let stats = candidate.4;
                 (
                     std::cmp::Reverse(
-                        observed_enemy_types.contains(&stats.unit_type)
+                        expected_enemy_types.contains(&stats.unit_type)
                             && !projected_types.contains(&stats.unit_type),
                     ),
                     candidate.1,
@@ -6401,11 +7205,14 @@ fn enemy_reinforcement_assessment(
                     }),
                 available_turn,
             };
-            // 占領可能増援は、見てからcounterを一体ずつ足す方式では数の圧力に
-            // 一手遅れる。前線の所有権を直接変え得るため、現在の作戦packageへ
-            // 必ず含める。特殊兵種だけを観測後counterの条件付き計画に残す。
-            if stats.can_capture || observed_enemy_types.contains(&stats.unit_type) {
-                assessment.unavoidable.push(reinforcement);
+            // Expectedは通常想定される到着戦力をすべてRollingPlanへ渡す。これが
+            // 「最低Goは満たしたから生産終了」を防ぐ継続戦力の基準になる。
+            // Stressだけは観測後に間に合うcounterを条件付き計画として残す。
+            if scenario == ReinforcementScenario::Expected
+                || stats.can_capture
+                || observed_enemy_types.contains(&stats.unit_type)
+            {
+                assessment.reinforcements.push(reinforcement);
             } else if let Some(contingency) = fastest_observed_counter(
                 scan,
                 ctx,
@@ -6419,7 +7226,7 @@ fn enemy_reinforcement_assessment(
                     .insert((contingency.counter_build_turn, contingency.counter_facility));
                 assessment.contingencies.push(contingency);
             } else {
-                assessment.unavoidable.push(reinforcement);
+                assessment.reinforcements.push(reinforcement);
             }
         }
     }
@@ -6528,6 +7335,7 @@ fn combat_plan_input(
     op: &Operation,
     used_facilities: &HashSet<GridPosition>,
     committed_combat_entities: &HashSet<Entity>,
+    staged_combat_entities: &HashSet<Entity>,
     remaining_funds: u32,
     require_self_deployment: bool,
 ) -> Option<RollingPlanInput> {
@@ -6571,7 +7379,7 @@ fn combat_plan_input(
         |objective| objective.required_capture_survivors,
     );
     let mut enemies = enemies;
-    enemies.extend(op.unavoidable_reinforcements.iter().cloned());
+    enemies.extend(op.expected_reinforcements.iter().cloned());
     if enemies.is_empty() {
         return None;
     }
@@ -6581,10 +7389,12 @@ fn combat_plan_input(
         if unit.stats.max_cargo > 0 {
             continue;
         }
-        if !unit
-            .entity
-            .is_some_and(|entity| committed_combat_entities.contains(&entity))
-        {
+        let Some(entity) = unit.entity else {
+            continue;
+        };
+        let committed = committed_combat_entities.contains(&entity);
+        let staged = staged_combat_entities.contains(&entity);
+        if !committed && !staged {
             continue;
         }
         let engageable_enemy_indices = enemies
@@ -6614,7 +7424,13 @@ fn combat_plan_input(
             stats: unit.stats.clone(),
             position: unit.pos,
             hp: unit.hp,
-            available_turn: 0,
+            // Stageは前線にいることを仮定しない。最短移動ETAの後にだけ戦闘へ
+            // 寄与する既存戦力として評価し、Advance部隊と同じ手番の火力にはしない。
+            available_turn: if staged {
+                eta_turns(&scan.map, &unit.pos, &op.anchor, unit.stats.max_movement).max(1)
+            } else {
+                0
+            },
             engageable_enemy_indices,
         });
     }
@@ -7704,6 +8520,299 @@ mod tests {
     }
 
     #[test]
+    fn nearby_capture_region_has_one_owner_operation() {
+        let map = flat_map(12, 3);
+        let anchors = vec![pos(1, 1), pos(2, 2), pos(4, 1), pos(8, 1)];
+        let mut targets = vec![
+            vec![pos(1, 1)],
+            vec![pos(2, 2)],
+            vec![pos(4, 1)],
+            vec![pos(8, 1)],
+        ];
+
+        consolidate_nearby_capture_target_regions(&map, &anchors, &mut targets);
+
+        assert_eq!(targets[0], vec![pos(1, 1), pos(4, 1), pos(2, 2)]);
+        assert!(targets[1].is_empty());
+        assert!(targets[2].is_empty());
+        assert_eq!(
+            targets[3],
+            vec![pos(8, 1)],
+            "局地半径を越えた拠点まで一つの完了条件へ混ぜない"
+        );
+    }
+
+    #[test]
+    fn linear_capture_corridor_keeps_independent_operations() {
+        let map = flat_map(12, 3);
+        let anchors = vec![pos(1, 1), pos(2, 1), pos(4, 1)];
+        let mut targets = vec![vec![pos(1, 1)], vec![pos(2, 1)], vec![pos(4, 1)]];
+
+        consolidate_nearby_capture_target_regions(&map, &anchors, &mut targets);
+
+        assert_eq!(
+            targets,
+            vec![vec![pos(1, 1)], vec![pos(2, 1)], vec![pos(4, 1)]],
+            "一直線の回廊は一Areaへ束ねず、前方へ順番に進める"
+        );
+    }
+
+    #[test]
+    fn capture_node_requires_secured_for_both_area_and_point() {
+        let player = PlayerId(1);
+        let topology = CapitalRouteTopologyKey {
+            player_id: player,
+            island_id: crate::ai::islands::IslandId(0),
+        };
+        let operation = |scope| CapitalRouteNodeOperation {
+            id: CapitalRouteNodeOperationId {
+                topology,
+                node: CapitalRouteNodeId(1),
+            },
+            anchor: pos(2, 2),
+            predecessors: Vec::new(),
+            successors: Vec::new(),
+            objective: CapitalRouteNodeObjective::Capture,
+            scope,
+            control_area: vec![pos(2, 2)],
+            capture_targets: vec![pos(2, 2)],
+            crossing_exit: None,
+            crossed: false,
+            state: victory_roadmap::RoadmapNodeState::Dominant,
+            assigned_squads: HashSet::new(),
+        };
+
+        assert!(
+            !capital_route_node_exit_satisfied(&operation(CapitalRouteNodeScope::Area)),
+            "Areaの局地優勢も全対象の所有権確保までは後続を開けない"
+        );
+        assert!(
+            !capital_route_node_exit_satisfied(&operation(CapitalRouteNodeScope::Point)),
+            "単一Capture拠点は所有権確保まで後続を開けない"
+        );
+    }
+
+    #[test]
+    fn dominant_area_capture_retains_one_escort_until_secured() {
+        let player = PlayerId(1);
+        let topology = CapitalRouteTopologyKey {
+            player_id: player,
+            island_id: crate::ai::islands::IslandId(0),
+        };
+        let rear_node = CapitalRouteNodeId(1);
+        let active_node = CapitalRouteNodeId(2);
+        let rear_id = CapitalRouteNodeOperationId {
+            topology,
+            node: rear_node,
+        };
+        let operation = |id, state| CapitalRouteNodeOperation {
+            id,
+            anchor: pos(id.node.0, 2),
+            predecessors: Vec::new(),
+            successors: Vec::new(),
+            objective: CapitalRouteNodeObjective::Capture,
+            scope: CapitalRouteNodeScope::Area,
+            control_area: vec![pos(id.node.0, 2)],
+            capture_targets: vec![pos(id.node.0, 2)],
+            crossing_exit: None,
+            crossed: false,
+            state,
+            assigned_squads: HashSet::new(),
+        };
+        let mut registry = CapitalRouteNodeOperationRegistry::default();
+        registry.operations.insert(
+            rear_id,
+            operation(rear_id, victory_roadmap::RoadmapNodeState::Dominant),
+        );
+
+        assert_eq!(
+            capital_route_dominant_capture_escort_node(
+                &[rear_node, active_node],
+                active_node,
+                &registry,
+                topology,
+            ),
+            Some(rear_node),
+            "主力が次Nodeへ進んでも未確保AreaにはControl護衛を残す"
+        );
+
+        registry
+            .operations
+            .get_mut(&rear_id)
+            .expect("後方Capture Nodeが存在する")
+            .state = victory_roadmap::RoadmapNodeState::Secured;
+        assert_eq!(
+            capital_route_dominant_capture_escort_node(
+                &[rear_node, active_node],
+                active_node,
+                &registry,
+                topology,
+            ),
+            None,
+            "占領完了後は護衛も次Nodeへ解放する"
+        );
+    }
+
+    #[test]
+    fn capture_frontline_reserves_both_capturer_and_control_lanes() {
+        let player = PlayerId(1);
+        let island = crate::ai::islands::IslandId(0);
+        let operation = |scope, control_area, capture_targets| CapitalRouteNodeOperation {
+            id: CapitalRouteNodeOperationId {
+                topology: CapitalRouteTopologyKey {
+                    player_id: player,
+                    island_id: island,
+                },
+                node: CapitalRouteNodeId(1),
+            },
+            anchor: pos(2, 2),
+            predecessors: Vec::new(),
+            successors: Vec::new(),
+            objective: CapitalRouteNodeObjective::Capture,
+            scope,
+            control_area,
+            capture_targets,
+            crossing_exit: None,
+            crossed: false,
+            state: victory_roadmap::RoadmapNodeState::Ready,
+            assigned_squads: HashSet::new(),
+        };
+
+        let point = operation(
+            CapitalRouteNodeScope::Point,
+            vec![pos(2, 2)],
+            vec![pos(2, 2)],
+        );
+        assert_eq!(capital_route_role_frontline_capacity(&point, true), 1);
+        assert_eq!(
+            capital_route_role_frontline_capacity(&point, false),
+            1,
+            "一点占領でも隣接護衛をStageへ落とさない"
+        );
+
+        let area = operation(
+            CapitalRouteNodeScope::Area,
+            vec![pos(1, 2), pos(2, 2), pos(3, 2), pos(4, 2)],
+            vec![pos(2, 2), pos(3, 2)],
+        );
+        assert_eq!(capital_route_role_frontline_capacity(&area, true), 2);
+        assert_eq!(capital_route_role_frontline_capacity(&area, false), 2);
+    }
+
+    #[test]
+    fn nearest_capture_capable_combat_squad_can_take_the_capture_lane() {
+        let player = PlayerId(1);
+        let island = crate::ai::islands::IslandId(0);
+        let mut operation = CapitalRouteNodeOperation {
+            id: CapitalRouteNodeOperationId {
+                topology: CapitalRouteTopologyKey {
+                    player_id: player,
+                    island_id: island,
+                },
+                node: CapitalRouteNodeId(1),
+            },
+            anchor: pos(2, 2),
+            predecessors: Vec::new(),
+            successors: Vec::new(),
+            objective: CapitalRouteNodeObjective::Capture,
+            scope: CapitalRouteNodeScope::Area,
+            control_area: vec![pos(2, 2), pos(3, 2)],
+            capture_targets: vec![pos(3, 2)],
+            crossing_exit: None,
+            crossed: false,
+            state: victory_roadmap::RoadmapNodeState::Ready,
+            assigned_squads: HashSet::new(),
+        };
+
+        assert!(capital_route_uses_capture_lane(
+            &operation,
+            &MissionType::Attack,
+            1,
+            0,
+        ));
+        assert!(
+            !capital_route_uses_capture_lane(&operation, &MissionType::Attack, 1, 1),
+            "占領枠が埋まった後の戦闘可能歩兵はControl枠へ回す"
+        );
+        assert!(
+            capital_route_uses_capture_lane(&operation, &MissionType::Capture, 1, 1),
+            "余剰Capture SquadはControl扱いにせずCapture待機線へ置く"
+        );
+        assert!(!capital_route_uses_capture_lane(
+            &operation,
+            &MissionType::Attack,
+            0,
+            0,
+        ));
+
+        operation.objective = CapitalRouteNodeObjective::Control;
+        assert!(!capital_route_uses_capture_lane(
+            &operation,
+            &MissionType::Capture,
+            1,
+            0,
+        ));
+    }
+
+    #[test]
+    fn forward_stage_squad_outranks_rear_advance_squad_for_frontline_rotation() {
+        let forward_stage =
+            capital_route_frontline_sort_key(12, &MissionType::Attack, 0, 1_000, SquadId(200));
+        let rear_advance =
+            capital_route_frontline_sort_key(3, &MissionType::Attack, 0, 20_000, SquadId(1));
+
+        assert!(
+            forward_stage < rear_advance,
+            "前線到達済みの予備を古い後方Squadより先にAdvanceへ昇格させる"
+        );
+    }
+
+    #[test]
+    fn durable_direct_fire_squad_wins_same_frontline_escort_slot() {
+        let armored =
+            capital_route_frontline_sort_key(8, &MissionType::Attack, 0, 20_000, SquadId(20));
+        let light =
+            capital_route_frontline_sort_key(8, &MissionType::Attack, 0, 5_000, SquadId(10));
+
+        assert!(
+            armored < light,
+            "同じ前進度なら耐久・価格・直接交戦能力が高いControl分隊を護衛へ回す"
+        );
+    }
+
+    #[test]
+    fn area_control_region_excludes_remote_milestones() {
+        let map = flat_map(30, 5);
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let anchor = pos(15, 2);
+        let island = island_map.get_island_at(&anchor).unwrap().id;
+        let capture_target = pos(14, 2);
+
+        let area = capital_route_node_control_area(
+            &map,
+            &island_map,
+            island,
+            anchor,
+            CapitalRouteNodeScope::Area,
+            &[capture_target],
+        );
+
+        assert!(area.contains(&anchor));
+        assert!(area.contains(&capture_target));
+        assert!(
+            !area.contains(&pos(22, 2)),
+            "後方Milestoneを局地優勢へ数えない"
+        );
+        assert!(
+            !area.contains(&pos(8, 2)),
+            "後続Milestoneの敵を現在Nodeへ数えない"
+        );
+        assert!(area.iter().all(|position| {
+            map.distance(anchor.x, anchor.y, position.x, position.y) <= CAPITAL_ROUTE_REGION_RADIUS
+        }));
+    }
+
+    #[test]
     fn hold_and_supply_remain_addressable_inside_the_route_dag() {
         let player = PlayerId(1);
         let island = crate::ai::islands::IslandId(0);
@@ -7865,6 +8974,73 @@ mod tests {
     }
 
     #[test]
+    fn recreated_squad_inherits_one_previous_squad_order_atomically() {
+        let player = PlayerId(1);
+        let island = crate::ai::islands::IslandId(0);
+        let member = Entity::from_raw(100);
+        let reinforcement = Entity::from_raw(101);
+        let old_squad = SquadId(4);
+        let new_squad = SquadId(9);
+        let target = pos(6, 1);
+        let commitment = CapitalRouteCommitment {
+            player_id: player,
+            island_id: island,
+            route: CapitalRouteId(0),
+            target,
+            target_node: CapitalRouteNodeId(2),
+            objective: CapitalRouteNodeObjective::Control,
+            scope: CapitalRouteNodeScope::Point,
+            control_area: vec![target],
+            capture_targets: Vec::new(),
+            crossing_exit: None,
+            crossed: false,
+            execution_target: target,
+            frontline_capacity: 1,
+            path_nodes: vec![CapitalRouteNodeId(0), CapitalRouteNodeId(2)],
+            path: vec![pos(1, 1), target],
+            phase: CapitalRouteExecutionPhase::Advance,
+        };
+        let registry = CapitalRoutePathRegistry {
+            commitments: HashMap::from([(old_squad, commitment)]),
+            commitment_members: HashMap::from([(old_squad, BTreeSet::from([member]))]),
+            assignment_diagnostics: HashMap::new(),
+        };
+
+        let inherited = inherited_capital_route_commitment(
+            &registry,
+            new_squad,
+            &BTreeSet::from([member, reinforcement]),
+        );
+        assert_eq!(
+            inherited.map(|order| order.target_node),
+            Some(CapitalRouteNodeId(2)),
+            "再編と補充でIDが変わっても、旧Squadが一意ならorderを全体へ移す"
+        );
+
+        let mut conflicting = registry.clone();
+        let other_squad = SquadId(5);
+        conflicting.commitments.insert(
+            other_squad,
+            CapitalRouteCommitment {
+                target_node: CapitalRouteNodeId(3),
+                ..conflicting.commitments[&old_squad].clone()
+            },
+        );
+        conflicting
+            .commitment_members
+            .insert(other_squad, BTreeSet::from([reinforcement]));
+        assert!(
+            inherited_capital_route_commitment(
+                &conflicting,
+                new_squad,
+                &BTreeSet::from([member, reinforcement]),
+            )
+            .is_none(),
+            "異なる旧Squadを統合した場合はEntityごとの命令を混在させない"
+        );
+    }
+
+    #[test]
     fn only_capturer_claims_an_unsecured_route_milestone() {
         let player = PlayerId(1);
         let island = crate::ai::islands::IslandId(0);
@@ -7966,6 +9142,106 @@ mod tests {
             capital_route_execution_phase(&MissionType::Transport),
             CapitalRouteExecutionPhase::Supply
         );
+    }
+
+    #[test]
+    fn forward_defense_squad_is_reassigned_as_current_node_control() {
+        assert!(capital_route_controls_active_node(
+            &MissionType::Attack,
+            false
+        ));
+        assert!(capital_route_controls_active_node(
+            &MissionType::Defense,
+            true
+        ));
+        assert!(
+            !capital_route_controls_active_node(&MissionType::Defense, false),
+            "本土側だけを指定するDefense Squadは現在Nodeから動かさない"
+        );
+        assert!(!capital_route_controls_active_node(
+            &MissionType::Capture,
+            true
+        ));
+    }
+
+    #[test]
+    fn capture_outside_the_active_route_keeps_its_squad_order() {
+        // map_25の外周拠点のように、前方にあっても現在DAG経路に
+        // 属さない目標はfalseとし、中央最短線へ上書きしない。
+        assert!(!capital_route_capture_joins_active_node(
+            &MissionType::Capture,
+            true,
+            false,
+            false,
+        ));
+        assert!(capital_route_capture_joins_active_node(
+            &MissionType::Capture,
+            true,
+            true,
+            false,
+        ));
+        assert!(!capital_route_capture_joins_active_node(
+            &MissionType::Capture,
+            true,
+            true,
+            true,
+        ));
+        assert!(capital_route_capture_joins_active_node(
+            &MissionType::Capture,
+            false,
+            false,
+            true,
+        ));
+        assert!(capital_route_capture_joins_active_node(
+            &MissionType::Attack,
+            true,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn unfinished_capture_node_reserves_property_cells_for_capturers() {
+        let player = PlayerId(1);
+        let topology = CapitalRouteTopologyKey {
+            player_id: player,
+            island_id: crate::ai::islands::IslandId(0),
+        };
+        let operation_id = CapitalRouteNodeOperationId {
+            topology,
+            node: CapitalRouteNodeId(1),
+        };
+        let target = pos(10, 11);
+        let mut registry = CapitalRouteNodeOperationRegistry::default();
+        registry.operations.insert(
+            operation_id,
+            CapitalRouteNodeOperation {
+                id: operation_id,
+                anchor: pos(8, 11),
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+                objective: CapitalRouteNodeObjective::Capture,
+                scope: CapitalRouteNodeScope::Area,
+                control_area: vec![pos(8, 11), target],
+                capture_targets: vec![target],
+                crossing_exit: None,
+                crossed: false,
+                state: victory_roadmap::RoadmapNodeState::Capturing,
+                assigned_squads: HashSet::new(),
+            },
+        );
+
+        assert!(capital_route_capture_target_is_reserved(
+            &registry, player, target,
+        ));
+        registry
+            .operations
+            .get_mut(&operation_id)
+            .expect("テスト対象Nodeが存在する")
+            .state = victory_roadmap::RoadmapNodeState::Secured;
+        assert!(!capital_route_capture_target_is_reserved(
+            &registry, player, target,
+        ));
     }
 
     #[test]
@@ -8819,12 +10095,22 @@ mod tests {
             },
         ];
 
-        let operations = build_operations(&scan, &mut ReachCtx::default(), &[]);
+        let active = ActivePlanObjective {
+            kind: OperationKind::AssaultCapital,
+            island_id: Some(island_id),
+            properties: vec![capital],
+            target_enemies: HashSet::new(),
+        };
+        let operations = build_operations(&scan, &mut ReachCtx::default(), &[active]);
         let same_island = operations
             .iter()
             .filter(|operation| operation.island_id == Some(island_id))
             .collect::<Vec<_>>();
-        assert_eq!(same_island.len(), 2);
+        assert_eq!(
+            same_island.len(),
+            2,
+            "継続PlanとRoadmapが同じ首都作戦を提示しても二重化しない"
+        );
         let local = same_island
             .iter()
             .find(|operation| operation.kind == OperationKind::Capture)
@@ -9066,12 +10352,16 @@ mod tests {
         let player = PlayerId(1);
         let island = crate::ai::islands::IslandId(4);
         let advancing = Entity::from_raw(904);
+        let staged = Entity::from_raw(907);
         let holding = Entity::from_raw(905);
         let supplying = Entity::from_raw(906);
         let mut manager = crate::ai::squad::SquadManager::default();
         let advancing_squad = manager.create_owned_squad(MissionType::Attack, player);
         advancing_squad.members.insert(advancing);
         let advancing_squad_id = advancing_squad.id;
+        let staged_squad = manager.create_owned_squad(MissionType::Attack, player);
+        staged_squad.members.insert(staged);
+        let staged_squad_id = staged_squad.id;
         let holding_squad = manager.create_owned_squad(MissionType::Defense, player);
         holding_squad.members.insert(holding);
         let holding_squad_id = holding_squad.id;
@@ -9103,6 +10393,10 @@ mod tests {
                     commitment(CapitalRouteExecutionPhase::Advance),
                 ),
                 (
+                    staged_squad_id,
+                    commitment(CapitalRouteExecutionPhase::Stage),
+                ),
+                (
                     holding_squad_id,
                     commitment(CapitalRouteExecutionPhase::Hold),
                 ),
@@ -9111,6 +10405,7 @@ mod tests {
                     commitment(CapitalRouteExecutionPhase::Supply),
                 ),
             ]),
+            commitment_members: HashMap::new(),
             assignment_diagnostics: HashMap::new(),
         };
 
@@ -9124,6 +10419,54 @@ mod tests {
             advancing_entities.by_target,
             HashMap::from([((island, pos(5, 1)), HashSet::from([advancing]))]),
             "前進部隊は首都全体ではなく、現在のDAG区間目標へ渡す"
+        );
+        assert_eq!(
+            advancing_entities.staged_by_target,
+            HashMap::from([((island, pos(5, 1)), HashSet::from([staged]))]),
+            "待機線も人数だけでなく、同じDAG区間へ向かうEntityとして保持する"
+        );
+    }
+
+    #[test]
+    fn staged_route_member_is_counted_after_its_front_arrival_eta() {
+        let mut scan = mixed_threat_multi_factory_scan();
+        let staged = Entity::from_raw(903);
+        let anti_air = scan
+            .available_types
+            .iter()
+            .find(|(unit_type, _)| *unit_type == UnitType::AntiAir)
+            .map(|(_, stats)| stats.clone())
+            .expect("fixture has an anti-air counter");
+        scan.my_units.push(UnitSnapshot {
+            entity: Some(staged),
+            pos: pos(1, 1),
+            stats: anti_air,
+            hp: 100,
+            free_cargo: 0,
+        });
+        let mut ctx = ReachCtx::default();
+        let operations = build_operations(&scan, &mut ctx, &[]);
+        let operation = operations
+            .iter()
+            .find(|operation| operation.kind == OperationKind::Capture)
+            .expect("capture operation");
+
+        let input = combat_plan_input(
+            &scan,
+            &mut ctx,
+            operation,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::from([staged]),
+            scan.funds,
+            false,
+        )
+        .expect("visible enemy creates a combat plan input");
+
+        assert_eq!(input.existing_units.len(), 1);
+        assert!(
+            input.existing_units[0].available_turn > 0,
+            "Stage部隊を前衛と同じ手番の火力にせず、到着後の既存戦力として評価する"
         );
     }
 
@@ -9161,6 +10504,7 @@ mod tests {
             operation,
             &HashSet::new(),
             &HashSet::new(),
+            &HashSet::new(),
             scan.funds,
             false,
         )
@@ -9196,20 +10540,51 @@ mod tests {
         let horizons = vec![4, 4];
         let mut ctx = ReachCtx::default();
 
-        // 最安の歩兵は1ターンで到着し、残る3生産ターン分だけを局地予算にする。
+        // 最安の歩兵は1ターンで到着する。Expectedは次の一波だけ、Stressは
+        // 作戦期限までの3生産ターンを局地予算にする。
+        let local = projected_enemy_reinforcement_envelope(&scan, &mut ctx, &anchors, &horizons, 0);
+        assert_eq!(local.expected_funds, 1000);
+        assert_eq!(local.stress_funds, 3000);
         assert_eq!(
-            projected_enemy_reinforcement_funds(&scan, &mut ctx, &anchors, &horizons, 0),
-            3000
-        );
-        assert_eq!(
-            projected_enemy_reinforcement_funds(&scan, &mut ctx, &anchors, &horizons, 1),
-            0
+            projected_enemy_reinforcement_envelope(&scan, &mut ctx, &anchors, &horizons, 1),
+            EnemyReinforcementEnvelope::default()
         );
 
         // 到着期限が0なら、この施設はどの作戦の脅威にもならない。
         assert_eq!(
-            projected_enemy_reinforcement_funds(&scan, &mut ctx, &anchors, &[0, 0], 0),
-            0
+            projected_enemy_reinforcement_envelope(&scan, &mut ctx, &anchors, &[0, 0], 0),
+            EnemyReinforcementEnvelope::default()
+        );
+    }
+
+    #[test]
+    fn expected_reinforcement_starts_production_without_changing_the_launch_gate() {
+        let mut scan = multi_factory_scan();
+        scan.enemy_income = 6_000;
+        scan.enemy_production_slots = 1;
+        scan.enemy_facilities = vec![EnemyFacilitySnapshot {
+            pos: pos(8, 2),
+            terrain: Terrain::Factory,
+        }];
+        // 初回観測は開幕配置と区別できないためforecastが空でも、敵施設と収入が
+        // ある限りExpectedを0にしない。
+        scan.enemy_production_forecast = EnemyProductionForecastTrace::default();
+        let mut ctx = ReachCtx::default();
+        let operations = build_operations(&scan, &mut ctx, &[]);
+        let capture = operations
+            .iter()
+            .find(|operation| operation.kind == OperationKind::Capture)
+            .expect("capture objective");
+
+        assert!(!capture.expected_reinforcements.is_empty());
+        assert!(capture.facts.enemy_reinforcement_funds > 0);
+        assert_eq!(
+            capture.slots.combat_plan_required, 1,
+            "Expectedは継続生産を起動する"
+        );
+        assert!(
+            !scan.capital_assault_authorized,
+            "Expectedを増やしてもDAG・兵站の進撃Goを変更しない"
         );
     }
 
@@ -9261,10 +10636,14 @@ mod tests {
         let mut ctx = ReachCtx::default();
 
         assert_eq!(
-            projected_enemy_reinforcement_funds(&scan, &mut ctx, &anchors, &horizons, 0),
-            0
+            projected_enemy_reinforcement_envelope(&scan, &mut ctx, &anchors, &horizons, 0),
+            EnemyReinforcementEnvelope::default()
         );
-        assert!(projected_enemy_reinforcement_funds(&scan, &mut ctx, &anchors, &horizons, 1) > 0);
+        assert!(
+            projected_enemy_reinforcement_envelope(&scan, &mut ctx, &anchors, &horizons, 1)
+                .expected_funds
+                > 0
+        );
     }
 
     #[test]
@@ -9286,9 +10665,16 @@ mod tests {
         op.anchor = pos(6, 2);
         op.facts.enemy_reinforcement_funds = 3_000;
 
-        let assessment = enemy_reinforcement_assessment(&scan, &mut ReachCtx::default(), &op, 5);
+        let assessment = enemy_reinforcement_assessment(
+            &scan,
+            &mut ReachCtx::default(),
+            &op,
+            5,
+            op.facts.enemy_reinforcement_funds,
+            ReinforcementScenario::Stress,
+        );
         let mut arrivals = assessment
-            .unavoidable
+            .reinforcements
             .iter()
             .map(|enemy| (enemy.available_turn, enemy.stats.unit_type))
             .chain(
@@ -9613,8 +10999,9 @@ mod tests {
             filled,
             unreachable_threats: Vec::new(),
             reachable_threats: Vec::new(),
-            unavoidable_reinforcements: Vec::new(),
+            expected_reinforcements: Vec::new(),
             reinforcement_contingencies: Vec::new(),
+            stress_reinforcement_funds: 0,
             contingency_reserve_funds: 0,
         }
     }
