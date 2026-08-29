@@ -1880,13 +1880,73 @@ fn candidate_capture_target_positions(
     };
     targets.sort_by_key(|position| target_priority(*position));
 
+    let own_capital = properties
+        .iter()
+        .find(|snapshot| {
+            island.tiles.contains(&snapshot.position)
+                && snapshot.property.terrain == Terrain::Capital
+                && snapshot.property.owner_id == Some(player_id)
+        })
+        .map(|snapshot| snapshot.position);
+    let enemy_capital = properties
+        .iter()
+        .find(|snapshot| {
+            island.tiles.contains(&snapshot.position)
+                && snapshot.property.terrain == Terrain::Capital
+                && snapshot
+                    .property
+                    .owner_id
+                    .is_some_and(|owner| owner != player_id)
+        })
+        .map(|snapshot| snapshot.position);
+
+    let route_fronts = if let (Some(own_cap), Some(enemy_cap)) = (own_capital, enemy_capital) {
+        crate::ai::v4::armored_capital_route_fronts(map, registry, own_cap, enemy_cap)
+    } else {
+        Vec::new()
+    };
+
     // 既に足場がある陸塊では、最短前線とその隣接帯だけを同時実行対象にする。
     // 全未所有施設は毎手番再観測するため捨てず、前線取得後に次の帯へ昇格する。
-    // 足場のない島は輸送波の目的一覧を縮めると再上陸が遅れるため従来どおり保持する。
-    if !origins.is_empty()
-        && let Some(nearest_distance) = targets.first().map(|target| target_priority(*target).1)
-    {
-        targets.retain(|target| target_priority(*target).1 <= nearest_distance.saturating_add(2));
+    // 足場のない島は輸送波の目的目的一覧を縮めると再上陸が遅れるため従来どおり保持する。
+    if !origins.is_empty() {
+        if route_fronts.len() >= 2 {
+            // 同一陸塊で複数の進軍軸（上段・下段等）がある場合、各ルートの最寄り拠点を
+            // 独立に保持する。単一前線で一括切断すると、片方のルートの占領が消滅する。
+            let nearest_route = |position: GridPosition| {
+                route_fronts
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(route, front)| {
+                        (
+                            map.distance(position.x, position.y, front.x, front.y),
+                            *route,
+                        )
+                    })
+                    .map_or(0, |(route, _)| route)
+            };
+            let mut min_distance_by_route: std::collections::HashMap<usize, u32> =
+                std::collections::HashMap::new();
+            for target in &targets {
+                let route = nearest_route(*target);
+                let distance = target_priority(*target).1;
+                min_distance_by_route
+                    .entry(route)
+                    .and_modify(|min| *min = (*min).min(distance))
+                    .or_insert(distance);
+            }
+            targets.retain(|target| {
+                let route = nearest_route(*target);
+                let distance = target_priority(*target).1;
+                let min_distance = min_distance_by_route.get(&route).copied().unwrap_or(0);
+                distance <= min_distance.saturating_add(2)
+            });
+        } else if let Some(nearest_distance) =
+            targets.first().map(|target| target_priority(*target).1)
+        {
+            targets
+                .retain(|target| target_priority(*target).1 <= nearest_distance.saturating_add(2));
+        }
     }
     if let Some(index) = targets
         .iter()

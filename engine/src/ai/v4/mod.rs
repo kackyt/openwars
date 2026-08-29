@@ -2298,11 +2298,13 @@ fn build_capital_route_topology(
         let route = nearest_route(*position);
         property_routes.insert(*position, CapitalRouteId(route));
     }
+    let detour = (total_distance / 4).clamp(4, 10);
     let mut corridor_positions = from_home
         .iter()
         .filter_map(|(position, from_start)| {
             let from_goal = from_enemy_capital.get(position)?;
-            (from_start.saturating_add(*from_goal) == total_distance).then_some(*position)
+            (from_start.saturating_add(*from_goal) <= total_distance.saturating_add(detour))
+                .then_some(*position)
         })
         .collect::<Vec<_>>();
     corridor_positions.sort_unstable_by_key(|position| {
@@ -2328,6 +2330,9 @@ fn build_capital_route_topology(
         })
         .collect::<Vec<_>>();
     for (position, node_id) in &node_ids {
+        if *node_id == goal_node {
+            continue;
+        }
         let progress = nodes[node_id.0].progress;
         nodes[node_id.0].successor_nodes = map
             .get_adjacent(position.x, position.y)
@@ -3234,15 +3239,25 @@ pub(crate) fn refresh_capital_route_path_commitments(
             if assigned_routes.contains_key(&squad.id) {
                 continue;
             }
-            let route = (0..topology.routes.len())
-                .filter(|route| targets[*route].is_some())
-                .max_by_key(|route| {
-                    (
-                        quotas[*route].saturating_sub(assigned_counts[*route]),
-                        demands[*route].demand_value,
-                        std::cmp::Reverse(*route),
-                    )
-                });
+            let preferred_target_route = if squad.mission == MissionType::Capture {
+                squad
+                    .target
+                    .and_then(|target| topology.property_routes.get(&target).map(|r| r.0))
+                    .filter(|route| targets.get(*route).is_some_and(|t| t.is_some()))
+            } else {
+                None
+            };
+            let route = preferred_target_route.or_else(|| {
+                (0..topology.routes.len())
+                    .filter(|route| targets[*route].is_some())
+                    .max_by_key(|route| {
+                        (
+                            quotas[*route].saturating_sub(assigned_counts[*route]),
+                            demands[*route].demand_value,
+                            std::cmp::Reverse(*route),
+                        )
+                    })
+            });
             let Some(route) = route else {
                 continue;
             };
@@ -4317,6 +4332,7 @@ pub(crate) fn same_land_route_force_demands(
     let mut opportunity_values = vec![0_u64; fronts.len()];
     let mut friendly_values = vec![0_u64; fronts.len()];
     let mut enemy_values = vec![0_u64; fronts.len()];
+    let mut capital_threat_values = vec![0_u64; fronts.len()];
 
     for entity in world.iter_entities() {
         let (Some(position), Some(property)) =
@@ -4385,6 +4401,15 @@ pub(crate) fn same_land_route_force_demands(
             friendly_values[route] = friendly_values[route].saturating_add(current_value);
         } else {
             enemy_values[route] = enemy_values[route].saturating_add(current_value);
+            // 自首都への距離に応じた首都防衛需要（Capital Threat）
+            let dist_to_capital = from_home.get(position).copied().unwrap_or(u32::MAX / 4);
+            if dist_to_capital < campaign_horizon {
+                let urgency = campaign_horizon
+                    .saturating_sub(dist_to_capital)
+                    .saturating_add(1) as u64;
+                capital_threat_values[route] = capital_threat_values[route]
+                    .saturating_add(current_value.saturating_mul(urgency));
+            }
         }
     }
     opportunity_values
@@ -4392,10 +4417,13 @@ pub(crate) fn same_land_route_force_demands(
         .enumerate()
         .map(|(route, opportunity_value)| {
             let force_deficit_value = enemy_values[route].saturating_sub(friendly_values[route]);
+            let capital_threat = capital_threat_values[route];
             RouteForceDemand {
                 opportunity_value,
                 force_deficit_value,
-                demand_value: opportunity_value.saturating_add(force_deficit_value),
+                demand_value: opportunity_value
+                    .saturating_add(force_deficit_value)
+                    .saturating_add(capital_threat),
             }
         })
         .collect()
@@ -9423,6 +9451,51 @@ mod tests {
             "山で分かれるmap_6を単一前線へ潰さない: fronts={fronts:?}"
         );
         assert!(fronts[0].y < fronts[1].y, "北・南の別回廊を前線として得る");
+
+        let p2 = PlayerId(2);
+        let p2_fronts = same_land_route_fronts(&world, p2, island);
+        assert_eq!(
+            p2_fronts.len(),
+            2,
+            "後攻P2でもmap_6は2本のルート前線を得る: p2_fronts={p2_fronts:?}"
+        );
+    }
+
+    #[test]
+    fn map6_p2_capital_route_discovers_both_frontiers() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (mut world, _schedule) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master_data,
+            "map_6",
+            GridTopology::Square,
+        )
+        .unwrap();
+        let player = PlayerId(2);
+        let own_capital = world
+            .iter_entities()
+            .find_map(|entity| {
+                let position = entity.get::<GridPosition>()?;
+                let property = entity.get::<Property>()?;
+                (property.terrain == Terrain::Capital && property.owner_id == Some(player))
+                    .then_some(*position)
+            })
+            .expect("自首都");
+        let island = world
+            .resource::<crate::ai::islands::IslandMap>()
+            .get_island_at(&own_capital)
+            .expect("首都の島")
+            .id;
+
+        prepare_capital_route_topologies(&mut world, player);
+        let topology = capital_route_topology_for(&world, player, island)
+            .expect("P2の首都戦役DAGを構築できる");
+        assert_eq!(topology.routes.len(), 2, "map_6の2進軍軸を保持する");
+
+        let frontiers = capital_route_dag_frontier_properties(&world, player, island)
+            .expect("両ルートの拠点を検出できる");
+        assert_eq!(frontiers.len(), 2);
+        assert!(!frontiers[0].is_empty(), "Route 0の拠点を検出する");
+        assert!(!frontiers[1].is_empty(), "Route 1の拠点を検出する");
     }
 
     #[test]
