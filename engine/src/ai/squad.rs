@@ -2368,6 +2368,7 @@ fn nearest_campaign_property_target_with_connectivity(
 
 fn campaign_assignment_capture_responsibilities(
     world: &World,
+    manager: &SquadManager,
     player_id: PlayerId,
     assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
     members: &[Entity],
@@ -2401,7 +2402,56 @@ fn campaign_assignment_capture_responsibilities(
 
     let mut remaining = members.to_vec();
     remaining.sort_by_key(|entity| entity.to_bits());
-    let mut responsibilities = Vec::new();
+    let mut responsibilities: Vec<CampaignResponsibility> = Vec::new();
+
+    // 生産時に期限・経路まで検証して具体化したCapture任務は、次回Campaign分析の
+    // 「最寄り物件」へ即座に戻さない。対象が未取得かつ本人が到達可能な間だけ保持し、
+    // 取得済み・到達不能なら下の通常割当へ自然に戻す。
+    let mut pinned_members = HashSet::new();
+    for member in &remaining {
+        let pinned_target = manager
+            .squads
+            .iter()
+            .filter(|squad| {
+                squad.owner_id == Some(player_id)
+                    && squad.mission_type == MissionType::Capture
+                    && squad.target_island == Some(assignment.island_id)
+                    && squad.members.contains(member)
+            })
+            .filter_map(|squad| squad.target)
+            .find(|target| {
+                world.iter_entities().any(|entity| {
+                    entity.get::<GridPosition>() == Some(target)
+                        && entity
+                            .get::<Property>()
+                            .is_some_and(|property| property.owner_id != Some(player_id))
+                }) && campaign_member_distance_to_position(world, *member, *target, connectivity)
+                    .is_some()
+            });
+        let Some(target) = pinned_target else {
+            continue;
+        };
+        pinned_members.insert(*member);
+        if let Some(responsibility) = responsibilities
+            .iter_mut()
+            .find(|responsibility| responsibility.target == target)
+        {
+            responsibility.members.push(*member);
+        } else {
+            responsibilities.push(CampaignResponsibility {
+                mission_type: MissionType::Capture,
+                target,
+                members: vec![*member],
+            });
+        }
+    }
+    remaining.retain(|member| !pinned_members.contains(member));
+    let pinned_targets = responsibilities
+        .iter()
+        .map(|responsibility| responsibility.target)
+        .collect::<HashSet<_>>();
+    targets.retain(|target| !pinned_targets.contains(target));
+
     for target in targets {
         let Some((index, _)) = remaining
             .iter()
@@ -3046,6 +3096,7 @@ fn prepare_campaign_local_assignment_with_connectivity(
             let capture = local_entities(&assignment.capture_entities);
             let capture_responsibilities = campaign_assignment_capture_responsibilities(
                 world,
+                manager,
                 player_id,
                 assignment,
                 &capture,
@@ -3121,6 +3172,7 @@ fn prepare_campaign_local_assignment_with_connectivity(
             let capture = local_entities(&assignment.capture_entities);
             let responsibilities = campaign_assignment_capture_responsibilities(
                 world,
+                manager,
                 player_id,
                 assignment,
                 &capture,
@@ -3158,6 +3210,7 @@ fn prepare_campaign_local_assignment_with_connectivity(
             let capture = local_entities(&assignment.capture_entities);
             let capture_responsibilities = campaign_assignment_capture_responsibilities(
                 world,
+                manager,
                 player_id,
                 assignment,
                 &capture,
@@ -12592,12 +12645,18 @@ mod tests {
             purchase_shortfall: requirement,
             allocated_budget: 3_000,
             transport_entities: Vec::new(),
-            capture_entities: capturers,
+            capture_entities: capturers.clone(),
             combat_entities: Vec::new(),
             operation_ready: true,
             continued_from_existing_squad: false,
         };
         let mut manager = SquadManager::new();
+        let pinned_target = GridPosition { x: 4, y: 0 };
+        let pinned_member = capturers[2];
+        let pinned = manager.create_owned_squad(MissionType::Capture, player);
+        pinned.members.insert(pinned_member);
+        pinned.target_island = Some(island_id);
+        pinned.target = Some(pinned_target);
 
         prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
 
@@ -12615,6 +12674,14 @@ mod tests {
                 .len(),
             3,
             "占領可能施設が残る限り、1施設1Squadへ排他的に振り分ける"
+        );
+        assert_eq!(
+            capture_squads
+                .iter()
+                .find(|squad| squad.members.contains(&pinned_member))
+                .and_then(|squad| squad.target),
+            Some(pinned_target),
+            "生産時に具体化した未取得・到達可能な物件任務は最寄り物件へ戻さない"
         );
     }
 

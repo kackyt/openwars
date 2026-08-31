@@ -19,14 +19,15 @@ pub mod logistics_plan;
 pub mod operation;
 mod operation_selection;
 pub mod plan_revision;
+pub mod property_control;
 pub mod rolling_plan;
 pub mod trace;
 pub mod victory_roadmap;
 
 use crate::ai::production::plan_campaign_with_expansion_denial_reserve;
 use operation::{
-    AcquisitionMode, OperationFacts, OperationKind, OperationSlots, RESERVATION_PATIENCE_TURNS,
-    SLOT_PRIORITY, SlotKind, SlotTier, acquisition_mode, derive_slots,
+    AcquisitionMode, MAX_CAPTURE_SLOTS, OperationFacts, OperationKind, OperationSlots,
+    RESERVATION_PATIENCE_TURNS, SLOT_PRIORITY, SlotKind, SlotTier, acquisition_mode, derive_slots,
 };
 use operation_selection::{OperationCandidate, select_operation_candidates};
 use plan_revision::{
@@ -839,6 +840,10 @@ const DEFENSE_THREAT_ETA: u32 = 2;
 /// 占領開始後に拠点を確保し切るまでに必要な最小手番数。
 const CAPTURE_COMPLETION_TURNS: u32 = 2;
 
+/// ユーザー指定の「T6までの物件到達・敵占領妨害」を、固定評価点ではなく
+/// 短期厳密シミュレーションの時間境界として表す。
+const EARLY_PROPERTY_CONTROL_HORIZON: u32 = 6;
+
 /// Expectedへ入れる敵生産の波数。Expectedは毎ターン再評価する直近波であり、
 /// 作戦期限全体の全生産を一括で仮想敵へ積むStressとは意図的に分ける。
 const EXPECTED_REINFORCEMENT_WAVES: u32 = 1;
@@ -1081,6 +1086,47 @@ impl ThreatTarget {
     }
 }
 
+/// 物件レースに対して選ぶ、観測可能な三つの制御方法。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PropertyControlApproach {
+    /// 占領役を先着させて所有権を取る。
+    DirectCapture,
+    /// 敵の占領完了前に合法な初撃を入れて占領力を落とす。
+    Interdict,
+    /// 先着も事前妨害も不能なため、撃破後の奪還へ切り替える。
+    Recapture,
+}
+
+/// 一つの物件レースについて、盤面時刻から選んだ成立可能な制御方法。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PropertyControlObjective {
+    property: GridPosition,
+    enemy_entity: Entity,
+    enemy_arrival_turn: u32,
+    enemy_completion_turn: u32,
+    attack_ready_turn: Option<u32>,
+    approach: PropertyControlApproach,
+    /// cluster内の複数物件を、別々の敵占領役が争っているため局所化が必要か。
+    disaggregated: bool,
+}
+
+/// 同じCapture clusterで同時に進められる物件レーンと、戦闘計画の主対象。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PropertyControlPlan {
+    primary: PropertyControlObjective,
+    /// 同じ時間窓に別々の敵Entityが進める、同時成立が必要な物件制御契約。
+    controls: Vec<PropertyControlObjective>,
+    capture_lanes: Vec<GridPosition>,
+}
+
+/// この生産判断内で確定した占領役。戦闘計画へ実兵種・実施設・実任務先を渡す。
+#[derive(Debug, Clone)]
+struct PlannedCaptureUnit {
+    stats: UnitStats,
+    facility: GridPosition,
+    target: GridPosition,
+}
+
 /// 1 つの作戦。対象拠点のまとまりと、そこから導出された枠を保持する。
 #[derive(Debug)]
 struct Operation {
@@ -1095,8 +1141,18 @@ struct Operation {
     execution_authorized: bool,
     /// 占領完了まで敵の攻撃から生存させる必要があるcampaign占領Entity。
     protected_capture_entities: HashSet<Entity>,
+    /// 初回編成ではなく、撃破済み占領担当1体の再契約を要求しているか。
+    capture_replacement_pending: bool,
     /// anchorが所有権変化で動いても同じ目的を照合するための拠点集合。
     objective_properties: Vec<GridPosition>,
+    /// Capture cluster全体ではなく、今この手番に成立させる一つの物件制御契約。
+    property_control: Option<PropertyControlObjective>,
+    /// 同時に別々の敵Entityへ成立させる必要がある物件制御契約。
+    property_controls: Vec<PropertyControlObjective>,
+    /// 直取りまたは期限内妨害が成立する物件ごとの占領任務先。
+    /// 一つのclusterを代表点へ畳まず、生産した占領役を別々の物件へ割り当てる。
+    capture_lane_targets: Vec<GridPosition>,
+    planned_capture_units: Vec<PlannedCaptureUnit>,
     /// 防衛の硬い期限と、旧枠の診断にだけ使う作戦時間幅。
     /// 敵を作戦へ帰属させる条件には使わない。
     threat_horizon: u32,
@@ -1715,6 +1771,8 @@ struct BoardScan {
     owned_airport_count: u32,
     /// 自軍が保有していない拠点（中立・敵）
     open_properties: Vec<GridPosition>,
+    /// まだどの勢力も所有していない拠点。初動の物件レース対象を敵領から分離する。
+    neutral_properties: Vec<GridPosition>,
     enemy_income: u32,
     enemy_production_slots: u32,
     enemy_facilities: Vec<EnemyFacilitySnapshot>,
@@ -1746,6 +1804,8 @@ struct CampaignPlanningObjective {
     forced_target_enemies: HashSet<Entity>,
     /// 施設数だけでなく、実際の占領兵が完了時点まで生存する案を評価する。
     protected_capture_entities: HashSet<Entity>,
+    /// 永続Roadmap上で占領担当撃破後の再契約が未完了か。
+    capture_replacement_pending: bool,
     /// 編成中は目的地へ逐次投入せず、ここへ集結させる。
     staging_anchor: GridPosition,
     /// falseなら生産は行うが、作戦地点への攻撃任務はまだ発行しない。
@@ -4484,8 +4544,8 @@ fn same_land_route_entry_ready(
                     steps.saturating_add(tank_stats.max_movement.max(1) - 1)
                         / tank_stats.max_movement.max(1)
                 })
-                // 生産したunitは次手番から行動するため、実際の到着予定へ1手番を加える。
-                .map(|turns| turns.saturating_add(1));
+                // 距離1は次手番の移動で到着する。生産待機と最初の移動を二重計上しない。
+                .map(|turns| property_control::produced_action_offset(0, turns));
             armor_arrival[route] = armor_arrival[route].min(turns.unwrap_or(u32::MAX));
         }
     }
@@ -5120,6 +5180,7 @@ fn split_bridge_route_objectives(
                 logistics_rank: objective.logistics_rank,
                 forced_target_enemies: HashSet::new(),
                 protected_capture_entities,
+                capture_replacement_pending: objective.capture_replacement_pending,
                 staging_anchor: anchor,
                 execution_authorized: objective.execution_authorized,
             });
@@ -5152,6 +5213,19 @@ impl BoardScan {
                     .enumerate()
                     .map(|(rank, island)| (*island, u32::try_from(rank).unwrap_or(u32::MAX)))
                     .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let pending_capture_replacements = world
+            .get_resource::<victory_roadmap::VictoryRoadmapRegistry>()
+            .map(|roadmap| {
+                roadmap
+                    .operations_for(player_id)
+                    .into_iter()
+                    .filter(|operation| {
+                        roadmap.capture_replacement_pending(player_id, operation.island_id)
+                    })
+                    .map(|operation| operation.island_id)
+                    .collect::<HashSet<_>>()
             })
             .unwrap_or_default();
         let mut campaign_objectives: Vec<CampaignPlanningObjective> = world
@@ -5191,6 +5265,8 @@ impl BoardScan {
                                 .iter()
                                 .copied()
                                 .collect(),
+                            capture_replacement_pending: pending_capture_replacements
+                                .contains(&assignment.island_id),
                             staging_anchor: assignment.target_position,
                             execution_authorized: true,
                         }
@@ -5245,6 +5321,7 @@ impl BoardScan {
         // --- 拠点の走査 ---
         let mut capital_pos = None;
         let mut open_properties = Vec::new();
+        let mut neutral_properties = Vec::new();
         let mut facilities = Vec::new();
         let mut production_facilities = Vec::new();
         let mut enemy_income = 0u32;
@@ -5325,7 +5402,10 @@ impl BoardScan {
                         }
                         open_properties.push(*pos);
                     }
-                    None => open_properties.push(*pos),
+                    None => {
+                        open_properties.push(*pos);
+                        neutral_properties.push(*pos);
+                    }
                 }
             }
         }
@@ -5459,6 +5539,7 @@ impl BoardScan {
                 // 到着できる敵を最寄りOperationへ一意に割り当てる。
                 forced_target_enemies: HashSet::new(),
                 protected_capture_entities: HashSet::new(),
+                capture_replacement_pending: false,
                 staging_anchor,
                 execution_authorized: capital_assault_authorized,
             });
@@ -5476,6 +5557,7 @@ impl BoardScan {
             enemy_units,
             owned_airport_count,
             open_properties,
+            neutral_properties,
             enemy_income,
             enemy_production_slots,
             enemy_facilities,
@@ -5521,6 +5603,7 @@ fn build_operations(
     scan: &BoardScan,
     ctx: &mut ReachCtx,
     active_objectives: &[ActivePlanObjective],
+    player_id: PlayerId,
 ) -> Vec<Operation> {
     let Some(reference) = scan.reference_capture_unit().cloned() else {
         return Vec::new();
@@ -5663,18 +5746,66 @@ fn build_operations(
     });
     let scored = select_operation_candidates(scored);
 
+    // Capture clusterは代表点一つで評価せず、敵占領役ごとに成立する物件制御を選ぶ。
+    // これにより中央が間に合わない場合も、左右の合法なInterdictを候補に残す。
+    let neutral_race_owner = scored
+        .iter()
+        .position(|candidate| candidate.kind == OperationKind::Capture);
+    let property_control_plans = scored
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            if candidate.kind != OperationKind::Capture {
+                return None;
+            }
+            // 初動の中立物件レースはDAG区間をまたいで同時に進むため、最優先Captureが
+            // 全中立物件を一度だけ共同評価する。各物件は下段の実capture completion期限で
+            // 除外されるので、遠方目標を固定数で抱え込まない。後続Captureは自身の区間だけ扱う。
+            let properties =
+                if neutral_race_owner == Some(index) && !scan.neutral_properties.is_empty() {
+                    // 中立が残る局面では中立物件レースだけを共同評価する。敵後方物件を
+                    // 混ぜると、直取り3件を奪還5件へ水増ししてしまう。
+                    scan.neutral_properties.clone()
+                } else {
+                    // 中立が無い初期分割マップでは、Campaignが選んだ前線物件を使う。
+                    // 首都は別Operationなのでここには入らない。
+                    candidate.cluster.clone()
+                };
+            select_property_control_plan(
+                scan,
+                ctx,
+                &properties,
+                // 小規模前線は「基準歩兵が最寄り物件へ着くまで」ではなく、T6までに
+                // 実際に支配へ変えられる全候補を合同比較する。短い歩兵ETAで切ると
+                // 快速攻撃役で前線を開き、後続占領役が取る行動列そのものが消える。
+                EARLY_PROPERTY_CONTROL_HORIZON,
+                player_id,
+            )
+        })
+        .collect::<Vec<_>>();
     let anchors: Vec<GridPosition> = scored
         .iter()
-        .map(|candidate| {
-            campaign_for_cluster(candidate.kind, &candidate.cluster).map_or_else(
-                || anchor_of(&candidate.cluster, scan),
-                |objective| objective.staging_anchor,
+        .zip(&property_control_plans)
+        .map(|(candidate, property_control_plan)| {
+            property_control_plan.as_ref().map_or_else(
+                || {
+                    campaign_for_cluster(candidate.kind, &candidate.cluster).map_or_else(
+                        || anchor_of(&candidate.cluster, scan),
+                        |objective| objective.staging_anchor,
+                    )
+                },
+                |plan| plan.primary.property,
             )
         })
         .collect();
+    let operation_leads = anchors
+        .iter()
+        .map(|anchor| facility_lead_time(scan, anchor, reference.max_movement))
+        .collect::<Vec<_>>();
     let horizons: Vec<u32> = scored
         .iter()
-        .map(|candidate| operation_threat_horizon(candidate.kind, candidate.lead))
+        .enumerate()
+        .map(|(index, candidate)| operation_threat_horizon(candidate.kind, operation_leads[index]))
         .collect();
     let assignment_enabled = scored
         .iter()
@@ -5690,13 +5821,11 @@ fn build_operations(
         .into_iter()
         .enumerate()
         .map(|(index, candidate)| {
-            let OperationCandidate {
-                lead,
-                kind,
-                cluster,
-                ..
-            } = candidate;
+            let OperationCandidate { kind, cluster, .. } = candidate;
             let anchor = anchors[index];
+            let property_control_plan = property_control_plans[index].clone();
+            let property_control = property_control_plan.as_ref().map(|plan| plan.primary);
+            let lead = operation_leads[index];
             let planning_objective = campaign_for_cluster(kind, &cluster);
             let forced_target_enemies = planning_objective
                 .map(|objective| &objective.forced_target_enemies)
@@ -5716,6 +5845,15 @@ fn build_operations(
             let protected_capture_entities = planning_objective
                 .map(|objective| &objective.protected_capture_entities)
                 .unwrap_or(&empty_entity_set);
+            let mut local_forced_target_enemies = forced_target_enemies.clone();
+            if let Some(plan) = property_control_plan.as_ref() {
+                local_forced_target_enemies.extend(
+                    plan.controls
+                        .iter()
+                        .filter(|control| control.disaggregated)
+                        .map(|control| control.enemy_entity),
+                );
+            }
             let mut operation = build_operation(
                 scan,
                 ctx,
@@ -5726,15 +5864,77 @@ fn build_operations(
                 &horizons,
                 &assignment_enabled,
                 &cluster,
-                forced_target_enemies,
+                &local_forced_target_enemies,
                 protected_capture_entities,
                 lead,
+                player_id,
             );
+            operation.property_control = property_control;
+            if let Some(plan) = property_control_plan {
+                operation.property_controls = plan.controls;
+                let current_capture_facility_capacity = scan
+                    .free_facilities
+                    .iter()
+                    .filter(|(_, terrain)| {
+                        scan.available_types.iter().any(|(unit_type, stats)| {
+                            stats.can_capture && scan.can_produce(*terrain, *unit_type)
+                        })
+                    })
+                    .count();
+                // 既にこの作戦へ確保済みの占領役は先頭レーンを担当済みとみなし、
+                // 今回新規に必要な任務先だけを残す。今手番に占領役を作れない施設数を
+                // 超えて仮想保護対象を要求せず、最大波サイズは既存の構造上限に従う。
+                operation.capture_lane_targets = plan
+                    .capture_lanes
+                    .into_iter()
+                    .skip(operation.facts.friendly_capture_units_committed as usize)
+                    .take(current_capture_facility_capacity)
+                    .take(MAX_CAPTURE_SLOTS as usize)
+                    .collect();
+                operation.slots.capture_units =
+                    u32::try_from(operation.capture_lane_targets.len()).unwrap_or(u32::MAX);
+            }
+            if operation
+                .property_controls
+                .iter()
+                .any(|control| control.disaggregated)
+            {
+                // 他の可視脅威を消さず、全ての物件別期限対象を戦闘計画へ含める。
+                for control in &operation.property_controls {
+                    if !operation
+                        .reachable_threats
+                        .iter()
+                        .any(|threat| threat.entity == Some(control.enemy_entity))
+                        && let Some(enemy) = scan
+                            .enemy_units
+                            .iter()
+                            .find(|enemy| enemy.entity == Some(control.enemy_entity))
+                    {
+                        operation
+                            .reachable_threats
+                            .push(ThreatTarget::from_snapshot(enemy));
+                    }
+                }
+                let priority_entities = operation
+                    .property_controls
+                    .iter()
+                    .map(|control| control.enemy_entity)
+                    .collect::<Vec<_>>();
+                operation.reachable_threats.sort_by_key(|threat| {
+                    priority_entities
+                        .iter()
+                        .position(|entity| threat.entity == Some(*entity))
+                        .unwrap_or(usize::MAX)
+                });
+                operation.slots.combat_plan_required =
+                    u32::from(!operation.reachable_threats.is_empty());
+            }
             if let Some(objective) = planning_objective {
                 operation.island_id = Some(objective.island_id);
                 operation.staging_anchor = objective.staging_anchor;
                 operation.execution_authorized = objective.execution_authorized;
                 operation.protected_capture_entities = objective.protected_capture_entities.clone();
+                operation.capture_replacement_pending = objective.capture_replacement_pending;
             } else if let Some(active) = active_objectives
                 .iter()
                 .find(|objective| objective.kind == kind && objective.properties == cluster)
@@ -5770,6 +5970,404 @@ fn facility_lead_time(scan: &BoardScan, anchor: &GridPosition, movement: u32) ->
         .map(|(f, _)| eta_turns(&scan.map, f, anchor, movement))
         .min()
         .unwrap_or(u32::MAX)
+}
+
+/// 物件の占領耐久をマスターデータから取得する。
+fn property_durability(scan: &BoardScan, property: &GridPosition) -> u32 {
+    scan.map
+        .get_terrain(property.x, property.y)
+        .map(|terrain| scan.master_data.landscape_durability(terrain.as_str()))
+        .unwrap_or(0)
+        .max(200)
+}
+
+/// 現在盤面または今手番の生産から、指定物件を最短で占領完了できる相対turnを返す。
+fn fastest_friendly_capture_completion(
+    scan: &BoardScan,
+    ctx: &mut ReachCtx,
+    property: &GridPosition,
+    player_id: PlayerId,
+) -> Option<u32> {
+    let durability = property_durability(scan, property);
+    let mut best = None;
+    for unit in scan.my_units.iter().filter(|unit| unit.stats.can_capture) {
+        let Some(arrival) = property_control::capture_arrival_turns(
+            &scan.map,
+            &scan.master_data,
+            (unit.pos.x, unit.pos.y),
+            (property.x, property.y),
+            unit.stats.movement_type,
+            unit.stats.max_movement,
+            unit.stats.max_fuel,
+            player_id,
+            &mut ctx.action_turns,
+        ) else {
+            continue;
+        };
+        let completion = property_control::completion_offset(
+            arrival,
+            durability,
+            property_control::capture_power_from_hp(unit.hp),
+        );
+        best = Some(best.map_or(completion, |current: u32| current.min(completion)));
+    }
+
+    // 新規生産unitは次の自分フェーズから行動する。距離1ならそのフェーズに到着して
+    // 占領を開始できるため、生産待機と移動フェーズを別々には加算しない。
+    for (facility, terrain) in &scan.free_facilities {
+        for (unit_type, stats) in &scan.available_types {
+            if !stats.can_capture
+                || stats.cost > scan.funds
+                || !scan.can_produce(*terrain, *unit_type)
+            {
+                continue;
+            }
+            let Some(arrival) = property_control::capture_arrival_turns(
+                &scan.map,
+                &scan.master_data,
+                (facility.x, facility.y),
+                (property.x, property.y),
+                stats.movement_type,
+                stats.max_movement,
+                stats.max_fuel,
+                player_id,
+                &mut ctx.action_turns,
+            ) else {
+                continue;
+            };
+            let completion = property_control::completion_offset(
+                property_control::produced_action_offset(0, arrival),
+                durability,
+                property_control::capture_power_from_hp(100),
+            );
+            best = Some(best.map_or(completion, |current: u32| current.min(completion)));
+        }
+    }
+    best
+}
+
+/// 今手番に生産できる戦闘unitのうち、敵が物件へ来た後に最も早く初撃できる時刻を返す。
+fn fastest_produced_attack_turn(
+    scan: &BoardScan,
+    ctx: &mut ReachCtx,
+    property: &GridPosition,
+    enemy: &UnitSnapshot,
+    enemy_arrival_turn: u32,
+    player_id: PlayerId,
+) -> Option<u32> {
+    let mut best: Option<(u32, u32, std::cmp::Reverse<u32>, usize, usize)> = None;
+    for (facility, terrain) in &scan.free_facilities {
+        for (unit_type, stats) in &scan.available_types {
+            let damage = best_damage(&scan.damage_chart, stats.unit_type, enemy.stats.unit_type);
+            if damage == 0 || stats.cost > scan.funds || !scan.can_produce(*terrain, *unit_type) {
+                continue;
+            }
+            let Some(ready) = produced_attack_turn_along_capture_route(
+                scan,
+                ctx,
+                facility,
+                stats,
+                enemy,
+                property,
+                enemy_arrival_turn,
+                player_id,
+            ) else {
+                continue;
+            };
+            let key = (
+                ready,
+                stats.cost,
+                std::cmp::Reverse(damage),
+                facility.y,
+                facility.x,
+            );
+            if best.is_none_or(|current| key < current) {
+                best = Some(key);
+            }
+        }
+    }
+    best.map(|candidate| candidate.0)
+}
+
+/// 生産した攻撃役が、敵占領役の最短物件進入経路上で合法な初撃を行える最早turn。
+///
+/// 現在位置へ敵を固定せず、また物件へ瞬間移動させない。敵の始点→経路セル→物件が
+/// 実行動ターン距離上の最短経路になる全セルを列挙し、攻撃役も地形・燃料・射程・
+/// 移動後間接攻撃制約を通した到達時刻で比較する。
+#[allow(clippy::too_many_arguments)]
+fn produced_attack_turn_along_capture_route(
+    scan: &BoardScan,
+    ctx: &mut ReachCtx,
+    facility: &GridPosition,
+    stats: &UnitStats,
+    enemy: &UnitSnapshot,
+    property: &GridPosition,
+    enemy_arrival_turn: u32,
+    player_id: PlayerId,
+) -> Option<u32> {
+    let actual_occupancy = scanned_occupants(scan, player_id);
+    let attacker_fuel = if stats.max_fuel == 0 {
+        u32::MAX
+    } else {
+        stats.max_fuel
+    };
+    let my_order = player_order(player_id);
+    let enemy_order = player_order(player_id.opposite());
+    let mut best = None;
+
+    for y in 0..scan.map.height {
+        for x in 0..scan.map.width {
+            let cell = GridPosition { x, y };
+            let Some(enemy_to_cell) = property_control::capture_arrival_turns(
+                &scan.map,
+                &scan.master_data,
+                (enemy.pos.x, enemy.pos.y),
+                (cell.x, cell.y),
+                enemy.stats.movement_type,
+                enemy.stats.max_movement,
+                enemy.stats.max_fuel,
+                player_id.opposite(),
+                &mut ctx.action_turns,
+            ) else {
+                continue;
+            };
+            let Some(cell_to_property) = property_control::capture_arrival_turns(
+                &scan.map,
+                &scan.master_data,
+                (cell.x, cell.y),
+                (property.x, property.y),
+                enemy.stats.movement_type,
+                enemy.stats.max_movement,
+                enemy.stats.max_fuel,
+                player_id.opposite(),
+                &mut ctx.action_turns,
+            ) else {
+                continue;
+            };
+            if enemy_to_cell.saturating_add(cell_to_property) > enemy_arrival_turn {
+                continue;
+            }
+            let Some(attacker_distance) = calculate_action_distance_to_range(
+                &scan.map,
+                &scan.master_data,
+                &actual_occupancy,
+                (facility.x, facility.y),
+                (cell.x, cell.y),
+                stats.movement_type,
+                stats.max_movement,
+                attacker_fuel,
+                stats.min_range,
+                stats.max_range,
+                player_id,
+                &mut ctx.action_turns,
+            ) else {
+                continue;
+            };
+            let attacker_ready =
+                property_control::produced_action_offset(0, attacker_distance.turns);
+            // 後手は敵がセルへ入った同roundに攻撃できる。先手は敵の移動後、次roundの
+            // 自分手番で攻撃する。現在セル(到達0)は生産直後には迎撃できない。
+            let encounter_turn = if my_order > enemy_order {
+                enemy_to_cell
+            } else {
+                enemy_to_cell.saturating_add(1)
+            };
+            if enemy_to_cell == 0 || attacker_ready > encounter_turn {
+                continue;
+            }
+            best = Some(best.map_or(encounter_turn, |current: u32| current.min(encounter_turn)));
+        }
+    }
+    best
+}
+
+/// Capture clusterを一つの中心点へ畳まず、物件ごとの直取り・妨害・奪還を列挙する。
+fn select_property_control_plan(
+    scan: &BoardScan,
+    ctx: &mut ReachCtx,
+    cluster: &[GridPosition],
+    latest_enemy_completion: u32,
+    player_id: PlayerId,
+) -> Option<PropertyControlPlan> {
+    let my_order = player_order(player_id);
+    let enemy_order = player_order(player_id.opposite());
+    let mut objectives = Vec::new();
+
+    // 一体の敵占領役を複数物件へ同時投入したことにしない。全「敵×物件」の実ETAを
+    // 早い順に並べ、敵Entityと物件をそれぞれ一度だけ割り当てる。これにより独立した
+    // 物件レース数は、実在する敵占領役数と物件数の双方を超えない。
+    let mut projections = Vec::new();
+    for property in cluster {
+        let durability = property_durability(scan, property);
+        let friendly_completion =
+            fastest_friendly_capture_completion(scan, ctx, property, player_id);
+        // 作戦時間幅までに自軍の占領完了が物理的に間に合わない物件は、今手番の
+        // 物件契約へ入れない。後方物件は次のRoadmap区間で盤面を再観測して扱う。
+        if friendly_completion.is_none_or(|completion| completion > latest_enemy_completion) {
+            continue;
+        }
+        let neutral = scan.neutral_properties.contains(property);
+        for enemy in scan
+            .enemy_units
+            .iter()
+            .filter(|enemy| enemy.stats.can_capture)
+        {
+            let Some(entity) = enemy.entity else {
+                continue;
+            };
+            let Some(arrival) = property_control::capture_arrival_turns(
+                &scan.map,
+                &scan.master_data,
+                (enemy.pos.x, enemy.pos.y),
+                (property.x, property.y),
+                enemy.stats.movement_type,
+                enemy.stats.max_movement,
+                enemy.stats.max_fuel,
+                player_id.opposite(),
+                &mut ctx.action_turns,
+            ) else {
+                continue;
+            };
+            let completion = property_control::completion_offset(
+                arrival,
+                durability,
+                property_control::capture_power_from_hp(enemy.hp),
+            );
+            if neutral && completion > latest_enemy_completion {
+                continue;
+            }
+            // 中立は敵の占領完了が早いレースから、敵所有物件は自軍が奪還完了できる
+            // 前線から割り当てる。後者で敵後方駐留地を先に選ばない。
+            let property_deadline = if neutral {
+                completion
+            } else {
+                friendly_completion.expect("到達可能物件だけを残している")
+            };
+            projections.push((
+                property_deadline,
+                arrival,
+                entity.to_bits(),
+                property.y,
+                property.x,
+                entity,
+                *property,
+                neutral,
+                completion,
+                friendly_completion,
+            ));
+        }
+    }
+    projections.sort_unstable_by_key(|projection| {
+        (
+            projection.0,
+            projection.1,
+            projection.2,
+            projection.3,
+            projection.4,
+        )
+    });
+    let mut assigned_enemies = HashSet::new();
+    let mut assigned_properties = HashSet::new();
+    for (
+        _,
+        enemy_arrival,
+        _,
+        _,
+        _,
+        enemy_entity,
+        property,
+        neutral,
+        enemy_completion,
+        friendly_completion,
+    ) in projections
+    {
+        if assigned_enemies.contains(&enemy_entity) || assigned_properties.contains(&property) {
+            continue;
+        }
+        assigned_enemies.insert(enemy_entity);
+        assigned_properties.insert(property);
+        let Some(enemy) = scan
+            .enemy_units
+            .iter()
+            .find(|enemy| enemy.entity == Some(enemy_entity))
+        else {
+            continue;
+        };
+
+        let attack_ready =
+            fastest_produced_attack_turn(scan, ctx, &property, enemy, enemy_arrival, player_id);
+        let approach = if !neutral {
+            PropertyControlApproach::Recapture
+        } else if friendly_completion.is_some_and(|mine| {
+            property_control::completion_race_won(mine, my_order, enemy_completion, enemy_order)
+        }) {
+            PropertyControlApproach::DirectCapture
+        } else if attack_ready.is_some_and(|attack| {
+            property_control::interdict_feasible(
+                property_control::ActionPhase::new(attack, my_order),
+                property_control::ActionPhase::new(enemy_completion, enemy_order),
+            )
+        }) {
+            PropertyControlApproach::Interdict
+        } else {
+            PropertyControlApproach::Recapture
+        };
+        objectives.push((
+            PropertyControlObjective {
+                property,
+                enemy_entity,
+                enemy_arrival_turn: enemy_arrival,
+                enemy_completion_turn: enemy_completion,
+                attack_ready_turn: attack_ready,
+                approach,
+                disaggregated: false,
+            },
+            friendly_completion,
+        ));
+    }
+
+    let distinct_enemy_count = objectives
+        .iter()
+        .map(|(objective, _)| objective.enemy_entity)
+        .collect::<HashSet<_>>()
+        .len();
+    objectives.sort_by_key(|(objective, friendly_completion)| {
+        let approach_rank = match objective.approach {
+            PropertyControlApproach::DirectCapture => 0,
+            PropertyControlApproach::Interdict => 1,
+            PropertyControlApproach::Recapture => 2,
+        };
+        let action_turn = match objective.approach {
+            PropertyControlApproach::DirectCapture => friendly_completion.unwrap_or(u32::MAX),
+            PropertyControlApproach::Interdict | PropertyControlApproach::Recapture => {
+                objective.attack_ready_turn.unwrap_or(u32::MAX)
+            }
+        };
+        (
+            approach_rank,
+            action_turn,
+            objective.enemy_completion_turn,
+            objective.property.y,
+            objective.property.x,
+        )
+    });
+    for (objective, _) in &mut objectives {
+        objective.disaggregated = distinct_enemy_count > 1;
+    }
+    let primary = objectives.first().map(|(objective, _)| *objective)?;
+    let capture_lanes = objectives
+        .iter()
+        // 直取り・妨害に失敗するレーンも、撃破後の奪還には占領役が必要である。
+        // 到達可能なレーンだけを残し、Recaptureを理由に占領生産そのものを消さない。
+        .filter(|(_, friendly_completion)| friendly_completion.is_some())
+        .map(|(objective, _)| objective.property)
+        .collect::<Vec<_>>();
+    let capture_lanes = (!capture_lanes.is_empty()).then_some(capture_lanes)?;
+    Some(PropertyControlPlan {
+        primary,
+        controls: objectives.iter().map(|(objective, _)| *objective).collect(),
+        capture_lanes,
+    })
 }
 
 fn operation_threat_horizon(kind: OperationKind, deploy_lead_time: u32) -> u32 {
@@ -5975,6 +6573,7 @@ fn build_operation(
     forced_target_enemies: &HashSet<Entity>,
     protected_capture_entities: &HashSet<Entity>,
     deploy_lead_time: u32,
+    player_id: PlayerId,
 ) -> Operation {
     // この作戦を「最寄りの作戦」とするユニットだけを、この作戦の担当として数える。
     // これにより 1 体のユニットが複数作戦に二重計上されない。
@@ -6131,7 +6730,10 @@ fn build_operation(
             {
                 friendly_capture_units_committed += 1;
             }
-        } else if unit.stats.max_cargo == 0 {
+        }
+        // 搭載能力ではなく、実在脅威への有効打と到達性で戦闘参加を判定する。
+        // 装甲車のような武装carrierを輸送台帳だけへ隔離しない。
+        {
             // 迎撃枠の条件：到達できない脅威へ有効打を持ち、かつ自力で現地へ行ける
             let self_deployable = ctx.is_reachable(
                 &scan.map,
@@ -6263,6 +6865,16 @@ fn build_operation(
     // 構造生産を島campaignが予約済みの手番は`allow_structural_slots`側で一括して
     // Capture/Transportを無効化するため、ここで恒久的に0へ落としてはならない。
 
+    let enemy_capture_completion = enemy_capture_completion_offset(scan, ctx, &anchor, player_id);
+    if kind == OperationKind::Capture
+        && capture_race_behind(deploy_lead_time, enemy_capture_completion, player_id)
+    {
+        // 敵が先に占領完了する物件へ、占領枠を複数方向へ広げない。
+        // 遅い占領兵を増やすだけの投資を止め、予算を妨害・奪還（Combat）側へ残す。
+        // 最小 1 枠は、敵排除後に物件へ入れる奪還要員として残す。
+        slots.capture_units = slots.capture_units.min(1);
+    }
+
     let mut operation = Operation {
         kind,
         island_id: None,
@@ -6270,7 +6882,12 @@ fn build_operation(
         staging_anchor: anchor,
         execution_authorized: true,
         protected_capture_entities: HashSet::new(),
+        capture_replacement_pending: false,
         objective_properties: cluster.to_vec(),
+        property_control: None,
+        property_controls: Vec::new(),
+        capture_lane_targets: Vec::new(),
+        planned_capture_units: Vec::new(),
         threat_horizon: anchor_index
             .and_then(|index| horizons.get(index).copied())
             .unwrap_or(0),
@@ -6347,7 +6964,7 @@ fn plan_production_with_registry(
 ) -> (Vec<PlannedProduction>, ProductionPlanTrace) {
     let mut ctx = ReachCtx::default();
     let active_objectives = plan_registry.active_objectives(player_id);
-    let mut operations = build_operations(scan, &mut ctx, &active_objectives);
+    let mut operations = build_operations(scan, &mut ctx, &active_objectives, player_id);
     let mut plan_trace =
         ProductionPlanTrace::new(player_id, scan.funds, scan.free_facilities.len());
 
@@ -6393,6 +7010,7 @@ fn plan_production_with_registry(
             kind: op.kind,
             anchor: op.anchor,
             slots: op.slots,
+            capture_replacement_pending: op.capture_replacement_pending,
             requires_transport: op.facts.requires_transport,
             enemy_combat_units: op.facts.enemy_combat_units,
             enemy_reinforcement_funds: op.facts.enemy_reinforcement_funds,
@@ -6581,6 +7199,7 @@ fn plan_production_with_registry(
                 &staged_for_plan,
                 spendable_funds,
                 !allow_structural_slots,
+                player_id,
             );
             if let Some(input) = rolling_input {
                 // 首都攻略の編成中は、固定購入列が今も実行可能ならその再評価だけを行う。
@@ -6670,6 +7289,12 @@ fn plan_production_with_registry(
                 );
                 if let Some(plan_id) = selected.plan_id {
                     seen_plan_ids.insert(plan_id);
+                }
+                if input.exact_property_control {
+                    // 物件数から歩兵数を先決めしない。施設・資金・敵相性を同時に列挙して
+                    // 選ばれた支配パッケージのCapture割当だけを、この手番の必要数とする。
+                    operations[op_index].slots.capture_units =
+                        u32::try_from(selected.plan.capture_purchases.len()).unwrap_or(u32::MAX);
                 }
                 let plan = &selected.plan;
                 plan_trace.rolling_combat_plans.retain(|current| {
@@ -6777,6 +7402,7 @@ fn plan_production_with_registry(
                     remaining_funds: spendable_funds,
                     per_slot_budget,
                 },
+                player_id,
             )
         };
 
@@ -6815,6 +7441,7 @@ fn plan_production_with_registry(
         // 見送り購入: 一括編成が必要な作戦で、今買える範囲に適合候補が無く、
         // 数ターン待てばより適合する候補が買えるなら、資金を貯める。
         if slot_kind != SlotKind::Combat
+            && operations[op_index].property_controls.is_empty()
             && should_defer_purchase(
                 scan,
                 &mut ctx,
@@ -6822,6 +7449,7 @@ fn plan_production_with_registry(
                 slot_kind,
                 spendable_funds,
                 candidate.cost,
+                player_id,
             )
         {
             plan_trace.steps.push(ProductionStepTrace {
@@ -6839,6 +7467,25 @@ fn plan_production_with_registry(
             break;
         }
 
+        let joint_capture_target = (slot_kind == SlotKind::Combat)
+            .then_some(rolling_plan)
+            .flatten()
+            .zip(planned_purchase)
+            .and_then(|(plan, purchase)| plan.plan.capture_target_for(purchase));
+        // 共同計画のCapture割当を優先し、通常Capture枠だけ従来の次レーンを使う。
+        let capture_mission_target = joint_capture_target.or_else(|| {
+            (slot_kind == SlotKind::Capture).then(|| next_capture_target(&operations[op_index]))
+        });
+        let effective_slot_kind = if capture_mission_target.is_some() {
+            SlotKind::Capture
+        } else {
+            slot_kind
+        };
+        let planned_combat_target = (effective_slot_kind == SlotKind::Combat)
+            .then_some(rolling_plan)
+            .flatten()
+            .zip(planned_purchase)
+            .and_then(|(plan, purchase)| plan.plan.combat_target_for(purchase));
         remaining_funds = remaining_funds.saturating_sub(candidate.cost);
         if planned_purchase.is_some() {
             issued_plan_purchase_cost = issued_plan_purchase_cost.saturating_add(candidate.cost);
@@ -6848,15 +7495,19 @@ fn plan_production_with_registry(
             candidate.facility,
             operation_priority_rank(&operations[op_index]),
         );
-        let mut deployment = planned_deployment(
-            scan,
-            &mut ctx,
-            &operations[op_index],
-            slot_kind,
-            &candidate,
-            None,
-        );
-        if slot_kind == SlotKind::Combat
+        let mut deployment = (effective_slot_kind != SlotKind::Capture)
+            .then(|| {
+                planned_deployment(
+                    scan,
+                    &mut ctx,
+                    &operations[op_index],
+                    effective_slot_kind,
+                    &candidate,
+                    planned_combat_target,
+                )
+            })
+            .flatten();
+        if effective_slot_kind == SlotKind::Combat
             && let (Some(deployment), Some(plan)) = (deployment.as_mut(), rolling_plan)
         {
             deployment.forecast = deployment::DeploymentForecast {
@@ -6876,24 +7527,35 @@ fn plan_production_with_registry(
         }
         // Combatは同じパッケージの未使用current purchaseを次の反復で選ぶ。
         // 全て消費した後は候補なしとなり、この手番のCombat枠を完了する。
-        if slot_kind != SlotKind::Combat {
+        if effective_slot_kind == SlotKind::Capture {
+            let target = capture_mission_target.expect("Capture購入には任務先がある");
+            operations[op_index]
+                .planned_capture_units
+                .push(PlannedCaptureUnit {
+                    stats: candidate_stats(scan, &candidate).clone(),
+                    facility: candidate.facility,
+                    target,
+                });
+            operations[op_index].filled.capture_units =
+                operations[op_index].filled.capture_units.saturating_add(1);
+        } else if effective_slot_kind != SlotKind::Combat {
             record_fill(
                 scan,
                 &mut ctx,
                 &mut operations[op_index],
-                slot_kind,
+                effective_slot_kind,
                 &candidate,
             );
         }
         plan_trace.steps.push(ProductionStepTrace {
             operation_kind,
             operation_anchor,
-            slot_kind,
+            slot_kind: effective_slot_kind,
             deficit_before,
             // 購入を反映した後の未充足率。ここが下がらない枠が同一ユニットを買い続ける。
             deficit_after: operations[op_index]
                 .slots
-                .deficit_ratio(slot_kind, &operations[op_index].filled),
+                .deficit_ratio(effective_slot_kind, &operations[op_index].filled),
             remaining_funds_before,
             decision: ProductionDecision::Produced {
                 unit_type: candidate.unit_type,
@@ -6901,7 +7563,7 @@ fn plan_production_with_registry(
                 facility: candidate.facility,
             },
         });
-        let capture_intent = (slot_kind == SlotKind::Capture)
+        let capture_intent = (effective_slot_kind == SlotKind::Capture)
             .then(|| {
                 operations[op_index].island_id.map(|island_id| {
                     campaign_execution::CampaignProductionIntent {
@@ -6913,6 +7575,7 @@ fn plan_production_with_registry(
                         },
                         island_id,
                         role: campaign_execution::CampaignProductionRole::Capture,
+                        mission_target: capture_mission_target,
                     }
                 })
             })
@@ -7173,7 +7836,7 @@ fn enemy_reinforcement_assessment(
                 })
                 .filter_map(|(_, stats)| {
                     let eta = eta_turns(&scan.map, &facility.pos, &op.anchor, stats.max_movement);
-                    let available_turn = build_turn.saturating_add(1).saturating_add(eta);
+                    let available_turn = property_control::produced_action_offset(build_turn, eta);
                     if available_turn > horizon {
                         return None;
                     }
@@ -7297,9 +7960,10 @@ fn fastest_observed_counter(
         .filter_map(|(facility, stats)| {
             let damage = best_damage(&scan.damage_chart, stats.unit_type, enemy.unit_type);
             let attacks_required = 100_u32.div_ceil(damage.max(1));
-            let counter_contact_turn = counter_build_turn
-                .saturating_add(1)
-                .saturating_add(eta_turns(&scan.map, &facility, &anchor, stats.max_movement));
+            let counter_contact_turn = property_control::produced_action_offset(
+                counter_build_turn,
+                eta_turns(&scan.map, &facility, &anchor, stats.max_movement),
+            );
             (counter_contact_turn <= enemy_contact_turn).then_some((
                 counter_contact_turn,
                 attacks_required,
@@ -7366,57 +8030,99 @@ fn combat_plan_input(
     staged_combat_entities: &HashSet<Entity>,
     remaining_funds: u32,
     require_self_deployment: bool,
+    player_id: PlayerId,
 ) -> Option<RollingPlanInput> {
     let enemies: Vec<_> = op
         .reachable_threats
         .iter()
         .filter(|threat| threat.current_hp > 0)
         .map(|threat| {
+            // 期限対象も仮想的に物件上へテレポートさせず、現在観測した実Entity位置から
+            // 追う。配置側もEntity IDへ追随するため、移動中の占領役を迎撃できる。
+            let position = threat.position;
+            let available_turn = threat.available_turn;
             let terrain = scan
                 .map
-                .get_terrain(threat.position.x, threat.position.y)
+                .get_terrain(position.x, position.y)
                 .unwrap_or(Terrain::Plains);
             EnemyPlanUnit {
                 entity: threat.entity,
                 stats: threat.stats.clone(),
-                position: threat.position,
+                position,
                 hp: threat.current_hp,
                 defense_bonus: scan.master_data.get_terrain_defense_bonus(terrain),
-                available_turn: threat.available_turn,
+                available_turn,
             }
         })
         .collect();
-    let hard_deadline =
+    let mut hard_deadline =
         if op.kind == OperationKind::Defense && op.facts.enemy_contact_eta != u32::MAX {
             Some(op.facts.enemy_contact_eta.max(1))
+        } else if op.kind == OperationKind::Capture {
+            if let Some(control) = op.property_control.filter(|control| control.disaggregated) {
+                if control.approach == PropertyControlApproach::Interdict {
+                    // 同一roundなら先手だけが敵占領完了前に行動できる。後手は一つ前の
+                    // roundを最終期限にし、turn整数化で同着を成功扱いしない。
+                    Some(
+                        if player_order(player_id) < player_order(player_id.opposite()) {
+                            control.enemy_completion_turn
+                        } else {
+                            control.enemy_completion_turn.saturating_sub(1)
+                        },
+                    )
+                    .filter(|deadline| *deadline > 0)
+                } else {
+                    None
+                }
+            } else {
+                // 直取り競争では、敵が占領完了する前の撃破が唯一の勝ち筋。
+                // 敵占領役の占領完了フェーズを「撃破のハード期限」にし、総ダメージではなく
+                // 「期限前に敵を倒せるか」を編成選択の最優先にする。
+                // ただし完了が1フェーズ以内（＝敵が既に物件上で占領中）なら、この手番の
+                // 生産では妨害が物理的に間に合わないため、期限を立てず通常の撃破計画へ委ねる。
+                enemy_capture_completion_offset(scan, ctx, &op.anchor, player_id)
+                    .filter(|deadline| *deadline > 1)
+            }
         } else {
             None
         };
     let campaign_objective = scan.campaign_objectives.iter().find(|objective| {
         objective.anchor == op.anchor || op.objective_properties.contains(&objective.anchor)
     });
-    let mut capture_completion_turn =
-        campaign_objective.and_then(|objective| objective.capture_eta);
-    let required_capture_survivors = campaign_objective.map_or_else(
-        || {
-            op.objective_properties
-                .iter()
-                .filter(|property| scan.open_properties.contains(property))
-                .count()
-        },
-        |objective| objective.required_capture_survivors,
-    );
+    let disaggregated_control = op.property_control.filter(|control| control.disaggregated);
+    let mut capture_completion_turn = if op.property_controls.is_empty() {
+        campaign_objective.and_then(|objective| objective.capture_eta)
+    } else {
+        None
+    };
+    let required_capture_survivors = if !op.property_controls.is_empty() {
+        // 単一路線でも合同探索が担当する。disaggregatedだけを条件にすると、物件が
+        // 一つの小規模マップで必要占領役が0になり、空の生産列を成立扱いしてしまう。
+        op.capture_lane_targets.len().max(1)
+    } else {
+        campaign_objective.map_or_else(
+            || {
+                op.objective_properties
+                    .iter()
+                    .filter(|property| scan.open_properties.contains(property))
+                    .count()
+            },
+            |objective| objective.required_capture_survivors,
+        )
+    };
     let mut enemies = enemies;
-    enemies.extend(op.expected_reinforcements.iter().cloned());
+    // Capture作戦のCombat計画は「今の物件レース」を解くもので、将来生産される
+    // 増援は対象にしない。将来増援まで含めると全滅が実行不能になり、快速の妨害が
+    // 出せなくなる。将来増援への備えはDefense/AssaultCapital側が担う。
+    if op.kind != OperationKind::Capture {
+        enemies.extend(op.expected_reinforcements.iter().cloned());
+    }
     if enemies.is_empty() {
         return None;
     }
 
     let mut existing_units = Vec::new();
     for unit in &scan.my_units {
-        if unit.stats.max_cargo > 0 {
-            continue;
-        }
         let Some(entity) = unit.entity else {
             continue;
         };
@@ -7484,48 +8190,45 @@ fn combat_plan_input(
     // Combat枠で選ぶ歩兵・重歩兵も生存占領能力へ数えるため、将来費用を先取りせず
     // 現在の空き施設・現金を前線戦力へ使える。
     let missing_protected_units = required_capture_survivors.saturating_sub(protected_units.len());
-    let newly_ordered_capture_units = usize::try_from(op.filled.capture_units)
-        .unwrap_or(usize::MAX)
-        .saturating_sub(protected_units.len())
-        .min(missing_protected_units);
-    let reference_capture = scan.reference_capture_unit().cloned();
-    if let Some(reference_capture) = reference_capture.as_ref() {
-        let targets = if op.objective_properties.is_empty() {
-            std::slice::from_ref(&op.anchor)
+    for planned in op
+        .planned_capture_units
+        .iter()
+        .take(missing_protected_units)
+    {
+        let movement_turns = if op.facts.requires_transport {
+            op.facts.deploy_lead_time.max(1)
         } else {
-            op.objective_properties.as_slice()
+            property_control::capture_arrival_turns(
+                &scan.map,
+                &scan.master_data,
+                (planned.facility.x, planned.facility.y),
+                (planned.target.x, planned.target.y),
+                planned.stats.movement_type,
+                planned.stats.max_movement,
+                planned.stats.max_fuel,
+                player_id,
+                &mut ctx.action_turns,
+            )
+            .unwrap_or(op.facts.deploy_lead_time)
         };
-        for index in 0..newly_ordered_capture_units {
-            let target = targets[index % targets.len()];
-            let movement_turns = if op.facts.requires_transport {
-                op.facts.deploy_lead_time.max(1)
-            } else {
-                scan.production_facilities
-                    .iter()
-                    .map(|(facility, _)| {
-                        eta_turns(&scan.map, facility, &target, reference_capture.max_movement)
-                    })
-                    .min()
-                    .unwrap_or(op.facts.deploy_lead_time)
-            };
-            protected_units.push(FriendlyPlanUnit {
-                stats: reference_capture.clone(),
-                position: target,
-                hp: 100,
-                available_turn: 1_u32.saturating_add(movement_turns),
-                engageable_enemy_indices: Vec::new(),
-            });
-        }
-        if capture_completion_turn.is_none()
-            && required_capture_survivors > 0
-            && protected_units.len() >= required_capture_survivors
-        {
-            capture_completion_turn = protected_units
-                .iter()
-                .map(|unit| unit.available_turn)
-                .max()
-                .map(|arrival| arrival.saturating_add(CAPTURE_COMPLETION_TURNS));
-        }
+        protected_units.push(FriendlyPlanUnit {
+            stats: planned.stats.clone(),
+            position: planned.target,
+            hp: 100,
+            // 距離1は次フェーズに到着する。生産待機を移動フェーズへ二重加算しない。
+            available_turn: property_control::produced_action_offset(0, movement_turns),
+            engageable_enemy_indices: Vec::new(),
+        });
+    }
+    if capture_completion_turn.is_none()
+        && required_capture_survivors > 0
+        && protected_units.len() >= required_capture_survivors
+    {
+        capture_completion_turn = protected_units
+            .iter()
+            .map(|unit| unit.available_turn)
+            .max()
+            .map(|arrival| arrival.saturating_add(CAPTURE_COMPLETION_TURNS));
     }
 
     // 局地Captureで首都戦用の12手番すべての施設×兵種を展開すると、敵が数体
@@ -7571,11 +8274,85 @@ fn combat_plan_input(
                 )
         },
     );
+    if !op.property_controls.is_empty() {
+        // 同じ施設・資金について、戦闘役だけでなく各物件の占領役として使う合法手も
+        // 同じ探索空間へ入れる。先に最安歩兵を予約せず、相性を含む全編成で比較する。
+        for target in &op.capture_lane_targets {
+            let durability = property_durability(scan, target);
+            for (facility, terrain) in &scan.free_facilities {
+                if used_facilities.contains(facility) {
+                    continue;
+                }
+                for (unit_type, stats) in &scan.available_types {
+                    if !stats.can_capture
+                        || stats.cost == 0
+                        || !scan.can_produce(*terrain, *unit_type)
+                        || !can_join_operation(
+                            scan,
+                            ctx,
+                            target,
+                            op.facts.requires_transport,
+                            facility,
+                            stats,
+                        )
+                    {
+                        continue;
+                    }
+                    let Some(arrival) = property_control::capture_arrival_turns(
+                        &scan.map,
+                        &scan.master_data,
+                        (facility.x, facility.y),
+                        (target.x, target.y),
+                        stats.movement_type,
+                        stats.max_movement,
+                        stats.max_fuel,
+                        player_id,
+                        &mut ctx.action_turns,
+                    )
+                    .map(|turns| property_control::produced_action_offset(0, turns)) else {
+                        continue;
+                    };
+                    let completion = property_control::completion_offset(
+                        arrival,
+                        durability,
+                        property_control::capture_power_from_hp(100),
+                    );
+                    options.push(rolling_plan::ProductionPlanOption {
+                        purchase: rolling_plan::PlannedPurchase {
+                            facility: *facility,
+                            unit_type: *unit_type,
+                            build_turn: 0,
+                            cost: stats.cost,
+                        },
+                        stats: stats.clone(),
+                        engageable_enemy_indices: Vec::new(),
+                        capture_target: Some(*target),
+                        capture_arrival_turn: Some(arrival),
+                        capture_completion_turn: Some(completion),
+                    });
+                }
+            }
+        }
+        options.sort_by_key(|option| {
+            (
+                option.purchase.build_turn,
+                option.purchase.facility.y,
+                option.purchase.facility.x,
+                option.capture_target.map(|target| (target.y, target.x)),
+                option.purchase.cost,
+                option.purchase.unit_type.as_str(),
+            )
+        });
+    }
     // この手番に既に使った施設は将来手番には再利用できるが、build_turn=0では使えない。
     options.retain(|option| {
         option.purchase.build_turn > 0 || !used_facilities.contains(&option.purchase.facility)
     });
     for option in &mut options {
+        if option.capture_target.is_some() {
+            option.engageable_enemy_indices.clear();
+            continue;
+        }
         option.engageable_enemy_indices = enemies
             .iter()
             .enumerate()
@@ -7597,7 +8374,126 @@ fn combat_plan_input(
             })
             .collect();
     }
-
+    if !op.property_controls.is_empty() {
+        // 物件前線の合同探索では、Capture契約を持たない候補は実在敵へ合法に
+        // 攻撃できる場合だけCombat枠へ残す。非武装輸送や未接敵兵を「敵の攻撃を
+        // 吸うだけの戦闘役」として評価すると、快速screenを省いた編成になる。
+        options.retain(|option| {
+            option.capture_target.is_some() || !option.engageable_enemy_indices.is_empty()
+        });
+    }
+    let unit_positions = scanned_occupants(scan, player_id);
+    let production_attack_ready_turns = options
+        .iter()
+        .map(|option| {
+            if option.capture_target.is_some() {
+                return vec![None; enemies.len()];
+            }
+            enemies
+                .iter()
+                .map(|enemy| {
+                    if best_damage(
+                        &scan.damage_chart,
+                        option.stats.unit_type,
+                        enemy.stats.unit_type,
+                    ) == 0
+                    {
+                        return None;
+                    }
+                    if let Some(control) = op
+                        .property_controls
+                        .iter()
+                        .find(|control| enemy.entity == Some(control.enemy_entity))
+                        && let Some(observed_enemy) = scan
+                            .enemy_units
+                            .iter()
+                            .find(|unit| unit.entity == Some(control.enemy_entity))
+                    {
+                        // 中立へのInterdictだけでなく、敵所有前線のRecaptureでも敵を
+                        // 初期位置へ固定しない。敵の実最短経路上で接触できる快速screenを
+                        // 評価し、経路上に合法な交戦点が無い場合だけ現在位置を追う。
+                        if let Some(ready_turn) = produced_attack_turn_along_capture_route(
+                            scan,
+                            ctx,
+                            &option.purchase.facility,
+                            &option.stats,
+                            observed_enemy,
+                            &control.property,
+                            control.enemy_arrival_turn,
+                            player_id,
+                        ) {
+                            return Some(ready_turn);
+                        }
+                    }
+                    let effective_fuel = if option.stats.max_fuel == 0 {
+                        u32::MAX
+                    } else {
+                        option.stats.max_fuel
+                    };
+                    calculate_action_distance_to_range(
+                        &scan.map,
+                        &scan.master_data,
+                        &unit_positions,
+                        (option.purchase.facility.x, option.purchase.facility.y),
+                        (enemy.position.x, enemy.position.y),
+                        option.stats.movement_type,
+                        option.stats.max_movement,
+                        effective_fuel,
+                        option.stats.min_range,
+                        option.stats.max_range,
+                        player_id,
+                        &mut ctx.action_turns,
+                    )
+                    .map(|distance| {
+                        property_control::produced_action_offset(
+                            option.purchase.build_turn,
+                            distance.turns,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let deadline_target_index = disaggregated_control
+        .filter(|control| control.approach == PropertyControlApproach::Interdict)
+        .and_then(|control| {
+            enemies
+                .iter()
+                .position(|enemy| enemy.entity == Some(control.enemy_entity))
+        });
+    let interdiction_deadlines = op
+        .property_controls
+        .iter()
+        .filter(|control| {
+            control.disaggregated && control.approach == PropertyControlApproach::Interdict
+        })
+        .filter_map(|control| {
+            let index = enemies
+                .iter()
+                .position(|enemy| enemy.entity == Some(control.enemy_entity))?;
+            // 同roundなら先手だけが占領完了前に行動できる。後手は直前roundを期限にする。
+            let deadline = if player_order(player_id) < player_order(player_id.opposite()) {
+                control.enemy_completion_turn
+            } else {
+                control.enemy_completion_turn.saturating_sub(1)
+            };
+            (deadline > 0).then_some((index, deadline))
+        })
+        .collect::<Vec<_>>();
+    if let Some(latest_deadline) = interdiction_deadlines
+        .iter()
+        .map(|(_, deadline)| *deadline)
+        .max()
+    {
+        hard_deadline = Some(latest_deadline);
+    }
+    if !op.property_controls.is_empty() {
+        hard_deadline = Some(
+            hard_deadline
+                .unwrap_or(0)
+                .max(EARLY_PROPERTY_CONTROL_HORIZON),
+        );
+    }
     Some(RollingPlanInput {
         map: scan.map.clone(),
         master_data: scan.master_data.clone(),
@@ -7606,6 +8502,9 @@ fn combat_plan_input(
         protected_units,
         enemies,
         production_options: options,
+        production_attack_ready_turns,
+        deadline_target_index,
+        interdiction_deadlines,
         current_funds: remaining_funds,
         income_per_turn: scan.my_income,
         hard_deadline,
@@ -7617,6 +8516,12 @@ fn combat_plan_input(
         } else {
             rolling_plan::SEARCH_BEAM_WIDTH
         },
+        // 初撃だけで成立するのは、敵ごとの期限を分離できたInterdict契約だけである。
+        // 通常Captureのhard deadlineは敵排除期限なので、同じfallbackへ流さない。
+        prioritize_deadline_interdiction: op.property_controls.iter().any(|control| {
+            control.disaggregated && control.approach == PropertyControlApproach::Interdict
+        }),
+        exact_property_control: !op.property_controls.is_empty(),
     })
 }
 
@@ -7716,16 +8621,21 @@ fn operation_priority_rank(operation: &Operation) -> u32 {
         && operation.facts.enemy_combat_units > 0
         && operation.facts.enemy_contact_eta
             <= operation.facts.deploy_lead_time.max(1).saturating_add(1);
+    let property_control_cannot_wait = !operation.property_controls.is_empty();
     match (
         operation.kind,
         operation.execution_authorized,
         defense_cannot_wait,
+        property_control_cannot_wait,
     ) {
-        (OperationKind::Defense, _, true) => 0,
-        (OperationKind::AssaultCapital, true, _) => 1,
-        (OperationKind::Defense, _, false) => 2,
-        (OperationKind::Capture, _, _) => 3,
-        (OperationKind::AssaultCapital, false, _) => 4,
+        (OperationKind::Defense, _, true, _) => 0,
+        // 敵の完了時刻を過ぎると消滅する局地案だけを、首都本隊の編成より先に通す。
+        // 通常Captureや成立不能なRecaptureは従来どおり首都作戦を追い越さない。
+        (OperationKind::Capture, _, _, true) => 1,
+        (OperationKind::AssaultCapital, true, _, _) => 2,
+        (OperationKind::Defense, _, false, _) => 3,
+        (OperationKind::Capture, _, _, false) => 4,
+        (OperationKind::AssaultCapital, false, _, _) => 5,
     }
 }
 
@@ -7734,6 +8644,20 @@ fn most_starved_in_tier(operations: &[Operation], tier: SlotTier) -> Option<(usi
     let mut best: Option<(usize, SlotKind, u32, f32, usize)> = None;
     for (index, op) in operations.iter().enumerate() {
         for (priority, kind) in SLOT_PRIORITY.iter().enumerate() {
+            if tier == SlotTier::Prerequisite
+                && *kind == SlotKind::Capture
+                && !op.property_controls.is_empty()
+                && (!op.capture_replacement_pending || op.filled.capture_units > 0)
+                && op.slots.deficit_ratio(SlotKind::Combat, &op.filled) > 0.0
+            {
+                // 期限付き物件制御はCombat計画が占領役も同じ組合せとして列挙する。ただし
+                // 過去に担当したEntityが全滅した場合までCaptureを飛ばすと、戦闘枠不足の
+                // 間は永久に奪還役が補充されない。初回編成は従来どおり共同計画へ任せ、
+                // 担当履歴に未解決の撃破がある場合だけ1体を先に再契約する。別の担当が
+                // 生存していても要求数を割っていれば補うが、当手番の発注後は共同計画へ
+                // 戻すことで、最安歩兵の無制限な先買いを防ぐ。
+                continue;
+            }
             let deficit = op.slots.tier_deficit(*kind, &op.filled, tier);
             if deficit <= 0.0 {
                 continue;
@@ -7794,7 +8718,14 @@ fn record_fill(
         SlotKind::Transport => {
             op.filled.transport_slots = op.filled.transport_slots.saturating_add(cargo.max(1))
         }
-        SlotKind::Capture => op.filled.capture_units += 1,
+        SlotKind::Capture => {
+            op.planned_capture_units.push(PlannedCaptureUnit {
+                stats: candidate_stats(scan, candidate).clone(),
+                facility: candidate.facility,
+                target: next_capture_target(op),
+            });
+            op.filled.capture_units += 1;
+        }
         SlotKind::Combat => unreachable!("Combat購入はRollingPlan経路だけで処理する"),
     }
 }
@@ -7865,7 +8796,18 @@ fn select_candidate(
     kind: SlotKind,
     used_facilities: &HashSet<GridPosition>,
     constraints: CandidateConstraints,
+    player_id: PlayerId,
 ) -> Option<SlotCandidate> {
+    if kind == SlotKind::Capture && !op.property_controls.is_empty() {
+        return select_property_capture_candidate(
+            scan,
+            ctx,
+            op,
+            used_facilities,
+            constraints.remaining_funds,
+            player_id,
+        );
+    }
     let mut best: Option<SlotCandidate> = None;
     let mut best_over_budget: Option<SlotCandidate> = None;
 
@@ -7877,7 +8819,8 @@ fn select_candidate(
             if !scan.can_produce(*terrain, *unit_type) {
                 continue;
             }
-            let Some(fitness) = slot_fitness(scan, ctx, op, kind, facility, stats) else {
+            let Some(fitness) = slot_fitness(scan, ctx, op, kind, facility, stats, player_id)
+            else {
                 continue;
             };
             if stats.cost == 0 || stats.cost > constraints.remaining_funds {
@@ -7919,6 +8862,95 @@ fn select_candidate(
 
     // 1 枠あたり予算に収まる候補を優先し、無ければ予算超過でも買える候補を使う
     best.or(best_over_budget)
+}
+
+/// 期限付き物件レーンの占領役を、実経路の占領完了時刻で辞書順選択する。
+///
+/// 価格で割った適合度は、到達1手の差を安価な歩兵で上書きしてしまう。ここではまず
+/// 完了時刻、次に観測敵から受ける最大実ダメージ、最後に費用を比較する。同じ期限を
+/// 満たす候補間でだけ費用が効くため、兵種名や固定評価点による軽歩兵優遇はない。
+fn select_property_capture_candidate(
+    scan: &BoardScan,
+    ctx: &mut ReachCtx,
+    op: &Operation,
+    used_facilities: &HashSet<GridPosition>,
+    remaining_funds: u32,
+    player_id: PlayerId,
+) -> Option<SlotCandidate> {
+    let target = next_capture_target(op);
+    let durability = property_durability(scan, &target);
+    let mut best: Option<((u32, u32, u32, usize, usize), SlotCandidate)> = None;
+
+    for (facility, terrain) in &scan.free_facilities {
+        if used_facilities.contains(facility) {
+            continue;
+        }
+        for (unit_type, stats) in &scan.available_types {
+            if !stats.can_capture
+                || stats.cost == 0
+                || stats.cost > remaining_funds
+                || !scan.can_produce(*terrain, *unit_type)
+                || !can_join_operation(
+                    scan,
+                    ctx,
+                    &target,
+                    op.facts.requires_transport,
+                    facility,
+                    stats,
+                )
+            {
+                continue;
+            }
+            let Some(arrival) = property_control::capture_arrival_turns(
+                &scan.map,
+                &scan.master_data,
+                (facility.x, facility.y),
+                (target.x, target.y),
+                stats.movement_type,
+                stats.max_movement,
+                stats.max_fuel,
+                player_id,
+                &mut ctx.action_turns,
+            )
+            .map(|turns| property_control::produced_action_offset(0, turns)) else {
+                continue;
+            };
+            // `capture_lane_targets` は既存担当数を除いた未充足レーンである。別レーンの
+            // 既存歩兵がこの物件へ近いというだけで候補を落とすと、1体が複数物件を
+            // 同時占領できる誤った前提になり、担当撃破後の有限な再契約まで消える。
+            let completion = property_control::completion_offset(
+                arrival,
+                durability,
+                property_control::capture_power_from_hp(100),
+            );
+            let maximum_incoming = op
+                .reachable_threats
+                .iter()
+                .map(|threat| {
+                    best_damage(&scan.damage_chart, threat.stats.unit_type, stats.unit_type)
+                })
+                .max()
+                .unwrap_or(0);
+            let candidate = SlotCandidate {
+                unit_type: *unit_type,
+                cost: stats.cost,
+                facility: *facility,
+                // トレース互換用。実際の比較は上の整数tupleだけで行う。
+                fitness: 1.0,
+            };
+            let key = (
+                completion,
+                maximum_incoming,
+                stats.cost,
+                facility.y,
+                facility.x,
+            );
+            if best.as_ref().is_none_or(|(current, _)| key < *current) {
+                best = Some((key, candidate));
+            }
+        }
+    }
+    best.map(|(_, candidate)| candidate)
 }
 
 /// 観測済み前線へ届くCombat増援の候補表を、各手番に一度だけ作る。
@@ -8062,6 +9094,19 @@ fn select_immediate_combat_reinforcement(
     within_budget.or(over_budget)
 }
 
+/// 敵が今この手番に未所有（中立・敵）拠点の上にいて占領を進めているか。
+///
+/// 占領中かどうかはユニット名や固定表ではなく、「占領能力を持ち、かつ未所有拠点の
+/// 座標に立っている」という盤面の事実だけで判定する。この敵は占領完了を目前にした
+/// `Interdict` の直接対象であり、単に「占領可能な敵」より優先して撃破・妨害を向ける。
+fn enemy_is_capturing(scan: &BoardScan, threat: &ThreatTarget) -> bool {
+    threat.stats.can_capture
+        && scan
+            .open_properties
+            .iter()
+            .any(|property| property.x == threat.position.x && property.y == threat.position.y)
+}
+
 /// 実在前線全体に対する、1体の増援候補の集約有効度。
 ///
 /// 同じ価格なら早く射撃でき、敵の反撃より大きく削れる候補を優先する。また、資金が
@@ -8108,17 +9153,20 @@ fn immediate_combat_engagements(
         }
         // 占領・輸送役を止める価値は、単なる射撃ユニットより高い。価格やユニット名で
         // はなく、その敵が盤面へ与えられる行動能力だけから重みを導く。
-        let strategic_weight = if threat.stats.can_capture {
+        // 今まさに未所有拠点の上で占領を進めている敵は、占領完了を遅らせる直接の
+        // `Interdict` 対象であり、まだ到達途中の占領可能敵より優先して攻撃を向ける。
+        let strategic_weight = if enemy_is_capturing(scan, threat) {
+            6.0
+        } else if threat.stats.can_capture {
             2.0
         } else if threat.stats.max_cargo > 0 {
             1.5
         } else {
             1.0
         };
-        // 新規生産unitはこの手番には撃てない。射撃位置への行動ターンに1を足して、
-        // 早く前線へ届く候補ほど大きくする。`calculate_action_distance_to_range` は
-        // 間接unitの最小射程・移動後攻撃不可も含む。
-        let arrival_turns = action_distance.turns.saturating_add(1);
+        // 新規生産unitはこの手番には撃てないが、距離1なら次フェーズの移動後に直接攻撃
+        // できる。`calculate_action_distance_to_range` が含む移動フェーズを二重加算しない。
+        let arrival_turns = property_control::produced_action_offset(0, action_distance.turns);
         let arrival_weight = 1.0 / (arrival_turns.saturating_add(1) as f32);
         let received_damage =
             best_damage(&scan.damage_chart, threat.stats.unit_type, stats.unit_type);
@@ -8163,6 +9211,115 @@ fn scanned_occupants(
             )
         })
         .collect()
+}
+
+/// 既に盤面にいて、この作戦の物件へ到達できる自軍占領役の最短到達フェーズ数。
+///
+/// 生産候補（`slot_fitness` の Capture 枝）は、この最短到達より速い場合だけ直取り目的で
+/// 価値を持つ。既存ユニットはこの手番に動けるので +1 しない。到達できる占領役が
+/// いなければ `None` を返す（＝候補は初動として必ず価値を持つ）。
+fn next_capture_target(op: &Operation) -> GridPosition {
+    op.capture_lane_targets
+        .get(op.filled.capture_units as usize)
+        .copied()
+        .unwrap_or(op.anchor)
+}
+
+fn committed_capture_arrival(
+    scan: &BoardScan,
+    ctx: &mut ReachCtx,
+    target: GridPosition,
+    player_id: PlayerId,
+) -> Option<u32> {
+    scan.my_units
+        .iter()
+        .filter(|unit| unit.stats.can_capture)
+        .filter_map(|unit| {
+            property_control::capture_arrival_turns(
+                &scan.map,
+                &scan.master_data,
+                (unit.pos.x, unit.pos.y),
+                (target.x, target.y),
+                unit.stats.movement_type,
+                unit.stats.max_movement,
+                unit.stats.max_fuel,
+                player_id,
+                &mut ctx.action_turns,
+            )
+        })
+        .min()
+}
+
+/// 敵の占領可能ユニットが `anchor` を占領完了するまでの相対フェーズ数（オフセット）を返す。
+///
+/// 到着フェーズは `capture_arrival_turns` で実測し、`completion_offset` で占領完了まで
+/// 加算する。対象物件の耐久（durability）は、`anchor` にある未所有拠点の
+/// `max_capture_points` を採用する。到達できる敵占領役がいなければ `None`。
+fn enemy_capture_completion_offset(
+    scan: &BoardScan,
+    ctx: &mut ReachCtx,
+    anchor: &GridPosition,
+    player_id: PlayerId,
+) -> Option<u32> {
+    // 物件の耐久（占領ポイント最大値）は地形から引く。都市・工場=200、空港・港=300、
+    // 首都=400。地形が不明な場合は標準の都市耐久 200 へ丸める。
+    let durability = scan
+        .map
+        .get_terrain(anchor.x, anchor.y)
+        .map(|terrain| scan.master_data.landscape_durability(terrain.as_str()))
+        .unwrap_or(0)
+        .max(200);
+
+    let opposing = player_id.opposite();
+    scan.enemy_units
+        .iter()
+        .filter(|unit| unit.stats.can_capture)
+        .filter_map(|unit| {
+            property_control::capture_arrival_turns(
+                &scan.map,
+                &scan.master_data,
+                (unit.pos.x, unit.pos.y),
+                (anchor.x, anchor.y),
+                unit.stats.movement_type,
+                unit.stats.max_movement,
+                unit.stats.max_fuel,
+                opposing,
+                &mut ctx.action_turns,
+            )
+            .map(|arrival| {
+                let power = property_control::capture_power_from_hp(unit.hp);
+                property_control::completion_offset(arrival, durability, power)
+            })
+        })
+        .min()
+}
+
+/// 手番順（0 が先手、1 が後手）。PlayerId(1) が先手、PlayerId(2) が後手。
+fn player_order(player_id: PlayerId) -> u32 {
+    player_id.0.saturating_sub(1)
+}
+
+/// 直接占領競争で後着かを判定する。
+///
+/// `deploy_lead_time` は基準占領ユニットの展開リードタイム。占領完了はそこに
+/// `CAPTURE_COMPLETION_TURNS` を加えたもの。敵の占領完了（`enemy_completion`）と同じか
+/// それより後なら後着（`true`）で、占領枠を広げず妨害・奪還へ予算を残すべき。
+/// 敵の完了が不明（`None`）なら後着と扱わない。
+fn capture_race_behind(
+    deploy_lead_time: u32,
+    enemy_completion: Option<u32>,
+    player_id: PlayerId,
+) -> bool {
+    let Some(enemy) = enemy_completion else {
+        return false;
+    };
+    let mine = deploy_lead_time.saturating_add(CAPTURE_COMPLETION_TURNS);
+    !property_control::completion_race_won(
+        mine,
+        player_order(player_id),
+        enemy,
+        player_order(player_id.opposite()),
+    )
 }
 
 /// 積荷を目標へ届けられるか。
@@ -8294,6 +9451,7 @@ fn can_join_operation(
 }
 
 /// ユニットが指定枠にどれだけ適合するかを返す。適合しない場合は `None`。
+#[allow(clippy::too_many_arguments)]
 fn slot_fitness(
     scan: &BoardScan,
     ctx: &mut ReachCtx,
@@ -8301,13 +9459,19 @@ fn slot_fitness(
     kind: SlotKind,
     facility: &GridPosition,
     stats: &UnitStats,
+    player_id: PlayerId,
 ) -> Option<f32> {
+    let slot_anchor = if kind == SlotKind::Capture {
+        next_capture_target(op)
+    } else {
+        op.anchor
+    };
     // 施設から作戦地点まで自力で到達できるか
     let self_deployable = ctx.is_reachable(
         &scan.map,
         &scan.master_data,
         (facility.x, facility.y),
-        (op.anchor.x, op.anchor.y),
+        (slot_anchor.x, slot_anchor.y),
         stats.movement_type,
     );
 
@@ -8322,14 +9486,31 @@ fn slot_fitness(
             if !can_join_operation(
                 scan,
                 ctx,
-                &op.anchor,
+                &slot_anchor,
                 op.facts.requires_transport,
                 facility,
                 stats,
             ) {
                 return None;
             }
-            Some(1.0)
+            // 兵種名ではなく「物件へ何フェーズで到着し、既存の占領役より速いか」で比較する。
+            // 速い兵種でも、既に割り当て済みの占領役より到着が遅い・同等なら直取り目的では
+            // 買い増さない（`docs/07-project-management/plans/v4-v200-small-map-expansion-analysis.md`）。
+            let candidate_arrival = property_control::capture_arrival_turns(
+                &scan.map,
+                &scan.master_data,
+                (facility.x, facility.y),
+                (slot_anchor.x, slot_anchor.y),
+                stats.movement_type,
+                stats.max_movement,
+                stats.max_fuel,
+                player_id,
+                &mut ctx.action_turns,
+            )
+            .map(|turns| property_control::produced_action_offset(0, turns))
+            .unwrap_or(u32::MAX);
+            let committed_best = committed_capture_arrival(scan, ctx, slot_anchor, player_id);
+            property_control::capture_speed_fitness(candidate_arrival, committed_best)
         }
         SlotKind::Transport => {
             if stats.max_cargo == 0 {
@@ -8408,6 +9589,7 @@ fn should_defer_purchase(
     kind: SlotKind,
     remaining_funds: u32,
     affordable_cost: u32,
+    player_id: PlayerId,
 ) -> bool {
     if acquisition_mode(&op.facts) != AcquisitionMode::SquadPackage {
         return false;
@@ -8422,7 +9604,8 @@ fn should_defer_purchase(
             if !scan.can_produce(*terrain, *unit_type) || stats.cost <= remaining_funds {
                 continue;
             }
-            let Some(fitness) = slot_fitness(scan, ctx, op, kind, facility, stats) else {
+            let Some(fitness) = slot_fitness(scan, ctx, op, kind, facility, stats, player_id)
+            else {
                 continue;
             };
             let scaled = fitness * 1000.0 / stats.cost as f32;
@@ -8444,7 +9627,7 @@ fn should_defer_purchase(
                 if !scan.can_produce(*terrain, stats.unit_type) {
                     return None;
                 }
-                slot_fitness(scan, ctx, op, kind, facility, stats)
+                slot_fitness(scan, ctx, op, kind, facility, stats, player_id)
                     .map(|f| f * 1000.0 / stats.cost as f32)
             })
         })
@@ -9301,6 +10484,7 @@ mod tests {
             logistics_rank: None,
             forced_target_enemies: HashSet::new(),
             protected_capture_entities: HashSet::new(),
+            capture_replacement_pending: false,
             staging_anchor: pos(2, 1),
             execution_authorized: true,
         };
@@ -10057,6 +11241,7 @@ mod tests {
             logistics_rank: Some(0),
             forced_target_enemies: HashSet::new(),
             protected_capture_entities: HashSet::new(),
+            capture_replacement_pending: false,
             staging_anchor: anchor,
             execution_authorized: true,
         }]
@@ -10117,11 +11302,12 @@ mod tests {
             logistics_rank: Some(0),
             forced_target_enemies: HashSet::new(),
             protected_capture_entities: HashSet::new(),
+            capture_replacement_pending: false,
             staging_anchor: campaign_anchor,
             execution_authorized: true,
         }];
 
-        let operations = build_operations(&scan, &mut ReachCtx::default(), &[]);
+        let operations = build_operations(&scan, &mut ReachCtx::default(), &[], PlayerId(1));
         let captures = operations
             .iter()
             .filter(|operation| operation.kind == OperationKind::Capture)
@@ -10150,6 +11336,7 @@ mod tests {
                 logistics_rank: Some(0),
                 forced_target_enemies: HashSet::new(),
                 protected_capture_entities: HashSet::new(),
+                capture_replacement_pending: false,
                 staging_anchor: local_anchor,
                 execution_authorized: true,
             },
@@ -10163,6 +11350,7 @@ mod tests {
                 logistics_rank: None,
                 forced_target_enemies: HashSet::new(),
                 protected_capture_entities: HashSet::new(),
+                capture_replacement_pending: false,
                 staging_anchor: local_anchor,
                 execution_authorized: false,
             },
@@ -10174,7 +11362,7 @@ mod tests {
             properties: vec![capital],
             target_enemies: HashSet::new(),
         };
-        let operations = build_operations(&scan, &mut ReachCtx::default(), &[active]);
+        let operations = build_operations(&scan, &mut ReachCtx::default(), &[active], PlayerId(1));
         let same_island = operations
             .iter()
             .filter(|operation| operation.island_id == Some(island_id))
@@ -10323,6 +11511,7 @@ mod tests {
                 .collect(),
             owned_airport_count: 1,
             open_properties: anchors.clone(),
+            neutral_properties: anchors.clone(),
             enemy_income: 0,
             enemy_production_slots: 0,
             enemy_facilities: Vec::new(),
@@ -10346,6 +11535,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             2,
+            PlayerId(1),
         );
         let far = build_operation(
             &scan,
@@ -10360,6 +11550,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             5,
+            PlayerId(1),
         );
 
         assert!(near.facts.friendly_combat_units_committed > 0);
@@ -10518,7 +11709,7 @@ mod tests {
             free_cargo: 0,
         });
         let mut ctx = ReachCtx::default();
-        let operations = build_operations(&scan, &mut ctx, &[]);
+        let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
         let operation = operations
             .iter()
             .find(|operation| operation.kind == OperationKind::Capture)
@@ -10533,6 +11724,7 @@ mod tests {
             &HashSet::from([staged]),
             scan.funds,
             false,
+            PlayerId(1),
         )
         .expect("visible enemy creates a combat plan input");
 
@@ -10559,17 +11751,28 @@ mod tests {
             logistics_rank: Some(0),
             forced_target_enemies: HashSet::new(),
             protected_capture_entities: HashSet::new(),
+            capture_replacement_pending: false,
             staging_anchor: anchor,
             execution_authorized: true,
         }];
         let mut ctx = ReachCtx::default();
-        let mut operations = build_operations(&scan, &mut ctx, &[]);
+        let mut operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
+        let planned_stats = scan
+            .reference_capture_unit()
+            .expect("fixtureには占領可能兵がある")
+            .clone();
+        let planned_facility = scan.free_facilities[0].0;
         let operation = operations
             .iter_mut()
             .find(|operation| operation.kind == OperationKind::Capture)
             .expect("局地Capture作戦");
         // 同じ生産手番で、占領兵1体を先に発注した状態を再現する。
         operation.filled.capture_units = 1;
+        operation.planned_capture_units.push(PlannedCaptureUnit {
+            stats: planned_stats,
+            facility: planned_facility,
+            target: anchor,
+        });
 
         let input = combat_plan_input(
             &scan,
@@ -10580,6 +11783,7 @@ mod tests {
             &HashSet::new(),
             scan.funds,
             false,
+            PlayerId(1),
         )
         .expect("観測敵がいるためCombat計画入力が作られる");
 
@@ -10643,7 +11847,7 @@ mod tests {
         // ある限りExpectedを0にしない。
         scan.enemy_production_forecast = EnemyProductionForecastTrace::default();
         let mut ctx = ReachCtx::default();
-        let operations = build_operations(&scan, &mut ctx, &[]);
+        let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
         let capture = operations
             .iter()
             .find(|operation| operation.kind == OperationKind::Capture)
@@ -10687,6 +11891,7 @@ mod tests {
                 logistics_rank: None,
                 forced_target_enemies: HashSet::new(),
                 protected_capture_entities: HashSet::new(),
+                capture_replacement_pending: false,
                 staging_anchor: pos(0, 2),
                 execution_authorized: false,
             },
@@ -10700,6 +11905,7 @@ mod tests {
                 logistics_rank: Some(0),
                 forced_target_enemies: HashSet::new(),
                 protected_capture_entities: HashSet::new(),
+                capture_replacement_pending: false,
                 staging_anchor: capture,
                 execution_authorized: true,
             },
@@ -10999,6 +12205,7 @@ mod tests {
                 .collect(),
             owned_airport_count: 3,
             open_properties: enemy_positions.to_vec(),
+            neutral_properties: enemy_positions.to_vec(),
             enemy_income: 0,
             enemy_production_slots: 0,
             enemy_facilities: Vec::new(),
@@ -11065,7 +12272,12 @@ mod tests {
             staging_anchor: pos(0, 0),
             execution_authorized: true,
             protected_capture_entities: HashSet::new(),
+            capture_replacement_pending: false,
             objective_properties: vec![pos(0, 0)],
+            property_control: None,
+            property_controls: Vec::new(),
+            capture_lane_targets: Vec::new(),
+            planned_capture_units: Vec::new(),
             threat_horizon: 0,
             facts: OperationFacts::default(),
             slots,
@@ -11118,6 +12330,7 @@ mod tests {
             enemy_units: Vec::new(),
             owned_airport_count: 0,
             open_properties: vec![pos(8, 1)],
+            neutral_properties: vec![pos(8, 1)],
             enemy_income: 0,
             enemy_production_slots: 0,
             enemy_facilities: Vec::new(),
@@ -11166,6 +12379,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             3,
+            PlayerId(1),
         );
 
         // それでも「対岸へ積荷を届けられる」以上、渡洋作戦の台帳に載らねばならない
@@ -11208,6 +12422,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             3,
+            PlayerId(1),
         );
 
         assert_eq!(operation.reachable_threats.len(), 1);
@@ -11252,6 +12467,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             3,
+            PlayerId(1),
         );
 
         assert!(operation.reachable_threats.is_empty());
@@ -11292,6 +12508,7 @@ mod tests {
             enemy_units: Vec::new(),
             owned_airport_count: 0,
             open_properties: vec![pos(6, 2)],
+            neutral_properties: vec![pos(6, 2)],
             enemy_income: 0,
             enemy_production_slots: 0,
             enemy_facilities: Vec::new(),
@@ -11367,6 +12584,7 @@ mod tests {
             ],
             owned_airport_count: 0,
             open_properties: vec![pos(6, 2)],
+            neutral_properties: vec![pos(6, 2)],
             enemy_income: 0,
             enemy_production_slots: 0,
             enemy_facilities: Vec::new(),
@@ -11442,6 +12660,7 @@ mod tests {
             }],
             owned_airport_count: 1,
             open_properties: vec![pos(7, 1)],
+            neutral_properties: vec![pos(7, 1)],
             enemy_income: 0,
             enemy_production_slots: 0,
             enemy_facilities: Vec::new(),
@@ -11520,6 +12739,7 @@ mod tests {
             }],
             owned_airport_count: 1,
             open_properties: vec![pos(7, 1)],
+            neutral_properties: vec![pos(7, 1)],
             enemy_income: 0,
             enemy_production_slots: 0,
             enemy_facilities: Vec::new(),
@@ -11530,7 +12750,7 @@ mod tests {
             enemy_production_forecast: EnemyProductionForecastTrace::default(),
         };
         let mut ctx = ReachCtx::default();
-        let operations = build_operations(&scan, &mut ctx, &[]);
+        let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
 
         let options = immediate_combat_options(&scan, &mut ctx, &operations, PlayerId(1));
         let (operation_index, candidate, engagement) = select_immediate_combat_reinforcement(
@@ -11674,6 +12894,7 @@ mod tests {
             }],
             owned_airport_count: 0,
             open_properties: vec![pos(6, 1)],
+            neutral_properties: vec![pos(6, 1)],
             enemy_income: 0,
             enemy_production_slots: 0,
             enemy_facilities: Vec::new(),
@@ -11684,7 +12905,7 @@ mod tests {
             enemy_production_forecast: EnemyProductionForecastTrace::default(),
         };
         let mut ctx = ReachCtx::default();
-        let operations = build_operations(&scan, &mut ctx, &[]);
+        let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
         let options = immediate_combat_options(&scan, &mut ctx, &operations, PlayerId(1));
 
         let (_, candidate, _) = select_immediate_combat_reinforcement(
@@ -11720,6 +12941,41 @@ mod tests {
         );
         assert!(combat_types.contains(&UnitType::AntiAir));
         assert!(combat_types.contains(&UnitType::Tank));
+    }
+
+    /// 今まさに未所有拠点の上で占領を進めている敵は、到達途中の占領可能敵より
+    /// 優先して攻撃対象（`Interdict`）になる。
+    #[test]
+    fn capturing_enemy_is_prioritized_for_interdict() {
+        let scan = BoardScan {
+            open_properties: vec![pos(5, 1)],
+            ..mixed_threat_multi_factory_scan()
+        };
+        // 未所有拠点上の占領可能ユニットは「占領中」と判定される。
+        let capturing = ThreatTarget {
+            entity: Some(Entity::from_raw(700)),
+            stats: UnitStats {
+                can_capture: true,
+                ..stats(UnitType::Infantry, 1_000)
+            },
+            position: pos(5, 1),
+            current_hp: 100,
+            available_turn: 0,
+        };
+        // 同じ占領可能ユニットでも、拠点上にいなければ「到達途中」で優先度は低い。
+        let incoming = ThreatTarget {
+            entity: Some(Entity::from_raw(701)),
+            stats: UnitStats {
+                can_capture: true,
+                ..stats(UnitType::Infantry, 1_000)
+            },
+            position: pos(4, 1),
+            current_hp: 100,
+            available_turn: 0,
+        };
+
+        assert!(enemy_is_capturing(&scan, &capturing));
+        assert!(!enemy_is_capturing(&scan, &incoming));
     }
 
     /// 増援予算だけでは敵兵種を特定できないため、敵未観測の撃破枠から汎用兵を作らない。
@@ -11825,6 +13081,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             3,
+            PlayerId(1),
         );
 
         assert_eq!(overseas.facts.available_free_cargo_slots, 0);
@@ -11879,6 +13136,110 @@ mod tests {
         assert_eq!(
             most_starved_slot(&[first_capture_ready]),
             Some((0, SlotKind::Combat))
+        );
+    }
+
+    /// 期限付き物件制御でも担当が全滅したら、戦闘計画の完了待ちにせず1体だけ補充する。
+    #[test]
+    fn property_control_replaces_one_destroyed_capturer_before_combat() {
+        let slots = OperationSlots {
+            capture_units: 3,
+            combat_plan_required: 1,
+            ..OperationSlots::default()
+        };
+        let control = PropertyControlObjective {
+            property: pos(4, 1),
+            enemy_entity: Entity::from_raw(42),
+            enemy_arrival_turn: 1,
+            enemy_completion_turn: 3,
+            attack_ready_turn: Some(2),
+            approach: PropertyControlApproach::Interdict,
+            disaggregated: false,
+        };
+        let mut initial_formation = operation(
+            OperationKind::Capture,
+            slots,
+            OperationSlots::default(),
+        );
+        initial_formation.property_controls.push(control);
+        assert_eq!(
+            most_starved_slot(&[initial_formation]),
+            Some((0, SlotKind::Combat)),
+            "担当履歴のない初回編成はCapture単独発注へ崩さず共同計画を使う"
+        );
+
+        let mut missing_capturer = operation(
+            OperationKind::Capture,
+            slots,
+            OperationSlots::default(),
+        );
+        missing_capturer.property_controls.push(control);
+        missing_capturer.capture_replacement_pending = true;
+        missing_capturer.facts.friendly_capture_units_committed = 1;
+
+        assert_eq!(
+            most_starved_slot(&[missing_capturer]),
+            Some((0, SlotKind::Capture)),
+            "一部の占領担当が生存していても、未解決の撃破1件はCombatより先に補う"
+        );
+
+        let mut replacement_ready = operation(
+            OperationKind::Capture,
+            slots,
+            OperationSlots {
+                capture_units: 1,
+                ..OperationSlots::default()
+            },
+        );
+        replacement_ready.property_controls.push(control);
+        replacement_ready.capture_replacement_pending = true;
+
+        assert_eq!(
+            most_starved_slot(&[replacement_ready]),
+            Some((0, SlotKind::Combat)),
+            "1体を再契約した後は残りのCaptureを連買いせず共同Combat計画へ戻す"
+        );
+    }
+
+    /// 別レーンに近い既存歩兵がいても、未充足レーン用の有限な1枠は消さない。
+    #[test]
+    fn property_capture_candidate_is_not_blocked_by_another_lanes_capturer() {
+        let mut scan = multi_factory_scan();
+        let target = pos(6, 2);
+        let infantry = scan
+            .reference_capture_unit()
+            .expect("fixtureには占領可能兵がある")
+            .clone();
+        scan.my_units.push(UnitSnapshot {
+            entity: Some(Entity::from_raw(51)),
+            pos: pos(5, 2),
+            stats: infantry,
+            hp: 100,
+            free_cargo: 0,
+        });
+        let mut operation = operation(
+            OperationKind::Capture,
+            OperationSlots {
+                capture_units: 1,
+                ..OperationSlots::default()
+            },
+            OperationSlots::default(),
+        );
+        operation.anchor = target;
+        operation.capture_lane_targets = vec![target];
+
+        let candidate = select_property_capture_candidate(
+            &scan,
+            &mut ReachCtx::default(),
+            &operation,
+            &HashSet::new(),
+            scan.funds,
+            PlayerId(1),
+        );
+
+        assert!(
+            candidate.is_some(),
+            "別レーンの既存担当は同時にこの未充足レーンを占領できない"
         );
     }
 
@@ -12039,7 +13400,9 @@ mod tests {
         defense.facts.deploy_lead_time = 2;
 
         let ops = vec![capital, defense];
-        assert_eq!(operation_priority_rank(&ops[0]), 1);
+        // 期限付き物件制御の順位を1段差し込んでも、緊急Defenseが最優先で
+        // 首都本隊そのものは削除されない。
+        assert_eq!(operation_priority_rank(&ops[0]), 2);
         assert_eq!(operation_priority_rank(&ops[1]), 0);
         assert_eq!(most_starved_slot(&ops), Some((1, SlotKind::Combat)));
         assert_eq!(ops[0].slots.combat_plan_required, 1);

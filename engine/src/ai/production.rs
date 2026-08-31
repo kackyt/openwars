@@ -779,6 +779,8 @@ fn plan_campaign_shortfall_production_with_damage(
                 command: command.clone(),
                 island_id: row.island_id,
                 role,
+                mission_target: (role == CampaignProductionRole::Capture)
+                    .then_some(row.target_position),
             });
             outcome.commands.push(command);
             outcome.remaining_funds = outcome.remaining_funds.saturating_sub(stats.cost);

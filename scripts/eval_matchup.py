@@ -431,6 +431,10 @@ def run_single_game(
             error = str(ai_result["error"])
             if ui_callback: ui_callback({"type": "log", "msg": f"AI Error: {error}"})
             break
+        # AIが診断情報を返さず合法手だけを適用した場合も、対戦自体は継続できる。
+        # 長期戦の評価を診断payloadの有無で中断しない。
+        if not isinstance(ai_result, dict):
+            ai_result = {}
 
         campaign = ai_result.get("island_campaign")
         if campaign is not None:

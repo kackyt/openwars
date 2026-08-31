@@ -82,6 +82,8 @@ pub struct ProductionOperationTrace {
     pub kind: OperationKind,
     pub anchor: GridPosition,
     pub slots: OperationSlots,
+    /// 永続Roadmap上の占領担当撃破に対する再契約が未完了か。
+    pub capture_replacement_pending: bool,
     pub requires_transport: bool,
     pub enemy_combat_units: u32,
     /// 実生産履歴と敵施設の事前分布を基準に、作戦期限までにこの前線へ到着しうる

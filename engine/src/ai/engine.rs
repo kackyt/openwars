@@ -842,7 +842,6 @@ pub fn decide_ai_action(
                 current_grid,
                 !is_stationary,
             );
-
             // 基本スコア
             let mut base_tile_score = 0;
             if let Some(terrain) = map.get_terrain(current_grid.x, current_grid.y) {
@@ -1749,8 +1748,12 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     // 未完成の島嶼輸送パッケージが生産施設上でFormingすると、不足している次の
     // 輸送役を自分で生産不能にする。任務所属は維持したまま隣接待機地へ一歩だけ退避する。
     if uses_v3 {
+        // 実行中のAttack/Capture任務は通常戦術を先に試す。ここでV4だけ全任務を含めると、
+        // 工場から届く敵への合法な初撃まで「退避Wait」が横取りする。前段では本当に
+        // Forming中の輸送役・護衛待ち占領役だけを動かし、通常戦術で動けなかった
+        // 生産施設blockerは下段の共通fallbackで初めて退避させる。
         let relief =
-            decide_forming_campaign_site_relief(world, active_player, &skip_entities, is_v4);
+            decide_forming_campaign_site_relief(world, active_player, &skip_entities, false);
         if let Some((entity, command)) = relief {
             let command_text = format!("{:?}", command);
             execute_ai_command(world, entity, command);
@@ -2307,12 +2310,21 @@ enum ActionPriority {
     /// DAG区間のセル列に沿う前進。通常の局地位置取りより優先するが、
     /// その場で成立する有利な戦闘・占領は妨げない。
     RouteAdvance,
+    /// 専任占領役が、実経路上で割当物件へ近づく移動またはその物件を占領する行動。
+    /// 一般の有利交換より先に置き、前面戦闘は同行するCombat役へ分担する。
+    CaptureAdvance,
     /// 作戦パッケージが実行段階にあり、他に有利な局地標的がない場合の必要攻撃。
     StrategicTargetFallback,
     /// 同じ作戦圏内で見つけた、現在兵種と相性のよい敵への攻撃。
     FavorableLocalTarget,
     /// 作戦対象そのものとの相性もよい攻撃。
     FavorableStrategicTarget,
+    /// V4が同じ局地戦で既に削った敵を、この一撃で撃破できる攻撃。
+    /// 実HPと実ダメージで成立し、個別deployment targetの分散より優先する。
+    FavorableFinishingTarget,
+    /// 全生産施設が自軍で埋まったとき、少なくとも一枠を開ける移動・移動攻撃。
+    /// 後続を途切れさせない盤面契約であり、通常の戦術scoreとは分離して扱う。
+    ProductionSiteRelief,
 }
 
 #[derive(Debug, Clone)]
@@ -2517,6 +2529,32 @@ fn decide_ai_action_v2_for_entities(
             .map(|(p, prop)| (*p, prop.terrain, prop.owner_id))
             .collect()
     };
+    let capital_positions = properties
+        .iter()
+        .filter_map(|(position, terrain, owner)| {
+            (*owner == Some(player_id) && *terrain == Terrain::Capital).then_some(*position)
+        })
+        .collect::<Vec<_>>();
+    let owned_production_positions = properties
+        .iter()
+        .filter_map(|(position, terrain, owner)| {
+            (*owner == Some(player_id)
+                && registry.is_production_facility(terrain.as_str())
+                && crate::systems::production::is_within_production_range(
+                    &capital_positions,
+                    position.x,
+                    position.y,
+                    map.topology,
+                ))
+            .then_some((position.x, position.y))
+        })
+        .collect::<HashSet<_>>();
+    // 一つでも空きがあれば通常の戦術行動を優先する。全枠閉塞時だけ、各action後に
+    // 再評価されるこの契約で一体を押し出し、最低一つの後続生産口を回復する。
+    let production_capacity_gridlocked = !owned_production_positions.is_empty()
+        && owned_production_positions
+            .iter()
+            .all(|position| unit_positions.contains_key(position));
     let unit_costs: HashMap<Entity, u32> = {
         let mut query = world.query::<(Entity, &UnitStats)>();
         query
@@ -2609,6 +2647,8 @@ fn decide_ai_action_v2_for_entities(
         };
 
         let is_combat_ineffective = atk_hp < 70 || (stats.max_ammo1 > 0 && atk_ammo.0 == 0);
+        let starts_on_owned_production_site =
+            owned_production_positions.contains(&(pos.x, pos.y));
         let deployment_target = world
             .get_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>()
             .and_then(|registry| registry.attack_target(unit_entity));
@@ -2665,7 +2705,7 @@ fn decide_ai_action_v2_for_entities(
         );
         // 進軍役は山を迂回するDAGセル列の次候補と、その場の戦闘・占領だけを比較する。
         // それ以外の横方向への通常探索を残すと、橋へ近づくスコアだけで経路から外れる。
-        let candidate_tiles = route_advance_destination
+        let mut candidate_tiles = route_advance_destination
             .map(|destination| {
                 [(pos.x, pos.y), (destination.x, destination.y)]
                     .into_iter()
@@ -2687,6 +2727,25 @@ fn decide_ai_action_v2_for_entities(
                     })
                     .collect()
             });
+        if let Some(planned_target) = deployment_target {
+            // 生産計画が具体的な敵Entityとの初撃を契約した場合、DAGの一本道だけで
+            // 移動候補を制限しない。実際にこの手番で射撃可能な全セルを加えることで、
+            // 複数の快速直接戦闘unitが同じ入口へ直列化せず、先行unitが使った射撃位置を
+            // 避けて別方向から同じblockerへ集中攻撃できる。
+            candidate_tiles.extend(reachable.iter().copied().filter(|(x, y)| {
+                tactical_snapshot
+                    .action_targets_at(
+                        unit_entity,
+                        &stats,
+                        GridPosition { x: *x, y: *y },
+                        *x != pos.x || *y != pos.y,
+                    )
+                    .attackable_targets
+                    .contains(&planned_target)
+            }));
+            candidate_tiles.sort_unstable();
+            candidate_tiles.dedup();
+        }
 
         // 回復中のDAG Entityへ古いSquad目標を渡すと、修理ではなく横の拠点へ戻る。
         // 所属はDAG Registryに残したまま、ここだけ通常の回復探索を使う。
@@ -2709,6 +2768,30 @@ fn decide_ai_action_v2_for_entities(
                                 | crate::ai::squad::MissionType::Transport
                         )
                     }));
+        let is_capture_mission = campaign_context
+            .as_ref()
+            .is_some_and(|context| context.mission_type == crate::ai::squad::MissionType::Capture)
+            || unit_squad_missions
+                .get(&unit_entity)
+                .is_some_and(|mission| *mission == crate::ai::squad::MissionType::Capture);
+        // Captureは面制圧パッケージの後続工程であり、一般敵を探す攻勢任務ではない。
+        // 目標物件を直接塞ぐ敵だけは下のAttack判定で戦略標的として扱う。
+        let has_offensive_mission = has_offensive_mission && !is_capture_mission;
+        let capture_mission_target = is_capture_mission.then_some(squad_target).flatten();
+        let capture_distance_before = capture_mission_target.map(|target| {
+            calculate_turn_distance(
+                &map,
+                &registry,
+                &unit_positions,
+                (pos.x, pos.y),
+                (target.x, target.y),
+                stats.movement_type,
+                stats.max_movement,
+                0,
+                player_id,
+                &mut turn_cache,
+            )
+        });
         let initial_is_solo = route_recovering
             || (solo_fallbacks.contains(&unit_entity) && route_tactical_target.is_none())
             || squad_target.is_none();
@@ -2735,7 +2818,15 @@ fn decide_ai_action_v2_for_entities(
                 continue;
             }
             let is_stationary = current_grid.x == pos.x && current_grid.y == pos.y;
-            let is_route_advance_cell = route_advance_destination == Some(current_grid);
+            // 現在セルはDAG上の合法セルでも「前進」ではない。停止Waitへ
+            // RouteAdvance優先度を与えると、満杯の生産施設上で作戦所属unitが
+            // 毎手番待機し、後続生産を永久に封鎖する。
+            let is_route_advance_cell = !is_stationary
+                && route_advance_destination == Some(current_grid);
+            let vacates_gridlocked_production_site = production_capacity_gridlocked
+                && starts_on_owned_production_site
+                && !is_combat_ineffective
+                && !owned_production_positions.contains(&(current_grid.x, current_grid.y));
 
             let actions = tactical_snapshot.action_targets_at(
                 unit_entity,
@@ -2743,7 +2834,23 @@ fn decide_ai_action_v2_for_entities(
                 current_grid,
                 !is_stationary,
             );
-
+            let advances_capture_contract = capture_mission_target
+                .zip(capture_distance_before)
+                .is_some_and(|(target, before)| {
+                    current_grid == target
+                        || calculate_turn_distance(
+                            &map,
+                            &registry,
+                            &unit_positions,
+                            (current_grid.x, current_grid.y),
+                            (target.x, target.y),
+                            stats.movement_type,
+                            stats.max_movement,
+                            0,
+                            player_id,
+                            &mut turn_cache,
+                        ) < before
+                });
             let mut base_tile_score = 0;
             let tile_def_bonus = map
                 .get_terrain(current_grid.x, current_grid.y)
@@ -3191,7 +3298,11 @@ fn decide_ai_action_v2_for_entities(
             {
                 let score = base_tile_score + 10000;
                 let rank = (
-                    if is_route_advance_cell {
+                    if vacates_gridlocked_production_site {
+                        ActionPriority::ProductionSiteRelief
+                    } else if advances_capture_contract {
+                        ActionPriority::CaptureAdvance
+                    } else if is_route_advance_cell {
                         ActionPriority::RouteAdvance
                     } else {
                         ActionPriority::Normal
@@ -3273,10 +3384,17 @@ fn decide_ai_action_v2_for_entities(
                         // 戦略上の必要性として扱う。上陸cargoはSquad再編の境界でCapture、
                         // Transport、Attackのいずれにもなり得るため、その差で必要攻撃を
                         // 非決定的に枝刈りしてはならない。
-                        let is_strategic_target = deployment_target
-                            .map_or(has_offensive_mission, |target| target == target_entity);
-                        let has_strategic_mission =
-                            deployment_target.is_some() || has_offensive_mission;
+                        let blocks_capture_target = is_capture_mission
+                            && capture_mission_target.is_some_and(|target| target == *t_pos);
+                        let is_strategic_target = if is_capture_mission {
+                            blocks_capture_target
+                        } else {
+                            deployment_target
+                                .map_or(has_offensive_mission, |target| target == target_entity)
+                        };
+                        let has_strategic_mission = deployment_target.is_some()
+                            || has_offensive_mission
+                            || blocks_capture_target;
                         let priority = match (is_strategic_target, exchange.is_favorable_matchup())
                         {
                             (true, true) => ActionPriority::FavorableStrategicTarget,
@@ -3289,6 +3407,11 @@ fn decide_ai_action_v2_for_entities(
                             // 作戦上の必要性がない不利交換は、従来どおり候補外とする。
                             (false, false) => continue,
                             (false, true) => ActionPriority::Normal,
+                        };
+                        let priority = if vacates_gridlocked_production_site {
+                            ActionPriority::ProductionSiteRelief
+                        } else {
+                            priority
                         };
                         let rank = (priority, score);
                         if rank > best_unit_rank {
@@ -3348,7 +3471,11 @@ fn decide_ai_action_v2_for_entities(
 
                 if !violates_campaign_step {
                     let rank = (
-                        if is_route_advance_cell {
+                        if vacates_gridlocked_production_site {
+                            ActionPriority::ProductionSiteRelief
+                        } else if advances_capture_contract {
+                            ActionPriority::CaptureAdvance
+                        } else if is_route_advance_cell {
                             ActionPriority::RouteAdvance
                         } else {
                             ActionPriority::Normal
@@ -3394,7 +3521,14 @@ fn decide_ai_action_v2_for_entities(
                         }
 
                         let score = base_tile_score + merge_score;
-                        let rank = (ActionPriority::Normal, score);
+                        let rank = (
+                            if vacates_gridlocked_production_site {
+                                ActionPriority::ProductionSiteRelief
+                            } else {
+                                ActionPriority::Normal
+                            },
+                            score,
+                        );
                         if rank > best_unit_rank {
                             best_unit_rank = rank;
                             best_unit_choice = Some(AiCommand::Merge {
@@ -3969,6 +4103,54 @@ mod tests {
         assert!(campaign_mission_allows_capture(&MissionType::Attack));
         assert!(!campaign_mission_allows_capture(&MissionType::Defense));
         assert!(!campaign_mission_allows_capture(&MissionType::Transport));
+    }
+
+    #[test]
+    fn map1_recon_can_move_and_attack_adjacent_infantry_on_hex_grid() {
+        let player = PlayerId(2);
+        let enemy_player = PlayerId(1);
+        let mut world = setup_v3_test_world(10, crate::ai::ai_version::AiVersion::V4);
+        world.insert_resource(Map::new(10, 14, Terrain::Plains, GridTopology::Hex));
+        let registry = world.resource::<MasterDataRegistry>().clone();
+        let recon_stats = registry
+            .create_unit_stats(&UnitName(UnitType::Recon.as_str().to_owned()))
+            .unwrap();
+        let infantry_stats = registry
+            .create_unit_stats(&UnitName(UnitType::Infantry.as_str().to_owned()))
+            .unwrap();
+        let recon = world
+            .spawn((
+                Faction(player),
+                GridPosition { x: 3, y: 10 },
+                recon_stats.clone(),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Ammo {
+                    ammo1: recon_stats.max_ammo1,
+                    max_ammo1: recon_stats.max_ammo1,
+                    ammo2: recon_stats.max_ammo2,
+                    max_ammo2: recon_stats.max_ammo2,
+                },
+            ))
+            .id();
+        let infantry = world
+            .spawn((
+                Faction(enemy_player),
+                GridPosition { x: 4, y: 6 },
+                infantry_stats,
+            ))
+            .id();
+
+        let snapshot = AiTacticalSnapshot::from_world(&mut world, &registry, GridTopology::Hex);
+        let actions =
+            snapshot.action_targets_at(recon, &recon_stats, GridPosition { x: 4, y: 7 }, true);
+
+        assert!(
+            actions.attackable_targets.contains(&infantry),
+            "map_1のT2射撃位置では、移動後の装甲車が隣接歩兵を攻撃できる"
+        );
     }
 
     #[test]

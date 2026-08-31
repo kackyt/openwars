@@ -598,6 +598,54 @@ impl VictoryRoadmapRegistry {
         operations
     }
 
+    /// 局地作戦で占領担当を失い、その後のCapture再発注がまだ記録されていないか。
+    ///
+    /// 現在の割当集合は撃破時に空になるため、そこだけでは初回編成と再補充を区別できない。
+    /// 永続する作戦履歴の最新時刻を比較し、価格や兵種名に依存しない再契約条件を返す。
+    pub(crate) fn capture_replacement_pending(
+        &self,
+        player_id: PlayerId,
+        island_id: IslandId,
+    ) -> bool {
+        self.operations.values().any(|operation| {
+            if operation.player_id != player_id
+                || operation.island_id != island_id
+                || !operation.active
+                || operation.purpose == StrategicPurpose::AssaultCapital
+            {
+                return false;
+            }
+            let latest_loss = operation
+                .issue_history
+                .iter()
+                .filter(|issue| {
+                    matches!(
+                        issue.kind,
+                        OperationIssueKind::CapturerDestroyed
+                            | OperationIssueKind::CargoLostWithTransport
+                    )
+                })
+                .map(|issue| issue.detected_turn)
+                .max();
+            let latest_replacement = operation
+                .recovery_history
+                .iter()
+                .filter(|recovery| {
+                    recovery.kind == OperationRecoveryKind::RequestReplacement
+                        && matches!(
+                            recovery.cause,
+                            OperationIssueKind::CapturerDestroyed
+                                | OperationIssueKind::CargoLostWithTransport
+                        )
+                })
+                .map(|recovery| recovery.completed_turn)
+                .max();
+            latest_loss.is_some_and(|loss_turn| {
+                latest_replacement.is_none_or(|replacement_turn| replacement_turn < loss_turn)
+            })
+        })
+    }
+
     pub fn step_history_for(&self, player_id: PlayerId) -> Vec<&OperationStepRecord> {
         self.step_history
             .iter()
@@ -3076,6 +3124,39 @@ mod tests {
         );
         registry.bind_entity_exclusive(operation, entity, role);
         operation
+    }
+
+    #[test]
+    fn capture_replacement_is_pending_only_between_loss_and_reorder() {
+        let player = PlayerId(1);
+        let island = IslandId(2);
+        let capturer = Entity::from_raw(41);
+        let mut registry = VictoryRoadmapRegistry::default();
+        let operation_id = operation_with_entity(
+            &mut registry,
+            player,
+            island,
+            capturer,
+            OperationEntityRole::Capture,
+        );
+
+        assert!(!registry.capture_replacement_pending(player, island));
+        registry.record_destroyed_entity(capturer, 6);
+        assert!(registry.capture_replacement_pending(player, island));
+
+        registry
+            .operations
+            .get_mut(&operation_id)
+            .expect("局地作戦")
+            .recovery_history
+            .push(OperationRecoveryAction {
+                kind: OperationRecoveryKind::RequestReplacement,
+                cause: OperationIssueKind::CapturerDestroyed,
+                completed_turn: 7,
+                entity: Some(Entity::from_raw(42)),
+                detail: "capture replacement ordered".to_string(),
+            });
+        assert!(!registry.capture_replacement_pending(player, island));
     }
 
     fn strategic_assignment(
