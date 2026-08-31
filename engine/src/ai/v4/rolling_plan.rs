@@ -759,16 +759,38 @@ fn exact_property_plan_better(
     current: &ForcePackagePlan,
 ) -> bool {
     if input.interdiction_deadlines.is_empty() {
-        // 通常の前線争奪では、敵全員の撃破数と占領役数を一対一対応させない。
-        // 一つの突破口を最速で開けた後、同じscreenの後方から複数の占領役を
-        // 別物件へ展開できるためである。最早突破時刻が同じ案では、T6等の盤面由来
-        // hard deadlineまでに完了・生存できる占領レーン数を最大化する。
+        // 全滅が達成可能（feasible）な案同士の比較では、占領達成と全滅完了を優先し、
+        // そのうえで余分な買い足しを避けて期待損失最小化・費用最小化で経済効率を高める。
+        if candidate.feasible && current.feasible {
+            return (
+                std::cmp::Reverse(candidate.deadline_capture_survivor_count),
+                candidate.capture_completion_profile(),
+                candidate.occupation_turn,
+                candidate.expected_loss,
+                candidate.production_cost,
+                std::cmp::Reverse(candidate.surviving_combat_value),
+            ) < (
+                std::cmp::Reverse(current.deadline_capture_survivor_count),
+                current.capture_completion_profile(),
+                current.occupation_turn,
+                current.expected_loss,
+                current.production_cost,
+                std::cmp::Reverse(current.surviving_combat_value),
+            );
+        }
+        if candidate.feasible != current.feasible {
+            return candidate.feasible;
+        }
+
+        // 全滅未達（敵が多数存在し、突破・前線維持が必要な場合）
+        // 最早突破時刻、占領レーン数、敵残HP最小化、被ダメ損失最小化、生存戦力価値最大化で比較
         return (
             candidate.front_breakthrough_rank(),
             std::cmp::Reverse(candidate.deadline_capture_survivor_count),
             candidate.capture_completion_profile(),
             candidate.remaining_hp(),
             candidate.expected_loss,
+            std::cmp::Reverse(candidate.surviving_combat_value),
             candidate.production_cost,
         ) < (
             current.front_breakthrough_rank(),
@@ -776,6 +798,7 @@ fn exact_property_plan_better(
             current.capture_completion_profile(),
             current.remaining_hp(),
             current.expected_loss,
+            std::cmp::Reverse(current.surviving_combat_value),
             current.production_cost,
         );
     }
@@ -792,23 +815,40 @@ fn exact_property_plan_better(
         return candidate_satisfied;
     }
     if candidate_satisfied {
-        // 物件契約を守るだけで観測済みの別兵科を放置しない。全敵排除と占領役生存を
-        // 実シミュレーションで満たせる案が一つでもあれば、それを費用比較より先に置く。
+        if candidate.feasible && current.feasible {
+            return (
+                candidate.expected_loss,
+                candidate.production_cost,
+                std::cmp::Reverse(candidate.surviving_combat_value),
+                candidate
+                    .interdiction_first_attack_turn()
+                    .unwrap_or(u32::MAX),
+            ) < (
+                current.expected_loss,
+                current.production_cost,
+                std::cmp::Reverse(current.surviving_combat_value),
+                current.interdiction_first_attack_turn().unwrap_or(u32::MAX),
+            );
+        }
         if candidate.feasible != current.feasible {
             return candidate.feasible;
         }
+        // 契約を満たした案同士では、敵残存HPを削り、被ダメージを抑え、生存戦力価値（NPV）を
+        // 最大化する案を優先する。これらが同等なら余剰資金温存のため費用最小を選ぶ。
         return (
-            candidate.production_cost,
+            candidate.interdiction_remaining_hp(input.deadline_target_index),
             candidate.expected_loss,
+            std::cmp::Reverse(candidate.surviving_combat_value),
             candidate
                 .interdiction_first_attack_turn()
                 .unwrap_or(u32::MAX),
-            candidate.interdiction_remaining_hp(input.deadline_target_index),
+            candidate.production_cost,
         ) < (
-            current.production_cost,
-            current.expected_loss,
-            current.interdiction_first_attack_turn().unwrap_or(u32::MAX),
             current.interdiction_remaining_hp(input.deadline_target_index),
+            current.expected_loss,
+            std::cmp::Reverse(current.surviving_combat_value),
+            current.interdiction_first_attack_turn().unwrap_or(u32::MAX),
+            current.production_cost,
         );
     }
 
@@ -831,6 +871,7 @@ fn exact_property_plan_better(
         candidate.remaining_hp(),
         candidate.capture_survivor_shortfall(required),
         candidate.expected_loss,
+        std::cmp::Reverse(candidate.surviving_combat_value),
         candidate.production_cost,
     ) < (
         required.saturating_sub(
@@ -840,6 +881,7 @@ fn exact_property_plan_better(
         current.remaining_hp(),
         current.capture_survivor_shortfall(required),
         current.expected_loss,
+        std::cmp::Reverse(current.surviving_combat_value),
         current.production_cost,
     )
 }
@@ -1088,49 +1130,52 @@ fn update_best_effort_interdiction(
         candidate
             .interdiction_first_attack_turn()
             .unwrap_or(u32::MAX),
-        candidate.production_cost,
-        candidate.expected_loss,
         candidate.interdiction_remaining_hp(target_index),
+        candidate.expected_loss,
+        std::cmp::Reverse(candidate.surviving_combat_value),
+        candidate.production_cost,
     );
     if best.as_ref().is_none_or(|current| {
         candidate_key
             < (
                 current.interdiction_first_attack_turn().unwrap_or(u32::MAX),
-                current.production_cost,
-                current.expected_loss,
                 current.interdiction_remaining_hp(target_index),
+                current.expected_loss,
+                std::cmp::Reverse(current.surviving_combat_value),
+                current.production_cost,
             )
     }) {
         *best = Some(candidate.clone());
     }
 }
 
-/// 期限前に合法な初撃を入れられる案同士は、追加ダメージを買い足さず最小の経済負担を選ぶ。
+/// 期限前に合法な初撃を入れられる案同士の比較。
 ///
-/// 攻撃が入ると表示HP由来の占領力が下がり、元の占領完了時刻は成立しなくなる。
-/// したがって、この集合で残HPを先に比較すると「既に成立した妨害」へ全資金を注ぎ込み、
-/// 同時に必要な占領役を生産できなくなる。費用と予測損失はともにマスターデータと
-/// 戦闘シミュレーション由来であり、固定評価点は用いない。
+/// 単に最小費用を優先すると安価で脆弱な兵種ばかり選ばれ、前線の戦闘優位が失われる。
+/// 初撃達成可能案同士では、残存軍事価値（NPV）の最大化、敵残HP最小化、被ダメージ損失の
+/// 最小化を優先し、それらが同等の場合にのみ経済効率（最小費用）を比較する。
 fn update_best_sufficient_interdiction(
     best: &mut Option<ForcePackagePlan>,
     candidate: &ForcePackagePlan,
     target_index: Option<usize>,
 ) {
     let candidate_key = (
-        candidate.production_cost,
-        candidate.expected_loss,
         candidate
             .interdiction_first_attack_turn()
             .unwrap_or(u32::MAX),
         candidate.interdiction_remaining_hp(target_index),
+        candidate.expected_loss,
+        std::cmp::Reverse(candidate.surviving_combat_value),
+        candidate.production_cost,
     );
     if best.as_ref().is_none_or(|current| {
         candidate_key
             < (
-                current.production_cost,
-                current.expected_loss,
                 current.interdiction_first_attack_turn().unwrap_or(u32::MAX),
                 current.interdiction_remaining_hp(target_index),
+                current.expected_loss,
+                std::cmp::Reverse(current.surviving_combat_value),
+                current.production_cost,
             )
     }) {
         *best = Some(candidate.clone());
@@ -2161,9 +2206,9 @@ mod tests {
         assert_eq!(selected.unwrap().first_attack_turn, Some(1));
     }
 
-    /// まだ期限成立が未確定の探索では、同じ初撃時刻なら安い枝を残す。
+    /// 同じ初撃時刻なら、敵残HPをより削れる案（高い軍事成果）を優先する。
     #[test]
-    fn deadline_fallback_prefers_lower_cost_after_equal_attack_turn() {
+    fn deadline_fallback_prefers_lower_remaining_hp_after_equal_attack_turn() {
         let mut cheap = plan_force_package(&input()).unwrap();
         cheap.feasible = false;
         cheap.first_attack_turn = Some(1);
@@ -2178,12 +2223,12 @@ mod tests {
         update_best_effort_interdiction(&mut selected, &expensive, None);
         update_best_effort_interdiction(&mut selected, &cheap, None);
 
-        assert_eq!(selected.unwrap().production_cost, 1_000);
+        assert_eq!(selected.unwrap().production_cost, 20_000);
     }
 
-    /// 期限前の初撃が成立した案同士では、早すぎる高価な火力より最小費用を選ぶ。
+    /// 期限前の初撃が成立した案同士でも、敵残HPをより削れる案を優先する。
     #[test]
-    fn sufficient_interdiction_does_not_buy_surplus_damage() {
+    fn sufficient_interdiction_prefers_higher_enemy_hp_reduction() {
         let mut early_expensive = plan_force_package(&input()).unwrap();
         early_expensive.feasible = false;
         early_expensive.first_attack_turn = Some(1);
@@ -2199,7 +2244,7 @@ mod tests {
         update_best_sufficient_interdiction(&mut selected, &early_expensive, None);
         update_best_sufficient_interdiction(&mut selected, &timely_cheap, None);
 
-        assert_eq!(selected.unwrap().production_cost, 4_000);
+        assert_eq!(selected.unwrap().production_cost, 20_000);
     }
 
     /// 同じ敵への一撃を複数物件の妨害として二重計上しない。
