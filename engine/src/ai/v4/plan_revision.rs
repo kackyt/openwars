@@ -2104,6 +2104,7 @@ mod tests {
             occupation_turn: Some(build_turn.saturating_add(5)),
             production_cost: 7_500,
             expected_loss: 1_000,
+            blocked_next_turn_production_slots: 0,
             surviving_combat_value: 6_500,
             required_overmatch_value: 0,
             overmatch_ready: true,

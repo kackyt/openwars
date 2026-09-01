@@ -5,7 +5,7 @@
 
 use crate::components::{GridPosition, PlayerId};
 use crate::resources::{Map, MovementType, master_data::MasterDataRegistry};
-use crate::systems::movement::{OccupantInfo, get_valid_movement_cost};
+use crate::systems::movement::{OccupantInfo, get_valid_movement_cost, is_enemy_zoc};
 use bevy_ecs::prelude::*;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -171,6 +171,8 @@ pub struct ActionTurnDistance {
     pub used_fuel: u32,
     /// 射撃位置へ移動する必要があるか。
     pub requires_movement: bool,
+    /// 最短経路で選択された射撃位置。
+    pub firing_position: GridPosition,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -528,6 +530,10 @@ pub fn calculate_action_distance_to_range(
             used_mp: 0,
             used_fuel: 0,
             requires_movement: false,
+            firing_position: GridPosition {
+                x: start.0,
+                y: start.1,
+            },
         });
         cache.cache.insert(cache_key, result);
         return result;
@@ -573,6 +579,17 @@ pub fn calculate_action_distance_to_range(
                 continue;
             }
 
+            // 実移動と同様、敵ZOCへ進入した手番はそのマスで移動を終了する。
+            // 次の隣接マスへは次手番の移動力を使って進めるため、到達不能にはしない。
+            let must_start_next_turn = state.position != start
+                && is_enemy_zoc(
+                    map,
+                    unit_positions,
+                    player_id,
+                    state.position.0,
+                    state.position.1,
+                );
+
             for next_position in map.get_adjacent(state.position.0, state.position.1) {
                 if unit_positions
                     .get(&next_position)
@@ -592,6 +609,8 @@ pub fn calculate_action_distance_to_range(
 
                 let (next_turns, next_mp_in_turn) = if state.turns == 0 {
                     (1, move_cost)
+                } else if must_start_next_turn {
+                    (state.turns.saturating_add(1), move_cost)
                 } else if state.mp_in_turn.saturating_add(move_cost) <= max_mp {
                     (state.turns, state.mp_in_turn + move_cost)
                 } else {
@@ -636,10 +655,25 @@ pub fn calculate_action_distance_to_range(
                 used_mp: *total_mp,
                 used_fuel: *used_fuel,
                 requires_movement: true,
+                firing_position: GridPosition {
+                    x: firing_position.0,
+                    y: firing_position.1,
+                },
             };
             let replace = best_result.is_none_or(|current| {
-                (candidate.turns, candidate.used_fuel, candidate.used_mp)
-                    < (current.turns, current.used_fuel, current.used_mp)
+                (
+                    candidate.turns,
+                    candidate.used_fuel,
+                    candidate.used_mp,
+                    candidate.firing_position.x,
+                    candidate.firing_position.y,
+                ) < (
+                    current.turns,
+                    current.used_fuel,
+                    current.used_mp,
+                    current.firing_position.x,
+                    current.firing_position.y,
+                )
             });
             if replace {
                 best_result = Some(candidate);
@@ -1068,6 +1102,81 @@ mod tests {
         assert_eq!(distance.turns, 3);
         assert_eq!(distance.used_mp, 10);
         assert_eq!(distance.used_fuel, 5);
+        assert_eq!(distance.firing_position, GridPosition { x: 5, y: 0 });
+    }
+
+    #[test]
+    fn action_distance_reports_selected_firing_position() {
+        let map = Map::new(
+            5,
+            1,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        let registry = MasterDataRegistry::load().unwrap_or_default();
+        let mut cache = ActionTurnDistanceCache::default();
+
+        let distance = calculate_action_distance_to_range(
+            &map,
+            &registry,
+            &HashMap::new(),
+            (0, 0),
+            (4, 0),
+            MovementType::Tank,
+            3,
+            99,
+            1,
+            1,
+            PlayerId(1),
+            &mut cache,
+        )
+        .unwrap();
+
+        assert_eq!(distance.turns, 1);
+        assert_eq!(distance.firing_position, GridPosition { x: 3, y: 0 });
+        assert!(distance.requires_movement);
+    }
+
+    #[test]
+    fn action_distance_enemy_zoc_ends_only_current_turn() {
+        let map = Map::new(
+            5,
+            2,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        let registry = MasterDataRegistry::load().unwrap_or_default();
+        let mut cache = ActionTurnDistanceCache::default();
+        let enemy = OccupantInfo {
+            player_id: PlayerId(2),
+            unit_type: crate::resources::UnitType::Infantry,
+            is_transport: false,
+            free_slots: 0,
+            loadable_types: Vec::new(),
+        };
+        let unit_positions = HashMap::from([((1, 1), enemy)]);
+
+        let distance = calculate_action_distance_to_range(
+            &map,
+            &registry,
+            &unit_positions,
+            (0, 0),
+            (4, 0),
+            MovementType::Tank,
+            4,
+            99,
+            0,
+            0,
+            PlayerId(1),
+            &mut cache,
+        )
+        .unwrap();
+
+        // (1, 0) は敵 (1, 1) のZOC。T1はそこで停止し、T2に残り3マスを進む。
+        assert_eq!(distance.turns, 2);
+        assert_eq!(distance.used_mp, 4);
+        assert_eq!(distance.used_fuel, 4);
+        assert_eq!(distance.firing_position, GridPosition { x: 4, y: 0 });
     }
 
     #[test]

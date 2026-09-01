@@ -26,6 +26,9 @@ pub(crate) struct FriendlyPlanUnit {
     pub available_turn: u32,
     /// 地形連結と武装の両方を満たし、実際に交戦できる敵index。
     pub engageable_enemy_indices: Vec<usize>,
+    /// 既に実Entityとなった占領担当を生存させる期限。同じEntityを別の
+    /// `protected_units`へ複製せず、この一体の攻撃・HP・生存を共有する。
+    pub protection_completion_turn: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,12 +73,26 @@ pub(crate) struct ProductionPlanOption {
     pub stats: UnitStats,
     /// 生産地点から実際に交戦できる敵index。
     pub engageable_enemy_indices: Vec<usize>,
-    /// Someなら、この候補は戦闘役ではなく指定物件の保護対象占領役として生産する。
+    /// Someなら、指定物件の戦闘・占領を一体の時系列契約として引き受ける。
+    /// 生産時点で戦闘役と占領専任役へ分断せず、物件を塞ぐ敵が残る間は攻撃し、
+    /// 排除後に占領行動へ移る。
     pub capture_target: Option<GridPosition>,
     /// 占領役候補が指定物件へ到着する実経路turn。
     pub capture_arrival_turn: Option<u32>,
     /// 占領役候補が指定物件を占領完了する実経路turn。
     pub capture_completion_turn: Option<u32>,
+    /// 対象物件の現在耐久値。戦闘でHPが減った場合の占領回数も実値から再計算する。
+    pub capture_durability: Option<u32>,
+    /// 対象物件への進入を妨げる観測済み敵。排除前は同じunitが攻撃役を兼ねる。
+    pub capture_blocking_enemy_index: Option<usize>,
+}
+
+/// 生産unitが観測敵へ初撃する際の、地形・手番順・射点を含む実行可能edge。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProductionAttackProjection {
+    pub ready_turn: u32,
+    pub firing_position: GridPosition,
+    pub requires_movement: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -90,7 +107,7 @@ pub(crate) struct RollingPlanInput {
     pub production_options: Vec<ProductionPlanOption>,
     /// 生産候補ごと・敵ごとの、実地形と射程を通した最早攻撃turn。
     /// 空なら従来の格子距離見積りへフォールバックする（単体テスト用）。
-    pub production_attack_ready_turns: Vec<Vec<Option<u32>>>,
+    pub production_attack_projections: Vec<Vec<Option<ProductionAttackProjection>>>,
     /// 期限付きInterdictで、初撃と残HPを判定する敵index。
     /// Noneの通常戦では全敵を従来どおり評価する。
     pub deadline_target_index: Option<usize>,
@@ -120,6 +137,11 @@ pub(crate) struct PlannedCapturePurchase {
     pub purchase: PlannedPurchase,
     pub target: GridPosition,
     pub completion_turn: Option<u32>,
+    /// この物件への進入を妨げる敵index。別レーンの容易な敵を倒しても、この契約を
+    /// 成立扱いにしないため、物件と実在敵の対応を最後まで保持する。
+    pub blocking_enemy_index: Option<usize>,
+    /// 占領完了時点にこの購入unitが生存していたか。
+    pub survived_at_completion: bool,
 }
 
 /// 戦闘シミュレーションで最初に成立した、購入unitと実在敵Entityの組合せ。
@@ -172,6 +194,9 @@ pub(crate) struct ForcePackagePlan {
     pub occupation_turn: Option<u32>,
     pub production_cost: u32,
     pub expected_loss: u32,
+    /// 次の自軍手番に生産施設上から攻撃して、その施設を空けない購入数。
+    /// 未成立作戦では、火力だけでなく失う次回生産slotも比較する。
+    pub blocked_next_turn_production_slots: usize,
     /// 敵排除時点に残る、戦闘可能な友軍のHP比例コスト。Expected増援の後に
     /// 前線を保持できるかを測るため、購入額だけでなく実損耗後の価値を使う。
     pub surviving_combat_value: u32,
@@ -233,6 +258,19 @@ impl ForcePackagePlan {
             .sum()
     }
 
+    /// 生き残った敵HPを、マスターデータ上の再調達価値で比例換算する。
+    /// 同じ100HPでも歩兵と戦車を同価値にせず、固定の兵種点ではなく盤面に存在する
+    /// unit自身の価格と残HPだけを使う。
+    fn remaining_enemy_value(&self, input: &RollingPlanInput) -> u64 {
+        self.target_forecasts
+            .iter()
+            .zip(&input.enemies)
+            .map(|(forecast, enemy)| {
+                u64::from(enemy.stats.cost).saturating_mul(u64::from(forecast.remaining_hp)) / 100
+            })
+            .sum()
+    }
+
     fn interdiction_first_attack_turn(&self) -> Option<u32> {
         self.deadline_target_first_attack_turn
             .or(self.first_attack_turn)
@@ -255,6 +293,51 @@ impl ForcePackagePlan {
                     .is_some_and(|turn| turn <= *deadline)
             })
             .count()
+    }
+
+    /// 期限が早い契約から見た累積未達数。
+    ///
+    /// 敵index順の初撃turnをそのまま辞書順比較すると、盤面走査で先に現れた無関係な敵へ
+    /// 一発入れる案が有利になる。同じ期限の契約は同価値として束ね、明示された期限だけから
+    /// 「この時点までに何件止め損ねたか」を作る。
+    fn interdiction_deadline_shortfall_profile(&self, deadlines: &[(usize, u32)]) -> Vec<usize> {
+        let mut checkpoints = deadlines
+            .iter()
+            .map(|(_, deadline)| *deadline)
+            .collect::<Vec<_>>();
+        checkpoints.sort_unstable();
+        checkpoints.dedup();
+        checkpoints
+            .into_iter()
+            .map(|checkpoint| {
+                deadlines
+                    .iter()
+                    .filter(|(_, deadline)| *deadline <= checkpoint)
+                    .filter(|(index, deadline)| {
+                        !self
+                            .target_first_attack_turns
+                            .get(*index)
+                            .and_then(|turn| *turn)
+                            .is_some_and(|turn| turn <= *deadline)
+                    })
+                    .count()
+            })
+            .collect()
+    }
+
+    /// 明示された妨害対象だけの初撃時刻。非契約敵への早い小ダメージは比較へ混ぜない。
+    fn interdiction_attack_turn_profile(&self, deadlines: &[(usize, u32)]) -> Vec<u32> {
+        let mut turns = deadlines
+            .iter()
+            .map(|(index, _)| {
+                self.target_first_attack_turns
+                    .get(*index)
+                    .and_then(|turn| *turn)
+                    .unwrap_or(u32::MAX)
+            })
+            .collect::<Vec<_>>();
+        turns.sort_unstable();
+        turns
     }
 
     fn interdiction_contracts_satisfied(&self, deadlines: &[(usize, u32)]) -> bool {
@@ -311,6 +394,70 @@ impl ForcePackagePlan {
         turns
     }
 
+    /// 物件ごとに対応付けた妨害敵を排除し、同じ占領役が生存して完了したレーン数。
+    ///
+    /// 撃破時刻と占領時刻を並べ替えて対応させると、左翼の容易な敵を倒しただけで
+    /// 中央レーンまで開通したことになる。生産入力で確定した物件―敵のidentityを使う。
+    fn cleared_capture_lane_count(&self) -> usize {
+        self.capture_purchases
+            .iter()
+            .filter(|assignment| {
+                let Some(completion_turn) = assignment.completion_turn else {
+                    return false;
+                };
+                if !assignment.survived_at_completion {
+                    return false;
+                }
+                assignment.blocking_enemy_index.is_none_or(|enemy_index| {
+                    self.target_forecasts
+                        .get(enemy_index)
+                        .and_then(|target| target.destroyed_turn)
+                        .is_some_and(|destroyed_turn| destroyed_turn <= completion_turn)
+                })
+            })
+            .count()
+            .min(self.required_capture_survivor_count)
+    }
+
+    /// 一体目だけでなく、観測した前線敵を何手番で順次掃討できるかを比較する。
+    fn target_destruction_profile(&self) -> Vec<u32> {
+        let mut turns = self
+            .target_forecasts
+            .iter()
+            .map(|target| target.destroyed_turn.unwrap_or(u32::MAX))
+            .collect::<Vec<_>>();
+        turns.sort_unstable();
+        turns
+    }
+
+    /// 対応する敵の排除と占領完了が両方そろう時刻を、レーンごとに比較する。
+    fn property_contract_completion_profile(&self) -> Vec<u32> {
+        let mut turns = self
+            .capture_purchases
+            .iter()
+            .map(|assignment| {
+                if !assignment.survived_at_completion {
+                    return u32::MAX;
+                }
+                let capture = assignment.completion_turn.unwrap_or(u32::MAX);
+                let destruction = assignment.blocking_enemy_index.map_or(0, |enemy_index| {
+                    self.target_forecasts
+                        .get(enemy_index)
+                        .and_then(|target| target.destroyed_turn)
+                        .unwrap_or(u32::MAX)
+                });
+                capture.max(destruction)
+            })
+            .collect::<Vec<_>>();
+        // `[] < [turn]` によって契約を一件も引き受けない案が有利にならないよう、
+        // 不足契約は未達時刻で埋める。同じ入力ではrequired数が共通なので比較可能。
+        if turns.len() < self.required_capture_survivor_count {
+            turns.resize(self.required_capture_survivor_count, u32::MAX);
+        }
+        turns.sort_unstable();
+        turns
+    }
+
     fn completion_for_ordering(&self) -> u32 {
         self.occupation_turn
             .or(self.elimination_turn)
@@ -338,6 +485,20 @@ struct SimFriendly {
     enemy_attack_profiles: Arc<[Option<EnemyAttackProfile>]>,
     /// 生産候補だけが持つ購入identity。既存戦力はNone。
     purchase: Option<PlannedPurchase>,
+    /// 生産時に割り当てた物件契約。戦闘と占領を別unitとして二重計上しない。
+    capture_contract: Option<SimCaptureContract>,
+    protection_completion_turn: Option<u32>,
+    survived_protection_completion: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct SimCaptureContract {
+    target: GridPosition,
+    arrival_turn: u32,
+    remaining_durability: u32,
+    blocking_enemy_index: Option<usize>,
+    completed_turn: Option<u32>,
+    survived_at_completion: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -345,6 +506,8 @@ struct FriendlyAttackProfile {
     base_damage: u32,
     incoming_damage: u32,
     ready_turn: u32,
+    firing_position: Option<GridPosition>,
+    requires_movement: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -398,34 +561,47 @@ impl SimulationCatalog {
                     input,
                     &FriendlyPlanUnit {
                         stats: option.stats.clone(),
-                        // 専任占領役は敵が残る物件へ先置きせず、生産地点側でscreenの
-                        // 掃討を待ってから追随する。目標到着・完了時刻は別フィールドの
-                        // 実経路ETAで保持し、被攻撃位置だけを敵前線へ瞬間移動させない。
                         position: option.purchase.facility,
                         hp: 100,
-                        available_turn: option
-                            .capture_arrival_turn
-                            .unwrap_or_else(|| option.purchase.build_turn.saturating_add(1)),
+                        // 生産unitは兵種・任務にかかわらず次の自軍手番からだけ行動できる。
+                        // 物件到着時刻まで戦闘不能にすると、経路上の迎撃を表現できない。
+                        available_turn: option.purchase.build_turn.saturating_add(1),
                         engageable_enemy_indices: option.engageable_enemy_indices.clone(),
+                        protection_completion_turn: None,
                     },
-                    // 専任占領役はscreenを追い越して敵へ接近しない。敵側が生産地点まで
-                    // 到達する時刻だけを被攻撃開始に使い、戦闘役だけが交戦距離を詰める。
-                    option.capture_target.is_none(),
+                    true,
                 );
                 simulated.purchase = Some(option.purchase);
+                debug_assert!(option.capture_completion_turn.is_none_or(|completion| {
+                    option
+                        .capture_arrival_turn
+                        .is_some_and(|arrival| completion >= arrival)
+                }));
+                simulated.capture_contract = option.capture_target.and_then(|target| {
+                    Some(SimCaptureContract {
+                        target,
+                        arrival_turn: option.capture_arrival_turn?,
+                        remaining_durability: option.capture_durability?,
+                        blocking_enemy_index: option.capture_blocking_enemy_index,
+                        completed_turn: None,
+                        survived_at_completion: false,
+                    })
+                });
                 // 生産判断側で計算した実経路ETAがあれば、格子距離による近似を
                 // 上書きする。山・川・橋・最小射程を無視した快速判定を防ぐ。
-                if let Some(exact_ready_turns) =
-                    input.production_attack_ready_turns.get(option_index)
+                if let Some(exact_projections) =
+                    input.production_attack_projections.get(option_index)
                 {
                     let mut profiles = simulated.attack_profiles.to_vec();
                     for (enemy_index, profile) in profiles.iter_mut().enumerate() {
                         match (
                             profile.as_mut(),
-                            exact_ready_turns.get(enemy_index).copied().flatten(),
+                            exact_projections.get(enemy_index).copied().flatten(),
                         ) {
-                            (Some(profile), Some(ready_turn)) => {
-                                profile.ready_turn = ready_turn;
+                            (Some(profile), Some(projection)) => {
+                                profile.ready_turn = projection.ready_turn;
+                                profile.firing_position = Some(projection.firing_position);
+                                profile.requires_movement = projection.requires_movement;
                             }
                             (Some(_), None) => *profile = None,
                             (None, _) => {}
@@ -736,6 +912,190 @@ fn plan_current_property_control_exact(
     let evaluated = crate::ai::deterministic_parallel::map_ordered(states, |state| {
         simulate_state_with_catalog(input, catalog, &state, combat_simulation_turns)
     });
+    if std::env::var_os("OPENWARS_ROLLING_AUDIT").is_some() && input.enemies.len() >= 8 {
+        // 選択結果だけでは誤った比較軸を特定できないため、明示的な監査実行時だけ
+        // 同じ辞書順で上位候補を表示する。通常対戦の探索量・選択結果には影響しない。
+        let mut audit = evaluated.clone();
+        audit.sort_by(|left, right| {
+            if exact_property_plan_better(input, left, right) {
+                std::cmp::Ordering::Less
+            } else if exact_property_plan_better(input, right, left) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+        eprintln!(
+            "ROLLING_AUDIT context funds={} enemies={:?} protected={} options={} capture_options={}",
+            input.current_funds,
+            input
+                .enemies
+                .iter()
+                .map(|enemy| (enemy.stats.unit_type, enemy.hp))
+                .collect::<Vec<_>>(),
+            input
+                .existing_units
+                .iter()
+                .filter(|unit| unit.protection_completion_turn.is_some())
+                .count()
+                + input.protected_units.len(),
+            input.production_options.len(),
+            input
+                .production_options
+                .iter()
+                .filter(|option| option.capture_target.is_some())
+                .count(),
+        );
+        for (rank, plan) in audit.iter().take(10).enumerate() {
+            eprintln!(
+                "ROLLING_AUDIT rank={} purchases={:?} lanes={} joint={:?} breakthrough={:?} blocked={} destruction={:?} survivors={}/{} remaining_hp={} loss={} surviving_value={} cost={}",
+                rank + 1,
+                plan.purchases
+                    .iter()
+                    .map(|purchase| purchase.unit_type)
+                    .collect::<Vec<_>>(),
+                plan.cleared_capture_lane_count(),
+                plan.property_contract_completion_profile(),
+                plan.front_breakthrough_rank(),
+                plan.blocked_next_turn_production_slots,
+                plan.target_destruction_profile(),
+                plan.deadline_capture_survivor_count,
+                plan.protected_unit_count,
+                plan.remaining_hp(),
+                plan.expected_loss,
+                plan.surviving_combat_value,
+                plan.production_cost,
+            );
+        }
+        let mut seen_unit_types = HashSet::new();
+        let unit_types = input
+            .production_options
+            .iter()
+            .map(|option| option.stats.unit_type)
+            .filter(|unit_type| seen_unit_types.insert(*unit_type))
+            .collect::<Vec<_>>();
+        for unit_type in unit_types {
+            if let Some((rank, plan)) = audit.iter().enumerate().find(|(_, plan)| {
+                plan.purchases
+                    .iter()
+                    .any(|purchase| purchase.unit_type == unit_type)
+            }) {
+                eprintln!(
+                    "ROLLING_AUDIT type_best={:?} rank={} purchases={:?} lanes={} joint={:?} breakthrough={:?} targets={:?} survivors={}/{} remaining_hp={} loss={} surviving_value={} cost={}",
+                    unit_type,
+                    rank + 1,
+                    plan.purchases
+                        .iter()
+                        .map(|purchase| purchase.unit_type)
+                        .collect::<Vec<_>>(),
+                    plan.cleared_capture_lane_count(),
+                    plan.property_contract_completion_profile(),
+                    plan.front_breakthrough_rank(),
+                    plan.target_forecasts
+                        .iter()
+                        .map(|target| (
+                            target.unit_type,
+                            target.initial_hp,
+                            target.remaining_hp,
+                            target.destroyed_turn,
+                        ))
+                        .collect::<Vec<_>>(),
+                    plan.deadline_capture_survivor_count,
+                    plan.protected_unit_count,
+                    plan.remaining_hp(),
+                    plan.expected_loss,
+                    plan.surviving_combat_value,
+                    plan.production_cost,
+                );
+            }
+        }
+        if let Some(plan) = audit.iter().find(|plan| {
+            plan.purchases.len() == 4
+                && plan
+                    .purchases
+                    .iter()
+                    .filter(|purchase| purchase.unit_type == UnitType::Tank)
+                    .count()
+                    == 1
+                && plan
+                    .purchases
+                    .iter()
+                    .filter(|purchase| purchase.unit_type == UnitType::Recon)
+                    .count()
+                    == 1
+                && plan
+                    .purchases
+                    .iter()
+                    .filter(|purchase| purchase.unit_type == UnitType::Infantry)
+                    .count()
+                    == 2
+        }) {
+            eprintln!(
+                "ROLLING_AUDIT ideal_shape purchases={:?} blocked={} destruction={:?} targets={:?} remaining_hp={} loss={} surviving_value={} cost={}",
+                plan.purchases
+                    .iter()
+                    .map(|purchase| purchase.unit_type)
+                    .collect::<Vec<_>>(),
+                plan.blocked_next_turn_production_slots,
+                plan.target_destruction_profile(),
+                plan.target_forecasts
+                    .iter()
+                    .map(|target| (
+                        target.unit_type,
+                        target.initial_hp,
+                        target.remaining_hp,
+                        target.destroyed_turn,
+                    ))
+                    .collect::<Vec<_>>(),
+                plan.remaining_hp(),
+                plan.expected_loss,
+                plan.surviving_combat_value,
+                plan.production_cost,
+            );
+        }
+        for (label, wanted) in [
+            (
+                "tank_recon_infantry",
+                [UnitType::Tank, UnitType::Recon, UnitType::Infantry],
+            ),
+            (
+                "tank_recon_mech",
+                [UnitType::Tank, UnitType::Recon, UnitType::Mech],
+            ),
+        ] {
+            if let Some(plan) = audit.iter().find(|plan| {
+                plan.purchases.len() == wanted.len()
+                    && wanted.iter().all(|unit_type| {
+                        plan.purchases
+                            .iter()
+                            .filter(|purchase| purchase.unit_type == *unit_type)
+                            .count()
+                            == wanted
+                                .iter()
+                                .filter(|wanted_type| *wanted_type == unit_type)
+                                .count()
+                    })
+            }) {
+                eprintln!(
+                    "ROLLING_AUDIT shape={label} purchases={:?} lanes={} joint={:?} breakthrough={:?} blocked={} destruction={:?} remaining_value={} remaining_hp={} loss={} surviving_value={} cost={}",
+                    plan.purchases
+                        .iter()
+                        .map(|purchase| purchase.unit_type)
+                        .collect::<Vec<_>>(),
+                    plan.cleared_capture_lane_count(),
+                    plan.property_contract_completion_profile(),
+                    plan.front_breakthrough_rank(),
+                    plan.blocked_next_turn_production_slots,
+                    plan.target_destruction_profile(),
+                    plan.remaining_enemy_value(input),
+                    plan.remaining_hp(),
+                    plan.expected_loss,
+                    plan.surviving_combat_value,
+                    plan.production_cost,
+                );
+            }
+        }
+    }
     let mut selected: Option<ForcePackagePlan> = None;
     for candidate in evaluated {
         if selected
@@ -763,15 +1123,21 @@ fn exact_property_plan_better(
         // そのうえで余分な買い足しを避けて期待損失最小化・費用最小化で経済効率を高める。
         if candidate.feasible && current.feasible {
             return (
+                std::cmp::Reverse(candidate.cleared_capture_lane_count()),
+                candidate.property_contract_completion_profile(),
                 std::cmp::Reverse(candidate.deadline_capture_survivor_count),
                 candidate.capture_completion_profile(),
+                candidate.target_destruction_profile(),
                 candidate.occupation_turn,
                 candidate.expected_loss,
                 candidate.production_cost,
                 std::cmp::Reverse(candidate.surviving_combat_value),
             ) < (
+                std::cmp::Reverse(current.cleared_capture_lane_count()),
+                current.property_contract_completion_profile(),
                 std::cmp::Reverse(current.deadline_capture_survivor_count),
                 current.capture_completion_profile(),
+                current.target_destruction_profile(),
                 current.occupation_turn,
                 current.expected_loss,
                 current.production_cost,
@@ -783,22 +1149,33 @@ fn exact_property_plan_better(
         }
 
         // 全滅未達（敵が多数存在し、突破・前線維持が必要な場合）
-        // 最早突破時刻、占領レーン数、敵残HP最小化、被ダメ損失最小化、生存戦力価値最大化で比較
+        // 掃討と占領が対になった成立レーン数を最優先し、その後に全レーンの掃討時刻、
+        // 占領時刻、敵残HP、損耗を比較する。一体目だけの突破で後続を見失わない。
         return (
+            std::cmp::Reverse(candidate.cleared_capture_lane_count()),
+            candidate.property_contract_completion_profile(),
             candidate.front_breakthrough_rank(),
+            candidate.remaining_enemy_value(input),
+            candidate.blocked_next_turn_production_slots,
+            candidate.expected_loss,
+            std::cmp::Reverse(candidate.surviving_combat_value),
+            candidate.target_destruction_profile(),
             std::cmp::Reverse(candidate.deadline_capture_survivor_count),
             candidate.capture_completion_profile(),
             candidate.remaining_hp(),
-            candidate.expected_loss,
-            std::cmp::Reverse(candidate.surviving_combat_value),
             candidate.production_cost,
         ) < (
+            std::cmp::Reverse(current.cleared_capture_lane_count()),
+            current.property_contract_completion_profile(),
             current.front_breakthrough_rank(),
+            current.remaining_enemy_value(input),
+            current.blocked_next_turn_production_slots,
+            current.expected_loss,
+            std::cmp::Reverse(current.surviving_combat_value),
+            current.target_destruction_profile(),
             std::cmp::Reverse(current.deadline_capture_survivor_count),
             current.capture_completion_profile(),
             current.remaining_hp(),
-            current.expected_loss,
-            std::cmp::Reverse(current.surviving_combat_value),
             current.production_cost,
         );
     }
@@ -815,74 +1192,104 @@ fn exact_property_plan_better(
         return candidate_satisfied;
     }
     if candidate_satisfied {
+        if candidate.cleared_capture_lane_count() != current.cleared_capture_lane_count() {
+            return candidate.cleared_capture_lane_count() > current.cleared_capture_lane_count();
+        }
+        let candidate_joint = candidate.property_contract_completion_profile();
+        let current_joint = current.property_contract_completion_profile();
+        if candidate_joint != current_joint {
+            return candidate_joint < current_joint;
+        }
         if candidate.feasible && current.feasible {
             return (
+                candidate.remaining_enemy_value(input),
+                candidate.blocked_next_turn_production_slots,
                 candidate.expected_loss,
-                candidate.production_cost,
                 std::cmp::Reverse(candidate.surviving_combat_value),
+                candidate.target_destruction_profile(),
+                candidate.production_cost,
                 candidate
                     .interdiction_first_attack_turn()
                     .unwrap_or(u32::MAX),
             ) < (
+                current.remaining_enemy_value(input),
+                current.blocked_next_turn_production_slots,
                 current.expected_loss,
-                current.production_cost,
                 std::cmp::Reverse(current.surviving_combat_value),
+                current.target_destruction_profile(),
+                current.production_cost,
                 current.interdiction_first_attack_turn().unwrap_or(u32::MAX),
             );
         }
         if candidate.feasible != current.feasible {
             return candidate.feasible;
         }
-        // 契約を満たした案同士では、敵残存HPを削り、被ダメージを抑え、生存戦力価値（NPV）を
-        // 最大化する案を優先する。これらが同等なら余剰資金温存のため費用最小を選ぶ。
+        // 契約を満たした案同士では、敵のマスター価格に残HPを掛けた実残存価値を減らす。
+        // raw HPや購入兵種への固定点ではなく、実盤面の敵編成と相性による撃破結果を使う。
         return (
-            candidate.interdiction_remaining_hp(input.deadline_target_index),
+            candidate.remaining_enemy_value(input),
+            candidate.blocked_next_turn_production_slots,
             candidate.expected_loss,
             std::cmp::Reverse(candidate.surviving_combat_value),
+            candidate.target_destruction_profile(),
             candidate
                 .interdiction_first_attack_turn()
                 .unwrap_or(u32::MAX),
             candidate.production_cost,
         ) < (
-            current.interdiction_remaining_hp(input.deadline_target_index),
+            current.remaining_enemy_value(input),
+            current.blocked_next_turn_production_slots,
             current.expected_loss,
             std::cmp::Reverse(current.surviving_combat_value),
+            current.target_destruction_profile(),
             current.interdiction_first_attack_turn().unwrap_or(u32::MAX),
             current.production_cost,
         );
     }
 
-    let candidate_attack_turns = candidate
-        .target_first_attack_turns
-        .iter()
-        .map(|turn| turn.unwrap_or(u32::MAX))
-        .collect::<Vec<_>>();
-    let current_attack_turns = current
-        .target_first_attack_turns
-        .iter()
-        .map(|turn| turn.unwrap_or(u32::MAX))
-        .collect::<Vec<_>>();
     let required = input.required_capture_survivors;
     (
+        std::cmp::Reverse(candidate.cleared_capture_lane_count()),
+        candidate.property_contract_completion_profile(),
         required.saturating_sub(
             candidate.completed_property_contracts(&input.interdiction_deadlines, required),
         ),
-        candidate_attack_turns,
-        candidate.remaining_hp(),
+        candidate.interdiction_deadline_shortfall_profile(&input.interdiction_deadlines),
         candidate.capture_survivor_shortfall(required),
-        candidate.expected_loss,
-        std::cmp::Reverse(candidate.surviving_combat_value),
-        candidate.production_cost,
+        (
+            candidate.remaining_enemy_value(input),
+            candidate.blocked_next_turn_production_slots,
+            candidate.expected_loss,
+            std::cmp::Reverse(candidate.surviving_combat_value),
+            candidate.front_breakthrough_rank(),
+            candidate.target_destruction_profile(),
+        ),
+        (
+            candidate.interdiction_attack_turn_profile(&input.interdiction_deadlines),
+            candidate.remaining_hp(),
+            candidate.production_cost,
+        ),
     ) < (
+        std::cmp::Reverse(current.cleared_capture_lane_count()),
+        current.property_contract_completion_profile(),
         required.saturating_sub(
             current.completed_property_contracts(&input.interdiction_deadlines, required),
         ),
-        current_attack_turns,
-        current.remaining_hp(),
+        current.interdiction_deadline_shortfall_profile(&input.interdiction_deadlines),
         current.capture_survivor_shortfall(required),
-        current.expected_loss,
-        std::cmp::Reverse(current.surviving_combat_value),
-        current.production_cost,
+        (
+            current.remaining_enemy_value(input),
+            current.blocked_next_turn_production_slots,
+            current.expected_loss,
+            std::cmp::Reverse(current.surviving_combat_value),
+            current.front_breakthrough_rank(),
+            current.target_destruction_profile(),
+        ),
+        (
+            current.interdiction_attack_turn_profile(&input.interdiction_deadlines),
+            current.remaining_hp(),
+            current.production_cost,
+        ),
     )
 }
 
@@ -1367,43 +1774,16 @@ fn simulate_state_with_catalog(
         .iter()
         .map(|index| input.production_options[*index].purchase)
         .collect();
-    let capture_purchases = state
-        .option_indices
-        .iter()
-        .filter_map(|index| {
-            input.production_options[*index]
-                .capture_target
-                .map(|target| PlannedCapturePurchase {
-                    purchase: input.production_options[*index].purchase,
-                    target,
-                    completion_turn: input.production_options[*index].capture_completion_turn,
-                })
-        })
-        .collect::<Vec<_>>();
-    let selected_capture_completion_turns = state
-        .option_indices
-        .iter()
-        .filter_map(|index| {
-            let option = &input.production_options[*index];
-            option
-                .capture_target
-                .map(|_| option.capture_completion_turn)
-        })
-        .collect::<Vec<_>>();
     let mut friendlies = catalog.existing_units.clone();
     let mut protected_units = catalog.protected_units.clone();
+    let mut capture_friendly_indices = Vec::new();
     for index in &state.option_indices {
+        let friendly_index = friendlies.len();
+        friendlies.push(catalog.production_units[*index].clone());
         if input.production_options[*index].capture_target.is_some() {
-            protected_units.push(catalog.production_units[*index].clone());
-        } else {
-            friendlies.push(catalog.production_units[*index].clone());
+            capture_friendly_indices.push(friendly_index);
         }
     }
-    let selected_capture_completion_turn = selected_capture_completion_turns
-        .iter()
-        .filter_map(|turn| *turn)
-        .chain(input.capture_completion_turn)
-        .max();
     let mut enemies = catalog.enemies.clone();
     let mut first_attack_turn = None;
     let mut front_breakthrough_turn = None;
@@ -1412,7 +1792,7 @@ fn simulate_state_with_catalog(
     let mut turn_forecasts = Vec::new();
     let mut combat_purchases = Vec::new();
     let mut assigned_combat_purchases = HashSet::new();
-    let mut capture_survival_at_completion = vec![None; selected_capture_completion_turns.len()];
+    let mut blocked_next_turn_production_facilities = HashSet::new();
     let mut protected_survivors_at_completion = None;
 
     for turn in 1..=search_turns {
@@ -1435,18 +1815,55 @@ fn simulate_state_with_catalog(
         // 物件前線では、各攻撃役が別の敵を少しずつ削る予測では突破能力を測れない。
         // この手番に同じ実在敵へ合法に届く全火力を合算し、撃破可能ならその敵へ
         // 集中させる。兵種名・価格・座標ではなく、実相性、HP、射程、経路ETAだけで決める。
+        let lethal_attacker_counts = lethal_attacker_counts(&friendlies, &enemies, turn);
         let front_breakthrough_target = (input.exact_property_control
-            && input.interdiction_deadlines.is_empty())
+            && input.interdiction_deadlines.is_empty()
+            // 一撃で排除できる相性担当がいる場合、その担当を容易な別標的への
+            // 集中射撃へ強制しない。単独撃破が無い局面だけ火力集中を組む。
+            && lethal_attacker_counts.iter().all(|count| *count == 0))
         .then(|| select_front_breakthrough_target(&friendlies, &enemies, turn))
         .flatten();
         if front_breakthrough_target.is_some() {
             front_breakthrough_turn.get_or_insert(turn);
         }
         for friendly in &mut friendlies {
-            if friendly.hp == 0 || friendly.attacks_left == 0 || turn < friendly.available_turn {
+            if friendly.hp == 0 || turn < friendly.available_turn {
                 continue;
             }
-            let concentrated_target = front_breakthrough_target.and_then(|target_index| {
+            let capture_blocker = friendly
+                .capture_contract
+                .as_ref()
+                .filter(|contract| contract.completed_turn.is_none())
+                .and_then(|contract| contract.blocking_enemy_index);
+            let blocker_cleared = capture_blocker
+                .and_then(|index| enemies.get(index))
+                .is_none_or(|enemy| enemy.hp == 0);
+            let capture_ready = friendly.capture_contract.as_ref().is_some_and(|contract| {
+                contract.completed_turn.is_none()
+                    && turn >= contract.arrival_turn
+                    && blocker_cleared
+            });
+            if capture_ready {
+                let power = super::property_control::capture_power_from_hp(friendly.hp);
+                let contract = friendly
+                    .capture_contract
+                    .as_mut()
+                    .expect("占領可能判定済みの契約が存在する");
+                // 占領と攻撃は同一手番に併用しない。被弾後HPから実占領力を求め、
+                // 固定2回で完了したことにしない。
+                contract.remaining_durability = contract.remaining_durability.saturating_sub(power);
+                if contract.remaining_durability == 0 {
+                    contract.completed_turn = Some(turn);
+                    contract.survived_at_completion = true;
+                }
+                continue;
+            }
+            if friendly.attacks_left == 0 {
+                continue;
+            }
+            // 占領レーンを塞ぐ敵が残る間は、同じunitの初撃をその敵へ割り当てる。
+            // これによりCapture用cloneとCombat用cloneでHP・行動を二重計上しない。
+            let contract_target = capture_blocker.and_then(|target_index| {
                 let enemy = enemies.get(target_index)?;
                 let profile = friendly
                     .attack_profiles
@@ -1456,6 +1873,20 @@ fn simulate_state_with_catalog(
                 (enemy.hp > 0 && turn >= enemy.source.available_turn && turn >= profile.ready_turn)
                     .then_some((target_index, profile))
             });
+            let concentrated_target = contract_target.or_else(|| {
+                front_breakthrough_target.and_then(|target_index| {
+                    let enemy = enemies.get(target_index)?;
+                    let profile = friendly
+                        .attack_profiles
+                        .get(target_index)
+                        .copied()
+                        .flatten()?;
+                    (enemy.hp > 0
+                        && turn >= enemy.source.available_turn
+                        && turn >= profile.ready_turn)
+                        .then_some((target_index, profile))
+                })
+            });
             let Some((target_index, attack_profile)) = concentrated_target.or_else(|| {
                 select_target(
                     friendly,
@@ -1463,6 +1894,7 @@ fn simulate_state_with_catalog(
                     turn,
                     &input.interdiction_deadlines,
                     &target_first_attack_turns,
+                    &lethal_attacker_counts,
                 )
             }) else {
                 continue;
@@ -1489,6 +1921,16 @@ fn simulate_state_with_catalog(
                     purchase,
                     target: target_entity,
                 });
+            }
+            if turn == 1
+                && let Some(purchase) = friendly.purchase
+                && purchase.build_turn == 0
+                && attack_profile.firing_position == Some(purchase.facility)
+                && !attack_profile.requires_movement
+            {
+                // 生産直後のunitが次手番も施設上から攻撃するなら、その手番の生産枠は
+                // 物理的に使えない。価格換算せず、失うslot数として保持する。
+                blocked_next_turn_production_facilities.insert(purchase.facility);
             }
             attack_count = attack_count.saturating_add(1);
             target.hp = target.hp.saturating_sub(damage);
@@ -1569,19 +2011,12 @@ fn simulate_state_with_catalog(
             }
             enemy.attacks_left = enemy.attacks_left.saturating_sub(1);
         }
-        // 占領契約の成立は戦闘シミュレーション末尾ではなく、各物件を取り切った
-        // その時点で判定する。占領後に戦線へ戻って撃破されても、取得済み物件を
-        // 「未達」へ巻き戻して占領役を戦闘役へ付け替えない。
-        for (purchase_index, completion_turn) in
-            selected_capture_completion_turns.iter().enumerate()
-        {
-            if *completion_turn == Some(turn) {
-                capture_survival_at_completion[purchase_index] = protected_units
-                    .get(input.protected_units.len().saturating_add(purchase_index))
-                    .map(|unit| unit.hp > 0);
+        for friendly in &mut friendlies {
+            if friendly.protection_completion_turn == Some(turn) {
+                friendly.survived_protection_completion = Some(friendly.hp > 0);
             }
         }
-        if selected_capture_completion_turn == Some(turn) {
+        if input.capture_completion_turn == Some(turn) {
             protected_survivors_at_completion =
                 Some(protected_units.iter().filter(|unit| unit.hp > 0).count());
         }
@@ -1602,8 +2037,18 @@ fn simulate_state_with_catalog(
             friendly_hp_lost: friendly_hp_before.saturating_sub(friendly_hp_after),
             attack_count,
         });
+        let all_selected_captures_complete = capture_friendly_indices.iter().all(|index| {
+            friendlies[*index]
+                .capture_contract
+                .as_ref()
+                .is_some_and(|contract| contract.completed_turn.is_some())
+        });
+        let existing_capture_complete = input
+            .capture_completion_turn
+            .is_none_or(|capture_turn| turn >= capture_turn);
         if enemies.iter().all(|enemy| enemy.hp == 0)
-            && selected_capture_completion_turn.is_none_or(|capture_turn| turn >= capture_turn)
+            && all_selected_captures_complete
+            && existing_capture_complete
         {
             break;
         }
@@ -1618,25 +2063,75 @@ fn simulate_state_with_catalog(
             .collect::<Option<Vec<_>>>()
             .and_then(|turns| turns.into_iter().max())
     };
-    // 物件別の合同探索では、対象物件と到達・完了時刻を持つCapture案だけを
-    // 契約成立へ数える。単にcan_captureなCombat案を数えると、敵を追う歩兵と
-    // 物件へ向かう歩兵を同一視し、実行時にもう一体を重複発注してしまう。
+    let capture_purchases = capture_friendly_indices
+        .iter()
+        .filter_map(|index| {
+            let friendly = &friendlies[*index];
+            let contract = friendly.capture_contract.as_ref()?;
+            Some(PlannedCapturePurchase {
+                purchase: friendly.purchase?,
+                target: contract.target,
+                completion_turn: contract.completed_turn,
+                blocking_enemy_index: contract.blocking_enemy_index,
+                survived_at_completion: contract.survived_at_completion,
+            })
+        })
+        .collect::<Vec<_>>();
+    let selected_capture_completion_turn = capture_purchases
+        .iter()
+        .filter_map(|purchase| purchase.completion_turn)
+        .chain(input.capture_completion_turn)
+        .max();
+    let selected_capture_survivor_count = capture_friendly_indices
+        .iter()
+        .filter(|index| {
+            friendlies[**index]
+                .capture_contract
+                .as_ref()
+                .is_some_and(|contract| contract.survived_at_completion)
+        })
+        .count();
+    let existing_protected_survivor_count = friendlies
+        .iter()
+        .filter(|friendly| friendly.protection_completion_turn.is_some())
+        .filter(|friendly| {
+            friendly
+                .survived_protection_completion
+                .unwrap_or(friendly.hp > 0)
+        })
+        .count();
+    // 物件別の合同探索では、対象物件を実際に取り切った同じunitだけを契約成立へ数える。
+    // 戦闘用cloneと保護用cloneへ分けず、購入費・HP・行動を一体分に保つ。
     let protected_survivor_count = protected_survivors_at_completion
         .unwrap_or_else(|| protected_units.iter().filter(|unit| unit.hp > 0).count())
+        .saturating_add(existing_protected_survivor_count)
+        .saturating_add(selected_capture_survivor_count)
         + if input.exact_property_control {
             0
         } else {
             friendlies
                 .iter()
-                .filter(|unit| unit.stats.can_capture && unit.hp > 0)
+                .filter(|unit| {
+                    unit.capture_contract.is_none()
+                        && unit.protection_completion_turn.is_none()
+                        && unit.stats.can_capture
+                        && unit.hp > 0
+                })
                 .count()
         };
     let capture_deadline = input.hard_deadline.unwrap_or(search_turns);
-    let deadline_capture_survivor_count = selected_capture_completion_turns
+    let deadline_capture_survivor_count = capture_friendly_indices
         .iter()
-        .zip(&capture_survival_at_completion)
-        .filter(|(completion, survived)| {
-            completion.is_some_and(|turn| turn <= capture_deadline) && **survived == Some(true)
+        .filter(|index| {
+            friendlies[**index]
+                .capture_contract
+                .as_ref()
+                .is_some_and(|contract| {
+                    contract.survived_at_completion
+                        && contract
+                            .completed_turn
+                            .is_some_and(|turn| turn <= capture_deadline)
+                })
         })
         .count();
     // 占領完了ETAがまだ無いことは、占領役の生存要求が無いことを意味しない。
@@ -1699,10 +2194,17 @@ fn simulate_state_with_catalog(
         occupation_turn,
         production_cost: state.cost,
         expected_loss,
+        blocked_next_turn_production_slots: blocked_next_turn_production_facilities.len(),
         surviving_combat_value,
         required_overmatch_value,
         overmatch_ready: surviving_combat_value >= required_overmatch_value,
-        protected_unit_count: input.protected_units.len(),
+        protected_unit_count: input.protected_units.len()
+            + catalog
+                .existing_units
+                .iter()
+                .filter(|unit| unit.protection_completion_turn.is_some())
+                .count()
+            + capture_friendly_indices.len(),
         protected_survivor_count,
         deadline_capture_survivor_count,
         required_capture_survivor_count: input.required_capture_survivors,
@@ -1768,6 +2270,8 @@ fn sim_friendly(
                 ready_turn: source
                     .available_turn
                     .saturating_add(attack_readiness_turns(distance, &source.stats)),
+                firing_position: None,
+                requires_movement: false,
             }
         }));
 
@@ -1800,6 +2304,9 @@ fn sim_friendly(
         attack_profiles: attack_profiles.into(),
         enemy_attack_profiles: enemy_attack_profiles.into(),
         purchase: None,
+        capture_contract: None,
+        protection_completion_turn: source.protection_completion_turn,
+        survived_protection_completion: None,
     }
 }
 
@@ -1852,12 +2359,55 @@ fn select_front_breakthrough_target(
         .map(|(_, enemy_index)| enemy_index)
 }
 
+/// 現在手番に各敵を単独撃破できる友軍数。
+///
+/// 「戦車なら装甲車を一撃で落とせるが、他兵科では落とせない」のような相性担当を
+/// 容易な歩兵へ浪費しないための希少度であり、兵種名や固定評価点は使わない。
+fn lethal_attacker_counts(
+    friendlies: &[SimFriendly],
+    enemies: &[SimEnemy],
+    turn: u32,
+) -> Vec<usize> {
+    enemies
+        .iter()
+        .enumerate()
+        .map(|(enemy_index, enemy)| {
+            if enemy.hp == 0 || turn < enemy.source.available_turn {
+                return 0;
+            }
+            friendlies
+                .iter()
+                .filter(|friendly| {
+                    friendly.hp > 0 && friendly.attacks_left > 0 && turn >= friendly.available_turn
+                })
+                .filter(|friendly| {
+                    friendly
+                        .attack_profiles
+                        .get(enemy_index)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|profile| {
+                            turn >= profile.ready_turn
+                                && calculate_damage_formula(
+                                    profile.base_damage,
+                                    friendly.hp,
+                                    enemy.source.defense_bonus,
+                                    false,
+                                ) >= enemy.hp
+                        })
+                })
+                .count()
+        })
+        .collect()
+}
+
 fn select_target(
     friendly: &SimFriendly,
     enemies: &[SimEnemy],
     turn: u32,
     interdiction_deadlines: &[(usize, u32)],
     target_first_attack_turns: &[Option<u32>],
+    lethal_attacker_counts: &[usize],
 ) -> Option<(usize, FriendlyAttackProfile)> {
     enemies
         .iter()
@@ -1890,13 +2440,31 @@ fn select_target(
                 Some(_) => 1,
                 None => 2,
             };
+            let damage = calculate_damage_formula(
+                profile.base_damage,
+                friendly.hp,
+                enemy.source.defense_bonus,
+                false,
+            );
+            let lethal = damage >= enemy.hp;
+            let lethal_scarcity = if lethal {
+                lethal_attacker_counts
+                    .get(index)
+                    .copied()
+                    .unwrap_or(1)
+                    .max(1)
+            } else {
+                usize::MAX
+            };
             // 占領能力だけで標的順を固定すると、後方の砲兵を放置したまま前衛へ
-            // 損耗を重ねる。自分へ返せる最大与ダメージを先に比較し、同程度なら
-            // 勝利条件へ直結する占領・輸送能力と残HPで集中撃破先を決める。
+            // 損耗を重ねる。まず今この一撃で除去でき、代替担当が少ない敵を選ぶ。
+            // 同程度なら自分へ返せる最大与ダメージと勝利条件への影響で決める。
             Some((
                 (
                     contract_rank,
                     contract_deadline.unwrap_or(u32::MAX),
+                    !lethal,
+                    lethal_scarcity,
                     std::cmp::Reverse(profile.incoming_damage),
                     strategic_rank,
                     enemy.hp,
@@ -1906,7 +2474,7 @@ fn select_target(
             ))
         })
         .min_by_key(|(key, _)| *key)
-        .map(|((_, _, _, _, _, index), profile)| (index, profile))
+        .map(|((_, _, _, _, _, _, _, index), profile)| (index, profile))
 }
 
 fn best_damage(chart: &DamageChart, attacker: UnitType, defender: UnitType) -> u32 {
@@ -1960,6 +2528,8 @@ pub(crate) fn production_options(
                     capture_target: None,
                     capture_arrival_turn: None,
                     capture_completion_turn: None,
+                    capture_durability: None,
+                    capture_blocking_enemy_index: None,
                 });
             }
         }
@@ -2037,6 +2607,8 @@ mod tests {
                     capture_target: None,
                     capture_arrival_turn: None,
                     capture_completion_turn: None,
+                    capture_durability: None,
+                    capture_blocking_enemy_index: None,
                 },
                 ProductionPlanOption {
                     purchase: PlannedPurchase {
@@ -2050,9 +2622,11 @@ mod tests {
                     capture_target: None,
                     capture_arrival_turn: None,
                     capture_completion_turn: None,
+                    capture_durability: None,
+                    capture_blocking_enemy_index: None,
                 },
             ],
-            production_attack_ready_turns: Vec::new(),
+            production_attack_projections: Vec::new(),
             deadline_target_index: None,
             interdiction_deadlines: Vec::new(),
             current_funds: 30_000,
@@ -2135,6 +2709,8 @@ mod tests {
             capture_target: None,
             capture_arrival_turn: None,
             capture_completion_turn: None,
+            capture_durability: None,
+            capture_blocking_enemy_index: None,
         });
         let state = SearchState {
             option_indices: vec![0],
@@ -2297,6 +2873,8 @@ mod tests {
             capture_target: None,
             capture_arrival_turn: None,
             capture_completion_turn: None,
+            capture_durability: None,
+            capture_blocking_enemy_index: None,
         };
         input.production_options.push(dominated);
 
@@ -2315,6 +2893,70 @@ mod tests {
     }
 
     #[test]
+    fn capture_unit_attacks_blocker_then_completes_with_one_action_per_turn() {
+        let mut input = input();
+        input.production_options = vec![ProductionPlanOption {
+            purchase: PlannedPurchase {
+                facility: GridPosition { x: 0, y: 0 },
+                unit_type: UnitType::Infantry,
+                build_turn: 0,
+                cost: 1_000,
+            },
+            stats: UnitStats {
+                unit_type: UnitType::Infantry,
+                cost: 1_000,
+                can_capture: true,
+                max_movement: 3,
+                movement_type: MovementType::Infantry,
+                max_fuel: 99,
+                max_ammo1: 9,
+                min_range: 1,
+                max_range: 1,
+                ..UnitStats::mock()
+            },
+            engageable_enemy_indices: vec![0],
+            capture_target: Some(GridPosition { x: 1, y: 0 }),
+            capture_arrival_turn: Some(1),
+            capture_completion_turn: Some(2),
+            capture_durability: Some(200),
+            capture_blocking_enemy_index: Some(0),
+        }];
+        input.production_attack_projections = vec![vec![Some(ProductionAttackProjection {
+            ready_turn: 1,
+            firing_position: GridPosition { x: 0, y: 0 },
+            requires_movement: false,
+        })]];
+        input.current_funds = 1_000;
+        input.income_per_turn = 0;
+        input.hard_deadline = Some(3);
+        input.required_capture_survivors = 1;
+        input.exact_property_control = true;
+        Arc::make_mut(&mut input.damage_chart).insert_damage(
+            UnitType::Infantry,
+            UnitType::Infantry,
+            100,
+        );
+
+        let plan = plan_force_package(&input).expect("同じ歩兵が排除後に占領する合同案");
+
+        assert_eq!(plan.purchases.len(), 1, "購入と費用を二重計上しない");
+        assert_eq!(plan.production_cost, 1_000);
+        assert_eq!(plan.first_attack_turn, Some(1), "生産当日には攻撃しない");
+        assert_eq!(plan.target_forecasts[0].destroyed_turn, Some(1));
+        assert_eq!(plan.capture_purchases[0].completion_turn, Some(3));
+        assert_eq!(plan.deadline_capture_survivor_count, 1);
+        assert_eq!(plan.turn_forecasts[0].attack_count, 1);
+        assert_eq!(
+            plan.turn_forecasts[1].attack_count, 0,
+            "占領手番には攻撃しない"
+        );
+        assert_eq!(
+            plan.turn_forecasts[2].attack_count, 0,
+            "占領手番には攻撃しない"
+        );
+    }
+
+    #[test]
     fn occupation_uses_live_campaign_eta_instead_of_a_fixed_delay() {
         let mut input = input();
         input.capture_completion_turn = Some(7);
@@ -2329,6 +2971,7 @@ mod tests {
             hp: 100,
             available_turn: 0,
             engageable_enemy_indices: Vec::new(),
+            protection_completion_turn: None,
         });
 
         let plan = plan_force_package(&input).unwrap();
@@ -2358,6 +3001,7 @@ mod tests {
             hp: 100,
             available_turn: 0,
             engageable_enemy_indices: vec![0],
+            protection_completion_turn: None,
         }];
         Arc::make_mut(&mut input.damage_chart).insert_damage(
             UnitType::Infantry,
@@ -2391,6 +3035,7 @@ mod tests {
             // 敵を最終的には倒せるが、占領兵が先に損耗する状況を作る。
             available_turn: 2,
             engageable_enemy_indices: vec![0],
+            protection_completion_turn: None,
         });
         let capturer = FriendlyPlanUnit {
             stats: UnitStats {
@@ -2402,6 +3047,7 @@ mod tests {
             hp: 100,
             available_turn: 0,
             engageable_enemy_indices: Vec::new(),
+            protection_completion_turn: None,
         };
         input.protected_units = vec![capturer.clone(), capturer];
         input.capture_completion_turn = Some(3);
@@ -2511,6 +3157,8 @@ mod tests {
                 capture_target: None,
                 capture_arrival_turn: None,
                 capture_completion_turn: None,
+                capture_durability: None,
+                capture_blocking_enemy_index: None,
             },
             ProductionPlanOption {
                 purchase: PlannedPurchase {
@@ -2524,6 +3172,8 @@ mod tests {
                 capture_target: None,
                 capture_arrival_turn: None,
                 capture_completion_turn: None,
+                capture_durability: None,
+                capture_blocking_enemy_index: None,
             },
         ];
 
@@ -2561,6 +3211,8 @@ mod tests {
                 capture_target: None,
                 capture_arrival_turn: None,
                 capture_completion_turn: None,
+                capture_durability: None,
+                capture_blocking_enemy_index: None,
             },
             ProductionPlanOption {
                 purchase: PlannedPurchase {
@@ -2574,6 +3226,8 @@ mod tests {
                 capture_target: None,
                 capture_arrival_turn: None,
                 capture_completion_turn: None,
+                capture_durability: None,
+                capture_blocking_enemy_index: None,
             },
         ];
         let original = vec![
@@ -2623,6 +3277,8 @@ mod tests {
                 capture_target: None,
                 capture_arrival_turn: None,
                 capture_completion_turn: None,
+                capture_durability: None,
+                capture_blocking_enemy_index: None,
             },
             ProductionPlanOption {
                 purchase: PlannedPurchase {
@@ -2636,6 +3292,8 @@ mod tests {
                 capture_target: None,
                 capture_arrival_turn: None,
                 capture_completion_turn: None,
+                capture_durability: None,
+                capture_blocking_enemy_index: None,
             },
             ProductionPlanOption {
                 purchase: PlannedPurchase {
@@ -2649,6 +3307,8 @@ mod tests {
                 capture_target: None,
                 capture_arrival_turn: None,
                 capture_completion_turn: None,
+                capture_durability: None,
+                capture_blocking_enemy_index: None,
             },
         ];
         let original = vec![
@@ -2745,14 +3405,94 @@ mod tests {
     }
 
     #[test]
+    fn property_plan_prefers_two_cleared_lanes_over_one_clear_and_extra_capturer() {
+        let input = input();
+        let mut one_clear = plan_force_package(&input).expect("比較元の作戦案");
+        one_clear.feasible = false;
+        one_clear.target_forecasts = vec![
+            TargetForecast {
+                destroyed_turn: Some(1),
+                ..one_clear.target_forecasts[0].clone()
+            },
+            TargetForecast {
+                destroyed_turn: None,
+                ..one_clear.target_forecasts[0].clone()
+            },
+            TargetForecast {
+                destroyed_turn: None,
+                ..one_clear.target_forecasts[0].clone()
+            },
+        ];
+        let capture_purchase = |x, completion_turn| PlannedCapturePurchase {
+            purchase: PlannedPurchase {
+                facility: GridPosition { x, y: 0 },
+                unit_type: UnitType::Infantry,
+                build_turn: 0,
+                cost: 1_000,
+            },
+            target: GridPosition { x, y: 1 },
+            completion_turn: Some(completion_turn),
+            blocking_enemy_index: Some(x),
+            survived_at_completion: true,
+        };
+        one_clear.capture_purchases = vec![
+            capture_purchase(0, 3),
+            capture_purchase(1, 4),
+            capture_purchase(2, 5),
+        ];
+        one_clear.required_capture_survivor_count = 3;
+        one_clear.deadline_capture_survivor_count = 3;
+
+        let mut two_clears = one_clear.clone();
+        two_clears.target_forecasts[1].destroyed_turn = Some(2);
+        two_clears.capture_purchases.pop();
+        two_clears.deadline_capture_survivor_count = 2;
+
+        assert_eq!(one_clear.cleared_capture_lane_count(), 1);
+        assert_eq!(two_clears.cleared_capture_lane_count(), 2);
+        assert!(exact_property_plan_better(&input, &two_clears, &one_clear));
+    }
+
+    #[test]
+    fn property_plan_prefers_earlier_joint_arrival_over_earlier_damage_only() {
+        let input = input();
+        let mut fast_arrival = plan_force_package(&input).expect("快速案");
+        fast_arrival.feasible = false;
+        fast_arrival.target_forecasts[0].destroyed_turn = Some(2);
+        fast_arrival.capture_purchases = vec![PlannedCapturePurchase {
+            purchase: fast_arrival.purchases[0],
+            target: GridPosition { x: 5, y: 0 },
+            completion_turn: Some(3),
+            blocking_enemy_index: Some(0),
+            survived_at_completion: true,
+        }];
+        fast_arrival.required_capture_survivor_count = 1;
+        fast_arrival.deadline_capture_survivor_count = 1;
+
+        let mut slow_stronger = fast_arrival.clone();
+        slow_stronger.target_forecasts[0].destroyed_turn = Some(1);
+        slow_stronger.capture_purchases[0].completion_turn = Some(4);
+        slow_stronger.expected_loss = 0;
+        slow_stronger.surviving_combat_value = u32::MAX;
+
+        assert_eq!(fast_arrival.cleared_capture_lane_count(), 1);
+        assert_eq!(slow_stronger.cleared_capture_lane_count(), 1);
+        assert!(exact_property_plan_better(
+            &input,
+            &fast_arrival,
+            &slow_stronger
+        ));
+    }
+
+    #[test]
     fn property_front_selects_two_unit_breakthrough_and_three_capture_lanes() {
         let mut input = input();
         input.production_options.clear();
-        input.production_attack_ready_turns.clear();
+        input.production_attack_projections.clear();
         input.current_funds = 11_400;
         input.income_per_turn = 0;
         input.hard_deadline = Some(6);
-        input.required_capture_survivors = 5;
+        input.required_capture_survivors = 3;
         input.exact_property_control = true;
         input.prioritize_deadline_interdiction = false;
         Arc::make_mut(&mut input.damage_chart).insert_damage(
@@ -2775,8 +3515,16 @@ mod tests {
                 capture_target: None,
                 capture_arrival_turn: None,
                 capture_completion_turn: None,
+                capture_durability: None,
+                capture_blocking_enemy_index: None,
             });
-            input.production_attack_ready_turns.push(vec![Some(1)]);
+            input
+                .production_attack_projections
+                .push(vec![Some(ProductionAttackProjection {
+                    ready_turn: 1,
+                    firing_position: facility,
+                    requires_movement: false,
+                })]);
 
             input.production_options.push(ProductionPlanOption {
                 purchase: PlannedPurchase {
@@ -2794,8 +3542,10 @@ mod tests {
                 capture_target: Some(GridPosition { x: x + 5, y: 0 }),
                 capture_arrival_turn: Some(2),
                 capture_completion_turn: Some(4),
+                capture_durability: Some(300),
+                capture_blocking_enemy_index: Some(0),
             });
-            input.production_attack_ready_turns.push(vec![None]);
+            input.production_attack_projections.push(vec![None]);
         }
 
         let plan = plan_force_package(&input).expect("突破と占領を合同で満たす生産案");
