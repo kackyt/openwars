@@ -55,7 +55,9 @@ use crate::components::{
 };
 use crate::events::ProduceUnitCommand;
 use crate::resources::master_data::MasterDataRegistry;
-use crate::resources::{DamageChart, Map, MovementType, Players, Terrain, UnitRegistry, UnitType};
+use crate::resources::{
+    DamageChart, Map, MatchState, MovementType, Players, Terrain, UnitRegistry, UnitType,
+};
 use crate::systems::movement::{
     OccupantInfo, calculate_reachable_tile_costs, get_valid_movement_cost,
 };
@@ -1762,6 +1764,7 @@ struct BoardScan {
     map: Arc<Map>,
     master_data: Arc<MasterDataRegistry>,
     damage_chart: Arc<DamageChart>,
+    current_turn: u32,
     funds: u32,
     /// 砲台の首都側防衛可否を、作戦名でなく実座標から判定する。
     capital_position: Option<GridPosition>,
@@ -5200,6 +5203,9 @@ impl BoardScan {
         let unit_registry = world.get_resource::<UnitRegistry>()?.clone();
         let damage_chart = Arc::new(world.get_resource::<DamageChart>()?.clone());
         let master_data = Arc::new(world.get_resource::<MasterDataRegistry>()?.clone());
+        let current_turn = world
+            .get_resource::<MatchState>()
+            .map_or(1, |state| state.current_turn_number.0);
         let funds = world
             .get_resource::<Players>()?
             .0
@@ -5554,6 +5560,7 @@ impl BoardScan {
             map,
             master_data,
             damage_chart,
+            current_turn,
             funds,
             capital_position: capital_pos,
             free_facilities: facilities,
@@ -8860,6 +8867,7 @@ fn combat_plan_input(
         map: scan.map.clone(),
         master_data: scan.master_data.clone(),
         damage_chart: scan.damage_chart.clone(),
+        current_turn: scan.current_turn,
         existing_units,
         protected_units,
         enemies,
@@ -11966,6 +11974,7 @@ mod tests {
             map: flat_map(20, 3).into(),
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: damage_chart.into(),
+            current_turn: 1,
             funds: 20_000,
             capital_position: None,
             free_facilities: vec![(pos(0, 1), Terrain::Factory), (pos(1, 1), Terrain::Airport)],
@@ -12660,6 +12669,7 @@ mod tests {
             map: flat_map(10, 3).into(),
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: damage_chart.into(),
+            current_turn: 1,
             funds: 22_500,
             capital_position: None,
             free_facilities: vec![
@@ -12799,6 +12809,7 @@ mod tests {
             map: strait_map(Some(Terrain::Shoal)).into(),
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: DamageChart::new().into(),
+            current_turn: 1,
             funds: 20000,
             capital_position: None,
             free_facilities: vec![(pos(1, 1), Terrain::Port)],
@@ -12980,6 +12991,7 @@ mod tests {
             map: flat_map(9, 5).into(),
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: DamageChart::new().into(),
+            current_turn: 1,
             funds: 20000,
             capital_position: None,
             free_facilities: vec![
@@ -13036,6 +13048,7 @@ mod tests {
             map: flat_map(9, 5).into(),
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: damage_chart.into(),
+            current_turn: 1,
             funds: 17000,
             capital_position: None,
             free_facilities: vec![
@@ -13128,6 +13141,7 @@ mod tests {
             map: map.into(),
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: damage_chart.into(),
+            current_turn: 1,
             funds: 20_000,
             capital_position: None,
             free_facilities: vec![(pos(1, 1), Terrain::Factory), (pos(2, 1), Terrain::Airport)],
@@ -13209,6 +13223,7 @@ mod tests {
             map: map.into(),
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: damage_chart.into(),
+            current_turn: 1,
             funds: 20_000,
             capital_position: None,
             free_facilities: vec![(pos(1, 1), Terrain::Factory), (pos(2, 1), Terrain::Airport)],
@@ -13369,6 +13384,7 @@ mod tests {
             map: flat_map(9, 3).into(),
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: damage_chart.into(),
+            current_turn: 1,
             funds: 10_000,
             capital_position: None,
             free_facilities: vec![(pos(1, 1), Terrain::Factory)],

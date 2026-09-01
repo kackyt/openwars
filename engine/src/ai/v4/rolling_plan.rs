@@ -100,6 +100,8 @@ pub(crate) struct RollingPlanInput {
     pub map: Arc<Map>,
     pub master_data: Arc<MasterDataRegistry>,
     pub damage_chart: Arc<DamageChart>,
+    /// 初手専用の役割下限を後続手番へ漏らさないための、実際のゲーム手番。
+    pub current_turn: u32,
     pub existing_units: Vec<FriendlyPlanUnit>,
     /// 戦闘部隊とは別に、占領完了まで生存させる必要がある実在の占領兵。
     pub protected_units: Vec<FriendlyPlanUnit>,
@@ -846,6 +848,200 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
     Some(selected)
 }
 
+/// 購入済み候補を、敵一体への最初の一発だけを割り当てて評価する。
+/// 同じunitは同じ手番に二つの敵へ撃てないが、別手番なら別の敵を止められる。
+#[allow(dead_code)]
+fn evaluate_opening_package_static(
+    input: &RollingPlanInput,
+    state: &SearchState,
+) -> ForcePackagePlan {
+    let mut purchases = state
+        .option_indices
+        .iter()
+        .map(|index| input.production_options[*index].purchase)
+        .collect::<Vec<_>>();
+    purchases.sort_unstable_by_key(|purchase| {
+        (
+            purchase.build_turn,
+            purchase.facility.y,
+            purchase.facility.x,
+        )
+    });
+
+    let capture_purchases = state
+        .option_indices
+        .iter()
+        .filter_map(|index| {
+            let option = &input.production_options[*index];
+            Some(PlannedCapturePurchase {
+                purchase: option.purchase,
+                target: option.capture_target?,
+                completion_turn: option.capture_completion_turn,
+                blocking_enemy_index: option.capture_blocking_enemy_index,
+                // 初動にはまだ敵の反撃手番が無い。生存判定は次手番に実盤面で行う。
+                survived_at_completion: true,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    // 明示的な妨害契約に加え、占領レーンを塞ぐ敵には占領完了時刻までの初撃を要求する。
+    let mut contract_deadlines = HashMap::<usize, u32>::new();
+    for (enemy_index, deadline) in &input.interdiction_deadlines {
+        contract_deadlines
+            .entry(*enemy_index)
+            .and_modify(|current| *current = (*current).min(*deadline))
+            .or_insert(*deadline);
+    }
+    for capture in &capture_purchases {
+        if let (Some(enemy_index), Some(deadline)) =
+            (capture.blocking_enemy_index, capture.completion_turn)
+        {
+            contract_deadlines
+                .entry(enemy_index)
+                .and_modify(|current| *current = (*current).min(deadline))
+                .or_insert(deadline);
+        }
+    }
+    let mut contracts = contract_deadlines.into_iter().collect::<Vec<_>>();
+    contracts.sort_unstable_by_key(|(enemy_index, deadline)| (*deadline, *enemy_index));
+
+    let mut used_unit_turns = HashSet::new();
+    let mut target_first_attack_turns = vec![None; input.enemies.len()];
+    let mut target_damage = vec![0_u32; input.enemies.len()];
+    let mut combat_purchases = Vec::new();
+    let mut assigned_units = HashSet::new();
+    for (enemy_index, deadline) in contracts {
+        let mut best: Option<(u32, std::cmp::Reverse<u32>, u32, usize, u32)> = None;
+        for option_index in &state.option_indices {
+            let option = &input.production_options[*option_index];
+            if option.capture_target.is_some() {
+                continue;
+            }
+            let Some(projection) = input
+                .production_attack_projections
+                .get(*option_index)
+                .and_then(|projections| projections.get(enemy_index))
+                .and_then(|projection| *projection)
+            else {
+                continue;
+            };
+            let damage = best_damage(
+                &input.damage_chart,
+                option.stats.unit_type,
+                input.enemies[enemy_index].stats.unit_type,
+            );
+            if damage == 0 || projection.ready_turn > deadline {
+                continue;
+            }
+            for turn in projection.ready_turn..=deadline {
+                if used_unit_turns.contains(&(*option_index, turn)) {
+                    continue;
+                }
+                let candidate = (
+                    turn,
+                    std::cmp::Reverse(damage),
+                    option.purchase.cost,
+                    *option_index,
+                    damage,
+                );
+                if best.as_ref().is_none_or(|current| candidate < *current) {
+                    best = Some(candidate);
+                }
+                break;
+            }
+        }
+        if let Some((turn, _, _, option_index, damage)) = best {
+            used_unit_turns.insert((option_index, turn));
+            target_first_attack_turns[enemy_index] = Some(turn);
+            target_damage[enemy_index] = target_damage[enemy_index].saturating_add(damage);
+            if assigned_units.insert(option_index)
+                && let Some(entity) = input.enemies[enemy_index].entity
+            {
+                combat_purchases.push(PlannedCombatPurchase {
+                    purchase: input.production_options[option_index].purchase,
+                    target: entity,
+                });
+            }
+        }
+    }
+
+    let target_forecasts = input
+        .enemies
+        .iter()
+        .enumerate()
+        .map(|(index, enemy)| {
+            let remaining_hp = enemy.hp.saturating_sub(target_damage[index]);
+            TargetForecast {
+                entity: enemy.entity,
+                unit_type: enemy.stats.unit_type,
+                available_turn: enemy.available_turn,
+                initial_hp: enemy.hp,
+                remaining_hp,
+                destroyed_turn: (remaining_hp == 0)
+                    .then_some(target_first_attack_turns[index].unwrap_or(u32::MAX)),
+            }
+        })
+        .collect::<Vec<_>>();
+    let first_attack_turn = target_first_attack_turns.iter().flatten().copied().min();
+    let elimination_turn = target_forecasts
+        .iter()
+        .all(|target| target.destroyed_turn.is_some())
+        .then(|| {
+            target_forecasts
+                .iter()
+                .filter_map(|target| target.destroyed_turn)
+                .max()
+                .unwrap_or_default()
+        });
+    let occupation_turn = capture_purchases
+        .iter()
+        .map(|capture| capture.completion_turn)
+        .collect::<Option<Vec<_>>>()
+        .filter(|_| capture_purchases.len() >= input.required_capture_survivors)
+        .map(|turns| turns.into_iter().max().unwrap_or_default());
+    let deadline_capture_survivor_count = capture_purchases
+        .iter()
+        .filter(|capture| {
+            capture
+                .completion_turn
+                .is_some_and(|turn| input.hard_deadline.is_none_or(|deadline| turn <= deadline))
+        })
+        .count()
+        .min(input.required_capture_survivors);
+    let surviving_combat_value = purchases.iter().map(|purchase| purchase.cost).sum();
+    let protected_unit_count = capture_purchases.len();
+
+    ForcePackagePlan {
+        purchases,
+        capture_purchases,
+        combat_purchases,
+        target_forecasts,
+        turn_forecasts: Vec::new(),
+        feasible: false,
+        first_attack_turn,
+        front_breakthrough_turn: elimination_turn,
+        deadline_target_first_attack_turn: input
+            .deadline_target_index
+            .and_then(|index| target_first_attack_turns.get(index).and_then(|turn| *turn)),
+        target_first_attack_turns,
+        elimination_turn,
+        occupation_turn,
+        production_cost: state.cost,
+        expected_loss: 0,
+        blocked_next_turn_production_slots: 0,
+        surviving_combat_value,
+        required_overmatch_value: 0,
+        overmatch_ready: false,
+        protected_unit_count,
+        protected_survivor_count: deadline_capture_survivor_count,
+        deadline_capture_survivor_count,
+        required_capture_survivor_count: input.required_capture_survivors,
+        candidates_considered: 0,
+        candidates_pruned: 0,
+        search_truncated: false,
+    }
+}
+
 /// 期限付き物件レースでは、今手番の全施設について合法な生産組合せを全列挙する。
 ///
 /// 毎手番盤面を再観測するRolling Planなので、未観測の将来生産を固定幅beamへ混ぜず、
@@ -866,20 +1062,72 @@ fn plan_current_property_control_exact(
                 .push(index);
         }
     }
+    // 厳密探索でも、同一施設・同一手番で全交戦対象・価格・被弾期待が劣る候補を
+    // 列挙する必要はない。兵種名や固定点ではなく、入力盤面の相性表だけで支配関係を
+    // 判定するため、残した候補の最適解は変わらない。
+    let mut candidates_pruned = 0_usize;
+    for option_indices in options_by_facility.values_mut() {
+        let original_len = option_indices.len();
+        let retained = option_indices
+            .iter()
+            .copied()
+            .filter(|candidate_index| {
+                !option_indices.iter().copied().any(|other_index| {
+                    other_index != *candidate_index
+                        && production_option_dominates(
+                            input,
+                            &input.production_options[other_index],
+                            &input.production_options[*candidate_index],
+                        )
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates_pruned = candidates_pruned.saturating_add(original_len - retained.len());
+        *option_indices = retained;
+    }
     let mut facilities = options_by_facility.into_iter().collect::<Vec<_>>();
     facilities.sort_unstable_by_key(|(facility, _)| (facility.y, facility.x));
 
+    if std::env::var_os("OPENWARS_ROLLING_AUDIT").is_some() {
+        let capture_option_count = input
+            .production_options
+            .iter()
+            .filter(|option| option.purchase.build_turn == 0 && option.capture_target.is_some())
+            .count();
+        let combat_option_count = input
+            .production_options
+            .iter()
+            .filter(|option| option.purchase.build_turn == 0 && option.capture_target.is_none())
+            .count();
+        let capture_target_count = input
+            .production_options
+            .iter()
+            .filter(|option| option.purchase.build_turn == 0)
+            .filter_map(|option| option.capture_target)
+            .collect::<HashSet<_>>()
+            .len();
+        eprintln!(
+            "ROLLING_AUDIT exact_input facilities={} combat_options={} capture_options={} capture_targets={} funds={} enemies={}",
+            facilities.len(),
+            combat_option_count,
+            capture_option_count,
+            capture_target_count,
+            input.current_funds,
+            input.enemies.len(),
+        );
+    }
+
     let mut states = vec![SearchState::default()];
-    for (facility, option_indices) in facilities {
+    for (facility, option_indices) in &facilities {
         let slot = ProductionSlot {
-            facility,
+            facility: *facility,
             build_turn: 0,
         };
         let mut next = Vec::new();
         for state in states {
             // 施設を使わない案も、他施設の高価なcounterへ資金を残す合法手として比較する。
             next.push(state.clone());
-            for option_index in &option_indices {
+            for option_index in option_indices {
                 let option = &input.production_options[*option_index];
                 if option
                     .capture_target
@@ -902,6 +1150,35 @@ fn plan_current_property_control_exact(
             }
         }
         states = next;
+    }
+
+    // 通常の物件マップでは、少なくとも二つの異なる物件へ向かう占領役を作戦の
+    // 下限にする。到達可能な物件または生産枠が二つ未満ならこの下限を課さないため、
+    // 占領不能・到達不能の特殊マップをマップ名で例外扱いしない。
+    let capture_targets = states
+        .iter()
+        .flat_map(|state| state.used_capture_targets.iter().copied())
+        .collect::<HashSet<_>>();
+    let available_slots = states
+        .iter()
+        .map(|state| state.used_slots.len())
+        .max()
+        .unwrap_or_default();
+    let role_floor = (input.current_turn == 1
+        && capture_targets.len() >= 2
+        && available_slots >= 2
+        && states
+            .iter()
+            .any(|state| state.used_capture_targets.len() >= 2))
+    .then_some(2_usize);
+    if let Some(required) = role_floor {
+        states.retain(|state| state.used_capture_targets.len() >= required);
+    }
+    // 初手では、空いている工場で残額以内の合法なunitを購入できるなら、資金を翌手番へ
+    // 繰り越す案を比較しない。途中状態の空き枠は高額案の組合せに必要なので、最終候補だけ
+    // を除外する。資金不足または占領先の重複で購入不能な枠はそのまま残す。
+    if input.current_turn == 1 {
+        states.retain(|state| opening_package_spends_all_usable_funds(input, state, &facilities));
     }
 
     let considered = states.len();
@@ -1107,9 +1384,32 @@ fn plan_current_property_control_exact(
     }
     let mut selected = selected?;
     selected.candidates_considered = considered;
-    selected.candidates_pruned = 0;
+    selected.candidates_pruned = candidates_pruned;
     selected.search_truncated = false;
     Some(selected)
+}
+
+/// 初手の最終編成が、残額で合法に追加できる生産枠を放置していないか判定する。
+fn opening_package_spends_all_usable_funds(
+    input: &RollingPlanInput,
+    state: &SearchState,
+    facilities: &[(GridPosition, Vec<usize>)],
+) -> bool {
+    let remaining_funds = input.current_funds.saturating_sub(state.cost);
+    !facilities.iter().any(|(facility, option_indices)| {
+        let slot = ProductionSlot {
+            facility: *facility,
+            build_turn: 0,
+        };
+        !state.used_slots.contains(&slot)
+            && option_indices.iter().any(|option_index| {
+                let option = &input.production_options[*option_index];
+                option.purchase.cost <= remaining_funds
+                    && option
+                        .capture_target
+                        .is_none_or(|target| !state.used_capture_targets.contains(&target))
+            })
+    })
 }
 
 /// 物件契約の辞書順比較。固定評価点や兵種名を使わない。
@@ -2581,6 +2881,7 @@ mod tests {
             map: Arc::new(map),
             master_data: Arc::new(MasterDataRegistry::load().unwrap()),
             damage_chart: Arc::new(chart),
+            current_turn: 1,
             existing_units: Vec::new(),
             protected_units: Vec::new(),
             enemies: vec![EnemyPlanUnit {
@@ -3481,6 +3782,49 @@ mod tests {
             &input,
             &fast_arrival,
             &slow_stronger
+        ));
+    }
+
+    #[test]
+    fn opening_package_rejects_an_affordable_idle_factory() {
+        let input = input();
+        let first_facility = GridPosition { x: 0, y: 0 };
+        let second_facility = GridPosition { x: 1, y: 0 };
+        let facilities = vec![(first_facility, vec![0]), (second_facility, vec![1])];
+        let first_only = SearchState {
+            option_indices: vec![0],
+            used_slots: HashSet::from([ProductionSlot {
+                facility: first_facility,
+                build_turn: 0,
+            }]),
+            used_capture_targets: HashSet::new(),
+            cost: 7_500,
+        };
+        let both_facilities = SearchState {
+            option_indices: vec![0, 1],
+            used_slots: HashSet::from([
+                ProductionSlot {
+                    facility: first_facility,
+                    build_turn: 0,
+                },
+                ProductionSlot {
+                    facility: second_facility,
+                    build_turn: 0,
+                },
+            ]),
+            used_capture_targets: HashSet::new(),
+            cost: 27_500,
+        };
+
+        assert!(!opening_package_spends_all_usable_funds(
+            &input,
+            &first_only,
+            &facilities
+        ));
+        assert!(opening_package_spends_all_usable_funds(
+            &input,
+            &both_facilities,
+            &facilities
         ));
     }
 
