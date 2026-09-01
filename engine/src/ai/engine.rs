@@ -2765,6 +2765,8 @@ fn decide_ai_action_v2_for_entities(
                     )
                     .can_wait
         });
+        let indirect_must_vacate_production_site =
+            stats.min_range > 1 && starts_on_owned_production_site && can_end_turn_off_production;
 
         // 回復中のDAG Entityへ古いSquad目標を渡すと、修理ではなく横の拠点へ戻る。
         // 所属はDAG Registryに残したまま、ここだけ通常の回復探索を使う。
@@ -3337,7 +3339,7 @@ fn decide_ai_action_v2_for_entities(
             }
 
             // (B) Attack
-            if !actions.attackable_targets.is_empty() {
+            if !indirect_must_vacate_production_site && !actions.attackable_targets.is_empty() {
                 for target_entity in actions.attackable_targets.iter().copied() {
                     if campaign_context.as_ref().is_some_and(|context| {
                         let target_position = world.get::<GridPosition>(target_entity).copied();
@@ -4456,11 +4458,22 @@ mod tests {
         let mut world = setup_v3_test_world(3, crate::ai::ai_version::AiVersion::V4);
         world.insert_resource(Map {
             width: 3,
-            height: 1,
-            tiles: vec![Terrain::Plains, Terrain::Factory, Terrain::Plains],
+            height: 2,
+            tiles: vec![
+                Terrain::Plains,
+                Terrain::Factory,
+                Terrain::Plains,
+                Terrain::Capital,
+                Terrain::Plains,
+                Terrain::Plains,
+            ],
             topology: crate::resources::GridTopology::Square,
         });
         world.insert_resource(DamageChart::new());
+        world.spawn((
+            GridPosition { x: 0, y: 1 },
+            Property::new(Terrain::Capital, Some(player), 100),
+        ));
         world.spawn((
             GridPosition { x: 1, y: 0 },
             Property::new(Terrain::Factory, Some(player), 100),
@@ -4506,6 +4519,91 @@ mod tests {
             GridPosition { x: 1, y: 0 },
             "回復開始より次手番の生産slotを優先し、工場外で行動終了する"
         );
+    }
+
+    #[test]
+    fn indirect_unit_vacates_factory_instead_of_firing_from_it() {
+        let player = PlayerId(1);
+        let enemy = PlayerId(2);
+        let mut world = setup_v3_test_world(5, crate::ai::ai_version::AiVersion::V4);
+        world.insert_resource(Map {
+            width: 5,
+            height: 2,
+            tiles: vec![
+                Terrain::Plains,
+                Terrain::Factory,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Capital,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+            ],
+            topology: crate::resources::GridTopology::Square,
+        });
+        world.insert_resource(DamageChart::new());
+        world.spawn((
+            GridPosition { x: 0, y: 1 },
+            Property::new(Terrain::Capital, Some(player), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Property::new(Terrain::Factory, Some(player), 100),
+        ));
+        let artillery = world
+            .resource::<MasterDataRegistry>()
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::LightSpGun.as_str().to_owned(),
+            ))
+            .unwrap();
+        let unit = world
+            .spawn((
+                Faction(player),
+                HasMoved(false),
+                ActionCompleted(false),
+                GridPosition { x: 1, y: 0 },
+                artillery.clone(),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                crate::components::Ammo {
+                    ammo1: artillery.max_ammo1,
+                    max_ammo1: artillery.max_ammo1,
+                    ammo2: artillery.max_ammo2,
+                    max_ammo2: artillery.max_ammo2,
+                },
+                crate::components::Fuel {
+                    current: artillery.max_fuel,
+                    max: artillery.max_fuel,
+                },
+            ))
+            .id();
+        let infantry = world
+            .resource::<MasterDataRegistry>()
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::Infantry.as_str().to_owned(),
+            ))
+            .unwrap();
+        world.spawn((
+            Faction(enemy),
+            GridPosition { x: 4, y: 0 },
+            infantry,
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ));
+
+        let (entity, command) =
+            decide_ai_action_v2(&mut world, player, &HashSet::new()).expect("行動を選ぶこと");
+        assert_eq!(entity, unit);
+        let AiCommand::Wait { target_pos } = command else {
+            panic!("間接unitは生産地点から攻撃せず、退避すること");
+        };
+        assert_ne!(target_pos, GridPosition { x: 1, y: 0 });
     }
 
     #[test]

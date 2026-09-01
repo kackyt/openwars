@@ -185,6 +185,8 @@ struct ActionRangeCacheKey {
     min_range: u32,
     max_range: u32,
     player_id: PlayerId,
+    /// 生産枠を空けるため、始点を射撃地点として使えないか。
+    must_leave_start: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -470,6 +472,73 @@ pub fn calculate_action_distance_to_range(
     player_id: PlayerId,
     cache: &mut ActionTurnDistanceCache,
 ) -> Option<ActionTurnDistance> {
+    calculate_action_distance_to_range_with_origin_policy(
+        map,
+        registry,
+        unit_positions,
+        start,
+        target,
+        movement_type,
+        max_mp,
+        max_fuel,
+        interaction_min_range,
+        interaction_max_range,
+        player_id,
+        false,
+        cache,
+    )
+}
+
+/// 生産施設から生まれた間接攻撃unitが、次手番の生産口を譲るために一度退避してから
+/// 射撃可能になるまでの最短行動ターンを返す。
+#[allow(clippy::too_many_arguments)]
+pub fn calculate_action_distance_to_range_after_leaving_start(
+    map: &Map,
+    registry: &MasterDataRegistry,
+    unit_positions: &HashMap<(usize, usize), OccupantInfo>,
+    start: (usize, usize),
+    target: (usize, usize),
+    movement_type: MovementType,
+    max_mp: u32,
+    max_fuel: u32,
+    interaction_min_range: u32,
+    interaction_max_range: u32,
+    player_id: PlayerId,
+    cache: &mut ActionTurnDistanceCache,
+) -> Option<ActionTurnDistance> {
+    calculate_action_distance_to_range_with_origin_policy(
+        map,
+        registry,
+        unit_positions,
+        start,
+        target,
+        movement_type,
+        max_mp,
+        max_fuel,
+        interaction_min_range,
+        interaction_max_range,
+        player_id,
+        true,
+        cache,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn calculate_action_distance_to_range_with_origin_policy(
+    map: &Map,
+    registry: &MasterDataRegistry,
+    unit_positions: &HashMap<(usize, usize), OccupantInfo>,
+    start: (usize, usize),
+    target: (usize, usize),
+    movement_type: MovementType,
+    max_mp: u32,
+    max_fuel: u32,
+    interaction_min_range: u32,
+    interaction_max_range: u32,
+    player_id: PlayerId,
+    must_leave_start: bool,
+    cache: &mut ActionTurnDistanceCache,
+) -> Option<ActionTurnDistance> {
     let cache_key = ActionRangeCacheKey {
         start,
         target,
@@ -479,6 +548,7 @@ pub fn calculate_action_distance_to_range(
         min_range: interaction_min_range,
         max_range: interaction_max_range,
         player_id,
+        must_leave_start,
     };
     if let Some(cached) = cache.cache.get(&cache_key) {
         return *cached;
@@ -524,7 +594,7 @@ pub fn calculate_action_distance_to_range(
         }
     }
 
-    if firing_positions.contains(&start) {
+    if firing_positions.contains(&start) && !must_leave_start {
         let result = Some(ActionTurnDistance {
             turns: 0,
             used_mp: 0,
@@ -646,6 +716,9 @@ pub fn calculate_action_distance_to_range(
     };
     let mut best_result: Option<ActionTurnDistance> = None;
     for firing_position in firing_positions {
+        if must_leave_start && firing_position == start {
+            continue;
+        }
         if let Some((turns, _, total_mp, used_fuel)) = best_by_position.get(&firing_position) {
             let firing_distance =
                 map.distance(firing_position.0, firing_position.1, target.0, target.1);
@@ -1239,6 +1312,38 @@ mod tests {
 
         assert_eq!(distance.turns, 2);
         assert_eq!(distance.used_fuel, 1);
+    }
+
+    #[test]
+    fn action_distance_after_leaving_start_counts_factory_vacation_setup_turn() {
+        let map = Map::new(
+            5,
+            2,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        let registry = MasterDataRegistry::load().unwrap_or_default();
+        let mut cache = ActionTurnDistanceCache::default();
+
+        let distance = calculate_action_distance_to_range_after_leaving_start(
+            &map,
+            &registry,
+            &HashMap::new(),
+            (0, 0),
+            (3, 0),
+            MovementType::Tank,
+            1,
+            1,
+            1,
+            3,
+            PlayerId(1),
+            &mut cache,
+        )
+        .expect("生産地点の外にも合法な射撃地点がある");
+
+        assert!(distance.requires_movement);
+        assert_ne!(distance.firing_position, GridPosition { x: 0, y: 0 });
+        assert_eq!(distance.turns, 2);
     }
 
     #[test]

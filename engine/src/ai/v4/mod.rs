@@ -48,6 +48,7 @@ use trace::{
 use crate::ai::squad::{MissionType, SquadId};
 use crate::ai::turn_distance::{
     ActionTurnDistanceCache, TerrainConnectivity, calculate_action_distance_to_range,
+    calculate_action_distance_to_range_after_leaving_start,
 };
 use crate::components::{
     CargoCapacity, Faction, GridPosition, Health, PlayerId, Property, Transporting, UnitStats,
@@ -1762,6 +1763,8 @@ struct BoardScan {
     master_data: Arc<MasterDataRegistry>,
     damage_chart: Arc<DamageChart>,
     funds: u32,
+    /// 砲台の首都側防衛可否を、作戦名でなく実座標から判定する。
+    capital_position: Option<GridPosition>,
     /// 生産可能な施設（未占有・生産範囲内・クールダウン対象外）
     free_facilities: Vec<(GridPosition, Terrain)>,
     /// 次ターン以降に空くことを見込める、生産範囲内の全所有施設。
@@ -5552,6 +5555,7 @@ impl BoardScan {
             master_data,
             damage_chart,
             funds,
+            capital_position: capital_pos,
             free_facilities: facilities,
             production_facilities,
             available_types,
@@ -8671,7 +8675,29 @@ fn combat_plan_input(
                     {
                         return None;
                     }
-                    if let Some(capture_target) = option.capture_target {
+                    let has_only_one_move_of_fuel = option.stats.min_range > 1
+                        && option.stats.max_fuel > 0
+                        && option.stats.max_fuel <= 1;
+                    let has_spare_production_capacity = scan.free_facilities.len() > 1;
+                    let capital_side_defense = op.kind == OperationKind::Defense
+                        && scan.capital_position.is_some_and(|capital| {
+                            scan.map
+                                .distance(capital.x, capital.y, op.anchor.x, op.anchor.y)
+                                <= option.stats.max_range
+                        });
+                    if has_only_one_move_of_fuel
+                        && !capital_side_defense
+                        && !has_spare_production_capacity
+                    {
+                        // 燃料が一マス分しかない砲台は、前線へ展開しても再配置できない。
+                        // 首都側の防衛でない限り、唯一の生産口を長期占有する案は候補に
+                        // しない。兵種名や攻撃力ではなく、マスターデータ上の燃料と実際の
+                        // 空き生産slotだけから判定する。
+                        return None;
+                    }
+                    if option.stats.min_range <= 1
+                        && let Some(capture_target) = option.capture_target
+                    {
                         if option.capture_blocking_enemy_index != Some(enemy_index) {
                             return None;
                         }
@@ -8696,10 +8722,11 @@ fn combat_plan_input(
                             player_id,
                         );
                     }
-                    if let Some(control) = op
-                        .property_controls
-                        .iter()
-                        .find(|control| enemy.entity == Some(control.enemy_entity))
+                    if option.stats.min_range <= 1
+                        && let Some(control) = op
+                            .property_controls
+                            .iter()
+                            .find(|control| enemy.entity == Some(control.enemy_entity))
                         && let Some(observed_enemy) = scan
                             .enemy_units
                             .iter()
@@ -8729,20 +8756,40 @@ fn combat_plan_input(
                     projected_target_cells[enemy_index]
                         .iter()
                         .filter_map(|target| {
-                            let distance = calculate_action_distance_to_range(
-                                &scan.map,
-                                &scan.master_data,
-                                &projected_occupancies[enemy_index],
-                                (option.purchase.facility.x, option.purchase.facility.y),
-                                (target.x, target.y),
-                                option.stats.movement_type,
-                                option.stats.max_movement,
-                                effective_fuel,
-                                option.stats.min_range,
-                                option.stats.max_range,
-                                player_id,
-                                &mut projected_action_caches[enemy_index],
-                            )?;
+                            let distance = if option.stats.min_range > 1 {
+                                // 間接unitは生産口の上から即射撃できても、その一手で次手番の
+                                // 生産枠を失う。退避してから射撃可能になるETAだけを戦力として
+                                // 数え、砲台を含めた高火力の見かけ上の即応性を使わない。
+                                calculate_action_distance_to_range_after_leaving_start(
+                                    &scan.map,
+                                    &scan.master_data,
+                                    &projected_occupancies[enemy_index],
+                                    (option.purchase.facility.x, option.purchase.facility.y),
+                                    (target.x, target.y),
+                                    option.stats.movement_type,
+                                    option.stats.max_movement,
+                                    effective_fuel,
+                                    option.stats.min_range,
+                                    option.stats.max_range,
+                                    player_id,
+                                    &mut projected_action_caches[enemy_index],
+                                )?
+                            } else {
+                                calculate_action_distance_to_range(
+                                    &scan.map,
+                                    &scan.master_data,
+                                    &projected_occupancies[enemy_index],
+                                    (option.purchase.facility.x, option.purchase.facility.y),
+                                    (target.x, target.y),
+                                    option.stats.movement_type,
+                                    option.stats.max_movement,
+                                    effective_fuel,
+                                    option.stats.min_range,
+                                    option.stats.max_range,
+                                    player_id,
+                                    &mut projected_action_caches[enemy_index],
+                                )?
+                            };
                             Some((
                                 property_control::produced_action_offset(
                                     option.purchase.build_turn,
@@ -9192,9 +9239,11 @@ fn select_property_capture_candidate(
     remaining_funds: u32,
     player_id: PlayerId,
 ) -> Option<SlotCandidate> {
+    // 占領完了時刻・敵反撃・費用・施設位置を混同しない比較キー。
+    type CaptureCandidateKey = (u32, u32, u32, u32, usize, usize);
     let target = next_capture_target(op);
     let durability = property_durability(scan, &target);
-    let mut best: Option<((u32, u32, u32, u32, usize, usize), SlotCandidate)> = None;
+    let mut best: Option<(CaptureCandidateKey, SlotCandidate)> = None;
 
     for (facility, terrain) in &scan.free_facilities {
         if used_facilities.contains(facility) {
@@ -11918,6 +11967,7 @@ mod tests {
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: damage_chart.into(),
             funds: 20_000,
+            capital_position: None,
             free_facilities: vec![(pos(0, 1), Terrain::Factory), (pos(1, 1), Terrain::Airport)],
             production_facilities: vec![
                 (pos(0, 1), Terrain::Factory),
@@ -12611,6 +12661,7 @@ mod tests {
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: damage_chart.into(),
             funds: 22_500,
+            capital_position: None,
             free_facilities: vec![
                 (pos(0, 1), Terrain::Factory),
                 (pos(1, 0), Terrain::Airport),
@@ -12749,6 +12800,7 @@ mod tests {
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: DamageChart::new().into(),
             funds: 20000,
+            capital_position: None,
             free_facilities: vec![(pos(1, 1), Terrain::Port)],
             production_facilities: vec![(pos(1, 1), Terrain::Port)],
             available_types: vec![
@@ -12929,6 +12981,7 @@ mod tests {
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: DamageChart::new().into(),
             funds: 20000,
+            capital_position: None,
             free_facilities: vec![
                 (pos(1, 1), Terrain::Factory),
                 (pos(1, 2), Terrain::Factory),
@@ -12984,6 +13037,7 @@ mod tests {
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: damage_chart.into(),
             funds: 17000,
+            capital_position: None,
             free_facilities: vec![
                 (pos(1, 0), Terrain::Factory),
                 (pos(1, 1), Terrain::Factory),
@@ -13075,6 +13129,7 @@ mod tests {
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: damage_chart.into(),
             funds: 20_000,
+            capital_position: None,
             free_facilities: vec![(pos(1, 1), Terrain::Factory), (pos(2, 1), Terrain::Airport)],
             production_facilities: vec![
                 (pos(1, 1), Terrain::Factory),
@@ -13155,6 +13210,7 @@ mod tests {
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: damage_chart.into(),
             funds: 20_000,
+            capital_position: None,
             free_facilities: vec![(pos(1, 1), Terrain::Factory), (pos(2, 1), Terrain::Airport)],
             production_facilities: vec![
                 (pos(1, 1), Terrain::Factory),
@@ -13314,6 +13370,7 @@ mod tests {
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: damage_chart.into(),
             funds: 10_000,
+            capital_position: None,
             free_facilities: vec![(pos(1, 1), Terrain::Factory)],
             production_facilities: vec![(pos(1, 1), Terrain::Factory)],
             available_types: vec![
