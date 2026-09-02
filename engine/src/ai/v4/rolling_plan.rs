@@ -285,6 +285,51 @@ impl ForcePackagePlan {
             .sum()
     }
 
+    fn has_indirect_purchase(&self, input: &RollingPlanInput) -> bool {
+        self.purchases.iter().any(|purchase| {
+            input
+                .production_options
+                .iter()
+                .find(|option| option.purchase == *purchase)
+                .is_some_and(|option| option.stats.min_range > 1)
+        })
+    }
+
+    /// 間接部隊が、同じ局地目標を担当する直接部隊の外側から射点を増やせるか。
+    ///
+    /// 戦力額の総和ではなく、各候補の実際の射点・到達turn・担当敵だけを見る。
+    /// したがって、歩兵・装甲車・戦車のどれがscreenを担うかは相性シミュレーションに
+    /// 任せ、砲撃役だけが直接部隊の任務を置き換える案を避けられる。
+    fn indirect_fire_has_local_support(&self, input: &RollingPlanInput) -> bool {
+        self.purchases.iter().all(|purchase| {
+            let Some(option_index) = input
+                .production_options
+                .iter()
+                .position(|option| option.purchase == *purchase)
+            else {
+                return true;
+            };
+            let option = &input.production_options[option_index];
+            if option.stats.min_range <= 1 {
+                return true;
+            }
+            input
+                .production_attack_projections
+                .get(option_index)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .filter_map(|(enemy_index, projection)| {
+                    (*projection).map(|edge| (enemy_index, edge))
+                })
+                // 工場上から撃ち続ける砲は、次手番の生産枠を失うため前線の火力枠にはしない。
+                .filter(|(_, edge)| edge.firing_position != option.purchase.facility)
+                .any(|(enemy_index, edge)| {
+                    direct_fire_saturates_target(input, self, enemy_index, edge.ready_turn)
+                })
+        })
+    }
+
     fn interdiction_first_attack_turn(&self) -> Option<u32> {
         self.deadline_target_first_attack_turn
             .or(self.first_attack_turn)
@@ -1385,20 +1430,187 @@ fn plan_current_property_control_exact(
             }
         }
     }
-    let mut selected: Option<ForcePackagePlan> = None;
-    for candidate in evaluated {
-        if selected
-            .as_ref()
-            .is_none_or(|current| exact_property_plan_better(input, &candidate, current))
-        {
-            selected = Some(candidate);
-        }
+    // まず直接部隊だけで、物件・突破・生産口を守る最良案をシミュレーションから選ぶ。
+    // 間接部隊はこの基準案を悪化させず、実際に残敵を減らせる時だけ後から置き換える。
+    // これにより密度や総額を入口条件にして、砲撃だけで直接部隊の任務を上書きしない。
+    let mut selected = select_best_property_plan(
+        input,
+        evaluated
+            .iter()
+            .filter(|plan| !plan.has_indirect_purchase(input)),
+    )
+    .or_else(|| select_best_property_plan(input, evaluated.iter()))?;
+    if let Some(indirect_upgrade) = select_best_indirect_upgrade(
+        input,
+        evaluated.iter().filter(|candidate| {
+            candidate.has_indirect_purchase(input)
+                && indirect_upgrade_preserves_direct_plan(input, candidate, &selected)
+        }),
+    ) {
+        selected = indirect_upgrade;
     }
-    let mut selected = selected?;
     selected.candidates_considered = considered;
     selected.candidates_pruned = candidates_pruned;
     selected.search_truncated = false;
     Some(selected)
+}
+
+/// 既にシミュレーション済みの候補から、物件計画の通常比較で最良の一案を選ぶ。
+fn select_best_property_plan<'a>(
+    input: &RollingPlanInput,
+    candidates: impl Iterator<Item = &'a ForcePackagePlan>,
+) -> Option<ForcePackagePlan> {
+    candidates.cloned().reduce(|selected, candidate| {
+        exact_property_plan_better(input, &candidate, &selected)
+            .then_some(candidate)
+            .unwrap_or(selected)
+    })
+}
+
+/// 直接案を壊さない間接案の中から、シミュレーション比較で最良の一案を選ぶ。
+/// 同値の場合だけ、実際に直接射点が密な側を優先する。密度だけで候補を捨てない。
+fn select_best_indirect_upgrade<'a>(
+    input: &RollingPlanInput,
+    candidates: impl Iterator<Item = &'a ForcePackagePlan>,
+) -> Option<ForcePackagePlan> {
+    candidates.cloned().reduce(|selected, candidate| {
+        if exact_property_plan_better(input, &candidate, &selected) {
+            candidate
+        } else if exact_property_plan_better(input, &selected, &candidate) {
+            selected
+        } else if candidate.indirect_fire_has_local_support(input)
+            && !selected.indirect_fire_has_local_support(input)
+        {
+            candidate
+        } else {
+            selected
+        }
+    })
+}
+
+/// 間接部隊を足した案が、直接部隊だけの基準作戦を崩していないか。
+///
+/// 物件契約、突破口、生産口、占領役の生存を一つでも悪化させる案は火力が高くても
+/// 採らない。全て維持した上で敵残存価値か損耗を実シミュレーションで改善した時だけ、
+/// 間接部隊を直接案の上位互換として扱う。
+fn indirect_upgrade_preserves_direct_plan(
+    input: &RollingPlanInput,
+    candidate: &ForcePackagePlan,
+    direct_plan: &ForcePackagePlan,
+) -> bool {
+    let (candidate_capture_count, candidate_direct_count) =
+        current_direct_role_counts(input, candidate);
+    let (direct_capture_count, direct_direct_count) =
+        current_direct_role_counts(input, direct_plan);
+    candidate.cleared_capture_lane_count() >= direct_plan.cleared_capture_lane_count()
+        && candidate_capture_count >= direct_capture_count
+        && candidate_direct_count >= direct_direct_count
+        && candidate.property_contract_completion_profile()
+            <= direct_plan.property_contract_completion_profile()
+        && candidate.deadline_capture_survivor_count >= direct_plan.deadline_capture_survivor_count
+        && candidate.capture_completion_profile() <= direct_plan.capture_completion_profile()
+        && candidate.front_breakthrough_rank() <= direct_plan.front_breakthrough_rank()
+        && candidate.blocked_next_turn_production_slots
+            <= direct_plan.blocked_next_turn_production_slots
+        && (candidate.remaining_enemy_value(input) < direct_plan.remaining_enemy_value(input)
+            || candidate.expected_loss < direct_plan.expected_loss)
+}
+
+/// 今手番に発注する占領役と、占領を担当しない直接戦闘役の本数。
+/// 間接部隊はこの二つを置換できないため、直接案に砲を加える比較の下限にする。
+fn current_direct_role_counts(input: &RollingPlanInput, plan: &ForcePackagePlan) -> (usize, usize) {
+    plan.current_purchases()
+        .fold((0, 0), |(capture, direct), purchase| {
+            let Some(option) = input
+                .production_options
+                .iter()
+                .find(|option| option.purchase == purchase)
+            else {
+                return (capture, direct);
+            };
+            if option.capture_target.is_some() {
+                (capture.saturating_add(1), direct)
+            } else if option.stats.min_range <= 1 {
+                (capture, direct.saturating_add(1))
+            } else {
+                (capture, direct)
+            }
+        })
+}
+
+/// 同じ敵へ向かう直接部隊の射点が飽和し、間接部隊が工場外から別の攻撃地点を
+/// 足せるかを判定する。
+///
+/// 戦力額や兵種ごとの固定点は使わない。既存・今回生産の直接部隊が、間接部隊の
+/// 初撃までに実際に立てる射点だけを数える。隣接射点をすべて直接部隊で埋める必要は
+/// なく、「空きが一つ以下」なら新たな直接部隊より外側から撃つ間接火力の限界効用が
+/// 高い、とゲーム上の攻撃地点の数から判断する。
+fn direct_fire_saturates_target(
+    input: &RollingPlanInput,
+    plan: &ForcePackagePlan,
+    enemy_index: usize,
+    indirect_ready_turn: u32,
+) -> bool {
+    let Some(enemy) = input.enemies.get(enemy_index) else {
+        return false;
+    };
+    let target = enemy.position;
+    let adjacent_capacity = input.map.get_adjacent(target.x, target.y).len();
+    if adjacent_capacity == 0 {
+        return false;
+    }
+
+    let mut direct_positions = input
+        .existing_units
+        .iter()
+        .filter(|unit| {
+            unit.stats.min_range <= 1
+                && unit.available_turn <= indirect_ready_turn
+                && unit.engageable_enemy_indices.contains(&enemy_index)
+        })
+        .map(|unit| unit.position)
+        .filter(|position| {
+            input
+                .map
+                .distance(position.x, position.y, target.x, target.y)
+                <= 1
+        })
+        .collect::<HashSet<_>>();
+
+    for purchase in &plan.purchases {
+        let Some(option_index) = input
+            .production_options
+            .iter()
+            .position(|option| option.purchase == *purchase)
+        else {
+            continue;
+        };
+        let option = &input.production_options[option_index];
+        // 占領役も、物件を塞ぐ敵へ攻撃する間は直接射点を一つ使う。占領契約だからと
+        // 数から外すと、中央で実際に起きている渋滞を見落として砲撃が遅くなる。
+        if option.stats.min_range > 1 {
+            continue;
+        }
+        let Some(projection) = input
+            .production_attack_projections
+            .get(option_index)
+            .and_then(|projections| projections.get(enemy_index))
+            .and_then(|projection| *projection)
+        else {
+            continue;
+        };
+        if input.map.distance(
+            projection.firing_position.x,
+            projection.firing_position.y,
+            target.x,
+            target.y,
+        ) <= 1
+        {
+            direct_positions.insert(projection.firing_position);
+        }
+    }
+
+    direct_positions.len().saturating_add(1) >= adjacent_capacity
 }
 
 /// 小規模開幕専用の制約を適用する条件を一箇所に固定する。
@@ -1471,29 +1683,33 @@ fn exact_property_plan_better(
         return (
             std::cmp::Reverse(candidate.cleared_capture_lane_count()),
             candidate.property_contract_completion_profile(),
-            candidate.front_breakthrough_rank(),
-            candidate.remaining_enemy_value(input),
-            candidate.blocked_next_turn_production_slots,
-            candidate.expected_loss,
-            std::cmp::Reverse(candidate.surviving_combat_value),
-            candidate.target_destruction_profile(),
-            std::cmp::Reverse(candidate.deadline_capture_survivor_count),
-            candidate.capture_completion_profile(),
-            candidate.remaining_hp(),
-            candidate.production_cost,
+            (
+                candidate.front_breakthrough_rank(),
+                candidate.remaining_enemy_value(input),
+                candidate.blocked_next_turn_production_slots,
+                candidate.expected_loss,
+                std::cmp::Reverse(candidate.surviving_combat_value),
+                candidate.target_destruction_profile(),
+                std::cmp::Reverse(candidate.deadline_capture_survivor_count),
+                candidate.capture_completion_profile(),
+                candidate.remaining_hp(),
+                candidate.production_cost,
+            ),
         ) < (
             std::cmp::Reverse(current.cleared_capture_lane_count()),
             current.property_contract_completion_profile(),
-            current.front_breakthrough_rank(),
-            current.remaining_enemy_value(input),
-            current.blocked_next_turn_production_slots,
-            current.expected_loss,
-            std::cmp::Reverse(current.surviving_combat_value),
-            current.target_destruction_profile(),
-            std::cmp::Reverse(current.deadline_capture_survivor_count),
-            current.capture_completion_profile(),
-            current.remaining_hp(),
-            current.production_cost,
+            (
+                current.front_breakthrough_rank(),
+                current.remaining_enemy_value(input),
+                current.blocked_next_turn_production_slots,
+                current.expected_loss,
+                std::cmp::Reverse(current.surviving_combat_value),
+                current.target_destruction_profile(),
+                std::cmp::Reverse(current.deadline_capture_survivor_count),
+                current.capture_completion_profile(),
+                current.remaining_hp(),
+                current.production_cost,
+            ),
         );
     }
 
@@ -2967,6 +3183,64 @@ mod tests {
         assert_eq!(plan.purchases.len(), 1);
         assert_eq!(plan.purchases[0].unit_type, UnitType::Bomber);
         assert_eq!(plan.elimination_turn, Some(2));
+    }
+
+    #[test]
+    fn indirect_fire_requires_an_off_factory_shot_after_direct_fire_saturates_the_target() {
+        let mut input = input();
+        // 中央の同じ敵へ直接部隊が二体集まり、一体分が余っているとする。ここでは、
+        // 工場外から撃てる間接部隊が直接部隊の担当を置き換えず火力を増やせる。
+        input.existing_units.push(FriendlyPlanUnit {
+            stats: stats(UnitType::Bcopters, 7_500, 6),
+            position: GridPosition { x: 7, y: 0 },
+            hp: 100,
+            available_turn: 0,
+            engageable_enemy_indices: vec![0],
+            protection_completion_turn: None,
+        });
+        input.existing_units.push(FriendlyPlanUnit {
+            stats: stats(UnitType::Bcopters, 7_500, 6),
+            position: GridPosition { x: 9, y: 0 },
+            hp: 100,
+            available_turn: 0,
+            engageable_enemy_indices: vec![0],
+            protection_completion_turn: None,
+        });
+        let indirect = ProductionPlanOption {
+            purchase: PlannedPurchase {
+                facility: GridPosition { x: 1, y: 0 },
+                unit_type: UnitType::Rockets,
+                build_turn: 0,
+                cost: 6_000,
+            },
+            stats: stats(UnitType::Rockets, 6_000, 5),
+            engageable_enemy_indices: vec![0],
+            capture_target: None,
+            capture_arrival_turn: None,
+            capture_completion_turn: None,
+            capture_durability: None,
+            capture_blocking_enemy_index: None,
+        };
+        input.production_options.push(indirect.clone());
+        input.production_attack_projections = vec![
+            vec![None],
+            vec![None],
+            vec![Some(ProductionAttackProjection {
+                ready_turn: 2,
+                firing_position: GridPosition { x: 6, y: 0 },
+                requires_movement: true,
+            })],
+        ];
+        let mut plan = plan_force_package(&input).expect("a plan");
+        plan.purchases = vec![indirect.purchase];
+
+        assert!(plan.indirect_fire_has_local_support(&input));
+
+        input.production_attack_projections[2][0]
+            .as_mut()
+            .expect("projection")
+            .firing_position = indirect.purchase.facility;
+        assert!(!plan.indirect_fire_has_local_support(&input));
     }
 
     #[test]
