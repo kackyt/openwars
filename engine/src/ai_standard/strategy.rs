@@ -1,16 +1,18 @@
 #![allow(clippy::too_many_arguments)]
 
-use crate::ai::demand::{
+use crate::ai_standard::demand::{
     AirDefenseAssessment, CombatCapabilitySnapshot, DemandMatrix, assess_air_defense,
     average_attack_expectation, compute_demand, compute_unit_affinity,
 };
-use crate::ai::island_campaign::{
+use crate::ai_standard::island_campaign::{
     IslandCampaignDiagnostics, IslandCampaignPortfolio, IslandCampaignShortfall,
 };
-use crate::ai::island_campaign_analysis::{
+use crate::ai_standard::island_campaign_analysis::{
     analyze_island_campaign, analyze_island_campaign_excluding,
 };
-use crate::ai::turn_distance::{TerrainConnectivity, TurnDistanceCache, calculate_turn_distance};
+use crate::ai_standard::turn_distance::{
+    TerrainConnectivity, TurnDistanceCache, calculate_turn_distance,
+};
 use crate::components::{
     ActionCompleted, Ammo, Faction, Fuel, GridPosition, Health, PlayerId, Property, UnitStats,
 };
@@ -201,7 +203,7 @@ pub(crate) fn analyze_strategy_for_turn(
     player_id: PlayerId,
 ) -> ProductionStrategy {
     let cached_campaign = world
-        .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+        .get_resource::<crate::ai_standard::engine::AiTurnStrategyCache>()
         .and_then(|cache| cache.campaign_portfolio(player_id))
         .cloned();
     analyze_strategy_internal(world, player_id, cached_campaign, &HashSet::new())
@@ -227,9 +229,7 @@ fn analyze_strategy_internal(
             crate::resources::master_data::MasterDataRegistry::load().unwrap_or_default()
         });
     let map = world.resource::<crate::resources::Map>().clone();
-    let ai_version = crate::ai::resolve_player_ai_version(world, player_id);
-    let is_v3 = ai_version.uses_v3_tactics();
-    let is_v4 = ai_version.uses_operation_driven_production();
+    let is_v3 = crate::ai_standard::resolve_player_ai_version(world, player_id).uses_v3_tactics();
     if is_v3 {
         if let Some(cached) = cached_campaign {
             strategy.campaign_portfolio = cached;
@@ -240,15 +240,6 @@ fn analyze_strategy_internal(
             } else {
                 analyze_island_campaign_excluding(world, player_id, reserved_entities)
             };
-            if is_v4 {
-                // 小規模/通常の分岐はここで持たず、ターン入口で確定したパイプラインへ
-                // portfolioを渡す。各層が別々に小規模作戦を有効化しないための境界である。
-                crate::ai::v4::strategy_pipeline::prepare_strategy(
-                    world,
-                    player_id,
-                    &mut strategy.campaign_portfolio,
-                );
-            }
             // 診断Resourceは意思決定に戻さず、最後の分析結果だけをプレイヤー別に上書きする。
             if let Some(mut diagnostics) = world.get_resource_mut::<IslandCampaignDiagnostics>() {
                 diagnostics
@@ -279,13 +270,14 @@ fn analyze_strategy_internal(
         );
     }
     let island_map = world
-        .get_resource::<crate::ai::islands::IslandMap>()
+        .get_resource::<crate::ai_standard::islands::IslandMap>()
         .cloned()
-        .unwrap_or_else(|| crate::ai::islands::IslandMap::analyze(&map));
+        .unwrap_or_else(|| crate::ai_standard::islands::IslandMap::analyze(&map));
 
     let mut allowed_islands = std::collections::HashMap::new();
     for island in &island_map.islands {
-        let allowed = crate::ai::planner::is_invasion_allowed(world, player_id, island.id, island);
+        let allowed =
+            crate::ai_standard::planner::is_invasion_allowed(world, player_id, island.id, island);
         allowed_islands.insert(island.id, allowed);
     }
 
@@ -1029,7 +1021,7 @@ mod tests {
     /// 首都のすぐ隣に敵戦車を置いて Defense フェーズを成立させ、
     /// `enemy_has_air` が真のときだけ敵の航空ユニットを追加する。
     fn setup_defense_phase_world(
-        ai_version: crate::ai::ai_version::AiVersion,
+        ai_version: crate::ai_standard::ai_version::AiVersion,
         enemy_has_air: bool,
     ) -> World {
         let mut world = World::new();
@@ -1038,7 +1030,7 @@ mod tests {
         let p1 = PlayerId(1);
         let p2 = PlayerId(2);
 
-        let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
+        let mut settings = crate::ai_standard::ai_version::PlayerAiSettings::default();
         settings.set_version(p1, ai_version);
         world.insert_resource(settings);
 
@@ -1080,7 +1072,8 @@ mod tests {
     /// 純粋な死に駒になるため、脅威がないのに需要を立ててはならない。
     #[test]
     fn v3_defense_composition_omits_anti_air_without_enemy_air() {
-        let mut world = setup_defense_phase_world(crate::ai::ai_version::AiVersion::V3, false);
+        let mut world =
+            setup_defense_phase_world(crate::ai_standard::ai_version::AiVersion::V3, false);
         let strategy = analyze_strategy(&mut world, PlayerId(1));
 
         assert_eq!(strategy.phase, GamePhase::Defense);
@@ -1094,7 +1087,8 @@ mod tests {
     /// 敵に航空戦力が存在する場合は、従来どおり Defense フェーズで対空需要を立てること。
     #[test]
     fn v3_defense_composition_demands_anti_air_against_enemy_air() {
-        let mut world = setup_defense_phase_world(crate::ai::ai_version::AiVersion::V3, true);
+        let mut world =
+            setup_defense_phase_world(crate::ai_standard::ai_version::AiVersion::V3, true);
         let strategy = analyze_strategy(&mut world, PlayerId(1));
 
         assert_eq!(strategy.phase, GamePhase::Defense);
@@ -1113,7 +1107,8 @@ mod tests {
     /// V1/V2 は評価の基準線として従来挙動を維持する（今回の是正は V3 限定）。
     #[test]
     fn v1_defense_composition_keeps_legacy_anti_air_demand() {
-        let mut world = setup_defense_phase_world(crate::ai::ai_version::AiVersion::V1, false);
+        let mut world =
+            setup_defense_phase_world(crate::ai_standard::ai_version::AiVersion::V1, false);
         let strategy = analyze_strategy(&mut world, PlayerId(1));
 
         assert_eq!(strategy.phase, GamePhase::Defense);
@@ -1180,14 +1175,14 @@ mod tests {
                 let _ = map.set_terrain(x, y, Terrain::Plains);
             }
         }
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         world.insert_resource(map);
         world.insert_resource(island_map);
 
         let p1 = PlayerId(1);
         // このテストはV2の汎用的な海越え需要を検証するため、バージョンを明示します。
-        let mut settings = crate::ai::PlayerAiSettings::default();
-        settings.set_version(p1, crate::ai::AiVersion::V2);
+        let mut settings = crate::ai_standard::PlayerAiSettings::default();
+        settings.set_version(p1, crate::ai_standard::AiVersion::V2);
         world.insert_resource(settings);
 
         // 島Aに自軍の首都を配置
@@ -1240,7 +1235,7 @@ mod tests {
         map.set_terrain(1, 0, separator).unwrap();
         world.insert_resource(map.clone());
         world.insert_resource(master_data);
-        world.insert_resource(crate::ai::islands::IslandMap::analyze(&map));
+        world.insert_resource(crate::ai_standard::islands::IslandMap::analyze(&map));
 
         let p1 = PlayerId(1);
         let p2 = PlayerId(2);
@@ -1310,7 +1305,7 @@ mod tests {
             Terrain::Shoal,
         );
         let island_count = world
-            .resource::<crate::ai::islands::IslandMap>()
+            .resource::<crate::ai_standard::islands::IslandMap>()
             .islands
             .len();
         assert_eq!(island_count, 1, "IslandMap 上は浅瀬で同じ島になる前提");
@@ -1329,14 +1324,14 @@ mod tests {
         map.set_terrain(6, 0, Terrain::Capital).unwrap();
         world.insert_resource(map.clone());
         world.insert_resource(master_data);
-        world.insert_resource(crate::ai::islands::IslandMap::analyze(&map));
+        world.insert_resource(crate::ai_standard::islands::IslandMap::analyze(&map));
         world.insert_resource(crate::resources::Players(vec![crate::resources::Player {
             id: PlayerId(1),
             name: "P1".to_owned(),
             funds,
         }]));
-        let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
-        settings.set_version(PlayerId(1), crate::ai::ai_version::AiVersion::V3);
+        let mut settings = crate::ai_standard::ai_version::PlayerAiSettings::default();
+        settings.set_version(PlayerId(1), crate::ai_standard::ai_version::AiVersion::V3);
         world.insert_resource(settings);
 
         let properties = [
@@ -1424,7 +1419,7 @@ mod tests {
     fn v3_strategy_assesses_every_island() {
         let mut world = setup_v3_portfolio_world(false, 6_000);
         let island_count = world
-            .resource::<crate::ai::islands::IslandMap>()
+            .resource::<crate::ai_standard::islands::IslandMap>()
             .islands
             .len();
 
@@ -1455,7 +1450,7 @@ mod tests {
     fn v3_turn_strategy_reuses_campaign_cache() {
         let mut world = setup_v3_portfolio_world(false, 6_000);
         let cached = IslandCampaignPortfolio::default();
-        let mut cache = crate::ai::engine::AiTurnStrategyCache::default();
+        let mut cache = crate::ai_standard::engine::AiTurnStrategyCache::default();
         cache.set_campaign_portfolio(PlayerId(1), cached.clone());
         world.insert_resource(cache);
 
@@ -1468,7 +1463,7 @@ mod tests {
     fn v3_turn_strategy_preserves_generic_capture_demand_without_campaign_assignments() {
         let mut world = setup_v3_portfolio_world(false, 6_000);
         let cached = IslandCampaignPortfolio::default();
-        let mut cache = crate::ai::engine::AiTurnStrategyCache::default();
+        let mut cache = crate::ai_standard::engine::AiTurnStrategyCache::default();
         cache.set_campaign_portfolio(PlayerId(1), cached);
         world.insert_resource(cache);
 
@@ -1492,7 +1487,7 @@ mod tests {
             .unwrap();
         world.spawn((Faction(PlayerId(1)), GridPosition { x: 0, y: 0 }, infantry));
         let cached = IslandCampaignPortfolio::default();
-        let mut cache = crate::ai::engine::AiTurnStrategyCache::default();
+        let mut cache = crate::ai_standard::engine::AiTurnStrategyCache::default();
         cache.set_campaign_portfolio(PlayerId(1), cached);
         world.insert_resource(cache);
 
@@ -1523,11 +1518,11 @@ mod tests {
         world.spawn((Faction(PlayerId(1)), GridPosition { x: 0, y: 0 }, infantry));
         let target = GridPosition { x: 3, y: 0 };
         let island_id = world
-            .resource::<crate::ai::islands::IslandMap>()
+            .resource::<crate::ai_standard::islands::IslandMap>()
             .get_island_at(&target)
             .unwrap()
             .id;
-        let empty_requirement = crate::ai::island_campaign::IslandCampaignRequirement {
+        let empty_requirement = crate::ai_standard::island_campaign::IslandCampaignRequirement {
             preferred_transport: None,
             transport_slots: 0,
             capture_units: 0,
@@ -1535,9 +1530,9 @@ mod tests {
             combat_units: 0,
             total_budget: 0,
         };
-        let assignment = crate::ai::island_campaign::IslandCampaignAssignment {
+        let assignment = crate::ai_standard::island_campaign::IslandCampaignAssignment {
             island_id,
-            decision: crate::ai::island_campaign::IslandCampaignDecision::Expand,
+            decision: crate::ai_standard::island_campaign::IslandCampaignDecision::Expand,
             target_position: target,
             capture_target_positions: vec![target],
             priority_enemy_types: Vec::new(),
@@ -1555,7 +1550,7 @@ mod tests {
             active_offensives: vec![assignment],
             defenses: Vec::new(),
         };
-        let mut cache = crate::ai::engine::AiTurnStrategyCache::default();
+        let mut cache = crate::ai_standard::engine::AiTurnStrategyCache::default();
         cache.set_campaign_portfolio(PlayerId(1), cached);
         world.insert_resource(cache);
 
@@ -1592,7 +1587,9 @@ mod tests {
     #[test]
     fn v3_funds_open_neutral_before_unaffordable_enemy_assault() {
         let mut world = setup_v3_portfolio_world(false, 6_000);
-        let island_map = world.resource::<crate::ai::islands::IslandMap>().clone();
+        let island_map = world
+            .resource::<crate::ai_standard::islands::IslandMap>()
+            .clone();
         let neutral_island = island_map
             .get_island_at(&GridPosition { x: 3, y: 0 })
             .unwrap()
@@ -1612,7 +1609,7 @@ mod tests {
             portfolio
                 .assignment_for(neutral_island)
                 .map(|assignment| assignment.decision),
-            Some(crate::ai::island_campaign::IslandCampaignDecision::Expand)
+            Some(crate::ai_standard::island_campaign::IslandCampaignDecision::Expand)
         );
         assert_eq!(
             portfolio
@@ -1620,14 +1617,16 @@ mod tests {
                 .iter()
                 .find(|assessment| assessment.island_id == enemy_island)
                 .map(|assessment| assessment.decision),
-            Some(crate::ai::island_campaign::IslandCampaignDecision::Observe)
+            Some(crate::ai_standard::island_campaign::IslandCampaignDecision::Observe)
         );
     }
 
     #[test]
     fn v3_enemy_held_below_minimum_budget_remains_observe() {
         let mut world = setup_v3_portfolio_world(false, 32_699);
-        let island_map = world.resource::<crate::ai::islands::IslandMap>().clone();
+        let island_map = world
+            .resource::<crate::ai_standard::islands::IslandMap>()
+            .clone();
         let enemy_island = island_map
             .get_island_at(&GridPosition { x: 6, y: 0 })
             .unwrap()
@@ -1642,7 +1641,7 @@ mod tests {
 
         assert_eq!(
             assessment.decision,
-            crate::ai::island_campaign::IslandCampaignDecision::Observe
+            crate::ai_standard::island_campaign::IslandCampaignDecision::Observe
         );
         assert!(portfolio.assignment_for(enemy_island).is_none());
     }

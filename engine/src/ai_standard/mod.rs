@@ -1,4 +1,6 @@
-pub mod ai_version;
+// AI種別の設定Resourceは小規模側と共有する。ここを複製すると、対局が保持する
+// PlayerAiSettingsを標準パイプラインから読めなくなる。
+pub use crate::ai::ai_version;
 pub mod demand;
 pub(crate) mod deterministic_parallel;
 pub mod engine;
@@ -21,7 +23,6 @@ pub mod pruning;
 #[cfg(test)]
 pub mod scenario_tests;
 pub mod strategy;
-pub mod strategy_profile;
 
 pub mod beam_search;
 pub mod cluster;
@@ -34,4 +35,4 @@ pub(crate) mod v100;
 /// V4: 作戦駆動生産（V1〜V3 の生産ロジックとは分離した独立実装）
 pub mod v4;
 
-pub use ai_version::{AiVersion, PlayerAiSettings, resolve_player_ai_version};
+pub use crate::ai::ai_version::{AiVersion, PlayerAiSettings, resolve_player_ai_version};

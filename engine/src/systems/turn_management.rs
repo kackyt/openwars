@@ -155,6 +155,10 @@ pub fn advance_next_phase(world: &mut World) {
     commands.remove_resource::<crate::ai::engine::AiActionCooldown>();
     commands.remove_resource::<crate::ai::engine::AiProductionCooldown>();
     commands.remove_resource::<crate::ai::engine::AiTurnStrategyCache>();
+    // 標準パイプラインはmain互換の独立Resourceを使うため、次手番へ状態を持ち越さない。
+    commands.remove_resource::<crate::ai_standard::engine::AiActionCooldown>();
+    commands.remove_resource::<crate::ai_standard::engine::AiProductionCooldown>();
+    commands.remove_resource::<crate::ai_standard::engine::AiTurnStrategyCache>();
 
     // 3. プレイヤーの切り替え
     match_state.active_player_index.0 += 1;

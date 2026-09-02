@@ -21,6 +21,7 @@ mod operation_selection;
 pub mod plan_revision;
 pub mod property_control;
 pub mod rolling_plan;
+pub(crate) mod strategy_pipeline;
 pub mod trace;
 pub mod victory_roadmap;
 
@@ -35,8 +36,9 @@ use plan_revision::{
     SelectedPlan, V4RollingPlanRegistry,
 };
 use rolling_plan::{
-    DEFAULT_SEARCH_TURNS, EnemyPlanUnit, FriendlyPlanUnit, ProductionAttackProjection,
-    RollingPlanInput, evaluate_fixed_package, plan_force_package, production_options,
+    DEFAULT_SEARCH_TURNS, EnemyPlanUnit, FriendlyPlanUnit, OpeningProductionPolicy,
+    ProductionAttackProjection, RollingPlanInput, evaluate_fixed_package, plan_force_package,
+    production_options,
 };
 use trace::{
     CampaignTurnForecastTrace, EnemyProductionForecastTrace, ProductionDecision,
@@ -1765,6 +1767,8 @@ struct BoardScan {
     master_data: Arc<MasterDataRegistry>,
     damage_chart: Arc<DamageChart>,
     current_turn: u32,
+    /// テスト用の直接構築では未指定を標準側として扱う。実盤面走査では必ず設定する。
+    opening_policy: Option<OpeningProductionPolicy>,
     funds: u32,
     /// 砲台の首都側防衛可否を、作戦名でなく実座標から判定する。
     capital_position: Option<GridPosition>,
@@ -5206,6 +5210,14 @@ impl BoardScan {
         let current_turn = world
             .get_resource::<MatchState>()
             .map_or(1, |state| state.current_turn_number.0);
+        let opening_policy = match crate::ai::strategy_profile::profile_for(world, player_id) {
+            crate::ai::strategy_profile::V4StrategyProfile::Standard => {
+                OpeningProductionPolicy::Standard
+            }
+            crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion => {
+                OpeningProductionPolicy::SmallMapExpansion
+            }
+        };
         let funds = world
             .get_resource::<Players>()?
             .0
@@ -5561,6 +5573,7 @@ impl BoardScan {
             master_data,
             damage_chart,
             current_turn,
+            opening_policy: Some(opening_policy),
             funds,
             capital_position: capital_pos,
             free_facilities: facilities,
@@ -8868,6 +8881,9 @@ fn combat_plan_input(
         master_data: scan.master_data.clone(),
         damage_chart: scan.damage_chart.clone(),
         current_turn: scan.current_turn,
+        opening_policy: scan
+            .opening_policy
+            .unwrap_or(OpeningProductionPolicy::Standard),
         existing_units,
         protected_units,
         enemies,
@@ -11975,6 +11991,7 @@ mod tests {
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: damage_chart.into(),
             current_turn: 1,
+            opening_policy: None,
             funds: 20_000,
             capital_position: None,
             free_facilities: vec![(pos(0, 1), Terrain::Factory), (pos(1, 1), Terrain::Airport)],
@@ -12670,6 +12687,7 @@ mod tests {
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: damage_chart.into(),
             current_turn: 1,
+            opening_policy: None,
             funds: 22_500,
             capital_position: None,
             free_facilities: vec![
@@ -12810,6 +12828,7 @@ mod tests {
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: DamageChart::new().into(),
             current_turn: 1,
+            opening_policy: None,
             funds: 20000,
             capital_position: None,
             free_facilities: vec![(pos(1, 1), Terrain::Port)],
@@ -12992,6 +13011,7 @@ mod tests {
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: DamageChart::new().into(),
             current_turn: 1,
+            opening_policy: None,
             funds: 20000,
             capital_position: None,
             free_facilities: vec![
@@ -13049,6 +13069,7 @@ mod tests {
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: damage_chart.into(),
             current_turn: 1,
+            opening_policy: None,
             funds: 17000,
             capital_position: None,
             free_facilities: vec![
@@ -13142,6 +13163,7 @@ mod tests {
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: damage_chart.into(),
             current_turn: 1,
+            opening_policy: None,
             funds: 20_000,
             capital_position: None,
             free_facilities: vec![(pos(1, 1), Terrain::Factory), (pos(2, 1), Terrain::Airport)],
@@ -13224,6 +13246,7 @@ mod tests {
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: damage_chart.into(),
             current_turn: 1,
+            opening_policy: None,
             funds: 20_000,
             capital_position: None,
             free_facilities: vec![(pos(1, 1), Terrain::Factory), (pos(2, 1), Terrain::Airport)],
@@ -13385,6 +13408,7 @@ mod tests {
             master_data: MasterDataRegistry::load().unwrap().into(),
             damage_chart: damage_chart.into(),
             current_turn: 1,
+            opening_policy: None,
             funds: 10_000,
             capital_position: None,
             free_facilities: vec![(pos(1, 1), Terrain::Factory)],

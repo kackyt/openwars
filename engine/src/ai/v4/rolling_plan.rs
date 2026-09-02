@@ -95,6 +95,16 @@ pub(crate) struct ProductionAttackProjection {
     pub requires_movement: bool,
 }
 
+/// 初手の候補集合に適用する戦略パイプライン固有の制約。
+///
+/// 標準マップの探索へ小規模マップの役割下限や全額投入を混ぜないため、候補列挙の
+/// 分岐ではなく入力時に一度だけ決定する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpeningProductionPolicy {
+    Standard,
+    SmallMapExpansion,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RollingPlanInput {
     pub map: Arc<Map>,
@@ -102,6 +112,8 @@ pub(crate) struct RollingPlanInput {
     pub damage_chart: Arc<DamageChart>,
     /// 初手専用の役割下限を後続手番へ漏らさないための、実際のゲーム手番。
     pub current_turn: u32,
+    /// ターン入口で固定した戦略パイプラインから渡す初手方針。
+    pub opening_policy: OpeningProductionPolicy,
     pub existing_units: Vec<FriendlyPlanUnit>,
     /// 戦闘部隊とは別に、占領完了まで生存させる必要がある実在の占領兵。
     pub protected_units: Vec<FriendlyPlanUnit>,
@@ -1164,7 +1176,7 @@ fn plan_current_property_control_exact(
         .map(|state| state.used_slots.len())
         .max()
         .unwrap_or_default();
-    let role_floor = (input.current_turn == 1
+    let role_floor = (uses_small_map_opening_rules(input)
         && capture_targets.len() >= 2
         && available_slots >= 2
         && states
@@ -1177,7 +1189,7 @@ fn plan_current_property_control_exact(
     // 初手では、空いている工場で残額以内の合法なunitを購入できるなら、資金を翌手番へ
     // 繰り越す案を比較しない。途中状態の空き枠は高額案の組合せに必要なので、最終候補だけ
     // を除外する。資金不足または占領先の重複で購入不能な枠はそのまま残す。
-    if input.current_turn == 1 {
+    if uses_small_map_opening_rules(input) {
         states.retain(|state| opening_package_spends_all_usable_funds(input, state, &facilities));
     }
 
@@ -1387,6 +1399,11 @@ fn plan_current_property_control_exact(
     selected.candidates_pruned = candidates_pruned;
     selected.search_truncated = false;
     Some(selected)
+}
+
+/// 小規模開幕専用の制約を適用する条件を一箇所に固定する。
+fn uses_small_map_opening_rules(input: &RollingPlanInput) -> bool {
+    input.current_turn == 1 && input.opening_policy == OpeningProductionPolicy::SmallMapExpansion
 }
 
 /// 初手の最終編成が、残額で合法に追加できる生産枠を放置していないか判定する。
@@ -2882,6 +2899,7 @@ mod tests {
             master_data: Arc::new(MasterDataRegistry::load().unwrap()),
             damage_chart: Arc::new(chart),
             current_turn: 1,
+            opening_policy: OpeningProductionPolicy::Standard,
             existing_units: Vec::new(),
             protected_units: Vec::new(),
             enemies: vec![EnemyPlanUnit {
@@ -3826,6 +3844,18 @@ mod tests {
             &both_facilities,
             &facilities
         ));
+    }
+
+    #[test]
+    fn opening_constraints_are_owned_by_the_small_map_pipeline() {
+        let mut input = input();
+        assert!(!uses_small_map_opening_rules(&input));
+
+        input.opening_policy = OpeningProductionPolicy::SmallMapExpansion;
+        assert!(uses_small_map_opening_rules(&input));
+
+        input.current_turn = 2;
+        assert!(!uses_small_map_opening_rules(&input));
     }
 
     #[test]

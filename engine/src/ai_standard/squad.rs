@@ -3,12 +3,12 @@
 #![allow(clippy::manual_while_let_some)]
 #![allow(clippy::unnecessary_map_or)]
 
-use crate::ai::cluster::detect_enemy_clusters;
-use crate::ai::operation_assignment::{
+use crate::ai_standard::cluster::detect_enemy_clusters;
+use crate::ai_standard::operation_assignment::{
     OperationOwner, OperationUnitRole, UnitOperationAssignment, UnitOperationRegistry,
 };
-use crate::ai::strategy::{analyze_strategy, analyze_strategy_with_reserved_entities};
-use crate::ai::turn_distance::{
+use crate::ai_standard::strategy::{analyze_strategy, analyze_strategy_with_reserved_entities};
+use crate::ai_standard::turn_distance::{
     TerrainConnectivity, TurnDistanceCache, calculate_all_turn_distances, calculate_turn_distance,
     is_terrain_reachable,
 };
@@ -64,7 +64,7 @@ pub struct Squad {
     pub members: BTreeSet<Entity>,
     pub mission_type: MissionType,
     pub target: Option<GridPosition>, // 攻撃・防衛・占領の目標座標
-    pub target_island: Option<crate::ai::islands::IslandId>, // 輸送ターゲットの島
+    pub target_island: Option<crate::ai_standard::islands::IslandId>, // 輸送ターゲットの島
     pub phase: MissionPhase,
     /// 輸送部隊の輸送役。HashSet の列挙順ではなく明示的に保持する。
     pub transport_entity: Option<Entity>,
@@ -247,7 +247,7 @@ fn reconcile_unique_operation_assignments(
             .collect::<HashMap<_, _>>()
     };
     let island_map = world
-        .get_resource::<crate::ai::islands::IslandMap>()
+        .get_resource::<crate::ai_standard::islands::IslandMap>()
         .cloned();
     let entity_islands = world
         .iter_entities()
@@ -270,7 +270,7 @@ fn reconcile_unique_operation_assignments(
     // 生産直後の作戦意図は、まだownerが無いEntityだけの初期seedにする。
     // その後の明示的な作戦移管を発注時anchorで巻き戻してはならない。
     if let Some(produced) = world
-        .get_resource::<crate::ai::v4::campaign_execution::V4CampaignExecutionRegistry>()
+        .get_resource::<crate::ai_standard::v4::campaign_execution::V4CampaignExecutionRegistry>()
         .map(|execution| execution.produced_entity_assignments(player_id))
     {
         for (entity, island_id) in produced {
@@ -438,7 +438,7 @@ fn reconcile_unique_operation_assignments(
 fn claim_campaign_portfolio_assignments(
     world: &mut World,
     player_id: PlayerId,
-    portfolio: &crate::ai::island_campaign::IslandCampaignPortfolio,
+    portfolio: &crate::ai_standard::island_campaign::IslandCampaignPortfolio,
 ) {
     let turn = world
         .get_resource::<crate::resources::MatchState>()
@@ -450,13 +450,13 @@ fn claim_campaign_portfolio_assignments(
         .collect::<Vec<_>>();
     assignments.sort_by_key(|assignment| campaign_assignment_priority(assignment));
     let mut protected_entities = world
-        .get_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>()
+        .get_resource::<crate::ai_standard::v4::deployment::V4DeploymentRegistry>()
         .map(|deployments| deployments.active_entities(player_id))
         .unwrap_or_default();
     // 首都強襲は兵站gateが開く前から形成する。局地portfolioにまだ現れないことだけを
     // 理由に前ターンの実Entity接続を解放すると、毎ターンReserveへ逆戻りするため保護する。
     if let Some(roadmap) =
-        world.get_resource::<crate::ai::v4::victory_roadmap::VictoryRoadmapRegistry>()
+        world.get_resource::<crate::ai_standard::v4::victory_roadmap::VictoryRoadmapRegistry>()
     {
         protected_entities.extend(roadmap.active_capital_entities(player_id));
     }
@@ -532,9 +532,9 @@ fn select_nearest_compatible_cargo(
     candidates: &[(Entity, GridPosition, UnitStats)],
     transport_position: GridPosition,
     transport_stats: &UnitStats,
-    target_island: crate::ai::islands::IslandId,
+    target_island: crate::ai_standard::islands::IslandId,
     target_position: Option<GridPosition>,
-    island_map: &crate::ai::islands::IslandMap,
+    island_map: &crate::ai_standard::islands::IslandMap,
     map: &Map,
     registry: &MasterDataRegistry,
     unit_positions: &HashMap<(usize, usize), crate::systems::movement::OccupantInfo>,
@@ -1036,7 +1036,7 @@ fn light_infantry_target_for_transport(
     world: &World,
     transport: Entity,
     player_id: PlayerId,
-    target_island: crate::ai::islands::IslandId,
+    target_island: crate::ai_standard::islands::IslandId,
 ) -> Option<GridPosition> {
     if world
         .get::<UnitStats>(transport)
@@ -1044,7 +1044,7 @@ fn light_infantry_target_for_transport(
     {
         return None;
     }
-    let island_map = world.get_resource::<crate::ai::islands::IslandMap>()?;
+    let island_map = world.get_resource::<crate::ai_standard::islands::IslandMap>()?;
     let mut targets: Vec<_> = world
         .iter_entities()
         .filter_map(|entity| {
@@ -1346,7 +1346,7 @@ pub fn update_squads(world: &mut World, perspective_player: PlayerId) {
 
     // 侵攻島の敵・未占領拠点が無くなった通常部隊は島拘束を解除する。
     if let Some(island_map) = world
-        .get_resource::<crate::ai::islands::IslandMap>()
+        .get_resource::<crate::ai_standard::islands::IslandMap>()
         .cloned()
     {
         let mut active_islands = HashSet::new();
@@ -1492,7 +1492,7 @@ fn search_ready_campaign_transport_partition(
 fn build_ready_campaign_transport_partitions(
     world: &World,
     player_id: PlayerId,
-    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    assignment: &crate::ai_standard::island_campaign::IslandCampaignAssignment,
     advanced_live_transports: &HashSet<Entity>,
 ) -> Option<Vec<CampaignTransportPartition>> {
     let mut transport_entities = assignment.transport_entities.clone();
@@ -1503,7 +1503,7 @@ fn build_ready_campaign_transport_partitions(
     }
     let transport_set: HashSet<_> = transport_entities.iter().copied().collect();
 
-    let island_map = world.get_resource::<crate::ai::islands::IslandMap>();
+    let island_map = world.get_resource::<crate::ai_standard::islands::IslandMap>();
     let mut requested_cargo: Vec<_> = assignment
         .capture_entities
         .iter()
@@ -1632,7 +1632,7 @@ fn reconcile_ready_forming_campaign_squad(
     world: &World,
     manager: &mut SquadManager,
     player_id: PlayerId,
-    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    assignment: &crate::ai_standard::island_campaign::IslandCampaignAssignment,
 ) -> bool {
     if !assignment.operation_ready {
         return false;
@@ -1837,10 +1837,10 @@ fn reconcile_ready_forming_campaign_squad(
         if !preserve_live_state {
             squad.allow_partial_departure = matches!(
                 assignment.decision,
-                crate::ai::island_campaign::IslandCampaignDecision::Expand
-                    | crate::ai::island_campaign::IslandCampaignDecision::Secure
-                    | crate::ai::island_campaign::IslandCampaignDecision::Contest
-                    | crate::ai::island_campaign::IslandCampaignDecision::Reinforce
+                crate::ai_standard::island_campaign::IslandCampaignDecision::Expand
+                    | crate::ai_standard::island_campaign::IslandCampaignDecision::Secure
+                    | crate::ai_standard::island_campaign::IslandCampaignDecision::Contest
+                    | crate::ai_standard::island_campaign::IslandCampaignDecision::Reinforce
             );
             squad.pickup_position = Some(partition.pickup_position);
             squad.drop_position = None;
@@ -1868,9 +1868,9 @@ fn reconcile_ready_forming_campaign_squad(
 }
 
 fn campaign_assignment_priority(
-    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    assignment: &crate::ai_standard::island_campaign::IslandCampaignAssignment,
 ) -> (u8, usize) {
-    use crate::ai::island_campaign::IslandCampaignDecision;
+    use crate::ai_standard::island_campaign::IslandCampaignDecision;
 
     let rank = match assignment.decision {
         IslandCampaignDecision::Defend => 0,
@@ -1885,7 +1885,7 @@ fn campaign_assignment_priority(
 
 fn cargo_is_landed_on_assignment_island(
     world: &World,
-    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    assignment: &crate::ai_standard::island_campaign::IslandCampaignAssignment,
     cargo: Entity,
 ) -> bool {
     if world
@@ -1898,7 +1898,7 @@ fn cargo_is_landed_on_assignment_island(
         return false;
     };
     world
-        .get_resource::<crate::ai::islands::IslandMap>()
+        .get_resource::<crate::ai_standard::islands::IslandMap>()
         .and_then(|map| map.get_island_at(position))
         .is_some_and(|island| island.id == assignment.island_id)
 }
@@ -1908,7 +1908,7 @@ fn cargo_is_landed_on_assignment_island(
 /// 輸送が必要な地上戦力との責務境界として用いる。
 fn entity_can_self_deploy_to_assignment(
     world: &World,
-    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    assignment: &crate::ai_standard::island_campaign::IslandCampaignAssignment,
     entity: Entity,
 ) -> bool {
     entity_can_self_deploy_to_assignment_with_connectivity(
@@ -1921,7 +1921,7 @@ fn entity_can_self_deploy_to_assignment(
 
 fn entity_can_self_deploy_to_assignment_with_connectivity(
     world: &World,
-    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    assignment: &crate::ai_standard::island_campaign::IslandCampaignAssignment,
     entity: Entity,
     connectivity: &mut TerrainConnectivity,
 ) -> bool {
@@ -1954,13 +1954,13 @@ fn promote_partial_campaign_transport_wave(
     world: &World,
     manager: &mut SquadManager,
     player_id: PlayerId,
-    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    assignment: &crate::ai_standard::island_campaign::IslandCampaignAssignment,
 ) -> bool {
     // Assaultも搭載・集合までは逐次進める。従来は完全編成までFormingに閉じ込め、
     // 輸送役とcargoを通常行動から除外したまま何ターンも停止させていた。
     // 発進可否は`departure_authorized`で別管理し、兵站gate前の逐次突入は防ぐ。
-    if assignment.decision == crate::ai::island_campaign::IslandCampaignDecision::Assault
-        && !crate::ai::resolve_player_ai_version(world, player_id)
+    if assignment.decision == crate::ai_standard::island_campaign::IslandCampaignDecision::Assault
+        && !crate::ai_standard::resolve_player_ai_version(world, player_id)
             .uses_operation_driven_production()
     {
         return false;
@@ -2095,10 +2095,11 @@ fn promote_partial_campaign_transport_wave(
         } else {
             TransportPhase::Pickup
         });
-        wave.allow_partial_departure =
-            assignment.decision != crate::ai::island_campaign::IslandCampaignDecision::Assault;
+        wave.allow_partial_departure = assignment.decision
+            != crate::ai_standard::island_campaign::IslandCampaignDecision::Assault;
         wave.departure_authorized = assignment.operation_ready
-            || assignment.decision != crate::ai::island_campaign::IslandCampaignDecision::Assault;
+            || assignment.decision
+                != crate::ai_standard::island_campaign::IslandCampaignDecision::Assault;
         waves.push(wave);
     }
     if waves.is_empty() {
@@ -2124,10 +2125,11 @@ fn promote_partial_campaign_transport_wave(
         follow_up.cargo_entities = remaining_cargo;
         follow_up.target_island = forming.target_island;
         follow_up.target = forming.target;
-        follow_up.allow_partial_departure =
-            assignment.decision != crate::ai::island_campaign::IslandCampaignDecision::Assault;
+        follow_up.allow_partial_departure = assignment.decision
+            != crate::ai_standard::island_campaign::IslandCampaignDecision::Assault;
         follow_up.departure_authorized = assignment.operation_ready
-            || assignment.decision != crate::ai::island_campaign::IslandCampaignDecision::Assault;
+            || assignment.decision
+                != crate::ai_standard::island_campaign::IslandCampaignDecision::Assault;
         follow_up.phase = MissionPhase::Forming;
     }
     manager.squads.extend(waves);
@@ -2141,7 +2143,7 @@ fn prepare_campaign_transport_assignment(
     world: &World,
     manager: &mut SquadManager,
     player_id: PlayerId,
-    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    assignment: &crate::ai_standard::island_campaign::IslandCampaignAssignment,
 ) -> bool {
     prepare_campaign_transport_assignment_with_connectivity(
         world,
@@ -2156,7 +2158,7 @@ fn prepare_campaign_transport_assignment_with_connectivity(
     world: &World,
     manager: &mut SquadManager,
     player_id: PlayerId,
-    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    assignment: &crate::ai_standard::island_campaign::IslandCampaignAssignment,
     connectivity: &mut TerrainConnectivity,
 ) -> bool {
     adopt_legacy_squad_owners(world, manager);
@@ -2176,7 +2178,8 @@ fn prepare_campaign_transport_assignment_with_connectivity(
         // 空港・港・都市という具体的な作戦施設へ目標を同期する。
         squad.target = Some(assignment.target_position);
         squad.departure_authorized = assignment.operation_ready
-            || assignment.decision != crate::ai::island_campaign::IslandCampaignDecision::Assault;
+            || assignment.decision
+                != crate::ai_standard::island_campaign::IslandCampaignDecision::Assault;
     }
     let assignment_transports: HashSet<_> = assignment.transport_entities.iter().copied().collect();
     let covered_transports: HashSet<_> = manager
@@ -2282,13 +2285,14 @@ fn prepare_campaign_transport_assignment_with_connectivity(
         squad.target = Some(assignment.target_position);
         squad.allow_partial_departure = matches!(
             assignment.decision,
-            crate::ai::island_campaign::IslandCampaignDecision::Expand
-                | crate::ai::island_campaign::IslandCampaignDecision::Secure
-                | crate::ai::island_campaign::IslandCampaignDecision::Contest
-                | crate::ai::island_campaign::IslandCampaignDecision::Reinforce
+            crate::ai_standard::island_campaign::IslandCampaignDecision::Expand
+                | crate::ai_standard::island_campaign::IslandCampaignDecision::Secure
+                | crate::ai_standard::island_campaign::IslandCampaignDecision::Contest
+                | crate::ai_standard::island_campaign::IslandCampaignDecision::Reinforce
         );
         squad.departure_authorized = assignment.operation_ready
-            || assignment.decision != crate::ai::island_campaign::IslandCampaignDecision::Assault;
+            || assignment.decision
+                != crate::ai_standard::island_campaign::IslandCampaignDecision::Assault;
         squad.phase = MissionPhase::Forming;
     }
 
@@ -2307,7 +2311,7 @@ fn prepare_campaign_transport_assignment_with_connectivity(
 fn nearest_campaign_property_target(
     world: &World,
     player_id: PlayerId,
-    island_id: crate::ai::islands::IslandId,
+    island_id: crate::ai_standard::islands::IslandId,
     members: &[Entity],
 ) -> Option<GridPosition> {
     nearest_campaign_property_target_with_connectivity(
@@ -2315,7 +2319,6 @@ fn nearest_campaign_property_target(
         player_id,
         island_id,
         members,
-        &HashSet::new(),
         &mut TerrainConnectivity::default(),
     )
 }
@@ -2323,12 +2326,11 @@ fn nearest_campaign_property_target(
 fn nearest_campaign_property_target_with_connectivity(
     world: &World,
     player_id: PlayerId,
-    island_id: crate::ai::islands::IslandId,
+    island_id: crate::ai_standard::islands::IslandId,
     members: &[Entity],
-    excluded_targets: &HashSet<GridPosition>,
     connectivity: &mut TerrainConnectivity,
 ) -> Option<GridPosition> {
-    let island_map = world.get_resource::<crate::ai::islands::IslandMap>()?;
+    let island_map = world.get_resource::<crate::ai_standard::islands::IslandMap>()?;
     let map = world.get_resource::<Map>()?;
     let registry = world.get_resource::<MasterDataRegistry>()?;
     world
@@ -2337,7 +2339,6 @@ fn nearest_campaign_property_target_with_connectivity(
             let target = entity.get::<GridPosition>().copied()?;
             let property = entity.get::<Property>()?;
             if property.owner_id == Some(player_id)
-                || excluded_targets.contains(&target)
                 || island_map
                     .get_island_at(&target)
                     .is_none_or(|island| island.id != island_id)
@@ -2368,9 +2369,8 @@ fn nearest_campaign_property_target_with_connectivity(
 
 fn campaign_assignment_capture_responsibilities(
     world: &World,
-    manager: &SquadManager,
     player_id: PlayerId,
-    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    assignment: &crate::ai_standard::island_campaign::IslandCampaignAssignment,
     members: &[Entity],
     connectivity: &mut TerrainConnectivity,
 ) -> Vec<CampaignResponsibility> {
@@ -2393,7 +2393,6 @@ fn campaign_assignment_capture_responsibilities(
             player_id,
             assignment.island_id,
             members,
-            &HashSet::new(),
             connectivity,
         )
     {
@@ -2402,56 +2401,7 @@ fn campaign_assignment_capture_responsibilities(
 
     let mut remaining = members.to_vec();
     remaining.sort_by_key(|entity| entity.to_bits());
-    let mut responsibilities: Vec<CampaignResponsibility> = Vec::new();
-
-    // 生産時に期限・経路まで検証して具体化したCapture任務は、次回Campaign分析の
-    // 「最寄り物件」へ即座に戻さない。対象が未取得かつ本人が到達可能な間だけ保持し、
-    // 取得済み・到達不能なら下の通常割当へ自然に戻す。
-    let mut pinned_members = HashSet::new();
-    for member in &remaining {
-        let pinned_target = manager
-            .squads
-            .iter()
-            .filter(|squad| {
-                squad.owner_id == Some(player_id)
-                    && squad.mission_type == MissionType::Capture
-                    && squad.target_island == Some(assignment.island_id)
-                    && squad.members.contains(member)
-            })
-            .filter_map(|squad| squad.target)
-            .find(|target| {
-                world.iter_entities().any(|entity| {
-                    entity.get::<GridPosition>() == Some(target)
-                        && entity
-                            .get::<Property>()
-                            .is_some_and(|property| property.owner_id != Some(player_id))
-                }) && campaign_member_distance_to_position(world, *member, *target, connectivity)
-                    .is_some()
-            });
-        let Some(target) = pinned_target else {
-            continue;
-        };
-        pinned_members.insert(*member);
-        if let Some(responsibility) = responsibilities
-            .iter_mut()
-            .find(|responsibility| responsibility.target == target)
-        {
-            responsibility.members.push(*member);
-        } else {
-            responsibilities.push(CampaignResponsibility {
-                mission_type: MissionType::Capture,
-                target,
-                members: vec![*member],
-            });
-        }
-    }
-    remaining.retain(|member| !pinned_members.contains(member));
-    let pinned_targets = responsibilities
-        .iter()
-        .map(|responsibility| responsibility.target)
-        .collect::<HashSet<_>>();
-    targets.retain(|target| !pinned_targets.contains(target));
-
+    let mut responsibilities = Vec::new();
     for target in targets {
         let Some((index, _)) = remaining
             .iter()
@@ -2475,51 +2425,20 @@ fn campaign_assignment_capture_responsibilities(
         }
     }
 
-    // 同一陸地の首都戦役では余剰占領兵を別施設へ展開する。海洋戦では上陸点へ
-    // 戦力を集中する必要があるため、従来どおり同じ目標への増援を許す。
-    let spread_over_land_routes =
-        crate::ai::v4::is_same_land_capital_island(world, player_id, assignment.island_id);
-    let mut claimed_targets = responsibilities
-        .iter()
-        .map(|responsibility| responsibility.target)
-        .collect::<HashSet<_>>();
+    // 施設数より占領要員が多い場合も遊兵化させず、島内の到達可能な未所有施設へ予備を送る。
     for member in remaining {
-        let excluded_targets = if spread_over_land_routes {
-            &claimed_targets
-        } else {
-            &HashSet::new()
-        };
         if let Some(target) = nearest_campaign_property_target_with_connectivity(
             world,
             player_id,
             assignment.island_id,
             &[member],
-            excluded_targets,
             connectivity,
         ) {
-            claimed_targets.insert(target);
             responsibilities.push(CampaignResponsibility {
                 mission_type: MissionType::Capture,
                 target,
                 members: vec![member],
             });
-        } else if let Some(responsibility) =
-            responsibilities.iter_mut().min_by_key(|responsibility| {
-                (
-                    campaign_member_distance_to_position(
-                        world,
-                        member,
-                        responsibility.target,
-                        connectivity,
-                    )
-                    .unwrap_or(usize::MAX),
-                    responsibility.target.y,
-                    responsibility.target.x,
-                )
-            })
-        {
-            // 未担当施設が尽きてもEntityを無所属へ落とさず、最寄りの既存責務へ増員する。
-            responsibility.members.push(member);
         }
     }
     responsibilities
@@ -2625,85 +2544,17 @@ struct CampaignResponsibility {
     members: Vec<Entity>,
 }
 
-/// 全体需要から決めたroute枠へ、memberを一度だけ配属する。
-///
-/// `route_slots` は戦役全体の資源・戦力・地形ETAから先に算出済みであり、ここでは
-/// 個々のunitを仮想投入して再評価しない。需要ゼロのrouteは空でもよく、残った
-/// memberは最寄りの実行可能routeへ置いて無所属を作らない。
-fn distribute_members_across_route_fronts(
-    world: &World,
-    map: &Map,
-    members: &[Entity],
-    route_fronts: &[GridPosition],
-    route_slots: &[usize],
-) -> Vec<Vec<Entity>> {
-    let mut remaining = members.to_vec();
-    remaining.sort_by_key(|entity| entity.to_bits());
-    remaining.dedup();
-    let mut distributed = vec![Vec::new(); route_fronts.len()];
-
-    // 先に全体需要から決めた枠だけを埋める。配属時には距離だけを使うので、既に
-    // 盤面評価へ含めた戦力差や収益をunitごとに二重計上しない。
-    let mut unassigned = Vec::new();
-    for member in remaining {
-        let route = world.get::<GridPosition>(member).and_then(|position| {
-            route_fronts
-                .iter()
-                .enumerate()
-                .filter(|(route, _)| {
-                    distributed[*route].len() < route_slots.get(*route).copied().unwrap_or(0)
-                })
-                .min_by_key(|(route, front)| {
-                    (
-                        map.distance(position.x, position.y, front.x, front.y),
-                        *route,
-                    )
-                })
-                .map(|(route, _)| route)
-        });
-        if let Some(route) = route {
-            distributed[route].push(member);
-        } else {
-            unassigned.push(member);
-        }
-    }
-
-    // 需要枠を超えるmemberも、同じcampaign内の最寄りrouteへ結び直す。これにより
-    // squadを失った遊休戦力や、汎用Reserveへの退避を発生させない。
-    for member in unassigned {
-        let route = world
-            .get::<GridPosition>(member)
-            .map(|position| {
-                route_fronts
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(index, front)| {
-                        (
-                            map.distance(position.x, position.y, front.x, front.y),
-                            distributed[*index].len(),
-                            *index,
-                        )
-                    })
-                    .map_or(0, |(index, _)| index)
-            })
-            .unwrap_or(0);
-        distributed[route].push(member);
-    }
-    distributed
-}
-
 fn campaign_combat_responsibilities(
     world: &World,
     player_id: PlayerId,
-    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    island_id: crate::ai_standard::islands::IslandId,
     members: &[Entity],
     connectivity: &mut TerrainConnectivity,
 ) -> Vec<CampaignResponsibility> {
-    let island_id = assignment.island_id;
-    let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() else {
+    let Some(island_map) = world.get_resource::<crate::ai_standard::islands::IslandMap>() else {
         return Vec::new();
     };
-    let enemies: Vec<_> = world
+    let mut enemies: Vec<_> = world
         .iter_entities()
         .filter_map(|entity| {
             let target = entity.get::<GridPosition>().copied()?;
@@ -2715,108 +2566,6 @@ fn campaign_combat_responsibilities(
             .then_some((entity.id(), target))
         })
         .collect();
-
-    let route_fronts = crate::ai::v4::same_land_route_fronts(world, player_id, island_id);
-    if route_fronts.len() >= 2 {
-        let Some(map) = world.get_resource::<Map>() else {
-            return Vec::new();
-        };
-        let pending_bridgeheads =
-            crate::ai::v4::same_land_pending_bridgeheads(world, player_id, island_id);
-        let breakthrough_positions =
-            crate::ai::v4::same_land_route_breakthrough_positions(world, player_id, island_id);
-        let nearest_front = |position: GridPosition| {
-            route_fronts
-                .iter()
-                .enumerate()
-                .min_by_key(|(index, front)| {
-                    (
-                        map.distance(position.x, position.y, front.x, front.y),
-                        *index,
-                    )
-                })
-                .map_or(0, |(index, _)| index)
-        };
-        let route_demands =
-            crate::ai::v4::same_land_route_force_demands(world, player_id, island_id);
-        let route_slots = crate::ai::v4::apportion_route_force_slots(members.len(), &route_demands);
-        let route_members = distribute_members_across_route_fronts(
-            world,
-            map,
-            members,
-            &route_fronts,
-            &route_slots,
-        );
-        let mut route_enemies = vec![Vec::new(); route_fronts.len()];
-        for (enemy, position) in enemies {
-            route_enemies[nearest_front(position)].push((enemy, position));
-        }
-        let mut route_capture_targets = vec![Vec::new(); route_fronts.len()];
-        for target in &assignment.capture_target_positions {
-            route_capture_targets[nearest_front(*target)].push(*target);
-        }
-        for (route, targets) in route_capture_targets.iter_mut().enumerate() {
-            targets.sort_unstable_by_key(|target| {
-                (
-                    map.distance(
-                        target.x,
-                        target.y,
-                        route_fronts[route].x,
-                        route_fronts[route].y,
-                    ),
-                    target.y,
-                    target.x,
-                )
-            });
-        }
-        let mut responsibilities = Vec::new();
-        for (route, route_members) in route_members.into_iter().enumerate() {
-            if route_members.is_empty() {
-                continue;
-            }
-            if let Some(bridgehead) = pending_bridgeheads.get(route).and_then(|target| *target) {
-                // 橋の手前に敵や未所有施設が残っていても、橋頭堡に地上部隊が立つまでは
-                // ルート任務を局地戦へ戻さない。ここで初めて「突破」を実行目標にする。
-                responsibilities.push(CampaignResponsibility {
-                    mission_type: MissionType::Defense,
-                    target: bridgehead,
-                    members: route_members,
-                });
-                continue;
-            }
-            if route_enemies[route].is_empty() {
-                // 接敵前は橋そのものではなく、その先で占領兵が狙う現在Milestoneまで進む。
-                // これによりGate到着を突破成功と誤認せず、橋向こうの施設を橋頭堡にする。
-                responsibilities.push(CampaignResponsibility {
-                    mission_type: MissionType::Defense,
-                    target: route_capture_targets[route]
-                        .first()
-                        .copied()
-                        .or_else(|| breakthrough_positions.get(route).copied())
-                        .unwrap_or(route_fronts[route]),
-                    members: route_members,
-                });
-            } else {
-                responsibilities.extend(campaign_combat_responsibilities_for_enemies(
-                    world,
-                    &route_members,
-                    std::mem::take(&mut route_enemies[route]),
-                    connectivity,
-                ));
-            }
-        }
-        return responsibilities;
-    }
-
-    campaign_combat_responsibilities_for_enemies(world, members, enemies, connectivity)
-}
-
-fn campaign_combat_responsibilities_for_enemies(
-    world: &World,
-    members: &[Entity],
-    mut enemies: Vec<(Entity, GridPosition)>,
-    connectivity: &mut TerrainConnectivity,
-) -> Vec<CampaignResponsibility> {
     enemies.sort_by_key(|(entity, target)| (target.y, target.x, entity.to_bits()));
 
     let mut remaining = members.to_vec();
@@ -2942,7 +2691,7 @@ fn assign_campaign_responsibilities(
     world: &World,
     manager: &mut SquadManager,
     player_id: PlayerId,
-    island_id: crate::ai::islands::IslandId,
+    island_id: crate::ai_standard::islands::IslandId,
     mut responsibilities: Vec<CampaignResponsibility>,
     managed_missions: &[MissionType],
 ) {
@@ -3036,7 +2785,7 @@ fn assign_campaign_members(
     manager: &mut SquadManager,
     player_id: PlayerId,
     mission_type: MissionType,
-    island_id: crate::ai::islands::IslandId,
+    island_id: crate::ai_standard::islands::IslandId,
     target: GridPosition,
     members: Vec<Entity>,
 ) {
@@ -3062,7 +2811,7 @@ fn prepare_campaign_local_assignment(
     world: &World,
     manager: &mut SquadManager,
     player_id: PlayerId,
-    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    assignment: &crate::ai_standard::island_campaign::IslandCampaignAssignment,
 ) {
     prepare_campaign_local_assignment_with_connectivity(
         world,
@@ -3077,10 +2826,10 @@ fn prepare_campaign_local_assignment_with_connectivity(
     world: &World,
     manager: &mut SquadManager,
     player_id: PlayerId,
-    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    assignment: &crate::ai_standard::island_campaign::IslandCampaignAssignment,
     connectivity: &mut TerrainConnectivity,
 ) {
-    use crate::ai::island_campaign::IslandCampaignDecision;
+    use crate::ai_standard::island_campaign::IslandCampaignDecision;
 
     let local_entities = |entities: &[Entity]| {
         entities
@@ -3096,7 +2845,6 @@ fn prepare_campaign_local_assignment_with_connectivity(
             let capture = local_entities(&assignment.capture_entities);
             let capture_responsibilities = campaign_assignment_capture_responsibilities(
                 world,
-                manager,
                 player_id,
                 assignment,
                 &capture,
@@ -3139,7 +2887,7 @@ fn prepare_campaign_local_assignment_with_connectivity(
             let mut combat_responsibilities = campaign_combat_responsibilities(
                 world,
                 player_id,
-                assignment,
+                assignment.island_id,
                 &combat,
                 connectivity,
             );
@@ -3147,9 +2895,6 @@ fn prepare_campaign_local_assignment_with_connectivity(
                 && combat_responsibilities
                     .iter()
                     .all(|responsibility| responsibility.mission_type == MissionType::Defense)
-                && crate::ai::v4::same_land_route_fronts(world, player_id, assignment.island_id)
-                    .len()
-                    < 2
             {
                 // 接近中でまだ島内に敵がいない場合は、防衛対象をばらけさせず
                 // assignmentの主要施設へ集結させる。
@@ -3172,7 +2917,6 @@ fn prepare_campaign_local_assignment_with_connectivity(
             let capture = local_entities(&assignment.capture_entities);
             let responsibilities = campaign_assignment_capture_responsibilities(
                 world,
-                manager,
                 player_id,
                 assignment,
                 &capture,
@@ -3186,22 +2930,6 @@ fn prepare_campaign_local_assignment_with_connectivity(
                 responsibilities,
                 &[MissionType::Capture],
             );
-            let combat = local_entities(&assignment.combat_entities);
-            let combat_responsibilities = campaign_combat_responsibilities(
-                world,
-                player_id,
-                assignment,
-                &combat,
-                connectivity,
-            );
-            assign_campaign_responsibilities(
-                world,
-                manager,
-                player_id,
-                assignment.island_id,
-                combat_responsibilities,
-                &[MissionType::Attack, MissionType::Defense],
-            );
         }
         IslandCampaignDecision::Expand
         | IslandCampaignDecision::Assault
@@ -3210,7 +2938,6 @@ fn prepare_campaign_local_assignment_with_connectivity(
             let capture = local_entities(&assignment.capture_entities);
             let capture_responsibilities = campaign_assignment_capture_responsibilities(
                 world,
-                manager,
                 player_id,
                 assignment,
                 &capture,
@@ -3243,7 +2970,7 @@ fn prepare_campaign_local_assignment_with_connectivity(
             let responsibilities = campaign_combat_responsibilities(
                 world,
                 player_id,
-                assignment,
+                assignment.island_id,
                 &combat,
                 connectivity,
             );
@@ -3268,10 +2995,10 @@ fn synchronize_local_capture_departure(
     world: &World,
     manager: &mut SquadManager,
     player_id: PlayerId,
-    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    assignment: &crate::ai_standard::island_campaign::IslandCampaignAssignment,
 ) {
-    if crate::ai::resolve_player_ai_version(world, player_id)
-        != crate::ai::ai_version::AiVersion::V4
+    if crate::ai_standard::resolve_player_ai_version(world, player_id)
+        != crate::ai_standard::ai_version::AiVersion::V4
     {
         return;
     }
@@ -3284,7 +3011,7 @@ fn synchronize_local_capture_departure(
     let Some(damage_chart) = world.get_resource::<crate::resources::DamageChart>() else {
         return;
     };
-    let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() else {
+    let Some(island_map) = world.get_resource::<crate::ai_standard::islands::IslandMap>() else {
         return;
     };
     let enemies = world
@@ -3422,11 +3149,11 @@ fn prepare_secure_local_captures(
     world: &World,
     manager: &mut SquadManager,
     player_id: PlayerId,
-    portfolio: &crate::ai::island_campaign::IslandCampaignPortfolio,
+    portfolio: &crate::ai_standard::island_campaign::IslandCampaignPortfolio,
 ) -> HashSet<Entity> {
-    use crate::ai::island_campaign::{IslandCampaignDecision, campaign_unit_type_rank};
+    use crate::ai_standard::island_campaign::{IslandCampaignDecision, campaign_unit_type_rank};
 
-    let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() else {
+    let Some(island_map) = world.get_resource::<crate::ai_standard::islands::IslandMap>() else {
         return HashSet::new();
     };
     let mut secure_islands: Vec<_> = portfolio
@@ -3513,9 +3240,9 @@ fn prepare_secure_local_captures(
 }
 
 fn campaign_paused_islands(
-    portfolio: &crate::ai::island_campaign::IslandCampaignPortfolio,
-) -> HashSet<crate::ai::islands::IslandId> {
-    use crate::ai::island_campaign::IslandCampaignDecision;
+    portfolio: &crate::ai_standard::island_campaign::IslandCampaignPortfolio,
+) -> HashSet<crate::ai_standard::islands::IslandId> {
+    use crate::ai_standard::island_campaign::IslandCampaignDecision;
 
     portfolio
         .islands
@@ -3532,7 +3259,7 @@ fn remove_abandoned_campaign_placeholders(
     world: &World,
     manager: &mut SquadManager,
     player_id: PlayerId,
-    active_islands: &HashSet<crate::ai::islands::IslandId>,
+    active_islands: &HashSet<crate::ai_standard::islands::IslandId>,
 ) {
     manager.squads.retain(|squad| {
         let is_empty_placeholder = squad.owner_id == Some(player_id)
@@ -3555,7 +3282,7 @@ fn apply_campaign_pauses(
     world: &World,
     manager: &mut SquadManager,
     player_id: PlayerId,
-    paused_islands: &HashSet<crate::ai::islands::IslandId>,
+    paused_islands: &HashSet<crate::ai_standard::islands::IslandId>,
 ) {
     if paused_islands.is_empty() {
         return;
@@ -3616,7 +3343,7 @@ fn assign_explicit_reserve_squads(
     world: &mut World,
     manager: &mut SquadManager,
     player_id: PlayerId,
-    campaign_assignments: &[crate::ai::island_campaign::IslandCampaignAssignment],
+    campaign_assignments: &[crate::ai_standard::island_campaign::IslandCampaignAssignment],
 ) {
     let Some(map) = world.get_resource::<Map>().cloned() else {
         return;
@@ -3666,7 +3393,7 @@ fn assign_explicit_reserve_squads(
                 .map(|assignment| assignment.target_position)
                 .or_else(|| {
                     world
-                        .get_resource::<crate::ai::islands::IslandMap>()
+                        .get_resource::<crate::ai_standard::islands::IslandMap>()
                         .and_then(|islands| {
                             islands.islands.iter().find(|island| island.id == island_id)
                         })
@@ -3881,7 +3608,7 @@ fn reconnect_unassigned_transport_waves(
     world: &mut World,
     manager: &mut SquadManager,
     player_id: PlayerId,
-    campaign_assignments: &[crate::ai::island_campaign::IslandCampaignAssignment],
+    campaign_assignments: &[crate::ai_standard::island_campaign::IslandCampaignAssignment],
 ) {
     if campaign_assignments.is_empty() {
         return;
@@ -3893,9 +3620,9 @@ fn reconnect_unassigned_transport_waves(
         return;
     };
     let island_map = world
-        .get_resource::<crate::ai::islands::IslandMap>()
+        .get_resource::<crate::ai_standard::islands::IslandMap>()
         .cloned()
-        .unwrap_or_else(|| crate::ai::islands::IslandMap::analyze(&map));
+        .unwrap_or_else(|| crate::ai_standard::islands::IslandMap::analyze(&map));
 
     let mut assigned_entities = HashSet::new();
     for squad in &manager.squads {
@@ -3970,8 +3697,8 @@ fn reconnect_unassigned_transport_waves(
         }
         if matches!(
             assignment.decision,
-            crate::ai::island_campaign::IslandCampaignDecision::Observe
-                | crate::ai::island_campaign::IslandCampaignDecision::Withdraw
+            crate::ai_standard::island_campaign::IslandCampaignDecision::Observe
+                | crate::ai_standard::island_campaign::IslandCampaignDecision::Withdraw
         ) {
             continue;
         }
@@ -4131,10 +3858,10 @@ fn reconnect_unassigned_transport_waves(
                 drop_position: None,
                 delivered_cargo: Vec::new(),
                 allow_partial_departure: assignment.decision
-                    != crate::ai::island_campaign::IslandCampaignDecision::Assault,
+                    != crate::ai_standard::island_campaign::IslandCampaignDecision::Assault,
                 departure_authorized: assignment.operation_ready
                     || assignment.decision
-                        != crate::ai::island_campaign::IslandCampaignDecision::Assault,
+                        != crate::ai_standard::island_campaign::IslandCampaignDecision::Assault,
                 return_after_combat: false,
             };
             new_waves.push(wave);
@@ -4209,10 +3936,10 @@ fn reconnect_unassigned_transport_waves(
             drop_position: None,
             delivered_cargo: Vec::new(),
             allow_partial_departure: assignment.decision
-                != crate::ai::island_campaign::IslandCampaignDecision::Assault,
+                != crate::ai_standard::island_campaign::IslandCampaignDecision::Assault,
             departure_authorized: assignment.operation_ready
                 || assignment.decision
-                    != crate::ai::island_campaign::IslandCampaignDecision::Assault,
+                    != crate::ai_standard::island_campaign::IslandCampaignDecision::Assault,
             return_after_combat: false,
         });
     }
@@ -4223,7 +3950,8 @@ fn reconnect_unassigned_transport_waves(
     let assault_objective = campaign_assignments
         .iter()
         .filter(|assignment| {
-            assignment.decision == crate::ai::island_campaign::IslandCampaignDecision::Assault
+            assignment.decision
+                == crate::ai_standard::island_campaign::IslandCampaignDecision::Assault
         })
         .min_by_key(|assignment| campaign_assignment_priority(assignment))
         .map(|assignment| {
@@ -4235,7 +3963,7 @@ fn reconnect_unassigned_transport_waves(
         })
         .or_else(|| {
             world
-                .get_resource::<crate::ai::v4::victory_roadmap::VictoryRoadmapRegistry>()
+                .get_resource::<crate::ai_standard::v4::victory_roadmap::VictoryRoadmapRegistry>()
                 .and_then(|registry| registry.active_capital_objective(player_id))
                 // 局地portfolioに現れる前は兵站gate未達なので発進させない。
                 .map(|(island_id, anchor)| (island_id, anchor, false))
@@ -4312,7 +4040,7 @@ fn reconnect_current_v4_operations(
     world: &mut World,
     manager: &mut SquadManager,
     player_id: PlayerId,
-    campaign_assignments: &[crate::ai::island_campaign::IslandCampaignAssignment],
+    campaign_assignments: &[crate::ai_standard::island_campaign::IslandCampaignAssignment],
 ) {
     // portfolio生成後の排他正規化や手番途中の完了でSquadだけを失っても、Campaign ownerは
     // 正本台帳に残る。集計時点のVecだけを再生するとこのEntityが再びReserveへ落ちるため、
@@ -4382,7 +4110,7 @@ fn reconnect_current_v4_operations(
     }
     // 生産目的を持つEntityも、対象消滅やSquad完了後に汎用Reserveへ落とさず、
     // 永続PlanのForming/Executeへ再接続する。
-    crate::ai::v4::deployment::prepare_deployment_squads(
+    crate::ai_standard::v4::deployment::prepare_deployment_squads(
         world,
         manager,
         player_id,
@@ -4433,7 +4161,7 @@ fn reconnect_v4_operation_fixed_point(
     world: &mut World,
     manager: &mut SquadManager,
     player_id: PlayerId,
-    campaign_assignments: &[crate::ai::island_campaign::IslandCampaignAssignment],
+    campaign_assignments: &[crate::ai_standard::island_campaign::IslandCampaignAssignment],
 ) {
     for _ in 0..3 {
         let before = unassigned_entity_ids(world, manager, player_id);
@@ -4453,13 +4181,13 @@ fn reconnect_v4_operation_fixed_point(
 /// 手番途中のDrop/Capture/作戦完了でSquad参照を失ったV4 Entityだけを再接続する。
 /// 戦略分析や生産計画は再実行せず、cache済みportfolioと現在の正規台帳を使う。
 pub(crate) fn reconcile_v4_end_turn_reserves(world: &mut World, player_id: PlayerId) {
-    if crate::ai::resolve_player_ai_version(world, player_id)
-        != crate::ai::ai_version::AiVersion::V4
+    if crate::ai_standard::resolve_player_ai_version(world, player_id)
+        != crate::ai_standard::ai_version::AiVersion::V4
     {
         return;
     }
     let campaign_assignments = world
-        .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+        .get_resource::<crate::ai_standard::engine::AiTurnStrategyCache>()
         .and_then(|cache| cache.campaign_portfolio(player_id))
         .map(|portfolio| {
             portfolio
@@ -4494,12 +4222,10 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     update_squads(world, perspective_player);
 
     // V3 の戦略拡張 (#53: 敵拠点の奪取目標化) を有効にするかどうか
-    let is_v3 = crate::ai::resolve_player_ai_version(world, perspective_player).uses_v3_tactics();
-    let is_v4 = crate::ai::resolve_player_ai_version(world, perspective_player)
+    let is_v3 =
+        crate::ai_standard::resolve_player_ai_version(world, perspective_player).uses_v3_tactics();
+    let is_v4 = crate::ai_standard::resolve_player_ai_version(world, perspective_player)
         .uses_operation_driven_production();
-    if is_v4 {
-        crate::ai::v4::strategy_pipeline::before_squad_planning(world, perspective_player);
-    }
     let mut manager = world.remove_resource::<SquadManager>().unwrap_or_default();
     // Reserveは永続所有権ではなく「次の再計画までの明示待機」である。
     // 毎手番いったんfree poolへ戻し、新しいcampaign・防衛・攻撃へ再徴用可能にする。
@@ -4519,7 +4245,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         // 防衛もcampaign portfolioの通常優先度・排他割当で扱う。
         let deployment_entities = if is_v4 {
             world
-                .get_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>()
+                .get_resource::<crate::ai_standard::v4::deployment::V4DeploymentRegistry>()
                 .map(|deployments| deployments.active_entities(perspective_player))
                 .unwrap_or_default()
         } else {
@@ -4541,32 +4267,22 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         manager = world.remove_resource::<SquadManager>().unwrap_or_default();
         strategy
     };
-    let roadmap_turn = world
-        .get_resource::<crate::resources::MatchState>()
-        .map_or(0, |state| state.current_turn_number.0);
-    let roadmap_portfolio = if is_v4 {
-        crate::ai::v4::strategy_pipeline::portfolio_for_squads(
-            world,
-            perspective_player,
-            roadmap_turn,
-            strategy.campaign_portfolio.clone(),
-            &manager,
-        )
-    } else {
-        strategy.campaign_portfolio.clone()
-    };
     let enemy_clusters = detect_enemy_clusters(world, perspective_player);
     if is_v3 {
         let mut cache = world
-            .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .remove_resource::<crate::ai_standard::engine::AiTurnStrategyCache>()
             .unwrap_or_default();
-        cache.set_campaign_portfolio(perspective_player, roadmap_portfolio.clone());
+        cache.set_campaign_portfolio(perspective_player, strategy.campaign_portfolio.clone());
         cache.mark_squads_planned(perspective_player);
         world.insert_resource(cache);
-        claim_campaign_portfolio_assignments(world, perspective_player, &roadmap_portfolio);
+        claim_campaign_portfolio_assignments(
+            world,
+            perspective_player,
+            &strategy.campaign_portfolio,
+        );
     }
     let paused_campaign_islands = if is_v3 {
-        campaign_paused_islands(&roadmap_portfolio)
+        campaign_paused_islands(&strategy.campaign_portfolio)
     } else {
         HashSet::new()
     };
@@ -4577,15 +4293,21 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
             perspective_player,
             &paused_campaign_islands,
         );
-        prepare_secure_local_captures(world, &mut manager, perspective_player, &roadmap_portfolio)
+        prepare_secure_local_captures(
+            world,
+            &mut manager,
+            perspective_player,
+            &strategy.campaign_portfolio,
+        )
     } else {
         HashSet::new()
     };
     let mut campaign_assignments: Vec<_> = if is_v3 {
-        roadmap_portfolio
+        strategy
+            .campaign_portfolio
             .defenses
             .iter()
-            .chain(roadmap_portfolio.active_offensives.iter())
+            .chain(strategy.campaign_portfolio.active_offensives.iter())
             .cloned()
             .collect()
     } else {
@@ -4639,7 +4361,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     // 要求元の局地Attack任務へ予約する。
     // 既存campaign assignmentへ残っていても、明示的な生産目的を優先して切り離す。
     if is_v4 {
-        let deployment_reserved = crate::ai::v4::deployment::prepare_deployment_squads(
+        let deployment_reserved = crate::ai_standard::v4::deployment::prepare_deployment_squads(
             world,
             &mut manager,
             perspective_player,
@@ -4663,9 +4385,9 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         .cloned()
         .unwrap_or_default();
     let island_map = world
-        .get_resource::<crate::ai::islands::IslandMap>()
+        .get_resource::<crate::ai_standard::islands::IslandMap>()
         .cloned()
-        .unwrap_or_else(|| crate::ai::islands::IslandMap::analyze(&map));
+        .unwrap_or_else(|| crate::ai_standard::islands::IslandMap::analyze(&map));
 
     // 他の部隊にすでに割り当て済みの全メンバーを特定
     let mut busy_entities = HashSet::new();
@@ -4846,7 +4568,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         };
         let enemy_prod = *enemy_production_count_map.get(&target_id).unwrap_or(&0);
 
-        let objective = crate::ai::objectives::Objective::evaluate(
+        let objective = crate::ai_standard::objectives::Objective::evaluate(
             target_id,
             &props_with_terrain,
             distance_to_nearest_base,
@@ -5165,9 +4887,9 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
             }
             if matches!(
                 assignment.decision,
-                crate::ai::island_campaign::IslandCampaignDecision::Observe
-                    | crate::ai::island_campaign::IslandCampaignDecision::Withdraw
-                    | crate::ai::island_campaign::IslandCampaignDecision::Defend
+                crate::ai_standard::island_campaign::IslandCampaignDecision::Observe
+                    | crate::ai_standard::island_campaign::IslandCampaignDecision::Withdraw
+                    | crate::ai_standard::island_campaign::IslandCampaignDecision::Defend
             ) {
                 continue;
             }
@@ -5282,10 +5004,10 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                 squad.target_island = Some(assignment.island_id);
                 squad.target = Some(assignment.target_position);
                 squad.allow_partial_departure = assignment.decision
-                    != crate::ai::island_campaign::IslandCampaignDecision::Assault;
+                    != crate::ai_standard::island_campaign::IslandCampaignDecision::Assault;
                 squad.departure_authorized = assignment.operation_ready
                     || assignment.decision
-                        != crate::ai::island_campaign::IslandCampaignDecision::Assault;
+                        != crate::ai_standard::island_campaign::IslandCampaignDecision::Assault;
                 squad.phase = MissionPhase::Transport(TransportPhase::Pickup);
             }
         }
@@ -5418,7 +5140,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
 
     // #53 (V3): 敵生産施設への突入 (スピアヘッド) は戦力優勢 (Assault フェーズ)
     // のときのみ許可する。拮抗・劣勢時に前線から兵力を抜くと防衛線が崩壊する
-    let allow_facility_capture = strategy.phase == crate::ai::strategy::GamePhase::Assault;
+    let allow_facility_capture = strategy.phase == crate::ai_standard::strategy::GamePhase::Assault;
 
     for unowned_pos in &capture_targets {
         // #53 (V3): 敵生産施設への奪取部隊は同時 MAX_CONCURRENT_FACILITY_CAPTURES 個まで
@@ -5576,7 +5298,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
 
         // ステップ1: 定員未満の既存 Attack/Defense 部隊のうち、最も近いものを探す
         let mut best_squad_idx = None;
-        let mut min_dist = crate::ai::turn_distance::TurnDistance {
+        let mut min_dist = crate::ai_standard::turn_distance::TurnDistance {
             turns: u32::MAX,
             used_mp: u32::MAX,
         };
@@ -5614,7 +5336,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         } else {
             // ステップ2: 既存部隊がすべて定員に達している場合、
             // 最も近い敵クラスターを目標とする新規 Attack 部隊（第2波）を新設する
-            let mut nearest_cluster_dist = crate::ai::turn_distance::TurnDistance {
+            let mut nearest_cluster_dist = crate::ai_standard::turn_distance::TurnDistance {
                 turns: u32::MAX,
                 used_mp: u32::MAX,
             };
@@ -5689,17 +5411,17 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         );
     }
 
+    if is_v4 {
+        crate::ai_standard::v4::victory_roadmap::reconcile_campaign_roadmap(
+            world,
+            perspective_player,
+            &strategy.campaign_portfolio,
+            &manager,
+        );
+    }
     // campaign・deployment・汎用任務をすべて構築した後に一度だけ正規化する。
     // これ以降の行動選択は重複Squadを見ず、所有者照会も平均O(1)になる。
     reconcile_unique_operation_assignments(world, &mut manager, perspective_player);
-    if is_v4 {
-        crate::ai::v4::strategy_pipeline::after_squad_planning(
-            world,
-            perspective_player,
-            &roadmap_portfolio,
-            &mut manager,
-        );
-    }
     world.insert_resource(manager);
 }
 
@@ -5709,7 +5431,7 @@ fn handoff_delivered_cargo(
     manager: &mut SquadManager,
     player_id: PlayerId,
     cargo: Entity,
-    target_island: Option<crate::ai::islands::IslandId>,
+    target_island: Option<crate::ai_standard::islands::IslandId>,
     preferred_target: Option<GridPosition>,
 ) -> bool {
     if world
@@ -5729,7 +5451,7 @@ fn handoff_delivered_cargo(
         return false;
     };
     let island_map = world
-        .get_resource::<crate::ai::islands::IslandMap>()
+        .get_resource::<crate::ai_standard::islands::IslandMap>()
         .cloned();
     let Some(map) = world.get_resource::<Map>().cloned() else {
         return false;
@@ -5845,7 +5567,7 @@ fn handoff_delivered_cargo(
 fn get_target_position_for_island(
     map: &Map,
     registry: &MasterDataRegistry,
-    island: &crate::ai::islands::Island,
+    island: &crate::ai_standard::islands::Island,
     t_pos: GridPosition,
     movement_type: crate::resources::MovementType,
 ) -> Option<GridPosition> {
@@ -5887,40 +5609,6 @@ fn get_target_position_for_island(
     }
 }
 
-/// 輸送役が次手番の降車候補へ近づくための移動目標を返す。
-///
-/// `target_island` の最寄りセルだけを選ぶと、輸送役がすでにその島にいる場合は
-/// 現在地自身が選ばれる。そこで、輸送役が実際に進入できる明示目標を優先する。
-/// 港以外を通れない輸送船は従来どおり島内のPort/Shoalを航行目標にする。
-fn transport_navigation_target(
-    map: &Map,
-    registry: &MasterDataRegistry,
-    island: &crate::ai::islands::Island,
-    transport_position: GridPosition,
-    movement_type: crate::resources::MovementType,
-    requested_target: Option<GridPosition>,
-) -> Option<GridPosition> {
-    if let Some(target) = requested_target
-        && island.tiles.contains(&target)
-        && map
-            .get_terrain(target.x, target.y)
-            .and_then(|terrain| {
-                crate::systems::movement::get_valid_movement_cost(registry, movement_type, terrain)
-            })
-            .is_some()
-        && is_terrain_reachable(
-            map,
-            registry,
-            (transport_position.x, transport_position.y),
-            (target.x, target.y),
-            movement_type,
-        )
-    {
-        return Some(target);
-    }
-    get_target_position_for_island(map, registry, island, transport_position, movement_type)
-}
-
 /// 現在ターンに到達可能な輸送位置から、合法・到達可能・低脅威な降車位置を選びます。
 fn select_landing_candidate(
     world: &mut World,
@@ -5928,7 +5616,7 @@ fn select_landing_candidate(
     cargo_entity: Entity,
     transport_position: GridPosition,
     reachable: &std::collections::BTreeSet<(usize, usize)>,
-    target_island: Option<crate::ai::islands::IslandId>,
+    target_island: Option<crate::ai_standard::islands::IslandId>,
     target_position: Option<GridPosition>,
 ) -> Option<(GridPosition, GridPosition)> {
     let cargo_stats = world.get::<UnitStats>(cargo_entity).cloned()?;
@@ -5940,7 +5628,7 @@ fn select_landing_candidate(
     let map = world.resource::<Map>().clone();
     let registry = world.resource::<MasterDataRegistry>().clone();
     let island_map = world
-        .get_resource::<crate::ai::islands::IslandMap>()
+        .get_resource::<crate::ai_standard::islands::IslandMap>()
         .cloned();
     let damage_chart = world
         .get_resource::<crate::resources::DamageChart>()
@@ -5967,58 +5655,24 @@ fn select_landing_candidate(
     reachable_positions.sort_by_key(|position| (position.1, position.0));
     let mut best = None;
     let empty_occupants = HashMap::new();
-    // 輸送船の作戦目標は、港・浅瀬のように輸送船だけが進入できるセルになることがある。
-    // この場合、貨物の経路をそのセルから逆算すると空の距離表になり、合法な揚陸候補まで
-    // 全て除外してしまう。貨物が進入できる目標では到達ターンを使い、それ以外では
-    // 目標岸へのグリッド距離を使って、前進する揚陸点を選ぶ。
-    let cargo_can_enter_target = target_position.is_none_or(|target| {
-        map.get_terrain(target.x, target.y)
-            .and_then(|terrain| {
-                crate::systems::movement::get_valid_movement_cost(
-                    &registry,
-                    cargo_stats.movement_type,
-                    terrain,
-                )
-            })
-            .is_some()
+    let target_distances = target_position.map(|target| {
+        calculate_all_turn_distances(
+            &map,
+            &registry,
+            &empty_occupants,
+            (target.x, target.y),
+            cargo_stats.movement_type,
+            cargo_stats.max_movement,
+            0,
+            cargo_faction,
+        )
     });
-    let target_distances = if cargo_can_enter_target {
-        target_position.map(|target| {
-            calculate_all_turn_distances(
-                &map,
-                &registry,
-                &empty_occupants,
-                (target.x, target.y),
-                cargo_stats.movement_type,
-                cargo_stats.max_movement,
-                0,
-                cargo_faction,
-            )
-        })
-    } else {
-        None
-    };
 
     for (transport_x, transport_y) in reachable_positions {
         let candidate_transport = GridPosition {
             x: transport_x,
             y: transport_y,
         };
-        // 浅瀬を目的にした便は、出港地の岸でも降ろせてしまう。まだ目標岸へ
-        // 到着していない段階での手前揚陸を防ぎ、目標浅瀬かその隣接地点まで
-        // 移動してから貨物を降ろす。
-        if !cargo_can_enter_target
-            && target_position.is_some_and(|target| {
-                map.distance(
-                    candidate_transport.x,
-                    candidate_transport.y,
-                    target.x,
-                    target.y,
-                ) > 1
-            })
-        {
-            continue;
-        }
         let mut drop_tiles = crate::systems::transport::get_droppable_tiles_at(
             world,
             transport_entity,
@@ -6040,13 +5694,11 @@ fn select_landing_candidate(
             }) {
                 continue;
             }
-            let progress = if let Some(distances) = &target_distances {
+            let turns = if let Some(distances) = &target_distances {
                 let Some(distance) = distances.get(&drop_position) else {
                     continue;
                 };
                 distance.turns
-            } else if let Some(target) = target_position {
-                map.distance(drop_position.x, drop_position.y, target.x, target.y)
             } else {
                 0
             };
@@ -6056,7 +5708,7 @@ fn select_landing_candidate(
                 .map(|terrain| registry.get_terrain_defense_bonus(terrain))
                 .unwrap_or(0);
             let danger = damage_chart.as_ref().map_or(0, |chart| {
-                crate::ai::threat::indirect_fire_expected_loss(
+                crate::ai_standard::threat::indirect_fire_expected_loss(
                     &map,
                     (drop_position.x, drop_position.y),
                     cargo_stats.unit_type,
@@ -6075,7 +5727,7 @@ fn select_landing_candidate(
             ) as usize;
             let score = (
                 danger,
-                progress,
+                turns,
                 transport_distance,
                 drop_y,
                 drop_x,
@@ -6231,7 +5883,7 @@ pub fn execute_transport_squad_step(
     world: &mut World,
     squad: &mut Squad,
     skip_entities: &std::collections::HashSet<Entity>,
-) -> Option<(Entity, crate::ai::engine::AiCommand)> {
+) -> Option<(Entity, crate::ai_standard::engine::AiCommand)> {
     let transport_entity = squad.transport_entity?;
 
     let (t_pos, t_stats, t_fuel, t_faction) = {
@@ -6274,7 +5926,7 @@ pub fn execute_transport_squad_step(
                     .is_some_and(|action| !action.0);
             return transport_available.then_some((
                 transport_entity,
-                crate::ai::engine::AiCommand::Wait { target_pos: t_pos },
+                crate::ai_standard::engine::AiCommand::Wait { target_pos: t_pos },
             ));
         }
     }
@@ -6315,7 +5967,7 @@ pub fn execute_transport_squad_step(
     {
         return Some((
             cargo,
-            crate::ai::engine::AiCommand::Load {
+            crate::ai_standard::engine::AiCommand::Load {
                 transport_entity,
                 target_pos: t_pos,
             },
@@ -6425,7 +6077,7 @@ pub fn execute_transport_squad_step(
             if dist == 0 && !cargo_action_completed && !must_vacate_production_site {
                 return Some((
                     cargo_entity,
-                    crate::ai::engine::AiCommand::Load {
+                    crate::ai_standard::engine::AiCommand::Load {
                         transport_entity,
                         target_pos: t_pos,
                     },
@@ -6441,12 +6093,12 @@ pub fn execute_transport_squad_step(
                 let mut best_tile = t_pos;
                 let mut min_score = None;
 
-                let mut cache = crate::ai::turn_distance::TurnDistanceCache::default();
+                let mut cache = crate::ai_standard::turn_distance::TurnDistanceCache::default();
                 let map = world.resource::<Map>();
                 let registry = world.resource::<MasterDataRegistry>();
 
                 for target_tile in &reachable {
-                    let t_dist = crate::ai::turn_distance::calculate_turn_distance(
+                    let t_dist = crate::ai_standard::turn_distance::calculate_turn_distance(
                         map,
                         registry,
                         &unit_positions,
@@ -6474,7 +6126,7 @@ pub fn execute_transport_squad_step(
                 }
                 return Some((
                     transport_entity,
-                    crate::ai::engine::AiCommand::Wait {
+                    crate::ai_standard::engine::AiCommand::Wait {
                         target_pos: best_tile,
                     },
                 ));
@@ -6513,7 +6165,7 @@ pub fn execute_transport_squad_step(
                 if cargo_reachable.contains(&(t_pos.x, t_pos.y)) {
                     return Some((
                         cargo_entity,
-                        crate::ai::engine::AiCommand::Load {
+                        crate::ai_standard::engine::AiCommand::Load {
                             transport_entity,
                             target_pos: t_pos,
                         },
@@ -6523,7 +6175,7 @@ pub fn execute_transport_squad_step(
                 let mut best_tile = cargo_pos;
                 let mut min_score = None;
 
-                let mut cache = crate::ai::turn_distance::TurnDistanceCache::default();
+                let mut cache = crate::ai_standard::turn_distance::TurnDistanceCache::default();
                 let map = world.resource::<Map>();
                 let registry = world.resource::<MasterDataRegistry>();
                 let cargo_goal = if t_pos == pickup_position {
@@ -6564,7 +6216,7 @@ pub fn execute_transport_squad_step(
                 };
 
                 for target_tile in &cargo_reachable {
-                    let t_dist = crate::ai::turn_distance::calculate_turn_distance(
+                    let t_dist = crate::ai_standard::turn_distance::calculate_turn_distance(
                         map,
                         registry,
                         &unit_positions,
@@ -6593,7 +6245,7 @@ pub fn execute_transport_squad_step(
 
                 return Some((
                     cargo_entity,
-                    crate::ai::engine::AiCommand::Wait {
+                    crate::ai_standard::engine::AiCommand::Wait {
                         target_pos: best_tile,
                     },
                 ));
@@ -6610,20 +6262,20 @@ pub fn execute_transport_squad_step(
             }
             if let Some(target_island_id) = squad.target_island {
                 let (island_tiles, target_pos) = {
-                    if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>()
+                    if let Some(island_map) =
+                        world.get_resource::<crate::ai_standard::islands::IslandMap>()
                     {
                         if let Some(island) =
                             island_map.islands.iter().find(|i| i.id == target_island_id)
                         {
                             let map = world.resource::<Map>();
                             let registry = world.resource::<MasterDataRegistry>();
-                            let target_pos = transport_navigation_target(
+                            let target_pos = get_target_position_for_island(
                                 map,
                                 registry,
                                 island,
                                 t_pos,
                                 t_stats.movement_type,
-                                squad.target,
                             );
                             (Some(island.tiles.clone()), target_pos)
                         } else {
@@ -6648,7 +6300,7 @@ pub fn execute_transport_squad_step(
                         squad.phase = MissionPhase::Transport(TransportPhase::Drop);
                         return Some((
                             transport_entity,
-                            crate::ai::engine::AiCommand::Drop {
+                            crate::ai_standard::engine::AiCommand::Drop {
                                 transport_target_pos: transport_target,
                                 cargo_drop_pos: drop_target,
                                 cargo_entity,
@@ -6659,12 +6311,12 @@ pub fn execute_transport_squad_step(
                     let mut best_tile = t_pos;
                     let mut min_score = None;
 
-                    let mut cache = crate::ai::turn_distance::TurnDistanceCache::default();
+                    let mut cache = crate::ai_standard::turn_distance::TurnDistanceCache::default();
                     let map = world.resource::<Map>();
                     let registry = world.resource::<MasterDataRegistry>();
 
                     for target_tile in &reachable {
-                        let t_dist = crate::ai::turn_distance::calculate_turn_distance(
+                        let t_dist = crate::ai_standard::turn_distance::calculate_turn_distance(
                             map,
                             registry,
                             &unit_positions,
@@ -6693,7 +6345,7 @@ pub fn execute_transport_squad_step(
 
                     return Some((
                         transport_entity,
-                        crate::ai::engine::AiCommand::Wait {
+                        crate::ai_standard::engine::AiCommand::Wait {
                             target_pos: best_tile,
                         },
                     ));
@@ -6721,7 +6373,7 @@ pub fn execute_transport_squad_step(
                 squad.drop_position = Some(drop_target);
                 return Some((
                     transport_entity,
-                    crate::ai::engine::AiCommand::Drop {
+                    crate::ai_standard::engine::AiCommand::Drop {
                         transport_target_pos: transport_target,
                         cargo_drop_pos: drop_target,
                         cargo_entity,
@@ -6730,39 +6382,42 @@ pub fn execute_transport_squad_step(
             }
 
             if let Some(target_island_id) = squad.target_island {
-                if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() {
+                if let Some(island_map) =
+                    world.get_resource::<crate::ai_standard::islands::IslandMap>()
+                {
                     if let Some(island) =
                         island_map.islands.iter().find(|i| i.id == target_island_id)
                     {
                         let map = world.resource::<Map>();
                         let registry = world.resource::<MasterDataRegistry>();
-                        if let Some(target_pos) = transport_navigation_target(
+                        if let Some(target_pos) = get_target_position_for_island(
                             map,
                             registry,
                             island,
                             t_pos,
                             t_stats.movement_type,
-                            squad.target,
                         ) {
                             let mut best_tile = t_pos;
                             let mut min_score = None;
-                            let mut cache = crate::ai::turn_distance::TurnDistanceCache::default();
+                            let mut cache =
+                                crate::ai_standard::turn_distance::TurnDistanceCache::default();
                             let map = world.resource::<Map>();
                             let registry = world.resource::<MasterDataRegistry>();
 
                             for target_tile in &reachable {
-                                let t_dist = crate::ai::turn_distance::calculate_turn_distance(
-                                    map,
-                                    registry,
-                                    &unit_positions,
-                                    (target_tile.0, target_tile.1),
-                                    (target_pos.x, target_pos.y),
-                                    t_stats.movement_type,
-                                    t_stats.max_movement,
-                                    1, // 目標に隣接するマスを目指す
-                                    t_faction,
-                                    &mut cache,
-                                );
+                                let t_dist =
+                                    crate::ai_standard::turn_distance::calculate_turn_distance(
+                                        map,
+                                        registry,
+                                        &unit_positions,
+                                        (target_tile.0, target_tile.1),
+                                        (target_pos.x, target_pos.y),
+                                        t_stats.movement_type,
+                                        t_stats.max_movement,
+                                        1, // 目標に隣接するマスを目指す
+                                        t_faction,
+                                        &mut cache,
+                                    );
                                 let m_dist = (target_tile.0 as i32 - target_pos.x as i32).abs()
                                     + (target_tile.1 as i32 - target_pos.y as i32).abs();
                                 let score = (t_dist, m_dist, target_tile.0, target_tile.1);
@@ -6777,7 +6432,7 @@ pub fn execute_transport_squad_step(
                             }
                             return Some((
                                 transport_entity,
-                                crate::ai::engine::AiCommand::Wait {
+                                crate::ai_standard::engine::AiCommand::Wait {
                                     target_pos: best_tile,
                                 },
                             ));
@@ -6787,7 +6442,7 @@ pub fn execute_transport_squad_step(
             }
             return Some((
                 transport_entity,
-                crate::ai::engine::AiCommand::Wait { target_pos: t_pos },
+                crate::ai_standard::engine::AiCommand::Wait { target_pos: t_pos },
             ));
         }
         TransportPhase::Return => {
@@ -6826,18 +6481,18 @@ pub fn execute_transport_squad_step(
             let Some(nearest_prop_pos) = return_targets.first().map(|target| target.3) else {
                 return Some((
                     transport_entity,
-                    crate::ai::engine::AiCommand::Wait { target_pos: t_pos },
+                    crate::ai_standard::engine::AiCommand::Wait { target_pos: t_pos },
                 ));
             };
 
             let mut best_tile = t_pos;
             let mut min_turn_dist = 999.0;
-            let mut cache = crate::ai::turn_distance::TurnDistanceCache::default();
+            let mut cache = crate::ai_standard::turn_distance::TurnDistanceCache::default();
             let map = world.resource::<Map>();
             let registry = world.resource::<MasterDataRegistry>();
 
             for target_tile in &reachable {
-                let t_dist = crate::ai::turn_distance::calculate_turn_distance(
+                let t_dist = crate::ai_standard::turn_distance::calculate_turn_distance(
                     map,
                     registry,
                     &unit_positions,
@@ -6869,7 +6524,7 @@ pub fn execute_transport_squad_step(
             }
             return Some((
                 transport_entity,
-                crate::ai::engine::AiCommand::Wait {
+                crate::ai_standard::engine::AiCommand::Wait {
                     target_pos: best_tile,
                 },
             ));
@@ -6904,160 +6559,9 @@ mod tests {
 
         // Setup a small map
         world.insert_resource(map.clone());
-        world.insert_resource(crate::ai::islands::IslandMap::analyze(&map));
+        world.insert_resource(crate::ai_standard::islands::IslandMap::analyze(&map));
         world.insert_resource(SquadManager::new());
         world
-    }
-
-    #[test]
-    fn transport_navigation_uses_explicit_target_on_the_current_island() {
-        let world = setup_test_world();
-        let map = world.resource::<Map>();
-        let registry = world.resource::<MasterDataRegistry>();
-        let islands = crate::ai::islands::IslandMap::analyze(map);
-        let transport_position = GridPosition { x: 6, y: 3 };
-        let target = GridPosition { x: 3, y: 1 };
-        let island = islands
-            .get_island_at(&transport_position)
-            .expect("輸送役がいる島");
-
-        // 島だけを目標にすると現在地を選んでしまうが、明示目標へ進めること。
-        assert_eq!(
-            transport_navigation_target(
-                map,
-                registry,
-                island,
-                transport_position,
-                MovementType::Air,
-                Some(target),
-            ),
-            Some(target)
-        );
-    }
-
-    #[test]
-    fn map26_combat_routes_target_bridgeheads_until_ground_crossing() {
-        use crate::ai::island_campaign::{
-            IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
-        };
-
-        let master_data = MasterDataRegistry::load().unwrap();
-        let (mut world, _schedule) = crate::setup::initialize_world_from_master_data_with_topology(
-            &master_data,
-            "map_26",
-            GridTopology::Square,
-        )
-        .expect("map_26 initialization should succeed");
-        let player = PlayerId(1);
-        let own_capital = world
-            .iter_entities()
-            .find_map(|entity| {
-                let position = entity.get::<GridPosition>()?;
-                let property = entity.get::<Property>()?;
-                (property.terrain == Terrain::Capital && property.owner_id == Some(player))
-                    .then_some(*position)
-            })
-            .expect("own capital");
-        let island_id = world
-            .resource::<crate::ai::islands::IslandMap>()
-            .get_island_at(&own_capital)
-            .expect("capital island")
-            .id;
-        let members = (0..2)
-            .map(|_| {
-                world
-                    .spawn((
-                        Faction(player),
-                        own_capital,
-                        UnitStats {
-                            unit_type: UnitType::Tank,
-                            movement_type: MovementType::Tank,
-                            max_movement: 6,
-                            ..UnitStats::mock()
-                        },
-                    ))
-                    .id()
-            })
-            .collect::<Vec<_>>();
-        let requirement = IslandCampaignRequirement {
-            preferred_transport: None,
-            transport_slots: 0,
-            capture_units: 0,
-            ground_combat_units: 2,
-            combat_units: 0,
-            total_budget: 14_000,
-        };
-        let assignment = IslandCampaignAssignment {
-            island_id,
-            decision: IslandCampaignDecision::Secure,
-            target_position: GridPosition { x: 13, y: 9 },
-            capture_target_positions: vec![GridPosition { x: 13, y: 9 }],
-            priority_enemy_types: Vec::new(),
-            requirement: requirement.clone(),
-            purchase_shortfall: requirement,
-            allocated_budget: 14_000,
-            transport_entities: Vec::new(),
-            capture_entities: Vec::new(),
-            combat_entities: members.clone(),
-            operation_ready: true,
-            continued_from_existing_squad: false,
-        };
-
-        let responsibilities = campaign_combat_responsibilities(
-            &world,
-            player,
-            &assignment,
-            &members,
-            &mut TerrainConnectivity::default(),
-        );
-        let targets = responsibilities
-            .iter()
-            .map(|responsibility| responsibility.target)
-            .collect::<HashSet<_>>();
-
-        assert_eq!(responsibilities.len(), 2);
-        assert!(
-            responsibilities
-                .iter()
-                .all(|responsibility| responsibility.mission_type == MissionType::Defense)
-        );
-        assert_eq!(
-            targets,
-            HashSet::from([GridPosition { x: 14, y: 4 }, GridPosition { x: 11, y: 17 },])
-        );
-
-        // Secureの占領要員を固定的にDefenseへ抜き取らない。CaptureとCombatは同じ
-        // campaignの別責務として保ち、橋頭堡を担うのは需要配分済みの装甲Combatだけにする。
-    }
-
-    #[test]
-    fn combat_members_follow_precomputed_route_slots_without_duplicate_ownership() {
-        let mut world = setup_test_world();
-        let player = PlayerId(1);
-        let first = world
-            .spawn((Faction(player), GridPosition { x: 2, y: 5 }))
-            .id();
-        let second = world
-            .spawn((Faction(player), GridPosition { x: 2, y: 5 }))
-            .id();
-        let map = world.resource::<Map>().clone();
-        let fronts = vec![GridPosition { x: 7, y: 1 }, GridPosition { x: 7, y: 9 }];
-
-        let distributed = distribute_members_across_route_fronts(
-            &world,
-            &map,
-            &[first, second],
-            &fronts,
-            &[1, 1],
-        );
-
-        assert_eq!(distributed.len(), 2);
-        assert!(
-            distributed.iter().all(|members| members.len() == 1),
-            "戦役需要から既に決まった二枠へ、同じEntityを重複させず配属する"
-        );
-        let assigned = distributed.into_iter().flatten().collect::<HashSet<_>>();
-        assert_eq!(assigned, HashSet::from([first, second]));
     }
 
     #[test]
@@ -7074,8 +6578,8 @@ mod tests {
                 },
             ))
             .id();
-        let intended_island = crate::ai::islands::IslandId(7);
-        let stale_island = crate::ai::islands::IslandId(5);
+        let intended_island = crate::ai_standard::islands::IslandId(7);
+        let stale_island = crate::ai_standard::islands::IslandId(5);
         let mut registry = UnitOperationRegistry::default();
         registry.assign(
             entity,
@@ -7148,7 +6652,7 @@ mod tests {
                 },
             ))
             .id();
-        let island = crate::ai::islands::IslandId(3);
+        let island = crate::ai_standard::islands::IslandId(3);
         let mut manager = SquadManager::new();
         let generic = manager.create_owned_squad(MissionType::Defense, player);
         generic.members.insert(entity);
@@ -7187,7 +6691,7 @@ mod tests {
                 },
             ))
             .id();
-        let island = crate::ai::islands::IslandId(3);
+        let island = crate::ai_standard::islands::IslandId(3);
         let mut registry = UnitOperationRegistry::default();
         registry.assign(
             stale,
@@ -7202,7 +6706,7 @@ mod tests {
             },
         );
         world.insert_resource(registry);
-        let requirement = crate::ai::island_campaign::IslandCampaignRequirement {
+        let requirement = crate::ai_standard::island_campaign::IslandCampaignRequirement {
             preferred_transport: None,
             transport_slots: 0,
             capture_units: 0,
@@ -7210,22 +6714,24 @@ mod tests {
             combat_units: 0,
             total_budget: 0,
         };
-        let portfolio = crate::ai::island_campaign::IslandCampaignPortfolio {
-            active_offensives: vec![crate::ai::island_campaign::IslandCampaignAssignment {
-                island_id: island,
-                decision: crate::ai::island_campaign::IslandCampaignDecision::Contest,
-                target_position: GridPosition { x: 3, y: 3 },
-                capture_target_positions: Vec::new(),
-                priority_enemy_types: Vec::new(),
-                requirement: requirement.clone(),
-                purchase_shortfall: requirement,
-                allocated_budget: 0,
-                transport_entities: Vec::new(),
-                capture_entities: Vec::new(),
-                combat_entities: Vec::new(),
-                operation_ready: true,
-                continued_from_existing_squad: true,
-            }],
+        let portfolio = crate::ai_standard::island_campaign::IslandCampaignPortfolio {
+            active_offensives: vec![
+                crate::ai_standard::island_campaign::IslandCampaignAssignment {
+                    island_id: island,
+                    decision: crate::ai_standard::island_campaign::IslandCampaignDecision::Contest,
+                    target_position: GridPosition { x: 3, y: 3 },
+                    capture_target_positions: Vec::new(),
+                    priority_enemy_types: Vec::new(),
+                    requirement: requirement.clone(),
+                    purchase_shortfall: requirement,
+                    allocated_budget: 0,
+                    transport_entities: Vec::new(),
+                    capture_entities: Vec::new(),
+                    combat_entities: Vec::new(),
+                    operation_ready: true,
+                    continued_from_existing_squad: true,
+                },
+            ],
             ..Default::default()
         };
 
@@ -7254,7 +6760,7 @@ mod tests {
                 },
             ))
             .id();
-        let island = crate::ai::islands::IslandId(3);
+        let island = crate::ai_standard::islands::IslandId(3);
         let mut manager = SquadManager::new();
         let first = manager.create_owned_squad(MissionType::Transport, player);
         let first_id = first.id;
@@ -7474,12 +6980,12 @@ mod tests {
     /// 編成されること、V2 では従来通り編成されないことを検証する
     #[test]
     fn test_v3_capture_squad_targets_enemy_property() {
-        let run = |version: crate::ai::ai_version::AiVersion| -> Option<GridPosition> {
+        let run = |version: crate::ai_standard::ai_version::AiVersion| -> Option<GridPosition> {
             let mut world = setup_test_world();
             let p1 = PlayerId(1);
             let p2 = PlayerId(2);
 
-            let mut settings = crate::ai::ai_version::PlayerAiSettings::new();
+            let mut settings = crate::ai_standard::ai_version::PlayerAiSettings::new();
             settings.set_version(p1, version);
             settings.set_version(p2, version);
             world.insert_resource(settings);
@@ -7526,14 +7032,14 @@ mod tests {
 
         // V2: 敵拠点は占領部隊の対象にならない (従来挙動)
         assert_eq!(
-            run(crate::ai::ai_version::AiVersion::V2),
+            run(crate::ai_standard::ai_version::AiVersion::V2),
             None,
             "V2 は敵拠点への占領部隊を編成しないはず"
         );
 
         // V3: 敵拠点を目標とする占領部隊が編成される
         assert_eq!(
-            run(crate::ai::ai_version::AiVersion::V3),
+            run(crate::ai_standard::ai_version::AiVersion::V3),
             Some(GridPosition { x: 5, y: 5 }),
             "V3 は敵拠点 (5,5) への占領部隊を編成するはず"
         );
@@ -7598,8 +7104,8 @@ mod tests {
         let p1 = PlayerId(1);
         let p2 = PlayerId(2);
 
-        let mut settings = crate::ai::ai_version::PlayerAiSettings::new();
-        settings.set_version(p1, crate::ai::ai_version::AiVersion::V3);
+        let mut settings = crate::ai_standard::ai_version::PlayerAiSettings::new();
+        settings.set_version(p1, crate::ai_standard::ai_version::AiVersion::V3);
         world.insert_resource(settings);
 
         world.spawn((
@@ -7661,8 +7167,8 @@ mod tests {
         }
 
         let player = PlayerId(1);
-        let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
-        settings.set_version(player, crate::ai::ai_version::AiVersion::V3);
+        let mut settings = crate::ai_standard::ai_version::PlayerAiSettings::default();
+        settings.set_version(player, crate::ai_standard::ai_version::AiVersion::V3);
         world.insert_resource(settings);
         for entry in &mut world.resource_mut::<Players>().0 {
             entry.funds = 0;
@@ -7675,7 +7181,7 @@ mod tests {
         map.set_terrain(1, 1, Terrain::Airport).unwrap();
         map.set_terrain(4, 1, Terrain::City).unwrap();
         map.set_terrain(6, 1, Terrain::City).unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         world.insert_resource(map);
         world.insert_resource(island_map);
         world.insert_resource(SquadManager::new());
@@ -7818,8 +7324,8 @@ mod tests {
         }
 
         let player = PlayerId(1);
-        let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
-        settings.set_version(player, crate::ai::ai_version::AiVersion::V3);
+        let mut settings = crate::ai_standard::ai_version::PlayerAiSettings::default();
+        settings.set_version(player, crate::ai_standard::ai_version::AiVersion::V3);
         world.insert_resource(settings);
         for entry in &mut world.resource_mut::<Players>().0 {
             entry.funds = 0;
@@ -7831,7 +7337,7 @@ mod tests {
         }
         map.set_terrain(1, 1, Terrain::Airport).unwrap();
         map.set_terrain(4, 1, Terrain::City).unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         world.insert_resource(map);
         world.insert_resource(island_map);
         world.insert_resource(SquadManager::new());
@@ -7954,8 +7460,8 @@ mod tests {
 
         let player = PlayerId(1);
         let opponent = PlayerId(2);
-        let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
-        settings.set_version(player, crate::ai::ai_version::AiVersion::V3);
+        let mut settings = crate::ai_standard::ai_version::PlayerAiSettings::default();
+        settings.set_version(player, crate::ai_standard::ai_version::AiVersion::V3);
         world.insert_resource(settings);
         for entry in &mut world.resource_mut::<Players>().0 {
             entry.funds = if entry.id == player { 32_700 } else { 0 };
@@ -7968,7 +7474,7 @@ mod tests {
         map.set_terrain(3, 1, Terrain::Shoal).unwrap();
         map.set_terrain(target.x, target.y, Terrain::Capital)
             .unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         world.insert_resource(map);
         world.insert_resource(island_map);
         world.insert_resource(SquadManager::new());
@@ -8216,7 +7722,7 @@ mod tests {
     struct ReadyAssaultFixture {
         world: World,
         load_schedule: Schedule,
-        target_island: crate::ai::islands::IslandId,
+        target_island: crate::ai_standard::islands::IslandId,
         lander: Entity,
         helicopter: Entity,
         cargo: [Entity; 4],
@@ -8233,8 +7739,8 @@ mod tests {
 
         let player = PlayerId(1);
         let opponent = PlayerId(2);
-        let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
-        settings.set_version(player, crate::ai::ai_version::AiVersion::V3);
+        let mut settings = crate::ai_standard::ai_version::PlayerAiSettings::default();
+        settings.set_version(player, crate::ai_standard::ai_version::AiVersion::V3);
         world.insert_resource(settings);
         world.resource_mut::<MatchState>().current_phase = Phase::Main;
         for entry in &mut world.resource_mut::<Players>().0 {
@@ -8250,7 +7756,7 @@ mod tests {
         map.set_terrain(3, 1, Terrain::Shoal).unwrap();
         map.set_terrain(target.x, target.y, Terrain::Capital)
             .unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let target_island = island_map.get_island_at(&target).unwrap().id;
         world.insert_resource(map);
         world.insert_resource(island_map);
@@ -8526,12 +8032,12 @@ mod tests {
                         .expect("Pickup squad must advance toward loading");
                 assert!(matches!(
                     command,
-                    crate::ai::engine::AiCommand::Load { .. }
-                        | crate::ai::engine::AiCommand::Wait { .. }
+                    crate::ai_standard::engine::AiCommand::Load { .. }
+                        | crate::ai_standard::engine::AiCommand::Wait { .. }
                 ));
                 executed_steps.push((entity, format!("{command:?}")));
                 fixture.world.insert_resource(manager);
-                crate::ai::engine::execute_ai_command(&mut fixture.world, entity, command);
+                crate::ai_standard::engine::execute_ai_command(&mut fixture.world, entity, command);
                 fixture.load_schedule.run(&mut fixture.world);
             }
             update_squads(&mut fixture.world, player);
@@ -9095,13 +8601,18 @@ mod tests {
         );
     }
 
-    fn setup_transport_phase_world() -> (World, Entity, Entity, Entity, crate::ai::islands::IslandId)
-    {
+    fn setup_transport_phase_world() -> (
+        World,
+        Entity,
+        Entity,
+        Entity,
+        crate::ai_standard::islands::IslandId,
+    ) {
         let mut world = World::new();
         let registry = MasterDataRegistry::load().unwrap();
         let mut map = Map::new(3, 1, Terrain::Plains, GridTopology::Square);
         map.set_terrain(0, 0, Terrain::Shoal).unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let target_island = island_map
             .get_island_at(&GridPosition { x: 2, y: 0 })
             .unwrap()
@@ -9291,8 +8802,8 @@ mod tests {
     fn end_turn_reconcile_keeps_existing_reserve_without_new_unassigned_entity() {
         let mut world = World::new();
         let player = PlayerId(1);
-        let mut ai_settings = crate::ai::PlayerAiSettings::new();
-        ai_settings.set_version(player, crate::ai::AiVersion::V4);
+        let mut ai_settings = crate::ai_standard::PlayerAiSettings::new();
+        ai_settings.set_version(player, crate::ai_standard::AiVersion::V4);
         world.insert_resource(ai_settings);
         let unit = world
             .spawn((
@@ -9357,7 +8868,7 @@ mod tests {
     fn campaign_owner_without_squad_is_reconnected_to_live_campaign_before_reserve() {
         let mut world = World::new();
         let map = Map::new(3, 1, Terrain::Plains, GridTopology::Square);
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let island_id = island_map
             .get_island_at(&GridPosition { x: 1, y: 0 })
             .unwrap()
@@ -9402,13 +8913,13 @@ mod tests {
         stale.target = Some(GridPosition { x: 2, y: 0 });
 
         reconcile_unique_operation_assignments(&mut world, &mut manager, player);
-        let assignment = crate::ai::island_campaign::IslandCampaignAssignment {
+        let assignment = crate::ai_standard::island_campaign::IslandCampaignAssignment {
             island_id,
-            decision: crate::ai::island_campaign::IslandCampaignDecision::Secure,
+            decision: crate::ai_standard::island_campaign::IslandCampaignDecision::Secure,
             target_position: GridPosition { x: 1, y: 0 },
             capture_target_positions: vec![GridPosition { x: 1, y: 0 }],
             priority_enemy_types: Vec::new(),
-            requirement: crate::ai::island_campaign::IslandCampaignRequirement {
+            requirement: crate::ai_standard::island_campaign::IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
                 capture_units: 1,
@@ -9416,7 +8927,7 @@ mod tests {
                 combat_units: 0,
                 total_budget: 0,
             },
-            purchase_shortfall: crate::ai::island_campaign::IslandCampaignRequirement {
+            purchase_shortfall: crate::ai_standard::island_campaign::IslandCampaignRequirement {
                 preferred_transport: None,
                 transport_slots: 0,
                 capture_units: 0,
@@ -9456,7 +8967,7 @@ mod tests {
         let mut map = Map::new(3, 1, Terrain::Sea, GridTopology::Hex);
         map.set_terrain(0, 0, Terrain::Plains).unwrap();
         map.set_terrain(2, 0, Terrain::City).unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let target_island = island_map
             .get_island_at(&GridPosition { x: 2, y: 0 })
             .unwrap()
@@ -9502,7 +9013,7 @@ mod tests {
             placeholder.phase = MissionPhase::Forming;
             placeholder.id
         };
-        let requirement = crate::ai::island_campaign::IslandCampaignRequirement {
+        let requirement = crate::ai_standard::island_campaign::IslandCampaignRequirement {
             preferred_transport: Some(UnitType::TransportHelicopter),
             transport_slots: 2,
             capture_units: 1,
@@ -9510,9 +9021,9 @@ mod tests {
             combat_units: 0,
             total_budget: 5_000,
         };
-        let assignment = crate::ai::island_campaign::IslandCampaignAssignment {
+        let assignment = crate::ai_standard::island_campaign::IslandCampaignAssignment {
             island_id: target_island,
-            decision: crate::ai::island_campaign::IslandCampaignDecision::Expand,
+            decision: crate::ai_standard::island_campaign::IslandCampaignDecision::Expand,
             target_position: GridPosition { x: 2, y: 0 },
             capture_target_positions: vec![GridPosition { x: 2, y: 0 }],
             priority_enemy_types: Vec::new(),
@@ -9553,7 +9064,7 @@ mod tests {
         let map = Map::new(2, 1, Terrain::Plains, GridTopology::Square);
         world.insert_resource(map.clone());
         world.insert_resource(MasterDataRegistry::load().unwrap());
-        world.insert_resource(crate::ai::islands::IslandMap::analyze(&map));
+        world.insert_resource(crate::ai_standard::islands::IslandMap::analyze(&map));
         let player = PlayerId(1);
         let first = world
             .spawn((
@@ -9622,7 +9133,7 @@ mod tests {
         assert_eq!(entity, second);
         assert!(matches!(
             command,
-            crate::ai::engine::AiCommand::Load {
+            crate::ai_standard::engine::AiCommand::Load {
                 transport_entity,
                 ..
             } if transport_entity == transport
@@ -9732,7 +9243,7 @@ mod tests {
         assert_eq!(entity, cargo);
         assert!(matches!(
             command,
-            crate::ai::engine::AiCommand::Load {
+            crate::ai_standard::engine::AiCommand::Load {
                 transport_entity,
                 target_pos: GridPosition { x: 0, y: 0 },
             } if transport_entity == transport
@@ -9824,7 +9335,7 @@ mod tests {
             execute_transport_squad_step(&mut world, &mut squad, &HashSet::new())
                 .expect("transport must vacate the airport before loading");
         assert_eq!(first_entity, transport);
-        let crate::ai::engine::AiCommand::Wait { target_pos } = first_command else {
+        let crate::ai_standard::engine::AiCommand::Wait { target_pos } = first_command else {
             panic!("airport relief must move the transport first");
         };
         assert_ne!(target_pos, GridPosition { x: 1, y: 0 });
@@ -9838,7 +9349,7 @@ mod tests {
         assert_eq!(second_entity, cargo);
         assert!(matches!(
             second_command,
-            crate::ai::engine::AiCommand::Load {
+            crate::ai_standard::engine::AiCommand::Load {
                 transport_entity,
                 target_pos: load_pos,
             } if transport_entity == transport && load_pos == target_pos
@@ -10092,7 +9603,7 @@ mod tests {
         assert_eq!(entity, actionable);
         assert!(matches!(
             command,
-            crate::ai::engine::AiCommand::Load {
+            crate::ai_standard::engine::AiCommand::Load {
                 transport_entity,
                 target_pos: GridPosition { x: 0, y: 0 },
             } if transport_entity == transport
@@ -10168,7 +9679,7 @@ mod tests {
         let mut world = World::new();
         let registry = MasterDataRegistry::load().unwrap();
         let map = Map::new(3, 1, Terrain::Plains, GridTopology::Square);
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let target_island = island_map
             .get_island_at(&GridPosition { x: 2, y: 0 })
             .unwrap()
@@ -10307,7 +9818,7 @@ mod tests {
         map.set_terrain(landing.x, landing.y, Terrain::City)
             .unwrap();
         map.set_terrain(remote.x, remote.y, Terrain::City).unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         world.insert_resource(map);
         world.insert_resource(registry);
         world.insert_resource(island_map);
@@ -10392,7 +9903,7 @@ mod tests {
             .unwrap();
         map.set_terrain(local_target.x, local_target.y, Terrain::City)
             .unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let landing_island = island_map.get_island_at(&landing).unwrap().id;
         world.insert_resource(map);
         world.insert_resource(registry);
@@ -10442,7 +9953,7 @@ mod tests {
         map.set_terrain(city.x, city.y, Terrain::City).unwrap();
         map.set_terrain(preferred_airport.x, preferred_airport.y, Terrain::Airport)
             .unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let island_id = island_map.get_island_at(&landing).unwrap().id;
         world.insert_resource(map);
         world.insert_resource(registry);
@@ -10503,7 +10014,7 @@ mod tests {
         let mut map = Map::new(2, 1, Terrain::Plains, GridTopology::Square);
         map.set_terrain(landing.x, landing.y, Terrain::City)
             .unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let landing_island = island_map.get_island_at(&landing).unwrap().id;
         world.insert_resource(map);
         world.insert_resource(registry);
@@ -10582,7 +10093,7 @@ mod tests {
         }
         map.set_terrain(1, 1, Terrain::Shoal).unwrap();
         map.set_terrain(3, 1, Terrain::Shoal).unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let target_island = island_map
             .get_island_at(&GridPosition { x: 4, y: 0 })
             .unwrap()
@@ -10670,80 +10181,11 @@ mod tests {
     }
 
     #[test]
-    fn landing_toward_shoal_target_does_not_discard_all_infantry_drop_candidates() {
-        let mut world = World::new();
-        let registry = MasterDataRegistry::load().unwrap();
-        let mut map = Map::new(5, 3, Terrain::Sea, GridTopology::Square);
-        for x in 1..=4 {
-            map.set_terrain(x, 0, Terrain::Plains).unwrap();
-        }
-        map.set_terrain(1, 1, Terrain::Shoal).unwrap();
-        map.set_terrain(3, 1, Terrain::Shoal).unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
-        let target_island = island_map
-            .get_island_at(&GridPosition { x: 4, y: 0 })
-            .unwrap()
-            .id;
-        world.insert_resource(map);
-        world.insert_resource(registry);
-        world.insert_resource(island_map);
-
-        let player = PlayerId(1);
-        let cargo = world
-            .spawn((
-                Faction(player),
-                GridPosition { x: 9_999, y: 9_999 },
-                UnitStats {
-                    unit_type: UnitType::Infantry,
-                    movement_type: MovementType::Infantry,
-                    max_movement: 3,
-                    cost: 1_000,
-                    can_capture: true,
-                    ..UnitStats::mock()
-                },
-            ))
-            .id();
-        let transport = world
-            .spawn((
-                Faction(player),
-                GridPosition { x: 1, y: 1 },
-                UnitStats {
-                    unit_type: UnitType::Lander,
-                    movement_type: MovementType::Ship,
-                    max_movement: 6,
-                    max_cargo: 1,
-                    loadable_unit_types: vec![UnitType::Infantry],
-                    ..UnitStats::mock()
-                },
-                CargoCapacity {
-                    max: 1,
-                    loaded: vec![cargo],
-                },
-            ))
-            .id();
-        world.entity_mut(cargo).insert(Transporting(transport));
-
-        let reachable = std::collections::BTreeSet::from([(1, 1), (3, 1)]);
-        let selected = select_landing_candidate(
-            &mut world,
-            transport,
-            cargo,
-            GridPosition { x: 1, y: 1 },
-            &reachable,
-            Some(target_island),
-            Some(GridPosition { x: 3, y: 1 }),
-        )
-        .expect("歩兵が入れない浅瀬を目標にしても、隣接する平地への揚陸を選ぶ");
-        assert_eq!(selected.0, GridPosition { x: 3, y: 1 });
-        assert_eq!(selected.1, GridPosition { x: 3, y: 0 });
-    }
-
-    #[test]
     fn shoal_separated_unit_remains_transport_candidate() {
         let registry = MasterDataRegistry::load().unwrap();
         let mut map = Map::new(3, 1, Terrain::Plains, GridTopology::Square);
         map.set_terrain(1, 0, Terrain::Shoal).unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let target = GridPosition { x: 2, y: 0 };
         let target_island = island_map.get_island_at(&target).unwrap().id;
         let candidate_entity = Entity::from_raw(1);
@@ -10792,7 +10234,7 @@ mod tests {
 
     #[test]
     fn secure_replaces_unreachable_stale_capture_with_allocator_selected_reachable_unit() {
-        use crate::ai::island_campaign::{
+        use crate::ai_standard::island_campaign::{
             IslandCampaignAssessment, IslandCampaignDecision, IslandCampaignPortfolio,
             IslandCampaignState,
         };
@@ -10809,7 +10251,7 @@ mod tests {
             .unwrap();
         map.set_terrain(neutral_city.x, neutral_city.y, Terrain::City)
             .unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let island_id = island_map.get_island_at(&owned_port).unwrap().id;
         world.insert_resource(map);
         world.insert_resource(registry);
@@ -11028,7 +10470,7 @@ mod tests {
         let mixed = manager.create_squad(MissionType::Attack);
         mixed.members = BTreeSet::from([member_a, member_b]);
         mixed.target = Some(GridPosition { x: 3, y: 3 });
-        mixed.target_island = Some(crate::ai::islands::IslandId(0));
+        mixed.target_island = Some(crate::ai_standard::islands::IslandId(0));
         mixed.phase = MissionPhase::MovingToTarget;
         let snapshot = mixed.clone();
         world.insert_resource(manager);
@@ -11052,7 +10494,7 @@ mod tests {
 
     #[test]
     fn defense_preempted_observe_island_releases_stale_forming_operation() {
-        use crate::ai::island_campaign::{
+        use crate::ai_standard::island_campaign::{
             IslandCampaignAssessment, IslandCampaignDecision, IslandCampaignPauseCause,
             IslandCampaignPortfolio, IslandCampaignState,
         };
@@ -11079,7 +10521,7 @@ mod tests {
                 },
             ))
             .id();
-        let island_id = crate::ai::islands::IslandId(0);
+        let island_id = crate::ai_standard::islands::IslandId(0);
         let mut manager = SquadManager::new();
         let stale = manager.create_squad(MissionType::Transport);
         stale.members.insert(transport);
@@ -11134,7 +10576,7 @@ mod tests {
 
     #[test]
     fn defend_does_not_assign_transported_or_unreachable_reserved_entities() {
-        use crate::ai::island_campaign::{
+        use crate::ai_standard::island_campaign::{
             IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
         };
 
@@ -11143,7 +10585,7 @@ mod tests {
         let mut map = Map::new(3, 1, Terrain::Sea, GridTopology::Square);
         map.set_terrain(0, 0, Terrain::City).unwrap();
         map.set_terrain(2, 0, Terrain::Plains).unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let defended_island = island_map
             .get_island_at(&GridPosition { x: 0, y: 0 })
             .unwrap()
@@ -11223,7 +10665,7 @@ mod tests {
 
     #[test]
     fn campaign_attack_uses_a_reachable_ranged_firing_position() {
-        use crate::ai::island_campaign::{
+        use crate::ai_standard::island_campaign::{
             IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
         };
 
@@ -11239,7 +10681,7 @@ mod tests {
             .unwrap();
         map.set_terrain(enemy_position.x, enemy_position.y, Terrain::City)
             .unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let island_id = island_map.get_island_at(&enemy_position).unwrap().id;
         let battleship_stats = registry
             .create_unit_stats(&UnitName(UnitType::Battleship.as_str().to_owned()))
@@ -11323,7 +10765,7 @@ mod tests {
 
     #[test]
     fn campaign_attack_uses_local_hold_when_same_island_enemy_is_unreachable() {
-        use crate::ai::island_campaign::{
+        use crate::ai_standard::island_campaign::{
             IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
         };
 
@@ -11339,7 +10781,7 @@ mod tests {
             .unwrap();
         map.set_terrain(enemy_position.x, enemy_position.y, Terrain::City)
             .unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let island_id = island_map.get_island_at(&enemy_position).unwrap().id;
         world.insert_resource(map);
         world.insert_resource(registry);
@@ -11429,7 +10871,7 @@ mod tests {
 
     #[test]
     fn campaign_combat_partitions_unreachable_members_into_stable_local_duties() {
-        use crate::ai::island_campaign::{
+        use crate::ai_standard::island_campaign::{
             IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
         };
 
@@ -11445,7 +10887,7 @@ mod tests {
             .unwrap();
         map.set_terrain(enemy_position.x, enemy_position.y, Terrain::City)
             .unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let island_id = island_map.get_island_at(&enemy_position).unwrap().id;
         world.insert_resource(map);
         world.insert_resource(registry);
@@ -11604,7 +11046,7 @@ mod tests {
 
     #[test]
     fn campaign_capture_preserves_exact_assigned_facility_over_nearer_property() {
-        use crate::ai::island_campaign::{
+        use crate::ai_standard::island_campaign::{
             IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
         };
 
@@ -11618,7 +11060,7 @@ mod tests {
             .unwrap();
         map.set_terrain(assigned_airport.x, assigned_airport.y, Terrain::Airport)
             .unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let island_id = island_map.get_island_at(&assigned_airport).unwrap().id;
         world.insert_resource(map);
         world.insert_resource(registry);
@@ -11699,7 +11141,7 @@ mod tests {
 
     #[test]
     fn campaign_combat_uses_one_attack_squad_for_a_common_reachable_enemy() {
-        use crate::ai::island_campaign::{
+        use crate::ai_standard::island_campaign::{
             IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
         };
 
@@ -11710,7 +11152,7 @@ mod tests {
         let mut map = Map::new(3, 1, Terrain::Plains, GridTopology::Square);
         map.set_terrain(enemy_position.x, enemy_position.y, Terrain::City)
             .unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let island_id = island_map.get_island_at(&enemy_position).unwrap().id;
         world.insert_resource(map);
         world.insert_resource(registry);
@@ -11811,7 +11253,7 @@ mod tests {
 
     #[test]
     fn campaign_attack_selects_reachable_same_island_enemy() {
-        use crate::ai::island_campaign::{
+        use crate::ai_standard::island_campaign::{
             IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
         };
 
@@ -11822,7 +11264,7 @@ mod tests {
         let mut map = Map::new(3, 1, Terrain::Plains, GridTopology::Square);
         map.set_terrain(enemy_position.x, enemy_position.y, Terrain::City)
             .unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let island_id = island_map.get_island_at(&enemy_position).unwrap().id;
         world.insert_resource(map);
         world.insert_resource(registry);
@@ -11909,14 +11351,14 @@ mod tests {
 
     #[test]
     fn purchase_only_assignment_keeps_forming_placeholder_across_replans() {
-        use crate::ai::island_campaign::{
+        use crate::ai_standard::island_campaign::{
             IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
         };
 
         let world = setup_test_world();
         let player = PlayerId(1);
         let island_id = world
-            .resource::<crate::ai::islands::IslandMap>()
+            .resource::<crate::ai_standard::islands::IslandMap>()
             .get_island_at(&GridPosition { x: 2, y: 2 })
             .unwrap()
             .id;
@@ -11979,7 +11421,7 @@ mod tests {
     /// 作戦島へ自力で飛べる航空戦力は搭載不能な輸送cargoにせず、直接Attackへ割り当てる。
     #[test]
     fn campaign_self_deploying_air_unit_does_not_stall_in_transport_forming() {
-        use crate::ai::island_campaign::{
+        use crate::ai_standard::island_campaign::{
             IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
         };
 
@@ -11991,7 +11433,7 @@ mod tests {
         map.set_terrain(source.x, source.y, Terrain::Airport)
             .unwrap();
         map.set_terrain(target.x, target.y, Terrain::City).unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let target_island = island_map.get_island_at(&target).unwrap().id;
         world.insert_resource(map);
         world.insert_resource(island_map);
@@ -12086,7 +11528,7 @@ mod tests {
 
     #[test]
     fn empty_forming_placeholders_are_isolated_by_explicit_player_owner() {
-        use crate::ai::island_campaign::{
+        use crate::ai_standard::island_campaign::{
             IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
         };
 
@@ -12094,7 +11536,7 @@ mod tests {
         let player_a = PlayerId(1);
         let player_b = PlayerId(2);
         let island_id = world
-            .resource::<crate::ai::islands::IslandMap>()
+            .resource::<crate::ai_standard::islands::IslandMap>()
             .get_island_at(&GridPosition { x: 3, y: 3 })
             .unwrap()
             .id;
@@ -12146,7 +11588,7 @@ mod tests {
 
     #[test]
     fn defend_replaces_same_island_unreachable_stale_member_with_exact_reachable_set() {
-        use crate::ai::island_campaign::{
+        use crate::ai_standard::island_campaign::{
             IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
         };
 
@@ -12161,7 +11603,7 @@ mod tests {
             .unwrap();
         map.set_terrain(defended.x, defended.y, Terrain::City)
             .unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let island_id = island_map.get_island_at(&defended).unwrap().id;
         world.insert_resource(map);
         world.insert_resource(registry);
@@ -12315,7 +11757,7 @@ mod tests {
 
     #[test]
     fn threatened_island_keeps_unowned_property_capture_separate_from_defense() {
-        use crate::ai::island_campaign::{
+        use crate::ai_standard::island_campaign::{
             IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
         };
 
@@ -12329,7 +11771,7 @@ mod tests {
             .unwrap();
         map.set_terrain(neutral.x, neutral.y, Terrain::City)
             .unwrap();
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let island_id = island_map.get_island_at(&neutral).unwrap().id;
         world.insert_resource(map);
         world.insert_resource(registry);
@@ -12423,20 +11865,20 @@ mod tests {
 
     #[test]
     fn v4_local_capture_launches_only_when_intercepting_enemy_has_timely_escort() {
-        use crate::ai::island_campaign::{
+        use crate::ai_standard::island_campaign::{
             IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
         };
 
         let mut world = World::new();
         let registry = MasterDataRegistry::load().unwrap();
         let map = Map::new(5, 1, Terrain::Plains, GridTopology::Square);
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_map = crate::ai_standard::islands::IslandMap::analyze(&map);
         let target = GridPosition { x: 3, y: 0 };
         let island_id = island_map.get_island_at(&target).unwrap().id;
         let player = PlayerId(1);
         let enemy = PlayerId(2);
-        let mut settings = crate::ai::ai_version::PlayerAiSettings::new();
-        settings.set_version(player, crate::ai::ai_version::AiVersion::V4);
+        let mut settings = crate::ai_standard::ai_version::PlayerAiSettings::new();
+        settings.set_version(player, crate::ai_standard::ai_version::AiVersion::V4);
         let mut damage_chart = crate::resources::DamageChart::new();
         damage_chart.insert_damage(UnitType::Infantry, UnitType::Infantry, 50);
         damage_chart.insert_damage(UnitType::Bcopters, UnitType::Infantry, 70);
@@ -12537,117 +11979,6 @@ mod tests {
             .find(|squad| squad.mission_type == MissionType::Capture)
             .expect("護衛合流後の局地Capture");
         assert!(capture.departure_authorized);
-    }
-
-    #[test]
-    fn surplus_campaign_capturers_receive_distinct_property_responsibilities() {
-        use crate::ai::island_campaign::{
-            IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
-        };
-
-        let mut world = World::new();
-        let mut map = Map::new(6, 1, Terrain::Plains, GridTopology::Square);
-        map.set_terrain(0, 0, Terrain::Capital).unwrap();
-        map.set_terrain(5, 0, Terrain::Capital).unwrap();
-        for x in 2..=4 {
-            map.set_terrain(x, 0, Terrain::City).unwrap();
-        }
-        let island_map = crate::ai::islands::IslandMap::analyze(&map);
-        let island_id = island_map
-            .get_island_at(&GridPosition { x: 2, y: 0 })
-            .unwrap()
-            .id;
-        world.insert_resource(map);
-        world.insert_resource(island_map);
-        world.insert_resource(MasterDataRegistry::load().unwrap());
-        let player = PlayerId(1);
-        world.spawn((
-            GridPosition { x: 0, y: 0 },
-            Property::new(Terrain::Capital, Some(player), 100),
-        ));
-        world.spawn((
-            GridPosition { x: 5, y: 0 },
-            Property::new(Terrain::Capital, Some(PlayerId(2)), 100),
-        ));
-        for x in 2..=4 {
-            world.spawn((
-                GridPosition { x, y: 0 },
-                Property::new(Terrain::City, None, 100),
-            ));
-        }
-        let capturers = (0..3)
-            .map(|x| {
-                world
-                    .spawn((
-                        Faction(player),
-                        GridPosition { x, y: 0 },
-                        UnitStats {
-                            can_capture: true,
-                            movement_type: MovementType::Infantry,
-                            max_movement: 3,
-                            ..UnitStats::mock()
-                        },
-                    ))
-                    .id()
-            })
-            .collect::<Vec<_>>();
-        let requirement = IslandCampaignRequirement {
-            preferred_transport: None,
-            transport_slots: 0,
-            capture_units: 3,
-            ground_combat_units: 0,
-            combat_units: 0,
-            total_budget: 3_000,
-        };
-        let assignment = IslandCampaignAssignment {
-            island_id,
-            decision: IslandCampaignDecision::Secure,
-            target_position: GridPosition { x: 2, y: 0 },
-            // 明示Milestoneが1件でも、余剰2体を同じ施設へ重複させてはならない。
-            capture_target_positions: vec![GridPosition { x: 2, y: 0 }],
-            priority_enemy_types: Vec::new(),
-            requirement: requirement.clone(),
-            purchase_shortfall: requirement,
-            allocated_budget: 3_000,
-            transport_entities: Vec::new(),
-            capture_entities: capturers.clone(),
-            combat_entities: Vec::new(),
-            operation_ready: true,
-            continued_from_existing_squad: false,
-        };
-        let mut manager = SquadManager::new();
-        let pinned_target = GridPosition { x: 4, y: 0 };
-        let pinned_member = capturers[2];
-        let pinned = manager.create_owned_squad(MissionType::Capture, player);
-        pinned.members.insert(pinned_member);
-        pinned.target_island = Some(island_id);
-        pinned.target = Some(pinned_target);
-
-        prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
-
-        let capture_squads = manager
-            .squads
-            .iter()
-            .filter(|squad| squad.mission_type == MissionType::Capture)
-            .collect::<Vec<_>>();
-        assert_eq!(capture_squads.len(), 3);
-        assert_eq!(
-            capture_squads
-                .iter()
-                .filter_map(|squad| squad.target)
-                .collect::<HashSet<_>>()
-                .len(),
-            3,
-            "占領可能施設が残る限り、1施設1Squadへ排他的に振り分ける"
-        );
-        assert_eq!(
-            capture_squads
-                .iter()
-                .find(|squad| squad.members.contains(&pinned_member))
-                .and_then(|squad| squad.target),
-            Some(pinned_target),
-            "生産時に具体化した未取得・到達可能な物件任務は最寄り物件へ戻さない"
-        );
     }
 
     #[test]

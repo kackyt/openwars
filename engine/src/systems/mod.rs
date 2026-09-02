@@ -52,4 +52,23 @@ pub fn add_main_game_systems(schedule: &mut Schedule) {
             .chain()
             .in_set(GameSystemSet),
     );
+    // 標準側もmain時点と同じイベント時点で台帳を更新する。小規模側とResourceを
+    // 共有せず、同じイベントを独立に購読するため、一方の戦略状態が他方を壊さない。
+    schedule.add_systems(
+        (
+            crate::ai_standard::v4::deployment::reconcile_pending_deployments_system
+                .after(produce_unit_system)
+                .before(move_unit_system),
+            crate::ai_standard::v4::campaign_execution::reconcile_campaign_production_system
+                .after(crate::ai_standard::v4::deployment::reconcile_pending_deployments_system)
+                .before(move_unit_system),
+            crate::ai_standard::v4::deployment::audit_deployment_attacks_system
+                .after(attack_unit_system)
+                .before(sync_cargo_health_system),
+            crate::ai_standard::v4::victory_roadmap::audit_victory_roadmap_system
+                .after(wait_unit_system)
+                .before(undo_move_system),
+        )
+            .in_set(GameSystemSet),
+    );
 }
