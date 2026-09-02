@@ -7682,7 +7682,22 @@ fn plan_production_with_registry(
     // RollingPlanの到着予定付き既存戦力へ入っているため、不足が残るときだけ
     // ここへ到達する。実在敵への有効打・到着性・HP上限による既存の枝刈りで、
     // 同一出口への無目的な量産は防ぐ。
-    let immediate_combat_options = immediate_combat_options(scan, &mut ctx, &operations, player_id);
+    // Rolling Planがこの手番の具体的な攻撃列で排除済みとした実Entityは、残額を
+    // 使い切るためだけの追加Combatの標的にしない。次手番は実盤面を再観測するため、
+    // ここで仮想的な追撃を買う必要はない。
+    let resolved_by_rolling_plan = rolling_plans
+        .values()
+        .flat_map(|selected| selected.plan.target_forecasts.iter())
+        .filter(|target| target.remaining_hp == 0)
+        .filter_map(|target| target.entity)
+        .collect::<HashSet<_>>();
+    let immediate_combat_options = immediate_combat_options(
+        scan,
+        &mut ctx,
+        &operations,
+        player_id,
+        &resolved_by_rolling_plan,
+    );
     // 1手番に1体が与えられる攻撃は1回だけなので、同じ敵HPを複数の工場枠で
     // 仮想的に何度も消費しない。ここは経路探索済みの攻撃表への割当だけであり、
     // 「1体追加ごとの将来戦闘シミュレーション」にはしない。
@@ -7789,6 +7804,18 @@ fn plan_production_with_registry(
         else {
             break;
         };
+        // Rolling Planで排除済みなら、未所有物件へ向かえる占領役だけを追加する。
+        // 交戦相手がいないのに航空・戦車まで残額で埋めると、次手番に必要となる
+        // 相性counterの資金と生産口を失う。輸送未成立の前線には単独の地上兵も出さない。
+        if op.facts.requires_transport {
+            break;
+        }
+        let has_unresolved_live_threat = op.reachable_threats.iter().any(|threat| {
+            threat.available_turn == 0
+                && threat
+                    .entity
+                    .is_some_and(|entity| !resolved_by_rolling_plan.contains(&entity))
+        });
 
         let per_slot_budget = immediate_reinforcement_funds / free_slots as u32;
         let mut best_mobilization: Option<SlotCandidate> = None;
@@ -7799,6 +7826,7 @@ fn plan_production_with_registry(
             for (unit_type, stats) in &scan.available_types {
                 if stats.cost == 0
                     || stats.cost > immediate_reinforcement_funds
+                    || (!has_unresolved_live_threat && !stats.can_capture)
                     || !scan.can_produce(*terrain, *unit_type)
                     || !can_join_operation(
                         scan,
@@ -8298,19 +8326,21 @@ fn combat_plan_input(
     } else {
         None
     };
-    let required_capture_survivors = campaign_objective.map_or_else(
-        || {
-            if !op.capture_lane_targets.is_empty() {
-                op.capture_lane_targets.len()
-            } else {
-                op.objective_properties
-                    .iter()
-                    .filter(|property| scan.open_properties.contains(property))
-                    .count()
-            }
-        },
-        |objective| objective.required_capture_survivors,
-    );
+    let local_capture_requirement = if !op.capture_lane_targets.is_empty() {
+        op.capture_lane_targets.len()
+    } else {
+        op.objective_properties
+            .iter()
+            .filter(|property| scan.open_properties.contains(property))
+            .count()
+    };
+    // Campaign側の0は「追加の生存占領役を予約していない」という意味であり、
+    // 目前の未所有物件を占領しなくてよい、ではない。局地レーンとcampaign要求の
+    // 大きい方をRolling Planへ渡し、歩兵を余剰生産へ漏らさない。
+    let required_capture_survivors = campaign_objective
+        .map_or(local_capture_requirement, |objective| {
+            local_capture_requirement.max(objective.required_capture_survivors)
+        });
     let mut enemies = enemies;
     if enemies.is_empty() && !op.property_controls.is_empty() {
         let reference_infantry = scan
@@ -9353,17 +9383,19 @@ fn immediate_combat_options(
     ctx: &mut ReachCtx,
     operations: &[Operation],
     player_id: PlayerId,
+    resolved_by_rolling_plan: &HashSet<Entity>,
 ) -> Vec<ImmediateCombatOption> {
     let mut options = Vec::new();
     let unit_positions = scanned_occupants(scan, player_id);
 
     for (op_index, operation) in operations.iter().enumerate() {
         // 実Entityが現在の前線へ出ていない作戦は、余剰Combatの送り先にしない。
-        if !operation
-            .reachable_threats
-            .iter()
-            .any(|threat| threat.entity.is_some() && threat.available_turn == 0)
-        {
+        if !operation.reachable_threats.iter().any(|threat| {
+            threat
+                .entity
+                .is_some_and(|entity| !resolved_by_rolling_plan.contains(&entity))
+                && threat.available_turn == 0
+        }) {
             continue;
         }
         for (facility, terrain) in &scan.free_facilities {
@@ -9379,7 +9411,10 @@ fn immediate_combat_options(
                     stats,
                     player_id,
                     &unit_positions,
-                );
+                )
+                .into_iter()
+                .filter(|engagement| !resolved_by_rolling_plan.contains(&engagement.entity))
+                .collect::<Vec<_>>();
                 if engagements.is_empty() {
                     continue;
                 }
@@ -13282,7 +13317,8 @@ mod tests {
         let mut ctx = ReachCtx::default();
         let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
 
-        let options = immediate_combat_options(&scan, &mut ctx, &operations, PlayerId(1));
+        let options =
+            immediate_combat_options(&scan, &mut ctx, &operations, PlayerId(1), &HashSet::new());
         let (operation_index, candidate, engagement) = select_immediate_combat_reinforcement(
             &operations,
             &options,
@@ -13439,7 +13475,8 @@ mod tests {
         };
         let mut ctx = ReachCtx::default();
         let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
-        let options = immediate_combat_options(&scan, &mut ctx, &operations, PlayerId(1));
+        let options =
+            immediate_combat_options(&scan, &mut ctx, &operations, PlayerId(1), &HashSet::new());
 
         let (_, candidate, _) = select_immediate_combat_reinforcement(
             &operations,

@@ -211,6 +211,21 @@ pub(crate) struct ForcePackagePlan {
     /// 次の自軍手番に生産施設上から攻撃して、その施設を空けない購入数。
     /// 未成立作戦では、火力だけでなく失う次回生産slotも比較する。
     pub blocked_next_turn_production_slots: usize,
+    /// 今手番の直接部隊が実シミュレーションで担当した、敵別のユニークな射点数。
+    /// 同じ敵・同じ射点へ向かう複数unitは一つと数え、渋滞の比較に使う。
+    pub direct_fire_lane_count: usize,
+    /// 生存している敵直接部隊へ、相性と接敵時刻を満たす直接担当を一体ずつ
+    /// 割り当てられなかった数。砲撃で直接戦線を置換しないために使う。
+    pub direct_front_shortfall: usize,
+    /// 敵直接部隊ごとに、直接部隊だけで担当割当てしても削り切れないHP。
+    /// 添字は `target_forecasts` と一致し、間接火力で直接戦線の穴を隠さない比較に使う。
+    pub direct_enemy_remaining_hp: Vec<u32>,
+    /// 直接部隊が各敵へ与えた実ダメージ。敵種を問わず、砲撃の標的重複判定に使う。
+    pub direct_damage_by_target: Vec<u32>,
+    /// 既存の間接部隊が各敵へ与えた実ダメージ。今回の砲の標的重複を判定する。
+    pub existing_indirect_damage_by_target: Vec<u32>,
+    /// 今回生産した間接部隊が各敵へ与えた実ダメージ。上の既存火力との差分で限界効用を測る。
+    pub produced_indirect_damage_by_target: Vec<u32>,
     /// 敵排除時点に残る、戦闘可能な友軍のHP比例コスト。Expected増援の後に
     /// 前線を保持できるかを測るため、購入額だけでなく実損耗後の価値を使う。
     pub surviving_combat_value: u32,
@@ -1086,6 +1101,12 @@ fn evaluate_opening_package_static(
         production_cost: state.cost,
         expected_loss: 0,
         blocked_next_turn_production_slots: 0,
+        direct_fire_lane_count: 0,
+        direct_front_shortfall: 0,
+        direct_enemy_remaining_hp: Vec::new(),
+        direct_damage_by_target: Vec::new(),
+        existing_indirect_damage_by_target: Vec::new(),
+        produced_indirect_damage_by_target: Vec::new(),
         surviving_combat_value,
         required_overmatch_value: 0,
         overmatch_ready: false,
@@ -1461,9 +1482,11 @@ fn select_best_property_plan<'a>(
     candidates: impl Iterator<Item = &'a ForcePackagePlan>,
 ) -> Option<ForcePackagePlan> {
     candidates.cloned().reduce(|selected, candidate| {
-        exact_property_plan_better(input, &candidate, &selected)
-            .then_some(candidate)
-            .unwrap_or(selected)
+        if exact_property_plan_better(input, &candidate, &selected) {
+            candidate
+        } else {
+            selected
+        }
     })
 }
 
@@ -1490,9 +1513,9 @@ fn select_best_indirect_upgrade<'a>(
 
 /// 間接部隊を足した案が、直接部隊だけの基準作戦を崩していないか。
 ///
-/// 物件契約、突破口、生産口、占領役の生存を一つでも悪化させる案は火力が高くても
-/// 採らない。全て維持した上で敵残存価値か損耗を実シミュレーションで改善した時だけ、
-/// 間接部隊を直接案の上位互換として扱う。
+/// 物件契約、突破口、生産口、占領役、または敵別のユニークな直接射点を一つでも
+/// 悪化させる案は火力が高くても採らない。直接unitの頭数ではなく射点を比較するため、
+/// 同じ地点へ向かう余剰unitだけを間接火力へ置き換えられる。
 fn indirect_upgrade_preserves_direct_plan(
     input: &RollingPlanInput,
     candidate: &ForcePackagePlan,
@@ -1502,9 +1525,16 @@ fn indirect_upgrade_preserves_direct_plan(
         current_direct_role_counts(input, candidate);
     let (direct_capture_count, direct_direct_count) =
         current_direct_role_counts(input, direct_plan);
+    let preserves_current_direct_roles = if uses_small_map_tactical_rules(input) {
+        // 小規模mapでは部隊数では渋滞を見落とすため、敵別の独自射点を維持する。
+        candidate.direct_fire_lane_count >= direct_plan.direct_fire_lane_count
+    } else {
+        // 標準mapは既存の汎用編成比較をそのまま残す。
+        candidate_direct_count >= direct_direct_count
+    };
     candidate.cleared_capture_lane_count() >= direct_plan.cleared_capture_lane_count()
         && candidate_capture_count >= direct_capture_count
-        && candidate_direct_count >= direct_direct_count
+        && preserves_current_direct_roles
         && candidate.property_contract_completion_profile()
             <= direct_plan.property_contract_completion_profile()
         && candidate.deadline_capture_survivor_count >= direct_plan.deadline_capture_survivor_count
@@ -1512,12 +1542,65 @@ fn indirect_upgrade_preserves_direct_plan(
         && candidate.front_breakthrough_rank() <= direct_plan.front_breakthrough_rank()
         && candidate.blocked_next_turn_production_slots
             <= direct_plan.blocked_next_turn_production_slots
+        && (!uses_small_map_tactical_rules(input)
+            || (candidate.direct_front_shortfall <= direct_plan.direct_front_shortfall
+                && candidate.direct_enemy_remaining_hp.len()
+                    == direct_plan.direct_enemy_remaining_hp.len()
+                && candidate
+                    .direct_enemy_remaining_hp
+                    .iter()
+                    .zip(&direct_plan.direct_enemy_remaining_hp)
+                    .all(|(candidate_remaining, direct_remaining)| {
+                        candidate_remaining <= direct_remaining
+                    })
+                // 既存砲だけで既に落とせる標的へ追加砲を重ねるなら、少なくとも撃破turnを
+                // 前倒しする必要がある。砲の台数ではなく、実際に誰へ何damageを足したかで見る。
+                && (candidate.indirect_fire_has_marginal_target()
+                    || candidate.target_elimination_profile()
+                        < direct_plan.target_elimination_profile())))
         && (candidate.remaining_enemy_value(input) < direct_plan.remaining_enemy_value(input)
             || candidate.expected_loss < direct_plan.expected_loss)
 }
 
+impl ForcePackagePlan {
+    /// 各敵の撃破予測を、未撃破を無限大として比較可能な形にする。
+    fn target_elimination_profile(&self) -> Vec<u32> {
+        self.target_forecasts
+            .iter()
+            .map(|target| target.destroyed_turn.unwrap_or(u32::MAX))
+            .collect()
+    }
+
+    /// 今回買う間接部隊が、既存の間接部隊と直接部隊だけでは倒せない敵へ
+    /// 実ダメージを足せているか。射撃対象の重複を「unit数」ではなく敵HPで判定する。
+    fn indirect_fire_has_marginal_target(&self) -> bool {
+        self.target_forecasts
+            .iter()
+            .enumerate()
+            .any(|(index, target)| {
+                let produced = self
+                    .produced_indirect_damage_by_target
+                    .get(index)
+                    .copied()
+                    .unwrap_or_default();
+                let prior_damage = self
+                    .direct_damage_by_target
+                    .get(index)
+                    .copied()
+                    .unwrap_or_default()
+                    .saturating_add(
+                        self.existing_indirect_damage_by_target
+                            .get(index)
+                            .copied()
+                            .unwrap_or_default(),
+                    );
+                produced > 0 && prior_damage < target.initial_hp
+            })
+    }
+}
+
 /// 今手番に発注する占領役と、占領を担当しない直接戦闘役の本数。
-/// 間接部隊はこの二つを置換できないため、直接案に砲を加える比較の下限にする。
+/// 標準mapでは従来通りこの二つを下限にし、小規模mapだけ射点比較へ切り替える。
 fn current_direct_role_counts(input: &RollingPlanInput, plan: &ForcePackagePlan) -> (usize, usize) {
     plan.current_purchases()
         .fold((0, 0), |(capture, direct), purchase| {
@@ -1536,6 +1619,139 @@ fn current_direct_role_counts(input: &RollingPlanInput, plan: &ForcePackagePlan)
                 (capture, direct)
             }
         })
+}
+
+/// 今手番に生産する直接部隊が、実シミュレーションで担当した敵ごとのユニークな射点数。
+/// 同じ敵・同じ射点へ何体も向かう案は一つと数える。候補ごとのsimulateの終端で一度だけ
+/// 計算し、候補比較中には再計算しない。
+fn direct_fire_lane_count(
+    input: &RollingPlanInput,
+    combat_purchases: &[PlannedCombatPurchase],
+) -> usize {
+    combat_purchases
+        .iter()
+        .filter_map(|assignment| {
+            let option = input
+                .production_options
+                .iter()
+                .find(|option| option.purchase == assignment.purchase)?;
+            if assignment.purchase.build_turn != 0 || option.stats.min_range > 1 {
+                return None;
+            }
+            let enemy_index = input
+                .enemies
+                .iter()
+                .position(|enemy| enemy.entity == Some(assignment.target))?;
+            let projection = input
+                .production_attack_projections
+                .get(
+                    input
+                        .production_options
+                        .iter()
+                        .position(|candidate| candidate.purchase == assignment.purchase)?,
+                )?
+                .get(enemy_index)
+                .and_then(|projection| *projection)?;
+            Some((enemy_index, projection.firing_position))
+        })
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+/// 直接部隊だけで敵直接部隊をどこまで駆逐できるかを、実際の相性・到着turn・弾数から
+/// 割り当てる。砲を足した候補で直接部隊の攻撃先が変わっても、直接戦線を維持する能力まで
+/// 失ったことにはしないため、通常simulationの実行結果とは別に不変の能力として計算する。
+fn direct_enemy_remaining_hp_after_assignment(
+    friendlies: &[SimFriendly],
+    enemies: &[SimEnemy],
+    search_turns: u32,
+) -> Vec<u32> {
+    let mut remaining_hp = enemies
+        .iter()
+        .map(|enemy| {
+            if enemy.source.stats.min_range <= 1 && enemy.source.available_turn <= search_turns {
+                enemy.source.hp
+            } else {
+                0
+            }
+        })
+        .collect::<Vec<_>>();
+    // unitごとの攻撃回数を、弾数と実際に攻撃可能なturn数の小さい方に制限する。
+    // これで、同じ戦車一両を複数の敵へ無限に割り当てる過大評価を避ける。
+    let mut remaining_shots = friendlies
+        .iter()
+        .map(|friendly| {
+            if friendly.stats.min_range > 1 || friendly.available_turn > search_turns {
+                0
+            } else {
+                friendly.attacks_left.min(
+                    search_turns
+                        .saturating_sub(friendly.available_turn)
+                        .saturating_add(1),
+                )
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut target_order = remaining_hp
+        .iter()
+        .enumerate()
+        .filter(|(_, hp)| **hp > 0)
+        .map(|(enemy_index, hp)| {
+            let eligible = friendlies
+                .iter()
+                .filter(|friendly| friendly.stats.min_range <= 1)
+                .filter(|friendly| {
+                    friendly
+                        .attack_profiles
+                        .get(enemy_index)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|profile| profile.ready_turn <= search_turns)
+                })
+                .count();
+            (eligible, std::cmp::Reverse(*hp), enemy_index)
+        })
+        .collect::<Vec<_>>();
+    // 対応できる直接兵種が少ない敵から先に担当を確保する。これにより歩兵・装甲車・
+    // 戦車の相性差を固定値にせず、実damage表が必要とする担当を残せる。
+    target_order.sort_unstable();
+    for (_, _, enemy_index) in target_order {
+        while remaining_hp[enemy_index] > 0 {
+            let best = friendlies
+                .iter()
+                .enumerate()
+                .filter(|(friendly_index, friendly)| {
+                    remaining_shots[*friendly_index] > 0 && friendly.stats.min_range <= 1
+                })
+                .filter_map(|(friendly_index, friendly)| {
+                    let profile = friendly
+                        .attack_profiles
+                        .get(enemy_index)
+                        .copied()
+                        .flatten()?;
+                    (profile.ready_turn <= search_turns).then(|| {
+                        let damage = calculate_damage_formula(
+                            profile.base_damage,
+                            friendly.hp,
+                            enemies[enemy_index].source.defense_bonus,
+                            false,
+                        );
+                        (damage > 0).then_some((
+                            damage,
+                            std::cmp::Reverse(profile.ready_turn),
+                            std::cmp::Reverse(friendly_index),
+                        ))
+                    })?
+                })
+                .max();
+            let Some((damage, _, std::cmp::Reverse(friendly_index))) = best else {
+                break;
+            };
+            remaining_shots[friendly_index] = remaining_shots[friendly_index].saturating_sub(1);
+            remaining_hp[enemy_index] = remaining_hp[enemy_index].saturating_sub(damage);
+        }
+    }
+    remaining_hp
 }
 
 /// 同じ敵へ向かう直接部隊の射点が飽和し、間接部隊が工場外から別の攻撃地点を
@@ -1615,7 +1831,13 @@ fn direct_fire_saturates_target(
 
 /// 小規模開幕専用の制約を適用する条件を一箇所に固定する。
 fn uses_small_map_opening_rules(input: &RollingPlanInput) -> bool {
-    input.current_turn == 1 && input.opening_policy == OpeningProductionPolicy::SmallMapExpansion
+    input.current_turn == 1 && uses_small_map_tactical_rules(input)
+}
+
+/// 戦略プロファイルは盤面構造から対局中に一度だけ決まる。初手以外にも効かせる
+/// 小規模マップ専用の判断はここへ集約し、標準マップのRolling Planを変えない。
+fn uses_small_map_tactical_rules(input: &RollingPlanInput) -> bool {
+    input.opening_policy == OpeningProductionPolicy::SmallMapExpansion
 }
 
 /// 初手の最終編成が、残額で合法に追加できる生産枠を放置していないか判定する。
@@ -1651,6 +1873,31 @@ fn exact_property_plan_better(
         // 全滅が達成可能（feasible）な案同士の比較では、占領達成と全滅完了を優先し、
         // そのうえで余分な買い足しを避けて期待損失最小化・費用最小化で経済効率を高める。
         if candidate.feasible && current.feasible {
+            if !uses_small_map_tactical_rules(input) && input.required_capture_survivors <= 1 {
+                // 標準mapでは、同じ物件契約を成立させた後の早過ぎる掃討のために
+                // 追加unitを買わない。次手番に盤面を再観測できるため、費用を先に比べる。
+                return (
+                    std::cmp::Reverse(candidate.cleared_capture_lane_count()),
+                    candidate.property_contract_completion_profile(),
+                    std::cmp::Reverse(candidate.deadline_capture_survivor_count),
+                    candidate.capture_completion_profile(),
+                    candidate.expected_loss,
+                    candidate.production_cost,
+                    candidate.target_destruction_profile(),
+                    candidate.occupation_turn,
+                    std::cmp::Reverse(candidate.surviving_combat_value),
+                ) < (
+                    std::cmp::Reverse(current.cleared_capture_lane_count()),
+                    current.property_contract_completion_profile(),
+                    std::cmp::Reverse(current.deadline_capture_survivor_count),
+                    current.capture_completion_profile(),
+                    current.expected_loss,
+                    current.production_cost,
+                    current.target_destruction_profile(),
+                    current.occupation_turn,
+                    std::cmp::Reverse(current.surviving_combat_value),
+                );
+            }
             return (
                 std::cmp::Reverse(candidate.cleared_capture_lane_count()),
                 candidate.property_contract_completion_profile(),
@@ -1734,6 +1981,29 @@ fn exact_property_plan_better(
             return candidate_joint < current_joint;
         }
         if candidate.feasible && current.feasible {
+            if !uses_small_map_tactical_rules(input) && input.required_capture_survivors <= 1 {
+                // 期限契約を同じく満たせるなら、標準mapは余剰の直接・航空戦力を
+                // 増やさず、次手番の観測後に必要なcounterへ資金を残す。
+                return (
+                    candidate.remaining_enemy_value(input),
+                    candidate.blocked_next_turn_production_slots,
+                    candidate.expected_loss,
+                    candidate.production_cost,
+                    candidate.target_destruction_profile(),
+                    std::cmp::Reverse(candidate.surviving_combat_value),
+                    candidate
+                        .interdiction_first_attack_turn()
+                        .unwrap_or(u32::MAX),
+                ) < (
+                    current.remaining_enemy_value(input),
+                    current.blocked_next_turn_production_slots,
+                    current.expected_loss,
+                    current.production_cost,
+                    current.target_destruction_profile(),
+                    std::cmp::Reverse(current.surviving_combat_value),
+                    current.interdiction_first_attack_turn().unwrap_or(u32::MAX),
+                );
+            }
             return (
                 candidate.remaining_enemy_value(input),
                 candidate.blocked_next_turn_production_slots,
@@ -2318,6 +2588,15 @@ fn simulate_state_with_catalog(
         }
     }
     let mut enemies = catalog.enemies.clone();
+    let direct_enemy_remaining_hp = if uses_small_map_tactical_rules(input) {
+        direct_enemy_remaining_hp_after_assignment(&friendlies, &enemies, search_turns)
+    } else {
+        vec![0; enemies.len()]
+    };
+    let direct_front_shortfall = direct_enemy_remaining_hp
+        .iter()
+        .filter(|remaining| **remaining > 0)
+        .count();
     let mut first_attack_turn = None;
     let mut front_breakthrough_turn = None;
     let mut deadline_target_first_attack_turn = None;
@@ -2327,6 +2606,12 @@ fn simulate_state_with_catalog(
     let mut assigned_combat_purchases = HashSet::new();
     let mut blocked_next_turn_production_facilities = HashSet::new();
     let mut protected_survivors_at_completion = None;
+    // 砲を増やすかは、同じ標的への砲数ではなく、直接部隊・既存砲・今回の砲が
+    // 実際にどの敵HPを削ったかで比較する。候補ごとに既存simulationの攻撃処理で
+    // 一度だけ加算するので、別の盤面simulationは増やさない。
+    let mut direct_damage_by_target = vec![0_u32; enemies.len()];
+    let mut existing_indirect_damage_by_target = vec![0_u32; enemies.len()];
+    let mut produced_indirect_damage_by_target = vec![0_u32; enemies.len()];
 
     for turn in 1..=search_turns {
         let enemy_arrival_hp = enemies
@@ -2466,6 +2751,16 @@ fn simulate_state_with_catalog(
                 blocked_next_turn_production_facilities.insert(purchase.facility);
             }
             attack_count = attack_count.saturating_add(1);
+            if friendly.stats.min_range <= 1 {
+                direct_damage_by_target[target_index] =
+                    direct_damage_by_target[target_index].saturating_add(damage);
+            } else if friendly.purchase.is_some() {
+                produced_indirect_damage_by_target[target_index] =
+                    produced_indirect_damage_by_target[target_index].saturating_add(damage);
+            } else {
+                existing_indirect_damage_by_target[target_index] =
+                    existing_indirect_damage_by_target[target_index].saturating_add(damage);
+            }
             target.hp = target.hp.saturating_sub(damage);
             friendly.attacks_left = friendly.attacks_left.saturating_sub(1);
             if target.hp == 0 {
@@ -2702,6 +2997,11 @@ fn simulate_state_with_catalog(
         .filter(|unit| unit.hp > 0 && unit.attack_profiles.iter().any(Option::is_some))
         .map(|unit| unit.stats.cost.saturating_mul(unit.hp) / 100)
         .fold(0_u32, u32::saturating_add);
+    let direct_fire_lane_count = if uses_small_map_tactical_rules(input) {
+        direct_fire_lane_count(input, &combat_purchases)
+    } else {
+        0
+    };
     ForcePackagePlan {
         purchases,
         capture_purchases,
@@ -2728,6 +3028,12 @@ fn simulate_state_with_catalog(
         production_cost: state.cost,
         expected_loss,
         blocked_next_turn_production_slots: blocked_next_turn_production_facilities.len(),
+        direct_fire_lane_count,
+        direct_front_shortfall,
+        direct_enemy_remaining_hp,
+        direct_damage_by_target,
+        existing_indirect_damage_by_target,
+        produced_indirect_damage_by_target,
         surviving_combat_value,
         required_overmatch_value,
         overmatch_ready: surviving_combat_value >= required_overmatch_value,

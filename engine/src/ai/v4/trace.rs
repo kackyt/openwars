@@ -218,8 +218,14 @@ impl ProductionPlanTrace {
     pub fn produced_counts(&self) -> HashMap<UnitType, usize> {
         let mut counts = HashMap::new();
         for step in &self.steps {
-            if let ProductionDecision::Produced { unit_type, .. } = &step.decision {
-                *counts.entry(*unit_type).or_insert(0) += 1;
+            match &step.decision {
+                ProductionDecision::Produced { unit_type, .. }
+                | ProductionDecision::ProducedImmediateReinforcement { unit_type, .. } => {
+                    *counts.entry(*unit_type).or_insert(0) += 1;
+                }
+                ProductionDecision::SlotCleared
+                | ProductionDecision::Deferred { .. }
+                | ProductionDecision::Reserved { .. } => {}
             }
         }
         counts
