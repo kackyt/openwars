@@ -17,6 +17,13 @@ use std::sync::Arc;
 pub(crate) const SEARCH_BEAM_WIDTH: usize = 64;
 pub(crate) const DEFAULT_SEARCH_TURNS: u32 = 12;
 
+/// 多工場の現手番物件制御で、実シミュレーションへ渡せる候補数上限。
+///
+/// 工場数と各工場の到達可能物件がともに多い盤面では、現在手番だけの選択でも
+/// 直積が指数的に増える。これは戦術上の評価値ではなく、実行時間を有限に保つための
+/// 候補数上限である。上限に達するまでは従来どおり全候補を厳密にシミュレーションする。
+const MANY_FACTORY_PROPERTY_STATE_LIMIT: usize = 256;
+
 #[derive(Debug, Clone)]
 pub(crate) struct FriendlyPlanUnit {
     pub stats: UnitStats,
@@ -1165,6 +1172,7 @@ fn plan_current_property_control_exact(
     }
     let mut facilities = options_by_facility.into_iter().collect::<Vec<_>>();
     facilities.sort_unstable_by_key(|(facility, _)| (facility.y, facility.x));
+    let state_limit = property_control_state_limit(facilities.len());
 
     if std::env::var_os("OPENWARS_ROLLING_AUDIT").is_some() {
         let capture_option_count = input
@@ -1196,6 +1204,7 @@ fn plan_current_property_control_exact(
     }
 
     let mut states = vec![SearchState::default()];
+    let mut frontier_truncated = false;
     for (facility, option_indices) in &facilities {
         let slot = ProductionSlot {
             facility: *facility,
@@ -1226,6 +1235,13 @@ fn plan_current_property_control_exact(
                 child.cost = next_cost;
                 next.push(child);
             }
+        }
+        // ここまでは全列挙を維持する。工場が多い盤面だけは、次の施設を掛ける前に
+        // 占領契約・実射程・相性から作る決定的な前線へ圧縮する。生産額の総和や
+        // 兵種名の固定点では落とさないため、敵編成が変われば残る候補も変わる。
+        if next.len() > state_limit {
+            retain_property_control_frontier(input, &mut next, state_limit);
+            frontier_truncated = true;
         }
         states = next;
     }
@@ -1472,8 +1488,114 @@ fn plan_current_property_control_exact(
     }
     selected.candidates_considered = considered;
     selected.candidates_pruned = candidates_pruned;
-    selected.search_truncated = false;
+    selected.search_truncated = frontier_truncated;
     Some(selected)
+}
+
+/// 全列挙できない物件制御だけで使う、現在盤面に基づく候補前線。
+///
+/// この段階は最終評価を代替しない。占領数の不足、各敵へ届く実ダメージ、占領完了ETA
+/// が劣る中間案から先に落とし、残った候補だけを従来どおり完全な戦闘シミュレーションで
+/// 比較する。従って小規模で候補数が上限未満の盤面（map_1を含む）は一切変わらない。
+fn retain_property_control_frontier(
+    input: &RollingPlanInput,
+    states: &mut Vec<SearchState>,
+    state_limit: usize,
+) {
+    states.sort_unstable_by_key(|state| property_control_frontier_key(input, state));
+    states.truncate(state_limit);
+}
+
+/// 多数工場の直積だけを小さく抑え、少数工場の物件レースは完全列挙を維持する。
+///
+/// 工場数は毎ターンの実際の空き生産地点から決まるため、特定mapや兵種には依存しない。
+fn property_control_state_limit(facility_count: usize) -> usize {
+    if facility_count <= 5 {
+        usize::MAX
+    } else {
+        MANY_FACTORY_PROPERTY_STATE_LIMIT
+    }
+}
+
+/// 現在手番の中間生産列を、物件契約と敵編成に対する到達性だけで順序付ける。
+///
+/// まだ戦闘順・反撃・渋滞を確定しないため、その評価は最終シミュレーションに残す。
+/// ここで見るダメージは「どの敵へ何も届かない候補か」を判別する下限であり、
+/// 高火力unitを固定的に優遇する評価値ではない。
+fn property_control_frontier_key(
+    input: &RollingPlanInput,
+    state: &SearchState,
+) -> (usize, u32, u32, Vec<u32>, usize, u32, Vec<usize>) {
+    let opening_capture_floor = if uses_small_map_opening_rules(input) {
+        2
+    } else {
+        0
+    };
+    let required_capturers = input.required_capture_survivors.max(opening_capture_floor);
+    let capture_count = state.used_capture_targets.len();
+    let capture_shortfall = required_capturers.saturating_sub(capture_count);
+
+    let mut capture_completion_turns = state
+        .option_indices
+        .iter()
+        .filter_map(|index| input.production_options[*index].capture_completion_turn)
+        .collect::<Vec<_>>();
+    capture_completion_turns.sort_unstable();
+    capture_completion_turns.truncate(required_capturers.max(1));
+    capture_completion_turns.resize(required_capturers.max(1), u32::MAX);
+
+    let mut damage_by_enemy = vec![0_u32; input.enemies.len()];
+    for option_index in &state.option_indices {
+        let option = &input.production_options[*option_index];
+        for (enemy_index, enemy) in input.enemies.iter().enumerate() {
+            let reaches_enemy = input
+                .production_attack_projections
+                .get(*option_index)
+                .map_or_else(
+                    || option.engageable_enemy_indices.contains(&enemy_index),
+                    |projections| projections.get(enemy_index).is_some_and(Option::is_some),
+                );
+            if reaches_enemy {
+                damage_by_enemy[enemy_index] =
+                    damage_by_enemy[enemy_index].saturating_add(best_damage(
+                        &input.damage_chart,
+                        option.stats.unit_type,
+                        enemy.stats.unit_type,
+                    ));
+            }
+        }
+    }
+    let remaining_by_enemy = input
+        .enemies
+        .iter()
+        .enumerate()
+        .map(|(index, enemy)| enemy.hp.saturating_sub(damage_by_enemy[index]))
+        .collect::<Vec<_>>();
+    let relevant_enemy_indices = if input.interdiction_deadlines.is_empty() {
+        (0..input.enemies.len()).collect::<Vec<_>>()
+    } else {
+        input
+            .interdiction_deadlines
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>()
+    };
+    let remaining_relevant_hp = relevant_enemy_indices
+        .into_iter()
+        .filter_map(|index| remaining_by_enemy.get(index))
+        .copied()
+        .sum();
+    let remaining_all_hp = remaining_by_enemy.into_iter().sum();
+
+    (
+        capture_shortfall,
+        remaining_relevant_hp,
+        remaining_all_hp,
+        capture_completion_turns,
+        capture_count.saturating_sub(required_capturers),
+        state.cost,
+        state.option_indices.clone(),
+    )
 }
 
 /// 既にシミュレーション済みの候補から、物件計画の通常比較で最良の一案を選ぶ。
@@ -4517,6 +4639,84 @@ mod tests {
             plan.combat_purchases
                 .iter()
                 .all(|assignment| assignment.target == Entity::from_raw(7))
+        );
+    }
+
+    #[test]
+    fn property_control_bounds_many_factory_combinations_before_simulation() {
+        assert_eq!(property_control_state_limit(5), usize::MAX);
+        assert_eq!(
+            property_control_state_limit(6),
+            MANY_FACTORY_PROPERTY_STATE_LIMIT
+        );
+
+        let mut input = input();
+        input.map = Arc::new(Map::new(20, 1, Terrain::Plains, GridTopology::Square));
+        input.production_options.clear();
+        input.production_attack_projections.clear();
+        input.current_funds = 100_000;
+        input.required_capture_survivors = 2;
+        input.exact_property_control = true;
+        Arc::make_mut(&mut input.damage_chart).insert_damage(
+            UnitType::Recon,
+            UnitType::Infantry,
+            60,
+        );
+
+        // 7工場 x (不生産・直接・占領) で2,187通りになる入力を作る。
+        // 上限を超えた場合だけ候補前線へ縮約し、最終候補は実戦闘simで選ぶ。
+        for x in 0..7 {
+            let facility = GridPosition { x, y: 0 };
+            input.production_options.push(ProductionPlanOption {
+                purchase: PlannedPurchase {
+                    facility,
+                    unit_type: UnitType::Recon,
+                    build_turn: 0,
+                    cost: 4_200,
+                },
+                stats: stats(UnitType::Recon, 4_200, 6),
+                engageable_enemy_indices: vec![0],
+                capture_target: None,
+                capture_arrival_turn: None,
+                capture_completion_turn: None,
+                capture_durability: None,
+                capture_blocking_enemy_index: None,
+            });
+            input
+                .production_attack_projections
+                .push(vec![Some(ProductionAttackProjection {
+                    ready_turn: 1,
+                    firing_position: facility,
+                    requires_movement: false,
+                })]);
+            input.production_options.push(ProductionPlanOption {
+                purchase: PlannedPurchase {
+                    facility,
+                    unit_type: UnitType::Infantry,
+                    build_turn: 0,
+                    cost: 1_000,
+                },
+                stats: UnitStats {
+                    can_capture: true,
+                    movement_type: MovementType::Infantry,
+                    ..stats(UnitType::Infantry, 1_000, 3)
+                },
+                engageable_enemy_indices: Vec::new(),
+                capture_target: Some(GridPosition { x: x + 10, y: 0 }),
+                capture_arrival_turn: Some(2),
+                capture_completion_turn: Some(4),
+                capture_durability: Some(200),
+                capture_blocking_enemy_index: Some(0),
+            });
+            input.production_attack_projections.push(vec![None]);
+        }
+
+        let plan = plan_force_package(&input).expect("bounded property plan");
+
+        assert!(plan.search_truncated);
+        assert!(
+            plan.candidates_considered <= property_control_state_limit(7),
+            "{plan:#?}"
         );
     }
 }
