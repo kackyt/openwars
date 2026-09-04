@@ -2387,6 +2387,38 @@ fn campaign_assignment_capture_responsibilities(
             })
         })
         .collect();
+    if crate::ai::strategy_profile::current_profile(world, player_id)
+        == crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion
+    {
+        if let Some(map) = world.get_resource::<Map>() {
+            let properties = world
+                .iter_entities()
+                .filter_map(|p| {
+                    Some((
+                        *p.get::<GridPosition>()?,
+                        p.get::<Property>()?.owner_id,
+                        p.get::<Property>()?.terrain,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let my_capital = properties.iter().find_map(|(pos, owner, terrain)| {
+                (*owner == Some(player_id) && *terrain == Terrain::Capital).then_some(*pos)
+            });
+            let enemy_capital = properties.iter().find_map(|(pos, owner, terrain)| {
+                (*owner != Some(player_id) && owner.is_some() && *terrain == Terrain::Capital)
+                    .then_some(*pos)
+            });
+            if let Some(my_cap) = my_capital {
+                targets.sort_unstable_by_key(|t| {
+                    let d_my = map.distance(my_cap.x, my_cap.y, t.x, t.y);
+                    let d_enemy = enemy_capital
+                        .map(|ec| map.distance(ec.x, ec.y, t.x, t.y))
+                        .unwrap_or(0);
+                    (std::cmp::Reverse(d_my), d_enemy, t.y, t.x)
+                });
+            }
+        }
+    }
     if targets.is_empty()
         && let Some(target) = nearest_campaign_property_target_with_connectivity(
             world,
@@ -2408,7 +2440,47 @@ fn campaign_assignment_capture_responsibilities(
     // 「最寄り物件」へ即座に戻さない。対象が未取得かつ本人が到達可能な間だけ保持し、
     // 取得済み・到達不能なら下の通常割当へ自然に戻す。
     let mut pinned_members = HashSet::new();
+    // 未所有物件マス上にすでに乗っている歩兵のうち、すでに占領進行中であるか、
+    // または既存Squadの目標としてその物件に到達している歩兵は、
+    // 他の物件へ移籍させず、その物件の占領完遂を最優先としてピン留めする。
     for member in &remaining {
+        let Some(member_pos) = world.get::<GridPosition>(*member).copied() else {
+            continue;
+        };
+        let is_capturing_or_committed = world.iter_entities().any(|entity| {
+            entity.get::<GridPosition>() == Some(&member_pos)
+                && entity.get::<Property>().is_some_and(|property| {
+                    property.owner_id != Some(player_id)
+                        && (property.capture_points < property.max_capture_points
+                            || manager.squads.iter().any(|squad| {
+                                squad.owner_id == Some(player_id)
+                                    && squad.mission_type == MissionType::Capture
+                                    && squad.target == Some(member_pos)
+                                    && squad.members.contains(member)
+                            }))
+                })
+        });
+        if is_capturing_or_committed {
+            pinned_members.insert(*member);
+            if let Some(responsibility) = responsibilities
+                .iter_mut()
+                .find(|responsibility| responsibility.target == member_pos)
+            {
+                responsibility.members.push(*member);
+            } else {
+                responsibilities.push(CampaignResponsibility {
+                    mission_type: MissionType::Capture,
+                    target: member_pos,
+                    members: vec![*member],
+                });
+            }
+        }
+    }
+
+    for member in &remaining {
+        if pinned_members.contains(member) {
+            continue;
+        }
         let pinned_target = manager
             .squads
             .iter()
@@ -2431,6 +2503,14 @@ fn campaign_assignment_capture_responsibilities(
         let Some(target) = pinned_target else {
             continue;
         };
+        let is_small_expansion = crate::ai::strategy_profile::current_profile(world, player_id)
+            == crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion;
+        let member_pos = world.get::<GridPosition>(*member).copied();
+        if is_small_expansion && member_pos != Some(target) {
+            // SmallMapExpansion では、目標物件に未到達の歩兵はピン留めせず、
+            // 奥の目標から順に最寄り歩兵を割り当てる全体最適マッチングに委ねる。
+            continue;
+        }
         pinned_members.insert(*member);
         if let Some(responsibility) = responsibilities
             .iter_mut()
@@ -3322,6 +3402,15 @@ fn synchronize_local_capture_departure(
             squad.departure_authorized = false;
             continue;
         };
+        // 小規模マップの物件展開では、初期の物件レースが勝敗を決定づける。
+        // 護衛戦闘部隊の完成を待って工場・待機線に居座ると、中立物件を敵に先取され
+        // 収入差を覆せなくなるため、到達可能な全物件への即時出撃を認める。
+        if crate::ai::strategy_profile::current_profile(world, player_id)
+            == crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion
+        {
+            squad.departure_authorized = true;
+            continue;
+        }
         squad.departure_authorized = squad.members.iter().all(|capturer| {
             let Some(capturer_position) = world.get::<GridPosition>(*capturer) else {
                 return false;
@@ -5301,55 +5390,60 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         }
     }
 
-    if let Some(capital) = my_capital_pos {
-        for cluster in &enemy_clusters {
-            let turn_dist = calculate_turn_distance(
-                &map,
-                &registry,
-                &unit_positions,
-                (capital.x, capital.y),
-                (cluster.center.x, cluster.center.y),
-                crate::resources::MovementType::Infantry,
-                3,
-                1,
-                perspective_player,
-                &mut turn_cache,
-            );
+    // V4では大局戦略（VictoryRoadmap/CampaignPortfolio/CombatPlan）で部隊編成を管理するため、
+    // レガシーな「首都から5ターン以内の全敵クラスターに対する防衛部隊作成」は実行しない。
+    // 小規模マップ等で全域が首都防衛圏になり、前線戦闘ユニットが誤って防衛に拘束されるのを防ぐ。
+    if !is_v4 {
+        if let Some(capital) = my_capital_pos {
+            for cluster in &enemy_clusters {
+                let turn_dist = calculate_turn_distance(
+                    &map,
+                    &registry,
+                    &unit_positions,
+                    (capital.x, capital.y),
+                    (cluster.center.x, cluster.center.y),
+                    crate::resources::MovementType::Infantry,
+                    3,
+                    1,
+                    perspective_player,
+                    &mut turn_cache,
+                );
 
-            if turn_dist.turns <= 5 {
-                // すでにこのクラスターを防衛目標としている部隊があるか
-                let exists = manager.squads.iter().any(|s| {
-                    squad_is_mutable_by_player(world, s, perspective_player)
-                        && s.mission_type == MissionType::Defense
-                        && s.target == Some(cluster.center)
-                });
-
-                if !exists {
-                    let squad =
-                        manager.create_owned_squad(MissionType::Defense, perspective_player);
-                    squad.target = Some(cluster.center);
-                    squad.phase = MissionPhase::Forming;
-
-                    // 最寄りの戦闘ユニットを最大2基割り当てる
-                    free_combat_units.sort_by_key(|(_, pos, stats)| {
-                        calculate_turn_distance(
-                            &map,
-                            &registry,
-                            &unit_positions,
-                            (pos.x, pos.y),
-                            (cluster.center.x, cluster.center.y),
-                            stats.movement_type,
-                            stats.max_movement,
-                            1,
-                            perspective_player,
-                            &mut turn_cache,
-                        )
+                if turn_dist.turns <= 5 {
+                    // すでにこのクラスターを防衛目標としている部隊があるか
+                    let exists = manager.squads.iter().any(|s| {
+                        squad_is_mutable_by_player(world, s, perspective_player)
+                            && s.mission_type == MissionType::Defense
+                            && s.target == Some(cluster.center)
                     });
 
-                    let assign_count = free_combat_units.len().min(3);
-                    for _ in 0..assign_count {
-                        let (ent, _, _) = free_combat_units.remove(0);
-                        squad.members.insert(ent);
+                    if !exists {
+                        let squad =
+                            manager.create_owned_squad(MissionType::Defense, perspective_player);
+                        squad.target = Some(cluster.center);
+                        squad.phase = MissionPhase::Forming;
+
+                        // 最寄りの戦闘ユニットを最大2基割り当てる
+                        free_combat_units.sort_by_key(|(_, pos, stats)| {
+                            calculate_turn_distance(
+                                &map,
+                                &registry,
+                                &unit_positions,
+                                (pos.x, pos.y),
+                                (cluster.center.x, cluster.center.y),
+                                stats.movement_type,
+                                stats.max_movement,
+                                1,
+                                perspective_player,
+                                &mut turn_cache,
+                            )
+                        });
+
+                        let assign_count = free_combat_units.len().min(3);
+                        for _ in 0..assign_count {
+                            let (ent, _, _) = free_combat_units.remove(0);
+                            squad.members.insert(ent);
+                        }
                     }
                 }
             }
@@ -5398,23 +5492,46 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                 && s.target.as_ref().is_some_and(&is_enemy_facility)
         })
         .count();
-    capture_targets.sort_by_key(|t| {
-        let d = free_infantry
-            .iter()
-            .map(|(_, pos, _)| pos.x.abs_diff(t.x) + pos.y.abs_diff(t.y))
-            .min()
-            .unwrap_or(usize::MAX);
-        let facility_bonus = if is_v3
-            && map
-                .get_terrain(t.x, t.y)
-                .is_some_and(|tr| registry.is_production_facility(tr.as_str()))
-        {
-            PRODUCTION_FACILITY_DIST_BONUS
-        } else {
-            0
+    if crate::ai::strategy_profile::current_profile(world, perspective_player)
+        == crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion
+    {
+        let enemy_capital = {
+            let mut q_props = world.query::<(&GridPosition, &Property)>();
+            q_props.iter(world).find_map(|(pos, prop)| {
+                (prop.terrain == Terrain::Capital
+                    && prop.owner_id != Some(perspective_player)
+                    && prop.owner_id.is_some())
+                .then_some(*pos)
+            })
         };
-        (d.saturating_sub(facility_bonus), t.x, t.y)
-    });
+        if let Some(my_cap) = my_capital_pos {
+            capture_targets.sort_unstable_by_key(|t| {
+                let d_my = map.distance(my_cap.x, my_cap.y, t.x, t.y);
+                let d_enemy = enemy_capital
+                    .map(|ec| map.distance(ec.x, ec.y, t.x, t.y))
+                    .unwrap_or(0);
+                (std::cmp::Reverse(d_my), d_enemy, t.y, t.x)
+            });
+        }
+    } else {
+        capture_targets.sort_by_key(|t| {
+            let d = free_infantry
+                .iter()
+                .map(|(_, pos, _)| pos.x.abs_diff(t.x) + pos.y.abs_diff(t.y))
+                .min()
+                .unwrap_or(usize::MAX);
+            let facility_bonus = if is_v3
+                && map
+                    .get_terrain(t.x, t.y)
+                    .is_some_and(|tr| registry.is_production_facility(tr.as_str()))
+            {
+                PRODUCTION_FACILITY_DIST_BONUS
+            } else {
+                0
+            };
+            (d.saturating_sub(facility_bonus), t.x, t.y)
+        });
+    }
 
     // #53 (V3): 敵生産施設への突入 (スピアヘッド) は戦力優勢 (Assault フェーズ)
     // のときのみ許可する。拮抗・劣勢時に前線から兵力を抜くと防衛線が崩壊する
@@ -5437,19 +5554,29 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         let target_island = target_island_opt.unwrap();
         let is_on_base_island = base_islands.contains(&target_island.id);
 
-        // この未占領拠点と同じ島にいるフリーの歩兵を探す
-        let inf_on_same_island_idx = free_infantry.iter().position(|(_, pos, stats)| {
-            island_map
-                .get_island_at(pos)
-                .is_some_and(|island| island.id == target_island.id)
-                && is_terrain_reachable(
-                    &map,
-                    &registry,
-                    (pos.x, pos.y),
-                    (unowned_pos.x, unowned_pos.y),
-                    stats.movement_type,
+        // この未占領拠点と同じ島にいるフリーの歩兵を探す（目標に最も近い歩兵を選択）
+        let inf_on_same_island_idx = free_infantry
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, pos, stats))| {
+                island_map
+                    .get_island_at(pos)
+                    .is_some_and(|island| island.id == target_island.id)
+                    && is_terrain_reachable(
+                        &map,
+                        &registry,
+                        (pos.x, pos.y),
+                        (unowned_pos.x, unowned_pos.y),
+                        stats.movement_type,
+                    )
+            })
+            .min_by_key(|(_, (ent, pos, _))| {
+                (
+                    map.distance(pos.x, pos.y, unowned_pos.x, unowned_pos.y),
+                    ent.to_bits(),
                 )
-        });
+            })
+            .map(|(idx, _)| idx);
 
         // V3の洋上移動はportfolio transportだけが担当し、generic Captureは到達可能な現地要員に限定する。
         let can_capture = inf_on_same_island_idx.is_some()

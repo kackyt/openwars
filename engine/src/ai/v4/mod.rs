@@ -2976,6 +2976,35 @@ fn capital_route_dag_frontier_properties(
     Some(route_properties)
 }
 
+/// 同一陸塊の首都戦役において、各進軍軸に属する全未所有物件を返す。
+///
+/// 最前線の1物件だけを見るフロンティア判定とは異なり、手前の自陣物件から
+/// 前線の前衛物件までを各routeへ残し、自首都に近い順に攻略できるようにする。
+fn capital_route_dag_all_properties(
+    world: &World,
+    player_id: PlayerId,
+    island_id: crate::ai::islands::IslandId,
+) -> Option<Vec<Vec<GridPosition>>> {
+    let topology = capital_route_topology_for(world, player_id, island_id)?;
+    let mut route_properties = vec![Vec::new(); topology.routes.len()];
+    for entity in world.iter_entities() {
+        let (Some(position), Some(property)) =
+            (entity.get::<GridPosition>(), entity.get::<Property>())
+        else {
+            continue;
+        };
+        if property.owner_id == Some(player_id) {
+            continue;
+        }
+        if let Some(route) = topology.property_routes.get(position)
+            && route.0 < route_properties.len()
+        {
+            route_properties[route.0].push(*position);
+        }
+    }
+    Some(route_properties)
+}
+
 /// 首都作戦を実行へ移してよいかを、DAG上の前方区間から判定する。
 ///
 /// 単に「自軍所有のどれかの都市が中間地点を越えたか」では、側方の都市やDAG外の
@@ -3773,13 +3802,44 @@ pub(crate) fn capital_route_allows_tactical_position(
     let can_capture = world
         .get::<UnitStats>(entity)
         .is_some_and(|stats| stats.can_capture);
-    let reserved_for_capturer = !can_capture
-        && world
-            .get_resource::<CapitalRouteNodeOperationRegistry>()
-            .is_some_and(|operations| {
-                capital_route_capture_target_is_reserved(operations, player_id, position)
-            });
+    let reserved_for_capturer =
+        !can_capture && is_capture_target_reserved(world, player_id, position);
     Some(inside_control_area && !reserved_for_capturer)
+}
+
+/// 非占領ユニットが自軍の占領予定物件を踏んで占領を塞ぐのを防ぐため、
+/// 当該位置が自軍の未完了Capture目標として予約されているかを判定する。
+pub(crate) fn is_capture_target_reserved(
+    world: &World,
+    player_id: PlayerId,
+    position: GridPosition,
+) -> bool {
+    // 既に自軍が所有している物件は占領完了済みなので予約対象外
+    let is_unowned = world.iter_entities().any(|e| {
+        e.get::<GridPosition>() == Some(&position)
+            && e.get::<Property>()
+                .is_some_and(|p| p.owner_id != Some(player_id))
+    });
+    if !is_unowned {
+        return false;
+    }
+    let reserved_in_registry = world
+        .get_resource::<CapitalRouteNodeOperationRegistry>()
+        .is_some_and(|operations| {
+            capital_route_capture_target_is_reserved(operations, player_id, position)
+        });
+    if reserved_in_registry {
+        return true;
+    }
+    world
+        .get_resource::<crate::ai::squad::SquadManager>()
+        .is_some_and(|manager| {
+            manager.squads.iter().any(|squad| {
+                squad.owner_id == Some(player_id)
+                    && squad.mission_type == crate::ai::squad::MissionType::Capture
+                    && squad.target == Some(position)
+            })
+        })
 }
 
 /// 行動決定側へ、現在の地域作戦の戦術的な目標を返す。
@@ -3802,6 +3862,160 @@ pub(crate) fn capital_route_tactical_target(
         return Some(Some(commitment.execution_target));
     }
     let position = world.get::<GridPosition>(entity).copied()?;
+    let can_capture = world
+        .get::<UnitStats>(entity)
+        .is_some_and(|stats| stats.can_capture);
+    // 小規模mapの序盤は、Capture Nodeの集結点へ着いてから物件を選ぶと、実際には
+    // 到達済みの複数レーンを一手ずつ失う。
+    // 占領役は未所有物件群との1対1排他マッチングを行い、各歩兵を別々の物件へ分散進軍させる。
+    // 戦闘役（Recon等）は自陣物件群が未確保の間、敵首都に最も近い最前線物件へ先行展開する。
+    if crate::ai::strategy_profile::current_profile(world, player_id)
+        == crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion
+        && commitment.objective == CapitalRouteNodeObjective::Capture
+    {
+        let map = world.get_resource::<Map>()?;
+        let properties = world
+            .iter_entities()
+            .filter_map(|p| {
+                Some((
+                    *p.get::<GridPosition>()?,
+                    p.get::<Property>()?.owner_id,
+                    p.get::<Property>()?.terrain,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let owners = properties
+            .iter()
+            .map(|(pos, owner, _)| (*pos, *owner))
+            .collect::<HashMap<_, _>>();
+        let unowned_targets = commitment
+            .capture_targets
+            .iter()
+            .filter(|target| owners.get(target) != Some(&Some(player_id)))
+            .copied()
+            .collect::<Vec<_>>();
+
+        if !unowned_targets.is_empty() {
+            let my_capital = properties
+                .iter()
+                .find_map(|(pos, owner, terrain)| {
+                    (*owner == Some(player_id) && *terrain == Terrain::Capital).then_some(*pos)
+                })
+                .unwrap_or(commitment.execution_target);
+            let enemy_capital = properties.iter().find_map(|(pos, owner, terrain)| {
+                (*owner != Some(player_id) && owner.is_some() && *terrain == Terrain::Capital)
+                    .then_some(*pos)
+            });
+
+            if can_capture {
+                // 自軍の占領歩兵を全員収集
+                let mut capturers = world
+                    .iter_entities()
+                    .filter_map(|e| {
+                        let f = e.get::<Faction>()?.0;
+                        let pos = *e.get::<GridPosition>()?;
+                        let stats = e.get::<UnitStats>()?;
+                        let hp = e.get::<Health>()?;
+                        (f == player_id && stats.can_capture && hp.current > 0)
+                            .then_some((e.id(), pos))
+                    })
+                    .collect::<Vec<_>>();
+                capturers.sort_unstable_by_key(|(e, pos)| (pos.x, pos.y, e.to_bits()));
+
+                // 奥（自軍首都から遠く、敵首都に近い順）からソート
+                let mut sorted_targets = unowned_targets.clone();
+                sorted_targets.sort_unstable_by_key(|t| {
+                    let d_my = map.distance(my_capital.x, my_capital.y, t.x, t.y);
+                    let d_enemy = enemy_capital
+                        .map(|ec| map.distance(ec.x, ec.y, t.x, t.y))
+                        .unwrap_or(0);
+                    (std::cmp::Reverse(d_my), d_enemy, t.y, t.x)
+                });
+
+                // 貪欲マッチング: 奥のtargetから順に、最も近い未割当の歩兵を割り当てる
+                let mut target_to_unit: HashMap<GridPosition, Entity> = HashMap::new();
+                let mut unit_to_target: HashMap<Entity, GridPosition> = HashMap::new();
+                let mut available_capturers = capturers.clone();
+
+                for t in &sorted_targets {
+                    if available_capturers.is_empty() {
+                        break;
+                    }
+                    if let Some(best_idx) = available_capturers
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, (e, pos))| {
+                            (map.distance(pos.x, pos.y, t.x, t.y), e.to_bits())
+                        })
+                        .map(|(idx, _)| idx)
+                    {
+                        let (best_e, _best_pos) = available_capturers.remove(best_idx);
+                        target_to_unit.insert(*t, best_e);
+                        unit_to_target.insert(best_e, *t);
+                    }
+                }
+
+                if let Some(&assigned_target) = unit_to_target.get(&entity) {
+                    return Some(Some(assigned_target));
+                }
+
+                // 割り当てから漏れた歩兵は、自分から最も近い未所有物件をフォールバックとして目指す
+                if let Some(fallback_target) = unowned_targets
+                    .iter()
+                    .min_by_key(|t| (map.distance(position.x, position.y, t.x, t.y), t.y, t.x))
+                    .copied()
+                {
+                    return Some(Some(fallback_target));
+                }
+            } else {
+                // 戦闘ユニット（Recon等）:
+                // 小規模マップでは1ターンで移動＋直接攻撃が成立するため、最寄りの敵を
+                // 直接目標にできる。敵が射程圏内にいる間は敵を優先して前進し、
+                // 敵がいなければ最前線物件（Frontier）へスクリーニング展開する。
+                // 撤退する敵を延々追いかけて拠点を失うのを防ぐため、射程圏外の敵は
+                // 追わず、従来どおり物件の確保を優先する。
+                let is_direct_fire = world
+                    .get::<UnitStats>(entity)
+                    .is_some_and(|s| s.min_range <= 1);
+                if is_direct_fire {
+                    let reach = world
+                        .get::<UnitStats>(entity)
+                        .map(|s| s.max_movement + s.max_range)
+                        .unwrap_or(0);
+                    let nearest_enemy = world
+                        .iter_entities()
+                        .filter_map(|e| {
+                            let faction = e.get::<Faction>()?.0;
+                            let epos = *e.get::<GridPosition>()?;
+                            let hp = e.get::<Health>()?.current;
+                            (faction != player_id
+                                && hp > 0
+                                && map.distance(position.x, position.y, epos.x, epos.y) <= reach)
+                                .then_some(epos)
+                        })
+                        .min_by_key(|epos| map.distance(position.x, position.y, epos.x, epos.y));
+                    if let Some(enemy) = nearest_enemy {
+                        return Some(Some(enemy));
+                    }
+                }
+                // 自陣物件が未占領の間、最も敵陣（敵首都）に近い最前線物件（Frontier）へ先行してスクリーニングする
+                let frontier_target = unowned_targets
+                    .iter()
+                    .min_by_key(|t| {
+                        let d_enemy = enemy_capital
+                            .map(|ec| map.distance(ec.x, ec.y, t.x, t.y))
+                            .unwrap_or(0);
+                        let d_my = map.distance(my_capital.x, my_capital.y, t.x, t.y);
+                        (d_enemy, std::cmp::Reverse(d_my), t.y, t.x)
+                    })
+                    .copied();
+
+                if let Some(target) = frontier_target {
+                    return Some(Some(target));
+                }
+            }
+        }
+    }
     if !capital_route_region_reached(commitment, position) {
         return Some(Some(commitment.execution_target));
     }
@@ -5001,8 +5215,8 @@ pub(crate) fn refine_same_land_route_milestones(
         }
         let route_demands = same_land_route_force_demands(world, player_id, assignment.island_id);
         let from_home = armored_step_distances(map, master_data, own_capital);
-        let route_properties =
-            capital_route_dag_frontier_properties(world, player_id, assignment.island_id)
+        let mut route_properties =
+            capital_route_dag_all_properties(world, player_id, assignment.island_id)
                 .unwrap_or_else(|| {
                     // Resource未初期化の単体テストなどでは、従来の地形解析へフォールバックする。
                     let nearest_front = |position: GridPosition| {
@@ -5035,29 +5249,34 @@ pub(crate) fn refine_same_land_route_milestones(
                     }
                     properties
                 });
-        let active_route_count = route_properties
-            .iter()
-            .filter(|properties| !properties.is_empty())
-            .count();
-        // Routeは戦力枠ではなく、首都戦役のロードマップである。従って有効な各routeに
-        // 現在Milestoneを一つ残し、余る占領目標の先読みだけを全体需要比で並べる。
-        // 兵力ゼロのrouteを作戦上閉じたり、逆に最低戦力を強制したりはしない。
-        let additional_milestone_slots = usize::try_from(assignment.requirement.capture_units)
-            .unwrap_or(usize::MAX)
-            .saturating_sub(active_route_count);
-        let additional_route_slots =
-            apportion_route_force_slots(additional_milestone_slots, &route_demands);
-        let route_slots = route_properties
-            .iter()
-            .enumerate()
-            .map(|(route, properties)| {
-                usize::from(!properties.is_empty())
-                    .saturating_add(additional_route_slots.get(route).copied().unwrap_or(0))
-            })
-            .collect::<Vec<_>>();
-        let mut milestones = Vec::new();
-        let mut route_milestones = Vec::new();
-        for (route, mut properties) in route_properties.into_iter().enumerate() {
+        let gates = same_land_armored_route_gates(world, player_id, assignment.island_id);
+        let crossed_gates = world
+            .get_resource::<RouteBreakthroughRegistry>()
+            .and_then(|registry| registry.crossed.get(&player_id))
+            .cloned()
+            .unwrap_or_default();
+
+        let has_any_before_gate = route_properties.iter().enumerate().any(|(route, props)| {
+            if let Some(gate) = gates.get(route) {
+                let gate_key = RouteBreakthroughKey {
+                    island_id: assignment.island_id,
+                    gate: *gate,
+                };
+                if !crossed_gates.contains(&gate_key)
+                    && let Some(gate_dist) = from_home.get(gate).copied()
+                {
+                    return props
+                        .iter()
+                        .any(|pos| from_home.get(pos).copied().unwrap_or(u32::MAX) <= gate_dist);
+                }
+            }
+            false
+        });
+
+        // 橋Gateを未突破のルートでは、橋手前に未所有物件がある間は橋向こうの
+        // 遠隔物件を先取りしない。スロット計算の前に各ルートの有効な候補物件を
+        // 確定させることで、空のルートへの無駄なスロット割り当てを防ぐ。
+        for (route, properties) in route_properties.iter_mut().enumerate() {
             if properties.is_empty() {
                 continue;
             }
@@ -5068,6 +5287,102 @@ pub(crate) fn refine_same_land_route_milestones(
                     position.x,
                 )
             });
+
+            if let Some(gate) = gates.get(route) {
+                let gate_key = RouteBreakthroughKey {
+                    island_id: assignment.island_id,
+                    gate: *gate,
+                };
+                if !crossed_gates.contains(&gate_key)
+                    && let Some(gate_dist) = from_home.get(gate).copied()
+                {
+                    let has_before_gate = properties
+                        .iter()
+                        .any(|pos| from_home.get(pos).copied().unwrap_or(u32::MAX) <= gate_dist);
+                    if has_before_gate {
+                        properties.retain(|pos| {
+                            from_home.get(pos).copied().unwrap_or(u32::MAX) <= gate_dist
+                        });
+                    } else if has_any_before_gate {
+                        // 自陣側に未確保物件が残っている間は、Gate未突破のルートで
+                        // Gate向こうの遠隔物件を先取りしない。
+                        properties.clear();
+                    }
+                }
+            }
+        }
+
+        let active_route_count = route_properties
+            .iter()
+            .filter(|properties| !properties.is_empty())
+            .count();
+        // Routeは戦力枠ではなく、首都戦役のロードマップである。従って有効な各routeに
+        // 現在Milestoneを一つ残し、余る占領目標の先読みだけを全体需要比で並べる。
+        // 兵力ゼロのrouteを作戦上閉じたり、逆に最低戦力を強制したりはしない。
+        let additional_milestone_slots = usize::try_from(assignment.requirement.capture_units)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(active_route_count);
+        let effective_demands = route_properties
+            .iter()
+            .enumerate()
+            .map(|(route, properties)| {
+                if properties.is_empty() {
+                    RouteForceDemand {
+                        opportunity_value: 0,
+                        force_deficit_value: 0,
+                        demand_value: 0,
+                    }
+                } else {
+                    route_demands
+                        .get(route)
+                        .cloned()
+                        .unwrap_or(RouteForceDemand {
+                            opportunity_value: 1,
+                            force_deficit_value: 0,
+                            demand_value: 1,
+                        })
+                }
+            })
+            .collect::<Vec<_>>();
+        let additional_route_slots =
+            apportion_route_force_slots(additional_milestone_slots, &effective_demands);
+        let mut route_slots = route_properties
+            .iter()
+            .enumerate()
+            .map(|(route, properties)| {
+                usize::from(!properties.is_empty())
+                    .saturating_add(additional_route_slots.get(route).copied().unwrap_or(0))
+            })
+            .collect::<Vec<_>>();
+
+        // あるルートで割り当てられたスロットが物件数を超えて余った場合、物件が残っている他のルートへ回す
+        let mut leftover_slots = 0_usize;
+        for (route, properties) in route_properties.iter().enumerate() {
+            if route_slots[route] > properties.len() {
+                leftover_slots += route_slots[route] - properties.len();
+                route_slots[route] = properties.len();
+            }
+        }
+        if leftover_slots > 0 {
+            for (route, properties) in route_properties.iter().enumerate() {
+                if leftover_slots == 0 {
+                    break;
+                }
+                if route_slots[route] < properties.len() {
+                    let take = (properties.len() - route_slots[route]).min(leftover_slots);
+                    route_slots[route] += take;
+                    leftover_slots -= take;
+                }
+            }
+        }
+
+        let mut milestones = Vec::new();
+        let mut route_milestones = Vec::new();
+        for (route, properties) in route_properties.into_iter().enumerate() {
+            if properties.is_empty() {
+                continue;
+            }
+
             route_milestones.push((
                 route,
                 properties
@@ -5093,7 +5408,13 @@ pub(crate) fn refine_same_land_route_milestones(
         }
         if let Some(target) = milestones.first().copied() {
             assignment.target_position = target;
-            assignment.capture_target_positions = milestones;
+            assignment.capture_target_positions = milestones.clone();
+            let new_capture_units = u32::try_from(milestones.len()).unwrap_or(u32::MAX);
+            assignment.requirement.capture_units = new_capture_units;
+            assignment.purchase_shortfall.capture_units = assignment
+                .purchase_shortfall
+                .capture_units
+                .min(new_capture_units);
         }
     }
 }
@@ -5105,6 +5426,7 @@ fn split_bridge_route_objectives(
     objectives: Vec<CampaignPlanningObjective>,
     gates: &[GridPosition],
     my_units: &[UnitSnapshot],
+    unit_targets: &HashMap<Entity, GridPosition>,
 ) -> Vec<CampaignPlanningObjective> {
     if gates.len() < 2 {
         return objectives;
@@ -5176,6 +5498,12 @@ fn split_bridge_route_objectives(
                 .protected_capture_entities
                 .iter()
                 .filter(|entity| {
+                    if let Some(target) = unit_targets.get(entity) {
+                        if properties.contains(target) {
+                            return true;
+                        }
+                        return nearest_gate(*target) == group_index;
+                    }
                     unit_positions
                         .get(entity)
                         .is_some_and(|position| nearest_gate(*position) == group_index)
@@ -5251,52 +5579,56 @@ impl BoardScan {
                     .collect::<HashSet<_>>()
             })
             .unwrap_or_default();
-        let mut campaign_objectives: Vec<CampaignPlanningObjective> = world
+        let cached_portfolio = world
             .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
             .and_then(|cache| cache.campaign_portfolio(player_id))
-            .map(|portfolio| {
-                portfolio
-                    .defenses
+            .cloned();
+        let portfolio = cached_portfolio.unwrap_or_else(|| {
+            let mut portfolio =
+                crate::ai::island_campaign_analysis::analyze_island_campaign(world, player_id);
+            crate::ai::v4::strategy_pipeline::prepare_strategy(world, player_id, &mut portfolio);
+            portfolio
+        });
+        let mut campaign_objectives: Vec<CampaignPlanningObjective> = portfolio
+            .defenses
+            .iter()
+            .chain(portfolio.active_offensives.iter())
+            .map(|assignment| {
+                let eta = portfolio
+                    .islands
                     .iter()
-                    .chain(portfolio.active_offensives.iter())
-                    .map(|assignment| {
-                        let eta = portfolio
-                            .islands
-                            .iter()
-                            .find(|assessment| assessment.island_id == assignment.island_id)
-                            .and_then(|assessment| assessment.friendly_capture_eta);
-                        CampaignPlanningObjective {
-                            island_id: assignment.island_id,
-                            kind: if assignment.decision
-                                == crate::ai::island_campaign::IslandCampaignDecision::Defend
-                            {
-                                OperationKind::Defense
-                            } else {
-                                OperationKind::Capture
-                            },
-                            anchor: assignment.target_position,
-                            objective_properties: assignment.capture_target_positions.clone(),
-                            capture_eta: eta,
-                            required_capture_survivors: usize::try_from(
-                                assignment.requirement.capture_units,
-                            )
-                            .unwrap_or(usize::MAX),
-                            logistics_rank: logistics_ranks.get(&assignment.island_id).copied(),
-                            forced_target_enemies: HashSet::new(),
-                            protected_capture_entities: assignment
-                                .capture_entities
-                                .iter()
-                                .copied()
-                                .collect(),
-                            capture_replacement_pending: pending_capture_replacements
-                                .contains(&assignment.island_id),
-                            staging_anchor: assignment.target_position,
-                            execution_authorized: true,
-                        }
-                    })
-                    .collect()
+                    .find(|assessment| assessment.island_id == assignment.island_id)
+                    .and_then(|assessment| assessment.friendly_capture_eta);
+                CampaignPlanningObjective {
+                    island_id: assignment.island_id,
+                    kind: if assignment.decision
+                        == crate::ai::island_campaign::IslandCampaignDecision::Defend
+                    {
+                        OperationKind::Defense
+                    } else {
+                        OperationKind::Capture
+                    },
+                    anchor: assignment.target_position,
+                    objective_properties: assignment.capture_target_positions.clone(),
+                    capture_eta: eta,
+                    required_capture_survivors: usize::try_from(
+                        assignment.requirement.capture_units,
+                    )
+                    .unwrap_or(usize::MAX),
+                    logistics_rank: logistics_ranks.get(&assignment.island_id).copied(),
+                    forced_target_enemies: HashSet::new(),
+                    protected_capture_entities: assignment
+                        .capture_entities
+                        .iter()
+                        .copied()
+                        .collect(),
+                    capture_replacement_pending: pending_capture_replacements
+                        .contains(&assignment.island_id),
+                    staging_anchor: assignment.target_position,
+                    execution_authorized: true,
+                }
             })
-            .unwrap_or_default();
+            .collect();
 
         // 同一ターン内で生産に失敗した施設を除外するためのクールダウン
         let cooldown: HashSet<(usize, usize)> = world
@@ -5455,8 +5787,28 @@ impl BoardScan {
             && let (Some(home), Some(capital)) = (capital_pos, enemy_capital)
         {
             let gates = armored_entry_bridge_gates(&map, &master_data, home, capital);
-            campaign_objectives =
-                split_bridge_route_objectives(&map, campaign_objectives, &gates, &my_units);
+            let unit_targets = world
+                .get_resource::<crate::ai::squad::SquadManager>()
+                .map(|manager| {
+                    manager
+                        .squads
+                        .iter()
+                        .filter(|squad| squad.owner_id == Some(player_id))
+                        .flat_map(|squad| {
+                            squad.target.into_iter().flat_map(move |target| {
+                                squad.members.iter().map(move |entity| (*entity, target))
+                            })
+                        })
+                        .collect::<HashMap<_, _>>()
+                })
+                .unwrap_or_default();
+            campaign_objectives = split_bridge_route_objectives(
+                &map,
+                campaign_objectives,
+                &gates,
+                &my_units,
+                &unit_targets,
+            );
         }
         let completed_route_island = logistics_plan.as_ref().and_then(|plan| {
             plan.route_islands
@@ -5791,7 +6143,24 @@ fn build_operations(
                 if neutral_race_owner == Some(index) && !scan.neutral_properties.is_empty() {
                     // 中立が残る局面では中立物件レースだけを共同評価する。敵後方物件を
                     // 混ぜると、直取り3件を奪還5件へ水増ししてしまう。
-                    scan.neutral_properties.clone()
+                    // ただし、Campaign作戦目標が認めていない遠隔物件（未突破Gate向こうなど）
+                    // を再投入して戦闘予算を枯渇させないよう、campaign_objectivesが認めた物件に限定する。
+                    let campaign_allowed_properties = scan
+                        .campaign_objectives
+                        .iter()
+                        .flat_map(|obj| obj.objective_properties.iter().copied())
+                        .collect::<HashSet<_>>();
+                    let filtered_neutrals: Vec<_> = scan
+                        .neutral_properties
+                        .iter()
+                        .copied()
+                        .filter(|pos| campaign_allowed_properties.contains(pos))
+                        .collect();
+                    if filtered_neutrals.is_empty() {
+                        candidate.cluster.clone()
+                    } else {
+                        filtered_neutrals
+                    }
                 } else {
                     // 中立が無い初期分割マップでは、Campaignが選んだ前線物件を使う。
                     // 首都は別Operationなのでここには入らない。
@@ -5909,12 +6278,40 @@ fn build_operations(
                     .count();
                 // 既にこの作戦へ確保済みの占領役は先頭レーンを担当済みとみなし、
                 // 今回新規に必要な任務先だけを残す。今手番に占領役を作れない施設数を
-                // 超えて仮想保護対象を要求せず、最大波サイズは既存の構造上限に従う。
-                operation.capture_lane_targets = plan
-                    .capture_lanes
+                // 超えて仮想保護対象を要求せず、作戦自身の対象クラスタの未所有拠点数および
+                // 最大波サイズに従う。別前線の遠隔物件まで先取りして戦闘予算を枯渇させない。
+                let cluster_target_cap = cluster
+                    .iter()
+                    .filter(|p| scan.open_properties.contains(p))
+                    .count();
+                let is_small_map_expansion =
+                    scan.opening_policy == Some(OpeningProductionPolicy::SmallMapExpansion);
+                let mut capture_lanes = plan.capture_lanes;
+                if is_small_map_expansion && let Some(my_cap) = scan.capital_position {
+                    let enemy_cap = scan
+                        .enemy_facilities
+                        .iter()
+                        .find_map(|f| (f.terrain == Terrain::Capital).then_some(f.pos));
+                    capture_lanes.sort_by(|a, b| {
+                        let d_my_a = scan.map.distance(a.x, a.y, my_cap.x, my_cap.y);
+                        let d_my_b = scan.map.distance(b.x, b.y, my_cap.x, my_cap.y);
+                        let d_en_a = enemy_cap
+                            .map(|ec| scan.map.distance(a.x, a.y, ec.x, ec.y))
+                            .unwrap_or(0);
+                        let d_en_b = enemy_cap
+                            .map(|ec| scan.map.distance(b.x, b.y, ec.x, ec.y))
+                            .unwrap_or(0);
+                        d_my_b
+                            .cmp(&d_my_a)
+                            .then_with(|| d_en_a.cmp(&d_en_b))
+                            .then_with(|| (a.y, a.x).cmp(&(b.y, b.x)))
+                    });
+                }
+                operation.capture_lane_targets = capture_lanes
                     .into_iter()
                     .skip(operation.facts.friendly_capture_units_committed as usize)
                     .take(current_capture_facility_capacity)
+                    .take(cluster_target_cap.max(1))
                     .take(MAX_CAPTURE_SLOTS as usize)
                     .collect();
                 operation.slots.capture_units =
@@ -7817,6 +8214,7 @@ fn plan_production_with_registry(
                     .is_some_and(|entity| !resolved_by_rolling_plan.contains(&entity))
         });
 
+        let is_small_map = scan.opening_policy == Some(OpeningProductionPolicy::SmallMapExpansion);
         let per_slot_budget = immediate_reinforcement_funds / free_slots as u32;
         let mut best_mobilization: Option<SlotCandidate> = None;
         for (facility, terrain) in &scan.free_facilities {
@@ -7824,9 +8222,10 @@ fn plan_production_with_registry(
                 continue;
             }
             for (unit_type, stats) in &scan.available_types {
+                let allow_combat_unit = has_unresolved_live_threat || is_small_map;
                 if stats.cost == 0
                     || stats.cost > immediate_reinforcement_funds
-                    || (!has_unresolved_live_threat && !stats.can_capture)
+                    || (!allow_combat_unit && !stats.can_capture)
                     || !scan.can_produce(*terrain, *unit_type)
                     || !can_join_operation(
                         scan,
@@ -7845,22 +8244,74 @@ fn plan_production_with_registry(
                     facility: *facility,
                     fitness: 1.0,
                 };
-                let fits_budget = stats.cost <= per_slot_budget.max(1000);
-                // Infantry (1,000G) による前線展開、または Tank (6,000G) による前線突破を最優先
-                let is_preferred = stats.cost == 1000 || stats.cost == 6000;
+                let fits_budget = if has_unresolved_live_threat || is_small_map {
+                    stats.cost <= immediate_reinforcement_funds
+                } else {
+                    stats.cost <= per_slot_budget.max(1000)
+                };
+                let damage_potential = if has_unresolved_live_threat {
+                    op.reachable_threats
+                        .iter()
+                        .map(|threat| {
+                            best_damage(&scan.damage_chart, stats.unit_type, threat.stats.unit_type)
+                        })
+                        .max()
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                let has_effective_damage = !has_unresolved_live_threat || damage_potential > 0;
+                let movement_rank = if is_small_map {
+                    std::cmp::Reverse(stats.max_movement)
+                } else {
+                    std::cmp::Reverse(0)
+                };
                 let key = (
+                    !has_effective_damage,
                     !fits_budget,
-                    !is_preferred,
+                    std::cmp::Reverse(damage_potential),
+                    movement_rank,
                     stats.cost,
                     facility.y,
                     facility.x,
                 );
                 if best_mobilization.as_ref().is_none_or(|current| {
-                    let current_fits = current.cost <= per_slot_budget.max(1000);
-                    let current_preferred = current.cost == 1000 || current.cost == 6000;
+                    let current_fits = if has_unresolved_live_threat || is_small_map {
+                        current.cost <= immediate_reinforcement_funds
+                    } else {
+                        current.cost <= per_slot_budget.max(1000)
+                    };
+                    let current_damage = if has_unresolved_live_threat {
+                        op.reachable_threats
+                            .iter()
+                            .map(|threat| {
+                                best_damage(
+                                    &scan.damage_chart,
+                                    current.unit_type,
+                                    threat.stats.unit_type,
+                                )
+                            })
+                            .max()
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let current_has_damage = !has_unresolved_live_threat || current_damage > 0;
+                    let current_stats = scan
+                        .available_types
+                        .iter()
+                        .find(|(t, _)| *t == current.unit_type)
+                        .map(|(_, s)| s);
+                    let current_movement_rank = if is_small_map {
+                        std::cmp::Reverse(current_stats.map_or(0, |s| s.max_movement))
+                    } else {
+                        std::cmp::Reverse(0)
+                    };
                     let current_key = (
+                        !current_has_damage,
                         !current_fits,
-                        !current_preferred,
+                        std::cmp::Reverse(current_damage),
+                        current_movement_rank,
                         current.cost,
                         current.facility.y,
                         current.facility.x,
@@ -7928,12 +8379,124 @@ fn plan_production_with_registry(
         });
     }
 
+    optimize_production_facility_assignments(scan, &mut commands);
+
     plan_registry.reconcile_unseen_plans(player_id, turn, &seen_plan_ids);
     plan_trace.leftover_funds = remaining_funds;
     plan_trace.reserved_funds =
         remaining_funds.min(unissued_plan_reserve.saturating_add(contingency_reserve));
     plan_trace.uncommitted_funds = remaining_funds.saturating_sub(plan_trace.reserved_funds);
     (commands, plan_trace)
+}
+
+/// 同一手番に発注する複数ユニットを、それぞれの目標地点への到着所要ターン数・距離の
+/// 総和が最小になるよう生産施設へ最適配分する。
+///
+/// 探索深さや施設の列挙順の都合で快速部隊が遠方の工場へ追いやられたり、占領兵が遠回り
+/// することを防ぎ、盤面の移動力と幾何距離に基づく純粋な二部マッチング最適化を行う。
+fn optimize_production_facility_assignments(scan: &BoardScan, commands: &mut [PlannedProduction]) {
+    if commands.len() <= 1 {
+        return;
+    }
+    let stats_by_type: HashMap<UnitType, &UnitStats> =
+        scan.available_types.iter().map(|(t, s)| (*t, s)).collect();
+
+    let mut improved = true;
+    let mut iterations = 0;
+    while improved && iterations < 32 {
+        improved = false;
+        iterations += 1;
+        for i in 0..commands.len() {
+            for j in (i + 1)..commands.len() {
+                let target_i = commands[i]
+                    .capture_intent
+                    .as_ref()
+                    .and_then(|intent| intent.mission_target)
+                    .or_else(|| commands[i].deployment.as_ref().map(|d| d.staging_anchor));
+                let target_j = commands[j]
+                    .capture_intent
+                    .as_ref()
+                    .and_then(|intent| intent.mission_target)
+                    .or_else(|| commands[j].deployment.as_ref().map(|d| d.staging_anchor));
+
+                let (Some(target_i), Some(target_j)) = (target_i, target_j) else {
+                    continue;
+                };
+
+                let pos_i = GridPosition {
+                    x: commands[i].command.target_x,
+                    y: commands[i].command.target_y,
+                };
+                let pos_j = GridPosition {
+                    x: commands[j].command.target_x,
+                    y: commands[j].command.target_y,
+                };
+                if pos_i == pos_j {
+                    continue;
+                }
+
+                let terrain_i = scan
+                    .map
+                    .get_terrain(pos_i.x, pos_i.y)
+                    .unwrap_or(Terrain::Factory);
+                let terrain_j = scan
+                    .map
+                    .get_terrain(pos_j.x, pos_j.y)
+                    .unwrap_or(Terrain::Factory);
+                let unit_i = commands[i].command.unit_type;
+                let unit_j = commands[j].command.unit_type;
+
+                // 地形生産制約の確認
+                if !scan.can_produce(terrain_j, unit_i) || !scan.can_produce(terrain_i, unit_j) {
+                    continue;
+                }
+
+                let speed_i = stats_by_type
+                    .get(&unit_i)
+                    .map_or(1, |s| s.max_movement)
+                    .max(1);
+                let speed_j = stats_by_type
+                    .get(&unit_j)
+                    .map_or(1, |s| s.max_movement)
+                    .max(1);
+
+                let dist_i_curr = scan.map.distance(pos_i.x, pos_i.y, target_i.x, target_i.y);
+                let dist_j_curr = scan.map.distance(pos_j.x, pos_j.y, target_j.x, target_j.y);
+                let eta_i_curr = dist_i_curr.div_ceil(speed_i);
+                let eta_j_curr = dist_j_curr.div_ceil(speed_j);
+                let curr_key = (
+                    eta_i_curr.saturating_add(eta_j_curr),
+                    dist_i_curr.saturating_add(dist_j_curr),
+                );
+
+                let dist_i_swap = scan.map.distance(pos_j.x, pos_j.y, target_i.x, target_i.y);
+                let dist_j_swap = scan.map.distance(pos_i.x, pos_i.y, target_j.x, target_j.y);
+                let eta_i_swap = dist_i_swap.div_ceil(speed_i);
+                let eta_j_swap = dist_j_swap.div_ceil(speed_j);
+                let swap_key = (
+                    eta_i_swap.saturating_add(eta_j_swap),
+                    dist_i_swap.saturating_add(dist_j_swap),
+                );
+
+                if swap_key < curr_key {
+                    commands[i].command.target_x = pos_j.x;
+                    commands[i].command.target_y = pos_j.y;
+                    if let Some(intent) = commands[i].capture_intent.as_mut() {
+                        intent.command.target_x = pos_j.x;
+                        intent.command.target_y = pos_j.y;
+                    }
+
+                    commands[j].command.target_x = pos_i.x;
+                    commands[j].command.target_y = pos_i.y;
+                    if let Some(intent) = commands[j].capture_intent.as_mut() {
+                        intent.command.target_x = pos_i.x;
+                        intent.command.target_y = pos_i.y;
+                    }
+                    improved = true;
+                }
+            }
+        }
+    }
 }
 
 /// 未確保のDAG区間が実在敵と交戦中なら、未許可の首都親作戦の構造枠を保留する。
@@ -8672,10 +9235,14 @@ fn combat_plan_input(
     }
     if !op.property_controls.is_empty() {
         // 物件前線の合同探索では、Capture契約を持たない候補は実在敵へ合法に
-        // 攻撃できる場合だけCombat枠へ残す。非武装輸送や未接敵兵を「敵の攻撃を
-        // 吸うだけの戦闘役」として評価すると、快速screenを省いた編成になる。
+        // 攻撃できる場合、または敵未接触・小規模マップで前線へ自力展開できる
+        // 武装戦闘役（快速screen等）の場合だけCombat枠へ残す。非武装輸送や
+        // 未接敵兵を「敵の攻撃を吸うだけの戦闘役」として評価することを防ぐ。
+        let is_small_map = scan.opening_policy == Some(OpeningProductionPolicy::SmallMapExpansion);
         options.retain(|option| {
-            option.capture_target.is_some() || !option.engageable_enemy_indices.is_empty()
+            option.capture_target.is_some()
+                || !option.engageable_enemy_indices.is_empty()
+                || ((enemies.is_empty() || is_small_map) && option.stats.max_range > 0)
         });
     }
     let next_occupancy = next_activation_occupants(scan, op, player_id);
@@ -11032,7 +11599,8 @@ mod tests {
             staging_anchor: pos(2, 1),
             execution_authorized: true,
         };
-        let routes = split_bridge_route_objectives(&map, vec![objective], &gates, &[]);
+        let targets = HashMap::new();
+        let routes = split_bridge_route_objectives(&map, vec![objective], &gates, &[], &targets);
 
         assert_eq!(routes.len(), 2);
         assert_eq!(
@@ -14046,6 +14614,275 @@ mod tests {
             world
                 .resource::<AiTurnStrategyCache>()
                 .campaign_production_blocks_generic(player_id)
+        );
+    }
+
+    #[test]
+    fn map32_p2_small_map_expansion_opening_and_capture() {
+        let registry = MasterDataRegistry::load().unwrap();
+        let (mut world, mut schedule) =
+            crate::setup::initialize_world_from_master_data_with_topology(
+                &registry,
+                "map_32",
+                GridTopology::Hex,
+            )
+            .unwrap();
+
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+        let mut settings = crate::ai::PlayerAiSettings::new();
+        settings.set_version(p1, crate::ai::AiVersion::V200);
+        settings.set_version(p2, crate::ai::AiVersion::V4);
+        world.insert_resource(settings);
+
+        // Turn 1 P1 full turn
+        while let Some(_cmd) = crate::ai::engine::execute_ai_turn(&mut world, p1) {
+            schedule.run(&mut world);
+        }
+        schedule.run(&mut world);
+
+        // Turn 1 P2 full turn: 自陣5都市に対する歩兵5体と、前線迎撃用のRecon1体が生産される
+        let mut t1_p2_commands = Vec::new();
+        while let Some(cmd) = crate::ai::engine::execute_ai_turn(&mut world, p2) {
+            t1_p2_commands.push(cmd);
+            schedule.run(&mut world);
+        }
+        schedule.run(&mut world);
+
+        let infantry_count = t1_p2_commands
+            .iter()
+            .filter(|c| c.contains("Infantry"))
+            .count();
+        let recon_count = t1_p2_commands
+            .iter()
+            .filter(|c| c.contains("Recon"))
+            .count();
+        assert!(
+            infantry_count >= 5,
+            "自陣5都市に対応する歩兵5体以上: {t1_p2_commands:?}"
+        );
+        assert!(
+            recon_count >= 1,
+            "初動で前線迎撃用のReconを生産すること: {t1_p2_commands:?}"
+        );
+
+        // Turn 2 P1 full turn
+        while let Some(_cmd) = crate::ai::engine::execute_ai_turn(&mut world, p1) {
+            schedule.run(&mut world);
+        }
+        schedule.run(&mut world);
+
+        // Turn 2 P2: 自陣都市の占領が即座に開始され、過剰な歩兵乱造が抑止される
+        let mut t2_p2_commands = Vec::new();
+        while let Some(cmd) = crate::ai::engine::execute_ai_turn(&mut world, p2) {
+            t2_p2_commands.push(cmd);
+            schedule.run(&mut world);
+        }
+
+        let capture_count = t2_p2_commands
+            .iter()
+            .filter(|c| c.contains("Capture"))
+            .count();
+        assert!(
+            capture_count >= 2,
+            "Turn 2で自陣都市の占領を開始すること: {t2_p2_commands:?}"
+        );
+
+        // Turn 3 P1 full turn
+        while let Some(_cmd) = crate::ai::engine::execute_ai_turn(&mut world, p1) {
+            schedule.run(&mut world);
+        }
+        schedule.run(&mut world);
+
+        // Turn 3 P2
+        let mut t3_p2_commands = Vec::new();
+        while let Some(cmd) = crate::ai::engine::execute_ai_turn(&mut world, p2) {
+            t3_p2_commands.push(cmd);
+            schedule.run(&mut world);
+        }
+        schedule.run(&mut world);
+
+        // Turn 4 P1 full turn
+        while let Some(_cmd) = crate::ai::engine::execute_ai_turn(&mut world, p1) {
+            schedule.run(&mut world);
+        }
+        schedule.run(&mut world);
+
+        // Turn 4 P2
+        let mut t4_p2_commands = Vec::new();
+        while let Some(cmd) = crate::ai::engine::execute_ai_turn(&mut world, p2) {
+            t4_p2_commands.push(cmd);
+            schedule.run(&mut world);
+        }
+        schedule.run(&mut world);
+
+        // 5都市の所有者を検証
+        let target_cities = [
+            GridPosition { x: 4, y: 9 },
+            GridPosition { x: 4, y: 8 },
+            GridPosition { x: 3, y: 9 },
+            GridPosition { x: 3, y: 8 },
+            GridPosition { x: 2, y: 9 },
+        ];
+        for city in &target_cities {
+            let owner = world
+                .iter_entities()
+                .find_map(|e| {
+                    let pos = e.get::<GridPosition>()?;
+                    let prop = e.get::<Property>()?;
+                    if pos == city {
+                        Some(prop.owner_id)
+                    } else {
+                        None
+                    }
+                })
+                .flatten();
+            assert_eq!(
+                owner,
+                Some(p2),
+                "City {:?} should be captured by P2 by T4",
+                city
+            );
+        }
+
+        println!("=== Starting T5-T15 trace ===");
+        for turn in 5..=15 {
+            // P1 turn
+            while let Some(cmd) = crate::ai::engine::execute_ai_turn(&mut world, p1) {
+                if cmd.contains("Produce") || cmd.contains("Capture") {
+                    println!("  T{turn} P1: {cmd}");
+                }
+                schedule.run(&mut world);
+            }
+            schedule.run(&mut world);
+
+            // P2 funds before turn
+            let p2_funds = world
+                .get_resource::<crate::resources::Players>()
+                .and_then(|players| players.0.iter().find(|p| p.id == p2).map(|p| p.funds))
+                .unwrap_or(0);
+            println!("--- T{turn} P2 Start (Funds: {p2_funds}) ---");
+            if let Some(manager) = world.get_resource::<crate::ai::squad::SquadManager>() {
+                for s in &manager.squads {
+                    if s.owner_id == Some(p2) {
+                        println!(
+                            "  Squad {:?}: mission={:?}, target={:?}, members={:?}",
+                            s.id, s.mission_type, s.target, s.members
+                        );
+                    }
+                }
+            }
+            for (e, stats, pos, hp) in world
+                .query::<(Entity, &UnitStats, &GridPosition, &Health)>()
+                .iter(&world)
+            {
+                let is_p2 = world.get::<Faction>(e).map(|f| f.0 == p2).unwrap_or(false);
+                if is_p2 {
+                    let squad_id = world
+                        .get_resource::<crate::ai::squad::SquadManager>()
+                        .and_then(|m| {
+                            m.squads
+                                .iter()
+                                .find(|s| s.members.contains(&e))
+                                .map(|s| s.id)
+                        });
+                    println!(
+                        "  P2 Unit {:?}: {:?} at {:?}, hp={}, squad={:?}",
+                        e, stats.unit_type, pos, hp.current, squad_id
+                    );
+                }
+            }
+
+            // P2 turn
+            let mut p2_produced = Vec::new();
+            while let Some(cmd) = crate::ai::engine::execute_ai_turn(&mut world, p2) {
+                if cmd.contains("Produce") {
+                    p2_produced.push(cmd.clone());
+                }
+                println!("  T{turn} P2: {cmd}");
+                schedule.run(&mut world);
+            }
+            schedule.run(&mut world);
+
+            // 5都市の状態と滞在ユニット
+            println!("  T{turn} Cities Status:");
+            for city in &target_cities {
+                let owner = world
+                    .iter_entities()
+                    .find_map(|e| {
+                        let pos = e.get::<GridPosition>()?;
+                        let prop = e.get::<Property>()?;
+                        if pos == city {
+                            Some(prop.owner_id)
+                        } else {
+                            None
+                        }
+                    })
+                    .flatten();
+                let occupying_unit = world.iter_entities().find_map(|e| {
+                    let pos = e.get::<GridPosition>()?;
+                    let stats = e.get::<UnitStats>()?;
+                    let faction = e.get::<Faction>()?;
+                    let hp = e.get::<Health>()?;
+                    if pos == city {
+                        Some(format!(
+                            "P{}:{:?}(hp={})",
+                            faction.0.0, stats.unit_type, hp.current
+                        ))
+                    } else {
+                        None
+                    }
+                });
+                println!(
+                    "    City ({},{}): owner={:?}, occupying={:?}",
+                    city.x, city.y, owner, occupying_unit
+                );
+            }
+
+            // 西側防衛線 (x <= 5, y >= 7) のユニット
+            let mut west_p2 = Vec::new();
+            let mut west_p1 = Vec::new();
+            for (_e, f, stats, pos, hp) in world
+                .query::<(Entity, &Faction, &UnitStats, &GridPosition, &Health)>()
+                .iter(&world)
+            {
+                if pos.x <= 5 && pos.y >= 7 {
+                    let desc = format!(
+                        "{:?}@({},{})(hp={})",
+                        stats.unit_type, pos.x, pos.y, hp.current
+                    );
+                    if f.0 == p1 {
+                        west_p1.push(desc);
+                    } else if f.0 == p2 {
+                        west_p2.push(desc);
+                    }
+                }
+            }
+            println!(
+                "  West Sector (x<=5, y>=7) P2 units ({}): {}",
+                west_p2.len(),
+                west_p2.join(", ")
+            );
+            println!(
+                "  West Sector (x<=5, y>=7) P1 units ({}): {}",
+                west_p1.len(),
+                west_p1.join(", ")
+            );
+        }
+
+        let p2_owned_target_cities = target_cities
+            .iter()
+            .filter(|city| {
+                world.iter_entities().any(|e| {
+                    e.get::<GridPosition>().is_some_and(|p| p == *city)
+                        && e.get::<Property>()
+                            .is_some_and(|prop| prop.owner_id == Some(p2))
+                })
+            })
+            .count();
+        assert!(
+            p2_owned_target_cities >= 3,
+            "P2 は T15 時点でも西側重要都市を少なくとも3箇所以上維持防衛できているべき (実際: {p2_owned_target_cities})"
         );
     }
 }

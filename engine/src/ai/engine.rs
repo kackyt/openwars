@@ -1876,6 +1876,10 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     }
 
     // 2. 通常部隊・SoloFallback ユニットの行動決定 (V2意思決定)
+    // 小規模mapの序盤は、Squadの目標同期より先に占領開始turnを失うと、後から戦闘力を
+    // 足しても収入差を埋められない。未割当の歩兵を単にWaitさせず、現盤面の未所有物件へ
+    // 到達できるCapture命令だけを先に実行する。敵・味方・地形から毎手番判定するため、
+    // 特定mapや固定の生産列には依存しない。
     let normal_action = if is_v4 {
         decide_squad_action_v4(world, active_player, &decide_skip_entities)
     } else {
@@ -2296,12 +2300,22 @@ fn decide_forming_campaign_site_relief(
                         })
                 });
             if let Some((x, y)) = destination {
-                return Some((
-                    *entity,
-                    AiCommand::Wait {
-                        target_pos: GridPosition { x, y },
-                    },
-                ));
+                let target_pos = GridPosition { x, y };
+                let is_capturable = world
+                    .get::<UnitStats>(*entity)
+                    .is_some_and(|s| s.can_capture)
+                    && world.iter_entities().any(|property| {
+                        property.get::<GridPosition>().copied() == Some(target_pos)
+                            && property.get::<Property>().is_some_and(|p| {
+                                p.max_capture_points > 0 && p.owner_id != Some(player_id)
+                            })
+                    });
+                let command = if is_capturable {
+                    AiCommand::Capture { target_pos }
+                } else {
+                    AiCommand::Wait { target_pos }
+                };
+                return Some((*entity, command));
             }
         }
     }
@@ -2324,15 +2338,19 @@ enum ActionPriority {
     /// DAG区間のセル列に沿う前進。通常の局地位置取りより優先するが、
     /// その場で成立する有利な戦闘・占領は妨げない。
     RouteAdvance,
-    /// 専任占領役が、実経路上で割当物件へ近づく移動またはその物件を占領する行動。
-    /// 一般の有利交換より先に置き、前面戦闘は同行するCombat役へ分担する。
+    /// 専任占領役が、実経路上で割当物件へ近づく移動。
     CaptureAdvance,
     /// 作戦パッケージが実行段階にあり、他に有利な局地標的がない場合の必要攻撃。
     StrategicTargetFallback,
+    /// 損耗部隊同士が前線で即時合流し、戦力・ZoCを再建する戦術行動。
+    TacticalMerge,
     /// 同じ作戦圏内で見つけた、現在兵種と相性のよい敵への攻撃。
     FavorableLocalTarget,
     /// 作戦対象そのものとの相性もよい攻撃。
     FavorableStrategicTarget,
+    /// 専任占領役が目標物件上で占領を実行する行動。
+    /// 前面戦闘は同行するCombat役へ分担し、占領完了を最優先する。
+    CaptureExecution,
     /// 全生産施設が自軍で埋まったとき、少なくとも一枠を開ける移動・移動攻撃。
     /// 後続を途切れさせない盤面契約であり、通常の戦術scoreとは分離して扱う。
     ProductionSiteRelief,
@@ -2667,6 +2685,29 @@ fn decide_ai_action_v2_for_entities(
         let route_tactical_target =
             crate::ai::v4::capital_route_tactical_target(world, player_id, unit_entity);
         let route_target = route_tactical_target.flatten();
+        // DAG再束縛前でも、RoadmapがCapture Squadへ渡した未所有物件は行動契約として
+        // 有効にする。Squad.targetを捨てて集結待ちへ戻すと、複数の占領レーンを同時に
+        // 開く小規模mapの初動そのものが失われる。
+        let small_map_capture_target =
+            (crate::ai::strategy_profile::current_profile(world, player_id)
+                == crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion
+                && stats.can_capture)
+                .then_some(route_target.or(unit_squad_targets.get(&unit_entity).copied()))
+                .flatten()
+                .filter(|target| {
+                    world.iter_entities().any(|property| {
+                        property.get::<GridPosition>().copied() == Some(*target)
+                            && property.get::<Property>().is_some_and(|property| {
+                                property.max_capture_points > 0
+                                    && property.owner_id != Some(player_id)
+                            })
+                    }) && crate::ai::v4::capital_route_allows_capture_at(
+                        world,
+                        player_id,
+                        unit_entity,
+                        *target,
+                    )
+                });
         let route_recovering =
             crate::ai::v4::capital_route_is_recovering(world, player_id, unit_entity);
         let campaign_context =
@@ -2690,7 +2731,7 @@ fn decide_ai_action_v2_for_entities(
         let capture_waits_for_local_escort = campaign_context.as_ref().is_some_and(|context| {
             context.mission_type == crate::ai::squad::MissionType::Capture
                 && !context.departure_authorized
-        });
+        }) && small_map_capture_target.is_none();
         let reachable = if capture_waits_for_local_escort {
             // 現在位置での攻撃・占領・Waitは残すが、護衛を待つ1手番に単独前進しない。
             std::iter::once((pos.x, pos.y)).collect()
@@ -2715,28 +2756,49 @@ fn decide_ai_action_v2_for_entities(
         );
         // 進軍役は山を迂回するDAGセル列の次候補と、その場の戦闘・占領だけを比較する。
         // それ以外の横方向への通常探索を残すと、橋へ近づくスコアだけで経路から外れる。
-        let mut candidate_tiles = route_advance_destination
-            .map(|destination| {
+        let mut candidate_tiles = if small_map_capture_target.is_some() {
+            reachable.iter().copied().collect::<Vec<_>>()
+        } else if let Some(destination) = route_advance_destination {
+            let advance_dest_blocked = (destination.x == pos.x && destination.y == pos.y)
+                || unit_positions.contains_key(&(destination.x, destination.y));
+            if starts_on_owned_production_site && advance_dest_blocked {
+                // 工場マス上にいてDAGの次マスが味方等で塞がっている場合、一本道に縛られて
+                // 工場上でその場Waitすると後続の生産を永久に封鎖する。
+                // 周囲の合法な非生産マスを候補に含めて、工場から脱出できるようにする。
+                let mut tiles = vec![(pos.x, pos.y)];
+                if reachable.contains(&(destination.x, destination.y)) {
+                    tiles.push((destination.x, destination.y));
+                }
+                tiles.extend(
+                    reachable
+                        .iter()
+                        .copied()
+                        .filter(|(x, y)| !owned_production_positions.contains(&(*x, *y))),
+                );
+                tiles.sort_unstable();
+                tiles.dedup();
+                tiles
+            } else {
                 [(pos.x, pos.y), (destination.x, destination.y)]
                     .into_iter()
                     .filter(|tile| reachable.contains(tile))
                     .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| {
-                reachable
-                    .iter()
-                    .copied()
-                    .filter(|(x, y)| {
-                        crate::ai::v4::capital_route_allows_tactical_position(
-                            world,
-                            player_id,
-                            unit_entity,
-                            GridPosition { x: *x, y: *y },
-                        )
-                        .unwrap_or(true)
-                    })
-                    .collect()
-            });
+            }
+        } else {
+            reachable
+                .iter()
+                .copied()
+                .filter(|(x, y)| {
+                    crate::ai::v4::capital_route_allows_tactical_position(
+                        world,
+                        player_id,
+                        unit_entity,
+                        GridPosition { x: *x, y: *y },
+                    )
+                    .unwrap_or(true)
+                })
+                .collect()
+        };
         if let Some(planned_target) = deployment_target {
             // 生産計画が具体的な敵Entityとの初撃を契約した場合、DAGの一本道だけで
             // 移動候補を制限しない。実際にこの手番で射撃可能な全セルを加えることで、
@@ -2755,6 +2817,28 @@ fn decide_ai_action_v2_for_entities(
             }));
             candidate_tiles.sort_unstable();
             candidate_tiles.dedup();
+        }
+        // 非占領戦闘ユニットが自軍の未所有な占領予定物件を踏んで占領を物理的に塞ぐのを防ぐ。
+        // （既に自軍が所有している物件は防衛・駐留すべき拠点なので除外しない）
+        if !stats.can_capture {
+            let non_reserved = candidate_tiles
+                .iter()
+                .copied()
+                .filter(|&(x, y)| {
+                    let is_unowned = properties.iter().any(|(p_pos, _, p_owner)| {
+                        p_pos.x == x && p_pos.y == y && *p_owner != Some(player_id)
+                    });
+                    !(is_unowned
+                        && crate::ai::v4::is_capture_target_reserved(
+                            world,
+                            player_id,
+                            GridPosition { x, y },
+                        ))
+                })
+                .collect::<Vec<_>>();
+            if !non_reserved.is_empty() {
+                candidate_tiles = non_reserved;
+            }
         }
         // 健全なunitが行動終了できる非生産セルを一つでも持つなら、Waitで自軍工場へ
         // 入る／残る必要はない。価格スコアで減点するだけではSquad接近点に負けて、
@@ -2962,42 +3046,55 @@ fn decide_ai_action_v2_for_entities(
                 }
             }
 
-            // 2. SoloFallback / 孤立・戦闘不能のインセンティブ
-            if is_solo {
-                if is_combat_ineffective {
-                    let mut min_score: Option<(crate::ai::turn_distance::TurnDistance, i32)> = None;
-                    for (p_pos, p_terrain, p_owner) in &properties {
-                        if *p_owner == Some(player_id)
-                            && registry.can_repair_on_terrain(stats.unit_type, *p_terrain)
-                        {
-                            let d = calculate_turn_distance(
-                                &map,
-                                &registry,
-                                &unit_positions,
-                                (current_grid.x, current_grid.y),
-                                (p_pos.x, p_pos.y),
-                                stats.movement_type,
-                                stats.max_movement,
-                                0,
-                                player_id,
-                                &mut turn_cache,
-                            );
-                            let m = (current_grid.x as i32 - p_pos.x as i32).abs()
-                                + (current_grid.y as i32 - p_pos.y as i32).abs();
-                            let score = (d, m);
-                            if min_score.map_or(true, |min| score < min) {
-                                min_score = Some(score);
-                            }
+            // 2. 損耗・戦闘不能時の回復拠点退避・合流、または SoloFallback のインセンティブ
+            let mut nearest_repair_turns: Option<u32> = None;
+            if is_combat_ineffective {
+                let mut min_score: Option<(crate::ai::turn_distance::TurnDistance, i32)> = None;
+                for (p_pos, p_terrain, p_owner) in &properties {
+                    if *p_owner == Some(player_id)
+                        && registry.can_repair_on_terrain(stats.unit_type, *p_terrain)
+                    {
+                        // 健全な味方なら移動して道を譲れるが、既に他の損耗ユニットが
+                        // 修理滞在中（HP < 100）の都市は空きがなく回復を受け入れられない
+                        let city_occupied_by_repairing_ally = world.iter_entities().any(|e| {
+                            e.id() != unit_entity
+                                && e.get::<GridPosition>() == Some(p_pos)
+                                && e.get::<Health>().is_some_and(|h| h.current < 100)
+                        });
+                        if city_occupied_by_repairing_ally {
+                            continue;
+                        }
+
+                        let d = calculate_turn_distance(
+                            &map,
+                            &registry,
+                            &unit_positions,
+                            (current_grid.x, current_grid.y),
+                            (p_pos.x, p_pos.y),
+                            stats.movement_type,
+                            stats.max_movement,
+                            0,
+                            player_id,
+                            &mut turn_cache,
+                        );
+                        let m = (current_grid.x as i32 - p_pos.x as i32).abs()
+                            + (current_grid.y as i32 - p_pos.y as i32).abs();
+                        let score = (d, m);
+                        if min_score.map_or(true, |min| score < min) {
+                            min_score = Some(score);
                         }
                     }
-                    if let Some((d, m)) = min_score {
-                        if d.turns < 99 {
-                            let p = m as f32 / stats.max_movement as f32;
-                            base_tile_score += (100 - d.turns as i32).max(0) * 1000;
-                            base_tile_score += ((100.0 - p).max(0.0) * 2000.0) as i32;
-                        }
+                }
+                if let Some((d, m)) = min_score {
+                    nearest_repair_turns = Some(d.turns);
+                    if d.turns < 99 {
+                        let p = m as f32 / stats.max_movement as f32;
+                        base_tile_score += (100 - d.turns as i32).max(0) * 1000;
+                        base_tile_score += ((100.0 - p).max(0.0) * 2000.0) as i32;
                     }
-                } else if !stats.can_capture {
+                }
+            } else if is_solo {
+                if !stats.can_capture {
                     // 健全な SoloFallback: 敵ユニットに接近する
                     let mut min_score: Option<(crate::ai::turn_distance::TurnDistance, i32)> = None;
                     for (e_pos, _, _, _, _, _, _) in &enemy_units {
@@ -3336,7 +3433,7 @@ fn decide_ai_action_v2_for_entities(
                     if vacates_gridlocked_production_site {
                         ActionPriority::ProductionSiteRelief
                     } else if advances_capture_contract {
-                        ActionPriority::CaptureAdvance
+                        ActionPriority::CaptureExecution
                     } else if is_route_advance_cell {
                         ActionPriority::RouteAdvance
                     } else {
@@ -3572,15 +3669,61 @@ fn decide_ai_action_v2_for_entities(
                             merge_score += 1000;
                         }
 
+                        // 前線即時合流（TacticalMerge）の明確な判断基準:
+                        // 1. 損耗: 自身または相手が損耗（HP < 70）しており、合流で戦力が実質的に回復する
+                        // 2. 効率: HP切り捨て（Overheal）が少ない（total_hp <= 110）
+                        // 3. 以下のいずれかの戦術的理由がある場合に都市帰還より合流を優先する:
+                        //    (a) 生存: 敵の攻撃到達圏にあり、低HP（<=40）で逃げても撃破されるが、合流すれば耐えられる（>=60）
+                        //    (b) ZoC維持: 前線（敵が4マス以内）にあり、退去すると戦線が崩壊する
+                        //    (c) 帰還困難: 近く（2マス以内）に自軍の修理可能拠点がない
+                        let heals_effectively = is_combat_ineffective || t_health.current < 70;
+                        let low_waste = total_hp <= 110;
+                        let should_tactical_merge = if heals_effectively && low_waste {
+                            let in_threat =
+                                enemy_units.iter().any(|(e_pos, _, _, e_hp, _, _, e_move)| {
+                                    *e_hp > 0
+                                        && map.distance(
+                                            current_grid.x,
+                                            current_grid.y,
+                                            e_pos.x,
+                                            e_pos.y,
+                                        ) <= *e_move + 1
+                                });
+                            let survive_by_merging = in_threat && atk_hp <= 40 && total_hp >= 60;
+                            let near_threatened_front =
+                                enemy_units.iter().any(|(e_pos, _, _, e_hp, _, _, e_move)| {
+                                    *e_hp > 0
+                                        && map.distance(
+                                            current_grid.x,
+                                            current_grid.y,
+                                            e_pos.x,
+                                            e_pos.y,
+                                        ) <= *e_move
+                                });
+                            let is_small_map = crate::ai::strategy_profile::current_profile(
+                                world, player_id,
+                            )
+                                == crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion
+                                || (map.width * map.height) <= 200;
+                            // 小規模マップでは1ターン圏外（2T以上）は戦線崩壊のため合流を優先。
+                            // 広いマップなら2ターンまでの戦術的後退は許容し、3T以上なら合流。
+                            let max_retreat_turns = if is_small_map { 1 } else { 2 };
+                            let no_fast_city =
+                                nearest_repair_turns.is_none_or(|turns| turns > max_retreat_turns);
+                            survive_by_merging || near_threatened_front || no_fast_city
+                        } else {
+                            false
+                        };
+
+                        let priority = if vacates_gridlocked_production_site {
+                            ActionPriority::ProductionSiteRelief
+                        } else if should_tactical_merge {
+                            ActionPriority::TacticalMerge
+                        } else {
+                            ActionPriority::Normal
+                        };
                         let score = base_tile_score + merge_score;
-                        let rank = (
-                            if vacates_gridlocked_production_site {
-                                ActionPriority::ProductionSiteRelief
-                            } else {
-                                ActionPriority::Normal
-                            },
-                            score,
-                        );
+                        let rank = (priority, score);
                         if rank > best_unit_rank {
                             best_unit_rank = rank;
                             best_unit_choice = Some(AiCommand::Merge {
@@ -3729,6 +3872,11 @@ pub(crate) fn decide_squad_action_v4(
     })
 }
 
+/// 小規模の物件レースで、Squadの再編待ちが占領開始を遅らせないようにする。
+///
+/// Capture可能な未行動unitだけへ既存の戦術探索を限定し、実際に選ばれた命令がCaptureの
+/// 場合だけ返す。よって攻撃・退避・目標選択の評価式を複製せず、物件契約を進められない
+/// 状況で戦闘部隊の行動順を横取りしない。
 fn update_v4_squad_execution_cursor(world: &mut World, player_id: PlayerId, squad_id: u32) {
     let mut cursor = world
         .remove_resource::<V4SquadExecutionCursor>()

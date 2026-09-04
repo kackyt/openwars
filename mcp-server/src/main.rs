@@ -101,7 +101,7 @@ pub struct ExecuteActionArgs {
 
 #[tool_router]
 impl OpenWarsAiServer {
-    #[tool(description = "Lists every embedded map name, including map_1 through map_57.")]
+    #[tool(description = "Lists every embedded map name, including map_1 through map_56.")]
     async fn list_maps(
         &self,
         Parameters(_args): Parameters<ListMapsArgs>,
@@ -111,7 +111,7 @@ impl OpenWarsAiServer {
         Ok(serde_json::json!({ "maps": registry.map_names() }).to_string())
     }
 
-    #[tool(description = "Loads a specific embedded map (map_1 through map_57) to evaluate.")]
+    #[tool(description = "Loads a specific embedded map (map_1 through map_56) to evaluate.")]
     async fn load_map(&self, Parameters(args): Parameters<LoadMapArgs>) -> Result<String, String> {
         let registry =
             MasterDataRegistry::load().map_err(|e| format!("Failed to load master data: {}", e))?;
@@ -858,19 +858,19 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn mcp_load_map_accepts_map_57() {
+    async fn mcp_load_map_accepts_map_56() {
         let server = OpenWarsAiServer {
             state: Arc::new(Mutex::new(None)),
         };
 
         let result = server
             .load_map(Parameters(LoadMapArgs {
-                map_name: "map_57".to_string(),
-                seed: Some(57),
+                map_name: "map_56".to_string(),
+                seed: Some(56),
                 grid_type: Some("hex".to_string()),
             }))
             .await;
 
-        assert_eq!(result.as_deref(), Ok("Loaded map: map_57"));
+        assert_eq!(result.as_deref(), Ok("Loaded map: map_56"));
     }
 }

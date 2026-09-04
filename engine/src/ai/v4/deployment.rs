@@ -9,7 +9,9 @@ use crate::ai::squad::{MissionPhase, MissionType, SquadId, SquadManager};
 use crate::ai::turn_distance::TerrainConnectivity;
 use crate::ai::v4::operation::SlotKind;
 use crate::ai::v4::plan_revision::{ActiveDeploymentIntent, PlanId, PlanStepRef};
-use crate::components::{Ammo, Faction, GridPosition, Health, PlayerId, Transporting, UnitStats};
+use crate::components::{
+    Ammo, Faction, GridPosition, Health, PlayerId, Property, Transporting, UnitStats,
+};
 use crate::events::{UnitAttackedEvent, UnitProducedEvent};
 use crate::resources::{DamageChart, Map, MatchState, UnitType, master_data::MasterDataRegistry};
 use bevy_ecs::event::EventReader;
@@ -911,14 +913,174 @@ fn assigned_unit_can_intercept_within_horizon(
     intercept_eta <= deployment.intent.threat_horizon.max(1)
 }
 
+/// 敵の占領歩兵が、自軍の邪魔（物理ブロック）もZoC足止めも受けずに
+/// 拠点群へフリーパスで侵入・占領できる状態（無防備な脅威）であるかを判定する。
+fn is_uncontested_capture_threat(
+    world: &World,
+    map: &Map,
+    player_id: PlayerId,
+    enemy_entity: Entity,
+    enemy_pos: GridPosition,
+    anchor_pos: GridPosition,
+) -> bool {
+    let Some(enemy_stats) = world.get::<UnitStats>(enemy_entity) else {
+        return false;
+    };
+    if !enemy_stats.can_capture {
+        return false;
+    }
+
+    // 敵歩兵が向かっている防衛作戦圏内の自軍・未所有物件を探す
+    let threatened_property = world.iter_entities().find_map(|e| {
+        let pos = *e.get::<GridPosition>()?;
+        let prop = e.get::<Property>()?;
+        if prop.max_capture_points == 0 {
+            return None;
+        }
+        // 敵自身がすでに所有している物件は防衛対象ではない
+        if prop.owner_id.is_some_and(|o| o != player_id) {
+            return None;
+        }
+        let dist_to_enemy = map.distance(pos.x, pos.y, enemy_pos.x, enemy_pos.y);
+        let dist_to_anchor = map.distance(pos.x, pos.y, anchor_pos.x, anchor_pos.y);
+        // 作戦anchorと同じセクター内にあり、敵歩兵が次ターン直接侵入・占領可能な物件（1ターン圏内）
+        (dist_to_anchor <= 8 && dist_to_enemy <= enemy_stats.max_movement).then_some(pos)
+    });
+
+    let Some(target_property) = threatened_property else {
+        return false;
+    };
+
+    // 1. その物件そのものに自軍ユニットが乗っていれば、無血侵入は物理的に阻止されている
+    let prop_occupied_by_friendly = world.iter_entities().any(|e| {
+        e.get::<Faction>().is_some_and(|f| f.0 == player_id)
+            && e.get::<GridPosition>() == Some(&target_property)
+            && e.get::<Health>().is_some_and(|h| h.current > 0)
+    });
+    if prop_occupied_by_friendly {
+        return false;
+    }
+
+    // 2. 敵歩兵に隣接してZoCをかけている（または交戦中の）自軍ユニットがいるか
+    let engaged_by_friendly_zoc = world.iter_entities().any(|e| {
+        e.get::<Faction>().is_some_and(|f| f.0 == player_id)
+            && e.get::<Health>().is_some_and(|h| h.current > 0)
+            && e.get::<GridPosition>()
+                .is_some_and(|pos| map.distance(pos.x, pos.y, enemy_pos.x, enemy_pos.y) <= 1)
+    });
+    if engaged_by_friendly_zoc {
+        return false;
+    }
+
+    // 物件上に味方もおらず、敵歩兵にZoCをかけている味方もいない -> 完全なフリーパス状態！
+    true
+}
+
 /// 優先敵の現在位置を追跡し、消滅・到達不能時だけ局地敵へ再目標化する。
 fn resolve_target(
     world: &mut World,
     connectivity: &mut TerrainConnectivity,
     deployment: &AssignedDeployment,
+    target_commitments: &HashMap<Entity, usize>,
 ) -> Option<(Entity, GridPosition)> {
-    // 毎手番priority listの先頭へ戻すと、複数の敵へダメージを散らして撃破できない。
-    // 現在標的が生存して交戦可能な限り固定し、撃破・到達不能時だけ次へ進む。
+    let map = world.get_resource::<Map>().cloned();
+    let anchor = deployment.intent.anchor;
+    let player_id = deployment.intent.player_id;
+
+    // 1. 防衛対象へのフリーパス侵入の阻止（壁役・迎撃役の緊急選出）:
+    //    部隊全体を引き上げる必要はなく、壁役・迎撃役は最大1体（小規模マップ）で十分。
+    //    すでに1体でも迎撃役が割り当てられているなら、過剰な引き返し（オーバーコミット）を防ぎ、
+    //    主力の攻勢・各個撃破（Focus Fire）を維持する。
+    //    また、壁役は能力値・ダメージ相性から「相手に倒されず、その手番で防ぎに向かえる」ユニットのみを選出する。
+    let is_small_map = map.as_ref().is_some_and(|m| (m.width * m.height) <= 200)
+        || crate::ai::strategy_profile::current_profile(world, player_id)
+            == crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion;
+    let max_interceptor_quota = if is_small_map { 1 } else { 2 };
+    let total_interceptors: usize = target_commitments.values().sum();
+
+    if total_interceptors < max_interceptor_quota
+        && let (Some(m), Some(chart), Some(my_stats)) = (
+            map.as_ref(),
+            world.get_resource::<DamageChart>(),
+            world.get::<UnitStats>(deployment.entity),
+        )
+    {
+        let my_hp = world
+            .get::<Health>(deployment.entity)
+            .map_or(0, |h| h.current);
+        let my_pos = world.get::<GridPosition>(deployment.entity).copied();
+
+        // 壁役の適格条件（兵種ハードコードなし、能力値・状態から判定）:
+        // 1. 直接反撃可能（近接で一方的に殴られない）
+        // 2. 占領専任ユニットではない
+        // 3. 健全な残HP（相手に倒されない）
+        let can_act_as_wall =
+            my_stats.min_range <= 1 && !my_stats.can_capture && my_hp >= 70 && my_pos.is_some();
+
+        if can_act_as_wall && let Some(my_pos) = my_pos {
+            let mut urgent_threats = deployment
+                .intent
+                .priority_enemies
+                .iter()
+                .copied()
+                .filter(|&candidate| {
+                    if target_commitments.get(&candidate).copied().unwrap_or(0) >= 1 {
+                        return false;
+                    }
+                    let Some(candidate_stats) = world.get::<UnitStats>(candidate) else {
+                        return false;
+                    };
+                    // 相手からの被ダメージが小さく、相手に倒されない（装甲・防御相性の判定）
+                    let incoming_damage = chart
+                        .get_base_damage(candidate_stats.unit_type, my_stats.unit_type)
+                        .unwrap_or(0)
+                        .max(
+                            chart
+                                .get_base_damage_secondary(
+                                    candidate_stats.unit_type,
+                                    my_stats.unit_type,
+                                )
+                                .unwrap_or(0),
+                        );
+                    if incoming_damage > 25 {
+                        return false;
+                    }
+
+                    if let Some(pos) = world.get::<GridPosition>(candidate).copied()
+                        && target_within_operation(world, deployment, candidate)
+                        && can_engage(world, connectivity, deployment.entity, candidate)
+                        && is_uncontested_capture_threat(
+                            world, m, player_id, candidate, pos, anchor,
+                        )
+                    {
+                        // 「そのターンで防ぎに向かえる」判定:
+                        // 自機の移動力＋最大射程で、そのターン内に敵を捕捉・攻撃できる距離にいる
+                        let dist_to_enemy = m.distance(my_pos.x, my_pos.y, pos.x, pos.y);
+                        let reach_this_turn =
+                            my_stats.max_movement.saturating_add(my_stats.max_range);
+                        dist_to_enemy <= reach_this_turn
+                    } else {
+                        false
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            if !urgent_threats.is_empty() {
+                urgent_threats.sort_unstable_by_key(|&candidate| {
+                    let c_pos = *world.get::<GridPosition>(candidate).unwrap();
+                    let d_anchor = m.distance(anchor.x, anchor.y, c_pos.x, c_pos.y);
+                    let d_unit = m.distance(my_pos.x, my_pos.y, c_pos.x, c_pos.y);
+                    (d_anchor, d_unit, candidate.to_bits())
+                });
+                let best = urgent_threats[0];
+                let pos = *world.get::<GridPosition>(best).unwrap();
+                return Some((best, pos));
+            }
+        }
+    }
+
+    // 2. 緊急のフリーパス脅威がなければ、各個撃破（Focus Fire）の原則に従い、
+    //    交戦可能な現標的を維持する。
     if let Some(enemy) = deployment.current_target
         && deployment.intent.priority_enemies.contains(&enemy)
         && target_within_operation(world, deployment, enemy)
@@ -927,14 +1089,48 @@ fn resolve_target(
     {
         return Some((enemy, *position));
     }
-    for &enemy in &deployment.intent.priority_enemies {
-        if target_within_operation(world, deployment, enemy)
-            && can_engage(world, connectivity, deployment.entity, enemy)
-            && let Some(position) = world.get::<GridPosition>(enemy)
+
+    // 3. 現標的が消滅・到達不能、または未割り当て（初期配備時）なら、
+    //    防衛対象（anchor）に近く、自機からも近い敵を優先して標的に選ぶ。
+    //    ただし歩兵に対しては、既に他の味方が担当していれば過剰な重複割り当てを避ける。
+    let mut candidate_enemies = deployment
+        .intent
+        .priority_enemies
+        .iter()
+        .copied()
+        .filter(|&enemy| {
+            let is_assigned_infantry = world.get::<UnitStats>(enemy).is_some_and(|s| s.can_capture)
+                && target_commitments.get(&enemy).copied().unwrap_or(0) >= 1;
+            if is_assigned_infantry {
+                return false;
+            }
+            target_within_operation(world, deployment, enemy)
+                && can_engage(world, connectivity, deployment.entity, enemy)
+                && world.get::<GridPosition>(enemy).is_some()
+        })
+        .collect::<Vec<_>>();
+
+    if !candidate_enemies.is_empty() {
+        if let (Some(map), Some(my_pos)) =
+            (&map, world.get::<GridPosition>(deployment.entity).copied())
         {
-            return Some((enemy, *position));
+            candidate_enemies.sort_unstable_by_key(|&enemy| {
+                let e_pos = *world.get::<GridPosition>(enemy).unwrap();
+                let d_anchor = map.distance(anchor.x, anchor.y, e_pos.x, e_pos.y);
+                let d_unit = map.distance(my_pos.x, my_pos.y, e_pos.x, e_pos.y);
+                (d_anchor, d_unit, enemy.to_bits())
+            });
+            let best_enemy = candidate_enemies[0];
+            let pos = *world.get::<GridPosition>(best_enemy).unwrap();
+            return Some((best_enemy, pos));
+        }
+        for &enemy in &candidate_enemies {
+            if let Some(position) = world.get::<GridPosition>(enemy) {
+                return Some((enemy, *position));
+            }
         }
     }
+
     local_retarget(world, connectivity, deployment).and_then(|enemy| {
         world
             .get::<GridPosition>(enemy)
@@ -969,6 +1165,7 @@ pub(crate) fn prepare_deployment_squads(
         .map(|(&entity, _)| entity)
         .collect();
     entities.sort_unstable_by_key(|entity| entity.to_bits());
+    let mut target_commitments: HashMap<Entity, usize> = HashMap::new();
 
     for entity in entities {
         let Some(snapshot) = registry.assigned.get(&entity).cloned() else {
@@ -990,8 +1187,9 @@ pub(crate) fn prepare_deployment_squads(
                 (None, snapshot.intent.staging_anchor, MissionType::Defense)
             }
             DeploymentPosture::Execute => {
-                match resolve_target(world, &mut connectivity, &snapshot) {
+                match resolve_target(world, &mut connectivity, &snapshot, &target_commitments) {
                     Some((target_entity, target)) => {
+                        *target_commitments.entry(target_entity).or_insert(0) += 1;
                         (Some(target_entity), target, MissionType::Attack)
                     }
                     // Combat排除後も対象拠点の占領完了まではPlanを閉じない。
@@ -1592,8 +1790,13 @@ mod tests {
         deployment.intent.priority_enemies = vec![remote_enemy];
         deployment.current_target = Some(remote_enemy);
         assert_eq!(
-            resolve_target(&mut world, &mut TerrainConnectivity::default(), &deployment)
-                .map(|target| target.0),
+            resolve_target(
+                &mut world,
+                &mut TerrainConnectivity::default(),
+                &deployment,
+                &HashMap::new(),
+            )
+            .map(|target| target.0),
             Some(local_enemy),
             "生産時の優先敵が別島へ移動したら同じ島の敵へ再目標化する"
         );
