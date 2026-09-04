@@ -1649,17 +1649,17 @@ mod tests {
     }
 
     #[test]
-    fn cli_exposes_every_embedded_map_through_map_53() {
+    fn cli_exposes_every_embedded_map_through_map_57() {
         let app = App::new().expect("master data should load");
 
-        assert_eq!(app.ui_state.available_maps.len(), 53);
+        assert_eq!(app.ui_state.available_maps.len(), 57);
         assert_eq!(
             app.ui_state.available_maps.first().map(String::as_str),
             Some("map_1")
         );
         assert_eq!(
             app.ui_state.available_maps.last().map(String::as_str),
-            Some("map_53")
+            Some("map_57")
         );
     }
 

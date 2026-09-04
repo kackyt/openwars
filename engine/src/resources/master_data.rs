@@ -951,6 +951,50 @@ mod tests {
         assert_eq!(cell_p2_cap11.player_id, 2);
         assert_eq!(cell_p2_cap11.terrain_id, LandscapeId(1));
 
+        // map_54 の確認（ROMシナリオ48: ルビコンガワ）
+        let map54 = registry.get_map("map_54").expect("map_54 not found");
+        assert_eq!(map54.width, 24);
+        assert_eq!(map54.height, 24);
+        let cell_p1_cap54 = map54.get_cell(3, 3).unwrap();
+        assert_eq!(cell_p1_cap54.player_id, 1);
+        assert_eq!(cell_p1_cap54.terrain_id, LandscapeId(1));
+        let cell_p2_cap54 = map54.get_cell(20, 19).unwrap();
+        assert_eq!(cell_p2_cap54.player_id, 2);
+        assert_eq!(cell_p2_cap54.terrain_id, LandscapeId(1));
+
+        // map_55 の確認（ROMシナリオ113: アーマゲトウゲ）
+        let map55 = registry.get_map("map_55").expect("map_55 not found");
+        assert_eq!(map55.width, 26);
+        assert_eq!(map55.height, 26);
+        let cell_p1_cap55 = map55.get_cell(4, 3).unwrap();
+        assert_eq!(cell_p1_cap55.player_id, 1);
+        assert_eq!(cell_p1_cap55.terrain_id, LandscapeId(1));
+        let cell_p2_cap55 = map55.get_cell(22, 22).unwrap();
+        assert_eq!(cell_p2_cap55.player_id, 2);
+        assert_eq!(cell_p2_cap55.terrain_id, LandscapeId(1));
+
+        // map_56 の確認（ROMシナリオ50: ドラゴンベイ）
+        let map56 = registry.get_map("map_56").expect("map_56 not found");
+        assert_eq!(map56.width, 30);
+        assert_eq!(map56.height, 30);
+        let cell_p1_cap56 = map56.get_cell(14, 3).unwrap();
+        assert_eq!(cell_p1_cap56.player_id, 1);
+        assert_eq!(cell_p1_cap56.terrain_id, LandscapeId(1));
+        let cell_p2_cap56 = map56.get_cell(15, 26).unwrap();
+        assert_eq!(cell_p2_cap56.player_id, 2);
+        assert_eq!(cell_p2_cap56.terrain_id, LandscapeId(1));
+
+        // map_57 の確認（ROMシナリオ52: ネプチューントウ）
+        let map57 = registry.get_map("map_57").expect("map_57 not found");
+        assert_eq!(map57.width, 30);
+        assert_eq!(map57.height, 30);
+        let cell_p1_cap57 = map57.get_cell(3, 26).unwrap();
+        assert_eq!(cell_p1_cap57.player_id, 1);
+        assert_eq!(cell_p1_cap57.terrain_id, LandscapeId(1));
+        let cell_p2_cap57 = map57.get_cell(23, 7).unwrap();
+        assert_eq!(cell_p2_cap57.player_id, 2);
+        assert_eq!(cell_p2_cap57.terrain_id, LandscapeId(1));
+
         // Check decoding at specific known coordinates from the csv output we saw
         // Cell (0, 0) was '12' -> player 0, terrain 12 (海)
         let cell_0_0 = map1.get_cell(0, 0).unwrap();
@@ -975,12 +1019,12 @@ mod tests {
         let registry = MasterDataRegistry::load().unwrap();
 
         // マップ名はAIコードではなくrom_scenario.csvのmap_name列で対応付ける。
-        assert_eq!(registry.rom_scenarios.len(), 53);
+        assert_eq!(registry.rom_scenarios.len(), 57);
         let map_names = registry.map_names();
-        assert_eq!(map_names.len(), 53);
+        assert_eq!(map_names.len(), 57);
         assert_eq!(map_names.first().map(String::as_str), Some("map_1"));
-        assert_eq!(map_names.last().map(String::as_str), Some("map_53"));
-        for map_number in 1..=53 {
+        assert_eq!(map_names.last().map(String::as_str), Some("map_57"));
+        for map_number in 1..=57 {
             let map_name = format!("map_{map_number}");
             let scenario = registry
                 .get_rom_scenario(&map_name)
