@@ -1142,6 +1142,265 @@ fn evaluate_opening_package_static(
     }
 }
 
+/// 物件レースにおける抽象生産要求（役割）。
+/// 施設ごとの順列展開を排除し、マルチセット（何を何体作るか）として組合せを表現する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ProductionRole {
+    Capture {
+        target: GridPosition,
+        unit_type: UnitType,
+        cost: u32,
+    },
+    Combat {
+        unit_type: UnitType,
+        cost: u32,
+    },
+}
+
+impl ProductionRole {
+    fn cost(&self) -> u32 {
+        match *self {
+            ProductionRole::Capture { cost, .. } | ProductionRole::Combat { cost, .. } => cost,
+        }
+    }
+
+    fn capture_target(&self) -> Option<GridPosition> {
+        match *self {
+            ProductionRole::Capture { target, .. } => Some(target),
+            ProductionRole::Combat { .. } => None,
+        }
+    }
+
+    fn unit_type(&self) -> UnitType {
+        match *self {
+            ProductionRole::Capture { unit_type, .. }
+            | ProductionRole::Combat { unit_type, .. } => unit_type,
+        }
+    }
+}
+
+/// 役割のマルチセット（重複組合せ）を資金上限およびスロット上限の範囲で全列挙する。
+/// 同一占領対象への二重割当は除外され、戦闘ユニットは重複が許容される。
+fn generate_role_multisets(
+    roles: &[ProductionRole],
+    role_start_idx: usize,
+    current_funds: u32,
+    max_slots: usize,
+    used_targets: &mut HashSet<GridPosition>,
+    current_multiset: &mut Vec<ProductionRole>,
+    all_multisets: &mut Vec<Vec<ProductionRole>>,
+) {
+    if !current_multiset.is_empty() {
+        all_multisets.push(current_multiset.clone());
+    }
+    if current_multiset.len() == max_slots {
+        return;
+    }
+
+    for i in role_start_idx..roles.len() {
+        let role = roles[i];
+        let cost = role.cost();
+        if cost > current_funds {
+            continue;
+        }
+        if let Some(target) = role.capture_target() {
+            if used_targets.contains(&target) {
+                continue;
+            }
+            used_targets.insert(target);
+            current_multiset.push(role);
+            generate_role_multisets(
+                roles,
+                i + 1,
+                current_funds.saturating_sub(cost),
+                max_slots,
+                used_targets,
+                current_multiset,
+                all_multisets,
+            );
+            current_multiset.pop();
+            used_targets.remove(&target);
+        } else {
+            current_multiset.push(role);
+            generate_role_multisets(
+                roles,
+                i,
+                current_funds.saturating_sub(cost),
+                max_slots,
+                used_targets,
+                current_multiset,
+                all_multisets,
+            );
+            current_multiset.pop();
+        }
+    }
+}
+
+/// ある施設に特定の役割を割り当てた際のコスト（所要ターン数・距離）。
+/// 小さいほど優秀な割当。鈍足ユニット（歩兵等）を前線工場に、俊足ユニットを後方工場に
+/// 自然に誘導する。
+fn calculate_assignment_cost(
+    input: &RollingPlanInput,
+    opt: &ProductionPlanOption,
+    opt_idx: usize,
+    fac_pos: GridPosition,
+) -> u64 {
+    if let Some(target) = opt.capture_target {
+        let arrival = opt.capture_arrival_turn.unwrap_or(99) as u64;
+        let completion = opt.capture_completion_turn.unwrap_or(99) as u64;
+        let dist = input.map.distance(fac_pos.x, fac_pos.y, target.x, target.y) as u64;
+        arrival * 10_000 + completion * 1_000 + dist
+    } else {
+        let speed = opt.stats.max_movement.max(1) as u64;
+        let proj_earliest = input
+            .production_attack_projections
+            .get(opt_idx)
+            .and_then(|projs| projs.iter().flatten().map(|p| p.ready_turn).min());
+
+        let target_pos = input
+            .enemies
+            .iter()
+            .min_by_key(|e| {
+                input
+                    .map
+                    .distance(fac_pos.x, fac_pos.y, e.position.x, e.position.y)
+            })
+            .map(|e| e.position)
+            .or_else(|| {
+                input
+                    .production_options
+                    .iter()
+                    .filter_map(|o| o.capture_target)
+                    .min_by_key(|t| input.map.distance(fac_pos.x, fac_pos.y, t.x, t.y))
+            });
+        let dist = target_pos
+            .map(|t| input.map.distance(fac_pos.x, fac_pos.y, t.x, t.y) as u64)
+            .unwrap_or(0);
+
+        if let Some(ready_turn) = proj_earliest {
+            (ready_turn as u64) * 10_000 + dist
+        } else {
+            let eta = dist.div_ceil(speed);
+            eta * 10_000 + dist
+        }
+    }
+}
+
+/// 役割列と施設列の最小費用二部マッチング（Branch and Bound）。
+#[allow(clippy::too_many_arguments)]
+fn solve_min_cost_assignment(
+    role_idx: usize,
+    used_facilities_mask: u32,
+    current_cost: u64,
+    current_assignment: &mut Vec<usize>,
+    best_cost: &mut u64,
+    best_assignment: &mut Vec<usize>,
+    cost_matrix: &[Vec<Option<u64>>],
+    num_facilities: usize,
+) {
+    if role_idx == cost_matrix.len() {
+        if current_cost < *best_cost {
+            *best_cost = current_cost;
+            *best_assignment = current_assignment.clone();
+        }
+        return;
+    }
+
+    for fac_idx in 0..num_facilities {
+        if (used_facilities_mask & (1 << fac_idx)) != 0 {
+            continue;
+        }
+        let Some(cost) = cost_matrix[role_idx][fac_idx] else {
+            continue;
+        };
+        let next_cost = current_cost.saturating_add(cost);
+        if next_cost >= *best_cost {
+            continue;
+        }
+        current_assignment.push(fac_idx);
+        solve_min_cost_assignment(
+            role_idx + 1,
+            used_facilities_mask | (1 << fac_idx),
+            next_cost,
+            current_assignment,
+            best_cost,
+            best_assignment,
+            cost_matrix,
+            num_facilities,
+        );
+        current_assignment.pop();
+    }
+}
+
+/// 単一の部隊編成（マルチセット）に対し、各役割をどの生産施設に配置するのが
+/// 最適（ETAおよび移動距離の総和が最小）かを解き、SearchStateを構築する。
+fn optimize_multiset_facility_assignment(
+    input: &RollingPlanInput,
+    multiset: &[ProductionRole],
+    facilities: &[(GridPosition, Vec<usize>)],
+    facility_role_options: &HashMap<(GridPosition, ProductionRole), usize>,
+) -> Option<SearchState> {
+    let m = multiset.len();
+    let n = facilities.len();
+    if m > n {
+        return None;
+    }
+
+    let mut cost_matrix = Vec::with_capacity(m);
+    for role in multiset {
+        let mut row = Vec::with_capacity(n);
+        for (fac_pos, _) in facilities {
+            if let Some(&opt_idx) = facility_role_options.get(&(*fac_pos, *role)) {
+                let opt = &input.production_options[opt_idx];
+                let cost = calculate_assignment_cost(input, opt, opt_idx, *fac_pos);
+                row.push(Some(cost));
+            } else {
+                row.push(None);
+            }
+        }
+        if row.iter().all(|c| c.is_none()) {
+            return None;
+        }
+        cost_matrix.push(row);
+    }
+
+    let mut best_cost = u64::MAX;
+    let mut best_assignment = Vec::new();
+    let mut current_assignment = Vec::with_capacity(m);
+
+    solve_min_cost_assignment(
+        0,
+        0,
+        0,
+        &mut current_assignment,
+        &mut best_cost,
+        &mut best_assignment,
+        &cost_matrix,
+        n,
+    );
+
+    if best_cost == u64::MAX {
+        return None;
+    }
+
+    let mut state = SearchState::default();
+    for (role_i, &fac_idx) in best_assignment.iter().enumerate() {
+        let fac_pos = facilities[fac_idx].0;
+        let opt_idx = facility_role_options[&(fac_pos, multiset[role_i])];
+        let option = &input.production_options[opt_idx];
+        state.option_indices.push(opt_idx);
+        state.used_slots.insert(ProductionSlot {
+            facility: fac_pos,
+            build_turn: 0,
+        });
+        if let Some(target) = option.capture_target {
+            state.used_capture_targets.insert(target);
+        }
+        state.cost = state.cost.saturating_add(option.purchase.cost);
+    }
+    Some(state)
+}
+
 /// 期限付き物件レースでは、今手番の全施設について合法な生産組合せを全列挙する。
 ///
 /// 毎手番盤面を再観測するRolling Planなので、未観測の将来生産を固定幅beamへ混ぜず、
@@ -1218,47 +1477,73 @@ fn plan_current_property_control_exact(
         );
     }
 
-    let mut states = vec![SearchState::default()];
-    let mut frontier_truncated = false;
+    let mut facility_role_options: HashMap<(GridPosition, ProductionRole), usize> = HashMap::new();
+    let mut distinct_roles_set: HashSet<ProductionRole> = HashSet::new();
+
     for (facility, option_indices) in &facilities {
-        let slot = ProductionSlot {
-            facility: *facility,
-            build_turn: 0,
-        };
-        let mut next = Vec::new();
-        for state in states {
-            // 施設を使わない案も、他施設の高価なcounterへ資金を残す合法手として比較する。
-            next.push(state.clone());
-            for option_index in option_indices {
-                let option = &input.production_options[*option_index];
-                if option
-                    .capture_target
-                    .is_some_and(|target| state.used_capture_targets.contains(&target))
-                {
-                    continue;
-                }
-                let next_cost = state.cost.saturating_add(option.purchase.cost);
-                if next_cost > input.current_funds {
-                    continue;
-                }
-                let mut child = state.clone();
-                child.option_indices.push(*option_index);
-                child.used_slots.insert(slot);
-                if let Some(target) = option.capture_target {
-                    child.used_capture_targets.insert(target);
-                }
-                child.cost = next_cost;
-                next.push(child);
+        for option_index in option_indices {
+            let option = &input.production_options[*option_index];
+            if option.stats.can_capture && option.capture_target.is_none() {
+                // 物件レースにおいて占領可能ユニット（歩兵・工兵等）は必ず占領対象物件と紐付けて評価する。
+                // 目標なき歩兵の乱造は、戦闘部隊（装甲車・戦車等）の配備枠を奪うため除外する。
+                continue;
             }
+            let role = if let Some(target) = option.capture_target {
+                ProductionRole::Capture {
+                    target,
+                    unit_type: option.purchase.unit_type,
+                    cost: option.purchase.cost,
+                }
+            } else {
+                ProductionRole::Combat {
+                    unit_type: option.purchase.unit_type,
+                    cost: option.purchase.cost,
+                }
+            };
+            facility_role_options.insert((*facility, role), *option_index);
+            distinct_roles_set.insert(role);
         }
-        // ここまでは全列挙を維持する。工場が多い盤面だけは、次の施設を掛ける前に
-        // 占領契約・実射程・相性から作る決定的な前線へ圧縮する。生産額の総和や
-        // 兵種名の固定点では落とさないため、敵編成が変われば残る候補も変わる。
-        if next.len() > state_limit {
-            retain_property_control_frontier(input, &mut next, state_limit);
-            frontier_truncated = true;
+    }
+
+    let mut distinct_roles: Vec<ProductionRole> = distinct_roles_set.into_iter().collect();
+    distinct_roles.sort_by_key(|role| {
+        (
+            role.capture_target().is_none(),
+            role.cost(),
+            role.unit_type().as_str(),
+            role.capture_target().map(|target| (target.y, target.x)),
+        )
+    });
+
+    let mut all_multisets = Vec::new();
+    let mut current_multiset = Vec::new();
+    let mut used_targets = HashSet::new();
+    generate_role_multisets(
+        &distinct_roles,
+        0,
+        input.current_funds,
+        facilities.len(),
+        &mut used_targets,
+        &mut current_multiset,
+        &mut all_multisets,
+    );
+
+    let mut states = vec![SearchState::default()];
+    for multiset in all_multisets {
+        if let Some(state) = optimize_multiset_facility_assignment(
+            input,
+            &multiset,
+            &facilities,
+            &facility_role_options,
+        ) {
+            states.push(state);
         }
-        states = next;
+    }
+
+    let mut frontier_truncated = false;
+    if states.len() > state_limit {
+        retain_property_control_frontier(input, &mut states, state_limit);
+        frontier_truncated = true;
     }
 
     // 通常の物件マップでは、少なくとも二つの異なる物件へ向かう占領役を作戦の
@@ -1626,15 +1911,11 @@ fn property_control_tactical_profile(
     )
 }
 
-/// 多数工場の直積だけを小さく抑え、少数工場の物件レースは完全列挙を維持する。
+/// 多数工場のマルチセット組合せが極端に膨張した場合だけ、候補前線へ縮約する安全弁。
 ///
-/// 工場数は毎ターンの実際の空き生産地点から決まるため、特定mapや兵種には依存しない。
-fn property_control_state_limit(facility_count: usize) -> usize {
-    if facility_count <= 5 {
-        usize::MAX
-    } else {
-        MANY_FACTORY_PROPERTY_STATE_LIMIT
-    }
+/// 施設の順列爆発を排除したため通常の盤面では上限に達しない。特定mapや施設数への依存を排除。
+fn property_control_state_limit(_facility_count: usize) -> usize {
+    MANY_FACTORY_PROPERTY_STATE_LIMIT
 }
 
 /// 現在手番の中間生産列を、物件契約と敵編成に対する到達性だけで順序付ける。
@@ -4955,7 +5236,10 @@ mod tests {
 
     #[test]
     fn property_control_bounds_many_factory_combinations_before_simulation() {
-        assert_eq!(property_control_state_limit(5), usize::MAX);
+        assert_eq!(
+            property_control_state_limit(5),
+            MANY_FACTORY_PROPERTY_STATE_LIMIT
+        );
         assert_eq!(
             property_control_state_limit(6),
             MANY_FACTORY_PROPERTY_STATE_LIMIT
