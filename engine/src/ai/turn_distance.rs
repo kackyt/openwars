@@ -175,8 +175,9 @@ pub struct ActionTurnDistance {
     pub firing_position: GridPosition,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ActionRangeCacheKey {
+    occupancy: Arc<[(usize, usize, PlayerId)]>,
     start: (usize, usize),
     target: (usize, usize),
     movement_type: MovementType,
@@ -189,8 +190,9 @@ struct ActionRangeCacheKey {
     must_leave_start: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ActionSourceCacheKey {
+    occupancy: Arc<[(usize, usize, PlayerId)]>,
     start: (usize, usize),
     movement_type: MovementType,
     max_mp: u32,
@@ -539,7 +541,16 @@ fn calculate_action_distance_to_range_with_origin_policy(
     must_leave_start: bool,
     cache: &mut ActionTurnDistanceCache,
 ) -> Option<ActionTurnDistance> {
+    // 配置を正規化し、空盤面・敵の封鎖・味方の停止位置を別の探索として保持する。
+    // この探索が参照する占有情報は座標と所有者のみ。
+    let mut occupancy: Vec<_> = unit_positions
+        .iter()
+        .map(|(&(x, y), occupant)| (x, y, occupant.player_id))
+        .collect();
+    occupancy.sort_unstable_by_key(|&(x, y, player)| (x, y, player.0));
+    let occupancy: Arc<[_]> = occupancy.into();
     let cache_key = ActionRangeCacheKey {
+        occupancy: Arc::clone(&occupancy),
         start,
         target,
         movement_type,
@@ -614,6 +625,7 @@ fn calculate_action_distance_to_range_with_origin_policy(
     }
 
     let source_key = ActionSourceCacheKey {
+        occupancy,
         start,
         movement_type,
         max_mp,
@@ -1431,6 +1443,51 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn action_distance_cache_distinguishes_occupancy() {
+        let map = Map::new(
+            5,
+            1,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        let registry = MasterDataRegistry::load().unwrap_or_default();
+        let empty = HashMap::new();
+        let blocked = HashMap::from([(
+            (2, 0),
+            OccupantInfo {
+                player_id: PlayerId(2),
+                unit_type: crate::resources::UnitType::Infantry,
+                is_transport: false,
+                free_slots: 0,
+                loadable_types: Vec::new(),
+            },
+        )]);
+        // 同一目標のキャッシュと、異なる目標へ共有する始点キャッシュの両方を検証する。
+        for targets in [[4, 4], [3, 4]] {
+            for blocked_first in [false, true] {
+                let mut cache = ActionTurnDistanceCache::default();
+                for (index, is_blocked) in [blocked_first, !blocked_first].into_iter().enumerate() {
+                    let result = calculate_action_distance_to_range(
+                        &map,
+                        &registry,
+                        if is_blocked { &blocked } else { &empty },
+                        (0, 0),
+                        (targets[index], 0),
+                        MovementType::Infantry,
+                        3,
+                        99,
+                        1,
+                        1,
+                        PlayerId(1),
+                        &mut cache,
+                    );
+                    assert_eq!(result.is_none(), is_blocked);
+                }
+            }
+        }
     }
 
     #[test]

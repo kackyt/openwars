@@ -14628,6 +14628,9 @@ mod tests {
             )
             .unwrap();
 
+        // 戦闘乱数を固定し、実行時刻で中盤の防衛結果が変わらないようにする。
+        world.insert_resource(crate::resources::GameRng::new(42));
+
         let p1 = PlayerId(1);
         let p2 = PlayerId(2);
         let mut settings = crate::ai::PlayerAiSettings::new();
