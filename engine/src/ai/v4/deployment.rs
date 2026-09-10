@@ -1090,44 +1090,22 @@ fn resolve_target(
         return Some((enemy, *position));
     }
 
-    // 3. 現標的が消滅・到達不能、または未割り当て（初期配備時）なら、
-    //    防衛対象（anchor）に近く、自機からも近い敵を優先して標的に選ぶ。
-    //    ただし歩兵に対しては、既に他の味方が担当していれば過剰な重複割り当てを避ける。
-    let mut candidate_enemies = deployment
-        .intent
-        .priority_enemies
-        .iter()
-        .copied()
-        .filter(|&enemy| {
-            let is_assigned_infantry = world.get::<UnitStats>(enemy).is_some_and(|s| s.can_capture)
-                && target_commitments.get(&enemy).copied().unwrap_or(0) >= 1;
-            if is_assigned_infantry {
-                return false;
-            }
-            target_within_operation(world, deployment, enemy)
-                && can_engage(world, connectivity, deployment.entity, enemy)
-                && world.get::<GridPosition>(enemy).is_some()
-        })
-        .collect::<Vec<_>>();
-
-    if !candidate_enemies.is_empty() {
-        if let (Some(map), Some(my_pos)) =
-            (&map, world.get::<GridPosition>(deployment.entity).copied())
+    // 3. 現標的が無効なら、購入時に比較した初撃相手の順序で選ぶ。
+    //    anchorからの距離による再選定は、実経路・期限の評価を別の前線へ置き換える。
+    //    到達不能な相手と、既に担当済みの占領兵は次の候補へ進む。
+    for enemy in deployment.intent.priority_enemies.iter().copied() {
+        let already_covered = world
+            .get::<UnitStats>(enemy)
+            .is_some_and(|stats| stats.can_capture)
+            && target_commitments.get(&enemy).copied().unwrap_or(0) >= 1;
+        if already_covered
+            || !target_within_operation(world, deployment, enemy)
+            || !can_engage(world, connectivity, deployment.entity, enemy)
         {
-            candidate_enemies.sort_unstable_by_key(|&enemy| {
-                let e_pos = *world.get::<GridPosition>(enemy).unwrap();
-                let d_anchor = map.distance(anchor.x, anchor.y, e_pos.x, e_pos.y);
-                let d_unit = map.distance(my_pos.x, my_pos.y, e_pos.x, e_pos.y);
-                (d_anchor, d_unit, enemy.to_bits())
-            });
-            let best_enemy = candidate_enemies[0];
-            let pos = *world.get::<GridPosition>(best_enemy).unwrap();
-            return Some((best_enemy, pos));
+            continue;
         }
-        for &enemy in &candidate_enemies {
-            if let Some(position) = world.get::<GridPosition>(enemy) {
-                return Some((enemy, *position));
-            }
+        if let Some(position) = world.get::<GridPosition>(enemy) {
+            return Some((enemy, *position));
         }
     }
 
@@ -1637,6 +1615,27 @@ mod tests {
             .find(|squad| squad.id == squad_id)
             .unwrap();
         assert_eq!(squad.target, Some(GridPosition { x: 6, y: 0 }));
+    }
+
+    #[test]
+    fn first_assignment_keeps_the_production_planners_target_order() {
+        let (mut world, attacker, planned, _, anchor_nearest) = deployment_world();
+        world
+            .resource_mut::<V4DeploymentRegistry>()
+            .assigned
+            .get_mut(&attacker)
+            .unwrap()
+            .intent
+            .priority_enemies = vec![planned, anchor_nearest];
+        let mut manager = SquadManager::default();
+        prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::new());
+        assert_eq!(
+            world
+                .resource::<V4DeploymentRegistry>()
+                .attack_target(attacker),
+            Some(planned),
+            "購入時に初撃を割り当てた敵を、作戦中心からの距離で選び直さない"
+        );
     }
 
     #[test]

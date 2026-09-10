@@ -1,0 +1,480 @@
+{
+  "turn": 4,
+  "player": 2,
+  "event": "TurnSnapshot",
+  "players_funds": [
+    [
+      1,
+      5555
+    ],
+    [
+      2,
+      11886
+    ]
+  ],
+  "properties": [
+    {
+      "owner": 1,
+      "x": 2,
+      "y": 2
+    },
+    {
+      "owner": 1,
+      "x": 3,
+      "y": 2
+    },
+    {
+      "owner": 1,
+      "x": 1,
+      "y": 3
+    },
+    {
+      "owner": 1,
+      "x": 2,
+      "y": 3
+    },
+    {
+      "owner": 1,
+      "x": 3,
+      "y": 3
+    },
+    {
+      "owner": 1,
+      "x": 5,
+      "y": 3
+    },
+    {
+      "owner": 1,
+      "x": 6,
+      "y": 3
+    },
+    {
+      "owner": null,
+      "x": 7,
+      "y": 3
+    },
+    {
+      "owner": 1,
+      "x": 2,
+      "y": 4
+    },
+    {
+      "owner": 1,
+      "x": 3,
+      "y": 4
+    },
+    {
+      "owner": 1,
+      "x": 6,
+      "y": 4
+    },
+    {
+      "owner": null,
+      "x": 7,
+      "y": 4
+    },
+    {
+      "owner": null,
+      "x": 3,
+      "y": 8
+    },
+    {
+      "owner": 2,
+      "x": 4,
+      "y": 8
+    },
+    {
+      "owner": 2,
+      "x": 7,
+      "y": 8
+    },
+    {
+      "owner": 2,
+      "x": 8,
+      "y": 8
+    },
+    {
+      "owner": null,
+      "x": 2,
+      "y": 9
+    },
+    {
+      "owner": 2,
+      "x": 3,
+      "y": 9
+    },
+    {
+      "owner": 2,
+      "x": 4,
+      "y": 9
+    },
+    {
+      "owner": 2,
+      "x": 6,
+      "y": 9
+    },
+    {
+      "owner": 2,
+      "x": 7,
+      "y": 9
+    },
+    {
+      "owner": 2,
+      "x": 8,
+      "y": 9
+    },
+    {
+      "owner": 2,
+      "x": 7,
+      "y": 10
+    },
+    {
+      "owner": 2,
+      "x": 8,
+      "y": 10
+    }
+  ],
+  "units": [
+    {
+      "ammo1": 8,
+      "ammo2": 0,
+      "entity_index": 24,
+      "fuel": 97,
+      "hp": 38,
+      "player": 1,
+      "unit_type": "Infantry",
+      "x": 6,
+      "y": 5
+    },
+    {
+      "ammo1": 9,
+      "ammo2": 0,
+      "entity_index": 25,
+      "fuel": 97,
+      "hp": 100,
+      "player": 1,
+      "unit_type": "Infantry",
+      "x": 6,
+      "y": 6
+    },
+    {
+      "ammo1": 8,
+      "ammo2": 0,
+      "entity_index": 26,
+      "fuel": 96,
+      "hp": 38,
+      "player": 1,
+      "unit_type": "Infantry",
+      "x": 8,
+      "y": 3
+    },
+    {
+      "ammo1": 9,
+      "ammo2": 0,
+      "entity_index": 45,
+      "fuel": 97,
+      "hp": 100,
+      "player": 2,
+      "unit_type": "Infantry",
+      "x": 8,
+      "y": 7
+    },
+    {
+      "ammo1": 8,
+      "ammo2": 0,
+      "entity_index": 28,
+      "fuel": 94,
+      "hp": 22,
+      "player": 1,
+      "unit_type": "Infantry",
+      "x": 7,
+      "y": 4
+    },
+    {
+      "ammo1": 7,
+      "ammo2": 0,
+      "entity_index": 29,
+      "fuel": 94,
+      "hp": 17,
+      "player": 1,
+      "unit_type": "Infantry",
+      "x": 2,
+      "y": 8
+    },
+    {
+      "ammo1": 8,
+      "ammo2": 0,
+      "entity_index": 30,
+      "fuel": 93,
+      "hp": 25,
+      "player": 1,
+      "unit_type": "Infantry",
+      "x": 7,
+      "y": 3
+    },
+    {
+      "ammo1": 9,
+      "ammo2": 0,
+      "entity_index": 31,
+      "fuel": 99,
+      "hp": 77,
+      "player": 2,
+      "unit_type": "Infantry",
+      "x": 4,
+      "y": 8
+    },
+    {
+      "ammo1": 9,
+      "ammo2": 0,
+      "entity_index": 32,
+      "fuel": 99,
+      "hp": 100,
+      "player": 2,
+      "unit_type": "Infantry",
+      "x": 3,
+      "y": 9
+    },
+    {
+      "ammo1": 9,
+      "ammo2": 0,
+      "entity_index": 33,
+      "fuel": 94,
+      "hp": 100,
+      "player": 2,
+      "unit_type": "Infantry",
+      "x": 3,
+      "y": 8
+    },
+    {
+      "ammo1": 9,
+      "ammo2": 0,
+      "entity_index": 34,
+      "fuel": 99,
+      "hp": 100,
+      "player": 2,
+      "unit_type": "Infantry",
+      "x": 4,
+      "y": 9
+    },
+    {
+      "ammo1": 9,
+      "ammo2": 0,
+      "entity_index": 35,
+      "fuel": 93,
+      "hp": 100,
+      "player": 2,
+      "unit_type": "Infantry",
+      "x": 2,
+      "y": 9
+    },
+    {
+      "ammo1": 7,
+      "ammo2": 0,
+      "entity_index": 38,
+      "fuel": 96,
+      "hp": 39,
+      "player": 1,
+      "unit_type": "Infantry",
+      "x": 1,
+      "y": 7
+    },
+    {
+      "ammo1": 8,
+      "ammo2": 0,
+      "entity_index": 39,
+      "fuel": 94,
+      "hp": 100,
+      "player": 1,
+      "unit_type": "Infantry",
+      "x": 6,
+      "y": 7
+    },
+    {
+      "ammo1": 8,
+      "ammo2": 0,
+      "entity_index": 41,
+      "fuel": 94,
+      "hp": 50,
+      "player": 1,
+      "unit_type": "Infantry",
+      "x": 4,
+      "y": 7
+    },
+    {
+      "ammo1": 9,
+      "ammo2": 0,
+      "entity_index": 44,
+      "fuel": 96,
+      "hp": 100,
+      "player": 2,
+      "unit_type": "Infantry",
+      "x": 8,
+      "y": 6
+    },
+    {
+      "ammo1": 8,
+      "ammo2": 0,
+      "entity_index": 27,
+      "fuel": 96,
+      "hp": 67,
+      "player": 1,
+      "unit_type": "Infantry",
+      "x": 2,
+      "y": 6
+    },
+    {
+      "ammo1": 4,
+      "ammo2": 0,
+      "entity_index": 46,
+      "fuel": 50,
+      "hp": 100,
+      "player": 2,
+      "unit_type": "Rockets",
+      "x": 7,
+      "y": 8
+    },
+    {
+      "ammo1": 9,
+      "ammo2": 0,
+      "entity_index": 36,
+      "fuel": 99,
+      "hp": 100,
+      "player": 1,
+      "unit_type": "Infantry",
+      "x": 2,
+      "y": 3
+    },
+    {
+      "ammo1": 9,
+      "ammo2": 0,
+      "entity_index": 48,
+      "fuel": 99,
+      "hp": 100,
+      "player": 1,
+      "unit_type": "Infantry",
+      "x": 5,
+      "y": 3
+    },
+    {
+      "ammo1": 9,
+      "ammo2": 0,
+      "entity_index": 49,
+      "fuel": 99,
+      "hp": 100,
+      "player": 1,
+      "unit_type": "Infantry",
+      "x": 3,
+      "y": 4
+    },
+    {
+      "ammo1": 9,
+      "ammo2": 0,
+      "entity_index": 50,
+      "fuel": 99,
+      "hp": 100,
+      "player": 1,
+      "unit_type": "Infantry",
+      "x": 3,
+      "y": 3
+    },
+    {
+      "ammo1": 9,
+      "ammo2": 0,
+      "entity_index": 51,
+      "fuel": 99,
+      "hp": 100,
+      "player": 1,
+      "unit_type": "Infantry",
+      "x": 2,
+      "y": 4
+    },
+    {
+      "ammo1": 4,
+      "ammo2": 9,
+      "entity_index": 52,
+      "fuel": 32,
+      "hp": 100,
+      "player": 1,
+      "unit_type": "Tank",
+      "x": 3,
+      "y": 2
+    },
+    {
+      "ammo1": 9,
+      "ammo2": 0,
+      "entity_index": 53,
+      "fuel": 99,
+      "hp": 100,
+      "player": 1,
+      "unit_type": "Infantry",
+      "x": 1,
+      "y": 3
+    },
+    {
+      "ammo1": 4,
+      "ammo2": 9,
+      "entity_index": 54,
+      "fuel": 32,
+      "hp": 100,
+      "player": 1,
+      "unit_type": "Tank",
+      "x": 2,
+      "y": 2
+    },
+    {
+      "ammo1": 9,
+      "ammo2": 0,
+      "entity_index": 47,
+      "fuel": 70,
+      "hp": 100,
+      "player": 2,
+      "unit_type": "Recon",
+      "x": 8,
+      "y": 8
+    },
+    {
+      "ammo1": 9,
+      "ammo2": 0,
+      "entity_index": 37,
+      "fuel": 65,
+      "hp": 100,
+      "player": 1,
+      "unit_type": "Recon",
+      "x": 6,
+      "y": 4
+    },
+    {
+      "ammo1": 9,
+      "ammo2": 0,
+      "entity_index": 40,
+      "fuel": 64,
+      "hp": 100,
+      "player": 1,
+      "unit_type": "Recon",
+      "x": 6,
+      "y": 3
+    },
+    {
+      "ammo1": 7,
+      "ammo2": 0,
+      "entity_index": 42,
+      "fuel": 66,
+      "hp": 60,
+      "player": 2,
+      "unit_type": "Recon",
+      "x": 8,
+      "y": 4
+    },
+    {
+      "ammo1": 7,
+      "ammo2": 0,
+      "entity_index": 43,
+      "fuel": 67,
+      "hp": 55,
+      "player": 2,
+      "unit_type": "Recon",
+      "x": 7,
+      "y": 5
+    }
+  ]
+}

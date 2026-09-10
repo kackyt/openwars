@@ -1881,7 +1881,8 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     // 到達できるCapture命令だけを先に実行する。敵・味方・地形から毎手番判定するため、
     // 特定mapや固定の生産列には依存しない。
     let normal_action = if is_v4 {
-        decide_squad_action_v4(world, active_player, &decide_skip_entities)
+        crate::ai::v4::home_defense::decide_action(world, active_player, &decide_skip_entities)
+            .or_else(|| decide_squad_action_v4(world, active_player, &decide_skip_entities))
     } else {
         decide_ai_action_v2(world, active_player, &decide_skip_entities)
     };
@@ -2863,8 +2864,6 @@ fn decide_ai_action_v2_for_entities(
                     )
                     .can_wait
         });
-        let indirect_must_vacate_production_site =
-            stats.min_range > 1 && starts_on_owned_production_site && can_end_turn_off_production;
 
         // 回復中のDAG Entityへ古いSquad目標を渡すと、修理ではなく横の拠点へ戻る。
         // 所属はDAG Registryに残したまま、ここだけ通常の回復探索を使う。
@@ -3450,7 +3449,9 @@ fn decide_ai_action_v2_for_entities(
             }
 
             // (B) Attack
-            if !indirect_must_vacate_production_site && !actions.attackable_targets.is_empty() {
+            // 工場上の砲撃も合法な戦闘候補。工場を空けられるという理由だけで
+            // 候補から消すと、射撃による損害と退去の効果を比較できなくなる。
+            if !actions.attackable_targets.is_empty() {
                 for target_entity in actions.attackable_targets.iter().copied() {
                     if campaign_context.as_ref().is_some_and(|context| {
                         let target_position = world.get::<GridPosition>(target_entity).copied();
@@ -4684,7 +4685,7 @@ mod tests {
     }
 
     #[test]
-    fn indirect_unit_vacates_factory_instead_of_firing_from_it() {
+    fn indirect_unit_fires_from_factory_when_other_production_slots_are_open() {
         let player = PlayerId(1);
         let enemy = PlayerId(2);
         let mut world = setup_v3_test_world(5, crate::ai::ai_version::AiVersion::V4);
@@ -4749,23 +4750,124 @@ mod tests {
                 UnitType::Infantry.as_str().to_owned(),
             ))
             .unwrap();
-        world.spawn((
-            Faction(enemy),
-            GridPosition { x: 4, y: 0 },
-            infantry,
-            Health {
-                current: 100,
-                max: 100,
-            },
-        ));
+        let target = world
+            .spawn((
+                Faction(enemy),
+                GridPosition { x: 4, y: 0 },
+                infantry,
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
 
         let (entity, command) =
             decide_ai_action_v2(&mut world, player, &HashSet::new()).expect("行動を選ぶこと");
         assert_eq!(entity, unit);
-        let AiCommand::Wait { target_pos } = command else {
-            panic!("間接unitは生産地点から攻撃せず、退避すること");
-        };
-        assert_ne!(target_pos, GridPosition { x: 1, y: 0 });
+        assert!(
+            matches!(command, AiCommand::Attack { target_entity, target_pos }
+            if target_entity == target && target_pos == GridPosition { x: 1, y: 0 }),
+            "別の生産口が空いているとき、合法な間接射撃を工場退去で潰さない: {command:?}"
+        );
+    }
+
+    #[test]
+    fn reference_map32_turn4_rocket_keeps_its_factory_firing_position() {
+        // 人間対局のP2第4手番開始時点。Entity番号は再生成し、座標・HP・弾薬を復元する。
+        let snapshot: serde_json::Value =
+            serde_json::from_str(include_str!("test_data/map32_human_turn4.json")).unwrap();
+        let data = MasterDataRegistry::load().unwrap();
+        let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &data,
+            "map_32",
+            GridTopology::Hex,
+        )
+        .unwrap();
+        let mut settings = crate::ai::PlayerAiSettings::new();
+        settings.set_version(PlayerId(2), crate::ai::AiVersion::V4);
+        world.insert_resource(settings);
+        world
+            .resource_mut::<crate::resources::MatchState>()
+            .current_turn_number
+            .0 = 4;
+        for funds in snapshot["players_funds"].as_array().unwrap() {
+            let id = PlayerId(funds[0].as_u64().unwrap() as u32);
+            world
+                .resource_mut::<crate::resources::Players>()
+                .0
+                .iter_mut()
+                .find(|player| player.id == id)
+                .unwrap()
+                .funds = funds[1].as_u64().unwrap() as u32;
+        }
+        for property in snapshot["properties"].as_array().unwrap() {
+            let at = GridPosition {
+                x: property["x"].as_u64().unwrap() as usize,
+                y: property["y"].as_u64().unwrap() as usize,
+            };
+            let owner = property["owner"]
+                .as_u64()
+                .map(|owner| PlayerId(owner as u32));
+            let entity = world
+                .iter_entities()
+                .find(|entity| {
+                    entity.get::<GridPosition>() == Some(&at) && entity.contains::<Property>()
+                })
+                .unwrap()
+                .id();
+            world.get_mut::<Property>(entity).unwrap().owner_id = owner;
+        }
+        let mut rocket = None;
+        for source in snapshot["units"].as_array().unwrap() {
+            let kind: UnitType = serde_json::from_value(source["unit_type"].clone()).unwrap();
+            let stats = data
+                .create_unit_stats(&UnitName(kind.as_str().to_owned()))
+                .unwrap();
+            let at = GridPosition {
+                x: source["x"].as_u64().unwrap() as usize,
+                y: source["y"].as_u64().unwrap() as usize,
+            };
+            let entity = world
+                .spawn((
+                    at,
+                    Faction(PlayerId(source["player"].as_u64().unwrap() as u32)),
+                    Health {
+                        current: source["hp"].as_u64().unwrap() as u32,
+                        max: 100,
+                    },
+                    crate::components::Fuel {
+                        current: source["fuel"].as_u64().unwrap() as u32,
+                        max: stats.max_fuel,
+                    },
+                    crate::components::Ammo {
+                        ammo1: source["ammo1"].as_u64().unwrap() as u32,
+                        ammo2: source["ammo2"].as_u64().unwrap() as u32,
+                        max_ammo1: stats.max_ammo1,
+                        max_ammo2: stats.max_ammo2,
+                    },
+                    HasMoved(false),
+                    ActionCompleted(false),
+                    stats,
+                ))
+                .id();
+            if source["entity_index"] == 46 {
+                rocket = Some(entity);
+            }
+        }
+        let rocket = rocket.unwrap();
+        let (_, command) = decide_ai_action_v2_for_entities(
+            &mut world,
+            PlayerId(2),
+            &HashSet::new(),
+            Some(&HashSet::from([rocket])),
+        )
+        .unwrap();
+        assert!(
+            matches!(command, AiCommand::Attack { target_pos, .. }
+            if target_pos == GridPosition { x: 7, y: 8 }),
+            "工場上の射撃を残して侵入部隊を削る: {command:?}"
+        );
     }
 
     #[test]

@@ -15,6 +15,7 @@
 pub mod campaign_execution;
 mod combat_profile;
 pub mod deployment;
+pub(crate) mod home_defense;
 pub mod logistics_plan;
 pub mod operation;
 mod operation_selection;
@@ -3152,9 +3153,20 @@ pub(crate) fn refresh_capital_route_path_commitments(
         members: BTreeSet<Entity>,
     }
 
+    // 発注から実Entityへ引き継いだ任務はDeploymentが正本である。汎用DAGが
+    // 同じ部隊へ二つ目の移動目標を与えると、購入時に検証した初撃ETAが成立しない。
+    let explicit_deployments = world
+        .get_resource::<deployment::V4DeploymentRegistry>()
+        .map(|registry| registry.active_entities(player_id))
+        .unwrap_or_default();
     let mut squads_by_island = HashMap::<crate::ai::islands::IslandId, Vec<RouteSquad>>::new();
     for squad in manager.squads.iter().filter(|squad| {
-        squad.owner_id == Some(player_id) && squad.mission_type != MissionType::Transport
+        squad.owner_id == Some(player_id)
+            && squad.mission_type != MissionType::Transport
+            && !squad
+                .members
+                .iter()
+                .any(|entity| explicit_deployments.contains(entity))
     }) {
         let mut island_id = None;
         let mut ground_member_count = 0_usize;
@@ -5673,6 +5685,11 @@ impl BoardScan {
             }
         }
 
+        // ECSのテーブル順は部品の追加や登録順で変わる。戦闘予測の攻撃順へ
+        // 格納順を持ち込まず、実EntityのID順を計画入力の正規順序とする。
+        my_units.sort_unstable_by_key(|unit| unit.entity.map(Entity::to_bits));
+        enemy_units.sort_unstable_by_key(|unit| unit.entity.map(Entity::to_bits));
+
         // --- 拠点の走査 ---
         let mut capital_pos = None;
         let mut open_properties = Vec::new();
@@ -5769,11 +5786,13 @@ impl BoardScan {
             return None;
         }
 
-        let available_types: Vec<(UnitType, UnitStats)> = unit_registry
+        let mut available_types: Vec<(UnitType, UnitStats)> = unit_registry
             .0
             .iter()
             .map(|(unit_type, stats)| (*unit_type, stats.clone()))
             .collect();
+        // HashMapの走査順で同値候補の採否が変わらないよう、兵種IDも固定する。
+        available_types.sort_unstable_by_key(|(unit_type, _)| unit_type.as_str());
 
         let island_map = crate::ai::islands::IslandMap::analyze(&map);
         let enemy_capital_island = enemy_capital
@@ -11620,6 +11639,89 @@ mod tests {
     }
 
     #[test]
+    fn explicit_combat_deployment_is_not_reassigned_to_a_capture_milestone() {
+        let data = MasterDataRegistry::load().unwrap();
+        let player = PlayerId(1);
+        let mut map = flat_map(12, 1);
+        map.set_terrain(0, 0, Terrain::Capital).unwrap();
+        map.set_terrain(11, 0, Terrain::Capital).unwrap();
+        map.set_terrain(3, 0, Terrain::City).unwrap();
+        let islands = crate::ai::islands::IslandMap::analyze(&map);
+        let island_id = islands.get_island_at(&pos(0, 0)).unwrap().id;
+        let mut world = World::new();
+        world.insert_resource(map);
+        world.insert_resource(islands);
+        world.insert_resource(data);
+        world.spawn((
+            pos(0, 0),
+            Property::new(Terrain::Capital, Some(player), 100),
+        ));
+        world.spawn((
+            pos(11, 0),
+            Property::new(Terrain::Capital, Some(PlayerId(2)), 100),
+        ));
+        world.spawn((pos(3, 0), Property::new(Terrain::City, None, 100)));
+        let attacker = world
+            .spawn((
+                pos(0, 0),
+                Faction(player),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                UnitStats {
+                    movement_type: MovementType::Tank,
+                    max_movement: 6,
+                    cost: 5000,
+                    ..UnitStats::mock()
+                },
+            ))
+            .id();
+        let enemy = world
+            .spawn((
+                pos(9, 0),
+                Faction(PlayerId(2)),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                UnitStats {
+                    movement_type: MovementType::Infantry,
+                    can_capture: true,
+                    ..UnitStats::mock()
+                },
+            ))
+            .id();
+        let mut deployment = deployment::V4DeploymentRegistry::default();
+        deployment.assign_target_for_test(player, attacker, enemy);
+        world.insert_resource(deployment);
+        let mut manager = crate::ai::squad::SquadManager::new();
+        let squad = manager.create_owned_squad(MissionType::Attack, player);
+        squad.members.insert(attacker);
+        squad.target = Some(pos(9, 0));
+        squad.target_island = Some(island_id);
+        let squad_id = squad.id;
+        prepare_capital_route_topologies(&mut world, player);
+        refresh_capital_route_path_commitments(&mut world, player, &mut manager);
+        assert!(
+            !world
+                .resource::<CapitalRoutePathRegistry>()
+                .commitments
+                .contains_key(&squad_id),
+            "実在敵を指定した購入任務を、手前の未占領都市への別命令で上書きしない"
+        );
+        world.remove_resource::<deployment::V4DeploymentRegistry>();
+        refresh_capital_route_path_commitments(&mut world, player, &mut manager);
+        assert!(
+            world
+                .resource::<CapitalRoutePathRegistry>()
+                .commitments
+                .contains_key(&squad_id),
+            "専用任務がなくなった汎用戦闘部隊はDAGへ参加できる"
+        );
+    }
+
+    #[test]
     fn route_milestone_requires_the_nearest_unsecured_property_before_advancing() {
         use crate::ai::island_campaign::{
             IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignPortfolio,
@@ -14615,6 +14717,56 @@ mod tests {
                 .resource::<AiTurnStrategyCache>()
                 .campaign_production_blocks_generic(player_id)
         );
+    }
+
+    #[test]
+    fn board_scan_is_independent_of_ecs_storage_order() {
+        let registry = MasterDataRegistry::load().unwrap();
+        let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &registry,
+            "map_32",
+            GridTopology::Hex,
+        )
+        .unwrap();
+        let player = PlayerId(2);
+        let mut entities = Vec::new();
+        for (x, owner) in [
+            (3, player),
+            (4, player),
+            (5, player.opposite()),
+            (6, player.opposite()),
+        ] {
+            entities.push(
+                world
+                    .spawn((
+                        pos(x, 7),
+                        Faction(owner),
+                        UnitStats::mock(),
+                        Health {
+                            current: 100,
+                            max: 100,
+                        },
+                    ))
+                    .id(),
+            );
+        }
+        let before = BoardScan::collect(&mut world, player).unwrap();
+        // ゲーム上の状態を変えずにECS内の格納先だけを変える。
+        // 走査順が計画入力へ漏れると、同じseedでも攻撃順・購入編成が変わる。
+        world.entity_mut(entities[0]).insert(CargoCapacity {
+            max: 0,
+            loaded: Vec::new(),
+        });
+        world.entity_mut(entities[2]).insert(CargoCapacity {
+            max: 0,
+            loaded: Vec::new(),
+        });
+        let after = BoardScan::collect(&mut world, player).unwrap();
+        let ids = |units: &[UnitSnapshot]| units.iter().map(|unit| unit.entity).collect::<Vec<_>>();
+        assert_eq!(before.my_units.len(), 2);
+        assert_eq!(before.enemy_units.len(), 2);
+        assert_eq!(ids(&before.my_units), ids(&after.my_units));
+        assert_eq!(ids(&before.enemy_units), ids(&after.enemy_units));
     }
 
     #[test]
