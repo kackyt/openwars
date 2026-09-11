@@ -47,24 +47,20 @@ except ImportError:
 
 p = None  # MCP Server process
 
-def init_mcp_server():
+def init_mcp_server(custom_bin=None):
     global p
     env = os.environ.copy()
     env['RUST_LOG'] = 'info'
-    if os.name == 'nt':
-        os.system('taskkill /F /IM mcp-server.exe >nul 2>&1')
+    if custom_bin:
+        exe_path = os.path.abspath(custom_bin)
     else:
-        os.system('pkill -f mcp-server >/dev/null 2>&1')
-    # スクリプト位置基準でリポジトリルートの実行ファイルを絶対パス解決する
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    exe_name = 'mcp-server.exe' if os.name == 'nt' else 'mcp-server'
-    exe_path = os.path.join(repo_root, 'target', 'release', exe_name)
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        exe_name = 'mcp-server.exe' if os.name == 'nt' else 'mcp-server'
+        exe_path = os.path.join(repo_root, 'target', 'release', exe_name)
     p = subprocess.Popen(
         [exe_path],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        # 通常評価では画面を崩さない。停止診断時だけ親へ流し、サーバー側で
-        # 最後に開始したAI stepを観測できるようにする。
         stderr=(
             None
             if os.environ.get("OPENWARS_TRACE_AI_STEPS")
@@ -1108,6 +1104,7 @@ def main():
         help="Grid topology for maps (square or hex, default: hex)",
     )
     parser.add_argument("--stall-turns", type=int, default=5, help="Subject turns before an unchanged transport is considered stalled")
+    parser.add_argument("--mcp-server-bin", default=None, help="Custom path to mcp-server binary for parallel worktree isolation")
     parser.add_argument("--output", default="matchup_report.md", help="Output file for the final report")
     args = parser.parse_args()
 
@@ -1215,7 +1212,7 @@ def main():
             player_order=args.player_order,
         )
 
-    init_mcp_server()
+    init_mcp_server(custom_bin=args.mcp_server_bin)
     all_results = []
     logs = []
     
@@ -1415,8 +1412,15 @@ def main():
 
     finally:
         if p:
-            p.stdin.close()
-            p.wait()
+            try:
+                p.stdin.close()
+            except Exception:
+                pass
+            try:
+                p.terminate()
+                p.wait(timeout=3)
+            except Exception:
+                p.kill()
 
     if args.mode == "batch" and args.criteria == "issue58":
         if execution_incomplete:
