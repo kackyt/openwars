@@ -1179,61 +1179,351 @@ impl ProductionRole {
     }
 }
 
-/// 役割のマルチセット（重複組合せ）を資金上限およびスロット上限の範囲で全列挙する。
-/// 同一占領対象への二重割当は除外され、戦闘ユニットは重複が許容される。
-fn generate_role_multisets(
-    roles: &[ProductionRole],
-    role_start_idx: usize,
-    current_funds: u32,
-    max_slots: usize,
-    used_targets: &mut HashSet<GridPosition>,
-    current_multiset: &mut Vec<ProductionRole>,
-    all_multisets: &mut Vec<Vec<ProductionRole>>,
-) {
-    if !current_multiset.is_empty() {
-        all_multisets.push(current_multiset.clone());
+/// 多工場の物件レースにおいて各サイズ段階で保持するマルチセット候補のビーム幅。
+/// 通常マップ（施設数5以下）では各段階の候補数がこの上限に達しないため、全候補が保持される。
+/// 施設数が多い盤面での順列・組合せ爆発を防ぎつつ、最も有望な編成を保持する。
+const MULTISET_BEAM_WIDTH: usize = 384;
+
+/// 同一の戦闘ユニット役割を同一手番に重複生産する上限。
+/// 前線物件制御において同種戦闘ユニット（戦車・対空等）の極端な偏重を抑え、諸兵科連合を促す。
+const MAX_COMBAT_ROLE_COPIES: usize = 3;
+
+#[derive(Debug, Clone)]
+struct RoleMetadata {
+    cost: u32,
+    capture_target: Option<GridPosition>,
+    capacity: usize,
+    min_capture_completion: u32,
+    is_combat_non_infantry: bool,
+    max_movement: u32,
+    damage_by_enemy: Vec<u32>,
+}
+
+#[derive(Clone)]
+struct MultisetCandidate {
+    role_indices: Vec<usize>,
+    /// 占領対象数は高々数個〜10個程度（MAX_CAPTURE_SLOTS=8）に収まるため、
+    /// HashSetのヒープ確保・ハッシュ計算オーバーヘッドを避け、連続メモリのVecによる線形探索（L1キャッシュ効率優先）を採用。
+    used_targets: Vec<GridPosition>,
+    current_role_count: usize,
+    remaining_funds: u32,
+    last_role_idx: usize,
+}
+
+/// 物件制御における候補（マルチセットおよびSearchState）の順序付けキー。
+/// 評価軸の一貫性を保ち、multiset探索段階と最終フロンティア段階での評価乖離を防ぐ。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PropertyFrontierKey {
+    /// 占領必要数に対する不足数（0が最良）
+    capture_shortfall: usize,
+    /// 小規模戦術ルールにおける占領完了予定ターン（昇順）
+    small_map_capture_completion: Vec<u32>,
+    /// 小規模戦術ルールにおける非歩兵戦闘ユニット数（降順）
+    combat_unit_count_desc: std::cmp::Reverse<usize>,
+    /// 全ユニットの合計移動力（降順）
+    total_movement_desc: std::cmp::Reverse<u32>,
+    /// 締切対象・関連敵の残HP合計（昇順）
+    remaining_relevant_hp: u32,
+    /// 全敵の残HP合計（昇順）
+    remaining_all_hp: u32,
+    /// 全占領予定の完了ターン（昇順、required_capturersでresize済み）
+    capture_completion_turns: Vec<u32>,
+    /// 占領必要数を超える余剰占領ユニットのペナルティ（昇順）
+    excess_capturers: usize,
+    /// 生産コスト合計（昇順）
+    cost: u32,
+    /// 同点時の決定論的タイブレーク用インデックス列
+    identity_indices: Vec<usize>,
+}
+
+/// 観測量から `PropertyFrontierKey` を共通ロジックで構築する。
+#[allow(clippy::too_many_arguments)]
+fn build_property_frontier_key(
+    input: &RollingPlanInput,
+    capture_count: usize,
+    mut capture_completion_turns: Vec<u32>,
+    combat_unit_count: usize,
+    total_movement: u32,
+    damage_by_enemy: &[u32],
+    total_cost: u32,
+    identity_indices: Vec<usize>,
+) -> PropertyFrontierKey {
+    let opening_capture_floor = if uses_small_map_opening_rules(input) {
+        2
+    } else {
+        0
+    };
+    let required_capturers = input.required_capture_survivors.max(opening_capture_floor);
+
+    let capture_shortfall = required_capturers.saturating_sub(capture_count);
+    capture_completion_turns.sort_unstable();
+    capture_completion_turns.truncate(required_capturers.max(1));
+    capture_completion_turns.resize(required_capturers.max(1), u32::MAX);
+
+    let small_map_capture_completion = if uses_small_map_tactical_rules(input) {
+        capture_completion_turns.clone()
+    } else {
+        Vec::new()
+    };
+
+    let (combat_unit_count_desc, total_movement_desc) = if uses_small_map_tactical_rules(input) {
+        (
+            std::cmp::Reverse(combat_unit_count),
+            std::cmp::Reverse(total_movement),
+        )
+    } else {
+        (std::cmp::Reverse(0), std::cmp::Reverse(0))
+    };
+
+    let remaining_by_enemy: Vec<u32> = input
+        .enemies
+        .iter()
+        .enumerate()
+        .map(|(index, enemy)| enemy.hp.saturating_sub(damage_by_enemy[index]))
+        .collect();
+
+    let relevant_enemy_indices: Vec<usize> = if input.interdiction_deadlines.is_empty() {
+        (0..input.enemies.len()).collect()
+    } else {
+        input
+            .interdiction_deadlines
+            .iter()
+            .map(|(index, _)| *index)
+            .collect()
+    };
+
+    let remaining_relevant_hp: u32 = relevant_enemy_indices
+        .into_iter()
+        .filter_map(|index| remaining_by_enemy.get(index))
+        .copied()
+        .sum();
+    let remaining_all_hp: u32 = remaining_by_enemy.into_iter().sum();
+
+    PropertyFrontierKey {
+        capture_shortfall,
+        small_map_capture_completion,
+        combat_unit_count_desc,
+        total_movement_desc,
+        remaining_relevant_hp,
+        remaining_all_hp,
+        capture_completion_turns,
+        excess_capturers: capture_count.saturating_sub(required_capturers),
+        cost: total_cost,
+        identity_indices,
     }
-    if current_multiset.len() == max_slots {
-        return;
+}
+
+fn multiset_frontier_key(
+    input: &RollingPlanInput,
+    role_indices: &[usize],
+    role_metas: &[RoleMetadata],
+) -> PropertyFrontierKey {
+    let mut capture_count = 0_usize;
+    let mut capture_completion_turns = Vec::new();
+    let mut combat_unit_count = 0_usize;
+    let mut total_movement = 0_u32;
+    let mut total_cost = 0_u32;
+    let mut damage_by_enemy = vec![0_u32; input.enemies.len()];
+
+    for &idx in role_indices {
+        let meta = &role_metas[idx];
+        total_cost = total_cost.saturating_add(meta.cost);
+        total_movement = total_movement.saturating_add(meta.max_movement);
+
+        if meta.capture_target.is_some() {
+            capture_count += 1;
+            if meta.min_capture_completion < u32::MAX {
+                capture_completion_turns.push(meta.min_capture_completion);
+            }
+        } else {
+            if meta.is_combat_non_infantry {
+                combat_unit_count += 1;
+            }
+            for (enemy_idx, &dmg) in meta.damage_by_enemy.iter().enumerate() {
+                damage_by_enemy[enemy_idx] = damage_by_enemy[enemy_idx].saturating_add(dmg);
+            }
+        }
     }
 
-    for i in role_start_idx..roles.len() {
-        let role = roles[i];
-        let cost = role.cost();
-        if cost > current_funds {
-            continue;
-        }
-        if let Some(target) = role.capture_target() {
-            if used_targets.contains(&target) {
-                continue;
+    build_property_frontier_key(
+        input,
+        capture_count,
+        capture_completion_turns,
+        combat_unit_count,
+        total_movement,
+        &damage_by_enemy,
+        total_cost,
+        role_indices.to_vec(),
+    )
+}
+
+/// 役割のマルチセット（重複組合せ）を資金上限およびスロット上限の範囲で生成する。
+/// 同一占領対象への二重割当は除外され、戦闘ユニットは重複が許容される。
+/// 施設数が多い盤面では、サイズ段階ごとにビーム幅で有望な候補を維持し、組合せ爆発を防ぐ。
+fn generate_role_multisets(
+    roles: &[ProductionRole],
+    input: &RollingPlanInput,
+    facilities: &[(GridPosition, Vec<usize>)],
+    facility_role_options: &HashMap<(GridPosition, ProductionRole), usize>,
+    current_funds: u32,
+    max_slots: usize,
+) -> (Vec<Vec<ProductionRole>>, bool) {
+    if roles.is_empty() || max_slots == 0 {
+        return (Vec::new(), false);
+    }
+
+    let role_metas: Vec<RoleMetadata> = roles
+        .iter()
+        .map(|role| {
+            let matching_facs: Vec<(GridPosition, usize)> = facilities
+                .iter()
+                .filter_map(|(fac, _)| {
+                    facility_role_options
+                        .get(&(*fac, *role))
+                        .copied()
+                        .map(|opt_idx| (*fac, opt_idx))
+                })
+                .collect();
+            let capacity = matching_facs.len();
+
+            let first_opt = matching_facs
+                .first()
+                .map(|&(_, opt_idx)| &input.production_options[opt_idx]);
+            let is_combat_non_infantry = role.capture_target().is_none()
+                && first_opt.is_some_and(|opt| opt.stats.movement_type != MovementType::Infantry);
+            let max_movement = first_opt.map_or(0, |opt| opt.stats.max_movement);
+
+            let min_capture_completion = if role.capture_target().is_some() {
+                matching_facs
+                    .iter()
+                    .filter_map(|&(_, opt_idx)| {
+                        input.production_options[opt_idx].capture_completion_turn
+                    })
+                    .min()
+                    .unwrap_or(u32::MAX)
+            } else {
+                u32::MAX
+            };
+
+            let damage_by_enemy: Vec<u32> = input
+                .enemies
+                .iter()
+                .enumerate()
+                .map(|(enemy_idx, enemy)| {
+                    if role.capture_target().is_some() {
+                        return 0;
+                    }
+                    let can_reach = matching_facs.iter().any(|&(_, opt_idx)| {
+                        input
+                            .production_attack_projections
+                            .get(opt_idx)
+                            .map_or_else(
+                                || {
+                                    input.production_options[opt_idx]
+                                        .engageable_enemy_indices
+                                        .contains(&enemy_idx)
+                                },
+                                |projections| {
+                                    projections.get(enemy_idx).is_some_and(Option::is_some)
+                                },
+                            )
+                    });
+                    if can_reach {
+                        best_damage(&input.damage_chart, role.unit_type(), enemy.stats.unit_type)
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+
+            RoleMetadata {
+                cost: role.cost(),
+                capture_target: role.capture_target(),
+                capacity,
+                min_capture_completion,
+                is_combat_non_infantry,
+                max_movement,
+                damage_by_enemy,
             }
-            used_targets.insert(target);
-            current_multiset.push(role);
-            generate_role_multisets(
-                roles,
-                i + 1,
-                current_funds.saturating_sub(cost),
-                max_slots,
-                used_targets,
-                current_multiset,
-                all_multisets,
-            );
-            current_multiset.pop();
-            used_targets.remove(&target);
-        } else {
-            current_multiset.push(role);
-            generate_role_multisets(
-                roles,
-                i,
-                current_funds.saturating_sub(cost),
-                max_slots,
-                used_targets,
-                current_multiset,
-                all_multisets,
-            );
-            current_multiset.pop();
+        })
+        .collect();
+
+    let initial = MultisetCandidate {
+        role_indices: Vec::new(),
+        used_targets: Vec::new(),
+        current_role_count: 0,
+        remaining_funds: current_funds,
+        last_role_idx: 0,
+    };
+
+    let mut current_level = vec![initial];
+    let mut all_multisets = Vec::new();
+    let mut truncated = false;
+
+    for _size in 1..=max_slots {
+        let mut next_level = Vec::new();
+        for parent in &current_level {
+            for (i, meta) in role_metas.iter().enumerate().skip(parent.last_role_idx) {
+                if meta.cost > parent.remaining_funds {
+                    continue;
+                }
+
+                let next_role_count = if i == parent.last_role_idx {
+                    parent.current_role_count.saturating_add(1)
+                } else {
+                    1
+                };
+
+                if let Some(target) = meta.capture_target {
+                    if parent.used_targets.contains(&target) {
+                        continue;
+                    }
+                    let mut used_targets = parent.used_targets.clone();
+                    used_targets.push(target);
+                    let mut new_role_indices = parent.role_indices.clone();
+                    new_role_indices.push(i);
+                    next_level.push(MultisetCandidate {
+                        role_indices: new_role_indices,
+                        used_targets,
+                        current_role_count: next_role_count,
+                        remaining_funds: parent.remaining_funds.saturating_sub(meta.cost),
+                        last_role_idx: i,
+                    });
+                } else if next_role_count <= meta.capacity
+                    && next_role_count <= MAX_COMBAT_ROLE_COPIES
+                {
+                    let mut new_role_indices = parent.role_indices.clone();
+                    new_role_indices.push(i);
+                    next_level.push(MultisetCandidate {
+                        role_indices: new_role_indices,
+                        used_targets: parent.used_targets.clone(),
+                        current_role_count: next_role_count,
+                        remaining_funds: parent.remaining_funds.saturating_sub(meta.cost),
+                        last_role_idx: i,
+                    });
+                }
+            }
+        }
+
+        if next_level.len() > MULTISET_BEAM_WIDTH {
+            truncated = true;
+            next_level.sort_unstable_by_key(|cand| {
+                multiset_frontier_key(input, &cand.role_indices, &role_metas)
+            });
+            next_level.truncate(MULTISET_BEAM_WIDTH);
+        }
+
+        for cand in &next_level {
+            all_multisets.push(cand.role_indices.iter().map(|&idx| roles[idx]).collect());
+        }
+
+        current_level = next_level;
+        if current_level.is_empty() {
+            break;
         }
     }
+
+    (all_multisets, truncated)
 }
 
 /// ある施設に特定の役割を割り当てた際のコスト（所要ターン数・距離）。
@@ -1515,17 +1805,13 @@ fn plan_current_property_control_exact(
         )
     });
 
-    let mut all_multisets = Vec::new();
-    let mut current_multiset = Vec::new();
-    let mut used_targets = HashSet::new();
-    generate_role_multisets(
+    let (all_multisets, multiset_truncated) = generate_role_multisets(
         &distinct_roles,
-        0,
+        input,
+        &facilities,
+        &facility_role_options,
         input.current_funds,
         facilities.len(),
-        &mut used_targets,
-        &mut current_multiset,
-        &mut all_multisets,
     );
 
     let mut states = vec![SearchState::default()];
@@ -1540,7 +1826,7 @@ fn plan_current_property_control_exact(
         }
     }
 
-    let mut frontier_truncated = false;
+    let mut frontier_truncated = multiset_truncated;
     if states.len() > state_limit {
         retain_property_control_frontier(input, &mut states, state_limit);
         frontier_truncated = true;
@@ -1923,46 +2209,32 @@ fn property_control_state_limit(_facility_count: usize) -> usize {
 /// まだ戦闘順・反撃・渋滞を確定しないため、その評価は最終シミュレーションに残す。
 /// ここで見るダメージは「どの敵へ何も届かない候補か」を判別する下限であり、
 /// 高火力unitを固定的に優遇する評価値ではない。
-#[allow(clippy::type_complexity)]
 fn property_control_frontier_key(
     input: &RollingPlanInput,
     state: &SearchState,
-) -> (
-    usize,
-    Vec<u32>,
-    (std::cmp::Reverse<usize>, std::cmp::Reverse<u32>),
-    u32,
-    u32,
-    Vec<u32>,
-    usize,
-    u32,
-    Vec<usize>,
-) {
-    let opening_capture_floor = if uses_small_map_opening_rules(input) {
-        2
-    } else {
-        0
-    };
-    let required_capturers = input.required_capture_survivors.max(opening_capture_floor);
+) -> PropertyFrontierKey {
     let capture_count = state.used_capture_targets.len();
-    let capture_shortfall = required_capturers.saturating_sub(capture_count);
-
-    let mut capture_completion_turns = state
+    let capture_completion_turns = state
         .option_indices
         .iter()
         .filter_map(|index| input.production_options[*index].capture_completion_turn)
         .collect::<Vec<_>>();
-    capture_completion_turns.sort_unstable();
-    capture_completion_turns.truncate(required_capturers.max(1));
-    capture_completion_turns.resize(required_capturers.max(1), u32::MAX);
 
     let mut damage_by_enemy = vec![0_u32; input.enemies.len()];
-    for option_index in &state.option_indices {
-        let option = &input.production_options[*option_index];
+    let mut combat_unit_count = 0_usize;
+    let mut total_movement = 0_u32;
+
+    for &option_index in &state.option_indices {
+        let option = &input.production_options[option_index];
+        total_movement = total_movement.saturating_add(option.stats.max_movement);
+        if option.capture_target.is_none() && option.stats.movement_type != MovementType::Infantry {
+            combat_unit_count += 1;
+        }
+
         for (enemy_index, enemy) in input.enemies.iter().enumerate() {
             let reaches_enemy = input
                 .production_attack_projections
-                .get(*option_index)
+                .get(option_index)
                 .map_or_else(
                     || option.engageable_enemy_indices.contains(&enemy_index),
                     |projections| projections.get(enemy_index).is_some_and(Option::is_some),
@@ -1977,64 +2249,14 @@ fn property_control_frontier_key(
             }
         }
     }
-    let remaining_by_enemy = input
-        .enemies
-        .iter()
-        .enumerate()
-        .map(|(index, enemy)| enemy.hp.saturating_sub(damage_by_enemy[index]))
-        .collect::<Vec<_>>();
-    let relevant_enemy_indices = if input.interdiction_deadlines.is_empty() {
-        (0..input.enemies.len()).collect::<Vec<_>>()
-    } else {
-        input
-            .interdiction_deadlines
-            .iter()
-            .map(|(index, _)| *index)
-            .collect::<Vec<_>>()
-    };
-    let remaining_relevant_hp = relevant_enemy_indices
-        .into_iter()
-        .filter_map(|index| remaining_by_enemy.get(index))
-        .copied()
-        .sum();
-    let remaining_all_hp = remaining_by_enemy.into_iter().sum();
 
-    let small_map_capture_completion = if uses_small_map_tactical_rules(input) {
-        capture_completion_turns.clone()
-    } else {
-        Default::default()
-    };
-
-    let small_map_combat_priority = if uses_small_map_tactical_rules(input) {
-        let combat_unit_count = state
-            .option_indices
-            .iter()
-            .filter(|&&idx| {
-                let opt = &input.production_options[idx];
-                opt.capture_target.is_none() && opt.stats.movement_type != MovementType::Infantry
-            })
-            .count();
-        let total_movement: u32 = state
-            .option_indices
-            .iter()
-            .map(|&idx| input.production_options[idx].stats.max_movement)
-            .sum();
-        (
-            std::cmp::Reverse(combat_unit_count),
-            std::cmp::Reverse(total_movement),
-        )
-    } else {
-        (std::cmp::Reverse(0), std::cmp::Reverse(0))
-    };
-
-    (
-        capture_shortfall,
-        small_map_capture_completion,
-        small_map_combat_priority,
-        remaining_relevant_hp,
-        remaining_all_hp,
+    build_property_frontier_key(
+        input,
+        capture_count,
         capture_completion_turns,
-        capture_count.saturating_sub(required_capturers),
+        combat_unit_count,
+        total_movement,
+        &damage_by_enemy,
         state.cost,
         state.option_indices.clone(),
     )
