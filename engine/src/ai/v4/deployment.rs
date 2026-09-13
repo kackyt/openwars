@@ -662,9 +662,10 @@ pub fn reconcile_pending_deployments_system(
         if let Some(assigned) = registry.assigned.get(&event.entity)
             && let Some(binding) = assigned.intent.operation_binding
             && let Some(contracts) = contract_registry.as_deref_mut()
+            && let Err(err) =
+                contracts.reconcile_produced_binding(event.entity, binding, assigned.intent.anchor)
         {
-            let _ =
-                contracts.reconcile_produced_binding(event.entity, binding, assigned.intent.anchor);
+            eprintln!("[WARN] Failed to reconcile produced binding: {:?}", err);
         }
     }
     // 失敗した生産命令を翌ターンの同型発注へ誤照合しない。
@@ -1177,6 +1178,7 @@ pub(crate) fn prepare_deployment_squads(
                 (None, snapshot.intent.staging_anchor, MissionType::Defense)
             }
             DeploymentPosture::Execute => {
+                // 占領スロットの場合はターゲット解決を行わず、直接占領任務を割り当てる
                 if snapshot.intent.slot_kind == SlotKind::Capture {
                     (None, snapshot.intent.anchor, MissionType::Capture)
                 } else {

@@ -8,6 +8,7 @@ use super::plan_revision::{PlanId, PlanRevision, PlanStepRef, ReplanReason};
 use super::property_control::ActionPhase;
 use super::victory_roadmap::{OperationEntityRole, OperationPhase, StrategicOperationId};
 use crate::components::GridPosition;
+use crate::resources::TurnNumber;
 use bevy_ecs::prelude::*;
 use std::collections::HashMap;
 
@@ -49,7 +50,7 @@ pub struct OperationPlanContract {
     pub target: TargetProperty,
     pub approach: OperationApproach,
     pub phase: OperationPhase,
-    pub deadline_turn: Option<u32>,
+    pub deadline_turn: Option<TurnNumber>,
     pub plan_id: Option<PlanId>,
     pub combat_entity: Option<Entity>,
     pub capture_entity: Option<Entity>,
@@ -59,23 +60,29 @@ pub struct OperationPlanContract {
 }
 
 /// ロール割当時のエラー。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RoleAssignmentError {
+    #[error(
+        "Entity {entity:?} is already assigned to operation {existing_operation:?} as role {existing_role:?}"
+    )]
     AlreadyAssigned {
         entity: Entity,
         existing_operation: StrategicOperationId,
         existing_role: OperationEntityRole,
     },
+    #[error("Operation {0:?} not found")]
     OperationNotFound(StrategicOperationId),
 }
 
 /// リビジョン検証エラー。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RevisionValidationError {
+    #[error("Stale revision: current {current:?}, received {received:?}")]
     StaleRevision {
         current: PlanRevision,
         received: PlanRevision,
     },
+    #[error("Operation {0:?} not found")]
     OperationNotFound(StrategicOperationId),
 }
 
@@ -298,7 +305,7 @@ impl PlanContractRegistry {
             return Some(ReplanReason::ContinuationInfeasible);
         }
         if let Some(deadline) = contract.deadline_turn
-            && current_turn > deadline
+            && current_turn > deadline.0
         {
             return Some(ReplanReason::HardDeadlineMissed);
         }
@@ -491,7 +498,7 @@ mod tests {
             target,
             approach: OperationApproach::Interdict,
             phase: OperationPhase::Forming,
-            deadline_turn: Some(10),
+            deadline_turn: Some(TurnNumber(10)),
             plan_id: Some(plan_id),
             combat_entity: None,
             capture_entity: None,
@@ -544,7 +551,7 @@ mod tests {
             target,
             approach: OperationApproach::Interdict,
             phase: OperationPhase::Forming,
-            deadline_turn: Some(10),
+            deadline_turn: Some(TurnNumber(10)),
             plan_id: Some(plan_id),
             combat_entity: None,
             capture_entity: None,
@@ -591,7 +598,7 @@ mod tests {
             target,
             approach: OperationApproach::Recapture,
             phase: OperationPhase::Forming,
-            deadline_turn: Some(15),
+            deadline_turn: Some(TurnNumber(15)),
             plan_id: None,
             combat_entity: None,
             capture_entity: None,
@@ -647,7 +654,7 @@ mod tests {
             target,
             approach: OperationApproach::Interdict,
             phase: OperationPhase::Forming,
-            deadline_turn: Some(10),
+            deadline_turn: Some(TurnNumber(10)),
             plan_id: None,
             combat_entity: None,
             capture_entity: None,
@@ -702,7 +709,7 @@ mod tests {
             target,
             approach: OperationApproach::Interdict,
             phase: OperationPhase::Forming,
-            deadline_turn: Some(12),
+            deadline_turn: Some(TurnNumber(12)),
             plan_id: None,
             combat_entity: None,
             capture_entity: None,

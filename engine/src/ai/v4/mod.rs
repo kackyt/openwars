@@ -6012,12 +6012,12 @@ fn eta_turns(map: &Map, from: &GridPosition, to: &GridPosition, movement: u32) -
 }
 
 /// 盤面から作戦の一覧を組み立てる。
+/// 分析関数として副作用を持たず、契約レジストリの同期は呼び出し元で行う。
 fn build_operations(
     scan: &BoardScan,
     ctx: &mut ReachCtx,
     active_objectives: &[ActivePlanObjective],
     player_id: PlayerId,
-    mut contract_registry: Option<&mut plan_contract::PlanContractRegistry>,
 ) -> Vec<Operation> {
     let Some(reference) = scan.reference_capture_unit().cloned() else {
         return Vec::new();
@@ -6354,33 +6354,7 @@ fn build_operations(
                     u32::try_from(operation.capture_lane_targets.len()).unwrap_or(u32::MAX);
             }
 
-            // V4中央作戦契約との同期
-            if let Some(control) = operation.property_control
-                && let Some(contracts) = contract_registry.as_deref_mut()
-                && let Some(&target_entity) = scan.property_entities.get(&control.property)
-            {
-                let op_id = contracts.maintain_or_replan(target_entity, control.property, None);
-                let approach = match control.approach {
-                    PropertyControlApproach::DirectCapture => {
-                        plan_contract::OperationApproach::DirectCapture
-                    }
-                    PropertyControlApproach::Interdict => {
-                        plan_contract::OperationApproach::Interdict
-                    }
-                    PropertyControlApproach::Recapture => {
-                        plan_contract::OperationApproach::Recapture
-                    }
-                };
-                contracts.update_approach_and_target(op_id, Some(approach), Some(control.property));
-                operation.operation_id = Some(op_id);
-            } else if let Some(objective) = planning_objective
-                && let Some(contracts) = contract_registry.as_deref_mut()
-                && let Some(&target_entity) = scan.property_entities.get(&objective.anchor)
-            {
-                let op_id = contracts.maintain_or_replan(target_entity, objective.anchor, None);
-                contracts.update_approach_and_target(op_id, None, Some(objective.anchor));
-                operation.operation_id = Some(op_id);
-            }
+            // NOTE: V4中央作戦契約との同期は呼び出し元（plan_production_with_registry）で実行する
             if operation
                 .property_controls
                 .iter()
@@ -7496,13 +7470,38 @@ fn plan_production_with_registry(
 ) -> (Vec<PlannedProduction>, ProductionPlanTrace) {
     let mut ctx = ReachCtx::default();
     let active_objectives = plan_registry.active_objectives(player_id);
-    let mut operations = build_operations(
-        scan,
-        &mut ctx,
-        &active_objectives,
-        player_id,
-        Some(contract_registry),
-    );
+    let mut operations = build_operations(scan, &mut ctx, &active_objectives, player_id);
+
+    // V4中央作戦契約との同期（build_operationsの純粋性を保つため、呼び出し元で実行）
+    for operation in &mut operations {
+        if let Some(control) = operation.property_control
+            && let Some(&target_entity) = scan.property_entities.get(&control.property)
+        {
+            let op_id = contract_registry.maintain_or_replan(target_entity, control.property, None);
+            let approach = match control.approach {
+                PropertyControlApproach::DirectCapture => {
+                    plan_contract::OperationApproach::DirectCapture
+                }
+                PropertyControlApproach::Interdict => plan_contract::OperationApproach::Interdict,
+                PropertyControlApproach::Recapture => plan_contract::OperationApproach::Recapture,
+            };
+            contract_registry.update_approach_and_target(
+                op_id,
+                Some(approach),
+                Some(control.property),
+            );
+            operation.operation_id = Some(op_id);
+        } else if let Some(objective) = scan
+            .campaign_objectives
+            .iter()
+            .find(|obj| operation.objective_properties.contains(&obj.anchor))
+            && let Some(&target_entity) = scan.property_entities.get(&objective.anchor)
+        {
+            let op_id = contract_registry.maintain_or_replan(target_entity, objective.anchor, None);
+            contract_registry.update_approach_and_target(op_id, None, Some(objective.anchor));
+            operation.operation_id = Some(op_id);
+        }
+    }
     let mut plan_trace =
         ProductionPlanTrace::new(player_id, scan.funds, scan.free_facilities.len());
 
@@ -12618,7 +12617,7 @@ mod tests {
             execution_authorized: true,
         }];
 
-        let operations = build_operations(&scan, &mut ReachCtx::default(), &[], PlayerId(1), None);
+        let operations = build_operations(&scan, &mut ReachCtx::default(), &[], PlayerId(1));
         let captures = operations
             .iter()
             .filter(|operation| operation.kind == OperationKind::Capture)
@@ -12673,13 +12672,7 @@ mod tests {
             properties: vec![capital],
             target_enemies: HashSet::new(),
         };
-        let operations = build_operations(
-            &scan,
-            &mut ReachCtx::default(),
-            &[active],
-            PlayerId(1),
-            None,
-        );
+        let operations = build_operations(&scan, &mut ReachCtx::default(), &[active], PlayerId(1));
         let same_island = operations
             .iter()
             .filter(|operation| operation.island_id == Some(island_id))
@@ -13030,7 +13023,7 @@ mod tests {
             free_cargo: 0,
         });
         let mut ctx = ReachCtx::default();
-        let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1), None);
+        let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
         let operation = operations
             .iter()
             .find(|operation| operation.kind == OperationKind::Capture)
@@ -13077,7 +13070,7 @@ mod tests {
             execution_authorized: true,
         }];
         let mut ctx = ReachCtx::default();
-        let mut operations = build_operations(&scan, &mut ctx, &[], PlayerId(1), None);
+        let mut operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
         let planned_stats = scan
             .reference_capture_unit()
             .expect("fixtureには占領可能兵がある")
@@ -13168,7 +13161,7 @@ mod tests {
         // ある限りExpectedを0にしない。
         scan.enemy_production_forecast = EnemyProductionForecastTrace::default();
         let mut ctx = ReachCtx::default();
-        let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1), None);
+        let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
         let capture = operations
             .iter()
             .find(|operation| operation.kind == OperationKind::Capture)
@@ -14096,7 +14089,7 @@ mod tests {
             enemy_production_forecast: EnemyProductionForecastTrace::default(),
         };
         let mut ctx = ReachCtx::default();
-        let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1), None);
+        let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
 
         let options =
             immediate_combat_options(&scan, &mut ctx, &operations, PlayerId(1), &HashSet::new());
@@ -14256,7 +14249,7 @@ mod tests {
             enemy_production_forecast: EnemyProductionForecastTrace::default(),
         };
         let mut ctx = ReachCtx::default();
-        let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1), None);
+        let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
         let options =
             immediate_combat_options(&scan, &mut ctx, &operations, PlayerId(1), &HashSet::new());
 
