@@ -19,6 +19,7 @@ pub(crate) mod home_defense;
 pub mod logistics_plan;
 pub mod operation;
 mod operation_selection;
+pub mod plan_contract;
 pub mod plan_revision;
 pub mod property_control;
 pub mod rolling_plan;
@@ -1141,6 +1142,8 @@ struct Operation {
     kind: OperationKind,
     /// 島campaignの永続identity。anchorや未所有施設集合が変わっても維持する。
     island_id: Option<crate::ai::islands::IslandId>,
+    /// V4中央契約との作戦ID。
+    operation_id: Option<victory_roadmap::StrategicOperationId>,
     /// 作戦の代表地点（距離計算の基準）
     anchor: GridPosition,
     /// 編成中の戦力を逐次投入せず集結させる、自軍側の安全な地点。
@@ -1305,6 +1308,8 @@ struct PlannedDeployment {
     forecast: deployment::DeploymentForecast,
     /// 永続Combat計画の生産step。旧Intercept等ではNone。
     plan_step: Option<PlanStepRef>,
+    /// V4中央契約との軽量バインディング。
+    operation_binding: Option<plan_contract::OperationBinding>,
 }
 
 impl std::ops::Deref for PlannedProduction {
@@ -1383,6 +1388,9 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
     let mut rolling_registry = world
         .remove_resource::<V4RollingPlanRegistry>()
         .unwrap_or_default();
+    let mut contract_registry = world
+        .remove_resource::<plan_contract::PlanContractRegistry>()
+        .unwrap_or_default();
     rolling_registry.reconcile_produced_steps(player_id, &produced_plan_steps);
     let (planned, mut plan_trace) = plan_production_with_registry(
         &scan,
@@ -1392,6 +1400,7 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
         &advancing_route_entities,
         turn,
         &mut rolling_registry,
+        &mut contract_registry,
     );
     plan_trace.enemy_production_forecast = enemy_production_forecast;
     // 陸続き前線ではCapture候補の選定を通常plannerへ委ねている。それでも生産完了後の
@@ -1425,6 +1434,7 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
         scan.capital_staging_anchor,
     );
     world.insert_resource(rolling_registry);
+    world.insert_resource(contract_registry);
 
     // 診断traceとは別に、生産完了イベントと照合する作戦意図を永続化する。
     let pending = planned
@@ -1450,6 +1460,7 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
                 forecast: deployment.forecast,
                 plan_step: deployment.plan_step,
                 forming_slot: None,
+                operation_binding: deployment.operation_binding,
             })
         })
         .collect::<Vec<_>>();
@@ -1782,6 +1793,8 @@ struct BoardScan {
     enemy_units: Vec<UnitSnapshot>,
     /// 首都の生産範囲内にある所有空港総数（占有中を含む）
     owned_airport_count: u32,
+    /// 盤面上の物件位置から安定ID（Entity）を引く辞書
+    pub property_entities: HashMap<GridPosition, Entity>,
     /// 自軍が保有していない拠点（中立・敵）
     open_properties: Vec<GridPosition>,
     /// まだどの勢力も所有していない拠点。初動の物件レース対象を敵領から分離する。
@@ -5706,10 +5719,12 @@ impl BoardScan {
             .get_resource::<victory_roadmap::VictoryRoadmapRegistry>()
             .and_then(|registry| registry.roadmap(player_id))
             .and_then(|roadmap| roadmap.enemy_capital);
+        let mut property_entities = HashMap::new();
         {
-            let mut q = world.query::<(&GridPosition, &Property)>();
+            let mut q = world.query::<(Entity, &GridPosition, &Property)>();
             let mut enemy_capitals = HashMap::new();
-            for (pos, prop) in q.iter(world) {
+            for (entity, pos, prop) in q.iter(world) {
+                property_entities.insert(*pos, entity);
                 if prop.owner_id == Some(player_id) && prop.terrain == Terrain::Capital {
                     capital_pos = Some(*pos);
                 } else if let Some(owner) = prop.owner_id
@@ -5719,7 +5734,7 @@ impl BoardScan {
                     enemy_capital.get_or_insert(*pos);
                 }
             }
-            for (pos, prop) in q.iter(world) {
+            for (_entity, pos, prop) in q.iter(world) {
                 let income = master_data.landscape_income(prop.terrain.as_str());
                 let is_facility = master_data.is_production_facility(prop.terrain.as_str());
                 match prop.owner_id {
@@ -5953,6 +5968,7 @@ impl BoardScan {
             my_units,
             enemy_units,
             owned_airport_count,
+            property_entities,
             open_properties,
             neutral_properties,
             enemy_income,
@@ -5996,6 +6012,7 @@ fn eta_turns(map: &Map, from: &GridPosition, to: &GridPosition, movement: u32) -
 }
 
 /// 盤面から作戦の一覧を組み立てる。
+/// 分析関数として副作用を持たず、契約レジストリの同期は呼び出し元で行う。
 fn build_operations(
     scan: &BoardScan,
     ctx: &mut ReachCtx,
@@ -6336,6 +6353,8 @@ fn build_operations(
                 operation.slots.capture_units =
                     u32::try_from(operation.capture_lane_targets.len()).unwrap_or(u32::MAX);
             }
+
+            // NOTE: V4中央作戦契約との同期は呼び出し元（plan_production_with_registry）で実行する
             if operation
                 .property_controls
                 .iter()
@@ -7360,6 +7379,7 @@ fn build_operation(
     let mut operation = Operation {
         kind,
         island_id: None,
+        operation_id: None,
         anchor,
         staging_anchor: anchor,
         execution_authorized: true,
@@ -7424,6 +7444,7 @@ fn plan_production(
     committed_combat_assignments: &HashMap<Entity, deployment::ActiveTargetAssignment>,
 ) -> (Vec<PlannedProduction>, ProductionPlanTrace) {
     let mut registry = V4RollingPlanRegistry::default();
+    let mut contract_registry = plan_contract::PlanContractRegistry::default();
     plan_production_with_registry(
         scan,
         player_id,
@@ -7432,9 +7453,11 @@ fn plan_production(
         &AdvancingCapitalRouteEntities::default(),
         0,
         &mut registry,
+        &mut contract_registry,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_production_with_registry(
     scan: &BoardScan,
     player_id: PlayerId,
@@ -7443,10 +7466,42 @@ fn plan_production_with_registry(
     advancing_route_entities: &AdvancingCapitalRouteEntities,
     turn: u32,
     plan_registry: &mut V4RollingPlanRegistry,
+    contract_registry: &mut plan_contract::PlanContractRegistry,
 ) -> (Vec<PlannedProduction>, ProductionPlanTrace) {
     let mut ctx = ReachCtx::default();
     let active_objectives = plan_registry.active_objectives(player_id);
     let mut operations = build_operations(scan, &mut ctx, &active_objectives, player_id);
+
+    // V4中央作戦契約との同期（build_operationsの純粋性を保つため、呼び出し元で実行）
+    for operation in &mut operations {
+        if let Some(control) = operation.property_control
+            && let Some(&target_entity) = scan.property_entities.get(&control.property)
+        {
+            let op_id = contract_registry.maintain_or_replan(target_entity, control.property, None);
+            let approach = match control.approach {
+                PropertyControlApproach::DirectCapture => {
+                    plan_contract::OperationApproach::DirectCapture
+                }
+                PropertyControlApproach::Interdict => plan_contract::OperationApproach::Interdict,
+                PropertyControlApproach::Recapture => plan_contract::OperationApproach::Recapture,
+            };
+            contract_registry.update_approach_and_target(
+                op_id,
+                Some(approach),
+                Some(control.property),
+            );
+            operation.operation_id = Some(op_id);
+        } else if let Some(objective) = scan
+            .campaign_objectives
+            .iter()
+            .find(|obj| operation.objective_properties.contains(&obj.anchor))
+            && let Some(&target_entity) = scan.property_entities.get(&objective.anchor)
+        {
+            let op_id = contract_registry.maintain_or_replan(target_entity, objective.anchor, None);
+            contract_registry.update_approach_and_target(op_id, None, Some(objective.anchor));
+            operation.operation_id = Some(op_id);
+        }
+    }
     let mut plan_trace =
         ProductionPlanTrace::new(player_id, scan.funds, scan.free_facilities.len());
 
@@ -7982,18 +8037,19 @@ fn plan_production_with_registry(
             candidate.facility,
             operation_priority_rank(&operations[op_index]),
         );
-        let mut deployment = (effective_slot_kind != SlotKind::Capture)
-            .then(|| {
-                planned_deployment(
-                    scan,
-                    &mut ctx,
-                    &operations[op_index],
-                    effective_slot_kind,
-                    &candidate,
-                    planned_combat_target,
-                )
-            })
-            .flatten();
+        let mut deployment = if effective_slot_kind == SlotKind::Capture {
+            let target = capture_mission_target.unwrap_or(operations[op_index].anchor);
+            Some(planned_capture_deployment(&operations[op_index], target))
+        } else {
+            planned_deployment(
+                scan,
+                &mut ctx,
+                &operations[op_index],
+                effective_slot_kind,
+                &candidate,
+                planned_combat_target,
+            )
+        };
         if effective_slot_kind == SlotKind::Combat
             && let (Some(deployment), Some(plan)) = (deployment.as_mut(), rolling_plan)
         {
@@ -8011,6 +8067,30 @@ fn plan_production_with_registry(
                 .and_then(|((plan_id, revision), purchase)| {
                     plan_registry.current_step_ref(plan_id, revision, turn, purchase)
                 });
+            if let (Some(plan_id), Some(op_id)) = (plan.plan_id, operations[op_index].operation_id)
+            {
+                contract_registry.link_plan_to_operation(plan_id, op_id);
+            }
+        }
+        if let Some(op_id) = operations[op_index].operation_id
+            && let Some(deployment) = deployment.as_mut()
+        {
+            let role = match effective_slot_kind {
+                SlotKind::Capture => victory_roadmap::OperationEntityRole::Capture,
+                SlotKind::Transport => victory_roadmap::OperationEntityRole::Transport,
+                SlotKind::Combat | SlotKind::Intercept => {
+                    victory_roadmap::OperationEntityRole::Combat
+                }
+            };
+            let revision = contract_registry
+                .contract_revision(op_id)
+                .unwrap_or(plan_revision::PlanRevision(1));
+            deployment.operation_binding = Some(plan_contract::OperationBinding {
+                operation_id: op_id,
+                plan_step: deployment.plan_step,
+                role,
+                revision,
+            });
         }
         // Combatは同じパッケージの未使用current purchaseを次の反復で選ぶ。
         // 全て消費した後は候補なしとなり、この手番のCombat枠を完了する。
@@ -9603,7 +9683,23 @@ fn planned_deployment(
         threat_horizon: op.threat_horizon,
         forecast: deployment::DeploymentForecast::default(),
         plan_step: None,
+        operation_binding: None,
     })
+}
+
+/// 占領スロット専用の計画配備状態を生成する。
+fn planned_capture_deployment(op: &Operation, target: GridPosition) -> PlannedDeployment {
+    PlannedDeployment {
+        anchor: target,
+        staging_anchor: op.staging_anchor,
+        posture: deployment::DeploymentPosture::Execute,
+        slot_kind: SlotKind::Capture,
+        priority_enemies: Vec::new(),
+        threat_horizon: op.threat_horizon,
+        forecast: deployment::DeploymentForecast::default(),
+        plan_step: None,
+        operation_binding: None,
+    }
 }
 
 /// 次に埋めるべき枠を返す。
@@ -12726,6 +12822,7 @@ mod tests {
                     free_cargo: 0,
                 })
                 .collect(),
+            property_entities: HashMap::new(),
             owned_airport_count: 1,
             open_properties: anchors.clone(),
             neutral_properties: anchors.clone(),
@@ -13423,6 +13520,7 @@ mod tests {
                     free_cargo: 0,
                 })
                 .collect(),
+            property_entities: HashMap::new(),
             owned_airport_count: 3,
             open_properties: enemy_positions.to_vec(),
             neutral_properties: enemy_positions.to_vec(),
@@ -13488,6 +13586,7 @@ mod tests {
         Operation {
             kind,
             island_id: None,
+            operation_id: None,
             anchor: pos(0, 0),
             staging_anchor: pos(0, 0),
             execution_authorized: true,
@@ -13551,6 +13650,7 @@ mod tests {
                 free_cargo: 2,
             }],
             enemy_units: Vec::new(),
+            property_entities: HashMap::new(),
             owned_airport_count: 0,
             open_properties: vec![pos(8, 1)],
             neutral_properties: vec![pos(8, 1)],
@@ -13732,6 +13832,7 @@ mod tests {
             available_types: vec![(UnitType::Infantry, infantry), (UnitType::Tank, tank)],
             my_units: Vec::new(),
             enemy_units: Vec::new(),
+            property_entities: HashMap::new(),
             owned_airport_count: 0,
             open_properties: vec![pos(6, 2)],
             neutral_properties: vec![pos(6, 2)],
@@ -13811,6 +13912,7 @@ mod tests {
                     free_cargo: 0,
                 },
             ],
+            property_entities: HashMap::new(),
             owned_airport_count: 0,
             open_properties: vec![pos(6, 2)],
             neutral_properties: vec![pos(6, 2)],
@@ -13890,6 +13992,7 @@ mod tests {
                 hp: 100,
                 free_cargo: 0,
             }],
+            property_entities: HashMap::new(),
             owned_airport_count: 1,
             open_properties: vec![pos(7, 1)],
             neutral_properties: vec![pos(7, 1)],
@@ -13972,6 +14075,7 @@ mod tests {
                 hp: 100,
                 free_cargo: 0,
             }],
+            property_entities: HashMap::new(),
             owned_airport_count: 1,
             open_properties: vec![pos(7, 1)],
             neutral_properties: vec![pos(7, 1)],
@@ -14131,6 +14235,7 @@ mod tests {
                 hp: 100,
                 free_cargo: 0,
             }],
+            property_entities: HashMap::new(),
             owned_airport_count: 0,
             open_properties: vec![pos(6, 1)],
             neutral_properties: vec![pos(6, 1)],
