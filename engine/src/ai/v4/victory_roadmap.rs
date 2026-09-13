@@ -132,7 +132,7 @@ pub struct RoadmapDependency {
     pub kind: RoadmapDependencyKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OperationEntityRole {
     Transport,
     Capture,

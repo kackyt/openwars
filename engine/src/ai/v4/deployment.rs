@@ -8,6 +8,7 @@ use crate::ai::islands::IslandMap;
 use crate::ai::squad::{MissionPhase, MissionType, SquadId, SquadManager};
 use crate::ai::turn_distance::TerrainConnectivity;
 use crate::ai::v4::operation::SlotKind;
+use crate::ai::v4::plan_contract::{OperationBinding, PlanContractRegistry};
 use crate::ai::v4::plan_revision::{ActiveDeploymentIntent, PlanId, PlanStepRef};
 use crate::components::{
     Ammo, Faction, GridPosition, Health, PlayerId, Property, Transporting, UnitStats,
@@ -71,6 +72,8 @@ pub(crate) struct PendingDeployment {
     /// 発注と同時に予約した作戦Squadの受入slot。手書きのテスト入力ではNoneを許容し、
     /// `replace_turn_orders` が必ず実IDへ正規化する。
     pub forming_slot: Option<FormingSquadSlotId>,
+    /// V4中央契約との軽量バインディング。
+    pub operation_binding: Option<OperationBinding>,
 }
 
 /// まだ実体が無いSquad slotの予約状態。発注と生産完了のあいだも作戦所有権を保つ。
@@ -612,6 +615,7 @@ impl V4DeploymentRegistry {
                     forecast: DeploymentForecast::default(),
                     plan_step: None,
                     forming_slot: None,
+                    operation_binding: None,
                 },
                 squad_id: None,
                 current_target: Some(target),
@@ -644,6 +648,7 @@ pub fn reconcile_pending_deployments_system(
     mut registry: ResMut<V4DeploymentRegistry>,
     manager: Option<ResMut<SquadManager>>,
     island_map: Option<Res<IslandMap>>,
+    mut contract_registry: Option<ResMut<PlanContractRegistry>>,
 ) {
     let turn = match_state.current_turn_number.0;
     let mut manager = manager;
@@ -653,6 +658,12 @@ pub fn reconcile_pending_deployments_system(
             && let Some(manager) = manager.as_deref_mut()
         {
             registry.resolve_produced_slot(event.entity, manager, island_map.as_deref());
+        }
+        if let Some(assigned) = registry.assigned.get(&event.entity)
+            && let Some(binding) = assigned.intent.operation_binding
+            && let Some(contracts) = contract_registry.as_deref_mut()
+        {
+            contracts.reconcile_produced_binding(event.entity, binding, assigned.intent.anchor);
         }
     }
     // 失敗した生産命令を翌ターンの同型発注へ誤照合しない。
@@ -1165,19 +1176,23 @@ pub(crate) fn prepare_deployment_squads(
                 (None, snapshot.intent.staging_anchor, MissionType::Defense)
             }
             DeploymentPosture::Execute => {
-                match resolve_target(world, &mut connectivity, &snapshot, &target_commitments) {
-                    Some((target_entity, target)) => {
-                        *target_commitments.entry(target_entity).or_insert(0) += 1;
-                        (Some(target_entity), target, MissionType::Attack)
-                    }
-                    // Combat排除後も対象拠点の占領完了まではPlanを閉じない。
-                    // 生産戦力をfree poolへ返さず、anchorで反撃増援を待ち受ける。
-                    None if snapshot.intent.plan_step.is_some() => {
-                        (None, snapshot.intent.anchor, MissionType::Defense)
-                    }
-                    None => {
-                        releases.push((entity, snapshot.squad_id));
-                        continue;
+                if snapshot.intent.slot_kind == SlotKind::Capture {
+                    (None, snapshot.intent.anchor, MissionType::Capture)
+                } else {
+                    match resolve_target(world, &mut connectivity, &snapshot, &target_commitments) {
+                        Some((target_entity, target)) => {
+                            *target_commitments.entry(target_entity).or_insert(0) += 1;
+                            (Some(target_entity), target, MissionType::Attack)
+                        }
+                        // Combat排除後も対象拠点の占領完了まではPlanを閉じない。
+                        // 生産戦力をfree poolへ返さず、anchorで反撃増援を待ち受ける。
+                        None if snapshot.intent.plan_step.is_some() => {
+                            (None, snapshot.intent.anchor, MissionType::Defense)
+                        }
+                        None => {
+                            releases.push((entity, snapshot.squad_id));
+                            continue;
+                        }
                     }
                 }
             }
@@ -1255,6 +1270,7 @@ mod tests {
             forecast: DeploymentForecast::default(),
             plan_step: None,
             forming_slot: None,
+            operation_binding: None,
         }
     }
 
@@ -1515,6 +1531,7 @@ mod tests {
                     forecast: DeploymentForecast::default(),
                     plan_step: None,
                     forming_slot: None,
+                    operation_binding: None,
                 },
                 squad_id: None,
                 current_target: None,
@@ -1751,6 +1768,7 @@ mod tests {
                 forecast: DeploymentForecast::default(),
                 plan_step: None,
                 forming_slot: None,
+                operation_binding: None,
             },
             squad_id: None,
             current_target: None,
@@ -1853,6 +1871,7 @@ mod tests {
                 forecast: DeploymentForecast::default(),
                 plan_step: None,
                 forming_slot: None,
+                operation_binding: None,
             },
             squad_id: None,
             current_target: Some(remote_enemy),
