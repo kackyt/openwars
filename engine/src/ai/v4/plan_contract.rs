@@ -83,15 +83,15 @@ pub enum RevisionValidationError {
 #[derive(Resource, Debug, Default, Clone)]
 pub struct PlanContractRegistry {
     /// 作戦IDごとの契約正本
-    pub contracts: HashMap<StrategicOperationId, OperationPlanContract>,
+    contracts: HashMap<StrategicOperationId, OperationPlanContract>,
     /// PlanId -> StrategicOperationId の親子マッピング
-    pub plan_to_operation: HashMap<PlanId, StrategicOperationId>,
+    plan_to_operation: HashMap<PlanId, StrategicOperationId>,
     /// Entity -> (StrategicOperationId, OperationEntityRole) の排他割当台帳
-    pub entity_assignments: HashMap<Entity, (StrategicOperationId, OperationEntityRole)>,
+    entity_assignments: HashMap<Entity, (StrategicOperationId, OperationEntityRole)>,
     /// 物件Entity -> StrategicOperationId のマッピング（前線固定用）
-    pub property_to_operation: HashMap<Entity, StrategicOperationId>,
+    property_to_operation: HashMap<Entity, StrategicOperationId>,
     /// 生産済みEntity -> (OperationBinding, deployment target) の保持台帳
-    pub entity_bindings: HashMap<Entity, (OperationBinding, GridPosition)>,
+    entity_bindings: HashMap<Entity, (OperationBinding, GridPosition)>,
     /// 次に発番する作戦IDカウンター
     next_operation_id: u64,
 }
@@ -119,6 +119,41 @@ impl PlanContractRegistry {
             OperationApproach::Interdict
         } else {
             OperationApproach::Recapture
+        }
+    }
+
+    /// 作戦契約の参照を取得する。
+    pub fn contract(&self, operation_id: StrategicOperationId) -> Option<&OperationPlanContract> {
+        self.contracts.get(&operation_id)
+    }
+
+    /// 作戦契約の可変参照を取得する。
+    pub fn contract_mut(
+        &mut self,
+        operation_id: StrategicOperationId,
+    ) -> Option<&mut OperationPlanContract> {
+        self.contracts.get_mut(&operation_id)
+    }
+
+    /// 作戦契約のリビジョンを取得する。
+    pub fn contract_revision(&self, operation_id: StrategicOperationId) -> Option<PlanRevision> {
+        self.contracts.get(&operation_id).map(|c| c.revision)
+    }
+
+    /// 作戦契約のアプローチおよび配備目標を安全に更新する。
+    pub fn update_approach_and_target(
+        &mut self,
+        operation_id: StrategicOperationId,
+        approach: Option<OperationApproach>,
+        deployment_target: Option<GridPosition>,
+    ) {
+        if let Some(contract) = self.contracts.get_mut(&operation_id) {
+            if let Some(approach) = approach {
+                contract.approach = approach;
+            }
+            if let Some(target) = deployment_target {
+                contract.deployment_target = Some(target);
+            }
         }
     }
 
@@ -201,7 +236,10 @@ impl PlanContractRegistry {
         }
 
         // 新規作成
-        self.next_operation_id = self.next_operation_id.saturating_add(1);
+        self.next_operation_id = self
+            .next_operation_id
+            .checked_add(1)
+            .expect("StrategicOperationId overflow");
         let op_id = StrategicOperationId(self.next_operation_id);
         let contract = OperationPlanContract {
             operation_id: op_id,
@@ -273,9 +311,10 @@ impl PlanContractRegistry {
         entity: Entity,
         binding: OperationBinding,
         target: GridPosition,
-    ) {
+    ) -> Result<(), RoleAssignmentError> {
+        self.assign_role(binding.operation_id, entity, binding.role)?;
         self.entity_bindings.insert(entity, (binding, target));
-        let _ = self.assign_role(binding.operation_id, entity, binding.role);
+        Ok(())
     }
 
     /// Entityのbindingとdeployment targetを取得する。
@@ -430,10 +469,7 @@ mod tests {
             initial_op, second_op,
             "ReplanReasonがない場合は同じoperation IDを維持しなければならない"
         );
-        let contract = registry
-            .contracts
-            .get(&second_op)
-            .expect("契約が存在すること");
+        let contract = registry.contract(second_op).expect("契約が存在すること");
         assert_eq!(contract.target.entity, target_property);
         assert_eq!(contract.revision, PlanRevision(1));
     }
@@ -498,11 +534,33 @@ mod tests {
             revision: PlanRevision(1),
         };
 
+        let target = TargetProperty {
+            entity: Entity::from_raw(500),
+            position: GridPosition { x: 7, y: 7 },
+        };
+        let contract = OperationPlanContract {
+            operation_id: op_id,
+            revision: PlanRevision(1),
+            target,
+            approach: OperationApproach::Interdict,
+            phase: OperationPhase::Forming,
+            deadline_turn: Some(10),
+            plan_id: Some(plan_id),
+            combat_entity: None,
+            capture_entity: None,
+            production_source: None,
+            deployment_target: Some(GridPosition { x: 7, y: 7 }),
+            is_active: true,
+        };
+        registry.register_contract(contract);
+
         let deployment_target = GridPosition { x: 7, y: 7 };
         let produced_entity = Entity::from_raw(777);
 
         // 生産意図から実Entityへのreconciliationシミュレーション
-        registry.reconcile_produced_binding(produced_entity, binding, deployment_target);
+        registry
+            .reconcile_produced_binding(produced_entity, binding, deployment_target)
+            .unwrap();
 
         let retrieved = registry.get_entity_binding(produced_entity);
         assert!(

@@ -663,7 +663,8 @@ pub fn reconcile_pending_deployments_system(
             && let Some(binding) = assigned.intent.operation_binding
             && let Some(contracts) = contract_registry.as_deref_mut()
         {
-            contracts.reconcile_produced_binding(event.entity, binding, assigned.intent.anchor);
+            let _ =
+                contracts.reconcile_produced_binding(event.entity, binding, assigned.intent.anchor);
         }
     }
     // 失敗した生産命令を翌ターンの同型発注へ誤照合しない。

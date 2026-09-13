@@ -6355,51 +6355,31 @@ fn build_operations(
             }
 
             // V4中央作戦契約との同期
-            if let Some(control) = operation.property_control {
-                let target_entity = scan
-                    .property_entities
-                    .get(&control.property)
-                    .copied()
-                    .unwrap_or_else(|| {
-                        Entity::from_raw(
-                            ((control.property.y as u32) << 16) | (control.property.x as u32),
-                        )
-                    });
-                if let Some(contracts) = contract_registry.as_deref_mut() {
-                    let op_id = contracts.maintain_or_replan(target_entity, control.property, None);
-                    if let Some(contract) = contracts.contracts.get_mut(&op_id) {
-                        contract.approach = match control.approach {
-                            PropertyControlApproach::DirectCapture => {
-                                plan_contract::OperationApproach::DirectCapture
-                            }
-                            PropertyControlApproach::Interdict => {
-                                plan_contract::OperationApproach::Interdict
-                            }
-                            PropertyControlApproach::Recapture => {
-                                plan_contract::OperationApproach::Recapture
-                            }
-                        };
-                        contract.deployment_target = Some(control.property);
+            if let Some(control) = operation.property_control
+                && let Some(contracts) = contract_registry.as_deref_mut()
+                && let Some(&target_entity) = scan.property_entities.get(&control.property)
+            {
+                let op_id = contracts.maintain_or_replan(target_entity, control.property, None);
+                let approach = match control.approach {
+                    PropertyControlApproach::DirectCapture => {
+                        plan_contract::OperationApproach::DirectCapture
                     }
-                    operation.operation_id = Some(op_id);
-                }
-            } else if let Some(objective) = planning_objective {
-                let target_entity = scan
-                    .property_entities
-                    .get(&objective.anchor)
-                    .copied()
-                    .unwrap_or_else(|| {
-                        Entity::from_raw(
-                            ((objective.anchor.y as u32) << 16) | (objective.anchor.x as u32),
-                        )
-                    });
-                if let Some(contracts) = contract_registry.as_deref_mut() {
-                    let op_id = contracts.maintain_or_replan(target_entity, objective.anchor, None);
-                    if let Some(contract) = contracts.contracts.get_mut(&op_id) {
-                        contract.deployment_target = Some(objective.anchor);
+                    PropertyControlApproach::Interdict => {
+                        plan_contract::OperationApproach::Interdict
                     }
-                    operation.operation_id = Some(op_id);
-                }
+                    PropertyControlApproach::Recapture => {
+                        plan_contract::OperationApproach::Recapture
+                    }
+                };
+                contracts.update_approach_and_target(op_id, Some(approach), Some(control.property));
+                operation.operation_id = Some(op_id);
+            } else if let Some(objective) = planning_objective
+                && let Some(contracts) = contract_registry.as_deref_mut()
+                && let Some(&target_entity) = scan.property_entities.get(&objective.anchor)
+            {
+                let op_id = contracts.maintain_or_replan(target_entity, objective.anchor, None);
+                contracts.update_approach_and_target(op_id, None, Some(objective.anchor));
+                operation.operation_id = Some(op_id);
             }
             if operation
                 .property_controls
@@ -8060,17 +8040,7 @@ fn plan_production_with_registry(
         );
         let mut deployment = if effective_slot_kind == SlotKind::Capture {
             let target = capture_mission_target.unwrap_or(operations[op_index].anchor);
-            Some(PlannedDeployment {
-                anchor: target,
-                staging_anchor: operations[op_index].staging_anchor,
-                posture: deployment::DeploymentPosture::Execute,
-                slot_kind: SlotKind::Capture,
-                priority_enemies: Vec::new(),
-                threat_horizon: operations[op_index].threat_horizon,
-                forecast: deployment::DeploymentForecast::default(),
-                plan_step: None,
-                operation_binding: None,
-            })
+            Some(planned_capture_deployment(&operations[op_index], target))
         } else {
             planned_deployment(
                 scan,
@@ -8114,9 +8084,7 @@ fn plan_production_with_registry(
                 }
             };
             let revision = contract_registry
-                .contracts
-                .get(&op_id)
-                .map(|c| c.revision)
+                .contract_revision(op_id)
                 .unwrap_or(plan_revision::PlanRevision(1));
             deployment.operation_binding = Some(plan_contract::OperationBinding {
                 operation_id: op_id,
@@ -9718,6 +9686,21 @@ fn planned_deployment(
         plan_step: None,
         operation_binding: None,
     })
+}
+
+/// 占領スロット専用の計画配備状態を生成する。
+fn planned_capture_deployment(op: &Operation, target: GridPosition) -> PlannedDeployment {
+    PlannedDeployment {
+        anchor: target,
+        staging_anchor: op.staging_anchor,
+        posture: deployment::DeploymentPosture::Execute,
+        slot_kind: SlotKind::Capture,
+        priority_enemies: Vec::new(),
+        threat_horizon: op.threat_horizon,
+        forecast: deployment::DeploymentForecast::default(),
+        plan_step: None,
+        operation_binding: None,
+    }
 }
 
 /// 次に埋めるべき枠を返す。
