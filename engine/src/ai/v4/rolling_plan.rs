@@ -1576,52 +1576,6 @@ fn calculate_assignment_cost(
     }
 }
 
-/// 役割列と施設列の最小費用二部マッチング（Branch and Bound）。
-#[allow(clippy::too_many_arguments)]
-fn solve_min_cost_assignment(
-    role_idx: usize,
-    used_facilities_mask: u32,
-    current_cost: u64,
-    current_assignment: &mut Vec<usize>,
-    best_cost: &mut u64,
-    best_assignment: &mut Vec<usize>,
-    cost_matrix: &[Vec<Option<u64>>],
-    num_facilities: usize,
-) {
-    if role_idx == cost_matrix.len() {
-        if current_cost < *best_cost {
-            *best_cost = current_cost;
-            *best_assignment = current_assignment.clone();
-        }
-        return;
-    }
-
-    for fac_idx in 0..num_facilities {
-        if (used_facilities_mask & (1 << fac_idx)) != 0 {
-            continue;
-        }
-        let Some(cost) = cost_matrix[role_idx][fac_idx] else {
-            continue;
-        };
-        let next_cost = current_cost.saturating_add(cost);
-        if next_cost >= *best_cost {
-            continue;
-        }
-        current_assignment.push(fac_idx);
-        solve_min_cost_assignment(
-            role_idx + 1,
-            used_facilities_mask | (1 << fac_idx),
-            next_cost,
-            current_assignment,
-            best_cost,
-            best_assignment,
-            cost_matrix,
-            num_facilities,
-        );
-        current_assignment.pop();
-    }
-}
-
 /// 単一の部隊編成（マルチセット）に対し、各役割をどの生産施設に配置するのが
 /// 最適（ETAおよび移動距離の総和が最小）かを解き、SearchStateを構築する。
 fn optimize_multiset_facility_assignment(
@@ -1654,24 +1608,9 @@ fn optimize_multiset_facility_assignment(
         cost_matrix.push(row);
     }
 
-    let mut best_cost = u64::MAX;
-    let mut best_assignment = Vec::new();
-    let mut current_assignment = Vec::with_capacity(m);
-
-    solve_min_cost_assignment(
-        0,
-        0,
-        0,
-        &mut current_assignment,
-        &mut best_cost,
-        &mut best_assignment,
-        &cost_matrix,
-        n,
-    );
-
-    if best_cost == u64::MAX {
-        return None;
-    }
+    // 割当は多項式時間のソルバ（assignment.rs）へ委譲する。同点時は施設indexが
+    // 辞書順最小の解が返るため、旧・分枝限定DFSと同じ生産施設が選ばれる。
+    let best_assignment = super::assignment::solve_min_cost_assignment(&cost_matrix, n)?;
 
     let mut state = SearchState::default();
     for (role_i, &fac_idx) in best_assignment.iter().enumerate() {

@@ -12,6 +12,7 @@
 //! 「敵を減らす」と「占領する」は別フェーズではなく同一作戦の別枠として
 //! 同時に立つため、倒してから占領するのではなく並行して進む。
 
+mod assignment;
 pub mod campaign_execution;
 mod combat_profile;
 pub mod deployment;
