@@ -995,7 +995,8 @@ fn resolve_target(
     connectivity: &mut TerrainConnectivity,
     deployment: &AssignedDeployment,
     target_commitments: &HashMap<Entity, usize>,
-) -> Option<(Entity, GridPosition)> {
+    interceptors: usize,
+) -> Option<(Entity, GridPosition, bool)> {
     let map = world.get_resource::<Map>().cloned();
     let anchor = deployment.intent.anchor;
     let player_id = deployment.intent.player_id;
@@ -1008,10 +1009,12 @@ fn resolve_target(
     let is_small_map = map.as_ref().is_some_and(|m| (m.width * m.height) <= 200)
         || crate::ai::strategy_profile::current_profile(world, player_id)
             == crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion;
+    // 上限は「実際に壁役へ割いた数」で数える。従来は目標を持つ全Entity数を合計して
+    // いたため、誰か一体が通常の攻撃目標を得た時点で以後は誰も壁役になれず、
+    // 前線に複数のフリーパス占領が同時に立つと2件目以降を塞げなかった。
     let max_interceptor_quota = if is_small_map { 1 } else { 2 };
-    let total_interceptors: usize = target_commitments.values().sum();
 
-    if total_interceptors < max_interceptor_quota
+    if interceptors < max_interceptor_quota
         && let (Some(m), Some(chart), Some(my_stats)) = (
             map.as_ref(),
             world.get_resource::<DamageChart>(),
@@ -1087,7 +1090,7 @@ fn resolve_target(
                 });
                 let best = urgent_threats[0];
                 let pos = *world.get::<GridPosition>(best).unwrap();
-                return Some((best, pos));
+                return Some((best, pos, true));
             }
         }
     }
@@ -1100,7 +1103,7 @@ fn resolve_target(
         && can_engage(world, connectivity, deployment.entity, enemy)
         && let Some(position) = world.get::<GridPosition>(enemy)
     {
-        return Some((enemy, *position));
+        return Some((enemy, *position, false));
     }
 
     // 3. 現標的が無効なら、購入時に比較した初撃相手の順序で選ぶ。
@@ -1118,7 +1121,7 @@ fn resolve_target(
             continue;
         }
         if let Some(position) = world.get::<GridPosition>(enemy) {
-            return Some((enemy, *position));
+            return Some((enemy, *position, false));
         }
     }
 
@@ -1126,7 +1129,7 @@ fn resolve_target(
         world
             .get::<GridPosition>(enemy)
             .copied()
-            .map(|position| (enemy, position))
+            .map(|position| (enemy, position, false))
     })
 }
 
@@ -1157,6 +1160,7 @@ pub(crate) fn prepare_deployment_squads(
         .collect();
     entities.sort_unstable_by_key(|entity| entity.to_bits());
     let mut target_commitments: HashMap<Entity, usize> = HashMap::new();
+    let mut interceptors = 0_usize;
 
     for entity in entities {
         let Some(snapshot) = registry.assigned.get(&entity).cloned() else {
@@ -1182,9 +1186,18 @@ pub(crate) fn prepare_deployment_squads(
                 if snapshot.intent.slot_kind == SlotKind::Capture {
                     (None, snapshot.intent.anchor, MissionType::Capture)
                 } else {
-                    match resolve_target(world, &mut connectivity, &snapshot, &target_commitments) {
-                        Some((target_entity, target)) => {
+                    match resolve_target(
+                        world,
+                        &mut connectivity,
+                        &snapshot,
+                        &target_commitments,
+                        interceptors,
+                    ) {
+                        Some((target_entity, target, is_wall)) => {
                             *target_commitments.entry(target_entity).or_insert(0) += 1;
+                            if is_wall {
+                                interceptors += 1;
+                            }
                             (Some(target_entity), target, MissionType::Attack)
                         }
                         // Combat排除後も対象拠点の占領完了まではPlanを閉じない。
@@ -1815,6 +1828,7 @@ mod tests {
                 &mut TerrainConnectivity::default(),
                 &deployment,
                 &HashMap::new(),
+                0,
             )
             .map(|target| target.0),
             Some(local_enemy),
