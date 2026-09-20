@@ -5447,6 +5447,13 @@ pub(crate) fn refine_same_land_route_milestones(
 
 /// 橋で分岐する同一陸塊の局地前線を、Gateごとの独立Operationへ分ける。
 /// 必要占領兵と既存所属は一意に配分し、同じEntityを複数ルートへ二重計上しない。
+/// 【一時的な診断専用】campaign quota（required_capture_survivors）と
+/// protected供給（protected_capture_entities）が同一objectiveに帰属しているかを
+/// 突き合わせるための監査。`OPENWARS_CAMPAIGN_SCOPE_AUDIT` 設定時のみ出力する。
+fn campaign_scope_audit_enabled() -> bool {
+    std::env::var_os("OPENWARS_CAMPAIGN_SCOPE_AUDIT").is_some()
+}
+
 fn split_bridge_route_objectives(
     map: &Map,
     objectives: Vec<CampaignPlanningObjective>,
@@ -5625,6 +5632,20 @@ impl BoardScan {
                     .iter()
                     .find(|assessment| assessment.island_id == assignment.island_id)
                     .and_then(|assessment| assessment.friendly_capture_eta);
+                if campaign_scope_audit_enabled() {
+                    eprintln!(
+                        "CAMPAIGN_SCOPE_AUDIT stage=producer turn={} player={:?} island={:?} decision={:?} anchor={:?} requirement_capture_units={} purchase_shortfall_capture_units={} capture_entities={:?} capture_target_positions={:?}",
+                        current_turn,
+                        player_id,
+                        assignment.island_id,
+                        assignment.decision,
+                        assignment.target_position,
+                        assignment.requirement.capture_units,
+                        assignment.purchase_shortfall.capture_units,
+                        assignment.capture_entities,
+                        assignment.capture_target_positions,
+                    );
+                }
                 CampaignPlanningObjective {
                     island_id: assignment.island_id,
                     kind: if assignment.decision
@@ -5844,6 +5865,22 @@ impl BoardScan {
                 &my_units,
                 &unit_targets,
             );
+        }
+        if campaign_scope_audit_enabled() {
+            for (index, objective) in campaign_objectives.iter().enumerate() {
+                eprintln!(
+                    "CAMPAIGN_SCOPE_AUDIT stage=post_split turn={} player={:?} idx={} island={:?} kind={:?} anchor={:?} properties={:?} quota={} protected={:?}",
+                    current_turn,
+                    player_id,
+                    index,
+                    objective.island_id,
+                    objective.kind,
+                    objective.anchor,
+                    objective.objective_properties,
+                    objective.required_capture_survivors,
+                    objective.protected_capture_entities,
+                );
+            }
         }
         let completed_route_island = logistics_plan.as_ref().and_then(|plan| {
             plan.route_islands
@@ -6353,6 +6390,35 @@ fn build_operations(
                     .collect();
                 operation.slots.capture_units =
                     u32::try_from(operation.capture_lane_targets.len()).unwrap_or(u32::MAX);
+            } else if kind == OperationKind::Capture {
+                // 敵競合が存在せず物件制御計画が成立しない平時Capture作戦でも、
+                // cluster内の未取得拠点を重複なく割り当て、同一anchorへの二重配備を防ぐ。
+                let is_anchor_open =
+                    scan.open_properties.contains(&anchor) && cluster.contains(&anchor);
+                let mut targets = Vec::new();
+                if is_anchor_open {
+                    targets.push(anchor);
+                }
+                let mut rest: Vec<GridPosition> = cluster
+                    .iter()
+                    .copied()
+                    .filter(|p| {
+                        scan.open_properties.contains(p) && (!is_anchor_open || *p != anchor)
+                    })
+                    .collect();
+                rest.sort_unstable_by_key(|p| {
+                    (scan.map.distance(anchor.x, anchor.y, p.x, p.y), p.y, p.x)
+                });
+                rest.dedup();
+                targets.extend(rest);
+                operation.capture_lane_targets = targets
+                    .into_iter()
+                    .take(MAX_CAPTURE_SLOTS as usize)
+                    .collect();
+                operation.slots.capture_units = operation
+                    .slots
+                    .capture_units
+                    .min(u32::try_from(operation.capture_lane_targets.len()).unwrap_or(u32::MAX));
             }
 
             // NOTE: V4中央作戦契約との同期は呼び出し元（plan_production_with_registry）で実行する
@@ -6390,6 +6456,22 @@ fn build_operations(
                 });
                 operation.slots.combat_plan_required =
                     u32::from(!operation.reachable_threats.is_empty());
+            }
+            if campaign_scope_audit_enabled() {
+                eprintln!(
+                    "CAMPAIGN_SCOPE_AUDIT stage=binding turn={} op_kind={:?} op_anchor={:?} op_properties={:?} bound={:?}",
+                    scan.current_turn,
+                    operation.kind,
+                    operation.anchor,
+                    operation.objective_properties,
+                    planning_objective.map(|objective| (
+                        objective.island_id,
+                        objective.kind,
+                        objective.anchor,
+                        objective.required_capture_survivors,
+                        objective.protected_capture_entities.len(),
+                    )),
+                );
             }
             if let Some(objective) = planning_objective {
                 operation.island_id = Some(objective.island_id);
@@ -9004,6 +9086,27 @@ fn combat_plan_input(
         .map_or(local_capture_requirement, |objective| {
             local_capture_requirement.max(objective.required_capture_survivors)
         });
+    if campaign_scope_audit_enabled() {
+        eprintln!(
+            "CAMPAIGN_SCOPE_AUDIT stage=quota turn={} op_kind={:?} op_anchor={:?} op_island={:?} op_properties={:?} op_protected={:?} lane_targets={:?} local_requirement={} found={:?} required={}",
+            scan.current_turn,
+            op.kind,
+            op.anchor,
+            op.island_id,
+            op.objective_properties,
+            op.protected_capture_entities,
+            op.capture_lane_targets,
+            local_capture_requirement,
+            campaign_objective.map(|objective| (
+                objective.island_id,
+                objective.kind,
+                objective.anchor,
+                objective.required_capture_survivors,
+                objective.protected_capture_entities.len(),
+            )),
+            required_capture_survivors,
+        );
+    }
     let mut enemies = enemies;
     if enemies.is_empty() && !op.property_controls.is_empty() {
         let reference_infantry = scan
@@ -9126,6 +9229,19 @@ fn combat_plan_input(
         .iter()
         .filter(|unit| unit.protection_completion_turn.is_some())
         .count();
+    if campaign_scope_audit_enabled() {
+        eprintln!(
+            "CAMPAIGN_SCOPE_AUDIT stage=supply turn={} op_kind={:?} op_anchor={:?} required={} existing_units={} existing_protected={} planned_capture_units={} my_units={}",
+            scan.current_turn,
+            op.kind,
+            op.anchor,
+            required_capture_survivors,
+            existing_units.len(),
+            existing_protected_count,
+            op.planned_capture_units.len(),
+            scan.my_units.len(),
+        );
+    }
 
     // この生産判断内で先に発注した専任CaptureだけはまだEntityになっていないため、
     // 実行中の保護対象へ投影する。将来手番の仮想Captureはここでは予約しない。
@@ -14396,6 +14512,117 @@ mod tests {
         assert_eq!(
             trace.produced_counts().values().sum::<usize>(),
             commands.len()
+        );
+    }
+
+    /// 平時Capture作戦で複数の中立物件がある場合、同一anchorへの二重割当を防ぎ別々の目標へ配備する。
+    #[test]
+    fn capture_operation_without_property_controls_assigns_distinct_targets() {
+        let mut scan = multi_factory_scan();
+        let prop_a = pos(6, 2);
+        let prop_b = pos(6, 3);
+        let mut map = flat_map(9, 5);
+        map.set_terrain(prop_a.x, prop_a.y, Terrain::City).unwrap();
+        map.set_terrain(prop_b.x, prop_b.y, Terrain::City).unwrap();
+        scan.map = Arc::new(map);
+        scan.open_properties = vec![prop_a, prop_b];
+        scan.neutral_properties = vec![prop_a, prop_b];
+        scan.campaign_objectives = vec![CampaignPlanningObjective {
+            island_id: crate::ai::islands::IslandId(0),
+            kind: OperationKind::Capture,
+            anchor: prop_a,
+            objective_properties: vec![prop_a, prop_b],
+            capture_eta: None,
+            required_capture_survivors: 0,
+            logistics_rank: Some(0),
+            forced_target_enemies: HashSet::new(),
+            protected_capture_entities: HashSet::new(),
+            capture_replacement_pending: false,
+            staging_anchor: prop_a,
+            execution_authorized: true,
+        }];
+
+        let (commands, _trace) = plan_production(&scan, PlayerId(0), true, &HashMap::new());
+
+        let capture_targets: Vec<GridPosition> = commands
+            .iter()
+            .filter_map(|cmd| {
+                cmd.deployment
+                    .as_ref()
+                    .and_then(|d| (d.slot_kind == SlotKind::Capture).then_some(d.anchor))
+            })
+            .collect();
+
+        assert_eq!(
+            capture_targets.len(),
+            2,
+            "2箇所の未取得中立物件に対して2つの占領枠が購入されること"
+        );
+        assert!(
+            capture_targets.contains(&prop_a) && capture_targets.contains(&prop_b),
+            "中立物件A・Bに対してそれぞれ異なる目標が割り当てられるべきだが、実際には重複または未割当が発生: {capture_targets:?}"
+        );
+    }
+
+    /// 作戦外や占領済み物件を目標に含めず、目標枯渇時に同一anchorへ二重割当しない。
+    #[test]
+    fn capture_operation_filters_out_of_cluster_and_owned_properties_without_duplicate() {
+        let mut scan = multi_factory_scan();
+        let prop_in_cluster_open = pos(6, 2);
+        let prop_in_cluster_owned = pos(6, 3);
+        let prop_out_of_cluster_open = pos(8, 4);
+        let mut map = flat_map(9, 5);
+        map.set_terrain(
+            prop_in_cluster_open.x,
+            prop_in_cluster_open.y,
+            Terrain::City,
+        )
+        .unwrap();
+        map.set_terrain(
+            prop_in_cluster_owned.x,
+            prop_in_cluster_owned.y,
+            Terrain::City,
+        )
+        .unwrap();
+        map.set_terrain(
+            prop_out_of_cluster_open.x,
+            prop_out_of_cluster_open.y,
+            Terrain::City,
+        )
+        .unwrap();
+        scan.map = Arc::new(map);
+        scan.open_properties = vec![prop_in_cluster_open, prop_out_of_cluster_open];
+        scan.neutral_properties = vec![prop_in_cluster_open, prop_out_of_cluster_open];
+        scan.campaign_objectives = vec![CampaignPlanningObjective {
+            island_id: crate::ai::islands::IslandId(0),
+            kind: OperationKind::Capture,
+            anchor: prop_in_cluster_open,
+            objective_properties: vec![prop_in_cluster_open, prop_in_cluster_owned],
+            capture_eta: None,
+            required_capture_survivors: 0,
+            logistics_rank: Some(0),
+            forced_target_enemies: HashSet::new(),
+            protected_capture_entities: HashSet::new(),
+            capture_replacement_pending: false,
+            staging_anchor: prop_in_cluster_open,
+            execution_authorized: true,
+        }];
+
+        let (commands, _trace) = plan_production(&scan, PlayerId(0), true, &HashMap::new());
+
+        let capture_targets: Vec<GridPosition> = commands
+            .iter()
+            .filter_map(|cmd| {
+                cmd.deployment
+                    .as_ref()
+                    .and_then(|d| (d.slot_kind == SlotKind::Capture).then_some(d.anchor))
+            })
+            .collect();
+
+        assert_eq!(
+            capture_targets,
+            vec![prop_in_cluster_open],
+            "合法な目標数（1件）にキャップされ、二重割当や作戦外物件の混入がないこと"
         );
     }
 

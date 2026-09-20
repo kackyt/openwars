@@ -2139,6 +2139,12 @@ fn unavailable_campaign_entities(
     unavailable
 }
 
+/// 【一時的な診断専用】campaign共有poolから自軍Entityが落ちる理由を特定する監査。
+/// `OPENWARS_POOL_AUDIT` 設定時のみ出力する。
+pub(crate) fn pool_audit_enabled() -> bool {
+    std::env::var_os("OPENWARS_POOL_AUDIT").is_some()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_campaign_resource_pool(
     player_id: PlayerId,
@@ -2153,6 +2159,7 @@ fn collect_campaign_resource_pool(
     assigned_transport_phases: &HashMap<Entity, AssignedTransportState>,
     unavailable_entities: &HashSet<Entity>,
     available_funds: u32,
+    audit_turn: u32,
 ) -> CampaignResourcePool {
     let unit_by_entity: HashMap<_, _> = units.iter().map(|unit| (unit.entity, unit)).collect();
     let assigned_by_entity =
@@ -2216,11 +2223,39 @@ fn collect_campaign_resource_pool(
             .saturating_add(loaded_cargo_entities.len() as u32);
         // targetless safe Drop、Completed、関連外cargo、実capacity無しの輸送役は再予約しない。
         // 空Returnだけは次便のpickupへ直接向け直し、帰投だけの空走を挟まない。
-        if unavailable_entities.contains(&unit.entity)
-            || is_offshore_transport && unit.fuel.is_some_and(|fuel| fuel == 0)
-            || is_offshore_transport && (!transport_is_available || available_cargo_slots == 0)
-            || (unit.transporting.is_some() && assigned_island.is_none())
-        {
+        // 【一時的な診断専用】除外理由を先に判定してから継続する。
+        let exclusion_reason = if unavailable_entities.contains(&unit.entity) {
+            Some("unavailable_set")
+        } else if is_offshore_transport && unit.fuel.is_some_and(|fuel| fuel == 0) {
+            Some("transport_fuel_zero")
+        } else if is_offshore_transport && !transport_is_available {
+            Some("transport_state_unavailable")
+        } else if is_offshore_transport && available_cargo_slots == 0 {
+            Some("transport_no_cargo_slot")
+        } else if unit.transporting.is_some() && assigned_island.is_none() {
+            Some("loaded_cargo_without_assignment")
+        } else {
+            None
+        };
+        if pool_audit_enabled() {
+            eprintln!(
+                "POOL_AUDIT stage=producer turn={} player={:?} entity={:?} type={:?} can_capture={} pos=({},{}) island={:?} assigned_island={:?} transporting={:?} excluded={:?}",
+                audit_turn,
+                player_id,
+                unit.entity,
+                unit.stats.unit_type,
+                unit.stats.can_capture,
+                unit.position.x,
+                unit.position.y,
+                island_map
+                    .get_island_at(&unit.position)
+                    .map(|island| island.id),
+                assigned_island,
+                unit.transporting,
+                exclusion_reason,
+            );
+        }
+        if exclusion_reason.is_some() {
             continue;
         }
         let island_id = island_map
@@ -2419,6 +2454,18 @@ pub fn analyze_island_campaign_excluding(
         .map(|registry| registry.campaign_entity_assignments(player_id))
         .unwrap_or_default();
     let mut unavailable_entities = unavailable_campaign_entities(&manager, &units, player_id);
+    let audit_turn = world
+        .get_resource::<MatchState>()
+        .map_or(0, |state| state.current_turn_number.0);
+    if pool_audit_enabled() {
+        let mut squad_unavailable: Vec<_> = unavailable_entities.iter().copied().collect();
+        squad_unavailable.sort_by_key(|entity| entity.to_bits());
+        let mut reserved: Vec<_> = reserved_entities.iter().copied().collect();
+        reserved.sort_by_key(|entity| entity.to_bits());
+        eprintln!(
+            "POOL_AUDIT stage=exclusion_sources turn={audit_turn} player={player_id:?} squad_unavailable={squad_unavailable:?} caller_reserved={reserved:?}"
+        );
+    }
     unavailable_entities.extend(reserved_entities.iter().copied());
     let pool = collect_campaign_resource_pool(
         player_id,
@@ -2433,6 +2480,7 @@ pub fn analyze_island_campaign_excluding(
         &assigned_transport_phases,
         &unavailable_entities,
         available_funds,
+        audit_turn,
     );
 
     let facts_by_island: HashMap<_, _> = facts

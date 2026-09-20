@@ -283,7 +283,13 @@ fn response(
         } else {
             distance(map, data, occupied, unit, threat.property, range, cache)?
         };
-        let travel_ready = availability.saturating_add(future.turns.saturating_sub(1));
+        // 間接武器は移動した手番に撃てない。到着と同時に撃てる前提で派遣すると、
+        // 撃ち返せないまま敵の射程内で手番を終えるだけになる。射点到達後に
+        // 構え直しの1手番を要する兵科は、その分だけ早く出発させる。
+        let setup_turns = u32::from(unit.stats.min_range > 1);
+        let travel_ready = availability
+            .saturating_add(future.turns.saturating_sub(1))
+            .saturating_add(setup_turns);
         let ready = travel_ready.max(threat.arrival);
         (future, threat.property, ready, travel_ready)
     };

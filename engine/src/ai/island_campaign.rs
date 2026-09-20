@@ -1095,6 +1095,34 @@ fn reserve_candidate(
         }
     }
     available = sorted_pool_units(&provisional, island_id);
+    // 【一時的な診断専用】占領役の補充直前に、provisional poolの全Entityと
+    // `sorted_pool_units` の assigned_island フィルタ結果を突き合わせる。
+    if crate::ai::island_campaign_analysis::pool_audit_enabled() {
+        eprintln!(
+            "POOL_AUDIT stage=capture_fill_begin island={:?} decision={:?} required_capture_units={} already_reserved={:?} remaining={} provisional_total={} after_assigned_filter={}",
+            island_id,
+            candidate.assessment.decision,
+            requirement.capture_units,
+            capture_entities,
+            remaining_capture_units,
+            provisional.units.len(),
+            available.len(),
+        );
+        for unit in &provisional.units {
+            let passes_assigned_filter =
+                unit.assigned_island.is_none() || unit.assigned_island == Some(island_id);
+            eprintln!(
+                "POOL_AUDIT stage=capture_fill_unit island={:?} entity={:?} type={:?} can_capture={} unit_island={:?} assigned_island={:?} passes_assigned_filter={}",
+                island_id,
+                unit.entity,
+                unit.unit_type,
+                unit.can_capture,
+                unit.island_id,
+                unit.assigned_island,
+                passes_assigned_filter,
+            );
+        }
+    }
     while remaining_capture_units > 0 {
         let Some(index) = available.iter().position(|unit| unit.can_capture) else {
             break;
@@ -1595,6 +1623,33 @@ pub(crate) fn allocate_campaign_portfolio_with_assessments(
         .cloned()
         .map(|unit| (unit.entity, unit))
         .collect();
+    // 【一時的な診断専用】allocator入口のpoolを記録する。
+    if crate::ai::island_campaign_analysis::pool_audit_enabled() {
+        for unit in &pool.units {
+            eprintln!(
+                "POOL_AUDIT stage=allocator_entry entity={:?} type={:?} can_capture={} can_secure_local={} island={:?} assigned_island={:?} transporting={}",
+                unit.entity,
+                unit.unit_type,
+                unit.can_capture,
+                unit.can_secure_local_property,
+                unit.island_id,
+                unit.assigned_island,
+                unit.is_transporting,
+            );
+        }
+        for candidate in &candidates {
+            eprintln!(
+                "POOL_AUDIT stage=candidate island={:?} decision={:?} capture_units={} transport_slots={} ground_combat_units={} target={:?} existing_op={}",
+                candidate.assessment.island_id,
+                candidate.assessment.decision,
+                candidate.requirement.capture_units,
+                candidate.requirement.transport_slots,
+                candidate.requirement.ground_combat_units,
+                candidate.target_position,
+                candidate.existing_operation.is_some(),
+            );
+        }
+    }
     let mut contest_protections = protect_contest_assets(&candidates, &mut pool);
     reserve_secure_capture_units(
         &candidates
@@ -1604,6 +1659,18 @@ pub(crate) fn allocate_campaign_portfolio_with_assessments(
             .collect::<Vec<_>>(),
         &mut pool,
     );
+    // 【一時的な診断専用】先行予約（Contest保護・Secure現地要員）の適用後を記録する。
+    if crate::ai::island_campaign_analysis::pool_audit_enabled() {
+        let remaining: Vec<_> = pool
+            .units
+            .iter()
+            .map(|unit| (unit.entity, unit.can_capture, unit.assigned_island))
+            .collect();
+        eprintln!(
+            "POOL_AUDIT stage=after_prereservation contest_protected={:?} remaining={:?}",
+            contest_protections, remaining
+        );
+    }
     // V4の兵站計画などが候補の評価を更新している場合は、同じ島の全島評価へ
     // 最新の判断を反映する。候補化されなかった島はここで上書きされない。
     for candidate in &candidates {

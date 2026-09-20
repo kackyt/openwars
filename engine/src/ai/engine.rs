@@ -4870,6 +4870,182 @@ mod tests {
         );
     }
 
+    fn setup_map42_human_turn5_world() -> (World, HashMap<u32, Entity>) {
+        let snapshot: serde_json::Value =
+            serde_json::from_str(include_str!("test_data/map42_human_turn5.json")).unwrap();
+        let data = MasterDataRegistry::load().unwrap();
+        let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &data,
+            "map_42",
+            GridTopology::Hex,
+        )
+        .unwrap();
+
+        let existing_units: Vec<Entity> = world
+            .iter_entities()
+            .filter(|e| e.contains::<UnitStats>())
+            .map(|e| e.id())
+            .collect();
+        for entity in existing_units {
+            world.despawn(entity);
+        }
+
+        let mut settings = crate::ai::PlayerAiSettings::new();
+        settings.set_version(PlayerId(2), crate::ai::AiVersion::V4);
+        world.insert_resource(settings);
+
+        let p2_idx = world
+            .resource::<crate::resources::Players>()
+            .0
+            .iter()
+            .position(|p| p.id == PlayerId(2))
+            .unwrap();
+        {
+            let mut match_state = world.resource_mut::<crate::resources::MatchState>();
+            match_state.current_turn_number.0 = 5;
+            match_state.active_player_index = crate::resources::PlayerIndex(p2_idx);
+            match_state.current_phase = crate::resources::Phase::Main;
+        }
+
+        for funds in snapshot["players_funds"].as_array().unwrap() {
+            let id = PlayerId(funds[0].as_u64().unwrap() as u32);
+            world
+                .resource_mut::<crate::resources::Players>()
+                .0
+                .iter_mut()
+                .find(|player| player.id == id)
+                .unwrap()
+                .funds = funds[1].as_u64().unwrap() as u32;
+        }
+
+        for property in snapshot["properties"].as_array().unwrap() {
+            let at = GridPosition {
+                x: property["x"].as_u64().unwrap() as usize,
+                y: property["y"].as_u64().unwrap() as usize,
+            };
+            let owner = property["owner"]
+                .as_u64()
+                .map(|owner| PlayerId(owner as u32));
+            let entity = world
+                .iter_entities()
+                .find(|entity| {
+                    entity.get::<GridPosition>() == Some(&at) && entity.contains::<Property>()
+                })
+                .unwrap()
+                .id();
+            world.get_mut::<Property>(entity).unwrap().owner_id = owner;
+        }
+
+        if let Some(captures) = snapshot
+            .get("capture_progress_in_flight")
+            .and_then(|c| c.as_array())
+        {
+            for cp in captures {
+                let at = GridPosition {
+                    x: cp["x"].as_u64().unwrap() as usize,
+                    y: cp["y"].as_u64().unwrap() as usize,
+                };
+                let remaining = cp["remaining_capture_points"].as_u64().unwrap() as u32;
+                let entity = world
+                    .iter_entities()
+                    .find(|entity| {
+                        entity.get::<GridPosition>() == Some(&at) && entity.contains::<Property>()
+                    })
+                    .unwrap()
+                    .id();
+                world.get_mut::<Property>(entity).unwrap().capture_points = remaining;
+            }
+        }
+
+        let mut entity_by_index = HashMap::new();
+        for source in snapshot["units"].as_array().unwrap() {
+            let kind: UnitType = serde_json::from_value(source["unit_type"].clone()).unwrap();
+            let stats = data
+                .create_unit_stats(&UnitName(kind.as_str().to_owned()))
+                .unwrap();
+            let at = GridPosition {
+                x: source["x"].as_u64().unwrap() as usize,
+                y: source["y"].as_u64().unwrap() as usize,
+            };
+            let has_moved = source
+                .get("has_moved")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let action_completed = source
+                .get("action_completed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let entity = world
+                .spawn((
+                    at,
+                    Faction(PlayerId(source["player"].as_u64().unwrap() as u32)),
+                    Health {
+                        current: source["hp"].as_u64().unwrap() as u32,
+                        max: 100,
+                    },
+                    crate::components::Fuel {
+                        current: source["fuel"].as_u64().unwrap() as u32,
+                        max: stats.max_fuel,
+                    },
+                    crate::components::Ammo {
+                        ammo1: source["ammo1"].as_u64().unwrap() as u32,
+                        ammo2: source["ammo2"].as_u64().unwrap() as u32,
+                        max_ammo1: stats.max_ammo1,
+                        max_ammo2: stats.max_ammo2,
+                    },
+                    HasMoved(has_moved),
+                    ActionCompleted(action_completed),
+                    stats,
+                ))
+                .id();
+            let idx = source["entity_index"].as_u64().unwrap() as u32;
+            entity_by_index.insert(idx, entity);
+        }
+
+        (world, entity_by_index)
+    }
+
+    #[test]
+    fn reference_map42_turn5_heavyspgun_shoots_rockets_from_city() {
+        // 人間対局の知見: 自走砲は移動せず射程4の敵ロケット砲を安全に間接射撃すべき（コールドスタート再現、Squad履歴なし）
+        let (mut world, entities) = setup_map42_human_turn5_world();
+        let gun = entities[&77];
+        let target_rocket = entities[&75];
+
+        let (actor, command) = decide_ai_action_v2_for_entities(
+            &mut world,
+            PlayerId(2),
+            &HashSet::new(),
+            Some(&HashSet::from([gun])),
+        )
+        .expect("自走砲の行動決定が得られること");
+
+        assert_eq!(actor, gun, "自走砲自身が行動すること");
+        assert!(
+            matches!(command, AiCommand::Attack { target_entity, target_pos }
+            if target_entity == target_rocket && target_pos == GridPosition { x: 3, y: 5 }),
+            "自走砲(3,5)は移動せず(3,5)から敵ロケット砲(6,8)を攻撃すること。実際の結果: {command:?}"
+        );
+    }
+
+    #[test]
+    fn reference_map42_turn5_global_v4_first_command_is_heavyspgun_attack() {
+        // 全体V4実行でも自走砲による敵ロケット砲への間接射撃が初手として選ばれることを検証する
+        let (mut world, entities) = setup_map42_human_turn5_world();
+        let target_rocket = entities[&75];
+
+        let first_command = execute_ai_turn_v2(&mut world, PlayerId(2));
+        let expected_command = format!(
+            "Attack {{ target_pos: GridPosition {{ x: 3, y: 5 }}, target_entity: {:?} }}",
+            target_rocket
+        );
+        assert_eq!(
+            first_command.as_deref(),
+            Some(expected_command.as_str()),
+            "全体V4初手で自走砲によるロケット砲への間接攻撃が実行されること"
+        );
+    }
+
     #[test]
     fn v3_turn_cache_marks_squad_plan_until_cleared() {
         let player = PlayerId(1);
