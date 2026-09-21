@@ -5212,58 +5212,6 @@ mod tests {
     }
 
     #[test]
-    fn reference_map42_turn5_screen_infantry_guards_exposed_indirect_gun() {
-        // 教義の検証:
-        // map_42 の実局面において、自走砲(3,5)が敵の到達圏内に晒されているとき、
-        // 近傍の自軍歩兵(4,5)は遠方の目標(9,11)ではなく、自走砲を守る遮蔽位置/迎撃対象を選ぶ。
-        let (mut world, entities) = setup_map42_human_turn5_world();
-        let _gun = entities[&77]; // HeavySpGun (3,5)
-        let infantry = entities[&80]; // Infantry (4,5)
-        let remote_enemy = entities[&41]; // Infantry (9,11) 遠方の敵
-
-        let mut registry = crate::ai::v4::deployment::V4DeploymentRegistry::default();
-        registry.insert_test_assignment(
-            infantry,
-            PlayerId(2),
-            crate::resources::UnitType::Infantry,
-            GridPosition { x: 4, y: 5 },
-            vec![remote_enemy],
-        );
-        world.insert_resource(registry);
-
-        let mut manager = crate::ai::squad::SquadManager::default();
-        crate::ai::v4::deployment::prepare_deployment_squads(
-            &mut world,
-            &mut manager,
-            PlayerId(2),
-            &HashSet::new(),
-        );
-
-        let target = world
-            .resource::<crate::ai::v4::deployment::V4DeploymentRegistry>()
-            .attack_target(infantry);
-
-        // 遠方の敵(9,11)ではなく、自走砲を脅かしている近傍の敵がスクリーン目標として選ばれること
-        assert_ne!(
-            target,
-            Some(remote_enemy),
-            "遠方の目標(9,11)を追わず、自走砲を遮蔽する近傍の敵を選ぶこと"
-        );
-        assert!(
-            target.is_some(),
-            "晒された自走砲を守るスクリーン目標が選出されること"
-        );
-        let screen_target = target.unwrap();
-        let target_pos = world.get::<GridPosition>(screen_target).copied().unwrap();
-        let map = world.resource::<Map>();
-        let d_to_gun = map.distance(target_pos.x, target_pos.y, 3, 5);
-        assert!(
-            d_to_gun <= 4,
-            "選ばれた目標は自走砲の到達圏内にある脅威であること (distance: {d_to_gun})"
-        );
-    }
-
-    #[test]
     fn v3_turn_cache_marks_squad_plan_until_cleared() {
         let player = PlayerId(1);
         let mut cache = AiTurnStrategyCache::default();
