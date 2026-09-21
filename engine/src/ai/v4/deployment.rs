@@ -989,6 +989,191 @@ fn is_uncontested_capture_threat(
     true
 }
 
+/// 自軍ユニットが現在立っているタイルで、現在進行形で物件を占領/修復中であるかを判定する。
+///
+/// 【教義・ゲームルール】
+/// 進行中の占領を中断して壁役に転用するのは戦術的退行となる。現在地が未占領物件または
+/// 被ダメージ物件であり、占領ポイントを詰めているユニットは絶対に引き剥がしてはならない。
+fn is_actively_capturing(world: &World, player_id: PlayerId, pos: GridPosition) -> bool {
+    world.iter_entities().any(|e| {
+        if e.get::<GridPosition>() != Some(&pos) {
+            return false;
+        }
+        let Some(prop) = e.get::<Property>() else {
+            return false;
+        };
+        if prop.max_capture_points == 0 {
+            return false;
+        }
+        // 自軍未所有の物件、または自軍所有だがHPが減っていて再占領/修復が必要
+        prop.owner_id != Some(player_id) || prop.capture_points < prop.max_capture_points
+    })
+}
+
+/// ユニットが特定のアンカー物件に対する専任占領任務として移動中であるかを判定する。
+///
+/// 【教義・ゲームルール】
+/// 占領スロットで購入された歩兵であっても、アンカー物件が既に自軍所有かつ占領度満タンで
+/// 完了している場合や、既に別の味方ユニットがその物件上に乗って占領している場合、
+/// 当該ユニットは「占領に余剰」である。その余剰戦力を遊兵とせず、直接阻止壁として動員する。
+fn is_dedicated_capture_in_progress(
+    world: &World,
+    player_id: PlayerId,
+    my_entity: Entity,
+    anchor: GridPosition,
+) -> bool {
+    let mut property_needs_capture = false;
+    let mut occupied_by_other_friendly = false;
+
+    for e in world.iter_entities() {
+        if e.get::<GridPosition>() == Some(&anchor) {
+            if let Some(prop) = e.get::<Property>()
+                && prop.max_capture_points > 0
+                && (prop.owner_id != Some(player_id)
+                    || prop.capture_points < prop.max_capture_points)
+            {
+                property_needs_capture = true;
+            }
+            if e.id() != my_entity
+                && e.get::<Faction>().is_some_and(|f| f.0 == player_id)
+                && e.get::<Health>().is_some_and(|h| h.current > 0)
+            {
+                occupied_by_other_friendly = true;
+            }
+        }
+    }
+
+    property_needs_capture && !occupied_by_other_friendly
+}
+
+/// 敵の到達圏内（移動力＋射程内）に晒されている味方間接ユニットを保護するため、
+/// その間接ユニットと敵の接近経路の間に立てる直接攻撃ユニットが
+/// 優先的に遮蔽（スクリーン）・迎撃すべき敵ユニットを探索する。
+///
+/// 【教義】
+/// 味方の間接攻撃ユニット（min_range > 1）が敵の到達圏内にあるとき、
+/// その間接ユニットと敵の接近経路の間に立てる直接攻撃ユニット（min_range <= 1）は、
+/// 自分の遠方の目標を追うよりも、そこに立つことを優先する。
+fn find_indirect_screening_threat(
+    world: &World,
+    map: &Map,
+    deployment: &AssignedDeployment,
+    my_stats: &UnitStats,
+    my_pos: GridPosition,
+    target_commitments: &HashMap<Entity, usize>,
+    connectivity: &mut TerrainConnectivity,
+) -> Option<(Entity, GridPosition)> {
+    let player_id = deployment.intent.player_id;
+    // 1. 自軍の健全な間接攻撃ユニット（min_range > 1）を収集
+    let friendly_indirects: Vec<(Entity, GridPosition, UnitStats)> = world
+        .iter_entities()
+        .filter_map(|e| {
+            let faction = e.get::<Faction>()?;
+            if faction.0 != player_id {
+                return None;
+            }
+            let health = e.get::<Health>()?;
+            if health.current == 0 {
+                return None;
+            }
+            let stats = e.get::<UnitStats>()?;
+            if stats.min_range <= 1 {
+                return None;
+            }
+            let pos = *e.get::<GridPosition>()?;
+            Some((e.id(), pos, stats.clone()))
+        })
+        .collect();
+
+    if friendly_indirects.is_empty() {
+        return None;
+    }
+
+    let my_reach = my_stats.max_movement.saturating_add(my_stats.max_range);
+    let mut candidate_threats = Vec::new();
+
+    for enemy_entity in world.iter_entities().filter_map(|e| {
+        let faction = e.get::<Faction>()?;
+        if faction.0 == player_id {
+            return None;
+        }
+        let health = e.get::<Health>()?;
+        if health.current == 0 {
+            return None;
+        }
+        let pos = *e.get::<GridPosition>()?;
+        let stats = e.get::<UnitStats>()?;
+        Some((e.id(), pos, stats.clone()))
+    }) {
+        let (enemy_id, enemy_pos, enemy_stats) = enemy_entity;
+
+        // 1体の敵に対して過剰に全軍が集中し、他の前線が崩壊するのを防ぐ（最大2体でスクリーン）
+        if target_commitments.get(&enemy_id).copied().unwrap_or(0) >= 2 {
+            continue;
+        }
+
+        let dist_my_to_enemy = map.distance(my_pos.x, my_pos.y, enemy_pos.x, enemy_pos.y);
+        if dist_my_to_enemy > my_reach {
+            // 今手番内で圧力をかけられない遠方からは、直前のスクリーン役を果たせない
+            continue;
+        }
+
+        if !can_engage(world, connectivity, deployment.entity, enemy_id) {
+            continue;
+        }
+
+        for &(_indirect_id, indirect_pos, _) in &friendly_indirects {
+            let dist_enemy_to_indirect =
+                map.distance(enemy_pos.x, enemy_pos.y, indirect_pos.x, indirect_pos.y);
+
+            // 脅威判定（engine/src/ai/threat.rs に基づく非対称性モデル）:
+            // 直接攻撃敵は移動力+射程で到達可能、間接攻撃敵は現在射程内
+            let is_threat = if enemy_stats.min_range <= 1 {
+                dist_enemy_to_indirect
+                    <= enemy_stats
+                        .max_movement
+                        .saturating_add(enemy_stats.max_range)
+            } else {
+                dist_enemy_to_indirect >= enemy_stats.min_range
+                    && dist_enemy_to_indirect <= enemy_stats.max_range
+            };
+
+            if !is_threat {
+                continue;
+            }
+
+            // 自機が「間接ユニットと敵の接近経路の間」に立てるか:
+            // - 自機が間接ユニットの防護圏内（移動2回以内）にある
+            // - 自機の方が間接ユニットよりも敵に近いか同等（敵の正面・進路上に出ている）
+            let dist_my_to_indirect =
+                map.distance(my_pos.x, my_pos.y, indirect_pos.x, indirect_pos.y);
+            let in_protection_radius =
+                dist_my_to_indirect <= my_stats.max_movement.saturating_mul(2);
+            let is_between = dist_my_to_enemy <= dist_enemy_to_indirect;
+
+            if in_protection_radius && is_between {
+                candidate_threats.push((
+                    dist_enemy_to_indirect,
+                    dist_my_to_enemy,
+                    enemy_id,
+                    enemy_pos,
+                ));
+            }
+        }
+    }
+
+    if candidate_threats.is_empty() {
+        return None;
+    }
+
+    // 間接ユニットへ最も肉薄している敵を最優先とし、次いで自機に近い敵を選ぶ
+    candidate_threats
+        .sort_unstable_by_key(|&(d_indirect, d_my, e_id, _)| (d_indirect, d_my, e_id.to_bits()));
+
+    let (_, _, best_enemy, best_pos) = candidate_threats[0];
+    Some((best_enemy, best_pos))
+}
+
 /// 優先敵の現在位置を追跡し、消滅・到達不能時だけ局地敵へ再目標化する。
 fn resolve_target(
     world: &mut World,
@@ -1001,96 +1186,129 @@ fn resolve_target(
     let anchor = deployment.intent.anchor;
     let player_id = deployment.intent.player_id;
 
-    // 1. 防衛対象へのフリーパス侵入の阻止（壁役・迎撃役の緊急選出）:
-    //    部隊全体を引き上げる必要はなく、壁役・迎撃役は最大1体（小規模マップ）で十分。
-    //    すでに1体でも迎撃役が割り当てられているなら、過剰な引き返し（オーバーコミット）を防ぎ、
-    //    主力の攻勢・各個撃破（Focus Fire）を維持する。
-    //    また、壁役は能力値・ダメージ相性から「相手に倒されず、その手番で防ぎに向かえる」ユニットのみを選出する。
-    let is_small_map = map.as_ref().is_some_and(|m| (m.width * m.height) <= 200)
-        || crate::ai::strategy_profile::current_profile(world, player_id)
-            == crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion;
-    // 上限は「実際に壁役へ割いた数」で数える。従来は目標を持つ全Entity数を合計して
-    // いたため、誰か一体が通常の攻撃目標を得た時点で以後は誰も壁役になれず、
-    // 前線に複数のフリーパス占領が同時に立つと2件目以降を塞げなかった。
-    let max_interceptor_quota = if is_small_map { 1 } else { 2 };
-
-    if interceptors < max_interceptor_quota
-        && let (Some(m), Some(chart), Some(my_stats)) = (
-            map.as_ref(),
-            world.get_resource::<DamageChart>(),
-            world.get::<UnitStats>(deployment.entity),
-        )
-    {
+    // 1. 防衛・遮蔽（壁役・迎撃役・スクリーン役の緊急選出）:
+    //    【教義】
+    //    (a) フリーパス占領の阻止: 自軍拠点が無血開城される脅威に対して、迎撃可能ユニットを向かわせる。
+    //    (b) 味方間接ユニットのスクリーン: 味方間接ユニット（min_range > 1）が敵の到達圏内にあるとき、
+    //        その間接ユニットと敵の接近経路の間に立てる直接攻撃ユニット（min_range <= 1）は、
+    //        自分の遠方の目標を追うよりも、そこに立つことを優先する。
+    //    進行中の占領任務をみだりに中断するのは退行だが、非占領枠の歩兵や、
+    //    占領目標が完了・重複して余剰となった歩兵は、安価な直接阻止戦力として防衛線形成に動員する。
+    if let (Some(m), Some(chart), Some(my_stats)) = (
+        map.as_ref(),
+        world.get_resource::<DamageChart>(),
+        world.get::<UnitStats>(deployment.entity),
+    ) {
         let my_hp = world
             .get::<Health>(deployment.entity)
             .map_or(0, |h| h.current);
         let my_pos = world.get::<GridPosition>(deployment.entity).copied();
 
-        // 壁役の適格条件（兵種ハードコードなし、能力値・状態から判定）:
-        // 1. 直接反撃可能（近接で一方的に殴られない）
-        // 2. 占領専任ユニットではない
-        // 3. 健全な残HP（相手に倒されない）
-        let can_act_as_wall =
-            my_stats.min_range <= 1 && !my_stats.can_capture && my_hp >= 70 && my_pos.is_some();
+        // 壁役・スクリーン役の適格条件（兵種ハードコードなし、能力値・状態・教義から判定）:
+        // 1. 直接反撃可能（min_range <= 1: 近接で一方的に殴られない）
+        // 2. 進行中の占領を妨げない（占領専任ユニットを占領から引き剥がさないが、
+        //    占領枠以外で生産された歩兵や、占領対象が完了・重複して余っている歩兵は動員する）
+        // 3. 健全な残HP（my_hp >= 70: 相手に即座に撃破されない）
+        let is_capturing_or_dedicated = if my_stats.can_capture {
+            if let Some(pos) = my_pos {
+                if is_actively_capturing(world, player_id, pos) {
+                    true
+                } else if deployment.intent.slot_kind == SlotKind::Capture {
+                    is_dedicated_capture_in_progress(world, player_id, deployment.entity, anchor)
+                } else {
+                    false
+                }
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+
+        let can_act_as_wall = my_stats.min_range <= 1
+            && !is_capturing_or_dedicated
+            && my_hp >= 70
+            && my_pos.is_some();
 
         if can_act_as_wall && let Some(my_pos) = my_pos {
-            let mut urgent_threats = deployment
-                .intent
-                .priority_enemies
-                .iter()
-                .copied()
-                .filter(|&candidate| {
-                    if target_commitments.get(&candidate).copied().unwrap_or(0) >= 1 {
-                        return false;
-                    }
-                    let Some(candidate_stats) = world.get::<UnitStats>(candidate) else {
-                        return false;
-                    };
-                    // 相手からの被ダメージが小さく、相手に倒されない（装甲・防御相性の判定）
-                    let incoming_damage = chart
-                        .get_base_damage(candidate_stats.unit_type, my_stats.unit_type)
-                        .unwrap_or(0)
-                        .max(
-                            chart
-                                .get_base_damage_secondary(
-                                    candidate_stats.unit_type,
-                                    my_stats.unit_type,
-                                )
-                                .unwrap_or(0),
-                        );
-                    if incoming_damage > 25 {
-                        return false;
-                    }
+            // (a) フリーパス占領脅威の迎撃選出
+            let is_small_map = m.width * m.height <= 200
+                || crate::ai::strategy_profile::current_profile(world, player_id)
+                    == crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion;
+            let max_interceptor_quota = if is_small_map { 1 } else { 2 };
 
-                    if let Some(pos) = world.get::<GridPosition>(candidate).copied()
-                        && target_within_operation(world, deployment, candidate)
-                        && can_engage(world, connectivity, deployment.entity, candidate)
-                        && is_uncontested_capture_threat(
-                            world, m, player_id, candidate, pos, anchor,
-                        )
-                    {
-                        // 「そのターンで防ぎに向かえる」判定:
-                        // 自機の移動力＋最大射程で、そのターン内に敵を捕捉・攻撃できる距離にいる
-                        let dist_to_enemy = m.distance(my_pos.x, my_pos.y, pos.x, pos.y);
-                        let reach_this_turn =
-                            my_stats.max_movement.saturating_add(my_stats.max_range);
-                        dist_to_enemy <= reach_this_turn
-                    } else {
-                        false
-                    }
-                })
-                .collect::<Vec<_>>();
+            if interceptors < max_interceptor_quota {
+                let mut urgent_threats = deployment
+                    .intent
+                    .priority_enemies
+                    .iter()
+                    .copied()
+                    .filter(|&candidate| {
+                        if target_commitments.get(&candidate).copied().unwrap_or(0) >= 1 {
+                            return false;
+                        }
+                        let Some(candidate_stats) = world.get::<UnitStats>(candidate) else {
+                            return false;
+                        };
+                        // 相手からの被ダメージが小さく、相手に倒されない（装甲・防御相性の判定）
+                        let incoming_damage = chart
+                            .get_base_damage(candidate_stats.unit_type, my_stats.unit_type)
+                            .unwrap_or(0)
+                            .max(
+                                chart
+                                    .get_base_damage_secondary(
+                                        candidate_stats.unit_type,
+                                        my_stats.unit_type,
+                                    )
+                                    .unwrap_or(0),
+                            );
+                        if incoming_damage > 25 {
+                            return false;
+                        }
 
-            if !urgent_threats.is_empty() {
-                urgent_threats.sort_unstable_by_key(|&candidate| {
-                    let c_pos = *world.get::<GridPosition>(candidate).unwrap();
-                    let d_anchor = m.distance(anchor.x, anchor.y, c_pos.x, c_pos.y);
-                    let d_unit = m.distance(my_pos.x, my_pos.y, c_pos.x, c_pos.y);
-                    (d_anchor, d_unit, candidate.to_bits())
-                });
-                let best = urgent_threats[0];
-                let pos = *world.get::<GridPosition>(best).unwrap();
-                return Some((best, pos, true));
+                        if let Some(pos) = world.get::<GridPosition>(candidate).copied()
+                            && target_within_operation(world, deployment, candidate)
+                            && can_engage(world, connectivity, deployment.entity, candidate)
+                            && is_uncontested_capture_threat(
+                                world, m, player_id, candidate, pos, anchor,
+                            )
+                        {
+                            let dist_to_enemy = m.distance(my_pos.x, my_pos.y, pos.x, pos.y);
+                            let reach_this_turn =
+                                my_stats.max_movement.saturating_add(my_stats.max_range);
+                            dist_to_enemy <= reach_this_turn
+                        } else {
+                            false
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                if !urgent_threats.is_empty() {
+                    urgent_threats.sort_unstable_by_key(|&candidate| {
+                        let c_pos = *world.get::<GridPosition>(candidate).unwrap();
+                        let d_anchor = m.distance(anchor.x, anchor.y, c_pos.x, c_pos.y);
+                        let d_unit = m.distance(my_pos.x, my_pos.y, c_pos.x, c_pos.y);
+                        (d_anchor, d_unit, candidate.to_bits())
+                    });
+                    let best = urgent_threats[0];
+                    let pos = *world.get::<GridPosition>(best).unwrap();
+                    return Some((best, pos, true));
+                }
+            }
+
+            // (b) 晒された味方間接ユニットのスクリーン（遮蔽）選出
+            // 【教義】味方の間接ユニットが敵の到達圏内にあるとき、その間接ユニットと
+            // 敵の接近経路の間に立てる直接攻撃ユニットは、遠方の目標を追うよりもそこに立つ。
+            if let Some((screen_target, screen_pos)) = find_indirect_screening_threat(
+                world,
+                m,
+                deployment,
+                my_stats,
+                my_pos,
+                target_commitments,
+                connectivity,
+            ) {
+                return Some((screen_target, screen_pos, true));
             }
         }
     }
@@ -1182,8 +1400,19 @@ pub(crate) fn prepare_deployment_squads(
                 (None, snapshot.intent.staging_anchor, MissionType::Defense)
             }
             DeploymentPosture::Execute => {
-                // 占領スロットの場合はターゲット解決を行わず、直接占領任務を割り当てる
-                if snapshot.intent.slot_kind == SlotKind::Capture {
+                // 占領スロットであっても、アンカー物件が未完了（未所有または被ダメージ）で、
+                // かつ他に味方占領ユニットが乗っていない場合のみ専任占領任務として継続する。
+                // 既に占領完了している、または他ユニットで充足している「占領に余剰なユニット」は、
+                // ターゲット解決（壁役・スクリーン役・通常攻撃）へ進め、防衛戦力として動員する。
+                let is_dedicated_capture = snapshot.intent.slot_kind == SlotKind::Capture
+                    && is_dedicated_capture_in_progress(
+                        world,
+                        player_id,
+                        entity,
+                        snapshot.intent.anchor,
+                    );
+
+                if is_dedicated_capture {
                     (None, snapshot.intent.anchor, MissionType::Capture)
                 } else {
                     match resolve_target(
@@ -1262,6 +1491,61 @@ pub(crate) fn prepare_deployment_squads(
     }
     world.insert_resource(registry);
     reserved
+}
+
+#[cfg(test)]
+impl V4DeploymentRegistry {
+    pub(crate) fn insert_test_assignment(
+        &mut self,
+        entity: Entity,
+        player_id: PlayerId,
+        unit_type: UnitType,
+        anchor: GridPosition,
+        priority_enemies: Vec<Entity>,
+    ) {
+        self.assigned.insert(
+            entity,
+            AssignedDeployment {
+                entity,
+                intent: PendingDeployment {
+                    player_id,
+                    turn: 1,
+                    order: 0,
+                    facility: anchor,
+                    unit_type,
+                    anchor,
+                    staging_anchor: anchor,
+                    posture: DeploymentPosture::Execute,
+                    slot_kind: SlotKind::Combat,
+                    priority_enemies,
+                    threat_horizon: 5,
+                    forecast: DeploymentForecast::default(),
+                    plan_step: None,
+                    forming_slot: None,
+                    operation_binding: None,
+                },
+                squad_id: None,
+                current_target: None,
+                active: true,
+                assigned_turn: 1,
+                attack_count: 0,
+                priority_attack_count: 0,
+                mission_target_attack_count: 0,
+                mission_target_kill_count: 0,
+                mission_target_damage_value_dealt: 0,
+                mission_target_counter_value_received: 0,
+                mission_target_destroyed_value: 0,
+                mission_target_first_attack_turn: None,
+                capture_unit_attack_count: 0,
+                transport_unit_attack_count: 0,
+                kill_count: 0,
+                damage_value_dealt: 0,
+                counter_value_received: 0,
+                destroyed_value: 0,
+                first_attack_turn: None,
+            },
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1927,6 +2211,120 @@ mod tests {
         assert_eq!(
             local_retarget(&mut world, &mut TerrainConnectivity::default(), &deployment),
             Some(nearby_enemy)
+        );
+    }
+
+    #[test]
+    fn exposed_indirect_unit_is_screened_by_nearby_direct_unit() {
+        // 教義の検証:
+        // 味方の間接攻撃ユニットが敵の到達圏内にあるとき、
+        // その間接ユニットと敵の接近経路の間に立てる直接攻撃ユニットは、
+        // 自分の遠方の目標を追うよりも、そこに立つことを優先する。
+        let mut world = World::new();
+        world.insert_resource(Map::new(12, 1, Terrain::Plains, GridTopology::Square));
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+        let mut chart = DamageChart::new();
+        chart.insert_damage(UnitType::Tank, UnitType::Artillery, 50);
+        chart.insert_damage(UnitType::Tank, UnitType::Infantry, 40);
+        chart.insert_damage(UnitType::Infantry, UnitType::Tank, 20);
+        chart.insert_damage(UnitType::Infantry, UnitType::Infantry, 50);
+        world.insert_resource(chart);
+
+        // 自軍 P1: 間接ユニット (2, 0) - min_range: 3, max_range: 5
+        let friendly_indirect = world
+            .spawn((
+                Faction(PlayerId(1)),
+                GridPosition { x: 2, y: 0 },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                UnitStats {
+                    unit_type: UnitType::Artillery,
+                    can_capture: false,
+                    min_range: 3,
+                    max_range: 5,
+                    max_movement: 3,
+                    ..UnitStats::mock()
+                },
+            ))
+            .id();
+
+        // 自軍 P1: 直接攻撃歩兵 (3, 0) - 間接ユニット (2,0) と敵 (5,0) の間に位置
+        let friendly_infantry = world
+            .spawn((
+                Faction(PlayerId(1)),
+                GridPosition { x: 3, y: 0 },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                UnitStats {
+                    unit_type: UnitType::Infantry,
+                    can_capture: true,
+                    min_range: 1,
+                    max_range: 1,
+                    max_movement: 3,
+                    ..UnitStats::mock()
+                },
+            ))
+            .id();
+
+        // 敵軍 P2: 近傍の直接攻撃敵 (5, 0) -> (2, 0) までの距離3 <= 移動力3+射程1 なので間接ユニットに届く脅威
+        let threatening_enemy = world
+            .spawn((
+                Faction(PlayerId(2)),
+                GridPosition { x: 5, y: 0 },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    can_capture: false,
+                    min_range: 1,
+                    max_range: 1,
+                    max_movement: 3,
+                    ..UnitStats::mock()
+                },
+            ))
+            .id();
+
+        // 敵軍 P2: 遠方の敵 (9, 0) - 自軍歩兵の発注時優先敵
+        let remote_priority_enemy = world
+            .spawn((
+                Faction(PlayerId(2)),
+                GridPosition { x: 9, y: 0 },
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                combat_stats(UnitType::Infantry, true, 0),
+            ))
+            .id();
+
+        let mut registry = V4DeploymentRegistry::default();
+        registry.insert_test_assignment(
+            friendly_infantry,
+            PlayerId(1),
+            UnitType::Infantry,
+            GridPosition { x: 5, y: 0 },
+            vec![remote_priority_enemy],
+        );
+        world.insert_resource(registry);
+
+        let mut manager = SquadManager::default();
+        prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::new());
+
+        let attack_target = world
+            .resource::<V4DeploymentRegistry>()
+            .attack_target(friendly_infantry);
+
+        assert!(world.get_entity(friendly_indirect).is_ok());
+        assert_eq!(
+            attack_target,
+            Some(threatening_enemy),
+            "晒された味方間接ユニットを守るため、遠方の目標ではなく近傍の脅威敵をスクリーンすること"
         );
     }
 }
