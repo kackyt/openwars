@@ -2384,6 +2384,28 @@ fn production_facility_blockade_value(terrain: Terrain, registry: &MasterDataReg
     }
 }
 
+/// 敵の補充依存度を分数 (分子, 分母) で返す。占位（blockade）の実効価値係数。
+///
+/// 占位が止められるのは「敵生産マス1つあたり毎ターン1体の補充」であり、
+/// その価値は敵の次ターン戦力に占める補充の割合、すなわち
+/// 生産能力 / (生産能力 + 現有戦力) に比例する。
+///
+/// - 敵が大軍を擁する序盤〜中盤はこの割合が小さい。補充1体を止める利得より、
+///   自軍1体を占位に貼り付けて遊ばせる損のほうが大きいため、占位は事実上無効になる。
+/// - 敵が消耗し、補充だけが生命線になった終盤で最大化し、全滅勝利を後押しする。
+///
+/// 魔法定数を持たず、盤面から導出した比率だけで判断する。
+fn enemy_replacement_dependence(production_capacity: usize, fielded_units: usize) -> (u32, u32) {
+    let capacity = production_capacity as u32;
+    let denominator = capacity.saturating_add(fielded_units as u32);
+    if denominator == 0 {
+        // 生産能力も現有戦力もない敵に対して、止めるべき補充は存在しない。
+        (0, 1)
+    } else {
+        (capacity, denominator)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CampaignActionContext {
     owner: crate::ai::operation_assignment::OperationOwner,
@@ -2711,6 +2733,9 @@ fn decide_ai_action_v2_for_entities(
             })
             .collect()
     };
+    // 敵の補充依存度。占位の価値は局面で決まるため、ここで一度だけ導出して全タイル評価で共有する。
+    let blockade_dependence =
+        enemy_replacement_dependence(enemy_production_positions.len(), enemy_units.len());
     let damage_chart = world.resource::<crate::resources::DamageChart>().clone();
     // 自軍の移動は距離探索上の通行可否を変えない。敵が撃破されて占有マスが
     // 変わるまで、同一手番の全ユニットでDijkstra結果を共有する。
@@ -2897,8 +2922,10 @@ fn decide_ai_action_v2_for_entities(
         }
         // 非占領戦闘ユニットが自軍の未所有な占領予定物件を踏んで占領を物理的に塞ぐのを防ぐ。
         // （既に自軍が所有している物件は防衛・駐留すべき拠点なので除外しない）
-        // ただし敵の有効な生産マスについては「占位（敵補充の物理的封鎖）」の対象となるため、
-        // 今手番で友軍の占領役が即座に占領着手できる場合を除き、候補から除外しない。
+        // 敵の生産マスも例外にしない。占位（blockade）は敵の補充を止めるだけだが、
+        // 占領（capture）は補充を止めたうえで収入と生産力を自軍へ移すため常に上位互換であり、
+        // 友軍の占領契約が既にあるマスを戦闘ユニットが塞ぐのは純損失になる。
+        // 占位は「誰も占領しに行かないマス」に対する代替手段であり、占領の競合相手ではない。
         if !stats.can_capture {
             let non_reserved = candidate_tiles
                 .iter()
@@ -2913,23 +2940,6 @@ fn decide_ai_action_v2_for_entities(
                     }
                     if !crate::ai::v4::is_capture_target_reserved(world, player_id, target_grid) {
                         return true;
-                    }
-                    // 敵の有効な生産施設である場合、占領（capture）と占位（blockade）を区別する。
-                    // 味方の占領部隊が今ターン即座にそのマスへ到達して占領に着手できる場合を除き、
-                    // 戦闘ユニットが敵生産口を占位して敵の補充を断つ行動を許可する（V4限定）。
-                    if uses_blockade && enemy_production_positions.contains(&target_grid) {
-                        let ally_can_capture_now = world.iter_entities().any(|e| {
-                            e.id() != unit_entity
-                                && e.get::<Faction>().is_some_and(|f| f.0 == player_id)
-                                && e.get::<UnitStats>().is_some_and(|s| s.can_capture)
-                                && e.get::<HasMoved>().is_some_and(|m| !m.0)
-                                && e.get::<ActionCompleted>().is_some_and(|c| !c.0)
-                                && e.get::<GridPosition>()
-                                    .is_some_and(|p| map.distance(p.x, p.y, x, y) <= 1)
-                        });
-                        if !ally_can_capture_now {
-                            return true;
-                        }
                     }
                     false
                 })
@@ -3091,9 +3101,12 @@ fn decide_ai_action_v2_for_entities(
                 } else {
                     None
                 };
+                // 施設が供給し得る補充の価値を、敵がその補充にどれだけ依存しているかで割り引く。
                 let val = enemy_site_terrain
                     .map(|t| production_facility_blockade_value(t, &registry))
-                    .unwrap_or(0);
+                    .unwrap_or(0)
+                    .saturating_mul(blockade_dependence.0)
+                    / blockade_dependence.1;
                 let incoming_damage = crate::ai::threat::expected_incoming_damage(
                     &map,
                     (current_grid.x, current_grid.y),
@@ -3754,14 +3767,12 @@ fn decide_ai_action_v2_for_entities(
 
                 let qualifies_enemy_production_blockade =
                     is_on_enemy_production_site && is_survivable_blockade;
-                if qualifies_enemy_production_blockade {
-                    // 敵生産マスを占位して補充を止める。
-                    // 既に占位中の場合は、不用意に持ち場を離れず封鎖を維持（Hold Blockade）する。
-                    if is_stationary {
-                        score += blockade_value as i32;
-                    }
-                } else if starts_on_enemy_production_site
-                    && !is_on_enemy_production_site
+                // 占位を維持するときの価値は base_tile_score で既に一度計上済みである。
+                // ここで居座り加点を重ねると同じ一つの価値を二重計上することになり、
+                // 占位マスが実力以上に固着してユニットが生産マスに貼り付いて遊ぶ。
+                // 占位を続けるかどうかは、計上済みの占位価値と他の行動価値の素の比較に委ねる。
+                if !qualifies_enemy_production_blockade
+                    && starts_on_enemy_production_site
                     && !is_combat_ineffective
                 {
                     // 健全なユニットが理由なく敵生産マスから退去して敵に生産口を明け渡す行動を抑止する。
@@ -7454,6 +7465,34 @@ mod tests {
     }
 
     #[test]
+    fn enemy_replacement_dependence_scales_with_reliance_on_production() {
+        // 敵が大軍を擁する序盤〜中盤: 補充1体を止めても次ターン戦力への寄与は小さい。
+        let (num, den) = enemy_replacement_dependence(4, 36);
+        assert_eq!((num, den), (4, 40));
+        assert!(
+            num * 10 <= den,
+            "大軍を持つ敵への占位価値は1割以下に割り引かれるべき"
+        );
+
+        // 敵が消耗し補充だけが生命線になった終盤: 占位価値が最大化する。
+        let (num, den) = enemy_replacement_dependence(4, 2);
+        assert_eq!((num, den), (4, 6));
+        assert!(
+            num * 2 > den,
+            "消耗した敵への占位価値は半分より大きく評価されるべき"
+        );
+
+        // 敵が全滅していれば止めるべき補充はないが、生産能力は価値を保つ。
+        assert_eq!(enemy_replacement_dependence(3, 0), (3, 3));
+
+        // 敵の生産能力がなければ占位の価値はゼロ。
+        assert_eq!(enemy_replacement_dependence(0, 10), (0, 10));
+
+        // 生産能力も戦力もない敵に対しては、ゼロ除算せず価値ゼロを返す。
+        assert_eq!(enemy_replacement_dependence(0, 0), (0, 1));
+    }
+
+    #[test]
     fn v3_combat_unit_does_not_blockade_enemy_production_site() {
         let player = PlayerId(2);
         let enemy = PlayerId(1);
@@ -7601,17 +7640,103 @@ mod tests {
     }
 
     #[test]
-    fn v4_healthy_combat_unit_holds_enemy_production_site_blockade() {
+    fn v4_combat_unit_does_not_blockade_enemy_production_site_reserved_for_friendly_capture() {
+        // 占位（blockade）は敵の補充を止めるだけだが、占領（capture）は補充を止めたうえで
+        // 収入と生産力を自軍へ移すため常に上位互換である。
+        // 友軍のCapture契約が既にあるマスを戦闘ユニットが塞ぐのは純損失なので、
+        // 占位は占領へ道を譲らなければならない。
         let player = PlayerId(2);
         let enemy = PlayerId(1);
-        let mut world = setup_v3_test_world(3, crate::ai::ai_version::AiVersion::V4);
+        let mut world = setup_v3_test_world(6, crate::ai::ai_version::AiVersion::V4);
         world.insert_resource(Map {
-            width: 3,
+            width: 6,
             height: 2,
             tiles: vec![
                 Terrain::Plains,
                 Terrain::Factory,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
                 Terrain::Capital,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+            ],
+            topology: crate::resources::GridTopology::Square,
+        });
+        world.insert_resource(DamageChart::new());
+        // 敵 (P1) の首都 (4, 0) と工場 (1, 0)（生産可能範囲内）
+        world.spawn((
+            GridPosition { x: 4, y: 0 },
+            Property::new(Terrain::Capital, Some(enemy), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Property::new(Terrain::Factory, Some(enemy), 100),
+        ));
+        // 敵首都 (4, 0) に敵守備隊がいるため進入不可
+        let enemy_stats = world
+            .resource::<MasterDataRegistry>()
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::Infantry.as_str().to_owned(),
+            ))
+            .unwrap();
+        spawn_v3_test_unit(&mut world, enemy, 4, 100, enemy_stats);
+
+        // 自軍 (P2) の戦車が (0, 0) にいる
+        let stats = world
+            .resource::<MasterDataRegistry>()
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::Tank.as_str().to_owned(),
+            ))
+            .unwrap();
+        let tank = spawn_v3_test_unit(&mut world, player, 0, 100, stats);
+        *world.get_mut::<GridPosition>(tank).unwrap() = GridPosition { x: 0, y: 0 };
+
+        let mut manager = crate::ai::squad::SquadManager::new();
+        let squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+        squad.members.insert(tank);
+        squad.target = Some(GridPosition { x: 4, y: 0 }); // 敵首都を目標
+        squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+        // 友軍の占領部隊が敵工場 (1, 0) を占領目標として予約している。
+        let capture_squad =
+            manager.create_owned_squad(crate::ai::squad::MissionType::Capture, player);
+        capture_squad.target = Some(GridPosition { x: 1, y: 0 });
+        world.insert_resource(manager);
+
+        let (entity, command) = decide_squad_action_v4(&mut world, player, &HashSet::new())
+            .expect("Tank should take an action");
+        assert_eq!(entity, tank);
+        let target_pos = match command {
+            AiCommand::Wait { target_pos } => target_pos,
+            AiCommand::Attack { target_pos, .. } => target_pos,
+            AiCommand::Capture { target_pos } => target_pos,
+            other => panic!("位置を伴う行動を期待したが {:?} であった", other),
+        };
+        assert_ne!(
+            target_pos,
+            GridPosition { x: 1, y: 0 },
+            "友軍が占領予約している敵工場 (1, 0) を戦闘ユニットが占位して塞いではならない"
+        );
+    }
+
+    #[test]
+    fn v4_healthy_combat_unit_holds_enemy_production_site_blockade() {
+        let player = PlayerId(2);
+        let enemy = PlayerId(1);
+        let mut world = setup_v3_test_world(4, crate::ai::ai_version::AiVersion::V4);
+        world.insert_resource(Map {
+            width: 4,
+            height: 2,
+            tiles: vec![
+                Terrain::Plains,
+                Terrain::Factory,
+                Terrain::Plains,
+                Terrain::Capital,
+                Terrain::Plains,
                 Terrain::Plains,
                 Terrain::Plains,
                 Terrain::Plains,
@@ -7620,7 +7745,7 @@ mod tests {
         });
         world.insert_resource(DamageChart::new());
         world.spawn((
-            GridPosition { x: 2, y: 0 },
+            GridPosition { x: 3, y: 0 },
             Property::new(Terrain::Capital, Some(enemy), 100),
         ));
         world.spawn((
@@ -7640,14 +7765,17 @@ mod tests {
         let mut manager = crate::ai::squad::SquadManager::new();
         let squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
         squad.members.insert(tank);
-        squad.target = Some(GridPosition { x: 2, y: 0 }); // 敵首都を目標
+        // 目標は生産施設ではない平地 (0, 1)。敵首都 (3, 0) も占位対象なので、
+        // そちらへ引かれる目標にすると「二つの占位マスのどちらを選ぶか」になってしまい、
+        // 封鎖を維持するかどうかを検証できない。占位マスから引き離す目標を与える。
+        squad.target = Some(GridPosition { x: 0, y: 1 });
         squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
         world.insert_resource(manager);
 
         let (entity, command) = decide_squad_action_v4(&mut world, player, &HashSet::new())
             .expect("Tank should take an action");
         assert_eq!(entity, tank);
-        // 戦車は敵首都へ不用意に前進して工場を明け渡すのではなく、工場 (1, 0) で待機して封鎖を維持すべき
+        // 戦車は目標へ不用意に前進して工場を明け渡すのではなく、工場 (1, 0) で待機して封鎖を維持すべき
         let AiCommand::Wait { target_pos } = command else {
             panic!("Wait行動を期待したが {:?} であった", command);
         };
