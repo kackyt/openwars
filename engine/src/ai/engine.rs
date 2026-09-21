@@ -2349,12 +2349,39 @@ enum ActionPriority {
     FavorableLocalTarget,
     /// 作戦対象そのものとの相性もよい攻撃。
     FavorableStrategicTarget,
+    /// 敵の有効な生産可能マスを占位し、敵の戦力補充を物理的に遮断する行動。
+    /// 自軍の生産口を開けるProductionSiteReliefの攻勢的鏡像であり、
+    /// 敵の補充速度を物理的に削ぐことで全滅勝利を確定させる。
+    EnemyProductionBlockade,
     /// 専任占領役が目標物件上で占領を実行する行動。
     /// 前面戦闘は同行するCombat役へ分担し、占領完了を最優先する。
     CaptureExecution,
     /// 全生産施設が自軍で埋まったとき、少なくとも一枠を開ける移動・移動攻撃。
     /// 後続を途切れさせない盤面契約であり、通常の戦術scoreとは分離して扱う。
     ProductionSiteRelief,
+}
+
+/// 生産施設が1ターンに供給し得るユニットの平均コスト（補充阻止価値）。
+/// 敵の生産マスを1つ占位することは、敵の補充を毎ターン1体分止めることであり、
+/// その価値は止めた補充の価値に等しいという教義に基づく。
+/// 魔法定数を避け、マスターデータのユニットカタログから導出する。
+fn production_facility_blockade_value(terrain: Terrain, registry: &MasterDataRegistry) -> u32 {
+    let producible_costs: Vec<u32> = registry
+        .unit_order
+        .iter()
+        .filter_map(|name| {
+            let record = registry.units.get(name)?;
+            let u_type = crate::resources::UnitType::from_str(&record.name.0)?;
+            registry
+                .can_produce_unit(terrain.as_str(), u_type)
+                .then_some(record.cost)
+        })
+        .collect();
+    if producible_costs.is_empty() {
+        0
+    } else {
+        producible_costs.iter().sum::<u32>() / producible_costs.len() as u32
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2579,6 +2606,42 @@ fn decide_ai_action_v2_for_entities(
             .then_some((position.x, position.y))
         })
         .collect::<HashSet<_>>();
+    // 敵プレイヤーの有効な生産施設を収集する。
+    // 敵首都からの生産可能範囲内にある敵所有の生産施設（工場・空港・港・首都）が該当する。
+    // 自軍の生産口を塞がない知識を攻勢的に反転させ、敵の補充を物理的に遮断（占位）する対象を特定する。
+    let enemy_capitals: Vec<(PlayerId, GridPosition)> = properties
+        .iter()
+        .filter_map(|(pos, terrain, owner)| match owner {
+            Some(owner_id) if *owner_id != player_id && *terrain == Terrain::Capital => {
+                Some((*owner_id, *pos))
+            }
+            _ => None,
+        })
+        .collect();
+    let enemy_production_positions: HashSet<GridPosition> = properties
+        .iter()
+        .filter_map(|(pos, terrain, owner)| match owner {
+            Some(owner_id)
+                if *owner_id != player_id && registry.is_production_facility(terrain.as_str()) =>
+            {
+                let matching_capitals: Vec<GridPosition> = enemy_capitals
+                    .iter()
+                    .filter_map(|(c_owner, c_pos)| (*c_owner == *owner_id).then_some(*c_pos))
+                    .collect();
+                if crate::systems::production::is_within_production_range(
+                    &matching_capitals,
+                    pos.x,
+                    pos.y,
+                    map.topology,
+                ) {
+                    Some(*pos)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .collect();
     // 一つでも空きがあれば通常の戦術行動を優先する。全枠閉塞時だけ、各action後に
     // 再評価されるこの契約で一体を押し出し、最低一つの後続生産口を回復する。
     let production_capacity_gridlocked = !owned_production_positions.is_empty()
@@ -2821,20 +2884,41 @@ fn decide_ai_action_v2_for_entities(
         }
         // 非占領戦闘ユニットが自軍の未所有な占領予定物件を踏んで占領を物理的に塞ぐのを防ぐ。
         // （既に自軍が所有している物件は防衛・駐留すべき拠点なので除外しない）
+        // ただし敵の有効な生産マスについては「占位（敵補充の物理的封鎖）」の対象となるため、
+        // 今手番で友軍の占領役が即座に占領着手できる場合を除き、候補から除外しない。
         if !stats.can_capture {
             let non_reserved = candidate_tiles
                 .iter()
                 .copied()
                 .filter(|&(x, y)| {
+                    let target_grid = GridPosition { x, y };
                     let is_unowned = properties.iter().any(|(p_pos, _, p_owner)| {
                         p_pos.x == x && p_pos.y == y && *p_owner != Some(player_id)
                     });
-                    !(is_unowned
-                        && crate::ai::v4::is_capture_target_reserved(
-                            world,
-                            player_id,
-                            GridPosition { x, y },
-                        ))
+                    if !is_unowned {
+                        return true;
+                    }
+                    if !crate::ai::v4::is_capture_target_reserved(world, player_id, target_grid) {
+                        return true;
+                    }
+                    // 敵の有効な生産施設である場合、占領（capture）と占位（blockade）を区別する。
+                    // 味方の占領部隊が今ターン即座にそのマスへ到達して占領に着手できる場合を除き、
+                    // 戦闘ユニットが敵生産口を占位して敵の補充を断つ行動を許可する。
+                    if enemy_production_positions.contains(&target_grid) {
+                        let ally_can_capture_now = world.iter_entities().any(|e| {
+                            e.id() != unit_entity
+                                && e.get::<Faction>().is_some_and(|f| f.0 == player_id)
+                                && e.get::<UnitStats>().is_some_and(|s| s.can_capture)
+                                && e.get::<HasMoved>().is_some_and(|m| !m.0)
+                                && e.get::<ActionCompleted>().is_some_and(|c| !c.0)
+                                && e.get::<GridPosition>()
+                                    .is_some_and(|p| map.distance(p.x, p.y, x, y) <= 1)
+                        });
+                        if !ally_can_capture_now {
+                            return true;
+                        }
+                    }
+                    false
                 })
                 .collect::<Vec<_>>();
             if !non_reserved.is_empty() {
@@ -2969,12 +3053,45 @@ fn decide_ai_action_v2_for_entities(
                             &mut turn_cache,
                         ) < before
                 });
+            let starts_on_enemy_production_site = enemy_production_positions.contains(&pos);
+            let is_on_enemy_production_site = enemy_production_positions.contains(&current_grid);
+            let enemy_site_terrain = if is_on_enemy_production_site {
+                properties
+                    .iter()
+                    .find(|(p_pos, _, _)| *p_pos == current_grid)
+                    .map(|(_, t, _)| *t)
+            } else {
+                None
+            };
+            let blockade_value = enemy_site_terrain
+                .map(|t| production_facility_blockade_value(t, &registry))
+                .unwrap_or(0);
+
             let mut base_tile_score = 0;
             let tile_def_bonus = map
                 .get_terrain(current_grid.x, current_grid.y)
                 .map(|t| registry.get_terrain_defense_bonus(t))
                 .unwrap_or(0);
             base_tile_score += tile_def_bonus as i32 * 10;
+
+            let incoming_damage = if is_v3 {
+                crate::ai::threat::expected_incoming_damage(
+                    &map,
+                    (current_grid.x, current_grid.y),
+                    stats.unit_type,
+                    tile_def_bonus,
+                    &enemy_units,
+                    &damage_chart,
+                )
+            } else {
+                0
+            };
+            // 敵生産口への突入・占位の生存性判定。
+            // 序盤の自殺的突入を抑止するため、戦闘不能ユニットや次ターン即死圏（期待被ダメージ >= 現在HP）は占位行動から除外する。
+            let is_survivable_blockade = !is_combat_ineffective && incoming_damage < atk_hp;
+            if is_on_enemy_production_site && is_survivable_blockade {
+                base_tile_score += blockade_value as i32;
+            }
 
             // #44 (V3): HP が低下しているほど防御地形 (森・山) への評価を引き上げ、
             // 生存率を高める位置取りを優先させる。
@@ -3543,6 +3660,11 @@ fn decide_ai_action_v2_for_entities(
                         };
                         let priority = if vacates_gridlocked_production_site {
                             ActionPriority::ProductionSiteRelief
+                        } else if is_on_enemy_production_site
+                            && is_survivable_blockade
+                            && priority < ActionPriority::EnemyProductionBlockade
+                        {
+                            ActionPriority::EnemyProductionBlockade
                         } else {
                             priority
                         };
@@ -3609,8 +3731,28 @@ fn decide_ai_action_v2_for_entities(
                     score -= 5000;
                 }
 
+                let qualifies_enemy_production_blockade =
+                    is_on_enemy_production_site && is_survivable_blockade;
+                if qualifies_enemy_production_blockade {
+                    // 敵生産マスを占位して補充を止める。
+                    // 既に占位中の場合は、不用意に持ち場を離れず封鎖を維持（Hold Blockade）する。
+                    if is_stationary {
+                        score += blockade_value as i32;
+                    }
+                } else if starts_on_enemy_production_site
+                    && !is_on_enemy_production_site
+                    && !is_combat_ineffective
+                {
+                    // 健全なユニットが理由なく敵生産マスから退去して敵に生産口を明け渡す行動を抑止する。
+                    // 自軍生産口を塞ぐのを避けるのと同様に、敵生産口を空けるのを避ける。
+                    score -= (blockade_value as i32) * 2;
+                }
+
                 let violates_campaign_step = campaign_context.as_ref().is_some_and(|context| {
-                    if is_stationary || is_on_recovery_property && is_combat_ineffective {
+                    if is_stationary
+                        || (is_on_recovery_property && is_combat_ineffective)
+                        || qualifies_enemy_production_blockade
+                    {
                         return false;
                     }
                     route_target.or(context.target).is_none_or(|target| {
@@ -3625,6 +3767,8 @@ fn decide_ai_action_v2_for_entities(
                             ActionPriority::ProductionSiteRelief
                         } else if advances_capture_contract {
                             ActionPriority::CaptureAdvance
+                        } else if qualifies_enemy_production_blockade {
+                            ActionPriority::EnemyProductionBlockade
                         } else if is_route_advance_cell {
                             ActionPriority::RouteAdvance
                         } else {
@@ -7285,6 +7429,139 @@ mod tests {
             v3_low_hp_safe, 3,
             "V3 は低HPでも脅威がなければ森に籠らず前進するはず (actual: x={})",
             v3_low_hp_safe
+        );
+    }
+
+    #[test]
+    fn v4_healthy_combat_unit_occupies_reachable_enemy_production_site_to_blockade_reinforcements()
+    {
+        let player = PlayerId(2);
+        let enemy = PlayerId(1);
+        let mut world = setup_v3_test_world(6, crate::ai::ai_version::AiVersion::V4);
+        world.insert_resource(Map {
+            width: 6,
+            height: 2,
+            tiles: vec![
+                Terrain::Plains,
+                Terrain::Factory,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Capital,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+            ],
+            topology: crate::resources::GridTopology::Square,
+        });
+        world.insert_resource(DamageChart::new());
+        // 敵 (P1) の首都 (4, 0) と工場 (1, 0) (距離3以内で生産可能範囲内)
+        world.spawn((
+            GridPosition { x: 4, y: 0 },
+            Property::new(Terrain::Capital, Some(enemy), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Property::new(Terrain::Factory, Some(enemy), 100),
+        ));
+        // 敵首都 (4, 0) に敵守備隊がいるため進入不可
+        let enemy_stats = world
+            .resource::<MasterDataRegistry>()
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::Infantry.as_str().to_owned(),
+            ))
+            .unwrap();
+        spawn_v3_test_unit(&mut world, enemy, 4, 100, enemy_stats);
+
+        // 自軍 (P2) の戦車が (0, 0) にいる (工場 (1, 0) にも、より首都に近い平地 (2, 0) や (3, 0) にも移動可能)
+        let stats = world
+            .resource::<MasterDataRegistry>()
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::Tank.as_str().to_owned(),
+            ))
+            .unwrap();
+        let tank = spawn_v3_test_unit(&mut world, player, 0, 100, stats);
+        *world.get_mut::<GridPosition>(tank).unwrap() = GridPosition { x: 0, y: 0 };
+
+        let mut manager = crate::ai::squad::SquadManager::new();
+        let squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+        squad.members.insert(tank);
+        squad.target = Some(GridPosition { x: 4, y: 0 }); // 敵首都を目標
+        squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+        world.insert_resource(manager);
+
+        let (entity, command) = decide_squad_action_v4(&mut world, player, &HashSet::new())
+            .expect("Tank should take an action");
+        assert_eq!(entity, tank);
+        // 戦車は敵首都への単なる平地前進 (RouteAdvance) ではなく、敵の補充を物理的に封鎖できる工場 (1, 0) を占位してWaitすべき
+        let AiCommand::Wait { target_pos } = command else {
+            panic!("Wait行動を期待したが {:?} であった", command);
+        };
+        assert_eq!(
+            target_pos,
+            GridPosition { x: 1, y: 0 },
+            "戦車は敵工場の生産を止めるために (1, 0) を占位すべき"
+        );
+    }
+
+    #[test]
+    fn v4_healthy_combat_unit_holds_enemy_production_site_blockade() {
+        let player = PlayerId(2);
+        let enemy = PlayerId(1);
+        let mut world = setup_v3_test_world(3, crate::ai::ai_version::AiVersion::V4);
+        world.insert_resource(Map {
+            width: 3,
+            height: 2,
+            tiles: vec![
+                Terrain::Plains,
+                Terrain::Factory,
+                Terrain::Capital,
+                Terrain::Plains,
+                Terrain::Plains,
+                Terrain::Plains,
+            ],
+            topology: crate::resources::GridTopology::Square,
+        });
+        world.insert_resource(DamageChart::new());
+        world.spawn((
+            GridPosition { x: 2, y: 0 },
+            Property::new(Terrain::Capital, Some(enemy), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Property::new(Terrain::Factory, Some(enemy), 100),
+        ));
+        // 自軍 (P2) の戦車が既に工場 (1, 0) 上にいる
+        let stats = world
+            .resource::<MasterDataRegistry>()
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::Tank.as_str().to_owned(),
+            ))
+            .unwrap();
+        let tank = spawn_v3_test_unit(&mut world, player, 0, 100, stats);
+        *world.get_mut::<GridPosition>(tank).unwrap() = GridPosition { x: 1, y: 0 };
+
+        let mut manager = crate::ai::squad::SquadManager::new();
+        let squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+        squad.members.insert(tank);
+        squad.target = Some(GridPosition { x: 2, y: 0 }); // 敵首都を目標
+        squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+        world.insert_resource(manager);
+
+        let (entity, command) = decide_squad_action_v4(&mut world, player, &HashSet::new())
+            .expect("Tank should take an action");
+        assert_eq!(entity, tank);
+        // 戦車は敵首都へ不用意に前進して工場を明け渡すのではなく、工場 (1, 0) で待機して封鎖を維持すべき
+        let AiCommand::Wait { target_pos } = command else {
+            panic!("Wait行動を期待したが {:?} であった", command);
+        };
+        assert_eq!(
+            target_pos,
+            GridPosition { x: 1, y: 0 },
+            "戦車は敵工場 (1, 0) の封鎖を維持すべき"
         );
     }
 }
