@@ -10199,7 +10199,10 @@ fn immediate_combat_options(
         }
         for (facility, terrain) in &scan.free_facilities {
             for (unit_type, stats) in &scan.available_types {
-                if !scan.can_produce(*terrain, *unit_type) || stats.cost == 0 {
+                // 支援砲は前衛を含むRollingPlanで購入する。余剰の単体補充でその検証を
+                // 迂回すると、前衛が失われた局面でも砲だけを追加してしまう。
+                if stats.min_range > 1 || !scan.can_produce(*terrain, *unit_type) || stats.cost == 0
+                {
                     continue;
                 }
                 let engagements = immediate_combat_engagements(
@@ -10248,8 +10251,9 @@ fn select_immediate_combat_reinforcement(
     committed_damage: &HashMap<(usize, Entity), u32>,
     constraints: CandidateConstraints,
 ) -> Option<(usize, SlotCandidate, ImmediateCombatEngagement)> {
-    let mut within_budget: Option<(usize, SlotCandidate, ImmediateCombatEngagement)> = None;
-    let mut over_budget: Option<(usize, SlotCandidate, ImmediateCombatEngagement)> = None;
+    // ここへ来る前に占領等のMust枠は確保済み。前衛の補充は頭数ではなく実効戦力を選ぶ。
+    // 工場数で割った仮予算を超えても、残額で買えるなら同じ候補集合で比較する。
+    let mut best: Option<(usize, SlotCandidate, ImmediateCombatEngagement)> = None;
     for option in options {
         let op_index = option.operation_index;
         let candidate = option.candidate;
@@ -10287,11 +10291,7 @@ fn select_immediate_combat_reinforcement(
         else {
             continue;
         };
-        let slot = if candidate.cost <= constraints.per_slot_budget.max(1) {
-            &mut within_budget
-        } else {
-            &mut over_budget
-        };
+        let slot = &mut best;
         let better = slot
             .as_ref()
             .is_none_or(|(current_op_index, current, current_engagement)| {
@@ -10314,7 +10314,7 @@ fn select_immediate_combat_reinforcement(
         }
     }
 
-    within_budget.or(over_budget)
+    best
 }
 
 /// 敵が今この手番に未所有（中立・敵）拠点の上にいて占領を進めているか。
@@ -14234,6 +14234,108 @@ mod tests {
         .expect("Combat増援に任務を付ける");
         assert_eq!(deployment.priority_enemies, vec![enemy]);
         assert!(deployment.plan_step.is_none());
+    }
+
+    #[test]
+    fn standalone_reinforcement_does_not_replace_missing_front_with_indirect_fire() {
+        let mut scan = mixed_threat_multi_factory_scan();
+        // 汎用fixtureの燃料0は経路判定用ではない。実マスターの燃料を与える。
+        for (kind, stats) in &mut scan.available_types {
+            stats.max_fuel = scan
+                .master_data
+                .create_unit_stats(&crate::resources::master_data::UnitName(
+                    kind.as_str().to_owned(),
+                ))
+                .unwrap()
+                .max_fuel;
+        }
+        let gun = scan
+            .master_data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::HeavySpGun.as_str().to_owned(),
+            ))
+            .unwrap();
+        scan.available_types.push((UnitType::HeavySpGun, gun));
+        Arc::make_mut(&mut scan.damage_chart).insert_damage(
+            UnitType::HeavySpGun,
+            UnitType::Infantry,
+            100,
+        );
+        let mut ctx = ReachCtx::default();
+        let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
+        let options =
+            immediate_combat_options(&scan, &mut ctx, &operations, PlayerId(1), &HashSet::new());
+        assert!(!options.is_empty(), "到達可能な前衛補充は残す");
+        assert!(
+            options
+                .iter()
+                .all(|option| option.candidate.unit_type != UnitType::HeavySpGun),
+            "前衛との成立を検証するRollingPlanを単体の砲生産で迂回しない"
+        );
+    }
+
+    /// 必要な占領枠を確保した後の前衛補充は、工場ごとの均等配分で戦力を落とさない。
+    #[test]
+    fn combat_reinforcement_uses_affordable_frontline_strength_not_equal_factory_budget() {
+        let enemy = Entity::from_raw(904);
+        let options = [
+            (UnitType::Infantry, 1000, 20, 0.2),
+            (UnitType::Tank, 6000, 80, 0.8),
+        ]
+        .into_iter()
+        .map(|(unit_type, cost, damage, fitness)| ImmediateCombatOption {
+            operation_index: 0,
+            candidate: SlotCandidate {
+                unit_type,
+                cost,
+                facility: pos(1, 1),
+                fitness: 0.0,
+            },
+            engagements: vec![ImmediateCombatEngagement {
+                entity: enemy,
+                current_hp: 100,
+                damage,
+                fitness,
+            }],
+        })
+        .collect::<Vec<_>>();
+        let operations = vec![operation(
+            OperationKind::Capture,
+            OperationSlots::default(),
+            OperationSlots::default(),
+        )];
+        let (_, candidate, _) = select_immediate_combat_reinforcement(
+            &operations,
+            &options,
+            &HashSet::new(),
+            &HashMap::new(),
+            CandidateConstraints {
+                remaining_funds: 6000,
+                per_slot_budget: 1000,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            candidate.unit_type,
+            UnitType::Tank,
+            "全工場で一体ずつ買う必要はなく、到達/相性で優れる前衛を買う"
+        );
+        let (_, candidate, _) = select_immediate_combat_reinforcement(
+            &operations,
+            &options,
+            &HashSet::new(),
+            &HashMap::new(),
+            CandidateConstraints {
+                remaining_funds: 1000,
+                per_slot_budget: 1000,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            candidate.unit_type,
+            UnitType::Infantry,
+            "実資金の制約は維持する"
+        );
     }
 
     /// 余剰Combatは候補表を一度だけ作るが、1体が同じ敵全員を同時に攻撃できるとは

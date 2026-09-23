@@ -522,6 +522,40 @@ impl V4DeploymentRegistry {
         }
     }
 
+    /// 同じ攻勢作戦の前衛・砲が協働できるか。別の敵を狙っていても作戦IDを失わない。
+    /// 台帳が無い二体だけは呼出側のSquad目標による判定へ委ねる。
+    pub(crate) fn shares_attack_operation(&self, left: Entity, right: Entity) -> Option<bool> {
+        let (left, right) = match (self.assigned.get(&left), self.assigned.get(&right)) {
+            (None, None) => return None,
+            (Some(left), Some(right)) => (left, right),
+            _ => return Some(false),
+        };
+        if !left.active
+            || !right.active
+            || left.intent.player_id != right.intent.player_id
+            || left.intent.posture != DeploymentPosture::Execute
+            || right.intent.posture != DeploymentPosture::Execute
+            || left.intent.slot_kind != SlotKind::Combat
+            || right.intent.slot_kind != SlotKind::Combat
+        {
+            return Some(false);
+        }
+        Some(
+            match (
+                left.intent.operation_binding,
+                right.intent.operation_binding,
+            ) {
+                (Some(a), Some(b)) => a.operation_id == b.operation_id && a.revision == b.revision,
+                (None, None) => match (left.intent.plan_step, right.intent.plan_step) {
+                    (Some(a), Some(b)) => a.plan_id == b.plan_id && a.revision == b.revision,
+                    (None, None) => left.intent.anchor == right.intent.anchor,
+                    _ => false,
+                },
+                _ => false,
+            },
+        )
+    }
+
     /// 行動評価で最優先する、現在有効な局地任務の敵Entityを返す。
     pub(crate) fn attack_target(&self, attacker: Entity) -> Option<Entity> {
         self.assigned
@@ -1184,6 +1218,12 @@ pub(crate) fn prepare_deployment_squads(
             DeploymentPosture::Execute => {
                 // 占領スロットの場合はターゲット解決を行わず、直接占領任務を割り当てる
                 if snapshot.intent.slot_kind == SlotKind::Capture {
+                    // anchor物件が既に自軍所有なら占領任務は達成済み。任務を出し続けると
+                    // 占領役が物件上に留まり続け、生産マス前の通路を塞ぐため解放する。
+                    if anchor_is_owned_by(world, snapshot.intent.anchor, player_id) {
+                        releases.push((entity, snapshot.squad_id));
+                        continue;
+                    }
                     (None, snapshot.intent.anchor, MissionType::Capture)
                 } else {
                     match resolve_target(
@@ -1262,6 +1302,16 @@ pub(crate) fn prepare_deployment_squads(
     }
     world.insert_resource(registry);
     reserved
+}
+
+/// 指定座標の物件が既に `player_id` の所有かどうか。
+fn anchor_is_owned_by(world: &World, anchor: GridPosition, player_id: PlayerId) -> bool {
+    world.iter_entities().any(|entity| {
+        entity.get::<GridPosition>() == Some(&anchor)
+            && entity
+                .get::<Property>()
+                .is_some_and(|property| property.owner_id == Some(player_id))
+    })
 }
 
 #[cfg(test)]
@@ -1605,6 +1655,61 @@ mod tests {
         );
         let registry = world.resource::<V4DeploymentRegistry>();
         assert_ne!(registry.assigned[&attacker].current_target, Some(priority));
+    }
+
+    #[test]
+    fn capture_slot_releases_entity_once_anchor_is_already_owned() {
+        let (mut world, attacker, _, _, _) = deployment_world();
+        let anchor = GridPosition { x: 5, y: 0 };
+        // 占領スロットのanchor物件は既に自軍所有になっている。
+        world.spawn((anchor, Property::new(Terrain::City, Some(PlayerId(1)), 20)));
+        {
+            let mut registry = world.resource_mut::<V4DeploymentRegistry>();
+            let deployment = registry.assigned.get_mut(&attacker).unwrap();
+            deployment.intent.slot_kind = SlotKind::Capture;
+            deployment.intent.anchor = anchor;
+        }
+        let mut manager = SquadManager::default();
+
+        let reserved =
+            prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::new());
+
+        // 占領済みの物件に占領任務を出し続けると、生産マス前の都市に歩兵が居座り
+        // 後続の装甲が出撃できなくなる。任務は完了扱いで解放する。
+        assert!(!reserved.contains(&attacker));
+        assert!(!world.resource::<V4DeploymentRegistry>().assigned[&attacker].active);
+        assert!(
+            !manager
+                .squads
+                .iter()
+                .any(|squad| squad.members.contains(&attacker))
+        );
+    }
+
+    #[test]
+    fn capture_slot_keeps_capture_mission_while_anchor_is_not_owned() {
+        let (mut world, attacker, _, _, _) = deployment_world();
+        let anchor = GridPosition { x: 5, y: 0 };
+        world.spawn((anchor, Property::new(Terrain::City, None, 20)));
+        {
+            let mut registry = world.resource_mut::<V4DeploymentRegistry>();
+            let deployment = registry.assigned.get_mut(&attacker).unwrap();
+            deployment.intent.slot_kind = SlotKind::Capture;
+            deployment.intent.anchor = anchor;
+        }
+        let mut manager = SquadManager::default();
+
+        let reserved =
+            prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::new());
+
+        assert!(reserved.contains(&attacker));
+        let squad = manager
+            .squads
+            .iter()
+            .find(|squad| squad.members.contains(&attacker))
+            .unwrap();
+        assert_eq!(squad.mission_type, MissionType::Capture);
+        assert_eq!(squad.target, Some(anchor));
     }
 
     #[test]
