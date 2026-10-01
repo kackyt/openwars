@@ -1418,9 +1418,20 @@ fn contested_is_competitive(facts: &IslandCampaignFacts) -> bool {
         .is_some_and(|(friendly_eta, enemy_eta)| friendly_eta <= enemy_eta.saturating_add(1))
 }
 
+/// テスト用: 標準V4以外（小規模V4・V1〜V3）の既定ポリシーで要求を算出する。
+#[cfg(test)]
 fn requirement_for_assessment(
     facts: &IslandCampaignFacts,
     assessment: &mut crate::ai::island_campaign::IslandCampaignAssessment,
+) -> IslandCampaignRequirement {
+    requirement_for_assessment_with_policy(facts, assessment, false)
+}
+
+/// 島評価から作戦要求を算出する。`standard_v4` が真のときは標準V4の従来要求を再現する。
+fn requirement_for_assessment_with_policy(
+    facts: &IslandCampaignFacts,
+    assessment: &mut crate::ai::island_campaign::IslandCampaignAssessment,
+    standard_v4: bool,
 ) -> IslandCampaignRequirement {
     // 未所有施設は互いに独立した占領対象なので、残数に応じて並行投入する。
     let remaining_properties = facts
@@ -1479,7 +1490,12 @@ fn requirement_for_assessment(
             // 残っている場合に歩兵だけが詰まり、首都作戦の前段そのものが停止する。
             // 必要な実際の編成・購入数は下流の時系列Combat Planが盤面の交戦・到達
             // 時間・損耗で決めるため、ここでは観測済み敵戦闘数を護衛枠として渡す。
-            let combat_units = facts.enemy_combat_units;
+            // 標準V4は従来どおり占領要員だけを要求し、護衛枠は下流の計画へ委ねる。
+            let combat_units = if standard_v4 {
+                0
+            } else {
+                facts.enemy_combat_units
+            };
             assessment.decision = IslandCampaignDecision::Contest;
             assessment.decision_reason =
                 "占領競争の時間内に介入できるため作戦を継続する".to_owned();
@@ -1759,8 +1775,14 @@ fn candidate_target_position(
     player_id: PlayerId,
     decision: IslandCampaignDecision,
     existing_operation: Option<&ExistingCampaignOperation>,
+    standard_v4: bool,
 ) -> Option<GridPosition> {
-    let origins = capture_front_origins(island, properties, units, player_id, existing_operation);
+    // 標準V4は前線の起点を島内の自軍所有施設で測る従来方式を維持する。
+    let origins = if standard_v4 {
+        owned_property_origins(island, properties, player_id)
+    } else {
+        capture_front_origins(island, properties, units, player_id, existing_operation)
+    };
     let mut targets = properties
         .iter()
         .filter(|snapshot| island.tiles.contains(&snapshot.position))
@@ -1780,7 +1802,7 @@ fn candidate_target_position(
 
     // 防衛作戦のアンカーは、奪取対象ではなく守るべき自軍施設である。敵が航空機だけで
     // 島外から接近している場合でも、候補自体を失うとThreatened島の防衛編成が作れない。
-    if decision == IslandCampaignDecision::Defend {
+    if !standard_v4 && decision == IslandCampaignDecision::Defend {
         let mut defensive_targets = properties
             .iter()
             .filter(|snapshot| island.tiles.contains(&snapshot.position))
@@ -1814,6 +1836,10 @@ fn candidate_target_position(
         {
             return Some(operation.target_position);
         }
+    }
+    // 標準V4は従来どおり、未所有施設がなければ島の先頭タイルを目標にする。
+    if standard_v4 {
+        return nearest.or_else(|| sorted_island_tiles(island).first().copied());
     }
     // 未所有の施設がなくなった島へ、任意の島タイルを輸送目標としてはいけない。
     // とくに島の先頭タイルが浅瀬だと、揚陸艇はcargoを降ろせない浅瀬まで進んで
@@ -1862,8 +1888,14 @@ fn candidate_capture_target_positions(
     player_id: PlayerId,
     primary_target: GridPosition,
     existing_operation: Option<&ExistingCampaignOperation>,
+    standard_v4: bool,
 ) -> Vec<GridPosition> {
-    let origins = capture_front_origins(island, properties, units, player_id, existing_operation);
+    // 標準V4は前線の起点を島内の自軍所有施設で測り、進軍軸ごとの分割も行わない。
+    let origins = if standard_v4 {
+        owned_property_origins(island, properties, player_id)
+    } else {
+        capture_front_origins(island, properties, units, player_id, existing_operation)
+    };
     let mut targets: Vec<_> = properties
         .iter()
         .filter(|snapshot| island.tiles.contains(&snapshot.position))
@@ -1900,7 +1932,9 @@ fn candidate_capture_target_positions(
         })
         .map(|snapshot| snapshot.position);
 
-    let route_fronts = if let (Some(own_cap), Some(enemy_cap)) = (own_capital, enemy_capital) {
+    let route_fronts = if standard_v4 {
+        Vec::new()
+    } else if let (Some(own_cap), Some(enemy_cap)) = (own_capital, enemy_capital) {
         crate::ai::v4::armored_capital_route_fronts(map, registry, own_cap, enemy_cap)
     } else {
         Vec::new()
@@ -1956,6 +1990,22 @@ fn candidate_capture_target_positions(
         targets.insert(0, primary_target);
     }
     targets
+}
+
+/// 標準V4の前線起点: 島内にある自軍所有施設の座標。
+fn owned_property_origins(
+    island: &Island,
+    properties: &[PropertySnapshot],
+    player_id: PlayerId,
+) -> Vec<GridPosition> {
+    properties
+        .iter()
+        .filter(|snapshot| {
+            island.tiles.contains(&snapshot.position)
+                && snapshot.property.owner_id == Some(player_id)
+        })
+        .map(|snapshot| snapshot.position)
+        .collect()
 }
 
 /// 局地占領作戦の前線は、所有施設ではなく実際にその作戦へ所属する占領兵から測る。
@@ -2364,6 +2414,8 @@ pub fn analyze_island_campaign_excluding(
     player_id: PlayerId,
     reserved_entities: &HashSet<Entity>,
 ) -> IslandCampaignPortfolio {
+    // 標準V4は目標選定・要求算出で従来の挙動を維持するため、ここで一度だけ判定する。
+    let standard_v4 = crate::ai::strategy_profile::is_standard_v4(world, player_id);
     let facts = collect_island_campaign_facts(world, player_id);
     let map = world.resource::<Map>().clone();
     let island_map = world
@@ -2500,7 +2552,8 @@ pub fn analyze_island_campaign_excluding(
         let mut assessment = assess_island(island_facts);
         // 陸塊が1つだけでも島嶼mapと同じ継続campaignとして扱う。違いは
         // `reachable` と輸送routeから輸送工程が必要になるかどうかだけである。
-        let mut requirement = requirement_for_assessment(island_facts, &mut assessment);
+        let mut requirement =
+            requirement_for_assessment_with_policy(island_facts, &mut assessment, standard_v4);
         let existing_operation = operations_by_island.get(&island.id).cloned();
         let assault_wave_is_live = existing_operation.as_ref().is_some_and(|operation| {
             matches!(
@@ -2583,9 +2636,11 @@ pub fn analyze_island_campaign_excluding(
             player_id,
             assessment.decision,
             existing_operation.as_ref(),
+            standard_v4,
         );
         let Some(target_position) = target_position else {
-            return Some((assessment, None));
+            // 標準V4は目標のない島を評価ごと除外する（従来挙動）。
+            return (!standard_v4).then_some((assessment, None));
         };
         let capture_target_positions = candidate_capture_target_positions(
             &map,
@@ -2596,6 +2651,7 @@ pub fn analyze_island_campaign_excluding(
             player_id,
             target_position,
             existing_operation.as_ref(),
+            standard_v4,
         );
         let has_foothold = properties.iter().any(|property| {
             island.tiles.contains(&property.position)
@@ -2705,6 +2761,15 @@ pub fn analyze_island_campaign_excluding(
             home_position,
         );
     }
+    // 標準V4は候補化された島の評価だけをportfolioへ載せる（候補外の島評価は保持しない）。
+    let assessments = if standard_v4 {
+        candidates
+            .iter()
+            .map(|candidate| candidate.assessment.clone())
+            .collect()
+    } else {
+        assessments
+    };
     let mut portfolio = allocate_campaign_portfolio_with_assessments(candidates, pool, assessments);
     if let Some((capital_island, logistics_ready, combat_plan_ready)) = capital_launch_gate {
         gate_capital_assault_launch(
@@ -2758,6 +2823,7 @@ mod tests {
             player,
             IslandCampaignDecision::Assault,
             None,
+            false,
         );
         assert_eq!(left_target, Some(GridPosition { x: 2, y: 0 }));
 
@@ -2775,6 +2841,7 @@ mod tests {
             player,
             IslandCampaignDecision::Assault,
             None,
+            false,
         );
         assert_eq!(right_target, Some(GridPosition { x: 8, y: 0 }));
         assert_eq!(
@@ -2787,6 +2854,7 @@ mod tests {
                 player,
                 right_target.expect("右側前線"),
                 None,
+                false,
             ),
             vec![GridPosition { x: 8, y: 0 }]
         );
@@ -2818,6 +2886,7 @@ mod tests {
                 player,
                 IslandCampaignDecision::Secure,
                 None,
+                false,
             ),
             None
         );
@@ -2850,6 +2919,7 @@ mod tests {
                 player,
                 IslandCampaignDecision::Assault,
                 None,
+                false,
             ),
             Some(enemy_position)
         );
@@ -2914,6 +2984,7 @@ mod tests {
                 player,
                 IslandCampaignDecision::Secure,
                 Some(&operation),
+                false,
             ),
             Some(GridPosition { x: 8, y: 0 })
         );
@@ -2927,6 +2998,7 @@ mod tests {
                 player,
                 GridPosition { x: 8, y: 0 },
                 Some(&operation),
+                false,
             ),
             vec![GridPosition { x: 8, y: 0 }]
         );
@@ -2996,6 +3068,7 @@ mod tests {
                 player,
                 IslandCampaignDecision::Contest,
                 Some(&operation),
+                false,
             ),
             Some(strategic_target),
             "同一陸塊の戦略目標を、後方の担当歩兵に近い中立拠点へ戻さない"

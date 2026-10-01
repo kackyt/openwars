@@ -14,17 +14,17 @@
 
 mod assignment;
 pub mod campaign_execution;
-mod combat_profile;
+pub(crate) mod combat_profile;
 pub mod deployment;
 pub(crate) mod home_defense;
 pub mod logistics_plan;
 pub mod operation;
-mod operation_selection;
+pub(crate) mod operation_selection;
 pub mod plan_contract;
 pub mod plan_revision;
 pub mod property_control;
 pub mod rolling_plan;
-pub(crate) mod strategy_pipeline;
+pub(crate) mod small_map;
 pub mod trace;
 pub mod victory_roadmap;
 
@@ -1641,6 +1641,8 @@ fn decide_campaign_production_v4(
     // 消えてしまう。直接到達できる前線でも、その要求だけは専用経路に残す。
     // 目標一覧そのものはcampaign/roadmapに残るため、単一目標へ縮退することはない。
     let mut reach = ReachCtx::default();
+    // 標準V4は橋頭堡への装甲到達要求を扱わず、陸続きの前線を丸ごと通常生産へ委ねる。
+    let standard_v4 = crate::ai::strategy_profile::is_standard_v4(world, player_id);
     let armored_entry_cost = scan
         .available_types
         .iter()
@@ -1657,7 +1659,7 @@ fn decide_campaign_production_v4(
         if !has_direct_capture_route(&scan, &mut reach, shortfall) {
             return true;
         }
-        if shortfall.ground_combat_units == 0 {
+        if standard_v4 || shortfall.ground_combat_units == 0 {
             return false;
         }
 
@@ -1684,6 +1686,10 @@ fn decide_campaign_production_v4(
         {
             shortfall.combat_units = 0;
         }
+        // 標準V4では地上戦闘ユニットの追加要求をキャンペーン生産へ渡さない。
+        if standard_v4 {
+            shortfall.ground_combat_units = 0;
+        }
     }
 
     let enemy_stats: Vec<_> = scan
@@ -1691,7 +1697,7 @@ fn decide_campaign_production_v4(
         .iter()
         .map(|unit| unit.stats.clone())
         .collect();
-    let outcome = plan_campaign_with_expansion_denial_reserve(
+    let mut outcome = plan_campaign_with_expansion_denial_reserve(
         player_id,
         &shortfalls,
         &scan.free_facilities,
@@ -1703,6 +1709,12 @@ fn decide_campaign_production_v4(
         &scan.master_data,
         scan.funds,
     );
+    // 標準V4の生産意図には小規模マップ用の任務目標を付けない。
+    if standard_v4 {
+        for intent in &mut outcome.intents {
+            intent.mission_target = None;
+        }
+    }
     world.init_resource::<campaign_execution::V4CampaignExecutionRegistry>();
     world
         .resource_mut::<campaign_execution::V4CampaignExecutionRegistry>()
@@ -5619,7 +5631,7 @@ impl BoardScan {
         let portfolio = cached_portfolio.unwrap_or_else(|| {
             let mut portfolio =
                 crate::ai::island_campaign_analysis::analyze_island_campaign(world, player_id);
-            crate::ai::v4::strategy_pipeline::prepare_strategy(world, player_id, &mut portfolio);
+            crate::ai::v4::small_map::prepare_strategy(world, player_id, &mut portfolio);
             portfolio
         });
         let mut campaign_objectives: Vec<CampaignPlanningObjective> = portfolio
@@ -5963,6 +5975,28 @@ impl BoardScan {
                 .map(|(position, _)| map.distance(position.x, position.y, capital.x, capital.y))
                 .min()
                 .unwrap_or(u32::MAX);
+            if opening_policy == OpeningProductionPolicy::Standard {
+                // 標準戦線では前線到達だけで本隊を解放しない。局地拠点の所有数で
+                // 優位を作ってから首都作戦へ切り替え、序盤の敵全生産枠を吸い込まない。
+                let owned_count = owned_properties
+                    .iter()
+                    .filter(|(position, _)| {
+                        island_map
+                            .get_island_at(position)
+                            .is_some_and(|island| island.id == capital_island)
+                    })
+                    .count();
+                let enemy_count = open_properties
+                    .iter()
+                    .filter(|position| {
+                        island_map
+                            .get_island_at(position)
+                            .is_some_and(|island| island.id == capital_island)
+                    })
+                    .count();
+                return owned_count > enemy_count
+                    && same_land_capital_front_reached(route_distance, forward_distance);
+            }
             // DAGが存在する地図では、側方の所有地ではなく各routeの先頭未確保拠点を
             // 正本にする。Topology未初期化の単体テストなどだけ、従来の距離判定へ
             // フォールバックする。
@@ -6207,7 +6241,10 @@ fn build_operations(
         .iter()
         .enumerate()
         .map(|(index, candidate)| {
-            if candidate.kind != OperationKind::Capture {
+            // 物件ごとの制御計画は小規模マップ専用。標準V4は既存のCapture作戦を使う。
+            if scan.opening_policy == Some(OpeningProductionPolicy::Standard)
+                || candidate.kind != OperationKind::Capture
+            {
                 return None;
             }
             // 初動の中立物件レースはDAG区間をまたいで同時に進むため、最優先Captureが
@@ -6260,7 +6297,13 @@ fn build_operations(
                 || {
                     campaign_for_cluster(candidate.kind, &candidate.cluster).map_or_else(
                         || anchor_of(&candidate.cluster, scan),
-                        |objective| objective.staging_anchor,
+                        |objective| {
+                            if scan.opening_policy == Some(OpeningProductionPolicy::Standard) {
+                                objective.anchor
+                            } else {
+                                objective.staging_anchor
+                            }
+                        },
                     )
                 },
                 |plan| plan.primary.property,
@@ -6269,12 +6312,21 @@ fn build_operations(
         .collect();
     let operation_leads = anchors
         .iter()
-        .map(|anchor| facility_lead_time(scan, anchor, reference.max_movement))
+        .zip(&scored)
+        .map(|(anchor, candidate)| {
+            if scan.opening_policy == Some(OpeningProductionPolicy::Standard) {
+                candidate.lead
+            } else {
+                facility_lead_time(scan, anchor, reference.max_movement)
+            }
+        })
         .collect::<Vec<_>>();
     let horizons: Vec<u32> = scored
         .iter()
         .enumerate()
-        .map(|(index, candidate)| operation_threat_horizon(candidate.kind, operation_leads[index]))
+        .map(|(index, candidate)| {
+            operation_threat_horizon(candidate.kind, operation_leads[index], scan.opening_policy)
+        })
         .collect();
     let assignment_enabled = scored
         .iter()
@@ -6954,14 +7006,23 @@ fn select_property_control_plan(
     })
 }
 
-fn operation_threat_horizon(kind: OperationKind, deploy_lead_time: u32) -> u32 {
+fn operation_threat_horizon(
+    kind: OperationKind,
+    deploy_lead_time: u32,
+    opening_policy: Option<OpeningProductionPolicy>,
+) -> u32 {
     match kind {
         OperationKind::Defense => DEFENSE_THREAT_ETA,
         OperationKind::Capture => deploy_lead_time.saturating_add(CAPTURE_COMPLETION_TURNS),
-        // 首都作戦の論理目標は首都だが、現在バッチの接触地点はDAGの次区間である。
-        // 首都到達までの全手番を一括で見積もると、未観測の敵生産を現在要求へ
-        // 膨張させるため、次区間を確保して再評価できる時点までに限定する。
-        OperationKind::AssaultCapital => deploy_lead_time.saturating_add(CAPTURE_COMPLETION_TURNS),
+        // 標準戦線は首都攻略の編成全体を見積もる。小規模のDAG戦線だけは
+        // 次区間を確保して再評価する時間幅に限定する。
+        OperationKind::AssaultCapital => deploy_lead_time.saturating_add(
+            if opening_policy == Some(OpeningProductionPolicy::Standard) {
+                rolling_plan::DEFAULT_SEARCH_TURNS
+            } else {
+                CAPTURE_COMPLETION_TURNS
+            },
+        ),
     }
 }
 
@@ -7417,6 +7478,7 @@ fn build_operation(
             projected_enemy_reinforcement_envelope(scan, ctx, anchors, horizons, index)
         });
 
+    let standard_v4 = scan.opening_policy == Some(OpeningProductionPolicy::Standard);
     // 輸送 1 往復にかかるターン数（片道リードタイムの 2 倍）
     let transport_round_trip_turns = deploy_lead_time.saturating_mul(2).max(1);
 
@@ -7425,9 +7487,12 @@ fn build_operation(
         friendly_capture_units_committed,
         enemy_combat_units,
         friendly_combat_units_committed,
-        // OperationFactsの既存フィールドはExpectedを保持する。Go判定には使わず、
-        // RollingPlanへ渡す通常の継続生産scenarioだけに使う。
-        enemy_reinforcement_funds: enemy_reinforcement.expected_funds,
+        // 標準戦線は作戦期限全体、小規模戦線は直近の生産波を編成の基準にする。
+        enemy_reinforcement_funds: if standard_v4 {
+            enemy_reinforcement.stress_funds
+        } else {
+            enemy_reinforcement.expected_funds
+        },
         friendly_intercept_units_committed,
         deploy_lead_time,
         enemy_contact_eta: if enemy_contact_eta == u32::MAX {
@@ -7439,6 +7504,7 @@ fn build_operation(
         transport_round_trip_turns,
         available_free_cargo_slots,
         unreachable_threat_units,
+        reinforcement_triggers_combat_plan: false,
     };
 
     let mut slots = derive_slots(&facts);
@@ -7450,7 +7516,8 @@ fn build_operation(
     // Capture/Transportを無効化するため、ここで恒久的に0へ落としてはならない。
 
     let enemy_capture_completion = enemy_capture_completion_offset(scan, ctx, &anchor, player_id);
-    if kind == OperationKind::Capture
+    if !standard_v4
+        && kind == OperationKind::Capture
         && capture_race_behind(deploy_lead_time, enemy_capture_completion, player_id)
     {
         // 敵が先に占領完了する物件へ、占領枠を複数方向へ広げない。
@@ -7487,6 +7554,29 @@ fn build_operation(
         contingency_reserve_funds: 0,
     };
     let horizon = operation.threat_horizon.max(1);
+    if standard_v4 {
+        // 広い戦線では次波だけで編成を完了扱いにせず、期限内の継続増援に備える。
+        // 観測後に対応可能な兵種は即時の撃破対象から分離し、counter資金を予約する。
+        let assessment = enemy_reinforcement_assessment(
+            scan,
+            ctx,
+            &operation,
+            horizon,
+            enemy_reinforcement.stress_funds,
+            ReinforcementScenario::Stress,
+        );
+        operation.expected_reinforcements = assessment.reinforcements;
+        operation.reinforcement_contingencies = assessment.contingencies;
+        operation.contingency_reserve_funds =
+            contingency_reserve_now(&operation.reinforcement_contingencies, scan.my_income);
+        operation.slots.combat_plan_required = u32::from(
+            !operation.reachable_threats.is_empty()
+                || !operation.expected_reinforcements.is_empty()
+                || (kind == OperationKind::AssaultCapital
+                    && operation.facts.enemy_reinforcement_funds > 0),
+        );
+        return operation;
+    }
     let expected_assessment = enemy_reinforcement_assessment(
         scan,
         ctx,
@@ -7984,6 +8074,13 @@ fn plan_production_with_registry(
                         candidates_pruned: plan.candidates_pruned,
                         search_truncated: plan.search_truncated,
                     });
+                if selected.plan_id.is_none()
+                    && scan.opening_policy == Some(OpeningProductionPolicy::Standard)
+                {
+                    // 標準戦線では長期編成のための資金を、診断用の部分購入で消費しない。
+                    clear_slot(&mut operations[op_index], SlotKind::Combat);
+                    continue;
+                }
                 if selected.plan_id.is_none() {
                     // 長期Expectedを今の資金で全滅できない場合でも、best-effortは
                     // 当手番に到達可能なscreenを返している。これを捨てると「敵増援を
@@ -8253,8 +8350,15 @@ fn plan_production_with_registry(
     let unissued_plan_reserve = plan_registry
         .reserved_purchase_cost(player_id)
         .saturating_sub(issued_plan_purchase_cost);
-    let mut immediate_reinforcement_funds =
-        remaining_funds.saturating_sub(unissued_plan_reserve.saturating_add(contingency_reserve));
+    // 空き工場を埋める即時動員は小規模戦線向け。標準マップでは作戦の購入列に
+    // 従い、安価な増援で残額を使い切って次手番の戦闘編成を妨げない。
+    let mut immediate_reinforcement_funds = if scan.opening_policy
+        == Some(OpeningProductionPolicy::Standard)
+    {
+        0
+    } else {
+        remaining_funds.saturating_sub(unissued_plan_reserve.saturating_add(contingency_reserve))
+    };
     // 到達性と対敵有効度は、残額を工場へ配るたびに変わらない。候補表をここで一度だけ
     // 作り、以下のループでは資金・使用済み施設だけを更新する。
     // 待機線の有無だけで余剰Combatを一律停止しない。Stage戦力は既に
@@ -8770,7 +8874,8 @@ fn enemy_reinforcement_assessment(
     // dominant一種類だけへ絞ると、敵の航空・地上混成を一方の相性だけで見積もり、
     // 対空や占領阻止を後追いにするため、少なくとも観測兵種の混成を維持する。
     let mut expected_enemy_types = observed_enemy_types.clone();
-    if let Some(unit_type) = scan.enemy_production_forecast.dominant_unit_type {
+    let standard_v4 = scan.opening_policy == Some(OpeningProductionPolicy::Standard);
+    if !standard_v4 && let Some(unit_type) = scan.enemy_production_forecast.dominant_unit_type {
         expected_enemy_types.insert(unit_type);
     }
 
@@ -8812,7 +8917,11 @@ fn enemy_reinforcement_assessment(
                 })
                 .filter_map(|(_, stats)| {
                     let eta = eta_turns(&scan.map, &facility.pos, &op.anchor, stats.max_movement);
-                    let available_turn = property_control::produced_action_offset(build_turn, eta);
+                    let available_turn = if standard_v4 {
+                        build_turn.saturating_add(1).saturating_add(eta)
+                    } else {
+                        property_control::produced_action_offset(build_turn, eta)
+                    };
                     if available_turn > horizon {
                         return None;
                     }
@@ -8936,10 +9045,13 @@ fn fastest_observed_counter(
         .filter_map(|(facility, stats)| {
             let damage = best_damage(&scan.damage_chart, stats.unit_type, enemy.unit_type);
             let attacks_required = 100_u32.div_ceil(damage.max(1));
-            let counter_contact_turn = property_control::produced_action_offset(
-                counter_build_turn,
-                eta_turns(&scan.map, &facility, &anchor, stats.max_movement),
-            );
+            let eta = eta_turns(&scan.map, &facility, &anchor, stats.max_movement);
+            let counter_contact_turn =
+                if scan.opening_policy == Some(OpeningProductionPolicy::Standard) {
+                    counter_build_turn.saturating_add(1).saturating_add(eta)
+                } else {
+                    property_control::produced_action_offset(counter_build_turn, eta)
+                };
             (counter_contact_turn <= enemy_contact_turn).then_some((
                 counter_contact_turn,
                 attacks_required,
@@ -8969,8 +9081,7 @@ fn fastest_observed_counter(
 
 /// 将来収入で賄えない累積counter費用だけを、現在残高から予約する。
 ///
-/// 未観測増援を予約しない現在のV4では、旧対比テスト専用の補助関数である。
-#[cfg(test)]
+/// 標準戦線の観測後counterに必要な現金だけを予約し、将来収入で賄える分は残す。
 fn contingency_reserve_now(
     contingencies: &[ReinforcementContingency],
     income_per_turn: u32,
@@ -9008,6 +9119,7 @@ fn combat_plan_input(
     require_self_deployment: bool,
     player_id: PlayerId,
 ) -> Option<RollingPlanInput> {
+    let standard_v4 = scan.opening_policy == Some(OpeningProductionPolicy::Standard);
     let enemies: Vec<_> = op
         .reachable_threats
         .iter()
@@ -9034,7 +9146,7 @@ fn combat_plan_input(
     let mut hard_deadline =
         if op.kind == OperationKind::Defense && op.facts.enemy_contact_eta != u32::MAX {
             Some(op.facts.enemy_contact_eta.max(1))
-        } else if op.kind == OperationKind::Capture {
+        } else if !standard_v4 && op.kind == OperationKind::Capture {
             if let Some(control) = op.property_control.filter(|control| control.disaggregated) {
                 if control.approach == PropertyControlApproach::Interdict {
                     // 同一roundなら先手だけが敵占領完了前に行動できる。後手は一つ前の
@@ -9082,9 +9194,15 @@ fn combat_plan_input(
     // Campaign側の0は「追加の生存占領役を予約していない」という意味であり、
     // 目前の未所有物件を占領しなくてよい、ではない。局地レーンとcampaign要求の
     // 大きい方をRolling Planへ渡し、歩兵を余剰生産へ漏らさない。
-    let required_capture_survivors = campaign_objective
-        .map_or(local_capture_requirement, |objective| {
-            local_capture_requirement.max(objective.required_capture_survivors)
+    let required_capture_survivors =
+        campaign_objective.map_or(local_capture_requirement, |objective| {
+            if standard_v4 {
+                // 標準の島campaignが予約した占領担当数を正本とする。全未所有物件を
+                // 同時に占領する人数へ膨張させると、戦闘編成が永久に実行不能になる。
+                objective.required_capture_survivors
+            } else {
+                local_capture_requirement.max(objective.required_capture_survivors)
+            }
         });
     if campaign_scope_audit_enabled() {
         eprintln!(
@@ -9162,7 +9280,7 @@ fn combat_plan_input(
     // Capture作戦のCombat計画は「今の物件レース」を解くもので、将来生産される
     // 増援は対象にしない。将来増援まで含めると全滅が実行不能になり、快速の妨害が
     // 出せなくなる。将来増援への備えはDefense/AssaultCapital側が担う。
-    if op.kind != OperationKind::Capture {
+    if standard_v4 || op.kind != OperationKind::Capture {
         enemies.extend(op.expected_reinforcements.iter().cloned());
     }
     if enemies.is_empty() {
@@ -9279,6 +9397,42 @@ fn combat_plan_input(
             engageable_enemy_indices: Vec::new(),
             protection_completion_turn: None,
         });
+    }
+    if standard_v4 && let Some(reference) = scan.reference_capture_unit() {
+        // 標準のCapture発注は物件契約を持たないため、filled台帳から当手番の
+        // 未Entity化担当を投影する。既存担当と契約付き発注は二重計上しない。
+        let credited = existing_protected_count.saturating_add(protected_units.len());
+        let newly_ordered = usize::try_from(op.filled.capture_units)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(credited)
+            .min(required_capture_survivors.saturating_sub(credited));
+        let targets = if op.objective_properties.is_empty() {
+            std::slice::from_ref(&op.anchor)
+        } else {
+            op.objective_properties.as_slice()
+        };
+        for index in 0..newly_ordered {
+            let target = targets[index % targets.len()];
+            let movement_turns = if op.facts.requires_transport {
+                op.facts.deploy_lead_time.max(1)
+            } else {
+                scan.production_facilities
+                    .iter()
+                    .map(|(facility, _)| {
+                        eta_turns(&scan.map, facility, &target, reference.max_movement)
+                    })
+                    .min()
+                    .unwrap_or(op.facts.deploy_lead_time)
+            };
+            protected_units.push(FriendlyPlanUnit {
+                stats: reference.clone(),
+                position: target,
+                hp: 100,
+                available_turn: 1_u32.saturating_add(movement_turns),
+                engageable_enemy_indices: Vec::new(),
+                protection_completion_turn: None,
+            });
+        }
     }
     if capture_completion_turn.is_none()
         && required_capture_survivors > 0
@@ -9701,7 +9855,15 @@ fn combat_plan_input(
         protected_units,
         enemies,
         production_options: options,
-        production_attack_projections,
+        // 標準戦線は従来の作戦距離モデルで長期編成を比較する。小規模の一手先
+        // 射撃セルへの厳密投影を混ぜると、到着の早い軽戦力だけに編成が偏る。
+        production_attack_projections: if scan.opening_policy
+            == Some(OpeningProductionPolicy::Standard)
+        {
+            Vec::new()
+        } else {
+            production_attack_projections
+        },
         deadline_target_index,
         interdiction_deadlines,
         current_funds: remaining_funds,
@@ -14042,6 +14204,126 @@ mod tests {
             capital_staging_anchor: None,
             enemy_production_forecast: EnemyProductionForecastTrace::default(),
         }
+    }
+
+    #[test]
+    fn standard_capture_orders_are_credited_without_property_contracts() {
+        let mut scan = mixed_threat_multi_factory_scan();
+        scan.opening_policy = Some(OpeningProductionPolicy::Standard);
+        scan.campaign_objectives[0].required_capture_survivors = 2;
+        let mut ctx = ReachCtx::default();
+        let mut operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
+        let operation = operations
+            .iter_mut()
+            .find(|operation| operation.kind == OperationKind::Capture)
+            .unwrap();
+        operation.filled.capture_units = 2;
+        assert!(operation.planned_capture_units.is_empty());
+        let input = combat_plan_input(
+            &scan,
+            &mut ctx,
+            operation,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            scan.funds,
+            false,
+            PlayerId(1),
+        )
+        .unwrap();
+        assert_eq!(input.required_capture_survivors, 2);
+        assert_eq!(input.protected_units.len(), 2);
+    }
+
+    #[test]
+    fn standard_capital_assault_waits_for_local_property_control() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master_data,
+            "map_25",
+            crate::resources::GridTopology::Hex,
+        )
+        .unwrap();
+        let mut settings = crate::ai::PlayerAiSettings::default();
+        settings.set_version(PlayerId(1), crate::ai::AiVersion::V4);
+        world.insert_resource(settings);
+        let scan = BoardScan::collect(&mut world, PlayerId(1)).expect("標準マップの盤面");
+        assert_eq!(scan.opening_policy, Some(OpeningProductionPolicy::Standard));
+        // 中間地点に初期所有物件があるだけでは、局地戦を飛ばして首都へ向かわない。
+        assert!(!scan.capital_assault_authorized);
+    }
+
+    #[test]
+    fn standard_combat_plan_uses_the_campaign_capture_quota() {
+        let mut scan = mixed_threat_multi_factory_scan();
+        scan.opening_policy = Some(OpeningProductionPolicy::Standard);
+        let mut ctx = ReachCtx::default();
+        let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
+        let operation = operations
+            .iter()
+            .find(|operation| operation.kind == OperationKind::Capture)
+            .expect("占領作戦");
+        assert!(!operation.objective_properties.is_empty());
+        let input = combat_plan_input(
+            &scan,
+            &mut ctx,
+            operation,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            scan.funds,
+            false,
+            PlayerId(1),
+        )
+        .expect("実在敵に対する戦闘編成");
+        // Campaignが追加の占領担当を要求していないなら、戦闘編成へ水増ししない。
+        assert_eq!(input.required_capture_survivors, 0);
+        assert!(input.hard_deadline.is_none());
+    }
+
+    #[test]
+    fn standard_capital_operation_keeps_the_full_formation_horizon() {
+        let lead = 3;
+        assert_eq!(
+            operation_threat_horizon(
+                OperationKind::AssaultCapital,
+                lead,
+                Some(OpeningProductionPolicy::Standard),
+            ),
+            lead + rolling_plan::DEFAULT_SEARCH_TURNS,
+        );
+        assert_eq!(
+            operation_threat_horizon(
+                OperationKind::AssaultCapital,
+                lead,
+                Some(OpeningProductionPolicy::SmallMapExpansion),
+            ),
+            lead + CAPTURE_COMPLETION_TURNS,
+        );
+    }
+
+    #[test]
+    fn standard_frontline_keeps_funds_for_an_affordable_full_plan() {
+        let mut scan = mixed_threat_multi_factory_scan();
+        scan.opening_policy = Some(OpeningProductionPolicy::Standard);
+        // 対空・対地の編成が成立する前に、診断用の部分購入で資金を使い切らない。
+        scan.funds = 8_000;
+        let (commands, trace) = plan_production(&scan, PlayerId(1), true, &HashMap::new());
+        assert!(
+            trace
+                .rolling_combat_plans
+                .iter()
+                .any(|plan| plan.plan_id.is_none())
+        );
+        assert!(
+            commands.iter().all(|command| {
+                command
+                    .deployment
+                    .as_ref()
+                    .is_none_or(|deployment| deployment.slot_kind != SlotKind::Combat)
+            }),
+            "commands={commands:?}, trace={trace:?}"
+        );
     }
 
     /// キャンペーンの予約超過分は、構造枠を二重購入せず、自力展開可能な対敵戦力へ使う。

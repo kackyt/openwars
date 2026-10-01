@@ -10,7 +10,7 @@ use crate::components::GridPosition;
 const BASE_OPERATION_CAPACITY: usize = 4;
 
 #[derive(Debug, Clone)]
-pub(super) struct OperationCandidate {
+pub(crate) struct OperationCandidate {
     pub continuing: bool,
     pub lead: u32,
     pub kind: OperationKind,
@@ -20,7 +20,7 @@ pub(super) struct OperationCandidate {
 }
 
 /// 優先度順の候補から、全必須作戦と容量内の追加作戦を選ぶ。
-pub(super) fn select_operation_candidates(
+pub(crate) fn select_operation_candidates(
     candidates: Vec<OperationCandidate>,
 ) -> Vec<OperationCandidate> {
     let required_count = candidates

@@ -243,7 +243,7 @@ fn analyze_strategy_internal(
             if is_v4 {
                 // 小規模/通常の分岐はここで持たず、ターン入口で確定したパイプラインへ
                 // portfolioを渡す。各層が別々に小規模作戦を有効化しないための境界である。
-                crate::ai::v4::strategy_pipeline::prepare_strategy(
+                crate::ai::v4::small_map::prepare_strategy(
                     world,
                     player_id,
                     &mut strategy.campaign_portfolio,

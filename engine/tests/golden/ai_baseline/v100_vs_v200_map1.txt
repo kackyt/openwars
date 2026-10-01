@@ -1,0 +1,547 @@
+scenario v100_vs_v200_map1 map=map_1 seed=1 P1=V100 P2=V200
+T1 P1 begin V100
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 6, target_y: 3, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 6, target_y: 3, unit_type: Infantry, entity: <entity> }
+    ev GamePhaseChangedEvent { new_phase: Main, active_player: PlayerId(1) }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 7, target_y: 4, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 7, target_y: 4, unit_type: Infantry, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 6, target_y: 4, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 6, target_y: 4, unit_type: Infantry, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 7, target_y: 3, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 7, target_y: 3, unit_type: Infantry, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 5, target_y: 3, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 5, target_y: 3, unit_type: Infantry, entity: <entity> }
+  <end>
+    ev GamePhaseChangedEvent { new_phase: Main, active_player: PlayerId(2) }
+T1 P1 end
+  funds P1 = 7000
+  funds P2 = 12000
+  unit P1 Infantry (5,3) hp=100
+  unit P1 Infantry (6,3) hp=100
+  unit P1 Infantry (6,4) hp=100
+  unit P1 Infantry (7,3) hp=100
+  unit P1 Infantry (7,4) hp=100
+  prop (1,7) City owner=Some(2) cp=200
+  prop (2,11) Factory owner=Some(2) cp=200
+  prop (2,7) City owner=Some(1) cp=200
+  prop (3,10) Factory owner=Some(2) cp=200
+  prop (3,11) Capital owner=Some(2) cp=400
+  prop (3,7) City owner=Some(2) cp=200
+  prop (4,10) Factory owner=Some(2) cp=200
+  prop (4,11) Factory owner=Some(2) cp=200
+  prop (4,7) City owner=Some(1) cp=200
+  prop (5,3) Factory owner=Some(1) cp=200
+  prop (5,7) City owner=Some(2) cp=200
+  prop (6,3) Capital owner=Some(1) cp=400
+  prop (6,4) Factory owner=Some(1) cp=200
+  prop (6,7) City owner=Some(1) cp=200
+  prop (7,3) Factory owner=Some(1) cp=200
+  prop (7,4) Factory owner=Some(1) cp=200
+  prop (7,7) City owner=Some(2) cp=200
+  prop (8,7) City owner=Some(1) cp=200
+T1 P2 begin V200
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 3, target_y: 11, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 3, target_y: 11, unit_type: Infantry, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 4, target_y: 10, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 4, target_y: 10, unit_type: Infantry, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 3, target_y: 10, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 3, target_y: 10, unit_type: Infantry, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 4, target_y: 11, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 4, target_y: 11, unit_type: Infantry, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 2, target_y: 11, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 2, target_y: 11, unit_type: Infantry, entity: <entity> }
+  <end>
+    ev GamePhaseChangedEvent { new_phase: Main, active_player: PlayerId(1) }
+T1 P2 end
+  funds P1 = 19000
+  funds P2 = 7000
+  unit P1 Infantry (5,3) hp=100
+  unit P1 Infantry (6,3) hp=100
+  unit P1 Infantry (6,4) hp=100
+  unit P1 Infantry (7,3) hp=100
+  unit P1 Infantry (7,4) hp=100
+  unit P2 Infantry (2,11) hp=100
+  unit P2 Infantry (3,10) hp=100
+  unit P2 Infantry (3,11) hp=100
+  unit P2 Infantry (4,10) hp=100
+  unit P2 Infantry (4,11) hp=100
+  prop (1,7) City owner=Some(2) cp=200
+  prop (2,11) Factory owner=Some(2) cp=200
+  prop (2,7) City owner=Some(1) cp=200
+  prop (3,10) Factory owner=Some(2) cp=200
+  prop (3,11) Capital owner=Some(2) cp=400
+  prop (3,7) City owner=Some(2) cp=200
+  prop (4,10) Factory owner=Some(2) cp=200
+  prop (4,11) Factory owner=Some(2) cp=200
+  prop (4,7) City owner=Some(1) cp=200
+  prop (5,3) Factory owner=Some(1) cp=200
+  prop (5,7) City owner=Some(2) cp=200
+  prop (6,3) Capital owner=Some(1) cp=400
+  prop (6,4) Factory owner=Some(1) cp=200
+  prop (6,7) City owner=Some(1) cp=200
+  prop (7,3) Factory owner=Some(1) cp=200
+  prop (7,4) Factory owner=Some(1) cp=200
+  prop (7,7) City owner=Some(2) cp=200
+  prop (8,7) City owner=Some(1) cp=200
+T2 P1 begin V100
+  Wait { target_pos: GridPosition { x: 7, y: 5 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 6, y: 3 }, to: GridPosition { x: 7, y: 5 }, fuel_used: 2 }
+  Wait { target_pos: GridPosition { x: 6, y: 6 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 7, y: 4 }, to: GridPosition { x: 6, y: 6 }, fuel_used: 2 }
+  Wait { target_pos: GridPosition { x: 4, y: 6 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 6, y: 4 }, to: GridPosition { x: 4, y: 6 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 6, y: 5 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 7, y: 3 }, to: GridPosition { x: 6, y: 5 }, fuel_used: 2 }
+  Wait { target_pos: GridPosition { x: 3, y: 5 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 5, y: 3 }, to: GridPosition { x: 3, y: 5 }, fuel_used: 3 }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 6, target_y: 3, unit_type: Recon }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 6, target_y: 3, unit_type: Recon, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 7, target_y: 4, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 7, target_y: 4, unit_type: Infantry, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 6, target_y: 4, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 6, target_y: 4, unit_type: Infantry, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 7, target_y: 3, unit_type: Recon }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 7, target_y: 3, unit_type: Recon, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 5, target_y: 3, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 5, target_y: 3, unit_type: Infantry, entity: <entity> }
+  <end>
+    ev GamePhaseChangedEvent { new_phase: Main, active_player: PlayerId(2) }
+T2 P1 end
+  funds P1 = 7600
+  funds P2 = 19000
+  unit P1 Infantry (3,5) hp=100
+  unit P1 Infantry (4,6) hp=100
+  unit P1 Infantry (5,3) hp=100
+  unit P1 Infantry (6,4) hp=100
+  unit P1 Infantry (6,5) hp=100
+  unit P1 Infantry (6,6) hp=100
+  unit P1 Infantry (7,4) hp=100
+  unit P1 Infantry (7,5) hp=100
+  unit P1 Recon (6,3) hp=100
+  unit P1 Recon (7,3) hp=100
+  unit P2 Infantry (2,11) hp=100
+  unit P2 Infantry (3,10) hp=100
+  unit P2 Infantry (3,11) hp=100
+  unit P2 Infantry (4,10) hp=100
+  unit P2 Infantry (4,11) hp=100
+  prop (1,7) City owner=Some(2) cp=200
+  prop (2,11) Factory owner=Some(2) cp=200
+  prop (2,7) City owner=Some(1) cp=200
+  prop (3,10) Factory owner=Some(2) cp=200
+  prop (3,11) Capital owner=Some(2) cp=400
+  prop (3,7) City owner=Some(2) cp=200
+  prop (4,10) Factory owner=Some(2) cp=200
+  prop (4,11) Factory owner=Some(2) cp=200
+  prop (4,7) City owner=Some(1) cp=200
+  prop (5,3) Factory owner=Some(1) cp=200
+  prop (5,7) City owner=Some(2) cp=200
+  prop (6,3) Capital owner=Some(1) cp=400
+  prop (6,4) Factory owner=Some(1) cp=200
+  prop (6,7) City owner=Some(1) cp=200
+  prop (7,3) Factory owner=Some(1) cp=200
+  prop (7,4) Factory owner=Some(1) cp=200
+  prop (7,7) City owner=Some(2) cp=200
+  prop (8,7) City owner=Some(1) cp=200
+T2 P2 begin V200
+  Wait { target_pos: GridPosition { x: 5, y: 9 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 3, y: 11 }, to: GridPosition { x: 5, y: 9 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 3, y: 8 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 4, y: 10 }, to: GridPosition { x: 3, y: 8 }, fuel_used: 2 }
+  Wait { target_pos: GridPosition { x: 6, y: 10 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 3, y: 10 }, to: GridPosition { x: 6, y: 10 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 7, y: 10 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 4, y: 11 }, to: GridPosition { x: 7, y: 10 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 5, y: 10 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 2, y: 11 }, to: GridPosition { x: 5, y: 10 }, fuel_used: 3 }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 3, target_y: 11, unit_type: Recon }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 3, target_y: 11, unit_type: Recon, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 4, target_y: 10, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 4, target_y: 10, unit_type: Infantry, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 3, target_y: 10, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 3, target_y: 10, unit_type: Infantry, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 4, target_y: 11, unit_type: Recon }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 4, target_y: 11, unit_type: Recon, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 2, target_y: 11, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 2, target_y: 11, unit_type: Infantry, entity: <entity> }
+  <end>
+    ev GamePhaseChangedEvent { new_phase: Main, active_player: PlayerId(1) }
+T2 P2 end
+  funds P1 = 19600
+  funds P2 = 7600
+  unit P1 Infantry (3,5) hp=100
+  unit P1 Infantry (4,6) hp=100
+  unit P1 Infantry (5,3) hp=100
+  unit P1 Infantry (6,4) hp=100
+  unit P1 Infantry (6,5) hp=100
+  unit P1 Infantry (6,6) hp=100
+  unit P1 Infantry (7,4) hp=100
+  unit P1 Infantry (7,5) hp=100
+  unit P1 Recon (6,3) hp=100
+  unit P1 Recon (7,3) hp=100
+  unit P2 Infantry (2,11) hp=100
+  unit P2 Infantry (3,10) hp=100
+  unit P2 Infantry (3,8) hp=100
+  unit P2 Infantry (4,10) hp=100
+  unit P2 Infantry (5,10) hp=100
+  unit P2 Infantry (5,9) hp=100
+  unit P2 Infantry (6,10) hp=100
+  unit P2 Infantry (7,10) hp=100
+  unit P2 Recon (3,11) hp=100
+  unit P2 Recon (4,11) hp=100
+  prop (1,7) City owner=Some(2) cp=200
+  prop (2,11) Factory owner=Some(2) cp=200
+  prop (2,7) City owner=Some(1) cp=200
+  prop (3,10) Factory owner=Some(2) cp=200
+  prop (3,11) Capital owner=Some(2) cp=400
+  prop (3,7) City owner=Some(2) cp=200
+  prop (4,10) Factory owner=Some(2) cp=200
+  prop (4,11) Factory owner=Some(2) cp=200
+  prop (4,7) City owner=Some(1) cp=200
+  prop (5,3) Factory owner=Some(1) cp=200
+  prop (5,7) City owner=Some(2) cp=200
+  prop (6,3) Capital owner=Some(1) cp=400
+  prop (6,4) Factory owner=Some(1) cp=200
+  prop (6,7) City owner=Some(1) cp=200
+  prop (7,3) Factory owner=Some(1) cp=200
+  prop (7,4) Factory owner=Some(1) cp=200
+  prop (7,7) City owner=Some(2) cp=200
+  prop (8,7) City owner=Some(1) cp=200
+T3 P1 begin V100
+  Wait { target_pos: GridPosition { x: 5, y: 4 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 6, y: 3 }, to: GridPosition { x: 5, y: 4 }, fuel_used: 2 }
+  Wait { target_pos: GridPosition { x: 4, y: 3 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 7, y: 3 }, to: GridPosition { x: 4, y: 3 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 7, y: 6 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 7, y: 4 }, to: GridPosition { x: 7, y: 6 }, fuel_used: 2 }
+  Wait { target_pos: GridPosition { x: 5, y: 6 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 6, y: 4 }, to: GridPosition { x: 5, y: 6 }, fuel_used: 2 }
+  Wait { target_pos: GridPosition { x: 4, y: 5 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 5, y: 3 }, to: GridPosition { x: 4, y: 5 }, fuel_used: 2 }
+  Capture { target_pos: GridPosition { x: 3, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 4, y: 6 }, to: GridPosition { x: 3, y: 7 }, fuel_used: 1 }
+  Capture { target_pos: GridPosition { x: 5, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 6, y: 6 }, to: GridPosition { x: 5, y: 7 }, fuel_used: 1 }
+  Capture { target_pos: GridPosition { x: 1, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 3, y: 5 }, to: GridPosition { x: 1, y: 7 }, fuel_used: 3 }
+  Capture { target_pos: GridPosition { x: 7, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 7, y: 5 }, to: GridPosition { x: 7, y: 7 }, fuel_used: 2 }
+  Wait { target_pos: GridPosition { x: 6, y: 8 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 6, y: 5 }, to: GridPosition { x: 6, y: 8 }, fuel_used: 3 }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 6, target_y: 3, unit_type: Recon }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 6, target_y: 3, unit_type: Recon, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 7, target_y: 4, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 7, target_y: 4, unit_type: Infantry, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 6, target_y: 4, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 6, target_y: 4, unit_type: Infantry, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 7, target_y: 3, unit_type: Recon }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 7, target_y: 3, unit_type: Recon, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 5, target_y: 3, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 5, target_y: 3, unit_type: Infantry, entity: <entity> }
+  <end>
+    ev GamePhaseChangedEvent { new_phase: Main, active_player: PlayerId(2) }
+T3 P1 end
+  funds P1 = 8200
+  funds P2 = 19600
+  unit P1 Infantry (1,7) hp=100
+  unit P1 Infantry (3,7) hp=100
+  unit P1 Infantry (4,5) hp=100
+  unit P1 Infantry (5,3) hp=100
+  unit P1 Infantry (5,6) hp=100
+  unit P1 Infantry (5,7) hp=100
+  unit P1 Infantry (6,4) hp=100
+  unit P1 Infantry (6,8) hp=100
+  unit P1 Infantry (7,4) hp=100
+  unit P1 Infantry (7,6) hp=100
+  unit P1 Infantry (7,7) hp=100
+  unit P1 Recon (4,3) hp=100
+  unit P1 Recon (5,4) hp=100
+  unit P1 Recon (6,3) hp=100
+  unit P1 Recon (7,3) hp=100
+  unit P2 Infantry (2,11) hp=100
+  unit P2 Infantry (3,10) hp=100
+  unit P2 Infantry (3,8) hp=100
+  unit P2 Infantry (4,10) hp=100
+  unit P2 Infantry (5,10) hp=100
+  unit P2 Infantry (5,9) hp=100
+  unit P2 Infantry (6,10) hp=100
+  unit P2 Infantry (7,10) hp=100
+  unit P2 Recon (3,11) hp=100
+  unit P2 Recon (4,11) hp=100
+  prop (1,7) City owner=Some(2) cp=100
+  prop (2,11) Factory owner=Some(2) cp=200
+  prop (2,7) City owner=Some(1) cp=200
+  prop (3,10) Factory owner=Some(2) cp=200
+  prop (3,11) Capital owner=Some(2) cp=400
+  prop (3,7) City owner=Some(2) cp=100
+  prop (4,10) Factory owner=Some(2) cp=200
+  prop (4,11) Factory owner=Some(2) cp=200
+  prop (4,7) City owner=Some(1) cp=200
+  prop (5,3) Factory owner=Some(1) cp=200
+  prop (5,7) City owner=Some(2) cp=100
+  prop (6,3) Capital owner=Some(1) cp=400
+  prop (6,4) Factory owner=Some(1) cp=200
+  prop (6,7) City owner=Some(1) cp=200
+  prop (7,3) Factory owner=Some(1) cp=200
+  prop (7,4) Factory owner=Some(1) cp=200
+  prop (7,7) City owner=Some(2) cp=100
+  prop (8,7) City owner=Some(1) cp=200
+T3 P2 begin V200
+  Wait { target_pos: GridPosition { x: 3, y: 11 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 3, y: 11 }, to: GridPosition { x: 3, y: 11 }, fuel_used: 0 }
+  Wait { target_pos: GridPosition { x: 4, y: 11 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 4, y: 11 }, to: GridPosition { x: 4, y: 11 }, fuel_used: 0 }
+  Attack { target_pos: GridPosition { x: 6, y: 9 }, target_entity: <entity> }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 4, y: 10 }, to: GridPosition { x: 6, y: 9 }, fuel_used: 3 }
+    ev UnitAttackedEvent { attacker: <entity>, defender: <entity>, damage_dealt: 53, counter_damage_dealt: Some(43), attacker_hp_before: 100, attacker_hp_after: 57, defender_hp_before: 100, defender_hp_after: 47 }
+  Attack { target_pos: GridPosition { x: 4, y: 8 }, target_entity: <entity> }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 3, y: 10 }, to: GridPosition { x: 4, y: 8 }, fuel_used: 2 }
+    ev UnitAttackedEvent { attacker: <entity>, defender: <entity>, damage_dealt: 50, counter_damage_dealt: Some(48), attacker_hp_before: 100, attacker_hp_after: 52, defender_hp_before: 100, defender_hp_after: 50 }
+  Wait { target_pos: GridPosition { x: 3, y: 9 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 2, y: 11 }, to: GridPosition { x: 3, y: 9 }, fuel_used: 2 }
+  Capture { target_pos: GridPosition { x: 2, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 3, y: 8 }, to: GridPosition { x: 2, y: 7 }, fuel_used: 1 }
+  Attack { target_pos: GridPosition { x: 5, y: 9 }, target_entity: <entity> }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 5, y: 9 }, to: GridPosition { x: 5, y: 9 }, fuel_used: 0 }
+    ev UnitAttackedEvent { attacker: <entity>, defender: <entity>, damage_dealt: 52, counter_damage_dealt: Some(28), attacker_hp_before: 100, attacker_hp_after: 72, defender_hp_before: 47, defender_hp_after: 0 }
+    ev UnitDestroyedEvent { entity: <entity> }
+  Attack { target_pos: GridPosition { x: 8, y: 8 }, target_entity: <entity> }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 7, y: 10 }, to: GridPosition { x: 8, y: 8 }, fuel_used: 2 }
+    ev UnitAttackedEvent { attacker: <entity>, defender: <entity>, damage_dealt: 47, counter_damage_dealt: Some(53), attacker_hp_before: 100, attacker_hp_after: 47, defender_hp_before: 100, defender_hp_after: 53 }
+  Attack { target_pos: GridPosition { x: 7, y: 8 }, target_entity: <entity> }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 6, y: 10 }, to: GridPosition { x: 7, y: 8 }, fuel_used: 2 }
+    ev UnitAttackedEvent { attacker: <entity>, defender: <entity>, damage_dealt: 45, counter_damage_dealt: Some(29), attacker_hp_before: 100, attacker_hp_after: 71, defender_hp_before: 53, defender_hp_after: 8 }
+  Attack { target_pos: GridPosition { x: 6, y: 8 }, target_entity: <entity> }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 5, y: 10 }, to: GridPosition { x: 6, y: 8 }, fuel_used: 2 }
+    ev UnitAttackedEvent { attacker: <entity>, defender: <entity>, damage_dealt: 43, counter_damage_dealt: Some(52), attacker_hp_before: 100, attacker_hp_after: 48, defender_hp_before: 100, defender_hp_after: 57 }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 4, target_y: 10, unit_type: Recon }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 4, target_y: 10, unit_type: Recon, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 3, target_y: 10, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 3, target_y: 10, unit_type: Infantry, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 2, target_y: 11, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 2, target_y: 11, unit_type: Infantry, entity: <entity> }
+  <end>
+    ev GamePhaseChangedEvent { new_phase: Main, active_player: PlayerId(1) }
+T3 P2 end
+  funds P1 = 20200
+  funds P2 = 13400
+  unit P1 Infantry (1,7) hp=100
+  unit P1 Infantry (3,7) hp=50
+  unit P1 Infantry (4,5) hp=100
+  unit P1 Infantry (5,3) hp=100
+  unit P1 Infantry (5,6) hp=100
+  unit P1 Infantry (5,7) hp=57
+  unit P1 Infantry (6,4) hp=100
+  unit P1 Infantry (7,4) hp=100
+  unit P1 Infantry (7,6) hp=100
+  unit P1 Infantry (7,7) hp=8
+  unit P1 Recon (4,3) hp=100
+  unit P1 Recon (5,4) hp=100
+  unit P1 Recon (6,3) hp=100
+  unit P1 Recon (7,3) hp=100
+  unit P2 Infantry (2,11) hp=100
+  unit P2 Infantry (2,7) hp=100
+  unit P2 Infantry (3,10) hp=100
+  unit P2 Infantry (3,9) hp=100
+  unit P2 Infantry (4,8) hp=52
+  unit P2 Infantry (5,9) hp=72
+  unit P2 Infantry (6,8) hp=48
+  unit P2 Infantry (6,9) hp=57
+  unit P2 Infantry (7,8) hp=71
+  unit P2 Infantry (8,8) hp=47
+  unit P2 Recon (3,11) hp=100
+  unit P2 Recon (4,10) hp=100
+  unit P2 Recon (4,11) hp=100
+  prop (1,7) City owner=Some(2) cp=100
+  prop (2,11) Factory owner=Some(2) cp=200
+  prop (2,7) City owner=Some(1) cp=100
+  prop (3,10) Factory owner=Some(2) cp=200
+  prop (3,11) Capital owner=Some(2) cp=400
+  prop (3,7) City owner=Some(2) cp=100
+  prop (4,10) Factory owner=Some(2) cp=200
+  prop (4,11) Factory owner=Some(2) cp=200
+  prop (4,7) City owner=Some(1) cp=200
+  prop (5,3) Factory owner=Some(1) cp=200
+  prop (5,7) City owner=Some(2) cp=100
+  prop (6,3) Capital owner=Some(1) cp=400
+  prop (6,4) Factory owner=Some(1) cp=200
+  prop (6,7) City owner=Some(1) cp=200
+  prop (7,3) Factory owner=Some(1) cp=200
+  prop (7,4) Factory owner=Some(1) cp=200
+  prop (7,7) City owner=Some(2) cp=100
+  prop (8,7) City owner=Some(1) cp=200
+T4 P1 begin V100
+  Wait { target_pos: GridPosition { x: 4, y: 4 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 6, y: 3 }, to: GridPosition { x: 4, y: 4 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 7, y: 3 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 7, y: 3 }, to: GridPosition { x: 7, y: 3 }, fuel_used: 0 }
+  Capture { target_pos: GridPosition { x: 7, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 7, y: 7 }, to: GridPosition { x: 7, y: 7 }, fuel_used: 0 }
+  Capture { target_pos: GridPosition { x: 5, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 5, y: 7 }, to: GridPosition { x: 5, y: 7 }, fuel_used: 0 }
+  Capture { target_pos: GridPosition { x: 3, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 3, y: 7 }, to: GridPosition { x: 3, y: 7 }, fuel_used: 0 }
+  Capture { target_pos: GridPosition { x: 1, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 1, y: 7 }, to: GridPosition { x: 1, y: 7 }, fuel_used: 0 }
+    ev PropertyCapturedEvent { x: 1, y: 7, new_owner: Some(PlayerId(1)) }
+  Wait { target_pos: GridPosition { x: 6, y: 6 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 7, y: 4 }, to: GridPosition { x: 6, y: 6 }, fuel_used: 2 }
+  Wait { target_pos: GridPosition { x: 4, y: 6 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 6, y: 4 }, to: GridPosition { x: 4, y: 6 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 3, y: 5 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 5, y: 3 }, to: GridPosition { x: 3, y: 5 }, fuel_used: 3 }
+  Attack { target_pos: GridPosition { x: 4, y: 7 }, target_entity: <entity> }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 5, y: 4 }, to: GridPosition { x: 4, y: 7 }, fuel_used: 3 }
+    ev UnitAttackedEvent { attacker: <entity>, defender: <entity>, damage_dealt: 81, counter_damage_dealt: Some(15), attacker_hp_before: 100, attacker_hp_after: 85, defender_hp_before: 52, defender_hp_after: 0 }
+    ev UnitDestroyedEvent { entity: <entity> }
+  Attack { target_pos: GridPosition { x: 6, y: 7 }, target_entity: <entity> }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 4, y: 3 }, to: GridPosition { x: 6, y: 7 }, fuel_used: 5 }
+    ev UnitAttackedEvent { attacker: <entity>, defender: <entity>, damage_dealt: 85, counter_damage_dealt: Some(14), attacker_hp_before: 100, attacker_hp_after: 86, defender_hp_before: 71, defender_hp_after: 0 }
+    ev UnitDestroyedEvent { entity: <entity> }
+  Attack { target_pos: GridPosition { x: 5, y: 8 }, target_entity: <entity> }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 5, y: 6 }, to: GridPosition { x: 5, y: 8 }, fuel_used: 2 }
+    ev UnitAttackedEvent { attacker: <entity>, defender: <entity>, damage_dealt: 51, counter_damage_dealt: Some(31), attacker_hp_before: 100, attacker_hp_after: 69, defender_hp_before: 48, defender_hp_after: 0 }
+    ev UnitDestroyedEvent { entity: <entity> }
+  Attack { target_pos: GridPosition { x: 7, y: 8 }, target_entity: <entity> }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 7, y: 6 }, to: GridPosition { x: 7, y: 8 }, fuel_used: 2 }
+    ev UnitAttackedEvent { attacker: <entity>, defender: <entity>, damage_dealt: 51, counter_damage_dealt: Some(25), attacker_hp_before: 100, attacker_hp_after: 75, defender_hp_before: 47, defender_hp_after: 0 }
+    ev UnitDestroyedEvent { entity: <entity> }
+  Attack { target_pos: GridPosition { x: 3, y: 6 }, target_entity: <entity> }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 4, y: 5 }, to: GridPosition { x: 3, y: 6 }, fuel_used: 2 }
+    ev UnitAttackedEvent { attacker: <entity>, defender: <entity>, damage_dealt: 40, counter_damage_dealt: Some(50), attacker_hp_before: 100, attacker_hp_after: 50, defender_hp_before: 100, defender_hp_after: 60 }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 6, target_y: 3, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 6, target_y: 3, unit_type: Infantry, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 7, target_y: 4, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 7, target_y: 4, unit_type: Infantry, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 6, target_y: 4, unit_type: Tank }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 6, target_y: 4, unit_type: Tank, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 5, target_y: 3, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 5, target_y: 3, unit_type: Infantry, entity: <entity> }
+  <end>
+    ev GamePhaseChangedEvent { new_phase: Main, active_player: PlayerId(2) }
+T4 P1 end
+  funds P1 = 11200
+  funds P2 = 24400
+  unit P1 Infantry (1,7) hp=100
+  unit P1 Infantry (3,5) hp=100
+  unit P1 Infantry (3,6) hp=50
+  unit P1 Infantry (3,7) hp=50
+  unit P1 Infantry (4,6) hp=100
+  unit P1 Infantry (5,3) hp=100
+  unit P1 Infantry (5,7) hp=57
+  unit P1 Infantry (5,8) hp=69
+  unit P1 Infantry (6,3) hp=100
+  unit P1 Infantry (6,6) hp=100
+  unit P1 Infantry (7,4) hp=100
+  unit P1 Infantry (7,7) hp=8
+  unit P1 Infantry (7,8) hp=75
+  unit P1 Recon (4,4) hp=100
+  unit P1 Recon (4,7) hp=85
+  unit P1 Recon (6,7) hp=86
+  unit P1 Recon (7,3) hp=100
+  unit P1 Tank (6,4) hp=100
+  unit P2 Infantry (2,11) hp=100
+  unit P2 Infantry (2,7) hp=60
+  unit P2 Infantry (3,10) hp=100
+  unit P2 Infantry (3,9) hp=100
+  unit P2 Infantry (5,9) hp=72
+  unit P2 Infantry (6,9) hp=57
+  unit P2 Recon (3,11) hp=100
+  unit P2 Recon (4,10) hp=100
+  unit P2 Recon (4,11) hp=100
+  prop (1,7) City owner=Some(1) cp=200
+  prop (2,11) Factory owner=Some(2) cp=200
+  prop (2,7) City owner=Some(1) cp=100
+  prop (3,10) Factory owner=Some(2) cp=200
+  prop (3,11) Capital owner=Some(2) cp=400
+  prop (3,7) City owner=Some(2) cp=50
+  prop (4,10) Factory owner=Some(2) cp=200
+  prop (4,11) Factory owner=Some(2) cp=200
+  prop (4,7) City owner=Some(1) cp=200
+  prop (5,3) Factory owner=Some(1) cp=200
+  prop (5,7) City owner=Some(2) cp=40
+  prop (6,3) Capital owner=Some(1) cp=400
+  prop (6,4) Factory owner=Some(1) cp=200
+  prop (6,7) City owner=Some(1) cp=200
+  prop (7,3) Factory owner=Some(1) cp=200
+  prop (7,4) Factory owner=Some(1) cp=200
+  prop (7,7) City owner=Some(2) cp=90
+  prop (8,7) City owner=Some(1) cp=200
+T4 P2 begin V200
+  Wait { target_pos: GridPosition { x: 3, y: 11 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 3, y: 11 }, to: GridPosition { x: 3, y: 11 }, fuel_used: 0 }
+  Wait { target_pos: GridPosition { x: 4, y: 11 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 4, y: 11 }, to: GridPosition { x: 4, y: 11 }, fuel_used: 0 }
+  Wait { target_pos: GridPosition { x: 4, y: 10 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 4, y: 10 }, to: GridPosition { x: 4, y: 10 }, fuel_used: 0 }
+  Capture { target_pos: GridPosition { x: 2, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 2, y: 7 }, to: GridPosition { x: 2, y: 7 }, fuel_used: 0 }
+  Attack { target_pos: GridPosition { x: 4, y: 8 }, target_entity: <entity> }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 3, y: 10 }, to: GridPosition { x: 4, y: 8 }, fuel_used: 2 }
+    ev UnitAttackedEvent { attacker: <entity>, defender: <entity>, damage_dealt: 47, counter_damage_dealt: Some(27), attacker_hp_before: 100, attacker_hp_after: 73, defender_hp_before: 50, defender_hp_after: 3 }
+  Wait { target_pos: GridPosition { x: 5, y: 10 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 2, y: 11 }, to: GridPosition { x: 5, y: 10 }, fuel_used: 3 }
+  Attack { target_pos: GridPosition { x: 6, y: 8 }, target_entity: <entity> }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 5, y: 9 }, to: GridPosition { x: 6, y: 8 }, fuel_used: 1 }
+    ev UnitAttackedEvent { attacker: <entity>, defender: <entity>, damage_dealt: 30, counter_damage_dealt: Some(26), attacker_hp_before: 72, attacker_hp_after: 46, defender_hp_before: 57, defender_hp_after: 27 }
+  Attack { target_pos: GridPosition { x: 5, y: 9 }, target_entity: <entity> }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 6, y: 9 }, to: GridPosition { x: 5, y: 9 }, fuel_used: 1 }
+    ev UnitAttackedEvent { attacker: <entity>, defender: <entity>, damage_dealt: 27, counter_damage_dealt: Some(33), attacker_hp_before: 57, attacker_hp_after: 24, defender_hp_before: 69, defender_hp_after: 42 }
+  Attack { target_pos: GridPosition { x: 4, y: 9 }, target_entity: <entity> }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 3, y: 9 }, to: GridPosition { x: 4, y: 9 }, fuel_used: 1 }
+    ev UnitAttackedEvent { attacker: <entity>, defender: <entity>, damage_dealt: 48, counter_damage_dealt: Some(16), attacker_hp_before: 100, attacker_hp_after: 84, defender_hp_before: 42, defender_hp_after: 0 }
+    ev UnitDestroyedEvent { entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 3, target_y: 10, unit_type: Mech }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 3, target_y: 10, unit_type: Mech, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 2, target_y: 11, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 2, target_y: 11, unit_type: Infantry, entity: <entity> }
+  <end>
+    ev GamePhaseChangedEvent { new_phase: Main, active_player: PlayerId(1) }
+T4 P2 end
+  funds P1 = 22885
+  funds P2 = 21400
+  unit P1 Infantry (1,7) hp=100
+  unit P1 Infantry (3,5) hp=100
+  unit P1 Infantry (3,6) hp=50
+  unit P1 Infantry (3,7) hp=3
+  unit P1 Infantry (4,6) hp=100
+  unit P1 Infantry (5,3) hp=100
+  unit P1 Infantry (5,7) hp=27
+  unit P1 Infantry (6,3) hp=100
+  unit P1 Infantry (6,6) hp=100
+  unit P1 Infantry (7,4) hp=100
+  unit P1 Infantry (7,7) hp=8
+  unit P1 Infantry (7,8) hp=75
+  unit P1 Recon (4,4) hp=100
+  unit P1 Recon (4,7) hp=100
+  unit P1 Recon (6,7) hp=100
+  unit P1 Recon (7,3) hp=100
+  unit P1 Tank (6,4) hp=100
+  unit P2 Infantry (2,11) hp=100
+  unit P2 Infantry (2,7) hp=60
+  unit P2 Infantry (4,8) hp=73
+  unit P2 Infantry (4,9) hp=84
+  unit P2 Infantry (5,10) hp=100
+  unit P2 Infantry (5,9) hp=24
+  unit P2 Infantry (6,8) hp=46
+  unit P2 Mech (3,10) hp=100
+  unit P2 Recon (3,11) hp=100
+  unit P2 Recon (4,10) hp=100
+  unit P2 Recon (4,11) hp=100
+  prop (1,7) City owner=Some(1) cp=200
+  prop (2,11) Factory owner=Some(2) cp=200
+  prop (2,7) City owner=Some(1) cp=40
+  prop (3,10) Factory owner=Some(2) cp=200
+  prop (3,11) Capital owner=Some(2) cp=400
+  prop (3,7) City owner=Some(2) cp=50
+  prop (4,10) Factory owner=Some(2) cp=200
+  prop (4,11) Factory owner=Some(2) cp=200
+  prop (4,7) City owner=Some(1) cp=200
+  prop (5,3) Factory owner=Some(1) cp=200
+  prop (5,7) City owner=Some(2) cp=40
+  prop (6,3) Capital owner=Some(1) cp=400
+  prop (6,4) Factory owner=Some(1) cp=200
+  prop (6,7) City owner=Some(1) cp=200
+  prop (7,3) Factory owner=Some(1) cp=200
+  prop (7,4) Factory owner=Some(1) cp=200
+  prop (7,7) City owner=Some(2) cp=90
+  prop (8,7) City owner=Some(1) cp=200

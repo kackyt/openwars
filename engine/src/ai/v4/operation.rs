@@ -123,6 +123,9 @@ pub struct OperationFacts {
     pub available_free_cargo_slots: u32,
     /// 自軍の通常戦力が到達できない位置にいる敵Entity数。
     pub unreachable_threat_units: u32,
+    /// 敵増援余力だけでもCombat計画を起動するか。標準V4は期限内に到着しうる増援を
+    /// 局地脅威として扱い、小規模V4は観測済みの敵だけで起動する。
+    pub reinforcement_triggers_combat_plan: bool,
 }
 
 /// 観測量から調達モードを決める。フェーズではなく展開リードタイムと輸送要否だけで決まる。
@@ -146,9 +149,13 @@ pub fn derive_slots(facts: &OperationFacts) -> OperationSlots {
         .min(MAX_CAPTURE_SLOTS);
 
     // --- 戦闘計画：対象Entityがあれば必要編成をrolling plannerへ委譲する ---
-    // 将来の敵生産上限は「今この手番に倒す敵」ではない。観測済みの敵だけで
+    // 小規模V4では、将来の敵生産上限は「今この手番に倒す敵」ではない。観測済みの敵だけで
     // Combat計画を起動し、敵ユニットが実際に現れた次手番に改めて見積もる。
-    let combat_plan_required = u32::from(facts.enemy_combat_units > 0);
+    // 標準V4は期限内に到着できる敵増援も局地脅威として計画を起動する。
+    let combat_plan_required = u32::from(
+        facts.enemy_combat_units > 0
+            || (facts.reinforcement_triggers_combat_plan && facts.enemy_reinforcement_funds > 0),
+    );
 
     // 作戦地点へ届ける占領要員の総数（既に手元にいる分＋これから買う分）
     let capture_presence = capture_units.saturating_add(facts.friendly_capture_units_committed);
@@ -273,6 +280,17 @@ mod tests {
         facts.enemy_reinforcement_funds = 2000;
 
         assert_eq!(derive_slots(&facts).combat_plan_required, 0);
+    }
+
+    /// 標準V4では期限内に到着しうる敵増援余力だけでCombat計画を起動する
+    #[test]
+    fn standard_combat_plan_required_accounts_for_enemy_reinforcement() {
+        let mut facts = base_facts();
+        facts.enemy_combat_units = 0;
+        facts.enemy_reinforcement_funds = 2000;
+        facts.reinforcement_triggers_combat_plan = true;
+
+        assert_eq!(derive_slots(&facts).combat_plan_required, 1);
     }
 
     /// 既存戦力がいても、対象Entityを全滅できるかは計画器で再評価する。

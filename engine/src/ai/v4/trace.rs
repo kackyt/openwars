@@ -86,8 +86,8 @@ pub struct ProductionOperationTrace {
     pub capture_replacement_pending: bool,
     pub requires_transport: bool,
     pub enemy_combat_units: u32,
-    /// 実生産履歴と敵施設の事前分布を基準に、作戦期限までにこの前線へ到着しうる
-    /// 通常増援額。RollingPlanへ仮想敵として渡す継続生産の基準である。
+    /// この前線へ到着しうる増援額。標準戦線では作戦期限全体、小規模戦線では
+    /// 実生産履歴と敵施設の事前分布から推定した直近生産波を編成の基準にする。
     pub enemy_reinforcement_funds: u32,
     /// 敵が施設・収入をより強く使った場合の上側見積り。進撃Goは止めず、
     /// counter候補と次回再計画の診断に使う。

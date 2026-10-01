@@ -203,12 +203,34 @@ struct ActionSourceCacheKey {
 type ActionPathCost = (u32, u32, u32, u32);
 type ActionSourceDistances = Arc<HashMap<(usize, usize), ActionPathCost>>;
 
+/// 行動ターン距離の探索方針。探索結果が方針に依存するため、キャッシュ単位で固定する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActionDistancePolicy {
+    /// 敵ZOCへの進入で手番の移動を終え、キャッシュは占有配置ごとに区別する。
+    #[default]
+    ZocAware,
+    /// 標準V4互換。敵ZOCで停止せず、キャッシュは占有配置を区別しない。
+    StandardV4,
+}
+
 /// 射程帯への正確な行動ターン距離を同一分析中に再利用するキャッシュ。
 #[derive(Default)]
 pub struct ActionTurnDistanceCache {
+    /// このキャッシュで行う探索の方針。
+    policy: ActionDistancePolicy,
     cache: HashMap<ActionRangeCacheKey, Option<ActionTurnDistance>>,
     /// 同じ攻撃者から多数の防衛対象へ到達判定するとき、盤面Dijkstraを1回にする。
     source_cache: HashMap<ActionSourceCacheKey, ActionSourceDistances>,
+}
+
+impl ActionTurnDistanceCache {
+    /// 指定した探索方針で空のキャッシュを作る。
+    pub fn with_policy(policy: ActionDistancePolicy) -> Self {
+        Self {
+            policy,
+            ..Self::default()
+        }
+    }
 }
 
 /// 実ターン境界を考慮する Dijkstra の状態。
@@ -541,12 +563,17 @@ fn calculate_action_distance_to_range_with_origin_policy(
     must_leave_start: bool,
     cache: &mut ActionTurnDistanceCache,
 ) -> Option<ActionTurnDistance> {
+    let zoc_aware = cache.policy == ActionDistancePolicy::ZocAware;
     // 配置を正規化し、空盤面・敵の封鎖・味方の停止位置を別の探索として保持する。
-    // この探索が参照する占有情報は座標と所有者のみ。
-    let mut occupancy: Vec<_> = unit_positions
-        .iter()
-        .map(|(&(x, y), occupant)| (x, y, occupant.player_id))
-        .collect();
+    // この探索が参照する占有情報は座標と所有者のみ。標準V4互換方針では配置を区別しない。
+    let mut occupancy: Vec<_> = if zoc_aware {
+        unit_positions
+            .iter()
+            .map(|(&(x, y), occupant)| (x, y, occupant.player_id))
+            .collect()
+    } else {
+        Vec::new()
+    };
     occupancy.sort_unstable_by_key(|&(x, y, player)| (x, y, player.0));
     let occupancy: Arc<[_]> = occupancy.into();
     let cache_key = ActionRangeCacheKey {
@@ -663,7 +690,8 @@ fn calculate_action_distance_to_range_with_origin_policy(
 
             // 実移動と同様、敵ZOCへ進入した手番はそのマスで移動を終了する。
             // 次の隣接マスへは次手番の移動力を使って進めるため、到達不能にはしない。
-            let must_start_next_turn = state.position != start
+            let must_start_next_turn = zoc_aware
+                && state.position != start
                 && is_enemy_zoc(
                     map,
                     unit_positions,
@@ -1262,6 +1290,46 @@ mod tests {
         assert_eq!(distance.used_mp, 4);
         assert_eq!(distance.used_fuel, 4);
         assert_eq!(distance.firing_position, GridPosition { x: 4, y: 0 });
+    }
+
+    #[test]
+    fn standard_v4_policy_does_not_stop_at_enemy_zoc() {
+        let map = Map::new(
+            5,
+            2,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        let registry = MasterDataRegistry::load().unwrap_or_default();
+        let mut cache = ActionTurnDistanceCache::with_policy(ActionDistancePolicy::StandardV4);
+        let enemy = OccupantInfo {
+            player_id: PlayerId(2),
+            unit_type: crate::resources::UnitType::Infantry,
+            is_transport: false,
+            free_slots: 0,
+            loadable_types: Vec::new(),
+        };
+        let unit_positions = HashMap::from([((1, 1), enemy)]);
+
+        let distance = calculate_action_distance_to_range(
+            &map,
+            &registry,
+            &unit_positions,
+            (0, 0),
+            (4, 0),
+            MovementType::Tank,
+            4,
+            99,
+            0,
+            0,
+            PlayerId(1),
+            &mut cache,
+        )
+        .unwrap();
+
+        // 標準V4互換方針では (1, 0) の敵ZOCで停止せず、T1で4マス進み切る。
+        assert_eq!(distance.turns, 1);
+        assert_eq!(distance.used_mp, 4);
     }
 
     #[test]

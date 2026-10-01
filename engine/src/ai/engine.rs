@@ -1676,15 +1676,6 @@ pub fn execute_ai_turn_v1(world: &mut World, active_player: PlayerId) -> Option<
 pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<String> {
     let ai_version = crate::ai::resolve_player_ai_version(world, active_player);
     let is_v4 = ai_version == crate::ai::ai_version::AiVersion::V4;
-    if is_v4
-        && crate::ai::strategy_profile::profile_for(world, active_player)
-            == crate::ai::strategy_profile::V4StrategyProfile::Standard
-    {
-        // 標準マップはmain時点のAI全体を実行する。小規模向けの変更を個別に
-        // 打ち消さず、入口で完全に別のパイプラインへ委譲する。
-        return crate::ai_standard::engine::execute_ai_turn_v2(world, active_player);
-    }
-
     let mut skip_entities = std::collections::HashSet::new();
     if let Some(res) = world.get_resource::<AiActionCooldown>() {
         skip_entities = res.0.clone();

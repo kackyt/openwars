@@ -2146,6 +2146,7 @@ mod additional_tests {
     fn issue75_air_defense_strategy() -> ProductionStrategy {
         ProductionStrategy {
             air_defense: AirDefenseAssessment {
+                distance_policy: Default::default(),
                 targets: vec![AirThreatTarget {
                     position: GridPosition { x: 5, y: 0 },
                     unit_type: UnitType::Bomber,
@@ -2221,6 +2222,7 @@ mod additional_tests {
         chart.insert_damage(UnitType::AntiAir, UnitType::TransportHelicopter, 65);
         let strategy = ProductionStrategy {
             air_defense: AirDefenseAssessment {
+                distance_policy: Default::default(),
                 targets: vec![AirThreatTarget {
                     position: GridPosition { x: 2, y: 0 },
                     unit_type: UnitType::TransportHelicopter,
@@ -2274,6 +2276,7 @@ mod additional_tests {
         chart.insert_damage(UnitType::AntiAir, UnitType::Bcopters, 65);
         let strategy = ProductionStrategy {
             air_defense: AirDefenseAssessment {
+                distance_policy: Default::default(),
                 targets: vec![AirThreatTarget {
                     position: GridPosition { x: 3, y: 0 },
                     unit_type: UnitType::Bcopters,
@@ -2351,6 +2354,7 @@ mod additional_tests {
         chart.insert_damage(UnitType::AntiAir, UnitType::Bomber, 68);
         let strategy = ProductionStrategy {
             air_defense: AirDefenseAssessment {
+                distance_policy: Default::default(),
                 targets: vec![AirThreatTarget {
                     position: GridPosition { x: 4, y: 0 },
                     unit_type: UnitType::Bomber,
@@ -2430,6 +2434,7 @@ mod additional_tests {
         chart.insert_damage(UnitType::AntiAir, UnitType::Bomber, 100);
         let strategy = ProductionStrategy {
             air_defense: AirDefenseAssessment {
+                distance_policy: Default::default(),
                 targets: vec![AirThreatTarget {
                     position: GridPosition { x: 5, y: 0 },
                     unit_type: UnitType::Bomber,
@@ -2484,6 +2489,7 @@ mod additional_tests {
         chart.insert_damage(UnitType::Missiles, UnitType::Bomber, 100);
         let strategy = ProductionStrategy {
             air_defense: AirDefenseAssessment {
+                distance_policy: Default::default(),
                 targets: vec![
                     AirThreatTarget {
                         position: GridPosition { x: 2, y: 0 },
@@ -3291,6 +3297,7 @@ mod additional_tests {
         let required_coverage = 11_250.0;
         let shortage = ProductionStrategy {
             air_defense: AirDefenseAssessment {
+                distance_policy: Default::default(),
                 targets: vec![target],
                 coverage_by_target: vec![0.0],
                 required_coverage,

@@ -2374,6 +2374,8 @@ fn campaign_assignment_capture_responsibilities(
     members: &[Entity],
     connectivity: &mut TerrainConnectivity,
 ) -> Vec<CampaignResponsibility> {
+    // 標準V4は既存の最寄り割当のみを使い、ピン留め・分散・既存責務への増員を行わない。
+    let standard_v4 = crate::ai::strategy_profile::is_standard_v4_readonly(world, player_id);
     let mut targets: Vec<_> = assignment
         .capture_target_positions
         .iter()
@@ -2440,10 +2442,11 @@ fn campaign_assignment_capture_responsibilities(
     // 「最寄り物件」へ即座に戻さない。対象が未取得かつ本人が到達可能な間だけ保持し、
     // 取得済み・到達不能なら下の通常割当へ自然に戻す。
     let mut pinned_members = HashSet::new();
+    let pin_candidates: &[Entity] = if standard_v4 { &[] } else { &remaining };
     // 未所有物件マス上にすでに乗っている歩兵のうち、すでに占領進行中であるか、
     // または既存Squadの目標としてその物件に到達している歩兵は、
     // 他の物件へ移籍させず、その物件の占領完遂を最優先としてピン留めする。
-    for member in &remaining {
+    for member in pin_candidates {
         let Some(member_pos) = world.get::<GridPosition>(*member).copied() else {
             continue;
         };
@@ -2477,7 +2480,7 @@ fn campaign_assignment_capture_responsibilities(
         }
     }
 
-    for member in &remaining {
+    for member in pin_candidates {
         if pinned_members.contains(member) {
             continue;
         }
@@ -2557,8 +2560,8 @@ fn campaign_assignment_capture_responsibilities(
 
     // 同一陸地の首都戦役では余剰占領兵を別施設へ展開する。海洋戦では上陸点へ
     // 戦力を集中する必要があるため、従来どおり同じ目標への増援を許す。
-    let spread_over_land_routes =
-        crate::ai::v4::is_same_land_capital_island(world, player_id, assignment.island_id);
+    let spread_over_land_routes = !standard_v4
+        && crate::ai::v4::is_same_land_capital_island(world, player_id, assignment.island_id);
     let mut claimed_targets = responsibilities
         .iter()
         .map(|responsibility| responsibility.target)
@@ -2583,8 +2586,8 @@ fn campaign_assignment_capture_responsibilities(
                 target,
                 members: vec![member],
             });
-        } else if let Some(responsibility) =
-            responsibilities.iter_mut().min_by_key(|responsibility| {
+        } else if !standard_v4
+            && let Some(responsibility) = responsibilities.iter_mut().min_by_key(|responsibility| {
                 (
                     campaign_member_distance_to_position(
                         world,
@@ -2796,7 +2799,12 @@ fn campaign_combat_responsibilities(
         })
         .collect();
 
-    let route_fronts = crate::ai::v4::same_land_route_fronts(world, player_id, island_id);
+    // 標準V4は同一陸続きのルート分割を行わず、敵ごとの局所責務だけで構成する。
+    let route_fronts = if crate::ai::strategy_profile::is_standard_v4_readonly(world, player_id) {
+        Vec::new()
+    } else {
+        crate::ai::v4::same_land_route_fronts(world, player_id, island_id)
+    };
     if route_fronts.len() >= 2 {
         let Some(map) = world.get_resource::<Map>() else {
             return Vec::new();
@@ -3162,6 +3170,7 @@ fn prepare_campaign_local_assignment_with_connectivity(
 ) {
     use crate::ai::island_campaign::IslandCampaignDecision;
 
+    let standard_v4 = crate::ai::strategy_profile::is_standard_v4_readonly(world, player_id);
     let local_entities = |entities: &[Entity]| {
         entities
             .iter()
@@ -3227,9 +3236,14 @@ fn prepare_campaign_local_assignment_with_connectivity(
                 && combat_responsibilities
                     .iter()
                     .all(|responsibility| responsibility.mission_type == MissionType::Defense)
-                && crate::ai::v4::same_land_route_fronts(world, player_id, assignment.island_id)
+                && (standard_v4
+                    || crate::ai::v4::same_land_route_fronts(
+                        world,
+                        player_id,
+                        assignment.island_id,
+                    )
                     .len()
-                    < 2
+                        < 2)
             {
                 // 接近中でまだ島内に敵がいない場合は、防衛対象をばらけさせず
                 // assignmentの主要施設へ集結させる。
@@ -3266,22 +3280,25 @@ fn prepare_campaign_local_assignment_with_connectivity(
                 responsibilities,
                 &[MissionType::Capture],
             );
-            let combat = local_entities(&assignment.combat_entities);
-            let combat_responsibilities = campaign_combat_responsibilities(
-                world,
-                player_id,
-                assignment,
-                &combat,
-                connectivity,
-            );
-            assign_campaign_responsibilities(
-                world,
-                manager,
-                player_id,
-                assignment.island_id,
-                combat_responsibilities,
-                &[MissionType::Attack, MissionType::Defense],
-            );
+            // 標準V4のSecureは占領責務だけを割り当てる。
+            if !standard_v4 {
+                let combat = local_entities(&assignment.combat_entities);
+                let combat_responsibilities = campaign_combat_responsibilities(
+                    world,
+                    player_id,
+                    assignment,
+                    &combat,
+                    connectivity,
+                );
+                assign_campaign_responsibilities(
+                    world,
+                    manager,
+                    player_id,
+                    assignment.island_id,
+                    combat_responsibilities,
+                    &[MissionType::Attack, MissionType::Defense],
+                );
+            }
         }
         IslandCampaignDecision::Expand
         | IslandCampaignDecision::Assault
@@ -4586,8 +4603,10 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     let is_v3 = crate::ai::resolve_player_ai_version(world, perspective_player).uses_v3_tactics();
     let is_v4 = crate::ai::resolve_player_ai_version(world, perspective_player)
         .uses_operation_driven_production();
+    // 標準V4は小規模マップ向けの拡張（レガシー防衛の省略・最寄り歩兵選択・Roadmap更新順）を使わない。
+    let standard_v4 = crate::ai::strategy_profile::is_standard_v4(world, perspective_player);
     if is_v4 {
-        crate::ai::v4::strategy_pipeline::before_squad_planning(world, perspective_player);
+        crate::ai::v4::small_map::before_squad_planning(world, perspective_player);
     }
     let mut manager = world.remove_resource::<SquadManager>().unwrap_or_default();
     // Reserveは永続所有権ではなく「次の再計画までの明示待機」である。
@@ -4634,7 +4653,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         .get_resource::<crate::resources::MatchState>()
         .map_or(0, |state| state.current_turn_number.0);
     let roadmap_portfolio = if is_v4 {
-        crate::ai::v4::strategy_pipeline::portfolio_for_squads(
+        crate::ai::v4::small_map::portfolio_for_squads(
             world,
             perspective_player,
             roadmap_turn,
@@ -5393,7 +5412,8 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     // V4では大局戦略（VictoryRoadmap/CampaignPortfolio/CombatPlan）で部隊編成を管理するため、
     // レガシーな「首都から5ターン以内の全敵クラスターに対する防衛部隊作成」は実行しない。
     // 小規模マップ等で全域が首都防衛圏になり、前線戦闘ユニットが誤って防衛に拘束されるのを防ぐ。
-    if !is_v4 {
+    // 標準V4は従来どおりレガシー防衛部隊を作成する。
+    if !is_v4 || standard_v4 {
         if let Some(capital) = my_capital_pos {
             for cluster in &enemy_clusters {
                 let turn_dist = calculate_turn_distance(
@@ -5570,11 +5590,17 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                         stats.movement_type,
                     )
             })
-            .min_by_key(|(_, (ent, pos, _))| {
-                (
-                    map.distance(pos.x, pos.y, unowned_pos.x, unowned_pos.y),
-                    ent.to_bits(),
-                )
+            // 標準V4は候補列の先頭（フリー歩兵の列挙順）を採用する。
+            .min_by_key(|(idx, (ent, pos, _))| {
+                if standard_v4 {
+                    (*idx, 0, 0)
+                } else {
+                    (
+                        0,
+                        map.distance(pos.x, pos.y, unowned_pos.x, unowned_pos.y) as u64,
+                        ent.to_bits(),
+                    )
+                }
             })
             .map(|(idx, _)| idx);
 
@@ -5818,9 +5844,18 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
 
     // campaign・deployment・汎用任務をすべて構築した後に一度だけ正規化する。
     // これ以降の行動選択は重複Squadを見ず、所有者照会も平均O(1)になる。
+    if standard_v4 {
+        // 標準V4は正規化前のSquad構成でRoadmapを照合する。
+        crate::ai::v4::victory_roadmap::reconcile_campaign_roadmap(
+            world,
+            perspective_player,
+            &roadmap_portfolio,
+            &manager,
+        );
+    }
     reconcile_unique_operation_assignments(world, &mut manager, perspective_player);
     if is_v4 {
-        crate::ai::v4::strategy_pipeline::after_squad_planning(
+        crate::ai::v4::small_map::after_squad_planning(
             world,
             perspective_player,
             &roadmap_portfolio,
@@ -6098,17 +6133,20 @@ fn select_landing_candidate(
     // この場合、貨物の経路をそのセルから逆算すると空の距離表になり、合法な揚陸候補まで
     // 全て除外してしまう。貨物が進入できる目標では到達ターンを使い、それ以外では
     // 目標岸へのグリッド距離を使って、前進する揚陸点を選ぶ。
-    let cargo_can_enter_target = target_position.is_none_or(|target| {
-        map.get_terrain(target.x, target.y)
-            .and_then(|terrain| {
-                crate::systems::movement::get_valid_movement_cost(
-                    &registry,
-                    cargo_stats.movement_type,
-                    terrain,
-                )
-            })
-            .is_some()
-    });
+    // 標準V4は従来どおり常に貨物の到達ターン表で揚陸点を評価する。
+    let standard_v4 = crate::ai::strategy_profile::is_standard_v4(world, cargo_faction);
+    let cargo_can_enter_target = standard_v4
+        || target_position.is_none_or(|target| {
+            map.get_terrain(target.x, target.y)
+                .and_then(|terrain| {
+                    crate::systems::movement::get_valid_movement_cost(
+                        &registry,
+                        cargo_stats.movement_type,
+                        terrain,
+                    )
+                })
+                .is_some()
+        });
     let target_distances = if cargo_can_enter_target {
         target_position.map(|target| {
             calculate_all_turn_distances(
@@ -6369,6 +6407,12 @@ pub fn execute_transport_squad_step(
             .map(|f| f.current)?;
         let t_faction = world.get::<Faction>(transport_entity).cloned()?;
         (t_pos, t_stats, t_fuel, t_faction.0)
+    };
+    // 標準V4は島単位の航行目標のみを使い、Squadの明示目標で航路を上書きしない。
+    let navigation_request = if crate::ai::strategy_profile::is_standard_v4(world, t_faction) {
+        None
+    } else {
+        squad.target
     };
 
     let mut phase = match squad.phase {
@@ -6750,7 +6794,7 @@ pub fn execute_transport_squad_step(
                                 island,
                                 t_pos,
                                 t_stats.movement_type,
-                                squad.target,
+                                navigation_request,
                             );
                             (Some(island.tiles.clone()), target_pos)
                         } else {
@@ -6869,7 +6913,7 @@ pub fn execute_transport_squad_step(
                             island,
                             t_pos,
                             t_stats.movement_type,
-                            squad.target,
+                            navigation_request,
                         ) {
                             let mut best_tile = t_pos;
                             let mut min_score = None;

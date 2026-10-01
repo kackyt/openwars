@@ -10,7 +10,7 @@ use crate::resources::master_data::UnitName;
 use crate::systems::combat::select_weapon;
 
 /// 現在距離から最初に合法な射撃を行う交戦距離で、敵が返せるdamageを得る。
-pub(super) fn planned_counter_damage(
+pub(crate) fn planned_counter_damage(
     master_data: &MasterDataRegistry,
     damage_chart: &DamageChart,
     attacker: &UnitStats,

@@ -1,8 +1,7 @@
-//! V4のターン入口で選ばれる戦略パイプライン。
+//! 通常のV4戦略に重ねる小規模マップ専用のDAG/Roadmap処理。
 //!
-//! 小規模マップ向けのDAG/Roadmap処理を各利用者が独自に有効化してはいけない。
-//! このモジュールだけがプロファイルを解釈し、Strategy・Squad・生産が同じ作戦系を
-//! 参照する境界にする。
+//! Strategy・Squad のDAG/Roadmap接続はここに集め、通常マップでは何もしない。
+//! 生産側は同じV4StrategyProfileを参照して小規模向けの判断を切り替える。
 
 use crate::ai::island_campaign::IslandCampaignPortfolio;
 use crate::ai::strategy_profile::{V4StrategyProfile, current_profile};

@@ -127,7 +127,7 @@ pub(crate) struct RollingPlanInput {
     pub enemies: Vec<EnemyPlanUnit>,
     pub production_options: Vec<ProductionPlanOption>,
     /// 生産候補ごと・敵ごとの、実地形と射程を通した最早攻撃turn。
-    /// 空なら従来の格子距離見積りへフォールバックする（単体テスト用）。
+    /// 空なら標準戦線で使う従来の格子距離見積りへフォールバックする。
     pub production_attack_projections: Vec<Vec<Option<ProductionAttackProjection>>>,
     /// 期限付きInterdictで、初撃と残HPを判定する敵index。
     /// Noneの通常戦では全敵を従来どおり評価する。
@@ -768,6 +768,11 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
     }
     let mut candidates_pruned = 0_usize;
     for option_indices in options_by_slot.values_mut() {
+        // 局地の相性だけによる支配関係は小規模の確定前線に限定する。
+        // 標準の長期編成では、未観測の兵種に備える候補まで事前に落とさない。
+        if !uses_small_map_tactical_rules(input) {
+            continue;
+        }
         let original_len = option_indices.len();
         let retained = option_indices
             .iter()
@@ -4722,9 +4727,13 @@ fn simulate_state_with_catalog(
                 })
         })
         .count();
-    // 占領完了ETAがまだ無いことは、占領役の生存要求が無いことを意味しない。
-    // 物件別Interdictでは撃破完了前にETAを確定できないため、要求数そのものを判定する。
-    let protected_force_survives = input.required_capture_survivors == 0
+    // 標準戦線では、占領工程が未確定の間も敵排除の編成を開始する。
+    // 小規模の物件別Interdictは撃破前にETAを確定できないため、担当数を先に要求する。
+    let capture_is_not_scheduled = input.opening_policy == OpeningProductionPolicy::Standard
+        && !input.exact_property_control
+        && selected_capture_completion_turn.is_none();
+    let protected_force_survives = capture_is_not_scheduled
+        || input.required_capture_survivors == 0
         || protected_survivor_count >= input.required_capture_survivors;
     // 固定2ターンを足さず、実campaignのPickup/Transit/Drop/Capture ETAと残敵排除の
     // 遅い方を採る。輸送編成がまだ存在しない場合は占領完了を予測しない。
@@ -5518,7 +5527,7 @@ mod tests {
     }
 
     #[test]
-    fn dominated_candidate_in_the_same_production_slot_is_pruned() {
+    fn matchup_pruning_is_limited_to_small_map_formations() {
         let mut input = input();
         input.production_options.truncate(1);
         let dominated = ProductionPlanOption {
@@ -5538,7 +5547,11 @@ mod tests {
         };
         input.production_options.push(dominated);
 
-        let plan = plan_force_package(&input).expect("a plan");
+        // 標準の長期編成は全候補を維持し、小規模前線だけ相性支配で枝刈りする。
+        let standard = plan_force_package(&input).expect("standard plan");
+        assert_eq!(standard.candidates_pruned, 0);
+        input.opening_policy = OpeningProductionPolicy::SmallMapExpansion;
+        let plan = plan_force_package(&input).expect("small-map plan");
 
         assert_eq!(plan.candidates_pruned, 1);
         assert!(plan.purchases.iter().all(|purchase| purchase.cost != 8_000));
@@ -5614,6 +5627,21 @@ mod tests {
             plan.turn_forecasts[2].attack_count, 0,
             "占領手番には攻撃しない"
         );
+    }
+
+    #[test]
+    fn standard_combat_does_not_wait_for_unscheduled_capture_roles() {
+        let mut input = input();
+        input.capture_completion_turn = None;
+        input.required_capture_survivors = 2;
+        let plan = plan_force_package(&input).expect("標準戦線の戦闘計画");
+        // 輸送・占領の時刻が未確定でも、敵排除の編成まで永久に止めない。
+        assert!(plan.feasible);
+        assert!(plan.occupation_turn.is_none());
+
+        input.opening_policy = OpeningProductionPolicy::SmallMapExpansion;
+        let small_plan = plan_force_package(&input).expect("小規模前線の戦闘計画");
+        assert!(!small_plan.feasible, "物件レースの担当要求は維持する");
     }
 
     #[test]

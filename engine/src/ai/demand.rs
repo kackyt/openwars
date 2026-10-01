@@ -1,4 +1,6 @@
-use crate::ai::turn_distance::{ActionTurnDistanceCache, calculate_action_distance_to_range};
+use crate::ai::turn_distance::{
+    ActionDistancePolicy, ActionTurnDistanceCache, calculate_action_distance_to_range,
+};
 use crate::components::{GridPosition, PlayerId, UnitStats};
 use crate::resources::{
     DamageChart, Map, MovementType, Terrain, UnitRegistry, UnitType,
@@ -108,6 +110,9 @@ pub struct AirDefenseAssessment {
     pub current_coverage: f32,
     pub shortage_ratio: f32,
     pub has_effective_coverage: bool,
+    /// 航空脅威の到達距離と対空カバレッジ算出に用いる行動距離方針。
+    /// 後続の候補評価でも評価時と同じ方針で距離を測るため、評価結果と一緒に保持する。
+    pub distance_policy: ActionDistancePolicy,
 }
 
 /// 生産候補1体が各航空脅威へ追加できるカバレッジ。
@@ -517,8 +522,9 @@ fn allocate_air_coverage(
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
     damage_chart: &DamageChart,
     coverage_by_target: &mut [f32],
+    distance_policy: ActionDistancePolicy,
 ) {
-    let mut distance_cache = ActionTurnDistanceCache::default();
+    let mut distance_cache = ActionTurnDistanceCache::with_policy(distance_policy);
     allocate_air_coverage_cached(
         units,
         targets,
@@ -713,6 +719,31 @@ pub fn assess_air_defense(
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
     damage_chart: &DamageChart,
 ) -> AirDefenseAssessment {
+    assess_air_defense_with_policy(
+        player_id,
+        units,
+        critical_sites,
+        map,
+        registry,
+        unit_positions,
+        damage_chart,
+        ActionDistancePolicy::default(),
+    )
+}
+
+/// 行動距離方針を指定して航空脅威と対空カバレッジを算出します。
+/// 標準V4は敵ZOCで停止しない互換方針を使うため、呼び出し側が方針を選ぶ。
+#[allow(clippy::too_many_arguments)]
+pub fn assess_air_defense_with_policy(
+    player_id: PlayerId,
+    units: &[CombatCapabilitySnapshot],
+    critical_sites: &[GridPosition],
+    map: &Map,
+    registry: &MasterDataRegistry,
+    unit_positions: &HashMap<(usize, usize), OccupantInfo>,
+    damage_chart: &DamageChart,
+    distance_policy: ActionDistancePolicy,
+) -> AirDefenseAssessment {
     let mut targets = Vec::new();
     for enemy in units
         .iter()
@@ -742,7 +773,7 @@ pub fn assess_air_defense(
         response_positions.dedup();
 
         let mut response = None;
-        let mut cache = ActionTurnDistanceCache::default();
+        let mut cache = ActionTurnDistanceCache::with_policy(distance_policy);
         for position in response_positions {
             let Some(distance) = calculate_action_distance_to_range(
                 map,
@@ -794,6 +825,7 @@ pub fn assess_air_defense(
         unit_positions,
         damage_chart,
         &mut coverage_by_target,
+        distance_policy,
     );
     let current_coverage = coverage_by_target.iter().sum::<f32>();
     let has_effective_coverage = current_coverage > 0.0;
@@ -809,6 +841,7 @@ pub fn assess_air_defense(
         current_coverage,
         shortage_ratio,
         has_effective_coverage,
+        distance_policy,
     }
 }
 
@@ -824,7 +857,7 @@ pub fn candidate_air_coverage(
     unit_positions: &HashMap<(usize, usize), OccupantInfo>,
     damage_chart: &DamageChart,
 ) -> AirCoverageContribution {
-    let mut distance_cache = ActionTurnDistanceCache::default();
+    let mut distance_cache = ActionTurnDistanceCache::with_policy(assessment.distance_policy);
     candidate_air_coverage_with_cache(
         stats,
         production_position,
@@ -928,7 +961,7 @@ fn candidate_air_coverage_with_delay_internal(
         vec![0.0; assessment.targets.len()]
     };
     let baseline = combined_coverage.clone();
-    let mut local_distance_cache = ActionTurnDistanceCache::default();
+    let mut local_distance_cache = ActionTurnDistanceCache::with_policy(assessment.distance_policy);
     allocate_air_coverage_cached(
         &[candidate],
         &assessment.targets,
@@ -987,6 +1020,7 @@ pub(crate) fn air_coverage_with_timing(
         unit_positions,
         damage_chart,
         &mut combined_coverage,
+        relaxed.distance_policy,
     );
     let by_target = combined_coverage
         .iter()
@@ -1799,6 +1833,7 @@ mod tests {
             &HashMap::new(),
             &chart,
             &mut coverage,
+            ActionDistancePolicy::default(),
         );
 
         assert_eq!(coverage, vec![18_000.0, 30_000.0]);
@@ -1871,6 +1906,7 @@ mod tests {
             &HashMap::new(),
             &chart,
             &mut coverage,
+            ActionDistancePolicy::default(),
         );
 
         assert_eq!(coverage, vec![19_800.0, 30_000.0]);
@@ -1925,6 +1961,7 @@ mod tests {
             &HashMap::new(),
             &chart,
             &mut coverage,
+            ActionDistancePolicy::default(),
         );
 
         assert_eq!(coverage, vec![19_800.0, 30_000.0, 30_000.0]);
@@ -1961,6 +1998,7 @@ mod tests {
         ];
         let required_coverage = targets.iter().map(target_threat_value).sum();
         let assessment = AirDefenseAssessment {
+            distance_policy: Default::default(),
             targets,
             coverage_by_target: vec![0.0, 0.0],
             required_coverage,
@@ -2060,6 +2098,7 @@ mod tests {
     #[test]
     fn issue75_large_air_threat_keeps_residual_demand_after_one_unit() {
         let mut assessment = AirDefenseAssessment {
+            distance_policy: Default::default(),
             targets: vec![AirThreatTarget {
                 position: GridPosition { x: 6, y: 0 },
                 unit_type: UnitType::Bomber,
@@ -2104,6 +2143,7 @@ mod tests {
             deadline_turns: 3,
         };
         let assessment = AirDefenseAssessment {
+            distance_policy: Default::default(),
             targets: vec![target],
             coverage_by_target: vec![0.0],
             required_coverage: target_threat_value(&target),
@@ -2118,6 +2158,7 @@ mod tests {
     #[test]
     fn issue75_uncovered_bomber_keeps_emergency_gate_active() {
         let mut assessment = AirDefenseAssessment {
+            distance_policy: Default::default(),
             targets: vec![
                 AirThreatTarget {
                     position: GridPosition { x: 3, y: 0 },
@@ -2165,6 +2206,7 @@ mod tests {
         let mut chart = DamageChart::new();
         chart.insert_damage(UnitType::AntiAir, UnitType::Bomber, 100);
         let mut assessment = AirDefenseAssessment {
+            distance_policy: Default::default(),
             targets: vec![
                 AirThreatTarget {
                     position: GridPosition { x: 0, y: 0 },
@@ -2246,6 +2288,7 @@ mod tests {
         let mut chart = DamageChart::new();
         chart.insert_damage(UnitType::AntiAir, UnitType::Bomber, 100);
         let assessment = AirDefenseAssessment {
+            distance_policy: Default::default(),
             targets: vec![AirThreatTarget {
                 position: GridPosition { x: 4, y: 0 },
                 unit_type: UnitType::Bomber,
@@ -2295,6 +2338,7 @@ mod tests {
         let mut chart = DamageChart::new();
         chart.insert_damage(UnitType::Missiles, UnitType::Bomber, 100);
         let assessment = AirDefenseAssessment {
+            distance_policy: Default::default(),
             targets: vec![AirThreatTarget {
                 position: GridPosition { x: 4, y: 0 },
                 unit_type: UnitType::Bomber,
@@ -2346,6 +2390,7 @@ mod tests {
         let mut chart = DamageChart::new();
         chart.insert_damage(UnitType::Missiles, UnitType::Bomber, 100);
         let assessment = AirDefenseAssessment {
+            distance_policy: Default::default(),
             targets: vec![AirThreatTarget {
                 position: GridPosition { x: 3, y: 0 },
                 unit_type: UnitType::Bomber,
@@ -2397,6 +2442,7 @@ mod tests {
         let mut chart = DamageChart::new();
         chart.insert_damage(UnitType::AntiAir, UnitType::Bomber, 80);
         let assessment = AirDefenseAssessment {
+            distance_policy: Default::default(),
             targets: vec![AirThreatTarget {
                 position: GridPosition { x: 6, y: 0 },
                 unit_type: UnitType::Bomber,
@@ -2471,6 +2517,7 @@ mod tests {
         let mut chart = DamageChart::new();
         chart.insert_damage(UnitType::AntiAir, UnitType::Bomber, 80);
         let assessment = AirDefenseAssessment {
+            distance_policy: Default::default(),
             targets: vec![AirThreatTarget {
                 position: GridPosition { x: 2, y: 0 },
                 unit_type: UnitType::Bomber,
