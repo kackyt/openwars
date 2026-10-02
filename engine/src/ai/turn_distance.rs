@@ -203,34 +203,12 @@ struct ActionSourceCacheKey {
 type ActionPathCost = (u32, u32, u32, u32);
 type ActionSourceDistances = Arc<HashMap<(usize, usize), ActionPathCost>>;
 
-/// 行動ターン距離の探索方針。探索結果が方針に依存するため、キャッシュ単位で固定する。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ActionDistancePolicy {
-    /// 敵ZOCへの進入で手番の移動を終え、キャッシュは占有配置ごとに区別する。
-    #[default]
-    ZocAware,
-    /// 標準V4互換。敵ZOCで停止せず、キャッシュは占有配置を区別しない。
-    StandardV4,
-}
-
 /// 射程帯への正確な行動ターン距離を同一分析中に再利用するキャッシュ。
 #[derive(Default)]
 pub struct ActionTurnDistanceCache {
-    /// このキャッシュで行う探索の方針。
-    policy: ActionDistancePolicy,
     cache: HashMap<ActionRangeCacheKey, Option<ActionTurnDistance>>,
     /// 同じ攻撃者から多数の防衛対象へ到達判定するとき、盤面Dijkstraを1回にする。
     source_cache: HashMap<ActionSourceCacheKey, ActionSourceDistances>,
-}
-
-impl ActionTurnDistanceCache {
-    /// 指定した探索方針で空のキャッシュを作る。
-    pub fn with_policy(policy: ActionDistancePolicy) -> Self {
-        Self {
-            policy,
-            ..Self::default()
-        }
-    }
 }
 
 /// 実ターン境界を考慮する Dijkstra の状態。
@@ -496,88 +474,26 @@ pub fn calculate_action_distance_to_range(
     player_id: PlayerId,
     cache: &mut ActionTurnDistanceCache,
 ) -> Option<ActionTurnDistance> {
-    calculate_action_distance_to_range_with_origin_policy(
-        map,
-        registry,
-        unit_positions,
-        start,
-        target,
-        movement_type,
-        max_mp,
-        max_fuel,
-        interaction_min_range,
-        interaction_max_range,
-        player_id,
-        false,
-        cache,
-    )
-}
-
-/// 生産施設から生まれた間接攻撃unitが、次手番の生産口を譲るために一度退避してから
-/// 射撃可能になるまでの最短行動ターンを返す。
-#[allow(clippy::too_many_arguments)]
-pub fn calculate_action_distance_to_range_after_leaving_start(
-    map: &Map,
-    registry: &MasterDataRegistry,
-    unit_positions: &HashMap<(usize, usize), OccupantInfo>,
-    start: (usize, usize),
-    target: (usize, usize),
-    movement_type: MovementType,
-    max_mp: u32,
-    max_fuel: u32,
-    interaction_min_range: u32,
-    interaction_max_range: u32,
-    player_id: PlayerId,
-    cache: &mut ActionTurnDistanceCache,
-) -> Option<ActionTurnDistance> {
-    calculate_action_distance_to_range_with_origin_policy(
-        map,
-        registry,
-        unit_positions,
-        start,
-        target,
-        movement_type,
-        max_mp,
-        max_fuel,
-        interaction_min_range,
-        interaction_max_range,
-        player_id,
-        true,
-        cache,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn calculate_action_distance_to_range_with_origin_policy(
-    map: &Map,
-    registry: &MasterDataRegistry,
-    unit_positions: &HashMap<(usize, usize), OccupantInfo>,
-    start: (usize, usize),
-    target: (usize, usize),
-    movement_type: MovementType,
-    max_mp: u32,
-    max_fuel: u32,
-    interaction_min_range: u32,
-    interaction_max_range: u32,
-    player_id: PlayerId,
-    must_leave_start: bool,
-    cache: &mut ActionTurnDistanceCache,
-) -> Option<ActionTurnDistance> {
-    let zoc_aware = cache.policy == ActionDistancePolicy::ZocAware;
-    // 配置を正規化し、空盤面・敵の封鎖・味方の停止位置を別の探索として保持する。
-    // この探索が参照する占有情報は座標と所有者のみ。標準V4互換方針では配置を区別しない。
-    let mut occupancy: Vec<_> = if zoc_aware {
-        unit_positions
-            .iter()
-            .map(|(&(x, y), occupant)| (x, y, occupant.player_id))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    occupancy.sort_unstable_by_key(|&(x, y, player)| (x, y, player.0));
-    let occupancy: Arc<[_]> = occupancy.into();
+    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended() {
+        return extended::calculate_action_distance_to_range(
+            map,
+            registry,
+            unit_positions,
+            start,
+            target,
+            movement_type,
+            max_mp,
+            max_fuel,
+            interaction_min_range,
+            interaction_max_range,
+            player_id,
+            cache,
+        );
+    }
     let cache_key = ActionRangeCacheKey {
-        occupancy: Arc::clone(&occupancy),
+        occupancy: Vec::new().into(),
+        must_leave_start: false,
         start,
         target,
         movement_type,
@@ -586,7 +502,6 @@ fn calculate_action_distance_to_range_with_origin_policy(
         min_range: interaction_min_range,
         max_range: interaction_max_range,
         player_id,
-        must_leave_start,
     };
     if let Some(cached) = cache.cache.get(&cache_key) {
         return *cached;
@@ -632,7 +547,7 @@ fn calculate_action_distance_to_range_with_origin_policy(
         }
     }
 
-    if firing_positions.contains(&start) && !must_leave_start {
+    if firing_positions.contains(&start) {
         let result = Some(ActionTurnDistance {
             turns: 0,
             used_mp: 0,
@@ -652,7 +567,7 @@ fn calculate_action_distance_to_range_with_origin_policy(
     }
 
     let source_key = ActionSourceCacheKey {
-        occupancy,
+        occupancy: Vec::new().into(),
         start,
         movement_type,
         max_mp,
@@ -688,18 +603,6 @@ fn calculate_action_distance_to_range_with_origin_policy(
                 continue;
             }
 
-            // 実移動と同様、敵ZOCへ進入した手番はそのマスで移動を終了する。
-            // 次の隣接マスへは次手番の移動力を使って進めるため、到達不能にはしない。
-            let must_start_next_turn = zoc_aware
-                && state.position != start
-                && is_enemy_zoc(
-                    map,
-                    unit_positions,
-                    player_id,
-                    state.position.0,
-                    state.position.1,
-                );
-
             for next_position in map.get_adjacent(state.position.0, state.position.1) {
                 if unit_positions
                     .get(&next_position)
@@ -719,8 +622,6 @@ fn calculate_action_distance_to_range_with_origin_policy(
 
                 let (next_turns, next_mp_in_turn) = if state.turns == 0 {
                     (1, move_cost)
-                } else if must_start_next_turn {
-                    (state.turns.saturating_add(1), move_cost)
                 } else if state.mp_in_turn.saturating_add(move_cost) <= max_mp {
                     (state.turns, state.mp_in_turn + move_cost)
                 } else {
@@ -756,9 +657,6 @@ fn calculate_action_distance_to_range_with_origin_policy(
     };
     let mut best_result: Option<ActionTurnDistance> = None;
     for firing_position in firing_positions {
-        if must_leave_start && firing_position == start {
-            continue;
-        }
         if let Some((turns, _, total_mp, used_fuel)) = best_by_position.get(&firing_position) {
             let firing_distance =
                 map.distance(firing_position.0, firing_position.1, target.0, target.1);
@@ -774,19 +672,8 @@ fn calculate_action_distance_to_range_with_origin_policy(
                 },
             };
             let replace = best_result.is_none_or(|current| {
-                (
-                    candidate.turns,
-                    candidate.used_fuel,
-                    candidate.used_mp,
-                    candidate.firing_position.x,
-                    candidate.firing_position.y,
-                ) < (
-                    current.turns,
-                    current.used_fuel,
-                    current.used_mp,
-                    current.firing_position.x,
-                    current.firing_position.y,
-                )
+                (candidate.turns, candidate.used_fuel, candidate.used_mp)
+                    < (current.turns, current.used_fuel, current.used_mp)
             });
             if replace {
                 best_result = Some(candidate);
@@ -1187,6 +1074,8 @@ mod tests {
 
     #[test]
     fn action_distance_respects_turn_movement_boundaries() {
+        let _code_path =
+            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let map = Map::new(
             6,
             1,
@@ -1215,121 +1104,6 @@ mod tests {
         assert_eq!(distance.turns, 3);
         assert_eq!(distance.used_mp, 10);
         assert_eq!(distance.used_fuel, 5);
-        assert_eq!(distance.firing_position, GridPosition { x: 5, y: 0 });
-    }
-
-    #[test]
-    fn action_distance_reports_selected_firing_position() {
-        let map = Map::new(
-            5,
-            1,
-            Terrain::Plains,
-            crate::resources::GridTopology::Square,
-        );
-        let registry = MasterDataRegistry::load().unwrap_or_default();
-        let mut cache = ActionTurnDistanceCache::default();
-
-        let distance = calculate_action_distance_to_range(
-            &map,
-            &registry,
-            &HashMap::new(),
-            (0, 0),
-            (4, 0),
-            MovementType::Tank,
-            3,
-            99,
-            1,
-            1,
-            PlayerId(1),
-            &mut cache,
-        )
-        .unwrap();
-
-        assert_eq!(distance.turns, 1);
-        assert_eq!(distance.firing_position, GridPosition { x: 3, y: 0 });
-        assert!(distance.requires_movement);
-    }
-
-    #[test]
-    fn action_distance_enemy_zoc_ends_only_current_turn() {
-        let map = Map::new(
-            5,
-            2,
-            Terrain::Plains,
-            crate::resources::GridTopology::Square,
-        );
-        let registry = MasterDataRegistry::load().unwrap_or_default();
-        let mut cache = ActionTurnDistanceCache::default();
-        let enemy = OccupantInfo {
-            player_id: PlayerId(2),
-            unit_type: crate::resources::UnitType::Infantry,
-            is_transport: false,
-            free_slots: 0,
-            loadable_types: Vec::new(),
-        };
-        let unit_positions = HashMap::from([((1, 1), enemy)]);
-
-        let distance = calculate_action_distance_to_range(
-            &map,
-            &registry,
-            &unit_positions,
-            (0, 0),
-            (4, 0),
-            MovementType::Tank,
-            4,
-            99,
-            0,
-            0,
-            PlayerId(1),
-            &mut cache,
-        )
-        .unwrap();
-
-        // (1, 0) は敵 (1, 1) のZOC。T1はそこで停止し、T2に残り3マスを進む。
-        assert_eq!(distance.turns, 2);
-        assert_eq!(distance.used_mp, 4);
-        assert_eq!(distance.used_fuel, 4);
-        assert_eq!(distance.firing_position, GridPosition { x: 4, y: 0 });
-    }
-
-    #[test]
-    fn standard_v4_policy_does_not_stop_at_enemy_zoc() {
-        let map = Map::new(
-            5,
-            2,
-            Terrain::Plains,
-            crate::resources::GridTopology::Square,
-        );
-        let registry = MasterDataRegistry::load().unwrap_or_default();
-        let mut cache = ActionTurnDistanceCache::with_policy(ActionDistancePolicy::StandardV4);
-        let enemy = OccupantInfo {
-            player_id: PlayerId(2),
-            unit_type: crate::resources::UnitType::Infantry,
-            is_transport: false,
-            free_slots: 0,
-            loadable_types: Vec::new(),
-        };
-        let unit_positions = HashMap::from([((1, 1), enemy)]);
-
-        let distance = calculate_action_distance_to_range(
-            &map,
-            &registry,
-            &unit_positions,
-            (0, 0),
-            (4, 0),
-            MovementType::Tank,
-            4,
-            99,
-            0,
-            0,
-            PlayerId(1),
-            &mut cache,
-        )
-        .unwrap();
-
-        // 標準V4互換方針では (1, 0) の敵ZOCで停止せず、T1で4マス進み切る。
-        assert_eq!(distance.turns, 1);
-        assert_eq!(distance.used_mp, 4);
     }
 
     #[test]
@@ -1392,38 +1166,6 @@ mod tests {
 
         assert_eq!(distance.turns, 2);
         assert_eq!(distance.used_fuel, 1);
-    }
-
-    #[test]
-    fn action_distance_after_leaving_start_counts_factory_vacation_setup_turn() {
-        let map = Map::new(
-            5,
-            2,
-            Terrain::Plains,
-            crate::resources::GridTopology::Square,
-        );
-        let registry = MasterDataRegistry::load().unwrap_or_default();
-        let mut cache = ActionTurnDistanceCache::default();
-
-        let distance = calculate_action_distance_to_range_after_leaving_start(
-            &map,
-            &registry,
-            &HashMap::new(),
-            (0, 0),
-            (3, 0),
-            MovementType::Tank,
-            1,
-            1,
-            1,
-            3,
-            PlayerId(1),
-            &mut cache,
-        )
-        .expect("生産地点の外にも合法な射撃地点がある");
-
-        assert!(distance.requires_movement);
-        assert_ne!(distance.firing_position, GridPosition { x: 0, y: 0 });
-        assert_eq!(distance.turns, 2);
     }
 
     #[test]
@@ -1514,51 +1256,6 @@ mod tests {
     }
 
     #[test]
-    fn action_distance_cache_distinguishes_occupancy() {
-        let map = Map::new(
-            5,
-            1,
-            Terrain::Plains,
-            crate::resources::GridTopology::Square,
-        );
-        let registry = MasterDataRegistry::load().unwrap_or_default();
-        let empty = HashMap::new();
-        let blocked = HashMap::from([(
-            (2, 0),
-            OccupantInfo {
-                player_id: PlayerId(2),
-                unit_type: crate::resources::UnitType::Infantry,
-                is_transport: false,
-                free_slots: 0,
-                loadable_types: Vec::new(),
-            },
-        )]);
-        // 同一目標のキャッシュと、異なる目標へ共有する始点キャッシュの両方を検証する。
-        for targets in [[4, 4], [3, 4]] {
-            for blocked_first in [false, true] {
-                let mut cache = ActionTurnDistanceCache::default();
-                for (index, is_blocked) in [blocked_first, !blocked_first].into_iter().enumerate() {
-                    let result = calculate_action_distance_to_range(
-                        &map,
-                        &registry,
-                        if is_blocked { &blocked } else { &empty },
-                        (0, 0),
-                        (targets[index], 0),
-                        MovementType::Infantry,
-                        3,
-                        99,
-                        1,
-                        1,
-                        PlayerId(1),
-                        &mut cache,
-                    );
-                    assert_eq!(result.is_none(), is_blocked);
-                }
-            }
-        }
-    }
-
-    #[test]
     fn test_turn_distance_unreachable() {
         let mut map = Map::new(
             5,
@@ -1613,3 +1310,8 @@ mod tests {
         ));
     }
 }
+
+// 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
+mod extended;
+#[allow(unused_imports)]
+pub use self::extended::*;

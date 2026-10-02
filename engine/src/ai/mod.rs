@@ -1,4 +1,6 @@
 pub mod ai_version;
+/// main互換実装と拡張実装の経路選択
+pub mod code_path;
 pub mod demand;
 pub(crate) mod deterministic_parallel;
 pub mod engine;

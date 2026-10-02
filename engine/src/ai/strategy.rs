@@ -213,6 +213,15 @@ fn analyze_strategy_internal(
     cached_campaign: Option<IslandCampaignPortfolio>,
     reserved_entities: &HashSet<Entity>,
 ) -> ProductionStrategy {
+    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended() {
+        return extended::analyze_strategy_internal(
+            world,
+            player_id,
+            cached_campaign,
+            reserved_entities,
+        );
+    }
     let mut strategy = ProductionStrategy::default();
 
     let mut unowned_properties = Vec::new();
@@ -227,9 +236,7 @@ fn analyze_strategy_internal(
             crate::resources::master_data::MasterDataRegistry::load().unwrap_or_default()
         });
     let map = world.resource::<crate::resources::Map>().clone();
-    let ai_version = crate::ai::resolve_player_ai_version(world, player_id);
-    let is_v3 = ai_version.uses_v3_tactics();
-    let is_v4 = ai_version.uses_operation_driven_production();
+    let is_v3 = crate::ai::resolve_player_ai_version(world, player_id).uses_v3_tactics();
     if is_v3 {
         if let Some(cached) = cached_campaign {
             strategy.campaign_portfolio = cached;
@@ -240,15 +247,6 @@ fn analyze_strategy_internal(
             } else {
                 analyze_island_campaign_excluding(world, player_id, reserved_entities)
             };
-            if is_v4 {
-                // 小規模/通常の分岐はここで持たず、ターン入口で確定したパイプラインへ
-                // portfolioを渡す。各層が別々に小規模作戦を有効化しないための境界である。
-                crate::ai::v4::small_map::prepare_strategy(
-                    world,
-                    player_id,
-                    &mut strategy.campaign_portfolio,
-                );
-            }
             // 診断Resourceは意思決定に戻さず、最後の分析結果だけをプレイヤー別に上書きする。
             if let Some(mut diagnostics) = world.get_resource_mut::<IslandCampaignDiagnostics>() {
                 diagnostics
@@ -1647,3 +1645,8 @@ mod tests {
         assert!(portfolio.assignment_for(enemy_island).is_none());
     }
 }
+
+// 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
+mod extended;
+#[allow(unused_imports)]
+pub use self::extended::*;

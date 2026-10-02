@@ -628,6 +628,8 @@ mod tests {
 
     #[test]
     fn beam_search_does_not_redirect_transport_invasion() {
+        let _code_path =
+            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut world = setup_test_world();
         let p1 = PlayerId(1);
         let map = world.resource::<Map>().clone();
@@ -675,3 +677,8 @@ mod tests {
         assert_eq!(manager.squads[0].target_island, Some(island_id));
     }
 }
+
+// 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
+mod extended;
+#[allow(unused_imports)]
+pub use self::extended::*;

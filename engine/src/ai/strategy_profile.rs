@@ -17,7 +17,7 @@ const SMALL_MAP_MAX_CELLS: usize = 14 * 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum V4StrategyProfile {
-    /// 共通パイプラインで実行する標準マップ向けの汎用V4戦略。
+    /// main互換の汎用V4戦略。
     Standard,
     /// 拡張レースと前線密度を強く扱う小規模マップ専用戦略。
     SmallMapExpansion,
@@ -44,24 +44,6 @@ pub fn profile_for(world: &mut World, player_id: crate::components::PlayerId) ->
         .profiles
         .insert(player_id, profile);
     profile
-}
-
-/// 標準V4（V4かつ盤面がStandardプロファイル）かを判定する。
-///
-/// V4以外のプレイヤーについてプロファイルを登録しないよう、V4の場合だけ
-/// `profile_for` で盤面から確定する。
-pub fn is_standard_v4(world: &mut World, player_id: crate::components::PlayerId) -> bool {
-    crate::ai::resolve_player_ai_version(world, player_id) == crate::ai::AiVersion::V4
-        && profile_for(world, player_id) == V4StrategyProfile::Standard
-}
-
-/// 読み取り専用の経路で標準V4かを判定する。
-///
-/// V4のターン開始時に `profile_for` でプロファイルが確定済みである前提で、
-/// `current_profile` を参照する。
-pub fn is_standard_v4_readonly(world: &World, player_id: crate::components::PlayerId) -> bool {
-    crate::ai::resolve_player_ai_version(world, player_id) == crate::ai::AiVersion::V4
-        && current_profile(world, player_id) == V4StrategyProfile::Standard
 }
 
 /// 読み取り専用の経路では未初期化をStandardとして扱う。
@@ -100,38 +82,6 @@ fn classify_profile(world: &World) -> V4StrategyProfile {
 mod tests {
     use super::*;
     use crate::resources::{GridTopology, master_data::MasterDataRegistry};
-
-    #[test]
-    fn small_map_boundary_requires_a_capturable_non_capital() {
-        fn profile_at(width: usize, height: usize, terrain: Terrain) -> V4StrategyProfile {
-            let mut world = World::new();
-            world.insert_resource(Map {
-                width,
-                height,
-                tiles: vec![Terrain::Plains; width * height],
-                topology: GridTopology::Square,
-            });
-            world.spawn((
-                GridPosition { x: 0, y: 0 },
-                Property::new(terrain, None, 100),
-            ));
-            profile_for(&mut world, crate::components::PlayerId(1))
-        }
-
-        // 境界の両側と、首都しか存在しない盤面で小規模戦略の適用範囲を固定する。
-        assert_eq!(
-            profile_at(14, 14, Terrain::City),
-            V4StrategyProfile::SmallMapExpansion
-        );
-        assert_eq!(
-            profile_at(197, 1, Terrain::City),
-            V4StrategyProfile::Standard
-        );
-        assert_eq!(
-            profile_at(14, 14, Terrain::Capital),
-            V4StrategyProfile::Standard
-        );
-    }
 
     #[test]
     fn profile_is_fixed_by_map_structure_not_by_turn_state() {

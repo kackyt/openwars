@@ -17,20 +17,6 @@ use crate::resources::UnitType;
 use bevy_ecs::prelude::*;
 use std::collections::HashMap;
 
-/// 敵の実生産観測から作る、次手番1回分の予測と既済予測の誤差。
-///
-/// 予測は現在の必須戦力や資金予約には使わない。まず対戦ログで誤差を測り、
-/// 予測器が追随できていることを確認するための診断値である。
-#[derive(Debug, Clone, Copy, Default)]
-pub struct EnemyProductionForecastTrace {
-    pub expected_units_next_turn: u32,
-    pub expected_cost_next_turn: u32,
-    pub dominant_unit_type: Option<UnitType>,
-    pub evaluated_samples: u32,
-    pub mean_absolute_unit_error: u32,
-    pub mean_absolute_cost_error: u32,
-}
-
 /// 1 枠分の購入判断の結末。
 #[derive(Debug, Clone)]
 pub enum ProductionDecision {
@@ -86,8 +72,8 @@ pub struct ProductionOperationTrace {
     pub capture_replacement_pending: bool,
     pub requires_transport: bool,
     pub enemy_combat_units: u32,
-    /// この前線へ到着しうる増援額。標準戦線では作戦期限全体、小規模戦線では
-    /// 実生産履歴と敵施設の事前分布から推定した直近生産波を編成の基準にする。
+    /// 実生産履歴と敵施設の事前分布を基準に、作戦期限までにこの前線へ到着しうる
+    /// 通常増援額。RollingPlanへ仮想敵として渡す継続生産の基準である。
     pub enemy_reinforcement_funds: u32,
     /// 敵が施設・収入をより強く使った場合の上側見積り。進撃Goは止めず、
     /// counter候補と次回再計画の診断に使う。
@@ -98,8 +84,7 @@ pub struct ProductionOperationTrace {
     pub deploy_lead_time: u32,
 }
 
-/// 実生産傾向から得た条件付きcounter候補。仮想敵を現在編成へ混ぜず、
-/// 予約も行わない。対応が必要なのは実Entityを観測した次手番である。
+/// 仮想敵を現在編成へ混ぜず、観測後に発動する条件付きcounter計画。
 #[derive(Debug, Clone, Copy)]
 pub struct ReinforcementContingencyTrace {
     pub enemy_type: UnitType,
@@ -198,7 +183,12 @@ pub struct ProductionPlanTrace {
 impl ProductionPlanTrace {
     /// 作戦が立たなかったターンの記録を作る。
     pub fn new(player_id: PlayerId, funds: u32, free_facility_count: usize) -> Self {
+        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
+        if crate::ai::code_path::is_extended() {
+            return Self::new_extended(player_id, funds, free_facility_count);
+        }
         Self {
+            enemy_production_forecast: Default::default(),
             player_id,
             funds,
             free_facility_count,
@@ -209,23 +199,20 @@ impl ProductionPlanTrace {
             leftover_funds: funds,
             reserved_funds: 0,
             uncommitted_funds: funds,
-            enemy_production_forecast: EnemyProductionForecastTrace::default(),
         }
     }
 
     /// 実際に発注されたユニット種別ごとの体数。
     /// 「工場数 × ターン数に張り付いていないか」の判定に使う。
     pub fn produced_counts(&self) -> HashMap<UnitType, usize> {
+        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
+        if crate::ai::code_path::is_extended() {
+            return self.produced_counts_extended();
+        }
         let mut counts = HashMap::new();
         for step in &self.steps {
-            match &step.decision {
-                ProductionDecision::Produced { unit_type, .. }
-                | ProductionDecision::ProducedImmediateReinforcement { unit_type, .. } => {
-                    *counts.entry(*unit_type).or_insert(0) += 1;
-                }
-                ProductionDecision::SlotCleared
-                | ProductionDecision::Deferred { .. }
-                | ProductionDecision::Reserved { .. } => {}
+            if let ProductionDecision::Produced { unit_type, .. } = &step.decision {
+                *counts.entry(*unit_type).or_insert(0) += 1;
             }
         }
         counts
@@ -337,3 +324,8 @@ mod tests {
         assert!(trace.steps.is_empty());
     }
 }
+
+// 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
+mod extended;
+#[allow(unused_imports)]
+pub use self::extended::*;

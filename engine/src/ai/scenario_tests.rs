@@ -845,6 +845,8 @@ mod tests {
 
     #[test]
     fn test_v3_multi_cargo_invasion_loads_transits_and_lands() {
+        let _code_path =
+            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let master_data = MasterDataRegistry::load().unwrap();
         let (mut world, mut schedule) =
             crate::setup::initialize_world_from_master_data(&master_data, "map_1").unwrap();
@@ -1088,3 +1090,8 @@ mod tests {
         assert!(world.get::<GridPosition>(combat).unwrap().x >= 3);
     }
 }
+
+// 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
+mod extended;
+#[allow(unused_imports)]
+pub use self::extended::*;

@@ -1,3 +1,4 @@
+use super::strategy::GamePhase;
 use crate::ai::demand::{
     AirCoverageContribution, AirDefenseAssessment, CombatCapabilitySnapshot,
     air_coverage_with_timing, candidate_air_coverage, candidate_air_coverage_with_cache,
@@ -13,6 +14,7 @@ use crate::ai::strategy::{
 use crate::ai::turn_distance::{
     ActionTurnDistanceCache, TerrainConnectivity, TurnDistanceCache, calculate_turn_distance,
 };
+use crate::ai::v4::campaign_execution::{CampaignProductionIntent, CampaignProductionRole};
 use crate::components::{
     ActionCompleted, Ammo, Faction, Fuel, GridPosition, Health, PlayerId, Property, UnitStats,
 };
@@ -20,8 +22,6 @@ use crate::events::ProduceUnitCommand;
 use crate::resources::master_data::MasterDataRegistry;
 use crate::resources::{DamageChart, MovementType, Players, Terrain, UnitRegistry, UnitType};
 use bevy_ecs::prelude::*;
-
-use super::strategy::GamePhase;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CampaignProductionRequirement {
@@ -31,8 +31,6 @@ enum CampaignProductionRequirement {
     Capture,
     Combat,
 }
-
-use crate::ai::v4::campaign_execution::{CampaignProductionIntent, CampaignProductionRole};
 
 #[derive(Debug)]
 pub(crate) struct CampaignProductionOutcome {
@@ -313,16 +311,16 @@ fn select_best_production_candidate(
 fn remaining_campaign_requirements(
     shortfall: &IslandCampaignShortfall,
 ) -> Vec<CampaignProductionRequirement> {
+    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended() {
+        return extended::remaining_campaign_requirements(shortfall);
+    }
     let mut requirements = Vec::new();
     if shortfall.heavy_transport_slots > 0 {
         requirements.push(CampaignProductionRequirement::HeavyTransport);
     }
     if shortfall.light_transport_slots > 0 {
         requirements.push(CampaignProductionRequirement::LightTransport);
-    }
-    if shortfall.ground_combat_units > 0 {
-        // 地形上の突破未達だけを表す構造要求。敵数から固定台数を積むCombatとは分ける。
-        requirements.push(CampaignProductionRequirement::GroundCombat);
     }
     if shortfall.capture_units > 0 {
         requirements.push(CampaignProductionRequirement::Capture);
@@ -338,6 +336,10 @@ fn campaign_candidate_matches(
     unit_type: UnitType,
     stats: &UnitStats,
 ) -> bool {
+    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended() {
+        return extended::campaign_candidate_matches(requirement, unit_type, stats);
+    }
     // 要求量を減らせない不正なマスターデータは候補から除外し、計画を確実に前進させる。
     match requirement {
         CampaignProductionRequirement::HeavyTransport => {
@@ -346,13 +348,9 @@ fn campaign_candidate_matches(
         CampaignProductionRequirement::LightTransport => {
             unit_type == UnitType::TransportHelicopter && stats.max_cargo > 0
         }
-        CampaignProductionRequirement::GroundCombat => {
-            matches!(
-                unit_type,
-                UnitType::Tank | UnitType::MdTank | UnitType::TankZ
-            ) && stats.movement_type == MovementType::Tank
-        }
         CampaignProductionRequirement::Capture => stats.can_capture,
+        // 地上戦闘要求は拡張経路だけが作る。main互換経路では一致させない。
+        CampaignProductionRequirement::GroundCombat => false,
         CampaignProductionRequirement::Combat => {
             stats.cost > 0
                 && !stats.can_capture
@@ -521,6 +519,10 @@ fn consume_campaign_candidate(
     requirement: CampaignProductionRequirement,
     stats: &UnitStats,
 ) {
+    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended() {
+        return extended::consume_campaign_candidate(shortfall, requirement, stats);
+    }
     match requirement {
         CampaignProductionRequirement::HeavyTransport => {
             shortfall.heavy_transport_slots = shortfall
@@ -532,18 +534,14 @@ fn consume_campaign_candidate(
                 .light_transport_slots
                 .saturating_sub(stats.max_cargo);
         }
-        CampaignProductionRequirement::GroundCombat => {
-            // 突破用のTankも通常のCombat一体として使える。同じ購入を次の
-            // Combat枠で再計上すると、構造要求だけで二重生産になってしまう。
-            shortfall.ground_combat_units = shortfall.ground_combat_units.saturating_sub(1);
-            shortfall.combat_units = shortfall.combat_units.saturating_sub(1);
-        }
         CampaignProductionRequirement::Capture => {
             shortfall.capture_units = shortfall.capture_units.saturating_sub(1);
         }
         CampaignProductionRequirement::Combat => {
             shortfall.combat_units = shortfall.combat_units.saturating_sub(1);
         }
+        // 地上戦闘要求は拡張経路だけが作る。
+        CampaignProductionRequirement::GroundCombat => {}
     }
     shortfall.reserved_budget = shortfall.reserved_budget.saturating_sub(stats.cost);
 }
@@ -581,6 +579,19 @@ fn plan_campaign_shortfall_production_with_damage(
     available_funds: u32,
     damage_chart: Option<&DamageChart>,
 ) -> CampaignProductionOutcome {
+    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended() {
+        return extended::plan_campaign_shortfall_production_with_damage(
+            player_id,
+            shortfalls,
+            facilities,
+            available_types,
+            map,
+            master_data,
+            available_funds,
+            damage_chart,
+        );
+    }
     let mut rows = shortfalls.to_vec();
     rows.sort_by_key(|row| (row.priority_rank, row.island_id.0));
     let mut sorted_facilities = facilities.to_vec();
@@ -634,11 +645,7 @@ fn plan_campaign_shortfall_production_with_damage(
                             // 「後で何かが運ぶ」と見込まず、施設から作戦地点へ自力到達
                             // できる候補だけを許す。渡洋支援は航空・艦船、または既に
                             // campaignへ割り当て済みの輸送可能戦力が担当する。
-                            || (matches!(
-                                requirement,
-                                CampaignProductionRequirement::GroundCombat
-                                    | CampaignProductionRequirement::Combat
-                            )
+                            || (requirement == CampaignProductionRequirement::Combat
                                 && !combat_connectivity.is_reachable(
                                     map,
                                     master_data,
@@ -654,11 +661,8 @@ fn plan_campaign_shortfall_production_with_damage(
                         {
                             continue;
                         }
-                        let combat_coverage = u32::from(matches!(
-                            requirement,
-                            CampaignProductionRequirement::GroundCombat
-                                | CampaignProductionRequirement::Combat
-                        ));
+                        let combat_coverage =
+                            u32::from(requirement == CampaignProductionRequirement::Combat);
                         // Capture枠は戦闘火力で選ばない。対象へ到着してCaptureを完了する
                         // 手番を優先し、同着なら安い候補を選ぶ。火力は別のCombat計画が担う。
                         let capture_completion_turn =
@@ -772,15 +776,15 @@ fn plan_campaign_shortfall_production_with_damage(
                     CampaignProductionRole::Transport
                 }
                 CampaignProductionRequirement::Capture => CampaignProductionRole::Capture,
-                CampaignProductionRequirement::GroundCombat
-                | CampaignProductionRequirement::Combat => CampaignProductionRole::Combat,
+                // 地上戦闘要求は拡張経路だけが作る。
+                CampaignProductionRequirement::Combat
+                | CampaignProductionRequirement::GroundCombat => CampaignProductionRole::Combat,
             };
             outcome.intents.push(CampaignProductionIntent {
+                mission_target: None,
                 command: command.clone(),
                 island_id: row.island_id,
                 role,
-                mission_target: (role == CampaignProductionRole::Capture)
-                    .then_some(row.target_position),
             });
             outcome.commands.push(command);
             outcome.remaining_funds = outcome.remaining_funds.saturating_sub(stats.cost);
@@ -2146,7 +2150,6 @@ mod additional_tests {
     fn issue75_air_defense_strategy() -> ProductionStrategy {
         ProductionStrategy {
             air_defense: AirDefenseAssessment {
-                distance_policy: Default::default(),
                 targets: vec![AirThreatTarget {
                     position: GridPosition { x: 5, y: 0 },
                     unit_type: UnitType::Bomber,
@@ -2222,7 +2225,6 @@ mod additional_tests {
         chart.insert_damage(UnitType::AntiAir, UnitType::TransportHelicopter, 65);
         let strategy = ProductionStrategy {
             air_defense: AirDefenseAssessment {
-                distance_policy: Default::default(),
                 targets: vec![AirThreatTarget {
                     position: GridPosition { x: 2, y: 0 },
                     unit_type: UnitType::TransportHelicopter,
@@ -2276,7 +2278,6 @@ mod additional_tests {
         chart.insert_damage(UnitType::AntiAir, UnitType::Bcopters, 65);
         let strategy = ProductionStrategy {
             air_defense: AirDefenseAssessment {
-                distance_policy: Default::default(),
                 targets: vec![AirThreatTarget {
                     position: GridPosition { x: 3, y: 0 },
                     unit_type: UnitType::Bcopters,
@@ -2354,7 +2355,6 @@ mod additional_tests {
         chart.insert_damage(UnitType::AntiAir, UnitType::Bomber, 68);
         let strategy = ProductionStrategy {
             air_defense: AirDefenseAssessment {
-                distance_policy: Default::default(),
                 targets: vec![AirThreatTarget {
                     position: GridPosition { x: 4, y: 0 },
                     unit_type: UnitType::Bomber,
@@ -2434,7 +2434,6 @@ mod additional_tests {
         chart.insert_damage(UnitType::AntiAir, UnitType::Bomber, 100);
         let strategy = ProductionStrategy {
             air_defense: AirDefenseAssessment {
-                distance_policy: Default::default(),
                 targets: vec![AirThreatTarget {
                     position: GridPosition { x: 5, y: 0 },
                     unit_type: UnitType::Bomber,
@@ -2489,7 +2488,6 @@ mod additional_tests {
         chart.insert_damage(UnitType::Missiles, UnitType::Bomber, 100);
         let strategy = ProductionStrategy {
             air_defense: AirDefenseAssessment {
-                distance_policy: Default::default(),
                 targets: vec![
                     AirThreatTarget {
                         position: GridPosition { x: 2, y: 0 },
@@ -3297,7 +3295,6 @@ mod additional_tests {
         let required_coverage = 11_250.0;
         let shortage = ProductionStrategy {
             air_defense: AirDefenseAssessment {
-                distance_policy: Default::default(),
                 targets: vec![target],
                 coverage_by_target: vec![0.0],
                 required_coverage,
@@ -3602,6 +3599,8 @@ mod additional_tests {
 
     #[test]
     fn campaign_production_rejects_zero_capacity_transport() {
+        let _code_path =
+            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let master_data = MasterDataRegistry::load().unwrap();
         let mut helicopter = master_data
             .create_unit_stats(&crate::resources::master_data::UnitName(
@@ -3638,6 +3637,8 @@ mod additional_tests {
 
     #[test]
     fn campaign_production_rejects_zero_cost_combat_unit() {
+        let _code_path =
+            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let master_data = MasterDataRegistry::load().unwrap();
         let mut infantry = master_data
             .create_unit_stats(&crate::resources::master_data::UnitName(
@@ -4043,6 +4044,8 @@ mod additional_tests {
 
     #[test]
     fn campaign_production_exposes_only_funds_above_all_remaining_reservations() {
+        let _code_path =
+            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let master_data = MasterDataRegistry::load().unwrap();
         let available_types = campaign_test_types(&master_data);
         let rows = vec![crate::ai::island_campaign::IslandCampaignShortfall {
@@ -4081,6 +4084,8 @@ mod additional_tests {
 
     #[test]
     fn campaign_combat_requires_an_affordable_non_capture_unit() {
+        let _code_path =
+            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let master_data = MasterDataRegistry::load().unwrap();
         let available_types = campaign_test_types(&master_data);
         let facilities = vec![(GridPosition { x: 0, y: 0 }, Terrain::Factory)];
@@ -4124,6 +4129,8 @@ mod additional_tests {
 
     #[test]
     fn campaign_assault_production_requires_lander_and_helicopter() {
+        let _code_path =
+            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let master_data = MasterDataRegistry::load().unwrap();
         let available_types = campaign_test_types(&master_data);
         let rows = vec![crate::ai::island_campaign::IslandCampaignShortfall {
@@ -4167,6 +4174,8 @@ mod additional_tests {
 
     #[test]
     fn campaign_assault_defers_combat_support_after_building_the_first_landing_wave() {
+        let _code_path =
+            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let master_data = MasterDataRegistry::load().unwrap();
         let available_types = campaign_test_types(&master_data);
         let rows = vec![crate::ai::island_campaign::IslandCampaignShortfall {
@@ -4316,6 +4325,8 @@ mod additional_tests {
     /// 残金を次ターンのLander購入へ温存する。
     #[test]
     fn campaign_assault_produces_one_affordable_prerequisite_while_saving_for_lander() {
+        let _code_path =
+            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let master_data = MasterDataRegistry::load().unwrap();
         let available_types = campaign_test_types(&master_data);
         let rows = vec![crate::ai::island_campaign::IslandCampaignShortfall {
@@ -4836,3 +4847,8 @@ mod additional_tests {
         );
     }
 }
+
+// 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
+mod extended;
+#[allow(unused_imports)]
+pub use self::extended::*;

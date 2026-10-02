@@ -99,15 +99,15 @@ impl PlanMetrics {
 }
 
 /// 全体撃破へ未到達でも、有限の購入列が敵HPを実際に減らすなら再評価付きtrancheとして実行する。
-///
-/// beam探索を打ち切った候補は、残敵・必要額とも未確定である。部分的にHPを削れる
-/// というだけで計画へ昇格させると、未探索の敵を含む巨額の予約を永続化してしまう。
 fn executable_plan(_kind: OperationKind, plan: &ForcePackagePlan) -> bool {
+    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended() {
+        return extended::executable_plan(_kind, plan);
+    }
     if plan.feasible {
         return true;
     }
-    !plan.search_truncated
-        && !plan.purchases.is_empty()
+    !plan.purchases.is_empty()
         && plan
             .target_forecasts
             .iter()
@@ -793,12 +793,16 @@ impl V4RollingPlanRegistry {
         &self,
         player_id: PlayerId,
     ) -> Vec<ActiveCombatPlanSummary> {
+        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
+        if crate::ai::code_path::is_extended() {
+            return self.active_combat_plan_summaries_extended(player_id);
+        }
         self.active
             .iter()
             .filter(|plan| plan.player_id == player_id)
             .map(|plan| ActiveCombatPlanSummary {
-                plan_id: plan.plan_id,
                 kind: plan.kind,
+                plan_id: plan.plan_id,
                 anchor: plan.anchor,
                 objective_properties: plan.objective_properties.clone(),
                 planned_elimination_turn: plan.execution.snapshot.planned_elimination_turn,
@@ -807,18 +811,22 @@ impl V4RollingPlanRegistry {
             .collect()
     }
 
-    /// 現在盤面で組み直した首都計画が、最初の交戦波を発進できるかを返す。
-    ///
-    /// 後続増援の予約は戦力目標であって、前方DAGが開いた既存部隊を停止させる理由では
-    /// ない。最初に攻撃を開始すると見積もった時点までに必要な購入だけを確認する。
+    /// 現在盤面で組み直した首都計画が、全生産を終えて一波として発進可能かを返す。
     pub(crate) fn operation_launch_ready(&self, player_id: PlayerId, island_id: IslandId) -> bool {
+        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
+        if crate::ai::code_path::is_extended() {
+            return self.operation_launch_ready_extended(player_id, island_id);
+        }
         self.active.iter().any(|plan| {
             plan.player_id == player_id
                 && plan.kind == OperationKind::AssaultCapital
                 && plan.island_id == Some(island_id)
                 && plan.execution_authorized
                 && plan.execution_ready
-                && first_attack_wave_produced(plan)
+                && plan
+                    .steps
+                    .iter()
+                    .all(|step| step.status == PurchaseStatus::Produced)
         })
     }
 
@@ -865,17 +873,26 @@ impl V4RollingPlanRegistry {
         capital_assault_authorized: bool,
         capital_staging_anchor: Option<GridPosition>,
     ) -> Vec<ActiveDeploymentIntent> {
+        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
+        if crate::ai::code_path::is_extended() {
+            return self.active_deployment_intents_extended(
+                player_id,
+                capital_assault_authorized,
+                capital_staging_anchor,
+            );
+        }
         self.active
             .iter()
             .filter(|plan| plan.player_id == player_id)
             .map(|plan| {
                 let mut priority_enemies = plan.target_enemies.iter().copied().collect::<Vec<_>>();
                 priority_enemies.sort_unstable_by_key(|entity| entity.to_bits());
-                let first_attack_wave_ready = first_attack_wave_produced(plan);
+                let formation_complete = plan
+                    .steps
+                    .iter()
+                    .all(|step| step.status == PurchaseStatus::Produced);
                 let posture = if plan.kind != OperationKind::AssaultCapital
-                    || (capital_assault_authorized
-                        && first_attack_wave_ready
-                        && plan.execution_ready)
+                    || (capital_assault_authorized && formation_complete && plan.execution_ready)
                 {
                     super::deployment::DeploymentPosture::Execute
                 } else {
@@ -960,12 +977,7 @@ impl V4RollingPlanRegistry {
         )
     }
 
-    /// 島IDと作戦種別を正本として、目標座標や敵集合の変化を同一Planのrevisionへ束ねる。
-    ///
-    /// 同じ島には「次のDAG区間を確保するCapture」と「首都を攻略する
-    /// AssaultCapital」が同時に存在し得る。これらを一つのPlanIdへ畳むと、後から
-    /// 評価した方が購入列・配属先・実績台帳を上書きし、中間区間の護衛も首都攻略も
-    /// 失われる。そのため島は継続境界ではあるが、作戦種別を越える境界ではない。
+    /// 島IDを作戦の正本として、目標座標や敵集合の変化を同一Planのrevisionへ束ねる。
     pub(crate) fn continuation_for_operation(
         &self,
         player_id: PlayerId,
@@ -1551,14 +1563,23 @@ impl V4RollingPlanRegistry {
         objective_properties: &[GridPosition],
         _target_enemies: &HashSet<Entity>,
     ) -> Option<usize> {
+        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
+        if crate::ai::code_path::is_extended() {
+            return self.matching_index_extended(
+                player_id,
+                kind,
+                island_id,
+                objective_properties,
+                _target_enemies,
+            );
+        }
         self.active
             .iter()
             .enumerate()
             .filter(|(_, plan)| plan.player_id == player_id)
             .find_map(|(index, plan)| {
                 if let Some(island_id) = island_id {
-                    return (plan.island_id == Some(island_id) && plan.kind == kind)
-                        .then_some(index);
+                    return (plan.island_id == Some(island_id)).then_some(index);
                 }
                 // 敵Entityは移動して別の島へ渡るため、敵の重複をPlan identityに使わない。
                 // 同じ目的拠点集合だけを同一作戦のrevisionとして扱い、別島への変質を禁止する。
@@ -1678,22 +1699,6 @@ impl V4RollingPlanRegistry {
             execution: plan.execution.snapshot.clone(),
         });
     }
-}
-
-/// 作戦が予測した最初の交戦までに必要な購入だけが実体化したかを返す。
-///
-/// `scheduled_turn` がその時点より後のstepは、進軍中に到着する後続増援である。これを
-/// 全軍の停止条件にすると、資金と工場が余っていても首都前で待ち続けてしまう。
-fn first_attack_wave_produced(plan: &StoredPlan) -> bool {
-    let first_attack_turn = plan
-        .execution
-        .snapshot
-        .planned_first_attack_turn
-        .unwrap_or(plan.last_evaluated_turn);
-    plan.steps
-        .iter()
-        .filter(|step| step.scheduled_turn <= first_attack_turn)
-        .all(|step| step.status == PurchaseStatus::Produced)
 }
 
 fn scheduled_steps(
@@ -2085,25 +2090,11 @@ mod tests {
 
     fn feasible_plan(build_turn: u32) -> ForcePackagePlan {
         ForcePackagePlan {
-            purchases: vec![PlannedPurchase {
-                facility: GridPosition { x: 2, y: 3 },
-                unit_type: UnitType::Bcopters,
-                build_turn,
-                cost: 7_500,
-            }],
             capture_purchases: Vec::new(),
             combat_purchases: Vec::new(),
-            target_forecasts: Vec::new(),
-            turn_forecasts: Vec::new(),
-            feasible: true,
-            first_attack_turn: Some(build_turn.saturating_add(2)),
-            front_breakthrough_turn: Some(build_turn.saturating_add(2)),
+            front_breakthrough_turn: None,
             deadline_target_first_attack_turn: None,
             target_first_attack_turns: Vec::new(),
-            elimination_turn: Some(build_turn.saturating_add(3)),
-            occupation_turn: Some(build_turn.saturating_add(5)),
-            production_cost: 7_500,
-            expected_loss: 1_000,
             blocked_next_turn_production_slots: 0,
             direct_fire_lane_count: 0,
             direct_front_shortfall: 0,
@@ -2111,15 +2102,29 @@ mod tests {
             direct_damage_by_target: Vec::new(),
             existing_indirect_damage_by_target: Vec::new(),
             produced_indirect_damage_by_target: Vec::new(),
-            surviving_combat_value: 6_500,
+            surviving_combat_value: 0,
             required_overmatch_value: 0,
-            overmatch_ready: true,
+            overmatch_ready: false,
+            deadline_capture_survivor_count: 0,
+            candidates_pruned: 0,
+            purchases: vec![PlannedPurchase {
+                facility: GridPosition { x: 2, y: 3 },
+                unit_type: UnitType::Bcopters,
+                build_turn,
+                cost: 7_500,
+            }],
+            target_forecasts: Vec::new(),
+            turn_forecasts: Vec::new(),
+            feasible: true,
+            first_attack_turn: Some(build_turn.saturating_add(2)),
+            elimination_turn: Some(build_turn.saturating_add(3)),
+            occupation_turn: Some(build_turn.saturating_add(5)),
+            production_cost: 7_500,
+            expected_loss: 1_000,
             protected_unit_count: 0,
             protected_survivor_count: 0,
-            deadline_capture_survivor_count: 0,
             required_capture_survivor_count: 0,
             candidates_considered: 1,
-            candidates_pruned: 0,
             search_truncated: false,
         }
     }
@@ -2182,7 +2187,9 @@ mod tests {
     }
 
     #[test]
-    fn capital_launch_gate_opens_after_first_attack_wave_is_produced() {
+    fn capital_launch_gate_opens_only_after_every_authorized_step_is_produced() {
+        let _code_path =
+            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let player = PlayerId(1);
         let island = IslandId(7);
         let anchor = GridPosition { x: 20, y: 10 };
@@ -2215,59 +2222,6 @@ mod tests {
         registry.reconcile_produced_steps(player, &HashSet::from([step]));
 
         assert!(registry.operation_launch_ready(player, island));
-    }
-
-    #[test]
-    fn future_capital_reinforcement_does_not_block_first_attack_wave() {
-        let player = PlayerId(1);
-        let island = IslandId(7);
-        let anchor = GridPosition { x: 20, y: 10 };
-        let enemy = Entity::from_raw(10);
-        let mut plan = feasible_plan(0);
-        plan.purchases.push(PlannedPurchase {
-            facility: GridPosition { x: 4, y: 3 },
-            unit_type: UnitType::Tank,
-            // 最初の攻撃予測（turn 5）より後の増援であり、首都前の部隊を待たせない。
-            build_turn: 4,
-            cost: 7_000,
-        });
-        plan.production_cost = 14_500;
-        let mut registry = V4RollingPlanRegistry::default();
-        let selected = registry.select_for_operation(
-            player,
-            3,
-            OperationKind::AssaultCapital,
-            Some(island),
-            anchor,
-            vec![anchor],
-            HashSet::from([enemy]),
-            true,
-            None,
-            plan,
-            None,
-            HashSet::new(),
-        );
-        let first_step = registry
-            .current_step_ref(
-                selected.plan_id.expect("首都Plan"),
-                selected.revision.expect("revision"),
-                3,
-                selected.plan.purchases[0],
-            )
-            .expect("第一波の当手番step");
-        registry.reconcile_produced_steps(player, &HashSet::from([first_step]));
-
-        assert!(
-            registry.operation_launch_ready(player, island),
-            "最初の攻撃波を揃えた後は、後続Tankの予約で首都作戦をFormingへ戻さない"
-        );
-        assert!(
-            registry.active[0]
-                .steps
-                .iter()
-                .any(|step| step.status != PurchaseStatus::Produced),
-            "後続増援は未生産のまま残り、予約自体は維持する"
-        );
     }
 
     #[test]
@@ -2328,7 +2282,9 @@ mod tests {
     }
 
     #[test]
-    fn island_operation_identity_keeps_kind_but_allows_anchor_property_and_enemy_changes() {
+    fn island_identity_survives_kind_anchor_property_and_enemy_changes() {
+        let _code_path =
+            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let player = PlayerId(1);
         let island = IslandId(3);
         let first_anchor = GridPosition { x: 14, y: 15 };
@@ -2354,49 +2310,16 @@ mod tests {
         );
         let plan_id = created.plan_id.expect("島campaignは永続Planを持つ");
 
-        assert!(
-            registry
-                .continuation_for_operation(
-                    player,
-                    4,
-                    OperationKind::Defense,
-                    Some(island),
-                    &[remaining_city],
-                    &HashSet::from([reinforcement]),
-                )
-                .is_none(),
-            "同じ島でもDefenseへCaptureのPlanIdを流用しない"
-        );
-        let defense = registry.select_for_operation(
-            player,
-            4,
-            OperationKind::Defense,
-            Some(island),
-            remaining_city,
-            vec![remaining_city],
-            HashSet::from([reinforcement]),
-            true,
-            None,
-            feasible_plan(0),
-            None,
-            HashSet::new(),
-        );
-        assert_ne!(
-            defense.plan_id,
-            Some(plan_id),
-            "同一島の別作戦は独立したPlanIdを持つ"
-        );
-        assert_eq!(registry.active.len(), 2);
         let continuation = registry
             .continuation_for_operation(
                 player,
                 4,
-                OperationKind::Capture,
+                OperationKind::Defense,
                 Some(island),
                 &[remaining_city],
                 &HashSet::from([reinforcement]),
             )
-            .expect("同じ島・同じ作戦ならanchor・残施設・敵が変わっても継続する");
+            .expect("同じ島なら作戦種別・anchor・残施設・敵が変わっても継続する");
         assert_eq!(continuation.plan_id, plan_id);
         assert!(
             registry
@@ -2975,3 +2898,8 @@ mod tests {
         );
     }
 }
+
+// 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
+mod extended;
+#[allow(unused_imports)]
+pub use self::extended::*;

@@ -104,10 +104,7 @@ pub struct OperationFacts {
     pub enemy_combat_units: u32,
     /// 同じ作戦へ実際に参加できる既存戦闘Entity数。診断用で、必要編成は計画器が決める。
     pub friendly_combat_units_committed: u32,
-    /// 敵施設が次の接触地点までに通常動員すると見積もる額。
-    ///
-    /// これは敵の実際の発注額ではない。進撃Goには使わず、RollingPlanが継続生産
-    /// すべき混成戦力を作るためのExpected scenarioにだけ用いる。
+    /// 敵施設が期限内に増援を生産できる資金。増援構成は別途ターン別に展開する。
     pub enemy_reinforcement_funds: u32,
     /// 到達不能脅威へ対抗できる既存迎撃Entity数。
     pub friendly_intercept_units_committed: u32,
@@ -123,9 +120,6 @@ pub struct OperationFacts {
     pub available_free_cargo_slots: u32,
     /// 自軍の通常戦力が到達できない位置にいる敵Entity数。
     pub unreachable_threat_units: u32,
-    /// 敵増援余力だけでもCombat計画を起動するか。標準V4は期限内に到着しうる増援を
-    /// 局地脅威として扱い、小規模V4は観測済みの敵だけで起動する。
-    pub reinforcement_triggers_combat_plan: bool,
 }
 
 /// 観測量から調達モードを決める。フェーズではなく展開リードタイムと輸送要否だけで決まる。
@@ -142,6 +136,10 @@ pub fn acquisition_mode(facts: &OperationFacts) -> AcquisitionMode {
 /// 依存順は 占領枠 → 戦闘計画 → 輸送枠 → 迎撃枠。
 /// 輸送枠は前段で決まった搭載対象数から導出されるため最後段に近い位置にある。
 pub fn derive_slots(facts: &OperationFacts) -> OperationSlots {
+    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended() {
+        return extended::derive_slots(facts);
+    }
     // --- 占領枠：拠点を面で押さえるため、対象拠点数から既に向かっている占領ユニットを引く ---
     let capture_units = facts
         .target_property_count
@@ -149,13 +147,8 @@ pub fn derive_slots(facts: &OperationFacts) -> OperationSlots {
         .min(MAX_CAPTURE_SLOTS);
 
     // --- 戦闘計画：対象Entityがあれば必要編成をrolling plannerへ委譲する ---
-    // 小規模V4では、将来の敵生産上限は「今この手番に倒す敵」ではない。観測済みの敵だけで
-    // Combat計画を起動し、敵ユニットが実際に現れた次手番に改めて見積もる。
-    // 標準V4は期限内に到着できる敵増援も局地脅威として計画を起動する。
-    let combat_plan_required = u32::from(
-        facts.enemy_combat_units > 0
-            || (facts.reinforcement_triggers_combat_plan && facts.enemy_reinforcement_funds > 0),
-    );
+    let combat_plan_required =
+        u32::from(facts.enemy_combat_units > 0 || facts.enemy_reinforcement_funds > 0);
 
     // 作戦地点へ届ける占領要員の総数（既に手元にいる分＋これから買う分）
     let capture_presence = capture_units.saturating_add(facts.friendly_capture_units_committed);
@@ -272,23 +265,14 @@ mod tests {
         assert_eq!(derive_slots(&facts).capture_units, 0);
     }
 
-    /// 未観測の敵増援余力は、現在Combatの必須要求へ加えない
+    /// 期限内に到着できる敵増援だけを局地脅威へ加える
     #[test]
-    fn combat_plan_required_ignores_unobserved_enemy_reinforcement_capacity() {
+    fn combat_plan_required_accounts_for_enemy_reinforcement() {
+        let _code_path =
+            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut facts = base_facts();
         facts.enemy_combat_units = 0;
         facts.enemy_reinforcement_funds = 2000;
-
-        assert_eq!(derive_slots(&facts).combat_plan_required, 0);
-    }
-
-    /// 標準V4では期限内に到着しうる敵増援余力だけでCombat計画を起動する
-    #[test]
-    fn standard_combat_plan_required_accounts_for_enemy_reinforcement() {
-        let mut facts = base_facts();
-        facts.enemy_combat_units = 0;
-        facts.enemy_reinforcement_funds = 2000;
-        facts.reinforcement_triggers_combat_plan = true;
 
         assert_eq!(derive_slots(&facts).combat_plan_required, 1);
     }
@@ -423,3 +407,8 @@ mod tests {
         assert_eq!(slots.deficit_ratio(SlotKind::Combat, &filled), 0.0);
     }
 }
+
+// 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
+mod extended;
+#[allow(unused_imports)]
+pub use self::extended::*;

@@ -370,15 +370,6 @@ fn is_campaign_support_unit(unit_type: UnitType) -> bool {
     )
 }
 
-/// 橋・山で分断された同一陸塊の進軍軸を実際に前進できる装甲戦力かを判定する。
-/// 砲兵など移動力の低い支援unitを、この突破枠の充足と誤認しない。
-fn is_route_armored_unit(unit_type: UnitType) -> bool {
-    matches!(
-        unit_type,
-        UnitType::Tank | UnitType::MdTank | UnitType::TankZ
-    )
-}
-
 type OffensivePriorityKey = (
     u8,
     u8,
@@ -928,6 +919,15 @@ fn reserve_candidate(
     catalog: &HashMap<Entity, CampaignUnitCandidate>,
     allow_future_budget_reservation: bool,
 ) -> Option<(IslandCampaignAssignment, CampaignResourcePool)> {
+    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended() {
+        return extended::reserve_candidate(
+            candidate,
+            pool,
+            catalog,
+            allow_future_budget_reservation,
+        );
+    }
     // 候補ごとのcloneへ全予約を適用し、完全編成を賄えない場合は元poolを一切変更しない。
     let mut provisional = pool.clone();
     let island_id = candidate.assessment.island_id;
@@ -1095,34 +1095,6 @@ fn reserve_candidate(
         }
     }
     available = sorted_pool_units(&provisional, island_id);
-    // 【一時的な診断専用】占領役の補充直前に、provisional poolの全Entityと
-    // `sorted_pool_units` の assigned_island フィルタ結果を突き合わせる。
-    if crate::ai::island_campaign_analysis::pool_audit_enabled() {
-        eprintln!(
-            "POOL_AUDIT stage=capture_fill_begin island={:?} decision={:?} required_capture_units={} already_reserved={:?} remaining={} provisional_total={} after_assigned_filter={}",
-            island_id,
-            candidate.assessment.decision,
-            requirement.capture_units,
-            capture_entities,
-            remaining_capture_units,
-            provisional.units.len(),
-            available.len(),
-        );
-        for unit in &provisional.units {
-            let passes_assigned_filter =
-                unit.assigned_island.is_none() || unit.assigned_island == Some(island_id);
-            eprintln!(
-                "POOL_AUDIT stage=capture_fill_unit island={:?} entity={:?} type={:?} can_capture={} unit_island={:?} assigned_island={:?} passes_assigned_filter={}",
-                island_id,
-                unit.entity,
-                unit.unit_type,
-                unit.can_capture,
-                unit.island_id,
-                unit.assigned_island,
-                passes_assigned_filter,
-            );
-        }
-    }
     while remaining_capture_units > 0 {
         let Some(index) = available.iter().position(|unit| unit.can_capture) else {
             break;
@@ -1134,73 +1106,6 @@ fn reserve_candidate(
         requirement_credit = requirement_credit.saturating_add(unit.cost);
         reserved_entity_value = reserved_entity_value.saturating_add(unit.cost);
         remove_entity(&mut provisional, unit.entity);
-    }
-
-    // `ground_combat_units` は従来の渡洋Assaultの台数見積りには使わない。同一陸塊で
-    // 地形分断を越える継続campaignだけが、分析済みの橋突破不足として保持する。
-    let maintains_armored_route_campaign = matches!(
-        candidate.assessment.decision,
-        IslandCampaignDecision::Secure
-            | IslandCampaignDecision::Contest
-            | IslandCampaignDecision::Reinforce
-    ) && requirement.ground_combat_units > 0;
-    let mut remaining_ground_combat_units = if maintains_armored_route_campaign {
-        requirement.ground_combat_units
-    } else {
-        0
-    };
-    for entity in &combat_entities {
-        if remaining_ground_combat_units == 0 {
-            break;
-        }
-        if catalog
-            .get(entity)
-            .is_some_and(|unit| is_route_armored_unit(unit.unit_type))
-        {
-            remaining_ground_combat_units = remaining_ground_combat_units.saturating_sub(1);
-            // 橋突破に必要な装甲枠は、既存の実Entityで満たした場合だけ構造予算から控除する。
-            requirement_credit =
-                requirement_credit.saturating_add(catalog.get(entity).map_or(0, |unit| unit.cost));
-        }
-    }
-    available = sorted_pool_units(&provisional, island_id);
-    while remaining_ground_combat_units > 0 {
-        let Some(index) = available.iter().position(|unit| {
-            is_route_armored_unit(unit.unit_type)
-                && (unit.island_id == Some(island_id)
-                    || unit
-                        .reachable_positions
-                        .contains(&candidate.target_position))
-        }) else {
-            break;
-        };
-        let unit = available.remove(index);
-        push_unique_entity(&mut combat_entities, unit.entity);
-        remaining_ground_combat_units = remaining_ground_combat_units.saturating_sub(1);
-        requirement_credit = requirement_credit.saturating_add(unit.cost);
-        reserved_entity_value = reserved_entity_value.saturating_add(unit.cost);
-        remove_entity(&mut provisional, unit.entity);
-    }
-    // 現在手番に橋突破を要する同一陸塊campaignでは、未予約の装甲unitも同じ
-    // campaignへ回収する。必要数のcreditには入れないので、単なる予算相殺にはしない。
-    if maintains_armored_route_campaign {
-        available = sorted_pool_units(&provisional, island_id);
-        let attached_armor = available
-            .iter()
-            .filter(|unit| {
-                is_route_armored_unit(unit.unit_type)
-                    && (unit.island_id == Some(island_id)
-                        || unit
-                            .reachable_positions
-                            .contains(&candidate.target_position))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        for unit in attached_armor {
-            push_unique_entity(&mut combat_entities, unit.entity);
-            reserved_entity_value = reserved_entity_value.saturating_add(unit.cost);
-            remove_entity(&mut provisional, unit.entity);
-        }
     }
 
     let mut remaining_combat_units = requirement.combat_units;
@@ -1387,17 +1292,15 @@ fn reserve_candidate(
         preferred_transport,
         transport_slots: remaining_transport_slots,
         capture_units: remaining_capture_units,
-        // 地形分断を越える装甲枠だけは、敵数ではなく実際の突破未達から保持する。
-        ground_combat_units: remaining_ground_combat_units,
+        // 敵領戦闘力は時系列planの結果であり、島campaignの固定台数要求にしない。
+        ground_combat_units: 0,
         combat_units: remaining_combat_units,
         total_budget: purchase_budget,
     };
     let capture_package_ready = purchase_shortfall.capture_units == 0
         || candidate.assessment.decision == IslandCampaignDecision::Reinforce
             && !capture_entities.is_empty();
-    let structural_package_ready = purchase_shortfall.transport_slots == 0
-        && purchase_shortfall.ground_combat_units == 0
-        && capture_package_ready;
+    let structural_package_ready = purchase_shortfall.transport_slots == 0 && capture_package_ready;
     // 中立の兵站前提だけは構造パッケージ完成時点で先行できる。
     // 敵領Assaultは敵戦力を上回る離散的な損耗余裕まで揃わなければ出航させない。
     let operation_ready = structural_package_ready
@@ -1585,31 +1488,10 @@ fn release_assignment(
     }
 }
 
-/// 候補から導出した評価だけを使う後方互換のallocator入口。
-///
-/// 実盤面の分析では、行動目標を持たない島も診断・Roadmap入力として残すため、
-/// `allocate_campaign_portfolio_with_assessments` を使用する。
-#[cfg(test)]
+/// 共有資金とEntity候補を1つの可変poolとして扱い、完全編成だけを決定的に予約する。
 pub(crate) fn allocate_campaign_portfolio(
     candidates: Vec<IslandCampaignCandidate>,
-    pool: CampaignResourcePool,
-) -> IslandCampaignPortfolio {
-    let assessments = candidates
-        .iter()
-        .map(|candidate| candidate.assessment.clone())
-        .collect();
-    allocate_campaign_portfolio_with_assessments(candidates, pool, assessments)
-}
-
-/// 全島評価を保持したまま、行動可能な候補だけへ共有資源を予約する。
-///
-/// `IslandCampaignPortfolio.islands` は作戦候補一覧ではなく盤面の全島評価である。
-/// そのため、目標座標を持たないSecured/Observed島をallocatorから外しても、
-/// その評価自体は捨てない。
-pub(crate) fn allocate_campaign_portfolio_with_assessments(
-    candidates: Vec<IslandCampaignCandidate>,
     mut pool: CampaignResourcePool,
-    mut assessments: Vec<IslandCampaignAssessment>,
 ) -> IslandCampaignPortfolio {
     let logistics_prerequisite_pending = candidates
         .iter()
@@ -1623,33 +1505,6 @@ pub(crate) fn allocate_campaign_portfolio_with_assessments(
         .cloned()
         .map(|unit| (unit.entity, unit))
         .collect();
-    // 【一時的な診断専用】allocator入口のpoolを記録する。
-    if crate::ai::island_campaign_analysis::pool_audit_enabled() {
-        for unit in &pool.units {
-            eprintln!(
-                "POOL_AUDIT stage=allocator_entry entity={:?} type={:?} can_capture={} can_secure_local={} island={:?} assigned_island={:?} transporting={}",
-                unit.entity,
-                unit.unit_type,
-                unit.can_capture,
-                unit.can_secure_local_property,
-                unit.island_id,
-                unit.assigned_island,
-                unit.is_transporting,
-            );
-        }
-        for candidate in &candidates {
-            eprintln!(
-                "POOL_AUDIT stage=candidate island={:?} decision={:?} capture_units={} transport_slots={} ground_combat_units={} target={:?} existing_op={}",
-                candidate.assessment.island_id,
-                candidate.assessment.decision,
-                candidate.requirement.capture_units,
-                candidate.requirement.transport_slots,
-                candidate.requirement.ground_combat_units,
-                candidate.target_position,
-                candidate.existing_operation.is_some(),
-            );
-        }
-    }
     let mut contest_protections = protect_contest_assets(&candidates, &mut pool);
     reserve_secure_capture_units(
         &candidates
@@ -1659,30 +1514,10 @@ pub(crate) fn allocate_campaign_portfolio_with_assessments(
             .collect::<Vec<_>>(),
         &mut pool,
     );
-    // 【一時的な診断専用】先行予約（Contest保護・Secure現地要員）の適用後を記録する。
-    if crate::ai::island_campaign_analysis::pool_audit_enabled() {
-        let remaining: Vec<_> = pool
-            .units
-            .iter()
-            .map(|unit| (unit.entity, unit.can_capture, unit.assigned_island))
-            .collect();
-        eprintln!(
-            "POOL_AUDIT stage=after_prereservation contest_protected={:?} remaining={:?}",
-            contest_protections, remaining
-        );
-    }
-    // V4の兵站計画などが候補の評価を更新している場合は、同じ島の全島評価へ
-    // 最新の判断を反映する。候補化されなかった島はここで上書きされない。
-    for candidate in &candidates {
-        if let Some(assessment) = assessments
-            .iter_mut()
-            .find(|assessment| assessment.island_id == candidate.assessment.island_id)
-        {
-            *assessment = candidate.assessment.clone();
-        } else {
-            assessments.push(candidate.assessment.clone());
-        }
-    }
+    let mut assessments: Vec<_> = candidates
+        .iter()
+        .map(|candidate| candidate.assessment.clone())
+        .collect();
     let mut offenses: Vec<_> = candidates
         .iter()
         .filter(|candidate| {
@@ -4190,3 +4025,8 @@ mod tests {
         assert!(!assignment.operation_ready);
     }
 }
+
+// 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
+mod extended;
+#[allow(unused_imports)]
+pub use self::extended::*;
