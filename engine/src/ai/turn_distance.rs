@@ -1425,28 +1425,33 @@ mod tests {
             },
         )]);
 
-        for blocked_first in [false, true] {
-            let mut cache = ActionTurnDistanceCache::default();
-            for (index, is_blocked) in [blocked_first, !blocked_first].into_iter().enumerate() {
-                let result = calculate_action_distance_to_range(
-                    &map,
-                    &registry,
-                    if is_blocked { &blocked } else { &empty },
-                    (0, 0),
-                    (4, 0),
-                    MovementType::Infantry,
-                    3,
-                    99,
-                    1,
-                    1,
-                    PlayerId(1),
-                    &mut cache,
-                );
-                assert_eq!(
-                    result.is_none(),
-                    is_blocked,
-                    "blocked_first: {blocked_first}, index: {index}"
-                );
+        // 同一目標のキャッシュと、異なる目標へ共有する始点キャッシュの両方を検証する。
+        // 1つのキャッシュに対し、(目標x, 遮断の有無) の組を順に問い合わせる。
+        for targets in [[4, 4], [3, 4]] {
+            for blocked_first in [false, true] {
+                let mut cache = ActionTurnDistanceCache::default();
+                let queries = [(targets[0], blocked_first), (targets[1], !blocked_first)];
+                for (target_x, is_blocked) in queries {
+                    let result = calculate_action_distance_to_range(
+                        &map,
+                        &registry,
+                        if is_blocked { &blocked } else { &empty },
+                        (0, 0),
+                        (target_x, 0),
+                        MovementType::Infantry,
+                        3,
+                        99,
+                        1,
+                        1,
+                        PlayerId(1),
+                        &mut cache,
+                    );
+                    assert_eq!(
+                        result.is_none(),
+                        is_blocked,
+                        "targets: {targets:?}, blocked_first: {blocked_first}, target_x: {target_x}"
+                    );
+                }
             }
         }
     }

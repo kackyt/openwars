@@ -4801,8 +4801,3 @@ mod additional_tests {
         );
     }
 }
-
-// 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
-mod extended;
-#[allow(unused_imports)]
-pub use self::extended::*;

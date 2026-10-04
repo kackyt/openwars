@@ -2600,6 +2600,54 @@ mod tests {
         );
     }
 
+    /// T2の差分fixture：非feasibleで探索打切りありの部分案を、通常経路は実行可能、
+    /// 拡張経路は実行不可と判定する。feasible案と打切りなしの部分案は両経路で実行可能。
+    #[test]
+    fn executable_plan_truncated_tranche_differs_only_on_extended_path() {
+        use crate::ai::code_path::{CodePath, enter};
+        // 敵HPを実際に減らす非feasibleな部分案を作る。
+        let tranche = |search_truncated: bool| {
+            let mut plan = feasible_plan(2);
+            plan.feasible = false;
+            plan.elimination_turn = None;
+            plan.occupation_turn = None;
+            plan.search_truncated = search_truncated;
+            plan.target_forecasts = vec![crate::ai::v4::rolling_plan::TargetForecast {
+                entity: Some(Entity::from_raw(10)),
+                unit_type: UnitType::Infantry,
+                available_turn: 0,
+                initial_hp: 100,
+                remaining_hp: 40,
+                destroyed_turn: None,
+            }];
+            plan
+        };
+        let mut truncated_feasible = feasible_plan(2);
+        truncated_feasible.search_truncated = true;
+
+        // (経路, 打切り部分案の期待値)。打切りなし部分案とfeasible案は常に実行可能。
+        for (path, truncated_expected) in [
+            (CodePath::MainCompatible, true),
+            (CodePath::Extended, false),
+        ] {
+            let _code_path = enter(path);
+            // 現在の executable_plan は kind を参照しない。T2（C）で作戦種別ごとの分岐を
+            // 入れても期待値が変わらないことを確かめるため、複数の kind で固定しておく。
+            for kind in [OperationKind::Capture, OperationKind::AssaultCapital] {
+                assert_eq!(
+                    executable_plan(kind, &tranche(true)),
+                    truncated_expected,
+                    "{path:?} {kind:?}"
+                );
+                assert!(executable_plan(kind, &tranche(false)), "{path:?} {kind:?}");
+                assert!(
+                    executable_plan(kind, &truncated_feasible),
+                    "{path:?} {kind:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn capital_progress_package_is_persisted_as_formation_not_attack() {
         let player = PlayerId(1);
