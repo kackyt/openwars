@@ -27,7 +27,6 @@ use bevy_ecs::prelude::*;
 enum CampaignProductionRequirement {
     HeavyTransport,
     LightTransport,
-    GroundCombat,
     Capture,
     Combat,
 }
@@ -311,10 +310,6 @@ fn select_best_production_candidate(
 fn remaining_campaign_requirements(
     shortfall: &IslandCampaignShortfall,
 ) -> Vec<CampaignProductionRequirement> {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::remaining_campaign_requirements(shortfall);
-    }
     let mut requirements = Vec::new();
     if shortfall.heavy_transport_slots > 0 {
         requirements.push(CampaignProductionRequirement::HeavyTransport);
@@ -336,10 +331,6 @@ fn campaign_candidate_matches(
     unit_type: UnitType,
     stats: &UnitStats,
 ) -> bool {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::campaign_candidate_matches(requirement, unit_type, stats);
-    }
     // 要求量を減らせない不正なマスターデータは候補から除外し、計画を確実に前進させる。
     match requirement {
         CampaignProductionRequirement::HeavyTransport => {
@@ -349,8 +340,6 @@ fn campaign_candidate_matches(
             unit_type == UnitType::TransportHelicopter && stats.max_cargo > 0
         }
         CampaignProductionRequirement::Capture => stats.can_capture,
-        // 地上戦闘要求は拡張経路だけが作る。main互換経路では一致させない。
-        CampaignProductionRequirement::GroundCombat => false,
         CampaignProductionRequirement::Combat => {
             stats.cost > 0
                 && !stats.can_capture
@@ -519,10 +508,6 @@ fn consume_campaign_candidate(
     requirement: CampaignProductionRequirement,
     stats: &UnitStats,
 ) {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::consume_campaign_candidate(shortfall, requirement, stats);
-    }
     match requirement {
         CampaignProductionRequirement::HeavyTransport => {
             shortfall.heavy_transport_slots = shortfall
@@ -540,8 +525,6 @@ fn consume_campaign_candidate(
         CampaignProductionRequirement::Combat => {
             shortfall.combat_units = shortfall.combat_units.saturating_sub(1);
         }
-        // 地上戦闘要求は拡張経路だけが作る。
-        CampaignProductionRequirement::GroundCombat => {}
     }
     shortfall.reserved_budget = shortfall.reserved_budget.saturating_sub(stats.cost);
 }
@@ -579,19 +562,6 @@ fn plan_campaign_shortfall_production_with_damage(
     available_funds: u32,
     damage_chart: Option<&DamageChart>,
 ) -> CampaignProductionOutcome {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::plan_campaign_shortfall_production_with_damage(
-            player_id,
-            shortfalls,
-            facilities,
-            available_types,
-            map,
-            master_data,
-            available_funds,
-            damage_chart,
-        );
-    }
     let mut rows = shortfalls.to_vec();
     rows.sort_by_key(|row| (row.priority_rank, row.island_id.0));
     let mut sorted_facilities = facilities.to_vec();
@@ -776,9 +746,7 @@ fn plan_campaign_shortfall_production_with_damage(
                     CampaignProductionRole::Transport
                 }
                 CampaignProductionRequirement::Capture => CampaignProductionRole::Capture,
-                // 地上戦闘要求は拡張経路だけが作る。
-                CampaignProductionRequirement::Combat
-                | CampaignProductionRequirement::GroundCombat => CampaignProductionRole::Combat,
+                CampaignProductionRequirement::Combat => CampaignProductionRole::Combat,
             };
             outcome.intents.push(CampaignProductionIntent {
                 mission_target: None,
@@ -3599,8 +3567,6 @@ mod additional_tests {
 
     #[test]
     fn campaign_production_rejects_zero_capacity_transport() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let master_data = MasterDataRegistry::load().unwrap();
         let mut helicopter = master_data
             .create_unit_stats(&crate::resources::master_data::UnitName(
@@ -3637,8 +3603,6 @@ mod additional_tests {
 
     #[test]
     fn campaign_production_rejects_zero_cost_combat_unit() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let master_data = MasterDataRegistry::load().unwrap();
         let mut infantry = master_data
             .create_unit_stats(&crate::resources::master_data::UnitName(
@@ -4044,8 +4008,6 @@ mod additional_tests {
 
     #[test]
     fn campaign_production_exposes_only_funds_above_all_remaining_reservations() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let master_data = MasterDataRegistry::load().unwrap();
         let available_types = campaign_test_types(&master_data);
         let rows = vec![crate::ai::island_campaign::IslandCampaignShortfall {
@@ -4084,8 +4046,6 @@ mod additional_tests {
 
     #[test]
     fn campaign_combat_requires_an_affordable_non_capture_unit() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let master_data = MasterDataRegistry::load().unwrap();
         let available_types = campaign_test_types(&master_data);
         let facilities = vec![(GridPosition { x: 0, y: 0 }, Terrain::Factory)];
@@ -4129,8 +4089,6 @@ mod additional_tests {
 
     #[test]
     fn campaign_assault_production_requires_lander_and_helicopter() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let master_data = MasterDataRegistry::load().unwrap();
         let available_types = campaign_test_types(&master_data);
         let rows = vec![crate::ai::island_campaign::IslandCampaignShortfall {
@@ -4174,8 +4132,6 @@ mod additional_tests {
 
     #[test]
     fn campaign_assault_defers_combat_support_after_building_the_first_landing_wave() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let master_data = MasterDataRegistry::load().unwrap();
         let available_types = campaign_test_types(&master_data);
         let rows = vec![crate::ai::island_campaign::IslandCampaignShortfall {
@@ -4325,8 +4281,6 @@ mod additional_tests {
     /// 残金を次ターンのLander購入へ温存する。
     #[test]
     fn campaign_assault_produces_one_affordable_prerequisite_while_saving_for_lander() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let master_data = MasterDataRegistry::load().unwrap();
         let available_types = campaign_test_types(&master_data);
         let rows = vec![crate::ai::island_campaign::IslandCampaignShortfall {

@@ -66,16 +66,6 @@ impl AiSimulationState {
         perspective_player: PlayerId,
         cache: &mut crate::ai::turn_distance::AiTurnCache,
     ) {
-        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended() {
-            return Self::simulate_plan_extended(
-                world,
-                squads,
-                assignments,
-                perspective_player,
-                cache,
-            );
-        }
         let map = world.resource::<Map>().clone();
         let registry = world
             .get_resource::<MasterDataRegistry>()
@@ -392,8 +382,3 @@ mod tests {
         );
     }
 }
-
-// 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
-mod extended;
-#[allow(unused_imports)]
-pub use self::extended::*;

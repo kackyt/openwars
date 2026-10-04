@@ -628,8 +628,6 @@ mod tests {
 
     #[test]
     fn beam_search_does_not_redirect_transport_invasion() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut world = setup_test_world();
         let p1 = PlayerId(1);
         let map = world.resource::<Map>().clone();

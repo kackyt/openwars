@@ -100,12 +100,13 @@ impl PlanMetrics {
 
 /// 全体撃破へ未到達でも、有限の購入列が敵HPを実際に減らすなら再評価付きtrancheとして実行する。
 fn executable_plan(_kind: OperationKind, plan: &ForcePackagePlan) -> bool {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::executable_plan(_kind, plan);
-    }
     if plan.feasible {
         return true;
+    }
+    let reject_truncated =
+        crate::ai::code_path::is_extended_at("v4/plan_revision.rs::executable_plan");
+    if reject_truncated && plan.search_truncated {
+        return false;
     }
     !plan.purchases.is_empty()
         && plan
@@ -793,10 +794,6 @@ impl V4RollingPlanRegistry {
         &self,
         player_id: PlayerId,
     ) -> Vec<ActiveCombatPlanSummary> {
-        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended() {
-            return self.active_combat_plan_summaries_extended(player_id);
-        }
         self.active
             .iter()
             .filter(|plan| plan.player_id == player_id)
@@ -813,10 +810,6 @@ impl V4RollingPlanRegistry {
 
     /// 現在盤面で組み直した首都計画が、全生産を終えて一波として発進可能かを返す。
     pub(crate) fn operation_launch_ready(&self, player_id: PlayerId, island_id: IslandId) -> bool {
-        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended() {
-            return self.operation_launch_ready_extended(player_id, island_id);
-        }
         self.active.iter().any(|plan| {
             plan.player_id == player_id
                 && plan.kind == OperationKind::AssaultCapital
@@ -873,8 +866,8 @@ impl V4RollingPlanRegistry {
         capital_assault_authorized: bool,
         capital_staging_anchor: Option<GridPosition>,
     ) -> Vec<ActiveDeploymentIntent> {
-        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended() {
+        // 小規模マップのV4は extended 側の実装を使う。
+        if crate::ai::code_path::is_extended_at("v4/plan_revision.rs::active_deployment_intents") {
             return self.active_deployment_intents_extended(
                 player_id,
                 capital_assault_authorized,
@@ -1563,23 +1556,17 @@ impl V4RollingPlanRegistry {
         objective_properties: &[GridPosition],
         _target_enemies: &HashSet<Entity>,
     ) -> Option<usize> {
-        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended() {
-            return self.matching_index_extended(
-                player_id,
-                kind,
-                island_id,
-                objective_properties,
-                _target_enemies,
-            );
-        }
+        let require_same_kind_for_island =
+            crate::ai::code_path::is_extended_at("v4/plan_revision.rs::matching_index");
         self.active
             .iter()
             .enumerate()
             .filter(|(_, plan)| plan.player_id == player_id)
             .find_map(|(index, plan)| {
                 if let Some(island_id) = island_id {
-                    return (plan.island_id == Some(island_id)).then_some(index);
+                    let matches_island = plan.island_id == Some(island_id);
+                    let matches_kind = !require_same_kind_for_island || plan.kind == kind;
+                    return (matches_island && matches_kind).then_some(index);
                 }
                 // 敵Entityは移動して別の島へ渡るため、敵の重複をPlan identityに使わない。
                 // 同じ目的拠点集合だけを同一作戦のrevisionとして扱い、別島への変質を禁止する。
@@ -2188,8 +2175,6 @@ mod tests {
 
     #[test]
     fn capital_launch_gate_opens_only_after_every_authorized_step_is_produced() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let player = PlayerId(1);
         let island = IslandId(7);
         let anchor = GridPosition { x: 20, y: 10 };
@@ -2283,8 +2268,6 @@ mod tests {
 
     #[test]
     fn island_identity_survives_kind_anchor_property_and_enemy_changes() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let player = PlayerId(1);
         let island = IslandId(3);
         let first_anchor = GridPosition { x: 14, y: 15 };

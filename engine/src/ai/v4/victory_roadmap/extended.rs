@@ -22,305 +22,6 @@ pub(super) fn purpose_for(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn diagnose_operation_execution(
-    world: &World,
-    manager: &SquadManager,
-    player_id: PlayerId,
-    turn: u32,
-    assignment: &IslandCampaignAssignment,
-    previous_entities: &[(Entity, OperationEntityRole)],
-    persistent_combat_entities: &HashSet<Entity>,
-    production_records: &[crate::ai::v4::campaign_execution::CampaignProductionRecord],
-) -> Vec<OperationIssue> {
-    use crate::ai::v4::campaign_execution::{CampaignProductionRole, CampaignProductionStatus};
-
-    let current_entities = assignment
-        .transport_entities
-        .iter()
-        .chain(assignment.capture_entities.iter())
-        .chain(assignment.combat_entities.iter())
-        .chain(persistent_combat_entities.iter())
-        .copied()
-        .collect::<HashSet<_>>();
-    let mut issues = Vec::new();
-
-    for (entity, role) in previous_entities {
-        if !operation_entity_is_alive(world, *entity) {
-            let kind = match role {
-                OperationEntityRole::Transport => OperationIssueKind::TransportDestroyed,
-                OperationEntityRole::Capture => OperationIssueKind::CapturerDestroyed,
-                OperationEntityRole::Combat => OperationIssueKind::CombatUnitDestroyed,
-            };
-            issues.push(OperationIssue {
-                kind,
-                detected_turn: turn,
-                entity: Some(*entity),
-                related_entity: None,
-                detail: format!(
-                    "previously assigned {:?} Entity {} no longer exists",
-                    role,
-                    entity.to_bits()
-                ),
-            });
-        } else if !current_entities.contains(entity)
-            && !entity_is_owned_by_island_squad(manager, player_id, assignment.island_id, *entity)
-        {
-            issues.push(OperationIssue {
-                kind: OperationIssueKind::AssignmentLost,
-                detected_turn: turn,
-                entity: Some(*entity),
-                related_entity: None,
-                detail: format!(
-                    "live {:?} Entity {} disappeared from the operation assignment",
-                    role,
-                    entity.to_bits()
-                ),
-            });
-        }
-    }
-
-    let island_map = world.get_resource::<IslandMap>();
-    for entity in &assignment.capture_entities {
-        if !operation_entity_is_alive(world, *entity) {
-            continue;
-        }
-        let landed = world.get::<GridPosition>(*entity).is_some_and(|position| {
-            island_map
-                .and_then(|map| map.get_island_at(position))
-                .is_some_and(|island| island.id == assignment.island_id)
-        });
-        if landed || world.get::<Transporting>(*entity).is_some() {
-            continue;
-        }
-        let assigned_transport = manager.squads.iter().any(|squad| {
-            squad.owner_id == Some(player_id)
-                && squad.target_island == Some(assignment.island_id)
-                && squad.cargo_entities.contains(entity)
-                && squad.transport_entity.is_some()
-        });
-        if !assigned_transport {
-            issues.push(OperationIssue {
-                kind: OperationIssueKind::TransportUnassigned,
-                detected_turn: turn,
-                entity: Some(*entity),
-                related_entity: None,
-                detail: format!(
-                    "capture Entity {} is alive but has no transport for island {}",
-                    entity.to_bits(),
-                    assignment.island_id.0
-                ),
-            });
-        }
-    }
-
-    // 同じ役割の再発注がある場合、過去の遅延ではなく最新の発注状態を現在原因にする。
-    for role in [
-        CampaignProductionRole::Transport,
-        CampaignProductionRole::Capture,
-        CampaignProductionRole::Combat,
-    ] {
-        let Some(record) = production_records
-            .iter()
-            .filter(|record| record.role == role)
-            .max_by_key(|record| record.planned_turn)
-        else {
-            continue;
-        };
-        let issue = match record.status {
-            CampaignProductionStatus::Planned | CampaignProductionStatus::Issued => {
-                Some((OperationIssueKind::AwaitingProduction, None))
-            }
-            CampaignProductionStatus::Delayed => {
-                Some((OperationIssueKind::ProductionDelayed, None))
-            }
-            CampaignProductionStatus::Produced => {
-                let entity = record.entity;
-                entity
-                    .filter(|entity| {
-                        !current_entities.contains(entity)
-                            && !entity_is_owned_by_island_squad(
-                                manager,
-                                player_id,
-                                assignment.island_id,
-                                *entity,
-                            )
-                    })
-                    .map(|entity| (OperationIssueKind::ProducedEntityUnassigned, Some(entity)))
-            }
-            CampaignProductionStatus::Lost | CampaignProductionStatus::Assigned => None,
-        };
-        if let Some((kind, entity)) = issue {
-            issues.push(OperationIssue {
-                kind,
-                detected_turn: turn,
-                entity,
-                related_entity: None,
-                detail: format!(
-                    "campaign {:?} production at ({},{}) is {:?}",
-                    role, record.facility_x, record.facility_y, record.status
-                ),
-            });
-        }
-    }
-
-    issues.sort_by_key(|issue| {
-        (
-            format!("{:?}", issue.kind),
-            issue.entity.map_or(u64::MAX, Entity::to_bits),
-        )
-    });
-    issues.dedup_by(|left, right| {
-        left.kind == right.kind
-            && left.entity == right.entity
-            && left.related_entity == right.related_entity
-    });
-    issues
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn diagnose_operation_recoveries(
-    world: &World,
-    manager: &SquadManager,
-    player_id: PlayerId,
-    turn: u32,
-    assignment: &IslandCampaignAssignment,
-    previous_issues: &[OperationIssue],
-    persistent_combat_entities: &HashSet<Entity>,
-    production_records: &[crate::ai::v4::campaign_execution::CampaignProductionRecord],
-) -> Vec<OperationRecoveryAction> {
-    use crate::ai::v4::campaign_execution::{CampaignProductionRole, CampaignProductionStatus};
-
-    let assigned_entities = assignment
-        .transport_entities
-        .iter()
-        .chain(assignment.capture_entities.iter())
-        .chain(assignment.combat_entities.iter())
-        .chain(persistent_combat_entities.iter())
-        .copied()
-        .collect::<HashSet<_>>();
-    let mut recoveries = Vec::new();
-    for issue in previous_issues {
-        let recovery = match issue.kind {
-            OperationIssueKind::AwaitingProduction => None,
-            // 新しい命令を実際に発行した時点でplan_entity_stepがReplanStepを記録する。
-            OperationIssueKind::StepBlocked => None,
-            OperationIssueKind::ProductionDelayed => production_records
-                .iter()
-                .filter(|record| record.planned_turn >= issue.detected_turn)
-                .filter(|record| {
-                    matches!(
-                        record.status,
-                        CampaignProductionStatus::Planned
-                            | CampaignProductionStatus::Issued
-                            | CampaignProductionStatus::Produced
-                            | CampaignProductionStatus::Assigned
-                    )
-                })
-                .max_by_key(|record| record.planned_turn)
-                .map(|record| OperationRecoveryAction {
-                    kind: OperationRecoveryKind::RetryProduction,
-                    cause: issue.kind,
-                    completed_turn: turn,
-                    entity: record.entity,
-                    detail: format!(
-                        "retried {:?} production for island {} on turn {}",
-                        record.role, assignment.island_id.0, record.planned_turn
-                    ),
-                }),
-            OperationIssueKind::ProducedEntityUnassigned | OperationIssueKind::AssignmentLost => {
-                issue.entity.and_then(|entity| {
-                    (assigned_entities.contains(&entity)
-                        || entity_is_owned_by_island_squad(
-                            manager,
-                            player_id,
-                            assignment.island_id,
-                            entity,
-                        ))
-                    .then(|| OperationRecoveryAction {
-                        kind: OperationRecoveryKind::RestoreAssignment,
-                        cause: issue.kind,
-                        completed_turn: turn,
-                        entity: Some(entity),
-                        detail: format!(
-                            "restored Entity {} to island {} operation",
-                            entity.to_bits(),
-                            assignment.island_id.0
-                        ),
-                    })
-                })
-            }
-            OperationIssueKind::TransportUnassigned => issue.entity.and_then(|entity| {
-                let loaded = world.get::<Transporting>(entity).is_some();
-                let assigned_transport = manager.squads.iter().any(|squad| {
-                    squad.owner_id == Some(player_id)
-                        && squad.target_island == Some(assignment.island_id)
-                        && squad.cargo_entities.contains(&entity)
-                        && squad.transport_entity.is_some()
-                });
-                (loaded || assigned_transport).then(|| OperationRecoveryAction {
-                    kind: OperationRecoveryKind::AssignTransport,
-                    cause: issue.kind,
-                    completed_turn: turn,
-                    entity: Some(entity),
-                    detail: format!(
-                        "assigned transport to capture Entity {} for island {}",
-                        entity.to_bits(),
-                        assignment.island_id.0
-                    ),
-                })
-            }),
-            OperationIssueKind::TransportDestroyed
-            | OperationIssueKind::CapturerDestroyed
-            | OperationIssueKind::CombatUnitDestroyed
-            | OperationIssueKind::CargoLostWithTransport => {
-                let role = match issue.kind {
-                    OperationIssueKind::TransportDestroyed => CampaignProductionRole::Transport,
-                    OperationIssueKind::CombatUnitDestroyed => CampaignProductionRole::Combat,
-                    OperationIssueKind::CapturerDestroyed
-                    | OperationIssueKind::CargoLostWithTransport => CampaignProductionRole::Capture,
-                    _ => unreachable!(),
-                };
-                production_records
-                    .iter()
-                    .filter(|record| record.role == role)
-                    .filter(|record| record.planned_turn >= issue.detected_turn)
-                    .filter(|record| {
-                        !matches!(
-                            record.status,
-                            CampaignProductionStatus::Delayed | CampaignProductionStatus::Lost
-                        )
-                    })
-                    .max_by_key(|record| record.planned_turn)
-                    .map(|record| OperationRecoveryAction {
-                        kind: OperationRecoveryKind::RequestReplacement,
-                        cause: issue.kind,
-                        completed_turn: turn,
-                        entity: record.entity,
-                        detail: format!(
-                            "requested replacement {:?} for island {} on turn {}",
-                            role, assignment.island_id.0, record.planned_turn
-                        ),
-                    })
-            }
-        };
-        if let Some(recovery) = recovery {
-            recoveries.push(recovery);
-        }
-    }
-    recoveries.sort_by_key(|recovery| {
-        (
-            format!("{:?}", recovery.kind),
-            format!("{:?}", recovery.cause),
-            recovery.entity.map_or(u64::MAX, Entity::to_bits),
-        )
-    });
-    recoveries.dedup_by(|left, right| {
-        left.kind == right.kind && left.cause == right.cause && left.entity == right.entity
-    });
-    recoveries
-}
-
 /// 毎ターンの島portfolioを、不変な勝利ロードマップと子作戦へ照合する。
 pub(crate) fn reconcile_campaign_roadmap(
     world: &mut World,
@@ -328,6 +29,9 @@ pub(crate) fn reconcile_campaign_roadmap(
     portfolio: &IslandCampaignPortfolio,
     manager: &SquadManager,
 ) {
+    if !crate::ai::code_path::ext_enabled("v4/victory_roadmap.rs::reconcile_campaign_roadmap") {
+        return super::reconcile_campaign_roadmap(world, player_id, portfolio, manager);
+    }
     let turn = world
         .get_resource::<MatchState>()
         .map_or(0, |state| state.current_turn_number.0);
@@ -924,7 +628,7 @@ pub(crate) fn reconcile_campaign_roadmap(
 
 /// action result Eventを、担当EntityのStrategicOperationへ照合する。
 #[allow(clippy::too_many_arguments)]
-pub fn audit_victory_roadmap_system(
+pub(crate) fn audit_victory_roadmap_system(
     match_state: Res<MatchState>,
     island_map: Option<Res<IslandMap>>,
     mut moved: EventReader<UnitMovedEvent>,
@@ -1110,6 +814,7 @@ mod tests {
 
     #[test]
     fn capture_replacement_is_pending_only_between_loss_and_reorder() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let island = IslandId(2);
         let capturer = Entity::from_raw(41);
@@ -1183,6 +888,7 @@ mod tests {
 
     #[test]
     fn strategy_candidate_search_prunes_to_a_single_best_focus_without_dropping_defense() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let defense = strategic_assignment(IslandId(9), IslandCampaignDecision::Defend, 0, true);
         let portfolio = IslandCampaignPortfolio {
             islands: Vec::new(),
@@ -1217,6 +923,7 @@ mod tests {
 
     #[test]
     fn node_state_distinguishes_dominance_capture_and_blocked() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let combat = Entity::from_raw(42);
         let mut registry = VictoryRoadmapRegistry::default();
@@ -1256,6 +963,7 @@ mod tests {
 
     #[test]
     fn observed_island_nodes_remain_in_the_roadmap_without_assignments() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let mut registry = VictoryRoadmapRegistry::default();
         let roadmap = registry.ensure_roadmap(player, 1, None, None, 0);
@@ -1337,6 +1045,7 @@ mod tests {
 
     #[test]
     fn successor_stays_locked_until_every_predecessor_is_dominant_or_secured() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let combat = Entity::from_raw(42);
         let mut registry = VictoryRoadmapRegistry::default();
@@ -1408,6 +1117,7 @@ mod tests {
 
     #[test]
     fn locked_operation_is_not_projected_to_the_squad_turn_plan() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let island = IslandId(2);
         let mut registry = VictoryRoadmapRegistry::default();
@@ -1477,6 +1187,7 @@ mod tests {
 
     #[test]
     fn logistics_route_and_capital_segment_create_deterministic_dependencies() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let mut registry = VictoryRoadmapRegistry::default();
         let first = operation_with_entity(
@@ -1564,6 +1275,7 @@ mod tests {
 
     #[test]
     fn turn_plan_rejects_squad_shared_by_multiple_operations() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let squad = crate::ai::squad::SquadId(7);
         let plan = RoadmapTurnPlan {
@@ -1595,6 +1307,7 @@ mod tests {
 
     #[test]
     fn operation_identity_does_not_depend_on_enemy_entity_or_anchor() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let island = IslandId(2);
         let assignment = IslandCampaignAssignment {
@@ -1663,6 +1376,7 @@ mod tests {
 
     #[test]
     fn regional_milestone_does_not_overwrite_capital_operation_on_the_same_island() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let island = IslandId(7);
         let capital = GridPosition { x: 20, y: 4 };
@@ -2040,6 +1754,9 @@ impl VictoryRoadmapRegistry {
         &self,
         player_id: PlayerId,
     ) -> Option<(IslandId, GridPosition)> {
+        if !crate::ai::code_path::ext_enabled("v4/victory_roadmap.rs::active_capital_objective") {
+            return self.active_capital_objective(player_id);
+        }
         self.operations
             .values()
             .filter(|operation| {
@@ -2052,89 +1769,6 @@ impl VictoryRoadmapRegistry {
             .map(|operation| (operation.island_id, operation.tactical_anchor))
     }
 
-    pub(super) fn block_pending_step_extended(
-        &mut self,
-        entity: Entity,
-        pending: PendingOperationStep,
-        turn: u32,
-        reason: &str,
-    ) {
-        let detail = format!(
-            "planned {:?} for Entity {} at turn {} was not completed: {}",
-            pending.step,
-            entity.to_bits(),
-            pending.planned_turn,
-            reason
-        );
-        if let Some(operation) = self.operations.get_mut(&pending.operation_id) {
-            operation.execution.blocked = operation.execution.blocked.saturating_add(1);
-            operation.execution.deviations = operation.execution.deviations.saturating_add(1);
-            operation.phase = OperationPhase::Blocked;
-            operation.node_state = RoadmapNodeState::Blocked;
-            operation.blocked_reason = Some(detail.clone());
-            let issue = OperationIssue {
-                kind: OperationIssueKind::StepBlocked,
-                detected_turn: turn,
-                entity: Some(entity),
-                related_entity: pending.target_entity,
-                detail: detail.clone(),
-            };
-            operation.current_issues.push(issue.clone());
-            operation.issue_history.push(issue);
-        }
-        if let Some(record) = self.step_history.iter_mut().rev().find(|record| {
-            record.entity == entity
-                && record.operation_id == pending.operation_id
-                && record.planned_turn == pending.planned_turn
-                && record.resolved_turn.is_none()
-        }) {
-            record.resolved_turn = Some(turn);
-            record.blocked_reason = Some(detail);
-        }
-    }
-
-    pub(super) fn ensure_roadmap_extended(
-        &mut self,
-        player_id: PlayerId,
-        turn: u32,
-        enemy_capital: Option<GridPosition>,
-        enemy_capital_island: Option<IslandId>,
-        enemy_unit_count: usize,
-    ) -> VictoryRoadmapId {
-        if let Some(roadmap) = self.roadmaps.get_mut(&player_id) {
-            roadmap.last_observed_turn = turn;
-            roadmap.enemy_capital = enemy_capital;
-            roadmap.enemy_capital_island = enemy_capital_island;
-            roadmap.current_enemy_unit_count = enemy_unit_count;
-            return roadmap.id;
-        }
-        self.next_roadmap_id = self.next_roadmap_id.saturating_add(1);
-        let id = VictoryRoadmapId(self.next_roadmap_id);
-        self.roadmaps.insert(
-            player_id,
-            VictoryRoadmap {
-                id,
-                player_id,
-                route: if enemy_capital.is_some() {
-                    VictoryRoute::CapitalCapture
-                } else {
-                    VictoryRoute::EnemyAnnihilation
-                },
-                created_turn: turn,
-                last_observed_turn: turn,
-                enemy_capital,
-                enemy_capital_island,
-                planned_victory_turn: None,
-                actual_victory_turn: None,
-                initial_enemy_unit_count: enemy_unit_count,
-                current_enemy_unit_count: enemy_unit_count,
-                operation_ids: Vec::new(),
-                dependencies: Vec::new(),
-            },
-        );
-        id
-    }
-
     pub(super) fn ensure_capital_objective_extended(
         &mut self,
         roadmap_id: VictoryRoadmapId,
@@ -2144,6 +1778,10 @@ impl VictoryRoadmapRegistry {
         capital: GridPosition,
         owned: bool,
     ) -> StrategicOperationId {
+        if !crate::ai::code_path::ext_enabled("v4/victory_roadmap.rs::ensure_capital_objective") {
+            return self
+                .ensure_capital_objective(roadmap_id, player_id, turn, island_id, capital, owned);
+        }
         let key = (player_id, island_id, StrategicOperationScope::Capital);
         let operation_id = if let Some(id) = self.operation_keys.get(&key).copied() {
             id
@@ -2237,6 +1875,18 @@ impl VictoryRoadmapRegistry {
         owned_properties: &HashSet<GridPosition>,
         phase: OperationPhase,
     ) -> StrategicOperationId {
+        if !crate::ai::code_path::ext_enabled("v4/victory_roadmap.rs::reconcile_assignment") {
+            return self.reconcile_assignment(
+                roadmap_id,
+                player_id,
+                turn,
+                assignment,
+                purpose,
+                objectives,
+                owned_properties,
+                phase,
+            );
+        }
         let operation_id = self.ensure_operation(
             roadmap_id,
             player_id,

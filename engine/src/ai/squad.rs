@@ -2310,10 +2310,6 @@ fn nearest_campaign_property_target(
     island_id: crate::ai::islands::IslandId,
     members: &[Entity],
 ) -> Option<GridPosition> {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::nearest_campaign_property_target(world, player_id, island_id, members);
-    }
     nearest_campaign_property_target_with_connectivity(
         world,
         player_id,
@@ -2829,8 +2825,10 @@ fn prepare_campaign_local_assignment_with_connectivity(
     assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
     connectivity: &mut TerrainConnectivity,
 ) {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
+    // 小規模マップのV4は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended_at(
+        "squad.rs::prepare_campaign_local_assignment_with_connectivity",
+    ) {
         return extended::prepare_campaign_local_assignment_with_connectivity(
             world,
             manager,
@@ -3007,8 +3005,8 @@ fn synchronize_local_capture_departure(
     player_id: PlayerId,
     assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
 ) {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
+    // 小規模マップのV4は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended_at("squad.rs::synchronize_local_capture_departure") {
         return extended::synchronize_local_capture_departure(
             world, manager, player_id, assignment,
         );
@@ -4233,8 +4231,8 @@ pub(crate) fn reconcile_v4_end_turn_reserves(world: &mut World, player_id: Playe
 
 /// ゲームの戦略状況に基づいて、自動的に部隊の構築と新規メンバーの割り当てを行います。
 pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
+    // 小規模マップのV4は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended_at("squad.rs::plan_squads") {
         return extended::plan_squads(world, perspective_player);
     }
     // 1. まず既存部隊のクリーンアップと SoloFallback 判定を実行
@@ -5637,18 +5635,6 @@ fn select_landing_candidate(
     target_island: Option<crate::ai::islands::IslandId>,
     target_position: Option<GridPosition>,
 ) -> Option<(GridPosition, GridPosition)> {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::select_landing_candidate(
-            world,
-            transport_entity,
-            cargo_entity,
-            transport_position,
-            reachable,
-            target_island,
-            target_position,
-        );
-    }
     let cargo_stats = world.get::<UnitStats>(cargo_entity).cloned()?;
     let cargo_health = world
         .get::<Health>(cargo_entity)
@@ -5914,10 +5900,6 @@ pub fn execute_transport_squad_step(
     squad: &mut Squad,
     skip_entities: &std::collections::HashSet<Entity>,
 ) -> Option<(Entity, crate::ai::engine::AiCommand)> {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::execute_transport_squad_step(world, squad, skip_entities);
-    }
     let transport_entity = squad.transport_entity?;
 
     let (t_pos, t_stats, t_fuel, t_faction) = {
@@ -6708,8 +6690,6 @@ mod tests {
 
     #[test]
     fn active_campaign_releases_entity_removed_from_current_portfolio() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut world = setup_test_world();
         let player = PlayerId(1);
         let stale = world

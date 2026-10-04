@@ -9,7 +9,7 @@ use super::*;
 /// 指定タイルにおいて敵から受ける期待総被ダメージ（HP換算）を計算します。
 /// 間接砲火および直接攻撃到達圏の敵からの推定ダメージを合算し、
 /// 突入時に次ターンで即死（被撃破）するかどうかの生存性を判定するために用います。
-pub fn expected_incoming_damage(
+pub(crate) fn expected_incoming_damage(
     map: &Map,
     tile: (usize, usize),
     my_unit_type: UnitType,
@@ -52,6 +52,7 @@ mod tests {
 
     #[test]
     fn expected_incoming_damage_sums_threats() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let map = Map::new(
             5,
             1,

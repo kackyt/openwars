@@ -6,37 +6,17 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// 計画済み列から実際に返す1命令だけをIssuedへ進める。
-pub(super) fn issue_planned_production(
-    world: &mut World,
-    turn: u32,
-    planned: Option<PlannedProduction>,
-) -> Vec<ProduceUnitCommand> {
-    let Some(planned) = planned else {
-        return Vec::new();
-    };
-    if let Some(step_ref) = planned
-        .deployment
-        .as_ref()
-        .and_then(|deployment| deployment.plan_step)
-        && let Some(mut registry) = world.get_resource_mut::<V4RollingPlanRegistry>()
-    {
-        registry.mark_issued(step_ref, turn);
-    }
-    if planned.capture_intent.is_some()
-        && let Some(mut registry) =
-            world.get_resource_mut::<campaign_execution::V4CampaignExecutionRegistry>()
-    {
-        registry.mark_issued(planned.command.player_id, turn, &planned.command);
-    }
-    vec![planned.command]
-}
-
 /// V4 の生産意思決定エントリポイント。
 ///
 /// `decide_production` から `AiVersion::uses_operation_driven_production()` が
 /// true のときだけ委譲される。V1/V2/V3 の経路には一切影響しない。
-pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<ProduceUnitCommand> {
+pub(crate) fn decide_production_v4(
+    world: &mut World,
+    player_id: PlayerId,
+) -> Vec<ProduceUnitCommand> {
+    if !crate::ai::code_path::ext_enabled("v4/mod.rs::decide_production_v4") {
+        return super::decide_production_v4(world, player_id);
+    }
     let turn = world
         .get_resource::<crate::resources::MatchState>()
         .map_or(0, |state| state.current_turn_number.0);
@@ -198,155 +178,6 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
     let next = turn_plan.commands.pop_front();
     world.insert_resource(turn_plan);
     issue_planned_production(world, turn, next)
-}
-
-/// 戦術層が組んだ島嶼キャンペーンの不足を、V4固有の汎用作戦より先に生産する。
-///
-/// `AiTurnStrategyCache` は行動計画時に同じプレイヤーのportfolioを保持している。
-/// 生産APIは1命令ごとに呼ばれるため、V3と同じcache queueへ完全パッケージを保存し、
-/// shortfallの再計算による二重発注を防ぐ。高優先行を完成できないときはgenericを
-/// blockし、輸送・積荷・戦闘戦力の一部だけを逐次投入しない。
-pub(super) fn decide_campaign_production_v4(
-    world: &mut World,
-    player_id: PlayerId,
-) -> CampaignProductionControl {
-    let turn = world
-        .get_resource::<crate::resources::MatchState>()
-        .map_or(0, |state| state.current_turn_number.0);
-    let plan_exists = world
-        .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
-        .is_some_and(|cache| cache.campaign_production_planned(player_id));
-    if plan_exists {
-        let mut cache = world
-            .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
-            .unwrap_or_default();
-        let next = cache.take_campaign_production_command(player_id);
-        let blocks_generic = cache.campaign_production_blocks_generic(player_id);
-        let generic_budget = cache.campaign_production_generic_budget(player_id);
-        world.insert_resource(cache);
-        return match next {
-            Some(command) => {
-                mark_campaign_production_issued(world, player_id, turn, &command);
-                CampaignProductionControl::Command(command)
-            }
-            None if blocks_generic => CampaignProductionControl::BlockGeneric,
-            None if generic_budget.is_some_and(|budget| budget > 0) => {
-                CampaignProductionControl::ContinueWithSurplus(generic_budget.unwrap_or(0))
-            }
-            None => CampaignProductionControl::Continue,
-        };
-    }
-
-    let mut shortfalls = world
-        .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
-        .and_then(|cache| cache.campaign_portfolio(player_id))
-        .map(|portfolio| portfolio.aggregate_missing_requirements())
-        .unwrap_or_default();
-    if shortfalls.is_empty() {
-        return CampaignProductionControl::Continue;
-    }
-
-    let Some(scan) = BoardScan::collect(world, player_id) else {
-        return CampaignProductionControl::BlockGeneric;
-    };
-
-    // 陸続きで自力到達できる前線まで島campaign専用生産へ通すと、占領枠を
-    // 全て買い終えるまで時系列Combat Planが起動せず、裸の占領兵を逐次損耗させる。
-    // ただし橋頭堡へ戦車を到達させる構造要求は、通常生産へ渡すと歩兵へ置換されて
-    // 消えてしまう。直接到達できる前線でも、その要求だけは専用経路に残す。
-    // 目標一覧そのものはcampaign/roadmapに残るため、単一目標へ縮退することはない。
-    let mut reach = ReachCtx::default();
-    let armored_entry_cost = scan
-        .available_types
-        .iter()
-        .filter(|(unit_type, stats)| {
-            matches!(
-                unit_type,
-                UnitType::Tank | UnitType::MdTank | UnitType::TankZ
-            ) && stats.movement_type == MovementType::Tank
-        })
-        .map(|(_, stats)| stats.cost)
-        .min()
-        .unwrap_or(0);
-    shortfalls.retain_mut(|shortfall| {
-        if !has_direct_capture_route(&scan, &mut reach, shortfall) {
-            return true;
-        }
-        if shortfall.ground_combat_units == 0 {
-            return false;
-        }
-
-        // 同一陸塊では占領・通常戦闘はrolling planへ委ねる。一方で橋頭堡への
-        // 装甲到達は代替不能な前提条件なので、必要台数とその予約額だけを保つ。
-        shortfall.light_transport_slots = 0;
-        shortfall.heavy_transport_slots = 0;
-        shortfall.capture_units = 0;
-        shortfall.combat_units = 0;
-        shortfall.reserved_budget =
-            armored_entry_cost.saturating_mul(shortfall.ground_combat_units);
-        true
-    });
-    if shortfalls.is_empty() {
-        return CampaignProductionControl::Continue;
-    }
-
-    // 航空掃討は後段のrolling planへ委譲する。一方、敵領Assaultで輸送・配置枠まで
-    // 予約済みの地上波はcampaign Squadへ渡さないと港で遊兵になるため、必要実体数と
-    // その購入上限だけを残す。
-    for shortfall in &mut shortfalls {
-        if shortfall.decision != crate::ai::island_campaign::IslandCampaignDecision::Assault
-            || shortfall.ground_combat_units == 0
-        {
-            shortfall.combat_units = 0;
-        }
-    }
-
-    let enemy_stats: Vec<_> = scan
-        .enemy_units
-        .iter()
-        .map(|unit| unit.stats.clone())
-        .collect();
-    let outcome = plan_campaign_with_expansion_denial_reserve(
-        player_id,
-        &shortfalls,
-        &scan.free_facilities,
-        scan.owned_airport_count,
-        &scan.available_types,
-        &enemy_stats,
-        &scan.damage_chart,
-        &scan.map,
-        &scan.master_data,
-        scan.funds,
-    );
-    world.init_resource::<campaign_execution::V4CampaignExecutionRegistry>();
-    world
-        .resource_mut::<campaign_execution::V4CampaignExecutionRegistry>()
-        .replace_turn_intents(player_id, turn, &outcome.intents);
-    let generic_budget = outcome.generic_funds;
-    let mut cache = world
-        .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
-        .unwrap_or_default();
-    cache.set_campaign_production_plan_with_generic_budget(
-        player_id,
-        outcome.commands,
-        generic_budget,
-    );
-    let next = cache.take_campaign_production_command(player_id);
-    let blocks_generic = cache.campaign_production_blocks_generic(player_id);
-    let generic_budget = cache.campaign_production_generic_budget(player_id);
-    world.insert_resource(cache);
-
-    match next {
-        Some(command) => {
-            mark_campaign_production_issued(world, player_id, turn, &command);
-            CampaignProductionControl::Command(command)
-        }
-        None if blocks_generic => CampaignProductionControl::BlockGeneric,
-        None if generic_budget.is_some_and(|budget| budget > 0) => {
-            CampaignProductionControl::ContinueWithSurplus(generic_budget.unwrap_or(0))
-        }
-        None => CampaignProductionControl::Continue,
-    }
 }
 
 /// 盤面から作戦の一覧を組み立てる。
@@ -792,16 +623,7 @@ pub(super) fn build_operations(
         .collect()
 }
 
-pub(super) fn operation_threat_horizon(kind: OperationKind, deploy_lead_time: u32) -> u32 {
-    match kind {
-        OperationKind::Defense => DEFENSE_THREAT_ETA,
-        OperationKind::Capture => deploy_lead_time.saturating_add(CAPTURE_COMPLETION_TURNS),
-        // 首都作戦の論理目標は首都だが、現在バッチの接触地点はDAGの次区間である。
-        // 首都到達までの全手番を一括で見積もると、未観測の敵生産を現在要求へ
-        // 膨張させるため、次区間を確保して再評価できる時点までに限定する。
-        OperationKind::AssaultCapital => deploy_lead_time.saturating_add(CAPTURE_COMPLETION_TURNS),
-    }
-}
+pub(super) use super::operation_threat_horizon;
 
 /// 1 つの作戦について観測量を集め、枠を導出する。
 #[allow(clippy::too_many_arguments)]
@@ -1178,28 +1000,6 @@ pub(super) fn build_operation(
     // counter候補として残し、Expected生産を予約資金で止めない。
     operation.contingency_reserve_funds = 0;
     operation
-}
-
-/// 作戦一覧と資金から、この生産フェーズで発行する生産命令を組み立てる。
-#[cfg(test)]
-pub(super) fn plan_production(
-    scan: &BoardScan,
-    player_id: PlayerId,
-    allow_structural_slots: bool,
-    committed_combat_assignments: &HashMap<Entity, deployment::ActiveTargetAssignment>,
-) -> (Vec<PlannedProduction>, ProductionPlanTrace) {
-    let mut registry = V4RollingPlanRegistry::default();
-    let mut contract_registry = plan_contract::PlanContractRegistry::default();
-    plan_production_with_registry(
-        scan,
-        player_id,
-        allow_structural_slots,
-        committed_combat_assignments,
-        &AdvancingCapitalRouteEntities::default(),
-        0,
-        &mut registry,
-        &mut contract_registry,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2413,73 +2213,6 @@ pub(super) fn enemy_reinforcement_assessment(
     assessment
 }
 
-/// 観測した敵1体へ、生産slot・移動・与ダメージを満たす最速counterを返す。
-pub(super) fn fastest_observed_counter(
-    scan: &BoardScan,
-    ctx: &mut ReachCtx,
-    anchor: GridPosition,
-    enemy: &UnitStats,
-    counter_build_turn: u32,
-    enemy_contact_turn: u32,
-    reserved_slots: &HashSet<(u32, GridPosition)>,
-) -> Option<ReinforcementContingency> {
-    scan.production_facilities
-        .iter()
-        .flat_map(|(facility, terrain)| {
-            scan.available_types
-                .iter()
-                .filter(move |(unit_type, stats)| {
-                    !stats.can_capture
-                        && stats.max_cargo == 0
-                        && scan.can_produce(*terrain, *unit_type)
-                })
-                .map(move |(_, stats)| (*facility, stats))
-        })
-        .filter(|(facility, stats)| {
-            !reserved_slots.contains(&(counter_build_turn, *facility))
-                && best_damage(&scan.damage_chart, stats.unit_type, enemy.unit_type) > 0
-                && ctx.is_reachable(
-                    &scan.map,
-                    &scan.master_data,
-                    (facility.x, facility.y),
-                    (anchor.x, anchor.y),
-                    stats.movement_type,
-                )
-        })
-        .filter_map(|(facility, stats)| {
-            let damage = best_damage(&scan.damage_chart, stats.unit_type, enemy.unit_type);
-            let attacks_required = 100_u32.div_ceil(damage.max(1));
-            let counter_contact_turn = property_control::produced_action_offset(
-                counter_build_turn,
-                eta_turns(&scan.map, &facility, &anchor, stats.max_movement),
-            );
-            (counter_contact_turn <= enemy_contact_turn).then_some((
-                counter_contact_turn,
-                attacks_required,
-                stats.cost,
-                facility,
-                stats,
-            ))
-        })
-        .min_by_key(|(contact, attacks, cost, facility, _)| {
-            (*contact, *attacks, *cost, facility.y, facility.x)
-        })
-        .map(
-            |(counter_contact_turn, attacks_required, reserve_cost, facility, stats)| {
-                ReinforcementContingency {
-                    enemy_type: enemy.unit_type,
-                    enemy_contact_turn,
-                    counter_type: stats.unit_type,
-                    counter_facility: facility,
-                    counter_build_turn,
-                    counter_contact_turn,
-                    attacks_required,
-                    reserve_cost,
-                }
-            },
-        )
-}
-
 /// 観測敵と到着しうる増援を排除できる混成生産列を、探索期間の全生産slotから計画する。
 ///
 /// `combat_plan_required`は呼び出し条件にだけ残し、候補数・生産停止・完了判定には使わない。
@@ -3296,6 +3029,9 @@ pub(super) fn planned_deployment(
 /// 生産枠の実効優先度。すべて同じ作戦集合で比較し、別枠の緊急作戦は作らない。
 /// Defenseは敵接触ETAと展開リードタイムから優先度を上げるが、必要枠だけを取得する。
 pub(super) fn operation_priority_rank(operation: &Operation) -> u32 {
+    if !crate::ai::code_path::ext_enabled("v4/mod.rs::operation_priority_rank") {
+        return super::operation_priority_rank(operation);
+    }
     let defense_cannot_wait = operation.kind == OperationKind::Defense
         && operation.facts.enemy_combat_units > 0
         && operation.facts.enemy_contact_eta
@@ -3323,6 +3059,9 @@ pub(super) fn most_starved_in_tier(
     operations: &[Operation],
     tier: SlotTier,
 ) -> Option<(usize, SlotKind)> {
+    if !crate::ai::code_path::ext_enabled("v4/mod.rs::most_starved_in_tier") {
+        return super::most_starved_in_tier(operations, tier);
+    }
     let mut best: Option<(usize, SlotKind, u32, f32, usize)> = None;
     for (index, op) in operations.iter().enumerate() {
         for (priority, kind) in SLOT_PRIORITY.iter().enumerate() {
@@ -3365,39 +3104,6 @@ pub(super) fn most_starved_in_tier(
         }
     }
     best.map(|(index, kind, _, _, _)| (index, kind))
-}
-
-/// 購入した 1 体分を充足量へ反映する。
-pub(super) fn record_fill(
-    scan: &BoardScan,
-    _ctx: &mut ReachCtx,
-    op: &mut Operation,
-    kind: SlotKind,
-    candidate: &SlotCandidate,
-) {
-    let cargo = scan
-        .available_types
-        .iter()
-        .find(|(unit_type, _)| *unit_type == candidate.unit_type)
-        .map(|(_, stats)| stats.max_cargo)
-        .unwrap_or(0);
-    match kind {
-        SlotKind::Intercept => {
-            op.filled.intercept_units = op.filled.intercept_units.saturating_add(1);
-        }
-        SlotKind::Transport => {
-            op.filled.transport_slots = op.filled.transport_slots.saturating_add(cargo.max(1))
-        }
-        SlotKind::Capture => {
-            op.planned_capture_units.push(PlannedCaptureUnit {
-                stats: candidate_stats(scan, candidate).clone(),
-                facility: candidate.facility,
-                target: next_capture_target(op),
-            });
-            op.filled.capture_units += 1;
-        }
-        SlotKind::Combat => unreachable!("Combat購入はRollingPlan経路だけで処理する"),
-    }
 }
 
 /// 指定の枠を満たす最良の候補を選ぶ。
@@ -3704,6 +3410,7 @@ mod tests {
 
     #[test]
     fn frontline_capacity_follows_scanned_node_geometry() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let island = crate::ai::islands::IslandId(0);
         let operation = |scope, control_area, capture_targets| CapitalRouteNodeOperation {
@@ -3749,6 +3456,7 @@ mod tests {
 
     #[test]
     fn nearby_capture_region_has_one_owner_operation() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let map = flat_map(12, 3);
         let anchors = vec![pos(1, 1), pos(2, 2), pos(4, 1), pos(8, 1)];
         let mut targets = vec![
@@ -3772,6 +3480,7 @@ mod tests {
 
     #[test]
     fn linear_capture_corridor_keeps_independent_operations() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let map = flat_map(12, 3);
         let anchors = vec![pos(1, 1), pos(2, 1), pos(4, 1)];
         let mut targets = vec![vec![pos(1, 1)], vec![pos(2, 1)], vec![pos(4, 1)]];
@@ -3787,6 +3496,7 @@ mod tests {
 
     #[test]
     fn capture_node_requires_secured_for_both_area_and_point() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let topology = CapitalRouteTopologyKey {
             player_id: player,
@@ -3822,6 +3532,7 @@ mod tests {
 
     #[test]
     fn dominant_area_capture_retains_one_escort_until_secured() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let topology = CapitalRouteTopologyKey {
             player_id: player,
@@ -3883,6 +3594,7 @@ mod tests {
 
     #[test]
     fn capture_frontline_reserves_both_capturer_and_control_lanes() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let island = crate::ai::islands::IslandId(0);
         let operation = |scope, control_area, capture_targets| CapitalRouteNodeOperation {
@@ -3929,6 +3641,7 @@ mod tests {
 
     #[test]
     fn nearest_capture_capable_combat_squad_can_take_the_capture_lane() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let island = crate::ai::islands::IslandId(0);
         let mut operation = CapitalRouteNodeOperation {
@@ -3984,6 +3697,7 @@ mod tests {
 
     #[test]
     fn forward_stage_squad_outranks_rear_advance_squad_for_frontline_rotation() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let forward_stage =
             capital_route_frontline_sort_key(12, &MissionType::Attack, 0, 1_000, SquadId(200));
         let rear_advance =
@@ -3997,6 +3711,7 @@ mod tests {
 
     #[test]
     fn durable_direct_fire_squad_wins_same_frontline_escort_slot() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let armored =
             capital_route_frontline_sort_key(8, &MissionType::Attack, 0, 20_000, SquadId(20));
         let light =
@@ -4010,6 +3725,7 @@ mod tests {
 
     #[test]
     fn area_control_region_excludes_remote_milestones() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let map = flat_map(30, 5);
         let island_map = crate::ai::islands::IslandMap::analyze(&map);
         let anchor = pos(15, 2);
@@ -4042,6 +3758,7 @@ mod tests {
 
     #[test]
     fn hold_and_supply_remain_addressable_inside_the_route_dag() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let island = crate::ai::islands::IslandId(0);
         let hold = GridPosition { x: 4, y: 4 };
@@ -4162,6 +3879,7 @@ mod tests {
 
     #[test]
     fn route_order_is_shared_by_members_of_the_same_squad() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let island = crate::ai::islands::IslandId(0);
         let target = pos(6, 1);
@@ -4203,6 +3921,7 @@ mod tests {
 
     #[test]
     fn recreated_squad_inherits_one_previous_squad_order_atomically() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let island = crate::ai::islands::IslandId(0);
         let member = Entity::from_raw(100);
@@ -4270,6 +3989,7 @@ mod tests {
 
     #[test]
     fn only_capturer_claims_an_unsecured_route_milestone() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let island = crate::ai::islands::IslandId(0);
         let target = pos(5, 1);
@@ -4357,6 +4077,7 @@ mod tests {
 
     #[test]
     fn squad_mission_alone_defines_route_execution_phase() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         assert_eq!(
             capital_route_execution_phase(&MissionType::Attack),
             CapitalRouteExecutionPhase::Advance
@@ -4374,6 +4095,7 @@ mod tests {
 
     #[test]
     fn forward_defense_squad_is_reassigned_as_current_node_control() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         assert!(capital_route_controls_active_node(
             &MissionType::Attack,
             false
@@ -4394,6 +4116,7 @@ mod tests {
 
     #[test]
     fn capture_outside_the_active_route_keeps_its_squad_order() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         // map_25の外周拠点のように、前方にあっても現在DAG経路に
         // 属さない目標はfalseとし、中央最短線へ上書きしない。
         assert!(!capital_route_capture_joins_active_node(
@@ -4430,6 +4153,7 @@ mod tests {
 
     #[test]
     fn unfinished_capture_node_reserves_property_cells_for_capturers() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let topology = CapitalRouteTopologyKey {
             player_id: player,
@@ -4474,6 +4198,7 @@ mod tests {
 
     #[test]
     fn capital_mainline_depends_on_forward_progress_not_auxiliary_property_count() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         assert!(same_land_capital_front_reached(16, 6));
         assert!(same_land_capital_front_reached(32, 16));
         assert!(!same_land_capital_front_reached(32, 17));
@@ -4481,6 +4206,7 @@ mod tests {
 
     #[test]
     fn bridge_gates_split_one_island_into_two_active_route_fronts() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let master_data = MasterDataRegistry::load().unwrap();
         let mut map = flat_map(7, 7);
         for y in 0..map.height {
@@ -4527,6 +4253,7 @@ mod tests {
 
     #[test]
     fn explicit_combat_deployment_is_not_reassigned_to_a_capture_milestone() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let data = MasterDataRegistry::load().unwrap();
         let player = PlayerId(1);
         let mut map = flat_map(12, 1);
@@ -4610,6 +4337,7 @@ mod tests {
 
     #[test]
     fn route_milestone_requires_the_nearest_unsecured_property_before_advancing() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         use crate::ai::island_campaign::{
             IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignPortfolio,
             IslandCampaignRequirement,
@@ -4705,6 +4433,7 @@ mod tests {
 
     #[test]
     fn map6_mountain_corridors_create_two_route_fronts() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let master_data = MasterDataRegistry::load().unwrap();
         let (world, _schedule) = crate::setup::initialize_world_from_master_data_with_topology(
             &master_data,
@@ -4748,6 +4477,7 @@ mod tests {
 
     #[test]
     fn map6_p2_capital_route_discovers_both_frontiers() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let master_data = MasterDataRegistry::load().unwrap();
         let (mut world, _schedule) = crate::setup::initialize_world_from_master_data_with_topology(
             &master_data,
@@ -4785,6 +4515,7 @@ mod tests {
 
     #[test]
     fn map1_single_corridor_still_builds_a_capital_route_dag() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let master_data = MasterDataRegistry::load().unwrap();
         let (mut world, _schedule) = crate::setup::initialize_world_from_master_data_with_topology(
             &master_data,
@@ -4839,6 +4570,7 @@ mod tests {
 
     #[test]
     fn map26_builds_a_forward_dag_independently_for_each_player() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let master_data = MasterDataRegistry::load().unwrap();
         let (mut world, _schedule) = crate::setup::initialize_world_from_master_data_with_topology(
             &master_data,
@@ -4909,6 +4641,7 @@ mod tests {
 
     #[test]
     fn map26_bridge_node_requires_a_ground_unit_to_reach_its_exit() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let master_data = MasterDataRegistry::load().unwrap();
         let (mut world, _schedule) = crate::setup::initialize_world_from_master_data_with_topology(
             &master_data,
@@ -5113,6 +4846,7 @@ mod tests {
 
     #[test]
     fn map6_mountain_routes_keep_a_milestone_on_each_corridor() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let master_data = MasterDataRegistry::load().unwrap();
         let (world, _schedule) = crate::setup::initialize_world_from_master_data_with_topology(
             &master_data,
@@ -5193,6 +4927,7 @@ mod tests {
 
     #[test]
     fn route_force_slots_follow_bulk_demand_without_minimum_per_route() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let north = RouteForceDemand {
             opportunity_value: 6_000,
             force_deficit_value: 3_000,
@@ -5219,6 +4954,7 @@ mod tests {
 
     #[test]
     fn map26_bridge_route_fronts_have_post_bridge_positions() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let master_data = MasterDataRegistry::load().unwrap();
         let (mut world, _schedule) = crate::setup::initialize_world_from_master_data_with_topology(
             &master_data,
@@ -5350,6 +5086,7 @@ mod tests {
 
     #[test]
     fn enemy_production_forecast_learns_new_entities_and_records_next_turn_error() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let mut world = World::new();
         let mut scan = multi_factory_scan();
@@ -5391,6 +5128,7 @@ mod tests {
 
     #[test]
     fn campaign_objective_is_the_only_capture_source_and_keeps_exact_anchor() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut scan = multi_factory_scan();
         let campaign_anchor = pos(8, 2);
         scan.campaign_objectives = vec![CampaignPlanningObjective {
@@ -5420,6 +5158,7 @@ mod tests {
 
     #[test]
     fn capital_objective_keeps_local_front_as_an_independent_operation() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut scan = multi_factory_scan();
         let local_anchor = pos(6, 2);
         let capital = pos(8, 2);
@@ -5496,6 +5235,7 @@ mod tests {
     /// 既存Combat 1体を複数前線の撃破要求から同時に控除してはならない。
     #[test]
     fn existing_combat_sorties_are_committed_to_only_one_operation() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let infantry = UnitStats {
             can_capture: true,
             movement_type: MovementType::Infantry,
@@ -5601,6 +5341,7 @@ mod tests {
 
     #[test]
     fn committed_combat_keeps_plan_ownership_and_accepts_operation_bound_reinforcements() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let own_entity = Entity::from_raw(900);
         let foreign_entity = Entity::from_raw(901);
         let immediate_entity = Entity::from_raw(902);
@@ -5655,6 +5396,7 @@ mod tests {
 
     #[test]
     fn advancing_route_registry_exposes_the_current_segment_roster() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let island = crate::ai::islands::IslandId(4);
         let advancing = Entity::from_raw(904);
@@ -5735,6 +5477,7 @@ mod tests {
 
     #[test]
     fn staged_route_member_is_counted_after_its_front_arrival_eta() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut scan = mixed_threat_multi_factory_scan();
         let staged = Entity::from_raw(903);
         let anti_air = scan
@@ -5779,6 +5522,7 @@ mod tests {
 
     #[test]
     fn combat_plan_projects_only_the_capturer_ordered_this_turn() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut scan = mixed_threat_multi_factory_scan();
         let anchor = pos(6, 2);
         let second_front = pos(7, 2);
@@ -5844,6 +5588,7 @@ mod tests {
     /// 実生産ペースを、期限内に到着できる最寄りの1作戦だけへ見積もる。
     #[test]
     fn enemy_reinforcement_funds_is_local_unique_and_deadline_bounded() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut scan = multi_factory_scan();
         scan.enemy_income = 6000;
         scan.enemy_production_slots = 1;
@@ -5878,6 +5623,7 @@ mod tests {
 
     #[test]
     fn expected_reinforcement_starts_production_without_changing_the_launch_gate() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut scan = multi_factory_scan();
         scan.enemy_income = 6_000;
         scan.enemy_production_slots = 1;
@@ -5909,6 +5655,7 @@ mod tests {
 
     #[test]
     fn unauthorized_capital_formation_does_not_hide_reinforcements_from_capture() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut scan = multi_factory_scan();
         scan.enemy_income = 6_000;
         scan.enemy_production_slots = 1;
@@ -5969,6 +5716,7 @@ mod tests {
 
     #[test]
     fn enemy_reinforcement_assessment_places_each_purchase_on_the_time_axis() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut scan = multi_factory_scan();
         scan.enemy_income = 1_000;
         scan.enemy_production_slots = 1;
@@ -6071,121 +5819,6 @@ mod tests {
         }
     }
 
-    /// Combat計画は購入価格ではなく、期限内の具体的な攻撃列で充足する。
-    #[test]
-    fn combat_plan_does_not_treat_purchase_price_as_destroyed_enemy_value() {
-        let infantry = UnitStats {
-            can_capture: true,
-            movement_type: MovementType::Infantry,
-            max_movement: 3,
-            ..stats(UnitType::Infantry, 1_000)
-        };
-        let helicopter = UnitStats {
-            movement_type: MovementType::Air,
-            max_movement: 8,
-            ..stats(UnitType::Bcopters, 7_500)
-        };
-        let mut damage_chart = DamageChart::new();
-        damage_chart.insert_damage(UnitType::Bcopters, UnitType::Infantry, 65);
-        damage_chart.insert_damage(UnitType::Infantry, UnitType::Bcopters, 0);
-        let enemy_positions = [pos(8, 0), pos(8, 1)];
-        let scan = BoardScan {
-            map: flat_map(10, 3).into(),
-            master_data: MasterDataRegistry::load().unwrap().into(),
-            damage_chart: damage_chart.into(),
-            current_turn: 1,
-            opening_policy: None,
-            funds: 22_500,
-            capital_position: None,
-            free_facilities: vec![
-                (pos(0, 1), Terrain::Factory),
-                (pos(1, 0), Terrain::Airport),
-                (pos(1, 1), Terrain::Airport),
-                (pos(1, 2), Terrain::Airport),
-            ],
-            production_facilities: vec![
-                (pos(0, 1), Terrain::Factory),
-                (pos(1, 0), Terrain::Airport),
-                (pos(1, 1), Terrain::Airport),
-                (pos(1, 2), Terrain::Airport),
-            ],
-            available_types: vec![
-                (UnitType::Infantry, infantry.clone()),
-                (UnitType::Bcopters, helicopter),
-            ],
-            my_units: Vec::new(),
-            enemy_units: enemy_positions
-                .iter()
-                .enumerate()
-                .map(|(index, position)| UnitSnapshot {
-                    entity: Some(Entity::from_raw(1_000 + index as u32)),
-                    pos: *position,
-                    stats: infantry.clone(),
-                    hp: 100,
-                    free_cargo: 0,
-                })
-                .collect(),
-            property_entities: HashMap::new(),
-            owned_airport_count: 3,
-            open_properties: enemy_positions.to_vec(),
-            neutral_properties: enemy_positions.to_vec(),
-            enemy_income: 0,
-            enemy_production_slots: 0,
-            enemy_facilities: Vec::new(),
-            my_income: 5_000,
-            campaign_objectives: capture_objective(enemy_positions[0]),
-            capital_assault_authorized: false,
-            capital_staging_anchor: None,
-            enemy_production_forecast: EnemyProductionForecastTrace::default(),
-        };
-
-        let (commands, trace) = plan_production(&scan, PlayerId(1), false, &HashMap::new());
-
-        // 占領役を1体確保してもCombat計画を消さず、65%攻撃を何回実行できるかを
-        // シミュレーションした攻撃列を保持する。実弾薬では1機が4回攻撃して
-        // 2体を排除できるため、価格を敵価値へ換算したCombat要求にはしない。
-        // 余剰生産は、同じ前線に到着して追加の有効打を与えられる時だけ出す。
-        // このfixtureでは一機が弾薬内で全2体を排除できるため、価格だけで二機目を
-        // 強制しない。これはplanの必要数を敵価値へ換算しないことの確認でもある。
-        assert_eq!(commands.len(), 2, "commands={commands:?}, trace={trace:?}");
-        assert_eq!(
-            commands
-                .iter()
-                .filter(|command| command.unit_type == UnitType::Infantry)
-                .count(),
-            1
-        );
-        assert_eq!(
-            commands
-                .iter()
-                .filter(|command| command.unit_type == UnitType::Bcopters)
-                .count(),
-            1
-        );
-        let combat_plan = &trace.rolling_combat_plans[0];
-        assert_eq!(combat_plan.targets.len(), 2);
-        assert!(
-            combat_plan
-                .targets
-                .iter()
-                .all(|target| target.remaining_hp == 0),
-            "combat_plan={combat_plan:?}"
-        );
-        assert_eq!(combat_plan.purchases.len(), 2);
-        assert_eq!(
-            trace
-                .steps
-                .iter()
-                .filter(|step| matches!(
-                    step.decision,
-                    ProductionDecision::ProducedImmediateReinforcement { .. }
-                ))
-                .count(),
-            0,
-            "追加の有効打がないため、余剰資金を無目的な即時増援へ使わない"
-        );
-    }
-
     /// テスト用の作戦。枠の充足状況だけを見たいので敵情報は空にしておく。
     fn operation(kind: OperationKind, slots: OperationSlots, filled: OperationSlots) -> Operation {
         Operation {
@@ -6278,6 +5911,7 @@ mod tests {
     /// 輸送枠の要求が減らないまま揚陸艇を延々と買い増すラチェットになる。
     #[test]
     fn transports_are_ledgered_by_delivery_ability_not_proximity() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let scan = strait_scan();
         let mut ctx = ReachCtx::default();
         let reference = UnitStats {
@@ -6317,6 +5951,7 @@ mod tests {
 
     #[test]
     fn loaded_enemy_transport_on_another_island_is_a_future_arrival() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut scan = strait_scan();
         scan.enemy_units.push(UnitSnapshot {
             entity: Some(Entity::from_raw(700)),
@@ -6363,6 +5998,7 @@ mod tests {
 
     #[test]
     fn empty_enemy_transport_does_not_create_anti_air_demand_on_every_island() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut scan = strait_scan();
         scan.enemy_units.push(UnitSnapshot {
             entity: Some(Entity::from_raw(700)),
@@ -6536,6 +6172,7 @@ mod tests {
     /// キャンペーンの予約超過分は、構造枠を二重購入せず、自力展開可能な対敵戦力へ使う。
     #[test]
     fn campaign_surplus_targets_enemy_infantry_without_buying_stranded_tank() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut map = flat_map(9, 3);
         for y in 0..map.height {
             map.set_terrain(4, y, Terrain::Sea).unwrap();
@@ -6628,6 +6265,7 @@ mod tests {
     /// 撃てる種類だけを選び、そのEntityをpriorityとして任務へ接続する。
     #[test]
     fn immediate_reinforcement_targets_a_live_reachable_frontline_enemy() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut map = flat_map(9, 3);
         for y in 0..map.height {
             map.set_terrain(4, y, Terrain::Sea).unwrap();
@@ -6727,6 +6365,7 @@ mod tests {
 
     #[test]
     fn standalone_reinforcement_does_not_replace_missing_front_with_indirect_fire() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut scan = mixed_threat_multi_factory_scan();
         // 汎用fixtureの燃料0は経路判定用ではない。実マスターの燃料を与える。
         for (kind, stats) in &mut scan.available_types {
@@ -6766,6 +6405,7 @@ mod tests {
     /// 必要な占領枠を確保した後の前衛補充は、工場ごとの均等配分で戦力を落とさない。
     #[test]
     fn combat_reinforcement_uses_affordable_frontline_strength_not_equal_factory_budget() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let enemy = Entity::from_raw(904);
         let options = [
             (UnitType::Infantry, 1000, 20, 0.2),
@@ -6832,6 +6472,7 @@ mod tests {
     /// 次の実在敵を担当させる。
     #[test]
     fn immediate_reinforcement_package_spreads_damage_across_live_enemies() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let first_enemy = Entity::from_raw(904);
         let second_enemy = Entity::from_raw(905);
         let candidate = |facility| SlotCandidate {
@@ -6906,6 +6547,7 @@ mod tests {
     /// の効率で安い歩兵へ寄せず、前線全体をより大きく削れる戦闘unitを選ぶ。
     #[test]
     fn immediate_reinforcement_values_factory_slot_over_unit_price() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let infantry = UnitStats {
             can_capture: true,
             max_movement: 3,
@@ -6980,6 +6622,7 @@ mod tests {
     /// 優先して攻撃対象（`Interdict`）になる。
     #[test]
     fn capturing_enemy_is_prioritized_for_interdict() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let scan = BoardScan {
             open_properties: vec![pos(5, 1)],
             ..mixed_threat_multi_factory_scan()
@@ -7018,6 +6661,7 @@ mod tests {
     /// 診断そのものが無意味になるため、記録専用であるという不変条件をここで固定する。
     #[test]
     fn production_trace_attributes_every_command_to_a_slot() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let scan = multi_factory_scan();
         let (commands, trace) = plan_production(&scan, PlayerId(0), true, &HashMap::new());
 
@@ -7066,120 +6710,10 @@ mod tests {
         );
     }
 
-    /// 平時Capture作戦で複数の中立物件がある場合、同一anchorへの二重割当を防ぎ別々の目標へ配備する。
-    #[test]
-    fn capture_operation_without_property_controls_assigns_distinct_targets() {
-        let mut scan = multi_factory_scan();
-        let prop_a = pos(6, 2);
-        let prop_b = pos(6, 3);
-        let mut map = flat_map(9, 5);
-        map.set_terrain(prop_a.x, prop_a.y, Terrain::City).unwrap();
-        map.set_terrain(prop_b.x, prop_b.y, Terrain::City).unwrap();
-        scan.map = Arc::new(map);
-        scan.open_properties = vec![prop_a, prop_b];
-        scan.neutral_properties = vec![prop_a, prop_b];
-        scan.campaign_objectives = vec![CampaignPlanningObjective {
-            island_id: crate::ai::islands::IslandId(0),
-            kind: OperationKind::Capture,
-            anchor: prop_a,
-            objective_properties: vec![prop_a, prop_b],
-            capture_eta: None,
-            required_capture_survivors: 0,
-            logistics_rank: Some(0),
-            forced_target_enemies: HashSet::new(),
-            protected_capture_entities: HashSet::new(),
-            capture_replacement_pending: false,
-            staging_anchor: prop_a,
-            execution_authorized: true,
-        }];
-
-        let (commands, _trace) = plan_production(&scan, PlayerId(0), true, &HashMap::new());
-
-        let capture_targets: Vec<GridPosition> = commands
-            .iter()
-            .filter_map(|cmd| {
-                cmd.deployment
-                    .as_ref()
-                    .and_then(|d| (d.slot_kind == SlotKind::Capture).then_some(d.anchor))
-            })
-            .collect();
-
-        assert_eq!(
-            capture_targets.len(),
-            2,
-            "2箇所の未取得中立物件に対して2つの占領枠が購入されること"
-        );
-        assert!(
-            capture_targets.contains(&prop_a) && capture_targets.contains(&prop_b),
-            "中立物件A・Bに対してそれぞれ異なる目標が割り当てられるべきだが、実際には重複または未割当が発生: {capture_targets:?}"
-        );
-    }
-
-    /// 作戦外や占領済み物件を目標に含めず、目標枯渇時に同一anchorへ二重割当しない。
-    #[test]
-    fn capture_operation_filters_out_of_cluster_and_owned_properties_without_duplicate() {
-        let mut scan = multi_factory_scan();
-        let prop_in_cluster_open = pos(6, 2);
-        let prop_in_cluster_owned = pos(6, 3);
-        let prop_out_of_cluster_open = pos(8, 4);
-        let mut map = flat_map(9, 5);
-        map.set_terrain(
-            prop_in_cluster_open.x,
-            prop_in_cluster_open.y,
-            Terrain::City,
-        )
-        .unwrap();
-        map.set_terrain(
-            prop_in_cluster_owned.x,
-            prop_in_cluster_owned.y,
-            Terrain::City,
-        )
-        .unwrap();
-        map.set_terrain(
-            prop_out_of_cluster_open.x,
-            prop_out_of_cluster_open.y,
-            Terrain::City,
-        )
-        .unwrap();
-        scan.map = Arc::new(map);
-        scan.open_properties = vec![prop_in_cluster_open, prop_out_of_cluster_open];
-        scan.neutral_properties = vec![prop_in_cluster_open, prop_out_of_cluster_open];
-        scan.campaign_objectives = vec![CampaignPlanningObjective {
-            island_id: crate::ai::islands::IslandId(0),
-            kind: OperationKind::Capture,
-            anchor: prop_in_cluster_open,
-            objective_properties: vec![prop_in_cluster_open, prop_in_cluster_owned],
-            capture_eta: None,
-            required_capture_survivors: 0,
-            logistics_rank: Some(0),
-            forced_target_enemies: HashSet::new(),
-            protected_capture_entities: HashSet::new(),
-            capture_replacement_pending: false,
-            staging_anchor: prop_in_cluster_open,
-            execution_authorized: true,
-        }];
-
-        let (commands, _trace) = plan_production(&scan, PlayerId(0), true, &HashMap::new());
-
-        let capture_targets: Vec<GridPosition> = commands
-            .iter()
-            .filter_map(|cmd| {
-                cmd.deployment
-                    .as_ref()
-                    .and_then(|d| (d.slot_kind == SlotKind::Capture).then_some(d.anchor))
-            })
-            .collect();
-
-        assert_eq!(
-            capture_targets,
-            vec![prop_in_cluster_open],
-            "合法な目標数（1件）にキャップされ、二重割当や作戦外物件の混入がないこと"
-        );
-    }
-
     /// 届けられない作戦地点の台帳には載せない（二重計上の歯止め）
     #[test]
     fn transports_are_not_ledgered_for_unreachable_anchors() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut scan = strait_scan();
         // 接岸できる地形を消すと、艦船は対岸へ陸上ユニットを降ろせなくなる
         scan.map = strait_map(None).into();
@@ -7214,6 +6748,7 @@ mod tests {
     /// 期限付き物件制御でも担当が全滅したら、戦闘計画の完了待ちにせず1体だけ補充する。
     #[test]
     fn property_control_replaces_one_destroyed_capturer_before_combat() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let slots = OperationSlots {
             capture_units: 3,
             combat_plan_required: 1,
@@ -7270,6 +6805,7 @@ mod tests {
     /// 別レーンに近い既存歩兵がいても、未充足レーン用の有限な1枠は消さない。
     #[test]
     fn property_capture_candidate_is_not_blocked_by_another_lanes_capturer() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut scan = multi_factory_scan();
         let target = pos(6, 2);
         let infantry = scan
@@ -7311,6 +6847,7 @@ mod tests {
 
     #[test]
     fn active_dag_segment_defers_unapproved_capital_capture_slots() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut segment = operation(
             OperationKind::Capture,
             OperationSlots {
@@ -7343,6 +6880,7 @@ mod tests {
     /// 前線の分類はmap名ではなく、占領可能unitの実到達性だけで決める。
     #[test]
     fn direct_front_uses_operation_production_while_strait_keeps_transport_campaign() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         use crate::ai::island_campaign::{IslandCampaignDecision, IslandCampaignShortfall};
         use crate::ai::islands::IslandId;
 
@@ -7382,6 +6920,7 @@ mod tests {
 
     #[test]
     fn defense_urgency_raises_normal_operation_priority_without_deleting_capital() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut capital = operation(
             OperationKind::AssaultCapital,
             OperationSlots {
@@ -7414,6 +6953,7 @@ mod tests {
 
     #[test]
     fn board_scan_is_independent_of_ecs_storage_order() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let registry = MasterDataRegistry::load().unwrap();
         let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
             &registry,
@@ -7464,6 +7004,7 @@ mod tests {
 
     #[test]
     fn map32_p2_small_map_expansion_opening_and_capture() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let registry = MasterDataRegistry::load().unwrap();
         let (mut world, mut schedule) =
             crate::setup::initialize_world_from_master_data_with_topology(
@@ -13673,6 +13214,9 @@ pub(super) fn capture_race_behind(
 
 impl BoardScan {
     pub(super) fn collect_extended(world: &mut World, player_id: PlayerId) -> Option<Self> {
+        if !crate::ai::code_path::ext_enabled("v4/mod.rs::collect") {
+            return Self::collect(world, player_id);
+        }
         let map = Arc::new(world.get_resource::<Map>()?.clone());
         let unit_registry = world.get_resource::<UnitRegistry>()?.clone();
         let damage_chart = Arc::new(world.get_resource::<DamageChart>()?.clone());

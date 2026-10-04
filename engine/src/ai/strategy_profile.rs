@@ -24,7 +24,7 @@ pub enum V4StrategyProfile {
 }
 
 #[derive(Resource, Debug, Default)]
-pub struct V4StrategyProfileRegistry {
+pub(crate) struct V4StrategyProfileRegistry {
     profiles: std::collections::HashMap<crate::components::PlayerId, V4StrategyProfile>,
 }
 
@@ -47,7 +47,10 @@ pub fn profile_for(world: &mut World, player_id: crate::components::PlayerId) ->
 }
 
 /// 読み取り専用の経路では未初期化をStandardとして扱う。
-pub fn current_profile(world: &World, player_id: crate::components::PlayerId) -> V4StrategyProfile {
+pub(crate) fn current_profile(
+    world: &World,
+    player_id: crate::components::PlayerId,
+) -> V4StrategyProfile {
     world
         .get_resource::<V4StrategyProfileRegistry>()
         .and_then(|registry| registry.profiles.get(&player_id))
@@ -85,6 +88,7 @@ mod tests {
 
     #[test]
     fn profile_is_fixed_by_map_structure_not_by_turn_state() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let master_data = MasterDataRegistry::load().unwrap();
         for map_id in ["map_1", "map_2"] {
             let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(

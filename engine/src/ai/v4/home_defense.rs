@@ -618,6 +618,7 @@ mod tests {
 
     #[test]
     fn assigns_distinct_units_and_firing_cells_until_required_damage_is_covered() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut world = board();
         let first = unit(&mut world, PlayerId(1), UnitType::Tank, position(0, 1));
         let second = unit(&mut world, PlayerId(1), UnitType::Tank, position(0, 3));
@@ -648,6 +649,7 @@ mod tests {
 
     #[test]
     fn enemy_heading_to_a_closer_neutral_property_does_not_reserve_defenders() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut world = board();
         world
             .resource_mut::<Map>()
@@ -666,6 +668,7 @@ mod tests {
 
     #[test]
     fn an_indirect_unit_that_must_move_cannot_meet_a_current_turn_capture_deadline() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut world = board();
         let city = world
             .iter_entities()
@@ -685,6 +688,7 @@ mod tests {
 
     #[test]
     fn keeps_fighting_until_the_latest_defense_departure_turn() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut world = board();
         unit(&mut world, PlayerId(1), UnitType::Tank, position(0, 1));
         unit(&mut world, PlayerId(1), UnitType::Tank, position(0, 3));
@@ -715,6 +719,7 @@ mod tests {
 
     #[test]
     fn capture_units_keep_their_existing_capture_contracts() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut world = board();
         unit(&mut world, PlayerId(1), UnitType::Infantry, position(1, 2));
         unit(&mut world, PlayerId(2), UnitType::Infantry, position(4, 2));

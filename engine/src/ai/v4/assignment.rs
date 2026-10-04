@@ -348,6 +348,7 @@ mod tests {
 
     #[test]
     fn matches_dfs_oracle_on_randomized_matrices() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut rng = Xorshift(0x5DEE_CE66_D1B2_7F01);
         // オラクル（指数時間DFS）が現実的に回る n ≤ 8 に限定する。
         for n in 1..=8usize {
@@ -400,6 +401,7 @@ mod tests {
 
     #[test]
     fn returns_lexicographically_smallest_assignment_on_ties() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         // 全要素が同一コストなら、辞書順最小の [0, 1, 2] でなければならない。
         // ここが崩れると同点時に生産施設が変わり、下流の配備先まで変化する。
         let matrix = vec![vec![Some(7); 4], vec![Some(7); 4], vec![Some(7); 4]];
@@ -408,6 +410,7 @@ mod tests {
 
     #[test]
     fn prefers_smaller_total_cost_over_lexicographic_order() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         // 辞書順は総コストより優先されない。[0,1] は 10+10=20、[1,0] は 1+1=2。
         let matrix = vec![vec![Some(10), Some(1)], vec![Some(1), Some(10)]];
         assert_eq!(solve_min_cost_assignment(&matrix, 2), Some(vec![1, 0]));
@@ -415,12 +418,14 @@ mod tests {
 
     #[test]
     fn rejects_more_roles_than_facilities() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let matrix = vec![vec![Some(1)], vec![Some(1)]];
         assert_eq!(solve_min_cost_assignment(&matrix, 1), None);
     }
 
     #[test]
     fn rejects_row_without_any_usable_facility() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let matrix = vec![vec![Some(1), Some(2)], vec![None, None]];
         assert_eq!(solve_min_cost_assignment(&matrix, 2), None);
         assert_eq!(solve_by_dfs(&matrix, 2), None);
@@ -428,6 +433,7 @@ mod tests {
 
     #[test]
     fn rejects_when_forbidden_edges_block_a_complete_matching() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         // 2役割とも施設0しか使えないので、別施設への同時配置は不可能。
         // 禁止辺を大きな定数で代用していると、ここで誤って Some を返してしまう。
         let matrix = vec![vec![Some(1), None], vec![Some(1), None]];
@@ -437,6 +443,7 @@ mod tests {
 
     #[test]
     fn handles_empty_and_single_cell_matrices() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let empty: Vec<Vec<Option<u64>>> = Vec::new();
         assert_eq!(solve_min_cost_assignment(&empty, 3), Some(Vec::new()));
         assert_eq!(solve_by_dfs(&empty, 3), Some(Vec::new()));
@@ -450,6 +457,7 @@ mod tests {
 
     #[test]
     fn saturated_square_matrix_uses_every_facility() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         // m == n の飽和ケース。対角が明確に安いので一意に定まる。
         let matrix = vec![
             vec![Some(1), Some(9), Some(9)],
@@ -461,6 +469,7 @@ mod tests {
 
     #[test]
     fn stays_within_polynomial_operation_budget() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         // 全同値の 12×12。旧DFSは 12! ≈ 4.8e8 葉を走査しうるが、
         // 逐次最短路法は m·n² のオーダーに収まる。
         // 壁時計時間ではなく内部ループ回数で判定し、CIの不安定要因にしない。
@@ -478,6 +487,7 @@ mod tests {
 
     #[test]
     fn falls_back_to_dfs_when_composite_cost_overflows() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         // n^m が u128 を溢れる規模ではフォールバック経路に入る。
         // 施設数が旧DFSの u32 マスク上限を超えるため、panic せず None を返す。
         let n = 40usize;

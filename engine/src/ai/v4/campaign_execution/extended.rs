@@ -7,7 +7,7 @@
 use super::*;
 
 /// 生産完了Eventを島作戦の発注意図へ照合する。
-pub fn reconcile_campaign_production_system(
+pub(crate) fn reconcile_campaign_production_system(
     match_state: Res<crate::resources::MatchState>,
     mut produced: EventReader<UnitProducedEvent>,
     registry: Option<ResMut<V4CampaignExecutionRegistry>>,
@@ -27,52 +27,6 @@ pub fn reconcile_campaign_production_system(
 }
 
 impl V4CampaignExecutionRegistry {
-    /// 同じ手番の再探索を置換し、過去手番の未照合発注は遅延として確定する。
-    pub(crate) fn replace_turn_intents_extended(
-        &mut self,
-        player_id: PlayerId,
-        turn: u32,
-        intents: &[CampaignProductionIntent],
-    ) {
-        for record in self.records.iter_mut().filter(|record| {
-            record.player_id == player_id
-                && record.planned_turn < turn
-                && matches!(
-                    record.status,
-                    CampaignProductionStatus::Planned | CampaignProductionStatus::Issued
-                )
-        }) {
-            record.status = CampaignProductionStatus::Delayed;
-        }
-        self.records.retain(|record| {
-            record.player_id != player_id
-                || record.planned_turn != turn
-                || !matches!(
-                    record.status,
-                    CampaignProductionStatus::Planned | CampaignProductionStatus::Issued
-                )
-        });
-        for intent in intents {
-            let forming_slot = self.next_forming_slot;
-            self.next_forming_slot = self.next_forming_slot.saturating_add(1);
-            self.records.push(CampaignProductionRecord {
-                player_id,
-                planned_turn: turn,
-                island_id: intent.island_id,
-                role: intent.role,
-                mission_target: intent.mission_target,
-                facility_x: intent.command.target_x,
-                facility_y: intent.command.target_y,
-                unit_type: intent.command.unit_type,
-                status: CampaignProductionStatus::Planned,
-                forming_slot,
-                squad_id: None,
-                entity: None,
-                resolved_turn: None,
-            });
-        }
-    }
-
     /// 汎用V4生産が選んだCapture枠を、既存の島Campaign発注と競合させずに追記する。
     ///
     /// 陸続き前線のCaptureはRollingPlan側で生産候補を選ぶが、完成した歩兵まで
@@ -182,6 +136,7 @@ mod tests {
 
     #[test]
     fn produced_entity_keeps_its_campaign_island_until_assignment() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(2);
         let island = IslandId(3);
         let command = ProduceUnitCommand {
@@ -227,55 +182,8 @@ mod tests {
     }
 
     #[test]
-    fn produced_campaign_entity_resolves_its_forming_squad_slot() {
-        let player = PlayerId(2);
-        let island = IslandId(3);
-        let command = ProduceUnitCommand {
-            player_id: player,
-            target_x: 4,
-            target_y: 5,
-            unit_type: UnitType::Infantry,
-        };
-        let mut registry = V4CampaignExecutionRegistry::default();
-        registry.replace_turn_intents(
-            player,
-            2,
-            &[CampaignProductionIntent {
-                command: command.clone(),
-                island_id: island,
-                role: CampaignProductionRole::Capture,
-                mission_target: None,
-            }],
-        );
-        registry.mark_issued(player, 2, &command);
-        let entity = Entity::from_raw(42);
-        registry.assign_produced(
-            &UnitProducedEvent {
-                player_id: player,
-                target_x: 4,
-                target_y: 5,
-                unit_type: UnitType::Infantry,
-                entity,
-            },
-            2,
-        );
-        let mut manager = SquadManager::default();
-
-        registry.resolve_produced_slot(entity, &mut manager);
-
-        let record = registry.records_for(player, island)[0];
-        let squad_id = record.squad_id.expect("Campaign slotをSquadへ解決する");
-        assert!(record.forming_slot < registry.next_forming_slot);
-        assert!(manager.squads.iter().any(|squad| {
-            squad.id == squad_id
-                && squad.mission_type == MissionType::Capture
-                && squad.target_island == Some(island)
-                && squad.members.contains(&entity)
-        }));
-    }
-
-    #[test]
     fn appended_rolling_capture_intent_keeps_campaign_ownership_until_squad_resolution() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(2);
         let island = IslandId(3);
         let mission_target = GridPosition { x: 8, y: 2 };
@@ -350,6 +258,7 @@ mod tests {
 
     #[test]
     fn explicit_capture_target_upgrades_an_identical_campaign_order() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(2);
         let island = IslandId(3);
         let mission_target = GridPosition { x: 8, y: 2 };
@@ -389,6 +298,7 @@ mod tests {
 
     #[test]
     fn unproduced_previous_turn_order_is_classified_as_delayed() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(2);
         let island = IslandId(3);
         let command = ProduceUnitCommand {

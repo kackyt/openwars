@@ -213,8 +213,8 @@ fn analyze_strategy_internal(
     cached_campaign: Option<IslandCampaignPortfolio>,
     reserved_entities: &HashSet<Entity>,
 ) -> ProductionStrategy {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
+    // 小規模マップのV4は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended_at("strategy.rs::analyze_strategy_internal") {
         return extended::analyze_strategy_internal(
             world,
             player_id,

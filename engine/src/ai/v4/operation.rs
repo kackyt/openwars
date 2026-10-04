@@ -136,10 +136,6 @@ pub fn acquisition_mode(facts: &OperationFacts) -> AcquisitionMode {
 /// 依存順は 占領枠 → 戦闘計画 → 輸送枠 → 迎撃枠。
 /// 輸送枠は前段で決まった搭載対象数から導出されるため最後段に近い位置にある。
 pub fn derive_slots(facts: &OperationFacts) -> OperationSlots {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::derive_slots(facts);
-    }
     // --- 占領枠：拠点を面で押さえるため、対象拠点数から既に向かっている占領ユニットを引く ---
     let capture_units = facts
         .target_property_count
@@ -268,8 +264,6 @@ mod tests {
     /// 期限内に到着できる敵増援だけを局地脅威へ加える
     #[test]
     fn combat_plan_required_accounts_for_enemy_reinforcement() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut facts = base_facts();
         facts.enemy_combat_units = 0;
         facts.enemy_reinforcement_funds = 2000;
@@ -407,8 +401,3 @@ mod tests {
         assert_eq!(slots.deficit_ratio(SlotKind::Combat, &filled), 0.0);
     }
 }
-
-// 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
-mod extended;
-#[allow(unused_imports)]
-pub use self::extended::*;

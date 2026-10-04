@@ -12,6 +12,14 @@ pub(super) fn analyze_strategy_internal(
     cached_campaign: Option<IslandCampaignPortfolio>,
     reserved_entities: &HashSet<Entity>,
 ) -> ProductionStrategy {
+    if !crate::ai::code_path::ext_enabled("strategy.rs::analyze_strategy_internal") {
+        return super::analyze_strategy_internal(
+            world,
+            player_id,
+            cached_campaign,
+            reserved_entities,
+        );
+    }
     let mut strategy = ProductionStrategy::default();
 
     let mut unowned_properties = Vec::new();

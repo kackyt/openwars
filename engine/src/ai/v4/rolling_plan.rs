@@ -309,8 +309,8 @@ struct SimulationCatalog {
 
 impl SimulationCatalog {
     fn new(input: &RollingPlanInput) -> Self {
-        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended() {
+        // 小規模マップのV4は extended 側の実装を使う。
+        if crate::ai::code_path::is_extended_at("v4/rolling_plan.rs::new") {
             return Self::new_extended(input);
         }
         let existing_units = input
@@ -367,8 +367,8 @@ impl SimulationCatalog {
 
 /// 現在観測した敵を排除できる混成パッケージを探索する。
 pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackagePlan> {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
+    // 小規模マップのV4は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended_at("v4/rolling_plan.rs::plan_force_package") {
         return extended::plan_force_package(input);
     }
     let catalog = SimulationCatalog::new(input);
@@ -518,10 +518,6 @@ fn fill_best_effort_current_screen(
     selected: ForcePackagePlan,
     search_turns: u32,
 ) -> ForcePackagePlan {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::fill_best_effort_current_screen(input, catalog, selected, search_turns);
-    }
     let mut purchases = selected.purchases.clone();
     let mut used_current_facilities = purchases
         .iter()
@@ -844,8 +840,8 @@ fn simulate_state_with_catalog(
     state: &SearchState,
     search_turns: u32,
 ) -> ForcePackagePlan {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
+    // 小規模マップのV4は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended_at("v4/rolling_plan.rs::simulate_state_with_catalog") {
         return extended::simulate_state_with_catalog(input, catalog, state, search_turns);
     }
     let purchases: Vec<_> = state
@@ -1088,8 +1084,8 @@ fn sim_friendly(
     source: &FriendlyPlanUnit,
     can_advance_to_enemy: bool,
 ) -> SimFriendly {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
+    // 小規模マップのV4は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended_at("v4/rolling_plan.rs::sim_friendly") {
         return extended::sim_friendly(input, source, can_advance_to_enemy);
     }
     let total_ammo = source
@@ -1246,17 +1242,8 @@ pub(crate) fn production_options(
     future_turns: u32,
     mut can_reach: impl FnMut(GridPosition, &UnitStats) -> bool,
 ) -> Vec<ProductionPlanOption> {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::production_options(
-            current_facilities,
-            future_facilities,
-            available_types,
-            master_data,
-            future_turns,
-            can_reach,
-        );
-    }
+    let allow_cargo =
+        crate::ai::code_path::is_extended_at("v4/rolling_plan.rs::production_options");
     let mut options = Vec::new();
     for build_turn in 0..future_turns {
         let facilities = if build_turn == 0 {
@@ -1267,7 +1254,7 @@ pub(crate) fn production_options(
         for (facility, terrain) in facilities {
             for (unit_type, stats) in available_types {
                 if stats.cost == 0
-                    || stats.max_cargo > 0
+                    || (!allow_cargo && stats.max_cargo > 0)
                     || !master_data.can_produce_unit(terrain.as_str(), *unit_type)
                     || !can_reach(*facility, stats)
                 {
@@ -1433,8 +1420,6 @@ mod tests {
 
     #[test]
     fn infeasible_plan_spends_an_idle_current_slot_before_late_purchases() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut input = input();
         input.current_funds = 8_500;
         Arc::make_mut(&mut input.damage_chart).insert_damage(
@@ -1530,8 +1515,6 @@ mod tests {
 
     #[test]
     fn occupation_uses_live_campaign_eta_instead_of_a_fixed_delay() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut input = input();
         input.capture_completion_turn = Some(7);
         input.required_capture_survivors = 1;
@@ -1556,8 +1539,6 @@ mod tests {
 
     #[test]
     fn combat_capturer_counts_once_as_a_surviving_occupation_unit() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut input = input();
         input.production_options.clear();
         input.existing_units = vec![FriendlyPlanUnit {
@@ -1597,8 +1578,6 @@ mod tests {
 
     #[test]
     fn losing_one_of_two_required_capturers_makes_the_plan_infeasible() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut input = input();
         input.production_options.clear();
         Arc::make_mut(&mut input.damage_chart).insert_damage(
@@ -1719,8 +1698,6 @@ mod tests {
 
     #[test]
     fn fixed_formation_uses_a_new_free_facility_without_changing_composition() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut input = input();
         let old_facility = GridPosition { x: 0, y: 0 };
         let new_facility = GridPosition { x: 2, y: 0 };
@@ -1776,8 +1753,6 @@ mod tests {
 
     #[test]
     fn schedule_compaction_does_not_steal_an_unprocessed_original_slot() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut input = input();
         let facility = GridPosition { x: 0, y: 0 };
         input.production_options = vec![
@@ -1842,8 +1817,6 @@ mod tests {
 
     #[test]
     fn schedule_compaction_preserves_funding_for_later_original_purchases() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut input = input();
         input.current_funds = 7_500;
         input.income_per_turn = 10_000;

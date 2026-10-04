@@ -6,122 +6,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-pub(super) fn requirement_for_assessment(
-    facts: &IslandCampaignFacts,
-    assessment: &mut crate::ai::island_campaign::IslandCampaignAssessment,
-) -> IslandCampaignRequirement {
-    // 未所有施設は互いに独立した占領対象なので、残数に応じて並行投入する。
-    let remaining_properties = facts
-        .neutral_properties
-        .saturating_add(facts.enemy_properties);
-    // 上陸・交戦中は1体撃破だけで占領能力を失わない最小2体を維持する。
-    let expedition_capture_units = remaining_properties.max(2);
-    match assessment.state {
-        IslandCampaignState::OpenNeutral
-            if assessment.decision == IslandCampaignDecision::Expand =>
-        {
-            let capture_budget = expedition_capture_units.saturating_mul(1_000);
-            let transport_units = expedition_capture_units.div_ceil(2);
-            let transport_budget = transport_units.saturating_mul(4_000);
-            IslandCampaignRequirement {
-                preferred_transport: Some(UnitType::TransportHelicopter),
-                transport_slots: expedition_capture_units,
-                capture_units: expedition_capture_units,
-                ground_combat_units: 0,
-                combat_units: 0,
-                total_budget: capture_budget.saturating_add(transport_budget),
-            }
-        }
-        IslandCampaignState::Secured if assessment.decision == IslandCampaignDecision::Secure => {
-            let capture_budget = remaining_properties.saturating_mul(1_000);
-            assessment.required_budget = capture_budget;
-            IslandCampaignRequirement {
-                // 現地要員は輸送不要。allocatorが遠隔要員を選んだ場合だけ実cargoから輸送を要求する。
-                preferred_transport: None,
-                transport_slots: 0,
-                capture_units: remaining_properties,
-                ground_combat_units: 0,
-                combat_units: 0,
-                total_budget: capture_budget,
-            }
-        }
-        IslandCampaignState::Threatened => {
-            let combat_units = facts.enemy_combat_units;
-            let capture_budget = remaining_properties.saturating_mul(1_000);
-            assessment.required_budget = capture_budget;
-            IslandCampaignRequirement {
-                preferred_transport: None,
-                transport_slots: 0,
-                // 接近脅威は未所有施設を放棄する理由ではない。既着の占領兵を
-                // assignmentへ残し、戦闘Entityとは独立して施設確保を続行する。
-                capture_units: remaining_properties,
-                ground_combat_units: 0,
-                combat_units,
-                total_budget: capture_budget,
-            }
-        }
-        IslandCampaignState::Contested if contested_is_competitive(facts) => {
-            let capture_budget = expedition_capture_units.saturating_mul(1_000);
-            // `Contest`は占領速度でまだ間に合うという判定であり、敵がいないという
-            // 意味ではない。占領要員だけを割り当てると、DAGの次区間に敵戦闘部隊が
-            // 残っている場合に歩兵だけが詰まり、首都作戦の前段そのものが停止する。
-            // 必要な実際の編成・購入数は下流の時系列Combat Planが盤面の交戦・到達
-            // 時間・損耗で決めるため、ここでは観測済み敵戦闘数を護衛枠として渡す。
-            let combat_units = facts.enemy_combat_units;
-            assessment.decision = IslandCampaignDecision::Contest;
-            assessment.decision_reason =
-                "占領競争の時間内に介入できるため作戦を継続する".to_owned();
-            IslandCampaignRequirement {
-                preferred_transport: None,
-                transport_slots: 0,
-                capture_units: expedition_capture_units,
-                ground_combat_units: 0,
-                combat_units,
-                total_budget: capture_budget,
-            }
-        }
-        IslandCampaignState::Contested => {
-            let capture_budget = expedition_capture_units.saturating_mul(1_000);
-            let combat_units = facts.enemy_combat_units;
-            assessment.decision = IslandCampaignDecision::Reinforce;
-            assessment.decision_reason =
-                "観測敵Entityを対象にターン別撃破計画を要求する".to_owned();
-            assessment.required_budget = capture_budget;
-            IslandCampaignRequirement {
-                preferred_transport: None,
-                transport_slots: 0,
-                capture_units: expedition_capture_units,
-                ground_combat_units: 0,
-                combat_units,
-                total_budget: capture_budget,
-            }
-        }
-        IslandCampaignState::EnemyHeld => {
-            let combat_units = facts.enemy_combat_units;
-            // 敵兵数・生産拠点・配置可能枠は島の実盤面を走査した後で確定する。
-            let capture_budget = expedition_capture_units.saturating_mul(1_000);
-            let total_budget = capture_budget;
-            assessment.required_budget = total_budget;
-            IslandCampaignRequirement {
-                preferred_transport: Some(UnitType::Lander),
-                transport_slots: expedition_capture_units,
-                capture_units: expedition_capture_units,
-                ground_combat_units: 0,
-                combat_units,
-                total_budget,
-            }
-        }
-        _ => IslandCampaignRequirement {
-            preferred_transport: None,
-            transport_slots: 0,
-            capture_units: 0,
-            ground_combat_units: 0,
-            combat_units: 0,
-            total_budget: 0,
-        },
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) fn candidate_target_position(
     map: &Map,
@@ -511,11 +395,16 @@ pub(super) fn collect_campaign_resource_pool(
 }
 
 /// 既存の実行任務へ予約済みのEntityを共有資源から除外して島嶼作戦を分析します。
-pub fn analyze_island_campaign_excluding(
+pub(crate) fn analyze_island_campaign_excluding(
     world: &mut World,
     player_id: PlayerId,
     reserved_entities: &HashSet<Entity>,
 ) -> IslandCampaignPortfolio {
+    if !crate::ai::code_path::ext_enabled(
+        "island_campaign_analysis.rs::analyze_island_campaign_excluding",
+    ) {
+        return super::analyze_island_campaign_excluding(world, player_id, reserved_entities);
+    }
     let facts = collect_island_campaign_facts(world, player_id);
     let map = world.resource::<Map>().clone();
     let island_map = world
@@ -962,6 +851,7 @@ mod tests {
 
     #[test]
     fn mirrored_land_fronts_choose_the_nearest_property_instead_of_coordinate_order() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let master_data = MasterDataRegistry::load().expect("master data should load");
         let map = Map::new(11, 1, Terrain::Plains, GridTopology::Square);
         let island = IslandMap::analyze(&map).islands.remove(0);
@@ -1022,6 +912,7 @@ mod tests {
 
     #[test]
     fn island_without_open_property_targets_only_a_live_ground_enemy() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let master_data = MasterDataRegistry::load().expect("master data should load");
         let player = PlayerId(1);
         let enemy = PlayerId(2);
@@ -1085,6 +976,7 @@ mod tests {
 
     #[test]
     fn local_capture_front_uses_assigned_unit_instead_of_distant_owned_property() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let master_data = MasterDataRegistry::load().expect("master data should load");
         let map = Map::new(11, 1, Terrain::Plains, GridTopology::Square);
         let island = IslandMap::analyze(&map).islands.remove(0);
@@ -1162,6 +1054,7 @@ mod tests {
 
     #[test]
     fn same_land_capital_front_does_not_retreat_to_the_capturer_position() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let master_data = MasterDataRegistry::load().expect("master data should load");
         let map = Map::new(11, 1, Terrain::Plains, GridTopology::Square);
         let island = IslandMap::analyze(&map).islands.remove(0);
@@ -1267,6 +1160,7 @@ mod tests {
 
     #[test]
     fn reconstructs_initial_state_for_every_island() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let master_data = MasterDataRegistry::load().expect("master data should load");
         let (mut world, _schedule) =
             crate::setup::initialize_world_from_master_data(&master_data, "map_1")
@@ -1348,55 +1242,5 @@ mod tests {
             .map(|assessment| (assessment.island_id, assessment.state))
             .collect();
         assert_eq!(v4_states, states);
-    }
-
-    #[test]
-    fn campaign_requirements_keep_one_parallel_capturer_per_unowned_property() {
-        let mut secured_facts = IslandCampaignFacts {
-            island_id: IslandId(0),
-            capturable_properties: 4,
-            strategic_production_sites: 0,
-            roi_production_sites: 0,
-            neutral_properties: 3,
-            friendly_properties: 1,
-            enemy_properties: 0,
-            friendly_units: 1,
-            enemy_units: 0,
-            friendly_combat_units: 1,
-            enemy_combat_units: 0,
-            friendly_arrival_eta: Some(0),
-            enemy_arrival_eta: None,
-            friendly_capture_eta: Some(1),
-            enemy_capture_eta: None,
-            transport_eta: Some(0),
-            capture_turns: 1,
-            island_income_per_turn: 4_000,
-            missing_expansion_package_cost: 0,
-            reachable: true,
-            has_unowned_properties: true,
-        };
-        let mut secure = assess_island(&secured_facts);
-        let secure_requirement = requirement_for_assessment(&secured_facts, &mut secure);
-        assert_eq!(secure.decision, IslandCampaignDecision::Secure);
-        assert_eq!(secure_requirement.capture_units, 3);
-        assert_eq!(secure_requirement.total_budget, 3_000);
-
-        secured_facts.enemy_arrival_eta = Some(1);
-        let mut threatened = assess_island(&secured_facts);
-        let threatened_requirement = requirement_for_assessment(&secured_facts, &mut threatened);
-        assert_eq!(threatened.decision, IslandCampaignDecision::Defend);
-        assert_eq!(threatened_requirement.capture_units, 3);
-        assert_eq!(threatened_requirement.total_budget, 3_000);
-
-        secured_facts.enemy_units = 1;
-        secured_facts.friendly_combat_units = 3;
-        secured_facts.enemy_combat_units = 2;
-        secured_facts.enemy_capture_eta = Some(2);
-        let mut contest = assess_island(&secured_facts);
-        let contest_requirement = requirement_for_assessment(&secured_facts, &mut contest);
-        assert_eq!(contest.decision, IslandCampaignDecision::Contest);
-        assert_eq!(contest_requirement.capture_units, 3);
-        assert_eq!(contest_requirement.combat_units, 2);
-        assert_eq!(contest_requirement.total_budget, 3_000);
     }
 }

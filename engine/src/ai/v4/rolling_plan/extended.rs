@@ -8,6 +8,9 @@ use super::*;
 
 /// 現在観測した敵を排除できる混成パッケージを探索する。
 pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackagePlan> {
+    if !crate::ai::code_path::ext_enabled("v4/rolling_plan.rs::plan_force_package") {
+        return super::plan_force_package(input);
+    }
     let catalog = SimulationCatalog::new(input);
     if input.enemies.is_empty() {
         let search_turns = input
@@ -229,94 +232,6 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
     Some(selected)
 }
 
-/// best-effort案の未使用current slotを、即時投入できる直接戦闘unitで埋める。
-pub(super) fn fill_best_effort_current_screen(
-    input: &RollingPlanInput,
-    catalog: &SimulationCatalog,
-    selected: ForcePackagePlan,
-    search_turns: u32,
-) -> ForcePackagePlan {
-    let mut purchases = selected.purchases.clone();
-    let mut used_current_facilities = purchases
-        .iter()
-        .filter(|purchase| purchase.build_turn == 0)
-        .map(|purchase| purchase.facility)
-        .collect::<HashSet<_>>();
-    let mut current_cost = purchases
-        .iter()
-        .filter(|purchase| purchase.build_turn == 0)
-        .map(|purchase| purchase.cost)
-        .fold(0_u32, u32::saturating_add);
-    let current_budget = input.current_funds;
-
-    let mut facilities = input
-        .production_options
-        .iter()
-        .filter(|option| option.purchase.build_turn == 0)
-        .map(|option| option.purchase.facility)
-        .collect::<Vec<_>>();
-    facilities.sort_unstable_by_key(|facility| (facility.y, facility.x));
-    facilities.dedup();
-
-    for facility in facilities {
-        if used_current_facilities.contains(&facility) {
-            continue;
-        }
-        let affordable = current_budget.saturating_sub(current_cost);
-        let candidate = input
-            .production_options
-            .iter()
-            .filter(|option| {
-                option.purchase.build_turn == 0
-                    && option.purchase.facility == facility
-                    && option.purchase.cost <= affordable
-                    && option.stats.min_range <= 1
-                    && !option.engageable_enemy_indices.is_empty()
-            })
-            .max_by_key(|option| {
-                let outgoing = option
-                    .engageable_enemy_indices
-                    .iter()
-                    .map(|index| {
-                        best_damage(
-                            &input.damage_chart,
-                            option.stats.unit_type,
-                            input.enemies[*index].stats.unit_type,
-                        )
-                    })
-                    .max()
-                    .unwrap_or_default();
-                let incoming = input
-                    .enemies
-                    .iter()
-                    .map(|enemy| {
-                        best_damage(
-                            &input.damage_chart,
-                            enemy.stats.unit_type,
-                            option.stats.unit_type,
-                        )
-                    })
-                    .max()
-                    .unwrap_or_default();
-                let exchange = outgoing.saturating_mul(100) / incoming.saturating_add(1);
-                (
-                    exchange,
-                    outgoing,
-                    std::cmp::Reverse(incoming),
-                    std::cmp::Reverse(option.purchase.cost),
-                )
-            });
-        let Some(candidate) = candidate else {
-            continue;
-        };
-        purchases.push(candidate.purchase);
-        used_current_facilities.insert(facility);
-        current_cost = current_cost.saturating_add(candidate.purchase.cost);
-    }
-
-    build_augmented_plan(input, catalog, selected, purchases, search_turns)
-}
-
 pub(super) fn update_best_feasible(
     input: &RollingPlanInput,
     best: &mut Option<ForcePackagePlan>,
@@ -360,6 +275,9 @@ pub(super) fn simulate_state_with_catalog(
     state: &SearchState,
     search_turns: u32,
 ) -> ForcePackagePlan {
+    if !crate::ai::code_path::ext_enabled("v4/rolling_plan.rs::simulate_state_with_catalog") {
+        return super::simulate_state_with_catalog(input, catalog, state, search_turns);
+    }
     let purchases: Vec<_> = state
         .option_indices
         .iter()
@@ -846,6 +764,9 @@ pub(super) fn sim_friendly(
     source: &FriendlyPlanUnit,
     can_advance_to_enemy: bool,
 ) -> SimFriendly {
+    if !crate::ai::code_path::ext_enabled("v4/rolling_plan.rs::sim_friendly") {
+        return super::sim_friendly(input, source, can_advance_to_enemy);
+    }
     let total_ammo = source
         .stats
         .max_ammo1
@@ -1013,60 +934,6 @@ pub(super) fn select_target(
         .map(|((_, _, _, _, _, _, _, index), profile)| (index, profile))
 }
 
-/// 生産可能施設から、現在手番と将来2手番分の離散的な生産slotを作る。
-pub(crate) fn production_options(
-    current_facilities: &[(GridPosition, Terrain)],
-    future_facilities: &[(GridPosition, Terrain)],
-    available_types: &[(UnitType, UnitStats)],
-    master_data: &crate::resources::master_data::MasterDataRegistry,
-    future_turns: u32,
-    mut can_reach: impl FnMut(GridPosition, &UnitStats) -> bool,
-) -> Vec<ProductionPlanOption> {
-    let mut options = Vec::new();
-    for build_turn in 0..future_turns {
-        let facilities = if build_turn == 0 {
-            current_facilities
-        } else {
-            future_facilities
-        };
-        for (facility, terrain) in facilities {
-            for (unit_type, stats) in available_types {
-                if stats.cost == 0
-                    || !master_data.can_produce_unit(terrain.as_str(), *unit_type)
-                    || !can_reach(*facility, stats)
-                {
-                    continue;
-                }
-                options.push(ProductionPlanOption {
-                    purchase: PlannedPurchase {
-                        facility: *facility,
-                        unit_type: *unit_type,
-                        build_turn,
-                        cost: stats.cost,
-                    },
-                    stats: stats.clone(),
-                    engageable_enemy_indices: Vec::new(),
-                    capture_target: None,
-                    capture_arrival_turn: None,
-                    capture_completion_turn: None,
-                    capture_durability: None,
-                    capture_blocking_enemy_index: None,
-                });
-            }
-        }
-    }
-    options.sort_by_key(|option| {
-        (
-            option.purchase.build_turn,
-            option.purchase.facility.y,
-            option.purchase.facility.x,
-            option.purchase.cost,
-            option.purchase.unit_type.as_str(),
-        )
-    });
-    options
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1166,6 +1033,7 @@ mod tests {
 
     #[test]
     fn indirect_fire_requires_an_off_factory_shot_after_direct_fire_saturates_the_target() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut input = input();
         // 中央の同じ敵へ直接部隊が二体集まり、一体分が余っているとする。ここでは、
         // 工場外から撃てる間接部隊が直接部隊の担当を置き換えず火力を増やせる。
@@ -1224,6 +1092,7 @@ mod tests {
 
     #[test]
     fn infeasible_plan_spends_an_idle_current_slot_before_late_purchases() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut input = input();
         input.current_funds = 8_500;
         Arc::make_mut(&mut input.damage_chart).insert_damage(
@@ -1294,6 +1163,7 @@ mod tests {
     /// 占領期限がある場合、兵種の移動力ではなくシミュレーション上の初撃時刻を優先する。
     #[test]
     fn deadline_fallback_prefers_earlier_simulated_interdiction() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut early = plan_force_package(&input()).unwrap();
         early.feasible = false;
         early.first_attack_turn = Some(1);
@@ -1317,6 +1187,7 @@ mod tests {
     /// 同じ初撃時刻なら、敵残HPをより削れる案（高い軍事成果）を優先する。
     #[test]
     fn deadline_fallback_prefers_lower_remaining_hp_after_equal_attack_turn() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut cheap = plan_force_package(&input()).unwrap();
         cheap.feasible = false;
         cheap.first_attack_turn = Some(1);
@@ -1337,6 +1208,7 @@ mod tests {
     /// 期限前の初撃が成立した案同士でも、敵残HPをより削れる案を優先する。
     #[test]
     fn sufficient_interdiction_prefers_higher_enemy_hp_reduction() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut early_expensive = plan_force_package(&input()).unwrap();
         early_expensive.feasible = false;
         early_expensive.first_attack_turn = Some(1);
@@ -1358,6 +1230,7 @@ mod tests {
     /// 同じ敵への一撃を複数物件の妨害として二重計上しない。
     #[test]
     fn interdiction_requires_a_legal_attack_for_every_distinct_contract() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut plan = plan_force_package(&input()).unwrap();
         plan.target_first_attack_turns = vec![Some(1), None];
         let deadlines = vec![(0, 2), (1, 3)];
@@ -1372,6 +1245,7 @@ mod tests {
 
     #[test]
     fn feasible_selection_prefers_a_plan_that_keeps_the_expected_overmatch_margin() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut without_margin = plan_force_package(&input()).unwrap();
         without_margin.production_cost = 7_500;
         without_margin.expected_loss = 0;
@@ -1392,6 +1266,7 @@ mod tests {
 
     #[test]
     fn dominated_candidate_in_the_same_production_slot_is_pruned() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut input = input();
         input.production_options.truncate(1);
         let dominated = ProductionPlanOption {
@@ -1419,6 +1294,7 @@ mod tests {
 
     #[test]
     fn capture_unit_attacks_blocker_then_completes_with_one_action_per_turn() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut input = input();
         input.production_options = vec![ProductionPlanOption {
             purchase: PlannedPurchase {
@@ -1483,6 +1359,7 @@ mod tests {
 
     #[test]
     fn occupation_uses_live_campaign_eta_instead_of_a_fixed_delay() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut input = input();
         input.capture_completion_turn = Some(7);
         input.required_capture_survivors = 1;
@@ -1507,6 +1384,7 @@ mod tests {
 
     #[test]
     fn combat_capturer_counts_once_as_a_surviving_occupation_unit() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut input = input();
         input.production_options.clear();
         input.existing_units = vec![FriendlyPlanUnit {
@@ -1546,6 +1424,7 @@ mod tests {
 
     #[test]
     fn losing_one_of_two_required_capturers_makes_the_plan_infeasible() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut input = input();
         input.production_options.clear();
         Arc::make_mut(&mut input.damage_chart).insert_damage(
@@ -1590,6 +1469,7 @@ mod tests {
 
     #[test]
     fn fixed_formation_uses_a_new_free_facility_without_changing_composition() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut input = input();
         let old_facility = GridPosition { x: 0, y: 0 };
         let new_facility = GridPosition { x: 2, y: 0 };
@@ -1645,6 +1525,7 @@ mod tests {
 
     #[test]
     fn schedule_compaction_does_not_steal_an_unprocessed_original_slot() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut input = input();
         let facility = GridPosition { x: 0, y: 0 };
         input.production_options = vec![
@@ -1709,6 +1590,7 @@ mod tests {
 
     #[test]
     fn schedule_compaction_preserves_funding_for_later_original_purchases() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut input = input();
         input.current_funds = 7_500;
         input.income_per_turn = 10_000;
@@ -1788,6 +1670,7 @@ mod tests {
 
     #[test]
     fn property_plan_prefers_two_cleared_lanes_over_one_clear_and_extra_capturer() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let input = input();
         let mut one_clear = plan_force_package(&input).expect("比較元の作戦案");
         one_clear.feasible = false;
@@ -1837,6 +1720,7 @@ mod tests {
 
     #[test]
     fn property_plan_prefers_earlier_joint_arrival_over_earlier_damage_only() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let input = input();
         let mut fast_arrival = plan_force_package(&input).expect("快速案");
         fast_arrival.feasible = false;
@@ -1868,6 +1752,7 @@ mod tests {
 
     #[test]
     fn opening_package_rejects_an_affordable_idle_factory() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let input = input();
         let first_facility = GridPosition { x: 0, y: 0 };
         let second_facility = GridPosition { x: 1, y: 0 };
@@ -1911,6 +1796,7 @@ mod tests {
 
     #[test]
     fn opening_constraints_are_owned_by_the_small_map_pipeline() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut input = input();
         assert!(!uses_small_map_opening_rules(&input));
 
@@ -1923,6 +1809,7 @@ mod tests {
 
     #[test]
     fn property_front_selects_two_unit_breakthrough_and_three_capture_lanes() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut input = input();
         input.production_options.clear();
         input.production_attack_projections.clear();
@@ -2005,6 +1892,7 @@ mod tests {
 
     #[test]
     fn property_control_bounds_many_factory_combinations_before_simulation() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         assert_eq!(
             property_control_state_limit(5),
             MANY_FACTORY_PROPERTY_STATE_LIMIT
@@ -2086,6 +1974,7 @@ mod tests {
 
     #[test]
     fn property_frontier_preserves_fast_screen_profile_before_damage_rank() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut input = input();
         input.production_options.clear();
         input.production_attack_projections.clear();
@@ -2169,6 +2058,7 @@ mod tests {
 
     #[test]
     fn small_map_frontier_keeps_earlier_capture_over_stronger_late_capture() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut input = input();
         input.opening_policy = OpeningProductionPolicy::SmallMapExpansion;
         input.required_capture_survivors = 1;
@@ -5273,57 +5163,6 @@ pub(super) fn production_option_dominates(
     matchup_not_worse && strictly_better
 }
 
-/// 即時screenを優先した結果、将来収入で払えなくなった最遠の予定だけを外し、
-/// 残った購入列を実評価して返す。
-pub(super) fn build_augmented_plan(
-    input: &RollingPlanInput,
-    catalog: &SimulationCatalog,
-    selected: ForcePackagePlan,
-    mut purchases: Vec<PlannedPurchase>,
-    search_turns: u32,
-) -> ForcePackagePlan {
-    while !funding_suffices(input, &purchases) {
-        let Some((index, _)) = purchases
-            .iter()
-            .enumerate()
-            .filter(|(_, purchase)| purchase.build_turn > 0)
-            .max_by_key(|(_, purchase)| purchase.build_turn)
-        else {
-            return selected;
-        };
-        purchases.remove(index);
-    }
-
-    let mut indexed = Vec::with_capacity(purchases.len());
-    for purchase in &purchases {
-        let Some(index) = input
-            .production_options
-            .iter()
-            .position(|option| option.purchase == *purchase)
-        else {
-            return selected;
-        };
-        indexed.push(index);
-    }
-    let state = SearchState {
-        option_indices: indexed,
-        used_slots: purchases
-            .iter()
-            .copied()
-            .map(ProductionSlot::from)
-            .collect(),
-        used_capture_targets: HashSet::new(),
-        cost: purchases
-            .iter()
-            .map(|purchase| purchase.cost)
-            .fold(0_u32, u32::saturating_add),
-    };
-    let mut augmented = simulate_state_with_catalog(input, catalog, &state, search_turns);
-    augmented.candidates_considered = selected.candidates_considered;
-    augmented.search_truncated = selected.search_truncated;
-    augmented
-}
-
 /// 期限付き目標の fallback 比較。
 ///
 /// 全滅が期限内に成立しない場合でも、実際の初撃が早く、同じ初撃時刻なら敵HPを
@@ -5744,6 +5583,9 @@ impl ForcePackagePlan {
 
 impl SimulationCatalog {
     pub(super) fn new_extended(input: &RollingPlanInput) -> Self {
+        if !crate::ai::code_path::ext_enabled("v4/rolling_plan.rs::new") {
+            return Self::new(input);
+        }
         let existing_units = input
             .existing_units
             .iter()

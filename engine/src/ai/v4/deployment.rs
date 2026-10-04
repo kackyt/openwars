@@ -181,8 +181,8 @@ impl V4DeploymentRegistry {
         turn: u32,
         orders: impl IntoIterator<Item = PendingDeployment>,
     ) {
-        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended() {
+        // 小規模マップのV4は extended 側の実装を使う。
+        if crate::ai::code_path::is_extended_at("v4/deployment.rs::replace_turn_orders") {
             return self.replace_turn_orders_extended(player_id, turn, orders);
         }
         self.pending
@@ -259,10 +259,6 @@ impl V4DeploymentRegistry {
         &self,
         player_id: PlayerId,
     ) -> HashMap<Entity, ActiveTargetAssignment> {
-        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended() {
-            return self.active_target_assignments_extended(player_id);
-        }
         self.assigned
             .values()
             .filter(|deployment| deployment.intent.player_id == player_id && deployment.active)
@@ -348,10 +344,6 @@ impl V4DeploymentRegistry {
         &mut self,
         plan_ids: &HashSet<super::plan_revision::PlanId>,
     ) {
-        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended() {
-            return self.release_closed_plans_extended(plan_ids);
-        }
         if plan_ids.is_empty() {
             return;
         }
@@ -488,10 +480,6 @@ impl V4DeploymentRegistry {
         attacker: Entity,
         target: Entity,
     ) {
-        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended() {
-            return self.assign_target_for_test_extended(player_id, attacker, target);
-        }
         self.assigned.insert(
             attacker,
             AssignedDeployment {
@@ -543,8 +531,6 @@ pub fn reconcile_pending_deployments_system(
     match_state: Res<MatchState>,
     mut registry: ResMut<V4DeploymentRegistry>,
 ) {
-    // システムは手番の外で動くため、main互換版は経路を明示する。
-    let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
     let turn = match_state.current_turn_number.0;
     for event in events.read() {
         registry.assign_produced(event, turn);
@@ -848,8 +834,8 @@ pub(crate) fn prepare_deployment_squads(
     player_id: PlayerId,
     higher_priority_reserved: &HashSet<Entity>,
 ) -> HashSet<Entity> {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
+    // 小規模マップのV4は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended_at("v4/deployment.rs::prepare_deployment_squads") {
         return extended::prepare_deployment_squads(
             world,
             manager,
@@ -1377,8 +1363,6 @@ mod tests {
 
     #[test]
     fn local_retarget_does_not_leave_the_operation_island() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut world = World::new();
         let mut map = Map::new(7, 1, Terrain::Plains, GridTopology::Square);
         map.set_terrain(2, 0, Terrain::Sea).unwrap();
@@ -1476,8 +1460,6 @@ mod tests {
 
     #[test]
     fn islandless_target_must_be_interceptable_by_the_assigned_unit() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut world = World::new();
         let mut map = Map::new(7, 1, Terrain::Plains, GridTopology::Square);
         for x in 2..7 {

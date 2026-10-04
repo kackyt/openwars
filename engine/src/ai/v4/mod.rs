@@ -292,10 +292,6 @@ fn issue_planned_production(
     turn: u32,
     planned: Option<PlannedProduction>,
 ) -> Vec<ProduceUnitCommand> {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::issue_planned_production(world, turn, planned);
-    }
     let Some(planned) = planned else {
         return Vec::new();
     };
@@ -377,8 +373,8 @@ impl std::ops::Deref for PlannedProduction {
 /// `decide_production` から `AiVersion::uses_operation_driven_production()` が
 /// true のときだけ委譲される。V1/V2/V3 の経路には一切影響しない。
 pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<ProduceUnitCommand> {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
+    // 小規模マップのV4は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended_at("v4/mod.rs::decide_production_v4") {
         return extended::decide_production_v4(world, player_id);
     }
     let turn = world
@@ -619,10 +615,6 @@ fn decide_campaign_production_v4(
     world: &mut World,
     player_id: PlayerId,
 ) -> CampaignProductionControl {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::decide_campaign_production_v4(world, player_id);
-    }
     let turn = world
         .get_resource::<crate::resources::MatchState>()
         .map_or(0, |state| state.current_turn_number.0);
@@ -840,8 +832,8 @@ struct CampaignPlanningObjective {
 
 impl BoardScan {
     fn collect(world: &mut World, player_id: PlayerId) -> Option<Self> {
-        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended() {
+        // 小規模マップのV4は extended 側の実装を使う。
+        if crate::ai::code_path::is_extended_at("v4/mod.rs::collect") {
             return Self::collect_extended(world, player_id);
         }
         let map = Arc::new(world.get_resource::<Map>()?.clone());
@@ -1486,17 +1478,17 @@ fn facility_lead_time(scan: &BoardScan, anchor: &GridPosition, movement: u32) ->
         .unwrap_or(u32::MAX)
 }
 
-fn operation_threat_horizon(kind: OperationKind, deploy_lead_time: u32) -> u32 {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::operation_threat_horizon(kind, deploy_lead_time);
-    }
+pub(super) fn operation_threat_horizon(kind: OperationKind, deploy_lead_time: u32) -> u32 {
+    let capital_search_turns =
+        if crate::ai::code_path::is_extended_at("v4/mod.rs::operation_threat_horizon") {
+            CAPTURE_COMPLETION_TURNS
+        } else {
+            rolling_plan::DEFAULT_SEARCH_TURNS
+        };
     match kind {
         OperationKind::Defense => DEFENSE_THREAT_ETA,
         OperationKind::Capture => deploy_lead_time.saturating_add(CAPTURE_COMPLETION_TURNS),
-        OperationKind::AssaultCapital => {
-            deploy_lead_time.saturating_add(rolling_plan::DEFAULT_SEARCH_TURNS)
-        }
+        OperationKind::AssaultCapital => deploy_lead_time.saturating_add(capital_search_turns),
     }
 }
 
@@ -2003,15 +1995,6 @@ fn plan_production(
     allow_structural_slots: bool,
     committed_combat_assignments: &HashMap<Entity, deployment::ActiveTargetAssignment>,
 ) -> (Vec<PlannedProduction>, ProductionPlanTrace) {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::plan_production(
-            scan,
-            player_id,
-            allow_structural_slots,
-            committed_combat_assignments,
-        );
-    }
     let mut registry = V4RollingPlanRegistry::default();
     plan_production_with_registry(
         scan,
@@ -2727,18 +2710,6 @@ fn fastest_observed_counter(
     enemy_contact_turn: u32,
     reserved_slots: &HashSet<(u32, GridPosition)>,
 ) -> Option<ReinforcementContingency> {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::fastest_observed_counter(
-            scan,
-            ctx,
-            anchor,
-            enemy,
-            counter_build_turn,
-            enemy_contact_turn,
-            reserved_slots,
-        );
-    }
     scan.production_facilities
         .iter()
         .flat_map(|(facility, terrain)| {
@@ -3175,8 +3146,8 @@ fn most_starved_slot(operations: &[Operation]) -> Option<(usize, SlotKind)> {
 /// 生産枠の実効優先度。すべて同じ作戦集合で比較し、別枠の緊急作戦は作らない。
 /// Defenseは敵接触ETAと展開リードタイムから優先度を上げるが、必要枠だけを取得する。
 fn operation_priority_rank(operation: &Operation) -> u32 {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
+    // 小規模マップのV4は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended_at("v4/mod.rs::operation_priority_rank") {
         return extended::operation_priority_rank(operation);
     }
     let defense_cannot_wait = operation.kind == OperationKind::Defense
@@ -3198,8 +3169,8 @@ fn operation_priority_rank(operation: &Operation) -> u32 {
 
 /// 指定した段階の中で最も飢えた枠を返す。
 fn most_starved_in_tier(operations: &[Operation], tier: SlotTier) -> Option<(usize, SlotKind)> {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
+    // 小規模マップのV4は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended_at("v4/mod.rs::most_starved_in_tier") {
         return extended::most_starved_in_tier(operations, tier);
     }
     let mut best: Option<(usize, SlotKind, u32, f32, usize)> = None;
@@ -3252,10 +3223,6 @@ fn record_fill(
     kind: SlotKind,
     candidate: &SlotCandidate,
 ) {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::record_fill(scan, _ctx, op, kind, candidate);
-    }
     let cargo = scan
         .available_types
         .iter()
@@ -3726,8 +3693,6 @@ mod tests {
 
     #[test]
     fn campaign_objective_is_the_only_capture_source_and_keeps_exact_anchor() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut scan = multi_factory_scan();
         let campaign_anchor = pos(8, 2);
         scan.campaign_objectives = vec![CampaignPlanningObjective {
@@ -3757,8 +3722,6 @@ mod tests {
 
     #[test]
     fn capital_objective_keeps_local_front_as_an_independent_operation() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut scan = multi_factory_scan();
         let local_anchor = pos(6, 2);
         let capital = pos(8, 2);
@@ -3887,8 +3850,6 @@ mod tests {
     /// 既存Combat 1体を複数前線の撃破要求から同時に控除してはならない。
     #[test]
     fn existing_combat_sorties_are_committed_to_only_one_operation() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let infantry = UnitStats {
             can_capture: true,
             movement_type: MovementType::Infantry,
@@ -3989,8 +3950,6 @@ mod tests {
 
     #[test]
     fn existing_combat_entity_is_credited_only_to_its_own_persistent_plan() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let own_entity = Entity::from_raw(900);
         let foreign_entity = Entity::from_raw(901);
         let legacy_entity = Entity::from_raw(902);
@@ -4013,8 +3972,6 @@ mod tests {
 
     #[test]
     fn combat_plan_projects_only_the_capturer_ordered_this_turn() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut scan = mixed_threat_multi_factory_scan();
         let anchor = pos(6, 2);
         let second_front = pos(7, 2);
@@ -4068,8 +4025,6 @@ mod tests {
     /// 敵施設の生産余力も、期限内に到着できる最寄りの1作戦だけへ計上する。
     #[test]
     fn enemy_reinforcement_funds_is_local_unique_and_deadline_bounded() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut scan = multi_factory_scan();
         scan.enemy_income = 6000;
         scan.enemy_production_slots = 1;
@@ -4100,8 +4055,6 @@ mod tests {
 
     #[test]
     fn unauthorized_capital_formation_does_not_hide_reinforcements_from_capture() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut scan = multi_factory_scan();
         scan.enemy_income = 6_000;
         scan.enemy_production_slots = 1;
@@ -4154,8 +4107,6 @@ mod tests {
 
     #[test]
     fn enemy_reinforcement_assessment_places_each_purchase_on_the_time_axis() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut scan = multi_factory_scan();
         scan.enemy_income = 1_000;
         scan.enemy_production_slots = 1;
@@ -4377,8 +4328,6 @@ mod tests {
     /// Combat計画は購入価格ではなく、期限内の具体的な攻撃列で充足する。
     #[test]
     fn combat_plan_does_not_treat_purchase_price_as_destroyed_enemy_value() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let infantry = UnitStats {
             can_capture: true,
             movement_type: MovementType::Infantry,
@@ -4568,8 +4517,6 @@ mod tests {
     /// 輸送枠の要求が減らないまま揚陸艇を延々と買い増すラチェットになる。
     #[test]
     fn transports_are_ledgered_by_delivery_ability_not_proximity() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let scan = strait_scan();
         let mut ctx = ReachCtx::default();
         let reference = UnitStats {
@@ -4608,8 +4555,6 @@ mod tests {
 
     #[test]
     fn loaded_enemy_transport_on_another_island_is_a_future_arrival() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut scan = strait_scan();
         scan.enemy_units.push(UnitSnapshot {
             entity: Some(Entity::from_raw(700)),
@@ -4655,8 +4600,6 @@ mod tests {
 
     #[test]
     fn empty_enemy_transport_does_not_create_anti_air_demand_on_every_island() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut scan = strait_scan();
         scan.enemy_units.push(UnitSnapshot {
             entity: Some(Entity::from_raw(700)),
@@ -4829,8 +4772,6 @@ mod tests {
     /// キャンペーンの予約超過分は、構造枠を二重購入せず、自力展開可能な対敵戦力へ使う。
     #[test]
     fn campaign_surplus_targets_enemy_infantry_without_buying_stranded_tank() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut map = flat_map(9, 3);
         for y in 0..map.height {
             map.set_terrain(4, y, Terrain::Sea).unwrap();
@@ -4964,8 +4905,6 @@ mod tests {
     /// 診断そのものが無意味になるため、記録専用であるという不変条件をここで固定する。
     #[test]
     fn production_trace_attributes_every_command_to_a_slot() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let scan = multi_factory_scan();
         let (commands, trace) = plan_production(&scan, PlayerId(0), true, &HashMap::new());
 
@@ -5012,8 +4951,6 @@ mod tests {
     /// 届けられない作戦地点の台帳には載せない（二重計上の歯止め）
     #[test]
     fn transports_are_not_ledgered_for_unreachable_anchors() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut scan = strait_scan();
         // 接岸できる地形を消すと、艦船は対岸へ陸上ユニットを降ろせなくなる
         scan.map = strait_map(None).into();
@@ -5099,8 +5036,6 @@ mod tests {
     /// 前線の分類はmap名ではなく、占領可能unitの実到達性だけで決める。
     #[test]
     fn direct_front_uses_operation_production_while_strait_keeps_transport_campaign() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         use crate::ai::island_campaign::{IslandCampaignDecision, IslandCampaignShortfall};
         use crate::ai::islands::IslandId;
 
@@ -5202,8 +5137,6 @@ mod tests {
 
     #[test]
     fn defense_urgency_raises_normal_operation_priority_without_deleting_capital() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut capital = operation(
             OperationKind::AssaultCapital,
             OperationSlots {

@@ -919,15 +919,6 @@ fn reserve_candidate(
     catalog: &HashMap<Entity, CampaignUnitCandidate>,
     allow_future_budget_reservation: bool,
 ) -> Option<(IslandCampaignAssignment, CampaignResourcePool)> {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::reserve_candidate(
-            candidate,
-            pool,
-            catalog,
-            allow_future_budget_reservation,
-        );
-    }
     // 候補ごとのcloneへ全予約を適用し、完全編成を賄えない場合は元poolを一切変更しない。
     let mut provisional = pool.clone();
     let island_id = candidate.assessment.island_id;

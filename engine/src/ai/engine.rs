@@ -631,10 +631,6 @@ pub fn decide_ai_action(
     player_id: PlayerId,
     skip_entities: &std::collections::HashSet<Entity>,
 ) -> Option<(Entity, AiCommand)> {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::decide_ai_action(world, player_id, skip_entities);
-    }
     // 1. 行動可能なユニットを収集
     let mut movable_units = Vec::new();
     let mut unit_positions = HashMap::new();
@@ -1670,7 +1666,7 @@ pub fn execute_ai_turn_v1(world: &mut World, active_player: PlayerId) -> Option<
 /// 新しいAI (V2) のメイン実行ループ。
 /// 最初のステップで部隊再編成とビーム探索をキャッシュし、毎ステップ1アクションずつ実行します。
 pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<String> {
-    // 手番の入口で実装経路を確定する。標準マップのV4だけがmain互換経路を使う。
+    // 手番の入口で実装経路を確定する。小規模マップのV4だけが拡張経路を使う。
     let path = crate::ai::code_path::for_player(world, active_player);
     let _code_path = crate::ai::code_path::enter(path);
     if path == crate::ai::code_path::CodePath::Extended {
@@ -2034,8 +2030,8 @@ fn decide_forming_campaign_site_relief(
     skip_entities: &HashSet<Entity>,
     include_active_missions: bool,
 ) -> Option<(Entity, AiCommand)> {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
+    // 小規模マップのV4は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended_at("engine.rs::decide_forming_campaign_site_relief") {
         return extended::decide_forming_campaign_site_relief(
             world,
             player_id,
@@ -2319,7 +2315,7 @@ enum ActionPriority {
 }
 
 #[derive(Debug, Clone)]
-struct CampaignActionContext {
+pub(crate) struct CampaignActionContext {
     owner: crate::ai::operation_assignment::OperationOwner,
     island_id: crate::ai::islands::IslandId,
     mission_type: crate::ai::squad::MissionType,
@@ -2331,16 +2327,12 @@ struct CampaignActionContext {
 /// V4のEntityは正本registryが指す具体Squadだけから行動方針を受け取る。
 /// Squad全件を行動候補ごとに走査せず、Entity→割当を平均O(1)で引いた後に
 /// concrete SquadIdを一度だけ解決する。
-fn campaign_action_context(
+pub(crate) fn campaign_action_context(
     world: &World,
     player_id: PlayerId,
     entity: Entity,
     manager: &crate::ai::squad::SquadManager,
 ) -> Result<Option<CampaignActionContext>, ()> {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::campaign_action_context(world, player_id, entity, manager);
-    }
     if crate::ai::resolve_player_ai_version(world, player_id)
         != crate::ai::ai_version::AiVersion::V4
     {
@@ -2363,11 +2355,20 @@ fn campaign_action_context(
     let Some(squad) = manager.squads.iter().find(|squad| squad.id == squad_id) else {
         return Err(());
     };
+    // 首都攻略DAGの外側では地域への入口へ進むが、地域内ではControl/Captureの
+    // 指令に従う。`Some(None)`はanchor直行を止めて局地戦術へ任せる明示値であり、
+    // その場合に古いSquad目標へフォールバックしてはならない。
+    let target = if crate::ai::code_path::is_extended_at("engine.rs::campaign_action_context") {
+        crate::ai::v4::capital_route_tactical_target(world, player_id, entity)
+            .unwrap_or(squad.target)
+    } else {
+        squad.target
+    };
     Ok(Some(CampaignActionContext {
         owner: assignment.owner,
         island_id,
         mission_type: squad.mission_type.clone(),
-        target: squad.target,
+        target,
         departure_authorized: squad.departure_authorized,
     }))
 }
@@ -2401,10 +2402,6 @@ pub fn decide_ai_action_v2(
     player_id: PlayerId,
     skip_entities: &std::collections::HashSet<Entity>,
 ) -> Option<(Entity, AiCommand)> {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::decide_ai_action_v2(world, player_id, skip_entities);
-    }
     // V3 の戦術評価 (#44/#45/#50) を有効にするかどうか
     let is_v3 = crate::ai::resolve_player_ai_version(world, player_id).uses_v3_tactics();
 
@@ -5545,8 +5542,6 @@ mod tests {
 
     #[test]
     fn v2_v3_transport_executor_skips_foreign_owned_squads() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         for version in [
             crate::ai::ai_version::AiVersion::V2,
             crate::ai::ai_version::AiVersion::V3,

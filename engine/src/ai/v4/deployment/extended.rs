@@ -7,7 +7,7 @@
 use super::*;
 
 /// 実際に生産されたEntityをpending deploymentへ照合する。
-pub fn reconcile_pending_deployments_system(
+pub(crate) fn reconcile_pending_deployments_system(
     mut events: EventReader<UnitProducedEvent>,
     match_state: Res<MatchState>,
     mut registry: ResMut<V4DeploymentRegistry>,
@@ -190,6 +190,14 @@ pub(crate) fn prepare_deployment_squads(
     player_id: PlayerId,
     higher_priority_reserved: &HashSet<Entity>,
 ) -> HashSet<Entity> {
+    if !crate::ai::code_path::ext_enabled("v4/deployment.rs::prepare_deployment_squads") {
+        return super::prepare_deployment_squads(
+            world,
+            manager,
+            player_id,
+            higher_priority_reserved,
+        );
+    }
     let mut registry = world
         .remove_resource::<V4DeploymentRegistry>()
         .unwrap_or_default();
@@ -346,6 +354,7 @@ mod tests {
 
     #[test]
     fn produced_entity_resolves_the_forming_squad_slot_immediately() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let player = PlayerId(1);
         let mut registry = V4DeploymentRegistry::default();
         registry.replace_turn_orders(player, 3, [pending(0)]);
@@ -484,6 +493,7 @@ mod tests {
 
     #[test]
     fn capture_slot_releases_entity_once_anchor_is_already_owned() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let (mut world, attacker, _, _, _) = deployment_world();
         let anchor = GridPosition { x: 5, y: 0 };
         // 占領スロットのanchor物件は既に自軍所有になっている。
@@ -513,6 +523,7 @@ mod tests {
 
     #[test]
     fn capture_slot_keeps_capture_mission_while_anchor_is_not_owned() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let (mut world, attacker, _, _, _) = deployment_world();
         let anchor = GridPosition { x: 5, y: 0 };
         world.spawn((anchor, Property::new(Terrain::City, None, 20)));
@@ -539,6 +550,7 @@ mod tests {
 
     #[test]
     fn first_assignment_keeps_the_production_planners_target_order() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let (mut world, attacker, planned, _, anchor_nearest) = deployment_world();
         world
             .resource_mut::<V4DeploymentRegistry>()
@@ -560,6 +572,7 @@ mod tests {
 
     #[test]
     fn local_retarget_does_not_leave_the_operation_island() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut world = World::new();
         let mut map = Map::new(7, 1, Terrain::Plains, GridTopology::Square);
         map.set_terrain(2, 0, Terrain::Sea).unwrap();
@@ -663,6 +676,7 @@ mod tests {
 
     #[test]
     fn islandless_target_must_be_interceptable_by_the_assigned_unit() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let mut world = World::new();
         let mut map = Map::new(7, 1, Terrain::Plains, GridTopology::Square);
         for x in 2..7 {
@@ -854,6 +868,9 @@ impl V4DeploymentRegistry {
         turn: u32,
         orders: impl IntoIterator<Item = PendingDeployment>,
     ) {
+        if !crate::ai::code_path::ext_enabled("v4/deployment.rs::replace_turn_orders") {
+            return self.replace_turn_orders(player_id, turn, orders);
+        }
         self.pending
             .retain(|pending| pending.player_id != player_id || pending.turn != turn);
         // 同一手番の再計画で未発行slotを残すと、取り消された生産先へ後続Eventを
@@ -935,126 +952,6 @@ impl V4DeploymentRegistry {
             reservation.entity = Some(event.entity);
         }
         forming_slot
-    }
-
-    /// Combat見積で既存戦力として数えてよいEntityと、その実任務の対象を返す。
-    ///
-    /// Entityだけを返すと、1機を複数の島作戦へ同時に計上できてしまう。生産時の
-    /// 優先敵と現在の再目標を併せて返し、対象敵が属する1作戦だけへ参加させる。
-    pub(crate) fn active_target_assignments_extended(
-        &self,
-        player_id: PlayerId,
-    ) -> HashMap<Entity, ActiveTargetAssignment> {
-        self.assigned
-            .values()
-            .filter(|deployment| deployment.intent.player_id == player_id && deployment.active)
-            .map(|deployment| {
-                let mut targets = deployment
-                    .intent
-                    .priority_enemies
-                    .iter()
-                    .copied()
-                    .collect::<HashSet<_>>();
-                targets.extend(deployment.current_target);
-                (
-                    deployment.entity,
-                    ActiveTargetAssignment {
-                        plan_id: deployment.intent.plan_step.map(|step| step.plan_id),
-                        slot_kind: deployment.intent.slot_kind,
-                        targets,
-                    },
-                )
-            })
-            .collect()
-    }
-
-    /// 完了・撤回された計画の局地任務保護を解除し、上位防衛や汎用任務へ返す。
-    pub(crate) fn release_closed_plans_extended(
-        &mut self,
-        plan_ids: &HashSet<super::super::plan_revision::PlanId>,
-    ) {
-        if plan_ids.is_empty() {
-            return;
-        }
-        let released_slots = self
-            .pending
-            .iter()
-            .filter(|pending| {
-                pending
-                    .plan_step
-                    .is_some_and(|step| plan_ids.contains(&step.plan_id))
-            })
-            .filter_map(|pending| pending.forming_slot)
-            .collect::<HashSet<_>>();
-        self.pending.retain(|pending| {
-            pending
-                .plan_step
-                .is_none_or(|step| !plan_ids.contains(&step.plan_id))
-        });
-        self.forming_slots.retain(|slot, reservation| {
-            !released_slots.contains(slot) || reservation.entity.is_some()
-        });
-        for deployment in self.assigned.values_mut() {
-            if deployment
-                .intent
-                .plan_step
-                .is_some_and(|step| plan_ids.contains(&step.plan_id))
-            {
-                deployment.active = false;
-                deployment.current_target = None;
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn assign_target_for_test_extended(
-        &mut self,
-        player_id: PlayerId,
-        attacker: Entity,
-        target: Entity,
-    ) {
-        self.assigned.insert(
-            attacker,
-            AssignedDeployment {
-                entity: attacker,
-                intent: PendingDeployment {
-                    player_id,
-                    turn: 1,
-                    order: 0,
-                    facility: GridPosition { x: 0, y: 0 },
-                    unit_type: UnitType::Fighter,
-                    anchor: GridPosition { x: 0, y: 0 },
-                    staging_anchor: GridPosition { x: 0, y: 0 },
-                    posture: DeploymentPosture::Execute,
-                    slot_kind: SlotKind::Combat,
-                    priority_enemies: vec![target],
-                    threat_horizon: 1,
-                    forecast: DeploymentForecast::default(),
-                    plan_step: None,
-                    forming_slot: None,
-                    operation_binding: None,
-                },
-                squad_id: None,
-                current_target: Some(target),
-                active: true,
-                assigned_turn: 1,
-                attack_count: 0,
-                priority_attack_count: 0,
-                mission_target_attack_count: 0,
-                mission_target_kill_count: 0,
-                mission_target_damage_value_dealt: 0,
-                mission_target_counter_value_received: 0,
-                mission_target_destroyed_value: 0,
-                mission_target_first_attack_turn: None,
-                capture_unit_attack_count: 0,
-                transport_unit_attack_count: 0,
-                kill_count: 0,
-                damage_value_dealt: 0,
-                counter_value_received: 0,
-                destroyed_value: 0,
-                first_attack_turn: None,
-            },
-        );
     }
 
     /// 生産完了直後に予約slotを実Squadへ解決する。

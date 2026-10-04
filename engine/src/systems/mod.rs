@@ -18,7 +18,7 @@ pub use supply::*;
 pub use transport::*;
 pub use turn_management::*;
 
-use crate::ai::code_path::{has_main_compatible_v4, has_no_main_compatible_v4};
+use crate::ai::code_path::{has_extended_v4, has_no_extended_v4};
 use bevy_ecs::schedule::{IntoSystemConfigs, Schedule, SystemSet};
 
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
@@ -35,15 +35,15 @@ pub fn add_main_game_systems(schedule: &mut Schedule) {
             // V4台帳のイベント処理はmain互換版と拡張版の一方だけを動かす。
             (
                 crate::ai::v4::deployment::reconcile_pending_deployments_system
-                    .run_if(has_main_compatible_v4),
+                    .run_if(has_no_extended_v4),
                 crate::ai::v4::deployment::extended::reconcile_pending_deployments_system
-                    .run_if(has_no_main_compatible_v4),
+                    .run_if(has_extended_v4),
             ),
             (
                 crate::ai::v4::campaign_execution::reconcile_campaign_production_system
-                    .run_if(has_main_compatible_v4),
+                    .run_if(has_no_extended_v4),
                 crate::ai::v4::campaign_execution::extended::reconcile_campaign_production_system
-                    .run_if(has_no_main_compatible_v4),
+                    .run_if(has_extended_v4),
             ),
             move_unit_system,
             attack_unit_system,
@@ -58,9 +58,9 @@ pub fn add_main_game_systems(schedule: &mut Schedule) {
             wait_unit_system,
             (
                 crate::ai::v4::victory_roadmap::audit_victory_roadmap_system
-                    .run_if(has_main_compatible_v4),
+                    .run_if(has_no_extended_v4),
                 crate::ai::v4::victory_roadmap::extended::audit_victory_roadmap_system
-                    .run_if(has_no_main_compatible_v4),
+                    .run_if(has_extended_v4),
             ),
             undo_move_system,
             next_phase_system,

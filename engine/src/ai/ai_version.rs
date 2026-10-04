@@ -36,6 +36,11 @@ impl AiVersion {
         matches!(self, AiVersion::V3 | AiVersion::V4)
     }
 
+    /// 敵生産マスの封鎖はV4だけが候補にする。標準経路ではこの追加評価を呼ばない。
+    pub(crate) fn uses_enemy_production_blockade(&self) -> bool {
+        matches!(self, AiVersion::V4)
+    }
+
     /// 作戦駆動の生産計画（V4）を使うかどうか。
     /// V1/V2/V3 はベースラインとして従来の生産ロジックを維持する。
     pub fn uses_operation_driven_production(&self) -> bool {
@@ -131,11 +136,11 @@ mod tests {
 
     #[test]
     fn v4_inherits_v3_tactics_and_owns_operation_production() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         // V4 は戦術評価を V3 から継承し、生産だけを作戦駆動へ差し替える。
         assert!(AiVersion::V4.uses_v3_tactics());
         assert!(AiVersion::V4.uses_operation_driven_production());
+        assert!(AiVersion::V4.uses_enemy_production_blockade());
+        assert!(!AiVersion::V3.uses_enemy_production_blockade());
         // 過去バージョンは作戦駆動生産を使わないベースラインのまま。
         assert!(!AiVersion::V3.uses_operation_driven_production());
         assert!(!AiVersion::V2.uses_operation_driven_production());
@@ -177,8 +182,3 @@ mod tests {
         assert!(!AiVersion::V200.uses_operation_driven_production());
     }
 }
-
-// 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
-mod extended;
-#[allow(unused_imports)]
-pub use self::extended::*;

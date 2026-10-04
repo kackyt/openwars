@@ -69,10 +69,6 @@ impl V4CampaignExecutionRegistry {
         turn: u32,
         intents: &[CampaignProductionIntent],
     ) {
-        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended() {
-            return self.replace_turn_intents_extended(player_id, turn, intents);
-        }
         for record in self.records.iter_mut().filter(|record| {
             record.player_id == player_id
                 && record.planned_turn < turn
@@ -199,8 +195,6 @@ pub fn reconcile_campaign_production_system(
     mut produced: EventReader<UnitProducedEvent>,
     registry: Option<ResMut<V4CampaignExecutionRegistry>>,
 ) {
-    // システムは手番の外で動くため、main互換版は経路を明示する。
-    let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
     let Some(mut registry) = registry else {
         return;
     };
@@ -216,8 +210,6 @@ mod tests {
 
     #[test]
     fn produced_entity_keeps_its_campaign_island_until_assignment() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let player = PlayerId(2);
         let island = IslandId(3);
         let command = ProduceUnitCommand {
@@ -264,8 +256,6 @@ mod tests {
 
     #[test]
     fn unproduced_previous_turn_order_is_classified_as_delayed() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let player = PlayerId(2);
         let island = IslandId(3);
         let command = ProduceUnitCommand {

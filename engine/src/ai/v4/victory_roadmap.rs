@@ -246,8 +246,8 @@ impl VictoryRoadmapRegistry {
         &self,
         player_id: PlayerId,
     ) -> Option<(IslandId, GridPosition)> {
-        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended() {
+        // 小規模マップのV4は extended 側の実装を使う。
+        if crate::ai::code_path::is_extended_at("v4/victory_roadmap.rs::active_capital_objective") {
             return self.active_capital_objective_extended(player_id);
         }
         self.operations
@@ -460,10 +460,6 @@ impl VictoryRoadmapRegistry {
         turn: u32,
         reason: &str,
     ) {
-        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended() {
-            return self.block_pending_step_extended(entity, pending, turn, reason);
-        }
         let detail = format!(
             "planned {:?} for Entity {} at turn {} was not completed: {}",
             pending.step,
@@ -524,16 +520,6 @@ impl VictoryRoadmapRegistry {
         enemy_capital_island: Option<IslandId>,
         enemy_unit_count: usize,
     ) -> VictoryRoadmapId {
-        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended() {
-            return self.ensure_roadmap_extended(
-                player_id,
-                turn,
-                enemy_capital,
-                enemy_capital_island,
-                enemy_unit_count,
-            );
-        }
         if let Some(roadmap) = self.roadmaps.get_mut(&player_id) {
             roadmap.last_observed_turn = turn;
             roadmap.enemy_capital = enemy_capital;
@@ -577,8 +563,8 @@ impl VictoryRoadmapRegistry {
         capital: GridPosition,
         owned: bool,
     ) -> StrategicOperationId {
-        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended() {
+        // 小規模マップのV4は extended 側の実装を使う。
+        if crate::ai::code_path::is_extended_at("v4/victory_roadmap.rs::ensure_capital_objective") {
             return self.ensure_capital_objective_extended(
                 roadmap_id, player_id, turn, island_id, capital, owned,
             );
@@ -670,8 +656,8 @@ impl VictoryRoadmapRegistry {
         owned_properties: &HashSet<GridPosition>,
         phase: OperationPhase,
     ) -> StrategicOperationId {
-        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended() {
+        // 小規模マップのV4は extended 側の実装を使う。
+        if crate::ai::code_path::is_extended_at("v4/victory_roadmap.rs::reconcile_assignment") {
             return self.reconcile_assignment_extended(
                 roadmap_id,
                 player_id,
@@ -1105,19 +1091,6 @@ fn diagnose_operation_execution(
     persistent_combat_entities: &HashSet<Entity>,
     production_records: &[crate::ai::v4::campaign_execution::CampaignProductionRecord],
 ) -> Vec<OperationIssue> {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::diagnose_operation_execution(
-            world,
-            manager,
-            player_id,
-            turn,
-            assignment,
-            previous_entities,
-            persistent_combat_entities,
-            production_records,
-        );
-    }
     use crate::ai::v4::campaign_execution::{CampaignProductionRole, CampaignProductionStatus};
 
     let current_entities = assignment
@@ -1274,19 +1247,6 @@ fn diagnose_operation_recoveries(
     persistent_combat_entities: &HashSet<Entity>,
     production_records: &[crate::ai::v4::campaign_execution::CampaignProductionRecord],
 ) -> Vec<OperationRecoveryAction> {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::diagnose_operation_recoveries(
-            world,
-            manager,
-            player_id,
-            turn,
-            assignment,
-            previous_issues,
-            persistent_combat_entities,
-            production_records,
-        );
-    }
     use crate::ai::v4::campaign_execution::{CampaignProductionRole, CampaignProductionStatus};
 
     let assigned_entities = assignment
@@ -1733,8 +1693,8 @@ pub(crate) fn reconcile_campaign_roadmap(
     portfolio: &IslandCampaignPortfolio,
     manager: &SquadManager,
 ) {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
+    // 小規模マップのV4は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended_at("v4/victory_roadmap.rs::reconcile_campaign_roadmap") {
         return extended::reconcile_campaign_roadmap(world, player_id, portfolio, manager);
     }
     let turn = world
@@ -2201,8 +2161,6 @@ pub fn audit_victory_roadmap_system(
     >,
     operation_assignments: Option<ResMut<crate::ai::operation_assignment::UnitOperationRegistry>>,
 ) {
-    // システムは手番の外で動くため、main互換版は経路を明示する。
-    let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
     let turn = match_state.current_turn_number.0;
     for event in moved.read() {
         if let Some(island_map) = island_map.as_deref() {
@@ -2461,8 +2419,6 @@ mod tests {
 
     #[test]
     fn operation_identity_does_not_depend_on_enemy_entity_or_anchor() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let player = PlayerId(1);
         let island = IslandId(2);
         let assignment = IslandCampaignAssignment {

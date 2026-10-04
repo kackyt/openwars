@@ -845,8 +845,6 @@ mod tests {
 
     #[test]
     fn test_v3_multi_cargo_invasion_loads_transits_and_lands() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let master_data = MasterDataRegistry::load().unwrap();
         let (mut world, mut schedule) =
             crate::setup::initialize_world_from_master_data(&master_data, "map_1").unwrap();

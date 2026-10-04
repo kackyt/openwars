@@ -183,10 +183,6 @@ pub struct ProductionPlanTrace {
 impl ProductionPlanTrace {
     /// 作戦が立たなかったターンの記録を作る。
     pub fn new(player_id: PlayerId, funds: u32, free_facility_count: usize) -> Self {
-        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended() {
-            return Self::new_extended(player_id, funds, free_facility_count);
-        }
         Self {
             enemy_production_forecast: Default::default(),
             player_id,
@@ -205,10 +201,6 @@ impl ProductionPlanTrace {
     /// 実際に発注されたユニット種別ごとの体数。
     /// 「工場数 × ターン数に張り付いていないか」の判定に使う。
     pub fn produced_counts(&self) -> HashMap<UnitType, usize> {
-        // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended() {
-            return self.produced_counts_extended();
-        }
         let mut counts = HashMap::new();
         for step in &self.steps {
             if let ProductionDecision::Produced { unit_type, .. } = &step.decision {
@@ -325,7 +317,16 @@ mod tests {
     }
 }
 
-// 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
-mod extended;
-#[allow(unused_imports)]
-pub use self::extended::*;
+/// 敵の実生産観測から作る、次手番1回分の予測と既済予測の誤差。
+///
+/// 予測は現在の必須戦力や資金予約には使わない。まず対戦ログで誤差を測り、
+/// 予測器が追随できていることを確認するための診断値である。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EnemyProductionForecastTrace {
+    pub expected_units_next_turn: u32,
+    pub expected_cost_next_turn: u32,
+    pub dominant_unit_type: Option<UnitType>,
+    pub evaluated_samples: u32,
+    pub mean_absolute_unit_error: u32,
+    pub mean_absolute_cost_error: u32,
+}

@@ -1423,10 +1423,6 @@ fn requirement_for_assessment(
     facts: &IslandCampaignFacts,
     assessment: &mut crate::ai::island_campaign::IslandCampaignAssessment,
 ) -> IslandCampaignRequirement {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
-        return extended::requirement_for_assessment(facts, assessment);
-    }
     // 未所有施設は互いに独立した占領対象なので、残数に応じて並行投入する。
     let remaining_properties = facts
         .neutral_properties
@@ -2146,8 +2142,10 @@ pub fn analyze_island_campaign_excluding(
     player_id: PlayerId,
     reserved_entities: &HashSet<Entity>,
 ) -> IslandCampaignPortfolio {
-    // 拡張経路（小規模マップ戦略・非V4）は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended() {
+    // 小規模マップのV4は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended_at(
+        "island_campaign_analysis.rs::analyze_island_campaign_excluding",
+    ) {
         return extended::analyze_island_campaign_excluding(world, player_id, reserved_entities);
     }
     let facts = collect_island_campaign_facts(world, player_id);
@@ -2489,8 +2487,6 @@ mod tests {
 
     #[test]
     fn mirrored_land_fronts_choose_the_nearest_property_instead_of_coordinate_order() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let master_data = MasterDataRegistry::load().expect("master data should load");
         let map = Map::new(11, 1, Terrain::Plains, GridTopology::Square);
         let island = IslandMap::analyze(&map).islands.remove(0);
@@ -2763,8 +2759,6 @@ mod tests {
 
     #[test]
     fn reconstructs_initial_state_for_every_island() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let master_data = MasterDataRegistry::load().expect("master data should load");
         let (mut world, _schedule) =
             crate::setup::initialize_world_from_master_data(&master_data, "map_1")
@@ -4075,8 +4069,6 @@ mod tests {
 
     #[test]
     fn campaign_requirements_keep_one_parallel_capturer_per_unowned_property() {
-        let _code_path =
-            crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         let mut secured_facts = IslandCampaignFacts {
             island_id: IslandId(0),
             capturable_properties: 4,
