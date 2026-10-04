@@ -2023,6 +2023,20 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     None
 }
 
+/// 指定座標に、自軍以外が所有する（または中立の）占領可能物件があるか。
+pub(super) fn has_capturable_property_at(
+    world: &World,
+    position: GridPosition,
+    player_id: PlayerId,
+) -> bool {
+    world.iter_entities().any(|entity_ref| {
+        entity_ref.get::<GridPosition>().copied() == Some(position)
+            && entity_ref.get::<Property>().is_some_and(|property| {
+                property.max_capture_points > 0 && property.owner_id != Some(player_id)
+            })
+    })
+}
+
 /// Forming中または割当待ちの空輸送役が自軍生産施設を塞いだ場合、隣へ退避する。
 fn decide_forming_campaign_site_relief(
     world: &mut World,
@@ -2030,16 +2044,12 @@ fn decide_forming_campaign_site_relief(
     skip_entities: &HashSet<Entity>,
     include_active_missions: bool,
 ) -> Option<(Entity, AiCommand)> {
-    // 小規模マップのV4は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended_at("engine.rs::decide_forming_campaign_site_relief") {
-        return extended::decide_forming_campaign_site_relief(
-            world,
-            player_id,
-            skip_entities,
-            include_active_missions,
-        );
-    }
     use crate::ai::squad::{MissionPhase, MissionType, SquadManager};
+
+    // 拡張経路では、首都攻略DAGの指令先・セル列と、退避先での占領開始を加える。
+    // 退避対象の収集・候補順・通常の退避先選択は両経路で共通。
+    let is_extended_path =
+        crate::ai::code_path::is_extended_at("engine.rs::decide_forming_campaign_site_relief");
 
     let map = world.get_resource::<Map>()?.clone();
     let registry = world.get_resource::<MasterDataRegistry>()?.clone();
@@ -2121,9 +2131,20 @@ fn decide_forming_campaign_site_relief(
                             || squad.departure_authorized)
                 })
                 .map(|squad| {
+                    // 通常executorより先に工場を空ける場合も、DAG orderがあれば
+                    // 古いSquad.targetではなく現在Nodeの指令先を使う。
+                    let route_target = is_extended_path
+                        .then(|| {
+                            squad.members.iter().find_map(|entity| {
+                                crate::ai::v4::capital_route_tactical_target(
+                                    world, player_id, *entity,
+                                )
+                            })
+                        })
+                        .flatten();
                     (
                         squad.members.iter().copied().collect::<Vec<_>>(),
-                        squad.target,
+                        route_target.unwrap_or(squad.target),
                     )
                 }),
         );
@@ -2247,27 +2268,53 @@ fn decide_forming_campaign_site_relief(
                 stats.unit_type,
                 &registry,
             );
-            let destination = reachable
-                .iter()
-                .copied()
-                .filter(|tile| *tile != (position.x, position.y))
-                .filter(|tile| !occupied.contains(tile))
-                .filter(|tile| !production_positions.contains(tile))
-                .min_by_key(|(x, y)| {
-                    let target_distance =
-                        mission_target.map_or(0, |target| map.distance(*x, *y, target.x, target.y));
-                    let group_distance = group_positions.iter().fold(0_u32, |total, member| {
-                        total.saturating_add(map.distance(*x, *y, member.x, member.y))
-                    });
-                    (target_distance, group_distance, *y, *x)
-                });
+            let is_valid_destination = |tile: &(usize, usize)| {
+                *tile != (position.x, position.y)
+                    && !occupied.contains(tile)
+                    && !production_positions.contains(tile)
+            };
+            // V4のDAG所属unitは、工場退避でも同じセル列を進む。単なる目標距離で
+            // 選ぶと、map_25で敵側Nodeとは逆の旧Squad.targetへ初手だけ逸脱する。
+            let route_destination = is_extended_path
+                .then(|| {
+                    crate::ai::v4::capital_route_advance_destination(
+                        world, player_id, *entity, &reachable,
+                    )
+                })
+                .flatten()
+                .map(|target| (target.x, target.y))
+                .filter(is_valid_destination);
+            let destination = route_destination.or_else(|| {
+                reachable
+                    .iter()
+                    .copied()
+                    .filter(is_valid_destination)
+                    .min_by_key(|(x, y)| {
+                        let target_distance = mission_target
+                            .map_or(0, |target| map.distance(*x, *y, target.x, target.y));
+                        let group_distance = group_positions.iter().fold(0_u32, |total, member| {
+                            total.saturating_add(map.distance(*x, *y, member.x, member.y))
+                        });
+                        (target_distance, group_distance, *y, *x)
+                    })
+            });
             if let Some((x, y)) = destination {
-                return Some((
-                    *entity,
-                    AiCommand::Wait {
-                        target_pos: GridPosition { x, y },
-                    },
-                ));
+                let target_pos = GridPosition { x, y };
+                // 拡張経路では、退避先が占領可能な物件ならその場で占領を始める。
+                // 首都攻略DAGの占領許可（capital_route_allows_capture_at）は旧拡張実装も
+                // 確認していない。退避は生産口を空ける行動であり、追加すると拡張経路の
+                // 挙動が変わるため、要否は別途の比較で判断する。
+                let starts_capture = is_extended_path
+                    && world
+                        .get::<UnitStats>(*entity)
+                        .is_some_and(|stats| stats.can_capture)
+                    && has_capturable_property_at(world, target_pos, player_id);
+                let command = if starts_capture {
+                    AiCommand::Capture { target_pos }
+                } else {
+                    AiCommand::Wait { target_pos }
+                };
+                return Some((*entity, command));
             }
         }
     }
@@ -3700,8 +3747,9 @@ mod tests {
         assert_ne!(target_pos, GridPosition { x: 1, y: 0 });
     }
 
-    #[test]
-    fn stalled_attack_unit_vacates_factory_toward_its_mission() {
+    /// 工場(1,0)上で停滞したAttack任務の歩兵と、任務目標(3,0)を持つ盤面を作る。
+    /// `neutral_city_at_target` がtrueなら、目標(3,0)に中立都市を置く。
+    fn stalled_attack_world(neutral_city_at_target: bool) -> (World, PlayerId, Entity) {
         let player = PlayerId(1);
         let mut world = setup_v3_test_world(3, crate::ai::ai_version::AiVersion::V4);
         world.insert_resource(Map {
@@ -3756,6 +3804,18 @@ mod tests {
         squad.target = Some(GridPosition { x: 3, y: 0 });
         squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
         world.insert_resource(manager);
+        if neutral_city_at_target {
+            world.spawn((
+                GridPosition { x: 3, y: 0 },
+                Property::new(Terrain::City, None, 100),
+            ));
+        }
+        (world, player, attacker)
+    }
+
+    #[test]
+    fn stalled_attack_unit_vacates_factory_toward_its_mission() {
+        let (mut world, player, attacker) = stalled_attack_world(false);
 
         assert!(
             decide_forming_campaign_site_relief(&mut world, player, &HashSet::new(), false)
@@ -3771,6 +3831,31 @@ mod tests {
             panic!("生産施設からの退避は移動Waitであること");
         };
         assert_eq!(target_pos, GridPosition { x: 3, y: 0 });
+    }
+
+    #[test]
+    fn factory_relief_starts_capture_only_on_extended_path() {
+        // 退避先(3,0)が中立都市のとき、通常経路は移動Waitのまま、
+        // 拡張経路は退避と同時に占領を始める（F01の経路差を固定する）。
+        for (path, expects_capture) in [
+            (crate::ai::code_path::CodePath::MainCompatible, false),
+            (crate::ai::code_path::CodePath::Extended, true),
+        ] {
+            let _guard = crate::ai::code_path::enter(path);
+            let (mut world, player, attacker) = stalled_attack_world(true);
+            let (entity, command) =
+                decide_forming_campaign_site_relief(&mut world, player, &HashSet::new(), true)
+                    .expect("停滞したAttack unitは工場を退避する");
+
+            assert_eq!(entity, attacker);
+            let target_pos = GridPosition { x: 3, y: 0 };
+            let is_expected = if expects_capture {
+                matches!(command, AiCommand::Capture { target_pos: pos } if pos == target_pos)
+            } else {
+                matches!(command, AiCommand::Wait { target_pos: pos } if pos == target_pos)
+            };
+            assert!(is_expected, "{path:?}: {command:?}");
+        }
     }
 
     #[test]

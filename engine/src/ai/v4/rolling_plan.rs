@@ -1084,10 +1084,14 @@ fn sim_friendly(
     source: &FriendlyPlanUnit,
     can_advance_to_enemy: bool,
 ) -> SimFriendly {
-    // 小規模マップのV4は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended_at("v4/rolling_plan.rs::sim_friendly") {
-        return extended::sim_friendly(input, source, can_advance_to_enemy);
-    }
+    // 保護完了時刻は、保護契約の生存を予測する拡張経路のモデルだけが使う。
+    // 通常経路は従来どおり保護期限を持たない戦力として初期化する。
+    let protection_completion_turn =
+        if crate::ai::code_path::is_extended_at("v4/rolling_plan.rs::sim_friendly") {
+            source.protection_completion_turn
+        } else {
+            None
+        };
     let total_ammo = source
         .stats
         .max_ammo1
@@ -1167,7 +1171,7 @@ fn sim_friendly(
     SimFriendly {
         purchase: None,
         capture_contract: None,
-        protection_completion_turn: None,
+        protection_completion_turn,
         survived_protection_completion: None,
         stats: source.stats.clone(),
         hp: source.hp,
@@ -1511,6 +1515,33 @@ mod tests {
         input.production_options.truncate(1);
         let plan = plan_force_package(&input).unwrap();
         assert!(plan.first_attack_turn.is_some_and(|turn| turn >= 3));
+    }
+
+    #[test]
+    fn sim_friendly_keeps_protection_deadline_only_on_extended_path() {
+        // 保護完了時刻は、保護契約を予測する拡張経路だけがsimulation unitへ渡す
+        // （F17の経路差を固定する）。
+        let input = input();
+        let source = FriendlyPlanUnit {
+            protection_completion_turn: Some(4),
+            stats: UnitStats {
+                unit_type: UnitType::Infantry,
+                can_capture: true,
+                ..UnitStats::mock()
+            },
+            position: GridPosition { x: 8, y: 0 },
+            hp: 100,
+            available_turn: 0,
+            engageable_enemy_indices: Vec::new(),
+        };
+        for (path, expected) in [
+            (crate::ai::code_path::CodePath::MainCompatible, None),
+            (crate::ai::code_path::CodePath::Extended, Some(4)),
+        ] {
+            let _guard = crate::ai::code_path::enter(path);
+            let simulated = sim_friendly(&input, &source, false);
+            assert_eq!(simulated.protection_completion_turn, expected, "{path:?}");
+        }
     }
 
     #[test]

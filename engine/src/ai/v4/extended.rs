@@ -3026,86 +3026,6 @@ pub(super) fn planned_deployment(
     })
 }
 
-/// 生産枠の実効優先度。すべて同じ作戦集合で比較し、別枠の緊急作戦は作らない。
-/// Defenseは敵接触ETAと展開リードタイムから優先度を上げるが、必要枠だけを取得する。
-pub(super) fn operation_priority_rank(operation: &Operation) -> u32 {
-    if !crate::ai::code_path::ext_enabled("v4/mod.rs::operation_priority_rank") {
-        return super::operation_priority_rank(operation);
-    }
-    let defense_cannot_wait = operation.kind == OperationKind::Defense
-        && operation.facts.enemy_combat_units > 0
-        && operation.facts.enemy_contact_eta
-            <= operation.facts.deploy_lead_time.max(1).saturating_add(1);
-    let property_control_cannot_wait = !operation.property_controls.is_empty();
-    match (
-        operation.kind,
-        operation.execution_authorized,
-        defense_cannot_wait,
-        property_control_cannot_wait,
-    ) {
-        (OperationKind::Defense, _, true, _) => 0,
-        // 敵の完了時刻を過ぎると消滅する局地案だけを、首都本隊の編成より先に通す。
-        // 通常Captureや成立不能なRecaptureは従来どおり首都作戦を追い越さない。
-        (OperationKind::Capture, _, _, true) => 1,
-        (OperationKind::AssaultCapital, true, _, _) => 2,
-        (OperationKind::Defense, _, false, _) => 3,
-        (OperationKind::Capture, _, _, false) => 4,
-        (OperationKind::AssaultCapital, false, _, _) => 5,
-    }
-}
-
-/// 指定した段階の中で最も飢えた枠を返す。
-pub(super) fn most_starved_in_tier(
-    operations: &[Operation],
-    tier: SlotTier,
-) -> Option<(usize, SlotKind)> {
-    if !crate::ai::code_path::ext_enabled("v4/mod.rs::most_starved_in_tier") {
-        return super::most_starved_in_tier(operations, tier);
-    }
-    let mut best: Option<(usize, SlotKind, u32, f32, usize)> = None;
-    for (index, op) in operations.iter().enumerate() {
-        for (priority, kind) in SLOT_PRIORITY.iter().enumerate() {
-            if tier == SlotTier::Prerequisite
-                && *kind == SlotKind::Capture
-                && !op.property_controls.is_empty()
-                && (!op.capture_replacement_pending || op.filled.capture_units > 0)
-                && op.slots.deficit_ratio(SlotKind::Combat, &op.filled) > 0.0
-            {
-                // 期限付き物件制御はCombat計画が占領役も同じ組合せとして列挙する。ただし
-                // 過去に担当したEntityが全滅した場合までCaptureを飛ばすと、戦闘枠不足の
-                // 間は永久に奪還役が補充されない。初回編成は従来どおり共同計画へ任せ、
-                // 担当履歴に未解決の撃破がある場合だけ1体を先に再契約する。別の担当が
-                // 生存していても要求数を割っていれば補うが、当手番の発注後は共同計画へ
-                // 戻すことで、最安歩兵の無制限な先買いを防ぐ。
-                continue;
-            }
-            let deficit = op.slots.tier_deficit(*kind, &op.filled, tier);
-            if deficit <= 0.0 {
-                continue;
-            }
-            let operation_rank = match tier {
-                SlotTier::Prerequisite => operation_priority_rank(op),
-                SlotTier::Residual => 0,
-            };
-            // 同じ作戦優先度なら、固定された役割順で全Captureを埋めるのではなく
-            // 未充足率が最大の枠を選ぶ。最初の占領兵を確保した後はCombat計画が
-            // 先に100%不足となるため、掃討波を形成してから残りの占領前線を広げる。
-            // 未充足率が同じ場合だけ輸送→占領→戦闘という依存順を使う。
-            let better = best.is_none_or(|(_, _, best_rank, best_deficit, best_priority)| {
-                operation_rank < best_rank
-                    || (operation_rank == best_rank
-                        && (deficit.total_cmp(&best_deficit).is_gt()
-                            || (deficit.total_cmp(&best_deficit).is_eq()
-                                && priority < best_priority)))
-            });
-            if better {
-                best = Some((index, *kind, operation_rank, deficit, priority));
-            }
-        }
-    }
-    best.map(|(index, kind, _, _, _)| (index, kind))
-}
-
 /// 指定の枠を満たす最良の候補を選ぶ。
 pub(super) fn select_candidate(
     scan: &BoardScan,
@@ -6945,8 +6865,14 @@ mod tests {
         let ops = vec![capital, defense];
         // 期限付き物件制御の順位を1段差し込んでも、緊急Defenseが最優先で
         // 首都本隊そのものは削除されない。
-        assert_eq!(operation_priority_rank(&ops[0]), 2);
-        assert_eq!(operation_priority_rank(&ops[1]), 0);
+        assert_eq!(
+            operation_priority_rank(&ops[0]),
+            PRIORITY_RANK_AUTHORIZED_CAPITAL
+        );
+        assert_eq!(
+            operation_priority_rank(&ops[1]),
+            PRIORITY_RANK_URGENT_DEFENSE
+        );
         assert_eq!(most_starved_slot(&ops), Some((1, SlotKind::Combat)));
         assert_eq!(ops[0].slots.combat_plan_required, 1);
     }
@@ -8181,6 +8107,22 @@ pub(super) struct PropertyControlObjective {
     approach: PropertyControlApproach,
     /// cluster内の複数物件を、別々の敵占領役が争っているため局所化が必要か。
     disaggregated: bool,
+}
+
+#[cfg(test)]
+impl PropertyControlObjective {
+    /// 単一物件を事前妨害で争う、テスト用の物件制御目標を作る。
+    pub(super) fn interdict_for_test(property: GridPosition) -> Self {
+        Self {
+            property,
+            enemy_entity: Entity::from_raw(42),
+            enemy_arrival_turn: 1,
+            enemy_completion_turn: 3,
+            attack_ready_turn: Some(2),
+            approach: PropertyControlApproach::Interdict,
+            disaggregated: false,
+        }
+    }
 }
 
 /// 同じCapture clusterで同時に進められる物件レーンと、戦闘計画の主対象。

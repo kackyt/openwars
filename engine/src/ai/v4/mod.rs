@@ -3143,39 +3143,75 @@ fn most_starved_slot(operations: &[Operation]) -> Option<(usize, SlotKind)> {
         .or_else(|| most_starved_in_tier(operations, SlotTier::Residual))
 }
 
+// 生産枠の作戦優先度（小さいほど先に枠を取る）。値は同一手番内の相対順だけに使う。
+/// 敵接触が展開リードタイム内に迫る防衛。
+const PRIORITY_RANK_URGENT_DEFENSE: u32 = 0;
+/// 期限付き物件制御を持つCapture（拡張経路のみ。通常経路では使われない段）。
+const PRIORITY_RANK_DEADLINE_PROPERTY_CAPTURE: u32 = 1;
+/// 実行許可済みの首都攻略。
+const PRIORITY_RANK_AUTHORIZED_CAPITAL: u32 = 2;
+/// 急を要さない防衛。
+const PRIORITY_RANK_DEFENSE: u32 = 3;
+/// 通常の占領作戦。
+const PRIORITY_RANK_CAPTURE: u32 = 4;
+/// 実行未許可の首都攻略。
+const PRIORITY_RANK_UNAUTHORIZED_CAPITAL: u32 = 5;
+
 /// 生産枠の実効優先度。すべて同じ作戦集合で比較し、別枠の緊急作戦は作らない。
 /// Defenseは敵接触ETAと展開リードタイムから優先度を上げるが、必要枠だけを取得する。
 fn operation_priority_rank(operation: &Operation) -> u32 {
-    // 小規模マップのV4は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended_at("v4/mod.rs::operation_priority_rank") {
-        return extended::operation_priority_rank(operation);
-    }
     let defense_cannot_wait = operation.kind == OperationKind::Defense
         && operation.facts.enemy_combat_units > 0
         && operation.facts.enemy_contact_eta
             <= operation.facts.deploy_lead_time.max(1).saturating_add(1);
+    // 期限付き物件制御を持つCaptureを緊急扱いにするのは拡張経路だけ。
+    // 通常経路では常にfalseとなり、順位1の段は使われない（相対順は従来どおり）。
+    let property_control_cannot_wait =
+        crate::ai::code_path::is_extended_at("v4/mod.rs::operation_priority_rank")
+            && !operation.property_controls.is_empty();
     match (
         operation.kind,
         operation.execution_authorized,
         defense_cannot_wait,
+        property_control_cannot_wait,
     ) {
-        (OperationKind::Defense, _, true) => 0,
-        (OperationKind::AssaultCapital, true, _) => 1,
-        (OperationKind::Defense, _, false) => 2,
-        (OperationKind::Capture, _, _) => 3,
-        (OperationKind::AssaultCapital, false, _) => 4,
+        (OperationKind::Defense, _, true, _) => PRIORITY_RANK_URGENT_DEFENSE,
+        // 敵の完了時刻を過ぎると消滅する局地案だけを、首都本隊の編成より先に通す。
+        // 通常Captureや成立不能なRecaptureは従来どおり首都作戦を追い越さない。
+        (OperationKind::Capture, _, _, true) => PRIORITY_RANK_DEADLINE_PROPERTY_CAPTURE,
+        (OperationKind::AssaultCapital, true, _, _) => PRIORITY_RANK_AUTHORIZED_CAPITAL,
+        (OperationKind::Defense, _, false, _) => PRIORITY_RANK_DEFENSE,
+        (OperationKind::Capture, _, _, false) => PRIORITY_RANK_CAPTURE,
+        (OperationKind::AssaultCapital, false, _, _) => PRIORITY_RANK_UNAUTHORIZED_CAPITAL,
     }
+}
+
+/// 期限付き物件制御の占領役を、戦闘との共同計画へ回して単独の先買いを控えるか。
+///
+/// 拡張経路だけの枠適格条件。Combat計画が占領役も同じ組合せとして列挙するため、
+/// 初回編成ではCapture枠を単独で埋めない。ただし過去の担当Entityが全滅した場合まで
+/// 飛ばすと、戦闘枠不足の間は永久に奪還役が補充されない。担当履歴に未解決の撃破が
+/// ある場合だけ1体を先に再契約し、当手番の発注後は共同計画へ戻すことで、最安歩兵の
+/// 無制限な先買いを防ぐ。
+fn defers_capture_to_joint_combat_plan(op: &Operation, kind: SlotKind, tier: SlotTier) -> bool {
+    tier == SlotTier::Prerequisite
+        && kind == SlotKind::Capture
+        && !op.property_controls.is_empty()
+        && (!op.capture_replacement_pending || op.filled.capture_units > 0)
+        && op.slots.deficit_ratio(SlotKind::Combat, &op.filled) > 0.0
+        // 切替IDは統合前の委譲点名のまま残す。OPENWARS_EXT_DISABLE で旧IDを指定した
+        // 計測手順と互換を保つため、関数名に合わせて変更しないこと。
+        && crate::ai::code_path::is_extended_at("v4/mod.rs::most_starved_in_tier")
 }
 
 /// 指定した段階の中で最も飢えた枠を返す。
 fn most_starved_in_tier(operations: &[Operation], tier: SlotTier) -> Option<(usize, SlotKind)> {
-    // 小規模マップのV4は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended_at("v4/mod.rs::most_starved_in_tier") {
-        return extended::most_starved_in_tier(operations, tier);
-    }
     let mut best: Option<(usize, SlotKind, u32, f32, usize)> = None;
     for (index, op) in operations.iter().enumerate() {
         for (priority, kind) in SLOT_PRIORITY.iter().enumerate() {
+            if defers_capture_to_joint_combat_plan(op, *kind, tier) {
+                continue;
+            }
             let deficit = op.slots.tier_deficit(*kind, &op.filled, tier);
             if deficit <= 0.0 {
                 continue;
@@ -4455,6 +4491,47 @@ mod tests {
         }
     }
 
+    /// 期限付き物件制御を持つCaptureの扱いは経路で異なる（F12・F13の経路差を固定する）。
+    /// 通常経路は普通のCaptureとして順位付けし、占領枠も単独で埋める。拡張経路は
+    /// 首都本隊より前の緊急段へ上げ、初回編成の占領役を戦闘との共同計画へ回す。
+    #[test]
+    fn property_control_capture_urgency_differs_only_on_extended_path() {
+        let slots = OperationSlots {
+            capture_units: 3,
+            combat_plan_required: 1,
+            ..OperationSlots::default()
+        };
+        let mut initial_formation =
+            operation(OperationKind::Capture, slots, OperationSlots::default());
+        initial_formation
+            .property_controls
+            .push(PropertyControlObjective::interdict_for_test(pos(4, 1)));
+        for (path, expected_rank, expected_slot) in [
+            (
+                crate::ai::code_path::CodePath::MainCompatible,
+                4,
+                SlotKind::Capture,
+            ),
+            (
+                crate::ai::code_path::CodePath::Extended,
+                1,
+                SlotKind::Combat,
+            ),
+        ] {
+            let _guard = crate::ai::code_path::enter(path);
+            assert_eq!(
+                operation_priority_rank(&initial_formation),
+                expected_rank,
+                "{path:?}"
+            );
+            assert_eq!(
+                most_starved_slot(std::slice::from_ref(&initial_formation)),
+                Some((0, expected_slot)),
+                "{path:?}"
+            );
+        }
+    }
+
     /// 海峡マップ上に、母港の輸送艦 1 隻だけを置いた盤面を作る。
     ///
     /// 対岸 (8,1) を獲りにいく作戦から見て、この輸送艦は
@@ -5159,8 +5236,14 @@ mod tests {
         defense.facts.deploy_lead_time = 2;
 
         let ops = vec![capital, defense];
-        assert_eq!(operation_priority_rank(&ops[0]), 1);
-        assert_eq!(operation_priority_rank(&ops[1]), 0);
+        assert_eq!(
+            operation_priority_rank(&ops[0]),
+            PRIORITY_RANK_AUTHORIZED_CAPITAL
+        );
+        assert_eq!(
+            operation_priority_rank(&ops[1]),
+            PRIORITY_RANK_URGENT_DEFENSE
+        );
         assert_eq!(most_starved_slot(&ops), Some((1, SlotKind::Combat)));
         assert_eq!(ops[0].slots.combat_plan_required, 1);
     }
