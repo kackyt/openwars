@@ -3005,12 +3005,11 @@ fn synchronize_local_capture_departure(
     player_id: PlayerId,
     assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
 ) {
-    // 小規模マップのV4は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended_at("squad.rs::synchronize_local_capture_departure") {
-        return extended::synchronize_local_capture_departure(
-            world, manager, player_id, assignment,
-        );
-    }
+    // 小規模マップ展開の即時出撃（H01の出撃方策）は拡張経路だけで使う。
+    let departs_immediately_on_small_map =
+        crate::ai::code_path::is_extended_at("squad.rs::synchronize_local_capture_departure")
+            && crate::ai::strategy_profile::current_profile(world, player_id)
+                == crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion;
     if crate::ai::resolve_player_ai_version(world, player_id)
         != crate::ai::ai_version::AiVersion::V4
     {
@@ -3063,6 +3062,13 @@ fn synchronize_local_capture_departure(
             squad.departure_authorized = false;
             continue;
         };
+        // 小規模マップの並列展開では、複数の物件レースを同時に開き続ける。
+        // 護衛戦闘部隊の完成を待って工場・待機地に居座ると、中立物件を敵に先取され
+        // 序盤収入を覆せなくなるため、到達可能な全物件への即時出撃を認める。
+        if departs_immediately_on_small_map {
+            squad.departure_authorized = true;
+            continue;
+        }
         squad.departure_authorized = squad.members.iter().all(|capturer| {
             let Some(capturer_position) = world.get::<GridPosition>(*capturer) else {
                 return false;
@@ -11867,8 +11873,14 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn v4_local_capture_launches_only_when_intercepting_enemy_has_timely_escort() {
+    /// 中立都市(3,0)を狙う占領兵(0,0)と、その手前(2,0)の敵歩兵、未合流の護衛ヘリを置いた
+    /// 局地Captureの盤面を作る。割当には占領兵だけを含め、護衛は呼出し側で加える。
+    fn local_capture_race_world() -> (
+        World,
+        PlayerId,
+        crate::ai::island_campaign::IslandCampaignAssignment,
+        Entity,
+    ) {
         use crate::ai::island_campaign::{
             IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
         };
@@ -11950,7 +11962,7 @@ mod tests {
             combat_units: 1,
             total_budget: 8_500,
         };
-        let mut assignment = IslandCampaignAssignment {
+        let assignment = IslandCampaignAssignment {
             island_id,
             decision: IslandCampaignDecision::Contest,
             target_position: target,
@@ -11965,6 +11977,12 @@ mod tests {
             operation_ready: false,
             continued_from_existing_squad: false,
         };
+        (world, player, assignment, escort)
+    }
+
+    #[test]
+    fn v4_local_capture_launches_only_when_intercepting_enemy_has_timely_escort() {
+        let (world, player, mut assignment, escort) = local_capture_race_world();
         let mut manager = SquadManager::new();
 
         prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
@@ -11985,6 +12003,33 @@ mod tests {
         assert!(capture.departure_authorized);
     }
 
+    /// 小規模マップ展開の局地Captureは、拡張経路だけ護衛を待たずに出撃する
+    /// （F06・H01の経路差を固定する）。通常経路は迎撃される占領兵を待機させる。
+    #[test]
+    fn small_map_capture_departs_without_escort_only_on_extended_path() {
+        for (path, expected) in [
+            (crate::ai::code_path::CodePath::MainCompatible, false),
+            (crate::ai::code_path::CodePath::Extended, true),
+        ] {
+            let _guard = crate::ai::code_path::enter(path);
+            let (mut world, player, assignment, _escort) = local_capture_race_world();
+            world.insert_resource(
+                crate::ai::strategy_profile::V4StrategyProfileRegistry::with_profile(
+                    player,
+                    crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion,
+                ),
+            );
+            let mut manager = SquadManager::new();
+
+            prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
+            let capture = manager
+                .squads
+                .iter()
+                .find(|squad| squad.mission_type == MissionType::Capture)
+                .expect("局地Capture");
+            assert_eq!(capture.departure_authorized, expected, "{path:?}");
+        }
+    }
     #[test]
     fn shoal_is_legal_pickup_for_adjacent_ground_cargo() {
         let mut world = World::new();

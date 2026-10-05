@@ -246,16 +246,17 @@ impl VictoryRoadmapRegistry {
         &self,
         player_id: PlayerId,
     ) -> Option<(IslandId, GridPosition)> {
-        // 小規模マップのV4は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended_at("v4/victory_roadmap.rs::active_capital_objective") {
-            return self.active_capital_objective_extended(player_id);
-        }
+        // 依存gateを持つ拡張経路のRoadmapでは、Lockedな首都Nodeを公開しない。
+        // 通常経路のNodeは常にReadyで作られるため、この条件は効かない。
+        let hides_locked_nodes =
+            crate::ai::code_path::is_extended_at("v4/victory_roadmap.rs::active_capital_objective");
         self.operations
             .values()
             .filter(|operation| {
                 operation.player_id == player_id
                     && operation.active
                     && operation.purpose == StrategicPurpose::AssaultCapital
+                    && !(hides_locked_nodes && operation.node_state == RoadmapNodeState::Locked)
             })
             .min_by_key(|operation| operation.id.0)
             .map(|operation| (operation.island_id, operation.tactical_anchor))
@@ -2966,6 +2967,38 @@ mod tests {
         assert_eq!(operation.objective_properties, vec![capital]);
         assert_eq!(operation.planned_completion_turn, None);
         assert!(operation.blocked_reason.is_some());
+    }
+
+    /// Lockedな首都Nodeを公開するかは経路で異なる（F24の経路差を固定する）。
+    /// 依存gateを持つ拡張経路は非公開、Nodeを常にReadyで作る通常経路は従来どおり返す。
+    #[test]
+    fn locked_capital_objective_is_hidden_only_on_extended_path() {
+        let player = PlayerId(1);
+        let capital = GridPosition { x: 20, y: 4 };
+        let island = IslandId(7);
+        let mut registry = VictoryRoadmapRegistry::default();
+        let roadmap = registry.ensure_roadmap(player, 1, Some(capital), Some(island), 6);
+        let operation = {
+            let _guard =
+                crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
+            registry.ensure_capital_objective(roadmap, player, 1, island, capital, false)
+        };
+        registry.operations.get_mut(&operation).unwrap().node_state = RoadmapNodeState::Locked;
+
+        for (path, expected) in [
+            (
+                crate::ai::code_path::CodePath::MainCompatible,
+                Some((island, capital)),
+            ),
+            (crate::ai::code_path::CodePath::Extended, None),
+        ] {
+            let _guard = crate::ai::code_path::enter(path);
+            assert_eq!(
+                registry.active_capital_objective(player),
+                expected,
+                "{path:?}"
+            );
+        }
     }
 
     #[test]

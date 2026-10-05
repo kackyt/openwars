@@ -775,6 +775,44 @@ pub struct V4RollingPlanRegistry {
     audits: Vec<PlanRevisionAudit>,
 }
 
+/// 首都攻略Planを出撃させるために完成している必要がある購入の範囲。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchReadiness {
+    /// 全購入stepの完成を待つ（通常経路）。
+    AllPurchases,
+    /// 最初の交戦までに予定された波の完成だけを待つ（拡張経路）。
+    FirstAttackWave,
+}
+
+impl LaunchReadiness {
+    /// このPlanが出撃条件を満たすだけ生産済みかを返す。
+    fn is_satisfied(self, plan: &StoredPlan) -> bool {
+        match self {
+            Self::AllPurchases => plan
+                .steps
+                .iter()
+                .all(|step| step.status == PurchaseStatus::Produced),
+            Self::FirstAttackWave => first_attack_wave_produced(plan),
+        }
+    }
+}
+
+/// 作戦が予測した最初の交戦までに必要な購入だけが実体化したかを返す。
+///
+/// `scheduled_turn` がその時点より後のstepは、進軍中に到着する後続増援である。これを
+/// 全軍の停止条件にすると、資金と工場が余っていても首都前で待ち続けてしまう。
+fn first_attack_wave_produced(plan: &StoredPlan) -> bool {
+    let first_attack_turn = plan
+        .execution
+        .snapshot
+        .planned_first_attack_turn
+        .unwrap_or(plan.last_evaluated_turn);
+    plan.steps
+        .iter()
+        .filter(|step| step.scheduled_turn <= first_attack_turn)
+        .all(|step| step.status == PurchaseStatus::Produced)
+}
+
 impl V4RollingPlanRegistry {
     /// 進行中計画を、新規候補より先に作戦集合へ復帰させる。
     pub(crate) fn active_objectives(&self, player_id: PlayerId) -> Vec<ActivePlanObjective> {
@@ -866,24 +904,22 @@ impl V4RollingPlanRegistry {
         capital_assault_authorized: bool,
         capital_staging_anchor: Option<GridPosition>,
     ) -> Vec<ActiveDeploymentIntent> {
-        // 小規模マップのV4は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended_at("v4/plan_revision.rs::active_deployment_intents") {
-            return self.active_deployment_intents_extended(
-                player_id,
-                capital_assault_authorized,
-                capital_staging_anchor,
-            );
-        }
+        // 首都攻略の出撃条件。通常経路は全購入stepの完成、拡張経路は初撃までに
+        // 予定された波の完成を待つ（どちらが強いかは未実測のため差を維持する）。
+        let readiness = if crate::ai::code_path::is_extended_at(
+            "v4/plan_revision.rs::active_deployment_intents",
+        ) {
+            LaunchReadiness::FirstAttackWave
+        } else {
+            LaunchReadiness::AllPurchases
+        };
         self.active
             .iter()
             .filter(|plan| plan.player_id == player_id)
             .map(|plan| {
                 let mut priority_enemies = plan.target_enemies.iter().copied().collect::<Vec<_>>();
                 priority_enemies.sort_unstable_by_key(|entity| entity.to_bits());
-                let formation_complete = plan
-                    .steps
-                    .iter()
-                    .all(|step| step.status == PurchaseStatus::Produced);
+                let formation_complete = readiness.is_satisfied(plan);
                 let posture = if plan.kind != OperationKind::AssaultCapital
                     || (capital_assault_authorized && formation_complete && plan.execution_ready)
                 {
@@ -2930,7 +2966,6 @@ mod tests {
     }
 }
 
-// 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
-mod extended;
-#[allow(unused_imports)]
-pub use self::extended::*;
+// 拡張経路（小規模マップ戦略）で検証するテスト。本文の分岐はすべて親の局所分岐へ集約済み。
+#[cfg(test)]
+mod extended_path_tests;

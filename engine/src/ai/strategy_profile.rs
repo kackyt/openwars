@@ -28,6 +28,19 @@ pub(crate) struct V4StrategyProfileRegistry {
     profiles: std::collections::HashMap<crate::components::PlayerId, V4StrategyProfile>,
 }
 
+#[cfg(test)]
+impl V4StrategyProfileRegistry {
+    /// 指定プレイヤーのプロファイルを確定済みにしたレジストリを作る（テスト用）。
+    pub(crate) fn with_profile(
+        player_id: crate::components::PlayerId,
+        profile: V4StrategyProfile,
+    ) -> Self {
+        Self {
+            profiles: std::collections::HashMap::from([(player_id, profile)]),
+        }
+    }
+}
+
 /// ターン開始時に決めたプロファイルを返す。未決定なら盤面構造から一度だけ確定する。
 pub fn profile_for(world: &mut World, player_id: crate::components::PlayerId) -> V4StrategyProfile {
     if let Some(profile) = world

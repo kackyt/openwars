@@ -326,6 +326,222 @@ pub(crate) fn prepare_deployment_squads(
     reserved
 }
 
+/// 敵の占領歩兵が、自軍の邪魔（物理ブロック）もZoC足止めも受けずに
+/// 拠点群へフリーパスで侵入・占領できる状態（無防備な脅威）であるかを判定する。
+pub(super) fn is_uncontested_capture_threat(
+    world: &World,
+    map: &Map,
+    player_id: PlayerId,
+    enemy_entity: Entity,
+    enemy_pos: GridPosition,
+    anchor_pos: GridPosition,
+) -> bool {
+    let Some(enemy_stats) = world.get::<UnitStats>(enemy_entity) else {
+        return false;
+    };
+    if !enemy_stats.can_capture {
+        return false;
+    }
+
+    // 敵歩兵が向かっている防衛作戦圏内の自軍・未所有物件を探す
+    let threatened_property = world.iter_entities().find_map(|e| {
+        let pos = *e.get::<GridPosition>()?;
+        let prop = e.get::<Property>()?;
+        if prop.max_capture_points == 0 {
+            return None;
+        }
+        // 敵自身がすでに所有している物件は防衛対象ではない
+        if prop.owner_id.is_some_and(|o| o != player_id) {
+            return None;
+        }
+        let dist_to_enemy = map.distance(pos.x, pos.y, enemy_pos.x, enemy_pos.y);
+        let dist_to_anchor = map.distance(pos.x, pos.y, anchor_pos.x, anchor_pos.y);
+        // 作戦anchorと同じセクター内にあり、敵歩兵が次ターン直接侵入・占領可能な物件（1ターン圏内）
+        (dist_to_anchor <= 8 && dist_to_enemy <= enemy_stats.max_movement).then_some(pos)
+    });
+
+    let Some(target_property) = threatened_property else {
+        return false;
+    };
+
+    // 1. その物件そのものに自軍ユニットが乗っていれば、無血侵入は物理的に阻止されている
+    let prop_occupied_by_friendly = world.iter_entities().any(|e| {
+        e.get::<Faction>().is_some_and(|f| f.0 == player_id)
+            && e.get::<GridPosition>() == Some(&target_property)
+            && e.get::<Health>().is_some_and(|h| h.current > 0)
+    });
+    if prop_occupied_by_friendly {
+        return false;
+    }
+
+    // 2. 敵歩兵に隣接してZoCをかけている（または交戦中の）自軍ユニットがいるか
+    let engaged_by_friendly_zoc = world.iter_entities().any(|e| {
+        e.get::<Faction>().is_some_and(|f| f.0 == player_id)
+            && e.get::<Health>().is_some_and(|h| h.current > 0)
+            && e.get::<GridPosition>()
+                .is_some_and(|pos| map.distance(pos.x, pos.y, enemy_pos.x, enemy_pos.y) <= 1)
+    });
+    if engaged_by_friendly_zoc {
+        return false;
+    }
+
+    // 物件上に味方もおらず、敵歩兵にZoCをかけている味方もいない -> 完全なフリーパス状態！
+    true
+}
+
+/// 指定座標の物件が既に `player_id` の所有かどうか。
+pub(super) fn anchor_is_owned_by(world: &World, anchor: GridPosition, player_id: PlayerId) -> bool {
+    world.iter_entities().any(|entity| {
+        entity.get::<GridPosition>() == Some(&anchor)
+            && entity
+                .get::<Property>()
+                .is_some_and(|property| property.owner_id == Some(player_id))
+    })
+}
+
+impl V4DeploymentRegistry {
+    /// 生産完了イベントを、同じ手番・施設・兵種の最初の発注へ決定的に照合する。
+    pub(super) fn assign_produced_extended(
+        &mut self,
+        event: &UnitProducedEvent,
+        turn: u32,
+    ) -> Option<FormingSquadSlotId> {
+        let index = self.pending.iter().position(|pending| {
+            pending.player_id == event.player_id
+                && pending.turn == turn
+                && pending.facility.x == event.target_x
+                && pending.facility.y == event.target_y
+                && pending.unit_type == event.unit_type
+        })?;
+        let intent = self
+            .pending
+            .remove(index)
+            .expect("照合済みpending deploymentが存在する");
+        let forming_slot = intent.forming_slot;
+        self.assigned.insert(
+            event.entity,
+            AssignedDeployment {
+                entity: event.entity,
+                intent,
+                squad_id: None,
+                current_target: None,
+                active: true,
+                assigned_turn: turn,
+                attack_count: 0,
+                priority_attack_count: 0,
+                mission_target_attack_count: 0,
+                mission_target_kill_count: 0,
+                mission_target_damage_value_dealt: 0,
+                mission_target_counter_value_received: 0,
+                mission_target_destroyed_value: 0,
+                mission_target_first_attack_turn: None,
+                capture_unit_attack_count: 0,
+                transport_unit_attack_count: 0,
+                kill_count: 0,
+                damage_value_dealt: 0,
+                counter_value_received: 0,
+                destroyed_value: 0,
+                first_attack_turn: None,
+            },
+        );
+        if let Some(slot) = forming_slot
+            && let Some(reservation) = self.forming_slots.get_mut(&slot)
+        {
+            reservation.entity = Some(event.entity);
+        }
+        forming_slot
+    }
+
+    /// 生産完了直後に予約slotを実Squadへ解決する。
+    ///
+    /// 実Entityは生成手番に行動できないが、次の再編まで`None`所属にしない。対象敵の
+    /// 再探索など戦術的な詳細は次手番の`prepare_deployment_squads`が更新する。
+    fn resolve_produced_slot(
+        &mut self,
+        entity: Entity,
+        manager: &mut SquadManager,
+        island_map: Option<&IslandMap>,
+    ) {
+        let Some(snapshot) = self.assigned.get(&entity).cloned() else {
+            return;
+        };
+        let Some(slot) = snapshot.intent.forming_slot else {
+            return;
+        };
+        let existing = self
+            .forming_slots
+            .get(&slot)
+            .and_then(|reservation| reservation.squad_id)
+            .and_then(|squad_id| {
+                manager.squads.iter().position(|squad| {
+                    squad.id == squad_id && squad.owner_id == Some(snapshot.intent.player_id)
+                })
+            });
+        let squad = if let Some(index) = existing {
+            &mut manager.squads[index]
+        } else {
+            manager.create_owned_squad(
+                match snapshot.intent.posture {
+                    DeploymentPosture::Execute => MissionType::Attack,
+                    DeploymentPosture::Forming => MissionType::Defense,
+                },
+                snapshot.intent.player_id,
+            )
+        };
+        squad.members.insert(entity);
+        squad.target = Some(match snapshot.intent.posture {
+            DeploymentPosture::Execute => snapshot.intent.anchor,
+            DeploymentPosture::Forming => snapshot.intent.staging_anchor,
+        });
+        squad.target_island = island_map
+            .and_then(|islands| islands.get_island_at(&snapshot.intent.anchor))
+            .map(|island| island.id);
+        squad.phase = MissionPhase::Forming;
+        let squad_id = squad.id;
+        if let Some(reservation) = self.forming_slots.get_mut(&slot) {
+            debug_assert_eq!(reservation.id, slot);
+            reservation.squad_id = Some(squad_id);
+        }
+        if let Some(deployment) = self.assigned.get_mut(&entity) {
+            deployment.squad_id = Some(squad_id);
+        }
+    }
+
+    /// 同じ攻勢作戦の前衛・砲が協働できるか。別の敵を狙っていても作戦IDを失わない。
+    /// 台帳が無い二体だけは呼出側のSquad目標による判定へ委ねる。
+    pub(crate) fn shares_attack_operation(&self, left: Entity, right: Entity) -> Option<bool> {
+        let (left, right) = match (self.assigned.get(&left), self.assigned.get(&right)) {
+            (None, None) => return None,
+            (Some(left), Some(right)) => (left, right),
+            _ => return Some(false),
+        };
+        if !left.active
+            || !right.active
+            || left.intent.player_id != right.intent.player_id
+            || left.intent.posture != DeploymentPosture::Execute
+            || right.intent.posture != DeploymentPosture::Execute
+            || left.intent.slot_kind != SlotKind::Combat
+            || right.intent.slot_kind != SlotKind::Combat
+        {
+            return Some(false);
+        }
+        Some(
+            match (
+                left.intent.operation_binding,
+                right.intent.operation_binding,
+            ) {
+                (Some(a), Some(b)) => a.operation_id == b.operation_id && a.revision == b.revision,
+                (None, None) => match (left.intent.plan_step, right.intent.plan_step) {
+                    (Some(a), Some(b)) => a.plan_id == b.plan_id && a.revision == b.revision,
+                    (None, None) => left.intent.anchor == right.intent.anchor,
+                    _ => false,
+                },
+                _ => false,
+            },
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -767,279 +983,5 @@ mod tests {
             local_retarget(&mut world, &mut TerrainConnectivity::default(), &deployment),
             Some(nearby_enemy)
         );
-    }
-}
-
-/// 生産命令時点で確保する、実Entityをまだ持たないSquad受入先の値オブジェクト。
-///
-/// Squad IDそのものはSquadManagerだけが発番する。ここでは発注の意図を安定IDで
-/// 予約し、生産完了Eventで実Squadへ一度だけ解決する。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct FormingSquadSlotId(u64);
-
-/// まだ実体が無いSquad slotの予約状態。発注と生産完了のあいだも作戦所有権を保つ。
-#[derive(Debug, Clone)]
-pub(super) struct FormingSquadReservation {
-    id: FormingSquadSlotId,
-    player_id: PlayerId,
-    turn: u32,
-    squad_id: Option<SquadId>,
-    entity: Option<Entity>,
-}
-
-/// 敵の占領歩兵が、自軍の邪魔（物理ブロック）もZoC足止めも受けずに
-/// 拠点群へフリーパスで侵入・占領できる状態（無防備な脅威）であるかを判定する。
-pub(super) fn is_uncontested_capture_threat(
-    world: &World,
-    map: &Map,
-    player_id: PlayerId,
-    enemy_entity: Entity,
-    enemy_pos: GridPosition,
-    anchor_pos: GridPosition,
-) -> bool {
-    let Some(enemy_stats) = world.get::<UnitStats>(enemy_entity) else {
-        return false;
-    };
-    if !enemy_stats.can_capture {
-        return false;
-    }
-
-    // 敵歩兵が向かっている防衛作戦圏内の自軍・未所有物件を探す
-    let threatened_property = world.iter_entities().find_map(|e| {
-        let pos = *e.get::<GridPosition>()?;
-        let prop = e.get::<Property>()?;
-        if prop.max_capture_points == 0 {
-            return None;
-        }
-        // 敵自身がすでに所有している物件は防衛対象ではない
-        if prop.owner_id.is_some_and(|o| o != player_id) {
-            return None;
-        }
-        let dist_to_enemy = map.distance(pos.x, pos.y, enemy_pos.x, enemy_pos.y);
-        let dist_to_anchor = map.distance(pos.x, pos.y, anchor_pos.x, anchor_pos.y);
-        // 作戦anchorと同じセクター内にあり、敵歩兵が次ターン直接侵入・占領可能な物件（1ターン圏内）
-        (dist_to_anchor <= 8 && dist_to_enemy <= enemy_stats.max_movement).then_some(pos)
-    });
-
-    let Some(target_property) = threatened_property else {
-        return false;
-    };
-
-    // 1. その物件そのものに自軍ユニットが乗っていれば、無血侵入は物理的に阻止されている
-    let prop_occupied_by_friendly = world.iter_entities().any(|e| {
-        e.get::<Faction>().is_some_and(|f| f.0 == player_id)
-            && e.get::<GridPosition>() == Some(&target_property)
-            && e.get::<Health>().is_some_and(|h| h.current > 0)
-    });
-    if prop_occupied_by_friendly {
-        return false;
-    }
-
-    // 2. 敵歩兵に隣接してZoCをかけている（または交戦中の）自軍ユニットがいるか
-    let engaged_by_friendly_zoc = world.iter_entities().any(|e| {
-        e.get::<Faction>().is_some_and(|f| f.0 == player_id)
-            && e.get::<Health>().is_some_and(|h| h.current > 0)
-            && e.get::<GridPosition>()
-                .is_some_and(|pos| map.distance(pos.x, pos.y, enemy_pos.x, enemy_pos.y) <= 1)
-    });
-    if engaged_by_friendly_zoc {
-        return false;
-    }
-
-    // 物件上に味方もおらず、敵歩兵にZoCをかけている味方もいない -> 完全なフリーパス状態！
-    true
-}
-
-/// 指定座標の物件が既に `player_id` の所有かどうか。
-pub(super) fn anchor_is_owned_by(world: &World, anchor: GridPosition, player_id: PlayerId) -> bool {
-    world.iter_entities().any(|entity| {
-        entity.get::<GridPosition>() == Some(&anchor)
-            && entity
-                .get::<Property>()
-                .is_some_and(|property| property.owner_id == Some(player_id))
-    })
-}
-
-impl V4DeploymentRegistry {
-    /// 同じ手番に再計画した古い発注を除き、新しい発注意図を順番どおり登録する。
-    pub(crate) fn replace_turn_orders_extended(
-        &mut self,
-        player_id: PlayerId,
-        turn: u32,
-        orders: impl IntoIterator<Item = PendingDeployment>,
-    ) {
-        if !crate::ai::code_path::ext_enabled("v4/deployment.rs::replace_turn_orders") {
-            return self.replace_turn_orders(player_id, turn, orders);
-        }
-        self.pending
-            .retain(|pending| pending.player_id != player_id || pending.turn != turn);
-        // 同一手番の再計画で未発行slotを残すと、取り消された生産先へ後続Eventを
-        // 誤接続する。その手番の予約はPendingと同じ粒度で置換する。
-        self.forming_slots.retain(|_, reservation| {
-            reservation.player_id != player_id
-                || reservation.turn != turn
-                || reservation.entity.is_some()
-        });
-        let mut normalized = orders.into_iter().collect::<Vec<_>>();
-        normalized.sort_unstable_by_key(|pending| pending.order);
-        for pending in &mut normalized {
-            let slot = pending.forming_slot.unwrap_or_else(|| {
-                let id = FormingSquadSlotId(self.next_forming_slot);
-                self.next_forming_slot = self.next_forming_slot.saturating_add(1);
-                id
-            });
-            pending.forming_slot = Some(slot);
-            self.forming_slots
-                .entry(slot)
-                .or_insert(FormingSquadReservation {
-                    id: slot,
-                    player_id: pending.player_id,
-                    turn: pending.turn,
-                    squad_id: None,
-                    entity: None,
-                });
-        }
-        self.pending.extend(normalized);
-    }
-
-    /// 生産完了イベントを、同じ手番・施設・兵種の最初の発注へ決定的に照合する。
-    pub(super) fn assign_produced_extended(
-        &mut self,
-        event: &UnitProducedEvent,
-        turn: u32,
-    ) -> Option<FormingSquadSlotId> {
-        let index = self.pending.iter().position(|pending| {
-            pending.player_id == event.player_id
-                && pending.turn == turn
-                && pending.facility.x == event.target_x
-                && pending.facility.y == event.target_y
-                && pending.unit_type == event.unit_type
-        })?;
-        let intent = self
-            .pending
-            .remove(index)
-            .expect("照合済みpending deploymentが存在する");
-        let forming_slot = intent.forming_slot;
-        self.assigned.insert(
-            event.entity,
-            AssignedDeployment {
-                entity: event.entity,
-                intent,
-                squad_id: None,
-                current_target: None,
-                active: true,
-                assigned_turn: turn,
-                attack_count: 0,
-                priority_attack_count: 0,
-                mission_target_attack_count: 0,
-                mission_target_kill_count: 0,
-                mission_target_damage_value_dealt: 0,
-                mission_target_counter_value_received: 0,
-                mission_target_destroyed_value: 0,
-                mission_target_first_attack_turn: None,
-                capture_unit_attack_count: 0,
-                transport_unit_attack_count: 0,
-                kill_count: 0,
-                damage_value_dealt: 0,
-                counter_value_received: 0,
-                destroyed_value: 0,
-                first_attack_turn: None,
-            },
-        );
-        if let Some(slot) = forming_slot
-            && let Some(reservation) = self.forming_slots.get_mut(&slot)
-        {
-            reservation.entity = Some(event.entity);
-        }
-        forming_slot
-    }
-
-    /// 生産完了直後に予約slotを実Squadへ解決する。
-    ///
-    /// 実Entityは生成手番に行動できないが、次の再編まで`None`所属にしない。対象敵の
-    /// 再探索など戦術的な詳細は次手番の`prepare_deployment_squads`が更新する。
-    fn resolve_produced_slot(
-        &mut self,
-        entity: Entity,
-        manager: &mut SquadManager,
-        island_map: Option<&IslandMap>,
-    ) {
-        let Some(snapshot) = self.assigned.get(&entity).cloned() else {
-            return;
-        };
-        let Some(slot) = snapshot.intent.forming_slot else {
-            return;
-        };
-        let existing = self
-            .forming_slots
-            .get(&slot)
-            .and_then(|reservation| reservation.squad_id)
-            .and_then(|squad_id| {
-                manager.squads.iter().position(|squad| {
-                    squad.id == squad_id && squad.owner_id == Some(snapshot.intent.player_id)
-                })
-            });
-        let squad = if let Some(index) = existing {
-            &mut manager.squads[index]
-        } else {
-            manager.create_owned_squad(
-                match snapshot.intent.posture {
-                    DeploymentPosture::Execute => MissionType::Attack,
-                    DeploymentPosture::Forming => MissionType::Defense,
-                },
-                snapshot.intent.player_id,
-            )
-        };
-        squad.members.insert(entity);
-        squad.target = Some(match snapshot.intent.posture {
-            DeploymentPosture::Execute => snapshot.intent.anchor,
-            DeploymentPosture::Forming => snapshot.intent.staging_anchor,
-        });
-        squad.target_island = island_map
-            .and_then(|islands| islands.get_island_at(&snapshot.intent.anchor))
-            .map(|island| island.id);
-        squad.phase = MissionPhase::Forming;
-        let squad_id = squad.id;
-        if let Some(reservation) = self.forming_slots.get_mut(&slot) {
-            debug_assert_eq!(reservation.id, slot);
-            reservation.squad_id = Some(squad_id);
-        }
-        if let Some(deployment) = self.assigned.get_mut(&entity) {
-            deployment.squad_id = Some(squad_id);
-        }
-    }
-
-    /// 同じ攻勢作戦の前衛・砲が協働できるか。別の敵を狙っていても作戦IDを失わない。
-    /// 台帳が無い二体だけは呼出側のSquad目標による判定へ委ねる。
-    pub(crate) fn shares_attack_operation(&self, left: Entity, right: Entity) -> Option<bool> {
-        let (left, right) = match (self.assigned.get(&left), self.assigned.get(&right)) {
-            (None, None) => return None,
-            (Some(left), Some(right)) => (left, right),
-            _ => return Some(false),
-        };
-        if !left.active
-            || !right.active
-            || left.intent.player_id != right.intent.player_id
-            || left.intent.posture != DeploymentPosture::Execute
-            || right.intent.posture != DeploymentPosture::Execute
-            || left.intent.slot_kind != SlotKind::Combat
-            || right.intent.slot_kind != SlotKind::Combat
-        {
-            return Some(false);
-        }
-        Some(
-            match (
-                left.intent.operation_binding,
-                right.intent.operation_binding,
-            ) {
-                (Some(a), Some(b)) => a.operation_id == b.operation_id && a.revision == b.revision,
-                (None, None) => match (left.intent.plan_step, right.intent.plan_step) {
-                    (Some(a), Some(b)) => a.plan_id == b.plan_id && a.revision == b.revision,
-                    (None, None) => left.intent.anchor == right.intent.anchor,
-                    _ => false,
-                },
-                _ => false,
-            },
-        )
     }
 }

@@ -1748,27 +1748,6 @@ pub(crate) fn current_turn_portfolio(
 }
 
 impl VictoryRoadmapRegistry {
-    /// 局地portfolioが兵站gate待ちで首都作戦をまだ公開していない期間も、
-    /// 勝利条件から消えない常在AssaultCapitalの島とanchorを返す。
-    pub(crate) fn active_capital_objective_extended(
-        &self,
-        player_id: PlayerId,
-    ) -> Option<(IslandId, GridPosition)> {
-        if !crate::ai::code_path::ext_enabled("v4/victory_roadmap.rs::active_capital_objective") {
-            return self.active_capital_objective(player_id);
-        }
-        self.operations
-            .values()
-            .filter(|operation| {
-                operation.player_id == player_id
-                    && operation.active
-                    && operation.purpose == StrategicPurpose::AssaultCapital
-                    && operation.node_state != RoadmapNodeState::Locked
-            })
-            .min_by_key(|operation| operation.id.0)
-            .map(|operation| (operation.island_id, operation.tactical_anchor))
-    }
-
     pub(super) fn ensure_capital_objective_extended(
         &mut self,
         roadmap_id: VictoryRoadmapId,

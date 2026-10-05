@@ -164,6 +164,23 @@ pub(crate) struct ActiveTargetAssignment {
     pub targets: HashSet<Entity>,
 }
 
+/// 生産命令時点で確保する、実Entityをまだ持たないSquad受入先の値オブジェクト。
+///
+/// Squad IDそのものはSquadManagerだけが発番する。ここでは発注の意図を安定IDで
+/// 予約し、生産完了Eventで実Squadへ一度だけ解決する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct FormingSquadSlotId(u64);
+
+/// まだ実体が無いSquad slotの予約状態。発注と生産完了のあいだも作戦所有権を保つ。
+#[derive(Debug, Clone)]
+struct FormingSquadReservation {
+    id: FormingSquadSlotId,
+    player_id: PlayerId,
+    turn: u32,
+    squad_id: Option<SquadId>,
+    entity: Option<Entity>,
+}
+
 /// V4の未照合発注と、生産済みEntityの局地任務を保持するリソース。
 #[derive(Resource, Debug, Default)]
 pub struct V4DeploymentRegistry {
@@ -181,13 +198,40 @@ impl V4DeploymentRegistry {
         turn: u32,
         orders: impl IntoIterator<Item = PendingDeployment>,
     ) {
-        // 小規模マップのV4は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended_at("v4/deployment.rs::replace_turn_orders") {
-            return self.replace_turn_orders_extended(player_id, turn, orders);
-        }
         self.pending
             .retain(|pending| pending.player_id != player_id || pending.turn != turn);
-        self.pending.extend(orders);
+        // 編成slotの予約は拡張経路だけが使う。通常経路はslotなしで発注をそのまま登録する。
+        if !crate::ai::code_path::is_extended_at("v4/deployment.rs::replace_turn_orders") {
+            self.pending.extend(orders);
+            return;
+        }
+        // 同一手番の再計画で未発行slotを残すと、取り消された生産先へ後続Eventを
+        // 誤接続する。その手番の予約はPendingと同じ粒度で置換する。
+        self.forming_slots.retain(|_, reservation| {
+            reservation.player_id != player_id
+                || reservation.turn != turn
+                || reservation.entity.is_some()
+        });
+        let mut normalized = orders.into_iter().collect::<Vec<_>>();
+        normalized.sort_unstable_by_key(|pending| pending.order);
+        for pending in &mut normalized {
+            let slot = pending.forming_slot.unwrap_or_else(|| {
+                let id = FormingSquadSlotId(self.next_forming_slot);
+                self.next_forming_slot = self.next_forming_slot.saturating_add(1);
+                id
+            });
+            pending.forming_slot = Some(slot);
+            self.forming_slots
+                .entry(slot)
+                .or_insert(FormingSquadReservation {
+                    id: slot,
+                    player_id: pending.player_id,
+                    turn: pending.turn,
+                    squad_id: None,
+                    entity: None,
+                });
+        }
+        self.pending.extend(normalized);
     }
 
     /// 生産完了イベントを、同じ手番・施設・兵種の最初の発注へ決定的に照合する。
@@ -972,6 +1016,106 @@ mod tests {
             forecast: DeploymentForecast::default(),
             plan_step: None,
         }
+    }
+
+    /// 同手番の再計画で発注を置き換えたとき、編成slotを予約するのは拡張経路だけ
+    /// （F22の経路差を固定する）。拡張経路は未実体のslotをPendingと同じ粒度で置換する。
+    #[test]
+    fn replace_turn_orders_reserves_forming_slots_only_on_extended_path() {
+        for (path, reserves_slots) in [
+            (crate::ai::code_path::CodePath::MainCompatible, false),
+            (crate::ai::code_path::CodePath::Extended, true),
+        ] {
+            let _guard = crate::ai::code_path::enter(path);
+            let mut registry = V4DeploymentRegistry::default();
+            registry.replace_turn_orders(PlayerId(1), 3, [pending(0), pending(1)]);
+            // 同じ手番に発注Aを取り消してBだけを残す。
+            registry.replace_turn_orders(PlayerId(1), 3, [pending(1)]);
+
+            assert_eq!(registry.pending.len(), 1, "{path:?}");
+            assert_eq!(
+                registry.pending[0].forming_slot.is_some(),
+                reserves_slots,
+                "{path:?}"
+            );
+            let expected_slots = usize::from(reserves_slots);
+            assert_eq!(registry.forming_slots.len(), expected_slots, "{path:?}");
+        }
+    }
+
+    /// `pending` の発注と同じ施設(2,4)・兵種で完成した生産Eventを作る。
+    fn produced_event(entity: Entity) -> UnitProducedEvent {
+        UnitProducedEvent {
+            player_id: PlayerId(1),
+            target_x: 2,
+            target_y: 4,
+            unit_type: UnitType::Fighter,
+            entity,
+        }
+    }
+
+    /// 拡張経路でA取消後にBが完成したとき、生産EventはBの発注意図と予約slotへ接続し、
+    /// 取り消したAの予約は残らない（F22の受入条件）。
+    #[test]
+    fn cancelled_order_slot_is_not_bound_to_the_next_produced_unit() {
+        let _guard = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
+        let mut registry = V4DeploymentRegistry::default();
+        registry.replace_turn_orders(PlayerId(1), 3, [pending(0), pending(1)]);
+        let cancelled_slot = registry.pending[0]
+            .forming_slot
+            .expect("拡張経路は発注Aにslotを予約する");
+        registry.replace_turn_orders(PlayerId(1), 3, [pending(1)]);
+        let kept_slot = registry.pending[0]
+            .forming_slot
+            .expect("拡張経路は発注Bにslotを予約する");
+        assert_ne!(kept_slot, cancelled_slot);
+
+        let produced = Entity::from_raw(100);
+        let bound_slot = registry.assign_produced_extended(&produced_event(produced), 3);
+
+        assert_eq!(bound_slot, Some(kept_slot));
+        let assigned = registry.assigned.get(&produced).expect("Bの完成Entity");
+        assert_eq!(
+            assigned.intent.order, 1,
+            "取り消したAの発注意図へ紐付けない"
+        );
+        assert_eq!(assigned.intent.forming_slot, Some(kept_slot));
+        assert!(!registry.forming_slots.contains_key(&cancelled_slot));
+        assert_eq!(
+            registry
+                .forming_slots
+                .get(&kept_slot)
+                .and_then(|reservation| reservation.entity),
+            Some(produced)
+        );
+    }
+
+    /// 完成済みEntityを持つslotは、同手番の再計画で発注を置き換えても撤回しない。
+    #[test]
+    fn produced_slot_survives_same_turn_order_replacement() {
+        let _guard = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
+        let mut registry = V4DeploymentRegistry::default();
+        registry.replace_turn_orders(PlayerId(1), 3, [pending(0)]);
+        let produced = Entity::from_raw(100);
+        let produced_slot = registry
+            .assign_produced_extended(&produced_event(produced), 3)
+            .expect("発注Aは予約slotへ接続する");
+
+        registry.replace_turn_orders(PlayerId(1), 3, [pending(1)]);
+
+        assert_eq!(
+            registry
+                .forming_slots
+                .get(&produced_slot)
+                .and_then(|reservation| reservation.entity),
+            Some(produced),
+            "完成済み予約は残る"
+        );
+        let new_slot = registry.pending[0]
+            .forming_slot
+            .expect("後続発注Bには新しいslotを予約する");
+        assert_ne!(new_slot, produced_slot);
+        assert_eq!(registry.forming_slots.len(), 2);
     }
 
     #[test]
