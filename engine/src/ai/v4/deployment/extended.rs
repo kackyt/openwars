@@ -6,37 +6,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// 実際に生産されたEntityをpending deploymentへ照合する。
-pub(crate) fn reconcile_pending_deployments_system(
-    mut events: EventReader<UnitProducedEvent>,
-    match_state: Res<MatchState>,
-    mut registry: ResMut<V4DeploymentRegistry>,
-    manager: Option<ResMut<SquadManager>>,
-    island_map: Option<Res<IslandMap>>,
-    mut contract_registry: Option<ResMut<PlanContractRegistry>>,
-) {
-    let turn = match_state.current_turn_number.0;
-    let mut manager = manager;
-    for event in events.read() {
-        let slot = registry.assign_produced_extended(event, turn);
-        if slot.is_some()
-            && let Some(manager) = manager.as_deref_mut()
-        {
-            registry.resolve_produced_slot(event.entity, manager, island_map.as_deref());
-        }
-        if let Some(assigned) = registry.assigned.get(&event.entity)
-            && let Some(binding) = assigned.intent.operation_binding
-            && let Some(contracts) = contract_registry.as_deref_mut()
-            && let Err(err) =
-                contracts.reconcile_produced_binding(event.entity, binding, assigned.intent.anchor)
-        {
-            eprintln!("[WARN] Failed to reconcile produced binding: {:?}", err);
-        }
-    }
-    // 失敗した生産命令を翌ターンの同型発注へ誤照合しない。
-    registry.pending.retain(|pending| pending.turn >= turn);
-}
-
 /// 優先敵の現在位置を追跡し、消滅・到達不能時だけ局地敵へ再目標化する。
 pub(super) fn resolve_target(
     world: &mut World,
@@ -400,113 +369,6 @@ pub(super) fn anchor_is_owned_by(world: &World, anchor: GridPosition, player_id:
 }
 
 impl V4DeploymentRegistry {
-    /// 生産完了イベントを、同じ手番・施設・兵種の最初の発注へ決定的に照合する。
-    pub(super) fn assign_produced_extended(
-        &mut self,
-        event: &UnitProducedEvent,
-        turn: u32,
-    ) -> Option<FormingSquadSlotId> {
-        let index = self.pending.iter().position(|pending| {
-            pending.player_id == event.player_id
-                && pending.turn == turn
-                && pending.facility.x == event.target_x
-                && pending.facility.y == event.target_y
-                && pending.unit_type == event.unit_type
-        })?;
-        let intent = self
-            .pending
-            .remove(index)
-            .expect("照合済みpending deploymentが存在する");
-        let forming_slot = intent.forming_slot;
-        self.assigned.insert(
-            event.entity,
-            AssignedDeployment {
-                entity: event.entity,
-                intent,
-                squad_id: None,
-                current_target: None,
-                active: true,
-                assigned_turn: turn,
-                attack_count: 0,
-                priority_attack_count: 0,
-                mission_target_attack_count: 0,
-                mission_target_kill_count: 0,
-                mission_target_damage_value_dealt: 0,
-                mission_target_counter_value_received: 0,
-                mission_target_destroyed_value: 0,
-                mission_target_first_attack_turn: None,
-                capture_unit_attack_count: 0,
-                transport_unit_attack_count: 0,
-                kill_count: 0,
-                damage_value_dealt: 0,
-                counter_value_received: 0,
-                destroyed_value: 0,
-                first_attack_turn: None,
-            },
-        );
-        if let Some(slot) = forming_slot
-            && let Some(reservation) = self.forming_slots.get_mut(&slot)
-        {
-            reservation.entity = Some(event.entity);
-        }
-        forming_slot
-    }
-
-    /// 生産完了直後に予約slotを実Squadへ解決する。
-    ///
-    /// 実Entityは生成手番に行動できないが、次の再編まで`None`所属にしない。対象敵の
-    /// 再探索など戦術的な詳細は次手番の`prepare_deployment_squads`が更新する。
-    fn resolve_produced_slot(
-        &mut self,
-        entity: Entity,
-        manager: &mut SquadManager,
-        island_map: Option<&IslandMap>,
-    ) {
-        let Some(snapshot) = self.assigned.get(&entity).cloned() else {
-            return;
-        };
-        let Some(slot) = snapshot.intent.forming_slot else {
-            return;
-        };
-        let existing = self
-            .forming_slots
-            .get(&slot)
-            .and_then(|reservation| reservation.squad_id)
-            .and_then(|squad_id| {
-                manager.squads.iter().position(|squad| {
-                    squad.id == squad_id && squad.owner_id == Some(snapshot.intent.player_id)
-                })
-            });
-        let squad = if let Some(index) = existing {
-            &mut manager.squads[index]
-        } else {
-            manager.create_owned_squad(
-                match snapshot.intent.posture {
-                    DeploymentPosture::Execute => MissionType::Attack,
-                    DeploymentPosture::Forming => MissionType::Defense,
-                },
-                snapshot.intent.player_id,
-            )
-        };
-        squad.members.insert(entity);
-        squad.target = Some(match snapshot.intent.posture {
-            DeploymentPosture::Execute => snapshot.intent.anchor,
-            DeploymentPosture::Forming => snapshot.intent.staging_anchor,
-        });
-        squad.target_island = island_map
-            .and_then(|islands| islands.get_island_at(&snapshot.intent.anchor))
-            .map(|island| island.id);
-        squad.phase = MissionPhase::Forming;
-        let squad_id = squad.id;
-        if let Some(reservation) = self.forming_slots.get_mut(&slot) {
-            debug_assert_eq!(reservation.id, slot);
-            reservation.squad_id = Some(squad_id);
-        }
-        if let Some(deployment) = self.assigned.get_mut(&entity) {
-            deployment.squad_id = Some(squad_id);
-        }
-    }
-
     /// 同じ攻勢作戦の前衛・砲が協働できるか。別の敵を狙っていても作戦IDを失わない。
     /// 台帳が無い二体だけは呼出側のSquad目標による判定へ委ねる。
     pub(crate) fn shares_attack_operation(&self, left: Entity, right: Entity) -> Option<bool> {
@@ -576,7 +438,7 @@ mod tests {
         registry.replace_turn_orders(player, 3, [pending(0)]);
         let entity = Entity::from_raw(100);
         let slot = registry
-            .assign_produced_extended(
+            .assign_produced(
                 &UnitProducedEvent {
                     player_id: player,
                     target_x: 2,

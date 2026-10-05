@@ -235,20 +235,27 @@ impl V4DeploymentRegistry {
     }
 
     /// 生産完了イベントを、同じ手番・施設・兵種の最初の発注へ決定的に照合する。
-    fn assign_produced(&mut self, event: &UnitProducedEvent, turn: u32) {
-        let Some(index) = self.pending.iter().position(|pending| {
+    /// 生産完了Eventを、同じ手番・施設・兵種の最初の発注へ決定的に照合する。
+    ///
+    /// 予約slotを持つ発注（拡張経路で登録）は、そのslotへ完成Entityを記録して返す。
+    /// slotなしの発注は従来どおり台帳へ移すだけで `None` を返す。
+    fn assign_produced(
+        &mut self,
+        event: &UnitProducedEvent,
+        turn: u32,
+    ) -> Option<FormingSquadSlotId> {
+        let index = self.pending.iter().position(|pending| {
             pending.player_id == event.player_id
                 && pending.turn == turn
                 && pending.facility.x == event.target_x
                 && pending.facility.y == event.target_y
                 && pending.unit_type == event.unit_type
-        }) else {
-            return;
-        };
+        })?;
         let intent = self
             .pending
             .remove(index)
             .expect("照合済みpending deploymentが存在する");
+        let forming_slot = intent.forming_slot;
         self.assigned.insert(
             event.entity,
             AssignedDeployment {
@@ -275,6 +282,67 @@ impl V4DeploymentRegistry {
                 first_attack_turn: None,
             },
         );
+        if let Some(slot) = forming_slot
+            && let Some(reservation) = self.forming_slots.get_mut(&slot)
+        {
+            reservation.entity = Some(event.entity);
+        }
+        forming_slot
+    }
+
+    /// 生産完了直後に予約slotを実Squadへ解決する。
+    ///
+    /// 実Entityは生成手番に行動できないが、次の再編まで`None`所属にしない。対象敵の
+    /// 再探索など戦術的な詳細は次手番の`prepare_deployment_squads`が更新する。
+    fn resolve_produced_slot(
+        &mut self,
+        entity: Entity,
+        manager: &mut SquadManager,
+        island_map: Option<&IslandMap>,
+    ) {
+        let Some(snapshot) = self.assigned.get(&entity).cloned() else {
+            return;
+        };
+        let Some(slot) = snapshot.intent.forming_slot else {
+            return;
+        };
+        let existing = self
+            .forming_slots
+            .get(&slot)
+            .and_then(|reservation| reservation.squad_id)
+            .and_then(|squad_id| {
+                manager.squads.iter().position(|squad| {
+                    squad.id == squad_id && squad.owner_id == Some(snapshot.intent.player_id)
+                })
+            });
+        let squad = if let Some(index) = existing {
+            &mut manager.squads[index]
+        } else {
+            manager.create_owned_squad(
+                match snapshot.intent.posture {
+                    DeploymentPosture::Execute => MissionType::Attack,
+                    DeploymentPosture::Forming => MissionType::Defense,
+                },
+                snapshot.intent.player_id,
+            )
+        };
+        squad.members.insert(entity);
+        squad.target = Some(match snapshot.intent.posture {
+            DeploymentPosture::Execute => snapshot.intent.anchor,
+            DeploymentPosture::Forming => snapshot.intent.staging_anchor,
+        });
+        squad.target_island = island_map
+            .and_then(|islands| islands.get_island_at(&snapshot.intent.anchor))
+            .map(|island| island.id);
+        squad.phase = MissionPhase::Forming;
+        let squad_id = squad.id;
+        if let Some(reservation) = self.forming_slots.get_mut(&slot) {
+            debug_assert_eq!(reservation.id, slot);
+            reservation.squad_id = Some(squad_id);
+        }
+        if let Some(deployment) = self.assigned.get_mut(&entity) {
+            deployment.squad_id = Some(squad_id);
+        }
     }
 
     /// 現在playerの局地任務としてbeam searchから保護するSquad IDを返す。
@@ -570,14 +638,34 @@ impl V4DeploymentRegistry {
 }
 
 /// 実際に生産されたEntityをpending deploymentへ照合する。
-pub fn reconcile_pending_deployments_system(
+///
+/// 予約slotや作戦契約bindingを持つ発注（拡張経路だけが登録する）は、ここで実Squadと
+/// 契約へ接続する。slotもbindingもない通常経路の発注は台帳へ移すだけで、従来と同じ。
+pub(crate) fn reconcile_pending_deployments_system(
     mut events: EventReader<UnitProducedEvent>,
     match_state: Res<MatchState>,
     mut registry: ResMut<V4DeploymentRegistry>,
+    manager: Option<ResMut<SquadManager>>,
+    island_map: Option<Res<IslandMap>>,
+    mut contract_registry: Option<ResMut<PlanContractRegistry>>,
 ) {
     let turn = match_state.current_turn_number.0;
+    let mut manager = manager;
     for event in events.read() {
-        registry.assign_produced(event, turn);
+        let slot = registry.assign_produced(event, turn);
+        if slot.is_some()
+            && let Some(manager) = manager.as_deref_mut()
+        {
+            registry.resolve_produced_slot(event.entity, manager, island_map.as_deref());
+        }
+        if let Some(assigned) = registry.assigned.get(&event.entity)
+            && let Some(binding) = assigned.intent.operation_binding
+            && let Some(contracts) = contract_registry.as_deref_mut()
+            && let Err(err) =
+                contracts.reconcile_produced_binding(event.entity, binding, assigned.intent.anchor)
+        {
+            eprintln!("[WARN] Failed to reconcile produced binding: {:?}", err);
+        }
     }
     // 失敗した生産命令を翌ターンの同型発注へ誤照合しない。
     registry.pending.retain(|pending| pending.turn >= turn);
@@ -1071,7 +1159,7 @@ mod tests {
         assert_ne!(kept_slot, cancelled_slot);
 
         let produced = Entity::from_raw(100);
-        let bound_slot = registry.assign_produced_extended(&produced_event(produced), 3);
+        let bound_slot = registry.assign_produced(&produced_event(produced), 3);
 
         assert_eq!(bound_slot, Some(kept_slot));
         let assigned = registry.assigned.get(&produced).expect("Bの完成Entity");
@@ -1098,7 +1186,7 @@ mod tests {
         registry.replace_turn_orders(PlayerId(1), 3, [pending(0)]);
         let produced = Entity::from_raw(100);
         let produced_slot = registry
-            .assign_produced_extended(&produced_event(produced), 3)
+            .assign_produced(&produced_event(produced), 3)
             .expect("発注Aは予約slotへ接続する");
 
         registry.replace_turn_orders(PlayerId(1), 3, [pending(1)]);
@@ -1116,6 +1204,48 @@ mod tests {
             .expect("後続発注Bには新しいslotを予約する");
         assert_ne!(new_slot, produced_slot);
         assert_eq!(registry.forming_slots.len(), 2);
+    }
+
+    /// 発注照合Systemは経路によらず1本で動き、予約slotを持つ発注だけを生産直後に
+    /// 実Squadへ解決する（T4：slotの有無で処理を選ぶ）。通常経路の発注はslotを
+    /// 持たないため、従来どおり台帳へ移すだけでSquadを作らない。
+    #[test]
+    fn reconcile_system_resolves_squads_only_for_slotted_orders() {
+        for (path, creates_squad) in [
+            (crate::ai::code_path::CodePath::MainCompatible, false),
+            (crate::ai::code_path::CodePath::Extended, true),
+        ] {
+            let _guard = crate::ai::code_path::enter(path);
+            let mut registry = V4DeploymentRegistry::default();
+            registry.replace_turn_orders(PlayerId(1), 3, [pending(0)]);
+
+            let mut world = World::new();
+            world.insert_resource(MatchState {
+                current_turn_number: crate::resources::TurnNumber(3),
+                ..MatchState::default()
+            });
+            world.insert_resource(registry);
+            world.insert_resource(SquadManager::default());
+            world.init_resource::<Events<UnitProducedEvent>>();
+            let produced = Entity::from_raw(100);
+            world.send_event(produced_event(produced));
+            let mut schedule = Schedule::default();
+            schedule.add_systems(reconcile_pending_deployments_system);
+            schedule.run(&mut world);
+
+            let registry = world.resource::<V4DeploymentRegistry>();
+            let assigned = registry
+                .assigned
+                .get(&produced)
+                .expect("完成Entityを照合する");
+            assert_eq!(assigned.squad_id.is_some(), creates_squad, "{path:?}");
+            let squads = &world.resource::<SquadManager>().squads;
+            assert_eq!(squads.len(), usize::from(creates_squad), "{path:?}");
+            assert!(
+                squads.iter().all(|squad| squad.members.contains(&produced)),
+                "{path:?}"
+            );
+        }
     }
 
     #[test]

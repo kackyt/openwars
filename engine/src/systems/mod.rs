@@ -32,13 +32,9 @@ pub fn add_main_game_systems(schedule: &mut Schedule) {
         (
             crate::ai::engine::clear_ai_cooldowns_system,
             produce_unit_system,
-            // V4台帳のイベント処理はmain互換版と拡張版の一方だけを動かす。
-            (
-                crate::ai::v4::deployment::reconcile_pending_deployments_system
-                    .run_if(has_no_extended_v4),
-                crate::ai::v4::deployment::extended::reconcile_pending_deployments_system
-                    .run_if(has_extended_v4),
-            ),
+            // 発注照合は予約slotの有無で処理を選ぶため、経路によらず1本で動かす。
+            crate::ai::v4::deployment::reconcile_pending_deployments_system,
+            // 以下のV4台帳のイベント処理はmain互換版と拡張版の一方だけを動かす。
             (
                 crate::ai::v4::campaign_execution::reconcile_campaign_production_system
                     .run_if(has_no_extended_v4),

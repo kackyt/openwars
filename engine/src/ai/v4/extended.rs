@@ -4488,6 +4488,49 @@ mod tests {
         );
     }
 
+    /// 戦略解析の首都攻略DAG準備hookは拡張経路のV4だけが呼ぶ（F03の経路差を固定する）。
+    /// 同じ盤面・同じプロファイルでも、通常経路の戦略解析はDAGトポロジを作らない。
+    #[test]
+    fn strategy_analysis_prepares_capital_route_dag_only_on_extended_path() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let player = PlayerId(1);
+        for (path, builds_dag) in [
+            (crate::ai::code_path::CodePath::MainCompatible, false),
+            (crate::ai::code_path::CodePath::Extended, true),
+        ] {
+            let _guard = crate::ai::code_path::enter(path);
+            let (mut world, _schedule) =
+                crate::setup::initialize_world_from_master_data_with_topology(
+                    &master_data,
+                    "map_26",
+                    GridTopology::Square,
+                )
+                .expect("map_26を初期化できる");
+            let mut settings = crate::ai::ai_version::PlayerAiSettings::new();
+            settings.set_version(player, crate::ai::ai_version::AiVersion::V4);
+            world.insert_resource(settings);
+            // DAG準備hookは小規模マップ展開のプロファイルでだけ動くため、明示的に確定する。
+            world.insert_resource(
+                crate::ai::strategy_profile::V4StrategyProfileRegistry::with_profile(
+                    player,
+                    crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion,
+                ),
+            );
+
+            crate::ai::strategy::analyze_strategy(&mut world, player);
+
+            let has_dag = world
+                .get_resource::<CapitalRouteTopologyRegistry>()
+                .is_some_and(|registry| {
+                    registry
+                        .topologies
+                        .keys()
+                        .any(|key| key.player_id == player)
+                });
+            assert_eq!(has_dag, builds_dag, "{path:?}");
+        }
+    }
+
     #[test]
     fn map26_builds_a_forward_dag_independently_for_each_player() {
         let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
