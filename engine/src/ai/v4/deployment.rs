@@ -966,15 +966,12 @@ pub(crate) fn prepare_deployment_squads(
     player_id: PlayerId,
     higher_priority_reserved: &HashSet<Entity>,
 ) -> HashSet<Entity> {
-    // 小規模マップのV4は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended_at("v4/deployment.rs::prepare_deployment_squads") {
-        return extended::prepare_deployment_squads(
-            world,
-            manager,
-            player_id,
-            higher_priority_reserved,
-        );
-    }
+    // 拡張経路では、占領枠の直接任務化と、迎撃役の上限つき目標解決（H06）を使う。
+    // Entityの走査順・Squadの付け替え・解放の手順は両経路で共通。
+    let is_extended_path =
+        crate::ai::code_path::is_extended_at("v4/deployment.rs::prepare_deployment_squads");
+    let mut target_commitments: HashMap<Entity, usize> = HashMap::new();
+    let mut interceptors = 0_usize;
     let mut registry = world
         .remove_resource::<V4DeploymentRegistry>()
         .unwrap_or_default();
@@ -1012,9 +1009,40 @@ pub(crate) fn prepare_deployment_squads(
             DeploymentPosture::Forming => {
                 (None, snapshot.intent.staging_anchor, MissionType::Defense)
             }
+            // 拡張経路の占領枠は敵の目標解決を行わず、anchor物件への占領任務にする。
+            DeploymentPosture::Execute
+                if is_extended_path && snapshot.intent.slot_kind == SlotKind::Capture =>
+            {
+                // anchor物件が既に自軍所有なら占領任務は達成済み。任務を出し続けると
+                // 占領役が物件上に留まり続け、生産マス前の通路を塞ぐため解放する。
+                if extended::anchor_is_owned_by(world, snapshot.intent.anchor, player_id) {
+                    releases.push((entity, snapshot.squad_id));
+                    continue;
+                }
+                (None, snapshot.intent.anchor, MissionType::Capture)
+            }
             DeploymentPosture::Execute => {
-                match resolve_target(world, &mut connectivity, &snapshot) {
-                    Some((target_entity, target)) => {
+                let resolved = if is_extended_path {
+                    extended::resolve_target(
+                        world,
+                        &mut connectivity,
+                        &snapshot,
+                        &target_commitments,
+                        interceptors,
+                    )
+                } else {
+                    resolve_target(world, &mut connectivity, &snapshot)
+                        .map(|(target_entity, target)| (target_entity, target, false))
+                };
+                match resolved {
+                    Some((target_entity, target, is_wall)) => {
+                        if is_extended_path {
+                            // 同じ敵への割当数と壁役の数は、拡張経路の目標解決だけが参照する。
+                            *target_commitments.entry(target_entity).or_insert(0) += 1;
+                            if is_wall {
+                                interceptors += 1;
+                            }
+                        }
                         (Some(target_entity), target, MissionType::Attack)
                     }
                     // Combat排除後も対象拠点の占領完了まではPlanを閉じない。

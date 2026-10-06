@@ -150,151 +150,6 @@ pub(super) fn resolve_target(
     })
 }
 
-/// 生産済みEntityを汎用free poolより先にV4局地Attack任務へ予約する。
-///
-/// 島嶼キャンペーンで既に予約されたEntityは既存作戦を優先し、次ターン再試行する。
-pub(crate) fn prepare_deployment_squads(
-    world: &mut World,
-    manager: &mut SquadManager,
-    player_id: PlayerId,
-    higher_priority_reserved: &HashSet<Entity>,
-) -> HashSet<Entity> {
-    if !crate::ai::code_path::ext_enabled("v4/deployment.rs::prepare_deployment_squads") {
-        return super::prepare_deployment_squads(
-            world,
-            manager,
-            player_id,
-            higher_priority_reserved,
-        );
-    }
-    let mut registry = world
-        .remove_resource::<V4DeploymentRegistry>()
-        .unwrap_or_default();
-    let mut connectivity = TerrainConnectivity::default();
-    let mut reserved = HashSet::new();
-    let mut releases = Vec::new();
-    let island_map = world
-        .get_resource::<IslandMap>()
-        .cloned()
-        .or_else(|| world.get_resource::<Map>().map(IslandMap::analyze));
-    let mut entities: Vec<_> = registry
-        .assigned
-        .iter()
-        .filter(|(_, deployment)| deployment.intent.player_id == player_id && deployment.active)
-        .map(|(&entity, _)| entity)
-        .collect();
-    entities.sort_unstable_by_key(|entity| entity.to_bits());
-    let mut target_commitments: HashMap<Entity, usize> = HashMap::new();
-    let mut interceptors = 0_usize;
-
-    for entity in entities {
-        let Some(snapshot) = registry.assigned.get(&entity).cloned() else {
-            continue;
-        };
-        if world.get_entity(entity).is_err() {
-            releases.push((entity, snapshot.squad_id));
-            continue;
-        }
-        if higher_priority_reserved.contains(&entity) {
-            if let Some(deployment) = registry.assigned.get_mut(&entity) {
-                deployment.current_target = None;
-            }
-            continue;
-        }
-        let (target_entity, target, mission_type) = match snapshot.intent.posture {
-            // 首都攻略パッケージが揃う前は、個々の生産Entityを敵地へ逐次投入しない。
-            DeploymentPosture::Forming => {
-                (None, snapshot.intent.staging_anchor, MissionType::Defense)
-            }
-            DeploymentPosture::Execute => {
-                // 占領スロットの場合はターゲット解決を行わず、直接占領任務を割り当てる
-                if snapshot.intent.slot_kind == SlotKind::Capture {
-                    // anchor物件が既に自軍所有なら占領任務は達成済み。任務を出し続けると
-                    // 占領役が物件上に留まり続け、生産マス前の通路を塞ぐため解放する。
-                    if anchor_is_owned_by(world, snapshot.intent.anchor, player_id) {
-                        releases.push((entity, snapshot.squad_id));
-                        continue;
-                    }
-                    (None, snapshot.intent.anchor, MissionType::Capture)
-                } else {
-                    match resolve_target(
-                        world,
-                        &mut connectivity,
-                        &snapshot,
-                        &target_commitments,
-                        interceptors,
-                    ) {
-                        Some((target_entity, target, is_wall)) => {
-                            *target_commitments.entry(target_entity).or_insert(0) += 1;
-                            if is_wall {
-                                interceptors += 1;
-                            }
-                            (Some(target_entity), target, MissionType::Attack)
-                        }
-                        // Combat排除後も対象拠点の占領完了まではPlanを閉じない。
-                        // 生産戦力をfree poolへ返さず、anchorで反撃増援を待ち受ける。
-                        None if snapshot.intent.plan_step.is_some() => {
-                            (None, snapshot.intent.anchor, MissionType::Defense)
-                        }
-                        None => {
-                            releases.push((entity, snapshot.squad_id));
-                            continue;
-                        }
-                    }
-                }
-            }
-        };
-
-        // 過去の汎用Squadへ混入していた場合は、このEntityだけを切り離す。
-        for squad in &mut manager.squads {
-            if squad.owner_id == Some(player_id) && Some(squad.id) != snapshot.squad_id {
-                squad.members.remove(&entity);
-            }
-        }
-        let squad_index = snapshot.squad_id.and_then(|id| {
-            manager
-                .squads
-                .iter()
-                .position(|squad| squad.id == id && squad.owner_id == Some(player_id))
-        });
-        let squad = if let Some(index) = squad_index {
-            &mut manager.squads[index]
-        } else {
-            manager.create_owned_squad(MissionType::Attack, player_id)
-        };
-        squad.members.clear();
-        squad.members.insert(entity);
-        squad.mission_type = mission_type;
-        squad.target = Some(target);
-        // 生産時Planと同じ島campaign ownerをSquadにも持たせる。Noneの汎用Squadに
-        // すると排他reconcileで正本campaign ownerと競合し、任務が断続的に消える。
-        squad.target_island = island_map
-            .as_ref()
-            .and_then(|islands| islands.get_island_at(&snapshot.intent.anchor))
-            .map(|island| island.id);
-        squad.phase = MissionPhase::MovingToTarget;
-        let squad_id = squad.id;
-        if let Some(deployment) = registry.assigned.get_mut(&entity) {
-            deployment.squad_id = Some(squad_id);
-            deployment.current_target = target_entity;
-        }
-        reserved.insert(entity);
-    }
-
-    for (entity, squad_id) in releases {
-        if let Some(deployment) = registry.assigned.get_mut(&entity) {
-            deployment.active = false;
-            deployment.squad_id = None;
-            deployment.current_target = None;
-        }
-        if let Some(squad_id) = squad_id {
-            manager.squads.retain(|squad| squad.id != squad_id);
-        }
-    }
-    world.insert_resource(registry);
-    reserved
-}
-
 /// 敵の占領歩兵が、自軍の邪魔（物理ブロック）もZoC足止めも受けずに
 /// 拠点群へフリーパスで侵入・占領できる状態（無防備な脅威）であるかを判定する。
 pub(super) fn is_uncontested_capture_threat(
@@ -624,6 +479,45 @@ mod tests {
             .unwrap();
         assert_eq!(squad.mission_type, MissionType::Capture);
         assert_eq!(squad.target, Some(anchor));
+    }
+
+    /// 占領枠の配備は、拡張経路だけが敵の目標解決を飛ばして占領任務にする
+    /// （F23の経路差を固定する）。通常経路は従来どおり優先敵へのAttack任務になる。
+    #[test]
+    fn capture_slot_becomes_capture_mission_only_on_extended_path() {
+        for (path, expected) in [
+            (
+                crate::ai::code_path::CodePath::MainCompatible,
+                MissionType::Attack,
+            ),
+            (
+                crate::ai::code_path::CodePath::Extended,
+                MissionType::Capture,
+            ),
+        ] {
+            let _code_path = crate::ai::code_path::enter(path);
+            let (mut world, attacker, _, _, _) = deployment_world();
+            let anchor = GridPosition { x: 5, y: 0 };
+            world.spawn((anchor, Property::new(Terrain::City, None, 20)));
+            {
+                let mut registry = world.resource_mut::<V4DeploymentRegistry>();
+                let deployment = registry.assigned.get_mut(&attacker).unwrap();
+                deployment.intent.slot_kind = SlotKind::Capture;
+                deployment.intent.anchor = anchor;
+            }
+            let mut manager = SquadManager::default();
+
+            let reserved =
+                prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::new());
+
+            assert!(reserved.contains(&attacker), "{path:?}");
+            let squad = manager
+                .squads
+                .iter()
+                .find(|squad| squad.members.contains(&attacker))
+                .unwrap();
+            assert_eq!(squad.mission_type, expected, "{path:?}");
+        }
     }
 
     #[test]
