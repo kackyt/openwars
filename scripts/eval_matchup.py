@@ -9,6 +9,7 @@ from collections import defaultdict
 from pathlib import Path
 
 if __package__:
+    from scripts import matchup_runner
     from scripts.eval_issue58 import (
         analyze_issue58_game,
         check_no_decline,
@@ -23,6 +24,7 @@ if __package__:
     )
 else:
     # 直接実行時は別 checkout の scripts パッケージではなく同階層を読む。
+    import matchup_runner
     from eval_issue58 import (
         analyze_issue58_game,
         check_no_decline,
@@ -45,83 +47,32 @@ try:
 except ImportError:
     HAS_RICH = False
 
-p = None  # MCP Server process
+# 対局を並列実行しても、このプロセスが起動したサーバーだけを終了時に後始末する。
+SERVER_REGISTRY = matchup_runner.ServerRegistry()
+
+# 互換用：単一サーバーで逐次に呼ぶ旧API（init_mcp_server / call_tool）の接続。
+_default_client = None
+p = None  # 旧APIで起動したMCPサーバーのプロセス（互換のため残す）
+
+
+def server_command(custom_bin=None):
+    """起動するmcp-serverのコマンドを返す。"""
+    if custom_bin:
+        return [os.path.abspath(custom_bin)]
+    return [str(matchup_runner.default_server_path())]
+
 
 def init_mcp_server(custom_bin=None):
-    global p
-    env = os.environ.copy()
-    env['RUST_LOG'] = 'info'
-    if custom_bin:
-        exe_path = os.path.abspath(custom_bin)
-    else:
-        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        exe_name = 'mcp-server.exe' if os.name == 'nt' else 'mcp-server'
-        exe_path = os.path.join(repo_root, 'target', 'release', exe_name)
-    p = subprocess.Popen(
-        [exe_path],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=(
-            None
-            if os.environ.get("OPENWARS_TRACE_AI_STEPS")
-            else subprocess.DEVNULL
-        ),
-        text=True,
-        encoding='utf-8',
-        env=env
-    )
-    
-    # MCP 初期化シーケンス
-    init_params = {
-        "protocolVersion": "2024-11-05",
-        "capabilities": {},
-        "clientInfo": {
-            "name": "openwars-eval",
-            "version": "0.1.0"
-        }
-    }
-    send_request("initialize", init_params, req_id=0)
-    receive_response()
+    """旧API：既定の接続を1本起動する。"""
+    global _default_client, p
+    _default_client = SERVER_REGISTRY.create(server_command(custom_bin))
+    _default_client._ensure_started()
+    p = _default_client.process
 
-def send_request(method, params=None, req_id=1):
-    req = {
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "method": method
-    }
-    if params:
-        req["params"] = params
-    line = json.dumps(req)
-    p.stdin.write(line + '\n')
-    p.stdin.flush()
-
-def receive_response():
-    line = p.stdout.readline()
-    if not line:
-        return None
-    return json.loads(line)
 
 def call_tool(name, arguments=None, req_id=1):
-    params = {
-        "name": name,
-        "arguments": arguments or {}
-    }
-    send_request("tools/call", params, req_id)
-    res = receive_response()
-    if not res:
-        return None
-    if "error" in res:
-        raise Exception(f"Tool {name} returned error: {res['error']}")
-    
-    result_data = res.get("result", {})
-    if result_data.get("isError"):
-        return {"error": result_data.get("content")}
-        
-    content = result_data.get('content', [{'text': '{}'}])[0]['text']
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        return content
+    """旧API：既定の接続でツールを呼ぶ。"""
+    return _default_client.call_tool(name, arguments, req_id)
 
 
 ISSUE58_V3_V1 = "v3-v1"
@@ -1058,6 +1009,82 @@ def generate_report(results, subject="V2", baseline="V1", max_turns=30):
 
     return "\n".join(report)
 
+def run_batch(match_specs, args, command, log_dir):
+    """batchモードの対局を --jobs 本のサーバーで実行し、仕様順の結果を返す。
+
+    log_dir が無い逐次実行では従来どおり詳細を標準出力へ出す。log_dir がある場合は
+    標準出力を進捗1行に絞り、対局ごとのログと結果の逐次追記（results.jsonl）を
+    log_dir へ書く。途中で止めても完了済みの対局は results.jsonl に残る。
+    """
+    log_root = Path(log_dir) if log_dir else None
+    results_jsonl = None
+    if log_root is not None:
+        log_root.mkdir(parents=True, exist_ok=True)
+        results_jsonl = open(log_root / "results.jsonl", "w", encoding="utf-8")
+    jobs = [dict(spec, index=index) for index, spec in enumerate(match_specs)]
+    done = [0]
+
+    def ui_callback_batch(event):
+        if event["type"] == "log":
+            print(f"[LOG] {event['msg']}")
+        elif event["type"] == "status_update":
+            print(json.dumps({"type": "metrics", "data": event["metrics"]}))
+
+    def make_client(job, number):
+        stderr_path = (
+            log_root / "servers" / f"server-{number}.stderr.log" if log_root else None
+        )
+        return SERVER_REGISTRY.create(command, stderr_path=stderr_path)
+
+    def run_one(job, client):
+        spec = {key: value for key, value in job.items() if key != "index"}
+        label = f"{job['index']:03d}_{matchup_runner.game_label(spec)}"
+        game_log = (
+            matchup_runner.GameLog(log_root / "games" / f"{label}.log") if log_root else None
+        )
+        try:
+            result = run_single_game(
+                spec["map"],
+                spec["p1"],
+                spec["p2"],
+                args.max_turns,
+                seed=spec["seed"],
+                grid_type=spec.get("grid_type", args.grid_type),
+                ui_callback=game_log if game_log else ui_callback_batch,
+                tool_caller=client.call_tool,
+            )
+        finally:
+            if game_log:
+                game_log.close()
+        result.update(spec)
+        return result
+
+    def on_done(index, job, result, elapsed):
+        done[0] += 1
+        if results_jsonl is not None:
+            results_jsonl.write(json.dumps(dict(result, index=index), ensure_ascii=False) + "\n")
+            results_jsonl.flush()
+            label = matchup_runner.game_label(result)
+            matchup_runner.print_flush(
+                matchup_runner.format_progress(done[0], len(jobs), label, result, elapsed)
+            )
+        else:
+            print(json.dumps({"type": "result", "data": matchup_runner.slim_result(result)}), flush=True)
+
+    try:
+        return matchup_runner.run_jobs(
+            jobs,
+            args.jobs,
+            server_key=lambda job: tuple(command),
+            make_client=make_client,
+            run_one=run_one,
+            on_done=on_done,
+        )
+    finally:
+        if results_jsonl is not None:
+            results_jsonl.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description="AI Matchup Evaluator for OpenWars")
     parser.add_argument("--mode", choices=["tui", "batch"], default="tui", help="Execution mode (tui or batch)")
@@ -1105,9 +1132,30 @@ def main():
     )
     parser.add_argument("--stall-turns", type=int, default=5, help="Subject turns before an unchanged transport is considered stalled")
     parser.add_argument("--mcp-server-bin", default=None, help="Custom path to mcp-server binary for parallel worktree isolation")
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="Number of games run in parallel (one mcp-server per worker)",
+    )
+    parser.add_argument(
+        "--log-dir",
+        default=None,
+        help="Directory for per-game logs and incremental results.jsonl "
+        "(default with --jobs > 1: <output stem>_logs)",
+    )
     parser.add_argument("--output", default="matchup_report.md", help="Output file for the final report")
     args = parser.parse_args()
 
+    if args.jobs < 1:
+        parser.error("--jobs must be >= 1")
+    if args.mode == "tui" and args.jobs > 1:
+        parser.error("--jobs > 1 is supported only in --mode batch")
+    # 並列時は標準出力に進捗だけを出し、対局ごとの詳細はファイルへ分ける。
+    log_dir = args.log_dir
+    if log_dir is None and args.jobs > 1:
+        output_path = Path(args.output)
+        log_dir = str(output_path.with_name(f"{output_path.stem}_logs"))
     maps = tuple(mn.strip() for mn in args.map.split(",") if mn.strip())
     issue58_metadata = None
     baseline_payload = None
@@ -1202,7 +1250,17 @@ def main():
             except (OSError, json.JSONDecodeError, ValueError) as error:
                 parser.error(str(error))
     else:
-        seeds = tuple(args.seed for _ in range(args.games))
+        # --seeds を指定した場合は各seedを --games 局ずつ、1回の実行でまとめて回す。
+        if args.seeds:
+            if args.seed is not None:
+                parser.error("--seeds and --seed are mutually exclusive")
+            try:
+                seed_list = parse_seed_list(args.seeds)
+            except ValueError as error:
+                parser.error(str(error))
+            seeds = tuple(seed for seed in seed_list for _ in range(args.games))
+        else:
+            seeds = tuple(args.seed for _ in range(args.games))
         match_specs = build_match_specs(
             maps,
             args.p1,
@@ -1212,7 +1270,7 @@ def main():
             player_order=args.player_order,
         )
 
-    init_mcp_server(custom_bin=args.mcp_server_bin)
+    command = server_command(args.mcp_server_bin)
     all_results = []
     logs = []
     
@@ -1262,6 +1320,7 @@ def main():
             layout["status"].update(Panel("Waiting for game to start..."))
             layout["log"].update(Panel("Logs will appear here..."))
 
+            client = SERVER_REGISTRY.create(command)
             with Live(layout, refresh_per_second=4) as live:
                 for spec in match_specs:
                     result = run_single_game(
@@ -1272,47 +1331,13 @@ def main():
                         seed=spec["seed"],
                         grid_type=spec.get("grid_type", args.grid_type),
                         ui_callback=lambda e: ui_callback_tui(e, layout, live),
+                        tool_caller=client.call_tool,
                     )
                     result.update(spec)
                     all_results.append(result)
         else:
-            print(json.dumps({"type": "info", "msg": f"Starting batch run: {args.p1} vs {args.p2} on {maps} ({len(match_specs)} matches, order={args.player_order})"}))
-            for spec in match_specs:
-                result = run_single_game(
-                    spec["map"],
-                    spec["p1"],
-                    spec["p2"],
-                    args.max_turns,
-                    seed=spec["seed"],
-                    grid_type=spec.get("grid_type", args.grid_type),
-                    ui_callback=ui_callback_batch,
-                )
-                result.update(spec)
-                all_results.append(result)
-                print(json.dumps({
-                    "type": "result",
-                    "data": {
-                        key: value
-                        for key, value in result.items()
-                        if key not in {
-                            "metrics",
-                            "final_state",
-                            "initial_state",
-                            "invasion_events",
-                            "transport_history",
-                            "strategic_history",
-                            "island_campaign_history",
-                            "idle_audit_history",
-                            "operation_assignment_history",
-                            "production_plan_history",
-                            "deployment_audit_history",
-                            "plan_revision_history",
-                            "plan_execution_history",
-                            "emergency_plan_history",
-                            "factory_relief_history",
-                        }
-                    },
-                }))
+            print(json.dumps({"type": "info", "msg": f"Starting batch run: {args.p1} vs {args.p2} on {maps} ({len(match_specs)} matches, order={args.player_order}, jobs={args.jobs})"}), flush=True)
+            all_results = run_batch(match_specs, args, command, log_dir)
 
         if args.trace_output:
             write_trace_jsonl(args.trace_output, all_results)
@@ -1400,6 +1425,7 @@ def main():
                             "player_order": args.player_order,
                             "games_per_order": args.games,
                             "seed": args.seed,
+                            "seeds": list(dict.fromkeys(seeds)),
                             "max_turns": args.max_turns,
                             "grid_type": args.grid_type,
                         },
@@ -1411,16 +1437,8 @@ def main():
             print(json.dumps({"type": "info", "msg": f"Report generated at {args.output}"}))
 
     finally:
-        if p:
-            try:
-                p.stdin.close()
-            except Exception:
-                pass
-            try:
-                p.terminate()
-                p.wait(timeout=3)
-            except Exception:
-                p.kill()
+        # 正常終了・例外・Ctrl+C のいずれでも、このプロセスが起動したサーバーだけを止める。
+        SERVER_REGISTRY.close_all()
 
     if args.mode == "batch" and args.criteria == "issue58":
         if execution_incomplete:

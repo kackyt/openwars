@@ -4,9 +4,9 @@
 
 実行前に、HEADと差分、必要な未追跡ソース、使用バイナリの識別子、マップ、グリッド、P1/P2、相手、seed、ターン上限を記録する。作業中の基準をソースのコピー/パッチや隔離した作業場所に保持し、候補の反証後に戻れるようにする。既存のユーザー変更は保持する。
 
-`scripts/eval_matchup.py` はreleaseの `mcp-server` を起動するため、実行コードの変更後は `cargo build --release -p mcp-server` の成功を確認する。古いバイナリの結果を新しいソースの結果として報告しない。ビルドとベンチマークの起動は依存順に行う。
+評価スクリプトはreleaseの `mcp-server` を起動するため、実行コードの変更後は `cargo build --release -p mcp-server` の成功を確認する。古いバイナリの結果を新しいソースの結果として報告しない。ビルドとベンチマークの起動は依存順に行う。比較に使うバイナリは別名でコピーして固定し（例: `.tmp/bench-<日付>/mcp-server-candidate.exe`）、実行中の再ビルドで上書きされないようにする。基準版は `git worktree` と別の `CARGO_TARGET_DIR` でビルドする。
 
-この評価スクリプトは起動時に既存のmcp-serverを終了する処理を持つ。**対戦ベンチマークを並列実行しない。** ユーザーが操作中の対局にも影響するので、同じサーバーを使う実行がないことを確認する。
+`scripts/eval_matchup.py` と `scripts/run_matchup_sweep.py` は `--jobs N` で対局を並列に回し、終了時（例外・Ctrl+Cを含む）に**自分が起動したサーバーだけ**を後始末する。他のベンチやユーザー操作中の対局には影響しないので、ベンチを並列に、またバックグラウンドで実行してよい。基準版と候補版の比較は `run_matchup_sweep.py` で1回にまとめる（使い方は `openwars-mcp-ai-eval` スキル）。
 
 ## 安い反証から進める
 
@@ -16,28 +16,34 @@
 
 P1を常に改善対象としない。後攻の改善ならP2を維持する。30ターンなどを固定の成功条件にせず、既存基準・指定ログ・ユーザー要件に合わせて上限を選ぶ。
 
-## 実行例（PowerShell）
+## 実行例
 
-以下は、既存の基準がMap32・P2=V4・60ターンである場合の例。値は実験条件へ置き換える。`$seedList` を代表seedだけにすれば局所検証にも使える。
+以下は、既存の基準がMap32・P2=V4・60ターンである場合の例。値は実験条件へ置き換える。`--seeds` を代表seedだけにすれば局所検証にも使える。
 
 ```powershell
-$runDir = 'reports/<new-run>'
-$seedList = 1..12
+$runDir = '.tmp/bench-<new-run>'
 if (Test-Path -LiteralPath $runDir) { throw '既存の計測結果を上書きしない' }
-New-Item -ItemType Directory -Path $runDir | Out-Null
 cargo build --release -p mcp-server
 if ($LASTEXITCODE -ne 0) { throw 'release build failed' }
-foreach ($seed in $seedList) {
-    python scripts/eval_matchup.py --mode batch --map map_32 --p1 V200 --p2 V4 --player-order as-given --seed $seed --games 1 --max-turns 60 --grid-type hex --output "$runDir/seed$seed.md" --json-output "$runDir/seed$seed.json" *> "$runDir/seed$seed.log"
-    if ($LASTEXITCODE -ne 0) { throw "seed $seed failed; inspect its log" }
-}
+New-Item -ItemType Directory -Path $runDir | Out-Null
+Copy-Item target/release/mcp-server.exe "$runDir/mcp-server-candidate.exe"
+# 基準版バイナリは別のworktreeでビルドして "$runDir/mcp-server-baseline.exe" へ置いておく。
+python scripts/run_matchup_sweep.py `
+    --variant baseline="$runDir/mcp-server-baseline.exe" `
+    --variant candidate="$runDir/mcp-server-candidate.exe" `
+    --map map_32 --p1 V200 --p2 V4 --player-order as-given `
+    --seeds 1,2,3,4,5,6,7,8,9,10,11,12 --max-turns 60 --jobs 8 `
+    --out-dir "$runDir/sweep" *> "$runDir/sweep.log"
+if ($LASTEXITCODE -ne 0) { throw 'sweep failed; inspect sweep.log and logs/' }
 ```
+
+`$runDir/sweep/games/<変種>/map_32_V200-V4_r0/seed<N>.json` が `compare_benchmarks.py` の入力ディレクトリになる。標準マップのように実行ごとに行動列が揺れる条件で挙動の一致を確かめるときは `--repeats 3` 以上にし、`summary.md` の判定（✅ 集合一致 / 🟡 共通あり / ❌ 共通なし）で分布を比べる。1局ずつの差を退行とみなさない。
 
 エラー・タイムアウト・欠損seedを敗北やゼロ指標へ置き換えない。比較可能なデータが揃うまで集計結果を確定しない。ログは全量を会話へ貼らず、問題のある区間を抜き出す。
 
 ## 比較の読み方
 
-付属 `scripts/compare_benchmarks.py` は各seedファイルに一対局ある結果を扱う。複数マップ・先後両方を一ファイルへ詰めた結果は、対戦条件別に分けてから使う。
+付属 `scripts/compare_benchmarks.py` は各seedファイルに一対局ある結果（`seed<N>.json`）を扱う。`run_matchup_sweep.py` の `games/<変種>/<条件>/` はこの形式で出力される。`eval_matchup.py --json-output` のように複数マップ・先後両方を一ファイルへ詰めた結果は、対戦条件別に分けてから使う。
 
 ```text
 python -X utf8 <skill-dir>/scripts/compare_benchmarks.py <baseline-dir> <candidate-dir> --subject V4 --output <local-report.md>

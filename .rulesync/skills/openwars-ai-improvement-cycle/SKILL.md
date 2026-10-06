@@ -58,7 +58,7 @@ description: >-
    - 3 seed（例: seed 1..3）での短縮対戦。明らかな退行やフリーズがないか確認。
 
 4. **Gate 3: フルベンチマーク (Subagent: `openwars-benchmark-runner` / `haiku`)**
-   - Gate 0〜2 を突破した最良の 1〜2 案のみに対して、12 seed フルベンチマーク (`eval_matchup.py`) と `compare_benchmarks.py` 集計を実行。
+   - Gate 0〜2 を突破した最良の 1〜2 案のみに対して、12 seed フルベンチマーク（`run_matchup_sweep.py` で基準版と候補版を `--jobs` 並列に同時実行）と `compare_benchmarks.py` 集計を実行。手順は [benchmark-protocol](references/benchmark-protocol.md)。
 
 ---
 
