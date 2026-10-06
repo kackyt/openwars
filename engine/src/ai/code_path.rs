@@ -60,7 +60,8 @@ pub fn is_extended_at(id: &str) -> bool {
 
 /// 拡張経路で手番を実行したプレイヤー。
 ///
-/// V4の台帳を更新するイベント処理システムは、main互換版と拡張版の一方だけを動かす。
+/// Roadmap監査は、main互換版と拡張版の一方だけを動かすためにこの履歴を参照する。
+/// 生産照合の2組は発注の予約有無で処理する共通Systemとなり、この履歴を参照しない。
 /// V4の経路は盤面で決まるため、同じ対局のV4は全員同じ経路になる。
 #[derive(Resource, Debug, Default)]
 pub struct CodePathRegistry {
@@ -84,12 +85,12 @@ pub fn for_player(world: &mut World, player_id: PlayerId) -> CodePath {
     }
 }
 
-/// 小規模マップのV4が対局にいるか（V4台帳のシステム選択条件）。
+/// 小規模マップのV4が対局にいるか（Roadmap監査システムの選択条件）。
 pub fn has_extended_v4(registry: Option<Res<CodePathRegistry>>) -> bool {
     registry.is_some_and(|registry| !registry.extended_players.is_empty())
 }
 
-/// main互換のV4台帳システムを動かすか。
+/// main互換のRoadmap監査システムを動かすか。
 pub fn has_no_extended_v4(registry: Option<Res<CodePathRegistry>>) -> bool {
     !has_extended_v4(registry)
 }
@@ -133,7 +134,7 @@ mod tests {
         world
     }
 
-    /// 小規模マップのV4だけが拡張経路を使い、台帳システムの選択にも反映される。
+    /// 小規模マップのV4だけが拡張経路を使い、Roadmap監査システムの選択にも反映される。
     #[test]
     fn only_small_map_v4_uses_extended_path() {
         let mut small = world_for("map_1", AiVersion::V4);

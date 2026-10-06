@@ -694,10 +694,15 @@ fn decide_campaign_production_v4(
         &scan.master_data,
         scan.funds,
     );
+    let reservation = if crate::ai::code_path::is_extended() {
+        campaign_execution::CampaignFormingReservation::Immediate
+    } else {
+        campaign_execution::CampaignFormingReservation::Deferred
+    };
     world.init_resource::<campaign_execution::V4CampaignExecutionRegistry>();
     world
         .resource_mut::<campaign_execution::V4CampaignExecutionRegistry>()
-        .replace_turn_intents(player_id, turn, &outcome.intents);
+        .replace_turn_intents(player_id, turn, &outcome.intents, reservation);
     let generic_budget = outcome.generic_funds;
     let mut cache = world
         .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
