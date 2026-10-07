@@ -313,6 +313,18 @@ impl SimulationCatalog {
         if crate::ai::code_path::is_extended_at("v4/rolling_plan.rs::new") {
             return Self::new_extended(input);
         }
+        Self::new_with_production_initializer(input, |_, option| {
+            sim_production_friendly(input, option, true)
+        })
+    }
+
+    /// 通常モデルを土台に、既存・保護・敵の初期化と入力順を共有する。
+    /// 生産unitにだけモデル固有の初期化を適用し、購入契約や実経路projectionは
+    /// この共通構築器へ持ち込まない。indexはprojection行との対応に使う。
+    fn new_with_production_initializer(
+        input: &RollingPlanInput,
+        mut initialize_production: impl FnMut(usize, &ProductionPlanOption) -> SimFriendly,
+    ) -> Self {
         let existing_units = input
             .existing_units
             .iter()
@@ -326,20 +338,8 @@ impl SimulationCatalog {
         let production_units = input
             .production_options
             .iter()
-            .map(|option| {
-                sim_friendly(
-                    input,
-                    &FriendlyPlanUnit {
-                        protection_completion_turn: None,
-                        stats: option.stats.clone(),
-                        position: option.purchase.facility,
-                        hp: 100,
-                        available_turn: option.purchase.build_turn.saturating_add(1),
-                        engageable_enemy_indices: option.engageable_enemy_indices.clone(),
-                    },
-                    true,
-                )
-            })
+            .enumerate()
+            .map(|(index, option)| initialize_production(index, option))
             .collect();
         let enemies = input
             .enemies
@@ -1079,6 +1079,27 @@ fn simulate_state_with_catalog(
     }
 }
 
+/// 両モデルで同じ購入unitの基礎状態を作る。生産当日は行動せず、次手番からだけ
+/// 行動できる。拡張の占領役も到着turnまでは待たせず、経路上での交戦を表現する。
+fn sim_production_friendly(
+    input: &RollingPlanInput,
+    option: &ProductionPlanOption,
+    can_advance_to_enemy: bool,
+) -> SimFriendly {
+    sim_friendly(
+        input,
+        &FriendlyPlanUnit {
+            protection_completion_turn: None,
+            stats: option.stats.clone(),
+            position: option.purchase.facility,
+            hp: 100,
+            available_turn: option.purchase.build_turn.saturating_add(1),
+            engageable_enemy_indices: option.engageable_enemy_indices.clone(),
+        },
+        can_advance_to_enemy,
+    )
+}
+
 fn sim_friendly(
     input: &RollingPlanInput,
     source: &FriendlyPlanUnit,
@@ -1389,6 +1410,176 @@ mod tests {
             delay_cost_per_turn: 5_000,
             search_beam_width: SEARCH_BEAM_WIDTH,
         }
+    }
+
+    /// F14の共通初期化は入力順、HP、行動可能turn、弾数を保持する。
+    /// 購入identity・占領契約・保護期限は拡張モデルだけが持つ。
+    #[test]
+    fn simulation_catalog_preserves_input_order_and_model_specific_contracts() {
+        let mut input = input();
+        let friendly = |hp, available_turn| FriendlyPlanUnit {
+            stats: stats(UnitType::Bcopters, 7_500, 6),
+            position: GridPosition { x: 0, y: 0 },
+            hp,
+            available_turn,
+            engageable_enemy_indices: vec![0],
+            protection_completion_turn: Some(5),
+        };
+        input.existing_units = vec![friendly(37, 2), friendly(81, 3)];
+        input.protected_units = vec![friendly(62, 4)];
+        // 友軍は弾数の和を燃料で制限する。弾数0・燃料0でも従来の最低1を保持。
+        input.existing_units[0].stats.max_ammo1 = u32::MAX;
+        input.existing_units[0].stats.max_ammo2 = 1;
+        input.existing_units[0].stats.max_fuel = 4;
+        input.existing_units[0].stats.daily_fuel_consumption = 2;
+        input.existing_units[1].stats.max_ammo1 = 0;
+        input.existing_units[1].stats.max_ammo2 = 0;
+        input.existing_units[1].stats.max_fuel = 0;
+        input.existing_units[1].stats.daily_fuel_consumption = 1;
+        // 占領契約のunitは自分から敵へ前進しないため、遅い敵の接触turnが変わる。
+        input.enemies[0].stats.max_movement = 1;
+        input.enemies[0].stats.max_range = 1;
+        input.production_options[1].purchase.build_turn = u32::MAX;
+        input.production_options[0].capture_target = Some(GridPosition { x: 8, y: 0 });
+        input.production_options[0].capture_arrival_turn = Some(3);
+        input.production_options[0].capture_completion_turn = Some(5);
+        input.production_options[0].capture_durability = Some(20);
+        input.production_options[0].capture_blocking_enemy_index = Some(0);
+        // 敵の弾数は0でも最低1、和が溢れる場合は飽和する（燃料で制限しない）。
+        input.enemies[0].stats.max_ammo1 = 0;
+        input.enemies[0].stats.max_ammo2 = 0;
+        let mut second_enemy = input.enemies[0].clone();
+        second_enemy.hp = 53;
+        second_enemy.entity = Some(Entity::from_raw(8));
+        second_enemy.stats.max_ammo1 = u32::MAX;
+        second_enemy.stats.max_ammo2 = 1;
+        input.enemies.push(second_enemy);
+
+        for (path, has_contracts) in [
+            (crate::ai::code_path::CodePath::MainCompatible, false),
+            (crate::ai::code_path::CodePath::Extended, true),
+        ] {
+            let _guard = crate::ai::code_path::enter(path);
+            let catalog = SimulationCatalog::new(&input);
+            assert_eq!(
+                catalog
+                    .existing_units
+                    .iter()
+                    .map(|unit| unit.hp)
+                    .collect::<Vec<_>>(),
+                vec![37, 81]
+            );
+            assert_eq!(catalog.protected_units[0].hp, 62);
+            assert_eq!(catalog.existing_units[0].available_turn, 2);
+            assert_eq!(catalog.existing_units[0].attacks_left, 2);
+            assert_eq!(catalog.existing_units[1].attacks_left, 1);
+            assert_eq!(
+                catalog.production_units[0].enemy_attack_profiles[0]
+                    .expect("敵歩兵からの被攻撃予測")
+                    .contact_turn,
+                if has_contracts { 7 } else { 3 },
+                "{path:?}"
+            );
+            assert_eq!(catalog.production_units.len(), 2);
+            assert_eq!(
+                catalog.production_units[0].stats.unit_type,
+                UnitType::Bcopters
+            );
+            assert_eq!(
+                catalog.production_units[1].stats.unit_type,
+                UnitType::Bomber
+            );
+            assert_eq!(catalog.production_units[0].hp, 100);
+            assert_eq!(catalog.production_units[0].available_turn, 1);
+            assert_eq!(catalog.production_units[1].available_turn, u32::MAX);
+            assert_eq!(
+                catalog.production_units[0].purchase.is_some(),
+                has_contracts
+            );
+            assert_eq!(
+                catalog.production_units[0].capture_contract.is_some(),
+                has_contracts
+            );
+            assert!(catalog.production_units[1].capture_contract.is_none());
+            assert_eq!(
+                catalog.protected_units[0].protection_completion_turn,
+                has_contracts.then_some(5)
+            );
+            assert_eq!(
+                catalog
+                    .enemies
+                    .iter()
+                    .map(|enemy| enemy.hp)
+                    .collect::<Vec<_>>(),
+                vec![100, 53]
+            );
+            assert_eq!(catalog.enemies[0].attacks_left, 1);
+            assert_eq!(catalog.enemies[1].attacks_left, u32::MAX);
+            assert_eq!(catalog.enemies[0].source.entity, Some(Entity::from_raw(7)));
+            assert!(
+                catalog
+                    .enemies
+                    .iter()
+                    .all(|enemy| enemy.destroyed_turn.is_none())
+            );
+        }
+    }
+
+    /// projectionの行なしは近似を保持し、要素なしは攻撃不能としてprofileを除去する。
+    /// 元から攻撃不能な敵のprofileは、projectionがあっても復活させない。
+    #[test]
+    fn simulation_catalog_applies_exact_profiles_only_on_extended_path() {
+        let mut input = input();
+        let mut second_enemy = input.enemies[0].clone();
+        second_enemy.entity = Some(Entity::from_raw(8));
+        input.enemies.push(second_enemy);
+        input.production_options[0].engageable_enemy_indices = vec![0, 1];
+        let projection = ProductionAttackProjection {
+            ready_turn: 9,
+            firing_position: GridPosition { x: 7, y: 0 },
+            requires_movement: true,
+        };
+        // 1番目候補は両敵と交戦可。2番目候補は敵0だけと交戦可。
+        input.production_attack_projections =
+            vec![vec![Some(projection)], vec![None, Some(projection)]];
+        for path in [
+            crate::ai::code_path::CodePath::MainCompatible,
+            crate::ai::code_path::CodePath::Extended,
+        ] {
+            let _guard = crate::ai::code_path::enter(path);
+            let catalog = SimulationCatalog::new(&input);
+            let first = catalog.production_units[0].attack_profiles[0].expect("交戦可能な敵0");
+            if path == crate::ai::code_path::CodePath::Extended {
+                assert_eq!(first.ready_turn, 9);
+                assert_eq!(first.firing_position, Some(projection.firing_position));
+                assert!(first.requires_movement);
+                assert!(
+                    catalog.production_units[0].attack_profiles[1].is_none(),
+                    "短い行の欠落要素は除去"
+                );
+                assert!(
+                    catalog.production_units[1].attack_profiles[0].is_none(),
+                    "明示Noneは除去"
+                );
+            } else {
+                assert!(first.ready_turn < 9);
+                assert_eq!(first.firing_position, None);
+                assert!(!first.requires_movement);
+                assert!(catalog.production_units[0].attack_profiles[1].is_some());
+                assert!(catalog.production_units[1].attack_profiles[0].is_some());
+            }
+            assert!(
+                catalog.production_units[1].attack_profiles[1].is_none(),
+                "攻撃不能profileは復活しない"
+            );
+        }
+        input.production_attack_projections.truncate(1);
+        let _guard = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
+        let catalog = SimulationCatalog::new(&input);
+        let profile =
+            catalog.production_units[1].attack_profiles[0].expect("行自体がなければ近似を保持");
+        assert_eq!(profile.firing_position, None);
+        assert!(!profile.requires_movement);
     }
 
     #[test]

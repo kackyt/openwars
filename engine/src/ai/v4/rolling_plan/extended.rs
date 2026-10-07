@@ -5487,96 +5487,47 @@ impl SimulationCatalog {
         if !crate::ai::code_path::ext_enabled("v4/rolling_plan.rs::new") {
             return Self::new(input);
         }
-        let existing_units = input
-            .existing_units
-            .iter()
-            .map(|source| sim_friendly(input, source, true))
-            .collect();
-        let protected_units = input
-            .protected_units
-            .iter()
-            .map(|source| sim_friendly(input, source, false))
-            .collect();
-        let production_units = input
-            .production_options
-            .iter()
-            .enumerate()
-            .map(|(option_index, option)| {
-                let mut simulated = sim_friendly(
-                    input,
-                    &FriendlyPlanUnit {
-                        stats: option.stats.clone(),
-                        position: option.purchase.facility,
-                        hp: 100,
-                        // 生産unitは兵種・任務にかかわらず次の自軍手番からだけ行動できる。
-                        // 物件到着時刻まで戦闘不能にすると、経路上の迎撃を表現できない。
-                        available_turn: option.purchase.build_turn.saturating_add(1),
-                        engageable_enemy_indices: option.engageable_enemy_indices.clone(),
-                        protection_completion_turn: None,
-                    },
-                    option.capture_target.is_none(),
-                );
-                simulated.purchase = Some(option.purchase);
-                debug_assert!(option.capture_completion_turn.is_none_or(|completion| {
-                    option
-                        .capture_arrival_turn
-                        .is_some_and(|arrival| completion >= arrival)
-                }));
-                simulated.capture_contract = option.capture_target.and_then(|target| {
-                    Some(SimCaptureContract {
-                        target,
-                        arrival_turn: option.capture_arrival_turn?,
-                        remaining_durability: option.capture_durability?,
-                        blocking_enemy_index: option.capture_blocking_enemy_index,
-                        completed_turn: None,
-                        survived_at_completion: false,
-                    })
-                });
-                // 生産判断側で計算した実経路ETAがあれば、格子距離による近似を
-                // 上書きする。山・川・橋・最小射程を無視した快速判定を防ぐ。
-                if let Some(exact_projections) =
-                    input.production_attack_projections.get(option_index)
-                {
-                    let mut profiles = simulated.attack_profiles.to_vec();
-                    for (enemy_index, profile) in profiles.iter_mut().enumerate() {
-                        match (
-                            profile.as_mut(),
-                            exact_projections.get(enemy_index).copied().flatten(),
-                        ) {
-                            (Some(profile), Some(projection)) => {
-                                profile.ready_turn = projection.ready_turn;
-                                profile.firing_position = Some(projection.firing_position);
-                                profile.requires_movement = projection.requires_movement;
-                            }
-                            (Some(_), None) => *profile = None,
-                            (None, _) => {}
+        // 共通初期化を使い、生産unitにだけ契約と実経路の射撃予測を追加する。
+        Self::new_with_production_initializer(input, |option_index, option| {
+            let mut simulated =
+                sim_production_friendly(input, option, option.capture_target.is_none());
+            simulated.purchase = Some(option.purchase);
+            debug_assert!(option.capture_completion_turn.is_none_or(|completion| {
+                option
+                    .capture_arrival_turn
+                    .is_some_and(|arrival| completion >= arrival)
+            }));
+            simulated.capture_contract = option.capture_target.and_then(|target| {
+                Some(SimCaptureContract {
+                    target,
+                    arrival_turn: option.capture_arrival_turn?,
+                    remaining_durability: option.capture_durability?,
+                    blocking_enemy_index: option.capture_blocking_enemy_index,
+                    completed_turn: None,
+                    survived_at_completion: false,
+                })
+            });
+            // 生産判断側で計算した実経路ETAがあれば、格子距離による近似を
+            // 上書きする。山・川・橋・最小射程を無視した快速判定を防ぐ。
+            if let Some(exact_projections) = input.production_attack_projections.get(option_index) {
+                let mut profiles = simulated.attack_profiles.to_vec();
+                for (enemy_index, profile) in profiles.iter_mut().enumerate() {
+                    match (
+                        profile.as_mut(),
+                        exact_projections.get(enemy_index).copied().flatten(),
+                    ) {
+                        (Some(profile), Some(projection)) => {
+                            profile.ready_turn = projection.ready_turn;
+                            profile.firing_position = Some(projection.firing_position);
+                            profile.requires_movement = projection.requires_movement;
                         }
+                        (Some(_), None) => *profile = None,
+                        (None, _) => {}
                     }
-                    simulated.attack_profiles = profiles.into();
                 }
-                simulated
-            })
-            .collect();
-        let enemies = input
-            .enemies
-            .iter()
-            .cloned()
-            .map(|source| SimEnemy {
-                hp: source.hp,
-                attacks_left: source
-                    .stats
-                    .max_ammo1
-                    .saturating_add(source.stats.max_ammo2)
-                    .max(1),
-                source,
-                destroyed_turn: None,
-            })
-            .collect();
-        Self {
-            existing_units,
-            protected_units,
-            production_units,
-            enemies,
-        }
+                simulated.attack_profiles = profiles.into();
+            }
+            simulated
+        })
     }
 }
