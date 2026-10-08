@@ -625,19 +625,7 @@ pub(crate) fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         crate::ai::v4::strategy_pipeline::before_squad_planning(world, perspective_player);
     }
     let mut manager = world.remove_resource::<SquadManager>().unwrap_or_default();
-    // Reserveは永続所有権ではなく「次の再計画までの明示待機」である。
-    // 毎手番いったんfree poolへ戻し、新しいcampaign・防衛・攻撃へ再徴用可能にする。
-    manager.squads.retain(|squad| {
-        squad.owner_id != Some(perspective_player) || squad.mission_type != MissionType::Reserve
-    });
-    if is_v4 {
-        // V4は手番末に全Entityへ明示Squadを保証する。旧V1/V3のSoloFallback印を
-        // 次手番へ持ち越すと、free pool収集から歩兵・輸送役が除外され、島作戦へ
-        // 再編入されないままReserveだけを毎手番作り直す循環になる。
-        manager.solo_fallbacks.clear();
-    }
-    // 前手番の作戦所有権を使って古い重複Squadを一度だけ正規化してから分析する。
-    reconcile_unique_operation_assignments(world, &mut manager, perspective_player);
+    prepare_squads_for_replanning(world, &mut manager, perspective_player, is_v4);
     let tactical_reserved_entities = HashSet::new();
     let strategy = if is_v3 {
         // 防衛もcampaign portfolioの通常優先度・排他割当で扱う。
@@ -1524,7 +1512,7 @@ pub(crate) fn plan_squads(world: &mut World, perspective_player: PlayerId) {
             squad_is_mutable_by_player(world, s, perspective_player)
                 && s.mission_type == MissionType::Capture
                 && !s.members.is_empty()
-                && s.target.as_ref().is_some_and(&is_enemy_facility)
+                && s.target.as_ref().is_some_and(is_enemy_facility)
         })
         .count();
     if crate::ai::strategy_profile::current_profile(world, perspective_player)

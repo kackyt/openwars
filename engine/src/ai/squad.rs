@@ -4173,6 +4173,28 @@ fn remove_player_reserve_squads(manager: &mut SquadManager, player_id: PlayerId)
     });
 }
 
+/// 戦略分析の前に再編入力を整える共通hook。Reserve解放→SoloFallback解除→所属正規化の
+/// 順序を保つ。is_v4は呼出し側で確定した値を使い、ここでは実装経路を判定しない。
+/// 手番末の再接続とは責務が異なるため、毎ターンのplan_squads入口でのみ使う。
+fn prepare_squads_for_replanning(
+    world: &mut World,
+    manager: &mut SquadManager,
+    player_id: PlayerId,
+    is_v4: bool,
+) {
+    // Reserveは永続所有権ではなく「次の再計画までの明示待機」である。
+    // 毎手番いったんfree poolへ戻し、新しいcampaign・防衛・攻撃へ再徴用可能にする。
+    remove_player_reserve_squads(manager, player_id);
+    if is_v4 {
+        // V4は手番末に全Entityへ明示Squadを保証する。旧V1/V3のSoloFallback印を
+        // 次手番へ持ち越すと、free pool収集から歩兵・輸送役が除外され、島作戦へ
+        // 再編入されないままReserveだけを毎手番作り直す循環になる。
+        manager.solo_fallbacks.clear();
+    }
+    // 前手番の作戦所有権を使って古い重複Squadを一度だけ正規化してから分析する。
+    reconcile_unique_operation_assignments(world, manager, player_id);
+}
+
 /// ある作戦の再構築が別SquadからEntityを解放する場合があるため、1回だけでは
 /// catch-all直前に新しい未割当が残る。未割当数が減る間だけ最大3回の線形固定点を取り、
 /// 行動候補ごとの全走査や無限反復は行わない。
@@ -4249,19 +4271,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     let is_v4 = crate::ai::resolve_player_ai_version(world, perspective_player)
         .uses_operation_driven_production();
     let mut manager = world.remove_resource::<SquadManager>().unwrap_or_default();
-    // Reserveは永続所有権ではなく「次の再計画までの明示待機」である。
-    // 毎手番いったんfree poolへ戻し、新しいcampaign・防衛・攻撃へ再徴用可能にする。
-    manager.squads.retain(|squad| {
-        squad.owner_id != Some(perspective_player) || squad.mission_type != MissionType::Reserve
-    });
-    if is_v4 {
-        // V4は手番末に全Entityへ明示Squadを保証する。旧V1/V3のSoloFallback印を
-        // 次手番へ持ち越すと、free pool収集から歩兵・輸送役が除外され、島作戦へ
-        // 再編入されないままReserveだけを毎手番作り直す循環になる。
-        manager.solo_fallbacks.clear();
-    }
-    // 前手番の作戦所有権を使って古い重複Squadを一度だけ正規化してから分析する。
-    reconcile_unique_operation_assignments(world, &mut manager, perspective_player);
+    prepare_squads_for_replanning(world, &mut manager, perspective_player, is_v4);
     let tactical_reserved_entities = HashSet::new();
     let strategy = if is_v3 {
         // 防衛もcampaign portfolioの通常優先度・排他割当で扱う。
@@ -5139,7 +5149,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
             squad_is_mutable_by_player(world, s, perspective_player)
                 && s.mission_type == MissionType::Capture
                 && !s.members.is_empty()
-                && s.target.as_ref().is_some_and(&is_enemy_facility)
+                && s.target.as_ref().is_some_and(is_enemy_facility)
         })
         .count();
     capture_targets.sort_by_key(|t| {
@@ -6653,6 +6663,105 @@ mod tests {
         assert_eq!(assignment.squad_id, Some(intended_id));
         assert_eq!(registry.last_reconcile_visits(), 2);
         assert_eq!(registry.rejected_conflicts(), 1);
+    }
+
+    /// F07の再編前処理は対象playerのReserveだけを解放し、旧campaign所有権に沿って
+    /// 重複所属を正規化する。V4だけは従来仕様どおり他player分も含めSoloFallbackを全解除。
+    #[test]
+    fn replanning_preparation_releases_only_player_reserves_before_reconcile() {
+        for path in [
+            crate::ai::code_path::CodePath::MainCompatible,
+            crate::ai::code_path::CodePath::Extended,
+        ] {
+            for is_v4 in [false, true] {
+                let _guard = crate::ai::code_path::enter(path);
+                let mut world = setup_test_world();
+                let player = PlayerId(1);
+                let other_player = PlayerId(2);
+                let entity = world
+                    .spawn((Faction(player), GridPosition { x: 0, y: 0 }))
+                    .id();
+                let other_entity = world
+                    .spawn((Faction(other_player), GridPosition { x: 1, y: 0 }))
+                    .id();
+                let island = crate::ai::islands::IslandId(7);
+                let mut registry = UnitOperationRegistry::default();
+                registry.assign(
+                    entity,
+                    UnitOperationAssignment {
+                        owner: OperationOwner::Campaign {
+                            player_id: player,
+                            island_id: island,
+                        },
+                        squad_id: None,
+                        role: OperationUnitRole::Member,
+                        assigned_turn: 1,
+                    },
+                );
+                world.insert_resource(registry);
+                let mut manager = SquadManager::new();
+                let reserve = manager.create_owned_squad(MissionType::Reserve, player);
+                let reserve_id = reserve.id;
+                reserve.members.insert(entity);
+                let other = manager.create_owned_squad(MissionType::Reserve, other_player);
+                let other_id = other.id;
+                other.members.insert(other_entity);
+                other.target = Some(GridPosition { x: 9, y: 0 });
+                let other_before = format!("{other:?}");
+                let ownerless = manager.create_squad(MissionType::Reserve);
+                let ownerless_id = ownerless.id;
+                ownerless.members.insert(other_entity);
+                let ownerless_before = format!("{ownerless:?}");
+                let stale = manager.create_owned_squad(MissionType::Defense, player);
+                let stale_id = stale.id;
+                stale.target_island = Some(crate::ai::islands::IslandId(5));
+                stale.members.insert(entity);
+                let intended = manager.create_owned_squad(MissionType::Capture, player);
+                let intended_id = intended.id;
+                intended.target_island = Some(island);
+                intended.members.insert(entity);
+                let fallback_marks = HashSet::from([entity, other_entity]);
+                manager.solo_fallbacks = fallback_marks.clone();
+
+                prepare_squads_for_replanning(&mut world, &mut manager, player, is_v4);
+
+                assert_eq!(
+                    manager
+                        .squads
+                        .iter()
+                        .map(|squad| squad.id)
+                        .collect::<Vec<_>>(),
+                    vec![other_id, ownerless_id, stale_id, intended_id],
+                    "{path:?} is_v4={is_v4}"
+                );
+                assert!(!manager.squads.iter().any(|squad| squad.id == reserve_id));
+                assert_eq!(format!("{:?}", manager.squads[0]), other_before);
+                assert_eq!(format!("{:?}", manager.squads[1]), ownerless_before);
+                assert!(manager.squads[2].members.is_empty());
+                assert_eq!(manager.squads[3].members, BTreeSet::from([entity]));
+                assert_eq!(
+                    manager.solo_fallbacks,
+                    if is_v4 {
+                        HashSet::new()
+                    } else {
+                        fallback_marks
+                    }
+                );
+                let registry = world.resource::<UnitOperationRegistry>();
+                let assignment = registry.assignment(entity).expect("具体Squadへ正規化");
+                assert_eq!(assignment.squad_id, Some(intended_id));
+                assert_eq!(
+                    assignment.owner,
+                    OperationOwner::Campaign {
+                        player_id: player,
+                        island_id: island,
+                    }
+                );
+                // Reserveにいたentityは正規化の走査前に解放され、DefenseとCaptureだけを数える。
+                assert_eq!(registry.last_reconcile_visits(), 2);
+                assert_eq!(registry.rejected_conflicts(), 1);
+            }
+        }
     }
 
     #[test]

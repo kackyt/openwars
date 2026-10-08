@@ -299,6 +299,48 @@ struct SearchState {
     cost: u32,
 }
 
+impl SearchState {
+    /// 同じ生産枠で購入できる子状態を作る。占領対象の適格条件や登録はモデル側が
+    /// 判断し、この共通処理は累積費用・生産turnまでの資金と購入列だけを扱う。
+    fn with_affordable_purchase(
+        &self,
+        input: &RollingPlanInput,
+        option_index: usize,
+        slot: ProductionSlot,
+    ) -> Option<Self> {
+        let option = &input.production_options[option_index];
+        let next_cost = self.cost.saturating_add(option.purchase.cost);
+        let available_by_build_turn = input.current_funds.saturating_add(
+            input
+                .income_per_turn
+                .saturating_mul(option.purchase.build_turn),
+        );
+        if next_cost > available_by_build_turn {
+            return None;
+        }
+        let mut child = self.clone();
+        child.option_indices.push(option_index);
+        child.used_slots.insert(slot);
+        child.cost = next_cost;
+        Some(child)
+    }
+}
+
+/// 施設・生産turnごとに候補をまとめ、同じ枠の兵種indexは入力順で保持する。
+/// 支配関係による候補除外と枠の処理順の確定は呼出し側に残す。
+fn group_production_options_by_slot(
+    input: &RollingPlanInput,
+) -> HashMap<ProductionSlot, Vec<usize>> {
+    let mut options_by_slot: HashMap<ProductionSlot, Vec<usize>> = HashMap::new();
+    for (index, option) in input.production_options.iter().enumerate() {
+        options_by_slot
+            .entry(option.purchase.into())
+            .or_default()
+            .push(index);
+    }
+    options_by_slot
+}
+
 /// 1回のRolling Plan入力で不変な交戦関係を全beam候補から共有する。
 struct SimulationCatalog {
     existing_units: Vec<SimFriendly>,
@@ -406,13 +448,7 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
     // 再展開すると、首都攻略のような長い購入列で同じ組合せを大量に作る。
     // 「作らない」または「この枠で1兵種を作る」を一度だけ分岐すれば、探索対象を
     // 減らさずにゲームルールの1施設1生産へ一致させられる。
-    let mut options_by_slot: HashMap<ProductionSlot, Vec<usize>> = HashMap::new();
-    for (index, option) in input.production_options.iter().enumerate() {
-        options_by_slot
-            .entry(option.purchase.into())
-            .or_default()
-            .push(index);
-    }
+    let options_by_slot = group_production_options_by_slot(input);
     let mut slots = options_by_slot.into_iter().collect::<Vec<_>>();
     slots.sort_unstable_by_key(|(slot, _)| (slot.build_turn, slot.facility.y, slot.facility.x));
 
@@ -423,21 +459,9 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
             // 選ぶ案を、安い現在購入で強制的に上書きしないためである。
             next.push(state.clone());
             for option_index in &option_indices {
-                let option = &input.production_options[*option_index];
-                let next_cost = state.cost.saturating_add(option.purchase.cost);
-                let available_by_build_turn = input.current_funds.saturating_add(
-                    input
-                        .income_per_turn
-                        .saturating_mul(option.purchase.build_turn),
-                );
-                if next_cost > available_by_build_turn {
-                    continue;
+                if let Some(child) = state.with_affordable_purchase(input, *option_index, slot) {
+                    next.push(child);
                 }
-                let mut child = state.clone();
-                child.option_indices.push(*option_index);
-                child.used_slots.insert(slot);
-                child.cost = next_cost;
-                next.push(child);
             }
         }
 
@@ -1580,6 +1604,91 @@ mod tests {
             catalog.production_units[1].attack_profiles[0].expect("行自体がなければ近似を保持");
         assert_eq!(profile.firing_position, None);
         assert!(!profile.requires_movement);
+    }
+
+    /// F15のグループ化は同じ施設・turnの兵種を入力順で保持し、別turnを混ぜない。
+    #[test]
+    fn production_slot_groups_keep_candidate_order_and_separate_turns() {
+        let mut input = input();
+        let mut later = input.production_options[0].clone();
+        later.purchase.build_turn = 2;
+        let mut same_slot = input.production_options[1].clone();
+        same_slot.purchase.facility = input.production_options[0].purchase.facility;
+        input.production_options.extend([later, same_slot]);
+        let groups = group_production_options_by_slot(&input);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(
+            groups[&input.production_options[0].purchase.into()],
+            vec![0, 3]
+        );
+        assert_eq!(
+            groups[&input.production_options[1].purchase.into()],
+            vec![1]
+        );
+        assert_eq!(
+            groups[&input.production_options[2].purchase.into()],
+            vec![2]
+        );
+    }
+
+    /// 累積購入費が生産turnまでの資金と等しければ許可し、1だけ超えれば除外する。
+    /// 子状態の生成は親状態を変更せず、候補順・既存slot・既存占領対象を保持する。
+    #[test]
+    fn search_child_respects_cumulative_budget_and_preserves_parent_state() {
+        let mut input = input();
+        input.current_funds = 7;
+        input.income_per_turn = 4;
+        input.production_options[1].purchase.build_turn = 2;
+        input.production_options[1].purchase.cost = 10;
+        let slot = input.production_options[1].purchase.into();
+        let previous_slot = input.production_options[0].purchase.into();
+        let target = GridPosition { x: 8, y: 0 };
+        let state = SearchState {
+            option_indices: vec![0],
+            used_slots: HashSet::from([previous_slot]),
+            used_capture_targets: HashSet::from([target]),
+            cost: 5,
+        };
+        let child = state
+            .with_affordable_purchase(&input, 1, slot)
+            .expect("5+10は7+4*2の資金と等しい");
+        assert_eq!(child.option_indices, vec![0, 1]);
+        assert_eq!(child.used_slots, HashSet::from([previous_slot, slot]));
+        assert_eq!(child.used_capture_targets, HashSet::from([target]));
+        assert_eq!(child.cost, 15);
+        assert_eq!(state.option_indices, vec![0]);
+        assert_eq!(state.used_slots, HashSet::from([previous_slot]));
+        assert_eq!(state.cost, 5);
+
+        input.production_options[1].purchase.cost = 11;
+        assert!(state.with_affordable_purchase(&input, 1, slot).is_none());
+        // 将来収入を現在turnの購入に流用しない。
+        input.production_options[1].purchase.build_turn = 0;
+        input.production_options[1].purchase.cost = 3;
+        assert!(
+            state
+                .with_affordable_purchase(&input, 1, input.production_options[1].purchase.into())
+                .is_none()
+        );
+    }
+
+    /// 購入費・収入の加算と乗算は、従来の探索と同じ飽和演算で扱う。
+    #[test]
+    fn search_child_preserves_saturating_budget_arithmetic() {
+        let mut input = input();
+        input.current_funds = u32::MAX - 1;
+        input.income_per_turn = u32::MAX;
+        input.production_options[0].purchase.build_turn = 2;
+        input.production_options[0].purchase.cost = 10;
+        let slot = input.production_options[0].purchase.into();
+        let state = SearchState {
+            cost: u32::MAX - 5,
+            ..SearchState::default()
+        };
+        let child = state
+            .with_affordable_purchase(&input, 0, slot)
+            .expect("双方ともMAXに飽和");
+        assert_eq!(child.cost, u32::MAX);
     }
 
     #[test]

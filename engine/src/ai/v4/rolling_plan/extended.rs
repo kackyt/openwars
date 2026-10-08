@@ -49,13 +49,7 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
     // 再展開すると、首都攻略のような長い購入列で同じ組合せを大量に作る。
     // 「作らない」または「この枠で1兵種を作る」を一度だけ分岐すれば、探索対象を
     // 減らさずにゲームルールの1施設1生産へ一致させられる。
-    let mut options_by_slot: HashMap<ProductionSlot, Vec<usize>> = HashMap::new();
-    for (index, option) in input.production_options.iter().enumerate() {
-        options_by_slot
-            .entry(option.purchase.into())
-            .or_default()
-            .push(index);
-    }
+    let mut options_by_slot = group_production_options_by_slot(input);
     let mut candidates_pruned = 0_usize;
     for option_indices in options_by_slot.values_mut() {
         let original_len = option_indices.len();
@@ -93,22 +87,13 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
                 {
                     continue;
                 }
-                let next_cost = state.cost.saturating_add(option.purchase.cost);
-                let available_by_build_turn = input.current_funds.saturating_add(
-                    input
-                        .income_per_turn
-                        .saturating_mul(option.purchase.build_turn),
-                );
-                if next_cost > available_by_build_turn {
+                let Some(mut child) = state.with_affordable_purchase(input, *option_index, slot)
+                else {
                     continue;
-                }
-                let mut child = state.clone();
-                child.option_indices.push(*option_index);
-                child.used_slots.insert(slot);
+                };
                 if let Some(target) = option.capture_target {
                     child.used_capture_targets.insert(target);
                 }
-                child.cost = next_cost;
                 next.push(child);
             }
         }
