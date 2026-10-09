@@ -4257,12 +4257,166 @@ pub(crate) fn reconcile_v4_end_turn_reserves(world: &mut World, player_id: Playe
     world.insert_resource(manager);
 }
 
+/// 通常の占領候補順位で、生産施設を距離何マス分だけ優先するか（従来値）。
+const PRODUCTION_FACILITY_DIST_BONUS: usize = 6;
+
+/// 汎用輸送はRoadmap採用後のportfolioではなく、戦略分析で得た元portfolioの
+/// 地理的目標を使う。見つからない場合だけ、従来どおり島内の未所有物件へ戻す。
+fn resolve_generic_transport_target(
+    source_portfolio: &crate::ai::island_campaign::IslandCampaignPortfolio,
+    island: crate::ai::islands::IslandId,
+    player: PlayerId,
+    island_properties: &HashMap<crate::ai::islands::IslandId, Vec<GridPosition>>,
+    ownership: &HashMap<GridPosition, Option<PlayerId>>,
+) -> Option<GridPosition> {
+    source_portfolio
+        .assignment_for(island)
+        .map(|assignment| assignment.target_position)
+        .or_else(|| {
+            island_properties.get(&island).and_then(|positions| {
+                let mut positions = positions.clone();
+                positions.sort_by_key(|position| (position.y, position.x));
+                positions
+                    .into_iter()
+                    .find(|position| ownership.get(position) != Some(&Some(player)))
+            })
+        })
+}
+
+/// 占領の並び順・歩兵選択に必要な読み取り専用入力。方策の設定値の束ではなく、
+/// 共通再編本体が収集した事実を、通常／拡張のコードへ渡す。
+struct CapturePlanningContext<'a> {
+    map: &'a Map,
+    registry: &'a MasterDataRegistry,
+    island_map: &'a crate::ai::islands::IslandMap,
+    infantry: &'a [(Entity, GridPosition, UnitStats)],
+    capital: Option<GridPosition>,
+    is_v3: bool,
+}
+
+/// 通常の再編本体へ差し込む境界。デフォルトは従来の通常実装で、拡張だけが
+/// 必要な処理をoverrideする。下位関数の個別委譲点IDはそれぞれの関数に残す。
+trait SquadPlanningHooks {
+    fn before_manager_removal(_world: &mut World, _player: PlayerId, _is_v4: bool) {}
+
+    fn portfolio_for_planning<'a>(
+        _world: &mut World,
+        _player: PlayerId,
+        _manager: &SquadManager,
+        portfolio: &'a crate::ai::island_campaign::IslandCampaignPortfolio,
+        _is_v4: bool,
+    ) -> std::borrow::Cow<'a, crate::ai::island_campaign::IslandCampaignPortfolio> {
+        std::borrow::Cow::Borrowed(portfolio)
+    }
+
+    fn prepare_local_assignment(
+        world: &World,
+        manager: &mut SquadManager,
+        player: PlayerId,
+        assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+        connectivity: &mut TerrainConnectivity,
+    ) {
+        prepare_campaign_local_assignment_with_connectivity(
+            world,
+            manager,
+            player,
+            assignment,
+            connectivity,
+        );
+    }
+
+    fn uses_legacy_capital_defense(_is_v4: bool) -> bool {
+        true
+    }
+
+    fn sort_capture_targets(
+        _world: &mut World,
+        _player: PlayerId,
+        targets: &mut [GridPosition],
+        context: &CapturePlanningContext<'_>,
+    ) {
+        targets.sort_by_key(|target| {
+            let distance = context
+                .infantry
+                .iter()
+                .map(|(_, position, _)| {
+                    position.x.abs_diff(target.x) + position.y.abs_diff(target.y)
+                })
+                .min()
+                .unwrap_or(usize::MAX);
+            let facility_bonus = if context.is_v3
+                && context
+                    .map
+                    .get_terrain(target.x, target.y)
+                    .is_some_and(|terrain| {
+                        context.registry.is_production_facility(terrain.as_str())
+                    }) {
+                PRODUCTION_FACILITY_DIST_BONUS
+            } else {
+                0
+            };
+            (distance.saturating_sub(facility_bonus), target.x, target.y)
+        });
+    }
+
+    fn select_capture_infantry(
+        context: &CapturePlanningContext<'_>,
+        island: crate::ai::islands::IslandId,
+        target: &GridPosition,
+    ) -> Option<usize> {
+        context.infantry.iter().position(|(_, position, stats)| {
+            context
+                .island_map
+                .get_island_at(position)
+                .is_some_and(|candidate| candidate.id == island)
+                && is_terrain_reachable(
+                    context.map,
+                    context.registry,
+                    (position.x, position.y),
+                    (target.x, target.y),
+                    stats.movement_type,
+                )
+        })
+    }
+
+    fn before_final_reconcile(
+        world: &mut World,
+        player: PlayerId,
+        portfolio: &crate::ai::island_campaign::IslandCampaignPortfolio,
+        manager: &SquadManager,
+        is_v4: bool,
+    ) {
+        if is_v4 {
+            crate::ai::v4::victory_roadmap::reconcile_campaign_roadmap(
+                world, player, portfolio, manager,
+            );
+        }
+    }
+
+    fn after_final_reconcile(
+        _world: &mut World,
+        _player: PlayerId,
+        _portfolio: &crate::ai::island_campaign::IslandCampaignPortfolio,
+        _manager: &mut SquadManager,
+        _is_v4: bool,
+    ) {
+    }
+}
+
+/// 通常側はtraitのデフォルト処理だけを使う。
+struct MainPlanningHooks;
+impl SquadPlanningHooks for MainPlanningHooks {}
+
 /// ゲームの戦略状況に基づいて、自動的に部隊の構築と新規メンバーの割り当てを行います。
 pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     // 小規模マップのV4は extended 側の実装を使う。
     if crate::ai::code_path::is_extended_at("squad.rs::plan_squads") {
         return extended::plan_squads(world, perspective_player);
     }
+    plan_squads_with_hooks::<MainPlanningHooks>(world, perspective_player);
+}
+
+fn plan_squads_with_hooks<H: SquadPlanningHooks>(world: &mut World, perspective_player: PlayerId) {
     // 1. まず既存部隊のクリーンアップと SoloFallback 判定を実行
     update_squads(world, perspective_player);
 
@@ -4270,6 +4424,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     let is_v3 = crate::ai::resolve_player_ai_version(world, perspective_player).uses_v3_tactics();
     let is_v4 = crate::ai::resolve_player_ai_version(world, perspective_player)
         .uses_operation_driven_production();
+    H::before_manager_removal(world, perspective_player, is_v4);
     let mut manager = world.remove_resource::<SquadManager>().unwrap_or_default();
     prepare_squads_for_replanning(world, &mut manager, perspective_player, is_v4);
     let tactical_reserved_entities = HashSet::new();
@@ -4299,22 +4454,27 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         manager = world.remove_resource::<SquadManager>().unwrap_or_default();
         strategy
     };
+    // 採用portfolioはcache・campaign編成用。汎用輸送の地理的候補は、引き続き
+    // 元のstrategy.campaign_portfolioを参照するためstrategyを置換しない。
+    let planning_portfolio = H::portfolio_for_planning(
+        world,
+        perspective_player,
+        &manager,
+        &strategy.campaign_portfolio,
+        is_v4,
+    );
     let enemy_clusters = detect_enemy_clusters(world, perspective_player);
     if is_v3 {
         let mut cache = world
             .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
             .unwrap_or_default();
-        cache.set_campaign_portfolio(perspective_player, strategy.campaign_portfolio.clone());
+        cache.set_campaign_portfolio(perspective_player, planning_portfolio.as_ref().clone());
         cache.mark_squads_planned(perspective_player);
         world.insert_resource(cache);
-        claim_campaign_portfolio_assignments(
-            world,
-            perspective_player,
-            &strategy.campaign_portfolio,
-        );
+        claim_campaign_portfolio_assignments(world, perspective_player, &planning_portfolio);
     }
     let paused_campaign_islands = if is_v3 {
-        campaign_paused_islands(&strategy.campaign_portfolio)
+        campaign_paused_islands(&planning_portfolio)
     } else {
         HashSet::new()
     };
@@ -4325,21 +4485,15 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
             perspective_player,
             &paused_campaign_islands,
         );
-        prepare_secure_local_captures(
-            world,
-            &mut manager,
-            perspective_player,
-            &strategy.campaign_portfolio,
-        )
+        prepare_secure_local_captures(world, &mut manager, perspective_player, &planning_portfolio)
     } else {
         HashSet::new()
     };
     let mut campaign_assignments: Vec<_> = if is_v3 {
-        strategy
-            .campaign_portfolio
+        planning_portfolio
             .defenses
             .iter()
-            .chain(strategy.campaign_portfolio.active_offensives.iter())
+            .chain(planning_portfolio.active_offensives.iter())
             .cloned()
             .collect()
     } else {
@@ -4380,7 +4534,7 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         ) {
             blocked_campaign_islands.insert(assignment.island_id);
         }
-        prepare_campaign_local_assignment_with_connectivity(
+        H::prepare_local_assignment(
             world,
             &mut manager,
             perspective_player,
@@ -4665,21 +4819,13 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         }
 
         let mut to_assign = objective.needed_infantry.0;
-        let target_position = strategy
-            .campaign_portfolio
-            .assignment_for(objective.target_island)
-            .map(|assignment| assignment.target_position)
-            .or_else(|| {
-                island_props_map
-                    .get(&objective.target_island)
-                    .and_then(|positions| {
-                        let mut positions = positions.clone();
-                        positions.sort_by_key(|position| (position.y, position.x));
-                        positions.into_iter().find(|position| {
-                            properties_ownership.get(position) != Some(&Some(perspective_player))
-                        })
-                    })
-            });
+        let target_position = resolve_generic_transport_target(
+            &strategy.campaign_portfolio,
+            objective.target_island,
+            perspective_player,
+            &island_props_map,
+            &properties_ownership,
+        );
         let mut enemy_types = Vec::new();
         let mut enemy_query = world.query::<(&GridPosition, &Faction, &UnitStats)>();
         for (position, faction, stats) in enemy_query.iter(world) {
@@ -5055,55 +5201,57 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         }
     }
 
-    if let Some(capital) = my_capital_pos {
-        for cluster in &enemy_clusters {
-            let turn_dist = calculate_turn_distance(
-                &map,
-                &registry,
-                &unit_positions,
-                (capital.x, capital.y),
-                (cluster.center.x, cluster.center.y),
-                crate::resources::MovementType::Infantry,
-                3,
-                1,
-                perspective_player,
-                &mut turn_cache,
-            );
+    if H::uses_legacy_capital_defense(is_v4) {
+        if let Some(capital) = my_capital_pos {
+            for cluster in &enemy_clusters {
+                let turn_dist = calculate_turn_distance(
+                    &map,
+                    &registry,
+                    &unit_positions,
+                    (capital.x, capital.y),
+                    (cluster.center.x, cluster.center.y),
+                    crate::resources::MovementType::Infantry,
+                    3,
+                    1,
+                    perspective_player,
+                    &mut turn_cache,
+                );
 
-            if turn_dist.turns <= 5 {
-                // すでにこのクラスターを防衛目標としている部隊があるか
-                let exists = manager.squads.iter().any(|s| {
-                    squad_is_mutable_by_player(world, s, perspective_player)
-                        && s.mission_type == MissionType::Defense
-                        && s.target == Some(cluster.center)
-                });
-
-                if !exists {
-                    let squad =
-                        manager.create_owned_squad(MissionType::Defense, perspective_player);
-                    squad.target = Some(cluster.center);
-                    squad.phase = MissionPhase::Forming;
-
-                    // 最寄りの戦闘ユニットを最大2基割り当てる
-                    free_combat_units.sort_by_key(|(_, pos, stats)| {
-                        calculate_turn_distance(
-                            &map,
-                            &registry,
-                            &unit_positions,
-                            (pos.x, pos.y),
-                            (cluster.center.x, cluster.center.y),
-                            stats.movement_type,
-                            stats.max_movement,
-                            1,
-                            perspective_player,
-                            &mut turn_cache,
-                        )
+                if turn_dist.turns <= 5 {
+                    // すでにこのクラスターを防衛目標としている部隊があるか
+                    let exists = manager.squads.iter().any(|s| {
+                        squad_is_mutable_by_player(world, s, perspective_player)
+                            && s.mission_type == MissionType::Defense
+                            && s.target == Some(cluster.center)
                     });
 
-                    let assign_count = free_combat_units.len().min(3);
-                    for _ in 0..assign_count {
-                        let (ent, _, _) = free_combat_units.remove(0);
-                        squad.members.insert(ent);
+                    if !exists {
+                        let squad =
+                            manager.create_owned_squad(MissionType::Defense, perspective_player);
+                        squad.target = Some(cluster.center);
+                        squad.phase = MissionPhase::Forming;
+
+                        // 最寄りの戦闘ユニットを最大2基割り当てる
+                        free_combat_units.sort_by_key(|(_, pos, stats)| {
+                            calculate_turn_distance(
+                                &map,
+                                &registry,
+                                &unit_positions,
+                                (pos.x, pos.y),
+                                (cluster.center.x, cluster.center.y),
+                                stats.movement_type,
+                                stats.max_movement,
+                                1,
+                                perspective_player,
+                                &mut turn_cache,
+                            )
+                        });
+
+                        let assign_count = free_combat_units.len().min(3);
+                        for _ in 0..assign_count {
+                            let (ent, _, _) = free_combat_units.remove(0);
+                            squad.members.insert(ent);
+                        }
                     }
                 }
             }
@@ -5129,7 +5277,6 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     // #53 (V3): 工場・首都などの生産施設は敵の増援源であり、奪取すれば
     // 前線の消耗戦を根本から崩せるため、多少遠くても優先する
     // (前線都市の取り返し合いに全歩兵が吸われる膠着の解消)
-    const PRODUCTION_FACILITY_DIST_BONUS: usize = 6;
     // #53 (V3): 敵生産施設への奪取部隊は同時に1個まで (集中スピアヘッド)。
     // 複数同時に編成すると前線から兵力が抜かれすぎて防衛線が崩壊し、
     // 逐次投入の各個撃破で全部隊が溶けるため
@@ -5152,23 +5299,19 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
                 && s.target.as_ref().is_some_and(is_enemy_facility)
         })
         .count();
-    capture_targets.sort_by_key(|t| {
-        let d = free_infantry
-            .iter()
-            .map(|(_, pos, _)| pos.x.abs_diff(t.x) + pos.y.abs_diff(t.y))
-            .min()
-            .unwrap_or(usize::MAX);
-        let facility_bonus = if is_v3
-            && map
-                .get_terrain(t.x, t.y)
-                .is_some_and(|tr| registry.is_production_facility(tr.as_str()))
-        {
-            PRODUCTION_FACILITY_DIST_BONUS
-        } else {
-            0
-        };
-        (d.saturating_sub(facility_bonus), t.x, t.y)
-    });
+    H::sort_capture_targets(
+        world,
+        perspective_player,
+        &mut capture_targets,
+        &CapturePlanningContext {
+            map: &map,
+            registry: &registry,
+            island_map: &island_map,
+            infantry: &free_infantry,
+            capital: my_capital_pos,
+            is_v3,
+        },
+    );
 
     // #53 (V3): 敵生産施設への突入 (スピアヘッド) は戦力優勢 (Assault フェーズ)
     // のときのみ許可する。拮抗・劣勢時に前線から兵力を抜くと防衛線が崩壊する
@@ -5191,19 +5334,19 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         let target_island = target_island_opt.unwrap();
         let is_on_base_island = base_islands.contains(&target_island.id);
 
-        // この未占領拠点と同じ島にいるフリーの歩兵を探す
-        let inf_on_same_island_idx = free_infantry.iter().position(|(_, pos, stats)| {
-            island_map
-                .get_island_at(pos)
-                .is_some_and(|island| island.id == target_island.id)
-                && is_terrain_reachable(
-                    &map,
-                    &registry,
-                    (pos.x, pos.y),
-                    (unowned_pos.x, unowned_pos.y),
-                    stats.movement_type,
-                )
-        });
+        // 到達可能な同島歩兵の選択方策だけをhookへ渡す。借用はremove前に終わる。
+        let inf_on_same_island_idx = H::select_capture_infantry(
+            &CapturePlanningContext {
+                map: &map,
+                registry: &registry,
+                island_map: &island_map,
+                infantry: &free_infantry,
+                capital: my_capital_pos,
+                is_v3,
+            },
+            target_island.id,
+            unowned_pos,
+        );
 
         // V3の洋上移動はportfolio transportだけが担当し、generic Captureは到達可能な現地要員に限定する。
         let can_capture = inf_on_same_island_idx.is_some()
@@ -5443,17 +5586,24 @@ pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
         );
     }
 
-    if is_v4 {
-        crate::ai::v4::victory_roadmap::reconcile_campaign_roadmap(
-            world,
-            perspective_player,
-            &strategy.campaign_portfolio,
-            &manager,
-        );
-    }
+    // Roadmap観測位置はモデルで異なるため、正規化の前後を独立したhookで維持する。
+    H::before_final_reconcile(
+        world,
+        perspective_player,
+        &planning_portfolio,
+        &manager,
+        is_v4,
+    );
     // campaign・deployment・汎用任務をすべて構築した後に一度だけ正規化する。
     // これ以降の行動選択は重複Squadを見ず、所有者照会も平均O(1)になる。
     reconcile_unique_operation_assignments(world, &mut manager, perspective_player);
+    H::after_final_reconcile(
+        world,
+        perspective_player,
+        &planning_portfolio,
+        &mut manager,
+        is_v4,
+    );
     world.insert_resource(manager);
 }
 
@@ -6567,7 +6717,7 @@ mod tests {
     use crate::resources::master_data::*;
     use crate::resources::*;
 
-    fn setup_test_world() -> World {
+    pub(super) fn setup_test_world() -> World {
         let master_data = MasterDataRegistry::load().unwrap();
         let (mut world, _) =
             crate::setup::initialize_world_from_master_data(&master_data, "map_1").unwrap();
@@ -12184,3 +12334,7 @@ mod tests {
 mod extended;
 #[allow(unused_imports)]
 pub use self::extended::*;
+
+// 再編本体と通常／拡張hookの差分契約。
+#[cfg(test)]
+mod planning_contract_tests;
