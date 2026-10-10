@@ -2468,8 +2468,14 @@ fn plan_production_with_registry(
             candidate.facility,
             operation_priority_rank(&operations[op_index]),
         );
-        let mut deployment =
-            planned_deployment(scan, &mut ctx, &operations[op_index], slot_kind, &candidate);
+        let mut deployment = planned_deployment(
+            scan,
+            &mut ctx,
+            &operations[op_index],
+            slot_kind,
+            &candidate,
+            None,
+        );
         if slot_kind == SlotKind::Combat
             && let (Some(deployment), Some(plan)) = (deployment.as_mut(), rolling_plan)
         {
@@ -3066,12 +3072,15 @@ fn combat_plan_input(
 ///
 /// 価格は敵の硬さでも攻撃能力でもないため使わない。占領・輸送能力を持つ敵を先にし、
 /// 同分類では必要攻撃回数が少ない敵から集中撃破する。
+/// `preferred_enemy` が候補内にあればそれだけを先頭へ置く（拡張経路の物件契約用）。
+/// `None` なら全候補の先頭keyが同値になり、従来の撃破順と一致する。
 fn planned_deployment(
     scan: &BoardScan,
     ctx: &mut ReachCtx,
     op: &Operation,
     slot_kind: SlotKind,
     candidate: &SlotCandidate,
+    preferred_enemy: Option<Entity>,
 ) -> Option<PlannedDeployment> {
     let stats = candidate_stats(scan, candidate);
     let (threats, eligible): (&[ThreatTarget], Vec<usize>) = match slot_kind {
@@ -3107,6 +3116,7 @@ fn planned_deployment(
             let incoming_damage =
                 best_damage(&scan.damage_chart, threat.stats.unit_type, stats.unit_type);
             (damage > 0 && threat.current_hp > 0).then_some((
+                usize::from(preferred_enemy.is_some_and(|preferred| preferred != entity)),
                 std::cmp::Reverse(incoming_damage),
                 strategic_class,
                 attacks_to_destroy,
@@ -3118,9 +3128,11 @@ fn planned_deployment(
         })
         .collect::<Vec<_>>();
     targets.sort_unstable_by_key(|target| {
-        (target.0, target.1, target.2, target.3, target.4, target.5)
+        (
+            target.0, target.1, target.2, target.3, target.4, target.5, target.6,
+        )
     });
-    let priority_enemies = targets.into_iter().map(|target| target.6).collect();
+    let priority_enemies = targets.into_iter().map(|target| target.7).collect();
     Some(PlannedDeployment {
         operation_binding: None,
         anchor: op.anchor,
@@ -3365,7 +3377,7 @@ fn select_candidate(
         kind,
         used_facilities,
         constraints,
-        |ctx, facility, stats| slot_fitness(scan, ctx, op, kind, facility, stats),
+        |ctx, facility, stats| slot_fitness(scan, ctx, op, kind, facility, stats, &JoinableCapture),
     )
 }
 
@@ -3564,7 +3576,45 @@ fn can_join_operation(
     })
 }
 
+/// 占領枠の経路別評価。輸送・迎撃枠の評価は経路で共通なので、Capture枠の
+/// 差（到達判定の地点と、参加可能な候補の適合度）だけをここへ切り出す。
+trait CaptureSlotPolicy {
+    /// 占領枠の到達判定に使う地点。Capture枠を評価するときだけ呼ばれる。
+    fn anchor(&self, op: &Operation) -> GridPosition;
+    /// 能力・参加可否を確認済みの占領候補の適合度。
+    fn fitness(
+        &self,
+        scan: &BoardScan,
+        ctx: &mut ReachCtx,
+        anchor: GridPosition,
+        facility: &GridPosition,
+        stats: &UnitStats,
+    ) -> Option<f32>;
+}
+
+/// 通常経路の占領枠評価。作戦anchorへ参加できる占領兵を同じ適合度で扱う。
+struct JoinableCapture;
+
+impl CaptureSlotPolicy for JoinableCapture {
+    fn anchor(&self, op: &Operation) -> GridPosition {
+        op.anchor
+    }
+
+    fn fitness(
+        &self,
+        _scan: &BoardScan,
+        _ctx: &mut ReachCtx,
+        _anchor: GridPosition,
+        _facility: &GridPosition,
+        _stats: &UnitStats,
+    ) -> Option<f32> {
+        Some(1.0)
+    }
+}
+
 /// ユニットが指定枠にどれだけ適合するかを返す。適合しない場合は `None`。
+///
+/// 評価順は 到達判定 → 能力 → 参加可否 → 占領枠の経路別評価。
 fn slot_fitness(
     scan: &BoardScan,
     ctx: &mut ReachCtx,
@@ -3572,13 +3622,19 @@ fn slot_fitness(
     kind: SlotKind,
     facility: &GridPosition,
     stats: &UnitStats,
+    capture_policy: &impl CaptureSlotPolicy,
 ) -> Option<f32> {
+    let slot_anchor = if kind == SlotKind::Capture {
+        capture_policy.anchor(op)
+    } else {
+        op.anchor
+    };
     // 施設から作戦地点まで自力で到達できるか
     let self_deployable = ctx.is_reachable(
         &scan.map,
         &scan.master_data,
         (facility.x, facility.y),
-        (op.anchor.x, op.anchor.y),
+        (slot_anchor.x, slot_anchor.y),
         stats.movement_type,
     );
 
@@ -3593,14 +3649,14 @@ fn slot_fitness(
             if !can_join_operation(
                 scan,
                 ctx,
-                &op.anchor,
+                &slot_anchor,
                 op.facts.requires_transport,
                 facility,
                 stats,
             ) {
                 return None;
             }
-            Some(1.0)
+            capture_policy.fitness(scan, ctx, slot_anchor, facility, stats)
         }
         SlotKind::Transport => {
             if stats.max_cargo == 0 {
@@ -3686,7 +3742,7 @@ fn should_defer_purchase(
         op,
         remaining_funds,
         affordable_cost,
-        |ctx, facility, stats| slot_fitness(scan, ctx, op, kind, facility, stats),
+        |ctx, facility, stats| slot_fitness(scan, ctx, op, kind, facility, stats, &JoinableCapture),
     )
 }
 
@@ -4990,6 +5046,168 @@ mod tests {
             1000,
             tank_better
         ));
+    }
+
+    /// 撃破順：優先敵が無い（または候補外の）ときは従来順、候補内なら優先敵だけが先頭。
+    #[test]
+    fn planned_deployment_moves_only_eligible_preferred_enemy_first() {
+        let mut scan = multi_factory_scan();
+        let mut chart = DamageChart::new();
+        chart.insert_damage(UnitType::Tank, UnitType::Infantry, 75);
+        scan.damage_chart = chart.into();
+        let infantry = scan.available_types[0].1.clone();
+        let threat = |raw: u32, position: GridPosition| ThreatTarget {
+            entity: Some(Entity::from_raw(raw)),
+            stats: infantry.clone(),
+            position,
+            current_hp: 100,
+            available_turn: 0,
+        };
+        let mut op = operation(
+            OperationKind::Capture,
+            OperationSlots::default(),
+            OperationSlots::default(),
+        );
+        // 同分類・同攻撃回数なので、従来順は座標（x→y）で決まる
+        op.unreachable_threats = vec![
+            threat(30, pos(6, 3)),
+            threat(10, pos(5, 1)),
+            threat(20, pos(5, 3)),
+        ];
+        let candidate = SlotCandidate {
+            unit_type: UnitType::Tank,
+            cost: 7000,
+            facility: pos(1, 1),
+            fitness: 1.0,
+        };
+        let mut ctx = ReachCtx::default();
+        let mut order = |preferred: Option<Entity>| {
+            planned_deployment(
+                &scan,
+                &mut ctx,
+                &op,
+                SlotKind::Intercept,
+                &candidate,
+                preferred,
+            )
+            .unwrap()
+            .priority_enemies
+        };
+        let legacy = vec![
+            Entity::from_raw(10),
+            Entity::from_raw(20),
+            Entity::from_raw(30),
+        ];
+        assert_eq!(order(None), legacy);
+        assert_eq!(order(Some(Entity::from_raw(99))), legacy);
+        assert_eq!(
+            order(Some(Entity::from_raw(30))),
+            vec![
+                Entity::from_raw(30),
+                Entity::from_raw(10),
+                Entity::from_raw(20),
+            ]
+        );
+    }
+
+    /// 呼び出しを記録する占領枠policy。
+    struct RecordingCapture {
+        anchor: GridPosition,
+        anchor_calls: std::cell::Cell<u32>,
+        fitness_anchor: std::cell::Cell<Option<GridPosition>>,
+    }
+
+    impl CaptureSlotPolicy for RecordingCapture {
+        fn anchor(&self, _op: &Operation) -> GridPosition {
+            self.anchor_calls.set(self.anchor_calls.get() + 1);
+            self.anchor
+        }
+
+        fn fitness(
+            &self,
+            _scan: &BoardScan,
+            _ctx: &mut ReachCtx,
+            anchor: GridPosition,
+            _facility: &GridPosition,
+            _stats: &UnitStats,
+        ) -> Option<f32> {
+            self.fitness_anchor.set(Some(anchor));
+            Some(3.5)
+        }
+    }
+
+    /// 枠の適合度：占領枠policyはCapture枠だけで使われ、能力・参加可否を通過した
+    /// 候補にだけ適合度を問い合わせる。輸送・迎撃枠では一切呼ばれない。
+    #[test]
+    fn slot_fitness_consults_capture_policy_only_for_capture_slots() {
+        let scan = multi_factory_scan();
+        let mut ctx = ReachCtx::default();
+        let op = operation(
+            OperationKind::Capture,
+            OperationSlots::default(),
+            OperationSlots::default(),
+        );
+        let infantry = scan.available_types[0].1.clone();
+        let tank = scan.available_types[1].1.clone();
+        let policy = RecordingCapture {
+            anchor: pos(6, 2),
+            anchor_calls: Default::default(),
+            fitness_anchor: Default::default(),
+        };
+        let facility = pos(1, 1);
+
+        for kind in [SlotKind::Transport, SlotKind::Intercept, SlotKind::Combat] {
+            assert_eq!(
+                slot_fitness(&scan, &mut ctx, &op, kind, &facility, &infantry, &policy),
+                None
+            );
+        }
+        assert_eq!(policy.anchor_calls.get(), 0);
+        assert_eq!(policy.fitness_anchor.get(), None);
+
+        // 占領能力が無ければ地点だけ決めて、適合度は問い合わせない
+        assert_eq!(
+            slot_fitness(
+                &scan,
+                &mut ctx,
+                &op,
+                SlotKind::Capture,
+                &facility,
+                &tank,
+                &policy
+            ),
+            None
+        );
+        assert_eq!(policy.anchor_calls.get(), 1);
+        assert_eq!(policy.fitness_anchor.get(), None);
+
+        // 参加可能な占領兵には、policyが決めた地点で適合度を問い合わせる
+        assert_eq!(
+            slot_fitness(
+                &scan,
+                &mut ctx,
+                &op,
+                SlotKind::Capture,
+                &facility,
+                &infantry,
+                &policy
+            ),
+            Some(3.5)
+        );
+        assert_eq!(policy.fitness_anchor.get(), Some(pos(6, 2)));
+        // 通常経路は参加可能なら同じ適合度
+        assert_eq!(
+            slot_fitness(
+                &scan,
+                &mut ctx,
+                &op,
+                SlotKind::Capture,
+                &facility,
+                &infantry,
+                &JoinableCapture
+            ),
+            Some(1.0)
+        );
     }
 
     /// 航空・地上の未対処脅威と工場3基を持つ、限界価値の統合テスト盤面。

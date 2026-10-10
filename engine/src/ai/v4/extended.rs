@@ -2946,86 +2946,6 @@ pub(super) fn combat_plan_input(
     })
 }
 
-/// 生産された戦闘Entityへ、実HPと与ダメージから撃破順を与える。
-///
-/// 価格は敵の硬さでも攻撃能力でもないため使わない。占領・輸送能力を持つ敵を先にし、
-/// 同分類では必要攻撃回数が少ない敵から集中撃破する。
-pub(super) fn planned_deployment(
-    scan: &BoardScan,
-    ctx: &mut ReachCtx,
-    op: &Operation,
-    slot_kind: SlotKind,
-    candidate: &SlotCandidate,
-    preferred_enemy: Option<Entity>,
-) -> Option<PlannedDeployment> {
-    let stats = candidate_stats(scan, candidate);
-    let (threats, eligible): (&[ThreatTarget], Vec<usize>) = match slot_kind {
-        SlotKind::Intercept => (
-            &op.unreachable_threats,
-            (0..op.unreachable_threats.len()).collect(),
-        ),
-        SlotKind::Combat => {
-            // Combatは標的位置ではなく射撃圏へ自力展開する。艦船を陸上anchorへ
-            // 仮置きすると到達判定が再び失敗するため、生産施設を常に起点とする。
-            let origin = candidate.facility;
-            (
-                &op.reachable_threats,
-                reachable_threat_indices(scan, ctx, &op.reachable_threats, origin, stats),
-            )
-        }
-        SlotKind::Capture | SlotKind::Transport => return None,
-    };
-    let mut targets = eligible
-        .into_iter()
-        .filter_map(|index| {
-            let threat = &threats[index];
-            let entity = threat.entity?;
-            let damage = best_damage(&scan.damage_chart, stats.unit_type, threat.stats.unit_type);
-            let attacks_to_destroy = threat.current_hp.div_ceil(damage.max(1));
-            let strategic_class = if threat.stats.can_capture {
-                0
-            } else if threat.stats.max_cargo > 0 {
-                1
-            } else {
-                2
-            };
-            let incoming_damage =
-                best_damage(&scan.damage_chart, threat.stats.unit_type, stats.unit_type);
-            (damage > 0 && threat.current_hp > 0).then_some((
-                usize::from(preferred_enemy.is_some_and(|preferred| preferred != entity)),
-                std::cmp::Reverse(incoming_damage),
-                strategic_class,
-                attacks_to_destroy,
-                threat.position.x,
-                threat.position.y,
-                entity.to_bits(),
-                entity,
-            ))
-        })
-        .collect::<Vec<_>>();
-    targets.sort_unstable_by_key(|target| {
-        (
-            target.0, target.1, target.2, target.3, target.4, target.5, target.6,
-        )
-    });
-    let priority_enemies = targets.into_iter().map(|target| target.7).collect();
-    Some(PlannedDeployment {
-        anchor: op.anchor,
-        staging_anchor: op.staging_anchor,
-        posture: if op.kind == OperationKind::AssaultCapital {
-            deployment::DeploymentPosture::Forming
-        } else {
-            deployment::DeploymentPosture::Execute
-        },
-        slot_kind,
-        priority_enemies,
-        threat_horizon: op.threat_horizon,
-        forecast: deployment::DeploymentForecast::default(),
-        plan_step: None,
-        operation_binding: None,
-    })
-}
-
 /// 指定の枠を満たす最良の候補を選ぶ。
 ///
 /// 物件制御付きCaptureだけは専用選定を使い、それ以外は親の共有骨格へ
@@ -3055,126 +2975,57 @@ pub(super) fn select_candidate(
         kind,
         used_facilities,
         constraints,
-        |ctx, facility, stats| slot_fitness(scan, ctx, op, kind, facility, stats, player_id),
+        |ctx, facility, stats| {
+            slot_fitness(
+                scan,
+                ctx,
+                op,
+                kind,
+                facility,
+                stats,
+                &CaptureArrivalPolicy { player_id },
+            )
+        },
     )
 }
 
-/// ユニットが指定枠にどれだけ適合するかを返す。適合しない場合は `None`。
-#[allow(clippy::too_many_arguments)]
-pub(super) fn slot_fitness(
-    scan: &BoardScan,
-    ctx: &mut ReachCtx,
-    op: &Operation,
-    kind: SlotKind,
-    facility: &GridPosition,
-    stats: &UnitStats,
-    player_id: PlayerId,
-) -> Option<f32> {
-    let slot_anchor = if kind == SlotKind::Capture {
-        next_capture_target(op)
-    } else {
-        op.anchor
-    };
-    // 施設から作戦地点まで自力で到達できるか
-    let self_deployable = ctx.is_reachable(
-        &scan.map,
-        &scan.master_data,
-        (facility.x, facility.y),
-        (slot_anchor.x, slot_anchor.y),
-        stats.movement_type,
-    );
+/// 拡張経路の占領枠評価。占領レーンの次目標へ、何フェーズで到着し既存の
+/// 占領役より速いかで比較する。
+pub(super) struct CaptureArrivalPolicy {
+    pub(super) player_id: PlayerId,
+}
 
-    match kind {
-        SlotKind::Capture => {
-            if !stats.can_capture {
-                return None;
-            }
-            // 自力で行けないなら、実際に運べる輸送手段が存在することが前提。
-            // 「輸送枠が立っている」だけでは運搬が成立する保証にならない。
-            // 台帳（`build_operation` の自軍仕分け）と同じ関数を通すこと。
-            if !can_join_operation(
-                scan,
-                ctx,
-                &slot_anchor,
-                op.facts.requires_transport,
-                facility,
-                stats,
-            ) {
-                return None;
-            }
-            // 兵種名ではなく「物件へ何フェーズで到着し、既存の占領役より速いか」で比較する。
-            // 速い兵種でも、既に割り当て済みの占領役より到着が遅い・同等なら直取り目的では
-            // 買い増さない（`docs/07-project-management/plans/v4-v200-small-map-expansion-analysis.md`）。
-            let candidate_arrival = property_control::capture_arrival_turns(
-                &scan.map,
-                &scan.master_data,
-                (facility.x, facility.y),
-                (slot_anchor.x, slot_anchor.y),
-                stats.movement_type,
-                stats.max_movement,
-                stats.max_fuel,
-                player_id,
-                &mut ctx.action_turns,
-            )
-            .map(|turns| property_control::produced_action_offset(0, turns))
-            .unwrap_or(u32::MAX);
-            let committed_best = committed_capture_arrival(scan, ctx, slot_anchor, player_id);
-            property_control::capture_speed_fitness(candidate_arrival, committed_best)
-        }
-        SlotKind::Transport => {
-            if stats.max_cargo == 0 {
-                return None;
-            }
-            // 「占領ユニットを積める」だけでは足りない。
-            // その積荷を実際に目標へ揚陸できるところまで確かめる。
-            // ここを緩めると運用の当てがない輸送を買い続けることになり、
-            // 逆に目標マス自体への到達を求めると艦船が永久に候補から外れる。
-            let deliverable = scan
-                .available_types
-                .iter()
-                .filter(|(unit_type, cargo)| {
-                    cargo.can_capture && stats.loadable_unit_types.contains(unit_type)
-                })
-                .map(|(_, cargo)| cargo.movement_type)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .any(|cargo_movement| {
-                    can_deliver_cargo(
-                        &scan.map,
-                        &scan.master_data,
-                        ctx,
-                        facility,
-                        &op.anchor,
-                        stats.movement_type,
-                        cargo_movement,
-                    )
-                });
-            if !deliverable {
-                return None;
-            }
-            Some(stats.max_cargo as f32)
-        }
-        SlotKind::Intercept => {
-            if op.unreachable_threats.is_empty() {
-                return None;
-            }
-            // 迎撃には「その脅威に届く」ことと「自力で現地へ行ける」ことの両方が要る。
-            // 対空戦車が海を渡れないために選ばれないのは、この 2 条件の帰結。
-            if !self_deployable {
-                return None;
-            }
-            // 価格ではなく、次の一撃で実際に削れるHPを適合度にする。
-            let value = op
-                .unreachable_threats
-                .iter()
-                .map(|threat| {
-                    best_damage(&scan.damage_chart, stats.unit_type, threat.stats.unit_type)
-                        .min(threat.current_hp) as f32
-                })
-                .sum::<f32>();
-            if value <= 0.0 { None } else { Some(value) }
-        }
-        SlotKind::Combat => None,
+impl CaptureSlotPolicy for CaptureArrivalPolicy {
+    fn anchor(&self, op: &Operation) -> GridPosition {
+        next_capture_target(op)
+    }
+
+    fn fitness(
+        &self,
+        scan: &BoardScan,
+        ctx: &mut ReachCtx,
+        anchor: GridPosition,
+        facility: &GridPosition,
+        stats: &UnitStats,
+    ) -> Option<f32> {
+        // 兵種名ではなく「物件へ何フェーズで到着し、既存の占領役より速いか」で比較する。
+        // 速い兵種でも、既に割り当て済みの占領役より到着が遅い・同等なら直取り目的では
+        // 買い増さない（`docs/07-project-management/plans/v4-v200-small-map-expansion-analysis.md`）。
+        let candidate_arrival = property_control::capture_arrival_turns(
+            &scan.map,
+            &scan.master_data,
+            (facility.x, facility.y),
+            (anchor.x, anchor.y),
+            stats.movement_type,
+            stats.max_movement,
+            stats.max_fuel,
+            self.player_id,
+            &mut ctx.action_turns,
+        )
+        .map(|turns| property_control::produced_action_offset(0, turns))
+        .unwrap_or(u32::MAX);
+        let committed_best = committed_capture_arrival(scan, ctx, anchor, self.player_id);
+        property_control::capture_speed_fitness(candidate_arrival, committed_best)
     }
 }
 
@@ -3196,7 +3047,17 @@ pub(super) fn should_defer_purchase(
         op,
         remaining_funds,
         affordable_cost,
-        |ctx, facility, stats| slot_fitness(scan, ctx, op, kind, facility, stats, player_id),
+        |ctx, facility, stats| {
+            slot_fitness(
+                scan,
+                ctx,
+                op,
+                kind,
+                facility,
+                stats,
+                &CaptureArrivalPolicy { player_id },
+            )
+        },
     )
 }
 
