@@ -3027,6 +3027,9 @@ pub(super) fn planned_deployment(
 }
 
 /// 指定の枠を満たす最良の候補を選ぶ。
+///
+/// 物件制御付きCaptureだけは専用選定を使い、それ以外は親の共有骨格へ
+/// 拡張の適合度を渡す。
 pub(super) fn select_candidate(
     scan: &BoardScan,
     ctx: &mut ReachCtx,
@@ -3046,60 +3049,14 @@ pub(super) fn select_candidate(
             player_id,
         );
     }
-    let mut best: Option<SlotCandidate> = None;
-    let mut best_over_budget: Option<SlotCandidate> = None;
-
-    for (facility, terrain) in &scan.free_facilities {
-        if used_facilities.contains(facility) {
-            continue;
-        }
-        for (unit_type, stats) in &scan.available_types {
-            if !scan.can_produce(*terrain, *unit_type) {
-                continue;
-            }
-            let Some(fitness) = slot_fitness(scan, ctx, op, kind, facility, stats, player_id)
-            else {
-                continue;
-            };
-            if stats.cost == 0 || stats.cost > constraints.remaining_funds {
-                continue;
-            }
-            // CombatはRollingPlan専用で、この候補選定へ入らない。残る枠はいずれも
-            // 体数・輸送容量なので、同じ実能力なら安い方を選ぶ。
-            let count_denominated = true;
-            let candidate = SlotCandidate {
-                unit_type: *unit_type,
-                cost: stats.cost,
-                facility: *facility,
-                fitness: normalized_candidate_fitness(
-                    kind,
-                    fitness,
-                    stats.cost,
-                    constraints.per_slot_budget,
-                ),
-            };
-            let slot = if count_denominated && stats.cost > constraints.per_slot_budget.max(1) {
-                &mut best_over_budget
-            } else {
-                &mut best
-            };
-            let better = slot.is_none_or(|current| {
-                if count_denominated {
-                    // 同性能なら安い方が多く揃う
-                    (candidate.fitness, current.cost) > (current.fitness, candidate.cost)
-                } else {
-                    // 枠が制約なので、同性能なら大きい方を投入する
-                    (candidate.fitness, candidate.cost) > (current.fitness, current.cost)
-                }
-            });
-            if better {
-                *slot = Some(candidate);
-            }
-        }
-    }
-
-    // 1 枠あたり予算に収まる候補を優先し、無ければ予算超過でも買える候補を使う
-    best.or(best_over_budget)
+    select_candidate_by(
+        scan,
+        ctx,
+        kind,
+        used_facilities,
+        constraints,
+        |ctx, facility, stats| slot_fitness(scan, ctx, op, kind, facility, stats, player_id),
+    )
 }
 
 /// ユニットが指定枠にどれだけ適合するかを返す。適合しない場合は `None`。
@@ -3223,8 +3180,7 @@ pub(super) fn slot_fitness(
 
 /// 見送り購入（資金を貯めて上位の候補を買う）を行うべきか。
 ///
-/// 一括編成が必要な作戦に限り、いま買える候補より明確に適合度の高い候補が
-/// `RESERVATION_PATIENCE_TURNS` 以内の収入で買えるなら、今ターンは生産しない。
+/// 判定骨格は親と共有し、適合度だけ拡張の評価を使う。
 pub(super) fn should_defer_purchase(
     scan: &BoardScan,
     ctx: &mut ReachCtx,
@@ -3234,54 +3190,14 @@ pub(super) fn should_defer_purchase(
     affordable_cost: u32,
     player_id: PlayerId,
 ) -> bool {
-    if acquisition_mode(&op.facts) != AcquisitionMode::SquadPackage {
-        return false;
-    }
-    if scan.my_income == 0 {
-        return false;
-    }
-    // 輸送が要る作戦で輸送枠がまだ空いているのに他の枠を先に埋めるのは避ける
-    let mut best_future: Option<(f32, u32)> = None;
-    for (facility, terrain) in &scan.free_facilities {
-        for (unit_type, stats) in &scan.available_types {
-            if !scan.can_produce(*terrain, *unit_type) || stats.cost <= remaining_funds {
-                continue;
-            }
-            let Some(fitness) = slot_fitness(scan, ctx, op, kind, facility, stats, player_id)
-            else {
-                continue;
-            };
-            let scaled = fitness * 1000.0 / stats.cost as f32;
-            if best_future.is_none_or(|(current, _)| scaled > current) {
-                best_future = Some((scaled, stats.cost));
-            }
-        }
-    }
-    let Some((future_fitness, future_cost)) = best_future else {
-        return false;
-    };
-    // 現在買える候補の適合度
-    let current_fitness = scan
-        .available_types
-        .iter()
-        .filter(|(_, stats)| stats.cost <= remaining_funds && stats.cost == affordable_cost)
-        .filter_map(|(_, stats)| {
-            scan.free_facilities.iter().find_map(|(facility, terrain)| {
-                if !scan.can_produce(*terrain, stats.unit_type) {
-                    return None;
-                }
-                slot_fitness(scan, ctx, op, kind, facility, stats, player_id)
-                    .map(|f| f * 1000.0 / stats.cost as f32)
-            })
-        })
-        .fold(0.0f32, f32::max);
-
-    if future_fitness <= current_fitness {
-        return false;
-    }
-    let shortfall = future_cost.saturating_sub(remaining_funds);
-    let turns_to_afford = shortfall.div_ceil(scan.my_income.max(1));
-    turns_to_afford <= RESERVATION_PATIENCE_TURNS
+    should_defer_purchase_by(
+        scan,
+        ctx,
+        op,
+        remaining_funds,
+        affordable_cost,
+        |ctx, facility, stats| slot_fitness(scan, ctx, op, kind, facility, stats, player_id),
+    )
 }
 
 #[cfg(test)]

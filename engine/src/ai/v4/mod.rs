@@ -3340,6 +3340,16 @@ fn normalized_candidate_fitness(
     raw_fitness * 1000.0 / opportunity_cost as f32
 }
 
+/// 枠の適合度関数。通常／拡張で評価本文が異なるため、候補走査の骨格へ明示的に渡す。
+///
+/// `ReachCtx` は到達判定cacheを更新するので、closureへcaptureさせず引数で受け取る。
+trait CandidateFitness: FnMut(&mut ReachCtx, &GridPosition, &UnitStats) -> Option<f32> {}
+
+impl<F> CandidateFitness for F where
+    F: FnMut(&mut ReachCtx, &GridPosition, &UnitStats) -> Option<f32>
+{
+}
+
 /// 指定の枠を満たす最良の候補を選ぶ。
 fn select_candidate(
     scan: &BoardScan,
@@ -3348,6 +3358,28 @@ fn select_candidate(
     kind: SlotKind,
     used_facilities: &HashSet<GridPosition>,
     constraints: CandidateConstraints,
+) -> Option<SlotCandidate> {
+    select_candidate_by(
+        scan,
+        ctx,
+        kind,
+        used_facilities,
+        constraints,
+        |ctx, facility, stats| slot_fitness(scan, ctx, op, kind, facility, stats),
+    )
+}
+
+/// 施設×兵種を走査し、渡された適合度で最良の候補を選ぶ共有骨格。
+///
+/// 走査順は施設が外側・兵種が内側。適合度は価格除外より前に評価し、
+/// 更新は厳密に良い場合だけなので、同値なら先に見つけた候補が残る。
+fn select_candidate_by(
+    scan: &BoardScan,
+    ctx: &mut ReachCtx,
+    kind: SlotKind,
+    used_facilities: &HashSet<GridPosition>,
+    constraints: CandidateConstraints,
+    mut fitness_of: impl CandidateFitness,
 ) -> Option<SlotCandidate> {
     let mut best: Option<SlotCandidate> = None;
     let mut best_over_budget: Option<SlotCandidate> = None;
@@ -3360,7 +3392,7 @@ fn select_candidate(
             if !scan.can_produce(*terrain, *unit_type) {
                 continue;
             }
-            let Some(fitness) = slot_fitness(scan, ctx, op, kind, facility, stats) else {
+            let Some(fitness) = fitness_of(ctx, facility, stats) else {
                 continue;
             };
             if stats.cost == 0 || stats.cost > constraints.remaining_funds {
@@ -3648,6 +3680,28 @@ fn should_defer_purchase(
     remaining_funds: u32,
     affordable_cost: u32,
 ) -> bool {
+    should_defer_purchase_by(
+        scan,
+        ctx,
+        op,
+        remaining_funds,
+        affordable_cost,
+        |ctx, facility, stats| slot_fitness(scan, ctx, op, kind, facility, stats),
+    )
+}
+
+/// 見送り購入判定の共有骨格。適合度は呼び出し側の経路別関数を使う。
+///
+/// 将来候補は全施設×兵種から厳密に良いものを選び、現在候補は兵種ごとに
+/// 最初に生産可能な施設の適合度を使う。
+fn should_defer_purchase_by(
+    scan: &BoardScan,
+    ctx: &mut ReachCtx,
+    op: &Operation,
+    remaining_funds: u32,
+    affordable_cost: u32,
+    mut fitness_of: impl CandidateFitness,
+) -> bool {
     if acquisition_mode(&op.facts) != AcquisitionMode::SquadPackage {
         return false;
     }
@@ -3661,7 +3715,7 @@ fn should_defer_purchase(
             if !scan.can_produce(*terrain, *unit_type) || stats.cost <= remaining_funds {
                 continue;
             }
-            let Some(fitness) = slot_fitness(scan, ctx, op, kind, facility, stats) else {
+            let Some(fitness) = fitness_of(ctx, facility, stats) else {
                 continue;
             };
             let scaled = fitness * 1000.0 / stats.cost as f32;
@@ -3683,8 +3737,7 @@ fn should_defer_purchase(
                 if !scan.can_produce(*terrain, stats.unit_type) {
                     return None;
                 }
-                slot_fitness(scan, ctx, op, kind, facility, stats)
-                    .map(|f| f * 1000.0 / stats.cost as f32)
+                fitness_of(ctx, facility, stats).map(|f| f * 1000.0 / stats.cost as f32)
             })
         })
         .fold(0.0f32, f32::max);
@@ -4769,6 +4822,174 @@ mod tests {
             capital_assault_authorized: false,
             capital_staging_anchor: None,
         }
+    }
+
+    /// 候補選定の共有骨格：予算内候補が予算超過候補より優先され、同値なら
+    /// 先に走査した施設が残る。適合度は価格除外より前に全施設×兵種で評価する。
+    #[test]
+    fn select_candidate_by_keeps_budget_priority_and_scan_order() {
+        let scan = multi_factory_scan();
+        let mut ctx = ReachCtx::default();
+        let mut evaluated = Vec::new();
+        let constraints = CandidateConstraints {
+            remaining_funds: 7000,
+            per_slot_budget: 1000,
+        };
+        // 戦車の方が正規化後も高いが、1枠予算を超えるので歩兵が選ばれる
+        let selected = select_candidate_by(
+            &scan,
+            &mut ctx,
+            SlotKind::Capture,
+            &HashSet::new(),
+            constraints,
+            |_, facility, stats| {
+                evaluated.push((*facility, stats.unit_type));
+                Some(if stats.unit_type == UnitType::Tank {
+                    10.0
+                } else {
+                    1.0
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(selected.unit_type, UnitType::Infantry);
+        assert_eq!(selected.facility, pos(1, 1));
+        // 施設が外側・兵種が内側の順で全組合せを評価する
+        assert_eq!(
+            evaluated,
+            vec![
+                (pos(1, 1), UnitType::Infantry),
+                (pos(1, 1), UnitType::Tank),
+                (pos(1, 2), UnitType::Infantry),
+                (pos(1, 2), UnitType::Tank),
+                (pos(1, 3), UnitType::Infantry),
+                (pos(1, 3), UnitType::Tank),
+            ]
+        );
+
+        // 買えない戦車も適合度評価は行い、その後に価格で除外する
+        let mut calls = 0;
+        let selected = select_candidate_by(
+            &scan,
+            &mut ctx,
+            SlotKind::Capture,
+            &HashSet::new(),
+            CandidateConstraints {
+                remaining_funds: 1000,
+                per_slot_budget: 10000,
+            },
+            |_, _, _| {
+                calls += 1;
+                Some(1.0)
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 6);
+        assert_eq!(selected.unit_type, UnitType::Infantry);
+
+        // 使用済み施設は飛ばし、厳密に良い施設だけが先頭候補を置き換える
+        let used = HashSet::from([pos(1, 1)]);
+        let selected = select_candidate_by(
+            &scan,
+            &mut ctx,
+            SlotKind::Capture,
+            &used,
+            constraints,
+            |_, facility, _| Some(if *facility == pos(1, 3) { 2.0 } else { 1.0 }),
+        )
+        .unwrap();
+        assert_eq!(selected.facility, pos(1, 3));
+        let selected = select_candidate_by(
+            &scan,
+            &mut ctx,
+            SlotKind::Capture,
+            &used,
+            constraints,
+            |_, _, _| Some(1.0),
+        )
+        .unwrap();
+        assert_eq!(selected.facility, pos(1, 2));
+    }
+
+    /// 見送り購入の共有骨格：一括編成の作戦だけが対象で、将来候補が厳密に良く、
+    /// 不足額を`RESERVATION_PATIENCE_TURNS`以内の収入で賄えるときだけ見送る。
+    #[test]
+    fn should_defer_purchase_by_respects_mode_and_patience_boundary() {
+        let mut scan = multi_factory_scan();
+        let mut ctx = ReachCtx::default();
+        let mut op = operation(
+            OperationKind::Capture,
+            OperationSlots::default(),
+            OperationSlots::default(),
+        );
+        let tank_better = |_: &mut ReachCtx, _: &GridPosition, stats: &UnitStats| {
+            Some(if stats.unit_type == UnitType::Tank {
+                70.0
+            } else {
+                1.0
+            })
+        };
+
+        // 補充型の作戦は適合度を評価せずに見送らない
+        let mut calls = 0;
+        assert!(!should_defer_purchase_by(
+            &scan,
+            &mut ctx,
+            &op,
+            1000,
+            1000,
+            |_, _, _| {
+                calls += 1;
+                Some(1.0)
+            },
+        ));
+        assert_eq!(calls, 0);
+
+        op.facts.requires_transport = true;
+        // 不足6000を収入1200なら5ターンで賄えるので見送る
+        scan.my_income = 1200;
+        assert!(should_defer_purchase_by(
+            &scan,
+            &mut ctx,
+            &op,
+            1000,
+            1000,
+            tank_better
+        ));
+        // 収入1199では6ターンかかり待機期限を超える
+        scan.my_income = 1199;
+        assert!(!should_defer_purchase_by(
+            &scan,
+            &mut ctx,
+            &op,
+            1000,
+            1000,
+            tank_better
+        ));
+        // 正規化後の適合度が同値なら見送らない（厳密比較）
+        scan.my_income = 1200;
+        assert!(!should_defer_purchase_by(
+            &scan,
+            &mut ctx,
+            &op,
+            1000,
+            1000,
+            |_, _, stats| Some(if stats.unit_type == UnitType::Tank {
+                7.0
+            } else {
+                1.0
+            }),
+        ));
+        // 収入が無ければ見送らない
+        scan.my_income = 0;
+        assert!(!should_defer_purchase_by(
+            &scan,
+            &mut ctx,
+            &op,
+            1000,
+            1000,
+            tank_better
+        ));
     }
 
     /// 航空・地上の未対処脅威と工場3基を持つ、限界価値の統合テスト盤面。
