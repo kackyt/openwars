@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AI 再設計の効果見積り</title>
+<style>
+/* 既存設計資料の書体・面の色を継承。読み順：結論の数字→段階別の推移→分布→構造→範囲外→前提。
+   グラフの系列色は検証済みの青（再設計後・中央）と橙（現状）。帯は控えめ〜積極の幅。 */
+:root{color-scheme:light;--bg:#f4f8fa;--surface:#ffffff;--fg:#102a43;--muted:#526b7a;--line:#bfd1da;--grid:#e3ecf0;--accent:#087e8b;--warn:#a4541b;
+--after:#2a78d6;--before:#eb6834;--band:rgba(42,120,214,.16);
+--display:"Yu Gothic UI","Meiryo",system-ui,sans-serif;--body:"Hiragino Sans","Meiryo",system-ui,sans-serif;--mono:"Cascadia Mono",Consolas,monospace}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--bg:#0c1921;--surface:#132631;--fg:#e8f2f6;--muted:#aac0ca;--line:#3c5966;--grid:#203a46;--accent:#58d2d8;--warn:#f0a86a;--after:#3987e5;--before:#d95926;--band:rgba(57,135,229,.22)}}
+:root[data-theme="dark"]{color-scheme:dark;--bg:#0c1921;--surface:#132631;--fg:#e8f2f6;--muted:#aac0ca;--line:#3c5966;--grid:#203a46;--accent:#58d2d8;--warn:#f0a86a;--after:#3987e5;--before:#d95926;--band:rgba(57,135,229,.22)}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.8 var(--body)}
+.page{max-width:1160px;margin:auto;padding-inline:16px;padding-block:32px 64px;display:grid;grid-template-columns:minmax(0,1fr);gap:40px}
+header,section{display:grid;grid-template-columns:minmax(0,1fr);gap:16px;min-width:0}header>*,section>*{min-width:0}section{border-top:1px solid var(--line);padding-top:28px}
+h1,h2,h3{font-family:var(--display);line-height:1.45;text-wrap:balance;margin:0}h1{font-size:clamp(1.8rem,4vw,2.5rem)}h2{font-size:1.45rem}h3{font-size:1.05rem}
+p,ul{margin:0}p{max-width:78ch}ul{padding-left:1.4em}li+li{margin-top:6px}
+a{color:var(--accent);text-underline-offset:4px}code{font-family:var(--mono);font-size:.86em;overflow-wrap:anywhere}
+.meta{color:var(--muted);font-size:.86rem}.eyebrow{font:.8rem/1.6 var(--mono);color:var(--muted);letter-spacing:.04em}
+.note{background:var(--surface);border-left:3px solid var(--warn);padding:14px 18px;font-size:.92rem}
+.tiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.tile{background:var(--surface);border:1px solid var(--line);padding:14px 16px;display:grid;gap:4px;min-width:0}
+.tile .k{font-size:.84rem;color:var(--muted)}
+.tile .v{font:700 1.5rem/1.3 var(--mono);font-variant-numeric:tabular-nums}
+.tile .v .from{color:var(--muted);font-weight:400;font-size:1.05rem}
+.tile .r{font:.8rem var(--mono);color:var(--muted)}
+.multi{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+figure{margin:0;background:var(--surface);border:1px solid var(--line);padding:14px 16px;display:grid;gap:6px;min-width:0;position:relative}
+figcaption{font-size:.84rem;color:var(--muted)}
+.chart{width:100%;overflow-x:auto}#hist svg{min-width:640px}svg{display:block;width:100%;height:auto}
+svg text{fill:var(--muted);font:11.5px var(--mono)}svg .lbl{fill:var(--fg)}
+.legend{display:flex;flex-wrap:wrap;gap:6px 18px;font-size:.84rem;color:var(--muted)}
+.legend i{display:inline-block;width:12px;height:12px;border-radius:2px;margin-right:6px;vertical-align:-1px}
+.tip{position:absolute;pointer-events:none;background:var(--bg);border:1px solid var(--line);padding:8px 10px;font:12px/1.6 var(--mono);color:var(--fg);box-shadow:0 2px 8px rgba(0,0,0,.12);white-space:nowrap;z-index:2}
+.scroll{overflow-x:auto;max-width:100%}table{width:100%;min-width:720px;border-collapse:collapse;background:var(--surface);font-size:.87rem}
+th,td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{font-weight:700;color:var(--muted);font-size:.8rem}
+td.n,th.n{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+td.done{color:var(--after);font-weight:700}
+details{background:var(--surface);border:1px solid var(--line);padding:10px 14px}summary{cursor:pointer;color:var(--muted);font-size:.88rem}
+:focus-visible{outline:3px solid var(--accent);outline-offset:3px}
+@media(max-width:760px){.tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.multi{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<main class="page">
+<header>
+<p class="eyebrow">OpenWars · AI architecture · 2026-10-11 · 基準 37dccd6 · 見積り</p>
+<h1>AI 再設計の効果見積り</h1>
+<p><a href="ai-refactor-redesign-plan.html">AI 抜本再設計計画</a>を段階7まで実行したとき、関数の複雑性と構造がどう変わるかの見積りです。<strong>大きく変わるのは「巨大関数の数」と「状態を書き換える場所の数」です。CC の合計はほとんど減りません。</strong>判断の総量は同じで、それを責務ごとの小さな関数と少数の更新口に分け直すからです。</p>
+<p class="meta">現状値は実測、それ以外は見積りです。中央シナリオを主に示し、帯と括弧内は控えめ〜積極の幅です。見積りの組み立ては末尾の<a href="#model">前提とモデル</a>にあります。計画の受入条件の代わりにはしません。各段階の完了時に、同じ定義で実測し直します。</p>
+</header>
+
+<section aria-labelledby="h-summary">
+<h2 id="h-summary">段階7完了時（中央シナリオ）</h2>
+<div class="tiles" id="tiles"></div>
+<p class="note">最大 CC が 106 で止まるのは、計画の対象外に巨大関数が残るためです（<a href="#uncovered">計画の範囲外</a>）。CC が 50 を超える 22 個のうち、計画が書き直すのは 16 個です。残りの 6 個も対象に加えると、最大 CC は 50 未満（V100 の <code>decide_action</code> 49）まで下がる見込みです。分けられない塊として残る最大は約 32 です。</p>
+</section>
+
+<section aria-labelledby="h-trend">
+<h2 id="h-trend">段階ごとの推移</h2>
+<p>段階3〜4（生産・所属）は対象の CC が全体の 2 割弱なので、全体の数字はあまり動きません。大きく動くのは、巨大関数が集まる段階5（戦略・編成）と段階6（行動選択）です。</p>
+<div class="multi" id="multi"></div>
+<p class="meta">折れ線は中央シナリオ、帯は控えめ〜積極の幅です。点にカーソルを置くと3シナリオの値を表示します。各段階の値は、その段階までを完了した累積です。</p>
+</section>
+
+<section aria-labelledby="h-dist">
+<h2 id="h-dist">関数あたり CC の分布</h2>
+<figure>
+<div class="legend"><span><i style="background:var(--before)"></i>現状</span><span><i style="background:var(--after)"></i>段階7後（中央）</span></div>
+<div class="chart" id="hist"></div>
+<figcaption>CC 16 以上の関数は 111 個から約 30 個へ、51 以上は 22 個から 6 個へ減ります。11〜15 の山は機械的な分割の見積りが上限近くに寄せたためで、実際の書き直しでは低い側へ散ると見込んでいます。</figcaption>
+</figure>
+<details><summary>表で見る</summary><div class="scroll"><table id="histTable"></table></div></details>
+</section>
+
+<section aria-labelledby="h-structure">
+<h2 id="h-structure">構造指標の推移</h2>
+<p>こちらは計画の削除対象と設計目標から決まる値なので、シナリオの幅はありません。CC よりもこちらが、再設計の本来の成果です。</p>
+<div class="scroll"><table>
+<thead><tr><th>指標</th><th class="n">現状</th><th class="n">段階3<br>生産</th><th class="n">段階4<br>所属</th><th class="n">段階5<br>戦略</th><th class="n">段階6<br>行動</th><th class="n">段階7<br>負債</th></tr></thead>
+<tbody>
+<tr><td>経路判定の記述箇所（<code>is_extended_at</code>・<code>ext_enabled</code>・<code>is_extended</code>、定義を含む）</td><td class="n">55</td><td class="n">46</td><td class="n">37</td><td class="n">26</td><td class="n">20</td><td class="n done">≈3</td></tr>
+<tr><td>親と extended の同名関数ペア</td><td class="n">39</td><td class="n">27</td><td class="n">13</td><td class="n">6</td><td class="n">4</td><td class="n done">0</td></tr>
+<tr><td><code>pub use …extended::*</code>（境界のない再export）</td><td class="n">9</td><td class="n">8</td><td class="n">6</td><td class="n">3</td><td class="n">1</td><td class="n done">0</td></tr>
+<tr><td>修復・事後修正の呼び出し（所属正規化・再接続・Roadmap再照合・DAG再準備・<code>clear_slot</code>・保存後の施設交換）</td><td class="n">22</td><td class="n">16</td><td class="n">8</td><td class="n done">3</td><td class="n">3</td><td class="n">3</td></tr>
+<tr><td>unit所属を保持する台帳 / 書き込む関数があるファイル</td><td class="n">6 / 13</td><td class="n">6 / 13</td><td class="n done">1＋投影 / 2〜3</td><td class="n">同左</td><td class="n">同左</td><td class="n">同左</td></tr>
+<tr><td>採用戦略を保持する台帳 / 書き込むファイル</td><td class="n">6 / 7</td><td class="n">6 / 7</td><td class="n">6 / 7</td><td class="n done">2〜3 / 2</td><td class="n">同左</td><td class="n">同左</td></tr>
+<tr><td>購入計画を保持する台帳 / 書き込むファイル</td><td class="n">5 / 6</td><td class="n done">2 / 2</td><td class="n">同左</td><td class="n">同左</td><td class="n">同左</td><td class="n">同左</td></tr>
+</tbody></table></div>
+<p class="meta">残る3件の修復呼び出しは、保存データ読込時の所属正規化、理由付き再計画時のRoadmap照合、入口でのDAG準備です。台帳数は、同じ概念の現在値を持つResourceの数です（<code>UnitOperationRegistry</code>・<code>SquadManager</code>・<code>PlanContractRegistry</code>・<code>VictoryRoadmapRegistry</code> など。1つが複数の概念にまたがるものは両方で数えています）。「1＋投影」は正本1つと、Squad.members などの読み取り専用の投影です。書き込むファイル数は、状態の定義ファイルの外で可変参照を取る関数を含むファイルと定義ファイルの合計です。</p>
+</section>
+
+<section aria-labelledby="h-depth">
+<h2 id="h-depth">呼び出しの深さ</h2>
+<p><strong>深さは少し増える見込みです（生産経路で +1〜+2）。</strong>1,000行規模の関数を責務ごとの段階関数に分けると、段階関数の層が1つ増えます。CC が 15 を超えるループ本体をさらに切り出すと、もう1層増えます。一方で、入口の <code>is_extended_at</code> による委譲（1層）と、mod.rs↔extended.rs の往復は消えます。</p>
+<p>深さが増えても、各層の関数が小さく1つの責務を持っていれば、読む負担は減ります。計画は「中継するだけの層を作らない」ことを条件にしています。そのため、深さの減少は受入条件にしません。中継するだけの関数の数を、レビューで確認します。</p>
+<p class="meta">現状の深さ（生産経路で通常 7・拡張 8）は、関数名で解決した近似の呼び出しグラフによる値です。trait 経由の呼び出しを含めて正確に測る方法は、計画の段階2で固定します。</p>
+</section>
+
+<section aria-labelledby="h-uncovered" id="uncovered">
+<h2 id="h-uncovered">計画の範囲外に残るもの</h2>
+<p id="coverText"></p>
+<div class="scroll"><table id="uncTable"></table></div>
+<p class="note">V1〜V3 の生産採点（<code>production.rs</code>）、輸送の実行（<code>squad.rs</code>・<code>missions.rs</code>・<code>planner.rs</code>）は、計画の段階に入っていません。段階6を「行動選択と行動実行」に広げるか、段階8として追加するかを、段階3の完了時に決めることを提案します。</p>
+</section>
+
+<section aria-labelledby="h-model" id="model">
+<h2 id="h-model">前提とモデル</h2>
+<div class="scroll"><table>
+<thead><tr><th>要素</th><th>見積りでの扱い</th><th>控えめ</th><th>中央</th><th>積極</th></tr></thead>
+<tbody>
+<tr><td>同名ペアの統合</td><td>行単位の LCS で共通行・通常のみ・拡張のみに分け、1本分として数える（39ペア）</td><td colspan="3">全シナリオ共通</td></tr>
+<tr><td>修復処理の削除</td><td>固定点ループ・<code>clear_slot</code>・編成前後の再準備は削除。所属正規化は3割、portfolio投影は半分が残る</td><td colspan="3">全シナリオ共通</td></tr>
+<tr><td>事後同期・再検査の撤去</td><td>書き直した関数の CC が減る割合</td><td class="n">0%</td><td class="n">10%</td><td class="n">20%</td></tr>
+<tr><td>新しい型・Outcome・検証の追加</td><td>書き直した関数の CC が増える割合</td><td class="n">+15%</td><td class="n">+10%</td><td class="n">+8%</td></tr>
+<tr><td>分割</td><td>トップレベル文ごとに CC を測り、15 を超える文は内側へ降りて分け、隣接断片を 15 以下に詰める。分けられない塊は例外として残す</td><td colspan="3">全シナリオ共通（殻の増分で約 +5〜10%）</td></tr>
+<tr><td>段階7の戦略負債返済</td><td>書き直し済みの関数がさらに減る割合</td><td class="n">0%</td><td class="n">5%</td><td class="n">10%</td></tr>
+<tr><td>認知的複雑度</td><td>書き直した部分は、現状の CC 15 以下の関数の比（認知的複雑度 / CC ＝ 0.9）で換算</td><td colspan="3">全シナリオ共通</td></tr>
+</tbody></table></div>
+<h3>計測の定義</h3>
+<ul>
+<li>CC：rust-code-analysis-cli 0.0.25 の <code>cyclomatic.sum</code> から、クロージャ1つごとの基底 +1 と入れ子の名前付き関数を除いた値（＝1＋本体とクロージャ内の分岐数）。前回資料の「子込み集計」とは定義が違うので、数字は直接比べられません（例：最大 360→293）。</li>
+<li>認知的複雑度：同じ crate の <code>cognitive.sum</code> から入れ子の名前付き関数を除いた値。</li>
+<li>対象：<code>engine/src/ai</code> の非テスト関数 911 個。テストmoduleとテスト専用ファイルは除きます。</li>
+<li>段階の割り当て：ファイルと関数名の規則で、関数を段階3〜7に割り当てます（632 関数、CC の 76%）。たとえば、<code>v4/extended.rs</code> のうち首都ルート・同陸ルートは段階5、生産のペア領域は段階3です。</li>
+</ul>
+<h3>この見積りの限界</h3>
+<ul>
+<li>分割は機械的な文単位の下限見積りです。実際の書き直しは責務で切るので、関数数・最大値は前後します。引数の増加や共有する局所変数は考慮していません。</li>
+<li>事後同期の撤去率と新規コードの増分は、根拠のある実測値ではなく仮定です。段階3（生産パイロット）の実測で校正し、段階4以降の見積りを更新します。</li>
+<li>戦略の変更（S）で判断そのものを減らした場合の効果は、段階7の負債返済率でしか表していません。個々の廃止案が採用されるかどうかは評価次第です。</li>
+<li>構造指標の値は計画の設計目標で、達成を保証するものではありません。未達なら段階の完了条件を満たしません。</li>
+</ul>
+<p class="meta">計測と見積りのスクリプト：<code>.tmp/forecast/measure.py</code>（現状の計測）、<code>structure.py</code>（状態の書き込み元）、<code>segment.py</code>（機械分割）、<code>forecast.py</code>（段階別の見積り）。いずれも未追跡の作業用ファイルです。計画の段階2で正式な計測器に置き換えます。</p>
+</section>
+</main>
+
+<script>
+// 計測・見積り結果（.tmp/forecast/forecast.json から埋め込み）
+const DATA = {"stages":{"控えめ":{"2":{"n":911,"sum":7719,"max":293,"p95":32,"over15":111,"over50":22,"cog_sum":10854,"cog_max":703},"3":{"n":934,"sum":7686,"max":293,"p95":29,"over15":101,"over50":20,"cog_sum":10479,"cog_max":703},"4":{"n":933,"sum":7697,"max":293,"p95":28,"over15":93,"over50":20,"cog_sum":10418,"cog_max":703},"5":{"n":1015,"sum":7954,"max":293,"p95":18,"over15":69,"over50":15,"cog_sum":9972,"cog_max":703},"6":{"n":1103,"sum":8171,"max":106,"p95":16,"over15":58,"over50":8,"cog_sum":8446,"cog_max":275},"7":{"n":1124,"sum":8282,"max":106,"p95":15,"over15":48,"over50":6,"cog_sum":8258,"cog_max":275}},"中央":{"2":{"n":911,"sum":7719,"max":293,"p95":32,"over15":111,"over50":22,"cog_sum":10854,"cog_max":703},"3":{"n":927,"sum":7586,"max":293,"p95":28,"over15":99,"over50":20,"cog_sum":10389,"cog_max":703},"4":{"n":925,"sum":7499,"max":293,"p95":28,"over15":90,"over50":20,"cog_sum":10239,"cog_max":703},"5":{"n":997,"sum":7428,"max":293,"p95":18,"over15":55,"over50":15,"cog_sum":9499,"cog_max":703},"6":{"n":1073,"sum":7427,"max":106,"p95":14,"over15":42,"over50":8,"cog_sum":7776,"cog_max":275},"7":{"n":1084,"sum":7117,"max":106,"p95":14,"over15":30,"over50":6,"cog_sum":7209,"cog_max":275}},"積極":{"2":{"n":911,"sum":7719,"max":293,"p95":32,"over15":111,"over50":22,"cog_sum":10854,"cog_max":703},"3":{"n":924,"sum":7507,"max":293,"p95":28,"over15":99,"over50":20,"cog_sum":10318,"cog_max":703},"4":{"n":920,"sum":7342,"max":293,"p95":28,"over15":90,"over50":20,"cog_sum":10098,"cog_max":703},"5":{"n":977,"sum":7011,"max":293,"p95":18,"over15":55,"over50":15,"cog_sum":9123,"cog_max":703},"6":{"n":1042,"sum":6837,"max":106,"p95":14,"over15":42,"over50":8,"cog_sum":7245,"cog_max":275},"7":{"n":1019,"sum":6203,"max":106,"p95":14,"over15":32,"over50":6,"cog_sum":6385,"cog_max":275}}},"hist":{"現状":[583,156,61,62,27,17,5],"控えめ":[529,259,288,36,6,5,1],"中央":[558,287,208,19,5,5,1],"積極":[615,191,180,22,4,5,1]},"covered":{"fns":632,"all":911,"cc":76,"over50_covered":16,"over50_all":22},"uncovered":[{"path":"production.rs","name":"calculate_unit_score_at_cached","cc":106,"cog":241},{"path":"squad.rs","name":"execute_transport_squad_step","cc":86,"cog":127},{"path":"squad.rs","name":"update_squads","cc":85,"cog":103},{"path":"production.rs","name":"decide_production","cc":80,"cog":135},{"path":"missions.rs","name":"execute_mission_step","cc":75,"cog":275},{"path":"planner.rs","name":"assign_transport_missions","cc":70,"cog":184},{"path":"v100/action.rs","name":"decide_action","cc":49,"cog":61}]};
+const SC = ["控えめ","中央","積極"];
+const STAGES = ["2","3","4","5","6","7"];
+const SLABEL = {"2":"現状","3":"段階3","4":"段階4","5":"段階5","6":"段階6","7":"段階7"};
+const fmt = n => Math.round(n).toLocaleString("ja-JP");
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, parent){const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);if(parent)parent.appendChild(e);return e}
+function txt(parent,x,y,s,attrs={}){const t=el("text",Object.assign({x,y},attrs),parent);t.textContent=s;return t}
+// 目盛りは 1・2・2.5・5 系の切りの良い刻みで4本前後にする
+function niceTicks(v){const raw=v/4,p=Math.pow(10,Math.floor(Math.log10(raw)));let step=p;for(const m of [1,2,2.5,5,10]){if(m*p>=raw){step=m*p;break}}const n=Math.ceil(v/step);return {max:step*n,ticks:Array.from({length:n+1},(_,i)=>i*step)}}
+
+// ---- 結論の数字 ----
+const S = DATA.stages, base = S["中央"]["2"], end = S["中央"]["7"];
+const lo = k => Math.min(...SC.map(s=>S[s]["7"][k])), hi = k => Math.max(...SC.map(s=>S[s]["7"][k]));
+const tiles = [
+ ["CC 50 超の関数","over50"],["CC 15 超の関数","over15"],["関数あたり最大 CC","max"],
+ ["認知的複雑度の合計","cog_sum"],["CC の合計","sum"],["関数の数","n"]];
+const tw = document.getElementById("tiles");
+for(const [label,key] of tiles){
+  const d=document.createElement("div");d.className="tile";
+  const range = lo(key)===hi(key) ? "全シナリオ同じ" : `幅 ${fmt(lo(key))}〜${fmt(hi(key))}`;
+  const pct = Math.round((end[key]/base[key]-1)*100);
+  d.innerHTML=`<span class="k">${label}</span><span class="v"><span class="from">${fmt(base[key])} → </span>${fmt(end[key])}</span><span class="r">${pct>0?"+":""}${pct}% · ${range}</span>`;
+  tw.appendChild(d);
+}
+
+// ---- 段階別の小さな折れ線（1指標1軸） ----
+const panels=[["over15","CC 15 超の関数の数"],["over50","CC 50 超の関数の数"],["max","関数あたり最大 CC"],["cog_sum","認知的複雑度の合計"]];
+const multi=document.getElementById("multi");
+for(const [key,title] of panels){
+  const fig=document.createElement("figure");fig.innerHTML=`<h3>${title}</h3><div class="chart"></div>`;multi.appendChild(fig);
+  const W=520,H=230,L=52,R=16,T=14,B=30;
+  const svg=el("svg",{viewBox:`0 0 ${W} ${H}`,role:"img","aria-label":`${title}の段階別推移`},fig.querySelector(".chart"));
+  const all=STAGES.flatMap(s=>SC.map(c=>S[c][s][key]));
+  const nt=niceTicks(Math.max(...all)*1.05),ymax=nt.max;
+  const x=i=>L+i*(W-L-R)/(STAGES.length-1), y=v=>T+(H-T-B)*(1-v/ymax);
+  for(const v of nt.ticks){el("line",{x1:L,x2:W-R,y1:y(v),y2:y(v),stroke:"var(--grid)","stroke-width":1},svg);txt(svg,L-8,y(v)+4,fmt(v),{"text-anchor":"end"})}
+  STAGES.forEach((s,i)=>txt(svg,x(i),H-8,SLABEL[s],{"text-anchor":"middle"}));
+  const top=STAGES.map((s,i)=>[x(i),y(Math.max(...SC.map(c=>S[c][s][key])))]);
+  const bot=STAGES.map((s,i)=>[x(i),y(Math.min(...SC.map(c=>S[c][s][key])))]).reverse();
+  el("path",{d:"M"+top.concat(bot).map(p=>p.join(",")).join("L")+"Z",fill:"var(--band)"},svg);
+  el("path",{d:"M"+STAGES.map((s,i)=>[x(i),y(S["中央"][s][key])].join(",")).join("L"),fill:"none",stroke:"var(--after)","stroke-width":2,"stroke-linejoin":"round"},svg);
+  STAGES.forEach((s,i)=>el("circle",{cx:x(i),cy:y(S["中央"][s][key]),r:4,fill:"var(--after)",stroke:"var(--surface)","stroke-width":2},svg));
+  const last=S["中央"]["7"][key];txt(svg,x(STAGES.length-1)-8,y(last)-10,fmt(last),{"text-anchor":"end",class:"lbl"});
+  txt(svg,x(0)+8,y(S["中央"]["2"][key])-10,fmt(S["中央"]["2"][key]),{class:"lbl"});
+  // ホバー：crosshair＋3シナリオの値
+  const cross=el("line",{y1:T,y2:H-B,stroke:"var(--muted)","stroke-width":1,"stroke-dasharray":"3 3",visibility:"hidden"},svg);
+  const tip=document.createElement("div");tip.className="tip";tip.hidden=true;fig.appendChild(tip);
+  STAGES.forEach((s,i)=>{
+    const hit=el("rect",{x:x(i)-(W-L-R)/(STAGES.length-1)/2,y:T,width:(W-L-R)/(STAGES.length-1),height:H-T-B,fill:"transparent",tabindex:0},svg);
+    const show=()=>{cross.setAttribute("x1",x(i));cross.setAttribute("x2",x(i));cross.setAttribute("visibility","visible");
+      tip.innerHTML=`<b>${SLABEL[s]}</b><br>`+SC.map(c=>`${c}：${fmt(S[c][s][key])}`).join("<br>");tip.hidden=false;
+      const r=svg.getBoundingClientRect(),fr=fig.getBoundingClientRect();const px=(x(i)/W)*r.width+r.left-fr.left;
+      tip.style.left=Math.min(Math.max(px-60,8),fr.width-150)+"px";tip.style.top="44px"};
+    const hide=()=>{cross.setAttribute("visibility","hidden");tip.hidden=true};
+    hit.addEventListener("mouseenter",show);hit.addEventListener("focus",show);hit.addEventListener("mouseleave",hide);hit.addEventListener("blur",hide);
+  });
+}
+
+// ---- 分布（グループ棒） ----
+const BK=["1–5","6–10","11–15","16–30","31–50","51–100","101+"];
+const H0=DATA.hist["現状"],H1=DATA.hist["中央"];
+(function(){
+  const W=1000,H=280,L=52,R=16,T=20,B=34,box=document.getElementById("hist");
+  const svg=el("svg",{viewBox:`0 0 ${W} ${H}`,role:"img","aria-label":"関数あたりCCの分布、現状と段階7後"},box);
+  const nt=niceTicks(Math.max(...H0,...H1)*1.08),ymax=nt.max,slot=(W-L-R)/BK.length,bw=Math.min(24,slot/3);
+  const y=v=>T+(H-T-B)*(1-v/ymax);
+  for(const v of nt.ticks){el("line",{x1:L,x2:W-R,y1:y(v),y2:y(v),stroke:"var(--grid)"},svg);txt(svg,L-8,y(v)+4,fmt(v),{"text-anchor":"end"})}
+  const tip=document.createElement("div");tip.className="tip";tip.hidden=true;box.parentElement.appendChild(tip);
+  const bar=(cx,v,color,label)=>{const h=Math.max(0,y(0)-y(v)),x0=cx-bw/2,r=Math.min(4,h);
+    const d=`M${x0},${y(0)}V${y(v)+r}Q${x0},${y(v)} ${x0+r},${y(v)}H${x0+bw-r}Q${x0+bw},${y(v)} ${x0+bw},${y(v)+r}V${y(0)}Z`;
+    el("path",{d,fill:color},svg);
+    const hit=el("rect",{x:cx-bw/2-4,y:T,width:bw+8,height:H-T-B,fill:"transparent",tabindex:0},svg);
+    const show=()=>{tip.textContent=`${label}：${fmt(v)} 関数`;tip.hidden=false;const r=svg.getBoundingClientRect(),fr=box.parentElement.getBoundingClientRect();
+      tip.style.left=Math.min(Math.max((cx/W)*r.width+r.left-fr.left-60,8),fr.width-180)+"px";tip.style.top="40px"};
+    const hide=()=>{tip.hidden=true};hit.addEventListener("mouseenter",show);hit.addEventListener("focus",show);hit.addEventListener("mouseleave",hide);hit.addEventListener("blur",hide);
+    if(v>0&&v<60)txt(svg,cx,y(v)-6,fmt(v),{"text-anchor":"middle",class:"lbl"});
+  };
+  BK.forEach((b,i)=>{const cx=L+slot*(i+.5);bar(cx-bw/2-1,H0[i],"var(--before)",`CC ${b}・現状`);bar(cx+bw/2+1,H1[i],"var(--after)",`CC ${b}・段階7後（中央）`);txt(svg,cx,H-10,"CC "+b,{"text-anchor":"middle"})});
+  el("line",{x1:L,x2:W-R,y1:y(0),y2:y(0),stroke:"var(--line)"},svg);
+  const t=document.getElementById("histTable");
+  t.innerHTML=`<thead><tr><th>CC</th>${BK.map(b=>`<th class="n">${b}</th>`).join("")}</tr></thead><tbody>`+
+    ["現状",...SC].map(k=>`<tr><td>${k==="現状"?"現状":"段階7後・"+k}</td>${DATA.hist[k].map(v=>`<td class="n">${fmt(v)}</td>`).join("")}</tr>`).join("")+"</tbody>";
+})();
+
+// ---- 範囲外 ----
+const C=DATA.covered;
+document.getElementById("coverText").innerHTML=`計画の段階3〜7が書き直すのは、911 関数のうち ${fmt(C.fns)} 関数（CC の ${C.cc}%）です。CC が 50 を超える ${C.over50_all} 関数のうち、${C.over50_covered} 関数が対象に入っています。次の関数は対象外なので、計画を最後まで実行しても今の形で残ります。`;
+document.getElementById("uncTable").innerHTML=`<thead><tr><th>ファイル</th><th>関数</th><th class="n">CC</th><th class="n">認知的複雑度</th></tr></thead><tbody>`+
+  DATA.uncovered.map(u=>`<tr><td><code>${u.path}</code></td><td><code>${u.name}</code></td><td class="n">${u.cc}</td><td class="n">${u.cog}</td></tr>`).join("")+"</tbody>";
+</script>
+</body>
+</html>
