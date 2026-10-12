@@ -1,3 +1,10 @@
+/// 生産配分の可変状態（資金・施設占有）。
+pub mod allocation;
+/// 購入案の確定・発行直前の検証。
+pub mod commit;
+/// 生産要求の台帳（未充足Outcomeと理由）。
+pub mod demand;
+
 use super::strategy::GamePhase;
 use crate::ai::demand::{
     AirCoverageContribution, AirDefenseAssessment, CombatCapabilitySnapshot,

@@ -12,6 +12,7 @@
 
 use super::operation::{OperationKind, OperationSlots, SlotKind};
 use super::plan_revision::{PlanDisposition, PlanId, PlanRevision, ReplanReason};
+use crate::ai::production::demand::UnfilledReason;
 use crate::components::{GridPosition, PlayerId};
 use crate::resources::UnitType;
 use bevy_ecs::prelude::*;
@@ -35,8 +36,8 @@ pub enum ProductionDecision {
         cost: u32,
         facility: GridPosition,
     },
-    /// この枠を満たせる候補が無く、枠の要求を落とした
-    SlotCleared,
+    /// 当手番はこの枠を充足しない。要求は残し、理由を記録する。
+    Unfilled { reason: UnfilledReason },
     /// 見送り購入（資金を貯めるためループを打ち切った）
     Deferred { unit_type: UnitType, cost: u32 },
     /// 永続計画に将来手番の購入を予約し、当手番は実行対象がない。
@@ -178,6 +179,19 @@ pub struct ProductionPlanTrace {
     pub uncommitted_funds: u32,
     /// 敵の実生産履歴からの次手番予測。要求量・予約額とは独立して記録する。
     pub enemy_production_forecast: EnemyProductionForecastTrace,
+    /// 当手番に充足しなかった要求枠と理由。要求自体は `operations` に残る。
+    pub unfilled_slots: Vec<UnfilledSlotTrace>,
+}
+
+/// 当手番に充足しなかった要求枠1件。
+#[derive(Debug, Clone, Copy)]
+pub struct UnfilledSlotTrace {
+    pub operation_kind: OperationKind,
+    pub anchor: GridPosition,
+    pub slot_kind: SlotKind,
+    /// 作戦が要求していた量（体数・スロット・計画起動フラグ）。
+    pub requirement: u32,
+    pub reason: UnfilledReason,
 }
 
 impl ProductionPlanTrace {
@@ -195,6 +209,7 @@ impl ProductionPlanTrace {
             leftover_funds: funds,
             reserved_funds: 0,
             uncommitted_funds: funds,
+            unfilled_slots: Vec::new(),
         }
     }
 
@@ -268,7 +283,9 @@ mod tests {
             deficit_before: 1.0,
             deficit_after: 0.0,
             remaining_funds_before: 20_000,
-            decision: ProductionDecision::SlotCleared,
+            decision: ProductionDecision::Unfilled {
+                reason: UnfilledReason::NoCandidate,
+            },
         });
         let mut second = ProductionPlanTrace::new(player, 10_000, 1);
         second.leftover_funds = 5_000;
@@ -279,7 +296,9 @@ mod tests {
             deficit_before: 1.0,
             deficit_after: 0.0,
             remaining_funds_before: 10_000,
-            decision: ProductionDecision::SlotCleared,
+            decision: ProductionDecision::Unfilled {
+                reason: UnfilledReason::NoCandidate,
+            },
         });
 
         diagnostics.record(3, first);
@@ -304,7 +323,9 @@ mod tests {
             deficit_before: 1.0,
             deficit_after: 0.0,
             remaining_funds_before: 20_000,
-            decision: ProductionDecision::SlotCleared,
+            decision: ProductionDecision::Unfilled {
+                reason: UnfilledReason::NoCandidate,
+            },
         });
         let second = ProductionPlanTrace::new(player, 8_000, 1);
 

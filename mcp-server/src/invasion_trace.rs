@@ -1142,7 +1142,7 @@ pub fn snapshot_production_plan_for_player(
                     Some(*cost),
                     Some(*facility),
                 ),
-                ProductionDecision::SlotCleared => ("slot_cleared", None, None, None),
+                ProductionDecision::Unfilled { .. } => ("slot_cleared", None, None, None),
                 ProductionDecision::Deferred { unit_type, cost } => {
                     ("deferred", Some(*unit_type), Some(*cost), None)
                 }

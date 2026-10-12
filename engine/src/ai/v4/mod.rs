@@ -22,6 +22,9 @@ pub mod plan_revision;
 pub mod rolling_plan;
 pub mod trace;
 pub mod victory_roadmap;
+use crate::ai::production::allocation::AllocationState;
+use crate::ai::production::commit::{self, PurchasePurpose};
+use crate::ai::production::demand::{DemandLedger, UnfilledReason};
 use crate::ai::production::plan_campaign_with_expansion_denial_reserve;
 use crate::ai::squad::{MissionType, SquadId};
 use crate::ai::turn_distance::{
@@ -61,7 +64,7 @@ use trace::{
     CampaignTurnForecastTrace, EnemyProductionForecastTrace, ProductionDecision,
     ProductionOperationTrace, ProductionPlanTrace, ProductionStepTrace, ProductionTraceDiagnostics,
     ReinforcementContingencyTrace, RollingCombatPlanTrace, RollingPurchaseTrace,
-    RollingTargetTrace,
+    RollingTargetTrace, UnfilledSlotTrace,
 };
 
 /// 揚陸可否キャッシュのキー。
@@ -286,24 +289,141 @@ struct V4ProductionObservationCache {
     turn: u32,
 }
 
-/// 計画済み列から実際に返す1命令だけをIssuedへ進める。
-fn issue_planned_production(
+/// 発行待ちの列から、発行直前の実盤面検証を通る1命令だけを返してIssuedへ進める。
+///
+/// 計画後に資金・施設が変わって検証を通らない購入案は発行しない（未発行の取消）。
+/// 取り消した案の永続stepはPlannedのまま残り、次手番の継続判定が生産失敗として
+/// 扱って再計画する。発行した案だけがIssuedになり、完了イベントとの照合を待つ。
+fn issue_next_planned_production(
     world: &mut World,
     turn: u32,
-    planned: Option<PlannedProduction>,
+    queue: &mut VecDeque<PlannedProduction>,
 ) -> Vec<ProduceUnitCommand> {
+    let (planned, _cancelled) =
+        commit::next_issuable(world, turn, queue, |planned| &planned.command);
     let Some(planned) = planned else {
         return Vec::new();
     };
-    if let Some(step_ref) = planned
-        .deployment
-        .as_ref()
-        .and_then(|deployment| deployment.plan_step)
+    if let PurchasePurpose::PlanStep(step_ref) = planned.purpose
         && let Some(mut registry) = world.get_resource_mut::<V4RollingPlanRegistry>()
     {
         registry.mark_issued(step_ref, turn);
     }
     vec![planned.command]
+}
+
+/// 発行待ちの列を手番資源から取り出し、次の1命令を発行してから戻す。
+fn issue_from_turn_plan(
+    world: &mut World,
+    turn: u32,
+    mut turn_plan: V4ProductionTurnPlan,
+) -> Vec<ProduceUnitCommand> {
+    let issued = issue_next_planned_production(world, turn, &mut turn_plan.commands);
+    world.insert_resource(turn_plan);
+    issued
+}
+
+/// 当手番の最終購入案を確定する。
+///
+/// 同じ購入案の列から、配備意図（生産完了イベントとの照合用）・診断trace・
+/// 発行待ちの列を生成する。永続Plan Registryはここで一度だけWorldへ戻す。
+/// 通常経路と小規模拡張経路は、購入案の作り方だけが異なり、確定処理は共通。
+#[allow(clippy::too_many_arguments)]
+fn commit_turn_production(
+    world: &mut World,
+    player_id: PlayerId,
+    turn: u32,
+    scan: &BoardScan,
+    planned: Vec<PlannedProduction>,
+    plan_trace: ProductionPlanTrace,
+    rolling_registry: V4RollingPlanRegistry,
+    mut turn_plan: V4ProductionTurnPlan,
+) -> Vec<ProduceUnitCommand> {
+    // 配分は開始時資金を超えて確保しない。超えていれば配分状態の更新漏れである。
+    debug_assert!(
+        planned
+            .iter()
+            .map(|planned| planned.cost)
+            .fold(0_u32, u32::saturating_add)
+            <= scan.funds,
+        "購入案の合計費用が配分開始時の資金を超えている"
+    );
+    // 陸続き前線のCapture購入は、生産完了後にRoadmap NodeのCapture Squadへ
+    // 受け入れるため、発注意図をCampaign実行registryへ追記する。
+    let capture_intents = planned
+        .iter()
+        .filter_map(|planned| planned.capture_intent.clone())
+        .collect::<Vec<_>>();
+    if !capture_intents.is_empty() {
+        world.init_resource::<campaign_execution::V4CampaignExecutionRegistry>();
+        world
+            .resource_mut::<campaign_execution::V4CampaignExecutionRegistry>()
+            .append_turn_intents(player_id, turn, &capture_intents);
+    }
+    let closed_plan_ids = rolling_registry
+        .audit_records(player_id)
+        .into_iter()
+        .filter(|audit| audit.turn == turn)
+        .filter(|audit| {
+            matches!(
+                audit.disposition,
+                PlanDisposition::Completed | PlanDisposition::Withdrawn
+            )
+        })
+        .map(|audit| audit.plan_id)
+        .collect::<HashSet<_>>();
+    let active_plan_intents = rolling_registry.active_deployment_intents(
+        player_id,
+        scan.capital_assault_authorized,
+        scan.capital_staging_anchor,
+    );
+    world.insert_resource(rolling_registry);
+
+    // 診断traceとは別に、生産完了イベントと照合する作戦意図を永続化する。
+    let pending = planned
+        .iter()
+        .enumerate()
+        .filter_map(|(order, planned)| {
+            let deployment = planned.deployment.as_ref()?;
+            debug_assert_eq!(deployment.slot_kind, planned.role);
+            Some(deployment::PendingDeployment {
+                forming_slot: None,
+                operation_binding: deployment.operation_binding,
+                player_id,
+                turn,
+                order: u32::try_from(order).unwrap_or(u32::MAX),
+                facility: GridPosition {
+                    x: planned.command.target_x,
+                    y: planned.command.target_y,
+                },
+                unit_type: planned.command.unit_type,
+                anchor: deployment.anchor,
+                staging_anchor: deployment.staging_anchor,
+                posture: deployment.posture,
+                slot_kind: planned.role,
+                priority_enemies: deployment.priority_enemies.clone(),
+                threat_horizon: deployment.threat_horizon,
+                forecast: deployment.forecast,
+                plan_step: deployment.plan_step,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut deployment_registry = world
+        .remove_resource::<deployment::V4DeploymentRegistry>()
+        .unwrap_or_default();
+    deployment_registry.release_closed_plans(&closed_plan_ids);
+    deployment_registry.replace_turn_orders(player_id, turn, pending);
+    deployment_registry.refresh_plan_intents(&active_plan_intents);
+    world.insert_resource(deployment_registry);
+    // 生産判断の内訳を診断リソースへ残す（判定は行わず記録のみ）。
+    world
+        .get_resource_or_insert_with(ProductionTraceDiagnostics::default)
+        .record(turn, plan_trace);
+
+    turn_plan.player_id = Some(player_id);
+    turn_plan.turn = turn;
+    turn_plan.commands = VecDeque::from(planned);
+    issue_from_turn_plan(world, turn, turn_plan)
 }
 
 /// 島嶼キャンペーンの完全パッケージをV4の汎用作戦より先に処理した結果。
@@ -335,9 +455,17 @@ struct CandidateConstraints {
 }
 
 /// 生産命令と、その命令だけが持つV4作戦意図。
+///
+/// 役割・費用・目的は購入案自身が持ち、価格や兵種から後で推測しない。
 #[derive(Debug)]
 struct PlannedProduction {
     command: ProduceUnitCommand,
+    /// 購入した枠の役割。
+    role: SlotKind,
+    /// 配分時に確保した生産費。
+    cost: u32,
+    /// 継続Planの工程か、計画を持たない即時購入か。
+    purpose: PurchasePurpose<PlanStepRef>,
     deployment: Option<PlannedDeployment>,
     /// Capture枠は完成時点からRoadmapの受入Squadに所属させる。Combat deploymentとは
     /// 別に保持し、占領歩兵をReserve/Defenseへ落とさない。
@@ -400,13 +528,11 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
         CampaignProductionControl::Continue => None,
     };
 
-    let mut turn_plan = world
+    let turn_plan = world
         .remove_resource::<V4ProductionTurnPlan>()
         .unwrap_or_default();
     if turn_plan.player_id == Some(player_id) && turn_plan.turn == turn {
-        let next = turn_plan.commands.pop_front();
-        world.insert_resource(turn_plan);
-        return issue_planned_production(world, turn, next);
+        return issue_from_turn_plan(world, turn, turn_plan);
     }
 
     let Some(mut scan) = BoardScan::collect(world, player_id) else {
@@ -438,75 +564,16 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
         turn,
         &mut rolling_registry,
     );
-    let closed_plan_ids = rolling_registry
-        .audit_records(player_id)
-        .into_iter()
-        .filter(|audit| audit.turn == turn)
-        .filter(|audit| {
-            matches!(
-                audit.disposition,
-                PlanDisposition::Completed | PlanDisposition::Withdrawn
-            )
-        })
-        .map(|audit| audit.plan_id)
-        .collect::<HashSet<_>>();
-    let active_plan_intents = rolling_registry.active_deployment_intents(
+    commit_turn_production(
+        world,
         player_id,
-        scan.capital_assault_authorized,
-        scan.capital_staging_anchor,
-    );
-    world.insert_resource(rolling_registry);
-
-    // 診断traceとは別に、生産完了イベントと照合する作戦意図を永続化する。
-    let pending = planned
-        .iter()
-        .enumerate()
-        .filter_map(|(order, planned)| {
-            let deployment = planned.deployment.as_ref()?;
-            Some(deployment::PendingDeployment {
-                forming_slot: None,
-                operation_binding: None,
-                player_id,
-                turn,
-                order: u32::try_from(order).unwrap_or(u32::MAX),
-                facility: GridPosition {
-                    x: planned.command.target_x,
-                    y: planned.command.target_y,
-                },
-                unit_type: planned.command.unit_type,
-                anchor: deployment.anchor,
-                staging_anchor: deployment.staging_anchor,
-                posture: deployment.posture,
-                slot_kind: deployment.slot_kind,
-                priority_enemies: deployment.priority_enemies.clone(),
-                threat_horizon: deployment.threat_horizon,
-                forecast: deployment.forecast,
-                plan_step: deployment.plan_step,
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut deployment_registry = world
-        .remove_resource::<deployment::V4DeploymentRegistry>()
-        .unwrap_or_default();
-    deployment_registry.release_closed_plans(&closed_plan_ids);
-    deployment_registry.replace_turn_orders(player_id, turn, pending);
-    deployment_registry.refresh_plan_intents(&active_plan_intents);
-    world.insert_resource(deployment_registry);
-    // 生産判断の内訳を診断リソースへ残す（判定は行わず記録のみ）。
-    if let Some(mut diagnostics) = world.get_resource_mut::<ProductionTraceDiagnostics>() {
-        diagnostics.record(turn, plan_trace);
-    } else {
-        let mut diagnostics = ProductionTraceDiagnostics::default();
-        diagnostics.record(turn, plan_trace);
-        world.insert_resource(diagnostics);
-    }
-
-    turn_plan.player_id = Some(player_id);
-    turn_plan.turn = turn;
-    turn_plan.commands = VecDeque::from(planned);
-    let next = turn_plan.commands.pop_front();
-    world.insert_resource(turn_plan);
-    issue_planned_production(world, turn, next)
+        turn,
+        &scan,
+        planned,
+        plan_trace,
+        rolling_registry,
+        turn_plan,
+    )
 }
 
 /// 生産計画を実Entityの戦闘・損耗・目標HP・拠点占領へ接続する予実集計。
@@ -2047,27 +2114,34 @@ fn plan_production_with_registry(
             op.facts.enemy_contact_eta,
         )
     });
+    // 要求（op.slots）は配分中に書き換えず、未充足の枠は理由付きで台帳へ記録する。
+    let mut ledger = SlotLedger::new();
     if !allow_structural_slots {
         // 占領要員と輸送役は島嶼キャンペーン側で予約済み。余剰予算を同じ役割へ
         // 二重投入せず、観測済みの敵に対する迎撃・護衛・撃破だけへ使う。
         // ただし陸続きの前線はcampaign専用生産の対象外なので、別の渡洋作戦が
-        // 同時に予約中でも構造枠を消してはならない。
-        for operation in &mut operations {
+        // 同時に予約中でも構造枠を見送ってはならない。
+        for (index, operation) in operations.iter().enumerate() {
             if operation.facts.requires_transport {
-                operation.slots.capture_units = 0;
-                operation.slots.transport_slots = 0;
+                ledger.close(index, SlotKind::Capture, UnfilledReason::CoveredByCampaign);
+                ledger.close(
+                    index,
+                    SlotKind::Transport,
+                    UnfilledReason::CoveredByCampaign,
+                );
             }
         }
     }
 
     plan_trace.operations = operations
         .iter()
-        .map(|op| ProductionOperationTrace {
+        .enumerate()
+        .map(|(index, op)| ProductionOperationTrace {
             capture_replacement_pending: false,
             enemy_stress_reinforcement_funds: 0,
             kind: op.kind,
             anchor: op.anchor,
-            slots: op.slots,
+            slots: effective_slots(op, index, &ledger),
             requires_transport: op.facts.requires_transport,
             enemy_combat_units: op.facts.enemy_combat_units,
             enemy_reinforcement_funds: op.facts.enemy_reinforcement_funds,
@@ -2129,29 +2203,24 @@ fn plan_production_with_registry(
         }
     }
 
-    let mut used_facilities: HashSet<GridPosition> = HashSet::new();
-    // 占有済みという事実だけでなく、どの作戦が枠を使ったかも保持する。
-    // これにより占領作戦同士の競合を「上位防衛による中断」と誤認しない。
-    let mut facility_owners: HashMap<GridPosition, u32> = HashMap::new();
+    // 資金と施設占有は配分状態に集約する。施設を確保した作戦の優先度も保持し、
+    // 占領作戦同士の競合を「上位防衛による中断」と誤認しない。
+    let mut allocation = AllocationState::new(scan.funds);
     // rolling plannerは1作戦につき1回だけ実行し、その混成パッケージの当手番分を
     // 施設ごとに順次消費する。施設を1つ埋めるたびに同じbeam searchをやり直さない。
     let mut rolling_plans: HashMap<usize, SelectedPlan> = HashMap::new();
     let mut seen_plan_ids = HashSet::new();
     let empty_committed_entities = HashSet::new();
-    let mut remaining_funds = scan.funds;
     let mut commands = Vec::new();
 
     loop {
-        let free_slots = scan
-            .free_facilities
-            .iter()
-            .filter(|(pos, _)| !used_facilities.contains(pos))
-            .count();
+        let free_slots =
+            allocation.free_facility_count(scan.free_facilities.iter().map(|(pos, _)| pos));
         if free_slots == 0 {
             break;
         }
         // 最も不足している枠を持つ作戦から順に見ていく
-        let Some((op_index, slot_kind)) = most_starved_slot(&operations) else {
+        let Some((op_index, slot_kind)) = most_starved_slot(&operations, &ledger) else {
             break;
         };
 
@@ -2161,7 +2230,7 @@ fn plan_production_with_registry(
             .iter()
             .map(|operation| operation.contingency_reserve_funds)
             .fold(0_u32, u32::saturating_add);
-        let spendable_funds = remaining_funds.saturating_sub(higher_priority_contingency_reserve);
+        let spendable_funds = allocation.spendable_after(higher_priority_contingency_reserve);
         // 1 枠あたり予算。高価なユニットで枠を食い潰さないためのソフト上限。
         let per_slot_budget = spendable_funds / free_slots as u32;
 
@@ -2171,7 +2240,7 @@ fn plan_production_with_registry(
         let deficit_before = operations[op_index]
             .slots
             .deficit_ratio(slot_kind, &operations[op_index].filled);
-        let remaining_funds_before = remaining_funds;
+        let remaining_funds_before = allocation.remaining_funds();
 
         if slot_kind == SlotKind::Combat && !rolling_plans.contains_key(&op_index) {
             let target_enemies = operations[op_index]
@@ -2198,7 +2267,7 @@ fn plan_production_with_registry(
                 scan,
                 &mut ctx,
                 &operations[op_index],
-                &used_facilities,
+                allocation.used_facilities(),
                 if committed_for_plan.is_empty() {
                     &empty_committed_entities
                 } else {
@@ -2229,7 +2298,7 @@ fn plan_production_with_registry(
                 let Some(candidate_plan) =
                     reusable_candidate.or_else(|| plan_force_package(&input))
                 else {
-                    clear_slot(&mut operations[op_index], SlotKind::Combat);
+                    ledger.close(op_index, SlotKind::Combat, UnfilledReason::NoForcePackage);
                     continue;
                 };
                 let conflicted_facilities = evaluated_continuation
@@ -2250,11 +2319,10 @@ fn plan_production_with_registry(
                         let mut affordable_funds = input.current_funds;
                         let mut conflicts = HashSet::new();
                         for purchase in due {
-                            let claimed_by_higher_priority = facility_owners
-                                .get(&purchase.facility)
-                                .is_some_and(|owner| {
-                                    *owner < operation_priority_rank(&operations[op_index])
-                                });
+                            let claimed_by_higher_priority =
+                                allocation.facility_owner(&purchase.facility).is_some_and(
+                                    |owner| owner < operation_priority_rank(&operations[op_index]),
+                                );
                             let claimed_by_campaign = scan
                                 .production_facilities
                                 .iter()
@@ -2363,7 +2431,7 @@ fn plan_production_with_registry(
                     // `NoFeasibleReplacement`は診断候補であって実行計画ではない。
                     // 先頭の購入だけをPlanIdなしで発注すると、次手番に継続も撤回も
                     // できず汎用任務へ流れるため、この作戦のCombat枠は実行しない。
-                    clear_slot(&mut operations[op_index], SlotKind::Combat);
+                    ledger.close(op_index, SlotKind::Combat, UnfilledReason::NoExecutablePlan);
                     continue;
                 }
                 rolling_plans.insert(op_index, selected);
@@ -2376,7 +2444,7 @@ fn plan_production_with_registry(
                 plan.plan
                     .current_purchases()
                     .find(|purchase| {
-                        !used_facilities.contains(&purchase.facility)
+                        !allocation.is_facility_used(&purchase.facility)
                             && purchase.cost <= spendable_funds
                     })
                     .map(|purchase| {
@@ -2395,7 +2463,7 @@ fn plan_production_with_registry(
                 &mut ctx,
                 &operations[op_index],
                 slot_kind,
-                &used_facilities,
+                allocation.used_facilities(),
                 CandidateConstraints {
                     remaining_funds: spendable_funds,
                     per_slot_budget,
@@ -2404,8 +2472,8 @@ fn plan_production_with_registry(
         };
 
         let Some(candidate) = candidate else {
-            // この枠を満たせる候補が無い場合は、枠の要求を落として次を探す
-            clear_slot(&mut operations[op_index], slot_kind);
+            // この枠を満たせる候補が無い場合は、要求を残したまま当手番は見送り、次を探す
+            ledger.close(op_index, slot_kind, UnfilledReason::NoCandidate);
             let reserved = (slot_kind == SlotKind::Combat)
                 .then_some(rolling_plan)
                 .flatten()
@@ -2424,13 +2492,16 @@ fn plan_production_with_registry(
                 deficit_before,
                 deficit_after: deficit_before,
                 remaining_funds_before,
-                decision: reserved.map_or(ProductionDecision::SlotCleared, |purchase| {
-                    ProductionDecision::Reserved {
+                decision: reserved.map_or(
+                    ProductionDecision::Unfilled {
+                        reason: UnfilledReason::NoCandidate,
+                    },
+                    |purchase| ProductionDecision::Reserved {
                         unit_type: purchase.unit_type,
                         cost: purchase.cost,
                         build_turn: purchase.build_turn,
-                    }
-                }),
+                    },
+                ),
             });
             continue;
         };
@@ -2462,10 +2533,9 @@ fn plan_production_with_registry(
             break;
         }
 
-        remaining_funds = remaining_funds.saturating_sub(candidate.cost);
-        used_facilities.insert(candidate.facility);
-        facility_owners.insert(
+        allocation.claim(
             candidate.facility,
+            candidate.cost,
             operation_priority_rank(&operations[op_index]),
         );
         let mut deployment = planned_deployment(
@@ -2521,6 +2591,7 @@ fn plan_production_with_registry(
                 facility: candidate.facility,
             },
         });
+        let purpose = plan_step_purpose(deployment.as_ref(), PurchasePurpose::OperationSlot);
         commands.push(PlannedProduction {
             capture_intent: None,
             command: ProduceUnitCommand {
@@ -2529,12 +2600,17 @@ fn plan_production_with_registry(
                 target_y: candidate.facility.y,
                 unit_type: candidate.unit_type,
             },
+            role: slot_kind,
+            cost: candidate.cost,
+            purpose,
             deployment,
         });
     }
 
     plan_registry.reconcile_unseen_plans(player_id, turn, &seen_plan_ids);
+    let remaining_funds = allocation.remaining_funds();
     plan_trace.leftover_funds = remaining_funds;
+    plan_trace.unfilled_slots = unfilled_slot_traces(&operations, &ledger);
     let contingency_reserve = operations
         .iter()
         .map(|operation| operation.contingency_reserve_funds)
@@ -2546,6 +2622,34 @@ fn plan_production_with_registry(
     );
     plan_trace.uncommitted_funds = remaining_funds.saturating_sub(plan_trace.reserved_funds);
     (commands, plan_trace)
+}
+
+/// 配備意図が永続Planの工程を持つならその工程、無ければ与えた目的を返す。
+fn plan_step_purpose(
+    deployment: Option<&PlannedDeployment>,
+    otherwise: PurchasePurpose<PlanStepRef>,
+) -> PurchasePurpose<PlanStepRef> {
+    deployment
+        .and_then(|deployment| deployment.plan_step)
+        .map_or(otherwise, PurchasePurpose::PlanStep)
+}
+
+/// 未充足で決着した要求枠を、作戦の識別情報つきのtraceへ変換する。
+fn unfilled_slot_traces(operations: &[Operation], ledger: &SlotLedger) -> Vec<UnfilledSlotTrace> {
+    ledger
+        .outcomes()
+        .iter()
+        .filter_map(|outcome| {
+            let operation = operations.get(outcome.key.operation)?;
+            Some(UnfilledSlotTrace {
+                operation_kind: operation.kind,
+                anchor: operation.anchor,
+                slot_kind: outcome.key.slot,
+                requirement: operation.slots.requirement(outcome.key.slot),
+                reason: outcome.reason,
+            })
+        })
+        .collect()
 }
 
 /// 見積に含めてよいのは、同じ永続Planへ実際に配属済みのEntityだけ。
@@ -3155,9 +3259,31 @@ fn planned_deployment(
 /// 2 段階で選ぶ。要求が有限の枠（前提条件）を全作戦ぶん先に満たし、
 /// そのうえで残額を要求が青天井の撃破枠へ注ぎ込む。
 /// 有限要求と青天井要求を同じ土俵で比べてはならない（`SlotTier` 参照）。
-fn most_starved_slot(operations: &[Operation]) -> Option<(usize, SlotKind)> {
-    most_starved_in_tier(operations, SlotTier::Prerequisite)
-        .or_else(|| most_starved_in_tier(operations, SlotTier::Residual))
+fn most_starved_slot(operations: &[Operation], ledger: &SlotLedger) -> Option<(usize, SlotKind)> {
+    most_starved_in_tier(operations, ledger, SlotTier::Prerequisite)
+        .or_else(|| most_starved_in_tier(operations, ledger, SlotTier::Residual))
+}
+
+/// 当手番の生産配分における要求枠の台帳。作戦番号は配分中の `operations` の添字。
+type SlotLedger = DemandLedger<SlotKind>;
+
+/// 要求（不変）から、当手番に未充足で決着した枠を除いた実効要求を返す。
+///
+/// traceと未充足率の比較だけに使う。要求そのものは `Operation::slots` に残す。
+fn effective_slots(op: &Operation, index: usize, ledger: &SlotLedger) -> OperationSlots {
+    let mut slots = op.slots;
+    for kind in SLOT_PRIORITY {
+        if ledger.is_open(index, kind) {
+            continue;
+        }
+        match kind {
+            SlotKind::Intercept => slots.intercept_units = 0,
+            SlotKind::Transport => slots.transport_slots = 0,
+            SlotKind::Capture => slots.capture_units = 0,
+            SlotKind::Combat => slots.combat_plan_required = 0,
+        }
+    }
+    slots
 }
 
 // 生産枠の作戦優先度（小さいほど先に枠を取る）。値は同一手番内の相対順だけに使う。
@@ -3210,11 +3336,19 @@ fn operation_priority_rank(operation: &Operation) -> u32 {
 /// 飛ばすと、戦闘枠不足の間は永久に奪還役が補充されない。担当履歴に未解決の撃破が
 /// ある場合だけ1体を先に再契約し、当手番の発注後は共同計画へ戻すことで、最安歩兵の
 /// 無制限な先買いを防ぐ。
-fn defers_capture_to_joint_combat_plan(op: &Operation, kind: SlotKind, tier: SlotTier) -> bool {
+fn defers_capture_to_joint_combat_plan(
+    op: &Operation,
+    index: usize,
+    ledger: &SlotLedger,
+    kind: SlotKind,
+    tier: SlotTier,
+) -> bool {
     tier == SlotTier::Prerequisite
         && kind == SlotKind::Capture
         && !op.property_controls.is_empty()
         && (!op.capture_replacement_pending || op.filled.capture_units > 0)
+        // Combat枠が未充足で決着済みなら、共同計画は成立しないため待たない。
+        && ledger.is_open(index, SlotKind::Combat)
         && op.slots.deficit_ratio(SlotKind::Combat, &op.filled) > 0.0
         // 切替IDは統合前の委譲点名のまま残す。OPENWARS_EXT_DISABLE で旧IDを指定した
         // 計測手順と互換を保つため、関数名に合わせて変更しないこと。
@@ -3222,11 +3356,19 @@ fn defers_capture_to_joint_combat_plan(op: &Operation, kind: SlotKind, tier: Slo
 }
 
 /// 指定した段階の中で最も飢えた枠を返す。
-fn most_starved_in_tier(operations: &[Operation], tier: SlotTier) -> Option<(usize, SlotKind)> {
+fn most_starved_in_tier(
+    operations: &[Operation],
+    ledger: &SlotLedger,
+    tier: SlotTier,
+) -> Option<(usize, SlotKind)> {
     let mut best: Option<(usize, SlotKind, u32, f32, usize)> = None;
     for (index, op) in operations.iter().enumerate() {
         for (priority, kind) in SLOT_PRIORITY.iter().enumerate() {
-            if defers_capture_to_joint_combat_plan(op, *kind, tier) {
+            // 未充足で決着した枠は、要求が残っていても当手番の配分対象にしない。
+            if !ledger.is_open(index, *kind) {
+                continue;
+            }
+            if defers_capture_to_joint_combat_plan(op, index, ledger, *kind, tier) {
                 continue;
             }
             let deficit = op.slots.tier_deficit(*kind, &op.filled, tier);
@@ -3254,18 +3396,6 @@ fn most_starved_in_tier(operations: &[Operation], tier: SlotTier) -> Option<(usi
         }
     }
     best.map(|(index, kind, _, _, _)| (index, kind))
-}
-
-/// 満たせないと判明した枠の要求を消す（無限ループ防止）。
-fn clear_slot(op: &mut Operation, kind: SlotKind) {
-    match kind {
-        SlotKind::Intercept => op.slots.intercept_units = 0,
-        SlotKind::Transport => op.slots.transport_slots = 0,
-        SlotKind::Capture => op.slots.capture_units = 0,
-        SlotKind::Combat => {
-            op.slots.combat_plan_required = 0;
-        }
-    }
 }
 
 /// 購入した 1 体分を充足量へ反映する。
@@ -4639,7 +4769,7 @@ mod tests {
                 "{path:?}"
             );
             assert_eq!(
-                most_starved_slot(std::slice::from_ref(&initial_formation)),
+                most_starved_slot(std::slice::from_ref(&initial_formation), &SlotLedger::new()),
                 Some((0, expected_slot)),
                 "{path:?}"
             );
@@ -5526,7 +5656,10 @@ mod tests {
             ),
         ];
 
-        assert_eq!(most_starved_slot(&ops), Some((1, SlotKind::Combat)));
+        assert_eq!(
+            most_starved_slot(&ops, &SlotLedger::new()),
+            Some((1, SlotKind::Combat))
+        );
     }
 
     /// 同一前線では占領兵を全数先買いせず、最初の占領兵に続いて掃討計画を起動する。
@@ -5538,7 +5671,10 @@ mod tests {
             ..OperationSlots::default()
         };
         let empty = operation(OperationKind::Capture, slots, OperationSlots::default());
-        assert_eq!(most_starved_slot(&[empty]), Some((0, SlotKind::Capture)));
+        assert_eq!(
+            most_starved_slot(&[empty], &SlotLedger::new()),
+            Some((0, SlotKind::Capture))
+        );
 
         let first_capture_ready = operation(
             OperationKind::Capture,
@@ -5549,7 +5685,7 @@ mod tests {
             },
         );
         assert_eq!(
-            most_starved_slot(&[first_capture_ready]),
+            most_starved_slot(&[first_capture_ready], &SlotLedger::new()),
             Some((0, SlotKind::Combat))
         );
     }
@@ -5617,7 +5753,10 @@ mod tests {
             ),
         ];
 
-        assert_eq!(most_starved_slot(&ops), Some((0, SlotKind::Combat)));
+        assert_eq!(
+            most_starved_slot(&ops, &SlotLedger::new()),
+            Some((0, SlotKind::Combat))
+        );
     }
 
     #[test]
@@ -5653,7 +5792,10 @@ mod tests {
         distant_defense.facts.deploy_lead_time = 1;
 
         let ops = vec![capture, distant_defense, capital];
-        assert_eq!(most_starved_slot(&ops), Some((2, SlotKind::Combat)));
+        assert_eq!(
+            most_starved_slot(&ops, &SlotLedger::new()),
+            Some((2, SlotKind::Combat))
+        );
     }
 
     #[test]
@@ -5688,7 +5830,10 @@ mod tests {
             operation_priority_rank(&ops[1]),
             PRIORITY_RANK_URGENT_DEFENSE
         );
-        assert_eq!(most_starved_slot(&ops), Some((1, SlotKind::Combat)));
+        assert_eq!(
+            most_starved_slot(&ops, &SlotLedger::new()),
+            Some((1, SlotKind::Combat))
+        );
         assert_eq!(ops[0].slots.combat_plan_required, 1);
     }
 

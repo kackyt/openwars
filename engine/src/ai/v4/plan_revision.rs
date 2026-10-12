@@ -1494,6 +1494,23 @@ impl V4RollingPlanRegistry {
         }
     }
 
+    /// 発行前の施設最適化で命令の施設を入れ替えたとき、保存済みstepの施設を命令と揃える。
+    ///
+    /// 発行前（Planned）のstepだけを対象にする。保存Planと発行命令の施設が食い違うと、
+    /// 生産失敗時の再購入や施設競合による繰り下げが、実際には使っていない施設を基準にする。
+    pub(crate) fn retarget_planned_step(&mut self, step_ref: PlanStepRef, facility: GridPosition) {
+        let Some(step) = self
+            .active
+            .iter_mut()
+            .filter(|plan| plan.plan_id == step_ref.plan_id && plan.revision == step_ref.revision)
+            .flat_map(|plan| plan.steps.iter_mut())
+            .find(|step| step.step == step_ref && step.status == PurchaseStatus::Planned)
+        else {
+            return;
+        };
+        step.facility = facility;
+    }
+
     /// 選択計画の当手番購入をstep参照へ変換する。
     pub(crate) fn current_step_ref(
         &self,
@@ -2599,6 +2616,65 @@ mod tests {
             .expect("失敗理由を付けて再評価するため計画自体は取得する");
         assert!(continuation.production_failed);
         assert_eq!(continuation.purchases.len(), 1);
+    }
+
+    #[test]
+    fn retargeted_step_keeps_plan_and_issued_command_on_same_facility() {
+        let player = PlayerId(1);
+        let mut registry = V4RollingPlanRegistry::default();
+        let selected = registry.select(
+            player,
+            3,
+            OperationKind::Capture,
+            GridPosition { x: 5, y: 5 },
+            vec![GridPosition { x: 5, y: 5 }],
+            HashSet::from([Entity::from_raw(10)]),
+            None,
+            feasible_plan(0),
+            None,
+            HashSet::new(),
+        );
+        let purchase = selected.plan.purchases[0];
+        let step = registry
+            .current_step_ref(
+                selected.plan_id.expect("永続plan"),
+                selected.revision.expect("revision"),
+                3,
+                purchase,
+            )
+            .expect("当手番step");
+        let swapped = GridPosition {
+            x: purchase.facility.x + 1,
+            y: purchase.facility.y,
+        };
+        registry.retarget_planned_step(step, swapped);
+        registry.mark_issued(step, 3);
+
+        // 発行命令が生産されなかった場合、再購入は実際に使った施設を基準にする。
+        let continuation = registry
+            .continuation(
+                player,
+                4,
+                OperationKind::Capture,
+                &[GridPosition { x: 5, y: 5 }],
+                &HashSet::from([Entity::from_raw(10)]),
+            )
+            .expect("再評価のため計画自体は取得する");
+        assert!(continuation.production_failed);
+        assert_eq!(continuation.purchases[0].facility, swapped);
+
+        // 発行済みstepは後から施設を書き換えない。
+        registry.retarget_planned_step(step, purchase.facility);
+        let continuation = registry
+            .continuation(
+                player,
+                4,
+                OperationKind::Capture,
+                &[GridPosition { x: 5, y: 5 }],
+                &HashSet::from([Entity::from_raw(10)]),
+            )
+            .expect("計画");
+        assert_eq!(continuation.purchases[0].facility, swapped);
     }
 
     #[test]
