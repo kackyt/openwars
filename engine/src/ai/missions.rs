@@ -1,13 +1,12 @@
 #![allow(clippy::collapsible_if)]
 
 use crate::ai::islands::IslandId;
+use crate::collections::HashMap;
 use crate::components::{Faction, GridPosition, Property, UnitStats};
 use crate::resources::Map;
 use crate::resources::master_data::MasterDataRegistry;
 use crate::systems::movement::{OccupantInfo, calculate_reachable_tiles};
 use bevy_ecs::prelude::*;
-use std::collections::HashMap;
-
 /// 輸送ミッションの各フェーズ
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportPhase {
@@ -121,7 +120,7 @@ pub fn execute_mission_step(
     };
 
     // 経路探索のために他ユニットの占有情報を取得
-    let mut unit_positions = HashMap::new();
+    let mut unit_positions = HashMap::default();
     {
         let mut query = world.query::<(
             Entity,

@@ -205,7 +205,7 @@ pub(super) fn build_operations(
     // 同時に提示し得る。両方を別候補として残すと同じAssaultCapitalがCapture枠を
     // 二重要求し、戦闘生産を毎ターン2体分の歩兵で圧迫する。Plan継続性は後段の
     // `continuing` で合流できるため、campaign identityごとに一件へ正規化する。
-    let mut seen_campaign_operations = HashSet::new();
+    let mut seen_campaign_operations = HashSet::default();
     raw.retain(|(kind, cluster)| {
         campaign_for_cluster(*kind, cluster).is_none_or(|objective| {
             seen_campaign_operations.insert((objective.kind.priority_rank(), objective.island_id))
@@ -341,7 +341,7 @@ pub(super) fn build_operations(
             })
         })
         .collect::<Vec<_>>();
-    let empty_entity_set = HashSet::new();
+    let empty_entity_set = HashSet::default();
 
     scored
         .into_iter()
@@ -596,7 +596,7 @@ pub(super) fn build_operation(
     // 「制空で応じるか対空で応じるか」が思想ではなく到達可能性の問題であるのと同じで、
     // 「敵の占領部隊を潰しに行けるか」もまた到達可能性の問題でしかない。
     let producible_movement_types: Vec<MovementType> = {
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         scan.available_types
             .iter()
             .map(|(_, stats)| stats.movement_type)
@@ -793,7 +793,7 @@ pub(super) fn build_operation(
     // 輸送台帳も同じ原則で数える。輸送枠の採用条件は「その積荷をこの作戦地点へ
     // 届けられるか」なので、台帳も同じく `can_deliver_cargo` で数える。
     let cargo_movements: Vec<MovementType> = {
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         scan.available_types
             .iter()
             .filter(|(_, stats)| stats.can_capture)
@@ -875,7 +875,7 @@ pub(super) fn build_operation(
         anchor,
         staging_anchor: anchor,
         execution_authorized: true,
-        protected_capture_entities: HashSet::new(),
+        protected_capture_entities: HashSet::default(),
         capture_replacement_pending: false,
         objective_properties: cluster.to_vec(),
         property_control: None,
@@ -1054,7 +1054,7 @@ pub(super) fn plan_production_with_registry(
     let mut committed_by_operation: HashMap<
         usize,
         HashMap<Entity, deployment::ActiveTargetAssignment>,
-    > = HashMap::new();
+    > = HashMap::default();
     for (&entity, assignment) in committed_combat_assignments {
         let Some(unit) = scan
             .my_units
@@ -1095,9 +1095,9 @@ pub(super) fn plan_production_with_registry(
     let mut allocation = AllocationState::new(scan.funds);
     // rolling plannerは1作戦につき1回だけ実行し、その混成パッケージの当手番分を
     // 施設ごとに順次消費する。施設を1つ埋めるたびに同じbeam searchをやり直さない。
-    let mut rolling_plans: HashMap<usize, SelectedPlan> = HashMap::new();
-    let mut seen_plan_ids = HashSet::new();
-    let empty_committed_entities = HashSet::new();
+    let mut rolling_plans: HashMap<usize, SelectedPlan> = HashMap::default();
+    let mut seen_plan_ids = HashSet::default();
+    let empty_committed_entities = HashSet::default();
     // この手番に発注済みの永続Plan購入。Registry上は生産完了を観測するまで
     // Plannedのまま残るため、余剰予算の計算では二重に予約しない。
     let mut issued_plan_purchase_cost = 0_u32;
@@ -1160,7 +1160,7 @@ pub(super) fn plan_production_with_registry(
             // Stageは前衛ではないが、Roadmapが同じDAG区間へ予約した実Entityである。
             // 到着予定付きの既存戦力としてRollingPlanへ渡し、人数だけを根拠に
             // 追加生産を禁止する第二の判定器にはしない。
-            let mut staged_for_plan = HashSet::new();
+            let mut staged_for_plan = HashSet::default();
             if let Some(island_id) = operations[op_index].island_id {
                 match operation_kind {
                     OperationKind::Capture => {
@@ -1245,7 +1245,7 @@ pub(super) fn plan_production_with_registry(
                     .as_ref()
                     .map(|(previous, evaluated)| {
                         if evaluated.is_ok() {
-                            return HashSet::new();
+                            return HashSet::default();
                         }
                         let mut due = previous
                             .purchases
@@ -1257,7 +1257,7 @@ pub(super) fn plan_production_with_registry(
                             (purchase.facility.y, purchase.facility.x, purchase.cost)
                         });
                         let mut affordable_funds = input.current_funds;
-                        let mut conflicts = HashSet::new();
+                        let mut conflicts = HashSet::default();
                         for purchase in due {
                             let claimed_by_higher_priority =
                                 allocation.facility_owner(&purchase.facility).is_some_and(
@@ -1677,7 +1677,7 @@ pub(super) fn plan_production_with_registry(
     // 1手番に1体が与えられる攻撃は1回だけなので、同じ敵HPを複数の工場枠で
     // 仮想的に何度も消費しない。ここは経路探索済みの攻撃表への割当だけであり、
     // 「1体追加ごとの将来戦闘シミュレーション」にはしない。
-    let mut immediately_committed_damage = HashMap::<(usize, Entity), u32>::new();
+    let mut immediately_committed_damage = HashMap::<(usize, Entity), u32>::default();
     while immediate_reinforcement_funds > 0 {
         let free_slots =
             allocation.free_facility_count(scan.free_facilities.iter().map(|(pos, _)| pos));
@@ -2039,7 +2039,7 @@ pub(super) fn enemy_reinforcement_assessment(
     let mut budget = 0_u32;
     let mut funded = 0_u32;
     let mut assessment = ReinforcementAssessment::default();
-    let mut reserved_counter_slots = HashSet::new();
+    let mut reserved_counter_slots = HashSet::default();
     let friendly_combat_types = scan
         .available_types
         .iter()
@@ -2066,7 +2066,7 @@ pub(super) fn enemy_reinforcement_assessment(
         ReinforcementScenario::Stress => horizon.saturating_sub(1),
     };
     for build_turn in 1..=last_build_turn {
-        let mut projected_types = HashSet::new();
+        let mut projected_types = HashSet::default();
         let income = scan
             .enemy_income
             .min(scenario_budget.saturating_sub(funded));
@@ -3100,7 +3100,7 @@ mod tests {
             crossing_exit: None,
             crossed: false,
             state: victory_roadmap::RoadmapNodeState::Ready,
-            assigned_squads: HashSet::new(),
+            assigned_squads: HashSet::default(),
         };
 
         // 橋などの一点Nodeは、部隊数ではなく通過地形そのものから一枠とする。
@@ -3186,7 +3186,7 @@ mod tests {
             crossing_exit: None,
             crossed: false,
             state: victory_roadmap::RoadmapNodeState::Dominant,
-            assigned_squads: HashSet::new(),
+            assigned_squads: HashSet::default(),
         };
 
         assert!(
@@ -3225,7 +3225,7 @@ mod tests {
             crossing_exit: None,
             crossed: false,
             state,
-            assigned_squads: HashSet::new(),
+            assigned_squads: HashSet::default(),
         };
         let mut registry = CapitalRouteNodeOperationRegistry::default();
         registry.operations.insert(
@@ -3284,7 +3284,7 @@ mod tests {
             crossing_exit: None,
             crossed: false,
             state: victory_roadmap::RoadmapNodeState::Ready,
-            assigned_squads: HashSet::new(),
+            assigned_squads: HashSet::default(),
         };
 
         let point = operation(
@@ -3331,7 +3331,7 @@ mod tests {
             crossing_exit: None,
             crossed: false,
             state: victory_roadmap::RoadmapNodeState::Ready,
-            assigned_squads: HashSet::new(),
+            assigned_squads: HashSet::default(),
         };
 
         assert!(capital_route_uses_capture_lane(
@@ -3452,7 +3452,7 @@ mod tests {
         let recover_squad =
             assign_route_squad(&mut world, player, MissionType::Attack, &[recover_entity]);
         world.insert_resource(CapitalRoutePathRegistry {
-            commitments: HashMap::from([
+            commitments: HashMap::from_iter([
                 (
                     hold_squad,
                     CapitalRouteCommitment {
@@ -3559,7 +3559,7 @@ mod tests {
         let squad_id =
             assign_route_squad(&mut world, player, MissionType::Attack, &[first, second]);
         world.insert_resource(CapitalRoutePathRegistry {
-            commitments: HashMap::from([(
+            commitments: HashMap::from_iter([(
                 squad_id,
                 CapitalRouteCommitment {
                     player_id: player,
@@ -3617,9 +3617,9 @@ mod tests {
             phase: CapitalRouteExecutionPhase::Advance,
         };
         let registry = CapitalRoutePathRegistry {
-            commitments: HashMap::from([(old_squad, commitment)]),
-            commitment_members: HashMap::from([(old_squad, BTreeSet::from([member]))]),
-            assignment_diagnostics: HashMap::new(),
+            commitments: HashMap::from_iter([(old_squad, commitment)]),
+            commitment_members: HashMap::from_iter([(old_squad, BTreeSet::from([member]))]),
+            assignment_diagnostics: HashMap::default(),
         };
 
         let inherited = inherited_capital_route_commitment(
@@ -3700,7 +3700,7 @@ mod tests {
             phase: CapitalRouteExecutionPhase::Advance,
         };
         world.insert_resource(CapitalRoutePathRegistry {
-            commitments: HashMap::from([
+            commitments: HashMap::from_iter([
                 (infantry_squad, commitment(0)),
                 (tank_squad, commitment(1)),
             ]),
@@ -3848,7 +3848,7 @@ mod tests {
                 crossing_exit: None,
                 crossed: false,
                 state: victory_roadmap::RoadmapNodeState::Capturing,
-                assigned_squads: HashSet::new(),
+                assigned_squads: HashSet::default(),
             },
         );
 
@@ -3894,13 +3894,13 @@ mod tests {
             capture_eta: Some(4),
             required_capture_survivors: 5,
             logistics_rank: None,
-            forced_target_enemies: HashSet::new(),
-            protected_capture_entities: HashSet::new(),
+            forced_target_enemies: HashSet::default(),
+            protected_capture_entities: HashSet::default(),
             capture_replacement_pending: false,
             staging_anchor: pos(2, 1),
             execution_authorized: true,
         };
-        let targets = HashMap::new();
+        let targets = HashMap::default();
         let routes = split_bridge_route_objectives(&map, vec![objective], &gates, &[], &targets);
 
         assert_eq!(routes.len(), 2);
@@ -4788,8 +4788,8 @@ mod tests {
             capture_eta: None,
             required_capture_survivors: 0,
             logistics_rank: Some(0),
-            forced_target_enemies: HashSet::new(),
-            protected_capture_entities: HashSet::new(),
+            forced_target_enemies: HashSet::default(),
+            protected_capture_entities: HashSet::default(),
             capture_replacement_pending: false,
             staging_anchor: anchor,
             execution_authorized: true,
@@ -4851,8 +4851,8 @@ mod tests {
             capture_eta: Some(3),
             required_capture_survivors: 1,
             logistics_rank: Some(0),
-            forced_target_enemies: HashSet::new(),
-            protected_capture_entities: HashSet::new(),
+            forced_target_enemies: HashSet::default(),
+            protected_capture_entities: HashSet::default(),
             capture_replacement_pending: false,
             staging_anchor: campaign_anchor,
             execution_authorized: true,
@@ -4886,8 +4886,8 @@ mod tests {
                 capture_eta: Some(3),
                 required_capture_survivors: 1,
                 logistics_rank: Some(0),
-                forced_target_enemies: HashSet::new(),
-                protected_capture_entities: HashSet::new(),
+                forced_target_enemies: HashSet::default(),
+                protected_capture_entities: HashSet::default(),
                 capture_replacement_pending: false,
                 staging_anchor: local_anchor,
                 execution_authorized: true,
@@ -4900,8 +4900,8 @@ mod tests {
                 capture_eta: None,
                 required_capture_survivors: 0,
                 logistics_rank: None,
-                forced_target_enemies: HashSet::new(),
-                protected_capture_entities: HashSet::new(),
+                forced_target_enemies: HashSet::default(),
+                protected_capture_entities: HashSet::default(),
                 capture_replacement_pending: false,
                 staging_anchor: local_anchor,
                 execution_authorized: false,
@@ -4912,7 +4912,7 @@ mod tests {
             kind: OperationKind::AssaultCapital,
             island_id: Some(island_id),
             properties: vec![capital],
-            target_enemies: HashSet::new(),
+            target_enemies: HashSet::default(),
         };
         let operations = build_operations(&scan, &mut ReachCtx::default(), &[active], PlayerId(1));
         let same_island = operations
@@ -5002,7 +5002,7 @@ mod tests {
                     free_cargo: 0,
                 })
                 .collect(),
-            property_entities: HashMap::new(),
+            property_entities: HashMap::default(),
             owned_airport_count: 1,
             open_properties: anchors.clone(),
             neutral_properties: anchors.clone(),
@@ -5026,8 +5026,8 @@ mod tests {
             &horizons,
             &[true, true],
             &[anchors[0]],
-            &HashSet::new(),
-            &HashSet::new(),
+            &HashSet::default(),
+            &HashSet::default(),
             2,
             PlayerId(1),
         );
@@ -5041,8 +5041,8 @@ mod tests {
             &horizons,
             &[true, true],
             &[anchors[1]],
-            &HashSet::new(),
-            &HashSet::new(),
+            &HashSet::default(),
+            &HashSet::default(),
             5,
             PlayerId(1),
         );
@@ -5059,13 +5059,13 @@ mod tests {
         let immediate_entity = Entity::from_raw(902);
         let intercept_entity = Entity::from_raw(903);
         let own_plan = plan_revision::PlanId(7);
-        let assignments = HashMap::from([
+        let assignments = HashMap::from_iter([
             (
                 own_entity,
                 deployment::ActiveTargetAssignment {
                     plan_id: Some(own_plan),
                     slot_kind: SlotKind::Combat,
-                    targets: HashSet::new(),
+                    targets: HashSet::default(),
                 },
             ),
             (
@@ -5073,7 +5073,7 @@ mod tests {
                 deployment::ActiveTargetAssignment {
                     plan_id: Some(plan_revision::PlanId(8)),
                     slot_kind: SlotKind::Combat,
-                    targets: HashSet::new(),
+                    targets: HashSet::default(),
                 },
             ),
             (
@@ -5081,7 +5081,7 @@ mod tests {
                 deployment::ActiveTargetAssignment {
                     plan_id: None,
                     slot_kind: SlotKind::Combat,
-                    targets: HashSet::new(),
+                    targets: HashSet::default(),
                 },
             ),
             (
@@ -5089,19 +5089,19 @@ mod tests {
                 deployment::ActiveTargetAssignment {
                     plan_id: None,
                     slot_kind: SlotKind::Intercept,
-                    targets: HashSet::new(),
+                    targets: HashSet::default(),
                 },
             ),
         ]);
 
         assert_eq!(
             committed_entities_for_plan(Some(&assignments), None),
-            HashSet::from([immediate_entity]),
+            HashSet::from_iter([immediate_entity]),
             "実在敵へ割り当てた即時Combat増援は、次の作戦見積でも継続して数える"
         );
         assert_eq!(
             committed_entities_for_plan(Some(&assignments), Some(own_plan)),
-            HashSet::from([own_entity, immediate_entity]),
+            HashSet::from_iter([own_entity, immediate_entity]),
             "別PlanとInterceptは混ぜず、同じPlanと即時Combatだけを数える"
         );
     }
@@ -5147,7 +5147,7 @@ mod tests {
             phase,
         };
         let registry = CapitalRoutePathRegistry {
-            commitments: HashMap::from([
+            commitments: HashMap::from_iter([
                 (
                     advancing_squad_id,
                     commitment(CapitalRouteExecutionPhase::Advance),
@@ -5165,24 +5165,24 @@ mod tests {
                     commitment(CapitalRouteExecutionPhase::Supply),
                 ),
             ]),
-            commitment_members: HashMap::new(),
-            assignment_diagnostics: HashMap::new(),
+            commitment_members: HashMap::default(),
+            assignment_diagnostics: HashMap::default(),
         };
 
         let advancing_entities = registry.advancing_combat_entities(player, &manager);
         assert_eq!(
             advancing_entities.by_island,
-            HashMap::from([(island, HashSet::from([advancing]))]),
+            HashMap::from_iter([(island, HashSet::from_iter([advancing]))]),
             "保持・補給Squadを見かけの攻略戦力にしない"
         );
         assert_eq!(
             advancing_entities.by_target,
-            HashMap::from([((island, pos(5, 1)), HashSet::from([advancing]))]),
+            HashMap::from_iter([((island, pos(5, 1)), HashSet::from_iter([advancing]))]),
             "前進部隊は首都全体ではなく、現在のDAG区間目標へ渡す"
         );
         assert_eq!(
             advancing_entities.staged_by_target,
-            HashMap::from([((island, pos(5, 1)), HashSet::from([staged]))]),
+            HashMap::from_iter([((island, pos(5, 1)), HashSet::from_iter([staged]))]),
             "待機線も人数だけでなく、同じDAG区間へ向かうEntityとして保持する"
         );
     }
@@ -5216,9 +5216,9 @@ mod tests {
             &scan,
             &mut ctx,
             operation,
-            &HashSet::new(),
-            &HashSet::new(),
-            &HashSet::from([staged]),
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashSet::from_iter([staged]),
             scan.funds,
             false,
             PlayerId(1),
@@ -5247,8 +5247,8 @@ mod tests {
             capture_eta: None,
             required_capture_survivors: 2,
             logistics_rank: Some(0),
-            forced_target_enemies: HashSet::new(),
-            protected_capture_entities: HashSet::new(),
+            forced_target_enemies: HashSet::default(),
+            protected_capture_entities: HashSet::default(),
             capture_replacement_pending: false,
             staging_anchor: anchor,
             execution_authorized: true,
@@ -5276,9 +5276,9 @@ mod tests {
             &scan,
             &mut ctx,
             operation,
-            &HashSet::new(),
-            &HashSet::new(),
-            &HashSet::new(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashSet::default(),
             scan.funds,
             false,
             PlayerId(1),
@@ -5390,8 +5390,8 @@ mod tests {
                 capture_eta: None,
                 required_capture_survivors: 0,
                 logistics_rank: None,
-                forced_target_enemies: HashSet::new(),
-                protected_capture_entities: HashSet::new(),
+                forced_target_enemies: HashSet::default(),
+                protected_capture_entities: HashSet::default(),
                 capture_replacement_pending: false,
                 staging_anchor: pos(0, 2),
                 execution_authorized: false,
@@ -5404,8 +5404,8 @@ mod tests {
                 capture_eta: Some(4),
                 required_capture_survivors: 3,
                 logistics_rank: Some(0),
-                forced_target_enemies: HashSet::new(),
-                protected_capture_entities: HashSet::new(),
+                forced_target_enemies: HashSet::default(),
+                protected_capture_entities: HashSet::default(),
                 capture_replacement_pending: false,
                 staging_anchor: capture,
                 execution_authorized: true,
@@ -5540,7 +5540,7 @@ mod tests {
             anchor: pos(0, 0),
             staging_anchor: pos(0, 0),
             execution_authorized: true,
-            protected_capture_entities: HashSet::new(),
+            protected_capture_entities: HashSet::default(),
             capture_replacement_pending: false,
             objective_properties: vec![pos(0, 0)],
             property_control: None,
@@ -5601,7 +5601,7 @@ mod tests {
                 free_cargo: 2,
             }],
             enemy_units: Vec::new(),
-            property_entities: HashMap::new(),
+            property_entities: HashMap::default(),
             owned_airport_count: 0,
             open_properties: vec![pos(8, 1)],
             neutral_properties: vec![pos(8, 1)],
@@ -5651,8 +5651,8 @@ mod tests {
             &horizons,
             &[true, true],
             &[anchors[1]],
-            &HashSet::new(),
-            &HashSet::new(),
+            &HashSet::default(),
+            &HashSet::default(),
             3,
             PlayerId(1),
         );
@@ -5695,8 +5695,8 @@ mod tests {
             &[5],
             &[true],
             &[anchor],
-            &HashSet::new(),
-            &HashSet::new(),
+            &HashSet::default(),
+            &HashSet::default(),
             3,
             PlayerId(1),
         );
@@ -5741,8 +5741,8 @@ mod tests {
             &[5],
             &[true],
             &[anchor],
-            &HashSet::new(),
-            &HashSet::new(),
+            &HashSet::default(),
+            &HashSet::default(),
             3,
             PlayerId(1),
         );
@@ -5786,7 +5786,7 @@ mod tests {
             available_types: vec![(UnitType::Infantry, infantry), (UnitType::Tank, tank)],
             my_units: Vec::new(),
             enemy_units: Vec::new(),
-            property_entities: HashMap::new(),
+            property_entities: HashMap::default(),
             owned_airport_count: 0,
             open_properties: vec![pos(6, 2)],
             neutral_properties: vec![pos(6, 2)],
@@ -5866,7 +5866,7 @@ mod tests {
                     free_cargo: 0,
                 },
             ],
-            property_entities: HashMap::new(),
+            property_entities: HashMap::default(),
             owned_airport_count: 0,
             open_properties: vec![pos(6, 2)],
             neutral_properties: vec![pos(6, 2)],
@@ -5947,7 +5947,7 @@ mod tests {
                 hp: 100,
                 free_cargo: 0,
             }],
-            property_entities: HashMap::new(),
+            property_entities: HashMap::default(),
             owned_airport_count: 1,
             open_properties: vec![pos(7, 1)],
             neutral_properties: vec![pos(7, 1)],
@@ -5961,7 +5961,7 @@ mod tests {
             enemy_production_forecast: EnemyProductionForecastTrace::default(),
         };
 
-        let (commands, trace) = plan_production(&scan, PlayerId(1), false, &HashMap::new());
+        let (commands, trace) = plan_production(&scan, PlayerId(1), false, &HashMap::default());
 
         assert_eq!(commands.len(), 1, "commands={commands:?}, trace={trace:?}");
         assert_eq!(commands[0].unit_type, UnitType::Fighter);
@@ -6031,7 +6031,7 @@ mod tests {
                 hp: 100,
                 free_cargo: 0,
             }],
-            property_entities: HashMap::new(),
+            property_entities: HashMap::default(),
             owned_airport_count: 1,
             open_properties: vec![pos(7, 1)],
             neutral_properties: vec![pos(7, 1)],
@@ -6047,13 +6047,18 @@ mod tests {
         let mut ctx = ReachCtx::default();
         let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
 
-        let options =
-            immediate_combat_options(&scan, &mut ctx, &operations, PlayerId(1), &HashSet::new());
+        let options = immediate_combat_options(
+            &scan,
+            &mut ctx,
+            &operations,
+            PlayerId(1),
+            &HashSet::default(),
+        );
         let (operation_index, candidate, engagement) = select_immediate_combat_reinforcement(
             &operations,
             &options,
-            &HashSet::new(),
-            &HashMap::new(),
+            &HashSet::default(),
+            &HashMap::default(),
             CandidateConstraints {
                 remaining_funds: scan.funds,
                 per_slot_budget: 10_000,
@@ -6103,8 +6108,13 @@ mod tests {
         );
         let mut ctx = ReachCtx::default();
         let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
-        let options =
-            immediate_combat_options(&scan, &mut ctx, &operations, PlayerId(1), &HashSet::new());
+        let options = immediate_combat_options(
+            &scan,
+            &mut ctx,
+            &operations,
+            PlayerId(1),
+            &HashSet::default(),
+        );
         assert!(!options.is_empty(), "到達可能な前衛補充は残す");
         assert!(
             options
@@ -6148,8 +6158,8 @@ mod tests {
         let (_, candidate, _) = select_immediate_combat_reinforcement(
             &operations,
             &options,
-            &HashSet::new(),
-            &HashMap::new(),
+            &HashSet::default(),
+            &HashMap::default(),
             CandidateConstraints {
                 remaining_funds: 6000,
                 per_slot_budget: 1000,
@@ -6164,8 +6174,8 @@ mod tests {
         let (_, candidate, _) = select_immediate_combat_reinforcement(
             &operations,
             &options,
-            &HashSet::new(),
-            &HashMap::new(),
+            &HashSet::default(),
+            &HashMap::default(),
             CandidateConstraints {
                 remaining_funds: 1000,
                 per_slot_budget: 1000,
@@ -6227,8 +6237,8 @@ mod tests {
         let (operation_index, _, first) = select_immediate_combat_reinforcement(
             &operations,
             &options,
-            &HashSet::new(),
-            &HashMap::new(),
+            &HashSet::default(),
+            &HashMap::default(),
             CandidateConstraints {
                 remaining_funds: 14_000,
                 per_slot_budget: 7_000,
@@ -6237,9 +6247,9 @@ mod tests {
         .expect("最初の前線敵へ増援を割り当てる");
         assert_eq!(first.entity, first_enemy);
 
-        let mut used_facilities = HashSet::new();
+        let mut used_facilities = HashSet::default();
         used_facilities.insert(pos(1, 1));
-        let mut committed_damage = HashMap::new();
+        let mut committed_damage = HashMap::default();
         committed_damage.insert((operation_index, first.entity), first.damage);
         let (_, _, second) = select_immediate_combat_reinforcement(
             &operations,
@@ -6297,7 +6307,7 @@ mod tests {
                 hp: 100,
                 free_cargo: 0,
             }],
-            property_entities: HashMap::new(),
+            property_entities: HashMap::default(),
             owned_airport_count: 0,
             open_properties: vec![pos(6, 1)],
             neutral_properties: vec![pos(6, 1)],
@@ -6312,14 +6322,19 @@ mod tests {
         };
         let mut ctx = ReachCtx::default();
         let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
-        let options =
-            immediate_combat_options(&scan, &mut ctx, &operations, PlayerId(1), &HashSet::new());
+        let options = immediate_combat_options(
+            &scan,
+            &mut ctx,
+            &operations,
+            PlayerId(1),
+            &HashSet::default(),
+        );
 
         let (_, candidate, _) = select_immediate_combat_reinforcement(
             &operations,
             &options,
-            &HashSet::new(),
-            &HashMap::new(),
+            &HashSet::default(),
+            &HashMap::default(),
             CandidateConstraints {
                 remaining_funds: scan.funds,
                 per_slot_budget: scan.funds,
@@ -6428,7 +6443,7 @@ mod tests {
     fn production_trace_attributes_every_command_to_a_slot() {
         let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         let scan = multi_factory_scan();
-        let (commands, trace) = plan_production(&scan, PlayerId(0), true, &HashMap::new());
+        let (commands, trace) = plan_production(&scan, PlayerId(0), true, &HashMap::default());
 
         // 作戦が立つ盤面なので fallback には落ちない
         assert!(!trace.fallback);
@@ -6501,8 +6516,8 @@ mod tests {
             &horizons,
             &[true, true],
             &[anchors[1]],
-            &HashSet::new(),
-            &HashSet::new(),
+            &HashSet::default(),
+            &HashSet::default(),
             3,
             PlayerId(1),
         );
@@ -6599,7 +6614,7 @@ mod tests {
             &scan,
             &mut ReachCtx::default(),
             &operation,
-            &HashSet::new(),
+            &HashSet::default(),
             scan.funds,
             PlayerId(1),
         );
@@ -8033,7 +8048,7 @@ pub(super) fn terrain_component_membership(
     cells: &HashSet<GridPosition>,
 ) -> HashMap<GridPosition, usize> {
     let mut unseen = cells.clone();
-    let mut membership = HashMap::new();
+    let mut membership = HashMap::default();
     let mut component_id = 0;
     while let Some(start) = unseen
         .iter()
@@ -8091,7 +8106,7 @@ pub(super) fn armored_entry_bridge_gates(
         .copied()
         .collect::<HashSet<_>>();
     let bridge_membership = terrain_component_membership(map, &bridge_cells);
-    let mut bridge_groups: HashMap<usize, Vec<GridPosition>> = HashMap::new();
+    let mut bridge_groups: HashMap<usize, Vec<GridPosition>> = HashMap::default();
     for (position, component) in bridge_membership {
         bridge_groups.entry(component).or_default().push(position);
     }
@@ -8141,7 +8156,7 @@ pub(super) fn movement_step_distances(
     start: GridPosition,
     movement_type: MovementType,
 ) -> HashMap<GridPosition, u32> {
-    let mut distances = HashMap::new();
+    let mut distances = HashMap::default();
     if !map.get_terrain(start.x, start.y).is_some_and(|terrain| {
         get_valid_movement_cost(master_data, movement_type, terrain).is_some()
     }) {
@@ -8223,7 +8238,7 @@ pub(super) fn armored_parallel_route_fronts(
             .copied()
             .collect::<HashSet<_>>();
         let membership = terrain_component_membership(map, &band);
-        let mut groups: HashMap<usize, Vec<GridPosition>> = HashMap::new();
+        let mut groups: HashMap<usize, Vec<GridPosition>> = HashMap::default();
         for position in band {
             if let Some(component) = membership.get(&position) {
                 groups.entry(*component).or_default().push(position);
@@ -8550,7 +8565,7 @@ pub(super) fn build_capital_route_topology(
             })
             .map_or(0, |(route, _)| route)
     };
-    let mut property_routes = HashMap::new();
+    let mut property_routes = HashMap::default();
     for entity in world.iter_entities() {
         let (Some(position), Some(_property)) =
             (entity.get::<GridPosition>(), entity.get::<Property>())
@@ -8740,7 +8755,8 @@ pub(super) fn ensure_capital_route_node_operations(world: &mut World, player_id:
         // 移動用のセルDAGを、そのまま作戦Nodeにはしない。全セルをNodeにすると、1マス
         // ごとに次手番の状態更新を待ち、開けた地形の代替経路まで全て制圧する誤った
         // 前提DAGになる。地形・拠点スキャンで意味のあるMilestoneだけを選ぶ。
-        let mut operation_indices = HashSet::from([topology.start_node.0, topology.goal_node.0]);
+        let mut operation_indices =
+            HashSet::from_iter([topology.start_node.0, topology.goal_node.0]);
         for (index, targets) in capture_targets.iter().enumerate() {
             if !targets.is_empty() {
                 operation_indices.insert(index);
@@ -8775,7 +8791,7 @@ pub(super) fn ensure_capital_route_node_operations(world: &mut World, player_id:
         let mut operation_successors = vec![Vec::new(); topology.nodes.len()];
         for &origin in &operation_indices {
             let mut pending = VecDeque::from(topology.nodes[origin].successor_nodes.clone());
-            let mut visited = HashSet::new();
+            let mut visited = HashSet::default();
             while let Some(candidate) = pending.pop_front() {
                 if !visited.insert(candidate) {
                     continue;
@@ -8873,7 +8889,7 @@ pub(super) fn ensure_capital_route_node_operations(world: &mut World, player_id:
                     crossing_exit,
                     crossed: false,
                     state: victory_roadmap::RoadmapNodeState::Locked,
-                    assigned_squads: HashSet::new(),
+                    assigned_squads: HashSet::default(),
                 });
         }
     }
@@ -8894,7 +8910,7 @@ pub(super) fn capital_route_crossing_exit(
     )? == Terrain::Bridge)
         .then_some(())?;
     let mut pending = VecDeque::from(topology.nodes[node.0].successor_nodes.clone());
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
     while let Some(candidate) = pending.pop_front() {
         if !visited.insert(candidate) {
             continue;
@@ -9138,7 +9154,7 @@ pub(super) fn capital_route_dag_frontier_properties(
     island_id: crate::ai::islands::IslandId,
 ) -> Option<Vec<Vec<GridPosition>>> {
     let topology = capital_route_topology_for(world, player_id, island_id)?;
-    let mut property_owners = HashMap::new();
+    let mut property_owners = HashMap::default();
     for entity in world.iter_entities() {
         let (Some(position), Some(property)) =
             (entity.get::<GridPosition>(), entity.get::<Property>())
@@ -9355,7 +9371,7 @@ pub(crate) fn refresh_capital_route_path_commitments(
         .get_resource::<deployment::V4DeploymentRegistry>()
         .map(|registry| registry.active_entities(player_id))
         .unwrap_or_default();
-    let mut squads_by_island = HashMap::<crate::ai::islands::IslandId, Vec<RouteSquad>>::new();
+    let mut squads_by_island = HashMap::<crate::ai::islands::IslandId, Vec<RouteSquad>>::default();
     for squad in manager.squads.iter().filter(|squad| {
         squad.owner_id == Some(player_id)
             && squad.mission_type != MissionType::Transport
@@ -9448,15 +9464,15 @@ pub(crate) fn refresh_capital_route_path_commitments(
         }
     }
 
-    let mut commitments = HashMap::new();
-    let mut assignment_diagnostics = HashMap::new();
+    let mut commitments = HashMap::default();
+    let mut assignment_diagnostics = HashMap::default();
     // Area Capture Nodeでは、Capture Squadの出発許可を島全体の曖昧な戦力数ではなく
     // 同じNodeへ割り当てたControl Squadの存在で決める。Capture自身を護衛扱いに
     // して単独前進を許可することはない。
     let mut capture_squads_by_operation =
-        HashMap::<CapitalRouteNodeOperationId, Vec<SquadId>>::new();
+        HashMap::<CapitalRouteNodeOperationId, Vec<SquadId>>::default();
     let mut control_squads_by_operation =
-        HashMap::<CapitalRouteNodeOperationId, HashSet<SquadId>>::new();
+        HashMap::<CapitalRouteNodeOperationId, HashSet<SquadId>>::default();
     for (island_id, mut squads) in squads_by_island {
         let Some(topology) = capital_route_topology_for(world, player_id, island_id) else {
             continue;
@@ -9507,14 +9523,15 @@ pub(crate) fn refresh_capital_route_path_commitments(
         let mut assigned_counts = vec![0_usize; topology.routes.len()];
         let mut committed_counts = vec![0_usize; topology.routes.len()];
         let mut path_unavailable_counts = vec![0_usize; topology.routes.len()];
-        let mut assigned_routes = HashMap::<SquadId, usize>::new();
+        let mut assigned_routes = HashMap::<SquadId, usize>::default();
         // 同じ未完了Nodeへ送った地上member数と、後方待機線の順序をSquad単位で持つ。
         // NodeはEntityの所属を決めず、ここで決めたSquad指令だけが流量を制御する。
-        let mut frontline_members = HashMap::<(CapitalRouteNodeOperationId, bool), usize>::new();
-        let mut staged_squads = HashMap::<CapitalRouteNodeOperationId, usize>::new();
+        let mut frontline_members =
+            HashMap::<(CapitalRouteNodeOperationId, bool), usize>::default();
+        let mut staged_squads = HashMap::<CapitalRouteNodeOperationId, usize>::default();
         // Dominantで主力を解放したCapture Areaごとに、占領完了まで残すControl分隊は
         // 一個だけにする。全軍を足止めせず、歩兵だけを残す状況も避ける。
-        let mut retained_capture_escorts = HashSet::<CapitalRouteNodeOperationId>::new();
+        let mut retained_capture_escorts = HashSet::<CapitalRouteNodeOperationId>::default();
         let inherited_commitments = squads
             .iter()
             .filter_map(|squad| {
@@ -10141,8 +10158,8 @@ pub(crate) fn capital_route_tactical_target(
                 });
 
                 // 貪欲マッチング: 奥のtargetから順に、最も近い未割当の歩兵を割り当てる
-                let mut target_to_unit: HashMap<GridPosition, Entity> = HashMap::new();
-                let mut unit_to_target: HashMap<Entity, GridPosition> = HashMap::new();
+                let mut target_to_unit: HashMap<GridPosition, Entity> = HashMap::default();
+                let mut unit_to_target: HashMap<Entity, GridPosition> = HashMap::default();
                 let mut available_capturers = capturers.clone();
 
                 for t in &sorted_targets {
@@ -11276,7 +11293,7 @@ pub(crate) fn observe_same_land_route_bridgeheads(
         })
         .map(|assignment| assignment.island_id)
         .collect::<HashSet<_>>();
-    let mut observed = HashSet::new();
+    let mut observed = HashSet::default();
     for island_id in islands {
         let gates = same_land_armored_route_gates(world, player_id, island_id);
         let bridgeheads = same_land_route_breakthrough_positions(world, player_id, island_id);
@@ -11309,7 +11326,7 @@ pub(crate) fn observe_same_land_route_bridgeheads(
             .extend(observed);
     } else {
         world.insert_resource(RouteBreakthroughRegistry {
-            crossed: HashMap::from([(player_id, observed)]),
+            crossed: HashMap::from_iter([(player_id, observed)]),
         });
     }
 }
@@ -11733,7 +11750,7 @@ pub(super) fn split_bridge_route_objectives(
                 capture_eta: objective.capture_eta,
                 required_capture_survivors,
                 logistics_rank: objective.logistics_rank,
-                forced_target_enemies: HashSet::new(),
+                forced_target_enemies: HashSet::default(),
                 protected_capture_entities,
                 capture_replacement_pending: objective.capture_replacement_pending,
                 staging_anchor: anchor,
@@ -12079,8 +12096,8 @@ pub(super) fn select_property_control_plan(
             projection.4,
         )
     });
-    let mut assigned_enemies = HashSet::new();
-    let mut assigned_properties = HashSet::new();
+    let mut assigned_enemies = HashSet::default();
+    let mut assigned_properties = HashSet::default();
     for (
         _,
         enemy_arrival,
@@ -13128,7 +13145,7 @@ impl BoardScan {
                     )
                     .unwrap_or(usize::MAX),
                     logistics_rank: logistics_ranks.get(&assignment.island_id).copied(),
-                    forced_target_enemies: HashSet::new(),
+                    forced_target_enemies: HashSet::default(),
                     protected_capture_entities: assignment
                         .capture_entities
                         .iter()
@@ -13149,7 +13166,7 @@ impl BoardScan {
             .unwrap_or_default();
 
         // --- ユニットの走査 ---
-        let mut occupied = HashSet::new();
+        let mut occupied = HashSet::default();
         let mut my_units = Vec::new();
         let mut enemy_units = Vec::new();
         {
@@ -13206,10 +13223,10 @@ impl BoardScan {
             .get_resource::<victory_roadmap::VictoryRoadmapRegistry>()
             .and_then(|registry| registry.roadmap(player_id))
             .and_then(|roadmap| roadmap.enemy_capital);
-        let mut property_entities = HashMap::new();
+        let mut property_entities = HashMap::default();
         {
             let mut q = world.query::<(Entity, &GridPosition, &Property)>();
-            let mut enemy_capitals = HashMap::new();
+            let mut enemy_capitals = HashMap::default();
             for (entity, pos, prop) in q.iter(world) {
                 property_entities.insert(*pos, entity);
                 if prop.owner_id == Some(player_id) && prop.terrain == Terrain::Capital {
@@ -13449,8 +13466,8 @@ impl BoardScan {
                 logistics_rank: None,
                 // 同じ陸塊の全敵を強制対象にしない。局地Captureと首都のanchorへ
                 // 到着できる敵を最寄りOperationへ一意に割り当てる。
-                forced_target_enemies: HashSet::new(),
-                protected_capture_entities: HashSet::new(),
+                forced_target_enemies: HashSet::default(),
+                protected_capture_entities: HashSet::default(),
                 capture_replacement_pending: false,
                 staging_anchor,
                 execution_authorized: capital_assault_authorized,

@@ -1,12 +1,12 @@
 use crate::ai::{AiVersion, PlayerAiSettings, resolve_player_ai_version};
+use crate::collections::{HashMap, HashSet};
 use crate::components::*;
 use crate::resources::*;
 use base64::prelude::*;
 use bevy_ecs::prelude::*;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use std::collections::{BTreeMap, HashMap, HashSet};
-
+use std::collections::BTreeMap;
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, thiserror::Error)]
@@ -223,7 +223,7 @@ pub fn export_save_data(world: &mut World, map_name: &str) -> Result<String, Sav
 
     // 物件とユニットをクエリで取得（これらは &mut World を借用します）
     let mut properties = Vec::new();
-    let mut entity_to_uuid = HashMap::new();
+    let mut entity_to_uuid = HashMap::default();
     let mut units = Vec::new();
     {
         let mut p_query = world.query::<(&GridPosition, &Property)>();
@@ -438,7 +438,7 @@ pub fn import_save_data(
     }
     world.insert_resource(damage_chart);
 
-    let mut unit_registry_map = std::collections::HashMap::new();
+    let mut unit_registry_map = crate::collections::HashMap::default();
     for name in master_data.units.keys() {
         let stats = master_data
             .create_unit_stats(name)
@@ -495,7 +495,7 @@ pub fn import_save_data(
     world.insert_resource(master_data.clone());
 
     // CombatLedger の復元
-    let mut ledger_records = HashMap::new();
+    let mut ledger_records = HashMap::default();
     for (pid_val, rec) in &save_state.combat_ledger.records {
         ledger_records.insert(
             PlayerId(*pid_val),
@@ -525,7 +525,7 @@ pub fn import_save_data(
     }
 
     // ユニットエンティティの spawn と Uuid から Entity ID へのマッピングテーブル構築
-    let mut uuid_to_entity = HashMap::new();
+    let mut uuid_to_entity = HashMap::default();
     let mut unit_cargos_to_resolve = Vec::new();
 
     let registry = world.resource::<UnitRegistry>().clone();

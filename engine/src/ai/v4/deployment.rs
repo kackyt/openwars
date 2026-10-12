@@ -10,6 +10,7 @@ use crate::ai::turn_distance::TerrainConnectivity;
 use crate::ai::v4::operation::SlotKind;
 use crate::ai::v4::plan_contract::{OperationBinding, PlanContractRegistry};
 use crate::ai::v4::plan_revision::{ActiveDeploymentIntent, PlanId, PlanStepRef};
+use crate::collections::{HashMap, HashSet};
 use crate::components::{
     Ammo, Faction, GridPosition, Health, PlayerId, Property, Transporting, UnitStats,
 };
@@ -17,8 +18,7 @@ use crate::events::{UnitAttackedEvent, UnitProducedEvent};
 use crate::resources::{DamageChart, Map, MatchState, UnitType, master_data::MasterDataRegistry};
 use bevy_ecs::event::EventReader;
 use bevy_ecs::prelude::*;
-use std::collections::{HashMap, HashSet, VecDeque};
-
+use std::collections::VecDeque;
 /// 生産済み戦力を作戦地点へ投入するか、編成完了まで集結させるか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeploymentPosture {
@@ -970,13 +970,13 @@ pub(crate) fn prepare_deployment_squads(
     // Entityの走査順・Squadの付け替え・解放の手順は両経路で共通。
     let is_extended_path =
         crate::ai::code_path::is_extended_at("v4/deployment.rs::prepare_deployment_squads");
-    let mut target_commitments: HashMap<Entity, usize> = HashMap::new();
+    let mut target_commitments: HashMap<Entity, usize> = HashMap::default();
     let mut interceptors = 0_usize;
     let mut registry = world
         .remove_resource::<V4DeploymentRegistry>()
         .unwrap_or_default();
     let mut connectivity = TerrainConnectivity::default();
-    let mut reserved = HashSet::new();
+    let mut reserved = HashSet::default();
     let mut releases = Vec::new();
     let island_map = world
         .get_resource::<IslandMap>()
@@ -1326,7 +1326,7 @@ mod tests {
         );
         assert!(registry.active_entities(PlayerId(1)).contains(&entity));
 
-        registry.release_closed_plans(&HashSet::from([plan_id]));
+        registry.release_closed_plans(&HashSet::from_iter([plan_id]));
 
         assert!(!registry.active_entities(PlayerId(1)).contains(&entity));
         assert!(!registry.assigned[&entity].active);
@@ -1537,7 +1537,7 @@ mod tests {
         let mut manager = SquadManager::default();
 
         let reserved =
-            prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::new());
+            prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::default());
 
         assert!(reserved.contains(&attacker));
         let squad = manager
@@ -1563,8 +1563,8 @@ mod tests {
         let (mut world, attacker, priority, _, _) = deployment_world();
         let mut manager = SquadManager::default();
         let reserved =
-            prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::new());
-        assert_eq!(reserved, HashSet::from([attacker]));
+            prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::default());
+        assert_eq!(reserved, HashSet::from_iter([attacker]));
         let squad = manager
             .squads
             .iter()
@@ -1588,11 +1588,11 @@ mod tests {
             world
                 .resource::<V4DeploymentRegistry>()
                 .active_entities(PlayerId(1)),
-            HashSet::from([attacker])
+            HashSet::from_iter([attacker])
         );
 
         *world.get_mut::<GridPosition>(priority).unwrap() = GridPosition { x: 6, y: 0 };
-        prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::new());
+        prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::default());
         let squad = manager
             .squads
             .iter()
@@ -1613,7 +1613,7 @@ mod tests {
         }
         let mut manager = SquadManager::default();
 
-        prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::new());
+        prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::default());
 
         assert_eq!(
             world
@@ -1633,9 +1633,9 @@ mod tests {
     fn issue95_missing_priority_retargets_capture_then_releases() {
         let (mut world, attacker, priority, transport, capture) = deployment_world();
         let mut manager = SquadManager::default();
-        prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::new());
+        prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::default());
         world.despawn(priority);
-        prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::new());
+        prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::default());
         let squad = manager
             .squads
             .iter()
@@ -1652,7 +1652,7 @@ mod tests {
         world.despawn(capture);
         world.despawn(transport);
         let reserved =
-            prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::new());
+            prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::default());
         assert!(reserved.is_empty());
         assert!(!world.resource::<V4DeploymentRegistry>().assigned[&attacker].active);
         assert!(

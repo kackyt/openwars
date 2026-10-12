@@ -124,8 +124,8 @@ impl GridGeometry for HexGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, VecDeque};
-
+    use crate::collections::HashMap;
+    use std::collections::VecDeque;
     #[test]
     fn test_square_distance_is_manhattan() {
         let g = GridTopology::Square;
@@ -221,7 +221,7 @@ mod tests {
         let start = (3usize, 3usize);
 
         // BFS で全セルへの最短ステップ数を計算
-        let mut steps: HashMap<(usize, usize), u32> = HashMap::new();
+        let mut steps: HashMap<(usize, usize), u32> = HashMap::default();
         let mut queue = VecDeque::new();
         steps.insert(start, 0);
         queue.push_back(start);

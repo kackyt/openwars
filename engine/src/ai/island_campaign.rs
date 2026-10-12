@@ -1,11 +1,10 @@
 use crate::ai::islands::IslandId;
 use crate::ai::squad::TransportPhase;
+use crate::collections::{HashMap, HashSet};
 use crate::components::{GridPosition, PlayerId};
 use crate::resources::{Map, UnitType};
 use bevy_ecs::prelude::{Entity, Resource};
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
-
 /// 戦力分散を避けるために同時維持する攻勢作戦数。
 const MAX_ACTIVE_OFFENSIVES: usize = 3;
 
@@ -757,7 +756,7 @@ fn campaign_transport_package_covers(
         return false;
     }
     transports.sort_by_key(|transport| transport.entity.to_bits());
-    let mut loaded_owner = HashMap::new();
+    let mut loaded_owner = HashMap::default();
     let mut assigned_counts = vec![0_u32; transports.len()];
     for (index, transport) in transports.iter().enumerate() {
         if transport.loaded_cargo_entities.len() as u32 > transport.available_cargo_slots {
@@ -855,7 +854,7 @@ fn remote_transport_shortfall(
         return None;
     }
 
-    let mut cargo_by_island: HashMap<IslandId, Vec<UnitType>> = HashMap::new();
+    let mut cargo_by_island: HashMap<IslandId, Vec<UnitType>> = HashMap::default();
     for entity in cargo_entities {
         let cargo = catalog.get(entity)?;
         cargo_by_island
@@ -1360,7 +1359,7 @@ fn protect_contest_assets(
     candidates: &[IslandCampaignCandidate],
     pool: &mut CampaignResourcePool,
 ) -> ContestProtection {
-    let mut protections: ContestProtection = HashMap::new();
+    let mut protections: ContestProtection = HashMap::default();
     let mut contest_islands: Vec<_> = candidates
         .iter()
         .filter(|candidate| candidate.assessment.decision == IslandCampaignDecision::Contest)
@@ -1449,7 +1448,7 @@ fn release_assignment(
     pool: &mut CampaignResourcePool,
     catalog: &HashMap<Entity, CampaignUnitCandidate>,
 ) {
-    let mut assigned_entities = HashSet::new();
+    let mut assigned_entities = HashSet::default();
     let assigned_entity_value = assignment
         .transport_entities
         .iter()
@@ -1864,9 +1863,8 @@ pub fn assess_island(facts: &IslandCampaignFacts) -> IslandCampaignAssessment {
 mod tests {
     use super::*;
     use crate::ai::islands::IslandId;
+    use crate::collections::HashSet;
     use crate::resources::{GridTopology, Terrain};
-    use std::collections::HashSet;
-
     fn facts_for_empty_neutral_island() -> IslandCampaignFacts {
         IslandCampaignFacts {
             island_id: IslandId(0),

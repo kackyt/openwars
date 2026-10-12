@@ -996,7 +996,7 @@ mod tests {
             let (entity, command) = crate::ai::squad::execute_transport_squad_step(
                 world,
                 squad,
-                &std::collections::HashSet::new(),
+                &crate::collections::HashSet::default(),
             )
             .expect("transport should produce a command");
             let result = command.clone();

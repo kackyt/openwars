@@ -7,6 +7,7 @@ use super::candidate_field::CandidateTile;
 use super::route_field::{build_route_field, build_route_field_to_any};
 use crate::ai::AiVersion;
 use crate::ai::engine::AiCommand;
+use crate::collections::{HashMap, HashSet};
 use crate::components::{
     ActionCompleted, CargoCapacity, Faction, Fuel, GridPosition, HasMoved, Health, PlayerId,
     Transporting, UnitStats,
@@ -15,8 +16,6 @@ use crate::resources::{Map, MasterDataRegistry, Terrain};
 use crate::systems::movement::{OccupantInfo, calculate_reachable_tile_costs};
 use bevy_ecs::prelude::*;
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
-
 #[derive(Clone)]
 struct PassengerView {
     entity: Entity,
@@ -190,7 +189,7 @@ fn build_pickup_coverage(
     version: AiVersion,
 ) -> HashMap<GridPosition, usize> {
     let passenger_penalty = super::rom_logic::movement_evaluation_penalty(version) * 2;
-    let mut coverage = HashMap::<GridPosition, usize>::new();
+    let mut coverage = HashMap::<GridPosition, usize>::default();
     for passenger in passengers.iter().filter(|passenger| passenger.available) {
         let movement = passenger
             .stats
@@ -446,7 +445,7 @@ fn collect_passengers_and_occupants(
     loadable_types: &[crate::resources::UnitType],
 ) -> (Vec<PassengerView>, HashMap<(usize, usize), OccupantInfo>) {
     let mut passengers = Vec::new();
-    let mut occupants = HashMap::new();
+    let mut occupants = HashMap::default();
     let pickup_eligible = world
         .get_resource::<super::rom_logic::RomAiState>()
         .map(|state| state.pickup_eligible_units(player_id));
@@ -551,7 +550,7 @@ mod tests {
                 available: !matches!(index, 3 | 4),
             })
             .collect();
-        let mut occupants = HashMap::new();
+        let mut occupants = HashMap::default();
         for position in passenger_positions {
             occupants.insert(
                 (position.x, position.y),
@@ -693,7 +692,7 @@ mod tests {
             position: actor_position,
             movement_cost: 0,
         }];
-        let cargo_objectives = HashMap::from([
+        let cargo_objectives = HashMap::from_iter([
             (first_cargo, GridPosition { x: 0, y: 0 }),
             (second_cargo, GridPosition { x: 2, y: 1 }),
         ]);
@@ -780,7 +779,7 @@ mod tests {
                 movement_cost: 1,
             },
         ];
-        let cargo_objectives = HashMap::from([(cargo, objective)]);
+        let cargo_objectives = HashMap::from_iter([(cargo, objective)]);
 
         let command = choose_loaded_action(
             &mut world,
@@ -852,7 +851,7 @@ mod tests {
             },
         ];
         let objective = GridPosition { x: 6, y: 1 };
-        let cargo_objectives = HashMap::from([(cargo, objective)]);
+        let cargo_objectives = HashMap::from_iter([(cargo, objective)]);
 
         let command = choose_loaded_action(
             &mut world,

@@ -111,7 +111,7 @@ pub(super) fn campaign_assignment_capture_responsibilities(
             player_id,
             assignment.island_id,
             members,
-            &HashSet::new(),
+            &HashSet::default(),
             connectivity,
         )
     {
@@ -125,7 +125,7 @@ pub(super) fn campaign_assignment_capture_responsibilities(
     // 生産時に期限・経路まで検証して具体化したCapture任務は、次回Campaign分析の
     // 「最寄り物件」へ即座に戻さない。対象が未取得かつ本人が到達可能な間だけ保持し、
     // 取得済み・到達不能なら下の通常割当へ自然に戻す。
-    let mut pinned_members = HashSet::new();
+    let mut pinned_members = HashSet::default();
     // 未所有物件マス上にすでに乗っている歩兵のうち、すでに占領進行中であるか、
     // または既存Squadの目標としてその物件に到達している歩兵は、
     // 他の物件へ移籍させず、その物件の占領完遂を最優先としてピン留めする。
@@ -253,7 +253,7 @@ pub(super) fn campaign_assignment_capture_responsibilities(
         let excluded_targets = if spread_over_land_routes {
             &claimed_targets
         } else {
-            &HashSet::new()
+            &HashSet::default()
         };
         if let Some(target) = nearest_campaign_property_target_with_connectivity(
             world,
@@ -1082,7 +1082,7 @@ mod tests {
         );
         assert_eq!(
             targets,
-            HashSet::from([GridPosition { x: 14, y: 4 }, GridPosition { x: 11, y: 17 },])
+            HashSet::from_iter([GridPosition { x: 14, y: 4 }, GridPosition { x: 11, y: 17 },])
         );
 
         // Secureの占領要員を固定的にDefenseへ抜き取らない。CaptureとCombatは同じ
@@ -1117,7 +1117,7 @@ mod tests {
             "戦役需要から既に決まった二枠へ、同じEntityを重複させず配属する"
         );
         let assigned = distributed.into_iter().flatten().collect::<HashSet<_>>();
-        assert_eq!(assigned, HashSet::from([first, second]));
+        assert_eq!(assigned, HashSet::from_iter([first, second]));
     }
 
     #[test]

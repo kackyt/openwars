@@ -1,5 +1,4 @@
-use std::collections::HashSet;
-
+use crate::collections::HashSet;
 use bevy_ecs::prelude::*;
 
 use crate::ai::{AiVersion, PlayerAiSettings};
@@ -266,8 +265,8 @@ fn v3_invasion_reaches_combat_or_capture_after_landing() {
     let mut capture_cursor = world
         .resource::<Events<PropertyCaptureProgressedEvent>>()
         .get_cursor();
-    let mut loaded_cargo = HashSet::new();
-    let mut unloaded_cargo = HashSet::new();
+    let mut loaded_cargo = HashSet::default();
+    let mut unloaded_cargo = HashSet::default();
     let mut invasion_started = false;
     let mut return_without_cargo = false;
 

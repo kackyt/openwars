@@ -1,10 +1,9 @@
 use crate::ai::eval::evaluate_board;
 use crate::ai::simulation::AiSimulationState;
 use crate::ai::squad::{MissionType, Squad, SquadManager};
+use crate::collections::HashMap;
 use crate::components::{GridPosition, PlayerId};
 use bevy_ecs::prelude::*;
-use std::collections::HashMap;
-
 /// ビーム幅のデフォルト値
 pub const BEAM_WIDTH: usize = 3;
 
@@ -94,7 +93,7 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
 
     // 初期状態：空のプラン
     let mut beam = vec![SquadAssignmentPlan {
-        assignments: HashMap::new(),
+        assignments: HashMap::default(),
         score: 0,
     }];
 
@@ -280,7 +279,7 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                     .cloned()
                     .unwrap_or_default();
 
-                let mut unit_positions = HashMap::new();
+                let mut unit_positions = HashMap::default();
                 let mut q_all_units = world.query::<(
                     &crate::components::Faction,
                     &GridPosition,
@@ -402,7 +401,6 @@ mod tests {
     use crate::resources::master_data::*;
     use crate::resources::*;
     use std::collections::BTreeSet;
-
     fn setup_test_world() -> World {
         let master_data = MasterDataRegistry::load().unwrap();
         let (mut world, _) =

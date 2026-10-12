@@ -182,8 +182,8 @@ pub(super) fn candidate_capture_target_positions(
                     })
                     .map_or(0, |(route, _)| route)
             };
-            let mut min_distance_by_route: std::collections::HashMap<usize, u32> =
-                std::collections::HashMap::new();
+            let mut min_distance_by_route: crate::collections::HashMap<usize, u32> =
+                crate::collections::HashMap::default();
             for target in &targets {
                 let route = nearest_route(*target);
                 let distance = target_priority(*target).1;
@@ -234,7 +234,7 @@ pub(super) fn collect_campaign_resource_pool(
     let unit_by_entity: HashMap<_, _> = units.iter().map(|unit| (unit.entity, unit)).collect();
     let assigned_by_entity =
         merge_campaign_assignment_sources(roadmap_assignments, operations, produced_assignments);
-    let mut assigned_entities_by_island: HashMap<IslandId, HashSet<Entity>> = HashMap::new();
+    let mut assigned_entities_by_island: HashMap<IslandId, HashSet<Entity>> = HashMap::default();
     for (entity, island_id) in &assigned_by_entity {
         assigned_entities_by_island
             .entry(*island_id)

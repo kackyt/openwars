@@ -12,12 +12,12 @@ use crate::ai::turn_distance::{
     TerrainConnectivity, TurnDistanceCache, calculate_all_turn_distances, calculate_turn_distance,
     is_terrain_reachable,
 };
+use crate::collections::{HashMap, HashSet};
 use crate::components::{Ammo, Faction, GridPosition, Health, PlayerId, Property, UnitStats};
 use crate::resources::{Map, Terrain, UnitType, master_data::MasterDataRegistry};
 use crate::systems::movement::calculate_reachable_tiles;
 use bevy_ecs::prelude::*;
-use std::collections::{BTreeSet, HashMap, HashSet};
-
+use std::collections::BTreeSet;
 /// ミッションの種別
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MissionType {
@@ -296,7 +296,7 @@ fn reconcile_unique_operation_assignments(
         }
     }
     let existing = registry.player_assignments(player_id);
-    let mut candidates: HashMap<Entity, Vec<SquadAssignmentCandidate>> = HashMap::new();
+    let mut candidates: HashMap<Entity, Vec<SquadAssignmentCandidate>> = HashMap::default();
     let mut visits = 0usize;
     for squad in manager
         .squads
@@ -353,7 +353,7 @@ fn reconcile_unique_operation_assignments(
         }
     }
 
-    let mut winners = HashMap::new();
+    let mut winners = HashMap::default();
     for (entity, entity_candidates) in &candidates {
         let prior = existing.get(entity).copied();
         let winner = entity_candidates
@@ -475,7 +475,7 @@ fn claim_campaign_portfolio_assignments(
             registry.release_operation(owner);
         }
     }
-    let mut claimed_entities = HashMap::new();
+    let mut claimed_entities = HashMap::default();
     for assignment in assignments {
         let owner = OperationOwner::Campaign {
             player_id,
@@ -621,7 +621,7 @@ fn active_production_positions(world: &World, player_id: PlayerId) -> HashSet<(u
         world.get_resource::<Map>(),
         world.get_resource::<MasterDataRegistry>(),
     ) else {
-        return HashSet::new();
+        return HashSet::default();
     };
     let capital_positions: Vec<_> = world
         .iter_entities()
@@ -905,7 +905,7 @@ fn cargo_can_board_transport_this_turn(
         return true;
     }
 
-    let mut unit_positions = HashMap::new();
+    let mut unit_positions = HashMap::default();
     let mut query = world.query::<(
         &GridPosition,
         &Faction,
@@ -1074,7 +1074,7 @@ pub fn update_squads(world: &mut World, perspective_player: PlayerId) {
     adopt_legacy_squad_owners(world, &mut manager);
 
     // 存在しなくなったエンティティの削除
-    let mut existing_entities = HashSet::new();
+    let mut existing_entities = HashSet::default();
     let mut units_needing_fallback = Vec::new();
     let mut units_recovered = Vec::new();
 
@@ -1322,7 +1322,7 @@ pub fn update_squads(world: &mut World, perspective_player: PlayerId) {
     }
 
     // 占領完了した Capture 部隊の解散
-    let mut properties_ownership = HashMap::new();
+    let mut properties_ownership = HashMap::default();
     {
         let mut q_props = world.query::<(&GridPosition, &Property)>();
         for (pos, prop) in q_props.iter(world) {
@@ -1349,7 +1349,7 @@ pub fn update_squads(world: &mut World, perspective_player: PlayerId) {
         .get_resource::<crate::ai::islands::IslandMap>()
         .cloned()
     {
-        let mut active_islands = HashSet::new();
+        let mut active_islands = HashSet::default();
         for (position, owner) in &properties_ownership {
             if *owner != Some(perspective_player)
                 && let Some(island) = island_map.get_island_at(position)
@@ -1530,7 +1530,7 @@ fn build_ready_campaign_transport_partitions(
         return None;
     }
 
-    let mut loaded_owner = HashMap::new();
+    let mut loaded_owner = HashMap::default();
     let mut transports = Vec::with_capacity(transport_entities.len());
     for transport in transport_entities {
         let position = world.get::<GridPosition>(transport).copied()?;
@@ -2005,7 +2005,7 @@ fn promote_partial_campaign_transport_wave(
     }
 
     let mut connectivity = TerrainConnectivity::default();
-    let mut launched_transports = HashSet::new();
+    let mut launched_transports = HashSet::default();
     let mut waves = Vec::new();
     for transport in transports {
         let (Some(position), Some(stats), Some(capacity)) = (
@@ -2704,7 +2704,7 @@ fn assign_campaign_responsibilities(
         .flat_map(|responsibility| responsibility.members.iter().copied())
         .collect();
     let mut selected_ids = Vec::with_capacity(responsibilities.len());
-    let mut used_ids = HashSet::new();
+    let mut used_ids = HashSet::default();
     for responsibility in &responsibilities {
         let member_set: HashSet<_> = responsibility.members.iter().copied().collect();
         let existing_id = manager
@@ -3174,7 +3174,7 @@ fn prepare_secure_local_captures(
     use crate::ai::island_campaign::{IslandCampaignDecision, campaign_unit_type_rank};
 
     let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() else {
-        return HashSet::new();
+        return HashSet::default();
     };
     let mut secure_islands: Vec<_> = portfolio
         .islands
@@ -3185,7 +3185,7 @@ fn prepare_secure_local_captures(
         .collect();
     secure_islands.sort_by_key(|island| island.0);
     secure_islands.dedup();
-    let mut protected = HashSet::new();
+    let mut protected = HashSet::default();
     for island_id in secure_islands {
         let mut candidates: Vec<_> = world
             .iter_entities()
@@ -3377,7 +3377,7 @@ fn assign_explicit_reserve_squads(
     // SoloFallback は「Squadを組めなかった」という旧経路の印であり、実行任務の
     // 所有を保証しない。ここで割当済み扱いにすると、Registry ownerだけを持つ
     // EntityがReserveへ再接続されず、行動可能なまま手番を終えてしまう。
-    let mut assigned = HashSet::new();
+    let mut assigned = HashSet::default();
     for squad in &manager.squads {
         assigned.extend(squad.members.iter().copied());
         assigned.extend(squad.cargo_entities.iter().copied());
@@ -3387,7 +3387,7 @@ fn assign_explicit_reserve_squads(
         }
     }
 
-    let mut campaign_by_entity = HashMap::new();
+    let mut campaign_by_entity = HashMap::default();
     for assignment in campaign_assignments {
         for entity in assignment
             .transport_entities
@@ -3430,7 +3430,7 @@ fn assign_explicit_reserve_squads(
         });
     }
 
-    let mut occupied = HashSet::new();
+    let mut occupied = HashSet::default();
     let mut units = Vec::new();
     let mut enemies = Vec::new();
     let mut unit_query = world.query::<(
@@ -3455,7 +3455,7 @@ fn assign_explicit_reserve_squads(
     units.sort_by_key(|(entity, _, _)| entity.to_bits());
 
     let mut owned_properties = Vec::new();
-    let mut production_positions = HashSet::new();
+    let mut production_positions = HashSet::default();
     let mut property_query = world.query::<(&GridPosition, &Property)>();
     for (position, property) in property_query.iter(world) {
         if property.owner_id != Some(player_id) {
@@ -3644,7 +3644,7 @@ fn reconnect_unassigned_transport_waves(
         .cloned()
         .unwrap_or_else(|| crate::ai::islands::IslandMap::analyze(&map));
 
-    let mut assigned_entities = HashSet::new();
+    let mut assigned_entities = HashSet::default();
     for squad in &manager.squads {
         assigned_entities.extend(squad.members.iter().copied());
         assigned_entities.extend(squad.cargo_entities.iter().copied());
@@ -3687,7 +3687,7 @@ fn reconnect_unassigned_transport_waves(
         return;
     }
 
-    let mut enemy_count_by_island = HashMap::new();
+    let mut enemy_count_by_island = HashMap::default();
     let mut enemy_query = world.query::<(
         &Faction,
         &GridPosition,
@@ -4133,7 +4133,7 @@ fn reconnect_current_v4_operations(
         world,
         manager,
         player_id,
-        &HashSet::new(),
+        &HashSet::default(),
     );
 }
 
@@ -4142,7 +4142,7 @@ fn unassigned_entity_ids(
     manager: &SquadManager,
     player_id: PlayerId,
 ) -> HashSet<Entity> {
-    let mut assigned = HashSet::new();
+    let mut assigned = HashSet::default();
     for squad in &manager.squads {
         assigned.extend(squad.members.iter().copied());
         assigned.extend(squad.cargo_entities.iter().copied());
@@ -4427,7 +4427,7 @@ fn plan_squads_with_hooks<H: SquadPlanningHooks>(world: &mut World, perspective_
     H::before_manager_removal(world, perspective_player, is_v4);
     let mut manager = world.remove_resource::<SquadManager>().unwrap_or_default();
     prepare_squads_for_replanning(world, &mut manager, perspective_player, is_v4);
-    let tactical_reserved_entities = HashSet::new();
+    let tactical_reserved_entities = HashSet::default();
     let strategy = if is_v3 {
         // 防衛もcampaign portfolioの通常優先度・排他割当で扱う。
         let deployment_entities = if is_v4 {
@@ -4436,7 +4436,7 @@ fn plan_squads_with_hooks<H: SquadPlanningHooks>(world: &mut World, perspective_
                 .map(|deployments| deployments.active_entities(perspective_player))
                 .unwrap_or_default()
         } else {
-            HashSet::new()
+            HashSet::default()
         };
 
         // deploymentだけは生産目的が解消されるまで通常free poolから保護する。
@@ -4476,7 +4476,7 @@ fn plan_squads_with_hooks<H: SquadPlanningHooks>(world: &mut World, perspective_
     let paused_campaign_islands = if is_v3 {
         campaign_paused_islands(&planning_portfolio)
     } else {
-        HashSet::new()
+        HashSet::default()
     };
     let secure_reserved_entities = if is_v3 {
         apply_campaign_pauses(
@@ -4487,7 +4487,7 @@ fn plan_squads_with_hooks<H: SquadPlanningHooks>(world: &mut World, perspective_
         );
         prepare_secure_local_captures(world, &mut manager, perspective_player, &planning_portfolio)
     } else {
-        HashSet::new()
+        HashSet::default()
     };
     let mut campaign_assignments: Vec<_> = if is_v3 {
         planning_portfolio
@@ -4522,7 +4522,7 @@ fn plan_squads_with_hooks<H: SquadPlanningHooks>(world: &mut World, perspective_
         .copied()
         .collect();
     all_campaign_reserved_entities.extend(secure_reserved_entities);
-    let mut blocked_campaign_islands = HashSet::new();
+    let mut blocked_campaign_islands = HashSet::default();
     let mut campaign_connectivity = TerrainConnectivity::default();
     for assignment in &campaign_assignments {
         if prepare_campaign_transport_assignment_with_connectivity(
@@ -4576,7 +4576,7 @@ fn plan_squads_with_hooks<H: SquadPlanningHooks>(world: &mut World, perspective_
         .unwrap_or_else(|| crate::ai::islands::IslandMap::analyze(&map));
 
     // 他の部隊にすでに割り当て済みの全メンバーを特定
-    let mut busy_entities = HashSet::new();
+    let mut busy_entities = HashSet::default();
     for squad in &manager.squads {
         for &member in &squad.members {
             busy_entities.insert(member);
@@ -4586,7 +4586,7 @@ fn plan_squads_with_hooks<H: SquadPlanningHooks>(world: &mut World, perspective_
     }
 
     // 占有情報（経路探索用）
-    let mut unit_positions = HashMap::new();
+    let mut unit_positions = HashMap::default();
     let mut q_all_units = world.query::<(
         &Faction,
         &GridPosition,
@@ -4656,9 +4656,9 @@ fn plan_squads_with_hooks<H: SquadPlanningHooks>(world: &mut World, perspective_
     }
 
     // A. 輸送部隊の割り当て（planner.rs からの統合）
-    let mut base_islands = HashSet::new();
+    let mut base_islands = HashSet::default();
     let mut target_islands = Vec::new();
-    let mut properties_ownership = HashMap::new();
+    let mut properties_ownership = HashMap::default();
     {
         let mut q_props = world.query::<(&GridPosition, &Property)>();
         for (pos, prop) in q_props.iter(world) {
@@ -4674,9 +4674,9 @@ fn plan_squads_with_hooks<H: SquadPlanningHooks>(world: &mut World, perspective_
     // V1からの統合: 島ごとの期待値（IslandScore）の算出
     // ---------------------------------------------------------
     let mut own_production_bases = Vec::new();
-    let mut enemy_production_count_map = std::collections::HashMap::new();
-    let mut enemy_owned_islands = HashSet::new();
-    let mut island_props_map = std::collections::HashMap::new();
+    let mut enemy_production_count_map = crate::collections::HashMap::default();
+    let mut enemy_owned_islands = HashSet::default();
+    let mut island_props_map = crate::collections::HashMap::default();
 
     for (pos, owner) in &properties_ownership {
         if let Some(island) = island_map.get_island_at(pos) {
@@ -4793,7 +4793,7 @@ fn plan_squads_with_hooks<H: SquadPlanningHooks>(world: &mut World, perspective_
 
     // #54 (V3): 自軍の歩兵 (占領要員) が存在する島の集合。
     // 輸送カーゴの選定で「占領要員が未着の島へはまず歩兵を送る」判定に使う
-    let mut my_infantry_islands = HashSet::new();
+    let mut my_infantry_islands = HashSet::default();
     if is_v3 {
         for ((x, y), occ) in &unit_positions {
             if occ.player_id == perspective_player
@@ -5041,7 +5041,7 @@ fn plan_squads_with_hooks<H: SquadPlanningHooks>(world: &mut World, perspective_
     // 損耗補充用の予備便を割り当てる。従来はfree poolへ残った歩兵・輸送役を
     // 以後いっさい再照合せず、生産拠点周辺の恒常的な遊兵にしていた。
     if is_v4 && !free_transports.is_empty() && !free_infantry.is_empty() {
-        let mut enemy_count_by_island = HashMap::new();
+        let mut enemy_count_by_island = HashMap::default();
         let mut enemy_query = world.query::<(
             &Faction,
             &GridPosition,
@@ -5836,7 +5836,7 @@ fn select_landing_candidate(
     let mut reachable_positions: Vec<_> = reachable.iter().copied().collect();
     reachable_positions.sort_by_key(|position| (position.1, position.0));
     let mut best = None;
-    let empty_occupants = HashMap::new();
+    let empty_occupants = HashMap::default();
     let target_distances = target_position.map(|target| {
         calculate_all_turn_distances(
             &map,
@@ -6064,7 +6064,7 @@ pub fn update_transport_squad_phase(world: &mut World, squad: &mut Squad) -> boo
 pub fn execute_transport_squad_step(
     world: &mut World,
     squad: &mut Squad,
-    skip_entities: &std::collections::HashSet<Entity>,
+    skip_entities: &crate::collections::HashSet<Entity>,
 ) -> Option<(Entity, crate::ai::engine::AiCommand)> {
     let transport_entity = squad.transport_entity?;
 
@@ -6192,7 +6192,7 @@ pub fn execute_transport_squad_step(
         TransportPhase::Return => None,
     };
 
-    let mut unit_positions = HashMap::new();
+    let mut unit_positions = HashMap::default();
     let mut query = world.query::<(
         Entity,
         &GridPosition,
@@ -6870,7 +6870,7 @@ mod tests {
                 let intended_id = intended.id;
                 intended.target_island = Some(island);
                 intended.members.insert(entity);
-                let fallback_marks = HashSet::from([entity, other_entity]);
+                let fallback_marks = HashSet::from_iter([entity, other_entity]);
                 manager.solo_fallbacks = fallback_marks.clone();
 
                 prepare_squads_for_replanning(&mut world, &mut manager, player, is_v4);
@@ -6892,7 +6892,7 @@ mod tests {
                 assert_eq!(
                     manager.solo_fallbacks,
                     if is_v4 {
-                        HashSet::new()
+                        HashSet::default()
                     } else {
                         fallback_marks
                     }
@@ -8302,7 +8302,7 @@ mod tests {
                     .find(|squad| squad.id == squad_id)
                     .unwrap();
                 let (entity, command) =
-                    execute_transport_squad_step(&mut fixture.world, squad, &HashSet::new())
+                    execute_transport_squad_step(&mut fixture.world, squad, &HashSet::default())
                         .expect("Pickup squad must advance toward loading");
                 assert!(matches!(
                     command,
@@ -8463,7 +8463,7 @@ mod tests {
             assert_eq!(lander.2, BTreeSet::from([fixture.lander]));
             assert_eq!(
                 lander.3.iter().copied().collect::<HashSet<_>>(),
-                HashSet::from([fixture.cargo[2], fixture.cargo[3]])
+                HashSet::from_iter([fixture.cargo[2], fixture.cargo[3]])
             );
 
             let helicopter = squads
@@ -9397,7 +9397,7 @@ mod tests {
         squad.phase = MissionPhase::Transport(TransportPhase::Pickup);
 
         let (entity, command) =
-            execute_transport_squad_step(&mut world, &mut squad, &HashSet::new())
+            execute_transport_squad_step(&mut world, &mut squad, &HashSet::default())
                 .expect("同じマスの2体目を同ターンに積載する");
         assert_eq!(entity, second);
         assert!(matches!(
@@ -9445,7 +9445,9 @@ mod tests {
         squad.transport_entity = Some(transport);
         squad.phase = MissionPhase::Transport(TransportPhase::Return);
 
-        assert!(execute_transport_squad_step(&mut world, &mut squad, &HashSet::new()).is_none());
+        assert!(
+            execute_transport_squad_step(&mut world, &mut squad, &HashSet::default()).is_none()
+        );
     }
 
     #[test]
@@ -9507,7 +9509,7 @@ mod tests {
         squad.phase = MissionPhase::Transport(TransportPhase::Pickup);
 
         let (entity, command) =
-            execute_transport_squad_step(&mut world, &mut squad, &HashSet::new())
+            execute_transport_squad_step(&mut world, &mut squad, &HashSet::default())
                 .expect("cargo should board the current helicopter before it moves");
         assert_eq!(entity, cargo);
         assert!(matches!(
@@ -9601,7 +9603,7 @@ mod tests {
         squad.phase = MissionPhase::Transport(TransportPhase::Pickup);
 
         let (first_entity, first_command) =
-            execute_transport_squad_step(&mut world, &mut squad, &HashSet::new())
+            execute_transport_squad_step(&mut world, &mut squad, &HashSet::default())
                 .expect("transport must vacate the airport before loading");
         assert_eq!(first_entity, transport);
         let crate::ai::engine::AiCommand::Wait { target_pos } = first_command else {
@@ -9613,7 +9615,7 @@ mod tests {
         world.get_mut::<HasMoved>(transport).unwrap().0 = true;
         world.get_mut::<ActionCompleted>(transport).unwrap().0 = true;
         let (second_entity, second_command) =
-            execute_transport_squad_step(&mut world, &mut squad, &HashSet::new())
+            execute_transport_squad_step(&mut world, &mut squad, &HashSet::default())
                 .expect("cargo must board the exhausted transport in the same turn");
         assert_eq!(second_entity, cargo);
         assert!(matches!(
@@ -9867,7 +9869,7 @@ mod tests {
         squad.phase = MissionPhase::Transport(TransportPhase::Pickup);
 
         let (entity, command) =
-            execute_transport_squad_step(&mut world, &mut squad, &HashSet::new())
+            execute_transport_squad_step(&mut world, &mut squad, &HashSet::default())
                 .expect("second cargo should load without a staging wait");
         assert_eq!(entity, actionable);
         assert!(matches!(
@@ -10489,7 +10491,7 @@ mod tests {
                 &island_map,
                 &map,
                 &registry,
-                &HashMap::new(),
+                &HashMap::default(),
                 PlayerId(1),
                 &mut cache,
                 &mut connectivity,
@@ -10646,7 +10648,7 @@ mod tests {
 
         let protected = prepare_secure_local_captures(&world, &mut manager, player, &portfolio);
 
-        assert_eq!(protected, HashSet::from([reachable]));
+        assert_eq!(protected, HashSet::from_iter([reachable]));
         let capture = manager
             .squads
             .iter()

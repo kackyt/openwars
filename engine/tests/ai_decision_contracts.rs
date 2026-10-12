@@ -17,12 +17,11 @@ use engine::ai::engine::execute_ai_turn;
 use engine::ai::production::commit::IssueAudit;
 use engine::ai::production::demand::UnfilledReason;
 use engine::ai::v4::trace::{ProductionDecision, ProductionTraceDiagnostics};
+use engine::collections::{HashMap, HashSet};
 use engine::components::*;
 use engine::events::*;
 use engine::resources::master_data::MasterDataRegistry;
 use engine::resources::*;
-use std::collections::{HashMap, HashSet};
-
 /// 1ターン内で許容するAIステップ数の上限（無限ループ検出用）
 const MAX_STEPS_PER_TURN: usize = 400;
 
@@ -105,9 +104,9 @@ fn check_turn_contracts(world: &World, observation: &TurnObservation) -> Vec<Str
         ));
     }
 
-    let mut facilities = HashSet::new();
+    let mut facilities = HashSet::default();
     let mut planned_cost = 0_u32;
-    let mut planned_by_type: HashMap<UnitType, u32> = HashMap::new();
+    let mut planned_by_type: HashMap<UnitType, u32> = HashMap::default();
     for step in &trace.steps {
         let (unit_type, cost, facility) = match step.decision {
             ProductionDecision::Produced {
@@ -142,7 +141,7 @@ fn check_turn_contracts(world: &World, observation: &TurnObservation) -> Vec<Str
 
     // 計画した購入案は、同じ兵種の生産として適用されている（施設は確定前の最適化で
     // 入れ替わり得るため兵種単位で照合する。campaign専用生産の分だけ実適用が多くてよい）。
-    let mut produced_by_type: HashMap<UnitType, u32> = HashMap::new();
+    let mut produced_by_type: HashMap<UnitType, u32> = HashMap::default();
     for event in &observation.produced {
         *produced_by_type.entry(event.unit_type).or_default() += 1;
     }

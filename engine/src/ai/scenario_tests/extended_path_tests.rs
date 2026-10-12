@@ -160,7 +160,7 @@ fn test_v3_multi_cargo_invasion_loads_transits_and_lands() {
         let (entity, command) = crate::ai::squad::execute_transport_squad_step(
             world,
             squad,
-            &std::collections::HashSet::new(),
+            &crate::collections::HashSet::default(),
         )
         .expect("transport should produce a command");
         let result = command.clone();

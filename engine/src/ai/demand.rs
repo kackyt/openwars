@@ -1,12 +1,11 @@
 use crate::ai::turn_distance::{ActionTurnDistanceCache, calculate_action_distance_to_range};
+use crate::collections::HashMap;
 use crate::components::{GridPosition, PlayerId, UnitStats};
 use crate::resources::{
     DamageChart, Map, MovementType, Terrain, UnitRegistry, UnitType,
     master_data::MasterDataRegistry,
 };
 use crate::systems::movement::OccupantInfo;
-use std::collections::HashMap;
-
 /// ユニットの戦闘カテゴリ。
 /// `MovementType` をもとに Ground / Air / Sea に分類します。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1210,10 +1209,9 @@ pub fn compute_demand(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collections::HashMap;
     use crate::components::UnitStats;
     use crate::resources::{DamageChart, UnitRegistry};
-    use std::collections::HashMap;
-
     fn capability(
         faction: PlayerId,
         position: GridPosition,
@@ -1243,7 +1241,7 @@ mod tests {
     }
 
     fn make_registry_with(types: Vec<(UnitType, MovementType, u32, u32)>) -> UnitRegistry {
-        let mut map = HashMap::new();
+        let mut map = HashMap::default();
         for (ut, mt, ammo1, ammo2) in types {
             map.insert(
                 ut,
@@ -1299,7 +1297,7 @@ mod tests {
             &[GridPosition { x: 1, y: 0 }],
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             &chart,
         );
 
@@ -1346,7 +1344,7 @@ mod tests {
             &[GridPosition { x: 0, y: 0 }],
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             &chart,
         );
 
@@ -1396,7 +1394,7 @@ mod tests {
             &[GridPosition { x: 0, y: 0 }],
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             &chart,
         );
 
@@ -1446,7 +1444,7 @@ mod tests {
             &[GridPosition { x: 0, y: 0 }],
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             &chart,
         );
 
@@ -1496,7 +1494,7 @@ mod tests {
             &[GridPosition { x: 0, y: 0 }],
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             &chart,
         );
 
@@ -1544,7 +1542,7 @@ mod tests {
             &[GridPosition { x: 0, y: 0 }],
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             &chart,
         );
 
@@ -1590,7 +1588,7 @@ mod tests {
             &[GridPosition { x: 0, y: 0 }],
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             &chart,
         );
 
@@ -1652,7 +1650,7 @@ mod tests {
             &[GridPosition { x: 0, y: 0 }],
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             &chart,
         );
 
@@ -1733,7 +1731,7 @@ mod tests {
                 &[GridPosition { x: 0, y: 0 }],
                 &map,
                 &registry,
-                &HashMap::new(),
+                &HashMap::default(),
                 &chart,
             )
         };
@@ -1796,7 +1794,7 @@ mod tests {
             &targets,
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             &chart,
             &mut coverage,
         );
@@ -1868,7 +1866,7 @@ mod tests {
             &targets,
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             &chart,
             &mut coverage,
         );
@@ -1922,7 +1920,7 @@ mod tests {
             &targets,
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             &chart,
             &mut coverage,
         );
@@ -1986,7 +1984,7 @@ mod tests {
             &assessment,
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             &chart,
         );
 
@@ -2048,7 +2046,7 @@ mod tests {
             &[GridPosition { x: 0, y: 0 }],
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             &chart,
         );
 
@@ -2206,7 +2204,7 @@ mod tests {
             &assessment,
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             &chart,
         );
         assessment.apply_coverage(&contribution);
@@ -2276,7 +2274,7 @@ mod tests {
             &assessment,
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             &chart,
         );
 
@@ -2327,7 +2325,7 @@ mod tests {
             &assessment,
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             &chart,
         );
 
@@ -2378,7 +2376,7 @@ mod tests {
             &assessment,
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             &chart,
         );
 
@@ -2437,7 +2435,7 @@ mod tests {
                 &assessment,
                 &map,
                 &registry,
-                &HashMap::new(),
+                &HashMap::default(),
                 &chart,
             )
             .total
@@ -2451,7 +2449,7 @@ mod tests {
                 &assessment,
                 &map,
                 &registry,
-                &HashMap::new(),
+                &HashMap::default(),
                 &chart,
             )
             .total,
@@ -2502,7 +2500,7 @@ mod tests {
                 &assessment,
                 &map,
                 &registry,
-                &HashMap::new(),
+                &HashMap::default(),
                 &chart,
             )
             .total,

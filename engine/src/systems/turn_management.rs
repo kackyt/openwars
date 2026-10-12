@@ -1,9 +1,8 @@
+use crate::collections::HashSet;
 use crate::components::*;
 use crate::events::*;
 use crate::resources::*;
 use bevy_ecs::prelude::*;
-use std::collections::HashSet;
-
 /// 空母がターン開始時に搭載ユニットへ提供できる内部HP回復量です。
 const MAX_CARRIER_CARGO_REPAIR_HP: u32 = 20;
 const REPAIR_COST_DENOMINATOR: u64 = 100;
@@ -259,7 +258,7 @@ fn apply_carrier_cargo_service(world: &mut World, active_player_id: PlayerId) {
     };
     carriers.sort_by_key(|(entity, _)| entity.to_bits());
 
-    let mut processed_cargo = HashSet::new();
+    let mut processed_cargo = HashSet::default();
     for (carrier, cargo_entities) in carriers {
         for cargo in cargo_entities {
             if !processed_cargo.insert(cargo) {
@@ -342,7 +341,7 @@ fn apply_unit_resupply(
     )>,
 ) {
     // 補給可能な物件の座標を収集
-    let mut resupply_tiles = HashSet::new();
+    let mut resupply_tiles = HashSet::default();
     for (pos, prop) in q_properties.iter() {
         if prop.owner_id == Some(active_player_id)
             && (prop.terrain == Terrain::City

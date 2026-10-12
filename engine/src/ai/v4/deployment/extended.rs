@@ -440,7 +440,7 @@ mod tests {
         let mut manager = SquadManager::default();
 
         let reserved =
-            prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::new());
+            prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::default());
 
         // 占領済みの物件に占領任務を出し続けると、生産マス前の都市に歩兵が居座り
         // 後続の装甲が出撃できなくなる。任務は完了扱いで解放する。
@@ -469,7 +469,7 @@ mod tests {
         let mut manager = SquadManager::default();
 
         let reserved =
-            prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::new());
+            prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::default());
 
         assert!(reserved.contains(&attacker));
         let squad = manager
@@ -507,8 +507,12 @@ mod tests {
             }
             let mut manager = SquadManager::default();
 
-            let reserved =
-                prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::new());
+            let reserved = prepare_deployment_squads(
+                &mut world,
+                &mut manager,
+                PlayerId(1),
+                &HashSet::default(),
+            );
 
             assert!(reserved.contains(&attacker), "{path:?}");
             let squad = manager
@@ -532,7 +536,7 @@ mod tests {
             .intent
             .priority_enemies = vec![planned, anchor_nearest];
         let mut manager = SquadManager::default();
-        prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::new());
+        prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::default());
         assert_eq!(
             world
                 .resource::<V4DeploymentRegistry>()
@@ -637,7 +641,7 @@ mod tests {
                 &mut world,
                 &mut TerrainConnectivity::default(),
                 &deployment,
-                &HashMap::new(),
+                &HashMap::default(),
                 0,
             )
             .map(|target| target.0),

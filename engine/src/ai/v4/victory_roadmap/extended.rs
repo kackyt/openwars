@@ -791,10 +791,10 @@ mod tests {
                 phase: OperationPhase::Forming,
                 planned_completion_turn: None,
                 actual_completion_turn: None,
-                assigned_transports: HashSet::new(),
-                assigned_capturers: HashSet::new(),
-                assigned_combat: HashSet::new(),
-                combat_plan_ids: HashSet::new(),
+                assigned_transports: HashSet::default(),
+                assigned_capturers: HashSet::default(),
+                assigned_combat: HashSet::default(),
+                combat_plan_ids: HashSet::default(),
                 planned_suppression_turn: None,
                 execution: StepExecutionTotals::default(),
                 last_step: None,
@@ -1008,7 +1008,7 @@ mod tests {
             &secured,
             secured_anchor,
             vec![secured_anchor],
-            &HashSet::from([secured_anchor]),
+            &HashSet::from_iter([secured_anchor]),
         );
         registry.reconcile_observed_island(
             roadmap,
@@ -1017,7 +1017,7 @@ mod tests {
             &pending,
             pending_anchor,
             vec![pending_anchor],
-            &HashSet::new(),
+            &HashSet::default(),
         );
         registry.refresh_node_states(player);
 
@@ -1348,7 +1348,7 @@ mod tests {
             &assignment,
             StrategicPurpose::CaptureIsland,
             vec![GridPosition { x: 10, y: 10 }],
-            &HashSet::new(),
+            &HashSet::default(),
             OperationPhase::Forming,
         );
         let mut moved_anchor = assignment.clone();
@@ -1360,7 +1360,7 @@ mod tests {
             &moved_anchor,
             StrategicPurpose::CaptureIsland,
             vec![GridPosition { x: 12, y: 11 }],
-            &HashSet::new(),
+            &HashSet::default(),
             OperationPhase::Transit,
         );
 
@@ -1426,7 +1426,7 @@ mod tests {
             &assignment,
             purpose_for(&assignment, Some(capital)),
             assignment.capture_target_positions.clone(),
-            &HashSet::new(),
+            &HashSet::default(),
             OperationPhase::Forming,
         );
 
@@ -1536,9 +1536,9 @@ impl RoadmapTurnPlan {
     /// これは候補選択ではなく、TurnPlanをSquadReconcilerへ渡す直前の整合性検査である。
     /// 空のSquad集合はForming Operationを表すため許可する。
     fn is_consistent(&self) -> bool {
-        let mut operation_ids = HashSet::new();
-        let mut objectives = HashSet::new();
-        let mut squad_owners = HashMap::new();
+        let mut operation_ids = HashSet::default();
+        let mut objectives = HashSet::default();
+        let mut squad_owners = HashMap::default();
         self.directives.iter().all(|directive| {
             let unique_operation = operation_ids.insert(directive.operation_id);
             let unique_objective =
@@ -1835,10 +1835,10 @@ impl VictoryRoadmapRegistry {
                 phase: OperationPhase::Forming,
                 planned_completion_turn: None,
                 actual_completion_turn: None,
-                assigned_transports: HashSet::new(),
-                assigned_capturers: HashSet::new(),
-                assigned_combat: HashSet::new(),
-                combat_plan_ids: HashSet::new(),
+                assigned_transports: HashSet::default(),
+                assigned_capturers: HashSet::default(),
+                assigned_combat: HashSet::default(),
+                combat_plan_ids: HashSet::default(),
                 planned_suppression_turn: None,
                 execution: StepExecutionTotals::default(),
                 last_step: None,
@@ -1968,7 +1968,7 @@ impl VictoryRoadmapRegistry {
                 .get(&(player_id, island_id, StrategicOperationScope::Capital))
                 .copied()
         });
-        let mut dependencies = HashSet::new();
+        let mut dependencies = HashSet::default();
         let mut previous = None;
         if let Some(plan) = logistics_plan {
             for island_id in &plan.selected_islands {
@@ -2085,7 +2085,8 @@ impl VictoryRoadmapRegistry {
             .get(&player_id)
             .map(|roadmap| roadmap.dependencies.clone())
             .unwrap_or_default();
-        let mut predecessors = HashMap::<StrategicOperationId, Vec<StrategicOperationId>>::new();
+        let mut predecessors =
+            HashMap::<StrategicOperationId, Vec<StrategicOperationId>>::default();
         for edge in dependencies {
             predecessors
                 .entry(edge.successor)

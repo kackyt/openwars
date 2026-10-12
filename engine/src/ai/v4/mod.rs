@@ -31,6 +31,7 @@ use crate::ai::turn_distance::{
     ActionTurnDistanceCache, TerrainConnectivity, calculate_action_distance_to_range,
     calculate_action_distance_to_range_after_leaving_start,
 };
+use crate::collections::{HashMap, HashSet};
 use crate::components::{
     CargoCapacity, Faction, GridPosition, Health, PlayerId, Property, Transporting, UnitStats,
 };
@@ -58,7 +59,7 @@ use rolling_plan::{
     ProductionAttackProjection, RollingPlanInput, evaluate_fixed_package, plan_force_package,
     production_options,
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use trace::{
     CampaignTurnForecastTrace, EnemyProductionForecastTrace, ProductionDecision,
@@ -605,7 +606,7 @@ fn observe_plan_execution(world: &mut World, player_id: PlayerId, turn: u32) {
         })
         .unwrap_or_default();
 
-    let mut owned_properties = HashSet::new();
+    let mut owned_properties = HashSet::default();
     let mut property_query = world.query::<(&GridPosition, &Property)>();
     for (position, property) in property_query.iter(world) {
         if property.owner_id == Some(player_id) {
@@ -614,7 +615,7 @@ fn observe_plan_execution(world: &mut World, player_id: PlayerId, turn: u32) {
     }
 
     // 搭載中の敵も増援・残存目標として追うため、盤面走査の除外条件を使わない。
-    let mut enemy_health = HashMap::new();
+    let mut enemy_health = HashMap::default();
     let mut enemy_query = world.query::<(Entity, &Faction, &Health)>();
     for (entity, faction, health) in enemy_query.iter(world) {
         if faction.0 != player_id && health.current > 0 {
@@ -964,7 +965,7 @@ impl BoardScan {
                             )
                             .unwrap_or(usize::MAX),
                             logistics_rank: logistics_ranks.get(&assignment.island_id).copied(),
-                            forced_target_enemies: HashSet::new(),
+                            forced_target_enemies: HashSet::default(),
                             protected_capture_entities: assignment
                                 .capture_entities
                                 .iter()
@@ -985,7 +986,7 @@ impl BoardScan {
             .unwrap_or_default();
 
         // --- ユニットの走査 ---
-        let mut occupied = HashSet::new();
+        let mut occupied = HashSet::default();
         let mut my_units = Vec::new();
         let mut enemy_units = Vec::new();
         {
@@ -1038,7 +1039,7 @@ impl BoardScan {
             .and_then(|roadmap| roadmap.enemy_capital);
         {
             let mut q = world.query::<(&GridPosition, &Property)>();
-            let mut enemy_capitals = HashMap::new();
+            let mut enemy_capitals = HashMap::default();
             for (pos, prop) in q.iter(world) {
                 if prop.owner_id == Some(player_id) && prop.terrain == Terrain::Capital {
                     capital_pos = Some(*pos);
@@ -1241,8 +1242,8 @@ impl BoardScan {
                 logistics_rank: None,
                 // 同じ陸塊の全敵を強制対象にしない。局地Captureと首都のanchorへ
                 // 到着できる敵を最寄りOperationへ一意に割り当てる。
-                forced_target_enemies: HashSet::new(),
-                protected_capture_entities: HashSet::new(),
+                forced_target_enemies: HashSet::default(),
+                protected_capture_entities: HashSet::default(),
                 staging_anchor,
                 execution_authorized: capital_assault_authorized,
             });
@@ -1252,7 +1253,7 @@ impl BoardScan {
             current_turn: 0,
             opening_policy: None,
             capital_position: None,
-            property_entities: HashMap::new(),
+            property_entities: HashMap::default(),
             neutral_properties: Vec::new(),
             enemy_production_forecast: Default::default(),
             map,
@@ -1462,7 +1463,7 @@ fn build_operations(
             })
         })
         .collect::<Vec<_>>();
-    let empty_entity_set = HashSet::new();
+    let empty_entity_set = HashSet::default();
 
     scored
         .into_iter()
@@ -1760,7 +1761,7 @@ fn build_operation(
     // 「制空で応じるか対空で応じるか」が思想ではなく到達可能性の問題であるのと同じで、
     // 「敵の占領部隊を潰しに行けるか」もまた到達可能性の問題でしかない。
     let producible_movement_types: Vec<MovementType> = {
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         scan.available_types
             .iter()
             .map(|(_, stats)| stats.movement_type)
@@ -1954,7 +1955,7 @@ fn build_operation(
     // 輸送台帳も同じ原則で数える。輸送枠の採用条件は「その積荷をこの作戦地点へ
     // 届けられるか」なので、台帳も同じく `can_deliver_cargo` で数える。
     let cargo_movements: Vec<MovementType> = {
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         scan.available_types
             .iter()
             .filter(|(_, stats)| stats.can_capture)
@@ -2033,7 +2034,7 @@ fn build_operation(
         anchor,
         staging_anchor: anchor,
         execution_authorized: true,
-        protected_capture_entities: HashSet::new(),
+        protected_capture_entities: HashSet::default(),
         objective_properties: cluster.to_vec(),
         threat_horizon: anchor_index
             .and_then(|index| horizons.get(index).copied())
@@ -2167,7 +2168,7 @@ fn plan_production_with_registry(
     // 1体は1手番に1作戦しか遂行できない。過去のpriority enemyが移動して複数作戦へ
     // 分散しても、現在位置から最も近い1作戦だけへ既存Combat Entityを帰属させる。
     let mut committed_by_operation: HashMap<usize, HashMap<Entity, Option<plan_revision::PlanId>>> =
-        HashMap::new();
+        HashMap::default();
     for (&entity, assignment) in committed_combat_assignments {
         let Some(unit) = scan
             .my_units
@@ -2208,9 +2209,9 @@ fn plan_production_with_registry(
     let mut allocation = AllocationState::new(scan.funds);
     // rolling plannerは1作戦につき1回だけ実行し、その混成パッケージの当手番分を
     // 施設ごとに順次消費する。施設を1つ埋めるたびに同じbeam searchをやり直さない。
-    let mut rolling_plans: HashMap<usize, SelectedPlan> = HashMap::new();
-    let mut seen_plan_ids = HashSet::new();
-    let empty_committed_entities = HashSet::new();
+    let mut rolling_plans: HashMap<usize, SelectedPlan> = HashMap::default();
+    let mut seen_plan_ids = HashSet::default();
+    let empty_committed_entities = HashSet::default();
     let mut commands = Vec::new();
 
     loop {
@@ -2305,7 +2306,7 @@ fn plan_production_with_registry(
                     .as_ref()
                     .map(|(previous, evaluated)| {
                         if evaluated.is_ok() {
-                            return HashSet::new();
+                            return HashSet::default();
                         }
                         let mut due = previous
                             .purchases
@@ -2317,7 +2318,7 @@ fn plan_production_with_registry(
                             (purchase.facility.y, purchase.facility.x, purchase.cost)
                         });
                         let mut affordable_funds = input.current_funds;
-                        let mut conflicts = HashSet::new();
+                        let mut conflicts = HashSet::default();
                         for purchase in due {
                             let claimed_by_higher_priority =
                                 allocation.facility_owner(&purchase.facility).is_some_and(
@@ -2694,7 +2695,7 @@ fn enemy_reinforcement_assessment(
     let mut budget = 0_u32;
     let mut funded = 0_u32;
     let mut assessment = ReinforcementAssessment::default();
-    let mut reserved_counter_slots = HashSet::new();
+    let mut reserved_counter_slots = HashSet::default();
     let friendly_combat_types = scan
         .available_types
         .iter()
@@ -2708,7 +2709,7 @@ fn enemy_reinforcement_assessment(
         .collect::<HashSet<_>>();
 
     for build_turn in 1..horizon {
-        let mut projected_types = HashSet::new();
+        let mut projected_types = HashSet::default();
         let income = scan
             .enemy_income
             .min(scenario_budget.saturating_sub(funded));
@@ -2886,7 +2887,7 @@ fn contingency_reserve_now(
     contingencies: &[ReinforcementContingency],
     income_per_turn: u32,
 ) -> u32 {
-    let mut due_by_turn = HashMap::<u32, u32>::new();
+    let mut due_by_turn = HashMap::<u32, u32>::default();
     for contingency in contingencies {
         due_by_turn
             .entry(contingency.counter_build_turn)
@@ -3964,8 +3965,8 @@ mod tests {
             capture_eta: None,
             required_capture_survivors: 0,
             logistics_rank: Some(0),
-            forced_target_enemies: HashSet::new(),
-            protected_capture_entities: HashSet::new(),
+            forced_target_enemies: HashSet::default(),
+            protected_capture_entities: HashSet::default(),
             staging_anchor: anchor,
             execution_authorized: true,
         }]
@@ -3984,8 +3985,8 @@ mod tests {
             capture_eta: Some(3),
             required_capture_survivors: 1,
             logistics_rank: Some(0),
-            forced_target_enemies: HashSet::new(),
-            protected_capture_entities: HashSet::new(),
+            forced_target_enemies: HashSet::default(),
+            protected_capture_entities: HashSet::default(),
             staging_anchor: campaign_anchor,
             execution_authorized: true,
         }];
@@ -4018,8 +4019,8 @@ mod tests {
                 capture_eta: Some(3),
                 required_capture_survivors: 1,
                 logistics_rank: Some(0),
-                forced_target_enemies: HashSet::new(),
-                protected_capture_entities: HashSet::new(),
+                forced_target_enemies: HashSet::default(),
+                protected_capture_entities: HashSet::default(),
                 staging_anchor: local_anchor,
                 execution_authorized: true,
             },
@@ -4032,8 +4033,8 @@ mod tests {
                 capture_eta: None,
                 required_capture_survivors: 0,
                 logistics_rank: None,
-                forced_target_enemies: HashSet::new(),
-                protected_capture_entities: HashSet::new(),
+                forced_target_enemies: HashSet::default(),
+                protected_capture_entities: HashSet::default(),
                 staging_anchor: local_anchor,
                 execution_authorized: false,
             },
@@ -4150,7 +4151,7 @@ mod tests {
             current_turn: 0,
             opening_policy: None,
             capital_position: None,
-            property_entities: HashMap::new(),
+            property_entities: HashMap::default(),
             neutral_properties: Vec::new(),
             enemy_production_forecast: Default::default(),
             map: flat_map(20, 3).into(),
@@ -4205,8 +4206,8 @@ mod tests {
             &horizons,
             &[true, true],
             &[anchors[0]],
-            &HashSet::new(),
-            &HashSet::new(),
+            &HashSet::default(),
+            &HashSet::default(),
             2,
         );
         let far = build_operation(
@@ -4219,8 +4220,8 @@ mod tests {
             &horizons,
             &[true, true],
             &[anchors[1]],
-            &HashSet::new(),
-            &HashSet::new(),
+            &HashSet::default(),
+            &HashSet::default(),
             5,
         );
 
@@ -4234,7 +4235,7 @@ mod tests {
         let foreign_entity = Entity::from_raw(901);
         let legacy_entity = Entity::from_raw(902);
         let own_plan = plan_revision::PlanId(7);
-        let assignments = HashMap::from([
+        let assignments = HashMap::from_iter([
             (own_entity, Some(own_plan)),
             (foreign_entity, Some(plan_revision::PlanId(8))),
             (legacy_entity, None),
@@ -4246,7 +4247,7 @@ mod tests {
         );
         assert_eq!(
             committed_entities_for_plan(Some(&assignments), Some(own_plan)),
-            HashSet::from([own_entity])
+            HashSet::from_iter([own_entity])
         );
     }
 
@@ -4265,8 +4266,8 @@ mod tests {
             capture_eta: None,
             required_capture_survivors: 2,
             logistics_rank: Some(0),
-            forced_target_enemies: HashSet::new(),
-            protected_capture_entities: HashSet::new(),
+            forced_target_enemies: HashSet::default(),
+            protected_capture_entities: HashSet::default(),
             staging_anchor: anchor,
             execution_authorized: true,
         }];
@@ -4283,8 +4284,8 @@ mod tests {
             &scan,
             &mut ctx,
             operation,
-            &HashSet::new(),
-            &HashSet::new(),
+            &HashSet::default(),
+            &HashSet::default(),
             scan.funds,
             false,
         )
@@ -4354,8 +4355,8 @@ mod tests {
                 capture_eta: None,
                 required_capture_survivors: 0,
                 logistics_rank: None,
-                forced_target_enemies: HashSet::new(),
-                protected_capture_entities: HashSet::new(),
+                forced_target_enemies: HashSet::default(),
+                protected_capture_entities: HashSet::default(),
                 staging_anchor: pos(0, 2),
                 execution_authorized: false,
             },
@@ -4368,8 +4369,8 @@ mod tests {
                 capture_eta: Some(4),
                 required_capture_survivors: 3,
                 logistics_rank: Some(0),
-                forced_target_enemies: HashSet::new(),
-                protected_capture_entities: HashSet::new(),
+                forced_target_enemies: HashSet::default(),
+                protected_capture_entities: HashSet::default(),
                 staging_anchor: capture,
                 execution_authorized: true,
             },
@@ -4627,7 +4628,7 @@ mod tests {
             current_turn: 0,
             opening_policy: None,
             capital_position: None,
-            property_entities: HashMap::new(),
+            property_entities: HashMap::default(),
             neutral_properties: Vec::new(),
             enemy_production_forecast: Default::default(),
             map: flat_map(10, 3).into(),
@@ -4673,7 +4674,7 @@ mod tests {
             capital_staging_anchor: None,
         };
 
-        let (commands, trace) = plan_production(&scan, PlayerId(1), false, &HashMap::new());
+        let (commands, trace) = plan_production(&scan, PlayerId(1), false, &HashMap::default());
 
         // 占領役を1体確保してもCombat計画を消さず、65%攻撃を何回実行できるかを
         // シミュレーションした攻撃列を保持する。実弾薬では1機が6回攻撃して
@@ -4721,7 +4722,7 @@ mod tests {
             anchor: pos(0, 0),
             staging_anchor: pos(0, 0),
             execution_authorized: true,
-            protected_capture_entities: HashSet::new(),
+            protected_capture_entities: HashSet::default(),
             objective_properties: vec![pos(0, 0)],
             threat_horizon: 0,
             facts: OperationFacts::default(),
@@ -4797,7 +4798,7 @@ mod tests {
             current_turn: 0,
             opening_policy: None,
             capital_position: None,
-            property_entities: HashMap::new(),
+            property_entities: HashMap::default(),
             neutral_properties: Vec::new(),
             enemy_production_forecast: Default::default(),
             map: strait_map(Some(Terrain::Shoal)).into(),
@@ -4865,8 +4866,8 @@ mod tests {
             &horizons,
             &[true, true],
             &[anchors[1]],
-            &HashSet::new(),
-            &HashSet::new(),
+            &HashSet::default(),
+            &HashSet::default(),
             3,
         );
 
@@ -4907,8 +4908,8 @@ mod tests {
             &[5],
             &[true],
             &[anchor],
-            &HashSet::new(),
-            &HashSet::new(),
+            &HashSet::default(),
+            &HashSet::default(),
             3,
         );
 
@@ -4951,8 +4952,8 @@ mod tests {
             &[5],
             &[true],
             &[anchor],
-            &HashSet::new(),
-            &HashSet::new(),
+            &HashSet::default(),
+            &HashSet::default(),
             3,
         );
 
@@ -4978,7 +4979,7 @@ mod tests {
             current_turn: 0,
             opening_policy: None,
             capital_position: None,
-            property_entities: HashMap::new(),
+            property_entities: HashMap::default(),
             neutral_properties: Vec::new(),
             enemy_production_forecast: Default::default(),
             map: flat_map(9, 5).into(),
@@ -5026,7 +5027,7 @@ mod tests {
             &scan,
             &mut ctx,
             SlotKind::Capture,
-            &HashSet::new(),
+            &HashSet::default(),
             constraints,
             |_, facility, stats| {
                 evaluated.push((*facility, stats.unit_type));
@@ -5059,7 +5060,7 @@ mod tests {
             &scan,
             &mut ctx,
             SlotKind::Capture,
-            &HashSet::new(),
+            &HashSet::default(),
             CandidateConstraints {
                 remaining_funds: 1000,
                 per_slot_budget: 10000,
@@ -5074,7 +5075,7 @@ mod tests {
         assert_eq!(selected.unit_type, UnitType::Infantry);
 
         // 使用済み施設は飛ばし、厳密に良い施設だけが先頭候補を置き換える
-        let used = HashSet::from([pos(1, 1)]);
+        let used = HashSet::from_iter([pos(1, 1)]);
         let selected = select_candidate_by(
             &scan,
             &mut ctx,
@@ -5367,7 +5368,7 @@ mod tests {
             current_turn: 0,
             opening_policy: None,
             capital_position: None,
-            property_entities: HashMap::new(),
+            property_entities: HashMap::default(),
             neutral_properties: Vec::new(),
             enemy_production_forecast: Default::default(),
             map: flat_map(9, 5).into(),
@@ -5460,7 +5461,7 @@ mod tests {
             current_turn: 0,
             opening_policy: None,
             capital_position: None,
-            property_entities: HashMap::new(),
+            property_entities: HashMap::default(),
             neutral_properties: Vec::new(),
             enemy_production_forecast: Default::default(),
             map: map.into(),
@@ -5497,7 +5498,7 @@ mod tests {
             capital_staging_anchor: None,
         };
 
-        let (commands, trace) = plan_production(&scan, PlayerId(1), false, &HashMap::new());
+        let (commands, trace) = plan_production(&scan, PlayerId(1), false, &HashMap::default());
 
         assert_eq!(commands.len(), 1, "commands={commands:?}, trace={trace:?}");
         assert_eq!(commands[0].unit_type, UnitType::Fighter);
@@ -5513,7 +5514,7 @@ mod tests {
     #[test]
     fn multi_factory_plan_switches_after_air_threat_is_covered() {
         let scan = mixed_threat_multi_factory_scan();
-        let (commands, trace) = plan_production(&scan, PlayerId(0), true, &HashMap::new());
+        let (commands, trace) = plan_production(&scan, PlayerId(0), true, &HashMap::default());
         let combat_types: Vec<UnitType> = commands
             .iter()
             .map(|command| command.unit_type)
@@ -5536,7 +5537,7 @@ mod tests {
         scan.enemy_income = 10_000;
         scan.enemy_production_slots = 1;
 
-        let (commands, trace) = plan_production(&scan, PlayerId(0), true, &HashMap::new());
+        let (commands, trace) = plan_production(&scan, PlayerId(0), true, &HashMap::default());
 
         assert!(
             commands
@@ -5557,7 +5558,7 @@ mod tests {
     #[test]
     fn production_trace_attributes_every_command_to_a_slot() {
         let scan = multi_factory_scan();
-        let (commands, trace) = plan_production(&scan, PlayerId(0), true, &HashMap::new());
+        let (commands, trace) = plan_production(&scan, PlayerId(0), true, &HashMap::default());
 
         // 作戦が立つ盤面なので fallback には落ちない
         assert!(!trace.fallback);
@@ -5624,8 +5625,8 @@ mod tests {
             &horizons,
             &[true, true],
             &[anchors[1]],
-            &HashSet::new(),
-            &HashSet::new(),
+            &HashSet::default(),
+            &HashSet::default(),
             3,
         );
 

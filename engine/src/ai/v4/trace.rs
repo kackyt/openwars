@@ -13,11 +13,10 @@
 use super::operation::{OperationKind, OperationSlots, SlotKind};
 use super::plan_revision::{PlanDisposition, PlanId, PlanRevision, ReplanReason};
 use crate::ai::production::demand::UnfilledReason;
+use crate::collections::HashMap;
 use crate::components::{GridPosition, PlayerId};
 use crate::resources::UnitType;
 use bevy_ecs::prelude::*;
-use std::collections::HashMap;
-
 /// 1 枠分の購入判断の結末。
 #[derive(Debug, Clone)]
 pub enum ProductionDecision {
@@ -216,7 +215,7 @@ impl ProductionPlanTrace {
     /// 実際に発注されたユニット種別ごとの体数。
     /// 「工場数 × ターン数に張り付いていないか」の判定に使う。
     pub fn produced_counts(&self) -> HashMap<UnitType, usize> {
-        let mut counts = HashMap::new();
+        let mut counts = HashMap::default();
         for step in &self.steps {
             if let ProductionDecision::Produced { unit_type, .. } = &step.decision {
                 *counts.entry(*unit_type).or_insert(0) += 1;

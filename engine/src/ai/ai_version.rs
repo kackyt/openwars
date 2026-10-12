@@ -1,7 +1,6 @@
+use crate::collections::HashMap;
 use crate::components::PlayerId;
 use bevy_ecs::prelude::*;
-use std::collections::HashMap;
-
 /// AIのバージョンを表すEnum。
 /// 評価や意思決定アルゴリズムを新旧で切り替えるために使用します。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -59,7 +58,7 @@ impl PlayerAiSettings {
     /// 新しい PlayerAiSettings を初期化します。
     pub fn new() -> Self {
         Self {
-            versions: HashMap::new(),
+            versions: HashMap::default(),
         }
     }
 

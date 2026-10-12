@@ -1,11 +1,10 @@
 use crate::ai::islands::IslandId;
 use crate::ai::squad::{MissionPhase, MissionType, SquadId, SquadManager};
+use crate::collections::HashMap;
 use crate::components::{GridPosition, PlayerId};
 use crate::events::{ProduceUnitCommand, UnitProducedEvent};
 use crate::resources::UnitType;
 use bevy_ecs::prelude::*;
-use std::collections::HashMap;
-
 /// 島作戦のために発注したunitの役割。汎用生産へ目的を漏らさず、実Entityまで引き継ぐ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum CampaignProductionRole {

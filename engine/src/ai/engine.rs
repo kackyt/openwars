@@ -3,6 +3,7 @@
 #![allow(clippy::unnecessary_map_or)]
 
 use crate::ai::turn_distance::{TurnDistanceCache, calculate_turn_distance};
+use crate::collections::{HashMap, HashSet};
 use crate::components::{
     ActionCompleted, Faction, GridPosition, HasMoved, Health, PlayerId, Property, UnitStats,
 };
@@ -12,8 +13,7 @@ use crate::resources::{GridTopology, Map, Terrain, UnitType};
 use crate::systems::combat::get_expected_damage;
 use crate::systems::movement::{OccupantInfo, calculate_reachable_tiles, get_valid_movement_cost};
 use bevy_ecs::prelude::*;
-use std::collections::{HashMap, HashSet, VecDeque};
-
+use std::collections::VecDeque;
 #[derive(Debug, Clone, Copy)]
 struct TacticalSnapshotUnit {
     entity: Entity,
@@ -49,8 +49,8 @@ impl AiTacticalSnapshot {
         topology: GridTopology,
     ) -> Self {
         let mut units = Vec::new();
-        let mut unit_indices = HashMap::new();
-        let mut units_by_position: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+        let mut unit_indices = HashMap::default();
+        let mut units_by_position: HashMap<(usize, usize), Vec<usize>> = HashMap::default();
         {
             let mut query = world.query::<(
                 Entity,
@@ -339,7 +339,7 @@ fn issue_production_command(
     if let Some(mut cooldown) = world.get_resource_mut::<AiProductionCooldown>() {
         cooldown.0.insert((command.target_x, command.target_y));
     } else {
-        world.insert_resource(AiProductionCooldown(HashSet::from([(
+        world.insert_resource(AiProductionCooldown(HashSet::from_iter([(
             command.target_x,
             command.target_y,
         )])));
@@ -629,11 +629,11 @@ fn air_move_preserves_return_fuel(
 pub fn decide_ai_action(
     world: &mut World,
     player_id: PlayerId,
-    skip_entities: &std::collections::HashSet<Entity>,
+    skip_entities: &crate::collections::HashSet<Entity>,
 ) -> Option<(Entity, AiCommand)> {
     // 1. 行動可能なユニットを収集
     let mut movable_units = Vec::new();
-    let mut unit_positions = HashMap::new();
+    let mut unit_positions = HashMap::default();
     {
         let mut query = world.query::<(
             Entity,
@@ -1492,7 +1492,7 @@ pub fn execute_ai_turn_v1(world: &mut World, active_player: PlayerId) -> Option<
     // 1. ユニット行動を1つ決定・実行
     // AI思考ループの中で、エンジン側のフラグが更新されるのを待たずに
     // 同一フレーム内の重複思考を避けるために、リソースで「指示済みユニット」を管理します。
-    let mut skip_entities = std::collections::HashSet::new();
+    let mut skip_entities = crate::collections::HashSet::default();
     if let Some(res) = world.get_resource::<AiActionCooldown>() {
         skip_entities = res.0.clone();
     }
@@ -1519,7 +1519,7 @@ pub fn execute_ai_turn_v1(world: &mut World, active_player: PlayerId) -> Option<
     crate::ai::planner::assign_transport_missions(world, active_player);
 
     // ミッションに関与している全Entity（輸送機と歩兵）を収集し、通常の意思決定から完全に除外する
-    let mut mission_entities = std::collections::HashSet::new();
+    let mut mission_entities = crate::collections::HashSet::default();
     if let Some(manager) = world.get_resource::<crate::ai::missions::TransportMissionManager>() {
         for m in &manager.missions {
             if world
@@ -1569,7 +1569,7 @@ pub fn execute_ai_turn_v1(world: &mut World, active_player: PlayerId) -> Option<
         if let Some(mut res) = world.get_resource_mut::<AiActionCooldown>() {
             res.0.insert(entity);
         } else {
-            let mut set = std::collections::HashSet::new();
+            let mut set = crate::collections::HashSet::default();
             set.insert(entity);
             world.insert_resource(AiActionCooldown(set));
         }
@@ -1588,7 +1588,7 @@ pub fn execute_ai_turn_v1(world: &mut World, active_player: PlayerId) -> Option<
         if let Some(mut res) = world.get_resource_mut::<AiActionCooldown>() {
             res.0.insert(entity);
         } else {
-            let mut set = std::collections::HashSet::new();
+            let mut set = crate::collections::HashSet::default();
             set.insert(entity);
             world.insert_resource(AiActionCooldown(set));
         }
@@ -1601,7 +1601,7 @@ pub fn execute_ai_turn_v1(world: &mut World, active_player: PlayerId) -> Option<
     let cooldown_set = if let Some(res) = world.get_resource::<AiProductionCooldown>() {
         res.0.clone()
     } else {
-        HashSet::new()
+        HashSet::default()
     };
 
     // 診断情報を取得（前回のエラーを確認）
@@ -1636,7 +1636,7 @@ pub fn execute_ai_turn_v1(world: &mut World, active_player: PlayerId) -> Option<
             if let Some(mut res) = world.get_resource_mut::<AiProductionCooldown>() {
                 res.0.insert((cmd.target_x, cmd.target_y));
             } else {
-                let mut set = HashSet::new();
+                let mut set = HashSet::default();
                 set.insert((cmd.target_x, cmd.target_y));
                 world.insert_resource(AiProductionCooldown(set));
             }
@@ -1672,7 +1672,7 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     if path == crate::ai::code_path::CodePath::Extended {
         return extended::execute_ai_turn_v2(world, active_player);
     }
-    let mut skip_entities = std::collections::HashSet::new();
+    let mut skip_entities = crate::collections::HashSet::default();
     if let Some(res) = world.get_resource::<AiActionCooldown>() {
         skip_entities = res.0.clone();
     }
@@ -1754,7 +1754,7 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
             if let Some(mut cooldown) = world.get_resource_mut::<AiActionCooldown>() {
                 cooldown.0.insert(entity);
             } else {
-                world.insert_resource(AiActionCooldown(HashSet::from([entity])));
+                world.insert_resource(AiActionCooldown(HashSet::from_iter([entity])));
             }
             return Some(command_text);
         }
@@ -1828,7 +1828,7 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
                 res.0.insert(cargo_entity);
             }
         } else {
-            let mut set = std::collections::HashSet::new();
+            let mut set = crate::collections::HashSet::default();
             if !transport_can_continue_drop {
                 set.insert(entity);
             }
@@ -1865,7 +1865,7 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
         if let Some(mut res) = world.get_resource_mut::<AiActionCooldown>() {
             res.0.insert(entity);
         } else {
-            let mut set = std::collections::HashSet::new();
+            let mut set = crate::collections::HashSet::default();
             set.insert(entity);
             world.insert_resource(AiActionCooldown(set));
         }
@@ -1885,7 +1885,7 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
             if let Some(mut cooldown) = world.get_resource_mut::<AiActionCooldown>() {
                 cooldown.0.insert(entity);
             } else {
-                world.insert_resource(AiActionCooldown(HashSet::from([entity])));
+                world.insert_resource(AiActionCooldown(HashSet::from_iter([entity])));
             }
             return Some(command_text);
         }
@@ -1901,7 +1901,7 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
             if let Some(mut cooldown) = world.get_resource_mut::<AiActionCooldown>() {
                 cooldown.0.insert(entity);
             } else {
-                world.insert_resource(AiActionCooldown(HashSet::from([entity])));
+                world.insert_resource(AiActionCooldown(HashSet::from_iter([entity])));
             }
             return Some(command_text);
         }
@@ -1910,7 +1910,7 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
     let cooldown_set = if let Some(res) = world.get_resource::<AiProductionCooldown>() {
         res.0.clone()
     } else {
-        HashSet::new()
+        HashSet::default()
     };
 
     let (last_error, last_event_str) =
@@ -1942,7 +1942,7 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
         if let Some(mut cooldown) = world.get_resource_mut::<AiProductionCooldown>() {
             cooldown.0.insert((cmd.target_x, cmd.target_y));
         } else {
-            world.insert_resource(AiProductionCooldown(HashSet::from([(
+            world.insert_resource(AiProductionCooldown(HashSet::from_iter([(
                 cmd.target_x,
                 cmd.target_y,
             )])));
@@ -1976,7 +1976,7 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
             if let Some(mut res) = world.get_resource_mut::<AiProductionCooldown>() {
                 res.0.insert((cmd.target_x, cmd.target_y));
             } else {
-                let mut set = HashSet::new();
+                let mut set = HashSet::default();
                 set.insert((cmd.target_x, cmd.target_y));
                 world.insert_resource(AiProductionCooldown(set));
             }
@@ -2192,8 +2192,8 @@ fn decide_forming_campaign_site_relief(
     forming_groups
         .sort_by_key(|(entities, _)| entities.first().map_or(u64::MAX, |entity| entity.to_bits()));
 
-    let mut occupied = HashSet::new();
-    let mut unit_positions = HashMap::new();
+    let mut occupied = HashSet::default();
+    let mut unit_positions = HashMap::default();
     for entity_ref in world.iter_entities() {
         if entity_ref
             .get::<crate::components::Transporting>()
@@ -2447,14 +2447,14 @@ fn campaign_mission_allows_capture(mission: &crate::ai::squad::MissionType) -> b
 pub fn decide_ai_action_v2(
     world: &mut World,
     player_id: PlayerId,
-    skip_entities: &std::collections::HashSet<Entity>,
+    skip_entities: &crate::collections::HashSet<Entity>,
 ) -> Option<(Entity, AiCommand)> {
     // V3 の戦術評価 (#44/#45/#50) を有効にするかどうか
     let is_v3 = crate::ai::resolve_player_ai_version(world, player_id).uses_v3_tactics();
 
     // 1. 行動可能なユニットを収集
     let mut movable_units = Vec::new();
-    let mut unit_positions = HashMap::new();
+    let mut unit_positions = HashMap::default();
     {
         let mut query = world.query::<(
             Entity,
@@ -2514,9 +2514,9 @@ pub fn decide_ai_action_v2(
         .get_resource::<crate::ai::squad::SquadManager>()
         .cloned()
         .unwrap_or_default();
-    let mut unit_squad_targets = HashMap::new();
-    let mut unit_squad_missions = HashMap::new();
-    let mut solo_fallbacks = HashSet::new();
+    let mut unit_squad_targets = HashMap::default();
+    let mut unit_squad_missions = HashMap::default();
+    let mut solo_fallbacks = HashSet::default();
 
     for squad in &manager.squads {
         for &member in &squad.members {
@@ -3497,7 +3497,7 @@ mod tests {
         let _ = calculate_turn_distance(
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             (0, 0),
             (3, 0),
             crate::resources::MovementType::Infantry,
@@ -3546,7 +3546,7 @@ mod tests {
         let mut world = World::new();
         let first_cargo = world.spawn_empty().id();
         let second_cargo = world.spawn_empty().id();
-        let unit_costs = HashMap::from([(first_cargo, 1000), (second_cargo, 3000)]);
+        let unit_costs = HashMap::from_iter([(first_cargo, 1000), (second_cargo, 3000)]);
         let cargo = crate::components::CargoCapacity {
             max: 2,
             loaded: vec![first_cargo, second_cargo],
@@ -3667,7 +3667,7 @@ mod tests {
         world.insert_resource(manager);
 
         let (entity, command) =
-            decide_forming_campaign_site_relief(&mut world, player, &HashSet::new(), false)
+            decide_forming_campaign_site_relief(&mut world, player, &HashSet::default(), false)
                 .expect("Forming transport must vacate the airport while waiting");
         assert_eq!(entity, transport);
         let AiCommand::Wait { target_pos } = command else {
@@ -3737,7 +3737,7 @@ mod tests {
         world.insert_resource(crate::ai::squad::SquadManager::new());
 
         let (entity, command) =
-            decide_forming_campaign_site_relief(&mut world, player, &HashSet::new(), false)
+            decide_forming_campaign_site_relief(&mut world, player, &HashSet::default(), false)
                 .expect("未割当の空輸送役も空港を退避する");
 
         assert_eq!(entity, transport);
@@ -3818,12 +3818,12 @@ mod tests {
         let (mut world, player, attacker) = stalled_attack_world(false);
 
         assert!(
-            decide_forming_campaign_site_relief(&mut world, player, &HashSet::new(), false)
+            decide_forming_campaign_site_relief(&mut world, player, &HashSet::default(), false)
                 .is_none(),
             "通常作戦より前の退避処理はAttack任務を奪わない"
         );
         let (entity, command) =
-            decide_forming_campaign_site_relief(&mut world, player, &HashSet::new(), true)
+            decide_forming_campaign_site_relief(&mut world, player, &HashSet::default(), true)
                 .expect("通常行動に失敗したAttack unitは工場を退避する");
 
         assert_eq!(entity, attacker);
@@ -3844,7 +3844,7 @@ mod tests {
             let _guard = crate::ai::code_path::enter(path);
             let (mut world, player, attacker) = stalled_attack_world(true);
             let (entity, command) =
-                decide_forming_campaign_site_relief(&mut world, player, &HashSet::new(), true)
+                decide_forming_campaign_site_relief(&mut world, player, &HashSet::default(), true)
                     .expect("停滞したAttack unitは工場を退避する");
 
             assert_eq!(entity, attacker);
@@ -3914,7 +3914,7 @@ mod tests {
             .id();
 
         let (entity, command) =
-            decide_ai_action_v2(&mut world, player, &HashSet::new()).expect("行動を選ぶこと");
+            decide_ai_action_v2(&mut world, player, &HashSet::default()).expect("行動を選ぶこと");
         assert_eq!(entity, aircraft);
         let AiCommand::Wait { target_pos } = command else {
             panic!("敵がいないため移動Waitを選ぶこと");
@@ -4012,7 +4012,7 @@ mod tests {
     #[test]
     fn test_decide_ai_action_no_units() {
         let mut world = World::new();
-        let skips = std::collections::HashSet::new();
+        let skips = crate::collections::HashSet::default();
         assert!(decide_ai_action(&mut world, PlayerId(1), &skips).is_none());
     }
 
@@ -4121,7 +4121,7 @@ mod tests {
         ));
 
         // Since there is no enemy to attack and no property to capture, it should return Wait.
-        let skips = std::collections::HashSet::new();
+        let skips = crate::collections::HashSet::default();
         let action = decide_ai_action(&mut world, PlayerId(1), &skips);
         assert!(action.is_some());
         if let Some((_, AiCommand::Wait { .. })) = action {
@@ -4207,7 +4207,7 @@ mod tests {
             },
         ));
 
-        let skips = std::collections::HashSet::new();
+        let skips = crate::collections::HashSet::default();
         let action = decide_ai_action(&mut world, p1, &skips);
         assert!(action.is_some());
         if let Some((entity, AiCommand::Attack { target_entity, .. })) = action {
@@ -4270,7 +4270,7 @@ mod tests {
         ));
 
         let p1 = PlayerId(1);
-        let skips = std::collections::HashSet::new();
+        let skips = crate::collections::HashSet::default();
         let action = decide_ai_action(&mut world, p1, &skips);
         assert!(action.is_some());
         if let Some((entity, AiCommand::Capture { .. })) = action {
@@ -4352,7 +4352,7 @@ mod tests {
             },
         ));
 
-        let skips = std::collections::HashSet::new();
+        let skips = crate::collections::HashSet::default();
         let action = decide_ai_action(&mut world, p1, &skips);
 
         assert!(action.is_some());
@@ -4432,7 +4432,7 @@ mod tests {
             },
         ));
 
-        let skips = std::collections::HashSet::new();
+        let skips = crate::collections::HashSet::default();
         let action = decide_ai_action(&mut world, p1, &skips);
 
         let (_, cmd) = action.expect("some action must be chosen");
@@ -4522,7 +4522,7 @@ mod tests {
             },
         ));
 
-        let skips = std::collections::HashSet::new();
+        let skips = crate::collections::HashSet::default();
         let action = decide_ai_action(&mut world, p1, &skips);
 
         assert!(action.is_some());
@@ -4610,7 +4610,7 @@ mod tests {
             ))
             .id();
 
-        let skips = std::collections::HashSet::new();
+        let skips = crate::collections::HashSet::default();
         let action = decide_ai_action(&mut world, p1, &skips);
 
         assert!(action.is_some());
@@ -4699,7 +4699,7 @@ mod tests {
             .entity_mut(inf)
             .insert(crate::components::Transporting(transport));
 
-        let skips = std::collections::HashSet::new();
+        let skips = crate::collections::HashSet::default();
         let action = decide_ai_action(&mut world, p1, &skips);
 
         assert!(action.is_some());
@@ -4755,7 +4755,7 @@ mod tests {
             },
         ));
 
-        let skips = std::collections::HashSet::new();
+        let skips = crate::collections::HashSet::default();
         let action = decide_ai_action(&mut world, p1, &skips);
 
         assert!(action.is_some());
@@ -4836,7 +4836,7 @@ mod tests {
             ))
             .id();
 
-        let skips = std::collections::HashSet::new();
+        let skips = crate::collections::HashSet::default();
         let action = decide_ai_action(&mut world, p1, &skips);
 
         assert!(action.is_some());
@@ -4918,7 +4918,7 @@ mod tests {
             ))
             .id();
 
-        let action = decide_ai_action(&mut world, player, &std::collections::HashSet::new());
+        let action = decide_ai_action(&mut world, player, &crate::collections::HashSet::default());
 
         assert!(
             !matches!(
@@ -4960,7 +4960,8 @@ mod tests {
             .id();
         insert_single_unit_squad(&mut world, source, GridPosition { x: 1, y: 0 });
 
-        let action = decide_ai_action_v2(&mut world, player, &std::collections::HashSet::new());
+        let action =
+            decide_ai_action_v2(&mut world, player, &crate::collections::HashSet::default());
 
         assert!(
             !matches!(
@@ -5025,7 +5026,7 @@ mod tests {
             },
         ));
 
-        let skips = std::collections::HashSet::new();
+        let skips = crate::collections::HashSet::default();
         let action = decide_ai_action(&mut world, p1, &skips);
 
         assert!(action.is_some());
@@ -5087,7 +5088,7 @@ mod tests {
             .id();
 
         // 4. AIに行動を決定させる
-        let skips = std::collections::HashSet::new();
+        let skips = crate::collections::HashSet::default();
         let action = decide_ai_action(&mut world, p1, &skips);
 
         // 5. 検証: 輸送ヘリが首都（x=0）の方向に移動しようとしていること
@@ -5179,7 +5180,7 @@ mod tests {
         // (1,1) にいる歩兵は海に隣接するマス（例: (0,1), (1,0), (1,2), (2,1)）のいずれかに移動して待機するはず。
         // なぜなら (1,1) は海に隣接しておらず、海までの距離が2だが、
         // 周囲4マスは海に隣接しており距離1だからである。
-        let skips = std::collections::HashSet::new();
+        let skips = crate::collections::HashSet::default();
         let action = decide_ai_action(&mut world, p1, &skips);
         assert!(action.is_some());
         if let Some((entity, AiCommand::Wait { target_pos })) = action {
@@ -5346,7 +5347,7 @@ mod tests {
         world.insert_resource(manager);
 
         // クールダウン用のリソースを登録
-        world.insert_resource(AiActionCooldown(std::collections::HashSet::new()));
+        world.insert_resource(AiActionCooldown(crate::collections::HashSet::default()));
 
         // 4. execute_ai_turn を呼び出す (1回目)
         // ミッション優先実行により、ヘリが歩兵(3,0)へ向かうコマンドが実行され、Someが返るはず。
@@ -5509,7 +5510,7 @@ mod tests {
     fn v1_prioritizes_transport_with_loaded_combat_value() {
         let (mut world, _, _, loaded_transport) = setup_strategic_target_selection_world();
 
-        let (_, action) = decide_ai_action(&mut world, PlayerId(1), &HashSet::new())
+        let (_, action) = decide_ai_action(&mut world, PlayerId(1), &HashSet::default())
             .expect("V1が攻撃行動を選ぶこと");
 
         assert!(matches!(
@@ -5522,7 +5523,7 @@ mod tests {
     fn v3_prioritizes_transport_with_loaded_combat_value() {
         let (mut world, _, _, loaded_transport) = setup_strategic_target_selection_world();
 
-        let (_, action) = decide_ai_action_v2(&mut world, PlayerId(1), &HashSet::new())
+        let (_, action) = decide_ai_action_v2(&mut world, PlayerId(1), &HashSet::default())
             .expect("V3が攻撃行動を選ぶこと");
 
         assert!(matches!(
@@ -5539,7 +5540,7 @@ mod tests {
         deployments.assign_target_for_test(PlayerId(1), attacker, assigned_target);
         world.insert_resource(deployments);
 
-        let (_, action) = decide_ai_action_v2(&mut world, PlayerId(1), &HashSet::new())
+        let (_, action) = decide_ai_action_v2(&mut world, PlayerId(1), &HashSet::default())
             .expect("V4の局地任務ユニットが攻撃行動を選ぶこと");
 
         assert!(matches!(
@@ -5572,7 +5573,7 @@ mod tests {
         deployments.assign_target_for_test(PlayerId(1), attacker, bad_mission_target);
         world.insert_resource(deployments);
 
-        let (_, action) = decide_ai_action_v2(&mut world, PlayerId(1), &HashSet::new())
+        let (_, action) = decide_ai_action_v2(&mut world, PlayerId(1), &HashSet::default())
             .expect("V4の局地任務ユニットが攻撃行動を選ぶこと");
 
         assert!(
@@ -5616,7 +5617,7 @@ mod tests {
         deployments.assign_target_for_test(PlayerId(1), attacker, bad_mission_target);
         world.insert_resource(deployments);
 
-        let (_, action) = decide_ai_action_v2(&mut world, PlayerId(1), &HashSet::new())
+        let (_, action) = decide_ai_action_v2(&mut world, PlayerId(1), &HashSet::default())
             .expect("実行段階の作戦対象には必要攻撃を選ぶこと");
 
         assert!(matches!(
@@ -5739,7 +5740,7 @@ mod tests {
                 (id, snapshot)
             };
             let sentinel = world.spawn_empty().id();
-            world.insert_resource(AiActionCooldown(HashSet::from([sentinel])));
+            world.insert_resource(AiActionCooldown(HashSet::from_iter([sentinel])));
 
             let result_b = execute_ai_turn(&mut world, player_b);
             assert!(result_b.is_some());
@@ -5886,7 +5887,7 @@ mod tests {
                 },
             ));
 
-            let skips = std::collections::HashSet::new();
+            let skips = crate::collections::HashSet::default();
             let action =
                 decide_ai_action_v2(&mut world, PlayerId(1), &skips).expect("行動が決定されること");
             match action.1 {
@@ -5963,7 +5964,7 @@ mod tests {
                 },
             ));
 
-            let skips = std::collections::HashSet::new();
+            let skips = crate::collections::HashSet::default();
             let action =
                 decide_ai_action_v2(&mut world, PlayerId(1), &skips).expect("行動が決定されること");
             match action.1 {
@@ -6042,7 +6043,7 @@ mod tests {
             // 部隊目標は敵戦車の位置
             insert_single_unit_squad(&mut world, sp_gun, GridPosition { x: 5, y: 0 });
 
-            let skips = std::collections::HashSet::new();
+            let skips = crate::collections::HashSet::default();
             let action =
                 decide_ai_action_v2(&mut world, PlayerId(1), &skips).expect("行動が決定されること");
             match action.1 {
@@ -6126,7 +6127,7 @@ mod tests {
                 ));
             }
 
-            let skips = std::collections::HashSet::new();
+            let skips = crate::collections::HashSet::default();
             let action =
                 decide_ai_action_v2(&mut world, PlayerId(1), &skips).expect("行動が決定されること");
             match action.1 {

@@ -1,6 +1,6 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
-
+use crate::collections::{HashMap, HashSet};
 use bevy_ecs::prelude::*;
+use std::collections::BTreeSet;
 
 use crate::ai::island_campaign::IslandCampaignAssignment;
 use crate::ai::squad::{MissionPhase, MissionType, SquadManager, TransportPhase, plan_squads};
@@ -146,7 +146,7 @@ fn four_expand_candidates_execute_exactly_three_complete_island_operations() {
         })
     }));
 
-    let mut entity_owners: HashMap<Entity, crate::ai::islands::IslandId> = HashMap::new();
+    let mut entity_owners: HashMap<Entity, crate::ai::islands::IslandId> = HashMap::default();
     for assignment in &portfolio.active_offensives {
         let operation_squads: Vec<_> = offensive_squads
             .iter()
@@ -1261,7 +1261,7 @@ fn full_planning_keeps_targetless_drop_deliveries_local_across_repeated_calls() 
             max: 100,
         },
     ));
-    let delivered = HashSet::from([capture_a, capture_b, combat]);
+    let delivered = HashSet::from_iter([capture_a, capture_b, combat]);
     let mut manager = world.remove_resource::<SquadManager>().unwrap();
     let safe_drop = manager.create_squad(MissionType::Transport);
     safe_drop.members.insert(safe_transport);
@@ -1921,7 +1921,7 @@ fn faction_only_cargo_marks_every_mixed_squad_reference_unavailable() {
     let faction_only_player_b = world.spawn(Faction(player_b)).id();
     let factionless_transport = world.spawn_empty().id();
     let factionless_delivered = world.spawn_empty().id();
-    let referenced = HashSet::from([
+    let referenced = HashSet::from_iter([
         mixed_player_a,
         faction_only_player_b,
         factionless_transport,

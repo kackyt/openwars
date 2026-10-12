@@ -7,6 +7,7 @@ use crate::ai::turn_distance::{
     ActionTurnDistance, ActionTurnDistanceCache, calculate_action_distance_to_range,
     calculate_action_distance_to_range_after_leaving_start,
 };
+use crate::collections::{HashMap, HashSet};
 use crate::components::{
     ActionCompleted, Ammo, CargoCapacity, Faction, Fuel, GridPosition, HasMoved, Health, PlayerId,
     Property, Transporting, UnitStats,
@@ -17,8 +18,6 @@ use crate::systems::combat::get_detailed_expected_damage;
 use crate::systems::movement::{OccupantInfo, calculate_reachable_tiles};
 use bevy_ecs::prelude::*;
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
-
 #[derive(Debug, Clone, Copy)]
 struct DefenseOrder {
     unit: Entity,
@@ -169,7 +168,7 @@ fn threats(
         })?
         .0;
     let home_island = islands.get_island_at(&home)?.id;
-    let empty = HashMap::new();
+    let empty = HashMap::default();
     let mut result = Vec::new();
     for enemy in units.iter().filter(|unit| {
         unit.owner != player
@@ -357,7 +356,7 @@ fn build_plan(world: &World, player: PlayerId, skip: &HashSet<Entity>) -> Option
     let mut cache = ActionTurnDistanceCache::default();
     let threats = threats(world, player, &units, &mut cache)?;
     let mut occupied = occupancy(&units);
-    let mut assigned = HashSet::new();
+    let mut assigned = HashSet::default();
     let mut orders = Vec::new();
     for threat in threats {
         let enemy = units.iter().find(|unit| unit.entity == threat.enemy)?;
@@ -624,7 +623,7 @@ mod tests {
         let second = unit(&mut world, PlayerId(1), UnitType::Tank, position(0, 3));
         unit(&mut world, PlayerId(1), UnitType::Tank, position(0, 4));
         let enemy = unit(&mut world, PlayerId(2), UnitType::Infantry, position(4, 2));
-        let plan = build_plan(&world, PlayerId(1), &HashSet::new()).unwrap();
+        let plan = build_plan(&world, PlayerId(1), &HashSet::default()).unwrap();
         assert_eq!(
             plan.orders.len(),
             2,
@@ -635,7 +634,7 @@ mod tests {
             .iter()
             .map(|order| order.unit)
             .collect::<HashSet<_>>();
-        assert_eq!(assigned, HashSet::from([first, second]));
+        assert_eq!(assigned, HashSet::from_iter([first, second]));
         assert_ne!(
             plan.orders[0].firing_position,
             plan.orders[1].firing_position
@@ -659,7 +658,7 @@ mod tests {
         unit(&mut world, PlayerId(1), UnitType::Tank, position(0, 1));
         unit(&mut world, PlayerId(2), UnitType::Infantry, position(4, 2));
         assert!(
-            build_plan(&world, PlayerId(1), &HashSet::new())
+            build_plan(&world, PlayerId(1), &HashSet::default())
                 .unwrap()
                 .orders
                 .is_empty()
@@ -679,7 +678,7 @@ mod tests {
         unit(&mut world, PlayerId(1), UnitType::Artillery, position(0, 4));
         unit(&mut world, PlayerId(2), UnitType::Infantry, position(2, 2));
         assert!(
-            build_plan(&world, PlayerId(1), &HashSet::new())
+            build_plan(&world, PlayerId(1), &HashSet::default())
                 .unwrap()
                 .orders
                 .is_empty()
@@ -693,7 +692,7 @@ mod tests {
         unit(&mut world, PlayerId(1), UnitType::Tank, position(0, 1));
         unit(&mut world, PlayerId(1), UnitType::Tank, position(0, 3));
         let enemy = unit(&mut world, PlayerId(2), UnitType::Infantry, position(4, 2));
-        let early = build_plan(&world, PlayerId(1), &HashSet::new()).unwrap();
+        let early = build_plan(&world, PlayerId(1), &HashSet::default()).unwrap();
         assert!(!early.orders.is_empty());
         assert!(early.orders.iter().all(|order| !order.departure_due));
 
@@ -708,10 +707,11 @@ mod tests {
             .unwrap()
             .id();
         world.get_mut::<Property>(city).unwrap().capture_points = 100;
-        let urgent = build_plan(&world, PlayerId(1), &HashSet::new()).unwrap();
+        let urgent = build_plan(&world, PlayerId(1), &HashSet::default()).unwrap();
         assert!(!urgent.orders.is_empty());
         assert!(urgent.orders.iter().all(|order| order.departure_due));
-        let (_, command) = command_for_order(&world, urgent.orders[0], &HashSet::new()).unwrap();
+        let (_, command) =
+            command_for_order(&world, urgent.orders[0], &HashSet::default()).unwrap();
         assert!(
             matches!(command, AiCommand::Attack { target_entity, .. } if target_entity == enemy)
         );
@@ -724,7 +724,7 @@ mod tests {
         unit(&mut world, PlayerId(1), UnitType::Infantry, position(1, 2));
         unit(&mut world, PlayerId(2), UnitType::Infantry, position(4, 2));
         assert!(
-            build_plan(&world, PlayerId(1), &HashSet::new())
+            build_plan(&world, PlayerId(1), &HashSet::default())
                 .unwrap()
                 .orders
                 .is_empty()

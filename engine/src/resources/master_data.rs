@@ -1,7 +1,6 @@
+use crate::collections::HashMap;
 use bevy_ecs::prelude::Resource;
 use serde::{Deserialize, Deserializer};
-use std::collections::HashMap;
-
 /// マスターデータ読み込み時の専用エラー型
 #[derive(thiserror::Error, Debug)]
 pub enum MasterDataError {
@@ -324,7 +323,7 @@ impl MasterDataRegistry {
         let headers = rdr.headers()?.clone();
         for result in rdr.records() {
             let record = result?;
-            let mut damages = HashMap::new();
+            let mut damages = HashMap::default();
             for (i, field) in record.iter().enumerate().skip(5) {
                 if let Some(header) = headers.get(i)
                     && !header.is_empty()
@@ -369,7 +368,7 @@ impl MasterDataRegistry {
         let headers = rdr.headers()?.clone();
         for result in rdr.records() {
             let record = result?;
-            let mut terrain_costs = HashMap::new();
+            let mut terrain_costs = HashMap::default();
             for (i, field) in record.iter().enumerate().skip(1) {
                 if let Some(header) = headers.get(i)
                     && !header.is_empty()

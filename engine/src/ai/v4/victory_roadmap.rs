@@ -9,6 +9,7 @@ use crate::ai::turn_distance::{TurnDistanceCache, calculate_turn_distance};
 use crate::ai::v4::deployment::V4DeploymentRegistry;
 use crate::ai::v4::operation::OperationKind;
 use crate::ai::v4::plan_revision::{ActiveCombatPlanSummary, PlanId, V4RollingPlanRegistry};
+use crate::collections::{HashMap, HashSet};
 use crate::components::{
     CargoCapacity, Faction, GridPosition, Health, PlayerId, Property, Transporting, UnitStats,
 };
@@ -19,8 +20,6 @@ use crate::events::{
 use crate::resources::{Map, MatchState, Terrain, master_data::MasterDataRegistry};
 use crate::systems::movement::OccupantInfo;
 use bevy_ecs::prelude::*;
-use std::collections::{HashMap, HashSet};
-
 /// 勝利条件までの親計画ID。局地PlanIdと分離し、勝利経路が変わるまで維持する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VictoryRoadmapId(pub u64);
@@ -601,10 +600,10 @@ impl VictoryRoadmapRegistry {
                     phase: OperationPhase::Forming,
                     planned_completion_turn: None,
                     actual_completion_turn: None,
-                    assigned_transports: HashSet::new(),
-                    assigned_capturers: HashSet::new(),
-                    assigned_combat: HashSet::new(),
-                    combat_plan_ids: HashSet::new(),
+                    assigned_transports: HashSet::default(),
+                    assigned_capturers: HashSet::default(),
+                    assigned_combat: HashSet::default(),
+                    combat_plan_ids: HashSet::default(),
                     planned_suppression_turn: None,
                     execution: StepExecutionTotals::default(),
                     last_step: None,
@@ -709,10 +708,10 @@ impl VictoryRoadmapRegistry {
                     phase: OperationPhase::Forming,
                     planned_completion_turn: None,
                     actual_completion_turn: None,
-                    assigned_transports: HashSet::new(),
-                    assigned_capturers: HashSet::new(),
-                    assigned_combat: HashSet::new(),
-                    combat_plan_ids: HashSet::new(),
+                    assigned_transports: HashSet::default(),
+                    assigned_capturers: HashSet::default(),
+                    assigned_combat: HashSet::default(),
+                    combat_plan_ids: HashSet::default(),
                     planned_suppression_turn: None,
                     execution: StepExecutionTotals::default(),
                     last_step: None,
@@ -1519,7 +1518,7 @@ fn estimate_full_objective_completion(
         return Ok(turn);
     }
 
-    let mut occupied = HashMap::new();
+    let mut occupied = HashMap::default();
     let mut unit_query = world.query::<(
         Entity,
         &GridPosition,
@@ -2333,10 +2332,10 @@ mod tests {
                 phase: OperationPhase::Forming,
                 planned_completion_turn: None,
                 actual_completion_turn: None,
-                assigned_transports: HashSet::new(),
-                assigned_capturers: HashSet::new(),
-                assigned_combat: HashSet::new(),
-                combat_plan_ids: HashSet::new(),
+                assigned_transports: HashSet::default(),
+                assigned_capturers: HashSet::default(),
+                assigned_combat: HashSet::default(),
+                combat_plan_ids: HashSet::default(),
                 planned_suppression_turn: None,
                 execution: StepExecutionTotals::default(),
                 last_step: None,
@@ -2485,7 +2484,7 @@ mod tests {
             &assignment,
             StrategicPurpose::CaptureIsland,
             vec![GridPosition { x: 10, y: 10 }],
-            &HashSet::new(),
+            &HashSet::default(),
             OperationPhase::Forming,
         );
         let mut moved_anchor = assignment.clone();
@@ -2497,7 +2496,7 @@ mod tests {
             &moved_anchor,
             StrategicPurpose::CaptureIsland,
             vec![GridPosition { x: 12, y: 11 }],
-            &HashSet::new(),
+            &HashSet::default(),
             OperationPhase::Transit,
         );
 
@@ -2553,7 +2552,7 @@ mod tests {
             &assignment,
             StrategicPurpose::CaptureIsland,
             assignment.capture_target_positions.clone(),
-            &HashSet::new(),
+            &HashSet::default(),
             OperationPhase::Capture,
         );
         let operation = registry.operations.get_mut(&operation_id).unwrap();
@@ -2574,7 +2573,7 @@ mod tests {
             &assignment,
             StrategicPurpose::DefendIsland,
             assignment.capture_target_positions.clone(),
-            &HashSet::new(),
+            &HashSet::default(),
             OperationPhase::Blocked,
         );
 
@@ -2643,7 +2642,7 @@ mod tests {
                 &assignment(first_wave),
                 StrategicPurpose::CaptureIsland,
                 vec![first_wave],
-                &HashSet::from([first_wave]),
+                &HashSet::from_iter([first_wave]),
                 OperationPhase::Forming,
             );
             assert_eq!(
@@ -2659,7 +2658,7 @@ mod tests {
                 &assignment(second_wave),
                 StrategicPurpose::CaptureIsland,
                 vec![second_wave],
-                &HashSet::from([first_wave]),
+                &HashSet::from_iter([first_wave]),
                 OperationPhase::Forming,
             );
             assert_eq!(same, operation, "{path:?}");
@@ -2726,7 +2725,7 @@ mod tests {
             &first_assignment,
             StrategicPurpose::CaptureIsland,
             first_assignment.capture_target_positions.clone(),
-            &HashSet::new(),
+            &HashSet::default(),
             OperationPhase::Forming,
         );
         registry.bind_assignment_entities(first, &first_assignment);
@@ -2737,7 +2736,7 @@ mod tests {
             &second_assignment,
             StrategicPurpose::CaptureIsland,
             second_assignment.capture_target_positions.clone(),
-            &HashSet::new(),
+            &HashSet::default(),
             OperationPhase::Forming,
         );
         registry.bind_assignment_entities(second, &second_assignment);
@@ -2803,7 +2802,7 @@ mod tests {
             3,
             &assignment,
             &[(entity, OperationEntityRole::Combat)],
-            &HashSet::from([entity]),
+            &HashSet::from_iter([entity]),
             &[],
         );
 
@@ -2858,7 +2857,7 @@ mod tests {
             &assignment,
             StrategicPurpose::CaptureIsland,
             assignment.capture_target_positions.clone(),
-            &HashSet::new(),
+            &HashSet::default(),
             OperationPhase::Forming,
         );
         registry.bind_assignment_entities(operation_id, &assignment);
@@ -2885,14 +2884,14 @@ mod tests {
             islands: vec![
                 crate::ai::islands::Island {
                     id: IslandId(1),
-                    tiles: HashSet::from([
+                    tiles: HashSet::from_iter([
                         GridPosition { x: 0, y: 0 },
                         GridPosition { x: 1, y: 0 },
                     ]),
                 },
                 crate::ai::islands::Island {
                     id: island,
-                    tiles: HashSet::from([GridPosition { x: 3, y: 4 }]),
+                    tiles: HashSet::from_iter([GridPosition { x: 3, y: 4 }]),
                 },
             ],
         };
@@ -2935,11 +2934,11 @@ mod tests {
             islands: vec![
                 crate::ai::islands::Island {
                     id: IslandId(1),
-                    tiles: HashSet::from([GridPosition { x: 0, y: 0 }]),
+                    tiles: HashSet::from_iter([GridPosition { x: 0, y: 0 }]),
                 },
                 crate::ai::islands::Island {
                     id: target_island,
-                    tiles: HashSet::from([GridPosition { x: 3, y: 4 }]),
+                    tiles: HashSet::from_iter([GridPosition { x: 3, y: 4 }]),
                 },
             ],
         };
@@ -3205,7 +3204,7 @@ mod tests {
             &assignment,
             StrategicPurpose::CaptureIsland,
             assignment.capture_target_positions.clone(),
-            &HashSet::new(),
+            &HashSet::default(),
             OperationPhase::Transit,
         );
         registry.bind_assignment_entities(operation_id, &assignment);

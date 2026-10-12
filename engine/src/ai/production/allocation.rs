@@ -4,9 +4,8 @@
 //! 施設を確保した作戦の優先度だけをここに集める。候補評価の途中で永続Registryを
 //! 書き換えず、配分の結果は最終的な購入案として確定処理（`commit`）へ渡す。
 
+use crate::collections::{HashMap, HashSet};
 use crate::components::GridPosition;
-use std::collections::{HashMap, HashSet};
-
 /// 生産配分の可変状態。
 #[derive(Debug, Clone)]
 pub struct AllocationState {
@@ -22,8 +21,8 @@ impl AllocationState {
     pub fn new(funds: u32) -> Self {
         Self {
             remaining_funds: funds,
-            used_facilities: HashSet::new(),
-            facility_owners: HashMap::new(),
+            used_facilities: HashSet::default(),
+            facility_owners: HashMap::default(),
         }
     }
 

@@ -1,7 +1,7 @@
+use crate::collections::HashSet;
 use crate::components::GridPosition;
 use crate::resources::{Map, Terrain};
-use std::collections::{HashSet, VecDeque};
-
+use std::collections::VecDeque;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IslandId(pub usize);
 
@@ -38,7 +38,7 @@ impl IslandMap {
                 }
 
                 // フラッドフィルによる島の検出
-                let mut island_tiles = HashSet::new();
+                let mut island_tiles = HashSet::default();
                 let mut queue = VecDeque::new();
                 queue.push_back((x, y));
                 visited[idx] = true;
@@ -79,7 +79,7 @@ impl IslandMap {
     pub fn classify_islands(
         &self,
         player_id: crate::components::PlayerId,
-        properties: &std::collections::HashMap<GridPosition, Option<crate::components::PlayerId>>,
+        properties: &crate::collections::HashMap<GridPosition, Option<crate::components::PlayerId>>,
     ) -> (Vec<IslandId>, Vec<IslandId>) {
         let mut base_islands = Vec::new();
         let mut target_islands = Vec::new();

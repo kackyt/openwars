@@ -13,6 +13,7 @@ use crate::ai::turn_distance::TurnDistanceCache;
 use crate::ai::turn_distance::{
     SourceTurnDistanceCache, TerrainConnectivity, calculate_source_turn_distances_cached,
 };
+use crate::collections::{HashMap, HashSet};
 use crate::components::{
     CargoCapacity, Faction, Fuel, GridPosition, Health, PlayerId, Property, Transporting, UnitStats,
 };
@@ -20,8 +21,6 @@ use crate::resources::master_data::{MasterDataRegistry, UnitName};
 use crate::resources::{Map, MatchState, MovementType, Players, Terrain, UnitType};
 use crate::systems::movement::{OccupantInfo, get_valid_movement_cost};
 use bevy_ecs::prelude::{Entity, World};
-use std::collections::{HashMap, HashSet};
-
 #[derive(Debug, Clone)]
 struct PropertySnapshot {
     position: GridPosition,
@@ -387,7 +386,7 @@ fn mixed_owner_squad_entities(
     let faction_by_entity: HashMap<_, _> = factions.iter().copied().collect();
     let mut squads: Vec<_> = manager.squads.iter().collect();
     squads.sort_by_key(|squad| squad.id.0);
-    let mut unavailable = HashSet::new();
+    let mut unavailable = HashSet::default();
     for squad in squads {
         let mut entities: Vec<_> = squad
             .transport_entity
@@ -459,7 +458,7 @@ fn collect_assigned_transport_phases(
     let unit_by_entity: HashMap<_, _> = units.iter().map(|unit| (unit.entity, unit)).collect();
     let mut squads: Vec<_> = manager.squads.iter().collect();
     squads.sort_by_key(|squad| squad.id.0);
-    let mut phases: HashMap<Entity, AssignedTransportState> = HashMap::new();
+    let mut phases: HashMap<Entity, AssignedTransportState> = HashMap::default();
     for squad in squads {
         let Some(transport) = squad.transport_entity.filter(|transport| {
             unit_by_entity
@@ -537,8 +536,8 @@ fn collect_existing_operations(
     let unit_by_entity: HashMap<_, _> = units.iter().map(|unit| (unit.entity, unit)).collect();
     let mut squads: Vec<_> = manager.squads.iter().collect();
     squads.sort_by_key(|squad| squad.id.0);
-    let mut operations: HashMap<IslandId, ExistingCampaignOperation> = HashMap::new();
-    let mut cargo_assignments = HashMap::new();
+    let mut operations: HashMap<IslandId, ExistingCampaignOperation> = HashMap::default();
+    let mut cargo_assignments = HashMap::default();
 
     for squad in squads {
         // Reserveは次作戦へ再徴用できる待機配置であり、島作戦へcommit済みの
@@ -1219,7 +1218,7 @@ pub fn collect_island_campaign_facts(
         accumulator.properties.push(snapshot);
     }
 
-    let mut unit_positions = HashMap::new();
+    let mut unit_positions = HashMap::default();
     for unit in &units {
         if unit.transporting.is_some()
             || unit.position.x >= map.width
@@ -1970,7 +1969,7 @@ fn collect_campaign_resource_pool(
     let unit_by_entity: HashMap<_, _> = units.iter().map(|unit| (unit.entity, unit)).collect();
     let assigned_by_entity =
         merge_campaign_assignment_sources(roadmap_assignments, operations, produced_assignments);
-    let mut assigned_entities_by_island: HashMap<IslandId, HashSet<Entity>> = HashMap::new();
+    let mut assigned_entities_by_island: HashMap<IslandId, HashSet<Entity>> = HashMap::default();
     for (entity, island_id) in &assigned_by_entity {
         assigned_entities_by_island
             .entry(*island_id)
@@ -2133,7 +2132,7 @@ fn merge_campaign_assignment_sources(
 
 /// 全島評価と現在の共有資源を毎回盤面から再構築し、純粋allocatorへ一括で渡す。
 pub fn analyze_island_campaign(world: &mut World, player_id: PlayerId) -> IslandCampaignPortfolio {
-    analyze_island_campaign_excluding(world, player_id, &HashSet::new())
+    analyze_island_campaign_excluding(world, player_id, &HashSet::default())
 }
 
 /// 既存の実行任務へ予約済みのEntityを共有資源から除外して島嶼作戦を分析します。
@@ -2548,7 +2547,7 @@ mod tests {
         let roadmap_island = IslandId(1);
         let squad_island = IslandId(2);
         let intended_island = IslandId(3);
-        let roadmap = HashMap::from([(entity, roadmap_island)]);
+        let roadmap = HashMap::from_iter([(entity, roadmap_island)]);
         let operations = vec![ExistingCampaignOperation {
             island_id: squad_island,
             target_position: GridPosition { x: 2, y: 2 },
@@ -2558,7 +2557,7 @@ mod tests {
             capture_entities: Vec::new(),
             combat_entities: Vec::new(),
         }];
-        let produced = HashMap::from([(entity, intended_island)]);
+        let produced = HashMap::from_iter([(entity, intended_island)]);
 
         let assignments = merge_campaign_assignment_sources(&roadmap, &operations, &produced);
 
@@ -2569,9 +2568,9 @@ mod tests {
         );
 
         let assignments = merge_campaign_assignment_sources(
-            &HashMap::from([(entity, roadmap_island)]),
+            &HashMap::from_iter([(entity, roadmap_island)]),
             &operations,
-            &HashMap::new(),
+            &HashMap::default(),
         );
         assert_eq!(
             assignments.get(&entity),
@@ -2754,7 +2753,7 @@ mod tests {
         let unavailable =
             mixed_owner_squad_entities(&manager, &[(entity_a, player_a), (entity_b, player_b)]);
 
-        assert_eq!(unavailable, HashSet::from([entity_a, entity_b]));
+        assert_eq!(unavailable, HashSet::from_iter([entity_a, entity_b]));
     }
 
     #[test]

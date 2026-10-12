@@ -8,11 +8,10 @@
 //! 同じターン数でも先手（player_order が小さい方）が先着するよう辞書順で比較する。
 
 use crate::ai::turn_distance::{ActionTurnDistanceCache, calculate_action_distance_to_range};
+use crate::collections::HashMap;
 use crate::components::PlayerId;
 use crate::resources::master_data::MasterDataRegistry;
 use crate::resources::{Map, MovementType};
-use std::collections::HashMap;
-
 /// 行動フェーズ。`(round, player_order)` の辞書順で比較する。
 ///
 /// `round` はターン番号、`player_order` はそのラウンド内の手番順（0 が先手、1 が後手）。
@@ -137,7 +136,7 @@ pub(crate) fn capture_arrival_turns(
     // 燃料 0 は「燃料制限なし」のセンチネル（テスト用モック等）。実ユニットは
     // 非ゼロ燃料を持ち、経路探索が燃料切れを正しく扱う。
     let effective_fuel = if max_fuel == 0 { u32::MAX } else { max_fuel };
-    let empty_occupancy = HashMap::new();
+    let empty_occupancy = HashMap::default();
     calculate_action_distance_to_range(
         map,
         registry,

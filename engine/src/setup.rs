@@ -164,7 +164,7 @@ pub fn initialize_world_from_master_data_with_topology(
     }
     world.insert_resource(damage_chart);
 
-    let mut unit_registry_map = std::collections::HashMap::new();
+    let mut unit_registry_map = crate::collections::HashMap::default();
     for name in master_data.units.keys() {
         let stats = master_data
             .create_unit_stats(name)
@@ -180,7 +180,7 @@ pub fn initialize_world_from_master_data_with_topology(
         .ok_or_else(|| SetupError::MapNotFound(map_name.to_string()))?;
 
     let mut ecs_map = Map::new(map_data.width, map_data.height, Terrain::Plains, topology);
-    let mut players_set = std::collections::HashSet::new();
+    let mut players_set = crate::collections::HashSet::default();
 
     for y in 0..map_data.height {
         for x in 0..map_data.width {

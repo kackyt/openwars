@@ -11,13 +11,12 @@ use crate::ai::island_campaign_analysis::{
     analyze_island_campaign, analyze_island_campaign_excluding,
 };
 use crate::ai::turn_distance::{TerrainConnectivity, TurnDistanceCache, calculate_turn_distance};
+use crate::collections::{HashMap, HashSet};
 use crate::components::{
     ActionCompleted, Ammo, Faction, Fuel, GridPosition, Health, PlayerId, Property, UnitStats,
 };
 use crate::resources::{Map, MovementType, Terrain, UnitType, master_data::MasterDataRegistry};
 use bevy_ecs::prelude::*;
-use std::collections::{HashMap, HashSet};
-
 /// ゲームの戦略的フェーズ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GamePhase {
@@ -43,9 +42,9 @@ pub struct ProductionStrategy {
     /// 戦略的に優先すべきターゲット位置（未占領拠点や敵の群れ）。
     pub priority_targets: Vec<GridPosition>,
     /// 未占領（中立）拠点の座標リスト
-    pub unowned_properties: std::collections::HashSet<GridPosition>,
+    pub unowned_properties: crate::collections::HashSet<GridPosition>,
     /// 敵所有拠点の座標リスト (#53: 占領部隊の奪取目標として使用)
-    pub enemy_properties: std::collections::HashSet<GridPosition>,
+    pub enemy_properties: crate::collections::HashSet<GridPosition>,
     /// 歩兵など、ヘリでも運搬可能な軽輸送需要
     pub light_transport_demand: u32,
     /// 車両など、輸送船でしか運搬できない重輸送需要
@@ -61,7 +60,7 @@ pub struct ProductionStrategy {
     /// 現在保有している輸送ユニットの数
     pub existing_transport_count: usize,
     /// 敵地上ユニットが存在しない平和な島にあるプロパティの座標セット
-    pub peaceful_properties: std::collections::HashSet<GridPosition>,
+    pub peaceful_properties: crate::collections::HashSet<GridPosition>,
     /// V3が毎ターン盤面から再構築する島嶼キャンペーン全体。
     pub campaign_portfolio: IslandCampaignPortfolio,
     /// 完全packageごとの予約額と不足カテゴリをproductionが優先順に消費する行。
@@ -182,7 +181,7 @@ fn enemy_threatens_property(
 
 /// 現在のマップ状況を分析し、最適な戦略を決定します。
 pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStrategy {
-    analyze_strategy_internal(world, player_id, None, &HashSet::new())
+    analyze_strategy_internal(world, player_id, None, &HashSet::default())
 }
 
 /// 既存の実行任務へ予約したEntityを島嶼キャンペーンから除外して戦略を分析します。
@@ -204,7 +203,7 @@ pub(crate) fn analyze_strategy_for_turn(
         .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
         .and_then(|cache| cache.campaign_portfolio(player_id))
         .cloned();
-    analyze_strategy_internal(world, player_id, cached_campaign, &HashSet::new())
+    analyze_strategy_internal(world, player_id, cached_campaign, &HashSet::default())
 }
 
 fn analyze_strategy_internal(
@@ -266,7 +265,7 @@ fn analyze_strategy_internal(
         }
     }
     let mut turn_cache = TurnDistanceCache::default();
-    let mut unit_positions = HashMap::new();
+    let mut unit_positions = HashMap::default();
     let mut q_all_units = world.query::<(&Faction, &GridPosition, &UnitStats)>();
     for (faction, pos, stats) in q_all_units.iter(world) {
         unit_positions.insert(
@@ -285,7 +284,7 @@ fn analyze_strategy_internal(
         .cloned()
         .unwrap_or_else(|| crate::ai::islands::IslandMap::analyze(&map));
 
-    let mut allowed_islands = std::collections::HashMap::new();
+    let mut allowed_islands = crate::collections::HashMap::default();
     for island in &island_map.islands {
         let allowed = crate::ai::planner::is_invasion_allowed(world, player_id, island.id, island);
         allowed_islands.insert(island.id, allowed);
@@ -294,7 +293,7 @@ fn analyze_strategy_internal(
     let get_island_id =
         |pos: &GridPosition| -> Option<usize> { island_map.get_island_at(pos).map(|i| i.id.0) };
 
-    let mut my_base_island_ids = std::collections::HashSet::new();
+    let mut my_base_island_ids = crate::collections::HashSet::default();
 
     // 1. 拠点の分析
     {
@@ -858,7 +857,7 @@ fn analyze_strategy_internal(
     }
 
     // 平和な拠点（敵ユニットから十分に離れており、脅かされていない拠点）の分析
-    let mut peaceful_properties = std::collections::HashSet::new();
+    let mut peaceful_properties = crate::collections::HashSet::default();
 
     for pos in &my_properties {
         let prop_island_id = get_island_id(pos);
@@ -1160,7 +1159,7 @@ mod tests {
         }
         world.insert_resource(damage_chart);
 
-        let mut unit_registry_map = std::collections::HashMap::new();
+        let mut unit_registry_map = crate::collections::HashMap::default();
         for name in master_data.units.keys() {
             let stats = master_data.create_unit_stats(name).unwrap();
             unit_registry_map.insert(stats.unit_type, stats);
@@ -1370,7 +1369,7 @@ mod tests {
     fn install_strategy_scoring_resources(world: &mut World) {
         let master_data = world.resource::<MasterDataRegistry>().clone();
         let mut damage_chart = crate::resources::DamageChart::new();
-        let mut unit_registry = std::collections::HashMap::new();
+        let mut unit_registry = crate::collections::HashMap::default();
         for (name, record) in &master_data.units {
             let unit_type = master_data.unit_type_for_name(&name.0).unwrap();
             let stats = master_data.create_unit_stats(name).unwrap();

@@ -2,11 +2,10 @@
 
 use crate::ai::squad::{MissionType, Squad};
 use crate::ai::turn_distance::calculate_all_turn_distances_cached;
+use crate::collections::HashMap;
 use crate::components::{Ammo, Faction, GridPosition, Health, PlayerId, Property, UnitStats};
 use crate::resources::{Map, master_data::MasterDataRegistry};
 use bevy_ecs::prelude::*;
-use std::collections::HashMap;
-
 /// ビーム探索用の、一時的な盤面状態の退避・仮想シミュレーションを行うための構造体
 pub struct AiSimulationState {
     unit_backups: Vec<(Entity, GridPosition, Health, Option<Ammo>)>,
@@ -72,7 +71,7 @@ impl AiSimulationState {
             .cloned()
             .unwrap_or_default();
 
-        let mut unit_positions = HashMap::new();
+        let mut unit_positions = HashMap::default();
         let mut q_all_units = world.query::<(&Faction, &GridPosition, &UnitStats)>();
         for (faction, pos, stats) in q_all_units.iter(world) {
             unit_positions.insert(
@@ -249,7 +248,6 @@ mod tests {
     use crate::components::{Faction, GridPosition, Health, PlayerId, Property, UnitStats};
     use crate::resources::{GridTopology, Map, Terrain, master_data::MasterDataRegistry};
     use std::collections::BTreeSet;
-
     fn setup_test_world() -> World {
         let master_data = MasterDataRegistry::load().unwrap();
         let (mut world, _) =
@@ -366,7 +364,7 @@ mod tests {
         };
         squad.members.insert(unit_entity);
 
-        let mut assignments = HashMap::new();
+        let mut assignments = HashMap::default();
         assignments.insert(squad.id, squad.target.unwrap());
 
         let mut cache = crate::ai::turn_distance::AiTurnCache::new();

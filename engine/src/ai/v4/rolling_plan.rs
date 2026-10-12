@@ -4,12 +4,13 @@
 //! 既存戦力と複数ターンの生産候補を混ぜ、悲観側ダメージで残敵を排除できる
 //! パッケージだけを費用・完了ターン・損耗で比較する。
 
+use crate::collections::{HashMap, HashSet};
 use crate::components::{GridPosition, UnitStats};
 use crate::resources::master_data::MasterDataRegistry;
 use crate::resources::{DamageChart, Map, MovementType, Terrain, UnitType};
 use crate::systems::combat::calculate_damage_formula;
 use bevy_ecs::prelude::Entity;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 // 1施設手番ごとの候補を順に展開するため、同手番に複数施設を使う混成案が
@@ -331,7 +332,7 @@ impl SearchState {
 fn group_production_options_by_slot(
     input: &RollingPlanInput,
 ) -> HashMap<ProductionSlot, Vec<usize>> {
-    let mut options_by_slot: HashMap<ProductionSlot, Vec<usize>> = HashMap::new();
+    let mut options_by_slot: HashMap<ProductionSlot, Vec<usize>> = HashMap::default();
     for (index, option) in input.production_options.iter().enumerate() {
         options_by_slot
             .entry(option.purchase.into())
@@ -644,7 +645,7 @@ fn fill_best_effort_current_screen(
         indexed.push(index);
     }
     let state = SearchState {
-        used_capture_targets: HashSet::new(),
+        used_capture_targets: HashSet::default(),
         option_indices: indexed,
         used_slots: purchases
             .iter()
@@ -723,7 +724,7 @@ fn left_shift_purchases(
     });
 
     let mut shifted = Vec::with_capacity(ordered.len());
-    let mut used_slots = HashSet::new();
+    let mut used_slots = HashSet::default();
     // まだ処理していない購入の元予定枠は先に確保する。前倒し先がその枠を奪うと、
     // 後続購入が元へ戻ったときに同一施設・同一手番の重複が発生する。
     let mut reserved_original_slots = ordered
@@ -1645,19 +1646,19 @@ mod tests {
         let target = GridPosition { x: 8, y: 0 };
         let state = SearchState {
             option_indices: vec![0],
-            used_slots: HashSet::from([previous_slot]),
-            used_capture_targets: HashSet::from([target]),
+            used_slots: HashSet::from_iter([previous_slot]),
+            used_capture_targets: HashSet::from_iter([target]),
             cost: 5,
         };
         let child = state
             .with_affordable_purchase(&input, 1, slot)
             .expect("5+10は7+4*2の資金と等しい");
         assert_eq!(child.option_indices, vec![0, 1]);
-        assert_eq!(child.used_slots, HashSet::from([previous_slot, slot]));
-        assert_eq!(child.used_capture_targets, HashSet::from([target]));
+        assert_eq!(child.used_slots, HashSet::from_iter([previous_slot, slot]));
+        assert_eq!(child.used_capture_targets, HashSet::from_iter([target]));
         assert_eq!(child.cost, 15);
         assert_eq!(state.option_indices, vec![0]);
-        assert_eq!(state.used_slots, HashSet::from([previous_slot]));
+        assert_eq!(state.used_slots, HashSet::from_iter([previous_slot]));
         assert_eq!(state.cost, 5);
 
         input.production_options[1].purchase.cost = 11;
@@ -1763,9 +1764,9 @@ mod tests {
             engageable_enemy_indices: vec![0],
         });
         let state = SearchState {
-            used_capture_targets: HashSet::new(),
+            used_capture_targets: HashSet::default(),
             option_indices: vec![0],
-            used_slots: HashSet::from([ProductionSlot {
+            used_slots: HashSet::from_iter([ProductionSlot {
                 facility: GridPosition { x: 0, y: 0 },
                 build_turn: 0,
             }]),

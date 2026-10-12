@@ -154,7 +154,6 @@ mod tests {
     use crate::components::{GridPosition, PlayerId, Property};
     use crate::resources::{Player, Terrain, UnitType};
     use std::collections::VecDeque;
-
     /// プレイヤーIDから現在資金を読む。
     fn funds_of(world: &World, player_id: PlayerId) -> Option<u32> {
         world
@@ -195,7 +194,7 @@ mod tests {
             max_cargo: 0,
             loadable_unit_types: vec![],
         };
-        UnitRegistry(std::collections::HashMap::from([(
+        UnitRegistry(crate::collections::HashMap::from_iter([(
             UnitType::Infantry,
             stats,
         )]))

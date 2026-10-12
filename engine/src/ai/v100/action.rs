@@ -9,6 +9,7 @@ use super::candidate_field::{
 use super::route_field::{build_route_field, build_route_field_to_any};
 use crate::ai::AiVersion;
 use crate::ai::engine::AiCommand;
+use crate::collections::{HashMap, HashSet};
 use crate::components::{
     ActionCompleted, Ammo, Faction, Fuel, GridPosition, HasMoved, Health, PlayerId, Property,
     UnitStats,
@@ -18,8 +19,6 @@ use crate::systems::combat::get_expected_damage;
 use crate::systems::movement::OccupantInfo;
 use bevy_ecs::prelude::*;
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
-
 /// GBの部隊レコードに保持される個別目標座標に相当するV100/V200専用状態。
 ///
 /// AIは1手番を複数のstepに分けて実行するため、毎stepで現在位置から目標を
@@ -165,9 +164,9 @@ pub(crate) fn decide_action(
         .begin_action_turn(player_id, turn);
     let mut units = Vec::new();
     let mut assignment_units = Vec::new();
-    let mut occupants = HashMap::new();
-    let mut friendly_by_position = HashMap::new();
-    let mut cargo_by_transport = HashMap::<Entity, Vec<Entity>>::new();
+    let mut occupants = HashMap::default();
+    let mut friendly_by_position = HashMap::default();
+    let mut cargo_by_transport = HashMap::<Entity, Vec<Entity>>::default();
     {
         let mut query = world.query::<(
             Entity,
@@ -676,7 +675,7 @@ fn assign_objectives(
         })
         .collect();
     ordered_units.sort_by_key(|unit| unit.record_order);
-    let mut reserved = HashSet::new();
+    let mut reserved = HashSet::default();
     let master_data = MasterDataRegistry::load().expect("master data");
     ordered_units
         .iter()
@@ -948,7 +947,7 @@ fn build_rom_influence_field(
     map: &Map,
     enemies: &[EnemyView],
 ) -> HashMap<GridPosition, RomInfluence> {
-    let mut influence = HashMap::<GridPosition, RomInfluence>::new();
+    let mut influence = HashMap::<GridPosition, RomInfluence>::default();
     for enemy in enemies {
         let (anti_air, anti_surface) =
             super::rom_logic::GbUnitKind::influence_weights(enemy.stats.unit_type);
@@ -1408,7 +1407,7 @@ fn build_ship_approach_route_field(
         .map(|position| map.distance(position.x, position.y, objective.x, objective.y))
         .min()
     else {
-        return HashMap::new();
+        return HashMap::default();
     };
     let approach_positions: Vec<_> = reachable
         .keys()
@@ -1456,7 +1455,7 @@ mod tests {
 
     #[test]
     fn actor_priority_uses_bank2_selection_passes() {
-        let property_positions = HashSet::from([(2, 2), (3, 2)]);
+        let property_positions = HashSet::from_iter([(2, 2), (3, 2)]);
         let mut recon = unit(2, MovementType::ArmoredCar, GridPosition { x: 2, y: 2 });
         recon.stats.unit_type = UnitType::Recon;
         let unassigned = unit(1, MovementType::Infantry, GridPosition { x: 3, y: 2 });
@@ -1492,7 +1491,7 @@ mod tests {
 
     #[test]
     fn actor_priority_uses_route_cost_and_later_record_for_ties() {
-        let property_positions = HashSet::new();
+        let property_positions = HashSet::default();
         let earlier = unit(0, MovementType::Infantry, GridPosition { x: 7, y: 5 });
         let later = unit(4, MovementType::Infantry, GridPosition { x: 3, y: 5 });
         let earlier_key = actor_priority(
@@ -1560,7 +1559,7 @@ mod tests {
             ))
             .id();
 
-        let _ = decide_action(&mut world, player, &HashSet::new());
+        let _ = decide_action(&mut world, player, &HashSet::default());
         let state = world.resource::<super::super::rom_logic::RomAiState>();
         assert_eq!(
             state.evaluation_mode_for(player),
@@ -1576,7 +1575,7 @@ mod tests {
             .get_mut::<GridPosition>()
             .unwrap()
             .y = 6;
-        let _ = decide_action(&mut world, player, &HashSet::new());
+        let _ = decide_action(&mut world, player, &HashSet::default());
         assert_eq!(
             world
                 .resource::<super::super::rom_logic::RomAiState>()
@@ -1646,9 +1645,9 @@ mod tests {
         let mut world = World::new();
         let master_data = MasterDataRegistry::load().unwrap();
         world.insert_resource(ObjectiveAssignmentState {
-            by_player: HashMap::from([(
+            by_player: HashMap::from_iter([(
                 player_id,
-                HashMap::from([(entity, RomUnitObjective::Position(captured_port))]),
+                HashMap::from_iter([(entity, RomUnitObjective::Position(captured_port))]),
             )]),
             ..Default::default()
         });
@@ -1690,9 +1689,9 @@ mod tests {
         let mut world = World::new();
         let master_data = MasterDataRegistry::load().unwrap();
         world.insert_resource(ObjectiveAssignmentState {
-            by_player: HashMap::from([(
+            by_player: HashMap::from_iter([(
                 player_id,
-                HashMap::from([(entity, RomUnitObjective::Position(captured_port))]),
+                HashMap::from_iter([(entity, RomUnitObjective::Position(captured_port))]),
             )]),
             ..Default::default()
         });
@@ -1727,9 +1726,9 @@ mod tests {
         let mut world = World::new();
         let master_data = MasterDataRegistry::load().unwrap();
         world.insert_resource(ObjectiveAssignmentState {
-            by_player: HashMap::from([(
+            by_player: HashMap::from_iter([(
                 player_id,
-                HashMap::from([(entity, RomUnitObjective::Position(objective))]),
+                HashMap::from_iter([(entity, RomUnitObjective::Position(objective))]),
             )]),
             ..Default::default()
         });
@@ -2138,7 +2137,7 @@ mod tests {
         actor.stats.max_movement = 3;
         let candidates = build_candidate_field(
             &map,
-            &HashMap::new(),
+            &HashMap::default(),
             actor.position,
             &actor.stats,
             actor.fuel,
@@ -2170,7 +2169,7 @@ mod tests {
         let master_data = MasterDataRegistry::load().unwrap();
         let map = Map::new(4, 4, Terrain::Plains, crate::resources::GridTopology::Hex);
         let actor = unit(0, MovementType::Infantry, GridPosition { x: 1, y: 1 });
-        let mut occupants = HashMap::new();
+        let mut occupants = HashMap::default();
         for position in [(2, 1), (1, 2)] {
             occupants.insert(
                 position,
@@ -2190,7 +2189,7 @@ mod tests {
                 max: 100,
             },))
             .id();
-        let friendly_by_position = HashMap::from([((1, 2), valid_target)]);
+        let friendly_by_position = HashMap::from_iter([((1, 2), valid_target)]);
 
         assert!(matches!(
             choose_merge(
@@ -2276,7 +2275,7 @@ mod tests {
         actor.stats.max_movement = 3;
         let candidates = build_candidate_field(
             &map,
-            &HashMap::new(),
+            &HashMap::default(),
             actor.position,
             &actor.stats,
             actor.fuel,
@@ -2452,7 +2451,7 @@ mod tests {
             hp: 100,
         };
         let influence = build_rom_influence_field(&map, &[enemy]);
-        let assignments = HashMap::new();
+        let assignments = HashMap::default();
         let properties = [];
 
         let objective = resolve_rom_movement_objective(
@@ -2488,8 +2487,8 @@ mod tests {
             enemy_capital,
             Property::new(crate::resources::Terrain::Capital, Some(PlayerId(2)), 200),
         )];
-        let assignments = HashMap::new();
-        let influence = HashMap::new();
+        let assignments = HashMap::default();
+        let influence = HashMap::default();
 
         let objective = resolve_rom_movement_objective(
             &actor,
@@ -2522,14 +2521,14 @@ mod tests {
         let first = Entity::from_raw(1);
         let last = Entity::from_raw(2);
         let last_objective = GridPosition { x: 5, y: 3 };
-        let assignments = HashMap::from([
+        let assignments = HashMap::from_iter([
             (
                 first,
                 RomUnitObjective::Position(GridPosition { x: 4, y: 1 }),
             ),
             (last, RomUnitObjective::Position(last_objective)),
         ]);
-        let influence = HashMap::new();
+        let influence = HashMap::default();
         let properties = [];
 
         let objective = resolve_rom_movement_objective(

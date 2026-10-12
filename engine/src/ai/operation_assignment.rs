@@ -1,9 +1,8 @@
 use crate::ai::islands::IslandId;
 use crate::ai::squad::SquadId;
+use crate::collections::{HashMap, HashSet};
 use crate::components::PlayerId;
 use bevy_ecs::prelude::*;
-use std::collections::{HashMap, HashSet};
-
 /// 1体のunitを所有できる作戦の一意な識別子。
 ///
 /// 戦術Squadは作戦の実行形であり、島作戦は輸送・占領など複数Squadへ分割できる。
@@ -280,8 +279,8 @@ mod tests {
 
         registry.release_unclaimed_campaign_entities(
             player,
-            &HashSet::from([claimed]),
-            &HashSet::from([protected]),
+            &HashSet::from_iter([claimed]),
+            &HashSet::from_iter([protected]),
         );
 
         assert!(registry.assignment(claimed).is_some());

@@ -1,7 +1,6 @@
-use std::collections::HashMap;
-
 use bevy_ecs::event::EventCursor;
 use bevy_ecs::prelude::*;
+use engine::collections::HashMap;
 use serde::Serialize;
 
 use engine::ai::idle_audit::IdleAuditDiagnostics;

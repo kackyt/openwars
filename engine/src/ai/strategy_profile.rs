@@ -25,7 +25,7 @@ pub enum V4StrategyProfile {
 
 #[derive(Resource, Debug, Default)]
 pub(crate) struct V4StrategyProfileRegistry {
-    profiles: std::collections::HashMap<crate::components::PlayerId, V4StrategyProfile>,
+    profiles: crate::collections::HashMap<crate::components::PlayerId, V4StrategyProfile>,
 }
 
 #[cfg(test)]
@@ -36,7 +36,7 @@ impl V4StrategyProfileRegistry {
         profile: V4StrategyProfile,
     ) -> Self {
         Self {
-            profiles: std::collections::HashMap::from([(player_id, profile)]),
+            profiles: crate::collections::HashMap::from_iter([(player_id, profile)]),
         }
     }
 }

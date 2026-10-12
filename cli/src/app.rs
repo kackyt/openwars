@@ -173,9 +173,9 @@ pub struct UiState {
     /// マップ選択画面で選ぶグリッド形状（スクエア/ヘックス）
     pub selected_topology: GridTopology,
     // In-game state
-    pub player_controls: std::collections::HashMap<u32, PlayerControlType>,
+    pub player_controls: engine::collections::HashMap<u32, PlayerControlType>,
     /// Humanへ切り替えた後も、次に使用するAIバージョンを保持します。
-    pub player_ai_versions: std::collections::HashMap<u32, CliAiVersion>,
+    pub player_ai_versions: engine::collections::HashMap<u32, CliAiVersion>,
     pub cursor_pos: (usize, usize),
     pub log_messages: Vec<String>,
     pub right_panel_mode: RightPanelMode,
@@ -183,11 +183,11 @@ pub struct UiState {
 
 impl UiState {
     pub fn new(maps: Vec<String>) -> Self {
-        let mut controls = std::collections::HashMap::new();
+        let mut controls = engine::collections::HashMap::default();
         controls.insert(1, PlayerControlType::Human);
         controls.insert(2, PlayerControlType::Ai);
 
-        let mut ai_versions = std::collections::HashMap::new();
+        let mut ai_versions = engine::collections::HashMap::default();
         ai_versions.insert(1, CliAiVersion::V3);
         ai_versions.insert(2, CliAiVersion::V3);
 
@@ -964,7 +964,7 @@ impl App {
                         fuel_cur = f.current;
                     }
 
-                    let mut unit_positions = std::collections::HashMap::new();
+                    let mut unit_positions = engine::collections::HashMap::default();
                     let mut q_all = world.query::<(
                         Entity,
                         &GridPosition,

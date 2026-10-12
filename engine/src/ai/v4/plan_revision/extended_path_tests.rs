@@ -58,12 +58,12 @@ fn capital_launch_gate_opens_after_first_attack_wave_is_produced() {
         Some(island),
         anchor,
         vec![anchor],
-        HashSet::from([enemy]),
+        HashSet::from_iter([enemy]),
         true,
         None,
         feasible_plan(0),
         None,
-        HashSet::new(),
+        HashSet::default(),
     );
     assert!(!registry.operation_launch_ready(player, island));
 
@@ -75,7 +75,7 @@ fn capital_launch_gate_opens_after_first_attack_wave_is_produced() {
             selected.plan.purchases[0],
         )
         .expect("当手番の生産step");
-    registry.reconcile_produced_steps(player, &HashSet::from([step]));
+    registry.reconcile_produced_steps(player, &HashSet::from_iter([step]));
 
     assert!(registry.operation_launch_ready(player, island));
 }
@@ -117,12 +117,12 @@ fn capital_launch_posture_waits_for_all_purchases_only_on_main_path() {
             Some(island),
             anchor,
             vec![anchor],
-            HashSet::from([Entity::from_raw(10)]),
+            HashSet::from_iter([Entity::from_raw(10)]),
             true,
             None,
             plan.clone(),
             None,
-            HashSet::new(),
+            HashSet::default(),
         );
         let first_wave = registry
             .current_step_ref(
@@ -132,7 +132,7 @@ fn capital_launch_posture_waits_for_all_purchases_only_on_main_path() {
                 selected.plan.purchases[0],
             )
             .expect("当手番の生産step");
-        registry.reconcile_produced_steps(player, &HashSet::from([first_wave]));
+        registry.reconcile_produced_steps(player, &HashSet::from_iter([first_wave]));
 
         let intents = registry.active_deployment_intents(player, true, None);
         assert_eq!(intents.len(), 1, "{path:?}");
@@ -159,12 +159,12 @@ fn island_operation_identity_keeps_kind_but_allows_anchor_property_and_enemy_cha
         Some(island),
         first_anchor,
         vec![first_anchor, remaining_city],
-        HashSet::from([enemy]),
+        HashSet::from_iter([enemy]),
         true,
         None,
         feasible_plan(0),
         None,
-        HashSet::new(),
+        HashSet::default(),
     );
     let plan_id = created.plan_id.expect("島campaignは永続Planを持つ");
 
@@ -176,7 +176,7 @@ fn island_operation_identity_keeps_kind_but_allows_anchor_property_and_enemy_cha
                 OperationKind::Defense,
                 Some(island),
                 &[remaining_city],
-                &HashSet::from([reinforcement]),
+                &HashSet::from_iter([reinforcement]),
             )
             .is_none(),
         "同じ島でもDefenseへCaptureのPlanIdを流用しない"
@@ -188,12 +188,12 @@ fn island_operation_identity_keeps_kind_but_allows_anchor_property_and_enemy_cha
         Some(island),
         remaining_city,
         vec![remaining_city],
-        HashSet::from([reinforcement]),
+        HashSet::from_iter([reinforcement]),
         true,
         None,
         feasible_plan(0),
         None,
-        HashSet::new(),
+        HashSet::default(),
     );
     assert_ne!(
         defense.plan_id,
@@ -208,7 +208,7 @@ fn island_operation_identity_keeps_kind_but_allows_anchor_property_and_enemy_cha
             OperationKind::Capture,
             Some(island),
             &[remaining_city],
-            &HashSet::from([reinforcement]),
+            &HashSet::from_iter([reinforcement]),
         )
         .expect("同じ島・同じ作戦ならanchor・残施設・敵が変わっても継続する");
     assert_eq!(continuation.plan_id, plan_id);
@@ -220,7 +220,7 @@ fn island_operation_identity_keeps_kind_but_allows_anchor_property_and_enemy_cha
                 OperationKind::Capture,
                 Some(other_island),
                 &[remaining_city],
-                &HashSet::from([enemy]),
+                &HashSet::from_iter([enemy]),
             )
             .is_none(),
         "座標が偶然重なっても別島へPlanを流用しない"

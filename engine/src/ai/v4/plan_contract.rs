@@ -6,11 +6,10 @@
 
 use super::plan_revision::{PlanId, PlanRevision, PlanStepRef, ReplanReason};
 use super::victory_roadmap::{OperationEntityRole, OperationPhase, StrategicOperationId};
+use crate::collections::HashMap;
 use crate::components::GridPosition;
 use crate::resources::TurnNumber;
 use bevy_ecs::prelude::*;
-use std::collections::HashMap;
-
 /// 作戦のアプローチ分類。
 /// 物件レースの行動フェーズETAに基づき、成立可能な行動形態を決定する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

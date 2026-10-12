@@ -3,11 +3,12 @@
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::manual_checked_ops)]
 
+use crate::collections::{HashMap, HashSet};
 use crate::components::{GridPosition, PlayerId};
 use crate::resources::{Map, MovementType, master_data::MasterDataRegistry};
 use crate::systems::movement::{OccupantInfo, get_valid_movement_cost, is_enemy_zoc};
 use bevy_ecs::prelude::*;
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, VecDeque};
 use std::sync::Arc;
 
 /// 目的地までのターン数と消費移動力（MP）を保持する構造体。
@@ -315,7 +316,7 @@ pub fn calculate_source_turn_distances_cached(
         return Arc::clone(cached);
     }
 
-    let mut costs = HashMap::new();
+    let mut costs = HashMap::default();
     let mut heap = BinaryHeap::new();
     if max_mp > 0 && start.0 < map.width && start.1 < map.height {
         costs.insert(start, 0_u32);
@@ -522,7 +523,7 @@ pub(super) fn calculate_action_distance_with_policy(
         return None;
     }
 
-    let mut firing_positions = HashSet::new();
+    let mut firing_positions = HashSet::default();
     for dx in -(interaction_max_range as i32)..=(interaction_max_range as i32) {
         for dy in -(interaction_max_range as i32)..=(interaction_max_range as i32) {
             let nx = target.0 as i32 + dx;
@@ -584,7 +585,7 @@ pub(super) fn calculate_action_distance_with_policy(
         Arc::clone(cached)
     } else {
         let mut heap = BinaryHeap::new();
-        let mut best_by_position = HashMap::new();
+        let mut best_by_position = HashMap::default();
         let start_state = ActionState {
             turns: 0,
             mp_in_turn: 0,
@@ -818,9 +819,9 @@ fn calculate_all_turn_distances_to_range(
     interaction_max_range: u32,
     player_id: PlayerId,
 ) -> HashMap<GridPosition, TurnDistance> {
-    let mut dist = HashMap::new();
+    let mut dist = HashMap::default();
     let mut heap = BinaryHeap::new();
-    let mut turns_map = HashMap::new();
+    let mut turns_map = HashMap::default();
 
     if max_mp == 0 {
         return turns_map;
@@ -933,7 +934,7 @@ pub struct AiTurnCache {
 impl AiTurnCache {
     pub fn new() -> Self {
         Self {
-            sssp_cache: HashMap::new(),
+            sssp_cache: HashMap::default(),
         }
     }
 
@@ -1012,7 +1013,7 @@ mod tests {
         );
         let registry = MasterDataRegistry::load().unwrap_or_default();
         let mut cache = TurnDistanceCache::default();
-        let unit_positions = HashMap::new();
+        let unit_positions = HashMap::default();
 
         // 平地はコスト1。歩兵（移動力3）。
         // 距離4のマスへは、コスト4。ターン数は ceil(4/3) = 2
@@ -1060,7 +1061,7 @@ mod tests {
             let distance = calculate_turn_distance(
                 &map,
                 &registry,
-                &HashMap::new(),
+                &HashMap::default(),
                 (start_x, 0),
                 (5, 0),
                 MovementType::Infantry,
@@ -1090,7 +1091,7 @@ mod tests {
             free_slots: 0,
             loadable_types: Vec::new(),
         };
-        let positions = HashMap::from([((2, 0), enemy)]);
+        let positions = HashMap::from_iter([((2, 0), enemy)]);
         let mut cache = SourceTurnDistanceCache::default();
         let distances = calculate_source_turn_distances_cached(
             &map,
@@ -1124,7 +1125,7 @@ mod tests {
         let distance = calculate_turn_distance_to_range(
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             (3, 0),
             (4, 0),
             MovementType::Infantry,
@@ -1153,7 +1154,7 @@ mod tests {
         let distance = calculate_turn_distance_to_range(
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             (2, 0),
             (4, 0),
             MovementType::Infantry,
@@ -1182,7 +1183,7 @@ mod tests {
         let distance = calculate_action_distance_to_range(
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             (0, 0),
             (5, 0),
             MovementType::Tank,
@@ -1214,7 +1215,7 @@ mod tests {
         let distance = calculate_action_distance_to_range(
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             (0, 0),
             (2, 0),
             MovementType::Tank,
@@ -1245,7 +1246,7 @@ mod tests {
         let distance = calculate_action_distance_to_range(
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             (0, 0),
             (4, 0),
             MovementType::Tank,
@@ -1276,7 +1277,7 @@ mod tests {
         let first = calculate_action_distance_to_range(
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             (0, 0),
             (4, 0),
             MovementType::Tank,
@@ -1291,7 +1292,7 @@ mod tests {
         let second = calculate_action_distance_to_range(
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             (0, 0),
             (6, 0),
             MovementType::Tank,
@@ -1319,7 +1320,7 @@ mod tests {
         );
         let registry = MasterDataRegistry::load().unwrap_or_default();
         let mut cache = ActionTurnDistanceCache::default();
-        let unit_positions = HashMap::from([(
+        let unit_positions = HashMap::from_iter([(
             (1, 0),
             OccupantInfo {
                 player_id: PlayerId(1),
@@ -1360,7 +1361,7 @@ mod tests {
         let _ = map.set_terrain(2, 0, Terrain::Sea); // 海は歩兵進入不可
         let registry = MasterDataRegistry::load().unwrap_or_default();
         let mut cache = TurnDistanceCache::default();
-        let unit_positions = HashMap::new();
+        let unit_positions = HashMap::default();
 
         let dist = calculate_turn_distance(
             &map,
@@ -1413,8 +1414,8 @@ mod tests {
             crate::resources::GridTopology::Square,
         );
         let registry = MasterDataRegistry::load().unwrap_or_default();
-        let empty = HashMap::new();
-        let blocked = HashMap::from([(
+        let empty = HashMap::default();
+        let blocked = HashMap::from_iter([(
             (2, 0),
             OccupantInfo {
                 player_id: PlayerId(2),

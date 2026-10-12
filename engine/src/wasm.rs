@@ -1,6 +1,5 @@
-use std::collections::BTreeMap;
-
 use bevy_ecs::prelude::*;
+use std::collections::BTreeMap;
 use wasm_bindgen::prelude::*;
 
 use crate::ai::{AiVersion, PlayerAiSettings, resolve_player_ai_version};
@@ -483,7 +482,7 @@ impl WasmEngine {
             return JsValue::from_str("[]");
         }
 
-        let mut unit_positions = std::collections::HashMap::new();
+        let mut unit_positions = crate::collections::HashMap::default();
         let mut q_all = self.world.query::<(
             Entity,
             &GridPosition,

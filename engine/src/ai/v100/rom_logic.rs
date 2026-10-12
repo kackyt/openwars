@@ -4,12 +4,11 @@
 //! 状態値を型として保持し、`action`と`production`が境界でOpenWarsの盤面へ適用する。
 
 use crate::ai::AiVersion;
+use crate::collections::{HashMap, HashSet};
 use crate::components::PlayerId;
 use crate::components::UnitStats;
 use crate::resources::UnitType;
 use bevy_ecs::prelude::{Entity, Resource};
-use std::collections::{HashMap, HashSet};
-
 /// ROMの部隊レコード先頭に入る陣営込み兵種番号から、陣営bitを除いた値。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GbUnitKind(u8);
@@ -668,11 +667,17 @@ mod tests {
         let second = Entity::from_raw(2);
 
         state.observe_units(player, [first]);
-        assert_eq!(state.pickup_eligible_units(player), HashSet::from([first]));
+        assert_eq!(
+            state.pickup_eligible_units(player),
+            HashSet::from_iter([first])
+        );
 
         state.set_pickup_eligible(player, first, false);
         state.observe_units(player, [first, second]);
-        assert_eq!(state.pickup_eligible_units(player), HashSet::from([second]));
+        assert_eq!(
+            state.pickup_eligible_units(player),
+            HashSet::from_iter([second])
+        );
 
         state.observe_units(player, [first]);
         assert!(state.pickup_eligible_units(player).is_empty());

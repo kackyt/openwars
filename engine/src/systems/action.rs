@@ -333,7 +333,7 @@ mod tests {
         let mut world = World::new();
 
         // ユニット種別登録
-        let mut registry = std::collections::HashMap::new();
+        let mut registry = crate::collections::HashMap::default();
         let u_type = UnitType::Infantry;
         let t_type = UnitType::SupplyTruck;
 
@@ -464,7 +464,7 @@ mod tests {
         let inf_type = UnitType::Infantry;
 
         // Setup Registry
-        let mut registry = std::collections::HashMap::new();
+        let mut registry = crate::collections::HashMap::default();
         registry.insert(
             inf_type,
             UnitStats {

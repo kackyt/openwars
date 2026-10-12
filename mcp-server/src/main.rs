@@ -297,7 +297,7 @@ impl OpenWarsAiServer {
                     e.get::<UnitStats>().cloned(),
                     e.get::<Fuel>().cloned(),
                 ) {
-                    let mut unit_positions = std::collections::HashMap::new();
+                    let mut unit_positions = engine::collections::HashMap::default();
                     let mut q_occupants = world.query::<(
                         Entity,
                         &GridPosition,
@@ -425,8 +425,8 @@ impl OpenWarsAiServer {
             let match_state = world.resource::<engine::resources::MatchState>();
 
             // 所有拠点数と生存ユニット総コストの計算
-            let mut player_properties_count = std::collections::HashMap::new();
-            let mut player_units_cost = std::collections::HashMap::new();
+            let mut player_properties_count = engine::collections::HashMap::default();
+            let mut player_units_cost = engine::collections::HashMap::default();
 
             for (_, _, prop) in prop_query.iter(world) {
                 if let Some(owner) = prop.owner_id {

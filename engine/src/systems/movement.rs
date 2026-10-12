@@ -1,9 +1,9 @@
+use crate::collections::HashMap;
 use crate::components::*;
 use crate::events::*;
 use crate::resources::*;
 use bevy_ecs::prelude::*;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
-
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 #[derive(Clone)]
 pub struct OccupantInfo {
     pub player_id: PlayerId,
@@ -107,7 +107,7 @@ pub fn calculate_reachable_tile_costs(
     // 安定する BTreeMap を用いる。値は移動経路の最小コストである。
     let mut reachable = BTreeMap::new();
     let mut heap = BinaryHeap::new();
-    let mut min_cost: HashMap<(usize, usize), u32> = HashMap::new();
+    let mut min_cost: HashMap<(usize, usize), u32> = HashMap::default();
 
     heap.push(State {
         cost: 0,
@@ -311,9 +311,9 @@ pub fn find_path_a_star(
         |a: (usize, usize), b: (usize, usize)| -> u32 { map.distance(a.0, a.1, b.0, b.1) };
 
     let mut heap = BinaryHeap::new();
-    let mut came_from: HashMap<(usize, usize), (usize, usize)> = HashMap::new();
-    let mut g_score: HashMap<(usize, usize), u32> = HashMap::new();
-    let mut fuel_score: HashMap<(usize, usize), u32> = HashMap::new();
+    let mut came_from: HashMap<(usize, usize), (usize, usize)> = HashMap::default();
+    let mut g_score: HashMap<(usize, usize), u32> = HashMap::default();
+    let mut fuel_score: HashMap<(usize, usize), u32> = HashMap::default();
 
     g_score.insert(start, 0);
     fuel_score.insert(start, 0);
@@ -470,7 +470,7 @@ pub fn move_unit_system(
         if let Some(ref mut diag) = diagnostic {
             diag.last_event = Some(format!("{:?}", event));
         }
-        let mut unit_positions = HashMap::new();
+        let mut unit_positions = HashMap::default();
         for (e, pos, _, _, faction, stats, _, trans, cargo_opt) in q_units.iter() {
             if e != event.unit_entity && trans.is_none() {
                 let free_slots = cargo_opt
@@ -1248,7 +1248,7 @@ mod tests {
         ));
 
         // Registry for production
-        let mut registry = UnitRegistry(std::collections::HashMap::new());
+        let mut registry = UnitRegistry(crate::collections::HashMap::default());
         registry
             .0
             .insert(UnitType::Infantry, create_infantry_stats());
@@ -1420,7 +1420,7 @@ mod tests {
         let master_data = crate::resources::master_data::MasterDataRegistry::load().unwrap();
 
         // (1, 0) に輸送ユニットを配置
-        let mut unit_positions = HashMap::new();
+        let mut unit_positions = HashMap::default();
         let inf_type = UnitType::Infantry;
         let transport_type = UnitType::TransportHelicopter;
 
@@ -1460,7 +1460,7 @@ mod tests {
 
         let costs = calculate_reachable_tile_costs(
             &map,
-            &HashMap::new(),
+            &HashMap::default(),
             (1, 1),
             MovementType::Infantry,
             2,

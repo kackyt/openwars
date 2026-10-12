@@ -148,7 +148,7 @@ mod tests {
         let distance = calculate_action_distance_to_range(
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             (0, 0),
             (5, 0),
             MovementType::Tank,
@@ -182,7 +182,7 @@ mod tests {
         let distance = calculate_action_distance_to_range(
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             (0, 0),
             (4, 0),
             MovementType::Tank,
@@ -218,7 +218,7 @@ mod tests {
             free_slots: 0,
             loadable_types: Vec::new(),
         };
-        let unit_positions = HashMap::from([((1, 1), enemy)]);
+        let unit_positions = HashMap::from_iter([((1, 1), enemy)]);
 
         let distance = calculate_action_distance_to_range(
             &map,
@@ -258,7 +258,7 @@ mod tests {
         let distance = calculate_action_distance_to_range_after_leaving_start(
             &map,
             &registry,
-            &HashMap::new(),
+            &HashMap::default(),
             (0, 0),
             (3, 0),
             MovementType::Tank,
@@ -286,8 +286,8 @@ mod tests {
             crate::resources::GridTopology::Square,
         );
         let registry = MasterDataRegistry::load().unwrap_or_default();
-        let empty = HashMap::new();
-        let blocked = HashMap::from([(
+        let empty = HashMap::default();
+        let blocked = HashMap::from_iter([(
             (2, 0),
             OccupantInfo {
                 player_id: PlayerId(2),

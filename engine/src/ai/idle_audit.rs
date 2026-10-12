@@ -14,13 +14,12 @@
 
 use crate::ai::islands::IslandId;
 use crate::ai::squad::{MissionPhase, MissionType, SquadId, SquadManager};
+use crate::collections::{HashMap, HashSet};
 use crate::components::{
     ActionCompleted, Faction, GridPosition, HasMoved, PlayerId, Transporting, UnitStats,
 };
 use crate::resources::UnitType;
 use bevy_ecs::prelude::*;
-use std::collections::{HashMap, HashSet};
-
 /// 遊兵1体分の記録。分類は排他ではなく、同時に複数立つ（C は A・B の上位集合）。
 #[derive(Debug, Clone)]
 pub struct IdleUnitRecord {
@@ -150,11 +149,11 @@ pub fn audit_idle_units(
 ) -> IdleAudit {
     // 1. Squad 側の情報を所有値へ写し取る。
     //    このあと World へクエリを掛けるためにリソースの借用をここで手放す必要がある。
-    let mut assigned: HashMap<Entity, (SquadId, MissionType)> = HashMap::new();
-    let mut squad_members: HashMap<SquadId, Vec<Entity>> = HashMap::new();
+    let mut assigned: HashMap<Entity, (SquadId, MissionType)> = HashMap::default();
+    let mut squad_members: HashMap<SquadId, Vec<Entity>> = HashMap::default();
     // 構成員の集計（member_count / acted_count）はクエリ後に埋めるため、ここでは 0 で作る。
     let mut squad_digests: Vec<IdleSquadDigest> = Vec::new();
-    let mut solo_fallbacks: HashSet<Entity> = HashSet::new();
+    let mut solo_fallbacks: HashSet<Entity> = HashSet::default();
 
     if let Some(manager) = world.get_resource::<SquadManager>() {
         solo_fallbacks = manager.solo_fallbacks.clone();
@@ -193,7 +192,7 @@ pub fn audit_idle_units(
 
     // 2. 盤上の自軍ユニットを走査して分類する。
     let mut records: Vec<IdleUnitRecord> = Vec::new();
-    let mut own_units: HashSet<Entity> = HashSet::new();
+    let mut own_units: HashSet<Entity> = HashSet::default();
     let mut total_units = 0usize;
 
     let mut query = world.query::<(
@@ -346,7 +345,7 @@ mod tests {
         let player = PlayerId(1);
         let entity = spawn_unit(&mut world, player, 1, 1);
 
-        let audit = audit_idle_units(&mut world, player, &HashSet::new());
+        let audit = audit_idle_units(&mut world, player, &HashSet::default());
 
         assert_eq!(audit.total_units, 1);
         assert_eq!(audit.no_mission_count(), 1);
@@ -409,7 +408,7 @@ mod tests {
         reserve.target = Some(GridPosition { x: 2, y: 1 });
         world.insert_resource(manager);
 
-        let acted = HashSet::from([entity]);
+        let acted = HashSet::from_iter([entity]);
         let mut diagnostics = IdleAuditDiagnostics::default();
         diagnostics.record(3, audit_idle_units(&mut world, player, &acted));
         let first = diagnostics.by_player.get(&player).unwrap();
@@ -435,7 +434,7 @@ mod tests {
         let cargo = spawn_unit(&mut world, player, 1, 2);
         world.entity_mut(cargo).insert(Transporting(transport));
 
-        let audit = audit_idle_units(&mut world, player, &HashSet::new());
+        let audit = audit_idle_units(&mut world, player, &HashSet::default());
 
         assert_eq!(audit.total_units, 1);
         assert_eq!(audit.no_mission_count(), 1);

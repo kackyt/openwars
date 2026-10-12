@@ -11,11 +11,10 @@
 
 use crate::ai::ai_version::AiVersion;
 use crate::ai::strategy_profile::{V4StrategyProfile, profile_for};
+use crate::collections::HashSet;
 use crate::components::PlayerId;
 use bevy_ecs::prelude::{Res, Resource, World};
 use std::cell::Cell;
-use std::collections::HashSet;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodePath {
     /// main時点と同じ実装。

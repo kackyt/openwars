@@ -294,8 +294,8 @@ pub(super) fn simulate_state_with_catalog(
     let mut target_first_attack_turns = vec![None; enemies.len()];
     let mut turn_forecasts = Vec::new();
     let mut combat_purchases = Vec::new();
-    let mut assigned_combat_purchases = HashSet::new();
-    let mut blocked_next_turn_production_facilities = HashSet::new();
+    let mut assigned_combat_purchases = HashSet::default();
+    let mut blocked_next_turn_production_facilities = HashSet::default();
     let mut protected_survivors_at_completion = None;
     // 砲を増やすかは、同じ標的への砲数ではなく、直接部隊・既存砲・今回の砲が
     // 実際にどの敵HPを削ったかで比較する。候補ごとに既存simulationの攻撃処理で
@@ -1019,11 +1019,11 @@ mod tests {
         });
         let state = SearchState {
             option_indices: vec![0],
-            used_slots: HashSet::from([ProductionSlot {
+            used_slots: HashSet::from_iter([ProductionSlot {
                 facility: GridPosition { x: 0, y: 0 },
                 build_turn: 0,
             }]),
-            used_capture_targets: HashSet::new(),
+            used_capture_targets: HashSet::default(),
             cost: 7_500,
         };
         let mut selected = simulate_state(&input, &state, DEFAULT_SEARCH_TURNS);
@@ -1645,16 +1645,16 @@ mod tests {
         let facilities = vec![(first_facility, vec![0]), (second_facility, vec![1])];
         let first_only = SearchState {
             option_indices: vec![0],
-            used_slots: HashSet::from([ProductionSlot {
+            used_slots: HashSet::from_iter([ProductionSlot {
                 facility: first_facility,
                 build_turn: 0,
             }]),
-            used_capture_targets: HashSet::new(),
+            used_capture_targets: HashSet::default(),
             cost: 7_500,
         };
         let both_facilities = SearchState {
             option_indices: vec![0, 1],
-            used_slots: HashSet::from([
+            used_slots: HashSet::from_iter([
                 ProductionSlot {
                     facility: first_facility,
                     build_turn: 0,
@@ -1664,7 +1664,7 @@ mod tests {
                     build_turn: 0,
                 },
             ]),
-            used_capture_targets: HashSet::new(),
+            used_capture_targets: HashSet::default(),
             cost: 27_500,
         };
 
@@ -1912,19 +1912,19 @@ mod tests {
             })]);
 
         let two_capture_lanes =
-            HashSet::from([GridPosition { x: 2, y: 0 }, GridPosition { x: 3, y: 0 }]);
+            HashSet::from_iter([GridPosition { x: 2, y: 0 }, GridPosition { x: 3, y: 0 }]);
         let mut states = (0..MANY_FACTORY_PROPERTY_STATE_LIMIT)
             .map(|index| SearchState {
                 option_indices: vec![index],
-                used_slots: HashSet::new(),
+                used_slots: HashSet::default(),
                 used_capture_targets: two_capture_lanes.clone(),
                 cost: 1_000,
             })
             .collect::<Vec<_>>();
         states.push(SearchState {
             option_indices: vec![fast_index],
-            used_slots: HashSet::new(),
-            used_capture_targets: HashSet::from([
+            used_slots: HashSet::default(),
+            used_capture_targets: HashSet::from_iter([
                 GridPosition { x: 2, y: 0 },
                 GridPosition { x: 3, y: 0 },
                 GridPosition { x: 4, y: 0 },
@@ -2003,14 +2003,14 @@ mod tests {
 
         let slow_state = SearchState {
             option_indices: vec![0],
-            used_slots: HashSet::new(),
-            used_capture_targets: HashSet::from([target]),
+            used_slots: HashSet::default(),
+            used_capture_targets: HashSet::from_iter([target]),
             cost: 2_000,
         };
         let fast_state = SearchState {
             option_indices: vec![1],
-            used_slots: HashSet::new(),
-            used_capture_targets: HashSet::from([target]),
+            used_slots: HashSet::default(),
+            used_capture_targets: HashSet::from_iter([target]),
             cost: 1_000,
         };
 
@@ -2115,7 +2115,7 @@ pub(super) fn evaluate_opening_package_static(
         .collect::<Vec<_>>();
 
     // 明示的な妨害契約に加え、占領レーンを塞ぐ敵には占領完了時刻までの初撃を要求する。
-    let mut contract_deadlines = HashMap::<usize, u32>::new();
+    let mut contract_deadlines = HashMap::<usize, u32>::default();
     for (enemy_index, deadline) in &input.interdiction_deadlines {
         contract_deadlines
             .entry(*enemy_index)
@@ -2135,11 +2135,11 @@ pub(super) fn evaluate_opening_package_static(
     let mut contracts = contract_deadlines.into_iter().collect::<Vec<_>>();
     contracts.sort_unstable_by_key(|(enemy_index, deadline)| (*deadline, *enemy_index));
 
-    let mut used_unit_turns = HashSet::new();
+    let mut used_unit_turns = HashSet::default();
     let mut target_first_attack_turns = vec![None; input.enemies.len()];
     let mut target_damage = vec![0_u32; input.enemies.len()];
     let mut combat_purchases = Vec::new();
-    let mut assigned_units = HashSet::new();
+    let mut assigned_units = HashSet::default();
     for (enemy_index, deadline) in contracts {
         let mut best: Option<(u32, std::cmp::Reverse<u32>, u32, usize, u32)> = None;
         for option_index in &state.option_indices {
@@ -2913,7 +2913,7 @@ pub(super) fn plan_current_property_control_exact(
     catalog: &SimulationCatalog,
     search_turns: u32,
 ) -> Option<ForcePackagePlan> {
-    let mut options_by_facility: HashMap<GridPosition, Vec<usize>> = HashMap::new();
+    let mut options_by_facility: HashMap<GridPosition, Vec<usize>> = HashMap::default();
     for (index, option) in input.production_options.iter().enumerate() {
         if option.purchase.build_turn == 0 {
             options_by_facility
@@ -2973,7 +2973,7 @@ pub(super) fn plan_current_property_control_exact(
         let post_indirect =
             indirect_count(&mut facilities.iter().flat_map(|(_, i)| i.iter().copied()));
         // 目標ごとの最安占領役を積み上げ、必要数を満たす最小費用を出す。
-        let mut cheapest_by_target: HashMap<GridPosition, u32> = HashMap::new();
+        let mut cheapest_by_target: HashMap<GridPosition, u32> = HashMap::default();
         for option in input
             .production_options
             .iter()
@@ -3051,8 +3051,9 @@ pub(super) fn plan_current_property_control_exact(
         );
     }
 
-    let mut facility_role_options: HashMap<(GridPosition, ProductionRole), usize> = HashMap::new();
-    let mut distinct_roles_set: HashSet<ProductionRole> = HashSet::new();
+    let mut facility_role_options: HashMap<(GridPosition, ProductionRole), usize> =
+        HashMap::default();
+    let mut distinct_roles_set: HashSet<ProductionRole> = HashSet::default();
 
     for (facility, option_indices) in &facilities {
         for option_index in option_indices {
@@ -3099,7 +3100,7 @@ pub(super) fn plan_current_property_control_exact(
             .map(|((_, role), _)| *role)
             .collect()
     } else {
-        HashSet::new()
+        HashSet::default()
     };
     if funnel_audit {
         eprintln!(
@@ -3422,7 +3423,7 @@ pub(super) fn plan_current_property_control_exact(
                 plan.production_cost,
             );
         }
-        let mut seen_unit_types = HashSet::new();
+        let mut seen_unit_types = HashSet::default();
         let unit_types = input
             .production_options
             .iter()
