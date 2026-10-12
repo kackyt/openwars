@@ -1901,12 +1901,15 @@ pub(super) fn plan_production_with_registry(
         let Some(candidate) = best_mobilization else {
             break;
         };
-        // 動員購入の役割は購入案に一度だけ決め、配備意図とtraceで同じ値を使う。
-        let role = if candidate.cost == 1000 {
-            SlotKind::Capture
-        } else {
-            SlotKind::Combat
-        };
+        // 動員購入の役割は、価格ではなく選定理由から購入案に一度だけ決める。
+        // 未解決の実在脅威へ有効打を持つことを理由に選んだ兵はCombat、
+        // それ以外で占領能力を持つ兵は前線物件へ向かうCapture、残りはCombat。
+        let role = mobilization_role(
+            candidate_stats(scan, &candidate),
+            has_unresolved_live_threat,
+            op,
+            &scan.damage_chart,
+        );
 
         let deployment = planned_deployment(
             scan,
@@ -1977,6 +1980,29 @@ pub(super) fn plan_production_with_registry(
         remaining_funds.min(unissued_plan_reserve.saturating_add(contingency_reserve));
     plan_trace.uncommitted_funds = remaining_funds.saturating_sub(plan_trace.reserved_funds);
     (commands, plan_trace)
+}
+
+/// 動員購入の役割を、兵種の能力と選定理由から決める。
+///
+/// 未解決の実在脅威があるときの動員は与ダメージ順に選ぶため、その脅威へ有効打を
+/// 持つ兵は交戦役（Combat）として配備意図を付ける。脅威が無い、または有効打が無い
+/// 占領能力兵は前線物件の占領役（Capture）とする。
+pub(super) fn mobilization_role(
+    stats: &UnitStats,
+    has_unresolved_live_threat: bool,
+    op: &Operation,
+    damage_chart: &DamageChart,
+) -> SlotKind {
+    let selected_for_engagement = has_unresolved_live_threat
+        && op
+            .reachable_threats
+            .iter()
+            .any(|threat| best_damage(damage_chart, stats.unit_type, threat.stats.unit_type) > 0);
+    if stats.can_capture && !selected_for_engagement {
+        SlotKind::Capture
+    } else {
+        SlotKind::Combat
+    }
 }
 
 /// 見積に含めてよいのは、同じ永続Planへ実際に配属済みのEntityだけ。
@@ -6302,6 +6328,59 @@ mod tests {
         .expect("両候補とも実在前線へ届く");
 
         assert_eq!(candidate.unit_type, UnitType::Tank);
+    }
+
+    /// 動員の役割は価格ではなく選定理由で決まる。脅威へ有効打を持つ占領兵は交戦役、
+    /// 脅威が無いときの占領兵は（価格に関係なく）占領役になる。
+    #[test]
+    fn mobilization_role_follows_selection_reason_not_price() {
+        let mut damage_chart = DamageChart::new();
+        damage_chart.insert_damage(UnitType::Infantry, UnitType::Infantry, 55);
+        damage_chart.insert_damage(UnitType::Mech, UnitType::Tank, 55);
+        let mut op = operation(
+            OperationKind::Capture,
+            OperationSlots::default(),
+            OperationSlots::default(),
+        );
+        op.reachable_threats.push(ThreatTarget {
+            entity: Some(Entity::from_raw(900)),
+            stats: stats(UnitType::Tank, 6_000),
+            position: pos(3, 3),
+            current_hp: 100,
+            available_turn: 0,
+        });
+        let infantry = UnitStats {
+            can_capture: true,
+            ..stats(UnitType::Infantry, 1_000)
+        };
+        let mech = UnitStats {
+            can_capture: true,
+            ..stats(UnitType::Mech, 2_000)
+        };
+        let tank = stats(UnitType::Tank, 6_000);
+
+        // 脅威が無ければ占領能力兵は価格に関係なく占領役。
+        assert_eq!(
+            mobilization_role(&mech, false, &op, &damage_chart),
+            SlotKind::Capture
+        );
+        assert_eq!(
+            mobilization_role(&infantry, false, &op, &damage_chart),
+            SlotKind::Capture
+        );
+        assert_eq!(
+            mobilization_role(&tank, false, &op, &damage_chart),
+            SlotKind::Combat
+        );
+        // 脅威へ有効打を持つ兵は交戦役、有効打の無い占領兵は占領役のまま。
+        assert_eq!(
+            mobilization_role(&mech, true, &op, &damage_chart),
+            SlotKind::Combat
+        );
+        assert_eq!(
+            mobilization_role(&infantry, true, &op, &damage_chart),
+            SlotKind::Capture
+        );
     }
 
     /// 今まさに未所有拠点の上で占領を進めている敵は、到達途中の占領可能敵より
