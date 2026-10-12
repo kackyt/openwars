@@ -1,0 +1,579 @@
+scenario v3_vs_v4_map6 map=map_6 seed=2 P1=V3 P2=V4
+T1 P1 begin V3
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 3, target_y: 16, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 3, target_y: 16, unit_type: Infantry, entity: <entity> }
+    ev GamePhaseChangedEvent { new_phase: Main, active_player: PlayerId(1) }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 4, target_y: 15, unit_type: MdTank }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 4, target_y: 15, unit_type: MdTank, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 3, target_y: 17, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 3, target_y: 17, unit_type: Infantry, entity: <entity> }
+  <end>
+    ev GamePhaseChangedEvent { new_phase: Main, active_player: PlayerId(2) }
+T1 P1 end
+  funds P1 = 0
+  funds P2 = 21000
+  unit P1 Infantry (3,16) hp=100
+  unit P1 Infantry (3,17) hp=100
+  unit P1 MdTank (4,15) hp=100
+  prop (0,18) City owner=Some(1) cp=200
+  prop (0,19) City owner=Some(1) cp=200
+  prop (1,18) City owner=Some(1) cp=200
+  prop (1,19) City owner=Some(1) cp=200
+  prop (2,15) Airport owner=Some(1) cp=300
+  prop (24,3) Airport owner=Some(2) cp=300
+  prop (24,5) Factory owner=Some(2) cp=200
+  prop (25,3) Airport owner=Some(2) cp=300
+  prop (25,4) Factory owner=Some(2) cp=200
+  prop (25,5) Capital owner=Some(2) cp=400
+  prop (25,6) Factory owner=Some(2) cp=200
+  prop (26,4) Factory owner=Some(2) cp=200
+  prop (26,5) Factory owner=Some(2) cp=200
+  prop (26,6) Factory owner=Some(2) cp=200
+  prop (28,2) City owner=Some(2) cp=200
+  prop (28,3) City owner=Some(2) cp=200
+  prop (28,6) Airport owner=Some(2) cp=300
+  prop (29,2) City owner=Some(2) cp=200
+  prop (29,3) City owner=Some(2) cp=200
+  prop (29,4) City owner=Some(2) cp=200
+  prop (3,15) Factory owner=Some(1) cp=200
+  prop (3,16) Factory owner=Some(1) cp=200
+  prop (3,17) Factory owner=Some(1) cp=200
+  prop (4,15) Factory owner=Some(1) cp=200
+  prop (4,16) Capital owner=Some(1) cp=400
+  prop (4,17) Factory owner=Some(1) cp=200
+  prop (4,18) Airport owner=Some(1) cp=300
+  prop (5,16) Factory owner=Some(1) cp=200
+  prop (5,18) Airport owner=Some(1) cp=300
+T1 P2 begin V4 Standard
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 25, target_y: 4, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 25, target_y: 4, unit_type: Infantry, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 24, target_y: 3, unit_type: Bcopters }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 24, target_y: 3, unit_type: Bcopters, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 25, target_y: 3, unit_type: Bcopters }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 25, target_y: 3, unit_type: Bcopters, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 26, target_y: 4, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 26, target_y: 4, unit_type: Infantry, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 24, target_y: 5, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 24, target_y: 5, unit_type: Infantry, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 25, target_y: 5, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 25, target_y: 5, unit_type: Infantry, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 26, target_y: 5, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 26, target_y: 5, unit_type: Infantry, entity: <entity> }
+  <end>
+    ev GamePhaseChangedEvent { new_phase: Main, active_player: PlayerId(1) }
+T1 P2 end
+  funds P1 = 20000
+  funds P2 = 1000
+  unit P1 Infantry (3,16) hp=100
+  unit P1 Infantry (3,17) hp=100
+  unit P1 MdTank (4,15) hp=100
+  unit P2 Bcopters (24,3) hp=100
+  unit P2 Bcopters (25,3) hp=100
+  unit P2 Infantry (24,5) hp=100
+  unit P2 Infantry (25,4) hp=100
+  unit P2 Infantry (25,5) hp=100
+  unit P2 Infantry (26,4) hp=100
+  unit P2 Infantry (26,5) hp=100
+  prop (0,18) City owner=Some(1) cp=200
+  prop (0,19) City owner=Some(1) cp=200
+  prop (1,18) City owner=Some(1) cp=200
+  prop (1,19) City owner=Some(1) cp=200
+  prop (2,15) Airport owner=Some(1) cp=300
+  prop (24,3) Airport owner=Some(2) cp=300
+  prop (24,5) Factory owner=Some(2) cp=200
+  prop (25,3) Airport owner=Some(2) cp=300
+  prop (25,4) Factory owner=Some(2) cp=200
+  prop (25,5) Capital owner=Some(2) cp=400
+  prop (25,6) Factory owner=Some(2) cp=200
+  prop (26,4) Factory owner=Some(2) cp=200
+  prop (26,5) Factory owner=Some(2) cp=200
+  prop (26,6) Factory owner=Some(2) cp=200
+  prop (28,2) City owner=Some(2) cp=200
+  prop (28,3) City owner=Some(2) cp=200
+  prop (28,6) Airport owner=Some(2) cp=300
+  prop (29,2) City owner=Some(2) cp=200
+  prop (29,3) City owner=Some(2) cp=200
+  prop (29,4) City owner=Some(2) cp=200
+  prop (3,15) Factory owner=Some(1) cp=200
+  prop (3,16) Factory owner=Some(1) cp=200
+  prop (3,17) Factory owner=Some(1) cp=200
+  prop (4,15) Factory owner=Some(1) cp=200
+  prop (4,16) Capital owner=Some(1) cp=400
+  prop (4,17) Factory owner=Some(1) cp=200
+  prop (4,18) Airport owner=Some(1) cp=300
+  prop (5,16) Factory owner=Some(1) cp=200
+  prop (5,18) Airport owner=Some(1) cp=300
+T2 P1 begin V3
+  Capture { target_pos: GridPosition { x: 0, y: 17 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 3, y: 16 }, to: GridPosition { x: 0, y: 17 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 1, y: 17 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 3, y: 17 }, to: GridPosition { x: 1, y: 17 }, fuel_used: 2 }
+  Wait { target_pos: GridPosition { x: 9, y: 12 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 4, y: 15 }, to: GridPosition { x: 9, y: 12 }, fuel_used: 6 }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 4, target_y: 16, unit_type: Rockets }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 4, target_y: 16, unit_type: Rockets, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 3, target_y: 15, unit_type: Rockets }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 3, target_y: 15, unit_type: Rockets, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 4, target_y: 17, unit_type: Rockets }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 4, target_y: 17, unit_type: Rockets, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 5, target_y: 16, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 5, target_y: 16, unit_type: Infantry, entity: <entity> }
+  <end>
+    ev GamePhaseChangedEvent { new_phase: Main, active_player: PlayerId(2) }
+T2 P1 end
+  funds P1 = 400
+  funds P2 = 22000
+  unit P1 Infantry (0,17) hp=100
+  unit P1 Infantry (1,17) hp=100
+  unit P1 Infantry (5,16) hp=100
+  unit P1 MdTank (9,12) hp=100
+  unit P1 Rockets (3,15) hp=100
+  unit P1 Rockets (4,16) hp=100
+  unit P1 Rockets (4,17) hp=100
+  unit P2 Bcopters (24,3) hp=100
+  unit P2 Bcopters (25,3) hp=100
+  unit P2 Infantry (24,5) hp=100
+  unit P2 Infantry (25,4) hp=100
+  unit P2 Infantry (25,5) hp=100
+  unit P2 Infantry (26,4) hp=100
+  unit P2 Infantry (26,5) hp=100
+  prop (0,17) City owner=None cp=100
+  prop (0,18) City owner=Some(1) cp=200
+  prop (0,19) City owner=Some(1) cp=200
+  prop (1,18) City owner=Some(1) cp=200
+  prop (1,19) City owner=Some(1) cp=200
+  prop (2,15) Airport owner=Some(1) cp=300
+  prop (24,3) Airport owner=Some(2) cp=300
+  prop (24,5) Factory owner=Some(2) cp=200
+  prop (25,3) Airport owner=Some(2) cp=300
+  prop (25,4) Factory owner=Some(2) cp=200
+  prop (25,5) Capital owner=Some(2) cp=400
+  prop (25,6) Factory owner=Some(2) cp=200
+  prop (26,4) Factory owner=Some(2) cp=200
+  prop (26,5) Factory owner=Some(2) cp=200
+  prop (26,6) Factory owner=Some(2) cp=200
+  prop (28,2) City owner=Some(2) cp=200
+  prop (28,3) City owner=Some(2) cp=200
+  prop (28,6) Airport owner=Some(2) cp=300
+  prop (29,2) City owner=Some(2) cp=200
+  prop (29,3) City owner=Some(2) cp=200
+  prop (29,4) City owner=Some(2) cp=200
+  prop (3,15) Factory owner=Some(1) cp=200
+  prop (3,16) Factory owner=Some(1) cp=200
+  prop (3,17) Factory owner=Some(1) cp=200
+  prop (4,15) Factory owner=Some(1) cp=200
+  prop (4,16) Capital owner=Some(1) cp=400
+  prop (4,17) Factory owner=Some(1) cp=200
+  prop (4,18) Airport owner=Some(1) cp=300
+  prop (5,16) Factory owner=Some(1) cp=200
+  prop (5,18) Airport owner=Some(1) cp=300
+T2 P2 begin V4 Standard
+  Wait { target_pos: GridPosition { x: 23, y: 6 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 25, y: 4 }, to: GridPosition { x: 23, y: 6 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 21, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 24, y: 3 }, to: GridPosition { x: 21, y: 7 }, fuel_used: 5 }
+  Wait { target_pos: GridPosition { x: 22, y: 6 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 25, y: 3 }, to: GridPosition { x: 22, y: 6 }, fuel_used: 5 }
+  Wait { target_pos: GridPosition { x: 23, y: 5 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 26, y: 4 }, to: GridPosition { x: 23, y: 5 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 22, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 24, y: 5 }, to: GridPosition { x: 22, y: 7 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 23, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 25, y: 5 }, to: GridPosition { x: 23, y: 7 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 24, y: 6 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 26, y: 5 }, to: GridPosition { x: 24, y: 6 }, fuel_used: 3 }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 25, target_y: 4, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 25, target_y: 4, unit_type: Infantry, entity: <entity> }
+  <end>
+    ev GamePhaseChangedEvent { new_phase: Main, active_player: PlayerId(1) }
+T2 P2 end
+  funds P1 = 20400
+  funds P2 = 21000
+  unit P1 Infantry (0,17) hp=100
+  unit P1 Infantry (1,17) hp=100
+  unit P1 Infantry (5,16) hp=100
+  unit P1 MdTank (9,12) hp=100
+  unit P1 Rockets (3,15) hp=100
+  unit P1 Rockets (4,16) hp=100
+  unit P1 Rockets (4,17) hp=100
+  unit P2 Bcopters (21,7) hp=100
+  unit P2 Bcopters (22,6) hp=100
+  unit P2 Infantry (22,7) hp=100
+  unit P2 Infantry (23,5) hp=100
+  unit P2 Infantry (23,6) hp=100
+  unit P2 Infantry (23,7) hp=100
+  unit P2 Infantry (24,6) hp=100
+  unit P2 Infantry (25,4) hp=100
+  prop (0,17) City owner=None cp=100
+  prop (0,18) City owner=Some(1) cp=200
+  prop (0,19) City owner=Some(1) cp=200
+  prop (1,18) City owner=Some(1) cp=200
+  prop (1,19) City owner=Some(1) cp=200
+  prop (2,15) Airport owner=Some(1) cp=300
+  prop (24,3) Airport owner=Some(2) cp=300
+  prop (24,5) Factory owner=Some(2) cp=200
+  prop (25,3) Airport owner=Some(2) cp=300
+  prop (25,4) Factory owner=Some(2) cp=200
+  prop (25,5) Capital owner=Some(2) cp=400
+  prop (25,6) Factory owner=Some(2) cp=200
+  prop (26,4) Factory owner=Some(2) cp=200
+  prop (26,5) Factory owner=Some(2) cp=200
+  prop (26,6) Factory owner=Some(2) cp=200
+  prop (28,2) City owner=Some(2) cp=200
+  prop (28,3) City owner=Some(2) cp=200
+  prop (28,6) Airport owner=Some(2) cp=300
+  prop (29,2) City owner=Some(2) cp=200
+  prop (29,3) City owner=Some(2) cp=200
+  prop (29,4) City owner=Some(2) cp=200
+  prop (3,15) Factory owner=Some(1) cp=200
+  prop (3,16) Factory owner=Some(1) cp=200
+  prop (3,17) Factory owner=Some(1) cp=200
+  prop (4,15) Factory owner=Some(1) cp=200
+  prop (4,16) Capital owner=Some(1) cp=400
+  prop (4,17) Factory owner=Some(1) cp=200
+  prop (4,18) Airport owner=Some(1) cp=300
+  prop (5,16) Factory owner=Some(1) cp=200
+  prop (5,18) Airport owner=Some(1) cp=300
+T3 P1 begin V3
+  Capture { target_pos: GridPosition { x: 0, y: 17 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 0, y: 17 }, to: GridPosition { x: 0, y: 17 }, fuel_used: 0 }
+    ev PropertyCapturedEvent { x: 0, y: 17, new_owner: Some(PlayerId(1)) }
+  Wait { target_pos: GridPosition { x: 0, y: 16 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 1, y: 17 }, to: GridPosition { x: 0, y: 16 }, fuel_used: 2 }
+  Wait { target_pos: GridPosition { x: 7, y: 14 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 5, y: 16 }, to: GridPosition { x: 7, y: 14 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 9, y: 8 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 9, y: 12 }, to: GridPosition { x: 9, y: 8 }, fuel_used: 4 }
+  Wait { target_pos: GridPosition { x: 6, y: 13 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 4, y: 16 }, to: GridPosition { x: 6, y: 13 }, fuel_used: 4 }
+  Wait { target_pos: GridPosition { x: 5, y: 13 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 3, y: 15 }, to: GridPosition { x: 5, y: 13 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 6, y: 14 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 4, y: 17 }, to: GridPosition { x: 6, y: 14 }, fuel_used: 3 }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 5, target_y: 16, unit_type: Rockets }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 5, target_y: 16, unit_type: Rockets, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 4, target_y: 15, unit_type: Rockets }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 4, target_y: 15, unit_type: Rockets, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 4, target_y: 16, unit_type: Rockets }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 4, target_y: 16, unit_type: Rockets, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 3, target_y: 17, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 3, target_y: 17, unit_type: Infantry, entity: <entity> }
+  <end>
+    ev GamePhaseChangedEvent { new_phase: Main, active_player: PlayerId(2) }
+T3 P1 end
+  funds P1 = 800
+  funds P2 = 42000
+  unit P1 Infantry (0,16) hp=100
+  unit P1 Infantry (0,17) hp=100
+  unit P1 Infantry (3,17) hp=100
+  unit P1 Infantry (7,14) hp=100
+  unit P1 MdTank (9,8) hp=100
+  unit P1 Rockets (4,15) hp=100
+  unit P1 Rockets (4,16) hp=100
+  unit P1 Rockets (5,13) hp=100
+  unit P1 Rockets (5,16) hp=100
+  unit P1 Rockets (6,13) hp=100
+  unit P1 Rockets (6,14) hp=100
+  unit P2 Bcopters (21,7) hp=100
+  unit P2 Bcopters (22,6) hp=100
+  unit P2 Infantry (22,7) hp=100
+  unit P2 Infantry (23,5) hp=100
+  unit P2 Infantry (23,6) hp=100
+  unit P2 Infantry (23,7) hp=100
+  unit P2 Infantry (24,6) hp=100
+  unit P2 Infantry (25,4) hp=100
+  prop (0,17) City owner=Some(1) cp=200
+  prop (0,18) City owner=Some(1) cp=200
+  prop (0,19) City owner=Some(1) cp=200
+  prop (1,18) City owner=Some(1) cp=200
+  prop (1,19) City owner=Some(1) cp=200
+  prop (2,15) Airport owner=Some(1) cp=300
+  prop (24,3) Airport owner=Some(2) cp=300
+  prop (24,5) Factory owner=Some(2) cp=200
+  prop (25,3) Airport owner=Some(2) cp=300
+  prop (25,4) Factory owner=Some(2) cp=200
+  prop (25,5) Capital owner=Some(2) cp=400
+  prop (25,6) Factory owner=Some(2) cp=200
+  prop (26,4) Factory owner=Some(2) cp=200
+  prop (26,5) Factory owner=Some(2) cp=200
+  prop (26,6) Factory owner=Some(2) cp=200
+  prop (28,2) City owner=Some(2) cp=200
+  prop (28,3) City owner=Some(2) cp=200
+  prop (28,6) Airport owner=Some(2) cp=300
+  prop (29,2) City owner=Some(2) cp=200
+  prop (29,3) City owner=Some(2) cp=200
+  prop (29,4) City owner=Some(2) cp=200
+  prop (3,15) Factory owner=Some(1) cp=200
+  prop (3,16) Factory owner=Some(1) cp=200
+  prop (3,17) Factory owner=Some(1) cp=200
+  prop (4,15) Factory owner=Some(1) cp=200
+  prop (4,16) Capital owner=Some(1) cp=400
+  prop (4,17) Factory owner=Some(1) cp=200
+  prop (4,18) Airport owner=Some(1) cp=300
+  prop (5,16) Factory owner=Some(1) cp=200
+  prop (5,18) Airport owner=Some(1) cp=300
+T3 P2 begin V4 Standard
+  Wait { target_pos: GridPosition { x: 23, y: 4 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 25, y: 4 }, to: GridPosition { x: 23, y: 4 }, fuel_used: 2 }
+  Capture { target_pos: GridPosition { x: 21, y: 8 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 23, y: 6 }, to: GridPosition { x: 21, y: 8 }, fuel_used: 3 }
+  Capture { target_pos: GridPosition { x: 22, y: 8 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 23, y: 7 }, to: GridPosition { x: 22, y: 8 }, fuel_used: 2 }
+  Wait { target_pos: GridPosition { x: 21, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 21, y: 7 }, to: GridPosition { x: 21, y: 7 }, fuel_used: 0 }
+  Wait { target_pos: GridPosition { x: 20, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 22, y: 6 }, to: GridPosition { x: 20, y: 7 }, fuel_used: 2 }
+  Wait { target_pos: GridPosition { x: 21, y: 6 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 22, y: 7 }, to: GridPosition { x: 21, y: 6 }, fuel_used: 2 }
+  Wait { target_pos: GridPosition { x: 22, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 23, y: 5 }, to: GridPosition { x: 22, y: 7 }, fuel_used: 2 }
+  Wait { target_pos: GridPosition { x: 22, y: 6 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 24, y: 6 }, to: GridPosition { x: 22, y: 6 }, fuel_used: 2 }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 25, target_y: 4, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 25, target_y: 4, unit_type: Infantry, entity: <entity> }
+  <end>
+    ev GamePhaseChangedEvent { new_phase: Main, active_player: PlayerId(1) }
+T3 P2 end
+  funds P1 = 21785
+  funds P2 = 41000
+  unit P1 Infantry (0,16) hp=100
+  unit P1 Infantry (0,17) hp=100
+  unit P1 Infantry (3,17) hp=100
+  unit P1 Infantry (7,14) hp=100
+  unit P1 MdTank (9,8) hp=100
+  unit P1 Rockets (4,15) hp=100
+  unit P1 Rockets (4,16) hp=100
+  unit P1 Rockets (5,13) hp=100
+  unit P1 Rockets (5,16) hp=100
+  unit P1 Rockets (6,13) hp=100
+  unit P1 Rockets (6,14) hp=100
+  unit P2 Bcopters (20,7) hp=100
+  unit P2 Bcopters (21,7) hp=100
+  unit P2 Infantry (21,6) hp=100
+  unit P2 Infantry (21,8) hp=100
+  unit P2 Infantry (22,6) hp=100
+  unit P2 Infantry (22,7) hp=100
+  unit P2 Infantry (22,8) hp=100
+  unit P2 Infantry (23,4) hp=100
+  unit P2 Infantry (25,4) hp=100
+  prop (0,17) City owner=Some(1) cp=200
+  prop (0,18) City owner=Some(1) cp=200
+  prop (0,19) City owner=Some(1) cp=200
+  prop (1,18) City owner=Some(1) cp=200
+  prop (1,19) City owner=Some(1) cp=200
+  prop (2,15) Airport owner=Some(1) cp=300
+  prop (21,8) City owner=None cp=100
+  prop (22,8) City owner=None cp=100
+  prop (24,3) Airport owner=Some(2) cp=300
+  prop (24,5) Factory owner=Some(2) cp=200
+  prop (25,3) Airport owner=Some(2) cp=300
+  prop (25,4) Factory owner=Some(2) cp=200
+  prop (25,5) Capital owner=Some(2) cp=400
+  prop (25,6) Factory owner=Some(2) cp=200
+  prop (26,4) Factory owner=Some(2) cp=200
+  prop (26,5) Factory owner=Some(2) cp=200
+  prop (26,6) Factory owner=Some(2) cp=200
+  prop (28,2) City owner=Some(2) cp=200
+  prop (28,3) City owner=Some(2) cp=200
+  prop (28,6) Airport owner=Some(2) cp=300
+  prop (29,2) City owner=Some(2) cp=200
+  prop (29,3) City owner=Some(2) cp=200
+  prop (29,4) City owner=Some(2) cp=200
+  prop (3,15) Factory owner=Some(1) cp=200
+  prop (3,16) Factory owner=Some(1) cp=200
+  prop (3,17) Factory owner=Some(1) cp=200
+  prop (4,15) Factory owner=Some(1) cp=200
+  prop (4,16) Capital owner=Some(1) cp=400
+  prop (4,17) Factory owner=Some(1) cp=200
+  prop (4,18) Airport owner=Some(1) cp=300
+  prop (5,16) Factory owner=Some(1) cp=200
+  prop (5,18) Airport owner=Some(1) cp=300
+T4 P1 begin V3
+  Capture { target_pos: GridPosition { x: 9, y: 14 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 7, y: 14 }, to: GridPosition { x: 9, y: 14 }, fuel_used: 2 }
+  Wait { target_pos: GridPosition { x: 7, y: 8 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 9, y: 8 }, to: GridPosition { x: 7, y: 8 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 2, y: 16 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 0, y: 17 }, to: GridPosition { x: 2, y: 16 }, fuel_used: 2 }
+  Wait { target_pos: GridPosition { x: 9, y: 11 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 6, y: 13 }, to: GridPosition { x: 9, y: 11 }, fuel_used: 4 }
+  Wait { target_pos: GridPosition { x: 9, y: 12 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 5, y: 13 }, to: GridPosition { x: 9, y: 12 }, fuel_used: 4 }
+  Wait { target_pos: GridPosition { x: 8, y: 12 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 6, y: 14 }, to: GridPosition { x: 8, y: 12 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 8, y: 14 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 5, y: 16 }, to: GridPosition { x: 8, y: 14 }, fuel_used: 4 }
+  Wait { target_pos: GridPosition { x: 7, y: 13 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 4, y: 15 }, to: GridPosition { x: 7, y: 13 }, fuel_used: 4 }
+  Wait { target_pos: GridPosition { x: 7, y: 14 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 4, y: 16 }, to: GridPosition { x: 7, y: 14 }, fuel_used: 4 }
+  Wait { target_pos: GridPosition { x: 5, y: 14 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 3, y: 17 }, to: GridPosition { x: 5, y: 14 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 2, y: 17 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 0, y: 16 }, to: GridPosition { x: 2, y: 17 }, fuel_used: 3 }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 5, target_y: 16, unit_type: Rockets }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 5, target_y: 16, unit_type: Rockets, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 4, target_y: 15, unit_type: Rockets }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 4, target_y: 15, unit_type: Rockets, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 4, target_y: 16, unit_type: Rockets }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 4, target_y: 16, unit_type: Rockets, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 3, target_y: 16, unit_type: Mech }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 3, target_y: 16, unit_type: Mech, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(1), target_x: 3, target_y: 17, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(1), target_x: 3, target_y: 17, unit_type: Infantry, entity: <entity> }
+  <end>
+    ev GamePhaseChangedEvent { new_phase: Main, active_player: PlayerId(2) }
+T4 P1 end
+  funds P1 = 185
+  funds P2 = 62000
+  unit P1 Infantry (2,16) hp=100
+  unit P1 Infantry (2,17) hp=100
+  unit P1 Infantry (3,17) hp=100
+  unit P1 Infantry (5,14) hp=100
+  unit P1 Infantry (9,14) hp=100
+  unit P1 MdTank (7,8) hp=100
+  unit P1 Mech (3,16) hp=100
+  unit P1 Rockets (4,15) hp=100
+  unit P1 Rockets (4,16) hp=100
+  unit P1 Rockets (5,16) hp=100
+  unit P1 Rockets (7,13) hp=100
+  unit P1 Rockets (7,14) hp=100
+  unit P1 Rockets (8,12) hp=100
+  unit P1 Rockets (8,14) hp=100
+  unit P1 Rockets (9,11) hp=100
+  unit P1 Rockets (9,12) hp=100
+  unit P2 Bcopters (20,7) hp=100
+  unit P2 Bcopters (21,7) hp=100
+  unit P2 Infantry (21,6) hp=100
+  unit P2 Infantry (21,8) hp=100
+  unit P2 Infantry (22,6) hp=100
+  unit P2 Infantry (22,7) hp=100
+  unit P2 Infantry (22,8) hp=100
+  unit P2 Infantry (23,4) hp=100
+  unit P2 Infantry (25,4) hp=100
+  prop (0,17) City owner=Some(1) cp=200
+  prop (0,18) City owner=Some(1) cp=200
+  prop (0,19) City owner=Some(1) cp=200
+  prop (1,18) City owner=Some(1) cp=200
+  prop (1,19) City owner=Some(1) cp=200
+  prop (2,15) Airport owner=Some(1) cp=300
+  prop (21,8) City owner=None cp=100
+  prop (22,8) City owner=None cp=100
+  prop (24,3) Airport owner=Some(2) cp=300
+  prop (24,5) Factory owner=Some(2) cp=200
+  prop (25,3) Airport owner=Some(2) cp=300
+  prop (25,4) Factory owner=Some(2) cp=200
+  prop (25,5) Capital owner=Some(2) cp=400
+  prop (25,6) Factory owner=Some(2) cp=200
+  prop (26,4) Factory owner=Some(2) cp=200
+  prop (26,5) Factory owner=Some(2) cp=200
+  prop (26,6) Factory owner=Some(2) cp=200
+  prop (28,2) City owner=Some(2) cp=200
+  prop (28,3) City owner=Some(2) cp=200
+  prop (28,6) Airport owner=Some(2) cp=300
+  prop (29,2) City owner=Some(2) cp=200
+  prop (29,3) City owner=Some(2) cp=200
+  prop (29,4) City owner=Some(2) cp=200
+  prop (3,15) Factory owner=Some(1) cp=200
+  prop (3,16) Factory owner=Some(1) cp=200
+  prop (3,17) Factory owner=Some(1) cp=200
+  prop (4,15) Factory owner=Some(1) cp=200
+  prop (4,16) Capital owner=Some(1) cp=400
+  prop (4,17) Factory owner=Some(1) cp=200
+  prop (4,18) Airport owner=Some(1) cp=300
+  prop (5,16) Factory owner=Some(1) cp=200
+  prop (5,18) Airport owner=Some(1) cp=300
+  prop (9,14) City owner=None cp=100
+T4 P2 begin V4 Standard
+  Wait { target_pos: GridPosition { x: 23, y: 6 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 25, y: 4 }, to: GridPosition { x: 23, y: 6 }, fuel_used: 3 }
+  Capture { target_pos: GridPosition { x: 22, y: 8 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 22, y: 8 }, to: GridPosition { x: 22, y: 8 }, fuel_used: 0 }
+    ev PropertyCapturedEvent { x: 22, y: 8, new_owner: Some(PlayerId(2)) }
+  Capture { target_pos: GridPosition { x: 21, y: 8 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 21, y: 8 }, to: GridPosition { x: 21, y: 8 }, fuel_used: 0 }
+    ev PropertyCapturedEvent { x: 21, y: 8, new_owner: Some(PlayerId(2)) }
+  Wait { target_pos: GridPosition { x: 21, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 21, y: 7 }, to: GridPosition { x: 21, y: 7 }, fuel_used: 0 }
+  Wait { target_pos: GridPosition { x: 20, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 20, y: 7 }, to: GridPosition { x: 20, y: 7 }, fuel_used: 0 }
+  Wait { target_pos: GridPosition { x: 21, y: 6 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 21, y: 6 }, to: GridPosition { x: 21, y: 6 }, fuel_used: 0 }
+  Wait { target_pos: GridPosition { x: 22, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 22, y: 7 }, to: GridPosition { x: 22, y: 7 }, fuel_used: 0 }
+  Wait { target_pos: GridPosition { x: 22, y: 6 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 22, y: 6 }, to: GridPosition { x: 22, y: 6 }, fuel_used: 0 }
+  Wait { target_pos: GridPosition { x: 23, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 23, y: 4 }, to: GridPosition { x: 23, y: 7 }, fuel_used: 3 }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 25, target_y: 3, unit_type: Bcopters }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 25, target_y: 3, unit_type: Bcopters, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 25, target_y: 4, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 25, target_y: 4, unit_type: Infantry, entity: <entity> }
+  ProduceUnitCommand { player_id: PlayerId(2), target_x: 26, target_y: 4, unit_type: Infantry }
+    ev UnitProducedEvent { player_id: PlayerId(2), target_x: 26, target_y: 4, unit_type: Infantry, entity: <entity> }
+  <end>
+    ev GamePhaseChangedEvent { new_phase: Main, active_player: PlayerId(1) }
+T4 P2 end
+  funds P1 = 21185
+  funds P2 = 52500
+  unit P1 Infantry (2,16) hp=100
+  unit P1 Infantry (2,17) hp=100
+  unit P1 Infantry (3,17) hp=100
+  unit P1 Infantry (5,14) hp=100
+  unit P1 Infantry (9,14) hp=100
+  unit P1 MdTank (7,8) hp=100
+  unit P1 Mech (3,16) hp=100
+  unit P1 Rockets (4,15) hp=100
+  unit P1 Rockets (4,16) hp=100
+  unit P1 Rockets (5,16) hp=100
+  unit P1 Rockets (7,13) hp=100
+  unit P1 Rockets (7,14) hp=100
+  unit P1 Rockets (8,12) hp=100
+  unit P1 Rockets (8,14) hp=100
+  unit P1 Rockets (9,11) hp=100
+  unit P1 Rockets (9,12) hp=100
+  unit P2 Bcopters (20,7) hp=100
+  unit P2 Bcopters (21,7) hp=100
+  unit P2 Bcopters (25,3) hp=100
+  unit P2 Infantry (21,6) hp=100
+  unit P2 Infantry (21,8) hp=100
+  unit P2 Infantry (22,6) hp=100
+  unit P2 Infantry (22,7) hp=100
+  unit P2 Infantry (22,8) hp=100
+  unit P2 Infantry (23,6) hp=100
+  unit P2 Infantry (23,7) hp=100
+  unit P2 Infantry (25,4) hp=100
+  unit P2 Infantry (26,4) hp=100
+  prop (0,17) City owner=Some(1) cp=200
+  prop (0,18) City owner=Some(1) cp=200
+  prop (0,19) City owner=Some(1) cp=200
+  prop (1,18) City owner=Some(1) cp=200
+  prop (1,19) City owner=Some(1) cp=200
+  prop (2,15) Airport owner=Some(1) cp=300
+  prop (21,8) City owner=Some(2) cp=200
+  prop (22,8) City owner=Some(2) cp=200
+  prop (24,3) Airport owner=Some(2) cp=300
+  prop (24,5) Factory owner=Some(2) cp=200
+  prop (25,3) Airport owner=Some(2) cp=300
+  prop (25,4) Factory owner=Some(2) cp=200
+  prop (25,5) Capital owner=Some(2) cp=400
+  prop (25,6) Factory owner=Some(2) cp=200
+  prop (26,4) Factory owner=Some(2) cp=200
+  prop (26,5) Factory owner=Some(2) cp=200
+  prop (26,6) Factory owner=Some(2) cp=200
+  prop (28,2) City owner=Some(2) cp=200
+  prop (28,3) City owner=Some(2) cp=200
+  prop (28,6) Airport owner=Some(2) cp=300
+  prop (29,2) City owner=Some(2) cp=200
+  prop (29,3) City owner=Some(2) cp=200
+  prop (29,4) City owner=Some(2) cp=200
+  prop (3,15) Factory owner=Some(1) cp=200
+  prop (3,16) Factory owner=Some(1) cp=200
+  prop (3,17) Factory owner=Some(1) cp=200
+  prop (4,15) Factory owner=Some(1) cp=200
+  prop (4,16) Capital owner=Some(1) cp=400
+  prop (4,17) Factory owner=Some(1) cp=200
+  prop (4,18) Airport owner=Some(1) cp=300
+  prop (5,16) Factory owner=Some(1) cp=200
+  prop (5,18) Airport owner=Some(1) cp=300
+  prop (9,14) City owner=None cp=100

@@ -12336,5 +12336,13 @@ mod extended;
 pub use self::extended::*;
 
 // 再編本体と通常／拡張hookの差分契約。
-#[cfg(test)]
-mod planning_contract_tests;
+// 未追跡のテスト資産のため、ファイルが存在する場合だけ build.rs がcfgを立てる。
+// rustfmtはcfgを評価せずにファイルを探すため、マクロ経由で宣言して存在しない
+// クローンでも `cargo fmt` が通るようにする。
+macro_rules! optional_test_module {
+    ($name:ident) => {
+        #[cfg(all(test, openwars_planning_contract_tests))]
+        mod $name;
+    };
+}
+optional_test_module!(planning_contract_tests);
