@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import shutil
 import subprocess
 import sys
@@ -63,8 +64,8 @@ class FunctionMetrics:
     inclusive_cognitive: float
     #: 直下の子space（クロージャ・入れ子関数）の数
     child_spaces: int
-    #: cfg(test) のモジュール内にある関数か（名前・位置からは判定できないため、
-    #: `tests` という名前のspace配下にあるものを印付けする）
+    #: `#[cfg(test)]` のモジュール内にある関数か。RCA 0.0.25はRustの `mod` を
+    #: spaceにしないため、ソースから求めた行範囲で判定する
     in_test_module: bool
 
 
@@ -81,8 +82,117 @@ def _metric_sum(space: dict[str, Any], metric: str, where: str) -> float:
     return float(value)
 
 
+#: 行範囲（両端を含む）。ファイル全体がテストなら (1, math.inf)。
+LineRange = tuple[float, float]
+
+_CFG_TEST = re.compile(r"^\s*#\[cfg\(test\)\]\s*$")
+_MOD_INLINE = re.compile(r"^\s*(pub(\([^)]*\))?\s+)?mod\s+\w+\s*\{")
+_MOD_FILE = re.compile(r"^\s*(pub(\([^)]*\))?\s+)?mod\s+(\w+)\s*;")
+
+
+def _count_braces(line: str) -> int:
+    """1行の `{` と `}` の差。文字列リテラル・文字リテラル・行コメント内は数えない。"""
+    depth = 0
+    in_string = False
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if in_string:
+            if char == "\\":
+                index += 2
+                continue
+            if char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char == "'" and index + 2 < len(line) and line[index + 2] == "'":
+            index += 3
+            continue
+        elif line.startswith("//", index):
+            break
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+        index += 1
+    return depth
+
+
+def test_module_ranges(source: str) -> tuple[list[LineRange], list[str]]:
+    """`#[cfg(test)]` の付いたインラインmodの行範囲と、別ファイルmodの名前を返す。"""
+    lines = source.splitlines()
+    ranges: list[LineRange] = []
+    file_modules: list[str] = []
+    index = 0
+    while index < len(lines):
+        if not _CFG_TEST.match(lines[index]):
+            index += 1
+            continue
+        target = index + 1
+        # 属性やdocコメントが続く場合は読み飛ばす
+        while target < len(lines) and lines[target].strip().startswith(("#[", "///", "//")):
+            target += 1
+        if target >= len(lines):
+            break
+        declared = _MOD_FILE.match(lines[target])
+        if declared:
+            file_modules.append(declared.group(3))
+            index = target + 1
+            continue
+        if not _MOD_INLINE.match(lines[target]):
+            index = target
+            continue
+        # mod行の `{` から、対応する `}` で深さが0へ戻る行までを範囲とする
+        depth = 0
+        end = target
+        for end in range(target, len(lines)):
+            depth += _count_braces(lines[end])
+            if depth <= 0:
+                break
+        ranges.append((target + 1, end + 1))
+        index = end + 1
+    return ranges, file_modules
+
+
+def _module_dir(file: Path) -> Path:
+    """`mod x;` が解決されるディレクトリ。mod.rs/lib.rs/main.rs はそのディレクトリ。"""
+    if file.name in {"mod.rs", "lib.rs", "main.rs"}:
+        return file.parent
+    return file.parent / file.stem
+
+
+def test_line_ranges(files: Iterable[Path]) -> dict[str, list[LineRange]]:
+    """ファイルごとのテスト行範囲。`#[cfg(test)] mod x;` の先はファイル全体をテストとする。"""
+    files = list(files)
+    result: dict[str, list[LineRange]] = {}
+    whole_test_files: set[Path] = set()
+    for file in files:
+        ranges, file_modules = test_module_ranges(file.read_text(encoding="utf-8"))
+        result[str(file)] = ranges
+        for name in file_modules:
+            base = _module_dir(file)
+            for candidate in (base / f"{name}.rs", base / name / "mod.rs"):
+                whole_test_files.add(candidate.resolve())
+    for file in files:
+        if file.resolve() in whole_test_files:
+            result[str(file)] = [(1, math.inf)]
+    # テストファイル配下のサブモジュール（scenario_tests/ 等）もテストとする
+    for file in files:
+        if any(
+            parent == test_file.parent / test_file.stem
+            for test_file in whole_test_files
+            for parent in file.resolve().parents
+        ):
+            result[str(file)] = [(1, math.inf)]
+    return result
+
+
+def _in_ranges(line: int, ranges: Iterable[LineRange]) -> bool:
+    return any(start <= line <= end for start, end in ranges)
+
+
 def _walk_functions(
-    space: dict[str, Any], file: str, in_test_module: bool
+    space: dict[str, Any], file: str, test_ranges: list[LineRange]
 ) -> Iterator[FunctionMetrics]:
     """space木を深さ優先にたどり、関数spaceの直接値・子込み値を求める。"""
     children = space.get("spaces") or []
@@ -90,7 +200,6 @@ def _walk_functions(
         raise MeasureError(f"{file}: spaces が配列ではない")
     kind = space.get("kind")
     name = space.get("name") or "<anonymous>"
-    child_in_test = in_test_module or (kind == "namespace" and name == "tests")
     if kind in FUNCTION_KINDS:
         where = f"{file}:{space.get('start_line', '?')} {name}"
         inclusive_cc = _metric_sum(space, "cyclomatic", where)
@@ -116,19 +225,21 @@ def _walk_functions(
             direct_cognitive=direct_cog,
             inclusive_cognitive=inclusive_cog,
             child_spaces=len(children),
-            in_test_module=in_test_module,
+            in_test_module=_in_ranges(int(space.get("start_line", 0)), test_ranges),
         )
     for child in children:
         if not isinstance(child, dict):
             raise MeasureError(f"{file}: spaceがオブジェクトではない")
-        yield from _walk_functions(child, file, child_in_test)
+        yield from _walk_functions(child, file, test_ranges)
 
 
-def functions_from_unit(unit: dict[str, Any]) -> list[FunctionMetrics]:
+def functions_from_unit(
+    unit: dict[str, Any], test_ranges: list[LineRange] | None = None
+) -> list[FunctionMetrics]:
     """RCAのファイル単位JSONから関数一覧を求める。"""
     if not isinstance(unit, dict) or "name" not in unit:
         raise MeasureError("RCAのファイル単位JSONに name がない")
-    return list(_walk_functions(unit, str(unit["name"]), in_test_module=False))
+    return list(_walk_functions(unit, str(unit["name"]), test_ranges or []))
 
 
 def load_rca_units(path: Path) -> list[dict[str, Any]]:
@@ -214,14 +325,27 @@ def summarize(functions: list[FunctionMetrics]) -> dict[str, Any]:
     return summary
 
 
-def measure(units: Iterable[dict[str, Any]], include_tests: bool) -> dict[str, Any]:
-    """RCAのファイル単位出力から、関数ごとの値と全体集計を作る。"""
-    functions = [
-        function
-        for unit in units
-        for function in functions_from_unit(unit)
-        if include_tests or not function.in_test_module
-    ]
+def measure(
+    units: Iterable[dict[str, Any]],
+    include_tests: bool,
+    test_ranges: dict[str, list[LineRange]] | None = None,
+) -> dict[str, Any]:
+    """RCAのファイル単位出力から、関数ごとの値と全体集計を作る。
+
+    `test_ranges` はファイル名（RCAの `name`）ごとの `#[cfg(test)]` 行範囲。
+    指定が無いファイルはソースが読めれば読み、読めなければテスト判定をしない。
+    """
+    test_ranges = dict(test_ranges or {})
+    functions = []
+    for unit in units:
+        name = str(unit.get("name", "")) if isinstance(unit, dict) else ""
+        if name not in test_ranges and Path(name).is_file():
+            test_ranges.update(test_line_ranges([Path(name)]))
+        functions.extend(
+            function
+            for function in functions_from_unit(unit, test_ranges.get(name, []))
+            if include_tests or not function.in_test_module
+        )
     if not functions:
         raise MeasureError("計測対象の関数が1件もない")
     functions.sort(key=lambda function: (function.file, function.start_line))
@@ -265,8 +389,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--top", type=int, default=0, help="直接CC上位N件を表示")
     args = parser.parse_args(argv)
     try:
-        units = run_rca(args.root) if args.root else load_rca_units(args.rca_json)
-        result = measure(units, include_tests=args.include_tests)
+        if args.root:
+            units = run_rca(args.root)
+            ranges = test_line_ranges(sorted(args.root.rglob("*.rs")))
+        else:
+            units = load_rca_units(args.rca_json)
+            ranges = None
+        result = measure(units, include_tests=args.include_tests, test_ranges=ranges)
     except MeasureError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

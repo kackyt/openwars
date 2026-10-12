@@ -69,14 +69,50 @@ class DirectAndInclusiveTest(unittest.TestCase):
         self.assertEqual(result["summary"]["direct_cyclomatic"]["max"], 3)
 
     def test_test_module_is_excluded_unless_requested(self):
-        test_fn = space("function", "fixture", 7, 9, start=50, end=60)
-        tests = space("namespace", "tests", 7, 9, [test_fn], start=49, end=61)
+        # RCA 0.0.25 は mod をspaceにしないため、テスト関数はunit直下に並ぶ
         body = space("function", "body", 2, 1, start=1, end=3)
-        units = [unit(body, tests)]
-        without = measure.measure(units, include_tests=False)
+        test_fn = space("function", "fixture", 7, 9, start=6, end=8)
+        units = [unit(body, test_fn)]
+        ranges = {"engine/src/ai/sample.rs": [(5, 9)]}
+        without = measure.measure(units, include_tests=False, test_ranges=ranges)
         self.assertEqual(without["summary"]["function_count"], 1)
-        with_tests = measure.measure(units, include_tests=True)
+        with_tests = measure.measure(units, include_tests=True, test_ranges=ranges)
         self.assertEqual(with_tests["summary"]["function_count"], 2)
+
+    def test_cfg_test_module_ranges_from_source(self):
+        source = "\n".join(
+            [
+                "fn body() {}",  # 1
+                "#[cfg(test)]",  # 2
+                "mod tests {",  # 3
+                '    const S: &str = "}";',  # 4 文字列内の } は数えない
+                "    fn a() { if true { } } // }",  # 5
+                "}",  # 6
+                "fn after() {}",  # 7
+                "#[cfg(test)]",  # 8
+                "mod extra_tests;",  # 9
+            ]
+        )
+        ranges, files = measure.test_module_ranges(source)
+        self.assertEqual(ranges, [(3, 6)])
+        self.assertEqual(files, ["extra_tests"])
+
+    def test_cfg_test_file_module_is_whole_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "ai").mkdir()
+            parent = root / "ai" / "mod.rs"
+            parent.write_text("#[cfg(test)]\nmod scenario_tests;\nfn body() {}\n", encoding="utf-8")
+            child = root / "ai" / "scenario_tests.rs"
+            child.write_text("fn fixture() {}\n", encoding="utf-8")
+            nested_dir = root / "ai" / "scenario_tests"
+            nested_dir.mkdir()
+            nested = nested_dir / "extended.rs"
+            nested.write_text("fn more() {}\n", encoding="utf-8")
+            ranges = measure.test_line_ranges([parent, child, nested])
+            self.assertEqual(ranges[str(parent)], [])
+            self.assertEqual(ranges[str(child)][0][0], 1)
+            self.assertEqual(ranges[str(nested)][0][0], 1)
 
     def test_unsupported_metrics_are_named(self):
         body = space("function", "body", 1, 0)
