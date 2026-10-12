@@ -1,8 +1,8 @@
-//! 同一seed・同一AI版の対局が、同じプロセス内で繰り返しても同じ行動列になることを検証する。
+//! 同一seed・同一AI版の対局が、繰り返しても同じ行動列になることを検証する。
 //!
-//! std の `RandomState` はHashMapごとに異なる鍵を使うため、反復順に依存する判断が
-//! 残っていると、同じプロセス内の2局目でも行動列が分岐する。プロセスを跨いだ
-//! 揺れ（対戦スイープで観測された通常経路の分岐）と同じ原因を、1プロセスで検出する。
+//! 同じプロセス内で同じ対局を2回行い、行動列を比べる。プロセスを跨いだ再現性
+//! （ahashの鍵がプロセスごとに変わり、ECSクエリの列挙順が変わる問題）は1プロセスでは
+//! 検出できないため、`print_decision_fingerprints` の出力を別プロセス間で比べる。
 
 use engine::ai::ai_version::{AiVersion, PlayerAiSettings};
 use engine::ai::engine::execute_ai_turn;
@@ -90,4 +90,53 @@ fn standard_map_25_replays_identically() {
 #[test]
 fn small_map_replays_identically() {
     assert_replays_identically("map_1", 1, AiVersion::V4, AiVersion::V200, 8);
+}
+
+/// 対戦スイープと同じ条件の行動列指紋を出力する（`OPENWARS_FINGERPRINT=1` のときだけ実行）。
+///
+/// 旧新の実装で同じ指紋になれば、その条件で判断・順序・出力が一致している。
+#[test]
+fn print_decision_fingerprints() {
+    if std::env::var_os("OPENWARS_FINGERPRINT").is_none() {
+        return;
+    }
+    use std::hash::{Hash, Hasher};
+    let maps = std::env::var("OPENWARS_FINGERPRINT_MAPS")
+        .unwrap_or_else(|_| "map_1,map_2,map_6,map_25".to_string());
+    for map in maps.split(',') {
+        let seeds: Vec<u64> = std::env::var("OPENWARS_FINGERPRINT_SEEDS")
+            .map(|v| v.split(',').filter_map(|s| s.parse().ok()).collect())
+            .unwrap_or_else(|_| vec![1, 2]);
+        let orders = match std::env::var("OPENWARS_FINGERPRINT_ORDER").as_deref() {
+            Ok("swapped") => vec![(AiVersion::V200, AiVersion::V4)],
+            Ok("as-given") => vec![(AiVersion::V4, AiVersion::V200)],
+            _ => vec![
+                (AiVersion::V4, AiVersion::V200),
+                (AiVersion::V200, AiVersion::V4),
+            ],
+        };
+        let turns = std::env::var("OPENWARS_FINGERPRINT_TURNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+        for seed in seeds.iter().copied() {
+            for (p1, p2) in orders.iter().copied() {
+                let actions = play(map, seed, p1, p2, turns);
+                if let Some(dir) = std::env::var_os("OPENWARS_FINGERPRINT_DUMP") {
+                    let path = std::path::PathBuf::from(dir).join(format!(
+                        "{map}_s{seed}_{p1:?}-{p2:?}_{}.txt",
+                        std::process::id()
+                    ));
+                    std::fs::write(path, actions.join("\n")).unwrap();
+                }
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                actions.hash(&mut hasher);
+                println!(
+                    "FINGERPRINT {map} seed={seed} {p1:?}-{p2:?} actions={} hash={:016x}",
+                    actions.len(),
+                    hasher.finish()
+                );
+            }
+        }
+    }
 }
