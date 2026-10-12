@@ -64,6 +64,11 @@ class FunctionMetrics:
     inclusive_cognitive: float
     #: 直下の子space（クロージャ・入れ子関数）の数
     child_spaces: int
+    #: 計画書の見積りと同じ定義のCC（名前付き関数のみ。クロージャ内の分岐は含め、
+    #: クロージャごとの基底+1と入れ子の名前付き関数を除く）。クロージャ自身はNone
+    plan_cyclomatic: float | None
+    #: 同じ定義の認知的複雑度（入れ子の名前付き関数を除く）。クロージャ自身はNone
+    plan_cognitive: float | None
     #: `#[cfg(test)]` のモジュール内にある関数か。RCA 0.0.25はRustの `mod` を
     #: spaceにしないため、ソースから求めた行範囲で判定する
     in_test_module: bool
@@ -191,6 +196,33 @@ def _in_ranges(line: int, ranges: Iterable[LineRange]) -> bool:
     return any(start <= line <= end for start, end in ranges)
 
 
+def _is_closure(space: dict[str, Any]) -> bool:
+    """RCAはクロージャを名前 `<anonymous>` の関数spaceとして出力する。"""
+    return space.get("kind") in FUNCTION_KINDS and (
+        not space.get("name") or space.get("name") == "<anonymous>"
+    )
+
+
+def _plan_values(space: dict[str, Any], where: str) -> tuple[float, float]:
+    """計画書の定義の CC・認知的複雑度を求める（名前付き関数spaceに対して呼ぶ）。"""
+    cc = _metric_sum(space, "cyclomatic", where)
+    cognitive = _metric_sum(space, "cognitive", where)
+    stack = list(space.get("spaces") or [])
+    while stack:
+        child = stack.pop()
+        if _is_closure(child):
+            # クロージャの分岐は親に含めたまま、基底の+1だけを除く
+            cc -= 1
+            stack.extend(child.get("spaces") or [])
+        elif child.get("kind") in FUNCTION_KINDS:
+            # 入れ子の名前付き関数は別の関数として数える
+            cc -= _metric_sum(child, "cyclomatic", where)
+            cognitive -= _metric_sum(child, "cognitive", where)
+        else:
+            stack.extend(child.get("spaces") or [])
+    return cc, cognitive
+
+
 def _walk_functions(
     space: dict[str, Any], file: str, test_ranges: list[LineRange]
 ) -> Iterator[FunctionMetrics]:
@@ -215,6 +247,9 @@ def _walk_functions(
                 f"{where}: 子spaceの合計が親の値を超える（cc {inclusive_cc} < {child_cc} "
                 f"または cognitive {inclusive_cog} < {child_cog}）"
             )
+        plan_cc, plan_cog = (
+            (None, None) if _is_closure(space) else _plan_values(space, where)
+        )
         yield FunctionMetrics(
             file=file,
             name=name,
@@ -225,6 +260,8 @@ def _walk_functions(
             direct_cognitive=direct_cog,
             inclusive_cognitive=inclusive_cog,
             child_spaces=len(children),
+            plan_cyclomatic=plan_cc,
+            plan_cognitive=plan_cog,
             in_test_module=_in_ranges(int(space.get("start_line", 0)), test_ranges),
         )
     for child in children:
@@ -305,6 +342,25 @@ def percentile(values: list[float], fraction: float) -> float:
     return ordered[rank - 1]
 
 
+def summarize_plan(functions: list[FunctionMetrics]) -> dict[str, Any]:
+    """計画書の効果見積りと同じ定義・同じ指標名で、名前付き関数を集計する。"""
+    named = [function for function in functions if function.plan_cyclomatic is not None]
+    if not named:
+        raise MeasureError("名前付き関数が1件もない")
+    cc = [function.plan_cyclomatic for function in named]
+    cognitive = [function.plan_cognitive for function in named]
+    return {
+        "n": len(named),
+        "sum": sum(cc),
+        "max": max(cc),
+        "p95": percentile(cc, 0.95),
+        "over15": sum(1 for value in cc if value > 15),
+        "over50": sum(1 for value in cc if value > 50),
+        "cog_sum": sum(cognitive),
+        "cog_max": max(cognitive),
+    }
+
+
 def summarize(functions: list[FunctionMetrics]) -> dict[str, Any]:
     """全体の最大・P95・合計を、直接値と子込み値で別々に求める。"""
     summary: dict[str, Any] = {"function_count": len(functions)}
@@ -357,6 +413,7 @@ def measure(
         },
         "unsupported": UNSUPPORTED_METRICS,
         "summary": summarize(functions),
+        "plan_summary": summarize_plan(functions),
         "functions": [asdict(function) for function in functions],
     }
 
