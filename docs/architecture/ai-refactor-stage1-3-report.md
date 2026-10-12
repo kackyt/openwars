@@ -77,7 +77,7 @@ map_1/2/6/25 × seed 1,2 × 先後 × 1局、基準バイナリを2変種とし�
 
 | コマンド | 結果 |
 |---|---|
-| `cargo test -p engine --lib` | 860 passed（基準コミットは未追跡ファイル欠落でコンパイル不可だった） |
+| `cargo test -p engine --lib` | 858 passed, 1 ignored（基準コミットは未追跡ファイル欠落でコンパイル不可だった） |
 | `cargo test -p engine --test ai_multi_turn_baseline --test ai_architecture_baseline` | 8 + 4 passed（基準コミット生成のgoldenと一致。R+S後も一致） |
 | `cargo test -p engine --test ai_decision_contracts` | 4 passed |
 | `cargo fmt --all -- --check` / `cargo clippy --all-targets --all-features -- -D warnings` | 警告なし |
