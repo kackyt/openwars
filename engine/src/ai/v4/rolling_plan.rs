@@ -356,8 +356,29 @@ impl SimulationCatalog {
         if crate::ai::code_path::is_extended_at("v4/rolling_plan.rs::new") {
             return Self::new_extended(input);
         }
+        // 同じ施設・兵種の生産案は生産turnだけが違う。交戦条件の表は1回だけ作り、
+        // 行動可能turnだけを生産案ごとに当てはめる。
+        let mut templates: HashMap<(GridPosition, UnitType), EngagementTemplate> =
+            HashMap::default();
         Self::new_with_production_initializer(input, |_, option| {
-            sim_production_friendly(input, option, true)
+            let key = (option.purchase.facility, option.purchase.unit_type);
+            let available_turn = option.purchase.build_turn.saturating_add(1);
+            match templates.get(&key) {
+                Some(template) if template.matches(option) => {
+                    template.instantiate(available_turn, 100, true, None)
+                }
+                _ => {
+                    let template = EngagementTemplate::build(
+                        input,
+                        &option.stats,
+                        option.purchase.facility,
+                        &option.engageable_enemy_indices,
+                    );
+                    let simulated = template.instantiate(available_turn, 100, true, None);
+                    templates.insert(key, template);
+                    simulated
+                }
+            }
         })
     }
 
@@ -1227,94 +1248,170 @@ fn sim_friendly(
         } else {
             None
         };
-    let total_ammo = source
-        .stats
-        .max_ammo1
-        .saturating_add(source.stats.max_ammo2)
-        .max(1);
-    let fuel_turns = source
-        .stats
-        .max_fuel
-        .checked_div(source.stats.daily_fuel_consumption)
-        .unwrap_or(u32::MAX);
-    // 敵・友軍位置と兵種は1回のRolling Plan探索中は不変である。同じbeam内の
-    // 数千候補で距離・相性・接触turnを再計算せず、敵indexに対応する表へ固定する。
-    debug_assert!(
-        source
-            .engageable_enemy_indices
-            .windows(2)
-            .all(|pair| pair[0] < pair[1]),
-        "交戦可能敵indexは盤面走査順の昇順で保持する"
-    );
-    let mut attack_profiles = Vec::with_capacity(input.enemies.len());
-    let mut enemy_attack_profiles = Vec::with_capacity(input.enemies.len());
-    for (enemy_index, enemy) in input.enemies.iter().enumerate() {
-        let distance = input.map.distance(
-            source.position.x,
-            source.position.y,
-            enemy.position.x,
-            enemy.position.y,
-        );
-        let base_damage = best_damage(
-            &input.damage_chart,
-            source.stats.unit_type,
-            enemy.stats.unit_type,
-        );
-        let can_attack = source
-            .engageable_enemy_indices
-            .binary_search(&enemy_index)
-            .is_ok()
-            && base_damage > 0;
-        attack_profiles.push(can_attack.then(|| {
-            FriendlyAttackProfile {
-                firing_position: None,
-                requires_movement: false,
-                base_damage,
-                incoming_damage: super::combat_profile::planned_counter_damage(
-                    &input.master_data,
-                    &input.damage_chart,
-                    &source.stats,
-                    &enemy.stats,
-                    distance,
-                ),
-                ready_turn: source
-                    .available_turn
-                    .saturating_add(attack_readiness_turns(distance, &source.stats)),
-            }
-        }));
-
-        let enemy_base_damage = best_damage(
-            &input.damage_chart,
-            enemy.stats.unit_type,
-            source.stats.unit_type,
-        );
-        let enemy_travel = attack_readiness_turns(distance, &enemy.stats);
-        let friendly_travel = distance
-            .saturating_sub(enemy.stats.max_range.max(1))
-            .div_ceil(source.stats.max_movement.max(1));
-        let enemy_contact_turn = enemy.available_turn.saturating_add(enemy_travel);
-        let contact_turn = if can_advance_to_enemy {
-            enemy_contact_turn.min(source.available_turn.saturating_add(friendly_travel))
-        } else {
-            enemy_contact_turn
-        };
-        enemy_attack_profiles.push((enemy_base_damage > 0).then_some(EnemyAttackProfile {
-            base_damage: enemy_base_damage,
-            contact_turn,
-        }));
-    }
-    SimFriendly {
-        purchase: None,
-        capture_contract: None,
+    EngagementTemplate::build(
+        input,
+        &source.stats,
+        source.position,
+        &source.engageable_enemy_indices,
+    )
+    .instantiate(
+        source.available_turn,
+        source.hp,
+        can_advance_to_enemy,
         protection_completion_turn,
-        survived_protection_completion: None,
-        stats: source.stats.clone(),
-        hp: source.hp,
-        initial_hp: source.hp,
-        available_turn: source.available_turn,
-        attacks_left: total_ammo.min(fuel_turns.max(1)),
-        attack_profiles: attack_profiles.into(),
-        enemy_attack_profiles: enemy_attack_profiles.into(),
+    )
+}
+
+/// 友軍1体と各敵の交戦条件のうち、行動可能turnに依存しない部分。
+///
+/// 敵・友軍位置と兵種は1回のRolling Plan探索中は不変である。同じbeam内の
+/// 数千候補で距離・相性・接触turnを再計算せず、敵indexに対応する表へ固定する。
+struct EngagementTemplate {
+    stats: UnitStats,
+    engageable_enemy_indices: Vec<usize>,
+    attacks_left: u32,
+    rows: Vec<EngagementRow>,
+}
+
+/// 敵1体との交戦条件。turnは友軍の行動可能turnからの相対値で持つ。
+#[derive(Debug, Clone, Copy)]
+struct EngagementRow {
+    /// 友軍から攻撃できる場合の (基礎damage, 被反撃damage, 射撃位置までのturn)。
+    attack: Option<(u32, u32, u32)>,
+    /// 敵からこの友軍への基礎damage（0なら攻撃されない）。
+    enemy_base_damage: u32,
+    /// 敵が自力で射程へ入るturn（絶対値）。
+    enemy_contact_turn: u32,
+    /// 友軍が敵の射程へ入るまでの移動turn。
+    friendly_travel: u32,
+}
+
+impl EngagementTemplate {
+    fn build(
+        input: &RollingPlanInput,
+        stats: &UnitStats,
+        position: GridPosition,
+        engageable_enemy_indices: &[usize],
+    ) -> Self {
+        let total_ammo = stats.max_ammo1.saturating_add(stats.max_ammo2).max(1);
+        let fuel_turns = stats
+            .max_fuel
+            .checked_div(stats.daily_fuel_consumption)
+            .unwrap_or(u32::MAX);
+        debug_assert!(
+            engageable_enemy_indices
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "交戦可能敵indexは盤面走査順の昇順で保持する"
+        );
+        let rows = input
+            .enemies
+            .iter()
+            .enumerate()
+            .map(|(enemy_index, enemy)| {
+                let distance =
+                    input
+                        .map
+                        .distance(position.x, position.y, enemy.position.x, enemy.position.y);
+                let base_damage =
+                    best_damage(&input.damage_chart, stats.unit_type, enemy.stats.unit_type);
+                let can_attack = engageable_enemy_indices
+                    .binary_search(&enemy_index)
+                    .is_ok()
+                    && base_damage > 0;
+                let attack = can_attack.then(|| {
+                    (
+                        base_damage,
+                        super::combat_profile::planned_counter_damage(
+                            &input.master_data,
+                            &input.damage_chart,
+                            stats,
+                            &enemy.stats,
+                            distance,
+                        ),
+                        attack_readiness_turns(distance, stats),
+                    )
+                });
+                let enemy_travel = attack_readiness_turns(distance, &enemy.stats);
+                EngagementRow {
+                    attack,
+                    enemy_base_damage: best_damage(
+                        &input.damage_chart,
+                        enemy.stats.unit_type,
+                        stats.unit_type,
+                    ),
+                    enemy_contact_turn: enemy.available_turn.saturating_add(enemy_travel),
+                    friendly_travel: distance
+                        .saturating_sub(enemy.stats.max_range.max(1))
+                        .div_ceil(stats.max_movement.max(1)),
+                }
+            })
+            .collect();
+        Self {
+            stats: stats.clone(),
+            engageable_enemy_indices: engageable_enemy_indices.to_vec(),
+            attacks_left: total_ammo.min(fuel_turns.max(1)),
+            rows,
+        }
+    }
+
+    /// 同じ表を使える生産案か（兵種性能と交戦可能な敵が同じ）。
+    fn matches(&self, option: &ProductionPlanOption) -> bool {
+        self.stats == option.stats
+            && self.engageable_enemy_indices == option.engageable_enemy_indices
+    }
+
+    fn instantiate(
+        &self,
+        available_turn: u32,
+        hp: u32,
+        can_advance_to_enemy: bool,
+        protection_completion_turn: Option<u32>,
+    ) -> SimFriendly {
+        let attack_profiles = self
+            .rows
+            .iter()
+            .map(|row| {
+                row.attack.map(|(base_damage, incoming_damage, readiness)| {
+                    FriendlyAttackProfile {
+                        firing_position: None,
+                        requires_movement: false,
+                        base_damage,
+                        incoming_damage,
+                        ready_turn: available_turn.saturating_add(readiness),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let enemy_attack_profiles = self
+            .rows
+            .iter()
+            .map(|row| {
+                let contact_turn = if can_advance_to_enemy {
+                    row.enemy_contact_turn
+                        .min(available_turn.saturating_add(row.friendly_travel))
+                } else {
+                    row.enemy_contact_turn
+                };
+                (row.enemy_base_damage > 0).then_some(EnemyAttackProfile {
+                    base_damage: row.enemy_base_damage,
+                    contact_turn,
+                })
+            })
+            .collect::<Vec<_>>();
+        SimFriendly {
+            purchase: None,
+            capture_contract: None,
+            protection_completion_turn,
+            survived_protection_completion: None,
+            stats: self.stats.clone(),
+            hp,
+            initial_hp: hp,
+            available_turn,
+            attacks_left: self.attacks_left,
+            attack_profiles: attack_profiles.into(),
+            enemy_attack_profiles: enemy_attack_profiles.into(),
+        }
     }
 }
 
