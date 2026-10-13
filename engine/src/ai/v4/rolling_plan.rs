@@ -1130,8 +1130,13 @@ impl<'c> CombatRun<'c> {
             // 既存unitの後に生産unitが並ぶ。同じdamage・HPなら後方の要素を選ぶ従来の順序を保つ。
             let combat_target = match (existing_target, production_target) {
                 (Some(existing), Some(produced))
-                    if (existing.1, attack_priority(&self.friendly_states, existing.0))
-                        > (produced.1, attack_priority(&self.friendly_states, produced.0)) =>
+                    if (
+                        existing.1,
+                        attack_priority(&self.friendly_states, existing.0),
+                    ) > (
+                        produced.1,
+                        attack_priority(&self.friendly_states, produced.0),
+                    ) =>
                 {
                     Some(existing)
                 }
@@ -1366,10 +1371,8 @@ impl EngagementTemplate {
                         .distance(position.x, position.y, enemy.position.x, enemy.position.y);
                 let base_damage =
                     best_damage(&input.damage_chart, stats.unit_type, enemy.stats.unit_type);
-                let can_attack = engageable_enemy_indices
-                    .binary_search(&enemy_index)
-                    .is_ok()
-                    && base_damage > 0;
+                let can_attack =
+                    engageable_enemy_indices.binary_search(&enemy_index).is_ok() && base_damage > 0;
                 let attack = can_attack.then(|| {
                     (
                         base_damage,
@@ -1441,15 +1444,15 @@ impl EngagementTemplate {
             .rows
             .iter()
             .map(|row| {
-                row.attack.map(|(base_damage, incoming_damage, readiness)| {
-                    FriendlyAttackProfile {
+                row.attack.map(
+                    |(base_damage, incoming_damage, readiness)| FriendlyAttackProfile {
                         firing_position: None,
                         requires_movement: false,
                         base_damage,
                         incoming_damage,
                         ready_turn: available_turn.saturating_add(readiness),
-                    }
-                })
+                    },
+                )
             })
             .collect::<Vec<_>>();
         let enemy_attack_profiles = self
@@ -1511,9 +1514,7 @@ fn select_target(
             break;
         }
         let enemy_hp = enemy_states[index].hp;
-        if enemy_hp == 0
-            || turn < enemies[index].source.available_turn
-            || turn < profile.ready_turn
+        if enemy_hp == 0 || turn < enemies[index].source.available_turn || turn < profile.ready_turn
         {
             continue;
         }
@@ -1587,10 +1588,7 @@ fn strongest_attack_in_damage_order(
         if best.is_some_and(|(best_damage, _, _)| damage < best_damage) {
             break;
         }
-        if unit_states[index].hp == 0
-            || turn < unit.available_turn
-            || turn < profile.contact_turn
-        {
+        if unit_states[index].hp == 0 || turn < unit.available_turn || turn < profile.contact_turn {
             continue;
         }
         let key = (damage, attack_priority(unit_states, index), index);
