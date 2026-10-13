@@ -27,6 +27,7 @@ pub mod strategy_profile;
 
 pub mod beam_search;
 pub mod cluster;
+pub(crate) mod runtime;
 pub mod simulation;
 pub mod squad;
 pub(crate) mod tactics;
