@@ -1,7 +1,7 @@
 # AI再設計 v3: 目標構造と最初の段階の提案
 
 `refactor/ai-redesign-v2` を土台に、共通基盤と小規模V4拡張の分離、依存方向、状態の正本を
-整理するための調査結果と提案。**この文書の段階では実装していない。§C と最初の段階の提案は作成中（下書き）。**最初の段階の範囲は末尾で提案し、
+整理するための調査結果と提案。**この文書の段階では実装していない。**最初の段階の範囲は末尾で提案し、
 承認後に着手する。
 
 ## 0. 基準
@@ -171,7 +171,77 @@ runtime::observe::formation(&squads, &decision)         … 編成結果の観�
 
 ## C. 所属・計画・配備の正本
 
-（作成中: 台帳ごとの正本・更新者・修復処理の調査を反映する）
+調査方法: コード読解に加え、作業ツリー外の複製へ計測用の出力だけを足し、map_1/2/6/25 × seed1 × 両手番 × 30T を
+実行した（fingerprintは計測なしと一致）。
+
+### 台帳ごとの正本と派生
+
+| 台帳 | 正本か派生か | 現在の書込み | 問題 |
+|---|---|---|---|
+| `SquadManager`（Squad.members ほか） | 事実上の書込み元。作戦ownerは `target_island` から派生 | 約25関数（編成・輸送・campaign・配備・修復） | 追記だけの書込み（campaign輸送）と、同じ島のSquadを丸ごと消す書込み（`assign_campaign_responsibilities`）が混在 |
+| `UnitOperationRegistry` | 文書上の「作戦割当の正本」。実際は毎回 SquadManager から作り直し、行動選択はこちらを読む | reconcile・claim・輸送波・撃破時 | 勝者が決まらない移管（campaign→別campaign/戦術）で、全Squadから外れたのに古い `squad_id` 付きのCampaign所属が残る |
+| `PlanContractRegistry.contracts` | 正本（物件契約のidと版） | 生産計画の維持/再計画 | ― |
+| `PlanContractRegistry` の entity台帳（`entity_assignments`/`entity_bindings`） | **書くだけで読まれない複製**（`AlreadyAssigned` の警告出力だけ）。解放もされない | 生産unitの束縛 | 削除できる |
+| `VictoryRoadmapRegistry` の割当 | 派生（監査）。ただし `active_capital_entities` が所有権claimの保護に、首都目標が輸送波の目標に戻る | 編成の後（通常は最終正規化の前、小規模は後に2回） | 監査の投影が次の判断の入力になっている |
+| `V4DeploymentRegistry` | 生産意図の正本。`squad_id`/`active` は派生 | 生産確定・生産イベント・配備Squad準備 | ― |
+| `V4CampaignExecutionRegistry` | 生産命令↔Entityの状態の正本 | 生産確定・発行・生産イベント・撃破 | 配備台帳と**同じ `UnitProducedEvent` を別々にSquadへ解決**し、1体が2つのSquadに入りうる |
+| 首都ルートDAGの経路・Node台帳 | 派生。**不安定な SquadId** をキーにし、`commitment_members` がid変更を跨いで指令を引き継ぐ修復cache | 編成の後 | SquadIdの作り直しで指令が切れる |
+| campaign portfolio | 派生（毎回 SquadManager・所属・生産記録から作る）。それが所属を書く入力になる | 戦略分析 | ― |
+| `AiTurnStrategyCache` のportfolio | **編成前**のsnapshot。手番の残りの間は古い | 編成の途中 | 生産・戦略・手番末の再接続が古い一覧を読む |
+
+ID: `SquadId` の発番は1か所（＋輸送波での手動発番）だが、複製先7台帳は作り直しのたびに古くなる。
+`StrategicOperationId` は Roadmap と PlanContract が**別々に1から発番**し、値が衝突する（現状、両者を比べる箇所はない）。
+生産slotのid型は配備用と campaign用の2種類がある。
+
+### 修復処理が補っているもの（実測）
+
+| 処理 | 実行時期 | 補っている不整合 | その不整合を生む上流 |
+|---|---|---|---|
+| `reconcile_unique_operation_assignments` | 編成の入口・固定点の各周に2回・最終・手番末 | 1体が複数Squadに入る、死亡、輸送役が members に居ない、所属のずれ | campaign輸送の追記、生産イベントの二重解決、積荷の引渡しでの新Squad、`update_squads` が非活性の島で `target_island` を消す |
+| `reconnect_current_v4_operations` | 固定点の各周の1手目 | 所属はCampaignなのにcache上の割当一覧に居ないunit | 割当一覧（cache）が古い。しかも自分が全campaignを組み直すため、配備Squadを消して別idで作り直し、**自分で新しい孤立unitを作る**（map_1の1周目で63体） |
+| `reconnect_unassigned_transport_waves` | 固定点の各周の3手目 | どのSquadにも居ない占領兵・輸送役 | 上の孤立、Return完了で空いた輸送役、通常経路の生産 |
+| `reconnect_v4_operation_fixed_point`（最大3周） | 編成の後・手番末 | 1周目の組み直しで生まれた孤立 | ― |
+| `assign_explicit_reserve_squads` | 固定点の後 | 残った未所属を明示Reserveにする | ― |
+| `reconcile_v4_end_turn_reserves` | V4で通常行動が尽きるたび | 手番途中の撃破・搭乗変更・生産で所属を失ったunit | ― |
+
+固定点の周回数（実測）:
+
+- map_1（小規模）: 52回中23回が2周目に入り、3周目は0回。2周目は未所属を減らしたことがなく、
+  1周目の組み直しが作った孤立のためだけに回っていた。23回中21回は**同じSquadを新しいidで作り直しただけ**
+  （延べ Attack171・Capture21・Defense18・Transport2）、2回だけ実際に所属が変わった
+  （輸送波でCampaignへ付けたunitを、2周目の組み直しが局地Captureへ移す）。
+- map_2: 66回中3回が2周目、そのうち2回で所属が変わった。
+- map_6・map_25（通常）: 各329回、すべて1周で収束。勝者なしの移管も0件。
+- 手番末の再接続: 未所属になったunitはすべて行動済みで、**同じ手番の行動を可能にした例はない**。
+  効果は次手番の入力だけ。
+
+結論: 固定点が本当に補っているのは「割当一覧（cache）が古いこと」と「campaignの組み直しが配備Squadを消して
+作り直すこと」の2つ。周回を減らすだけでは原因が残る（計画書の「反復上限を下げただけは不合格」と一致）。
+
+### 目標
+
+- 所属の正本は1つ（`planning/assignment.rs` の `OperationLedger`。現 `UnitOperationRegistry` を発展させる）。
+  更新は `propose → resolve（競合解消・検証）→ commit(AssignmentDelta)` の1入口だけ。
+  `Squad.members` は ledger の投影にし、members から所属を逆算しない。
+- campaignの組み直しは「同じ島のSquadを消して作る」のではなく、差分（追加・移動・解放）を提案する。
+- 生産イベントの解決は1か所（配備と campaign の生産slotを1つの `on_produced` に）。
+- 割当一覧のcacheは、ledgerのcommit**後**に作る（古い一覧を読ませない）。
+- DAG台帳は安定した作戦idで引き、`commitment_members` の引継ぎcacheを廃止する。
+- 戦略作戦id・物件契約id・PlanId/Step・SquadId を別の型にする。
+
+区分:
+
+| 変更 | 区分 | 根拠 |
+|---|---|---|
+| PlanContract の書くだけのentity台帳の削除 | R | 読み手がいない |
+| PlanContract の作戦idを別の型に（値は変えない） | R | 比較箇所がない |
+| 撃破時の解放経路を1本に（`retain_live_entities` とイベント側の重複） | R（fingerprintで確認） | 同じ解放を2回している |
+| 生産イベントの解決を1か所に | Rの可能性。現在の勝者規則を厳密に再現できた場合だけ | 正規化が決める勝者と同じ結果が必要 |
+| 固定点の2周目以降をなくす／配備Squadの作り直しをやめる | **S** | SquadIdの作り直しは `squad.id` の同点処理・Squad順・DAG指令に効く。map_1で2/23回は所属も変わる |
+| 輸送波・明示Reserve・手番末再接続の廃止や変更 | **S** | 次手番の分析・正規化の入力が変わる |
+| 割当一覧cacheをcommit後に作る | **S** | 生産・戦略が読む一覧が変わる |
+| 正規化の勝者規則、claimの解放・保護、`update_squads` の `target_island` 消去 | **S**（方策そのもの） | ― |
+
 
 ## D. 生産の契約（stage3-wip からの取り込み評価）
 
@@ -235,4 +305,48 @@ wip の性能悪化の原因（コード読解）: 施設確定後の再予測�
 
 ## 最初の段階の提案
 
-（作成中: §C の調査結果を反映してから記載する）
+### 段階の順序（全体）
+
+| 段階 | 内容 | 区分 | 依存 |
+|---|---|---|---|
+| **1（最初）** | A: 依存方向の確立と `AiTurnStrategyCache` の分割／D-1・D-2: 失敗しない予約と発行検証の強化／C: PlanContractの書くだけの台帳削除と作戦id型の分離 | すべてR | ― |
+| 2 | B: 盤面snapshot（`context`）・状況判断・campaign提案・採用（`TurnDecision`）・編成提案の分離。8個のhookを2つの方策enumへ | R（Roadmap 2回目の選択などは別のS） | 1 |
+| 3 | C: `OperationLedger` の1入口化、生産イベントの解決の一本化、D-3（施設確定の1段化）・D-4（requested/effective） | R部分を先に、固定点・cache・Squad作り直しはSとして1件ずつ | 2 |
+| 4 | 後攻小規模の戦略改善（ログで診断した仮説を1件ずつ） | S | 診断は並行可、採用判断は3の後の基準で |
+
+1を最初にする理由: BとCが必要とする置き場所（`command`・`context`・`runtime` の状態・`planning` の判断）と
+一方向の依存を先に作る。どれも判断を変えないので全行動履歴の一致で受け入れられ、Sの評価と混ざらない。
+D-1・D-2は、以後の生産の変更で失敗を隠さないための安全網になる。
+
+### 段階1の作業順（各項目を1〜数コミットに分け、各コミットでRの検証を行う）
+
+1. `ai/command.rs` を作り `AiCommand` を移す。`execute_ai_command` を `runtime/issue.rs` へ。
+2. `context/tactical.rs` へ `AiTacticalSnapshot`・`strategic_target_value`・`has_capturable_property_at`・`is_unit_stranded`。
+3. tactics側: `ActionPriority`・`AMBUSH_*` を `tactics/scoring.rs`、campaign制約を `tactics/campaign.rs`、
+   `air_move_preserves_return_fuel` を `tactics/candidates.rs`、小規模V4のSquad実行器を `tactics/small_map/squad_executor.rs`。
+4. runtime側: 生産queue・cooldownを `runtime/production_queue.rs`。
+5. `AiTurnStrategyCache` を持ち主ごとに分割（距離cache→tactics、`squads_planned`→runtime、生産旗→production、
+   採用portfolio→planning。採用portfolioはBの `TurnDecision` の前身として型だけ分ける）。
+6. V1（`decide_ai_action`・`execute_ai_turn_v1`）を `ai/v1/` へ。`engine.rs` は外部APIの入口だけにする。
+7. `scripts/measure_ai_structure.py` に逆依存（tactics/context/command → runtime/engine）の計数を追加し、0を確認。
+8. D-1: `AllocationState::try_claim -> Result` と移植テスト（v2で現状失敗するものが成功に変わることを確認）。
+9. D-2: `validate_issue` に手番・行動中player・Mainフェーズ・終局の検査を加え、campaignの発行経路にも適用。移植テスト2件。
+10. C: PlanContract の entity台帳の削除、物件契約の作戦idを専用型に。
+
+### 段階1の受入条件
+
+- 判断: 各コミットで判断fingerprint（V1〜V4、各18条件）が基準と完全一致。段階末に主比較
+  （map_1/2/6/25/32 × seed1〜6 × 両手番 × 60T、60局）で全局の全行動履歴が基準と一致。差が出たら最初の分岐と原因を
+  特定し、挙動を戻すかSとして切り出す（goldenは更新しない）。
+- 構造: 上の完了条件1〜5。変更前後の依存図・型と状態の持ち主・更新入口を文書で示す。
+- 性能: 同じビルド・条件（単一スレッド＋既定並列）で map_6 seed1 後攻60T の平均・p95・最悪step・生産判断時間が
+  基準からA/Aノイズを超えて悪化しない。
+- 複雑度: 同じ計測器・定義・テスト除外で前後比較（変更対象の関数・多引数・重複・依存方向も報告）。
+- テスト: `cargo test`、`cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`、
+  `cargo check -p engine --target wasm32-unknown-unknown`（基準で成功を確認済み）。
+
+### 段階1の所要（見積り）
+
+実装と各コミットのfingerprint確認で数時間、段階末の主比較（基準は固定バイナリの結果を再利用）で約35分＋性能計測約10分。
+最終の非劣後評価（504局、約4.5時間/バイナリ）はSを採否判断するときに行い、Rだけの段階1では行わない提案とする。
+
