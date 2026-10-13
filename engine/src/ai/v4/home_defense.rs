@@ -1,7 +1,7 @@
 //! 所有拠点へ向かう敵占領役に対し、占領期限から地上戦力を排他的に割り当てる。
 //! 進軍DAGのセル順ではなく、拠点を射程に収める配置と実経路の到着時刻を使う。
 
-use crate::ai::engine::AiCommand;
+use crate::ai::command::AiCommand;
 use crate::ai::islands::IslandMap;
 use crate::ai::turn_distance::{
     ActionTurnDistance, ActionTurnDistanceCache, calculate_action_distance_to_range,

@@ -6,7 +6,7 @@
 use super::candidate_field::CandidateTile;
 use super::route_field::{build_route_field, build_route_field_to_any};
 use crate::ai::AiVersion;
-use crate::ai::engine::AiCommand;
+use crate::ai::command::AiCommand;
 use crate::collections::{HashMap, HashSet};
 use crate::components::{
     ActionCompleted, CargoCapacity, Faction, Fuel, GridPosition, HasMoved, Health, PlayerId,

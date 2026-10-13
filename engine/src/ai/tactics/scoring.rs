@@ -7,11 +7,11 @@
 use super::approach::{ApproachDistances, approach_bonus, manhattan, nearest_approach_bonus};
 use super::board::TacticalBoard;
 use super::unit::UnitState;
-use crate::ai::engine::{
-    AMBUSH_APPROACH_MARGIN, AMBUSH_IN_RANGE_BONUS, AMBUSH_NEAR_RANGE_BONUS,
-    AMBUSH_TOO_CLOSE_PENALTY, ActionPriority, AiCommand, CampaignActionContext, is_unit_stranded,
-    strategic_target_value,
-};
+use crate::ai::command::AiCommand;
+use crate::ai::context::tactical::is_unit_stranded;
+use crate::ai::context::tactical::strategic_target_value;
+use crate::ai::tactics::campaign::CampaignActionContext;
+
 use crate::ai::pruning::AttackExchange;
 use crate::components::{Faction, GridPosition, Health, UnitStats};
 use crate::resources::{MovementType, Terrain};
@@ -430,7 +430,7 @@ pub(crate) fn attack_serves_campaign(
         context.mission_type == crate::ai::squad::MissionType::Transport
             || (deployment_target != Some(target)
                 && !target_position.is_some_and(|position| {
-                    crate::ai::engine::campaign_position_is_on_target_island(
+                    crate::ai::tactics::campaign::campaign_position_is_on_target_island(
                         world, context, position,
                     )
                 }))
@@ -522,4 +522,44 @@ fn report_evaluated_action(
             score,
         });
     }
+}
+
+/// #45 (V3): 待ち伏せポジションのスコア。射程内で待機して先制攻撃を狙う位置
+pub(crate) const AMBUSH_IN_RANGE_BONUS: i32 = 4000;
+/// #45 (V3): 敵の進行を1〜2ターン待ち受けられる位置のスコア
+pub(crate) const AMBUSH_NEAR_RANGE_BONUS: i32 = 2000;
+/// #45 (V3): 最小射程より内側 (攻撃不能な近距離) へ前進するペナルティ
+pub(crate) const AMBUSH_TOO_CLOSE_PENALTY: i32 = 3000;
+/// #45 (V3): 待ち受けゾーンとみなす最大射程からのマージン (敵の接近を想定)
+pub(crate) const AMBUSH_APPROACH_MARGIN: u32 = 2;
+
+/// 通常スコアとは別軸で、作戦上必要な不利交換と戦術的に有利な攻撃を順序付ける。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ActionPriority {
+    Normal,
+    /// 同じ作戦の前衛が開いた後方射点への、間接部隊の追随。
+    SupportAdvance,
+    /// DAG区間のセル列に沿う前進。通常の局地位置取りより優先するが、
+    /// その場で成立する有利な戦闘・占領は妨げない。
+    RouteAdvance,
+    /// 専任占領役が、実経路上で割当物件へ近づく移動。
+    CaptureAdvance,
+    /// 作戦パッケージが実行段階にあり、他に有利な局地標的がない場合の必要攻撃。
+    StrategicTargetFallback,
+    /// 損耗部隊同士が前線で即時合流し、戦力・ZoCを再建する戦術行動。
+    TacticalMerge,
+    /// 同じ作戦圏内で見つけた、現在兵種と相性のよい敵への攻撃。
+    FavorableLocalTarget,
+    /// 作戦対象そのものとの相性もよい攻撃。
+    FavorableStrategicTarget,
+    /// 敵の有効な生産可能マスを占位し、敵の戦力補充を物理的に遮断する行動。
+    /// 自軍の生産口を開けるProductionSiteReliefの攻勢的鏡像であり、
+    /// 敵の補充速度を物理的に削ぐことで全滅勝利を確定させる。
+    EnemyProductionBlockade,
+    /// 専任占領役が目標物件上で占領を実行する行動。
+    /// 前面戦闘は同行するCombat役へ分担し、占領完了を最優先する。
+    CaptureExecution,
+    /// 全生産施設が自軍で埋まったとき、少なくとも一枠を開ける移動・移動攻撃。
+    /// 後続を途切れさせない盤面契約であり、通常の戦術scoreとは分離して扱う。
+    ProductionSiteRelief,
 }

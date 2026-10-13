@@ -14,6 +14,7 @@ use crate::ai::demand::{
 use crate::ai::island_campaign::{
     IslandCampaignDecision, IslandCampaignShortfall, campaign_unit_type_rank,
 };
+use crate::ai::production::turn_state::ProductionTurnState;
 use crate::ai::strategy::{
     EmergencyAntiAirReservation, ProductionPlan, ProductionStrategy, analyze_strategy_for_turn,
     sea_transport_capacity_from_slots,
@@ -808,7 +809,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
 
     if is_v3
         && world
-            .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .get_resource::<ProductionTurnState>()
             .is_some_and(|cache| cache.production_batch_planned(player_id))
     {
         // 同じ生産フェーズ中は敵・収入・所有施設が変わらない。全施設分をすでに
@@ -823,15 +824,15 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
     if is_v3
         && !strategy.air_defense.requires_emergency_production()
         && world
-            .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .get_resource::<ProductionTurnState>()
             .is_some_and(|cache| cache.campaign_production_planned(player_id))
     {
         // 緊急対空の再判定だけは毎回優先する。平時の完全packageは初回計画時に
         // 予算・施設重複を検証済みなので、残り命令を全候補scoreより先に消費する。
         let mut cache = world
-            .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .remove_resource::<ProductionTurnState>()
             .unwrap_or_default();
-        let next_command = cache.take_campaign_production_command(player_id);
+        let next_command = cache.take_issuable_campaign_command(world, player_id);
         let blocks_generic = cache.campaign_production_blocks_generic(player_id);
         world.insert_resource(cache);
         if let Some(command) = next_command {
@@ -1204,14 +1205,14 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
     };
     if is_v3 && !strategy.campaign_shortfalls.is_empty() {
         let campaign_plan_exists = world
-            .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .get_resource::<ProductionTurnState>()
             .is_some_and(|cache| cache.campaign_production_planned(player_id));
         if campaign_plan_exists {
             // 最初の完全package計画を1commandずつ消費し、同じshortfallの重複生産を防ぐ。
             let mut cache = world
-                .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+                .remove_resource::<ProductionTurnState>()
                 .unwrap_or_default();
-            let next_command = cache.take_campaign_production_command(player_id);
+            let next_command = cache.take_issuable_campaign_command(world, player_id);
             let blocks_generic = cache.campaign_production_blocks_generic(player_id);
             let generic_budget = cache.campaign_production_generic_budget(player_id);
             world.insert_resource(cache);
@@ -1243,10 +1244,13 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
             let campaign_commands = std::mem::take(&mut campaign_outcome.commands);
             commands.extend(campaign_commands);
             let mut cache = world
-                .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+                .remove_resource::<ProductionTurnState>()
                 .unwrap_or_default();
             cache.set_campaign_production_plan_with_generic_budget(
                 player_id,
+                world
+                    .get_resource::<crate::resources::MatchState>()
+                    .map_or(0, |state| state.current_turn_number.0),
                 Vec::new(),
                 generic_budget,
             );
@@ -1255,7 +1259,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
             if blocks_generic {
                 if !strategy.air_defense.requires_emergency_production() {
                     let mut cache = world
-                        .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+                        .remove_resource::<ProductionTurnState>()
                         .unwrap_or_default();
                     cache.mark_production_batch_planned(player_id);
                     world.insert_resource(cache);
@@ -1385,7 +1389,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
 
     if is_v3 && !strategy.air_defense.requires_emergency_production() {
         let mut cache = world
-            .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .remove_resource::<ProductionTurnState>()
             .unwrap_or_default();
         cache.mark_production_batch_planned(player_id);
         world.insert_resource(cache);
@@ -4811,3 +4815,5 @@ mod additional_tests {
         );
     }
 }
+
+pub(crate) mod turn_state;

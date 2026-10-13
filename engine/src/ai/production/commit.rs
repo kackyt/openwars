@@ -12,7 +12,7 @@
 use crate::components::UnitStats;
 use crate::events::ProduceUnitCommand;
 use crate::resources::master_data::MasterDataRegistry;
-use crate::resources::{Players, UnitRegistry};
+use crate::resources::{MatchState, Phase, Players, UnitRegistry};
 use bevy_ecs::prelude::*;
 
 /// 購入の目的。継続計画の工程だけが工程参照を必須にし、形式だけの計画は作らない。
@@ -31,6 +31,14 @@ pub enum PurchasePurpose<StepRef> {
 /// 発行直前の検証で購入案を発行しない理由。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IssueRejection {
+    /// 発行待ち列が別手番のもの。
+    StaleTurn { planned: u32, current: u32 },
+    /// 行動中のplayerと命令のplayerが一致しない。
+    WrongPlayer,
+    /// Main以外のフェーズでは生産を発行できない。
+    WrongPhase,
+    /// 終局後の発行を禁止する。
+    GameOver,
     /// 命令のプレイヤーが存在しない。
     UnknownPlayer,
     /// 兵種の能力値が登録されていない。
@@ -85,6 +93,7 @@ pub fn validate_issue(
     world: &mut World,
     command: &ProduceUnitCommand,
 ) -> Result<(), IssueRejection> {
+    validate_turn(world, command, None)?;
     if let Some(players) = world.get_resource::<Players>() {
         let Some(player) = players.0.iter().find(|p| p.id == command.player_id) else {
             return Err(IssueRejection::UnknownPlayer);
@@ -122,6 +131,47 @@ pub fn validate_issue(
     Ok(())
 }
 
+/// 計画手番と発行時の手番を照合する。テスト用の部分Worldは存在する項目だけ検査する。
+fn validate_turn(
+    world: &World,
+    command: &ProduceUnitCommand,
+    planned_turn: Option<u32>,
+) -> Result<(), IssueRejection> {
+    if let Some(state) = world.get_resource::<MatchState>() {
+        if state.game_over.is_some() {
+            return Err(IssueRejection::GameOver);
+        }
+        if planned_turn.is_some_and(|turn| turn != state.current_turn_number.0) {
+            return Err(IssueRejection::StaleTurn {
+                planned: planned_turn.unwrap(),
+                current: state.current_turn_number.0,
+            });
+        }
+        if state.current_phase != Phase::Main {
+            return Err(IssueRejection::WrongPhase);
+        }
+        if let Some(players) = world.get_resource::<Players>()
+            && players
+                .0
+                .get(state.active_player_index.0)
+                .is_none_or(|player| player.id != command.player_id)
+        {
+            return Err(IssueRejection::WrongPlayer);
+        }
+    }
+    Ok(())
+}
+
+/// 手番つき命令の共通検証。汎用・campaignの両方で発行直前に使う。
+pub fn validate_issue_for_turn(
+    world: &mut World,
+    turn: u32,
+    command: &ProduceUnitCommand,
+) -> Result<(), IssueRejection> {
+    validate_turn(world, command, Some(turn))?;
+    validate_issue(world, command)
+}
+
 /// 発行待ちの列から、検証を通る最初の購入案を取り出す。
 ///
 /// 検証に失敗した案は発行せず `IssueAudit` へ記録して捨て、次の案を検証する。
@@ -134,7 +184,7 @@ pub fn next_issuable<T>(
 ) -> (Option<T>, Vec<T>) {
     let mut cancelled = Vec::new();
     while let Some(candidate) = queue.pop_front() {
-        match validate_issue(world, command_of(&candidate)) {
+        match validate_issue_for_turn(world, turn, command_of(&candidate)) {
             Ok(()) => return (Some(candidate), cancelled),
             Err(rejection) => {
                 let command = command_of(&candidate).clone();
@@ -269,5 +319,230 @@ mod tests {
             audit.rejected()[0].rejection,
             IssueRejection::FacilityUnavailable(_)
         ));
+    }
+
+    #[test]
+    fn stale_turn_budget_facility_loss_and_wrong_player_are_rejected() {
+        let mut world = world_with_funds(5000);
+        world.insert_resource(infantry_registry());
+        world.insert_resource(MatchState::default());
+        let cmd = command(0, UnitType::Infantry);
+        assert_eq!(
+            validate_issue_for_turn(&mut world, 0, &cmd),
+            Err(IssueRejection::StaleTurn {
+                planned: 0,
+                current: 1
+            })
+        );
+        assert!(validate_issue_for_turn(&mut world, 1, &cmd).is_ok());
+        world.resource_mut::<MatchState>().active_player_index.0 = 1;
+        assert_eq!(
+            validate_issue(&mut world, &cmd),
+            Err(IssueRejection::WrongPlayer)
+        );
+        world.resource_mut::<MatchState>().active_player_index.0 = 0;
+        world.resource_mut::<MatchState>().current_phase = Phase::EndTurn;
+        assert_eq!(
+            validate_issue(&mut world, &cmd),
+            Err(IssueRejection::WrongPhase)
+        );
+        world.resource_mut::<MatchState>().current_phase = Phase::Main;
+        world.resource_mut::<Players>().0[0].funds = 999;
+        assert!(matches!(
+            validate_issue(&mut world, &cmd),
+            Err(IssueRejection::InsufficientFunds { .. })
+        ));
+        world.resource_mut::<Players>().0[0].funds = 5000;
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Factory, Some(PlayerId(2)), 100),
+        ));
+        assert!(matches!(
+            validate_issue(&mut world, &cmd),
+            Err(IssueRejection::FacilityUnavailable(_))
+        ));
+        world.resource_mut::<MatchState>().game_over =
+            Some(crate::resources::GameOverCondition::Draw);
+        assert_eq!(
+            validate_issue(&mut world, &cmd),
+            Err(IssueRejection::GameOver)
+        );
+    }
+
+    #[test]
+    fn issue_validation_does_not_spend_or_spawn_and_rechecks_after_application() {
+        let master = MasterDataRegistry::load().unwrap();
+        let (mut world, mut schedule) =
+            crate::setup::initialize_world_from_master_data(&master, "map_1").unwrap();
+        let player =
+            world.resource::<Players>().0[world.resource::<MatchState>().active_player_index.0].id;
+        let facility = world
+            .query::<(&GridPosition, &Property)>()
+            .iter(&world)
+            .find(|(_, property)| {
+                property.owner_id == Some(player) && property.terrain == Terrain::Capital
+            })
+            .map(|(pos, _)| *pos)
+            .unwrap();
+        let cmd = ProduceUnitCommand {
+            player_id: player,
+            target_x: facility.x,
+            target_y: facility.y,
+            unit_type: UnitType::Infantry,
+        };
+        let funds = funds_of(&world, player).unwrap();
+        let count = world.entities().len();
+        let turn = world.resource::<MatchState>().current_turn_number.0;
+        validate_issue_for_turn(&mut world, turn, &cmd).unwrap();
+        validate_issue_for_turn(&mut world, turn, &cmd).unwrap();
+        assert_eq!(funds_of(&world, player), Some(funds));
+        assert_eq!(world.entities().len(), count);
+        world.send_event(cmd.clone());
+        schedule.run(&mut world);
+        assert!(funds_of(&world, player).unwrap() < funds);
+        assert_eq!(world.entities().len(), count + 1);
+        assert!(matches!(
+            validate_issue_for_turn(&mut world, turn, &cmd),
+            Err(IssueRejection::FacilityUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn stale_campaign_queue_is_audited_without_spending_or_spawning() {
+        use crate::ai::production::turn_state::{ProductionTurnState, next_campaign_command};
+        let mut world = world_with_funds(5000);
+        world.insert_resource(MatchState::default());
+        let mut state = ProductionTurnState::default();
+        state.set_campaign_production_plan(
+            PlayerId(1),
+            0,
+            vec![command(0, UnitType::Infantry)],
+            true,
+        );
+        world.insert_resource(state);
+        assert!(next_campaign_command(&mut world, PlayerId(1)).is_none());
+        assert_eq!(funds_of(&world, PlayerId(1)), Some(5000));
+        assert_eq!(world.entities().len(), 0);
+        assert!(matches!(
+            world.resource::<IssueAudit>().rejected()[0].rejection,
+            IssueRejection::StaleTurn { .. }
+        ));
+    }
+
+    #[test]
+    fn runtime_rechecks_before_publishing_campaign_or_generic_command() {
+        use crate::ai::runtime::production_queue::{
+            AiProductionCooldown, issue_production_command,
+        };
+        let mut world = world_with_funds(5000);
+        world.insert_resource(MatchState {
+            current_phase: Phase::EndTurn,
+            ..MatchState::default()
+        });
+        world.insert_resource(Events::<ProduceUnitCommand>::default());
+        assert!(issue_production_command(&mut world, command(0, UnitType::Infantry)).is_none());
+        assert!(world.resource::<Events<ProduceUnitCommand>>().is_empty());
+        assert!(!world.contains_resource::<AiProductionCooldown>());
+        assert_eq!(funds_of(&world, PlayerId(1)), Some(5000));
+        assert_eq!(world.entities().len(), 0);
+        assert_eq!(
+            world.resource::<IssueAudit>().rejected()[0].rejection,
+            IssueRejection::WrongPhase
+        );
+    }
+
+    #[test]
+    fn terminal_purchase_log_does_not_publish_or_mark_a_plan_issued() {
+        use crate::ai::production::turn_state::ProductionTurnState;
+        use crate::ai::runtime::production_queue::issue_production_command;
+        let mut world = world_with_funds(5000);
+        world.insert_resource(MatchState {
+            game_over: Some(crate::resources::GameOverCondition::Draw),
+            ..MatchState::default()
+        });
+        world.insert_resource(Events::<ProduceUnitCommand>::default());
+        let cmd = command(0, UnitType::Infantry);
+        let mut state = ProductionTurnState::default();
+        state.set_campaign_production_plan(PlayerId(1), 1, vec![cmd.clone()], true);
+        let attempt = state
+            .take_issuable_campaign_command(&mut world, PlayerId(1))
+            .unwrap();
+        assert_eq!(
+            issue_production_command(&mut world, attempt),
+            Some(format!("{cmd:?}"))
+        );
+        assert!(
+            state
+                .take_issuable_campaign_command(&mut world, PlayerId(1))
+                .is_none()
+        );
+        assert!(world.resource::<Events<ProduceUnitCommand>>().is_empty());
+        assert_eq!(funds_of(&world, PlayerId(1)), Some(5000));
+        assert_eq!(world.entities().len(), 0);
+        assert_eq!(
+            world.resource::<IssueAudit>().rejected()[0].rejection,
+            IssueRejection::GameOver
+        );
+    }
+
+    #[test]
+    fn rejected_queued_purchase_records_attempt_and_then_ends_turn() {
+        use crate::ai::runtime::production_queue::{
+            AiProductionCommandQueue, AiProductionCooldown,
+        };
+        use crate::ai::runtime::turn::execute_turn_step;
+        let master = MasterDataRegistry::load().unwrap();
+        let (mut world, _) =
+            crate::setup::initialize_world_from_master_data(&master, "map_1").unwrap();
+        let player = world.resource::<Players>().0[0].id;
+        world.resource_mut::<Players>().0[0].funds = 185;
+        let mut settings = crate::ai::PlayerAiSettings::default();
+        settings.set_version(player, crate::ai::AiVersion::V3);
+        world.insert_resource(settings);
+        let site = world
+            .query::<(&GridPosition, &Property)>()
+            .iter(&world)
+            .find(|(_, property)| {
+                property.owner_id == Some(player) && property.terrain == Terrain::Capital
+            })
+            .map(|(position, _)| *position)
+            .unwrap();
+        let command = ProduceUnitCommand {
+            player_id: player,
+            target_x: site.x,
+            target_y: site.y,
+            unit_type: UnitType::Infantry,
+        };
+        world.insert_resource(AiProductionCommandQueue {
+            player_id: Some(player),
+            turn: 1,
+            commands: VecDeque::from([command.clone()]),
+        });
+        let before = world.entities().len();
+        // 拒否は終了ではなく、旧実装と同じ1件の購入試行として返す。
+        assert_eq!(
+            execute_turn_step(&mut world, player),
+            Some(format!("{command:?}"))
+        );
+        assert!(world.resource::<Events<ProduceUnitCommand>>().is_empty());
+        assert_eq!(funds_of(&world, player), Some(185));
+        assert_eq!(world.entities().len(), before);
+        assert!(
+            world
+                .resource::<AiProductionCooldown>()
+                .0
+                .contains(&(site.x, site.y))
+        );
+        assert!(matches!(
+            world.resource::<IssueAudit>().rejected()[0].rejection,
+            IssueRejection::InsufficientFunds { .. }
+        ));
+        assert!(execute_turn_step(&mut world, player).is_none());
+        assert!(
+            !world
+                .resource::<Events<crate::events::NextPhaseCommand>>()
+                .is_empty()
+        );
     }
 }

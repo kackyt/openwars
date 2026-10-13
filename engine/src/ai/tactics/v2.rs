@@ -13,11 +13,14 @@ use super::scoring::{
     v3_positioning_score, wait_recovery_score,
 };
 use super::unit::UnitState;
-use crate::ai::engine::{
-    ActionPriority, AiCommand, CampaignActionContext, air_move_preserves_return_fuel,
-    campaign_action_context, campaign_mission_allows_capture,
-    campaign_position_is_on_target_island,
-};
+use crate::ai::command::AiCommand;
+use crate::ai::tactics::campaign::CampaignActionContext;
+use crate::ai::tactics::campaign::campaign_action_context;
+use crate::ai::tactics::campaign::campaign_mission_allows_capture;
+use crate::ai::tactics::campaign::campaign_position_is_on_target_island;
+use crate::ai::tactics::candidates::air_move_preserves_return_fuel;
+use crate::ai::tactics::scoring::ActionPriority;
+
 use crate::ai::squad::{MissionType, SquadManager};
 use crate::collections::HashSet;
 use crate::components::{GridPosition, PlayerId};

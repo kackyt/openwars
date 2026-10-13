@@ -11,8 +11,8 @@ pub fn create_world() -> (World, Schedule) {
     let mut schedule = Schedule::default();
 
     // Register resources
-    world.init_resource::<crate::ai::engine::AiActionCooldown>();
-    world.init_resource::<crate::ai::engine::AiProductionCooldown>();
+    world.init_resource::<crate::ai::runtime::state::AiActionCooldown>();
+    world.init_resource::<crate::ai::runtime::production_queue::AiProductionCooldown>();
     world.init_resource::<crate::ai::PlayerAiSettings>();
     world.init_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>();
     world.init_resource::<crate::ai::v4::logistics_plan::V4LogisticsPlanRegistry>();

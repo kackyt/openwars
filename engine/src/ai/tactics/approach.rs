@@ -1,7 +1,7 @@
 //! 移動先から目標への接近の測り方。
 
 use super::board::TacticalBoard;
-use crate::ai::engine::AiTurnStrategyCache;
+use crate::ai::tactics::distance_cache::ActionDistanceCache;
 use crate::ai::turn_distance::{TurnDistance, TurnDistanceCache, calculate_turn_distance};
 use crate::components::{GridPosition, UnitStats};
 use bevy_ecs::prelude::*;
@@ -28,7 +28,7 @@ pub(crate) fn with_turn_distances<R>(
     evaluate: impl FnOnce(&World, &mut ApproachDistances) -> R,
 ) -> R {
     let mut strategy_cache = world
-        .remove_resource::<AiTurnStrategyCache>()
+        .remove_resource::<ActionDistanceCache>()
         .unwrap_or_default();
     let mut cache = strategy_cache
         .take_action_distance_cache(board.player_id, &board.enemy_blocker_positions());

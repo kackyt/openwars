@@ -10,6 +10,7 @@ use crate::ai::island_campaign::{
 use crate::ai::island_campaign_analysis::{
     analyze_island_campaign, analyze_island_campaign_excluding,
 };
+use crate::ai::planning::decision::AdoptedTurnPortfolio;
 use crate::ai::turn_distance::{TerrainConnectivity, TurnDistanceCache, calculate_turn_distance};
 use crate::collections::{HashMap, HashSet};
 use crate::components::{
@@ -200,7 +201,7 @@ pub(crate) fn analyze_strategy_for_turn(
     player_id: PlayerId,
 ) -> ProductionStrategy {
     let cached_campaign = world
-        .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+        .get_resource::<AdoptedTurnPortfolio>()
         .and_then(|cache| cache.campaign_portfolio(player_id))
         .cloned();
     analyze_strategy_internal(world, player_id, cached_campaign, &HashSet::default())
@@ -1456,7 +1457,7 @@ mod tests {
     fn v3_turn_strategy_reuses_campaign_cache() {
         let mut world = setup_v3_portfolio_world(false, 6_000);
         let cached = IslandCampaignPortfolio::default();
-        let mut cache = crate::ai::engine::AiTurnStrategyCache::default();
+        let mut cache = AdoptedTurnPortfolio::default();
         cache.set_campaign_portfolio(PlayerId(1), cached.clone());
         world.insert_resource(cache);
 
@@ -1469,7 +1470,7 @@ mod tests {
     fn v3_turn_strategy_preserves_generic_capture_demand_without_campaign_assignments() {
         let mut world = setup_v3_portfolio_world(false, 6_000);
         let cached = IslandCampaignPortfolio::default();
-        let mut cache = crate::ai::engine::AiTurnStrategyCache::default();
+        let mut cache = AdoptedTurnPortfolio::default();
         cache.set_campaign_portfolio(PlayerId(1), cached);
         world.insert_resource(cache);
 
@@ -1493,7 +1494,7 @@ mod tests {
             .unwrap();
         world.spawn((Faction(PlayerId(1)), GridPosition { x: 0, y: 0 }, infantry));
         let cached = IslandCampaignPortfolio::default();
-        let mut cache = crate::ai::engine::AiTurnStrategyCache::default();
+        let mut cache = AdoptedTurnPortfolio::default();
         cache.set_campaign_portfolio(PlayerId(1), cached);
         world.insert_resource(cache);
 
@@ -1556,7 +1557,7 @@ mod tests {
             active_offensives: vec![assignment],
             defenses: Vec::new(),
         };
-        let mut cache = crate::ai::engine::AiTurnStrategyCache::default();
+        let mut cache = AdoptedTurnPortfolio::default();
         cache.set_campaign_portfolio(PlayerId(1), cached);
         world.insert_resource(cache);
 

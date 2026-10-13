@@ -3,8 +3,9 @@
 //! 親モジュールはmain互換の実装を持ち、本文の異なる関数は
 //! `crate::ai::code_path::is_extended()` でここへ委譲する。
 
-#[allow(unused_imports)]
 use super::*;
+#[allow(unused_imports)]
+use crate::ai::planning::decision::AdoptedTurnPortfolio;
 
 /// V4 の生産意思決定エントリポイント。
 ///
@@ -1505,11 +1506,17 @@ pub(super) fn plan_production_with_registry(
             .flatten()
             .zip(planned_purchase)
             .and_then(|(plan, purchase)| plan.plan.combat_target_for(purchase));
-        allocation.claim(
-            candidate.facility,
-            candidate.cost,
-            operation_priority_rank(&operations[op_index]),
-        );
+        if allocation
+            .try_claim(
+                candidate.facility,
+                candidate.cost,
+                operation_priority_rank(&operations[op_index]),
+            )
+            .is_err()
+        {
+            // 候補評価後に競合した予約は、後続の意図や工程へ反映せず配分を止める。
+            break;
+        }
         if planned_purchase.is_some() {
             issued_plan_purchase_cost = issued_plan_purchase_cost.saturating_add(candidate.cost);
         }
@@ -1717,11 +1724,17 @@ pub(super) fn plan_production_with_registry(
             break;
         };
 
-        allocation.claim(
-            candidate.facility,
-            candidate.cost,
-            operation_priority_rank(&operations[op_index]),
-        );
+        if allocation
+            .try_claim(
+                candidate.facility,
+                candidate.cost,
+                operation_priority_rank(&operations[op_index]),
+            )
+            .is_err()
+        {
+            // 候補評価後に競合した予約は、後続の意図や工程へ反映せず配分を止める。
+            break;
+        }
         immediate_reinforcement_funds =
             immediate_reinforcement_funds.saturating_sub(candidate.cost);
         let committed_damage = immediately_committed_damage
@@ -1920,11 +1933,17 @@ pub(super) fn plan_production_with_registry(
             None,
         );
 
-        allocation.claim(
-            candidate.facility,
-            candidate.cost,
-            operation_priority_rank(&operations[op_index]),
-        );
+        if allocation
+            .try_claim(
+                candidate.facility,
+                candidate.cost,
+                operation_priority_rank(&operations[op_index]),
+            )
+            .is_err()
+        {
+            // 候補評価後に競合した予約は、後続の意図や工程へ反映せず配分を止める。
+            break;
+        }
         immediate_reinforcement_funds =
             immediate_reinforcement_funds.saturating_sub(candidate.cost);
 
@@ -6825,14 +6844,14 @@ mod tests {
         world.insert_resource(settings);
 
         // Turn 1 P1 full turn
-        while let Some(_cmd) = crate::ai::engine::execute_ai_turn(&mut world, p1) {
+        while let Some(_cmd) = crate::ai::execute_ai_turn(&mut world, p1) {
             schedule.run(&mut world);
         }
         schedule.run(&mut world);
 
         // Turn 1 P2 full turn: 自陣5都市に対する歩兵5体と、前線迎撃用のRecon1体が生産される
         let mut t1_p2_commands = Vec::new();
-        while let Some(cmd) = crate::ai::engine::execute_ai_turn(&mut world, p2) {
+        while let Some(cmd) = crate::ai::execute_ai_turn(&mut world, p2) {
             t1_p2_commands.push(cmd);
             schedule.run(&mut world);
         }
@@ -6856,14 +6875,14 @@ mod tests {
         );
 
         // Turn 2 P1 full turn
-        while let Some(_cmd) = crate::ai::engine::execute_ai_turn(&mut world, p1) {
+        while let Some(_cmd) = crate::ai::execute_ai_turn(&mut world, p1) {
             schedule.run(&mut world);
         }
         schedule.run(&mut world);
 
         // Turn 2 P2: 自陣都市の占領が即座に開始され、過剰な歩兵乱造が抑止される
         let mut t2_p2_commands = Vec::new();
-        while let Some(cmd) = crate::ai::engine::execute_ai_turn(&mut world, p2) {
+        while let Some(cmd) = crate::ai::execute_ai_turn(&mut world, p2) {
             t2_p2_commands.push(cmd);
             schedule.run(&mut world);
         }
@@ -6878,28 +6897,28 @@ mod tests {
         );
 
         // Turn 3 P1 full turn
-        while let Some(_cmd) = crate::ai::engine::execute_ai_turn(&mut world, p1) {
+        while let Some(_cmd) = crate::ai::execute_ai_turn(&mut world, p1) {
             schedule.run(&mut world);
         }
         schedule.run(&mut world);
 
         // Turn 3 P2
         let mut t3_p2_commands = Vec::new();
-        while let Some(cmd) = crate::ai::engine::execute_ai_turn(&mut world, p2) {
+        while let Some(cmd) = crate::ai::execute_ai_turn(&mut world, p2) {
             t3_p2_commands.push(cmd);
             schedule.run(&mut world);
         }
         schedule.run(&mut world);
 
         // Turn 4 P1 full turn
-        while let Some(_cmd) = crate::ai::engine::execute_ai_turn(&mut world, p1) {
+        while let Some(_cmd) = crate::ai::execute_ai_turn(&mut world, p1) {
             schedule.run(&mut world);
         }
         schedule.run(&mut world);
 
         // Turn 4 P2
         let mut t4_p2_commands = Vec::new();
-        while let Some(cmd) = crate::ai::engine::execute_ai_turn(&mut world, p2) {
+        while let Some(cmd) = crate::ai::execute_ai_turn(&mut world, p2) {
             t4_p2_commands.push(cmd);
             schedule.run(&mut world);
         }
@@ -6937,7 +6956,7 @@ mod tests {
         println!("=== Starting T5-T15 trace ===");
         for turn in 5..=15 {
             // P1 turn
-            while let Some(cmd) = crate::ai::engine::execute_ai_turn(&mut world, p1) {
+            while let Some(cmd) = crate::ai::execute_ai_turn(&mut world, p1) {
                 if cmd.contains("Produce") || cmd.contains("Capture") {
                     println!("  T{turn} P1: {cmd}");
                 }
@@ -6984,7 +7003,7 @@ mod tests {
 
             // P2 turn
             let mut p2_produced = Vec::new();
-            while let Some(cmd) = crate::ai::engine::execute_ai_turn(&mut world, p2) {
+            while let Some(cmd) = crate::ai::execute_ai_turn(&mut world, p2) {
                 if cmd.contains("Produce") {
                     p2_produced.push(cmd.clone());
                 }
@@ -13095,7 +13114,7 @@ impl BoardScan {
             })
             .unwrap_or_default();
         let cached_portfolio = world
-            .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .get_resource::<AdoptedTurnPortfolio>()
             .and_then(|cache| cache.campaign_portfolio(player_id))
             .cloned();
         let portfolio = cached_portfolio.unwrap_or_else(|| {
@@ -13161,7 +13180,7 @@ impl BoardScan {
 
         // 同一ターン内で生産に失敗した施設を除外するためのクールダウン
         let cooldown: HashSet<(usize, usize)> = world
-            .get_resource::<crate::ai::engine::AiProductionCooldown>()
+            .get_resource::<crate::ai::runtime::production_queue::AiProductionCooldown>()
             .map(|c| c.0.clone())
             .unwrap_or_default();
 

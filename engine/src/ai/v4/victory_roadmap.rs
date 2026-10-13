@@ -1,4 +1,4 @@
-use crate::ai::engine::AiCommand;
+use crate::ai::command::AiCommand;
 use crate::ai::island_campaign::{
     IslandCampaignAssessment, IslandCampaignAssignment, IslandCampaignDecision,
     IslandCampaignPortfolio,

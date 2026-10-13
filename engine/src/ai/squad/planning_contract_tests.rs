@@ -1,5 +1,6 @@
 //! F07の通常／拡張hookと共通オーケストレーションの境界を固定する。
 
+use crate::ai::planning::decision::AdoptedTurnPortfolio;
 use super::*;
 use crate::ai::ai_version::{AiVersion, PlayerAiSettings};
 use crate::ai::island_campaign::{
@@ -288,7 +289,7 @@ fn shared_planning_keeps_manager_lifetime_and_adopted_portfolio_cache() {
     assert_ne!(world.resource::<OriginalPortfolio>().0, selected);
     assert_eq!(
         world
-            .resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .resource::<AdoptedTurnPortfolio>()
             .campaign_portfolio(player),
         Some(&selected)
     );

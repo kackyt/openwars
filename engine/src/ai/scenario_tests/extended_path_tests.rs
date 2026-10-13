@@ -1,6 +1,6 @@
 //! 拡張経路（小規模マップ戦略）で実行する複数ターンのシナリオ回帰テスト。
 
-use crate::ai::engine::*;
+use crate::ai::AiCommand;
 use crate::components::*;
 use crate::resources::master_data::*;
 use crate::resources::*;
@@ -165,7 +165,7 @@ fn test_v3_multi_cargo_invasion_loads_transits_and_lands() {
         .expect("transport should produce a command");
         let result = command.clone();
         world.insert_resource(manager);
-        crate::ai::engine::execute_ai_command(world, entity, command);
+        crate::ai::runtime::issue::execute_ai_command(world, entity, command);
         schedule.run(world);
         result
     };

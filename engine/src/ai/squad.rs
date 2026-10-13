@@ -7,6 +7,8 @@ use crate::ai::cluster::detect_enemy_clusters;
 use crate::ai::operation_assignment::{
     OperationOwner, OperationUnitRole, UnitOperationAssignment, UnitOperationRegistry,
 };
+use crate::ai::planning::decision::AdoptedTurnPortfolio;
+use crate::ai::runtime::state::AiTurnProgress;
 use crate::ai::strategy::{analyze_strategy, analyze_strategy_with_reserved_entities};
 use crate::ai::turn_distance::{
     TerrainConnectivity, TurnDistanceCache, calculate_all_turn_distances, calculate_turn_distance,
@@ -4229,7 +4231,7 @@ pub(crate) fn reconcile_v4_end_turn_reserves(world: &mut World, player_id: Playe
         return;
     }
     let campaign_assignments = world
-        .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+        .get_resource::<AdoptedTurnPortfolio>()
         .and_then(|cache| cache.campaign_portfolio(player_id))
         .map(|portfolio| {
             portfolio
@@ -4467,10 +4469,12 @@ fn plan_squads_with_hooks<H: SquadPlanningHooks>(world: &mut World, perspective_
     let enemy_clusters = detect_enemy_clusters(world, perspective_player);
     if is_v3 {
         let mut cache = world
-            .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .remove_resource::<AdoptedTurnPortfolio>()
             .unwrap_or_default();
         cache.set_campaign_portfolio(perspective_player, planning_portfolio.as_ref().clone());
-        cache.mark_squads_planned(perspective_player);
+        world
+            .get_resource_or_insert_with(AiTurnProgress::default)
+            .mark_squads_planned(perspective_player);
         world.insert_resource(cache);
         claim_campaign_portfolio_assignments(world, perspective_player, &planning_portfolio);
     }
@@ -6066,7 +6070,7 @@ pub fn execute_transport_squad_step(
     world: &mut World,
     squad: &mut Squad,
     skip_entities: &crate::collections::HashSet<Entity>,
-) -> Option<(Entity, crate::ai::engine::AiCommand)> {
+) -> Option<(Entity, crate::ai::command::AiCommand)> {
     let transport_entity = squad.transport_entity?;
 
     let (t_pos, t_stats, t_fuel, t_faction) = {
@@ -6109,7 +6113,7 @@ pub fn execute_transport_squad_step(
                     .is_some_and(|action| !action.0);
             return transport_available.then_some((
                 transport_entity,
-                crate::ai::engine::AiCommand::Wait { target_pos: t_pos },
+                crate::ai::command::AiCommand::Wait { target_pos: t_pos },
             ));
         }
     }
@@ -6150,7 +6154,7 @@ pub fn execute_transport_squad_step(
     {
         return Some((
             cargo,
-            crate::ai::engine::AiCommand::Load {
+            crate::ai::command::AiCommand::Load {
                 transport_entity,
                 target_pos: t_pos,
             },
@@ -6260,7 +6264,7 @@ pub fn execute_transport_squad_step(
             if dist == 0 && !cargo_action_completed && !must_vacate_production_site {
                 return Some((
                     cargo_entity,
-                    crate::ai::engine::AiCommand::Load {
+                    crate::ai::command::AiCommand::Load {
                         transport_entity,
                         target_pos: t_pos,
                     },
@@ -6309,7 +6313,7 @@ pub fn execute_transport_squad_step(
                 }
                 return Some((
                     transport_entity,
-                    crate::ai::engine::AiCommand::Wait {
+                    crate::ai::command::AiCommand::Wait {
                         target_pos: best_tile,
                     },
                 ));
@@ -6348,7 +6352,7 @@ pub fn execute_transport_squad_step(
                 if cargo_reachable.contains(&(t_pos.x, t_pos.y)) {
                     return Some((
                         cargo_entity,
-                        crate::ai::engine::AiCommand::Load {
+                        crate::ai::command::AiCommand::Load {
                             transport_entity,
                             target_pos: t_pos,
                         },
@@ -6428,7 +6432,7 @@ pub fn execute_transport_squad_step(
 
                 return Some((
                     cargo_entity,
-                    crate::ai::engine::AiCommand::Wait {
+                    crate::ai::command::AiCommand::Wait {
                         target_pos: best_tile,
                     },
                 ));
@@ -6482,7 +6486,7 @@ pub fn execute_transport_squad_step(
                         squad.phase = MissionPhase::Transport(TransportPhase::Drop);
                         return Some((
                             transport_entity,
-                            crate::ai::engine::AiCommand::Drop {
+                            crate::ai::command::AiCommand::Drop {
                                 transport_target_pos: transport_target,
                                 cargo_drop_pos: drop_target,
                                 cargo_entity,
@@ -6527,7 +6531,7 @@ pub fn execute_transport_squad_step(
 
                     return Some((
                         transport_entity,
-                        crate::ai::engine::AiCommand::Wait {
+                        crate::ai::command::AiCommand::Wait {
                             target_pos: best_tile,
                         },
                     ));
@@ -6555,7 +6559,7 @@ pub fn execute_transport_squad_step(
                 squad.drop_position = Some(drop_target);
                 return Some((
                     transport_entity,
-                    crate::ai::engine::AiCommand::Drop {
+                    crate::ai::command::AiCommand::Drop {
                         transport_target_pos: transport_target,
                         cargo_drop_pos: drop_target,
                         cargo_entity,
@@ -6610,7 +6614,7 @@ pub fn execute_transport_squad_step(
                             }
                             return Some((
                                 transport_entity,
-                                crate::ai::engine::AiCommand::Wait {
+                                crate::ai::command::AiCommand::Wait {
                                     target_pos: best_tile,
                                 },
                             ));
@@ -6620,7 +6624,7 @@ pub fn execute_transport_squad_step(
             }
             return Some((
                 transport_entity,
-                crate::ai::engine::AiCommand::Wait { target_pos: t_pos },
+                crate::ai::command::AiCommand::Wait { target_pos: t_pos },
             ));
         }
         TransportPhase::Return => {
@@ -6659,7 +6663,7 @@ pub fn execute_transport_squad_step(
             let Some(nearest_prop_pos) = return_targets.first().map(|target| target.3) else {
                 return Some((
                     transport_entity,
-                    crate::ai::engine::AiCommand::Wait { target_pos: t_pos },
+                    crate::ai::command::AiCommand::Wait { target_pos: t_pos },
                 ));
             };
 
@@ -6702,7 +6706,7 @@ pub fn execute_transport_squad_step(
             }
             return Some((
                 transport_entity,
-                crate::ai::engine::AiCommand::Wait {
+                crate::ai::command::AiCommand::Wait {
                     target_pos: best_tile,
                 },
             ));
@@ -8307,12 +8311,12 @@ mod tests {
                         .expect("Pickup squad must advance toward loading");
                 assert!(matches!(
                     command,
-                    crate::ai::engine::AiCommand::Load { .. }
-                        | crate::ai::engine::AiCommand::Wait { .. }
+                    crate::ai::command::AiCommand::Load { .. }
+                        | crate::ai::command::AiCommand::Wait { .. }
                 ));
                 executed_steps.push((entity, format!("{command:?}")));
                 fixture.world.insert_resource(manager);
-                crate::ai::engine::execute_ai_command(&mut fixture.world, entity, command);
+                crate::ai::runtime::issue::execute_ai_command(&mut fixture.world, entity, command);
                 fixture.load_schedule.run(&mut fixture.world);
             }
             update_squads(&mut fixture.world, player);
@@ -9403,7 +9407,7 @@ mod tests {
         assert_eq!(entity, second);
         assert!(matches!(
             command,
-            crate::ai::engine::AiCommand::Load {
+            crate::ai::command::AiCommand::Load {
                 transport_entity,
                 ..
             } if transport_entity == transport
@@ -9515,7 +9519,7 @@ mod tests {
         assert_eq!(entity, cargo);
         assert!(matches!(
             command,
-            crate::ai::engine::AiCommand::Load {
+            crate::ai::command::AiCommand::Load {
                 transport_entity,
                 target_pos: GridPosition { x: 0, y: 0 },
             } if transport_entity == transport
@@ -9607,7 +9611,7 @@ mod tests {
             execute_transport_squad_step(&mut world, &mut squad, &HashSet::default())
                 .expect("transport must vacate the airport before loading");
         assert_eq!(first_entity, transport);
-        let crate::ai::engine::AiCommand::Wait { target_pos } = first_command else {
+        let crate::ai::command::AiCommand::Wait { target_pos } = first_command else {
             panic!("airport relief must move the transport first");
         };
         assert_ne!(target_pos, GridPosition { x: 1, y: 0 });
@@ -9621,7 +9625,7 @@ mod tests {
         assert_eq!(second_entity, cargo);
         assert!(matches!(
             second_command,
-            crate::ai::engine::AiCommand::Load {
+            crate::ai::command::AiCommand::Load {
                 transport_entity,
                 target_pos: load_pos,
             } if transport_entity == transport && load_pos == target_pos
@@ -9875,7 +9879,7 @@ mod tests {
         assert_eq!(entity, actionable);
         assert!(matches!(
             command,
-            crate::ai::engine::AiCommand::Load {
+            crate::ai::command::AiCommand::Load {
                 transport_entity,
                 target_pos: GridPosition { x: 0, y: 0 },
             } if transport_entity == transport

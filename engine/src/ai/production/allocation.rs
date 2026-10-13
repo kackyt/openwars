@@ -6,8 +6,17 @@
 
 use crate::collections::{HashMap, HashSet};
 use crate::components::GridPosition;
+/// 予約が成立しない理由。失敗時は資金・施設・所有者のすべてを維持する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ReservationError {
+    #[error("生産施設は予約済み")]
+    FacilityConflict,
+    #[error("予約資金が不足: required={required}, available={available}")]
+    BudgetUnavailable { required: u32, available: u32 },
+}
+
 /// 生産配分の可変状態。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllocationState {
     remaining_funds: u32,
     used_facilities: HashSet<GridPosition>,
@@ -63,10 +72,26 @@ impl AllocationState {
     }
 
     /// 購入案1件を確保する。資金を差し引き、施設を確保作戦の優先度とともに占有する。
-    pub fn claim(&mut self, facility: GridPosition, cost: u32, owner_rank: u32) {
-        self.remaining_funds = self.remaining_funds.saturating_sub(cost);
+    pub fn try_claim(
+        &mut self,
+        facility: GridPosition,
+        cost: u32,
+        owner_rank: u32,
+    ) -> Result<(), ReservationError> {
+        // すべての前提を確認してから、一度だけ状態を確定する。
+        if self.is_facility_used(&facility) {
+            return Err(ReservationError::FacilityConflict);
+        }
+        if cost > self.remaining_funds {
+            return Err(ReservationError::BudgetUnavailable {
+                required: cost,
+                available: self.remaining_funds,
+            });
+        }
+        self.remaining_funds -= cost;
         self.used_facilities.insert(facility);
         self.facility_owners.insert(facility, owner_rank);
+        Ok(())
     }
 }
 
@@ -83,7 +108,7 @@ mod tests {
         let mut state = AllocationState::new(5000);
         let facilities = [pos(1, 1), pos(2, 2)];
         assert_eq!(state.free_facility_count(&facilities), 2);
-        state.claim(pos(1, 1), 3000, 4);
+        state.try_claim(pos(1, 1), 3000, 4).unwrap();
         assert_eq!(state.remaining_funds(), 2000);
         assert!(state.is_facility_used(&pos(1, 1)));
         assert_eq!(state.facility_owner(&pos(1, 1)), Some(4));
@@ -96,7 +121,39 @@ mod tests {
         let mut state = AllocationState::new(1000);
         assert_eq!(state.spendable_after(400), 600);
         assert_eq!(state.spendable_after(4000), 0);
-        state.claim(pos(0, 0), 5000, 0);
+        assert!(state.try_claim(pos(0, 0), 5000, 0).is_err());
+        assert_eq!(state.remaining_funds(), 1000);
+    }
+
+    #[test]
+    fn unfilled_demand_survives_and_failed_reservation_is_atomic() {
+        use crate::ai::production::demand::{DemandLedger, UnfilledReason};
+        let mut ledger = DemandLedger::new();
+        let mut state = AllocationState::new(5000);
+        state.try_claim(pos(1, 1), 3000, 4).unwrap();
+        let before = state.clone();
+        assert_eq!(
+            state.try_claim(pos(1, 1), 1000, 0),
+            Err(ReservationError::FacilityConflict)
+        );
+        assert_eq!(state, before);
+        assert_eq!(
+            state.try_claim(pos(2, 2), 3000, 0),
+            Err(ReservationError::BudgetUnavailable {
+                required: 3000,
+                available: 2000
+            })
+        );
+        assert_eq!(state, before);
+        ledger.close(0, "capture", UnfilledReason::NoCandidate);
+        assert_eq!(
+            ledger.reason(0, "capture"),
+            Some(UnfilledReason::NoCandidate)
+        );
+        assert!(ledger.is_open(0, "combat"));
+        // 失敗した施設を再利用でき、残額ぴったりの予約も成立する。
+        state.try_claim(pos(2, 2), 2000, 1).unwrap();
         assert_eq!(state.remaining_funds(), 0);
+        assert_eq!(state.facility_owner(&pos(1, 1)), Some(4));
     }
 }

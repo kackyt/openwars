@@ -96,7 +96,7 @@ fn get_target_position_for_island(
 pub fn execute_mission_step(
     world: &mut World,
     mission: &TransportMission,
-) -> Vec<(Entity, super::engine::AiCommand)> {
+) -> Vec<(Entity, crate::ai::command::AiCommand)> {
     // 輸送機の基本情報を取得
     let t_pos = if let Some(p) = world.get::<GridPosition>(mission.transport_entity).cloned() {
         p
@@ -336,7 +336,7 @@ pub fn execute_mission_step(
                 }
                 cmds.push((
                     mission.transport_entity,
-                    super::engine::AiCommand::Wait {
+                    crate::ai::command::AiCommand::Wait {
                         target_pos: best_t_tile,
                     },
                 ));
@@ -377,7 +377,7 @@ pub fn execute_mission_step(
                 if can_load {
                     cmds.push((
                         mission.cargo_entity,
-                        super::engine::AiCommand::Load {
+                        crate::ai::command::AiCommand::Load {
                             transport_entity: mission.transport_entity,
                             target_pos: t_pos,
                         },
@@ -444,7 +444,7 @@ pub fn execute_mission_step(
                         }
                         cmds.push((
                             mission.cargo_entity,
-                            super::engine::AiCommand::Wait {
+                            crate::ai::command::AiCommand::Wait {
                                 target_pos: best_c_tile,
                             },
                         ));
@@ -455,7 +455,7 @@ pub fn execute_mission_step(
             if cmds.is_empty() {
                 cmds.push((
                     mission.transport_entity,
-                    super::engine::AiCommand::Wait { target_pos: t_pos },
+                    crate::ai::command::AiCommand::Wait { target_pos: t_pos },
                 ));
             }
             return cmds;
@@ -521,7 +521,7 @@ pub fn execute_mission_step(
                     if let Some((trans_pos, drop_pos)) = best_drop_tile_pair {
                         return vec![(
                             mission.transport_entity,
-                            super::engine::AiCommand::Drop {
+                            crate::ai::command::AiCommand::Drop {
                                 transport_target_pos: trans_pos,
                                 cargo_drop_pos: drop_pos,
                                 cargo_entity: mission.cargo_entity,
@@ -559,7 +559,7 @@ pub fn execute_mission_step(
                     }
                     return vec![(
                         mission.transport_entity,
-                        super::engine::AiCommand::Wait {
+                        crate::ai::command::AiCommand::Wait {
                             target_pos: best_tile,
                         },
                     )];
@@ -576,7 +576,7 @@ pub fn execute_mission_step(
             if let Some(drop_tile) = drop_tiles.first() {
                 return vec![(
                     mission.transport_entity,
-                    super::engine::AiCommand::Drop {
+                    crate::ai::command::AiCommand::Drop {
                         transport_target_pos: t_pos,
                         cargo_drop_pos: GridPosition {
                             x: drop_tile.0,
@@ -618,7 +618,7 @@ pub fn execute_mission_step(
                 if let Some((trans_pos, drop_pos)) = best_drop_tile_pair {
                     return vec![(
                         mission.transport_entity,
-                        super::engine::AiCommand::Drop {
+                        crate::ai::command::AiCommand::Drop {
                             transport_target_pos: trans_pos,
                             cargo_drop_pos: drop_pos,
                             cargo_entity: mission.cargo_entity,
@@ -659,7 +659,7 @@ pub fn execute_mission_step(
                                 }
                                 return vec![(
                                     mission.transport_entity,
-                                    super::engine::AiCommand::Wait {
+                                    crate::ai::command::AiCommand::Wait {
                                         target_pos: best_tile,
                                     },
                                 )];
@@ -670,7 +670,7 @@ pub fn execute_mission_step(
                 // フォールバック：現在位置で待機
                 return vec![(
                     mission.transport_entity,
-                    super::engine::AiCommand::Wait { target_pos: t_pos },
+                    crate::ai::command::AiCommand::Wait { target_pos: t_pos },
                 )];
             }
         }
@@ -706,7 +706,7 @@ pub fn execute_mission_step(
             }
             return vec![(
                 mission.transport_entity,
-                super::engine::AiCommand::Wait {
+                crate::ai::command::AiCommand::Wait {
                     target_pos: best_tile,
                 },
             )];
@@ -999,7 +999,7 @@ mod tests {
 
         let cmds = execute_mission_step(&mut world, &mission);
         assert!(!cmds.is_empty());
-        if let Some((_entity, crate::ai::engine::AiCommand::Wait { target_pos })) =
+        if let Some((_entity, crate::ai::command::AiCommand::Wait { target_pos })) =
             cmds.into_iter().next()
         {
             // ヘリは (0,0) にいて、歩兵は (2,0) にいる。ヘリは (2,0) に隣接するマス（(1,0), (3,0), (2,1) など）へ向かうべき
@@ -1030,7 +1030,7 @@ mod tests {
 
         let cmds = execute_mission_step(&mut world, &mission);
         assert!(!cmds.is_empty());
-        if let Some((_entity, crate::ai::engine::AiCommand::Wait { target_pos })) =
+        if let Some((_entity, crate::ai::command::AiCommand::Wait { target_pos })) =
             cmds.into_iter().next()
         {
             // (0,0) から (5,5) へ移動可能な最大範囲内で最も近い場所へ向かうはず
@@ -1066,7 +1066,7 @@ mod tests {
         assert!(!cmds.is_empty());
         if let Some((
             _entity,
-            crate::ai::engine::AiCommand::Drop {
+            crate::ai::command::AiCommand::Drop {
                 transport_target_pos,
                 cargo_drop_pos,
                 cargo_entity,
@@ -1110,7 +1110,7 @@ mod tests {
 
         let cmds = execute_mission_step(&mut world, &mission);
         assert!(!cmds.is_empty());
-        if let Some((_entity, crate::ai::engine::AiCommand::Wait { target_pos })) =
+        if let Some((_entity, crate::ai::command::AiCommand::Wait { target_pos })) =
             cmds.into_iter().next()
         {
             // 降車不可時の Wait フォールバック。現在位置で待機する
@@ -1144,7 +1144,7 @@ mod tests {
 
         let cmds = execute_mission_step(&mut world, &mission);
         assert!(!cmds.is_empty());
-        if let Some((_entity, crate::ai::engine::AiCommand::Wait { target_pos })) =
+        if let Some((_entity, crate::ai::command::AiCommand::Wait { target_pos })) =
             cmds.into_iter().next()
         {
             // 拠点 (0,0) に最も近づく方向へ移動するはず
@@ -1244,7 +1244,7 @@ mod tests {
 
         let cmds = execute_mission_step(&mut world, &mission);
         assert!(!cmds.is_empty());
-        if let Some((_entity, crate::ai::engine::AiCommand::Wait { target_pos })) =
+        if let Some((_entity, crate::ai::command::AiCommand::Wait { target_pos })) =
             cmds.into_iter().next()
         {
             // 目標島内の陸地 (3,0) 自体ではなく、隣接する海マスである (2,0) をターゲットにし、
@@ -1293,7 +1293,7 @@ mod tests {
         assert!(!cmds.is_empty());
         if let Some((
             _entity,
-            crate::ai::engine::AiCommand::Drop {
+            crate::ai::command::AiCommand::Drop {
                 transport_target_pos,
                 cargo_drop_pos,
                 cargo_entity,

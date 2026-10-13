@@ -8,7 +8,7 @@ use crate::ai::islands::IslandMap;
 use crate::ai::squad::{MissionPhase, MissionType, SquadId, SquadManager};
 use crate::ai::turn_distance::TerrainConnectivity;
 use crate::ai::v4::operation::SlotKind;
-use crate::ai::v4::plan_contract::{OperationBinding, PlanContractRegistry};
+use crate::ai::v4::plan_contract::OperationBinding;
 use crate::ai::v4::plan_revision::{ActiveDeploymentIntent, PlanId, PlanStepRef};
 use crate::collections::{HashMap, HashSet};
 use crate::components::{
@@ -647,7 +647,6 @@ pub(crate) fn reconcile_pending_deployments_system(
     mut registry: ResMut<V4DeploymentRegistry>,
     manager: Option<ResMut<SquadManager>>,
     island_map: Option<Res<IslandMap>>,
-    mut contract_registry: Option<ResMut<PlanContractRegistry>>,
 ) {
     let turn = match_state.current_turn_number.0;
     let mut manager = manager;
@@ -657,14 +656,6 @@ pub(crate) fn reconcile_pending_deployments_system(
             && let Some(manager) = manager.as_deref_mut()
         {
             registry.resolve_produced_slot(event.entity, manager, island_map.as_deref());
-        }
-        if let Some(assigned) = registry.assigned.get(&event.entity)
-            && let Some(binding) = assigned.intent.operation_binding
-            && let Some(contracts) = contract_registry.as_deref_mut()
-            && let Err(err) =
-                contracts.reconcile_produced_binding(event.entity, binding, assigned.intent.anchor)
-        {
-            eprintln!("[WARN] Failed to reconcile produced binding: {:?}", err);
         }
     }
     // 失敗した生産命令を翌ターンの同型発注へ誤照合しない。

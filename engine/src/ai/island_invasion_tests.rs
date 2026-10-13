@@ -274,7 +274,7 @@ fn v3_invasion_reaches_combat_or_capture_after_landing() {
         for _ in 0..2 {
             let active_player = active_player(&world);
             for _ in 0..MAX_ACTIONS_PER_PHASE {
-                let action = crate::ai::engine::execute_ai_turn(&mut world, active_player);
+                let action = crate::ai::execute_ai_turn(&mut world, active_player);
                 schedule.run(&mut world);
 
                 for event in loaded_cursor.read(world.resource::<Events<UnitLoadedEvent>>()) {

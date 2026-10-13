@@ -370,7 +370,7 @@ impl WasmEngine {
             pid
         };
 
-        let res = crate::ai::engine::execute_ai_turn(&mut self.world, active_player);
+        let res = crate::ai::execute_ai_turn(&mut self.world, active_player);
         self.schedule.run(&mut self.world);
 
         let acted = res.is_some();

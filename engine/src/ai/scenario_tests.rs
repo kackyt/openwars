@@ -3,7 +3,9 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::ai::engine::*;
+    use crate::ai::AiCommand;
+    use crate::ai::runtime::turn::execute_turn_step as execute_ai_turn_v2;
+    use crate::ai::v1::execute_ai_turn_v1;
     use crate::components::*;
     use crate::resources::master_data::*;
     use crate::resources::*;
@@ -1001,7 +1003,7 @@ mod tests {
             .expect("transport should produce a command");
             let result = command.clone();
             world.insert_resource(manager);
-            crate::ai::engine::execute_ai_command(world, entity, command);
+            crate::ai::runtime::issue::execute_ai_command(world, entity, command);
             schedule.run(world);
             result
         };

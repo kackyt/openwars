@@ -22,10 +22,12 @@ pub mod plan_revision;
 pub mod rolling_plan;
 pub mod trace;
 pub mod victory_roadmap;
+use crate::ai::planning::decision::AdoptedTurnPortfolio;
 use crate::ai::production::allocation::AllocationState;
 use crate::ai::production::commit::{self, PurchasePurpose};
 use crate::ai::production::demand::{DemandLedger, UnfilledReason};
 use crate::ai::production::plan_campaign_with_expansion_denial_reserve;
+use crate::ai::production::turn_state::ProductionTurnState;
 use crate::ai::squad::{MissionType, SquadId};
 use crate::ai::turn_distance::{
     ActionTurnDistanceCache, TerrainConnectivity, calculate_action_distance_to_range,
@@ -219,7 +221,7 @@ struct Operation {
     /// 島campaignの永続identity。anchorや未所有施設集合が変わっても維持する。
     island_id: Option<crate::ai::islands::IslandId>,
     /// V4中央契約との作戦ID。
-    operation_id: Option<victory_roadmap::StrategicOperationId>,
+    operation_id: Option<plan_contract::PropertyContractId>,
     /// 作戦の代表地点（距離計算の基準）
     anchor: GridPosition,
     /// 編成中の戦力を逐次投入せず集結させる、自軍側の安全な地点。
@@ -300,6 +302,16 @@ fn issue_next_planned_production(
     turn: u32,
     queue: &mut VecDeque<PlannedProduction>,
 ) -> Vec<ProduceUnitCommand> {
+    // 終局後は発行待ちの案を監査入口へ渡すだけで、Issuedへ進めない。
+    if world
+        .get_resource::<crate::resources::MatchState>()
+        .is_some_and(|state| state.game_over.is_some())
+    {
+        return queue
+            .pop_front()
+            .map(|planned| vec![planned.command])
+            .unwrap_or_default();
+    }
     let (planned, _cancelled) =
         commit::next_issuable(world, turn, queue, |planned| &planned.command);
     let Some(planned) = planned else {
@@ -675,7 +687,7 @@ fn observe_plan_execution(world: &mut World, player_id: PlayerId, turn: u32) {
 
 /// 戦術層が組んだ島嶼キャンペーンの不足を、V4固有の汎用作戦より先に生産する。
 ///
-/// `AiTurnStrategyCache` は行動計画時に同じプレイヤーのportfolioを保持している。
+/// `AdoptedTurnPortfolio` は行動計画時に同じプレイヤーのportfolioを保持している。
 /// 生産APIは1命令ごとに呼ばれるため、V3と同じcache queueへ完全パッケージを保存し、
 /// shortfallの再計算による二重発注を防ぐ。高優先行を完成できないときはgenericを
 /// blockし、輸送・積荷・戦闘戦力の一部だけを逐次投入しない。
@@ -687,13 +699,13 @@ fn decide_campaign_production_v4(
         .get_resource::<crate::resources::MatchState>()
         .map_or(0, |state| state.current_turn_number.0);
     let plan_exists = world
-        .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+        .get_resource::<ProductionTurnState>()
         .is_some_and(|cache| cache.campaign_production_planned(player_id));
     if plan_exists {
         let mut cache = world
-            .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .remove_resource::<ProductionTurnState>()
             .unwrap_or_default();
-        let next = cache.take_campaign_production_command(player_id);
+        let next = cache.take_issuable_campaign_command(world, player_id);
         let blocks_generic = cache.campaign_production_blocks_generic(player_id);
         let generic_budget = cache.campaign_production_generic_budget(player_id);
         world.insert_resource(cache);
@@ -711,7 +723,7 @@ fn decide_campaign_production_v4(
     }
 
     let mut shortfalls = world
-        .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+        .get_resource::<AdoptedTurnPortfolio>()
         .and_then(|cache| cache.campaign_portfolio(player_id))
         .map(|portfolio| portfolio.aggregate_missing_requirements())
         .unwrap_or_default();
@@ -773,14 +785,15 @@ fn decide_campaign_production_v4(
         .replace_turn_intents(player_id, turn, &outcome.intents, reservation);
     let generic_budget = outcome.generic_funds;
     let mut cache = world
-        .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+        .remove_resource::<ProductionTurnState>()
         .unwrap_or_default();
     cache.set_campaign_production_plan_with_generic_budget(
         player_id,
+        turn,
         outcome.commands,
         generic_budget,
     );
-    let next = cache.take_campaign_production_command(player_id);
+    let next = cache.take_issuable_campaign_command(world, player_id);
     let blocks_generic = cache.campaign_production_blocks_generic(player_id);
     let generic_budget = cache.campaign_production_generic_budget(player_id);
     world.insert_resource(cache);
@@ -830,6 +843,14 @@ fn mark_campaign_production_issued(
     turn: u32,
     command: &ProduceUnitCommand,
 ) {
+    // 終局後の監査用出力は実際の発行として台帳へ記録しない。
+    if world
+        .get_resource::<crate::resources::MatchState>()
+        .is_some_and(|state| state.game_over.is_some())
+    {
+        return;
+    }
+
     if let Some(mut registry) =
         world.get_resource_mut::<campaign_execution::V4CampaignExecutionRegistry>()
     {
@@ -934,7 +955,7 @@ impl BoardScan {
             })
             .unwrap_or_default();
         let mut campaign_objectives: Vec<CampaignPlanningObjective> = world
-            .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .get_resource::<AdoptedTurnPortfolio>()
             .and_then(|cache| cache.campaign_portfolio(player_id))
             .map(|portfolio| {
                 portfolio
@@ -981,7 +1002,7 @@ impl BoardScan {
 
         // 同一ターン内で生産に失敗した施設を除外するためのクールダウン
         let cooldown: HashSet<(usize, usize)> = world
-            .get_resource::<crate::ai::engine::AiProductionCooldown>()
+            .get_resource::<crate::ai::runtime::production_queue::AiProductionCooldown>()
             .map(|c| c.0.clone())
             .unwrap_or_default();
 
@@ -2534,11 +2555,17 @@ fn plan_production_with_registry(
             break;
         }
 
-        allocation.claim(
-            candidate.facility,
-            candidate.cost,
-            operation_priority_rank(&operations[op_index]),
-        );
+        if allocation
+            .try_claim(
+                candidate.facility,
+                candidate.cost,
+                operation_priority_rank(&operations[op_index]),
+            )
+            .is_err()
+        {
+            // 候補評価後に競合した予約は、後続の意図や工程へ反映せず配分を止める。
+            break;
+        }
         let mut deployment = planned_deployment(
             scan,
             &mut ctx,
@@ -5842,12 +5869,12 @@ mod tests {
     /// 余った施設を汎用生産へ開放しない。
     #[test]
     fn v4_prioritizes_campaign_package_and_blocks_generic_when_incomplete() {
-        use crate::ai::engine::AiTurnStrategyCache;
         use crate::ai::island_campaign::{
             IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignPortfolio,
             IslandCampaignRequirement,
         };
         use crate::ai::islands::IslandId;
+        use crate::ai::planning::decision::AdoptedTurnPortfolio;
         use crate::resources::Players;
         use crate::resources::master_data::MasterDataRegistry;
 
@@ -5892,7 +5919,7 @@ mod tests {
             operation_ready: false,
             continued_from_existing_squad: false,
         };
-        let mut cache = AiTurnStrategyCache::default();
+        let mut cache = AdoptedTurnPortfolio::default();
         cache.set_campaign_portfolio(
             player_id,
             IslandCampaignPortfolio {
@@ -5910,7 +5937,7 @@ mod tests {
         assert!(decide_production_v4(&mut world, player_id).is_empty());
         assert!(
             world
-                .resource::<AiTurnStrategyCache>()
+                .resource::<ProductionTurnState>()
                 .campaign_production_blocks_generic(player_id)
         );
     }

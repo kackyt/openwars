@@ -1,6 +1,8 @@
 //! 1回の行動選択で全unitが共有する盤面の事実。
 
-use crate::ai::engine::{AiTacticalSnapshot, strategic_target_value};
+use crate::ai::context::tactical::AiTacticalSnapshot;
+use crate::ai::context::tactical::strategic_target_value;
+
 use crate::ai::squad::{MissionType, SquadManager};
 use crate::ai::threat::EnemyThreatInfo;
 use crate::collections::{HashMap, HashSet};

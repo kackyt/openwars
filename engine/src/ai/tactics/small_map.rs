@@ -19,12 +19,16 @@ use super::scoring::{
     terrain_defense_bonus, v3_positioning_score, wait_recovery_score,
 };
 use super::unit::UnitState;
-use crate::ai::engine::{
-    ActionPriority, AiCommand, CampaignActionContext, air_move_preserves_return_fuel,
-    campaign_action_context, campaign_mission_allows_capture,
-    campaign_position_is_on_target_island, coordinated_support_destination,
-    has_capturable_property_at,
-};
+use crate::ai::command::AiCommand;
+use crate::ai::context::tactical::has_capturable_property_at;
+use crate::ai::tactics::campaign::CampaignActionContext;
+use crate::ai::tactics::campaign::campaign_action_context;
+use crate::ai::tactics::campaign::campaign_mission_allows_capture;
+use crate::ai::tactics::campaign::campaign_position_is_on_target_island;
+use crate::ai::tactics::candidates::air_move_preserves_return_fuel;
+use crate::ai::tactics::scoring::ActionPriority;
+use crate::ai::tactics::small_map::squad_executor::coordinated_support_destination;
+
 use crate::ai::squad::{MissionType, SquadManager};
 use crate::ai::strategy_profile::{V4StrategyProfile, current_profile};
 use crate::ai::turn_distance::TurnDistance;
@@ -1193,3 +1197,5 @@ mod tests {
         assert_eq!(enemy_replacement_dependence(0, 0), (0, 1));
     }
 }
+
+pub(crate) mod squad_executor;

@@ -1,16 +1,30 @@
-//! 拡張経路（小規模マップ戦略・非V4）の実装。
-//!
-//! 親モジュールはmain互換の実装を持ち、本文の異なる関数は
-//! `crate::ai::code_path::is_extended()` でここへ委譲する。
-
-#[allow(unused_imports)]
-use super::*;
-
+//! 小規模V4のSquad単位の行動実行順。
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::unnecessary_min_or_max)]
+#![allow(clippy::unnecessary_map_or)]
+use crate::ai::command::AiCommand;
+use crate::ai::context::tactical::*;
+use crate::collections::{HashMap, HashSet};
+use crate::components::{
+    ActionCompleted, Faction, GridPosition, HasMoved, Health, PlayerId, Property, UnitStats,
+};
+use crate::resources::Map;
+use crate::resources::master_data::MasterDataRegistry;
+use crate::systems::combat::get_expected_damage;
+use crate::systems::movement::{OccupantInfo, calculate_reachable_tiles, get_valid_movement_cost};
+use bevy_ecs::prelude::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::execute_ai_turn;
+    use crate::ai::runtime::state::AiActionCooldown;
+    use crate::ai::runtime::turn::execute_turn_step as execute_ai_turn_v2;
+    use crate::ai::tactics::v2::decide_action as decide_ai_action_v2;
     use crate::components::{Faction, Health, PlayerId, Property, UnitStats};
+    use crate::events::AttackUnitCommand;
+    use crate::resources::master_data::UnitName;
     use crate::resources::{DamageChart, UnitType};
+    use crate::resources::{GridTopology, Terrain};
 
     /// 弾薬を備えた前衛と砲を同一攻略目標へ割り当てる。
     fn setup_cooperative_fire_world() -> (World, Entity, Entity, Entity) {
@@ -651,7 +665,7 @@ mod tests {
         let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
         // 人間対局のP2第4手番開始時点。Entity番号は再生成し、座標・HP・弾薬を復元する。
         let snapshot: serde_json::Value =
-            serde_json::from_str(include_str!("../test_data/map32_human_turn4.json")).unwrap();
+            serde_json::from_str(include_str!("../../test_data/map32_human_turn4.json")).unwrap();
         let data = MasterDataRegistry::load().unwrap();
         let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
             &data,
@@ -747,7 +761,7 @@ mod tests {
 
     fn setup_map42_human_turn5_world() -> (World, HashMap<u32, Entity>) {
         let snapshot: serde_json::Value =
-            serde_json::from_str(include_str!("../test_data/map42_human_turn5.json")).unwrap();
+            serde_json::from_str(include_str!("../../test_data/map42_human_turn5.json")).unwrap();
         let data = MasterDataRegistry::load().unwrap();
         let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
             &data,
@@ -1430,7 +1444,7 @@ mod tests {
 /// Entity単位の全体順位へ戻さず、Squadを命令主体に保ったまま、攻勢・占領・防衛の
 /// 進行を1アクションずつ交互にする。
 #[derive(Resource, Debug, Default)]
-pub(super) struct V4SquadExecutionCursor {
+struct V4SquadExecutionCursor {
     last_squad: HashMap<PlayerId, crate::ai::squad::SquadId>,
 }
 
@@ -1439,7 +1453,7 @@ pub(super) struct V4SquadExecutionCursor {
 /// V2/V3の公開関数は従来どおり全unitを対象にする。V4だけはSquadが選んだ
 /// candidate集合を渡すため、ここは戦略目標を新たに発明せず、Move/Attack/Captureの
 /// 戦術順位だけを決める。
-pub(super) fn decide_ai_action_v2_for_entities(
+fn decide_ai_action_v2_for_entities(
     world: &mut World,
     player_id: PlayerId,
     skip_entities: &crate::collections::HashSet<Entity>,
@@ -1459,12 +1473,7 @@ pub(super) fn decide_ai_action_v2_for_entities(
 /// 既存の戦術採点器へ渡す。従ってこの層は別の島・別NodeへEntityを再配分せず、
 /// `AiCommand` がEntity指定であるというエンジン境界だけを最後に解決する。
 /// 台帳の作戦所有権を優先し、未登録の通常Squadだけ目標一致で協働する。
-pub(super) fn shares_attack_operation(
-    world: &World,
-    left: Entity,
-    right: Entity,
-    same_target: bool,
-) -> bool {
+fn shares_attack_operation(world: &World, left: Entity, right: Entity, same_target: bool) -> bool {
     world
         .get_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>()
         .and_then(|registry| registry.shares_attack_operation(left, right))
@@ -1532,7 +1541,7 @@ pub(crate) fn coordinated_support_destination(
         })
         .min()?;
     let target = snapshot
-        .units
+        .units()
         .iter()
         .find(|unit| {
             unit.position == objective
@@ -1581,7 +1590,7 @@ pub(crate) fn coordinated_support_destination(
     let mut future_occupants = occupants.clone();
     future_occupants.remove(&(origin.x, origin.y));
     let enemies = snapshot
-        .units
+        .units()
         .iter()
         .filter_map(|unit| {
             if unit.faction == player || unit.is_transporting {
@@ -1816,11 +1825,7 @@ pub(crate) fn decide_squad_action_v4(
 /// Capture可能な未行動unitだけへ既存の戦術探索を限定し、実際に選ばれた命令がCaptureの
 /// 場合だけ返す。よって攻撃・退避・目標選択の評価式を複製せず、物件契約を進められない
 /// 状況で戦闘部隊の行動順を横取りしない。
-pub(super) fn update_v4_squad_execution_cursor(
-    world: &mut World,
-    player_id: PlayerId,
-    squad_id: u32,
-) {
+fn update_v4_squad_execution_cursor(world: &mut World, player_id: PlayerId, squad_id: u32) {
     let mut cursor = world
         .remove_resource::<V4SquadExecutionCursor>()
         .unwrap_or_default();
@@ -1834,7 +1839,7 @@ pub(super) fn update_v4_squad_execution_cursor(
 ///
 /// 敵・行動済み友軍・地形による閉塞は同じ手番中に解消する保証がないため保留しない。
 /// DAGが一点目標を外したControl中も、古いSquad目標を復活させず通常のWaitを確定する。
-pub(super) fn wait_is_temporarily_blocked_by_unacted_friendly(
+fn wait_is_temporarily_blocked_by_unacted_friendly(
     world: &World,
     player_id: PlayerId,
     entity: Entity,
@@ -1914,7 +1919,7 @@ pub(super) fn wait_is_temporarily_blocked_by_unacted_friendly(
 ///
 /// これは戦術の点数を置換するものではなく、複数Squadのうちどの命令を次に展開するか
 /// を決めるRoadmap投影順である。
-pub(super) fn squad_executor_priority(mission: &crate::ai::squad::MissionType) -> u8 {
+fn squad_executor_priority(mission: &crate::ai::squad::MissionType) -> u8 {
     match mission {
         crate::ai::squad::MissionType::Attack => 0,
         crate::ai::squad::MissionType::Capture => 1,

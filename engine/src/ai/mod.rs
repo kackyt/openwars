@@ -39,3 +39,17 @@ pub(crate) mod v100;
 pub mod v4;
 
 pub use ai_version::{AiVersion, PlayerAiSettings, resolve_player_ai_version};
+
+pub mod command;
+pub(crate) mod context;
+pub(crate) mod planning;
+pub(crate) mod v1;
+
+// 外部公開APIの正規経路。内部moduleは定義元を直接参照する。
+pub use command::AiCommand;
+pub use engine::execute_ai_turn;
+pub use runtime::issue::execute_ai_command;
+pub use runtime::production_queue::AiProductionCooldown;
+pub use runtime::state::{AiActionCooldown, clear_ai_cooldowns_system};
+#[cfg(test)]
+mod decision_tests;

@@ -16,12 +16,19 @@
 //! 版・経路で異なるのは、通常行動を選ぶ戦術（[`TurnTactics`]）と、3の退避の対象だけである。
 
 use crate::ai::code_path::{self, CodePath};
-use crate::ai::engine::{
-    AiActionCooldown, AiCommand, AiProductionCommandQueue, AiProductionCooldown,
-    AiTurnStrategyCache, decide_ai_action_v2, decide_forming_campaign_site_relief,
-    decide_squad_action_v4, execute_ai_command, issue_production_command,
-    take_next_queued_production_command, transport_has_other_actionable_cargo,
-};
+use crate::ai::command::AiCommand;
+use crate::ai::context::tactical::transport_has_other_actionable_cargo;
+use crate::ai::runtime::issue::execute_ai_command;
+use crate::ai::runtime::production_queue::AiProductionCommandQueue;
+use crate::ai::runtime::production_queue::AiProductionCooldown;
+use crate::ai::runtime::production_queue::issue_production_command;
+use crate::ai::runtime::production_queue::take_next_queued_production_command;
+use crate::ai::runtime::state::AiActionCooldown;
+use crate::ai::runtime::state::AiTurnProgress;
+use crate::ai::tactics::relief::decide_forming_campaign_site_relief;
+use crate::ai::tactics::small_map::squad_executor::decide_squad_action_v4;
+use crate::ai::tactics::v2::decide_action as decide_ai_action_v2;
+
 use crate::ai::squad::{MissionPhase, MissionType, SquadManager, TransportPhase};
 use crate::collections::HashSet;
 use crate::components::{GridPosition, PlayerId};
@@ -143,7 +150,7 @@ fn has_queued_production(world: &World, step: &TurnStep) -> bool {
 /// それ以外の呼び出しでは、降車・搭乗が実際に起きた場合だけSquadを更新する。
 fn prepare_squads(world: &mut World, step: &TurnStep) {
     let squads_planned_this_turn = world
-        .get_resource::<AiTurnStrategyCache>()
+        .get_resource::<AiTurnProgress>()
         .is_some_and(|cache| cache.squads_planned(step.player_id));
     let should_plan_squads =
         step.acted.is_empty() && (!step.uses_v3_tactics || !squads_planned_this_turn);
@@ -344,8 +351,7 @@ fn issue_production_or_end_turn(world: &mut World, step: &TurnStep) -> Option<St
             continue;
         }
         world.insert_resource(queue);
-        mark_produced(world, &command);
-        return send_production(world, command, command_text);
+        return issue_production_command(world, command);
     }
 
     let mut planned =
@@ -361,33 +367,13 @@ fn issue_production_or_end_turn(world: &mut World, step: &TurnStep) -> Option<St
             }
             continue;
         }
-        mark_produced(world, &command);
         queue.commands.extend(planned);
         world.insert_resource(queue);
-        return send_production(world, command, command_text);
+        return issue_production_command(world, command);
     }
     world.insert_resource(queue);
     end_turn(world, step.player_id);
     None
-}
-
-fn mark_produced(world: &mut World, command: &crate::events::ProduceUnitCommand) {
-    let site = (command.target_x, command.target_y);
-    if let Some(mut cooldown) = world.get_resource_mut::<AiProductionCooldown>() {
-        cooldown.0.insert(site);
-    } else {
-        world.insert_resource(AiProductionCooldown(HashSet::from_iter([site])));
-    }
-}
-
-fn send_production(
-    world: &mut World,
-    command: crate::events::ProduceUnitCommand,
-    command_text: String,
-) -> Option<String> {
-    let mut events = world.get_resource_mut::<Events<crate::events::ProduceUnitCommand>>()?;
-    events.send(command);
-    Some(command_text)
 }
 
 /// 手番を終える。終了直前は「この手番に結局何が動かなかったか」が確定する唯一の点で、

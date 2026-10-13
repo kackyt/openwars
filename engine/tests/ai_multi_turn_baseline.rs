@@ -9,7 +9,7 @@
 use bevy_ecs::event::EventCursor;
 use bevy_ecs::prelude::*;
 use engine::ai::ai_version::{AiVersion, PlayerAiSettings};
-use engine::ai::engine::execute_ai_turn;
+use engine::ai::execute_ai_turn;
 use engine::ai::strategy_profile::{V4StrategyProfile, profile_for};
 use engine::components::*;
 use engine::events::*;

@@ -13,7 +13,7 @@
 use bevy_ecs::event::EventCursor;
 use bevy_ecs::prelude::*;
 use engine::ai::ai_version::{AiVersion, PlayerAiSettings};
-use engine::ai::engine::execute_ai_turn;
+use engine::ai::execute_ai_turn;
 use engine::ai::production::commit::IssueAudit;
 use engine::ai::production::demand::UnfilledReason;
 use engine::ai::v4::trace::{ProductionDecision, ProductionTraceDiagnostics};

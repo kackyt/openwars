@@ -46,6 +46,7 @@ _PATH_CHECK = re.compile(r"\b(is_extended_at|ext_enabled|is_extended)\b")
 _GLOB_REEXPORT = re.compile(r"^\s*pub use .*extended::\*")
 _FN_DEF = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+|async\s+|unsafe\s+)*fn\s+(\w+)")
 _REPAIR_CALL = re.compile(r"\b(" + "|".join(REPAIR_FUNCTIONS) + r")\s*\(")
+_AI_DEPENDENCY = re.compile(r"\bcrate::ai::(engine|runtime)\b")
 
 
 def _code_lines(file: Path, ranges: list[tuple[float, float]]) -> list[tuple[int, str]]:
@@ -106,6 +107,23 @@ def measure(root: Path) -> dict:
             for match in _REPAIR_CALL.finditer(line):
                 repair[match.group(1)] += 1
 
+    # 移動先を直接参照しているかを検査する。テストの適用処理は対象外。
+    # 行単位で数え、再export経由の上向き依存も禁止する。
+    reverse_dependencies = {}
+    for file in files:
+        source = file.relative_to(root).parts[0].removesuffix(".rs")
+        if source not in {"runtime", "tactics", "context", "command"}:
+            continue
+        for number, line in lines[file]:
+            for match in _AI_DEPENDENCY.finditer(line):
+                target = match.group(1)
+                if source == "runtime" and target == "runtime":
+                    continue
+                key = f"{source}->{target}"
+                reverse_dependencies.setdefault(key, []).append(
+                    f"{file.relative_to(root)}:{number}"
+                )
+
     return {
         "path_checks": path_checks,
         "extended_pairs": sum(len(names) for names in pairs.values()),
@@ -113,6 +131,8 @@ def measure(root: Path) -> dict:
         "repair_calls": sum(repair.values()),
         "repair_calls_by_function": {k: v for k, v in repair.items() if v},
         "extended_pairs_by_file": pairs,
+        "reverse_dependencies": sum(map(len, reverse_dependencies.values())),
+        "reverse_dependencies_by_direction": reverse_dependencies,
     }
 
 

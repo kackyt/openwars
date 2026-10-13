@@ -3,7 +3,7 @@
 //! 小規模マップでV4を先後両方で対戦させ、行動列をファイルへ書き出す。
 
 use engine::ai::ai_version::{AiVersion, PlayerAiSettings};
-use engine::ai::engine::execute_ai_turn;
+use engine::ai::execute_ai_turn;
 use engine::components::*;
 use engine::resources::master_data::MasterDataRegistry;
 use engine::resources::*;

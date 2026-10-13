@@ -6,7 +6,7 @@
 
 use bevy_ecs::prelude::*;
 use engine::ai::ai_version::{AiVersion, PlayerAiSettings};
-use engine::ai::engine::execute_ai_turn;
+use engine::ai::execute_ai_turn;
 use engine::components::*;
 use engine::resources::master_data::MasterDataRegistry;
 use engine::resources::*;

@@ -14,3 +14,8 @@ pub(crate) mod scoring;
 pub(crate) mod small_map;
 pub(crate) mod unit;
 pub(crate) mod v2;
+
+pub(crate) mod campaign;
+pub(crate) mod candidates;
+pub(crate) mod distance_cache;
+pub(crate) mod relief;

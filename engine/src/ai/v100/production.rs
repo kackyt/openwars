@@ -1,6 +1,6 @@
 //! Gameboy Wars Turboの生産状態機械を移植したV100/V200専用実装。
 
-use crate::ai::engine::AiProductionCooldown;
+use crate::ai::runtime::production_queue::AiProductionCooldown;
 use crate::collections::{HashMap, HashSet};
 use crate::components::{Faction, GridPosition, Health, PlayerId, Property};
 use crate::events::ProduceUnitCommand;

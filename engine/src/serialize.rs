@@ -307,7 +307,7 @@ pub fn export_save_data(world: &mut World, map_name: &str) -> Result<String, Sav
 
     // クエリ終了後、再度リソースを借用して AI のクールダウン情報を抽出
     let ai_action_cooldown =
-        if let Some(res) = world.get_resource::<crate::ai::engine::AiActionCooldown>() {
+        if let Some(res) = world.get_resource::<crate::ai::runtime::state::AiActionCooldown>() {
             res.0
                 .iter()
                 .filter_map(|e| entity_to_uuid.get(e).copied())
@@ -316,12 +316,13 @@ pub fn export_save_data(world: &mut World, map_name: &str) -> Result<String, Sav
             Vec::new()
         };
 
-    let ai_production_cooldown =
-        if let Some(res) = world.get_resource::<crate::ai::engine::AiProductionCooldown>() {
-            res.0.iter().copied().collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+    let ai_production_cooldown = if let Some(res) =
+        world.get_resource::<crate::ai::runtime::production_queue::AiProductionCooldown>()
+    {
+        res.0.iter().copied().collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
 
     // 2. SaveState オブジェクトの構築
     let save_state = SaveState {
@@ -609,7 +610,7 @@ pub fn import_save_data(
         .iter()
         .filter_map(|uuid| uuid_to_entity.get(uuid).copied())
         .collect::<HashSet<_>>();
-    world.insert_resource(crate::ai::engine::AiActionCooldown(
+    world.insert_resource(crate::ai::runtime::state::AiActionCooldown(
         ai_action_cooldown_entities,
     ));
 
@@ -618,7 +619,7 @@ pub fn import_save_data(
         .iter()
         .copied()
         .collect::<HashSet<_>>();
-    world.insert_resource(crate::ai::engine::AiProductionCooldown(
+    world.insert_resource(crate::ai::runtime::production_queue::AiProductionCooldown(
         ai_production_cooldown_coords,
     ));
 

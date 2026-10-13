@@ -30,7 +30,7 @@ pub fn add_main_game_systems(schedule: &mut Schedule) {
     schedule.configure_sets(GameSystemSet);
     schedule.add_systems(
         (
-            crate::ai::engine::clear_ai_cooldowns_system,
+            crate::ai::runtime::state::clear_ai_cooldowns_system,
             produce_unit_system,
             // 発注照合は予約slotの有無で処理を選ぶため、経路によらず1本で動かす。
             crate::ai::v4::deployment::reconcile_pending_deployments_system,

@@ -233,7 +233,7 @@ where
             if let (Some(world), Some(schedule)) = (&mut app.world, &mut app.schedule) {
                 use app::{InGameState, PlayerControlType};
                 use bevy_ecs::event::Events;
-                use engine::ai::engine::execute_ai_turn;
+                use engine::ai::execute_ai_turn;
                 use engine::events::{GameOverEvent, GamePhaseChangedEvent, UnitAttackedEvent};
                 use engine::resources::{GameOverCondition, MatchState, Players};
 
