@@ -436,7 +436,8 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
         plan.candidates_considered = 1;
         return Some(plan);
     }
-    let mut frontier = vec![SearchState::default()];
+    let root = SearchState::default();
+    let mut frontier = vec![(root.clone(), CombatRun::start(&catalog, &root))];
     // 全中間案の敵別forecastを保持すると長期戦でメモリと比較時間が膨張する。
     // 最終選択に必要な3案だけを逐次更新し、各候補のsimulateも1回に限定する。
     let mut best_within_deadline: Option<ForcePackagePlan> = None;
@@ -454,26 +455,32 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
     slots.sort_unstable_by_key(|(slot, _)| (slot.build_turn, slot.facility.y, slot.facility.x));
 
     for (slot, option_indices) in slots {
+        // この枠の生産unitは生産turnの翌turnから交戦する。それまでの交戦は親案と同じなので、
+        // 親案を生産turnまで進めた途中状態から子案を再開する。
+        let resume_turn = slot.build_turn.min(search_turns);
         let mut next = Vec::new();
-        for state in &frontier {
+        for (state, run) in &mut frontier {
+            run.advance_to(input, resume_turn);
             // この枠を使わない案も残す。高額兵種のための現金予約や、将来の別施設を
             // 選ぶ案を、安い現在購入で強制的に上書きしないためである。
-            next.push(state.clone());
+            next.push((state.clone(), run.clone()));
             for option_index in &option_indices {
                 if let Some(child) = state.with_affordable_purchase(input, *option_index, slot) {
-                    next.push(child);
+                    next.push((child, run.with_purchase(*option_index)));
                 }
             }
         }
 
         // 同じbeam層の各状態はsnapshotだけを読む独立計算である。nativeでは並列評価し、
         // 結果は入力順へ戻してから従来どおり最良案を逐次更新するため、同点時の選択は不変。
-        let evaluated = crate::ai::deterministic_parallel::map_ordered(next, |state| {
-            let plan = simulate_state_with_catalog(input, &catalog, &state, search_turns);
-            (state, plan)
+        let evaluated = crate::ai::deterministic_parallel::map_ordered(next, |(state, run)| {
+            let mut finished = run.clone();
+            finished.advance_to(input, search_turns);
+            let plan = finished.into_plan(input, &state);
+            (state, run, plan)
         });
         let mut evaluated_next = Vec::with_capacity(evaluated.len());
-        for (state, mut plan) in evaluated {
+        for (state, run, mut plan) in evaluated {
             considered = considered.saturating_add(1);
             plan.candidates_considered = considered;
             if plan.feasible {
@@ -489,12 +496,12 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
                 }
             }
             update_best_effort(&mut best_effort, &plan);
-            evaluated_next.push((state, plan));
+            evaluated_next.push((state, run, plan));
         }
         let beam_width = input.search_beam_width.clamp(1, SEARCH_BEAM_WIDTH);
         if evaluated_next.len() > beam_width {
             truncated = true;
-            evaluated_next.sort_by_key(|(_, plan)| {
+            evaluated_next.sort_by_key(|(_, _, plan)| {
                 (
                     plan.remaining_hp(),
                     plan.expected_loss,
@@ -504,7 +511,10 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
             });
             evaluated_next.truncate(beam_width);
         }
-        frontier = evaluated_next.into_iter().map(|(state, _)| state).collect();
+        frontier = evaluated_next
+            .into_iter()
+            .map(|(state, run, _)| (state, run))
+            .collect();
         if frontier.is_empty() {
             break;
         }
@@ -869,62 +879,156 @@ fn simulate_state_with_catalog(
     if crate::ai::code_path::is_extended_at("v4/rolling_plan.rs::simulate_state_with_catalog") {
         return extended::simulate_state_with_catalog(input, catalog, state, search_turns);
     }
-    let purchases: Vec<_> = state
-        .option_indices
-        .iter()
-        .map(|index| input.production_options[*index].purchase)
-        .collect();
-    let mut friendlies = catalog.existing_units.clone();
-    friendlies.extend(
-        state
-            .option_indices
-            .iter()
-            .map(|index| catalog.production_units[*index].clone()),
-    );
-    let mut protected_units = catalog.protected_units.clone();
-    let mut enemies = catalog.enemies.clone();
-    let mut first_attack_turn = None;
-    let mut turn_forecasts = Vec::new();
+    let mut run = CombatRun::start(catalog, state);
+    run.advance_to(input, search_turns);
+    run.into_plan(input, state)
+}
 
-    for turn in 1..=search_turns {
-        let enemy_arrival_hp = enemies
+/// 1購入案の交戦シミュレーションの途中状態。
+///
+/// 交戦条件（兵種・射程・接触turn）は探索中不変なので `SimulationCatalog` を参照し、
+/// 1候補ごとに変わるHP・残弾・撃破turnと経過turnだけを持つ。生産unitは生産turnの
+/// 翌turnまで交戦しないため、親案を生産turnまで進めた状態から子案を再開できる。
+#[derive(Clone)]
+struct CombatRun<'c> {
+    catalog: &'c SimulationCatalog,
+    /// 戦闘に加わる生産案（`catalog.production_units` の添字、購入列の順）。
+    production: Vec<usize>,
+    /// 既存unit、生産unitの順に並ぶ友軍の状態。
+    friendly_states: Vec<UnitCombatState>,
+    protected_states: Vec<UnitCombatState>,
+    enemy_states: Vec<EnemyCombatState>,
+    first_attack_turn: Option<u32>,
+    turn_forecasts: Vec<CampaignTurnForecast>,
+    completed_turns: u32,
+    /// 全敵を排除して占領期限も過ぎたため、以後のturnを打ち切った。
+    finished: bool,
+}
+
+impl<'c> CombatRun<'c> {
+    fn start(catalog: &'c SimulationCatalog, state: &SearchState) -> Self {
+        let mut run = Self {
+            catalog,
+            production: Vec::with_capacity(state.option_indices.len()),
+            friendly_states: catalog
+                .existing_units
+                .iter()
+                .map(UnitCombatState::of)
+                .collect(),
+            protected_states: catalog
+                .protected_units
+                .iter()
+                .map(UnitCombatState::of)
+                .collect(),
+            enemy_states: catalog.enemies.iter().map(EnemyCombatState::of).collect(),
+            first_attack_turn: None,
+            turn_forecasts: Vec::new(),
+            completed_turns: 0,
+            finished: false,
+        };
+        for option_index in &state.option_indices {
+            run.add_production(*option_index);
+        }
+        run
+    }
+
+    /// 生産unitを友軍の末尾へ加えた子案。生産turnまでの経過は親と同じである。
+    fn with_purchase(&self, option_index: usize) -> Self {
+        let mut child = self.clone();
+        child.add_production(option_index);
+        child
+    }
+
+    fn add_production(&mut self, option_index: usize) {
+        let unit = &self.catalog.production_units[option_index];
+        debug_assert!(
+            unit.available_turn > self.completed_turns,
+            "経過済みturnに交戦できる生産unitを後から加えない"
+        );
+        self.production.push(option_index);
+        self.friendly_states.push(UnitCombatState::of(unit));
+    }
+
+    fn friendly(&self, index: usize) -> &'c SimFriendly {
+        let existing = &self.catalog.existing_units;
+        if index < existing.len() {
+            &existing[index]
+        } else {
+            &self.catalog.production_units[self.production[index - existing.len()]]
+        }
+    }
+
+    /// `last_turn` まで交戦を進める（打ち切り済みなら何もしない）。
+    fn advance_to(&mut self, input: &RollingPlanInput, last_turn: u32) {
+        while !self.finished && self.completed_turns < last_turn {
+            let turn = self.completed_turns + 1;
+            self.simulate_turn(input, turn);
+            self.completed_turns = turn;
+        }
+    }
+
+    fn simulate_turn(&mut self, input: &RollingPlanInput, turn: u32) {
+        let catalog = self.catalog;
+        let enemy_arrival_hp = catalog
+            .enemies
             .iter()
             .filter(|enemy| enemy.source.available_turn == turn)
             .map(|enemy| enemy.source.hp)
             .sum();
-        let enemy_hp_before: u32 = enemies
-            .iter()
-            .filter(|enemy| enemy.source.available_turn <= turn)
-            .map(|enemy| enemy.hp)
-            .sum();
-        let friendly_hp_before: u32 = friendlies
-            .iter()
-            .chain(protected_units.iter())
-            .map(|friendly| friendly.hp)
-            .sum();
+        let enemy_hp_before = arrived_enemy_hp(&catalog.enemies, &self.enemy_states, turn);
+        let friendly_hp_before = total_hp(&self.friendly_states) + total_hp(&self.protected_states);
+        let attack_count = self.friendly_attacks(turn);
+        self.enemy_attacks(turn);
+        let enemy_hp_after = arrived_enemy_hp(&catalog.enemies, &self.enemy_states, turn);
+        let friendly_hp_after = total_hp(&self.friendly_states) + total_hp(&self.protected_states);
+        self.turn_forecasts.push(CampaignTurnForecast {
+            turn,
+            enemy_arrival_hp,
+            enemy_hp_removed: enemy_hp_before.saturating_sub(enemy_hp_after),
+            friendly_hp_lost: friendly_hp_before.saturating_sub(friendly_hp_after),
+            attack_count,
+        });
+        if self.enemy_states.iter().all(|enemy| enemy.hp == 0)
+            && input
+                .capture_completion_turn
+                .is_none_or(|capture_turn| turn >= capture_turn)
+        {
+            self.finished = true;
+        }
+    }
+
+    /// 友軍が並び順に1回ずつ攻撃し、生存した標的から反撃を受ける。攻撃回数を返す。
+    fn friendly_attacks(&mut self, turn: u32) -> u32 {
+        let catalog = self.catalog;
         let mut attack_count = 0_u32;
-        for friendly in &mut friendlies {
-            if friendly.hp == 0 || friendly.attacks_left == 0 || turn < friendly.available_turn {
+        for index in 0..self.friendly_states.len() {
+            let friendly = self.friendly(index);
+            let friendly_state = &mut self.friendly_states[index];
+            if friendly_state.hp == 0
+                || friendly_state.attacks_left == 0
+                || turn < friendly.available_turn
+            {
                 continue;
             }
-            let Some((target_index, attack_profile)) = select_target(friendly, &enemies, turn)
+            let Some((target_index, attack_profile)) =
+                select_target(friendly, &catalog.enemies, &self.enemy_states, turn)
             else {
                 continue;
             };
-            let target = &mut enemies[target_index];
+            let target = &mut self.enemy_states[target_index];
             let damage = calculate_damage_formula(
                 attack_profile.base_damage,
-                friendly.hp,
-                target.source.defense_bonus,
+                friendly_state.hp,
+                catalog.enemies[target_index].source.defense_bonus,
                 false,
             );
             if damage == 0 {
                 continue;
             }
-            first_attack_turn.get_or_insert(turn);
+            self.first_attack_turn.get_or_insert(turn);
             attack_count = attack_count.saturating_add(1);
             target.hp = target.hp.saturating_sub(damage);
-            friendly.attacks_left = friendly.attacks_left.saturating_sub(1);
+            friendly_state.attacks_left = friendly_state.attacks_left.saturating_sub(1);
             if target.hp == 0 {
                 target.destroyed_turn = Some(turn);
                 continue;
@@ -936,171 +1040,156 @@ fn simulate_state_with_catalog(
             if counter_base > 0 {
                 let counter =
                     calculate_damage_formula(counter_base, target.hp, 0, true).saturating_add(10);
-                friendly.hp = friendly.hp.saturating_sub(counter);
+                friendly_state.hp = friendly_state.hp.saturating_sub(counter);
             }
         }
-        // 敵砲兵・直接戦闘unitも手番ごとに最も有利な友軍を攻撃する。
-        // 占領兵だけを損耗対象にすると、射程へ入った護衛砲台が無傷という予測になり、
-        // 間接火力だけの脆い編成を過大評価する。
-        for (enemy_index, enemy) in enemies.iter_mut().enumerate() {
-            if enemy.hp == 0 || enemy.attacks_left == 0 || turn < enemy.source.available_turn {
+        attack_count
+    }
+
+    /// 敵砲兵・直接戦闘unitも手番ごとに最も有利な友軍を攻撃する。
+    /// 占領兵だけを損耗対象にすると、射程へ入った護衛砲台が無傷という予測になり、
+    /// 間接火力だけの脆い編成を過大評価する。
+    fn enemy_attacks(&mut self, turn: u32) {
+        let catalog = self.catalog;
+        for enemy_index in 0..catalog.enemies.len() {
+            let enemy = &catalog.enemies[enemy_index];
+            let enemy_hp = self.enemy_states[enemy_index].hp;
+            if enemy_hp == 0
+                || self.enemy_states[enemy_index].attacks_left == 0
+                || turn < enemy.source.available_turn
+            {
                 continue;
             }
-            let combat_target = friendlies
-                .iter()
-                .enumerate()
-                .filter(|(_, target)| target.hp > 0 && turn >= target.available_turn)
-                .filter_map(|(index, target)| {
-                    let profile = target.enemy_attack_profiles[enemy_index]?;
-                    if turn < profile.contact_turn {
-                        return None;
-                    }
-                    let damage = calculate_damage_formula(profile.base_damage, enemy.hp, 0, true)
-                        .saturating_add(10);
-                    Some((index, damage))
-                })
-                .max_by_key(|(index, damage)| {
-                    (*damage, 100_u32.saturating_sub(friendlies[*index].hp))
-                });
-            let protected_target = protected_units
-                .iter()
-                .enumerate()
-                .filter(|(_, target)| target.hp > 0 && turn >= target.available_turn)
-                .filter_map(|(index, target)| {
-                    let profile = target.enemy_attack_profiles[enemy_index]?;
-                    if turn < profile.contact_turn {
-                        return None;
-                    }
-                    let damage = calculate_damage_formula(profile.base_damage, enemy.hp, 0, true)
-                        .saturating_add(10);
-                    Some((index, damage))
-                })
-                .max_by_key(|(index, damage)| {
-                    (*damage, 100_u32.saturating_sub(protected_units[*index].hp))
-                });
-            let target = match (combat_target, protected_target) {
+            let combat_target = strongest_enemy_attack(
+                (0..self.friendly_states.len()).map(|index| self.friendly(index)),
+                &self.friendly_states,
+                enemy_index,
+                enemy_hp,
+                turn,
+            );
+            let protected_target = strongest_enemy_attack(
+                catalog.protected_units.iter(),
+                &self.protected_states,
+                enemy_index,
+                enemy_hp,
+                turn,
+            );
+            let (target_states, target_index, damage) = match (combat_target, protected_target) {
                 (Some((_index, damage)), Some((protected_index, protected_damage)))
                     if protected_damage > damage =>
                 {
-                    (true, protected_index, protected_damage)
+                    (
+                        &mut self.protected_states,
+                        protected_index,
+                        protected_damage,
+                    )
                 }
-                (Some((index, damage)), _) => (false, index, damage),
-                (None, Some((index, damage))) => (true, index, damage),
+                (Some((index, damage)), _) => (&mut self.friendly_states, index, damage),
+                (None, Some((index, damage))) => (&mut self.protected_states, index, damage),
                 (None, None) => {
                     continue;
                 }
             };
-            if target.0 {
-                protected_units[target.1].hp =
-                    protected_units[target.1].hp.saturating_sub(target.2);
-            } else {
-                friendlies[target.1].hp = friendlies[target.1].hp.saturating_sub(target.2);
-            }
-            if target.2 == 0 {
+            target_states[target_index].hp = target_states[target_index].hp.saturating_sub(damage);
+            if damage == 0 {
                 continue;
             }
-            enemy.attacks_left = enemy.attacks_left.saturating_sub(1);
-        }
-        let enemy_hp_after: u32 = enemies
-            .iter()
-            .filter(|enemy| enemy.source.available_turn <= turn)
-            .map(|enemy| enemy.hp)
-            .sum();
-        let friendly_hp_after: u32 = friendlies
-            .iter()
-            .chain(protected_units.iter())
-            .map(|friendly| friendly.hp)
-            .sum();
-        turn_forecasts.push(CampaignTurnForecast {
-            turn,
-            enemy_arrival_hp,
-            enemy_hp_removed: enemy_hp_before.saturating_sub(enemy_hp_after),
-            friendly_hp_lost: friendly_hp_before.saturating_sub(friendly_hp_after),
-            attack_count,
-        });
-        if enemies.iter().all(|enemy| enemy.hp == 0)
-            && input
-                .capture_completion_turn
-                .is_none_or(|capture_turn| turn >= capture_turn)
-        {
-            break;
+            let enemy_state = &mut self.enemy_states[enemy_index];
+            enemy_state.attacks_left = enemy_state.attacks_left.saturating_sub(1);
         }
     }
 
-    let elimination_turn = if enemies.is_empty() {
-        Some(0)
-    } else {
-        enemies
+    fn into_plan(self, input: &RollingPlanInput, state: &SearchState) -> ForcePackagePlan {
+        let catalog = self.catalog;
+        let purchases: Vec<_> = state
+            .option_indices
             .iter()
-            .map(|enemy| enemy.destroyed_turn)
-            .collect::<Option<Vec<_>>>()
-            .and_then(|turns| turns.into_iter().max())
-    };
-    // Combat枠の歩兵・重歩兵も、生き残ればそのまま前線施設を占領できる。
-    // 専任Captureとして同数を二重要求せず、作戦パッケージ全体の占領能力を数える。
-    let protected_survivor_count = protected_units
-        .iter()
-        .chain(friendlies.iter().filter(|unit| unit.stats.can_capture))
-        .filter(|unit| unit.hp > 0)
-        .count();
-    let protected_force_survives = input.capture_completion_turn.is_none()
-        || protected_survivor_count >= input.required_capture_survivors.max(1);
-    // 固定2ターンを足さず、実campaignのPickup/Transit/Drop/Capture ETAと残敵排除の
-    // 遅い方を採る。輸送編成がまだ存在しない場合は占領完了を予測しない。
-    let occupation_turn = elimination_turn
-        .zip(input.capture_completion_turn)
-        .filter(|_| protected_force_survives)
-        .map(|(elimination, capture)| elimination.max(capture));
-    let expected_loss =
-        friendlies
+            .map(|index| input.production_options[*index].purchase)
+            .collect();
+        let enemy_states = &self.enemy_states;
+        let elimination_turn = if enemy_states.is_empty() {
+            Some(0)
+        } else {
+            enemy_states
+                .iter()
+                .map(|enemy| enemy.destroyed_turn)
+                .collect::<Option<Vec<_>>>()
+                .and_then(|turns| turns.into_iter().max())
+        };
+        // Combat枠の歩兵・重歩兵も、生き残ればそのまま前線施設を占領できる。
+        // 専任Captureとして同数を二重要求せず、作戦パッケージ全体の占領能力を数える。
+        let protected_survivor_count = self
+            .protected_states
             .iter()
-            .chain(protected_units.iter())
-            .fold(0_u32, |total, unit| {
-                let lost_hp = unit.initial_hp.saturating_sub(unit.hp);
+            .filter(|unit| unit.hp > 0)
+            .count()
+            + (0..self.friendly_states.len())
+                .filter(|index| {
+                    self.friendly(*index).stats.can_capture && self.friendly_states[*index].hp > 0
+                })
+                .count();
+        let protected_force_survives = input.capture_completion_turn.is_none()
+            || protected_survivor_count >= input.required_capture_survivors.max(1);
+        // 固定2ターンを足さず、実campaignのPickup/Transit/Drop/Capture ETAと残敵排除の
+        // 遅い方を採る。輸送編成がまだ存在しない場合は占領完了を予測しない。
+        let occupation_turn = elimination_turn
+            .zip(input.capture_completion_turn)
+            .filter(|_| protected_force_survives)
+            .map(|(elimination, capture)| elimination.max(capture));
+        let expected_loss = (0..self.friendly_states.len())
+            .map(|index| (self.friendly(index), &self.friendly_states[index]))
+            .chain(catalog.protected_units.iter().zip(&self.protected_states))
+            .fold(0_u32, |total, (unit, unit_state)| {
+                let lost_hp = unit.initial_hp.saturating_sub(unit_state.hp);
                 total.saturating_add(unit.stats.cost.saturating_mul(lost_hp) / 100)
             });
-    ForcePackagePlan {
-        capture_purchases: Vec::new(),
-        combat_purchases: Vec::new(),
-        front_breakthrough_turn: None,
-        deadline_target_first_attack_turn: None,
-        target_first_attack_turns: Vec::new(),
-        blocked_next_turn_production_slots: 0,
-        direct_fire_lane_count: 0,
-        direct_front_shortfall: 0,
-        direct_enemy_remaining_hp: Vec::new(),
-        direct_damage_by_target: Vec::new(),
-        existing_indirect_damage_by_target: Vec::new(),
-        produced_indirect_damage_by_target: Vec::new(),
-        surviving_combat_value: 0,
-        required_overmatch_value: 0,
-        overmatch_ready: false,
-        deadline_capture_survivor_count: 0,
-        candidates_pruned: 0,
-        purchases,
-        target_forecasts: enemies
-            .into_iter()
-            .map(|enemy| TargetForecast {
-                entity: enemy.source.entity,
-                unit_type: enemy.source.stats.unit_type,
-                available_turn: enemy.source.available_turn,
-                initial_hp: enemy.source.hp,
-                remaining_hp: enemy.hp,
-                destroyed_turn: enemy.destroyed_turn,
-            })
-            .collect(),
-        turn_forecasts,
-        feasible: elimination_turn.is_some() && protected_force_survives,
-        first_attack_turn,
-        elimination_turn,
-        occupation_turn,
-        production_cost: state.cost,
-        expected_loss,
-        protected_unit_count: input.protected_units.len(),
-        protected_survivor_count,
-        required_capture_survivor_count: input.required_capture_survivors,
-        candidates_considered: 0,
-        search_truncated: false,
+        let first_attack_turn = self.first_attack_turn;
+        let turn_forecasts = self.turn_forecasts;
+        ForcePackagePlan {
+            capture_purchases: Vec::new(),
+            combat_purchases: Vec::new(),
+            front_breakthrough_turn: None,
+            deadline_target_first_attack_turn: None,
+            target_first_attack_turns: Vec::new(),
+            blocked_next_turn_production_slots: 0,
+            direct_fire_lane_count: 0,
+            direct_front_shortfall: 0,
+            direct_enemy_remaining_hp: Vec::new(),
+            direct_damage_by_target: Vec::new(),
+            existing_indirect_damage_by_target: Vec::new(),
+            produced_indirect_damage_by_target: Vec::new(),
+            surviving_combat_value: 0,
+            required_overmatch_value: 0,
+            overmatch_ready: false,
+            deadline_capture_survivor_count: 0,
+            candidates_pruned: 0,
+            purchases,
+            target_forecasts: catalog
+                .enemies
+                .iter()
+                .zip(enemy_states)
+                .map(|(enemy, enemy_state)| TargetForecast {
+                    entity: enemy.source.entity,
+                    unit_type: enemy.source.stats.unit_type,
+                    available_turn: enemy.source.available_turn,
+                    initial_hp: enemy.source.hp,
+                    remaining_hp: enemy_state.hp,
+                    destroyed_turn: enemy_state.destroyed_turn,
+                })
+                .collect(),
+            turn_forecasts,
+            feasible: elimination_turn.is_some() && protected_force_survives,
+            first_attack_turn,
+            elimination_turn,
+            occupation_turn,
+            production_cost: state.cost,
+            expected_loss,
+            protected_unit_count: input.protected_units.len(),
+            protected_survivor_count,
+            required_capture_survivor_count: input.required_capture_survivors,
+            candidates_considered: 0,
+            search_truncated: false,
+        }
     }
 }
 
@@ -1232,14 +1321,16 @@ fn sim_friendly(
 fn select_target(
     friendly: &SimFriendly,
     enemies: &[SimEnemy],
+    enemy_states: &[EnemyCombatState],
     turn: u32,
 ) -> Option<(usize, FriendlyAttackProfile)> {
     enemies
         .iter()
+        .zip(enemy_states)
         .enumerate()
-        .filter(|(_, enemy)| enemy.hp > 0)
-        .filter(|(_, enemy)| turn >= enemy.source.available_turn)
-        .filter_map(|(index, enemy)| {
+        .filter(|(_, (_, enemy_state))| enemy_state.hp > 0)
+        .filter(|(_, (enemy, _))| turn >= enemy.source.available_turn)
+        .filter_map(|(index, (enemy, enemy_state))| {
             let profile = friendly.attack_profiles[index]?;
             if turn < profile.ready_turn {
                 return None;
@@ -1258,7 +1349,7 @@ fn select_target(
                 (
                     std::cmp::Reverse(profile.incoming_damage),
                     strategic_rank,
-                    enemy.hp,
+                    enemy_state.hp,
                     index,
                 ),
                 profile,
@@ -1266,6 +1357,78 @@ fn select_target(
         })
         .min_by_key(|(key, _)| *key)
         .map(|((_, _, _, index), profile)| (index, profile))
+}
+
+/// 敵1体が今手番に与えられる最大damageの友軍（同点ならHPの低い方、さらに同点なら後方の要素）。
+fn strongest_enemy_attack<'a>(
+    units: impl Iterator<Item = &'a SimFriendly>,
+    unit_states: &[UnitCombatState],
+    enemy_index: usize,
+    enemy_hp: u32,
+    turn: u32,
+) -> Option<(usize, u32)> {
+    units
+        .zip(unit_states)
+        .enumerate()
+        .filter(|(_, (unit, unit_state))| unit_state.hp > 0 && turn >= unit.available_turn)
+        .filter_map(|(index, (unit, _))| {
+            let profile = unit.enemy_attack_profiles[enemy_index]?;
+            if turn < profile.contact_turn {
+                return None;
+            }
+            let damage =
+                calculate_damage_formula(profile.base_damage, enemy_hp, 0, true).saturating_add(10);
+            Some((index, damage))
+        })
+        .max_by_key(|(index, damage)| (*damage, 100_u32.saturating_sub(unit_states[*index].hp)))
+}
+
+/// 1候補のシミュレーション中に変わる友軍の状態。交戦条件はcatalogの `SimFriendly` が持つ。
+#[derive(Debug, Clone, Copy)]
+struct UnitCombatState {
+    hp: u32,
+    attacks_left: u32,
+}
+
+impl UnitCombatState {
+    fn of(unit: &SimFriendly) -> Self {
+        Self {
+            hp: unit.hp,
+            attacks_left: unit.attacks_left,
+        }
+    }
+}
+
+/// 1候補のシミュレーション中に変わる敵の状態。
+#[derive(Debug, Clone, Copy)]
+struct EnemyCombatState {
+    hp: u32,
+    attacks_left: u32,
+    destroyed_turn: Option<u32>,
+}
+
+impl EnemyCombatState {
+    fn of(enemy: &SimEnemy) -> Self {
+        Self {
+            hp: enemy.hp,
+            attacks_left: enemy.attacks_left,
+            destroyed_turn: enemy.destroyed_turn,
+        }
+    }
+}
+
+fn total_hp(states: &[UnitCombatState]) -> u32 {
+    states.iter().map(|state| state.hp).sum()
+}
+
+/// `turn` までに戦場へ到着している敵の残HP合計。
+fn arrived_enemy_hp(enemies: &[SimEnemy], states: &[EnemyCombatState], turn: u32) -> u32 {
+    enemies
+        .iter()
+        .zip(states)
+        .filter(|(enemy, _)| enemy.source.available_turn <= turn)
+        .map(|(_, state)| state.hp)
+        .sum()
 }
 
 fn best_damage(chart: &DamageChart, attacker: UnitType, defender: UnitType) -> u32 {
