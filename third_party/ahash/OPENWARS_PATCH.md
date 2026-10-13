@@ -18,3 +18,5 @@ crates.io の `ahash 0.8.12` に、乱数の鍵を使わない変更だけを加
 
 ライセンスは元のとおり MIT OR Apache-2.0（同梱の LICENSE-* を参照）。
 - third_party/ahash/src/lib.rs: 先頭に `#![allow(warnings)]`（ワークスペースの `-D warnings` を外部コードへ適用しないため）。
+- third_party/ahash/src/specialize.rs: `default fn` の既定実装を `src/specialize_default.rs` へ移し、`cfg(specialize)` のときだけ読み込む。
+  cfgで除外したコードでも `default fn` の構文検査で「specialization is experimental」の将来非互換警告が出るため（stableでは実装は使われない）。

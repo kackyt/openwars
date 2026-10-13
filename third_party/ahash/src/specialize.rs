@@ -33,18 +33,11 @@ where
     }
 }
 
+// OpenWarsパッチ: `default fn` は cfg で除外しても構文検査で将来非互換の警告が出るため、
+// cfg(specialize) のときだけ読み込む別ファイルへ移した（除外されたファイルは構文解析されない）。
 #[cfg(specialize)]
-impl<T> CallHasher for T
-where
-    T: Hash + ?Sized,
-{
-    #[inline]
-    default fn get_hash<H: Hash + ?Sized>(value: &H, random_state: &RandomState) -> u64 {
-        let mut hasher = random_state.build_hasher();
-        value.hash(&mut hasher);
-        hasher.finish()
-    }
-}
+#[path = "specialize_default.rs"]
+mod specialize_default;
 
 macro_rules! call_hasher_impl_u64 {
     ($typ:ty) => {

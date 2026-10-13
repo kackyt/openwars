@@ -142,13 +142,17 @@ fn print_decision_fingerprints() {
         let seeds: Vec<u64> = std::env::var("OPENWARS_FINGERPRINT_SEEDS")
             .map(|v| v.split(',').filter_map(|s| s.parse().ok()).collect())
             .unwrap_or_else(|_| vec![1, 2]);
+        // 検査対象のAI（既定V4）。V1〜V3の旧経路を確かめるときは `OPENWARS_FINGERPRINT_AI` で選ぶ。
+        let subject = match std::env::var("OPENWARS_FINGERPRINT_AI").as_deref() {
+            Ok("V1") => AiVersion::V1,
+            Ok("V2") => AiVersion::V2,
+            Ok("V3") => AiVersion::V3,
+            _ => AiVersion::V4,
+        };
         let orders = match std::env::var("OPENWARS_FINGERPRINT_ORDER").as_deref() {
-            Ok("swapped") => vec![(AiVersion::V200, AiVersion::V4)],
-            Ok("as-given") => vec![(AiVersion::V4, AiVersion::V200)],
-            _ => vec![
-                (AiVersion::V4, AiVersion::V200),
-                (AiVersion::V200, AiVersion::V4),
-            ],
+            Ok("swapped") => vec![(AiVersion::V200, subject)],
+            Ok("as-given") => vec![(subject, AiVersion::V200)],
+            _ => vec![(subject, AiVersion::V200), (AiVersion::V200, subject)],
         };
         let turns = std::env::var("OPENWARS_FINGERPRINT_TURNS")
             .ok()
