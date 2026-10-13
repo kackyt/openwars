@@ -29,6 +29,7 @@ pub mod beam_search;
 pub mod cluster;
 pub mod simulation;
 pub mod squad;
+pub(crate) mod tactics;
 pub mod threat;
 pub mod turn_distance;
 /// V100/V200の独立した逐次AI。
