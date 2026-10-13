@@ -1,7 +1,4 @@
-//! AI再設計: 責務ごとに分離した共通処理。
-#![allow(clippy::collapsible_if)]
-#![allow(clippy::unnecessary_min_or_max)]
-#![allow(clippy::unnecessary_map_or)]
+//! V4島嶼キャンペーン所属ユニットの戦術制約と目標解決。
 use crate::components::{GridPosition, PlayerId};
 use bevy_ecs::prelude::*;
 

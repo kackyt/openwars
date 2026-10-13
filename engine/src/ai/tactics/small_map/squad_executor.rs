@@ -1,7 +1,4 @@
-//! 小規模V4のSquad単位の行動実行順。
-#![allow(clippy::collapsible_if)]
-#![allow(clippy::unnecessary_min_or_max)]
-#![allow(clippy::unnecessary_map_or)]
+//! 小規模V4のSquad単位の行動実行順と前衛・間接支援の連携。
 use crate::ai::command::AiCommand;
 use crate::ai::context::tactical::*;
 use crate::collections::{HashMap, HashSet};
@@ -13,6 +10,526 @@ use crate::resources::master_data::MasterDataRegistry;
 use crate::systems::combat::get_expected_damage;
 use crate::systems::movement::{OccupantInfo, calculate_reachable_tiles, get_valid_movement_cost};
 use bevy_ecs::prelude::*;
+
+/// V4 Squad executorが同じ任務だけを連続実行しないための巡回位置。
+///
+/// Entity単位の全体順位へ戻さず、Squadを命令主体に保ったまま、攻勢・占領・防衛の
+/// 進行を1アクションずつ交互にする。
+#[derive(Resource, Debug, Default)]
+struct V4SquadExecutionCursor {
+    last_squad: HashMap<PlayerId, crate::ai::squad::SquadId>,
+}
+
+/// 実行順ソート済みの1つのSquadエントリ: (任務優先度, SquadId, 所属Entity集合, 目標座標)。
+type ExecutableSquadEntry = (u8, u32, HashSet<Entity>, Option<GridPosition>);
+
+/// Squad executorから渡されたmember集合だけを戦術採点する内部入口。
+///
+/// V2/V3の公開関数は従来どおり全unitを対象にする。V4だけはSquadが選んだ
+/// candidate集合を渡すため、ここは戦略目標を新たに発明せず、Move/Attack/Captureの
+/// 戦術順位だけを決める。
+fn decide_ai_action_v2_for_entities(
+    world: &mut World,
+    player_id: PlayerId,
+    skip_entities: &crate::collections::HashSet<Entity>,
+    permitted_entities: Option<&HashSet<Entity>>,
+) -> Option<(Entity, AiCommand)> {
+    crate::ai::tactics::small_map::decide_action(
+        world,
+        player_id,
+        skip_entities,
+        permitted_entities,
+    )
+}
+
+/// 台帳の作戦所有権を優先し、未登録の通常Squadだけ目標一致で協働する。
+fn shares_attack_operation(world: &World, left: Entity, right: Entity, same_target: bool) -> bool {
+    world
+        .get_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>()
+        .and_then(|registry| registry.shares_attack_operation(left, right))
+        .unwrap_or(same_target)
+}
+
+/// 前衛の現在位置に追随する後方射点を選ぶ。前衛の将来位置を既成事実にしない。
+/// 射撃可能なら移動しない。敵の合法な移動後攻撃が届くセルも追随先にしない。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn coordinated_support_destination(
+    world: &World,
+    player: PlayerId,
+    gun: Entity,
+    gun_stats: &UnitStats,
+    origin: GridPosition,
+    objective: Option<GridPosition>,
+    candidates: &[(usize, usize)],
+    occupants: &HashMap<(usize, usize), OccupantInfo>,
+    manager: &crate::ai::squad::SquadManager,
+    snapshot: &AiTacticalSnapshot,
+    map: &Map,
+    master: &MasterDataRegistry,
+    chart: &crate::resources::DamageChart,
+) -> Option<GridPosition> {
+    let objective = objective?;
+    if !snapshot
+        .action_targets_at(gun, gun_stats, origin, false)
+        .attackable_targets
+        .is_empty()
+    {
+        return None;
+    }
+    let attack_squads = manager
+        .squads
+        .iter()
+        .filter(|squad| {
+            squad.owner_id == Some(player)
+                && squad.mission_type == crate::ai::squad::MissionType::Attack
+        })
+        .collect::<Vec<_>>();
+    if !attack_squads
+        .iter()
+        .any(|squad| squad.members.contains(&gun))
+    {
+        return None;
+    }
+    let front_distance = attack_squads
+        .iter()
+        .flat_map(|squad| {
+            squad.members.iter().filter(move |entity| {
+                shares_attack_operation(world, gun, **entity, squad.target == Some(objective))
+            })
+        })
+        .filter_map(|entity| {
+            let stats = world.get::<UnitStats>(*entity)?;
+            let hp = world.get::<Health>(*entity)?;
+            let pos = world.get::<GridPosition>(*entity)?;
+            // 占領担当を引き抜かず、この攻勢に所属する生存直接部隊だけを見る。
+            (stats.min_range <= 1
+                && hp.current > 0
+                && world
+                    .get::<crate::components::Transporting>(*entity)
+                    .is_none())
+            .then_some(map.distance(pos.x, pos.y, objective.x, objective.y))
+        })
+        .min()?;
+    let target = snapshot
+        .units()
+        .iter()
+        .find(|unit| {
+            unit.position == objective
+                && unit.faction != player
+                && !unit.is_transporting
+                && world
+                    .get::<Health>(unit.entity)
+                    .is_some_and(|hp| hp.current > 0)
+        })?
+        .entity;
+    let mut destinations = candidates
+        .iter()
+        .filter_map(|&(x, y)| {
+            let pos = GridPosition { x, y };
+            let distance = map.distance(x, y, objective.x, objective.y);
+            (pos != origin
+                && !occupants.contains_key(&(x, y))
+                && distance > front_distance
+                && distance < map.distance(origin.x, origin.y, objective.x, objective.y)
+                && snapshot
+                    .action_targets_at(gun, gun_stats, pos, false)
+                    .attackable_targets
+                    .contains(&target)
+                && !world.iter_entities().any(|entity| {
+                    entity.get::<GridPosition>().copied() == Some(pos)
+                        && entity.get::<Property>().is_some_and(|property| {
+                            master.is_production_facility(property.terrain.as_str())
+                        })
+                }))
+            .then_some(pos)
+        })
+        .collect::<Vec<_>>();
+    // 射程を満たす最後方のセルから検査する。同距離は移動量・座標で安定化する。
+    destinations.sort_unstable_by_key(|pos| {
+        (
+            std::cmp::Reverse(map.distance(pos.x, pos.y, objective.x, objective.y)),
+            map.distance(origin.x, origin.y, pos.x, pos.y),
+            pos.y,
+            pos.x,
+        )
+    });
+    if destinations.is_empty() {
+        return None;
+    }
+    // 砲の元の位置は空く。味方前衛・敵を含む他の占有はそのまま経路計算へ渡す。
+    let mut future_occupants = occupants.clone();
+    future_occupants.remove(&(origin.x, origin.y));
+    let enemies = snapshot
+        .units()
+        .iter()
+        .filter_map(|unit| {
+            if unit.faction == player || unit.is_transporting {
+                return None;
+            }
+            let stats = world.get::<UnitStats>(unit.entity)?;
+            let hp = world.get::<Health>(unit.entity)?.current;
+            if hp == 0 {
+                return None;
+            }
+            let fuel = world
+                .get::<crate::components::Fuel>(unit.entity)
+                .map_or(0, |f| f.current);
+            let reachable = calculate_reachable_tiles(
+                map,
+                &future_occupants,
+                (unit.position.x, unit.position.y),
+                stats.movement_type,
+                stats.max_movement,
+                fuel,
+                unit.faction,
+                stats.unit_type,
+                master,
+            );
+            Some((unit, stats, hp, reachable))
+        })
+        .collect::<Vec<_>>();
+    destinations.into_iter().find(|pos| {
+        let defense = map
+            .get_terrain(pos.x, pos.y)
+            .map_or(0, |terrain| master.get_terrain_defense_bonus(terrain));
+        !enemies.iter().any(|(unit, stats, hp, reachable)| {
+            reachable
+                .iter()
+                .chain(std::iter::once(&(unit.position.x, unit.position.y)))
+                .any(|&(x, y)| {
+                    if future_occupants.contains_key(&(x, y))
+                        && (x, y) != (unit.position.x, unit.position.y)
+                    {
+                        return false;
+                    }
+                    let distance = map.distance(x, y, pos.x, pos.y);
+                    // 実ゲームと同じく、移動後には遠距離射撃できない。
+                    if (x, y) != (unit.position.x, unit.position.y) && distance > 1 {
+                        return false;
+                    }
+                    get_expected_damage(
+                        stats,
+                        *hp,
+                        (unit.ammo1, unit.ammo2),
+                        gun_stats,
+                        defense,
+                        distance,
+                        master,
+                        chart,
+                        false,
+                    ) > 0
+                })
+        })
+    })
+}
+
+/// V4の通常行動を、Squadを命令主体として選ぶ。
+///
+/// 先にRoadmap/Reconcilerが確定した唯一所属Squadを優先順に取り出し、そのmemberだけを
+/// 既存の戦術採点器へ渡す。従ってこの層は別の島・別NodeへEntityを再配分せず、
+/// `AiCommand` がEntity指定であるというエンジン境界だけを最後に解決する。
+pub(crate) fn decide_squad_action_v4(
+    world: &mut World,
+    player_id: PlayerId,
+    skip_entities: &HashSet<Entity>,
+) -> Option<(Entity, AiCommand)> {
+    let squads = collect_executable_squads(world, player_id);
+    let start = world
+        .get_resource::<V4SquadExecutionCursor>()
+        .and_then(|cursor| cursor.last_squad.get(&player_id).copied())
+        .and_then(|last_squad| {
+            squads
+                .iter()
+                .position(|(_, squad_id, _, _)| *squad_id == last_squad.0)
+                .map(|index| (index + 1) % squads.len())
+        })
+        .unwrap_or(0);
+    let mut deferred_wait = None;
+    for offset in 0..squads.len() {
+        let index = (start + offset) % squads.len();
+        let (priority, squad_id, members, squad_target) = &squads[index];
+        let Some(action) =
+            decide_ai_action_v2_for_entities(world, player_id, skip_entities, Some(members))
+        else {
+            continue;
+        };
+        if let Some(support_action) = try_stationary_support_fire_before_frontline(
+            world,
+            player_id,
+            *priority,
+            *squad_target,
+            &action,
+            &squads,
+            skip_entities,
+        ) {
+            // 巡回位置を進めず、砲撃後は前衛から再評価する。
+            return Some(support_action);
+        }
+        // 目的方向の出口を、まだ行動できる友軍が塞いでいる場合だけ同位置Waitを
+        // 一巡保留する。先に出口側Squadを動かした次のAI stepで同じEntityを再評価し、
+        // 生産拠点内の後続を行動済みにしてから出口が空く順序逆転を防ぐ。
+        if wait_is_temporarily_blocked_by_unacted_friendly(
+            world,
+            player_id,
+            action.0,
+            &action.1,
+            *squad_target,
+            skip_entities,
+        ) {
+            deferred_wait.get_or_insert((*squad_id, action));
+            continue;
+        }
+        // 保留済みSquadがある間は巡回位置を進めない。退去行動を実行した次stepを
+        // 同じ走査位置から始め、空いた出口を他のSquadに再占有される前に再評価する。
+        if deferred_wait.is_none() {
+            update_v4_squad_execution_cursor(world, player_id, *squad_id);
+        }
+        return Some(action);
+    }
+    // 全Squadを一巡して退去・攻撃などを選べなければ、最初のWaitを確定する。
+    // 保留だけを返さず再走査する構造にしないことで、相互閉塞時も無限deferしない。
+    deferred_wait.map(|(squad_id, action)| {
+        update_v4_squad_execution_cursor(world, player_id, squad_id);
+        action
+    })
+}
+
+/// 自軍の非Transport Squadを、任務優先度とSquadIdで安定ソートして返す。
+fn collect_executable_squads(world: &World, player_id: PlayerId) -> Vec<ExecutableSquadEntry> {
+    let manager = world
+        .get_resource::<crate::ai::squad::SquadManager>()
+        .cloned()
+        .unwrap_or_default();
+    let assignments = world
+        .get_resource::<crate::ai::operation_assignment::UnitOperationRegistry>()
+        .map(|registry| registry.player_assignments(player_id));
+    let mut squads = manager
+        .squads
+        .iter()
+        .filter(|squad| {
+            squad.owner_id == Some(player_id)
+                && squad.mission_type != crate::ai::squad::MissionType::Transport
+        })
+        .filter_map(|squad| {
+            let members = squad
+                .members
+                .iter()
+                .copied()
+                .filter(|entity| {
+                    assignments.as_ref().is_none_or(|assignments| {
+                        assignments
+                            .get(entity)
+                            .is_none_or(|assignment| assignment.squad_id == Some(squad.id))
+                    })
+                })
+                .collect::<HashSet<_>>();
+            (!members.is_empty()).then_some((
+                squad_executor_priority(&squad.mission_type),
+                squad.id.0,
+                members,
+                squad.target,
+            ))
+        })
+        .collect::<Vec<_>>();
+    // 同一任務のSquad間はIDで安定化する。乱数を持たないため、評価試合のseedを跨いで
+    // 意思決定順が揺れない。
+    squads.sort_unstable_by_key(|(priority, squad_id, _, _)| (*priority, *squad_id));
+    squads
+}
+
+/// 同じ攻略目標の前衛を行動済みにする前に、後方からの合法な静止砲撃があれば先に返す。
+/// 火力を仮想的に被害から差し引かず、次のAI stepで実際の敵HPを読み直す。
+/// Capture/Defenseの担当は引き抜かず、攻勢Squad同士に限定する。
+fn try_stationary_support_fire_before_frontline(
+    world: &mut World,
+    player_id: PlayerId,
+    squad_priority: u8,
+    squad_target: Option<GridPosition>,
+    front_action: &(Entity, AiCommand),
+    squads: &[ExecutableSquadEntry],
+    skip_entities: &HashSet<Entity>,
+) -> Option<(Entity, AiCommand)> {
+    let attack_priority = squad_executor_priority(&crate::ai::squad::MissionType::Attack);
+    if squad_priority != attack_priority
+        || !world
+            .get::<UnitStats>(front_action.0)
+            .is_some_and(|stats| stats.min_range <= 1)
+        || !matches!(
+            front_action.1,
+            AiCommand::Attack { .. } | AiCommand::Wait { .. }
+        )
+    {
+        return None;
+    }
+    let objective = squad_target?;
+    let support_target = match &front_action.1 {
+        AiCommand::Attack { target_entity, .. } => Some(*target_entity),
+        // 足止めされている前衛も、目的地の敵が削られる前にWaitを確定しない。
+        _ => world.iter_entities().find_map(|entity| {
+            (entity.get::<GridPosition>().copied() == Some(objective)
+                && entity.get::<Faction>().is_some_and(|f| f.0 != player_id)
+                && entity.get::<Health>().is_some_and(|h| h.current > 0)
+                && entity.get::<UnitStats>().is_some())
+            .then_some(entity.id())
+        }),
+    }?;
+
+    for (priority, _, support_members, support_objective) in squads {
+        if *priority != squad_priority {
+            continue;
+        }
+        let guns = support_members
+            .iter()
+            .copied()
+            .filter(|entity| {
+                world
+                    .get::<UnitStats>(*entity)
+                    .is_some_and(|stats| stats.min_range > 1)
+                    && world.get::<HasMoved>(*entity).is_some_and(|moved| !moved.0)
+                    && shares_attack_operation(
+                        world,
+                        front_action.0,
+                        *entity,
+                        *support_objective == Some(objective),
+                    )
+            })
+            .collect::<HashSet<_>>();
+        if guns.is_empty() {
+            continue;
+        }
+        if let Some((gun, command)) =
+            decide_ai_action_v2_for_entities(world, player_id, skip_entities, Some(&guns))
+        {
+            // 通常評価でも選ばれた、その場からの同一目標への射撃だけを実行。
+            // 移動先での架空射撃や、別任務の砲の徴用はしない。
+            if let AiCommand::Attack { target_pos, .. } = &command
+                && world.get::<GridPosition>(gun) == Some(target_pos)
+                && crate::systems::action::get_tactical_action_targets_at(
+                    world,
+                    gun,
+                    *target_pos,
+                    false,
+                )
+                .attackable_targets
+                .contains(&support_target)
+            {
+                return Some((
+                    gun,
+                    AiCommand::Attack {
+                        target_pos: *target_pos,
+                        target_entity: support_target,
+                    },
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn update_v4_squad_execution_cursor(world: &mut World, player_id: PlayerId, squad_id: u32) {
+    let mut cursor = world
+        .remove_resource::<V4SquadExecutionCursor>()
+        .unwrap_or_default();
+    cursor
+        .last_squad
+        .insert(player_id, crate::ai::squad::SquadId(squad_id));
+    world.insert_resource(cursor);
+}
+
+/// 同位置Waitが、目的地へ近づく全ての隣接出口を未行動友軍に塞がれた一時停止か判定する。
+///
+/// 敵・行動済み友軍・地形による閉塞は同じ手番中に解消する保証がないため保留しない。
+/// DAGが一点目標を外したControl中も、古いSquad目標を復活させず通常のWaitを確定する。
+fn wait_is_temporarily_blocked_by_unacted_friendly(
+    world: &World,
+    player_id: PlayerId,
+    entity: Entity,
+    command: &AiCommand,
+    squad_target: Option<GridPosition>,
+    skip_entities: &HashSet<Entity>,
+) -> bool {
+    let AiCommand::Wait { target_pos } = command else {
+        return false;
+    };
+    let Some(position) = world.get::<GridPosition>(entity).copied() else {
+        return false;
+    };
+    if *target_pos != position {
+        return false;
+    }
+    let objective = match crate::ai::v4::capital_route_tactical_target(world, player_id, entity) {
+        Some(target) => target,
+        None => squad_target,
+    };
+    let Some(objective) = objective.filter(|target| *target != position) else {
+        return false;
+    };
+    let Some(map) = world.get_resource::<Map>() else {
+        return false;
+    };
+    let Some(master_data) = world.get_resource::<MasterDataRegistry>() else {
+        return false;
+    };
+    let Some(stats) = world.get::<UnitStats>(entity) else {
+        return false;
+    };
+    let current_distance = map.distance(position.x, position.y, objective.x, objective.y);
+    let mut found_toward_exit = false;
+
+    for (x, y) in map.get_adjacent(position.x, position.y) {
+        if map.distance(x, y, objective.x, objective.y) >= current_distance {
+            continue;
+        }
+        let Some(terrain) = map.get_terrain(x, y) else {
+            continue;
+        };
+        if get_valid_movement_cost(master_data, stats.movement_type, terrain).is_none() {
+            continue;
+        }
+        found_toward_exit = true;
+        let blocker = world.iter_entities().find_map(|candidate| {
+            if candidate.id() == entity
+                || candidate.get::<crate::components::Transporting>().is_some()
+                || candidate.get::<GridPosition>().copied() != Some(GridPosition { x, y })
+            {
+                return None;
+            }
+            candidate
+                .get::<Faction>()
+                .map(|faction| (candidate.id(), faction.0))
+        });
+        let Some((blocker, faction)) = blocker else {
+            return false;
+        };
+        let blocker_unacted = faction == player_id
+            && !skip_entities.contains(&blocker)
+            && world.get::<HasMoved>(blocker).is_some_and(|moved| !moved.0)
+            && world
+                .get::<ActionCompleted>(blocker)
+                .is_some_and(|completed| !completed.0);
+        if !blocker_unacted {
+            return false;
+        }
+    }
+
+    found_toward_exit
+}
+
+/// 敵前のCapture Squadを単独で先走らせないよう、まずSuppress/Attackを扱い、残りは
+/// Capture・Defense・Reserveの順にする。
+///
+/// これは戦術の点数を置換するものではなく、複数Squadのうちどの命令を次に展開するか
+/// を決めるRoadmap投影順である。
+fn squad_executor_priority(mission: &crate::ai::squad::MissionType) -> u8 {
+    match mission {
+        crate::ai::squad::MissionType::Attack => 0,
+        crate::ai::squad::MissionType::Capture => 1,
+        crate::ai::squad::MissionType::Defense => 2,
+        crate::ai::squad::MissionType::Reserve => 3,
+        crate::ai::squad::MissionType::Transport => u8::MAX,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1436,495 +1953,5 @@ mod tests {
             GridPosition { x: 1, y: 0 },
             "戦車は敵工場 (1, 0) の封鎖を維持すべき"
         );
-    }
-}
-
-/// V4 Squad executorが同じ任務だけを連続実行しないための巡回位置。
-///
-/// Entity単位の全体順位へ戻さず、Squadを命令主体に保ったまま、攻勢・占領・防衛の
-/// 進行を1アクションずつ交互にする。
-#[derive(Resource, Debug, Default)]
-struct V4SquadExecutionCursor {
-    last_squad: HashMap<PlayerId, crate::ai::squad::SquadId>,
-}
-
-/// Squad executorから渡されたmember集合だけを戦術採点する内部入口。
-///
-/// V2/V3の公開関数は従来どおり全unitを対象にする。V4だけはSquadが選んだ
-/// candidate集合を渡すため、ここは戦略目標を新たに発明せず、Move/Attack/Captureの
-/// 戦術順位だけを決める。
-fn decide_ai_action_v2_for_entities(
-    world: &mut World,
-    player_id: PlayerId,
-    skip_entities: &crate::collections::HashSet<Entity>,
-    permitted_entities: Option<&HashSet<Entity>>,
-) -> Option<(Entity, AiCommand)> {
-    crate::ai::tactics::small_map::decide_action(
-        world,
-        player_id,
-        skip_entities,
-        permitted_entities,
-    )
-}
-
-/// V4の通常行動を、Squadを命令主体として選ぶ。
-///
-/// 先にRoadmap/Reconcilerが確定した唯一所属Squadを優先順に取り出し、そのmemberだけを
-/// 既存の戦術採点器へ渡す。従ってこの層は別の島・別NodeへEntityを再配分せず、
-/// `AiCommand` がEntity指定であるというエンジン境界だけを最後に解決する。
-/// 台帳の作戦所有権を優先し、未登録の通常Squadだけ目標一致で協働する。
-fn shares_attack_operation(world: &World, left: Entity, right: Entity, same_target: bool) -> bool {
-    world
-        .get_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>()
-        .and_then(|registry| registry.shares_attack_operation(left, right))
-        .unwrap_or(same_target)
-}
-
-/// 前衛の現在位置に追随する後方射点を選ぶ。前衛の将来位置を既成事実にしない。
-/// 射撃可能なら移動しない。敵の合法な移動後攻撃が届くセルも追随先にしない。
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn coordinated_support_destination(
-    world: &World,
-    player: PlayerId,
-    gun: Entity,
-    gun_stats: &UnitStats,
-    origin: GridPosition,
-    objective: Option<GridPosition>,
-    candidates: &[(usize, usize)],
-    occupants: &HashMap<(usize, usize), OccupantInfo>,
-    manager: &crate::ai::squad::SquadManager,
-    snapshot: &AiTacticalSnapshot,
-    map: &Map,
-    master: &MasterDataRegistry,
-    chart: &crate::resources::DamageChart,
-) -> Option<GridPosition> {
-    let objective = objective?;
-    if !snapshot
-        .action_targets_at(gun, gun_stats, origin, false)
-        .attackable_targets
-        .is_empty()
-    {
-        return None;
-    }
-    let attack_squads = manager
-        .squads
-        .iter()
-        .filter(|squad| {
-            squad.owner_id == Some(player)
-                && squad.mission_type == crate::ai::squad::MissionType::Attack
-        })
-        .collect::<Vec<_>>();
-    if !attack_squads
-        .iter()
-        .any(|squad| squad.members.contains(&gun))
-    {
-        return None;
-    }
-    let front_distance = attack_squads
-        .iter()
-        .flat_map(|squad| {
-            squad.members.iter().filter(move |entity| {
-                shares_attack_operation(world, gun, **entity, squad.target == Some(objective))
-            })
-        })
-        .filter_map(|entity| {
-            let stats = world.get::<UnitStats>(*entity)?;
-            let hp = world.get::<Health>(*entity)?;
-            let pos = world.get::<GridPosition>(*entity)?;
-            // 占領担当を引き抜かず、この攻勢に所属する生存直接部隊だけを見る。
-            (stats.min_range <= 1
-                && hp.current > 0
-                && world
-                    .get::<crate::components::Transporting>(*entity)
-                    .is_none())
-            .then_some(map.distance(pos.x, pos.y, objective.x, objective.y))
-        })
-        .min()?;
-    let target = snapshot
-        .units()
-        .iter()
-        .find(|unit| {
-            unit.position == objective
-                && unit.faction != player
-                && !unit.is_transporting
-                && world
-                    .get::<Health>(unit.entity)
-                    .is_some_and(|hp| hp.current > 0)
-        })?
-        .entity;
-    let mut destinations = candidates
-        .iter()
-        .filter_map(|&(x, y)| {
-            let pos = GridPosition { x, y };
-            let distance = map.distance(x, y, objective.x, objective.y);
-            (pos != origin
-                && !occupants.contains_key(&(x, y))
-                && distance > front_distance
-                && distance < map.distance(origin.x, origin.y, objective.x, objective.y)
-                && snapshot
-                    .action_targets_at(gun, gun_stats, pos, false)
-                    .attackable_targets
-                    .contains(&target)
-                && !world.iter_entities().any(|entity| {
-                    entity.get::<GridPosition>().copied() == Some(pos)
-                        && entity.get::<Property>().is_some_and(|property| {
-                            master.is_production_facility(property.terrain.as_str())
-                        })
-                }))
-            .then_some(pos)
-        })
-        .collect::<Vec<_>>();
-    // 射程を満たす最後方のセルから検査する。同距離は移動量・座標で安定化する。
-    destinations.sort_unstable_by_key(|pos| {
-        (
-            std::cmp::Reverse(map.distance(pos.x, pos.y, objective.x, objective.y)),
-            map.distance(origin.x, origin.y, pos.x, pos.y),
-            pos.y,
-            pos.x,
-        )
-    });
-    if destinations.is_empty() {
-        return None;
-    }
-    // 砲の元の位置は空く。味方前衛・敵を含む他の占有はそのまま経路計算へ渡す。
-    let mut future_occupants = occupants.clone();
-    future_occupants.remove(&(origin.x, origin.y));
-    let enemies = snapshot
-        .units()
-        .iter()
-        .filter_map(|unit| {
-            if unit.faction == player || unit.is_transporting {
-                return None;
-            }
-            let stats = world.get::<UnitStats>(unit.entity)?;
-            let hp = world.get::<Health>(unit.entity)?.current;
-            if hp == 0 {
-                return None;
-            }
-            let fuel = world
-                .get::<crate::components::Fuel>(unit.entity)
-                .map_or(0, |f| f.current);
-            let reachable = calculate_reachable_tiles(
-                map,
-                &future_occupants,
-                (unit.position.x, unit.position.y),
-                stats.movement_type,
-                stats.max_movement,
-                fuel,
-                unit.faction,
-                stats.unit_type,
-                master,
-            );
-            Some((unit, stats, hp, reachable))
-        })
-        .collect::<Vec<_>>();
-    destinations.into_iter().find(|pos| {
-        let defense = map
-            .get_terrain(pos.x, pos.y)
-            .map_or(0, |terrain| master.get_terrain_defense_bonus(terrain));
-        !enemies.iter().any(|(unit, stats, hp, reachable)| {
-            reachable
-                .iter()
-                .chain(std::iter::once(&(unit.position.x, unit.position.y)))
-                .any(|&(x, y)| {
-                    if future_occupants.contains_key(&(x, y))
-                        && (x, y) != (unit.position.x, unit.position.y)
-                    {
-                        return false;
-                    }
-                    let distance = map.distance(x, y, pos.x, pos.y);
-                    // 実ゲームと同じく、移動後には遠距離射撃できない。
-                    if (x, y) != (unit.position.x, unit.position.y) && distance > 1 {
-                        return false;
-                    }
-                    get_expected_damage(
-                        stats,
-                        *hp,
-                        (unit.ammo1, unit.ammo2),
-                        gun_stats,
-                        defense,
-                        distance,
-                        master,
-                        chart,
-                        false,
-                    ) > 0
-                })
-        })
-    })
-}
-
-pub(crate) fn decide_squad_action_v4(
-    world: &mut World,
-    player_id: PlayerId,
-    skip_entities: &HashSet<Entity>,
-) -> Option<(Entity, AiCommand)> {
-    let manager = world
-        .get_resource::<crate::ai::squad::SquadManager>()
-        .cloned()
-        .unwrap_or_default();
-    let assignments = world
-        .get_resource::<crate::ai::operation_assignment::UnitOperationRegistry>()
-        .map(|registry| registry.player_assignments(player_id));
-    let mut squads = manager
-        .squads
-        .iter()
-        .filter(|squad| {
-            squad.owner_id == Some(player_id)
-                && squad.mission_type != crate::ai::squad::MissionType::Transport
-        })
-        .filter_map(|squad| {
-            let members = squad
-                .members
-                .iter()
-                .copied()
-                .filter(|entity| {
-                    assignments.as_ref().is_none_or(|assignments| {
-                        assignments
-                            .get(entity)
-                            .is_none_or(|assignment| assignment.squad_id == Some(squad.id))
-                    })
-                })
-                .collect::<HashSet<_>>();
-            (!members.is_empty()).then_some((
-                squad_executor_priority(&squad.mission_type),
-                squad.id.0,
-                members,
-                squad.target,
-            ))
-        })
-        .collect::<Vec<_>>();
-    // 同一任務のSquad間はIDで安定化する。乱数を持たないため、評価試合のseedを跨いで
-    // 意思決定順が揺れない。
-    squads.sort_unstable_by_key(|(priority, squad_id, _, _)| (*priority, *squad_id));
-    let start = world
-        .get_resource::<V4SquadExecutionCursor>()
-        .and_then(|cursor| cursor.last_squad.get(&player_id).copied())
-        .and_then(|last_squad| {
-            squads
-                .iter()
-                .position(|(_, squad_id, _, _)| *squad_id == last_squad.0)
-                .map(|index| (index + 1) % squads.len())
-        })
-        .unwrap_or(0);
-    let mut deferred_wait = None;
-    for offset in 0..squads.len() {
-        let index = (start + offset) % squads.len();
-        let (_, squad_id, members, squad_target) = &squads[index];
-        if let Some(action) =
-            decide_ai_action_v2_for_entities(world, player_id, skip_entities, Some(members))
-        {
-            // 同じ攻略目標の前衛を行動済みにする前に、後方からの合法な砲撃を解決する。
-            // 火力を仮想的に被害から差し引かず、次のAI stepで実際の敵HPを読み直す。
-            // Capture/Defenseの担当は引き抜かず、攻勢Squad同士に限定する。
-            if squads[index].0 == squad_executor_priority(&crate::ai::squad::MissionType::Attack)
-                && world
-                    .get::<UnitStats>(action.0)
-                    .is_some_and(|stats| stats.min_range <= 1)
-                && matches!(action.1, AiCommand::Attack { .. } | AiCommand::Wait { .. })
-                && let Some(objective) = *squad_target
-            {
-                let support_target = match &action.1 {
-                    AiCommand::Attack { target_entity, .. } => Some(*target_entity),
-                    // 足止めされている前衛も、目的地の敵が削られる前にWaitを確定しない。
-                    _ => world.iter_entities().find_map(|entity| {
-                        (entity.get::<GridPosition>().copied() == Some(objective)
-                            && entity.get::<Faction>().is_some_and(|f| f.0 != player_id)
-                            && entity.get::<Health>().is_some_and(|h| h.current > 0)
-                            && entity.get::<UnitStats>().is_some())
-                        .then_some(entity.id())
-                    }),
-                };
-                if let Some(support_target) = support_target {
-                    for (priority, _, support_members, support_objective) in &squads {
-                        if *priority != squads[index].0 {
-                            continue;
-                        }
-                        let guns = support_members
-                            .iter()
-                            .copied()
-                            .filter(|entity| {
-                                world
-                                    .get::<UnitStats>(*entity)
-                                    .is_some_and(|stats| stats.min_range > 1)
-                                    && world.get::<HasMoved>(*entity).is_some_and(|moved| !moved.0)
-                                    && shares_attack_operation(
-                                        world,
-                                        action.0,
-                                        *entity,
-                                        *support_objective == Some(objective),
-                                    )
-                            })
-                            .collect::<HashSet<_>>();
-                        if guns.is_empty() {
-                            continue;
-                        }
-                        if let Some((gun, command)) = decide_ai_action_v2_for_entities(
-                            world,
-                            player_id,
-                            skip_entities,
-                            Some(&guns),
-                        ) {
-                            // 通常評価でも選ばれた、その場からの同一目標への射撃だけを実行。
-                            // 移動先での架空射撃や、別任務の砲の徴用はしない。
-                            if let AiCommand::Attack { target_pos, .. } = &command
-                                && world.get::<GridPosition>(gun) == Some(target_pos)
-                                && crate::systems::action::get_tactical_action_targets_at(
-                                    world,
-                                    gun,
-                                    *target_pos,
-                                    false,
-                                )
-                                .attackable_targets
-                                .contains(&support_target)
-                            {
-                                // 巡回位置を進めず、砲撃後は前衛から再評価する。
-                                return Some((
-                                    gun,
-                                    AiCommand::Attack {
-                                        target_pos: *target_pos,
-                                        target_entity: support_target,
-                                    },
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            // 目的方向の出口を、まだ行動できる友軍が塞いでいる場合だけ同位置Waitを
-            // 一巡保留する。先に出口側Squadを動かした次のAI stepで同じEntityを再評価し、
-            // 生産拠点内の後続を行動済みにしてから出口が空く順序逆転を防ぐ。
-            if wait_is_temporarily_blocked_by_unacted_friendly(
-                world,
-                player_id,
-                action.0,
-                &action.1,
-                *squad_target,
-                skip_entities,
-            ) {
-                deferred_wait.get_or_insert((*squad_id, action));
-                continue;
-            }
-            // 保留済みSquadがある間は巡回位置を進めない。退去行動を実行した次stepを
-            // 同じ走査位置から始め、空いた出口を他のSquadに再占有される前に再評価する。
-            if deferred_wait.is_none() {
-                update_v4_squad_execution_cursor(world, player_id, *squad_id);
-            }
-            return Some(action);
-        }
-    }
-    // 全Squadを一巡して退去・攻撃などを選べなければ、最初のWaitを確定する。
-    // 保留だけを返さず再走査する構造にしないことで、相互閉塞時も無限deferしない。
-    deferred_wait.map(|(squad_id, action)| {
-        update_v4_squad_execution_cursor(world, player_id, squad_id);
-        action
-    })
-}
-
-/// 小規模の物件レースで、Squadの再編待ちが占領開始を遅らせないようにする。
-///
-/// Capture可能な未行動unitだけへ既存の戦術探索を限定し、実際に選ばれた命令がCaptureの
-/// 場合だけ返す。よって攻撃・退避・目標選択の評価式を複製せず、物件契約を進められない
-/// 状況で戦闘部隊の行動順を横取りしない。
-fn update_v4_squad_execution_cursor(world: &mut World, player_id: PlayerId, squad_id: u32) {
-    let mut cursor = world
-        .remove_resource::<V4SquadExecutionCursor>()
-        .unwrap_or_default();
-    cursor
-        .last_squad
-        .insert(player_id, crate::ai::squad::SquadId(squad_id));
-    world.insert_resource(cursor);
-}
-
-/// 同位置Waitが、目的地へ近づく全ての隣接出口を未行動友軍に塞がれた一時停止か判定する。
-///
-/// 敵・行動済み友軍・地形による閉塞は同じ手番中に解消する保証がないため保留しない。
-/// DAGが一点目標を外したControl中も、古いSquad目標を復活させず通常のWaitを確定する。
-fn wait_is_temporarily_blocked_by_unacted_friendly(
-    world: &World,
-    player_id: PlayerId,
-    entity: Entity,
-    command: &AiCommand,
-    squad_target: Option<GridPosition>,
-    skip_entities: &HashSet<Entity>,
-) -> bool {
-    let AiCommand::Wait { target_pos } = command else {
-        return false;
-    };
-    let Some(position) = world.get::<GridPosition>(entity).copied() else {
-        return false;
-    };
-    if *target_pos != position {
-        return false;
-    }
-    let objective = match crate::ai::v4::capital_route_tactical_target(world, player_id, entity) {
-        Some(target) => target,
-        None => squad_target,
-    };
-    let Some(objective) = objective.filter(|target| *target != position) else {
-        return false;
-    };
-    let Some(map) = world.get_resource::<Map>() else {
-        return false;
-    };
-    let Some(master_data) = world.get_resource::<MasterDataRegistry>() else {
-        return false;
-    };
-    let Some(stats) = world.get::<UnitStats>(entity) else {
-        return false;
-    };
-    let current_distance = map.distance(position.x, position.y, objective.x, objective.y);
-    let mut found_toward_exit = false;
-
-    for (x, y) in map.get_adjacent(position.x, position.y) {
-        if map.distance(x, y, objective.x, objective.y) >= current_distance {
-            continue;
-        }
-        let Some(terrain) = map.get_terrain(x, y) else {
-            continue;
-        };
-        if get_valid_movement_cost(master_data, stats.movement_type, terrain).is_none() {
-            continue;
-        }
-        found_toward_exit = true;
-        let blocker = world.iter_entities().find_map(|candidate| {
-            if candidate.id() == entity
-                || candidate.get::<crate::components::Transporting>().is_some()
-                || candidate.get::<GridPosition>().copied() != Some(GridPosition { x, y })
-            {
-                return None;
-            }
-            candidate
-                .get::<Faction>()
-                .map(|faction| (candidate.id(), faction.0))
-        });
-        let Some((blocker, faction)) = blocker else {
-            return false;
-        };
-        let blocker_unacted = faction == player_id
-            && !skip_entities.contains(&blocker)
-            && world.get::<HasMoved>(blocker).is_some_and(|moved| !moved.0)
-            && world
-                .get::<ActionCompleted>(blocker)
-                .is_some_and(|completed| !completed.0);
-        if !blocker_unacted {
-            return false;
-        }
-    }
-
-    found_toward_exit
-}
-
-/// 敵前のCapture Squadを単独で先走らせないよう、まずSuppress/Attackを扱い、残りは
-/// Capture・Defense・Reserveの順にする。
-///
-/// これは戦術の点数を置換するものではなく、複数Squadのうちどの命令を次に展開するか
-/// を決めるRoadmap投影順である。
-fn squad_executor_priority(mission: &crate::ai::squad::MissionType) -> u8 {
-    match mission {
-        crate::ai::squad::MissionType::Attack => 0,
-        crate::ai::squad::MissionType::Capture => 1,
-        crate::ai::squad::MissionType::Defense => 2,
-        crate::ai::squad::MissionType::Reserve => 3,
-        crate::ai::squad::MissionType::Transport => u8::MAX,
     }
 }

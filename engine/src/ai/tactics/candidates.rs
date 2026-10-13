@@ -1,7 +1,4 @@
-//! AI再設計: 責務ごとに分離した共通処理。
-#![allow(clippy::collapsible_if)]
-#![allow(clippy::unnecessary_min_or_max)]
-#![allow(clippy::unnecessary_map_or)]
+//! 移動候補タイルの事前フィルタ（航空ユニットの帰投燃料保証など）。
 use crate::components::{GridPosition, PlayerId, UnitStats};
 use crate::resources::{Map, Terrain};
 

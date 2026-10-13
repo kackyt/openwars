@@ -1,4 +1,4 @@
-//! 手番境界で破棄する、所有者ごとの一時状態。
+//! 当手番の生産計画状態（キャンペーン生産キュー・汎用生産予算・一括計画済みフラグ）。手番境界で破棄する。
 use crate::components::PlayerId;
 use bevy_ecs::prelude::*;
 use std::collections::VecDeque;

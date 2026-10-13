@@ -1,7 +1,4 @@
-//! AI再設計: 責務ごとに分離した共通処理。
-#![allow(clippy::collapsible_if)]
-#![allow(clippy::unnecessary_min_or_max)]
-#![allow(clippy::unnecessary_map_or)]
+//! AIが決定した [`AiCommand`] をゲームエンジンの各種コマンドイベントへ変換して発行する。
 use crate::ai::command::AiCommand;
 use crate::events::{AttackUnitCommand, CapturePropertyCommand, MoveUnitCommand, WaitUnitCommand};
 use bevy_ecs::prelude::*;

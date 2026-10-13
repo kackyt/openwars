@@ -1,4 +1,4 @@
-//! 手番境界で破棄する、所有者ごとの一時状態。
+//! 同一手番内で敵占有配置が変わらない間に再利用する行動距離キャッシュ。手番境界で破棄する。
 use crate::ai::turn_distance::TurnDistanceCache;
 use crate::components::PlayerId;
 use bevy_ecs::prelude::*;

@@ -97,7 +97,7 @@ def measure(root: Path) -> dict:
             continue
         shared = sorted(defined(parent) & defined(extended))
         if shared:
-            pairs[str(extended.relative_to(root))] = shared
+            pairs[extended.relative_to(root).as_posix()] = shared
 
     repair: dict[str, int] = {name: 0 for name in REPAIR_FUNCTIONS}
     for file in files:
@@ -121,7 +121,7 @@ def measure(root: Path) -> dict:
                     continue
                 key = f"{source}->{target}"
                 reverse_dependencies.setdefault(key, []).append(
-                    f"{file.relative_to(root)}:{number}"
+                    f"{file.relative_to(root).as_posix()}:{number}"
                 )
 
     return {

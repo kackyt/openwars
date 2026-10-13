@@ -1,7 +1,4 @@
-//! AI再設計: 責務ごとに分離した共通処理。
-#![allow(clippy::collapsible_if)]
-#![allow(clippy::unnecessary_min_or_max)]
-#![allow(clippy::unnecessary_map_or)]
+//! 戦術・生産評価が参照する読み取り専用の盤面スナップショットと標的価値計算。
 use crate::collections::{HashMap, HashSet};
 use crate::components::{Faction, GridPosition, PlayerId, Property, UnitStats};
 use crate::resources::master_data::{MasterDataRegistry, UnitName, WeaponRecord};

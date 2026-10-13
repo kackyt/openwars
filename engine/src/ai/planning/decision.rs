@@ -1,4 +1,4 @@
-//! 手番境界で破棄する、所有者ごとの一時状態。
+//! 当手番で採用した戦略ポートフォリオの一時保持。手番境界で破棄する。
 use crate::components::PlayerId;
 use bevy_ecs::prelude::*;
 

@@ -1,7 +1,4 @@
-//! AI判断の出力。選択・適用の層に依存しない。
-#![allow(clippy::collapsible_if)]
-#![allow(clippy::unnecessary_min_or_max)]
-#![allow(clippy::unnecessary_map_or)]
+//! AI判断の出力コマンド型。選択・適用の各層に依存しない。
 use crate::components::GridPosition;
 use bevy_ecs::entity::Entity;
 

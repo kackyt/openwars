@@ -1,7 +1,4 @@
-//! AI再設計: 責務ごとに分離した共通処理。
-#![allow(clippy::collapsible_if)]
-#![allow(clippy::unnecessary_min_or_max)]
-#![allow(clippy::unnecessary_map_or)]
+//! 当手番の生産命令キューと施設ごとの生産クールダウン管理、および生産命令の発行。
 use crate::collections::HashSet;
 use crate::components::PlayerId;
 use bevy_ecs::prelude::*;

@@ -1,9 +1,7 @@
-//! AI再設計: 責務ごとに分離した共通処理。
-#![allow(clippy::collapsible_if)]
-#![allow(clippy::unnecessary_min_or_max)]
-#![allow(clippy::unnecessary_map_or)]
+//! 手番内のユニット行動済みクールダウンと部隊編成済みフラグ。手番境界で破棄する。
 use super::production_queue::AiProductionCooldown;
 use crate::collections::HashSet;
+use crate::components::PlayerId;
 use bevy_ecs::prelude::*;
 
 #[derive(Resource, Default)]
@@ -27,8 +25,6 @@ pub fn clear_ai_cooldowns_system(
         pc.0.clear();
     }
 }
-
-use crate::components::PlayerId;
 
 #[derive(Resource, Default)]
 pub(crate) struct AiTurnProgress {
