@@ -1,8 +1,10 @@
 //! 移動先から目標への接近の測り方。
 
 use super::board::TacticalBoard;
+use crate::ai::engine::AiTurnStrategyCache;
 use crate::ai::turn_distance::{TurnDistance, TurnDistanceCache, calculate_turn_distance};
 use crate::components::{GridPosition, UnitStats};
+use bevy_ecs::prelude::*;
 
 /// ターン距離がこれ以上なら到達不能とみなし、接近の加点をしない。
 const UNREACHABLE_TURNS: u32 = 99;
@@ -16,11 +18,33 @@ pub(crate) struct ApproachDistances<'a> {
 /// 目標までのターン距離と、同点比較用の格子（マンハッタン）距離。
 pub(crate) type Approach = (TurnDistance, i32);
 
-impl<'a> ApproachDistances<'a> {
-    pub(crate) fn new(board: &'a TacticalBoard, cache: &'a mut TurnDistanceCache) -> Self {
-        Self { board, cache }
-    }
+/// 手番内で共有するターン距離cacheを借りて `evaluate` を実行する。
+///
+/// 自軍の移動は距離探索上の通行可否を変えない。敵が撃破されて占有マスが変わるまで、
+/// 同一手番の全unitでDijkstra結果を共有する。
+pub(crate) fn with_turn_distances<R>(
+    world: &mut World,
+    board: &TacticalBoard,
+    evaluate: impl FnOnce(&World, &mut ApproachDistances) -> R,
+) -> R {
+    let mut strategy_cache = world
+        .remove_resource::<AiTurnStrategyCache>()
+        .unwrap_or_default();
+    let mut cache = strategy_cache
+        .take_action_distance_cache(board.player_id, &board.enemy_blocker_positions());
+    let result = evaluate(
+        world,
+        &mut ApproachDistances {
+            board,
+            cache: &mut cache,
+        },
+    );
+    strategy_cache.put_action_distance_cache(cache);
+    world.insert_resource(strategy_cache);
+    result
+}
 
+impl ApproachDistances<'_> {
     /// `from` から `target` を `range` 以内に捉えるまでのターン距離。
     pub(crate) fn turns(
         &mut self,

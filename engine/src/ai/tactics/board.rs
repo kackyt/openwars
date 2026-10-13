@@ -45,13 +45,48 @@ pub(crate) struct SquadRoles {
 }
 
 impl SquadRoles {
-    fn from_manager(manager: SquadManager) -> Self {
+    pub(crate) fn from_manager(manager: SquadManager) -> Self {
         let mut targets = HashMap::default();
         let mut missions = HashMap::default();
         for squad in &manager.squads {
             for &member in &squad.members {
                 missions.insert(member, squad.mission_type.clone());
                 if let Some(target) = squad.target {
+                    targets.insert(member, target);
+                }
+            }
+        }
+        let solo_fallbacks = manager.solo_fallbacks.iter().copied().collect();
+        Self {
+            manager,
+            targets,
+            missions,
+            solo_fallbacks,
+        }
+    }
+
+    /// 小規模マップV4: 正規化済みの所属（UnitOperationRegistryの唯一のSquadId）を満たす
+    /// Squadだけから任務と目標を読む。SquadManagerをそのまま全走査すると、再編途中に残った
+    /// 重複memberが別の目標を上書きできてしまう。目標は首都ルートDAGの指令を優先する。
+    pub(crate) fn for_small_map(world: &World, player_id: PlayerId, manager: SquadManager) -> Self {
+        let assignments =
+            world.get_resource::<crate::ai::operation_assignment::UnitOperationRegistry>();
+        let mut targets = HashMap::default();
+        let mut missions = HashMap::default();
+        for squad in &manager.squads {
+            for &member in &squad.members {
+                if assignments.is_some_and(|assignments| {
+                    assignments
+                        .assignment(member)
+                        .is_none_or(|assignment| assignment.squad_id != Some(squad.id))
+                }) {
+                    continue;
+                }
+                missions.insert(member, squad.mission_type.clone());
+                if let Some(target) =
+                    crate::ai::v4::capital_route_tactical_target(world, player_id, member)
+                        .unwrap_or(squad.target)
+                {
                     targets.insert(member, target);
                 }
             }
@@ -95,10 +130,12 @@ impl SquadRoles {
 }
 
 /// 行動可能な自軍unitと、輸送中を除く全unitの占有マスを集める。
+/// `permitted` を渡すと、その集合のunitだけを行動候補にする（Squad単位の指令）。
 pub(crate) fn movable_units_and_occupancy(
     world: &mut World,
     player_id: PlayerId,
     skip_entities: &HashSet<Entity>,
+    permitted: Option<&HashSet<Entity>>,
 ) -> (Vec<Entity>, HashMap<(usize, usize), OccupantInfo>) {
     let mut movable_units = Vec::new();
     let mut occupancy = HashMap::default();
@@ -118,7 +155,8 @@ pub(crate) fn movable_units_and_occupancy(
         if transporting.is_some() {
             continue;
         }
-        if !skip_entities.contains(&entity)
+        if permitted.is_none_or(|permitted| permitted.contains(&entity))
+            && !skip_entities.contains(&entity)
             && faction.0 == player_id
             && !has_moved.0
             && !action_completed.0
@@ -147,15 +185,10 @@ impl TacticalBoard {
         world: &mut World,
         player_id: PlayerId,
         occupancy: HashMap<(usize, usize), OccupantInfo>,
+        squads: SquadRoles,
     ) -> Self {
         let uses_v3_tactics =
             crate::ai::resolve_player_ai_version(world, player_id).uses_v3_tactics();
-        let squads = SquadRoles::from_manager(
-            world
-                .get_resource::<SquadManager>()
-                .cloned()
-                .unwrap_or_default(),
-        );
         let map = world.resource::<Map>().clone();
         let registry = world.resource::<MasterDataRegistry>().clone();
         let action_targets = AiTacticalSnapshot::from_world(world, &registry, map.topology);

@@ -2,7 +2,7 @@
 #![allow(clippy::unnecessary_min_or_max)]
 #![allow(clippy::unnecessary_map_or)]
 
-use crate::ai::turn_distance::{TurnDistanceCache, calculate_turn_distance};
+use crate::ai::turn_distance::TurnDistanceCache;
 use crate::collections::{HashMap, HashSet};
 use crate::components::{
     ActionCompleted, Faction, GridPosition, HasMoved, Health, PlayerId, Property, UnitStats,
@@ -1670,7 +1670,7 @@ pub fn execute_ai_turn_v2(world: &mut World, active_player: PlayerId) -> Option<
 }
 
 /// 指定座標に、自軍以外が所有する（または中立の）占領可能物件があるか。
-pub(super) fn has_capturable_property_at(
+pub(crate) fn has_capturable_property_at(
     world: &World,
     position: GridPosition,
     player_id: PlayerId,
@@ -2142,6 +2142,7 @@ pub(crate) fn is_unit_stranded(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::turn_distance::calculate_turn_distance;
     use crate::components::{Faction, Health, PlayerId, Property, UnitStats};
     use crate::resources::{DamageChart, UnitType};
 
