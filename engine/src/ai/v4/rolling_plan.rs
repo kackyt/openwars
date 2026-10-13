@@ -261,6 +261,9 @@ struct SimFriendly {
     attack_profiles: Arc<[Option<FriendlyAttackProfile>]>,
     /// 各敵がこの友軍を攻撃するときの不変条件。敵indexと同じ添字で参照する。
     enemy_attack_profiles: Arc<[Option<EnemyAttackProfile>]>,
+    /// 攻撃できる敵indexを、標的選択の静的な優先順（被反撃damageの大きい順、
+    /// 占領・輸送・その他の順、index順）に並べたもの。
+    target_order: Arc<[usize]>,
     /// 生産候補だけが持つ購入identity。既存戦力はNone。
     purchase: Option<PlannedPurchase>,
     /// 生産時に割り当てた物件契約。戦闘と占領を別unitとして二重計上しない。
@@ -348,6 +351,8 @@ struct SimulationCatalog {
     protected_units: Vec<SimFriendly>,
     production_units: Vec<SimFriendly>,
     enemies: Vec<SimEnemy>,
+    /// 敵indexごとに、その敵が攻撃できる既存unitの添字を基礎damageの大きい順に並べたもの。
+    existing_by_enemy_damage: Vec<Vec<usize>>,
 }
 
 impl SimulationCatalog {
@@ -393,7 +398,7 @@ impl SimulationCatalog {
             .existing_units
             .iter()
             .map(|source| sim_friendly(input, source, true))
-            .collect();
+            .collect::<Vec<_>>();
         let protected_units = input
             .protected_units
             .iter()
@@ -419,14 +424,36 @@ impl SimulationCatalog {
                 source,
                 destroyed_turn: None,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let existing_by_enemy_damage = existing_units_by_enemy_damage(&existing_units, &enemies);
         Self {
             existing_units,
             protected_units,
             production_units,
             enemies,
+            existing_by_enemy_damage,
         }
     }
+}
+
+fn existing_units_by_enemy_damage(
+    existing_units: &[SimFriendly],
+    enemies: &[SimEnemy],
+) -> Vec<Vec<usize>> {
+    (0..enemies.len())
+        .map(|enemy_index| {
+            let mut order = existing_units
+                .iter()
+                .enumerate()
+                .filter_map(|(index, unit)| {
+                    unit.enemy_attack_profiles[enemy_index]
+                        .map(|profile| (std::cmp::Reverse(profile.base_damage), index))
+                })
+                .collect::<Vec<_>>();
+            order.sort_unstable();
+            order.into_iter().map(|(_, index)| index).collect()
+        })
+        .collect()
 }
 
 /// 現在観測した敵を排除できる混成パッケージを探索する。
@@ -1081,13 +1108,36 @@ impl<'c> CombatRun<'c> {
             {
                 continue;
             }
-            let combat_target = strongest_enemy_attack(
-                (0..self.friendly_states.len()).map(|index| self.friendly(index)),
-                &self.friendly_states,
+            let existing_count = catalog.existing_units.len();
+            let existing_target = strongest_attack_in_damage_order(
+                &catalog.existing_by_enemy_damage[enemy_index],
+                &catalog.existing_units,
+                &self.friendly_states[..existing_count],
                 enemy_index,
                 enemy_hp,
                 turn,
             );
+            let production_target = strongest_enemy_attack(
+                self.production
+                    .iter()
+                    .map(|option_index| &catalog.production_units[*option_index]),
+                &self.friendly_states[existing_count..],
+                enemy_index,
+                enemy_hp,
+                turn,
+            )
+            .map(|(index, damage)| (existing_count + index, damage));
+            // 既存unitの後に生産unitが並ぶ。同じdamage・HPなら後方の要素を選ぶ従来の順序を保つ。
+            let combat_target = match (existing_target, production_target) {
+                (Some(existing), Some(produced))
+                    if (existing.1, attack_priority(&self.friendly_states, existing.0))
+                        > (produced.1, attack_priority(&self.friendly_states, produced.0)) =>
+                {
+                    Some(existing)
+                }
+                (existing, None) => existing,
+                (_, produced) => produced,
+            };
             let protected_target = strongest_enemy_attack(
                 catalog.protected_units.iter(),
                 &self.protected_states,
@@ -1271,6 +1321,7 @@ struct EngagementTemplate {
     engageable_enemy_indices: Vec<usize>,
     attacks_left: u32,
     rows: Vec<EngagementRow>,
+    target_order: Arc<[usize]>,
 }
 
 /// 敵1体との交戦条件。turnは友軍の行動可能turnからの相対値で持つ。
@@ -1346,12 +1397,30 @@ impl EngagementTemplate {
                         .div_ceil(stats.max_movement.max(1)),
                 }
             })
-            .collect();
+            .collect::<Vec<EngagementRow>>();
+        let mut target_order = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                row.attack.map(|(_, incoming_damage, _)| {
+                    (
+                        std::cmp::Reverse(incoming_damage),
+                        strategic_rank(&input.enemies[index].stats),
+                        index,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        target_order.sort_unstable();
         Self {
             stats: stats.clone(),
             engageable_enemy_indices: engageable_enemy_indices.to_vec(),
             attacks_left: total_ammo.min(fuel_turns.max(1)),
             rows,
+            target_order: target_order
+                .into_iter()
+                .map(|(_, _, index)| index)
+                .collect(),
         }
     }
 
@@ -1411,49 +1480,61 @@ impl EngagementTemplate {
             attacks_left: self.attacks_left,
             attack_profiles: attack_profiles.into(),
             enemy_attack_profiles: enemy_attack_profiles.into(),
+            target_order: Arc::clone(&self.target_order),
         }
     }
 }
 
+/// 友軍1体の標的。比較順は（被反撃damageの大きい順、占領・輸送・その他の順、残HPの少ない順、index順）。
+///
+/// 占領能力だけで標的順を固定すると、後方の砲兵を放置したまま前衛へ損耗を重ねる。
+/// 自分へ返せる最大与ダメージを先に比較し、同程度なら勝利条件へ直結する占領・
+/// 輸送能力と残HPで集中撃破先を決める。前2項は探索中不変なので `target_order` の順に
+/// 調べ、最初に攻撃できる敵と同じ前2項の範囲だけで残HPを比べる。
 fn select_target(
     friendly: &SimFriendly,
     enemies: &[SimEnemy],
     enemy_states: &[EnemyCombatState],
     turn: u32,
 ) -> Option<(usize, FriendlyAttackProfile)> {
-    enemies
-        .iter()
-        .zip(enemy_states)
-        .enumerate()
-        .filter(|(_, (_, enemy_state))| enemy_state.hp > 0)
-        .filter(|(_, (enemy, _))| turn >= enemy.source.available_turn)
-        .filter_map(|(index, (enemy, enemy_state))| {
-            let profile = friendly.attack_profiles[index]?;
-            if turn < profile.ready_turn {
-                return None;
-            }
-            let strategic_rank = if enemy.source.stats.can_capture {
-                0
-            } else if enemy.source.stats.max_cargo > 0 {
-                1
-            } else {
-                2
-            };
-            // 占領能力だけで標的順を固定すると、後方の砲兵を放置したまま前衛へ
-            // 損耗を重ねる。自分へ返せる最大与ダメージを先に比較し、同程度なら
-            // 勝利条件へ直結する占領・輸送能力と残HPで集中撃破先を決める。
-            Some((
-                (
-                    std::cmp::Reverse(profile.incoming_damage),
-                    strategic_rank,
-                    enemy_state.hp,
-                    index,
-                ),
-                profile,
-            ))
-        })
-        .min_by_key(|(key, _)| *key)
-        .map(|((_, _, _, index), profile)| (index, profile))
+    let mut leading_group = None;
+    let mut best: Option<((u32, usize), FriendlyAttackProfile)> = None;
+    for &index in friendly.target_order.iter() {
+        let Some(profile) = friendly.attack_profiles[index] else {
+            continue;
+        };
+        let group = (
+            profile.incoming_damage,
+            strategic_rank(&enemies[index].source.stats),
+        );
+        if leading_group.is_some_and(|leading| leading != group) {
+            break;
+        }
+        let enemy_hp = enemy_states[index].hp;
+        if enemy_hp == 0
+            || turn < enemies[index].source.available_turn
+            || turn < profile.ready_turn
+        {
+            continue;
+        }
+        leading_group = Some(group);
+        let key = (enemy_hp, index);
+        if best.is_none_or(|(best_key, _)| key < best_key) {
+            best = Some((key, profile));
+        }
+    }
+    best.map(|((_, index), profile)| (index, profile))
+}
+
+/// 標的選択で占領能力・輸送能力を持つ敵を先に狙う順位。
+fn strategic_rank(stats: &UnitStats) -> u8 {
+    if stats.can_capture {
+        0
+    } else if stats.max_cargo > 0 {
+        1
+    } else {
+        2
+    }
 }
 
 /// 敵1体が今手番に与えられる最大damageの友軍（同点ならHPの低い方、さらに同点なら後方の要素）。
@@ -1478,6 +1559,46 @@ fn strongest_enemy_attack<'a>(
             Some((index, damage))
         })
         .max_by_key(|(index, damage)| (*damage, 100_u32.saturating_sub(unit_states[*index].hp)))
+}
+
+/// 同じdamageの友軍では、HPの低い方を敵が優先する。
+fn attack_priority(states: &[UnitCombatState], index: usize) -> u32 {
+    100_u32.saturating_sub(states[index].hp)
+}
+
+/// `strongest_enemy_attack` と同じ選択を、基礎damageの大きい順に並べた添字で行う。
+/// damageは基礎damageについて単調なので、最良候補よりdamageが小さくなった時点で打ち切る。
+fn strongest_attack_in_damage_order(
+    order: &[usize],
+    units: &[SimFriendly],
+    unit_states: &[UnitCombatState],
+    enemy_index: usize,
+    enemy_hp: u32,
+    turn: u32,
+) -> Option<(usize, u32)> {
+    let mut best: Option<(u32, u32, usize)> = None;
+    for &index in order {
+        let unit = &units[index];
+        let Some(profile) = unit.enemy_attack_profiles[enemy_index] else {
+            continue;
+        };
+        let damage =
+            calculate_damage_formula(profile.base_damage, enemy_hp, 0, true).saturating_add(10);
+        if best.is_some_and(|(best_damage, _, _)| damage < best_damage) {
+            break;
+        }
+        if unit_states[index].hp == 0
+            || turn < unit.available_turn
+            || turn < profile.contact_turn
+        {
+            continue;
+        }
+        let key = (damage, attack_priority(unit_states, index), index);
+        if best.is_none_or(|best_key| key > best_key) {
+            best = Some(key);
+        }
+    }
+    best.map(|(damage, _, index)| (index, damage))
 }
 
 /// 1候補のシミュレーション中に変わる友軍の状態。交戦条件はcatalogの `SimFriendly` が持つ。
