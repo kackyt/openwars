@@ -2993,7 +2993,7 @@ fn prepare_campaign_local_assignment_with_connectivity(
         }
         _ => {}
     }
-    synchronize_local_capture_departure(world, manager, player_id, assignment);
+    synchronize_local_capture_departure(world, manager, player_id, assignment, connectivity);
 }
 
 /// 局地Captureは首都本隊の完全編成を待たない。ただし占領完了前に接触できる敵が
@@ -3004,6 +3004,7 @@ fn synchronize_local_capture_departure(
     manager: &mut SquadManager,
     player_id: PlayerId,
     assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    connectivity: &mut TerrainConnectivity,
 ) {
     // 小規模マップ展開の即時出撃（H01の出撃方策）は拡張経路だけで使う。
     let departs_immediately_on_small_map =
@@ -3105,7 +3106,7 @@ fn synchronize_local_capture_departure(
                                 .unwrap_or(0),
                         );
                     if damage == 0
-                        || !is_terrain_reachable(
+                        || !connectivity.is_reachable(
                             map,
                             registry,
                             (enemy_position.x, enemy_position.y),
@@ -3134,7 +3135,7 @@ fn synchronize_local_capture_departure(
                         if world
                             .get::<crate::components::Transporting>(*escort)
                             .is_some()
-                            || !is_terrain_reachable(
+                            || !connectivity.is_reachable(
                                 map,
                                 registry,
                                 (position.x, position.y),

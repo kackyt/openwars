@@ -606,7 +606,7 @@ pub(super) fn prepare_campaign_local_assignment_with_connectivity(
         }
         _ => {}
     }
-    synchronize_local_capture_departure(world, manager, player_id, assignment);
+    synchronize_local_capture_departure(world, manager, player_id, assignment, connectivity);
 }
 
 /// 拡張の再編差分はこの型へ閉じ込め、再編本体は通常側と共有する。
