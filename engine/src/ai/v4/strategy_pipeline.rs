@@ -52,7 +52,7 @@ pub(crate) fn portfolio_for_squads(
     super::victory_roadmap::current_turn_portfolio(world, player_id, turn).unwrap_or(portfolio)
 }
 
-/// Squadを構築し終えた後、DAGの実行区間とRoadmapを同時に更新する。
+/// Squad構築後はDAGの実行区間とRoadmap実績を更新し、採用portfolioは選び直さない。
 pub(crate) fn after_squad_planning(
     world: &mut World,
     player_id: PlayerId,
@@ -63,5 +63,5 @@ pub(crate) fn after_squad_planning(
         return;
     }
     super::refresh_capital_route_path_commitments(world, player_id, manager);
-    super::victory_roadmap::reconcile_campaign_roadmap(world, player_id, portfolio, manager);
+    super::victory_roadmap::observe_adopted_campaign_roadmap(world, player_id, portfolio, manager);
 }

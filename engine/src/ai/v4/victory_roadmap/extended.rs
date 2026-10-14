@@ -32,9 +32,6 @@ pub(crate) fn reconcile_campaign_roadmap(
     if !crate::ai::code_path::ext_enabled("v4/victory_roadmap.rs::reconcile_campaign_roadmap") {
         return super::reconcile_campaign_roadmap(world, player_id, portfolio, manager);
     }
-    let turn = world
-        .get_resource::<MatchState>()
-        .map_or(0, |state| state.current_turn_number.0);
     let (selected_portfolio, candidate_evaluations) = select_strategic_portfolio(portfolio);
     // analyzerの単一proposalをそのまま受理せず、Roadmapが比較した候補のうち一つだけを
     // この手番の正本にする。全島assessmentは選択と無関係に保持する。
@@ -54,9 +51,62 @@ pub(crate) fn reconcile_campaign_roadmap(
         .by_player
         .insert(player_id, candidate_evaluations);
     world.insert_resource(candidate_registry);
-    let Some(island_map) = world.get_resource::<IslandMap>().cloned() else {
+    let Some(observation) = observe_campaign_execution(world, player_id, portfolio, manager) else {
         return;
     };
+    let approved_portfolio =
+        observation
+            .registry
+            .approved_portfolio(player_id, observation.enemy_capital, portfolio);
+    publish_roadmap_observation(
+        world,
+        player_id,
+        approved_portfolio,
+        manager,
+        observation.registry,
+    );
+}
+
+/// 編成後は採用済みの案を変えず、実績と最新Squadへの指令参照だけを更新する。
+/// 候補比較と兵站gateの再承認は、編成前の採用にだけ属する。
+pub(crate) fn observe_adopted_campaign_roadmap(
+    world: &mut World,
+    player_id: PlayerId,
+    portfolio: &IslandCampaignPortfolio,
+    manager: &SquadManager,
+) {
+    if !crate::ai::code_path::ext_enabled("v4/victory_roadmap.rs::reconcile_campaign_roadmap") {
+        return super::reconcile_campaign_roadmap(world, player_id, portfolio, manager);
+    }
+    let Some(observation) = observe_campaign_execution(world, player_id, portfolio, manager) else {
+        return;
+    };
+    publish_roadmap_observation(
+        world,
+        player_id,
+        portfolio.clone(),
+        manager,
+        observation.registry,
+    );
+}
+
+/// 実績の照合結果。採用の承認に必要な首都位置だけを台帳と一緒に戻す。
+struct RoadmapObservation {
+    registry: VictoryRoadmapRegistry,
+    enemy_capital: Option<GridPosition>,
+}
+
+/// 候補を選び直さず、portfolioの作戦へ盤面・生産・編成の実績を照合する。
+fn observe_campaign_execution(
+    world: &mut World,
+    player_id: PlayerId,
+    portfolio: &IslandCampaignPortfolio,
+    manager: &SquadManager,
+) -> Option<RoadmapObservation> {
+    let turn = world
+        .get_resource::<MatchState>()
+        .map_or(0, |state| state.current_turn_number.0);
+    let island_map = world.get_resource::<IslandMap>()?.clone();
     let mut property_snapshots = Vec::new();
     let mut property_query = world.query::<(&GridPosition, &Property)>();
     for (position, property) in property_query.iter(world) {
@@ -550,7 +600,23 @@ pub(crate) fn reconcile_campaign_roadmap(
             roadmap.actual_victory_turn.get_or_insert(turn);
         }
     }
-    let approved_portfolio = registry.approved_portfolio(player_id, enemy_capital, portfolio);
+    Some(RoadmapObservation {
+        registry,
+        enemy_capital,
+    })
+}
+
+/// 照合済み台帳と指令を公開する。portfolioは呼出側で採用済みのものを受け取る。
+fn publish_roadmap_observation(
+    world: &mut World,
+    player_id: PlayerId,
+    portfolio: IslandCampaignPortfolio,
+    manager: &SquadManager,
+    mut registry: VictoryRoadmapRegistry,
+) {
+    let turn = world
+        .get_resource::<MatchState>()
+        .map_or(0, |state| state.current_turn_number.0);
     let assigned_campaign_entities = registry
         .operations
         .values()
@@ -612,7 +678,7 @@ pub(crate) fn reconcile_campaign_roadmap(
     turn_plans.replace(RoadmapTurnPlan {
         player_id,
         turn,
-        portfolio: approved_portfolio,
+        portfolio,
         directives,
     });
     world.insert_resource(turn_plans);
@@ -884,6 +950,104 @@ mod tests {
             operation_ready: true,
             continued_from_existing_squad: continued,
         }
+    }
+
+    #[test]
+    fn post_formation_observation_keeps_adoption_and_refreshes_squad_directives() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
+        let player = PlayerId(1);
+        let position = GridPosition { x: 1, y: 0 };
+        let island = IslandId(1);
+        let mut world = World::new();
+        world.insert_resource(
+            crate::ai::strategy_profile::V4StrategyProfileRegistry::with_profile(
+                player,
+                crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion,
+            ),
+        );
+        world.insert_resource(IslandMap {
+            islands: vec![crate::ai::islands::Island {
+                id: island,
+                tiles: HashSet::from_iter([position]),
+            }],
+        });
+        let entity = world.spawn((Faction(player), position)).id();
+        let mut assignment = strategic_assignment(island, IslandCampaignDecision::Expand, 0, true);
+        assignment.capture_entities.push(entity);
+        let adopted = IslandCampaignPortfolio {
+            islands: Vec::new(),
+            active_offensives: vec![assignment],
+            defenses: Vec::new(),
+        };
+        // 採用時の監査値を固定し、編成後の再評価で上書きされないことを検査する。
+        let mut candidates = RoadmapStrategicCandidateRegistry::default();
+        candidates.by_player.insert(
+            player,
+            vec![StrategicCandidateEvaluation {
+                kind: StrategicCandidateKind::Focus,
+                offensive_islands: vec![island],
+                score: 123_456,
+                selected: true,
+            }],
+        );
+        world.insert_resource(candidates);
+        let mut manager = SquadManager::new();
+        let old_squad = manager.create_squad(MissionType::Capture);
+        old_squad.owner_id = Some(player);
+        old_squad.target_island = Some(island);
+        old_squad.members.insert(entity);
+        let old_id = old_squad.id;
+        crate::ai::v4::strategy_pipeline::after_squad_planning(
+            &mut world,
+            player,
+            &adopted,
+            &mut manager,
+        );
+        assert_eq!(
+            world
+                .resource::<RoadmapStrategicCandidateRegistry>()
+                .by_player[&player][0]
+                .score,
+            123_456
+        );
+        assert_eq!(
+            world.resource::<RoadmapTurnPlanRegistry>().plans[&player].portfolio,
+            adopted
+        );
+
+        // 同じ実EntityのSquadが作り直された場合も、採用案は固定して参照だけを更新する。
+        manager.squads.clear();
+        let new_squad = manager.create_squad(MissionType::Capture);
+        new_squad.owner_id = Some(player);
+        new_squad.target_island = Some(island);
+        new_squad.members.insert(entity);
+        let new_id = new_squad.id;
+        assert_ne!(old_id, new_id);
+        crate::ai::v4::strategy_pipeline::after_squad_planning(
+            &mut world,
+            player,
+            &adopted,
+            &mut manager,
+        );
+        let plan = &world.resource::<RoadmapTurnPlanRegistry>().plans[&player];
+        assert_eq!(plan.portfolio, adopted);
+        assert!(
+            plan.directives
+                .iter()
+                .any(|directive| directive.squad_ids == vec![new_id])
+        );
+        assert!(
+            plan.directives
+                .iter()
+                .all(|directive| !directive.squad_ids.contains(&old_id))
+        );
+        assert_eq!(
+            world
+                .resource::<RoadmapStrategicCandidateRegistry>()
+                .by_player[&player][0]
+                .score,
+            123_456
+        );
     }
 
     #[test]
