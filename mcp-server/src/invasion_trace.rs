@@ -14,6 +14,7 @@ use engine::ai::operation_assignment::UnitOperationRegistry;
 use engine::ai::squad::{MissionPhase, MissionType, SquadManager};
 use engine::ai::v4::deployment::V4DeploymentRegistry;
 use engine::ai::v4::logistics_plan::{LogisticsRouteMetrics, V4LogisticsPlanRegistry};
+use engine::ai::v4::operation::OperationSlots;
 use engine::ai::v4::plan_revision::{PlanExecutionSnapshot, V4RollingPlanRegistry};
 use engine::ai::v4::trace::{ProductionDecision, ProductionTraceDiagnostics};
 use engine::ai::v4::victory_roadmap::VictoryRoadmapRegistry;
@@ -276,6 +277,54 @@ pub struct ReinforcementContingencySnapshot {
     pub reserve_cost: u32,
 }
 
+/// 要求・実効要求・確保量を同じ単位で写し取る。判断や不足量の再計算は行わない。
+#[derive(Debug, Serialize)]
+pub struct DemandSlotsSnapshot {
+    pub capture_units: u32,
+    pub combat_plan_required: u32,
+    pub transport_slots: u32,
+    pub intercept_units: u32,
+}
+
+impl From<OperationSlots> for DemandSlotsSnapshot {
+    fn from(slots: OperationSlots) -> Self {
+        Self {
+            capture_units: slots.capture_units,
+            combat_plan_required: slots.combat_plan_required,
+            transport_slots: slots.transport_slots,
+            intercept_units: slots.intercept_units,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct EffectiveDemandSnapshot {
+    pub slot_kind: String,
+    pub amount: u32,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProductionDemandSnapshot {
+    pub operation_kind: String,
+    pub anchor_x: usize,
+    pub anchor_y: usize,
+    pub requested: DemandSlotsSnapshot,
+    pub effective: DemandSlotsSnapshot,
+    pub filled: DemandSlotsSnapshot,
+    pub adjustments: Vec<EffectiveDemandSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UnfilledDemandSnapshot {
+    pub operation_kind: String,
+    pub anchor_x: usize,
+    pub anchor_y: usize,
+    pub slot_kind: String,
+    pub requirement: u32,
+    pub reason: String,
+}
+
 /// V4 生産判断のターン単位スナップショット。
 #[derive(Debug, Serialize)]
 pub struct ProductionPlanSnapshot {
@@ -292,6 +341,8 @@ pub struct ProductionPlanSnapshot {
     pub uncommitted_funds: u32,
     pub enemy_production_forecast: EnemyProductionForecastSnapshot,
     pub operations: Vec<ProductionOperationSnapshot>,
+    pub demands: Vec<ProductionDemandSnapshot>,
+    pub unfilled_slots: Vec<UnfilledDemandSnapshot>,
     pub steps: Vec<ProductionStepSnapshot>,
     pub rolling_combat_plans: Vec<RollingCombatPlanSnapshot>,
 }
@@ -1120,6 +1171,40 @@ pub fn snapshot_production_plan_for_player(
         })
         .collect();
 
+    let demands = plan
+        .demands
+        .iter()
+        .map(|demand| ProductionDemandSnapshot {
+            operation_kind: format!("{:?}", demand.operation_kind),
+            anchor_x: demand.anchor.x,
+            anchor_y: demand.anchor.y,
+            requested: demand.requested.into(),
+            effective: demand.effective.into(),
+            filled: demand.filled.into(),
+            adjustments: demand
+                .adjustments
+                .iter()
+                .map(|adjustment| EffectiveDemandSnapshot {
+                    slot_kind: format!("{:?}", adjustment.key.slot),
+                    amount: adjustment.amount,
+                    reason: format!("{:?}", adjustment.reason),
+                })
+                .collect(),
+        })
+        .collect();
+    let unfilled_slots = plan
+        .unfilled_slots
+        .iter()
+        .map(|outcome| UnfilledDemandSnapshot {
+            operation_kind: format!("{:?}", outcome.operation_kind),
+            anchor_x: outcome.anchor.x,
+            anchor_y: outcome.anchor.y,
+            slot_kind: format!("{:?}", outcome.slot_kind),
+            requirement: outcome.requirement,
+            reason: format!("{:?}", outcome.reason),
+        })
+        .collect();
+
     let steps = plan
         .steps
         .iter()
@@ -1246,6 +1331,8 @@ pub fn snapshot_production_plan_for_player(
             mean_absolute_cost_error: plan.enemy_production_forecast.mean_absolute_cost_error,
         },
         operations,
+        demands,
+        unfilled_slots,
         steps,
         rolling_combat_plans,
     })
@@ -1704,6 +1791,62 @@ mod tests {
     use engine::ai::islands::IslandId;
     use engine::components::PlayerId;
     use engine::resources::UnitType;
+
+    #[test]
+    fn production_snapshot_exports_requested_effective_and_unfilled_reason() {
+        use engine::ai::production::demand::{
+            DemandKey, EffectiveDemand, EffectiveDemandReason, UnfilledReason,
+        };
+        use engine::ai::v4::operation::{OperationKind, SlotKind};
+        use engine::ai::v4::trace::{
+            ProductionDemandTrace, ProductionPlanTrace, UnfilledSlotTrace,
+        };
+
+        let player = PlayerId(1);
+        let anchor = GridPosition { x: 2, y: 3 };
+        let mut trace = ProductionPlanTrace::new(player, 0, 0);
+        trace.demands.push(ProductionDemandTrace {
+            operation_kind: OperationKind::Capture,
+            anchor,
+            requested: OperationSlots {
+                capture_units: 4,
+                ..OperationSlots::default()
+            },
+            effective: OperationSlots::default(),
+            filled: OperationSlots::default(),
+            adjustments: vec![EffectiveDemand {
+                key: DemandKey {
+                    operation: 0,
+                    slot: SlotKind::Capture,
+                },
+                amount: 2,
+                reason: EffectiveDemandReason::JointPackageSelected,
+            }],
+        });
+        trace.unfilled_slots.push(UnfilledSlotTrace {
+            operation_kind: OperationKind::Capture,
+            anchor,
+            slot_kind: SlotKind::Capture,
+            requirement: 4,
+            reason: UnfilledReason::NoCandidate,
+        });
+        let mut diagnostics = ProductionTraceDiagnostics::default();
+        diagnostics.record(1, trace);
+        let mut world = World::new();
+        world.insert_resource(diagnostics);
+        let snapshot = snapshot_production_plan_for_player(&world, player).unwrap();
+        let json = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(json["demands"][0]["requested"]["capture_units"], 4);
+        assert_eq!(json["demands"][0]["effective"]["capture_units"], 0);
+        assert_eq!(json["demands"][0]["filled"]["capture_units"], 0);
+        assert_eq!(json["demands"][0]["adjustments"][0]["amount"], 2);
+        assert_eq!(
+            json["demands"][0]["adjustments"][0]["reason"],
+            "JointPackageSelected"
+        );
+        assert_eq!(json["unfilled_slots"][0]["requirement"], 4);
+        assert_eq!(json["unfilled_slots"][0]["reason"], "NoCandidate");
+    }
 
     fn snapshot(health: u32, cost: u32) -> UnitTraceSnapshot {
         UnitTraceSnapshot {

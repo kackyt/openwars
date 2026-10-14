@@ -3,7 +3,8 @@
 //! 作戦が必要とする枠（要求）は配分の途中で書き換えない。当手番に充足しない枠は
 //! 要求を0にして隠すのではなく、どの枠をなぜ見送ったかを `SlotOutcome` として
 //! 別に記録する。配分処理は `is_open` で未決着の枠だけを選び、traceや診断は
-//! `outcomes` から未充足の理由を説明できる。
+//! `outcomes` から未充足の理由を説明できる。合同パッケージが選んだ実効要求は
+//! `effective_demands` に分け、元の要求や未充足の理由を上書きしない。
 
 /// 要求枠を当手番で充足しない理由。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -36,6 +37,21 @@ pub struct SlotOutcome<S> {
     pub reason: UnfilledReason,
 }
 
+/// 元の要求と異なる実効要求を採用した理由。未充足の理由とは別に保持する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectiveDemandReason {
+    /// 合同占領・戦闘パッケージが実行対象の占領役数を定めた。
+    JointPackageSelected,
+}
+
+/// 配分中に採用した実効要求。元の要求は作戦側に不変で残す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveDemand<S> {
+    pub key: DemandKey<S>,
+    pub amount: u32,
+    pub reason: EffectiveDemandReason,
+}
+
 /// 1回の生産配分における、要求枠ごとの未充足Outcome台帳。
 ///
 /// 決着した枠は記録順を保持する（traceを決定的に出すため）。件数は作戦数×枠種別で
@@ -43,12 +59,14 @@ pub struct SlotOutcome<S> {
 #[derive(Debug, Clone)]
 pub struct DemandLedger<S> {
     outcomes: Vec<SlotOutcome<S>>,
+    effective_demands: Vec<EffectiveDemand<S>>,
 }
 
 impl<S> Default for DemandLedger<S> {
     fn default() -> Self {
         Self {
             outcomes: Vec::new(),
+            effective_demands: Vec::new(),
         }
     }
 }
@@ -82,10 +100,10 @@ impl<S: Copy + Eq> DemandLedger<S> {
             .map(|outcome| outcome.reason)
     }
 
-    /// 作戦計画が要求量そのものを定め直したとき、以前の決着を取り消す。
+    /// 実効要求を定め直したとき、以前の未充足の決着を取り消す。
     ///
     /// 例: 合同占領・戦闘計画が当手番の占領役数を確定した場合、それ以前の
-    /// 「候補なし」は古い要求に対する判断であり、新しい要求には適用しない。
+    /// 「候補なし」は以前の実効要求に対する判断なので取り消す。元の要求は変えない。
     pub fn reopen(&mut self, operation: usize, slot: S) {
         let key = DemandKey { operation, slot };
         self.outcomes.retain(|outcome| outcome.key != key);
@@ -94,6 +112,42 @@ impl<S: Copy + Eq> DemandLedger<S> {
     /// 決着した枠を記録順に返す。
     pub fn outcomes(&self) -> &[SlotOutcome<S>] {
         &self.outcomes
+    }
+
+    /// 実効要求だけを更新する。未充足の取消は従来と同じ位置で `reopen` を呼ぶ。
+    pub fn set_effective(
+        &mut self,
+        operation: usize,
+        slot: S,
+        amount: u32,
+        reason: EffectiveDemandReason,
+    ) {
+        let key = DemandKey { operation, slot };
+        if let Some(demand) = self
+            .effective_demands
+            .iter_mut()
+            .find(|demand| demand.key == key)
+        {
+            demand.amount = amount;
+            demand.reason = reason;
+        } else {
+            self.effective_demands
+                .push(EffectiveDemand { key, amount, reason });
+        }
+    }
+
+    /// 未充足の決着を除く前の実効要求。指定が無ければ元の要求を使う。
+    pub fn effective_requirement(&self, operation: usize, slot: S, requested: u32) -> u32 {
+        let key = DemandKey { operation, slot };
+        self.effective_demands
+            .iter()
+            .find(|demand| demand.key == key)
+            .map_or(requested, |demand| demand.amount)
+    }
+
+    /// 実効要求の採用理由を記録順に返す。未充足で閉じてもこの履歴は保持する。
+    pub fn effective_demands(&self) -> &[EffectiveDemand<S>] {
+        &self.effective_demands
     }
 }
 
@@ -105,6 +159,60 @@ mod tests {
     enum Slot {
         Capture,
         Combat,
+    }
+
+    #[test]
+    fn effective_demand_survives_close_and_reopen_without_changing_requested() {
+        let requested = 4;
+        let mut ledger = DemandLedger::new();
+        assert_eq!(ledger.effective_requirement(0, Slot::Capture, requested), 4);
+        ledger.set_effective(
+            0,
+            Slot::Capture,
+            2,
+            EffectiveDemandReason::JointPackageSelected,
+        );
+        ledger.close(0, Slot::Capture, UnfilledReason::NoCandidate);
+        assert_eq!(requested, 4);
+        assert_eq!(ledger.effective_requirement(0, Slot::Capture, requested), 2);
+        assert_eq!(
+            ledger.reason(0, Slot::Capture),
+            Some(UnfilledReason::NoCandidate)
+        );
+        ledger.reopen(0, Slot::Capture);
+        assert!(ledger.is_open(0, Slot::Capture));
+        assert_eq!(ledger.effective_requirement(0, Slot::Capture, requested), 2);
+        assert_eq!(ledger.effective_requirement(1, Slot::Capture, requested), 4);
+        assert_eq!(ledger.effective_requirement(0, Slot::Combat, 1), 1);
+    }
+
+    #[test]
+    fn effective_demand_can_be_zero_or_exceed_requested_and_keeps_record_order() {
+        let mut ledger = DemandLedger::new();
+        ledger.set_effective(
+            1,
+            Slot::Capture,
+            0,
+            EffectiveDemandReason::JointPackageSelected,
+        );
+        assert_eq!(ledger.effective_requirement(1, Slot::Capture, 4), 0);
+        ledger.set_effective(
+            0,
+            Slot::Capture,
+            2,
+            EffectiveDemandReason::JointPackageSelected,
+        );
+        ledger.set_effective(
+            1,
+            Slot::Capture,
+            6,
+            EffectiveDemandReason::JointPackageSelected,
+        );
+        assert_eq!(ledger.effective_requirement(1, Slot::Capture, 4), 6);
+        assert_eq!(ledger.effective_demands().len(), 2);
+        assert_eq!(ledger.effective_demands()[0].key.operation, 1);
+        assert_eq!(ledger.effective_demands()[0].amount, 6);
+        assert_eq!(ledger.effective_demands()[1].key.operation, 0);
     }
 
     #[test]

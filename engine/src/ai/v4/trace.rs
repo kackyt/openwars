@@ -12,7 +12,7 @@
 
 use super::operation::{OperationKind, OperationSlots, SlotKind};
 use super::plan_revision::{PlanDisposition, PlanId, PlanRevision, ReplanReason};
-use crate::ai::production::demand::UnfilledReason;
+use crate::ai::production::demand::{EffectiveDemand, UnfilledReason};
 use crate::collections::HashMap;
 use crate::components::{GridPosition, PlayerId};
 use crate::resources::UnitType;
@@ -82,6 +82,21 @@ pub struct ProductionOperationTrace {
     pub contingency_reserve_funds: u32,
     pub reinforcement_contingencies: Vec<ReinforcementContingencyTrace>,
     pub deploy_lead_time: u32,
+}
+
+/// 配分終了時の需要。実効要求と実際に確保した量は同一とは限らない。
+#[derive(Debug, Clone)]
+pub struct ProductionDemandTrace {
+    pub operation_kind: OperationKind,
+    pub anchor: GridPosition,
+    /// 分析が導出した元の要求。予算不足や合同パッケージで上書きしない。
+    pub requested: OperationSlots,
+    /// 当手番の配分対象。未充足で閉じた枠を除き、合同パッケージの量を反映する。
+    pub effective: OperationSlots,
+    /// 当手番に購入案として確保した量。命令発行・生産完了を意味しない。
+    pub filled: OperationSlots,
+    /// 合同パッケージなどが実効要求を定めた理由。未充足理由とは別に保持する。
+    pub adjustments: Vec<EffectiveDemand<SlotKind>>,
 }
 
 /// 仮想敵を現在編成へ混ぜず、観測後に発動する条件付きcounter計画。
@@ -167,6 +182,8 @@ pub struct ProductionPlanTrace {
     /// 作戦が 1 つも立たず fallback に落ちたか
     pub fallback: bool,
     pub operations: Vec<ProductionOperationTrace>,
+    /// 配分終了時のrequested/effective/filledと、実効要求を採用した理由。
+    pub demands: Vec<ProductionDemandTrace>,
     pub steps: Vec<ProductionStepTrace>,
     /// 島ごとの実行可能な混成Combat計画。anchorごとに最終revisionだけを保持する。
     pub rolling_combat_plans: Vec<RollingCombatPlanTrace>,
@@ -203,6 +220,7 @@ impl ProductionPlanTrace {
             free_facility_count,
             fallback: false,
             operations: Vec::new(),
+            demands: Vec::new(),
             steps: Vec::new(),
             rolling_combat_plans: Vec::new(),
             leftover_funds: funds,

@@ -1128,8 +1128,7 @@ pub(super) fn plan_production_with_registry(
         // トレース用に、選定前の未充足率と作戦の識別情報を控えておく。
         let operation_kind = operations[op_index].kind;
         let operation_anchor = operations[op_index].anchor;
-        let deficit_before = operations[op_index]
-            .slots
+        let deficit_before = allocation_slots(&operations[op_index], op_index, &ledger)
             .deficit_ratio(slot_kind, &operations[op_index].filled);
         let remaining_funds_before = allocation.remaining_funds();
 
@@ -1308,9 +1307,14 @@ pub(super) fn plan_production_with_registry(
                 if input.exact_property_control {
                     // 物件数から歩兵数を先決めしない。施設・資金・敵相性を同時に列挙して
                     // 選ばれた支配パッケージのCapture割当だけを、この手番の必要数とする。
-                    // 要求量そのものを定め直すため、旧要求に対する未充足の決着は取り消す。
-                    operations[op_index].slots.capture_units =
-                        u32::try_from(selected.plan.capture_purchases.len()).unwrap_or(u32::MAX);
+                    // 元の要求を保持し、従来の上書き量を実効要求として台帳へ記録する。
+                    // 以前の実効要求に対する未充足の取消タイミングは変えない。
+                    ledger.set_effective(
+                        op_index,
+                        SlotKind::Capture,
+                        u32::try_from(selected.plan.capture_purchases.len()).unwrap_or(u32::MAX),
+                        EffectiveDemandReason::JointPackageSelected,
+                    );
                     ledger.reopen(op_index, SlotKind::Capture);
                 }
                 let plan = &selected.plan;
@@ -1603,8 +1607,7 @@ pub(super) fn plan_production_with_registry(
             slot_kind: effective_slot_kind,
             deficit_before,
             // 購入を反映した後の未充足率。ここが下がらない枠が同一ユニットを買い続ける。
-            deficit_after: operations[op_index]
-                .slots
+            deficit_after: allocation_slots(&operations[op_index], op_index, &ledger)
                 .deficit_ratio(effective_slot_kind, &operations[op_index].filled),
             remaining_funds_before,
             decision: ProductionDecision::Produced {
@@ -1995,6 +1998,7 @@ pub(super) fn plan_production_with_registry(
     let remaining_funds = allocation.remaining_funds();
     plan_trace.leftover_funds = remaining_funds;
     plan_trace.unfilled_slots = unfilled_slot_traces(&operations, &ledger);
+    plan_trace.demands = production_demand_traces(&operations, &ledger);
     plan_trace.reserved_funds =
         remaining_funds.min(unissued_plan_reserve.saturating_add(contingency_reserve));
     plan_trace.uncommitted_funds = remaining_funds.saturating_sub(plan_trace.reserved_funds);
@@ -5602,6 +5606,98 @@ mod tests {
             reinforcement_contingencies: Vec::new(),
             stress_reinforcement_funds: 0,
             contingency_reserve_funds: 0,
+        }
+    }
+
+    #[test]
+    fn rejected_joint_package_keeps_requested_demand_and_records_effective_demand() {
+        let requested = OperationSlots {
+            capture_units: 4,
+            ..OperationSlots::default()
+        };
+        let operations = vec![operation(
+            OperationKind::Capture,
+            requested,
+            OperationSlots::default(),
+        )];
+        let mut ledger = SlotLedger::new();
+        ledger.close(0, SlotKind::Capture, UnfilledReason::NoCandidate);
+        // 実行対象の占領購入が無い合同案でも、旧実装と同じ位置でCaptureを再開する。
+        ledger.set_effective(
+            0,
+            SlotKind::Capture,
+            0,
+            EffectiveDemandReason::JointPackageSelected,
+        );
+        ledger.reopen(0, SlotKind::Capture);
+        assert_eq!(operations[0].slots, requested);
+        assert!(ledger.is_open(0, SlotKind::Capture));
+        assert_eq!(most_starved_slot(&operations, &ledger), None);
+        let traces = production_demand_traces(&operations, &ledger);
+        assert_eq!(traces[0].requested, requested);
+        assert_eq!(traces[0].effective.capture_units, 0);
+        assert_eq!(traces[0].filled.capture_units, 0);
+        assert_eq!(
+            traces[0].adjustments[0].reason,
+            EffectiveDemandReason::JointPackageSelected
+        );
+        ledger.close(0, SlotKind::Capture, UnfilledReason::NoExecutablePlan);
+        assert_eq!(unfilled_slot_traces(&operations, &ledger)[0].requirement, 4);
+        assert_eq!(
+            ledger.reason(0, SlotKind::Capture),
+            Some(UnfilledReason::NoExecutablePlan)
+        );
+    }
+
+    #[test]
+    fn effective_joint_demand_preserves_legacy_slot_selection_and_deficit() {
+        for amount in [0, 1, 2, 6] {
+            for filled in [0, 1, 3] {
+                let requested = OperationSlots {
+                    capture_units: 4,
+                    ..OperationSlots::default()
+                };
+                let filled_slots = OperationSlots {
+                    capture_units: filled,
+                    ..OperationSlots::default()
+                };
+                let mut current = operation(OperationKind::Capture, requested, filled_slots);
+                let competing_slots = OperationSlots {
+                    capture_units: 2,
+                    ..OperationSlots::default()
+                };
+                let mut ledger = SlotLedger::new();
+                ledger.set_effective(
+                    0,
+                    SlotKind::Capture,
+                    amount,
+                    EffectiveDemandReason::JointPackageSelected,
+                );
+                let effective = allocation_slots(&current, 0, &ledger);
+                let competing = operation(
+                    OperationKind::Capture,
+                    competing_slots,
+                    OperationSlots::default(),
+                );
+                let new_choice = most_starved_slot(&[current, competing], &ledger);
+                // 旧実装の直接上書きと、実効要求を読む実装の配分先・未充足率を比較する。
+                current = operation(OperationKind::Capture, requested, filled_slots);
+                current.slots.capture_units = amount;
+                assert_eq!(effective, current.slots);
+                assert_eq!(
+                    effective.deficit_ratio(SlotKind::Capture, &current.filled),
+                    current.slots.deficit_ratio(SlotKind::Capture, &current.filled)
+                );
+                let competing = operation(
+                    OperationKind::Capture,
+                    competing_slots,
+                    OperationSlots::default(),
+                );
+                assert_eq!(
+                    new_choice,
+                    most_starved_slot(&[current, competing], &SlotLedger::new())
+                );
+            }
         }
     }
 

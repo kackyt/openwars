@@ -25,7 +25,7 @@ pub mod victory_roadmap;
 use crate::ai::planning::decision::AdoptedTurnPortfolio;
 use crate::ai::production::allocation::AllocationState;
 use crate::ai::production::commit::{self, PurchasePurpose};
-use crate::ai::production::demand::{DemandLedger, UnfilledReason};
+use crate::ai::production::demand::{DemandLedger, EffectiveDemandReason, UnfilledReason};
 use crate::ai::production::plan_campaign_with_expansion_denial_reserve;
 use crate::ai::production::turn_state::ProductionTurnState;
 use crate::ai::squad::{MissionType, SquadId};
@@ -65,9 +65,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use trace::{
     CampaignTurnForecastTrace, EnemyProductionForecastTrace, ProductionDecision,
-    ProductionOperationTrace, ProductionPlanTrace, ProductionStepTrace, ProductionTraceDiagnostics,
-    ReinforcementContingencyTrace, RollingCombatPlanTrace, RollingPurchaseTrace,
-    RollingTargetTrace, UnfilledSlotTrace,
+    ProductionDemandTrace, ProductionOperationTrace, ProductionPlanTrace, ProductionStepTrace,
+    ProductionTraceDiagnostics, ReinforcementContingencyTrace, RollingCombatPlanTrace,
+    RollingPurchaseTrace, RollingTargetTrace, UnfilledSlotTrace,
 };
 
 /// 揚陸可否キャッシュのキー。
@@ -2639,6 +2639,7 @@ fn plan_production_with_registry(
     let remaining_funds = allocation.remaining_funds();
     plan_trace.leftover_funds = remaining_funds;
     plan_trace.unfilled_slots = unfilled_slot_traces(&operations, &ledger);
+    plan_trace.demands = production_demand_traces(&operations, &ledger);
     let contingency_reserve = operations
         .iter()
         .map(|operation| operation.contingency_reserve_funds)
@@ -2676,6 +2677,30 @@ fn unfilled_slot_traces(operations: &[Operation], ledger: &SlotLedger) -> Vec<Un
                 requirement: operation.slots.requirement(outcome.key.slot),
                 reason: outcome.reason,
             })
+        })
+        .collect()
+}
+
+/// 元の要求・配分対象の実効要求・予約済みの充足量を、決定の入力と分離して記録する。
+fn production_demand_traces(
+    operations: &[Operation],
+    ledger: &SlotLedger,
+) -> Vec<ProductionDemandTrace> {
+    operations
+        .iter()
+        .enumerate()
+        .map(|(index, operation)| ProductionDemandTrace {
+            operation_kind: operation.kind,
+            anchor: operation.anchor,
+            requested: operation.slots,
+            effective: effective_slots(operation, index, ledger),
+            filled: operation.filled,
+            adjustments: ledger
+                .effective_demands()
+                .iter()
+                .filter(|demand| demand.key.operation == index)
+                .copied()
+                .collect(),
         })
         .collect()
 }
@@ -3295,11 +3320,24 @@ fn most_starved_slot(operations: &[Operation], ledger: &SlotLedger) -> Option<(u
 /// 当手番の生産配分における要求枠の台帳。作戦番号は配分中の `operations` の添字。
 type SlotLedger = DemandLedger<SlotKind>;
 
-/// 要求（不変）から、当手番に未充足で決着した枠を除いた実効要求を返す。
+/// 元の要求へ合同パッケージ等の実効要求を反映する。閉じた枠の除外は別に行う。
 ///
-/// traceと未充足率の比較だけに使う。要求そのものは `Operation::slots` に残す。
-fn effective_slots(op: &Operation, index: usize, ledger: &SlotLedger) -> OperationSlots {
+/// 未充足率と配分対象の選択に使う。要求そのものは `Operation::slots` に残す。
+fn allocation_slots(op: &Operation, index: usize, ledger: &SlotLedger) -> OperationSlots {
     let mut slots = op.slots;
+    slots.capture_units = ledger.effective_requirement(index, SlotKind::Capture, slots.capture_units);
+    slots.transport_slots =
+        ledger.effective_requirement(index, SlotKind::Transport, slots.transport_slots);
+    slots.intercept_units =
+        ledger.effective_requirement(index, SlotKind::Intercept, slots.intercept_units);
+    slots.combat_plan_required =
+        ledger.effective_requirement(index, SlotKind::Combat, slots.combat_plan_required);
+    slots
+}
+
+/// 当手番に未充足で決着した枠を除いた実効要求。元の要求は作戦に残す。
+fn effective_slots(op: &Operation, index: usize, ledger: &SlotLedger) -> OperationSlots {
+    let mut slots = allocation_slots(op, index, ledger);
     for kind in SLOT_PRIORITY {
         if ledger.is_open(index, kind) {
             continue;
@@ -3377,7 +3415,7 @@ fn defers_capture_to_joint_combat_plan(
         && (!op.capture_replacement_pending || op.filled.capture_units > 0)
         // Combat枠が未充足で決着済みなら、共同計画は成立しないため待たない。
         && ledger.is_open(index, SlotKind::Combat)
-        && op.slots.deficit_ratio(SlotKind::Combat, &op.filled) > 0.0
+        && allocation_slots(op, index, ledger).deficit_ratio(SlotKind::Combat, &op.filled) > 0.0
         // 切替IDは統合前の委譲点名のまま残す。OPENWARS_EXT_DISABLE で旧IDを指定した
         // 計測手順と互換を保つため、関数名に合わせて変更しないこと。
         && crate::ai::code_path::is_extended_at("v4/mod.rs::most_starved_in_tier")
@@ -3391,6 +3429,7 @@ fn most_starved_in_tier(
 ) -> Option<(usize, SlotKind)> {
     let mut best: Option<(usize, SlotKind, u32, f32, usize)> = None;
     for (index, op) in operations.iter().enumerate() {
+        let slots = allocation_slots(op, index, ledger);
         for (priority, kind) in SLOT_PRIORITY.iter().enumerate() {
             // 未充足で決着した枠は、要求が残っていても当手番の配分対象にしない。
             if !ledger.is_open(index, *kind) {
@@ -3399,7 +3438,7 @@ fn most_starved_in_tier(
             if defers_capture_to_joint_combat_plan(op, index, ledger, *kind, tier) {
                 continue;
             }
-            let deficit = op.slots.tier_deficit(*kind, &op.filled, tier);
+            let deficit = slots.tier_deficit(*kind, &op.filled, tier);
             if deficit <= 0.0 {
                 continue;
             }
