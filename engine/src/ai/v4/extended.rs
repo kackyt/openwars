@@ -4104,8 +4104,33 @@ mod tests {
             "橋の通過だけを優先せず、各枝で最初に未確保の施設をMilestoneにする"
         );
 
+        // 提案で精錬した入力は採用の正本。採用中に再び盤面を読んで精錬し直さない。
+        world.insert_resource(
+            crate::ai::strategy_profile::V4StrategyProfileRegistry::with_profile(
+                player,
+                crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion,
+            ),
+        );
+        let mut prepared = portfolio.clone();
+        prepared.active_offensives[0].continued_from_existing_squad = true;
+        crate::ai::v4::strategy_pipeline::prepare_strategy(&mut world, player, &mut prepared);
+        let prepared_targets = prepared.active_offensives[0]
+            .capture_target_positions
+            .clone();
         world.get_mut::<Property>(first_north).unwrap().owner_id = Some(player);
         world.get_mut::<Property>(first_south).unwrap().owner_id = Some(player);
+        let adopted = crate::ai::v4::strategy_pipeline::portfolio_for_squads(
+            &mut world,
+            player,
+            0,
+            prepared,
+            &crate::ai::squad::SquadManager::new(),
+        );
+        assert_eq!(adopted.active_offensives.len(), 1, "継続中の作戦は採用する");
+        assert_eq!(
+            adopted.active_offensives[0].capture_target_positions, prepared_targets,
+            "採用は既に精錬した提案を使い、盤面更新後の次Milestoneへ精錬し直さない"
+        );
         assert!(
             capital_route_assault_authorized_from_dag(&world, player, island_id)
                 .expect("前方区間を確保した後のDAG Go判定"),

@@ -34,7 +34,8 @@ pub(crate) fn before_squad_planning(world: &mut World, player_id: PlayerId) {
     }
 }
 
-/// Roadmapを小規模パイプラインの正本として更新し、実働Squadが読むportfolioを返す。
+/// 提案側で精錬・観測済みのportfolioをRoadmapで採用し、実働Squadへ返す。
+/// 精錬と橋頭堡観測は `prepare_strategy` にだけ置き、採用時は繰り返さない。
 pub(crate) fn portfolio_for_squads(
     world: &mut World,
     player_id: PlayerId,
@@ -45,9 +46,6 @@ pub(crate) fn portfolio_for_squads(
     if !uses_small_map_expansion(world, player_id) {
         return portfolio;
     }
-    let mut portfolio = portfolio;
-    super::refine_same_land_route_milestones(world, player_id, &mut portfolio);
-    super::observe_same_land_route_bridgeheads(world, player_id, &portfolio.active_offensives);
     super::victory_roadmap::reconcile_campaign_roadmap(world, player_id, &portfolio, manager);
     super::victory_roadmap::current_turn_portfolio(world, player_id, turn).unwrap_or(portfolio)
 }
