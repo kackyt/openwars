@@ -402,7 +402,10 @@ impl FreeUnits {
     }
 }
 
-/// 汎用編成で使い回す距離cache。地形連結判定はマップ全体のフラッドフィルを毎回やり直さない。
+/// 再編で使い回す距離cache。地形連結判定はマップ全体のフラッドフィルを毎回やり直さない。
+///
+/// `turn_cache` は編成の占有モデルで求めたターン距離なので汎用編成だけが使う。
+/// `connectivity` は占有に依存しないため、campaign編成・配備・汎用編成で共有する。
 #[derive(Default)]
 struct FormationCaches {
     turn_cache: TurnDistanceCache,
@@ -430,18 +433,31 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
         policy.adopt_portfolio(world, player, &manager, &analysis.campaign_portfolio, is_v4);
     let enemy_clusters = detect_enemy_clusters(world, player);
 
+    // 地形連結cacheは地図と移動種別だけで決まるため、campaign編成・配備・汎用編成で共有する。
+    let mut caches = FormationCaches::default();
+
     // 3. campaign編成
-    let mut campaign = form_campaign_squads(world, &mut manager, player, &adopted, is_v3, policy);
+    let mut campaign = form_campaign_squads(
+        world,
+        &mut manager,
+        player,
+        &adopted,
+        is_v3,
+        policy,
+        &mut caches.connectivity,
+    );
     // V4のCombat枠で生産した実Entityは、campaign再配分とgeneric free poolより前に
     // 要求元の局地Attack任務へ予約する。
     // 既存campaign assignmentへ残っていても、明示的な生産目的を優先して切り離す。
     if is_v4 {
-        let deployment_reserved = crate::ai::v4::deployment::prepare_deployment_squads(
-            world,
-            &mut manager,
-            player,
-            &HashSet::default(),
-        );
+        let deployment_reserved =
+            crate::ai::v4::deployment::prepare_deployment_squads_with_connectivity(
+                world,
+                &mut manager,
+                player,
+                &HashSet::default(),
+                &mut caches.connectivity,
+            );
         campaign.reserved_entities.extend(deployment_reserved);
     }
     // #53 (V3): メンバーが全滅した占領部隊を解散する。
@@ -456,7 +472,6 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
     // 4. 汎用編成
     let board = FormationBoard::observe(&snapshot, is_v3);
     let mut free = FreeUnits::collect(&board, &manager, &campaign.reserved_entities);
-    let mut caches = FormationCaches::default();
     let objectives = generic_transport_objectives(&board, &campaign);
     assign_generic_transports(
         world,
@@ -575,6 +590,7 @@ fn form_campaign_squads(
     adopted: &IslandCampaignPortfolio,
     is_v3: bool,
     policy: PlanningPolicy,
+    connectivity: &mut TerrainConnectivity,
 ) -> CampaignFormation {
     if is_v3 {
         let mut cache = world
@@ -628,18 +644,17 @@ fn form_campaign_squads(
         .collect();
     reserved_entities.extend(secure_reserved_entities);
     let mut blocked_islands = HashSet::default();
-    let mut connectivity = TerrainConnectivity::default();
     for assignment in &assignments {
         if prepare_campaign_transport_assignment_with_connectivity(
             world,
             manager,
             player,
             assignment,
-            &mut connectivity,
+            connectivity,
         ) {
             blocked_islands.insert(assignment.island_id);
         }
-        policy.prepare_local_assignment(world, manager, player, assignment, &mut connectivity);
+        policy.prepare_local_assignment(world, manager, player, assignment, connectivity);
     }
     CampaignFormation {
         assignments,

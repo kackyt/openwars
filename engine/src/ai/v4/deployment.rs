@@ -957,6 +957,25 @@ pub(crate) fn prepare_deployment_squads(
     player_id: PlayerId,
     higher_priority_reserved: &HashSet<Entity>,
 ) -> HashSet<Entity> {
+    prepare_deployment_squads_with_connectivity(
+        world,
+        manager,
+        player_id,
+        higher_priority_reserved,
+        &mut TerrainConnectivity::default(),
+    )
+}
+
+/// [`prepare_deployment_squads`] の地形連結cacheを呼出側と共有する版。
+///
+/// 地形連結は地図と移動種別だけで決まるため、同じ手番の部隊再編と同じcacheを使ってよい。
+pub(crate) fn prepare_deployment_squads_with_connectivity(
+    world: &mut World,
+    manager: &mut SquadManager,
+    player_id: PlayerId,
+    higher_priority_reserved: &HashSet<Entity>,
+    connectivity: &mut TerrainConnectivity,
+) -> HashSet<Entity> {
     // 拡張経路では、占領枠の直接任務化と、迎撃役の上限つき目標解決（H06）を使う。
     // Entityの走査順・Squadの付け替え・解放の手順は両経路で共通。
     let is_extended_path =
@@ -966,7 +985,6 @@ pub(crate) fn prepare_deployment_squads(
     let mut registry = world
         .remove_resource::<V4DeploymentRegistry>()
         .unwrap_or_default();
-    let mut connectivity = TerrainConnectivity::default();
     let mut reserved = HashSet::default();
     let mut releases = Vec::new();
     let island_map = world
@@ -1016,13 +1034,13 @@ pub(crate) fn prepare_deployment_squads(
                 let resolved = if is_extended_path {
                     extended::resolve_target(
                         world,
-                        &mut connectivity,
+                        connectivity,
                         &snapshot,
                         &target_commitments,
                         interceptors,
                     )
                 } else {
-                    resolve_target(world, &mut connectivity, &snapshot)
+                    resolve_target(world, connectivity, &snapshot)
                         .map(|(target_entity, target)| (target_entity, target, false))
                 };
                 match resolved {
