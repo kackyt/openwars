@@ -609,155 +609,105 @@ pub(super) fn prepare_campaign_local_assignment_with_connectivity(
     synchronize_local_capture_departure(world, manager, player_id, assignment, connectivity);
 }
 
-/// 拡張の再編差分はこの型へ閉じ込め、再編本体は通常側と共有する。
-pub(super) struct ExtendedPlanningHooks;
-
-impl SquadPlanningHooks for ExtendedPlanningHooks {
-    fn before_manager_removal(world: &mut World, player: PlayerId, is_v4: bool) {
-        if is_v4 {
-            crate::ai::v4::strategy_pipeline::before_squad_planning(world, player);
-        }
+/// 小規模V4の採用: 首都ルートDAGとRoadmapで戦略分析のportfolioから部分集合を選ぶ。
+/// V4以外は分析結果をそのまま採用する。
+pub(super) fn adopt_portfolio(
+    world: &mut World,
+    player: PlayerId,
+    manager: &SquadManager,
+    portfolio: &crate::ai::island_campaign::IslandCampaignPortfolio,
+    is_v4: bool,
+) -> crate::ai::island_campaign::IslandCampaignPortfolio {
+    if !is_v4 {
+        return portfolio.clone();
     }
+    let turn = world
+        .get_resource::<crate::resources::MatchState>()
+        .map_or(0, |state| state.current_turn_number.0);
+    crate::ai::v4::strategy_pipeline::portfolio_for_squads(
+        world,
+        player,
+        turn,
+        portfolio.clone(),
+        manager,
+    )
+}
 
-    fn portfolio_for_planning<'a>(
-        world: &mut World,
-        player: PlayerId,
-        manager: &SquadManager,
-        portfolio: &'a crate::ai::island_campaign::IslandCampaignPortfolio,
-        is_v4: bool,
-    ) -> std::borrow::Cow<'a, crate::ai::island_campaign::IslandCampaignPortfolio> {
-        let turn = world
-            .get_resource::<crate::resources::MatchState>()
-            .map_or(0, |state| state.current_turn_number.0);
-        std::borrow::Cow::Owned(if is_v4 {
-            crate::ai::v4::strategy_pipeline::portfolio_for_squads(
-                world,
-                player,
-                turn,
-                portfolio.clone(),
-                manager,
-            )
-        } else {
-            portfolio.clone()
+/// 小規模マップの占領目標順: 自首都から遠い順（同点は敵首都に近い順）。
+/// 小規模プロファイルでない場合は通常の順序を使う。
+pub(super) fn sort_small_map_capture_targets(
+    world: &mut World,
+    player: PlayerId,
+    targets: &mut [GridPosition],
+    context: &CapturePlanningContext<'_>,
+) {
+    if crate::ai::strategy_profile::current_profile(world, player)
+        != crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion
+    {
+        super::formation::sort_capture_targets_by_nearest_infantry(targets, context);
+        return;
+    }
+    let enemy_capital = {
+        let mut properties = world.query::<(&GridPosition, &Property)>();
+        properties.iter(world).find_map(|(position, property)| {
+            (property.terrain == Terrain::Capital
+                && property.owner_id != Some(player)
+                && property.owner_id.is_some())
+            .then_some(*position)
         })
-    }
+    };
+    // 小規模かつ自首都なしでは従来どおり入力順を保つ。通常sortへ戻さない。
+    let Some(capital) = context.capital else {
+        return;
+    };
+    targets.sort_unstable_by_key(|target| {
+        let distance = context
+            .map
+            .distance(capital.x, capital.y, target.x, target.y);
+        let enemy_distance = enemy_capital
+            .map(|enemy| context.map.distance(enemy.x, enemy.y, target.x, target.y))
+            .unwrap_or(0);
+        (
+            std::cmp::Reverse(distance),
+            enemy_distance,
+            target.y,
+            target.x,
+        )
+    });
+}
 
-    fn prepare_local_assignment(
-        world: &World,
-        manager: &mut SquadManager,
-        player: PlayerId,
-        assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
-        connectivity: &mut TerrainConnectivity,
-    ) {
-        // 親の同名関数へ単純に置換しない。ここからは子の独立ID付き実装を直接呼ぶ。
-        self::prepare_campaign_local_assignment_with_connectivity(
-            world,
-            manager,
-            player,
-            assignment,
-            connectivity,
-        );
-    }
-
-    fn uses_legacy_capital_defense(is_v4: bool) -> bool {
-        !is_v4
-    }
-
-    fn sort_capture_targets(
-        world: &mut World,
-        player: PlayerId,
-        targets: &mut [GridPosition],
-        context: &CapturePlanningContext<'_>,
-    ) {
-        if crate::ai::strategy_profile::current_profile(world, player)
-            == crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion
-        {
-            let enemy_capital = {
-                let mut properties = world.query::<(&GridPosition, &Property)>();
-                properties.iter(world).find_map(|(position, property)| {
-                    (property.terrain == Terrain::Capital
-                        && property.owner_id != Some(player)
-                        && property.owner_id.is_some())
-                    .then_some(*position)
-                })
-            };
-            // 小規模かつ自首都なしでは従来どおり入力順を保つ。通常sortへ戻さない。
-            if let Some(capital) = context.capital {
-                targets.sort_unstable_by_key(|target| {
-                    let distance = context
-                        .map
-                        .distance(capital.x, capital.y, target.x, target.y);
-                    let enemy_distance = enemy_capital
-                        .map(|enemy| context.map.distance(enemy.x, enemy.y, target.x, target.y))
-                        .unwrap_or(0);
-                    (
-                        std::cmp::Reverse(distance),
-                        enemy_distance,
-                        target.y,
-                        target.x,
-                    )
-                });
-            }
-        } else {
-            MainPlanningHooks::sort_capture_targets(world, player, targets, context);
-        }
-    }
-
-    fn select_capture_infantry(
-        context: &CapturePlanningContext<'_>,
-        island: crate::ai::islands::IslandId,
-        target: &GridPosition,
-    ) -> Option<usize> {
-        context
-            .infantry
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, position, stats))| {
-                context
-                    .island_map
-                    .get_island_at(position)
-                    .is_some_and(|candidate| candidate.id == island)
-                    && is_terrain_reachable(
-                        context.map,
-                        context.registry,
-                        (position.x, position.y),
-                        (target.x, target.y),
-                        stats.movement_type,
-                    )
-            })
-            .min_by_key(|(_, (entity, position, _))| {
-                (
-                    context
-                        .map
-                        .distance(position.x, position.y, target.x, target.y),
-                    entity.to_bits(),
+/// 小規模マップの占領要員: 同島で到達できる歩兵のうち、目標に最も近いもの。
+pub(super) fn select_nearest_capture_infantry(
+    context: &CapturePlanningContext<'_>,
+    island: crate::ai::islands::IslandId,
+    target: &GridPosition,
+) -> Option<usize> {
+    context
+        .infantry
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, position, stats))| {
+            context
+                .island_map
+                .get_island_at(position)
+                .is_some_and(|candidate| candidate.id == island)
+                && is_terrain_reachable(
+                    context.map,
+                    context.registry,
+                    (position.x, position.y),
+                    (target.x, target.y),
+                    stats.movement_type,
                 )
-            })
-            .map(|(index, _)| index)
-    }
-
-    fn before_final_reconcile(
-        _world: &mut World,
-        _player: PlayerId,
-        _portfolio: &crate::ai::island_campaign::IslandCampaignPortfolio,
-        _manager: &SquadManager,
-        _is_v4: bool,
-    ) {
-    }
-
-    fn after_final_reconcile(
-        world: &mut World,
-        player: PlayerId,
-        portfolio: &crate::ai::island_campaign::IslandCampaignPortfolio,
-        manager: &mut SquadManager,
-        is_v4: bool,
-    ) {
-        if is_v4 {
-            crate::ai::v4::strategy_pipeline::after_squad_planning(
-                world, player, portfolio, manager,
-            );
-        }
-    }
+        })
+        .min_by_key(|(_, (entity, position, _))| {
+            (
+                context
+                    .map
+                    .distance(position.x, position.y, target.x, target.y),
+                entity.to_bits(),
+            )
+        })
+        .map(|(index, _)| index)
 }
 
 /// ゲームの戦略状況に基づいて、自動的に部隊の構築と新規メンバーの割り当てを行います。
@@ -765,7 +715,11 @@ pub(crate) fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     if !crate::ai::code_path::ext_enabled("squad.rs::plan_squads") {
         return super::plan_squads(world, perspective_player);
     }
-    super::plan_squads_with_hooks::<ExtendedPlanningHooks>(world, perspective_player);
+    super::formation::plan_squads_with_policy(
+        world,
+        perspective_player,
+        super::formation::PlanningPolicy::SmallMap,
+    );
 }
 
 /// 全体需要から決めたroute枠へ、memberを一度だけ配属する。

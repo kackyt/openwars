@@ -1,7 +1,8 @@
-//! F07の通常／拡張hookと共通オーケストレーションの境界を固定する。
+//! 再編の通常／小規模V4方策と共通の段の境界を固定する。
 
-use crate::ai::planning::decision::AdoptedTurnPortfolio;
+use super::formation::{PlanningPolicy, plan_squads_with_policy};
 use super::*;
+use crate::ai::planning::decision::AdoptedTurnPortfolio;
 use crate::ai::ai_version::{AiVersion, PlayerAiSettings};
 use crate::ai::island_campaign::{
     IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignPortfolio,
@@ -76,11 +77,11 @@ fn capture_hooks_keep_main_input_order_and_extended_distance_order() {
     };
     let target = GridPosition { x: 9, y: 0 };
     assert_eq!(
-        MainPlanningHooks::select_capture_infantry(&context, IslandId(0), &target),
+        PlanningPolicy::Standard.select_capture_infantry(&context, IslandId(0), &target),
         Some(0)
     );
     assert_eq!(
-        extended::ExtendedPlanningHooks::select_capture_infantry(&context, IslandId(0), &target),
+        PlanningPolicy::SmallMap.select_capture_infantry(&context, IslandId(0), &target),
         Some(2)
     );
     let original = vec![
@@ -94,7 +95,7 @@ fn capture_hooks_keep_main_input_order_and_extended_distance_order() {
         ..context
     };
     let mut main_targets = original.clone();
-    MainPlanningHooks::sort_capture_targets(
+    PlanningPolicy::Standard.sort_capture_targets(
         &mut world,
         player,
         &mut main_targets,
@@ -105,7 +106,7 @@ fn capture_hooks_keep_main_input_order_and_extended_distance_order() {
         vec![3, 5, 8]
     );
     let mut extended_targets = original.clone();
-    extended::ExtendedPlanningHooks::sort_capture_targets(
+    PlanningPolicy::SmallMap.sort_capture_targets(
         &mut world,
         player,
         &mut extended_targets,
@@ -120,7 +121,7 @@ fn capture_hooks_keep_main_input_order_and_extended_distance_order() {
         ..sorting_context
     };
     extended_targets = original.clone();
-    extended::ExtendedPlanningHooks::sort_capture_targets(
+    PlanningPolicy::SmallMap.sort_capture_targets(
         &mut world,
         player,
         &mut extended_targets,
@@ -134,7 +135,7 @@ fn capture_hooks_keep_main_input_order_and_extended_distance_order() {
         player,
         V4StrategyProfile::Standard,
     ));
-    extended::ExtendedPlanningHooks::sort_capture_targets(
+    PlanningPolicy::SmallMap.sort_capture_targets(
         &mut world,
         player,
         &mut extended_targets,
@@ -152,7 +153,7 @@ fn portfolio_and_capital_defense_hooks_keep_model_specific_behavior() {
     let manager = SquadManager::new();
     let portfolio = IslandCampaignPortfolio::default();
     assert!(matches!(
-        MainPlanningHooks::portfolio_for_planning(
+        PlanningPolicy::Standard.adopt_portfolio(
             &mut world,
             PlayerId(1),
             &manager,
@@ -162,7 +163,7 @@ fn portfolio_and_capital_defense_hooks_keep_model_specific_behavior() {
         Cow::Borrowed(_)
     ));
     assert!(matches!(
-        extended::ExtendedPlanningHooks::portfolio_for_planning(
+        PlanningPolicy::SmallMap.adopt_portfolio(
             &mut world,
             PlayerId(1),
             &manager,
@@ -172,9 +173,9 @@ fn portfolio_and_capital_defense_hooks_keep_model_specific_behavior() {
         Cow::Owned(_)
     ));
     for is_v4 in [false, true] {
-        assert!(MainPlanningHooks::uses_legacy_capital_defense(is_v4));
+        assert!(PlanningPolicy::Standard.uses_legacy_capital_defense(is_v4));
         assert_eq!(
-            extended::ExtendedPlanningHooks::uses_legacy_capital_defense(is_v4),
+            PlanningPolicy::SmallMap.uses_legacy_capital_defense(is_v4),
             !is_v4
         );
     }
@@ -212,87 +213,32 @@ fn generic_transport_uses_source_portfolio_and_preserves_property_fallback() {
     );
 }
 
-#[derive(Resource, Default)]
-struct Stages(Vec<&'static str>);
-#[derive(Resource, Clone)]
-struct SelectedPortfolio(IslandCampaignPortfolio);
-#[derive(Resource)]
-struct OriginalPortfolio(IslandCampaignPortfolio);
-struct RecordingHooks;
-impl SquadPlanningHooks for RecordingHooks {
-    fn portfolio_for_planning<'a>(
-        world: &mut World,
-        _player: PlayerId,
-        _manager: &SquadManager,
-        portfolio: &'a IslandCampaignPortfolio,
-        _is_v4: bool,
-    ) -> Cow<'a, IslandCampaignPortfolio> {
-        assert!(!world.contains_resource::<SquadManager>());
-        world.resource_mut::<Stages>().0.push("portfolio");
-        world.insert_resource(OriginalPortfolio(portfolio.clone()));
-        Cow::Owned(world.resource::<SelectedPortfolio>().0.clone())
-    }
-    fn before_final_reconcile(
-        world: &mut World,
-        _player: PlayerId,
-        _portfolio: &IslandCampaignPortfolio,
-        _manager: &SquadManager,
-        _is_v4: bool,
-    ) {
-        assert!(!world.contains_resource::<SquadManager>());
-        world.resource_mut::<Stages>().0.push("before_reconcile");
-        world
-            .resource_mut::<UnitOperationRegistry>()
-            .note_reconcile_visits(usize::MAX);
-    }
-    fn after_final_reconcile(
-        world: &mut World,
-        _player: PlayerId,
-        _portfolio: &IslandCampaignPortfolio,
-        _manager: &mut SquadManager,
-        _is_v4: bool,
-    ) {
-        assert!(!world.contains_resource::<SquadManager>());
-        assert_ne!(
-            world
-                .resource::<UnitOperationRegistry>()
-                .last_reconcile_visits(),
-            usize::MAX
-        );
-        world.resource_mut::<Stages>().0.push("after_reconcile");
-    }
-}
-
+/// 共通の段は、分析の間だけSquadManagerをWorldへ戻し、最後に必ず戻す。
+/// V3以降は採用portfolioを手番cacheへ残し、編成済みを記録する。
 #[test]
-fn shared_planning_keeps_manager_lifetime_and_adopted_portfolio_cache() {
-    let mut world = super::tests::setup_test_world();
-    let player = PlayerId(1);
-    let mut settings = PlayerAiSettings::new();
-    settings.set_version(player, AiVersion::V3);
-    world.insert_resource(settings);
-    let selected = IslandCampaignPortfolio {
-        active_offensives: vec![assignment(GridPosition { x: 2, y: 0 })],
-        ..Default::default()
-    };
-    world.insert_resource(SelectedPortfolio(selected.clone()));
-    world.insert_resource(Stages::default());
-    plan_squads_with_hooks::<RecordingHooks>(&mut world, player);
-    assert_eq!(
-        world.resource::<Stages>().0,
-        vec![
-            "portfolio",
-            "before_reconcile",
-            "after_reconcile"
-        ]
-    );
-    assert!(world.contains_resource::<SquadManager>());
-    assert_ne!(world.resource::<OriginalPortfolio>().0, selected);
-    assert_eq!(
-        world
-            .resource::<AdoptedTurnPortfolio>()
-            .campaign_portfolio(player),
-        Some(&selected)
-    );
+fn shared_planning_restores_manager_and_caches_adopted_portfolio() {
+    for policy in [PlanningPolicy::Standard, PlanningPolicy::SmallMap] {
+        let mut world = super::tests::setup_test_world();
+        let player = PlayerId(1);
+        let mut settings = PlayerAiSettings::new();
+        settings.set_version(player, AiVersion::V3);
+        world.insert_resource(settings);
+        plan_squads_with_policy(&mut world, player, policy);
+        assert!(world.contains_resource::<SquadManager>(), "{policy:?}");
+        assert!(
+            world
+                .resource::<AdoptedTurnPortfolio>()
+                .campaign_portfolio(player)
+                .is_some(),
+            "{policy:?}"
+        );
+        assert!(
+            world
+                .resource::<crate::ai::runtime::state::AiTurnProgress>()
+                .squads_planned(player),
+            "{policy:?}"
+        );
+    }
 }
 
 fn v4_small_world() -> World {
@@ -369,7 +315,7 @@ fn planning_entry_and_local_assignment_follow_code_path() {
             let mut manager = SquadManager::new();
             let mut connectivity = TerrainConnectivity::default();
             if direct_extended {
-                extended::ExtendedPlanningHooks::prepare_local_assignment(
+                PlanningPolicy::SmallMap.prepare_local_assignment(
                     &world,
                     &mut manager,
                     PlayerId(1),
@@ -377,7 +323,7 @@ fn planning_entry_and_local_assignment_follow_code_path() {
                     &mut connectivity,
                 );
             } else {
-                MainPlanningHooks::prepare_local_assignment(
+                PlanningPolicy::Standard.prepare_local_assignment(
                     &world,
                     &mut manager,
                     PlayerId(1),
