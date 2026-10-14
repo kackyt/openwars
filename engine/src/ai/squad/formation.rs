@@ -14,7 +14,8 @@ use super::*;
 use crate::ai::context::board::{BoardUnit, PlayerBoard};
 use crate::ai::island_campaign::{IslandCampaignAssignment, IslandCampaignPortfolio};
 use crate::ai::islands::{IslandId, IslandMap};
-use crate::ai::strategy::{ProductionStrategy, analyze_strategy_on_board};
+use crate::ai::planning::campaign;
+use crate::ai::planning::situation::{self, StrategicSituation};
 use crate::systems::movement::OccupantInfo;
 use std::borrow::Cow;
 
@@ -423,10 +424,10 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
     let snapshot = PlayerBoard::observe(world, player);
 
     // 2. 戦略分析と採用。採用portfolioはcache・campaign編成用。汎用輸送の地理的候補は、
-    // 引き続き元のstrategy.campaign_portfolioを参照するためstrategyを置換しない。
-    let strategy = analyze_strategy_for_formation(world, &mut manager, &snapshot, is_v3, is_v4);
+    // 引き続き元のanalysis.campaign_portfolio（提案のまま）を参照する。
+    let analysis = analyze_strategy_for_formation(world, &mut manager, &snapshot, is_v3, is_v4);
     let adopted =
-        policy.adopt_portfolio(world, player, &manager, &strategy.campaign_portfolio, is_v4);
+        policy.adopt_portfolio(world, player, &manager, &analysis.campaign_portfolio, is_v4);
     let enemy_clusters = detect_enemy_clusters(world, player);
 
     // 3. campaign編成
@@ -461,7 +462,7 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
         world,
         &mut manager,
         &board,
-        &strategy.campaign_portfolio,
+        &analysis.campaign_portfolio,
         &objectives,
         &mut free,
         &mut caches,
@@ -491,7 +492,7 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
         world,
         &mut manager,
         &board,
-        &strategy,
+        &analysis.situation,
         &campaign.paused_islands,
         policy,
         &mut free,
@@ -526,30 +527,44 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
     world.insert_resource(manager);
 }
 
-/// 戦略分析。分析はSquadManagerをWorldから読むため、分析の間だけ戻す。
+/// 再編に使う戦略分析の結果。生産需要は含まない（生産判断の分析が別に求める）。
+struct FormationAnalysis {
+    situation: StrategicSituation,
+    /// 盤面から提案したcampaign portfolio（V2は空）。
+    campaign_portfolio: IslandCampaignPortfolio,
+}
+
+/// 状況判断とcampaign提案。campaign提案はSquadManagerをWorldから読むため、提案の間だけ戻す。
 fn analyze_strategy_for_formation(
     world: &mut World,
     manager: &mut SquadManager,
     snapshot: &PlayerBoard,
     is_v3: bool,
     is_v4: bool,
-) -> ProductionStrategy {
+) -> FormationAnalysis {
     let player = snapshot.player;
-    // V3以降は防衛もcampaign portfolioの通常優先度・排他割当で扱う。
-    // V4のdeploymentだけは生産目的が解消されるまで通常free poolから保護する。
-    let deployment_entities = if is_v3 && is_v4 {
-        world
-            .get_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>()
-            .map(|deployments| deployments.active_entities(player))
-            .unwrap_or_default()
+    let campaign_portfolio = if is_v3 {
+        // V3以降は防衛もcampaign portfolioの通常優先度・排他割当で扱う。
+        // V4のdeploymentだけは生産目的が解消されるまで通常free poolから保護する。
+        let deployment_entities = if is_v4 {
+            world
+                .get_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>()
+                .map(|deployments| deployments.active_entities(player))
+                .unwrap_or_default()
+        } else {
+            HashSet::default()
+        };
+        world.insert_resource(std::mem::take(manager));
+        let portfolio = campaign::propose(world, player, &deployment_entities);
+        *manager = world.remove_resource::<SquadManager>().unwrap_or_default();
+        portfolio
     } else {
-        HashSet::default()
+        IslandCampaignPortfolio::default()
     };
-    world.insert_resource(std::mem::take(manager));
-    // V2は予約なし（空集合）で分析する。
-    let strategy = analyze_strategy_on_board(world, snapshot, &deployment_entities);
-    *manager = world.remove_resource::<SquadManager>().unwrap_or_default();
-    strategy
+    FormationAnalysis {
+        situation: situation::assess(snapshot),
+        campaign_portfolio,
+    }
 }
 
 /// 採用portfolioの防衛・攻勢をSquadへ展開する（V3以降）。V2では放棄されたplaceholderの掃除だけを行う。
@@ -1253,7 +1268,7 @@ fn form_capture_squads(
     world: &mut World,
     manager: &mut SquadManager,
     board: &FormationBoard,
-    strategy: &ProductionStrategy,
+    situation: &StrategicSituation,
     paused_islands: &HashSet<IslandId>,
     policy: PlanningPolicy,
     free: &mut FreeUnits,
@@ -1261,9 +1276,9 @@ fn form_capture_squads(
     let player = board.player;
     let is_v3 = board.is_v3;
     let mut capture_targets: Vec<GridPosition> =
-        strategy.unowned_properties.iter().cloned().collect();
+        situation.unowned_properties.iter().cloned().collect();
     if is_v3 {
-        capture_targets.extend(strategy.enemy_properties.iter().cloned());
+        capture_targets.extend(situation.enemy_properties.iter().cloned());
         capture_targets.retain(|target| {
             board
                 .island_map
@@ -1304,7 +1319,7 @@ fn form_capture_squads(
 
     // #53 (V3): 敵生産施設への突入 (スピアヘッド) は戦力優勢 (Assault フェーズ)
     // のときのみ許可する。拮抗・劣勢時に前線から兵力を抜くと防衛線が崩壊する
-    let allow_facility_capture = strategy.phase == crate::ai::strategy::GamePhase::Assault;
+    let allow_facility_capture = situation.phase == crate::ai::strategy::GamePhase::Assault;
 
     for target in &capture_targets {
         let target_is_enemy_facility = is_enemy_facility(target);
