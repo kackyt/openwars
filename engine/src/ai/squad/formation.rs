@@ -10,6 +10,7 @@
 //!
 //! 通常（V2/V3・標準マップV4）と小規模マップV4の差は [`PlanningPolicy`] に集める。
 
+use super::assignment::{AssignmentProposal, SquadDraft, SquadSlot};
 use super::*;
 use crate::ai::context::board::{BoardUnit, PlayerBoard};
 use crate::ai::island_campaign::{IslandCampaignAssignment, IslandCampaignPortfolio};
@@ -469,24 +470,25 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
             .retain(|s| s.mission_type != MissionType::Capture || !s.members.is_empty());
     }
 
-    // 4. 汎用編成
+    // 4. 汎用編成。各段はSquadの新設・追加を提案へ積み、最後に1回だけ確定する。
     let board = FormationBoard::observe(&snapshot, is_v3);
     let mut free = FreeUnits::collect(&board, &manager, &campaign.reserved_entities);
+    let mut proposal = AssignmentProposal::new(world, &manager, player);
     let objectives = generic_transport_objectives(&board, &campaign);
     assign_generic_transports(
         world,
-        &mut manager,
+        &mut proposal,
         &board,
         &analysis.campaign_portfolio,
         &objectives,
         &mut free,
         &mut caches,
     );
-    unload_unreserved_loaded_transports(world, &mut manager, player, &mut free);
+    unload_unreserved_loaded_transports(world, &mut proposal, &mut free);
     if is_v4 {
         assign_capture_depth_transports(
             world,
-            &mut manager,
+            &mut proposal,
             &board,
             &campaign.assignments,
             &mut free,
@@ -495,8 +497,7 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
     }
     if policy.uses_legacy_capital_defense(is_v4) {
         form_capital_defense_squads(
-            world,
-            &mut manager,
+            &mut proposal,
             &board,
             &enemy_clusters,
             &mut free,
@@ -505,7 +506,7 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
     }
     form_capture_squads(
         world,
-        &mut manager,
+        &mut proposal,
         &board,
         &analysis.situation,
         &campaign.paused_islands,
@@ -513,21 +514,20 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
         &mut free,
     );
     form_attack_squads(
-        world,
-        &mut manager,
+        &mut proposal,
         &board,
         &enemy_clusters,
         &mut free,
         &mut caches.turn_cache,
     );
     absorb_surplus_combat_units(
-        world,
-        &mut manager,
+        &mut proposal,
         &board,
         &enemy_clusters,
         &mut free,
         &mut caches.turn_cache,
     );
+    proposal.commit(&mut manager);
 
     // 5. 仕上げ
     finalize_formation(
@@ -811,8 +811,8 @@ impl CargoSearch<'_> {
 
 /// A. 汎用輸送: 優先順位の高い島から、輸送役と不足する占領要員・護衛を組む。
 fn assign_generic_transports(
-    world: &mut World,
-    manager: &mut SquadManager,
+    world: &World,
+    proposal: &mut AssignmentProposal,
     board: &FormationBoard,
     source_portfolio: &IslandCampaignPortfolio,
     objectives: &[crate::ai::objectives::Objective],
@@ -851,7 +851,7 @@ fn assign_generic_transports(
         while to_assign > 0 && !free.transports.is_empty() {
             let transport = free.transports.pop().unwrap();
             if let Some(capture_count) =
-                load_generic_transport(world, manager, &search, transport, free, caches)
+                load_generic_transport(world, proposal, &search, transport, free, caches)
             {
                 to_assign = to_assign.saturating_sub(capture_count);
             }
@@ -862,7 +862,7 @@ fn assign_generic_transports(
 /// 輸送役1体へカーゴを選んで輸送Squadを作る。作ったSquadの占領要員数を返す。
 fn load_generic_transport(
     world: &World,
-    manager: &mut SquadManager,
+    proposal: &mut AssignmentProposal,
     search: &CargoSearch<'_>,
     transport: FreeUnit,
     free: &mut FreeUnits,
@@ -980,27 +980,24 @@ fn load_generic_transport(
         pickup_position = Some(transport_position);
     }
 
-    let squad = manager.create_owned_squad(MissionType::Transport, search.board.player);
-    squad.members.insert(transport_entity);
-    squad.transport_entity = Some(transport_entity);
-    squad.cargo_entities = cargo_entities;
-    squad.target_island = Some(search.target_island);
-    squad.target = search.target_position;
-    squad.pickup_position = pickup_position;
-    squad.allow_partial_departure = true;
-    squad.phase = MissionPhase::Transport(if requires_pickup && !selected_entries.is_empty() {
+    let phase = if requires_pickup && !selected_entries.is_empty() {
         TransportPhase::Pickup
     } else {
         TransportPhase::Transit
-    });
+    };
+    let mut draft = SquadDraft::transport(transport_entity, cargo_entities, phase);
+    draft.target_island = Some(search.target_island);
+    draft.target = search.target_position;
+    draft.pickup_position = pickup_position;
+    draft.allow_partial_departure = true;
+    proposal.create(draft);
     Some(assigned_capture_count)
 }
 
 /// campaignへ予約されていない搭載済み輸送機は、別assignmentへ転用せず安全に降ろす。
 fn unload_unreserved_loaded_transports(
     world: &World,
-    manager: &mut SquadManager,
-    player: PlayerId,
+    proposal: &mut AssignmentProposal,
     free: &mut FreeUnits,
 ) {
     free.transports
@@ -1019,14 +1016,10 @@ fn unload_unreserved_loaded_transports(
             i += 1;
             continue;
         }
-        let squad = manager.create_owned_squad(MissionType::Transport, player);
-        squad.members.insert(transport_entity);
-        squad.transport_entity = Some(transport_entity);
-        squad.cargo_entities = cargo_entities;
-        squad.pickup_position = Some(transport_position);
-        squad.target_island = None;
-        squad.target = None;
-        squad.phase = MissionPhase::Transport(TransportPhase::Drop);
+        let mut draft =
+            SquadDraft::transport(transport_entity, cargo_entities, TransportPhase::Drop);
+        draft.pickup_position = Some(transport_position);
+        proposal.create(draft);
         free.transports.remove(i);
     }
 }
@@ -1049,8 +1042,8 @@ fn enemy_count_by_island(board: &FormationBoard<'_>) -> HashMap<IslandId, usize>
 /// 損耗補充用の予備便を割り当てる。free poolへ残った歩兵・輸送役を
 /// 生産拠点周辺の恒常的な遊兵にしない。
 fn assign_capture_depth_transports(
-    world: &mut World,
-    manager: &mut SquadManager,
+    world: &World,
+    proposal: &mut AssignmentProposal,
     board: &FormationBoard,
     campaign_assignments: &[IslandCampaignAssignment],
     free: &mut FreeUnits,
@@ -1089,7 +1082,7 @@ fn assign_capture_depth_transports(
         while remaining > 0 && !free.transports.is_empty() && !free.infantry.is_empty() {
             let Some(loaded) = load_capture_depth_transport(
                 world,
-                manager,
+                proposal,
                 board,
                 assignment,
                 remaining,
@@ -1106,7 +1099,7 @@ fn assign_capture_depth_transports(
 /// 予備便1便を組む。成立したら積んだ歩兵数、輸送役か歩兵が見つからなければNone。
 fn load_capture_depth_transport(
     world: &World,
-    manager: &mut SquadManager,
+    proposal: &mut AssignmentProposal,
     board: &FormationBoard,
     assignment: &IslandCampaignAssignment,
     remaining: usize,
@@ -1195,24 +1188,21 @@ fn load_capture_depth_transport(
     };
 
     let loaded = cargo_entities.len();
-    let squad = manager.create_owned_squad(MissionType::Transport, board.player);
-    squad.members.insert(transport);
-    squad.transport_entity = Some(transport);
-    squad.cargo_entities = cargo_entities;
-    squad.pickup_position = Some(pickup_position);
-    squad.target_island = Some(assignment.island_id);
-    squad.target = Some(assignment.target_position);
-    squad.allow_partial_departure =
-        assignment.decision != crate::ai::island_campaign::IslandCampaignDecision::Assault;
-    squad.departure_authorized = assignment.operation_ready
-        || assignment.decision != crate::ai::island_campaign::IslandCampaignDecision::Assault;
-    squad.phase = MissionPhase::Transport(TransportPhase::Pickup);
+    let is_assault =
+        assignment.decision == crate::ai::island_campaign::IslandCampaignDecision::Assault;
+    let mut draft = SquadDraft::transport(transport, cargo_entities, TransportPhase::Pickup);
+    draft.pickup_position = Some(pickup_position);
+    draft.target_island = Some(assignment.island_id);
+    draft.target = Some(assignment.target_position);
+    draft.allow_partial_departure = !is_assault;
+    draft.departure_authorized = assignment.operation_ready || !is_assault;
+    proposal.create(draft);
     Some(loaded)
 }
 
 /// 新しいSquadへ、目標へのターン距離が近い順にfreeの戦闘unitを最大3体入れる。
 fn assign_nearest_combat_units(
-    squad: &mut Squad,
+    members: &mut BTreeSet<Entity>,
     board: &FormationBoard,
     target: GridPosition,
     free_combat: &mut Vec<FreeUnit>,
@@ -1222,14 +1212,13 @@ fn assign_nearest_combat_units(
     let assign_count = free_combat.len().min(3);
     for _ in 0..assign_count {
         let (entity, _, _) = free_combat.remove(0);
-        squad.members.insert(entity);
+        members.insert(entity);
     }
 }
 
 /// B. 防衛部隊の立ち上げ: 自首都から5ターン以内の敵クラスタごとに防衛Squadを作る。
 fn form_capital_defense_squads(
-    world: &World,
-    manager: &mut SquadManager,
+    proposal: &mut AssignmentProposal,
     board: &FormationBoard,
     enemy_clusters: &[crate::ai::cluster::AttackCluster],
     free: &mut FreeUnits,
@@ -1255,18 +1244,19 @@ fn form_capital_defense_squads(
             continue;
         }
         // すでにこのクラスターを防衛目標としている部隊があるか
-        let exists = manager.squads.iter().any(|s| {
-            squad_is_mutable_by_player(world, s, board.player)
-                && s.mission_type == MissionType::Defense
-                && s.target == Some(cluster.center)
-        });
-        if exists {
+        if proposal.has_squad(MissionType::Defense, cluster.center) {
             continue;
         }
-        let squad = manager.create_owned_squad(MissionType::Defense, board.player);
-        squad.target = Some(cluster.center);
-        squad.phase = MissionPhase::Forming;
-        assign_nearest_combat_units(squad, board, cluster.center, &mut free.combat, turn_cache);
+        let mut draft = SquadDraft::new(MissionType::Defense, MissionPhase::Forming);
+        draft.target = Some(cluster.center);
+        assign_nearest_combat_units(
+            &mut draft.members,
+            board,
+            cluster.center,
+            &mut free.combat,
+            turn_cache,
+        );
+        proposal.create(draft);
     }
 }
 
@@ -1281,7 +1271,7 @@ const MAX_CONCURRENT_FACILITY_CAPTURES: usize = 1;
 /// 対象だったため、中立を取り切ると占領部隊が編成されなくなり、敵領土の奪取が発生しなかった。
 fn form_capture_squads(
     world: &mut World,
-    manager: &mut SquadManager,
+    proposal: &mut AssignmentProposal,
     board: &FormationBoard,
     situation: &StrategicSituation,
     paused_islands: &HashSet<IslandId>,
@@ -1311,14 +1301,13 @@ fn form_capture_squads(
                 .get_terrain(t.x, t.y)
                 .is_some_and(|tr| board.registry.is_production_facility(tr.as_str()))
     };
-    let mut active_facility_captures = manager
-        .squads
-        .iter()
-        .filter(|s| {
-            squad_is_mutable_by_player(world, s, player)
-                && s.mission_type == MissionType::Capture
-                && !s.members.is_empty()
-                && s.target.as_ref().is_some_and(is_enemy_facility)
+    let mut active_facility_captures = proposal
+        .squads()
+        .filter(|(_, squad)| {
+            squad.mutable
+                && squad.mission_type == MissionType::Capture
+                && squad.members > 0
+                && squad.target.as_ref().is_some_and(is_enemy_facility)
         })
         .count();
     // 最寄りのフリー歩兵から近い順に割り当てる (HashSet 順の非決定性も排除し、
@@ -1360,36 +1349,31 @@ fn form_capture_squads(
         if !can_capture {
             continue;
         }
-        let exists = manager.squads.iter().any(|s| {
-            squad_is_mutable_by_player(world, s, player)
-                && s.mission_type == MissionType::Capture
-                && s.target == Some(*target)
-        });
-        if exists {
+        if proposal.has_squad(MissionType::Capture, *target) {
             continue;
         }
 
-        let squad = manager.create_owned_squad(MissionType::Capture, player);
-        squad.target = Some(*target);
+        let mut draft = SquadDraft::new(MissionType::Capture, MissionPhase::Forming);
+        draft.target = Some(*target);
         if is_v3 {
-            squad.target_island = Some(target_island.id);
+            draft.target_island = Some(target_island.id);
         }
-        squad.phase = MissionPhase::Forming;
         // 同じ島にいる歩兵がいればそれを優先、いなければ free_infantry の最後の歩兵を割り当てる
         let assigned_index = same_island_infantry.unwrap_or_else(|| free.infantry.len() - 1);
         let (infantry, _, infantry_stats) = free.infantry.remove(assigned_index);
-        squad.members.insert(infantry);
+        draft.members.insert(infantry);
 
         if is_v3 && target_is_enemy_facility {
             assign_facility_capture_escorts(
                 world,
-                squad,
+                &mut draft.members,
                 *target,
                 infantry_stats.max_movement,
                 &mut free.combat,
             );
             active_facility_captures += 1;
         }
+        proposal.create(draft);
     }
 }
 
@@ -1400,7 +1384,7 @@ fn form_capture_squads(
 /// (鈍足の砲台や弾切れ・損傷ユニットを組み込むと部隊が機能しないため)
 fn assign_facility_capture_escorts(
     world: &World,
-    squad: &mut Squad,
+    members: &mut BTreeSet<Entity>,
     target: GridPosition,
     infantry_movement: u32,
     free_combat: &mut Vec<FreeUnit>,
@@ -1426,7 +1410,7 @@ fn assign_facility_capture_escorts(
             .map(|a| (a.ammo1, a.ammo2))
             .unwrap_or((u32::MAX, u32::MAX));
         if escort_is_eligible(&stats, infantry_movement, hp, ammo1, ammo2) {
-            squad.members.insert(entity);
+            members.insert(entity);
             assigned += 1;
         } else {
             rejected.push((entity, position, stats));
@@ -1438,8 +1422,7 @@ fn assign_facility_capture_escorts(
 
 /// D. 攻撃部隊の立ち上げ: 敵クラスタごとに攻撃Squadを作る。
 fn form_attack_squads(
-    world: &World,
-    manager: &mut SquadManager,
+    proposal: &mut AssignmentProposal,
     board: &FormationBoard,
     enemy_clusters: &[crate::ai::cluster::AttackCluster],
     free: &mut FreeUnits,
@@ -1449,18 +1432,19 @@ fn form_attack_squads(
         if free.combat.is_empty() {
             break;
         }
-        let exists = manager.squads.iter().any(|s| {
-            squad_is_mutable_by_player(world, s, board.player)
-                && s.mission_type == MissionType::Attack
-                && s.target == Some(cluster.center)
-        });
-        if exists {
+        if proposal.has_squad(MissionType::Attack, cluster.center) {
             continue;
         }
-        let squad = manager.create_owned_squad(MissionType::Attack, board.player);
-        squad.target = Some(cluster.center);
-        squad.phase = MissionPhase::Forming;
-        assign_nearest_combat_units(squad, board, cluster.center, &mut free.combat, turn_cache);
+        let mut draft = SquadDraft::new(MissionType::Attack, MissionPhase::Forming);
+        draft.target = Some(cluster.center);
+        assign_nearest_combat_units(
+            &mut draft.members,
+            board,
+            cluster.center,
+            &mut free.combat,
+            turn_cache,
+        );
+        proposal.create(draft);
     }
 }
 
@@ -1472,47 +1456,45 @@ const MAX_SQUAD_SIZE: usize = 3;
 /// 定員未満の既存Attack/Defense部隊のうち最も近いものへ吸収し、すべて定員なら
 /// 最も近い敵クラスタ（15ターン超なら最寄りの未所有・敵物件）へ新しい攻撃部隊を作る。
 fn absorb_surplus_combat_units(
-    world: &World,
-    manager: &mut SquadManager,
+    proposal: &mut AssignmentProposal,
     board: &FormationBoard,
     enemy_clusters: &[crate::ai::cluster::AttackCluster],
     free: &mut FreeUnits,
     turn_cache: &mut TurnDistanceCache,
 ) {
     while let Some((entity, pos, stats)) = free.combat.pop() {
-        if let Some(index) = nearest_open_squad(world, manager, board, pos, &stats, turn_cache) {
-            manager.squads[index].members.insert(entity);
+        if let Some(slot) = nearest_open_squad(proposal, board, pos, &stats, turn_cache) {
+            proposal.join(slot, entity);
             continue;
         }
         // 目標がまったく存在しない場合は放置（SoloFallback として機能）
         if let Some(target) = second_wave_target(board, enemy_clusters, pos, &stats, turn_cache) {
-            let squad = manager.create_owned_squad(MissionType::Attack, board.player);
-            squad.target = Some(target);
-            squad.phase = MissionPhase::Forming;
-            squad.members.insert(entity);
+            let mut draft = SquadDraft::new(MissionType::Attack, MissionPhase::Forming);
+            draft.target = Some(target);
+            draft.members.insert(entity);
+            proposal.create(draft);
         }
     }
 }
 
-/// 定員未満の既存Attack/Defense部隊のうち、目標へのターン距離が最も近いものの添字。
+/// 定員未満の既存Attack/Defense部隊（新設提案を含む）のうち、目標へのターン距離が最も近いもの。
 fn nearest_open_squad(
-    world: &World,
-    manager: &SquadManager,
+    proposal: &AssignmentProposal,
     board: &FormationBoard,
     pos: GridPosition,
     stats: &UnitStats,
     turn_cache: &mut TurnDistanceCache,
-) -> Option<usize> {
-    let mut best_index = None;
+) -> Option<SquadSlot> {
+    let mut best_slot = None;
     let mut min_dist = crate::ai::turn_distance::TurnDistance {
         turns: u32::MAX,
         used_mp: u32::MAX,
     };
-    for (index, squad) in manager.squads.iter().enumerate() {
-        if !squad_is_mutable_by_player(world, squad, board.player)
+    for (slot, squad) in proposal.squads() {
+        if !squad.mutable
             || !(squad.mission_type == MissionType::Attack
                 || squad.mission_type == MissionType::Defense)
-            || squad.members.len() >= MAX_SQUAD_SIZE
+            || squad.members >= MAX_SQUAD_SIZE
         {
             continue;
         }
@@ -1522,10 +1504,10 @@ fn nearest_open_squad(
         let dist = board.turn_distance(pos, target, stats, turn_cache);
         if dist < min_dist {
             min_dist = dist;
-            best_index = Some(index);
+            best_slot = Some(slot);
         }
     }
-    best_index
+    best_slot
 }
 
 /// 既存部隊がすべて定員のときに新設する第2波の目標。

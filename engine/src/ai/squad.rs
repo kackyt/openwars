@@ -11039,6 +11039,9 @@ mod tests {
 // 手番ごとの部隊再編の段と、通常／小規模V4の方策。
 mod formation;
 
+// 汎用編成の提案（Squadの新設・追加）と、1つの更新口での確定。
+mod assignment;
+
 // 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
 mod extended;
 #[allow(unused_imports)]
