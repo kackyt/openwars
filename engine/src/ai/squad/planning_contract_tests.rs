@@ -182,7 +182,7 @@ fn portfolio_and_capital_defense_hooks_keep_model_specific_behavior() {
 }
 
 #[test]
-fn generic_transport_uses_source_portfolio_and_preserves_property_fallback() {
+fn generic_transport_uses_adopted_portfolio_and_preserves_property_fallback() {
     let player = PlayerId(1);
     let source_target = GridPosition { x: 2, y: 0 };
     let adopted_target = GridPosition { x: 4, y: 0 };
@@ -198,8 +198,9 @@ fn generic_transport_uses_source_portfolio_and_preserves_property_fallback() {
     let ownership = HashMap::from_iter([(source_target, Some(player))]);
     assert_ne!(source, adopted);
     assert_eq!(
-        resolve_generic_transport_target(&source, IslandId(0), player, &properties, &ownership),
-        Some(source_target)
+        resolve_generic_transport_target(&adopted, IslandId(0), player, &properties, &ownership),
+        Some(adopted_target),
+        "元案の目標が自軍所有でも、採用案の目標を優先する"
     );
     assert_eq!(
         resolve_generic_transport_target(

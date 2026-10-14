@@ -427,8 +427,7 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
     // 盤面（unit・物件・地図）は再編の間に変わらないため、戦略分析と汎用編成で1つを共有する。
     let snapshot = PlayerBoard::observe(world, player);
 
-    // 2. 戦略分析と採用。採用portfolioはcache・campaign編成用。汎用輸送の地理的候補は、
-    // 引き続き元のanalysis.campaign_portfolio（提案のまま）を参照する。
+    // 2. 戦略分析と採用。cache・campaign編成・汎用輸送は同じ採用portfolioを参照する。
     let analysis = analyze_strategy_for_formation(world, &mut manager, &snapshot, is_v3, is_v4);
     let adopted =
         policy.adopt_portfolio(world, player, &manager, &analysis.campaign_portfolio, is_v4);
@@ -479,7 +478,7 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
         world,
         &mut proposal,
         &board,
-        &analysis.campaign_portfolio,
+        &adopted,
         &objectives,
         &mut free,
         &mut caches,
@@ -814,7 +813,7 @@ fn assign_generic_transports(
     world: &World,
     proposal: &mut AssignmentProposal,
     board: &FormationBoard,
-    source_portfolio: &IslandCampaignPortfolio,
+    adopted_portfolio: &IslandCampaignPortfolio,
     objectives: &[crate::ai::objectives::Objective],
     free: &mut FreeUnits,
     caches: &mut FormationCaches,
@@ -830,7 +829,7 @@ fn assign_generic_transports(
         }
         let mut to_assign = objective.needed_infantry.0;
         let target_position = resolve_generic_transport_target(
-            source_portfolio,
+            adopted_portfolio,
             objective.target_island,
             board.player,
             &board.island_properties,

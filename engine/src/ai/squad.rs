@@ -4262,16 +4262,16 @@ pub(crate) fn reconcile_v4_end_turn_reserves(world: &mut World, player_id: Playe
 /// 通常の占領候補順位で、生産施設を距離何マス分だけ優先するか（従来値）。
 const PRODUCTION_FACILITY_DIST_BONUS: usize = 6;
 
-/// 汎用輸送はRoadmap採用後のportfolioではなく、戦略分析で得た元portfolioの
-/// 地理的目標を使う。見つからない場合だけ、従来どおり島内の未所有物件へ戻す。
+/// 汎用輸送もcache・campaign編成と同じ採用portfolioの地理的目標を使う。
+/// 採用assignmentが見つからない場合は、島内の未所有物件へ戻す。
 fn resolve_generic_transport_target(
-    source_portfolio: &crate::ai::island_campaign::IslandCampaignPortfolio,
+    adopted_portfolio: &crate::ai::island_campaign::IslandCampaignPortfolio,
     island: crate::ai::islands::IslandId,
     player: PlayerId,
     island_properties: &HashMap<crate::ai::islands::IslandId, Vec<GridPosition>>,
     ownership: &HashMap<GridPosition, Option<PlayerId>>,
 ) -> Option<GridPosition> {
-    source_portfolio
+    adopted_portfolio
         .assignment_for(island)
         .map(|assignment| assignment.target_position)
         .or_else(|| {
