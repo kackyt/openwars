@@ -5,7 +5,7 @@
 //! 1. 前手番の掃除と再計画の準備（[`super::update_squads`]・Reserve解放）
 //! 2. 戦略分析と採用（[`PlanningPolicy::adopt_portfolio`]）
 //! 3. campaign編成（採用portfolioの防衛・攻勢と、V4の配備Squad）
-//! 4. 汎用編成（輸送・旧首都防衛・占領・攻撃・余剰吸収）。盤面の事実は [`FormationBoard`]
+//! 4. 汎用編成（輸送・占領・攻撃・余剰吸収）。盤面の事実は [`FormationBoard`]
 //! 5. 仕上げ（V4所属修復・所属の正規化・Roadmap観測）
 //!
 //! 通常（V2/V3・標準マップV4）と小規模マップV4の差は [`PlanningPolicy`] に集める。
@@ -83,14 +83,6 @@ impl PlanningPolicy {
                 assignment,
                 connectivity,
             ),
-        }
-    }
-
-    /// 敵クラスタへの旧来の首都防衛Squadを作るか（小規模V4は本拠防衛を別に持つ）。
-    pub(super) fn uses_legacy_capital_defense(self, is_v4: bool) -> bool {
-        match self {
-            Self::Standard => true,
-            Self::SmallMap => !is_v4,
         }
     }
 
@@ -492,15 +484,6 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
             &campaign.assignments,
             &mut free,
             &mut caches.connectivity,
-        );
-    }
-    if policy.uses_legacy_capital_defense(is_v4) {
-        form_capital_defense_squads(
-            &mut proposal,
-            &board,
-            &enemy_clusters,
-            &mut free,
-            &mut caches.turn_cache,
         );
     }
     form_capture_squads(
@@ -1212,50 +1195,6 @@ fn assign_nearest_combat_units(
     for _ in 0..assign_count {
         let (entity, _, _) = free_combat.remove(0);
         members.insert(entity);
-    }
-}
-
-/// B. 防衛部隊の立ち上げ: 自首都から5ターン以内の敵クラスタごとに防衛Squadを作る。
-fn form_capital_defense_squads(
-    proposal: &mut AssignmentProposal,
-    board: &FormationBoard,
-    enemy_clusters: &[crate::ai::cluster::AttackCluster],
-    free: &mut FreeUnits,
-    turn_cache: &mut TurnDistanceCache,
-) {
-    let Some(capital) = board.capital else {
-        return;
-    };
-    for cluster in enemy_clusters {
-        let turn_dist = calculate_turn_distance(
-            board.map,
-            board.registry,
-            &board.unit_positions,
-            (capital.x, capital.y),
-            (cluster.center.x, cluster.center.y),
-            crate::resources::MovementType::Infantry,
-            3,
-            1,
-            board.player,
-            turn_cache,
-        );
-        if turn_dist.turns > 5 {
-            continue;
-        }
-        // すでにこのクラスターを防衛目標としている部隊があるか
-        if proposal.has_squad(MissionType::Defense, cluster.center) {
-            continue;
-        }
-        let mut draft = SquadDraft::new(MissionType::Defense, MissionPhase::Forming);
-        draft.target = Some(cluster.center);
-        assign_nearest_combat_units(
-            &mut draft.members,
-            board,
-            cluster.center,
-            &mut free.combat,
-            turn_cache,
-        );
-        proposal.create(draft);
     }
 }
 

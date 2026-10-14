@@ -100,7 +100,7 @@ mod tests {
     /// ## 1. 首都防衛 (Capital Defense)
     /// - **ケース**: 敵ユニットが自軍首都の目の前に迫っている状況。
     /// - **期待結果 (V1)**: ユニットごとに貪欲に攻撃や移動を判断するため、首都をがら空きにして敵に突っ込むなど、防衛目標を優先しない行動をとる。
-    /// - **期待結果 (V2)**: 部隊（Squad）システムとビーム探索により、首都防衛（Defendミッション）を最優先と認識し、ユニットを首都周辺に待機させて防衛線を張る。
+    /// - **期待結果 (V2)**: 旧首都防衛を作らず、汎用Attack部隊が首都近傍の敵へ攻撃する。
     #[test]
     fn test_scenario_1_capital_defense() {
         let p1 = PlayerId(1);
@@ -125,9 +125,17 @@ mod tests {
         crate::ai::squad::plan_squads(&mut world_v2, p1);
         let cmd_v2 = execute_ai_turn_v2(&mut world_v2, p1);
         let cmd_str_v2 = cmd_v2.expect("V2 should take action");
+        let manager = world_v2.resource::<crate::ai::squad::SquadManager>();
         assert!(
-            cmd_str_v2.contains("GridPosition { x: 5, y: 5 }"),
-            "V2 should move to or stay at the capital (5,5) to defend"
+            manager
+                .squads
+                .iter()
+                .all(|squad| squad.mission_type != crate::ai::squad::MissionType::Defense),
+            "V2は首都近傍でも旧Defenseを作らない"
+        );
+        assert!(
+            cmd_str_v2.contains("Attack {"),
+            "旧首都防衛の待機ではなく、汎用Attackから敵へ攻撃する: {cmd_str_v2}"
         );
     }
 

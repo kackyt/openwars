@@ -148,7 +148,39 @@ fn capture_hooks_keep_main_input_order_and_extended_distance_order() {
 }
 
 #[test]
-fn portfolio_and_capital_defense_hooks_keep_model_specific_behavior() {
+fn generic_formation_does_not_create_legacy_capital_defense_even_for_v2() {
+    let mut world = super::tests::setup_test_world();
+    let player = PlayerId(1);
+    let mut settings = PlayerAiSettings::new();
+    settings.set_version(player, AiVersion::V2);
+    world.insert_resource(settings);
+    let capital = GridPosition { x: 0, y: 0 };
+    world.resource_mut::<Map>().set_terrain(capital.x, capital.y, Terrain::Capital).unwrap();
+    world.spawn((capital, Property::new(Terrain::Capital, Some(player), 100)));
+    let registry = world.resource::<MasterDataRegistry>();
+    let combat_stats = registry.create_unit_stats(&crate::resources::master_data::UnitName(
+        UnitType::Tank.as_str().to_owned(),
+    )).unwrap();
+    let enemy_stats = registry.create_unit_stats(&crate::resources::master_data::UnitName(
+        UnitType::Infantry.as_str().to_owned(),
+    )).unwrap();
+    let combat = world.spawn((Faction(player), GridPosition { x: 1, y: 0 }, combat_stats,
+        Health { current: 100, max: 100 })).id();
+    world.spawn((Faction(PlayerId(2)), GridPosition { x: 3, y: 0 }, enemy_stats,
+        Health { current: 100, max: 100 }));
+
+    plan_squads_with_policy(&mut world, player, PlanningPolicy::Standard);
+
+    let manager = world.resource::<SquadManager>();
+    assert!(manager.squads.iter().all(|squad| squad.mission_type != MissionType::Defense),
+        "campaignを持たないV2も、旧首都防衛を汎用編成から作らない");
+    assert!(manager.squads.iter().any(|squad|
+        squad.mission_type == MissionType::Attack && squad.members.contains(&combat)),
+        "旧防衛へ先取りせず、汎用の攻撃編成へ戦闘要員を渡す");
+}
+
+#[test]
+fn portfolio_adoption_keeps_model_specific_behavior() {
     let mut world = super::tests::setup_test_world();
     let manager = SquadManager::new();
     let portfolio = IslandCampaignPortfolio::default();
@@ -172,13 +204,6 @@ fn portfolio_and_capital_defense_hooks_keep_model_specific_behavior() {
         ),
         Cow::Owned(_)
     ));
-    for is_v4 in [false, true] {
-        assert!(PlanningPolicy::Standard.uses_legacy_capital_defense(is_v4));
-        assert_eq!(
-            PlanningPolicy::SmallMap.uses_legacy_capital_defense(is_v4),
-            !is_v4
-        );
-    }
 }
 
 #[test]
