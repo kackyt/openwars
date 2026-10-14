@@ -11,9 +11,10 @@
 //! 通常（V2/V3・標準マップV4）と小規模マップV4の差は [`PlanningPolicy`] に集める。
 
 use super::*;
+use crate::ai::context::board::{BoardUnit, PlayerBoard};
 use crate::ai::island_campaign::{IslandCampaignAssignment, IslandCampaignPortfolio};
 use crate::ai::islands::{IslandId, IslandMap};
-use crate::ai::strategy::ProductionStrategy;
+use crate::ai::strategy::{ProductionStrategy, analyze_strategy_on_board};
 use crate::systems::movement::OccupantInfo;
 use std::borrow::Cow;
 
@@ -212,14 +213,16 @@ struct CampaignFormation {
     paused_islands: HashSet<IslandId>,
 }
 
-/// 汎用編成で共有する読み取り専用の盤面の事実。
-struct FormationBoard {
+/// 汎用編成で共有する読み取り専用の盤面の事実。地図・unit・物件は [`PlayerBoard`] から借りる。
+struct FormationBoard<'a> {
     player: PlayerId,
     is_v3: bool,
-    map: Map,
-    registry: MasterDataRegistry,
-    island_map: IslandMap,
-    /// 経路探索用の占有情報（搭載中のunitを除く）。
+    map: &'a Map,
+    registry: &'a MasterDataRegistry,
+    island_map: &'a IslandMap,
+    /// 盤面snapshot（汎用編成のunit走査に使う）。
+    snapshot: &'a PlayerBoard,
+    /// 経路探索用の占有情報（編成の占有モデル: 搭載中のunitを除く）。
     unit_positions: HashMap<(usize, usize), OccupantInfo>,
     /// 物件の座標と所有者。
     ownership: HashMap<GridPosition, Option<PlayerId>>,
@@ -233,62 +236,22 @@ struct FormationBoard {
     /// 島ごとの敵の工場・首都の数と、敵物件のある島。
     enemy_production_count: HashMap<IslandId, u32>,
     enemy_owned_islands: HashSet<IslandId>,
-    /// 自軍首都。
+    /// 自軍首都（列挙順で最初のもの）。
     capital: Option<GridPosition>,
 }
 
-impl FormationBoard {
-    fn observe(world: &mut World, player: PlayerId, is_v3: bool) -> Self {
-        let map = world.resource::<Map>().clone();
-        let registry = world
-            .get_resource::<MasterDataRegistry>()
-            .cloned()
-            .unwrap_or_default();
-        let island_map = world
-            .get_resource::<IslandMap>()
-            .cloned()
-            .unwrap_or_else(|| IslandMap::analyze(&map));
-
-        let mut unit_positions = HashMap::default();
-        let mut q_all_units = world.query::<(
-            &Faction,
-            &GridPosition,
-            &UnitStats,
-            Option<&crate::components::Transporting>,
-            Option<&crate::components::CargoCapacity>,
-        )>();
-        for (faction, pos, stats, transporting, cargo) in q_all_units.iter(world) {
-            if transporting.is_some() {
-                continue;
-            }
-            unit_positions.insert(
-                (pos.x, pos.y),
-                OccupantInfo {
-                    player_id: faction.0,
-                    is_transport: stats.max_cargo > 0,
-                    unit_type: stats.unit_type,
-                    loadable_types: stats.loadable_unit_types.clone(),
-                    free_slots: cargo
-                        .map(|capacity| capacity.max.saturating_sub(capacity.loaded.len() as u32))
-                        .unwrap_or(0),
-                },
-            );
-        }
-
-        let mut ownership = HashMap::default();
-        let mut capital = None;
-        {
-            let mut q_props = world.query::<(&GridPosition, &Property)>();
-            for (pos, prop) in q_props.iter(world) {
-                ownership.insert(*pos, prop.owner_id);
-                if capital.is_none()
-                    && prop.terrain == Terrain::Capital
-                    && prop.owner_id == Some(player)
-                {
-                    capital = Some(*pos);
-                }
-            }
-        }
+impl<'a> FormationBoard<'a> {
+    fn observe(snapshot: &'a PlayerBoard, is_v3: bool) -> Self {
+        let player = snapshot.player;
+        let map = &snapshot.map;
+        let island_map = &snapshot.island_map;
+        let unit_positions = snapshot.formation_occupancy();
+        let ownership = snapshot.property_ownership();
+        let capital = snapshot
+            .properties
+            .iter()
+            .find(|property| property.terrain == Terrain::Capital && property.owner == Some(player))
+            .map(|property| property.position);
         let (base, targets) = island_map.classify_islands(player, &ownership);
         let base_islands: HashSet<_> = base.iter().copied().collect();
         let target_islands = targets.to_vec();
@@ -324,8 +287,9 @@ impl FormationBoard {
             player,
             is_v3,
             map,
-            registry,
+            registry: &snapshot.registry,
             island_map,
+            snapshot,
             unit_positions,
             ownership,
             base_islands,
@@ -338,11 +302,20 @@ impl FormationBoard {
         }
     }
 
-    fn capture_context<'a>(&'a self, infantry: &'a [FreeUnit]) -> CapturePlanningContext<'a> {
+    /// 自軍以外のunit（搭載中を含む）。
+    fn enemy_units(&self) -> impl Iterator<Item = &'a BoardUnit> + '_ {
+        let player = self.player;
+        self.snapshot
+            .units
+            .iter()
+            .filter(move |unit| unit.owner != player)
+    }
+
+    fn capture_context<'b>(&'b self, infantry: &'b [FreeUnit]) -> CapturePlanningContext<'b> {
         CapturePlanningContext {
-            map: &self.map,
-            registry: &self.registry,
-            island_map: &self.island_map,
+            map: self.map,
+            registry: self.registry,
+            island_map: self.island_map,
             infantry,
             capital: self.capital,
             is_v3: self.is_v3,
@@ -358,8 +331,8 @@ impl FormationBoard {
         turn_cache: &mut TurnDistanceCache,
     ) -> crate::ai::turn_distance::TurnDistance {
         calculate_turn_distance(
-            &self.map,
-            &self.registry,
+            self.map,
+            self.registry,
             &self.unit_positions,
             (from.x, from.y),
             (to.x, to.y),
@@ -381,9 +354,8 @@ struct FreeUnits {
 
 impl FreeUnits {
     fn collect(
-        world: &mut World,
+        board: &FormationBoard<'_>,
         manager: &SquadManager,
-        player: PlayerId,
         reserved: &HashSet<Entity>,
     ) -> Self {
         // 他の部隊にすでに割り当て済みの全メンバー
@@ -399,37 +371,30 @@ impl FreeUnits {
             infantry: Vec::new(),
             transports: Vec::new(),
         };
-        let mut q_my_units = world.query::<(
-            Entity,
-            &Faction,
-            &GridPosition,
-            &UnitStats,
-            Option<&crate::components::Transporting>,
-            Option<&crate::components::Fuel>,
-            Option<&crate::components::CargoCapacity>,
-        )>();
-        for (entity, faction, pos, stats, transporting, fuel, cargo) in q_my_units.iter(world) {
-            if faction.0 != player
+        for unit in &board.snapshot.units {
+            let entity = unit.entity;
+            if unit.owner != board.player
                 || busy_entities.contains(&entity)
                 || reserved.contains(&entity)
                 || manager.solo_fallbacks.contains(&entity)
-                || transporting.is_some()
-                || fuel.is_some_and(|fuel| fuel.current == 0)
+                || unit.transported
+                || unit.fuel == Some(0)
             {
                 continue;
             }
+            let stats = &unit.stats;
             let is_transport = stats.unit_type == UnitType::TransportHelicopter
                 || stats.unit_type == UnitType::Lander;
             let is_infantry =
                 stats.unit_type == UnitType::Infantry || stats.unit_type == UnitType::Mech;
             if is_transport {
-                if cargo.is_some_and(|capacity| capacity.max > 0) {
-                    free.transports.push((entity, *pos, stats.clone()));
+                if unit.cargo.is_some_and(|capacity| capacity.max > 0) {
+                    free.transports.push((entity, unit.position, stats.clone()));
                 }
             } else if is_infantry {
-                free.infantry.push((entity, *pos, stats.clone()));
+                free.infantry.push((entity, unit.position, stats.clone()));
             } else {
-                free.combat.push((entity, *pos, stats.clone()));
+                free.combat.push((entity, unit.position, stats.clone()));
             }
         }
         free
@@ -454,10 +419,12 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
     policy.before_manager_removal(world, player, is_v4);
     let mut manager = world.remove_resource::<SquadManager>().unwrap_or_default();
     prepare_squads_for_replanning(world, &mut manager, player, is_v4);
+    // 盤面（unit・物件・地図）は再編の間に変わらないため、戦略分析と汎用編成で1つを共有する。
+    let snapshot = PlayerBoard::observe(world, player);
 
     // 2. 戦略分析と採用。採用portfolioはcache・campaign編成用。汎用輸送の地理的候補は、
     // 引き続き元のstrategy.campaign_portfolioを参照するためstrategyを置換しない。
-    let strategy = analyze_strategy_for_formation(world, &mut manager, player, is_v3, is_v4);
+    let strategy = analyze_strategy_for_formation(world, &mut manager, &snapshot, is_v3, is_v4);
     let adopted =
         policy.adopt_portfolio(world, player, &manager, &strategy.campaign_portfolio, is_v4);
     let enemy_clusters = detect_enemy_clusters(world, player);
@@ -486,8 +453,8 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
     }
 
     // 4. 汎用編成
-    let board = FormationBoard::observe(world, player, is_v3);
-    let mut free = FreeUnits::collect(world, &manager, player, &campaign.reserved_entities);
+    let board = FormationBoard::observe(&snapshot, is_v3);
+    let mut free = FreeUnits::collect(&board, &manager, &campaign.reserved_entities);
     let mut caches = FormationCaches::default();
     let objectives = generic_transport_objectives(&board, &campaign);
     assign_generic_transports(
@@ -563,10 +530,11 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
 fn analyze_strategy_for_formation(
     world: &mut World,
     manager: &mut SquadManager,
-    player: PlayerId,
+    snapshot: &PlayerBoard,
     is_v3: bool,
     is_v4: bool,
 ) -> ProductionStrategy {
+    let player = snapshot.player;
     // V3以降は防衛もcampaign portfolioの通常優先度・排他割当で扱う。
     // V4のdeploymentだけは生産目的が解消されるまで通常free poolから保護する。
     let deployment_entities = if is_v3 && is_v4 {
@@ -578,11 +546,8 @@ fn analyze_strategy_for_formation(
         HashSet::default()
     };
     world.insert_resource(std::mem::take(manager));
-    let strategy = if is_v3 {
-        analyze_strategy_with_reserved_entities(world, player, &deployment_entities)
-    } else {
-        analyze_strategy(world, player)
-    };
+    // V2は予約なし（空集合）で分析する。
+    let strategy = analyze_strategy_on_board(world, snapshot, &deployment_entities);
     *manager = world.remove_resource::<SquadManager>().unwrap_or_default();
     strategy
 }
@@ -725,7 +690,7 @@ fn generic_transport_objectives(
             &props_with_terrain,
             distance_to_nearest_base,
             enemy_prod,
-            &board.registry,
+            board.registry,
         ));
     }
 
@@ -759,23 +724,17 @@ fn generic_transport_objectives(
 }
 
 /// 目標島の敵兵種（重複なし・兵種順）。
-fn enemy_types_on_island(
-    world: &mut World,
-    board: &FormationBoard,
-    island: IslandId,
-) -> Vec<UnitType> {
-    let mut enemy_types = Vec::new();
-    let mut enemy_query = world.query::<(&GridPosition, &Faction, &UnitStats)>();
-    for (position, faction, stats) in enemy_query.iter(world) {
-        if faction.0 != board.player
-            && board
+fn enemy_types_on_island(board: &FormationBoard<'_>, island: IslandId) -> Vec<UnitType> {
+    let mut enemy_types: Vec<_> = board
+        .enemy_units()
+        .filter(|unit| {
+            board
                 .island_map
-                .get_island_at(position)
+                .get_island_at(&unit.position)
                 .is_some_and(|candidate| candidate.id == island)
-        {
-            enemy_types.push(stats.unit_type);
-        }
-    }
+        })
+        .map(|unit| unit.stats.unit_type)
+        .collect();
     enemy_types.sort_by_key(|unit_type| *unit_type as u8);
     enemy_types.dedup();
     enemy_types
@@ -783,7 +742,7 @@ fn enemy_types_on_island(
 
 /// 1つの目標島へ向かう汎用輸送のカーゴ探索条件。
 struct CargoSearch<'a> {
-    board: &'a FormationBoard,
+    board: &'a FormationBoard<'a>,
     target_island: IslandId,
     target_position: Option<GridPosition>,
     enemy_types: &'a [UnitType],
@@ -806,9 +765,9 @@ impl CargoSearch<'_> {
             &transport.2,
             self.target_island,
             self.target_position,
-            &board.island_map,
-            &board.map,
-            &board.registry,
+            board.island_map,
+            board.map,
+            board.registry,
             &board.unit_positions,
             board.player,
             &mut caches.turn_cache,
@@ -847,7 +806,7 @@ fn assign_generic_transports(
             &board.island_properties,
             &board.ownership,
         );
-        let enemy_types = enemy_types_on_island(world, board, objective.target_island);
+        let enemy_types = enemy_types_on_island(board, objective.target_island);
         let damage_chart = world
             .get_resource::<crate::resources::DamageChart>()
             .cloned();
@@ -1043,18 +1002,10 @@ fn unload_unreserved_loaded_transports(
 }
 
 /// 島ごとの敵unit数（搭載中を除く）。
-fn enemy_count_by_island(world: &mut World, board: &FormationBoard) -> HashMap<IslandId, usize> {
+fn enemy_count_by_island(board: &FormationBoard<'_>) -> HashMap<IslandId, usize> {
     let mut counts = HashMap::default();
-    let mut enemy_query = world.query::<(
-        &Faction,
-        &GridPosition,
-        Option<&crate::components::Transporting>,
-    )>();
-    for (faction, position, transporting) in enemy_query.iter(world) {
-        if faction.0 == board.player || transporting.is_some() {
-            continue;
-        }
-        if let Some(island) = board.island_map.get_island_at(position) {
+    for unit in board.enemy_units().filter(|unit| !unit.transported) {
+        if let Some(island) = board.island_map.get_island_at(&unit.position) {
             counts
                 .entry(island.id)
                 .and_modify(|count: &mut usize| *count = count.saturating_add(1))
@@ -1078,7 +1029,7 @@ fn assign_capture_depth_transports(
     if free.transports.is_empty() || free.infantry.is_empty() {
         return;
     }
-    let enemy_counts = enemy_count_by_island(world, board);
+    let enemy_counts = enemy_count_by_island(board);
     for assignment in campaign_assignments {
         if free.transports.is_empty() || free.infantry.is_empty() {
             break;
@@ -1140,8 +1091,8 @@ fn load_capture_depth_transport(
             .find(|island| island.id == assignment.island_id)
             .and_then(|island| {
                 get_target_position_for_island(
-                    &board.map,
-                    &board.registry,
+                    board.map,
+                    board.registry,
                     island,
                     *position,
                     stats.movement_type,
@@ -1259,8 +1210,8 @@ fn form_capital_defense_squads(
     };
     for cluster in enemy_clusters {
         let turn_dist = calculate_turn_distance(
-            &board.map,
-            &board.registry,
+            board.map,
+            board.registry,
             &board.unit_positions,
             (capital.x, capital.y),
             (cluster.center.x, cluster.center.y),

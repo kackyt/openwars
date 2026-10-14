@@ -9,7 +9,6 @@ use crate::ai::operation_assignment::{
 };
 use crate::ai::planning::decision::AdoptedTurnPortfolio;
 use crate::ai::runtime::state::AiTurnProgress;
-use crate::ai::strategy::{analyze_strategy, analyze_strategy_with_reserved_entities};
 use crate::ai::turn_distance::{
     TerrainConnectivity, TurnDistanceCache, calculate_all_turn_distances, calculate_turn_distance,
     is_terrain_reachable,
@@ -5417,6 +5416,7 @@ pub fn execute_transport_squad_step(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::strategy::analyze_strategy;
     use crate::components::*;
     use crate::resources::master_data::*;
     use crate::resources::*;
