@@ -273,3 +273,84 @@ fn capital_is_threatened(
             <= 2
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::components::{Faction, PlayerId, Property};
+    use crate::resources::{GridTopology, UnitType};
+    use bevy_ecs::prelude::*;
+
+    fn tank() -> UnitStats {
+        UnitStats {
+            unit_type: UnitType::Tank,
+            max_movement: 6,
+            movement_type: MovementType::Tank,
+            ..UnitStats::mock()
+        }
+    }
+
+    /// 自首都の近くに敵戦車、遠くに中立工場と敵工場がある盤面。
+    fn threatened_world() -> World {
+        let mut world = World::new();
+        world.insert_resource(Map::new(15, 15, Terrain::Plains, GridTopology::Square));
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+        let (p1, p2) = (PlayerId(1), PlayerId(2));
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(p1), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 7, y: 7 },
+            Property::new(Terrain::Factory, None, 100),
+        ));
+        world.spawn((
+            GridPosition { x: 14, y: 14 },
+            Property::new(Terrain::Factory, Some(p2), 100),
+        ));
+        world.spawn((GridPosition { x: 2, y: 0 }, Faction(p1), tank()));
+        world.spawn((GridPosition { x: 1, y: 1 }, Faction(p2), tank()));
+        world
+    }
+
+    #[test]
+    fn capital_threat_sets_defense_and_targets_own_capital() {
+        let mut world = threatened_world();
+        let board = PlayerBoard::observe(&mut world, PlayerId(1));
+
+        let situation = assess(&board);
+
+        assert_eq!(situation.phase, GamePhase::Defense);
+        assert_eq!(
+            situation.priority_targets,
+            vec![GridPosition { x: 0, y: 0 }]
+        );
+        assert!(
+            situation
+                .unowned_properties
+                .contains(&GridPosition { x: 7, y: 7 })
+        );
+        assert!(
+            situation
+                .enemy_properties
+                .contains(&GridPosition { x: 14, y: 14 })
+        );
+        assert_eq!(situation.my_units.len(), 1);
+        assert_eq!(situation.enemy_units.len(), 1);
+    }
+
+    #[test]
+    fn situation_matches_production_strategy_analysis() {
+        // 部隊再編は状況判断だけを使い、生産判断は同じ結果に生産需要を加える。
+        let mut world = threatened_world();
+        let board = PlayerBoard::observe(&mut world, PlayerId(1));
+        let situation = assess(&board);
+
+        let strategy = crate::ai::strategy::analyze_strategy(&mut world, PlayerId(1));
+
+        assert_eq!(strategy.phase, situation.phase);
+        assert_eq!(strategy.priority_targets, situation.priority_targets);
+        assert_eq!(strategy.unowned_properties, situation.unowned_properties);
+        assert_eq!(strategy.enemy_properties, situation.enemy_properties);
+    }
+}
