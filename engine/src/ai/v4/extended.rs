@@ -5686,7 +5686,9 @@ mod tests {
                 assert_eq!(effective, current.slots);
                 assert_eq!(
                     effective.deficit_ratio(SlotKind::Capture, &current.filled),
-                    current.slots.deficit_ratio(SlotKind::Capture, &current.filled)
+                    current
+                        .slots
+                        .deficit_ratio(SlotKind::Capture, &current.filled)
                 );
                 let competing = operation(
                     OperationKind::Capture,

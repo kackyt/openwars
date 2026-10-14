@@ -131,8 +131,11 @@ impl<S: Copy + Eq> DemandLedger<S> {
             demand.amount = amount;
             demand.reason = reason;
         } else {
-            self.effective_demands
-                .push(EffectiveDemand { key, amount, reason });
+            self.effective_demands.push(EffectiveDemand {
+                key,
+                amount,
+                reason,
+            });
         }
     }
 

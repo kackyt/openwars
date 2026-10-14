@@ -3325,7 +3325,8 @@ type SlotLedger = DemandLedger<SlotKind>;
 /// 未充足率と配分対象の選択に使う。要求そのものは `Operation::slots` に残す。
 fn allocation_slots(op: &Operation, index: usize, ledger: &SlotLedger) -> OperationSlots {
     let mut slots = op.slots;
-    slots.capture_units = ledger.effective_requirement(index, SlotKind::Capture, slots.capture_units);
+    slots.capture_units =
+        ledger.effective_requirement(index, SlotKind::Capture, slots.capture_units);
     slots.transport_slots =
         ledger.effective_requirement(index, SlotKind::Transport, slots.transport_slots);
     slots.intercept_units =
