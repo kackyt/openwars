@@ -165,23 +165,30 @@ impl AssignmentProposal {
         );
         debug_assert!(self.has_unique_entities(), "同じEntityを2回割り当てる提案");
         let mut delta = AssignmentDelta::default();
+        // 提案Squadの所属は、SquadIdで指す提案storeの確定口から登録する。
+        let mut proposals = OperationLedger::proposals(manager);
+        let mut slot_ids = proposals.squad_ids();
         for op in self.ops {
             match op {
                 AssignmentOp::Create(draft) => {
-                    let squad = manager.create_owned_squad(draft.mission_type, self.player);
-                    squad.members = draft.members;
+                    let squad = proposals.create_owned(
+                        draft.mission_type,
+                        self.player,
+                        draft.members,
+                        draft.transport_entity,
+                        draft.cargo_entities,
+                    );
+                    slot_ids.push(squad.id);
                     squad.target = draft.target;
                     squad.target_island = draft.target_island;
                     squad.phase = draft.phase;
-                    squad.transport_entity = draft.transport_entity;
-                    squad.cargo_entities = draft.cargo_entities;
                     squad.pickup_position = draft.pickup_position;
                     squad.allow_partial_departure = draft.allow_partial_departure;
                     squad.departure_authorized = draft.departure_authorized;
                     delta.created.push(squad.id);
                 }
                 AssignmentOp::Join { slot, entity } => {
-                    manager.squads[slot.0].members.insert(entity);
+                    proposals.join(slot_ids[slot.0], entity);
                     delta.joined += 1;
                 }
             }
@@ -242,6 +249,27 @@ mod tests {
         assert_eq!(squad.owner_id, Some(player));
         assert_eq!(squad.members, BTreeSet::from([first, second]));
         assert_eq!(squad.target, Some(GridPosition { x: 3, y: 4 }));
+
+        // S1b: 汎用編成の所属はkeyed確定口から提案storeへ同時に書かれ、
+        // Squad側rosterからの取込み（未同期）を必要としない。
+        assert!(!manager.has_unsynced_rosters());
+        let store = manager.synced_proposals();
+        let created_id = delta.created[0];
+        assert_eq!(
+            store.proposed(created_id).unwrap().members,
+            BTreeSet::from([first, second])
+        );
+        assert_eq!(
+            store.proposed(existing).unwrap().members,
+            BTreeSet::from([third])
+        );
+        assert_eq!(
+            store.candidates(second),
+            &[(
+                created_id,
+                crate::ai::operation_assignment::OperationUnitRole::Member
+            )]
+        );
     }
 
     #[test]

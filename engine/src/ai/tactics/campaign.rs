@@ -80,3 +80,69 @@ pub(crate) fn campaign_mission_allows_capture(mission: &crate::ai::squad::Missio
         crate::ai::squad::MissionType::Capture | crate::ai::squad::MissionType::Attack
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::ai_version::{AiVersion, PlayerAiSettings};
+    use crate::ai::islands::IslandId;
+    use crate::ai::operation_assignment::{
+        OperationOwner, OperationUnitRole, UnitOperationAssignment, UnitOperationRegistry,
+    };
+    use crate::ai::planning::assignment::LedgerKey;
+    use crate::ai::squad::{MissionType, SquadManager};
+
+    /// S1: 作戦ownerだけを残して具体Squadを失ったEntityは、履歴のSquadIdがまだ一覧に
+    /// 残っていても、そのSquadの任務・目標を受け取らない（Errで再接続待ちになる）。
+    /// 現在bindingを持つEntityは従来どおりSquadの任務・目標を受け取る。
+    /// small_mapの行動選択はこのErrで、DAG指令が無ければ候補を出さない（tactics/small_map.rs）。
+    #[test]
+    fn detached_campaign_entity_does_not_read_history_squad() {
+        let player = PlayerId(1);
+        let owner = OperationOwner::Campaign {
+            player_id: player,
+            island_id: IslandId(0),
+        };
+        let [bound, detached] = [Entity::from_raw(1), Entity::from_raw(2)];
+        let mut manager = SquadManager::default();
+        let squad = manager.create_owned_squad(MissionType::Capture, player);
+        squad.target = Some(GridPosition { x: 3, y: 4 });
+        squad.members.insert(bound);
+        let squad_id = squad.id;
+        let mut registry = UnitOperationRegistry::default();
+        for entity in [bound, detached] {
+            registry.assign(
+                entity,
+                UnitOperationAssignment {
+                    owner,
+                    squad_id: Some(squad_id),
+                    role: OperationUnitRole::Member,
+                    assigned_turn: 1,
+                },
+            );
+        }
+        registry.apply_detach_squad(LedgerKey::fixture(), detached);
+        let mut settings = PlayerAiSettings::new();
+        settings.set_version(player, AiVersion::V4);
+        let mut world = World::new();
+        world.insert_resource(settings);
+        world.insert_resource(registry);
+
+        let context = campaign_action_context(&world, player, bound, &manager)
+            .expect("現在bindingのSquadを解決する")
+            .expect("V4のCampaign所属");
+        assert_eq!(context.mission_type, MissionType::Capture);
+        assert!(campaign_action_context(&world, player, detached, &manager).is_err());
+        // DAG指令もSquadIdで引くため、現在bindingの無いEntityには指令が無い。
+        assert_eq!(
+            crate::ai::v4::capital_route_tactical_target(&world, player, detached),
+            None
+        );
+        assert_eq!(
+            world
+                .resource::<UnitOperationRegistry>()
+                .previous_squad(detached),
+            Some(squad_id)
+        );
+    }
+}

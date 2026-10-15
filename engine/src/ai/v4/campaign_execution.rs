@@ -1,5 +1,10 @@
 use crate::ai::islands::IslandId;
-use crate::ai::squad::{MissionPhase, MissionType, SquadId, SquadManager};
+#[cfg(test)]
+use crate::ai::planning::assignment::OperationLedger;
+use crate::ai::planning::assignment::{
+    ProducedAssignmentDelta, ProducedAssignmentProposal, ProducedJoin, ProducedSquad,
+};
+use crate::ai::squad::{MissionType, SquadId, SquadManager};
 use crate::collections::HashMap;
 use crate::components::{GridPosition, PlayerId};
 use crate::events::{ProduceUnitCommand, UnitProducedEvent};
@@ -294,69 +299,114 @@ impl V4CampaignExecutionRegistry {
         }
     }
 
-    /// Campaign生産の受入slotを、完成Eventと同じ更新で実Squadへ解決する。
+    /// Campaign生産の受入slotを、受入Squadへの所属提案にする（SquadManagerは変更しない）。
     ///
     /// 目標座標は次回Roadmap TurnPlanが詳細化するが、島・役割・Forming状態はここで
     /// 固定する。輸送unitも独立した汎用unitにはせず、明示Transport Squadに残す。
-    fn resolve_produced_slot(&mut self, entity: Entity, manager: &mut SquadManager) {
-        let Some(index) = self.records.iter().position(|record| {
+    /// 同じ受付で同じrecordが先に提案済みなら、そのSquad（確定前）へ合流させる。
+    fn propose_produced_slot(
+        &self,
+        entity: Entity,
+        manager: &SquadManager,
+        proposal: &mut ProducedAssignmentProposal,
+        batch: &mut HashMap<usize, usize>,
+    ) -> Option<ProducedRecordReceipt> {
+        let index = self.records.iter().position(|record| {
             record.entity == Some(entity)
                 && record.status == CampaignProductionStatus::Produced
                 && record.forming_slot.is_some()
-        }) else {
-            return;
-        };
-        let record = &mut self.records[index];
-        let squad_index = record.squad_id.and_then(|squad_id| {
-            manager
-                .squads
-                .iter()
-                .position(|squad| squad.id == squad_id && squad.owner_id == Some(record.player_id))
-        });
-        let squad = if let Some(index) = squad_index {
-            &mut manager.squads[index]
-        } else {
-            manager.create_owned_squad(
-                match record.role {
-                    CampaignProductionRole::Transport => MissionType::Transport,
-                    CampaignProductionRole::Capture => MissionType::Capture,
-                    CampaignProductionRole::Combat => MissionType::Attack,
-                },
-                record.player_id,
-            )
-        };
-        squad.members.insert(entity);
-        squad.target_island = Some(record.island_id);
-        squad.target = record.mission_target;
-        squad.phase = MissionPhase::Forming;
-        record.squad_id = Some(squad.id);
+        })?;
+        let record = &self.records[index];
         // slotはrecordと同じ寿命を持つ。debug時に発番漏れを検知できるよう利用する。
         debug_assert!(
             record
                 .forming_slot
                 .is_some_and(|slot| slot.0 < self.next_forming_slot)
         );
+        let mission = match record.role {
+            CampaignProductionRole::Transport => MissionType::Transport,
+            CampaignProductionRole::Capture => MissionType::Capture,
+            CampaignProductionRole::Combat => MissionType::Attack,
+        };
+        let squad = if let Some(join) = batch.get(&index) {
+            ProducedSquad::Proposed(*join)
+        } else if let Some(squad_id) = record.squad_id.filter(|squad_id| {
+            manager
+                .squads
+                .iter()
+                .any(|squad| squad.id == *squad_id && squad.owner_id == Some(record.player_id))
+        }) {
+            ProducedSquad::Existing(squad_id)
+        } else {
+            ProducedSquad::Create(mission.clone())
+        };
+        let join = proposal.propose(ProducedJoin {
+            player: record.player_id,
+            entity,
+            squad,
+            fallback_mission: mission,
+            target: record.mission_target,
+            target_island: Some(record.island_id),
+        });
+        batch.insert(index, join);
+        Some(ProducedRecordReceipt {
+            record: index,
+            join,
+        })
+    }
+
+    /// テスト用: 1体のslotを提案→確定→書戻しまで行う。
+    #[cfg(test)]
+    fn resolve_produced_slot(&mut self, entity: Entity, manager: &mut SquadManager) {
+        let mut proposal = ProducedAssignmentProposal::default();
+        let receipt =
+            self.propose_produced_slot(entity, manager, &mut proposal, &mut HashMap::default());
+        let delta = OperationLedger::commit_produced(manager, proposal);
+        if let Some(receipt) = receipt {
+            self.records[receipt.record].squad_id = Some(delta.squad_for(receipt.join));
+        }
     }
 }
 
-/// 生産完了Eventを島作戦の発注意図へ照合する。
-pub fn reconcile_campaign_production_system(
-    match_state: Res<crate::resources::MatchState>,
-    mut produced: EventReader<UnitProducedEvent>,
-    registry: Option<ResMut<V4CampaignExecutionRegistry>>,
-    mut manager: Option<ResMut<SquadManager>>,
-) {
-    let Some(mut registry) = registry else {
-        return;
-    };
-    let turn = match_state.current_turn_number.0;
-    for event in produced.read() {
+/// campaign生産recordの所属提案と、確定後に書き戻すrecord位置。
+#[derive(Debug)]
+pub(super) struct ProducedRecordReceipt {
+    record: usize,
+    join: usize,
+}
+
+/// 生産完了Eventを島作戦の発注意図へ照合し、受入slotの所属を提案する。
+pub(super) fn propose_produced_events(
+    events: &[&UnitProducedEvent],
+    turn: u32,
+    registry: &mut V4CampaignExecutionRegistry,
+    manager: Option<&SquadManager>,
+    proposal: &mut ProducedAssignmentProposal,
+) -> Vec<ProducedRecordReceipt> {
+    let mut receipts = Vec::new();
+    let mut batch = HashMap::default();
+    for event in events {
         registry.assign_produced(event, turn);
-        // 予約のない通常発注はresolve側で除外する。両経路が混在しても他方の
+        // 予約のない通常発注はpropose側で除外する。両経路が混在しても他方の
         // プレイヤーを即時編成せず、同じEventの再受信でも既存Squadを再利用する。
-        if let Some(manager) = manager.as_deref_mut() {
-            registry.resolve_produced_slot(event.entity, manager);
+        if let Some(manager) = manager
+            && let Some(receipt) =
+                registry.propose_produced_slot(event.entity, manager, proposal, &mut batch)
+        {
+            receipts.push(receipt);
         }
+    }
+    receipts
+}
+
+/// 所属確定後の受入SquadIdを、提案順にcampaign生産recordへ書き戻す。
+pub(super) fn bind_produced_squads(
+    registry: &mut V4CampaignExecutionRegistry,
+    receipts: &[ProducedRecordReceipt],
+    delta: &ProducedAssignmentDelta,
+) {
+    for receipt in receipts {
+        registry.records[receipt.record].squad_id = Some(delta.squad_for(receipt.join));
     }
 }
 
@@ -409,7 +459,8 @@ mod tests {
                 entity,
             });
             let mut schedule = Schedule::default();
-            schedule.add_systems(reconcile_campaign_production_system);
+            schedule
+                .add_systems(crate::ai::v4::production_events::reconcile_production_events_system);
             schedule.run(&mut world);
             let record = &world.resource::<V4CampaignExecutionRegistry>().records[0];
             assert_eq!(record.status, CampaignProductionStatus::Produced);
@@ -478,7 +529,7 @@ mod tests {
         });
         world.init_resource::<Events<UnitProducedEvent>>();
         let mut schedule = Schedule::default();
-        schedule.add_systems(reconcile_campaign_production_system);
+        schedule.add_systems(crate::ai::v4::production_events::reconcile_production_events_system);
         // Systemは経路やCodePathRegistryを参照しないことも確認する。
         let _guard = crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
         for _ in 0..2 {

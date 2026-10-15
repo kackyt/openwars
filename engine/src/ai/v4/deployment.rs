@@ -5,6 +5,10 @@
 //! 優先敵が有効な間だけ汎用目標探索から保護する。
 
 use crate::ai::islands::IslandMap;
+use crate::ai::planning::assignment::{
+    OperationLedger, ProducedAssignmentDelta, ProducedAssignmentProposal, ProducedJoin,
+    ProducedSquad,
+};
 use crate::ai::squad::{MissionPhase, MissionType, SquadId, SquadManager};
 use crate::ai::turn_distance::TerrainConnectivity;
 use crate::ai::v4::operation::SlotKind;
@@ -290,58 +294,90 @@ impl V4DeploymentRegistry {
         forming_slot
     }
 
-    /// 生産完了直後に予約slotを実Squadへ解決する。
+    /// 生産完了直後の予約slotを、受入Squadへの所属提案にする（SquadManagerは変更しない）。
     ///
     /// 実Entityは生成手番に行動できないが、次の再編まで`None`所属にしない。対象敵の
     /// 再探索など戦術的な詳細は次手番の`prepare_deployment_squads`が更新する。
+    /// 同じ受付で同じslotが先に提案済みなら、そのSquad（確定前）へ合流させる。
+    fn propose_produced_slot(
+        &self,
+        entity: Entity,
+        manager: &SquadManager,
+        island_map: Option<&IslandMap>,
+        proposal: &mut ProducedAssignmentProposal,
+        batch: &mut HashMap<FormingSquadSlotId, usize>,
+    ) -> Option<ProducedSlotReceipt> {
+        let snapshot = self.assigned.get(&entity)?;
+        let slot = snapshot.intent.forming_slot?;
+        let player = snapshot.intent.player_id;
+        let mission = match snapshot.intent.posture {
+            DeploymentPosture::Execute => MissionType::Attack,
+            DeploymentPosture::Forming => MissionType::Defense,
+        };
+        let squad = if let Some(index) = batch.get(&slot) {
+            ProducedSquad::Proposed(*index)
+        } else if let Some(squad_id) = self
+            .forming_slots
+            .get(&slot)
+            .and_then(|reservation| reservation.squad_id)
+            .filter(|squad_id| {
+                manager
+                    .squads
+                    .iter()
+                    .any(|squad| squad.id == *squad_id && squad.owner_id == Some(player))
+            })
+        {
+            ProducedSquad::Existing(squad_id)
+        } else {
+            ProducedSquad::Create(mission.clone())
+        };
+        let join = proposal.propose(ProducedJoin {
+            player,
+            entity,
+            squad,
+            fallback_mission: mission,
+            target: Some(match snapshot.intent.posture {
+                DeploymentPosture::Execute => snapshot.intent.anchor,
+                DeploymentPosture::Forming => snapshot.intent.staging_anchor,
+            }),
+            target_island: island_map
+                .and_then(|islands| islands.get_island_at(&snapshot.intent.anchor))
+                .map(|island| island.id),
+        });
+        batch.insert(slot, join);
+        Some(ProducedSlotReceipt { slot, entity, join })
+    }
+
+    /// 所属確定後に、slot予約と配備台帳へ受入SquadIdを記録する。
+    fn bind_produced_squad(&mut self, receipt: &ProducedSlotReceipt, squad_id: SquadId) {
+        if let Some(reservation) = self.forming_slots.get_mut(&receipt.slot) {
+            debug_assert_eq!(reservation.id, receipt.slot);
+            reservation.squad_id = Some(squad_id);
+        }
+        if let Some(deployment) = self.assigned.get_mut(&receipt.entity) {
+            deployment.squad_id = Some(squad_id);
+        }
+    }
+
+    /// テスト用: 1体のslotを提案→確定→書戻しまで行う。
+    #[cfg(test)]
     fn resolve_produced_slot(
         &mut self,
         entity: Entity,
         manager: &mut SquadManager,
         island_map: Option<&IslandMap>,
     ) {
-        let Some(snapshot) = self.assigned.get(&entity).cloned() else {
-            return;
-        };
-        let Some(slot) = snapshot.intent.forming_slot else {
-            return;
-        };
-        let existing = self
-            .forming_slots
-            .get(&slot)
-            .and_then(|reservation| reservation.squad_id)
-            .and_then(|squad_id| {
-                manager.squads.iter().position(|squad| {
-                    squad.id == squad_id && squad.owner_id == Some(snapshot.intent.player_id)
-                })
-            });
-        let squad = if let Some(index) = existing {
-            &mut manager.squads[index]
-        } else {
-            manager.create_owned_squad(
-                match snapshot.intent.posture {
-                    DeploymentPosture::Execute => MissionType::Attack,
-                    DeploymentPosture::Forming => MissionType::Defense,
-                },
-                snapshot.intent.player_id,
-            )
-        };
-        squad.members.insert(entity);
-        squad.target = Some(match snapshot.intent.posture {
-            DeploymentPosture::Execute => snapshot.intent.anchor,
-            DeploymentPosture::Forming => snapshot.intent.staging_anchor,
-        });
-        squad.target_island = island_map
-            .and_then(|islands| islands.get_island_at(&snapshot.intent.anchor))
-            .map(|island| island.id);
-        squad.phase = MissionPhase::Forming;
-        let squad_id = squad.id;
-        if let Some(reservation) = self.forming_slots.get_mut(&slot) {
-            debug_assert_eq!(reservation.id, slot);
-            reservation.squad_id = Some(squad_id);
-        }
-        if let Some(deployment) = self.assigned.get_mut(&entity) {
-            deployment.squad_id = Some(squad_id);
+        let mut proposal = ProducedAssignmentProposal::default();
+        let receipt = self.propose_produced_slot(
+            entity,
+            manager,
+            island_map,
+            &mut proposal,
+            &mut HashMap::default(),
+        );
+        let delta = OperationLedger::commit_produced(manager, proposal);
+        if let Some(receipt) = receipt {
+            self.bind_produced_squad(&receipt, delta.squad_for(receipt.join));
         }
     }
 
@@ -637,29 +673,57 @@ impl V4DeploymentRegistry {
     }
 }
 
-/// 実際に生産されたEntityをpending deploymentへ照合する。
+/// 生産slotの所属提案と、確定後に書き戻す台帳上の位置。
+#[derive(Debug)]
+pub(super) struct ProducedSlotReceipt {
+    slot: FormingSquadSlotId,
+    entity: Entity,
+    join: usize,
+}
+
+/// 実際に生産されたEntityをpending deploymentへ照合し、slotの所属を提案する。
 ///
-/// 予約slotや作戦契約bindingを持つ発注（拡張経路だけが登録する）は、ここで実Squadと
-/// 契約へ接続する。slotもbindingもない通常経路の発注は台帳へ移すだけで、従来と同じ。
-pub(crate) fn reconcile_pending_deployments_system(
-    mut events: EventReader<UnitProducedEvent>,
-    match_state: Res<MatchState>,
-    mut registry: ResMut<V4DeploymentRegistry>,
-    manager: Option<ResMut<SquadManager>>,
-    island_map: Option<Res<IslandMap>>,
-) {
-    let turn = match_state.current_turn_number.0;
-    let mut manager = manager;
-    for event in events.read() {
+/// 予約slotや作戦契約bindingを持つ発注（拡張経路だけが登録する）は、所属提案として
+/// 受付へ渡す。slotもbindingもない通常経路の発注は台帳へ移すだけで、従来と同じ。
+pub(super) fn propose_produced_events(
+    events: &[&UnitProducedEvent],
+    turn: u32,
+    registry: &mut V4DeploymentRegistry,
+    manager: Option<&SquadManager>,
+    island_map: Option<&IslandMap>,
+    proposal: &mut ProducedAssignmentProposal,
+) -> Vec<ProducedSlotReceipt> {
+    let mut receipts = Vec::new();
+    let mut batch = HashMap::default();
+    for event in events {
         let slot = registry.assign_produced(event, turn);
         if slot.is_some()
-            && let Some(manager) = manager.as_deref_mut()
+            && let Some(manager) = manager
+            && let Some(receipt) = registry.propose_produced_slot(
+                event.entity,
+                manager,
+                island_map,
+                proposal,
+                &mut batch,
+            )
         {
-            registry.resolve_produced_slot(event.entity, manager, island_map.as_deref());
+            receipts.push(receipt);
         }
     }
     // 失敗した生産命令を翌ターンの同型発注へ誤照合しない。
     registry.pending.retain(|pending| pending.turn >= turn);
+    receipts
+}
+
+/// 所属確定後の受入SquadIdを、提案順に配備台帳へ書き戻す。
+pub(super) fn bind_produced_squads(
+    registry: &mut V4DeploymentRegistry,
+    receipts: &[ProducedSlotReceipt],
+    delta: &ProducedAssignmentDelta,
+) {
+    for receipt in receipts {
+        registry.bind_produced_squad(receipt, delta.squad_for(receipt.join));
+    }
 }
 
 /// deployment Entityの攻撃実績を台帳へ記録し、任務接続の効果をEntity単位で評価可能にする。
@@ -1067,35 +1131,50 @@ pub(crate) fn prepare_deployment_squads_with_connectivity(
             }
         };
 
-        // 過去の汎用Squadへ混入していた場合は、このEntityだけを切り離す。
-        for squad in &mut manager.squads {
-            if squad.owner_id == Some(player_id) && Some(squad.id) != snapshot.squad_id {
-                squad.members.remove(&entity);
-            }
-        }
-        let squad_index = snapshot.squad_id.and_then(|id| {
+        // ID列を先に集め、1つのkeyed確定口で旧参照除去→受入の順序を保つ。
+        let other_ids = manager
+            .squads
+            .iter()
+            .filter(|squad| {
+                squad.owner_id == Some(player_id) && Some(squad.id) != snapshot.squad_id
+            })
+            .map(|squad| squad.id)
+            .collect::<Vec<_>>();
+        let existing_id = snapshot.squad_id.filter(|id| {
             manager
                 .squads
                 .iter()
-                .position(|squad| squad.id == id && squad.owner_id == Some(player_id))
+                .any(|squad| squad.id == *id && squad.owner_id == Some(player_id))
         });
-        let squad = if let Some(index) = squad_index {
-            &mut manager.squads[index]
-        } else {
-            manager.create_owned_squad(MissionType::Attack, player_id)
+        let squad_id = {
+            let mut proposals = OperationLedger::proposals(manager);
+            for id in other_ids {
+                proposals.leave(id, entity);
+            }
+            let id = existing_id.unwrap_or_else(|| {
+                proposals
+                    .create_owned(
+                        MissionType::Attack,
+                        player_id,
+                        Default::default(),
+                        None,
+                        Vec::new(),
+                    )
+                    .id
+            });
+            proposals.clear_members(id);
+            proposals.join(id, entity);
+            let squad = proposals.squad_mut(id).expect("確定した配備Squad");
+            squad.mission_type = mission_type;
+            squad.target = Some(target);
+            // Planと同じcampaign ownerを保ち、排他reconcileとの競合を防ぐ。
+            squad.target_island = island_map
+                .as_ref()
+                .and_then(|islands| islands.get_island_at(&snapshot.intent.anchor))
+                .map(|island| island.id);
+            squad.phase = MissionPhase::MovingToTarget;
+            id
         };
-        squad.members.clear();
-        squad.members.insert(entity);
-        squad.mission_type = mission_type;
-        squad.target = Some(target);
-        // 生産時Planと同じ島campaign ownerをSquadにも持たせる。Noneの汎用Squadに
-        // すると排他reconcileで正本campaign ownerと競合し、任務が断続的に消える。
-        squad.target_island = island_map
-            .as_ref()
-            .and_then(|islands| islands.get_island_at(&snapshot.intent.anchor))
-            .map(|island| island.id);
-        squad.phase = MissionPhase::MovingToTarget;
-        let squad_id = squad.id;
         if let Some(deployment) = registry.assigned.get_mut(&entity) {
             deployment.squad_id = Some(squad_id);
             deployment.current_target = target_entity;
@@ -1110,7 +1189,7 @@ pub(crate) fn prepare_deployment_squads_with_connectivity(
             deployment.current_target = None;
         }
         if let Some(squad_id) = squad_id {
-            manager.squads.retain(|squad| squad.id != squad_id);
+            OperationLedger::squad_list(manager).retain(|squad| squad.id != squad_id);
         }
     }
     world.insert_resource(registry);
@@ -1243,6 +1322,136 @@ mod tests {
         assert_eq!(registry.forming_slots.len(), 2);
     }
 
+    /// 段階3以前の `resolve_produced_slot`（イベントごとに直接Squadへ書く実装）の参照実装。
+    /// 所属fieldは現在テストfixture経由でしか直接書けないため、書込みだけfixture口を使う。
+    fn legacy_resolve_produced_slot(
+        registry: &mut V4DeploymentRegistry,
+        entity: Entity,
+        manager: &mut SquadManager,
+        island_map: Option<&IslandMap>,
+    ) {
+        let Some(snapshot) = registry.assigned.get(&entity).cloned() else {
+            return;
+        };
+        let Some(slot) = snapshot.intent.forming_slot else {
+            return;
+        };
+        let existing = registry
+            .forming_slots
+            .get(&slot)
+            .and_then(|reservation| reservation.squad_id)
+            .and_then(|squad_id| {
+                manager.squads.iter().position(|squad| {
+                    squad.id == squad_id && squad.owner_id == Some(snapshot.intent.player_id)
+                })
+            });
+        let squad = if let Some(index) = existing {
+            &mut manager.squads[index]
+        } else {
+            manager.create_owned_squad(
+                match snapshot.intent.posture {
+                    DeploymentPosture::Execute => MissionType::Attack,
+                    DeploymentPosture::Forming => MissionType::Defense,
+                },
+                snapshot.intent.player_id,
+            )
+        };
+        squad.members.insert(entity);
+        squad.target = Some(match snapshot.intent.posture {
+            DeploymentPosture::Execute => snapshot.intent.anchor,
+            DeploymentPosture::Forming => snapshot.intent.staging_anchor,
+        });
+        squad.target_island = island_map
+            .and_then(|islands| islands.get_island_at(&snapshot.intent.anchor))
+            .map(|island| island.id);
+        squad.phase = MissionPhase::Forming;
+        let squad_id = squad.id;
+        if let Some(reservation) = registry.forming_slots.get_mut(&slot) {
+            reservation.squad_id = Some(squad_id);
+        }
+        if let Some(deployment) = registry.assigned.get_mut(&entity) {
+            deployment.squad_id = Some(squad_id);
+        }
+    }
+
+    /// 同じ受付で同じslotの2体が完成したとき、1回の確定でも段階3以前の逐次解決
+    /// （参照実装）と同じく先行提案のSquadへ後続を合流させ、SquadIdと書戻しも一致する。
+    ///
+    /// 本番の `replace_turn_orders` は発注ごとに新しいslotを発番するため（呼出し元は
+    /// すべて `forming_slot: None`）、同じslotの共有はこのテストで指定した場合だけ起きる。
+    /// 提案の `Proposed` 合流が逐次実装と等価であることの契約として固定する。
+    #[test]
+    fn shared_slot_in_one_receipt_matches_sequential_resolution() {
+        let _guard = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
+        let setup = || {
+            let mut registry = V4DeploymentRegistry::default();
+            let shared = Some(FormingSquadSlotId(77));
+            let orders = [pending(0), pending(1)].map(|mut order| {
+                order.forming_slot = shared;
+                order
+            });
+            registry.replace_turn_orders(PlayerId(1), 3, orders);
+            let mut manager = SquadManager::default();
+            // 既存Squadがあっても新設idは発番順どおりになることを確かめる。
+            manager.create_owned_squad(MissionType::Reserve, PlayerId(1));
+            (registry, manager)
+        };
+        let entities = [Entity::from_raw(100), Entity::from_raw(101)];
+
+        // 段階3以前: イベントごとに解決し、その場でSquadへ書き込む。
+        let (mut sequential, mut sequential_manager) = setup();
+        for entity in entities {
+            sequential.assign_produced(&produced_event(entity), 3);
+            legacy_resolve_produced_slot(&mut sequential, entity, &mut sequential_manager, None);
+        }
+
+        // 新: 全件を提案してから1回だけ確定する。
+        let (mut registry, mut manager) = setup();
+        let events = entities.map(produced_event);
+        let events = events.iter().collect::<Vec<_>>();
+        let mut proposal = ProducedAssignmentProposal::default();
+        let receipts = propose_produced_events(
+            &events,
+            3,
+            &mut registry,
+            Some(&manager),
+            None,
+            &mut proposal,
+        );
+        // 確定前はSquadManagerを変更しない。
+        assert_eq!(manager.squads.len(), 1);
+        let delta = OperationLedger::commit_produced(&mut manager, proposal);
+        bind_produced_squads(&mut registry, &receipts, &delta);
+
+        assert_eq!(manager.squads.len(), 2);
+        assert_eq!(manager.squads.len(), sequential_manager.squads.len());
+        for (left, right) in manager.squads.iter().zip(&sequential_manager.squads) {
+            assert_eq!(left.id, right.id);
+            assert_eq!(left.members, *right.members);
+            assert_eq!(left.mission_type, right.mission_type);
+            assert_eq!(left.target, right.target);
+            assert_eq!(left.phase, right.phase);
+        }
+        assert_eq!(
+            manager.squads[1]
+                .members
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            entities.to_vec()
+        );
+        for entity in entities {
+            assert_eq!(
+                registry.assigned[&entity].squad_id,
+                sequential.assigned[&entity].squad_id
+            );
+        }
+        assert_eq!(
+            registry.forming_slots[&FormingSquadSlotId(77)].squad_id,
+            Some(manager.squads[1].id)
+        );
+    }
+
     /// 発注照合Systemは経路によらず1本で動き、予約slotを持つ発注だけを生産直後に
     /// 実Squadへ解決する（T4：slotの有無で処理を選ぶ）。通常経路の発注はslotを
     /// 持たないため、従来どおり台帳へ移すだけでSquadを作らない。
@@ -1267,7 +1476,8 @@ mod tests {
             let produced = Entity::from_raw(100);
             world.send_event(produced_event(produced));
             let mut schedule = Schedule::default();
-            schedule.add_systems(reconcile_pending_deployments_system);
+            schedule
+                .add_systems(crate::ai::v4::production_events::reconcile_production_events_system);
             schedule.run(&mut world);
 
             let registry = world.resource::<V4DeploymentRegistry>();

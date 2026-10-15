@@ -1621,7 +1621,7 @@ fn estimate_full_objective_completion(
         });
         let transport = transporting
             .map(|transporting| transporting.0)
-            .or_else(|| squad.and_then(|squad| squad.transport_entity))
+            .or_else(|| squad.and_then(|squad| *squad.transport_entity))
             .ok_or_else(|| format!("capture Entity {} has no transport", entity.to_bits()))?;
         let transport_position = world
             .get::<GridPosition>(transport)
@@ -2002,7 +2002,7 @@ pub(crate) fn reconcile_campaign_roadmap(
         for squad in manager.squads.iter().filter(|squad| {
             squad.owner_id == Some(player_id) && squad.target_island == Some(assignment.island_id)
         }) {
-            if let Some(transport) = squad.transport_entity {
+            if let Some(transport) = *squad.transport_entity {
                 registry.bind_entity_exclusive(
                     operation_id,
                     transport,
@@ -2079,7 +2079,7 @@ pub(crate) fn reconcile_campaign_roadmap(
         for squad in manager.squads.iter().filter(|squad| {
             squad.owner_id == Some(player_id) && squad.target_island == Some(capital_island)
         }) {
-            if let Some(transport) = squad.transport_entity {
+            if let Some(transport) = *squad.transport_entity {
                 registry.bind_entity_exclusive(
                     operation_id,
                     transport,
@@ -2295,7 +2295,8 @@ pub fn audit_victory_roadmap_system(
             execution.mark_destroyed(event.entity, turn);
         }
         if let Some(assignments) = operation_assignments.as_deref_mut() {
-            assignments.release_entity(event.entity);
+            crate::ai::planning::assignment::OperationLedger::open(assignments)
+                .release_destroyed(event.entity);
         }
         registry.record_destroyed_entity(event.entity, turn);
     }

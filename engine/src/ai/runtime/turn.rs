@@ -196,7 +196,7 @@ fn transport_boarding_changed(world: &World) -> bool {
 fn select_transport_step(world: &mut World, step: &TurnStep) -> Option<(Entity, AiCommand)> {
     let mut manager = world.remove_resource::<SquadManager>()?;
     let mut transport_action = None;
-    for squad in &mut manager.squads {
+    for squad in manager.squads_mut() {
         if squad.mission_type != MissionType::Transport
             || squad.owner_id != Some(step.player_id)
             || !crate::ai::squad::squad_is_mutable_by_player(world, squad, step.player_id)
@@ -249,7 +249,7 @@ fn decision_skip_entities(world: &World, step: &TurnStep) -> HashSet<Entity> {
             .filter(|squad| squad.mission_type == MissionType::Transport)
         {
             skip.extend(squad.members.iter().copied());
-            if let Some(transport_entity) = squad.transport_entity {
+            if let Some(transport_entity) = *squad.transport_entity {
                 skip.insert(transport_entity);
             }
             skip.extend(squad.cargo_entities.iter().copied());

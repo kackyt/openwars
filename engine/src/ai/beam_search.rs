@@ -375,7 +375,7 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
 
     // 4. 最もスコアの高いプランを採択して SquadManager 内の部隊目標を決定
     if let Some(best_plan) = beam.first() {
-        for squad in &mut manager.squads {
+        for squad in manager.squads_mut() {
             if let Some(&target) = best_plan.assignments.get(&squad.id) {
                 squad.target = Some(target);
                 if squad.mission_type == MissionType::Transport {
@@ -463,23 +463,7 @@ mod tests {
             ))
             .id();
 
-        let mut squad = Squad {
-            id: crate::ai::squad::SquadId(1),
-            owner_id: Some(p1),
-            members: BTreeSet::new(),
-            mission_type: MissionType::Attack,
-            target: None,
-            target_island: None,
-            phase: crate::ai::squad::MissionPhase::Forming,
-            transport_entity: None,
-            cargo_entities: Vec::new(),
-            pickup_position: None,
-            drop_position: None,
-            delivered_cargo: Vec::new(),
-            allow_partial_departure: false,
-            departure_authorized: true,
-            return_after_combat: false,
-        };
+        let mut squad = Squad::new(crate::ai::squad::SquadId(1), Some(p1), MissionType::Attack);
         squad.members.insert(u1);
 
         let mut manager = SquadManager::new();
@@ -660,7 +644,7 @@ mod tests {
         let mut manager = SquadManager::new();
         let squad = manager.create_squad(MissionType::Transport);
         squad.members.insert(transport);
-        squad.transport_entity = Some(transport);
+        squad.transport_entity = Some(transport).into();
         squad.target = Some(GridPosition { x: 8, y: 8 });
         squad.target_island = Some(island_id);
         squad.phase =

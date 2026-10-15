@@ -19,6 +19,8 @@ pub mod logistics_plan;
 pub mod operation;
 mod operation_selection;
 pub mod plan_revision;
+pub(crate) mod production_events;
+mod production_finalize;
 pub mod rolling_plan;
 pub mod trace;
 pub mod victory_roadmap;
@@ -2635,6 +2637,8 @@ fn plan_production_with_registry(
         });
     }
 
+    // 通常経路は施設を交換しない。同じ確定口で工程・意図・診断の投影だけを揃える。
+    production_finalize::finalize(scan, &mut commands, &mut plan_trace, plan_registry, false);
     plan_registry.reconcile_unseen_plans(player_id, turn, &seen_plan_ids);
     let remaining_funds = allocation.remaining_funds();
     plan_trace.leftover_funds = remaining_funds;

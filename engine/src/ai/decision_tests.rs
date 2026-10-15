@@ -246,7 +246,7 @@ mod tests {
         let mut manager = crate::ai::squad::SquadManager::new();
         let squad = manager.create_owned_squad(crate::ai::squad::MissionType::Transport, player);
         squad.members.insert(transport);
-        squad.transport_entity = Some(transport);
+        squad.transport_entity = Some(transport).into();
         squad.target_island = Some(crate::ai::islands::IslandId(1));
         squad.phase = crate::ai::squad::MissionPhase::Forming;
         world.insert_resource(manager);
@@ -2295,7 +2295,7 @@ mod tests {
                 let foreign =
                     manager.create_owned_squad(crate::ai::squad::MissionType::Transport, player_a);
                 foreign.members.insert(transport_a);
-                foreign.transport_entity = Some(transport_a);
+                foreign.transport_entity = Some(transport_a).into();
                 foreign.phase = crate::ai::squad::MissionPhase::Transport(
                     crate::ai::squad::TransportPhase::Return,
                 );
@@ -2314,14 +2314,14 @@ mod tests {
                 let id = foreign.id;
                 let ownerless = manager.create_squad(crate::ai::squad::MissionType::Transport);
                 ownerless.members.insert(ownerless_transport);
-                ownerless.transport_entity = Some(ownerless_transport);
+                ownerless.transport_entity = Some(ownerless_transport).into();
                 ownerless.phase = crate::ai::squad::MissionPhase::Transport(
                     crate::ai::squad::TransportPhase::Return,
                 );
                 let own =
                     manager.create_owned_squad(crate::ai::squad::MissionType::Transport, player_b);
                 own.members.insert(transport_b);
-                own.transport_entity = Some(transport_b);
+                own.transport_entity = Some(transport_b).into();
                 own.phase = crate::ai::squad::MissionPhase::Transport(
                     crate::ai::squad::TransportPhase::Return,
                 );
@@ -2400,25 +2400,15 @@ mod tests {
     /// 指定ユニット1体のみからなる部隊 (目標つき) を登録するヘルパー
     fn insert_single_unit_squad(world: &mut World, member: Entity, target: GridPosition) {
         let mut manager = crate::ai::squad::SquadManager::default();
-        let mut members = std::collections::BTreeSet::new();
-        members.insert(member);
-        manager.squads.push(crate::ai::squad::Squad {
-            id: crate::ai::squad::SquadId(1),
-            owner_id: None,
-            members,
-            mission_type: crate::ai::squad::MissionType::Attack,
-            target: Some(target),
-            target_island: None,
-            phase: crate::ai::squad::MissionPhase::MovingToTarget,
-            transport_entity: None,
-            cargo_entities: Vec::new(),
-            pickup_position: None,
-            drop_position: None,
-            delivered_cargo: Vec::new(),
-            allow_partial_departure: false,
-            departure_authorized: true,
-            return_after_combat: false,
-        });
+        let mut squad = crate::ai::squad::Squad::new(
+            crate::ai::squad::SquadId(1),
+            None,
+            crate::ai::squad::MissionType::Attack,
+        );
+        squad.members.insert(member);
+        squad.target = Some(target);
+        squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+        manager.squads.push(squad);
         world.insert_resource(manager);
     }
 

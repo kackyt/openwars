@@ -239,7 +239,7 @@ fn v3_invasion_reaches_combat_or_capture_after_landing() {
         (
             planned
                 .iter()
-                .filter_map(|squad| squad.transport_entity)
+                .filter_map(|squad| *squad.transport_entity)
                 .collect::<HashSet<_>>(),
             planned
                 .iter()

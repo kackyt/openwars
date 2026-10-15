@@ -32,10 +32,8 @@ pub fn add_main_game_systems(schedule: &mut Schedule) {
         (
             crate::ai::runtime::state::clear_ai_cooldowns_system,
             produce_unit_system,
-            // 発注照合は予約slotの有無で処理を選ぶため、経路によらず1本で動かす。
-            crate::ai::v4::deployment::reconcile_pending_deployments_system,
-            // Campaign側も、各発注の予約slotの有無で生産直後の編成を判断する。
-            crate::ai::v4::campaign_execution::reconcile_campaign_production_system,
+            // 生産完了を一度だけ受付け、両台帳の照合を従来の発番順で適用する。
+            crate::ai::v4::production_events::reconcile_production_events_system,
             move_unit_system,
             attack_unit_system,
             crate::ai::v4::deployment::audit_deployment_attacks_system,

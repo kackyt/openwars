@@ -889,8 +889,8 @@ fn reinforce_keeps_other_operations_and_stranded_capture_continuity() {
         }
         let squad = manager.create_squad(MissionType::Transport);
         squad.members.insert(transport);
-        squad.transport_entity = Some(transport);
-        squad.cargo_entities = cargo.to_vec();
+        squad.transport_entity = Some(transport).into();
+        squad.cargo_entities = cargo.to_vec().into();
         squad.target_island = Some(island);
         squad.target = Some(expand_positions[index]);
         squad.phase = MissionPhase::Transport(TransportPhase::Transit);
@@ -922,7 +922,7 @@ fn reinforce_keeps_other_operations_and_stranded_capture_continuity() {
         .id();
     let recoverable = manager.create_squad(MissionType::Transport);
     recoverable.members.insert(recoverable_transport);
-    recoverable.transport_entity = Some(recoverable_transport);
+    recoverable.transport_entity = Some(recoverable_transport).into();
     recoverable.target_island = Some(contested_island);
     recoverable.target = Some(contested_property);
     recoverable.phase = MissionPhase::Forming;
@@ -1143,8 +1143,8 @@ fn partially_loaded_assignment_owned_reinforce_transport_remains_available_for_i
     let mut manager = world.remove_resource::<SquadManager>().unwrap();
     let transit = manager.create_squad(MissionType::Transport);
     transit.members.insert(transport);
-    transit.transport_entity = Some(transport);
-    transit.cargo_entities = vec![remote_combat];
+    transit.transport_entity = Some(transport).into();
+    transit.cargo_entities = vec![remote_combat].into();
     transit.target_island = Some(target_island);
     transit.target = Some(target);
     transit.phase = MissionPhase::Transport(TransportPhase::Transit);
@@ -1265,8 +1265,8 @@ fn full_planning_keeps_targetless_drop_deliveries_local_across_repeated_calls() 
     let mut manager = world.remove_resource::<SquadManager>().unwrap();
     let safe_drop = manager.create_squad(MissionType::Transport);
     safe_drop.members.insert(safe_transport);
-    safe_drop.transport_entity = Some(safe_transport);
-    safe_drop.cargo_entities = vec![capture_a, capture_b, combat];
+    safe_drop.transport_entity = Some(safe_transport).into();
+    safe_drop.cargo_entities = vec![capture_a, capture_b, combat].into();
     safe_drop.target_island = None;
     safe_drop.target = None;
     safe_drop.phase = MissionPhase::Transport(TransportPhase::Drop);
@@ -1323,9 +1323,9 @@ fn missing_source_transport_keeps_targetless_delivery_in_a_local_hold() {
     let source_id = {
         let mut manager = world.remove_resource::<SquadManager>().unwrap();
         let source = manager.create_owned_squad(MissionType::Transport, player);
-        source.transport_entity = Some(missing_transport);
+        source.transport_entity = Some(missing_transport).into();
         source.members.insert(missing_transport);
-        source.delivered_cargo = vec![held_cargo];
+        source.delivered_cargo = vec![held_cargo].into();
         source.phase = MissionPhase::Transport(TransportPhase::Return);
         let id = source.id;
         world.insert_resource(manager);
@@ -1444,8 +1444,8 @@ fn targetless_delivery_releases_returned_transport_and_waits_for_local_duty() {
         let mut manager = world.remove_resource::<SquadManager>().unwrap();
         let source = manager.create_squad(MissionType::Transport);
         source.members.insert(transport);
-        source.transport_entity = Some(transport);
-        source.cargo_entities = vec![held_cargo];
+        source.transport_entity = Some(transport).into();
+        source.cargo_entities = vec![held_cargo].into();
         source.phase = MissionPhase::Transport(TransportPhase::Drop);
         let id = source.id;
         world.insert_resource(manager);
@@ -1804,7 +1804,7 @@ fn mixed_owner_squad_entities_are_unavailable_to_both_players_campaign_planning(
     let (mixed_id, snapshot) = {
         let mut manager = world.remove_resource::<SquadManager>().unwrap();
         let mixed = manager.create_squad(MissionType::Capture);
-        mixed.members = mixed_set.clone();
+        mixed.members = mixed_set.clone().into();
         mixed.target_island = Some(target_island);
         mixed.target = Some(target);
         mixed.phase = MissionPhase::MovingToTarget;
@@ -1931,9 +1931,9 @@ fn faction_only_cargo_marks_every_mixed_squad_reference_unavailable() {
         let mut manager = world.remove_resource::<SquadManager>().unwrap();
         let mixed = manager.create_squad(MissionType::Capture);
         mixed.members.insert(mixed_player_a);
-        mixed.transport_entity = Some(factionless_transport);
-        mixed.cargo_entities = vec![faction_only_player_b];
-        mixed.delivered_cargo = vec![factionless_delivered];
+        mixed.transport_entity = Some(factionless_transport).into();
+        mixed.cargo_entities = vec![faction_only_player_b].into();
+        mixed.delivered_cargo = vec![factionless_delivered].into();
         mixed.target_island = Some(target_island);
         mixed.target = Some(target);
         mixed.phase = MissionPhase::MovingToTarget;
@@ -2151,8 +2151,8 @@ fn planning_another_player_preserves_foreign_transport_squad_continuity() {
         let mut manager = world.remove_resource::<SquadManager>().unwrap();
         let squad = manager.create_squad(MissionType::Transport);
         squad.members.insert(transport);
-        squad.transport_entity = Some(transport);
-        squad.cargo_entities = vec![cargo];
+        squad.transport_entity = Some(transport).into();
+        squad.cargo_entities = vec![cargo].into();
         squad.target_island = Some(target_island);
         squad.target = Some(target);
         squad.phase = MissionPhase::Transport(TransportPhase::Transit);

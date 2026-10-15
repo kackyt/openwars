@@ -1713,7 +1713,7 @@ pub fn snapshot_transport_squads(world: &World) -> Vec<TransportSquadSnapshot> {
         if squad.mission_type != MissionType::Transport {
             continue;
         }
-        let Some(transport) = squad.transport_entity else {
+        let Some(transport) = *squad.transport_entity else {
             continue;
         };
         let phase = match squad.phase {

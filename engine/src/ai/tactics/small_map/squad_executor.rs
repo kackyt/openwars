@@ -1555,7 +1555,7 @@ mod tests {
                 let foreign =
                     manager.create_owned_squad(crate::ai::squad::MissionType::Transport, player_a);
                 foreign.members.insert(transport_a);
-                foreign.transport_entity = Some(transport_a);
+                foreign.transport_entity = Some(transport_a).into();
                 foreign.phase = crate::ai::squad::MissionPhase::Transport(
                     crate::ai::squad::TransportPhase::Return,
                 );
@@ -1574,14 +1574,14 @@ mod tests {
                 let id = foreign.id;
                 let ownerless = manager.create_squad(crate::ai::squad::MissionType::Transport);
                 ownerless.members.insert(ownerless_transport);
-                ownerless.transport_entity = Some(ownerless_transport);
+                ownerless.transport_entity = Some(ownerless_transport).into();
                 ownerless.phase = crate::ai::squad::MissionPhase::Transport(
                     crate::ai::squad::TransportPhase::Return,
                 );
                 let own =
                     manager.create_owned_squad(crate::ai::squad::MissionType::Transport, player_b);
                 own.members.insert(transport_b);
-                own.transport_entity = Some(transport_b);
+                own.transport_entity = Some(transport_b).into();
                 own.phase = crate::ai::squad::MissionPhase::Transport(
                     crate::ai::squad::TransportPhase::Return,
                 );

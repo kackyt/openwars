@@ -1979,20 +1979,7 @@ pub(super) fn plan_production_with_registry(
         });
     }
 
-    optimize_production_facility_assignments(scan, &mut commands);
-    // 施設の入替えは購入案の確定前の最終調整として扱い、保存済みPlanの工程も
-    // 最終的な命令と同じ施設へ揃える。命令だけを書き換えた状態で確定しない。
-    for planned in &commands {
-        if let PurchasePurpose::PlanStep(step_ref) = planned.purpose {
-            plan_registry.retarget_planned_step(
-                step_ref,
-                GridPosition {
-                    x: planned.command.target_x,
-                    y: planned.command.target_y,
-                },
-            );
-        }
-    }
+    production_finalize::finalize(scan, &mut commands, &mut plan_trace, plan_registry, true);
 
     plan_registry.reconcile_unseen_plans(player_id, turn, &seen_plan_ids);
     let remaining_funds = allocation.remaining_funds();
@@ -6576,6 +6563,126 @@ mod tests {
         assert!(!enemy_is_capturing(&scan, &incoming));
     }
 
+    /// 同型購入の施設交換でも、命令・占領意図・購入診断を購入順で確定する。
+    #[test]
+    fn facility_finalization_synchronizes_same_type_capture_purchases() {
+        let mut scan = multi_factory_scan();
+        let facilities = [pos(1, 1), pos(1, 3)];
+        // 最適化は施設一覧でなく実地形で生産可否を確認する。fixtureの地形も工場へ揃える。
+        for facility in facilities {
+            Arc::make_mut(&mut scan.map)
+                .set_terrain(facility.x, facility.y, Terrain::Factory)
+                .unwrap();
+        }
+        for optimize in [false, true] {
+            let mut commands = Vec::new();
+            let mut trace = ProductionPlanTrace::new(PlayerId(0), 2000, 2);
+            for (facility, target) in facilities.into_iter().zip(facilities.into_iter().rev()) {
+                let command = ProduceUnitCommand {
+                    player_id: PlayerId(0),
+                    target_x: facility.x,
+                    target_y: facility.y,
+                    unit_type: UnitType::Infantry,
+                };
+                commands.push(PlannedProduction {
+                    capture_intent: Some(campaign_execution::CampaignProductionIntent {
+                        command: command.clone(),
+                        island_id: crate::ai::islands::IslandId(0),
+                        role: campaign_execution::CampaignProductionRole::Capture,
+                        mission_target: Some(target),
+                    }),
+                    command,
+                    role: SlotKind::Capture,
+                    cost: 1000,
+                    purpose: PurchasePurpose::OperationSlot,
+                    deployment: None,
+                });
+                trace.steps.push(ProductionStepTrace {
+                    operation_kind: OperationKind::Capture,
+                    operation_anchor: pos(6, 2),
+                    slot_kind: SlotKind::Capture,
+                    deficit_before: 1.0,
+                    deficit_after: 0.0,
+                    remaining_funds_before: 2000,
+                    decision: ProductionDecision::Produced {
+                        unit_type: UnitType::Infantry,
+                        cost: 1000,
+                        facility,
+                    },
+                });
+            }
+            trace.rolling_combat_plans.push(RollingCombatPlanTrace {
+                plan_id: None,
+                revision: None,
+                disposition: PlanDisposition::Rejected,
+                replan_reason: None,
+                operation_kind: OperationKind::Capture,
+                anchor: pos(6, 2),
+                feasible: false,
+                // 同型2件と同じ施設の将来購入を併記し、今手番だけを対応付ける。
+                purchases: facilities
+                    .into_iter()
+                    .map(|facility| RollingPurchaseTrace {
+                        unit_type: UnitType::Infantry,
+                        facility,
+                        build_turn: 0,
+                        cost: 1000,
+                    })
+                    .chain(std::iter::once(RollingPurchaseTrace {
+                        unit_type: UnitType::Infantry,
+                        facility: facilities[0],
+                        build_turn: 1,
+                        cost: 1000,
+                    }))
+                    .collect(),
+                targets: Vec::new(),
+                turn_forecasts: Vec::new(),
+                first_attack_turn: None,
+                elimination_turn: None,
+                occupation_turn: None,
+                production_cost: 3000,
+                expected_loss: 0,
+                surviving_combat_value: 0,
+                required_overmatch_value: 0,
+                overmatch_ready: false,
+                protected_unit_count: 0,
+                protected_survivor_count: 0,
+                required_capture_survivor_count: 0,
+                candidates_considered: 0,
+                candidates_pruned: 0,
+                search_truncated: false,
+            });
+            production_finalize::finalize(
+                &scan,
+                &mut commands,
+                &mut trace,
+                &mut V4RollingPlanRegistry::default(),
+                optimize,
+            );
+            let expected = if optimize {
+                [facilities[1], facilities[0]]
+            } else {
+                facilities
+            };
+            for ((planned, step), expected) in commands.iter().zip(&trace.steps).zip(expected) {
+                assert_eq!(pos(planned.target_x, planned.target_y), expected);
+                let intent = planned.capture_intent.as_ref().unwrap();
+                assert_eq!(
+                    pos(intent.command.target_x, intent.command.target_y),
+                    expected
+                );
+                let ProductionDecision::Produced { facility, .. } = step.decision else {
+                    panic!("購入traceが失われた");
+                };
+                assert_eq!(facility, expected);
+            }
+            let purchases = &trace.rolling_combat_plans[0].purchases;
+            assert_eq!([purchases[0].facility, purchases[1].facility], expected);
+            assert_eq!(purchases[2].facility, facilities[0]);
+            assert_eq!(purchases[2].build_turn, 1);
+        }
+    }
+
     /// 生産トレースは、発行した命令 1 件ごとに「どの作戦のどの枠から出たか」を残す
     ///
     /// 「同一ターン内に同じユニットが全施設へ発注される」現象を切り分けるには、
@@ -10088,7 +10195,7 @@ pub(crate) fn refresh_capital_route_path_commitments(
             // 同じNodeへControl Squadを割り当てた場合だけCapture Squadを発進させる。
             let departure_authorized = !local_enemy_present || has_control_squad;
             if let Some(squad) = manager
-                .squads
+                .squads_mut()
                 .iter_mut()
                 .find(|squad| squad.id == squad_id && squad.owner_id == Some(player_id))
             {
@@ -12522,17 +12629,9 @@ pub(super) fn optimize_production_facility_assignments(
                 if swap_key < curr_key {
                     commands[i].command.target_x = pos_j.x;
                     commands[i].command.target_y = pos_j.y;
-                    if let Some(intent) = commands[i].capture_intent.as_mut() {
-                        intent.command.target_x = pos_j.x;
-                        intent.command.target_y = pos_j.y;
-                    }
 
                     commands[j].command.target_x = pos_i.x;
                     commands[j].command.target_y = pos_i.y;
-                    if let Some(intent) = commands[j].capture_intent.as_mut() {
-                        intent.command.target_x = pos_i.x;
-                        intent.command.target_y = pos_i.y;
-                    }
                     improved = true;
                 }
             }

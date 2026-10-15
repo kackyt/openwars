@@ -456,8 +456,7 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
     // 残しておくと「そのターゲットには部隊が存在する」と誤判定され続け
     // (dedupe に引っかかる)、失敗した奪取目標へ二度と部隊が送られなくなる
     if is_v3 {
-        manager
-            .squads
+        OperationLedger::squad_list(&mut manager)
             .retain(|s| s.mission_type != MissionType::Capture || !s.members.is_empty());
     }
 

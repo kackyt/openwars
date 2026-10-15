@@ -160,7 +160,7 @@ pub fn audit_idle_units(
         for squad in &manager.squads {
             // 構成要素は members だけではない。輸送役・カーゴ・降車待ちも「任務を持っている」。
             let mut entities: Vec<Entity> = squad.members.iter().copied().collect();
-            if let Some(transport) = squad.transport_entity {
+            if let Some(transport) = *squad.transport_entity {
                 entities.push(transport);
             }
             entities.extend(squad.cargo_entities.iter().copied());
@@ -368,8 +368,8 @@ mod tests {
         let mut manager = SquadManager::new();
         {
             let squad = manager.create_owned_squad(MissionType::Transport, player);
-            squad.transport_entity = Some(transport);
-            squad.cargo_entities = vec![cargo];
+            squad.transport_entity = Some(transport).into();
+            squad.cargo_entities = vec![cargo].into();
             squad.phase = MissionPhase::Transport(crate::ai::squad::TransportPhase::Pickup);
         }
         world.insert_resource(manager);

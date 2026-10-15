@@ -247,7 +247,6 @@ mod tests {
     use crate::ai::squad::{MissionPhase, MissionType, SquadId};
     use crate::components::{Faction, GridPosition, Health, PlayerId, Property, UnitStats};
     use crate::resources::{GridTopology, Map, Terrain, master_data::MasterDataRegistry};
-    use std::collections::BTreeSet;
     fn setup_test_world() -> World {
         let master_data = MasterDataRegistry::load().unwrap();
         let (mut world, _) =
@@ -345,23 +344,9 @@ mod tests {
             ))
             .id();
 
-        let mut squad = Squad {
-            id: SquadId(1),
-            owner_id: Some(p1),
-            members: BTreeSet::new(),
-            mission_type: MissionType::Attack,
-            target: Some(GridPosition { x: 1, y: 8 }),
-            target_island: None,
-            phase: MissionPhase::Executing,
-            transport_entity: None,
-            cargo_entities: Vec::new(),
-            pickup_position: None,
-            drop_position: None,
-            delivered_cargo: Vec::new(),
-            allow_partial_departure: false,
-            departure_authorized: true,
-            return_after_combat: false,
-        };
+        let mut squad = Squad::new(SquadId(1), Some(p1), MissionType::Attack);
+        squad.target = Some(GridPosition { x: 1, y: 8 });
+        squad.phase = MissionPhase::Executing;
         squad.members.insert(unit_entity);
 
         let mut assignments = HashMap::default();

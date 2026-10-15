@@ -139,8 +139,8 @@ fn test_v3_multi_cargo_invasion_loads_transits_and_lands() {
     let mut manager = crate::ai::squad::SquadManager::new();
     let squad = manager.create_squad(crate::ai::squad::MissionType::Transport);
     squad.members.insert(transport);
-    squad.transport_entity = Some(transport);
-    squad.cargo_entities = vec![capture, combat];
+    squad.transport_entity = Some(transport).into();
+    squad.cargo_entities = vec![capture, combat].into();
     squad.pickup_position = Some(GridPosition { x: 0, y: 1 });
     squad.target_island = Some(target_island);
     squad.target = Some(GridPosition { x: 4, y: 0 });
