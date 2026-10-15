@@ -3,45 +3,51 @@
 [v3提案書](ai-redesign-v3-proposal.md) §C・§D と段階3の実装方針。
 開始点は `refactor/ai-redesign-v3-stage2` の `c7dd8882b5d029cb12b90caa6975e4ba1475edd1`（S4採用後）。
 
-## 継続実装の候補（2026-10-15、評価中）
+## 今回の継続範囲（2026-10-15、実装・検証済み）
 
-開始HEAD `c8ad829` を取得し、S1〜S8の候補を実装した。**まだ受入完了ではない。**
-以下の過去の受入履歴と、今回の候補の検証を混同しない。
-S1は全28条件で一致。修正版S2は総勝利21→20、通常勝利8→12のトレードオフを記録した。
-S3は8局で中断しS4〜S8は対戦未受入。全Rust検証にはgolden 3件の失敗が残る。
-ユーザーのHANDOFF/push依頼でcheckpointを保存し、稼働jobは停止／完了した。
-詳細な継続状態はリポジトリの `HANDOFF.md`、証拠は `work/stage3/` に記録する。
+開始HEAD `c8ad829` からS1〜S8を実装し、checkpoint `9412feb` をpush後に再開した。
+S1は全28条件で本文・勝敗・turn一致。修正版S2は総勝利21→20、通常勝利8→12のトレードオフを記録した。
+再開後はS3〜S8を一段ずつ直前採用版と50T・28条件・全体jobs8で比較して受け入れた。
+最終S8はV4通常9＋上限13＝22勝、V200通常3＋上限3＝6敗。V4勝局平均42.636T、通常勝利平均32.000T。
+S4/S6で通常勝利数と平均Tが後退した点、各段の得失を[再開後報告](../reports/ai-stage3-resume-20261015/README.md)に残す。
+一様な改善や統計的な非劣後は主張しない。
+
+最終全Rustは971成功・失敗0・ignore2。Clippy全target/feature、engine WASM、fmt、diffも成功。
+map32の既存都市維持期待は変更せず成功した。golden3件はS3/S4の意図的な実行・目標変更を確認後に更新し、
+事前審査したactualのSHAと照合した。他4fixtureは不変。更新前968成功・3失敗・ignore2の記録も保存した。
+レビューは主担当による確認で、独立agent/humanレビューは未実施。
 
 | 状態 | 正本／投影 | 更新境界 |
 |---|---|---|
 | Entityの一意な現在所属と旧Squad履歴 | UnitOperationRegistry | resolve→delta→OperationLedger::commit。履歴は現在bindingへ復活させない |
-| 正規化前の所属候補とEntity候補索引 | manager側ProposalStore | SquadId-keyed ProposalCommit。draftの構造変更も明示的に登録／解放 |
-| Squadの所属field | 読取り互換view | 提案commitで候補の投影、正規化commit後は現在bindingの投影。一意な実所属照会には使わない |
-| 当手番の採用portfolioのEntity列 | commit後の現在所属からの投影 | 編成完了／手番末のcommit後。目標・予算・購入不足は戦略意図として保持 |
-| 生産の専任Capture予約 | 採用時担当 ∩ commit後の有効Capture実所属 | 実所属一覧が増えても予約範囲を増やさず、攻撃歩兵・Combat cargoは数えない |
-| Reserveの再利用先 | reserve_entityという受入identity履歴 | 通常配分へ解放後、実際に未所属で再びReserveになる場合だけ再利用。所属判定には使わない |
-| DAG指令の継続参照 | SquadOperationId→現在の実行Squadの索引 | 新設時のlogical IDを保持し、member集合の重複から引き継がない |
+| 正規化前の所属候補とEntity候補索引 | manager側ProposalStore | SquadId-keyed ProposalCommit。draftの構造変更も登録／解放する |
+| Squadの所属field | 読取り互換view | 提案commitで候補の投影、正規化commit後は現在bindingの投影。一意所属照会には使わない |
+| 当手番portfolioのEntity列 | commit後の現在所属からの投影 | 編成完了／手番末のcommit後。目標・予算・購入不足は戦略意図として保持 |
+| 生産の専任Capture予約 | 採用時担当 ∩ commit後の有効Capture実所属 | 実所属の追加で予約を広げず、Attack歩兵・Combat cargoを数えない |
+| Reserveの再利用先 | reserve_entityという受入identity履歴 | 通常配分へ解放後、再び未所属でReserveになる場合だけ再利用。現在所属の判定には使わない |
+| DAG指令の継続参照 | SquadOperationId→現在の実行Squad索引 | member集合の重複から引き継がず、実行作戦のidentityで参照する |
 
-途中の複数候補を読む判断は `proposal_view()` / storeを明示する。本番の
-Squad→store逆算同期は廃止し、直接書込みを許すfixtureの同期だけをtest buildへ隔離した。
-内部の複合phase更新はstoreのrosterを作業値へ移し、索引と互換viewを同じ確定で更新する。
-公開readonly viewとの互換を残しているため、「常時すべてのviewが一意所属」を保証する構造ではない。
-唯一性の境界はresolve/commitであり、読み手は現在所属と途中提案を区別する。
+途中判断はproposal view/store、現在所属はregistryから読む。本番のSquad→store逆算同期は除去し、
+直接書込みを許すfixtureの同期だけcfg(test)に残した。途中の複数候補を許すため、常時view全てが
+一意所属である構造ではない。内部mutable APIを閉じるセキュリティ境界でもない。
 
-S3では継続配備をcampaign再編から保護してIDの再作成を防ぐ。S4では未所属の無い再接続を省き、
-未所属を含む作戦だけを処理する。固定3周をやめ、集合変化と循環検出で停止する。
-S5では追加輸送波を通常のSquadDraft→commitへ統合し、手動発番を削除する。
-S6ではReserveを通常配分へ解放したうえで受入identityを再利用し、S7では手番末の
-既存Reserve全体の解放を除去する。foreign/mixed rosterは再利用せず保護する。
+S3は継続配備のSquad IDをcampaign再編の転用・解散から保護する。
+S4は未所属と、目標島へ上陸済みで輸送bindingが残るcargoだけを修復し、搭載中cargoを保護する。
+局地再接続はCampaignAssignmentScopeで通常再計画と分け、pending以外の現在任務・目標・IDを置換しない。
+現在のAttack/Defenseを護衛の読取り文脈として取得し、所属修復なしの入口でも出発許可を更新する。
+追加占領兵は既存Captureの担当施設を避け、未担当施設を優先する。全施設が担当済みなら従来fallbackで援護する。
+固定3周はEntityと修復理由の集合変化・循環検出へ変更し、実際の孤立・上陸handoff用の修復経路は残る。
 
-DAGは島全体のCampaign ownerだけでは複数の区間任務を区別できないため、
-実行作戦のSquadOperationIdを使う。SquadIdの実行索引は残すが、commitment_membersの
-member引継ぎcacheや指令本文の二重保持は行わない。
+S5は追加輸送波を通常draft→proposal→commitへ統合した。全28局で本文・勝敗・turnだけでなく、
+最終盤面・所属・輸送・配備traceも一致した。S6はV4のReserveを通常配分へ解放した後に受入IDを再利用し、
+S7は手番末に既存Reserve全体を解放しない。foreign/mixedと旧AIを保護する。
+S8は実行作戦のSquadOperationIdを用い、commitment_membersとRouteSquadのmember複製を除去した。
+島全体のCampaign ownerだけでは複数の区間任務を区別できないため、現在Squadの実行索引は残す。
 
-別snapshotでCargo targetを共有した際の成果物の誤再利用を検出したため、
-ビルドはsource内容の前後SHA照合に加え、Cargo JSONでengine/serverが再コンパイルされたことと
-実executableを確認する。無効な初回S4/S5 binは受入根拠から除外する。
-全体の対戦並列数は8。最終Rustテストは専用targetで別途ビルドする。
+各nativeは不変snapshotの前後全source SHA、Cargo JSONのengine/server fresh=false、実executableを検査して固定した。
+共有targetで過去に検出した誤再利用の成果物は受入根拠から除外した。rootのRust156ファイルは固定S8とbyte一致する。
+現在の引継ぎはrootのHANDOFF.md、詳細は再開後報告、巨大な生履歴・snapshot・bin・targetはwork/stage3/に保持する。
+この完了範囲とv3提案全体を混同しない。D5、占有モデル統一、施設の再予測/交換条件強化等は今回の範囲外。
 
 ## 開始版までの受入履歴
 

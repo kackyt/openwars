@@ -487,12 +487,12 @@ T4 P1 end
 T4 P2 begin V4 Standard
   Wait { target_pos: GridPosition { x: 23, y: 6 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 25, y: 4 }, to: GridPosition { x: 23, y: 6 }, fuel_used: 3 }
-  Capture { target_pos: GridPosition { x: 22, y: 8 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 22, y: 8 }, to: GridPosition { x: 22, y: 8 }, fuel_used: 0 }
-    ev PropertyCapturedEvent { x: 22, y: 8, new_owner: Some(PlayerId(2)) }
   Capture { target_pos: GridPosition { x: 21, y: 8 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 21, y: 8 }, to: GridPosition { x: 21, y: 8 }, fuel_used: 0 }
     ev PropertyCapturedEvent { x: 21, y: 8, new_owner: Some(PlayerId(2)) }
+  Capture { target_pos: GridPosition { x: 22, y: 8 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 22, y: 8 }, to: GridPosition { x: 22, y: 8 }, fuel_used: 0 }
+    ev PropertyCapturedEvent { x: 22, y: 8, new_owner: Some(PlayerId(2)) }
   Wait { target_pos: GridPosition { x: 21, y: 7 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 21, y: 7 }, to: GridPosition { x: 21, y: 7 }, fuel_used: 0 }
   Wait { target_pos: GridPosition { x: 20, y: 7 } }

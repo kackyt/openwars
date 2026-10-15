@@ -2496,13 +2496,107 @@ fn campaign_combat_responsibilities(
     responsibilities
 }
 
+/// 通常の再計画と、正本で特定したEntityだけの再接続を分ける。
+#[derive(Clone, Copy)]
+enum CampaignAssignmentScope<'a> {
+    Full,
+    Reconnect(&'a HashSet<Entity>),
+}
+impl CampaignAssignmentScope<'_> {
+    /// 再接続するEntityと、現在任務にいる護衛の読取り文脈を混同しない。
+    fn synchronize_departure(
+        self,
+        world: &World,
+        manager: &mut SquadManager,
+        player: PlayerId,
+        assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+        connectivity: &mut TerrainConnectivity,
+    ) {
+        let Self::Reconnect(pending) = self else {
+            synchronize_local_capture_departure(world, manager, player, assignment, connectivity);
+            return;
+        };
+        let owner = OperationOwner::Campaign {
+            player_id: player,
+            island_id: assignment.island_id,
+        };
+        let registry = world.get_resource::<UnitOperationRegistry>();
+        let mut escorts = HashSet::default();
+        for squad in manager.proposal_view().squads.iter().filter(|squad| {
+            matches!(
+                squad.mission_type,
+                MissionType::Attack | MissionType::Defense
+            ) && squad_is_mutable_by_player(world, squad, player)
+        }) {
+            for entity in &squad.members {
+                if registry
+                    .and_then(|r| r.assignment(*entity))
+                    .is_some_and(|current| {
+                        current.owner == owner
+                            && ((current.squad_id == Some(squad.id)
+                                && current.role == OperationUnitRole::Member)
+                                || pending.contains(entity))
+                    })
+                {
+                    escorts.insert(*entity);
+                }
+            }
+        }
+        let mut context = assignment.clone();
+        context.combat_entities = escorts.into_iter().collect();
+        context
+            .combat_entities
+            .sort_by_key(|entity| entity.to_bits());
+        synchronize_local_capture_departure(world, manager, player, &context, connectivity);
+    }
+
+    fn assign(
+        self,
+        world: &World,
+        manager: &mut SquadManager,
+        player: PlayerId,
+        island: crate::ai::islands::IslandId,
+        responsibilities: Vec<CampaignResponsibility>,
+        missions: &[MissionType],
+    ) {
+        assign_campaign_responsibilities_scoped(
+            world,
+            manager,
+            player,
+            island,
+            responsibilities,
+            missions,
+            self,
+        );
+    }
+}
+
 pub(super) fn assign_campaign_responsibilities(
+    world: &World,
+    manager: &mut SquadManager,
+    player_id: PlayerId,
+    island_id: crate::ai::islands::IslandId,
+    responsibilities: Vec<CampaignResponsibility>,
+    managed_missions: &[MissionType],
+) {
+    CampaignAssignmentScope::Full.assign(
+        world,
+        manager,
+        player_id,
+        island_id,
+        responsibilities,
+        managed_missions,
+    );
+}
+
+fn assign_campaign_responsibilities_scoped(
     world: &World,
     manager: &mut SquadManager,
     player_id: PlayerId,
     island_id: crate::ai::islands::IslandId,
     mut responsibilities: Vec<CampaignResponsibility>,
     managed_missions: &[MissionType],
+    scope: CampaignAssignmentScope<'_>,
 ) {
     // 生産目的が続くSquadはcampaign再編の受入先に転用せず、空になっても解散しない。
     // 後段の配備接続が同じidentityへ差分を戻すため、新しい孤立Entityを生まない。
@@ -2510,6 +2604,38 @@ pub(super) fn assign_campaign_responsibilities(
         .get_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>()
         .map(|registry| registry.protected_squads(player_id))
         .unwrap_or_default();
+    // 他の現在bindingを持つSquadを受入先・解散対象にせず、既存任務を維持する。
+    let fixed_ids = match scope {
+        CampaignAssignmentScope::Full => HashSet::default(),
+        CampaignAssignmentScope::Reconnect(pending) => {
+            for responsibility in &mut responsibilities {
+                responsibility
+                    .members
+                    .retain(|entity| pending.contains(entity));
+            }
+            manager
+                .proposal_view()
+                .squads
+                .iter()
+                .filter(|squad| {
+                    squad
+                        .members
+                        .iter()
+                        .chain(squad.cargo_entities.iter())
+                        .chain(squad.delivered_cargo.iter())
+                        .chain(squad.transport_entity.iter())
+                        .any(|entity| {
+                            !pending.contains(entity)
+                                && world
+                                    .get_resource::<UnitOperationRegistry>()
+                                    .and_then(|registry| registry.assignment(*entity))
+                                    .is_some_and(|binding| binding.squad_id == Some(squad.id))
+                        })
+                })
+                .map(|squad| squad.id)
+                .collect()
+        }
+    };
     for responsibility in &mut responsibilities {
         responsibility
             .members
@@ -2530,7 +2656,11 @@ pub(super) fn assign_campaign_responsibilities(
             .proposal_view()
             .squads
             .iter()
-            .filter(|squad| !used_ids.contains(&squad.id) && !deployment_ids.contains(&squad.id))
+            .filter(|squad| {
+                !used_ids.contains(&squad.id)
+                    && !deployment_ids.contains(&squad.id)
+                    && !fixed_ids.contains(&squad.id)
+            })
             .filter(|squad| squad_is_mutable_by_player(world, squad, player_id))
             .filter(|squad| squad.mission_type == responsibility.mission_type)
             .filter(|squad| squad.target_island == Some(island_id))
@@ -2594,6 +2724,7 @@ pub(super) fn assign_campaign_responsibilities(
     let selected_set: HashSet<_> = selected_ids.into_iter().collect();
     OperationLedger::squad_list(manager).retain(|squad| {
         selected_set.contains(&squad.id)
+            || fixed_ids.contains(&squad.id)
             || deployment_ids.contains(&squad.id)
             || !squad_is_mutable_by_player(world, squad, player_id)
             || squad.return_after_combat
@@ -2652,16 +2783,35 @@ fn prepare_campaign_local_assignment_with_connectivity(
     assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
     connectivity: &mut TerrainConnectivity,
 ) {
+    prepare_campaign_local_assignment_scoped(
+        world,
+        manager,
+        player_id,
+        assignment,
+        connectivity,
+        CampaignAssignmentScope::Full,
+    );
+}
+
+fn prepare_campaign_local_assignment_scoped(
+    world: &World,
+    manager: &mut SquadManager,
+    player_id: PlayerId,
+    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    connectivity: &mut TerrainConnectivity,
+    scope: CampaignAssignmentScope<'_>,
+) {
     // 小規模マップのV4は extended 側の実装を使う。
     if crate::ai::code_path::is_extended_at(
         "squad.rs::prepare_campaign_local_assignment_with_connectivity",
     ) {
-        return extended::prepare_campaign_local_assignment_with_connectivity(
+        return extended::prepare_campaign_local_assignment_scoped(
             world,
             manager,
             player_id,
             assignment,
             connectivity,
+            scope,
         );
     }
     use crate::ai::island_campaign::IslandCampaignDecision;
@@ -2689,7 +2839,7 @@ fn prepare_campaign_local_assignment_with_connectivity(
                 .iter()
                 .flat_map(|responsibility| responsibility.members.iter().copied())
                 .collect();
-            assign_campaign_responsibilities(
+            scope.assign(
                 world,
                 manager,
                 player_id,
@@ -2739,7 +2889,7 @@ fn prepare_campaign_local_assignment_with_connectivity(
                     members: combat,
                 }];
             }
-            assign_campaign_responsibilities(
+            scope.assign(
                 world,
                 manager,
                 player_id,
@@ -2757,7 +2907,7 @@ fn prepare_campaign_local_assignment_with_connectivity(
                 &capture,
                 connectivity,
             );
-            assign_campaign_responsibilities(
+            scope.assign(
                 world,
                 manager,
                 player_id,
@@ -2778,7 +2928,7 @@ fn prepare_campaign_local_assignment_with_connectivity(
                 &capture,
                 connectivity,
             );
-            assign_campaign_responsibilities(
+            scope.assign(
                 world,
                 manager,
                 player_id,
@@ -2809,7 +2959,7 @@ fn prepare_campaign_local_assignment_with_connectivity(
                 &combat,
                 connectivity,
             );
-            assign_campaign_responsibilities(
+            scope.assign(
                 world,
                 manager,
                 player_id,
@@ -2820,7 +2970,7 @@ fn prepare_campaign_local_assignment_with_connectivity(
         }
         _ => {}
     }
-    synchronize_local_capture_departure(world, manager, player_id, assignment, connectivity);
+    scope.synchronize_departure(world, manager, player_id, assignment, connectivity);
 }
 
 /// 局地Captureは首都本隊の完全編成を待たない。ただし占領完了前に接触できる敵が
@@ -3886,7 +4036,80 @@ fn reconnect_unassigned_transport_waves(
     world.insert_resource(operation_registry);
 }
 
-/// 排他正規化で具体Squadだけを失ったEntityを、正本のCampaign/Deployment意図へ戻す。
+/// 同じEntityでも、所属欠落から上陸後の引渡し待ちへ進むことを固定点で区別する。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum V4ReconnectionReason {
+    Unbound,
+    LandedCargo,
+}
+
+/// 現在bindingを失ったEntityと、現地に到着した輸送cargoだけを修復対象にする。
+/// 有効な局地任務を再生せず、搭載中や他島のcargoも引き剥がさない。
+fn pending_v4_reconnections(
+    world: &World,
+    manager: &SquadManager,
+    player: PlayerId,
+    campaign_assignments: &[crate::ai::island_campaign::IslandCampaignAssignment],
+) -> HashMap<Entity, V4ReconnectionReason> {
+    let mut pending = unbound_entity_ids(world, manager, player)
+        .into_iter()
+        .map(|entity| (entity, V4ReconnectionReason::Unbound))
+        .collect::<HashMap<_, _>>();
+    let Some(islands) = world.get_resource::<crate::ai::islands::IslandMap>() else {
+        return pending;
+    };
+    let Some(registry) = world.get_resource::<UnitOperationRegistry>() else {
+        return pending;
+    };
+    let active_islands = campaign_assignments
+        .iter()
+        .map(|assignment| assignment.island_id)
+        .collect::<HashSet<_>>();
+    let transports = manager
+        .proposal_view()
+        .squads
+        .iter()
+        .filter(|squad| {
+            squad.mission_type == MissionType::Transport
+                && squad_is_mutable_by_player(world, squad, player)
+        })
+        .filter_map(|squad| {
+            let island = squad.target_island?;
+            active_islands
+                .contains(&island)
+                .then_some((squad.id, island))
+        })
+        .collect::<HashMap<_, _>>();
+    for (entity, binding) in registry.player_assignments(player) {
+        if !matches!(
+            binding.role,
+            OperationUnitRole::Cargo | OperationUnitRole::DeliveredCargo
+        ) || world
+            .get::<crate::components::Transporting>(entity)
+            .is_some()
+        {
+            continue;
+        }
+        let Some(island) = binding.squad_id.and_then(|id| transports.get(&id)).copied() else {
+            continue;
+        };
+        if binding.owner
+            == (OperationOwner::Campaign {
+                player_id: player,
+                island_id: island,
+            })
+            && world
+                .get::<GridPosition>(entity)
+                .and_then(|position| islands.get_island_at(position))
+                .is_some_and(|current| current.id == island)
+        {
+            pending.insert(entity, V4ReconnectionReason::LandedCargo);
+        }
+    }
+    pending
+}
+
+/// 排他正規化で具体Squadだけを失ったEntityと上陸cargoを、現在の作戦意図へ戻す。
 /// 到着ETAは候補除外に使わない。既存Entityは新規生産より遅い場合でも作戦へ寄与でき、
 /// 計画遅延はrolling plan側の予実差として別に評価する。
 fn reconnect_current_v4_operations(
@@ -3895,7 +4118,7 @@ fn reconnect_current_v4_operations(
     player_id: PlayerId,
     campaign_assignments: &[crate::ai::island_campaign::IslandCampaignAssignment],
 ) {
-    let pending = unbound_entity_ids(world, manager, player_id);
+    let pending = pending_v4_reconnections(world, manager, player_id, campaign_assignments);
     if pending.is_empty() {
         return;
     }
@@ -3906,14 +4129,28 @@ fn reconnect_current_v4_operations(
         .get_resource::<UnitOperationRegistry>()
         .map(|registry| registry.player_assignments(player_id))
         .unwrap_or_default();
+    let repair_entities = pending.keys().copied().collect::<HashSet<_>>();
     let mut effective_assignments = campaign_assignments.to_vec();
     for assignment in &mut effective_assignments {
         let owner = OperationOwner::Campaign {
             player_id,
             island_id: assignment.island_id,
         };
+        // 敗れた別ownerの元候補を復活させず、現在のownerだけを文脈に残す。
+        for entities in [
+            &mut assignment.transport_entities,
+            &mut assignment.capture_entities,
+            &mut assignment.combat_entities,
+        ] {
+            entities.retain(|entity| {
+                owner_assignments
+                    .get(entity)
+                    .is_some_and(|current| current.owner == owner)
+            });
+        }
         for (entity, current) in &owner_assignments {
             if current.owner != owner
+                || !repair_entities.contains(entity)
                 || assignment.transport_entities.contains(entity)
                 || assignment.capture_entities.contains(entity)
                 || assignment.combat_entities.contains(entity)
@@ -3956,23 +4193,96 @@ fn reconnect_current_v4_operations(
             .iter()
             .chain(&assignment.capture_entities)
             .chain(&assignment.combat_entities)
-            .any(|entity| pending.contains(entity))
+            .any(|entity| pending.contains_key(entity))
     });
     let mut connectivity = TerrainConnectivity::default();
     for assignment in &effective_assignments {
-        prepare_campaign_transport_assignment_with_connectivity(
+        // 上陸cargoの引渡しでは輸送編成を再実行しない。輸送が必要な欠落だけを処理する。
+        let needs_transport = assignment
+            .transport_entities
+            .iter()
+            .any(|e| repair_entities.contains(e))
+            || assignment
+                .capture_entities
+                .iter()
+                .chain(&assignment.combat_entities)
+                .any(|e| {
+                    repair_entities.contains(e)
+                        && !entity_can_self_deploy_to_assignment(world, assignment, *e)
+                });
+        if needs_transport {
+            prepare_campaign_transport_assignment_with_connectivity(
+                world,
+                manager,
+                player_id,
+                assignment,
+                &mut connectivity,
+            );
+        }
+        let mut local = assignment.clone();
+        for entities in [
+            &mut local.transport_entities,
+            &mut local.capture_entities,
+            &mut local.combat_entities,
+        ] {
+            entities.retain(|entity| repair_entities.contains(entity));
+        }
+        // 現在のCapture担当がいる施設へ修復要員を重ねず、未担当施設を優先する。
+        // 既存の担当を動かさないため、元の全員partitionの再生では補完できない。
+        let claimed = manager
+            .proposal_view()
+            .squads
+            .iter()
+            .filter(|squad| {
+                squad.mission_type == MissionType::Capture
+                    && squad.target_island == Some(assignment.island_id)
+                    && squad_is_mutable_by_player(world, squad, player_id)
+            })
+            .filter(|squad| {
+                squad.members.iter().any(|entity| {
+                    !repair_entities.contains(entity)
+                        && world
+                            .get_resource::<UnitOperationRegistry>()
+                            .and_then(|registry| registry.assignment(*entity))
+                            .is_some_and(|binding| {
+                                binding.squad_id == Some(squad.id)
+                                    && binding.role == OperationUnitRole::Member
+                            })
+                })
+            })
+            .filter_map(|squad| squad.target)
+            .collect::<HashSet<_>>();
+        local
+            .capture_target_positions
+            .retain(|target| !claimed.contains(target));
+        if local.capture_target_positions.is_empty() {
+            // 採用済み候補が全て担当済みでも、同島の別の未所有施設を探す。
+            // 全施設が担当済みなら既存のnearest fallbackで援護を許す。
+            local.capture_target_positions = world
+                .iter_entities()
+                .filter_map(|entity| {
+                    let target = *entity.get::<GridPosition>()?;
+                    let property = entity.get::<Property>()?;
+                    (property.owner_id != Some(player_id)
+                        && !claimed.contains(&target)
+                        && world
+                            .get_resource::<crate::ai::islands::IslandMap>()?
+                            .get_island_at(&target)
+                            .is_some_and(|island| island.id == assignment.island_id))
+                    .then_some(target)
+                })
+                .collect();
+            local
+                .capture_target_positions
+                .sort_by_key(|target| (target.y, target.x));
+        }
+        prepare_campaign_local_assignment_scoped(
             world,
             manager,
             player_id,
-            assignment,
+            &local,
             &mut connectivity,
-        );
-        prepare_campaign_local_assignment_with_connectivity(
-            world,
-            manager,
-            player_id,
-            assignment,
-            &mut connectivity,
+            CampaignAssignmentScope::Reconnect(&repair_entities),
         );
     }
     let pending_deployment = world
@@ -3981,7 +4291,7 @@ fn reconnect_current_v4_operations(
             registry
                 .active_entities(player_id)
                 .iter()
-                .any(|e| pending.contains(e))
+                .any(|e| pending.contains_key(e))
         });
     if pending_deployment {
         crate::ai::v4::deployment::prepare_deployment_squads(
@@ -4125,8 +4435,29 @@ fn prepare_squads_for_replanning(
     reconcile_unique_operation_assignments(world, manager, player_id);
 }
 
-/// 現在bindingを失ったEntityを作業集合として再接続する。
-/// 古いcacheの全作戦再生と固定3周を廃止し、変化した未所属集合だけを処理する。
+/// 所属の確定後は、再編せずに現在の護衛で出発許可だけを更新する。
+/// pendingが空でも新しい護衛の配置を反映し、編成途中の待機判定を持ち越さない。
+fn synchronize_current_v4_capture_departures(
+    world: &World,
+    manager: &mut SquadManager,
+    player: PlayerId,
+    assignments: &[crate::ai::island_campaign::IslandCampaignAssignment],
+) {
+    let pending = HashSet::default();
+    let mut connectivity = TerrainConnectivity::default();
+    for assignment in assignments {
+        CampaignAssignmentScope::Reconnect(&pending).synchronize_departure(
+            world,
+            manager,
+            player,
+            assignment,
+            &mut connectivity,
+        );
+    }
+}
+
+/// 所属欠落と上陸引渡しを作業集合として再接続する。
+/// 古いcacheの全作戦再生と固定3周を廃止し、対象と修復理由の変化だけを処理する。
 fn reconnect_v4_operation_fixed_point(
     world: &mut World,
     manager: &mut SquadManager,
@@ -4135,11 +4466,14 @@ fn reconnect_v4_operation_fixed_point(
 ) {
     let mut seen = HashSet::default();
     loop {
-        let before = unbound_entity_ids(world, manager, player_id);
+        let before = pending_v4_reconnections(world, manager, player_id, campaign_assignments);
         if before.is_empty() {
             break;
         }
-        let mut key = before.iter().map(|e| e.to_bits()).collect::<Vec<_>>();
+        let mut key = before
+            .iter()
+            .map(|(e, reason)| (e.to_bits(), *reason))
+            .collect::<Vec<_>>();
         key.sort_unstable();
         // 同じ未所属集合への再訪は移管の循環であり、さらに再編しても解決しない。
         // 固定の周回数で打ち切らず、循環をcatch-allの明示Reserveへ渡す。
@@ -4150,10 +4484,11 @@ fn reconnect_v4_operation_fixed_point(
         reconcile_unique_operation_assignments(world, manager, player_id);
         reconnect_unassigned_transport_waves(world, manager, player_id, campaign_assignments);
         reconcile_unique_operation_assignments(world, manager, player_id);
-        if unbound_entity_ids(world, manager, player_id) == before {
+        if pending_v4_reconnections(world, manager, player_id, campaign_assignments) == before {
             break;
         }
     }
+    synchronize_current_v4_capture_departures(world, manager, player_id, campaign_assignments);
 }
 
 /// 手番途中のDrop/Capture/作戦完了でSquad参照を失ったV4 Entityだけを再接続する。
@@ -4182,7 +4517,17 @@ pub(crate) fn reconcile_v4_end_turn_reserves(world: &mut World, player_id: Playe
     // Reserveはこの手番の再割当をすでに試した明示待機である。Drop/Capture/撃破などで
     // 新たにSquad参照を失ったEntityがいない限り、同じportfolioへ全Reserveを何度も
     // 戻して再構築しても結果は変わらない。通常行動1件ごとの全campaign再走査を防ぐ。
-    if unassigned_in_roster_view(world, &manager, player_id).is_empty() {
+    let landed_handoff_pending =
+        pending_v4_reconnections(world, &manager, player_id, &campaign_assignments)
+            .values()
+            .any(|reason| *reason == V4ReconnectionReason::LandedCargo);
+    if unassigned_in_roster_view(world, &manager, player_id).is_empty() && !landed_handoff_pending {
+        synchronize_current_v4_capture_departures(
+            world,
+            &mut manager,
+            player_id,
+            &campaign_assignments,
+        );
         world.insert_resource(manager);
         return;
     }
@@ -5400,6 +5745,287 @@ mod tests {
         world.insert_resource(crate::ai::islands::IslandMap::analyze(&map));
         world.insert_resource(SquadManager::new());
         world
+    }
+
+    /// 上陸済みcargoはbindingがあっても輸送待機へ残さず、現地の占領任務へ引き渡す。
+    #[test]
+    fn reconnection_hands_landed_bound_cargo_to_local_capture() {
+        for path in [
+            crate::ai::code_path::CodePath::MainCompatible,
+            crate::ai::code_path::CodePath::Extended,
+        ] {
+            let _path = crate::ai::code_path::enter(path);
+            // 編成末と手番途中の両方で、搭載中cargoのbindingを保持する。
+            for (end_turn, loaded) in [(false, false), (true, false), (false, true), (true, true)] {
+                use crate::ai::island_campaign::{
+                    IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignRequirement,
+                };
+                let mut world = setup_test_world();
+                let player = PlayerId(1);
+                let target = GridPosition { x: 2, y: 0 };
+                let mut map = Map::new(5, 1, Terrain::Plains, GridTopology::Square);
+                map.set_terrain(target.x, target.y, Terrain::City).unwrap();
+                let occupied_target = GridPosition { x: 1, y: 0 };
+                map.set_terrain(occupied_target.x, occupied_target.y, Terrain::City)
+                    .unwrap();
+                let islands = crate::ai::islands::IslandMap::analyze(&map);
+                let island = islands.get_island_at(&target).unwrap().id;
+                world.insert_resource(map);
+                world.insert_resource(islands);
+                world.spawn((target, Property::new(Terrain::City, None, 200)));
+                world.spawn((occupied_target, Property::new(Terrain::City, None, 200)));
+                let current_capturer = world
+                    .spawn((
+                        Faction(player),
+                        occupied_target,
+                        Health {
+                            current: 100,
+                            max: 100,
+                        },
+                        UnitStats {
+                            can_capture: true,
+                            movement_type: MovementType::Infantry,
+                            ..UnitStats::mock()
+                        },
+                    ))
+                    .id();
+                let cargo = world
+                    .spawn((
+                        Faction(player),
+                        GridPosition { x: 0, y: 0 },
+                        Health {
+                            current: 100,
+                            max: 100,
+                        },
+                        UnitStats {
+                            can_capture: true,
+                            movement_type: MovementType::Infantry,
+                            ..UnitStats::mock()
+                        },
+                    ))
+                    .id();
+                // 修復不要な同作戦のAttack歩兵を、占領能力だけでCaptureへ転用しない。
+                let attacker = world
+                    .spawn((
+                        Faction(player),
+                        GridPosition { x: 3, y: 0 },
+                        UnitStats {
+                            can_capture: true,
+                            ..UnitStats::mock()
+                        },
+                        Health {
+                            current: 100,
+                            max: 100,
+                        },
+                    ))
+                    .id();
+                world.spawn((
+                    Faction(PlayerId(2)),
+                    GridPosition { x: 4, y: 0 },
+                    UnitStats::mock(),
+                    Health {
+                        current: 100,
+                        max: 100,
+                    },
+                ));
+                let mut settings = crate::ai::PlayerAiSettings::new();
+                settings.set_version(player, crate::ai::AiVersion::V4);
+                world.insert_resource(settings);
+                let carrier = loaded.then(|| {
+                    world
+                        .spawn((
+                            Faction(player),
+                            GridPosition { x: 0, y: 0 },
+                            UnitStats {
+                                unit_type: UnitType::TransportHelicopter,
+                                can_capture: false,
+                                ..UnitStats::mock()
+                            },
+                            CargoCapacity {
+                                max: 1,
+                                loaded: vec![cargo],
+                            },
+                        ))
+                        .id()
+                });
+                if let Some(carrier) = carrier {
+                    world.entity_mut(cargo).insert(Transporting(carrier));
+                }
+                let mut manager = SquadManager::new();
+                {
+                    let mut proposals = OperationLedger::proposals(&mut manager);
+                    let squad = proposals.create_owned(
+                        MissionType::Transport,
+                        player,
+                        carrier.into_iter().collect(),
+                        carrier,
+                        vec![cargo],
+                    );
+                    squad.target = Some(target);
+                    squad.target_island = Some(island);
+                    let capture = proposals.create_owned(
+                        MissionType::Capture,
+                        player,
+                        BTreeSet::from([current_capturer]),
+                        None,
+                        vec![],
+                    );
+                    capture.target_island = Some(island);
+                    capture.target = Some(occupied_target);
+                    let attack = proposals.create_owned(
+                        MissionType::Attack,
+                        player,
+                        BTreeSet::from([attacker]),
+                        None,
+                        vec![],
+                    );
+                    attack.target_island = Some(island);
+                    attack.target = Some(GridPosition { x: 4, y: 0 });
+                }
+                reconcile_unique_operation_assignments(&mut world, &mut manager, player);
+                assert!(unbound_entity_ids(&world, &manager, player).is_empty());
+                let original_attack = world
+                    .resource::<UnitOperationRegistry>()
+                    .assignment(attacker)
+                    .unwrap();
+                let requirement = IslandCampaignRequirement {
+                    preferred_transport: None,
+                    transport_slots: 0,
+                    capture_units: 1,
+                    ground_combat_units: 0,
+                    combat_units: 0,
+                    total_budget: 1000,
+                };
+                let assignment = IslandCampaignAssignment {
+                    island_id: island,
+                    decision: IslandCampaignDecision::Expand,
+                    target_position: target,
+                    capture_target_positions: vec![occupied_target, target],
+                    priority_enemy_types: vec![],
+                    requirement: requirement.clone(),
+                    purchase_shortfall: requirement,
+                    allocated_budget: 1000,
+                    transport_entities: vec![],
+                    capture_entities: vec![cargo],
+                    combat_entities: vec![],
+                    operation_ready: false,
+                    continued_from_existing_squad: true,
+                };
+                let repeat_assignment = assignment.clone();
+                if end_turn {
+                    let mut cache = AdoptedTurnPortfolio::default();
+                    cache.set_campaign_portfolio(
+                        player,
+                        crate::ai::island_campaign::IslandCampaignPortfolio {
+                            active_offensives: vec![assignment],
+                            ..Default::default()
+                        },
+                    );
+                    world.insert_resource(cache);
+                    world.insert_resource(manager);
+                    reconcile_v4_end_turn_reserves(&mut world, player);
+                    manager = world.remove_resource::<SquadManager>().unwrap();
+                } else {
+                    reconnect_v4_operation_fixed_point(
+                        &mut world,
+                        &mut manager,
+                        player,
+                        &[assignment],
+                    );
+                }
+                assert_eq!(
+                    world
+                        .resource::<UnitOperationRegistry>()
+                        .assignment(attacker),
+                    Some(original_attack),
+                    "上陸cargoだけを修復し、現在のAttack所属を維持する"
+                );
+                let attack = manager
+                    .squads
+                    .iter()
+                    .find(|s| Some(s.id) == original_attack.squad_id)
+                    .unwrap();
+                assert_eq!(attack.mission_type, MissionType::Attack);
+                assert_eq!(attack.target, Some(GridPosition { x: 4, y: 0 }));
+                let binding = world
+                    .resource::<UnitOperationRegistry>()
+                    .assignment(cargo)
+                    .unwrap();
+                assert_eq!(
+                    binding.role,
+                    if loaded {
+                        OperationUnitRole::Cargo
+                    } else {
+                        OperationUnitRole::Member
+                    }
+                );
+                let squad = manager
+                    .squads
+                    .iter()
+                    .find(|s| Some(s.id) == binding.squad_id)
+                    .unwrap();
+                assert_eq!(
+                    squad.mission_type,
+                    if loaded {
+                        MissionType::Transport
+                    } else {
+                        MissionType::Capture
+                    }
+                );
+                assert_eq!(squad.target, Some(target));
+                if !loaded {
+                    assert!(
+                        squad.departure_authorized,
+                        "現在のAttack部隊を変更せず、護衛として出発判定へ計上する"
+                    );
+                }
+                if loaded {
+                    assert!(squad.cargo_entities.contains(&cargo));
+                } else {
+                    assert!(squad.members.contains(&cargo));
+                }
+                if !loaded {
+                    // 所属修復が不要な次の入口でも、護衛の現在状態で出発許可を更新する。
+                    OperationLedger::proposals(&mut manager).edit(binding.squad_id.unwrap(), |s| {
+                        s.departure_authorized = false;
+                    });
+                    assert!(
+                        pending_v4_reconnections(
+                            &world,
+                            &manager,
+                            player,
+                            std::slice::from_ref(&repeat_assignment)
+                        )
+                        .is_empty()
+                    );
+                    if end_turn {
+                        world.insert_resource(manager);
+                        reconcile_v4_end_turn_reserves(&mut world, player);
+                        manager = world.remove_resource::<SquadManager>().unwrap();
+                    } else {
+                        reconnect_v4_operation_fixed_point(
+                            &mut world,
+                            &mut manager,
+                            player,
+                            &[repeat_assignment],
+                        );
+                    }
+                    assert_eq!(
+                        world.resource::<UnitOperationRegistry>().assignment(cargo),
+                        Some(binding)
+                    );
+                    assert!(
+                        manager
+                            .squads
+                            .iter()
+                            .find(|s| Some(s.id) == binding.squad_id)
+                            .unwrap()
+                            .departure_authorized,
+                        "所属変更なしでも現在の護衛を反映し、古い出発待機を持ち越さない"
+                    );
+                }
+            }
+        }
     }
 
     /// 実所属が揃っている場合、古いportfolioを再生して別島の空placeholderを作らない。

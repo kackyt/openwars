@@ -418,15 +418,34 @@ pub(super) fn prepare_campaign_local_assignment_with_connectivity(
     assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
     connectivity: &mut TerrainConnectivity,
 ) {
+    prepare_campaign_local_assignment_scoped(
+        world,
+        manager,
+        player_id,
+        assignment,
+        connectivity,
+        CampaignAssignmentScope::Full,
+    );
+}
+
+pub(super) fn prepare_campaign_local_assignment_scoped(
+    world: &World,
+    manager: &mut SquadManager,
+    player_id: PlayerId,
+    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+    connectivity: &mut TerrainConnectivity,
+    scope: CampaignAssignmentScope<'_>,
+) {
     if !crate::ai::code_path::ext_enabled(
         "squad.rs::prepare_campaign_local_assignment_with_connectivity",
     ) {
-        return super::prepare_campaign_local_assignment_with_connectivity(
+        return super::prepare_campaign_local_assignment_scoped(
             world,
             manager,
             player_id,
             assignment,
             connectivity,
+            scope,
         );
     }
     use crate::ai::island_campaign::IslandCampaignDecision;
@@ -455,7 +474,7 @@ pub(super) fn prepare_campaign_local_assignment_with_connectivity(
                 .iter()
                 .flat_map(|responsibility| responsibility.members.iter().copied())
                 .collect();
-            assign_campaign_responsibilities(
+            scope.assign(
                 world,
                 manager,
                 player_id,
@@ -508,7 +527,7 @@ pub(super) fn prepare_campaign_local_assignment_with_connectivity(
                     members: combat,
                 }];
             }
-            assign_campaign_responsibilities(
+            scope.assign(
                 world,
                 manager,
                 player_id,
@@ -527,7 +546,7 @@ pub(super) fn prepare_campaign_local_assignment_with_connectivity(
                 &capture,
                 connectivity,
             );
-            assign_campaign_responsibilities(
+            scope.assign(
                 world,
                 manager,
                 player_id,
@@ -543,7 +562,7 @@ pub(super) fn prepare_campaign_local_assignment_with_connectivity(
                 &combat,
                 connectivity,
             );
-            assign_campaign_responsibilities(
+            scope.assign(
                 world,
                 manager,
                 player_id,
@@ -565,7 +584,7 @@ pub(super) fn prepare_campaign_local_assignment_with_connectivity(
                 &capture,
                 connectivity,
             );
-            assign_campaign_responsibilities(
+            scope.assign(
                 world,
                 manager,
                 player_id,
@@ -596,7 +615,7 @@ pub(super) fn prepare_campaign_local_assignment_with_connectivity(
                 &combat,
                 connectivity,
             );
-            assign_campaign_responsibilities(
+            scope.assign(
                 world,
                 manager,
                 player_id,
@@ -607,7 +626,7 @@ pub(super) fn prepare_campaign_local_assignment_with_connectivity(
         }
         _ => {}
     }
-    synchronize_local_capture_departure(world, manager, player_id, assignment, connectivity);
+    scope.synchronize_departure(world, manager, player_id, assignment, connectivity);
 }
 
 /// 小規模V4の採用: 首都ルートDAGとRoadmapで戦略分析のportfolioから部分集合を選ぶ。
