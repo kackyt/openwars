@@ -1,31 +1,30 @@
 //! 所属の提案・競合解決・差分確定。
 //!
-//! 所属台帳（OperationLedger）は、正本1つと、正本の写像を兼ねる提案viewで構成する。
+//! 所属台帳（OperationLedger）は、次の正本と読み出し用の投影を区別する。
 //!
-//! - 正本（現在binding＋履歴）: [`UnitOperationRegistry`]。Entityごとの唯一の作戦ownerと、
-//!   現在の具体Squad binding（`squad_id`）を持つ。勝者の無いCampaign所属はownerを残したまま
-//!   `squad_id=None` とし、直前のSquadIdは別の履歴（`previous_squad`）へ分ける。
-//!   履歴は次の正規化の「前手番の具体Squadを維持する」同点規則だけが読み、投影・行動選択・
-//!   DAG指令の参照には使わない。正規化直後に所属を判定する読み手は `bound_entities` を読む。
-//! - 提案view（roster）: Squadごとの `members` / `cargo_entities` / `delivered_cargo` /
-//!   `transport_entity`。正規化の直後は正本の現在bindingの写像に揃う（[`OperationLedger::commit`]
-//!   が正本を確定してから投影し直す）。手番途中は [`RosterCommit`] の書込みで1体が複数Squadに
-//!   現れうる提案の集合になり、次の正規化の候補（[`AssignmentProposal::from_roster_view`]）となる。
-//!   手番途中の変化を見る必要がある読み手（手番末の再接続判定など）だけがrosterを走査する。
+//! - 現在binding＋履歴: [`UnitOperationRegistry`]。Entityごとの唯一の作戦ownerと現在の
+//!   `squad_id` を持つ。勝者の無いCampaignはownerを残して `squad_id=None` とし、過去の
+//!   SquadIdを `previous_squad` へ分離する。履歴は同点規則だけが読み、行動へ復活させない。
+//! - 所属提案: managerが持つ `ProposalStore`。SquadId→roster、Entity→複数候補の索引を
+//!   keyed確定口で更新する。編成中の読み手は `proposal_view()` とstoreを明示して読む。
+//!   [`AssignmentProposal::from_roster_view`] はstoreから候補を集め、純粋なresolveがdeltaを作る。
+//! - Squadの所属field: storeの読取り互換view。提案commit時は複数候補を含みうる。
+//!   [`OperationLedger::commit`] は正規化所属を確定してから、その現在bindingだけへ投影する。
+//!   一意な実所属を照会する読み手はregistryを使い、途中viewを実所属と見なさない。
+//!
+//! 本番ではSquadのrosterからstoreを逆算する同期を行わない。構造変更時の明示的な候補登録と、
+//! `ProposalCommit::edit` の作業値だけがroster adapterを使う。直接書込みを許すテストfixtureは
+//! test専用の同期で取り込む。
 //!
 //! 境界（何を型で保証し、何を保証しないか）:
 //!
-//! - 型で保証: 本番buildでは、Squadの**所属field**（roster）への代入・swap・take・既定値上書き・
-//!   集合の変更ができず、所属fieldの書込みは [`RosterCommit`] と正規化commitだけが行う
-//!   （roster.rsのcompile_fail契約）。Squad一覧のfieldも外部から代入できない。registryの書込みは
-//!   `LedgerKey` を要求する。
-//! - 型で保証しない: Squad一覧の構造変化全般。`squads_mut()`（crate内）が返す `&mut [Squad]` は
-//!   一般の可変sliceで、`sort`・`swap`・`reverse` や `*squad = 別のSquad値` による丸ごと置換が
-//!   できる。本番codeの一覧構造変更は `SquadListCommit`（`OperationLedger::squad_list`）だけで行う
-//!   約束で、典型形の直接置換が無いことはsource走査の契約テストで確認する（近似。範囲はテストdoc）。
-//!   確定口はcrate内のどこからでも静的に開け、ownerや台帳instanceとの対応は呼出し側の責務。
-//!   World Resourceの全置換もECS一般の特権として対象外。
-//! - 未実施: rosterの実体を台帳側の提案storeへ移し、Squad側を正本の写像だけにすること。
+//! - 本番buildで所属fieldへの代入・swap・take・集合変更は外部から行えない。
+//!   fieldの実装はroster moduleに閉じ、提案store更新口と内部draft adapterが投影を更新する。
+//!   Squad一覧fieldも外部から置換できず、registryの書込みは `LedgerKey` を要求する。
+//! - crate内の `squads_mut()` は一般の可変sliceであり、sort/swap/丸ごとの置換は型だけでは
+//!   防げない。一覧変更は `SquadListCommit` を使い、典型形の直接置換をsource監査で検出する。
+//!   監査はRust parserではなく近似である。確定口のowner対応はcallerの責務であり、
+//!   World Resourceの全置換などECS一般の特権を閉じるセキュリティ境界ではない。
 
 use crate::ai::islands::IslandId;
 use crate::ai::operation_assignment::{
@@ -83,7 +82,7 @@ impl<'a> OperationLedger<'a> {
         manager.list_commit()
     }
 
-    /// 1つのSquadの実行binding層への確定口を開く。
+    /// keyed提案トランザクションまたは一覧外draftのroster adapterを開く。
     pub(crate) fn roster(squad: &mut Squad) -> RosterCommit<'_> {
         RosterCommit::open(squad)
     }
@@ -278,34 +277,16 @@ impl<'a> OperationLedger<'a> {
                         && role.is_none_or(|role| current.role == role)
                 })
         };
-        for squad in manager
-            .squads_mut()
-            .iter_mut()
+        let ids = manager
+            .proposal_view()
+            .squads
+            .iter()
             .filter(|squad| squad.owner_id == Some(player))
-        {
-            let squad_id = squad.id;
-            let roster = &mut squad.roster;
-            // 正規化後の提案は現在bindingの写像から始める（次の読取り前にstoreへ取り込む）。
-            roster.unsynced = true;
-            roster
-                .members
-                .0
-                .retain(|entity| bound(entity, squad_id, None));
-            roster
-                .cargo_entities
-                .0
-                .retain(|entity| bound(entity, squad_id, Some(OperationUnitRole::Cargo)));
-            roster
-                .delivered_cargo
-                .0
-                .retain(|entity| bound(entity, squad_id, Some(OperationUnitRole::DeliveredCargo)));
-            if roster
-                .transport_entity
-                .0
-                .is_some_and(|entity| !roster.members.0.contains(&entity))
-            {
-                roster.transport_entity.0 = None;
-            }
+            .map(|squad| squad.id)
+            .collect::<Vec<_>>();
+        let mut proposals = Self::proposals(manager);
+        for id in ids {
+            proposals.project_current(id, |entity, role| bound(entity, id, role));
         }
     }
 }
@@ -491,10 +472,12 @@ impl AssignmentProposal {
     ) -> Self {
         let mut candidates: HashMap<Entity, Vec<SquadAssignmentCandidate>> = HashMap::default();
         let mut visits = 0usize;
-        // Squad側rosterではなく、提案storeを読む（未移行writerの差分は同期で取り込む）。
+        // 提案の正本を読む。テストfixture以外にSquad→storeの逆算経路は無い。
+        #[cfg(test)]
         manager.sync_proposals();
         let store = manager.synced_proposals();
         for squad in manager
+            .proposal_view()
             .squads
             .iter()
             .filter(|squad| squad.owner_id == Some(player))
@@ -1344,6 +1327,8 @@ mod tests {
             let bytes = source.as_bytes();
             let mut index = pos;
             let mut depth = 0usize;
+            let mut parens = 0usize;
+            let mut brackets = 0usize;
             while index < bytes.len() {
                 match bytes[index] {
                     b'/' if bytes.get(index + 1) == Some(&b'/') => {
@@ -1377,9 +1362,20 @@ mod tests {
                     {
                         index += 3
                     }
-                    b';' if depth == 0 => return index + 1,
+                    // cfg(test)はitemだけでなくfield・initializerにも付く。
+                    // 関数の引数や配列の中のcommaでは区切らない。
+                    b'(' => parens += 1,
+                    b')' => parens = parens.saturating_sub(1),
+                    b'[' => brackets += 1,
+                    b']' => brackets = brackets.saturating_sub(1),
+                    b';' | b',' if depth == 0 && parens == 0 && brackets == 0 => return index + 1,
                     b'{' => depth += 1,
                     b'}' => {
+                        assert!(
+                            depth > 0,
+                            "cfg(test)の終端を判定できない: {}",
+                            &source[pos..index]
+                        );
                         depth -= 1;
                         if depth == 0 {
                             return index + 1;
@@ -1513,6 +1509,15 @@ mod tests {
         assert_eq!(deref_assignments(&compact("let n = a * squad=")), 0);
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ai");
+        let fields = strip_test_items(
+            "struct S { #[cfg(test)] dirty: bool, live: bool }\nfn make() { S { #[cfg(test)] dirty: false, live: true }; }\nfn after() { m.squads_mut()[0] = z; }",
+        );
+        assert!(!fields.contains("dirty:"));
+        assert!(fields.contains("live: bool"));
+        assert!(fields.contains("live: true"));
+        assert!(fields.contains("fn after()"));
+        assert_eq!(indexed_assignments(&compact(&fields)), 1);
+
         let mut sources = Vec::new();
         production_sources(&root, &mut sources);
         assert!(sources.len() > 50, "本番sourceを走査できていない");

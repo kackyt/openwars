@@ -3,7 +3,47 @@
 [v3提案書](ai-redesign-v3-proposal.md) §C・§D と段階3の実装方針。
 開始点は `refactor/ai-redesign-v3-stage2` の `c7dd8882b5d029cb12b90caa6975e4ba1475edd1`（S4採用後）。
 
-## 現在の状態
+## 継続実装の候補（2026-10-15、評価中）
+
+開始HEAD `c8ad829` を取得し、S1〜S8の候補を実装した。**まだ受入完了ではない。**
+以下の過去の受入履歴と、今回の候補の検証を混同しない。
+S1は全28条件で一致。修正版S2は総勝利21→20、通常勝利8→12のトレードオフを記録した。
+S3は8局で中断しS4〜S8は対戦未受入。全Rust検証にはgolden 3件の失敗が残る。
+ユーザーのHANDOFF/push依頼でcheckpointを保存し、稼働jobは停止／完了した。
+詳細な継続状態はリポジトリの `HANDOFF.md`、証拠は `work/stage3/` に記録する。
+
+| 状態 | 正本／投影 | 更新境界 |
+|---|---|---|
+| Entityの一意な現在所属と旧Squad履歴 | UnitOperationRegistry | resolve→delta→OperationLedger::commit。履歴は現在bindingへ復活させない |
+| 正規化前の所属候補とEntity候補索引 | manager側ProposalStore | SquadId-keyed ProposalCommit。draftの構造変更も明示的に登録／解放 |
+| Squadの所属field | 読取り互換view | 提案commitで候補の投影、正規化commit後は現在bindingの投影。一意な実所属照会には使わない |
+| 当手番の採用portfolioのEntity列 | commit後の現在所属からの投影 | 編成完了／手番末のcommit後。目標・予算・購入不足は戦略意図として保持 |
+| 生産の専任Capture予約 | 採用時担当 ∩ commit後の有効Capture実所属 | 実所属一覧が増えても予約範囲を増やさず、攻撃歩兵・Combat cargoは数えない |
+| Reserveの再利用先 | reserve_entityという受入identity履歴 | 通常配分へ解放後、実際に未所属で再びReserveになる場合だけ再利用。所属判定には使わない |
+| DAG指令の継続参照 | SquadOperationId→現在の実行Squadの索引 | 新設時のlogical IDを保持し、member集合の重複から引き継がない |
+
+途中の複数候補を読む判断は `proposal_view()` / storeを明示する。本番の
+Squad→store逆算同期は廃止し、直接書込みを許すfixtureの同期だけをtest buildへ隔離した。
+内部の複合phase更新はstoreのrosterを作業値へ移し、索引と互換viewを同じ確定で更新する。
+公開readonly viewとの互換を残しているため、「常時すべてのviewが一意所属」を保証する構造ではない。
+唯一性の境界はresolve/commitであり、読み手は現在所属と途中提案を区別する。
+
+S3では継続配備をcampaign再編から保護してIDの再作成を防ぐ。S4では未所属の無い再接続を省き、
+未所属を含む作戦だけを処理する。固定3周をやめ、集合変化と循環検出で停止する。
+S5では追加輸送波を通常のSquadDraft→commitへ統合し、手動発番を削除する。
+S6ではReserveを通常配分へ解放したうえで受入identityを再利用し、S7では手番末の
+既存Reserve全体の解放を除去する。foreign/mixed rosterは再利用せず保護する。
+
+DAGは島全体のCampaign ownerだけでは複数の区間任務を区別できないため、
+実行作戦のSquadOperationIdを使う。SquadIdの実行索引は残すが、commitment_membersの
+member引継ぎcacheや指令本文の二重保持は行わない。
+
+別snapshotでCargo targetを共有した際の成果物の誤再利用を検出したため、
+ビルドはsource内容の前後SHA照合に加え、Cargo JSONでengine/serverが再コンパイルされたことと
+実executableを確認する。無効な初回S4/S5 binは受入根拠から除外する。
+全体の対戦並列数は8。最終Rustテストは専用targetで別途ビルドする。
+
+## 開始版までの受入履歴
 
 2026-10-15、D-4（`8424ee6`）をローカル環境で検証し、Rとして受け入れた。
 基準 `c7dd8882` と28条件・50Tで比較し、全 `action_history` 本文・勝敗・ターン数が
@@ -184,7 +224,7 @@ debugの全実行ログは `.tmp/stage3-c1-20261015/debug-tests.log` に保存�
 ターン数・条件metadataが28/28一致。累積を主作業ツリーへ統合し、全Rust938件成功
 （ignore 2）、fmt・Clippy全target全feature・WASMチェック成功。
 
-### 未完了の境界
+### 当時（C3受入時点）の未完了境界
 
 実行binding（Squadのroster）と正規化所属・旧Squad履歴（registry）の2層を保持するR移行であり、
 現在のcanonical bindingをledgerだけに持ちSquadへ導出する正本反転はまだ行っていない。
@@ -225,7 +265,7 @@ R6対S1aの28条件でも全行動列・勝敗・ターン・metadataが一致�
 結果は `.tmp/stage3-c3-20261015/compare-r3-to-r6.json` と `compare-r6-to-s1a.json`。
 S1aのrosterはまだSquad内の提案viewを読む中間段階であり、提案store化は未完了。
 
-### 次段階
+### 当時（S1a時点）の次段階
 
 R6bでsource監査のtest module範囲・CRLF対応を補強し、test後の本番関数を残す契約を追加。
 S1b-1で、正規化直後の固定点・Reserve・輸送波の割当済み集合を現在bindingから読む候補を作った。

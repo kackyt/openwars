@@ -989,11 +989,9 @@ impl BoardScan {
                             .unwrap_or(usize::MAX),
                             logistics_rank: logistics_ranks.get(&assignment.island_id).copied(),
                             forced_target_enemies: HashSet::default(),
-                            protected_capture_entities: assignment
-                                .capture_entities
-                                .iter()
-                                .copied()
-                                .collect(),
+                            protected_capture_entities: world.get_resource::<crate::ai::planning::decision::AdoptedTurnPortfolio>()
+                    .and_then(|cache| cache.committed_capture_reservations(player_id, assignment.island_id))
+                    .cloned().unwrap_or_else(|| assignment.capture_entities.iter().copied().collect()),
                             staging_anchor: assignment.target_position,
                             execution_authorized: true,
                         }

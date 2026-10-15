@@ -3599,14 +3599,10 @@ mod tests {
     }
 
     #[test]
-    fn recreated_squad_inherits_one_previous_squad_order_atomically() {
-        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
+    fn stable_operation_reference_preserves_order_without_member_inheritance() {
+        use crate::ai::squad::SquadOperationId;
         let player = PlayerId(1);
         let island = crate::ai::islands::IslandId(0);
-        let member = Entity::from_raw(100);
-        let reinforcement = Entity::from_raw(101);
-        let old_squad = SquadId(4);
-        let new_squad = SquadId(9);
         let target = pos(6, 1);
         let commitment = CapitalRouteCommitment {
             player_id: player,
@@ -3626,43 +3622,27 @@ mod tests {
             path: vec![pos(1, 1), target],
             phase: CapitalRouteExecutionPhase::Advance,
         };
-        let registry = CapitalRoutePathRegistry {
-            commitments: HashMap::from_iter([(old_squad, commitment)]),
-            commitment_members: HashMap::from_iter([(old_squad, BTreeSet::from([member]))]),
-            assignment_diagnostics: HashMap::default(),
-        };
-
-        let inherited = inherited_capital_route_commitment(
-            &registry,
-            new_squad,
-            &BTreeSet::from([member, reinforcement]),
-        );
+        let logical = SquadOperationId(4);
+        let mut registry = CapitalRoutePathRegistry::default();
+        registry.commitments.insert(SquadId(4), commitment);
+        registry.squads_by_operation.insert(logical, SquadId(4));
+        let mut manager = crate::ai::squad::SquadManager::new();
+        let old = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+        old.operation_id = logical;
+        old.members.insert(Entity::from_raw(100));
+        let mut relocated = old.clone();
+        relocated.id = SquadId(9);
+        relocated.members.insert(Entity::from_raw(101));
         assert_eq!(
-            inherited.map(|order| order.target_node),
-            Some(CapitalRouteNodeId(2)),
-            "再編と補充でIDが変わっても、旧Squadが一意ならorderを全体へ移す"
+            inherited_capital_route_commitment(&registry, relocated.operation_id)
+                .map(|order| order.target_node),
+            Some(CapitalRouteNodeId(2))
         );
-
-        let mut conflicting = registry.clone();
-        let other_squad = SquadId(5);
-        conflicting.commitments.insert(
-            other_squad,
-            CapitalRouteCommitment {
-                target_node: CapitalRouteNodeId(3),
-                ..conflicting.commitments[&old_squad].clone()
-            },
-        );
-        conflicting
-            .commitment_members
-            .insert(other_squad, BTreeSet::from([reinforcement]));
+        let mut unrelated = relocated.clone();
+        unrelated.operation_id = SquadOperationId(10);
         assert!(
-            inherited_capital_route_commitment(
-                &conflicting,
-                new_squad,
-                &BTreeSet::from([member, reinforcement]),
-            )
-            .is_none(),
-            "異なる旧Squadを統合した場合はEntityごとの命令を混在させない"
+            inherited_capital_route_commitment(&registry, unrelated.operation_id).is_none(),
+            "memberが完全一致しても別作戦へ古いDAG指令を復活させない"
         );
     }
 
@@ -5200,7 +5180,7 @@ mod tests {
                     commitment(CapitalRouteExecutionPhase::Supply),
                 ),
             ]),
-            commitment_members: HashMap::default(),
+            squads_by_operation: HashMap::default(),
             assignment_diagnostics: HashMap::default(),
         };
 
@@ -7792,40 +7772,20 @@ pub(crate) struct CapitalRoutePathRegistry {
     /// EntityではなくSquadをキーにする。memberの追加・回復・退却があっても、
     /// Squad orderのidentityとDAG上の担当区間は変わらない。
     commitments: HashMap<SquadId, CapitalRouteCommitment>,
-    /// 再編でSquad IDが変わった場合に、旧Squadのorderを新Squadへ一括移送するための
-    /// 前手番member集合。Entityごとの別命令にはせず、重なる旧Squadが一つの場合だけ
-    /// 新しいSquad全体へ継承する。
-    commitment_members: HashMap<SquadId, BTreeSet<Entity>>,
+    /// 論理作戦IDから現在の実行形へ引く索引。指令本文やmember集合を二重保持しない。
+    squads_by_operation: HashMap<crate::ai::squad::SquadOperationId, SquadId>,
     assignment_diagnostics: HashMap<CapitalRouteTopologyKey, CapitalRouteAssignmentDiagnostics>,
 }
 
-/// 再編後のSquadへ、前手番の首都戦役orderを継承する。
-///
-/// Squad IDが維持されていれば直接参照する。IDが変わった場合も、memberが重なる旧Squadが
-/// 一つだけなら、そのorderを新Squad全体へ移す。複数の旧Squadを統合した場合はどちらかの
-/// Entityの命令を優先せず、現在の需要からSquad単位で再計画する。
-pub(super) fn inherited_capital_route_commitment<'a>(
-    registry: &'a CapitalRoutePathRegistry,
-    squad_id: SquadId,
-    members: &BTreeSet<Entity>,
-) -> Option<&'a CapitalRouteCommitment> {
-    if let Some(commitment) = registry.commitments.get(&squad_id) {
-        return Some(commitment);
-    }
-    let mut inherited = None;
-    for (previous_squad_id, previous_members) in &registry.commitment_members {
-        if previous_members.is_disjoint(members) {
-            continue;
-        }
-        let Some(commitment) = registry.commitments.get(previous_squad_id) else {
-            continue;
-        };
-        if inherited.is_some() {
-            return None;
-        }
-        inherited = Some(commitment);
-    }
-    inherited
+/// 同じ論理作戦のDAG指令だけを参照する。memberの重なりから旧命令を推測しない。
+pub(super) fn inherited_capital_route_commitment(
+    registry: &CapitalRoutePathRegistry,
+    operation_id: crate::ai::squad::SquadOperationId,
+) -> Option<&CapitalRouteCommitment> {
+    registry
+        .squads_by_operation
+        .get(&operation_id)
+        .and_then(|id| registry.commitments.get(id))
 }
 
 /// 後方Nodeが再び争奪になっても、すでに先のNodeへ投入した前衛は呼び戻さない。
@@ -9605,13 +9565,13 @@ pub(crate) fn refresh_capital_route_path_commitments(
     #[derive(Debug, Clone)]
     struct RouteSquad {
         id: SquadId,
+        operation_id: crate::ai::squad::SquadOperationId,
         mission: MissionType,
         target: Option<GridPosition>,
         forward_progress: u32,
         ground_member_count: usize,
         capture_member_count: usize,
         frontline_control_value: u64,
-        members: BTreeSet<Entity>,
     }
 
     // 発注から実Entityへ引き継いだ任務はDeploymentが正本である。汎用DAGが
@@ -9702,13 +9662,13 @@ pub(crate) fn refresh_capital_route_path_commitments(
                 .or_default()
                 .push(RouteSquad {
                     id: squad.id,
+                    operation_id: squad.operation_id,
                     mission: squad.mission_type.clone(),
                     target: squad.target,
                     forward_progress,
                     ground_member_count,
                     capture_member_count,
                     frontline_control_value,
-                    members: squad.members.clone(),
                 });
         }
     }
@@ -9784,7 +9744,7 @@ pub(crate) fn refresh_capital_route_path_commitments(
         let inherited_commitments = squads
             .iter()
             .filter_map(|squad| {
-                inherited_capital_route_commitment(&existing, squad.id, &squad.members)
+                inherited_capital_route_commitment(&existing, squad.operation_id)
                     .cloned()
                     .map(|commitment| (squad.id, commitment))
             })
@@ -10213,17 +10173,23 @@ pub(crate) fn refresh_capital_route_path_commitments(
         .commitments
         .retain(|_, commitment| commitment.player_id != player_id);
     registry.commitments.extend(commitments);
-    let committed_squad_ids = registry.commitments.keys().copied().collect::<HashSet<_>>();
-    registry
-        .commitment_members
-        .retain(|squad_id, _| committed_squad_ids.contains(squad_id));
-    registry.commitment_members.extend(
-        manager
-            .squads
-            .iter()
-            .filter(|squad| committed_squad_ids.contains(&squad.id))
-            .map(|squad| (squad.id, squad.members.clone())),
-    );
+    let commitments = &registry.commitments;
+    registry.squads_by_operation.retain(|_, id| {
+        commitments
+            .get(id)
+            .is_some_and(|order| order.player_id != player_id)
+    });
+    for squad in manager
+        .squads
+        .iter()
+        .filter(|s| s.owner_id == Some(player_id))
+    {
+        if registry.commitments.contains_key(&squad.id) {
+            registry
+                .squads_by_operation
+                .insert(squad.operation_id, squad.id);
+        }
+    }
     registry
         .assignment_diagnostics
         .retain(|key, _| key.player_id != player_id);
@@ -13387,11 +13353,9 @@ impl BoardScan {
                     .unwrap_or(usize::MAX),
                     logistics_rank: logistics_ranks.get(&assignment.island_id).copied(),
                     forced_target_enemies: HashSet::default(),
-                    protected_capture_entities: assignment
-                        .capture_entities
-                        .iter()
-                        .copied()
-                        .collect(),
+                    protected_capture_entities: world.get_resource::<crate::ai::planning::decision::AdoptedTurnPortfolio>()
+                    .and_then(|cache| cache.committed_capture_reservations(player_id, assignment.island_id))
+                    .cloned().unwrap_or_else(|| assignment.capture_entities.iter().copied().collect()),
                     capture_replacement_pending: pending_capture_replacements
                         .contains(&assignment.island_id),
                     staging_anchor: assignment.target_position,

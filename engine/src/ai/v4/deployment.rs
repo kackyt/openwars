@@ -322,6 +322,7 @@ impl V4DeploymentRegistry {
             .and_then(|reservation| reservation.squad_id)
             .filter(|squad_id| {
                 manager
+                    .proposal_view()
                     .squads
                     .iter()
                     .any(|squad| squad.id == *squad_id && squad.owner_id == Some(player))
@@ -1133,6 +1134,7 @@ pub(crate) fn prepare_deployment_squads_with_connectivity(
 
         // ID列を先に集め、1つのkeyed確定口で旧参照除去→受入の順序を保つ。
         let other_ids = manager
+            .proposal_view()
             .squads
             .iter()
             .filter(|squad| {
@@ -1142,6 +1144,7 @@ pub(crate) fn prepare_deployment_squads_with_connectivity(
             .collect::<Vec<_>>();
         let existing_id = snapshot.squad_id.filter(|id| {
             manager
+                .proposal_view()
                 .squads
                 .iter()
                 .any(|squad| squad.id == *id && squad.owner_id == Some(player_id))
@@ -1818,6 +1821,53 @@ mod tests {
             .find(|squad| squad.id == squad_id)
             .unwrap();
         assert_eq!(squad.target, Some(GridPosition { x: 6, y: 0 }));
+    }
+
+    /// 空になったcampaign責務の解放が、継続中の生産配備identityを消してはならない。
+    #[test]
+    fn campaign_delta_preserves_live_deployment_squad_identity() {
+        let (mut world, attacker, _, _, _) = deployment_world();
+        let player = PlayerId(1);
+        let mut manager = SquadManager::default();
+        prepare_deployment_squads(&mut world, &mut manager, player, &HashSet::default());
+        let before = manager
+            .squads
+            .iter()
+            .find(|s| s.members.contains(&attacker))
+            .unwrap();
+        let id = before.id;
+        let island = before.target_island.unwrap();
+        let target = before.target;
+        crate::ai::squad::assign_campaign_responsibilities(
+            &world,
+            &mut manager,
+            player,
+            island,
+            Vec::new(),
+            &[MissionType::Attack],
+        );
+        let preserved = manager
+            .squads
+            .iter()
+            .find(|s| s.id == id)
+            .expect("継続配備のSquadを保持する");
+        assert!(preserved.members.contains(&attacker));
+        assert_eq!(preserved.target, target);
+        prepare_deployment_squads(&mut world, &mut manager, player, &HashSet::default());
+        assert_eq!(
+            world
+                .resource::<V4DeploymentRegistry>()
+                .protected_squads(player),
+            HashSet::from_iter([id])
+        );
+        assert_eq!(
+            manager
+                .squads
+                .iter()
+                .filter(|s| s.members.contains(&attacker))
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -103,6 +103,7 @@ impl AssignmentProposal {
     /// 新設Squadは提案のplayerが所有し自軍unitだけを持つので、常に変更できる。
     pub fn new(world: &World, manager: &SquadManager, player: PlayerId) -> Self {
         let views = manager
+            .proposal_view()
             .squads
             .iter()
             .map(|squad| SquadView {
@@ -114,7 +115,7 @@ impl AssignmentProposal {
             .collect();
         Self {
             player,
-            existing: manager.squads.len(),
+            existing: manager.proposal_view().squads.len(),
             views,
             ops: Vec::new(),
         }
@@ -159,7 +160,7 @@ impl AssignmentProposal {
     /// 提案後にSquadManagerのSquad数が変わっていれば、添字が一致しないためpanicする。
     pub fn commit(self, manager: &mut SquadManager) -> AssignmentDelta {
         assert_eq!(
-            manager.squads.len(),
+            manager.proposal_view().squads.len(),
             self.existing,
             "提案の作成後にSquadManagerが変更された"
         );

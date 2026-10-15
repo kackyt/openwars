@@ -354,7 +354,7 @@ impl FreeUnits {
     ) -> Self {
         // 他の部隊にすでに割り当て済みの全メンバー
         let mut busy_entities = HashSet::default();
-        for squad in &manager.squads {
+        for squad in &manager.proposal_view().squads {
             busy_entities.extend(squad.members.iter().copied());
             busy_entities.extend(squad.cargo_entities.iter().copied());
             busy_entities.extend(squad.delivered_cargo.iter().copied());
@@ -574,14 +574,9 @@ fn form_campaign_squads(
     connectivity: &mut TerrainConnectivity,
 ) -> CampaignFormation {
     if is_v3 {
-        let mut cache = world
-            .remove_resource::<AdoptedTurnPortfolio>()
-            .unwrap_or_default();
-        cache.set_campaign_portfolio(player, adopted.clone());
         world
             .get_resource_or_insert_with(AiTurnProgress::default)
             .mark_squads_planned(player);
-        world.insert_resource(cache);
         claim_campaign_portfolio_assignments(world, player, adopted);
     }
     let paused_islands = if is_v3 {
@@ -1512,4 +1507,13 @@ fn finalize_formation(
     // これ以降の行動選択は重複Squadを見ず、所有者照会も平均O(1)になる。
     reconcile_unique_operation_assignments(world, manager, player);
     policy.after_final_reconcile(world, player, adopted, manager, is_v4);
+    // Squadの実所属を確定してから当手番portfolioを公開する。
+    if crate::ai::resolve_player_ai_version(world, player).uses_v3_tactics() {
+        let mut cache = world
+            .remove_resource::<AdoptedTurnPortfolio>()
+            .unwrap_or_default();
+        cache.set_campaign_portfolio(player, adopted.clone());
+        cache.project_committed(world, player, manager);
+        world.insert_resource(cache);
+    }
 }

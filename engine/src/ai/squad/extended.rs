@@ -138,7 +138,7 @@ pub(super) fn campaign_assignment_capture_responsibilities(
                 && entity.get::<Property>().is_some_and(|property| {
                     property.owner_id != Some(player_id)
                         && (property.capture_points < property.max_capture_points
-                            || manager.squads.iter().any(|squad| {
+                            || manager.proposal_view().squads.iter().any(|squad| {
                                 squad.owner_id == Some(player_id)
                                     && squad.mission_type == MissionType::Capture
                                     && squad.target == Some(member_pos)
@@ -168,6 +168,7 @@ pub(super) fn campaign_assignment_capture_responsibilities(
             continue;
         }
         let pinned_target = manager
+            .proposal_view()
             .squads
             .iter()
             .filter(|squad| {

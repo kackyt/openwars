@@ -1,11 +1,11 @@
-//! 所属台帳の実行binding層（Squadごとのroster）。
+//! 所属台帳の提案正本と、Squadごとの読取り投影。
 //!
-//! Squadの所属fieldはこのmoduleの非公開fieldにあり、外部はDerefで読むだけである。
-//! 書込みは [`RosterCommit`]（`OperationLedger::roster` が開く）と、親moduleの正規化commitだけ。
+//! [`ProposalStore`] をkeyed確定口で更新し、索引とSquad互換viewを同時に確定する。
+//! 外部のSquad所属fieldは読取り専用。内部draftの集合演算には [`RosterCommit`] を使う。
 
 use crate::ai::islands::IslandId;
 use crate::ai::operation_assignment::OperationUnitRole;
-use crate::ai::squad::{MissionPhase, MissionType, SquadId};
+use crate::ai::squad::{MissionPhase, MissionType, SquadId, SquadOperationId};
 use crate::collections::{HashMap, HashSet};
 use crate::components::{GridPosition, PlayerId};
 use bevy_ecs::prelude::*;
@@ -17,7 +17,7 @@ use std::ops::Deref;
 /// 所属の実行binding（通常メンバー・輸送役・積荷・降車済み積荷）は、このmoduleだけが
 /// 名前を付けられる非公開field `roster` に保持する。外部からは [`Deref`] で
 /// `squad.members` のように読めるが、`DerefMut` が無いためfield代入・swap・moveはできず、
-/// 書込みは `OperationLedger::roster` が返す [`RosterCommit`] だけが行う。
+/// 本番の更新はmanager単位の [`ProposalCommit`] と、明示的なdraftの確定で行う。
 /// `Clone` は手実装する（所属投影型は `.clone()` が中身の写しを返すよう `Clone` を持たない）。
 ///
 /// 所属は読める:
@@ -66,6 +66,8 @@ use std::ops::Deref;
 #[derive(Debug)]
 pub struct Squad {
     pub id: SquadId,
+    /// 実行形の再配置でも変えない論理作戦参照。新設時だけ発番する。
+    pub(crate) operation_id: SquadOperationId,
     /// Entityがまだ無いFormingもplayer間で共有しない、Squad自身の明示所有者。
     pub owner_id: Option<PlayerId>,
     pub mission_type: MissionType,
@@ -84,12 +86,14 @@ pub struct Squad {
     pub departure_authorized: bool,
     /// 着陸地点の軽歩兵だけを排除した後、輸送任務のReturnへ復帰する一時護衛状態。
     pub return_after_combat: bool,
+    /// 再計画中に一時解放したReserveの受入identity。所属の正本ではない。
+    pub(crate) reserve_entity: Option<Entity>,
     pub(super) roster: SquadRoster,
 }
 
 /// Squadの所属実行binding。読取りは `Squad` のDeref経由で行う。
 ///
-/// `Debug` は所属だけを出力し、提案storeとの同期管理（`unsynced`）は含めない。
+/// `Debug` は所属だけを出力し、test fixture専用のdirty markerは含めない。
 #[derive(Default)]
 pub struct SquadRoster {
     /// 部隊メンバー。HashSet はプロセス・スレッドごとに反復順が変わり、
@@ -102,8 +106,8 @@ pub struct SquadRoster {
     pub cargo_entities: CargoRoster,
     /// 降車済みで通常部隊への引き継ぎを待つカーゴ。
     pub delivered_cargo: CargoRoster,
-    /// 提案storeへ未反映の書込み（未移行writerのRosterCommit・テストfixture・複製）があるか。
-    /// keyed確定口（[`ProposalCommit`]）の書込みはstoreと同時に適用するので立てない。
+    /// 直接書込みするtest fixtureが提案storeへ未反映か。本番にはこのfield自体が無い。
+    #[cfg(test)]
     pub(super) unsynced: bool,
 }
 
@@ -124,6 +128,7 @@ impl Squad {
     pub(crate) fn new(id: SquadId, owner_id: Option<PlayerId>, mission_type: MissionType) -> Self {
         Self {
             id,
+            operation_id: SquadOperationId(u64::from(id.0)),
             owner_id,
             mission_type,
             target: None,
@@ -134,8 +139,10 @@ impl Squad {
             allow_partial_departure: false,
             departure_authorized: true,
             return_after_combat: false,
+            reserve_entity: None,
             roster: SquadRoster {
                 // 一覧外で作られたSquadは、一覧へ入った時点で提案storeへ登録する。
+                #[cfg(test)]
                 unsynced: true,
                 ..SquadRoster::default()
             },
@@ -154,6 +161,7 @@ impl Clone for Squad {
     fn clone(&self) -> Self {
         Self {
             id: self.id,
+            operation_id: self.operation_id,
             owner_id: self.owner_id,
             mission_type: self.mission_type.clone(),
             target: self.target,
@@ -164,12 +172,14 @@ impl Clone for Squad {
             allow_partial_departure: self.allow_partial_departure,
             departure_authorized: self.departure_authorized,
             return_after_combat: self.return_after_combat,
+            reserve_entity: self.reserve_entity,
             roster: SquadRoster {
                 members: self.roster.members.duplicate(),
                 transport_entity: self.roster.transport_entity,
                 cargo_entities: self.roster.cargo_entities.duplicate(),
                 delivered_cargo: self.roster.delivered_cargo.duplicate(),
                 // 複製は一覧へ戻されると別の提案として登録し直す。
+                #[cfg(test)]
                 unsynced: true,
             },
         }
@@ -275,7 +285,10 @@ pub(crate) struct RosterCommit<'a> {
 impl<'a> RosterCommit<'a> {
     pub(super) fn open(squad: &'a mut Squad) -> Self {
         // 未移行writerの書込みは、次に提案storeを読む時にこのSquadから取り込む。
-        squad.roster.unsynced = true;
+        #[cfg(test)]
+        {
+            squad.roster.unsynced = true;
+        }
         Self {
             squad: &mut squad.roster,
         }
@@ -284,6 +297,7 @@ impl<'a> RosterCommit<'a> {
 
 impl RosterCommit<'_> {
     /// 通常メンバーへ追加する。追加された場合はtrue。
+    #[cfg(test)]
     pub(crate) fn join(&mut self, entity: Entity) -> bool {
         self.squad.members.0.insert(entity)
     }
@@ -292,19 +306,7 @@ impl RosterCommit<'_> {
         self.squad.members.0.extend(entities);
     }
 
-    /// 通常メンバーから外す。外れた場合はtrue。積荷・輸送役bindingは変更しない。
-    pub(crate) fn leave(&mut self, entity: Entity) -> bool {
-        self.squad.members.0.remove(&entity)
-    }
-
-    pub(crate) fn retain_members(&mut self, keep: impl FnMut(&Entity) -> bool) {
-        self.squad.members.0.retain(keep);
-    }
-
-    pub(crate) fn clear_members(&mut self) {
-        self.squad.members.0.clear();
-    }
-
+    /// 輸送役bindingを設定する。
     pub(crate) fn bind_transport(&mut self, transport: Option<Entity>) {
         self.squad.transport_entity.0 = transport;
     }
@@ -314,6 +316,7 @@ impl RosterCommit<'_> {
     ///
     /// 述語は同じEntityに対して最大4回（members・cargo・delivered・transport）呼ばれる。
     /// 呼出し間で結果が変わる述語（状態を持つclosure等）を渡してはならない。
+    #[cfg(test)]
     pub(crate) fn release_where(&mut self, mut release: impl FnMut(&Entity) -> bool) {
         self.squad.members.0.retain(|entity| !release(entity));
         self.squad
@@ -336,10 +339,6 @@ impl RosterCommit<'_> {
         self.squad.members.0.insert(transport);
         self.squad.transport_entity.0 = Some(transport);
         self.squad.cargo_entities.0 = cargo;
-    }
-
-    pub(crate) fn clear_cargo(&mut self) {
-        self.squad.cargo_entities.0.clear();
     }
 
     /// 確定中の積荷bindingに含まれるか（確定口を開いたまま読むための参照）。
@@ -381,19 +380,8 @@ impl RosterCommit<'_> {
         self.squad.delivered_cargo.0.push(entity);
     }
 
-    pub(crate) fn retain_delivered(&mut self, keep: impl FnMut(&Entity) -> bool) {
-        self.squad.delivered_cargo.0.retain(keep);
-    }
-
     pub(crate) fn clear_delivered(&mut self) {
         self.squad.delivered_cargo.0.clear();
-    }
-
-    pub(crate) fn sort_delivered(&mut self) {
-        self.squad
-            .delivered_cargo
-            .0
-            .sort_by_key(|entity| entity.to_bits());
     }
 }
 
@@ -537,10 +525,9 @@ impl ProposedRoster {
 
 /// manager単位の所属提案store。SquadId→提案roster と Entity→候補（Squad・役割）の索引を持つ。
 ///
-/// 移行中の同期規則: keyed確定口（[`ProposalCommit`]）はstoreとSquad側rosterへ同じ差分を
-/// 同時に適用する。未移行writer（[`RosterCommit`]）・テストfixture・Squadの複製/新設は
-/// Squadへ `unsynced` を立て、storeを読む前の [`SquadManager::sync_proposals`] がその
-/// Squadだけをstoreへ取り込む（全writer移行後に廃止する逆算経路）。
+/// keyed確定口（[`ProposalCommit`]）がstoreを更新し、Squadへ投影する。一覧外の候補は
+/// 構造変更portalで明示的に登録する。読取り前にSquadを逆算する本番経路は持たず、
+/// 直接書込みを許すfixtureの同期だけをtest buildへ隔離する。
 #[derive(Debug, Default, Clone)]
 pub(crate) struct ProposalStore {
     by_squad: HashMap<SquadId, ProposedRoster>,
@@ -556,6 +543,13 @@ impl ProposalStore {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn candidates(&self, entity: Entity) -> &[(SquadId, OperationUnitRole)] {
         self.by_entity.get(&entity).map_or(&[], Vec::as_slice)
+    }
+
+    /// 未所属判定用の明示的な提案参照。輸送役がまだmembersにない途中状態も保護する。
+    pub(crate) fn mentioned_entities(&self) -> HashSet<Entity> {
+        let mut entities = self.by_entity.keys().copied().collect::<HashSet<_>>();
+        entities.extend(self.by_squad.values().filter_map(|r| r.transport));
+        entities
     }
 
     fn unindex(&mut self, squad_id: SquadId) {
@@ -619,6 +613,7 @@ impl SquadManager {
     pub fn create_squad(&mut self, mission_type: MissionType) -> &mut Squad {
         let squad = Squad::new(SquadId(self.next_id), None, mission_type);
         self.next_id += 1;
+        self.proposals.put(squad.id, ProposedRoster::default());
         self.list.squads.push(squad);
         self.list.squads.last_mut().unwrap()
     }
@@ -631,6 +626,11 @@ impl SquadManager {
         let squad = self.create_squad(mission_type);
         squad.owner_id = Some(owner_id);
         squad
+    }
+
+    /// 正規化前の複数候補を含む編成用view。現在所属の照会にはregistryを使う。
+    pub(crate) fn proposal_view(&self) -> &SquadList {
+        &self.list
     }
 
     /// 各Squadの非所属fieldを更新するための可変slice（crate内限定）。所属fieldは読取り専用のまま。
@@ -649,17 +649,15 @@ impl SquadManager {
         SquadListCommit { manager: self }
     }
 
-    /// 未反映のSquadを提案storeへ取り込み、一覧から消えたSquadの提案を外す。
+    /// 直接書込みを許すテストfixtureだけを取り込む。本番に逆算同期は存在しない。
+    #[cfg(test)]
     pub(crate) fn sync_proposals(&mut self) {
-        let mut listed = HashSet::default();
-        for squad in &mut self.list.squads {
-            listed.insert(squad.id);
-            if squad.roster.unsynced || !self.proposals.by_squad.contains_key(&squad.id) {
-                self.proposals
-                    .put(squad.id, ProposedRoster::of(&squad.roster));
-                squad.roster.unsynced = false;
-            }
-        }
+        let listed = self
+            .list
+            .squads
+            .iter()
+            .map(|s| s.id)
+            .collect::<HashSet<_>>();
         let stale = self
             .proposals
             .by_squad
@@ -667,34 +665,33 @@ impl SquadManager {
             .filter(|id| !listed.contains(id))
             .copied()
             .collect::<Vec<_>>();
-        for squad_id in stale {
-            self.proposals.unindex(squad_id);
+        for id in stale {
+            self.proposals.unindex(id);
+        }
+        for squad in &mut self.list.squads {
+            if squad.roster.unsynced {
+                self.proposals
+                    .put(squad.id, ProposedRoster::of(&squad.roster));
+                squad.roster.unsynced = false;
+            }
         }
     }
 
-    /// テスト用: keyed確定口を経由せずに書かれ、提案storeへ未反映のSquadがあるか。
     #[cfg(test)]
     pub(crate) fn has_unsynced_rosters(&self) -> bool {
         self.list
             .squads
             .iter()
-            .any(|squad| squad.roster.unsynced || !self.proposals.by_squad.contains_key(&squad.id))
+            .any(|s| self.proposals.proposed(s.id) != Some(&ProposedRoster::of(&s.roster)))
     }
 
-    /// 直前に [`Self::sync_proposals`] 済みの提案view（`&self` で一覧と同時に読むため）。
+    /// 正規化前の多重候補を含む明示的な提案view。
     pub(crate) fn synced_proposals(&self) -> &ProposalStore {
-        debug_assert!(
-            self.list
-                .squads
-                .iter()
-                .all(|squad| !squad.roster.unsynced
-                    && self.proposals.by_squad.contains_key(&squad.id)),
-            "提案storeが未同期"
-        );
         &self.proposals
     }
 
     pub(super) fn proposal_commit(&mut self) -> ProposalCommit<'_> {
+        #[cfg(test)]
         self.sync_proposals();
         ProposalCommit { manager: self }
     }
@@ -734,11 +731,38 @@ impl ProposalCommit<'_> {
         squad.roster.members.0 = roster.members.clone();
         squad.roster.transport_entity.0 = roster.transport;
         squad.roster.cargo_entities.0 = roster.cargo.clone();
-        squad.roster.unsynced = false;
+        #[cfg(test)]
+        {
+            squad.roster.unsynced = false;
+        }
         let squad_id = squad.id;
         self.manager.proposals.put(squad_id, roster);
         let index = self.index_of(squad_id).expect("新設したSquad");
         &mut self.manager.list.squads[index]
+    }
+
+    /// 提案storeを更新してから互換viewへ投影する。一意化はresolve時に行う。
+    fn update<R>(
+        &mut self,
+        id: SquadId,
+        apply: impl FnOnce(&mut ProposedRoster) -> R,
+    ) -> Option<R> {
+        let index = self.index_of(id)?;
+        let mut result = None;
+        self.manager
+            .proposals
+            .update(id, |roster| result = Some(apply(roster)));
+        let roster = &self.manager.proposals.by_squad[&id];
+        let view = &mut self.manager.list.squads[index].roster;
+        view.members.0.clone_from(&roster.members);
+        view.transport_entity.0 = roster.transport;
+        view.cargo_entities.0.clone_from(&roster.cargo);
+        view.delivered_cargo.0.clone_from(&roster.delivered);
+        #[cfg(test)]
+        {
+            view.unsynced = false;
+        }
+        result
     }
 
     /// 既存Squadへ通常メンバーとして提案する。追加された場合はtrue。
@@ -818,6 +842,89 @@ impl ProposalCommit<'_> {
         });
     }
 
+    /// 消滅・移管対象を全役割から解放する。述語は各参照につき一度だけ評価する。
+    pub(crate) fn release_where(&mut self, id: SquadId, mut release: impl FnMut(&Entity) -> bool) {
+        self.update(id, |r| {
+            r.members.retain(|e| !release(e));
+            r.cargo.retain(|e| !release(e));
+            r.delivered.retain(|e| !release(e));
+            if r.transport.is_some_and(|e| release(&e)) {
+                r.transport = None;
+            }
+        });
+    }
+    /// fallbackへの離脱は通常メンバーだけ。積荷と輸送役bindingは旧規則を保つ。
+    pub(crate) fn retain_live(&mut self, id: SquadId, live: &HashSet<Entity>) {
+        self.release_where(id, |e| !live.contains(e));
+    }
+
+    pub(crate) fn clear_cargo(&mut self, id: SquadId) {
+        self.update(id, |r| r.cargo.clear());
+    }
+
+    pub(crate) fn deliver(&mut self, id: SquadId, entity: Entity) {
+        self.update(id, |r| {
+            if !r.delivered.contains(&entity) {
+                r.delivered.push(entity);
+                r.delivered.sort_by_key(|e| e.to_bits());
+            }
+        });
+    }
+
+    /// 輸送phaseなど複数fieldを扱う提案トランザクション。
+    /// storeのrosterを所有権ごと作業値へ移し、処理後に索引と互換viewを同時に確定する。
+    /// 読取り時に実行viewから所属を逆算する同期ではない。
+    pub(crate) fn edit<R>(
+        &mut self,
+        id: SquadId,
+        apply: impl FnOnce(&mut Squad) -> R,
+    ) -> Option<R> {
+        let index = self.index_of(id)?;
+        let roster = self
+            .manager
+            .proposals
+            .by_squad
+            .remove(&id)
+            .expect("登録済みの提案");
+        self.manager.proposals.remove_entity_refs(id, &roster);
+        let mut draft = self.manager.list.squads[index].clone();
+        draft.roster = SquadRoster {
+            members: MemberRoster(roster.members),
+            transport_entity: TransportBinding(roster.transport),
+            cargo_entities: CargoRoster(roster.cargo),
+            delivered_cargo: CargoRoster(roster.delivered),
+            #[cfg(test)]
+            unsynced: false,
+        };
+        let result = apply(&mut draft);
+        self.manager
+            .proposals
+            .put(id, ProposedRoster::of(&draft.roster));
+        #[cfg(test)]
+        {
+            draft.roster.unsynced = false;
+        }
+        self.manager.list.squads[index] = draft;
+        Some(result)
+    }
+
+    /// resolveで選んだ現在bindingを提案正本へ反映する。foreign参照の保護はcallerが決める。
+    pub(super) fn project_current(
+        &mut self,
+        id: SquadId,
+        bound: impl Fn(&Entity, Option<OperationUnitRole>) -> bool,
+    ) {
+        self.update(id, |r| {
+            r.members.retain(|e| bound(e, None));
+            r.cargo.retain(|e| bound(e, Some(OperationUnitRole::Cargo)));
+            r.delivered
+                .retain(|e| bound(e, Some(OperationUnitRole::DeliveredCargo)));
+            if r.transport.is_some_and(|e| !r.members.contains(&e)) {
+                r.transport = None;
+            }
+        });
+    }
+
     /// 一覧順のSquadId（提案の添字をidへ写すため）。
     pub(crate) fn squad_ids(&self) -> Vec<SquadId> {
         self.manager
@@ -844,48 +951,60 @@ impl SquadListCommit<'_> {
     /// 条件を満たさないSquadを解散する（従来の `squads.retain`）。
     pub(crate) fn retain(&mut self, keep: impl FnMut(&Squad) -> bool) {
         self.manager.list.squads.retain(keep);
-    }
-
-    /// 解散判定と同時に残すSquadを更新する（従来の `squads.retain_mut`）。
-    /// 所属の書換えは閉包内でも `OperationLedger::roster` だけで行う。
-    pub(crate) fn retain_mut(&mut self, keep: impl FnMut(&mut Squad) -> bool) {
-        self.manager.list.squads.retain_mut(keep);
+        let listed = self
+            .manager
+            .list
+            .squads
+            .iter()
+            .map(|s| s.id)
+            .collect::<HashSet<_>>();
+        let removed = self
+            .manager
+            .proposals
+            .by_squad
+            .keys()
+            .filter(|id| !listed.contains(id))
+            .copied()
+            .collect::<Vec<_>>();
+        for id in removed {
+            self.manager.proposals.unindex(id);
+        }
     }
 
     /// 一覧から取り出す（再partition中の退避）。
     pub(crate) fn remove(&mut self, index: usize) -> Squad {
-        self.manager.list.squads.remove(index)
+        let squad = self.manager.list.squads.remove(index);
+        self.manager.proposals.unindex(squad.id);
+        squad
     }
 
     pub(crate) fn insert(&mut self, index: usize, squad: Squad) {
+        self.manager
+            .proposals
+            .put(squad.id, ProposedRoster::of(&squad.roster));
         self.manager.list.squads.insert(index, squad);
     }
 
     /// 退避・再構成したSquadを戻す。
     pub(crate) fn extend(&mut self, squads: impl IntoIterator<Item = Squad>) {
-        self.manager.list.squads.extend(squads);
-    }
-
-    /// 同じ位置のSquadを丸ごと置き換える（複製して更新したSquadの書戻し）。
-    pub(crate) fn replace(&mut self, index: usize, squad: Squad) {
-        self.manager.list.squads[index] = squad;
+        for squad in squads {
+            self.manager
+                .proposals
+                .put(squad.id, ProposedRoster::of(&squad.roster));
+            self.manager.list.squads.push(squad);
+        }
     }
 
     /// 発番済みSquadの末尾を一覧外へ取り出す（新規idだけを使う再構成用）。
     pub(crate) fn pop(&mut self) -> Option<Squad> {
-        self.manager.list.squads.pop()
+        let squad = self.manager.list.squads.pop()?;
+        self.manager.proposals.unindex(squad.id);
+        Some(squad)
     }
 
     /// SquadId順へ並べ直す。
     pub(crate) fn sort_by_id(&mut self) {
         self.manager.list.squads.sort_by_key(|squad| squad.id.0);
-    }
-
-    /// 一覧外で組んだSquadへ発番順にidを与えて追加する（輸送波の手動発番）。
-    pub(crate) fn push_numbered(&mut self, mut squad: Squad) {
-        squad.id = SquadId(self.manager.next_id);
-        self.manager.next_id = self.manager.next_id.saturating_add(1);
-        self.manager.list.squads.push(squad);
     }
 }
 
@@ -894,5 +1013,100 @@ impl SquadListCommit<'_> {
 impl std::ops::DerefMut for SquadManager {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.list
+    }
+}
+
+#[cfg(test)]
+mod proposal_contracts {
+    use super::*;
+    use crate::ai::planning::assignment::OperationLedger;
+
+    /// 状態を持つ述語でも二重評価せず、全役割とEntity索引を同時に解放する。
+    #[test]
+    fn keyed_release_evaluates_each_reference_once_and_removes_stale_indices() {
+        let [transport, cargo, delivered] = [1, 2, 3].map(Entity::from_raw);
+        let mut manager = SquadManager::new();
+        let id = {
+            let mut proposals = OperationLedger::proposals(&mut manager);
+            let id = proposals
+                .create_owned(
+                    MissionType::Transport,
+                    PlayerId(1),
+                    BTreeSet::from([transport]),
+                    Some(transport),
+                    vec![cargo],
+                )
+                .id;
+            proposals.deliver(id, delivered);
+            id
+        };
+        let mut visits = 0;
+        OperationLedger::proposals(&mut manager).release_where(id, |_| {
+            visits += 1;
+            true
+        });
+        assert_eq!(visits, 4); // members・cargo・delivered・transport。
+        assert_eq!(
+            manager.synced_proposals().proposed(id),
+            Some(&ProposedRoster::default())
+        );
+        for entity in [transport, cargo, delivered] {
+            assert!(manager.synced_proposals().candidates(entity).is_empty());
+        }
+        assert!(!manager.has_unsynced_rosters());
+    }
+
+    /// 解散・退避・再挿入は読取り時の逆算に頼らず、候補索引をその場で更新する。
+    #[test]
+    fn structural_commit_removes_and_restores_only_explicit_draft_proposals() {
+        let entity = Entity::from_raw(9);
+        let mut manager = SquadManager::new();
+        let id = OperationLedger::proposals(&mut manager)
+            .create_owned(
+                MissionType::Attack,
+                PlayerId(1),
+                BTreeSet::from([entity]),
+                None,
+                vec![],
+            )
+            .id;
+        let draft = OperationLedger::squad_list(&mut manager).remove(0);
+        assert!(manager.synced_proposals().candidates(entity).is_empty());
+        OperationLedger::squad_list(&mut manager).insert(0, draft);
+        assert_eq!(
+            manager.synced_proposals().candidates(entity),
+            &[(id, OperationUnitRole::Member)]
+        );
+        OperationLedger::squad_list(&mut manager).retain(|_| false);
+        assert!(manager.synced_proposals().candidates(entity).is_empty());
+        assert!(manager.synced_proposals().proposed(id).is_none());
+    }
+
+    /// 輸送phaseの複合更新も、storeを元にする一回のkeyed提案として確定する。
+    #[test]
+    fn keyed_phase_edit_commits_store_indices_and_projection_together() {
+        let [transport, cargo] = [20, 21].map(Entity::from_raw);
+        let mut manager = SquadManager::new();
+        let id = OperationLedger::proposals(&mut manager)
+            .create_owned(
+                MissionType::Transport,
+                PlayerId(1),
+                BTreeSet::from([transport]),
+                Some(transport),
+                vec![cargo],
+            )
+            .id;
+        OperationLedger::proposals(&mut manager).edit(id, |draft| {
+            let mut roster = OperationLedger::roster(draft);
+            roster.replace_cargo(Vec::new());
+            roster.push_delivered(cargo);
+            draft.phase = MissionPhase::Transport(crate::ai::squad::TransportPhase::Return);
+        });
+        assert_eq!(
+            manager.synced_proposals().candidates(cargo),
+            &[(id, OperationUnitRole::DeliveredCargo)]
+        );
+        assert!(!manager.has_unsynced_rosters());
+        assert_eq!(manager.squads[0].delivered_cargo, vec![cargo]);
     }
 }
