@@ -129,19 +129,20 @@ fn four_expand_candidates_execute_exactly_three_complete_island_operations() {
         .squads
         .iter()
         .filter(|squad| {
-            squad.mission_type == MissionType::Transport
+            squad.plan.mission_type == MissionType::Transport
                 && squad
+                    .plan
                     .target_island
                     .is_some_and(|island| selected_islands.contains(&island))
         })
         .collect();
     let executed_islands: HashSet<_> = offensive_squads
         .iter()
-        .filter_map(|squad| squad.target_island)
+        .filter_map(|squad| squad.plan.target_island)
         .collect();
     assert_eq!(executed_islands, selected_islands);
     assert!(manager.squads.iter().all(|squad| {
-        squad.target_island.is_none_or(|island| {
+        squad.plan.target_island.is_none_or(|island| {
             !candidate_islands.contains(&island) || selected_islands.contains(&island)
         })
     }));
@@ -150,7 +151,7 @@ fn four_expand_candidates_execute_exactly_three_complete_island_operations() {
     for assignment in &portfolio.active_offensives {
         let operation_squads: Vec<_> = offensive_squads
             .iter()
-            .filter(|squad| squad.target_island == Some(assignment.island_id))
+            .filter(|squad| squad.plan.target_island == Some(assignment.island_id))
             .collect();
         assert!(!operation_squads.is_empty());
         let mut actual_entities = Vec::new();
@@ -176,9 +177,9 @@ fn four_expand_candidates_execute_exactly_three_complete_island_operations() {
                 squad.transport_entity,
                 squad.members.clone(),
                 squad.cargo_entities.clone(),
-                squad.target_island,
-                squad.target,
-                squad.phase.clone(),
+                squad.plan.target_island,
+                squad.plan.target,
+                squad.plan.phase.clone(),
             )
         })
         .collect();
@@ -190,8 +191,9 @@ fn four_expand_candidates_execute_exactly_three_complete_island_operations() {
         .squads
         .iter()
         .filter(|squad| {
-            squad.mission_type == MissionType::Transport
+            squad.plan.mission_type == MissionType::Transport
                 && squad
+                    .plan
                     .target_island
                     .is_some_and(|island| selected_islands.contains(&island))
         })
@@ -201,9 +203,9 @@ fn four_expand_candidates_execute_exactly_three_complete_island_operations() {
                 squad.transport_entity,
                 squad.members.clone(),
                 squad.cargo_entities.clone(),
-                squad.target_island,
-                squad.target,
-                squad.phase.clone(),
+                squad.plan.target_island,
+                squad.plan.target,
+                squad.plan.phase.clone(),
             )
         })
         .collect();
@@ -253,10 +255,10 @@ fn purchase_only_assignment_keeps_owner_placeholder_until_assignment_is_removed(
 
     let stale_id = {
         let mut manager = world.remove_resource::<SquadManager>().unwrap();
-        let stale = manager.create_squad(MissionType::Transport);
-        stale.target_island = Some(stale_island);
-        stale.target = Some(stale_target);
-        stale.phase = MissionPhase::Forming;
+        let mut stale = manager.create_squad(MissionType::Transport);
+        stale.plan.target_island = Some(stale_island);
+        stale.plan.target = Some(stale_target);
+        stale.plan.phase = MissionPhase::Forming;
         let id = stale.id;
         world.insert_resource(manager);
         id
@@ -282,24 +284,24 @@ fn purchase_only_assignment_keeps_owner_placeholder_until_assignment_is_removed(
             .squads
             .iter()
             .find(|squad| {
-                squad.owner_id == Some(player_a)
-                    && squad.target_island == Some(target_island)
-                    && squad.mission_type == MissionType::Transport
+                squad.plan.owner_id == Some(player_a)
+                    && squad.plan.target_island == Some(target_island)
+                    && squad.plan.mission_type == MissionType::Transport
             })
             .expect("player A purchase-only assignment must create a placeholder");
-        assert_eq!(placeholder.phase, MissionPhase::Forming);
-        assert_eq!(placeholder.target, Some(assignment_a.target_position));
+        assert_eq!(placeholder.plan.phase, MissionPhase::Forming);
+        assert_eq!(placeholder.plan.target, Some(assignment_a.target_position));
         assert!(placeholder.members.is_empty());
         assert!(placeholder.transport_entity.is_none());
         assert!(placeholder.cargo_entities.is_empty());
         assert!(placeholder.delivered_cargo.is_empty());
         (
             placeholder.id,
-            placeholder.owner_id,
-            placeholder.mission_type.clone(),
-            placeholder.target_island,
-            placeholder.target,
-            placeholder.phase.clone(),
+            placeholder.plan.owner_id,
+            placeholder.plan.mission_type.clone(),
+            placeholder.plan.target_island,
+            placeholder.plan.target,
+            placeholder.plan.phase.clone(),
             placeholder.members.clone(),
             placeholder.transport_entity,
             placeholder.cargo_entities.clone(),
@@ -314,9 +316,9 @@ fn purchase_only_assignment_keeps_owner_placeholder_until_assignment_is_removed(
             .squads
             .iter()
             .find(|squad| {
-                squad.owner_id == Some(player_b)
-                    && squad.target_island == Some(target_island)
-                    && squad.mission_type == MissionType::Transport
+                squad.plan.owner_id == Some(player_b)
+                    && squad.plan.target_island == Some(target_island)
+                    && squad.plan.mission_type == MissionType::Transport
             })
             .expect("player B must keep a separate purchase-only placeholder");
         assert_ne!(placeholder.id, snapshot_a.0);
@@ -330,17 +332,18 @@ fn purchase_only_assignment_keeps_owner_placeholder_until_assignment_is_removed(
             .squads
             .iter()
             .find(|squad| {
-                squad.owner_id == Some(player_a) && squad.target_island == Some(target_island)
+                squad.plan.owner_id == Some(player_a)
+                    && squad.plan.target_island == Some(target_island)
             })
             .expect("repeated full planning must retain player A placeholder");
         assert_eq!(
             (
                 placeholder.id,
-                placeholder.owner_id,
-                placeholder.mission_type.clone(),
-                placeholder.target_island,
-                placeholder.target,
-                placeholder.phase.clone(),
+                placeholder.plan.owner_id,
+                placeholder.plan.mission_type.clone(),
+                placeholder.plan.target_island,
+                placeholder.plan.target,
+                placeholder.plan.phase.clone(),
                 placeholder.members.clone(),
                 placeholder.transport_entity,
                 placeholder.cargo_entities.clone(),
@@ -514,11 +517,11 @@ fn secure_keeps_local_capture_unit_on_nearest_unowned_property() {
         .iter()
         .find(|squad| squad.members.contains(&infantry))
         .expect("Secure must retain a local capture responsibility");
-    assert_eq!(capture.mission_type, MissionType::Capture);
-    assert_eq!(capture.target_island, Some(island));
-    assert_eq!(capture.target, Some(neutral));
+    assert_eq!(capture.plan.mission_type, MissionType::Capture);
+    assert_eq!(capture.plan.target_island, Some(island));
+    assert_eq!(capture.plan.target, Some(neutral));
     assert!(matches!(
-        capture.phase,
+        capture.plan.phase,
         MissionPhase::Forming | MissionPhase::MovingToTarget | MissionPhase::Executing
     ));
 }
@@ -580,13 +583,13 @@ fn secure_protects_its_sole_local_capture_from_an_earlier_other_island_target() 
             .iter()
             .find(|squad| squad.members.contains(&capture))
             .expect("Secure local capture Entity must remain assigned");
-        assert_eq!(squad.mission_type, MissionType::Capture);
-        assert_eq!(squad.target_island, Some(secure_island));
-        assert_eq!(squad.target, Some(secure_unowned));
+        assert_eq!(squad.plan.mission_type, MissionType::Capture);
+        assert_eq!(squad.plan.target_island, Some(secure_island));
+        assert_eq!(squad.plan.target, Some(secure_unowned));
         (
             squad.id,
-            squad.target_island,
-            squad.target,
+            squad.plan.target_island,
+            squad.plan.target,
             squad.members.clone(),
         )
     };
@@ -600,8 +603,8 @@ fn secure_protects_its_sole_local_capture_from_an_earlier_other_island_target() 
         .map(|squad| {
             (
                 squad.id,
-                squad.target_island,
-                squad.target,
+                squad.plan.target_island,
+                squad.plan.target,
                 squad.members.clone(),
             )
         })
@@ -654,7 +657,7 @@ fn secure_does_not_assign_a_disconnected_capture_unit() {
     plan_squads(&mut world, player);
     let manager = world.resource::<SquadManager>();
     assert!(manager.squads.iter().all(|squad| {
-        !squad.members.contains(&disconnected) || squad.mission_type != MissionType::Capture
+        !squad.members.contains(&disconnected) || squad.plan.mission_type != MissionType::Capture
     }));
 }
 
@@ -711,19 +714,19 @@ fn contest_preserves_capture_while_combat_uses_campaign_attack() {
         .iter()
         .find(|squad| squad.members.contains(&capture))
         .expect("Contest capture Entity must keep a capture duty");
-    assert_eq!(capture_squad.mission_type, MissionType::Capture);
-    assert_eq!(capture_squad.target_island, Some(island));
-    assert_eq!(capture_squad.target, Some(neutral));
+    assert_eq!(capture_squad.plan.mission_type, MissionType::Capture);
+    assert_eq!(capture_squad.plan.target_island, Some(island));
+    assert_eq!(capture_squad.plan.target, Some(neutral));
 
     let attack_squad = manager
         .squads
         .iter()
         .find(|squad| squad.members.contains(&combat))
         .expect("Contest combat Entity must receive a campaign attack duty");
-    assert_eq!(attack_squad.mission_type, MissionType::Attack);
-    assert_eq!(attack_squad.target_island, Some(island));
+    assert_eq!(attack_squad.plan.mission_type, MissionType::Attack);
+    assert_eq!(attack_squad.plan.target_island, Some(island));
     assert_eq!(
-        attack_squad.target,
+        attack_squad.plan.target,
         world.get::<GridPosition>(enemy).copied()
     );
     assert!(!attack_squad.members.contains(&capture));
@@ -755,11 +758,11 @@ fn defend_uses_reserved_combat_entities_and_assignment_target() {
     );
     {
         let mut manager = world.remove_resource::<SquadManager>().unwrap();
-        let squad = manager.create_squad(MissionType::Defense);
+        let mut squad = manager.create_squad(MissionType::Defense);
         squad.members.insert(tank_a);
-        squad.target_island = Some(island);
-        squad.target = Some(defended);
-        squad.phase = MissionPhase::MovingToTarget;
+        squad.plan.target_island = Some(island);
+        squad.plan.target = Some(defended);
+        squad.plan.phase = MissionPhase::MovingToTarget;
         world.insert_resource(manager);
     }
 
@@ -791,10 +794,11 @@ fn defend_uses_reserved_combat_entities_and_assignment_target() {
         .squads
         .iter()
         .find(|squad| {
-            squad.mission_type == MissionType::Defense && squad.target_island == Some(island)
+            squad.plan.mission_type == MissionType::Defense
+                && squad.plan.target_island == Some(island)
         })
         .expect("Defend assignment must create a Defense Squad");
-    assert_eq!(squad.target, Some(expected_target));
+    assert_eq!(squad.plan.target, Some(expected_target));
     assert_eq!(squad.members, expected_members);
     let registry = world.resource::<crate::ai::operation_assignment::UnitOperationRegistry>();
     for entity in &squad.members {
@@ -887,20 +891,20 @@ fn reinforce_keeps_other_operations_and_stranded_capture_continuity() {
         for entity in cargo {
             world.entity_mut(entity).insert(Transporting(transport));
         }
-        let squad = manager.create_squad(MissionType::Transport);
+        let mut squad = manager.create_squad(MissionType::Transport);
         squad.members.insert(transport);
         squad.transport_entity = Some(transport).into();
         squad.cargo_entities = cargo.to_vec().into();
-        squad.target_island = Some(island);
-        squad.target = Some(expand_positions[index]);
-        squad.phase = MissionPhase::Transport(TransportPhase::Transit);
+        squad.plan.target_island = Some(island);
+        squad.plan.target = Some(expand_positions[index]);
+        squad.plan.phase = MissionPhase::Transport(TransportPhase::Transit);
         operation_snapshots.push((
             squad.id,
             transport,
             squad.cargo_entities.clone(),
             island,
-            squad.target,
-            squad.phase.clone(),
+            squad.plan.target,
+            squad.plan.phase.clone(),
         ));
     }
 
@@ -920,12 +924,12 @@ fn reinforce_keeps_other_operations_and_stranded_capture_continuity() {
             },
         ))
         .id();
-    let recoverable = manager.create_squad(MissionType::Transport);
+    let mut recoverable = manager.create_squad(MissionType::Transport);
     recoverable.members.insert(recoverable_transport);
     recoverable.transport_entity = Some(recoverable_transport).into();
-    recoverable.target_island = Some(contested_island);
-    recoverable.target = Some(contested_property);
-    recoverable.phase = MissionPhase::Forming;
+    recoverable.plan.target_island = Some(contested_island);
+    recoverable.plan.target = Some(contested_property);
+    recoverable.plan.phase = MissionPhase::Forming;
     let _recoverable_id = recoverable.id;
     let remote_free_capture =
         spawn_master_unit(&mut world, &master_data, player, base, UnitType::Infantry);
@@ -944,11 +948,11 @@ fn reinforce_keeps_other_operations_and_stranded_capture_continuity() {
         contested_property,
         UnitType::Tank,
     );
-    let local = manager.create_squad(MissionType::Capture);
+    let mut local = manager.create_squad(MissionType::Capture);
     local.members.insert(stranded_capture);
-    local.target_island = Some(contested_island);
-    local.target = Some(contested_property);
-    local.phase = MissionPhase::MovingToTarget;
+    local.plan.target_island = Some(contested_island);
+    local.plan.target = Some(contested_property);
+    local.plan.phase = MissionPhase::MovingToTarget;
     let local_id = local.id;
     world.insert_resource(manager);
 
@@ -976,22 +980,22 @@ fn reinforce_keeps_other_operations_and_stranded_capture_continuity() {
             .expect("unaffected operation must keep its Squad ID");
         assert_eq!(squad.transport_entity, Some(transport));
         assert_eq!(squad.cargo_entities, cargo);
-        assert_eq!(squad.target_island, Some(island));
-        assert_eq!(squad.target, target);
-        assert_eq!(squad.phase, phase);
+        assert_eq!(squad.plan.target_island, Some(island));
+        assert_eq!(squad.plan.target, target);
+        assert_eq!(squad.plan.phase, phase);
     }
     let local = manager
         .squads
         .iter()
         .find(|squad| squad.id == local_id)
         .expect("stranded capture duty must continue locally");
-    assert_eq!(local.mission_type, MissionType::Capture);
-    assert_eq!(local.target_island, Some(contested_island));
-    assert_eq!(local.target, Some(contested_property));
+    assert_eq!(local.plan.mission_type, MissionType::Capture);
+    assert_eq!(local.plan.target_island, Some(contested_island));
+    assert_eq!(local.plan.target, Some(contested_property));
     assert!(local.members.contains(&stranded_capture));
     assert!(manager.squads.iter().any(|squad| {
-        squad.mission_type == MissionType::Transport
-            && squad.target_island == Some(contested_island)
+        squad.plan.mission_type == MissionType::Transport
+            && squad.plan.target_island == Some(contested_island)
             && (squad.cargo_entities.contains(&stranded_capture)
                 || squad.cargo_entities.contains(&remote_free_capture))
     }));
@@ -1079,7 +1083,7 @@ fn offshore_reinforce_without_owned_transport_is_not_ready_and_idle() {
     let manager = world.resource::<SquadManager>();
     assert!(manager.squads.iter().all(|squad| {
         !squad.cargo_entities.contains(&remote_combat)
-            || squad.mission_type == MissionType::Transport
+            || squad.plan.mission_type == MissionType::Transport
     }));
 }
 
@@ -1109,11 +1113,11 @@ fn offshore_reinforce_with_complete_owned_transport_executes_its_assignment() {
         .iter()
         .find(|squad| squad.transport_entity == Some(transport))
         .expect("reserved Reinforce transport must receive a Transport Squad");
-    assert_eq!(squad.target_island, Some(target_island));
-    assert_eq!(squad.target, Some(assignment.target_position));
+    assert_eq!(squad.plan.target_island, Some(target_island));
+    assert_eq!(squad.plan.target, Some(assignment.target_position));
     assert!(squad.cargo_entities.contains(&remote_combat));
     assert!(matches!(
-        squad.phase,
+        squad.plan.phase,
         MissionPhase::Transport(TransportPhase::Pickup | TransportPhase::Transit)
     ));
 }
@@ -1141,13 +1145,13 @@ fn partially_loaded_assignment_owned_reinforce_transport_remains_available_for_i
         .copied()
         .unwrap();
     let mut manager = world.remove_resource::<SquadManager>().unwrap();
-    let transit = manager.create_squad(MissionType::Transport);
+    let mut transit = manager.create_squad(MissionType::Transport);
     transit.members.insert(transport);
     transit.transport_entity = Some(transport).into();
     transit.cargo_entities = vec![remote_combat].into();
-    transit.target_island = Some(target_island);
-    transit.target = Some(target);
-    transit.phase = MissionPhase::Transport(TransportPhase::Transit);
+    transit.plan.target_island = Some(target_island);
+    transit.plan.target = Some(target);
+    transit.plan.phase = MissionPhase::Transport(TransportPhase::Transit);
     world.insert_resource(manager);
 
     let first = crate::ai::strategy::analyze_strategy(&mut world, player).campaign_portfolio;
@@ -1171,10 +1175,10 @@ fn partially_loaded_assignment_owned_reinforce_transport_remains_available_for_i
         .iter()
         .find(|squad| squad.transport_entity == Some(transport))
         .expect("associated loaded transport must remain in its original operation");
-    assert_eq!(continued.target_island, Some(target_island));
+    assert_eq!(continued.plan.target_island, Some(target_island));
     assert!(continued.cargo_entities.contains(&remote_combat));
     assert!(matches!(
-        continued.phase,
+        continued.plan.phase,
         MissionPhase::Transport(TransportPhase::Transit | TransportPhase::Drop)
     ));
 }
@@ -1263,13 +1267,13 @@ fn full_planning_keeps_targetless_drop_deliveries_local_across_repeated_calls() 
     ));
     let delivered = HashSet::from_iter([capture_a, capture_b, combat]);
     let mut manager = world.remove_resource::<SquadManager>().unwrap();
-    let safe_drop = manager.create_squad(MissionType::Transport);
+    let mut safe_drop = manager.create_squad(MissionType::Transport);
     safe_drop.members.insert(safe_transport);
     safe_drop.transport_entity = Some(safe_transport).into();
     safe_drop.cargo_entities = vec![capture_a, capture_b, combat].into();
-    safe_drop.target_island = None;
-    safe_drop.target = None;
-    safe_drop.phase = MissionPhase::Transport(TransportPhase::Drop);
+    safe_drop.plan.target_island = None;
+    safe_drop.plan.target = None;
+    safe_drop.plan.phase = MissionPhase::Transport(TransportPhase::Drop);
     world.insert_resource(manager);
 
     for _ in 0..2 {
@@ -1282,8 +1286,8 @@ fn full_planning_keeps_targetless_drop_deliveries_local_across_repeated_calls() 
                 .iter()
                 .find(|squad| squad.delivered_cargo.contains(entity))
                 .expect("targetless delivery must remain protected by Squad-derived local state");
-            assert_eq!(holder.target_island, None);
-            assert_eq!(holder.target, None);
+            assert_eq!(holder.plan.target_island, None);
+            assert_eq!(holder.plan.target, None);
             assert!(manager.squads.iter().all(|squad| {
                 if squad.id == holder.id {
                     return true;
@@ -1293,7 +1297,7 @@ fn full_planning_keeps_targetless_drop_deliveries_local_across_repeated_calls() 
                     && !squad.delivered_cargo.contains(entity)
             }));
             assert!(manager.squads.iter().all(|squad| {
-                !squad.members.contains(entity) || squad.target_island == Some(landing_island)
+                !squad.members.contains(entity) || squad.plan.target_island == Some(landing_island)
             }));
         }
     }
@@ -1322,11 +1326,11 @@ fn missing_source_transport_keeps_targetless_delivery_in_a_local_hold() {
     let missing_transport = world.spawn_empty().id();
     let source_id = {
         let mut manager = world.remove_resource::<SquadManager>().unwrap();
-        let source = manager.create_owned_squad(MissionType::Transport, player);
+        let mut source = manager.create_owned_squad(MissionType::Transport, player);
         source.transport_entity = Some(missing_transport).into();
         source.members.insert(missing_transport);
         source.delivered_cargo = vec![held_cargo].into();
-        source.phase = MissionPhase::Transport(TransportPhase::Return);
+        source.plan.phase = MissionPhase::Transport(TransportPhase::Return);
         let id = source.id;
         world.insert_resource(manager);
         id
@@ -1342,13 +1346,13 @@ fn missing_source_transport_keeps_targetless_delivery_in_a_local_hold() {
             .iter()
             .find(|squad| squad.delivered_cargo.contains(&held_cargo))
             .expect("missing source transport must leave cargo in a transport-independent hold");
-        assert_eq!(hold.owner_id, Some(player));
-        assert_eq!(hold.mission_type, MissionType::Transport);
-        assert_eq!(hold.phase, MissionPhase::Forming);
+        assert_eq!(hold.plan.owner_id, Some(player));
+        assert_eq!(hold.plan.mission_type, MissionType::Transport);
+        assert_eq!(hold.plan.phase, MissionPhase::Forming);
         assert_eq!(hold.transport_entity, None);
         assert!(hold.members.is_empty());
-        assert_eq!(hold.target_island, None);
-        assert_eq!(hold.target, None);
+        assert_eq!(hold.plan.target_island, None);
+        assert_eq!(hold.plan.target, None);
         assert_eq!(world.get::<GridPosition>(held_cargo), Some(&landing));
         assert_eq!(hold_id.get_or_insert(hold.id), &hold.id);
         assert_eq!(
@@ -1375,9 +1379,9 @@ fn missing_source_transport_keeps_targetless_delivery_in_a_local_hold() {
         .iter()
         .find(|squad| squad.members.contains(&held_cargo))
         .expect("held cargo must accept a later reachable local duty");
-    assert_eq!(local.mission_type, MissionType::Capture);
-    assert_eq!(local.target_island, Some(landing_island));
-    assert_eq!(local.target, Some(local_target));
+    assert_eq!(local.plan.mission_type, MissionType::Capture);
+    assert_eq!(local.plan.target_island, Some(landing_island));
+    assert_eq!(local.plan.target, Some(local_target));
     assert!(manager.squads.iter().all(|squad| {
         squad
             .delivered_cargo
@@ -1442,11 +1446,11 @@ fn targetless_delivery_releases_returned_transport_and_waits_for_local_duty() {
         .id();
     let source_id = {
         let mut manager = world.remove_resource::<SquadManager>().unwrap();
-        let source = manager.create_squad(MissionType::Transport);
+        let mut source = manager.create_squad(MissionType::Transport);
         source.members.insert(transport);
         source.transport_entity = Some(transport).into();
         source.cargo_entities = vec![held_cargo].into();
-        source.phase = MissionPhase::Transport(TransportPhase::Drop);
+        source.plan.phase = MissionPhase::Transport(TransportPhase::Drop);
         let id = source.id;
         world.insert_resource(manager);
         id
@@ -1462,7 +1466,7 @@ fn targetless_delivery_releases_returned_transport_and_waits_for_local_duty() {
             .find(|squad| squad.id == source_id)
             .expect("returning source transport must remain until reaching a base");
         assert_eq!(
-            source.phase,
+            source.plan.phase,
             MissionPhase::Transport(TransportPhase::Return)
         );
         assert_eq!(source.delivered_cargo, vec![held_cargo]);
@@ -1479,8 +1483,8 @@ fn targetless_delivery_releases_returned_transport_and_waits_for_local_duty() {
             .iter()
             .find(|squad| {
                 squad.transport_entity.is_none()
-                    && squad.target_island.is_none()
-                    && squad.target.is_none()
+                    && squad.plan.target_island.is_none()
+                    && squad.plan.target.is_none()
                     && squad.delivered_cargo.contains(&held_cargo)
             })
             .expect("landed cargo must move to a transport-independent local hold");
@@ -1489,7 +1493,7 @@ fn targetless_delivery_releases_returned_transport_and_waits_for_local_duty() {
             .iter()
             .find(|squad| {
                 squad.transport_entity == Some(transport)
-                    && squad.target_island == Some(remote_island)
+                    && squad.plan.target_island == Some(remote_island)
             })
             .expect("returned transport must be reusable by another campaign");
         assert!(
@@ -1541,7 +1545,7 @@ fn targetless_delivery_releases_returned_transport_and_waits_for_local_duty() {
                 .any(|squad| squad.id == remote_squad_id)
         );
         assert!(manager.squads.iter().all(|squad| {
-            !squad.members.contains(&held_cargo) || squad.target_island == Some(landing_island)
+            !squad.members.contains(&held_cargo) || squad.plan.target_island == Some(landing_island)
         }));
     }
 
@@ -1554,9 +1558,9 @@ fn targetless_delivery_releases_returned_transport_and_waits_for_local_duty() {
         .iter()
         .find(|squad| squad.members.contains(&held_cargo))
         .expect("held cargo must take over a later reachable local duty");
-    assert_eq!(local.mission_type, MissionType::Capture);
-    assert_eq!(local.target_island, Some(landing_island));
-    assert_eq!(local.target, Some(local_target));
+    assert_eq!(local.plan.mission_type, MissionType::Capture);
+    assert_eq!(local.plan.target_island, Some(landing_island));
+    assert_eq!(local.plan.target, Some(local_target));
     assert!(
         manager
             .squads
@@ -1646,17 +1650,17 @@ fn explicit_squad_owner_conflicts_are_quarantined_for_both_players() {
 
     let snapshots = {
         let mut manager = world.remove_resource::<SquadManager>().unwrap();
-        let squad_a = manager.create_owned_squad(MissionType::Capture, player_b);
+        let mut squad_a = manager.create_owned_squad(MissionType::Capture, player_b);
         squad_a.members.insert(conflict_a);
-        squad_a.target_island = None;
-        squad_a.target = None;
-        squad_a.phase = MissionPhase::MovingToTarget;
+        squad_a.plan.target_island = None;
+        squad_a.plan.target = None;
+        squad_a.plan.phase = MissionPhase::MovingToTarget;
         let id_a = squad_a.id;
-        let squad_b = manager.create_owned_squad(MissionType::Capture, player_a);
+        let mut squad_b = manager.create_owned_squad(MissionType::Capture, player_a);
         squad_b.members.insert(conflict_b);
-        squad_b.target_island = None;
-        squad_b.target = None;
-        squad_b.phase = MissionPhase::MovingToTarget;
+        squad_b.plan.target_island = None;
+        squad_b.plan.target = None;
+        squad_b.plan.phase = MissionPhase::MovingToTarget;
         let id_b = squad_b.id;
         let snapshots: Vec<_> = manager
             .squads
@@ -1664,12 +1668,12 @@ fn explicit_squad_owner_conflicts_are_quarantined_for_both_players() {
             .map(|squad| {
                 (
                     squad.id,
-                    squad.owner_id,
-                    squad.mission_type.clone(),
+                    squad.plan.owner_id,
+                    squad.plan.mission_type.clone(),
                     squad.members.clone(),
-                    squad.target_island,
-                    squad.target,
-                    squad.phase.clone(),
+                    squad.plan.target_island,
+                    squad.plan.target,
+                    squad.plan.phase.clone(),
                 )
             })
             .collect();
@@ -1700,12 +1704,12 @@ fn explicit_squad_owner_conflicts_are_quarantined_for_both_players() {
             .map(|squad| {
                 (
                     squad.id,
-                    squad.owner_id,
-                    squad.mission_type.clone(),
+                    squad.plan.owner_id,
+                    squad.plan.mission_type.clone(),
                     squad.members.clone(),
-                    squad.target_island,
-                    squad.target,
-                    squad.phase.clone(),
+                    squad.plan.target_island,
+                    squad.plan.target,
+                    squad.plan.phase.clone(),
                 )
             })
             .collect();
@@ -1803,22 +1807,22 @@ fn mixed_owner_squad_entities_are_unavailable_to_both_players_campaign_planning(
     let mixed_set: BTreeSet<_> = mixed_entities.iter().copied().collect();
     let (mixed_id, snapshot) = {
         let mut manager = world.remove_resource::<SquadManager>().unwrap();
-        let mixed = manager.create_squad(MissionType::Capture);
+        let mut mixed = manager.create_squad(MissionType::Capture);
         mixed.members = mixed_set.clone().into();
-        mixed.target_island = Some(target_island);
-        mixed.target = Some(target);
-        mixed.phase = MissionPhase::MovingToTarget;
+        mixed.plan.target_island = Some(target_island);
+        mixed.plan.target = Some(target);
+        mixed.plan.phase = MissionPhase::MovingToTarget;
         let snapshot = (
-            mixed.mission_type.clone(),
+            mixed.plan.mission_type.clone(),
             mixed.members.clone(),
             mixed.transport_entity,
             mixed.cargo_entities.clone(),
             mixed.delivered_cargo.clone(),
-            mixed.target_island,
-            mixed.target,
-            mixed.phase.clone(),
-            mixed.pickup_position,
-            mixed.drop_position,
+            mixed.plan.target_island,
+            mixed.plan.target,
+            mixed.plan.phase.clone(),
+            mixed.plan.pickup_position,
+            mixed.plan.drop_position,
         );
         let id = mixed.id;
         world.insert_resource(manager);
@@ -1843,19 +1847,19 @@ fn mixed_owner_squad_entities_are_unavailable_to_both_players_campaign_planning(
             .iter()
             .find(|squad| squad.id == mixed_id)
             .expect("mixed Squad must remain present");
-        assert_eq!(mixed.owner_id, None);
+        assert_eq!(mixed.plan.owner_id, None);
         assert_eq!(
             (
-                mixed.mission_type.clone(),
+                mixed.plan.mission_type.clone(),
                 mixed.members.clone(),
                 mixed.transport_entity,
                 mixed.cargo_entities.clone(),
                 mixed.delivered_cargo.clone(),
-                mixed.target_island,
-                mixed.target,
-                mixed.phase.clone(),
-                mixed.pickup_position,
-                mixed.drop_position,
+                mixed.plan.target_island,
+                mixed.plan.target,
+                mixed.plan.phase.clone(),
+                mixed.plan.pickup_position,
+                mixed.plan.drop_position,
             ),
             snapshot
         );
@@ -1929,25 +1933,25 @@ fn faction_only_cargo_marks_every_mixed_squad_reference_unavailable() {
     ]);
     let (mixed_id, snapshot) = {
         let mut manager = world.remove_resource::<SquadManager>().unwrap();
-        let mixed = manager.create_squad(MissionType::Capture);
+        let mut mixed = manager.create_squad(MissionType::Capture);
         mixed.members.insert(mixed_player_a);
         mixed.transport_entity = Some(factionless_transport).into();
         mixed.cargo_entities = vec![faction_only_player_b].into();
         mixed.delivered_cargo = vec![factionless_delivered].into();
-        mixed.target_island = Some(target_island);
-        mixed.target = Some(target);
-        mixed.phase = MissionPhase::MovingToTarget;
+        mixed.plan.target_island = Some(target_island);
+        mixed.plan.target = Some(target);
+        mixed.plan.phase = MissionPhase::MovingToTarget;
         let snapshot = (
-            mixed.mission_type.clone(),
+            mixed.plan.mission_type.clone(),
             mixed.members.clone(),
             mixed.transport_entity,
             mixed.cargo_entities.clone(),
             mixed.delivered_cargo.clone(),
-            mixed.target_island,
-            mixed.target,
-            mixed.phase.clone(),
-            mixed.pickup_position,
-            mixed.drop_position,
+            mixed.plan.target_island,
+            mixed.plan.target,
+            mixed.plan.phase.clone(),
+            mixed.plan.pickup_position,
+            mixed.plan.drop_position,
         );
         let id = mixed.id;
         world.insert_resource(manager);
@@ -1974,19 +1978,19 @@ fn faction_only_cargo_marks_every_mixed_squad_reference_unavailable() {
             .iter()
             .find(|squad| squad.id == mixed_id)
             .expect("mixed Squad must remain present");
-        assert_eq!(mixed.owner_id, None);
+        assert_eq!(mixed.plan.owner_id, None);
         assert_eq!(
             (
-                mixed.mission_type.clone(),
+                mixed.plan.mission_type.clone(),
                 mixed.members.clone(),
                 mixed.transport_entity,
                 mixed.cargo_entities.clone(),
                 mixed.delivered_cargo.clone(),
-                mixed.target_island,
-                mixed.target,
-                mixed.phase.clone(),
-                mixed.pickup_position,
-                mixed.drop_position,
+                mixed.plan.target_island,
+                mixed.plan.target,
+                mixed.plan.phase.clone(),
+                mixed.plan.pickup_position,
+                mixed.plan.drop_position,
             ),
             snapshot
         );
@@ -2036,21 +2040,21 @@ fn generic_planning_never_appends_units_to_a_foreign_same_target_squad() {
     let own_member = spawn_master_unit(&mut world, &master_data, player_b, staging, UnitType::Tank);
     let (foreign_id, snapshot) = {
         let mut manager = world.remove_resource::<SquadManager>().unwrap();
-        let squad = manager.create_squad(MissionType::Attack);
+        let mut squad = manager.create_squad(MissionType::Attack);
         squad.members.insert(foreign_member);
-        squad.target = Some(enemy_position);
-        squad.phase = MissionPhase::MovingToTarget;
+        squad.plan.target = Some(enemy_position);
+        squad.plan.phase = MissionPhase::MovingToTarget;
         let snapshot = (
-            squad.mission_type.clone(),
+            squad.plan.mission_type.clone(),
             squad.members.clone(),
             squad.transport_entity,
             squad.cargo_entities.clone(),
             squad.delivered_cargo.clone(),
-            squad.target_island,
-            squad.target,
-            squad.phase.clone(),
-            squad.pickup_position,
-            squad.drop_position,
+            squad.plan.target_island,
+            squad.plan.target,
+            squad.plan.phase.clone(),
+            squad.plan.pickup_position,
+            squad.plan.drop_position,
         );
         let id = squad.id;
         world.insert_resource(manager);
@@ -2067,16 +2071,16 @@ fn generic_planning_never_appends_units_to_a_foreign_same_target_squad() {
             .expect("foreign Squad must remain present");
         assert_eq!(
             (
-                foreign.mission_type.clone(),
+                foreign.plan.mission_type.clone(),
                 foreign.members.clone(),
                 foreign.transport_entity,
                 foreign.cargo_entities.clone(),
                 foreign.delivered_cargo.clone(),
-                foreign.target_island,
-                foreign.target,
-                foreign.phase.clone(),
-                foreign.pickup_position,
-                foreign.drop_position,
+                foreign.plan.target_island,
+                foreign.plan.target,
+                foreign.plan.phase.clone(),
+                foreign.plan.pickup_position,
+                foreign.plan.drop_position,
             ),
             snapshot
         );
@@ -2149,19 +2153,19 @@ fn planning_another_player_preserves_foreign_transport_squad_continuity() {
 
     let (squad_id, snapshot) = {
         let mut manager = world.remove_resource::<SquadManager>().unwrap();
-        let squad = manager.create_squad(MissionType::Transport);
+        let mut squad = manager.create_squad(MissionType::Transport);
         squad.members.insert(transport);
         squad.transport_entity = Some(transport).into();
         squad.cargo_entities = vec![cargo].into();
-        squad.target_island = Some(target_island);
-        squad.target = Some(target);
-        squad.phase = MissionPhase::Transport(TransportPhase::Transit);
+        squad.plan.target_island = Some(target_island);
+        squad.plan.target = Some(target);
+        squad.plan.phase = MissionPhase::Transport(TransportPhase::Transit);
         let snapshot = (
-            squad.phase.clone(),
+            squad.plan.phase.clone(),
             squad.transport_entity,
             squad.cargo_entities.clone(),
-            squad.target_island,
-            squad.target,
+            squad.plan.target_island,
+            squad.plan.target,
             squad.members.clone(),
         );
         let id = squad.id;
@@ -2179,11 +2183,11 @@ fn planning_another_player_preserves_foreign_transport_squad_continuity() {
             .expect("foreign planning must not delete player A Squad");
         assert_eq!(
             (
-                squad.phase.clone(),
+                squad.plan.phase.clone(),
                 squad.transport_entity,
                 squad.cargo_entities.clone(),
-                squad.target_island,
-                squad.target,
+                squad.plan.target_island,
+                squad.plan.target,
                 squad.members.clone(),
             ),
             snapshot
@@ -2199,9 +2203,9 @@ fn planning_another_player_preserves_foreign_transport_squad_continuity() {
         .expect("player A planning must continue its live transport operation");
     assert_eq!(squad.transport_entity, Some(transport));
     assert_eq!(squad.cargo_entities, vec![cargo]);
-    assert_eq!(squad.target_island, Some(target_island));
+    assert_eq!(squad.plan.target_island, Some(target_island));
     assert!(matches!(
-        squad.phase,
+        squad.plan.phase,
         MissionPhase::Transport(TransportPhase::Transit | TransportPhase::Drop)
     ));
 }

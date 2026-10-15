@@ -173,15 +173,15 @@ pub fn audit_idle_units(
                 // 自軍ユニットを含むことはない。所有者での事前フィルタは不要。
                 assigned
                     .entry(*entity)
-                    .or_insert_with(|| (squad.id, squad.mission_type.clone()));
+                    .or_insert_with(|| (squad.id, squad.plan.mission_type.clone()));
             }
 
             squad_digests.push(IdleSquadDigest {
                 squad_id: squad.id,
-                mission_type: squad.mission_type.clone(),
-                phase: squad.phase.clone(),
-                target: squad.target,
-                target_island: squad.target_island,
+                mission_type: squad.plan.mission_type.clone(),
+                phase: squad.plan.phase.clone(),
+                target: squad.plan.target,
+                target_island: squad.plan.target_island,
                 member_count: 0,
                 acted_count: 0,
                 member_unit_types: Vec::new(),
@@ -367,10 +367,10 @@ mod tests {
 
         let mut manager = SquadManager::new();
         {
-            let squad = manager.create_owned_squad(MissionType::Transport, player);
+            let mut squad = manager.create_owned_squad(MissionType::Transport, player);
             squad.transport_entity = Some(transport).into();
             squad.cargo_entities = vec![cargo].into();
-            squad.phase = MissionPhase::Transport(crate::ai::squad::TransportPhase::Pickup);
+            squad.plan.phase = MissionPhase::Transport(crate::ai::squad::TransportPhase::Pickup);
         }
         world.insert_resource(manager);
 
@@ -403,9 +403,9 @@ mod tests {
         let player = PlayerId(1);
         let entity = spawn_unit(&mut world, player, 1, 1);
         let mut manager = SquadManager::new();
-        let reserve = manager.create_owned_squad(MissionType::Reserve, player);
+        let mut reserve = manager.create_owned_squad(MissionType::Reserve, player);
         reserve.members.insert(entity);
-        reserve.target = Some(GridPosition { x: 2, y: 1 });
+        reserve.plan.target = Some(GridPosition { x: 2, y: 1 });
         world.insert_resource(manager);
 
         let acted = HashSet::from_iter([entity]);

@@ -139,9 +139,9 @@ pub(super) fn campaign_assignment_capture_responsibilities(
                     property.owner_id != Some(player_id)
                         && (property.capture_points < property.max_capture_points
                             || manager.proposal_view().squads.iter().any(|squad| {
-                                squad.owner_id == Some(player_id)
-                                    && squad.mission_type == MissionType::Capture
-                                    && squad.target == Some(member_pos)
+                                squad.plan.owner_id == Some(player_id)
+                                    && squad.plan.mission_type == MissionType::Capture
+                                    && squad.plan.target == Some(member_pos)
                                     && squad.members.contains(member)
                             }))
                 })
@@ -172,12 +172,12 @@ pub(super) fn campaign_assignment_capture_responsibilities(
             .squads
             .iter()
             .filter(|squad| {
-                squad.owner_id == Some(player_id)
-                    && squad.mission_type == MissionType::Capture
-                    && squad.target_island == Some(assignment.island_id)
+                squad.plan.owner_id == Some(player_id)
+                    && squad.plan.mission_type == MissionType::Capture
+                    && squad.plan.target_island == Some(assignment.island_id)
                     && squad.members.contains(member)
             })
-            .filter_map(|squad| squad.target)
+            .filter_map(|squad| squad.plan.target)
             .find(|target| {
                 world.iter_entities().any(|entity| {
                     entity.get::<GridPosition>() == Some(target)
@@ -1242,23 +1242,23 @@ mod tests {
         let mut manager = SquadManager::new();
         let pinned_target = GridPosition { x: 4, y: 0 };
         let pinned_member = capturers[2];
-        let pinned = manager.create_owned_squad(MissionType::Capture, player);
+        let mut pinned = manager.create_owned_squad(MissionType::Capture, player);
         pinned.members.insert(pinned_member);
-        pinned.target_island = Some(island_id);
-        pinned.target = Some(pinned_target);
+        pinned.plan.target_island = Some(island_id);
+        pinned.plan.target = Some(pinned_target);
 
         prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
 
         let capture_squads = manager
             .squads
             .iter()
-            .filter(|squad| squad.mission_type == MissionType::Capture)
+            .filter(|squad| squad.plan.mission_type == MissionType::Capture)
             .collect::<Vec<_>>();
         assert_eq!(capture_squads.len(), 3);
         assert_eq!(
             capture_squads
                 .iter()
-                .filter_map(|squad| squad.target)
+                .filter_map(|squad| squad.plan.target)
                 .collect::<HashSet<_>>()
                 .len(),
             3,
@@ -1268,7 +1268,7 @@ mod tests {
             capture_squads
                 .iter()
                 .find(|squad| squad.members.contains(&pinned_member))
-                .and_then(|squad| squad.target),
+                .and_then(|squad| squad.plan.target),
             Some(pinned_target),
             "生産時に具体化した未取得・到達可能な物件任務は最寄り物件へ戻さない"
         );

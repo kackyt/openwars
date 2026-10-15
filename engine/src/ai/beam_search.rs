@@ -75,11 +75,11 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
         .squads
         .iter()
         // active playerのgeneric責務だけを探索し、輸送および島別campaign責務の目標を上書きしない。
-        .filter(|s| s.owner_id == Some(perspective_player))
+        .filter(|s| s.plan.owner_id == Some(perspective_player))
         // V4の生産目的を持つ局地任務は、優先敵が有効な間は別前線へ上書きしない。
         .filter(|s| !protected_squads.contains(&s.id))
-        .filter(|s| !s.members.is_empty() && !matches!(s.mission_type, MissionType::Transport))
-        .filter(|s| s.target_island.is_none())
+        .filter(|s| !s.members.is_empty() && !matches!(s.plan.mission_type, MissionType::Transport))
+        .filter(|s| s.plan.target_island.is_none())
         .cloned()
         .collect();
 
@@ -102,7 +102,7 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
         let mut next_beam = Vec::new();
 
         let mut valid_targets = Vec::new();
-        match squad.mission_type {
+        match squad.plan.mission_type {
             MissionType::Attack => {
                 valid_targets.extend(&target_enemies);
                 // 前線の押し上げ：未占領拠点や敵拠点もターゲット候補に含める
@@ -125,13 +125,13 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
             MissionType::Reserve => {
                 // 予備配置は作戦計画が選んだ待機地点を維持し、汎用探索で
                 // 別前線へ再目標化しない。
-                if let Some(target) = squad.target {
+                if let Some(target) = squad.plan.target {
                     valid_targets.push(target);
                 }
             }
             MissionType::Transport => {
                 // squad.rs の段階ですでに戦略的価値に基づく target_island が設定されているはず
-                if let Some(target_island_id) = squad.target_island {
+                if let Some(target_island_id) = squad.plan.target_island {
                     let mut island_targets = Vec::new();
                     if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>()
                     {
@@ -157,8 +157,8 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
         }
 
         // 上陸後に引き継がれた部隊は、侵攻対象島の外へ目標を飛ばさない。
-        if squad.mission_type != MissionType::Transport
-            && let Some(target_island) = squad.target_island
+        if squad.plan.mission_type != MissionType::Transport
+            && let Some(target_island) = squad.plan.target_island
             && let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>()
         {
             valid_targets.retain(|target| {
@@ -167,7 +167,7 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                     .is_some_and(|island| island.id == target_island)
             });
             if valid_targets.is_empty()
-                && let Some(current_target) = squad.target
+                && let Some(current_target) = squad.plan.target
             {
                 valid_targets.push(current_target);
             }
@@ -309,7 +309,7 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                                 // 目標を始点とした SSSP で各ユニットへの最短ターン数を取得
                                 let mut turns = u32::MAX;
 
-                                let interaction_max_range = match squad.mission_type {
+                                let interaction_max_range = match squad.plan.mission_type {
                                     MissionType::Attack | MissionType::Defense => {
                                         if stats.max_range > 0 {
                                             stats.max_range
@@ -341,15 +341,15 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
                                     // 1ターン近づくごとに 150 相当の加点を行う
                                     let mut proximity_bonus = (50 - turns.min(50)) as i32 * 150;
                                     if Some(target_pos) == enemy_capital_pos
-                                        && (squad.mission_type == MissionType::Attack
-                                            || squad.mission_type == MissionType::Capture)
+                                        && (squad.plan.mission_type == MissionType::Attack
+                                            || squad.plan.mission_type == MissionType::Capture)
                                     {
                                         // 攻撃・占領部隊にとって敵首都は最重要目標なので、3倍のボーナス（極端な特攻はしないが優先はする）
                                         proximity_bonus *= 3;
                                     }
 
                                     // 輸送部隊の Time Discounting: 到達ターン数に応じたペナルティ（遠すぎる島への無謀な輸送を防ぐ）
-                                    if squad.mission_type == MissionType::Transport {
+                                    if squad.plan.mission_type == MissionType::Transport {
                                         proximity_bonus -= turns as i32 * 200;
                                     }
 
@@ -375,17 +375,17 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
 
     // 4. 最もスコアの高いプランを採択して SquadManager 内の部隊目標を決定
     if let Some(best_plan) = beam.first() {
-        for squad in manager.squads_mut() {
+        for mut squad in manager.edit_each() {
             if let Some(&target) = best_plan.assignments.get(&squad.id) {
-                squad.target = Some(target);
-                if squad.mission_type == MissionType::Transport {
+                squad.plan_mut().target = Some(target);
+                if squad.plan.mission_type == MissionType::Transport {
                     if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>()
                         && let Some(island) = island_map.get_island_at(&target)
                     {
-                        squad.target_island = Some(island.id);
+                        squad.plan_mut().target_island = Some(island.id);
                     }
                 } else {
-                    squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+                    squad.plan_mut().phase = crate::ai::squad::MissionPhase::MovingToTarget;
                 }
             }
         }
@@ -480,9 +480,12 @@ mod tests {
         let manager = world.get_resource::<SquadManager>().unwrap();
 
         assert_eq!(manager.squads.len(), 1);
-        assert_eq!(manager.squads[0].target, Some(GridPosition { x: 8, y: 8 }));
         assert_eq!(
-            manager.squads[0].phase,
+            manager.squads[0].plan.target,
+            Some(GridPosition { x: 8, y: 8 })
+        );
+        assert_eq!(
+            manager.squads[0].plan.phase,
             crate::ai::squad::MissionPhase::MovingToTarget
         );
     }
@@ -528,12 +531,12 @@ mod tests {
             ))
             .id();
         let mut manager = SquadManager::new();
-        let own = manager.create_owned_squad(MissionType::Attack, player_a);
+        let mut own = manager.create_owned_squad(MissionType::Attack, player_a);
         own.members.insert(unit_a);
-        let foreign = manager.create_owned_squad(MissionType::Attack, player_b);
+        let mut foreign = manager.create_owned_squad(MissionType::Attack, player_b);
         foreign.members.insert(unit_b);
-        foreign.target = Some(GridPosition { x: 1, y: 1 });
-        foreign.phase = crate::ai::squad::MissionPhase::Executing;
+        foreign.plan.target = Some(GridPosition { x: 1, y: 1 });
+        foreign.plan.phase = crate::ai::squad::MissionPhase::Executing;
         let foreign_id = foreign.id;
         world.insert_resource(manager);
 
@@ -545,9 +548,12 @@ mod tests {
             .iter()
             .find(|squad| squad.id == foreign_id)
             .unwrap();
-        assert_eq!(foreign.owner_id, Some(player_b));
-        assert_eq!(foreign.target, Some(GridPosition { x: 1, y: 1 }));
-        assert_eq!(foreign.phase, crate::ai::squad::MissionPhase::Executing);
+        assert_eq!(foreign.plan.owner_id, Some(player_b));
+        assert_eq!(foreign.plan.target, Some(GridPosition { x: 1, y: 1 }));
+        assert_eq!(
+            foreign.plan.phase,
+            crate::ai::squad::MissionPhase::Executing
+        );
         assert_eq!(foreign.members, BTreeSet::from([unit_b]));
     }
 
@@ -587,11 +593,11 @@ mod tests {
             ))
             .id();
         let mut manager = SquadManager::new();
-        let squad = manager.create_owned_squad(MissionType::Defense, player);
+        let mut squad = manager.create_owned_squad(MissionType::Defense, player);
         squad.members.insert(defender);
-        squad.target = Some(exact_target);
-        squad.target_island = Some(island_id);
-        squad.phase = crate::ai::squad::MissionPhase::Executing;
+        squad.plan.target = Some(exact_target);
+        squad.plan.target_island = Some(island_id);
+        squad.plan.phase = crate::ai::squad::MissionPhase::Executing;
         let squad_id = squad.id;
         world.insert_resource(manager);
 
@@ -603,9 +609,9 @@ mod tests {
             .iter()
             .find(|squad| squad.id == squad_id)
             .unwrap();
-        assert_eq!(squad.target, Some(exact_target));
-        assert_eq!(squad.target_island, Some(island_id));
-        assert_eq!(squad.phase, crate::ai::squad::MissionPhase::Executing);
+        assert_eq!(squad.plan.target, Some(exact_target));
+        assert_eq!(squad.plan.target_island, Some(island_id));
+        assert_eq!(squad.plan.phase, crate::ai::squad::MissionPhase::Executing);
     }
 
     #[test]
@@ -642,18 +648,21 @@ mod tests {
             .id();
 
         let mut manager = SquadManager::new();
-        let squad = manager.create_squad(MissionType::Transport);
+        let mut squad = manager.create_squad(MissionType::Transport);
         squad.members.insert(transport);
         squad.transport_entity = Some(transport).into();
-        squad.target = Some(GridPosition { x: 8, y: 8 });
-        squad.target_island = Some(island_id);
-        squad.phase =
+        squad.plan.target = Some(GridPosition { x: 8, y: 8 });
+        squad.plan.target_island = Some(island_id);
+        squad.plan.phase =
             crate::ai::squad::MissionPhase::Transport(crate::ai::squad::TransportPhase::Transit);
         world.insert_resource(manager);
 
         run_squad_beam_search(&mut world, p1);
         let manager = world.resource::<SquadManager>();
-        assert_eq!(manager.squads[0].target, Some(GridPosition { x: 8, y: 8 }));
-        assert_eq!(manager.squads[0].target_island, Some(island_id));
+        assert_eq!(
+            manager.squads[0].plan.target,
+            Some(GridPosition { x: 8, y: 8 })
+        );
+        assert_eq!(manager.squads[0].plan.target_island, Some(island_id));
     }
 }

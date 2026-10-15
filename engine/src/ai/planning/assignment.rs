@@ -1,49 +1,35 @@
 //! 所属の提案・競合解決・差分確定。
 //!
-//! 所属台帳（OperationLedger）は、次の正本と読み出し用の投影を区別する。
+//! - 確定所属と履歴は `UnitOperationRegistry` に保持する。
+//! - 編成中の候補は `Squad.roster` だけに保持する。複数Squadへの提案を許し、
+//!   `AssignmentProposal::from_roster_view` → resolve → commitで一意化する。
+//! - commitは確定所属を記録し、敗者参照をrosterから除く。履歴からmemberを復活させない。
 //!
-//! - 現在binding＋履歴: [`UnitOperationRegistry`]。Entityごとの唯一の作戦ownerと現在の
-//!   `squad_id` を持つ。勝者の無いCampaignはownerを残して `squad_id=None` とし、過去の
-//!   SquadIdを `previous_squad` へ分離する。履歴は同点規則だけが読み、行動へ復活させない。
-//! - 所属提案: managerが持つ `ProposalStore`。SquadId→roster、Entity→複数候補の索引を
-//!   keyed確定口で更新する。編成中の読み手は `proposal_view()` とstoreを明示して読む。
-//!   [`AssignmentProposal::from_roster_view`] はstoreから候補を集め、純粋なresolveがdeltaを作る。
-//! - Squadの所属field: storeの読取り互換view。提案commit時は複数候補を含みうる。
-//!   [`OperationLedger::commit`] は正規化所属を確定してから、その現在bindingだけへ投影する。
-//!   一意な実所属を照会する読み手はregistryを使い、途中viewを実所属と見なさない。
-//!
-//! 本番ではSquadのrosterからstoreを逆算する同期を行わない。構造変更時の明示的な候補登録と、
-//! `ProposalCommit::edit` の作業値だけがroster adapterを使う。直接書込みを許すテストfixtureは
-//! test専用の同期で取り込む。
-//!
-//! 境界（何を型で保証し、何を保証しないか）:
-//!
-//! - 本番buildで所属fieldへの代入・swap・take・集合変更は外部から行えない。
-//!   fieldの実装はroster moduleに閉じ、提案store更新口と内部draft adapterが投影を更新する。
-//!   Squad一覧fieldも外部から置換できず、registryの書込みは `LedgerKey` を要求する。
-//! - crate内の `squads_mut()` は一般の可変sliceであり、sort/swap/丸ごとの置換は型だけでは
-//!   防げない。一覧変更は `SquadListCommit` を使い、典型形の直接置換をsource監査で検出する。
-//!   監査はRust parserではなく近似である。確定口のowner対応はcallerの責務であり、
-//!   World Resourceの全置換などECS一般の特権を閉じるセキュリティ境界ではない。
+//! データ型は `squad_model`、勝者の優先規則は `candidate` に置く。
+//! 本番のmanagerは `SquadEdit` だけを返し、所属変更はledgerの更新口に限定する。
+//! テストfixtureも同じrosterを読み、別storeへの同期や実行分岐を持たない。
 
+use self::candidate::{
+    SquadAssignmentCandidate, assignment_candidate_key, assignment_mission_rank,
+    operation_owner_for_squad,
+};
+use self::squad_model::{MissionPhase, MissionType, SquadId};
 use crate::ai::islands::IslandId;
 use crate::ai::operation_assignment::{
     OperationOwner, OperationUnitRole, UnitOperationAssignment, UnitOperationRegistry,
-};
-use crate::ai::squad::{
-    MissionPhase, MissionType, SquadAssignmentCandidate, SquadId, assignment_candidate_key,
-    assignment_mission_rank, operation_owner_for_squad,
 };
 use crate::collections::{HashMap, HashSet};
 use crate::components::{GridPosition, PlayerId};
 use bevy_ecs::prelude::*;
 use std::collections::BTreeSet;
 
-mod roster;
-pub use roster::{
-    CargoRoster, MemberRoster, Squad, SquadList, SquadManager, SquadRoster, TransportBinding,
+pub(crate) mod candidate;
+pub mod squad_model;
+pub use squad_model::{
+    CargoRoster, MemberRoster, Squad, SquadEdit, SquadList, SquadManager, SquadRoster,
+    TransportBinding,
 };
-pub(crate) use roster::{ProposalCommit, RosterCommit, SquadListCommit};
+pub(crate) use squad_model::{ProposalCommit, RosterCommit, SquadListCommit};
 
 /// 正規化所属層（[`UnitOperationRegistry`]）の書込み権。このmodule外では生成できない。
 ///
@@ -72,7 +58,7 @@ impl<'a> OperationLedger<'a> {
         Self { registry }
     }
 
-    /// SquadIdで指す所属提案の確定口を開く（提案storeとSquad側rosterへ同時に適用する）。
+    /// SquadIdで指す所属提案の更新口を開く。
     pub(crate) fn proposals(manager: &mut SquadManager) -> ProposalCommit<'_> {
         manager.proposal_commit()
     }
@@ -83,7 +69,7 @@ impl<'a> OperationLedger<'a> {
     }
 
     /// keyed提案トランザクションまたは一覧外draftのroster adapterを開く。
-    pub(crate) fn roster(squad: &mut Squad) -> RosterCommit<'_> {
+    pub(crate) fn roster<'s>(squad: &'s mut SquadEdit<'_>) -> RosterCommit<'s> {
         RosterCommit::open(squad)
     }
 
@@ -156,12 +142,12 @@ impl<'a> OperationLedger<'a> {
             .filter(|id| {
                 proposals
                     .squad_mut(*id)
-                    .is_some_and(|squad| squad.owner_id == Some(join.player))
+                    .is_some_and(|squad| squad.plan.owner_id == Some(join.player))
             });
             let empty = || (BTreeSet::new(), None, Vec::new());
             let squad_id = match (existing, join.squad) {
                 (Some(id), _) => {
-                    // 既存Squadへの所属提案は、提案storeとSquad側rosterへ同時に適用する。
+                    // 既存Squadのrosterへ所属を提案する。一意化は後段のresolveが行う。
                     proposals.join(id, join.entity);
                     id
                 }
@@ -197,10 +183,10 @@ impl<'a> OperationLedger<'a> {
                     id
                 }
             };
-            let squad = proposals.squad_mut(squad_id).expect("受入Squad");
-            squad.target = join.target;
-            squad.target_island = join.target_island;
-            squad.phase = MissionPhase::Forming;
+            let mut squad = proposals.squad_mut(squad_id).expect("受入Squad");
+            squad.plan_mut().target = join.target;
+            squad.plan_mut().target_island = join.target_island;
+            squad.plan_mut().phase = MissionPhase::Forming;
             squads.push(squad_id);
         }
         ProducedAssignmentDelta { squads }
@@ -281,7 +267,7 @@ impl<'a> OperationLedger<'a> {
             .proposal_view()
             .squads
             .iter()
-            .filter(|squad| squad.owner_id == Some(player))
+            .filter(|squad| squad.plan.owner_id == Some(player))
             .map(|squad| squad.id)
             .collect::<Vec<_>>();
         let mut proposals = Self::proposals(manager);
@@ -472,26 +458,23 @@ impl AssignmentProposal {
     ) -> Self {
         let mut candidates: HashMap<Entity, Vec<SquadAssignmentCandidate>> = HashMap::default();
         let mut visits = 0usize;
-        // 提案の正本を読む。テストfixture以外にSquad→storeの逆算経路は無い。
-        #[cfg(test)]
-        manager.sync_proposals();
-        let store = manager.synced_proposals();
+        // 一覧内のrosterだけから、一覧順・役割順に候補を集める。
         for squad in manager
             .proposal_view()
             .squads
             .iter()
-            .filter(|squad| squad.owner_id == Some(player))
+            .filter(|squad| squad.plan.owner_id == Some(player))
         {
             let owner = operation_owner_for_squad(squad, player);
-            let mission_rank = assignment_mission_rank(&squad.mission_type);
-            let proposed = store.proposed(squad.id).expect("同期済みの提案");
+            let mission_rank = assignment_mission_rank(&squad.plan.mission_type);
+            let proposed = &**squad;
             for entity in proposed
                 .members
                 .iter()
                 .filter(|entity| live.contains(entity))
             {
                 visits = visits.saturating_add(1);
-                let role = if proposed.transport == Some(*entity) {
+                let role = if proposed.transport_entity == Some(*entity) {
                     OperationUnitRole::Transport
                 } else {
                     OperationUnitRole::Member
@@ -509,13 +492,13 @@ impl AssignmentProposal {
                     });
             }
             for (entities, role) in [
-                (&proposed.cargo, OperationUnitRole::Cargo),
-                (&proposed.delivered, OperationUnitRole::DeliveredCargo),
+                (&proposed.cargo_entities, OperationUnitRole::Cargo),
+                (&proposed.delivered_cargo, OperationUnitRole::DeliveredCargo),
             ] {
                 for entity in entities.iter().filter(|entity| live.contains(entity)) {
                     visits = visits.saturating_add(1);
                     let physically_loaded = proposed
-                        .transport
+                        .transport_entity
                         .is_some_and(|transport| transported_by.get(entity) == Some(&transport));
                     candidates
                         .entry(*entity)
@@ -596,7 +579,7 @@ impl AssignmentProposal {
 mod tests {
     use super::*;
     use crate::ai::islands::IslandId;
-    use crate::ai::squad::{MissionType, SquadId};
+    use crate::ai::planning::assignment::squad_model::{MissionType, SquadId};
 
     /// 正規化直後の不変条件: 自軍Squadのroster（foreign除く）は正本の現在bindingの写像と一致し、
     /// 現在bindingを持つ自軍Entityは必ずそのSquadのrosterに居る。履歴は写像に含まれない。
@@ -610,7 +593,7 @@ mod tests {
         for squad in manager
             .squads
             .iter()
-            .filter(|squad| squad.owner_id == Some(player))
+            .filter(|squad| squad.plan.owner_id == Some(player))
         {
             for entity in squad
                 .members
@@ -720,7 +703,7 @@ mod tests {
         let player = PlayerId(1);
         let entity = Entity::from_raw(10);
         let mut manager = SquadManager::default();
-        let squad = manager.create_owned_squad(MissionType::Capture, player);
+        let mut squad = manager.create_owned_squad(MissionType::Capture, player);
         squad.members.insert(entity);
         let id = squad.id.0;
         let old = candidate(
@@ -819,7 +802,7 @@ mod tests {
         let foreign = Entity::from_raw(12);
         let mut manager = SquadManager::default();
         let old_id = {
-            let squad = manager.create_owned_squad(MissionType::Attack, player);
+            let mut squad = manager.create_owned_squad(MissionType::Attack, player);
             squad.members.extend([entity, released, foreign]);
             squad.id
         };
@@ -902,7 +885,7 @@ mod tests {
         for squad in manager
             .squads
             .iter_mut()
-            .filter(|squad| squad.owner_id == Some(player))
+            .filter(|squad| squad.plan.owner_id == Some(player))
         {
             let id = squad.id;
             let foreign = |entity: &Entity| all_live.contains(entity) && !live.contains(entity);
@@ -945,22 +928,22 @@ mod tests {
         let e = (0..12).map(Entity::from_raw).collect::<Vec<_>>();
         let mut manager = SquadManager::default();
         // 0: 輸送Squad（輸送役e0、積荷e1・e2、降車済みe3、foreign e10）
-        let transport = manager.create_owned_squad(MissionType::Transport, player);
-        transport.target_island = Some(IslandId(1));
+        let mut transport = manager.create_owned_squad(MissionType::Transport, player);
+        transport.plan.target_island = Some(IslandId(1));
         transport.members.extend([e[0], e[10]]);
         *transport.transport_entity = Some(e[0]);
         transport.cargo_entities.extend([e[1], e[2]]);
         transport.delivered_cargo.push(e[3]);
         // 1: 現地Capture（e1を物理搭載外で重複主張、e3も主張、e4）
-        let capture = manager.create_owned_squad(MissionType::Capture, player);
-        capture.target_island = Some(IslandId(1));
+        let mut capture = manager.create_owned_squad(MissionType::Capture, player);
+        capture.plan.target_island = Some(IslandId(1));
         capture.members.extend([e[1], e[3], e[4]]);
         // 2: 戦術Attack（e5、e6は旧Campaign 2から移管を主張→拒否される）
-        let attack = manager.create_owned_squad(MissionType::Attack, player);
+        let mut attack = manager.create_owned_squad(MissionType::Attack, player);
         attack.members.extend([e[5], e[6]]);
         // 3: 別Campaign 2の輸送（e7を輸送役に持つが、e0と同じ輸送役をrosterで主張しない）
-        let other_transport = manager.create_owned_squad(MissionType::Transport, player);
-        other_transport.target_island = Some(IslandId(2));
+        let mut other_transport = manager.create_owned_squad(MissionType::Transport, player);
+        other_transport.plan.target_island = Some(IslandId(2));
         other_transport.members.insert(e[7]);
         *other_transport.transport_entity = Some(e[7]);
         // 4: ownerなしSquad（自軍e8）と、5: 他playerのSquad（自軍e9）
@@ -1073,7 +1056,7 @@ mod tests {
         let cargo = Entity::from_raw(11);
         let mut manager = SquadManager::default();
         let ownerless = {
-            let squad = manager.create_squad(MissionType::Transport);
+            let mut squad = manager.create_squad(MissionType::Transport);
             squad.members.insert(entity);
             squad.cargo_entities.push(cargo);
             *squad.transport_entity = Some(entity);
@@ -1255,18 +1238,18 @@ mod tests {
         let player = PlayerId(1);
         let [transport, cargo_a, cargo_b, member] = [1, 2, 3, 4].map(Entity::from_raw);
         let mut manager = SquadManager::default();
-        let squad = manager.create_owned_squad(MissionType::Transport, player);
+        let mut squad = manager.create_owned_squad(MissionType::Transport, player);
         squad.members.extend([transport, member]);
         *squad.transport_entity = Some(transport);
         squad.cargo_entities.extend([cargo_b, cargo_a, cargo_b]);
         squad.delivered_cargo.push(cargo_a);
 
-        OperationLedger::roster(squad).release_where(|entity| *entity == cargo_a);
+        OperationLedger::roster(&mut squad).release_where(|entity| *entity == cargo_a);
         assert_eq!(*squad.cargo_entities, vec![cargo_b, cargo_b]);
         assert!(squad.delivered_cargo.is_empty());
         assert_eq!(squad.transport_entity, Some(transport));
 
-        let mut roster = OperationLedger::roster(squad);
+        let mut roster = OperationLedger::roster(&mut squad);
         roster.sort_dedup_cargo();
         roster.release_where(|entity| *entity == transport);
         assert_eq!(squad.transport_entity, None);
@@ -1276,7 +1259,7 @@ mod tests {
             vec![member]
         );
 
-        OperationLedger::roster(squad).rebind_transport_wave(transport, vec![cargo_a]);
+        OperationLedger::roster(&mut squad).rebind_transport_wave(transport, vec![cargo_a]);
         assert_eq!(
             squad.members.iter().copied().collect::<Vec<_>>(),
             vec![transport]
@@ -1285,267 +1268,9 @@ mod tests {
         assert_eq!(*squad.cargo_entities, vec![cargo_a]);
     }
 
-    /// `&mut Squad` 経由のSquad丸ごと置換は型で防げないため、`engine/src/ai` 配下の本番codeに
-    /// 典型形の直接置換が無いことをsource走査で固定する（型保証ではない）。
-    ///
-    /// - 対象: `*_tests.rs`・`*_tests/`・`tests.rs` を除く `engine/src/ai` 配下の全 `.rs`。
-    ///   各fileから `#[cfg(test)]` 直後のitem（`mod tests {..}` やtest用fn/impl）だけを
-    ///   括弧対応で取り除き、それ以降の本番codeも検査する（v4/extended.rsのようにtest module
-    ///   の後に本番codeが続くfileの盲点を塞ぐ）。文字列・文字・comment内の括弧は読み飛ばす。
-    ///   raw文字列（`r#"..."#`）と `#[cfg(all(test, ..))]` 等の複合条件は扱わない（近似）。
-    ///   CRLFはLFへ正規化してから処理する。
-    ///   行commentを除き、空白・改行を詰めてから検査するので改行を跨ぐ式も検出する。
-    /// - 検出: `squads_mut()[<index>] =`（`==` は除く）と、識別子に続かない `*squad =`。
-    /// - 検出できない: 別名の可変参照経由の置換、`slice.swap/sort/reverse` 等の一般操作。
+    /// 同じ生産Entityを2つのSquadが提案でき、正規化で現在所属だけへ絞られる。
     #[test]
-    fn production_code_does_not_replace_whole_squads_directly() {
-        fn production_sources(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
-            let mut entries = std::fs::read_dir(dir)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .collect::<Vec<_>>();
-            entries.sort();
-            for path in entries {
-                let name = path.file_name().unwrap().to_string_lossy().to_string();
-                if path.is_dir() {
-                    if !name.ends_with("_tests") {
-                        production_sources(&path, out);
-                    }
-                } else if name.ends_with(".rs")
-                    && !name.ends_with("_tests.rs")
-                    && name != "tests.rs"
-                {
-                    let source = std::fs::read_to_string(&path).unwrap();
-                    out.push((path.display().to_string(), strip_test_items(&source)));
-                }
-            }
-        }
-
-        /// `pos` から始まるitemの終端（`;` か対応する `}` の直後）を返す。
-        /// 文字列・文字literal・commentの中の括弧は数えない。
-        fn item_end(source: &str, pos: usize) -> usize {
-            let bytes = source.as_bytes();
-            let mut index = pos;
-            let mut depth = 0usize;
-            let mut parens = 0usize;
-            let mut brackets = 0usize;
-            while index < bytes.len() {
-                match bytes[index] {
-                    b'/' if bytes.get(index + 1) == Some(&b'/') => {
-                        while index < bytes.len() && bytes[index] != b'\n' {
-                            index += 1;
-                        }
-                    }
-                    b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                        index += 2;
-                        while index + 1 < bytes.len()
-                            && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
-                        {
-                            index += 1;
-                        }
-                        index += 1;
-                    }
-                    b'"' => {
-                        index += 1;
-                        while index < bytes.len() && bytes[index] != b'"' {
-                            if bytes[index] == b'\\' {
-                                index += 1;
-                            }
-                            index += 1;
-                        }
-                    }
-                    // 文字literal（'{' や '\''）。lifetime（'a）は閉じ引用符が無いので読み飛ばさない。
-                    b'\'' if bytes.get(index + 2) == Some(&b'\'') => index += 2,
-                    b'\''
-                        if bytes.get(index + 1) == Some(&b'\\')
-                            && bytes.get(index + 3) == Some(&b'\'') =>
-                    {
-                        index += 3
-                    }
-                    // cfg(test)はitemだけでなくfield・initializerにも付く。
-                    // 関数の引数や配列の中のcommaでは区切らない。
-                    b'(' => parens += 1,
-                    b')' => parens = parens.saturating_sub(1),
-                    b'[' => brackets += 1,
-                    b']' => brackets = brackets.saturating_sub(1),
-                    b';' | b',' if depth == 0 && parens == 0 && brackets == 0 => return index + 1,
-                    b'{' => depth += 1,
-                    b'}' => {
-                        assert!(
-                            depth > 0,
-                            "cfg(test)の終端を判定できない: {}",
-                            &source[pos..index]
-                        );
-                        depth -= 1;
-                        if depth == 0 {
-                            return index + 1;
-                        }
-                    }
-                    _ => {}
-                }
-                index += 1;
-            }
-            bytes.len()
-        }
-
-        /// `#[cfg(test)]` 直後のitemを取り除いた本番source。
-        fn strip_test_items(source: &str) -> String {
-            let marker = "#[cfg(test)]";
-            // CRLFのfileでもcomment終端と改行跨ぎの検出を同じにするため、LFへ正規化する。
-            let source = source.replace("\r\n", "\n");
-            let mut out = String::with_capacity(source.len());
-            let mut rest = source.as_str();
-            while let Some(start) = rest.find(marker) {
-                out.push_str(&rest[..start]);
-                let after = start + marker.len();
-                rest = &rest[item_end(rest, after)..];
-            }
-            out.push_str(rest);
-            out
-        }
-
-        /// 行comment（文字列中の `//` は近似で扱う）を除き、空白を詰める。
-        fn compact(source: &str) -> String {
-            source
-                .lines()
-                .map(|line| line.split("//").next().unwrap_or(""))
-                .collect::<String>()
-                .chars()
-                .filter(|ch| !ch.is_whitespace())
-                .collect()
-        }
-
-        fn indexed_assignments(code: &str) -> usize {
-            let needle = "squads_mut()[";
-            let mut found = 0;
-            let mut rest = code;
-            while let Some(start) = rest.find(needle) {
-                let after = &rest[start + needle.len()..];
-                let mut depth = 1;
-                let mut close = None;
-                for (offset, ch) in after.char_indices() {
-                    match ch {
-                        '[' => depth += 1,
-                        ']' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                close = Some(offset);
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                if let Some(close) = close {
-                    let tail = &after[close + 1..];
-                    if tail.starts_with('=') && !tail.starts_with("==") {
-                        found += 1;
-                    }
-                }
-                rest = after;
-            }
-            found
-        }
-
-        fn deref_assignments(code: &str) -> usize {
-            code.match_indices("*squad=")
-                .filter(|(index, _)| {
-                    let before = code[..*index].chars().next_back();
-                    let after = &code[index + "*squad=".len()..];
-                    !after.starts_with('=')
-                        && before.is_none_or(|ch| !(ch.is_alphanumeric() || ch == '_' || ch == ')'))
-                })
-                .count()
-        }
-
-        // test item除去の契約: test moduleの後ろの本番codeは残し、文字列中の括弧で誤らない。
-        let stripped = strip_test_items(
-            "fn a() {}\n#[cfg(test)]\nmod tests {\n fn t() { let s = \"}\"; let c = '{'; }\n}\nfn after() { x.squads_mut()[0] = y; }\n#[cfg(test)]\nuse foo;\nfn last() {}",
-        );
-        assert!(stripped.contains("fn a()"));
-        assert!(!stripped.contains("fn t()"));
-        assert!(stripped.contains("fn after()"));
-        assert!(!stripped.contains("use foo"));
-        assert!(stripped.contains("fn last()"));
-        assert_eq!(indexed_assignments(&compact(&stripped)), 1);
-        // CRLFのfile: test module後の本番関数の置換と、comment内の括弧・置換風文字列を正しく扱う。
-        let crlf_source = [
-            "fn a() {}",
-            "#[cfg(test)]",
-            "mod tests {",
-            " // }",
-            " fn t() {}",
-            "}",
-            "fn after() {",
-            " // squads_mut()[0] = z;",
-            " x.squads_mut()[1]",
-            " = y;",
-            "}",
-        ]
-        .join("\r\n");
-        assert!(crlf_source.contains('\r'));
-        let crlf = strip_test_items(&crlf_source);
-        assert!(!crlf.contains('\r'));
-        assert!(!crlf.contains("fn t()"));
-        assert!(crlf.contains("fn after()"));
-        assert_eq!(indexed_assignments(&compact(&crlf)), 1);
-
-        // 検出器自体の契約（改行・空白・入れ子index・比較との区別）。
-        assert_eq!(
-            indexed_assignments(&compact("m.squads_mut()[i]\n    = s;")),
-            1
-        );
-        assert_eq!(
-            indexed_assignments(&compact("m.squads_mut()[ix[0]] = s;")),
-            1
-        );
-        assert_eq!(
-            indexed_assignments(&compact("m.squads_mut()[i].phase = p;")),
-            0
-        );
-        assert_eq!(indexed_assignments(&compact("m.squads_mut()[i] == s")), 0);
-        assert_eq!(deref_assignments(&compact("*squad\n = other;")), 1);
-        assert_eq!(deref_assignments(&compact("*squad == other")), 0);
-        assert_eq!(deref_assignments(&compact("let n = a * squad=")), 0);
-
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ai");
-        let fields = strip_test_items(
-            "struct S { #[cfg(test)] dirty: bool, live: bool }\nfn make() { S { #[cfg(test)] dirty: false, live: true }; }\nfn after() { m.squads_mut()[0] = z; }",
-        );
-        assert!(!fields.contains("dirty:"));
-        assert!(fields.contains("live: bool"));
-        assert!(fields.contains("live: true"));
-        assert!(fields.contains("fn after()"));
-        assert_eq!(indexed_assignments(&compact(&fields)), 1);
-
-        let mut sources = Vec::new();
-        production_sources(&root, &mut sources);
-        assert!(sources.len() > 50, "本番sourceを走査できていない");
-        // test moduleの後ろに本番codeが続くfileも、後ろの本番codeまで走査対象に残る。
-        let extended = &sources
-            .iter()
-            .find(|(path, _)| path.replace('\\', "/").ends_with("ai/v4/extended.rs"))
-            .expect("v4/extended.rsを走査する")
-            .1;
-        assert!(extended.contains("fn refresh_capital_route_path_commitments"));
-        assert!(extended.contains("fn apportion_route_force_slots"));
-        assert!(!extended.contains("fn frontline_capacity_follows_scanned_node_geometry"));
-        assert!(!extended.contains("fn same_land_armored_entry_shortfall"));
-        for (path, source) in sources {
-            let code = compact(&source);
-            assert_eq!(
-                indexed_assignments(&code) + deref_assignments(&code),
-                0,
-                "{path}: Squadを確定口を通さず丸ごと置換している"
-            );
-        }
-    }
-
-    /// S1b: 生産所属の確定はkeyed確定口から提案storeへ同時に書く。同じEntityを
-    /// 2つのSquadが提案した場合も、索引は両方の候補を持つ（一意化は正規化の責務）。
-    /// 正規化の候補収集は提案storeを読み、未移行writerの差分は同期で取り込む。
-    #[test]
-    fn produced_commit_writes_proposal_store_and_normalization_reads_it() {
+    fn produced_rosters_are_candidates_until_normalization() {
         let player = PlayerId(1);
         let [entity, legacy] = [Entity::from_raw(10), Entity::from_raw(11)];
         let mut manager = SquadManager::default();
@@ -1568,26 +1293,18 @@ mod tests {
             target_island: Some(IslandId(0)),
         });
         let delta = OperationLedger::commit_produced(&mut manager, proposal);
-        assert!(!manager.has_unsynced_rosters());
         let created = delta.squad_for(second);
         assert_eq!(delta.squad_for(first), existing);
-        {
-            let store = manager.synced_proposals();
-            assert_eq!(
-                store.candidates(entity),
-                &[
-                    (existing, OperationUnitRole::Member),
-                    (created, OperationUnitRole::Member)
-                ]
-            );
-            assert_eq!(
-                store.proposed(created).unwrap().members,
-                BTreeSet::from([entity])
-            );
-        }
-        // 未移行writer（RosterCommit）の差分は、正規化が提案storeを読む前に同期で取り込まれる。
-        OperationLedger::roster(&mut manager.squads_mut()[0]).join(legacy);
-        assert!(manager.has_unsynced_rosters());
+        assert_eq!(
+            manager
+                .squads
+                .iter()
+                .filter(|s| s.members.contains(&entity))
+                .count(),
+            2
+        );
+        // draftと同じroster更新口の変更が候補収集へ直接見える。
+        OperationLedger::roster(&mut manager.edit_each().next().unwrap()).join(legacy);
         let live = HashSet::from_iter([entity, legacy]);
         let proposal = AssignmentProposal::from_roster_view(
             2,
@@ -1598,7 +1315,6 @@ mod tests {
             &HashMap::default(),
             |_, _| false,
         );
-        assert!(!manager.has_unsynced_rosters());
         assert_eq!(proposal.candidates[&entity].len(), 2);
         assert_eq!(proposal.candidates[&legacy][0].squad_id, existing);
         let mut registry = UnitOperationRegistry::default();
@@ -1609,20 +1325,29 @@ mod tests {
             &live,
             &live,
         );
-        // 正規化後の提案storeは現在bindingの写像（敗者Squadから外れた状態）に揃う。
-        manager.sync_proposals();
+        // 正規化後のrosterには現在bindingだけが残る。
         let winner = registry.assignment(entity).unwrap().squad_id.unwrap();
         let loser = if winner == existing {
             created
         } else {
             existing
         };
-        let store = manager.synced_proposals();
-        assert_eq!(
-            store.candidates(entity),
-            &[(winner, OperationUnitRole::Member)]
+        let winners = manager
+            .squads
+            .iter()
+            .filter(|s| s.members.contains(&entity))
+            .map(|s| s.id)
+            .collect::<Vec<_>>();
+        assert_eq!(winners, vec![winner]);
+        assert!(
+            !manager
+                .squads
+                .iter()
+                .find(|s| s.id == loser)
+                .unwrap()
+                .members
+                .contains(&entity)
         );
-        assert!(!store.proposed(loser).unwrap().members.contains(&entity));
     }
 
     /// 生産所属の確定時に検証済みのExisting/Proposedが欠けるのは不変条件違反であり、
@@ -1650,8 +1375,8 @@ mod tests {
             let delta = result.expect("release buildでは所属を捨てない");
             let squad = &manager.squads[0];
             assert_eq!(delta.squad_for(0), squad.id);
-            assert_eq!(squad.mission_type, MissionType::Capture);
-            assert_eq!(squad.owner_id, Some(player));
+            assert_eq!(squad.plan.mission_type, MissionType::Capture);
+            assert_eq!(squad.plan.owner_id, Some(player));
             assert!(squad.members.contains(&entity));
         }
     }

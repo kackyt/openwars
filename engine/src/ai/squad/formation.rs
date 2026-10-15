@@ -457,7 +457,7 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
     // (dedupe に引っかかる)、失敗した奪取目標へ二度と部隊が送られなくなる
     if is_v3 {
         OperationLedger::squad_list(&mut manager)
-            .retain(|s| s.mission_type != MissionType::Capture || !s.members.is_empty());
+            .retain(|s| s.plan.mission_type != MissionType::Capture || !s.members.is_empty());
     }
 
     // 4. 汎用編成。各段はSquadの新設・追加を提案へ積み、最後に1回だけ確定する。

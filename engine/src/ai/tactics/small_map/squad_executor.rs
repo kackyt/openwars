@@ -80,8 +80,8 @@ pub(crate) fn coordinated_support_destination(
         .squads
         .iter()
         .filter(|squad| {
-            squad.owner_id == Some(player)
-                && squad.mission_type == crate::ai::squad::MissionType::Attack
+            squad.plan.owner_id == Some(player)
+                && squad.plan.mission_type == crate::ai::squad::MissionType::Attack
         })
         .collect::<Vec<_>>();
     if !attack_squads
@@ -94,7 +94,7 @@ pub(crate) fn coordinated_support_destination(
         .iter()
         .flat_map(|squad| {
             squad.members.iter().filter(move |entity| {
-                shares_attack_operation(world, gun, **entity, squad.target == Some(objective))
+                shares_attack_operation(world, gun, **entity, squad.plan.target == Some(objective))
             })
         })
         .filter_map(|entity| {
@@ -307,8 +307,8 @@ fn collect_executable_squads(world: &World, player_id: PlayerId) -> Vec<Executab
         .squads
         .iter()
         .filter(|squad| {
-            squad.owner_id == Some(player_id)
-                && squad.mission_type != crate::ai::squad::MissionType::Transport
+            squad.plan.owner_id == Some(player_id)
+                && squad.plan.mission_type != crate::ai::squad::MissionType::Transport
         })
         .filter_map(|squad| {
             let members = squad
@@ -324,10 +324,10 @@ fn collect_executable_squads(world: &World, player_id: PlayerId) -> Vec<Executab
                 })
                 .collect::<HashSet<_>>();
             (!members.is_empty()).then_some((
-                squad_executor_priority(&squad.mission_type),
+                squad_executor_priority(&squad.plan.mission_type),
                 squad.id.0,
                 members,
-                squad.target,
+                squad.plan.target,
             ))
         })
         .collect::<Vec<_>>();
@@ -575,10 +575,11 @@ mod tests {
         let target = GridPosition { x: 3, y: 0 };
         let mut manager = crate::ai::squad::SquadManager::new();
         for entity in [front, gun] {
-            let squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+            let mut squad =
+                manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
             squad.members.insert(entity);
-            squad.target = Some(target);
-            squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+            squad.plan.target = Some(target);
+            squad.plan.phase = crate::ai::squad::MissionPhase::MovingToTarget;
         }
         world.insert_resource(manager);
         (world, front, gun, enemy)
@@ -641,6 +642,7 @@ mod tests {
             .iter_mut()
             .find(|s| s.members.contains(&gun))
             .unwrap()
+            .plan
             .target = Some(GridPosition { x: 5, y: 2 });
         let mut deployments = crate::ai::v4::deployment::V4DeploymentRegistry::default();
         deployments.assign_target_for_test(PlayerId(1), front, enemy);
@@ -678,6 +680,7 @@ mod tests {
                         .iter_mut()
                         .find(|s| s.members.contains(&gun))
                         .unwrap()
+                        .plan
                         .target = Some(GridPosition { x: 5, y: 2 });
                 }
                 _ => {
@@ -727,10 +730,11 @@ mod tests {
         world.get_mut::<ActionCompleted>(front).unwrap().0 = true;
         let mut manager = crate::ai::squad::SquadManager::new();
         for entity in [front, gun] {
-            let squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+            let mut squad =
+                manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
             squad.members.insert(entity);
-            squad.target = Some(GridPosition { x: 7, y: 0 });
-            squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+            squad.plan.target = Some(GridPosition { x: 7, y: 0 });
+            squad.plan.phase = crate::ai::squad::MissionPhase::MovingToTarget;
         }
         world.insert_resource(manager);
         let (actor, command) =
@@ -773,19 +777,22 @@ mod tests {
         *world.get_mut::<GridPosition>(side).unwrap() = GridPosition { x: 0, y: 1 };
         let objective = GridPosition { x: 3, y: 0 };
         let mut manager = crate::ai::squad::SquadManager::new();
-        let rear_squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+        let mut rear_squad =
+            manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
         rear_squad.members.insert(rear);
-        rear_squad.target = Some(objective);
-        rear_squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
-        let front_squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+        rear_squad.plan.target = Some(objective);
+        rear_squad.plan.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+        let mut front_squad =
+            manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
         front_squad.members.insert(front);
-        front_squad.target = Some(objective);
-        front_squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+        front_squad.plan.target = Some(objective);
+        front_squad.plan.phase = crate::ai::squad::MissionPhase::MovingToTarget;
         // 前方退去後にこの第三Squadへカーソルを進めず、保留した後方を先に再評価する。
-        let side_squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+        let mut side_squad =
+            manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
         side_squad.members.insert(side);
-        side_squad.target = Some(GridPosition { x: 3, y: 1 });
-        side_squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+        side_squad.plan.target = Some(GridPosition { x: 3, y: 1 });
+        side_squad.plan.phase = crate::ai::squad::MissionPhase::MovingToTarget;
         world.insert_resource(manager);
 
         let (first_entity, first_command) =
@@ -833,14 +840,16 @@ mod tests {
         let left = spawn_v3_test_unit(&mut world, player, 0, 100, stats.clone());
         let right = spawn_v3_test_unit(&mut world, player, 1, 100, stats);
         let mut manager = crate::ai::squad::SquadManager::new();
-        let left_squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+        let mut left_squad =
+            manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
         left_squad.members.insert(left);
-        left_squad.target = Some(GridPosition { x: 1, y: 0 });
-        left_squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
-        let right_squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+        left_squad.plan.target = Some(GridPosition { x: 1, y: 0 });
+        left_squad.plan.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+        let mut right_squad =
+            manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
         right_squad.members.insert(right);
-        right_squad.target = Some(GridPosition { x: 0, y: 0 });
-        right_squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+        right_squad.plan.target = Some(GridPosition { x: 0, y: 0 });
+        right_squad.plan.phase = crate::ai::squad::MissionPhase::MovingToTarget;
         world.insert_resource(manager);
 
         let (entity, command) = decide_squad_action_v4(&mut world, player, &HashSet::default())
@@ -1552,37 +1561,37 @@ mod tests {
                 .id();
             let (foreign_id, foreign_snapshot) = {
                 let mut manager = crate::ai::squad::SquadManager::new();
-                let foreign =
+                let mut foreign =
                     manager.create_owned_squad(crate::ai::squad::MissionType::Transport, player_a);
                 foreign.members.insert(transport_a);
                 foreign.transport_entity = Some(transport_a).into();
-                foreign.phase = crate::ai::squad::MissionPhase::Transport(
+                foreign.plan.phase = crate::ai::squad::MissionPhase::Transport(
                     crate::ai::squad::TransportPhase::Return,
                 );
                 let snapshot = (
-                    foreign.owner_id,
+                    foreign.plan.owner_id,
                     foreign.members.clone(),
                     foreign.transport_entity,
                     foreign.cargo_entities.clone(),
                     foreign.delivered_cargo.clone(),
-                    foreign.target_island,
-                    foreign.target,
-                    foreign.phase.clone(),
-                    foreign.pickup_position,
-                    foreign.drop_position,
+                    foreign.plan.target_island,
+                    foreign.plan.target,
+                    foreign.plan.phase.clone(),
+                    foreign.plan.pickup_position,
+                    foreign.plan.drop_position,
                 );
                 let id = foreign.id;
-                let ownerless = manager.create_squad(crate::ai::squad::MissionType::Transport);
+                let mut ownerless = manager.create_squad(crate::ai::squad::MissionType::Transport);
                 ownerless.members.insert(ownerless_transport);
                 ownerless.transport_entity = Some(ownerless_transport).into();
-                ownerless.phase = crate::ai::squad::MissionPhase::Transport(
+                ownerless.plan.phase = crate::ai::squad::MissionPhase::Transport(
                     crate::ai::squad::TransportPhase::Return,
                 );
-                let own =
+                let mut own =
                     manager.create_owned_squad(crate::ai::squad::MissionType::Transport, player_b);
                 own.members.insert(transport_b);
                 own.transport_entity = Some(transport_b).into();
-                own.phase = crate::ai::squad::MissionPhase::Transport(
+                own.plan.phase = crate::ai::squad::MissionPhase::Transport(
                     crate::ai::squad::TransportPhase::Return,
                 );
                 world.insert_resource(manager);
@@ -1601,16 +1610,16 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 (
-                    foreign.owner_id,
+                    foreign.plan.owner_id,
                     foreign.members.clone(),
                     foreign.transport_entity,
                     foreign.cargo_entities.clone(),
                     foreign.delivered_cargo.clone(),
-                    foreign.target_island,
-                    foreign.target,
-                    foreign.phase.clone(),
-                    foreign.pickup_position,
-                    foreign.drop_position,
+                    foreign.plan.target_island,
+                    foreign.plan.target,
+                    foreign.plan.phase.clone(),
+                    foreign.plan.pickup_position,
+                    foreign.plan.drop_position,
                 ),
                 foreign_snapshot
             );
@@ -1709,10 +1718,10 @@ mod tests {
         *world.get_mut::<GridPosition>(tank).unwrap() = GridPosition { x: 0, y: 0 };
 
         let mut manager = crate::ai::squad::SquadManager::new();
-        let squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+        let mut squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
         squad.members.insert(tank);
-        squad.target = Some(GridPosition { x: 4, y: 0 });
-        squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+        squad.plan.target = Some(GridPosition { x: 4, y: 0 });
+        squad.plan.phase = crate::ai::squad::MissionPhase::MovingToTarget;
         world.insert_resource(manager);
 
         // V3思考では敵生産マスの封鎖評価を行わないため、敵工場 (1, 0) に留まらず
@@ -1786,10 +1795,10 @@ mod tests {
         *world.get_mut::<GridPosition>(tank).unwrap() = GridPosition { x: 0, y: 0 };
 
         let mut manager = crate::ai::squad::SquadManager::new();
-        let squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+        let mut squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
         squad.members.insert(tank);
-        squad.target = Some(GridPosition { x: 4, y: 0 }); // 敵首都を目標
-        squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+        squad.plan.target = Some(GridPosition { x: 4, y: 0 }); // 敵首都を目標
+        squad.plan.phase = crate::ai::squad::MissionPhase::MovingToTarget;
         world.insert_resource(manager);
 
         let (entity, command) = decide_squad_action_v4(&mut world, player, &HashSet::default())
@@ -1865,14 +1874,14 @@ mod tests {
         *world.get_mut::<GridPosition>(tank).unwrap() = GridPosition { x: 0, y: 0 };
 
         let mut manager = crate::ai::squad::SquadManager::new();
-        let squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+        let mut squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
         squad.members.insert(tank);
-        squad.target = Some(GridPosition { x: 4, y: 0 }); // 敵首都を目標
-        squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+        squad.plan.target = Some(GridPosition { x: 4, y: 0 }); // 敵首都を目標
+        squad.plan.phase = crate::ai::squad::MissionPhase::MovingToTarget;
         // 友軍の占領部隊が敵工場 (1, 0) を占領目標として予約している。
-        let capture_squad =
+        let mut capture_squad =
             manager.create_owned_squad(crate::ai::squad::MissionType::Capture, player);
-        capture_squad.target = Some(GridPosition { x: 1, y: 0 });
+        capture_squad.plan.target = Some(GridPosition { x: 1, y: 0 });
         world.insert_resource(manager);
 
         let (entity, command) = decide_squad_action_v4(&mut world, player, &HashSet::default())
@@ -1932,13 +1941,13 @@ mod tests {
         *world.get_mut::<GridPosition>(tank).unwrap() = GridPosition { x: 1, y: 0 };
 
         let mut manager = crate::ai::squad::SquadManager::new();
-        let squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+        let mut squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
         squad.members.insert(tank);
         // 目標は生産施設ではない平地 (0, 1)。敵首都 (3, 0) も占位対象なので、
         // そちらへ引かれる目標にすると「二つの占位マスのどちらを選ぶか」になってしまい、
         // 封鎖を維持するかどうかを検証できない。占位マスから引き離す目標を与える。
-        squad.target = Some(GridPosition { x: 0, y: 1 });
-        squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+        squad.plan.target = Some(GridPosition { x: 0, y: 1 });
+        squad.plan.phase = crate::ai::squad::MissionPhase::MovingToTarget;
         world.insert_resource(manager);
 
         let (entity, command) = decide_squad_action_v4(&mut world, player, &HashSet::default())

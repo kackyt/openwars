@@ -314,24 +314,23 @@ impl V4DeploymentRegistry {
             DeploymentPosture::Execute => MissionType::Attack,
             DeploymentPosture::Forming => MissionType::Defense,
         };
-        let squad = if let Some(index) = batch.get(&slot) {
-            ProducedSquad::Proposed(*index)
-        } else if let Some(squad_id) = self
-            .forming_slots
-            .get(&slot)
-            .and_then(|reservation| reservation.squad_id)
-            .filter(|squad_id| {
-                manager
-                    .proposal_view()
-                    .squads
-                    .iter()
-                    .any(|squad| squad.id == *squad_id && squad.owner_id == Some(player))
-            })
-        {
-            ProducedSquad::Existing(squad_id)
-        } else {
-            ProducedSquad::Create(mission.clone())
-        };
+        let squad =
+            if let Some(index) = batch.get(&slot) {
+                ProducedSquad::Proposed(*index)
+            } else if let Some(squad_id) =
+                self.forming_slots
+                    .get(&slot)
+                    .and_then(|reservation| reservation.squad_id)
+                    .filter(|squad_id| {
+                        manager.proposal_view().squads.iter().any(|squad| {
+                            squad.id == *squad_id && squad.plan.owner_id == Some(player)
+                        })
+                    })
+            {
+                ProducedSquad::Existing(squad_id)
+            } else {
+                ProducedSquad::Create(mission.clone())
+            };
         let join = proposal.propose(ProducedJoin {
             player,
             entity,
@@ -1138,7 +1137,7 @@ pub(crate) fn prepare_deployment_squads_with_connectivity(
             .squads
             .iter()
             .filter(|squad| {
-                squad.owner_id == Some(player_id) && Some(squad.id) != snapshot.squad_id
+                squad.plan.owner_id == Some(player_id) && Some(squad.id) != snapshot.squad_id
             })
             .map(|squad| squad.id)
             .collect::<Vec<_>>();
@@ -1147,7 +1146,7 @@ pub(crate) fn prepare_deployment_squads_with_connectivity(
                 .proposal_view()
                 .squads
                 .iter()
-                .any(|squad| squad.id == *id && squad.owner_id == Some(player_id))
+                .any(|squad| squad.id == *id && squad.plan.owner_id == Some(player_id))
         });
         let squad_id = {
             let mut proposals = OperationLedger::proposals(manager);
@@ -1167,15 +1166,15 @@ pub(crate) fn prepare_deployment_squads_with_connectivity(
             });
             proposals.clear_members(id);
             proposals.join(id, entity);
-            let squad = proposals.squad_mut(id).expect("確定した配備Squad");
-            squad.mission_type = mission_type;
-            squad.target = Some(target);
+            let mut squad = proposals.squad_mut(id).expect("確定した配備Squad");
+            squad.plan_mut().mission_type = mission_type;
+            squad.plan_mut().target = Some(target);
             // Planと同じcampaign ownerを保ち、排他reconcileとの競合を防ぐ。
-            squad.target_island = island_map
+            squad.plan_mut().target_island = island_map
                 .as_ref()
                 .and_then(|islands| islands.get_island_at(&snapshot.intent.anchor))
                 .map(|island| island.id);
-            squad.phase = MissionPhase::MovingToTarget;
+            squad.plan_mut().phase = MissionPhase::MovingToTarget;
             id
         };
         if let Some(deployment) = registry.assigned.get_mut(&entity) {
@@ -1345,11 +1344,11 @@ mod tests {
             .and_then(|reservation| reservation.squad_id)
             .and_then(|squad_id| {
                 manager.squads.iter().position(|squad| {
-                    squad.id == squad_id && squad.owner_id == Some(snapshot.intent.player_id)
+                    squad.id == squad_id && squad.plan.owner_id == Some(snapshot.intent.player_id)
                 })
             });
-        let squad = if let Some(index) = existing {
-            &mut manager.squads[index]
+        let mut squad = if let Some(index) = existing {
+            manager.squads[index].edit()
         } else {
             manager.create_owned_squad(
                 match snapshot.intent.posture {
@@ -1360,14 +1359,14 @@ mod tests {
             )
         };
         squad.members.insert(entity);
-        squad.target = Some(match snapshot.intent.posture {
+        squad.plan.target = Some(match snapshot.intent.posture {
             DeploymentPosture::Execute => snapshot.intent.anchor,
             DeploymentPosture::Forming => snapshot.intent.staging_anchor,
         });
-        squad.target_island = island_map
+        squad.plan.target_island = island_map
             .and_then(|islands| islands.get_island_at(&snapshot.intent.anchor))
             .map(|island| island.id);
-        squad.phase = MissionPhase::Forming;
+        squad.plan.phase = MissionPhase::Forming;
         let squad_id = squad.id;
         if let Some(reservation) = registry.forming_slots.get_mut(&slot) {
             reservation.squad_id = Some(squad_id);
@@ -1431,9 +1430,9 @@ mod tests {
         for (left, right) in manager.squads.iter().zip(&sequential_manager.squads) {
             assert_eq!(left.id, right.id);
             assert_eq!(left.members, *right.members);
-            assert_eq!(left.mission_type, right.mission_type);
-            assert_eq!(left.target, right.target);
-            assert_eq!(left.phase, right.phase);
+            assert_eq!(left.plan.mission_type, right.plan.mission_type);
+            assert_eq!(left.plan.target, right.plan.target);
+            assert_eq!(left.plan.phase, right.plan.phase);
         }
         assert_eq!(
             manager.squads[1]
@@ -1767,10 +1766,10 @@ mod tests {
             .iter()
             .find(|squad| squad.members.contains(&attacker))
             .unwrap();
-        assert_eq!(squad.mission_type, MissionType::Defense);
-        assert_eq!(squad.target, Some(GridPosition { x: 1, y: 0 }));
+        assert_eq!(squad.plan.mission_type, MissionType::Defense);
+        assert_eq!(squad.plan.target, Some(GridPosition { x: 1, y: 0 }));
         assert_eq!(
-            squad.target_island,
+            squad.plan.target_island,
             IslandMap::analyze(world.resource::<Map>())
                 .get_island_at(&GridPosition { x: 5, y: 0 })
                 .map(|island| island.id),
@@ -1792,7 +1791,7 @@ mod tests {
             .iter()
             .find(|squad| squad.members.contains(&attacker))
             .unwrap();
-        assert_eq!(squad.target, Some(GridPosition { x: 3, y: 0 }));
+        assert_eq!(squad.plan.target, Some(GridPosition { x: 3, y: 0 }));
         let squad_id = squad.id;
         assert!(
             world
@@ -1820,7 +1819,7 @@ mod tests {
             .iter()
             .find(|squad| squad.id == squad_id)
             .unwrap();
-        assert_eq!(squad.target, Some(GridPosition { x: 6, y: 0 }));
+        assert_eq!(squad.plan.target, Some(GridPosition { x: 6, y: 0 }));
     }
 
     /// 空になったcampaign責務の解放が、継続中の生産配備identityを消してはならない。
@@ -1836,8 +1835,8 @@ mod tests {
             .find(|s| s.members.contains(&attacker))
             .unwrap();
         let id = before.id;
-        let island = before.target_island.unwrap();
-        let target = before.target;
+        let island = before.plan.target_island.unwrap();
+        let target = before.plan.target;
         crate::ai::squad::assign_campaign_responsibilities(
             &world,
             &mut manager,
@@ -1852,7 +1851,7 @@ mod tests {
             .find(|s| s.id == id)
             .expect("継続配備のSquadを保持する");
         assert!(preserved.members.contains(&attacker));
-        assert_eq!(preserved.target, target);
+        assert_eq!(preserved.plan.target, target);
         prepare_deployment_squads(&mut world, &mut manager, player, &HashSet::default());
         assert_eq!(
             world
@@ -1895,7 +1894,7 @@ mod tests {
             .iter()
             .find(|squad| squad.members.contains(&attacker))
             .unwrap();
-        assert_eq!(squad.target, Some(GridPosition { x: 3, y: 0 }));
+        assert_eq!(squad.plan.target, Some(GridPosition { x: 3, y: 0 }));
     }
 
     #[test]
@@ -1910,7 +1909,7 @@ mod tests {
             .iter()
             .find(|squad| squad.members.contains(&attacker))
             .unwrap();
-        assert_eq!(squad.target, Some(GridPosition { x: 4, y: 0 }));
+        assert_eq!(squad.plan.target, Some(GridPosition { x: 4, y: 0 }));
         assert_eq!(
             world
                 .resource::<V4DeploymentRegistry>()

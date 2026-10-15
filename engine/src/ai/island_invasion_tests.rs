@@ -224,13 +224,13 @@ fn v3_invasion_reaches_combat_or_capture_after_landing() {
             .squads
             .iter()
             .filter(|squad| {
-                squad.mission_type == crate::ai::squad::MissionType::Transport
-                    && squad.target_island == Some(enemy_island)
+                squad.plan.mission_type == crate::ai::squad::MissionType::Transport
+                    && squad.plan.target_island == Some(enemy_island)
             })
             .collect();
         assert_eq!(planned.len(), 2, "complete Assault uses both transports");
         assert!(planned.iter().all(|squad| matches!(
-            squad.phase,
+            squad.plan.phase,
             crate::ai::squad::MissionPhase::Transport(
                 crate::ai::squad::TransportPhase::Pickup
                     | crate::ai::squad::TransportPhase::Transit
@@ -323,8 +323,9 @@ fn v3_invasion_reaches_combat_or_capture_after_landing() {
                             squad
                                 .transport_entity
                                 .is_some_and(|transport| transport_entities.contains(&transport))
-                                && squad.mission_type == crate::ai::squad::MissionType::Transport
-                                && squad.phase
+                                && squad.plan.mission_type
+                                    == crate::ai::squad::MissionType::Transport
+                                && squad.plan.phase
                                     == crate::ai::squad::MissionPhase::Transport(
                                         crate::ai::squad::TransportPhase::Return,
                                     )

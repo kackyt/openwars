@@ -161,8 +161,8 @@ mod tests {
         .enumerate()
         {
             assert_eq!(squads[index].id, SquadId(index as u32));
-            assert_eq!(squads[index].mission_type, mission);
-            assert_eq!(squads[index].owner_id, Some(player));
+            assert_eq!(squads[index].plan.mission_type, mission);
+            assert_eq!(squads[index].plan.owner_id, Some(player));
             assert_eq!(
                 squads[index].members.iter().copied().collect::<Vec<_>>(),
                 vec![entity]
@@ -308,7 +308,13 @@ mod tests {
         let squads = &world.resource::<SquadManager>().squads;
         let observed = squads
             .iter()
-            .map(|squad| (squad.id, squad.owner_id, squad.mission_type.clone()))
+            .map(|squad| {
+                (
+                    squad.id,
+                    squad.plan.owner_id,
+                    squad.plan.mission_type.clone(),
+                )
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             observed,
@@ -380,13 +386,19 @@ mod tests {
         schedule.add_systems(reconcile_production_events_system);
         schedule.run(&mut world);
         let first = world.resource::<SquadManager>().squads[0].id;
-        world.resource_mut::<SquadManager>().squads_mut()[0].owner_id = Some(PlayerId(2));
+        world
+            .resource_mut::<SquadManager>()
+            .edit_each()
+            .next()
+            .unwrap()
+            .plan_mut()
+            .owner_id = Some(PlayerId(2));
         // 同じEventの再受信: record.squad_idは他player所有なのでExistingにならない。
         world.send_event(produced(player, entity, facility));
         schedule.run(&mut world);
         let squads = &world.resource::<SquadManager>().squads;
         assert_eq!(squads.len(), 2);
-        assert_eq!(squads[1].owner_id, Some(player));
+        assert_eq!(squads[1].plan.owner_id, Some(player));
         assert!(squads[1].members.contains(&entity));
         let records = world
             .resource::<V4CampaignExecutionRegistry>()

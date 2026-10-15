@@ -1710,13 +1710,13 @@ pub fn snapshot_transport_squads(world: &World) -> Vec<TransportSquadSnapshot> {
     };
     let mut snapshots = Vec::new();
     for squad in &manager.squads {
-        if squad.mission_type != MissionType::Transport {
+        if squad.plan.mission_type != MissionType::Transport {
             continue;
         }
         let Some(transport) = *squad.transport_entity else {
             continue;
         };
-        let phase = match squad.phase {
+        let phase = match squad.plan.phase {
             MissionPhase::Transport(phase) => format!("{phase:?}"),
             _ => continue,
         };
@@ -1758,15 +1758,15 @@ pub fn snapshot_transport_squads(world: &World) -> Vec<TransportSquadSnapshot> {
             transport_id: transport.to_bits(),
             x: position.map(|position| position.x),
             y: position.map(|position| position.y),
-            target_island_id: squad.target_island.map(|island| island.0),
-            target_x: squad.target.map(|position| position.x),
-            target_y: squad.target.map(|position| position.y),
-            pickup_x: squad.pickup_position.map(|position| position.x),
-            pickup_y: squad.pickup_position.map(|position| position.y),
-            drop_x: squad.drop_position.map(|position| position.x),
-            drop_y: squad.drop_position.map(|position| position.y),
-            departure_authorized: squad.departure_authorized,
-            allow_partial_departure: squad.allow_partial_departure,
+            target_island_id: squad.plan.target_island.map(|island| island.0),
+            target_x: squad.plan.target.map(|position| position.x),
+            target_y: squad.plan.target.map(|position| position.y),
+            pickup_x: squad.plan.pickup_position.map(|position| position.x),
+            pickup_y: squad.plan.pickup_position.map(|position| position.y),
+            drop_x: squad.plan.drop_position.map(|position| position.x),
+            drop_y: squad.plan.drop_position.map(|position| position.y),
+            departure_authorized: squad.plan.departure_authorized,
+            allow_partial_departure: squad.plan.allow_partial_departure,
             planned_cargo_ids,
             planned_cargo_positions,
             loaded_cargo_ids,

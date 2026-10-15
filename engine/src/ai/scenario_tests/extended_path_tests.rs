@@ -137,14 +137,14 @@ fn test_v3_multi_cargo_invasion_loads_transits_and_lands() {
         .id();
 
     let mut manager = crate::ai::squad::SquadManager::new();
-    let squad = manager.create_squad(crate::ai::squad::MissionType::Transport);
+    let mut squad = manager.create_squad(crate::ai::squad::MissionType::Transport);
     squad.members.insert(transport);
     squad.transport_entity = Some(transport).into();
     squad.cargo_entities = vec![capture, combat].into();
-    squad.pickup_position = Some(GridPosition { x: 0, y: 1 });
-    squad.target_island = Some(target_island);
-    squad.target = Some(GridPosition { x: 4, y: 0 });
-    squad.phase =
+    squad.plan.pickup_position = Some(GridPosition { x: 0, y: 1 });
+    squad.plan.target_island = Some(target_island);
+    squad.plan.target = Some(GridPosition { x: 4, y: 0 });
+    squad.plan.phase =
         crate::ai::squad::MissionPhase::Transport(crate::ai::squad::TransportPhase::Pickup);
     world.insert_resource(manager);
 
@@ -155,11 +155,11 @@ fn test_v3_multi_cargo_invasion_loads_transits_and_lands() {
         let squad = manager
             .squads
             .iter_mut()
-            .find(|squad| squad.mission_type == crate::ai::squad::MissionType::Transport)
+            .find(|squad| squad.plan.mission_type == crate::ai::squad::MissionType::Transport)
             .unwrap();
         let (entity, command) = crate::ai::squad::execute_transport_squad_step(
             world,
-            squad,
+            &mut squad.edit(),
             &crate::collections::HashSet::default(),
         )
         .expect("transport should produce a command");
@@ -201,8 +201,9 @@ fn test_v3_multi_cargo_invasion_loads_transits_and_lands() {
             .resource::<crate::ai::squad::SquadManager>()
             .squads
             .iter()
-            .find(|squad| squad.mission_type == crate::ai::squad::MissionType::Transport)
+            .find(|squad| squad.plan.mission_type == crate::ai::squad::MissionType::Transport)
             .unwrap()
+            .plan
             .phase,
         crate::ai::squad::MissionPhase::Transport(crate::ai::squad::TransportPhase::Transit)
     );
@@ -222,7 +223,7 @@ fn test_v3_multi_cargo_invasion_loads_transits_and_lands() {
             .resource::<crate::ai::squad::SquadManager>()
             .squads
             .iter()
-            .any(|squad| squad.mission_type == crate::ai::squad::MissionType::Capture)
+            .any(|squad| squad.plan.mission_type == crate::ai::squad::MissionType::Capture)
     );
 
     reset_actions(&mut world);
@@ -235,10 +236,10 @@ fn test_v3_multi_cargo_invasion_loads_transits_and_lands() {
     let transport_squad = manager
         .squads
         .iter()
-        .find(|squad| squad.mission_type == crate::ai::squad::MissionType::Transport)
+        .find(|squad| squad.plan.mission_type == crate::ai::squad::MissionType::Transport)
         .unwrap();
     assert_eq!(
-        transport_squad.phase,
+        transport_squad.plan.phase,
         crate::ai::squad::MissionPhase::Transport(crate::ai::squad::TransportPhase::Return)
     );
     assert!(transport_squad.cargo_entities.is_empty());
@@ -246,7 +247,7 @@ fn test_v3_multi_cargo_invasion_loads_transits_and_lands() {
         manager
             .squads
             .iter()
-            .any(|squad| squad.mission_type == crate::ai::squad::MissionType::Attack)
+            .any(|squad| squad.plan.mission_type == crate::ai::squad::MissionType::Attack)
     );
     assert!(world.get::<GridPosition>(capture).unwrap().x >= 3);
     assert!(world.get::<GridPosition>(combat).unwrap().x >= 3);

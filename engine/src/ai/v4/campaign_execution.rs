@@ -334,7 +334,7 @@ impl V4CampaignExecutionRegistry {
             manager
                 .squads
                 .iter()
-                .any(|squad| squad.id == *squad_id && squad.owner_id == Some(record.player_id))
+                .any(|squad| squad.id == *squad_id && squad.plan.owner_id == Some(record.player_id))
         }) {
             ProducedSquad::Existing(squad_id)
         } else {
@@ -546,9 +546,9 @@ mod tests {
             assert_eq!(manager.squads.len(), 1);
             let squad = &manager.squads[0];
             assert_eq!(squad.id, squad_id);
-            assert_eq!(squad.owner_id, Some(extended_player));
-            assert_eq!(squad.mission_type, MissionType::Capture);
-            assert_eq!(squad.target_island, Some(IslandId(3)));
+            assert_eq!(squad.plan.owner_id, Some(extended_player));
+            assert_eq!(squad.plan.mission_type, MissionType::Capture);
+            assert_eq!(squad.plan.target_island, Some(IslandId(3)));
             assert!(squad.members.contains(&extended_entity));
             assert!(!squad.members.contains(&main_entity));
         }
@@ -580,7 +580,7 @@ mod tests {
         registry.assign_produced(&produced_capture(player, entity), 2);
         let mut manager = SquadManager::default();
         registry.resolve_produced_slot(entity, &mut manager);
-        assert_eq!(manager.squads[0].target_island, Some(IslandId(4)));
+        assert_eq!(manager.squads[0].plan.target_island, Some(IslandId(4)));
         let squad_id = registry.records[0].squad_id;
 
         // 同手番の再発注Cは別slotとなり、完成済みBのEntity・所属を変更しない。
@@ -808,9 +808,9 @@ mod tests {
             .expect("Capture発注をCapture Squadへ解決する");
         assert!(manager.squads.iter().any(|squad| {
             squad.id == squad_id
-                && squad.mission_type == MissionType::Capture
-                && squad.target_island == Some(island)
-                && squad.target == Some(mission_target)
+                && squad.plan.mission_type == MissionType::Capture
+                && squad.plan.target_island == Some(island)
+                && squad.plan.target == Some(mission_target)
                 && squad.members.contains(&entity)
         }));
     }

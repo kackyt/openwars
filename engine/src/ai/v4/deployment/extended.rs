@@ -477,8 +477,8 @@ mod tests {
             .iter()
             .find(|squad| squad.members.contains(&attacker))
             .unwrap();
-        assert_eq!(squad.mission_type, MissionType::Capture);
-        assert_eq!(squad.target, Some(anchor));
+        assert_eq!(squad.plan.mission_type, MissionType::Capture);
+        assert_eq!(squad.plan.target, Some(anchor));
     }
 
     /// 占領枠の配備は、拡張経路だけが敵の目標解決を飛ばして占領任務にする
@@ -520,7 +520,7 @@ mod tests {
                 .iter()
                 .find(|squad| squad.members.contains(&attacker))
                 .unwrap();
-            assert_eq!(squad.mission_type, expected, "{path:?}");
+            assert_eq!(squad.plan.mission_type, expected, "{path:?}");
         }
     }
 

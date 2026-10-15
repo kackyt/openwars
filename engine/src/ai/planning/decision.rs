@@ -58,12 +58,12 @@ impl AdoptedTurnPortfolio {
         &mut self,
         world: &World,
         player: PlayerId,
-        manager: &crate::ai::squad::SquadManager,
+        manager: &crate::ai::planning::assignment::squad_model::SquadManager,
     ) {
         use crate::ai::operation_assignment::{
             OperationOwner, OperationUnitRole, UnitOperationRegistry,
         };
-        use crate::ai::squad::MissionType;
+        use crate::ai::planning::assignment::squad_model::MissionType;
         use crate::collections::HashMap;
         use crate::components::{Faction, UnitStats};
         if self.player_id != Some(player) {
@@ -80,8 +80,8 @@ impl AdoptedTurnPortfolio {
         let missions = manager
             .squads
             .iter()
-            .filter(|s| s.owner_id == Some(player))
-            .map(|s| (s.id, &s.mission_type))
+            .filter(|s| s.plan.owner_id == Some(player))
+            .map(|s| (s.id, &s.plan.mission_type))
             .collect::<HashMap<_, _>>();
         for campaign in portfolio
             .defenses
@@ -180,7 +180,7 @@ mod tests {
         OperationOwner, OperationUnitRole, UnitOperationAssignment, UnitOperationRegistry,
     };
     use crate::ai::planning::assignment::LedgerKey;
-    use crate::ai::squad::{MissionType, SquadId, SquadManager};
+    use crate::ai::planning::assignment::squad_model::{MissionType, SquadId, SquadManager};
     use crate::components::{Faction, GridPosition, UnitStats};
 
     /// 競合の敗者・実行bindingなし・死亡Entityを採用一覧へ復活させず、購入意図は保持する。
@@ -230,7 +230,7 @@ mod tests {
         {
             let mut proposals =
                 crate::ai::planning::assignment::OperationLedger::proposals(&mut manager);
-            let squad = proposals.create_owned(
+            let mut squad = proposals.create_owned(
                 MissionType::Capture,
                 player,
                 std::collections::BTreeSet::from([current]),
@@ -238,7 +238,7 @@ mod tests {
                 vec![],
             );
             assert_eq!(squad.id, SquadId(1));
-            squad.target_island = Some(island);
+            squad.plan.target_island = Some(island);
         }
         let mut registry = UnitOperationRegistry::default();
         for (entity, squad_id, owner) in [
@@ -352,8 +352,8 @@ mod tests {
                 } else {
                     (BTreeSet::from([entity]), vec![])
                 };
-                let squad = proposals.create_owned(mission, player, members, None, cargo);
-                squad.target_island = Some(island);
+                let mut squad = proposals.create_owned(mission, player, members, None, cargo);
+                squad.plan.target_island = Some(island);
                 registry.apply_assign(
                     LedgerKey::fixture(),
                     entity,

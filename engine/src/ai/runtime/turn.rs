@@ -169,7 +169,7 @@ fn transport_boarding_changed(world: &World) -> bool {
     };
     manager.squads.iter().any(|squad| {
         let delivered_cargo = matches!(
-            squad.phase,
+            squad.plan.phase,
             MissionPhase::Transport(TransportPhase::Transit | TransportPhase::Drop)
         ) && squad.cargo_entities.iter().any(|cargo| {
             world
@@ -177,16 +177,17 @@ fn transport_boarding_changed(world: &World) -> bool {
                 .is_none()
                 && world.get::<GridPosition>(*cargo).is_some()
         });
-        let pickup_completed =
-            matches!(squad.phase, MissionPhase::Transport(TransportPhase::Pickup))
-                && !squad.cargo_entities.is_empty()
-                && squad.cargo_entities.iter().all(|cargo| {
-                    squad.transport_entity.is_some_and(|transport| {
-                        world
-                            .get::<crate::components::Transporting>(*cargo)
-                            .is_some_and(|transporting| transporting.0 == transport)
-                    })
-                });
+        let pickup_completed = matches!(
+            squad.plan.phase,
+            MissionPhase::Transport(TransportPhase::Pickup)
+        ) && !squad.cargo_entities.is_empty()
+            && squad.cargo_entities.iter().all(|cargo| {
+                squad.transport_entity.is_some_and(|transport| {
+                    world
+                        .get::<crate::components::Transporting>(*cargo)
+                        .is_some_and(|transporting| transporting.0 == transport)
+                })
+            });
         delivered_cargo || pickup_completed
     })
 }
@@ -196,10 +197,10 @@ fn transport_boarding_changed(world: &World) -> bool {
 fn select_transport_step(world: &mut World, step: &TurnStep) -> Option<(Entity, AiCommand)> {
     let mut manager = world.remove_resource::<SquadManager>()?;
     let mut transport_action = None;
-    for squad in manager.squads_mut() {
-        if squad.mission_type != MissionType::Transport
-            || squad.owner_id != Some(step.player_id)
-            || !crate::ai::squad::squad_is_mutable_by_player(world, squad, step.player_id)
+    for mut squad in manager.edit_each() {
+        if squad.plan.mission_type != MissionType::Transport
+            || squad.plan.owner_id != Some(step.player_id)
+            || !crate::ai::squad::squad_is_mutable_by_player(world, &squad, step.player_id)
         {
             continue;
         }
@@ -216,7 +217,7 @@ fn select_transport_step(world: &mut World, step: &TurnStep) -> Option<(Entity, 
             continue;
         }
         let Some((entity, command)) =
-            crate::ai::squad::execute_transport_squad_step(world, squad, &step.acted)
+            crate::ai::squad::execute_transport_squad_step(world, &mut squad, &step.acted)
         else {
             continue;
         };
@@ -246,7 +247,7 @@ fn decision_skip_entities(world: &World, step: &TurnStep) -> HashSet<Entity> {
         for squad in manager
             .squads
             .iter()
-            .filter(|squad| squad.mission_type == MissionType::Transport)
+            .filter(|squad| squad.plan.mission_type == MissionType::Transport)
         {
             skip.extend(squad.members.iter().copied());
             if let Some(transport_entity) = *squad.transport_entity {

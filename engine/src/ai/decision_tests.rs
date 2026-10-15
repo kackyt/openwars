@@ -244,11 +244,12 @@ mod tests {
             ))
             .id();
         let mut manager = crate::ai::squad::SquadManager::new();
-        let squad = manager.create_owned_squad(crate::ai::squad::MissionType::Transport, player);
+        let mut squad =
+            manager.create_owned_squad(crate::ai::squad::MissionType::Transport, player);
         squad.members.insert(transport);
         squad.transport_entity = Some(transport).into();
-        squad.target_island = Some(crate::ai::islands::IslandId(1));
-        squad.phase = crate::ai::squad::MissionPhase::Forming;
+        squad.plan.target_island = Some(crate::ai::islands::IslandId(1));
+        squad.plan.phase = crate::ai::squad::MissionPhase::Forming;
         world.insert_resource(manager);
 
         let (entity, command) =
@@ -384,10 +385,10 @@ mod tests {
             ))
             .id();
         let mut manager = crate::ai::squad::SquadManager::new();
-        let squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+        let mut squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
         squad.members.insert(attacker);
-        squad.target = Some(GridPosition { x: 3, y: 0 });
-        squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+        squad.plan.target = Some(GridPosition { x: 3, y: 0 });
+        squad.plan.phase = crate::ai::squad::MissionPhase::MovingToTarget;
         world.insert_resource(manager);
         if neutral_city_at_target {
             world.spawn((
@@ -2292,37 +2293,37 @@ mod tests {
                 .id();
             let (foreign_id, foreign_snapshot) = {
                 let mut manager = crate::ai::squad::SquadManager::new();
-                let foreign =
+                let mut foreign =
                     manager.create_owned_squad(crate::ai::squad::MissionType::Transport, player_a);
                 foreign.members.insert(transport_a);
                 foreign.transport_entity = Some(transport_a).into();
-                foreign.phase = crate::ai::squad::MissionPhase::Transport(
+                foreign.plan.phase = crate::ai::squad::MissionPhase::Transport(
                     crate::ai::squad::TransportPhase::Return,
                 );
                 let snapshot = (
-                    foreign.owner_id,
+                    foreign.plan.owner_id,
                     foreign.members.clone(),
                     foreign.transport_entity,
                     foreign.cargo_entities.clone(),
                     foreign.delivered_cargo.clone(),
-                    foreign.target_island,
-                    foreign.target,
-                    foreign.phase.clone(),
-                    foreign.pickup_position,
-                    foreign.drop_position,
+                    foreign.plan.target_island,
+                    foreign.plan.target,
+                    foreign.plan.phase.clone(),
+                    foreign.plan.pickup_position,
+                    foreign.plan.drop_position,
                 );
                 let id = foreign.id;
-                let ownerless = manager.create_squad(crate::ai::squad::MissionType::Transport);
+                let mut ownerless = manager.create_squad(crate::ai::squad::MissionType::Transport);
                 ownerless.members.insert(ownerless_transport);
                 ownerless.transport_entity = Some(ownerless_transport).into();
-                ownerless.phase = crate::ai::squad::MissionPhase::Transport(
+                ownerless.plan.phase = crate::ai::squad::MissionPhase::Transport(
                     crate::ai::squad::TransportPhase::Return,
                 );
-                let own =
+                let mut own =
                     manager.create_owned_squad(crate::ai::squad::MissionType::Transport, player_b);
                 own.members.insert(transport_b);
                 own.transport_entity = Some(transport_b).into();
-                own.phase = crate::ai::squad::MissionPhase::Transport(
+                own.plan.phase = crate::ai::squad::MissionPhase::Transport(
                     crate::ai::squad::TransportPhase::Return,
                 );
                 world.insert_resource(manager);
@@ -2341,16 +2342,16 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 (
-                    foreign.owner_id,
+                    foreign.plan.owner_id,
                     foreign.members.clone(),
                     foreign.transport_entity,
                     foreign.cargo_entities.clone(),
                     foreign.delivered_cargo.clone(),
-                    foreign.target_island,
-                    foreign.target,
-                    foreign.phase.clone(),
-                    foreign.pickup_position,
-                    foreign.drop_position,
+                    foreign.plan.target_island,
+                    foreign.plan.target,
+                    foreign.plan.phase.clone(),
+                    foreign.plan.pickup_position,
+                    foreign.plan.drop_position,
                 ),
                 foreign_snapshot
             );
@@ -2406,8 +2407,8 @@ mod tests {
             crate::ai::squad::MissionType::Attack,
         );
         squad.members.insert(member);
-        squad.target = Some(target);
-        squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+        squad.plan.target = Some(target);
+        squad.plan.phase = crate::ai::squad::MissionPhase::MovingToTarget;
         manager.squads.push(squad);
         world.insert_resource(manager);
     }

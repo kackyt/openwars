@@ -108,8 +108,8 @@ impl AssignmentProposal {
             .iter()
             .map(|squad| SquadView {
                 mutable: squad_is_mutable_by_player(world, squad, player),
-                mission_type: squad.mission_type.clone(),
-                target: squad.target,
+                mission_type: squad.plan.mission_type.clone(),
+                target: squad.plan.target,
                 members: squad.members.len(),
             })
             .collect();
@@ -172,7 +172,7 @@ impl AssignmentProposal {
         for op in self.ops {
             match op {
                 AssignmentOp::Create(draft) => {
-                    let squad = proposals.create_owned(
+                    let mut squad = proposals.create_owned(
                         draft.mission_type,
                         self.player,
                         draft.members,
@@ -180,12 +180,12 @@ impl AssignmentProposal {
                         draft.cargo_entities,
                     );
                     slot_ids.push(squad.id);
-                    squad.target = draft.target;
-                    squad.target_island = draft.target_island;
-                    squad.phase = draft.phase;
-                    squad.pickup_position = draft.pickup_position;
-                    squad.allow_partial_departure = draft.allow_partial_departure;
-                    squad.departure_authorized = draft.departure_authorized;
+                    squad.plan_mut().target = draft.target;
+                    squad.plan_mut().target_island = draft.target_island;
+                    squad.plan_mut().phase = draft.phase;
+                    squad.plan_mut().pickup_position = draft.pickup_position;
+                    squad.plan_mut().allow_partial_departure = draft.allow_partial_departure;
+                    squad.plan_mut().departure_authorized = draft.departure_authorized;
                     delta.created.push(squad.id);
                 }
                 AssignmentOp::Join { slot, entity } => {
@@ -247,29 +247,14 @@ mod tests {
         assert_eq!(delta.joined, 2);
         assert_eq!(manager.squads[0].members, BTreeSet::from([third]));
         let squad = &manager.squads[1];
-        assert_eq!(squad.owner_id, Some(player));
+        assert_eq!(squad.plan.owner_id, Some(player));
         assert_eq!(squad.members, BTreeSet::from([first, second]));
-        assert_eq!(squad.target, Some(GridPosition { x: 3, y: 4 }));
+        assert_eq!(squad.plan.target, Some(GridPosition { x: 3, y: 4 }));
 
-        // S1b: 汎用編成の所属はkeyed確定口から提案storeへ同時に書かれ、
-        // Squad側rosterからの取込み（未同期）を必要としない。
-        assert!(!manager.has_unsynced_rosters());
-        let store = manager.synced_proposals();
-        let created_id = delta.created[0];
+        // 一覧内のrosterが提案の唯一の保存先である。
         assert_eq!(
-            store.proposed(created_id).unwrap().members,
-            BTreeSet::from([first, second])
-        );
-        assert_eq!(
-            store.proposed(existing).unwrap().members,
-            BTreeSet::from([third])
-        );
-        assert_eq!(
-            store.candidates(second),
-            &[(
-                created_id,
-                crate::ai::operation_assignment::OperationUnitRole::Member
-            )]
+            manager.mentioned_entities(),
+            HashSet::from_iter([first, second, third])
         );
     }
 
@@ -278,8 +263,8 @@ mod tests {
         let player = PlayerId(1);
         let world = World::new();
         let mut manager = SquadManager::default();
-        let foreign = manager.create_owned_squad(MissionType::Capture, PlayerId(2));
-        foreign.target = Some(GridPosition { x: 1, y: 1 });
+        let mut foreign = manager.create_owned_squad(MissionType::Capture, PlayerId(2));
+        foreign.plan.target = Some(GridPosition { x: 1, y: 1 });
 
         let proposal = AssignmentProposal::new(&world, &manager, player);
         assert!(!proposal.has_squad(MissionType::Capture, GridPosition { x: 1, y: 1 }));

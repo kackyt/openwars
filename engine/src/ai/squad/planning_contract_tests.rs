@@ -172,10 +172,10 @@ fn generic_formation_does_not_create_legacy_capital_defense_even_for_v2() {
     plan_squads_with_policy(&mut world, player, PlanningPolicy::Standard);
 
     let manager = world.resource::<SquadManager>();
-    assert!(manager.squads.iter().all(|squad| squad.mission_type != MissionType::Defense),
+    assert!(manager.squads.iter().all(|squad| squad.plan.mission_type != MissionType::Defense),
         "campaignを持たないV2も、旧首都防衛を汎用編成から作らない");
     assert!(manager.squads.iter().any(|squad|
-        squad.mission_type == MissionType::Attack && squad.members.contains(&combat)),
+        squad.plan.mission_type == MissionType::Attack && squad.members.contains(&combat)),
         "旧防衛へ先取りせず、汎用の攻撃編成へ戦闘要員を渡す");
 }
 

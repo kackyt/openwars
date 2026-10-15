@@ -52,8 +52,8 @@ impl SquadRoles {
         let mut missions = HashMap::default();
         for squad in &manager.squads {
             for &member in &squad.members {
-                missions.insert(member, squad.mission_type.clone());
-                if let Some(target) = squad.target {
+                missions.insert(member, squad.plan.mission_type.clone());
+                if let Some(target) = squad.plan.target {
                     targets.insert(member, target);
                 }
             }
@@ -84,10 +84,10 @@ impl SquadRoles {
                 }) {
                     continue;
                 }
-                missions.insert(member, squad.mission_type.clone());
+                missions.insert(member, squad.plan.mission_type.clone());
                 if let Some(target) =
                     crate::ai::v4::capital_route_tactical_target(world, player_id, member)
-                        .unwrap_or(squad.target)
+                        .unwrap_or(squad.plan.target)
                 {
                     targets.insert(member, target);
                 }
@@ -120,7 +120,7 @@ impl SquadRoles {
             .squads
             .iter()
             .find(|squad| squad.members.contains(&entity))
-            .map(|squad| format!("{:?}", squad.mission_type))
+            .map(|squad| format!("{:?}", squad.plan.mission_type))
             .unwrap_or_else(|| {
                 if self.manager.solo_fallbacks.contains(&entity) {
                     "SoloFallback".to_string()

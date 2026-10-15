@@ -48,16 +48,16 @@ pub(crate) fn campaign_action_context(
     // その場合に古いSquad目標へフォールバックしてはならない。
     let target = if crate::ai::code_path::is_extended_at("engine.rs::campaign_action_context") {
         crate::ai::v4::capital_route_tactical_target(world, player_id, entity)
-            .unwrap_or(squad.target)
+            .unwrap_or(squad.plan.target)
     } else {
-        squad.target
+        squad.plan.target
     };
     Ok(Some(CampaignActionContext {
         owner: assignment.owner,
         island_id,
-        mission_type: squad.mission_type.clone(),
+        mission_type: squad.plan.mission_type.clone(),
         target,
-        departure_authorized: squad.departure_authorized,
+        departure_authorized: squad.plan.departure_authorized,
     }))
 }
 
@@ -105,8 +105,8 @@ mod tests {
         };
         let [bound, detached] = [Entity::from_raw(1), Entity::from_raw(2)];
         let mut manager = SquadManager::default();
-        let squad = manager.create_owned_squad(MissionType::Capture, player);
-        squad.target = Some(GridPosition { x: 3, y: 4 });
+        let mut squad = manager.create_owned_squad(MissionType::Capture, player);
+        squad.plan.target = Some(GridPosition { x: 3, y: 4 });
         squad.members.insert(bound);
         let squad_id = squad.id;
         let mut registry = UnitOperationRegistry::default();

@@ -1,6 +1,6 @@
 use crate::ai::islands::IslandId;
 use crate::ai::planning::assignment::LedgerKey;
-use crate::ai::squad::SquadId;
+use crate::ai::planning::assignment::squad_model::SquadId;
 use crate::collections::{HashMap, HashSet};
 use crate::components::PlayerId;
 use bevy_ecs::prelude::*;

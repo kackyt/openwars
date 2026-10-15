@@ -449,7 +449,8 @@ fn observe_campaign_execution(
         registry.replace_operation_issues(operation_id, issues, recoveries);
         registry.bind_assignment_entities(operation_id, assignment);
         for squad in manager.squads.iter().filter(|squad| {
-            squad.owner_id == Some(player_id) && squad.target_island == Some(assignment.island_id)
+            squad.plan.owner_id == Some(player_id)
+                && squad.plan.target_island == Some(assignment.island_id)
         }) {
             if let Some(transport) = *squad.transport_entity {
                 registry.bind_entity_exclusive(
@@ -527,7 +528,8 @@ fn observe_campaign_execution(
             // 中間区間が閉じた後は、親作戦がSquadから実Entityを引き継ぐ。これにより
             // Capitalへ進んだ時点でCampaign→Reserve→Campaignへ分断しない。
             for squad in manager.squads.iter().filter(|squad| {
-                squad.owner_id == Some(player_id) && squad.target_island == Some(capital_island)
+                squad.plan.owner_id == Some(player_id)
+                    && squad.plan.target_island == Some(capital_island)
             }) {
                 if let Some(transport) = *squad.transport_entity {
                     registry.bind_entity_exclusive(
@@ -650,7 +652,7 @@ fn publish_roadmap_observation(
             let mut squad_ids = manager
                 .squads
                 .iter()
-                .filter(|squad| squad.owner_id == Some(player_id))
+                .filter(|squad| squad.plan.owner_id == Some(player_id))
                 .filter(|squad| {
                     squad
                         .members
@@ -993,9 +995,9 @@ mod tests {
         );
         world.insert_resource(candidates);
         let mut manager = SquadManager::new();
-        let old_squad = manager.create_squad(MissionType::Capture);
-        old_squad.owner_id = Some(player);
-        old_squad.target_island = Some(island);
+        let mut old_squad = manager.create_squad(MissionType::Capture);
+        old_squad.plan.owner_id = Some(player);
+        old_squad.plan.target_island = Some(island);
         old_squad.members.insert(entity);
         let old_id = old_squad.id;
         crate::ai::v4::strategy_pipeline::after_squad_planning(
@@ -1018,9 +1020,9 @@ mod tests {
 
         // 同じ実EntityのSquadが作り直された場合も、採用案は固定して参照だけを更新する。
         manager.squads.clear();
-        let new_squad = manager.create_squad(MissionType::Capture);
-        new_squad.owner_id = Some(player);
-        new_squad.target_island = Some(island);
+        let mut new_squad = manager.create_squad(MissionType::Capture);
+        new_squad.plan.owner_id = Some(player);
+        new_squad.plan.target_island = Some(island);
         new_squad.members.insert(entity);
         let new_id = new_squad.id;
         assert_ne!(old_id, new_id);

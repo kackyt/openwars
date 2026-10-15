@@ -3061,7 +3061,7 @@ mod tests {
         let mut manager = world
             .remove_resource::<crate::ai::squad::SquadManager>()
             .unwrap_or_default();
-        let squad = manager.create_owned_squad(mission, player);
+        let mut squad = manager.create_owned_squad(mission, player);
         squad.members.extend(members.iter().copied());
         let squad_id = squad.id;
         world.insert_resource(manager);
@@ -3627,7 +3627,7 @@ mod tests {
         registry.commitments.insert(SquadId(4), commitment);
         registry.squads_by_operation.insert(logical, SquadId(4));
         let mut manager = crate::ai::squad::SquadManager::new();
-        let old = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+        let mut old = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
         old.operation_id = logical;
         old.members.insert(Entity::from_raw(100));
         let mut relocated = old.clone();
@@ -3969,10 +3969,10 @@ mod tests {
         deployment.assign_target_for_test(player, attacker, enemy);
         world.insert_resource(deployment);
         let mut manager = crate::ai::squad::SquadManager::new();
-        let squad = manager.create_owned_squad(MissionType::Attack, player);
+        let mut squad = manager.create_owned_squad(MissionType::Attack, player);
         squad.members.insert(attacker);
-        squad.target = Some(pos(9, 0));
-        squad.target_island = Some(island_id);
+        squad.plan.target = Some(pos(9, 0));
+        squad.plan.target_island = Some(island_id);
         let squad_id = squad.id;
         prepare_capital_route_topologies(&mut world, player);
         refresh_capital_route_path_commitments(&mut world, player, &mut manager);
@@ -5131,16 +5131,16 @@ mod tests {
         let holding = Entity::from_raw(905);
         let supplying = Entity::from_raw(906);
         let mut manager = crate::ai::squad::SquadManager::default();
-        let advancing_squad = manager.create_owned_squad(MissionType::Attack, player);
+        let mut advancing_squad = manager.create_owned_squad(MissionType::Attack, player);
         advancing_squad.members.insert(advancing);
         let advancing_squad_id = advancing_squad.id;
-        let staged_squad = manager.create_owned_squad(MissionType::Attack, player);
+        let mut staged_squad = manager.create_owned_squad(MissionType::Attack, player);
         staged_squad.members.insert(staged);
         let staged_squad_id = staged_squad.id;
-        let holding_squad = manager.create_owned_squad(MissionType::Defense, player);
+        let mut holding_squad = manager.create_owned_squad(MissionType::Defense, player);
         holding_squad.members.insert(holding);
         let holding_squad_id = holding_squad.id;
-        let supplying_squad = manager.create_owned_squad(MissionType::Transport, player);
+        let mut supplying_squad = manager.create_owned_squad(MissionType::Transport, player);
         supplying_squad.members.insert(supplying);
         let supplying_squad_id = supplying_squad.id;
         let commitment = |phase| CapitalRouteCommitment {
@@ -7182,10 +7182,10 @@ mod tests {
             println!("--- T{turn} P2 Start (Funds: {p2_funds}) ---");
             if let Some(manager) = world.get_resource::<crate::ai::squad::SquadManager>() {
                 for s in &manager.squads {
-                    if s.owner_id == Some(p2) {
+                    if s.plan.owner_id == Some(p2) {
                         println!(
                             "  Squad {:?}: mission={:?}, target={:?}, members={:?}",
-                            s.id, s.mission_type, s.target, s.members
+                            s.id, s.plan.mission_type, s.plan.target, s.members
                         );
                     }
                 }
@@ -7907,7 +7907,7 @@ impl CapitalRoutePathRegistry {
             let Some(squad) = manager.squads.iter().find(|squad| squad.id == *squad_id) else {
                 continue;
             };
-            if squad.owner_id != Some(player_id) {
+            if squad.plan.owner_id != Some(player_id) {
                 continue;
             }
             if commitment.phase == CapitalRouteExecutionPhase::Stage {
@@ -9582,8 +9582,8 @@ pub(crate) fn refresh_capital_route_path_commitments(
         .unwrap_or_default();
     let mut squads_by_island = HashMap::<crate::ai::islands::IslandId, Vec<RouteSquad>>::default();
     for squad in manager.squads.iter().filter(|squad| {
-        squad.owner_id == Some(player_id)
-            && squad.mission_type != MissionType::Transport
+        squad.plan.owner_id == Some(player_id)
+            && squad.plan.mission_type != MissionType::Transport
             && !squad
                 .members
                 .iter()
@@ -9663,8 +9663,8 @@ pub(crate) fn refresh_capital_route_path_commitments(
                 .push(RouteSquad {
                     id: squad.id,
                     operation_id: squad.operation_id,
-                    mission: squad.mission_type.clone(),
-                    target: squad.target,
+                    mission: squad.plan.mission_type.clone(),
+                    target: squad.plan.target,
                     forward_progress,
                     ground_member_count,
                     capture_member_count,
@@ -10154,14 +10154,15 @@ pub(crate) fn refresh_capital_route_path_commitments(
             // 敵がいないAreaはControl Squadの到着待ちで占領を止めない。敵がいるAreaは
             // 同じNodeへControl Squadを割り当てた場合だけCapture Squadを発進させる。
             let departure_authorized = !local_enemy_present || has_control_squad;
-            if let Some(squad) = manager
-                .squads_mut()
-                .iter_mut()
-                .find(|squad| squad.id == squad_id && squad.owner_id == Some(player_id))
+            if let Some(mut squad) = manager
+                .edit_each()
+                .find(|squad| squad.id == squad_id && squad.plan.owner_id == Some(player_id))
             {
-                squad.departure_authorized = departure_authorized;
-                if departure_authorized && squad.phase == crate::ai::squad::MissionPhase::Forming {
-                    squad.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+                squad.plan_mut().departure_authorized = departure_authorized;
+                if departure_authorized
+                    && squad.plan.phase == crate::ai::squad::MissionPhase::Forming
+                {
+                    squad.plan_mut().phase = crate::ai::squad::MissionPhase::MovingToTarget;
                 }
             }
         }
@@ -10182,7 +10183,7 @@ pub(crate) fn refresh_capital_route_path_commitments(
     for squad in manager
         .squads
         .iter()
-        .filter(|s| s.owner_id == Some(player_id))
+        .filter(|s| s.plan.owner_id == Some(player_id))
     {
         if registry.commitments.contains_key(&squad.id) {
             registry
@@ -10275,9 +10276,9 @@ pub(crate) fn is_capture_target_reserved(
         .get_resource::<crate::ai::squad::SquadManager>()
         .is_some_and(|manager| {
             manager.squads.iter().any(|squad| {
-                squad.owner_id == Some(player_id)
-                    && squad.mission_type == crate::ai::squad::MissionType::Capture
-                    && squad.target == Some(position)
+                squad.plan.owner_id == Some(player_id)
+                    && squad.plan.mission_type == crate::ai::squad::MissionType::Capture
+                    && squad.plan.target == Some(position)
             })
         })
 }
@@ -10712,18 +10713,18 @@ pub fn capital_route_diagnostics_for_player(
             manager
                 .squads
                 .iter()
-                .filter(|squad| squad.owner_id == Some(player_id))
+                .filter(|squad| squad.plan.owner_id == Some(player_id))
                 .flat_map(|squad| {
                     squad.members.iter().map(move |entity| {
                         (
                             *entity,
                             (
                                 squad.id,
-                                squad.target_island,
-                                squad.target,
-                                format!("{:?}", squad.mission_type),
-                                format!("{:?}", squad.phase),
-                                squad.departure_authorized,
+                                squad.plan.target_island,
+                                squad.plan.target,
+                                format!("{:?}", squad.plan.mission_type),
+                                format!("{:?}", squad.plan.phase),
+                                squad.plan.departure_authorized,
                             ),
                         )
                     })
@@ -13536,9 +13537,9 @@ impl BoardScan {
                     manager
                         .squads
                         .iter()
-                        .filter(|squad| squad.owner_id == Some(player_id))
+                        .filter(|squad| squad.plan.owner_id == Some(player_id))
                         .flat_map(|squad| {
-                            squad.target.into_iter().flat_map(move |target| {
+                            squad.plan.target.into_iter().flat_map(move |target| {
                                 squad.members.iter().map(move |entity| (*entity, target))
                             })
                         })

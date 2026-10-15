@@ -992,7 +992,7 @@ pub(crate) fn record_operation_command(world: &mut World, entity: Entity, comman
                     || squad.cargo_entities.contains(&entity)
             })
         })
-        .and_then(|squad| match squad.phase {
+        .and_then(|squad| match squad.plan.phase {
             MissionPhase::Transport(phase) => Some(phase),
             _ => None,
         });
@@ -1097,8 +1097,8 @@ fn entity_is_owned_by_island_squad(
     entity: Entity,
 ) -> bool {
     manager.squads.iter().any(|squad| {
-        squad.owner_id == Some(player_id)
-            && squad.target_island == Some(island_id)
+        squad.plan.owner_id == Some(player_id)
+            && squad.plan.target_island == Some(island_id)
             && (squad.members.contains(&entity)
                 || squad.cargo_entities.contains(&entity)
                 || squad.delivered_cargo.contains(&entity))
@@ -1177,8 +1177,8 @@ fn diagnose_operation_execution(
             continue;
         }
         let assigned_transport = manager.squads.iter().any(|squad| {
-            squad.owner_id == Some(player_id)
-                && squad.target_island == Some(assignment.island_id)
+            squad.plan.owner_id == Some(player_id)
+                && squad.plan.target_island == Some(assignment.island_id)
                 && squad.cargo_entities.contains(entity)
                 && squad.transport_entity.is_some()
         });
@@ -1336,8 +1336,8 @@ fn diagnose_operation_recoveries(
             OperationIssueKind::TransportUnassigned => issue.entity.and_then(|entity| {
                 let loaded = world.get::<Transporting>(entity).is_some();
                 let assigned_transport = manager.squads.iter().any(|squad| {
-                    squad.owner_id == Some(player_id)
-                        && squad.target_island == Some(assignment.island_id)
+                    squad.plan.owner_id == Some(player_id)
+                        && squad.plan.target_island == Some(assignment.island_id)
                         && squad.cargo_entities.contains(&entity)
                         && squad.transport_entity.is_some()
                 });
@@ -1415,11 +1415,11 @@ fn operation_phase(
         .squads
         .iter()
         .filter(|squad| {
-            squad.owner_id == Some(player_id)
-                && squad.mission_type == MissionType::Transport
-                && squad.target_island == Some(assignment.island_id)
+            squad.plan.owner_id == Some(player_id)
+                && squad.plan.mission_type == MissionType::Transport
+                && squad.plan.target_island == Some(assignment.island_id)
         })
-        .filter_map(|squad| match squad.phase {
+        .filter_map(|squad| match squad.plan.phase {
             MissionPhase::Transport(phase) => Some(phase),
             _ => None,
         })
@@ -1565,11 +1565,9 @@ fn estimate_full_objective_completion(
         .iter()
         .copied()
         .collect::<HashSet<_>>();
-    for squad in manager
-        .squads
-        .iter()
-        .filter(|squad| squad.owner_id == Some(player_id) && squad.target_island == Some(island_id))
-    {
+    for squad in manager.squads.iter().filter(|squad| {
+        squad.plan.owner_id == Some(player_id) && squad.plan.target_island == Some(island_id)
+    }) {
         for entity in squad
             .cargo_entities
             .iter()
@@ -1614,8 +1612,8 @@ fn estimate_full_objective_completion(
         }
 
         let squad = manager.squads.iter().find(|squad| {
-            squad.owner_id == Some(player_id)
-                && squad.target_island == Some(island_id)
+            squad.plan.owner_id == Some(player_id)
+                && squad.plan.target_island == Some(island_id)
                 && (squad.cargo_entities.contains(&entity)
                     || squad.delivered_cargo.contains(&entity))
         });
@@ -1631,7 +1629,7 @@ fn estimate_full_objective_completion(
             .get::<UnitStats>(transport)
             .ok_or_else(|| format!("transport Entity {} has no stats", transport.to_bits()))?;
         let pickup = squad
-            .and_then(|squad| squad.pickup_position)
+            .and_then(|squad| squad.plan.pickup_position)
             .unwrap_or(transport_position);
         let mut ready = 0_u32;
         let departure = if transporting.is_some() {
@@ -2000,7 +1998,8 @@ pub(crate) fn reconcile_campaign_roadmap(
         registry.replace_operation_issues(operation_id, issues, recoveries);
         registry.bind_assignment_entities(operation_id, assignment);
         for squad in manager.squads.iter().filter(|squad| {
-            squad.owner_id == Some(player_id) && squad.target_island == Some(assignment.island_id)
+            squad.plan.owner_id == Some(player_id)
+                && squad.plan.target_island == Some(assignment.island_id)
         }) {
             if let Some(transport) = *squad.transport_entity {
                 registry.bind_entity_exclusive(
@@ -2077,7 +2076,8 @@ pub(crate) fn reconcile_campaign_roadmap(
         // 局地portfolioと同じくSquadから実Entityを拾う。これがないと毎ターン
         // Campaign→Reserve→Campaignを循環して、形成済み戦力の予実が分断される。
         for squad in manager.squads.iter().filter(|squad| {
-            squad.owner_id == Some(player_id) && squad.target_island == Some(capital_island)
+            squad.plan.owner_id == Some(player_id)
+                && squad.plan.target_island == Some(capital_island)
         }) {
             if let Some(transport) = *squad.transport_entity {
                 registry.bind_entity_exclusive(

@@ -91,7 +91,7 @@ impl AiSimulationState {
                 continue;
             };
 
-            if squad.mission_type == MissionType::Transport {
+            if squad.plan.mission_type == MissionType::Transport {
                 // マクロ・シミュレーション（深い読み）: ターゲットにワープ＆ドロップ
                 // 歩兵を目標地点に直接配置することで、直後の evaluate_board が「上陸完了」として高く評価する
                 for &cargo_entity in &squad.cargo_entities {
@@ -122,7 +122,7 @@ impl AiSimulationState {
                         continue;
                     };
 
-                    let interaction_max_range = match squad.mission_type {
+                    let interaction_max_range = match squad.plan.mission_type {
                         crate::ai::squad::MissionType::Attack
                         | crate::ai::squad::MissionType::Defense => {
                             if stats.max_range > 0 {
@@ -218,7 +218,7 @@ impl AiSimulationState {
                     *pos = best_tile;
                     pos_val = best_tile;
 
-                    if squad.mission_type == MissionType::Capture
+                    if squad.plan.mission_type == MissionType::Capture
                         && pos.x == target_pos.x
                         && pos.y == target_pos.y
                     {
@@ -345,12 +345,12 @@ mod tests {
             .id();
 
         let mut squad = Squad::new(SquadId(1), Some(p1), MissionType::Attack);
-        squad.target = Some(GridPosition { x: 1, y: 8 });
-        squad.phase = MissionPhase::Executing;
+        squad.plan.target = Some(GridPosition { x: 1, y: 8 });
+        squad.plan.phase = MissionPhase::Executing;
         squad.members.insert(unit_entity);
 
         let mut assignments = HashMap::default();
-        assignments.insert(squad.id, squad.target.unwrap());
+        assignments.insert(squad.id, squad.plan.target.unwrap());
 
         let mut cache = crate::ai::turn_distance::AiTurnCache::new();
 

@@ -111,9 +111,9 @@ fn collect_relief_groups(
         .squads
         .iter()
         .filter(|squad| {
-            squad.owner_id == Some(player_id)
-                && squad.mission_type == MissionType::Transport
-                && squad.phase == MissionPhase::Forming
+            squad.plan.owner_id == Some(player_id)
+                && squad.plan.mission_type == MissionType::Transport
+                && squad.plan.phase == MissionPhase::Forming
         })
         .map(|squad| {
             let mut entities: Vec<_> = squad
@@ -124,7 +124,7 @@ fn collect_relief_groups(
                 .collect();
             entities.sort_by_key(|entity| entity.to_bits());
             entities.dedup();
-            (entities, squad.target)
+            (entities, squad.plan.target)
         })
         .collect();
     // 局地護衛待ちの占領兵も、生産施設上では待たせない。任務目標へは進めず、
@@ -134,14 +134,14 @@ fn collect_relief_groups(
             .squads
             .iter()
             .filter(|squad| {
-                squad.owner_id == Some(player_id)
-                    && squad.mission_type == MissionType::Capture
-                    && !squad.departure_authorized
+                squad.plan.owner_id == Some(player_id)
+                    && squad.plan.mission_type == MissionType::Capture
+                    && !squad.plan.departure_authorized
             })
             .map(|squad| {
                 (
                     squad.members.iter().copied().collect::<Vec<_>>(),
-                    squad.target,
+                    squad.plan.target,
                 )
             }),
     );
@@ -151,10 +151,10 @@ fn collect_relief_groups(
                 .squads
                 .iter()
                 .filter(|squad| {
-                    squad.owner_id == Some(player_id)
-                        && squad.mission_type != MissionType::Transport
-                        && (squad.mission_type != MissionType::Capture
-                            || squad.departure_authorized)
+                    squad.plan.owner_id == Some(player_id)
+                        && squad.plan.mission_type != MissionType::Transport
+                        && (squad.plan.mission_type != MissionType::Capture
+                            || squad.plan.departure_authorized)
                 })
                 .map(|squad| {
                     // 通常executorより先に工場を空ける場合も、DAG orderがあれば
@@ -170,7 +170,7 @@ fn collect_relief_groups(
                         .flatten();
                     (
                         squad.members.iter().copied().collect::<Vec<_>>(),
-                        route_target.unwrap_or(squad.target),
+                        route_target.unwrap_or(squad.plan.target),
                     )
                 }),
         );
