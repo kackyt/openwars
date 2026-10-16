@@ -48,7 +48,7 @@ pub fn add_main_game_systems(schedule: &mut Schedule) {
             (
                 crate::ai::v4::victory_roadmap::audit_victory_roadmap_system
                     .run_if(has_no_extended_v4),
-                crate::ai::v4::victory_roadmap::extended::audit_victory_roadmap_system
+                crate::ai::v4::victory_roadmap::audit::audit_victory_roadmap_system
                     .run_if(has_extended_v4),
             ),
             undo_move_system,

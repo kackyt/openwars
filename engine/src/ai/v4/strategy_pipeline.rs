@@ -87,7 +87,7 @@ pub(in crate::ai::v4) fn prepare_production_scan(
     world: &mut World,
     player_id: PlayerId,
 ) -> Option<ProductionScanPreparation> {
-    if !crate::ai::code_path::is_extended_at("v4/mod.rs::collect") {
+    if !crate::ai::code_path::is_extended() {
         return None;
     }
     world.get_resource::<crate::resources::Map>()?;

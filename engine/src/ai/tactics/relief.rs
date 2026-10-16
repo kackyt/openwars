@@ -20,8 +20,7 @@ pub(crate) fn decide_forming_campaign_site_relief(
 ) -> Option<(Entity, AiCommand)> {
     // 拡張経路では、首都攻略DAGの指令先・セル列と、退避先での占領開始を加える。
     // 退避対象の収集・候補順・通常の退避先選択は両経路で共通。
-    let is_extended_path =
-        crate::ai::code_path::is_extended_at("engine.rs::decide_forming_campaign_site_relief");
+    let is_extended_path = crate::ai::code_path::is_extended();
 
     let map = world.get_resource::<Map>()?.clone();
     let registry = world.get_resource::<MasterDataRegistry>()?.clone();

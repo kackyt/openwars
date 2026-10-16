@@ -2342,10 +2342,8 @@ fn prepare_campaign_local_assignment_scoped(
     scope: CampaignAssignmentScope<'_>,
 ) {
     // 小規模マップのV4は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended_at(
-        "squad.rs::prepare_campaign_local_assignment_with_connectivity",
-    ) {
-        return extended::prepare_campaign_local_assignment_scoped(
+    if crate::ai::code_path::is_extended() {
+        return local_assignment::prepare_campaign_local_assignment_scoped(
             world,
             manager,
             player_id,
@@ -2524,10 +2522,9 @@ fn synchronize_local_capture_departure(
     connectivity: &mut TerrainConnectivity,
 ) {
     // 小規模マップ展開の即時出撃（H01の出撃方策）は拡張経路だけで使う。
-    let departs_immediately_on_small_map =
-        crate::ai::code_path::is_extended_at("squad.rs::synchronize_local_capture_departure")
-            && crate::ai::strategy_profile::current_profile(world, player_id)
-                == crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion;
+    let departs_immediately_on_small_map = crate::ai::code_path::is_extended()
+        && crate::ai::strategy_profile::current_profile(world, player_id)
+            == crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion;
     if crate::ai::resolve_player_ai_version(world, player_id)
         != crate::ai::ai_version::AiVersion::V4
     {
@@ -3744,8 +3741,8 @@ struct CapturePlanningContext<'a> {
 /// 再編の段は [`formation`] にある。
 pub fn plan_squads(world: &mut World, perspective_player: PlayerId) {
     // 小規模マップのV4は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended_at("squad.rs::plan_squads") {
-        return extended::plan_squads(world, perspective_player);
+    if crate::ai::code_path::is_extended() {
+        return planning_policy::plan_squads(world, perspective_player);
     }
     formation::plan_squads_with_policy(
         world,
@@ -10544,9 +10541,10 @@ mod formation;
 mod assignment;
 
 // 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
-mod extended;
-#[allow(unused_imports)]
-pub use self::extended::*;
+mod capture_responsibilities;
+mod combat_responsibilities;
+mod local_assignment;
+mod planning_policy;
 
 // 再編本体と通常／拡張hookの差分契約。
 // 未追跡のテスト資産のため、ファイルが存在する場合だけ build.rs がcfgを立てる。

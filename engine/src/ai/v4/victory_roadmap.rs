@@ -247,8 +247,7 @@ impl VictoryRoadmapRegistry {
     ) -> Option<(IslandId, GridPosition)> {
         // 依存gateを持つ拡張経路のRoadmapでは、Lockedな首都Nodeを公開しない。
         // 通常経路のNodeは常にReadyで作られるため、この条件は効かない。
-        let hides_locked_nodes =
-            crate::ai::code_path::is_extended_at("v4/victory_roadmap.rs::active_capital_objective");
+        let hides_locked_nodes = crate::ai::code_path::is_extended();
         self.operations
             .values()
             .filter(|operation| {
@@ -566,8 +565,7 @@ impl VictoryRoadmapRegistry {
         // 拡張経路の首都作戦は、同じ島の地域作戦と別のCapital scopeで識別し、
         // 所有状態をNode状態（Secured／Blocked）にも反映する。通常経路は地域作戦と
         // 同じidentityで、Nodeは常にReadyのまま扱う。
-        let uses_capital_scope =
-            crate::ai::code_path::is_extended_at("v4/victory_roadmap.rs::ensure_capital_objective");
+        let uses_capital_scope = crate::ai::code_path::is_extended();
         let key = if uses_capital_scope {
             (player_id, island_id, StrategicOperationScope::Capital)
         } else {
@@ -672,8 +670,7 @@ impl VictoryRoadmapRegistry {
         // 拡張経路のRoadmapは、観測Node（Locked）として先に作られたOperationを目的別
         // scopeで引き継ぎ、目標集合を現在の波へ置換する。通常経路は地域作戦として
         // 作成し、見つかった前線目標を同じ作戦へ累積する。
-        let replaces_current_wave =
-            crate::ai::code_path::is_extended_at("v4/victory_roadmap.rs::reconcile_assignment");
+        let replaces_current_wave = crate::ai::code_path::is_extended();
         let key = main_operation_key(player_id, assignment.island_id);
         let operation_id = if replaces_current_wave {
             self.ensure_operation(
@@ -1717,8 +1714,10 @@ pub(crate) fn reconcile_campaign_roadmap(
     manager: &SquadManager,
 ) {
     // 小規模マップのV4は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended_at("v4/victory_roadmap.rs::reconcile_campaign_roadmap") {
-        return extended::reconcile_campaign_roadmap(world, player_id, portfolio, manager);
+    if crate::ai::code_path::is_extended() {
+        return strategic_selection::reconcile_campaign_roadmap(
+            world, player_id, portfolio, manager,
+        );
     }
     let turn = world
         .get_resource::<MatchState>()
@@ -3241,7 +3240,16 @@ fn main_operation_key(
     (player_id, island_id, StrategicOperationScope::Regional)
 }
 
-// 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
-pub(crate) mod extended;
-#[allow(unused_imports)]
-pub use self::extended::*;
+// 公開する状態型と入口だけを列挙し、判断・観測の本文は責務別に置く。
+pub(crate) mod audit;
+mod dependency_graph;
+mod execution_observation;
+mod strategic_selection;
+mod turn_plan;
+use dependency_graph::StrategicOperationScope;
+pub use dependency_graph::{RoadmapDependency, RoadmapDependencyKind, RoadmapNodeState};
+pub(crate) use strategic_selection::observe_adopted_campaign_roadmap;
+pub(crate) use turn_plan::current_turn_portfolio;
+#[cfg(test)]
+#[path = "victory_roadmap/tests.rs"]
+mod small_map_tests;

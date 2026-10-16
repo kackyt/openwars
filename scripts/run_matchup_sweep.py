@@ -1,6 +1,6 @@
 """複数のAI変種（バイナリ・環境変数）× マップ × seed × 先後 × 繰返しを並列に対戦させて比較する。
 
-変種はサーバー起動時に決まる設定（mcp-serverのバイナリ、`OPENWARS_EXT_DISABLE` などの
+変種はサーバー起動時に決まる設定（mcp-serverのバイナリ、診断出力などの
 環境変数）の組で、1本のサーバーの中では切り替えられない。本スクリプトは全変種の対局を
 1本の作業キューにまとめ、全体の並列数を `--jobs` だけで制御する。
 
@@ -8,14 +8,14 @@
 
     python scripts/run_matchup_sweep.py \\
         --variant baseline=.tmp/bench/mcp-server-baseline.exe \\
-        --variant current=target/release/mcp-server.exe \\
+        --variant current=.tmp/bench/mcp-server-current.exe \\
         --map map_6,map_25 --seeds 1,2 --repeats 3 --jobs 8 \\
         --out-dir .tmp/sweep-YYYYMMDD
 
 環境変数つきの変種:
 
-    --variant noext=target/release/mcp-server.exe \\
-    --env noext:OPENWARS_EXT_DISABLE=v4/mod.rs::collect
+    --variant trace=.tmp/bench/mcp-server-current.exe \\
+    --env trace:OPENWARS_TRACE_AI_STEPS=1
 
 出力（`--out-dir` 配下）:
 

@@ -291,7 +291,7 @@ fn planning_entry_and_local_assignment_follow_code_path() {
             let _guard = crate::ai::code_path::enter(path);
             let mut world = v4_small_world();
             if direct_extended {
-                extended::plan_squads(&mut world, PlayerId(1));
+                planning_policy::plan_squads(&mut world, PlayerId(1));
             } else {
                 plan_squads(&mut world, PlayerId(1));
             }

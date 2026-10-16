@@ -51,7 +51,7 @@ impl PlanningPolicy {
     ) -> Cow<'a, IslandCampaignPortfolio> {
         match self {
             Self::Standard => Cow::Borrowed(portfolio),
-            Self::SmallMap => Cow::Owned(extended::adopt_portfolio(
+            Self::SmallMap => Cow::Owned(planning_policy::adopt_portfolio(
                 world, player, manager, portfolio, is_v4,
             )),
         }
@@ -76,13 +76,15 @@ impl PlanningPolicy {
                 connectivity,
             ),
             // 拡張側は委譲点を経由せず、子の独立ID付き実装を直接呼ぶ。
-            Self::SmallMap => extended::prepare_campaign_local_assignment_with_connectivity(
-                world,
-                manager,
-                player,
-                assignment,
-                connectivity,
-            ),
+            Self::SmallMap => {
+                local_assignment::prepare_campaign_local_assignment_with_connectivity(
+                    world,
+                    manager,
+                    player,
+                    assignment,
+                    connectivity,
+                )
+            }
         }
     }
 
@@ -97,7 +99,7 @@ impl PlanningPolicy {
         match self {
             Self::Standard => sort_capture_targets_by_nearest_infantry(targets, context),
             Self::SmallMap => {
-                extended::sort_small_map_capture_targets(world, player, targets, context)
+                planning_policy::sort_small_map_capture_targets(world, player, targets, context)
             }
         }
     }
@@ -111,7 +113,9 @@ impl PlanningPolicy {
     ) -> Option<usize> {
         match self {
             Self::Standard => select_first_reachable_infantry(context, island, target),
-            Self::SmallMap => extended::select_nearest_capture_infantry(context, island, target),
+            Self::SmallMap => {
+                planning_policy::select_nearest_capture_infantry(context, island, target)
+            }
         }
     }
 

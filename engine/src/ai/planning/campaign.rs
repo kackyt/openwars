@@ -25,8 +25,8 @@ pub(crate) fn propose(
 ) -> IslandCampaignPortfolio {
     let ai_version = crate::ai::resolve_player_ai_version(world, player_id);
     // 首都攻略DAGの準備hookは拡張経路のV4だけが使う。
-    let prepares_strategy_pipeline = ai_version.uses_operation_driven_production()
-        && crate::ai::code_path::is_extended_at("strategy.rs::analyze_strategy_internal");
+    let prepares_strategy_pipeline =
+        ai_version.uses_operation_driven_production() && crate::ai::code_path::is_extended();
     let mut portfolio = if reserved_entities.is_empty() {
         analyze_island_campaign(world, player_id)
     } else {

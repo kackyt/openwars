@@ -102,8 +102,7 @@ fn executable_plan(_kind: OperationKind, plan: &ForcePackagePlan) -> bool {
     if plan.feasible {
         return true;
     }
-    let reject_truncated =
-        crate::ai::code_path::is_extended_at("v4/plan_revision.rs::executable_plan");
+    let reject_truncated = crate::ai::code_path::is_extended();
     if reject_truncated && plan.search_truncated {
         return false;
     }
@@ -905,9 +904,7 @@ impl V4RollingPlanRegistry {
     ) -> Vec<ActiveDeploymentIntent> {
         // 首都攻略の出撃条件。通常経路は全購入stepの完成、拡張経路は初撃までに
         // 予定された波の完成を待つ（どちらが強いかは未実測のため差を維持する）。
-        let readiness = if crate::ai::code_path::is_extended_at(
-            "v4/plan_revision.rs::active_deployment_intents",
-        ) {
+        let readiness = if crate::ai::code_path::is_extended() {
             LaunchReadiness::FirstAttackWave
         } else {
             LaunchReadiness::AllPurchases
@@ -1608,8 +1605,7 @@ impl V4RollingPlanRegistry {
         objective_properties: &[GridPosition],
         _target_enemies: &HashSet<Entity>,
     ) -> Option<usize> {
-        let require_same_kind_for_island =
-            crate::ai::code_path::is_extended_at("v4/plan_revision.rs::matching_index");
+        let require_same_kind_for_island = crate::ai::code_path::is_extended();
         self.active
             .iter()
             .enumerate()

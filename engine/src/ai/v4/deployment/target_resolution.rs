@@ -1,14 +1,38 @@
-//! 拡張経路（小規模マップ戦略・非V4）の実装。
-//!
-//! 親モジュールはmain互換の実装を持ち、本文の異なる関数は
-//! `crate::ai::code_path::is_extended()` でここへ委譲する。
+//! 配備済みunitの緊急迎撃と優先敵追跡。
 
-#[allow(unused_imports)]
-use super::*;
-
-/// 優先敵の現在位置を追跡し、消滅・到達不能時だけ局地敵へ再目標化する。
+#[cfg(test)]
+use super::{
+    Ammo, DeploymentForecast, HashSet, MasterDataRegistry, MissionType, PendingDeployment,
+    SquadManager, UnitProducedEvent, UnitType, prepare_deployment_squads,
+};
+use super::{
+    AssignedDeployment, DamageChart, DeploymentPosture, Entity, Faction, GridPosition, HashMap,
+    Health, Map, PlayerId, Property, SlotKind, TerrainConnectivity, UnitStats,
+    V4DeploymentRegistry, World, can_engage, local_retarget, target_within_operation,
+};
+/// 緊急迎撃がなければ、現標的→購入時の優先順→局地再選定の順で選ぶ。
 pub(super) fn resolve_target(
     world: &mut World,
+    connectivity: &mut TerrainConnectivity,
+    deployment: &AssignedDeployment,
+    target_commitments: &HashMap<Entity, usize>,
+    interceptors: usize,
+) -> Option<(Entity, GridPosition, bool)> {
+    if let Some(target) = emergency_interception(
+        world,
+        connectivity,
+        deployment,
+        target_commitments,
+        interceptors,
+    ) {
+        return Some(target);
+    }
+    track_priority_target(world, connectivity, deployment, target_commitments)
+}
+
+/// 壁役を選べる枠と適格性を確認してから、同じ順序で緊急候補を比較する。
+fn emergency_interception(
+    world: &World,
     connectivity: &mut TerrainConnectivity,
     deployment: &AssignedDeployment,
     target_commitments: &HashMap<Entity, usize>,
@@ -57,44 +81,16 @@ pub(super) fn resolve_target(
                 .iter()
                 .copied()
                 .filter(|&candidate| {
-                    if target_commitments.get(&candidate).copied().unwrap_or(0) >= 1 {
-                        return false;
+                    WallCandidateContext {
+                        world,
+                        map: m,
+                        chart,
+                        stats: my_stats,
+                        position: my_pos,
+                        deployment,
+                        target_commitments,
                     }
-                    let Some(candidate_stats) = world.get::<UnitStats>(candidate) else {
-                        return false;
-                    };
-                    // 相手からの被ダメージが小さく、相手に倒されない（装甲・防御相性の判定）
-                    let incoming_damage = chart
-                        .get_base_damage(candidate_stats.unit_type, my_stats.unit_type)
-                        .unwrap_or(0)
-                        .max(
-                            chart
-                                .get_base_damage_secondary(
-                                    candidate_stats.unit_type,
-                                    my_stats.unit_type,
-                                )
-                                .unwrap_or(0),
-                        );
-                    if incoming_damage > 25 {
-                        return false;
-                    }
-
-                    if let Some(pos) = world.get::<GridPosition>(candidate).copied()
-                        && target_within_operation(world, deployment, candidate)
-                        && can_engage(world, connectivity, deployment.entity, candidate)
-                        && is_uncontested_capture_threat(
-                            world, m, player_id, candidate, pos, anchor,
-                        )
-                    {
-                        // 「そのターンで防ぎに向かえる」判定:
-                        // 自機の移動力＋最大射程で、そのターン内に敵を捕捉・攻撃できる距離にいる
-                        let dist_to_enemy = m.distance(my_pos.x, my_pos.y, pos.x, pos.y);
-                        let reach_this_turn =
-                            my_stats.max_movement.saturating_add(my_stats.max_range);
-                        dist_to_enemy <= reach_this_turn
-                    } else {
-                        false
-                    }
+                    .is_urgent(connectivity, candidate)
                 })
                 .collect::<Vec<_>>();
 
@@ -111,7 +107,72 @@ pub(super) fn resolve_target(
             }
         }
     }
+    None
+}
 
+/// 一回の迎撃候補評価で共有する読み取り専用の能力値と作戦制約。
+struct WallCandidateContext<'a> {
+    world: &'a World,
+    map: &'a Map,
+    chart: &'a DamageChart,
+    stats: &'a UnitStats,
+    position: GridPosition,
+    deployment: &'a AssignedDeployment,
+    target_commitments: &'a HashMap<Entity, usize>,
+}
+impl WallCandidateContext<'_> {
+    fn is_urgent(&self, connectivity: &mut TerrainConnectivity, candidate: Entity) -> bool {
+        let world = self.world;
+        let m = self.map;
+        let chart = self.chart;
+        let my_stats = self.stats;
+        let my_pos = self.position;
+        let deployment = self.deployment;
+        let target_commitments = self.target_commitments;
+        let player_id = deployment.intent.player_id;
+        let anchor = deployment.intent.anchor;
+        if target_commitments.get(&candidate).copied().unwrap_or(0) >= 1 {
+            return false;
+        }
+        let Some(candidate_stats) = world.get::<UnitStats>(candidate) else {
+            return false;
+        };
+        // 相手からの被ダメージが小さく、相手に倒されない（装甲・防御相性の判定）
+        let incoming_damage = chart
+            .get_base_damage(candidate_stats.unit_type, my_stats.unit_type)
+            .unwrap_or(0)
+            .max(
+                chart
+                    .get_base_damage_secondary(candidate_stats.unit_type, my_stats.unit_type)
+                    .unwrap_or(0),
+            );
+        if incoming_damage > 25 {
+            return false;
+        }
+
+        if let Some(pos) = world.get::<GridPosition>(candidate).copied()
+            && target_within_operation(world, deployment, candidate)
+            && can_engage(world, connectivity, deployment.entity, candidate)
+            && is_uncontested_capture_threat(world, m, player_id, candidate, pos, anchor)
+        {
+            // 「そのターンで防ぎに向かえる」判定:
+            // 自機の移動力＋最大射程で、そのターン内に敵を捕捉・攻撃できる距離にいる
+            let dist_to_enemy = m.distance(my_pos.x, my_pos.y, pos.x, pos.y);
+            let reach_this_turn = my_stats.max_movement.saturating_add(my_stats.max_range);
+            dist_to_enemy <= reach_this_turn
+        } else {
+            false
+        }
+    }
+}
+
+/// 現標的が有効なら維持し、無効なときだけ購入時の優先順で再選定する。
+fn track_priority_target(
+    world: &mut World,
+    connectivity: &mut TerrainConnectivity,
+    deployment: &AssignedDeployment,
+    target_commitments: &HashMap<Entity, usize>,
+) -> Option<(Entity, GridPosition, bool)> {
     // 2. 緊急のフリーパス脅威がなければ、各個撃破（Focus Fire）の原則に従い、
     //    交戦可能な現標的を維持する。
     if let Some(enemy) = deployment.current_target
@@ -262,6 +323,7 @@ impl V4DeploymentRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::ai::islands::IslandMap;
     use crate::resources::{GridTopology, MovementType, Terrain};
 

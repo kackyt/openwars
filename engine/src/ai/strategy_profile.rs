@@ -99,6 +99,68 @@ mod tests {
     use super::*;
     use crate::resources::{GridTopology, master_data::MasterDataRegistry};
 
+    /// 一時計測の撤去で正式な面積境界や地形方式を変えない。
+    #[test]
+    fn profile_boundary_is_196_cells_for_both_topologies() {
+        for topology in [GridTopology::Square, GridTopology::Hex] {
+            for (cells, expected) in [
+                (196, V4StrategyProfile::SmallMapExpansion),
+                (197, V4StrategyProfile::Standard),
+            ] {
+                let mut world = World::new();
+                world.insert_resource(Map::new(cells, 1, Terrain::Plains, topology));
+                world.spawn((
+                    GridPosition { x: 0, y: 0 },
+                    Property::new(Terrain::City, None, 100),
+                ));
+                assert_eq!(classify_profile(&world), expected);
+            }
+        }
+    }
+
+    /// 小盤面でも占領可能な非首都物件がなければ通常方策を使う。
+    #[test]
+    fn capital_and_uncapturable_properties_do_not_enable_small_map_profile() {
+        let mut world = World::new();
+        world.insert_resource(Map::new(14, 14, Terrain::Plains, GridTopology::Hex));
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(crate::components::PlayerId(1)), 100),
+        ));
+        let mut city = Property::new(Terrain::City, None, 100);
+        city.max_capture_points = 0;
+        world.spawn((GridPosition { x: 1, y: 0 }, city));
+        assert_eq!(classify_profile(&world), V4StrategyProfile::Standard);
+    }
+
+    /// 確定後の物件喪失で、読み取り側が別方策へ切り替わらない。
+    #[test]
+    fn fixed_profile_survives_property_removal() {
+        let player = crate::components::PlayerId(1);
+        let mut world = World::new();
+        world.insert_resource(Map::new(14, 14, Terrain::Plains, GridTopology::Square));
+        let city = world
+            .spawn((
+                GridPosition { x: 0, y: 0 },
+                Property::new(Terrain::City, None, 100),
+            ))
+            .id();
+        assert_eq!(
+            profile_for(&mut world, player),
+            V4StrategyProfile::SmallMapExpansion
+        );
+        world.despawn(city);
+        assert_eq!(classify_profile(&world), V4StrategyProfile::Standard);
+        assert_eq!(
+            profile_for(&mut world, player),
+            V4StrategyProfile::SmallMapExpansion
+        );
+        assert_eq!(
+            current_profile(&world, player),
+            V4StrategyProfile::SmallMapExpansion
+        );
+    }
+
     #[test]
     fn profile_is_fixed_by_map_structure_not_by_turn_state() {
         let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);

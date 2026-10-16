@@ -205,7 +205,7 @@ impl V4DeploymentRegistry {
         self.pending
             .retain(|pending| pending.player_id != player_id || pending.turn != turn);
         // 編成slotの予約は拡張経路だけが使う。通常経路はslotなしで発注をそのまま登録する。
-        if !crate::ai::code_path::is_extended_at("v4/deployment.rs::replace_turn_orders") {
+        if !crate::ai::code_path::is_extended() {
             self.pending.extend(orders);
             return;
         }
@@ -1042,8 +1042,7 @@ pub(crate) fn prepare_deployment_squads_with_connectivity(
 ) -> HashSet<Entity> {
     // 拡張経路では、占領枠の直接任務化と、迎撃役の上限つき目標解決（H06）を使う。
     // Entityの走査順・Squadの付け替え・解放の手順は両経路で共通。
-    let is_extended_path =
-        crate::ai::code_path::is_extended_at("v4/deployment.rs::prepare_deployment_squads");
+    let is_extended_path = crate::ai::code_path::is_extended();
     let mut target_commitments: HashMap<Entity, usize> = HashMap::default();
     let mut interceptors = 0_usize;
     let mut registry = world
@@ -1088,7 +1087,7 @@ pub(crate) fn prepare_deployment_squads_with_connectivity(
             {
                 // anchor物件が既に自軍所有なら占領任務は達成済み。任務を出し続けると
                 // 占領役が物件上に留まり続け、生産マス前の通路を塞ぐため解放する。
-                if extended::anchor_is_owned_by(world, snapshot.intent.anchor, player_id) {
+                if target_resolution::anchor_is_owned_by(world, snapshot.intent.anchor, player_id) {
                     releases.push((entity, snapshot.squad_id));
                     continue;
                 }
@@ -1096,7 +1095,7 @@ pub(crate) fn prepare_deployment_squads_with_connectivity(
             }
             DeploymentPosture::Execute => {
                 let resolved = if is_extended_path {
-                    extended::resolve_target(
+                    target_resolution::resolve_target(
                         world,
                         connectivity,
                         &snapshot,
@@ -2124,6 +2123,4 @@ mod tests {
 }
 
 // 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
-pub(crate) mod extended;
-#[allow(unused_imports)]
-pub use self::extended::*;
+pub(crate) mod target_resolution;

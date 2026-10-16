@@ -2150,10 +2150,12 @@ pub fn analyze_island_campaign_excluding(
     reserved_entities: &HashSet<Entity>,
 ) -> IslandCampaignPortfolio {
     // 小規模マップのV4は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended_at(
-        "island_campaign_analysis.rs::analyze_island_campaign_excluding",
-    ) {
-        return extended::analyze_island_campaign_excluding(world, player_id, reserved_entities);
+    if crate::ai::code_path::is_extended() {
+        return campaign_analysis::analyze_island_campaign_excluding(
+            world,
+            player_id,
+            reserved_entities,
+        );
     }
     let facts = collect_island_campaign_facts(world, player_id);
     let map = world.resource::<Map>().clone();
@@ -4307,6 +4309,7 @@ mod tests {
 }
 
 // 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
-mod extended;
-#[allow(unused_imports)]
-pub use self::extended::*;
+mod campaign_analysis;
+mod resource_pool;
+mod target_selection;
+pub(crate) use campaign_analysis::pool_audit_enabled;

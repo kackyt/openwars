@@ -3,9 +3,12 @@
 //! 親モジュールはmain互換の実装を持ち、本文の異なる関数は
 //! `crate::ai::code_path::is_extended()` でここへ委譲する。
 
-#[allow(unused_imports)]
-use super::*;
-
+#[cfg(test)]
+use super::GridPosition;
+use super::{
+    ActionTurnDistance, ActionTurnDistanceCache, HashMap, Map, MasterDataRegistry, MovementType,
+    OccupantInfo, PlayerId,
+};
 /// 実ゲームの移動力繰越禁止・燃料消費・移動後間接攻撃禁止を考慮し、
 /// 指定射程帯から攻撃可能になるまでの最短行動ターンを返します。
 #[allow(clippy::too_many_arguments)]
@@ -23,22 +26,6 @@ pub(crate) fn calculate_action_distance_to_range(
     player_id: PlayerId,
     cache: &mut ActionTurnDistanceCache,
 ) -> Option<ActionTurnDistance> {
-    if !crate::ai::code_path::ext_enabled("turn_distance.rs::calculate_action_distance_to_range") {
-        return super::calculate_action_distance_to_range(
-            map,
-            registry,
-            unit_positions,
-            start,
-            target,
-            movement_type,
-            max_mp,
-            max_fuel,
-            interaction_min_range,
-            interaction_max_range,
-            player_id,
-            cache,
-        );
-    }
     calculate_action_distance_to_range_with_origin_policy(
         map,
         registry,
@@ -131,6 +118,7 @@ pub(super) fn calculate_action_distance_to_range_with_origin_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::resources::Terrain;
 
     #[test]

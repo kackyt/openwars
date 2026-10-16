@@ -743,9 +743,8 @@ pub fn calculate_action_distance_to_range(
     cache: &mut ActionTurnDistanceCache,
 ) -> Option<ActionTurnDistance> {
     // 小規模マップのV4は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended_at("turn_distance.rs::calculate_action_distance_to_range")
-    {
-        return extended::calculate_action_distance_to_range(
+    if crate::ai::code_path::is_extended() {
+        return action_distance::calculate_action_distance_to_range(
             map,
             registry,
             unit_positions,
@@ -1459,6 +1458,5 @@ mod tests {
 }
 
 // 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
-mod extended;
-#[allow(unused_imports)]
-pub use self::extended::*;
+mod action_distance;
+pub(crate) use action_distance::calculate_action_distance_to_range_after_leaving_start;

@@ -358,7 +358,7 @@ struct SimulationCatalog {
 impl SimulationCatalog {
     fn new(input: &RollingPlanInput) -> Self {
         // 小規模マップのV4は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended_at("v4/rolling_plan.rs::new") {
+        if crate::ai::code_path::is_extended() {
             return Self::new_extended(input);
         }
         // 同じ施設・兵種の生産案は生産turnだけが違う。交戦条件の表は1回だけ作り、
@@ -459,8 +459,8 @@ fn existing_units_by_enemy_damage(
 /// 現在観測した敵を排除できる混成パッケージを探索する。
 pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackagePlan> {
     // 小規模マップのV4は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended_at("v4/rolling_plan.rs::plan_force_package") {
-        return extended::plan_force_package(input);
+    if crate::ai::code_path::is_extended() {
+        return force_package::plan_force_package(input);
     }
     let catalog = SimulationCatalog::new(input);
     if input.enemies.is_empty() {
@@ -924,8 +924,13 @@ fn simulate_state_with_catalog(
     search_turns: u32,
 ) -> ForcePackagePlan {
     // 小規模マップのV4は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended_at("v4/rolling_plan.rs::simulate_state_with_catalog") {
-        return extended::simulate_state_with_catalog(input, catalog, state, search_turns);
+    if crate::ai::code_path::is_extended() {
+        return combat_capture_simulation::simulate_state_with_catalog(
+            input,
+            catalog,
+            state,
+            search_turns,
+        );
     }
     let mut run = CombatRun::start(catalog, state);
     run.advance_to(input, search_turns);
@@ -1297,12 +1302,11 @@ fn sim_friendly(
 ) -> SimFriendly {
     // 保護完了時刻は、保護契約の生存を予測する拡張経路のモデルだけが使う。
     // 通常経路は従来どおり保護期限を持たない戦力として初期化する。
-    let protection_completion_turn =
-        if crate::ai::code_path::is_extended_at("v4/rolling_plan.rs::sim_friendly") {
-            source.protection_completion_turn
-        } else {
-            None
-        };
+    let protection_completion_turn = if crate::ai::code_path::is_extended() {
+        source.protection_completion_turn
+    } else {
+        None
+    };
     EngagementTemplate::build(
         input,
         &source.stats,
@@ -1671,8 +1675,7 @@ pub(crate) fn production_options(
     future_turns: u32,
     mut can_reach: impl FnMut(GridPosition, &UnitStats) -> bool,
 ) -> Vec<ProductionPlanOption> {
-    let allow_cargo =
-        crate::ai::code_path::is_extended_at("v4/rolling_plan.rs::production_options");
+    let allow_cargo = crate::ai::code_path::is_extended();
     let mut options = Vec::new();
     for build_turn in 0..future_turns {
         let facilities = if build_turn == 0 {
@@ -2674,6 +2677,21 @@ mod tests {
 }
 
 // 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
-mod extended;
-#[allow(unused_imports)]
-pub use self::extended::*;
+mod combat_capture_simulation;
+mod exact_property_control;
+mod facility_assignment;
+mod force_package;
+mod frontier;
+mod model;
+mod opening_package;
+mod plan_ranking;
+mod role_multiset;
+mod search_diagnostics;
+pub(crate) use model::OpeningProductionPolicy;
+pub(crate) use model::PlannedCapturePurchase;
+pub(crate) use model::PlannedCombatPurchase;
+pub(crate) use model::ProductionAttackProjection;
+use model::SimCaptureContract;
+#[cfg(test)]
+#[path = "rolling_plan/tests.rs"]
+mod small_map_tests;

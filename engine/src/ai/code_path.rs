@@ -1,11 +1,10 @@
 //! AIの実装経路（main互換 / 小規模マップ拡張）の選択。
 //!
-//! AIはmain時点と同じ実装で動かし、小規模マップのV4だけが拡張実装を使う。
-//! 本文が異なる関数は先頭で [`is_extended`] を見て各モジュールの `extended`
-//! 子モジュールへ委譲する。
+//! V4の正式な戦略プロファイルに従い、小規模マップ専用の方策を入口で選ぶ。
+//! 各責務の入口は [`is_extended`] を参照し、計算中に経路を切り替えない。
 //!
-//! 経路はV4の手番の入口で [`enter`] によって確定させる。純粋な計算関数まで経路を
-//! 引数で渡すとmain互換側の本文が変わってしまうため、スレッドローカルで保持する。
+//! 経路はV4の手番の入口で [`enter`] によって確定させる。標準の呼び出し契約を
+//! 維持するため、スレッドローカルで保持する。
 //! 並列評価では [`current`] を取り出して各ワーカーへ引き継ぐ
 //! （`deterministic_parallel` を参照）。
 
@@ -36,25 +35,6 @@ pub fn current() -> CodePath {
 /// 拡張実装で動いているか。
 pub fn is_extended() -> bool {
     current() == CodePath::Extended
-}
-
-/// （一時計測）委譲点IDごとの拡張の有効/無効。
-pub fn ext_enabled(id: &str) -> bool {
-    static DISABLED: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
-    let disabled = DISABLED.get_or_init(|| {
-        std::env::var("OPENWARS_EXT_DISABLE")
-            .unwrap_or_default()
-            .split(',')
-            .filter(|v| !v.is_empty())
-            .map(str::to_string)
-            .collect()
-    });
-    !disabled.contains(id)
-}
-
-/// （一時計測）IDつきの委譲判定。
-pub fn is_extended_at(id: &str) -> bool {
-    is_extended() && ext_enabled(id)
 }
 
 /// 拡張経路で手番を実行したプレイヤー。
@@ -152,8 +132,20 @@ mod tests {
         );
         assert!(standard.get_resource::<CodePathRegistry>().is_none());
 
-        let mut v3 = world_for("map_1", AiVersion::V3);
-        assert_eq!(for_player(&mut v3, PlayerId(1)), CodePath::MainCompatible);
+        // 共通基盤を使う他版へ、小規模V4の方策を漏らさない。
+        for version in [
+            AiVersion::V1,
+            AiVersion::V2,
+            AiVersion::V3,
+            AiVersion::V100,
+            AiVersion::V200,
+        ] {
+            let mut world = world_for("map_1", version);
+            assert_eq!(
+                for_player(&mut world, PlayerId(1)),
+                CodePath::MainCompatible
+            );
+        }
     }
 
     /// ガードを抜けると直前の経路へ戻る（入れ子でも崩れない）。

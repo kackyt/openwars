@@ -117,11 +117,11 @@ class SweepSummaryTest(unittest.TestCase):
             binary = Path(tmp) / "server.exe"
             binary.write_text("", encoding="utf-8")
             variants = run_matchup_sweep.parse_variants(
-                [f"base={binary}", f"noext={binary}"],
-                ["noext:OPENWARS_EXT_DISABLE=v4/mod.rs::collect"],
+                [f"base={binary}", f"trace={binary}"],
+                ["trace:OPENWARS_TRACE_AI_STEPS=1"],
             )
         self.assertEqual(variants["base"]["env"], {})
-        self.assertEqual(variants["noext"]["env"], {"OPENWARS_EXT_DISABLE": "v4/mod.rs::collect"})
+        self.assertEqual(variants["trace"]["env"], {"OPENWARS_TRACE_AI_STEPS": "1"})
         with self.assertRaises(ValueError):
             run_matchup_sweep.parse_variants(["broken"], [])
 
