@@ -11,8 +11,9 @@ use crate::ai::v4::{
     AdoptedTurnPortfolio, Arc, CampaignPlanningObjective, CargoCapacity, DamageChart,
     EnemyFacilitySnapshot, EnemyProductionForecastTrace, Entity, Faction, GridPosition, HashMap,
     HashSet, Health, Map, MasterDataRegistry, MatchState, OccupantInfo, OpeningProductionPolicy,
-    OperationKind, PlayerId, Players, Property, Terrain, Transporting, UnitRegistry, UnitSnapshot,
-    UnitStats, UnitType, World, logistics_plan, strategy_pipeline, victory_roadmap,
+    OperationKind, PlayerId, Players, ProductionPolicy, Property, Terrain, Transporting,
+    UnitRegistry, UnitSnapshot, UnitStats, UnitType, World, logistics_plan, strategy_pipeline,
+    victory_roadmap,
 };
 
 impl BoardScan {
@@ -524,9 +525,10 @@ impl BoardScan {
         player_id: PlayerId,
         prepared: Option<&strategy_pipeline::ProductionScanPreparation>,
         queries: &BoardScanQueries,
+        policy: ProductionPolicy,
     ) -> Option<Self> {
         // 小規模マップのV4は extended 側の実装を使う。
-        if crate::ai::code_path::is_extended_at("v4/mod.rs::collect") {
+        if policy == ProductionPolicy::SmallMap {
             return Self::collect_extended(world, player_id, prepared, queries);
         }
         let map = Arc::new(world.get_resource::<Map>()?.clone());

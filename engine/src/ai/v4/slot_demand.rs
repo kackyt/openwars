@@ -65,9 +65,10 @@ pub(in crate::ai::v4) fn production_demand_traces(
 pub(in crate::ai::v4) fn most_starved_slot(
     operations: &[Operation],
     ledger: &SlotLedger,
+    policy: ProductionPolicy,
 ) -> Option<(usize, SlotKind)> {
-    most_starved_in_tier(operations, ledger, SlotTier::Prerequisite)
-        .or_else(|| most_starved_in_tier(operations, ledger, SlotTier::Residual))
+    most_starved_in_tier(operations, ledger, SlotTier::Prerequisite, policy)
+        .or_else(|| most_starved_in_tier(operations, ledger, SlotTier::Residual, policy))
 }
 
 /// 当手番の生産配分における要求枠の台帳。作戦番号は配分中の `operations` の添字。
@@ -130,7 +131,10 @@ pub(in crate::ai::v4) const PRIORITY_RANK_UNAUTHORIZED_CAPITAL: u32 = 5;
 
 /// 生産枠の実効優先度。すべて同じ作戦集合で比較し、別枠の緊急作戦は作らない。
 /// Defenseは敵接触ETAと展開リードタイムから優先度を上げるが、必要枠だけを取得する。
-pub(in crate::ai::v4) fn operation_priority_rank(operation: &Operation) -> u32 {
+pub(in crate::ai::v4) fn operation_priority_rank(
+    operation: &Operation,
+    policy: ProductionPolicy,
+) -> u32 {
     let defense_cannot_wait = operation.kind == OperationKind::Defense
         && operation.facts.enemy_combat_units > 0
         && operation.facts.enemy_contact_eta
@@ -138,8 +142,7 @@ pub(in crate::ai::v4) fn operation_priority_rank(operation: &Operation) -> u32 {
     // 期限付き物件制御を持つCaptureを緊急扱いにするのは拡張経路だけ。
     // 通常経路では常にfalseとなり、順位1の段は使われない（相対順は従来どおり）。
     let property_control_cannot_wait =
-        crate::ai::code_path::is_extended_at("v4/mod.rs::operation_priority_rank")
-            && !operation.property_controls.is_empty();
+        policy.reports_property_control() && !operation.property_controls.is_empty();
     match (
         operation.kind,
         operation.execution_authorized,
@@ -170,6 +173,7 @@ pub(in crate::ai::v4) fn defers_capture_to_joint_combat_plan(
     ledger: &SlotLedger,
     kind: SlotKind,
     tier: SlotTier,
+    policy: ProductionPolicy,
 ) -> bool {
     tier == SlotTier::Prerequisite
         && kind == SlotKind::Capture
@@ -178,9 +182,9 @@ pub(in crate::ai::v4) fn defers_capture_to_joint_combat_plan(
         // Combat枠が未充足で決着済みなら、共同計画は成立しないため待たない。
         && ledger.is_open(index, SlotKind::Combat)
         && allocation_slots(op, index, ledger).deficit_ratio(SlotKind::Combat, &op.filled) > 0.0
-        // 切替IDは統合前の委譲点名のまま残す。OPENWARS_EXT_DISABLE で旧IDを指定した
-        // 計測手順と互換を保つため、関数名に合わせて変更しないこと。
-        && crate::ai::code_path::is_extended_at("v4/mod.rs::most_starved_in_tier")
+        // 入口で選んだ方策だけで共同計画への委譲を決める。個別の計測IDや
+        // 呼出し時のTLS経路を、配分の途中から再参照しない。
+        && policy.uses_joint_capture()
 }
 
 /// 指定した段階の中で最も飢えた枠を返す。
@@ -188,6 +192,7 @@ pub(in crate::ai::v4) fn most_starved_in_tier(
     operations: &[Operation],
     ledger: &SlotLedger,
     tier: SlotTier,
+    policy: ProductionPolicy,
 ) -> Option<(usize, SlotKind)> {
     let mut best: Option<(usize, SlotKind, u32, f32, usize)> = None;
     for (index, op) in operations.iter().enumerate() {
@@ -197,7 +202,7 @@ pub(in crate::ai::v4) fn most_starved_in_tier(
             if !ledger.is_open(index, *kind) {
                 continue;
             }
-            if defers_capture_to_joint_combat_plan(op, index, ledger, *kind, tier) {
+            if defers_capture_to_joint_combat_plan(op, index, ledger, *kind, tier, policy) {
                 continue;
             }
             let deficit = slots.tier_deficit(*kind, &op.filled, tier);
@@ -205,7 +210,7 @@ pub(in crate::ai::v4) fn most_starved_in_tier(
                 continue;
             }
             let operation_rank = match tier {
-                SlotTier::Prerequisite => operation_priority_rank(op),
+                SlotTier::Prerequisite => operation_priority_rank(op, policy),
                 SlotTier::Residual => 0,
             };
             // 同じ作戦優先度なら、固定された役割順で全Captureを埋めるのではなく
@@ -250,5 +255,31 @@ pub(in crate::ai::v4) fn record_fill(
         }
         SlotKind::Capture => op.filled.capture_units += 1,
         SlotKind::Combat => unreachable!("Combat購入はRollingPlan経路だけで処理する"),
+    }
+}
+
+pub(in crate::ai::v4) fn defer_unapproved_capital_structure_for_active_segment(
+    operations: &[Operation],
+    ledger: &mut SlotLedger,
+) {
+    let active_segment_under_pressure = operations.iter().any(|operation| {
+        operation.kind == OperationKind::Capture && operation.facts.enemy_combat_units > 0
+    });
+    if !active_segment_under_pressure {
+        return;
+    }
+    for (index, operation) in operations.iter().enumerate() {
+        if operation.kind == OperationKind::AssaultCapital && !operation.execution_authorized {
+            ledger.close(
+                index,
+                SlotKind::Capture,
+                UnfilledReason::DeferredBehindActiveSegment,
+            );
+            ledger.close(
+                index,
+                SlotKind::Transport,
+                UnfilledReason::DeferredBehindActiveSegment,
+            );
+        }
     }
 }

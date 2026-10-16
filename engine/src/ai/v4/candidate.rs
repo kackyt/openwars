@@ -4,14 +4,21 @@ use crate::ai::v4::*;
 
 /// 見積に含めてよいのは、同じ永続Planへ実際に配属済みのEntityだけ。
 pub(in crate::ai::v4) fn committed_entities_for_plan(
-    assignments: Option<&HashMap<Entity, Option<plan_revision::PlanId>>>,
+    assignments: Option<&HashMap<Entity, deployment::ActiveTargetAssignment>>,
     continuation_plan_id: Option<plan_revision::PlanId>,
+    policy: ProductionPolicy,
 ) -> HashSet<Entity> {
     assignments
         .into_iter()
         .flat_map(|assignments| assignments.iter())
-        .filter_map(|(&entity, &plan_id)| {
-            (plan_id == continuation_plan_id && plan_id.is_some()).then_some(entity)
+        .filter_map(|(&entity, assignment)| {
+            let belongs_to_continuation =
+                assignment.plan_id == continuation_plan_id && assignment.plan_id.is_some();
+            let is_operation_bound_immediate_combat =
+                assignment.plan_id.is_none() && assignment.slot_kind == SlotKind::Combat;
+            (belongs_to_continuation
+                || (policy.issues_best_effort() && is_operation_bound_immediate_combat))
+                .then_some(entity)
         })
         .collect()
 }
@@ -170,25 +177,6 @@ pub(in crate::ai::v4) trait CandidateFitness:
 impl<F> CandidateFitness for F where
     F: FnMut(&mut ReachCtx, &GridPosition, &UnitStats) -> Option<f32>
 {
-}
-
-/// 指定の枠を満たす最良の候補を選ぶ。
-pub(in crate::ai::v4) fn select_candidate(
-    scan: &BoardScan,
-    ctx: &mut ReachCtx,
-    op: &Operation,
-    kind: SlotKind,
-    used_facilities: &HashSet<GridPosition>,
-    constraints: CandidateConstraints,
-) -> Option<SlotCandidate> {
-    select_candidate_by(
-        scan,
-        ctx,
-        kind,
-        used_facilities,
-        constraints,
-        |ctx, facility, stats| slot_fitness(scan, ctx, op, kind, facility, stats, &JoinableCapture),
-    )
 }
 
 /// 施設×兵種を走査し、渡された適合度で最良の候補を選ぶ共有骨格。
@@ -402,26 +390,6 @@ pub(in crate::ai::v4) trait CaptureSlotPolicy {
     ) -> Option<f32>;
 }
 
-/// 通常経路の占領枠評価。作戦anchorへ参加できる占領兵を同じ適合度で扱う。
-pub(in crate::ai::v4) struct JoinableCapture;
-
-impl CaptureSlotPolicy for JoinableCapture {
-    fn anchor(&self, op: &Operation) -> GridPosition {
-        op.anchor
-    }
-
-    fn fitness(
-        &self,
-        _scan: &BoardScan,
-        _ctx: &mut ReachCtx,
-        _anchor: GridPosition,
-        _facility: &GridPosition,
-        _stats: &UnitStats,
-    ) -> Option<f32> {
-        Some(1.0)
-    }
-}
-
 /// ユニットが指定枠にどれだけ適合するかを返す。適合しない場合は `None`。
 ///
 /// 評価順は 到達判定 → 能力 → 参加可否 → 占領枠の経路別評価。
@@ -540,26 +508,6 @@ pub(in crate::ai::v4) fn best_damage(
 
 /// 見送り購入（資金を貯めて上位の候補を買う）を行うべきか。
 ///
-/// 一括編成が必要な作戦に限り、いま買える候補より明確に適合度の高い候補が
-/// `RESERVATION_PATIENCE_TURNS` 以内の収入で買えるなら、今ターンは生産しない。
-pub(in crate::ai::v4) fn should_defer_purchase(
-    scan: &BoardScan,
-    ctx: &mut ReachCtx,
-    op: &Operation,
-    kind: SlotKind,
-    remaining_funds: u32,
-    affordable_cost: u32,
-) -> bool {
-    should_defer_purchase_by(
-        scan,
-        ctx,
-        op,
-        remaining_funds,
-        affordable_cost,
-        |ctx, facility, stats| slot_fitness(scan, ctx, op, kind, facility, stats, &JoinableCapture),
-    )
-}
-
 /// 見送り購入判定の共有骨格。適合度は呼び出し側の経路別関数を使う。
 ///
 /// 将来候補は全施設×兵種から厳密に良いものを選び、現在候補は兵種ごとに
@@ -618,4 +566,21 @@ pub(in crate::ai::v4) fn should_defer_purchase_by(
     let shortfall = future_cost.saturating_sub(remaining_funds);
     let turns_to_afford = shortfall.div_ceil(scan.my_income.max(1));
     turns_to_afford <= RESERVATION_PATIENCE_TURNS
+}
+
+pub(in crate::ai::v4) fn planned_capture_deployment(
+    op: &Operation,
+    target: GridPosition,
+) -> PlannedDeployment {
+    PlannedDeployment {
+        anchor: target,
+        staging_anchor: op.staging_anchor,
+        posture: deployment::DeploymentPosture::Execute,
+        slot_kind: SlotKind::Capture,
+        priority_enemies: Vec::new(),
+        threat_horizon: op.threat_horizon,
+        forecast: deployment::DeploymentForecast::default(),
+        plan_step: None,
+        operation_binding: None,
+    }
 }

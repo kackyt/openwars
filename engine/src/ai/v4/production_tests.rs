@@ -1,3 +1,4 @@
+use super::production_entry::has_direct_capture_route;
 use crate::ai::v4::capital_route::commitment::{
     capital_route_frontline_sort_key, inherited_capital_route_commitment,
     refresh_capital_route_path_commitments,
@@ -10,7 +11,7 @@ use crate::ai::v4::capital_route::prepare_capital_route_topologies;
 use crate::ai::v4::enemy_forecast::{
     EnemyReinforcementEnvelope, ReinforcementScenario, projected_enemy_reinforcement_envelope,
 };
-use crate::ai::v4::extended::{
+use crate::ai::v4::production_pipeline::test_exports::{
     ImmediateCombatEngagement, ImmediateCombatOption, build_operation, build_operations,
     combat_plan_input, committed_entities_for_plan,
     defer_unapproved_capital_structure_for_active_segment, enemy_reinforcement_assessment,
@@ -191,7 +192,13 @@ fn campaign_objective_is_the_only_capture_source_and_keeps_exact_anchor() {
         execution_authorized: true,
     }];
 
-    let operations = build_operations(&scan, &mut ReachCtx::default(), &[], PlayerId(1));
+    let operations = build_operations(
+        &scan,
+        &mut ReachCtx::default(),
+        &[],
+        PlayerId(1),
+        ProductionPolicy::SmallMap,
+    );
     let captures = operations
         .iter()
         .filter(|operation| operation.kind == OperationKind::Capture)
@@ -247,7 +254,13 @@ fn capital_objective_keeps_local_front_as_an_independent_operation() {
         properties: vec![capital],
         target_enemies: HashSet::default(),
     };
-    let operations = build_operations(&scan, &mut ReachCtx::default(), &[active], PlayerId(1));
+    let operations = build_operations(
+        &scan,
+        &mut ReachCtx::default(),
+        &[active],
+        PlayerId(1),
+        ProductionPolicy::SmallMap,
+    );
     let same_island = operations
         .iter()
         .filter(|operation| operation.island_id == Some(island_id))
@@ -360,6 +373,7 @@ fn existing_combat_sorties_are_committed_to_only_one_operation() {
         &HashSet::default(),
         2,
         PlayerId(1),
+        ProductionPolicy::SmallMap,
     );
     let far = build_operation(
         &scan,
@@ -375,6 +389,7 @@ fn existing_combat_sorties_are_committed_to_only_one_operation() {
         &HashSet::default(),
         5,
         PlayerId(1),
+        ProductionPolicy::SmallMap,
     );
 
     assert!(near.facts.friendly_combat_units_committed > 0);
@@ -425,12 +440,16 @@ fn committed_combat_keeps_plan_ownership_and_accepts_operation_bound_reinforceme
     ]);
 
     assert_eq!(
-        committed_entities_for_plan(Some(&assignments), None),
+        committed_entities_for_plan(Some(&assignments), None, ProductionPolicy::SmallMap),
         HashSet::from_iter([immediate_entity]),
         "実在敵へ割り当てた即時Combat増援は、次の作戦見積でも継続して数える"
     );
     assert_eq!(
-        committed_entities_for_plan(Some(&assignments), Some(own_plan)),
+        committed_entities_for_plan(
+            Some(&assignments),
+            Some(own_plan),
+            ProductionPolicy::SmallMap
+        ),
         HashSet::from_iter([own_entity, immediate_entity]),
         "別PlanとInterceptは混ぜず、同じPlanと即時Combatだけを数える"
     );
@@ -458,7 +477,13 @@ fn combat_plan_projects_only_the_capturer_ordered_this_turn() {
         execution_authorized: true,
     }];
     let mut ctx = ReachCtx::default();
-    let mut operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
+    let mut operations = build_operations(
+        &scan,
+        &mut ctx,
+        &[],
+        PlayerId(1),
+        ProductionPolicy::SmallMap,
+    );
     let planned_stats = scan
         .reference_capture_unit()
         .expect("fixtureには占領可能兵がある")
@@ -486,6 +511,7 @@ fn combat_plan_projects_only_the_capturer_ordered_this_turn() {
         scan.funds,
         false,
         PlayerId(1),
+        ProductionPolicy::SmallMap,
     )
     .expect("観測敵がいるためCombat計画入力が作られる");
 
@@ -551,7 +577,13 @@ fn expected_reinforcement_starts_production_without_changing_the_launch_gate() {
     // ある限りExpectedを0にしない。
     scan.enemy_production_forecast = EnemyProductionForecastTrace::default();
     let mut ctx = ReachCtx::default();
-    let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
+    let operations = build_operations(
+        &scan,
+        &mut ctx,
+        &[],
+        PlayerId(1),
+        ProductionPolicy::SmallMap,
+    );
     let capture = operations
         .iter()
         .find(|operation| operation.kind == OperationKind::Capture)
@@ -657,6 +689,7 @@ fn enemy_reinforcement_assessment_places_each_purchase_on_the_time_axis() {
         5,
         op.facts.enemy_reinforcement_funds,
         ReinforcementScenario::Stress,
+        ProductionPolicy::SmallMap,
     );
     let mut arrivals = assessment
         .reinforcements
@@ -706,7 +739,10 @@ fn rejected_joint_package_keeps_requested_demand_and_records_effective_demand() 
     ledger.reopen(0, SlotKind::Capture);
     assert_eq!(operations[0].slots, requested);
     assert!(ledger.is_open(0, SlotKind::Capture));
-    assert_eq!(most_starved_slot(&operations, &ledger), None);
+    assert_eq!(
+        most_starved_slot(&operations, &ledger, ProductionPolicy::for_current_path()),
+        None
+    );
     let traces = production_demand_traces(&operations, &ledger);
     assert_eq!(traces[0].requested, requested);
     assert_eq!(traces[0].effective.capture_units, 0);
@@ -753,7 +789,11 @@ fn effective_joint_demand_preserves_legacy_slot_selection_and_deficit() {
                 competing_slots,
                 OperationSlots::default(),
             );
-            let new_choice = most_starved_slot(&[current, competing], &ledger);
+            let new_choice = most_starved_slot(
+                &[current, competing],
+                &ledger,
+                ProductionPolicy::for_current_path(),
+            );
             // 旧実装の直接上書きと、実効要求を読む実装の配分先・未充足率を比較する。
             current = operation(OperationKind::Capture, requested, filled_slots);
             current.slots.capture_units = amount;
@@ -771,7 +811,11 @@ fn effective_joint_demand_preserves_legacy_slot_selection_and_deficit() {
             );
             assert_eq!(
                 new_choice,
-                most_starved_slot(&[current, competing], &SlotLedger::new())
+                most_starved_slot(
+                    &[current, competing],
+                    &SlotLedger::new(),
+                    ProductionPolicy::for_current_path()
+                )
             );
         }
     }
@@ -816,6 +860,7 @@ fn transports_are_ledgered_by_delivery_ability_not_proximity() {
         &HashSet::default(),
         3,
         PlayerId(1),
+        ProductionPolicy::SmallMap,
     );
 
     // それでも「対岸へ積荷を届けられる」以上、渡洋作戦の台帳に載らねばならない
@@ -860,6 +905,7 @@ fn loaded_enemy_transport_on_another_island_is_a_future_arrival() {
         &HashSet::default(),
         3,
         PlayerId(1),
+        ProductionPolicy::SmallMap,
     );
 
     assert_eq!(operation.reachable_threats.len(), 1);
@@ -906,6 +952,7 @@ fn empty_enemy_transport_does_not_create_anti_air_demand_on_every_island() {
         &HashSet::default(),
         3,
         PlayerId(1),
+        ProductionPolicy::SmallMap,
     );
 
     assert!(operation.reachable_threats.is_empty());
@@ -1069,7 +1116,13 @@ fn immediate_reinforcement_targets_a_live_reachable_frontline_enemy() {
         enemy_production_forecast: EnemyProductionForecastTrace::default(),
     };
     let mut ctx = ReachCtx::default();
-    let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
+    let operations = build_operations(
+        &scan,
+        &mut ctx,
+        &[],
+        PlayerId(1),
+        ProductionPolicy::SmallMap,
+    );
 
     let options = immediate_combat_options(
         &scan,
@@ -1087,6 +1140,7 @@ fn immediate_reinforcement_targets_a_live_reachable_frontline_enemy() {
             remaining_funds: scan.funds,
             per_slot_budget: 10_000,
         },
+        ProductionPolicy::SmallMap,
     )
     .expect("実在前線へ届く増援を選ぶ");
 
@@ -1131,7 +1185,13 @@ fn standalone_reinforcement_does_not_replace_missing_front_with_indirect_fire() 
         100,
     );
     let mut ctx = ReachCtx::default();
-    let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
+    let operations = build_operations(
+        &scan,
+        &mut ctx,
+        &[],
+        PlayerId(1),
+        ProductionPolicy::SmallMap,
+    );
     let options = immediate_combat_options(
         &scan,
         &mut ctx,
@@ -1188,6 +1248,7 @@ fn combat_reinforcement_uses_affordable_frontline_strength_not_equal_factory_bud
             remaining_funds: 6000,
             per_slot_budget: 1000,
         },
+        ProductionPolicy::SmallMap,
     )
     .unwrap();
     assert_eq!(
@@ -1204,6 +1265,7 @@ fn combat_reinforcement_uses_affordable_frontline_strength_not_equal_factory_bud
             remaining_funds: 1000,
             per_slot_budget: 1000,
         },
+        ProductionPolicy::SmallMap,
     )
     .unwrap();
     assert_eq!(
@@ -1267,6 +1329,7 @@ fn immediate_reinforcement_package_spreads_damage_across_live_enemies() {
             remaining_funds: 14_000,
             per_slot_budget: 7_000,
         },
+        ProductionPolicy::SmallMap,
     )
     .expect("最初の前線敵へ増援を割り当てる");
     assert_eq!(first.entity, first_enemy);
@@ -1284,6 +1347,7 @@ fn immediate_reinforcement_package_spreads_damage_across_live_enemies() {
             remaining_funds: 7_000,
             per_slot_budget: 7_000,
         },
+        ProductionPolicy::SmallMap,
     )
     .expect("別の未充足前線敵へ増援を割り当てる");
     assert_eq!(second.entity, second_enemy);
@@ -1345,7 +1409,13 @@ fn immediate_reinforcement_values_factory_slot_over_unit_price() {
         enemy_production_forecast: EnemyProductionForecastTrace::default(),
     };
     let mut ctx = ReachCtx::default();
-    let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
+    let operations = build_operations(
+        &scan,
+        &mut ctx,
+        &[],
+        PlayerId(1),
+        ProductionPolicy::SmallMap,
+    );
     let options = immediate_combat_options(
         &scan,
         &mut ctx,
@@ -1363,6 +1433,7 @@ fn immediate_reinforcement_values_factory_slot_over_unit_price() {
             remaining_funds: scan.funds,
             per_slot_budget: scan.funds,
         },
+        ProductionPolicy::SmallMap,
     )
     .expect("両候補とも実在前線へ届く");
 
@@ -1664,6 +1735,7 @@ fn transports_are_not_ledgered_for_unreachable_anchors() {
         &HashSet::default(),
         3,
         PlayerId(1),
+        ProductionPolicy::SmallMap,
     );
 
     assert_eq!(overseas.facts.available_free_cargo_slots, 0);
@@ -1690,7 +1762,11 @@ fn property_control_replaces_one_destroyed_capturer_before_combat() {
     let mut initial_formation = operation(OperationKind::Capture, slots, OperationSlots::default());
     initial_formation.property_controls.push(control);
     assert_eq!(
-        most_starved_slot(&[initial_formation], &SlotLedger::new()),
+        most_starved_slot(
+            &[initial_formation],
+            &SlotLedger::new(),
+            ProductionPolicy::for_current_path()
+        ),
         Some((0, SlotKind::Combat)),
         "担当履歴のない初回編成はCapture単独発注へ崩さず共同計画を使う"
     );
@@ -1701,7 +1777,11 @@ fn property_control_replaces_one_destroyed_capturer_before_combat() {
     missing_capturer.facts.friendly_capture_units_committed = 1;
 
     assert_eq!(
-        most_starved_slot(&[missing_capturer], &SlotLedger::new()),
+        most_starved_slot(
+            &[missing_capturer],
+            &SlotLedger::new(),
+            ProductionPolicy::for_current_path()
+        ),
         Some((0, SlotKind::Capture)),
         "一部の占領担当が生存していても、未解決の撃破1件はCombatより先に補う"
     );
@@ -1718,7 +1798,11 @@ fn property_control_replaces_one_destroyed_capturer_before_combat() {
     replacement_ready.capture_replacement_pending = true;
 
     assert_eq!(
-        most_starved_slot(&[replacement_ready], &SlotLedger::new()),
+        most_starved_slot(
+            &[replacement_ready],
+            &SlotLedger::new(),
+            ProductionPolicy::for_current_path()
+        ),
         Some((0, SlotKind::Combat)),
         "1体を再契約した後は残りのCaptureを連買いせず共同Combat計画へ戻す"
     );
@@ -1879,15 +1963,19 @@ fn defense_urgency_raises_normal_operation_priority_without_deleting_capital() {
     // 期限付き物件制御の順位を1段差し込んでも、緊急Defenseが最優先で
     // 首都本隊そのものは削除されない。
     assert_eq!(
-        operation_priority_rank(&ops[0]),
+        operation_priority_rank(&ops[0], ProductionPolicy::for_current_path()),
         PRIORITY_RANK_AUTHORIZED_CAPITAL
     );
     assert_eq!(
-        operation_priority_rank(&ops[1]),
+        operation_priority_rank(&ops[1], ProductionPolicy::for_current_path()),
         PRIORITY_RANK_URGENT_DEFENSE
     );
     assert_eq!(
-        most_starved_slot(&ops, &SlotLedger::new()),
+        most_starved_slot(
+            &ops,
+            &SlotLedger::new(),
+            ProductionPolicy::for_current_path()
+        ),
         Some((1, SlotKind::Combat))
     );
     assert_eq!(ops[0].slots.combat_plan_required, 1);
@@ -1927,7 +2015,14 @@ fn board_scan_is_independent_of_ecs_storage_order() {
     }
     let prepared = strategy_pipeline::prepare_production_scan(&mut world, player);
     let queries = board_scan::BoardScanQueries::prepare(&mut world);
-    let before = BoardScan::collect(&world, player, prepared.as_ref(), &queries).unwrap();
+    let before = BoardScan::collect(
+        &world,
+        player,
+        prepared.as_ref(),
+        &queries,
+        ProductionPolicy::for_current_path(),
+    )
+    .unwrap();
     // ゲーム上の状態を変えずにECS内の格納先だけを変える。
     // 走査順が計画入力へ漏れると、同じseedでも攻撃順・購入編成が変わる。
     world.entity_mut(entities[0]).insert(CargoCapacity {
@@ -1940,7 +2035,14 @@ fn board_scan_is_independent_of_ecs_storage_order() {
     });
     let prepared = strategy_pipeline::prepare_production_scan(&mut world, player);
     let queries = board_scan::BoardScanQueries::prepare(&mut world);
-    let after = BoardScan::collect(&world, player, prepared.as_ref(), &queries).unwrap();
+    let after = BoardScan::collect(
+        &world,
+        player,
+        prepared.as_ref(),
+        &queries,
+        ProductionPolicy::for_current_path(),
+    )
+    .unwrap();
     let ids = |units: &[UnitSnapshot]| units.iter().map(|unit| unit.entity).collect::<Vec<_>>();
     assert_eq!(before.my_units.len(), 2);
     assert_eq!(before.enemy_units.len(), 2);
@@ -2218,4 +2320,43 @@ fn map32_p2_small_map_expansion_opening_and_capture() {
         p2_owned_target_cities >= 3,
         "P2 は T15 時点でも西側重要都市を少なくとも3箇所以上維持防衛できているべき (実際: {p2_owned_target_cities})"
     );
+}
+
+/// 呼出し元のスレッド経路に引かれず、入口から渡した方策だけで枠を選ぶ。
+#[test]
+fn explicit_production_policy_controls_joint_capture_without_thread_path() {
+    let mut op = operation(
+        OperationKind::Capture,
+        OperationSlots {
+            capture_units: 3,
+            combat_plan_required: 1,
+            ..OperationSlots::default()
+        },
+        OperationSlots::default(),
+    );
+    op.property_controls.push(PropertyControlObjective {
+        property: pos(4, 1),
+        enemy_entity: Entity::from_raw(42),
+        enemy_arrival_turn: 1,
+        enemy_completion_turn: 3,
+        attack_ready_turn: Some(2),
+        approach: PropertyControlApproach::Interdict,
+        disaggregated: false,
+    });
+    let operations = [op];
+    let ledger = SlotLedger::new();
+    for path in [
+        crate::ai::code_path::CodePath::MainCompatible,
+        crate::ai::code_path::CodePath::Extended,
+    ] {
+        let _guard = crate::ai::code_path::enter(path);
+        assert_eq!(
+            most_starved_slot(&operations, &ledger, ProductionPolicy::Standard),
+            Some((0, SlotKind::Capture))
+        );
+        assert_eq!(
+            most_starved_slot(&operations, &ledger, ProductionPolicy::SmallMap),
+            Some((0, SlotKind::Combat))
+        );
+    }
 }

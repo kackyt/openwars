@@ -1,3 +1,5 @@
+use super::combat_input::combat_plan_input;
+use super::production_entry::has_direct_capture_route;
 use super::*;
 use crate::resources::GridTopology;
 
@@ -50,7 +52,13 @@ fn campaign_objective_is_the_only_capture_source_and_keeps_exact_anchor() {
         execution_authorized: true,
     }];
 
-    let operations = build_operations(&scan, &mut ReachCtx::default(), &[]);
+    let operations = build_operations(
+        &scan,
+        &mut ReachCtx::default(),
+        &[],
+        PlayerId(1),
+        ProductionPolicy::Standard,
+    );
     let captures = operations
         .iter()
         .filter(|operation| operation.kind == OperationKind::Capture)
@@ -99,7 +107,13 @@ fn capital_objective_keeps_local_front_as_an_independent_operation() {
         },
     ];
 
-    let operations = build_operations(&scan, &mut ReachCtx::default(), &[]);
+    let operations = build_operations(
+        &scan,
+        &mut ReachCtx::default(),
+        &[],
+        PlayerId(1),
+        ProductionPolicy::Standard,
+    );
     let same_island = operations
         .iter()
         .filter(|operation| operation.island_id == Some(island_id))
@@ -265,6 +279,8 @@ fn existing_combat_sorties_are_committed_to_only_one_operation() {
         &HashSet::default(),
         &HashSet::default(),
         2,
+        PlayerId(1),
+        ProductionPolicy::Standard,
     );
     let far = build_operation(
         &scan,
@@ -279,6 +295,8 @@ fn existing_combat_sorties_are_committed_to_only_one_operation() {
         &HashSet::default(),
         &HashSet::default(),
         5,
+        PlayerId(1),
+        ProductionPolicy::Standard,
     );
 
     assert!(near.facts.friendly_combat_units_committed > 0);
@@ -291,18 +309,35 @@ fn existing_combat_entity_is_credited_only_to_its_own_persistent_plan() {
     let foreign_entity = Entity::from_raw(901);
     let legacy_entity = Entity::from_raw(902);
     let own_plan = plan_revision::PlanId(7);
-    let assignments = HashMap::from_iter([
-        (own_entity, Some(own_plan)),
-        (foreign_entity, Some(plan_revision::PlanId(8))),
-        (legacy_entity, None),
-    ]);
+    let assignments = HashMap::from_iter(
+        [
+            (own_entity, Some(own_plan)),
+            (foreign_entity, Some(plan_revision::PlanId(8))),
+            (legacy_entity, None),
+        ]
+        .map(|(entity, plan_id)| {
+            (
+                entity,
+                deployment::ActiveTargetAssignment {
+                    plan_id,
+                    slot_kind: SlotKind::Combat,
+                    targets: HashSet::default(),
+                },
+            )
+        }),
+    );
 
     assert!(
-        committed_entities_for_plan(Some(&assignments), None).is_empty(),
+        committed_entities_for_plan(Some(&assignments), None, ProductionPolicy::Standard)
+            .is_empty(),
         "新規Planは別任務中の既存戦力を見積へ借りない"
     );
     assert_eq!(
-        committed_entities_for_plan(Some(&assignments), Some(own_plan)),
+        committed_entities_for_plan(
+            Some(&assignments),
+            Some(own_plan),
+            ProductionPolicy::Standard
+        ),
         HashSet::from_iter([own_entity])
     );
 }
@@ -328,7 +363,13 @@ fn combat_plan_projects_only_the_capturer_ordered_this_turn() {
         execution_authorized: true,
     }];
     let mut ctx = ReachCtx::default();
-    let mut operations = build_operations(&scan, &mut ctx, &[]);
+    let mut operations = build_operations(
+        &scan,
+        &mut ctx,
+        &[],
+        PlayerId(1),
+        ProductionPolicy::Standard,
+    );
     let operation = operations
         .iter_mut()
         .find(|operation| operation.kind == OperationKind::Capture)
@@ -336,7 +377,7 @@ fn combat_plan_projects_only_the_capturer_ordered_this_turn() {
     // 同じ生産手番で、占領兵1体を先に発注した状態を再現する。
     operation.filled.capture_units = 1;
 
-    let input = combat_plan_input(
+    let input = standard_combat_plan_input(
         &scan,
         &mut ctx,
         operation,
@@ -461,7 +502,15 @@ fn enemy_reinforcement_assessment_places_each_purchase_on_the_time_axis() {
     op.anchor = pos(6, 2);
     op.facts.enemy_reinforcement_funds = 3_000;
 
-    let assessment = enemy_reinforcement_assessment(&scan, &mut ReachCtx::default(), &op, 5);
+    let assessment = enemy_reinforcement_assessment(
+        &scan,
+        &mut ReachCtx::default(),
+        &op,
+        5,
+        op.facts.enemy_reinforcement_funds,
+        enemy_forecast::ReinforcementScenario::Stress,
+        ProductionPolicy::Standard,
+    );
     let mut arrivals = assessment
         .unavoidable
         .iter()
@@ -820,12 +869,16 @@ fn property_control_capture_urgency_differs_only_on_extended_path() {
     ] {
         let _guard = crate::ai::code_path::enter(path);
         assert_eq!(
-            operation_priority_rank(&initial_formation),
+            operation_priority_rank(&initial_formation, ProductionPolicy::for_current_path()),
             expected_rank,
             "{path:?}"
         );
         assert_eq!(
-            most_starved_slot(std::slice::from_ref(&initial_formation), &SlotLedger::new()),
+            most_starved_slot(
+                std::slice::from_ref(&initial_formation),
+                &SlotLedger::new(),
+                ProductionPolicy::for_current_path()
+            ),
             Some((0, expected_slot)),
             "{path:?}"
         );
@@ -924,6 +977,8 @@ fn transports_are_ledgered_by_delivery_ability_not_proximity() {
         &HashSet::default(),
         &HashSet::default(),
         3,
+        PlayerId(1),
+        ProductionPolicy::Standard,
     );
 
     // それでも「対岸へ積荷を届けられる」以上、渡洋作戦の台帳に載らねばならない
@@ -966,6 +1021,8 @@ fn loaded_enemy_transport_on_another_island_is_a_future_arrival() {
         &HashSet::default(),
         &HashSet::default(),
         3,
+        PlayerId(1),
+        ProductionPolicy::Standard,
     );
 
     assert_eq!(operation.reachable_threats.len(), 1);
@@ -1010,6 +1067,8 @@ fn empty_enemy_transport_does_not_create_anti_air_demand_on_every_island() {
         &HashSet::default(),
         &HashSet::default(),
         3,
+        PlayerId(1),
+        ProductionPolicy::Standard,
     );
 
     assert!(operation.reachable_threats.is_empty());
@@ -1390,7 +1449,7 @@ fn slot_fitness_consults_capture_policy_only_for_capture_slots() {
             SlotKind::Capture,
             &facility,
             &infantry,
-            &JoinableCapture
+            &ProductionPolicy::Standard.capture_evaluation(PlayerId(1))
         ),
         Some(1.0)
     );
@@ -1680,6 +1739,8 @@ fn transports_are_not_ledgered_for_unreachable_anchors() {
         &HashSet::default(),
         &HashSet::default(),
         3,
+        PlayerId(1),
+        ProductionPolicy::Standard,
     );
 
     assert_eq!(overseas.facts.available_free_cargo_slots, 0);
@@ -1710,7 +1771,11 @@ fn operation_priority_outranks_slot_priority_among_prerequisites() {
     ];
 
     assert_eq!(
-        most_starved_slot(&ops, &SlotLedger::new()),
+        most_starved_slot(
+            &ops,
+            &SlotLedger::new(),
+            ProductionPolicy::for_current_path()
+        ),
         Some((1, SlotKind::Combat))
     );
 }
@@ -1725,7 +1790,11 @@ fn combat_plan_follows_first_capture_before_remaining_fronts_expand() {
     };
     let empty = operation(OperationKind::Capture, slots, OperationSlots::default());
     assert_eq!(
-        most_starved_slot(&[empty], &SlotLedger::new()),
+        most_starved_slot(
+            &[empty],
+            &SlotLedger::new(),
+            ProductionPolicy::for_current_path()
+        ),
         Some((0, SlotKind::Capture))
     );
 
@@ -1738,7 +1807,11 @@ fn combat_plan_follows_first_capture_before_remaining_fronts_expand() {
         },
     );
     assert_eq!(
-        most_starved_slot(&[first_capture_ready], &SlotLedger::new()),
+        most_starved_slot(
+            &[first_capture_ready],
+            &SlotLedger::new(),
+            ProductionPolicy::for_current_path()
+        ),
         Some((0, SlotKind::Combat))
     );
 }
@@ -1807,7 +1880,11 @@ fn a_top_priority_combat_plan_precedes_a_lower_priority_transport() {
     ];
 
     assert_eq!(
-        most_starved_slot(&ops, &SlotLedger::new()),
+        most_starved_slot(
+            &ops,
+            &SlotLedger::new(),
+            ProductionPolicy::for_current_path()
+        ),
         Some((0, SlotKind::Combat))
     );
 }
@@ -1846,7 +1923,11 @@ fn authorized_capital_outranks_non_imminent_local_operations_only() {
 
     let ops = vec![capture, distant_defense, capital];
     assert_eq!(
-        most_starved_slot(&ops, &SlotLedger::new()),
+        most_starved_slot(
+            &ops,
+            &SlotLedger::new(),
+            ProductionPolicy::for_current_path()
+        ),
         Some((2, SlotKind::Combat))
     );
 }
@@ -1876,15 +1957,19 @@ fn defense_urgency_raises_normal_operation_priority_without_deleting_capital() {
 
     let ops = vec![capital, defense];
     assert_eq!(
-        operation_priority_rank(&ops[0]),
+        operation_priority_rank(&ops[0], ProductionPolicy::for_current_path()),
         PRIORITY_RANK_AUTHORIZED_CAPITAL
     );
     assert_eq!(
-        operation_priority_rank(&ops[1]),
+        operation_priority_rank(&ops[1], ProductionPolicy::for_current_path()),
         PRIORITY_RANK_URGENT_DEFENSE
     );
     assert_eq!(
-        most_starved_slot(&ops, &SlotLedger::new()),
+        most_starved_slot(
+            &ops,
+            &SlotLedger::new(),
+            ProductionPolicy::for_current_path()
+        ),
         Some((1, SlotKind::Combat))
     );
     assert_eq!(ops[0].slots.combat_plan_required, 1);
@@ -1965,4 +2050,28 @@ fn v4_prioritizes_campaign_package_and_blocks_generic_when_incomplete() {
             .resource::<ProductionTurnState>()
             .campaign_production_blocks_generic(player_id)
     );
+}
+
+// 標準経路の既存fixtureはStage入力を持たない。共通APIへ空集合だけを補う。
+fn standard_combat_plan_input(
+    scan: &BoardScan,
+    ctx: &mut ReachCtx,
+    op: &Operation,
+    used: &HashSet<GridPosition>,
+    committed: &HashSet<Entity>,
+    funds: u32,
+    self_deployment: bool,
+) -> Option<RollingPlanInput> {
+    combat_plan_input(
+        scan,
+        ctx,
+        op,
+        used,
+        committed,
+        &HashSet::default(),
+        funds,
+        self_deployment,
+        PlayerId(1),
+        ProductionPolicy::Standard,
+    )
 }

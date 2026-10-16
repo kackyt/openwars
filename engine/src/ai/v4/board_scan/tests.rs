@@ -111,7 +111,16 @@ fn small_map_snapshot_requires_preparation_and_never_initializes_strategy() {
     assert!(!world.contains_resource::<CapitalRouteTopologyRegistry>());
     // 準備なしのsnapshotが隠れた解析・DAG準備を実行しない。
     let queries = BoardScanQueries::prepare(&mut world);
-    assert!(BoardScan::collect(&world, player, None, &queries).is_none());
+    assert!(
+        BoardScan::collect(
+            &world,
+            player,
+            None,
+            &queries,
+            ProductionPolicy::for_current_path()
+        )
+        .is_none()
+    );
     assert!(!world.contains_resource::<CapitalRouteTopologyRegistry>());
     let prepared = strategy_pipeline::prepare_production_scan(&mut world, player).unwrap();
     assert!(
@@ -124,7 +133,14 @@ fn small_map_snapshot_requires_preparation_and_never_initializes_strategy() {
     );
     let entities_before = world.entities().len();
     let queries = BoardScanQueries::prepare(&mut world);
-    let scan = BoardScan::collect(&world, player, Some(&prepared), &queries).unwrap();
+    let scan = BoardScan::collect(
+        &world,
+        player,
+        Some(&prepared),
+        &queries,
+        ProductionPolicy::for_current_path(),
+    )
+    .unwrap();
     assert_eq!(scan.opening_policy, Some(prepared.opening_policy));
     assert_eq!(world.entities().len(), entities_before);
     assert_eq!(

@@ -1,0 +1,348 @@
+{
+  "baseline_commit": "bd0e3608dce741f8f2b8ae35db29cd250c3e1f8c",
+  "branch": "refactor/ai-redesign-v3-stage5",
+  "rust_tests": {
+    "decomposed": {
+      "passed": 978,
+      "ignored": 2
+    },
+    "integrated": {
+      "passed": 979,
+      "ignored": 2
+    }
+  },
+  "python_tests": 41,
+  "clippy": "all-targets all-features -D warnings passed",
+  "wasm": "engine wasm32-unknown-unknown check passed",
+  "fmt": "passed",
+  "golden_updated": false,
+  "cargo_lock_changed": false,
+  "existing_ai_test_names_preserved": 828,
+  "new_ai_tests": [
+    "explicit_production_policy_controls_joint_capture_without_thread_path"
+  ],
+  "tested_source_manifest_sha256": "bb704da258574b53b8ce80cb1f77b80a3e024a92d0568d95ad28643cbc042054",
+  "final_source_manifest_sha256": "909b4b9fad58431cebb9d490105269ce66ddcaed3b998ca1203b126712564ed4",
+  "comment_only_change_after_build": {
+    "file": "engine/src/ai/v4/slot_demand.rs",
+    "from_sha256": "3e463f39ce5c74583e4d93e7a069d9f33d517a68183b44b200e08c0abf650bea",
+    "to_sha256": "0bb5dc1f1d95724e49c67d51638b2bc87de3ae8ea67499d272474dee58380a57",
+    "old_comment": "        // 切替IDは統合前の委譲点名のまま残す。OPENWARS_EXT_DISABLE で旧IDを指定した\n        // 計測手順と互換を保つため、関数名に合わせて変更しないこと。\n",
+    "new_comment": "        // 入口で選んだ方策だけで共同計画への委譲を決める。個別の計測IDや\n        // 呼出し時のTLS経路を、配分の途中から再参照しない。\n",
+    "line_count_changed": false
+  },
+  "binaries_sha256": {
+    "baseline": "befb0a64f5d431ed7d176f43d6a9ba8eb0f86cb96c7e6323198381827f160afb",
+    "decomposed": "3d96f3b37e1dd301e07a9af366b03603f42fc2fc440528e7551923caa81320e2",
+    "integrated": "99b689371c7a8d9e2c97710627e2ba39f8104e8b3075447800fa5930e93981fe"
+  },
+  "comparison": "deep JSON equality of complete action_history, result and turns; error must be absent",
+  "full_history": {
+    "decomposed": {
+      "expected": 28,
+      "matched": 28,
+      "failures": []
+    },
+    "integrated": {
+      "expected": 28,
+      "matched": 28,
+      "failures": []
+    }
+  },
+  "prefix_6T": {
+    "expected": 8,
+    "matched": 8,
+    "failures": []
+  },
+  "fingerprints_4T": {
+    "V1": {
+      "decomposed": {
+        "expected": 4,
+        "matched": 4,
+        "failures": []
+      },
+      "integrated": {
+        "expected": 4,
+        "matched": 4,
+        "failures": []
+      }
+    },
+    "V2": {
+      "decomposed": {
+        "expected": 4,
+        "matched": 4,
+        "failures": []
+      },
+      "integrated": {
+        "expected": 4,
+        "matched": 4,
+        "failures": []
+      }
+    },
+    "V3": {
+      "decomposed": {
+        "expected": 4,
+        "matched": 4,
+        "failures": []
+      },
+      "integrated": {
+        "expected": 4,
+        "matched": 4,
+        "failures": []
+      }
+    },
+    "V4": {
+      "decomposed": {
+        "expected": 4,
+        "matched": 4,
+        "failures": []
+      },
+      "integrated": {
+        "expected": 4,
+        "matched": 4,
+        "failures": []
+      }
+    }
+  },
+  "cases": [
+    {
+      "case": "map_10_V200-V4_r0/seed1.json",
+      "turns": 50,
+      "result": "P2_Win_MaxTurns",
+      "action_history_sha256": "7c4ebd1f22531847832911b1d4cbd25b1636132a5fdb6a99d455aab3e405e857"
+    },
+    {
+      "case": "map_10_V200-V4_r0/seed2.json",
+      "turns": 50,
+      "result": "P2_Win_MaxTurns",
+      "action_history_sha256": "a50f07029f20ec2ab909a3e4be2afb88ecd45f91b4962334c5eff5f14bc19b09"
+    },
+    {
+      "case": "map_10_V4-V200_r0/seed1.json",
+      "turns": 50,
+      "result": "P2_Win_MaxTurns",
+      "action_history_sha256": "a5aeaafa8e990317d0ea493a1ece151c8600c451b86cee360b68fec07aba8b43"
+    },
+    {
+      "case": "map_10_V4-V200_r0/seed2.json",
+      "turns": 50,
+      "result": "P2_Win_MaxTurns",
+      "action_history_sha256": "5b22745bd8ecac8d7a58410f34ce617cbae3cf37f3db98f068dba20e89c01edc"
+    },
+    {
+      "case": "map_1_V200-V4_r0/seed1.json",
+      "turns": 21,
+      "result": "P2_Win",
+      "action_history_sha256": "06947422a3f8abe3fbec60af4d536a9387d7f5cfbef575735ad23ca4876ca848"
+    },
+    {
+      "case": "map_1_V200-V4_r0/seed2.json",
+      "turns": 50,
+      "result": "P2_Win_MaxTurns",
+      "action_history_sha256": "53b605abb66a038e100da382a9108c9c0a34daf4881c628c52b2a1f8ed36edd9"
+    },
+    {
+      "case": "map_1_V4-V200_r0/seed1.json",
+      "turns": 42,
+      "result": "P1_Win",
+      "action_history_sha256": "b9122890b7ef819f4e33e3a7a9bdb679385caf4aa1ff30dd741babf0434afe1b"
+    },
+    {
+      "case": "map_1_V4-V200_r0/seed2.json",
+      "turns": 20,
+      "result": "P1_Win",
+      "action_history_sha256": "94013d2379a442841a3800a69c27ad4177123134b59546f7ccf68ad9a1e5bc49"
+    },
+    {
+      "case": "map_25_V200-V4_r0/seed1.json",
+      "turns": 50,
+      "result": "P2_Win_MaxTurns",
+      "action_history_sha256": "7fe7a9457aee1cf729a1e16625a2f43088edeca484d371e212b392ec5472e094"
+    },
+    {
+      "case": "map_25_V200-V4_r0/seed2.json",
+      "turns": 50,
+      "result": "P2_Win_MaxTurns",
+      "action_history_sha256": "1c0def01f657c732a32a9ffc40658d7344c68bf2ceb993479134f5190e6a8e4f"
+    },
+    {
+      "case": "map_25_V4-V200_r0/seed1.json",
+      "turns": 50,
+      "result": "P1_Win_MaxTurns",
+      "action_history_sha256": "414b15fe5cc174897baca6959f498f72e4275d36556326588280d849ecf28917"
+    },
+    {
+      "case": "map_25_V4-V200_r0/seed2.json",
+      "turns": 50,
+      "result": "P1_Win_MaxTurns",
+      "action_history_sha256": "acfbb92ebb8221bc7ec5ba0e00398f603e55191dd9321b09cc36bf4cc3014d98"
+    },
+    {
+      "case": "map_2_V200-V4_r0/seed1.json",
+      "turns": 48,
+      "result": "P2_Win",
+      "action_history_sha256": "3503039a95f2fc2b7877c3112ed149e50925465f07680ed375c14bf08537b9ca"
+    },
+    {
+      "case": "map_2_V200-V4_r0/seed2.json",
+      "turns": 23,
+      "result": "P2_Win",
+      "action_history_sha256": "f412ade6cddc3c63a371482fcb9ffd9f97f2cf1ca0c85bba268ffd56dcb57ea3"
+    },
+    {
+      "case": "map_2_V4-V200_r0/seed1.json",
+      "turns": 26,
+      "result": "P1_Win",
+      "action_history_sha256": "27947f2d0c382877eff3ceb8c6610180693cc614dfa254b8a33d4de4fa5c7405"
+    },
+    {
+      "case": "map_2_V4-V200_r0/seed2.json",
+      "turns": 26,
+      "result": "P1_Win",
+      "action_history_sha256": "770c7d0fb10a77e48bcd12daa92cd0542f3c622d1d8414ae97a0465fbbf16182"
+    },
+    {
+      "case": "map_32_V200-V4_r0/seed1.json",
+      "turns": 32,
+      "result": "P2_Win",
+      "action_history_sha256": "413066992815d668ef93944aaf63af5e0df33ec76fca9f9ff494c826ec30f492"
+    },
+    {
+      "case": "map_32_V200-V4_r0/seed2.json",
+      "turns": 26,
+      "result": "P1_Win",
+      "action_history_sha256": "b491156aba8afd558bc1f9cb6faf53e455bacec1e7bddf21120b2d12f26d983d"
+    },
+    {
+      "case": "map_32_V4-V200_r0/seed1.json",
+      "turns": 50,
+      "result": "P1_Win_MaxTurns",
+      "action_history_sha256": "23e60295a292abfe1c74670b4339b033920ad1b0b35cd42e425f3fd7fe565c47"
+    },
+    {
+      "case": "map_32_V4-V200_r0/seed2.json",
+      "turns": 50,
+      "result": "P1_Win_MaxTurns",
+      "action_history_sha256": "8d292ae18fb60974743d35ead4a2b3e1c54d44fa48c8ab55798ddc65f917434b"
+    },
+    {
+      "case": "map_42_V200-V4_r0/seed1.json",
+      "turns": 31,
+      "result": "P1_Win",
+      "action_history_sha256": "87cff1acb885c72bea69380e9c3f0e5e188268d6b2f710846fd4846eef5db3d1"
+    },
+    {
+      "case": "map_42_V200-V4_r0/seed2.json",
+      "turns": 50,
+      "result": "P2_Win_MaxTurns",
+      "action_history_sha256": "ada26f72e6eabe6cc109a20e0ac2948fabc8159a365d9b2ac23bf1b2e018d1f4"
+    },
+    {
+      "case": "map_42_V4-V200_r0/seed1.json",
+      "turns": 50,
+      "result": "P1_Win_MaxTurns",
+      "action_history_sha256": "7025bb2f004cec43be5e32e1d7e50e68ee1a341bba106570e08fef7d81599259"
+    },
+    {
+      "case": "map_42_V4-V200_r0/seed2.json",
+      "turns": 50,
+      "result": "P2_Win",
+      "action_history_sha256": "c8dcf2fc3c8368b6b4ca8c2296a2f5df110b0852025b0626ef86e5cb6e7200e4"
+    },
+    {
+      "case": "map_6_V200-V4_r0/seed1.json",
+      "turns": 50,
+      "result": "P2_Win_MaxTurns",
+      "action_history_sha256": "075bea60e368a2b1906762c6ac05541c8253ce934cc7bdc48fd8c8d1d7434bef"
+    },
+    {
+      "case": "map_6_V200-V4_r0/seed2.json",
+      "turns": 50,
+      "result": "P2_Win",
+      "action_history_sha256": "3de101d89e4412a9e15abf14f90c266cdb2523352387498f84a0b86c786d4059"
+    },
+    {
+      "case": "map_6_V4-V200_r0/seed1.json",
+      "turns": 50,
+      "result": "P1_Win_MaxTurns",
+      "action_history_sha256": "dc221e09d8749dda4423f87760c3fdd19287be6ccbb2d8e53a709aba8119f1db"
+    },
+    {
+      "case": "map_6_V4-V200_r0/seed2.json",
+      "turns": 50,
+      "result": "P2_Win_MaxTurns",
+      "action_history_sha256": "a1ea91180d9586f50eebd87d3e052cdf23b2fe667551cf7c368bf9b47b8b1b72"
+    }
+  ],
+  "complexity": {
+    "baseline": {
+      "function_count": 5033,
+      "direct_cyclomatic": {
+        "max": 108.0,
+        "p95": 8.0,
+        "total": 11712.0
+      },
+      "inclusive_cyclomatic": {
+        "max": 155.0,
+        "p95": 13.0,
+        "total": 18268.0
+      },
+      "direct_cognitive": {
+        "max": 391.0,
+        "p95": 8.0,
+        "total": 9551.0
+      },
+      "inclusive_cognitive": {
+        "max": 392.0,
+        "p95": 10.0,
+        "total": 11289.0
+      }
+    },
+    "decomposed": {
+      "function_count": 5065,
+      "direct_cyclomatic": {
+        "max": 108.0,
+        "p95": 8.0,
+        "total": 11752.0
+      },
+      "inclusive_cyclomatic": {
+        "max": 128.0,
+        "p95": 13.0,
+        "total": 18231.0
+      },
+      "direct_cognitive": {
+        "max": 391.0,
+        "p95": 9.0,
+        "total": 9547.0
+      },
+      "inclusive_cognitive": {
+        "max": 392.0,
+        "p95": 10.0,
+        "total": 11243.0
+      }
+    },
+    "integrated": {
+      "function_count": 4975,
+      "direct_cyclomatic": {
+        "max": 108.0,
+        "p95": 8.0,
+        "total": 11605.0
+      },
+      "inclusive_cyclomatic": {
+        "max": 128.0,
+        "p95": 13.0,
+        "total": 17804.0
+      },
+      "direct_cognitive": {
+        "max": 391.0,
+        "p95": 9.0,
+        "total": 9360.0
+      },
+      "inclusive_cognitive": {
+        "max": 392.0,
+        "p95": 10.0,
+        "total": 10903.0
+      }
+    }
+  }
+}

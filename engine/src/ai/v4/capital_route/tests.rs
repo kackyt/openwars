@@ -1,3 +1,4 @@
+use crate::ai::v4::ProductionPolicy;
 use crate::ai::v4::capital_route::commitment::{
     capital_route_capture_joins_active_node, capital_route_controls_active_node,
     capital_route_dominant_capture_escort_node, capital_route_execution_phase,
@@ -32,7 +33,7 @@ use crate::ai::v4::capital_route::topology::{
     armored_entry_bridge_gates, armored_step_distances, capital_route_topology_for,
     same_land_capital_front_reached, same_land_route_fronts,
 };
-use crate::ai::v4::extended::{build_operations, combat_plan_input};
+use crate::ai::v4::production_pipeline::test_exports::{build_operations, combat_plan_input};
 use crate::ai::v4::test_support::*;
 use crate::ai::v4::{
     CampaignPlanningObjective, Entity, Faction, GridPosition, HashMap, HashSet, Health, Map,
@@ -1684,7 +1685,13 @@ fn staged_route_member_is_counted_after_its_front_arrival_eta() {
         free_cargo: 0,
     });
     let mut ctx = ReachCtx::default();
-    let operations = build_operations(&scan, &mut ctx, &[], PlayerId(1));
+    let operations = build_operations(
+        &scan,
+        &mut ctx,
+        &[],
+        PlayerId(1),
+        ProductionPolicy::SmallMap,
+    );
     let operation = operations
         .iter()
         .find(|operation| operation.kind == OperationKind::Capture)
@@ -1700,6 +1707,7 @@ fn staged_route_member_is_counted_after_its_front_arrival_eta() {
         scan.funds,
         false,
         PlayerId(1),
+        ProductionPolicy::SmallMap,
     )
     .expect("visible enemy creates a combat plan input");
 

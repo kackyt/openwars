@@ -31,13 +31,13 @@ th,td{padding:12px;border-bottom:1px solid var(--line);text-align:left;vertical-
 <body>
 <main class="page">
 <header>
-<p class="eyebrow">OpenWars · AI architecture · 2026-10-16 更新 · 段階1〜4完了</p>
+<p class="eyebrow">OpenWars · AI architecture · 2026-10-16 更新 · 段階1〜5完了</p>
 <h1>AI 抜本再設計計画</h1>
 <p><strong>判断と状態更新の責任を分け、後から矛盾を修復しなくてよいAIに作り直す。</strong>ファイル移動や重複行の削減だけを成果にせず、巨大関数の段階分解と、戦略の補正・判断そのものの整理まで扱います。</p>
 <p class="meta">読者：AIの再設計・実装・検証を担当する開発者。対象：V1〜V4の共通基盤、版別戦略、V4小規模拡張。共有コードを使うV100/V200も回帰確認対象。</p>
 <div class="notice">
-<p><strong>現行計画の正本です。段階1〜4は実装・検証済みです。</strong>実績と検証記録は <a href="ai-redesign-v3-stage1.md">段階1</a>・<a href="ai-redesign-v3-stage2.md">段階2</a>・<a href="ai-redesign-v3-stage3.md">段階3</a>・<a href="ai-redesign-v3-stage3b.md">段階3b</a>・<a href="ai-redesign-v3-stage4.md">段階4</a> を参照してください。</p>
-<p>次の着手範囲は<strong>段階5：残る <code>v4/extended.rs</code>（3,580行）と標準側の生産関数を6段へ分割し、<code>ProductionPolicy</code> で統合してコピーと <code>v4/extended.rs</code> を完全廃止する作業（区分R）</strong>です。</p>
+<p><strong>現行計画の正本です。段階1〜5は実装・検証済みです。</strong>実績と検証記録は <a href="ai-redesign-v3-stage1.md">段階1</a>・<a href="ai-redesign-v3-stage2.md">段階2</a>・<a href="ai-redesign-v3-stage3.md">段階3</a>・<a href="ai-redesign-v3-stage3b.md">段階3b</a>・<a href="ai-redesign-v3-stage4.md">段階4</a>・<a href="ai-redesign-v3-stage5.md">段階5</a> を参照してください。</p>
+<p>次の着手範囲は<strong>段階6a：残る <code>*/extended.rs</code> の責務別分離と巨大関数の段階分解（区分R）</strong>です。戦略変更（6b）は1件ずつ別評価します。</p>
 </div>
 <p class="meta">提案と段階別の詳細：<a href="ai-redesign-v3-proposal.md">AI再設計 v3 提案書</a> ／ 効果の見積り：<a href="ai-refactor-forecast.html">AI 再設計の効果見積り</a>。</p>
 <p class="meta">旧案と棚卸し：<a href="v4-map-branching-assessment.html">V4 構造整理の旧案</a> ／ <a href="v4-structure-map.html">旧構造マップと計測上の注意</a>。旧A〜Fは本計画の前提作業ではなく、置き換えられた案です。</p>
@@ -50,7 +50,7 @@ th,td{padding:12px;border-bottom:1px solid var(--line);text-align:left;vertical-
 <h2>見直しの根拠と現在の到達点</h2>
 <p>旧A〜Fは「移動→共有本文＋hook」が中心でした。この方法は置き場所とコピーを整理しても、判断の途中で複数の台帳を書き換え、後処理で辻褄を合わせる構造を残します。さらに、関数内に <code>if is_extended()</code> のような分岐を増やすと1関数あたりの複雑度が上がるため、<strong>「責務別モジュールへの分離」「巨大関数の直線的な段階（フェーズ）分解」「方策型による関数外での差し替え」</strong>を組み合わせて進めています。</p>
 <div class="scroll"><table>
-<caption>確認済みの構造問題と、段階1〜4での解消状況・段階5〜6の対応。</caption>
+<caption>確認済みの構造問題と、段階1〜5での解消状況・段階6の対応。</caption>
 <thead><tr><th>確認した構造</th><th>新しい境界</th><th>状況</th></tr></thead>
 <tbody>
 <tr><td><code>engine.rs</code> と <code>runtime</code>/<code>tactics</code> の双方向参照、<code>AiTurnStrategyCache</code> への無関係な状態の同居</td><td><code>runtime → {tactics, production, planning} → context → command</code> の一方向化と持ち主別Resourceへの4分割</td><td><strong>段階1で完了</strong></td></tr>
@@ -59,7 +59,7 @@ th,td{padding:12px;border-bottom:1px solid var(--line);text-align:left;vertical-
 <tr><td>生産計画の最後に命令・占領意図の施設だけを交換し、配備・工程・traceとずれる</td><td><code>v4/production_finalize.rs</code> で命令・占領意図・計画工程・traceを1か所で同時に確定（D-3）</td><td><strong>段階3で完了</strong></td></tr>
 <tr><td>再接続と所属正規化を最大3周反復し、<code>ProposalStore</code> と <code>Squad.roster</code> を二重保持する</td><td><code>OperationLedger</code> への更新口一本化、<code>ProposalStore</code> 廃止、<code>SquadEdit</code> 化、変化・循環検出（S1〜S8）、<code>squad.rs</code> 巨大3関数の分割</td><td><strong>段階3・3bで完了</strong></td></tr>
 <tr><td>異なる粒度の台帳が同じ作戦ID型を独立発番し、書くだけのentity台帳を持つ</td><td>物件契約IDの分離と未読台帳の削除、DAGの <code>SquadOperationId</code> 継続参照化（S8）</td><td><strong>段階1・3で完了</strong></td></tr>
-<tr><td><code>v4/extended.rs</code>（13,710行）に首都ルートDAG・敵生産予測・物件支配計画・生産9関数の全文コピーが同居し、<code>pub use self::extended::*</code> で境界がない</td><td>責務別モジュール（<code>capital_route/</code>、<code>enemy_forecast.rs</code>、<code>production_pipeline/</code>）へ反転し、6段分割＋<code>ProductionPolicy</code> で統合して <code>v4/extended.rs</code> を廃止</td><td><strong>ドメイン分離は段階4で完了。生産統合・廃止は段階5（区分R）</strong></td></tr>
+<tr><td><code>v4/extended.rs</code>（13,710行）に首都ルートDAG・敵生産予測・物件支配計画・生産9関数の全文コピーが同居し、<code>pub use self::extended::*</code> で境界がない</td><td>責務別モジュール（<code>capital_route/</code>、<code>enemy_forecast.rs</code>、<code>production_pipeline/</code>）へ反転し、6段分割＋<code>ProductionPolicy</code> で統合して <code>v4/extended.rs</code> を廃止</td><td><strong>ドメイン分離は段階4、生産統合・廃止は段階5で完了（区分R）</strong></td></tr>
 <tr><td>盤面収集 <code>collect_extended</code> の途中で戦略解析・DAG準備を実行する</td><td>観測（<code>BoardScan</code>）は読み取り専用にし、準備は呼び出し前の入口で明示</td><td><strong>段階4で完了（区分R）</strong></td></tr>
 <tr><td>編成前後にRoadmap更新を2回呼び、残りの <code>*/extended.rs</code>（<code>rolling_plan</code> 5,519行等）に巨大関数が残る</td><td><code>rolling_plan</code> 等の責務名モジュール化・段分割（6a：R）と、採用判断／編成後観測の分離・残S項目の個別評価（6b：S）</td><td><strong>段階6で実施（R→S）</strong></td></tr>
 </tbody></table></div>
@@ -136,8 +136,8 @@ th,td{padding:12px;border-bottom:1px solid var(--line);text-align:left;vertical-
 </section>
 
 <section id="stages">
-<h2>6段階の移行（段階1〜4完了・段階5〜6計画）</h2>
-<p>段階1〜4は実装・検証済みです。残る課題（<code>v4/extended.rs</code> の生産本文3,580行と標準側の統合、周辺 <code>*/extended.rs</code> の解体、残S項目）を段階5→6の順に進めます。以下のパスは、特記なき場合 <code>engine/src/ai/</code> 配下です。</p>
+<h2>6段階の移行（段階1〜5完了・段階6計画）</h2>
+<p>段階1〜5は実装・検証済みです。残る課題（周辺 <code>*/extended.rs</code> の解体・巨大関数分割、残S項目）を段階6a→6bの順に進めます。以下のパスは、特記なき場合 <code>engine/src/ai/</code> 配下です。</p>
 
 <article class="stage" id="stage-1">
 <h3>1. 依存方向の確立・一時状態の分割・生産予約/発行契約【完了】</h3>
@@ -179,18 +179,19 @@ th,td{padding:12px;border-bottom:1px solid var(--line);text-align:left;vertical-
 </article>
 
 <article class="stage" id="stage-5">
-<h3>5. V4生産パイプラインの6段分解と <code>ProductionPolicy</code> による統合（<code>v4/extended.rs</code> の完全廃止）【次着手・区分R】</h3>
+<h3>5. V4生産パイプラインの6段分解と <code>ProductionPolicy</code> による統合（<code>v4/extended.rs</code> の完全廃止）【完了・区分R】</h3>
 <dl>
-<dt>対象</dt><dd><code>v4/mod.rs</code>（段階4後5,575行）、<code>v4/extended.rs</code>（残部）、新規 <code>v4/production_pipeline/{mod,slot_allocation,immediate_combat,mobilization}.rs</code>、<code>v4/operation_builder.rs</code>、<code>v4/combat_input.rs</code>、<code>v4/board_scan.rs</code></dd>
+<dt>対象</dt><dd>（記録：<a href="ai-redesign-v3-stage5.md">段階5報告</a>）<code>v4/mod.rs</code>（段階4後5,575行）、<code>v4/extended.rs</code>（残部）、新規 <code>v4/production_pipeline/{mod,slot_allocation,immediate_combat,mobilization}.rs</code>、<code>v4/operation_builder.rs</code>、<code>v4/combat_input.rs</code>、<code>v4/board_scan.rs</code></dd>
 <dt>変更</dt><dd><ol><li><strong><code>plan_production_with_registry</code>（拡張1,061行 / 標準554行）の6段分解</strong>：20個以上の局所変数を中間データ型で切り離し、①<code>prepare_operations</code>（作戦構築・中央契約同期・優先度ソート・初期SlotLedger）②<code>assign_committed_combat</code>（既存Combatの単一作戦帰属）③<code>allocate_operation_slots</code>（最不足枠からの反復配分。内部の「RollingPlan評価・継続判定」と「1枠発注・Deployment生成」も別関数へ分離）④<code>allocate_immediate_reinforcements</code>（対実在敵の即時交戦増援）⑤<code>allocate_surplus_mobilization</code>（遊休施設の余剰動員）⑥<code>finalize_turn_production</code>（施設確定・未観測計画の整理・Trace確定）の6段に分解する。</li><li><strong><code>combat_plan_input</code>（726行）と <code>build_operations</code>（440行）の段階分解</strong>：それぞれ「対象抽出・既存戦力集計・脅威地平計算」および「作戦候補構築・統合・優先度付与」の小関数群（1関数50〜100行以下、最大ループ1つ、直接CC≤15目安）へ分解する。</li><li><strong><code>ProductionPolicy { Standard, SmallMap }</code> による関数外差し替えと統合</strong>：段階2の <code>PlanningPolicy</code> と同じ型で、段4・段5の実行有無、首都DAGの枠保留、合同パッケージの実効要求反映、候補選択・見送り条件の差を <code>ProductionPolicy</code> に集約する。入口の <code>decide_production_v4</code> で1回だけ方策を選び、関数内に <code>if is_extended()</code> を増やさずに重複9関数（約1,400行）を統合する。</li></ol></dd>
 <dt>検証</dt><dd>分解コミットと統合コミットを分け、判断fingerprint（V1〜V4）・28条件50Tの全 <code>action_history</code> 本文一致、および <code>measure_ai_complexity.py</code> による関数単位のCC・認知的複雑度の低下を確認。</dd>
 <dt>削除</dt><dd><strong><code>v4/extended.rs</code> ファイル全体</strong>、<code>v4/mod.rs</code> との重複関数コピー約1,400行、親 <code>v4/mod.rs</code> に置かれた実装本文（<code>v4/mod.rs</code> は公開入口と宣言のみにする）。</dd>
 <dt>完了</dt><dd><code>v4/extended.rs</code> が完全に消滅し、生産パイプラインの各段が独立した小関数として読め、標準/小規模の差が <code>ProductionPolicy</code> だけで説明できる。</dd>
+<dt>実績</dt><dd>標準・小規模の生産9関数を <code>ProductionPolicy</code> で統合し、<code>v4/extended.rs</code> を削除。親 <code>v4/mod.rs</code> は5,575→117行。分解版978件・統合版979件のRustテスト、Clippy・WASM・fmt・Python 41件を確認し、両版とも28条件50Tの全 <code>action_history</code> 本文・勝敗・終了turnが基準と28/28一致。</dd>
 </dl>
 </article>
 
 <article class="stage" id="stage-6">
-<h3>6. 残りの <code>*/extended.rs</code> の責務別整理と、戦略・状態遷移の負債（S）の個別返済【区分R → S】</h3>
+<h3>6. 残りの <code>*/extended.rs</code> の責務別整理と、戦略・状態遷移の負債（S）の個別返済【次着手・区分R → S】</h3>
 <dl>
 <dt>対象</dt><dd><code>v4/rolling_plan/extended.rs</code>（5,519行）、<code>v4/victory_roadmap/extended.rs</code>（2,318行）、<code>island_campaign/extended.rs</code>、<code>island_campaign_analysis/extended.rs</code>、<code>turn_distance/extended.rs</code>、<code>v4/strategy_pipeline.rs</code></dd>
 <dt>変更</dt><dd><ul><li><strong>6a（区分R：残りの <code>extended.rs</code> 解消と巨大関数分割）</strong>：<code>rolling_plan/extended.rs</code> にある小規模固有の合同探索（<code>plan_current_property_control_exact</code> 686行、<code>simulate_state_with_catalog</code> 489行など）や <code>victory_roadmap/extended.rs</code>（<code>observe_campaign_execution</code> 510行など）を、段階4・5と同じ手順で責務名モジュール（例：<code>rolling_plan/exact_property_control.rs</code>）へ分離・段分割し、<code>extended.rs</code> というファイル名と一時スイッチ <code>OPENWARS_EXT_DISABLE</code> を撤去する。</li><li><strong>6b（区分S：戦略・状態遷移の整理、1件ずつ隔離評価）</strong>：挙動が変わる残課題——①編成後のRoadmap 2回目選択を実績観測のみにする、②発行拒否時の工程取消と配備・占領意図の解放（D-5）、③戦略分析と編成の占有モデルの統一、④後攻小規模マップの前衛/間接バランス等の戦術改善——を、「旧ルールの目的→最小反例→代案→28条件50T比較（jobs=8）→採用/棄却」の手順で1件ずつ扱う。</li></ul></dd>
@@ -316,8 +317,8 @@ python scripts/measure_ai_complexity.py --root engine/src/ai --output &lt;段階
 </section>
 
 <footer>
-<p>2026-10-11：ゼロベース再設計の計画を保存。2026-10-16：段階1〜3bの完了実績を反映し、<code>v4/extended.rs</code> 解体と生産パイプライン統合を段階4〜6として統合。同日：段階4を完了し、次着手を段階5へ更新。</p>
-<p><a href="ai-redesign-v3-proposal.md">v3提案書</a> ／ <a href="ai-redesign-v3-stage1.md">段階1</a> ／ <a href="ai-redesign-v3-stage2.md">段階2</a> ／ <a href="ai-redesign-v3-stage3.md">段階3</a> ／ <a href="ai-redesign-v3-stage3b.md">段階3b</a> ／ <a href="ai-redesign-v3-stage4.md">段階4</a> ／ <a href="#stages">現行の段階計画</a></p>
+<p>2026-10-11：ゼロベース再設計の計画を保存。2026-10-16：段階1〜3bの完了実績を反映し、<code>v4/extended.rs</code> 解体と生産パイプライン統合を段階4〜6として統合。同日：段階4を完了し、次着手を段階5へ更新。同日：段階5を完了し、次着手を段階6aへ更新。</p>
+<p><a href="ai-redesign-v3-proposal.md">v3提案書</a> ／ <a href="ai-redesign-v3-stage1.md">段階1</a> ／ <a href="ai-redesign-v3-stage2.md">段階2</a> ／ <a href="ai-redesign-v3-stage3.md">段階3</a> ／ <a href="ai-redesign-v3-stage3b.md">段階3b</a> ／ <a href="ai-redesign-v3-stage4.md">段階4</a> ／ <a href="ai-redesign-v3-stage5.md">段階5</a> ／ <a href="#stages">現行の段階計画</a></p>
 </footer>
 </main>
 </body>

@@ -68,7 +68,7 @@ pub(super) fn finalize(
         .collect::<Vec<_>>();
 
     if optimize {
-        extended::optimize_production_facility_assignments(scan, commands);
+        optimize_production_facility_assignments(scan, commands);
     }
     commit_facilities(commands, trace, registry, &produced_steps, &rolling_links);
 }
@@ -108,6 +108,106 @@ fn commit_facilities(
         }
         for &(plan_index, purchase_index) in links {
             trace.rolling_combat_plans[plan_index].purchases[purchase_index].facility = selected;
+        }
+    }
+}
+
+pub(in crate::ai::v4) fn optimize_production_facility_assignments(
+    scan: &BoardScan,
+    commands: &mut [PlannedProduction],
+) {
+    if commands.len() <= 1 {
+        return;
+    }
+    let stats_by_type: HashMap<UnitType, &UnitStats> =
+        scan.available_types.iter().map(|(t, s)| (*t, s)).collect();
+
+    let mut improved = true;
+    let mut iterations = 0;
+    while improved && iterations < 32 {
+        improved = false;
+        iterations += 1;
+        for i in 0..commands.len() {
+            for j in (i + 1)..commands.len() {
+                let target_i = commands[i]
+                    .capture_intent
+                    .as_ref()
+                    .and_then(|intent| intent.mission_target)
+                    .or_else(|| commands[i].deployment.as_ref().map(|d| d.staging_anchor));
+                let target_j = commands[j]
+                    .capture_intent
+                    .as_ref()
+                    .and_then(|intent| intent.mission_target)
+                    .or_else(|| commands[j].deployment.as_ref().map(|d| d.staging_anchor));
+
+                let (Some(target_i), Some(target_j)) = (target_i, target_j) else {
+                    continue;
+                };
+
+                let pos_i = GridPosition {
+                    x: commands[i].command.target_x,
+                    y: commands[i].command.target_y,
+                };
+                let pos_j = GridPosition {
+                    x: commands[j].command.target_x,
+                    y: commands[j].command.target_y,
+                };
+                if pos_i == pos_j {
+                    continue;
+                }
+
+                let terrain_i = scan
+                    .map
+                    .get_terrain(pos_i.x, pos_i.y)
+                    .unwrap_or(Terrain::Factory);
+                let terrain_j = scan
+                    .map
+                    .get_terrain(pos_j.x, pos_j.y)
+                    .unwrap_or(Terrain::Factory);
+                let unit_i = commands[i].command.unit_type;
+                let unit_j = commands[j].command.unit_type;
+
+                // 地形生産制約の確認
+                if !scan.can_produce(terrain_j, unit_i) || !scan.can_produce(terrain_i, unit_j) {
+                    continue;
+                }
+
+                let speed_i = stats_by_type
+                    .get(&unit_i)
+                    .map_or(1, |s| s.max_movement)
+                    .max(1);
+                let speed_j = stats_by_type
+                    .get(&unit_j)
+                    .map_or(1, |s| s.max_movement)
+                    .max(1);
+
+                let dist_i_curr = scan.map.distance(pos_i.x, pos_i.y, target_i.x, target_i.y);
+                let dist_j_curr = scan.map.distance(pos_j.x, pos_j.y, target_j.x, target_j.y);
+                let eta_i_curr = dist_i_curr.div_ceil(speed_i);
+                let eta_j_curr = dist_j_curr.div_ceil(speed_j);
+                let curr_key = (
+                    eta_i_curr.saturating_add(eta_j_curr),
+                    dist_i_curr.saturating_add(dist_j_curr),
+                );
+
+                let dist_i_swap = scan.map.distance(pos_j.x, pos_j.y, target_i.x, target_i.y);
+                let dist_j_swap = scan.map.distance(pos_i.x, pos_i.y, target_j.x, target_j.y);
+                let eta_i_swap = dist_i_swap.div_ceil(speed_i);
+                let eta_j_swap = dist_j_swap.div_ceil(speed_j);
+                let swap_key = (
+                    eta_i_swap.saturating_add(eta_j_swap),
+                    dist_i_swap.saturating_add(dist_j_swap),
+                );
+
+                if swap_key < curr_key {
+                    commands[i].command.target_x = pos_j.x;
+                    commands[i].command.target_y = pos_j.y;
+
+                    commands[j].command.target_x = pos_i.x;
+                    commands[j].command.target_y = pos_i.y;
+                    improved = true;
+                }
+            }
         }
     }
 }

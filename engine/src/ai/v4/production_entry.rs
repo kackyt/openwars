@@ -154,10 +154,7 @@ pub(in crate::ai::v4) fn commit_turn_production(
 /// `decide_production` から `AiVersion::uses_operation_driven_production()` が
 /// true のときだけ委譲される。V1/V2/V3 の経路には一切影響しない。
 pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<ProduceUnitCommand> {
-    // 小規模マップのV4は extended 側の実装を使う。
-    if crate::ai::code_path::is_extended_at("v4/mod.rs::decide_production_v4") {
-        return extended::decide_production_v4(world, player_id);
-    }
+    let policy = ProductionPolicy::for_current_path();
     let turn = world
         .get_resource::<crate::resources::MatchState>()
         .map_or(0, |state| state.current_turn_number.0);
@@ -174,7 +171,7 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
         });
     }
 
-    let campaign_surplus = match decide_campaign_production_v4(world, player_id) {
+    let campaign_surplus = match decide_campaign_production_v4(world, player_id, policy) {
         CampaignProductionControl::Command(command) => return vec![command],
         CampaignProductionControl::BlockGeneric => return Vec::new(),
         CampaignProductionControl::ContinueWithSurplus(budget) => Some(budget),
@@ -190,10 +187,18 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
 
     let prepared = strategy_pipeline::prepare_production_scan(world, player_id);
     let queries = board_scan::BoardScanQueries::prepare(world);
-    let Some(mut scan) = BoardScan::collect(world, player_id, prepared.as_ref(), &queries) else {
+    let Some(mut scan) = BoardScan::collect(world, player_id, prepared.as_ref(), &queries, policy)
+    else {
         world.insert_resource(turn_plan);
         return Vec::new();
     };
+    // 敵の初期配置は学習せず、前回走査後に現れた実Entityだけで次手番を予測する。
+    let enemy_production_forecast = if policy.reports_property_control() {
+        enemy_forecast::observe_enemy_production(world, player_id, turn, &scan)
+    } else {
+        EnemyProductionForecastTrace::default()
+    };
+    scan.enemy_production_forecast = enemy_production_forecast;
     if let Some(budget) = campaign_surplus {
         scan.funds = scan.funds.min(budget);
     }
@@ -203,6 +208,14 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
         .get_resource::<deployment::V4DeploymentRegistry>()
         .map(|registry| registry.active_target_assignments(player_id))
         .unwrap_or_default();
+    // Squad計画でDAGへ束縛した前進部隊を、首都作戦の既存戦力として同じ手番の
+    // 生産plannerへ渡す。PlanIdの有無ではなく、親戦役の未完了区間へ実際に進む
+    // という作戦状態を正本にする。
+    let advancing_route_entities = world
+        .get_resource::<capital_route::model::CapitalRoutePathRegistry>()
+        .zip(world.get_resource::<crate::ai::squad::SquadManager>())
+        .map(|(registry, manager)| registry.advancing_combat_entities(player_id, manager))
+        .unwrap_or_default();
     let produced_plan_steps = world
         .get_resource::<deployment::V4DeploymentRegistry>()
         .map(|registry| registry.produced_plan_steps(player_id))
@@ -210,15 +223,32 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
     let mut rolling_registry = world
         .remove_resource::<V4RollingPlanRegistry>()
         .unwrap_or_default();
+    let mut contract_registry = if policy.uses_joint_capture() {
+        world
+            .remove_resource::<plan_contract::PlanContractRegistry>()
+            .unwrap_or_default()
+    } else {
+        plan_contract::PlanContractRegistry::default()
+    };
     rolling_registry.reconcile_produced_steps(player_id, &produced_plan_steps);
-    let (planned, plan_trace) = plan_production_with_registry(
-        &scan,
+    let input = production_pipeline::ProductionInputs {
+        policy,
+        scan: &scan,
         player_id,
-        campaign_surplus.is_none(),
-        &committed_combat_assignments,
+        allow_structural_slots: campaign_surplus.is_none(),
+        committed_combat_assignments: &committed_combat_assignments,
+        advancing_route_entities: &advancing_route_entities,
         turn,
+    };
+    let (planned, mut plan_trace) = production_pipeline::plan_production_with_registry(
+        &input,
         &mut rolling_registry,
+        &mut contract_registry,
     );
+    plan_trace.enemy_production_forecast = enemy_production_forecast;
+    if policy.uses_joint_capture() {
+        world.insert_resource(contract_registry);
+    }
     commit_turn_production(
         world,
         player_id,
@@ -336,6 +366,7 @@ pub(in crate::ai::v4) fn observe_plan_execution(world: &mut World, player_id: Pl
 pub(in crate::ai::v4) fn decide_campaign_production_v4(
     world: &mut World,
     player_id: PlayerId,
+    policy: ProductionPolicy,
 ) -> CampaignProductionControl {
     let turn = world
         .get_resource::<crate::resources::MatchState>()
@@ -375,7 +406,8 @@ pub(in crate::ai::v4) fn decide_campaign_production_v4(
 
     let prepared = strategy_pipeline::prepare_production_scan(world, player_id);
     let queries = board_scan::BoardScanQueries::prepare(world);
-    let Some(scan) = BoardScan::collect(world, player_id, prepared.as_ref(), &queries) else {
+    let Some(scan) = BoardScan::collect(world, player_id, prepared.as_ref(), &queries, policy)
+    else {
         return CampaignProductionControl::BlockGeneric;
     };
 
@@ -418,7 +450,7 @@ pub(in crate::ai::v4) fn decide_campaign_production_v4(
         &scan.master_data,
         scan.funds,
     );
-    let reservation = if crate::ai::code_path::is_extended() {
+    let reservation = if policy.uses_route_commitments() {
         campaign_execution::CampaignFormingReservation::Immediate
     } else {
         campaign_execution::CampaignFormingReservation::Deferred

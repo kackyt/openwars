@@ -84,12 +84,10 @@ use trace::{
 };
 
 use candidate::*;
-use combat_input::*;
 use operation_builder::*;
 pub use production_entry::decide_production_v4;
-use production_entry::*;
 use production_model::*;
-use production_pipeline::standard::*;
+
 use slot_demand::*;
 
 #[cfg(test)]
@@ -101,15 +99,19 @@ pub mod plan_contract;
 pub mod property_control;
 pub(crate) mod strategy_pipeline;
 
-// 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
+// 盤面snapshot、首都DAG、敵予測は担当moduleが所有し、生産方策は入口で選ぶ。
 mod board_scan;
 #[allow(unused_imports)]
 pub(crate) mod capital_route;
 mod enemy_forecast;
-mod extended;
+mod production_policy;
+use production_policy::ProductionPolicy;
 #[cfg(test)]
 mod production_tests;
 #[cfg(test)]
 mod test_support;
 
 pub use capital_route::commitment::capital_route_diagnostics_for_player;
+
+#[cfg(test)]
+use production_pipeline::plan_production;
