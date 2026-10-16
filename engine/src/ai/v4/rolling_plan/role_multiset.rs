@@ -1,6 +1,10 @@
 //! RollingPlanのrole_multiset責務。
-use super::frontier::{first_differing_frontier_field, multiset_frontier_key};
+use super::frontier::multiset_frontier_key;
+use super::search_diagnostics::MultisetBeamAudit;
 use super::{GridPosition, HashMap, MovementType, RollingPlanInput, UnitType, best_damage};
+
+#[cfg(test)]
+mod tests;
 
 /// 物件レースにおける抽象生産要求（役割）。
 /// 施設ごとの順列展開を排除し、マルチセット（何を何体作るか）として組合せを表現する。
@@ -110,262 +114,203 @@ pub(super) fn generate_role_multisets(
     if roles.is_empty() || max_slots == 0 {
         return (Vec::new(), false);
     }
-
     let role_metas: Vec<RoleMetadata> = roles
         .iter()
-        .map(|role| {
-            let matching_facs: Vec<(GridPosition, usize)> = facilities
-                .iter()
-                .filter_map(|(fac, _)| {
-                    facility_role_options
-                        .get(&(*fac, *role))
-                        .copied()
-                        .map(|opt_idx| (*fac, opt_idx))
-                })
-                .collect();
-            let capacity = matching_facs.len();
-
-            let first_opt = matching_facs
-                .first()
-                .map(|&(_, opt_idx)| &input.production_options[opt_idx]);
-            let is_combat_non_infantry = role.capture_target().is_none()
-                && first_opt.is_some_and(|opt| opt.stats.movement_type != MovementType::Infantry);
-            let max_movement = first_opt.map_or(0, |opt| opt.stats.max_movement);
-
-            let min_capture_completion = if role.capture_target().is_some() {
-                matching_facs
-                    .iter()
-                    .filter_map(|&(_, opt_idx)| {
-                        input.production_options[opt_idx].capture_completion_turn
-                    })
-                    .min()
-                    .unwrap_or(u32::MAX)
-            } else {
-                u32::MAX
-            };
-
-            let damage_by_enemy: Vec<u32> = input
-                .enemies
-                .iter()
-                .enumerate()
-                .map(|(enemy_idx, enemy)| {
-                    if role.capture_target().is_some() {
-                        return 0;
-                    }
-                    let can_reach = matching_facs.iter().any(|&(_, opt_idx)| {
-                        input
-                            .production_attack_projections
-                            .get(opt_idx)
-                            .map_or_else(
-                                || {
-                                    input.production_options[opt_idx]
-                                        .engageable_enemy_indices
-                                        .contains(&enemy_idx)
-                                },
-                                |projections| {
-                                    projections.get(enemy_idx).is_some_and(Option::is_some)
-                                },
-                            )
-                    });
-                    if can_reach {
-                        best_damage(&input.damage_chart, role.unit_type(), enemy.stats.unit_type)
-                    } else {
-                        0
-                    }
-                })
-                .collect();
-
-            RoleMetadata {
-                cost: role.cost(),
-                capture_target: role.capture_target(),
-                capacity,
-                min_capture_completion,
-                is_combat_non_infantry,
-                max_movement,
-                damage_by_enemy,
-            }
-        })
+        .map(|role| RoleMetadata::observe(*role, input, facilities, facility_role_options))
         .collect();
+    let beam_audit = MultisetBeamAudit::from_env(roles, input, facilities, facility_role_options);
 
-    // 【一時的な診断専用】役割indexごとの「間接（min_range>1）か」を、
-    // 環境変数が設定された時だけ作る。生成ロジックからは参照されない。
-    let funnel_indirect_roles: Option<Vec<bool>> =
-        std::env::var_os("OPENWARS_INDIRECT_FUNNEL_AUDIT")
-            .is_some()
-            .then(|| {
-                roles
-                    .iter()
-                    .map(|role| {
-                        facilities
-                            .iter()
-                            .find_map(|(facility, _)| {
-                                facility_role_options.get(&(*facility, *role)).copied()
-                            })
-                            .is_some_and(|option_index| {
-                                input.production_options[option_index].stats.min_range > 1
-                            })
-                    })
-                    .collect()
-            });
-
-    let initial = MultisetCandidate {
-        role_indices: Vec::new(),
-        used_targets: Vec::new(),
-        current_role_count: 0,
-        remaining_funds: current_funds,
-        last_role_idx: 0,
-    };
-
-    let mut current_level = vec![initial];
+    let mut current_level = vec![MultisetCandidate::empty(current_funds)];
     let mut all_multisets = Vec::new();
     let mut truncated = false;
-
-    for _size in 1..=max_slots {
-        let mut next_level = Vec::new();
-        for parent in &current_level {
-            for (i, meta) in role_metas.iter().enumerate().skip(parent.last_role_idx) {
-                if meta.cost > parent.remaining_funds {
-                    continue;
-                }
-
-                let next_role_count = if i == parent.last_role_idx {
-                    parent.current_role_count.saturating_add(1)
-                } else {
-                    1
-                };
-
-                if let Some(target) = meta.capture_target {
-                    if parent.used_targets.contains(&target) {
-                        continue;
-                    }
-                    let mut used_targets = parent.used_targets.clone();
-                    used_targets.push(target);
-                    let mut new_role_indices = parent.role_indices.clone();
-                    new_role_indices.push(i);
-                    next_level.push(MultisetCandidate {
-                        role_indices: new_role_indices,
-                        used_targets,
-                        current_role_count: next_role_count,
-                        remaining_funds: parent.remaining_funds.saturating_sub(meta.cost),
-                        last_role_idx: i,
-                    });
-                } else if next_role_count <= meta.capacity
-                    && next_role_count <= MAX_COMBAT_ROLE_COPIES
-                {
-                    let mut new_role_indices = parent.role_indices.clone();
-                    new_role_indices.push(i);
-                    next_level.push(MultisetCandidate {
-                        role_indices: new_role_indices,
-                        used_targets: parent.used_targets.clone(),
-                        current_role_count: next_role_count,
-                        remaining_funds: parent.remaining_funds.saturating_sub(meta.cost),
-                        last_role_idx: i,
-                    });
-                }
-            }
+    for size in 1..=max_slots {
+        let mut next_level = expand_level(&current_level, &role_metas);
+        // 【一時的な診断専用】縮約前の候補を控える。環境変数が無い通常対戦では何もしない。
+        let generated = beam_audit
+            .as_ref()
+            .map(|audit| audit.observe_generated(&next_level));
+        truncated |= retain_multiset_beam(input, &mut next_level, &role_metas);
+        if let (Some(audit), Some(generated)) = (&beam_audit, generated) {
+            audit.report(input, roles, &role_metas, size, generated, &next_level);
         }
-
-        // 【一時的な診断専用】ビーム切り捨ての前後で間接役を含む候補が何件残るかを記録する。
-        // 環境変数が無い通常対戦では一切実行されない。探索結果は変更しない。
-        let next_level_snapshot = if funnel_indirect_roles.is_some() {
-            next_level.clone()
-        } else {
-            Vec::new()
-        };
-        let funnel_audit_before = funnel_indirect_roles.as_ref().map(|indirect| {
-            next_level
-                .iter()
-                .filter(|cand| cand.role_indices.iter().any(|idx| indirect[*idx]))
-                .count()
-        });
-
-        if next_level.len() > MULTISET_BEAM_WIDTH {
-            truncated = true;
-            next_level.sort_unstable_by_key(|cand| {
-                multiset_frontier_key(input, &cand.role_indices, &role_metas)
-            });
-            next_level.truncate(MULTISET_BEAM_WIDTH);
-        }
-
-        if let (Some(indirect), Some(before)) =
-            (funnel_indirect_roles.as_ref(), funnel_audit_before)
-        {
-            let after = next_level
-                .iter()
-                .filter(|cand| cand.role_indices.iter().any(|idx| indirect[*idx]))
-                .count();
-            // 切り捨てで全滅した場合だけ、最良の間接候補と最下位の残存候補を突き合わせ、
-            // どのキー成分で負けたかを一つだけ特定する。
-            let mut detail = String::new();
-            if before > 0 && after == 0 {
-                let best_indirect = next_level_snapshot
-                    .iter()
-                    .filter(|cand| cand.role_indices.iter().any(|idx| indirect[*idx]))
-                    .min_by_key(|cand| {
-                        multiset_frontier_key(input, &cand.role_indices, &role_metas)
-                    });
-                let worst_retained = next_level.iter().max_by_key(|cand| {
-                    multiset_frontier_key(input, &cand.role_indices, &role_metas)
-                });
-                if let (Some(rejected), Some(retained)) = (best_indirect, worst_retained) {
-                    let rejected_key =
-                        multiset_frontier_key(input, &rejected.role_indices, &role_metas);
-                    let retained_key =
-                        multiset_frontier_key(input, &retained.role_indices, &role_metas);
-                    detail = format!(
-                        " first_differing_key={} rejected(roles={:?} cost={} capture_shortfall={} completion={:?} combat_desc={:?} movement_desc={:?} rel_hp={} all_hp={} excess={}) retained(roles={:?} cost={} capture_shortfall={} completion={:?} combat_desc={:?} movement_desc={:?} rel_hp={} all_hp={} excess={})",
-                        first_differing_frontier_field(&rejected_key, &retained_key),
-                        rejected
-                            .role_indices
-                            .iter()
-                            .map(|idx| (roles[*idx].unit_type(), roles[*idx].capture_target()))
-                            .collect::<Vec<_>>(),
-                        rejected_key.cost,
-                        rejected_key.capture_shortfall,
-                        rejected_key.capture_completion_turns,
-                        rejected_key.combat_unit_count_desc,
-                        rejected_key.total_movement_desc,
-                        rejected_key.remaining_relevant_hp,
-                        rejected_key.remaining_all_hp,
-                        rejected_key.excess_capturers,
-                        retained
-                            .role_indices
-                            .iter()
-                            .map(|idx| (roles[*idx].unit_type(), roles[*idx].capture_target()))
-                            .collect::<Vec<_>>(),
-                        retained_key.cost,
-                        retained_key.capture_shortfall,
-                        retained_key.capture_completion_turns,
-                        retained_key.combat_unit_count_desc,
-                        retained_key.total_movement_desc,
-                        retained_key.remaining_relevant_hp,
-                        retained_key.remaining_all_hp,
-                        retained_key.excess_capturers,
-                    );
-                }
-            }
-            eprintln!(
-                "INDIRECT_FUNNEL_AUDIT stage=multiset_beam turn={} size={} generated={} beam_width={} indirect_before={} indirect_after={} truncated={}{}",
-                input.current_turn,
-                _size,
-                next_level_snapshot.len(),
-                MULTISET_BEAM_WIDTH,
-                before,
-                after,
-                next_level_snapshot.len() > MULTISET_BEAM_WIDTH,
-                detail,
-            );
-        }
-
-        for cand in &next_level {
-            all_multisets.push(cand.role_indices.iter().map(|&idx| roles[idx]).collect());
-        }
-
+        all_multisets.extend(next_level.iter().map(|candidate| candidate.roles(roles)));
         current_level = next_level;
         if current_level.is_empty() {
             break;
         }
     }
-
     (all_multisets, truncated)
+}
+
+impl RoleMetadata {
+    /// 役割を生産できる施設の選択肢から、展開と順位付けに使う静的な諸元を一度だけ求める。
+    fn observe(
+        role: ProductionRole,
+        input: &RollingPlanInput,
+        facilities: &[(GridPosition, Vec<usize>)],
+        facility_role_options: &HashMap<(GridPosition, ProductionRole), usize>,
+    ) -> Self {
+        let option_indices: Vec<usize> = facilities
+            .iter()
+            .filter_map(|(facility, _)| facility_role_options.get(&(*facility, role)).copied())
+            .collect();
+        // 戦闘役の兵種諸元は、施設順で最初に見つかった選択肢を代表として使う。
+        let first_option = option_indices
+            .first()
+            .map(|&index| &input.production_options[index]);
+        Self {
+            cost: role.cost(),
+            capture_target: role.capture_target(),
+            capacity: option_indices.len(),
+            min_capture_completion: min_capture_completion(role, input, &option_indices),
+            is_combat_non_infantry: role.capture_target().is_none()
+                && first_option
+                    .is_some_and(|option| option.stats.movement_type != MovementType::Infantry),
+            max_movement: first_option.map_or(0, |option| option.stats.max_movement),
+            damage_by_enemy: damage_by_enemy(role, input, &option_indices),
+        }
+    }
+}
+
+/// 占領役は、生産可能な施設のうち最短の占領完了turnを持つ。戦闘役と不明は最大値。
+fn min_capture_completion(
+    role: ProductionRole,
+    input: &RollingPlanInput,
+    option_indices: &[usize],
+) -> u32 {
+    if role.capture_target().is_none() {
+        return u32::MAX;
+    }
+    option_indices
+        .iter()
+        .filter_map(|&index| input.production_options[index].capture_completion_turn)
+        .min()
+        .unwrap_or(u32::MAX)
+}
+
+/// 敵ごとに、いずれかの施設から攻撃が届く戦闘役だけ最大基本ダメージを計上する。
+fn damage_by_enemy(
+    role: ProductionRole,
+    input: &RollingPlanInput,
+    option_indices: &[usize],
+) -> Vec<u32> {
+    input
+        .enemies
+        .iter()
+        .enumerate()
+        .map(|(enemy_index, enemy)| {
+            let reaches = role.capture_target().is_none()
+                && option_indices
+                    .iter()
+                    .any(|&index| option_reaches_enemy(input, index, enemy_index));
+            if reaches {
+                best_damage(&input.damage_chart, role.unit_type(), enemy.stats.unit_type)
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
+/// 射撃投影がある選択肢は投影を正とし、投影が無い場合だけ交戦可能敵の一覧へ戻る。
+fn option_reaches_enemy(input: &RollingPlanInput, option_index: usize, enemy_index: usize) -> bool {
+    input
+        .production_attack_projections
+        .get(option_index)
+        .map_or_else(
+            || {
+                input.production_options[option_index]
+                    .engageable_enemy_indices
+                    .contains(&enemy_index)
+            },
+            |projections| projections.get(enemy_index).is_some_and(Option::is_some),
+        )
+}
+
+impl MultisetCandidate {
+    fn empty(remaining_funds: u32) -> Self {
+        Self {
+            role_indices: Vec::new(),
+            used_targets: Vec::new(),
+            current_role_count: 0,
+            remaining_funds,
+            last_role_idx: 0,
+        }
+    }
+
+    /// 役割を1つ加えた子候補を返す。資金超過、占領対象の重複、
+    /// 戦闘役の施設数・重複上限超過はNoneとして展開しない。
+    fn extend_with(&self, role_index: usize, meta: &RoleMetadata) -> Option<Self> {
+        if meta.cost > self.remaining_funds {
+            return None;
+        }
+        // 役割indexは非減少で追加するため、直前と同じ役割なら連続数が重複数になる。
+        let role_count = if role_index == self.last_role_idx {
+            self.current_role_count.saturating_add(1)
+        } else {
+            1
+        };
+        let used_targets = match meta.capture_target {
+            Some(target) if self.used_targets.contains(&target) => return None,
+            Some(target) => {
+                let mut used_targets = self.used_targets.clone();
+                used_targets.push(target);
+                used_targets
+            }
+            None if role_count <= meta.capacity && role_count <= MAX_COMBAT_ROLE_COPIES => {
+                self.used_targets.clone()
+            }
+            None => return None,
+        };
+        let mut role_indices = self.role_indices.clone();
+        role_indices.push(role_index);
+        Some(Self {
+            role_indices,
+            used_targets,
+            current_role_count: role_count,
+            remaining_funds: self.remaining_funds.saturating_sub(meta.cost),
+            last_role_idx: role_index,
+        })
+    }
+
+    fn roles(&self, roles: &[ProductionRole]) -> Vec<ProductionRole> {
+        self.role_indices
+            .iter()
+            .map(|&index| roles[index])
+            .collect()
+    }
+}
+
+/// 親候補の順に、直前の役割index以降だけを加えて次のサイズ段を作る（重複組合せを1回だけ生成）。
+fn expand_level(
+    parents: &[MultisetCandidate],
+    role_metas: &[RoleMetadata],
+) -> Vec<MultisetCandidate> {
+    parents
+        .iter()
+        .flat_map(|parent| {
+            role_metas
+                .iter()
+                .enumerate()
+                .skip(parent.last_role_idx)
+                .filter_map(move |(index, meta)| parent.extend_with(index, meta))
+        })
+        .collect()
+}
+
+/// 候補数がビーム幅を超えた段だけ前線キー順に縮約し、縮約したかを返す。
+/// キーは役割index列を含み候補間で一意なので、不安定ソートでも順序は決定的。
+fn retain_multiset_beam(
+    input: &RollingPlanInput,
+    level: &mut Vec<MultisetCandidate>,
+    role_metas: &[RoleMetadata],
+) -> bool {
+    if level.len() <= MULTISET_BEAM_WIDTH {
+        return false;
+    }
+    level.sort_unstable_by_key(|candidate| {
+        multiset_frontier_key(input, &candidate.role_indices, role_metas)
+    });
+    level.truncate(MULTISET_BEAM_WIDTH);
+    true
 }

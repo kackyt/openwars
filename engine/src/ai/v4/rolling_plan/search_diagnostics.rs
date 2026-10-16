@@ -1,12 +1,15 @@
 //! RollingPlanのsearch_diagnostics責務。
 use super::combat_capture_simulation::simulate_state_with_catalog;
 use super::frontier::first_differing_frontier_field;
+use super::frontier::multiset_frontier_key;
 use super::frontier::property_control_tactical_profile;
 use super::frontier::{indirect_upgrade_preserves_direct_plan, property_control_frontier_key};
 use super::plan_ranking::{
     current_direct_role_counts, exact_property_plan_better, uses_small_map_tactical_rules,
 };
-use super::role_multiset::ProductionRole;
+use super::role_multiset::{
+    MULTISET_BEAM_WIDTH, MultisetCandidate, ProductionRole, PropertyFrontierKey, RoleMetadata,
+};
 use super::{ForcePackagePlan, HashSet, RollingPlanInput, SearchState, SimulationCatalog};
 use super::{GridPosition, HashMap, UnitType};
 
@@ -636,6 +639,148 @@ pub(super) fn audit_exact_multisets(
             multiset_truncated,
         );
     }
+}
+
+/// 【一時的な診断専用】役割集合のビーム縮約の前後で、間接役を含む候補が何件残るかを記録する。
+/// `OPENWARS_INDIRECT_FUNNEL_AUDIT` が設定された時だけ作られ、探索結果は変更しない。
+pub(super) struct MultisetBeamAudit {
+    /// 役割indexごとに、間接（min_range>1）の選択肢を代表に持つか。
+    indirect_roles: Vec<bool>,
+}
+
+/// 縮約前に控えた一段分の候補と、そのうち間接役を含む件数。
+pub(super) struct GeneratedMultisets {
+    candidates: Vec<MultisetCandidate>,
+    indirect: usize,
+}
+
+impl MultisetBeamAudit {
+    pub(super) fn from_env(
+        roles: &[ProductionRole],
+        input: &RollingPlanInput,
+        facilities: &[(GridPosition, Vec<usize>)],
+        facility_role_options: &HashMap<(GridPosition, ProductionRole), usize>,
+    ) -> Option<Self> {
+        std::env::var_os("OPENWARS_INDIRECT_FUNNEL_AUDIT")
+            .is_some()
+            .then(|| Self {
+                indirect_roles: roles
+                    .iter()
+                    .map(|role| {
+                        facilities
+                            .iter()
+                            .find_map(|(facility, _)| {
+                                facility_role_options.get(&(*facility, *role)).copied()
+                            })
+                            .is_some_and(|option_index| {
+                                input.production_options[option_index].stats.min_range > 1
+                            })
+                    })
+                    .collect(),
+            })
+    }
+
+    fn has_indirect(&self, candidate: &MultisetCandidate) -> bool {
+        candidate
+            .role_indices
+            .iter()
+            .any(|index| self.indirect_roles[*index])
+    }
+
+    pub(super) fn observe_generated(&self, level: &[MultisetCandidate]) -> GeneratedMultisets {
+        GeneratedMultisets {
+            candidates: level.to_vec(),
+            indirect: level
+                .iter()
+                .filter(|candidate| self.has_indirect(candidate))
+                .count(),
+        }
+    }
+
+    pub(super) fn report(
+        &self,
+        input: &RollingPlanInput,
+        roles: &[ProductionRole],
+        role_metas: &[RoleMetadata],
+        size: usize,
+        generated: GeneratedMultisets,
+        retained: &[MultisetCandidate],
+    ) {
+        let after = retained
+            .iter()
+            .filter(|candidate| self.has_indirect(candidate))
+            .count();
+        // 切り捨てで全滅した場合だけ、どのキー成分で負けたかを特定する。
+        let detail = if generated.indirect > 0 && after == 0 {
+            self.rejection_detail(input, roles, role_metas, &generated.candidates, retained)
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "INDIRECT_FUNNEL_AUDIT stage=multiset_beam turn={} size={} generated={} beam_width={} indirect_before={} indirect_after={} truncated={}{}",
+            input.current_turn,
+            size,
+            generated.candidates.len(),
+            MULTISET_BEAM_WIDTH,
+            generated.indirect,
+            after,
+            generated.candidates.len() > MULTISET_BEAM_WIDTH,
+            detail,
+        );
+    }
+
+    /// 最良の間接候補と最下位の残存候補を突き合わせ、最初に食い違うキー成分を示す。
+    fn rejection_detail(
+        &self,
+        input: &RollingPlanInput,
+        roles: &[ProductionRole],
+        role_metas: &[RoleMetadata],
+        generated: &[MultisetCandidate],
+        retained: &[MultisetCandidate],
+    ) -> String {
+        let key = |candidate: &MultisetCandidate| {
+            multiset_frontier_key(input, &candidate.role_indices, role_metas)
+        };
+        let best_indirect = generated
+            .iter()
+            .filter(|candidate| self.has_indirect(candidate))
+            .min_by_key(|candidate| key(candidate));
+        let worst_retained = retained.iter().max_by_key(|candidate| key(candidate));
+        let (Some(rejected), Some(retained)) = (best_indirect, worst_retained) else {
+            return String::new();
+        };
+        let rejected_key = key(rejected);
+        let retained_key = key(retained);
+        format!(
+            " first_differing_key={} rejected({}) retained({})",
+            first_differing_frontier_field(&rejected_key, &retained_key),
+            describe_multiset(roles, rejected, &rejected_key),
+            describe_multiset(roles, retained, &retained_key),
+        )
+    }
+}
+
+fn describe_multiset(
+    roles: &[ProductionRole],
+    candidate: &MultisetCandidate,
+    key: &PropertyFrontierKey,
+) -> String {
+    format!(
+        "roles={:?} cost={} capture_shortfall={} completion={:?} combat_desc={:?} movement_desc={:?} rel_hp={} all_hp={} excess={}",
+        candidate
+            .role_indices
+            .iter()
+            .map(|index| (roles[*index].unit_type(), roles[*index].capture_target()))
+            .collect::<Vec<_>>(),
+        key.cost,
+        key.capture_shortfall,
+        key.capture_completion_turns,
+        key.combat_unit_count_desc,
+        key.total_movement_desc,
+        key.remaining_relevant_hp,
+        key.remaining_all_hp,
+        key.excess_capturers,
+    )
 }
 
 /// 施設割当まで成立した案数を観測する。

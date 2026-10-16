@@ -23,7 +23,7 @@ use super::{
 use crate::resources::GridTopology;
 use crate::resources::master_data::UnitName;
 
-fn stats(unit_type: UnitType, cost: u32, movement: u32) -> UnitStats {
+pub(super) fn stats(unit_type: UnitType, cost: u32, movement: u32) -> UnitStats {
     let master = MasterDataRegistry::load().unwrap();
     let weapon_stats = master
         .create_unit_stats(&UnitName(unit_type.as_str().to_owned()))
@@ -42,7 +42,7 @@ fn stats(unit_type: UnitType, cost: u32, movement: u32) -> UnitStats {
     }
 }
 
-fn input() -> RollingPlanInput {
+pub(super) fn input() -> RollingPlanInput {
     let map = Map::new(12, 1, Terrain::Plains, GridTopology::Square);
     let mut chart = DamageChart::new();
     chart.insert_damage(UnitType::Bcopters, UnitType::Infantry, 40);
