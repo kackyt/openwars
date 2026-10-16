@@ -23,17 +23,23 @@ use crate::ai::v4::capital_route::node_operation::{
     capital_route_node_predecessors_released, consolidate_nearby_capture_target_regions,
     ensure_capital_route_node_operations, refresh_capital_route_node_operations,
 };
+use crate::ai::v4::capital_route::prepare_capital_route_topologies;
 use crate::ai::v4::capital_route::tactical::{
     capital_route_allows_capture_at, capital_route_capture_target_is_reserved,
     capital_route_is_recovering, capital_route_waypoint,
 };
 use crate::ai::v4::capital_route::topology::{
     armored_entry_bridge_gates, armored_step_distances, capital_route_topology_for,
-    prepare_capital_route_topologies, same_land_capital_front_reached, same_land_route_fronts,
+    same_land_capital_front_reached, same_land_route_fronts,
 };
 use crate::ai::v4::extended::{build_operations, combat_plan_input};
 use crate::ai::v4::test_support::*;
-use crate::ai::v4::*;
+use crate::ai::v4::{
+    CampaignPlanningObjective, Entity, Faction, GridPosition, HashMap, HashSet, Health, Map,
+    MasterDataRegistry, MissionType, MovementType, OperationKind, PlayerId, Property, ReachCtx,
+    SquadId, Terrain, UnitSnapshot, UnitStats, UnitType, World, assignment, operation,
+    victory_roadmap,
+};
 use crate::resources::GridTopology;
 
 #[test]

@@ -368,3 +368,8 @@ pub struct EnemyProductionForecastTrace {
     pub mean_absolute_unit_error: u32,
     pub mean_absolute_cost_error: u32,
 }
+
+/// 物件契約と保護供給の帰属を照合する任意の診断出力。
+pub(in crate::ai::v4) fn campaign_scope_audit_enabled() -> bool {
+    std::env::var_os("OPENWARS_CAMPAIGN_SCOPE_AUDIT").is_some()
+}

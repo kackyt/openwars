@@ -7,7 +7,10 @@ use crate::ai::v4::capital_route::model::{
 };
 use crate::ai::v4::capital_route::node_operation::capital_route_node_exit_satisfied;
 use crate::ai::v4::capital_route::topology::capital_route_topology_for;
-use crate::ai::v4::*;
+use crate::ai::v4::{
+    BTreeSet, Entity, Faction, GridPosition, HashMap, Health, Map, MasterDataRegistry, PlayerId,
+    Property, Terrain, UnitStats, World, get_valid_movement_cost, operation,
+};
 
 /// 未完了Capture Nodeの施設セルを、占領可能unitのために予約する。
 ///

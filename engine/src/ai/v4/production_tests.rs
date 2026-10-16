@@ -6,7 +6,7 @@ use crate::ai::v4::capital_route::model::{
     CapitalRouteCommitment, CapitalRouteExecutionPhase, CapitalRouteId, CapitalRouteNodeId,
     CapitalRouteNodeObjective, CapitalRouteNodeScope, CapitalRoutePathRegistry,
 };
-use crate::ai::v4::capital_route::topology::prepare_capital_route_topologies;
+use crate::ai::v4::capital_route::prepare_capital_route_topologies;
 use crate::ai::v4::enemy_forecast::{
     EnemyReinforcementEnvelope, ReinforcementScenario, projected_enemy_reinforcement_envelope,
 };
@@ -1925,7 +1925,9 @@ fn board_scan_is_independent_of_ecs_storage_order() {
                 .id(),
         );
     }
-    let before = BoardScan::collect(&mut world, player).unwrap();
+    let prepared = strategy_pipeline::prepare_production_scan(&mut world, player);
+    let queries = board_scan::BoardScanQueries::prepare(&mut world);
+    let before = BoardScan::collect(&world, player, prepared.as_ref(), &queries).unwrap();
     // ゲーム上の状態を変えずにECS内の格納先だけを変える。
     // 走査順が計画入力へ漏れると、同じseedでも攻撃順・購入編成が変わる。
     world.entity_mut(entities[0]).insert(CargoCapacity {
@@ -1936,7 +1938,9 @@ fn board_scan_is_independent_of_ecs_storage_order() {
         max: 0,
         loaded: Vec::new(),
     });
-    let after = BoardScan::collect(&mut world, player).unwrap();
+    let prepared = strategy_pipeline::prepare_production_scan(&mut world, player);
+    let queries = board_scan::BoardScanQueries::prepare(&mut world);
+    let after = BoardScan::collect(&world, player, prepared.as_ref(), &queries).unwrap();
     let ids = |units: &[UnitSnapshot]| units.iter().map(|unit| unit.entity).collect::<Vec<_>>();
     assert_eq!(before.my_units.len(), 2);
     assert_eq!(before.enemy_units.len(), 2);

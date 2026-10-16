@@ -4,8 +4,10 @@ use crate::ai::v4::capital_route::model::{
     CapitalRoute, CapitalRouteId, CapitalRouteNode, CapitalRouteNodeId, CapitalRouteTopology,
     CapitalRouteTopologyKey, CapitalRouteTopologyRegistry,
 };
-use crate::ai::v4::capital_route::node_operation::ensure_capital_route_node_operations;
-use crate::ai::v4::*;
+use crate::ai::v4::{
+    GridPosition, HashMap, HashSet, Map, MasterDataRegistry, MovementType, PlayerId, Property,
+    Terrain, VecDeque, World, get_valid_movement_cost,
+};
 
 /// 同一陸塊の首都攻略本隊を解放できるだけ、勝利ルート上の前線が進んだかを判定する。
 /// 後方・側方の補助目標の所有数は、首都へ向かう主線のGo条件には含めない。
@@ -578,7 +580,7 @@ pub(in crate::ai::v4) fn build_capital_route_topology(
 }
 
 /// V4の手番開始時に、同一陸塊の首都戦役を一度だけ解析してResourceへ保存する。
-pub(crate) fn prepare_capital_route_topologies(world: &mut World, player_id: PlayerId) {
+pub(super) fn cache_capital_route_topologies(world: &mut World, player_id: PlayerId) {
     let island_ids = world
         .get_resource::<crate::ai::islands::IslandMap>()
         .map(|island_map| {
@@ -610,7 +612,6 @@ pub(crate) fn prepare_capital_route_topologies(world: &mut World, player_id: Pla
         registry.topologies.extend(newly_built);
         world.insert_resource(registry);
     }
-    ensure_capital_route_node_operations(world, player_id);
 }
 
 /// 指定島が自首都と敵首都をともに含む、陸路主体の首都戦役かを返す。

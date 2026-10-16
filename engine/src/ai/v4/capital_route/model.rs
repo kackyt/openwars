@@ -1,6 +1,8 @@
 //! 首都ルートDAGの型と台帳。所属の正本はSquadの作戦IDで参照する。
 
-use crate::ai::v4::*;
+use crate::ai::v4::{
+    self, Entity, GridPosition, HashMap, HashSet, PlayerId, Resource, SquadId, victory_roadmap,
+};
 
 /// 同一陸塊Campaignで、どの橋を地上部隊が実際に越えたかを保持する。
 /// 橋の向こうで北南の進軍路が再合流する地図でも、片方を越えただけで両方を

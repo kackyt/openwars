@@ -1,6 +1,9 @@
 //! 敵生産の観測学習と増援予測。
 
-use crate::ai::v4::*;
+use crate::ai::v4::{
+    BoardScan, EnemyProductionForecastTrace, Entity, GridPosition, HashMap, HashSet, OperationKind,
+    PlayerId, ReachCtx, Resource, UnitType, VecDeque, World, enemy_facility_arrival,
+};
 
 /// Expectedへ入れる敵生産の波数。Expectedは毎ターン再評価する直近波であり、
 /// 作戦期限全体の全生産を一括で仮想敵へ積むStressとは意図的に分ける。

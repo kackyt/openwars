@@ -7,7 +7,10 @@ use crate::ai::v4::capital_route::model::{
     CapitalRouteTopology, CapitalRouteTopologyRegistry,
 };
 use crate::ai::v4::capital_route::topology::capital_route_topology_for;
-use crate::ai::v4::*;
+use crate::ai::v4::{
+    Faction, GridPosition, HashMap, HashSet, Health, Map, MovementType, PlayerId, Property,
+    Terrain, UnitStats, VecDeque, World, operation, victory_roadmap,
+};
 
 /// Nodeの戦術地域を、前後Nodeではなくanchor近傍の実セルから構築する。
 pub(in crate::ai::v4) fn capital_route_node_control_area(

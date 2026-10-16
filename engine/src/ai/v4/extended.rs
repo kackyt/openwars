@@ -3,8 +3,9 @@
 //! 親モジュールはmain互換の実装を持ち、本文の異なる関数は
 //! `crate::ai::code_path::is_extended()` でここへ委譲する。
 
-use super::board_scan::{campaign_scope_audit_enabled, scanned_occupants};
+use super::board_scan::scanned_occupants;
 use super::property_control::PlannedCaptureUnit;
+use super::trace::campaign_scope_audit_enabled;
 use super::*;
 use crate::ai::v4::capital_route::model::{
     AdvancingCapitalRouteEntities, CapitalRoutePathRegistry,
@@ -64,7 +65,9 @@ pub(crate) fn decide_production_v4(
         return issue_from_turn_plan(world, turn, turn_plan);
     }
 
-    let Some(mut scan) = BoardScan::collect(world, player_id) else {
+    let prepared = strategy_pipeline::prepare_production_scan(world, player_id);
+    let queries = board_scan::BoardScanQueries::prepare(world);
+    let Some(mut scan) = BoardScan::collect(world, player_id, prepared.as_ref(), &queries) else {
         world.insert_resource(turn_plan);
         return Vec::new();
     };

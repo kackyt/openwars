@@ -246,7 +246,11 @@ mod tests {
     }
 }
 
-use crate::ai::v4::*;
+use crate::ai::v4::{
+    BoardScan, CAPTURE_COMPLETION_TURNS, Entity, GridPosition, HashSet, Operation,
+    ProductionAttackProjection, ReachCtx, SlotCandidate, ThreatTarget, UnitSnapshot, UnitStats,
+    UnitType, best_damage, can_join_operation, property_control,
+};
 /// ユーザー指定の「T6までの物件到達・敵占領妨害」を、固定評価点ではなく
 /// 短期厳密シミュレーションの時間境界として表す。
 pub(in crate::ai::v4) const EARLY_PROPERTY_CONTROL_HORIZON: u32 = 6;

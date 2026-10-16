@@ -1,6 +1,5 @@
 //! 陸続きルートの兵力需要と突破実績。
 
-use crate::ai::v4::board_scan::campaign_scope_audit_enabled;
 use crate::ai::v4::capital_route::model::{
     RouteBreakthroughKey, RouteBreakthroughRegistry, RouteForceDemand,
 };
@@ -9,7 +8,13 @@ use crate::ai::v4::capital_route::topology::{
     armored_entry_bridge_gates, armored_step_distances, movement_step_distances,
     same_land_armored_route_gates, same_land_route_fronts, terrain_component_membership,
 };
-use crate::ai::v4::*;
+use crate::ai::v4::trace::campaign_scope_audit_enabled;
+use crate::ai::v4::{
+    CampaignPlanningObjective, Entity, Faction, GridPosition, HashMap, HashSet, Health, Map,
+    MasterDataRegistry, MovementType, OperationKind, PlayerId, Property, Terrain, UnitRegistry,
+    UnitSnapshot, UnitStats, UnitType, World, assignment, get_valid_movement_cost,
+    property_control,
+};
 
 /// 地形・経済・現有戦力から、首都攻略の各進軍軸の需要を一括で作る。
 ///
