@@ -245,7 +245,11 @@ pub(super) fn campaign_assignment_capture_responsibilities(
     // 同一陸地の首都戦役では余剰占領兵を別施設へ展開する。海洋戦では上陸点へ
     // 戦力を集中する必要があるため、従来どおり同じ目標への増援を許す。
     let spread_over_land_routes =
-        crate::ai::v4::is_same_land_capital_island(world, player_id, assignment.island_id);
+        crate::ai::v4::capital_route::topology::is_same_land_capital_island(
+            world,
+            player_id,
+            assignment.island_id,
+        );
     let mut claimed_targets = responsibilities
         .iter()
         .map(|responsibility| responsibility.target)
@@ -316,15 +320,20 @@ pub(super) fn campaign_combat_responsibilities(
         })
         .collect();
 
-    let route_fronts = crate::ai::v4::same_land_route_fronts(world, player_id, island_id);
+    let route_fronts =
+        crate::ai::v4::capital_route::topology::same_land_route_fronts(world, player_id, island_id);
     if route_fronts.len() >= 2 {
         let Some(map) = world.get_resource::<Map>() else {
             return Vec::new();
         };
         let pending_bridgeheads =
-            crate::ai::v4::same_land_pending_bridgeheads(world, player_id, island_id);
+            crate::ai::v4::capital_route::force_demand::same_land_pending_bridgeheads(
+                world, player_id, island_id,
+            );
         let breakthrough_positions =
-            crate::ai::v4::same_land_route_breakthrough_positions(world, player_id, island_id);
+            crate::ai::v4::capital_route::force_demand::same_land_route_breakthrough_positions(
+                world, player_id, island_id,
+            );
         let nearest_front = |position: GridPosition| {
             route_fronts
                 .iter()
@@ -338,8 +347,13 @@ pub(super) fn campaign_combat_responsibilities(
                 .map_or(0, |(index, _)| index)
         };
         let route_demands =
-            crate::ai::v4::same_land_route_force_demands(world, player_id, island_id);
-        let route_slots = crate::ai::v4::apportion_route_force_slots(members.len(), &route_demands);
+            crate::ai::v4::capital_route::force_demand::same_land_route_force_demands(
+                world, player_id, island_id,
+            );
+        let route_slots = crate::ai::v4::capital_route::force_demand::apportion_route_force_slots(
+            members.len(),
+            &route_demands,
+        );
         let route_members = distribute_members_across_route_fronts(
             world,
             map,
@@ -515,8 +529,12 @@ pub(super) fn prepare_campaign_local_assignment_scoped(
                 && combat_responsibilities
                     .iter()
                     .all(|responsibility| responsibility.mission_type == MissionType::Defense)
-                && crate::ai::v4::same_land_route_fronts(world, player_id, assignment.island_id)
-                    .len()
+                && crate::ai::v4::capital_route::topology::same_land_route_fronts(
+                    world,
+                    player_id,
+                    assignment.island_id,
+                )
+                .len()
                     < 2
             {
                 // 接近中でまだ島内に敵がいない場合は、防衛対象をばらけさせず

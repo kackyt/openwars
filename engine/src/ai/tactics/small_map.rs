@@ -373,10 +373,14 @@ impl SmallMapUnit {
             .get_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>()
             .and_then(|registry| registry.attack_target(entity));
         let route_tactical_target =
-            crate::ai::v4::capital_route_tactical_target(world, player_id, entity);
+            crate::ai::v4::capital_route::tactical::capital_route_tactical_target(
+                world, player_id, entity,
+            );
         // 回復中のDAG Entityは、所属をDAGに残したまま通常の回復探索を使う
         // （古いSquad目標を渡すと、修理ではなく横の拠点へ戻る）。
-        let recovering = crate::ai::v4::capital_route_is_recovering(world, player_id, entity);
+        let recovering = crate::ai::v4::capital_route::tactical::capital_route_is_recovering(
+            world, player_id, entity,
+        );
         let campaign =
             match campaign_action_context(world, player_id, entity, &tactical.squads.manager) {
                 Ok(context) => context,
@@ -409,9 +413,10 @@ impl SmallMapUnit {
         };
         let route = RouteOrders {
             tactical_target: route_tactical_target,
-            advance_destination: crate::ai::v4::capital_route_advance_destination(
-                world, player_id, entity, &reachable,
-            ),
+            advance_destination:
+                crate::ai::v4::capital_route::tactical::capital_route_advance_destination(
+                    world, player_id, entity, &reachable,
+                ),
         };
         let starts_on_own_production = board
             .own_production
@@ -533,7 +538,7 @@ fn small_map_capture_target(
         .or(board.tactical.squads.target(unit.entity))
         .filter(|target| {
             has_capturable_property_at(world, *target, player_id)
-                && crate::ai::v4::capital_route_allows_capture_at(
+                && crate::ai::v4::capital_route::tactical::capital_route_allows_capture_at(
                     world,
                     player_id,
                     unit.entity,
@@ -591,7 +596,7 @@ fn candidate_tiles(
             .iter()
             .copied()
             .filter(|(x, y)| {
-                crate::ai::v4::capital_route_allows_tactical_position(
+                crate::ai::v4::capital_route::tactical::capital_route_allows_tactical_position(
                     world,
                     tactical.player_id,
                     unit.entity,
@@ -633,7 +638,7 @@ fn candidate_tiles(
                     *site == position && *owner != Some(tactical.player_id)
                 });
                 !is_unowned
-                    || !crate::ai::v4::is_capture_target_reserved(
+                    || !crate::ai::v4::capital_route::tactical::is_capture_target_reserved(
                         world,
                         tactical.player_id,
                         position,
@@ -856,7 +861,7 @@ fn consider_capture(
     best: &mut BestAction,
 ) {
     if !tile.actions.can_capture
-        || !crate::ai::v4::capital_route_allows_capture_at(
+        || !crate::ai::v4::capital_route::tactical::capital_route_allows_capture_at(
             world,
             board.tactical.player_id,
             unit.state.entity,

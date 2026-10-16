@@ -457,7 +457,9 @@ fn wait_is_temporarily_blocked_by_unacted_friendly(
     if *target_pos != position {
         return false;
     }
-    let objective = match crate::ai::v4::capital_route_tactical_target(world, player_id, entity) {
+    let objective = match crate::ai::v4::capital_route::tactical::capital_route_tactical_target(
+        world, player_id, entity,
+    ) {
         Some(target) => target,
         None => squad_target,
     };

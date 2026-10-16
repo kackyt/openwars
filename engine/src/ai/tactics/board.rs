@@ -86,8 +86,10 @@ impl SquadRoles {
                 }
                 missions.insert(member, squad.plan.mission_type.clone());
                 if let Some(target) =
-                    crate::ai::v4::capital_route_tactical_target(world, player_id, member)
-                        .unwrap_or(squad.plan.target)
+                    crate::ai::v4::capital_route::tactical::capital_route_tactical_target(
+                        world, player_id, member,
+                    )
+                    .unwrap_or(squad.plan.target)
                 {
                     targets.insert(member, target);
                 }

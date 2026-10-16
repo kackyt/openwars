@@ -12,6 +12,9 @@
 //! 「敵を減らす」と「占領する」は別フェーズではなく同一作戦の別枠として
 //! 同時に立つため、倒してから占領するのではなく並行して進む。
 
+use crate::ai::v4::property_control::PlannedCaptureUnit;
+use crate::ai::v4::property_control::PropertyControlObjective;
+
 pub mod campaign_execution;
 mod combat_profile;
 pub mod deployment;
@@ -5991,6 +5994,14 @@ pub mod property_control;
 pub(crate) mod strategy_pipeline;
 
 // 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
-mod extended;
+mod board_scan;
 #[allow(unused_imports)]
-pub use self::extended::*;
+pub(crate) mod capital_route;
+mod enemy_forecast;
+mod extended;
+#[cfg(test)]
+mod production_tests;
+#[cfg(test)]
+mod test_support;
+
+pub use capital_route::commitment::capital_route_diagnostics_for_player;

@@ -298,7 +298,7 @@ fn planning_entry_and_local_assignment_follow_code_path() {
             let expects_extended =
                 direct_extended || path == crate::ai::code_path::CodePath::Extended;
             assert_eq!(
-                world.contains_resource::<crate::ai::v4::CapitalRoutePathRegistry>(),
+                world.contains_resource::<crate::ai::v4::capital_route::model::CapitalRoutePathRegistry>(),
                 expects_extended,
                 "plan入口: path={path:?}, direct={direct_extended}"
             );

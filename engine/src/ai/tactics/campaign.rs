@@ -47,8 +47,10 @@ pub(crate) fn campaign_action_context(
     // 指令に従う。`Some(None)`はanchor直行を止めて局地戦術へ任せる明示値であり、
     // その場合に古いSquad目標へフォールバックしてはならない。
     let target = if crate::ai::code_path::is_extended_at("engine.rs::campaign_action_context") {
-        crate::ai::v4::capital_route_tactical_target(world, player_id, entity)
-            .unwrap_or(squad.plan.target)
+        crate::ai::v4::capital_route::tactical::capital_route_tactical_target(
+            world, player_id, entity,
+        )
+        .unwrap_or(squad.plan.target)
     } else {
         squad.plan.target
     };
@@ -135,7 +137,9 @@ mod tests {
         assert!(campaign_action_context(&world, player, detached, &manager).is_err());
         // DAG指令もSquadIdで引くため、現在bindingの無いEntityには指令が無い。
         assert_eq!(
-            crate::ai::v4::capital_route_tactical_target(&world, player, detached),
+            crate::ai::v4::capital_route::tactical::capital_route_tactical_target(
+                &world, player, detached
+            ),
             None
         );
         assert_eq!(

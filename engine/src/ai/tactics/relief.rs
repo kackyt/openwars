@@ -162,7 +162,7 @@ fn collect_relief_groups(
                     let route_target = is_extended_path
                         .then(|| {
                             squad.members.iter().find_map(|entity| {
-                                crate::ai::v4::capital_route_tactical_target(
+                                crate::ai::v4::capital_route::tactical::capital_route_tactical_target(
                                     world, player_id, *entity,
                                 )
                             })
@@ -322,7 +322,9 @@ fn select_relief_action_for_unit(
     // 選ぶと、map_25で敵側Nodeとは逆の旧Squad.targetへ初手だけ逸脱する。
     let route_destination = is_extended_path
         .then(|| {
-            crate::ai::v4::capital_route_advance_destination(world, player_id, entity, &reachable)
+            crate::ai::v4::capital_route::tactical::capital_route_advance_destination(
+                world, player_id, entity, &reachable,
+            )
         })
         .flatten()
         .map(|target| (target.x, target.y))

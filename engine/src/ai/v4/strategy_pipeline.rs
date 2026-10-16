@@ -22,15 +22,21 @@ pub(crate) fn prepare_strategy(
     if !uses_small_map_expansion(world, player_id) {
         return;
     }
-    super::prepare_capital_route_topologies(world, player_id);
-    super::refine_same_land_route_milestones(world, player_id, portfolio);
-    super::observe_same_land_route_bridgeheads(world, player_id, &portfolio.active_offensives);
+    crate::ai::v4::capital_route::topology::prepare_capital_route_topologies(world, player_id);
+    crate::ai::v4::capital_route::force_demand::refine_same_land_route_milestones(
+        world, player_id, portfolio,
+    );
+    crate::ai::v4::capital_route::force_demand::observe_same_land_route_bridgeheads(
+        world,
+        player_id,
+        &portfolio.active_offensives,
+    );
 }
 
 /// Squad解析の前にDAGを確実に初期化する。Strategy単体テストもこの順序に依存しない。
 pub(crate) fn before_squad_planning(world: &mut World, player_id: PlayerId) {
     if uses_small_map_expansion(world, player_id) {
-        super::prepare_capital_route_topologies(world, player_id);
+        crate::ai::v4::capital_route::topology::prepare_capital_route_topologies(world, player_id);
     }
 }
 
@@ -60,6 +66,8 @@ pub(crate) fn after_squad_planning(
     if !uses_small_map_expansion(world, player_id) {
         return;
     }
-    super::refresh_capital_route_path_commitments(world, player_id, manager);
+    crate::ai::v4::capital_route::commitment::refresh_capital_route_path_commitments(
+        world, player_id, manager,
+    );
     super::victory_roadmap::observe_adopted_campaign_roadmap(world, player_id, portfolio, manager);
 }

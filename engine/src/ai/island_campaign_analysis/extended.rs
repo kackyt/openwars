@@ -158,7 +158,9 @@ pub(super) fn candidate_capture_target_positions(
         .map(|snapshot| snapshot.position);
 
     let route_fronts = if let (Some(own_cap), Some(enemy_cap)) = (own_capital, enemy_capital) {
-        crate::ai::v4::armored_capital_route_fronts(map, registry, own_cap, enemy_cap)
+        crate::ai::v4::capital_route::topology::armored_capital_route_fronts(
+            map, registry, own_cap, enemy_cap,
+        )
     } else {
         Vec::new()
     };
