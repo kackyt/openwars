@@ -128,6 +128,53 @@ pub(crate) fn decide_production_v4(
 
 /// 盤面から作戦の一覧を組み立てる。
 /// 分析関数として副作用を持たず、契約レジストリの同期は呼び出し元で行う。
+type CampaignClusters<'a> = Vec<(&'a CampaignPlanningObjective, Vec<GridPosition>)>;
+struct OperationSources<'a> {
+    campaign_clusters: CampaignClusters<'a>,
+    island_map: crate::ai::islands::IslandMap,
+}
+impl<'a> OperationSources<'a> {
+    fn campaign_for_cluster(
+        &self,
+        kind: OperationKind,
+        cluster: &[GridPosition],
+    ) -> Option<&'a CampaignPlanningObjective> {
+        self.campaign_clusters
+            .iter()
+            .find_map(|(objective, properties)| {
+                (objective.kind == kind
+                    && cluster.iter().any(|property| properties.contains(property)))
+                .then_some(*objective)
+            })
+            .or_else(|| {
+                // Capture→Defense/Contestの遷移でも、島そのものが同じなら同一campaign。
+                self.campaign_clusters.iter().find_map(|(objective, _)| {
+                    cluster
+                        .iter()
+                        .any(|property| {
+                            self.island_map
+                                .get_island_at(property)
+                                .is_some_and(|island| island.id == objective.island_id)
+                        })
+                        .then_some(*objective)
+                })
+            })
+    }
+}
+struct OperationLayout {
+    anchors: Vec<GridPosition>,
+    horizons: Vec<u32>,
+    assignment_enabled: Vec<bool>,
+    operation_leads: Vec<u32>,
+}
+struct OperationAssembly<'a, 'b> {
+    scan: &'a BoardScan,
+    reference: &'a UnitStats,
+    active_objectives: &'a [ActivePlanObjective],
+    sources: &'a OperationSources<'b>,
+    layout: &'a OperationLayout,
+    property_control_plans: &'a [Option<property_control::PropertyControlPlan>],
+}
 pub(super) fn build_operations(
     scan: &BoardScan,
     ctx: &mut ReachCtx,
@@ -141,6 +188,33 @@ pub(super) fn build_operations(
     // V4の作戦源は、島campaignが選んだCapture/Defenseと、既に実行を始めた
     // Combat planだけに限定する。全未所有拠点を距離で束ねる第二の目標選定器を
     // 併用すると、勝利ロードマップ外の前線へ生産予算が流れるためである。
+    let (raw, sources) = collect_operation_sources(scan, active_objectives);
+    let scored = score_operation_candidates(scan, active_objectives, &reference, raw, &sources);
+    let property_control_plans = select_property_controls(scan, ctx, &scored, player_id);
+    let layout =
+        prepare_operation_layout(scan, &reference, &scored, &sources, &property_control_plans);
+    let input = OperationAssembly {
+        scan,
+        reference: &reference,
+        active_objectives,
+        sources: &sources,
+        layout: &layout,
+        property_control_plans: &property_control_plans,
+    };
+    scored
+        .into_iter()
+        .enumerate()
+        .map(|(index, candidate)| assemble_operation(&input, ctx, index, candidate, player_id))
+        .collect()
+}
+
+fn collect_operation_sources<'a>(
+    scan: &'a BoardScan,
+    active_objectives: &[ActivePlanObjective],
+) -> (
+    Vec<(OperationKind, Vec<GridPosition>)>,
+    OperationSources<'a>,
+) {
     let mut raw = active_objectives
         .iter()
         .filter(|objective| !objective.properties.is_empty())
@@ -198,38 +272,34 @@ pub(super) fn build_operations(
             .map(|(objective, cluster)| (objective.kind, cluster.clone())),
     );
 
-    let campaign_for_cluster = |kind: OperationKind, cluster: &[GridPosition]| {
-        campaign_clusters
-            .iter()
-            .find_map(|(objective, properties)| {
-                (objective.kind == kind
-                    && cluster.iter().any(|property| properties.contains(property)))
-                .then_some(*objective)
-            })
-            .or_else(|| {
-                // Capture→Defense/Contestの遷移でも、島そのものが同じなら同一campaign。
-                campaign_clusters.iter().find_map(|(objective, _)| {
-                    cluster
-                        .iter()
-                        .any(|property| {
-                            island_map
-                                .get_island_at(property)
-                                .is_some_and(|island| island.id == objective.island_id)
-                        })
-                        .then_some(*objective)
-                })
-            })
-    };
+    (
+        raw,
+        OperationSources {
+            campaign_clusters,
+            island_map,
+        },
+    )
+}
 
+fn score_operation_candidates(
+    scan: &BoardScan,
+    active_objectives: &[ActivePlanObjective],
+    reference: &UnitStats,
+    mut raw: Vec<(OperationKind, Vec<GridPosition>)>,
+    sources: &OperationSources<'_>,
+) -> Vec<OperationCandidate> {
     // 継続中Planのsnapshotと当ターンRoadmapは、同じ島・同じ目的のOperationを
     // 同時に提示し得る。両方を別候補として残すと同じAssaultCapitalがCapture枠を
     // 二重要求し、戦闘生産を毎ターン2体分の歩兵で圧迫する。Plan継続性は後段の
     // `continuing` で合流できるため、campaign identityごとに一件へ正規化する。
     let mut seen_campaign_operations = HashSet::default();
     raw.retain(|(kind, cluster)| {
-        campaign_for_cluster(*kind, cluster).is_none_or(|objective| {
-            seen_campaign_operations.insert((objective.kind.priority_rank(), objective.island_id))
-        })
+        sources
+            .campaign_for_cluster(*kind, cluster)
+            .is_none_or(|objective| {
+                seen_campaign_operations
+                    .insert((objective.kind.priority_rank(), objective.island_id))
+            })
     });
 
     // 上位campaignと永続Planが所有する作戦を必須として識別し、追加の局地候補だけを
@@ -238,12 +308,13 @@ pub(super) fn build_operations(
         .into_iter()
         .filter(|(_, cluster)| !cluster.is_empty())
         .map(|(kind, cluster)| {
-            let campaign = campaign_for_cluster(kind, &cluster);
+            let campaign = sources.campaign_for_cluster(kind, &cluster);
             let anchor =
                 campaign.map_or_else(|| anchor_of(&cluster, scan), |objective| objective.anchor);
             let lead = facility_lead_time(scan, &anchor, reference.max_movement);
             let continuing = active_objectives.iter().any(|objective| {
-                campaign_for_cluster(kind, &cluster)
+                sources
+                    .campaign_for_cluster(kind, &cluster)
                     .is_some_and(|campaign| objective.island_id == Some(campaign.island_id))
                     || (objective.island_id.is_none()
                         && objective.kind == kind
@@ -261,7 +332,8 @@ pub(super) fn build_operations(
         })
         .collect();
     scored.sort_by_key(|candidate| {
-        let logistics_rank = campaign_for_cluster(candidate.kind, &candidate.cluster)
+        let logistics_rank = sources
+            .campaign_for_cluster(candidate.kind, &candidate.cluster)
             .and_then(|objective| objective.logistics_rank)
             .unwrap_or(u32::MAX);
         (
@@ -273,14 +345,23 @@ pub(super) fn build_operations(
             usize::MAX - candidate.cluster.len(),
         )
     });
-    let scored = select_operation_candidates(scored);
 
+    select_operation_candidates(scored)
+}
+
+fn select_property_controls(
+    scan: &BoardScan,
+    ctx: &mut ReachCtx,
+    scored: &[OperationCandidate],
+    player_id: PlayerId,
+) -> Vec<Option<property_control::PropertyControlPlan>> {
     // Capture clusterは代表点一つで評価せず、敵占領役ごとに成立する物件制御を選ぶ。
     // これにより中央が間に合わない場合も、左右の合法なInterdictを候補に残す。
     let neutral_race_owner = scored
         .iter()
         .position(|candidate| candidate.kind == OperationKind::Capture);
-    let property_control_plans = scored
+
+    scored
         .iter()
         .enumerate()
         .map(|(index, candidate)| {
@@ -328,17 +409,28 @@ pub(super) fn build_operations(
                 player_id,
             )
         })
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>()
+}
+
+fn prepare_operation_layout(
+    scan: &BoardScan,
+    reference: &UnitStats,
+    scored: &[OperationCandidate],
+    sources: &OperationSources<'_>,
+    property_control_plans: &[Option<property_control::PropertyControlPlan>],
+) -> OperationLayout {
     let anchors: Vec<GridPosition> = scored
         .iter()
-        .zip(&property_control_plans)
+        .zip(property_control_plans)
         .map(|(candidate, property_control_plan)| {
             property_control_plan.as_ref().map_or_else(
                 || {
-                    campaign_for_cluster(candidate.kind, &candidate.cluster).map_or_else(
-                        || anchor_of(&candidate.cluster, scan),
-                        |objective| objective.staging_anchor,
-                    )
+                    sources
+                        .campaign_for_cluster(candidate.kind, &candidate.cluster)
+                        .map_or_else(
+                            || anchor_of(&candidate.cluster, scan),
+                            |objective| objective.staging_anchor,
+                        )
                 },
                 |plan| plan.primary.property,
             )
@@ -356,217 +448,236 @@ pub(super) fn build_operations(
     let assignment_enabled = scored
         .iter()
         .map(|candidate| {
-            campaign_for_cluster(candidate.kind, &candidate.cluster).is_none_or(|objective| {
-                objective.kind != OperationKind::AssaultCapital || objective.execution_authorized
-            })
+            sources
+                .campaign_for_cluster(candidate.kind, &candidate.cluster)
+                .is_none_or(|objective| {
+                    objective.kind != OperationKind::AssaultCapital
+                        || objective.execution_authorized
+                })
         })
         .collect::<Vec<_>>();
+    OperationLayout {
+        anchors,
+        horizons,
+        assignment_enabled,
+        operation_leads,
+    }
+}
+
+fn assemble_operation(
+    input: &OperationAssembly<'_, '_>,
+    ctx: &mut ReachCtx,
+    index: usize,
+    candidate: OperationCandidate,
+    player_id: PlayerId,
+) -> Operation {
+    let OperationAssembly {
+        scan,
+        reference,
+        active_objectives,
+        sources,
+        layout,
+        property_control_plans,
+    } = *input;
+    let OperationLayout {
+        anchors,
+        horizons,
+        assignment_enabled,
+        operation_leads,
+    } = layout;
     let empty_entity_set = HashSet::default();
-
-    scored
-        .into_iter()
-        .enumerate()
-        .map(|(index, candidate)| {
-            let OperationCandidate { kind, cluster, .. } = candidate;
-            let anchor = anchors[index];
-            let property_control_plan = property_control_plans[index].clone();
-            let property_control = property_control_plan.as_ref().map(|plan| plan.primary);
-            let lead = operation_leads[index];
-            let planning_objective = campaign_for_cluster(kind, &cluster);
-            let forced_target_enemies = planning_objective
-                .map(|objective| &objective.forced_target_enemies)
-                .or_else(|| {
-                    active_objectives
-                        .iter()
-                        .find(|objective| {
-                            planning_objective.is_some_and(|campaign| {
-                                objective.island_id == Some(campaign.island_id)
-                            }) || (objective.island_id.is_none()
-                                && objective.kind == kind
-                                && objective.properties == cluster)
-                        })
-                        .map(|objective| &objective.target_enemies)
+    let OperationCandidate { kind, cluster, .. } = candidate;
+    let anchor = anchors[index];
+    let property_control_plan = property_control_plans[index].clone();
+    let property_control = property_control_plan.as_ref().map(|plan| plan.primary);
+    let lead = operation_leads[index];
+    let planning_objective = sources.campaign_for_cluster(kind, &cluster);
+    let forced_target_enemies = planning_objective
+        .map(|objective| &objective.forced_target_enemies)
+        .or_else(|| {
+            active_objectives
+                .iter()
+                .find(|objective| {
+                    planning_objective
+                        .is_some_and(|campaign| objective.island_id == Some(campaign.island_id))
+                        || (objective.island_id.is_none()
+                            && objective.kind == kind
+                            && objective.properties == cluster)
                 })
-                .unwrap_or(&empty_entity_set);
-            let protected_capture_entities = planning_objective
-                .map(|objective| &objective.protected_capture_entities)
-                .unwrap_or(&empty_entity_set);
-            let mut local_forced_target_enemies = forced_target_enemies.clone();
-            if let Some(plan) = property_control_plan.as_ref() {
-                local_forced_target_enemies.extend(
-                    plan.controls
-                        .iter()
-                        .filter(|control| control.disaggregated)
-                        .map(|control| control.enemy_entity),
-                );
-            }
-            let mut operation = build_operation(
-                scan,
-                ctx,
-                &reference,
-                kind,
-                anchor,
-                &anchors,
-                &horizons,
-                &assignment_enabled,
-                &cluster,
-                &local_forced_target_enemies,
-                protected_capture_entities,
-                lead,
-                player_id,
-            );
-            operation.property_control = property_control;
-            if let Some(plan) = property_control_plan {
-                operation.property_controls = plan.controls;
-                let current_capture_facility_capacity = scan
-                    .free_facilities
-                    .iter()
-                    .filter(|(_, terrain)| {
-                        scan.available_types.iter().any(|(unit_type, stats)| {
-                            stats.can_capture && scan.can_produce(*terrain, *unit_type)
-                        })
-                    })
-                    .count();
-                // 既にこの作戦へ確保済みの占領役は先頭レーンを担当済みとみなし、
-                // 今回新規に必要な任務先だけを残す。今手番に占領役を作れない施設数を
-                // 超えて仮想保護対象を要求せず、作戦自身の対象クラスタの未所有拠点数および
-                // 最大波サイズに従う。別前線の遠隔物件まで先取りして戦闘予算を枯渇させない。
-                let cluster_target_cap = cluster
-                    .iter()
-                    .filter(|p| scan.open_properties.contains(p))
-                    .count();
-                let is_small_map_expansion =
-                    scan.opening_policy == Some(OpeningProductionPolicy::SmallMapExpansion);
-                let mut capture_lanes = plan.capture_lanes;
-                if is_small_map_expansion && let Some(my_cap) = scan.capital_position {
-                    let enemy_cap = scan
-                        .enemy_facilities
-                        .iter()
-                        .find_map(|f| (f.terrain == Terrain::Capital).then_some(f.pos));
-                    capture_lanes.sort_by(|a, b| {
-                        let d_my_a = scan.map.distance(a.x, a.y, my_cap.x, my_cap.y);
-                        let d_my_b = scan.map.distance(b.x, b.y, my_cap.x, my_cap.y);
-                        let d_en_a = enemy_cap
-                            .map(|ec| scan.map.distance(a.x, a.y, ec.x, ec.y))
-                            .unwrap_or(0);
-                        let d_en_b = enemy_cap
-                            .map(|ec| scan.map.distance(b.x, b.y, ec.x, ec.y))
-                            .unwrap_or(0);
-                        d_my_b
-                            .cmp(&d_my_a)
-                            .then_with(|| d_en_a.cmp(&d_en_b))
-                            .then_with(|| (a.y, a.x).cmp(&(b.y, b.x)))
-                    });
-                }
-                operation.capture_lane_targets = capture_lanes
-                    .into_iter()
-                    .skip(operation.facts.friendly_capture_units_committed as usize)
-                    .take(current_capture_facility_capacity)
-                    .take(cluster_target_cap.max(1))
-                    .take(MAX_CAPTURE_SLOTS as usize)
-                    .collect();
-                operation.slots.capture_units =
-                    u32::try_from(operation.capture_lane_targets.len()).unwrap_or(u32::MAX);
-            } else if kind == OperationKind::Capture {
-                // 敵競合が存在せず物件制御計画が成立しない平時Capture作戦でも、
-                // cluster内の未取得拠点を重複なく割り当て、同一anchorへの二重配備を防ぐ。
-                let is_anchor_open =
-                    scan.open_properties.contains(&anchor) && cluster.contains(&anchor);
-                let mut targets = Vec::new();
-                if is_anchor_open {
-                    targets.push(anchor);
-                }
-                let mut rest: Vec<GridPosition> = cluster
-                    .iter()
-                    .copied()
-                    .filter(|p| {
-                        scan.open_properties.contains(p) && (!is_anchor_open || *p != anchor)
-                    })
-                    .collect();
-                rest.sort_unstable_by_key(|p| {
-                    (scan.map.distance(anchor.x, anchor.y, p.x, p.y), p.y, p.x)
-                });
-                rest.dedup();
-                targets.extend(rest);
-                operation.capture_lane_targets = targets
-                    .into_iter()
-                    .take(MAX_CAPTURE_SLOTS as usize)
-                    .collect();
-                operation.slots.capture_units = operation
-                    .slots
-                    .capture_units
-                    .min(u32::try_from(operation.capture_lane_targets.len()).unwrap_or(u32::MAX));
-            }
-
-            // NOTE: V4中央作戦契約との同期は呼び出し元（plan_production_with_registry）で実行する
-            if operation
-                .property_controls
-                .iter()
-                .any(|control| control.disaggregated)
-            {
-                // 他の可視脅威を消さず、全ての物件別期限対象を戦闘計画へ含める。
-                for control in &operation.property_controls {
-                    if !operation
-                        .reachable_threats
-                        .iter()
-                        .any(|threat| threat.entity == Some(control.enemy_entity))
-                        && let Some(enemy) = scan
-                            .enemy_units
-                            .iter()
-                            .find(|enemy| enemy.entity == Some(control.enemy_entity))
-                    {
-                        operation
-                            .reachable_threats
-                            .push(ThreatTarget::from_snapshot(enemy));
-                    }
-                }
-                let priority_entities = operation
-                    .property_controls
-                    .iter()
-                    .map(|control| control.enemy_entity)
-                    .collect::<Vec<_>>();
-                operation.reachable_threats.sort_by_key(|threat| {
-                    priority_entities
-                        .iter()
-                        .position(|entity| threat.entity == Some(*entity))
-                        .unwrap_or(usize::MAX)
-                });
-                operation.slots.combat_plan_required =
-                    u32::from(!operation.reachable_threats.is_empty());
-            }
-            if campaign_scope_audit_enabled() {
-                eprintln!(
-                    "CAMPAIGN_SCOPE_AUDIT stage=binding turn={} op_kind={:?} op_anchor={:?} op_properties={:?} bound={:?}",
-                    scan.current_turn,
-                    operation.kind,
-                    operation.anchor,
-                    operation.objective_properties,
-                    planning_objective.map(|objective| (
-                        objective.island_id,
-                        objective.kind,
-                        objective.anchor,
-                        objective.required_capture_survivors,
-                        objective.protected_capture_entities.len(),
-                    )),
-                );
-            }
-            if let Some(objective) = planning_objective {
-                operation.island_id = Some(objective.island_id);
-                operation.staging_anchor = objective.staging_anchor;
-                operation.execution_authorized = objective.execution_authorized;
-                operation.protected_capture_entities = objective.protected_capture_entities.clone();
-                operation.capture_replacement_pending = objective.capture_replacement_pending;
-            } else if let Some(active) = active_objectives
-                .iter()
-                .find(|objective| objective.kind == kind && objective.properties == cluster)
-            {
-                // portfolioがObserveへ一時遷移しても、active Plan由来のOperationは
-                // 島identityを失わない。敵やanchorの変化で新Planへ分裂させない。
-                operation.island_id = active.island_id;
-            }
-            operation
+                .map(|objective| &objective.target_enemies)
         })
-        .collect()
+        .unwrap_or(&empty_entity_set);
+    let protected_capture_entities = planning_objective
+        .map(|objective| &objective.protected_capture_entities)
+        .unwrap_or(&empty_entity_set);
+    let mut local_forced_target_enemies = forced_target_enemies.clone();
+    if let Some(plan) = property_control_plan.as_ref() {
+        local_forced_target_enemies.extend(
+            plan.controls
+                .iter()
+                .filter(|control| control.disaggregated)
+                .map(|control| control.enemy_entity),
+        );
+    }
+    let mut operation = build_operation(
+        scan,
+        ctx,
+        reference,
+        kind,
+        anchor,
+        anchors,
+        horizons,
+        assignment_enabled,
+        &cluster,
+        &local_forced_target_enemies,
+        protected_capture_entities,
+        lead,
+        player_id,
+    );
+    operation.property_control = property_control;
+    if let Some(plan) = property_control_plan {
+        operation.property_controls = plan.controls;
+        let current_capture_facility_capacity = scan
+            .free_facilities
+            .iter()
+            .filter(|(_, terrain)| {
+                scan.available_types.iter().any(|(unit_type, stats)| {
+                    stats.can_capture && scan.can_produce(*terrain, *unit_type)
+                })
+            })
+            .count();
+        // 既にこの作戦へ確保済みの占領役は先頭レーンを担当済みとみなし、
+        // 今回新規に必要な任務先だけを残す。今手番に占領役を作れない施設数を
+        // 超えて仮想保護対象を要求せず、作戦自身の対象クラスタの未所有拠点数および
+        // 最大波サイズに従う。別前線の遠隔物件まで先取りして戦闘予算を枯渇させない。
+        let cluster_target_cap = cluster
+            .iter()
+            .filter(|p| scan.open_properties.contains(p))
+            .count();
+        let is_small_map_expansion =
+            scan.opening_policy == Some(OpeningProductionPolicy::SmallMapExpansion);
+        let mut capture_lanes = plan.capture_lanes;
+        if is_small_map_expansion && let Some(my_cap) = scan.capital_position {
+            let enemy_cap = scan
+                .enemy_facilities
+                .iter()
+                .find_map(|f| (f.terrain == Terrain::Capital).then_some(f.pos));
+            capture_lanes.sort_by(|a, b| {
+                let d_my_a = scan.map.distance(a.x, a.y, my_cap.x, my_cap.y);
+                let d_my_b = scan.map.distance(b.x, b.y, my_cap.x, my_cap.y);
+                let d_en_a = enemy_cap
+                    .map(|ec| scan.map.distance(a.x, a.y, ec.x, ec.y))
+                    .unwrap_or(0);
+                let d_en_b = enemy_cap
+                    .map(|ec| scan.map.distance(b.x, b.y, ec.x, ec.y))
+                    .unwrap_or(0);
+                d_my_b
+                    .cmp(&d_my_a)
+                    .then_with(|| d_en_a.cmp(&d_en_b))
+                    .then_with(|| (a.y, a.x).cmp(&(b.y, b.x)))
+            });
+        }
+        operation.capture_lane_targets = capture_lanes
+            .into_iter()
+            .skip(operation.facts.friendly_capture_units_committed as usize)
+            .take(current_capture_facility_capacity)
+            .take(cluster_target_cap.max(1))
+            .take(MAX_CAPTURE_SLOTS as usize)
+            .collect();
+        operation.slots.capture_units =
+            u32::try_from(operation.capture_lane_targets.len()).unwrap_or(u32::MAX);
+    } else if kind == OperationKind::Capture {
+        // 敵競合が存在せず物件制御計画が成立しない平時Capture作戦でも、
+        // cluster内の未取得拠点を重複なく割り当て、同一anchorへの二重配備を防ぐ。
+        let is_anchor_open = scan.open_properties.contains(&anchor) && cluster.contains(&anchor);
+        let mut targets = Vec::new();
+        if is_anchor_open {
+            targets.push(anchor);
+        }
+        let mut rest: Vec<GridPosition> = cluster
+            .iter()
+            .copied()
+            .filter(|p| scan.open_properties.contains(p) && (!is_anchor_open || *p != anchor))
+            .collect();
+        rest.sort_unstable_by_key(|p| (scan.map.distance(anchor.x, anchor.y, p.x, p.y), p.y, p.x));
+        rest.dedup();
+        targets.extend(rest);
+        operation.capture_lane_targets = targets
+            .into_iter()
+            .take(MAX_CAPTURE_SLOTS as usize)
+            .collect();
+        operation.slots.capture_units = operation
+            .slots
+            .capture_units
+            .min(u32::try_from(operation.capture_lane_targets.len()).unwrap_or(u32::MAX));
+    }
+
+    // NOTE: V4中央作戦契約との同期は呼び出し元（plan_production_with_registry）で実行する
+    if operation
+        .property_controls
+        .iter()
+        .any(|control| control.disaggregated)
+    {
+        // 他の可視脅威を消さず、全ての物件別期限対象を戦闘計画へ含める。
+        for control in &operation.property_controls {
+            if !operation
+                .reachable_threats
+                .iter()
+                .any(|threat| threat.entity == Some(control.enemy_entity))
+                && let Some(enemy) = scan
+                    .enemy_units
+                    .iter()
+                    .find(|enemy| enemy.entity == Some(control.enemy_entity))
+            {
+                operation
+                    .reachable_threats
+                    .push(ThreatTarget::from_snapshot(enemy));
+            }
+        }
+        let priority_entities = operation
+            .property_controls
+            .iter()
+            .map(|control| control.enemy_entity)
+            .collect::<Vec<_>>();
+        operation.reachable_threats.sort_by_key(|threat| {
+            priority_entities
+                .iter()
+                .position(|entity| threat.entity == Some(*entity))
+                .unwrap_or(usize::MAX)
+        });
+        operation.slots.combat_plan_required = u32::from(!operation.reachable_threats.is_empty());
+    }
+    if campaign_scope_audit_enabled() {
+        eprintln!(
+            "CAMPAIGN_SCOPE_AUDIT stage=binding turn={} op_kind={:?} op_anchor={:?} op_properties={:?} bound={:?}",
+            scan.current_turn,
+            operation.kind,
+            operation.anchor,
+            operation.objective_properties,
+            planning_objective.map(|objective| (
+                objective.island_id,
+                objective.kind,
+                objective.anchor,
+                objective.required_capture_survivors,
+                objective.protected_capture_entities.len(),
+            )),
+        );
+    }
+    if let Some(objective) = planning_objective {
+        operation.island_id = Some(objective.island_id);
+        operation.staging_anchor = objective.staging_anchor;
+        operation.execution_authorized = objective.execution_authorized;
+        operation.protected_capture_entities = objective.protected_capture_entities.clone();
+        operation.capture_replacement_pending = objective.capture_replacement_pending;
+    } else if let Some(active) = active_objectives
+        .iter()
+        .find(|objective| objective.kind == kind && objective.properties == cluster)
+    {
+        // portfolioがObserveへ一時遷移しても、active Plan由来のOperationは
+        // 島identityを失わない。敵やanchorの変化で新Planへ分裂させない。
+        operation.island_id = active.island_id;
+    }
+    operation
 }
 
 pub(super) use super::operation_threat_horizon;
@@ -948,6 +1059,29 @@ pub(super) fn build_operation(
     operation
 }
 
+#[derive(Clone, Copy)]
+struct ProductionInputs<'a> {
+    scan: &'a BoardScan,
+    player_id: PlayerId,
+    allow_structural_slots: bool,
+    committed_combat_assignments: &'a HashMap<Entity, deployment::ActiveTargetAssignment>,
+    advancing_route_entities: &'a AdvancingCapitalRouteEntities,
+    turn: u32,
+}
+/// 今回の配分だけで共有する作業状態。永続的な戦略状態はRegistryが所有する。
+struct ProductionState {
+    ctx: ReachCtx,
+    operations: Vec<Operation>,
+    ledger: SlotLedger,
+    plan_trace: ProductionPlanTrace,
+    committed_by_operation: HashMap<usize, HashMap<Entity, deployment::ActiveTargetAssignment>>,
+    allocation: AllocationState,
+    rolling_plans: HashMap<usize, SelectedPlan>,
+    seen_plan_ids: HashSet<plan_revision::PlanId>,
+    empty_committed_entities: HashSet<Entity>,
+    commands: Vec<PlannedProduction>,
+    issued_plan_purchase_cost: u32,
+}
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan_production_with_registry(
     scan: &BoardScan,
@@ -959,6 +1093,37 @@ pub(super) fn plan_production_with_registry(
     plan_registry: &mut V4RollingPlanRegistry,
     contract_registry: &mut plan_contract::PlanContractRegistry,
 ) -> (Vec<PlannedProduction>, ProductionPlanTrace) {
+    let input = ProductionInputs {
+        scan,
+        player_id,
+        allow_structural_slots,
+        committed_combat_assignments,
+        advancing_route_entities,
+        turn,
+    };
+    let mut state = prepare_operations(&input, plan_registry, contract_registry);
+    if state.operations.is_empty() {
+        return (state.commands, state.plan_trace);
+    }
+    assign_committed_combat(&input, &mut state);
+    allocate_operation_slots(&input, &mut state, plan_registry, contract_registry);
+    let surplus = allocate_immediate_reinforcements(&input, &mut state, plan_registry);
+    allocate_surplus_mobilization(&input, &mut state, &surplus);
+    finalize_turn_production(&input, state, plan_registry, surplus)
+}
+
+fn prepare_operations(
+    input: &ProductionInputs<'_>,
+    plan_registry: &V4RollingPlanRegistry,
+    contract_registry: &mut plan_contract::PlanContractRegistry,
+) -> ProductionState {
+    let ProductionInputs {
+        scan,
+        player_id,
+        allow_structural_slots,
+        ..
+    } = *input;
+
     let mut ctx = ReachCtx::default();
     let active_objectives = plan_registry.active_objectives(player_id);
     let mut operations = build_operations(scan, &mut ctx, &active_objectives, player_id);
@@ -1000,7 +1165,6 @@ pub(super) fn plan_production_with_registry(
         plan_trace.fallback = true;
         // 作戦に接続されない汎用戦闘生産は行わない。戦力が必要なら、兵站確保・
         // 防衛・首都攻略のいずれかを先にOperationとして成立させる。
-        return (Vec::new(), plan_trace);
     }
 
     // campaignと切り離した汎用clusterが、固定兵站工程のCombat予算を先取りしない。
@@ -1069,12 +1233,32 @@ pub(super) fn plan_production_with_registry(
         })
         .collect();
 
-    // 1体は1手番に1作戦しか遂行できない。過去のpriority enemyが移動して複数作戦へ
-    // 分散しても、現在位置から最も近い1作戦だけへ既存Combat Entityを帰属させる。
-    let mut committed_by_operation: HashMap<
-        usize,
-        HashMap<Entity, deployment::ActiveTargetAssignment>,
-    > = HashMap::default();
+    ProductionState {
+        ctx,
+        operations,
+        ledger,
+        plan_trace,
+        committed_by_operation: HashMap::default(),
+        allocation: AllocationState::new(scan.funds),
+        rolling_plans: HashMap::default(),
+        seen_plan_ids: HashSet::default(),
+        empty_committed_entities: HashSet::default(),
+        commands: Vec::new(),
+        issued_plan_purchase_cost: 0,
+    }
+}
+
+fn assign_committed_combat(input: &ProductionInputs<'_>, state: &mut ProductionState) {
+    let ProductionInputs {
+        scan,
+        committed_combat_assignments,
+        ..
+    } = *input;
+    let ProductionState {
+        operations,
+        committed_by_operation,
+        ..
+    } = state;
     for (&entity, assignment) in committed_combat_assignments {
         let Some(unit) = scan
             .my_units
@@ -1109,28 +1293,40 @@ pub(super) fn plan_production_with_registry(
                 .insert(entity, assignment.clone());
         }
     }
+}
 
-    // 資金と施設占有は配分状態に集約する。施設を確保した作戦の優先度も保持し、
-    // 占領作戦同士の競合を「上位防衛による中断」と誤認しない。
-    let mut allocation = AllocationState::new(scan.funds);
-    // rolling plannerは1作戦につき1回だけ実行し、その混成パッケージの当手番分を
-    // 施設ごとに順次消費する。施設を1つ埋めるたびに同じbeam searchをやり直さない。
-    let mut rolling_plans: HashMap<usize, SelectedPlan> = HashMap::default();
-    let mut seen_plan_ids = HashSet::default();
-    let empty_committed_entities = HashSet::default();
-    // この手番に発注済みの永続Plan購入。Registry上は生産完了を観測するまで
-    // Plannedのまま残るため、余剰予算の計算では二重に予約しない。
-    let mut issued_plan_purchase_cost = 0_u32;
-    let mut commands = Vec::new();
-
+#[derive(Clone, Copy)]
+struct SlotRequest {
+    op_index: usize,
+    slot_kind: SlotKind,
+    spendable_funds: u32,
+    per_slot_budget: u32,
+    operation_kind: OperationKind,
+    operation_anchor: GridPosition,
+    deficit_before: f32,
+    remaining_funds_before: u32,
+}
+fn allocate_operation_slots(
+    input: &ProductionInputs<'_>,
+    state: &mut ProductionState,
+    plan_registry: &mut V4RollingPlanRegistry,
+    contract_registry: &mut plan_contract::PlanContractRegistry,
+) {
     loop {
+        let ProductionInputs { scan, .. } = *input;
+        let ProductionState {
+            operations,
+            ledger,
+            allocation,
+            ..
+        } = state;
         let free_slots =
             allocation.free_facility_count(scan.free_facilities.iter().map(|(pos, _)| pos));
         if free_slots == 0 {
             break;
         }
         // 最も不足している枠を持つ作戦から順に見ていく
-        let Some((op_index, slot_kind)) = most_starved_slot(&operations, &ledger) else {
+        let Some((op_index, slot_kind)) = most_starved_slot(operations, ledger) else {
             break;
         };
 
@@ -1147,527 +1343,638 @@ pub(super) fn plan_production_with_registry(
         // トレース用に、選定前の未充足率と作戦の識別情報を控えておく。
         let operation_kind = operations[op_index].kind;
         let operation_anchor = operations[op_index].anchor;
-        let deficit_before = allocation_slots(&operations[op_index], op_index, &ledger)
+        let deficit_before = allocation_slots(&operations[op_index], op_index, ledger)
             .deficit_ratio(slot_kind, &operations[op_index].filled);
         let remaining_funds_before = allocation.remaining_funds();
 
-        if slot_kind == SlotKind::Combat && !rolling_plans.contains_key(&op_index) {
-            let target_enemies = operations[op_index]
-                .reachable_threats
-                .iter()
-                .filter_map(|threat| threat.entity)
-                .collect::<HashSet<_>>();
-            let continuation = plan_registry.continuation_for_operation(
+        let request = SlotRequest {
+            op_index,
+            slot_kind,
+            spendable_funds,
+            per_slot_budget,
+            operation_kind,
+            operation_anchor,
+            deficit_before,
+            remaining_funds_before,
+        };
+        if evaluate_rolling_plan(input, state, plan_registry, contract_registry, request) {
+            continue;
+        }
+        if !purchase_operation_slot(input, state, plan_registry, contract_registry, request) {
+            break;
+        }
+    }
+}
+fn evaluate_rolling_plan(
+    input: &ProductionInputs<'_>,
+    state: &mut ProductionState,
+    plan_registry: &mut V4RollingPlanRegistry,
+    _contract_registry: &mut plan_contract::PlanContractRegistry,
+    request: SlotRequest,
+) -> bool {
+    let ProductionInputs {
+        scan,
+        player_id,
+        allow_structural_slots,
+        advancing_route_entities,
+        turn,
+        ..
+    } = *input;
+    let ProductionState {
+        ctx,
+        operations,
+        ledger,
+        plan_trace,
+        committed_by_operation,
+        allocation,
+        rolling_plans,
+        seen_plan_ids,
+        empty_committed_entities,
+        ..
+    } = state;
+    let SlotRequest {
+        op_index,
+        slot_kind,
+        spendable_funds,
+        operation_kind,
+        operation_anchor,
+        ..
+    } = request;
+    if slot_kind == SlotKind::Combat && !rolling_plans.contains_key(&op_index) {
+        let target_enemies = operations[op_index]
+            .reachable_threats
+            .iter()
+            .filter_map(|threat| threat.entity)
+            .collect::<HashSet<_>>();
+        let continuation = plan_registry.continuation_for_operation(
+            player_id,
+            turn,
+            operation_kind,
+            operations[op_index].island_id,
+            &operations[op_index].objective_properties,
+            &target_enemies,
+        );
+        // 既存戦力は、PlanIdが一致する発注済み部隊だけでなく、親戦役DAGの
+        // 未完了区間へ前進中の部隊から導く。ただし首都作戦と「次の区間を確保する」
+        // Captureが同じ戦力を同時に数えることはない。前段では区間目標に一致する
+        // Captureだけが受け取り、首都戦闘へ移るのは実行許可後である。
+        // 別のPlan由来の部隊は借りず、即時Combat増援は実在敵への任務を持つ場合だけ
+        // 入れるため、防衛・輸送・回復部隊を見かけの首都戦力にしない。
+        let continuation_plan_id = continuation.as_ref().map(|plan| plan.plan_id);
+        let mut committed_for_plan = committed_entities_for_plan(
+            committed_by_operation.get(&op_index),
+            continuation_plan_id,
+        );
+        // Stageは前衛ではないが、Roadmapが同じDAG区間へ予約した実Entityである。
+        // 到着予定付きの既存戦力としてRollingPlanへ渡し、人数だけを根拠に
+        // 追加生産を禁止する第二の判定器にはしない。
+        let mut staged_for_plan = HashSet::default();
+        if let Some(island_id) = operations[op_index].island_id {
+            match operation_kind {
+                OperationKind::Capture => {
+                    for objective in &operations[op_index].objective_properties {
+                        if let Some(route_entities) = advancing_route_entities
+                            .by_target
+                            .get(&(island_id, *objective))
+                        {
+                            committed_for_plan.extend(route_entities.iter().copied());
+                        }
+                        if let Some(route_entities) = advancing_route_entities
+                            .staged_by_target
+                            .get(&(island_id, *objective))
+                        {
+                            staged_for_plan.extend(route_entities.iter().copied());
+                        }
+                    }
+                }
+                OperationKind::AssaultCapital if operations[op_index].execution_authorized => {
+                    if let Some(route_entities) = advancing_route_entities.by_island.get(&island_id)
+                    {
+                        committed_for_plan.extend(route_entities.iter().copied());
+                    }
+                    for ((staged_island, _), route_entities) in
+                        &advancing_route_entities.staged_by_target
+                    {
+                        if *staged_island == island_id {
+                            staged_for_plan.extend(route_entities.iter().copied());
+                        }
+                    }
+                }
+                OperationKind::Defense | OperationKind::AssaultCapital => {}
+            }
+        }
+        let rolling_input = combat_plan_input(
+            scan,
+            ctx,
+            &operations[op_index],
+            allocation.used_facilities(),
+            if committed_for_plan.is_empty() {
+                empty_committed_entities
+            } else {
+                &committed_for_plan
+            },
+            &staged_for_plan,
+            spendable_funds,
+            !allow_structural_slots,
+            player_id,
+        );
+        if let Some(input) = rolling_input {
+            // 首都攻略の編成中は、固定購入列が今も実行可能ならその再評価だけを行う。
+            // 継続すると分かっている案の全beam searchを先に実行して捨てない。
+            // ただし物件制御の前線作戦では毎ターンの動的最新盤面から合同探索を行う。
+            let evaluated_continuation = if input.exact_property_control {
+                None
+            } else {
+                continuation.map(|previous| {
+                    let evaluated = evaluate_fixed_package(&input, &previous.purchases);
+                    (previous, evaluated)
+                })
+            };
+            let reusable_candidate =
+                evaluated_continuation
+                    .as_ref()
+                    .and_then(|(previous, evaluated)| {
+                        previous
+                            .can_reuse_without_search(
+                                operation_kind,
+                                operations[op_index].execution_authorized,
+                            )
+                            .then(|| evaluated.as_ref().ok().cloned())
+                            .flatten()
+                    });
+            let Some(candidate_plan) = reusable_candidate.or_else(|| plan_force_package(&input))
+            else {
+                ledger.close(op_index, SlotKind::Combat, UnfilledReason::NoForcePackage);
+                return true;
+            };
+            let conflicted_facilities = evaluated_continuation
+                .as_ref()
+                .map(|(previous, evaluated)| {
+                    if evaluated.is_ok() {
+                        return HashSet::default();
+                    }
+                    let mut due = previous
+                        .purchases
+                        .iter()
+                        .filter(|purchase| purchase.build_turn == 0)
+                        .copied()
+                        .collect::<Vec<_>>();
+                    due.sort_unstable_by_key(|purchase| {
+                        (purchase.facility.y, purchase.facility.x, purchase.cost)
+                    });
+                    let mut affordable_funds = input.current_funds;
+                    let mut conflicts = HashSet::default();
+                    for purchase in due {
+                        let claimed_by_higher_priority = allocation
+                            .facility_owner(&purchase.facility)
+                            .is_some_and(|owner| {
+                                owner < operation_priority_rank(&operations[op_index])
+                            });
+                        let claimed_by_campaign = scan
+                            .production_facilities
+                            .iter()
+                            .any(|(facility, _)| *facility == purchase.facility)
+                            && !scan
+                                .free_facilities
+                                .iter()
+                                .any(|(facility, _)| *facility == purchase.facility);
+                        if claimed_by_higher_priority || claimed_by_campaign {
+                            conflicts.insert(purchase.facility);
+                        } else if operation_kind == OperationKind::AssaultCapital {
+                            if purchase.cost <= affordable_funds {
+                                affordable_funds = affordable_funds.saturating_sub(purchase.cost);
+                            } else {
+                                // 上位作戦が当手番の現金を使った場合も、失敗ではなく
+                                // 当該施設の首都編成列を次手番以降へ繰り下げる。
+                                conflicts.insert(purchase.facility);
+                            }
+                        }
+                    }
+                    conflicts
+                })
+                .unwrap_or_default();
+            let selected = plan_registry.select_for_operation(
                 player_id,
                 turn,
                 operation_kind,
                 operations[op_index].island_id,
-                &operations[op_index].objective_properties,
-                &target_enemies,
+                operation_anchor,
+                operations[op_index].objective_properties.clone(),
+                target_enemies,
+                operations[op_index].execution_authorized,
+                evaluated_continuation,
+                candidate_plan,
+                input.hard_deadline,
+                conflicted_facilities,
             );
-            // 既存戦力は、PlanIdが一致する発注済み部隊だけでなく、親戦役DAGの
-            // 未完了区間へ前進中の部隊から導く。ただし首都作戦と「次の区間を確保する」
-            // Captureが同じ戦力を同時に数えることはない。前段では区間目標に一致する
-            // Captureだけが受け取り、首都戦闘へ移るのは実行許可後である。
-            // 別のPlan由来の部隊は借りず、即時Combat増援は実在敵への任務を持つ場合だけ
-            // 入れるため、防衛・輸送・回復部隊を見かけの首都戦力にしない。
-            let continuation_plan_id = continuation.as_ref().map(|plan| plan.plan_id);
-            let mut committed_for_plan = committed_entities_for_plan(
-                committed_by_operation.get(&op_index),
-                continuation_plan_id,
-            );
-            // Stageは前衛ではないが、Roadmapが同じDAG区間へ予約した実Entityである。
-            // 到着予定付きの既存戦力としてRollingPlanへ渡し、人数だけを根拠に
-            // 追加生産を禁止する第二の判定器にはしない。
-            let mut staged_for_plan = HashSet::default();
-            if let Some(island_id) = operations[op_index].island_id {
-                match operation_kind {
-                    OperationKind::Capture => {
-                        for objective in &operations[op_index].objective_properties {
-                            if let Some(route_entities) = advancing_route_entities
-                                .by_target
-                                .get(&(island_id, *objective))
-                            {
-                                committed_for_plan.extend(route_entities.iter().copied());
-                            }
-                            if let Some(route_entities) = advancing_route_entities
-                                .staged_by_target
-                                .get(&(island_id, *objective))
-                            {
-                                staged_for_plan.extend(route_entities.iter().copied());
-                            }
-                        }
-                    }
-                    OperationKind::AssaultCapital if operations[op_index].execution_authorized => {
-                        if let Some(route_entities) =
-                            advancing_route_entities.by_island.get(&island_id)
-                        {
-                            committed_for_plan.extend(route_entities.iter().copied());
-                        }
-                        for ((staged_island, _), route_entities) in
-                            &advancing_route_entities.staged_by_target
-                        {
-                            if *staged_island == island_id {
-                                staged_for_plan.extend(route_entities.iter().copied());
-                            }
-                        }
-                    }
-                    OperationKind::Defense | OperationKind::AssaultCapital => {}
-                }
+            if let Some(plan_id) = selected.plan_id {
+                seen_plan_ids.insert(plan_id);
             }
-            let rolling_input = combat_plan_input(
-                scan,
-                &mut ctx,
-                &operations[op_index],
-                allocation.used_facilities(),
-                if committed_for_plan.is_empty() {
-                    &empty_committed_entities
-                } else {
-                    &committed_for_plan
-                },
-                &staged_for_plan,
-                spendable_funds,
-                !allow_structural_slots,
-                player_id,
-            );
-            if let Some(input) = rolling_input {
-                // 首都攻略の編成中は、固定購入列が今も実行可能ならその再評価だけを行う。
-                // 継続すると分かっている案の全beam searchを先に実行して捨てない。
-                // ただし物件制御の前線作戦では毎ターンの動的最新盤面から合同探索を行う。
-                let evaluated_continuation = if input.exact_property_control {
-                    None
-                } else {
-                    continuation.map(|previous| {
-                        let evaluated = evaluate_fixed_package(&input, &previous.purchases);
-                        (previous, evaluated)
-                    })
-                };
-                let reusable_candidate =
-                    evaluated_continuation
-                        .as_ref()
-                        .and_then(|(previous, evaluated)| {
-                            previous
-                                .can_reuse_without_search(
-                                    operation_kind,
-                                    operations[op_index].execution_authorized,
-                                )
-                                .then(|| evaluated.as_ref().ok().cloned())
-                                .flatten()
-                        });
-                let Some(candidate_plan) =
-                    reusable_candidate.or_else(|| plan_force_package(&input))
-                else {
-                    ledger.close(op_index, SlotKind::Combat, UnfilledReason::NoForcePackage);
-                    continue;
-                };
-                let conflicted_facilities = evaluated_continuation
-                    .as_ref()
-                    .map(|(previous, evaluated)| {
-                        if evaluated.is_ok() {
-                            return HashSet::default();
-                        }
-                        let mut due = previous
-                            .purchases
-                            .iter()
-                            .filter(|purchase| purchase.build_turn == 0)
-                            .copied()
-                            .collect::<Vec<_>>();
-                        due.sort_unstable_by_key(|purchase| {
-                            (purchase.facility.y, purchase.facility.x, purchase.cost)
-                        });
-                        let mut affordable_funds = input.current_funds;
-                        let mut conflicts = HashSet::default();
-                        for purchase in due {
-                            let claimed_by_higher_priority =
-                                allocation.facility_owner(&purchase.facility).is_some_and(
-                                    |owner| owner < operation_priority_rank(&operations[op_index]),
-                                );
-                            let claimed_by_campaign = scan
-                                .production_facilities
-                                .iter()
-                                .any(|(facility, _)| *facility == purchase.facility)
-                                && !scan
-                                    .free_facilities
-                                    .iter()
-                                    .any(|(facility, _)| *facility == purchase.facility);
-                            if claimed_by_higher_priority || claimed_by_campaign {
-                                conflicts.insert(purchase.facility);
-                            } else if operation_kind == OperationKind::AssaultCapital {
-                                if purchase.cost <= affordable_funds {
-                                    affordable_funds =
-                                        affordable_funds.saturating_sub(purchase.cost);
-                                } else {
-                                    // 上位作戦が当手番の現金を使った場合も、失敗ではなく
-                                    // 当該施設の首都編成列を次手番以降へ繰り下げる。
-                                    conflicts.insert(purchase.facility);
-                                }
-                            }
-                        }
-                        conflicts
-                    })
-                    .unwrap_or_default();
-                let selected = plan_registry.select_for_operation(
-                    player_id,
-                    turn,
-                    operation_kind,
-                    operations[op_index].island_id,
-                    operation_anchor,
-                    operations[op_index].objective_properties.clone(),
-                    target_enemies,
-                    operations[op_index].execution_authorized,
-                    evaluated_continuation,
-                    candidate_plan,
-                    input.hard_deadline,
-                    conflicted_facilities,
+            if input.exact_property_control {
+                // 物件数から歩兵数を先決めしない。施設・資金・敵相性を同時に列挙して
+                // 選ばれた支配パッケージのCapture割当だけを、この手番の必要数とする。
+                // 元の要求を保持し、従来の上書き量を実効要求として台帳へ記録する。
+                // 以前の実効要求に対する未充足の取消タイミングは変えない。
+                ledger.set_effective(
+                    op_index,
+                    SlotKind::Capture,
+                    u32::try_from(selected.plan.capture_purchases.len()).unwrap_or(u32::MAX),
+                    EffectiveDemandReason::JointPackageSelected,
                 );
-                if let Some(plan_id) = selected.plan_id {
-                    seen_plan_ids.insert(plan_id);
-                }
-                if input.exact_property_control {
-                    // 物件数から歩兵数を先決めしない。施設・資金・敵相性を同時に列挙して
-                    // 選ばれた支配パッケージのCapture割当だけを、この手番の必要数とする。
-                    // 元の要求を保持し、従来の上書き量を実効要求として台帳へ記録する。
-                    // 以前の実効要求に対する未充足の取消タイミングは変えない。
-                    ledger.set_effective(
-                        op_index,
-                        SlotKind::Capture,
-                        u32::try_from(selected.plan.capture_purchases.len()).unwrap_or(u32::MAX),
-                        EffectiveDemandReason::JointPackageSelected,
-                    );
-                    ledger.reopen(op_index, SlotKind::Capture);
-                }
-                let plan = &selected.plan;
-                plan_trace.rolling_combat_plans.retain(|current| {
-                    current.operation_kind != operation_kind || current.anchor != operation_anchor
-                });
-                plan_trace
-                    .rolling_combat_plans
-                    .push(RollingCombatPlanTrace {
-                        plan_id: selected.plan_id,
-                        revision: selected.revision,
-                        disposition: selected.disposition,
-                        replan_reason: selected.reason,
-                        operation_kind,
-                        anchor: operation_anchor,
-                        feasible: plan.feasible,
-                        purchases: plan
-                            .purchases
-                            .iter()
-                            .copied()
-                            .map(|purchase| RollingPurchaseTrace {
-                                unit_type: purchase.unit_type,
-                                facility: purchase.facility,
-                                build_turn: purchase.build_turn,
-                                cost: purchase.cost,
-                            })
-                            .collect(),
-                        targets: plan
-                            .target_forecasts
-                            .iter()
-                            .map(|target| RollingTargetTrace {
-                                entity: target.entity,
-                                unit_type: target.unit_type,
-                                available_turn: target.available_turn,
-                                initial_hp: target.initial_hp,
-                                remaining_hp: target.remaining_hp,
-                                destroyed_turn: target.destroyed_turn,
-                            })
-                            .collect(),
-                        turn_forecasts: plan
-                            .turn_forecasts
-                            .iter()
-                            .map(|forecast| CampaignTurnForecastTrace {
-                                turn: forecast.turn,
-                                enemy_arrival_hp: forecast.enemy_arrival_hp,
-                                enemy_hp_removed: forecast.enemy_hp_removed,
-                                friendly_hp_lost: forecast.friendly_hp_lost,
-                                attack_count: forecast.attack_count,
-                            })
-                            .collect(),
-                        first_attack_turn: plan.first_attack_turn,
-                        elimination_turn: plan.elimination_turn,
-                        occupation_turn: plan.occupation_turn,
-                        production_cost: plan.production_cost,
-                        expected_loss: plan.expected_loss,
-                        surviving_combat_value: plan.surviving_combat_value,
-                        required_overmatch_value: plan.required_overmatch_value,
-                        overmatch_ready: plan.overmatch_ready,
-                        protected_unit_count: plan.protected_unit_count,
-                        protected_survivor_count: plan.protected_survivor_count,
-                        required_capture_survivor_count: plan.required_capture_survivor_count,
-                        candidates_considered: plan.candidates_considered,
-                        candidates_pruned: plan.candidates_pruned,
-                        search_truncated: plan.search_truncated,
-                    });
-                if selected.plan_id.is_none() {
-                    // 長期Expectedを今の資金で全滅できない場合でも、best-effortは
-                    // 当手番に到達可能なscreenを返している。これを捨てると「敵増援を
-                    // 多く見積もるほど1体も生産しない」逆転が起きる。
-                    // PlanIdなしの購入は永続計画に固定せず、次手番の実敵・資金・
-                    // 生産結果で必ず再評価する即時Combatとして発行する。
-                    rolling_plans.insert(op_index, selected);
-                    continue;
-                }
-                rolling_plans.insert(op_index, selected);
+                ledger.reopen(op_index, SlotKind::Capture);
             }
-        }
-        let rolling_plan = rolling_plans.get(&op_index);
-        let mut planned_purchase = None;
-        let candidate = if slot_kind == SlotKind::Combat {
-            rolling_plan.and_then(|plan| {
-                plan.plan
-                    .current_purchases()
-                    .find(|purchase| {
-                        !allocation.is_facility_used(&purchase.facility)
-                            && purchase.cost <= spendable_funds
-                    })
-                    .map(|purchase| {
-                        planned_purchase = Some(purchase);
-                        SlotCandidate {
-                            unit_type: purchase.unit_type,
-                            cost: purchase.cost,
-                            facility: purchase.facility,
-                            fitness: 1.0,
-                        }
-                    })
-            })
-        } else {
-            select_candidate(
-                scan,
-                &mut ctx,
-                &operations[op_index],
-                slot_kind,
-                allocation.used_facilities(),
-                CandidateConstraints {
-                    remaining_funds: spendable_funds,
-                    per_slot_budget,
-                },
-                player_id,
-            )
-        };
-
-        let Some(candidate) = candidate else {
-            // この枠を満たせる候補が無い場合は、要求を残したまま当手番は見送り、次を探す
-            ledger.close(op_index, slot_kind, UnfilledReason::NoCandidate);
-            let reserved = (slot_kind == SlotKind::Combat)
-                .then_some(rolling_plan)
-                .flatten()
-                .filter(|plan| plan.plan_id.is_some())
-                .and_then(|plan| {
-                    plan.plan
+            let plan = &selected.plan;
+            plan_trace.rolling_combat_plans.retain(|current| {
+                current.operation_kind != operation_kind || current.anchor != operation_anchor
+            });
+            plan_trace
+                .rolling_combat_plans
+                .push(RollingCombatPlanTrace {
+                    plan_id: selected.plan_id,
+                    revision: selected.revision,
+                    disposition: selected.disposition,
+                    replan_reason: selected.reason,
+                    operation_kind,
+                    anchor: operation_anchor,
+                    feasible: plan.feasible,
+                    purchases: plan
                         .purchases
                         .iter()
-                        .filter(|purchase| purchase.build_turn > 0)
-                        .min_by_key(|purchase| purchase.build_turn)
+                        .copied()
+                        .map(|purchase| RollingPurchaseTrace {
+                            unit_type: purchase.unit_type,
+                            facility: purchase.facility,
+                            build_turn: purchase.build_turn,
+                            cost: purchase.cost,
+                        })
+                        .collect(),
+                    targets: plan
+                        .target_forecasts
+                        .iter()
+                        .map(|target| RollingTargetTrace {
+                            entity: target.entity,
+                            unit_type: target.unit_type,
+                            available_turn: target.available_turn,
+                            initial_hp: target.initial_hp,
+                            remaining_hp: target.remaining_hp,
+                            destroyed_turn: target.destroyed_turn,
+                        })
+                        .collect(),
+                    turn_forecasts: plan
+                        .turn_forecasts
+                        .iter()
+                        .map(|forecast| CampaignTurnForecastTrace {
+                            turn: forecast.turn,
+                            enemy_arrival_hp: forecast.enemy_arrival_hp,
+                            enemy_hp_removed: forecast.enemy_hp_removed,
+                            friendly_hp_lost: forecast.friendly_hp_lost,
+                            attack_count: forecast.attack_count,
+                        })
+                        .collect(),
+                    first_attack_turn: plan.first_attack_turn,
+                    elimination_turn: plan.elimination_turn,
+                    occupation_turn: plan.occupation_turn,
+                    production_cost: plan.production_cost,
+                    expected_loss: plan.expected_loss,
+                    surviving_combat_value: plan.surviving_combat_value,
+                    required_overmatch_value: plan.required_overmatch_value,
+                    overmatch_ready: plan.overmatch_ready,
+                    protected_unit_count: plan.protected_unit_count,
+                    protected_survivor_count: plan.protected_survivor_count,
+                    required_capture_survivor_count: plan.required_capture_survivor_count,
+                    candidates_considered: plan.candidates_considered,
+                    candidates_pruned: plan.candidates_pruned,
+                    search_truncated: plan.search_truncated,
                 });
-            plan_trace.steps.push(ProductionStepTrace {
-                operation_kind,
-                operation_anchor,
-                slot_kind,
-                deficit_before,
-                deficit_after: deficit_before,
-                remaining_funds_before,
-                decision: reserved.map_or(
-                    ProductionDecision::Unfilled {
-                        reason: UnfilledReason::NoCandidate,
-                    },
-                    |purchase| ProductionDecision::Reserved {
+            if selected.plan_id.is_none() {
+                // 長期Expectedを今の資金で全滅できない場合でも、best-effortは
+                // 当手番に到達可能なscreenを返している。これを捨てると「敵増援を
+                // 多く見積もるほど1体も生産しない」逆転が起きる。
+                // PlanIdなしの購入は永続計画に固定せず、次手番の実敵・資金・
+                // 生産結果で必ず再評価する即時Combatとして発行する。
+                rolling_plans.insert(op_index, selected);
+                return true;
+            }
+            rolling_plans.insert(op_index, selected);
+        }
+    }
+    false
+}
+
+fn purchase_operation_slot(
+    input: &ProductionInputs<'_>,
+    state: &mut ProductionState,
+    plan_registry: &mut V4RollingPlanRegistry,
+    contract_registry: &mut plan_contract::PlanContractRegistry,
+    request: SlotRequest,
+) -> bool {
+    let ProductionInputs {
+        scan,
+        player_id,
+        turn,
+        ..
+    } = *input;
+    let ProductionState {
+        ctx,
+        operations,
+        ledger,
+        plan_trace,
+        allocation,
+        rolling_plans,
+        commands,
+        issued_plan_purchase_cost,
+        ..
+    } = state;
+    let SlotRequest {
+        op_index,
+        slot_kind,
+        spendable_funds,
+        per_slot_budget,
+        operation_kind,
+        operation_anchor,
+        deficit_before,
+        remaining_funds_before,
+    } = request;
+    let rolling_plan = rolling_plans.get(&op_index);
+    let mut planned_purchase = None;
+    let candidate = if slot_kind == SlotKind::Combat {
+        rolling_plan.and_then(|plan| {
+            plan.plan
+                .current_purchases()
+                .find(|purchase| {
+                    !allocation.is_facility_used(&purchase.facility)
+                        && purchase.cost <= spendable_funds
+                })
+                .map(|purchase| {
+                    planned_purchase = Some(purchase);
+                    SlotCandidate {
                         unit_type: purchase.unit_type,
                         cost: purchase.cost,
-                        build_turn: purchase.build_turn,
-                    },
-                ),
-            });
-            continue;
-        };
+                        facility: purchase.facility,
+                        fitness: 1.0,
+                    }
+                })
+        })
+    } else {
+        select_candidate(
+            scan,
+            ctx,
+            &operations[op_index],
+            slot_kind,
+            allocation.used_facilities(),
+            CandidateConstraints {
+                remaining_funds: spendable_funds,
+                per_slot_budget,
+            },
+            player_id,
+        )
+    };
 
-        // 見送り購入: 一括編成が必要な作戦で、今買える範囲に適合候補が無く、
-        // 数ターン待てばより適合する候補が買えるなら、資金を貯める。
-        if slot_kind != SlotKind::Combat
-            && operations[op_index].property_controls.is_empty()
-            && should_defer_purchase(
-                scan,
-                &mut ctx,
-                &operations[op_index],
-                slot_kind,
-                spendable_funds,
-                candidate.cost,
-                player_id,
-            )
-        {
-            plan_trace.steps.push(ProductionStepTrace {
-                operation_kind,
-                operation_anchor,
-                slot_kind,
-                deficit_before,
-                deficit_after: deficit_before,
-                remaining_funds_before,
-                decision: ProductionDecision::Deferred {
-                    unit_type: candidate.unit_type,
-                    cost: candidate.cost,
-                },
-            });
-            break;
-        }
-
-        let joint_capture_target = (slot_kind == SlotKind::Combat)
+    let Some(candidate) = candidate else {
+        // この枠を満たせる候補が無い場合は、要求を残したまま当手番は見送り、次を探す
+        ledger.close(op_index, slot_kind, UnfilledReason::NoCandidate);
+        let reserved = (slot_kind == SlotKind::Combat)
             .then_some(rolling_plan)
             .flatten()
-            .zip(planned_purchase)
-            .and_then(|(plan, purchase)| plan.plan.capture_target_for(purchase));
-        // 共同計画のCapture割当を優先し、通常Capture枠だけ従来の次レーンを使う。
-        let capture_mission_target = joint_capture_target.or_else(|| {
-            (slot_kind == SlotKind::Capture).then(|| next_capture_target(&operations[op_index]))
-        });
-        let effective_slot_kind = if capture_mission_target.is_some() {
-            SlotKind::Capture
-        } else {
-            slot_kind
-        };
-        let planned_combat_target = (effective_slot_kind == SlotKind::Combat)
-            .then_some(rolling_plan)
-            .flatten()
-            .zip(planned_purchase)
-            .and_then(|(plan, purchase)| plan.plan.combat_target_for(purchase));
-        if allocation
-            .try_claim(
-                candidate.facility,
-                candidate.cost,
-                operation_priority_rank(&operations[op_index]),
-            )
-            .is_err()
-        {
-            // 候補評価後に競合した予約は、後続の意図や工程へ反映せず配分を止める。
-            break;
-        }
-        if planned_purchase.is_some() {
-            issued_plan_purchase_cost = issued_plan_purchase_cost.saturating_add(candidate.cost);
-        }
-        let mut deployment = if effective_slot_kind == SlotKind::Capture {
-            let target = capture_mission_target.unwrap_or(operations[op_index].anchor);
-            Some(planned_capture_deployment(&operations[op_index], target))
-        } else {
-            planned_deployment(
-                scan,
-                &mut ctx,
-                &operations[op_index],
-                effective_slot_kind,
-                &candidate,
-                planned_combat_target,
-            )
-        };
-        if effective_slot_kind == SlotKind::Combat
-            && let (Some(deployment), Some(plan)) = (deployment.as_mut(), rolling_plan)
-        {
-            deployment.forecast = deployment::DeploymentForecast {
-                first_attack_turn: plan.plan.first_attack_turn,
-                elimination_turn: plan.plan.elimination_turn,
-                occupation_turn: plan.plan.occupation_turn,
-                package_cost: plan.plan.production_cost,
-                package_size: u32::try_from(plan.plan.purchases.len()).unwrap_or(u32::MAX),
-            };
-            deployment.plan_step = plan
-                .plan_id
-                .zip(plan.revision)
-                .zip(planned_purchase)
-                .and_then(|((plan_id, revision), purchase)| {
-                    plan_registry.current_step_ref(plan_id, revision, turn, purchase)
-                });
-            if let (Some(plan_id), Some(op_id)) = (plan.plan_id, operations[op_index].operation_id)
-            {
-                contract_registry.link_plan_to_operation(plan_id, op_id);
-            }
-        }
-        if let Some(op_id) = operations[op_index].operation_id
-            && let Some(deployment) = deployment.as_mut()
-        {
-            let role = match effective_slot_kind {
-                SlotKind::Capture => victory_roadmap::OperationEntityRole::Capture,
-                SlotKind::Transport => victory_roadmap::OperationEntityRole::Transport,
-                SlotKind::Combat | SlotKind::Intercept => {
-                    victory_roadmap::OperationEntityRole::Combat
-                }
-            };
-            let revision = contract_registry
-                .contract_revision(op_id)
-                .unwrap_or(plan_revision::PlanRevision(1));
-            deployment.operation_binding = Some(plan_contract::OperationBinding {
-                operation_id: op_id,
-                plan_step: deployment.plan_step,
-                role,
-                revision,
+            .filter(|plan| plan.plan_id.is_some())
+            .and_then(|plan| {
+                plan.plan
+                    .purchases
+                    .iter()
+                    .filter(|purchase| purchase.build_turn > 0)
+                    .min_by_key(|purchase| purchase.build_turn)
             });
-        }
-        // Combatは同じパッケージの未使用current purchaseを次の反復で選ぶ。
-        // 全て消費した後は候補なしとなり、この手番のCombat枠を完了する。
-        if effective_slot_kind == SlotKind::Capture {
-            let target = capture_mission_target.expect("Capture購入には任務先がある");
-            operations[op_index]
-                .planned_capture_units
-                .push(PlannedCaptureUnit {
-                    stats: candidate_stats(scan, &candidate).clone(),
-                    facility: candidate.facility,
-                    target,
-                });
-            operations[op_index].filled.capture_units =
-                operations[op_index].filled.capture_units.saturating_add(1);
-        } else if effective_slot_kind != SlotKind::Combat {
-            record_fill(
-                scan,
-                &mut ctx,
-                &mut operations[op_index],
-                effective_slot_kind,
-                &candidate,
-            );
-        }
         plan_trace.steps.push(ProductionStepTrace {
             operation_kind,
             operation_anchor,
-            slot_kind: effective_slot_kind,
+            slot_kind,
             deficit_before,
-            // 購入を反映した後の未充足率。ここが下がらない枠が同一ユニットを買い続ける。
-            deficit_after: allocation_slots(&operations[op_index], op_index, &ledger)
-                .deficit_ratio(effective_slot_kind, &operations[op_index].filled),
+            deficit_after: deficit_before,
             remaining_funds_before,
-            decision: ProductionDecision::Produced {
+            decision: reserved.map_or(
+                ProductionDecision::Unfilled {
+                    reason: UnfilledReason::NoCandidate,
+                },
+                |purchase| ProductionDecision::Reserved {
+                    unit_type: purchase.unit_type,
+                    cost: purchase.cost,
+                    build_turn: purchase.build_turn,
+                },
+            ),
+        });
+        return true;
+    };
+
+    // 見送り購入: 一括編成が必要な作戦で、今買える範囲に適合候補が無く、
+    // 数ターン待てばより適合する候補が買えるなら、資金を貯める。
+    if slot_kind != SlotKind::Combat
+        && operations[op_index].property_controls.is_empty()
+        && should_defer_purchase(
+            scan,
+            ctx,
+            &operations[op_index],
+            slot_kind,
+            spendable_funds,
+            candidate.cost,
+            player_id,
+        )
+    {
+        plan_trace.steps.push(ProductionStepTrace {
+            operation_kind,
+            operation_anchor,
+            slot_kind,
+            deficit_before,
+            deficit_after: deficit_before,
+            remaining_funds_before,
+            decision: ProductionDecision::Deferred {
                 unit_type: candidate.unit_type,
                 cost: candidate.cost,
-                facility: candidate.facility,
             },
         });
-        let capture_intent = (effective_slot_kind == SlotKind::Capture)
-            .then(|| {
-                operations[op_index].island_id.map(|island_id| {
-                    campaign_execution::CampaignProductionIntent {
-                        command: ProduceUnitCommand {
-                            player_id,
-                            target_x: candidate.facility.x,
-                            target_y: candidate.facility.y,
-                            unit_type: candidate.unit_type,
-                        },
-                        island_id,
-                        role: campaign_execution::CampaignProductionRole::Capture,
-                        mission_target: capture_mission_target,
-                    }
-                })
-            })
-            .flatten();
-        let purpose = plan_step_purpose(deployment.as_ref(), PurchasePurpose::OperationSlot);
-        commands.push(PlannedProduction {
-            command: ProduceUnitCommand {
-                player_id,
-                target_x: candidate.facility.x,
-                target_y: candidate.facility.y,
-                unit_type: candidate.unit_type,
-            },
-            role: effective_slot_kind,
-            cost: candidate.cost,
-            purpose,
-            deployment,
-            capture_intent,
-        });
+        return false;
     }
 
+    let joint_capture_target = (slot_kind == SlotKind::Combat)
+        .then_some(rolling_plan)
+        .flatten()
+        .zip(planned_purchase)
+        .and_then(|(plan, purchase)| plan.plan.capture_target_for(purchase));
+    // 共同計画のCapture割当を優先し、通常Capture枠だけ従来の次レーンを使う。
+    let capture_mission_target = joint_capture_target.or_else(|| {
+        (slot_kind == SlotKind::Capture).then(|| next_capture_target(&operations[op_index]))
+    });
+    let effective_slot_kind = if capture_mission_target.is_some() {
+        SlotKind::Capture
+    } else {
+        slot_kind
+    };
+    let planned_combat_target = (effective_slot_kind == SlotKind::Combat)
+        .then_some(rolling_plan)
+        .flatten()
+        .zip(planned_purchase)
+        .and_then(|(plan, purchase)| plan.plan.combat_target_for(purchase));
+    if allocation
+        .try_claim(
+            candidate.facility,
+            candidate.cost,
+            operation_priority_rank(&operations[op_index]),
+        )
+        .is_err()
+    {
+        // 候補評価後に競合した予約は、後続の意図や工程へ反映せず配分を止める。
+        return false;
+    }
+    if planned_purchase.is_some() {
+        *issued_plan_purchase_cost = issued_plan_purchase_cost.saturating_add(candidate.cost);
+    }
+    let mut deployment = if effective_slot_kind == SlotKind::Capture {
+        let target = capture_mission_target.unwrap_or(operations[op_index].anchor);
+        Some(planned_capture_deployment(&operations[op_index], target))
+    } else {
+        planned_deployment(
+            scan,
+            ctx,
+            &operations[op_index],
+            effective_slot_kind,
+            &candidate,
+            planned_combat_target,
+        )
+    };
+    if effective_slot_kind == SlotKind::Combat
+        && let (Some(deployment), Some(plan)) = (deployment.as_mut(), rolling_plan)
+    {
+        deployment.forecast = deployment::DeploymentForecast {
+            first_attack_turn: plan.plan.first_attack_turn,
+            elimination_turn: plan.plan.elimination_turn,
+            occupation_turn: plan.plan.occupation_turn,
+            package_cost: plan.plan.production_cost,
+            package_size: u32::try_from(plan.plan.purchases.len()).unwrap_or(u32::MAX),
+        };
+        deployment.plan_step = plan
+            .plan_id
+            .zip(plan.revision)
+            .zip(planned_purchase)
+            .and_then(|((plan_id, revision), purchase)| {
+                plan_registry.current_step_ref(plan_id, revision, turn, purchase)
+            });
+        if let (Some(plan_id), Some(op_id)) = (plan.plan_id, operations[op_index].operation_id) {
+            contract_registry.link_plan_to_operation(plan_id, op_id);
+        }
+    }
+    if let Some(op_id) = operations[op_index].operation_id
+        && let Some(deployment) = deployment.as_mut()
+    {
+        let role = match effective_slot_kind {
+            SlotKind::Capture => victory_roadmap::OperationEntityRole::Capture,
+            SlotKind::Transport => victory_roadmap::OperationEntityRole::Transport,
+            SlotKind::Combat | SlotKind::Intercept => victory_roadmap::OperationEntityRole::Combat,
+        };
+        let revision = contract_registry
+            .contract_revision(op_id)
+            .unwrap_or(plan_revision::PlanRevision(1));
+        deployment.operation_binding = Some(plan_contract::OperationBinding {
+            operation_id: op_id,
+            plan_step: deployment.plan_step,
+            role,
+            revision,
+        });
+    }
+    // Combatは同じパッケージの未使用current purchaseを次の反復で選ぶ。
+    // 全て消費した後は候補なしとなり、この手番のCombat枠を完了する。
+    if effective_slot_kind == SlotKind::Capture {
+        let target = capture_mission_target.expect("Capture購入には任務先がある");
+        operations[op_index]
+            .planned_capture_units
+            .push(PlannedCaptureUnit {
+                stats: candidate_stats(scan, &candidate).clone(),
+                facility: candidate.facility,
+                target,
+            });
+        operations[op_index].filled.capture_units =
+            operations[op_index].filled.capture_units.saturating_add(1);
+    } else if effective_slot_kind != SlotKind::Combat {
+        record_fill(
+            scan,
+            ctx,
+            &mut operations[op_index],
+            effective_slot_kind,
+            &candidate,
+        );
+    }
+    plan_trace.steps.push(ProductionStepTrace {
+        operation_kind,
+        operation_anchor,
+        slot_kind: effective_slot_kind,
+        deficit_before,
+        // 購入を反映した後の未充足率。ここが下がらない枠が同一ユニットを買い続ける。
+        deficit_after: allocation_slots(&operations[op_index], op_index, ledger)
+            .deficit_ratio(effective_slot_kind, &operations[op_index].filled),
+        remaining_funds_before,
+        decision: ProductionDecision::Produced {
+            unit_type: candidate.unit_type,
+            cost: candidate.cost,
+            facility: candidate.facility,
+        },
+    });
+    let capture_intent = (effective_slot_kind == SlotKind::Capture)
+        .then(|| {
+            operations[op_index].island_id.map(|island_id| {
+                campaign_execution::CampaignProductionIntent {
+                    command: ProduceUnitCommand {
+                        player_id,
+                        target_x: candidate.facility.x,
+                        target_y: candidate.facility.y,
+                        unit_type: candidate.unit_type,
+                    },
+                    island_id,
+                    role: campaign_execution::CampaignProductionRole::Capture,
+                    mission_target: capture_mission_target,
+                }
+            })
+        })
+        .flatten();
+    let purpose = plan_step_purpose(deployment.as_ref(), PurchasePurpose::OperationSlot);
+    commands.push(PlannedProduction {
+        command: ProduceUnitCommand {
+            player_id,
+            target_x: candidate.facility.x,
+            target_y: candidate.facility.y,
+            unit_type: candidate.unit_type,
+        },
+        role: effective_slot_kind,
+        cost: candidate.cost,
+        purpose,
+        deployment,
+        capture_intent,
+    });
+    true
+}
+
+struct SurplusBudget {
+    funds: u32,
+    unissued_plan_reserve: u32,
+    contingency_reserve: u32,
+    resolved: HashSet<Entity>,
+}
+
+fn allocate_immediate_reinforcements(
+    input: &ProductionInputs<'_>,
+    state: &mut ProductionState,
+    plan_registry: &V4RollingPlanRegistry,
+) -> SurplusBudget {
+    let ProductionInputs {
+        scan, player_id, ..
+    } = *input;
+    let ProductionState {
+        ctx,
+        operations,
+        plan_trace,
+        allocation,
+        rolling_plans,
+        commands,
+        issued_plan_purchase_cost,
+        ..
+    } = state;
     // 永続Planの予約は「最低限ここまでは作る」というMustであり、手番の生産停止条件
     // ではない。未発行のMustと観測後counterだけを残し、残額・空き施設があれば
     // 実在する前線の敵へ交戦可能な増援を追加する。仮想増援や未接敵の敵はここに
@@ -1678,7 +1985,7 @@ pub(super) fn plan_production_with_registry(
         .fold(0_u32, u32::saturating_add);
     let unissued_plan_reserve = plan_registry
         .reserved_purchase_cost(player_id)
-        .saturating_sub(issued_plan_purchase_cost);
+        .saturating_sub(*issued_plan_purchase_cost);
     let mut immediate_reinforcement_funds =
         allocation.spendable_after(unissued_plan_reserve.saturating_add(contingency_reserve));
     // 到達性と対敵有効度は、残額を工場へ配るたびに変わらない。候補表をここで一度だけ
@@ -1696,13 +2003,8 @@ pub(super) fn plan_production_with_registry(
         .filter(|target| target.remaining_hp == 0)
         .filter_map(|target| target.entity)
         .collect::<HashSet<_>>();
-    let immediate_combat_options = immediate_combat_options(
-        scan,
-        &mut ctx,
-        &operations,
-        player_id,
-        &resolved_by_rolling_plan,
-    );
+    let immediate_combat_options =
+        immediate_combat_options(scan, ctx, operations, player_id, &resolved_by_rolling_plan);
     // 1手番に1体が与えられる攻撃は1回だけなので、同じ敵HPを複数の工場枠で
     // 仮想的に何度も消費しない。ここは経路探索済みの攻撃表への割当だけであり、
     // 「1体追加ごとの将来戦闘シミュレーション」にはしない。
@@ -1715,7 +2017,7 @@ pub(super) fn plan_production_with_registry(
         }
         let per_slot_budget = immediate_reinforcement_funds / free_slots as u32;
         let Some((op_index, candidate, engagement)) = select_immediate_combat_reinforcement(
-            &operations,
+            operations,
             &immediate_combat_options,
             allocation.used_facilities(),
             &immediately_committed_damage,
@@ -1732,7 +2034,7 @@ pub(super) fn plan_production_with_registry(
         let remaining_funds_before = allocation.remaining_funds();
         let deployment = planned_deployment(
             scan,
-            &mut ctx,
+            ctx,
             &operations[op_index],
             SlotKind::Combat,
             &candidate,
@@ -1793,6 +2095,32 @@ pub(super) fn plan_production_with_registry(
         });
     }
 
+    SurplusBudget {
+        funds: immediate_reinforcement_funds,
+        unissued_plan_reserve,
+        contingency_reserve,
+        resolved: resolved_by_rolling_plan,
+    }
+}
+
+fn allocate_surplus_mobilization(
+    input: &ProductionInputs<'_>,
+    state: &mut ProductionState,
+    surplus: &SurplusBudget,
+) {
+    let ProductionInputs {
+        scan, player_id, ..
+    } = *input;
+    let ProductionState {
+        ctx,
+        operations,
+        plan_trace,
+        allocation,
+        commands,
+        ..
+    } = state;
+    let mut immediate_reinforcement_funds = surplus.funds;
+    let resolved_by_rolling_plan = &surplus.resolved;
     // 空き施設があり、Must予約・予備費を除いた余剰資金が残っている場合は、
     // 工場枠の遊休化を防ぎ前線圧・戦線維持を継続するため、前線作戦へ向けて動員生産を行う。
     while immediate_reinforcement_funds >= 1000 {
@@ -1839,7 +2167,7 @@ pub(super) fn plan_production_with_registry(
                     || !scan.can_produce(*terrain, *unit_type)
                     || !can_join_operation(
                         scan,
-                        &mut ctx,
+                        ctx,
                         &op.anchor,
                         op.facts.requires_transport,
                         facility,
@@ -1946,14 +2274,8 @@ pub(super) fn plan_production_with_registry(
             &scan.damage_chart,
         );
 
-        let deployment = planned_deployment(
-            scan,
-            &mut ctx,
-            &operations[op_index],
-            role,
-            &candidate,
-            None,
-        );
+        let deployment =
+            planned_deployment(scan, ctx, &operations[op_index], role, &candidate, None);
 
         if allocation
             .try_claim(
@@ -1997,7 +2319,34 @@ pub(super) fn plan_production_with_registry(
             capture_intent: None,
         });
     }
+}
 
+fn finalize_turn_production(
+    input: &ProductionInputs<'_>,
+    state: ProductionState,
+    plan_registry: &mut V4RollingPlanRegistry,
+    surplus: SurplusBudget,
+) -> (Vec<PlannedProduction>, ProductionPlanTrace) {
+    let ProductionInputs {
+        scan,
+        player_id,
+        turn,
+        ..
+    } = *input;
+    let ProductionState {
+        operations,
+        ledger,
+        mut plan_trace,
+        allocation,
+        seen_plan_ids,
+        mut commands,
+        ..
+    } = state;
+    let SurplusBudget {
+        unissued_plan_reserve,
+        contingency_reserve,
+        ..
+    } = surplus;
     production_finalize::finalize(scan, &mut commands, &mut plan_trace, plan_registry, true);
 
     plan_registry.reconcile_unseen_plans(player_id, turn, &seen_plan_ids);
@@ -2219,6 +2568,29 @@ pub(super) fn enemy_reinforcement_assessment(
 /// `combat_plan_required`は呼び出し条件にだけ残し、候補数・生産停止・完了判定には使わない。
 /// 既存unitと同じ手番に発注済みのunitを初期編成へ入れ、敵EntityのHPが0になるまで
 /// ターン単位で攻撃を進めた結果から必要な購入だけを返す。
+#[derive(Clone, Copy)]
+struct CombatInputs<'a> {
+    scan: &'a BoardScan,
+    op: &'a Operation,
+    used_facilities: &'a HashSet<GridPosition>,
+    committed_combat_entities: &'a HashSet<Entity>,
+    staged_combat_entities: &'a HashSet<Entity>,
+    remaining_funds: u32,
+    require_self_deployment: bool,
+    player_id: PlayerId,
+}
+
+/// 構築途中の入力。対象・既存戦力・購入候補をこの順で確定する。
+struct CombatDraft {
+    enemies: Vec<EnemyPlanUnit>,
+    hard_deadline: Option<u32>,
+    capture_completion_turn: Option<u32>,
+    required_capture_survivors: usize,
+    existing_units: Vec<FriendlyPlanUnit>,
+    protected_units: Vec<FriendlyPlanUnit>,
+    options: Vec<rolling_plan::ProductionPlanOption>,
+    production_attack_projections: Vec<Vec<Option<ProductionAttackProjection>>>,
+}
 #[allow(clippy::too_many_arguments)]
 pub(super) fn combat_plan_input(
     scan: &BoardScan,
@@ -2231,6 +2603,31 @@ pub(super) fn combat_plan_input(
     require_self_deployment: bool,
     player_id: PlayerId,
 ) -> Option<RollingPlanInput> {
+    let input = CombatInputs {
+        scan,
+        op,
+        used_facilities,
+        committed_combat_entities,
+        staged_combat_entities,
+        remaining_funds,
+        require_self_deployment,
+        player_id,
+    };
+    let mut draft = collect_combat_targets(&input, ctx)?;
+    collect_existing_force(&input, ctx, &mut draft);
+    collect_production_options(&input, ctx, &mut draft);
+    draft.production_attack_projections = project_production_attacks(&input, ctx, &draft);
+    finish_combat_input(&input, draft)
+}
+
+fn collect_combat_targets(input: &CombatInputs<'_>, ctx: &mut ReachCtx) -> Option<CombatDraft> {
+    let CombatInputs {
+        scan,
+        op,
+        player_id,
+        ..
+    } = *input;
+
     let enemies: Vec<_> = op
         .reachable_threats
         .iter()
@@ -2254,7 +2651,7 @@ pub(super) fn combat_plan_input(
             }
         })
         .collect();
-    let mut hard_deadline =
+    let hard_deadline =
         if op.kind == OperationKind::Defense && op.facts.enemy_contact_eta != u32::MAX {
             Some(op.facts.enemy_contact_eta.max(1))
         } else if op.kind == OperationKind::Capture {
@@ -2288,8 +2685,7 @@ pub(super) fn combat_plan_input(
     let campaign_objective = scan.campaign_objectives.iter().find(|objective| {
         objective.anchor == op.anchor || op.objective_properties.contains(&objective.anchor)
     });
-    let disaggregated_control = op.property_control.filter(|control| control.disaggregated);
-    let mut capture_completion_turn = if op.property_controls.is_empty() {
+    let capture_completion_turn = if op.property_controls.is_empty() {
         campaign_objective.and_then(|objective| objective.capture_eta)
     } else {
         None
@@ -2392,6 +2788,31 @@ pub(super) fn combat_plan_input(
         return None;
     }
 
+    Some(CombatDraft {
+        enemies,
+        hard_deadline,
+        capture_completion_turn,
+        required_capture_survivors,
+        existing_units: Vec::new(),
+        protected_units: Vec::new(),
+        options: Vec::new(),
+        production_attack_projections: Vec::new(),
+    })
+}
+
+fn collect_existing_force(input: &CombatInputs<'_>, ctx: &mut ReachCtx, draft: &mut CombatDraft) {
+    let CombatInputs {
+        scan,
+        op,
+        committed_combat_entities,
+        staged_combat_entities,
+        player_id,
+        ..
+    } = *input;
+    let enemies = &draft.enemies;
+    let hard_deadline = draft.hard_deadline;
+    let mut capture_completion_turn = draft.capture_completion_turn;
+    let required_capture_survivors = draft.required_capture_survivors;
     let mut existing_units = Vec::new();
     for unit in &scan.my_units {
         let Some(entity) = unit.entity else {
@@ -2517,6 +2938,27 @@ pub(super) fn combat_plan_input(
             .map(|arrival| arrival.saturating_add(CAPTURE_COMPLETION_TURNS));
     }
 
+    draft.existing_units = existing_units;
+    draft.protected_units = protected_units;
+    draft.capture_completion_turn = capture_completion_turn;
+}
+
+fn collect_production_options(
+    input: &CombatInputs<'_>,
+    ctx: &mut ReachCtx,
+    draft: &mut CombatDraft,
+) {
+    let CombatInputs {
+        scan,
+        op,
+        used_facilities,
+        require_self_deployment,
+        player_id,
+        ..
+    } = *input;
+    let enemies = &draft.enemies;
+    let hard_deadline = draft.hard_deadline;
+    let capture_completion_turn = draft.capture_completion_turn;
     // 局地Captureで首都戦用の12手番すべての施設×兵種を展開すると、敵が数体
     // 現れただけでbeam候補が急増する。局地パッケージは占領完了ETAまでに投入可能な
     // 生産枠だけを比較し、長期の全軍編成はAssaultCapital側へ分離する。
@@ -2684,6 +3126,22 @@ pub(super) fn combat_plan_input(
                 || ((enemies.is_empty() || is_small_map) && option.stats.max_range > 0)
         });
     }
+    draft.options = options;
+}
+
+fn project_production_attacks(
+    input: &CombatInputs<'_>,
+    ctx: &mut ReachCtx,
+    draft: &CombatDraft,
+) -> Vec<Vec<Option<ProductionAttackProjection>>> {
+    let CombatInputs {
+        scan,
+        op,
+        player_id,
+        ..
+    } = *input;
+    let enemies = &draft.enemies;
+    let options = &draft.options;
     let next_occupancy = next_activation_occupants(scan, op, player_id);
     let projected_target_cells = enemies
         .iter()
@@ -2716,7 +3174,8 @@ pub(super) fn combat_plan_input(
     let mut projected_action_caches = (0..enemies.len())
         .map(|_| ActionTurnDistanceCache::default())
         .collect::<Vec<_>>();
-    let production_attack_projections = options
+
+    options
         .iter()
         .map(|option| {
             enemies
@@ -2871,7 +3330,28 @@ pub(super) fn combat_plan_input(
                 })
                 .collect::<Vec<_>>()
         })
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>()
+}
+
+fn finish_combat_input(input: &CombatInputs<'_>, draft: CombatDraft) -> Option<RollingPlanInput> {
+    let CombatInputs {
+        scan,
+        op,
+        remaining_funds,
+        player_id,
+        ..
+    } = *input;
+    let CombatDraft {
+        enemies,
+        mut hard_deadline,
+        capture_completion_turn,
+        required_capture_survivors,
+        existing_units,
+        protected_units,
+        options,
+        production_attack_projections,
+    } = draft;
+    let disaggregated_control = op.property_control.filter(|control| control.disaggregated);
     let deadline_target_index = disaggregated_control
         .filter(|control| control.approach == PropertyControlApproach::Interdict)
         .and_then(|control| {
