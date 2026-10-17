@@ -33,6 +33,15 @@ pub(super) enum PlanningPolicy {
 }
 
 impl PlanningPolicy {
+    /// 占領の完了したanchorに残るV4配備戦闘Entityの扱い。
+    fn secured_anchor_rule(self) -> crate::ai::v4::deployment::SecuredAnchorRule {
+        use crate::ai::v4::deployment::SecuredAnchorRule;
+        match self {
+            Self::Standard => SecuredAnchorRule::Release,
+            Self::SmallMap => SecuredAnchorRule::Hold,
+        }
+    }
+
     /// SquadManagerをWorldから外す前の準備（小規模V4: 戦略パイプラインの事前処理）。
     fn before_manager_removal(self, world: &mut World, player: PlayerId, is_v4: bool) {
         if self == Self::SmallMap && is_v4 {
@@ -452,6 +461,7 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
                 &mut manager,
                 player,
                 &HashSet::default(),
+                policy.secured_anchor_rule(),
                 &mut caches.connectivity,
             );
         campaign.reserved_entities.extend(deployment_reserved);

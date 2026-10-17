@@ -80,11 +80,10 @@ fn capital_launch_gate_opens_after_first_attack_wave_is_produced() {
     assert!(registry.operation_launch_ready(player, island));
 }
 
-/// 初撃波だけ完成し後続増援が未完成のとき、首都Planの出撃姿勢は経路で異なる
-/// （F20の経路差を固定する）。通常経路は全購入の完成まで集結を続け、拡張経路は
-/// 初撃までに予定された波の完成で出撃する。
+/// 初撃波だけ完成し後続増援が未完成のとき、首都Planはどちらの経路でも出撃する。
+/// 全購入の完成まで集結を続けると、生産済みの戦力が集結地点で滞留する。
 #[test]
-fn capital_launch_posture_waits_for_all_purchases_only_on_main_path() {
+fn capital_launch_posture_departs_with_the_first_attack_wave_on_both_paths() {
     use super::super::deployment::DeploymentPosture;
 
     let player = PlayerId(1);
@@ -101,7 +100,7 @@ fn capital_launch_posture_waits_for_all_purchases_only_on_main_path() {
     for (path, expected) in [
         (
             crate::ai::code_path::CodePath::MainCompatible,
-            DeploymentPosture::Forming,
+            DeploymentPosture::Execute,
         ),
         (
             crate::ai::code_path::CodePath::Extended,

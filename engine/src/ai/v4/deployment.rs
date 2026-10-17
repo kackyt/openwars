@@ -1048,6 +1048,50 @@ fn resolve_target(
     })
 }
 
+/// 敵を排除した配備戦闘Entityが、占領の完了したanchorに残るか。
+///
+/// Combat枠は対象拠点の占領完了まではanchorで反撃増援を待ち受ける。占領が完了した後も
+/// 留まると、次手番のPlan更新まで確保済みの拠点で戦力が止まる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecuredAnchorRule {
+    /// free poolへ返し、次の拠点へ向かう編成に委ねる（次手番のPlan更新で次anchorへ復帰する）。
+    /// 標準マップでは確保済み拠点での滞留を解き、進軍と決着を早める。
+    Release,
+    /// anchorで待ち受け続ける。小規模マップでは解放した戦力が汎用編成へ流れ、
+    /// 押し切れていた局面を判定勝ちへ落とすため（map_2で実測）、従来どおり留める。
+    Hold,
+}
+
+impl SecuredAnchorRule {
+    /// 実行中の経路に対応する規則。Squad再編の方策を持たない呼出側が使う。
+    pub(crate) fn for_current_path() -> Self {
+        if crate::ai::code_path::is_extended() {
+            Self::Hold
+        } else {
+            Self::Release
+        }
+    }
+
+    /// `secured` がanchorの確保済みを返すときに配備を解放するか。
+    fn releases(self, secured: impl FnOnce() -> bool) -> bool {
+        self == Self::Release && secured()
+    }
+}
+
+/// 配備の作戦目的だったanchor施設が、既に自軍の占領で確保されたか。
+///
+/// 防衛Planのanchorは元から自軍施設なので、所有していても確保済みとは扱わない。
+fn anchor_secured(
+    world: &World,
+    intent: &PendingDeployment,
+    defense_plans: &HashSet<PlanId>,
+) -> bool {
+    intent
+        .plan_step
+        .is_none_or(|step| !defense_plans.contains(&step.plan_id))
+        && target_resolution::anchor_is_owned_by(world, intent.anchor, intent.player_id)
+}
+
 /// 生産済みEntityを汎用free poolより先にV4局地Attack任務へ予約する。
 ///
 /// 島嶼キャンペーンで既に予約されたEntityは既存作戦を優先し、次ターン再試行する。
@@ -1062,6 +1106,7 @@ pub(crate) fn prepare_deployment_squads(
         manager,
         player_id,
         higher_priority_reserved,
+        SecuredAnchorRule::for_current_path(),
         &mut TerrainConnectivity::default(),
     )
 }
@@ -1074,10 +1119,11 @@ pub(crate) fn prepare_deployment_squads_with_connectivity(
     manager: &mut SquadManager,
     player_id: PlayerId,
     higher_priority_reserved: &HashSet<Entity>,
+    secured_anchor_rule: SecuredAnchorRule,
     connectivity: &mut TerrainConnectivity,
 ) -> HashSet<Entity> {
-    // 拡張経路では、占領枠の直接任務化と、迎撃役の上限つき目標解決（H06）を使う。
-    // Entityの走査順・Squadの付け替え・解放の手順は両経路で共通。
+    // 拡張経路では、迎撃役の上限つき目標解決（H06）を使う。
+    // 占領枠の直接任務化、Entityの走査順・Squadの付け替え・解放の手順は両経路で共通。
     let is_extended_path = crate::ai::code_path::is_extended();
     let mut target_commitments: HashMap<Entity, usize> = HashMap::default();
     let mut interceptors = 0_usize;
@@ -1090,6 +1136,10 @@ pub(crate) fn prepare_deployment_squads_with_connectivity(
         .get_resource::<IslandMap>()
         .cloned()
         .or_else(|| world.get_resource::<Map>().map(IslandMap::analyze));
+    let defense_plans = world
+        .get_resource::<super::plan_revision::V4RollingPlanRegistry>()
+        .map(|plans| plans.defense_plan_ids(player_id))
+        .unwrap_or_default();
     let mut entities: Vec<_> = registry
         .assigned
         .iter()
@@ -1117,10 +1167,8 @@ pub(crate) fn prepare_deployment_squads_with_connectivity(
             DeploymentPosture::Forming => {
                 (None, snapshot.intent.staging_anchor, MissionType::Defense)
             }
-            // 拡張経路の占領枠は敵の目標解決を行わず、anchor物件への占領任務にする。
-            DeploymentPosture::Execute
-                if is_extended_path && snapshot.intent.slot_kind == SlotKind::Capture =>
-            {
+            // 占領枠は敵の目標解決を行わず、anchor物件への占領任務にする。
+            DeploymentPosture::Execute if snapshot.intent.slot_kind == SlotKind::Capture => {
                 // anchor物件が既に自軍所有なら占領任務は達成済み。任務を出し続けると
                 // 占領役が物件上に留まり続け、生産マス前の通路を塞ぐため解放する。
                 if target_resolution::anchor_is_owned_by(world, snapshot.intent.anchor, player_id) {
@@ -1155,7 +1203,12 @@ pub(crate) fn prepare_deployment_squads_with_connectivity(
                     }
                     // Combat排除後も対象拠点の占領完了まではPlanを閉じない。
                     // 生産戦力をfree poolへ返さず、anchorで反撃増援を待ち受ける。
-                    None if snapshot.intent.plan_step.is_some() => {
+                    // 占領が完了したanchorの扱いは呼出側の規則に従う（[`SecuredAnchorRule`]）。
+                    None if snapshot.intent.plan_step.is_some()
+                        && !secured_anchor_rule.releases(|| {
+                            anchor_secured(world, &snapshot.intent, &defense_plans)
+                        }) =>
+                    {
                         (None, snapshot.intent.anchor, MissionType::Defense)
                     }
                     None => {
@@ -2045,6 +2098,109 @@ mod tests {
                 .iter()
                 .all(|squad| !squad.members.contains(&attacker))
         );
+    }
+
+    fn plan_step(plan_id: u64) -> PlanStepRef {
+        PlanStepRef {
+            plan_id: PlanId(plan_id),
+            revision: crate::ai::v4::plan_revision::PlanRevision(0),
+            step_id: crate::ai::v4::plan_revision::PlanStepId(0),
+        }
+    }
+
+    /// 敵を排除した後も、anchor施設の占領が完了するまではanchorで待ち受ける。
+    /// 占領が完了したら確保済みのanchorに留まらず、free poolへ戻って次の拠点へ向かう。
+    #[test]
+    fn combat_deployment_leaves_anchor_once_its_capture_is_secured() {
+        let (mut world, attacker, priority, transport, capture) = deployment_world();
+        for enemy in [priority, transport, capture] {
+            world.despawn(enemy);
+        }
+        let anchor = GridPosition { x: 5, y: 0 };
+        let property = world
+            .spawn((anchor, Property::new(Terrain::City, None, 20)))
+            .id();
+        world
+            .resource_mut::<V4DeploymentRegistry>()
+            .assigned
+            .get_mut(&attacker)
+            .unwrap()
+            .intent
+            .plan_step = Some(plan_step(1));
+        let mut manager = SquadManager::default();
+
+        let reserved =
+            prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::default());
+        assert!(reserved.contains(&attacker), "未占領のanchorでは待ち受ける");
+        let squad = manager
+            .squads
+            .iter()
+            .find(|squad| squad.members.contains(&attacker))
+            .unwrap();
+        assert_eq!(squad.plan.mission_type, MissionType::Defense);
+        assert_eq!(squad.plan.target, Some(anchor));
+
+        world.get_mut::<Property>(property).unwrap().owner_id = Some(PlayerId(1));
+        let reserved =
+            prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::default());
+
+        assert!(!reserved.contains(&attacker));
+        assert!(!world.resource::<V4DeploymentRegistry>().assigned[&attacker].active);
+        assert!(
+            manager
+                .squads
+                .iter()
+                .all(|squad| !squad.members.contains(&attacker))
+        );
+    }
+
+    /// 小規模マップの経路は、占領の完了したanchorでも配備戦闘Entityを待ち受けさせ続ける。
+    #[test]
+    fn small_map_path_holds_combat_deployment_at_a_secured_anchor() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
+        let (mut world, attacker, priority, transport, capture) = deployment_world();
+        for enemy in [priority, transport, capture] {
+            world.despawn(enemy);
+        }
+        let anchor = GridPosition { x: 5, y: 0 };
+        world.spawn((anchor, Property::new(Terrain::City, Some(PlayerId(1)), 20)));
+        world
+            .resource_mut::<V4DeploymentRegistry>()
+            .assigned
+            .get_mut(&attacker)
+            .unwrap()
+            .intent
+            .plan_step = Some(plan_step(1));
+        let mut manager = SquadManager::default();
+
+        let reserved =
+            prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::default());
+
+        assert!(reserved.contains(&attacker));
+        let squad = manager
+            .squads
+            .iter()
+            .find(|squad| squad.members.contains(&attacker))
+            .unwrap();
+        assert_eq!(squad.plan.mission_type, MissionType::Defense);
+        assert_eq!(squad.plan.target, Some(anchor));
+    }
+
+    /// 防衛Planのanchorは元から自軍施設なので、所有していても確保済みとは扱わない。
+    #[test]
+    fn defense_plan_anchor_is_not_treated_as_a_secured_capture() {
+        let (mut world, _, _, _, _) = deployment_world();
+        let anchor = GridPosition { x: 5, y: 0 };
+        world.spawn((anchor, Property::new(Terrain::City, Some(PlayerId(1)), 20)));
+        let intent = PendingDeployment {
+            plan_step: Some(plan_step(7)),
+            anchor,
+            ..pending(0)
+        };
+        let defense_plans = [PlanId(7)].into_iter().collect::<HashSet<_>>();
+
+        assert!(!anchor_secured(&world, &intent, &defense_plans));
+        assert!(anchor_secured(&world, &intent, &HashSet::default()));
     }
 
     #[test]
