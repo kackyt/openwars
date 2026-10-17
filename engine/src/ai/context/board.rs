@@ -3,10 +3,8 @@
 //! 戦略分析とSquad編成は、同じ盤面からunit・物件・地図を別々に集め直していた。
 //! [`PlayerBoard`] はそれらを1回だけWorldから写し取り、両者へ同じ事実を渡す。
 //!
-//! 占有モデルは用途で2種類あり、どちらも意図して維持する（統一は戦略変更になる）。
-//!
-//! - [`PlayerBoard::strategic_occupancy`] ― 戦略分析用。搭載中のunitも含め、空き枠は最大積載数とみなす
-//! - [`PlayerBoard::formation_occupancy`] ― 編成用。搭載中のunitを除き、空き枠は実際の積載から求める
+//! 占有モデルは戦略分析とSquad編成で共通の [`PlayerBoard::occupancy`] 1つだけを使う。
+//! 搭載中のunitは地図上に居ないので除き、輸送unitの空き枠は実際の積載から求める。
 //!
 //! unitと物件はWorldのクエリ列挙順のまま保持する。占有や所有のmapはこの順に挿入するため、
 //! 個別にWorldを走査していたときと同じ内容・同じ反復順になる。
@@ -153,20 +151,11 @@ impl PlayerBoard {
         }
     }
 
-    /// 戦略分析の占有モデル。搭載中のunitも含め、輸送unitの空き枠は最大積載数とみなす。
-    pub fn strategic_occupancy(&self) -> HashMap<(usize, usize), OccupantInfo> {
-        let mut occupancy = HashMap::default();
-        for unit in &self.units {
-            occupancy.insert(
-                (unit.position.x, unit.position.y),
-                occupant_info(unit, unit.stats.max_cargo),
-            );
-        }
-        occupancy
-    }
-
-    /// 編成の占有モデル。搭載中のunitを除き、輸送unitの空き枠は実際の積載から求める。
-    pub fn formation_occupancy(&self) -> HashMap<(usize, usize), OccupantInfo> {
+    /// 盤面の占有。搭載中のunitを除き、輸送unitの空き枠は実際の積載から求める。
+    ///
+    /// 戦略分析（首都脅威・物件脅威・対空）と編成のターン距離が同じ占有を読む。
+    /// 搭載中のunitは座標が残っていても地図上の進路を塞がない。
+    pub fn occupancy(&self) -> HashMap<(usize, usize), OccupantInfo> {
         let mut occupancy = HashMap::default();
         for unit in self.units.iter().filter(|unit| !unit.transported) {
             let free_slots = unit
@@ -241,32 +230,30 @@ mod tests {
     }
 
     #[test]
-    fn formation_occupancy_excludes_cargo_and_counts_actual_free_slots() {
-        let (mut world, _, _) = board_world();
+    fn occupancy_excludes_cargo_and_counts_actual_free_slots() {
+        let (mut world, _, cargo) = board_world();
         let board = PlayerBoard::observe(&mut world, PlayerId(1));
 
-        let occupant = &board.formation_occupancy()[&(1, 0)];
+        // 同じ座標に搭載中unitが居ても、列挙順に関係なく輸送unitが占有者になる。
+        let occupancy = board.occupancy();
+        let occupant = &occupancy[&(1, 0)];
         assert!(occupant.is_transport);
         assert_eq!(occupant.free_slots, 1);
-    }
-
-    #[test]
-    fn strategic_occupancy_keeps_cargo_and_assumes_full_free_slots() {
-        let (mut world, transport, cargo) = board_world();
-        let board = PlayerBoard::observe(&mut world, PlayerId(1));
-
-        // 搭載中のunitも含めるため、同じ座標では後に列挙されたunitが残る。
-        let last = board.units.last().unwrap();
-        let occupant = &board.strategic_occupancy()[&(1, 0)];
-        assert_eq!(occupant.is_transport, last.entity == transport);
-        if last.entity == transport {
-            assert_eq!(occupant.free_slots, 2);
-        }
+        assert_eq!(occupancy.len(), 1);
         let cargo_unit = board
             .units
             .iter()
             .find(|unit| unit.entity == cargo)
             .unwrap();
         assert!(!cargo_unit.is_deployed());
+    }
+
+    #[test]
+    fn occupancy_ignores_a_loaded_unit_left_on_another_tile() {
+        let (mut world, _, cargo) = board_world();
+        *world.get_mut::<GridPosition>(cargo).unwrap() = GridPosition { x: 3, y: 0 };
+        let board = PlayerBoard::observe(&mut world, PlayerId(1));
+
+        assert!(!board.occupancy().contains_key(&(3, 0)));
     }
 }

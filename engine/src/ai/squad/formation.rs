@@ -243,7 +243,7 @@ impl<'a> FormationBoard<'a> {
         let player = snapshot.player;
         let map = &snapshot.map;
         let island_map = &snapshot.island_map;
-        let unit_positions = snapshot.formation_occupancy();
+        let unit_positions = snapshot.occupancy();
         let ownership = snapshot.property_ownership();
         let capital = snapshot
             .properties

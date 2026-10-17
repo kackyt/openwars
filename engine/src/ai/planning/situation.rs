@@ -252,8 +252,8 @@ fn capital_is_threatened(
     capital: GridPosition,
     enemy_units: &[(GridPosition, UnitStats)],
 ) -> bool {
-    // 戦略分析の占有モデル（搭載中を含み、空き枠は最大積載数）。
-    let unit_positions = board.strategic_occupancy();
+    // 編成と共通の占有（搭載中のunitは進路を塞がない）。
+    let unit_positions = board.occupancy();
     let mut turn_cache = TurnDistanceCache::default();
     let enemy_id = board.player.opposite();
     enemy_units.iter().any(|(enemy_pos, enemy_stats)| {
@@ -337,6 +337,43 @@ mod tests {
         );
         assert_eq!(situation.my_units.len(), 1);
         assert_eq!(situation.enemy_units.len(), 1);
+    }
+
+    /// 搭載中のunitは盤面に居ない（6b③）。地図上の座標が残っていても敵の進路を塞がず、
+    /// 2ターンで首都へ届く敵戦車を脅威として判定する。
+    #[test]
+    fn loaded_unit_with_stale_position_does_not_block_capital_threat() {
+        let mut world = World::new();
+        world.insert_resource(Map::new(10, 1, Terrain::Plains, GridTopology::Square));
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+        let (p1, p2) = (PlayerId(1), PlayerId(2));
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(p1), 100),
+        ));
+        // 9マス先の敵戦車（移動6）は、何も塞がなければ2ターンで首都へ届く。
+        world.spawn((GridPosition { x: 9, y: 0 }, Faction(p2), tank()));
+        // 1マス幅の通路の途中に、搭載中で座標だけ残った自軍unitを置く。
+        let carrier = world.spawn_empty().id();
+        world.spawn((
+            GridPosition { x: 5, y: 0 },
+            Faction(p1),
+            UnitStats::mock(),
+            crate::components::Transporting(carrier),
+        ));
+        let board = PlayerBoard::observe(&mut world, p1);
+
+        let situation = assess(&board);
+
+        assert_eq!(situation.phase, GamePhase::Defense);
+        assert_eq!(
+            situation.priority_targets,
+            vec![GridPosition { x: 0, y: 0 }]
+        );
+        assert!(
+            situation.my_units.is_empty(),
+            "搭載中unitは地図上の自軍に数えない"
+        );
     }
 
     #[test]

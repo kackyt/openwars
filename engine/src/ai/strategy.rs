@@ -209,8 +209,8 @@ fn apply_production_demand(
     let need_more_revenue = situation.need_more_revenue;
     let get_island_id =
         |pos: &GridPosition| -> Option<usize> { island_map.get_island_at(pos).map(|i| i.id.0) };
-    // 戦略分析の占有モデル（搭載中を含み、空き枠は最大積載数）。
-    let unit_positions = board.strategic_occupancy();
+    // 編成と共通の占有（搭載中のunitは進路を塞がない）。
+    let unit_positions = board.occupancy();
 
     // 理想構成の適用
     match strategy.phase {
