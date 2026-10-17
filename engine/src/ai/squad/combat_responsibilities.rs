@@ -250,15 +250,15 @@ pub(super) fn campaign_combat_responsibilities_for_enemies(
         }
         // 全員が到達できる共通敵を最優先し、無ければ最多memberを受け持つ局所目標を選ぶ。
         candidates.sort_by_key(|(enemy, target, reachable, total_distance)| {
-            (
+            std::cmp::Reverse((
                 usize::MAX - reachable.len(),
                 *total_distance,
                 target.y,
                 target.x,
                 enemy.to_bits(),
-            )
+            ))
         });
-        let (_, target, reachable, _) = candidates.remove(0);
+        let (_, target, reachable, _) = candidates.pop().unwrap();
         let assigned: Vec<_> = reachable.iter().map(|(member, _)| *member).collect();
         let assigned_set: HashSet<_> = assigned.iter().copied().collect();
         remaining.retain(|member| !assigned_set.contains(member));

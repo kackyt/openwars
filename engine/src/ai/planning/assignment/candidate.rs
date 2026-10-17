@@ -63,16 +63,20 @@ pub(crate) fn assignment_candidate_key(
         // 前手番の具体Squadを維持する。
         return Some((3, candidate.mission_rank, candidate.squad_id.0));
     }
-    match existing.map(|assignment| assignment.owner) {
-        Some(OperationOwner::Campaign { .. }) if existing.unwrap().owner != candidate.owner => {
+    match existing {
+        Some(assignment)
+            if matches!(assignment.owner, OperationOwner::Campaign { .. })
+                && assignment.owner != candidate.owner =>
+        {
             // campaign間の移管は作戦plannerが明示する。Squadの重複だけでは横取りしない。
             None
         }
-        Some(owner) if owner == candidate.owner => {
+        Some(assignment) if assignment.owner == candidate.owner => {
             Some((4, candidate.mission_rank, candidate.squad_id.0))
         }
-        Some(OperationOwner::TacticalSquad { .. })
-            if matches!(candidate.owner, OperationOwner::Campaign { .. }) =>
+        Some(assignment)
+            if matches!(assignment.owner, OperationOwner::TacticalSquad { .. })
+                && matches!(candidate.owner, OperationOwner::Campaign { .. }) =>
         {
             Some((5, candidate.mission_rank, candidate.squad_id.0))
         }
