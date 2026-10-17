@@ -38,7 +38,7 @@ th,td{padding:12px;border-bottom:1px solid var(--line);text-align:left;vertical-
 <div class="notice">
 <p><strong>現行計画の正本です。段階1〜5は実装・検証済みです。</strong>実績と検証記録は <a href="ai-redesign-v3-stage1.md">段階1</a>・<a href="ai-redesign-v3-stage2.md">段階2</a>・<a href="ai-redesign-v3-stage3.md">段階3</a>・<a href="ai-redesign-v3-stage3b.md">段階3b</a>・<a href="ai-redesign-v3-stage4.md">段階4</a>・<a href="ai-redesign-v3-stage5.md">段階5</a> を参照してください。</p>
 <p><strong>段階6aの主要構造変更は実装済みです。資源pool観測の追補は段階6の実績欄に分離して記録します。</strong>残る7個の <code>*/extended.rs</code> を責務名へ分離し、合同探索・戦闘占領simulation・比較器・Roadmap観測を段分割しました。移動版・段分割版・一時スイッチ撤去版はいずれも28条件50Tの全行動履歴本文が基準と一致しています。</p>
-<p><strong>段階6全体は未完了です。</strong>6b①の編成後観測限定は既存実装・回帰試験を確認済みですが、D-5、占有モデル統一、兵種バランス変更は未採用です。これらは構造変更に混ぜず、最小反例と単独評価を必要とします。</p>
+<p><strong>段階6全体は未完了です。</strong>6b①の編成後観測限定は確認済み、②D-5と③占有モデル統一は採用済みです。④兵種バランスは直接射点数を一律に維持する候補を実装・検証しましたが、既存map_32の戦況契約を壊したため棄却しました。改善案は未採用で、最小反例と単独評価を伴う検討が残ります。</p>
 </div>
 <p class="meta">提案と段階別の詳細：<a href="ai-redesign-v3-proposal.md">AI再設計 v3 提案書</a> ／ 効果の見積り：<a href="ai-refactor-forecast.html">AI 再設計の効果見積り</a>。</p>
 <p class="meta">旧案と棚卸し：<a href="v4-map-branching-assessment.html">V4 構造整理の旧案</a> ／ <a href="v4-structure-map.html">旧構造マップと計測上の注意</a>。旧A〜Fは本計画の前提作業ではなく、置き換えられた案です。</p>
@@ -204,7 +204,8 @@ th,td{padding:12px;border-bottom:1px solid var(--line);text-align:left;vertical-
 <dt>6a追補3</dt><dd>2026-10-17：通常パッケージ探索 <code>plan_force_package</code>（206行）を、枠ごとの劣後除去・枠の展開・層の並列評価と最良案3種の更新（<code>BestPlans</code>）・beam縮約・最終整形へ分解した（区分R）。入口は206→40行、直接CC 25→5、直接認知48→3。新設関数はすべて直接CC5以下・認知5以下。全AIの最大/P95は不変。前倒し成功時に直後で上書きされていた死んだ代入2つだけを削除した。分割前に計画結果全体の指紋テスト5件（標準・妨害優先・小規模順位・早期return・実行不能補完）を固定した。全Rustテスト999件成功（既存ignore 2件）、Clippy・WASM・fmt成功。基準・分割の28条件50T（jobs=8）で全 <code>action_history</code> 本文・勝敗・終了turnが28/28一致。記録は <a href="ai-redesign-v3-stage6a-package-validation.json">通常パッケージ探索追補の検証記録</a>。</dd>
 <dt>6b②</dt><dd>2026-10-17：D-5を採用（区分S）。発行直前の検証で取り消した生産命令について、同時に保存した配備意図・受入slot予約・占領意図（campaign発注記録）を同じ手番に解放する処理を <code>v4/production_cancellation.rs</code> に一本化した。汎用V4生産とV4島嶼campaign列の両方が対象。永続Planの工程は発行前（Planned）のまま残し、次手番の生産失敗判定による同一計画内の再配置という既存契約を維持する。共通の発行列は取消命令を返すだけで、解放はV4側が行う。修正前に失敗する最小反例2件（取消後もpendingと発注記録が残る）と境界テスト4件を追加。50T・28条件の計測で取消は27件すべて終局後の監査記録で、対戦中の取消は0件だったため、直前採用版との28条件比較は全 <code>action_history</code> 本文・勝敗・終了turnが28/28一致した（想定どおり）。取消発生時の勝敗への効果は対戦条件に存在せず未評価。全Rustテスト1005件成功（既存ignore 2件）、Clippy・WASM・fmt成功。記録は <a href="ai-redesign-v3-stage6b-d5-validation.json">D-5の検証記録</a>。</dd>
 <dt>6b③</dt><dd>2026-10-17：占有モデルの統一を採用。戦略分析（首都脅威・物件脅威・対空評価）とSquad編成で別々だった占有を <code>PlayerBoard::occupancy</code> 1つにし、旧 <code>strategic_occupancy</code> を削除した。統一後の定義は、搭載中unitを除き輸送unitの空き枠を実積載から求める旧編成用の定義で、<code>BoardUnit::is_deployed</code> と同じく搭載中unitを地図上に置かない。消費者を調べた結果、どの消費者も「マスの占有有無と占有者のplayer」しか読まず、ゲームは搭載中unitを(9999,9999)へ移すため、実対局で生じ得る盤面では判断不変と結論した。差が出るのは搭載中unitの座標が地図内に残るルール外の盤面だけで、旧モデルがその搭載中unitを敵の進路を塞ぐ自軍として数え首都脅威を見落とす最小反例を、修正前に失敗するテストとして固定した。直前採用版との28条件50Tで全 <code>action_history</code> 本文・勝敗・終了turnが28/28一致。全Rustテスト1006件成功（既存ignore 2件）、Clippy・WASM・fmt成功。V1〜V3の対戦比較は未実施。記録は <a href="ai-redesign-v3-stage6b-occupancy-validation.json">占有モデル統一の検証記録</a>。</dd>
-<dt>残課題</dt><dd>既存診断（<code>report_frontier_witness_simulation</code>・<code>report_indirect_gate_audit</code> 等）には複雑度目安を超える関数が残る。すべての巨大関数や全AIの最大複雑度を解消したとは扱わない。6b①は既存の観測限定実装を確認済み、6b②D-5と③占有モデル統一は採用済み。④兵種バランスは未評価で、新たな戦略変更は未採用。12seed以上の最終非劣後評価と性能のA/A校正・最大メモリ比較も未実施。</dd>
+<dt>6b④試行</dt><dd>2026-10-17：前衛／間接バランスの候補として、小規模の間接upgradeに直接基準以上のユニーク直接射点数を求める単独変更を試したが、既存map_32後攻の戦況契約を壊したため棄却した。基準診断4対局と実戦由来リプレイにより、map_42後攻seed1のT6では戦車3体（射点2）から対空戦車2体＋軽自走砲（射点1）への採用が確認できた。新しい射点保持テストは旧実装で失敗・候補で成功した一方、既存テスト <code>map32_p2_small_map_expansion_opening_and_capture</code> がT15西側重要都市3箇所以上の維持条件に対して1箇所となり失敗した。Gate0で停止し、短期候補対戦・28条件比較・holdout評価は行っていない。ゲート・診断・試験用観測を基準版へ復元し、実験コードはローカル証跡へ退避した。6b④は未完了であり、射点の集約数を守れば前衛の生存や勝率が改善すると結論していない。記録は <a href="ai-redesign-v3-stage6b-balance-validation.json">兵種バランス候補の棄却記録</a>。</dd>
+<dt>残課題</dt><dd>既存診断（<code>report_frontier_witness_simulation</code>・<code>report_indirect_gate_audit</code> 等）には複雑度目安を超える関数が残る。すべての巨大関数や全AIの最大複雑度を解消したとは扱わない。6b①は既存の観測限定実装を確認済み、6b②D-5と③占有モデル統一は採用済み。④兵種バランスは射点数非減少の単独候補を試して棄却し、改善は未採用・未完了。12seed以上の最終非劣後評価と性能のA/A校正・最大メモリ比較も未実施。</dd>
 <dt>完了条件</dt><dd>コードベースから経路名ファイル（<code>extended.rs</code>）が消え、すべてのモジュールが責務名を持ち、各Sの採用/棄却の根拠が記録されている。段階6全体の完了には上記の残課題と個別評価を区別して閉じる必要がある。</dd>
 </dl>
 </article>
@@ -325,7 +326,7 @@ python scripts/measure_ai_complexity.py --root engine/src/ai --output &lt;段階
 </section>
 
 <footer>
-<p>2026-10-11：ゼロベース再設計の計画を保存。2026-10-16：段階1〜3bの完了実績を反映し、<code>v4/extended.rs</code> 解体と生産パイプライン統合を段階4〜6として統合。同日：段階4を完了し、次着手を段階5へ更新。同日：段階5を完了し、次着手を段階6aへ更新。2026-10-17：段階6aの資源pool観測を責務分解し、今回の検証記録と未完了項目を分離。同日：役割多重集合探索を責務分解。同日：通常パッケージ探索を責務分解。同日：6b②D-5（発行拒否時の意図解放）を採用。同日：6b③占有モデル統一を採用。</p>
+<p>2026-10-11：ゼロベース再設計の計画を保存。2026-10-16：段階1〜3bの完了実績を反映し、<code>v4/extended.rs</code> 解体と生産パイプライン統合を段階4〜6として統合。同日：段階4を完了し、次着手を段階5へ更新。同日：段階5を完了し、次着手を段階6aへ更新。2026-10-17：段階6aの資源pool観測を責務分解し、今回の検証記録と未完了項目を分離。同日：役割多重集合探索を責務分解。同日：通常パッケージ探索を責務分解。同日：6b②D-5（発行拒否時の意図解放）を採用。同日：6b③占有モデル統一を採用。同日：6b④の直接射点数維持候補を既存戦況契約の退行により棄却・復元。</p>
 <p><a href="ai-redesign-v3-proposal.md">v3提案書</a> ／ <a href="ai-redesign-v3-stage1.md">段階1</a> ／ <a href="ai-redesign-v3-stage2.md">段階2</a> ／ <a href="ai-redesign-v3-stage3.md">段階3</a> ／ <a href="ai-redesign-v3-stage3b.md">段階3b</a> ／ <a href="ai-redesign-v3-stage4.md">段階4</a> ／ <a href="ai-redesign-v3-stage5.md">段階5</a> ／ <a href="#stages">現行の段階計画</a></p>
 </footer>
 </main>
