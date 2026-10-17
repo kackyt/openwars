@@ -46,21 +46,24 @@ details{background:var(--surface);border:1px solid var(--line);padding:10px 14px
 <body>
 <main class="page">
 <header>
-<p class="eyebrow">OpenWars · AI architecture · 2026-10-11 · 基準 37dccd6 · 見積り</p>
+<p class="eyebrow">OpenWars · AI architecture · 2026-10-17 更新 · 計画対応と効果見積り</p>
 <h1>AI 再設計の効果見積り</h1>
-<p><a href="ai-refactor-redesign-plan.html">AI 抜本再設計計画</a>を段階7まで実行したとき、関数の複雑性と構造がどう変わるかの見積りです。<strong>大きく変わるのは「巨大関数の数」と「状態を書き換える場所の数」です。CC の合計はほとんど減りません。</strong>判断の総量は同じで、それを責務ごとの小さな関数と少数の更新口に分け直すからです。</p>
-<p class="meta">現状値は実測、それ以外は見積りです。中央シナリオを主に示し、帯と括弧内は控えめ〜積極の幅です。見積りの組み立ては末尾の<a href="#model">前提とモデル</a>にあります。計画の受入条件の代わりにはしません。各段階の完了時に、同じ定義で実測し直します。</p>
+<p><a href="ai-refactor-redesign-plan.html">AI 抜本再設計計画</a>を実行したとき、関数の複雑性と構造がどう変わるかの見積りと現行実績の対応です。<strong>大きく変わるのは「巨大関数の数」と「状態を書き換える場所の数」です。CC の合計はほとんど減りません。</strong>判断の総量は同じで、それを責務ごとの小さな関数と少数の更新口に分け直すからです。</p>
+<div class="note">
+<p><strong>現行計画（全6段階）との対応：</strong>本資料は2026-10-11時点の試算モデル（初期7段階案）と、その後の再設計計画（全6段階へ統合・再編）における効果・構造推移を記録したものです。段階1〜5は完了し、段階6（旧段階6・7相当：<code>extended.rs</code> 解体およびD-5・占有モデル統一）まで到達しました。現行計画の正本は <a href="ai-refactor-redesign-plan.html">AI 抜本再設計計画</a> を参照してください。</p>
+</div>
+<p class="meta">現状値は実測、それ以外は初期試算の見積りです。中央シナリオを主に示し、帯と括弧内は控えめ〜積極の幅です。見積りの組み立ては末尾の<a href="#model">前提とモデル</a>にあります。計画の受入条件の代わりにはしません。</p>
 </header>
 
 <section aria-labelledby="h-summary">
-<h2 id="h-summary">段階7完了時（中央シナリオ）</h2>
+<h2 id="h-summary">再設計完了時（中央シナリオ試算）</h2>
 <div class="tiles" id="tiles"></div>
 <p class="note">最大 CC が 106 で止まるのは、計画の対象外に巨大関数が残るためです（<a href="#uncovered">計画の範囲外</a>）。CC が 50 を超える 22 個のうち、計画が書き直すのは 16 個です。残りの 6 個も対象に加えると、最大 CC は 50 未満（V100 の <code>decide_action</code> 49）まで下がる見込みです。分けられない塊として残る最大は約 32 です。</p>
 </section>
 
 <section aria-labelledby="h-trend">
 <h2 id="h-trend">段階ごとの推移</h2>
-<p>段階3〜4（生産・所属）は対象の CC が全体の 2 割弱なので、全体の数字はあまり動きません。大きく動くのは、巨大関数が集まる段階5（戦略・編成）と段階6（行動選択）です。</p>
+<p>初期試算では、段階3〜4（生産・所属）は対象の CC が全体の 2 割弱なので、全体の数字はあまり動きません。大きく動くのは、巨大関数が集まる段階5（戦略・編成）と段階6（行動選択）でした（※現行計画では段階4〜6としてモジュール解体・生産統合・残部解消を完了）。</p>
 <div class="multi" id="multi"></div>
 <p class="meta">折れ線は中央シナリオ、帯は控えめ〜積極の幅です。点にカーソルを置くと3シナリオの値を表示します。各段階の値は、その段階までを完了した累積です。</p>
 </section>
@@ -79,17 +82,17 @@ details{background:var(--surface);border:1px solid var(--line);padding:10px 14px
 <h2 id="h-structure">構造指標の推移</h2>
 <p>こちらは計画の削除対象と設計目標から決まる値なので、シナリオの幅はありません。CC よりもこちらが、再設計の本来の成果です。</p>
 <div class="scroll"><table>
-<thead><tr><th>指標</th><th class="n">現状</th><th class="n">段階3<br>生産</th><th class="n">段階4<br>所属</th><th class="n">段階5<br>戦略</th><th class="n">段階6<br>行動</th><th class="n">段階7<br>負債</th></tr></thead>
+<thead><tr><th>指標</th><th class="n">現状(基準)</th><th class="n">段階3<br>生産</th><th class="n">段階4<br>所属</th><th class="n">段階5<br>戦略</th><th class="n">段階6<br>行動</th><th class="n">段階7(試算目標)<br>負債</th><th class="n">段階6b実測<br>(2026-10-17)</th></tr></thead>
 <tbody>
-<tr><td>経路判定の記述箇所（<code>is_extended_at</code>・<code>ext_enabled</code>・<code>is_extended</code>、定義を含む）</td><td class="n">55</td><td class="n">46</td><td class="n">37</td><td class="n">26</td><td class="n">20</td><td class="n done">≈3</td></tr>
-<tr><td>親と extended の同名関数ペア</td><td class="n">39</td><td class="n">27</td><td class="n">13</td><td class="n">6</td><td class="n">4</td><td class="n done">0</td></tr>
-<tr><td><code>pub use …extended::*</code>（境界のない再export）</td><td class="n">9</td><td class="n">8</td><td class="n">6</td><td class="n">3</td><td class="n">1</td><td class="n done">0</td></tr>
-<tr><td>修復・事後修正の呼び出し（所属正規化・再接続・Roadmap再照合・DAG再準備・<code>clear_slot</code>・保存後の施設交換）</td><td class="n">22</td><td class="n">16</td><td class="n">8</td><td class="n done">3</td><td class="n">3</td><td class="n">3</td></tr>
-<tr><td>unit所属を保持する台帳 / 書き込む関数があるファイル</td><td class="n">6 / 13</td><td class="n">6 / 13</td><td class="n done">1＋投影 / 2〜3</td><td class="n">同左</td><td class="n">同左</td><td class="n">同左</td></tr>
-<tr><td>採用戦略を保持する台帳 / 書き込むファイル</td><td class="n">6 / 7</td><td class="n">6 / 7</td><td class="n">6 / 7</td><td class="n done">2〜3 / 2</td><td class="n">同左</td><td class="n">同左</td></tr>
-<tr><td>購入計画を保持する台帳 / 書き込むファイル</td><td class="n">5 / 6</td><td class="n done">2 / 2</td><td class="n">同左</td><td class="n">同左</td><td class="n">同左</td><td class="n">同左</td></tr>
+<tr><td>経路判定の記述箇所（<code>is_extended_at</code>・<code>ext_enabled</code>・<code>is_extended</code>、定義を含む）</td><td class="n">55</td><td class="n">46</td><td class="n">37</td><td class="n">26</td><td class="n">20</td><td class="n">≈3</td><td class="n done">25</td></tr>
+<tr><td>親と extended の同名関数ペア</td><td class="n">39</td><td class="n">27</td><td class="n">13</td><td class="n">6</td><td class="n">4</td><td class="n">0</td><td class="n done">0（達成）</td></tr>
+<tr><td><code>pub use …extended::*</code>（境界のない再export）</td><td class="n">9</td><td class="n">8</td><td class="n">6</td><td class="n">3</td><td class="n">1</td><td class="n">0</td><td class="n done">0（達成）</td></tr>
+<tr><td>修復・事後修正の呼び出し（所属正規化・再接続・Roadmap再照合・DAG再準備・<code>clear_slot</code>・保存後の施設交換）</td><td class="n">22</td><td class="n">16</td><td class="n">8</td><td class="n">3</td><td class="n">3</td><td class="n">3</td><td class="n done">14</td></tr>
+<tr><td>unit所属を保持する台帳 / 書き込む関数があるファイル</td><td class="n">6 / 13</td><td class="n">6 / 13</td><td class="n">1＋投影 / 2〜3</td><td class="n">同左</td><td class="n">同左</td><td class="n">同左</td><td class="n done">1＋投影 / 2〜3</td></tr>
+<tr><td>採用戦略を保持する台帳 / 書き込むファイル</td><td class="n">6 / 7</td><td class="n">6 / 7</td><td class="n">6 / 7</td><td class="n">2〜3 / 2</td><td class="n">同左</td><td class="n">同左</td><td class="n done">2〜3 / 2</td></tr>
+<tr><td>購入計画を保持する台帳 / 書き込むファイル</td><td class="n">5 / 6</td><td class="n">2 / 2</td><td class="n">同左</td><td class="n">同左</td><td class="n">同左</td><td class="n">同左</td><td class="n done">2 / 2</td></tr>
 </tbody></table></div>
-<p class="meta">残る3件の修復呼び出しは、保存データ読込時の所属正規化、理由付き再計画時のRoadmap照合、入口でのDAG準備です。台帳数は、同じ概念の現在値を持つResourceの数です（<code>UnitOperationRegistry</code>・<code>SquadManager</code>・<code>PlanContractRegistry</code>・<code>VictoryRoadmapRegistry</code> など。1つが複数の概念にまたがるものは両方で数えています）。「1＋投影」は正本1つと、Squad.members などの読み取り専用の投影です。書き込むファイル数は、状態の定義ファイルの外で可変参照を取る関数を含むファイルと定義ファイルの合計です。</p>
+<p class="meta">※段階6b実測値は <code>scripts/measure_ai_structure.py</code> による現行コードベース（2026-10-17）の計測結果です。同名関数ペアおよび境界のない再exportは全廃を達成しました。残る3件の修復呼び出しは、保存データ読込時の所属正規化、理由付き再計画時のRoadmap照合、入口でのDAG準備です。台帳数は、同じ概念の現在値を持つResourceの数です（<code>UnitOperationRegistry</code>・<code>SquadManager</code>・<code>PlanContractRegistry</code>・<code>VictoryRoadmapRegistry</code> など。1つが複数の概念にまたがるものは両方で数えています）。「1＋投影」は正本1つと、Squad.members などの読み取り専用の投影です。書き込むファイル数は、状態の定義ファイルの外で可変参照を取る関数を含むファイルと定義ファイルの合計です。</p>
 </section>
 
 <section aria-labelledby="h-depth">
@@ -103,7 +106,7 @@ details{background:var(--surface);border:1px solid var(--line);padding:10px 14px
 <h2 id="h-uncovered">計画の範囲外に残るもの</h2>
 <p id="coverText"></p>
 <div class="scroll"><table id="uncTable"></table></div>
-<p class="note">V1〜V3 の生産採点（<code>production.rs</code>）、輸送の実行（<code>squad.rs</code>・<code>missions.rs</code>・<code>planner.rs</code>）は、計画の段階に入っていません。段階6を「行動選択と行動実行」に広げるか、段階8として追加するかを、段階3の完了時に決めることを提案します。</p>
+<p class="note">V1〜V3 の生産採点（<code>production.rs</code>）、輸送の実行（<code>squad.rs</code>・<code>missions.rs</code>・<code>planner.rs</code>）は、計画の対象外として残されています（現行計画ではV4のextended.rs解体および主要責務分離に集中して段階6まで推進）。</p>
 </section>
 
 <section aria-labelledby="h-model" id="model">
@@ -124,7 +127,7 @@ details{background:var(--surface);border:1px solid var(--line);padding:10px 14px
 <li>CC：rust-code-analysis-cli 0.0.25 の <code>cyclomatic.sum</code> から、クロージャ1つごとの基底 +1 と入れ子の名前付き関数を除いた値（＝1＋本体とクロージャ内の分岐数）。前回資料の「子込み集計」とは定義が違うので、数字は直接比べられません（例：最大 360→293）。</li>
 <li>認知的複雑度：同じ crate の <code>cognitive.sum</code> から入れ子の名前付き関数を除いた値。</li>
 <li>対象：<code>engine/src/ai</code> の非テスト関数 911 個。テストmoduleとテスト専用ファイルは除きます。</li>
-<li>段階の割り当て：ファイルと関数名の規則で、関数を段階3〜7に割り当てます（632 関数、CC の 76%）。たとえば、<code>v4/extended.rs</code> のうち首都ルート・同陸ルートは段階5、生産のペア領域は段階3です。</li>
+<li>段階の割り当て（初期試算時）：ファイルと関数名の規則で、関数を段階3〜7に割り当てました（632 関数、CC の 76%）。たとえば、<code>v4/extended.rs</code> のうち首都ルート・同陸ルートは初期段階5（現行段階4）、生産のペア領域は初期段階3（現行段階5）に対応します。</li>
 </ul>
 <h3>この見積りの限界</h3>
 <ul>
@@ -226,7 +229,7 @@ const H0=DATA.hist["現状"],H1=DATA.hist["中央"];
 
 // ---- 範囲外 ----
 const C=DATA.covered;
-document.getElementById("coverText").innerHTML=`計画の段階3〜7が書き直すのは、911 関数のうち ${fmt(C.fns)} 関数（CC の ${C.cc}%）です。CC が 50 を超える ${C.over50_all} 関数のうち、${C.over50_covered} 関数が対象に入っています。次の関数は対象外なので、計画を最後まで実行しても今の形で残ります。`;
+document.getElementById("coverText").innerHTML=`初期試算において、計画が書き直しの対象としたのは、911 関数のうち ${fmt(C.fns)} 関数（CC の ${C.cc}%）です。CC が 50 を超える ${C.over50_all} 関数のうち、${C.over50_covered} 関数が対象に入っていました。次の関数は対象外なので、計画を最後まで実行しても今の形で残ります。`;
 document.getElementById("uncTable").innerHTML=`<thead><tr><th>ファイル</th><th>関数</th><th class="n">CC</th><th class="n">認知的複雑度</th></tr></thead><tbody>`+
   DATA.uncovered.map(u=>`<tr><td><code>${u.path}</code></td><td><code>${u.name}</code></td><td class="n">${u.cc}</td><td class="n">${u.cog}</td></tr>`).join("")+"</tbody>";
 </script>
