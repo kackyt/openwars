@@ -1,11 +1,11 @@
 ---
 title: "PLAYBOOK"
-version: "1.19.0"
+version: "1.20.0"
 status: "approved"
 created: "2026-06-06"
-updated: "2026-08-24"
+updated: "2026-10-17"
 owner: "@t_kak"
-ace_entry_count: 43
+ace_entry_count: 46
 tags: [ace, playbook, knowledge-management]
 references:
   - docs/ACE_FRAMEWORK.md
@@ -164,14 +164,14 @@ Playbook が 800 行を超えた場合、以下のように分割する：
 
 | カテゴリ | サブファイル | エントリ数 | 主な内容 |
 | -------- | ------------ | ---------- | -------- |
-| `architecture` | [Architecture](./playbook/architecture.md) | 21 件 | 設計判断、構造上の決定事項、状態管理 |
+| `architecture` | [Architecture](./playbook/architecture.md) | 23 件 | 設計判断、構造上の決定事項、状態管理 |
 | `performance` | [Performance](./playbook/performance.md) | 9 件 | パフォーマンス最適化、キャッシュ、計算量削減 |
 | `coding` | [Coding](./playbook/coding.md) | 5 件 | コーディングパターン、言語固有・型安全のベストプラクティス |
 | `testing` | [Testing](./playbook/testing.md) | 4 件 | テスト戦略、テストパターン、モック・シミュレーション設計 |
 | `tooling` | [Tooling](./playbook/tooling.md) | 4 件 | ツール設定、ログ出力・可視化、開発環境・スキル |
 | `security` | [Security](./playbook/security.md) | 0 件 | セキュリティ対策、脆弱性防止、入力検証 |
 | `devops` | [Devops](./playbook/devops.md) | 0 件 | CI/CD、デプロイ、ビルドパイプライン |
-| `process` | [Process](./playbook/process.md) | 0 件 | 開発プロセス、ワークフロー改善、タスク管理 |
+| `process` | [Process](./playbook/process.md) | 1 件 | 開発プロセス、ワークフロー改善、タスク管理 |
 
 ---
 
@@ -222,10 +222,20 @@ Playbook が 800 行を超えた場合、以下のように分割する：
 | [ACE-101-1](./playbook/coding.md#ace-101-1) | コレクション走査中の ? オペレータ誤用による早期終了バグの防止とループ継続ガード | `coding` | PR #101 | `active` | [詳細](./playbook/coding.md#ace-101-1) |
 | [ACE-101-2](./playbook/architecture.md#ace-101-2) | 盤面集計・生産判定における撃破済みエンティティ（HP 0）の除外ガード | `architecture` | PR #101 | `active` | [詳細](./playbook/architecture.md#ace-101-2) |
 | [ACE-101-3](./playbook/tooling.md#ace-101-3) | 大量マスターデータ検証におけるリソース名・不正値を含めたコンテキスト付きエラー設計 | `tooling` | PR #101 | `active` | [詳細](./playbook/tooling.md#ace-101-3) |
+| [ACE-103-1](./playbook/architecture.md#ace-103-1) | 取り消された生産命令に伴う配備意図・受入予約・作戦発注の整合的ロールバック（D-5 意図解放の一本化） | `architecture` | PR #103 | `active` | [詳細](./playbook/architecture.md#ace-103-1) |
+| [ACE-103-2](./playbook/architecture.md#ace-103-2) | 複数サブシステム間での占有モデル（Occupancy）の単一情報源（SSOT）統一による意思決定乖離防止 | `architecture` | PR #103 | `active` | [詳細](./playbook/architecture.md#ace-103-2) |
+| [ACE-103-3](./playbook/process.md#ace-103-3) | 構造整理・状態整合化リファクタリングとゲーム挙動・バランス調整の厳格な分離 | `process` | PR #103 | `active` | [詳細](./playbook/process.md#ace-103-3) |
 
 ---
 
 ## Changelog
+
+### [1.20.0] - 2026-10-17
+
+#### 追加
+
+- PR #103 より知見抽出: ACE-103-1 (architecture), ACE-103-2 (architecture), ACE-103-3 (process)
+- カウンター更新: ACE-57-1 (performance) helpful+1
 
 ### [1.19.0] - 2026-08-24
 
