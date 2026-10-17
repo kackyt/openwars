@@ -7,11 +7,10 @@
 use super::operation::OperationKind;
 use super::rolling_plan::{FixedPackageError, ForcePackagePlan, PlannedPurchase};
 use crate::ai::islands::IslandId;
+use crate::collections::{HashMap, HashSet};
 use crate::components::{GridPosition, PlayerId};
 use crate::resources::UnitType;
 use bevy_ecs::prelude::*;
-use std::collections::{HashMap, HashSet};
-
 /// 作戦計画を手番間で識別するID。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PlanId(pub u64);
@@ -102,6 +101,10 @@ impl PlanMetrics {
 fn executable_plan(_kind: OperationKind, plan: &ForcePackagePlan) -> bool {
     if plan.feasible {
         return true;
+    }
+    let reject_truncated = crate::ai::code_path::is_extended();
+    if reject_truncated && plan.search_truncated {
+        return false;
     }
     !plan.purchases.is_empty()
         && plan
@@ -732,6 +735,9 @@ pub(crate) struct ActivePlanObjective {
 #[derive(Debug, Clone)]
 pub(crate) struct ActiveCombatPlanSummary {
     pub plan_id: PlanId,
+    /// 同じ島で前段Captureと首都Assaultが同時に動くため、島だけで子作戦を
+    /// 照合してはならない。RoadmapがPlan実績を担当作戦へ戻すための種別。
+    pub kind: OperationKind,
     pub anchor: GridPosition,
     pub objective_properties: Vec<GridPosition>,
     pub planned_elimination_turn: Option<u32>,
@@ -767,6 +773,44 @@ pub struct V4RollingPlanRegistry {
     audits: Vec<PlanRevisionAudit>,
 }
 
+/// 首都攻略Planを出撃させるために完成している必要がある購入の範囲。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchReadiness {
+    /// 全購入stepの完成を待つ（通常経路）。
+    AllPurchases,
+    /// 最初の交戦までに予定された波の完成だけを待つ（拡張経路）。
+    FirstAttackWave,
+}
+
+impl LaunchReadiness {
+    /// このPlanが出撃条件を満たすだけ生産済みかを返す。
+    fn is_satisfied(self, plan: &StoredPlan) -> bool {
+        match self {
+            Self::AllPurchases => plan
+                .steps
+                .iter()
+                .all(|step| step.status == PurchaseStatus::Produced),
+            Self::FirstAttackWave => first_attack_wave_produced(plan),
+        }
+    }
+}
+
+/// 作戦が予測した最初の交戦までに必要な購入だけが実体化したかを返す。
+///
+/// `scheduled_turn` がその時点より後のstepは、進軍中に到着する後続増援である。これを
+/// 全軍の停止条件にすると、資金と工場が余っていても首都前で待ち続けてしまう。
+fn first_attack_wave_produced(plan: &StoredPlan) -> bool {
+    let first_attack_turn = plan
+        .execution
+        .snapshot
+        .planned_first_attack_turn
+        .unwrap_or(plan.last_evaluated_turn);
+    plan.steps
+        .iter()
+        .filter(|step| step.scheduled_turn <= first_attack_turn)
+        .all(|step| step.status == PurchaseStatus::Produced)
+}
+
 impl V4RollingPlanRegistry {
     /// 進行中計画を、新規候補より先に作戦集合へ復帰させる。
     pub(crate) fn active_objectives(&self, player_id: PlayerId) -> Vec<ActivePlanObjective> {
@@ -790,6 +834,7 @@ impl V4RollingPlanRegistry {
             .iter()
             .filter(|plan| plan.player_id == player_id)
             .map(|plan| ActiveCombatPlanSummary {
+                kind: plan.kind,
                 plan_id: plan.plan_id,
                 anchor: plan.anchor,
                 objective_properties: plan.objective_properties.clone(),
@@ -857,16 +902,20 @@ impl V4RollingPlanRegistry {
         capital_assault_authorized: bool,
         capital_staging_anchor: Option<GridPosition>,
     ) -> Vec<ActiveDeploymentIntent> {
+        // 首都攻略の出撃条件。通常経路は全購入stepの完成、拡張経路は初撃までに
+        // 予定された波の完成を待つ（どちらが強いかは未実測のため差を維持する）。
+        let readiness = if crate::ai::code_path::is_extended() {
+            LaunchReadiness::FirstAttackWave
+        } else {
+            LaunchReadiness::AllPurchases
+        };
         self.active
             .iter()
             .filter(|plan| plan.player_id == player_id)
             .map(|plan| {
                 let mut priority_enemies = plan.target_enemies.iter().copied().collect::<Vec<_>>();
                 priority_enemies.sort_unstable_by_key(|entity| entity.to_bits());
-                let formation_complete = plan
-                    .steps
-                    .iter()
-                    .all(|step| step.status == PurchaseStatus::Produced);
+                let formation_complete = readiness.is_satisfied(plan);
                 let posture = if plan.kind != OperationKind::AssaultCapital
                     || (capital_assault_authorized && formation_complete && plan.execution_ready)
                 {
@@ -1441,6 +1490,23 @@ impl V4RollingPlanRegistry {
         }
     }
 
+    /// 発行前の施設最適化で命令の施設を入れ替えたとき、保存済みstepの施設を命令と揃える。
+    ///
+    /// 発行前（Planned）のstepだけを対象にする。保存Planと発行命令の施設が食い違うと、
+    /// 生産失敗時の再購入や施設競合による繰り下げが、実際には使っていない施設を基準にする。
+    pub(crate) fn retarget_planned_step(&mut self, step_ref: PlanStepRef, facility: GridPosition) {
+        let Some(step) = self
+            .active
+            .iter_mut()
+            .filter(|plan| plan.plan_id == step_ref.plan_id && plan.revision == step_ref.revision)
+            .flat_map(|plan| plan.steps.iter_mut())
+            .find(|step| step.step == step_ref && step.status == PurchaseStatus::Planned)
+        else {
+            return;
+        };
+        step.facility = facility;
+    }
+
     /// 選択計画の当手番購入をstep参照へ変換する。
     pub(crate) fn current_step_ref(
         &self,
@@ -1539,13 +1605,16 @@ impl V4RollingPlanRegistry {
         objective_properties: &[GridPosition],
         _target_enemies: &HashSet<Entity>,
     ) -> Option<usize> {
+        let require_same_kind_for_island = crate::ai::code_path::is_extended();
         self.active
             .iter()
             .enumerate()
             .filter(|(_, plan)| plan.player_id == player_id)
             .find_map(|(index, plan)| {
                 if let Some(island_id) = island_id {
-                    return (plan.island_id == Some(island_id)).then_some(index);
+                    let matches_island = plan.island_id == Some(island_id);
+                    let matches_kind = !require_same_kind_for_island || plan.kind == kind;
+                    return (matches_island && matches_kind).then_some(index);
                 }
                 // 敵Entityは移動して別の島へ渡るため、敵の重複をPlan identityに使わない。
                 // 同じ目的拠点集合だけを同一作戦のrevisionとして扱い、別島への変質を禁止する。
@@ -1781,7 +1850,7 @@ mod tests {
             },
         ];
 
-        defer_remaining_schedule(&mut steps, 10, &HashSet::from([facility]));
+        defer_remaining_schedule(&mut steps, 10, &HashSet::from_iter([facility]));
 
         assert_eq!(steps[0].scheduled_turn, 11);
         assert_eq!(steps[0].status, PurchaseStatus::Planned);
@@ -1860,7 +1929,7 @@ mod tests {
         let player = PlayerId(1);
         let enemy = Entity::from_raw(10);
         let anchor = GridPosition { x: 9, y: 9 };
-        let enemies = HashSet::from([enemy]);
+        let enemies = HashSet::from_iter([enemy]);
         let mut registry = V4RollingPlanRegistry::default();
         let created = registry.select(
             player,
@@ -1872,7 +1941,7 @@ mod tests {
             None,
             feasible_plan(0),
             None,
-            HashSet::new(),
+            HashSet::default(),
         );
         let continuation = registry
             .continuation(
@@ -1895,7 +1964,7 @@ mod tests {
             Some((continuation, Err(FixedPackageError::FundingUnavailable))),
             feasible_plan(0),
             None,
-            HashSet::from([facility]),
+            HashSet::from_iter([facility]),
         );
 
         assert_eq!(selected.plan_id, created.plan_id);
@@ -1920,7 +1989,7 @@ mod tests {
             let player = PlayerId(1);
             let enemy = Entity::from_raw(10);
             let anchor = GridPosition { x: 9, y: 9 };
-            let enemies = HashSet::from([enemy]);
+            let enemies = HashSet::from_iter([enemy]);
             let mut registry = V4RollingPlanRegistry::default();
             let created = registry.select(
                 player,
@@ -1932,7 +2001,7 @@ mod tests {
                 None,
                 feasible_plan(0),
                 None,
-                HashSet::new(),
+                HashSet::default(),
             );
             let purchase = created.plan.purchases[0];
             let step = registry
@@ -1960,7 +2029,7 @@ mod tests {
                 Some((continuation, Ok(feasible_plan(0)))),
                 feasible_plan(0),
                 None,
-                HashSet::new(),
+                HashSet::default(),
             );
 
             assert_eq!(selected.plan_id, created.plan_id);
@@ -2056,6 +2125,23 @@ mod tests {
 
     fn feasible_plan(build_turn: u32) -> ForcePackagePlan {
         ForcePackagePlan {
+            capture_purchases: Vec::new(),
+            combat_purchases: Vec::new(),
+            front_breakthrough_turn: None,
+            deadline_target_first_attack_turn: None,
+            target_first_attack_turns: Vec::new(),
+            blocked_next_turn_production_slots: 0,
+            direct_fire_lane_count: 0,
+            direct_front_shortfall: 0,
+            direct_enemy_remaining_hp: Vec::new(),
+            direct_damage_by_target: Vec::new(),
+            existing_indirect_damage_by_target: Vec::new(),
+            produced_indirect_damage_by_target: Vec::new(),
+            surviving_combat_value: 0,
+            required_overmatch_value: 0,
+            overmatch_ready: false,
+            deadline_capture_survivor_count: 0,
+            candidates_pruned: 0,
             purchases: vec![PlannedPurchase {
                 facility: GridPosition { x: 2, y: 3 },
                 unit_type: UnitType::Bcopters,
@@ -2093,12 +2179,12 @@ mod tests {
             Some(island),
             anchor,
             vec![anchor],
-            HashSet::from([enemy]),
+            HashSet::from_iter([enemy]),
             false,
             None,
             feasible_plan(0),
             None,
-            HashSet::new(),
+            HashSet::default(),
         );
         let plan_id = created.plan_id.expect("形成中の首都計画");
         let continuation = registry
@@ -2108,7 +2194,7 @@ mod tests {
                 OperationKind::AssaultCapital,
                 Some(island),
                 &[anchor],
-                &HashSet::from([enemy, reinforcement]),
+                &HashSet::from_iter([enemy, reinforcement]),
             )
             .expect("同じ首都作戦を再評価する");
 
@@ -2119,12 +2205,12 @@ mod tests {
             Some(island),
             anchor,
             vec![anchor],
-            HashSet::from([enemy, reinforcement]),
+            HashSet::from_iter([enemy, reinforcement]),
             true,
             Some((continuation, Ok(feasible_plan(0)))),
             feasible_plan(1),
             None,
-            HashSet::new(),
+            HashSet::default(),
         );
 
         assert_eq!(revised.plan_id, Some(plan_id));
@@ -2149,12 +2235,12 @@ mod tests {
             Some(island),
             anchor,
             vec![anchor],
-            HashSet::from([enemy]),
+            HashSet::from_iter([enemy]),
             true,
             None,
             feasible_plan(0),
             None,
-            HashSet::new(),
+            HashSet::default(),
         );
         assert!(!registry.operation_launch_ready(player, island));
 
@@ -2166,7 +2252,7 @@ mod tests {
                 selected.plan.purchases[0],
             )
             .expect("当手番の生産step");
-        registry.reconcile_produced_steps(player, &HashSet::from([step]));
+        registry.reconcile_produced_steps(player, &HashSet::from_iter([step]));
 
         assert!(registry.operation_launch_ready(player, island));
     }
@@ -2185,12 +2271,12 @@ mod tests {
             Some(island),
             anchor,
             vec![anchor],
-            HashSet::from([enemy]),
+            HashSet::from_iter([enemy]),
             true,
             None,
             feasible_plan(0),
             None,
-            HashSet::new(),
+            HashSet::default(),
         );
         registry.active[0].steps[0].status = PurchaseStatus::Issued { turn: 3 };
         registry.active[0]
@@ -2204,7 +2290,7 @@ mod tests {
                 OperationKind::AssaultCapital,
                 Some(island),
                 &[anchor],
-                &HashSet::from([enemy]),
+                &HashSet::from_iter([enemy]),
             )
             .expect("形成中計画");
 
@@ -2215,12 +2301,12 @@ mod tests {
             Some(island),
             anchor,
             vec![anchor],
-            HashSet::from([enemy]),
+            HashSet::from_iter([enemy]),
             true,
             Some((continuation, Ok(feasible_plan(0)))),
             feasible_plan(1),
             None,
-            HashSet::new(),
+            HashSet::default(),
         );
 
         assert_eq!(revised.disposition, PlanDisposition::Revised);
@@ -2246,12 +2332,12 @@ mod tests {
             Some(island),
             first_anchor,
             vec![first_anchor, remaining_city],
-            HashSet::from([enemy]),
+            HashSet::from_iter([enemy]),
             true,
             None,
             feasible_plan(0),
             None,
-            HashSet::new(),
+            HashSet::default(),
         );
         let plan_id = created.plan_id.expect("島campaignは永続Planを持つ");
 
@@ -2262,7 +2348,7 @@ mod tests {
                 OperationKind::Defense,
                 Some(island),
                 &[remaining_city],
-                &HashSet::from([reinforcement]),
+                &HashSet::from_iter([reinforcement]),
             )
             .expect("同じ島なら作戦種別・anchor・残施設・敵が変わっても継続する");
         assert_eq!(continuation.plan_id, plan_id);
@@ -2274,7 +2360,7 @@ mod tests {
                     OperationKind::Capture,
                     Some(other_island),
                     &[remaining_city],
-                    &HashSet::from([enemy]),
+                    &HashSet::from_iter([enemy]),
                 )
                 .is_none(),
             "座標が偶然重なっても別島へPlanを流用しない"
@@ -2296,12 +2382,12 @@ mod tests {
             Some(island),
             anchor,
             vec![anchor],
-            HashSet::from([first_enemy]),
+            HashSet::from_iter([first_enemy]),
             true,
             None,
             feasible_plan(1),
             None,
-            HashSet::new(),
+            HashSet::default(),
         );
         let plan_id = created.plan_id.expect("作成済みPlan");
         let continuation = registry
@@ -2311,7 +2397,7 @@ mod tests {
                 OperationKind::Capture,
                 Some(island),
                 &[anchor],
-                &HashSet::from([first_enemy, reinforcement]),
+                &HashSet::from_iter([first_enemy, reinforcement]),
             )
             .expect("同じ島の継続");
         let mut stalled = feasible_plan(0);
@@ -2327,12 +2413,12 @@ mod tests {
             Some(island),
             anchor,
             vec![anchor],
-            HashSet::from([first_enemy, reinforcement]),
+            HashSet::from_iter([first_enemy, reinforcement]),
             true,
             Some((continuation, Ok(stalled.clone()))),
             stalled,
             None,
-            HashSet::new(),
+            HashSet::default(),
         );
 
         assert_eq!(selected.plan_id, Some(plan_id));
@@ -2350,11 +2436,11 @@ mod tests {
             OperationKind::Capture,
             GridPosition { x: 5, y: 5 },
             vec![GridPosition { x: 5, y: 5 }],
-            HashSet::from([Entity::from_raw(10)]),
+            HashSet::from_iter([Entity::from_raw(10)]),
             None,
             feasible_plan(1),
             None,
-            HashSet::new(),
+            HashSet::default(),
         );
         assert_eq!(selected.disposition, PlanDisposition::Created);
         let created_audit = registry
@@ -2371,7 +2457,7 @@ mod tests {
                 4,
                 OperationKind::Capture,
                 &[GridPosition { x: 5, y: 5 }],
-                &HashSet::from([Entity::from_raw(10)]),
+                &HashSet::from_iter([Entity::from_raw(10)]),
             )
             .expect("将来購入は次手番まで保持される");
         assert!(!continuation.production_failed);
@@ -2385,7 +2471,7 @@ mod tests {
         let enemy = Entity::from_raw(10);
         let original = GridPosition { x: 5, y: 5 };
         let another_island = GridPosition { x: 20, y: 20 };
-        let enemies = HashSet::from([enemy]);
+        let enemies = HashSet::from_iter([enemy]);
         let mut registry = V4RollingPlanRegistry::default();
         registry.select(
             player,
@@ -2397,7 +2483,7 @@ mod tests {
             None,
             feasible_plan(1),
             None,
-            HashSet::new(),
+            HashSet::default(),
         );
 
         assert!(
@@ -2419,7 +2505,7 @@ mod tests {
                     4,
                     OperationKind::Capture,
                     &[original],
-                    &HashSet::from([Entity::from_raw(11)]),
+                    &HashSet::from_iter([Entity::from_raw(11)]),
                 )
                 .is_some(),
             "敵集合が変化しても目的拠点が同じなら同一作戦として再評価する"
@@ -2431,7 +2517,7 @@ mod tests {
         let player = PlayerId(1);
         let enemy = Entity::from_raw(10);
         let properties = [GridPosition { x: 5, y: 5 }];
-        let enemies = HashSet::from([enemy]);
+        let enemies = HashSet::from_iter([enemy]);
         let mut registry = V4RollingPlanRegistry::default();
         let selected = registry.select(
             player,
@@ -2443,12 +2529,12 @@ mod tests {
             None,
             feasible_plan(1),
             None,
-            HashSet::new(),
+            HashSet::default(),
         );
         let plan_id = selected.plan_id.expect("実行可能な計画は永続化される");
 
         // 作戦候補へ再掲されなかったこと自体は撤回理由ではない。
-        registry.reconcile_unseen_plans(player, 4, &HashSet::new());
+        registry.reconcile_unseen_plans(player, 4, &HashSet::default());
         assert!(
             registry
                 .continuation(player, 4, OperationKind::Capture, &properties, &enemies)
@@ -2456,7 +2542,7 @@ mod tests {
         );
 
         // 生産予定手番を過ぎても発注されなかった時点で、初めて実行失敗として撤回する。
-        registry.reconcile_unseen_plans(player, 5, &HashSet::new());
+        registry.reconcile_unseen_plans(player, 5, &HashSet::default());
         assert!(
             registry
                 .continuation(player, 5, OperationKind::Capture, &properties, &enemies)
@@ -2482,11 +2568,11 @@ mod tests {
             OperationKind::Capture,
             GridPosition { x: 5, y: 5 },
             vec![GridPosition { x: 5, y: 5 }],
-            HashSet::from([Entity::from_raw(10)]),
+            HashSet::from_iter([Entity::from_raw(10)]),
             None,
             feasible_plan(0),
             None,
-            HashSet::new(),
+            HashSet::default(),
         );
         let purchase = selected.plan.purchases[0];
         let step = registry
@@ -2505,7 +2591,7 @@ mod tests {
                 3,
                 OperationKind::Capture,
                 &[GridPosition { x: 5, y: 5 }],
-                &HashSet::from([Entity::from_raw(10)]),
+                &HashSet::from_iter([Entity::from_raw(10)]),
             )
             .expect("同一手番の発注済みplanを取得する");
         assert!(!current_turn.production_failed);
@@ -2520,11 +2606,70 @@ mod tests {
                 4,
                 OperationKind::Capture,
                 &[GridPosition { x: 5, y: 5 }],
-                &HashSet::from([Entity::from_raw(10)]),
+                &HashSet::from_iter([Entity::from_raw(10)]),
             )
             .expect("失敗理由を付けて再評価するため計画自体は取得する");
         assert!(continuation.production_failed);
         assert_eq!(continuation.purchases.len(), 1);
+    }
+
+    #[test]
+    fn retargeted_step_keeps_plan_and_issued_command_on_same_facility() {
+        let player = PlayerId(1);
+        let mut registry = V4RollingPlanRegistry::default();
+        let selected = registry.select(
+            player,
+            3,
+            OperationKind::Capture,
+            GridPosition { x: 5, y: 5 },
+            vec![GridPosition { x: 5, y: 5 }],
+            HashSet::from_iter([Entity::from_raw(10)]),
+            None,
+            feasible_plan(0),
+            None,
+            HashSet::default(),
+        );
+        let purchase = selected.plan.purchases[0];
+        let step = registry
+            .current_step_ref(
+                selected.plan_id.expect("永続plan"),
+                selected.revision.expect("revision"),
+                3,
+                purchase,
+            )
+            .expect("当手番step");
+        let swapped = GridPosition {
+            x: purchase.facility.x + 1,
+            y: purchase.facility.y,
+        };
+        registry.retarget_planned_step(step, swapped);
+        registry.mark_issued(step, 3);
+
+        // 発行命令が生産されなかった場合、再購入は実際に使った施設を基準にする。
+        let continuation = registry
+            .continuation(
+                player,
+                4,
+                OperationKind::Capture,
+                &[GridPosition { x: 5, y: 5 }],
+                &HashSet::from_iter([Entity::from_raw(10)]),
+            )
+            .expect("再評価のため計画自体は取得する");
+        assert!(continuation.production_failed);
+        assert_eq!(continuation.purchases[0].facility, swapped);
+
+        // 発行済みstepは後から施設を書き換えない。
+        registry.retarget_planned_step(step, purchase.facility);
+        let continuation = registry
+            .continuation(
+                player,
+                4,
+                OperationKind::Capture,
+                &[GridPosition { x: 5, y: 5 }],
+                &HashSet::from_iter([Entity::from_raw(10)]),
+            )
+            .expect("計画");
+        assert_eq!(continuation.purchases[0].facility, swapped);
     }
 
     #[test]
@@ -2541,11 +2686,11 @@ mod tests {
             OperationKind::Capture,
             GridPosition { x: 5, y: 5 },
             vec![GridPosition { x: 5, y: 5 }],
-            HashSet::from([Entity::from_raw(10)]),
+            HashSet::from_iter([Entity::from_raw(10)]),
             None,
             impossible,
             None,
-            HashSet::new(),
+            HashSet::default(),
         );
         assert_eq!(selected.disposition, PlanDisposition::Rejected);
         assert!(selected.plan_id.is_none());
@@ -2556,10 +2701,58 @@ mod tests {
                     4,
                     OperationKind::Capture,
                     &[GridPosition { x: 5, y: 5 }],
-                    &HashSet::from([Entity::from_raw(10)]),
+                    &HashSet::from_iter([Entity::from_raw(10)]),
                 )
                 .is_none()
         );
+    }
+
+    /// T2の差分fixture：非feasibleで探索打切りありの部分案を、通常経路は実行可能、
+    /// 拡張経路は実行不可と判定する。feasible案と打切りなしの部分案は両経路で実行可能。
+    #[test]
+    fn executable_plan_truncated_tranche_differs_only_on_extended_path() {
+        use crate::ai::code_path::{CodePath, enter};
+        // 敵HPを実際に減らす非feasibleな部分案を作る。
+        let tranche = |search_truncated: bool| {
+            let mut plan = feasible_plan(2);
+            plan.feasible = false;
+            plan.elimination_turn = None;
+            plan.occupation_turn = None;
+            plan.search_truncated = search_truncated;
+            plan.target_forecasts = vec![crate::ai::v4::rolling_plan::TargetForecast {
+                entity: Some(Entity::from_raw(10)),
+                unit_type: UnitType::Infantry,
+                available_turn: 0,
+                initial_hp: 100,
+                remaining_hp: 40,
+                destroyed_turn: None,
+            }];
+            plan
+        };
+        let mut truncated_feasible = feasible_plan(2);
+        truncated_feasible.search_truncated = true;
+
+        // (経路, 打切り部分案の期待値)。打切りなし部分案とfeasible案は常に実行可能。
+        for (path, truncated_expected) in [
+            (CodePath::MainCompatible, true),
+            (CodePath::Extended, false),
+        ] {
+            let _code_path = enter(path);
+            // 現在の executable_plan は kind を参照しない。T2（C）で作戦種別ごとの分岐を
+            // 入れても期待値が変わらないことを確かめるため、複数の kind で固定しておく。
+            for kind in [OperationKind::Capture, OperationKind::AssaultCapital] {
+                assert_eq!(
+                    executable_plan(kind, &tranche(true)),
+                    truncated_expected,
+                    "{path:?} {kind:?}"
+                );
+                assert!(executable_plan(kind, &tranche(false)), "{path:?} {kind:?}");
+                assert!(
+                    executable_plan(kind, &truncated_feasible),
+                    "{path:?} {kind:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2586,11 +2779,11 @@ mod tests {
             OperationKind::AssaultCapital,
             GridPosition { x: 9, y: 9 },
             vec![GridPosition { x: 9, y: 9 }],
-            HashSet::from([enemy]),
+            HashSet::from_iter([enemy]),
             None,
             tranche,
             None,
-            HashSet::new(),
+            HashSet::default(),
         );
 
         assert_eq!(selected.disposition, PlanDisposition::Created);
@@ -2632,11 +2825,11 @@ mod tests {
             OperationKind::Capture,
             anchor,
             vec![anchor],
-            HashSet::from([enemy]),
+            HashSet::from_iter([enemy]),
             None,
             tranche,
             None,
-            HashSet::new(),
+            HashSet::default(),
         );
 
         assert_eq!(selected.disposition, PlanDisposition::Created);
@@ -2668,7 +2861,8 @@ mod tests {
             remaining_hp: 0,
             destroyed_turn: Some(3),
         }];
-        let mut ledger = PlanExecutionLedger::new(3, &HashSet::from([enemy]), &[objective], &plan);
+        let mut ledger =
+            PlanExecutionLedger::new(3, &HashSet::from_iter([enemy]), &[objective], &plan);
         let step = PlanStepRef {
             plan_id: PlanId(1),
             revision: PlanRevision(0),
@@ -2676,10 +2870,10 @@ mod tests {
         };
         ledger.observe(
             5,
-            &HashSet::from([enemy, reinforcement]),
+            &HashSet::from_iter([enemy, reinforcement]),
             &[objective],
-            &HashSet::new(),
-            &HashMap::from([(enemy, 40), (reinforcement, 100)]),
+            &HashSet::default(),
+            &HashMap::from_iter([(enemy, 40), (reinforcement, 100)]),
             &[DeploymentExecutionObservation {
                 entity: unit,
                 plan_id: PlanId(1),
@@ -2730,7 +2924,7 @@ mod tests {
         let player = PlayerId(1);
         let enemy = Entity::from_raw(10);
         let objective = GridPosition { x: 5, y: 5 };
-        let enemies = HashSet::from([enemy]);
+        let enemies = HashSet::from_iter([enemy]);
         let mut registry = V4RollingPlanRegistry::default();
         let selected = registry.select(
             player,
@@ -2742,12 +2936,12 @@ mod tests {
             None,
             feasible_plan(1),
             None,
-            HashSet::new(),
+            HashSet::default(),
         );
         let plan_id = selected.plan_id.expect("永続plan");
 
-        registry.observe_execution(player, 4, &HashSet::new(), &HashMap::new(), &[]);
-        registry.reconcile_unseen_plans(player, 4, &HashSet::new());
+        registry.observe_execution(player, 4, &HashSet::default(), &HashMap::default(), &[]);
+        registry.reconcile_unseen_plans(player, 4, &HashSet::default());
         assert!(
             registry
                 .continuation(player, 4, OperationKind::Capture, &[objective], &enemies)
@@ -2755,8 +2949,14 @@ mod tests {
             "敵を排除しただけでは占領作戦を完了しない"
         );
 
-        registry.observe_execution(player, 4, &HashSet::from([objective]), &HashMap::new(), &[]);
-        registry.reconcile_unseen_plans(player, 4, &HashSet::new());
+        registry.observe_execution(
+            player,
+            4,
+            &HashSet::from_iter([objective]),
+            &HashMap::default(),
+            &[],
+        );
+        registry.reconcile_unseen_plans(player, 4, &HashSet::default());
         assert!(
             registry
                 .continuation(player, 4, OperationKind::Capture, &[objective], &enemies)
@@ -2789,12 +2989,12 @@ mod tests {
             Some(IslandId(3)),
             objectives[0],
             objectives.to_vec(),
-            HashSet::new(),
+            HashSet::default(),
             true,
             None,
             feasible_plan(1),
             None,
-            HashSet::new(),
+            HashSet::default(),
         );
 
         // 現在の戦術目的が最後の1施設へ縮んでも、予実は島全体3施設を分母にする。
@@ -2802,8 +3002,8 @@ mod tests {
         registry.observe_execution(
             player,
             4,
-            &HashSet::from([objectives[0], objectives[1]]),
-            &HashMap::new(),
+            &HashSet::from_iter([objectives[0], objectives[1]]),
+            &HashMap::default(),
             &[],
         );
 
@@ -2818,23 +3018,24 @@ mod tests {
         let enemy = Entity::from_raw(10);
         let objective = GridPosition { x: 5, y: 5 };
         let plan = feasible_plan(1);
-        let mut ledger = PlanExecutionLedger::new(3, &HashSet::from([enemy]), &[objective], &plan);
+        let mut ledger =
+            PlanExecutionLedger::new(3, &HashSet::from_iter([enemy]), &[objective], &plan);
         ledger.observe(
             6,
-            &HashSet::from([enemy]),
+            &HashSet::from_iter([enemy]),
             &[objective],
-            &HashSet::new(),
-            &HashMap::from([(enemy, 100)]),
+            &HashSet::default(),
+            &HashMap::from_iter([(enemy, 100)]),
             &[],
         );
         assert_eq!(ledger.delay_reason(6), None);
 
         ledger.observe(
             7,
-            &HashSet::from([enemy]),
+            &HashSet::from_iter([enemy]),
             &[objective],
-            &HashSet::new(),
-            &HashMap::from([(enemy, 100)]),
+            &HashSet::default(),
+            &HashMap::from_iter([(enemy, 100)]),
             &[],
         );
         assert_eq!(
@@ -2843,3 +3044,7 @@ mod tests {
         );
     }
 }
+
+// 拡張経路（小規模マップ戦略）で検証するテスト。本文の分岐はすべて親の局所分岐へ集約済み。
+#[cfg(test)]
+mod extended_path_tests;

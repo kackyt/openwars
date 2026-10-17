@@ -101,7 +101,7 @@ pub struct ExecuteActionArgs {
 
 #[tool_router]
 impl OpenWarsAiServer {
-    #[tool(description = "Lists every embedded map name, including map_1 through map_53.")]
+    #[tool(description = "Lists every embedded map name, including map_1 through map_56.")]
     async fn list_maps(
         &self,
         Parameters(_args): Parameters<ListMapsArgs>,
@@ -111,7 +111,7 @@ impl OpenWarsAiServer {
         Ok(serde_json::json!({ "maps": registry.map_names() }).to_string())
     }
 
-    #[tool(description = "Loads a specific embedded map (map_1 through map_53) to evaluate.")]
+    #[tool(description = "Loads a specific embedded map (map_1 through map_56) to evaluate.")]
     async fn load_map(&self, Parameters(args): Parameters<LoadMapArgs>) -> Result<String, String> {
         let registry =
             MasterDataRegistry::load().map_err(|e| format!("Failed to load master data: {}", e))?;
@@ -297,7 +297,7 @@ impl OpenWarsAiServer {
                     e.get::<UnitStats>().cloned(),
                     e.get::<Fuel>().cloned(),
                 ) {
-                    let mut unit_positions = std::collections::HashMap::new();
+                    let mut unit_positions = engine::collections::HashMap::default();
                     let mut q_occupants = world.query::<(
                         Entity,
                         &GridPosition,
@@ -425,8 +425,8 @@ impl OpenWarsAiServer {
             let match_state = world.resource::<engine::resources::MatchState>();
 
             // 所有拠点数と生存ユニット総コストの計算
-            let mut player_properties_count = std::collections::HashMap::new();
-            let mut player_units_cost = std::collections::HashMap::new();
+            let mut player_properties_count = engine::collections::HashMap::default();
+            let mut player_units_cost = engine::collections::HashMap::default();
 
             for (_, _, prop) in prop_query.iter(world) {
                 if let Some(owner) = prop.owner_id {
@@ -556,8 +556,7 @@ impl OpenWarsAiServer {
                 }
                 let units_before = invasion_trace::snapshot_units(&mut state.world);
                 let decision_started = std::time::Instant::now();
-                let action_taken =
-                    engine::ai::engine::execute_ai_turn(&mut state.world, active_player_id);
+                let action_taken = engine::ai::execute_ai_turn(&mut state.world, active_player_id);
                 if trace_ai_steps {
                     eprintln!(
                         "simulate_ai_turn decided player={} turn={} step={} elapsed_us={} action={:?}",
@@ -613,6 +612,12 @@ impl OpenWarsAiServer {
                 invasion_trace::snapshot_victory_roadmap_for_player(&state.world, active_player_id);
             let logistics_plan =
                 invasion_trace::snapshot_logistics_plan_for_player(&state.world, active_player_id);
+            // 進軍DAGの所属と実位置を返し、枝の選択と経路探索のどちらで停滞したかを
+            // 対戦トレース上で切り分けられるようにする。
+            let capital_routes = engine::ai::v4::capital_route_diagnostics_for_player(
+                &state.world,
+                active_player_id,
+            );
             let after_metrics = engine::ai::eval::evaluate_board_with_metrics(
                 &mut state.world,
                 active_player_id,
@@ -632,6 +637,7 @@ impl OpenWarsAiServer {
                 "plan_executions": plan_executions,
                 "victory_roadmap": victory_roadmap,
                 "logistics_plan": logistics_plan,
+                "capital_routes": capital_routes,
                 "player_id": active_player_id.0,
                 "player_index": active_player_index.0,
                 "before_score": before_metrics.total_score,
@@ -851,19 +857,19 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn mcp_load_map_accepts_map_53() {
+    async fn mcp_load_map_accepts_map_56() {
         let server = OpenWarsAiServer {
             state: Arc::new(Mutex::new(None)),
         };
 
         let result = server
             .load_map(Parameters(LoadMapArgs {
-                map_name: "map_53".to_string(),
-                seed: Some(53),
+                map_name: "map_56".to_string(),
+                seed: Some(56),
                 grid_type: Some("hex".to_string()),
             }))
             .await;
 
-        assert_eq!(result.as_deref(), Ok("Loaded map: map_53"));
+        assert_eq!(result.as_deref(), Ok("Loaded map: map_56"));
     }
 }

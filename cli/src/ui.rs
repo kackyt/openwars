@@ -161,8 +161,8 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
 
     if let Some(world) = &mut app.world {
         // ユニット/不動産情報の収集
-        let mut factions = std::collections::HashMap::new();
-        let mut units = std::collections::HashMap::new();
+        let mut factions = engine::collections::HashMap::default();
+        let mut units = engine::collections::HashMap::default();
 
         // 不動産のクエリ
         let mut p_query = world.query::<(
@@ -198,7 +198,7 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         }
 
         // 到達可能タイルの収集
-        let mut reachable_tiles = std::collections::HashSet::new();
+        let mut reachable_tiles = engine::collections::HashSet::default();
         if let crate::app::InGameState::UnitSelected {
             reachable_tiles: rt,
             ..
@@ -210,7 +210,7 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
         }
 
         // ターゲットタイルの収集
-        let mut target_tiles = std::collections::HashSet::new();
+        let mut target_tiles = engine::collections::HashSet::default();
         match &app.ui_state.in_game_state {
             crate::app::InGameState::TargetSelection { targets, .. } => {
                 let mut q_pos = world.query::<&engine::components::GridPosition>();
@@ -682,8 +682,8 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                     right_panel_text.push_str(&format!("--- ターン {} ---\n\n", turn_num));
 
                     // 拠点の所有状況と収入の集計
-                    let mut property_counts = std::collections::HashMap::<u32, u32>::new();
-                    let mut income_counts = std::collections::HashMap::<u32, u32>::new();
+                    let mut property_counts = engine::collections::HashMap::<u32, u32>::default();
+                    let mut income_counts = engine::collections::HashMap::<u32, u32>::default();
 
                     let mut owned_properties = Vec::new();
                     let mut q_prop = world.query::<(
@@ -710,11 +710,11 @@ fn draw_in_game(f: &mut Frame, app: &mut App) {
                     }
 
                     // ユニットの集計 (種類ごとの数と総数)
-                    let mut unit_counts = std::collections::HashMap::<
+                    let mut unit_counts = engine::collections::HashMap::<
                         u32,
                         std::collections::BTreeMap<String, u32>,
-                    >::new();
-                    let mut unit_totals = std::collections::HashMap::<u32, u32>::new();
+                    >::default();
+                    let mut unit_totals = engine::collections::HashMap::<u32, u32>::default();
 
                     let mut q_unit = world
                         .query::<(&engine::components::Faction, &engine::components::UnitStats)>();

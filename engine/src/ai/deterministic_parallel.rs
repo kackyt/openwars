@@ -19,7 +19,15 @@ where
         if items.len() < 4 {
             return items.into_iter().map(evaluate).collect();
         }
-        items.into_par_iter().map(evaluate).collect()
+        // 実装経路はスレッドローカルなので、ワーカーへ呼び出し元の経路を引き継ぐ。
+        let path = crate::ai::code_path::current();
+        items
+            .into_par_iter()
+            .map(|item| {
+                let _code_path = crate::ai::code_path::enter(path);
+                evaluate(item)
+            })
+            .collect()
     }
 
     #[cfg(target_arch = "wasm32")]

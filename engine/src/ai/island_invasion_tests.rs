@@ -1,5 +1,4 @@
-use std::collections::HashSet;
-
+use crate::collections::HashSet;
 use bevy_ecs::prelude::*;
 
 use crate::ai::{AiVersion, PlayerAiSettings};
@@ -225,13 +224,13 @@ fn v3_invasion_reaches_combat_or_capture_after_landing() {
             .squads
             .iter()
             .filter(|squad| {
-                squad.mission_type == crate::ai::squad::MissionType::Transport
-                    && squad.target_island == Some(enemy_island)
+                squad.plan.mission_type == crate::ai::squad::MissionType::Transport
+                    && squad.plan.target_island == Some(enemy_island)
             })
             .collect();
         assert_eq!(planned.len(), 2, "complete Assault uses both transports");
         assert!(planned.iter().all(|squad| matches!(
-            squad.phase,
+            squad.plan.phase,
             crate::ai::squad::MissionPhase::Transport(
                 crate::ai::squad::TransportPhase::Pickup
                     | crate::ai::squad::TransportPhase::Transit
@@ -240,7 +239,7 @@ fn v3_invasion_reaches_combat_or_capture_after_landing() {
         (
             planned
                 .iter()
-                .filter_map(|squad| squad.transport_entity)
+                .filter_map(|squad| *squad.transport_entity)
                 .collect::<HashSet<_>>(),
             planned
                 .iter()
@@ -266,8 +265,8 @@ fn v3_invasion_reaches_combat_or_capture_after_landing() {
     let mut capture_cursor = world
         .resource::<Events<PropertyCaptureProgressedEvent>>()
         .get_cursor();
-    let mut loaded_cargo = HashSet::new();
-    let mut unloaded_cargo = HashSet::new();
+    let mut loaded_cargo = HashSet::default();
+    let mut unloaded_cargo = HashSet::default();
     let mut invasion_started = false;
     let mut return_without_cargo = false;
 
@@ -275,7 +274,7 @@ fn v3_invasion_reaches_combat_or_capture_after_landing() {
         for _ in 0..2 {
             let active_player = active_player(&world);
             for _ in 0..MAX_ACTIONS_PER_PHASE {
-                let action = crate::ai::engine::execute_ai_turn(&mut world, active_player);
+                let action = crate::ai::execute_ai_turn(&mut world, active_player);
                 schedule.run(&mut world);
 
                 for event in loaded_cursor.read(world.resource::<Events<UnitLoadedEvent>>()) {
@@ -324,8 +323,9 @@ fn v3_invasion_reaches_combat_or_capture_after_landing() {
                             squad
                                 .transport_entity
                                 .is_some_and(|transport| transport_entities.contains(&transport))
-                                && squad.mission_type == crate::ai::squad::MissionType::Transport
-                                && squad.phase
+                                && squad.plan.mission_type
+                                    == crate::ai::squad::MissionType::Transport
+                                && squad.plan.phase
                                     == crate::ai::squad::MissionPhase::Transport(
                                         crate::ai::squad::TransportPhase::Return,
                                     )

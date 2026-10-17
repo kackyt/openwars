@@ -1,6 +1,7 @@
 //! Gameboy Wars Turboの生産状態機械を移植したV100/V200専用実装。
 
-use crate::ai::engine::AiProductionCooldown;
+use crate::ai::runtime::production_queue::AiProductionCooldown;
+use crate::collections::{HashMap, HashSet};
 use crate::components::{Faction, GridPosition, Health, PlayerId, Property};
 use crate::events::ProduceUnitCommand;
 use crate::resources::{
@@ -8,8 +9,6 @@ use crate::resources::{
 };
 use bevy_ecs::prelude::*;
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
-
 /// V100/V200専用の単発生産判断。既存V1〜V4の生産計画を使用しない。
 pub(crate) fn decide_production(
     world: &mut World,
@@ -49,9 +48,9 @@ pub(crate) fn decide_production(
             &crate::components::UnitStats,
             &Health,
         )>();
-        let mut positions = HashSet::new();
-        let mut friendly = HashMap::<UnitType, u32>::new();
-        let mut enemy = HashMap::<UnitType, u32>::new();
+        let mut positions = HashSet::default();
+        let mut friendly = HashMap::<UnitType, u32>::default();
+        let mut enemy = HashMap::<UnitType, u32>::default();
         let mut own_value = 0_u64;
         let mut enemy_value = 0_u64;
         for (position, faction, stats, health) in query.iter(world) {
@@ -623,7 +622,8 @@ mod tests {
         let registry = world.resource::<UnitRegistry>();
         let strategy = super::super::rom_logic::ProductionStrategy::Opening;
         let facilities = [(GridPosition { x: 6, y: 3 }, Terrain::Capital)];
-        let mut friendly_counts = HashMap::from([(UnitType::Infantry, 11), (UnitType::Recon, 4)]);
+        let mut friendly_counts =
+            HashMap::from_iter([(UnitType::Infantry, 11), (UnitType::Recon, 4)]);
 
         let mut allocation_round = production_allocation_round(
             strategy,
@@ -827,7 +827,7 @@ mod tests {
             target_y: position.y,
             unit_type,
         };
-        let enemy_counts = HashMap::from([(UnitType::Recon, 4)]);
+        let enemy_counts = HashMap::from_iter([(UnitType::Recon, 4)]);
         let mut damage_chart = DamageChart::new();
         damage_chart.insert_damage(UnitType::Tank, UnitType::Recon, 95);
 

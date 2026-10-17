@@ -1,12 +1,12 @@
 use crate::ai::{AiVersion, PlayerAiSettings, resolve_player_ai_version};
+use crate::collections::{HashMap, HashSet};
 use crate::components::*;
 use crate::resources::*;
 use base64::prelude::*;
 use bevy_ecs::prelude::*;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use std::collections::{BTreeMap, HashMap, HashSet};
-
+use std::collections::BTreeMap;
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, thiserror::Error)]
@@ -223,7 +223,7 @@ pub fn export_save_data(world: &mut World, map_name: &str) -> Result<String, Sav
 
     // 物件とユニットをクエリで取得（これらは &mut World を借用します）
     let mut properties = Vec::new();
-    let mut entity_to_uuid = HashMap::new();
+    let mut entity_to_uuid = HashMap::default();
     let mut units = Vec::new();
     {
         let mut p_query = world.query::<(&GridPosition, &Property)>();
@@ -307,7 +307,7 @@ pub fn export_save_data(world: &mut World, map_name: &str) -> Result<String, Sav
 
     // クエリ終了後、再度リソースを借用して AI のクールダウン情報を抽出
     let ai_action_cooldown =
-        if let Some(res) = world.get_resource::<crate::ai::engine::AiActionCooldown>() {
+        if let Some(res) = world.get_resource::<crate::ai::runtime::state::AiActionCooldown>() {
             res.0
                 .iter()
                 .filter_map(|e| entity_to_uuid.get(e).copied())
@@ -316,12 +316,13 @@ pub fn export_save_data(world: &mut World, map_name: &str) -> Result<String, Sav
             Vec::new()
         };
 
-    let ai_production_cooldown =
-        if let Some(res) = world.get_resource::<crate::ai::engine::AiProductionCooldown>() {
-            res.0.iter().copied().collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+    let ai_production_cooldown = if let Some(res) =
+        world.get_resource::<crate::ai::runtime::production_queue::AiProductionCooldown>()
+    {
+        res.0.iter().copied().collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
 
     // 2. SaveState オブジェクトの構築
     let save_state = SaveState {
@@ -438,7 +439,7 @@ pub fn import_save_data(
     }
     world.insert_resource(damage_chart);
 
-    let mut unit_registry_map = std::collections::HashMap::new();
+    let mut unit_registry_map = crate::collections::HashMap::default();
     for name in master_data.units.keys() {
         let stats = master_data
             .create_unit_stats(name)
@@ -495,7 +496,7 @@ pub fn import_save_data(
     world.insert_resource(master_data.clone());
 
     // CombatLedger の復元
-    let mut ledger_records = HashMap::new();
+    let mut ledger_records = HashMap::default();
     for (pid_val, rec) in &save_state.combat_ledger.records {
         ledger_records.insert(
             PlayerId(*pid_val),
@@ -525,7 +526,7 @@ pub fn import_save_data(
     }
 
     // ユニットエンティティの spawn と Uuid から Entity ID へのマッピングテーブル構築
-    let mut uuid_to_entity = HashMap::new();
+    let mut uuid_to_entity = HashMap::default();
     let mut unit_cargos_to_resolve = Vec::new();
 
     let registry = world.resource::<UnitRegistry>().clone();
@@ -609,7 +610,7 @@ pub fn import_save_data(
         .iter()
         .filter_map(|uuid| uuid_to_entity.get(uuid).copied())
         .collect::<HashSet<_>>();
-    world.insert_resource(crate::ai::engine::AiActionCooldown(
+    world.insert_resource(crate::ai::runtime::state::AiActionCooldown(
         ai_action_cooldown_entities,
     ));
 
@@ -618,7 +619,7 @@ pub fn import_save_data(
         .iter()
         .copied()
         .collect::<HashSet<_>>();
-    world.insert_resource(crate::ai::engine::AiProductionCooldown(
+    world.insert_resource(crate::ai::runtime::production_queue::AiProductionCooldown(
         ai_production_cooldown_coords,
     ));
 

@@ -4,3 +4,8 @@ members = [
     "engine"
 , "mcp-server"]
 resolver = "2"
+
+# bevy_ecsの内部HashMapの反復順をプロセスに依存させない（同一seedの対局を再現するため）。
+# 詳細は third_party/ahash/OPENWARS_PATCH.md。
+[patch.crates-io]
+ahash = { path = "third_party/ahash" }

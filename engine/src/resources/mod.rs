@@ -51,8 +51,7 @@ impl GameRng {
         ((self.seed >> 33) % 11) as u32
     }
 }
-use std::collections::HashMap;
-
+use crate::collections::HashMap;
 #[derive(Debug, thiserror::Error)]
 pub enum DomainError {
     #[error("座標 ({x}, {y}) がマップ境界外です")]
@@ -447,7 +446,7 @@ impl DamageChart {
 }
 
 #[derive(Resource, Debug, Clone)]
-pub struct UnitRegistry(pub std::collections::HashMap<UnitType, crate::components::UnitStats>);
+pub struct UnitRegistry(pub crate::collections::HashMap<UnitType, crate::components::UnitStats>);
 
 impl UnitRegistry {
     pub fn get_stats(&self, unit_type: UnitType) -> Option<&crate::components::UnitStats> {

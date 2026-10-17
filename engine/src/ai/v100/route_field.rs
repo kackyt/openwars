@@ -3,11 +3,11 @@
 //! ROMの近傍展開（bank 0 `1E55`）は、OpenWarsのodd-r六近傍と一致する。
 //! 一方、地形コストを含む目標距離場はV100/V200専用なので通常AIとは分ける。
 
+use crate::collections::HashMap;
 use crate::components::GridPosition;
 use crate::resources::{Map, MasterDataRegistry, MovementType};
 use crate::systems::movement::get_valid_movement_cost;
-use std::collections::{BinaryHeap, HashMap};
-
+use std::collections::BinaryHeap;
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct RouteState {
     cost: u32,
@@ -52,7 +52,7 @@ pub(crate) fn build_route_field_to_any(
     targets: &[GridPosition],
     movement_type: MovementType,
 ) -> HashMap<GridPosition, u32> {
-    let mut distances = HashMap::new();
+    let mut distances = HashMap::default();
     let mut heap = BinaryHeap::new();
     for target in targets {
         if target.x >= map.width || target.y >= map.height {

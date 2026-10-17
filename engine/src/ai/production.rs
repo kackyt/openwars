@@ -1,3 +1,11 @@
+/// 生産配分の可変状態（資金・施設占有）。
+pub mod allocation;
+/// 購入案の確定・発行直前の検証。
+pub mod commit;
+/// 生産要求の台帳（未充足Outcomeと理由）。
+pub mod demand;
+
+use super::strategy::GamePhase;
 use crate::ai::demand::{
     AirCoverageContribution, AirDefenseAssessment, CombatCapabilitySnapshot,
     air_coverage_with_timing, candidate_air_coverage, candidate_air_coverage_with_cache,
@@ -6,6 +14,7 @@ use crate::ai::demand::{
 use crate::ai::island_campaign::{
     IslandCampaignDecision, IslandCampaignShortfall, campaign_unit_type_rank,
 };
+use crate::ai::production::turn_state::ProductionTurnState;
 use crate::ai::strategy::{
     EmergencyAntiAirReservation, ProductionPlan, ProductionStrategy, analyze_strategy_for_turn,
     sea_transport_capacity_from_slots,
@@ -13,6 +22,7 @@ use crate::ai::strategy::{
 use crate::ai::turn_distance::{
     ActionTurnDistanceCache, TerrainConnectivity, TurnDistanceCache, calculate_turn_distance,
 };
+use crate::ai::v4::campaign_execution::{CampaignProductionIntent, CampaignProductionRole};
 use crate::components::{
     ActionCompleted, Ammo, Faction, Fuel, GridPosition, Health, PlayerId, Property, UnitStats,
 };
@@ -20,8 +30,6 @@ use crate::events::ProduceUnitCommand;
 use crate::resources::master_data::MasterDataRegistry;
 use crate::resources::{DamageChart, MovementType, Players, Terrain, UnitRegistry, UnitType};
 use bevy_ecs::prelude::*;
-
-use super::strategy::GamePhase;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CampaignProductionRequirement {
@@ -31,8 +39,6 @@ enum CampaignProductionRequirement {
     Combat,
 }
 
-use crate::ai::v4::campaign_execution::{CampaignProductionIntent, CampaignProductionRole};
-
 #[derive(Debug)]
 pub(crate) struct CampaignProductionOutcome {
     pub(crate) commands: Vec<ProduceUnitCommand>,
@@ -40,7 +46,7 @@ pub(crate) struct CampaignProductionOutcome {
     pub(crate) remaining_funds: u32,
     /// 全キャンペーン不足の予約額を残した後、汎用の迎撃・戦闘へ使ってよい額。
     pub(crate) generic_funds: u32,
-    pub(crate) used_facilities: std::collections::HashSet<GridPosition>,
+    pub(crate) used_facilities: crate::collections::HashSet<GridPosition>,
     pub(crate) completed_all_rows: bool,
 }
 
@@ -111,7 +117,7 @@ fn build_air_containment_assessment(
     existing_units: &[CombatCapabilitySnapshot],
     master_data: &MasterDataRegistry,
     map: &crate::resources::Map,
-    unit_positions: &std::collections::HashMap<
+    unit_positions: &crate::collections::HashMap<
         (usize, usize),
         crate::systems::movement::OccupantInfo,
     >,
@@ -157,7 +163,7 @@ fn select_emergency_anti_air_candidate_with_existing(
     strategy: &ProductionStrategy,
     master_data: &MasterDataRegistry,
     map: &crate::resources::Map,
-    unit_positions: &std::collections::HashMap<
+    unit_positions: &crate::collections::HashMap<
         (usize, usize),
         crate::systems::movement::OccupantInfo,
     >,
@@ -264,7 +270,7 @@ fn select_emergency_anti_air_candidate(
     strategy: &ProductionStrategy,
     master_data: &MasterDataRegistry,
     map: &crate::resources::Map,
-    unit_positions: &std::collections::HashMap<
+    unit_positions: &crate::collections::HashMap<
         (usize, usize),
         crate::systems::movement::OccupantInfo,
     >,
@@ -577,14 +583,14 @@ fn plan_campaign_shortfall_production_with_damage(
         intents: Vec::new(),
         remaining_funds: available_funds,
         generic_funds: 0,
-        used_facilities: std::collections::HashSet::new(),
+        used_facilities: crate::collections::HashSet::default(),
         completed_all_rows: true,
     };
     // 上位作戦が施設不足で同一手番に完成しなくても、その残予算だけは保護した上で、
     // 競合しない施設（例: SecureのFactoryに対するExpandのAirport）を下位作戦へ使う。
     let mut protected_higher_priority_funds = 0_u32;
     let mut combat_connectivity = TerrainConnectivity::default();
-    let unit_positions = std::collections::HashMap::new();
+    let unit_positions = crate::collections::HashMap::default();
     let mut turn_distance_cache = TurnDistanceCache::default();
 
     'rows: for row in &mut rows {
@@ -751,6 +757,7 @@ fn plan_campaign_shortfall_production_with_damage(
                 CampaignProductionRequirement::Combat => CampaignProductionRole::Combat,
             };
             outcome.intents.push(CampaignProductionIntent {
+                mission_target: None,
                 command: command.clone(),
                 island_id: row.island_id,
                 role,
@@ -802,7 +809,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
 
     if is_v3
         && world
-            .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .get_resource::<ProductionTurnState>()
             .is_some_and(|cache| cache.production_batch_planned(player_id))
     {
         // 同じ生産フェーズ中は敵・収入・所有施設が変わらない。全施設分をすでに
@@ -817,15 +824,17 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
     if is_v3
         && !strategy.air_defense.requires_emergency_production()
         && world
-            .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .get_resource::<ProductionTurnState>()
             .is_some_and(|cache| cache.campaign_production_planned(player_id))
     {
         // 緊急対空の再判定だけは毎回優先する。平時の完全packageは初回計画時に
         // 予算・施設重複を検証済みなので、残り命令を全候補scoreより先に消費する。
         let mut cache = world
-            .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .remove_resource::<ProductionTurnState>()
             .unwrap_or_default();
-        let next_command = cache.take_campaign_production_command(player_id);
+        let next_command = cache
+            .take_issuable_campaign_command(world, player_id)
+            .command;
         let blocks_generic = cache.campaign_production_blocks_generic(player_id);
         world.insert_resource(cache);
         if let Some(command) = next_command {
@@ -859,8 +868,8 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
     };
 
     // --- 0. 施設・ユニット・首都のスキャン ---
-    let mut occupied_positions = std::collections::HashSet::new();
-    let mut unit_positions = std::collections::HashMap::new();
+    let mut occupied_positions = crate::collections::HashSet::default();
+    let mut unit_positions = crate::collections::HashMap::default();
     let mut enemy_units = Vec::new();
     let mut my_units = Vec::new();
     let mut my_capability_units = Vec::new();
@@ -941,7 +950,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
 
     let mut capital_pos = None;
     let mut my_facilities = Vec::new();
-    let mut producible_types = std::collections::HashSet::new();
+    let mut producible_types = crate::collections::HashSet::default();
     let mut income_per_turn = 0u32;
     let mut owned_airport_count = 0u32;
 
@@ -1193,19 +1202,21 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
         intents: Vec::new(),
         remaining_funds: available_funds,
         generic_funds: 0,
-        used_facilities: std::collections::HashSet::new(),
+        used_facilities: crate::collections::HashSet::default(),
         completed_all_rows: true,
     };
     if is_v3 && !strategy.campaign_shortfalls.is_empty() {
         let campaign_plan_exists = world
-            .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .get_resource::<ProductionTurnState>()
             .is_some_and(|cache| cache.campaign_production_planned(player_id));
         if campaign_plan_exists {
             // 最初の完全package計画を1commandずつ消費し、同じshortfallの重複生産を防ぐ。
             let mut cache = world
-                .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+                .remove_resource::<ProductionTurnState>()
                 .unwrap_or_default();
-            let next_command = cache.take_campaign_production_command(player_id);
+            let next_command = cache
+                .take_issuable_campaign_command(world, player_id)
+                .command;
             let blocks_generic = cache.campaign_production_blocks_generic(player_id);
             let generic_budget = cache.campaign_production_generic_budget(player_id);
             world.insert_resource(cache);
@@ -1237,10 +1248,13 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
             let campaign_commands = std::mem::take(&mut campaign_outcome.commands);
             commands.extend(campaign_commands);
             let mut cache = world
-                .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+                .remove_resource::<ProductionTurnState>()
                 .unwrap_or_default();
             cache.set_campaign_production_plan_with_generic_budget(
                 player_id,
+                world
+                    .get_resource::<crate::resources::MatchState>()
+                    .map_or(0, |state| state.current_turn_number.0),
                 Vec::new(),
                 generic_budget,
             );
@@ -1249,7 +1263,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
             if blocks_generic {
                 if !strategy.air_defense.requires_emergency_production() {
                     let mut cache = world
-                        .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+                        .remove_resource::<ProductionTurnState>()
                         .unwrap_or_default();
                     cache.mark_production_batch_planned(player_id);
                     world.insert_resource(cache);
@@ -1379,7 +1393,7 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
 
     if is_v3 && !strategy.air_defense.requires_emergency_production() {
         let mut cache = world
-            .remove_resource::<crate::ai::engine::AiTurnStrategyCache>()
+            .remove_resource::<ProductionTurnState>()
             .unwrap_or_default();
         cache.mark_production_batch_planned(player_id);
         world.insert_resource(cache);
@@ -1500,7 +1514,7 @@ pub fn calculate_unit_score_at(
     damage_chart: &DamageChart,
     master_data: &MasterDataRegistry,
     map: &crate::resources::Map,
-    unit_positions: &std::collections::HashMap<
+    unit_positions: &crate::collections::HashMap<
         (usize, usize),
         crate::systems::movement::OccupantInfo,
     >,
@@ -1543,7 +1557,7 @@ fn calculate_unit_score_at_cached(
     damage_chart: &DamageChart,
     master_data: &MasterDataRegistry,
     map: &crate::resources::Map,
-    unit_positions: &std::collections::HashMap<
+    unit_positions: &crate::collections::HashMap<
         (usize, usize),
         crate::systems::movement::OccupantInfo,
     >,
@@ -2176,7 +2190,7 @@ mod additional_tests {
             &issue75_air_defense_strategy(),
             &master_data,
             &map,
-            &std::collections::HashMap::new(),
+            &crate::collections::HashMap::default(),
             &chart,
             20_000,
         )
@@ -2231,7 +2245,7 @@ mod additional_tests {
             &strategy,
             &master_data,
             &map,
-            &std::collections::HashMap::new(),
+            &crate::collections::HashMap::default(),
             &chart,
             20_000,
         );
@@ -2289,7 +2303,7 @@ mod additional_tests {
             &strategy,
             &master_data,
             &map,
-            &std::collections::HashMap::new(),
+            &crate::collections::HashMap::default(),
             &chart,
             20_000,
         );
@@ -2307,7 +2321,7 @@ mod additional_tests {
                 &strategy,
                 &master_data,
                 &map,
-                &std::collections::HashMap::new(),
+                &crate::collections::HashMap::default(),
                 &chart,
                 20_000,
             )
@@ -2372,7 +2386,7 @@ mod additional_tests {
                 &strategy,
                 &master_data,
                 &map,
-                &std::collections::HashMap::new(),
+                &crate::collections::HashMap::default(),
                 &chart,
                 20_000,
             )
@@ -2387,7 +2401,7 @@ mod additional_tests {
                 &strategy,
                 &master_data,
                 &map,
-                &std::collections::HashMap::new(),
+                &crate::collections::HashMap::default(),
                 &chart,
                 20_000,
             )
@@ -2440,7 +2454,7 @@ mod additional_tests {
             &strategy,
             &master_data,
             &map,
-            &std::collections::HashMap::new(),
+            &crate::collections::HashMap::default(),
             &chart,
             20_000,
         );
@@ -2505,7 +2519,7 @@ mod additional_tests {
             &strategy,
             &master_data,
             &map,
-            &std::collections::HashMap::new(),
+            &crate::collections::HashMap::default(),
             &chart,
             12_000,
         )
@@ -2556,7 +2570,7 @@ mod additional_tests {
             &issue75_air_defense_strategy(),
             &master_data,
             &map,
-            &std::collections::HashMap::new(),
+            &crate::collections::HashMap::default(),
             &chart,
             1_000,
         )
@@ -2668,7 +2682,7 @@ mod additional_tests {
             &analyzed,
             &master_data,
             world.resource::<Map>(),
-            &std::collections::HashMap::new(),
+            &crate::collections::HashMap::default(),
             &chart,
             0,
         )
@@ -2822,7 +2836,7 @@ mod additional_tests {
             ((10, 10), 2),
         ]
         .into_iter()
-        .collect::<std::collections::HashMap<_, _>>();
+        .collect::<crate::collections::HashMap<_, _>>();
         {
             let mut query = world.query::<(&GridPosition, &mut Property)>();
             for (position, mut property) in query.iter_mut(&mut world) {
@@ -3128,8 +3142,8 @@ mod additional_tests {
             &chart,
             &master_data,
             &map,
-            &std::collections::HashMap::new(),
-            &UnitRegistry(std::collections::HashMap::new()),
+            &crate::collections::HashMap::default(),
+            &UnitRegistry(crate::collections::HashMap::default()),
             Terrain::Factory,
             0.0,
             is_v3,
@@ -3178,7 +3192,7 @@ mod additional_tests {
             max_range: 1,
             ..UnitStats::mock()
         };
-        let registry = UnitRegistry(std::collections::HashMap::new());
+        let registry = UnitRegistry(crate::collections::HashMap::default());
         let shortage = issue75_air_defense_strategy();
         let mut covered = shortage.clone();
         let required_coverage = covered.air_defense.required_coverage;
@@ -3200,7 +3214,7 @@ mod additional_tests {
             &chart,
             &master_data,
             &map,
-            &std::collections::HashMap::new(),
+            &crate::collections::HashMap::default(),
             &registry,
             Terrain::Factory,
             0.0,
@@ -3217,7 +3231,7 @@ mod additional_tests {
             &chart,
             &master_data,
             &map,
-            &std::collections::HashMap::new(),
+            &crate::collections::HashMap::default(),
             &registry,
             Terrain::Factory,
             0.0,
@@ -3281,7 +3295,7 @@ mod additional_tests {
                 total: required_coverage,
             });
         let enemy_units = vec![(GridPosition { x: 5, y: 0 }, enemy_bcopters)];
-        let registry = UnitRegistry(std::collections::HashMap::new());
+        let registry = UnitRegistry(crate::collections::HashMap::default());
         let score = |strategy: &ProductionStrategy| {
             calculate_unit_score_at(
                 UnitType::Missiles,
@@ -3294,7 +3308,7 @@ mod additional_tests {
                 &chart,
                 &master_data,
                 &map,
-                &std::collections::HashMap::new(),
+                &crate::collections::HashMap::default(),
                 &registry,
                 Terrain::Factory,
                 0.0,
@@ -3355,7 +3369,7 @@ mod additional_tests {
             ))
             .unwrap();
         let damage_chart = DamageChart::new();
-        let unit_registry = UnitRegistry(std::collections::HashMap::new());
+        let unit_registry = UnitRegistry(crate::collections::HashMap::default());
         calculate_unit_score_at(
             unit_type,
             &stats,
@@ -3367,7 +3381,7 @@ mod additional_tests {
             &damage_chart,
             &master_data,
             map,
-            &std::collections::HashMap::new(),
+            &crate::collections::HashMap::default(),
             &unit_registry,
             Terrain::Factory,
             0.0,
@@ -4118,7 +4132,7 @@ mod additional_tests {
             &master_data,
             20_500,
         );
-        let produced: std::collections::HashSet<_> = outcome
+        let produced: crate::collections::HashSet<_> = outcome
             .commands
             .iter()
             .map(|command| command.unit_type)
@@ -4126,7 +4140,10 @@ mod additional_tests {
 
         assert_eq!(
             produced,
-            std::collections::HashSet::from([UnitType::Lander, UnitType::TransportHelicopter,])
+            crate::collections::HashSet::from_iter([
+                UnitType::Lander,
+                UnitType::TransportHelicopter,
+            ])
         );
         assert!(outcome.completed_all_rows);
     }
@@ -4580,7 +4597,7 @@ mod additional_tests {
                 &chart,
                 &master_data,
                 &map,
-                &std::collections::HashMap::new(),
+                &crate::collections::HashMap::default(),
                 &registry,
                 Terrain::Factory,
                 0.0,
@@ -4614,7 +4631,7 @@ mod additional_tests {
                 &chart,
                 &master_data,
                 &map,
-                &std::collections::HashMap::new(),
+                &crate::collections::HashMap::default(),
                 &registry,
                 Terrain::Factory,
                 0.0,
@@ -4802,3 +4819,5 @@ mod additional_tests {
         );
     }
 }
+
+pub(crate) mod turn_state;

@@ -12,11 +12,11 @@
 
 use super::operation::{OperationKind, OperationSlots, SlotKind};
 use super::plan_revision::{PlanDisposition, PlanId, PlanRevision, ReplanReason};
+use crate::ai::production::demand::{EffectiveDemand, UnfilledReason};
+use crate::collections::HashMap;
 use crate::components::{GridPosition, PlayerId};
 use crate::resources::UnitType;
 use bevy_ecs::prelude::*;
-use std::collections::HashMap;
-
 /// 1 枠分の購入判断の結末。
 #[derive(Debug, Clone)]
 pub enum ProductionDecision {
@@ -26,8 +26,17 @@ pub enum ProductionDecision {
         cost: u32,
         facility: GridPosition,
     },
-    /// この枠を満たせる候補が無く、枠の要求を落とした
-    SlotCleared,
+    /// Must を確保した残額で、観測済み前線へ直ちに寄与する増援を発行した。
+    ///
+    /// 永続Combat計画の購入列ではないため、次手番にそのまま再利用する予約にはしない。
+    /// ただし生産Entityには通常のCombat任務を付けるので、無所属戦力にはならない。
+    ProducedImmediateReinforcement {
+        unit_type: UnitType,
+        cost: u32,
+        facility: GridPosition,
+    },
+    /// 当手番はこの枠を充足しない。要求は残し、理由を記録する。
+    Unfilled { reason: UnfilledReason },
     /// 見送り購入（資金を貯めるためループを打ち切った）
     Deferred { unit_type: UnitType, cost: u32 },
     /// 永続計画に将来手番の購入を予約し、当手番は実行対象がない。
@@ -59,14 +68,35 @@ pub struct ProductionOperationTrace {
     pub kind: OperationKind,
     pub anchor: GridPosition,
     pub slots: OperationSlots,
+    /// 永続Roadmap上の占領担当撃破に対する再契約が未完了か。
+    pub capture_replacement_pending: bool,
     pub requires_transport: bool,
     pub enemy_combat_units: u32,
-    /// 作戦期限までにこの前線へ到着できる敵生産分だけを数えた増援予算。
+    /// 実生産履歴と敵施設の事前分布を基準に、作戦期限までにこの前線へ到着しうる
+    /// 通常増援額。RollingPlanへ仮想敵として渡す継続生産の基準である。
     pub enemy_reinforcement_funds: u32,
+    /// 敵が施設・収入をより強く使った場合の上側見積り。進撃Goは止めず、
+    /// counter候補と次回再計画の診断に使う。
+    pub enemy_stress_reinforcement_funds: u32,
     /// 観測後に間に合う具体的counter生産列の現在必要な予約額。
     pub contingency_reserve_funds: u32,
     pub reinforcement_contingencies: Vec<ReinforcementContingencyTrace>,
     pub deploy_lead_time: u32,
+}
+
+/// 配分終了時の需要。実効要求と実際に確保した量は同一とは限らない。
+#[derive(Debug, Clone)]
+pub struct ProductionDemandTrace {
+    pub operation_kind: OperationKind,
+    pub anchor: GridPosition,
+    /// 分析が導出した元の要求。予算不足や合同パッケージで上書きしない。
+    pub requested: OperationSlots,
+    /// 当手番の配分対象。未充足で閉じた枠を除き、合同パッケージの量を反映する。
+    pub effective: OperationSlots,
+    /// 当手番に購入案として確保した量。命令発行・生産完了を意味しない。
+    pub filled: OperationSlots,
+    /// 合同パッケージなどが実効要求を定めた理由。未充足理由とは別に保持する。
+    pub adjustments: Vec<EffectiveDemand<SlotKind>>,
 }
 
 /// 仮想敵を現在編成へ混ぜず、観測後に発動する条件付きcounter計画。
@@ -130,10 +160,14 @@ pub struct RollingCombatPlanTrace {
     pub occupation_turn: Option<u32>,
     pub production_cost: u32,
     pub expected_loss: u32,
+    pub surviving_combat_value: u32,
+    pub required_overmatch_value: u32,
+    pub overmatch_ready: bool,
     pub protected_unit_count: usize,
     pub protected_survivor_count: usize,
     pub required_capture_survivor_count: usize,
     pub candidates_considered: usize,
+    pub candidates_pruned: usize,
     pub search_truncated: bool,
 }
 
@@ -148,6 +182,8 @@ pub struct ProductionPlanTrace {
     /// 作戦が 1 つも立たず fallback に落ちたか
     pub fallback: bool,
     pub operations: Vec<ProductionOperationTrace>,
+    /// 配分終了時のrequested/effective/filledと、実効要求を採用した理由。
+    pub demands: Vec<ProductionDemandTrace>,
     pub steps: Vec<ProductionStepTrace>,
     /// 島ごとの実行可能な混成Combat計画。anchorごとに最終revisionだけを保持する。
     pub rolling_combat_plans: Vec<RollingCombatPlanTrace>,
@@ -157,29 +193,47 @@ pub struct ProductionPlanTrace {
     pub reserved_funds: u32,
     /// どの作戦・購入列にも帰属していない、真の余剰資金。
     pub uncommitted_funds: u32,
+    /// 敵の実生産履歴からの次手番予測。要求量・予約額とは独立して記録する。
+    pub enemy_production_forecast: EnemyProductionForecastTrace,
+    /// 当手番に充足しなかった要求枠と理由。要求自体は `operations` に残る。
+    pub unfilled_slots: Vec<UnfilledSlotTrace>,
+}
+
+/// 当手番に充足しなかった要求枠1件。
+#[derive(Debug, Clone, Copy)]
+pub struct UnfilledSlotTrace {
+    pub operation_kind: OperationKind,
+    pub anchor: GridPosition,
+    pub slot_kind: SlotKind,
+    /// 作戦が要求していた量（体数・スロット・計画起動フラグ）。
+    pub requirement: u32,
+    pub reason: UnfilledReason,
 }
 
 impl ProductionPlanTrace {
     /// 作戦が立たなかったターンの記録を作る。
     pub fn new(player_id: PlayerId, funds: u32, free_facility_count: usize) -> Self {
         Self {
+            enemy_production_forecast: Default::default(),
             player_id,
             funds,
             free_facility_count,
             fallback: false,
             operations: Vec::new(),
+            demands: Vec::new(),
             steps: Vec::new(),
             rolling_combat_plans: Vec::new(),
             leftover_funds: funds,
             reserved_funds: 0,
             uncommitted_funds: funds,
+            unfilled_slots: Vec::new(),
         }
     }
 
     /// 実際に発注されたユニット種別ごとの体数。
     /// 「工場数 × ターン数に張り付いていないか」の判定に使う。
     pub fn produced_counts(&self) -> HashMap<UnitType, usize> {
-        let mut counts = HashMap::new();
+        let mut counts = HashMap::default();
         for step in &self.steps {
             if let ProductionDecision::Produced { unit_type, .. } = &step.decision {
                 *counts.entry(*unit_type).or_insert(0) += 1;
@@ -246,7 +300,9 @@ mod tests {
             deficit_before: 1.0,
             deficit_after: 0.0,
             remaining_funds_before: 20_000,
-            decision: ProductionDecision::SlotCleared,
+            decision: ProductionDecision::Unfilled {
+                reason: UnfilledReason::NoCandidate,
+            },
         });
         let mut second = ProductionPlanTrace::new(player, 10_000, 1);
         second.leftover_funds = 5_000;
@@ -257,7 +313,9 @@ mod tests {
             deficit_before: 1.0,
             deficit_after: 0.0,
             remaining_funds_before: 10_000,
-            decision: ProductionDecision::SlotCleared,
+            decision: ProductionDecision::Unfilled {
+                reason: UnfilledReason::NoCandidate,
+            },
         });
 
         diagnostics.record(3, first);
@@ -282,7 +340,9 @@ mod tests {
             deficit_before: 1.0,
             deficit_after: 0.0,
             remaining_funds_before: 20_000,
-            decision: ProductionDecision::SlotCleared,
+            decision: ProductionDecision::Unfilled {
+                reason: UnfilledReason::NoCandidate,
+            },
         });
         let second = ProductionPlanTrace::new(player, 8_000, 1);
 
@@ -293,4 +353,23 @@ mod tests {
         assert_eq!(trace.funds, 8_000);
         assert!(trace.steps.is_empty());
     }
+}
+
+/// 敵の実生産観測から作る、次手番1回分の予測と既済予測の誤差。
+///
+/// 予測は現在の必須戦力や資金予約には使わない。まず対戦ログで誤差を測り、
+/// 予測器が追随できていることを確認するための診断値である。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EnemyProductionForecastTrace {
+    pub expected_units_next_turn: u32,
+    pub expected_cost_next_turn: u32,
+    pub dominant_unit_type: Option<UnitType>,
+    pub evaluated_samples: u32,
+    pub mean_absolute_unit_error: u32,
+    pub mean_absolute_cost_error: u32,
+}
+
+/// 物件契約と保護供給の帰属を照合する任意の診断出力。
+pub(in crate::ai::v4) fn campaign_scope_audit_enabled() -> bool {
+    std::env::var_os("OPENWARS_CAMPAIGN_SCOPE_AUDIT").is_some()
 }

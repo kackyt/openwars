@@ -175,7 +175,7 @@ pub fn produce_unit_system(
         return;
     }
     let active_player_id = players.0[match_state.active_player_index.0].id;
-    let mut newly_spawned_positions = std::collections::HashSet::new();
+    let mut newly_spawned_positions = crate::collections::HashSet::default();
 
     for event in produce_events.read() {
         if let Some(ref mut diag) = diagnostic {
@@ -345,7 +345,7 @@ mod tests {
             loadable_unit_types: vec![],
         };
 
-        let mut registry = UnitRegistry(std::collections::HashMap::new());
+        let mut registry = UnitRegistry(crate::collections::HashMap::default());
         registry.0.insert(UnitType::Infantry, stats);
         world.insert_resource(registry);
         world.send_event(ProduceUnitCommand {
@@ -414,7 +414,7 @@ mod tests {
             UnitStats::mock(),
         ));
 
-        let mut registry = UnitRegistry(std::collections::HashMap::new());
+        let mut registry = UnitRegistry(crate::collections::HashMap::default());
         registry.0.insert(
             UnitType::Infantry,
             UnitStats {

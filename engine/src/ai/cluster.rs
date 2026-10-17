@@ -1,10 +1,9 @@
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::unnecessary_cast)]
 
+use crate::collections::HashSet;
 use crate::components::{Faction, GridPosition, PlayerId, UnitStats};
 use bevy_ecs::prelude::*;
-use std::collections::HashSet;
-
 /// 敵ユニットのクラスター。
 /// 2ターン以内に相互支援できるユニット群。
 #[derive(Debug, Clone)]
@@ -29,7 +28,7 @@ pub fn detect_enemy_clusters(
         }
     }
 
-    let mut unit_positions = std::collections::HashMap::new();
+    let mut unit_positions = crate::collections::HashMap::default();
     let mut q_all_units = world.query::<(&Faction, &GridPosition, &UnitStats)>();
     for (faction, pos, stats) in q_all_units.iter(world) {
         unit_positions.insert(
@@ -45,7 +44,7 @@ pub fn detect_enemy_clusters(
     }
 
     let mut clusters = Vec::new();
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
 
     let map = world.resource::<crate::resources::Map>();
     let registry = world
@@ -58,7 +57,7 @@ pub fn detect_enemy_clusters(
             continue;
         }
 
-        let mut cluster_units = HashSet::new();
+        let mut cluster_units = HashSet::default();
         let mut total_threat = 0;
         let mut total_value = 0;
         let mut sum_x = 0;

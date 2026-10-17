@@ -1,7 +1,6 @@
+use crate::collections::HashMap;
 use crate::components::PlayerId;
 use bevy_ecs::prelude::*;
-use std::collections::HashMap;
-
 /// AIのバージョンを表すEnum。
 /// 評価や意思決定アルゴリズムを新旧で切り替えるために使用します。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -36,6 +35,11 @@ impl AiVersion {
         matches!(self, AiVersion::V3 | AiVersion::V4)
     }
 
+    /// 敵生産マスの封鎖はV4だけが候補にする。標準経路ではこの追加評価を呼ばない。
+    pub(crate) fn uses_enemy_production_blockade(&self) -> bool {
+        matches!(self, AiVersion::V4)
+    }
+
     /// 作戦駆動の生産計画（V4）を使うかどうか。
     /// V1/V2/V3 はベースラインとして従来の生産ロジックを維持する。
     pub fn uses_operation_driven_production(&self) -> bool {
@@ -54,7 +58,7 @@ impl PlayerAiSettings {
     /// 新しい PlayerAiSettings を初期化します。
     pub fn new() -> Self {
         Self {
-            versions: HashMap::new(),
+            versions: HashMap::default(),
         }
     }
 
@@ -134,6 +138,8 @@ mod tests {
         // V4 は戦術評価を V3 から継承し、生産だけを作戦駆動へ差し替える。
         assert!(AiVersion::V4.uses_v3_tactics());
         assert!(AiVersion::V4.uses_operation_driven_production());
+        assert!(AiVersion::V4.uses_enemy_production_blockade());
+        assert!(!AiVersion::V3.uses_enemy_production_blockade());
         // 過去バージョンは作戦駆動生産を使わないベースラインのまま。
         assert!(!AiVersion::V3.uses_operation_driven_production());
         assert!(!AiVersion::V2.uses_operation_driven_production());

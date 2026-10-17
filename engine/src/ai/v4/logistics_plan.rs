@@ -3,11 +3,10 @@ use crate::ai::island_campaign::{
     preferred_logistics_target,
 };
 use crate::ai::islands::IslandId;
+use crate::collections::{HashMap, HashSet};
 use crate::components::{GridPosition, PlayerId};
 use crate::resources::Map;
 use bevy_ecs::prelude::Resource;
-use std::collections::{HashMap, HashSet};
-
 /// 予測占領手番をこの幅だけ超過した場合、同じ経路を含めて見積り直す。
 const COMPLETION_DELAY_GRACE_TURNS: u32 = 1;
 /// 兵站のないカテゴリを抱えたまま最終強襲へ進む場合の通常シナリオ上の準備遅延。

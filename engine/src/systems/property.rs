@@ -1,9 +1,8 @@
+use crate::collections::HashSet;
 use crate::components::*;
 use crate::events::*;
 use crate::resources::*;
 use bevy_ecs::prelude::*;
-use std::collections::HashSet;
-
 /// 拠点の占領・修理コマンド(`CapturePropertyCommand`)を処理するシステム。
 ///
 /// 【処理の流れ】
@@ -168,7 +167,7 @@ pub fn victory_check_system(
     phase_changed_events.clear();
 
     // 首都を所有しているプレイヤーを収集 (O(M))
-    let mut players_with_capitals = HashSet::new();
+    let mut players_with_capitals = HashSet::default();
     for prop in q_properties.iter() {
         if let (Terrain::Capital, Some(owner_id)) = (prop.terrain, prop.owner_id) {
             players_with_capitals.insert(owner_id);
@@ -176,7 +175,7 @@ pub fn victory_check_system(
     }
 
     // 生存しているユニットを所有しているプレイヤーを収集 (O(N))
-    let mut players_with_units = HashSet::new();
+    let mut players_with_units = HashSet::default();
     for (u_fac, u_hp) in q_units.iter() {
         if !u_hp.is_destroyed() {
             players_with_units.insert(u_fac.0);

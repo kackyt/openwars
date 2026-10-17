@@ -1,7 +1,6 @@
+use crate::collections::HashMap;
 use bevy_ecs::prelude::Resource;
 use serde::{Deserialize, Deserializer};
-use std::collections::HashMap;
-
 /// マスターデータ読み込み時の専用エラー型
 #[derive(thiserror::Error, Debug)]
 pub enum MasterDataError {
@@ -324,7 +323,7 @@ impl MasterDataRegistry {
         let headers = rdr.headers()?.clone();
         for result in rdr.records() {
             let record = result?;
-            let mut damages = HashMap::new();
+            let mut damages = HashMap::default();
             for (i, field) in record.iter().enumerate().skip(5) {
                 if let Some(header) = headers.get(i)
                     && !header.is_empty()
@@ -369,7 +368,7 @@ impl MasterDataRegistry {
         let headers = rdr.headers()?.clone();
         for result in rdr.records() {
             let record = result?;
-            let mut terrain_costs = HashMap::new();
+            let mut terrain_costs = HashMap::default();
             for (i, field) in record.iter().enumerate().skip(1) {
                 if let Some(header) = headers.get(i)
                     && !header.is_empty()
@@ -951,6 +950,39 @@ mod tests {
         assert_eq!(cell_p2_cap11.player_id, 2);
         assert_eq!(cell_p2_cap11.terrain_id, LandscapeId(1));
 
+        // map_54 の確認（ROMシナリオ48: ルビコンガワ）
+        let map54 = registry.get_map("map_54").expect("map_54 not found");
+        assert_eq!(map54.width, 24);
+        assert_eq!(map54.height, 24);
+        let cell_p1_cap54 = map54.get_cell(3, 3).unwrap();
+        assert_eq!(cell_p1_cap54.player_id, 1);
+        assert_eq!(cell_p1_cap54.terrain_id, LandscapeId(1));
+        let cell_p2_cap54 = map54.get_cell(20, 19).unwrap();
+        assert_eq!(cell_p2_cap54.player_id, 2);
+        assert_eq!(cell_p2_cap54.terrain_id, LandscapeId(1));
+
+        // map_55 の確認（ROMシナリオ50: ドラゴンベイ）
+        let map55 = registry.get_map("map_55").expect("map_55 not found");
+        assert_eq!(map55.width, 30);
+        assert_eq!(map55.height, 30);
+        let cell_p1_cap55 = map55.get_cell(14, 3).unwrap();
+        assert_eq!(cell_p1_cap55.player_id, 1);
+        assert_eq!(cell_p1_cap55.terrain_id, LandscapeId(1));
+        let cell_p2_cap55 = map55.get_cell(15, 26).unwrap();
+        assert_eq!(cell_p2_cap55.player_id, 2);
+        assert_eq!(cell_p2_cap55.terrain_id, LandscapeId(1));
+
+        // map_56 の確認（ROMシナリオ52: ネプチューントウ）
+        let map56 = registry.get_map("map_56").expect("map_56 not found");
+        assert_eq!(map56.width, 30);
+        assert_eq!(map56.height, 30);
+        let cell_p1_cap56 = map56.get_cell(3, 26).unwrap();
+        assert_eq!(cell_p1_cap56.player_id, 1);
+        assert_eq!(cell_p1_cap56.terrain_id, LandscapeId(1));
+        let cell_p2_cap56 = map56.get_cell(23, 7).unwrap();
+        assert_eq!(cell_p2_cap56.player_id, 2);
+        assert_eq!(cell_p2_cap56.terrain_id, LandscapeId(1));
+
         // Check decoding at specific known coordinates from the csv output we saw
         // Cell (0, 0) was '12' -> player 0, terrain 12 (海)
         let cell_0_0 = map1.get_cell(0, 0).unwrap();
@@ -975,12 +1007,12 @@ mod tests {
         let registry = MasterDataRegistry::load().unwrap();
 
         // マップ名はAIコードではなくrom_scenario.csvのmap_name列で対応付ける。
-        assert_eq!(registry.rom_scenarios.len(), 53);
+        assert_eq!(registry.rom_scenarios.len(), 56);
         let map_names = registry.map_names();
-        assert_eq!(map_names.len(), 53);
+        assert_eq!(map_names.len(), 56);
         assert_eq!(map_names.first().map(String::as_str), Some("map_1"));
-        assert_eq!(map_names.last().map(String::as_str), Some("map_53"));
-        for map_number in 1..=53 {
+        assert_eq!(map_names.last().map(String::as_str), Some("map_56"));
+        for map_number in 1..=56 {
             let map_name = format!("map_{map_number}");
             let scenario = registry
                 .get_rom_scenario(&map_name)

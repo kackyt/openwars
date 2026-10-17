@@ -1,23 +1,19 @@
 #![allow(clippy::too_many_arguments)]
 
+use crate::ai::context::board::PlayerBoard;
 use crate::ai::demand::{
     AirDefenseAssessment, CombatCapabilitySnapshot, DemandMatrix, assess_air_defense,
     average_attack_expectation, compute_demand, compute_unit_affinity,
 };
-use crate::ai::island_campaign::{
-    IslandCampaignDiagnostics, IslandCampaignPortfolio, IslandCampaignShortfall,
-};
-use crate::ai::island_campaign_analysis::{
-    analyze_island_campaign, analyze_island_campaign_excluding,
-};
-use crate::ai::turn_distance::{TerrainConnectivity, TurnDistanceCache, calculate_turn_distance};
-use crate::components::{
-    ActionCompleted, Ammo, Faction, Fuel, GridPosition, Health, PlayerId, Property, UnitStats,
-};
+use crate::ai::island_campaign::{IslandCampaignPortfolio, IslandCampaignShortfall};
+use crate::ai::planning::campaign;
+use crate::ai::planning::decision::AdoptedTurnPortfolio;
+use crate::ai::planning::situation::{self, StrategicSituation};
+use crate::ai::turn_distance::{TurnDistanceCache, calculate_turn_distance};
+use crate::collections::{HashMap, HashSet};
+use crate::components::{GridPosition, PlayerId, UnitStats};
 use crate::resources::{Map, MovementType, Terrain, UnitType, master_data::MasterDataRegistry};
 use bevy_ecs::prelude::*;
-use std::collections::{HashMap, HashSet};
-
 /// ゲームの戦略的フェーズ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GamePhase {
@@ -43,9 +39,9 @@ pub struct ProductionStrategy {
     /// 戦略的に優先すべきターゲット位置（未占領拠点や敵の群れ）。
     pub priority_targets: Vec<GridPosition>,
     /// 未占領（中立）拠点の座標リスト
-    pub unowned_properties: std::collections::HashSet<GridPosition>,
+    pub unowned_properties: crate::collections::HashSet<GridPosition>,
     /// 敵所有拠点の座標リスト (#53: 占領部隊の奪取目標として使用)
-    pub enemy_properties: std::collections::HashSet<GridPosition>,
+    pub enemy_properties: crate::collections::HashSet<GridPosition>,
     /// 歩兵など、ヘリでも運搬可能な軽輸送需要
     pub light_transport_demand: u32,
     /// 車両など、輸送船でしか運搬できない重輸送需要
@@ -61,7 +57,7 @@ pub struct ProductionStrategy {
     /// 現在保有している輸送ユニットの数
     pub existing_transport_count: usize,
     /// 敵地上ユニットが存在しない平和な島にあるプロパティの座標セット
-    pub peaceful_properties: std::collections::HashSet<GridPosition>,
+    pub peaceful_properties: crate::collections::HashSet<GridPosition>,
     /// V3が毎ターン盤面から再構築する島嶼キャンペーン全体。
     pub campaign_portfolio: IslandCampaignPortfolio,
     /// 完全packageごとの予約額と不足カテゴリをproductionが優先順に消費する行。
@@ -88,10 +84,6 @@ pub struct ProductionPlan {
     pub emergency_anti_air_reservations: HashMap<u32, EmergencyAntiAirReservation>,
 }
 
-fn is_ground_movement(movement_type: MovementType) -> bool {
-    !matches!(movement_type, MovementType::Air | MovementType::Ship)
-}
-
 /// V3の島嶼作戦で海を越えられる輸送枠だけを返します。
 /// 地上輸送車のcargo枠は同一島内では有効でも、海上輸送需要を満たしません。
 pub(crate) fn sea_transport_capacity(unit_type: UnitType, stats: &UnitStats) -> (u32, u32) {
@@ -104,37 +96,6 @@ pub(crate) fn sea_transport_capacity_from_slots(unit_type: UnitType, max_cargo: 
         UnitType::Lander => (max_cargo, max_cargo),
         _ => (0, 0),
     }
-}
-
-/// 2ユニットを戦略上の近距離交戦候補として扱えるかを判定します。
-/// 地上ユニット同士だけは、互いの地形移動で接続されていない場合に除外します。
-fn can_form_ground_engagement(
-    map: &Map,
-    registry: &MasterDataRegistry,
-    my_pos: GridPosition,
-    my_stats: &UnitStats,
-    enemy_pos: GridPosition,
-    enemy_stats: &UnitStats,
-    connectivity: &mut TerrainConnectivity,
-) -> bool {
-    if !is_ground_movement(my_stats.movement_type) || !is_ground_movement(enemy_stats.movement_type)
-    {
-        return true;
-    }
-
-    connectivity.is_reachable(
-        map,
-        registry,
-        (my_pos.x, my_pos.y),
-        (enemy_pos.x, enemy_pos.y),
-        my_stats.movement_type,
-    ) || connectivity.is_reachable(
-        map,
-        registry,
-        (enemy_pos.x, enemy_pos.y),
-        (my_pos.x, my_pos.y),
-        enemy_stats.movement_type,
-    )
 }
 
 /// 敵ユニットが特定の拠点を脅かしているかを判定するヘルパー関数。
@@ -182,16 +143,8 @@ fn enemy_threatens_property(
 
 /// 現在のマップ状況を分析し、最適な戦略を決定します。
 pub fn analyze_strategy(world: &mut World, player_id: PlayerId) -> ProductionStrategy {
-    analyze_strategy_internal(world, player_id, None, &HashSet::new())
-}
-
-/// 既存の実行任務へ予約したEntityを島嶼キャンペーンから除外して戦略を分析します。
-pub(crate) fn analyze_strategy_with_reserved_entities(
-    world: &mut World,
-    player_id: PlayerId,
-    reserved_entities: &HashSet<Entity>,
-) -> ProductionStrategy {
-    analyze_strategy_internal(world, player_id, None, reserved_entities)
+    let board = PlayerBoard::observe(world, player_id);
+    analyze_strategy_internal(world, &board, None, &HashSet::default())
 }
 
 /// 同一ターンのSquad計画が保存したV3キャンペーンを後続の判断へ再利用する。
@@ -201,325 +154,63 @@ pub(crate) fn analyze_strategy_for_turn(
     player_id: PlayerId,
 ) -> ProductionStrategy {
     let cached_campaign = world
-        .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
+        .get_resource::<AdoptedTurnPortfolio>()
         .and_then(|cache| cache.campaign_portfolio(player_id))
         .cloned();
-    analyze_strategy_internal(world, player_id, cached_campaign, &HashSet::new())
+    let board = PlayerBoard::observe(world, player_id);
+    analyze_strategy_internal(world, &board, cached_campaign, &HashSet::default())
 }
 
+/// 戦略分析: campaign提案 → 状況判断 → 生産需要 の順に求め、生産判断用にまとめる。
 fn analyze_strategy_internal(
     world: &mut World,
-    player_id: PlayerId,
+    board: &PlayerBoard,
     cached_campaign: Option<IslandCampaignPortfolio>,
     reserved_entities: &HashSet<Entity>,
 ) -> ProductionStrategy {
-    let mut strategy = ProductionStrategy::default();
-
-    let mut unowned_properties = Vec::new();
-    let mut my_properties = Vec::new();
-    let mut enemy_properties = Vec::new();
-    let mut my_capital_pos = None;
-
-    let master_data = world
-        .get_resource::<crate::resources::master_data::MasterDataRegistry>()
-        .cloned()
-        .unwrap_or_else(|| {
-            crate::resources::master_data::MasterDataRegistry::load().unwrap_or_default()
-        });
-    let map = world.resource::<crate::resources::Map>().clone();
+    let player_id = board.player;
     let is_v3 = crate::ai::resolve_player_ai_version(world, player_id).uses_v3_tactics();
-    if is_v3 {
-        if let Some(cached) = cached_campaign {
-            strategy.campaign_portfolio = cached;
-        } else {
-            // 通常分析では盤面から再構築し、同じ呼び出し内と診断出力で共有する。
-            strategy.campaign_portfolio = if reserved_entities.is_empty() {
-                analyze_island_campaign(world, player_id)
-            } else {
-                analyze_island_campaign_excluding(world, player_id, reserved_entities)
-            };
-            // 診断Resourceは意思決定に戻さず、最後の分析結果だけをプレイヤー別に上書きする。
-            if let Some(mut diagnostics) = world.get_resource_mut::<IslandCampaignDiagnostics>() {
-                diagnostics
-                    .by_player
-                    .insert(player_id, strategy.campaign_portfolio.clone());
-            } else {
-                let mut diagnostics = IslandCampaignDiagnostics::default();
-                diagnostics
-                    .by_player
-                    .insert(player_id, strategy.campaign_portfolio.clone());
-                world.insert_resource(diagnostics);
-            }
-        }
-    }
-    let mut turn_cache = TurnDistanceCache::default();
-    let mut unit_positions = HashMap::new();
-    let mut q_all_units = world.query::<(&Faction, &GridPosition, &UnitStats)>();
-    for (faction, pos, stats) in q_all_units.iter(world) {
-        unit_positions.insert(
-            (pos.x, pos.y),
-            crate::systems::movement::OccupantInfo {
-                player_id: faction.0,
-                is_transport: stats.max_cargo > 0,
-                unit_type: stats.unit_type,
-                loadable_types: stats.loadable_unit_types.clone(),
-                free_slots: stats.max_cargo,
-            },
-        );
-    }
-    let island_map = world
-        .get_resource::<crate::ai::islands::IslandMap>()
-        .cloned()
-        .unwrap_or_else(|| crate::ai::islands::IslandMap::analyze(&map));
+    // 同じ手番の部隊再編が採用したportfolioがあれば再利用し、なければ盤面から提案する。
+    let campaign_portfolio = match (is_v3, cached_campaign) {
+        (false, _) => IslandCampaignPortfolio::default(),
+        (true, Some(cached)) => cached,
+        (true, None) => campaign::propose(world, player_id, reserved_entities),
+    };
+    let situation = situation::assess(board);
+    let mut strategy = ProductionStrategy {
+        phase: situation.phase,
+        campaign_portfolio,
+        ..ProductionStrategy::default()
+    };
+    apply_production_demand(world, board, &situation, &mut strategy, is_v3);
+    strategy.priority_targets = situation.priority_targets;
+    strategy.unowned_properties = situation.unowned_properties;
+    strategy.enemy_properties = situation.enemy_properties;
+    strategy
+}
 
-    let mut allowed_islands = std::collections::HashMap::new();
-    for island in &island_map.islands {
-        let allowed = crate::ai::planner::is_invasion_allowed(world, player_id, island.id, island);
-        allowed_islands.insert(island.id, allowed);
-    }
-
+/// 生産需要: 構成比・占領需要・需要マトリクス・対空・輸送需要・campaign不足・平和物件。
+///
+/// 部隊再編はこれらを使わないため、生産判断の分析だけが計算する。
+fn apply_production_demand(
+    world: &mut World,
+    board: &PlayerBoard,
+    situation: &StrategicSituation,
+    strategy: &mut ProductionStrategy,
+    is_v3: bool,
+) {
+    let player_id = board.player;
+    let map = &board.map;
+    let master_data = &board.registry;
+    let island_map = &board.island_map;
+    let my_units = &situation.my_units;
+    let enemy_units = &situation.enemy_units;
+    let my_base_island_ids = &situation.my_base_island_ids;
+    let need_more_revenue = situation.need_more_revenue;
     let get_island_id =
         |pos: &GridPosition| -> Option<usize> { island_map.get_island_at(pos).map(|i| i.id.0) };
-
-    let mut my_base_island_ids = std::collections::HashSet::new();
-
-    // 1. 拠点の分析
-    {
-        let mut q_props = world.query::<(&GridPosition, &Property)>();
-        for (pos, prop) in q_props.iter(world) {
-            if prop.owner_id == Some(player_id) {
-                my_properties.push(*pos);
-                if prop.terrain == crate::resources::Terrain::Capital {
-                    my_capital_pos = Some(*pos);
-                }
-                // 自軍の任意の拠点がある島IDを収集
-                if let Some(island_id) = get_island_id(pos) {
-                    my_base_island_ids.insert(island_id);
-                }
-            } else if prop.owner_id.is_none() {
-                unowned_properties.push(*pos);
-            } else {
-                enemy_properties.push(*pos);
-            }
-        }
-    }
-
-    // unowned_properties / enemy_properties を strategy に保存
-    strategy.unowned_properties = unowned_properties.iter().cloned().collect();
-    strategy.enemy_properties = enemy_properties.iter().cloned().collect();
-
-    let mut my_units = Vec::new();
-    let mut enemy_units = Vec::new();
-
-    // 2. ユニットの分析
-    {
-        let mut q_units = world.query::<(
-            &GridPosition,
-            &Faction,
-            &UnitStats,
-            Option<&crate::components::Transporting>,
-        )>();
-        for (pos, faction, stats, transporting) in q_units.iter(world) {
-            // マップ外（輸送機内など）のユニットは距離計算などの分析から除外
-            if pos.x >= 9999 || transporting.is_some() {
-                continue;
-            }
-            if faction.0 == player_id {
-                my_units.push((*pos, stats.clone()));
-            } else {
-                enemy_units.push((*pos, stats.clone()));
-            }
-        }
-    }
-
-    let capability_units = {
-        let mut query = world.query::<(
-            &GridPosition,
-            &Faction,
-            &UnitStats,
-            &Health,
-            Option<&Ammo>,
-            Option<&Fuel>,
-            Option<&ActionCompleted>,
-            Option<&crate::components::Transporting>,
-        )>();
-        query
-            .iter(world)
-            .filter(|(position, _, _, health, _, _, _, transporting)| {
-                position.x < 9999 && health.current > 0 && transporting.is_none()
-            })
-            .map(
-                |(position, faction, stats, health, ammo, fuel, action_completed, _)| {
-                    CombatCapabilitySnapshot {
-                        faction: faction.0,
-                        position: *position,
-                        unit_type: stats.unit_type,
-                        movement_type: stats.movement_type,
-                        hp: health.current,
-                        cost: stats.cost,
-                        max_movement: stats.max_movement,
-                        min_range: stats.min_range,
-                        max_range: stats.max_range,
-                        ammo1: ammo.map_or(99, |ammo| ammo.ammo1),
-                        max_ammo1: stats.max_ammo1,
-                        ammo2: ammo.map_or(99, |ammo| ammo.ammo2),
-                        max_ammo2: stats.max_ammo2,
-                        fuel: fuel.map_or(u32::MAX, |fuel| fuel.current),
-                        action_delay: u32::from(
-                            action_completed.is_some_and(|completed| completed.0),
-                        ),
-                    }
-                },
-            )
-            .collect::<Vec<_>>()
-    };
-
-    // 自軍の歩兵が存在する島IDも収集対象に加える
-    for (pos, stats) in &my_units {
-        #[allow(clippy::collapsible_if)]
-        if stats.can_capture {
-            if let Some(island_id) = get_island_id(pos) {
-                my_base_island_ids.insert(island_id);
-            }
-        }
-    }
-
-    let mut terrain_connectivity = TerrainConnectivity::default();
-
-    // 交戦可能性の判定。地上部隊同士は、海や進入不能地形で分断された組を除外する。
-    let mut min_enemy_dist = 999;
-    for (m_pos, m_stats) in &my_units {
-        for (e_pos, e_stats) in &enemy_units {
-            if !can_form_ground_engagement(
-                &map,
-                &master_data,
-                *m_pos,
-                m_stats,
-                *e_pos,
-                e_stats,
-                &mut terrain_connectivity,
-            ) {
-                continue;
-            }
-            let distance = map.distance(m_pos.x, m_pos.y, e_pos.x, e_pos.y) as i32;
-            if distance < min_enemy_dist {
-                min_enemy_dist = distance;
-            }
-        }
-    }
-
-    // 自軍平均移動力 + 射程 を閾値とする
-    let avg_engagement_range = if !my_units.is_empty() {
-        let total_reach: u32 = my_units
-            .iter()
-            .map(|(_, s)| s.max_movement + s.max_range)
-            .sum();
-        total_reach / my_units.len() as u32
-    } else {
-        5
-    };
-
-    let is_engaged = min_enemy_dist <= (avg_engagement_range + 1) as i32;
-
-    // 3. フェーズの判定
-    // 首都付近に敵がいるかチェック
-    let mut capital_threatened = false;
-    if let Some(cap_pos) = my_capital_pos {
-        for (enemy_pos, enemy_stats) in &enemy_units {
-            let enemy_id = player_id.opposite();
-            let dist = calculate_turn_distance(
-                &map,
-                &master_data,
-                &unit_positions,
-                (enemy_pos.x, enemy_pos.y),
-                (cap_pos.x, cap_pos.y),
-                enemy_stats.movement_type,
-                enemy_stats.max_movement,
-                1,
-                enemy_id,
-                &mut turn_cache,
-            );
-            if dist.turns <= 2 {
-                capital_threatened = true;
-                break;
-            }
-        }
-    }
-
-    // --- 3.1 島嶼（IslandMap）と拠点獲得劣勢（収入不足）の分析 ---
-    let mut island_unowned_properties = 0;
-    for pos in &unowned_properties {
-        if let Some(island_id) = get_island_id(pos)
-            && my_base_island_ids.contains(&island_id)
-        {
-            island_unowned_properties += 1;
-        }
-    }
-
-    let mut island_enemy_properties = 0;
-    for pos in &enemy_properties {
-        if let Some(island_id) = get_island_id(pos)
-            && my_base_island_ids.contains(&island_id)
-        {
-            island_enemy_properties += 1;
-        }
-    }
-
-    let mut island_my_capture_units = 0;
-    for (pos, stats) in &my_units {
-        if stats.can_capture
-            && let Some(island_id) = get_island_id(pos)
-            && my_base_island_ids.contains(&island_id)
-        {
-            island_my_capture_units += 1;
-        }
-    }
-
-    // 島内の拠点数に基づく目標占領ユニット数
-    let total_island_properties = island_unowned_properties + island_enemy_properties;
-    let ideal_capture_units = ((total_island_properties as f32 * 0.5).ceil() as usize).clamp(3, 10);
-
-    // 収入（拠点確保）優先判定: 島内に中立拠点が残っており、歩兵が目標未満である場合
-    let need_more_revenue =
-        island_unowned_properties > 0 && island_my_capture_units < ideal_capture_units;
-
-    // フェーズの判定
-    if capital_threatened {
-        strategy.phase = GamePhase::Defense;
-    } else if need_more_revenue {
-        strategy.phase = GamePhase::Expansion;
-    } else if is_engaged {
-        if enemy_units.len() >= my_units.len() {
-            strategy.phase = GamePhase::Contested;
-        } else {
-            strategy.phase = GamePhase::Assault;
-        }
-    } else {
-        strategy.phase = GamePhase::Expansion;
-    }
-
-    // ターゲットの統合: フェーズに関わらず、中立拠点と敵拠点の両方を考慮する
-    // ただしフェーズによって重みを変えるために、ここではリストの順序や内容を調整
-    strategy.priority_targets = match strategy.phase {
-        GamePhase::Expansion => {
-            let mut targets = unowned_properties.clone();
-            targets.extend(enemy_properties.iter().cloned());
-            targets
-        }
-        GamePhase::Contested | GamePhase::Assault => {
-            let mut targets = enemy_properties.clone();
-            // 中立拠点も近いものはターゲットに含める
-            targets.extend(unowned_properties.iter().cloned());
-            targets
-        }
-        GamePhase::Defense => {
-            if let Some(cap_pos) = my_capital_pos {
-                vec![cap_pos]
-            } else {
-                enemy_properties.clone()
-            }
-        }
-    };
+    // 編成と共通の占有（搭載中のunitは進路を塞がない）。
+    let unit_positions = board.occupancy();
 
     // 理想構成の適用
     match strategy.phase {
@@ -561,7 +252,8 @@ fn analyze_strategy_internal(
 
     // 占領需要の計算
     // 自軍の島に未占領・敵拠点があるかどうかにかかわらず、マップ全体で占領すべき拠点があるなら歩兵を需要とする
-    let total_unowned_or_enemy = unowned_properties.len() + enemy_properties.len();
+    let total_unowned_or_enemy =
+        situation.unowned_properties.len() + situation.enemy_properties.len();
     if total_unowned_or_enemy > 0 {
         // マップ全体での占領目標に対する歩兵的理想数（マップが広ければ多い）
         let ideal_capture_units_global =
@@ -592,17 +284,11 @@ fn analyze_strategy_internal(
 
         if let (Some(chart), Some(registry)) = (damage_chart, unit_registry) {
             // 自軍屠性を制限する：拠点の terrain を取得
-            let my_props_for_demand: Vec<(GridPosition, Terrain)> = {
-                let mut q = world.query::<(&GridPosition, &Property)>();
-                q.iter(world)
-                    .filter(|(_, p)| p.owner_id == Some(player_id))
-                    .map(|(pos, p)| (*pos, p.terrain))
-                    .collect()
-            };
+            let my_props_for_demand = &situation.my_properties;
             strategy.demand = compute_demand(
-                &my_units,
-                &enemy_units,
-                &my_props_for_demand,
+                my_units,
+                enemy_units,
+                my_props_for_demand,
                 &chart,
                 &registry,
             );
@@ -621,12 +307,13 @@ fn analyze_strategy_internal(
                     })
                     .map(|(position, _)| *position)
                     .collect::<Vec<_>>();
+                let capability_units = combat_capabilities(board);
                 strategy.air_defense = assess_air_defense(
                     player_id,
                     &capability_units,
                     &critical_sites,
-                    &map,
-                    &master_data,
+                    map,
+                    master_data,
                     &unit_positions,
                     &chart,
                 );
@@ -635,14 +322,19 @@ fn analyze_strategy_internal(
 
             // 輸送が必要なユニット（停滞ユニット）的抽出。
             // V3はallocatorが確定した全攻勢を、割当優先順位どおりの輸送先として共有する。
-            let map = world.resource::<crate::resources::Map>();
             let normalization_scale = average_attack_expectation(&chart, &registry);
             let transport_targets = if is_v3 {
                 strategy.campaign_portfolio.offensive_target_positions()
             } else {
-                strategy.priority_targets.clone()
+                situation.priority_targets.clone()
             };
-            for (pos, stats) in &my_units {
+            // V2 は既存の侵攻許可を維持する。V3 はallocator確定済み目標を使う。
+            let allowed_islands = if is_v3 {
+                HashMap::default()
+            } else {
+                invasion_allowed_islands(world, board)
+            };
+            for (pos, stats) in my_units {
                 // 陸上ユニットかつ、輸送能力を持たない戦闘/占領用ユニットのみ
                 if matches!(
                     stats.movement_type,
@@ -793,7 +485,7 @@ fn analyze_strategy_internal(
             let has_sea_bound_target = if is_v3 {
                 !strategy.campaign_portfolio.active_offensives.is_empty()
             } else {
-                strategy.priority_targets.iter().any(|target| {
+                situation.priority_targets.iter().any(|target| {
                     get_island_id(target).is_some_and(|target_island_id| {
                         !my_base_island_ids.contains(&target_island_id)
                     })
@@ -845,18 +537,18 @@ fn analyze_strategy_internal(
     }
 
     // 平和な拠点（敵ユニットから十分に離れており、脅かされていない拠点）の分析
-    let mut peaceful_properties = std::collections::HashSet::new();
-
-    for pos in &my_properties {
+    let mut turn_cache = TurnDistanceCache::default();
+    let mut peaceful_properties = crate::collections::HashSet::default();
+    for (pos, _) in &situation.my_properties {
         let prop_island_id = get_island_id(pos);
         let mut is_peaceful = true;
 
-        for (e_pos, e_stats) in &enemy_units {
+        for (e_pos, e_stats) in enemy_units {
             let e_island_id = get_island_id(e_pos);
             let enemy_id = player_id.opposite();
             if enemy_threatens_property(
-                &map,
-                &master_data,
+                map,
+                master_data,
                 &unit_positions,
                 &mut turn_cache,
                 enemy_id,
@@ -876,13 +568,56 @@ fn analyze_strategy_internal(
         }
     }
     strategy.peaceful_properties = peaceful_properties;
+}
 
-    strategy
+/// 対空評価に使う、地図上で生存しているunitの戦闘能力。
+fn combat_capabilities(board: &PlayerBoard) -> Vec<CombatCapabilitySnapshot> {
+    board
+        .units
+        .iter()
+        .filter(|unit| unit.is_deployed() && unit.health.is_some_and(|hp| hp > 0))
+        .map(|unit| {
+            let (ammo1, ammo2) = unit.ammo.unwrap_or((99, 99));
+            CombatCapabilitySnapshot {
+                faction: unit.owner,
+                position: unit.position,
+                unit_type: unit.stats.unit_type,
+                movement_type: unit.stats.movement_type,
+                hp: unit.health.unwrap_or(0),
+                cost: unit.stats.cost,
+                max_movement: unit.stats.max_movement,
+                min_range: unit.stats.min_range,
+                max_range: unit.stats.max_range,
+                ammo1,
+                max_ammo1: unit.stats.max_ammo1,
+                ammo2,
+                max_ammo2: unit.stats.max_ammo2,
+                fuel: unit.fuel.unwrap_or(u32::MAX),
+                action_delay: u32::from(unit.action_completed.unwrap_or(false)),
+            }
+        })
+        .collect()
+}
+
+/// V2の輸送候補で使う、島ごとの侵攻許可。
+fn invasion_allowed_islands(
+    world: &mut World,
+    board: &PlayerBoard,
+) -> HashMap<crate::ai::islands::IslandId, bool> {
+    let mut allowed_islands = HashMap::default();
+    for island in &board.island_map.islands {
+        let allowed =
+            crate::ai::planner::is_invasion_allowed(world, board.player, island.id, island);
+        allowed_islands.insert(island.id, allowed);
+    }
+    allowed_islands
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::island_campaign::IslandCampaignDiagnostics;
+    use crate::components::{Faction, Property};
     use crate::resources::{GridTopology, Map, Terrain};
 
     #[test]
@@ -1147,7 +882,7 @@ mod tests {
         }
         world.insert_resource(damage_chart);
 
-        let mut unit_registry_map = std::collections::HashMap::new();
+        let mut unit_registry_map = crate::collections::HashMap::default();
         for name in master_data.units.keys() {
             let stats = master_data.create_unit_stats(name).unwrap();
             unit_registry_map.insert(stats.unit_type, stats);
@@ -1357,7 +1092,7 @@ mod tests {
     fn install_strategy_scoring_resources(world: &mut World) {
         let master_data = world.resource::<MasterDataRegistry>().clone();
         let mut damage_chart = crate::resources::DamageChart::new();
-        let mut unit_registry = std::collections::HashMap::new();
+        let mut unit_registry = crate::collections::HashMap::default();
         for (name, record) in &master_data.units {
             let unit_type = master_data.unit_type_for_name(&name.0).unwrap();
             let stats = master_data.create_unit_stats(name).unwrap();
@@ -1444,7 +1179,7 @@ mod tests {
     fn v3_turn_strategy_reuses_campaign_cache() {
         let mut world = setup_v3_portfolio_world(false, 6_000);
         let cached = IslandCampaignPortfolio::default();
-        let mut cache = crate::ai::engine::AiTurnStrategyCache::default();
+        let mut cache = AdoptedTurnPortfolio::default();
         cache.set_campaign_portfolio(PlayerId(1), cached.clone());
         world.insert_resource(cache);
 
@@ -1457,7 +1192,7 @@ mod tests {
     fn v3_turn_strategy_preserves_generic_capture_demand_without_campaign_assignments() {
         let mut world = setup_v3_portfolio_world(false, 6_000);
         let cached = IslandCampaignPortfolio::default();
-        let mut cache = crate::ai::engine::AiTurnStrategyCache::default();
+        let mut cache = AdoptedTurnPortfolio::default();
         cache.set_campaign_portfolio(PlayerId(1), cached);
         world.insert_resource(cache);
 
@@ -1481,7 +1216,7 @@ mod tests {
             .unwrap();
         world.spawn((Faction(PlayerId(1)), GridPosition { x: 0, y: 0 }, infantry));
         let cached = IslandCampaignPortfolio::default();
-        let mut cache = crate::ai::engine::AiTurnStrategyCache::default();
+        let mut cache = AdoptedTurnPortfolio::default();
         cache.set_campaign_portfolio(PlayerId(1), cached);
         world.insert_resource(cache);
 
@@ -1544,7 +1279,7 @@ mod tests {
             active_offensives: vec![assignment],
             defenses: Vec::new(),
         };
-        let mut cache = crate::ai::engine::AiTurnStrategyCache::default();
+        let mut cache = AdoptedTurnPortfolio::default();
         cache.set_campaign_portfolio(PlayerId(1), cached);
         world.insert_resource(cache);
 

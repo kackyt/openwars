@@ -5,11 +5,10 @@
 use crate::ai::ai_version::PlayerAiSettings;
 use crate::ai::ai_version::{AiVersion, resolve_player_ai_version};
 
+use crate::collections::HashMap;
 use crate::components::{Ammo, Faction, GridPosition, Health, PlayerId, Property, UnitStats};
 use crate::resources::{Map, Terrain, master_data::MasterDataRegistry};
 use bevy_ecs::prelude::*;
-use std::collections::HashMap;
-
 const TERRITORY_WEIGHT: i32 = 2500;
 /// V2 の ZOC 方式支配面積はマス単位のため、拠点単位の TERRITORY_WEIGHT より大幅に小さくする
 const ZOC_TERRITORY_WEIGHT: i32 = 300;
@@ -253,7 +252,7 @@ pub fn evaluate_board_v1(world: &mut World, perspective_player: PlayerId) -> Boa
     let mut unit_score = 0;
     let mut property_score = 0;
 
-    let mut capturing_props = HashMap::new();
+    let mut capturing_props = HashMap::default();
     let mut prop_query = world.query::<(&GridPosition, &Property)>();
     for (pos, prop) in prop_query.iter(world) {
         if prop.capture_points < prop.max_capture_points {
@@ -528,7 +527,7 @@ fn evaluate_board_v2(
         .unwrap_or(1);
 
     // 占有情報（TurnDistance用）
-    let mut unit_positions = HashMap::new();
+    let mut unit_positions = HashMap::default();
     let mut q_all_units = world.query::<(&Faction, &GridPosition, &UnitStats)>();
     for (faction, pos, stats) in q_all_units.iter(world) {
         unit_positions.insert(
@@ -552,7 +551,7 @@ fn evaluate_board_v2(
 
     // 拠点のリスト化
     let mut properties = Vec::new();
-    let mut capturing_props = HashMap::new();
+    let mut capturing_props = HashMap::default();
     let mut my_production_bases = Vec::new();
     let mut enemy_production_bases = Vec::new();
 
@@ -590,8 +589,8 @@ fn evaluate_board_v2(
     let mut enemy_combat_positions: Vec<(GridPosition, crate::resources::MovementType)> =
         Vec::new();
     // #55 (V3): NPV 計算の副産物として得る拠点ごとの最短 ETA (先着レース評価用)
-    let mut my_prop_etas: HashMap<GridPosition, u32> = HashMap::new();
-    let mut enemy_prop_etas: HashMap<GridPosition, u32> = HashMap::new();
+    let mut my_prop_etas: HashMap<GridPosition, u32> = HashMap::default();
+    let mut enemy_prop_etas: HashMap<GridPosition, u32> = HashMap::default();
 
     let mut query = world.query::<(
         Entity,
@@ -863,9 +862,10 @@ fn evaluate_board_v2(
 
     // 3. 領域支配スコア (ZOC 方式)
     // 支配領域 = ユニットのいるマス + その隣接マス (ZOC) + 占領済み拠点のマス
-    let mut my_cells: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
-    let mut enemy_cells: std::collections::HashSet<(usize, usize)> =
-        std::collections::HashSet::new();
+    let mut my_cells: crate::collections::HashSet<(usize, usize)> =
+        crate::collections::HashSet::default();
+    let mut enemy_cells: crate::collections::HashSet<(usize, usize)> =
+        crate::collections::HashSet::default();
 
     for pos in &my_unit_positions_list {
         my_cells.insert((pos.x, pos.y));
@@ -996,7 +996,7 @@ pub fn compute_objective_metrics(world: &mut World, player: PlayerId) -> Objecti
         .unwrap_or(1);
 
     // ユニット走査: 占有情報・ZOC・占領可能ユニット・輸送ユニットの収集
-    let mut unit_positions = HashMap::new();
+    let mut unit_positions = HashMap::default();
     let mut my_positions: Vec<GridPosition> = Vec::new();
     let mut capture_units: Vec<CaptureUnitInfo> = Vec::new();
     let mut transports: Vec<TransportInfo> = Vec::new();
@@ -1053,7 +1053,8 @@ pub fn compute_objective_metrics(world: &mut World, player: PlayerId) -> Objecti
     }
 
     // ZOC 支配面積 (ユニットのマス + 隣接マス)
-    let mut cells: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    let mut cells: crate::collections::HashSet<(usize, usize)> =
+        crate::collections::HashSet::default();
     for pos in &my_positions {
         cells.insert((pos.x, pos.y));
         for adj in map.get_adjacent(pos.x, pos.y) {
@@ -1078,7 +1079,7 @@ pub fn compute_objective_metrics(world: &mut World, player: PlayerId) -> Objecti
     // NPV (獲得機会価値)
     let mut cache = crate::ai::turn_distance::AiTurnCache::default();
     // 客観メトリクスでは ETA の副産物は使用しない
-    let mut unused_etas = HashMap::new();
+    let mut unused_etas = HashMap::default();
     let npv = side_npv(
         &map,
         &registry,
@@ -1327,7 +1328,7 @@ mod tests {
             crate::resources::GridTopology::Square,
         );
         let registry = crate::resources::MasterDataRegistry::load().unwrap();
-        let unit_positions = HashMap::new();
+        let unit_positions = HashMap::default();
         let unit = CaptureUnitInfo {
             pos: GridPosition { x: 0, y: 0 },
             movement_type: crate::resources::MovementType::Infantry,

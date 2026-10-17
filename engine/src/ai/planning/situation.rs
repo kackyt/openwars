@@ -1,0 +1,393 @@
+//! 状況判断: 盤面snapshotから戦略フェーズ・物件の区分・首都脅威・収入要否を求める。
+//!
+//! 部隊再編と生産判断の両方がこの結果を使う。生産需要（構成比・輸送・対空など）は
+//! ここでは計算せず、生産側（[`crate::ai::strategy`]）が状況判断の結果から求める。
+//! Worldは読み書きしない。
+
+use crate::ai::context::board::PlayerBoard;
+use crate::ai::strategy::GamePhase;
+use crate::ai::turn_distance::{TerrainConnectivity, TurnDistanceCache, calculate_turn_distance};
+use crate::collections::HashSet;
+use crate::components::{GridPosition, UnitStats};
+use crate::resources::master_data::MasterDataRegistry;
+use crate::resources::{Map, MovementType, Terrain};
+
+/// 状況判断の結果。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StrategicSituation {
+    pub phase: GamePhase,
+    /// 未占領（中立）物件。
+    pub unowned_properties: HashSet<GridPosition>,
+    /// 敵所有物件。
+    pub enemy_properties: HashSet<GridPosition>,
+    /// フェーズに応じて並べた戦略目標（未占領・敵物件・自首都）。
+    pub priority_targets: Vec<GridPosition>,
+    /// 自軍物件の座標と物件地形（列挙順）。
+    pub my_properties: Vec<(GridPosition, Terrain)>,
+    /// 自軍物件か占領可能unitのある島。
+    pub my_base_island_ids: HashSet<usize>,
+    /// 自島の中立物件が残り、占領要員が目標未満か。
+    pub need_more_revenue: bool,
+    /// 地図上の自軍・敵軍unit（搭載中・マップ外を除く。列挙順）。
+    pub my_units: Vec<(GridPosition, UnitStats)>,
+    pub enemy_units: Vec<(GridPosition, UnitStats)>,
+}
+
+/// 盤面から状況を判断する。
+pub(crate) fn assess(board: &PlayerBoard) -> StrategicSituation {
+    let player_id = board.player;
+    let map = &board.map;
+    let registry = &board.registry;
+    let island_map = &board.island_map;
+    let get_island_id =
+        |pos: &GridPosition| -> Option<usize> { island_map.get_island_at(pos).map(|i| i.id.0) };
+
+    // 1. 拠点の分析
+    let mut unowned_properties = Vec::new();
+    let mut enemy_properties = Vec::new();
+    let mut my_properties = Vec::new();
+    // 自首都は列挙順で最後に見つかったもの。
+    let mut my_capital_pos = None;
+    let mut my_base_island_ids = HashSet::default();
+    for property in &board.properties {
+        let pos = &property.position;
+        if property.owner == Some(player_id) {
+            my_properties.push((*pos, property.terrain));
+            if property.terrain == Terrain::Capital {
+                my_capital_pos = Some(*pos);
+            }
+            // 自軍の任意の拠点がある島IDを収集
+            if let Some(island_id) = get_island_id(pos) {
+                my_base_island_ids.insert(island_id);
+            }
+        } else if property.owner.is_none() {
+            unowned_properties.push(*pos);
+        } else {
+            enemy_properties.push(*pos);
+        }
+    }
+
+    // 2. ユニットの分析（マップ外・輸送機内のユニットは距離計算などの分析から除外）
+    let mut my_units = Vec::new();
+    let mut enemy_units = Vec::new();
+    for unit in board.units.iter().filter(|unit| unit.is_deployed()) {
+        if unit.owner == player_id {
+            my_units.push((unit.position, unit.stats.clone()));
+        } else {
+            enemy_units.push((unit.position, unit.stats.clone()));
+        }
+    }
+
+    // 自軍の歩兵が存在する島IDも収集対象に加える
+    for (pos, stats) in &my_units {
+        if stats.can_capture
+            && let Some(island_id) = get_island_id(pos)
+        {
+            my_base_island_ids.insert(island_id);
+        }
+    }
+
+    let is_engaged = is_engaged(map, registry, &my_units, &enemy_units);
+    let capital_threatened =
+        my_capital_pos.is_some_and(|capital| capital_is_threatened(board, capital, &enemy_units));
+
+    // 3. 島嶼（IslandMap）と拠点獲得劣勢（収入不足）の分析
+    let on_base_island = |pos: &GridPosition| {
+        get_island_id(pos).is_some_and(|island_id| my_base_island_ids.contains(&island_id))
+    };
+    let island_unowned_properties = unowned_properties
+        .iter()
+        .filter(|pos| on_base_island(pos))
+        .count();
+    let island_enemy_properties = enemy_properties
+        .iter()
+        .filter(|pos| on_base_island(pos))
+        .count();
+    let island_my_capture_units = my_units
+        .iter()
+        .filter(|(pos, stats)| stats.can_capture && on_base_island(pos))
+        .count();
+
+    // 島内の拠点数に基づく目標占領ユニット数
+    let total_island_properties = island_unowned_properties + island_enemy_properties;
+    let ideal_capture_units = ((total_island_properties as f32 * 0.5).ceil() as usize).clamp(3, 10);
+
+    // 収入（拠点確保）優先判定: 島内に中立拠点が残っており、歩兵が目標未満である場合
+    let need_more_revenue =
+        island_unowned_properties > 0 && island_my_capture_units < ideal_capture_units;
+
+    // 4. フェーズの判定
+    let phase = if capital_threatened {
+        GamePhase::Defense
+    } else if need_more_revenue {
+        GamePhase::Expansion
+    } else if is_engaged {
+        if enemy_units.len() >= my_units.len() {
+            GamePhase::Contested
+        } else {
+            GamePhase::Assault
+        }
+    } else {
+        GamePhase::Expansion
+    };
+
+    // ターゲットの統合: フェーズに関わらず、中立拠点と敵拠点の両方を考慮する
+    // ただしフェーズによって重みを変えるために、ここではリストの順序や内容を調整
+    let priority_targets = match phase {
+        GamePhase::Expansion => {
+            let mut targets = unowned_properties.clone();
+            targets.extend(enemy_properties.iter().cloned());
+            targets
+        }
+        GamePhase::Contested | GamePhase::Assault => {
+            let mut targets = enemy_properties.clone();
+            // 中立拠点も近いものはターゲットに含める
+            targets.extend(unowned_properties.iter().cloned());
+            targets
+        }
+        GamePhase::Defense => {
+            if let Some(cap_pos) = my_capital_pos {
+                vec![cap_pos]
+            } else {
+                enemy_properties.clone()
+            }
+        }
+    };
+
+    StrategicSituation {
+        phase,
+        unowned_properties: unowned_properties.into_iter().collect(),
+        enemy_properties: enemy_properties.into_iter().collect(),
+        priority_targets,
+        my_properties,
+        my_base_island_ids,
+        need_more_revenue,
+        my_units,
+        enemy_units,
+    }
+}
+
+fn is_ground_movement(movement_type: MovementType) -> bool {
+    !matches!(movement_type, MovementType::Air | MovementType::Ship)
+}
+
+/// 2ユニットを戦略上の近距離交戦候補として扱えるかを判定します。
+/// 地上ユニット同士だけは、互いの地形移動で接続されていない場合に除外します。
+fn can_form_ground_engagement(
+    map: &Map,
+    registry: &MasterDataRegistry,
+    my_pos: GridPosition,
+    my_stats: &UnitStats,
+    enemy_pos: GridPosition,
+    enemy_stats: &UnitStats,
+    connectivity: &mut TerrainConnectivity,
+) -> bool {
+    if !is_ground_movement(my_stats.movement_type) || !is_ground_movement(enemy_stats.movement_type)
+    {
+        return true;
+    }
+
+    connectivity.is_reachable(
+        map,
+        registry,
+        (my_pos.x, my_pos.y),
+        (enemy_pos.x, enemy_pos.y),
+        my_stats.movement_type,
+    ) || connectivity.is_reachable(
+        map,
+        registry,
+        (enemy_pos.x, enemy_pos.y),
+        (my_pos.x, my_pos.y),
+        enemy_stats.movement_type,
+    )
+}
+
+/// 交戦中か: 交戦しうる最寄りの敵が、自軍の平均到達距離（移動力＋射程）＋1以内に居る。
+/// 地上部隊同士は、海や進入不能地形で分断された組を除外する。
+fn is_engaged(
+    map: &Map,
+    registry: &MasterDataRegistry,
+    my_units: &[(GridPosition, UnitStats)],
+    enemy_units: &[(GridPosition, UnitStats)],
+) -> bool {
+    let mut terrain_connectivity = TerrainConnectivity::default();
+    let mut min_enemy_dist = 999;
+    for (m_pos, m_stats) in my_units {
+        for (e_pos, e_stats) in enemy_units {
+            if !can_form_ground_engagement(
+                map,
+                registry,
+                *m_pos,
+                m_stats,
+                *e_pos,
+                e_stats,
+                &mut terrain_connectivity,
+            ) {
+                continue;
+            }
+            let distance = map.distance(m_pos.x, m_pos.y, e_pos.x, e_pos.y) as i32;
+            if distance < min_enemy_dist {
+                min_enemy_dist = distance;
+            }
+        }
+    }
+
+    // 自軍平均移動力 + 射程 を閾値とする
+    let avg_engagement_range = if !my_units.is_empty() {
+        let total_reach: u32 = my_units
+            .iter()
+            .map(|(_, s)| s.max_movement + s.max_range)
+            .sum();
+        total_reach / my_units.len() as u32
+    } else {
+        5
+    };
+
+    min_enemy_dist <= (avg_engagement_range + 1) as i32
+}
+
+/// 首都が脅かされているか: 2ターン以内に首都へ届く敵unitが居る。
+fn capital_is_threatened(
+    board: &PlayerBoard,
+    capital: GridPosition,
+    enemy_units: &[(GridPosition, UnitStats)],
+) -> bool {
+    // 編成と共通の占有（搭載中のunitは進路を塞がない）。
+    let unit_positions = board.occupancy();
+    let mut turn_cache = TurnDistanceCache::default();
+    let enemy_id = board.player.opposite();
+    enemy_units.iter().any(|(enemy_pos, enemy_stats)| {
+        calculate_turn_distance(
+            &board.map,
+            &board.registry,
+            &unit_positions,
+            (enemy_pos.x, enemy_pos.y),
+            (capital.x, capital.y),
+            enemy_stats.movement_type,
+            enemy_stats.max_movement,
+            1,
+            enemy_id,
+            &mut turn_cache,
+        )
+        .turns
+            <= 2
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::components::{Faction, PlayerId, Property};
+    use crate::resources::{GridTopology, UnitType};
+    use bevy_ecs::prelude::*;
+
+    fn tank() -> UnitStats {
+        UnitStats {
+            unit_type: UnitType::Tank,
+            max_movement: 6,
+            movement_type: MovementType::Tank,
+            ..UnitStats::mock()
+        }
+    }
+
+    /// 自首都の近くに敵戦車、遠くに中立工場と敵工場がある盤面。
+    fn threatened_world() -> World {
+        let mut world = World::new();
+        world.insert_resource(Map::new(15, 15, Terrain::Plains, GridTopology::Square));
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+        let (p1, p2) = (PlayerId(1), PlayerId(2));
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(p1), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 7, y: 7 },
+            Property::new(Terrain::Factory, None, 100),
+        ));
+        world.spawn((
+            GridPosition { x: 14, y: 14 },
+            Property::new(Terrain::Factory, Some(p2), 100),
+        ));
+        world.spawn((GridPosition { x: 2, y: 0 }, Faction(p1), tank()));
+        world.spawn((GridPosition { x: 1, y: 1 }, Faction(p2), tank()));
+        world
+    }
+
+    #[test]
+    fn capital_threat_sets_defense_and_targets_own_capital() {
+        let mut world = threatened_world();
+        let board = PlayerBoard::observe(&mut world, PlayerId(1));
+
+        let situation = assess(&board);
+
+        assert_eq!(situation.phase, GamePhase::Defense);
+        assert_eq!(
+            situation.priority_targets,
+            vec![GridPosition { x: 0, y: 0 }]
+        );
+        assert!(
+            situation
+                .unowned_properties
+                .contains(&GridPosition { x: 7, y: 7 })
+        );
+        assert!(
+            situation
+                .enemy_properties
+                .contains(&GridPosition { x: 14, y: 14 })
+        );
+        assert_eq!(situation.my_units.len(), 1);
+        assert_eq!(situation.enemy_units.len(), 1);
+    }
+
+    /// 搭載中のunitは盤面に居ない（6b③）。地図上の座標が残っていても敵の進路を塞がず、
+    /// 2ターンで首都へ届く敵戦車を脅威として判定する。
+    #[test]
+    fn loaded_unit_with_stale_position_does_not_block_capital_threat() {
+        let mut world = World::new();
+        world.insert_resource(Map::new(10, 1, Terrain::Plains, GridTopology::Square));
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+        let (p1, p2) = (PlayerId(1), PlayerId(2));
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Capital, Some(p1), 100),
+        ));
+        // 9マス先の敵戦車（移動6）は、何も塞がなければ2ターンで首都へ届く。
+        world.spawn((GridPosition { x: 9, y: 0 }, Faction(p2), tank()));
+        // 1マス幅の通路の途中に、搭載中で座標だけ残った自軍unitを置く。
+        let carrier = world.spawn_empty().id();
+        world.spawn((
+            GridPosition { x: 5, y: 0 },
+            Faction(p1),
+            UnitStats::mock(),
+            crate::components::Transporting(carrier),
+        ));
+        let board = PlayerBoard::observe(&mut world, p1);
+
+        let situation = assess(&board);
+
+        assert_eq!(situation.phase, GamePhase::Defense);
+        assert_eq!(
+            situation.priority_targets,
+            vec![GridPosition { x: 0, y: 0 }]
+        );
+        assert!(
+            situation.my_units.is_empty(),
+            "搭載中unitは地図上の自軍に数えない"
+        );
+    }
+
+    #[test]
+    fn situation_matches_production_strategy_analysis() {
+        // 部隊再編は状況判断だけを使い、生産判断は同じ結果に生産需要を加える。
+        let mut world = threatened_world();
+        let board = PlayerBoard::observe(&mut world, PlayerId(1));
+        let situation = assess(&board);
+
+        let strategy = crate::ai::strategy::analyze_strategy(&mut world, PlayerId(1));
+
+        assert_eq!(strategy.phase, situation.phase);
+        assert_eq!(strategy.priority_targets, situation.priority_targets);
+        assert_eq!(strategy.unowned_properties, situation.unowned_properties);
+        assert_eq!(strategy.enemy_properties, situation.enemy_properties);
+    }
+}

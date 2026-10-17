@@ -1,9 +1,8 @@
+use crate::collections::HashSet;
 use crate::components::*;
 use crate::events::*;
 use crate::resources::*;
 use bevy_ecs::prelude::*;
-use std::collections::HashSet;
-
 /// 輸送ユニットが現在地の地形から積載ユニットを降ろせるかを判定します。
 pub fn can_unload_from_terrain(
     movement_type: Option<MovementType>,
@@ -109,8 +108,8 @@ pub fn get_droppable_tiles_at(
     };
 
     // 1. ユニットがいる座標を事前に取得
-    use std::collections::HashSet;
-    let mut occupied_positions = HashSet::new();
+    use crate::collections::HashSet;
+    let mut occupied_positions = HashSet::default();
     let mut q_units =
         world.query_filtered::<&GridPosition, (With<Faction>, Without<Transporting>)>();
     for u_pos in q_units.iter(world) {
@@ -425,7 +424,7 @@ pub fn sync_cargo_health_system(
         Query<(&Transporting, &mut Health)>,
     )>,
 ) {
-    let mut damaged_transports = HashSet::new();
+    let mut damaged_transports = HashSet::default();
     for event in attacked_events.read() {
         if event.defender_hp_after < event.defender_hp_before {
             damaged_transports.insert(event.defender);
@@ -1173,9 +1172,8 @@ mod tests {
 
     #[test]
     fn test_shoal_transport_load_reachability() {
+        use crate::collections::HashMap;
         use crate::systems::movement::{OccupantInfo, calculate_reachable_tiles};
-        use std::collections::HashMap;
-
         let mut map = Map::new(5, 5, Terrain::Plains, GridTopology::Square);
         // (2, 2) を浅瀬 (Shoal), (3, 2) を海 (Sea) に設定
         let _ = map.set_terrain(2, 2, Terrain::Shoal);
@@ -1184,7 +1182,7 @@ mod tests {
         let master_data = MasterDataRegistry::load().unwrap();
         let p1 = PlayerId(1);
 
-        let mut unit_positions = HashMap::new();
+        let mut unit_positions = HashMap::default();
 
         // (2, 2) 浅瀬に空きありの自軍輸送船 (Lander) を配置
         unit_positions.insert(

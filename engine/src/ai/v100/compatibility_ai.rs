@@ -2,7 +2,10 @@
 //!
 //! 行動と生産の判断は同じ`v100`配下へ分離し、ここでは命令の発行順だけを管理する。
 
-use crate::ai::engine::{AiActionCooldown, AiProductionCooldown, execute_ai_command};
+use crate::ai::runtime::issue::execute_ai_command;
+use crate::ai::runtime::production_queue::AiProductionCooldown;
+use crate::ai::runtime::state::AiActionCooldown;
+
 use crate::components::{ActionCompleted, CargoCapacity, PlayerId};
 use crate::events::{NextPhaseCommand, ProduceUnitCommand};
 use bevy_ecs::prelude::*;
@@ -15,7 +18,7 @@ pub(super) fn execute_turn(world: &mut World, player_id: PlayerId) -> Option<Str
         .unwrap_or_default();
     if let Some((entity, command)) = super::action::decide_action(world, player_id, &skipped) {
         let continues_rom_drop = match &command {
-            crate::ai::engine::AiCommand::Drop { cargo_entity, .. } => {
+            crate::ai::command::AiCommand::Drop { cargo_entity, .. } => {
                 world.get::<CargoCapacity>(entity).is_some_and(|capacity| {
                     capacity.loaded.iter().any(|loaded| {
                         *loaded != *cargo_entity

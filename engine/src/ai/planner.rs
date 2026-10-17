@@ -1,11 +1,10 @@
 use crate::ai::islands::IslandMap;
 use crate::ai::missions::{TransportMission, TransportMissionManager, TransportPhase};
 use crate::ai::objectives::Objective;
+use crate::collections::{HashMap, HashSet};
 use crate::components::{CargoCapacity, Faction, GridPosition, PlayerId, Property, UnitStats};
 use crate::resources::UnitType;
 use bevy_ecs::prelude::*;
-use std::collections::{HashMap, HashSet};
-
 /// 敵本島（敵生産拠点がある島）への侵攻が許可されているか判定する。
 ///
 /// - すでにその島に、自軍の戦闘ユニット（歩兵・重歩兵・輸送機・輸送船・補給車以外の、戦車や対空戦車など）が1基以上展開している（護衛の存在）
@@ -83,11 +82,11 @@ pub fn is_invasion_allowed(
 /// 3. 必要な歩兵数と輸送機数を算出し、フリーなユニットから割り当てる。
 pub fn assign_transport_missions(world: &mut World, player_id: PlayerId) {
     // 進行中の自軍ミッションに割り当てられているユニットを収集
-    let mut assigned_missions_count = HashMap::new();
-    let mut transport_target_islands = HashMap::new();
-    let mut busy_infantry = HashSet::new();
+    let mut assigned_missions_count = HashMap::default();
+    let mut transport_target_islands = HashMap::default();
+    let mut busy_infantry = HashSet::default();
     let mut missions_to_add = Vec::new();
-    let mut enemy_invasion_islands = HashSet::new();
+    let mut enemy_invasion_islands = HashSet::default();
 
     if let Some(manager) = world.get_resource::<TransportMissionManager>() {
         for m in &manager.missions {
@@ -110,8 +109,8 @@ pub fn assign_transport_missions(world: &mut World, player_id: PlayerId) {
     }
 
     // 1. 全拠点情報を収集
-    let mut properties_map = HashMap::new();
-    let mut ownership_map = HashMap::new();
+    let mut properties_map = HashMap::default();
+    let mut ownership_map = HashMap::default();
     {
         let mut query = world.query::<(&GridPosition, &Property)>();
         for (pos, prop) in query.iter(world) {
@@ -122,7 +121,7 @@ pub fn assign_transport_missions(world: &mut World, player_id: PlayerId) {
 
     // 2. 目標の優先度評価と島情報の取得
     let mut objectives = Vec::new();
-    let mut base_islands_cache = HashSet::new();
+    let mut base_islands_cache = HashSet::default();
 
     world.resource_scope(|_world, island_map: Mut<IslandMap>| {
         let (base_islands, target_islands) = island_map.classify_islands(player_id, &ownership_map);
@@ -426,8 +425,7 @@ mod tests {
     use crate::components::{Faction, GridPosition, PlayerId, Property, UnitStats};
     use crate::resources::{Terrain, UnitType};
 
-    use std::collections::HashSet;
-
+    use crate::collections::HashSet;
     #[test]
     fn test_assign_transport_mission() {
         let mut world = World::new();
@@ -435,9 +433,9 @@ mod tests {
 
         world.insert_resource(TransportMissionManager::default());
 
-        let mut island1_tiles = HashSet::new();
+        let mut island1_tiles = HashSet::default();
         island1_tiles.insert(GridPosition { x: 0, y: 0 });
-        let mut island2_tiles = HashSet::new();
+        let mut island2_tiles = HashSet::default();
         island2_tiles.insert(GridPosition { x: 10, y: 10 });
 
         let island_map = IslandMap {
@@ -515,11 +513,11 @@ mod tests {
 
         world.insert_resource(TransportMissionManager::default());
 
-        let mut base_island_tiles = HashSet::new();
+        let mut base_island_tiles = HashSet::default();
         base_island_tiles.insert(GridPosition { x: 0, y: 0 });
         base_island_tiles.insert(GridPosition { x: 1, y: 0 });
 
-        let mut target_island_tiles = HashSet::new();
+        let mut target_island_tiles = HashSet::default();
         target_island_tiles.insert(GridPosition { x: 5, y: 5 });
         target_island_tiles.insert(GridPosition { x: 6, y: 5 });
         target_island_tiles.insert(GridPosition { x: 7, y: 5 }); // Target has 3 properties
@@ -608,17 +606,17 @@ mod tests {
 
         // 3つの島を定義
         // 島0: 自軍基地島 (Base Island)
-        let mut base_island_tiles = HashSet::new();
+        let mut base_island_tiles = HashSet::default();
         base_island_tiles.insert(GridPosition { x: 0, y: 0 });
 
         // 島1: 敵の本島 (危険な島、敵の生産拠点がある)
         // 距離は近いが敵の生産拠点があるためペナルティがかかる
-        let mut dangerous_island_tiles = HashSet::new();
+        let mut dangerous_island_tiles = HashSet::default();
         dangerous_island_tiles.insert(GridPosition { x: 2, y: 2 });
 
         // 島2: 中立の島 (安全な島、敵の生産拠点がない)
         // 距離は少し遠いが安全
-        let mut neutral_island_tiles = HashSet::new();
+        let mut neutral_island_tiles = HashSet::default();
         neutral_island_tiles.insert(GridPosition { x: 5, y: 5 });
 
         let island_map = IslandMap {
@@ -713,11 +711,11 @@ mod tests {
         world.insert_resource(TransportMissionManager::default());
 
         // 島0: 自軍基地島 (Base Island)
-        let mut base_island_tiles = HashSet::new();
+        let mut base_island_tiles = HashSet::default();
         base_island_tiles.insert(GridPosition { x: 0, y: 0 });
 
         // 島1: 敵の本島 (危険な島、敵の生産拠点がある)
-        let mut dangerous_island_tiles = HashSet::new();
+        let mut dangerous_island_tiles = HashSet::default();
         dangerous_island_tiles.insert(GridPosition { x: 2, y: 2 });
 
         let island_map = IslandMap {

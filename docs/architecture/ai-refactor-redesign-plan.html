@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AI 抜本再設計計画</title>
+<style>
+/* 既存設計資料の色・書体を継承。目的→状態の所有→移行手順→検証の順に読む長文計画書。 */
+:root{color-scheme:light;--bg:#f4f8fa;--surface:#ffffff;--fg:#102a43;--muted:#526b7a;--line:#bfd1da;--accent:#087e8b;--warn:#a4541b;--display:"Yu Gothic UI","Meiryo",system-ui,sans-serif;--body:"Hiragino Sans","Meiryo",system-ui,sans-serif;--mono:"Cascadia Mono",Consolas,monospace}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--bg:#0c1921;--surface:#132631;--fg:#e8f2f6;--muted:#aac0ca;--line:#3c5966;--accent:#58d2d8;--warn:#f0a86a}}
+:root[data-theme="dark"]{color-scheme:dark;--bg:#0c1921;--surface:#132631;--fg:#e8f2f6;--muted:#aac0ca;--line:#3c5966;--accent:#58d2d8;--warn:#f0a86a}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.85 var(--body)}
+.page{max-width:1160px;margin:auto;padding-inline:16px;padding-block:32px 64px;display:grid;gap:36px}
+header,section,article{display:grid;gap:16px;min-width:0}section{border-top:1px solid var(--line);padding-top:28px;scroll-margin-top:20px}
+h1,h2,h3,h4{font-family:var(--display);line-height:1.45;text-wrap:balance;margin:0}h1{font-size:clamp(1.8rem,4vw,2.6rem)}h2{font-size:1.5rem}h3{font-size:1.15rem}h4{font-size:1rem}
+p,ul,ol,dl{margin:0}p{max-width:78ch}ul,ol{padding-left:1.5em}li+li{margin-top:8px}
+a{color:var(--accent);text-underline-offset:4px}code,pre{font-family:var(--mono)}code{font-size:.87em;overflow-wrap:anywhere}
+pre{margin:0;padding:16px;border:1px solid var(--line);background:var(--surface);overflow-x:auto;max-width:100%;font-size:.83rem;line-height:1.7}
+.meta{color:var(--muted);font-size:.85rem}.eyebrow{font: .8rem/1.6 var(--mono);color:var(--muted);letter-spacing:.04em}
+.notice{padding:18px;border:2px solid var(--accent);background:var(--surface);display:grid;gap:10px}.notice.warn{border-color:var(--warn)}
+nav{display:flex;flex-wrap:wrap;gap:8px 22px;padding-block:14px;border-block:1px solid var(--line)}
+.scroll{overflow-x:auto;max-width:100%;min-width:0}table{width:100%;min-width:760px;border-collapse:collapse;font-size:.87rem;background:var(--surface)}
+th,td{padding:12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{font-weight:700}caption{text-align:left;color:var(--muted);padding-bottom:8px}
+.stage{padding-block:20px;border-top:1px solid var(--line)}.stage:first-of-type{border-top:0}.stage h3{color:var(--accent)}
+.stage dl{display:grid;grid-template-columns:5.5em minmax(0,1fr);gap:10px 16px}.stage dt{font-weight:700}.stage dd{margin:0;min-width:0}
+.two{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px}.two>*{min-width:0}.two article{align-content:start}
+:focus-visible{outline:3px solid var(--accent);outline-offset:4px}footer{color:var(--muted);font-size:.85rem}
+@media(max-width:760px){.two{grid-template-columns:1fr}.stage dl{grid-template-columns:1fr;gap:6px}.stage dd{padding-bottom:8px}h2{font-size:1.3rem}}
+</style>
+</head>
+<body>
+<main class="page">
+<header>
+<p class="eyebrow">OpenWars · AI architecture · 2026-10-17 更新 · 段階1〜5完了・6a完了・6b主要項目採用</p>
+<h1>AI 抜本再設計計画</h1>
+<p><strong>判断と状態更新の責任を分け、後から矛盾を修復しなくてよいAIに作り直す。</strong>ファイル移動や重複行の削減だけを成果にせず、巨大関数の段階分解と、戦略の補正・判断そのものの整理まで扱います。</p>
+<p class="meta">読者：AIの再設計・実装・検証を担当する開発者。対象：V1〜V4の共通基盤、版別戦略、V4小規模拡張。共有コードを使うV100/V200も回帰確認対象。</p>
+<div class="notice">
+<p><strong>現行計画の正本です。段階1〜5は実装・検証済みです。</strong>段階1〜5の実装・検証実績は各コミットログおよび対戦検証記録に基づきます。</p>
+<p><strong>段階6aの主要構造変更は実装済みです。資源pool観測の追補は段階6の実績欄に記録しています。</strong>残る7個の <code>*/extended.rs</code> を責務名へ分離し、合同探索・戦闘占領simulation・比較器・Roadmap観測を段分割しました。移動版・段分割版・一時スイッチ撤去版はいずれも28条件50Tの全行動履歴本文が基準と一致しています。</p>
+<p><strong>段階6bの主要項目（②D-5、③占有モデル統一）を採用しました。</strong>6b①の編成後観測限定は既存実装・回帰試験を確認済み、②D-5（発行拒否時の意図解放）と③占有モデル統一を採用済みです。④兵種バランス等の戦術改善は本段階のスコープ外（未着手・将来課題）とし、構造・状態遷移の整合化を完了とします。</p>
+</div>
+<p class="meta">効果の見積り：<a href="ai-refactor-forecast.html">AI 再設計の効果見積り</a>。</p>
+<p class="meta">旧案と棚卸し：旧A〜Fは本計画の前提作業ではなく、置き換えられた案です。</p>
+<nav aria-label="目次">
+<a href="#context">見直しの根拠</a><a href="#goal">目標・固定条件</a><a href="#ownership">状態の所有</a><a href="#structure">責務と配置</a><a href="#stages">6段階の移行（1〜5完了・6進行中）</a><a href="#reuse">再利用する資産</a><a href="#acceptance">受入条件</a><a href="#metrics">メトリクス</a><a href="#verification">検証手順</a><a href="#risks">リスク・撤回</a><a href="#open">段階4〜6の設計契約</a>
+</nav>
+</header>
+
+<section id="context">
+<h2>見直しの根拠と現在の到達点</h2>
+<p>旧A〜Fは「移動→共有本文＋hook」が中心でした。この方法は置き場所とコピーを整理しても、判断の途中で複数の台帳を書き換え、後処理で辻褄を合わせる構造を残します。さらに、関数内に <code>if is_extended()</code> のような分岐を増やすと1関数あたりの複雑度が上がるため、<strong>「責務別モジュールへの分離」「巨大関数の直線的な段階（フェーズ）分解」「方策型による関数外での差し替え」</strong>を組み合わせて進めています。</p>
+<div class="scroll"><table>
+<caption>確認済みの構造問題と、段階1〜5での解消状況・段階6の対応。</caption>
+<thead><tr><th>確認した構造</th><th>新しい境界</th><th>状況</th></tr></thead>
+<tbody>
+<tr><td><code>engine.rs</code> と <code>runtime</code>/<code>tactics</code> の双方向参照、<code>AiTurnStrategyCache</code> への無関係な状態の同居</td><td><code>runtime → {tactics, production, planning} → context → command</code> の一方向化と持ち主別Resourceへの4分割</td><td><strong>段階1で完了</strong></td></tr>
+<tr><td><code>plan_squads_with_hooks</code>（1,190行）の8個の前後hookと盤面再走査</td><td><code>squad/formation.rs</code> の5段分割、<code>FormationBoard</code> 共有、<code>PlanningPolicy { Standard, SmallMap }</code> への集約</td><td><strong>段階2で完了</strong></td></tr>
+<tr><td>候補なしを要求値0への書換えで扱い、予約失敗や合同案の上書きで元の要求が消える</td><td><code>DemandLedger</code> による requested / effective 分離（D-4）と <code>AllocationState::try_claim</code> の原子化（D-1）</td><td><strong>段階1・3で完了</strong></td></tr>
+<tr><td>生産計画の最後に命令・占領意図の施設だけを交換し、配備・工程・traceとずれる</td><td><code>v4/production_finalize.rs</code> で命令・占領意図・計画工程・traceを1か所で同時に確定（D-3）</td><td><strong>段階3で完了</strong></td></tr>
+<tr><td>再接続と所属正規化を最大3周反復し、<code>ProposalStore</code> と <code>Squad.roster</code> を二重保持する</td><td><code>OperationLedger</code> への更新口一本化、<code>ProposalStore</code> 廃止、<code>SquadEdit</code> 化、変化・循環検出（S1〜S8）、<code>squad.rs</code> 巨大3関数の分割</td><td><strong>段階3・3bで完了</strong></td></tr>
+<tr><td>異なる粒度の台帳が同じ作戦ID型を独立発番し、書くだけのentity台帳を持つ</td><td>物件契約IDの分離と未読台帳の削除、DAGの <code>SquadOperationId</code> 継続参照化（S8）</td><td><strong>段階1・3で完了</strong></td></tr>
+<tr><td><code>v4/extended.rs</code>（13,710行）に首都ルートDAG・敵生産予測・物件支配計画・生産9関数の全文コピーが同居し、<code>pub use self::extended::*</code> で境界がない</td><td>責務別モジュール（<code>capital_route/</code>、<code>enemy_forecast.rs</code>、<code>production_pipeline/</code>）へ反転し、6段分割＋<code>ProductionPolicy</code> で統合して <code>v4/extended.rs</code> を廃止</td><td><strong>ドメイン分離は段階4、生産統合・廃止は段階5で完了（区分R）</strong></td></tr>
+<tr><td>盤面収集 <code>collect_extended</code> の途中で戦略解析・DAG準備を実行する</td><td>観測（<code>BoardScan</code>）は読み取り専用にし、準備は呼び出し前の入口で明示</td><td><strong>段階4で完了（区分R）</strong></td></tr>
+<tr><td>編成前後にRoadmap更新を2回呼び、残りの <code>*/extended.rs</code>（<code>rolling_plan</code> 5,519行等）に巨大関数が残る</td><td><code>rolling_plan</code> 等の責務名モジュール化・段分割（6a：R）と、採用判断／編成後観測の分離・残S項目の個別評価（6b：S）</td><td><strong>段階6で実施（R→S）</strong></td></tr>
+</tbody></table></div>
+</section>
+
+<section id="goal">
+<h2>目標と固定条件</h2>
+<div class="two">
+<article><h3>作り直すもの</h3><ul>
+<li>観測・戦略判断・資源配分・保存・命令発行・結果観測の責務。</li>
+<li>複数箇所で同じ現在状態を保持し、後から同期する仕組み。</li>
+<li>必要性を説明できない補正、重複判断、fallback、互換用の死んだ抽象。</li>
+<li>関数全体のコピー、分岐点ごとの細粒度hook、親mod.rsに集まる共有骨格。</li>
+</ul></article>
+<article><h3>維持するもの</h3><ul>
+<li>V1〜V4共通基盤＋版別戦略＋コード単位のV4小規模拡張。V1にSquad/Roadmapを強制しない。</li>
+<li>小規模経路の入口は<strong>V4・196セル以下・占領可能な非首都物件あり</strong>。profileの固定と復元も維持する。</li>
+<li>通常側を基準に共通能力を抽出する。拡張側を土台に通常挙動を後付けしない。方策を設定プリセットの束にしない。</li>
+<li>合法性、状態整合性、AIの強さ。API・保存互換は原則維持し、必要な形式変更は移行テストを先行する。</li>
+</ul></article>
+</div>
+<p>入口条件の実装：<a href="../../engine/src/ai/strategy_profile.rs#L74">strategy_profile.rs:74</a>。面積判定を、戦術上の別の閾値や関数ごとの経路判定と混同しません。</p>
+<div class="scroll"><table>
+<thead><tr><th>変更区分</th><th>扱い</th><th>要求する証拠</th></tr></thead>
+<tbody>
+<tr><td><strong>R：構造変更</strong></td><td>同じ入力への判断・順序・出力を維持する</td><td>固定入力での旧新比較、状態契約、回帰テスト</td></tr>
+<tr><td><strong>S：戦略変更</strong></td><td>判断の廃止・簡略化・順序変更を認める</td><td>旧ルールの目的、最小反例、代案、判断差の説明、未使用条件での対戦評価</td></tr>
+<tr><td><strong>B：不具合修正</strong></td><td>再現できた不正動作を修正する</td><td>失敗する再現テスト、修正後の成功、意図した差の確認</td></tr>
+</tbody></table></div>
+<p>R/S/Bを一つの変更に混ぜません。Sを計画に含める許可は、個別の戦略変更を無評価で採用する許可ではありません。goldenは意図した差を確認した後に更新し、不一致を消すために書き換えません。</p>
+</section>
+
+<section id="ownership">
+<h2>状態の正本と更新責任</h2>
+<p>同じ値の正本を複数持たない一方、意味の違う台帳は無理に統合しません。以下は<strong>目標設計</strong>で、現在の実装状態ではありません。</p>
+<div class="scroll"><table>
+<thead><tr><th>情報</th><th>正本・更新者</th><th>派生情報／一時状態</th><th>禁止する更新</th></tr></thead>
+<tbody>
+<tr><td>実盤面・資金・unit状態</td><td>既存ゲームSystem。AIは命令を発行する</td><td>読み取り専用BoardFacts。命令適用後に再取得</td><td>候補評価中のWorld変更、古い盤面のstep越し再利用</td></tr>
+<tr><td>戦略作戦と物件契約</td><td>作戦・契約ごとの所有module。親子参照とplayerを明示</td><td>地理上の候補全集合、評価結果</td><td>同じID型を異なる意味で独立発番すること</td></tr>
+<tr><td>当手番の採用戦略</td><td>確定済みTurnDecision（仮称）。選択・確定の境界だけが更新</td><td>Squad/生産が読むportfolio、directives</td><td>編成後の無条件再選択、独立した採用cache</td></tr>
+<tr><td>unitの現在所属</td><td>UnitOperationRegistryを発展させた配属更新API</td><td>Squad.members、役割別の索引、AssignmentDelta</td><td>複数Registryの直接書換え、membersから正本を逆推定</td></tr>
+<tr><td>継続する購入工程</td><td>StoredPlan。購入計画の検証・確定処理が更新</td><td>ForcePackagePlan、候補、AllocationState</td><td>探索の途中保存、保存後に命令の施設だけを交換</td></tr>
+<tr><td>要求・予算／施設予約</td><td>要求は不変。計画内の配分処理が予約を調停</td><td>充足・保留・候補なしのOutcomeと理由</td><td>要求を0にして失敗を隠す、予約を実支出と同一視</td></tr>
+<tr><td>発行履歴と実適用</td><td>deployment/campaign_execution等の照合処理</td><td>成功・失敗・取消の記録、所属変更への要求</td><td>発行だけで成功扱い、照合側による独立した所属確定</td></tr>
+</tbody></table></div>
+<h3>状態遷移で守ること</h3>
+<ul>
+<li>購入は <code>Planned → Issued → ObservedSuccess / Failed</code> を区別し、未発行の取消も扱う。失敗後の再試行には新しい検証と識別が必要。</li>
+<li>継続Plan、campaign、即時購入を購入目的のenumで区別する。Planが必要な目的だけPlanStepRefを必須にし、形式だけのPlanは作らない。</li>
+<li>戦略作戦ID・物件契約ID・PlanId/Step・SquadIdを区別する。同じ名前の型を流用して結びついたように見せない。</li>
+<li>campaign所有権は実行Squadが一時的に消えても保持できる。輸送中・降車済み・Reserve・死亡・作戦終了を明示的に扱う。</li>
+<li>再計画は理由と旧新revisionを伴う新しい判断。編成結果の観測で隠れて戦略を選び直さない。</li>
+</ul>
+</section>
+
+<section id="structure">
+<h2>責務に基づく配置</h2>
+<p>空のディレクトリを先に量産しません。既存の型と純粋関数を再利用し、境界の置換と同時に必要なファイルだけ作ります。名称は仮称ですが、責務と更新禁止事項は設計契約です。</p>
+<div class="scroll"><table>
+<thead><tr><th>所有先</th><th>責務</th><th>置かない処理</th></tr></thead>
+<tbody>
+<tr><td><code>ai/context/</code></td><td>盤面・利用可能資源の読み取り専用snapshot</td><td>戦略初期化・台帳更新</td></tr>
+<tr><td><code>ai/planning/</code></td><td>ID関係・作戦要求・配属提案/確定（<code>OperationLedger</code>）・採用案</td><td>Squad.membersから正本を逆算する修復</td></tr>
+<tr><td><code>ai/production/</code></td><td>予算/施設の配分（<code>AllocationState</code>）、要求台帳（<code>DemandLedger</code>）、購入案の検証・確定</td><td>保存後の命令だけの書換え</td></tr>
+<tr><td><code>ai/tactics/</code></td><td>合法候補・評価内訳・選択・小規模Squad実行順</td><td>隠れた経路判定、永続戦略の再選択</td></tr>
+<tr><td><code>ai/runtime/</code></td><td>手番段取り・命令発行・生産queue・結果反映</td><td>個別戦略の判断本文</td></tr>
+<tr><td><code>ai/v4/capital_route/</code></td><td>首都ルートDAG（トポロジー、Node作戦、Squad経路コミットメント、戦術位置、陸続き兵力要求）</td><td>生産配分ループ・汎用盤面収集</td></tr>
+<tr><td><code>ai/v4/enemy_forecast.rs</code></td><td>敵生産の観測学習・増援予測エンベロープ</td><td>味方の施設配分・作戦構築</td></tr>
+<tr><td><code>ai/v4/production_pipeline/</code></td><td>V4生産の6段パイプライン（作戦準備・既存戦力帰属・枠配分・即時増援・余剰動員・確定）と <code>ProductionPolicy</code></td><td>関数内に散在する <code>if is_extended()</code> 分岐</td></tr>
+</tbody></table></div>
+<p><code>mod.rs</code> は公開範囲と入口の組立だけにし、共有の骨格は責務名の実装ファイルへ置きます。共有側から具体的なV4実装を直接呼ぶ逆依存はなくし、入口が実装を組み立てます。実行時に共有側が注入された処理を呼ぶことと、ソースコードの依存方向は別です。</p>
+<p>通常経路と小規模拡張の差は、関数本文の内部に <code>if is_extended()</code> を埋め込むのではなく、<strong>パイプラインの段の有無</strong>と<strong>方策型（<code>PlanningPolicy</code> / <code>ProductionPolicy</code> の静的ディスパッチまたはenum）</strong>で関数の外に出します。「1段階1trait」「1分岐1hook」は採用しません。合同Capture/Combat探索、DAG、敵生産予測等は、差を消すために無理に同一モデルへ押し込みません。</p>
+</section>
+
+<section id="stages">
+<h2>6段階の移行（段階1〜5完了・段階6進行中）</h2>
+<p>段階1〜5は実装・検証済みです。段階6aでは周辺 <code>*/extended.rs</code> の解体と主要な巨大関数の段分割を実装しました。移動のみの複雑関数の追加整理と6bの個別評価が残ります。以下のパスは、特記なき場合 <code>engine/src/ai/</code> 配下です。</p>
+
+<article class="stage" id="stage-1">
+<h3>1. 依存方向の確立・一時状態の分割・生産予約/発行契約【完了】</h3>
+<dl>
+<dt>対象</dt><dd><code>command.rs</code>、<code>context/tactical.rs</code>、<code>tactics/{scoring,campaign,candidates,relief,small_map/squad_executor}.rs</code>、<code>runtime/{issue,production_queue,state}.rs</code>、<code>production/{allocation,commit,turn_state}.rs</code>、<code>v1/mod.rs</code>、<code>v4/plan_contract.rs</code>（記録：段階1報告）</dd>
+<dt>実施内容</dt><dd><ul><li><code>engine.rs</code> と <code>runtime</code>/<code>tactics</code> の双方向参照を解消し、<code>runtime → {tactics, production, planning} → context → command</code> の一方向依存を確立。V1を <code>ai/v1/</code> に分離。</li><li>旧 <code>AiTurnStrategyCache</code> を廃止し、持ち主別の4つのResource（<code>AdoptedTurnPortfolio</code>、<code>AiTurnProgress</code>、<code>ProductionTurnState</code>、<code>ActionDistanceCache</code>）に分割。</li><li>D-1（<code>AllocationState::try_claim -&gt; Result</code> による原子的予約）、D-2（計画手番・行動中player・Main・未終局を含む共通発行検証）、および <code>PlanContractRegistry</code> の未読entity台帳削除と物件契約ID型の分離を完了。</li></ul></dd>
+<dt>検証結果</dt><dd>判断fingerprint（V1〜V4）および主比較で全行動履歴一致、逆依存数0を確認。</dd>
+</dl>
+</article>
+
+<article class="stage" id="stage-2">
+<h3>2. 部隊再編の段分割・方策enum化・盤面snapshot共有【完了】</h3>
+<dl>
+<dt>対象</dt><dd><code>squad/formation.rs</code>、<code>squad/extended.rs</code>、<code>context/board.rs</code>、<code>planning/{situation,campaign,decision}.rs</code>（記録：段階2報告）</dd>
+<dt>実施内容</dt><dd><ul><li>1,190行の <code>plan_squads_with_hooks</code> を5つの段（準備 → 分析と採用 → campaign編成 → 汎用編成 → 仕上げ）に分割し、盤面の事実を <code>FormationBoard</code> に1回だけ収集して共有。</li><li>8個の前後hook（<code>SquadPlanningHooks</code>）を廃止し、<code>PlanningPolicy { Standard, SmallMap }</code> の6メソッドに集約。使われない束縛を削除。</li></ul></dd>
+<dt>検証結果</dt><dd>V2/V3/V4 × 48条件の判断fingerprint完全一致、段階2後半のS項目4件を個別対戦評価で検証。</dd>
+</dl>
+</article>
+
+<article class="stage" id="stage-3">
+<h3>3. 所属の正本化（OperationLedger）・生産確定口の統合・squad巨大関数の分割【完了】</h3>
+<dl>
+<dt>対象</dt><dd><code>planning/assignment.rs</code>、<code>planning/assignment/{squad_model,candidate}.rs</code>、<code>operation_assignment.rs</code>、<code>squad/{transport_step,update,reconnection}.rs</code>、<code>production/demand.rs</code>、<code>v4/{production_finalize,production_events}.rs</code>（記録：段階3・段階3b報告）</dd>
+<dt>実施内容</dt><dd><ul><li>D-4：元の要求（<code>Operation::slots</code>）を保持し、合同パッケージの上書き量を <code>DemandLedger</code> の実効要求（effective）として分離。</li><li>D-3：<code>v4/production_finalize.rs</code> で命令・占領意図・Planned工程・traceの最終施設を1か所で同時確定。<code>v4/production_events.rs</code> で生産完了イベント受付を一本化。</li><li>所属の書込みを <code>OperationLedger</code>（propose → resolve → delta → commit）へ一本化。<code>ProposalStore</code> の二重保持を廃止し、<code>SquadEdit</code> で所属fieldの直接書換えを型で防止（段階3b）。</li><li>S1〜S8：配備Squad ID保護、未所属/上陸済みcargoへの再接続限定と変化・循環検出、追加輸送波の通常commit統合、Reserve再利用、DAGの <code>SquadOperationId</code> 参照化を28条件50Tで段階評価。</li><li><code>squad.rs</code> の巨大3関数（<code>execute_transport_squad_step</code>、<code>update_squads</code>、<code>reconnect_unassigned_transport_waves</code>）を責務別モジュールへ分割（段階3b）。</li></ul></dd>
+<dt>検証結果</dt><dd>全Rustテスト971件成功・Clippy・WASM・fmt成功、28条件50Tの段階比較と段階3bの全行動列一致を確認。</dd>
+</dl>
+</article>
+
+<article class="stage" id="stage-4">
+<h3>4. <code>v4/extended.rs</code> の責務別モジュール解体・首都ルートDAG分割・盤面収集の純粋化【完了・区分R】</h3>
+<dl>
+<dt>対象</dt><dd><code>v4/extended.rs</code>（開始時13,710行）、<code>v4/mod.rs</code>、<code>v4/property_control.rs</code>、新規 <code>v4/capital_route/{mod,model,topology,node_operation,commitment,tactical,force_demand}.rs</code>、<code>v4/enemy_forecast.rs</code>、<code>v4/board_scan.rs</code>（記録：段階4報告）</dd>
+<dt>変更</dt><dd><ol><li><strong>小規模固有ドメインの切り出し（本文不変の移動を先行）</strong>：<code>v4/extended.rs</code> の後半にある首都ルートDAG・陸続き兵力配分（約4,550行）を <code>v4/capital_route/</code> へ、敵生産学習・増援予測（約200行＋補助関数）を <code>v4/enemy_forecast.rs</code> へ、物件支配計画を <code>v4/property_control.rs</code> へ移動する。<code>v4/mod.rs</code> 末尾の <code>pub use self::extended::*;</code> を廃止し、参照元が担当モジュールを明示的に指すようにする。</li><li><strong>テストの責務別配置</strong>：ファイル中盤にある約4,260行のテストモジュールを、対応する各ドメインモジュール（主に <code>capital_route</code> と生産パイプライン）へ分割配置する。</li><li><strong>DAG巨大関数の段階分解</strong>：<code>refresh_capital_route_path_commitments</code>（675行）を「候補Squad抽出 → 前線枠割当 → 後方Stage/回復割当 → コミットメント反映」の段に分割し、各関数を直接CC≤15・認知的複雑度≤20の目安に収める。</li><li><strong>盤面収集の読み取り専用化</strong>：<code>BoardScan::collect_extended</code> の内部で実行している戦略解析・DAGトポロジー準備を呼び出し前の入口へ出し、<code>BoardScan</code> を純粋な読み取り専用snapshotにする。</li></ol></dd>
+<dt>検証</dt><dd>移動版・分割版のソースsnapshotとバイナリを分離し、各版で全Rustテスト・V1〜V4の固定入力行動列・28条件50Tの全 <code>action_history</code> 本文・勝敗・終了ターンの一致を確認。</dd>
+<dt>削除</dt><dd><code>v4/mod.rs</code> の <code>pub use self::extended::*;</code>、<code>BoardScan</code> 内の隠れた戦略・DAG準備fallback。</dd>
+<dt>完了</dt><dd><code>v4/extended.rs</code> が生産本文と補助関数群3,580行に縮小し、DAG・敵生産予測・物件支配の責務境界と依存方向が一方向になる。</dd>
+<dt>実績</dt><dd>移動174関数の本文一致と66テストの保存を確認。DAG入口675→47行、直接CC 56→2・認知的複雑度119→2。分割した21関数の最大は直接CC 10・認知7・97行。<code>BoardScan</code> は通常・小規模とも <code>&amp;World</code> で読み取り、戦略準備と解析前の兵站観測は入口の明示入力へ移した。詳細な検証件数と全履歴比較は段階4報告参照。</dd>
+</dl>
+</article>
+
+<article class="stage" id="stage-5">
+<h3>5. V4生産パイプラインの6段分解と <code>ProductionPolicy</code> による統合（<code>v4/extended.rs</code> の完全廃止）【完了・区分R】</h3>
+<dl>
+<dt>対象</dt><dd>（記録：段階5報告）<code>v4/mod.rs</code>（段階4後5,575行）、<code>v4/extended.rs</code>（残部）、新規 <code>v4/production_pipeline/{mod,slot_allocation,immediate_combat,mobilization}.rs</code>、<code>v4/operation_builder.rs</code>、<code>v4/combat_input.rs</code>、<code>v4/board_scan.rs</code></dd>
+<dt>変更</dt><dd><ol><li><strong><code>plan_production_with_registry</code>（拡張1,061行 / 標準554行）の6段分解</strong>：20個以上の局所変数を中間データ型で切り離し、①<code>prepare_operations</code>（作戦構築・中央契約同期・優先度ソート・初期SlotLedger）②<code>assign_committed_combat</code>（既存Combatの単一作戦帰属）③<code>allocate_operation_slots</code>（最不足枠からの反復配分。内部の「RollingPlan評価・継続判定」と「1枠発注・Deployment生成」も別関数へ分離）④<code>allocate_immediate_reinforcements</code>（対実在敵の即時交戦増援）⑤<code>allocate_surplus_mobilization</code>（遊休施設の余剰動員）⑥<code>finalize_turn_production</code>（施設確定・未観測計画の整理・Trace確定）の6段に分解する。</li><li><strong><code>combat_plan_input</code>（726行）と <code>build_operations</code>（440行）の段階分解</strong>：それぞれ「対象抽出・既存戦力集計・脅威地平計算」および「作戦候補構築・統合・優先度付与」の小関数群（1関数50〜100行以下、最大ループ1つ、直接CC≤15目安）へ分解する。</li><li><strong><code>ProductionPolicy { Standard, SmallMap }</code> による関数外差し替えと統合</strong>：段階2の <code>PlanningPolicy</code> と同じ型で、段4・段5の実行有無、首都DAGの枠保留、合同パッケージの実効要求反映、候補選択・見送り条件の差を <code>ProductionPolicy</code> に集約する。入口の <code>decide_production_v4</code> で1回だけ方策を選び、関数内に <code>if is_extended()</code> を増やさずに重複9関数（約1,400行）を統合する。</li></ol></dd>
+<dt>検証</dt><dd>分解コミットと統合コミットを分け、判断fingerprint（V1〜V4）・28条件50Tの全 <code>action_history</code> 本文一致、および <code>measure_ai_complexity.py</code> による関数単位のCC・認知的複雑度の低下を確認。</dd>
+<dt>削除</dt><dd><strong><code>v4/extended.rs</code> ファイル全体</strong>、<code>v4/mod.rs</code> との重複関数コピー約1,400行、親 <code>v4/mod.rs</code> に置かれた実装本文（<code>v4/mod.rs</code> は公開入口と宣言のみにする）。</dd>
+<dt>完了</dt><dd><code>v4/extended.rs</code> が完全に消滅し、生産パイプラインの各段が独立した小関数として読め、標準/小規模の差が <code>ProductionPolicy</code> だけで説明できる。</dd>
+<dt>実績</dt><dd>標準・小規模の生産9関数を <code>ProductionPolicy</code> で統合し、<code>v4/extended.rs</code> を削除。親 <code>v4/mod.rs</code> は5,575→117行。分解版978件・統合版979件のRustテスト、Clippy・WASM・fmt・Python 41件を確認し、両版とも28条件50Tの全 <code>action_history</code> 本文・勝敗・終了turnが基準と28/28一致。</dd>
+</dl>
+</article>
+
+<article class="stage" id="stage-6">
+<h3>6. 残りの <code>*/extended.rs</code> の責務別整理と、戦略・状態遷移の負債（S）の個別返済【6a完了・6b主要項目採用】</h3>
+<dl>
+<dt>対象</dt><dd>着手時の <code>v4/rolling_plan/extended.rs</code>（5,519行）、<code>v4/victory_roadmap/extended.rs</code>（2,318行）、<code>island_campaign/extended.rs</code>、<code>island_campaign_analysis/extended.rs</code>、<code>turn_distance/extended.rs</code> に、完了条件上必要な <code>squad/extended.rs</code>・<code>v4/deployment/extended.rs</code> を追加。<code>v4/strategy_pipeline.rs</code> の正式なprofile選択は維持。</dd>
+<dt>変更</dt><dd><ul><li><strong>6a（区分R：残りの <code>extended.rs</code> 解消と巨大関数分割）</strong>：<code>rolling_plan/extended.rs</code> にある小規模固有の合同探索（<code>plan_current_property_control_exact</code> 686行、<code>simulate_state_with_catalog</code> 489行など）や <code>victory_roadmap/extended.rs</code>（<code>observe_campaign_execution</code> 510行など）を、段階4・5と同じ手順で責務名モジュール（例：<code>rolling_plan/exact_property_control.rs</code>）へ分離・段分割し、<code>extended.rs</code> というファイル名と一時スイッチ <code>OPENWARS_EXT_DISABLE</code> を撤去する。</li><li><strong>6b（区分S：戦略・状態遷移の整理、1件ずつ隔離評価）</strong>：挙動が変わる残課題——①編成後のRoadmap 2回目選択を実績観測のみにする、②発行拒否時の工程取消と配備・占領意図の解放（D-5）、③戦略分析と編成の占有モデルの統一——を、「旧ルールの目的→最小反例→代案→28条件50T比較（jobs=8）→採用/棄却」の手順で1件ずつ扱う。（※兵種バランス改善等の戦術変更は本段階のスコープ外とし、構造・状態遷移の正常化に集中する）</li></ul></dd>
+<dt>検証</dt><dd>6aは全行動列本文一致（R）。6bは1件ごとに直前採用版との28条件50T比較および最終非劣後評価を実施し、複数のSを同時に入れない。</dd>
+<dt>削除</dt><dd>すべての <code>*/extended.rs</code> モジュール名、<code>OPENWARS_EXT_DISABLE</code> / <code>is_extended_at</code>、編成後の無条件Roadmap再選択、採用案の旧補正。</dd>
+<dt>実績</dt><dd>7個の <code>extended.rs</code> と一時無効化APIを撤去。合同探索686行、戦闘占領simulation489行、比較器364行、Roadmap実績観測510行を責務別の段へ分割。親の実装を巨大な <code>mod.rs</code> へ統合していない。Rustテスト982件、Clippy・WASM・fmt、Python48件を確認。移動・段分割・スイッチ撤去をそれぞれ固定バイナリと全履歴本文で照合している。</dd>
+<dt>6a追補</dt><dd>2026-10-17：通常・小規模の資源pool観測を <code>island_campaign_analysis/resource_pool.rs</code> に配置し、所属索引・輸送とcargoの利用可能性・到達性・候補構築・整列へ段分割した（区分R）。両入口と小規模固有の除外理由・診断は分離したまま、同一の低位判定だけを共用する。通常入口148→43行、小規模入口177→51行。抽出helperを含む対象全体の最大直接CCは32→14、最大直接認知は31→9。全AIの最大/P95は不変。直接回帰8件を追加し、全Rustテスト990件成功（既存ignore 2件）、Clippy・WASM・fmt、Python41件と比較器6件を確認。基準・本文移動・段分割の3固定バイナリで各28条件50T（jobs=8）を実行し、基準↔移動・基準↔分割・移動↔分割のすべてで全 <code>action_history</code> 本文・勝敗・終了turnが28/28一致した。記録はpool追補の検証記録に分離。</dd>
+<dt>6a追補2</dt><dd>2026-10-17：物件レース合同探索の役割多重集合生成 <code>generate_role_multisets</code>（270行）を、役割諸元の観測・子候補生成・段展開・ビーム縮約・サイズ段ループへ分解した（区分R）。環境変数で有効になる縮約診断は <code>search_diagnostics.rs</code> の <code>MultisetBeamAudit</code> へ移し、出力文字列と出力時点を維持した。入口は270→38行、直接CC 20→6、直接認知47→7。ファイル内最大は直接CC10・認知7。全AIの最大/P95は不変。分割前に直接テスト4件（手計算3件、縮約時2,446件の全順序指紋1件）を固定した。全Rustテスト994件成功（既存ignore 2件）、Clippy・WASM・fmt成功。基準・分割の2固定バイナリで28条件50T（jobs=8）の全 <code>action_history</code> 本文・勝敗・終了turnが28/28一致し、診断有効時の診断行774行も逐語一致した。間接候補全滅時の詳細行だけは実行で未到達。記録は役割探索追補の検証記録。</dd>
+<dt>6a追補3</dt><dd>2026-10-17：通常パッケージ探索 <code>plan_force_package</code>（206行）を、枠ごとの劣後除去・枠の展開・層の並列評価と最良案3種の更新（<code>BestPlans</code>）・beam縮約・最終整形へ分解した（区分R）。入口は206→40行、直接CC 25→5、直接認知48→3。新設関数はすべて直接CC5以下・認知5以下。全AIの最大/P95は不変。前倒し成功時に直後で上書きされていた死んだ代入2つだけを削除した。分割前に計画結果全体の指紋テスト5件（標準・妨害優先・小規模順位・早期return・実行不能補完）を固定した。全Rustテスト999件成功（既存ignore 2件）、Clippy・WASM・fmt成功。基準・分割の28条件50T（jobs=8）で全 <code>action_history</code> 本文・勝敗・終了turnが28/28一致。記録は通常パッケージ探索追補の検証記録。</dd>
+<dt>6b②</dt><dd>2026-10-17：D-5を採用（区分S）。発行直前の検証で取り消した生産命令について、同時に保存した配備意図・受入slot予約・占領意図（campaign発注記録）を同じ手番に解放する処理を <code>v4/production_cancellation.rs</code> に一本化した。汎用V4生産とV4島嶼campaign列の両方が対象。永続Planの工程は発行前（Planned）のまま残し、次手番の生産失敗判定による同一計画内の再配置という既存契約を維持する。共通の発行列は取消命令を返すだけで、解放はV4側が行う。修正前に失敗する最小反例2件（取消後もpendingと発注記録が残る）と境界テスト4件を追加。50T・28条件の計測で取消は27件すべて終局後の監査記録で、対戦中の取消は0件だったため、直前採用版との28条件比較は全 <code>action_history</code> 本文・勝敗・終了turnが28/28一致した（想定どおり）。取消発生時の勝敗への効果は対戦条件に存在せず未評価。全Rustテスト1005件成功（既存ignore 2件）、Clippy・WASM・fmt成功。記録はD-5の検証記録。</dd>
+<dt>6b③</dt><dd>2026-10-17：占有モデルの統一を採用。戦略分析（首都脅威・物件脅威・対空評価）とSquad編成で別々だった占有を <code>PlayerBoard::occupancy</code> 1つにし、旧 <code>strategic_occupancy</code> を削除した。統一後の定義は、搭載中unitを除き輸送unitの空き枠を実積載から求める旧編成用の定義で、<code>BoardUnit::is_deployed</code> と同じく搭載中unitを地図上に置かない。消費者を調べた結果、どの消費者も「マスの占有有無と占有者のplayer」しか読まず、ゲームは搭載中unitを(9999,9999)へ移すため、実対局で生じ得る盤面では判断不変と結論した。差が出るのは搭載中unitの座標が地図内に残るルール外の盤面だけで、旧モデルがその搭載中unitを敵の進路を塞ぐ自軍として数え首都脅威を見落とす最小反例を、修正前に失敗するテストとして固定した。直前採用版との28条件50Tで全 <code>action_history</code> 本文・勝敗・終了turnが28/28一致。全Rustテスト1006件成功（既存ignore 2件）、Clippy・WASM・fmt成功。V1〜V3の対戦比較は未実施。記録は占有モデル統一の検証記録。</dd>
+<dt>残課題</dt><dd>既存診断（<code>report_frontier_witness_simulation</code>・<code>report_indirect_gate_audit</code> 等）には複雑度目安を超える関数が残る。すべての巨大関数や全AIの最大複雑度を解消したとは扱わない。6b①は既存の観測限定実装を確認済み、6b②D-5と③占有モデル統一は採用済み。兵種バランス等の戦術改善は本段階では未着手・将来の検討課題とする。12seed以上の最終非劣後評価と性能のA/A校正・最大メモリ比較も未実施。</dd>
+<dt>完了条件</dt><dd>コードベースから経路名ファイル（<code>extended.rs</code>）が消え、すべてのモジュールが責務名を持ち、採用した各S（D-5、占有モデル統一）の根拠が記録されている。</dd>
+</dl>
+</article>
+</section>
+
+<section id="reuse">
+<h2>再利用する資産</h2>
+<ul>
+<li><a href="../../engine/src/ai/v4/operation.rs#L138">OperationFacts / derive_slots</a>：観測から要求を導く純粋な境界。</li>
+<li><a href="../../engine/src/ai/v4/operation_selection.rs#L23">select_operation_candidates</a>：必須作戦を落とさない候補選択。</li>
+<li><a href="../../engine/src/ai/v4/property_control.rs#L21">ActionPhaseと時間offset</a>：先後手・生産後の行動可能時刻を揃える。</li>
+<li><a href="../../engine/src/ai/v4/plan_revision.rs#L29">PlanStepRef</a>、<a href="../../engine/src/ai/v4/plan_revision.rs#L144">decide_lifecycle</a>：工程参照と計画寿命の判断。</li>
+<li><a href="../../engine/src/ai/deterministic_parallel.rs">deterministic_parallel</a>：並列結果を入力順に戻す既存機構。</li>
+<li>既存deployment/campaign照合、Roadmap/Logisticsの履歴・進捗、architecture/multi-turn/planning契約テスト。</li>
+</ul>
+<p>通常/小規模で異なる初撃波の準備完了条件、合同占領探索、武装carrierの計上、AND前提とOR経路は、名前が似ていても同一視しません。変更する場合はSとして目的と評価を持たせます。</p>
+</section>
+
+<section id="acceptance">
+<h2>受入条件</h2>
+<h3>正しさと判断差</h3>
+<ul>
+<li>違法命令、矛盾する所属、二重発注/二重実績、資金/施設予約の矛盾、別playerへの混入は<strong>0件</strong>。</li>
+<li>Rは固定入力で判断・採用順・出力が一致。対戦のハッシュ集合一致だけを同値証明にしない。</li>
+<li>S/Bは最初の差、変更ルール、期待する改善を説明できる。goldenは証拠と対戦評価を確認してから更新。</li>
+<li>各正本の書込APIは所有moduleに限定。観測中の戦略変更、理由なし再選択、保存後の命令だけの変更、通常経路の所属修復固定点は最終的に0箇所。</li>
+</ul>
+<h3>読みやすさを確認するレビュー課題</h3>
+<ol>
+<li>購入候補を一つ却下する制約は、どこに追加するか。</li>
+<li>unitを別作戦へ移すとき、誰が所属を確定するか。</li>
+<li>首都Goの条件を変更すると、どの判断と状態に影響するか。</li>
+<li>発行した命令が失敗したとき、どこで予約と実績を照合するか。</li>
+</ol>
+<p>これらを入口から説明でき、変更先が責務に沿って定まることを要求します。別台帳への同期修正や複数段階のhookを追加しないと変更できない設計なら不合格です。</p>
+<h3>強さと性能</h3>
+<ul>
+<li>短期screenはmap_1/2/6/25、seed 1〜3、3反復、両先後、V4対V200。これは最終非劣後認定ではない。</li>
+<li>最終評価はmap_42、輸送/島嶼、標準大規模の固定セットを加え、12seed以上×両先後×3反復以上。開発用と未使用のseed/マップを事前に分ける。</li>
+<li>V1〜V3、通常/小規模V4、Square/Hexを別層で確認。196セル境界、非首都物件なしは合成fixtureでも確認。</li>
+<li>勝ち1・引分0.5・負け0のscore、通常決着率、上限打切り率、勝利手数を主要指標にする。上限時の代理判定を通常勝利へ合算せず、欠測/crashも除外して勝率を上げない。</li>
+<li>劣後不可を運用化する本計画の初期基準として、scoreの非劣後許容幅を<strong>0</strong>とする。対応するmap/seed/先後を単位に比較し、反復を独立seed扱いしない。層別差の点推定と95%区間を報告し、区間下限が負なら「非劣後未確認」。不明なら追加試験・保留/棄却とし、ユーザー合意なく許容幅を広げない。</li>
+<li>平均改善で通常経路、特定版、重要シナリオの退行を相殺しない。全マップで将来も非劣後だと証明したとは主張しない。</li>
+<li>同一機材・条件の反復でp95思考時間と最大メモリを比較。A/Aノイズを超える明確な増加は不合格。強さと速度の交換条件が必要なら、その変更だけ再相談する。</li>
+</ul>
+</section>
+
+<section id="metrics">
+<h2>メトリクスの訂正と新しい使い方</h2>
+<p>前回の「CC最大154→129」「D後に合計7〜11%減」「AI全体5%減」等は、校正前の集計とLCS断片からの予測でした。<strong>新計画の効果保証・完了判定から外します。</strong>元の数値と限界は 旧構造マップの計測節 に記録します。</p>
+<p>定義を補正した現状値と、段階ごとの見積り（前提とシナリオの幅つき）は <a href="ai-refactor-forecast.html">AI 再設計の効果見積り</a> にあります。見積りは計画の判断材料で、受入条件の代わりにはしません。</p>
+<div class="scroll"><table>
+<thead><tr><th>指標</th><th>前回の限界</th><th>今後の扱い</th></tr></thead>
+<tbody>
+<tr><td>CC・認知的複雑度</td><td>RCA 0.0.25のsumはクロージャ等込み。maxは親自身とは限らない</td><td>space別の直接値と子込み値を校正して別々に報告。重複計上を防ぐ</td></tr>
+<tr><td>ABC</td><td>RCAのRust ABCは未対応で0。自作regex版は独自近似</td><td>AST定義とfixture校正ができた場合のみ参考値。未対応は未対応とする</td></tr>
+<tr><td>呼出深さ・循環</td><td>同名method混同、対象外関数欠落、手動の辺除外</td><td>解決済み経路だけを記録し、未解決辺と対象範囲を明示。真の最長深さとは呼ばない</td></tr>
+<tr><td>移行後の予測</td><td>LCSのhunkは意味的な責務や必要hook数ではない</td><td>実装後に同じ定義で比較。削減率を事前保証しない</td></tr>
+</tbody></table></div>
+<p>新規・再設計する通常の判断関数では、校正後の直接CC≤15・認知的複雑度≤20を設計上の目安にします。不可分な探索核等は、理由とテストを伴う例外にできます。未校正の旧数値へこの閾値を当てません。</p>
+<p>変更単位全体と全AIの最大/P95、分岐・引数依存・状態書込箇所も併記します。子へ分岐を逃がして親だけ小さくしても、責務や正本が改善していなければ不合格。呼出深さの減少は必須ではありませんが、単なる中継層は増やしません。</p>
+</section>
+
+<section id="verification">
+<h2>検証手順とコマンド</h2>
+<p>段階1〜3bで確立した以下の検証手順を、段階4〜6でも継続して適用します。並列数は標準の <code>--jobs 8</code> を使用します。</p>
+<h3>各段階の検証</h3>
+<pre>cargo fmt --all -- --check
+cargo test --release --locked --no-fail-fast
+cargo clippy --all-targets --all-features -- -D warnings
+cargo check --locked -p engine --target wasm32-unknown-unknown
+git diff --check
+python -m unittest scripts.test_measure_ai_complexity scripts.test_eval_matchup scripts.test_matchup_runner
+python scripts/measure_ai_complexity.py --root engine/src/ai --output &lt;段階別JSON&gt;</pre>
+<p class="meta">通常検証では <code>OPENWARS_BLESS_AI_BASELINE</code> を未設定にします。Rの段階ではgoldenを更新しません。</p>
+<h3>28条件・50Tの行動履歴比較（Rの同値確認・Sの段階評価）</h3>
+<pre>python scripts/run_matchup_sweep.py \
+  --variant baseline=&lt;基準exe絶対パス&gt; \
+  --variant candidate=&lt;候補exe絶対パス&gt; \
+  --p1 V4 --p2 V200 --grid-type hex \
+  --map map_1,map_2,map_6,map_25,map_32,map_42,map_10 \
+  --seeds 1,2 --player-order both --repeats 1 --games 1 \
+  --max-turns 50 --jobs 8 --out-dir &lt;比較結果ディレクトリ&gt;</pre>
+<p>Rの段階（段階4・段階5・段階6a）では、28条件すべてで各対局JSONの <strong><code>action_history</code> 本文全体</strong>・勝敗・終了ターンが基準バイナリと28/28一致することを確認します。Sの段階（段階6b）では1件ずつ直前採用版と比較し、判断差と条件別の得失を記録します。</p>
+<h3>既存の安全網の限界</h3>
+<ul>
+<li>multi-turn goldenは短い手番の主要イベント・盤面比較であり、中終盤や全版×盤面×先後を網羅しない。</li>
+<li>既存save/load試験は直後盤面・profile・進行を検証し、ロード後の行動列同値までは保証していない。新設計では台帳・ID対応・継続実行も確認する。</li>
+<li>sweepの短いハッシュや勝敗一致だけでは同値証明にならないため、Rの検証では必ず <code>action_history</code> 本文全体を比較する。</li>
+<li>未来の敵実行結果を使うPythonのjoint-production replayは診断補助であり、Rust旧新の同値/汎化ゲートではない。</li>
+</ul>
+</section>
+
+<section id="risks">
+<h2>リスクと撤回方法</h2>
+<div class="scroll"><table>
+<thead><tr><th>リスク</th><th>抑止策</th><th>失敗したとき</th></tr></thead>
+<tbody>
+<tr><td>意味の違う台帳まで一つにする</td><td>作戦・契約・工程・現在所属・履歴を区別。重複する現在値だけ除く</td><td>該当するID/所有境界を見直す。巨大な中央台帳で吸収しない</td></tr>
+<tr><td>戦略整理で強さを落とす</td><td>R/S/B分離、反例、未使用条件、層別評価</td><td>当該S/Bだけ戻す。不確実性を改善として扱わない</td></tr>
+<tr><td>抽象化で複雑さが移るだけ</td><td>責務レビュー、更新口、補正回数、判断経路全体を確認</td><td>生産パイロットで止め、全体へ展開しない</td></tr>
+<tr><td>旧新の二重保守</td><td>一つの実プレイでは一方だけcommit。アダプターに撤去条件を持たせる</td><td>切替前の基準で再実行。二重正本には戻さない</td></tr>
+<tr><td>古いcache・World複製コスト</td><td>step内の借用/共有を優先。実適用後に再取得</td><td>snapshot寿命と失効契約を修正</td></tr>
+<tr><td>保存互換・Entity再生成</td><td>永続IDと実行時Entityを区別し、移行/復元テストを先行</td><td>移行前保存＋対応する基準バイナリで再開可能にする</td></tr>
+</tbody></table></div>
+<p>各段階を「移動のみ（本文不変）」「巨大関数の段分割」「Policyによる統合・旧処理削除」の小差分に分け、それぞれ対象テストと行動列比較で確認します。</p>
+<p>失敗時は直前のR/S/B変更だけを戻します。ユーザー変更・未追跡資産を巻き込むreset/cleanは使わず、stage・commit・pushは指示がある場合のみ。最終的には旧経路と比較スイッチを削除し、恒久的な旧新モードは残しません。</p>
+</section>
+
+<section id="open">
+<h2>段階4〜6の設計契約（守るべきルール）</h2>
+<ul>
+<li><strong>移動と分割と統合を混ぜない</strong>：先に責務別モジュールへの移動（本文不変）を行い、次に各関数を直線的な段（フェーズ）へ分解して複雑度を下げ、最後に <code>ProductionPolicy</code> 等で標準と小規模を統合する。</li>
+<li><strong>関数内に経路分岐を増やさない</strong>：重複を消すために関数本文の中に <code>if is_extended()</code> を散りばめない。段の有無と方策型のメソッドで関数の外から差し替える。</li>
+<li><strong>共有処理を親 <code>v4/mod.rs</code> に置かない</strong>：<code>v4/mod.rs</code> は公開範囲と入口の組み立てだけにし、実装本体はすべて責務名のサブモジュール（<code>capital_route/</code>、<code>production_pipeline/</code> 等）に置く。</li>
+<li><strong>関数単位の複雑度目標</strong>：分割後の判断・段取り関数は、校正後の直接CC≤15・認知的複雑度≤20・1関数あたり最大ループ1つを目安とする。</li>
+</ul>
+</section>
+
+<footer>
+<p>2026-10-11：ゼロベース再設計の計画を保存。2026-10-16：段階1〜3bの完了実績を反映し、<code>v4/extended.rs</code> 解体と生産パイプライン統合を段階4〜6として統合。同日：段階4を完了し、次着手を段階5へ更新。同日：段階5を完了し、次着手を段階6aへ更新。2026-10-17：段階6aの資源pool観測を責務分解し、今回の検証記録と未完了項目を分離。同日：役割多重集合探索を責務分解。同日：通常パッケージ探索を責務分解。同日：6b②D-5（発行拒否時の意図解放）を採用。同日：6b③占有モデル統一を採用。</p>
+<p><a href="ai-refactor-forecast.html">効果見積り</a> ／ <a href="#stages">現行の段階計画</a></p>
+</footer>
+</main>
+</body>
+</html>

@@ -2,7 +2,23 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
+/// リポジトリ未追跡のまま参照されることがあるテストモジュール。
+/// 存在する環境（作成者の作業ツリー）でだけcfgを立ててコンパイルし、
+/// 存在しないクローンでもlibテスト全体がビルドできるようにする。
+const OPTIONAL_TEST_MODULES: &[(&str, &str)] = &[(
+    "src/ai/squad/planning_contract_tests.rs",
+    "openwars_planning_contract_tests",
+)];
+
 fn main() {
+    for (path, cfg) in OPTIONAL_TEST_MODULES {
+        println!("cargo::rustc-check-cfg=cfg({cfg})");
+        println!("cargo:rerun-if-changed={path}");
+        if Path::new(path).exists() {
+            println!("cargo:rustc-cfg={cfg}");
+        }
+    }
+
     let out_dir = env::var_os("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("generated_maps.rs");
 

@@ -3,11 +3,10 @@
 //! GB版は移動探索の結果をWRAMの盤面配列へ保存し、後続の行動判定がその配列を
 //! 順に走査する。OpenWarsでは永続RAMを持たず、手番ごとに同じ意味の候補を生成する。
 
+use crate::collections::HashMap;
 use crate::components::{GridPosition, PlayerId, UnitStats};
 use crate::resources::{Map, MasterDataRegistry};
 use crate::systems::movement::{OccupantInfo, calculate_reachable_tile_costs};
-use std::collections::HashMap;
-
 /// 一つの移動先候補。`movement_cost` はGB版の到達可能盤面の値に相当する。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CandidateTile {
@@ -163,7 +162,7 @@ mod tests {
 
         let candidates = build_candidate_field(
             &map,
-            &HashMap::new(),
+            &HashMap::default(),
             GridPosition { x: 1, y: 1 },
             &stats,
             99,
@@ -186,7 +185,7 @@ mod tests {
             max_movement: 2,
             ..UnitStats::mock()
         };
-        let mut occupants = HashMap::new();
+        let mut occupants = HashMap::default();
         occupants.insert(
             (2, 1),
             OccupantInfo {
@@ -237,7 +236,7 @@ mod tests {
             max_movement: 2,
             ..UnitStats::mock()
         };
-        let mut occupants = HashMap::new();
+        let mut occupants = HashMap::default();
         occupants.insert(
             (2, 1),
             OccupantInfo {
@@ -291,7 +290,7 @@ mod tests {
         let stats = master_data
             .create_unit_stats(&UnitName(UnitType::Recon.as_str().to_owned()))
             .unwrap();
-        let mut occupants = HashMap::new();
+        let mut occupants = HashMap::default();
         for position in [
             (3, 7),
             (5, 7),
@@ -325,7 +324,7 @@ mod tests {
             PlayerId(2),
             &master_data,
         );
-        let positions: std::collections::HashSet<_> = candidates
+        let positions: crate::collections::HashSet<_> = candidates
             .iter()
             .map(|candidate| candidate.position)
             .collect();
@@ -353,7 +352,7 @@ mod tests {
             .create_unit_stats(&UnitName(UnitType::Infantry.as_str().to_owned()))
             .unwrap();
         let target = GridPosition { x: 20, y: 23 };
-        let occupants = HashMap::from([(
+        let occupants = HashMap::from_iter([(
             (target.x, target.y),
             OccupantInfo {
                 player_id: PlayerId(2),
@@ -413,7 +412,7 @@ mod tests {
             .create_unit_stats(&UnitName(UnitType::Infantry.as_str().to_owned()))
             .unwrap();
         let target = GridPosition { x: 19, y: 23 };
-        let occupants = HashMap::from([(
+        let occupants = HashMap::from_iter([(
             (target.x, target.y),
             OccupantInfo {
                 player_id: PlayerId(2),

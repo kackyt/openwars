@@ -4,12 +4,11 @@
 //! 「生産された順番」と同一視しない。生産命令を発行した時点で通し番号を予約し、
 //! 次の行動フェーズで実際に生成されたEntityへ結び付ける。
 
+use crate::collections::{HashMap, HashSet};
 use crate::components::{GridPosition, PlayerId};
 use crate::events::ProduceUnitCommand;
 use crate::resources::UnitType;
 use bevy_ecs::prelude::*;
-use std::collections::{HashMap, HashSet};
-
 #[derive(Clone, Copy)]
 struct PendingRecord {
     player_id: PlayerId,

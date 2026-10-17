@@ -1,12 +1,15 @@
-use crate::ai::engine::AiCommand;
+use crate::ai::command::AiCommand;
 use crate::ai::island_campaign::{
-    IslandCampaignAssignment, IslandCampaignDecision, IslandCampaignPortfolio,
+    IslandCampaignAssessment, IslandCampaignAssignment, IslandCampaignDecision,
+    IslandCampaignPortfolio,
 };
 use crate::ai::islands::{IslandId, IslandMap};
 use crate::ai::squad::{MissionPhase, MissionType, SquadManager, TransportPhase};
 use crate::ai::turn_distance::{TurnDistanceCache, calculate_turn_distance};
 use crate::ai::v4::deployment::V4DeploymentRegistry;
+use crate::ai::v4::operation::OperationKind;
 use crate::ai::v4::plan_revision::{ActiveCombatPlanSummary, PlanId, V4RollingPlanRegistry};
+use crate::collections::{HashMap, HashSet};
 use crate::components::{
     CargoCapacity, Faction, GridPosition, Health, PlayerId, Property, Transporting, UnitStats,
 };
@@ -17,8 +20,6 @@ use crate::events::{
 use crate::resources::{Map, MatchState, Terrain, master_data::MasterDataRegistry};
 use crate::systems::movement::OccupantInfo;
 use bevy_ecs::prelude::*;
-use std::collections::{HashMap, HashSet};
-
 /// 勝利条件までの親計画ID。局地PlanIdと分離し、勝利経路が変わるまで維持する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VictoryRoadmapId(pub u64);
@@ -67,7 +68,7 @@ pub enum OperationPhase {
     Blocked,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OperationEntityRole {
     Transport,
     Capture,
@@ -172,9 +173,11 @@ pub struct StrategicOperation {
     pub created_turn: u32,
     pub last_observed_turn: u32,
     pub tactical_anchor: GridPosition,
-    /// 作戦開始時に固定した全目的拠点。revisionで別島の集合へ差し替えない。
+    /// 現在の局地Milestoneが担当する目的拠点。完了済みの旧目標は残さない。
     pub objective_properties: Vec<GridPosition>,
     pub owned_objective_count: usize,
+    /// `VictoryRoadmap` が公開する、Nodeの戦略上の進行状態。
+    pub node_state: RoadmapNodeState,
     pub phase: OperationPhase,
     pub planned_completion_turn: Option<u32>,
     pub actual_completion_turn: Option<u32>,
@@ -209,6 +212,8 @@ pub struct VictoryRoadmap {
     pub initial_enemy_unit_count: usize,
     pub current_enemy_unit_count: usize,
     pub operation_ids: Vec<StrategicOperationId>,
+    /// IslandCampaignと首都攻略を接続する、当該Roadmapの有向非巡回な依存辺。
+    pub dependencies: Vec<RoadmapDependency>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -224,9 +229,9 @@ pub struct VictoryRoadmapRegistry {
     next_operation_id: u64,
     roadmaps: HashMap<PlayerId, VictoryRoadmap>,
     operations: HashMap<StrategicOperationId, StrategicOperation>,
-    // 作戦のidentityは「誰が、どの島を攻略するか」で固定する。
-    // 攻勢・防衛は戦況で変わる状態であり、keyへ含めると予実履歴が分断される。
-    operation_keys: HashMap<(PlayerId, IslandId), StrategicOperationId>,
+    // 同一島のCapture/Defenseは局地作戦として連続させる一方、首都作戦は別identityにする。
+    // これにより局地目標のanchor更新が勝利条件の終端目標を上書きしない。
+    operation_keys: HashMap<(PlayerId, IslandId, StrategicOperationScope), StrategicOperationId>,
     entity_bindings: HashMap<Entity, EntityOperationBinding>,
     transport_manifests: HashMap<Entity, HashSet<Entity>>,
     pending_steps: HashMap<Entity, PendingOperationStep>,
@@ -240,12 +245,16 @@ impl VictoryRoadmapRegistry {
         &self,
         player_id: PlayerId,
     ) -> Option<(IslandId, GridPosition)> {
+        // 依存gateを持つ拡張経路のRoadmapでは、Lockedな首都Nodeを公開しない。
+        // 通常経路のNodeは常にReadyで作られるため、この条件は効かない。
+        let hides_locked_nodes = crate::ai::code_path::is_extended();
         self.operations
             .values()
             .filter(|operation| {
                 operation.player_id == player_id
                     && operation.active
                     && operation.purpose == StrategicPurpose::AssaultCapital
+                    && !(hides_locked_nodes && operation.node_state == RoadmapNodeState::Locked)
             })
             .min_by_key(|operation| operation.id.0)
             .map(|operation| (operation.island_id, operation.tactical_anchor))
@@ -522,6 +531,7 @@ impl VictoryRoadmapRegistry {
         self.roadmaps.insert(
             player_id,
             VictoryRoadmap {
+                dependencies: Vec::new(),
                 id,
                 player_id,
                 route: if enemy_capital.is_some() {
@@ -552,7 +562,15 @@ impl VictoryRoadmapRegistry {
         capital: GridPosition,
         owned: bool,
     ) -> StrategicOperationId {
-        let key = (player_id, island_id);
+        // 拡張経路の首都作戦は、同じ島の地域作戦と別のCapital scopeで識別し、
+        // 所有状態をNode状態（Secured／Blocked）にも反映する。通常経路は地域作戦と
+        // 同じidentityで、Nodeは常にReadyのまま扱う。
+        let uses_capital_scope = crate::ai::code_path::is_extended();
+        let key = if uses_capital_scope {
+            (player_id, island_id, StrategicOperationScope::Capital)
+        } else {
+            main_operation_key(player_id, island_id)
+        };
         let operation_id = if let Some(id) = self.operation_keys.get(&key).copied() {
             id
         } else {
@@ -562,6 +580,11 @@ impl VictoryRoadmapRegistry {
             self.operations.insert(
                 id,
                 StrategicOperation {
+                    node_state: match (uses_capital_scope, owned) {
+                        (false, _) => RoadmapNodeState::Ready,
+                        (true, true) => RoadmapNodeState::Secured,
+                        (true, false) => RoadmapNodeState::Blocked,
+                    },
                     id,
                     roadmap_id,
                     player_id,
@@ -575,10 +598,10 @@ impl VictoryRoadmapRegistry {
                     phase: OperationPhase::Forming,
                     planned_completion_turn: None,
                     actual_completion_turn: None,
-                    assigned_transports: HashSet::new(),
-                    assigned_capturers: HashSet::new(),
-                    assigned_combat: HashSet::new(),
-                    combat_plan_ids: HashSet::new(),
+                    assigned_transports: HashSet::default(),
+                    assigned_capturers: HashSet::default(),
+                    assigned_combat: HashSet::default(),
+                    combat_plan_ids: HashSet::default(),
                     planned_suppression_turn: None,
                     execution: StepExecutionTotals::default(),
                     last_step: None,
@@ -615,10 +638,16 @@ impl VictoryRoadmapRegistry {
         operation.planned_suppression_turn = None;
         if owned {
             operation.phase = OperationPhase::Completed;
+            if uses_capital_scope {
+                operation.node_state = RoadmapNodeState::Secured;
+            }
             operation.actual_completion_turn.get_or_insert(turn);
             operation.blocked_reason = None;
         } else {
             operation.phase = OperationPhase::Forming;
+            if uses_capital_scope {
+                operation.node_state = RoadmapNodeState::Blocked;
+            }
             operation.planned_completion_turn = None;
             operation.blocked_reason =
                 Some("no executable capital assault schedule has been selected".to_owned());
@@ -638,8 +667,22 @@ impl VictoryRoadmapRegistry {
         owned_properties: &HashSet<GridPosition>,
         phase: OperationPhase,
     ) -> StrategicOperationId {
-        let key = (player_id, assignment.island_id);
-        let operation_id = if let Some(id) = self.operation_keys.get(&key).copied() {
+        // 拡張経路のRoadmapは、観測Node（Locked）として先に作られたOperationを目的別
+        // scopeで引き継ぎ、目標集合を現在の波へ置換する。通常経路は地域作戦として
+        // 作成し、見つかった前線目標を同じ作戦へ累積する。
+        let replaces_current_wave = crate::ai::code_path::is_extended();
+        let key = main_operation_key(player_id, assignment.island_id);
+        let operation_id = if replaces_current_wave {
+            self.ensure_operation(
+                roadmap_id,
+                player_id,
+                turn,
+                assignment.island_id,
+                purpose,
+                assignment.target_position,
+                objectives.clone(),
+            )
+        } else if let Some(id) = self.operation_keys.get(&key).copied() {
             id
         } else {
             self.next_operation_id = self.next_operation_id.saturating_add(1);
@@ -648,6 +691,7 @@ impl VictoryRoadmapRegistry {
             self.operations.insert(
                 id,
                 StrategicOperation {
+                    node_state: RoadmapNodeState::Ready,
                     id,
                     roadmap_id,
                     player_id,
@@ -661,10 +705,10 @@ impl VictoryRoadmapRegistry {
                     phase: OperationPhase::Forming,
                     planned_completion_turn: None,
                     actual_completion_turn: None,
-                    assigned_transports: HashSet::new(),
-                    assigned_capturers: HashSet::new(),
-                    assigned_combat: HashSet::new(),
-                    combat_plan_ids: HashSet::new(),
+                    assigned_transports: HashSet::default(),
+                    assigned_capturers: HashSet::default(),
+                    assigned_combat: HashSet::default(),
+                    combat_plan_ids: HashSet::default(),
                     planned_suppression_turn: None,
                     execution: StepExecutionTotals::default(),
                     last_step: None,
@@ -698,11 +742,17 @@ impl VictoryRoadmapRegistry {
             operation.last_replan_turn = Some(turn);
         }
         operation.tactical_anchor = assignment.target_position;
-        // 毎ターン見つかった前線目標を同じ作戦へ追加する。anchorや局地状態の変化で
-        // 既存目標を捨てず、複数の中立・敵施設を並行して前進させる。
-        for objective in objectives {
-            if !operation.objective_properties.contains(&objective) {
-                operation.objective_properties.push(objective);
+        if replaces_current_wave {
+            // 作戦identityと実績は維持するが、Milestoneの目標集合は現在の波へ差し替える。
+            // 成功済み施設を永続追加すると局地戦が全島制圧まで閉じないゾンビ作戦になる。
+            operation.objective_properties = objectives;
+        } else {
+            // 毎ターン見つかった前線目標を同じ作戦へ追加する。anchorや局地状態の変化で
+            // 既存目標を捨てず、複数の中立・敵施設を並行して前進させる。
+            for objective in objectives {
+                if !operation.objective_properties.contains(&objective) {
+                    operation.objective_properties.push(objective);
+                }
             }
         }
         operation.owned_objective_count = operation
@@ -721,6 +771,10 @@ impl VictoryRoadmapRegistry {
             operation.actual_completion_turn.get_or_insert(turn);
             OperationPhase::Completed
         } else {
+            // 現在波へ置換する拡張経路では、新しい波が未完了なら完了時刻も取り消す。
+            if replaces_current_wave {
+                operation.actual_completion_turn = None;
+            }
             phase
         };
         operation_id
@@ -935,7 +989,7 @@ pub(crate) fn record_operation_command(world: &mut World, entity: Entity, comman
                     || squad.cargo_entities.contains(&entity)
             })
         })
-        .and_then(|squad| match squad.phase {
+        .and_then(|squad| match squad.plan.phase {
             MissionPhase::Transport(phase) => Some(phase),
             _ => None,
         });
@@ -1040,8 +1094,8 @@ fn entity_is_owned_by_island_squad(
     entity: Entity,
 ) -> bool {
     manager.squads.iter().any(|squad| {
-        squad.owner_id == Some(player_id)
-            && squad.target_island == Some(island_id)
+        squad.plan.owner_id == Some(player_id)
+            && squad.plan.target_island == Some(island_id)
             && (squad.members.contains(&entity)
                 || squad.cargo_entities.contains(&entity)
                 || squad.delivered_cargo.contains(&entity))
@@ -1120,8 +1174,8 @@ fn diagnose_operation_execution(
             continue;
         }
         let assigned_transport = manager.squads.iter().any(|squad| {
-            squad.owner_id == Some(player_id)
-                && squad.target_island == Some(assignment.island_id)
+            squad.plan.owner_id == Some(player_id)
+                && squad.plan.target_island == Some(assignment.island_id)
                 && squad.cargo_entities.contains(entity)
                 && squad.transport_entity.is_some()
         });
@@ -1279,8 +1333,8 @@ fn diagnose_operation_recoveries(
             OperationIssueKind::TransportUnassigned => issue.entity.and_then(|entity| {
                 let loaded = world.get::<Transporting>(entity).is_some();
                 let assigned_transport = manager.squads.iter().any(|squad| {
-                    squad.owner_id == Some(player_id)
-                        && squad.target_island == Some(assignment.island_id)
+                    squad.plan.owner_id == Some(player_id)
+                        && squad.plan.target_island == Some(assignment.island_id)
                         && squad.cargo_entities.contains(&entity)
                         && squad.transport_entity.is_some()
                 });
@@ -1358,11 +1412,11 @@ fn operation_phase(
         .squads
         .iter()
         .filter(|squad| {
-            squad.owner_id == Some(player_id)
-                && squad.mission_type == MissionType::Transport
-                && squad.target_island == Some(assignment.island_id)
+            squad.plan.owner_id == Some(player_id)
+                && squad.plan.mission_type == MissionType::Transport
+                && squad.plan.target_island == Some(assignment.island_id)
         })
-        .filter_map(|squad| match squad.phase {
+        .filter_map(|squad| match squad.plan.phase {
             MissionPhase::Transport(phase) => Some(phase),
             _ => None,
         })
@@ -1461,7 +1515,7 @@ fn estimate_full_objective_completion(
         return Ok(turn);
     }
 
-    let mut occupied = HashMap::new();
+    let mut occupied = HashMap::default();
     let mut unit_query = world.query::<(
         Entity,
         &GridPosition,
@@ -1508,11 +1562,9 @@ fn estimate_full_objective_completion(
         .iter()
         .copied()
         .collect::<HashSet<_>>();
-    for squad in manager
-        .squads
-        .iter()
-        .filter(|squad| squad.owner_id == Some(player_id) && squad.target_island == Some(island_id))
-    {
+    for squad in manager.squads.iter().filter(|squad| {
+        squad.plan.owner_id == Some(player_id) && squad.plan.target_island == Some(island_id)
+    }) {
         for entity in squad
             .cargo_entities
             .iter()
@@ -1557,14 +1609,14 @@ fn estimate_full_objective_completion(
         }
 
         let squad = manager.squads.iter().find(|squad| {
-            squad.owner_id == Some(player_id)
-                && squad.target_island == Some(island_id)
+            squad.plan.owner_id == Some(player_id)
+                && squad.plan.target_island == Some(island_id)
                 && (squad.cargo_entities.contains(&entity)
                     || squad.delivered_cargo.contains(&entity))
         });
         let transport = transporting
             .map(|transporting| transporting.0)
-            .or_else(|| squad.and_then(|squad| squad.transport_entity))
+            .or_else(|| squad.and_then(|squad| *squad.transport_entity))
             .ok_or_else(|| format!("capture Entity {} has no transport", entity.to_bits()))?;
         let transport_position = world
             .get::<GridPosition>(transport)
@@ -1574,7 +1626,7 @@ fn estimate_full_objective_completion(
             .get::<UnitStats>(transport)
             .ok_or_else(|| format!("transport Entity {} has no stats", transport.to_bits()))?;
         let pickup = squad
-            .and_then(|squad| squad.pickup_position)
+            .and_then(|squad| squad.plan.pickup_position)
             .unwrap_or(transport_position);
         let mut ready = 0_u32;
         let departure = if transporting.is_some() {
@@ -1661,6 +1713,12 @@ pub(crate) fn reconcile_campaign_roadmap(
     portfolio: &IslandCampaignPortfolio,
     manager: &SquadManager,
 ) {
+    // 小規模マップのV4は extended 側の実装を使う。
+    if crate::ai::code_path::is_extended() {
+        return strategic_selection::reconcile_campaign_roadmap(
+            world, player_id, portfolio, manager,
+        );
+    }
     let turn = world
         .get_resource::<MatchState>()
         .map_or(0, |state| state.current_turn_number.0);
@@ -1760,7 +1818,7 @@ pub(crate) fn reconcile_campaign_roadmap(
         let purpose = purpose_for(assignment, enemy_capital_island);
         let previous_entities = registry
             .operation_keys
-            .get(&(player_id, assignment.island_id))
+            .get(&main_operation_key(player_id, assignment.island_id))
             .and_then(|operation_id| registry.operations.get(operation_id))
             .map(|operation| {
                 operation
@@ -1784,7 +1842,7 @@ pub(crate) fn reconcile_campaign_roadmap(
             .unwrap_or_default();
         let previous_issues = registry
             .operation_keys
-            .get(&(player_id, assignment.island_id))
+            .get(&main_operation_key(player_id, assignment.island_id))
             .and_then(|operation_id| registry.operations.get(operation_id))
             .map(|operation| operation.current_issues.clone())
             .unwrap_or_default();
@@ -1939,9 +1997,10 @@ pub(crate) fn reconcile_campaign_roadmap(
         registry.replace_operation_issues(operation_id, issues, recoveries);
         registry.bind_assignment_entities(operation_id, assignment);
         for squad in manager.squads.iter().filter(|squad| {
-            squad.owner_id == Some(player_id) && squad.target_island == Some(assignment.island_id)
+            squad.plan.owner_id == Some(player_id)
+                && squad.plan.target_island == Some(assignment.island_id)
         }) {
-            if let Some(transport) = squad.transport_entity {
+            if let Some(transport) = *squad.transport_entity {
                 registry.bind_entity_exclusive(
                     operation_id,
                     transport,
@@ -1972,7 +2031,7 @@ pub(crate) fn reconcile_campaign_roadmap(
     if let Some(capital_island) = enemy_capital_island
         && let Some(operation_id) = registry
             .operation_keys
-            .get(&(player_id, capital_island))
+            .get(&main_operation_key(player_id, capital_island))
             .copied()
     {
         let capital_plans = combat_plan_summaries
@@ -2016,9 +2075,10 @@ pub(crate) fn reconcile_campaign_roadmap(
         // 局地portfolioと同じくSquadから実Entityを拾う。これがないと毎ターン
         // Campaign→Reserve→Campaignを循環して、形成済み戦力の予実が分断される。
         for squad in manager.squads.iter().filter(|squad| {
-            squad.owner_id == Some(player_id) && squad.target_island == Some(capital_island)
+            squad.plan.owner_id == Some(player_id)
+                && squad.plan.target_island == Some(capital_island)
         }) {
-            if let Some(transport) = squad.transport_entity {
+            if let Some(transport) = *squad.transport_entity {
                 registry.bind_entity_exclusive(
                     operation_id,
                     transport,
@@ -2234,7 +2294,8 @@ pub fn audit_victory_roadmap_system(
             execution.mark_destroyed(event.entity, turn);
         }
         if let Some(assignments) = operation_assignments.as_deref_mut() {
-            assignments.release_entity(event.entity);
+            crate::ai::planning::assignment::OperationLedger::open(assignments)
+                .release_destroyed(event.entity);
         }
         registry.record_destroyed_entity(event.entity, turn);
     }
@@ -2257,6 +2318,7 @@ mod tests {
         registry.operations.insert(
             operation,
             StrategicOperation {
+                node_state: RoadmapNodeState::Ready,
                 id: operation,
                 roadmap_id: roadmap,
                 player_id: player,
@@ -2270,10 +2332,10 @@ mod tests {
                 phase: OperationPhase::Forming,
                 planned_completion_turn: None,
                 actual_completion_turn: None,
-                assigned_transports: HashSet::new(),
-                assigned_capturers: HashSet::new(),
-                assigned_combat: HashSet::new(),
-                combat_plan_ids: HashSet::new(),
+                assigned_transports: HashSet::default(),
+                assigned_capturers: HashSet::default(),
+                assigned_combat: HashSet::default(),
+                combat_plan_ids: HashSet::default(),
                 planned_suppression_turn: None,
                 execution: StepExecutionTotals::default(),
                 last_step: None,
@@ -2422,7 +2484,7 @@ mod tests {
             &assignment,
             StrategicPurpose::CaptureIsland,
             vec![GridPosition { x: 10, y: 10 }],
-            &HashSet::new(),
+            &HashSet::default(),
             OperationPhase::Forming,
         );
         let mut moved_anchor = assignment.clone();
@@ -2434,7 +2496,7 @@ mod tests {
             &moved_anchor,
             StrategicPurpose::CaptureIsland,
             vec![GridPosition { x: 12, y: 11 }],
-            &HashSet::new(),
+            &HashSet::default(),
             OperationPhase::Transit,
         );
 
@@ -2490,7 +2552,7 @@ mod tests {
             &assignment,
             StrategicPurpose::CaptureIsland,
             assignment.capture_target_positions.clone(),
-            &HashSet::new(),
+            &HashSet::default(),
             OperationPhase::Capture,
         );
         let operation = registry.operations.get_mut(&operation_id).unwrap();
@@ -2511,7 +2573,7 @@ mod tests {
             &assignment,
             StrategicPurpose::DefendIsland,
             assignment.capture_target_positions.clone(),
-            &HashSet::new(),
+            &HashSet::default(),
             OperationPhase::Blocked,
         );
 
@@ -2523,6 +2585,94 @@ mod tests {
         assert_eq!(operation.execution.completed, 3);
         assert_eq!(operation.issue_history.len(), 1);
         assert_eq!(registry.roadmaps[&player].operation_ids, vec![operation_id]);
+    }
+
+    /// 同じ島の前線目標を2波続けて照合したとき、目標集合と完了時刻の扱いは経路で
+    /// 異なる（F26の経路差を固定する）。通常経路は累積し完了時刻を残す。拡張経路は
+    /// 現在の波へ置換し、新しい波が未完了なら完了時刻を取り消す。
+    #[test]
+    fn assignment_objectives_accumulate_on_main_and_replace_on_extended_path() {
+        let player = PlayerId(1);
+        let island = IslandId(2);
+        let first_wave = GridPosition { x: 2, y: 0 };
+        let second_wave = GridPosition { x: 4, y: 0 };
+        let requirement = crate::ai::island_campaign::IslandCampaignRequirement {
+            preferred_transport: None,
+            transport_slots: 0,
+            capture_units: 1,
+            ground_combat_units: 0,
+            combat_units: 0,
+            total_budget: 1_000,
+        };
+        let assignment = |target: GridPosition| IslandCampaignAssignment {
+            island_id: island,
+            decision: IslandCampaignDecision::Expand,
+            target_position: target,
+            capture_target_positions: vec![target],
+            priority_enemy_types: Vec::new(),
+            requirement: requirement.clone(),
+            purchase_shortfall: requirement.clone(),
+            allocated_budget: 1_000,
+            transport_entities: Vec::new(),
+            capture_entities: Vec::new(),
+            combat_entities: Vec::new(),
+            operation_ready: true,
+            continued_from_existing_squad: false,
+        };
+        for (path, expected_objectives, expected_completion) in [
+            (
+                crate::ai::code_path::CodePath::MainCompatible,
+                vec![first_wave, second_wave],
+                Some(1),
+            ),
+            (
+                crate::ai::code_path::CodePath::Extended,
+                vec![second_wave],
+                None,
+            ),
+        ] {
+            let _guard = crate::ai::code_path::enter(path);
+            let mut registry = VictoryRoadmapRegistry::default();
+            let roadmap = registry.ensure_roadmap(player, 1, None, None, 1);
+            // 1波目は所有済みで完了する。
+            let operation = registry.reconcile_assignment(
+                roadmap,
+                player,
+                1,
+                &assignment(first_wave),
+                StrategicPurpose::CaptureIsland,
+                vec![first_wave],
+                &HashSet::from_iter([first_wave]),
+                OperationPhase::Forming,
+            );
+            assert_eq!(
+                registry.operations[&operation].phase,
+                OperationPhase::Completed
+            );
+
+            // 2波目の目標は未所有。
+            let same = registry.reconcile_assignment(
+                roadmap,
+                player,
+                2,
+                &assignment(second_wave),
+                StrategicPurpose::CaptureIsland,
+                vec![second_wave],
+                &HashSet::from_iter([first_wave]),
+                OperationPhase::Forming,
+            );
+            assert_eq!(same, operation, "{path:?}");
+            let operation = &registry.operations[&operation];
+            assert_eq!(
+                operation.objective_properties, expected_objectives,
+                "{path:?}"
+            );
+            assert_eq!(operation.phase, OperationPhase::Forming, "{path:?}");
+            assert_eq!(
+                operation.actual_completion_turn, expected_completion,
+                "{path:?}"
+            );
+        }
     }
 
     #[test]
@@ -2575,7 +2725,7 @@ mod tests {
             &first_assignment,
             StrategicPurpose::CaptureIsland,
             first_assignment.capture_target_positions.clone(),
-            &HashSet::new(),
+            &HashSet::default(),
             OperationPhase::Forming,
         );
         registry.bind_assignment_entities(first, &first_assignment);
@@ -2586,7 +2736,7 @@ mod tests {
             &second_assignment,
             StrategicPurpose::CaptureIsland,
             second_assignment.capture_target_positions.clone(),
-            &HashSet::new(),
+            &HashSet::default(),
             OperationPhase::Forming,
         );
         registry.bind_assignment_entities(second, &second_assignment);
@@ -2652,7 +2802,7 @@ mod tests {
             3,
             &assignment,
             &[(entity, OperationEntityRole::Combat)],
-            &HashSet::from([entity]),
+            &HashSet::from_iter([entity]),
             &[],
         );
 
@@ -2707,7 +2857,7 @@ mod tests {
             &assignment,
             StrategicPurpose::CaptureIsland,
             assignment.capture_target_positions.clone(),
-            &HashSet::new(),
+            &HashSet::default(),
             OperationPhase::Forming,
         );
         registry.bind_assignment_entities(operation_id, &assignment);
@@ -2734,14 +2884,14 @@ mod tests {
             islands: vec![
                 crate::ai::islands::Island {
                     id: IslandId(1),
-                    tiles: HashSet::from([
+                    tiles: HashSet::from_iter([
                         GridPosition { x: 0, y: 0 },
                         GridPosition { x: 1, y: 0 },
                     ]),
                 },
                 crate::ai::islands::Island {
                     id: island,
-                    tiles: HashSet::from([GridPosition { x: 3, y: 4 }]),
+                    tiles: HashSet::from_iter([GridPosition { x: 3, y: 4 }]),
                 },
             ],
         };
@@ -2784,11 +2934,11 @@ mod tests {
             islands: vec![
                 crate::ai::islands::Island {
                     id: IslandId(1),
-                    tiles: HashSet::from([GridPosition { x: 0, y: 0 }]),
+                    tiles: HashSet::from_iter([GridPosition { x: 0, y: 0 }]),
                 },
                 crate::ai::islands::Island {
                     id: target_island,
-                    tiles: HashSet::from([GridPosition { x: 3, y: 4 }]),
+                    tiles: HashSet::from_iter([GridPosition { x: 3, y: 4 }]),
                 },
             ],
         };
@@ -2931,6 +3081,85 @@ mod tests {
         assert!(operation.blocked_reason.is_some());
     }
 
+    /// 首都作戦のidentityとNode状態は経路で異なる（F25の経路差を固定する）。
+    /// 通常経路は地域作戦と同じキーでNodeは常にReady。拡張経路はCapital scopeの
+    /// 別キーを使い、未所有ならBlocked、所有したらSecuredへ遷移する。
+    #[test]
+    fn capital_objective_scope_and_node_state_differ_only_on_extended_path() {
+        let player = PlayerId(1);
+        let capital = GridPosition { x: 20, y: 4 };
+        let island = IslandId(7);
+        for (path, scope, unowned_state, owned_state) in [
+            (
+                crate::ai::code_path::CodePath::MainCompatible,
+                StrategicOperationScope::Regional,
+                RoadmapNodeState::Ready,
+                RoadmapNodeState::Ready,
+            ),
+            (
+                crate::ai::code_path::CodePath::Extended,
+                StrategicOperationScope::Capital,
+                RoadmapNodeState::Blocked,
+                RoadmapNodeState::Secured,
+            ),
+        ] {
+            let _guard = crate::ai::code_path::enter(path);
+            let mut registry = VictoryRoadmapRegistry::default();
+            let roadmap = registry.ensure_roadmap(player, 1, Some(capital), Some(island), 6);
+
+            let operation =
+                registry.ensure_capital_objective(roadmap, player, 1, island, capital, false);
+            assert_eq!(
+                registry.operation_keys.get(&(player, island, scope)),
+                Some(&operation),
+                "{path:?}"
+            );
+            assert_eq!(
+                registry.operations[&operation].node_state, unowned_state,
+                "{path:?}"
+            );
+
+            let same = registry.ensure_capital_objective(roadmap, player, 2, island, capital, true);
+            assert_eq!(same, operation, "{path:?}");
+            assert_eq!(
+                registry.operations[&operation].node_state, owned_state,
+                "{path:?}"
+            );
+        }
+    }
+
+    /// Lockedな首都Nodeを公開するかは経路で異なる（F24の経路差を固定する）。
+    /// 依存gateを持つ拡張経路は非公開、Nodeを常にReadyで作る通常経路は従来どおり返す。
+    #[test]
+    fn locked_capital_objective_is_hidden_only_on_extended_path() {
+        let player = PlayerId(1);
+        let capital = GridPosition { x: 20, y: 4 };
+        let island = IslandId(7);
+        let mut registry = VictoryRoadmapRegistry::default();
+        let roadmap = registry.ensure_roadmap(player, 1, Some(capital), Some(island), 6);
+        let operation = {
+            let _guard =
+                crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
+            registry.ensure_capital_objective(roadmap, player, 1, island, capital, false)
+        };
+        registry.operations.get_mut(&operation).unwrap().node_state = RoadmapNodeState::Locked;
+
+        for (path, expected) in [
+            (
+                crate::ai::code_path::CodePath::MainCompatible,
+                Some((island, capital)),
+            ),
+            (crate::ai::code_path::CodePath::Extended, None),
+        ] {
+            let _guard = crate::ai::code_path::enter(path);
+            assert_eq!(
+                registry.active_capital_objective(player),
+                expected,
+                "{path:?}"
+            );
+        }
+    }
+
     #[test]
     fn destroyed_transport_classifies_carrier_and_loaded_cargo_separately() {
         let player = PlayerId(2);
@@ -2975,7 +3204,7 @@ mod tests {
             &assignment,
             StrategicPurpose::CaptureIsland,
             assignment.capture_target_positions.clone(),
-            &HashSet::new(),
+            &HashSet::default(),
             OperationPhase::Transit,
         );
         registry.bind_assignment_entities(operation_id, &assignment);
@@ -3001,3 +3230,26 @@ mod tests {
         assert!(operation.recovery_history.is_empty());
     }
 }
+
+/// main互換経路の作戦キー。main互換経路は島ごとに1作戦で、作戦の範囲を区別しない。
+/// 共有台帳のキーは範囲を含むため、main互換経路では範囲を固定値にする。
+fn main_operation_key(
+    player_id: PlayerId,
+    island_id: IslandId,
+) -> (PlayerId, IslandId, StrategicOperationScope) {
+    (player_id, island_id, StrategicOperationScope::Regional)
+}
+
+// 公開する状態型と入口だけを列挙し、判断・観測の本文は責務別に置く。
+pub(crate) mod audit;
+mod dependency_graph;
+mod execution_observation;
+mod strategic_selection;
+mod turn_plan;
+use dependency_graph::StrategicOperationScope;
+pub use dependency_graph::{RoadmapDependency, RoadmapDependencyKind, RoadmapNodeState};
+pub(crate) use strategic_selection::observe_adopted_campaign_roadmap;
+pub(crate) use turn_plan::current_turn_portfolio;
+#[cfg(test)]
+#[path = "victory_roadmap/tests.rs"]
+mod small_map_tests;

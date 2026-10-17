@@ -18,6 +18,7 @@ pub use supply::*;
 pub use transport::*;
 pub use turn_management::*;
 
+use crate::ai::code_path::{has_extended_v4, has_no_extended_v4};
 use bevy_ecs::schedule::{IntoSystemConfigs, Schedule, SystemSet};
 
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
@@ -29,10 +30,10 @@ pub fn add_main_game_systems(schedule: &mut Schedule) {
     schedule.configure_sets(GameSystemSet);
     schedule.add_systems(
         (
-            crate::ai::engine::clear_ai_cooldowns_system,
+            crate::ai::runtime::state::clear_ai_cooldowns_system,
             produce_unit_system,
-            crate::ai::v4::deployment::reconcile_pending_deployments_system,
-            crate::ai::v4::campaign_execution::reconcile_campaign_production_system,
+            // 生産完了を一度だけ受付け、両台帳の照合を従来の発番順で適用する。
+            crate::ai::v4::production_events::reconcile_production_events_system,
             move_unit_system,
             attack_unit_system,
             crate::ai::v4::deployment::audit_deployment_attacks_system,
@@ -44,7 +45,12 @@ pub fn add_main_game_systems(schedule: &mut Schedule) {
             load_unit_system,
             unload_unit_system,
             wait_unit_system,
-            crate::ai::v4::victory_roadmap::audit_victory_roadmap_system,
+            (
+                crate::ai::v4::victory_roadmap::audit_victory_roadmap_system
+                    .run_if(has_no_extended_v4),
+                crate::ai::v4::victory_roadmap::audit::audit_victory_roadmap_system
+                    .run_if(has_extended_v4),
+            ),
             undo_move_system,
             next_phase_system,
             victory_check_system,

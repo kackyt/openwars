@@ -15,3 +15,5 @@ suggestions.md
 review_*.md
 saves/
 /web/.firebase
+trace_*.jsonl
+scratch/

@@ -17,7 +17,7 @@ pub const SHORT_LEAD_TIME_TURNS: u32 = 2;
 pub const RESERVATION_PATIENCE_TURNS: u32 = 5;
 
 /// 1 作戦あたりの占領枠の上限。面で取る性質上大きめだが、無限には広げない。
-const MAX_CAPTURE_SLOTS: u32 = 8;
+pub(crate) const MAX_CAPTURE_SLOTS: u32 = 8;
 
 /// 1 作戦あたりの輸送枠（搭載スロット）の上限。
 const MAX_TRANSPORT_SLOTS: u32 = 4;

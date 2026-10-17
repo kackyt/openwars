@@ -1,9 +1,8 @@
+use crate::collections::HashSet;
 use crate::components::*;
 use crate::events::*;
 use crate::resources::*;
 use bevy_ecs::prelude::*;
-use std::collections::HashSet;
-
 /// 空母がターン開始時に搭載ユニットへ提供できる内部HP回復量です。
 const MAX_CARRIER_CARGO_REPAIR_HP: u32 = 20;
 const REPAIR_COST_DENOMINATOR: u64 = 100;
@@ -152,9 +151,12 @@ pub fn advance_next_phase(world: &mut World) {
 
     // 2. 移動履歴・AIクールダウンを強制削除 (ターン終了時にリセット)
     commands.remove_resource::<PendingMove>();
-    commands.remove_resource::<crate::ai::engine::AiActionCooldown>();
-    commands.remove_resource::<crate::ai::engine::AiProductionCooldown>();
-    commands.remove_resource::<crate::ai::engine::AiTurnStrategyCache>();
+    commands.remove_resource::<crate::ai::runtime::state::AiActionCooldown>();
+    commands.remove_resource::<crate::ai::runtime::production_queue::AiProductionCooldown>();
+    commands.remove_resource::<crate::ai::planning::decision::AdoptedTurnPortfolio>();
+    commands.remove_resource::<crate::ai::production::turn_state::ProductionTurnState>();
+    commands.remove_resource::<crate::ai::runtime::state::AiTurnProgress>();
+    commands.remove_resource::<crate::ai::tactics::distance_cache::ActionDistanceCache>();
 
     // 3. プレイヤーの切り替え
     match_state.active_player_index.0 += 1;
@@ -259,7 +261,7 @@ fn apply_carrier_cargo_service(world: &mut World, active_player_id: PlayerId) {
     };
     carriers.sort_by_key(|(entity, _)| entity.to_bits());
 
-    let mut processed_cargo = HashSet::new();
+    let mut processed_cargo = HashSet::default();
     for (carrier, cargo_entities) in carriers {
         for cargo in cargo_entities {
             if !processed_cargo.insert(cargo) {
@@ -342,7 +344,7 @@ fn apply_unit_resupply(
     )>,
 ) {
     // 補給可能な物件の座標を収集
-    let mut resupply_tiles = HashSet::new();
+    let mut resupply_tiles = HashSet::default();
     for (pos, prop) in q_properties.iter() {
         if prop.owner_id == Some(active_player_id)
             && (prop.terrain == Terrain::City
@@ -810,13 +812,16 @@ mod tests {
         let entity = world.spawn_empty().id();
 
         // クールダウンをセット
-        world.insert_resource(crate::ai::engine::AiActionCooldown(
+        world.insert_resource(crate::ai::runtime::state::AiActionCooldown(
             [entity].into_iter().collect(),
         ));
-        world.insert_resource(crate::ai::engine::AiProductionCooldown(
+        world.insert_resource(crate::ai::runtime::production_queue::AiProductionCooldown(
             [(5, 5)].into_iter().collect(),
         ));
-        world.insert_resource(crate::ai::engine::AiTurnStrategyCache::default());
+        world.insert_resource(crate::ai::planning::decision::AdoptedTurnPortfolio::default());
+        world.insert_resource(crate::ai::production::turn_state::ProductionTurnState::default());
+        world.insert_resource(crate::ai::runtime::state::AiTurnProgress::default());
+        world.insert_resource(crate::ai::tactics::distance_cache::ActionDistanceCache::default());
 
         // ターン終了 -> P2へ
         world.send_event(NextPhaseCommand);
@@ -825,18 +830,21 @@ mod tests {
         // クールダウンが削除されていることを確認
         assert!(
             world
-                .get_resource::<crate::ai::engine::AiActionCooldown>()
+                .get_resource::<crate::ai::runtime::state::AiActionCooldown>()
                 .is_none()
         );
         assert!(
             world
-                .get_resource::<crate::ai::engine::AiProductionCooldown>()
+                .get_resource::<crate::ai::runtime::production_queue::AiProductionCooldown>()
                 .is_none()
         );
+        assert!(!world.contains_resource::<crate::ai::planning::decision::AdoptedTurnPortfolio>());
         assert!(
-            world
-                .get_resource::<crate::ai::engine::AiTurnStrategyCache>()
-                .is_none()
+            !world.contains_resource::<crate::ai::production::turn_state::ProductionTurnState>()
+        );
+        assert!(!world.contains_resource::<crate::ai::runtime::state::AiTurnProgress>());
+        assert!(
+            !world.contains_resource::<crate::ai::tactics::distance_cache::ActionDistanceCache>()
         );
     }
 

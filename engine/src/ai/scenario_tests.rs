@@ -3,7 +3,9 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::ai::engine::*;
+    use crate::ai::AiCommand;
+    use crate::ai::runtime::turn::execute_turn_step as execute_ai_turn_v2;
+    use crate::ai::v1::execute_ai_turn_v1;
     use crate::components::*;
     use crate::resources::master_data::*;
     use crate::resources::*;
@@ -98,7 +100,7 @@ mod tests {
     /// ## 1. 首都防衛 (Capital Defense)
     /// - **ケース**: 敵ユニットが自軍首都の目の前に迫っている状況。
     /// - **期待結果 (V1)**: ユニットごとに貪欲に攻撃や移動を判断するため、首都をがら空きにして敵に突っ込むなど、防衛目標を優先しない行動をとる。
-    /// - **期待結果 (V2)**: 部隊（Squad）システムとビーム探索により、首都防衛（Defendミッション）を最優先と認識し、ユニットを首都周辺に待機させて防衛線を張る。
+    /// - **期待結果 (V2)**: 旧首都防衛を作らず、汎用Attack部隊が首都近傍の敵へ攻撃する。
     #[test]
     fn test_scenario_1_capital_defense() {
         let p1 = PlayerId(1);
@@ -123,9 +125,17 @@ mod tests {
         crate::ai::squad::plan_squads(&mut world_v2, p1);
         let cmd_v2 = execute_ai_turn_v2(&mut world_v2, p1);
         let cmd_str_v2 = cmd_v2.expect("V2 should take action");
+        let manager = world_v2.resource::<crate::ai::squad::SquadManager>();
         assert!(
-            cmd_str_v2.contains("GridPosition { x: 5, y: 5 }"),
-            "V2 should move to or stay at the capital (5,5) to defend"
+            manager
+                .squads
+                .iter()
+                .all(|squad| squad.plan.mission_type != crate::ai::squad::MissionType::Defense),
+            "V2は首都近傍でも旧Defenseを作らない"
+        );
+        assert!(
+            cmd_str_v2.contains("Attack {"),
+            "旧首都防衛の待機ではなく、汎用Attackから敵へ攻撃する: {cmd_str_v2}"
         );
     }
 
@@ -373,9 +383,9 @@ mod tests {
             .get_resource::<crate::ai::squad::SquadManager>()
             .expect("V2 should create squad manager");
         assert!(
-            manager_v2.squads.iter().any(|s| s.mission_type
+            manager_v2.squads.iter().any(|s| s.plan.mission_type
                 == crate::ai::squad::MissionType::Transport
-                && s.phase
+                && s.plan.phase
                     == crate::ai::squad::MissionPhase::Transport(
                         crate::ai::squad::TransportPhase::Pickup
                     )),
@@ -622,8 +632,8 @@ mod tests {
             .squads
             .iter()
             .find(|squad| {
-                squad.mission_type == crate::ai::squad::MissionType::Transport
-                    && squad.phase
+                squad.plan.mission_type == crate::ai::squad::MissionType::Transport
+                    && squad.plan.phase
                         == crate::ai::squad::MissionPhase::Transport(
                             crate::ai::squad::TransportPhase::Transit,
                         )
@@ -694,7 +704,7 @@ mod tests {
         let transport = manager
             .squads
             .iter()
-            .find(|squad| squad.mission_type == crate::ai::squad::MissionType::Transport)
+            .find(|squad| squad.plan.mission_type == crate::ai::squad::MissionType::Transport)
             .expect("V3 should create one invasion transport squad");
         assert_eq!(transport.transport_entity, Some(lander));
         assert_eq!(transport.cargo_entities.len(), 1);
@@ -762,14 +772,14 @@ mod tests {
         let transport = manager
             .squads
             .iter()
-            .find(|squad| squad.mission_type == crate::ai::squad::MissionType::Transport)
+            .find(|squad| squad.plan.mission_type == crate::ai::squad::MissionType::Transport)
             .unwrap();
         assert_eq!(transport.cargo_entities, vec![infantry]);
         assert!(!transport.cargo_entities.contains(&tank));
-        assert_eq!(transport.target_island, None);
-        assert_eq!(transport.target, None);
+        assert_eq!(transport.plan.target_island, None);
+        assert_eq!(transport.plan.target, None);
         assert_eq!(
-            transport.phase,
+            transport.plan.phase,
             crate::ai::squad::MissionPhase::Transport(crate::ai::squad::TransportPhase::Drop)
         );
     }
@@ -838,7 +848,7 @@ mod tests {
                 .resource::<crate::ai::squad::SquadManager>()
                 .squads
                 .iter()
-                .any(|squad| squad.mission_type == crate::ai::squad::MissionType::Transport),
+                .any(|squad| squad.plan.mission_type == crate::ai::squad::MissionType::Transport),
             "敵島侵攻が無い場合も中立島への輸送拡張を維持する"
         );
     }
@@ -973,14 +983,14 @@ mod tests {
             .id();
 
         let mut manager = crate::ai::squad::SquadManager::new();
-        let squad = manager.create_squad(crate::ai::squad::MissionType::Transport);
+        let mut squad = manager.create_squad(crate::ai::squad::MissionType::Transport);
         squad.members.insert(transport);
-        squad.transport_entity = Some(transport);
-        squad.cargo_entities = vec![capture, combat];
-        squad.pickup_position = Some(GridPosition { x: 0, y: 1 });
-        squad.target_island = Some(target_island);
-        squad.target = Some(GridPosition { x: 4, y: 0 });
-        squad.phase =
+        squad.transport_entity = Some(transport).into();
+        squad.cargo_entities = vec![capture, combat].into();
+        squad.plan.pickup_position = Some(GridPosition { x: 0, y: 1 });
+        squad.plan.target_island = Some(target_island);
+        squad.plan.target = Some(GridPosition { x: 4, y: 0 });
+        squad.plan.phase =
             crate::ai::squad::MissionPhase::Transport(crate::ai::squad::TransportPhase::Pickup);
         world.insert_resource(manager);
 
@@ -991,17 +1001,17 @@ mod tests {
             let squad = manager
                 .squads
                 .iter_mut()
-                .find(|squad| squad.mission_type == crate::ai::squad::MissionType::Transport)
+                .find(|squad| squad.plan.mission_type == crate::ai::squad::MissionType::Transport)
                 .unwrap();
             let (entity, command) = crate::ai::squad::execute_transport_squad_step(
                 world,
-                squad,
-                &std::collections::HashSet::new(),
+                &mut squad.edit(),
+                &crate::collections::HashSet::default(),
             )
             .expect("transport should produce a command");
             let result = command.clone();
             world.insert_resource(manager);
-            crate::ai::engine::execute_ai_command(world, entity, command);
+            crate::ai::runtime::issue::execute_ai_command(world, entity, command);
             schedule.run(world);
             result
         };
@@ -1037,8 +1047,9 @@ mod tests {
                 .resource::<crate::ai::squad::SquadManager>()
                 .squads
                 .iter()
-                .find(|squad| squad.mission_type == crate::ai::squad::MissionType::Transport)
+                .find(|squad| squad.plan.mission_type == crate::ai::squad::MissionType::Transport)
                 .unwrap()
+                .plan
                 .phase,
             crate::ai::squad::MissionPhase::Transport(crate::ai::squad::TransportPhase::Transit)
         );
@@ -1058,7 +1069,7 @@ mod tests {
                 .resource::<crate::ai::squad::SquadManager>()
                 .squads
                 .iter()
-                .any(|squad| squad.mission_type == crate::ai::squad::MissionType::Capture)
+                .any(|squad| squad.plan.mission_type == crate::ai::squad::MissionType::Capture)
         );
 
         reset_actions(&mut world);
@@ -1071,10 +1082,10 @@ mod tests {
         let transport_squad = manager
             .squads
             .iter()
-            .find(|squad| squad.mission_type == crate::ai::squad::MissionType::Transport)
+            .find(|squad| squad.plan.mission_type == crate::ai::squad::MissionType::Transport)
             .unwrap();
         assert_eq!(
-            transport_squad.phase,
+            transport_squad.plan.phase,
             crate::ai::squad::MissionPhase::Transport(crate::ai::squad::TransportPhase::Return)
         );
         assert!(transport_squad.cargo_entities.is_empty());
@@ -1082,9 +1093,13 @@ mod tests {
             manager
                 .squads
                 .iter()
-                .any(|squad| squad.mission_type == crate::ai::squad::MissionType::Attack)
+                .any(|squad| squad.plan.mission_type == crate::ai::squad::MissionType::Attack)
         );
         assert!(world.get::<GridPosition>(capture).unwrap().x >= 3);
         assert!(world.get::<GridPosition>(combat).unwrap().x >= 3);
     }
 }
+
+// 拡張経路（小規模マップ戦略）で実行するシナリオ回帰テスト。
+#[cfg(test)]
+mod extended_path_tests;

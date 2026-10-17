@@ -1,7 +1,6 @@
-use std::collections::HashMap;
-
 use bevy_ecs::event::EventCursor;
 use bevy_ecs::prelude::*;
+use engine::collections::HashMap;
 use serde::Serialize;
 
 use engine::ai::idle_audit::IdleAuditDiagnostics;
@@ -15,6 +14,7 @@ use engine::ai::operation_assignment::UnitOperationRegistry;
 use engine::ai::squad::{MissionPhase, MissionType, SquadManager};
 use engine::ai::v4::deployment::V4DeploymentRegistry;
 use engine::ai::v4::logistics_plan::{LogisticsRouteMetrics, V4LogisticsPlanRegistry};
+use engine::ai::v4::operation::OperationSlots;
 use engine::ai::v4::plan_revision::{PlanExecutionSnapshot, V4RollingPlanRegistry};
 use engine::ai::v4::trace::{ProductionDecision, ProductionTraceDiagnostics};
 use engine::ai::v4::victory_roadmap::VictoryRoadmapRegistry;
@@ -142,8 +142,30 @@ pub struct TransportSquadSnapshot {
     pub x: Option<usize>,
     pub y: Option<usize>,
     pub target_island_id: Option<usize>,
+    /// 輸送作戦が指定する到着後の目標座標。島だけでは降車地点の妥当性を判定できない。
+    pub target_x: Option<usize>,
+    pub target_y: Option<usize>,
+    /// Pickup中の輸送役が向かう合流地点。空走がcargo回収なのか誤った前進なのかを区別する。
+    pub pickup_x: Option<usize>,
+    pub pickup_y: Option<usize>,
+    /// Transit / Drop で最後に選ばれたcargoの降車先。
+    pub drop_x: Option<usize>,
+    pub drop_y: Option<usize>,
+    /// 積載済みでも兵站gate待ちなのか、実際にTransitできる状態なのかを区別する。
+    pub departure_authorized: bool,
+    pub allow_partial_departure: bool,
     pub planned_cargo_ids: Vec<u64>,
+    /// 計画に含まれるcargoの現在座標。輸送役だけが移動している事実を検証する。
+    pub planned_cargo_positions: Vec<TransportCargoPositionSnapshot>,
     pub loaded_cargo_ids: Vec<u64>,
+    pub delivered_cargo_ids: Vec<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TransportCargoPositionSnapshot {
+    pub unit_id: u64,
+    pub x: Option<usize>,
+    pub y: Option<usize>,
 }
 
 /// 遊兵1体分の記録。分類は排他ではない（actionable は no_mission / mission_stalled の上位集合）。
@@ -214,7 +236,7 @@ pub struct ProductionStepSnapshot {
     pub deficit_before: f32,
     pub deficit_after: f32,
     pub remaining_funds_before: u32,
-    /// "produced" | "slot_cleared" | "deferred" | "reserved"
+    /// "produced" | "immediate_reinforcement" | "slot_cleared" | "deferred" | "reserved"
     pub decision: String,
     pub unit_type: Option<UnitType>,
     pub cost: Option<u32>,
@@ -232,9 +254,11 @@ pub struct ProductionOperationSnapshot {
     pub combat_plan_required: u32,
     pub transport_slots: u32,
     pub intercept_units: u32,
+    pub capture_replacement_pending: bool,
     pub requires_transport: bool,
     pub enemy_combat_units: u32,
     pub enemy_reinforcement_funds: u32,
+    pub enemy_stress_reinforcement_funds: u32,
     pub contingency_reserve_funds: u32,
     pub reinforcement_contingencies: Vec<ReinforcementContingencySnapshot>,
     pub deploy_lead_time: u32,
@@ -253,6 +277,54 @@ pub struct ReinforcementContingencySnapshot {
     pub reserve_cost: u32,
 }
 
+/// 要求・実効要求・確保量を同じ単位で写し取る。判断や不足量の再計算は行わない。
+#[derive(Debug, Serialize)]
+pub struct DemandSlotsSnapshot {
+    pub capture_units: u32,
+    pub combat_plan_required: u32,
+    pub transport_slots: u32,
+    pub intercept_units: u32,
+}
+
+impl From<OperationSlots> for DemandSlotsSnapshot {
+    fn from(slots: OperationSlots) -> Self {
+        Self {
+            capture_units: slots.capture_units,
+            combat_plan_required: slots.combat_plan_required,
+            transport_slots: slots.transport_slots,
+            intercept_units: slots.intercept_units,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct EffectiveDemandSnapshot {
+    pub slot_kind: String,
+    pub amount: u32,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProductionDemandSnapshot {
+    pub operation_kind: String,
+    pub anchor_x: usize,
+    pub anchor_y: usize,
+    pub requested: DemandSlotsSnapshot,
+    pub effective: DemandSlotsSnapshot,
+    pub filled: DemandSlotsSnapshot,
+    pub adjustments: Vec<EffectiveDemandSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UnfilledDemandSnapshot {
+    pub operation_kind: String,
+    pub anchor_x: usize,
+    pub anchor_y: usize,
+    pub slot_kind: String,
+    pub requirement: u32,
+    pub reason: String,
+}
+
 /// V4 生産判断のターン単位スナップショット。
 #[derive(Debug, Serialize)]
 pub struct ProductionPlanSnapshot {
@@ -267,9 +339,23 @@ pub struct ProductionPlanSnapshot {
     pub reserved_funds: u32,
     /// どの作戦にも帰属していない現金
     pub uncommitted_funds: u32,
+    pub enemy_production_forecast: EnemyProductionForecastSnapshot,
     pub operations: Vec<ProductionOperationSnapshot>,
+    pub demands: Vec<ProductionDemandSnapshot>,
+    pub unfilled_slots: Vec<UnfilledDemandSnapshot>,
     pub steps: Vec<ProductionStepSnapshot>,
     pub rolling_combat_plans: Vec<RollingCombatPlanSnapshot>,
+}
+
+/// 敵の実生産履歴に基づく次手番予測と、既済予測の平均絶対誤差。
+#[derive(Debug, Serialize)]
+pub struct EnemyProductionForecastSnapshot {
+    pub expected_units_next_turn: u32,
+    pub expected_cost_next_turn: u32,
+    pub dominant_unit_type: Option<UnitType>,
+    pub evaluated_samples: u32,
+    pub mean_absolute_unit_error: u32,
+    pub mean_absolute_cost_error: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -290,10 +376,14 @@ pub struct RollingCombatPlanSnapshot {
     pub occupation_turn: Option<u32>,
     pub production_cost: u32,
     pub expected_loss: u32,
+    pub surviving_combat_value: u32,
+    pub required_overmatch_value: u32,
+    pub overmatch_ready: bool,
     pub protected_unit_count: usize,
     pub protected_survivor_count: usize,
     pub required_capture_survivor_count: usize,
     pub candidates_considered: usize,
+    pub candidates_pruned: usize,
     pub search_truncated: bool,
 }
 
@@ -1056,9 +1146,11 @@ pub fn snapshot_production_plan_for_player(
             combat_plan_required: op.slots.combat_plan_required,
             transport_slots: op.slots.transport_slots,
             intercept_units: op.slots.intercept_units,
+            capture_replacement_pending: op.capture_replacement_pending,
             requires_transport: op.requires_transport,
             enemy_combat_units: op.enemy_combat_units,
             enemy_reinforcement_funds: op.enemy_reinforcement_funds,
+            enemy_stress_reinforcement_funds: op.enemy_stress_reinforcement_funds,
             contingency_reserve_funds: op.contingency_reserve_funds,
             reinforcement_contingencies: op
                 .reinforcement_contingencies
@@ -1079,6 +1171,40 @@ pub fn snapshot_production_plan_for_player(
         })
         .collect();
 
+    let demands = plan
+        .demands
+        .iter()
+        .map(|demand| ProductionDemandSnapshot {
+            operation_kind: format!("{:?}", demand.operation_kind),
+            anchor_x: demand.anchor.x,
+            anchor_y: demand.anchor.y,
+            requested: demand.requested.into(),
+            effective: demand.effective.into(),
+            filled: demand.filled.into(),
+            adjustments: demand
+                .adjustments
+                .iter()
+                .map(|adjustment| EffectiveDemandSnapshot {
+                    slot_kind: format!("{:?}", adjustment.key.slot),
+                    amount: adjustment.amount,
+                    reason: format!("{:?}", adjustment.reason),
+                })
+                .collect(),
+        })
+        .collect();
+    let unfilled_slots = plan
+        .unfilled_slots
+        .iter()
+        .map(|outcome| UnfilledDemandSnapshot {
+            operation_kind: format!("{:?}", outcome.operation_kind),
+            anchor_x: outcome.anchor.x,
+            anchor_y: outcome.anchor.y,
+            slot_kind: format!("{:?}", outcome.slot_kind),
+            requirement: outcome.requirement,
+            reason: format!("{:?}", outcome.reason),
+        })
+        .collect();
+
     let steps = plan
         .steps
         .iter()
@@ -1090,7 +1216,17 @@ pub fn snapshot_production_plan_for_player(
                     cost,
                     facility,
                 } => ("produced", Some(*unit_type), Some(*cost), Some(*facility)),
-                ProductionDecision::SlotCleared => ("slot_cleared", None, None, None),
+                ProductionDecision::ProducedImmediateReinforcement {
+                    unit_type,
+                    cost,
+                    facility,
+                } => (
+                    "immediate_reinforcement",
+                    Some(*unit_type),
+                    Some(*cost),
+                    Some(*facility),
+                ),
+                ProductionDecision::Unfilled { .. } => ("slot_cleared", None, None, None),
                 ProductionDecision::Deferred { unit_type, cost } => {
                     ("deferred", Some(*unit_type), Some(*cost), None)
                 }
@@ -1166,10 +1302,14 @@ pub fn snapshot_production_plan_for_player(
             occupation_turn: rolling.occupation_turn,
             production_cost: rolling.production_cost,
             expected_loss: rolling.expected_loss,
+            surviving_combat_value: rolling.surviving_combat_value,
+            required_overmatch_value: rolling.required_overmatch_value,
+            overmatch_ready: rolling.overmatch_ready,
             protected_unit_count: rolling.protected_unit_count,
             protected_survivor_count: rolling.protected_survivor_count,
             required_capture_survivor_count: rolling.required_capture_survivor_count,
             candidates_considered: rolling.candidates_considered,
+            candidates_pruned: rolling.candidates_pruned,
             search_truncated: rolling.search_truncated,
         })
         .collect();
@@ -1182,7 +1322,17 @@ pub fn snapshot_production_plan_for_player(
         leftover_funds: plan.leftover_funds,
         reserved_funds: plan.reserved_funds,
         uncommitted_funds: plan.uncommitted_funds,
+        enemy_production_forecast: EnemyProductionForecastSnapshot {
+            expected_units_next_turn: plan.enemy_production_forecast.expected_units_next_turn,
+            expected_cost_next_turn: plan.enemy_production_forecast.expected_cost_next_turn,
+            dominant_unit_type: plan.enemy_production_forecast.dominant_unit_type,
+            evaluated_samples: plan.enemy_production_forecast.evaluated_samples,
+            mean_absolute_unit_error: plan.enemy_production_forecast.mean_absolute_unit_error,
+            mean_absolute_cost_error: plan.enemy_production_forecast.mean_absolute_cost_error,
+        },
         operations,
+        demands,
+        unfilled_slots,
         steps,
         rolling_combat_plans,
     })
@@ -1560,13 +1710,13 @@ pub fn snapshot_transport_squads(world: &World) -> Vec<TransportSquadSnapshot> {
     };
     let mut snapshots = Vec::new();
     for squad in &manager.squads {
-        if squad.mission_type != MissionType::Transport {
+        if squad.plan.mission_type != MissionType::Transport {
             continue;
         }
-        let Some(transport) = squad.transport_entity else {
+        let Some(transport) = *squad.transport_entity else {
             continue;
         };
-        let phase = match squad.phase {
+        let phase = match squad.plan.phase {
             MissionPhase::Transport(phase) => format!("{phase:?}"),
             _ => continue,
         };
@@ -1577,6 +1727,19 @@ pub fn snapshot_transport_squads(world: &World) -> Vec<TransportSquadSnapshot> {
             .map(|entity| entity.to_bits())
             .collect();
         planned_cargo_ids.sort_unstable();
+        let mut planned_cargo_positions: Vec<_> = squad
+            .cargo_entities
+            .iter()
+            .map(|entity| {
+                let position = world.get::<GridPosition>(*entity).copied();
+                TransportCargoPositionSnapshot {
+                    unit_id: entity.to_bits(),
+                    x: position.map(|position| position.x),
+                    y: position.map(|position| position.y),
+                }
+            })
+            .collect();
+        planned_cargo_positions.sort_by_key(|cargo| cargo.unit_id);
         let mut loaded_cargo_ids: Vec<_> = world
             .get::<CargoCapacity>(transport)
             .map(|capacity| {
@@ -1595,9 +1758,23 @@ pub fn snapshot_transport_squads(world: &World) -> Vec<TransportSquadSnapshot> {
             transport_id: transport.to_bits(),
             x: position.map(|position| position.x),
             y: position.map(|position| position.y),
-            target_island_id: squad.target_island.map(|island| island.0),
+            target_island_id: squad.plan.target_island.map(|island| island.0),
+            target_x: squad.plan.target.map(|position| position.x),
+            target_y: squad.plan.target.map(|position| position.y),
+            pickup_x: squad.plan.pickup_position.map(|position| position.x),
+            pickup_y: squad.plan.pickup_position.map(|position| position.y),
+            drop_x: squad.plan.drop_position.map(|position| position.x),
+            drop_y: squad.plan.drop_position.map(|position| position.y),
+            departure_authorized: squad.plan.departure_authorized,
+            allow_partial_departure: squad.plan.allow_partial_departure,
             planned_cargo_ids,
+            planned_cargo_positions,
             loaded_cargo_ids,
+            delivered_cargo_ids: squad
+                .delivered_cargo
+                .iter()
+                .map(|entity| entity.to_bits())
+                .collect(),
         });
     }
     snapshots.sort_by_key(|snapshot| snapshot.squad_id);
@@ -1614,6 +1791,62 @@ mod tests {
     use engine::ai::islands::IslandId;
     use engine::components::PlayerId;
     use engine::resources::UnitType;
+
+    #[test]
+    fn production_snapshot_exports_requested_effective_and_unfilled_reason() {
+        use engine::ai::production::demand::{
+            DemandKey, EffectiveDemand, EffectiveDemandReason, UnfilledReason,
+        };
+        use engine::ai::v4::operation::{OperationKind, SlotKind};
+        use engine::ai::v4::trace::{
+            ProductionDemandTrace, ProductionPlanTrace, UnfilledSlotTrace,
+        };
+
+        let player = PlayerId(1);
+        let anchor = GridPosition { x: 2, y: 3 };
+        let mut trace = ProductionPlanTrace::new(player, 0, 0);
+        trace.demands.push(ProductionDemandTrace {
+            operation_kind: OperationKind::Capture,
+            anchor,
+            requested: OperationSlots {
+                capture_units: 4,
+                ..OperationSlots::default()
+            },
+            effective: OperationSlots::default(),
+            filled: OperationSlots::default(),
+            adjustments: vec![EffectiveDemand {
+                key: DemandKey {
+                    operation: 0,
+                    slot: SlotKind::Capture,
+                },
+                amount: 2,
+                reason: EffectiveDemandReason::JointPackageSelected,
+            }],
+        });
+        trace.unfilled_slots.push(UnfilledSlotTrace {
+            operation_kind: OperationKind::Capture,
+            anchor,
+            slot_kind: SlotKind::Capture,
+            requirement: 4,
+            reason: UnfilledReason::NoCandidate,
+        });
+        let mut diagnostics = ProductionTraceDiagnostics::default();
+        diagnostics.record(1, trace);
+        let mut world = World::new();
+        world.insert_resource(diagnostics);
+        let snapshot = snapshot_production_plan_for_player(&world, player).unwrap();
+        let json = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(json["demands"][0]["requested"]["capture_units"], 4);
+        assert_eq!(json["demands"][0]["effective"]["capture_units"], 0);
+        assert_eq!(json["demands"][0]["filled"]["capture_units"], 0);
+        assert_eq!(json["demands"][0]["adjustments"][0]["amount"], 2);
+        assert_eq!(
+            json["demands"][0]["adjustments"][0]["reason"],
+            "JointPackageSelected"
+        );
+        assert_eq!(json["unfilled_slots"][0]["requirement"], 4);
+        assert_eq!(json["unfilled_slots"][0]["reason"], "NoCandidate");
+    }
 
     fn snapshot(health: u32, cost: u32) -> UnitTraceSnapshot {
         UnitTraceSnapshot {

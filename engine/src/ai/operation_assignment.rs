@@ -1,9 +1,9 @@
 use crate::ai::islands::IslandId;
-use crate::ai::squad::SquadId;
+use crate::ai::planning::assignment::LedgerKey;
+use crate::ai::planning::assignment::squad_model::SquadId;
+use crate::collections::{HashMap, HashSet};
 use crate::components::PlayerId;
 use bevy_ecs::prelude::*;
-use std::collections::{HashMap, HashSet};
-
 /// 1体のunitを所有できる作戦の一意な識別子。
 ///
 /// 戦術Squadは作戦の実行形であり、島作戦は輸送・占領など複数Squadへ分割できる。
@@ -37,6 +37,10 @@ pub enum OperationUnitRole {
 }
 
 /// Entityから唯一の作戦所有者を平均O(1)で引ける正規化済み割当。
+///
+/// `squad_id` は**現在の実行binding**だけを表す。正規化で具体Squadを失った作戦所属
+/// （winnerの無いCampaign）は `None` になり、過去のSquadIdは
+/// [`UnitOperationRegistry::previous_squad`] の履歴へ分けて保持する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnitOperationAssignment {
     pub owner: OperationOwner,
@@ -45,11 +49,18 @@ pub struct UnitOperationAssignment {
     pub assigned_turn: u32,
 }
 
-/// 作戦割当の正本。逆引きも持ち、作戦終了時の解放を所属unit数O(k)で行う。
+/// 所属台帳（OperationLedger）の正規化所属層。逆引きも持ち、作戦終了時の解放を所属unit数O(k)で行う。
+///
+/// 書込みは `planning::assignment::OperationLedger` だけが行う。各書込みmethodは
+/// そのmodule外で生成できない [`LedgerKey`] を要求し、読取りは誰でも行える。
 #[derive(Resource, Debug, Default)]
 pub struct UnitOperationRegistry {
     by_entity: HashMap<Entity, UnitOperationAssignment>,
     entities_by_owner: HashMap<OperationOwner, HashSet<Entity>>,
+    /// 作戦所属は残したまま具体Squadを失ったEntityの、直前の具体SquadId（履歴）。
+    /// 現在bindingではないため、Squadの投影・行動選択・DAG指令の参照には使わない。
+    /// 次の正規化で「前手番の具体Squadを維持する」同点規則だけが参照する。
+    previous_squads: HashMap<Entity, SquadId>,
     rejected_conflicts: u64,
     last_reconcile_visits: usize,
 }
@@ -57,6 +68,39 @@ pub struct UnitOperationRegistry {
 impl UnitOperationRegistry {
     pub fn assignment(&self, entity: Entity) -> Option<UnitOperationAssignment> {
         self.by_entity.get(&entity).copied()
+    }
+
+    /// 具体Squadへの現在bindingを持つEntity（全player）。正規化直後の「任務あり」判定に使う。
+    /// 作戦ownerだけを持ちSquadを失ったEntityや、履歴のSquadIdは含めない。
+    pub fn bound_entities(&self) -> HashSet<Entity> {
+        self.by_entity
+            .iter()
+            .filter(|(_, assignment)| assignment.squad_id.is_some())
+            .map(|(entity, _)| *entity)
+            .collect()
+    }
+
+    /// 現在bindingを失った作戦所属の、直前の具体SquadId（履歴）。
+    pub fn previous_squad(&self, entity: Entity) -> Option<SquadId> {
+        self.previous_squads.get(&entity).copied()
+    }
+
+    /// 正規化の同点規則に使う旧所属。現在bindingが無ければ履歴のSquadIdを補う。
+    pub(crate) fn resolution_priors(
+        &self,
+        player_id: PlayerId,
+    ) -> HashMap<Entity, UnitOperationAssignment> {
+        self.by_entity
+            .iter()
+            .filter(|(_, assignment)| assignment.owner.player_id() == player_id)
+            .map(|(entity, assignment)| {
+                let mut prior = *assignment;
+                if prior.squad_id.is_none() {
+                    prior.squad_id = self.previous_squads.get(entity).copied();
+                }
+                (*entity, prior)
+            })
+            .collect()
     }
 
     pub fn campaign_entity_assignments(&self, player_id: PlayerId) -> HashMap<Entity, IslandId> {
@@ -116,16 +160,23 @@ impl UnitOperationRegistry {
         self.last_reconcile_visits
     }
 
-    pub(crate) fn note_reconcile_visits(&mut self, visits: usize) {
+    pub(crate) fn apply_reconcile_visits(&mut self, _key: LedgerKey, visits: usize) {
         self.last_reconcile_visits = visits;
     }
 
-    pub(crate) fn note_rejected_conflict(&mut self) {
+    pub(crate) fn apply_rejected_conflict(&mut self, _key: LedgerKey) {
         self.rejected_conflicts = self.rejected_conflicts.saturating_add(1);
     }
 
     /// callerが選んだ唯一の勝者へ割当を更新する。旧ownerの逆引きも同時に外す。
-    pub(crate) fn assign(&mut self, entity: Entity, assignment: UnitOperationAssignment) {
+    pub(crate) fn apply_assign(
+        &mut self,
+        _key: LedgerKey,
+        entity: Entity,
+        assignment: UnitOperationAssignment,
+    ) {
+        // 新しい割当は現在bindingの決定であり、旧履歴を持ち越さない。
+        self.previous_squads.remove(&entity);
         if let Some(previous) = self.by_entity.insert(entity, assignment)
             && previous.owner != assignment.owner
             && let Some(entities) = self.entities_by_owner.get_mut(&previous.owner)
@@ -141,7 +192,18 @@ impl UnitOperationRegistry {
             .insert(entity);
     }
 
-    pub(crate) fn release_entity(&mut self, entity: Entity) {
+    /// 作戦所属は残したまま現在の具体Squad bindingを外し、そのSquadIdを履歴へ移す。
+    pub(crate) fn apply_detach_squad(&mut self, _key: LedgerKey, entity: Entity) {
+        let Some(assignment) = self.by_entity.get_mut(&entity) else {
+            return;
+        };
+        if let Some(squad_id) = assignment.squad_id.take() {
+            self.previous_squads.insert(entity, squad_id);
+        }
+    }
+
+    pub(crate) fn apply_release_entity(&mut self, _key: LedgerKey, entity: Entity) {
+        self.previous_squads.remove(&entity);
         let Some(previous) = self.by_entity.remove(&entity) else {
             return;
         };
@@ -153,20 +215,22 @@ impl UnitOperationRegistry {
         }
     }
 
-    pub fn release_operation(&mut self, owner: OperationOwner) {
+    pub(crate) fn apply_release_operation(&mut self, _key: LedgerKey, owner: OperationOwner) {
         let Some(entities) = self.entities_by_owner.remove(&owner) else {
             return;
         };
         for entity in entities {
             self.by_entity.remove(&entity);
+            self.previous_squads.remove(&entity);
         }
     }
 
     /// 現在のportfolioにも永続deploymentにも含まれないcampaign予約を解放する。
     ///
     /// owner単位の逆引きだけを走査するため、盤面Entityや作戦ごとの全なめを行わない。
-    pub(crate) fn release_unclaimed_campaign_entities(
+    pub(crate) fn apply_release_unclaimed_campaign_entities(
         &mut self,
+        key: LedgerKey,
         player_id: PlayerId,
         claimed_entities: &HashSet<Entity>,
         protected_entities: &HashSet<Entity>,
@@ -189,11 +253,15 @@ impl UnitOperationRegistry {
             })
             .collect::<Vec<_>>();
         for entity in stale {
-            self.release_entity(entity);
+            self.apply_release_entity(key, entity);
         }
     }
 
-    pub(crate) fn retain_live_entities(&mut self, live_entities: &HashSet<Entity>) {
+    pub(crate) fn apply_retain_live_entities(
+        &mut self,
+        key: LedgerKey,
+        live_entities: &HashSet<Entity>,
+    ) {
         let stale = self
             .by_entity
             .keys()
@@ -201,8 +269,34 @@ impl UnitOperationRegistry {
             .copied()
             .collect::<Vec<_>>();
         for entity in stale {
-            self.release_entity(entity);
+            self.apply_release_entity(key, entity);
         }
+    }
+}
+
+/// テストの盤面組立て用。本番buildでは台帳の確定口（LedgerKey）を経由しない書込みはできない。
+#[cfg(test)]
+impl UnitOperationRegistry {
+    pub(crate) fn assign(&mut self, entity: Entity, assignment: UnitOperationAssignment) {
+        self.apply_assign(LedgerKey::fixture(), entity, assignment);
+    }
+
+    pub(crate) fn release_operation(&mut self, owner: OperationOwner) {
+        self.apply_release_operation(LedgerKey::fixture(), owner);
+    }
+
+    pub(crate) fn release_unclaimed_campaign_entities(
+        &mut self,
+        player_id: PlayerId,
+        claimed_entities: &HashSet<Entity>,
+        protected_entities: &HashSet<Entity>,
+    ) {
+        self.apply_release_unclaimed_campaign_entities(
+            LedgerKey::fixture(),
+            player_id,
+            claimed_entities,
+            protected_entities,
+        );
     }
 }
 
@@ -280,8 +374,8 @@ mod tests {
 
         registry.release_unclaimed_campaign_entities(
             player,
-            &HashSet::from([claimed]),
-            &HashSet::from([protected]),
+            &HashSet::from_iter([claimed]),
+            &HashSet::from_iter([protected]),
         );
 
         assert!(registry.assignment(claimed).is_some());
