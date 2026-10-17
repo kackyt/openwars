@@ -470,6 +470,42 @@ impl V4DeploymentRegistry {
         records
     }
 
+    /// 発行直前の検証で取り消した生産命令の発注意図と、その受入slot予約を解放する。
+    ///
+    /// 生産完了Eventの照合と同じ規則（手番・施設・兵種の最初の発注）で対象を選ぶ。
+    /// 取り消した命令に意図を残すと、同じ手番に同じ施設・兵種で完成したunitを
+    /// 誤って受け入れ、翌手番以降も受入slotの予約が残り続ける。
+    pub(crate) fn cancel_unissued_order(
+        &mut self,
+        player_id: PlayerId,
+        turn: u32,
+        facility: GridPosition,
+        unit_type: UnitType,
+    ) -> bool {
+        let Some(index) = self.pending.iter().position(|pending| {
+            pending.player_id == player_id
+                && pending.turn == turn
+                && pending.facility == facility
+                && pending.unit_type == unit_type
+        }) else {
+            return false;
+        };
+        let cancelled = self
+            .pending
+            .remove(index)
+            .expect("位置を確認したpending deploymentが存在する");
+        // 完成Entityを受け入れたslotは別の照合結果なので、未完成の予約だけを消す。
+        if let Some(slot) = cancelled.forming_slot
+            && self
+                .forming_slots
+                .get(&slot)
+                .is_some_and(|reservation| reservation.entity.is_none())
+        {
+            self.forming_slots.remove(&slot);
+        }
+        true
+    }
+
     /// 生産完了イベントと照合できていない発注数を返す。
     pub fn pending_count(&self, player_id: PlayerId) -> usize {
         self.pending
@@ -1246,6 +1282,87 @@ mod tests {
             let expected_slots = usize::from(reserves_slots);
             assert_eq!(registry.forming_slots.len(), expected_slots, "{path:?}");
         }
+    }
+
+    /// 発行直前の検証で取り消した命令は、その発注意図と未完成の受入slotだけを外す（D-5）。
+    /// 別player・別手番・別兵種の発注と、完成Entityを受け入れたslotは保持する。
+    #[test]
+    fn cancel_unissued_order_releases_only_the_matching_unproduced_reservation() {
+        let _guard = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
+        let mut registry = V4DeploymentRegistry::default();
+        let other_player = PendingDeployment {
+            player_id: PlayerId(2),
+            ..pending(1)
+        };
+        let other_type = PendingDeployment {
+            facility: GridPosition { x: 3, y: 4 },
+            unit_type: UnitType::Bomber,
+            ..pending(2)
+        };
+        registry.replace_turn_orders(PlayerId(1), 3, [pending(0), other_type]);
+        registry.replace_turn_orders(PlayerId(2), 3, [other_player]);
+        registry.replace_turn_orders(
+            PlayerId(1),
+            4,
+            [PendingDeployment {
+                turn: 4,
+                ..pending(3)
+            }],
+        );
+        let cancelled_slot = registry.pending[0].forming_slot.expect("予約slot");
+        assert_eq!(registry.forming_slots.len(), 4);
+
+        assert!(!registry.cancel_unissued_order(
+            PlayerId(1),
+            3,
+            GridPosition { x: 2, y: 4 },
+            UnitType::Bomber
+        ));
+        assert!(registry.cancel_unissued_order(
+            PlayerId(1),
+            3,
+            GridPosition { x: 2, y: 4 },
+            UnitType::Fighter
+        ));
+
+        assert!(!registry.forming_slots.contains_key(&cancelled_slot));
+        assert_eq!(registry.forming_slots.len(), 3);
+        assert_eq!(registry.pending_count(PlayerId(1)), 2);
+        assert_eq!(registry.pending_count(PlayerId(2)), 1);
+        assert!(registry.pending.iter().all(|pending| pending.order != 0));
+        // 照合済みの発注は再度取り消せない。
+        assert!(!registry.cancel_unissued_order(
+            PlayerId(1),
+            3,
+            GridPosition { x: 2, y: 4 },
+            UnitType::Fighter
+        ));
+    }
+
+    /// 完成Entityを記録済みのslotは、同じ施設・兵種の取消でも外さない。
+    #[test]
+    fn cancel_unissued_order_keeps_a_slot_that_already_received_an_entity() {
+        let _guard = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
+        let mut registry = V4DeploymentRegistry::default();
+        registry.replace_turn_orders(PlayerId(1), 3, [pending(0)]);
+        let slot = registry.pending[0].forming_slot.expect("予約slot");
+        registry
+            .forming_slots
+            .get_mut(&slot)
+            .expect("予約slot")
+            .entity = Some(Entity::from_raw(50));
+
+        assert!(registry.cancel_unissued_order(
+            PlayerId(1),
+            3,
+            GridPosition { x: 2, y: 4 },
+            UnitType::Fighter
+        ));
+
+        assert_eq!(
+            registry.forming_slots[&slot].entity,
+            Some(Entity::from_raw(50))
+        );
     }
 
     /// `pending` の発注と同じ施設(2,4)・兵種で完成した生産Eventを作る。

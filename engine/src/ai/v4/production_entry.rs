@@ -2,11 +2,15 @@
 
 use crate::ai::v4::*;
 
+#[cfg(test)]
+mod tests;
+
 /// 発行待ちの列から、発行直前の実盤面検証を通る1命令だけを返してIssuedへ進める。
 ///
 /// 計画後に資金・施設が変わって検証を通らない購入案は発行しない（未発行の取消）。
-/// 取り消した案の永続stepはPlannedのまま残り、次手番の継続判定が生産失敗として
-/// 扱って再計画する。発行した案だけがIssuedになり、完了イベントとの照合を待つ。
+/// 取り消した案の配備・占領意図は同じ手番に解放し、永続stepはPlannedのまま残して
+/// 次手番の継続判定が生産失敗として扱って再計画する。発行した案だけがIssuedになり、
+/// 完了イベントとの照合を待つ。
 pub(in crate::ai::v4) fn issue_next_planned_production(
     world: &mut World,
     turn: u32,
@@ -22,8 +26,9 @@ pub(in crate::ai::v4) fn issue_next_planned_production(
             .map(|planned| vec![planned.command])
             .unwrap_or_default();
     }
-    let (planned, _cancelled) =
+    let (planned, cancelled) =
         commit::next_issuable(world, turn, queue, |planned| &planned.command);
+    production_cancellation::release_cancelled_purchases(world, turn, &cancelled);
     let Some(planned) = planned else {
         return Vec::new();
     };
@@ -378,7 +383,7 @@ pub(in crate::ai::v4) fn decide_campaign_production_v4(
         let mut cache = world
             .remove_resource::<ProductionTurnState>()
             .unwrap_or_default();
-        let next = cache.take_issuable_campaign_command(world, player_id);
+        let next = take_campaign_command(world, &mut cache, player_id);
         let blocks_generic = cache.campaign_production_blocks_generic(player_id);
         let generic_budget = cache.campaign_production_generic_budget(player_id);
         world.insert_resource(cache);
@@ -469,7 +474,7 @@ pub(in crate::ai::v4) fn decide_campaign_production_v4(
         outcome.commands,
         generic_budget,
     );
-    let next = cache.take_issuable_campaign_command(world, player_id);
+    let next = take_campaign_command(world, &mut cache, player_id);
     let blocks_generic = cache.campaign_production_blocks_generic(player_id);
     let generic_budget = cache.campaign_production_generic_budget(player_id);
     world.insert_resource(cache);
@@ -485,6 +490,22 @@ pub(in crate::ai::v4) fn decide_campaign_production_v4(
         }
         None => CampaignProductionControl::Continue,
     }
+}
+
+/// campaign専用列から発行する命令を取り出し、取り消した命令の発注記録を同じ手番に解放する。
+fn take_campaign_command(
+    world: &mut World,
+    cache: &mut ProductionTurnState,
+    player_id: PlayerId,
+) -> Option<ProduceUnitCommand> {
+    let issue = cache.take_issuable_campaign_command(world, player_id);
+    production_cancellation::release_cancelled_campaign_commands(
+        world,
+        player_id,
+        issue.planned_turn,
+        &issue.cancelled,
+    );
+    issue.command
 }
 
 /// 生産施設から占領可能unitが対象へ自力到達できるかを判定する。

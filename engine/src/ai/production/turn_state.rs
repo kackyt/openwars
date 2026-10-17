@@ -3,6 +3,16 @@ use crate::components::PlayerId;
 use bevy_ecs::prelude::*;
 use std::collections::VecDeque;
 
+/// campaign専用列から取り出した結果。取り消した案の意図解放は版別の呼び出し側が行う。
+pub(crate) struct CampaignIssue {
+    /// 発行直前の検証を通った命令。
+    pub(crate) command: Option<crate::events::ProduceUnitCommand>,
+    /// 検証に失敗し、発行せずに列から外した命令。
+    pub(crate) cancelled: Vec<crate::events::ProduceUnitCommand>,
+    /// 列を計画した手番。取り消した命令の発注記録はこの手番で照合する。
+    pub(crate) planned_turn: u32,
+}
+
 #[derive(Resource, Default)]
 pub(crate) struct ProductionTurnState {
     player_id: Option<PlayerId>,
@@ -14,29 +24,35 @@ pub(crate) struct ProductionTurnState {
     production_batch_planned: bool,
 }
 impl ProductionTurnState {
-    /// 発行する案だけを取り出す。取り消しは共通の監査へ記録する。
+    /// 発行する案を取り出す。取り消しは共通の監査へ記録し、取り消した案も返す。
     pub(crate) fn take_issuable_campaign_command(
         &mut self,
         world: &mut World,
         player_id: PlayerId,
-    ) -> Option<crate::events::ProduceUnitCommand> {
+    ) -> CampaignIssue {
+        let mut issue = CampaignIssue {
+            command: None,
+            cancelled: Vec::new(),
+            planned_turn: self.planned_turn,
+        };
         if self.player_id != Some(player_id) {
-            return None;
+            return issue;
         }
         // 終局後も旧来の購入試行ログを残す。発行入口が検証し、監査だけを記録する。
         if world
             .get_resource::<crate::resources::MatchState>()
             .is_some_and(|state| state.game_over.is_some())
         {
-            return self.campaign_production_commands.pop_front();
+            issue.command = self.campaign_production_commands.pop_front();
+            return issue;
         }
-        crate::ai::production::commit::next_issuable(
+        (issue.command, issue.cancelled) = crate::ai::production::commit::next_issuable(
             world,
             self.planned_turn,
             &mut self.campaign_production_commands,
             |command| command,
-        )
-        .0
+        );
+        issue
     }
 
     #[cfg(test)]
@@ -115,7 +131,7 @@ impl ProductionTurnState {
     }
 }
 
-/// campaign専用列も汎用生産と同じ発行検証を通す。取消意図の解放は後続段階で扱う。
+/// campaign専用列も汎用生産と同じ発行検証を通す。取消意図の解放は版別の呼び出し側が行う。
 #[cfg(test)]
 pub(crate) fn next_campaign_command(
     world: &mut World,
@@ -124,7 +140,7 @@ pub(crate) fn next_campaign_command(
     let mut state = world
         .remove_resource::<ProductionTurnState>()
         .unwrap_or_default();
-    let command = state.take_issuable_campaign_command(world, player_id);
+    let issue = state.take_issuable_campaign_command(world, player_id);
     world.insert_resource(state);
-    command
+    issue.command
 }

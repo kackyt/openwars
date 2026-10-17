@@ -187,6 +187,26 @@ impl V4CampaignExecutionRegistry {
         }
     }
 
+    /// 発行直前の検証で取り消した命令の、未発行（Planned）の発注記録を解放する。
+    ///
+    /// 発行していない命令は生産遅延でも作戦の待機でもないため、Delayedへ繰り越さず
+    /// 記録ごと取り除く。発行済み・完成済みの記録は照合結果なので対象にしない。
+    pub(crate) fn cancel_unissued(
+        &mut self,
+        player_id: PlayerId,
+        turn: u32,
+        command: &ProduceUnitCommand,
+    ) -> bool {
+        let Some(index) = self.records.iter().position(|record| {
+            record.matches_open_command(player_id, turn, command)
+                && record.status == CampaignProductionStatus::Planned
+        }) else {
+            return false;
+        };
+        self.records.remove(index);
+        true
+    }
+
     fn assign_produced(&mut self, event: &UnitProducedEvent, turn: u32) {
         // 一度照合したEntityの完成Eventは再消費しない。再計画後に同じ施設・兵種へ
         // 後続発注があっても、古い完成Eventをその発注へ誤接続してはならない。
@@ -496,6 +516,48 @@ mod tests {
             unit_type: UnitType::Infantry,
             entity,
         }
+    }
+
+    /// 発行直前に取り消した命令は、同じplayer・手番の未発行記録だけを外す（D-5）。
+    /// 発行済み・別player・別手番の記録は照合結果や他作戦の所有なので残す。
+    #[test]
+    fn cancel_unissued_removes_only_the_matching_planned_record() {
+        let player = PlayerId(1);
+        let other = PlayerId(2);
+        let mut registry = V4CampaignExecutionRegistry::default();
+        registry.replace_turn_intents(
+            player,
+            2,
+            &[capture_intent(player, IslandId(3))],
+            CampaignFormingReservation::Immediate,
+        );
+        registry.replace_turn_intents(
+            other,
+            2,
+            &[capture_intent(other, IslandId(3))],
+            CampaignFormingReservation::Immediate,
+        );
+        let command = capture_intent(player, IslandId(3)).command;
+
+        assert!(!registry.cancel_unissued(player, 1, &command));
+        registry.mark_issued(player, 2, &command);
+        assert!(
+            !registry.cancel_unissued(player, 2, &command),
+            "発行済みの記録は取り消さない"
+        );
+        assert_eq!(registry.records_for(player, IslandId(3)).len(), 1);
+
+        registry.replace_turn_intents(
+            player,
+            3,
+            &[capture_intent(player, IslandId(3))],
+            CampaignFormingReservation::Immediate,
+        );
+        assert!(registry.cancel_unissued(player, 3, &command));
+        let remaining = registry.records_for(player, IslandId(3));
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].planned_turn, 2);
+        assert_eq!(registry.records_for(other, IslandId(3)).len(), 1);
     }
 
     /// 同一対局の通常・拡張プレイヤーの発注は、イベント処理時の経路に関係なく

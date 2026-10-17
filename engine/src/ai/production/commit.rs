@@ -467,6 +467,7 @@ mod tests {
         state.set_campaign_production_plan(PlayerId(1), 1, vec![cmd.clone()], true);
         let attempt = state
             .take_issuable_campaign_command(&mut world, PlayerId(1))
+            .command
             .unwrap();
         assert_eq!(
             issue_production_command(&mut world, attempt),
@@ -475,6 +476,7 @@ mod tests {
         assert!(
             state
                 .take_issuable_campaign_command(&mut world, PlayerId(1))
+                .command
                 .is_none()
         );
         assert!(world.resource::<Events<ProduceUnitCommand>>().is_empty());

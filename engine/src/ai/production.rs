@@ -832,7 +832,9 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
         let mut cache = world
             .remove_resource::<ProductionTurnState>()
             .unwrap_or_default();
-        let next_command = cache.take_issuable_campaign_command(world, player_id);
+        let next_command = cache
+            .take_issuable_campaign_command(world, player_id)
+            .command;
         let blocks_generic = cache.campaign_production_blocks_generic(player_id);
         world.insert_resource(cache);
         if let Some(command) = next_command {
@@ -1212,7 +1214,9 @@ pub fn decide_production(world: &mut World, player_id: PlayerId) -> Vec<ProduceU
             let mut cache = world
                 .remove_resource::<ProductionTurnState>()
                 .unwrap_or_default();
-            let next_command = cache.take_issuable_campaign_command(world, player_id);
+            let next_command = cache
+                .take_issuable_campaign_command(world, player_id)
+                .command;
             let blocks_generic = cache.campaign_production_blocks_generic(player_id);
             let generic_budget = cache.campaign_production_generic_budget(player_id);
             world.insert_resource(cache);

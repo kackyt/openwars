@@ -26,6 +26,7 @@ pub mod operation;
 mod operation_builder;
 mod operation_selection;
 pub mod plan_revision;
+mod production_cancellation;
 mod production_entry;
 pub(crate) mod production_events;
 mod production_finalize;
