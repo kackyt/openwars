@@ -201,7 +201,8 @@ th,td{padding:12px;border-bottom:1px solid var(--line);text-align:left;vertical-
 <dt>実績</dt><dd>7個の <code>extended.rs</code> と一時無効化APIを撤去。合同探索686行、戦闘占領simulation489行、比較器364行、Roadmap実績観測510行を責務別の段へ分割。親の実装を巨大な <code>mod.rs</code> へ統合していない。Rustテスト982件、Clippy・WASM・fmt、Python48件を確認。移動・段分割・スイッチ撤去をそれぞれ固定バイナリと全履歴本文で照合している。過去の検証記録 <code>ai-redesign-v3-stage6-validation.json</code> は現作業ツリーで実在を確認できない（下記追補を参照）。</dd>
 <dt>6a追補</dt><dd>2026-10-17：通常・小規模の資源pool観測を <code>island_campaign_analysis/resource_pool.rs</code> に配置し、所属索引・輸送とcargoの利用可能性・到達性・候補構築・整列へ段分割した（区分R）。両入口と小規模固有の除外理由・診断は分離したまま、同一の低位判定だけを共用する。通常入口148→43行、小規模入口177→51行。抽出helperを含む対象全体の最大直接CCは32→14、最大直接認知は31→9。全AIの最大/P95は不変。直接回帰8件を追加し、全Rustテスト990件成功（既存ignore 2件）、Clippy・WASM・fmt、Python41件と比較器6件を確認。基準・本文移動・段分割の3固定バイナリで各28条件50T（jobs=8）を実行し、基準↔移動・基準↔分割・移動↔分割のすべてで全 <code>action_history</code> 本文・勝敗・終了turnが28/28一致した。今回の実在する証跡は <a href="ai-redesign-v3-stage6a-pool-validation.json">pool追補の検証記録</a> に分離した。上記の過去記録が参照する <code>ai-redesign-v3-stage6-validation.json</code> は着手時に実在を確認できず、過去実績の原証跡を今回照合できたとは扱わない。</dd>
 <dt>6a追補2</dt><dd>2026-10-17：物件レース合同探索の役割多重集合生成 <code>generate_role_multisets</code>（270行）を、役割諸元の観測・子候補生成・段展開・ビーム縮約・サイズ段ループへ分解した（区分R）。環境変数で有効になる縮約診断は <code>search_diagnostics.rs</code> の <code>MultisetBeamAudit</code> へ移し、出力文字列と出力時点を維持した。入口は270→38行、直接CC 20→6、直接認知47→7。ファイル内最大は直接CC10・認知7。全AIの最大/P95は不変。分割前に直接テスト4件（手計算3件、縮約時2,446件の全順序指紋1件）を固定した。全Rustテスト994件成功（既存ignore 2件）、Clippy・WASM・fmt成功。基準・分割の2固定バイナリで28条件50T（jobs=8）の全 <code>action_history</code> 本文・勝敗・終了turnが28/28一致し、診断有効時の診断行774行も逐語一致した。間接候補全滅時の詳細行だけは実行で未到達。記録は <a href="ai-redesign-v3-stage6a-roles-validation.json">役割探索追補の検証記録</a>。</dd>
-<dt>残課題</dt><dd>移動のみの通常パッケージ探索・既存診断等には複雑度目安を超える関数が残る。すべての巨大関数や全AIの最大複雑度を解消したとは扱わない。6b①は既存の観測限定実装を確認済み。6b②D-5は未実装、③占有モデルと④兵種バランスは未評価で、新たな戦略変更は未採用。12seed以上の最終非劣後評価と性能のA/A校正・最大メモリ比較も未実施。</dd>
+<dt>6a追補3</dt><dd>2026-10-17：通常パッケージ探索 <code>plan_force_package</code>（206行）を、枠ごとの劣後除去・枠の展開・層の並列評価と最良案3種の更新（<code>BestPlans</code>）・beam縮約・最終整形へ分解した（区分R）。入口は206→40行、直接CC 25→5、直接認知48→3。新設関数はすべて直接CC5以下・認知5以下。全AIの最大/P95は不変。前倒し成功時に直後で上書きされていた死んだ代入2つだけを削除した。分割前に計画結果全体の指紋テスト5件（標準・妨害優先・小規模順位・早期return・実行不能補完）を固定した。全Rustテスト999件成功（既存ignore 2件）、Clippy・WASM・fmt成功。基準・分割の28条件50T（jobs=8）で全 <code>action_history</code> 本文・勝敗・終了turnが28/28一致。記録は <a href="ai-redesign-v3-stage6a-package-validation.json">通常パッケージ探索追補の検証記録</a>。</dd>
+<dt>残課題</dt><dd>既存診断（<code>report_frontier_witness_simulation</code>・<code>report_indirect_gate_audit</code> 等）には複雑度目安を超える関数が残る。すべての巨大関数や全AIの最大複雑度を解消したとは扱わない。6b①は既存の観測限定実装を確認済み。6b②D-5は未実装、③占有モデルと④兵種バランスは未評価で、新たな戦略変更は未採用。12seed以上の最終非劣後評価と性能のA/A校正・最大メモリ比較も未実施。</dd>
 <dt>完了条件</dt><dd>コードベースから経路名ファイル（<code>extended.rs</code>）が消え、すべてのモジュールが責務名を持ち、各Sの採用/棄却の根拠が記録されている。段階6全体の完了には上記の残課題と個別評価を区別して閉じる必要がある。</dd>
 </dl>
 </article>
@@ -322,7 +323,7 @@ python scripts/measure_ai_complexity.py --root engine/src/ai --output &lt;段階
 </section>
 
 <footer>
-<p>2026-10-11：ゼロベース再設計の計画を保存。2026-10-16：段階1〜3bの完了実績を反映し、<code>v4/extended.rs</code> 解体と生産パイプライン統合を段階4〜6として統合。同日：段階4を完了し、次着手を段階5へ更新。同日：段階5を完了し、次着手を段階6aへ更新。2026-10-17：段階6aの資源pool観測を責務分解し、今回の検証記録と未完了項目を分離。同日：役割多重集合探索を責務分解。</p>
+<p>2026-10-11：ゼロベース再設計の計画を保存。2026-10-16：段階1〜3bの完了実績を反映し、<code>v4/extended.rs</code> 解体と生産パイプライン統合を段階4〜6として統合。同日：段階4を完了し、次着手を段階5へ更新。同日：段階5を完了し、次着手を段階6aへ更新。2026-10-17：段階6aの資源pool観測を責務分解し、今回の検証記録と未完了項目を分離。同日：役割多重集合探索を責務分解。同日：通常パッケージ探索を責務分解。</p>
 <p><a href="ai-redesign-v3-proposal.md">v3提案書</a> ／ <a href="ai-redesign-v3-stage1.md">段階1</a> ／ <a href="ai-redesign-v3-stage2.md">段階2</a> ／ <a href="ai-redesign-v3-stage3.md">段階3</a> ／ <a href="ai-redesign-v3-stage3b.md">段階3b</a> ／ <a href="ai-redesign-v3-stage4.md">段階4</a> ／ <a href="ai-redesign-v3-stage5.md">段階5</a> ／ <a href="#stages">現行の段階計画</a></p>
 </footer>
 </main>
