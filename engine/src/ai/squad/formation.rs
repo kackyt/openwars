@@ -429,6 +429,17 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
     policy.before_manager_removal(world, player, is_v4);
     let mut manager = world.remove_resource::<SquadManager>().unwrap_or_default();
     prepare_squads_for_replanning(world, &mut manager, player, is_v4);
+    // 達成済みの生産任務は分析前に引き渡す。同じ編成回のcampaignで次の役割を与える。
+    let mut caches = FormationCaches::default();
+    if is_v4 {
+        crate::ai::v4::deployment::release_completed_deployments(
+            world,
+            &mut manager,
+            player,
+            policy.secured_anchor_rule(),
+            &mut caches.connectivity,
+        );
+    }
     // 盤面（unit・物件・地図）は再編の間に変わらないため、戦略分析と汎用編成で1つを共有する。
     let snapshot = PlayerBoard::observe(world, player);
 
@@ -438,8 +449,7 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
         policy.adopt_portfolio(world, player, &manager, &analysis.campaign_portfolio, is_v4);
     let enemy_clusters = detect_enemy_clusters(world, player);
 
-    // 地形連結cacheは地図と移動種別だけで決まるため、campaign編成・配備・汎用編成で共有する。
-    let mut caches = FormationCaches::default();
+    // 地形連結cacheは、達成済み任務の解除・campaign編成・配備・汎用編成で共有する。
 
     // 3. campaign編成
     let mut campaign = form_campaign_squads(

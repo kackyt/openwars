@@ -753,6 +753,7 @@ pub(crate) struct ActiveDeploymentIntent {
     pub priority_enemies: Vec<Entity>,
     pub threat_horizon: u32,
     pub posture: super::deployment::DeploymentPosture,
+    pub continuity: super::deployment::DeploymentContinuity,
 }
 
 /// 選択された実行計画と、永続台帳上の識別情報。
@@ -891,6 +892,7 @@ impl V4RollingPlanRegistry {
         player_id: PlayerId,
         capital_assault_authorized: bool,
         capital_staging_anchor: Option<GridPosition>,
+        continuity: super::deployment::DeploymentContinuity,
     ) -> Vec<ActiveDeploymentIntent> {
         self.active
             .iter()
@@ -921,6 +923,15 @@ impl V4RollingPlanRegistry {
                         .saturating_sub(plan.last_evaluated_turn)
                         .max(1),
                     posture,
+                    // 出撃が許可されていない首都作戦へ、完了済み配備を再接続しない。
+                    // 編成待ちの判定は上のpostureで独立して適用する。
+                    continuity: if plan.kind != OperationKind::AssaultCapital
+                        || capital_assault_authorized
+                    {
+                        continuity
+                    } else {
+                        super::deployment::DeploymentContinuity::FollowPlan
+                    },
                 }
             })
             .collect()
@@ -2812,7 +2823,12 @@ mod tests {
         assert!(selected.plan_id.is_some());
         assert_eq!(registry.reserved_purchase_cost(player), 7_500);
         let intent = registry
-            .active_deployment_intents(player, true, Some(GridPosition { x: 2, y: 2 }))
+            .active_deployment_intents(
+                player,
+                true,
+                Some(GridPosition { x: 2, y: 2 }),
+                super::super::deployment::DeploymentContinuity::FollowPlan,
+            )
             .pop()
             .unwrap();
         assert_eq!(
@@ -2820,6 +2836,25 @@ mod tests {
             super::super::deployment::DeploymentPosture::Forming
         );
         assert_eq!(intent.staging_anchor, GridPosition { x: 2, y: 2 });
+
+        // 前進継続を要求しても、首都出撃の許可がなければ既存部隊も集結へ戻す。
+        let unauthorized = registry
+            .active_deployment_intents(
+                player,
+                false,
+                Some(GridPosition { x: 2, y: 2 }),
+                super::super::deployment::DeploymentContinuity::Advance,
+            )
+            .pop()
+            .unwrap();
+        assert_eq!(
+            unauthorized.posture,
+            super::super::deployment::DeploymentPosture::Forming
+        );
+        assert_eq!(
+            unauthorized.continuity,
+            super::super::deployment::DeploymentContinuity::FollowPlan
+        );
     }
 
     #[test]
@@ -2858,7 +2893,12 @@ mod tests {
         assert!(selected.plan_id.is_some());
         assert_eq!(registry.reserved_purchase_cost(player), 7_500);
         let intent = registry
-            .active_deployment_intents(player, false, None)
+            .active_deployment_intents(
+                player,
+                false,
+                None,
+                super::super::deployment::DeploymentContinuity::FollowPlan,
+            )
             .pop()
             .unwrap();
         assert_eq!(

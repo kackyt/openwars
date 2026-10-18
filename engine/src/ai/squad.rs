@@ -10613,6 +10613,63 @@ mod tests {
         assert!(capture.plan.departure_authorized);
     }
 
+    /// 達成済み配備を分析前に解放すると、同じ再編で次の占領作戦へ採用される。
+    #[test]
+    fn completed_deployment_joins_the_next_campaign_in_the_same_replanning() {
+        let _path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
+        let (mut world, player, _, escort) = local_capture_race_world();
+        let enemies = world
+            .query::<(Entity, &Faction)>()
+            .iter(&world)
+            .filter(|(_, faction)| faction.0 != player)
+            .map(|(entity, _)| entity)
+            .collect::<Vec<_>>();
+        // 旧anchorの1手番圏から外し、次の占領施設の近傍には敵を残す。
+        // 敵が全くいない盤面ではcampaignに戦闘枠の需要がなく、再配属の検証にならない。
+        for enemy in enemies {
+            *world.get_mut::<GridPosition>(enemy).unwrap() = GridPosition { x: 4, y: 0 };
+        }
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::City, Some(player), 100),
+        ));
+        let mut deployments = crate::ai::v4::deployment::V4DeploymentRegistry::default();
+        deployments.assign_target_for_test(player, escort, escort);
+        world.insert_resource(deployments);
+
+        plan_squads(&mut world, player);
+
+        let registry = world.resource::<crate::ai::v4::deployment::V4DeploymentRegistry>();
+        assert!(!registry.active_entities(player).contains(&escort));
+        assert!(
+            registry
+                .audit_records(player)
+                .iter()
+                .any(|record| record.entity == escort && record.completed)
+        );
+        let manager = world.resource::<SquadManager>();
+        let squads = manager
+            .squads
+            .iter()
+            .filter(|squad| squad.members.contains(&escort))
+            .collect::<Vec<_>>();
+        assert_eq!(squads.len(), 1, "引渡し後の二重所属を作らない");
+        assert_eq!(squads[0].plan.mission_type, MissionType::Defense);
+        assert_eq!(
+            squads[0].plan.target,
+            Some(GridPosition { x: 3, y: 0 }),
+            "Defenseでも旧anchorではなく次の占領施設の護衛へ前進する"
+        );
+        let diagnostics = world.resource::<crate::ai::island_campaign::IslandCampaignDiagnostics>();
+        assert!(
+            diagnostics.by_player[&player]
+                .active_offensives
+                .iter()
+                .any(|assignment| assignment.combat_entities.contains(&escort)),
+            "汎用編成だけに流さず、この回のcampaignに再配分する"
+        );
+    }
+
     /// 敵へ到達できない戦闘memberは、現在地で待たずに前進先の施設の防御へ向かう。
     /// 前進先が無いときだけ、従来どおり現在地で防御する。
     #[test]

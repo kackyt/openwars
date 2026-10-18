@@ -28,6 +28,13 @@ impl ProductionPolicy {
             Self::Standard
         }
     }
+    /// 標準経路は完了任務から後続任務へ引き渡す。小規模は既存のDAG編成契約を維持する。
+    pub(in crate::ai::v4) fn deployment_continuity(self) -> deployment::DeploymentContinuity {
+        match self {
+            Self::Standard => deployment::DeploymentContinuity::Advance,
+            Self::SmallMap => deployment::DeploymentContinuity::FollowPlan,
+        }
+    }
     pub(in crate::ai::v4) fn allocates_surplus(self) -> bool {
         self == Self::SmallMap
     }

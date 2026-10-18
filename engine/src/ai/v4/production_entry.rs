@@ -104,6 +104,7 @@ pub(in crate::ai::v4) fn commit_turn_production(
         player_id,
         scan.capital_assault_authorized,
         scan.capital_staging_anchor,
+        ProductionPolicy::for_current_path().deployment_continuity(),
     );
     world.insert_resource(rolling_registry);
 

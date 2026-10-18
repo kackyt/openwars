@@ -23,6 +23,13 @@ use crate::resources::{DamageChart, Map, MatchState, UnitType, master_data::Mast
 use bevy_ecs::event::EventReader;
 use bevy_ecs::prelude::*;
 use std::collections::VecDeque;
+/// 完了した目的から、同じPlanの後続目的への引き渡しを許可する方策。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeploymentContinuity {
+    FollowPlan,
+    Advance,
+}
+
 /// 生産済み戦力を作戦地点へ投入するか、編成完了まで集結させるか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeploymentPosture {
@@ -110,6 +117,7 @@ pub struct DeploymentAuditRecord {
     pub squad_id: Option<SquadId>,
     pub current_target: Option<Entity>,
     pub active: bool,
+    pub completed: bool,
     pub assigned_turn: u32,
     pub attack_count: u32,
     pub priority_attack_count: u32,
@@ -190,6 +198,8 @@ struct FormingSquadReservation {
 pub struct V4DeploymentRegistry {
     pending: VecDeque<PendingDeployment>,
     assigned: HashMap<Entity, AssignedDeployment>,
+    /// 目的達成後にcampaignへ引き渡したEntity。一時休止と区別し、旧Plan同期で奪い返さない。
+    completed: HashSet<Entity>,
     forming_slots: HashMap<FormingSquadSlotId, FormingSquadReservation>,
     next_forming_slot: u64,
 }
@@ -260,6 +270,7 @@ impl V4DeploymentRegistry {
             .remove(index)
             .expect("照合済みpending deploymentが存在する");
         let forming_slot = intent.forming_slot;
+        self.completed.remove(&event.entity);
         self.assigned.insert(
             event.entity,
             AssignedDeployment {
@@ -445,6 +456,7 @@ impl V4DeploymentRegistry {
                 squad_id: deployment.squad_id,
                 current_target: deployment.current_target,
                 active: deployment.active,
+                completed: self.completed.contains(&deployment.entity),
                 assigned_turn: deployment.assigned_turn,
                 attack_count: deployment.attack_count,
                 priority_attack_count: deployment.priority_attack_count,
@@ -574,8 +586,20 @@ impl V4DeploymentRegistry {
             let Some(intent) = by_plan.get(&step.plan_id) else {
                 continue;
             };
+            if self.completed.contains(&deployment.entity) {
+                // 完了は旧anchorの任務に対するもの。採用済みPlanが別の目的を提示したら
+                // その後続任務へ引き渡す。同じ目的の同期だけでは再拘束しない。
+                if intent.continuity != DeploymentContinuity::Advance
+                    || deployment.intent.anchor == intent.anchor
+                {
+                    continue;
+                }
+                self.completed.remove(&deployment.entity);
+            }
             deployment.intent.anchor = intent.anchor;
             deployment.intent.staging_anchor = intent.staging_anchor;
+            // 旧目的でのExecuteは、後続作戦の初回出撃が許可済みであることを意味しない。
+            // 後続目的への接続と編成完了の判定を分離し、最新Planの待機条件を尊重する。
             deployment.intent.posture = intent.posture;
             deployment.intent.priority_enemies = intent.priority_enemies.clone();
             deployment.intent.threat_horizon = intent.threat_horizon;
@@ -1054,7 +1078,7 @@ fn resolve_target(
 /// 留まると、次手番のPlan更新まで確保済みの拠点で戦力が止まる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SecuredAnchorRule {
-    /// free poolへ返し、次の拠点へ向かう編成に委ねる（次手番のPlan更新で次anchorへ復帰する）。
+    /// 達成済み任務を終了し、次の拠点へ向かうcampaign編成へ引き渡す。
     /// 標準マップでは確保済み拠点での滞留を解き、進軍と決着を早める。
     Release,
     /// anchorで待ち受け続ける。小規模マップでは解放した戦力が汎用編成へ流れ、
@@ -1090,6 +1114,82 @@ fn anchor_secured(
         .plan_step
         .is_none_or(|step| !defense_plans.contains(&step.plan_id))
         && target_resolution::anchor_is_owned_by(world, intent.anchor, intent.player_id)
+}
+
+/// 手番開始のcampaign分析より前に、達成済みの配備だけを次の任務へ引き渡す。
+/// 小規模のHold方策は既存の編成順と復帰契約を維持する。
+pub(crate) fn release_completed_deployments(
+    world: &mut World,
+    manager: &mut SquadManager,
+    player_id: PlayerId,
+    rule: SecuredAnchorRule,
+    connectivity: &mut TerrainConnectivity,
+) {
+    if !rule.releases(|| true) {
+        return;
+    }
+    let mut registry = world
+        .remove_resource::<V4DeploymentRegistry>()
+        .unwrap_or_default();
+    let defense_plans = world
+        .get_resource::<super::plan_revision::V4RollingPlanRegistry>()
+        .map(|plans| plans.defense_plan_ids(player_id))
+        .unwrap_or_default();
+    let mut candidates = registry
+        .assigned
+        .values()
+        .filter(|deployment| deployment.active && deployment.intent.player_id == player_id)
+        .filter(|deployment| completed_anchor_objective(world, deployment, rule, &defense_plans))
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|deployment| deployment.entity.to_bits());
+    for deployment in candidates {
+        // 交戦中の部隊は解放しない。占領枠は既存と同じく所有権の確保で完了する。
+        if deployment.intent.slot_kind == SlotKind::Capture
+            || resolve_target(world, connectivity, &deployment).is_none()
+        {
+            release_deployment(
+                &mut registry,
+                manager,
+                deployment.entity,
+                deployment.squad_id,
+                true,
+            );
+        }
+    }
+    world.insert_resource(registry);
+}
+
+/// 占領目的を達成したか。防衛Planや編成待ちは所有済みでも完了させない。
+fn completed_anchor_objective(
+    world: &World,
+    deployment: &AssignedDeployment,
+    rule: SecuredAnchorRule,
+    defense_plans: &HashSet<PlanId>,
+) -> bool {
+    deployment.intent.posture == DeploymentPosture::Execute
+        && rule.releases(|| anchor_secured(world, &deployment.intent, defense_plans))
+}
+
+/// 配備台帳と旧Squadを一緒に解放し、達成による引渡しだけを終端状態として残す。
+fn release_deployment(
+    registry: &mut V4DeploymentRegistry,
+    manager: &mut SquadManager,
+    entity: Entity,
+    squad_id: Option<SquadId>,
+    completed: bool,
+) {
+    if let Some(deployment) = registry.assigned.get_mut(&entity) {
+        deployment.active = false;
+        deployment.squad_id = None;
+        deployment.current_target = None;
+    }
+    if completed {
+        registry.completed.insert(entity);
+    }
+    if let Some(squad_id) = squad_id {
+        OperationLedger::squad_list(manager).retain(|squad| squad.id != squad_id);
+    }
 }
 
 /// 生産済みEntityを汎用free poolより先にV4局地Attack任務へ予約する。
@@ -1153,7 +1253,7 @@ pub(crate) fn prepare_deployment_squads_with_connectivity(
             continue;
         };
         if world.get_entity(entity).is_err() {
-            releases.push((entity, snapshot.squad_id));
+            releases.push((entity, snapshot.squad_id, false));
             continue;
         }
         if higher_priority_reserved.contains(&entity) {
@@ -1172,7 +1272,16 @@ pub(crate) fn prepare_deployment_squads_with_connectivity(
                 // anchor物件が既に自軍所有なら占領任務は達成済み。任務を出し続けると
                 // 占領役が物件上に留まり続け、生産マス前の通路を塞ぐため解放する。
                 if target_resolution::anchor_is_owned_by(world, snapshot.intent.anchor, player_id) {
-                    releases.push((entity, snapshot.squad_id));
+                    releases.push((
+                        entity,
+                        snapshot.squad_id,
+                        completed_anchor_objective(
+                            world,
+                            &snapshot,
+                            secured_anchor_rule,
+                            &defense_plans,
+                        ),
+                    ));
                     continue;
                 }
                 (None, snapshot.intent.anchor, MissionType::Capture)
@@ -1212,7 +1321,16 @@ pub(crate) fn prepare_deployment_squads_with_connectivity(
                         (None, snapshot.intent.anchor, MissionType::Defense)
                     }
                     None => {
-                        releases.push((entity, snapshot.squad_id));
+                        releases.push((
+                            entity,
+                            snapshot.squad_id,
+                            completed_anchor_objective(
+                                world,
+                                &snapshot,
+                                secured_anchor_rule,
+                                &defense_plans,
+                            ),
+                        ));
                         continue;
                     }
                 }
@@ -1272,15 +1390,8 @@ pub(crate) fn prepare_deployment_squads_with_connectivity(
         reserved.insert(entity);
     }
 
-    for (entity, squad_id) in releases {
-        if let Some(deployment) = registry.assigned.get_mut(&entity) {
-            deployment.active = false;
-            deployment.squad_id = None;
-            deployment.current_target = None;
-        }
-        if let Some(squad_id) = squad_id {
-            OperationLedger::squad_list(manager).retain(|squad| squad.id != squad_id);
-        }
+    for (entity, squad_id, completed) in releases {
+        release_deployment(&mut registry, manager, entity, squad_id, completed);
     }
     world.insert_resource(registry);
     reserved
@@ -2152,6 +2263,338 @@ mod tests {
                 .iter()
                 .all(|squad| !squad.members.contains(&attacker))
         );
+    }
+
+    /// 分析前の引渡しは確保済み・非交戦のExecute配備だけを対象にする。
+    #[test]
+    fn completed_deployments_are_released_before_campaign_analysis() {
+        let (mut world, attacker, priority, transport, capture) = deployment_world();
+        let anchor = GridPosition { x: 5, y: 0 };
+        let property = world
+            .spawn((anchor, Property::new(Terrain::City, None, 20)))
+            .id();
+        world
+            .resource_mut::<V4DeploymentRegistry>()
+            .assigned
+            .get_mut(&attacker)
+            .unwrap()
+            .intent
+            .plan_step = Some(plan_step(1));
+        let mut manager = SquadManager::default();
+        let mut connectivity = TerrainConnectivity::default();
+        // 未占領の護衛は敵を排除しても保持する。
+        for enemy in [priority, transport, capture] {
+            world.despawn(enemy);
+        }
+        prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::default());
+        release_completed_deployments(
+            &mut world,
+            &mut manager,
+            PlayerId(1),
+            SecuredAnchorRule::Release,
+            &mut connectivity,
+        );
+        assert!(
+            world
+                .resource::<V4DeploymentRegistry>()
+                .active_entities(PlayerId(1))
+                .contains(&attacker)
+        );
+        world.get_mut::<Property>(property).unwrap().owner_id = Some(PlayerId(1));
+        // Hold方策とFormingでは確保後も編成予約を維持する。
+        release_completed_deployments(
+            &mut world,
+            &mut manager,
+            PlayerId(1),
+            SecuredAnchorRule::Hold,
+            &mut connectivity,
+        );
+        assert!(
+            world
+                .resource::<V4DeploymentRegistry>()
+                .active_entities(PlayerId(1))
+                .contains(&attacker)
+        );
+        world
+            .resource_mut::<V4DeploymentRegistry>()
+            .assigned
+            .get_mut(&attacker)
+            .unwrap()
+            .intent
+            .posture = DeploymentPosture::Forming;
+        release_completed_deployments(
+            &mut world,
+            &mut manager,
+            PlayerId(1),
+            SecuredAnchorRule::Release,
+            &mut connectivity,
+        );
+        assert!(
+            world
+                .resource::<V4DeploymentRegistry>()
+                .active_entities(PlayerId(1))
+                .contains(&attacker)
+        );
+        world
+            .resource_mut::<V4DeploymentRegistry>()
+            .assigned
+            .get_mut(&attacker)
+            .unwrap()
+            .intent
+            .posture = DeploymentPosture::Execute;
+        release_completed_deployments(
+            &mut world,
+            &mut manager,
+            PlayerId(1),
+            SecuredAnchorRule::Release,
+            &mut connectivity,
+        );
+        assert!(
+            !world
+                .resource::<V4DeploymentRegistry>()
+                .active_entities(PlayerId(1))
+                .contains(&attacker)
+        );
+        assert!(
+            manager
+                .squads
+                .iter()
+                .all(|squad| !squad.members.contains(&attacker)),
+            "旧Squad参照を残さず次作戦の候補へ戻す"
+        );
+        assert!(
+            world
+                .resource::<V4DeploymentRegistry>()
+                .audit_records(PlayerId(1))[0]
+                .completed
+        );
+    }
+
+    #[test]
+    fn engaged_deployment_is_not_released_at_an_owned_anchor() {
+        let (mut world, attacker, _, _, _) = deployment_world();
+        world.spawn((
+            GridPosition { x: 5, y: 0 },
+            Property::new(Terrain::City, Some(PlayerId(1)), 20),
+        ));
+        let mut manager = SquadManager::default();
+        release_completed_deployments(
+            &mut world,
+            &mut manager,
+            PlayerId(1),
+            SecuredAnchorRule::Release,
+            &mut TerrainConnectivity::default(),
+        );
+        assert!(
+            world
+                .resource::<V4DeploymentRegistry>()
+                .active_entities(PlayerId(1))
+                .contains(&attacker)
+        );
+    }
+
+    /// 一時休止と正常なanchor更新には、これまでどおり同期を適用する。
+    #[test]
+    fn dormant_deployment_can_resume_with_a_new_plan_intent() {
+        let (mut world, attacker, priority, _, _) = deployment_world();
+        {
+            let mut registry = world.resource_mut::<V4DeploymentRegistry>();
+            let deployment = registry.assigned.get_mut(&attacker).unwrap();
+            deployment.active = false;
+            deployment.intent.plan_step = Some(plan_step(1));
+        }
+        let anchor = GridPosition { x: 6, y: 0 };
+        world
+            .resource_mut::<V4DeploymentRegistry>()
+            .refresh_plan_intents(&[ActiveDeploymentIntent {
+                plan_id: PlanId(1),
+                anchor,
+                staging_anchor: anchor,
+                priority_enemies: vec![priority],
+                threat_horizon: 3,
+                posture: DeploymentPosture::Execute,
+                continuity: DeploymentContinuity::Advance,
+            }]);
+        let registry = world.resource::<V4DeploymentRegistry>();
+        assert!(registry.active_entities(PlayerId(1)).contains(&attacker));
+        assert_eq!(registry.assigned[&attacker].intent.anchor, anchor);
+    }
+
+    /// 達成済み任務を離れたEntityは、同Planの同期だけでは旧配属へ戻らない。
+    #[test]
+    fn completed_deployment_is_not_reactivated_by_plan_refresh() {
+        let (mut world, attacker, priority, transport, capture) = deployment_world();
+        for enemy in [priority, transport, capture] {
+            world.despawn(enemy);
+        }
+        let anchor = GridPosition { x: 5, y: 0 };
+        world.spawn((anchor, Property::new(Terrain::City, Some(PlayerId(1)), 20)));
+        world
+            .resource_mut::<V4DeploymentRegistry>()
+            .assigned
+            .get_mut(&attacker)
+            .unwrap()
+            .intent
+            .plan_step = Some(plan_step(1));
+        let mut manager = SquadManager::default();
+        prepare_deployment_squads(&mut world, &mut manager, PlayerId(1), &HashSet::default());
+        assert!(
+            !world
+                .resource::<V4DeploymentRegistry>()
+                .active_entities(PlayerId(1))
+                .contains(&attacker)
+        );
+
+        let intent = ActiveDeploymentIntent {
+            plan_id: PlanId(1),
+            anchor,
+            staging_anchor: anchor,
+            priority_enemies: Vec::new(),
+            threat_horizon: 3,
+            posture: DeploymentPosture::Execute,
+            continuity: DeploymentContinuity::Advance,
+        };
+        for _ in 0..2 {
+            world
+                .resource_mut::<V4DeploymentRegistry>()
+                .refresh_plan_intents(std::slice::from_ref(&intent));
+            assert!(
+                !world
+                    .resource::<V4DeploymentRegistry>()
+                    .active_entities(PlayerId(1))
+                    .contains(&attacker),
+                "達成済み配備を旧Planへ再拘束しない"
+            );
+        }
+        assert!(
+            world
+                .resource::<V4DeploymentRegistry>()
+                .produced_plan_steps(PlayerId(1))
+                .contains(&plan_step(1)),
+            "生産実績のstepは引渡し後も保持する"
+        );
+    }
+
+    /// 旧目的の再同期は拒否するが、計画が次の目的を採用したら配備を引き渡す。
+    #[test]
+    fn completed_deployment_accepts_an_explicit_successor_objective() {
+        let (mut world, attacker, priority, transport, capture) = deployment_world();
+        for enemy in [priority, transport, capture] {
+            world.despawn(enemy);
+        }
+        let anchor = GridPosition { x: 5, y: 0 };
+        world.spawn((anchor, Property::new(Terrain::City, Some(PlayerId(1)), 20)));
+        world
+            .resource_mut::<V4DeploymentRegistry>()
+            .assigned
+            .get_mut(&attacker)
+            .unwrap()
+            .intent
+            .plan_step = Some(plan_step(1));
+        prepare_deployment_squads(
+            &mut world,
+            &mut SquadManager::default(),
+            PlayerId(1),
+            &HashSet::default(),
+        );
+        let successor = GridPosition { x: 9, y: 0 };
+        world
+            .resource_mut::<V4DeploymentRegistry>()
+            .refresh_plan_intents(&[ActiveDeploymentIntent {
+                plan_id: PlanId(1),
+                anchor: successor,
+                staging_anchor: GridPosition { x: 0, y: 0 },
+                priority_enemies: Vec::new(),
+                threat_horizon: 3,
+                posture: DeploymentPosture::Execute,
+                continuity: DeploymentContinuity::Advance,
+            }]);
+        let registry = world.resource::<V4DeploymentRegistry>();
+        assert!(
+            registry.active_entities(PlayerId(1)).contains(&attacker),
+            "旧任務の完了を、後続任務への参加禁止にしない"
+        );
+        assert_eq!(registry.assigned[&attacker].intent.anchor, successor);
+        assert!(!registry.audit_records(PlayerId(1))[0].completed);
+    }
+
+    /// 旧任務のExecuteを後続作戦の出撃許可と混同しない。
+    #[test]
+    fn executing_deployment_obeys_a_forming_successor_plan() {
+        let (mut world, attacker, priority, _, _) = deployment_world();
+        world
+            .resource_mut::<V4DeploymentRegistry>()
+            .assigned
+            .get_mut(&attacker)
+            .unwrap()
+            .intent
+            .plan_step = Some(plan_step(1));
+        world
+            .resource_mut::<V4DeploymentRegistry>()
+            .refresh_plan_intents(&[ActiveDeploymentIntent {
+                plan_id: PlanId(1),
+                anchor: GridPosition { x: 9, y: 0 },
+                staging_anchor: GridPosition { x: 0, y: 0 },
+                priority_enemies: vec![priority],
+                threat_horizon: 3,
+                posture: DeploymentPosture::Forming,
+                continuity: DeploymentContinuity::Advance,
+            }]);
+        assert_eq!(
+            world.resource::<V4DeploymentRegistry>().assigned[&attacker]
+                .intent
+                .posture,
+            DeploymentPosture::Forming,
+            "旧目的で実行中でも、後続作戦の初回集結を迂回しない"
+        );
+    }
+
+    /// 後続目的への引き渡し方策にかかわらず、新規増援と既存部隊の編成待ちを維持する。
+    #[test]
+    fn forming_reinforcements_and_follow_plan_deployments_keep_staging() {
+        for (previous_posture, continuity, expected_posture) in [
+            (
+                DeploymentPosture::Forming,
+                DeploymentContinuity::Advance,
+                DeploymentPosture::Forming,
+            ),
+            (
+                DeploymentPosture::Execute,
+                DeploymentContinuity::FollowPlan,
+                DeploymentPosture::Forming,
+            ),
+            (
+                DeploymentPosture::Execute,
+                DeploymentContinuity::Advance,
+                DeploymentPosture::Forming,
+            ),
+        ] {
+            let (mut world, attacker, priority, _, _) = deployment_world();
+            let mut registry = world.resource_mut::<V4DeploymentRegistry>();
+            let deployment = registry.assigned.get_mut(&attacker).unwrap();
+            deployment.intent.plan_step = Some(plan_step(1));
+            deployment.intent.posture = previous_posture;
+            // 発注済みで未生産の増援にも、最新Planの編成待ちを適用する。
+            let pending = deployment.intent.clone();
+            registry.pending.push_back(pending);
+            registry.refresh_plan_intents(&[ActiveDeploymentIntent {
+                plan_id: PlanId(1),
+                anchor: GridPosition { x: 9, y: 0 },
+                staging_anchor: GridPosition { x: 0, y: 0 },
+                priority_enemies: vec![priority],
+                threat_horizon: 3,
+                posture: DeploymentPosture::Forming,
+                continuity,
+            }]);
+            assert_eq!(
+                registry.assigned[&attacker].intent.posture,
+                expected_posture
+            );
+            assert_eq!(
+                registry.pending.back().unwrap().posture,
+                DeploymentPosture::Forming
+            );
+        }
     }
 
     /// 小規模マップの経路は、占領の完了したanchorでも配備戦闘Entityを待ち受けさせ続ける。

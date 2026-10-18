@@ -133,7 +133,12 @@ fn capital_launch_posture_departs_with_the_first_attack_wave_on_both_paths() {
             .expect("当手番の生産step");
         registry.reconcile_produced_steps(player, &HashSet::from_iter([first_wave]));
 
-        let intents = registry.active_deployment_intents(player, true, None);
+        let intents = registry.active_deployment_intents(
+            player,
+            true,
+            None,
+            crate::ai::v4::deployment::DeploymentContinuity::FollowPlan,
+        );
         assert_eq!(intents.len(), 1, "{path:?}");
         assert_eq!(intents[0].posture, expected, "{path:?}");
     }
