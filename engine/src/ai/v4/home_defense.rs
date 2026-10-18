@@ -295,46 +295,23 @@ fn response(
     if ready > threat.deadline {
         return None;
     }
-    let target_bonus = data.get_terrain_defense_bonus(map.get_terrain(target.x, target.y)?);
-    let range = map.distance(
-        projection.firing_position.x,
-        projection.firing_position.y,
-        target.x,
-        target.y,
-    );
-    let (damage, (_, _, indirect)) = get_detailed_expected_damage(
-        unit.stats,
-        unit.hp,
-        unit.ammo,
-        enemy.stats,
-        target_bonus,
-        range,
+    let exchange = crate::ai::engagement::expected_exchange(
+        map,
         data,
         chart,
-        false,
+        crate::ai::engagement::Combatant {
+            stats: unit.stats,
+            hp: unit.hp,
+            ammo: unit.ammo,
+        },
+        crate::ai::engagement::Combatant {
+            stats: enemy.stats,
+            hp: enemy.hp,
+            ammo: enemy.ammo,
+        },
+        projection.firing_position,
+        target,
     )?;
-    if damage == 0 {
-        return None;
-    }
-    let my_bonus = data.get_terrain_defense_bonus(
-        map.get_terrain(projection.firing_position.x, projection.firing_position.y)?,
-    );
-    let counter = if indirect {
-        0
-    } else {
-        get_detailed_expected_damage(
-            enemy.stats,
-            enemy.hp,
-            enemy.ammo,
-            unit.stats,
-            my_bonus,
-            range,
-            data,
-            chart,
-            true,
-        )
-        .map_or(0, |(damage, _)| damage)
-    };
     Some(Response {
         order: DefenseOrder {
             unit: unit.entity,
@@ -346,8 +323,8 @@ fn response(
             departure_due: travel_ready >= threat.deadline,
         },
         ready,
-        damage,
-        loss: counter.min(unit.hp).saturating_mul(unit.stats.cost) / 100,
+        damage: exchange.damage,
+        loss: exchange.loss,
     })
 }
 

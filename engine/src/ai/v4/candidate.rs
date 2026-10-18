@@ -2,12 +2,20 @@
 
 use crate::ai::v4::*;
 
-/// 見積に含めてよいのは、同じ永続Planへ実際に配属済みのEntityだけ。
-pub(in crate::ai::v4) fn committed_entities_for_plan(
+/// 標準は現在の責任対象へ一意に配分済みのSquad戦力を使う。小規模は従来のPlan契約を守る。
+pub(in crate::ai::v4) fn committed_entities_for_operation(
     assignments: Option<&HashMap<Entity, deployment::ActiveTargetAssignment>>,
     continuation_plan_id: Option<plan_revision::PlanId>,
     policy: ProductionPolicy,
 ) -> HashSet<Entity> {
+    if policy == ProductionPolicy::Standard {
+        return assignments
+            .into_iter()
+            .flat_map(|assignments| assignments.iter())
+            .filter(|(_, assignment)| assignment.slot_kind == SlotKind::Combat)
+            .map(|(&entity, _)| entity)
+            .collect();
+    }
     assignments
         .into_iter()
         .flat_map(|assignments| assignments.iter())

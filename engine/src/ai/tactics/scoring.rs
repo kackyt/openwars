@@ -64,6 +64,13 @@ impl BestUnitAction {
         }
     }
 
+    /// 観測用の読取口。候補の再評価やcommand生成は行わない。
+    pub(crate) fn evaluated_choice(&self) -> Option<(Rank, Entity, &AiCommand)> {
+        self.0
+            .as_ref()
+            .map(|(rank, entity, command)| (*rank, *entity, command))
+    }
+
     /// 最良の1手を確定し、その評価をEventで通知する。
     pub(crate) fn choose(
         self,

@@ -1607,6 +1607,124 @@ fn gate_capital_assault_launch(
     }
 }
 
+/// 標準V4の首都攻勢出撃ゲート。
+///
+/// 購入Planの進捗（全Produced）には依存せず、盤面上の現在割当済戦力（`assignment.operation_ready`）
+/// と地理・兵站認可（`geographic_authorized`）によって出撃可否を決定する。
+/// 空集合（実戦力ゼロ）や地理・兵站未成立での出撃は許可しない。
+fn gate_capital_assault_launch_standard(
+    portfolio: &mut IslandCampaignPortfolio,
+    capital_island: IslandId,
+    geographic_authorized: bool,
+) {
+    let Some(assignment) = portfolio
+        .active_offensives
+        .iter_mut()
+        .find(|assignment| assignment.island_id == capital_island)
+    else {
+        return;
+    };
+
+    let has_assigned_force =
+        !assignment.capture_entities.is_empty() || !assignment.combat_entities.is_empty();
+
+    if !geographic_authorized {
+        assignment.operation_ready = false;
+        if let Some(assessment) = portfolio
+            .islands
+            .iter_mut()
+            .find(|assessment| assessment.island_id == capital_island)
+        {
+            assessment.decision_reason =
+                "地理・兵站条件が未成立のため、首都第一波を集結状態に留める".to_owned();
+        }
+    } else if !has_assigned_force {
+        assignment.operation_ready = false;
+        if let Some(assessment) = portfolio
+            .islands
+            .iter_mut()
+            .find(|assessment| assessment.island_id == capital_island)
+        {
+            assessment.decision_reason =
+                "出撃可能な実戦力が割り当てられていないため、第一波を集結させる".to_owned();
+        }
+    }
+}
+
+/// 首都出撃ゲートの判定方針。
+enum CapitalLaunchPolicy {
+    Extended {
+        capital_island: IslandId,
+        logistics_ready: bool,
+        combat_plan_ready: bool,
+    },
+    Standard {
+        capital_island: IslandId,
+        geographic_authorized: bool,
+    },
+}
+
+impl CapitalLaunchPolicy {
+    /// 経路の選択はこの境界で一度だけ行い、共通の戦略分析へ分岐を散らさない。
+    fn select(
+        world: &World,
+        player: PlayerId,
+        capital_island: IslandId,
+        logistics_ready: bool,
+        geographic_authorized: bool,
+    ) -> Self {
+        if crate::ai::code_path::is_extended() {
+            let combat_plan_ready = world
+                .get_resource::<crate::ai::v4::plan_revision::V4RollingPlanRegistry>()
+                .is_some_and(|plans| plans.operation_launch_ready(player, capital_island));
+            Self::Extended {
+                capital_island,
+                logistics_ready,
+                combat_plan_ready,
+            }
+        } else {
+            Self::Standard {
+                capital_island,
+                geographic_authorized,
+            }
+        }
+    }
+
+    fn prepare_candidate(&self, candidates: &mut [IslandCampaignCandidate]) {
+        // 戦闘充足を購入Planへ委ねる旧編成は小規模だけに残す。
+        if let Self::Extended { capital_island, .. } = self
+            && let Some(candidate) = candidates
+                .iter_mut()
+                .find(|candidate| candidate.assessment.island_id == *capital_island)
+        {
+            prepare_capital_assault_wave(candidate);
+        }
+    }
+
+    fn apply(self, portfolio: &mut IslandCampaignPortfolio) {
+        match self {
+            Self::Extended {
+                capital_island,
+                logistics_ready,
+                combat_plan_ready,
+            } => gate_capital_assault_launch(
+                portfolio,
+                capital_island,
+                logistics_ready,
+                combat_plan_ready,
+            ),
+            Self::Standard {
+                capital_island,
+                geographic_authorized,
+            } => gate_capital_assault_launch_standard(
+                portfolio,
+                capital_island,
+                geographic_authorized,
+            ),
+        }
+    }
+}
+
 /// 同じ出発島で生産できる輸送手段から、占領要員を運べる暫定編成を返す。
 ///
 /// これは中立島向けの初便を止めないための互換経路であり、敵領Assaultの必要総数や
@@ -2270,7 +2388,7 @@ pub fn analyze_island_campaign_excluding(
     .collect::<Vec<_>>();
     let uses_operation_driven_production =
         crate::ai::resolve_player_ai_version(world, player_id).uses_operation_driven_production();
-    let mut capital_launch_gate = None;
+    let mut capital_launch_policy = None;
     if uses_operation_driven_production {
         let turn = world
             .get_resource::<MatchState>()
@@ -2294,17 +2412,38 @@ pub fn analyze_island_campaign_excluding(
         let logistics_ready = logistics_registry
             .plan(player_id)
             .is_some_and(|plan| plan.selected_islands.is_empty());
-        if let Some((capital_island, _)) = enemy_capital {
-            if let Some(candidate) = candidates
-                .iter_mut()
-                .find(|candidate| candidate.assessment.island_id == capital_island)
-            {
-                prepare_capital_assault_wave(candidate);
-            }
-            let combat_plan_ready = world
-                .get_resource::<crate::ai::v4::plan_revision::V4RollingPlanRegistry>()
-                .is_some_and(|registry| registry.operation_launch_ready(player_id, capital_island));
-            capital_launch_gate = Some((capital_island, logistics_ready, combat_plan_ready));
+        if let Some((capital_island, enemy_capital_pos)) = enemy_capital {
+            let owned_positions = properties
+                .iter()
+                .filter(|p| p.property.owner_id == Some(player_id))
+                .map(|p| &p.position);
+            let open_positions = properties
+                .iter()
+                .filter(|p| p.property.owner_id != Some(player_id))
+                .map(|p| &p.position);
+            let geography = crate::ai::v4::board_scan::CapitalAssaultGeography {
+                home_island,
+                capital_island,
+                home_pos: home_position,
+                enemy_capital_pos: Some(enemy_capital_pos),
+            };
+            let geographic_authorized = crate::ai::v4::board_scan::is_capital_assault_authorized(
+                geography,
+                &map,
+                &island_map,
+                owned_positions,
+                open_positions,
+                logistics_ready,
+            );
+            let launch = CapitalLaunchPolicy::select(
+                world,
+                player_id,
+                capital_island,
+                logistics_ready,
+                geographic_authorized,
+            );
+            launch.prepare_candidate(&mut candidates);
+            capital_launch_policy = Some(launch);
         }
         world.insert_resource(logistics_registry);
     } else {
@@ -2318,13 +2457,8 @@ pub fn analyze_island_campaign_excluding(
         );
     }
     let mut portfolio = allocate_campaign_portfolio(candidates, pool);
-    if let Some((capital_island, logistics_ready, combat_plan_ready)) = capital_launch_gate {
-        gate_capital_assault_launch(
-            &mut portfolio,
-            capital_island,
-            logistics_ready,
-            combat_plan_ready,
-        );
+    if let Some(policy) = capital_launch_policy {
+        policy.apply(&mut portfolio);
     }
     portfolio
 }
@@ -4155,6 +4289,490 @@ mod tests {
             .find(|assessment| assessment.island_id == target_island)
             .unwrap();
         assert_eq!(target_assessment.decision, IslandCampaignDecision::Observe);
+    }
+
+    fn setup_capital_assault_test_world() -> (World, PlayerId, IslandId) {
+        let master_data = MasterDataRegistry::load().expect("master data should load");
+        let (mut world, _schedule) =
+            crate::setup::initialize_world_from_master_data(&master_data, "map_1")
+                .expect("test world should initialize");
+        let entities: Vec<Entity> = world.query::<Entity>().iter(&world).collect();
+        for entity in entities {
+            world.despawn(entity);
+        }
+
+        let player = PlayerId(1);
+        let enemy = PlayerId(2);
+
+        // 渡海マップ: 自軍島 (x=0,1) と 敵首都島 (x=4,5) が 海 (x=2,3) で隔てられている
+        let mut map = Map::new(6, 1, Terrain::Sea, GridTopology::Square);
+        map.set_terrain(0, 0, Terrain::Airport).unwrap();
+        map.set_terrain(1, 0, Terrain::Capital).unwrap();
+        map.set_terrain(4, 0, Terrain::City).unwrap();
+        map.set_terrain(5, 0, Terrain::Capital).unwrap();
+
+        let island_map = IslandMap::analyze(&map);
+        let capital_island = island_map
+            .get_island_at(&GridPosition { x: 5, y: 0 })
+            .unwrap()
+            .id;
+
+        world.insert_resource(map);
+        world.insert_resource(island_map);
+
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Airport, Some(player), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Property::new(Terrain::Capital, Some(player), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 4, y: 0 },
+            Property::new(Terrain::City, Some(enemy), 100),
+        ));
+        world.spawn((
+            GridPosition { x: 5, y: 0 },
+            Property::new(Terrain::Capital, Some(enemy), 100),
+        ));
+
+        let mut settings = crate::ai::PlayerAiSettings::new();
+        settings.set_version(player, crate::ai::AiVersion::V4);
+        world.insert_resource(settings);
+
+        world.resource_mut::<Players>().0[0].funds = 10_000;
+
+        (world, player, capital_island)
+    }
+
+    #[test]
+    fn standard_capital_assault_does_not_erase_the_boards_combat_shortfall() {
+        let (mut world, player, capital_island) = setup_capital_assault_test_world();
+        let data = MasterDataRegistry::load().unwrap();
+        let infantry = data
+            .create_unit_stats(&UnitName(UnitType::Infantry.as_str().to_owned()))
+            .unwrap();
+        let helicopter = data
+            .create_unit_stats(&UnitName(UnitType::TransportHelicopter.as_str().to_owned()))
+            .unwrap();
+        let tank = data
+            .create_unit_stats(&UnitName(UnitType::Tank.as_str().to_owned()))
+            .unwrap();
+        let origin = GridPosition { x: 0, y: 0 };
+        spawn_test_unit(&mut world, player, origin, infantry.clone());
+        spawn_test_unit(&mut world, player, origin, infantry);
+        let transport = spawn_test_unit(&mut world, player, origin, helicopter.clone());
+        world.entity_mut(transport).insert(CargoCapacity {
+            max: helicopter.max_cargo,
+            loaded: Vec::new(),
+        });
+        spawn_test_unit(&mut world, PlayerId(2), GridPosition { x: 5, y: 0 }, tank);
+
+        let portfolio = analyze_island_campaign(&mut world, player);
+        let assignment = portfolio
+            .assignment_for(capital_island)
+            .expect("首都の不足戦力を計画する");
+        assert!(
+            !assignment.operation_ready,
+            "歩兵と輸送だけでは、敵戦闘部隊を無視して出撃しない"
+        );
+        assert!(assignment.purchase_shortfall.combat_units > 0);
+    }
+
+    #[test]
+    fn standard_capital_assault_ready_when_held_force_assembled_regardless_of_purchase_steps() {
+        use crate::ai::v4::operation::OperationKind;
+        use crate::ai::v4::plan_revision::V4RollingPlanRegistry;
+        use crate::ai::v4::rolling_plan::{ForcePackagePlan, PlannedPurchase};
+
+        let (mut world, player, capital_island) = setup_capital_assault_test_world();
+        let master_data = MasterDataRegistry::load().expect("master data should load");
+        let infantry = master_data
+            .create_unit_stats(&UnitName(UnitType::Infantry.as_str().to_owned()))
+            .unwrap();
+        let helicopter = master_data
+            .create_unit_stats(&UnitName(UnitType::TransportHelicopter.as_str().to_owned()))
+            .unwrap();
+
+        // 敵拠点数は2つ（x=4, x=5）。歩兵2体と輸送ヘリ1体を配置して必要戦力を完全に充足させる。
+        let origin = GridPosition { x: 0, y: 0 };
+        spawn_test_unit(&mut world, player, origin, infantry.clone());
+        spawn_test_unit(&mut world, player, origin, infantry);
+        let transport = spawn_test_unit(&mut world, player, origin, helicopter.clone());
+        world.entity_mut(transport).insert(CargoCapacity {
+            max: helicopter.max_cargo,
+            loaded: Vec::new(),
+        });
+
+        // 未Producedの購入stepを持つRollingPlanを登録（operation_launch_readyはfalse）
+        let anchor = GridPosition { x: 10, y: 0 };
+        let mut registry = V4RollingPlanRegistry::default();
+        let purchase = PlannedPurchase {
+            facility: GridPosition { x: 0, y: 0 },
+            unit_type: UnitType::Infantry,
+            build_turn: 1,
+            cost: 1_000,
+        };
+        let plan = ForcePackagePlan {
+            purchases: vec![purchase],
+            capture_purchases: Vec::new(),
+            combat_purchases: Vec::new(),
+            target_forecasts: Vec::new(),
+            turn_forecasts: Vec::new(),
+            feasible: true,
+            first_attack_turn: Some(2),
+            front_breakthrough_turn: Some(2),
+            deadline_target_first_attack_turn: None,
+            target_first_attack_turns: Vec::new(),
+            elimination_turn: Some(3),
+            occupation_turn: Some(5),
+            production_cost: 1_000,
+            expected_loss: 0,
+            blocked_next_turn_production_slots: 0,
+            direct_fire_lane_count: 0,
+            direct_front_shortfall: 0,
+            direct_enemy_remaining_hp: Vec::new(),
+            direct_damage_by_target: Vec::new(),
+            existing_indirect_damage_by_target: Vec::new(),
+            produced_indirect_damage_by_target: Vec::new(),
+            surviving_combat_value: 1_000,
+            required_overmatch_value: 0,
+            overmatch_ready: true,
+            protected_unit_count: 0,
+            protected_survivor_count: 0,
+            deadline_capture_survivor_count: 0,
+            required_capture_survivor_count: 0,
+            candidates_considered: 1,
+            candidates_pruned: 0,
+            search_truncated: false,
+        };
+        registry.select_for_operation(
+            player,
+            1,
+            OperationKind::AssaultCapital,
+            Some(capital_island),
+            anchor,
+            vec![anchor],
+            HashSet::default(),
+            true,
+            None,
+            plan,
+            None,
+            HashSet::default(),
+        );
+        assert!(!registry.operation_launch_ready(player, capital_island));
+        world.insert_resource(registry);
+
+        // 標準パス（Standard）では、購入stepが未完でも実戦力と地理条件が揃えばreadyになる。
+        let portfolio = analyze_island_campaign(&mut world, player);
+        let assignment = portfolio
+            .assignment_for(capital_island)
+            .expect("capital assault assignment must exist");
+        assert_eq!(assignment.decision, IslandCampaignDecision::Assault);
+        assert_eq!(assignment.purchase_shortfall.capture_units, 0);
+        assert!(
+            assignment.operation_ready,
+            "標準パスでは購入step未完でも現在割当戦力が充足していればoperation_readyがtrueであること"
+        );
+
+        // 既存のExtendedパスでは、同じ盤面でも購入step未完ならready=falseとなる既存動作を維持していることを検証
+        let _path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
+        let extended_portfolio = analyze_island_campaign(&mut world, player);
+        let extended_assignment = extended_portfolio
+            .assignment_for(capital_island)
+            .expect("capital assault assignment must exist on extended path");
+        assert!(
+            !extended_assignment.operation_ready,
+            "Extendedパスでは購入step未完時にoperation_ready=falseとなる既存挙動を維持すること"
+        );
+    }
+
+    #[test]
+    fn standard_capital_assault_invariant_to_plan_presence_or_revision() {
+        use crate::ai::v4::operation::OperationKind;
+        use crate::ai::v4::plan_revision::V4RollingPlanRegistry;
+        use crate::ai::v4::rolling_plan::{ForcePackagePlan, PlannedPurchase};
+
+        let (mut world, player, capital_island) = setup_capital_assault_test_world();
+        let master_data = MasterDataRegistry::load().expect("master data should load");
+        let infantry = master_data
+            .create_unit_stats(&UnitName(UnitType::Infantry.as_str().to_owned()))
+            .unwrap();
+        let helicopter = master_data
+            .create_unit_stats(&UnitName(UnitType::TransportHelicopter.as_str().to_owned()))
+            .unwrap();
+
+        let origin = GridPosition { x: 0, y: 0 };
+        spawn_test_unit(&mut world, player, origin, infantry.clone());
+        spawn_test_unit(&mut world, player, origin, infantry);
+        let transport = spawn_test_unit(&mut world, player, origin, helicopter.clone());
+        world.entity_mut(transport).insert(CargoCapacity {
+            max: helicopter.max_cargo,
+            loaded: Vec::new(),
+        });
+
+        // 1. PlanRegistryがそもそも存在しない場合でも、実戦力が揃っていればready
+        world.remove_resource::<V4RollingPlanRegistry>();
+        assert!(!world.contains_resource::<V4RollingPlanRegistry>());
+        let portfolio_no_plan = analyze_island_campaign(&mut world, player);
+        let assignment_no_plan = portfolio_no_plan
+            .assignment_for(capital_island)
+            .expect("assignment exists");
+        assert!(
+            assignment_no_plan.operation_ready,
+            "PlanRegistryが存在しなくても盤面実戦力充足ならready"
+        );
+
+        // 2. 任意のPlanが登録・改訂されても、盤面が変わらなければreadyの結果は不変
+        let anchor = GridPosition { x: 5, y: 0 };
+        let mut registry = V4RollingPlanRegistry::default();
+        let plan = ForcePackagePlan {
+            purchases: vec![PlannedPurchase {
+                facility: GridPosition { x: 0, y: 0 },
+                unit_type: UnitType::Tank,
+                build_turn: 2,
+                cost: 7_000,
+            }],
+            capture_purchases: Vec::new(),
+            combat_purchases: Vec::new(),
+            target_forecasts: Vec::new(),
+            turn_forecasts: Vec::new(),
+            feasible: true,
+            first_attack_turn: Some(3),
+            front_breakthrough_turn: Some(3),
+            deadline_target_first_attack_turn: None,
+            target_first_attack_turns: Vec::new(),
+            elimination_turn: Some(4),
+            occupation_turn: Some(6),
+            production_cost: 7_000,
+            expected_loss: 0,
+            blocked_next_turn_production_slots: 0,
+            direct_fire_lane_count: 0,
+            direct_front_shortfall: 0,
+            direct_enemy_remaining_hp: Vec::new(),
+            direct_damage_by_target: Vec::new(),
+            existing_indirect_damage_by_target: Vec::new(),
+            produced_indirect_damage_by_target: Vec::new(),
+            surviving_combat_value: 7_000,
+            required_overmatch_value: 0,
+            overmatch_ready: true,
+            protected_unit_count: 0,
+            protected_survivor_count: 0,
+            deadline_capture_survivor_count: 0,
+            required_capture_survivor_count: 0,
+            candidates_considered: 1,
+            candidates_pruned: 0,
+            search_truncated: false,
+        };
+        registry.select_for_operation(
+            player,
+            2,
+            OperationKind::AssaultCapital,
+            Some(capital_island),
+            anchor,
+            vec![anchor],
+            HashSet::default(),
+            true,
+            None,
+            plan,
+            None,
+            HashSet::default(),
+        );
+        world.insert_resource(registry);
+
+        let portfolio_with_plan = analyze_island_campaign(&mut world, player);
+        let assignment_with_plan = portfolio_with_plan
+            .assignment_for(capital_island)
+            .expect("assignment exists");
+        assert_eq!(
+            assignment_with_plan.operation_ready, assignment_no_plan.operation_ready,
+            "Planの有無や改訂によらずoperation_readyは不変であること"
+        );
+    }
+
+    #[test]
+    fn standard_capital_assault_not_ready_when_force_insufficient_or_empty_or_geography_unauthorized()
+     {
+        use crate::ai::v4::operation::OperationKind;
+        use crate::ai::v4::plan_revision::V4RollingPlanRegistry;
+        use crate::ai::v4::rolling_plan::{ForcePackagePlan, PlannedPurchase};
+
+        let master_data = MasterDataRegistry::load().expect("master data should load");
+        let infantry = master_data
+            .create_unit_stats(&UnitName(UnitType::Infantry.as_str().to_owned()))
+            .unwrap();
+        let helicopter = master_data
+            .create_unit_stats(&UnitName(UnitType::TransportHelicopter.as_str().to_owned()))
+            .unwrap();
+
+        // 1. 全購入Produced完了のPlanがあっても、盤面の実戦力が不足（歩兵1体のみ）ならready=false
+        {
+            let (mut world, player, capital_island) = setup_capital_assault_test_world();
+            let origin = GridPosition { x: 0, y: 0 };
+            // 必要数2体に対して1体のみ配置
+            spawn_test_unit(&mut world, player, origin, infantry.clone());
+            let transport = spawn_test_unit(&mut world, player, origin, helicopter.clone());
+            world.entity_mut(transport).insert(CargoCapacity {
+                max: helicopter.max_cargo,
+                loaded: Vec::new(),
+            });
+
+            // 全購入Produced済みのPlanを作成
+            let anchor = GridPosition { x: 5, y: 0 };
+            let mut registry = V4RollingPlanRegistry::default();
+            let purchase = PlannedPurchase {
+                facility: GridPosition { x: 0, y: 0 },
+                unit_type: UnitType::Infantry,
+                build_turn: 0,
+                cost: 1_000,
+            };
+            let plan = ForcePackagePlan {
+                purchases: vec![purchase],
+                capture_purchases: Vec::new(),
+                combat_purchases: Vec::new(),
+                target_forecasts: Vec::new(),
+                turn_forecasts: Vec::new(),
+                feasible: true,
+                first_attack_turn: Some(2),
+                front_breakthrough_turn: Some(2),
+                deadline_target_first_attack_turn: None,
+                target_first_attack_turns: Vec::new(),
+                elimination_turn: Some(3),
+                occupation_turn: Some(5),
+                production_cost: 1_000,
+                expected_loss: 0,
+                blocked_next_turn_production_slots: 0,
+                direct_fire_lane_count: 0,
+                direct_front_shortfall: 0,
+                direct_enemy_remaining_hp: Vec::new(),
+                direct_damage_by_target: Vec::new(),
+                existing_indirect_damage_by_target: Vec::new(),
+                produced_indirect_damage_by_target: Vec::new(),
+                surviving_combat_value: 1_000,
+                required_overmatch_value: 0,
+                overmatch_ready: true,
+                protected_unit_count: 0,
+                protected_survivor_count: 0,
+                deadline_capture_survivor_count: 0,
+                required_capture_survivor_count: 0,
+                candidates_considered: 1,
+                candidates_pruned: 0,
+                search_truncated: false,
+            };
+            let selected = registry.select_for_operation(
+                player,
+                1,
+                OperationKind::AssaultCapital,
+                Some(capital_island),
+                anchor,
+                vec![anchor],
+                HashSet::default(),
+                true,
+                None,
+                plan,
+                None,
+                HashSet::default(),
+            );
+            let step = registry
+                .current_step_ref(
+                    selected.plan_id.unwrap(),
+                    selected.revision.unwrap(),
+                    1,
+                    selected.plan.purchases[0],
+                )
+                .unwrap();
+            registry.reconcile_produced_steps(player, &HashSet::from_iter([step]));
+            assert!(registry.operation_launch_ready(player, capital_island));
+            world.insert_resource(registry);
+
+            let portfolio = analyze_island_campaign(&mut world, player);
+            let assignment = portfolio
+                .assignment_for(capital_island)
+                .expect("assignment exists");
+            assert!(
+                !assignment.operation_ready,
+                "Planが全Producedでも盤面実戦力が不足していればready=falseであること"
+            );
+        }
+
+        // 2. 割当戦力が空集合（ユニット0体）ならready=false
+        {
+            let (mut world, player, capital_island) = setup_capital_assault_test_world();
+            let portfolio = analyze_island_campaign(&mut world, player);
+            if let Some(assignment) = portfolio.assignment_for(capital_island) {
+                assert!(
+                    !assignment.operation_ready,
+                    "実戦力0体（空集合）のときはready=falseであること"
+                );
+            }
+        }
+
+        // 3. 兵站/地理未成立ならready=false
+        {
+            // 同一陸塊で自軍所有施設が劣勢・前線未進出の盤面を作成
+            let (mut world, _schedule) =
+                crate::setup::initialize_world_from_master_data(&master_data, "map_1")
+                    .expect("test world should initialize");
+            let entities: Vec<Entity> = world.query::<Entity>().iter(&world).collect();
+            for entity in entities {
+                world.despawn(entity);
+            }
+            let player = PlayerId(1);
+            let enemy = PlayerId(2);
+
+            let mut map = Map::new(7, 1, Terrain::Plains, GridTopology::Square);
+            map.set_terrain(0, 0, Terrain::Capital).unwrap();
+            map.set_terrain(2, 0, Terrain::City).unwrap();
+            map.set_terrain(4, 0, Terrain::City).unwrap();
+            map.set_terrain(6, 0, Terrain::Capital).unwrap();
+            let island_map = IslandMap::analyze(&map);
+            let capital_island = island_map
+                .get_island_at(&GridPosition { x: 6, y: 0 })
+                .unwrap()
+                .id;
+            world.insert_resource(map);
+            world.insert_resource(island_map);
+
+            world.spawn((
+                GridPosition { x: 0, y: 0 },
+                Property::new(Terrain::Capital, Some(player), 100),
+            ));
+            world.spawn((
+                GridPosition { x: 2, y: 0 },
+                Property::new(Terrain::City, Some(enemy), 100),
+            ));
+            world.spawn((
+                GridPosition { x: 4, y: 0 },
+                Property::new(Terrain::City, Some(enemy), 100),
+            ));
+            world.spawn((
+                GridPosition { x: 6, y: 0 },
+                Property::new(Terrain::Capital, Some(enemy), 100),
+            ));
+
+            let mut settings = crate::ai::PlayerAiSettings::new();
+            settings.set_version(player, crate::ai::AiVersion::V4);
+            world.insert_resource(settings);
+            world.resource_mut::<Players>().0[0].funds = 10_000;
+
+            // 歩兵を配置しても、地理条件未成立（自軍1施設 vs 敵3施設）のため出撃不可
+            spawn_test_unit(
+                &mut world,
+                player,
+                GridPosition { x: 0, y: 0 },
+                infantry.clone(),
+            );
+            spawn_test_unit(&mut world, player, GridPosition { x: 0, y: 0 }, infantry);
+
+            let portfolio = analyze_island_campaign(&mut world, player);
+            if let Some(assignment) = portfolio.assignment_for(capital_island) {
+                assert!(
+                    !assignment.operation_ready,
+                    "同一陸塊で地理条件未成立（所有劣勢・前線未進出）のときはready=falseであること"
+                );
+            }
+        }
     }
 }
 

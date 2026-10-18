@@ -11,6 +11,7 @@ use bevy_ecs::prelude::*;
 /// 何らかの行動を実行した場合はその行動内容（文字列）を `Some` で返し、ターンが終了した場合は `None` を返します。
 /// AIのメイン実行エントリーポイント。
 pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> Option<String> {
+    crate::ai::wait_probe::begin_step(world);
     let ai_version = crate::ai::resolve_player_ai_version(world, active_player);
 
     match ai_version {

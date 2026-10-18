@@ -119,6 +119,13 @@ pub enum InvasionEvent {
         damage_value_dealt: i64,
         counter_value_received: i64,
     },
+    /// 明示的に有効化したWait診断。ゲームの侵攻イベントとは別のtypeで保存する。
+    AiWaitProbe {
+        turn: u32,
+        player_id: u32,
+        step: usize,
+        probe: serde_json::Value,
+    },
     PropertyCaptureProgressed {
         turn: u32,
         player_id: u32,
@@ -756,6 +763,35 @@ impl InvasionTraceCollector {
     ) -> Vec<InvasionEvent> {
         let units_after = snapshot_units(world);
         let mut result = Vec::new();
+        if let Some(mut probe) = engine::ai::wait_probe::take_issued(world) {
+            let unit_id = probe["unit_id"].as_u64().unwrap_or_default();
+            let before = units_before
+                .get(&unit_id)
+                .map(|u| [u.position.x, u.position.y]);
+            let after = units_after
+                .get(&unit_id)
+                .map(|u| [u.position.x, u.position.y]);
+            let requested = probe["requested_position"]
+                .as_array()
+                .and_then(|p| Some([p.first()?.as_u64()? as usize, p.get(1)?.as_u64()? as usize]));
+            let result_kind = match (before, after, requested) {
+                (Some(a), Some(b), Some(r)) if a == r && b == r => "stationary_wait",
+                (Some(a), Some(b), Some(r)) if a != r && b == r => "moved_to_requested",
+                (Some(a), Some(b), Some(r)) if a != r && a == b => "requested_move_not_observed",
+                (_, None, _) => "unit_missing_after_execution",
+                _ => "different_or_unknown_result",
+            };
+            probe["execution"] = serde_json::json!({"position_before":before,"position_after":after,
+                "result":result_kind,"moved":before.zip(after).map(|(a,b)|a!=b),
+                "failure_reason":"not_inferred_from_position_only",
+                "turn_player_match":probe["turn"].as_u64()==Some(u64::from(turn)) && probe["player_id"].as_u64()==Some(u64::from(player_id))});
+            result.push(InvasionEvent::AiWaitProbe {
+                turn,
+                player_id,
+                step,
+                probe,
+            });
+        }
         let island_map = world.resource::<IslandMap>();
 
         // 積載後はカーゴが盤面から外れるため、行動前スナップショットから位置を取得する。
@@ -1793,6 +1829,90 @@ mod tests {
     use engine::ai::islands::IslandId;
     use engine::components::PlayerId;
     use engine::resources::UnitType;
+
+    /// 選択理由とは別に、実行前後snapshotからWaitの実体を区別する。
+    #[test]
+    fn wait_probe_distinguishes_stationary_moved_and_unobserved_requests() {
+        use engine::ai::command::AiCommand;
+        use engine::ai::wait_probe::{WaitProbe, WaitProbeSettings};
+        use engine::resources::{GridTopology, Map, MatchState, Terrain};
+        for (request, after, expected) in [
+            (
+                GridPosition { x: 1, y: 1 },
+                GridPosition { x: 1, y: 1 },
+                "stationary_wait",
+            ),
+            (
+                GridPosition { x: 2, y: 1 },
+                GridPosition { x: 2, y: 1 },
+                "moved_to_requested",
+            ),
+            (
+                GridPosition { x: 2, y: 1 },
+                GridPosition { x: 1, y: 1 },
+                "requested_move_not_observed",
+            ),
+        ] {
+            let (mut world, _schedule) = engine::setup::create_world();
+            let map = Map::new(4, 3, Terrain::Plains, GridTopology::Square);
+            world.insert_resource(IslandMap::analyze(&map));
+            world.insert_resource(map);
+            world.insert_resource(MatchState::default());
+            let mut ai = engine::ai::PlayerAiSettings::new();
+            ai.set_version(PlayerId(1), engine::ai::AiVersion::V4);
+            world.insert_resource(ai);
+            world.resource_mut::<WaitProbe>().settings = WaitProbeSettings {
+                enabled: true,
+                ..Default::default()
+            };
+            let unit = world
+                .spawn((
+                    Faction(PlayerId(1)),
+                    GridPosition { x: 1, y: 1 },
+                    Health {
+                        current: 100,
+                        max: 100,
+                    },
+                    engine::resources::master_data::MasterDataRegistry::load()
+                        .unwrap()
+                        .create_unit_stats(&engine::resources::master_data::UnitName(
+                            UnitType::Tank.as_str().into(),
+                        ))
+                        .unwrap(),
+                ))
+                .id();
+            let mut collector = InvasionTraceCollector::new(&world);
+            let before = snapshot_units(&mut world);
+            engine::ai::execute_ai_command(
+                &mut world,
+                unit,
+                AiCommand::Wait {
+                    target_pos: request,
+                },
+            );
+            // このテストはcollect_stepの結合を検証するため、適用後snapshotの位置だけを与える。
+            *world.get_mut::<GridPosition>(unit).unwrap() = after;
+            let turn = world.resource::<MatchState>().current_turn_number.0;
+            let events = collector.collect_step(&mut world, turn, 1, 7, &before);
+            let value = serde_json::to_value(&events).unwrap();
+            let probe = value
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["type"] == "ai_wait_probe")
+                .unwrap();
+            assert_eq!(probe["step"], 7);
+            assert_eq!(probe["probe"]["execution"]["result"], expected);
+            assert_eq!(probe["probe"]["unit_id"], unit.to_bits());
+            assert_eq!(probe["probe"]["selection_stage"], "untraced");
+            assert!(
+                collector
+                    .collect_step(&mut world, turn, 1, 8, &before)
+                    .is_empty(),
+                "前stepの診断を再利用しない"
+            );
+        }
+    }
 
     #[test]
     fn production_snapshot_exports_requested_effective_and_unfilled_reason() {

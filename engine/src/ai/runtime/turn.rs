@@ -97,6 +97,7 @@ pub(crate) fn execute_turn_step(world: &mut World, player_id: PlayerId) -> Optio
         return issue_production_command(world, command);
     }
     prepare_squads(world, &step);
+    crate::ai::wait_probe::stage(world, "early_production_relief");
     // 未完成の島嶼輸送パッケージが生産施設上でFormingすると、不足している次の
     // 輸送役を自分で生産不能にする。任務所属は維持したまま隣接待機地へ一歩だけ退避する。
     if step.uses_v3_tactics
@@ -109,10 +110,12 @@ pub(crate) fn execute_turn_step(world: &mut World, player_id: PlayerId) -> Optio
     {
         return Some(issue_unit_command(world, entity, command));
     }
+    crate::ai::wait_probe::stage(world, "transport");
     if let Some((entity, command)) = select_transport_step(world, &step) {
         return Some(issue_transport_command(world, entity, command));
     }
     let decision_skip = decision_skip_entities(world, &step);
+    crate::ai::wait_probe::stage(world, "normal_tactics");
     if let Some((entity, command)) = decide_normal_action(world, &step, &decision_skip) {
         return Some(issue_unit_command(world, entity, command));
     }
@@ -121,11 +124,13 @@ pub(crate) fn execute_turn_step(world: &mut World, player_id: PlayerId) -> Optio
         // 時点で再接続する。Reserve行動そのものが目標到達でSquadを完了させる場合もあるため、
         // 通常行動が尽きるたびに取り直す。行動候補が無ければ生産へ進む。
         crate::ai::squad::reconcile_v4_end_turn_reserves(world, player_id);
+        crate::ai::wait_probe::stage(world, "reassigned_tactics");
         if let Some((entity, command)) = decide_reassigned_action(world, &step) {
             return Some(issue_unit_command(world, entity, command));
         }
         // 通常の作戦行動で進めなかった任務所属unitも、生産施設だけは塞ぎ続けない。
         // 先に通常行動を試した後のfallbackなので、前線へ進めるunitの移動距離は奪わない。
+        crate::ai::wait_probe::stage(world, "late_production_relief");
         if let Some((entity, command)) =
             decide_forming_campaign_site_relief(world, player_id, &step.acted, true)
         {

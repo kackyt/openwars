@@ -8,8 +8,19 @@ pub(crate) struct CampaignActionContext {
     pub(crate) island_id: crate::ai::islands::IslandId,
     pub(crate) mission_type: crate::ai::squad::MissionType,
     pub(crate) target: Option<GridPosition>,
-    /// 局地Captureの最小護衛が合流可能か。falseでも現在位置での反撃は許可する。
+    /// 占領護衛・首都集結の盤面条件が成立したか。falseでも現在位置での反撃は許可する。
     pub(crate) departure_authorized: bool,
+}
+
+impl CampaignActionContext {
+    /// 任務は維持したまま出発を待つ。購入Planではなく具体Squadの許可だけに従う。
+    pub(crate) fn holds_position(&self) -> bool {
+        !self.departure_authorized
+            && matches!(
+                self.mission_type,
+                crate::ai::squad::MissionType::Capture | crate::ai::squad::MissionType::Attack
+            )
+    }
 }
 
 /// V4のEntityは正本registryが指す具体Squadだけから行動方針を受け取る。
@@ -93,6 +104,25 @@ mod tests {
     };
     use crate::ai::planning::assignment::LedgerKey;
     use crate::ai::squad::{MissionType, SquadManager};
+
+    #[test]
+    fn departure_permission_holds_both_capture_and_capital_attack_in_place() {
+        for mission in [MissionType::Capture, MissionType::Attack] {
+            let mut context = CampaignActionContext {
+                owner: OperationOwner::Campaign {
+                    player_id: PlayerId(1),
+                    island_id: IslandId(0),
+                },
+                island_id: IslandId(0),
+                mission_type: mission,
+                target: Some(GridPosition { x: 4, y: 4 }),
+                departure_authorized: false,
+            };
+            assert!(context.holds_position());
+            context.departure_authorized = true;
+            assert!(!context.holds_position());
+        }
+    }
 
     /// S1: 作戦ownerだけを残して具体Squadを失ったEntityは、履歴のSquadIdがまだ一覧に
     /// 残っていても、そのSquadの任務・目標を受け取らない（Errで再接続待ちになる）。

@@ -4,7 +4,7 @@ use crate::ai::planning::assignment::OperationLedger;
 use crate::ai::planning::assignment::{
     ProducedAssignmentDelta, ProducedAssignmentProposal, ProducedJoin, ProducedSquad,
 };
-use crate::ai::squad::{MissionType, SquadId, SquadManager};
+use crate::ai::squad::{MissionPhase, MissionType, SquadId, SquadManager};
 use crate::collections::HashMap;
 use crate::components::{GridPosition, PlayerId};
 use crate::events::{ProduceUnitCommand, UnitProducedEvent};
@@ -365,6 +365,7 @@ impl V4CampaignExecutionRegistry {
             entity,
             squad,
             fallback_mission: mission,
+            initial_phase: MissionPhase::Forming,
             target: record.mission_target,
             target_island: Some(record.island_id),
         });

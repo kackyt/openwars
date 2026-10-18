@@ -7,6 +7,7 @@ use crate::ai::v4::capital_route::topology::{
 };
 use crate::ai::v4::trace::campaign_scope_audit_enabled;
 
+use crate::ai::islands::{IslandId, IslandMap};
 use crate::ai::v4::{
     AdoptedTurnPortfolio, Arc, CampaignPlanningObjective, CargoCapacity, DamageChart,
     EnemyFacilitySnapshot, EnemyProductionForecastTrace, Entity, Faction, GridPosition, HashMap,
@@ -805,48 +806,24 @@ impl BoardScan {
                 })
                 .or(Some(forward_property))
         });
+        let logistics_ready = logistics_plan
+            .as_ref()
+            .is_some_and(|plan| plan.selected_islands.is_empty());
         let capital_assault_authorized = enemy_capital_island.is_some_and(|capital_island| {
-            if home_island != Some(capital_island) {
-                return logistics_plan
-                    .as_ref()
-                    .is_some_and(|plan| plan.selected_islands.is_empty());
-            }
-            let Some(home) = capital_pos else {
-                return false;
+            let geography = CapitalAssaultGeography {
+                home_island,
+                capital_island,
+                home_pos: capital_pos,
+                enemy_capital_pos: enemy_capital,
             };
-            let Some(capital) = enemy_capital else {
-                return false;
-            };
-            let owned_count = owned_properties
-                .iter()
-                .filter(|(position, _)| {
-                    island_map
-                        .get_island_at(position)
-                        .is_some_and(|island| island.id == capital_island)
-                })
-                .count();
-            let enemy_count = open_properties
-                .iter()
-                .filter(|position| {
-                    island_map
-                        .get_island_at(position)
-                        .is_some_and(|island| island.id == capital_island)
-                })
-                .count();
-            let route_distance = map.distance(home.x, home.y, capital.x, capital.y).max(1);
-            let forward_distance = owned_properties
-                .iter()
-                .filter(|(position, _)| {
-                    island_map
-                        .get_island_at(position)
-                        .is_some_and(|island| island.id == capital_island)
-                })
-                .map(|(position, _)| map.distance(position.x, position.y, capital.x, capital.y))
-                .min()
-                .unwrap_or(u32::MAX);
-            // 同一大陸であること自体はGo条件にしない。局地拠点を奪って所有数で
-            // 優位を作り、少なくとも戦線が両首都の中間まで進んだときだけ本隊を解放する。
-            owned_count > enemy_count && forward_distance.saturating_mul(2) <= route_distance
+            is_capital_assault_authorized(
+                geography,
+                &map,
+                &island_map,
+                owned_properties.iter().map(|(position, _)| position),
+                open_properties.iter(),
+                logistics_ready,
+            )
         });
         if let (Some(capital), Some(capital_island), Some(staging_anchor)) =
             (enemy_capital, enemy_capital_island, staging_anchor)
@@ -918,6 +895,62 @@ impl BoardScan {
             .min_by_key(|(_, stats)| stats.cost)
             .map(|(_, stats)| stats)
     }
+}
+
+/// 首都攻勢の地理情報。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CapitalAssaultGeography {
+    pub home_island: Option<IslandId>,
+    pub capital_island: IslandId,
+    pub home_pos: Option<GridPosition>,
+    pub enemy_capital_pos: Option<GridPosition>,
+}
+
+/// 首都攻勢の地理・兵站認可条件が成立しているかを判定する純粋関数。
+///
+/// - 渡海（別島）の場合: 兵站計画の選択島がすべて完了（空）していること
+/// - 同一陸塊の場合: 自軍所有施設数が敵・中立施設数を上回り、かつ最前線拠点が両首都間の中間地点まで進出していること
+pub(crate) fn is_capital_assault_authorized<'a>(
+    geography: CapitalAssaultGeography,
+    map: &Map,
+    island_map: &IslandMap,
+    owned_properties: impl IntoIterator<Item = &'a GridPosition>,
+    open_properties: impl IntoIterator<Item = &'a GridPosition>,
+    logistics_route_ready: bool,
+) -> bool {
+    if geography.home_island != Some(geography.capital_island) {
+        return logistics_route_ready;
+    }
+    let Some(home) = geography.home_pos else {
+        return false;
+    };
+    let Some(capital) = geography.enemy_capital_pos else {
+        return false;
+    };
+    let mut owned_count = 0;
+    let mut forward_distance = u32::MAX;
+    for position in owned_properties {
+        if island_map
+            .get_island_at(position)
+            .is_some_and(|island| island.id == geography.capital_island)
+        {
+            owned_count += 1;
+            forward_distance =
+                forward_distance.min(map.distance(position.x, position.y, capital.x, capital.y));
+        }
+    }
+    let enemy_count = open_properties
+        .into_iter()
+        .filter(|position| {
+            island_map
+                .get_island_at(position)
+                .is_some_and(|island| island.id == geography.capital_island)
+        })
+        .count();
+    let route_distance = map.distance(home.x, home.y, capital.x, capital.y).max(1);
+    // 同一大陸であること自体はGo条件にしない。局地拠点を奪って所有数で
+    // 優位を作り、少なくとも戦線が両首都の中間まで進んだときだけ本隊を解放する。
+    owned_count > enemy_count && forward_distance.saturating_mul(2) <= route_distance
 }
 
 // QueryStateは入口でだけ準備し、snapshotは同じWorldの登録済みQueryを読み取る。

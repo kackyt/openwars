@@ -33,12 +33,26 @@ pub(super) enum PlanningPolicy {
 }
 
 impl PlanningPolicy {
-    /// 占領の完了したanchorに残るV4配備戦闘Entityの扱い。
-    fn secured_anchor_rule(self) -> crate::ai::v4::deployment::SecuredAnchorRule {
-        use crate::ai::v4::deployment::SecuredAnchorRule;
+    /// 標準はcampaign/Squadだけが現在任務を決める。旧配備命令は小規模の互換境界に閉じる。
+    fn prepare_legacy_deployments(
+        self,
+        world: &mut World,
+        manager: &mut SquadManager,
+        player: PlayerId,
+        connectivity: &mut TerrainConnectivity,
+    ) -> HashSet<Entity> {
         match self {
-            Self::Standard => SecuredAnchorRule::Release,
-            Self::SmallMap => SecuredAnchorRule::Hold,
+            Self::Standard => HashSet::default(),
+            Self::SmallMap => {
+                crate::ai::v4::deployment::prepare_deployment_squads_with_connectivity(
+                    world,
+                    manager,
+                    player,
+                    &HashSet::default(),
+                    crate::ai::v4::deployment::SecuredAnchorRule::Hold,
+                    connectivity,
+                )
+            }
         }
     }
 
@@ -429,17 +443,8 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
     policy.before_manager_removal(world, player, is_v4);
     let mut manager = world.remove_resource::<SquadManager>().unwrap_or_default();
     prepare_squads_for_replanning(world, &mut manager, player, is_v4);
-    // 達成済みの生産任務は分析前に引き渡す。同じ編成回のcampaignで次の役割を与える。
+    // 任務の完了更新はupdate_squads、次の責任割当はcampaign編成が担当する。
     let mut caches = FormationCaches::default();
-    if is_v4 {
-        crate::ai::v4::deployment::release_completed_deployments(
-            world,
-            &mut manager,
-            player,
-            policy.secured_anchor_rule(),
-            &mut caches.connectivity,
-        );
-    }
     // 盤面（unit・物件・地図）は再編の間に変わらないため、戦略分析と汎用編成で1つを共有する。
     let snapshot = PlayerBoard::observe(world, player);
 
@@ -461,20 +466,16 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
         policy,
         &mut caches.connectivity,
     );
-    // V4のCombat枠で生産した実Entityは、campaign再配分とgeneric free poolより前に
-    // 要求元の局地Attack任務へ予約する。
-    // 既存campaign assignmentへ残っていても、明示的な生産目的を優先して切り離す。
+    // 小規模の旧配備契約だけを互換段として適用する。標準は生産履歴から任務を上書きしない。
     if is_v4 {
-        let deployment_reserved =
-            crate::ai::v4::deployment::prepare_deployment_squads_with_connectivity(
+        campaign
+            .reserved_entities
+            .extend(policy.prepare_legacy_deployments(
                 world,
                 &mut manager,
                 player,
-                &HashSet::default(),
-                policy.secured_anchor_rule(),
                 &mut caches.connectivity,
-            );
-        campaign.reserved_entities.extend(deployment_reserved);
+            ));
     }
     // #53 (V3): メンバーが全滅した占領部隊を解散する。
     // 残しておくと「そのターゲットには部隊が存在する」と誤判定され続け

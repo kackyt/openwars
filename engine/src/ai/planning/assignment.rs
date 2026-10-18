@@ -24,6 +24,8 @@ use bevy_ecs::prelude::*;
 use std::collections::BTreeSet;
 
 pub(crate) mod candidate;
+#[cfg(test)]
+mod production_tests;
 pub mod squad_model;
 pub use squad_model::{
     CargoRoster, MemberRoster, Squad, SquadEdit, SquadList, SquadManager, SquadRoster,
@@ -183,10 +185,14 @@ impl<'a> OperationLedger<'a> {
                     id
                 }
             };
-            let mut squad = proposals.squad_mut(squad_id).expect("受入Squad");
-            squad.plan_mut().target = join.target;
-            squad.plan_mut().target_island = join.target_island;
-            squad.plan_mut().phase = MissionPhase::Forming;
+            // 補充は所属だけを増やす。現在任務の目標・出撃状態はSquad自身が保持し、
+            // 生産発注時の古い意図で進行中の本隊をFormingへ巻き戻さない。
+            if existing.is_none() {
+                let mut squad = proposals.squad_mut(squad_id).expect("受入Squad");
+                squad.plan_mut().target = join.target;
+                squad.plan_mut().target_island = join.target_island;
+                squad.plan_mut().phase = join.initial_phase;
+            }
             squads.push(squad_id);
         }
         ProducedAssignmentDelta { squads }
@@ -288,7 +294,7 @@ pub(crate) enum ProducedSquad {
     Create(MissionType),
 }
 
-/// 生産slotの解決が提案する所属1件。目標・島・Forming化も同じ確定で適用する。
+/// 生産slotの解決が提案する所属1件。新設時の目標・島・状態も同じ確定で適用する。
 #[derive(Debug, Clone)]
 pub(crate) struct ProducedJoin {
     pub player: PlayerId,
@@ -296,6 +302,8 @@ pub(crate) struct ProducedJoin {
     pub squad: ProducedSquad,
     /// Squadが欠けていた場合に新設する任務（slotの任務種別）。
     pub fallback_mission: MissionType,
+    /// 新設する任務の進行状態。補充先の既存Squadには適用しない。
+    pub initial_phase: MissionPhase,
     pub target: Option<GridPosition>,
     pub target_island: Option<IslandId>,
 }
@@ -1281,6 +1289,7 @@ mod tests {
             entity,
             squad: ProducedSquad::Existing(existing),
             fallback_mission: MissionType::Defense,
+            initial_phase: MissionPhase::Forming,
             target: None,
             target_island: None,
         });
@@ -1289,6 +1298,7 @@ mod tests {
             entity,
             squad: ProducedSquad::Create(MissionType::Capture),
             fallback_mission: MissionType::Capture,
+            initial_phase: MissionPhase::Forming,
             target: None,
             target_island: Some(IslandId(0)),
         });
@@ -1362,6 +1372,7 @@ mod tests {
             entity,
             squad: ProducedSquad::Existing(SquadId(99)),
             fallback_mission: MissionType::Capture,
+            initial_phase: MissionPhase::Forming,
             target: None,
             target_island: None,
         });

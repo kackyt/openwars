@@ -115,14 +115,10 @@ pub(super) fn evaluate_rolling_plan(
         &operations[op_index].objective_properties,
         &target_enemies,
     );
-    // 既存戦力は、PlanIdが一致する発注済み部隊だけでなく、親戦役DAGの
-    // 未完了区間へ前進中の部隊から導く。ただし首都作戦と「次の区間を確保する」
-    // Captureが同じ戦力を同時に数えることはない。前段では区間目標に一致する
-    // Captureだけが受け取り、首都戦闘へ移るのは実行許可後である。
-    // 別のPlan由来の部隊は借りず、即時Combat増援は実在敵への任務を持つ場合だけ
-    // 入れるため、防衛・輸送・回復部隊を見かけの首都戦力にしない。
+    // 標準は現在任務の責任対象へ一意に配分したSquad戦力を使う。
+    // 小規模は購入Planと親戦役DAGの既存契約を維持し、前段Captureと首都へ二重計上しない。
     let continuation_plan_id = continuation.as_ref().map(|plan| plan.plan_id);
-    let mut committed_for_plan = committed_entities_for_plan(
+    let mut committed_for_operation = committed_entities_for_operation(
         committed_by_operation.get(&op_index),
         continuation_plan_id,
         input.policy,
@@ -131,17 +127,17 @@ pub(super) fn evaluate_rolling_plan(
         input.policy,
         advancing_route_entities,
         &operations[op_index],
-        &mut committed_for_plan,
+        &mut committed_for_operation,
     );
     let rolling_input = combat_input::combat_plan_input(
         scan,
         ctx,
         &operations[op_index],
         allocation.used_facilities(),
-        if committed_for_plan.is_empty() {
+        if committed_for_operation.is_empty() {
             empty_committed_entities
         } else {
-            &committed_for_plan
+            &committed_for_operation
         },
         &staged_for_plan,
         spendable_funds,
@@ -312,7 +308,7 @@ fn include_route_force(
     policy: ProductionPolicy,
     advancing_route_entities: &AdvancingCapitalRouteEntities,
     operation: &Operation,
-    committed_for_plan: &mut HashSet<Entity>,
+    committed_for_operation: &mut HashSet<Entity>,
 ) -> HashSet<Entity> {
     let operation_kind = operation.kind;
     // Stageは前衛ではないが、Roadmapが同じDAG区間へ予約した実Entityである。
@@ -329,7 +325,7 @@ fn include_route_force(
                         .by_target
                         .get(&(island_id, *objective))
                     {
-                        committed_for_plan.extend(route_entities.iter().copied());
+                        committed_for_operation.extend(route_entities.iter().copied());
                     }
                     if let Some(route_entities) = advancing_route_entities
                         .staged_by_target
@@ -341,7 +337,7 @@ fn include_route_force(
             }
             OperationKind::AssaultCapital if operation.execution_authorized => {
                 if let Some(route_entities) = advancing_route_entities.by_island.get(&island_id) {
-                    committed_for_plan.extend(route_entities.iter().copied());
+                    committed_for_operation.extend(route_entities.iter().copied());
                 }
                 for ((staged_island, _), route_entities) in
                     &advancing_route_entities.staged_by_target

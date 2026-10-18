@@ -13,7 +13,7 @@ use crate::ai::v4::enemy_forecast::{
 };
 use crate::ai::v4::production_pipeline::test_exports::{
     ImmediateCombatEngagement, ImmediateCombatOption, build_operation, build_operations,
-    combat_plan_input, committed_entities_for_plan,
+    combat_plan_input, committed_entities_for_operation,
     defer_unapproved_capital_structure_for_active_segment, enemy_reinforcement_assessment,
     immediate_combat_options, mobilization_role, select_immediate_combat_reinforcement,
 };
@@ -410,6 +410,7 @@ fn committed_combat_keeps_plan_ownership_and_accepts_operation_bound_reinforceme
             deployment::ActiveTargetAssignment {
                 plan_id: Some(own_plan),
                 slot_kind: SlotKind::Combat,
+                objective: None,
                 targets: HashSet::default(),
             },
         ),
@@ -418,6 +419,7 @@ fn committed_combat_keeps_plan_ownership_and_accepts_operation_bound_reinforceme
             deployment::ActiveTargetAssignment {
                 plan_id: Some(plan_revision::PlanId(8)),
                 slot_kind: SlotKind::Combat,
+                objective: None,
                 targets: HashSet::default(),
             },
         ),
@@ -426,6 +428,7 @@ fn committed_combat_keeps_plan_ownership_and_accepts_operation_bound_reinforceme
             deployment::ActiveTargetAssignment {
                 plan_id: None,
                 slot_kind: SlotKind::Combat,
+                objective: None,
                 targets: HashSet::default(),
             },
         ),
@@ -434,18 +437,19 @@ fn committed_combat_keeps_plan_ownership_and_accepts_operation_bound_reinforceme
             deployment::ActiveTargetAssignment {
                 plan_id: None,
                 slot_kind: SlotKind::Intercept,
+                objective: None,
                 targets: HashSet::default(),
             },
         ),
     ]);
 
     assert_eq!(
-        committed_entities_for_plan(Some(&assignments), None, ProductionPolicy::SmallMap),
+        committed_entities_for_operation(Some(&assignments), None, ProductionPolicy::SmallMap),
         HashSet::from_iter([immediate_entity]),
         "実在敵へ割り当てた即時Combat増援は、次の作戦見積でも継続して数える"
     );
     assert_eq!(
-        committed_entities_for_plan(
+        committed_entities_for_operation(
             Some(&assignments),
             Some(own_plan),
             ProductionPolicy::SmallMap

@@ -22,6 +22,7 @@ mod combat_input;
 mod combat_profile;
 pub mod deployment;
 pub mod logistics_plan;
+mod mission_input;
 pub mod operation;
 mod operation_builder;
 mod operation_selection;
@@ -101,7 +102,7 @@ pub mod property_control;
 pub(crate) mod strategy_pipeline;
 
 // 盤面snapshot、首都DAG、敵予測は担当moduleが所有し、生産方策は入口で選ぶ。
-mod board_scan;
+pub(crate) mod board_scan;
 #[allow(unused_imports)]
 pub(crate) mod capital_route;
 mod enemy_forecast;

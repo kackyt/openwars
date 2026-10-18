@@ -169,7 +169,14 @@ fn assign_committed_combat(input: &ProductionInputs<'_>, state: &mut ProductionS
             .iter()
             .enumerate()
             .filter(|(_, operation)| {
-                operation.reachable_threats.iter().any(|threat| {
+                assignment.objective.is_some_and(|target| {
+                    operation.anchor == target
+                        || operation.objective_properties.contains(&target)
+                        || operation
+                            .reachable_threats
+                            .iter()
+                            .any(|threat| threat.position == target)
+                }) || operation.reachable_threats.iter().any(|threat| {
                     threat
                         .entity
                         .is_some_and(|enemy| assignment.targets.contains(&enemy))
@@ -273,7 +280,7 @@ pub(in crate::ai::v4) mod test_exports {
         select_immediate_combat_reinforcement,
     };
     pub(in crate::ai::v4) use super::mobilization::mobilization_role;
-    pub(in crate::ai::v4) use crate::ai::v4::candidate::committed_entities_for_plan;
+    pub(in crate::ai::v4) use crate::ai::v4::candidate::committed_entities_for_operation;
     pub(in crate::ai::v4) use crate::ai::v4::combat_input::combat_plan_input;
     pub(in crate::ai::v4) use crate::ai::v4::operation_builder::{
         build_operation, build_operations, enemy_reinforcement_assessment,

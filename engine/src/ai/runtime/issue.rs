@@ -4,6 +4,8 @@ use crate::events::{AttackUnitCommand, CapturePropertyCommand, MoveUnitCommand, 
 use bevy_ecs::prelude::*;
 
 pub fn execute_ai_command(world: &mut World, unit_entity: Entity, command: AiCommand) {
+    // 評価だけでなく、実際の発行口でWaitの診断を確定する。
+    crate::ai::wait_probe::issued(world, unit_entity, &command);
     // 命令発行時点で作戦stepを登録し、結果Eventが届くまで進捗扱いしない。
     // Roadmapへ未所属のV1〜V3 Entityでは何も記録されない。
     crate::ai::v4::victory_roadmap::record_operation_command(world, unit_entity, &command);
