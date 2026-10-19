@@ -496,37 +496,3 @@ fn test_repair_site_production_range() {
         }
     }
 }
-
-/// 接近の格子距離と最寄り候補の距離は、Hexでも盤面の距離に一致する。
-#[test]
-fn approach_distance_respects_topology() {
-    use crate::ai::tactics::{
-        approach::with_turn_distances,
-        board::{SquadRoles, TacticalBoard},
-    };
-    for topology in [GridTopology::Square, GridTopology::Hex] {
-        let mut world = world(false);
-        world.resource_mut::<Map>().topology = topology;
-        let tank = spawn(&mut world, PlayerId(1), UnitType::Tank, pos(1, 1));
-        let stats = world
-            .get::<crate::components::UnitStats>(tank)
-            .unwrap()
-            .clone();
-        let board = TacticalBoard::observe(
-            &mut world,
-            PlayerId(1),
-            crate::collections::HashMap::default(),
-            SquadRoles::from_manager(SquadManager::default()),
-        );
-        let from = pos(1, 1);
-        let target = pos(2, 2);
-        let expected = board.map.distance(from.x, from.y, target.x, target.y) as i32;
-        with_turn_distances(&mut world, &board, |_, distances| {
-            assert_eq!(distances.distance(from, target), expected);
-            assert_eq!(
-                distances.nearest(&stats, from, [target], 0).unwrap().1,
-                expected
-            );
-        });
-    }
-}

@@ -15,7 +15,7 @@ pub(crate) struct ApproachDistances<'a> {
     cache: &'a mut TurnDistanceCache,
 }
 
-/// 目標までのターン距離と、同点比較用のトポロジーに応じた格子距離。
+/// 目標までのターン距離と、同点比較用の格子（マンハッタン）距離。
 pub(crate) type Approach = (TurnDistance, i32);
 
 /// 手番内で共有するターン距離cacheを借りて `evaluate` を実行する。
@@ -45,11 +45,6 @@ pub(crate) fn with_turn_distances<R>(
 }
 
 impl ApproachDistances<'_> {
-    /// Square / Hexの盤面トポロジーに従って格子距離を測る。
-    pub(crate) fn distance(&self, a: GridPosition, b: GridPosition) -> i32 {
-        self.board.map.distance(a.x, a.y, b.x, b.y) as i32
-    }
-
     /// `from` から `target` を `range` 以内に捉えるまでのターン距離。
     pub(crate) fn turns(
         &mut self,
@@ -84,7 +79,7 @@ impl ApproachDistances<'_> {
         for target in targets {
             let candidate = (
                 self.turns(stats, from, target, range),
-                self.distance(from, target),
+                manhattan(from, target),
             );
             if nearest.is_none_or(|current| candidate < current) {
                 nearest = Some(candidate);
@@ -94,98 +89,23 @@ impl ApproachDistances<'_> {
     }
 }
 
-/// 目標へ近いほど大きい接近score。消費MPによる連続ターン距離と格子距離を加える。
-/// 切り上げ境界を跨ぐ小さな迂回で、前進の加点を相殺しない。
-pub(crate) fn approach_bonus(dist: TurnDistance, grid_distance: i32, max_movement: u32) -> i32 {
-    if dist.turns >= UNREACHABLE_TURNS {
-        return 0;
-    }
-    let movement = max_movement.max(1) as f32;
-    let cont_turns = dist.used_mp as f32 / movement;
-    let turn_score = (100.0 - cont_turns).max(0.0) * 1000.0;
-    let moves = grid_distance as f32 / movement;
-    let move_score = (100.0 - moves).max(0.0) * 2000.0;
-    (turn_score + move_score) as i32
+pub(crate) fn manhattan(from: GridPosition, to: GridPosition) -> i32 {
+    (from.x as i32 - to.x as i32).abs() + (from.y as i32 - to.y as i32).abs()
+}
+
+/// 目標へ近いほど大きい接近score。ターン距離（1ターン1000点）と、移動力で割った
+/// 格子距離（1移動分2000点）の両方を加える。後者は同じターン距離の中での前進を区別する。
+pub(crate) fn approach_bonus(turns: u32, grid_distance: i32, max_movement: u32) -> i32 {
+    let moves = grid_distance as f32 / max_movement as f32;
+    (100 - turns as i32).max(0) * 1000 + ((100.0 - moves).max(0.0) * 2000.0) as i32
 }
 
 /// 到達可能な最寄り目標への接近score（到達不能・目標なしは0）。
 pub(crate) fn nearest_approach_bonus(nearest: Option<Approach>, max_movement: u32) -> i32 {
     match nearest {
         Some((turns, grid_distance)) if turns.turns < UNREACHABLE_TURNS => {
-            approach_bonus(turns, grid_distance, max_movement)
+            approach_bonus(turns.turns, grid_distance, max_movement)
         }
         _ => 0,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_approach_bonus_continuous() {
-        // 48→49MPで切り上げターンが増えても、2マスの前進は森の防御200点を上回る。
-        let before = approach_bonus(
-            TurnDistance {
-                turns: 12,
-                used_mp: 48,
-            },
-            20,
-            4,
-        );
-        let after = approach_bonus(
-            TurnDistance {
-                turns: 13,
-                used_mp: 49,
-            },
-            18,
-            4,
-        );
-        assert_eq!(after - before, 750);
-        assert!(after > before + 200);
-        assert!(
-            approach_bonus(
-                TurnDistance {
-                    turns: 13,
-                    used_mp: 50
-                },
-                18,
-                4
-            ) < after
-        );
-        assert_eq!(
-            approach_bonus(
-                TurnDistance {
-                    turns: 0,
-                    used_mp: 0
-                },
-                0,
-                4
-            ),
-            300_000
-        );
-        assert_eq!(
-            approach_bonus(
-                TurnDistance {
-                    turns: 0,
-                    used_mp: 0
-                },
-                0,
-                0
-            ),
-            300_000
-        );
-        assert_eq!(nearest_approach_bonus(None, 4), 0);
-        assert_eq!(
-            approach_bonus(
-                TurnDistance {
-                    turns: 99,
-                    used_mp: 0
-                },
-                0,
-                4
-            ),
-            0
-        );
     }
 }
