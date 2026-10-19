@@ -250,6 +250,17 @@ impl TacticalBoard {
             .map(|(position, ..)| *position)
     }
 
+    /// 生産可能範囲の基準になる自軍所有の首都。
+    pub(crate) fn own_capitals(&self) -> Vec<GridPosition> {
+        self.properties
+            .iter()
+            .filter(|(_, terrain, owner)| {
+                *terrain == Terrain::Capital && *owner == Some(self.player_id)
+            })
+            .map(|(position, ..)| *position)
+            .collect()
+    }
+
     /// 自軍所有の生産施設。
     pub(crate) fn own_production_sites(&self) -> impl Iterator<Item = GridPosition> + '_ {
         self.properties

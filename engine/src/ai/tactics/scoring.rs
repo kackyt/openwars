@@ -4,7 +4,7 @@
 //! 占領を10000点、撃破を5000点などの目安で加減する。行動の優先度（[`ActionPriority`]）は
 //! scoreより先に比べる別軸である。
 
-use super::approach::{ApproachDistances, approach_bonus, manhattan, nearest_approach_bonus};
+use super::approach::{ApproachDistances, approach_bonus, nearest_approach_bonus};
 use super::board::TacticalBoard;
 use super::unit::UnitState;
 use crate::ai::command::AiCommand;
@@ -138,7 +138,7 @@ pub(crate) fn v3_positioning_score(
     score
 }
 
-/// Squad目標への接近（到達可否によらず加点する）。
+/// 到達可能なSquad目標への接近。
 pub(crate) fn squad_target_approach_score(
     unit: &UnitState,
     position: GridPosition,
@@ -147,7 +147,11 @@ pub(crate) fn squad_target_approach_score(
 ) -> i32 {
     let stats = &unit.stats;
     let turns = distances.turns(stats, position, target, stats.max_range);
-    approach_bonus(turns.turns, manhattan(position, target), stats.max_movement)
+    approach_bonus(
+        turns,
+        distances.distance(position, target),
+        stats.max_movement,
+    )
 }
 
 /// campaignの非占領unitにとってのSquad目標は、全員が重なる駐留マスではなく、
@@ -161,8 +165,9 @@ pub(crate) fn reference_point_approach_score(
 ) -> i32 {
     let stats = &unit.stats;
     let turns = distances.turns(stats, position, target, stats.max_range);
-    let outside_reach = (manhattan(position, target) - reference_reach(stats) as i32).max(0);
-    approach_bonus(turns.turns, outside_reach, stats.max_movement)
+    let outside_reach =
+        (distances.distance(position, target) - reference_reach(stats) as i32).max(0);
+    approach_bonus(turns, outside_reach, stats.max_movement)
 }
 
 /// 参照点に対して働ける距離。直接攻撃unitも隣接マスから参照点を支えられる。
@@ -331,7 +336,7 @@ fn solo_hunt_score(
         for (enemy_position, ..) in &board.enemies {
             let mut turns = distances.turns(stats, position, *enemy_position, stats.max_range);
             turns.turns += ship_blocked_penalty(board, unit, *enemy_position);
-            let candidate = (turns, manhattan(position, *enemy_position));
+            let candidate = (turns, distances.distance(position, *enemy_position));
             if nearest.is_none_or(|current| candidate < current) {
                 nearest = Some(candidate);
                 best_target_position = Some(*enemy_position);
@@ -341,7 +346,7 @@ fn solo_hunt_score(
             for property in board.unowned_properties() {
                 let candidate = (
                     distances.turns(stats, position, property, 0),
-                    manhattan(position, property),
+                    distances.distance(position, property),
                 );
                 if nearest.is_none_or(|current| candidate < current) {
                     nearest = Some(candidate);
@@ -352,7 +357,7 @@ fn solo_hunt_score(
         if let Some((turns, grid_distance)) = nearest {
             best_target_turns = turns.turns as i32;
             if turns.turns < 99 {
-                score += approach_bonus(turns.turns, grid_distance, stats.max_movement);
+                score += approach_bonus(turns, grid_distance, stats.max_movement);
             }
         }
     }
@@ -361,7 +366,7 @@ fn solo_hunt_score(
     if stats.min_range > 1
         && let Some(target) = best_target_position
     {
-        let grid_distance = manhattan(position, target);
+        let grid_distance = distances.distance(position, target);
         if grid_distance >= stats.min_range as i32 && grid_distance <= stats.max_range as i32 {
             // 標的を射程に収める射撃位置。
             score += 10_000;
@@ -480,7 +485,16 @@ pub(crate) fn repair_site_at(
                     .registry
                     .can_repair_on_terrain(unit.stats.unit_type, *terrain)
         })
-        .map(|(_, terrain, _)| board.registry.is_production_facility(terrain.as_str()))
+        // 実際に生産できる首都圏の施設だけを、生産枠の封鎖として評価する。
+        .map(|(_, terrain, _)| {
+            board.registry.is_production_facility(terrain.as_str())
+                && crate::systems::production::is_within_production_range(
+                    &board.own_capitals(),
+                    position.x,
+                    position.y,
+                    board.map.topology,
+                )
+        })
 }
 
 /// 待機の回復・占有に関する加減点。回復の必要があれば回復拠点で待ち、

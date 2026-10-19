@@ -458,3 +458,75 @@ fn different_issue_stage_does_not_reuse_a_previous_choice() {
     assert_eq!(probe["selection_stage"], "untraced");
     assert_eq!(probe["runtime_stage"], "late_production_relief");
 }
+
+/// 首都圏の境界は生産ルールと一致し、前線施設や敵・中立施設を誤認しない。
+#[test]
+fn test_repair_site_production_range() {
+    use crate::ai::tactics::{
+        board::{SquadRoles, TacticalBoard},
+        scoring::repair_site_at,
+        unit::UnitState,
+    };
+    for topology in [GridTopology::Square, GridTopology::Hex] {
+        let mut world = world(false);
+        world.resource_mut::<Map>().topology = topology;
+        let tank = spawn(&mut world, PlayerId(1), UnitType::Tank, pos(1, 2));
+        let mut board = TacticalBoard::observe(
+            &mut world,
+            PlayerId(1),
+            crate::collections::HashMap::default(),
+            SquadRoles::from_manager(SquadManager::default()),
+        );
+        let unit = UnitState::observe(&world, &board, tank).unwrap();
+        board.properties = vec![(pos(0, 2), Terrain::Capital, Some(PlayerId(1)))];
+        for terrain in [Terrain::City, Terrain::Factory] {
+            for x in [3, 4] {
+                board.properties.truncate(1);
+                board
+                    .properties
+                    .push((pos(x, 2), terrain, Some(PlayerId(1))));
+                assert_eq!(repair_site_at(&board, &unit, pos(x, 2)), Some(x == 3));
+            }
+        }
+        board.properties = vec![(pos(3, 2), Terrain::City, Some(PlayerId(1)))];
+        assert_eq!(repair_site_at(&board, &unit, pos(3, 2)), Some(false));
+        for owner in [None, Some(PlayerId(2))] {
+            board.properties[0].2 = owner;
+            assert_eq!(repair_site_at(&board, &unit, pos(3, 2)), None);
+        }
+    }
+}
+
+/// 接近の格子距離と最寄り候補の距離は、Hexでも盤面の距離に一致する。
+#[test]
+fn approach_distance_respects_topology() {
+    use crate::ai::tactics::{
+        approach::with_turn_distances,
+        board::{SquadRoles, TacticalBoard},
+    };
+    for topology in [GridTopology::Square, GridTopology::Hex] {
+        let mut world = world(false);
+        world.resource_mut::<Map>().topology = topology;
+        let tank = spawn(&mut world, PlayerId(1), UnitType::Tank, pos(1, 1));
+        let stats = world
+            .get::<crate::components::UnitStats>(tank)
+            .unwrap()
+            .clone();
+        let board = TacticalBoard::observe(
+            &mut world,
+            PlayerId(1),
+            crate::collections::HashMap::default(),
+            SquadRoles::from_manager(SquadManager::default()),
+        );
+        let from = pos(1, 1);
+        let target = pos(2, 2);
+        let expected = board.map.distance(from.x, from.y, target.x, target.y) as i32;
+        with_turn_distances(&mut world, &board, |_, distances| {
+            assert_eq!(distances.distance(from, target), expected);
+            assert_eq!(
+                distances.nearest(&stats, from, [target], 0).unwrap().1,
+                expected
+            );
+        });
+    }
+}
