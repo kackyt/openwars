@@ -8,9 +8,9 @@ use super::approach::{ApproachDistances, nearest_approach_bonus, with_turn_dista
 use super::board::{SquadRoles, TacticalBoard, movable_units_and_occupancy};
 use super::scoring::{
     BestAction, BestUnitAction, CAPTURE_SCORE, assess_attack, assess_merge, attack_serves_campaign,
-    capture_or_hunt_score, empty_transport_return_score, repair_site_at, solo_enemy_approach_score,
-    squad_target_approach_score, stranded_infantry_score, terrain_defense_bonus,
-    v3_positioning_score, wait_recovery_score,
+    capture_or_hunt_score, empty_transport_return_score, reference_point_approach_score,
+    reference_reach, repair_site_at, solo_enemy_approach_score, squad_target_approach_score,
+    stranded_infantry_score, terrain_defense_bonus, v3_positioning_score, wait_recovery_score,
 };
 use super::unit::UnitState;
 use crate::ai::command::AiCommand;
@@ -32,6 +32,8 @@ use serde_json::json;
 
 #[cfg(test)]
 mod probe_tests;
+#[cfg(test)]
+mod reference_point_tests;
 
 /// 行動可能な全unitから最良の1手を選び、評価内訳をEventで通知する。
 pub(crate) fn decide_action(
@@ -131,6 +133,12 @@ impl UnitTactics {
         })
     }
 
+    /// campaignの非占領unitは、Squad目標を集合・戦闘の参照点として扱う。
+    /// 占領unitは実際に施設へ入る必要があるので、目標マスそのものを目指す。
+    fn treats_target_as_reference(&self) -> bool {
+        self.campaign.is_some() && !self.state.stats.can_capture
+    }
+
     /// 移動先候補。護衛・集結待ちのSquadは、現在位置での攻撃・占領・待機だけを残す。
     fn candidate_tiles(&self, board: &TacticalBoard) -> std::collections::BTreeSet<(usize, usize)> {
         let unit = &self.state;
@@ -176,7 +184,10 @@ fn best_action_for_unit(
 ) -> BestAction {
     let state = &unit.state;
     let mut best = BestAction::default();
-    let tiles = unit.candidate_tiles(board);
+    let mut tiles = unit.candidate_tiles(board);
+    if unit.treats_target_as_reference() {
+        vacate_reserved_capture_sites(world, board, &mut tiles, probe.as_deref_mut());
+    }
     if let Some(trace) = probe.as_deref_mut() {
         trace.tiles(tiles.len());
         if unit
@@ -237,6 +248,44 @@ fn best_action_for_unit(
     best
 }
 
+/// 非占領unitが、友軍の占領予定の未所有施設を踏んで占領を物理的に塞がないようにする。
+/// 小規模経路の同じ規則（`small_map.rs` の候補生成）と同じ予約判定を使う。
+/// 他に行き先が無い（燃料切れ等）ときは塞いだまま残し、退避済みとは扱わない。
+fn vacate_reserved_capture_sites(
+    world: &World,
+    board: &TacticalBoard,
+    tiles: &mut std::collections::BTreeSet<(usize, usize)>,
+    mut probe: Option<&mut UnitProbe>,
+) {
+    let reserved = tiles
+        .iter()
+        .copied()
+        .filter(|&(x, y)| {
+            let position = GridPosition { x, y };
+            board
+                .properties
+                .iter()
+                .any(|(site, _, owner)| *site == position && *owner != Some(board.player_id))
+                && crate::ai::v4::capital_route::tactical::is_capture_target_reserved(
+                    world,
+                    board.player_id,
+                    position,
+                )
+        })
+        .collect::<Vec<_>>();
+    if reserved.is_empty() || reserved.len() == tiles.len() {
+        return;
+    }
+    for (x, y) in reserved {
+        tiles.remove(&(x, y));
+        if let Some(trace) = probe.as_deref_mut() {
+            trace.reject("tile_reserved_for_capture", GridPosition { x, y }, || {
+                json!({})
+            });
+        }
+    }
+}
+
 /// 移動先そのものの価値: 地形・脅威に基づく位置取りと、任務・状態に応じた目標への接近。
 fn tile_score(
     world: &World,
@@ -260,7 +309,11 @@ fn tile_score(
     if !unit.is_solo
         && let Some(target) = unit.squad_target
     {
-        squad_approach = squad_target_approach_score(state, position, target, distances);
+        squad_approach = if unit.treats_target_as_reference() {
+            reference_point_approach_score(state, position, target, distances)
+        } else {
+            squad_target_approach_score(state, position, target, distances)
+        };
         score += squad_approach;
     }
     let mut solo_approach = 0;
@@ -457,6 +510,7 @@ fn attack_priority(
 }
 
 /// 待機。campaign所属unitは、作戦目標から遠ざかる移動で待機しない。
+/// 非占領unitは参照点に働ける距離の内側なら、射点・前衛・明け渡しのための位置替えを許す。
 fn consider_wait(
     board: &TacticalBoard,
     unit: &UnitTactics,
@@ -488,8 +542,14 @@ fn consider_wait(
                 board
                     .map
                     .distance(state.position.x, state.position.y, target.x, target.y);
+            // 参照点の周囲で働ける範囲までは「離れた」と扱わない。範囲外への後退は従来どおり拒否。
+            let allowed = if unit.treats_target_as_reference() {
+                current.max(reference_reach(&state.stats))
+            } else {
+                current
+            };
             comparison = Some((target, current, candidate));
-            candidate > current
+            candidate > allowed
         })
     });
     if moves_away_from_campaign {

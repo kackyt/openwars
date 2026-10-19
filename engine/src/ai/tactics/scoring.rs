@@ -150,6 +150,26 @@ pub(crate) fn squad_target_approach_score(
     approach_bonus(turns.turns, manhattan(position, target), stats.max_movement)
 }
 
+/// campaignの非占領unitにとってのSquad目標は、全員が重なる駐留マスではなく、
+/// 部隊が集合して戦う参照点である。自分の射程で参照点に働ける距離までは同点とし、
+/// 中心1マスだけへ吸着させない。そこから先の位置取りは地形・脅威・攻撃の評価に委ねる。
+pub(crate) fn reference_point_approach_score(
+    unit: &UnitState,
+    position: GridPosition,
+    target: GridPosition,
+    distances: &mut ApproachDistances,
+) -> i32 {
+    let stats = &unit.stats;
+    let turns = distances.turns(stats, position, target, stats.max_range);
+    let outside_reach = (manhattan(position, target) - reference_reach(stats) as i32).max(0);
+    approach_bonus(turns.turns, outside_reach, stats.max_movement)
+}
+
+/// 参照点に対して働ける距離。直接攻撃unitも隣接マスから参照点を支えられる。
+pub(crate) fn reference_reach(stats: &UnitStats) -> u32 {
+    stats.max_range.max(1)
+}
+
 /// 単独行動の健全な非占領unitが敵へ近づく価値。
 pub(crate) fn solo_enemy_approach_score(
     board: &TacticalBoard,
