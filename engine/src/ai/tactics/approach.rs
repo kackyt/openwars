@@ -2,7 +2,10 @@
 
 use super::board::TacticalBoard;
 use crate::ai::tactics::distance_cache::ActionDistanceCache;
-use crate::ai::turn_distance::{TurnDistance, TurnDistanceCache, calculate_turn_distance};
+use crate::ai::turn_distance::{
+    TurnDistance, TurnDistanceCache, calculate_turn_distance,
+    calculate_turn_distance_through_enemies,
+};
 use crate::collections::HashMap;
 use crate::components::{GridPosition, UnitStats};
 use crate::systems::movement::OccupantInfo;
@@ -15,6 +18,8 @@ const UNREACHABLE_TURNS: u32 = 99;
 pub(crate) struct ApproachDistances<'a> {
     board: &'a TacticalBoard,
     cache: &'a mut TurnDistanceCache,
+    /// 敵が入口を塞いで到達不能なときの、敵を押し通る距離。
+    through_enemy_cache: &'a mut TurnDistanceCache,
     /// 占有を無視した地形だけの距離（`terrain_cache` 用の空の占有表と組で使う）。
     terrain_cache: &'a mut TurnDistanceCache,
     no_occupancy: HashMap<(usize, usize), OccupantInfo>,
@@ -37,17 +42,20 @@ pub(crate) fn with_turn_distances<R>(
         .unwrap_or_default();
     let mut cache = strategy_cache
         .take_action_distance_cache(board.player_id, &board.enemy_blocker_positions());
+    let mut through_enemy_cache = strategy_cache.take_through_enemy_distance_cache();
     let mut terrain_cache = strategy_cache.take_terrain_distance_cache();
     let result = evaluate(
         world,
         &mut ApproachDistances {
             board,
             cache: &mut cache,
+            through_enemy_cache: &mut through_enemy_cache,
             terrain_cache: &mut terrain_cache,
             no_occupancy: HashMap::default(),
         },
     );
     strategy_cache.put_action_distance_cache(cache);
+    strategy_cache.put_through_enemy_distance_cache(through_enemy_cache);
     strategy_cache.put_terrain_distance_cache(terrain_cache);
     world.insert_resource(strategy_cache);
     result
@@ -55,6 +63,8 @@ pub(crate) fn with_turn_distances<R>(
 
 impl ApproachDistances<'_> {
     /// `from` から `target` を `range` 以内に捉えるまでのターン距離。
+    /// 敵が入口を塞いで到達不能なら、敵を押し通る距離で代替する。直線距離からの近似値に
+    /// 落ちると、塞がれた目標への接近が地形を無視した評価に退化するため。
     pub(crate) fn turns(
         &mut self,
         stats: &UnitStats,
@@ -62,7 +72,7 @@ impl ApproachDistances<'_> {
         target: GridPosition,
         range: u32,
     ) -> TurnDistance {
-        calculate_turn_distance(
+        let distance = calculate_turn_distance(
             &self.board.map,
             &self.board.registry,
             &self.board.occupancy,
@@ -73,6 +83,21 @@ impl ApproachDistances<'_> {
             range,
             self.board.player_id,
             self.cache,
+        );
+        if path_mp(distance).is_some() {
+            return distance;
+        }
+        calculate_turn_distance_through_enemies(
+            &self.board.map,
+            &self.board.registry,
+            &self.board.occupancy,
+            (from.x, from.y),
+            (target.x, target.y),
+            stats.movement_type,
+            stats.max_movement,
+            range,
+            self.board.player_id,
+            self.through_enemy_cache,
         )
     }
 

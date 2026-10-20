@@ -389,6 +389,73 @@ pub fn calculate_turn_distance_to_range(
     player_id: PlayerId,
     cache: &mut TurnDistanceCache,
 ) -> TurnDistance {
+    turn_distance_to_range(
+        map,
+        registry,
+        unit_positions,
+        start,
+        target,
+        movement_type,
+        max_mp,
+        interaction_min_range,
+        interaction_max_range,
+        player_id,
+        None,
+        cache,
+    )
+}
+
+/// 敵占有マスを「撃破して押し通る」1ターン分（`max_mp`）の追加costで通過可能とみなした
+/// ターン距離。敵が入口を塞いで通常の距離が到達不能になったときの代替に使う。
+/// 地形的に到達不能なら通常と同じ近似値を返す。
+///
+/// 占有状態はcache keyへ含めないため、通常の距離とは別のcacheを使い、敵配置が変わったら
+/// 呼び出し側が破棄すること。
+#[allow(clippy::too_many_arguments)]
+pub fn calculate_turn_distance_through_enemies(
+    map: &Map,
+    registry: &MasterDataRegistry,
+    unit_positions: &HashMap<(usize, usize), OccupantInfo>,
+    start: (usize, usize),
+    target: (usize, usize),
+    movement_type: MovementType,
+    max_mp: u32,
+    interaction_max_range: u32,
+    player_id: PlayerId,
+    cache: &mut TurnDistanceCache,
+) -> TurnDistance {
+    turn_distance_to_range(
+        map,
+        registry,
+        unit_positions,
+        start,
+        target,
+        movement_type,
+        max_mp,
+        0,
+        interaction_max_range,
+        player_id,
+        Some(max_mp),
+        cache,
+    )
+}
+
+/// `enemy_pass_cost` がNoneなら敵占有マスは通過不可、Someならそのcostを加えて通過可。
+#[allow(clippy::too_many_arguments)]
+fn turn_distance_to_range(
+    map: &Map,
+    registry: &MasterDataRegistry,
+    unit_positions: &HashMap<(usize, usize), OccupantInfo>,
+    start: (usize, usize),
+    target: (usize, usize),
+    movement_type: MovementType,
+    max_mp: u32,
+    interaction_min_range: u32,
+    interaction_max_range: u32,
+    player_id: PlayerId,
+    enemy_pass_cost: Option<u32>,
+    cache: &mut TurnDistanceCache,
+) -> TurnDistance {
     if start == target && interaction_min_range == 0 {
         return TurnDistance {
             turns: 0,
@@ -433,6 +500,7 @@ pub fn calculate_turn_distance_to_range(
             interaction_min_range,
             interaction_max_range,
             player_id,
+            enemy_pass_cost,
         ));
         cache
             .to_target_cache
@@ -803,6 +871,7 @@ pub fn calculate_all_turn_distances(
         0,
         interaction_max_range,
         player_id,
+        None,
     )
 }
 
@@ -817,7 +886,13 @@ fn calculate_all_turn_distances_to_range(
     interaction_min_range: u32,
     interaction_max_range: u32,
     player_id: PlayerId,
+    enemy_pass_cost: Option<u32>,
 ) -> HashMap<GridPosition, TurnDistance> {
+    let is_enemy = |pos: &(usize, usize)| {
+        unit_positions
+            .get(pos)
+            .is_some_and(|occupant| occupant.player_id != player_id)
+    };
     let mut dist = HashMap::default();
     let mut heap = BinaryHeap::new();
     let mut turns_map = HashMap::default();
@@ -839,15 +914,10 @@ fn calculate_all_turn_distances_to_range(
                 }
                 if let Some(terrain) = map.get_terrain(pos.0, pos.1) {
                     if get_valid_movement_cost(registry, movement_type, terrain).is_some() {
-                        let mut can_enter = true;
                         // 目標地点そのもの以外で、敵がいる場合は始点にできない
-                        if pos != target {
-                            if let Some(occupant) = unit_positions.get(&pos) {
-                                if occupant.player_id != player_id {
-                                    can_enter = false;
-                                }
-                            }
-                        }
+                        // （押し通る距離では、そのマスの通過costを払って始点にできる）。
+                        let can_enter =
+                            pos == target || enemy_pass_cost.is_some() || !is_enemy(&pos);
                         if can_enter {
                             dist.insert(pos, 0);
                             heap.push(State {
@@ -870,9 +940,17 @@ fn calculate_all_turn_distances_to_range(
         let Some(pos_terrain) = map.get_terrain(position.0, position.1) else {
             continue;
         };
-        let Some(move_cost) = get_valid_movement_cost(registry, movement_type, pos_terrain) else {
+        let Some(mut move_cost) = get_valid_movement_cost(registry, movement_type, pos_terrain)
+        else {
             continue;
         };
+        // 押し通る距離では、敵占有マスへ入るときに撃破分のcostを加える。
+        if let Some(pass_cost) = enemy_pass_cost
+            && position != target
+            && is_enemy(&position)
+        {
+            move_cost += pass_cost;
+        }
 
         for next_pos in map.get_adjacent(position.0, position.1) {
             let Some(next_terrain) = map.get_terrain(next_pos.0, next_pos.1) else {
@@ -886,10 +964,9 @@ fn calculate_all_turn_distances_to_range(
 
             // 敵ユニットによるゾック（通行不可）判定
             // 逆方向探索では、next_pos が味方にとって通行可能かを見る（実際には next_pos から出発するため）
-            if let Some(occupant) = unit_positions.get(&next_pos) {
-                if occupant.player_id != player_id {
-                    continue; // 敵がいるマスは通過不可
-                }
+            // 押し通る距離では通過可能とし、costは next_pos から先へ展開するときに加える。
+            if enemy_pass_cost.is_none() && is_enemy(&next_pos) {
+                continue; // 敵がいるマスは通過不可
             }
 
             let next_cost = cost + move_cost;
@@ -1108,6 +1185,80 @@ mod tests {
             1
         );
         assert!(!distances.contains_key(&GridPosition { x: 3, y: 0 }));
+    }
+
+    #[test]
+    fn through_enemy_distance_passes_a_blocked_corridor_at_one_turn_cost() {
+        // 1列の通路 (0,0)→(5,0) の (2,0) を敵が塞ぐ。
+        let map = Map::new(
+            6,
+            1,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        let registry = MasterDataRegistry::load().unwrap_or_default();
+        let enemy = OccupantInfo {
+            player_id: PlayerId(2),
+            unit_type: crate::resources::UnitType::Infantry,
+            is_transport: false,
+            free_slots: 0,
+            loadable_types: Vec::new(),
+        };
+        let positions = HashMap::from_iter([((2, 0), enemy)]);
+        let blocked = calculate_turn_distance(
+            &map,
+            &registry,
+            &positions,
+            (0, 0),
+            (5, 0),
+            MovementType::Infantry,
+            3,
+            0,
+            PlayerId(1),
+            &mut TurnDistanceCache::default(),
+        );
+        assert_eq!(blocked.used_mp, u32::MAX, "通常の距離では到達不能");
+
+        let mut cache = TurnDistanceCache::default();
+        let through = calculate_turn_distance_through_enemies(
+            &map,
+            &registry,
+            &positions,
+            (0, 0),
+            (5, 0),
+            MovementType::Infantry,
+            3,
+            0,
+            PlayerId(1),
+            &mut cache,
+        );
+        // 地形cost 5 ＋ 敵マス通過の1ターン分（移動力3）。
+        assert_eq!(through.used_mp, 8);
+        assert_eq!(through.turns, 3);
+
+        // 敵を避けられる経路があれば、押し通る距離もそちらを選ぶ（通常の距離と一致）。
+        let open_map = Map::new(
+            6,
+            2,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        let detour = calculate_turn_distance_through_enemies(
+            &open_map,
+            &registry,
+            &positions,
+            (0, 0),
+            (5, 0),
+            MovementType::Infantry,
+            3,
+            0,
+            PlayerId(1),
+            &mut TurnDistanceCache::default(),
+        );
+        assert_eq!(
+            detour.used_mp, 7,
+            "敵を迂回する2マス増しの経路が押し通る経路より短い"
+        );
     }
 
     #[test]
