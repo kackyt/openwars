@@ -597,7 +597,12 @@ fn route_quotas(
         .unwrap_or_else(|| vec![Vec::new(); topology.routes.len()]);
     let targets = frontiers
         .iter()
-        .map(|properties| properties.first().copied())
+        .map(|properties| {
+            properties
+                .first()
+                .copied()
+                .map(|property| route_target_node_anchor(world, player_id, island_id, property))
+        })
         .collect::<Vec<_>>();
     let mut demands = same_land_route_force_demands(world, player_id, island_id);
     for (route, target) in targets.iter().enumerate() {
@@ -621,10 +626,50 @@ fn route_quotas(
     (targets, demands, quotas)
 }
 
+/// 区間目標の拠点を、それを占領対象に含むNode作戦のanchorへ置き換える。
+///
+/// Node作戦は近接する拠点を一つのAreaにまとめて登録するため、拠点自体のセルには
+/// 作戦がないことがある。拠点セルをそのまま目標にすると経路の終点に作戦がなく、
+/// その枝のSquadが全員「経路なし」になってDAGから外れる。
+pub(in crate::ai::v4) fn route_target_node_anchor(
+    world: &World,
+    player_id: PlayerId,
+    island_id: crate::ai::islands::IslandId,
+    property: GridPosition,
+) -> GridPosition {
+    let Some(operations) = world.get_resource::<CapitalRouteNodeOperationRegistry>() else {
+        return property;
+    };
+    let topology_key = CapitalRouteTopologyKey {
+        player_id,
+        island_id,
+    };
+    let mut candidates = operations
+        .operations
+        .values()
+        .filter(|operation| operation.id.topology == topology_key)
+        .collect::<Vec<_>>();
+    // 拠点セル自身に作戦があればそれを使い、なければ占領対象に含む作戦のうち
+    // 自首都側（Node番号が小さい）のものを選ぶ。
+    if candidates
+        .iter()
+        .any(|operation| operation.anchor == property)
+    {
+        return property;
+    }
+    candidates.sort_unstable_by_key(|operation| operation.id.node.0);
+    candidates
+        .into_iter()
+        .find(|operation| operation.capture_targets.contains(&property))
+        .map_or(property, |operation| operation.anchor)
+}
+
 /// 同じ区間目標へ向かう前回の枝を先に保持し、Squad単位で既配分を数える。
 fn retain_previous_routes(
     player_id: PlayerId,
     island_id: crate::ai::islands::IslandId,
+    topology: &CapitalRouteTopology,
+    map: &Map,
     squads: &[RouteSquad],
     allocation: &mut RouteAllocation,
     assigned_counts: &mut [usize],
@@ -637,6 +682,7 @@ fn retain_previous_routes(
     } = allocation;
     // 前手番のSquad orderをまず保持する。Squadのmember数が変化しても、同じ
     // Nodeを実行する限り分岐を変えないため、回復・補充で戦略目標が揺れない。
+    // ただし作戦がSquadの目標を別の枝へ移した場合は、作戦の枝を優先する。
     for squad in squads {
         let Some(commitment) = inherited_commitments.get(&squad.id) else {
             continue;
@@ -645,6 +691,8 @@ fn retain_previous_routes(
         if commitment.player_id != player_id
             || commitment.island_id != island_id
             || targets.get(route).copied().flatten() != Some(commitment.target)
+            || squad_target_route(topology, map, &squad.mission, squad.target, targets)
+                .is_some_and(|target_route| target_route != route)
         {
             continue;
         }
@@ -653,9 +701,52 @@ fn retain_previous_routes(
     }
 }
 
+/// 作戦がSquadに与えた目標が属するDAGの枝を返す。
+///
+/// 作戦は進軍路の前線・拠点・敵を目標にSquadを作る。DAGがその目標と無関係に枝を
+/// 決めると、南の前線を守るSquadが北のNodeへ回され、南のCapture Nodeには制圧役が
+/// いないまま占領役の出発許可が止まる。目標が前線そのものならその枝、枝の拠点なら
+/// その枝、それ以外は最寄りの前線の枝とする。占領役は従来どおり枝の拠点だけで決める。
+pub(in crate::ai::v4) fn squad_target_route(
+    topology: &CapitalRouteTopology,
+    map: &Map,
+    mission: &MissionType,
+    target: Option<GridPosition>,
+    targets: &[Option<GridPosition>],
+) -> Option<usize> {
+    let target = target?;
+    let route = topology
+        .routes
+        .iter()
+        .position(|route| route.front == target)
+        .or_else(|| topology.property_routes.get(&target).map(|route| route.0))
+        .or_else(|| {
+            (*mission != MissionType::Capture)
+                .then(|| {
+                    topology
+                        .routes
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(index, route)| {
+                            (
+                                map.distance(target.x, target.y, route.front.x, route.front.y),
+                                *index,
+                            )
+                        })
+                        .map(|(index, _)| index)
+                })
+                .flatten()
+        })?;
+    targets
+        .get(route)
+        .is_some_and(|target| target.is_some())
+        .then_some(route)
+}
+
 /// 未配分Squadを占領目標または不足枠の順で枝へ置く。同点時の枝番号を保つ。
 fn assign_remaining_routes(
     topology: &CapitalRouteTopology,
+    map: &Map,
     squads: &[RouteSquad],
     demands: &[RouteForceDemand],
     allocation: &mut RouteAllocation,
@@ -673,14 +764,8 @@ fn assign_remaining_routes(
         if assigned_routes.contains_key(&squad.id) {
             continue;
         }
-        let preferred_target_route = if squad.mission == MissionType::Capture {
-            squad
-                .target
-                .and_then(|target| topology.property_routes.get(&target).map(|r| r.0))
-                .filter(|route| targets.get(*route).is_some_and(|t| t.is_some()))
-        } else {
-            None
-        };
+        let preferred_target_route =
+            squad_target_route(topology, map, &squad.mission, squad.target, targets);
         let route = preferred_target_route.or_else(|| {
             (0..topology.routes.len())
                 .filter(|route| targets[*route].is_some())
@@ -772,15 +857,21 @@ fn assign_island_routes(
         preferred_capture_escort_by_route: Vec::new(),
     };
     let mut assigned_counts = vec![0_usize; topology.routes.len()];
+    let Some(map) = world.get_resource::<Map>() else {
+        return;
+    };
     retain_previous_routes(
         player_id,
         island_id,
+        topology,
+        map,
         &squads,
         &mut allocation,
         &mut assigned_counts,
     );
     assign_remaining_routes(
         topology,
+        map,
         &squads,
         &demands,
         &mut allocation,

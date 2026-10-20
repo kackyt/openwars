@@ -4,6 +4,7 @@ use crate::ai::v4::capital_route::commitment::{
     capital_route_dominant_capture_escort_node, capital_route_execution_phase,
     capital_route_frontline_sort_key, capital_route_node_frontline_capacity,
     capital_route_role_frontline_capacity, capital_route_uses_capture_lane,
+    route_target_node_anchor, squad_target_route,
 };
 use crate::ai::v4::capital_route::force_demand::split_bridge_route_objectives;
 use crate::ai::v4::capital_route::force_demand::{
@@ -1715,5 +1716,139 @@ fn staged_route_member_is_counted_after_its_front_arrival_eta() {
     assert!(
         input.existing_units[0].available_turn > 0,
         "Stage部隊を前衛と同じ手番の火力にせず、到着後の既存戦力として評価する"
+    );
+}
+
+/// map_6で、`player` の首都がある島と、DAG・Node作戦を用意したWorldを返す。
+fn map6_route_world(player: PlayerId) -> (World, crate::ai::islands::IslandId) {
+    let master_data = MasterDataRegistry::load().unwrap();
+    let (mut world, _schedule) = crate::setup::initialize_world_from_master_data_with_topology(
+        &master_data,
+        "map_6",
+        GridTopology::Square,
+    )
+    .unwrap();
+    let own_capital = world
+        .iter_entities()
+        .find_map(|entity| {
+            let position = entity.get::<GridPosition>()?;
+            let property = entity.get::<Property>()?;
+            (property.terrain == Terrain::Capital && property.owner_id == Some(player))
+                .then_some(*position)
+        })
+        .expect("自首都");
+    let island = world
+        .resource::<crate::ai::islands::IslandMap>()
+        .get_island_at(&own_capital)
+        .expect("首都の島")
+        .id;
+    prepare_capital_route_topologies(&mut world, player);
+    ensure_capital_route_node_operations(&mut world, player);
+    (world, island)
+}
+
+/// 区間目標の拠点が地域Nodeの占領対象にまとめられているだけなら、そのNodeのanchorを
+/// 目標にする。拠点セルのままだと経路の終点に作戦がなく、枝全体がDAGから外れる。
+#[test]
+fn route_target_property_resolves_to_its_capture_node_anchor() {
+    let player = PlayerId(2);
+    let (world, island) = map6_route_world(player);
+    let operations = world.resource::<CapitalRouteNodeOperationRegistry>();
+    let player_operations = operations
+        .operations
+        .values()
+        .filter(|operation| operation.id.topology.player_id == player)
+        .collect::<Vec<_>>();
+    let frontiers = capital_route_dag_frontier_properties(&world, player, island).unwrap();
+
+    let mut resolved_inside_area = 0;
+    for property in frontiers.iter().flatten().copied() {
+        let target = route_target_node_anchor(&world, player, island, property);
+        if player_operations
+            .iter()
+            .any(|operation| operation.anchor == property)
+        {
+            assert_eq!(target, property, "拠点自身がNodeなら置き換えない");
+        } else if let Some(owner) = player_operations
+            .iter()
+            .filter(|operation| operation.capture_targets.contains(&property))
+            .min_by_key(|operation| operation.id.node.0)
+        {
+            assert_eq!(
+                target, owner.anchor,
+                "{property:?}を含む自首都側のNodeを目標にする"
+            );
+            resolved_inside_area += 1;
+        }
+    }
+    assert!(
+        resolved_inside_area > 0,
+        "map_6の区間目標には地域Nodeにまとめられた拠点がある: {frontiers:?}"
+    );
+}
+
+/// DAGはSquadを、作戦が与えた目標の属する枝へ置く。
+#[test]
+fn squad_route_follows_the_branch_of_its_own_target() {
+    let player = PlayerId(2);
+    let (world, island) = map6_route_world(player);
+    let topology = capital_route_topology_for(&world, player, island).unwrap();
+    let map = world.resource::<Map>();
+    let open = vec![Some(pos(0, 0)); topology.routes.len()];
+    let south = topology.routes[1].front;
+
+    // 前線そのものを守るSquadは、その前線の枝へ入る。
+    assert_eq!(
+        squad_target_route(topology, map, &MissionType::Defense, Some(south), &open),
+        Some(1)
+    );
+    // 枝の拠点を目標にするSquadは、任務によらずその拠点の枝へ入る。
+    let (property, route) = topology
+        .property_routes
+        .iter()
+        .map(|(property, route)| (*property, route.0))
+        .min_by_key(|(property, _)| (property.y, property.x))
+        .unwrap();
+    for mission in [MissionType::Capture, MissionType::Attack] {
+        assert_eq!(
+            squad_target_route(topology, map, &mission, Some(property), &open),
+            Some(route)
+        );
+    }
+    // 拠点でも前線でもない目標は、戦闘役なら最寄りの前線の枝、占領役なら枝を決めない。
+    let north = topology.routes[0].front;
+    let near_south = [(0, 1), (1, 0), (0, -1), (-1, 0), (1, 1), (-1, -1)]
+        .into_iter()
+        .filter_map(|(dx, dy): (isize, isize)| {
+            Some(pos(
+                south.x.checked_add_signed(dx)?,
+                south.y.checked_add_signed(dy)?,
+            ))
+        })
+        .find(|cell| {
+            !topology.property_routes.contains_key(cell)
+                && map.distance(cell.x, cell.y, south.x, south.y)
+                    < map.distance(cell.x, cell.y, north.x, north.y)
+        })
+        .expect("南の前線の隣に拠点でないマスがある");
+    assert_eq!(
+        squad_target_route(topology, map, &MissionType::Attack, Some(near_south), &open),
+        Some(1)
+    );
+    assert_eq!(
+        squad_target_route(
+            topology,
+            map,
+            &MissionType::Capture,
+            Some(near_south),
+            &open
+        ),
+        None
+    );
+    // 区間目標の無い枝には入れない。
+    let closed = vec![Some(pos(0, 0)), None];
+    assert_eq!(
+        squad_target_route(topology, map, &MissionType::Defense, Some(south), &closed),
+        None
     );
 }

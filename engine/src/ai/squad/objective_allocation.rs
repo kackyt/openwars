@@ -411,6 +411,45 @@ impl Allocation {
     }
 }
 
+/// 余った戦闘役を首都ルートの前線へ配る。配った戦闘役は `remaining` から外す。
+fn route_front_responsibilities(
+    world: &World,
+    map: &Map,
+    player: PlayerId,
+    island: IslandId,
+    remaining: &mut Vec<Entity>,
+) -> Vec<CampaignResponsibility> {
+    let fronts =
+        crate::ai::v4::capital_route::topology::same_land_route_fronts(world, player, island);
+    // 進軍路が1本なら配分を選ぶ余地がない。前線一点へ集めると、拠点列を進む敵から
+    // 占領役を守る戦力まで引き抜くため、従来どおり占領目標への前進に任せる
+    // （拡張経路の戦闘配分も進軍路が2本以上のときだけ働く）。
+    if fronts.len() < 2 || remaining.is_empty() {
+        return Vec::new();
+    }
+    let demands = crate::ai::v4::capital_route::force_demand::same_land_route_force_demands(
+        world, player, island,
+    );
+    let slots = crate::ai::v4::capital_route::force_demand::apportion_route_force_slots(
+        remaining.len(),
+        &demands,
+    );
+    let groups = super::combat_responsibilities::distribute_members_across_route_fronts(
+        world, map, remaining, &fronts, &slots,
+    );
+    remaining.clear();
+    fronts
+        .into_iter()
+        .zip(groups)
+        .filter(|(_, members)| !members.is_empty())
+        .map(|(front, members)| CampaignResponsibility {
+            mission_type: MissionType::Defense,
+            target: front,
+            members,
+        })
+        .collect()
+}
+
 /// 施設を目的とする攻勢の戦闘責務。`objectives` は優先順の未所有施設。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn objective_combat_responsibilities(
@@ -568,6 +607,16 @@ pub(super) fn objective_combat_responsibilities(
         .filter(|(_, assigned)| !**assigned)
         .map(|(unit, _)| unit.entity)
         .collect::<Vec<_>>();
+    // 進軍路が2本以上の島では、余った戦闘役を占領目標そのものへ集めず、首都ルートの
+    // 前線へルートごとの必要戦力に応じて配る。進軍路が1本以下の島は従来どおり
+    // 占領目標へ前進させる。
+    responsibilities.extend(route_front_responsibilities(
+        world,
+        board.map,
+        player,
+        island,
+        &mut remaining,
+    ));
     responsibilities.extend(campaign_advance_responsibilities(
         world,
         &mut remaining,

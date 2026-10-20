@@ -56,9 +56,10 @@ impl PlanningPolicy {
         }
     }
 
-    /// SquadManagerをWorldから外す前の準備（小規模V4: 戦略パイプラインの事前処理）。
+    /// SquadManagerをWorldから外す前の準備（V4: 戦略パイプラインの事前処理）。
+    /// 首都ルートDAGは標準マップでも構築し、小規模専用の処理はパイプライン側で判定する。
     fn before_manager_removal(self, world: &mut World, player: PlayerId, is_v4: bool) {
-        if self == Self::SmallMap && is_v4 {
+        if is_v4 {
             crate::ai::v4::strategy_pipeline::before_squad_planning(world, player);
         }
     }
@@ -158,7 +159,7 @@ impl PlanningPolicy {
         }
     }
 
-    /// 所属の正規化の後の仕上げ（小規模V4: 経路commitmentとRoadmapでの採用）。
+    /// 所属の正規化の後の仕上げ（V4: 経路commitment、小規模はRoadmapでの採用も）。
     fn after_final_reconcile(
         self,
         world: &mut World,
@@ -167,10 +168,17 @@ impl PlanningPolicy {
         manager: &mut SquadManager,
         is_v4: bool,
     ) {
-        if self == Self::SmallMap && is_v4 {
-            crate::ai::v4::strategy_pipeline::after_squad_planning(
+        if !is_v4 {
+            return;
+        }
+        match self {
+            // 標準マップは首都ルートDAGの実行区間だけを更新する（Roadmapの採用は小規模専用）。
+            Self::Standard => {
+                crate::ai::v4::strategy_pipeline::refresh_route_commitments(world, player, manager)
+            }
+            Self::SmallMap => crate::ai::v4::strategy_pipeline::after_squad_planning(
                 world, player, portfolio, manager,
-            );
+            ),
         }
     }
 }

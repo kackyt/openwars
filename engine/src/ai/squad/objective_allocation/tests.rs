@@ -247,3 +247,75 @@ fn enemy_sitting_on_the_objective_is_always_a_threat() {
     assert_eq!(for_tank.mission_type, MissionType::Attack);
     assert_eq!(for_tank.target, objective);
 }
+
+/// 実マップを読み込み、`player` の首都がある島を返す。
+fn real_map(name: &str, player: PlayerId) -> (World, IslandId) {
+    let master_data = MasterDataRegistry::load().unwrap();
+    let (world, _schedule) = crate::setup::initialize_world_from_master_data_with_topology(
+        &master_data,
+        name,
+        GridTopology::Square,
+    )
+    .expect("マップを初期化できる");
+    let capital = world
+        .iter_entities()
+        .find_map(|entity| {
+            let position = entity.get::<GridPosition>()?;
+            let property = entity.get::<Property>()?;
+            (property.terrain == Terrain::Capital && property.owner_id == Some(player))
+                .then_some(*position)
+        })
+        .expect("自首都");
+    let island = world
+        .resource::<IslandMap>()
+        .get_island_at(&capital)
+        .expect("首都の島")
+        .id;
+    (world, island)
+}
+
+/// 進軍路が1本の島では、余った戦闘役を前線一点へ集めず、占領目標への前進に残す。
+#[test]
+fn single_route_island_keeps_surplus_combat_for_capture_advance() {
+    let (world, island) = real_map("map_25", ENEMY);
+    let fronts =
+        crate::ai::v4::capital_route::topology::same_land_route_fronts(&world, ENEMY, island);
+    assert!(fronts.len() < 2, "map_25は進軍路が1本以下: {fronts:?}");
+    let map = world.resource::<Map>().clone();
+    let members = vec![Entity::from_raw(1), Entity::from_raw(2)];
+    let mut remaining = members.clone();
+
+    let responsibilities =
+        route_front_responsibilities(&world, &map, ENEMY, island, &mut remaining);
+
+    assert!(responsibilities.is_empty());
+    assert_eq!(remaining, members, "配らなかった戦闘役は次の前進責務へ残す");
+}
+
+/// 進軍路が2本の島では、余った戦闘役を両方の前線へDefenseとして配り切る。
+#[test]
+fn two_route_island_sends_surplus_combat_to_each_route_front() {
+    let (mut world, island) = real_map("map_6", ENEMY);
+    let fronts =
+        crate::ai::v4::capital_route::topology::same_land_route_fronts(&world, ENEMY, island);
+    assert_eq!(fronts.len(), 2, "map_6は北・南の2本: {fronts:?}");
+    // 各前線の近くに戦闘役を置き、距離で両方の前線へ分かれることを確かめる。
+    let mut remaining = fronts
+        .iter()
+        .flat_map(|front| [0, 1].map(|_| world.spawn(*front).id()))
+        .collect::<Vec<_>>();
+    let map = world.resource::<Map>().clone();
+
+    let responsibilities =
+        route_front_responsibilities(&world, &map, ENEMY, island, &mut remaining);
+
+    assert!(remaining.is_empty(), "余った戦闘役を配り切る");
+    let targets = responsibilities
+        .iter()
+        .map(|responsibility| {
+            assert_eq!(responsibility.mission_type, MissionType::Defense);
+            responsibility.target
+        })
+        .collect::<HashSet<_>>();
+    assert_eq!(targets, fronts.into_iter().collect::<HashSet<_>>());
+}

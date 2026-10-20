@@ -13,6 +13,14 @@ fn uses_small_map_expansion(world: &World, player_id: PlayerId) -> bool {
     current_profile(world, player_id) == V4StrategyProfile::SmallMapExpansion
 }
 
+/// 首都ルートDAG（構築・ノード作戦・Squadのルート割当）を使うか。
+///
+/// DAGは盤面の大きさによらずV4の進軍路として使う。小規模マップ専用なのは
+/// マイルストーンによるportfolioの精錬とRoadmapの採用・観測だけである。
+pub(crate) fn uses_capital_route_dag(world: &World, player_id: PlayerId) -> bool {
+    crate::ai::resolve_player_ai_version(world, player_id) == crate::ai::ai_version::AiVersion::V4
+}
+
 /// Strategy解析時に小規模マップ用の静的DAGと当ターンのMilestoneを作る。
 pub(crate) fn prepare_strategy(
     world: &mut World,
@@ -35,7 +43,7 @@ pub(crate) fn prepare_strategy(
 
 /// Squad解析の前にDAGを確実に初期化する。Strategy単体テストもこの順序に依存しない。
 pub(crate) fn before_squad_planning(world: &mut World, player_id: PlayerId) {
-    if uses_small_map_expansion(world, player_id) {
+    if uses_capital_route_dag(world, player_id) {
         crate::ai::v4::capital_route::prepare_capital_route_topologies(world, player_id);
     }
 }
@@ -63,13 +71,25 @@ pub(crate) fn after_squad_planning(
     portfolio: &IslandCampaignPortfolio,
     manager: &mut crate::ai::squad::SquadManager,
 ) {
-    if !uses_small_map_expansion(world, player_id) {
-        return;
+    refresh_route_commitments(world, player_id, manager);
+    if uses_small_map_expansion(world, player_id) {
+        super::victory_roadmap::observe_adopted_campaign_roadmap(
+            world, player_id, portfolio, manager,
+        );
     }
-    crate::ai::v4::capital_route::commitment::refresh_capital_route_path_commitments(
-        world, player_id, manager,
-    );
-    super::victory_roadmap::observe_adopted_campaign_roadmap(world, player_id, portfolio, manager);
+}
+
+/// Squad構築後に首都ルートDAGの実行区間（どのユニットがどの区間を担うか）を更新する。
+pub(crate) fn refresh_route_commitments(
+    world: &mut World,
+    player_id: PlayerId,
+    manager: &mut crate::ai::squad::SquadManager,
+) {
+    if uses_capital_route_dag(world, player_id) {
+        crate::ai::v4::capital_route::commitment::refresh_capital_route_path_commitments(
+            world, player_id, manager,
+        );
+    }
 }
 
 /// 生産snapshotの前にだけ用意する小規模経路の戦略入力。永続cacheは増やさない。
