@@ -35,6 +35,12 @@ impl AiVersion {
         matches!(self, AiVersion::V3 | AiVersion::V4)
     }
 
+    /// 敵の直接攻撃圏で、地形防御が避ける期待損失を位置取りに加えるか（V4のみ）。
+    /// V3は対戦評価の基準線として位置取りを変えない。
+    pub(crate) fn weighs_direct_threat_terrain(&self) -> bool {
+        matches!(self, AiVersion::V4)
+    }
+
     /// 敵生産マスの封鎖はV4だけが候補にする。標準経路ではこの追加評価を呼ばない。
     pub(crate) fn uses_enemy_production_blockade(&self) -> bool {
         matches!(self, AiVersion::V4)

@@ -8,9 +8,10 @@ use super::approach::{ApproachDistances, nearest_approach_bonus, with_turn_dista
 use super::board::{SquadRoles, TacticalBoard, movable_units_and_occupancy};
 use super::scoring::{
     BestAction, BestUnitAction, CAPTURE_SCORE, assess_attack, assess_merge, attack_serves_campaign,
-    capture_or_hunt_score, empty_transport_return_score, reference_point_approach_score,
-    reference_reach, repair_site_at, solo_enemy_approach_score, squad_target_approach_score,
-    stranded_infantry_score, terrain_defense_bonus, v3_positioning_score, wait_recovery_score,
+    capture_or_hunt_score, direct_threat_terrain_score, empty_transport_return_score,
+    reference_point_approach_score, reference_reach, repair_site_at, solo_enemy_approach_score,
+    squad_target_approach_score, stranded_infantry_score, terrain_defense_bonus,
+    v3_positioning_score, wait_recovery_score,
 };
 use super::unit::UnitState;
 use crate::ai::command::AiCommand;
@@ -36,6 +37,8 @@ mod detour_tests;
 mod probe_tests;
 #[cfg(test)]
 mod reference_point_tests;
+#[cfg(test)]
+mod terrain_tests;
 
 /// 行動可能な全unitから最良の1手を選び、評価内訳をEventで通知する。
 pub(crate) fn decide_action(
@@ -310,6 +313,7 @@ fn tile_score(
     let mut score = terrain;
     let positioning = if board.uses_v3_tactics {
         v3_positioning_score(board, state, position, defense_bonus)
+            + direct_threat_terrain_score(board, state, position, defense_bonus)
     } else {
         0
     };

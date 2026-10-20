@@ -138,6 +138,39 @@ pub(crate) fn v3_positioning_score(
     score
 }
 
+/// 地形防御の加点の上限（約半移動分の接近点）。高価なunitほど避けられる損失が大きく、
+/// 上限が無いと防御地形に留まる価値が前進を上回り、進軍が止まる。
+pub(crate) const DIRECT_THREAT_TERRAIN_CAP: i32 = 1000;
+
+/// V4の通常経路で、直接攻撃unitが敵の直接攻撃圏で防御地形に止まる価値。
+///
+/// 直接攻撃unitは敵の直接攻撃圏への踏み込みを減点しない（[`v3_positioning_score`]）。
+/// そのため地形防御の効果が `地形効果×10` の同点比較にしか残らず、前線で道路に止まる。
+/// 圏内に限り、地形で避けられる期待損失を上限つきで加点し、同程度の前進なら防御地形で
+/// 止まるようにする。小規模マップの経路では前進が遅れたため使わない。
+pub(crate) fn direct_threat_terrain_score(
+    board: &TacticalBoard,
+    unit: &UnitState,
+    position: GridPosition,
+    defense_bonus: u32,
+) -> i32 {
+    let stats = &unit.stats;
+    if !board.weighs_direct_threat_terrain || stats.min_range > 1 {
+        return 0;
+    }
+    crate::ai::threat::direct_reach_terrain_relief(
+        &board.map,
+        (position.x, position.y),
+        stats.unit_type,
+        stats.cost,
+        unit.hp,
+        defense_bonus,
+        &board.enemies,
+        &board.damage_chart,
+    )
+    .min(DIRECT_THREAT_TERRAIN_CAP)
+}
+
 /// Squad目標への接近（到達可否によらず加点する）。
 pub(crate) fn squad_target_approach_score(
     unit: &UnitState,

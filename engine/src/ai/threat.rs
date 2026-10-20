@@ -144,6 +144,39 @@ pub fn exposure_penalty(
     expected_loss_value(total_damage, my_cost, my_hp) * EXPOSURE_RISK_NUM / EXPOSURE_RISK_DEN
 }
 
+/// 敵の直接攻撃が届くタイルで、地形防御によって避けられる期待損失額を返します。
+/// 地形防御0のときと実際の地形との期待損失の差で、直接攻撃圏の外では0になります。
+/// 露出そのものは減点しないため、前進の評価は変えずに、前線での停止位置だけを
+/// 防御地形へ寄せられます。
+#[allow(clippy::too_many_arguments)]
+pub fn direct_reach_terrain_relief(
+    map: &Map,
+    tile: (usize, usize),
+    my_unit_type: UnitType,
+    my_cost: u32,
+    my_hp: u32,
+    tile_def_bonus: u32,
+    enemy_units: &[EnemyThreatInfo],
+    damage_chart: &DamageChart,
+) -> i32 {
+    if tile_def_bonus == 0 {
+        return 0;
+    }
+    let bare = direct_reach_expected_damage(map, tile, my_unit_type, 0, enemy_units, damage_chart);
+    if bare == 0 {
+        return 0;
+    }
+    let defended = direct_reach_expected_damage(
+        map,
+        tile,
+        my_unit_type,
+        tile_def_bonus,
+        enemy_units,
+        damage_chart,
+    );
+    expected_loss_value(bare, my_cost, my_hp) - expected_loss_value(defended, my_cost, my_hp)
+}
+
 /// 指定タイルにおいて敵から受ける期待総被ダメージ（HP換算）を計算します。
 /// 間接砲火および直接攻撃到達圏の敵からの推定ダメージを合算し、
 /// 突入時に次ターンで即死（被撃破）するかどうかの生存性を判定するために用います。
@@ -221,6 +254,47 @@ mod tests {
                 &chart,
             ) > 0
         );
+    }
+
+    #[test]
+    fn direct_reach_terrain_relief_counts_only_avoided_loss_in_reach() {
+        let map = Map::new(
+            10,
+            1,
+            crate::resources::Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        let mut chart = DamageChart::new();
+        chart.insert_damage(UnitType::Tank, UnitType::Tank, 50);
+        // 移動力4・射程1の敵戦車は格子距離5まで届く。
+        let enemy = [(
+            GridPosition { x: 0, y: 0 },
+            UnitType::Tank,
+            7000,
+            100,
+            1,
+            1,
+            4,
+        )];
+        let relief = |tile, defense| {
+            direct_reach_terrain_relief(
+                &map,
+                tile,
+                UnitType::Tank,
+                7000,
+                100,
+                defense,
+                &enemy,
+                &chart,
+            )
+        };
+
+        // 期待被害50 → 森(20%)で40。避けられる10HP分 × 7000/100 = 700。
+        assert_eq!(relief((3, 0), 20), 700);
+        assert_eq!(relief((3, 0), 40), 1400);
+        // 地形防御0、または直接攻撃圏の外では0。
+        assert_eq!(relief((3, 0), 0), 0);
+        assert_eq!(relief((6, 0), 40), 0);
     }
 
     #[test]

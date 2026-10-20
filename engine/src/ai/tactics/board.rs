@@ -24,6 +24,8 @@ pub(crate) struct TacticalBoard {
     pub(crate) player_id: PlayerId,
     /// V3以降の戦術評価（地形防御・脅威圏・待ち伏せ）を使うか。
     pub(crate) uses_v3_tactics: bool,
+    /// 敵の直接攻撃圏で地形防御の効果を位置取りに加えるか（V4）。
+    pub(crate) weighs_direct_threat_terrain: bool,
     pub(crate) map: Map,
     pub(crate) registry: MasterDataRegistry,
     pub(crate) damage_chart: DamageChart,
@@ -191,8 +193,9 @@ impl TacticalBoard {
         occupancy: HashMap<(usize, usize), OccupantInfo>,
         squads: SquadRoles,
     ) -> Self {
-        let uses_v3_tactics =
-            crate::ai::resolve_player_ai_version(world, player_id).uses_v3_tactics();
+        let ai_version = crate::ai::resolve_player_ai_version(world, player_id);
+        let uses_v3_tactics = ai_version.uses_v3_tactics();
+        let weighs_direct_threat_terrain = ai_version.weighs_direct_threat_terrain();
         let map = world.resource::<Map>().clone();
         let registry = world.resource::<MasterDataRegistry>().clone();
         let action_targets = AiTacticalSnapshot::from_world(world, &registry, map.topology);
@@ -211,6 +214,7 @@ impl TacticalBoard {
         Self {
             player_id,
             uses_v3_tactics,
+            weighs_direct_threat_terrain,
             map,
             registry,
             damage_chart,
