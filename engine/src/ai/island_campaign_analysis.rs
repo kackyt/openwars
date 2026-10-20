@@ -1868,6 +1868,7 @@ fn producible_campaign_transports(
     blueprints
 }
 
+#[allow(clippy::too_many_arguments)]
 fn candidate_target_position(
     map: &Map,
     registry: &MasterDataRegistry,
@@ -1876,13 +1877,9 @@ fn candidate_target_position(
     units: &[UnitSnapshot],
     player_id: PlayerId,
     existing_operation: Option<&ExistingCampaignOperation>,
+    force_origins: bool,
 ) -> Option<GridPosition> {
-    let origins = properties
-        .iter()
-        .filter(|snapshot| island.tiles.contains(&snapshot.position))
-        .filter(|snapshot| snapshot.property.owner_id == Some(player_id))
-        .map(|snapshot| snapshot.position)
-        .collect::<Vec<_>>();
+    let origins = capture_origins(island, properties, units, player_id, force_origins);
     let mut targets = properties
         .iter()
         .filter(|snapshot| island.tiles.contains(&snapshot.position))
@@ -1916,6 +1913,7 @@ fn candidate_target_position(
     nearest.or_else(|| sorted_island_tiles(island).first().copied())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn candidate_capture_target_positions(
     map: &Map,
     registry: &MasterDataRegistry,
@@ -1924,13 +1922,9 @@ fn candidate_capture_target_positions(
     units: &[UnitSnapshot],
     player_id: PlayerId,
     primary_target: GridPosition,
+    force_origins: bool,
 ) -> Vec<GridPosition> {
-    let origins = properties
-        .iter()
-        .filter(|snapshot| island.tiles.contains(&snapshot.position))
-        .filter(|snapshot| snapshot.property.owner_id == Some(player_id))
-        .map(|snapshot| snapshot.position)
-        .collect::<Vec<_>>();
+    let origins = capture_origins(island, properties, units, player_id, force_origins);
     let mut targets: Vec<_> = properties
         .iter()
         .filter(|snapshot| island.tiles.contains(&snapshot.position))
@@ -1963,6 +1957,54 @@ fn candidate_capture_target_positions(
         targets.insert(0, primary_target);
     }
     targets
+}
+
+/// 占領目標の距離を測る起点。
+///
+/// 従来は島内の自軍所有物件の全体を起点にしていた。初期配置で敵側にも自軍物件がある
+/// 盤面（map_25）や、物件を各地で占領した後の盤面では、部隊のいない場所の物件が
+/// 「最も近い」と判定され、全軍が反対側へ向かう。`force_origins` では、島内の自軍
+/// 占領役と自軍の生産拠点（首都・工場）の位置から測り、実際に占領役が向かえる物件を選ぶ。
+/// 起点が無ければ従来どおり自軍所有物件から測る。
+fn capture_origins(
+    island: &Island,
+    properties: &[PropertySnapshot],
+    units: &[UnitSnapshot],
+    player_id: PlayerId,
+    force_origins: bool,
+) -> Vec<GridPosition> {
+    let owned = || {
+        properties
+            .iter()
+            .filter(|snapshot| island.tiles.contains(&snapshot.position))
+            .filter(|snapshot| snapshot.property.owner_id == Some(player_id))
+    };
+    if force_origins {
+        let origins = units
+            .iter()
+            .filter(|unit| {
+                unit.faction == player_id
+                    && unit.stats.can_capture
+                    && unit.transporting.is_none()
+                    && island.tiles.contains(&unit.position)
+            })
+            .map(|unit| unit.position)
+            .chain(
+                owned()
+                    .filter(|snapshot| {
+                        matches!(
+                            snapshot.property.terrain,
+                            Terrain::Capital | Terrain::Factory
+                        )
+                    })
+                    .map(|snapshot| snapshot.position),
+            )
+            .collect::<Vec<_>>();
+        if !origins.is_empty() {
+            return origins;
+        }
+    }
+    owned().map(|snapshot| snapshot.position).collect()
 }
 
 /// 自軍前線からの占領ETAを第一基準、敵占領兵の到着ETAを同距離帯の競争優先度にする。
@@ -2126,6 +2168,9 @@ pub fn analyze_island_campaign_excluding(
         );
     }
     let facts = collect_island_campaign_facts(world, player_id);
+    // V4は占領目標を占領役・生産拠点の位置から測る。V3以前は基準線として変えない。
+    let uses_force_origins = crate::ai::resolve_player_ai_version(world, player_id)
+        == crate::ai::ai_version::AiVersion::V4;
     let map = world.resource::<Map>().clone();
     let island_map = world
         .get_resource::<IslandMap>()
@@ -2326,6 +2371,7 @@ pub fn analyze_island_campaign_excluding(
             &units,
             player_id,
             existing_operation.as_ref(),
+            uses_force_origins,
         )?;
         let capture_target_positions = candidate_capture_target_positions(
             &map,
@@ -2335,6 +2381,7 @@ pub fn analyze_island_campaign_excluding(
             &units,
             player_id,
             target_position,
+            uses_force_origins,
         );
         let has_foothold = properties.iter().any(|property| {
             island.tiles.contains(&property.position)
@@ -2503,6 +2550,7 @@ mod tests {
             &[],
             player,
             None,
+            false,
         );
         assert_eq!(left_target, Some(GridPosition { x: 2, y: 0 }));
 
@@ -2519,6 +2567,7 @@ mod tests {
             &[],
             player,
             None,
+            false,
         );
         assert_eq!(right_target, Some(GridPosition { x: 8, y: 0 }));
         assert_eq!(
@@ -2530,9 +2579,64 @@ mod tests {
                 &[],
                 player,
                 right_target.expect("右側前線"),
+                false,
             ),
             vec![GridPosition { x: 8, y: 0 }]
         );
+    }
+
+    /// 初期配置で敵側にも自軍物件がある盤面では、物件網から測ると占領役のいない
+    /// 敵側の物件が選ばれる。占領役の位置から測れば、占領役の近くの物件を選ぶ。
+    #[test]
+    fn force_origins_choose_the_property_near_the_capturers() {
+        let master_data = MasterDataRegistry::load().expect("master data should load");
+        let map = Map::new(11, 1, Terrain::Plains, GridTopology::Square);
+        let island = IslandMap::analyze(&map).islands.remove(0);
+        let player = PlayerId(1);
+        let enemy = PlayerId(2);
+        let property = |x, owner| PropertySnapshot {
+            position: GridPosition { x, y: 0 },
+            property: Property::new(Terrain::City, owner, 200),
+        };
+        // 自軍の都市は敵側の端 x=0 にあり、占領役は反対側の x=10 にいる。
+        let properties = vec![
+            property(0, Some(player)),
+            property(2, Some(enemy)),
+            property(8, Some(enemy)),
+        ];
+        let infantry = master_data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::Infantry.as_str().to_string(),
+            ))
+            .unwrap();
+        let capturer = UnitSnapshot {
+            entity: Entity::from_raw(7),
+            faction: player,
+            position: GridPosition { x: 10, y: 0 },
+            stats: infantry,
+            health: Health {
+                current: 100,
+                max: 100,
+            },
+            fuel: Some(99),
+            transporting: None,
+            free_cargo_slots: 0,
+            loaded_cargo_entities: Vec::new(),
+        };
+        let target = |force_origins| {
+            candidate_target_position(
+                &map,
+                &master_data,
+                &island,
+                &properties,
+                std::slice::from_ref(&capturer),
+                player,
+                None,
+                force_origins,
+            )
+        };
+        assert_eq!(target(false), Some(GridPosition { x: 2, y: 0 }));
+        assert_eq!(target(true), Some(GridPosition { x: 8, y: 0 }));
     }
 
     #[test]

@@ -1716,6 +1716,91 @@ fn nearest_campaign_property_target_with_connectivity(
         .map(|candidate| candidate.3)
 }
 
+/// 1つの未所有施設へ向かわせる占領兵の上限（先行担当を含む）。
+const CAPTURE_TARGET_CAP: usize = 2;
+
+/// 予備の占領兵を、担当数が上限に満たない最寄りの未所有施設へ配る。
+/// すべての施設が上限に達したら、従来どおり最寄りの施設へ送る。
+fn capped_capture_reserve_responsibilities(
+    world: &World,
+    player_id: PlayerId,
+    island_id: crate::ai::islands::IslandId,
+    remaining: Vec<Entity>,
+    assigned: &[CampaignResponsibility],
+    connectivity: &mut TerrainConnectivity,
+) -> Vec<CampaignResponsibility> {
+    let (Some(island_map), Some(map), Some(registry)) = (
+        world.get_resource::<crate::ai::islands::IslandMap>(),
+        world.get_resource::<Map>(),
+        world.get_resource::<MasterDataRegistry>(),
+    ) else {
+        return Vec::new();
+    };
+    let mut targets = world
+        .iter_entities()
+        .filter_map(|entity| {
+            let target = entity.get::<GridPosition>().copied()?;
+            let property = entity.get::<Property>()?;
+            (property.owner_id != Some(player_id)
+                && island_map
+                    .get_island_at(&target)
+                    .is_some_and(|island| island.id == island_id))
+            .then_some(target)
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by_key(|target| (target.y, target.x));
+    let mut counts: HashMap<GridPosition, usize> = HashMap::default();
+    for responsibility in assigned {
+        *counts.entry(responsibility.target).or_default() += responsibility.members.len();
+    }
+    let mut members = remaining;
+    members.sort_by_key(|entity| entity.to_bits());
+    let mut responsibilities = Vec::new();
+    for member in members {
+        let (Some(position), Some(stats)) = (
+            world.get::<GridPosition>(member),
+            world.get::<UnitStats>(member),
+        ) else {
+            continue;
+        };
+        let mut reachable = targets
+            .iter()
+            .copied()
+            .filter(|target| {
+                connectivity.is_reachable(
+                    map,
+                    registry,
+                    (position.x, position.y),
+                    (target.x, target.y),
+                    stats.movement_type,
+                )
+            })
+            .map(|target| {
+                (
+                    map.distance(position.x, position.y, target.x, target.y),
+                    target,
+                )
+            })
+            .collect::<Vec<_>>();
+        reachable.sort_by_key(|(distance, target)| (*distance, target.y, target.x));
+        let Some(target) = reachable
+            .iter()
+            .find(|(_, target)| counts.get(target).copied().unwrap_or(0) < CAPTURE_TARGET_CAP)
+            .or_else(|| reachable.first())
+            .map(|(_, target)| *target)
+        else {
+            continue;
+        };
+        *counts.entry(target).or_default() += 1;
+        responsibilities.push(CampaignResponsibility {
+            mission_type: MissionType::Capture,
+            target,
+            members: vec![member],
+        });
+    }
+    responsibilities
+}
+
 fn campaign_assignment_capture_responsibilities(
     world: &World,
     player_id: PlayerId,
@@ -1774,6 +1859,23 @@ fn campaign_assignment_capture_responsibilities(
         }
     }
 
+    // V4の互換経路では、予備を各自の最寄り施設へ一斉に送らず、1施設あたりの担当数に
+    // 上限を設けて近い順に配る。本国から流れてくる占領兵が同じ施設を選び、1施設に
+    // 数十体が集まって前線の手前を塞ぐのを防ぐ。
+    if !crate::ai::code_path::is_extended()
+        && crate::ai::resolve_player_ai_version(world, player_id)
+            == crate::ai::ai_version::AiVersion::V4
+    {
+        responsibilities.extend(capped_capture_reserve_responsibilities(
+            world,
+            player_id,
+            assignment.island_id,
+            remaining,
+            &responsibilities,
+            connectivity,
+        ));
+        return responsibilities;
+    }
     // 施設数より占領要員が多い場合も遊兵化させず、島内の到達可能な未所有施設へ予備を送る。
     for member in remaining {
         if let Some(target) = nearest_campaign_property_target_with_connectivity(
