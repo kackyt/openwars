@@ -845,7 +845,7 @@ fn best_action_for_unit(
             &mut best,
             &mut best_stationary_attack,
         );
-        consider_wait(board, unit, &tile, &mut best);
+        consider_wait(board, unit, &tile, distances, &mut best);
         consider_merges(world, board, unit, &tile, &mut best);
     }
     prefer_fire_in_place(board, unit, best_stationary_attack, &mut best);
@@ -992,11 +992,12 @@ fn attack_priority(
     }
 }
 
-/// 待機。自軍生産口を塞ぐ待機と、campaign目標から遠ざかる待機はしない。
+/// 待機。自軍生産口を塞ぐ待機と、campaign目標から（経路長で）遠ざかる待機はしない。
 fn consider_wait(
     board: &SmallMapBoard,
     unit: &SmallMapUnit,
     tile: &TileCandidate,
+    distances: &mut ApproachDistances,
     best: &mut BestAction,
 ) {
     if !tile.actions.can_wait {
@@ -1042,12 +1043,9 @@ fn consider_wait(
             .flatten()
             .or(context.target)
             .is_none_or(|target| {
-                tactical
-                    .map
-                    .distance(tile.position.x, tile.position.y, target.x, target.y)
-                    > tactical
-                        .map
-                        .distance(state.position.x, state.position.y, target.x, target.y)
+                distances
+                    .target_progress(&state.stats, state.position, tile.position, target, 0)
+                    .moves_away()
             })
     });
     if moves_away_from_campaign {

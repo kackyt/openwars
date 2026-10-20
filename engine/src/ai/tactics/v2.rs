@@ -31,6 +31,8 @@ use bevy_ecs::prelude::*;
 use serde_json::json;
 
 #[cfg(test)]
+mod detour_tests;
+#[cfg(test)]
 mod probe_tests;
 #[cfg(test)]
 mod reference_point_tests;
@@ -242,7 +244,14 @@ fn best_action_for_unit(
         };
         consider_capture(world, unit, &tile, &mut best, probe.as_deref_mut());
         consider_attacks(world, board, unit, &tile, &mut best, probe.as_deref_mut());
-        consider_wait(board, unit, &tile, &mut best, probe.as_deref_mut());
+        consider_wait(
+            board,
+            unit,
+            &tile,
+            distances,
+            &mut best,
+            probe.as_deref_mut(),
+        );
         consider_merges(world, unit, &tile, &mut best, probe.as_deref_mut());
     }
     best
@@ -509,12 +518,13 @@ fn attack_priority(
     }
 }
 
-/// 待機。campaign所属unitは、作戦目標から遠ざかる移動で待機しない。
+/// 待機。campaign所属unitは、作戦目標から（経路長で）遠ざかる移動で待機しない。
 /// 非占領unitは参照点に働ける距離の内側なら、射点・前衛・明け渡しのための位置替えを許す。
 fn consider_wait(
     board: &TacticalBoard,
     unit: &UnitTactics,
     tile: &TileCandidate,
+    distances: &mut ApproachDistances,
     best: &mut BestAction,
     mut probe: Option<&mut UnitProbe>,
 ) {
@@ -534,22 +544,21 @@ fn consider_wait(
             return false;
         }
         context.target.is_none_or(|target| {
-            let candidate =
-                board
-                    .map
-                    .distance(tile.position.x, tile.position.y, target.x, target.y);
-            let current =
-                board
-                    .map
-                    .distance(state.position.x, state.position.y, target.x, target.y);
             // 参照点の周囲で働ける範囲までは「離れた」と扱わない。範囲外への後退は従来どおり拒否。
-            let allowed = if unit.treats_target_as_reference() {
-                current.max(reference_reach(&state.stats))
+            let range = if unit.treats_target_as_reference() {
+                reference_reach(&state.stats)
             } else {
-                current
+                0
             };
-            comparison = Some((target, current, candidate));
-            candidate > allowed
+            let progress = distances.target_progress(
+                &state.stats,
+                state.position,
+                tile.position,
+                target,
+                range,
+            );
+            comparison = Some((target, progress));
+            progress.moves_away()
         })
     });
     if moves_away_from_campaign {
@@ -560,9 +569,11 @@ fn consider_wait(
                 "wait_move_no_campaign_target"
             };
             trace.reject(reason,tile.position,||json!({
-                "target":comparison.map(|(t,_,_)|[t.x,t.y]),
-                "current_grid_distance":comparison.map(|(_,c,_)|c),
-                "candidate_grid_distance":comparison.map(|(_,_,c)|c),
+                "target":comparison.map(|(t,_)|[t.x,t.y]),
+                "current_grid_distance":comparison.map(|(_,p)|p.current_grid),
+                "candidate_grid_distance":comparison.map(|(_,p)|p.candidate_grid),
+                "current_path_mp":comparison.and_then(|(_,p)|p.current_path_mp),
+                "candidate_path_mp":comparison.and_then(|(_,p)|p.candidate_path_mp),
                 "is_stationary":tile.is_stationary,"repair_exception":repair_site.is_some() && state.combat_ineffective}));
         }
         return;
