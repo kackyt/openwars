@@ -6,7 +6,7 @@ use crate::ai::v4::capital_route::model::{
     CapitalRouteNodeOperationRegistry, CapitalRouteNodeScope, CapitalRoutePathRegistry,
     CapitalRouteTopology, CapitalRouteTopologyRegistry,
 };
-use crate::ai::v4::capital_route::topology::capital_route_topology_for;
+use crate::ai::v4::capital_route::topology::{capital_route_topology_for, progress_order};
 use crate::ai::v4::{
     Faction, GridPosition, HashMap, HashSet, Health, Map, MovementType, PlayerId, Property,
     Terrain, UnitStats, VecDeque, World, operation, victory_roadmap,
@@ -40,40 +40,71 @@ pub(in crate::ai::v4) fn capital_route_node_control_area(
     control_area
 }
 
+/// 拠点を、最も近い回廊セルへ占領目標として結びつける。
+///
+/// 回廊から `CAPITAL_ROUTE_REGION_RADIUS` を超えて離れた拠点は取り込まない。島全域の
+/// 占領を1セルに背負わせず、その地域で意味を持つ周辺拠点だけを出口条件にする。
+/// 等距離のセルが複数あれば自首都側（`corridor` の先頭側）を選ぶ。戻り値は目標を持つ
+/// セルだけを `corridor` の順に並べ、各セルの目標は y・x 順に整列・重複除去する。
+pub(in crate::ai::v4) fn attach_capture_targets_to_corridor(
+    map: &Map,
+    corridor: &[GridPosition],
+    properties: impl IntoIterator<Item = GridPosition>,
+) -> Vec<(GridPosition, Vec<GridPosition>)> {
+    let mut targets_by_cell = vec![Vec::new(); corridor.len()];
+    for position in properties {
+        let Some((cell, distance)) = corridor
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| (index, map.distance(position.x, position.y, cell.x, cell.y)))
+            .min_by_key(|(index, distance)| (*distance, *index))
+        else {
+            continue;
+        };
+        if distance <= CAPITAL_ROUTE_REGION_RADIUS {
+            targets_by_cell[cell].push(position);
+        }
+    }
+    corridor
+        .iter()
+        .zip(targets_by_cell)
+        .filter(|(_, targets)| !targets.is_empty())
+        .map(|(cell, mut targets)| {
+            targets.sort_unstable_by_key(|position| (position.y, position.x));
+            targets.dedup();
+            (*cell, targets)
+        })
+        .collect()
+}
+
 /// 近接する二次元のCapture群を、一つのArea Operationへ統合する。
 ///
 /// 同じ対象集合を複数Nodeへ複製すると、一拠点の奪回で全Nodeが同時に未完了へ戻る。
 /// 先頭Nodeだけへ地域の全対象を持たせ、後続Nodeからは対象を除くことで、複数の
 /// Capture Squadによる並行占領と、単一の完了判定を両立する。一直線の回廊は統合せず、
-/// map_25のように前方へ順番に確保する。
+/// map_25のように前方へ順番に確保する。`capture_regions` は（代表セル, 占領目標）を
+/// 自首都からの進行順に並べたもので、統合で空になった目標も要素として残す。
 pub(in crate::ai::v4) fn consolidate_nearby_capture_target_regions(
     map: &Map,
-    node_anchors: &[GridPosition],
-    capture_targets: &mut [Vec<GridPosition>],
+    capture_regions: &mut [(GridPosition, Vec<GridPosition>)],
 ) {
-    let capture_nodes = capture_targets
-        .iter()
-        .enumerate()
-        .filter_map(|(index, targets)| (!targets.is_empty()).then_some(index))
-        .collect::<Vec<_>>();
     let mut start = 0;
-    while start < capture_nodes.len() {
-        let first_node = capture_nodes[start];
+    while start < capture_regions.len() {
+        let first_anchor = capture_regions[start].0;
         let mut end = start + 1;
-        while end < capture_nodes.len()
+        while end < capture_regions.len()
             && map.distance(
-                node_anchors[first_node].x,
-                node_anchors[first_node].y,
-                node_anchors[capture_nodes[end]].x,
-                node_anchors[capture_nodes[end]].y,
+                first_anchor.x,
+                first_anchor.y,
+                capture_regions[end].0.x,
+                capture_regions[end].0.y,
             ) <= CAPITAL_ROUTE_REGION_RADIUS
         {
             end += 1;
         }
-        let group = &capture_nodes[start..end];
-        let mut regional_targets = group
+        let mut regional_targets = capture_regions[start..end]
             .iter()
-            .flat_map(|index| capture_targets[*index].iter().copied())
+            .flat_map(|(_, targets)| targets.iter().copied())
             .collect::<Vec<_>>();
         regional_targets.sort_unstable_by_key(|position| (position.y, position.x));
         regional_targets.dedup();
@@ -90,9 +121,9 @@ pub(in crate::ai::v4) fn consolidate_nearby_capture_target_regions(
             .len()
             > 1;
         if regional_targets.len() > 1 && spans_multiple_columns && spans_multiple_rows {
-            capture_targets[first_node] = regional_targets;
-            for index in &group[1..] {
-                capture_targets[*index].clear();
+            capture_regions[start].1 = regional_targets;
+            for (_, targets) in &mut capture_regions[start + 1..end] {
+                targets.clear();
             }
         }
         start = end;
@@ -137,80 +168,69 @@ pub(in crate::ai::v4) fn ensure_capital_route_node_operations(
         if key.player_id != player_id {
             continue;
         }
-        // Capture Nodeは、回廊から離れすぎた拠点を取り込まない。島全域の占領を
-        // 1セルNodeに背負わせず、その地域で意味を持つ周辺拠点だけを出口条件にする。
-        let mut capture_targets = vec![Vec::new(); topology.nodes.len()];
-        for (position, _) in &properties {
-            if *position == topology.nodes[topology.start_node.0].anchor
-                || island_map
-                    .get_island_at(position)
-                    .is_none_or(|island| island.id != key.island_id)
-            {
-                continue;
-            }
-            let Some((node, distance)) = topology
-                .nodes
+        // 占領目標の結びつけはDAGのノード番号ではなく、回廊セルの集合で決める。
+        let home = topology.nodes[topology.start_node.0].anchor;
+        let mut capture_regions = attach_capture_targets_to_corridor(
+            &map,
+            &topology.corridor,
+            properties
                 .iter()
-                .enumerate()
-                .map(|(index, node)| {
-                    (
-                        index,
-                        map.distance(position.x, position.y, node.anchor.x, node.anchor.y),
-                    )
-                })
-                .min_by_key(|(index, distance)| (*distance, *index))
-            else {
-                continue;
-            };
-            if distance <= CAPITAL_ROUTE_REGION_RADIUS {
-                capture_targets[node].push(*position);
-            }
-        }
-        for targets in &mut capture_targets {
-            targets.sort_unstable_by_key(|position| (position.y, position.x));
-            targets.dedup();
-        }
-        let node_anchors = topology
-            .nodes
-            .iter()
-            .map(|node| node.anchor)
-            .collect::<Vec<_>>();
+                .map(|(position, _)| *position)
+                .filter(|position| {
+                    *position != home
+                        && island_map
+                            .get_island_at(position)
+                            .is_some_and(|island| island.id == key.island_id)
+                }),
+        );
         if topology.routes.len() >= 2 {
-            consolidate_nearby_capture_target_regions(&map, &node_anchors, &mut capture_targets);
+            consolidate_nearby_capture_target_regions(&map, &mut capture_regions);
         }
+        let capture_targets = capture_regions
+            .into_iter()
+            .filter(|(_, targets)| !targets.is_empty())
+            .collect::<HashMap<_, _>>();
+        let no_targets = Vec::new();
+        let capture_targets_at = |index: usize| {
+            capture_targets
+                .get(&topology.nodes[index].anchor)
+                .unwrap_or(&no_targets)
+        };
         // 移動用のセルDAGを、そのまま作戦Nodeにはしない。全セルをNodeにすると、1マス
         // ごとに次手番の状態更新を待ち、開けた地形の代替経路まで全て制圧する誤った
         // 前提DAGになる。地形・拠点スキャンで意味のあるMilestoneだけを選ぶ。
         let mut operation_indices =
             HashSet::from_iter([topology.start_node.0, topology.goal_node.0]);
-        for (index, targets) in capture_targets.iter().enumerate() {
-            if !targets.is_empty() {
-                operation_indices.insert(index);
-            }
-        }
-        for route in &topology.routes {
-            if let Some(index) = topology
-                .nodes
+        operation_indices.extend(
+            capture_targets
+                .keys()
+                .filter_map(|anchor| topology.node_at(*anchor))
+                .map(|node| node.0),
+        );
+        operation_indices.extend(
+            topology
+                .routes
                 .iter()
-                .position(|node| node.anchor == route.front)
-            {
-                operation_indices.insert(index);
-            }
-        }
+                .filter_map(|route| topology.node_at(route.front))
+                .map(|node| node.0),
+        );
         for index in 0..topology.nodes.len() {
             if let Some(exit) =
                 capital_route_crossing_exit(&map, &topology, CapitalRouteNodeId(index))
             {
                 operation_indices.insert(index);
-                if let Some(exit_index) = topology.nodes.iter().position(|node| node.anchor == exit)
-                {
-                    operation_indices.insert(exit_index);
+                if let Some(exit_node) = topology.node_at(exit) {
+                    operation_indices.insert(exit_node.0);
                 }
             }
         }
         let mut operation_indices = operation_indices.into_iter().collect::<Vec<_>>();
         operation_indices.sort_unstable();
         let operation_index_set = operation_indices.iter().copied().collect::<HashSet<_>>();
+        let operation_anchor_set = operation_indices
+            .iter()
+            .map(|&index| topology.nodes[index].anchor)
+            .collect::<HashSet<_>>();
 
         // 圧縮後のedgeは、あるMilestoneから次のMilestoneへ到達可能という地理的な
         // 選択肢を表す。途中セルは移動経路へ残すが、作戦の状態遷移を増やさない。
@@ -247,12 +267,12 @@ pub(in crate::ai::v4) fn ensure_capital_route_node_operations(
         // `entry`で保持するため、橋の通過実績を失わない。
         operations
             .operations
-            .retain(|id, _| id.topology != key || operation_index_set.contains(&id.node.0));
+            .retain(|id, _| id.topology != key || operation_anchor_set.contains(&id.anchor));
         for &index in &operation_indices {
             let node = &topology.nodes[index];
             let id = CapitalRouteNodeOperationId {
                 topology: key,
-                node: CapitalRouteNodeId(index),
+                anchor: node.anchor,
             };
             let crossing_exit =
                 capital_route_crossing_exit(&map, &topology, CapitalRouteNodeId(index));
@@ -262,7 +282,7 @@ pub(in crate::ai::v4) fn ensure_capital_route_node_operations(
             let scope = if crossing_exit.is_some()
                 || (operation_predecessors[index].len() <= 1
                     && operation_successors[index].len() <= 1
-                    && capture_targets[index].len() <= 1)
+                    && capture_targets_at(index).len() <= 1)
             {
                 CapitalRouteNodeScope::Point
             } else {
@@ -274,14 +294,14 @@ pub(in crate::ai::v4) fn ensure_capital_route_node_operations(
                 key.island_id,
                 node.anchor,
                 scope,
-                &capture_targets[index],
+                capture_targets_at(index),
             );
             if let Some(exit) = crossing_exit
                 && !control_area.contains(&exit)
             {
                 control_area.push(exit);
             }
-            let objective = if capture_targets[index].is_empty() {
+            let objective = if capture_targets_at(index).is_empty() {
                 CapitalRouteNodeObjective::Control
             } else {
                 CapitalRouteNodeObjective::Capture
@@ -294,24 +314,22 @@ pub(in crate::ai::v4) fn ensure_capital_route_node_operations(
                     anchor: node.anchor,
                     predecessors: operation_predecessors[index]
                         .iter()
-                        .copied()
                         .map(|node| CapitalRouteNodeOperationId {
                             topology: key,
-                            node,
+                            anchor: topology.nodes[node.0].anchor,
                         })
                         .collect(),
                     successors: operation_successors[index]
                         .iter()
-                        .copied()
                         .map(|node| CapitalRouteNodeOperationId {
                             topology: key,
-                            node,
+                            anchor: topology.nodes[node.0].anchor,
                         })
                         .collect(),
                     objective,
                     scope,
                     control_area,
-                    capture_targets: capture_targets[index].clone(),
+                    capture_targets: capture_targets_at(index).clone(),
                     crossing_exit,
                     crossed: false,
                     state: victory_roadmap::RoadmapNodeState::Locked,
@@ -440,18 +458,23 @@ pub(in crate::ai::v4) fn refresh_capital_route_node_operations(
         if key.player_id != player_id {
             continue;
         }
+        let home = topology.nodes[topology.start_node.0].anchor;
+        // 前提作戦を先に評価できるよう、自首都側から進行順に並べる。
+        let mut operation_ids = operations
+            .operations
+            .keys()
+            .copied()
+            .filter(|id| id.topology == key)
+            .collect::<Vec<_>>();
+        operation_ids.sort_unstable_by_key(|id| progress_order(&topology.from_home, id.anchor));
         // まず担当情報だけを毎手番リセットする。`crossed`は橋を越えた盤面事実なので
         // 消さず、Node状態は下の観測・dependency計算で再構築する。
-        for index in 0..topology.nodes.len() {
-            let id = CapitalRouteNodeOperationId {
-                topology: key,
-                node: CapitalRouteNodeId(index),
-            };
-            let Some(operation) = operations.operations.get_mut(&id) else {
+        for id in &operation_ids {
+            let Some(operation) = operations.operations.get_mut(id) else {
                 continue;
             };
             operation.assigned_squads.clear();
-            operation.state = if index == topology.start_node.0 {
+            operation.state = if id.anchor == home {
                 victory_roadmap::RoadmapNodeState::Secured
             } else {
                 victory_roadmap::RoadmapNodeState::Locked
@@ -460,12 +483,8 @@ pub(in crate::ai::v4) fn refresh_capital_route_node_operations(
         // DAGのedgeは進捗を必ず増やすため、前方への線形走査で前提Nodeの出口条件を
         // 評価できる。地形DAGの合流edgeは「複数経路のいずれから来てもよい」という
         // 代替関係であり、全経路の同時制圧を要求する依存辺ではない。
-        for index in 0..topology.nodes.len() {
-            let id = CapitalRouteNodeOperationId {
-                topology: key,
-                node: CapitalRouteNodeId(index),
-            };
-            if index == topology.start_node.0 {
+        for &id in &operation_ids {
+            if id.anchor == home {
                 continue;
             }
             let Some(operation) = operations.operations.get(&id).cloned() else {
@@ -561,7 +580,7 @@ pub(in crate::ai::v4) fn refresh_capital_route_node_operations(
         }) {
             let id = CapitalRouteNodeOperationId {
                 topology: key,
-                node: commitment.target_node,
+                anchor: commitment.target_anchor,
             };
             let Some(operation) = operations.operations.get_mut(&id) else {
                 continue;
@@ -657,13 +676,13 @@ pub(in crate::ai::v4) fn capital_route_assault_authorized_from_dag(
     island_id: crate::ai::islands::IslandId,
 ) -> Option<bool> {
     let topology = capital_route_topology_for(world, player_id, island_id)?;
-    let total_progress = topology.nodes[topology.goal_node.0].progress.max(1);
+    let goal = topology.nodes[topology.goal_node.0].anchor;
+    let total_progress = topology.from_home.get(&goal).copied()?.max(1);
     let frontiers = capital_route_dag_frontier_properties(world, player_id, island_id)?;
     Some(frontiers.iter().flatten().any(|frontier| {
         topology
-            .nodes
-            .iter()
-            .find(|node| node.anchor == *frontier)
-            .is_some_and(|node| node.progress.saturating_mul(2) >= total_progress)
+            .from_home
+            .get(frontier)
+            .is_some_and(|progress| progress.saturating_mul(2) >= total_progress)
     }))
 }
