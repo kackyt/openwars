@@ -434,6 +434,13 @@ fn route_front_responsibilities(
         remaining.len(),
         &demands,
     );
+    // 配る先は進軍路の固定識別点ではなく、DAGで求めた各進軍路の現在の前線にする。
+    // DAGが無い（初期化前の）島だけ識別点を使う。
+    let fronts = crate::ai::v4::capital_route::node_operation::capital_route_current_fronts(
+        world, player, island,
+    )
+    .filter(|current| current.len() == fronts.len())
+    .unwrap_or(fronts);
     let groups = super::combat_responsibilities::distribute_members_across_route_fronts(
         world, map, remaining, &fronts, &slots,
     );
@@ -608,7 +615,7 @@ pub(super) fn objective_combat_responsibilities(
         .map(|(unit, _)| unit.entity)
         .collect::<Vec<_>>();
     // 進軍路が2本以上の島では、余った戦闘役を占領目標そのものへ集めず、首都ルートの
-    // 前線へルートごとの必要戦力に応じて配る。進軍路が1本以下の島は従来どおり
+    // 各進軍路の現在の前線へ、ルートごとの必要戦力に応じて配る。進軍路が1本以下の島は従来どおり
     // 占領目標へ前進させる。
     responsibilities.extend(route_front_responsibilities(
         world,

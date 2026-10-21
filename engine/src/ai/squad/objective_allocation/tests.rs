@@ -319,3 +319,33 @@ fn two_route_island_sends_surplus_combat_to_each_route_front() {
         .collect::<HashSet<_>>();
     assert_eq!(targets, fronts.into_iter().collect::<HashSet<_>>());
 }
+
+/// 首都ルートDAGがある島では、余った戦闘役を固定の識別点ではなく各進軍路の現在の前線へ配る。
+#[test]
+fn surplus_combat_follows_current_route_fronts_when_dag_exists() {
+    let (mut world, island) = real_map("map_6", ENEMY);
+    crate::ai::v4::capital_route::prepare_capital_route_topologies(&mut world, ENEMY);
+    let current_fronts =
+        crate::ai::v4::capital_route::node_operation::capital_route_current_fronts(
+            &world, ENEMY, island,
+        )
+        .expect("DAGの前線");
+    let mut remaining = current_fronts
+        .iter()
+        .flat_map(|front| [0, 1].map(|_| world.spawn(*front).id()))
+        .collect::<Vec<_>>();
+    let map = world.resource::<Map>().clone();
+
+    let responsibilities =
+        route_front_responsibilities(&world, &map, ENEMY, island, &mut remaining);
+
+    assert!(remaining.is_empty(), "余った戦闘役を配り切る");
+    let targets = responsibilities
+        .iter()
+        .map(|responsibility| responsibility.target)
+        .collect::<HashSet<_>>();
+    assert!(
+        targets.is_subset(&current_fronts.iter().copied().collect()),
+        "配属先 {targets:?} は現在の前線 {current_fronts:?} のいずれか"
+    );
+}

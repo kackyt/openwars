@@ -21,10 +21,10 @@ use crate::ai::v4::capital_route::model::{
 };
 use crate::ai::v4::capital_route::node_operation::{
     attach_capture_targets_to_corridor, capital_route_assault_authorized_from_dag,
-    capital_route_dag_frontier_properties, capital_route_node_control_area,
-    capital_route_node_exit_satisfied, capital_route_node_predecessors_released,
-    consolidate_nearby_capture_target_regions, ensure_capital_route_node_operations,
-    refresh_capital_route_node_operations,
+    capital_route_current_fronts, capital_route_dag_frontier_properties,
+    capital_route_node_control_area, capital_route_node_exit_satisfied,
+    capital_route_node_predecessors_released, consolidate_nearby_capture_target_regions,
+    ensure_capital_route_node_operations, refresh_capital_route_node_operations,
 };
 use crate::ai::v4::capital_route::prepare_capital_route_topologies;
 use crate::ai::v4::capital_route::tactical::{
@@ -1778,6 +1778,69 @@ fn map6_route_world(player: PlayerId) -> (World, crate::ai::islands::IslandId) {
     prepare_capital_route_topologies(&mut world, player);
     ensure_capital_route_node_operations(&mut world, player);
     (world, island)
+}
+
+/// 進軍路の現在の前線は、その進軍路の前線拠点のうち最も前進した拠点である。
+#[test]
+fn current_route_fronts_are_the_most_advanced_frontier_properties() {
+    let player = PlayerId(2);
+    let (world, island) = map6_route_world(player);
+    let topology = capital_route_topology_for(&world, player, island).expect("map_6の進軍回廊");
+    let frontiers = capital_route_dag_frontier_properties(&world, player, island).unwrap();
+
+    let fronts = capital_route_current_fronts(&world, player, island).unwrap();
+
+    assert_eq!(fronts.len(), topology.routes.len());
+    for (route, front) in fronts.iter().enumerate() {
+        assert!(
+            frontiers[route].contains(front),
+            "route {route} の前線 {front:?} は前線拠点 {:?} の一つ",
+            frontiers[route]
+        );
+        let front_progress = topology.from_home[front];
+        assert!(
+            frontiers[route]
+                .iter()
+                .all(|property| topology.from_home[property] <= front_progress),
+            "route {route} の前線は最も前進した前線拠点"
+        );
+    }
+    assert!(
+        fronts
+            .iter()
+            .zip(&topology.routes)
+            .any(|(front, route)| *front != route.front),
+        "固定の識別点ではなく、盤面の所有状況から前線を求める"
+    );
+}
+
+/// 敵首都以外の拠点をすべて確保した進軍路では、敵首都を前線にする。
+#[test]
+fn current_route_fronts_fall_back_to_enemy_capital_once_cleared() {
+    let player = PlayerId(2);
+    let (mut world, island) = map6_route_world(player);
+    let goal = {
+        let topology = capital_route_topology_for(&world, player, island).unwrap();
+        topology.nodes[topology.goal_node.0].anchor
+    };
+    let properties = world
+        .iter_entities()
+        .filter_map(|entity| {
+            let property = entity.get::<Property>()?;
+            (property.terrain != Terrain::Capital).then_some(entity.id())
+        })
+        .collect::<Vec<_>>();
+    for entity in properties {
+        world
+            .entity_mut(entity)
+            .get_mut::<Property>()
+            .expect("Propertyを持つEntity")
+            .owner_id = Some(player);
+    }
+
+    let fronts = capital_route_current_fronts(&world, player, island).unwrap();
+
+    assert_eq!(fronts, vec![goal; fronts.len()]);
 }
 
 /// 区間目標の拠点が地域Nodeの占領対象にまとめられているだけなら、そのNodeのanchorを

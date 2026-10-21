@@ -686,3 +686,48 @@ pub(in crate::ai::v4) fn capital_route_assault_authorized_from_dag(
             .is_some_and(|progress| progress.saturating_mul(2) >= total_progress)
     }))
 }
+
+/// 各進軍路の現在の前線を返す。DAGが無い島では `None`。
+///
+/// 進軍路の識別点（`CapitalRoute::front`）は地形から一度だけ決める固定点で、戦線が
+/// 進んでも動かない。余った戦闘役をそこへ送ると、戦線が敵首都の周りへ移った後も
+/// 中盤の識別点へ向かい続ける（map_6 では R31-40 に約47体が北の識別点へ向かっていた）。
+/// 代わりに、自首都から確保済みの拠点を連続してたどった先の未確保拠点（DAGの前線拠点）
+/// のうち、最も前進した拠点を使う。その進軍路に未確保拠点が残っていなければ敵首都とする。
+pub(crate) fn capital_route_current_fronts(
+    world: &World,
+    player_id: PlayerId,
+    island_id: crate::ai::islands::IslandId,
+) -> Option<Vec<GridPosition>> {
+    Some(
+        capital_route_front_properties(world, player_id, island_id)?
+            .into_iter()
+            .map(|properties| properties[0])
+            .collect(),
+    )
+}
+
+/// 各進軍路の前線拠点を、最も前進した順に返す。前線拠点が無い進軍路は敵首都だけを持つ。
+pub(crate) fn capital_route_front_properties(
+    world: &World,
+    player_id: PlayerId,
+    island_id: crate::ai::islands::IslandId,
+) -> Option<Vec<Vec<GridPosition>>> {
+    let topology = capital_route_topology_for(world, player_id, island_id)?;
+    let frontiers = capital_route_dag_frontier_properties(world, player_id, island_id)?;
+    let goal = topology.nodes[topology.goal_node.0].anchor;
+    Some(
+        frontiers
+            .into_iter()
+            .map(|mut properties| {
+                properties.sort_unstable_by_key(|position| {
+                    std::cmp::Reverse(progress_order(&topology.from_home, *position))
+                });
+                if properties.is_empty() {
+                    properties.push(goal);
+                }
+                properties
+            })
+            .collect(),
+    )
+}
