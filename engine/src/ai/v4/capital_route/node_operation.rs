@@ -731,3 +731,60 @@ pub(crate) fn capital_route_front_properties(
             .collect(),
     )
 }
+
+/// 敵首都の攻略で、首都の敵に有効打を持たない部隊が待つ位置の、首都からの手前ステップ数。
+///
+/// map_6 では首都の袋地の入口の外に、入口の敵を射程に収める広場がある。待機をその広場より
+/// 手前に置き、射撃位置を有効打を持つ部隊へ空ける（7ステップでは広場の中になった）。
+const CAPITAL_ASSAULT_STAGING_STEPS: u32 = 11;
+
+/// 終盤の敵首都攻略の地理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CapitalAssaultGeometry {
+    /// 敵首都。
+    pub(crate) capital: GridPosition,
+    /// 首都の敵に有効打を持たない部隊が、射撃位置を空けて待つ回廊セル。
+    pub(crate) staging: GridPosition,
+}
+
+/// 敵首都の地域とみなす、首都からの距離。
+pub(crate) fn capital_assault_region_radius() -> u32 {
+    CAPITAL_ROUTE_REGION_RADIUS.saturating_add(1)
+}
+
+/// 全進軍路の全前線拠点が敵首都の地域に入ったときだけ、首都攻略の地理を返す。
+///
+/// 最も前進した前線拠点だけを見ると、拠点を通らない経路がある進軍路では中盤から首都の
+/// 地域に達してしまうため、前線拠点をすべて見る。
+pub(crate) fn capital_assault_geometry(
+    world: &World,
+    player_id: PlayerId,
+    island_id: crate::ai::islands::IslandId,
+) -> Option<CapitalAssaultGeometry> {
+    let topology = capital_route_topology_for(world, player_id, island_id)?;
+    let map = world.get_resource::<Map>()?;
+    let capital = topology.nodes[topology.goal_node.0].anchor;
+    let front_properties = capital_route_front_properties(world, player_id, island_id)?;
+    if !front_properties.iter().flatten().all(|front| {
+        map.distance(front.x, front.y, capital.x, capital.y) <= CAPITAL_ROUTE_REGION_RADIUS
+    }) {
+        return None;
+    }
+    let staging_progress = topology
+        .from_home
+        .get(&capital)?
+        .saturating_sub(CAPITAL_ASSAULT_STAGING_STEPS);
+    let staging = topology
+        .corridor
+        .iter()
+        .copied()
+        .filter(|cell| topology.from_home.get(cell) == Some(&staging_progress))
+        .min_by_key(|cell| {
+            (
+                map.distance(cell.x, cell.y, capital.x, capital.y),
+                cell.y,
+                cell.x,
+            )
+        })?;
+    Some(CapitalAssaultGeometry { capital, staging })
+}

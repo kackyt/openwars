@@ -427,6 +427,12 @@ fn route_front_responsibilities(
     if fronts.len() < 2 || remaining.is_empty() {
         return Vec::new();
     }
+    // 全進軍路の前線が敵首都の地域に入った終盤は、前線拠点の防衛ではなく首都への攻撃にする。
+    if let Some(geometry) = crate::ai::v4::capital_route::node_operation::capital_assault_geometry(
+        world, player, island,
+    ) {
+        return capital_assault_responsibilities(world, map, player, geometry, remaining);
+    }
     let demands = crate::ai::v4::capital_route::force_demand::same_land_route_force_demands(
         world, player, island,
     );
@@ -455,6 +461,58 @@ fn route_front_responsibilities(
             members,
         })
         .collect()
+}
+
+/// 敵首都の攻略で、余った戦闘役を首都への攻撃（Attack）へ回す。首都の地域にいる敵に
+/// 有効打を持たない部隊（対空専用など）は、入口の射撃位置を塞がないよう手前で待たせる。
+///
+/// 防衛（Defense）のままでは有利な交換しか攻撃せず、敵首都の袋地で生産され続ける敵を
+/// 削り切れない。Attackにすると、作戦上必要な攻撃として不利な交換も受け入れる。
+fn capital_assault_responsibilities(
+    world: &World,
+    map: &Map,
+    player: PlayerId,
+    geometry: crate::ai::v4::capital_route::node_operation::CapitalAssaultGeometry,
+    remaining: &mut Vec<Entity>,
+) -> Vec<CampaignResponsibility> {
+    let capital = geometry.capital;
+    let radius = crate::ai::v4::capital_route::node_operation::capital_assault_region_radius();
+    let enemy_types = world
+        .iter_entities()
+        .filter_map(|entity| unit_view(world, entity.id()))
+        .filter(|unit| {
+            unit.owner != player
+                && map.distance(unit.position.x, unit.position.y, capital.x, capital.y) <= radius
+        })
+        .map(|unit| unit.stats.unit_type)
+        .collect::<Vec<_>>();
+    let chart = world.get_resource::<DamageChart>();
+    // 首都の地域に敵がいなければ、全員で首都へ向かう（占領役の前進を援護する）。
+    let can_hit_region = |entity: Entity| {
+        enemy_types.is_empty()
+            || world.get::<UnitStats>(entity).is_some_and(|stats| {
+                chart.is_some_and(|chart| {
+                    enemy_types
+                        .iter()
+                        .any(|enemy| base_damage(chart, stats.unit_type, *enemy) > 0)
+                })
+            })
+    };
+    let (assault, staged): (Vec<_>, Vec<_>) = remaining
+        .drain(..)
+        .partition(|entity| can_hit_region(*entity));
+    [
+        (MissionType::Attack, capital, assault),
+        (MissionType::Defense, geometry.staging, staged),
+    ]
+    .into_iter()
+    .filter(|(_, _, members)| !members.is_empty())
+    .map(|(mission_type, target, members)| CampaignResponsibility {
+        mission_type,
+        target,
+        members,
+    })
+    .collect()
 }
 
 /// 施設を目的とする攻勢の戦闘責務。`objectives` は優先順の未所有施設。

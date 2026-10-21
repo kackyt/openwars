@@ -20,11 +20,12 @@ use crate::ai::v4::capital_route::model::{
     RouteForceDemand,
 };
 use crate::ai::v4::capital_route::node_operation::{
-    attach_capture_targets_to_corridor, capital_route_assault_authorized_from_dag,
-    capital_route_current_fronts, capital_route_dag_frontier_properties,
-    capital_route_node_control_area, capital_route_node_exit_satisfied,
-    capital_route_node_predecessors_released, consolidate_nearby_capture_target_regions,
-    ensure_capital_route_node_operations, refresh_capital_route_node_operations,
+    attach_capture_targets_to_corridor, capital_assault_geometry,
+    capital_route_assault_authorized_from_dag, capital_route_current_fronts,
+    capital_route_dag_frontier_properties, capital_route_node_control_area,
+    capital_route_node_exit_satisfied, capital_route_node_predecessors_released,
+    consolidate_nearby_capture_target_regions, ensure_capital_route_node_operations,
+    refresh_capital_route_node_operations,
 };
 use crate::ai::v4::capital_route::prepare_capital_route_topologies;
 use crate::ai::v4::capital_route::tactical::{
@@ -1841,6 +1842,62 @@ fn current_route_fronts_fall_back_to_enemy_capital_once_cleared() {
     let fronts = capital_route_current_fronts(&world, player, island).unwrap();
 
     assert_eq!(fronts, vec![goal; fronts.len()]);
+}
+
+/// `player` の首都戦役で、敵首都から `radius` より離れた拠点をすべて `player` の所有にする。
+fn own_properties_outside_capital_region(
+    world: &mut World,
+    player: PlayerId,
+    capital: GridPosition,
+    radius: u32,
+) {
+    let map = world.resource::<Map>().clone();
+    let properties = world
+        .iter_entities()
+        .filter_map(|entity| {
+            let position = entity.get::<GridPosition>()?;
+            entity.get::<Property>()?;
+            (map.distance(position.x, position.y, capital.x, capital.y) > radius)
+                .then_some(entity.id())
+        })
+        .collect::<Vec<_>>();
+    for entity in properties {
+        world
+            .entity_mut(entity)
+            .get_mut::<Property>()
+            .expect("Propertyを持つEntity")
+            .owner_id = Some(player);
+    }
+}
+
+/// 序盤は前線拠点が敵首都の地域の外にも残るので、首都攻略の段階に入らない。
+#[test]
+fn capital_assault_waits_until_every_front_property_is_near_the_capital() {
+    let player = PlayerId(2);
+    let (world, island) = map6_route_world(player);
+
+    assert_eq!(capital_assault_geometry(&world, player, island), None);
+}
+
+/// 首都の地域の外の拠点をすべて確保すると首都攻略に入り、待機地点は首都の入口の外
+/// （首都から11ステップ手前の回廊セル）になる。
+#[test]
+fn capital_assault_starts_once_only_the_capital_region_remains() {
+    let player = PlayerId(2);
+    let (mut world, island) = map6_route_world(player);
+    let (goal, goal_progress) = {
+        let topology = capital_route_topology_for(&world, player, island).unwrap();
+        let goal = topology.nodes[topology.goal_node.0].anchor;
+        (goal, topology.from_home[&goal])
+    };
+    own_properties_outside_capital_region(&mut world, player, goal, CAPITAL_ROUTE_REGION_RADIUS);
+
+    let geometry = capital_assault_geometry(&world, player, island).expect("首都攻略の段階");
+
+    let topology = capital_route_topology_for(&world, player, island).unwrap();
+    assert_eq!(geometry.capital, goal);
+    assert!(topology.corridor.contains(&geometry.staging));
+    assert_eq!(topology.from_home[&geometry.staging] + 11, goal_progress);
 }
 
 /// 区間目標の拠点が地域Nodeの占領対象にまとめられているだけなら、そのNodeのanchorを

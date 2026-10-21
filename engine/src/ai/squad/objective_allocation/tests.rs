@@ -349,3 +349,65 @@ fn surplus_combat_follows_current_route_fronts_when_dag_exists() {
         "配属先 {targets:?} は現在の前線 {current_fronts:?} のいずれか"
     );
 }
+
+/// 敵首都の攻略では、首都の地域の敵に有効打を持つ余った戦闘役を首都への攻撃へ回し、
+/// 有効打を持たない部隊（対空ミサイル対歩兵）は入口の外で待たせる。
+#[test]
+fn capital_assault_attacks_with_effective_units_and_stages_the_rest() {
+    let (mut world, island) = real_map("map_6", ENEMY);
+    crate::ai::v4::capital_route::prepare_capital_route_topologies(&mut world, ENEMY);
+    let capital = world
+        .iter_entities()
+        .find_map(|entity| {
+            let position = entity.get::<GridPosition>()?;
+            let property = entity.get::<Property>()?;
+            (property.terrain == Terrain::Capital && property.owner_id == Some(ME))
+                .then_some(*position)
+        })
+        .expect("敵首都");
+    let map = world.resource::<Map>().clone();
+    let outside = world
+        .iter_entities()
+        .filter_map(|entity| {
+            let position = entity.get::<GridPosition>()?;
+            entity.get::<Property>()?;
+            (map.distance(position.x, position.y, capital.x, capital.y) > 3).then_some(entity.id())
+        })
+        .collect::<Vec<_>>();
+    for entity in outside {
+        world
+            .entity_mut(entity)
+            .get_mut::<Property>()
+            .unwrap()
+            .owner_id = Some(ENEMY);
+    }
+    let geometry = crate::ai::v4::capital_route::node_operation::capital_assault_geometry(
+        &world, ENEMY, island,
+    )
+    .expect("首都攻略の段階");
+    let chart = world.resource::<DamageChart>();
+    assert!(base_damage(chart, UnitType::Tank, UnitType::Infantry) > 0);
+    assert_eq!(
+        base_damage(chart, UnitType::Missiles, UnitType::Infantry),
+        0
+    );
+    let defender = GridPosition {
+        x: capital.x + 1,
+        y: capital.y,
+    };
+    unit(&mut world, ME, UnitType::Infantry, defender, 100);
+    let tank = unit(&mut world, ENEMY, UnitType::Tank, geometry.staging, 100);
+    let missiles = unit(&mut world, ENEMY, UnitType::Missiles, geometry.staging, 100);
+    let mut remaining = vec![tank, missiles];
+
+    let responsibilities =
+        route_front_responsibilities(&world, &map, ENEMY, island, &mut remaining);
+
+    assert!(remaining.is_empty());
+    let for_tank = responsibility_of(&responsibilities, tank);
+    assert_eq!(for_tank.mission_type, MissionType::Attack);
+    assert_eq!(for_tank.target, capital);
+    let for_missiles = responsibility_of(&responsibilities, missiles);
+    assert_eq!(for_missiles.mission_type, MissionType::Defense);
+    assert_eq!(for_missiles.target, geometry.staging);
+}
