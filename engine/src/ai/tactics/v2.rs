@@ -15,6 +15,7 @@ use super::scoring::{
 };
 use super::unit::UnitState;
 use crate::ai::command::AiCommand;
+use crate::ai::tactics::blockade::{BlockadeTile, EnemyProductionBlockade};
 use crate::ai::tactics::campaign::CampaignActionContext;
 use crate::ai::tactics::campaign::campaign_action_context;
 use crate::ai::tactics::campaign::campaign_mission_allows_capture;
@@ -31,6 +32,8 @@ use crate::systems::movement::calculate_reachable_tiles;
 use bevy_ecs::prelude::*;
 use serde_json::json;
 
+#[cfg(test)]
+mod capture_blockade_tests;
 #[cfg(test)]
 mod detour_tests;
 #[cfg(test)]
@@ -58,6 +61,13 @@ pub(crate) fn decide_action(
             .unwrap_or_default(),
     );
     let board = TacticalBoard::observe(world, player_id, occupancy, squads);
+    let ai_version = crate::ai::resolve_player_ai_version(world, player_id);
+    // 敵生産口の占位（V4）。V2/V3は基準線として挙動を変えない。
+    let blockade = ai_version
+        .uses_enemy_production_blockade()
+        .then(|| EnemyProductionBlockade::observe(&board));
+    // 占領の実行（敵首都・割当物件）を前面の戦闘より優先する（V4）。
+    let executes_capture = ai_version == crate::ai::ai_version::AiVersion::V4;
     let mut probe_call = ProbeCall::start(world, player_id);
     let best = with_turn_distances(world, &board, |world, distances| {
         let mut best = BestUnitAction::default();
@@ -83,7 +93,15 @@ pub(crate) fn decide_action(
             }
             best.offer(
                 entity,
-                best_action_for_unit(world, &board, &unit, distances, probe.as_mut()),
+                best_action_for_unit(
+                    world,
+                    &board,
+                    &unit,
+                    blockade.as_ref(),
+                    executes_capture,
+                    distances,
+                    probe.as_mut(),
+                ),
             );
             if let (Some(call), Some(trace)) = (probe_call.as_mut(), probe) {
                 call.add_unit(entity, trace);
@@ -177,13 +195,18 @@ struct TileCandidate {
     base_score: i32,
     /// 実際の加算中に記録した内訳。プローブ詳細OFFでは構築しない。
     score_parts: Option<ScoreParts>,
+    /// 移動先が敵生産口なら、その占位の事実。
+    blockade: BlockadeTile,
 }
 
 /// 1体のunitの全移動先・全行動のうち最良の (優先度, score) と命令。
+#[allow(clippy::too_many_arguments)]
 fn best_action_for_unit(
     world: &World,
     board: &TacticalBoard,
     unit: &UnitTactics,
+    blockade: Option<&EnemyProductionBlockade>,
+    executes_capture: bool,
     distances: &mut ApproachDistances,
     mut probe: Option<&mut UnitProbe>,
 ) -> BestAction {
@@ -191,7 +214,16 @@ fn best_action_for_unit(
     let mut best = BestAction::default();
     let mut tiles = unit.candidate_tiles(board);
     if unit.treats_target_as_reference() {
-        vacate_reserved_capture_sites(world, board, &mut tiles, probe.as_deref_mut());
+        // 敵の生産口は、占領役の予約より占位（補充の遮断）を優先して候補に残す。
+        // 予約で外すと、占領役が着くまで敵が空いた生産口で補充を続ける。
+        let blockade_sites = blockade.map(|blockade| &blockade.sites);
+        vacate_reserved_capture_sites(
+            world,
+            board,
+            &mut tiles,
+            blockade_sites,
+            probe.as_deref_mut(),
+        );
     }
     if let Some(trace) = probe.as_deref_mut() {
         trace.tiles(tiles.len());
@@ -236,16 +268,39 @@ fn best_action_for_unit(
             probe.as_deref_mut(),
         );
         let detailed = probe.as_ref().is_some_and(|p| p.detailed);
-        let (base_score, score_parts) =
+        let (mut base_score, score_parts) =
             tile_score(world, board, unit, position, distances, detailed);
+        let tile_blockade = blockade
+            .map(|blockade| {
+                blockade.assess(
+                    board,
+                    state,
+                    position,
+                    terrain_defense_bonus(board, position),
+                )
+            })
+            .unwrap_or_default();
+        // 占位を続けられる敵生産口は、止められる補充の価値だけ位置の価値を上げる。
+        if tile_blockade.holds_site {
+            base_score += tile_blockade.site_value as i32;
+        }
         let tile = TileCandidate {
             position,
             is_stationary,
             actions,
             base_score,
             score_parts,
+            blockade: tile_blockade,
         };
-        consider_capture(world, unit, &tile, &mut best, probe.as_deref_mut());
+        consider_capture(
+            world,
+            board,
+            unit,
+            &tile,
+            executes_capture,
+            &mut best,
+            probe.as_deref_mut(),
+        );
         consider_attacks(world, board, unit, &tile, &mut best, probe.as_deref_mut());
         consider_wait(
             board,
@@ -267,6 +322,7 @@ fn vacate_reserved_capture_sites(
     world: &World,
     board: &TacticalBoard,
     tiles: &mut std::collections::BTreeSet<(usize, usize)>,
+    blockade_sites: Option<&HashSet<GridPosition>>,
     mut probe: Option<&mut UnitProbe>,
 ) {
     let reserved = tiles
@@ -274,10 +330,11 @@ fn vacate_reserved_capture_sites(
         .copied()
         .filter(|&(x, y)| {
             let position = GridPosition { x, y };
-            board
-                .properties
-                .iter()
-                .any(|(site, _, owner)| *site == position && *owner != Some(board.player_id))
+            !blockade_sites.is_some_and(|sites| sites.contains(&position))
+                && board
+                    .properties
+                    .iter()
+                    .any(|(site, _, owner)| *site == position && *owner != Some(board.player_id))
                 && crate::ai::v4::capital_route::tactical::is_capture_target_reserved(
                     world,
                     board.player_id,
@@ -391,39 +448,60 @@ fn observe_offer(
 /// 占領。campaign所属unitは、占領を許す任務で作戦島の上にいる場合だけ占領する。
 fn consider_capture(
     world: &World,
+    board: &TacticalBoard,
     unit: &UnitTactics,
     tile: &TileCandidate,
+    executes_capture: bool,
     best: &mut BestAction,
     mut probe: Option<&mut UnitProbe>,
 ) {
     if !tile.actions.can_capture {
         return;
     }
-    let outside_campaign = unit.campaign.as_ref().is_some_and(|context| {
-        !campaign_mission_allows_capture(&context.mission_type)
-            || !campaign_position_is_on_target_island(world, context, tile.position)
-    });
+    // 敵首都の占領は勝敗を決めるため、任務にかかわらず最優先で実行する。
+    let is_enemy_capital = executes_capture
+        && board.properties.iter().any(|(site, terrain, owner)| {
+            *site == tile.position
+                && *terrain == crate::resources::Terrain::Capital
+                && owner.is_some_and(|owner| owner != board.player_id)
+        });
+    let outside_campaign = !is_enemy_capital
+        && unit.campaign.as_ref().is_some_and(|context| {
+            !campaign_mission_allows_capture(&context.mission_type)
+                || !campaign_position_is_on_target_island(world, context, tile.position)
+        });
     if outside_campaign {
         if let Some(trace) = probe.as_deref_mut() {
             trace.reject("capture_campaign_constraint", tile.position, || json!({}));
         }
         return;
     }
+    // 占領任務の割当物件そのものの占領も、前面の戦闘より優先する（小規模マップと同じ）。
+    let executes_assigned_capture = executes_capture
+        && unit.squad_target == Some(tile.position)
+        && unit
+            .campaign
+            .as_ref()
+            .is_some_and(|context| context.mission_type == MissionType::Capture);
+    let priority = if is_enemy_capital || executes_assigned_capture {
+        ActionPriority::CaptureExecution
+    } else {
+        ActionPriority::Normal
+    };
     observe_offer(
         probe,
         unit,
         tile,
         "Capture",
         None,
-        (ActionPriority::Normal, tile.base_score + CAPTURE_SCORE),
+        (priority, tile.base_score + CAPTURE_SCORE),
         CAPTURE_SCORE,
     );
-    best.offer(
-        (ActionPriority::Normal, tile.base_score + CAPTURE_SCORE),
-        || AiCommand::Capture {
+    best.offer((priority, tile.base_score + CAPTURE_SCORE), || {
+        AiCommand::Capture {
             target_pos: tile.position,
-        },
-    );
+        }
+    });
 }
 
 /// 攻撃。交換予測で期待damageが0の標的、作戦上の必要がない不利交換は候補にしない。
@@ -473,7 +551,15 @@ fn consider_attacks(
             }
             continue;
         };
-        let Some(priority) = attack_priority(unit, target, exchange.is_favorable_matchup()) else {
+        let Some(priority) =
+            attack_priority(unit, target, exchange.is_favorable_matchup()).map(|priority| {
+                if tile.blockade.holds_site {
+                    priority.max(ActionPriority::EnemyProductionBlockade)
+                } else {
+                    priority
+                }
+            })
+        else {
             if let Some(trace) = probe.as_deref_mut() {
                 trace.reject("attack_priority_rejected",tile.position,||json!({"target_id":target.to_bits(),"damage":exchange.expected_damage,"counter_damage":exchange.expected_counter_damage,"favorable":exchange.is_favorable_matchup()}));
             }
@@ -541,10 +627,17 @@ fn consider_wait(
     let state = &unit.state;
     let repair_site = repair_site_at(board, state, tile.position);
     let recovery = wait_recovery_score(state, repair_site);
-    let score = tile.base_score + recovery;
+    let mut score = tile.base_score + recovery;
+    let holds_blockade = tile.blockade.holds_site;
+    // 敵生産口から始めた健全なunitが、占位を続けられない場所で待機するなら、
+    // 手放す占位の価値の2倍を減点する（小規模マップと同じ）。
+    if !holds_blockade && tile.blockade.starts_on_site && !state.combat_ineffective {
+        score -= tile.blockade.site_value as i32 * 2;
+    }
     let mut comparison = None;
     let moves_away_from_campaign = unit.campaign.as_ref().is_some_and(|context| {
-        if tile.is_stationary || repair_site.is_some() && state.combat_ineffective {
+        if tile.is_stationary || repair_site.is_some() && state.combat_ineffective || holds_blockade
+        {
             return false;
         }
         context.target.is_none_or(|target| {
@@ -582,16 +675,13 @@ fn consider_wait(
         }
         return;
     }
-    observe_offer(
-        probe,
-        unit,
-        tile,
-        "Wait",
-        None,
-        (ActionPriority::Normal, score),
-        recovery,
-    );
-    best.offer((ActionPriority::Normal, score), || AiCommand::Wait {
+    let priority = if holds_blockade {
+        ActionPriority::EnemyProductionBlockade
+    } else {
+        ActionPriority::Normal
+    };
+    observe_offer(probe, unit, tile, "Wait", None, (priority, score), recovery);
+    best.offer((priority, score), || AiCommand::Wait {
         target_pos: tile.position,
     });
 }
