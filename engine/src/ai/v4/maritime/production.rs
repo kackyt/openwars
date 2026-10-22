@@ -27,8 +27,12 @@ const STRANDED_PER_TRANSPORT_SLOT: u32 = 1;
 /// 輸送部隊がまだ揃っていなくても、本拠島に溜めてよい取り残された部隊の数。
 /// 輸送部隊が届いたときに積荷が無い状態を避ける。
 const MIN_STRANDED_BACKLOG: u32 = 2;
+/// 戦艦の上限を1隻引き上げる余剰資金（戦艦の価格の何隻分か）。
+const SURPLUS_PER_EXTRA_BATTLESHIP: u32 = 3;
 /// 余剰資金で揃える航空戦闘部隊の上限（敵航空機の数を上乗せする）。
 const MAX_AIR_COMBAT_UNITS: u32 = 6;
+/// 作戦生産に輸送船の買い足しを許す上限。
+const MAX_LANDERS: u32 = 6;
 /// 同時に保有する輸送部隊（輸送船・輸送ヘリ）の上限。
 const MAX_SEALIFT_TRANSPORTS: u32 = 6;
 
@@ -94,10 +98,11 @@ impl SealiftStatus {
     }
 }
 
-/// 作戦生産の地上部隊の購入が、運べない部隊を本拠島へ溜めるだけになるか。
+/// 作戦生産の購入が、戦局に寄与しない部隊を溜めるだけになるか。
 ///
-/// 生産施設の陸塊に仕事（未所有拠点・敵）が無く、既に取り残された部隊が輸送能力を
-/// 超えている場合に見送る。占領役以外は輸送船（港）が無い限り陸塊を出られない。
+/// - 地上部隊: 生産施設の陸塊に仕事（未所有拠点・敵）が無く、既に取り残された部隊が
+///   輸送能力を超えている場合に見送る。占領役以外は輸送船（港）が無い限り陸塊を出られない。
+/// - 輸送船: 既に十分な数を持っていれば見送り、港を戦艦の生産へ回す。
 pub(crate) fn rejects_ground_purchase(
     world: &mut World,
     player_id: PlayerId,
@@ -110,11 +115,16 @@ pub(crate) fn rejects_ground_purchase(
     else {
         return false;
     };
-    if matches!(stats.movement_type, MovementType::Air | MovementType::Ship) {
+    let lander = stats.unit_type == UnitType::Lander;
+    if !lander && matches!(stats.movement_type, MovementType::Air | MovementType::Ship) {
         return false;
     }
     let board = PlayerBoard::observe(world, player_id);
     let landmasses = Landmasses::observe(&board, player_id);
+    if lander {
+        // 港は戦艦と輸送船で取り合う。輸送船が揃った後も買い足すと戦艦を出せない。
+        return SealiftStatus::observe(&board, &landmasses, player_id).landers >= MAX_LANDERS;
+    }
     let site = GridPosition {
         x: command.target_x,
         y: command.target_y,
@@ -191,7 +201,13 @@ pub(crate) fn decide_supplementary_production(
     if let Some(transport) = transport_wish(&status, &theater) {
         wishes.push(transport);
     }
-    if theater.own_battleships < theater.battleship_cap() {
+    // 戦艦が役立つ盤面で資金が大きく余っている場合は、余剰に応じて上限を引き上げる。
+    // 使い道の無い資金は戦局に寄与しないため、射程へ捉えられる敵がいる限り艦隊へ回す。
+    let battleship_cap = match theater.battleship_cap() {
+        0 => 0,
+        cap => cap + spendable / (SURPLUS_PER_EXTRA_BATTLESHIP * cost_of(UnitType::Battleship)),
+    };
+    if theater.own_battleships < battleship_cap {
         wishes.push(UnitType::Battleship);
     }
     if let Some(aircraft) = air_wish(&board, &theater, player_id, spendable, &cost_of) {
@@ -235,7 +251,9 @@ fn transport_wish(status: &SealiftStatus, theater: &MaritimeTheater) -> Option<U
         return None;
     }
     let stranded = status.stranded_capturers + status.stranded_others;
-    if stranded <= status.capturer_slots {
+    // 取り残された部隊の買い足しは積載枠で頭打ちにする（[`rejects_ground_purchase`]）。
+    // 待機が積載枠に達したら輸送部隊を足さないと、輸送部隊を失った後に輸送力が戻らない。
+    if stranded == 0 || stranded < status.capturer_slots {
         return None;
     }
     let heavy_backlog = status.stranded_others > status.heavy_slots;

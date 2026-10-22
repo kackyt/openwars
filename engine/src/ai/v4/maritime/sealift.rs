@@ -130,6 +130,12 @@ pub(crate) fn decide_port_relief(
         .map(|(entity, ..)| entity)
         .min()?;
     let context = SealiftContext::observe(world, player_id, skip);
+    // 港・空港の生産が戦局に効く盤面（海で隔てられた首都、または敵が艦船を出している）に
+    // 限る。陸続きの盤面では、手番の初めに退かせると攻撃の機会を奪うだけになる。
+    let theater = super::theater::MaritimeTheater::observe(&context.board, player_id);
+    if !theater.capitals_separated_by_sea && theater.enemy_ships == 0 {
+        return None;
+    }
     let unit = context
         .board
         .units
@@ -508,9 +514,11 @@ impl SealiftContext {
         let capturers = cargo.iter().filter(|cargo| cargo.stats.can_capture).count() as i64;
         let fighters = cargo.len() as i64 - capturers;
         let capture_need = i64::from(info.capture_need());
-        let mut value = capturers.min(capture_need) * CAPTURE_SLOT_VALUE;
+        let assigned_capturers = capturers.min(capture_need);
+        let mut value = assigned_capturers * CAPTURE_SLOT_VALUE;
         if info.needs_combat() {
-            value += fighters * COMBAT_SLOT_VALUE;
+            // 占領枠を超えた歩兵も、敵の残る陸塊では戦力として働く。
+            value += (fighters + capturers - assigned_capturers) * COMBAT_SLOT_VALUE;
         }
         if info.enemy_capital && capturers > 0 {
             value += ENEMY_CAPITAL_BONUS;
