@@ -125,6 +125,13 @@ pub(crate) fn execute_turn_step(world: &mut World, player_id: PlayerId) -> Optio
     {
         return Some(issue_unit_command(world, entity, command));
     }
+    // 乗船待ちの占領役は通常行動から外れるため、足元の未所有拠点はここで占領させる（V4）。
+    if step.is_v4
+        && let Some((entity, command)) =
+            crate::ai::v4::forming_capture::decide_forming_capture(world, player_id, &step.acted)
+    {
+        return Some(issue_unit_command(world, entity, command));
+    }
     // 島で隔てられた盤面では、仕事の無い陸塊に取り残された地上部隊を輸送船・輸送ヘリで
     // 運ぶ（V4）。担当しない輸送部隊は従来の輸送Squadへ残す。
     if step.is_v4
