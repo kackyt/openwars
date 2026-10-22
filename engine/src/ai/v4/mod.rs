@@ -22,6 +22,7 @@ mod combat_input;
 mod combat_profile;
 pub mod deployment;
 pub mod logistics_plan;
+pub(crate) mod maritime;
 mod mission_input;
 pub mod operation;
 mod operation_builder;

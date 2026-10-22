@@ -34,6 +34,9 @@ use crate::collections::HashSet;
 use crate::components::{GridPosition, PlayerId};
 use bevy_ecs::prelude::*;
 
+/// 生産計画の列を読み進める回数の上限（見送った命令の後ろを読むため）。
+const MAX_PRODUCTION_PLAN_READS: usize = 16;
+
 /// 通常行動を選ぶ戦術。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnTactics {
@@ -109,6 +112,29 @@ pub(crate) fn execute_turn_step(world: &mut World, player_id: PlayerId) -> Optio
         )
     {
         return Some(issue_unit_command(world, entity, command));
+    }
+    // 戦艦は移動した手番に撃てないため、汎用の戦術評価より先に射撃・位置取りを決める。
+    // 他unitの攻撃より先に撃つことで、後続の直接攻撃が撃破を取りやすくなる。
+    if step.is_v4
+        && let Some((entity, command)) =
+            crate::ai::v4::maritime::decide_naval_action(world, player_id, &step.acted)
+    {
+        return Some(issue_unit_command(world, entity, command));
+    }
+    // 港・空港に居座る地上部隊を退かせ、艦船・航空機の生産枠を空ける（V4）。
+    if step.is_v4
+        && let Some((entity, command)) =
+            crate::ai::v4::maritime::decide_port_relief(world, player_id, &step.acted)
+    {
+        return Some(issue_unit_command(world, entity, command));
+    }
+    // 島で隔てられた盤面では、仕事の無い陸塊に取り残された地上部隊を輸送船・輸送ヘリで
+    // 運ぶ（V4）。担当しない輸送部隊は従来の輸送Squadへ残す。
+    if step.is_v4
+        && let Some((entity, command)) =
+            crate::ai::v4::maritime::decide_sealift_action(world, player_id, &step.acted)
+    {
+        return Some(issue_transport_command(world, entity, command));
     }
     crate::ai::wait_probe::stage(world, "transport");
     if let Some((entity, command)) = select_transport_step(world, &step) {
@@ -300,6 +326,7 @@ fn mark_acted(world: &mut World, entities: impl IntoIterator<Item = Entity>) {
 /// unit命令を適用して行動済みにし、ログ用の命令文字列を返す。
 fn issue_unit_command(world: &mut World, entity: Entity, command: AiCommand) -> String {
     let command_text = format!("{:?}", command);
+
     execute_ai_command(world, entity, command);
     mark_acted(world, [entity]);
     command_text
@@ -360,24 +387,54 @@ fn issue_production_or_end_turn(world: &mut World, step: &TurnStep) -> Option<St
         return issue_production_command(world, command);
     }
 
-    let mut planned =
-        super::super::production::decide_production(world, step.player_id).into_iter();
-    while let Some(command) = planned.next() {
-        if produced_sites.contains(&(command.target_x, command.target_y)) {
-            continue;
-        }
-        let command_text = format!("{:?}", command);
-        if failed_last_time(&command_text) {
-            if let Some(mut cooldown) = world.get_resource_mut::<AiProductionCooldown>() {
-                cooldown.0.insert((command.target_x, command.target_y));
+    // V4は計画済みの命令を1件ずつ返すため、見送った命令の後ろに残る計画も読み進める。
+    // 計画の列は呼ぶたびに短くなるが、念のため回数を施設数相当で打ち切る。
+    let mut rejected_sites: HashSet<(usize, usize)> = HashSet::default();
+    for _ in 0..MAX_PRODUCTION_PLAN_READS {
+        let mut planned =
+            super::super::production::decide_production(world, step.player_id).into_iter();
+        let mut rejected_any = false;
+        while let Some(command) = planned.next() {
+            if produced_sites.contains(&(command.target_x, command.target_y))
+                || rejected_sites.contains(&(command.target_x, command.target_y))
+            {
+                continue;
             }
-            continue;
+            let command_text = format!("{:?}", command);
+            if failed_last_time(&command_text) {
+                if let Some(mut cooldown) = world.get_resource_mut::<AiProductionCooldown>() {
+                    cooldown.0.insert((command.target_x, command.target_y));
+                }
+                continue;
+            }
+            // 仕事の無い陸塊で輸送能力を超えて地上部隊を溜める購入は見送る（V4）。
+            if step.is_v4
+                && crate::ai::v4::maritime::rejects_ground_purchase(world, step.player_id, &command)
+            {
+                rejected_sites.insert((command.target_x, command.target_y));
+                rejected_any = true;
+                continue;
+            }
+            queue.commands.extend(planned);
+            world.insert_resource(queue);
+            return issue_production_command(world, command);
         }
-        queue.commands.extend(planned);
-        world.insert_resource(queue);
-        return issue_production_command(world, command);
+        if !rejected_any {
+            break;
+        }
     }
     world.insert_resource(queue);
+    // 作戦生産が使い切らなかった資金で、海上戦域に寄与する艦船を補う（V4）。
+    if step.is_v4
+        && let Some(command) = crate::ai::v4::maritime::decide_supplementary_production(
+            world,
+            step.player_id,
+            &produced_sites.union(&rejected_sites).copied().collect(),
+        )
+        && !failed_last_time(&format!("{:?}", command))
+    {
+        return issue_production_command(world, command);
+    }
     end_turn(world, step.player_id);
     None
 }
