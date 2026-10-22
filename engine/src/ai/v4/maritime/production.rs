@@ -154,6 +154,14 @@ pub(crate) fn rejects_ground_purchase(
     }
     let status = SealiftStatus::observe(&board, &landmasses, player_id);
     let theater = MaritimeTheater::observe(&board, player_id);
+    // 揚陸作戦の間は、浜を確保する戦闘部隊を運ぶ分だけ買う。
+    let assault_active = world
+        .get_resource::<super::sealift::AssaultPlans>()
+        .is_some_and(|plans| plans.0.contains_key(&player_id));
+    let heavy_percent = match super::sealift::assault_tuning().heavy_backlog_percent {
+        Some(percent) if assault_active => percent,
+        _ => tuned("OPENWARS_HEAVY_BACKLOG_PERCENT", 100),
+    };
     if stats.can_capture {
         status.stranded_capturers + status.stranded_others
             >= (STRANDED_PER_TRANSPORT_SLOT * status.capturer_slots).max(MIN_STRANDED_BACKLOG)
@@ -162,8 +170,7 @@ pub(crate) fn rejects_ground_purchase(
         true
     } else {
         status.stranded_others
-            >= (status.heavy_slots * tuned("OPENWARS_HEAVY_BACKLOG_PERCENT", 100) / 100)
-                .max(MIN_STRANDED_BACKLOG / 2)
+            >= (status.heavy_slots * heavy_percent / 100).max(MIN_STRANDED_BACKLOG / 2)
     }
 }
 

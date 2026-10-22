@@ -48,6 +48,12 @@ pub(crate) struct AssaultTuning {
     pub(crate) embark: bool,
     /// 乗船地点の、浜への海路距離の最小からの許容幅。
     pub(crate) embark_slack: u32,
+    /// 撃てない戦艦を浜の支援位置へ集めるか。
+    pub(crate) battleship_support: bool,
+    /// 揚陸作戦の間、占領役より戦闘部隊を先に積むか。
+    pub(crate) combat_first: bool,
+    /// 揚陸作戦の間、運ぶ戦闘部隊の購入を許す積載枠の割合（%）。None なら常の基準。
+    pub(crate) heavy_backlog_percent: Option<u32>,
 }
 
 impl AssaultTuning {
@@ -69,6 +75,11 @@ impl AssaultTuning {
             beach_fire_bonus_percent: read("OPENWARS_ASSAULT_FIRE_BONUS", 100),
             embark: read("OPENWARS_ASSAULT_EMBARK", 0u32) != 0,
             embark_slack: read("OPENWARS_ASSAULT_EMBARK_SLACK", 2),
+            battleship_support: read("OPENWARS_ASSAULT_BS_SUPPORT", 0u32) != 0,
+            combat_first: read("OPENWARS_ASSAULT_COMBAT_FIRST", 0u32) != 0,
+            heavy_backlog_percent: std::env::var("OPENWARS_ASSAULT_HEAVY_PERCENT")
+                .ok()
+                .and_then(|value| value.parse().ok()),
         }
     }
 }

@@ -314,7 +314,15 @@ impl<'a> NavalBoard<'a> {
         let port_distances = sea_distances(self.board, free_ports.iter().copied());
         let current = (unit.position.x, unit.position.y);
         if self.needs_resupply(unit, port_distances.get(&current).copied()) {
-            return self.move_toward(&reachable, &port_distances, unit, true);
+            return self.move_toward(&reachable, &port_distances, unit, true, None);
+        }
+        // 揚陸作戦があれば、浜の守り（居なければ浜の周り）を射程に捉える位置へ集める。
+        if super::sealift::assault_tuning().battleship_support {
+            let support = self.beach_support_cells(unit);
+            if !support.is_empty() {
+                let approach = sea_distances(self.board, support.iter().copied());
+                return self.move_toward(&reachable, &approach, unit, false, Some(&support));
+            }
         }
 
         // 次の手番に敵を射程へ捉えられる海上セルを射撃位置とする。
@@ -325,7 +333,60 @@ impl<'a> NavalBoard<'a> {
             });
         }
         let approach = sea_distances(self.board, firing_cells.iter().copied());
-        self.move_toward(&reachable, &approach, unit, false)
+        self.move_toward(&reachable, &approach, unit, false, None)
+    }
+
+    /// 揚陸作戦の浜を支援する射撃位置。浜の守り（停泊セルの近くの敵地上部隊）を
+    /// 撃てる海上セル、守りが居なければ浜の停泊セルを射程に捉える海上セル。
+    fn beach_support_cells(&self, unit: &BoardUnit) -> HashSet<(usize, usize)> {
+        let mut cells = HashSet::default();
+        if self.beach.is_empty() {
+            return cells;
+        }
+        let radius = super::sealift::assault_tuning().defense_radius;
+        let map = &self.board.map;
+        let guards: Vec<&&BoardUnit> = self
+            .enemies
+            .iter()
+            .filter(|enemy| {
+                super::landmass::is_ground(enemy)
+                    && self.beach.iter().any(|stop| {
+                        map.distance(stop.0, stop.1, enemy.position.x, enemy.position.y) <= radius
+                    })
+            })
+            .collect();
+        for guard in &guards {
+            for cell in cells_within_ring(map, guard.position, 2, NAVAL_GUN_MAX_RANGE) {
+                if !cells.contains(&cell)
+                    && is_navigable(self.board, cell.0, cell.1)
+                    && self.expected_damage(
+                        unit,
+                        guard,
+                        guard.position,
+                        map.distance(cell.0, cell.1, guard.position.x, guard.position.y),
+                    ) > 0
+                {
+                    cells.insert(cell);
+                }
+            }
+        }
+        if guards.is_empty() {
+            for stop in &self.beach {
+                cells.extend(
+                    cells_within_ring(
+                        map,
+                        GridPosition {
+                            x: stop.0,
+                            y: stop.1,
+                        },
+                        2,
+                        NAVAL_GUN_MAX_RANGE,
+                    )
+                    .filter(|cell| is_navigable(self.board, cell.0, cell.1)),
+                );
+            }
+        }
+        cells
     }
 
     /// 戦艦の主兵装で敵（部隊、居なければ敵拠点）を捉えられる海上セル。
@@ -398,6 +459,7 @@ impl<'a> NavalBoard<'a> {
         goal_distance: &HashMap<(usize, usize), u32>,
         unit: &BoardUnit,
         returning_to_port: bool,
+        focus: Option<&HashSet<(usize, usize)>>,
     ) -> Option<AiCommand> {
         let current = (unit.position.x, unit.position.y);
         let hp = unit.health.unwrap_or(100).max(1);
@@ -431,6 +493,7 @@ impl<'a> NavalBoard<'a> {
         let firing = candidates
             .iter()
             .filter(|stop| stop.fire > 0 && !stop.lethal)
+            .filter(|stop| focus.is_none_or(|focus| focus.contains(&stop.cell)))
             .max_by_key(|stop| {
                 let survived = i64::from(hp - stop.threat_hp);
                 let fire = i64::from(stop.fire) * survived / i64::from(hp);

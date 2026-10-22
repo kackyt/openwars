@@ -347,8 +347,10 @@ impl SealiftContext {
             .own_units()
             .filter(|unit| self.landmasses.is_stranded(unit))
             .collect();
-        // 占領役を先に運ぶ（中立拠点の収入が最も早く戦局を変える）。
-        units.sort_by_key(|unit| (!unit.stats.can_capture, unit.entity));
+        // 占領役を先に運ぶ（中立拠点の収入が最も早く戦局を変える）。揚陸作戦の間は、
+        // 浜を確保する戦闘部隊を先に運ぶ。
+        let combat_first = self.assault.is_some() && assault_tuning().combat_first;
+        units.sort_by_key(|unit| (unit.stats.can_capture == combat_first, unit.entity));
         units
     }
 
