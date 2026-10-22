@@ -75,6 +75,8 @@ pub(crate) fn decide_sealift_action(
         return None;
     }
     let mut context = SealiftContext::observe(world, player_id, skip);
+    context.beachhead_origins =
+        crate::ai::v4::capital_route::beachhead_route_origins(world, player_id);
     // 敵の守る陸塊への揚陸は、輸送船をそろえてから一斉に行う（手番ごとに1回判断する）。
     let previous = world
         .get_resource::<AssaultPlans>()
@@ -252,6 +254,8 @@ struct SealiftContext {
     boarding_cache: RefCell<HashMap<u32, Rc<Vec<Cell>>>>,
     /// この手番の揚陸作戦（敵の守る陸塊への一斉上陸）。
     assault: Option<assault::AssaultPlan>,
+    /// 橋頭堡を起点にした首都攻略DAGの起点。揚陸部隊はこの浜へ届け続ける。
+    beachhead_origins: Vec<GridPosition>,
 }
 
 impl SealiftContext {
@@ -321,6 +325,7 @@ impl SealiftContext {
             own_ports,
             reachable_cache: RefCell::default(),
             assault: None,
+            beachhead_origins: Vec::new(),
             boarding_cache: RefCell::default(),
         }
     }

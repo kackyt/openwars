@@ -100,6 +100,8 @@ pub(in crate::ai::v4) struct CapitalRouteTopology {
     pub(in crate::ai::v4) property_routes: HashMap<GridPosition, CapitalRouteId>,
     /// 自首都からの装甲移動ステップ数。前方・後方の判定はすべてこの距離表で行う。
     pub(in crate::ai::v4) from_home: HashMap<GridPosition, u32>,
+    /// 起点が自軍首都ではなく、揚陸作戦の橋頭堡か（自軍首都の無い敵首都島）。
+    pub(in crate::ai::v4) beachhead: bool,
 }
 
 impl CapitalRouteTopology {

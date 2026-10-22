@@ -485,11 +485,26 @@ pub(in crate::ai::v4) fn build_capital_route_topology(
     let map = world.get_resource::<Map>()?;
     let master_data = world.get_resource::<MasterDataRegistry>()?;
     let island_map = world.get_resource::<crate::ai::islands::IslandMap>()?;
-    let (home, enemy_capital) = same_land_capitals(world, player_id, island_id)?;
+    // 自軍首都の無い敵首都島では、揚陸作戦の橋頭堡を起点にして島内の首都攻略を進める。
+    let (home, enemy_capital, beachhead) = match same_land_capitals(world, player_id, island_id) {
+        Some((home, enemy_capital)) => (home, enemy_capital, false),
+        None => {
+            // 調整中の作戦（TODO: 評価で有効性を確認したら環境変数の切替を外す）。
+            if std::env::var("OPENWARS_BEACHHEAD_DAG").is_err() {
+                return None;
+            }
+            let (home, enemy_capital) = beachhead_capitals(world, player_id, island_id)?;
+            (home, enemy_capital, true)
+        }
+    };
     let from_home = armored_step_distances(map, master_data, home);
     let from_enemy_capital = armored_step_distances(map, master_data, enemy_capital);
     let total_distance = from_home.get(&enemy_capital).copied()?;
-    let mut fronts = derive_same_land_route_fronts(world, player_id, island_id);
+    let mut fronts = if beachhead {
+        armored_capital_route_fronts(map, master_data, home, enemy_capital)
+    } else {
+        derive_same_land_route_fronts(world, player_id, island_id)
+    };
     // 分岐がない地図も「routeが無い」のではなく、一本の首都進軍路である。
     // ここをTopologyなしへ落とすと、map_1/map_2ではDAG・Squad・生産が再び別系統に
     // なってしまう。最短装甲回廊の中間セルを一枝の識別点にし、単一路と分岐路を
@@ -586,6 +601,87 @@ pub(in crate::ai::v4) fn build_capital_route_topology(
         routes,
         property_routes,
         from_home,
+        beachhead,
+    })
+}
+
+/// 自軍首都の無い敵首都島での、首都攻略DAGの起点（橋頭堡）と敵首都。
+///
+/// 起点は揚陸作戦の浜（停泊セル）に接する島内のセルのうち、敵首都へ装甲移動で
+/// 最も近いセルとする。揚陸作戦がこの島を目標にしていなければNone。
+pub(in crate::ai::v4) fn beachhead_capitals(
+    world: &World,
+    player_id: PlayerId,
+    island_id: crate::ai::islands::IslandId,
+) -> Option<(GridPosition, GridPosition)> {
+    let map = world.get_resource::<Map>()?;
+    let master_data = world.get_resource::<MasterDataRegistry>()?;
+    let island_map = world.get_resource::<crate::ai::islands::IslandMap>()?;
+    let on_island = |position: &GridPosition| {
+        island_map
+            .get_island_at(position)
+            .is_some_and(|island| island.id == island_id)
+    };
+    let mut enemy_capitals = Vec::new();
+    for entity in world.iter_entities() {
+        let (Some(position), Some(property)) =
+            (entity.get::<GridPosition>(), entity.get::<Property>())
+        else {
+            continue;
+        };
+        if property.terrain != Terrain::Capital || !on_island(position) {
+            continue;
+        }
+        if property.owner_id == Some(player_id) {
+            // 自軍首都がある島は同一陸塊の首都戦役として扱う。
+            return None;
+        }
+        if property.owner_id.is_some() {
+            enemy_capitals.push(*position);
+        }
+    }
+    enemy_capitals.sort_unstable_by_key(|position| (position.y, position.x));
+    let enemy_capital = *enemy_capitals.first()?;
+    let plan = world
+        .get_resource::<crate::ai::v4::maritime::sealift::AssaultPlans>()?
+        .0
+        .get(&player_id)?;
+    let from_capital = armored_step_distances(map, master_data, enemy_capital);
+    let origin = plan
+        .stops
+        .iter()
+        .flat_map(|stop| map.get_adjacent(stop.0, stop.1))
+        .map(|(x, y)| GridPosition { x, y })
+        .filter(|cell| on_island(cell))
+        .filter_map(|cell| Some((*from_capital.get(&cell)?, cell)))
+        .min_by_key(|(distance, cell)| (*distance, cell.y, cell.x))
+        .map(|(_, cell)| cell)?;
+    Some((origin, enemy_capital))
+}
+
+/// 島に自軍の地上部隊（搭載中を除く）が居るか。
+fn has_own_ground_on_island(
+    world: &World,
+    player_id: PlayerId,
+    island_id: crate::ai::islands::IslandId,
+) -> bool {
+    let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() else {
+        return false;
+    };
+    world.iter_entities().any(|entity| {
+        entity
+            .get::<crate::components::Faction>()
+            .is_some_and(|faction| faction.0 == player_id)
+            && entity.get::<crate::components::Transporting>().is_none()
+            && entity
+                .get::<crate::components::UnitStats>()
+                .is_some_and(|stats| {
+                    !matches!(stats.movement_type, MovementType::Air | MovementType::Ship)
+                })
+            && entity
+                .get::<GridPosition>()
+                .and_then(|position| island_map.get_island_at(position))
+                .is_some_and(|island| island.id == island_id)
     })
 }
 
@@ -607,11 +703,38 @@ pub(super) fn cache_capital_route_topologies(world: &mut World, player_id: Playe
             player_id,
             island_id,
         };
-        let exists = world
+        let existing_origin = world
             .get_resource::<CapitalRouteTopologyRegistry>()
-            .is_some_and(|registry| registry.topologies.contains_key(&key));
-        if !exists && let Some(topology) = build_capital_route_topology(world, player_id, island_id)
+            .and_then(|registry| registry.topologies.get(&key))
+            .map(|topology| {
+                (
+                    topology.beachhead,
+                    topology.nodes[topology.start_node.0].anchor,
+                )
+            });
+        let rebuild = match existing_origin {
+            None => true,
+            // 橋頭堡のDAGは、まだ誰も上陸していない間だけ揚陸作戦の浜の変更に合わせて
+            // 作り直す。上陸後は起点を固定し、上陸部隊の前進順序を揺らさない。
+            Some((true, origin)) => {
+                !has_own_ground_on_island(world, player_id, island_id)
+                    && beachhead_capitals(world, player_id, island_id)
+                        .is_some_and(|(new_origin, _)| new_origin != origin)
+            }
+            Some((false, _)) => false,
+        };
+        if rebuild && let Some(topology) = build_capital_route_topology(world, player_id, island_id)
         {
+            if topology.beachhead && std::env::var("OPENWARS_ASSAULT_TRACE").is_ok() {
+                eprintln!(
+                    "BEACHHEAD_DAG p{} island{:?} origin{:?} goal{:?} routes{}",
+                    player_id.0,
+                    island_id,
+                    topology.nodes[topology.start_node.0].anchor,
+                    topology.nodes[topology.goal_node.0].anchor,
+                    topology.routes.len()
+                );
+            }
             newly_built.push((key, topology));
         }
     }
@@ -619,6 +742,16 @@ pub(super) fn cache_capital_route_topologies(world: &mut World, player_id: Playe
         let mut registry = world
             .remove_resource::<CapitalRouteTopologyRegistry>()
             .unwrap_or_default();
+        // 作り直したDAGの旧Milestoneの作戦状態を残さない。
+        if let Some(mut operations) = world
+            .get_resource_mut::<crate::ai::v4::capital_route::model::CapitalRouteNodeOperationRegistry>()
+        {
+            operations.operations.retain(|id, _| {
+                !newly_built
+                    .iter()
+                    .any(|(key, _)| registry.topologies.contains_key(key) && id.topology == *key)
+            });
+        }
         registry.topologies.extend(newly_built);
         world.insert_resource(registry);
     }

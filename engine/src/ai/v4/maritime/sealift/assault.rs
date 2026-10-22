@@ -161,7 +161,24 @@ impl SealiftContext {
                 .iter()
                 .find(|beach| beach.stops.iter().any(|stop| previous.stops.contains(stop)))
         });
+        // 橋頭堡のDAGがあれば、その起点に接する浜へ届け続ける（上陸部隊の前進と
+        // 後続の増援を同じ進軍路にそろえる）。
+        let map = &self.board.map;
+        let dag_beach = beaches.iter().find(|beach| {
+            beach.stops.iter().any(|stop| {
+                self.beachhead_origins
+                    .iter()
+                    .any(|origin| map.distance(stop.0, stop.1, origin.x, origin.y) <= 1)
+            })
+        });
+        let kept = dag_beach.or(kept);
         let (beach, since_turn) = match (kept, previous) {
+            (Some(kept), _) if dag_beach.is_some() => (
+                kept,
+                previous
+                    .filter(|previous| previous.stops == kept.stops)
+                    .map_or(turn, |previous| previous.since_turn),
+            ),
             (Some(kept), Some(previous))
                 if (tuning.keep_beachhead && kept.friendly > 0)
                     || best.score() * 100 <= kept.score() * tuning.switch_percent =>

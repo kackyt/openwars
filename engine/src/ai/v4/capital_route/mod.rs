@@ -18,3 +18,119 @@ pub(crate) fn prepare_capital_route_topologies(
     topology::cache_capital_route_topologies(world, player_id);
     node_operation::ensure_capital_route_node_operations(world, player_id);
 }
+
+/// 橋頭堡を起点にした首都攻略DAG（自軍首都の無い敵首都島）に居る自軍unit。
+pub(crate) fn beachhead_route_units(
+    world: &bevy_ecs::prelude::World,
+    player_id: crate::components::PlayerId,
+) -> crate::collections::HashSet<bevy_ecs::prelude::Entity> {
+    let islands = world
+        .get_resource::<model::CapitalRouteTopologyRegistry>()
+        .map(|registry| {
+            registry
+                .topologies
+                .iter()
+                .filter(|(key, topology)| key.player_id == player_id && topology.beachhead)
+                .map(|(key, _)| key.island_id)
+                .collect::<crate::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() else {
+        return crate::collections::HashSet::default();
+    };
+    if islands.is_empty() {
+        return crate::collections::HashSet::default();
+    }
+    world
+        .iter_entities()
+        .filter(|entity| {
+            entity
+                .get::<crate::components::Faction>()
+                .is_some_and(|faction| faction.0 == player_id)
+                && entity.get::<crate::components::UnitStats>().is_some()
+                && entity.get::<crate::components::Transporting>().is_none()
+                && entity
+                    .get::<crate::components::GridPosition>()
+                    .and_then(|position| island_map.get_island_at(position))
+                    .is_some_and(|island| islands.contains(&island.id))
+        })
+        .map(|entity| entity.id())
+        .collect()
+}
+
+/// 橋頭堡を起点にした首都攻略DAGの起点（揚陸部隊を届ける浜の陸側）。
+pub(crate) fn beachhead_route_origins(
+    world: &bevy_ecs::prelude::World,
+    player_id: crate::components::PlayerId,
+) -> Vec<crate::components::GridPosition> {
+    let mut origins: Vec<_> = world
+        .get_resource::<model::CapitalRouteTopologyRegistry>()
+        .map(|registry| {
+            registry
+                .topologies
+                .iter()
+                .filter(|(key, topology)| key.player_id == player_id && topology.beachhead)
+                .map(|(_, topology)| topology.nodes[topology.start_node.0].anchor)
+                .collect()
+        })
+        .unwrap_or_default();
+    origins.sort_unstable_by_key(|position| (position.y, position.x));
+    origins
+}
+
+/// 診断用: unitの所属Squadが持つ首都攻略DAGの指令の要約。
+pub(crate) fn describe_route_order(
+    world: &bevy_ecs::prelude::World,
+    entity: bevy_ecs::prelude::Entity,
+) -> String {
+    let Some(manager) = world.get_resource::<crate::ai::squad::SquadManager>() else {
+        return "no-manager".into();
+    };
+    let Some(squad) = manager
+        .squads
+        .iter()
+        .find(|squad| squad.members.contains(&entity))
+    else {
+        return "no-squad".into();
+    };
+    let order = world
+        .get_resource::<model::CapitalRoutePathRegistry>()
+        .and_then(|registry| registry.commitments.get(&squad.id))
+        .map(|commitment| {
+            format!(
+                "route{:?} {:?}/{:?} exec{:?} targets{:?}",
+                commitment.route,
+                commitment.objective,
+                commitment.scope,
+                (commitment.execution_target.x, commitment.execution_target.y),
+                commitment
+                    .capture_targets
+                    .iter()
+                    .map(|target| (target.x, target.y))
+                    .collect::<Vec<_>>()
+            )
+        })
+        .unwrap_or_else(|| "no-order".into());
+    format!(
+        "{:?}/{:?} {order}",
+        squad.plan.mission_type, squad.plan.phase
+    )
+}
+
+/// 橋頭堡を起点にした首都攻略DAGがある島（揚陸済みの敵首都島）。
+pub(crate) fn beachhead_route_islands(
+    world: &bevy_ecs::prelude::World,
+    player_id: crate::components::PlayerId,
+) -> crate::collections::HashSet<crate::ai::islands::IslandId> {
+    world
+        .get_resource::<model::CapitalRouteTopologyRegistry>()
+        .map(|registry| {
+            registry
+                .topologies
+                .iter()
+                .filter(|(key, topology)| key.player_id == player_id && topology.beachhead)
+                .map(|(key, _)| key.island_id)
+                .collect()
+        })
+        .unwrap_or_default()
+}

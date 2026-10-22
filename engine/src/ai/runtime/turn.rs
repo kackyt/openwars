@@ -302,12 +302,58 @@ fn decide_normal_action(
     skip: &HashSet<Entity>,
 ) -> Option<(Entity, AiCommand)> {
     match step.tactics {
-        TurnTactics::Standard => decide_ai_action_v2(world, step.player_id, skip),
+        TurnTactics::Standard => {
+            // 揚陸後の敵首都島では、橋頭堡を起点にした首都攻略DAGのSquad指令
+            // （Nodeの制圧・占領、前衛と待機線、敵生産口の占位）に従って動かす（V4）。
+            if step.is_v4
+                && let Some(action) = decide_beachhead_route_action(world, step.player_id, skip)
+            {
+                return Some(action);
+            }
+            decide_ai_action_v2(world, step.player_id, skip)
+        }
         TurnTactics::SmallMapSquads => {
             crate::ai::v4::home_defense::decide_action(world, step.player_id, skip)
                 .or_else(|| decide_squad_action_v4(world, step.player_id, skip))
         }
     }
+}
+
+/// 橋頭堡DAGの島に居るunitだけを、DAGを読むSquad executorで動かす。
+fn decide_beachhead_route_action(
+    world: &mut World,
+    player_id: PlayerId,
+    skip: &HashSet<Entity>,
+) -> Option<(Entity, AiCommand)> {
+    let landed = crate::ai::v4::capital_route::beachhead_route_units(world, player_id);
+    if landed.iter().all(|entity| skip.contains(entity)) {
+        return None;
+    }
+    // 他の島のunitは通常の行動選択に残す。
+    let mut others = skip.clone();
+    let mut query = world.query::<(Entity, &crate::components::Faction)>();
+    others.extend(
+        query
+            .iter(world)
+            .filter(|(entity, faction)| faction.0 == player_id && !landed.contains(entity))
+            .map(|(entity, _)| entity),
+    );
+    let action = decide_squad_action_v4(world, player_id, &others);
+    if std::env::var("OPENWARS_ASSAULT_TRACE").is_ok() && action.is_none() {
+        let left: Vec<String> = landed
+            .iter()
+            .filter(|entity| !skip.contains(entity))
+            .map(|entity| crate::ai::v4::capital_route::describe_route_order(world, *entity))
+            .collect();
+        eprintln!("BEACHHEAD_NONE {}", left.join(" | "));
+    }
+    if std::env::var("OPENWARS_ASSAULT_TRACE").is_ok()
+        && let Some((entity, command)) = &action
+    {
+        let route = crate::ai::v4::capital_route::describe_route_order(world, *entity);
+        eprintln!("BEACHHEAD_ACT {entity:?} {command:?} {route}");
+    }
+    action
 }
 
 /// 再接続後の通常行動。輸送Squadのunitも対象に含める（行動済みだけを除外する）。

@@ -58,6 +58,20 @@ pub(crate) fn decide_naval_action(
         .and_then(|plans| plans.0.get(&player_id))
         .map(|plan| plan.stops.clone())
         .unwrap_or_default();
+    // 揚陸後は、橋頭堡を起点にした首都攻略DAGの現在の前線（次に確保する拠点）も砲撃で
+    // 支援する。上陸部隊が前進する先の守りを先に削る。
+    let mut beach = beach;
+    for island in crate::ai::v4::capital_route::beachhead_route_islands(world, player_id) {
+        if let Some(fronts) =
+            crate::ai::v4::capital_route::node_operation::capital_route_current_fronts(
+                world, player_id, island,
+            )
+        {
+            beach.extend(fronts.into_iter().map(|front| (front.x, front.y)));
+        }
+    }
+    beach.sort_unstable();
+    beach.dedup();
     let mut naval = NavalBoard::new(&board, &chart, &occupancy, player_id, cargo_costs);
     naval.beach = beach;
 
