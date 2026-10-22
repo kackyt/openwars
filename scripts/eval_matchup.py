@@ -892,6 +892,21 @@ def judge_objective_criteria(results, subject="V2", baseline="V1"):
     return map_pass, overall, detail_rows
 
 
+def summarize_landings(game, player_id):
+    """輸送部隊から降ろした部隊の種別ごとの数と、最初・最後の降車手番（記録が無ければ "-"）。"""
+    diagnostics = (game.get("final_state") or {}).get("diagnostics") or {}
+    landings = [e for e in diagnostics.get("landings", []) if e.get("player_id") == player_id]
+    if not landings:
+        return "-"
+    counts = defaultdict(int)
+    for entry in landings:
+        counts[entry["unit_type"]] += 1
+    turns = [entry["turn"] for entry in landings]
+    parts = [f"{name}: {count}" for name, count in sorted(counts.items(), key=lambda kv: -kv[1])]
+    parts.append(f"T{min(turns)}〜T{max(turns)}")
+    return "<br>".join(parts)
+
+
 def generate_report(results, subject="V2", baseline="V1", max_turns=30):
     v2_wins = 0
     v1_wins = 0
@@ -929,6 +944,8 @@ def generate_report(results, subject="V2", baseline="V1", max_turns=30):
             "turns": game["turns"],
             "p1_actions": game.get("action_counts", {}).get(1, {}),
             "p2_actions": game.get("action_counts", {}).get(2, {}),
+            "p1_landings": summarize_landings(game, 1),
+            "p2_landings": summarize_landings(game, 2),
             "metrics": game.get("metrics", [])
         })
         
@@ -971,12 +988,15 @@ def generate_report(results, subject="V2", baseline="V1", max_turns=30):
     
     for map_name, games in map_summaries.items():
         report.append(f"### 📍 {map_name}")
-        report.append("| 対戦カード | 結果 | ターン数 | P1 生産内訳 | P2 生産内訳 |")
-        report.append("| :--- | :--- | :--- | :--- | :--- |")
+        report.append("| 対戦カード | 結果 | ターン数 | P1 生産内訳 | P2 生産内訳 | P1 揚陸内訳 | P2 揚陸内訳 |")
+        report.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
         for g in games:
             p1_act = "<br>".join([f"{k}: {v}" for k, v in g['p1_actions'].items()]) if g['p1_actions'] else "None"
             p2_act = "<br>".join([f"{k}: {v}" for k, v in g['p2_actions'].items()]) if g['p2_actions'] else "None"
-            report.append(f"| {g['matchup']} | **{g['result']}** | {g['turns']} | {p1_act} | {p2_act} |")
+            report.append(
+                f"| {g['matchup']} | **{g['result']}** | {g['turns']} | {p1_act} | {p2_act} "
+                f"| {g['p1_landings']} | {g['p2_landings']} |"
+            )
         report.append("\n")
         
         # 客観メトリクス（支配面積・収入・NPV）の推移表

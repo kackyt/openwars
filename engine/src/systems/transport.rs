@@ -276,6 +276,7 @@ pub fn unload_unit_system(
     players: Res<Players>,
     map: Res<Map>,
     master_data: Res<MasterDataRegistry>,
+    mut landing_log: Option<ResMut<crate::resources::LandingLog>>,
 ) {
     if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
@@ -397,6 +398,17 @@ pub fn unload_unit_system(
             commands
                 .entity(event.transport_entity)
                 .insert(HasMoved(true));
+
+            // 揚陸の検証用に、降ろした部隊の種別と降車先を記録する
+            if let Some(log) = landing_log.as_mut() {
+                log.entries.push(crate::resources::LandingRecord {
+                    turn: match_state.current_turn_number.0,
+                    player_id: trans_faction,
+                    unit_type: cargo.6.unit_type,
+                    x: event.target_x,
+                    y: event.target_y,
+                });
+            }
 
             // 降車完了イベントを送出
             unloaded_writer.send(UnitUnloadedEvent {
@@ -545,6 +557,7 @@ mod tests {
             unit_entity: cargo_entity,
         });
 
+        world.init_resource::<crate::resources::LandingLog>();
         let mut schedule = Schedule::default();
         schedule.add_systems(load_unit_system);
         schedule.add_systems(unload_unit_system);
@@ -585,6 +598,12 @@ mod tests {
         let cargo_pos = world.get::<GridPosition>(cargo_entity).unwrap();
         assert_eq!(cargo_pos.x, 6);
         assert_eq!(cargo_pos.y, 5);
+
+        // 降車は検証用の揚陸記録に残る
+        let log = world.resource::<crate::resources::LandingLog>();
+        assert_eq!(log.entries.len(), 1);
+        assert_eq!(log.entries[0].unit_type, UnitType::Infantry);
+        assert_eq!((log.entries[0].x, log.entries[0].y), (6, 5));
 
         let trans_act = world.get::<ActionCompleted>(transport_entity).unwrap();
         assert!(trans_act.0);
