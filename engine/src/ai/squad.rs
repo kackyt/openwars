@@ -1716,6 +1716,91 @@ fn nearest_campaign_property_target_with_connectivity(
         .map(|candidate| candidate.3)
 }
 
+/// 1つの未所有施設へ向かわせる占領兵の上限（先行担当を含む）。
+const CAPTURE_TARGET_CAP: usize = 2;
+
+/// 予備の占領兵を、担当数が上限に満たない最寄りの未所有施設へ配る。
+/// すべての施設が上限に達したら、従来どおり最寄りの施設へ送る。
+fn capped_capture_reserve_responsibilities(
+    world: &World,
+    player_id: PlayerId,
+    island_id: crate::ai::islands::IslandId,
+    remaining: Vec<Entity>,
+    assigned: &[CampaignResponsibility],
+    connectivity: &mut TerrainConnectivity,
+) -> Vec<CampaignResponsibility> {
+    let (Some(island_map), Some(map), Some(registry)) = (
+        world.get_resource::<crate::ai::islands::IslandMap>(),
+        world.get_resource::<Map>(),
+        world.get_resource::<MasterDataRegistry>(),
+    ) else {
+        return Vec::new();
+    };
+    let mut targets = world
+        .iter_entities()
+        .filter_map(|entity| {
+            let target = entity.get::<GridPosition>().copied()?;
+            let property = entity.get::<Property>()?;
+            (property.owner_id != Some(player_id)
+                && island_map
+                    .get_island_at(&target)
+                    .is_some_and(|island| island.id == island_id))
+            .then_some(target)
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by_key(|target| (target.y, target.x));
+    let mut counts: HashMap<GridPosition, usize> = HashMap::default();
+    for responsibility in assigned {
+        *counts.entry(responsibility.target).or_default() += responsibility.members.len();
+    }
+    let mut members = remaining;
+    members.sort_by_key(|entity| entity.to_bits());
+    let mut responsibilities = Vec::new();
+    for member in members {
+        let (Some(position), Some(stats)) = (
+            world.get::<GridPosition>(member),
+            world.get::<UnitStats>(member),
+        ) else {
+            continue;
+        };
+        let mut reachable = targets
+            .iter()
+            .copied()
+            .filter(|target| {
+                connectivity.is_reachable(
+                    map,
+                    registry,
+                    (position.x, position.y),
+                    (target.x, target.y),
+                    stats.movement_type,
+                )
+            })
+            .map(|target| {
+                (
+                    map.distance(position.x, position.y, target.x, target.y),
+                    target,
+                )
+            })
+            .collect::<Vec<_>>();
+        reachable.sort_by_key(|(distance, target)| (*distance, target.y, target.x));
+        let Some(target) = reachable
+            .iter()
+            .find(|(_, target)| counts.get(target).copied().unwrap_or(0) < CAPTURE_TARGET_CAP)
+            .or_else(|| reachable.first())
+            .map(|(_, target)| *target)
+        else {
+            continue;
+        };
+        *counts.entry(target).or_default() += 1;
+        responsibilities.push(CampaignResponsibility {
+            mission_type: MissionType::Capture,
+            target,
+            members: vec![member],
+        });
+    }
+    responsibilities
+}
+
 fn campaign_assignment_capture_responsibilities(
     world: &World,
     player_id: PlayerId,
@@ -1774,6 +1859,23 @@ fn campaign_assignment_capture_responsibilities(
         }
     }
 
+    // V4の互換経路では、予備を各自の最寄り施設へ一斉に送らず、1施設あたりの担当数に
+    // 上限を設けて近い順に配る。本国から流れてくる占領兵が同じ施設を選び、1施設に
+    // 数十体が集まって前線の手前を塞ぐのを防ぐ。
+    if !crate::ai::code_path::is_extended()
+        && crate::ai::resolve_player_ai_version(world, player_id)
+            == crate::ai::ai_version::AiVersion::V4
+    {
+        responsibilities.extend(capped_capture_reserve_responsibilities(
+            world,
+            player_id,
+            assignment.island_id,
+            remaining,
+            &responsibilities,
+            connectivity,
+        ));
+        return responsibilities;
+    }
     // 施設数より占領要員が多い場合も遊兵化させず、島内の到達可能な未所有施設へ予備を送る。
     for member in remaining {
         if let Some(target) = nearest_campaign_property_target_with_connectivity(
@@ -1893,11 +1995,14 @@ pub(super) struct CampaignResponsibility {
     members: Vec<Entity>,
 }
 
+/// `advance_targets` は、敵へ到達できないmemberが前進する先の未所有前線施設（優先順）。
+/// 空なら従来どおりmember位置での現地防御にまとめる。
 fn campaign_combat_responsibilities(
     world: &World,
     player_id: PlayerId,
     island_id: crate::ai::islands::IslandId,
     members: &[Entity],
+    advance_targets: &[GridPosition],
     connectivity: &mut TerrainConnectivity,
 ) -> Vec<CampaignResponsibility> {
     let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>() else {
@@ -1972,7 +2077,17 @@ fn campaign_combat_responsibilities(
         });
     }
 
-    // 敵へ到達できないmemberは、全員が到達できるmember位置ごとに決定的に現地防御へまとめる。
+    // 敵へ到達できないmemberを現在地へ留めると、占領兵が先へ出るまで誰も前進せず、
+    // 次の拠点が前線として扱われない循環に陥る。前進先の施設へ届くmemberは、
+    // その施設の防御（護衛）として先に送り出す。
+    responsibilities.extend(campaign_advance_responsibilities(
+        world,
+        &mut remaining,
+        advance_targets,
+        connectivity,
+    ));
+
+    // 前進先へも届かないmemberは、全員が到達できるmember位置ごとに決定的に現地防御へまとめる。
     while !remaining.is_empty() {
         let mut hold_candidates: Vec<_> = remaining
             .iter()
@@ -2034,6 +2149,47 @@ fn campaign_combat_responsibilities(
         )
     });
     responsibilities
+}
+
+/// 敵へ到達できない戦闘memberを、到達できる最寄りの前進先施設ごとの防御責務へまとめる。
+///
+/// 各memberは自分から最も近い前進先へ向かう（同距離なら `advance_targets` の優先順）。
+/// どの前進先へも到達できないmemberは `remaining` に残す。
+fn campaign_advance_responsibilities(
+    world: &World,
+    remaining: &mut Vec<Entity>,
+    advance_targets: &[GridPosition],
+    connectivity: &mut TerrainConnectivity,
+) -> Vec<CampaignResponsibility> {
+    if advance_targets.is_empty() {
+        return Vec::new();
+    }
+    let mut members_by_target: Vec<Vec<Entity>> = vec![Vec::new(); advance_targets.len()];
+    remaining.retain(|member| {
+        let nearest = advance_targets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, target)| {
+                campaign_member_distance_to_position(world, *member, *target, connectivity)
+                    .map(|distance| (distance, index))
+            })
+            .min();
+        let Some((_, index)) = nearest else {
+            return true;
+        };
+        members_by_target[index].push(*member);
+        false
+    });
+    advance_targets
+        .iter()
+        .zip(members_by_target)
+        .filter(|(_, members)| !members.is_empty())
+        .map(|(target, members)| CampaignResponsibility {
+            mission_type: MissionType::Defense,
+            target: *target,
+            members,
+        })
+        .collect()
 }
 
 /// 通常の再計画と、正本で特定したEntityだけの再接続を分ける。
@@ -2407,11 +2563,13 @@ fn prepare_campaign_local_assignment_scoped(
                 .collect();
             combat.sort_by_key(|entity| entity.to_bits());
             combat.dedup();
+            // 防衛島では、敵へ届かない戦力を下の分岐で主要施設へ集結させる。
             let mut combat_responsibilities = campaign_combat_responsibilities(
                 world,
                 player_id,
                 assignment.island_id,
                 &combat,
+                &[],
                 connectivity,
             );
             if !combat.is_empty()
@@ -2466,6 +2624,27 @@ fn prepare_campaign_local_assignment_scoped(
                 &capture,
                 connectivity,
             );
+            // 敵へ届かない戦闘戦力は、占領兵が向かう施設、次に前線帯の未所有施設へ前進させる。
+            let mut advance_targets = capture_responsibilities
+                .iter()
+                .map(|responsibility| responsibility.target)
+                .chain(assignment.capture_target_positions.iter().copied())
+                .chain(std::iter::once(assignment.target_position))
+                .collect::<Vec<_>>();
+            // 施設が尽きた島の目標は任意タイルになり得るため、未所有の施設だけを前進先にする。
+            let unowned_properties = world
+                .iter_entities()
+                .filter_map(|entity| {
+                    let property = entity.get::<Property>()?;
+                    (property.owner_id != Some(player_id))
+                        .then(|| entity.get::<GridPosition>().copied())
+                        .flatten()
+                })
+                .collect::<HashSet<_>>();
+            let mut seen_targets = HashSet::default();
+            advance_targets.retain(|target| {
+                unowned_properties.contains(target) && seen_targets.insert(*target)
+            });
             scope.assign(
                 world,
                 manager,
@@ -2490,13 +2669,29 @@ fn prepare_campaign_local_assignment_scoped(
                         )
                 })
                 .collect::<Vec<_>>();
-            let responsibilities = campaign_combat_responsibilities(
-                world,
-                player_id,
-                assignment.island_id,
-                &combat,
-                connectivity,
-            );
+            // V4は施設を目的とし、その占領を妨げる敵だけを兵種相性・到着・損失で割り当てる。
+            let responsibilities = if crate::ai::resolve_player_ai_version(world, player_id)
+                == crate::ai::ai_version::AiVersion::V4
+            {
+                objective_allocation::objective_combat_responsibilities(
+                    world,
+                    player_id,
+                    assignment.island_id,
+                    &combat,
+                    &capture,
+                    &advance_targets,
+                    connectivity,
+                )
+            } else {
+                campaign_combat_responsibilities(
+                    world,
+                    player_id,
+                    assignment.island_id,
+                    &combat,
+                    &advance_targets,
+                    connectivity,
+                )
+            };
             scope.assign(
                 world,
                 manager,
@@ -2509,6 +2704,42 @@ fn prepare_campaign_local_assignment_scoped(
         _ => {}
     }
     scope.synchronize_departure(world, manager, player_id, assignment, connectivity);
+    synchronize_campaign_phases(world, manager, player_id, assignment);
+}
+
+/// 局地任務の状態を実際の待ちに合わせる（V4）。
+///
+/// Formingに留めるのは、占領兵が特定の敵に対する護衛の合流を待つ場合だけ。
+/// 待つ相手のない攻撃・防衛・占領任務は、作られた直後でも目標へ向かう状態にする。
+fn synchronize_campaign_phases(
+    world: &World,
+    manager: &mut SquadManager,
+    player: PlayerId,
+    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+) {
+    if crate::ai::resolve_player_ai_version(world, player) != crate::ai::ai_version::AiVersion::V4 {
+        return;
+    }
+    for mut squad in manager.edit_each() {
+        if squad.plan.owner_id != Some(player)
+            || squad.plan.target_island != Some(assignment.island_id)
+        {
+            continue;
+        }
+        match squad.plan.mission_type {
+            // 戦闘任務には出発を待つ相手がない。占領兵への護衛は戦闘側から合流する。
+            MissionType::Attack | MissionType::Defense => {
+                squad.plan_mut().departure_authorized = true;
+            }
+            MissionType::Capture => {}
+            _ => continue,
+        }
+        if !squad.plan.departure_authorized {
+            squad.plan_mut().phase = MissionPhase::Forming;
+        } else if squad.plan.phase == MissionPhase::Forming {
+            squad.plan_mut().phase = MissionPhase::MovingToTarget;
+        }
+    }
 }
 
 /// 局地Captureは首都本隊の完全編成を待たない。ただし占領完了前に接触できる敵が
@@ -2565,6 +2796,7 @@ fn synchronize_local_capture_departure(
             ))
         })
         .collect::<HashMap<_, _>>();
+    let escorts = local_capture_escort_candidates(world, manager, player_id, assignment);
 
     for mut squad in manager.edit_each() {
         if squad.plan.owner_id != Some(player_id)
@@ -2639,7 +2871,7 @@ fn synchronize_local_capture_departure(
                 .collect::<Vec<_>>();
             threats.is_empty()
                 || threats.iter().all(|(_, enemy_stats)| {
-                    assignment.combat_entities.iter().any(|escort| {
+                    escorts.iter().any(|escort| {
                         let (Some(position), Some(stats)) = (
                             world.get::<GridPosition>(*escort),
                             world.get::<UnitStats>(*escort),
@@ -2678,6 +2910,54 @@ fn synchronize_local_capture_departure(
                 })
         });
     }
+}
+
+/// 局地Captureの出発判定で護衛として数える自軍戦闘Entity。
+///
+/// campaignへ割り当てた戦闘Entityだけでは、V4が作戦用に生産した配備台帳の戦力や、
+/// 既存のAttack/Defense Squadの戦力が護衛から漏れる。盤上に味方の戦闘部隊がいても
+/// 「護衛不足」と判定し、占領兵が生産施設前から出発できなくなるため、それらも候補に含める。
+/// 到達可否・有効打・合流ETAは呼出側が個別に判定する。
+fn local_capture_escort_candidates(
+    world: &World,
+    manager: &SquadManager,
+    player_id: PlayerId,
+    assignment: &crate::ai::island_campaign::IslandCampaignAssignment,
+) -> Vec<Entity> {
+    let deployment_entities = world
+        .get_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>()
+        .map(|registry| registry.active_entities(player_id))
+        .unwrap_or_default();
+    let squad_entities = manager
+        .proposal_view()
+        .squads
+        .iter()
+        .filter(|squad| {
+            squad.plan.owner_id == Some(player_id)
+                && matches!(
+                    squad.plan.mission_type,
+                    MissionType::Attack | MissionType::Defense
+                )
+        })
+        .flat_map(|squad| squad.members.iter().copied());
+    // 追加分は占領兵自身を護衛と数えないよう、占領できないEntityに限る。
+    let additional = deployment_entities
+        .into_iter()
+        .chain(squad_entities)
+        .filter(|entity| {
+            world
+                .get::<UnitStats>(*entity)
+                .is_some_and(|stats| !stats.can_capture)
+        });
+    let mut escorts = assignment
+        .combat_entities
+        .iter()
+        .copied()
+        .chain(additional)
+        .collect::<Vec<_>>();
+    escorts.sort_unstable_by_key(|entity| entity.to_bits());
+    escorts.dedup();
+    escorts
 }
 
 fn prepare_secure_local_captures(
@@ -10361,6 +10641,8 @@ mod tests {
         let mut damage_chart = crate::resources::DamageChart::new();
         damage_chart.insert_damage(UnitType::Infantry, UnitType::Infantry, 50);
         damage_chart.insert_damage(UnitType::Bcopters, UnitType::Infantry, 70);
+        // 対歩兵では機銃（副武器）が選ばれるため、実際の武器選択と同じ表を用意する。
+        damage_chart.insert_secondary_damage(UnitType::Bcopters, UnitType::Infantry, 70);
         world.insert_resource(map);
         world.insert_resource(island_map);
         world.insert_resource(registry);
@@ -10466,6 +10748,240 @@ mod tests {
         assert!(capture.plan.departure_authorized);
     }
 
+    /// 占領先の隣で占領兵を攻撃できる敵には、有効打を持つ護衛を排除役として割り当てる。
+    /// 護衛は目標へ向かう状態になり、占領兵は護衛の合流を待たずに出発できる。
+    #[test]
+    fn campaign_escort_engages_the_enemy_that_threatens_the_objective() {
+        let (mut world, player, mut assignment, escort) = local_capture_race_world();
+        // 実際の移動は燃料と弾薬を使うため、盤上のユニットと同じ状態を与える。
+        world.entity_mut(escort).insert((
+            Ammo {
+                ammo1: 10,
+                max_ammo1: 10,
+                ammo2: 10,
+                max_ammo2: 10,
+            },
+            crate::components::Fuel {
+                current: 99,
+                max: 99,
+            },
+        ));
+        assignment.combat_entities.push(escort);
+        let mut manager = SquadManager::default();
+        prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
+        let guard = manager
+            .squads
+            .iter()
+            .find(|squad| squad.members.contains(&escort))
+            .unwrap();
+        assert_eq!(guard.plan.mission_type, MissionType::Attack);
+        assert_eq!(
+            guard.plan.target,
+            Some(GridPosition { x: 2, y: 0 }),
+            "占領を妨げる敵を排除対象にする"
+        );
+        assert_eq!(guard.plan.phase, MissionPhase::MovingToTarget);
+        let capture = manager
+            .squads
+            .iter()
+            .find(|squad| squad.plan.mission_type == MissionType::Capture)
+            .unwrap();
+        assert!(capture.plan.departure_authorized);
+        assert_eq!(capture.plan.phase, MissionPhase::MovingToTarget);
+    }
+
+    /// 首都でも、購入計画や戦力充足の一括判定では待たせない。占領兵が待つのは、
+    /// 占領を妨げる敵に対する護衛が間に合わないときだけ。
+    #[test]
+    fn capital_capture_waits_only_for_a_concrete_escort() {
+        let _path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
+        let (mut world, player, mut assignment, escort) = local_capture_race_world();
+        let capital = world
+            .iter_entities()
+            .find(|entity| {
+                entity.get::<GridPosition>() == Some(&assignment.target_position)
+                    && entity.contains::<Property>()
+            })
+            .unwrap()
+            .id();
+        {
+            let mut property = world.get_mut::<Property>(capital).unwrap();
+            property.terrain = Terrain::Capital;
+            property.owner_id = Some(PlayerId(2));
+        }
+        world.entity_mut(escort).insert(Ammo {
+            ammo1: 10,
+            max_ammo1: 10,
+            ammo2: 10,
+            max_ammo2: 10,
+        });
+        assignment.decision = crate::ai::island_campaign::IslandCampaignDecision::Assault;
+        assignment.operation_ready = false;
+
+        // 護衛がいない：占領兵だけが具体的な護衛待ちとしてFormingになる。
+        let mut manager = SquadManager::default();
+        prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
+        let capture = manager
+            .squads
+            .iter()
+            .find(|squad| squad.plan.mission_type == MissionType::Capture)
+            .unwrap();
+        assert!(!capture.plan.departure_authorized);
+        assert_eq!(capture.plan.phase, MissionPhase::Forming);
+
+        // 間に合う護衛が割り当てられれば、operation_readyがfalseでも出発する。
+        assignment.combat_entities.push(escort);
+        prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
+        let capture = manager
+            .squads
+            .iter()
+            .find(|squad| squad.plan.mission_type == MissionType::Capture)
+            .unwrap();
+        assert!(capture.plan.departure_authorized);
+        assert_eq!(capture.plan.phase, MissionPhase::MovingToTarget);
+        let guard = manager
+            .squads
+            .iter()
+            .find(|squad| squad.members.contains(&escort))
+            .unwrap();
+        assert_ne!(guard.plan.phase, MissionPhase::Forming);
+        assert!(guard.plan.departure_authorized);
+    }
+
+    /// V4が作戦用に生産した配備台帳の戦闘Entityも、局地Captureの護衛として数える。
+    /// campaignの戦闘枠に入っていなくても、盤上の味方戦力を理由に占領兵を待たせない。
+    #[test]
+    fn v4_deployment_combat_unit_counts_as_local_capture_escort() {
+        let (mut world, player, assignment, escort) = local_capture_race_world();
+        let mut deployments = crate::ai::v4::deployment::V4DeploymentRegistry::default();
+        deployments.assign_target_for_test(player, escort, escort);
+        world.insert_resource(deployments);
+        let mut manager = SquadManager::new();
+
+        prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
+
+        let capture = manager
+            .squads
+            .iter()
+            .find(|squad| squad.plan.mission_type == MissionType::Capture)
+            .expect("局地Capture");
+        assert!(capture.plan.departure_authorized);
+    }
+
+    /// 完了拠点のSquadは、生産Planによる解放を待たず同じ再編で次の任務へ進む。
+    #[test]
+    fn completed_squad_joins_the_next_campaign_without_purchase_plan_handoff() {
+        let _path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
+        let (mut world, player, _, escort) = local_capture_race_world();
+        let enemies = world
+            .query::<(Entity, &Faction)>()
+            .iter(&world)
+            .filter(|(_, faction)| faction.0 != player)
+            .map(|(entity, _)| entity)
+            .collect::<Vec<_>>();
+        // 旧anchorの1手番圏から外し、次の占領施設の近傍には敵を残す。
+        // 敵が全くいない盤面ではcampaignに戦闘枠の需要がなく、再配属の検証にならない。
+        for enemy in enemies {
+            *world.get_mut::<GridPosition>(enemy).unwrap() = GridPosition { x: 4, y: 0 };
+        }
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::City, Some(player), 100),
+        ));
+        let mut manager = SquadManager::default();
+        {
+            let mut proposals = OperationLedger::proposals(&mut manager);
+            let mut squad = proposals.create_owned(
+                MissionType::Defense,
+                player,
+                std::collections::BTreeSet::from_iter([escort]),
+                None,
+                Vec::new(),
+            );
+            squad.plan_mut().target = Some(GridPosition { x: 0, y: 0 });
+        }
+        world.insert_resource(manager);
+
+        plan_squads(&mut world, player);
+
+        let manager = world.resource::<SquadManager>();
+        let squads = manager
+            .squads
+            .iter()
+            .filter(|squad| squad.members.contains(&escort))
+            .collect::<Vec<_>>();
+        assert_eq!(squads.len(), 1, "引渡し後の二重所属を作らない");
+        assert_eq!(squads[0].plan.mission_type, MissionType::Defense);
+        assert_eq!(
+            squads[0].plan.target,
+            Some(GridPosition { x: 3, y: 0 }),
+            "Defenseでも旧anchorではなく次の占領施設の護衛へ前進する"
+        );
+        let diagnostics = world.resource::<crate::ai::island_campaign::IslandCampaignDiagnostics>();
+        assert!(
+            diagnostics.by_player[&player]
+                .active_offensives
+                .iter()
+                .any(|assignment| assignment.combat_entities.contains(&escort)),
+            "汎用編成だけに流さず、この回のcampaignに再配分する"
+        );
+    }
+
+    /// 敵へ到達できない戦闘memberは、現在地で待たずに前進先の施設の防御へ向かう。
+    /// 前進先が無いときだけ、従来どおり現在地で防御する。
+    #[test]
+    fn unreachable_combat_members_advance_to_the_next_capture_target() {
+        let mut world = World::new();
+        let map = Map::new(10, 1, Terrain::Plains, GridTopology::Square);
+        let island_map = crate::ai::islands::IslandMap::analyze(&map);
+        let island_id = island_map
+            .get_island_at(&GridPosition { x: 0, y: 0 })
+            .unwrap()
+            .id;
+        world.insert_resource(map);
+        world.insert_resource(island_map);
+        world.insert_resource(MasterDataRegistry::load().unwrap());
+        let source = GridPosition { x: 1, y: 0 };
+        let tank = world
+            .spawn((
+                Faction(PlayerId(1)),
+                source,
+                UnitStats {
+                    unit_type: UnitType::Tank,
+                    movement_type: MovementType::Tank,
+                    max_movement: 6,
+                    ..UnitStats::mock()
+                },
+            ))
+            .id();
+        let next_property = GridPosition { x: 8, y: 0 };
+        let mut connectivity = TerrainConnectivity::default();
+
+        let advancing = campaign_combat_responsibilities(
+            &world,
+            PlayerId(1),
+            island_id,
+            &[tank],
+            &[next_property],
+            &mut connectivity,
+        );
+        let holding = campaign_combat_responsibilities(
+            &world,
+            PlayerId(1),
+            island_id,
+            &[tank],
+            &[],
+            &mut connectivity,
+        );
+
+        assert_eq!(advancing.len(), 1);
+        assert_eq!(advancing[0].mission_type, MissionType::Defense);
+        assert_eq!(advancing[0].target, next_property);
+        assert_eq!(advancing[0].members, vec![tank]);
+        assert_eq!(holding.len(), 1);
+        assert_eq!(holding[0].target, source);
+    }
+
     /// 小規模マップ展開の局地Captureは、拡張経路だけ護衛を待たずに出撃する
     /// （F06・H01の経路差を固定する）。通常経路は迎撃される占領兵を待機させる。
     #[test]
@@ -10544,6 +11060,8 @@ mod assignment;
 mod capture_responsibilities;
 mod combat_responsibilities;
 mod local_assignment;
+// 標準V4の施設を目的とする戦闘割当。
+mod objective_allocation;
 mod planning_policy;
 
 // 再編本体と通常／拡張hookの差分契約。

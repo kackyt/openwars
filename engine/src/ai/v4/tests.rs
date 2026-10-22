@@ -304,7 +304,7 @@ fn existing_combat_sorties_are_committed_to_only_one_operation() {
 }
 
 #[test]
-fn existing_combat_entity_is_credited_only_to_its_own_persistent_plan() {
+fn current_mission_combat_is_not_filtered_by_purchase_plan() {
     let own_entity = Entity::from_raw(900);
     let foreign_entity = Entity::from_raw(901);
     let legacy_entity = Entity::from_raw(902);
@@ -321,24 +321,25 @@ fn existing_combat_entity_is_credited_only_to_its_own_persistent_plan() {
                 deployment::ActiveTargetAssignment {
                     plan_id,
                     slot_kind: SlotKind::Combat,
+                    objective: Some(pos(6, 2)),
                     targets: HashSet::default(),
                 },
             )
         }),
     );
 
-    assert!(
-        committed_entities_for_plan(Some(&assignments), None, ProductionPolicy::Standard)
-            .is_empty(),
-        "新規Planは別任務中の既存戦力を見積へ借りない"
+    assert_eq!(
+        committed_entities_for_operation(Some(&assignments), None, ProductionPolicy::Standard),
+        HashSet::from_iter([own_entity, foreign_entity, legacy_entity]),
+        "現在任務への一意配分後は、新規購入Planでも既存戦力を数える"
     );
     assert_eq!(
-        committed_entities_for_plan(
+        committed_entities_for_operation(
             Some(&assignments),
             Some(own_plan),
             ProductionPolicy::Standard
         ),
-        HashSet::from_iter([own_entity])
+        HashSet::from_iter([own_entity, foreign_entity, legacy_entity])
     );
 }
 

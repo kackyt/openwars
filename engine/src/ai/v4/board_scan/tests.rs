@@ -150,3 +150,102 @@ fn small_map_snapshot_requires_preparation_and_never_initializes_strategy() {
         before
     );
 }
+
+#[test]
+fn capital_assault_authorization_pure_logic_verifies_geography_and_logistics() {
+    let map = Map::new(10, 10, Terrain::Plains, GridTopology::Square);
+    let island_map = crate::ai::islands::IslandMap::analyze(&map);
+    let home_pos = GridPosition { x: 0, y: 0 };
+    let enemy_capital_pos = GridPosition { x: 8, y: 0 };
+    let home_island = island_map.get_island_at(&home_pos).unwrap().id;
+    let route_dist = map.distance(
+        home_pos.x,
+        home_pos.y,
+        enemy_capital_pos.x,
+        enemy_capital_pos.y,
+    );
+    assert_eq!(route_dist, 8);
+
+    // 1. 同一島: 所有数が劣勢または同数のときは認可されない
+    let owned = [GridPosition { x: 4, y: 0 }];
+    let enemy = [GridPosition { x: 6, y: 0 }, GridPosition { x: 7, y: 0 }];
+    assert!(!is_capital_assault_authorized(
+        CapitalAssaultGeography {
+            home_island: Some(home_island),
+            capital_island: home_island,
+            home_pos: Some(home_pos),
+            enemy_capital_pos: Some(enemy_capital_pos),
+        },
+        &map,
+        &island_map,
+        owned.iter(),
+        enemy.iter(),
+        false,
+    ));
+
+    // 2. 同一島: 所有数は優位だが、戦線が中間地点まで進出していないときは認可されない
+    // forward_dist = 6 (4マス離れているが首都からは6), 6 * 2 = 12 > 8
+    let owned_back = [GridPosition { x: 2, y: 0 }, GridPosition { x: 1, y: 0 }];
+    let enemy_single = [GridPosition { x: 7, y: 0 }];
+    assert!(!is_capital_assault_authorized(
+        CapitalAssaultGeography {
+            home_island: Some(home_island),
+            capital_island: home_island,
+            home_pos: Some(home_pos),
+            enemy_capital_pos: Some(enemy_capital_pos),
+        },
+        &map,
+        &island_map,
+        owned_back.iter(),
+        enemy_single.iter(),
+        false,
+    ));
+
+    // 3. 同一島: 所有数優位 かつ 前線が中間地点（forward_dist * 2 <= 8）まで進出しているときは認可される
+    // forward_dist = 4 (x=4の位置), 4 * 2 = 8 <= 8
+    let owned_front = [GridPosition { x: 4, y: 0 }, GridPosition { x: 1, y: 0 }];
+    assert!(is_capital_assault_authorized(
+        CapitalAssaultGeography {
+            home_island: Some(home_island),
+            capital_island: home_island,
+            home_pos: Some(home_pos),
+            enemy_capital_pos: Some(enemy_capital_pos),
+        },
+        &map,
+        &island_map,
+        owned_front.iter(),
+        enemy_single.iter(),
+        false,
+    ));
+
+    // 4. 別島（渡海）: 兵站路未完了なら認可されない
+    let other_island = IslandId(2);
+    assert!(!is_capital_assault_authorized(
+        CapitalAssaultGeography {
+            home_island: Some(home_island),
+            capital_island: other_island,
+            home_pos: Some(home_pos),
+            enemy_capital_pos: Some(enemy_capital_pos),
+        },
+        &map,
+        &island_map,
+        owned_front.iter(),
+        enemy_single.iter(),
+        false,
+    ));
+
+    // 5. 別島（渡海）: 兵站路完了なら認可される
+    assert!(is_capital_assault_authorized(
+        CapitalAssaultGeography {
+            home_island: Some(home_island),
+            capital_island: other_island,
+            home_pos: Some(home_pos),
+            enemy_capital_pos: Some(enemy_capital_pos),
+        },
+        &map,
+        &island_map,
+        owned_front.iter(),
+        enemy_single.iter(),
+        true,
+    ));
+}

@@ -297,8 +297,9 @@ fn planning_entry_and_local_assignment_follow_code_path() {
             }
             let expects_extended =
                 direct_extended || path == crate::ai::code_path::CodePath::Extended;
+            // 首都ルートDAGは両経路で作るため、拡張だけが行うRoadmapの採用観測で判別する。
             assert_eq!(
-                world.contains_resource::<crate::ai::v4::capital_route::model::CapitalRoutePathRegistry>(),
+                world.contains_resource::<crate::ai::v4::victory_roadmap::RoadmapTurnPlanRegistry>(),
                 expects_extended,
                 "plan入口: path={path:?}, direct={direct_extended}"
             );

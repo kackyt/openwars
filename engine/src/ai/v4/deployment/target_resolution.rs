@@ -543,14 +543,14 @@ mod tests {
         assert_eq!(squad.plan.target, Some(anchor));
     }
 
-    /// 占領枠の配備は、拡張経路だけが敵の目標解決を飛ばして占領任務にする
-    /// （F23の経路差を固定する）。通常経路は従来どおり優先敵へのAttack任務になる。
+    /// 占領枠の配備は、どちらの経路でも敵の目標解決を飛ばしてanchorへの占領任務にする。
+    /// 通常経路で優先敵へのAttack任務にすると、占領兵が拠点を取らずに戦闘へ流れる。
     #[test]
-    fn capture_slot_becomes_capture_mission_only_on_extended_path() {
+    fn capture_slot_becomes_capture_mission_on_both_paths() {
         for (path, expected) in [
             (
                 crate::ai::code_path::CodePath::MainCompatible,
-                MissionType::Attack,
+                MissionType::Capture,
             ),
             (
                 crate::ai::code_path::CodePath::Extended,

@@ -28,6 +28,57 @@ impl ProductionPolicy {
             Self::Standard
         }
     }
+    /// 標準の戦力見積はSquad正本、小規模は既存の配備契約を参照する。
+    pub(in crate::ai::v4) fn current_combat_assignments(
+        self,
+        world: &World,
+        player: PlayerId,
+    ) -> HashMap<Entity, deployment::ActiveTargetAssignment> {
+        match self {
+            Self::Standard => mission_input::combat_assignments(world, player),
+            Self::SmallMap => world
+                .get_resource::<deployment::V4DeploymentRegistry>()
+                .map(|registry| registry.active_target_assignments(player))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// 購入Planの更新は標準経路の現在任務を変更しない。旧配備同期は小規模の互換境界だけに残す。
+    pub(in crate::ai::v4) fn register_deployment_orders(
+        self,
+        deployments: &mut deployment::V4DeploymentRegistry,
+        plans: &V4RollingPlanRegistry,
+        scan: &BoardScan,
+        player: PlayerId,
+        turn: u32,
+        orders: Vec<deployment::PendingDeployment>,
+    ) {
+        if self == Self::SmallMap {
+            let closed = plans
+                .audit_records(player)
+                .into_iter()
+                .filter(|audit| {
+                    audit.turn == turn
+                        && matches!(
+                            audit.disposition,
+                            PlanDisposition::Completed | PlanDisposition::Withdrawn
+                        )
+                })
+                .map(|audit| audit.plan_id)
+                .collect();
+            deployments.release_closed_plans(&closed);
+            deployments.replace_turn_orders(player, turn, orders);
+            let intents = plans.active_deployment_intents(
+                player,
+                scan.capital_assault_authorized,
+                scan.capital_staging_anchor,
+            );
+            deployments.refresh_plan_intents(&intents);
+        } else {
+            deployments.replace_turn_orders(player, turn, orders);
+        }
+    }
+
     pub(in crate::ai::v4) fn allocates_surplus(self) -> bool {
         self == Self::SmallMap
     }

@@ -4,8 +4,8 @@ use crate::ai::v4::capital_route::commitment::{
     refresh_capital_route_path_commitments,
 };
 use crate::ai::v4::capital_route::model::{
-    CapitalRouteCommitment, CapitalRouteExecutionPhase, CapitalRouteId, CapitalRouteNodeId,
-    CapitalRouteNodeObjective, CapitalRouteNodeScope, CapitalRoutePathRegistry,
+    CapitalRouteCommitment, CapitalRouteExecutionPhase, CapitalRouteId, CapitalRouteNodeObjective,
+    CapitalRouteNodeScope, CapitalRoutePathRegistry,
 };
 use crate::ai::v4::capital_route::prepare_capital_route_topologies;
 use crate::ai::v4::enemy_forecast::{
@@ -13,7 +13,7 @@ use crate::ai::v4::enemy_forecast::{
 };
 use crate::ai::v4::production_pipeline::test_exports::{
     ImmediateCombatEngagement, ImmediateCombatOption, build_operation, build_operations,
-    combat_plan_input, committed_entities_for_plan,
+    combat_plan_input, committed_entities_for_operation,
     defer_unapproved_capital_structure_for_active_segment, enemy_reinforcement_assessment,
     immediate_combat_options, mobilization_role, select_immediate_combat_reinforcement,
 };
@@ -51,7 +51,7 @@ fn stable_operation_reference_preserves_order_without_member_inheritance() {
         island_id: island,
         route: CapitalRouteId(0),
         target,
-        target_node: CapitalRouteNodeId(2),
+        target_anchor: target,
         objective: CapitalRouteNodeObjective::Control,
         scope: CapitalRouteNodeScope::Point,
         control_area: vec![target],
@@ -60,7 +60,6 @@ fn stable_operation_reference_preserves_order_without_member_inheritance() {
         crossed: false,
         execution_target: target,
         frontline_capacity: 1,
-        path_nodes: vec![CapitalRouteNodeId(0), CapitalRouteNodeId(2)],
         path: vec![pos(1, 1), target],
         phase: CapitalRouteExecutionPhase::Advance,
     };
@@ -77,8 +76,8 @@ fn stable_operation_reference_preserves_order_without_member_inheritance() {
     relocated.members.insert(Entity::from_raw(101));
     assert_eq!(
         inherited_capital_route_commitment(&registry, relocated.operation_id)
-            .map(|order| order.target_node),
-        Some(CapitalRouteNodeId(2))
+            .map(|order| order.target_anchor),
+        Some(target)
     );
     let mut unrelated = relocated.clone();
     unrelated.operation_id = SquadOperationId(10);
@@ -410,6 +409,7 @@ fn committed_combat_keeps_plan_ownership_and_accepts_operation_bound_reinforceme
             deployment::ActiveTargetAssignment {
                 plan_id: Some(own_plan),
                 slot_kind: SlotKind::Combat,
+                objective: None,
                 targets: HashSet::default(),
             },
         ),
@@ -418,6 +418,7 @@ fn committed_combat_keeps_plan_ownership_and_accepts_operation_bound_reinforceme
             deployment::ActiveTargetAssignment {
                 plan_id: Some(plan_revision::PlanId(8)),
                 slot_kind: SlotKind::Combat,
+                objective: None,
                 targets: HashSet::default(),
             },
         ),
@@ -426,6 +427,7 @@ fn committed_combat_keeps_plan_ownership_and_accepts_operation_bound_reinforceme
             deployment::ActiveTargetAssignment {
                 plan_id: None,
                 slot_kind: SlotKind::Combat,
+                objective: None,
                 targets: HashSet::default(),
             },
         ),
@@ -434,18 +436,19 @@ fn committed_combat_keeps_plan_ownership_and_accepts_operation_bound_reinforceme
             deployment::ActiveTargetAssignment {
                 plan_id: None,
                 slot_kind: SlotKind::Intercept,
+                objective: None,
                 targets: HashSet::default(),
             },
         ),
     ]);
 
     assert_eq!(
-        committed_entities_for_plan(Some(&assignments), None, ProductionPolicy::SmallMap),
+        committed_entities_for_operation(Some(&assignments), None, ProductionPolicy::SmallMap),
         HashSet::from_iter([immediate_entity]),
         "実在敵へ割り当てた即時Combat増援は、次の作戦見積でも継続して数える"
     );
     assert_eq!(
-        committed_entities_for_plan(
+        committed_entities_for_operation(
             Some(&assignments),
             Some(own_plan),
             ProductionPolicy::SmallMap

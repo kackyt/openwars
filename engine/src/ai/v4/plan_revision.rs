@@ -773,28 +773,6 @@ pub struct V4RollingPlanRegistry {
     audits: Vec<PlanRevisionAudit>,
 }
 
-/// 首都攻略Planを出撃させるために完成している必要がある購入の範囲。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LaunchReadiness {
-    /// 全購入stepの完成を待つ（通常経路）。
-    AllPurchases,
-    /// 最初の交戦までに予定された波の完成だけを待つ（拡張経路）。
-    FirstAttackWave,
-}
-
-impl LaunchReadiness {
-    /// このPlanが出撃条件を満たすだけ生産済みかを返す。
-    fn is_satisfied(self, plan: &StoredPlan) -> bool {
-        match self {
-            Self::AllPurchases => plan
-                .steps
-                .iter()
-                .all(|step| step.status == PurchaseStatus::Produced),
-            Self::FirstAttackWave => first_attack_wave_produced(plan),
-        }
-    }
-}
-
 /// 作戦が予測した最初の交戦までに必要な購入だけが実体化したかを返す。
 ///
 /// `scheduled_turn` がその時点より後のstepは、進軍中に到着する後続増援である。これを
@@ -812,6 +790,18 @@ fn first_attack_wave_produced(plan: &StoredPlan) -> bool {
 }
 
 impl V4RollingPlanRegistry {
+    /// 自軍施設を守る防衛Planの集合。
+    ///
+    /// 防衛Planのanchorは最初から自軍所有の施設なので、anchorの所有だけでは
+    /// 目的達成を意味しない。配備台帳が「占領済みanchor」を判定するときに除外する。
+    pub(crate) fn defense_plan_ids(&self, player_id: PlayerId) -> HashSet<PlanId> {
+        self.active
+            .iter()
+            .filter(|plan| plan.player_id == player_id && plan.kind == OperationKind::Defense)
+            .map(|plan| plan.plan_id)
+            .collect()
+    }
+
     /// 進行中計画を、新規候補より先に作戦集合へ復帰させる。
     pub(crate) fn active_objectives(&self, player_id: PlayerId) -> Vec<ActivePlanObjective> {
         self.active
@@ -902,20 +892,15 @@ impl V4RollingPlanRegistry {
         capital_assault_authorized: bool,
         capital_staging_anchor: Option<GridPosition>,
     ) -> Vec<ActiveDeploymentIntent> {
-        // 首都攻略の出撃条件。通常経路は全購入stepの完成、拡張経路は初撃までに
-        // 予定された波の完成を待つ（どちらが強いかは未実測のため差を維持する）。
-        let readiness = if crate::ai::code_path::is_extended() {
-            LaunchReadiness::FirstAttackWave
-        } else {
-            LaunchReadiness::AllPurchases
-        };
         self.active
             .iter()
             .filter(|plan| plan.player_id == player_id)
             .map(|plan| {
                 let mut priority_enemies = plan.target_enemies.iter().copied().collect::<Vec<_>>();
                 priority_enemies.sort_unstable_by_key(|entity| entity.to_bits());
-                let formation_complete = readiness.is_satisfied(plan);
+                // 首都攻略は初撃までに予定された波が揃った時点で出撃させる。全購入stepの
+                // 完成を待つと、生産済みの戦力が集結地点で滞留し生産施設の周辺を塞ぐ。
+                let formation_complete = first_attack_wave_produced(plan);
                 let posture = if plan.kind != OperationKind::AssaultCapital
                     || (capital_assault_authorized && formation_complete && plan.execution_ready)
                 {
@@ -2123,6 +2108,43 @@ mod tests {
         assert_eq!(result.reason, Some(ReplanReason::EliminationDelayed));
     }
 
+    /// 防衛Planのanchorは元から自軍施設なので、占領済みanchorの判定から除外できる。
+    #[test]
+    fn defense_plan_ids_lists_only_the_players_defense_plans() {
+        let player = PlayerId(1);
+        let mut registry = V4RollingPlanRegistry::default();
+        let mut select = |player, kind, anchor| {
+            registry
+                .select(
+                    player,
+                    3,
+                    kind,
+                    anchor,
+                    vec![anchor],
+                    HashSet::default(),
+                    None,
+                    feasible_plan(0),
+                    None,
+                    HashSet::default(),
+                )
+                .plan_id
+                .expect("実行可能な案はPlanになる")
+        };
+        let defense = select(player, OperationKind::Defense, GridPosition { x: 1, y: 1 });
+        let capture = select(player, OperationKind::Capture, GridPosition { x: 5, y: 5 });
+        let other = select(
+            PlayerId(2),
+            OperationKind::Defense,
+            GridPosition { x: 9, y: 9 },
+        );
+
+        let ids = registry.defense_plan_ids(player);
+
+        assert!(ids.contains(&defense));
+        assert!(!ids.contains(&capture));
+        assert!(!ids.contains(&other));
+    }
+
     fn feasible_plan(build_turn: u32) -> ForcePackagePlan {
         ForcePackagePlan {
             capture_purchases: Vec::new(),
@@ -2798,6 +2820,16 @@ mod tests {
             super::super::deployment::DeploymentPosture::Forming
         );
         assert_eq!(intent.staging_anchor, GridPosition { x: 2, y: 2 });
+
+        // 小規模の互換配備では、首都出撃の許可がなければ集結を維持する。
+        let unauthorized = registry
+            .active_deployment_intents(player, false, Some(GridPosition { x: 2, y: 2 }))
+            .pop()
+            .unwrap();
+        assert_eq!(
+            unauthorized.posture,
+            super::super::deployment::DeploymentPosture::Forming
+        );
     }
 
     #[test]

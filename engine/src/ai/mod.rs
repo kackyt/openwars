@@ -3,6 +3,7 @@ pub mod ai_version;
 pub mod code_path;
 pub mod demand;
 pub(crate) mod deterministic_parallel;
+pub(crate) mod engagement;
 pub mod engine;
 pub mod eval;
 /// 遊兵（任務なし・任務があるのに動けないユニット）の計測
@@ -24,6 +25,8 @@ pub mod pruning;
 pub mod scenario_tests;
 pub mod strategy;
 pub mod strategy_profile;
+/// Waitの原因観測。判断には使わない診断専用データ。
+pub mod wait_probe;
 
 pub mod beam_search;
 pub mod cluster;

@@ -3249,6 +3249,8 @@ mod turn_plan;
 use dependency_graph::StrategicOperationScope;
 pub use dependency_graph::{RoadmapDependency, RoadmapDependencyKind, RoadmapNodeState};
 pub(crate) use strategic_selection::observe_adopted_campaign_roadmap;
+#[cfg(test)]
+pub(crate) use turn_plan::RoadmapTurnPlanRegistry;
 pub(crate) use turn_plan::current_turn_portfolio;
 #[cfg(test)]
 #[path = "victory_roadmap/tests.rs"]

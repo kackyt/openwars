@@ -17,3 +17,6 @@ saves/
 /web/.firebase
 trace_*.jsonl
 scratch/
+
+# ローカルのベンチ・計測成果物（Git管理外）
+.tmp/

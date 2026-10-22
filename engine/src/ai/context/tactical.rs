@@ -133,7 +133,22 @@ impl AiTacticalSnapshot {
         position: GridPosition,
         is_moved: bool,
     ) -> crate::systems::action::TacticalActionTargets {
+        self.action_targets_at_observed(attacker, stats, position, is_moved, None)
+    }
+
+    /// 診断は実際に通過した判定だけを記録する。通常口もこの同じ経路を使用する。
+    pub(crate) fn action_targets_at_observed(
+        &self,
+        attacker: Entity,
+        stats: &UnitStats,
+        position: GridPosition,
+        is_moved: bool,
+        mut probe: Option<&mut crate::ai::wait_probe::UnitProbe>,
+    ) -> crate::systems::action::TacticalActionTargets {
         let Some(&attacker_index) = self.unit_indices.get(&attacker) else {
+            if let Some(p) = probe.as_deref_mut() {
+                p.reject("actor_not_in_snapshot", position, || serde_json::json!({}));
+            }
             return crate::systems::action::TacticalActionTargets::default();
         };
         let attacker_unit = self.units[attacker_index];
@@ -170,6 +185,23 @@ impl AiTacticalSnapshot {
                 }
             });
 
+        if let Some(p) = probe.as_deref_mut() {
+            if is_occupied_by_other {
+                p.reject("tile_occupied_by_other", position, || serde_json::json!({
+                    "occupants":position_indices.iter().filter_map(|&i| {
+                        let u=self.units[i]; (!u.is_transporting && u.entity!=attacker).then_some(u.entity.to_bits())
+                    }).collect::<Vec<_>>(),"attack_generation_skipped":true
+                }));
+            }
+            if !can_capture || is_occupied_by_other {
+                p.reject("capture_eligibility_false", position, || serde_json::json!({
+                    "can_capture":stats.can_capture,"has_property":self.properties.contains_key(&(position.x,position.y)),
+                    "owner":self.properties.get(&(position.x,position.y)).and_then(|p|p.owner).map(|p|p.0),
+                    "occupied_by_other":is_occupied_by_other,
+                    "max_capture_points":self.properties.get(&(position.x,position.y)).map(|p|p.max_capture_points)
+                }));
+            }
+        }
         let attackable_targets = if is_occupied_by_other {
             Vec::new()
         } else {
@@ -188,22 +220,35 @@ impl AiTacticalSnapshot {
                         (position.x, position.y),
                         (target.position.x, target.position.y),
                     );
-                    let weapon_can_attack = |weapon: &WeaponRecord, ammo: u32| {
-                        weapon
-                            .damages
-                            .get(target.unit_type.as_str())
-                            .copied()
-                            .unwrap_or(0)
-                            > 0
-                            && ammo > 0
-                            && (distance <= 1 || !is_moved)
-                            && distance >= weapon.range_min
-                            && distance <= weapon.range_max
+                    let mut weapon_can_attack = |weapon: &WeaponRecord, ammo: u32, slot: &str| {
+                        // 元のANDの順序を維持し、最初に実際に落ちた条件だけを記録する。
+                        let reason = if weapon.damages.get(target.unit_type.as_str()).copied().unwrap_or(0) == 0 {
+                            Some("attack_weapon_zero_damage")
+                        } else if ammo == 0 {
+                            Some("attack_weapon_no_ammo")
+                        } else if distance > 1 && is_moved {
+                            Some("attack_ranged_after_move")
+                        } else if distance < weapon.range_min {
+                            Some("attack_inside_min_range")
+                        } else if distance > weapon.range_max {
+                            Some("attack_outside_max_range")
+                        } else { None };
+                        if let Some(reason) = reason {
+                            if let Some(p) = probe.as_deref_mut() {
+                                p.reject(reason, position, || serde_json::json!({"target_id":target.entity.to_bits(),
+                                    "weapon_slot":slot,"distance":distance,"ammo":ammo,"is_moved":is_moved,
+                                    "min_range":weapon.range_min,"max_range":weapon.range_max}));
+                            }
+                            false
+                        } else { true }
                     };
-                    (primary.is_some_and(|weapon| weapon_can_attack(weapon, attacker_unit.ammo1))
-                        || secondary
-                            .is_some_and(|weapon| weapon_can_attack(weapon, attacker_unit.ammo2)))
-                    .then_some(target.entity)
+                    let allowed = primary.is_some_and(|weapon| weapon_can_attack(weapon, attacker_unit.ammo1, "primary"))
+                        || secondary.is_some_and(|weapon| weapon_can_attack(weapon, attacker_unit.ammo2, "secondary"));
+                    if !allowed && let Some(p) = probe.as_deref_mut() {
+                        p.reject("attack_target_no_usable_weapon", position, || serde_json::json!({
+                            "target_id":target.entity.to_bits(),"primary_exists":primary.is_some(),"secondary_exists":secondary.is_some()}));
+                    }
+                    allowed.then_some(target.entity)
                 })
                 .collect()
         };

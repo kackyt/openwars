@@ -55,6 +55,8 @@ pub fn create_world() -> (World, Schedule) {
 
     // Add event update system to be run at the end of each frame
     schedule.add_systems(update_all_events.after(crate::systems::GameSystemSet));
+    // ON/OFFで登録される診断Resourceを変えず、ゲームの判断には参照させない。
+    world.init_resource::<crate::ai::wait_probe::WaitProbe>();
 
     (world, schedule)
 }

@@ -4,6 +4,7 @@ use crate::ai::v4::capital_route::commitment::{
     capital_route_dominant_capture_escort_node, capital_route_execution_phase,
     capital_route_frontline_sort_key, capital_route_node_frontline_capacity,
     capital_route_role_frontline_capacity, capital_route_uses_capture_lane,
+    route_target_node_anchor, squad_target_route,
 };
 use crate::ai::v4::capital_route::force_demand::split_bridge_route_objectives;
 use crate::ai::v4::capital_route::force_demand::{
@@ -13,16 +14,18 @@ use crate::ai::v4::capital_route::force_demand::{
 };
 use crate::ai::v4::capital_route::model::{
     CAPITAL_ROUTE_REGION_RADIUS, CapitalRouteCommitment, CapitalRouteExecutionPhase,
-    CapitalRouteId, CapitalRouteNodeId, CapitalRouteNodeObjective, CapitalRouteNodeOperation,
+    CapitalRouteId, CapitalRouteNodeObjective, CapitalRouteNodeOperation,
     CapitalRouteNodeOperationId, CapitalRouteNodeOperationRegistry, CapitalRouteNodeScope,
     CapitalRoutePathRegistry, CapitalRouteTopologyKey, CapitalRouteTopologyRegistry,
     RouteForceDemand,
 };
 use crate::ai::v4::capital_route::node_operation::{
-    capital_route_assault_authorized_from_dag, capital_route_dag_frontier_properties,
-    capital_route_node_control_area, capital_route_node_exit_satisfied,
-    capital_route_node_predecessors_released, consolidate_nearby_capture_target_regions,
-    ensure_capital_route_node_operations, refresh_capital_route_node_operations,
+    attach_capture_targets_to_corridor, capital_assault_geometry,
+    capital_route_assault_authorized_from_dag, capital_route_current_fronts,
+    capital_route_dag_frontier_properties, capital_route_node_control_area,
+    capital_route_node_exit_satisfied, capital_route_node_predecessors_released,
+    consolidate_nearby_capture_target_regions, ensure_capital_route_node_operations,
+    refresh_capital_route_node_operations,
 };
 use crate::ai::v4::capital_route::prepare_capital_route_topologies;
 use crate::ai::v4::capital_route::tactical::{
@@ -30,7 +33,7 @@ use crate::ai::v4::capital_route::tactical::{
     capital_route_is_recovering, capital_route_waypoint,
 };
 use crate::ai::v4::capital_route::topology::{
-    armored_entry_bridge_gates, armored_step_distances, capital_route_topology_for,
+    armored_entry_bridge_gates, armored_step_distances, capital_route_topology_for, progress_order,
     same_land_capital_front_reached, same_land_route_fronts,
 };
 use crate::ai::v4::production_pipeline::test_exports::{build_operations, combat_plan_input};
@@ -54,7 +57,7 @@ fn frontline_capacity_follows_scanned_node_geometry() {
                 player_id: player,
                 island_id: island,
             },
-            node: CapitalRouteNodeId(1),
+            anchor: pos(2, 2),
         },
         anchor: pos(2, 2),
         predecessors: Vec::new(),
@@ -93,21 +96,20 @@ fn frontline_capacity_follows_scanned_node_geometry() {
 fn nearby_capture_region_has_one_owner_operation() {
     let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
     let map = flat_map(12, 3);
-    let anchors = vec![pos(1, 1), pos(2, 2), pos(4, 1), pos(8, 1)];
-    let mut targets = vec![
-        vec![pos(1, 1)],
-        vec![pos(2, 2)],
-        vec![pos(4, 1)],
-        vec![pos(8, 1)],
+    let mut regions = vec![
+        (pos(1, 1), vec![pos(1, 1)]),
+        (pos(2, 2), vec![pos(2, 2)]),
+        (pos(4, 1), vec![pos(4, 1)]),
+        (pos(8, 1), vec![pos(8, 1)]),
     ];
 
-    consolidate_nearby_capture_target_regions(&map, &anchors, &mut targets);
+    consolidate_nearby_capture_target_regions(&map, &mut regions);
 
-    assert_eq!(targets[0], vec![pos(1, 1), pos(4, 1), pos(2, 2)]);
-    assert!(targets[1].is_empty());
-    assert!(targets[2].is_empty());
+    assert_eq!(regions[0].1, vec![pos(1, 1), pos(4, 1), pos(2, 2)]);
+    assert!(regions[1].1.is_empty());
+    assert!(regions[2].1.is_empty());
     assert_eq!(
-        targets[3],
+        regions[3].1,
         vec![pos(8, 1)],
         "局地半径を越えた拠点まで一つの完了条件へ混ぜない"
     );
@@ -117,15 +119,65 @@ fn nearby_capture_region_has_one_owner_operation() {
 fn linear_capture_corridor_keeps_independent_operations() {
     let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
     let map = flat_map(12, 3);
-    let anchors = vec![pos(1, 1), pos(2, 1), pos(4, 1)];
-    let mut targets = vec![vec![pos(1, 1)], vec![pos(2, 1)], vec![pos(4, 1)]];
+    let mut regions = vec![
+        (pos(1, 1), vec![pos(1, 1)]),
+        (pos(2, 1), vec![pos(2, 1)]),
+        (pos(4, 1), vec![pos(4, 1)]),
+    ];
 
-    consolidate_nearby_capture_target_regions(&map, &anchors, &mut targets);
+    consolidate_nearby_capture_target_regions(&map, &mut regions);
 
     assert_eq!(
-        targets,
-        vec![vec![pos(1, 1)], vec![pos(2, 1)], vec![pos(4, 1)]],
+        regions,
+        vec![
+            (pos(1, 1), vec![pos(1, 1)]),
+            (pos(2, 1), vec![pos(2, 1)]),
+            (pos(4, 1), vec![pos(4, 1)]),
+        ],
         "一直線の回廊は一Areaへ束ねず、前方へ順番に進める"
+    );
+}
+
+#[test]
+fn capture_targets_attach_to_nearest_corridor_cell_within_radius() {
+    let map = flat_map(12, 8);
+    let corridor = vec![pos(0, 0), pos(1, 0), pos(2, 0), pos(3, 0), pos(4, 0)];
+
+    let regions = attach_capture_targets_to_corridor(
+        &map,
+        &corridor,
+        [
+            pos(2, 3),
+            pos(1, 2),
+            pos(4, 1),
+            pos(4, 1),
+            pos(9, 0),
+            pos(2, 6),
+        ],
+    );
+
+    assert_eq!(
+        regions,
+        vec![
+            (pos(1, 0), vec![pos(1, 2)]),
+            (pos(2, 0), vec![pos(2, 3)]),
+            (pos(4, 0), vec![pos(4, 1)]),
+        ],
+        "最寄りの回廊セルへ結びつけ、半径を越える拠点は取り込まず、目標を持つセルだけを進行順に返す"
+    );
+}
+
+#[test]
+fn capture_target_tie_prefers_home_side_corridor_cell() {
+    let map = flat_map(6, 4);
+    let corridor = vec![pos(1, 0), pos(3, 0)];
+
+    let regions = attach_capture_targets_to_corridor(&map, &corridor, [pos(2, 1)]);
+
+    assert_eq!(
+        regions,
+        vec![(pos(1, 0), vec![pos(2, 1)])],
+        "等距離なら自首都側の回廊セルを選ぶ"
     );
 }
 
@@ -140,7 +192,7 @@ fn capture_node_requires_secured_for_both_area_and_point() {
     let operation = |scope| CapitalRouteNodeOperation {
         id: CapitalRouteNodeOperationId {
             topology,
-            node: CapitalRouteNodeId(1),
+            anchor: pos(2, 2),
         },
         anchor: pos(2, 2),
         predecessors: Vec::new(),
@@ -173,21 +225,21 @@ fn dominant_area_capture_retains_one_escort_until_secured() {
         player_id: player,
         island_id: crate::ai::islands::IslandId(0),
     };
-    let rear_node = CapitalRouteNodeId(1);
-    let active_node = CapitalRouteNodeId(2);
+    let rear_node = pos(1, 2);
+    let active_node = pos(2, 2);
     let rear_id = CapitalRouteNodeOperationId {
         topology,
-        node: rear_node,
+        anchor: rear_node,
     };
     let operation = |id, state| CapitalRouteNodeOperation {
         id,
-        anchor: pos(id.node.0, 2),
+        anchor: id.anchor,
         predecessors: Vec::new(),
         successors: Vec::new(),
         objective: CapitalRouteNodeObjective::Capture,
         scope: CapitalRouteNodeScope::Area,
-        control_area: vec![pos(id.node.0, 2)],
-        capture_targets: vec![pos(id.node.0, 2)],
+        control_area: vec![id.anchor],
+        capture_targets: vec![id.anchor],
         crossing_exit: None,
         crossed: false,
         state,
@@ -238,7 +290,7 @@ fn capture_frontline_reserves_both_capturer_and_control_lanes() {
                 player_id: player,
                 island_id: island,
             },
-            node: CapitalRouteNodeId(1),
+            anchor: pos(2, 2),
         },
         anchor: pos(2, 2),
         predecessors: Vec::new(),
@@ -285,7 +337,7 @@ fn nearest_capture_capable_combat_squad_can_take_the_capture_lane() {
                 player_id: player,
                 island_id: island,
             },
-            node: CapitalRouteNodeId(1),
+            anchor: pos(2, 2),
         },
         anchor: pos(2, 2),
         predecessors: Vec::new(),
@@ -409,7 +461,7 @@ fn hold_and_supply_remain_addressable_inside_the_route_dag() {
                     island_id: island,
                     route: CapitalRouteId(0),
                     target: segment_target,
-                    target_node: CapitalRouteNodeId(2),
+                    target_anchor: segment_target,
                     objective: CapitalRouteNodeObjective::Control,
                     scope: CapitalRouteNodeScope::Point,
                     control_area: vec![segment_target],
@@ -418,11 +470,6 @@ fn hold_and_supply_remain_addressable_inside_the_route_dag() {
                     crossed: false,
                     execution_target: hold,
                     frontline_capacity: 1,
-                    path_nodes: vec![
-                        CapitalRouteNodeId(0),
-                        CapitalRouteNodeId(1),
-                        CapitalRouteNodeId(2),
-                    ],
                     path: vec![hold, supply, segment_target],
                     phase: CapitalRouteExecutionPhase::Hold,
                 },
@@ -434,7 +481,7 @@ fn hold_and_supply_remain_addressable_inside_the_route_dag() {
                     island_id: island,
                     route: CapitalRouteId(0),
                     target: segment_target,
-                    target_node: CapitalRouteNodeId(2),
+                    target_anchor: segment_target,
                     objective: CapitalRouteNodeObjective::Control,
                     scope: CapitalRouteNodeScope::Point,
                     control_area: vec![segment_target],
@@ -443,11 +490,6 @@ fn hold_and_supply_remain_addressable_inside_the_route_dag() {
                     crossed: false,
                     execution_target: supply,
                     frontline_capacity: 1,
-                    path_nodes: vec![
-                        CapitalRouteNodeId(0),
-                        CapitalRouteNodeId(1),
-                        CapitalRouteNodeId(2),
-                    ],
                     path: vec![hold, supply, segment_target],
                     phase: CapitalRouteExecutionPhase::Supply,
                 },
@@ -459,7 +501,7 @@ fn hold_and_supply_remain_addressable_inside_the_route_dag() {
                     island_id: island,
                     route: CapitalRouteId(0),
                     target: segment_target,
-                    target_node: CapitalRouteNodeId(2),
+                    target_anchor: segment_target,
                     objective: CapitalRouteNodeObjective::Control,
                     scope: CapitalRouteNodeScope::Point,
                     control_area: vec![segment_target],
@@ -468,11 +510,6 @@ fn hold_and_supply_remain_addressable_inside_the_route_dag() {
                     crossed: false,
                     execution_target: segment_target,
                     frontline_capacity: 1,
-                    path_nodes: vec![
-                        CapitalRouteNodeId(0),
-                        CapitalRouteNodeId(1),
-                        CapitalRouteNodeId(2),
-                    ],
                     path: vec![hold, supply, segment_target],
                     phase: CapitalRouteExecutionPhase::Advance,
                 },
@@ -514,7 +551,7 @@ fn route_order_is_shared_by_members_of_the_same_squad() {
                 island_id: island,
                 route: CapitalRouteId(0),
                 target,
-                target_node: CapitalRouteNodeId(1),
+                target_anchor: target,
                 objective: CapitalRouteNodeObjective::Control,
                 scope: CapitalRouteNodeScope::Point,
                 control_area: vec![target],
@@ -523,7 +560,6 @@ fn route_order_is_shared_by_members_of_the_same_squad() {
                 crossed: false,
                 execution_target: target,
                 frontline_capacity: 1,
-                path_nodes: vec![CapitalRouteNodeId(0), CapitalRouteNodeId(1)],
                 path: vec![pos(1, 1), target],
                 phase: CapitalRouteExecutionPhase::Advance,
             },
@@ -565,7 +601,7 @@ fn only_capturer_claims_an_unsecured_route_milestone() {
         island_id: island,
         route: CapitalRouteId(route),
         target,
-        target_node: CapitalRouteNodeId(1),
+        target_anchor: target,
         objective: CapitalRouteNodeObjective::Capture,
         scope: CapitalRouteNodeScope::Point,
         control_area: vec![target],
@@ -574,7 +610,6 @@ fn only_capturer_claims_an_unsecured_route_milestone() {
         crossed: false,
         execution_target: target,
         frontline_capacity: 1,
-        path_nodes: vec![CapitalRouteNodeId(0), CapitalRouteNodeId(1)],
         path: vec![pos(1, 1), target],
         phase: CapitalRouteExecutionPhase::Advance,
     };
@@ -709,7 +744,7 @@ fn unfinished_capture_node_reserves_property_cells_for_capturers() {
     };
     let operation_id = CapitalRouteNodeOperationId {
         topology,
-        node: CapitalRouteNodeId(1),
+        anchor: pos(8, 11),
     };
     let target = pos(10, 11);
     let mut registry = CapitalRouteNodeOperationRegistry::default();
@@ -1036,7 +1071,7 @@ fn map1_single_corridor_still_builds_a_capital_route_dag() {
         1,
         "map_1を複数routeへ水増しせず、一本の首都進軍路として管理する"
     );
-    let start_node = topology.start_node;
+    let home = topology.nodes[topology.start_node.0].anchor;
     let manager = crate::ai::squad::SquadManager::default();
     refresh_capital_route_node_operations(&mut world, player, &manager);
     let node_operations = world.resource::<CapitalRouteNodeOperationRegistry>();
@@ -1047,7 +1082,7 @@ fn map1_single_corridor_still_builds_a_capital_route_dag() {
                 player_id: player,
                 island_id: island,
             },
-            node: start_node,
+            anchor: home,
         })
         .expect("静的DAGの開始Nodeを作戦台帳へ展開する");
     assert_eq!(
@@ -1153,9 +1188,10 @@ fn map26_builds_a_forward_dag_independently_for_each_player() {
     for topology in [first, second] {
         assert!(topology.routes.len() >= 2, "橋の北・南を別の入口として持つ");
         assert!(topology.nodes.iter().all(|node| {
-            node.successor_nodes
-                .iter()
-                .all(|successor| topology.nodes[successor.0].progress > node.progress)
+            node.successor_nodes.iter().all(|successor| {
+                topology.from_home[&topology.nodes[successor.0].anchor]
+                    > topology.from_home[&node.anchor]
+            })
         }));
         let mut inbound = vec![0_u32; topology.nodes.len()];
         for node in &topology.nodes {
@@ -1253,7 +1289,7 @@ fn map26_bridge_node_requires_a_ground_unit_to_reach_its_exit() {
         .values()
         .filter(|operation| operation.id.topology == topology_key)
         .filter(|operation| operation.crossing_exit.is_some())
-        .min_by_key(|operation| topology.nodes[operation.id.node.0].progress)
+        .min_by_key(|operation| topology.from_home[&operation.anchor])
         .cloned()
         .expect("map_26の先攻DAGには橋を越えるNodeがある");
     assert!(
@@ -1273,7 +1309,7 @@ fn map26_bridge_node_requires_a_ground_unit_to_reach_its_exit() {
         "橋は局地Areaではなく、出口へ通過すべきPoint Nodeとして分類する"
     );
     let crossing_exit = bridge_operation.crossing_exit.expect("橋向こうの出口");
-    let bridge_progress = topology.nodes[bridge_operation.id.node.0].progress;
+    let bridge_progress = topology.from_home[&bridge_operation.anchor];
 
     // 前段を確保済み・優勢にして、橋Nodeだけの通過条件を単独で観測できるようにする。
     // 実際の対局ではこの状態は前段NodeのCapture/Control完了後に得られる。
@@ -1291,7 +1327,7 @@ fn map26_bridge_node_requires_a_ground_unit_to_reach_its_exit() {
     for node in topology
         .nodes
         .iter()
-        .filter(|node| node.progress < bridge_progress)
+        .filter(|node| topology.from_home[&node.anchor] < bridge_progress)
     {
         world.spawn((
             Faction(player),
@@ -1612,7 +1648,7 @@ fn advancing_route_registry_exposes_the_current_segment_roster() {
         island_id: island,
         route: CapitalRouteId(0),
         target: pos(5, 1),
-        target_node: CapitalRouteNodeId(1),
+        target_anchor: pos(5, 1),
         objective: CapitalRouteNodeObjective::Control,
         scope: CapitalRouteNodeScope::Point,
         control_area: vec![pos(5, 1)],
@@ -1621,7 +1657,6 @@ fn advancing_route_registry_exposes_the_current_segment_roster() {
         crossed: false,
         execution_target: pos(5, 1),
         frontline_capacity: 1,
-        path_nodes: vec![CapitalRouteNodeId(0), CapitalRouteNodeId(1)],
         path: vec![pos(0, 1), pos(5, 1)],
         phase,
     };
@@ -1715,5 +1750,259 @@ fn staged_route_member_is_counted_after_its_front_arrival_eta() {
     assert!(
         input.existing_units[0].available_turn > 0,
         "Stage部隊を前衛と同じ手番の火力にせず、到着後の既存戦力として評価する"
+    );
+}
+
+/// map_6で、`player` の首都がある島と、DAG・Node作戦を用意したWorldを返す。
+fn map6_route_world(player: PlayerId) -> (World, crate::ai::islands::IslandId) {
+    let master_data = MasterDataRegistry::load().unwrap();
+    let (mut world, _schedule) = crate::setup::initialize_world_from_master_data_with_topology(
+        &master_data,
+        "map_6",
+        GridTopology::Square,
+    )
+    .unwrap();
+    let own_capital = world
+        .iter_entities()
+        .find_map(|entity| {
+            let position = entity.get::<GridPosition>()?;
+            let property = entity.get::<Property>()?;
+            (property.terrain == Terrain::Capital && property.owner_id == Some(player))
+                .then_some(*position)
+        })
+        .expect("自首都");
+    let island = world
+        .resource::<crate::ai::islands::IslandMap>()
+        .get_island_at(&own_capital)
+        .expect("首都の島")
+        .id;
+    prepare_capital_route_topologies(&mut world, player);
+    ensure_capital_route_node_operations(&mut world, player);
+    (world, island)
+}
+
+/// 進軍路の現在の前線は、その進軍路の前線拠点のうち最も前進した拠点である。
+#[test]
+fn current_route_fronts_are_the_most_advanced_frontier_properties() {
+    let player = PlayerId(2);
+    let (world, island) = map6_route_world(player);
+    let topology = capital_route_topology_for(&world, player, island).expect("map_6の進軍回廊");
+    let frontiers = capital_route_dag_frontier_properties(&world, player, island).unwrap();
+
+    let fronts = capital_route_current_fronts(&world, player, island).unwrap();
+
+    assert_eq!(fronts.len(), topology.routes.len());
+    for (route, front) in fronts.iter().enumerate() {
+        assert!(
+            frontiers[route].contains(front),
+            "route {route} の前線 {front:?} は前線拠点 {:?} の一つ",
+            frontiers[route]
+        );
+        let front_progress = topology.from_home[front];
+        assert!(
+            frontiers[route]
+                .iter()
+                .all(|property| topology.from_home[property] <= front_progress),
+            "route {route} の前線は最も前進した前線拠点"
+        );
+    }
+    assert!(
+        fronts
+            .iter()
+            .zip(&topology.routes)
+            .any(|(front, route)| *front != route.front),
+        "固定の識別点ではなく、盤面の所有状況から前線を求める"
+    );
+}
+
+/// 敵首都以外の拠点をすべて確保した進軍路では、敵首都を前線にする。
+#[test]
+fn current_route_fronts_fall_back_to_enemy_capital_once_cleared() {
+    let player = PlayerId(2);
+    let (mut world, island) = map6_route_world(player);
+    let goal = {
+        let topology = capital_route_topology_for(&world, player, island).unwrap();
+        topology.nodes[topology.goal_node.0].anchor
+    };
+    let properties = world
+        .iter_entities()
+        .filter_map(|entity| {
+            let property = entity.get::<Property>()?;
+            (property.terrain != Terrain::Capital).then_some(entity.id())
+        })
+        .collect::<Vec<_>>();
+    for entity in properties {
+        world
+            .entity_mut(entity)
+            .get_mut::<Property>()
+            .expect("Propertyを持つEntity")
+            .owner_id = Some(player);
+    }
+
+    let fronts = capital_route_current_fronts(&world, player, island).unwrap();
+
+    assert_eq!(fronts, vec![goal; fronts.len()]);
+}
+
+/// `player` の首都戦役で、敵首都から `radius` より離れた拠点をすべて `player` の所有にする。
+fn own_properties_outside_capital_region(
+    world: &mut World,
+    player: PlayerId,
+    capital: GridPosition,
+    radius: u32,
+) {
+    let map = world.resource::<Map>().clone();
+    let properties = world
+        .iter_entities()
+        .filter_map(|entity| {
+            let position = entity.get::<GridPosition>()?;
+            entity.get::<Property>()?;
+            (map.distance(position.x, position.y, capital.x, capital.y) > radius)
+                .then_some(entity.id())
+        })
+        .collect::<Vec<_>>();
+    for entity in properties {
+        world
+            .entity_mut(entity)
+            .get_mut::<Property>()
+            .expect("Propertyを持つEntity")
+            .owner_id = Some(player);
+    }
+}
+
+/// 序盤は前線拠点が敵首都の地域の外にも残るので、首都攻略の段階に入らない。
+#[test]
+fn capital_assault_waits_until_every_front_property_is_near_the_capital() {
+    let player = PlayerId(2);
+    let (world, island) = map6_route_world(player);
+
+    assert_eq!(capital_assault_geometry(&world, player, island), None);
+}
+
+/// 首都の地域の外の拠点をすべて確保すると首都攻略に入り、待機地点は首都の入口の外
+/// （首都から11ステップ手前の回廊セル）になる。
+#[test]
+fn capital_assault_starts_once_only_the_capital_region_remains() {
+    let player = PlayerId(2);
+    let (mut world, island) = map6_route_world(player);
+    let (goal, goal_progress) = {
+        let topology = capital_route_topology_for(&world, player, island).unwrap();
+        let goal = topology.nodes[topology.goal_node.0].anchor;
+        (goal, topology.from_home[&goal])
+    };
+    own_properties_outside_capital_region(&mut world, player, goal, CAPITAL_ROUTE_REGION_RADIUS);
+
+    let geometry = capital_assault_geometry(&world, player, island).expect("首都攻略の段階");
+
+    let topology = capital_route_topology_for(&world, player, island).unwrap();
+    assert_eq!(geometry.capital, goal);
+    assert!(topology.corridor.contains(&geometry.staging));
+    assert_eq!(topology.from_home[&geometry.staging] + 11, goal_progress);
+}
+
+/// 区間目標の拠点が地域Nodeの占領対象にまとめられているだけなら、そのNodeのanchorを
+/// 目標にする。拠点セルのままだと経路の終点に作戦がなく、枝全体がDAGから外れる。
+#[test]
+fn route_target_property_resolves_to_its_capture_node_anchor() {
+    let player = PlayerId(2);
+    let (world, island) = map6_route_world(player);
+    let topology = capital_route_topology_for(&world, player, island).expect("map_6の進軍回廊");
+    let operations = world.resource::<CapitalRouteNodeOperationRegistry>();
+    let player_operations = operations
+        .operations
+        .values()
+        .filter(|operation| operation.id.topology.player_id == player)
+        .collect::<Vec<_>>();
+    let frontiers = capital_route_dag_frontier_properties(&world, player, island).unwrap();
+
+    let mut resolved_inside_area = 0;
+    for property in frontiers.iter().flatten().copied() {
+        let target = route_target_node_anchor(&world, player, island, property);
+        if player_operations
+            .iter()
+            .any(|operation| operation.anchor == property)
+        {
+            assert_eq!(target, property, "拠点自身がNodeなら置き換えない");
+        } else if let Some(owner) = player_operations
+            .iter()
+            .filter(|operation| operation.capture_targets.contains(&property))
+            .min_by_key(|operation| progress_order(&topology.from_home, operation.anchor))
+        {
+            assert_eq!(
+                target, owner.anchor,
+                "{property:?}を含む自首都側のNodeを目標にする"
+            );
+            resolved_inside_area += 1;
+        }
+    }
+    assert!(
+        resolved_inside_area > 0,
+        "map_6の区間目標には地域Nodeにまとめられた拠点がある: {frontiers:?}"
+    );
+}
+
+/// DAGはSquadを、作戦が与えた目標の属する枝へ置く。
+#[test]
+fn squad_route_follows_the_branch_of_its_own_target() {
+    let player = PlayerId(2);
+    let (world, island) = map6_route_world(player);
+    let topology = capital_route_topology_for(&world, player, island).unwrap();
+    let map = world.resource::<Map>();
+    let open = vec![Some(pos(0, 0)); topology.routes.len()];
+    let south = topology.routes[1].front;
+
+    // 前線そのものを守るSquadは、その前線の枝へ入る。
+    assert_eq!(
+        squad_target_route(topology, map, &MissionType::Defense, Some(south), &open),
+        Some(1)
+    );
+    // 枝の拠点を目標にするSquadは、任務によらずその拠点の枝へ入る。
+    let (property, route) = topology
+        .property_routes
+        .iter()
+        .map(|(property, route)| (*property, route.0))
+        .min_by_key(|(property, _)| (property.y, property.x))
+        .unwrap();
+    for mission in [MissionType::Capture, MissionType::Attack] {
+        assert_eq!(
+            squad_target_route(topology, map, &mission, Some(property), &open),
+            Some(route)
+        );
+    }
+    // 拠点でも前線でもない目標は、戦闘役なら最寄りの前線の枝、占領役なら枝を決めない。
+    let north = topology.routes[0].front;
+    let near_south = [(0, 1), (1, 0), (0, -1), (-1, 0), (1, 1), (-1, -1)]
+        .into_iter()
+        .filter_map(|(dx, dy): (isize, isize)| {
+            Some(pos(
+                south.x.checked_add_signed(dx)?,
+                south.y.checked_add_signed(dy)?,
+            ))
+        })
+        .find(|cell| {
+            !topology.property_routes.contains_key(cell)
+                && map.distance(cell.x, cell.y, south.x, south.y)
+                    < map.distance(cell.x, cell.y, north.x, north.y)
+        })
+        .expect("南の前線の隣に拠点でないマスがある");
+    assert_eq!(
+        squad_target_route(topology, map, &MissionType::Attack, Some(near_south), &open),
+        Some(1)
+    );
+    assert_eq!(
+        squad_target_route(
+            topology,
+            map,
+            &MissionType::Capture,
+            Some(near_south),
+            &open
+        ),
+        None
+    );
+    // 区間目標の無い枝には入れない。
+    let closed = vec![Some(pos(0, 0)), None];
+    assert_eq!(
+        squad_target_route(topology, map, &MissionType::Defense, Some(south), &closed),
+        None
     );
 }

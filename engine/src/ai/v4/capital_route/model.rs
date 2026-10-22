@@ -36,14 +36,15 @@ pub(in crate::ai::v4) struct CapitalRouteId(pub(in crate::ai::v4) usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(in crate::ai::v4) struct CapitalRouteNodeId(pub(in crate::ai::v4) usize);
 
-/// 静的なセルDAGのNodeを、毎手番に観測・実行できる作戦として識別するID。
+/// 進軍回廊上の中継点を、毎手番に観測・実行できる作戦として識別するID。
 ///
 /// `VictoryRoadmap` の島Campaign IDとは混ぜない。同一島の地上進軍を表すため、
-/// topologyとその中のNode番号の組で一意にする。
+/// topologyと中継点の代表座標の組で一意にする。回廊の内部表現（セル番号）に
+/// 依存させないことで、回廊の作り方を変えても作戦・Squad指令の参照を保てる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(in crate::ai::v4) struct CapitalRouteNodeOperationId {
     pub(in crate::ai::v4) topology: CapitalRouteTopologyKey,
-    pub(in crate::ai::v4) node: CapitalRouteNodeId,
+    pub(in crate::ai::v4) anchor: GridPosition,
 }
 
 /// DAG NodeがSquadへ要求する達成内容。
@@ -68,10 +69,10 @@ pub(in crate::ai::v4) enum CapitalRouteNodeScope {
 
 /// 首都間の最短装甲回廊を構成する一マス分のDAGノード。
 ///
-/// 同距離の別ノードは並列に進め、後段の同一ノードへ合流できる。
+/// 同距離の別ノードは並列に進め、後段の同一ノードへ合流できる。DAGは枝に沿った
+/// 通り道の選択と分岐・合流の検出だけに使い、前後の判定は `from_home` の距離表で行う。
 #[derive(Debug, Clone)]
 pub(in crate::ai::v4) struct CapitalRouteNode {
-    pub(in crate::ai::v4) progress: u32,
     pub(in crate::ai::v4) anchor: GridPosition,
     pub(in crate::ai::v4) successor_nodes: Vec<CapitalRouteNodeId>,
 }
@@ -92,9 +93,23 @@ pub(in crate::ai::v4) struct CapitalRouteTopology {
     pub(in crate::ai::v4) start_node: CapitalRouteNodeId,
     pub(in crate::ai::v4) goal_node: CapitalRouteNodeId,
     pub(in crate::ai::v4) nodes: Vec<CapitalRouteNode>,
+    /// 進軍回廊のセルを自首都からの進行順に並べたもの。拠点の結びつけと中継点の選定は
+    /// このセル集合で行い、DAGのノード番号や辺には依存させない。
+    pub(in crate::ai::v4) corridor: Vec<GridPosition>,
     pub(in crate::ai::v4) routes: Vec<CapitalRoute>,
     pub(in crate::ai::v4) property_routes: HashMap<GridPosition, CapitalRouteId>,
+    /// 自首都からの装甲移動ステップ数。前方・後方の判定はすべてこの距離表で行う。
     pub(in crate::ai::v4) from_home: HashMap<GridPosition, u32>,
+}
+
+impl CapitalRouteTopology {
+    /// 指定セルに対応するDAGノードを返す。回廊外のセルにはノードがない。
+    pub(in crate::ai::v4) fn node_at(&self, position: GridPosition) -> Option<CapitalRouteNodeId> {
+        self.nodes
+            .iter()
+            .position(|node| node.anchor == position)
+            .map(CapitalRouteNodeId)
+    }
 }
 
 #[derive(Resource, Debug, Default)]
@@ -154,8 +169,9 @@ pub(in crate::ai::v4) struct CapitalRouteCommitment {
     pub(in crate::ai::v4) route: CapitalRouteId,
     /// 区間の完了を判定する先頭未確保拠点。所有権が変わるまで進軍区間は閉じない。
     pub(in crate::ai::v4) target: GridPosition,
-    /// `target` が対応するセルDAG Node。SquadはこのNode Operationを実行する。
-    pub(in crate::ai::v4) target_node: CapitalRouteNodeId,
+    /// Squadが実行する中継点作戦の代表座標。`target` の拠点を含む作戦とは限らず、
+    /// 後方の未完了作戦へ護衛を残す場合などはそちらを指す。
+    pub(in crate::ai::v4) target_anchor: GridPosition,
     /// 現在のNodeが要求する達成内容。移動先の一点ではなく、Squadの局地任務を
     /// 決めるために保持する。
     pub(in crate::ai::v4) objective: CapitalRouteNodeObjective,
@@ -176,9 +192,7 @@ pub(in crate::ai::v4) struct CapitalRouteCommitment {
     /// 前線Nodeへ同時に入れてよい地上member数。地形から決める収容枠であり、
     /// 敵の数だけ無制限に後続を集めないためにSquad指令へ付随させる。
     pub(in crate::ai::v4) frontline_capacity: usize,
-    /// 経路の座標列と同じ順序のNode列。地理制約だけでなく、どのNodeを通過するかを
-    /// 監査・状態遷移へ渡す。
-    pub(in crate::ai::v4) path_nodes: Vec<CapitalRouteNodeId>,
+    /// 分岐から区間目標までの移動用セル列。
     pub(in crate::ai::v4) path: Vec<GridPosition>,
     pub(in crate::ai::v4) phase: CapitalRouteExecutionPhase,
 }

@@ -33,9 +33,33 @@ pub(super) enum PlanningPolicy {
 }
 
 impl PlanningPolicy {
-    /// SquadManagerをWorldから外す前の準備（小規模V4: 戦略パイプラインの事前処理）。
+    /// 標準はcampaign/Squadだけが現在任務を決める。旧配備命令は小規模の互換境界に閉じる。
+    fn prepare_legacy_deployments(
+        self,
+        world: &mut World,
+        manager: &mut SquadManager,
+        player: PlayerId,
+        connectivity: &mut TerrainConnectivity,
+    ) -> HashSet<Entity> {
+        match self {
+            Self::Standard => HashSet::default(),
+            Self::SmallMap => {
+                crate::ai::v4::deployment::prepare_deployment_squads_with_connectivity(
+                    world,
+                    manager,
+                    player,
+                    &HashSet::default(),
+                    crate::ai::v4::deployment::SecuredAnchorRule::Hold,
+                    connectivity,
+                )
+            }
+        }
+    }
+
+    /// SquadManagerをWorldから外す前の準備（V4: 戦略パイプラインの事前処理）。
+    /// 首都ルートDAGは標準マップでも構築し、小規模専用の処理はパイプライン側で判定する。
     fn before_manager_removal(self, world: &mut World, player: PlayerId, is_v4: bool) {
-        if self == Self::SmallMap && is_v4 {
+        if is_v4 {
             crate::ai::v4::strategy_pipeline::before_squad_planning(world, player);
         }
     }
@@ -135,7 +159,7 @@ impl PlanningPolicy {
         }
     }
 
-    /// 所属の正規化の後の仕上げ（小規模V4: 経路commitmentとRoadmapでの採用）。
+    /// 所属の正規化の後の仕上げ（V4: 経路commitment、小規模はRoadmapでの採用も）。
     fn after_final_reconcile(
         self,
         world: &mut World,
@@ -144,10 +168,17 @@ impl PlanningPolicy {
         manager: &mut SquadManager,
         is_v4: bool,
     ) {
-        if self == Self::SmallMap && is_v4 {
-            crate::ai::v4::strategy_pipeline::after_squad_planning(
+        if !is_v4 {
+            return;
+        }
+        match self {
+            // 標準マップは首都ルートDAGの実行区間だけを更新する（Roadmapの採用は小規模専用）。
+            Self::Standard => {
+                crate::ai::v4::strategy_pipeline::refresh_route_commitments(world, player, manager)
+            }
+            Self::SmallMap => crate::ai::v4::strategy_pipeline::after_squad_planning(
                 world, player, portfolio, manager,
-            );
+            ),
         }
     }
 }
@@ -420,6 +451,8 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
     policy.before_manager_removal(world, player, is_v4);
     let mut manager = world.remove_resource::<SquadManager>().unwrap_or_default();
     prepare_squads_for_replanning(world, &mut manager, player, is_v4);
+    // 任務の完了更新はupdate_squads、次の責任割当はcampaign編成が担当する。
+    let mut caches = FormationCaches::default();
     // 盤面（unit・物件・地図）は再編の間に変わらないため、戦略分析と汎用編成で1つを共有する。
     let snapshot = PlayerBoard::observe(world, player);
 
@@ -429,8 +462,7 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
         policy.adopt_portfolio(world, player, &manager, &analysis.campaign_portfolio, is_v4);
     let enemy_clusters = detect_enemy_clusters(world, player);
 
-    // 地形連結cacheは地図と移動種別だけで決まるため、campaign編成・配備・汎用編成で共有する。
-    let mut caches = FormationCaches::default();
+    // 地形連結cacheは、達成済み任務の解除・campaign編成・配備・汎用編成で共有する。
 
     // 3. campaign編成
     let mut campaign = form_campaign_squads(
@@ -442,19 +474,16 @@ pub(super) fn plan_squads_with_policy(world: &mut World, player: PlayerId, polic
         policy,
         &mut caches.connectivity,
     );
-    // V4のCombat枠で生産した実Entityは、campaign再配分とgeneric free poolより前に
-    // 要求元の局地Attack任務へ予約する。
-    // 既存campaign assignmentへ残っていても、明示的な生産目的を優先して切り離す。
+    // 小規模の旧配備契約だけを互換段として適用する。標準は生産履歴から任務を上書きしない。
     if is_v4 {
-        let deployment_reserved =
-            crate::ai::v4::deployment::prepare_deployment_squads_with_connectivity(
+        campaign
+            .reserved_entities
+            .extend(policy.prepare_legacy_deployments(
                 world,
                 &mut manager,
                 player,
-                &HashSet::default(),
                 &mut caches.connectivity,
-            );
-        campaign.reserved_entities.extend(deployment_reserved);
+            ));
     }
     // #53 (V3): メンバーが全滅した占領部隊を解散する。
     // 残しておくと「そのターゲットには部隊が存在する」と誤判定され続け

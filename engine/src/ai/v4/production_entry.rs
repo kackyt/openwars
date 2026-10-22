@@ -88,24 +88,6 @@ pub(in crate::ai::v4) fn commit_turn_production(
             .resource_mut::<campaign_execution::V4CampaignExecutionRegistry>()
             .append_turn_intents(player_id, turn, &capture_intents);
     }
-    let closed_plan_ids = rolling_registry
-        .audit_records(player_id)
-        .into_iter()
-        .filter(|audit| audit.turn == turn)
-        .filter(|audit| {
-            matches!(
-                audit.disposition,
-                PlanDisposition::Completed | PlanDisposition::Withdrawn
-            )
-        })
-        .map(|audit| audit.plan_id)
-        .collect::<HashSet<_>>();
-    let active_plan_intents = rolling_registry.active_deployment_intents(
-        player_id,
-        scan.capital_assault_authorized,
-        scan.capital_staging_anchor,
-    );
-    world.insert_resource(rolling_registry);
 
     // 診断traceとは別に、生産完了イベントと照合する作戦意図を永続化する。
     let pending = planned
@@ -139,10 +121,16 @@ pub(in crate::ai::v4) fn commit_turn_production(
     let mut deployment_registry = world
         .remove_resource::<deployment::V4DeploymentRegistry>()
         .unwrap_or_default();
-    deployment_registry.release_closed_plans(&closed_plan_ids);
-    deployment_registry.replace_turn_orders(player_id, turn, pending);
-    deployment_registry.refresh_plan_intents(&active_plan_intents);
+    ProductionPolicy::for_current_path().register_deployment_orders(
+        &mut deployment_registry,
+        &rolling_registry,
+        scan,
+        player_id,
+        turn,
+        pending,
+    );
     world.insert_resource(deployment_registry);
+    world.insert_resource(rolling_registry);
     // 生産判断の内訳を診断リソースへ残す（判定は行わず記録のみ）。
     world
         .get_resource_or_insert_with(ProductionTraceDiagnostics::default)
@@ -207,12 +195,8 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
     if let Some(budget) = campaign_surplus {
         scan.funds = scan.funds.min(budget);
     }
-    // 既存戦力として見積へ入れるのは、実際にV4 Combat任務へ接続済みのEntityだけ。
-    // 占領・輸送など別任務中のunitを「倒せるはず」と二重計上しない。
-    let committed_combat_assignments = world
-        .get_resource::<deployment::V4DeploymentRegistry>()
-        .map(|registry| registry.active_target_assignments(player_id))
-        .unwrap_or_default();
+    // 既存戦力は現在任務から読む。購入履歴のPlanIdを現在所属と混同しない。
+    let committed_combat_assignments = policy.current_combat_assignments(world, player_id);
     // Squad計画でDAGへ束縛した前進部隊を、首都作戦の既存戦力として同じ手番の
     // 生産plannerへ渡す。PlanIdの有無ではなく、親戦役の未完了区間へ実際に進む
     // という作戦状態を正本にする。
@@ -312,6 +296,10 @@ pub(in crate::ai::v4) fn observe_plan_execution(world: &mut World, player_id: Pl
         }
     }
 
+    let current_missions = match ProductionPolicy::for_current_path() {
+        ProductionPolicy::Standard => mission_input::active_entities(world, player_id),
+        ProductionPolicy::SmallMap => HashSet::default(),
+    };
     let deployments = audit_records
         .into_iter()
         .filter_map(|record| {
@@ -330,9 +318,10 @@ pub(in crate::ai::v4) fn observe_plan_execution(world: &mut World, player_id: Pl
                 plan_step: Some(plan_step),
                 unit_cost,
                 alive,
-                // higher-priority任務へ一時preemptされSquadを失ったEntityを、Planが
-                // 実行中の戦力として数えない。Defense待機はSquadを持つため残る。
-                mission_active: alive && record.active && record.squad_id.is_some(),
+                // 購入予実の帰属は不変。現在任務中かどうかだけをSquad正本から観測する。
+                mission_active: alive
+                    && (current_missions.contains(&record.entity)
+                        || (record.active && record.squad_id.is_some())),
                 current_loss_value,
                 // PlanIdを持つ生産Entityの全戦闘を、そのPlanの実績へ一度だけ戻す。
                 // 「現在標的だけ」に絞ると、同一作戦圏内の好機標的へ切り替えた攻撃や、

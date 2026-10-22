@@ -458,6 +458,21 @@ pub(in crate::ai::v4) fn same_land_capitals(
     Some((*own_capitals.first()?, *enemy_capitals.first()?))
 }
 
+/// 自首都からの進行距離・y・xの順で、回廊上の座標を決定的に並べるキー。
+///
+/// 回廊外の座標は最後に並べる。中継点作戦の前提関係は自首都側から評価するため、
+/// 作戦の走査順と回廊セルの並びの両方でこのキーを使う。
+pub(in crate::ai::v4) fn progress_order(
+    from_home: &HashMap<GridPosition, u32>,
+    position: GridPosition,
+) -> (u32, usize, usize) {
+    (
+        from_home.get(&position).copied().unwrap_or(u32::MAX),
+        position.y,
+        position.x,
+    )
+}
+
 /// 静的な地形・拠点配置から、勢力ごとの前向き首都攻略DAGを一度だけ構築する。
 ///
 /// ノードは両首都を結ぶ最短装甲回廊のセル、辺は自首都からの距離が一つ増える移動だけで
@@ -530,13 +545,7 @@ pub(in crate::ai::v4) fn build_capital_route_topology(
                 .then_some(*position)
         })
         .collect::<Vec<_>>();
-    corridor_positions.sort_unstable_by_key(|position| {
-        (
-            from_home.get(position).copied().unwrap_or(u32::MAX),
-            position.y,
-            position.x,
-        )
-    });
+    corridor_positions.sort_unstable_by_key(|position| progress_order(&from_home, *position));
     let node_ids = corridor_positions
         .iter()
         .enumerate()
@@ -547,7 +556,6 @@ pub(in crate::ai::v4) fn build_capital_route_topology(
     let mut nodes = corridor_positions
         .iter()
         .map(|position| CapitalRouteNode {
-            progress: from_home.get(position).copied().unwrap_or(u32::MAX),
             anchor: *position,
             successor_nodes: Vec::new(),
         })
@@ -556,13 +564,14 @@ pub(in crate::ai::v4) fn build_capital_route_topology(
         if *node_id == goal_node {
             continue;
         }
-        let progress = nodes[node_id.0].progress;
+        // 回廊セルは必ず距離表に載っている。辺は距離が一つ増える隣接セルへだけ張る。
+        let progress = from_home[position];
         nodes[node_id.0].successor_nodes = map
             .get_adjacent(position.x, position.y)
             .into_iter()
             .map(|(x, y)| GridPosition { x, y })
+            .filter(|adjacent| from_home.get(adjacent) == Some(&progress.saturating_add(1)))
             .filter_map(|adjacent| node_ids.get(&adjacent).copied())
-            .filter(|adjacent_id| nodes[adjacent_id.0].progress == progress.saturating_add(1))
             .collect();
     }
     let routes = fronts
@@ -573,6 +582,7 @@ pub(in crate::ai::v4) fn build_capital_route_topology(
         start_node,
         goal_node,
         nodes,
+        corridor: corridor_positions,
         routes,
         property_routes,
         from_home,

@@ -9,6 +9,7 @@
 //! - `small_map`: 小規模マップV4の行動選択（DAG・占領契約・生産口・占位を加える）
 
 pub(crate) mod approach;
+pub(crate) mod blockade;
 pub(crate) mod board;
 pub(crate) mod scoring;
 pub(crate) mod small_map;

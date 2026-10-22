@@ -64,6 +64,13 @@ impl BestUnitAction {
         }
     }
 
+    /// 観測用の読取口。候補の再評価やcommand生成は行わない。
+    pub(crate) fn evaluated_choice(&self) -> Option<(Rank, Entity, &AiCommand)> {
+        self.0
+            .as_ref()
+            .map(|(rank, entity, command)| (*rank, *entity, command))
+    }
+
     /// 最良の1手を確定し、その評価をEventで通知する。
     pub(crate) fn choose(
         self,
@@ -131,6 +138,39 @@ pub(crate) fn v3_positioning_score(
     score
 }
 
+/// 地形防御の加点の上限（約半移動分の接近点）。高価なunitほど避けられる損失が大きく、
+/// 上限が無いと防御地形に留まる価値が前進を上回り、進軍が止まる。
+pub(crate) const DIRECT_THREAT_TERRAIN_CAP: i32 = 1000;
+
+/// V4の通常経路で、直接攻撃unitが敵の直接攻撃圏で防御地形に止まる価値。
+///
+/// 直接攻撃unitは敵の直接攻撃圏への踏み込みを減点しない（[`v3_positioning_score`]）。
+/// そのため地形防御の効果が `地形効果×10` の同点比較にしか残らず、前線で道路に止まる。
+/// 圏内に限り、地形で避けられる期待損失を上限つきで加点し、同程度の前進なら防御地形で
+/// 止まるようにする。小規模マップの経路では前進が遅れたため使わない。
+pub(crate) fn direct_threat_terrain_score(
+    board: &TacticalBoard,
+    unit: &UnitState,
+    position: GridPosition,
+    defense_bonus: u32,
+) -> i32 {
+    let stats = &unit.stats;
+    if !board.weighs_direct_threat_terrain || stats.min_range > 1 {
+        return 0;
+    }
+    crate::ai::threat::direct_reach_terrain_relief(
+        &board.map,
+        (position.x, position.y),
+        stats.unit_type,
+        stats.cost,
+        unit.hp,
+        defense_bonus,
+        &board.enemies,
+        &board.damage_chart,
+    )
+    .min(DIRECT_THREAT_TERRAIN_CAP)
+}
+
 /// Squad目標への接近（到達可否によらず加点する）。
 pub(crate) fn squad_target_approach_score(
     unit: &UnitState,
@@ -141,6 +181,26 @@ pub(crate) fn squad_target_approach_score(
     let stats = &unit.stats;
     let turns = distances.turns(stats, position, target, stats.max_range);
     approach_bonus(turns.turns, manhattan(position, target), stats.max_movement)
+}
+
+/// campaignの非占領unitにとってのSquad目標は、全員が重なる駐留マスではなく、
+/// 部隊が集合して戦う参照点である。自分の射程で参照点に働ける距離までは同点とし、
+/// 中心1マスだけへ吸着させない。そこから先の位置取りは地形・脅威・攻撃の評価に委ねる。
+pub(crate) fn reference_point_approach_score(
+    unit: &UnitState,
+    position: GridPosition,
+    target: GridPosition,
+    distances: &mut ApproachDistances,
+) -> i32 {
+    let stats = &unit.stats;
+    let turns = distances.turns(stats, position, target, stats.max_range);
+    let outside_reach = (manhattan(position, target) - reference_reach(stats) as i32).max(0);
+    approach_bonus(turns.turns, outside_reach, stats.max_movement)
+}
+
+/// 参照点に対して働ける距離。直接攻撃unitも隣接マスから参照点を支えられる。
+pub(crate) fn reference_reach(stats: &UnitStats) -> u32 {
+    stats.max_range.max(1)
 }
 
 /// 単独行動の健全な非占領unitが敵へ近づく価値。
@@ -453,7 +513,16 @@ pub(crate) fn repair_site_at(
                     .registry
                     .can_repair_on_terrain(unit.stats.unit_type, *terrain)
         })
-        .map(|(_, terrain, _)| board.registry.is_production_facility(terrain.as_str()))
+        // 実際に生産できる首都圏の施設だけを、生産枠の封鎖として評価する。
+        .map(|(_, terrain, _)| {
+            board.registry.is_production_facility(terrain.as_str())
+                && crate::systems::production::is_within_production_range(
+                    &board.own_capitals(),
+                    position.x,
+                    position.y,
+                    board.map.topology,
+                )
+        })
 }
 
 /// 待機の回復・占有に関する加減点。回復の必要があれば回復拠点で待ち、

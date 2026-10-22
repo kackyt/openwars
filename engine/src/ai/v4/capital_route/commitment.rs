@@ -14,7 +14,7 @@ use crate::ai::v4::capital_route::node_operation::{
     capital_route_dag_frontier_properties, capital_route_node_exit_satisfied,
     refresh_capital_route_node_operations,
 };
-use crate::ai::v4::capital_route::topology::capital_route_topology_for;
+use crate::ai::v4::capital_route::topology::{capital_route_topology_for, progress_order};
 use crate::ai::v4::{
     BTreeMap, Entity, Faction, GridPosition, HashMap, HashSet, Health, Map, MasterDataRegistry,
     MissionType, MovementType, PlayerId, Property, SquadId, Transporting, UnitStats, UnitType,
@@ -206,47 +206,47 @@ pub(in crate::ai::v4) fn inherited_capital_route_commitment(
 /// 区間目標に対してAdvance/Stage済みのSquadは、担当Nodeが未完了である限り前進を継続する。
 /// これにより前線の小さな戦力変動で全軍が往復することを防ぐ。
 pub(in crate::ai::v4) fn capital_route_active_node_for_squad(
-    operation_path_nodes: &[CapitalRouteNodeId],
-    roadmap_active_node: CapitalRouteNodeId,
+    operation_path: &[GridPosition],
+    roadmap_active_anchor: GridPosition,
     previous: Option<&CapitalRouteCommitment>,
     operations: &CapitalRouteNodeOperationRegistry,
     topology_key: CapitalRouteTopologyKey,
-) -> CapitalRouteNodeId {
+) -> GridPosition {
     let Some(previous) = previous.filter(|commitment| {
         matches!(
             commitment.phase,
             CapitalRouteExecutionPhase::Advance | CapitalRouteExecutionPhase::Stage
         )
     }) else {
-        return roadmap_active_node;
+        return roadmap_active_anchor;
     };
-    let Some(roadmap_index) = operation_path_nodes
+    let Some(roadmap_index) = operation_path
         .iter()
-        .position(|node| *node == roadmap_active_node)
+        .position(|anchor| *anchor == roadmap_active_anchor)
     else {
-        return roadmap_active_node;
+        return roadmap_active_anchor;
     };
-    let Some(previous_index) = operation_path_nodes
+    let Some(previous_index) = operation_path
         .iter()
-        .position(|node| *node == previous.target_node)
+        .position(|anchor| *anchor == previous.target_anchor)
     else {
-        return roadmap_active_node;
+        return roadmap_active_anchor;
     };
     if previous_index <= roadmap_index {
-        return roadmap_active_node;
+        return roadmap_active_anchor;
     }
     let operation_id = CapitalRouteNodeOperationId {
         topology: topology_key,
-        node: previous.target_node,
+        anchor: previous.target_anchor,
     };
     if operations
         .operations
         .get(&operation_id)
         .is_some_and(|operation| !capital_route_node_exit_satisfied(operation))
     {
-        previous.target_node
+        previous.target_anchor
     } else {
-        roadmap_active_node
+        roadmap_active_anchor
     }
 }
 
@@ -256,24 +256,24 @@ pub(in crate::ai::v4) fn capital_route_active_node_for_squad(
 /// 意味しない。Capture役だけを残すと歩兵が各個撃破されるため、現在Nodeより後方にある
 /// 最も近い未完了AreaへControl分隊を一個だけ残し、`Secured`になるまで占領を援護する。
 pub(in crate::ai::v4) fn capital_route_dominant_capture_escort_node(
-    operation_path_nodes: &[CapitalRouteNodeId],
-    active_node: CapitalRouteNodeId,
+    operation_path: &[GridPosition],
+    active_anchor: GridPosition,
     operations: &CapitalRouteNodeOperationRegistry,
     topology_key: CapitalRouteTopologyKey,
-) -> Option<CapitalRouteNodeId> {
-    let active_index = operation_path_nodes
+) -> Option<GridPosition> {
+    let active_index = operation_path
         .iter()
-        .position(|node| *node == active_node)?;
-    operation_path_nodes[..active_index]
+        .position(|anchor| *anchor == active_anchor)?;
+    operation_path[..active_index]
         .iter()
         .rev()
         .copied()
-        .find(|node| {
+        .find(|anchor| {
             operations
                 .operations
                 .get(&CapitalRouteNodeOperationId {
                     topology: topology_key,
-                    node: *node,
+                    anchor: *anchor,
                 })
                 .is_some_and(|operation| {
                     operation.objective == CapitalRouteNodeObjective::Capture
@@ -313,11 +313,7 @@ pub(in crate::ai::v4) fn capital_route_dag_nodes_for_target(
     target: GridPosition,
 ) -> Option<Vec<CapitalRouteNodeId>> {
     let topology = capital_route_topology_for(world, player_id, island_id)?;
-    let target_node = topology
-        .nodes
-        .iter()
-        .position(|node| node.anchor == target)
-        .map(CapitalRouteNodeId)?;
+    let target_node = topology.node_at(target)?;
     let mut reaches_target = vec![false; topology.nodes.len()];
     reaches_target[target_node.0] = true;
     for index in (0..topology.nodes.len()).rev() {
@@ -472,12 +468,13 @@ struct CommitmentDraft {
     control_squads_by_operation: HashMap<CapitalRouteNodeOperationId, HashSet<SquadId>>,
 }
 
-/// 全セルの移動経路と、作戦が存在するMilestoneの列を区別する。
+/// 全セルの移動経路と、作戦が存在する中継点の列を区別する。
 struct SquadRoutePath {
-    path_nodes: Vec<CapitalRouteNodeId>,
     path: Vec<GridPosition>,
-    target_node: CapitalRouteNodeId,
-    operation_path_nodes: Vec<CapitalRouteNodeId>,
+    /// 経路の終点（区間目標の作戦の代表座標）。
+    target_anchor: GridPosition,
+    /// `path` のうち中継点作戦が存在する座標だけを、経路順に並べた列。
+    operation_path: Vec<GridPosition>,
 }
 
 /// 任務と現在Nodeを照合した前衛役割・前進先。
@@ -597,7 +594,12 @@ fn route_quotas(
         .unwrap_or_else(|| vec![Vec::new(); topology.routes.len()]);
     let targets = frontiers
         .iter()
-        .map(|properties| properties.first().copied())
+        .map(|properties| {
+            properties
+                .first()
+                .copied()
+                .map(|property| route_target_node_anchor(world, player_id, island_id, property))
+        })
         .collect::<Vec<_>>();
     let mut demands = same_land_route_force_demands(world, player_id, island_id);
     for (route, target) in targets.iter().enumerate() {
@@ -621,10 +623,54 @@ fn route_quotas(
     (targets, demands, quotas)
 }
 
+/// 区間目標の拠点を、それを占領対象に含むNode作戦のanchorへ置き換える。
+///
+/// Node作戦は近接する拠点を一つのAreaにまとめて登録するため、拠点自体のセルには
+/// 作戦がないことがある。拠点セルをそのまま目標にすると経路の終点に作戦がなく、
+/// その枝のSquadが全員「経路なし」になってDAGから外れる。
+pub(in crate::ai::v4) fn route_target_node_anchor(
+    world: &World,
+    player_id: PlayerId,
+    island_id: crate::ai::islands::IslandId,
+    property: GridPosition,
+) -> GridPosition {
+    let Some(operations) = world.get_resource::<CapitalRouteNodeOperationRegistry>() else {
+        return property;
+    };
+    let topology_key = CapitalRouteTopologyKey {
+        player_id,
+        island_id,
+    };
+    let mut candidates = operations
+        .operations
+        .values()
+        .filter(|operation| operation.id.topology == topology_key)
+        .collect::<Vec<_>>();
+    // 拠点セル自身に作戦があればそれを使い、なければ占領対象に含む作戦のうち
+    // 自首都側（Node番号が小さい）のものを選ぶ。
+    if candidates
+        .iter()
+        .any(|operation| operation.anchor == property)
+    {
+        return property;
+    }
+    if let Some(topology) = capital_route_topology_for(world, player_id, island_id) {
+        candidates.sort_unstable_by_key(|operation| {
+            progress_order(&topology.from_home, operation.anchor)
+        });
+    }
+    candidates
+        .into_iter()
+        .find(|operation| operation.capture_targets.contains(&property))
+        .map_or(property, |operation| operation.anchor)
+}
+
 /// 同じ区間目標へ向かう前回の枝を先に保持し、Squad単位で既配分を数える。
 fn retain_previous_routes(
     player_id: PlayerId,
     island_id: crate::ai::islands::IslandId,
+    topology: &CapitalRouteTopology,
+    map: &Map,
     squads: &[RouteSquad],
     allocation: &mut RouteAllocation,
     assigned_counts: &mut [usize],
@@ -637,6 +683,7 @@ fn retain_previous_routes(
     } = allocation;
     // 前手番のSquad orderをまず保持する。Squadのmember数が変化しても、同じ
     // Nodeを実行する限り分岐を変えないため、回復・補充で戦略目標が揺れない。
+    // ただし作戦がSquadの目標を別の枝へ移した場合は、作戦の枝を優先する。
     for squad in squads {
         let Some(commitment) = inherited_commitments.get(&squad.id) else {
             continue;
@@ -645,6 +692,8 @@ fn retain_previous_routes(
         if commitment.player_id != player_id
             || commitment.island_id != island_id
             || targets.get(route).copied().flatten() != Some(commitment.target)
+            || squad_target_route(topology, map, &squad.mission, squad.target, targets)
+                .is_some_and(|target_route| target_route != route)
         {
             continue;
         }
@@ -653,9 +702,52 @@ fn retain_previous_routes(
     }
 }
 
+/// 作戦がSquadに与えた目標が属するDAGの枝を返す。
+///
+/// 作戦は進軍路の前線・拠点・敵を目標にSquadを作る。DAGがその目標と無関係に枝を
+/// 決めると、南の前線を守るSquadが北のNodeへ回され、南のCapture Nodeには制圧役が
+/// いないまま占領役の出発許可が止まる。目標が前線そのものならその枝、枝の拠点なら
+/// その枝、それ以外は最寄りの前線の枝とする。占領役は従来どおり枝の拠点だけで決める。
+pub(in crate::ai::v4) fn squad_target_route(
+    topology: &CapitalRouteTopology,
+    map: &Map,
+    mission: &MissionType,
+    target: Option<GridPosition>,
+    targets: &[Option<GridPosition>],
+) -> Option<usize> {
+    let target = target?;
+    let route = topology
+        .routes
+        .iter()
+        .position(|route| route.front == target)
+        .or_else(|| topology.property_routes.get(&target).map(|route| route.0))
+        .or_else(|| {
+            (*mission != MissionType::Capture)
+                .then(|| {
+                    topology
+                        .routes
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(index, route)| {
+                            (
+                                map.distance(target.x, target.y, route.front.x, route.front.y),
+                                *index,
+                            )
+                        })
+                        .map(|(index, _)| index)
+                })
+                .flatten()
+        })?;
+    targets
+        .get(route)
+        .is_some_and(|target| target.is_some())
+        .then_some(route)
+}
+
 /// 未配分Squadを占領目標または不足枠の順で枝へ置く。同点時の枝番号を保つ。
 fn assign_remaining_routes(
     topology: &CapitalRouteTopology,
+    map: &Map,
     squads: &[RouteSquad],
     demands: &[RouteForceDemand],
     allocation: &mut RouteAllocation,
@@ -673,14 +765,8 @@ fn assign_remaining_routes(
         if assigned_routes.contains_key(&squad.id) {
             continue;
         }
-        let preferred_target_route = if squad.mission == MissionType::Capture {
-            squad
-                .target
-                .and_then(|target| topology.property_routes.get(&target).map(|r| r.0))
-                .filter(|route| targets.get(*route).is_some_and(|t| t.is_some()))
-        } else {
-            None
-        };
+        let preferred_target_route =
+            squad_target_route(topology, map, &squad.mission, squad.target, targets);
         let route = preferred_target_route.or_else(|| {
             (0..topology.routes.len())
                 .filter(|route| targets[*route].is_some())
@@ -772,15 +858,21 @@ fn assign_island_routes(
         preferred_capture_escort_by_route: Vec::new(),
     };
     let mut assigned_counts = vec![0_usize; topology.routes.len()];
+    let Some(map) = world.get_resource::<Map>() else {
+        return;
+    };
     retain_previous_routes(
         player_id,
         island_id,
+        topology,
+        map,
         &squads,
         &mut allocation,
         &mut assigned_counts,
     );
     assign_remaining_routes(
         topology,
+        map,
         &squads,
         &demands,
         &mut allocation,
@@ -840,16 +932,15 @@ fn squad_route_path(
         .iter()
         .map(|node| topology.nodes[node.0].anchor)
         .collect::<Vec<_>>();
-    let target_node = *path_nodes.last().expect("DAGの目標Nodeへの経路は空でない");
-    // path_nodesは移動用の全セル列であり、Operationが存在するのは走査で選んだ
-    // Milestoneだけである。未選択セルを未達Nodeと見なして一歩ずつ止めない。
-    let operation_path_nodes = world
+    let target_anchor = *path.last().expect("区間目標への経路は空でない");
+    // pathは移動用の全セル列であり、作戦が存在するのは走査で選んだ中継点だけである。
+    // 未選択セルを未達の中継点と見なして一歩ずつ止めない。
+    let operation_path = world
         .get_resource::<CapitalRouteNodeOperationRegistry>()
         .map(|registry| {
-            path_nodes
-                .iter()
+            path.iter()
                 .copied()
-                .filter(|node| {
+                .filter(|anchor| {
                     registry
                         .operations
                         .contains_key(&CapitalRouteNodeOperationId {
@@ -857,21 +948,20 @@ fn squad_route_path(
                                 player_id,
                                 island_id,
                             },
-                            node: *node,
+                            anchor: *anchor,
                         })
                 })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    if operation_path_nodes.is_empty() {
+    if operation_path.is_empty() {
         return None;
     }
 
     Some(SquadRoutePath {
-        path_nodes,
         path,
-        target_node,
-        operation_path_nodes,
+        target_anchor,
+        operation_path,
     })
 }
 
@@ -884,11 +974,11 @@ fn active_squad_node(
     path: &SquadRoutePath,
     allocation: &RouteAllocation,
     retained_capture_escorts: &mut HashSet<CapitalRouteNodeOperationId>,
-) -> CapitalRouteNodeId {
+) -> GridPosition {
     let world = context.world;
     let player_id = context.player_id;
-    let operation_path_nodes = &path.operation_path_nodes;
-    let target_node = path.target_node;
+    let operation_path = &path.operation_path;
+    let target_anchor = path.target_anchor;
     let inherited_commitments = &allocation.inherited_commitments;
     let preferred_capture_escort_by_route = &allocation.preferred_capture_escort_by_route;
     // Nodeの状態名ではなく出口条件を見る。Capture Nodeは`Dominant`でも未完了で、
@@ -897,31 +987,31 @@ fn active_squad_node(
         player_id,
         island_id,
     };
-    let mut active_node = world
+    let mut active_anchor = world
         .get_resource::<CapitalRouteNodeOperationRegistry>()
         .map(|registry| {
-            let roadmap_active_node = operation_path_nodes
+            let roadmap_active_anchor = operation_path
                 .iter()
                 .copied()
-                .find(|node| {
+                .find(|anchor| {
                     registry
                         .operations
                         .get(&CapitalRouteNodeOperationId {
                             topology: topology_key,
-                            node: *node,
+                            anchor: *anchor,
                         })
                         .is_none_or(|operation| !capital_route_node_exit_satisfied(operation))
                 })
-                .unwrap_or(target_node);
+                .unwrap_or(target_anchor);
             capital_route_active_node_for_squad(
-                operation_path_nodes,
-                roadmap_active_node,
+                operation_path,
+                roadmap_active_anchor,
                 inherited_commitments.get(&squad.id),
                 registry,
                 topology_key,
             )
         })
-        .unwrap_or(target_node);
+        .unwrap_or(target_anchor);
     if squad.capture_member_count == 0
         && squad.mission == MissionType::Attack
         && preferred_capture_escort_by_route
@@ -929,12 +1019,12 @@ fn active_squad_node(
             .copied()
             .flatten()
             == Some(squad.id)
-        && let Some(escort_node) = world
+        && let Some(escort_anchor) = world
             .get_resource::<CapitalRouteNodeOperationRegistry>()
             .and_then(|registry| {
                 capital_route_dominant_capture_escort_node(
-                    operation_path_nodes,
-                    active_node,
+                    operation_path,
+                    active_anchor,
                     registry,
                     topology_key,
                 )
@@ -942,21 +1032,21 @@ fn active_squad_node(
     {
         let escort_operation_id = CapitalRouteNodeOperationId {
             topology: topology_key,
-            node: escort_node,
+            anchor: escort_anchor,
         };
         if retained_capture_escorts.insert(escort_operation_id) {
-            active_node = escort_node;
+            active_anchor = escort_anchor;
         }
     }
 
-    active_node
+    active_anchor
 }
 
 /// 盤面投影済みNodeを読む。作戦未登録時は経路未準備として返す。
 fn assigned_node_operation(
     world: &World,
     topology_key: CapitalRouteTopologyKey,
-    active_node: CapitalRouteNodeId,
+    active_anchor: GridPosition,
 ) -> Option<CapitalRouteNodeOperation> {
     let player_id = topology_key.player_id;
     let island_id = topology_key.island_id;
@@ -970,7 +1060,7 @@ fn assigned_node_operation(
                         player_id,
                         island_id,
                     },
-                    node: active_node,
+                    anchor: active_anchor,
                 })
                 .cloned()
         })
@@ -1213,7 +1303,7 @@ fn assign_route_squad(
             state.path_unavailable_counts[route].saturating_add(1);
         return;
     };
-    let active_node = active_squad_node(
+    let active_anchor = active_squad_node(
         context,
         island_id,
         route,
@@ -1226,7 +1316,7 @@ fn assign_route_squad(
         player_id,
         island_id,
     };
-    let Some(node_operation) = assigned_node_operation(world, topology_key, active_node) else {
+    let Some(node_operation) = assigned_node_operation(world, topology_key, active_anchor) else {
         state.path_unavailable_counts[route] =
             state.path_unavailable_counts[route].saturating_add(1);
         return;
@@ -1259,9 +1349,7 @@ fn assign_route_squad(
         uses_capture_lane,
         draft,
     );
-    let SquadRoutePath {
-        path_nodes, path, ..
-    } = route_path;
+    let SquadRoutePath { path, .. } = route_path;
     let committed_counts = &mut state.committed_counts;
     let commitments = &mut draft.commitments;
     committed_counts[route] = committed_counts[route].saturating_add(squad.ground_member_count);
@@ -1272,7 +1360,7 @@ fn assign_route_squad(
             island_id,
             route: CapitalRouteId(route),
             target,
-            target_node: active_node,
+            target_anchor: active_anchor,
             objective: node_operation.objective,
             scope: node_operation.scope,
             control_area: node_operation.control_area,
@@ -1281,7 +1369,6 @@ fn assign_route_squad(
             crossed: node_operation.crossed,
             execution_target,
             frontline_capacity,
-            path_nodes,
             path,
             phase,
         },
@@ -1591,7 +1678,9 @@ pub fn capital_route_diagnostics_for_player(
                     "phase": commitment.map(|commitment| format!("{:?}", commitment.phase)),
                     "target_x": commitment.map(|commitment| commitment.target.x),
                     "target_y": commitment.map(|commitment| commitment.target.y),
-                    "target_node": commitment.map(|commitment| commitment.target_node.0),
+                    "target_anchor": commitment.map(|commitment| {
+                        serde_json::json!({ "x": commitment.target_anchor.x, "y": commitment.target_anchor.y })
+                    }),
                     "node_objective": commitment.map(|commitment| format!("{:?}", commitment.objective)),
                     "node_scope": commitment.map(|commitment| format!("{:?}", commitment.scope)),
                     "capture_targets": commitment.map(|commitment| commitment.capture_targets.iter().map(|target| {
@@ -1605,7 +1694,6 @@ pub fn capital_route_diagnostics_for_player(
                     "execution_target_y": commitment.map(|commitment| commitment.execution_target.y),
                     "frontline_capacity": commitment.map(|commitment| commitment.frontline_capacity),
                     "path_len": commitment.map(|commitment| commitment.path.len()),
-                    "path_nodes": commitment.map(|commitment| commitment.path_nodes.iter().map(|node| node.0).collect::<Vec<_>>()),
                     // 停滞時に「割当はあるが、次にどの山迂回セルを踏むべきか」を
                     // ログだけで再現できるよう、実行対象のセル列も残す。
                     "path": commitment.map(|commitment| commitment.path.iter().map(|cell| {
@@ -1629,9 +1717,14 @@ pub fn capital_route_diagnostics_for_player(
                 .get(&key)
                 .cloned()
                 .unwrap_or_default();
-            let mut node_states = node_operations
+            let mut operations_in_order = node_operations
                 .values()
                 .filter(|operation| operation.id.topology == key)
+                .collect::<Vec<_>>();
+            operations_in_order
+                .sort_by_key(|operation| progress_order(&topology.from_home, operation.anchor));
+            let node_states = operations_in_order
+                .into_iter()
                 .map(|operation| {
                     let mut squad_ids = operation
                         .assigned_squads
@@ -1640,7 +1733,6 @@ pub fn capital_route_diagnostics_for_player(
                         .collect::<Vec<_>>();
                     squad_ids.sort_unstable();
                     serde_json::json!({
-                        "node": operation.id.node.0,
                         "x": operation.anchor.x,
                         "y": operation.anchor.y,
                         "state": format!("{:?}", operation.state),
@@ -1656,13 +1748,16 @@ pub fn capital_route_diagnostics_for_player(
                             serde_json::json!({ "x": position.x, "y": position.y })
                         }),
                         "crossed": operation.crossed,
-                        "predecessors": operation.predecessors.iter().map(|predecessor| predecessor.node.0).collect::<Vec<_>>(),
-                        "successors": operation.successors.iter().map(|successor| successor.node.0).collect::<Vec<_>>(),
+                        "predecessors": operation.predecessors.iter().map(|predecessor| {
+                            serde_json::json!({ "x": predecessor.anchor.x, "y": predecessor.anchor.y })
+                        }).collect::<Vec<_>>(),
+                        "successors": operation.successors.iter().map(|successor| {
+                            serde_json::json!({ "x": successor.anchor.x, "y": successor.anchor.y })
+                        }).collect::<Vec<_>>(),
                         "assigned_squad_ids": squad_ids,
                     })
                 })
                 .collect::<Vec<_>>();
-            node_states.sort_by_key(|node| node["node"].as_u64().unwrap_or_default());
             Some(serde_json::json!({
                 "island_id": key.island_id.0,
                 "start": {
