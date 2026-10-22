@@ -5,11 +5,13 @@
 //! 海上を漂っていた。ここでは次の順で1手を決める。
 //!
 //! 1. 移動せずに撃てる敵が居れば、期待損害価値が最大の敵を撃つ。
-//! 2. 撃てなければ、次の手番に撃てる位置（射撃位置）へ移る。敵の反撃圏は避け、
-//!    射撃位置が届かなければ海路で最も近い射撃位置へ寄せる。
-//! 3. 弾薬切れ・燃料不足・大破のときは自軍の港へ戻って補給と修理を受ける。
+//! 2. 撃てなければ、次の手番に撃てる位置（射撃位置）へ移る。射撃位置へ届くなら、
+//!    射撃位置の中で被弾の少ないセルを選ぶ。届かなければ海路で最も近い射撃位置へ寄せる。
+//!    撃つには射程へ入るしかないので、被弾の見積もりで接近そのものは止めない。
+//! 3. 主兵装の弾切れ・燃料不足・大破のときは自軍の港へ戻って補給と修理を受ける。
 
 use super::theater::{NAVAL_GUN_MAX_RANGE, cells_within_ring, is_navigable, sea_distances};
+use super::threat::ThreatMap;
 use crate::ai::command::AiCommand;
 use crate::ai::context::board::{BoardUnit, PlayerBoard};
 use crate::collections::{HashMap, HashSet};
@@ -21,12 +23,6 @@ use bevy_ecs::prelude::*;
 
 /// 撃破した場合に、与えた損害へ上乗せする割合（%）。残存戦力の反撃を断つ価値。
 const KILL_BONUS_PERCENT: u32 = 30;
-/// 位置取りで、次の手番に受ける期待損害をどれだけ重く見るか（%）。
-const THREAT_WEIGHT_PERCENT: i64 = 70;
-/// 射撃位置へ1手遠いごとの減点（資金換算）。
-const APPROACH_STEP_PENALTY: i64 = 1500;
-/// 自軍の生産用の港を塞ぐ位置の減点（資金換算）。
-const PORT_BLOCK_PENALTY: i64 = 4000;
 /// 港へ戻って修理を受けるHP（100満点）。
 const REPAIR_HP_THRESHOLD: u32 = 30;
 /// 港までの海路に加えて残しておく燃料。
@@ -55,7 +51,8 @@ pub(crate) fn decide_naval_action(
     for (transporting, stats) in loaded.iter(world) {
         *cargo_costs.entry(transporting.0).or_default() += stats.cost;
     }
-    let naval = NavalBoard::new(&board, &chart, player_id, cargo_costs);
+    let occupancy = board.occupancy();
+    let naval = NavalBoard::new(&board, &chart, &occupancy, player_id, cargo_costs);
 
     let mut best_fire: Option<(u32, Entity, AiCommand)> = None;
     for unit in board
@@ -119,7 +116,8 @@ struct NavalBoard<'a> {
     chart: &'a DamageChart,
     player_id: PlayerId,
     enemies: Vec<&'a BoardUnit>,
-    occupancy: HashMap<(usize, usize), crate::systems::movement::OccupantInfo>,
+    occupancy: &'a HashMap<(usize, usize), crate::systems::movement::OccupantInfo>,
+    threat: ThreatMap<'a>,
     own_ports: HashSet<(usize, usize)>,
     /// 輸送部隊ごとの積荷の生産費の合計。
     cargo_costs: HashMap<Entity, u32>,
@@ -129,6 +127,7 @@ impl<'a> NavalBoard<'a> {
     fn new(
         board: &'a PlayerBoard,
         chart: &'a DamageChart,
+        occupancy: &'a HashMap<(usize, usize), crate::systems::movement::OccupantInfo>,
         player_id: PlayerId,
         cargo_costs: HashMap<Entity, u32>,
     ) -> Self {
@@ -150,7 +149,8 @@ impl<'a> NavalBoard<'a> {
             chart,
             player_id,
             enemies,
-            occupancy: board.occupancy(),
+            occupancy,
+            threat: ThreatMap::new(board, chart, occupancy, player_id),
             own_ports,
             cargo_costs,
         }
@@ -249,38 +249,11 @@ impl<'a> NavalBoard<'a> {
             .unwrap_or(0)
     }
 
-    /// 位置 `position` に止まった場合に、敵の次の手番で受ける期待損害（HP、100満点）。
-    ///
-    /// 直接攻撃は敵の移動力+1以内、間接射撃は移動しないで届く射程内だけを数える。
-    /// 地形による陸上部隊の移動制約は無視した上限見積もりである。
-    fn threat_hp_at(&self, unit: &BoardUnit, position: GridPosition) -> u32 {
-        let total: u32 = self
-            .enemies
-            .iter()
-            .map(|enemy| {
-                let distance = self.distance(position, enemy.position);
-                // 移動してから隣接して撃つ直接攻撃。
-                let direct = if distance <= enemy.stats.max_movement + 1 {
-                    self.expected_damage(enemy, unit, position, 1)
-                } else {
-                    0
-                };
-                // 移動せずに撃つ間接射撃。
-                let indirect = if distance >= 2 {
-                    self.expected_damage(enemy, unit, position, distance)
-                } else {
-                    0
-                };
-                direct.max(indirect)
-            })
-            .sum();
-        total.min(unit.health.unwrap_or(100))
-    }
-
     /// 補給・修理のため港へ戻るべきか。
     fn needs_resupply(&self, unit: &BoardUnit, port_distance: Option<u32>) -> bool {
-        let (ammo1, ammo2) = unit.ammo.unwrap_or((1, 1));
-        let out_of_ammo = ammo1 == 0 && ammo2 == 0;
+        // 主兵装（ammo1: 対艦ミサイル）が地上部隊・艦船を撃てる唯一の兵装である。
+        // 副兵装（艦対空ミサイル）が残っていても、主兵装が尽きれば砲撃の役目を果たせない。
+        let out_of_ammo = unit.ammo.is_some_and(|(ammo1, _)| ammo1 == 0);
         let low_fuel = match (unit.fuel, port_distance) {
             (Some(fuel), Some(distance)) => fuel <= distance.saturating_add(FUEL_MARGIN),
             _ => false,
@@ -293,7 +266,7 @@ impl<'a> NavalBoard<'a> {
     fn reposition(&self, unit: &BoardUnit) -> Option<AiCommand> {
         let reachable = calculate_reachable_tile_costs(
             &self.board.map,
-            &self.occupancy,
+            self.occupancy,
             (unit.position.x, unit.position.y),
             unit.stats.movement_type,
             unit.stats.max_movement,
@@ -381,7 +354,16 @@ impl<'a> NavalBoard<'a> {
         cells
     }
 
-    /// 到達可能セルのうち、射撃価値・被弾見積もり・目標までの海路距離で最良のセルへ動く。
+    /// 到達可能セルから移動先を選ぶ。
+    ///
+    /// - 射撃位置へ向かう場合、次の手番に撃てて撃沈されないセルがあれば、その中で
+    ///   「生き残るHPの割合で割り引いた射撃価値 − 受ける損害の資金換算」が最大のセル。
+    ///   敵の手番の損害は次の手番の射撃より先に起きるため、射撃価値を割り引く。
+    /// - 撃てるセルが無ければ（港へ戻る場合も）、目標までの海路距離が最小のセル。
+    ///   撃沈されるセルは避け、同じ距離なら被弾の少ないセルを選ぶ。
+    ///
+    /// 被弾は同じ前進量の中での選び分けにだけ使い、射程へ近づくこと自体は止めない。
+    /// 自軍の港は艦船の生産を塞ぐので、他に候補がある限り止まらない。
     fn move_toward(
         &self,
         reachable: &std::collections::BTreeMap<(usize, usize), u32>,
@@ -390,56 +372,84 @@ impl<'a> NavalBoard<'a> {
         returning_to_port: bool,
     ) -> Option<AiCommand> {
         let current = (unit.position.x, unit.position.y);
-        let mut best: Option<(i64, (usize, usize))> = None;
-        for &cell in reachable.keys() {
-            if cell != current && self.occupancy.contains_key(&cell) {
-                continue;
-            }
-            let position = GridPosition {
-                x: cell.0,
-                y: cell.1,
-            };
-            let Some(&distance) = goal_distance.get(&cell) else {
-                continue;
-            };
-            // 敵の手番で受ける損害は、次の手番の射撃より先に起きる。射撃価値は
-            // 生き残ったHPの割合で割り引き、相打ちを狙って先に撃たれる位置を避ける。
-            let hp = i64::from(unit.health.unwrap_or(100).max(1));
-            let threat_hp = i64::from(self.threat_hp_at(unit, position));
-            let fire = if returning_to_port {
-                0
-            } else {
-                i64::from(self.fire_value_from(unit, position)) * (hp - threat_hp) / hp
-            };
-            let threat = i64::from(unit.stats.cost) * threat_hp / 100;
-            let mut score = fire
-                - threat * THREAT_WEIGHT_PERCENT / 100
-                - i64::from(distance) * APPROACH_STEP_PENALTY;
-            if !returning_to_port && self.own_ports.contains(&cell) {
-                score -= PORT_BLOCK_PENALTY;
-            }
-            // 同点なら動かない（燃料を節約し、射撃位置を保つ）。次に座標順で決める。
-            let better = match best {
-                None => true,
-                Some((best_score, best_cell)) => {
-                    score > best_score
-                        || (score == best_score
-                            && best_cell != current
-                            && (cell == current || cell < best_cell))
-                }
-            };
-            if better {
-                best = Some((score, cell));
-            }
-        }
-        let (_, cell) = best?;
+        let hp = unit.health.unwrap_or(100).max(1);
+        let candidates: Vec<NavalStop> = reachable
+            .keys()
+            .copied()
+            .filter(|cell| *cell == current || !self.occupancy.contains_key(cell))
+            .filter_map(|cell| {
+                let distance = *goal_distance.get(&cell)?;
+                let position = GridPosition {
+                    x: cell.0,
+                    y: cell.1,
+                };
+                let threat_hp = self.threat.damage_hp(unit, cell);
+                let fire = if returning_to_port {
+                    0
+                } else {
+                    self.fire_value_from(unit, position)
+                };
+                Some(NavalStop {
+                    cell,
+                    distance,
+                    threat_hp,
+                    fire,
+                    lethal: threat_hp >= hp,
+                    blocks_port: !returning_to_port && self.own_ports.contains(&cell),
+                    stays: cell == current,
+                })
+            })
+            .collect();
+        let firing = candidates
+            .iter()
+            .filter(|stop| stop.fire > 0 && !stop.lethal)
+            .max_by_key(|stop| {
+                let survived = i64::from(hp - stop.threat_hp);
+                let fire = i64::from(stop.fire) * survived / i64::from(hp);
+                let loss = i64::from(unit.stats.cost) * i64::from(stop.threat_hp) / 100;
+                (
+                    !stop.blocks_port,
+                    fire - loss,
+                    stop.stays,
+                    std::cmp::Reverse(stop.cell),
+                )
+            });
+        let stop = firing.or_else(|| {
+            candidates.iter().min_by_key(|stop| {
+                (
+                    stop.blocks_port,
+                    stop.lethal,
+                    stop.distance,
+                    stop.threat_hp,
+                    !stop.stays,
+                    stop.cell,
+                )
+            })
+        })?;
         Some(AiCommand::Wait {
             target_pos: GridPosition {
-                x: cell.0,
-                y: cell.1,
+                x: stop.cell.0,
+                y: stop.cell.1,
             },
         })
     }
+}
+
+/// 戦艦の移動先の候補。
+struct NavalStop {
+    cell: (usize, usize),
+    /// 目標（射撃位置・港）までの海路距離。
+    distance: u32,
+    /// 次の敵手番に受ける期待損害（HP）。
+    threat_hp: u32,
+    /// 次の手番に移動せずに撃てる最大の損害価値。
+    fire: u32,
+    /// 次の敵手番に撃沈されるか。
+    lethal: bool,
+    /// 自軍の港（艦船の生産）を塞ぐか。
+    blocks_port: bool,
+    /// 現在地に留まるか。
+    stays: bool,
 }
 
 #[cfg(test)]
@@ -510,8 +520,59 @@ mod tests {
     }
 
     #[test]
-    fn battleship_stays_out_of_enemy_battleship_range() {
-        // 敵戦艦が東に居る。射程(2..6)の外から相手が入ってくるのを待つ。
+    fn battleship_without_main_gun_ammo_returns_to_port() {
+        // 主兵装（対艦ミサイル）が尽き、艦対空ミサイルだけが残る。射程内の戦車は撃てないので
+        // 港へ戻って補給を受ける。
+        let mut world = naval_world(&["P~~~~~~~~."]);
+        property(&mut world, 1, 0, 0);
+        let battleship = spawn(&mut world, 1, UnitType::Battleship, 4, 0);
+        world
+            .get_mut::<crate::components::Ammo>(battleship)
+            .unwrap()
+            .ammo1 = 0;
+        spawn(&mut world, 2, UnitType::Tank, 9, 0);
+
+        let (entity, command) =
+            decide_naval_action(&mut world, PlayerId(1), &HashSet::default()).unwrap();
+        assert_eq!(entity, battleship);
+        let AiCommand::Wait { target_pos } = command else {
+            panic!("港へ戻るはず: {command:?}");
+        };
+        assert_eq!(target_pos, GridPosition { x: 0, y: 0 });
+    }
+
+    #[test]
+    fn battleship_approaches_coast_guarded_by_land_units() {
+        // 東の島に敵の戦車が並ぶ。戦車は海へ入れないので、沖合の射撃位置は脅かされない。
+        let mut world = naval_world(&[
+            "~~~~~~~~~~~~~~....",
+            "~~~~~~~~~~~~~~....",
+            "~~~~~~~~~~~~~~....",
+        ]);
+        let battleship = spawn(&mut world, 1, UnitType::Battleship, 4, 1);
+        for (x, y) in [(15, 0), (15, 1), (15, 2), (16, 1), (17, 1)] {
+            spawn(&mut world, 2, UnitType::Tank, x, y);
+        }
+
+        let (entity, command) =
+            decide_naval_action(&mut world, PlayerId(1), &HashSet::default()).unwrap();
+        assert_eq!(entity, battleship);
+        let AiCommand::Wait { target_pos } = command else {
+            panic!("射撃位置へ移動するはず: {command:?}");
+        };
+        let distance =
+            world
+                .resource::<crate::resources::Map>()
+                .distance(target_pos.x, target_pos.y, 15, 1);
+        assert!(
+            distance <= NAVAL_GUN_MAX_RANGE,
+            "次手番に戦車を撃てる位置へ入る: {target_pos:?} distance={distance}"
+        );
+    }
+
+    #[test]
+    fn battleship_closes_in_on_out_of_range_enemy_battleship() {
+        // 敵戦艦は今手番に届く射撃位置より遠い。被弾を恐れて留まらず、海路で最も近づく。
         let mut world = naval_world(&["~~~~~~~~~~~~~~~~", "~~~~~~~~~~~~~~~~", "~~~~~~~~~~~~~~~~"]);
         let own = spawn(&mut world, 1, UnitType::Battleship, 0, 1);
         spawn(&mut world, 2, UnitType::Battleship, 15, 1);
@@ -526,10 +587,7 @@ mod tests {
             world
                 .resource::<crate::resources::Map>()
                 .distance(target_pos.x, target_pos.y, 15, 1);
-        assert!(
-            distance > NAVAL_GUN_MAX_RANGE,
-            "敵戦艦の射程外に止まる: {distance}"
-        );
+        assert_eq!(distance, 10, "最大限に近づく: {target_pos:?}");
     }
 
     #[test]

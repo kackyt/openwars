@@ -6,6 +6,7 @@
 //! - [`naval_combat`] — 戦艦の射撃・射撃位置取り・補給帰還（移動後に撃てない間接射撃）。
 //! - [`sealift`] — 輸送船・輸送ヘリで、仕事の無い陸塊に取り残された地上部隊を
 //!   未所有の拠点や敵の残る陸塊へ運ぶ。
+//! - [`threat`] — 次の敵手番に受ける期待損害（敵が実際に隣接できるかで直接攻撃を数える）。
 //! - [`production`] — 運べない地上部隊の買い足しを止め、余った資金で輸送部隊・戦艦・
 //!   航空機を補う。
 //!
@@ -17,6 +18,7 @@ pub(crate) mod naval_combat;
 pub(crate) mod production;
 pub(crate) mod sealift;
 pub(crate) mod theater;
+pub(crate) mod threat;
 
 #[cfg(test)]
 pub(crate) mod test_support;

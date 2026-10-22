@@ -13,9 +13,15 @@
 //! 輸送部隊は積載すると同じ手番に移動できず、積んだ部隊はその手番に降ろせない。
 //! 輸送船は港か浅瀬からしか降ろせない。輸送ヘリは燃料が尽きると墜落するため、
 //! 燃料が足りなくなる前に自軍の空港へ戻す。
+//!
+//! 輸送部隊の移動先は、資金換算の点数を足し引きせず、次の優先順で選ぶ。
+//! 自軍の生産施設を塞がない → 次の敵手番に撃沈されない → 目的地へ着くまでの手番数が
+//! 少ない → 被弾が少ない → 目的地に近い。被弾は同じ前進量の中での選び分けにだけ使い、
+//! 撃沈されない限り揚陸地点への接近を止めない。
 
 use super::landmass::{Landmasses, is_ground};
 use super::theater::sea_distances;
+use super::threat::ThreatMap;
 use crate::ai::command::AiCommand;
 use crate::ai::context::board::{BoardUnit, PlayerBoard};
 use crate::collections::{HashMap, HashSet};
@@ -23,12 +29,12 @@ use crate::components::{
     ActionCompleted, Faction, GridPosition, HasMoved, PlayerId, Transporting, UnitStats,
 };
 use crate::resources::{DamageChart, MovementType, Terrain, UnitType};
-use crate::systems::combat::get_expected_damage;
 use crate::systems::movement::{
     OccupantInfo, calculate_reachable_tile_costs, get_valid_movement_cost,
 };
 use bevy_ecs::prelude::*;
 use std::cell::RefCell;
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -38,18 +44,10 @@ const CAPTURE_SLOT_VALUE: i64 = 3000;
 const COMBAT_SLOT_VALUE: i64 = 2500;
 /// 敵首都のある陸塊へ占領役を届ける上乗せ。
 const ENEMY_CAPITAL_BONUS: i64 = 2000;
-/// 護衛の無い占領役の降車セルの近くに居る、敵地上部隊1体ごとの減点。
-const UNESCORTED_ENEMY_PENALTY: i64 = 900;
 /// 護衛の無い占領役を降ろすとき、敵の地上部隊を数える降車セルからの距離。
 const DROP_DANGER_RADIUS: u32 = 2;
 /// 揚陸地点を、積荷の目標からこの距離以内に絞る。
 const LANDING_TARGET_RADIUS: u32 = 3;
-/// 目標までの残り距離1マスあたりの減点（輸送部隊の位置取り）。
-const STEP_PENALTY: i64 = 400;
-/// 位置取りで、次の敵手番に受ける期待損害をどれだけ重く見るか（%）。
-const THREAT_WEIGHT_PERCENT: i64 = 80;
-/// 自軍の生産施設に止まる減点（生産を塞ぐ）。
-const PRODUCTION_SITE_PENALTY: i64 = 3000;
 /// 燃料の残りがこの手番数分の消費を下回る前に補給へ戻る。
 const FUEL_RESERVE_TURNS: u32 = 2;
 
@@ -197,6 +195,16 @@ fn has_active_transport(world: &mut World, player_id: PlayerId, skip: &HashSet<E
 type Cell = (usize, usize);
 /// unitの到達可能セルと最小移動コスト。
 type ReachableCells = Rc<BTreeMap<Cell, u32>>;
+/// 揚陸地点の優先順のキー（大きいほど良い）: 輸送部隊が撃沈されない、揚陸の価値、
+/// 降車セルの近くの敵の少なさ、積荷の目標への近さ、輸送部隊の被弾の少なさ、座標。
+type DropKey = (
+    bool,
+    i64,
+    Reverse<u32>,
+    Reverse<i64>,
+    Reverse<u32>,
+    Reverse<(Cell, Cell)>,
+);
 
 /// 輸送中の部隊。
 #[derive(Debug, Clone)]
@@ -324,11 +332,12 @@ impl SealiftContext {
     }
 
     fn decide(&self) -> Option<(Entity, AiCommand)> {
+        let threat = ThreatMap::new(&self.board, &self.chart, &self.occupancy, self.player_id);
         let transports = self.transports();
         let overseas_demand = self.has_overseas_demand();
         // 1. 降車（移動済みで降車を続ける輸送部隊を含む）。
         for transport in &transports {
-            if let Some(command) = self.drop_now(transport) {
+            if let Some(command) = self.drop_now(transport, &threat) {
                 return Some((transport.entity, command));
             }
         }
@@ -338,7 +347,7 @@ impl SealiftContext {
                 continue;
             }
             // 燃料・弾薬の補給が先（輸送ヘリは燃料切れで墜落する）。
-            if let Some(command) = self.resupply(transport) {
+            if let Some(command) = self.resupply(transport, &threat) {
                 return Some((transport.entity, command));
             }
             let loaded = self.cargo.get(&transport.entity).map_or(0, Vec::len);
@@ -354,10 +363,11 @@ impl SealiftContext {
                 ));
             }
             if loaded > 0 {
-                if let Some(command) = self.sail_to_destination(transport) {
+                if let Some(command) = self.sail_to_destination(transport, &threat) {
                     return Some((transport.entity, command));
                 }
-            } else if overseas_demand && let Some(command) = self.go_to_pickup(transport, &stranded)
+            } else if overseas_demand
+                && let Some(command) = self.go_to_pickup(transport, &stranded, &threat)
             {
                 return Some((transport.entity, command));
             }
@@ -529,8 +539,10 @@ impl SealiftContext {
     /// 積荷を降ろせるなら降車命令を返す。
     ///
     /// 移動前なら今手番に届く揚陸地点のうち最良の地点へ、移動済み（降車を続ける）なら
-    /// 現在地から降ろす。
-    fn drop_now(&self, transport: &BoardUnit) -> Option<AiCommand> {
+    /// 現在地から降ろす。揚陸地点は次の優先順で選ぶ: 輸送部隊が次の敵手番に撃沈されない
+    /// → 揚陸の価値が高い → 護衛の無い占領役の降車セルの近くに敵が少ない → 積荷の目標に
+    /// 近い → 輸送部隊の被弾が少ない。
+    fn drop_now(&self, transport: &BoardUnit, threat: &ThreatMap) -> Option<AiCommand> {
         if !self.active.contains(&transport.entity) {
             return None;
         }
@@ -554,13 +566,14 @@ impl SealiftContext {
         } else {
             vec![current]
         };
-        // (score, 輸送部隊の停止セル, 降車セル, 降ろす積荷)
-        let mut best: Option<(i64, Cell, Cell, Entity)> = None;
+        let hp = transport.health.unwrap_or(100).max(1);
+        // (優先順のキー, 降ろす積荷)
+        let mut best: Option<(DropKey, Entity)> = None;
         for stop in stops {
             if !self.can_unload_at(transport, stop) {
                 continue;
             }
-            let threat = self.threat_value(transport, stop);
+            let threat_hp = threat.damage_hp(transport, stop);
             for item in &cargo {
                 for (cell, landmass) in self.drop_cells(transport, item, stop) {
                     // 揚陸先の陸塊に仕事が無ければ降ろさない（出発地へ戻すだけになる）。
@@ -571,25 +584,25 @@ impl SealiftContext {
                     let approach = self.drop_cell_approach(item, landmass, cell);
                     // 護衛の無い占領役は、降車セルの近くの敵に先に倒される。
                     let danger = if item.stats.can_capture {
-                        i64::from(self.enemies_near(cell, DROP_DANGER_RADIUS))
-                            * UNESCORTED_ENEMY_PENALTY
+                        self.enemies_near(cell, DROP_DANGER_RADIUS)
                     } else {
                         0
                     };
-                    let score = value - approach * STEP_PENALTY - threat - danger;
-                    if best
-                        .as_ref()
-                        .is_none_or(|(best_score, best_stop, best_cell, _)| {
-                            score > *best_score
-                                || (score == *best_score && (stop, cell) < (*best_stop, *best_cell))
-                        })
-                    {
-                        best = Some((score, stop, cell, item.entity));
+                    let key = (
+                        threat_hp < hp,
+                        value,
+                        Reverse(danger),
+                        Reverse(approach),
+                        Reverse(threat_hp),
+                        Reverse((stop, cell)),
+                    );
+                    if best.as_ref().is_none_or(|(best_key, _)| key > *best_key) {
+                        best = Some((key, item.entity));
                     }
                 }
             }
         }
-        let (_, stop, cell, cargo_entity) = best?;
+        let ((.., Reverse((stop, cell))), cargo_entity) = best?;
         Some(AiCommand::Drop {
             transport_target_pos: GridPosition {
                 x: stop.0,
@@ -695,73 +708,8 @@ impl SealiftContext {
             .count() as u32
     }
 
-    /// 次の敵手番に、輸送部隊（積荷を含む）がセル `cell` で受ける期待損害の資金換算。
-    fn threat_value(&self, transport: &BoardUnit, cell: (usize, usize)) -> i64 {
-        let position = GridPosition {
-            x: cell.0,
-            y: cell.1,
-        };
-        let hp = transport.health.unwrap_or(100);
-        let damage: u32 = self
-            .board
-            .units
-            .iter()
-            .filter(|enemy| enemy.owner != self.player_id && enemy.is_deployed())
-            .map(|enemy| {
-                let distance =
-                    self.board
-                        .map
-                        .distance(cell.0, cell.1, enemy.position.x, enemy.position.y);
-                let attack = |range: u32| {
-                    get_expected_damage(
-                        &enemy.stats,
-                        enemy.health.unwrap_or(100),
-                        enemy
-                            .ammo
-                            .unwrap_or((enemy.stats.max_ammo1, enemy.stats.max_ammo2)),
-                        &transport.stats,
-                        self.terrain_defense(position),
-                        range,
-                        &self.board.registry,
-                        &self.chart,
-                        false,
-                    )
-                };
-                let direct = if distance <= enemy.stats.max_movement + 1 {
-                    attack(1)
-                } else {
-                    0
-                };
-                let indirect = if distance >= 2 { attack(distance) } else { 0 };
-                direct.max(indirect)
-            })
-            .sum();
-        let cargo_cost: u32 = self
-            .cargo
-            .get(&transport.entity)
-            .map(|cargo| cargo.iter().map(|item| item.stats.cost).sum())
-            .unwrap_or(0);
-        let at_risk = i64::from(transport.stats.cost + cargo_cost);
-        let damage = i64::from(damage.min(hp));
-        // 撃沈されると積荷も失うので、損害が耐久を超える場合は積荷込みで数える。
-        let value = if damage >= i64::from(hp) {
-            at_risk
-        } else {
-            i64::from(transport.stats.cost) * damage / 100
-        };
-        value * THREAT_WEIGHT_PERCENT / 100
-    }
-
-    fn terrain_defense(&self, position: GridPosition) -> u32 {
-        self.board
-            .map
-            .get_terrain(position.x, position.y)
-            .map(|terrain| self.board.registry.get_terrain_defense_bonus(terrain))
-            .unwrap_or(0)
-    }
-
     /// 燃料が足りなくなった輸送部隊を補給施設へ戻す。
-    fn resupply(&self, transport: &BoardUnit) -> Option<AiCommand> {
+    fn resupply(&self, transport: &BoardUnit, threat: &ThreatMap) -> Option<AiCommand> {
         let fuel = transport.fuel?;
         let sites: HashSet<(usize, usize)> = match transport.stats.movement_type {
             MovementType::Air => self.own_airports.iter().copied().collect(),
@@ -792,45 +740,51 @@ impl SealiftContext {
                 target_pos: transport.position,
             });
         }
-        // 補給施設そのもの（空港・港）が目的地なので、生産施設の減点を打ち消す。
-        self.step_toward(transport, &field, PRODUCTION_SITE_PENALTY)
+        // 補給施設そのもの（空港・港）が目的地なので、生産施設への到着を許す。
+        self.step_toward(transport, &field, true, threat)
     }
 
-    /// 到達可能セルのうち、距離場の値と被弾見積もりで最良のセルへ動く。
+    /// 到達可能セルのうち、距離場の目的地へ向けて最良のセルへ動く。
+    ///
+    /// 次の優先順で選ぶ: 自軍の生産施設を塞がない（`site_is_goal` なら到着は許す）→
+    /// 次の敵手番に撃沈されない → 目的地へ着くまでの手番数が少ない → 被弾が少ない →
+    /// 目的地に近い → 現在地に留まる。同じ手番数で着けるセルの中では安全なセルで待ち、
+    /// 次の手番に移動と降車を一度に行う。
     fn step_toward(
         &self,
         transport: &BoardUnit,
         field: &dyn Fn((usize, usize)) -> Option<u32>,
-        arrival_bonus: i64,
+        site_is_goal: bool,
+        threat: &ThreatMap,
     ) -> Option<AiCommand> {
         let current = (transport.position.x, transport.position.y);
-        let mut best: Option<(i64, (usize, usize))> = None;
-        for cell in self.reachable(transport).keys().copied() {
-            if !self.is_free_for(transport, cell) {
-                continue;
-            }
-            let Some(distance) = field(cell) else {
-                continue;
-            };
-            let mut score =
-                -i64::from(distance) * STEP_PENALTY - self.threat_value(transport, cell);
-            if distance == 0 {
-                score += arrival_bonus;
-            }
-            if self.production_sites.contains(&cell) {
-                score -= PRODUCTION_SITE_PENALTY;
-            }
-            let better = best.is_none_or(|(best_score, best_cell)| {
-                score > best_score
-                    || (score == best_score
-                        && best_cell != current
-                        && (cell == current || cell < best_cell))
-            });
-            if better {
-                best = Some((score, cell));
-            }
-        }
-        let (_, cell) = best?;
+        let hp = transport.health.unwrap_or(100).max(1);
+        let movement = transport.stats.max_movement.max(1);
+        let cell = self
+            .reachable(transport)
+            .keys()
+            .copied()
+            .filter(|cell| self.is_free_for(transport, *cell))
+            .filter_map(|cell| {
+                let distance = field(cell)?;
+                let blocks_production =
+                    self.production_sites.contains(&cell) && !(site_is_goal && distance == 0);
+                let threat_hp = threat.damage_hp(transport, cell);
+                Some((
+                    (
+                        blocks_production,
+                        threat_hp >= hp,
+                        distance.div_ceil(movement),
+                        threat_hp,
+                        distance,
+                        cell != current,
+                        cell,
+                    ),
+                    cell,
+                ))
+            })
+            .min_by_key(|(key, _)| *key)
+            .map(|(_, cell)| cell)?;
         Some(AiCommand::Wait {
             target_pos: GridPosition {
                 x: cell.0,
@@ -840,7 +794,7 @@ impl SealiftContext {
     }
 
     /// 積荷を載せた輸送部隊を、最も価値の高い陸塊の揚陸地点へ進める。
-    fn sail_to_destination(&self, transport: &BoardUnit) -> Option<AiCommand> {
+    fn sail_to_destination(&self, transport: &BoardUnit, threat: &ThreatMap) -> Option<AiCommand> {
         let cargo = self.cargo.get(&transport.entity)?;
         let current = (transport.position.x, transport.position.y);
         let mut best: Option<(i64, HashSet<(usize, usize)>)> = None;
@@ -869,7 +823,7 @@ impl SealiftContext {
         }
         let (_, cells) = best?;
         let field = self.distance_field(transport, &cells);
-        self.step_toward(transport, &*field, 0)
+        self.step_toward(transport, &*field, false, threat)
     }
 
     /// このセルで、取り残された部隊が今手番にこの輸送部隊へ乗れるか。
@@ -967,7 +921,12 @@ impl SealiftContext {
     }
 
     /// 空の輸送部隊を、取り残された部隊を最も早く拾える乗船セルへ向かわせる。
-    fn go_to_pickup(&self, transport: &BoardUnit, stranded: &[&BoardUnit]) -> Option<AiCommand> {
+    fn go_to_pickup(
+        &self,
+        transport: &BoardUnit,
+        stranded: &[&BoardUnit],
+        threat: &ThreatMap,
+    ) -> Option<AiCommand> {
         let cells = self.pickup_cells(transport, stranded);
         if cells.is_empty() {
             return None;
@@ -990,7 +949,7 @@ impl SealiftContext {
         }
         let (_, _, target) = best?;
         let field = self.distance_field(transport, &HashSet::from_iter([target]));
-        self.step_toward(transport, &*field, PRODUCTION_SITE_PENALTY)
+        self.step_toward(transport, &*field, true, threat)
     }
 
     /// 行動を終えた輸送部隊へ、今手番に届く取り残された部隊を乗せる。
@@ -1061,32 +1020,26 @@ impl SealiftContext {
             return self.leave_production_site(unit);
         }
         let current = (unit.position.x, unit.position.y);
-        let mut best: Option<(i64, (usize, usize))> = None;
-        for cell in self.reachable(unit).keys().copied() {
-            if !self.is_free_for(unit, cell) {
-                continue;
-            }
-            let distance = boarding
-                .iter()
-                .map(|target| map.distance(cell.0, cell.1, target.0, target.1))
-                .min()
-                .unwrap_or(0);
-            // 乗船セルの隣で待つ。乗船セル（港）そのものや生産施設は塞がない。
-            let mut score = -i64::from(distance.max(1)) * STEP_PENALTY;
-            if self.production_sites.contains(&cell) {
-                score -= PRODUCTION_SITE_PENALTY;
-            }
-            let better = best.is_none_or(|(best_score, best_cell)| {
-                score > best_score
-                    || (score == best_score
-                        && best_cell != current
-                        && (cell == current || cell < best_cell))
-            });
-            if better {
-                best = Some((score, cell));
-            }
-        }
-        let (_, cell) = best?;
+        // 乗船セルの隣で待つ。乗船セル（港）そのものや生産施設は塞がない。
+        // 優先順: 生産施設を塞がない → 乗船セルに近い → 現在地に留まる。
+        let cell = self
+            .reachable(unit)
+            .keys()
+            .copied()
+            .filter(|cell| self.is_free_for(unit, *cell))
+            .min_by_key(|cell| {
+                let distance = boarding
+                    .iter()
+                    .map(|target| map.distance(cell.0, cell.1, target.0, target.1))
+                    .min()
+                    .unwrap_or(0);
+                (
+                    self.production_sites.contains(cell),
+                    distance.max(1),
+                    *cell != current,
+                    *cell,
+                )
+            })?;
         (cell != current || self.production_sites.contains(&current)).then_some(AiCommand::Wait {
             target_pos: GridPosition {
                 x: cell.0,
@@ -1179,6 +1132,25 @@ mod tests {
             }
             other => panic!("揚陸するはず: {other:?}"),
         }
+    }
+
+    #[test]
+    fn loaded_lander_closes_in_on_guarded_landing_site() {
+        // 右の島に中立都市と敵の戦車。揚陸地点（浅瀬x=12）は今手番に届かない。
+        // 戦車は海へ入れないので、沖合で揚陸地点の1手前まで進む（留まらない）。
+        let mut world = naval_world(&["H.~~~~~~~~~~,C.."]);
+        property(&mut world, 1, 0, 0);
+        property(&mut world, 0, 13, 0);
+        let lander = spawn(&mut world, 1, UnitType::Lander, 3, 0);
+        load(&mut world, lander, UnitType::Infantry, 1);
+        spawn(&mut world, 2, UnitType::Tank, 15, 0);
+
+        let (entity, command) = decide(&mut world).unwrap();
+        assert_eq!(entity, lander);
+        let AiCommand::Wait { target_pos } = command else {
+            panic!("揚陸地点へ進むはず: {command:?}");
+        };
+        assert_eq!(target_pos, GridPosition { x: 8, y: 0 });
     }
 
     #[test]
