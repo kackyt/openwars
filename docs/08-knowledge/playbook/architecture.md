@@ -1,12 +1,12 @@
 ---
 title: "PLAYBOOK - Architecture"
 category: "architecture"
-version: "1.1.0"
+version: "1.2.0"
 status: "approved"
 created: "2026-08-15"
-updated: "2026-10-17"
+updated: "2026-10-22"
 owner: "@t_kak"
-ace_entry_count: 23
+ace_entry_count: 24
 tags: [ace, playbook, architecture]
 references:
   - docs/08-knowledge/PLAYBOOK.md
@@ -223,7 +223,7 @@ references:
 | Category   | architecture |
 | Origin     | PR #71 |
 | Date       | 2026-07-25 |
-| Helpful    | 0 |
+| Helpful    | 1 |
 | Harmful    | 0 |
 | Status     | active |
 
@@ -462,3 +462,22 @@ references:
 **Action**: 盤面認識（ユニット占有、脅威範囲、進入可否など）は、レイヤー（戦略・作戦・戦術）ごとに個別計算・派生させず、手番開始時に一度だけ生成した統一スナップショット（`PlayerBoard`）に集約し、全フェーズへ immutable に参照渡しする設計を徹底する。
 
 
+
+<a id="ace-104-1"></a>
+
+### ACE-104-1: 敵生産口の占位（Blockade）と重要拠点占領の優先度昇格による補充サイクルの遮断
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | architecture |
+| Origin     | PR #104 |
+| Date       | 2026-10-22 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: 敵拠点が高密度に集積する首都周辺等の終盤戦において、有利な交戦（Attack）を最優先にするだけでは敵の毎ターンの即時生産・補充ペースに相殺され膠着する。次ターン生存可能な敵生産口への占位（Blockade）と、首都や割当物件の占領実行（CaptureExecution）を通常戦闘より上位の戦術優先度に昇格させ、かつ占領予約地との進入競合を解除することで、敵の補充サイクルを断ち確実に終局へ収束させられる。
+
+**Context**: PR #104 において、終盤 map_6 で敵首都 (4,16) 周辺の工場から毎ターン新造ユニットが湧き出し、自軍の攻撃回数（1手番約10回）と敵の補充ペースが拮抗して首都を落とせない問題が発生していた。また占領役が敵首都上に到達しても隣の敵への攻撃を優先していた。小規模マップ向けだった「敵生産口の占位」と「占領の実行」の優先度を標準マップ経路へ導入し、予約地解放ロジック（`vacate_reserved_capture_sites`）を緩和した結果、map_6 で 64局中64局全局撃破（53/64 → 64/64、撃破率100%）を達成した。
+
+**Action**: 終盤の拠点戦役において、敵生産圏内の敵工場等への占位（次ターン生存可能時）および目標拠点の占領実行を、通常の交戦（Attack）より上位の優先度（Priority）として評価パイプラインに組み込む。また、占領予約（Capture reservation）によって味方の戦闘ユニットが敵生産口へ進入・占位するのを不当にブロックしないよう、予約地解放の例外規則を設ける。
