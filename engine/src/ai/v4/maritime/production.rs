@@ -17,7 +17,7 @@ use crate::collections::HashSet;
 use crate::components::{GridPosition, PlayerId};
 use crate::events::ProduceUnitCommand;
 use crate::resources::master_data::MasterDataRegistry;
-use crate::resources::{MatchState, MovementType, Players, UnitRegistry, UnitType};
+use crate::resources::{MatchState, MovementType, Players, Terrain, UnitRegistry, UnitType};
 use crate::systems::production::can_produce_at;
 use bevy_ecs::prelude::*;
 
@@ -35,6 +35,14 @@ const MAX_AIR_COMBAT_UNITS: u32 = 6;
 const MAX_LANDERS: u32 = 6;
 /// 同時に保有する輸送部隊（輸送船・輸送ヘリ）の上限。
 const MAX_SEALIFT_TRANSPORTS: u32 = 6;
+
+/// 調整中の上限（TODO: 調整後に定数へ戻す）。
+fn tuned(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
 
 /// 島嶼間輸送の需給。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -126,7 +134,8 @@ pub(crate) fn rejects_ground_purchase(
     let landmasses = Landmasses::observe(&board, player_id);
     if lander {
         // 港は戦艦と輸送船で取り合う。輸送船が揃った後も買い足すと戦艦を出せない。
-        return SealiftStatus::observe(&board, &landmasses, player_id).landers >= MAX_LANDERS;
+        return SealiftStatus::observe(&board, &landmasses, player_id).landers
+            >= tuned("OPENWARS_MAX_LANDERS", MAX_LANDERS);
     }
     let site = GridPosition {
         x: command.target_x,
@@ -220,18 +229,43 @@ pub(crate) fn decide_supplementary_production(
     if let Some(aircraft) = air_wish(&board, &theater, player_id, spendable, &cost_of) {
         wishes.push(aircraft);
     }
+    // 揚陸作戦の上陸部隊（歩兵だけでは浜の守りを破れない）。輸送船の積載枠に空きがある間だけ。
+    let has_assault = world
+        .get_resource::<super::sealift::AssaultPlans>()
+        .is_some_and(|plans| plans.0.contains_key(&player_id));
+    let landing_tank = match tuned("OPENWARS_ASSAULT_TANKS", 0) {
+        1 => Some(UnitType::MdTank),
+        2 => Some(UnitType::Tank),
+        3 => Some(UnitType::TankZ),
+        _ => None,
+    };
+    if let Some(tank) = landing_tank
+        && has_assault
+        && status.stranded_others < status.heavy_slots
+    {
+        wishes.push(tank);
+    }
+    let factories: Vec<GridPosition> = board
+        .properties
+        .iter()
+        .filter(|property| {
+            property.owner == Some(player_id)
+                && matches!(property.terrain, Terrain::Factory | Terrain::Capital)
+        })
+        .map(|property| property.position)
+        .collect();
     let master = world.get_resource::<MasterDataRegistry>()?.clone();
     for unit_type in wishes {
         if cost_of(unit_type) > spendable {
             continue;
         }
-        let produced_at_airport = registry
+        let sites = match registry
             .get_stats(unit_type)
-            .is_some_and(|stats| stats.movement_type == MovementType::Air);
-        let sites = if produced_at_airport {
-            &theater.own_airports
-        } else {
-            &theater.own_ports
+            .map(|stats| stats.movement_type)
+        {
+            Some(MovementType::Air) => &theater.own_airports,
+            Some(MovementType::Ship) => &theater.own_ports,
+            _ => &factories,
         };
         let site = sites.iter().copied().find(|site| {
             !produced_sites.contains(&(site.x, site.y))
@@ -254,7 +288,9 @@ pub(crate) fn decide_supplementary_production(
 /// 占領役だけなら速く安い輸送ヘリ（空港）を、戦車など占領役以外が溜まっていれば
 /// 輸送船（港）を選ぶ。
 fn transport_wish(status: &SealiftStatus, theater: &MaritimeTheater) -> Option<UnitType> {
-    if !status.overseas_demand || status.transports() >= MAX_SEALIFT_TRANSPORTS {
+    if !status.overseas_demand
+        || status.transports() >= tuned("OPENWARS_MAX_SEALIFT", MAX_SEALIFT_TRANSPORTS)
+    {
         return None;
     }
     let stranded = status.stranded_capturers + status.stranded_others;

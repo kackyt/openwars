@@ -19,6 +19,10 @@
 //! 少ない → 被弾が少ない → 目的地に近い。被弾は同じ前進量の中での選び分けにだけ使い、
 //! 撃沈されない限り揚陸地点への接近を止めない。
 
+mod assault;
+
+pub(crate) use assault::{AssaultPlans, tuning as assault_tuning};
+
 use super::landmass::{Landmasses, is_ground};
 use super::theater::sea_distances;
 use super::threat::ThreatMap;
@@ -70,7 +74,21 @@ pub(crate) fn decide_sealift_action(
     if !has_active_transport(world, player_id, skip) {
         return None;
     }
-    let context = SealiftContext::observe(world, player_id, skip);
+    let mut context = SealiftContext::observe(world, player_id, skip);
+    // 敵の守る陸塊への揚陸は、輸送船をそろえてから一斉に行う（手番ごとに1回判断する）。
+    let previous = world
+        .get_resource::<AssaultPlans>()
+        .and_then(|plans| plans.0.get(&player_id).cloned());
+    context.assault = context.plan_assault(previous.as_ref(), turn);
+    let mut plans = world.get_resource_or_insert_with(AssaultPlans::default);
+    match &context.assault {
+        Some(plan) => {
+            plans.0.insert(player_id, plan.clone());
+        }
+        None => {
+            plans.0.remove(&player_id);
+        }
+    }
     let decision = context.decide();
     if decision.is_none() {
         world.insert_resource(SealiftIdle { player_id, turn });
@@ -232,6 +250,8 @@ struct SealiftContext {
     own_ports: Vec<(usize, usize)>,
     reachable_cache: RefCell<HashMap<Entity, ReachableCells>>,
     boarding_cache: RefCell<HashMap<u32, Rc<Vec<Cell>>>>,
+    /// この手番の揚陸作戦（敵の守る陸塊への一斉上陸）。
+    assault: Option<assault::AssaultPlan>,
 }
 
 impl SealiftContext {
@@ -300,6 +320,7 @@ impl SealiftContext {
             own_airports,
             own_ports,
             reachable_cache: RefCell::default(),
+            assault: None,
             boarding_cache: RefCell::default(),
         }
     }
@@ -576,6 +597,10 @@ impl SealiftContext {
             let threat_hp = threat.damage_hp(transport, stop);
             for item in &cargo {
                 for (cell, landmass) in self.drop_cells(transport, item, stop) {
+                    // 揚陸作戦の陸塊へは、出撃の手番に作戦の浜からだけ降ろす。
+                    if self.assault_holds(transport, stop, landmass) {
+                        continue;
+                    }
                     // 揚陸先の陸塊に仕事が無ければ降ろさない（出発地へ戻すだけになる）。
                     let Some(value) = self.landing_value(std::slice::from_ref(item), landmass)
                     else {
@@ -795,9 +820,20 @@ impl SealiftContext {
 
     /// 積荷を載せた輸送部隊を、最も価値の高い陸塊の揚陸地点へ進める。
     fn sail_to_destination(&self, transport: &BoardUnit, threat: &ThreatMap) -> Option<AiCommand> {
+        let (landmass, mut cells) = self.destination(transport)?;
+        // 揚陸作戦の陸塊へは、出撃までは集結海域で待ち、出撃したら作戦の浜へ向かう。
+        if let Some(assault_cells) = self.assault_destination(transport, landmass) {
+            cells = assault_cells;
+        }
+        let field = self.distance_field(transport, &cells);
+        self.step_toward(transport, &*field, false, threat)
+    }
+
+    /// 積荷を載せた輸送部隊が向かう陸塊と、その揚陸地点。
+    fn destination(&self, transport: &BoardUnit) -> Option<(u32, HashSet<Cell>)> {
         let cargo = self.cargo.get(&transport.entity)?;
         let current = (transport.position.x, transport.position.y);
-        let mut best: Option<(i64, HashSet<(usize, usize)>)> = None;
+        let mut best: Option<(i64, u32, HashSet<Cell>)> = None;
         let mut landmasses: Vec<_> = self.landmasses.info.keys().copied().collect();
         landmasses.sort_unstable();
         for landmass in landmasses {
@@ -816,14 +852,12 @@ impl SealiftContext {
             let score = value * 10 / (turns + 1);
             if best
                 .as_ref()
-                .is_none_or(|(best_score, _)| score > *best_score)
+                .is_none_or(|(best_score, ..)| score > *best_score)
             {
-                best = Some((score, cells));
+                best = Some((score, landmass, cells));
             }
         }
-        let (_, cells) = best?;
-        let field = self.distance_field(transport, &cells);
-        self.step_toward(transport, &*field, false, threat)
+        best.map(|(_, landmass, cells)| (landmass, cells))
     }
 
     /// このセルで、取り残された部隊が今手番にこの輸送部隊へ乗れるか。
@@ -1137,7 +1171,7 @@ mod tests {
     #[test]
     fn loaded_lander_closes_in_on_guarded_landing_site() {
         // 右の島に中立都市と敵の戦車。揚陸地点（浅瀬x=12）は今手番に届かない。
-        // 戦車は海へ入れないので、沖合で揚陸地点の1手前まで進む（留まらない）。
+        // 戦車は海へ入れないので、沖合の集結海域（次の手番に浜へ届くセル）まで進む。
         let mut world = naval_world(&["H.~~~~~~~~~~,C.."]);
         property(&mut world, 1, 0, 0);
         property(&mut world, 0, 13, 0);
@@ -1150,7 +1184,52 @@ mod tests {
         let AiCommand::Wait { target_pos } = command else {
             panic!("揚陸地点へ進むはず: {command:?}");
         };
-        assert_eq!(target_pos, GridPosition { x: 8, y: 0 });
+        assert!(
+            (7..=11).contains(&target_pos.x),
+            "次の手番に浜へ届く集結海域へ進む: {target_pos:?}"
+        );
+    }
+
+    #[test]
+    fn single_lander_waits_offshore_until_the_wave_can_beat_the_beach_guard() {
+        // 浜（浅瀬x=6）の隣に敵の戦車。歩兵2体の輸送船1隻では守りに届かないので降ろさない。
+        let mut world = naval_world(&["H.~~~~,C.."]);
+        property(&mut world, 1, 0, 0);
+        property(&mut world, 0, 7, 0);
+        let lander = spawn(&mut world, 1, UnitType::Lander, 3, 0);
+        load(&mut world, lander, UnitType::Infantry, 1);
+        load(&mut world, lander, UnitType::Infantry, 1);
+        spawn(&mut world, 2, UnitType::Tank, 8, 0);
+
+        let (entity, command) = decide(&mut world).unwrap();
+        assert_eq!(entity, lander);
+        assert!(
+            matches!(command, AiCommand::Wait { target_pos } if target_pos.x < 6),
+            "浜へ降ろさず沖で待つ: {command:?}"
+        );
+        let plans = world.resource::<AssaultPlans>();
+        assert!(!plans.0[&PlayerId(1)].launch);
+    }
+
+    #[test]
+    fn two_landers_launch_together_against_a_light_guard() {
+        // 浜（浅瀬x=6, y=0..1）の近くに敵の歩兵1体。輸送船2隻（歩兵4体）で一斉に降ろす。
+        let mut world = naval_world(&["H.~~~~,C..", "..~~~~,..."]);
+        property(&mut world, 1, 0, 0);
+        property(&mut world, 0, 7, 0);
+        for y in 0..2 {
+            let lander = spawn(&mut world, 1, UnitType::Lander, 3, y);
+            load(&mut world, lander, UnitType::Infantry, 1);
+            load(&mut world, lander, UnitType::Infantry, 1);
+        }
+        spawn(&mut world, 2, UnitType::Infantry, 9, 1);
+
+        let (_, command) = decide(&mut world).unwrap();
+        assert!(
+            matches!(command, AiCommand::Drop { transport_target_pos, .. } if transport_target_pos.x == 6),
+            "浜へ降ろす: {command:?}"
+        );
+        assert!(world.resource::<AssaultPlans>().0[&PlayerId(1)].launch);
     }
 
     #[test]

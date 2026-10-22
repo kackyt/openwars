@@ -52,7 +52,14 @@ pub(crate) fn decide_naval_action(
         *cargo_costs.entry(transporting.0).or_default() += stats.cost;
     }
     let occupancy = board.occupancy();
-    let naval = NavalBoard::new(&board, &chart, &occupancy, player_id, cargo_costs);
+    // 揚陸作戦の浜。浜の守りを優先して撃ち、上陸を助ける。
+    let beach = world
+        .get_resource::<super::sealift::AssaultPlans>()
+        .and_then(|plans| plans.0.get(&player_id))
+        .map(|plan| plan.stops.clone())
+        .unwrap_or_default();
+    let mut naval = NavalBoard::new(&board, &chart, &occupancy, player_id, cargo_costs);
+    naval.beach = beach;
 
     let mut best_fire: Option<(u32, Entity, AiCommand)> = None;
     for unit in board
@@ -121,6 +128,8 @@ struct NavalBoard<'a> {
     own_ports: HashSet<(usize, usize)>,
     /// 輸送部隊ごとの積荷の生産費の合計。
     cargo_costs: HashMap<Entity, u32>,
+    /// 揚陸作戦の浜の停泊セル。
+    beach: Vec<(usize, usize)>,
 }
 
 impl<'a> NavalBoard<'a> {
@@ -153,6 +162,7 @@ impl<'a> NavalBoard<'a> {
             threat: ThreatMap::new(board, chart, occupancy, player_id),
             own_ports,
             cargo_costs,
+            beach: Vec::new(),
         }
     }
 
@@ -202,6 +212,24 @@ impl<'a> NavalBoard<'a> {
         value
     }
 
+    /// 射撃の価値。揚陸作戦の浜を守る地上部隊は上乗せする。
+    fn target_value(&self, defender: &BoardUnit, damage: u32) -> u32 {
+        let value = self.damage_value(defender, damage);
+        let tuning = super::sealift::assault_tuning();
+        let guards_beach = super::landmass::is_ground(defender)
+            && self.beach.iter().any(|stop| {
+                self.board
+                    .map
+                    .distance(stop.0, stop.1, defender.position.x, defender.position.y)
+                    <= tuning.defense_radius
+            });
+        if guards_beach {
+            value.saturating_mul(100 + tuning.beach_fire_bonus_percent) / 100
+        } else {
+            value
+        }
+    }
+
     /// 輸送部隊に搭載中の部隊の価値（撃沈で同時に失われる）。
     fn cargo_value(&self, transport: &BoardUnit) -> u32 {
         self.cargo_costs
@@ -217,7 +245,7 @@ impl<'a> NavalBoard<'a> {
             .filter_map(|enemy| {
                 let distance = self.distance(unit.position, enemy.position);
                 let damage = self.expected_damage(unit, enemy, enemy.position, distance);
-                (damage > 0).then(|| (self.damage_value(enemy, damage), enemy))
+                (damage > 0).then(|| (self.target_value(enemy, damage), enemy))
             })
             .max_by_key(|(value, enemy)| {
                 (
@@ -243,7 +271,7 @@ impl<'a> NavalBoard<'a> {
             .filter_map(|enemy| {
                 let distance = self.distance(position, enemy.position);
                 let damage = self.expected_damage(unit, enemy, enemy.position, distance);
-                (damage > 0).then(|| self.damage_value(enemy, damage))
+                (damage > 0).then(|| self.target_value(enemy, damage))
             })
             .max()
             .unwrap_or(0)
