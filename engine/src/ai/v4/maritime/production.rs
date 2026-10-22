@@ -162,7 +162,8 @@ pub(crate) fn rejects_ground_purchase(
         true
     } else {
         status.stranded_others
-            >= (STRANDED_PER_TRANSPORT_SLOT * status.heavy_slots).max(MIN_STRANDED_BACKLOG / 2)
+            >= (status.heavy_slots * tuned("OPENWARS_HEAVY_BACKLOG_PERCENT", 100) / 100)
+                .max(MIN_STRANDED_BACKLOG / 2)
     }
 }
 
@@ -216,7 +217,7 @@ pub(crate) fn decide_supplementary_production(
     }
     // 戦艦が役立つ盤面で資金が大きく余っている場合は、余剰に応じて上限を引き上げる。
     // 使い道の無い資金は戦局に寄与しないため、射程へ捉えられる敵がいる限り艦隊へ回す。
-    let surplus_per_battleship = SURPLUS_PER_EXTRA_BATTLESHIP
+    let surplus_per_battleship = tuned("OPENWARS_BS_SURPLUS", SURPLUS_PER_EXTRA_BATTLESHIP)
         .saturating_mul(cost_of(UnitType::Battleship))
         .max(1);
     let battleship_cap = match theater.battleship_cap() {

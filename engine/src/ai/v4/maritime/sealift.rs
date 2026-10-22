@@ -910,24 +910,26 @@ impl SealiftContext {
                     continue;
                 };
                 let boardable = if transport.stats.movement_type == MovementType::Ship {
-                    // 港は陸塊の一部、浅瀬は陸塊に接していれば乗れる。
-                    match terrain {
-                        Terrain::Port => {
-                            self.landmasses.land.at(GridPosition {
-                                x: cell.0,
-                                y: cell.1,
-                            }) == Some(landmass)
+                    // 港は陸塊の一部、浅瀬は陸塊に接していれば乗れる。乗船地点が浜に近い
+                    // 港・浅瀬へ絞られていれば、そこだけで拾う。
+                    self.boarding_cells(landmass).contains(&cell)
+                        && match terrain {
+                            Terrain::Port => {
+                                self.landmasses.land.at(GridPosition {
+                                    x: cell.0,
+                                    y: cell.1,
+                                }) == Some(landmass)
+                            }
+                            Terrain::Shoal => {
+                                map.get_adjacent(cell.0, cell.1)
+                                    .into_iter()
+                                    .any(|(nx, ny)| {
+                                        self.landmasses.land.at(GridPosition { x: nx, y: ny })
+                                            == Some(landmass)
+                                    })
+                            }
+                            _ => false,
                         }
-                        Terrain::Shoal => {
-                            map.get_adjacent(cell.0, cell.1)
-                                .into_iter()
-                                .any(|(nx, ny)| {
-                                    self.landmasses.land.at(GridPosition { x: nx, y: ny })
-                                        == Some(landmass)
-                                })
-                        }
-                        _ => false,
-                    }
                 } else {
                     self.landmasses.land.at(GridPosition {
                         x: cell.0,
@@ -1105,7 +1107,7 @@ impl SealiftContext {
                 }
             }
         }
-        let cells = Rc::new(cells);
+        let cells = Rc::new(self.embark_cells(cells));
         self.boarding_cache
             .borrow_mut()
             .insert(landmass, Rc::clone(&cells));
