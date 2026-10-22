@@ -116,7 +116,10 @@ pub(crate) fn rejects_ground_purchase(
         return false;
     };
     let lander = stats.unit_type == UnitType::Lander;
-    if !lander && matches!(stats.movement_type, MovementType::Air | MovementType::Ship) {
+    // 地図が無ければ陸塊を判定できないので見送らない（盤面の無い生産計画の検証など）。
+    if (!lander && matches!(stats.movement_type, MovementType::Air | MovementType::Ship))
+        || !world.contains_resource::<crate::resources::Map>()
+    {
         return false;
     }
     let board = PlayerBoard::observe(world, player_id);
@@ -184,8 +187,9 @@ pub(crate) fn decide_supplementary_production(
         .get_resource::<MatchState>()
         .map_or(0, |state| state.current_turn_number.0);
     let board = PlayerBoard::observe(world, player_id);
-    // 作戦生産は未発行の将来購入（最長で十数手番先）の費用を全額取り置く。将来の購入は
-    // 将来の収入でも賄えるため、ここで守るのは次の1手番の収入で賄えない分だけにする。
+    // 作戦生産は未発行の将来購入（最長で十数手番先）の費用を全額取り置く。手番を追うごとに
+    // 収入が入るため、取り置きの全額を守ると資金が積み上がるだけになる。ここでは直近の購入に
+    // 備えて、取り置きのうち1手番の収入までだけを残す。
     let income = income_per_turn(&board, player_id);
     let reserved = world
         .get_resource::<crate::ai::v4::trace::ProductionTraceDiagnostics>()
@@ -203,9 +207,12 @@ pub(crate) fn decide_supplementary_production(
     }
     // 戦艦が役立つ盤面で資金が大きく余っている場合は、余剰に応じて上限を引き上げる。
     // 使い道の無い資金は戦局に寄与しないため、射程へ捉えられる敵がいる限り艦隊へ回す。
+    let surplus_per_battleship = SURPLUS_PER_EXTRA_BATTLESHIP
+        .saturating_mul(cost_of(UnitType::Battleship))
+        .max(1);
     let battleship_cap = match theater.battleship_cap() {
         0 => 0,
-        cap => cap + spendable / (SURPLUS_PER_EXTRA_BATTLESHIP * cost_of(UnitType::Battleship)),
+        cap => cap.saturating_add(spendable / surplus_per_battleship),
     };
     if theater.own_battleships < battleship_cap {
         wishes.push(UnitType::Battleship);
@@ -286,6 +293,7 @@ fn air_wish(
     let mut enemy_bomber_value = 0_u32;
     let mut enemy_surface_value = 0_u32;
     let mut own_air_combat = 0_u32;
+    let mut enemy_air_units = 0_u32;
     for unit in board.units.iter().filter(|unit| unit.is_deployed()) {
         let is_air = unit.stats.movement_type == MovementType::Air;
         if unit.owner == player_id {
@@ -295,6 +303,7 @@ fn air_wish(
             continue;
         }
         if is_air {
+            enemy_air_units += 1;
             enemy_air_value = enemy_air_value.saturating_add(unit.stats.cost);
             if matches!(
                 unit.stats.unit_type,
@@ -306,15 +315,6 @@ fn air_wish(
             enemy_surface_value = enemy_surface_value.saturating_add(unit.stats.cost);
         }
     }
-    let enemy_air_units = board
-        .units
-        .iter()
-        .filter(|unit| {
-            unit.owner != player_id
-                && unit.is_deployed()
-                && unit.stats.movement_type == MovementType::Air
-        })
-        .count() as u32;
     if own_air_combat >= MAX_AIR_COMBAT_UNITS + enemy_air_units {
         return None;
     }

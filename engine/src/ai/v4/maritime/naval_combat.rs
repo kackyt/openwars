@@ -348,13 +348,30 @@ impl<'a> NavalBoard<'a> {
             }
         }
         if cells.is_empty() {
-            // 撃てる敵部隊が見えない間は、敵拠点（次の敵部隊の出現点）を射程に置く。
-            for property in self
+            // 撃てる敵部隊が見えない間は、次の敵部隊が現れる敵の生産施設を射程に置く。
+            // 生産施設が無ければ（都市だけの敵領など）、敵拠点全体を対象にする。
+            let enemy_properties: Vec<_> = self
                 .board
                 .properties
                 .iter()
                 .filter(|property| property.owner.is_some_and(|owner| owner != self.player_id))
-            {
+                .collect();
+            let production_sites: Vec<_> = enemy_properties
+                .iter()
+                .copied()
+                .filter(|property| {
+                    matches!(
+                        property.terrain,
+                        Terrain::Capital | Terrain::Factory | Terrain::Airport | Terrain::Port
+                    )
+                })
+                .collect();
+            let anchors = if production_sites.is_empty() {
+                enemy_properties
+            } else {
+                production_sites
+            };
+            for property in anchors {
                 cells.extend(
                     cells_within_ring(&self.board.map, property.position, 2, NAVAL_GUN_MAX_RANGE)
                         .filter(|cell| is_navigable(self.board, cell.0, cell.1)),
@@ -428,7 +445,7 @@ impl<'a> NavalBoard<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::v4::maritime::test_support::{naval_world, spawn};
+    use crate::ai::v4::maritime::test_support::{naval_world, property, spawn};
 
     #[test]
     fn battleship_fires_without_moving_when_enemy_is_in_range() {
@@ -513,6 +530,23 @@ mod tests {
             distance > NAVAL_GUN_MAX_RANGE,
             "敵戦艦の射程外に止まる: {distance}"
         );
+    }
+
+    #[test]
+    fn battleship_without_visible_enemies_heads_for_enemy_production_site() {
+        // 敵部隊は見えない。西端に敵の都市、東端に敵の工場。戦艦は工場側へ寄せる。
+        let mut world = naval_world(&["C~~~~~~~~~~~~~~~~~~F"]);
+        property(&mut world, 2, 0, 0);
+        property(&mut world, 2, 19, 0);
+        let battleship = spawn(&mut world, 1, UnitType::Battleship, 9, 0);
+
+        let (entity, command) =
+            decide_naval_action(&mut world, PlayerId(1), &HashSet::default()).unwrap();
+        assert_eq!(entity, battleship);
+        let AiCommand::Wait { target_pos } = command else {
+            panic!("位置取りするはず: {command:?}");
+        };
+        assert!(target_pos.x > 9, "敵の工場側へ寄せる: {target_pos:?}");
     }
 
     #[test]
