@@ -365,6 +365,28 @@ impl SealiftContext {
             }
         }
         let stranded = self.stranded();
+        if std::env::var("OPENWARS_SEALIFT_DEBUG").is_ok() {
+            let list: Vec<String> = stranded
+                .iter()
+                .map(|unit| {
+                    format!(
+                        "{:?}@({},{}){}",
+                        unit.stats.unit_type,
+                        unit.position.x,
+                        unit.position.y,
+                        if self.fresh.contains(&unit.entity) {
+                            ""
+                        } else {
+                            "*"
+                        }
+                    )
+                })
+                .collect();
+            eprintln!(
+                "SEALIFT demand={overseas_demand} stranded={}",
+                list.join(" ")
+            );
+        }
         for transport in &transports {
             if !self.fresh.contains(&transport.entity) {
                 continue;

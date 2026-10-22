@@ -48,6 +48,8 @@ pub(crate) struct AssaultTuning {
     pub(crate) embark: bool,
     /// 乗船地点の、浜への海路距離の最小からの許容幅。
     pub(crate) embark_slack: u32,
+    /// 味方が上陸済みの浜（橋頭堡）を、他の浜の評価に関わらず続けて使うか。
+    pub(crate) keep_beachhead: bool,
     /// 撃てない戦艦を浜の支援位置へ集めるか。
     pub(crate) battleship_support: bool,
     /// 揚陸作戦の間、占領役より戦闘部隊を先に積むか。
@@ -75,6 +77,7 @@ impl AssaultTuning {
             beach_fire_bonus_percent: read("OPENWARS_ASSAULT_FIRE_BONUS", 100),
             embark: read("OPENWARS_ASSAULT_EMBARK", 0u32) != 0,
             embark_slack: read("OPENWARS_ASSAULT_EMBARK_SLACK", 2),
+            keep_beachhead: read("OPENWARS_ASSAULT_KEEP_BEACHHEAD", 0u32) != 0,
             battleship_support: read("OPENWARS_ASSAULT_BS_SUPPORT", 0u32) != 0,
             combat_first: read("OPENWARS_ASSAULT_COMBAT_FIRST", 0u32) != 0,
             heavy_backlog_percent: std::env::var("OPENWARS_ASSAULT_HEAVY_PERCENT")
@@ -160,7 +163,8 @@ impl SealiftContext {
         });
         let (beach, since_turn) = match (kept, previous) {
             (Some(kept), Some(previous))
-                if best.score() * 100 <= kept.score() * tuning.switch_percent =>
+                if (tuning.keep_beachhead && kept.friendly > 0)
+                    || best.score() * 100 <= kept.score() * tuning.switch_percent =>
             {
                 (kept, previous.since_turn)
             }
@@ -346,7 +350,8 @@ impl SealiftContext {
                     friendly,
                 }
             })
-            .filter(|beach| beach.objective > 0)
+            // 目標の無い浜は除く。ただし味方が上陸済みの浜（橋頭堡）は残す。
+            .filter(|beach| beach.objective > 0 || beach.friendly > 0)
             .collect();
         beaches.sort_by_key(|beach| beach.stops.clone());
         beaches
