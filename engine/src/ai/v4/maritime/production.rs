@@ -162,9 +162,26 @@ pub(crate) fn rejects_ground_purchase(
         Some(percent) if assault_active => percent,
         _ => tuned("OPENWARS_HEAVY_BACKLOG_PERCENT", 100),
     };
+    let stranded = status.stranded_capturers + status.stranded_others;
+    let total_cap = (STRANDED_PER_TRANSPORT_SLOT * status.capturer_slots).max(MIN_STRANDED_BACKLOG);
+    if tuned("OPENWARS_ASSAULT_SPLIT", 0) != 0 {
+        // 待機させる地上部隊は合計で輸送部隊の積載枠まで。揚陸作戦の間は、積載枠を
+        // 戦闘部隊と占領役へ決まった割合で分ける（歩兵だけで本拠島を埋めない）。
+        let heavy_cap = (status.heavy_slots * heavy_percent / 100).max(MIN_STRANDED_BACKLOG / 2);
+        if stranded >= total_cap {
+            return true;
+        }
+        return if stats.can_capture {
+            assault_active
+                && heavy_percent > 0
+                && !theater.own_ports.is_empty()
+                && status.stranded_capturers >= total_cap.saturating_sub(heavy_cap)
+        } else {
+            theater.own_ports.is_empty() || status.stranded_others >= heavy_cap
+        };
+    }
     if stats.can_capture {
-        status.stranded_capturers + status.stranded_others
-            >= (STRANDED_PER_TRANSPORT_SLOT * status.capturer_slots).max(MIN_STRANDED_BACKLOG)
+        stranded >= total_cap
     } else if theater.own_ports.is_empty() {
         // 輸送船を持てない盤面では、占領役以外の地上部隊は本拠島から出られない。
         true
