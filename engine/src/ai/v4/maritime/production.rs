@@ -398,12 +398,15 @@ mod tests {
     #[test]
     fn no_transport_without_demand_or_backlog() {
         let mut status = SealiftStatus {
-            stranded_capturers: 2,
+            stranded_capturers: 1,
             capturer_slots: 2,
             overseas_demand: true,
             ..SealiftStatus::default()
         };
         assert_eq!(transport_wish(&status, &theater(true, true)), None);
+        // 待機が積載枠に達したら（地上部隊の買い足しが止まる点）輸送部隊を足す。
+        status.stranded_capturers = 2;
+        assert!(transport_wish(&status, &theater(true, true)).is_some());
         status.stranded_capturers = 5;
         status.overseas_demand = false;
         assert_eq!(transport_wish(&status, &theater(true, true)), None);
