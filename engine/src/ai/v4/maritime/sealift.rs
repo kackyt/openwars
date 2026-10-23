@@ -20,6 +20,7 @@
 //! 撃沈されない限り揚陸地点への接近を止めない。
 
 mod assault;
+mod landing_site;
 
 pub(crate) use assault::{AssaultPlans, tuning as assault_tuning};
 

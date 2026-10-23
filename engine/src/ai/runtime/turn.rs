@@ -319,13 +319,21 @@ fn decide_normal_action(
     }
 }
 
-/// 橋頭堡DAGの島に居るunitだけを、DAGを読むSquad executorで動かす。
+/// 橋頭堡DAGの島に居る戦闘役だけを、DAGを読むSquad executorで動かす。
+///
+/// 戦闘役はDAGの前線Nodeを制圧しながら敵首都・敵生産口へ進む。占領役はDAGの順序で
+/// 拠点を待たせると確保が遅れるため、通常の行動選択で橋頭堡の近くの拠点を並行して占領する。
 fn decide_beachhead_route_action(
     world: &mut World,
     player_id: PlayerId,
     skip: &HashSet<Entity>,
 ) -> Option<(Entity, AiCommand)> {
-    let landed = crate::ai::v4::capital_route::beachhead_route_units(world, player_id);
+    let mut landed = crate::ai::v4::capital_route::beachhead_route_units(world, player_id);
+    landed.retain(|entity| {
+        world
+            .get::<crate::components::UnitStats>(*entity)
+            .is_some_and(|stats| !stats.can_capture)
+    });
     if landed.iter().all(|entity| skip.contains(entity)) {
         return None;
     }

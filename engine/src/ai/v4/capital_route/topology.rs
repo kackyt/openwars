@@ -607,15 +607,14 @@ pub(in crate::ai::v4) fn build_capital_route_topology(
 
 /// 自軍首都の無い敵首都島での、首都攻略DAGの起点（橋頭堡）と敵首都。
 ///
-/// 起点は揚陸作戦の浜（停泊セル）に接する島内のセルのうち、敵首都へ装甲移動で
-/// 最も近いセルとする。揚陸作戦がこの島を目標にしていなければNone。
+/// 起点は、揚陸作戦が戦況（上陸できるか・反撃の危険・進軍路で得られるもの）から選んだ
+/// 浜の降車セルのうち、敵首都へ装甲移動で最も近いセルとする。揚陸作戦がこの島を目標に
+/// していなければNone。
 pub(in crate::ai::v4) fn beachhead_capitals(
     world: &World,
     player_id: PlayerId,
     island_id: crate::ai::islands::IslandId,
 ) -> Option<(GridPosition, GridPosition)> {
-    let map = world.get_resource::<Map>()?;
-    let master_data = world.get_resource::<MasterDataRegistry>()?;
     let island_map = world.get_resource::<crate::ai::islands::IslandMap>()?;
     let on_island = |position: &GridPosition| {
         island_map
@@ -642,20 +641,13 @@ pub(in crate::ai::v4) fn beachhead_capitals(
     }
     enemy_capitals.sort_unstable_by_key(|position| (position.y, position.x));
     let enemy_capital = *enemy_capitals.first()?;
-    let plan = world
+    // 起点は揚陸作戦が戦況から選んだ浜の起点（揚陸先の評価と同じ定義）。
+    let origin = world
         .get_resource::<crate::ai::v4::maritime::sealift::AssaultPlans>()?
         .0
-        .get(&player_id)?;
-    let from_capital = armored_step_distances(map, master_data, enemy_capital);
-    let origin = plan
-        .stops
-        .iter()
-        .flat_map(|stop| map.get_adjacent(stop.0, stop.1))
-        .map(|(x, y)| GridPosition { x, y })
-        .filter(|cell| on_island(cell))
-        .filter_map(|cell| Some((*from_capital.get(&cell)?, cell)))
-        .min_by_key(|(distance, cell)| (*distance, cell.y, cell.x))
-        .map(|(_, cell)| cell)?;
+        .get(&player_id)?
+        .origin
+        .filter(|origin| on_island(origin))?;
     Some((origin, enemy_capital))
 }
 

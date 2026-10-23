@@ -4,26 +4,23 @@
 //! 敵の地上部隊が居る陸塊へは、次の手順で一斉に上陸する。
 //!
 //! 1. 浜の選択: 陸塊へ降ろせる停泊セル（港・浅瀬）を近いものどうしで浜にまとめ、
-//!    近くの未所有拠点（目標）の多さと、近くの敵地上戦力の少なさで浜を選ぶ。
+//!    上陸できるか・反撃の危険・進軍路で得られるもので浜を選ぶ（[`super::landing_site`]）。
+//!    上陸済みの浜（橋頭堡）は、塞がれて上陸できなくならない限り使い続ける。
 //! 2. 集結: 積荷を載せた輸送船は、次の手番に浜へ届く海上のセル（集結海域）で待つ。
 //! 3. 出撃: 今手番に浜へ届く輸送船（波）がそろい、上陸戦力が浜の守りを上回ったら、
 //!    同じ手番に一斉に降ろす。戦艦は手番の初めに浜の守りを優先して撃つ。
 //!
 //! 出撃の条件は [`AssaultTuning`] にまとめる（評価で調整するため環境変数で上書きできる）。
 
+use super::landing_site::{LandingSite, strength};
 use super::{Cell, SealiftContext};
 use crate::ai::context::board::BoardUnit;
-use crate::ai::v4::maritime::landmass::is_ground;
 use crate::ai::v4::maritime::theater::sea_distances;
 use crate::collections::{HashMap, HashSet};
 use crate::components::{GridPosition, PlayerId};
-use crate::resources::{MovementType, Terrain};
-use crate::systems::movement::get_valid_movement_cost;
+use crate::resources::MovementType;
 use bevy_ecs::prelude::*;
 use std::sync::OnceLock;
-
-/// 停泊セルを同じ浜にまとめる距離。
-const BEACH_LINK_DISTANCE: u32 = 3;
 
 /// 揚陸作戦の調整値。
 #[derive(Debug, Clone)]
@@ -38,8 +35,6 @@ pub(crate) struct AssaultTuning {
     pub(crate) max_wait: u32,
     /// 浜の守り・上陸済みの味方を数える、停泊セルからの距離。
     pub(crate) defense_radius: u32,
-    /// 浜の目標（未所有拠点）を数える、停泊セルからの距離。
-    pub(crate) objective_radius: u32,
     /// 選んだ浜を別の浜へ変える、評価の比（%）。
     pub(crate) switch_percent: i64,
     /// 戦艦が浜の守りを撃つときの、損害価値の上乗せ（%）。
@@ -72,7 +67,6 @@ impl AssaultTuning {
             min_wave: read("OPENWARS_ASSAULT_MIN_WAVE", 2),
             max_wait: read("OPENWARS_ASSAULT_MAX_WAIT", 3),
             defense_radius: read("OPENWARS_ASSAULT_DEFENSE_RADIUS", 3),
-            objective_radius: read("OPENWARS_ASSAULT_OBJECTIVE_RADIUS", 6),
             switch_percent: read("OPENWARS_ASSAULT_SWITCH", 150),
             beach_fire_bonus_percent: read("OPENWARS_ASSAULT_FIRE_BONUS", 100),
             embark: read("OPENWARS_ASSAULT_EMBARK", 0u32) != 0,
@@ -104,35 +98,14 @@ pub(crate) struct AssaultPlan {
     pub(crate) landmass: u32,
     /// 浜の停泊セル（輸送船が止まって降ろすセル）。
     pub(crate) stops: Vec<Cell>,
+    /// 浜を起点にした島内の首都攻略DAGの起点（降車セルのうち敵首都へ最も近いセル）。
+    pub(crate) origin: Option<GridPosition>,
     /// この判断をした手番。
     decided_turn: u32,
     /// この浜で集結を始めた手番（出撃したら次の集結の始まりに戻す）。
     since_turn: u32,
     /// この手番に一斉に降ろすか。
     pub(crate) launch: bool,
-}
-
-/// 浜の評価。
-struct Beach {
-    stops: Vec<Cell>,
-    /// 停泊セルの近くの未所有拠点の重み（首都は3、他は1）。
-    objective: i64,
-    /// 停泊セルの近くの敵地上戦力（生産費×HP）。
-    defense: i64,
-    /// 停泊セルの近くに上陸済みの味方地上戦力。
-    friendly: i64,
-}
-
-impl Beach {
-    fn score(&self) -> i64 {
-        let net = (self.defense - self.friendly).max(0);
-        self.objective * 100_000 / (net + 5_000)
-    }
-}
-
-/// 部隊の戦力（生産費×HP）。
-fn strength(unit: &BoardUnit) -> i64 {
-    i64::from(unit.stats.cost) * i64::from(unit.health.unwrap_or(100)) / 100
 }
 
 impl SealiftContext {
@@ -153,66 +126,41 @@ impl SealiftContext {
             return Some(previous.clone());
         }
         let landmass = self.assault_landmass()?;
-        let beaches = self.beaches(landmass);
-        let best = beaches.iter().max_by_key(|beach| beach.score())?;
-        // 前の浜が残っていれば、明らかに良い浜が無い限り変えない（集結をやり直さない）。
-        let kept = previous.and_then(|previous| {
-            beaches
-                .iter()
-                .find(|beach| beach.stops.iter().any(|stop| previous.stops.contains(stop)))
-        });
-        // 橋頭堡のDAGがあれば、その起点に接する浜へ届け続ける（上陸部隊の前進と
-        // 後続の増援を同じ進軍路にそろえる）。
-        let map = &self.board.map;
-        let dag_beach = beaches.iter().find(|beach| {
-            beach.stops.iter().any(|stop| {
-                self.beachhead_origins
-                    .iter()
-                    .any(|origin| map.distance(stop.0, stop.1, origin.x, origin.y) <= 1)
-            })
-        });
-        let kept = dag_beach.or(kept);
-        let (beach, since_turn) = match (kept, previous) {
-            (Some(kept), _) if dag_beach.is_some() => (
-                kept,
-                previous
-                    .filter(|previous| previous.stops == kept.stops)
-                    .map_or(turn, |previous| previous.since_turn),
-            ),
-            (Some(kept), Some(previous))
-                if (tuning.keep_beachhead && kept.friendly > 0)
-                    || best.score() * 100 <= kept.score() * tuning.switch_percent =>
-            {
-                (kept, previous.since_turn)
-            }
-            _ => (best, turn),
-        };
+        let sites = self.landing_sites(landmass);
+        let (site, since_turn) = self.choose_landing_site(&sites, previous, turn)?;
         // 1手番に降ろせるのは停泊セルの数の輸送船まで。積荷の強い輸送船から数える。
         let mut wave: Vec<i64> = self
-            .assault_wave(landmass, &beach.stops)
+            .assault_wave(landmass, &site.stops)
             .into_iter()
             .map(|transport| self.cargo_strength(transport))
             .collect();
         wave.sort_unstable_by(|a, b| b.cmp(a));
-        wave.truncate(beach.stops.len());
-        let power: i64 = wave.iter().sum::<i64>() + beach.friendly;
+        wave.truncate(site.free_stops);
+        let power: i64 = wave.iter().sum::<i64>() + site.friendly;
         let waited = turn.saturating_sub(since_turn);
-        let defended = beach.defense > beach.friendly;
+        // 浜の守りは、次の敵手番に降車セルを攻撃できる敵と近くの敵生産拠点からの増援。
+        let defense = site.threat();
+        let defended = defense > site.friendly;
         let launch = !wave.is_empty()
+            && site.feasible()
             && (!defended
-                || beach.friendly * 100 >= tuning.ratio_percent * beach.defense
+                || site.friendly * 100 >= tuning.ratio_percent * defense
                 || (wave.len() >= tuning.min_wave
-                    && (power * 100 >= tuning.ratio_percent * beach.defense
+                    && (power * 100 >= tuning.ratio_percent * defense
                         || waited >= tuning.max_wait
-                        || wave.len() >= beach.stops.len())));
+                        || wave.len() >= site.free_stops)));
         if std::env::var("OPENWARS_ASSAULT_TRACE").is_ok() {
             eprintln!(
-                "ASSAULT p{} T{turn} land{landmass} stops{:?} obj{} def{} fr{} wave{} power{} waited{} launch{launch}",
+                "ASSAULT p{} T{turn} land{landmass} stops{:?} free{} route{:?}/{} counter{} reinf{} fr{} score{} wave{} power{} waited{} launch{launch}",
                 self.player_id.0,
-                beach.stops,
-                beach.objective,
-                beach.defense,
-                beach.friendly,
+                site.stops,
+                site.free_stops,
+                site.route_steps,
+                site.route_properties,
+                site.counterattack,
+                site.reinforcement,
+                site.friendly,
+                site.score(),
                 wave.len(),
                 power,
                 waited
@@ -220,7 +168,8 @@ impl SealiftContext {
         }
         Some(AssaultPlan {
             landmass,
-            stops: beach.stops.clone(),
+            stops: site.stops.clone(),
+            origin: site.origin,
             decided_turn: turn,
             // 出撃したら、次の波の集結はこの手番から数え直す。
             since_turn: if launch { turn } else { since_turn },
@@ -278,100 +227,75 @@ impl SealiftContext {
             .map(|(landmass, _)| landmass)
     }
 
-    /// 陸塊 `landmass` へ輸送船が降ろせる停泊セルを、近いものどうし（3マス以内で連鎖）で
-    /// まとめた浜ごとの評価。目標の無い浜は除く。
-    fn beaches(&self, landmass: u32) -> Vec<Beach> {
-        let map = &self.board.map;
-        let registry = &self.board.registry;
-        let mut stops: Vec<Cell> = Vec::new();
-        for y in 0..map.height {
-            for x in 0..map.width {
-                let Some(terrain) = map.get_terrain(x, y) else {
-                    continue;
-                };
-                if !matches!(terrain, Terrain::Shoal | Terrain::Port)
-                    || get_valid_movement_cost(registry, MovementType::Ship, terrain).is_none()
-                    || !map.get_adjacent(x, y).into_iter().any(|(nx, ny)| {
-                        self.landmasses.land.at(GridPosition { x: nx, y: ny }) == Some(landmass)
-                    })
-                {
-                    continue;
-                }
-                stops.push((x, y));
-            }
-        }
-        // 近く（BEACH_LINK_DISTANCE以内）で連鎖する停泊セルを1つの浜にまとめる。
-        let mut groups: Vec<Vec<Cell>> = Vec::new();
-        for stop in stops {
-            let linked: Vec<usize> = groups
-                .iter()
-                .enumerate()
-                .filter(|(_, group)| {
-                    group.iter().any(|other| {
-                        map.distance(stop.0, stop.1, other.0, other.1) <= BEACH_LINK_DISTANCE
-                    })
-                })
-                .map(|(index, _)| index)
-                .collect();
-            let mut merged = vec![stop];
-            for index in linked.into_iter().rev() {
-                merged.extend(groups.swap_remove(index));
-            }
-            merged.sort_unstable();
-            groups.push(merged);
-        }
+    /// 揚陸先の浜を選ぶ。選んだ浜と、その浜で集結を始めた手番を返す。
+    ///
+    /// 1. 上陸済みの浜（首都攻略DAGの起点に接する浜）が上陸できるなら、それを使い続ける。
+    ///    塞がれていれば、上陸できる浜のうち橋頭堡に最も近い浜で増援を送る。
+    /// 2. まだ上陸していなければ、上陸できる浜のうち評価（得られるもの÷反撃の危険）が
+    ///    最も良い浜を選ぶ。前の手番の浜は、明らかに良い浜が無い限り変えない。
+    /// 3. 上陸できる浜が無ければ、評価が最も良い浜で待つ（出撃はしない）。
+    fn choose_landing_site<'a>(
+        &self,
+        sites: &'a [LandingSite],
+        previous: Option<&AssaultPlan>,
+        turn: u32,
+    ) -> Option<(&'a LandingSite, u32)> {
         let tuning = tuning();
-        let near = |stops: &[Cell], position: GridPosition, radius: u32| {
-            stops
-                .iter()
-                .any(|stop| map.distance(stop.0, stop.1, position.x, position.y) <= radius)
+        let map = &self.board.map;
+        let continuing = |site: &LandingSite| {
+            previous
+                .filter(|previous| site.stops.iter().any(|stop| previous.stops.contains(stop)))
+                .map_or(turn, |previous| previous.since_turn)
         };
-        let mut beaches: Vec<Beach> = groups
-            .into_iter()
-            .map(|stops| {
-                let objective = self
-                    .board
-                    .properties
+        let feasible: Vec<&LandingSite> = sites.iter().filter(|site| site.feasible()).collect();
+        let best = feasible
+            .iter()
+            .copied()
+            .max_by_key(|site| (site.score(), std::cmp::Reverse(site.stops.clone())));
+        // 1. 橋頭堡（首都攻略DAGの起点）。
+        let beachhead_origin = self.beachhead_origins.first().copied();
+        if let Some(origin) = beachhead_origin {
+            let at_origin = |site: &&LandingSite| site.drop_cells.contains(&origin);
+            if let Some(site) = feasible.iter().copied().find(at_origin) {
+                return Some((site, continuing(site)));
+            }
+            let nearest = feasible.iter().copied().min_by_key(|site| {
+                let distance = site
+                    .drop_cells
                     .iter()
-                    .filter(|property| {
-                        property.owner != Some(self.player_id)
-                            && self.landmasses.land.at(property.position) == Some(landmass)
-                            && near(&stops, property.position, tuning.objective_radius)
-                    })
-                    .map(|property| {
-                        if property.terrain == Terrain::Capital {
-                            3
-                        } else {
-                            1
-                        }
-                    })
-                    .sum();
-                let mut defense = 0;
-                let mut friendly = 0;
-                for unit in self.board.units.iter().filter(|unit| {
-                    unit.is_deployed()
-                        && is_ground(unit)
-                        && self.landmasses.land.at(unit.position) == Some(landmass)
-                        && near(&stops, unit.position, tuning.defense_radius)
-                }) {
-                    if unit.owner == self.player_id {
-                        friendly += strength(unit);
-                    } else {
-                        defense += strength(unit);
-                    }
+                    .map(|cell| map.distance(cell.x, cell.y, origin.x, origin.y))
+                    .min()
+                    .unwrap_or(u32::MAX);
+                (distance, site.stops.clone())
+            });
+            if let Some(site) = nearest {
+                return Some((site, continuing(site)));
+            }
+        }
+        // 2. 前の手番の浜を続けるか、より良い浜へ移る。
+        if let Some(best) = best {
+            let kept = previous.and_then(|previous| {
+                feasible
+                    .iter()
+                    .copied()
+                    .find(|site| site.stops.iter().any(|stop| previous.stops.contains(stop)))
+            });
+            let site = match kept {
+                Some(kept)
+                    if (tuning.keep_beachhead && kept.friendly > 0)
+                        || best.score() * 100 <= kept.score() * tuning.switch_percent =>
+                {
+                    kept
                 }
-                Beach {
-                    stops,
-                    objective,
-                    defense,
-                    friendly,
-                }
-            })
-            // 目標の無い浜は除く。ただし味方が上陸済みの浜（橋頭堡）は残す。
-            .filter(|beach| beach.objective > 0 || beach.friendly > 0)
-            .collect();
-        beaches.sort_by_key(|beach| beach.stops.clone());
-        beaches
+                _ => best,
+            };
+            return Some((site, continuing(site)));
+        }
+        // 3. 上陸できる浜が無い。
+        let site = sites
+            .iter()
+            .max_by_key(|site| (site.score(), std::cmp::Reverse(site.stops.clone())))?;
+        Some((site, continuing(site)))
     }
 
     /// 今手番に浜 `stops` へ届いて降ろせる、陸塊 `landmass` 行きの輸送船（波）。
