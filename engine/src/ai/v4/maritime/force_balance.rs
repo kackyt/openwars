@@ -20,7 +20,9 @@
 //!    運べない戦車は戦局に寄与しないので、輸送船の積載枠に空きがある分だけ買う。
 //!    戦車が要る間は、積載枠の半分を戦闘役のために空け、占領役の待機をその残りまでにする
 //!    （[`super::production::rejects_ground_purchase`]）。
-//! 5. 戦車の種類は、作戦地域の敵への「与える損害価値 ÷（費用＋受ける損害価値）」で選ぶ。
+//! 5. 揚陸する戦闘部隊の種類は、輸送船の積載枠1つ当たりの戦力で選ぶ。島の作戦では資金より
+//!    積載枠が足りないため、費用当たりではなく1台の強さ（作戦地域の敵へ与える損害価値と、
+//!    受ける損害の少なさ）で中戦車・重戦車・重自走砲から選ぶ。
 
 use super::landmass::{Landmasses, is_ground};
 use super::sealift::AssaultPlans;
@@ -47,8 +49,9 @@ const STATIONS_PER_BATTLESHIP: usize = 2;
 const SUPPLY_PORT_RADIUS: u32 = 16;
 /// 港1つで補給を回せる戦艦の数（1港で1手番1隻が補給し、1隻は6発を約4手番で撃つ）。
 pub(crate) const BATTLESHIPS_PER_PORT: usize = 4;
-/// 揚陸用の戦車の候補。
-const TANK_CANDIDATES: [UnitType; 3] = [UnitType::Tank, UnitType::MdTank, UnitType::TankZ];
+/// 揚陸する戦闘部隊の候補（積載枠1つに見合う強さのもの）。
+const LANDING_COMBAT_CANDIDATES: [UnitType; 3] =
+    [UnitType::MdTank, UnitType::TankZ, UnitType::HeavySpGun];
 
 /// 揚陸作戦の火力と地上戦力の需給。
 #[derive(Debug, Clone, Default)]
@@ -205,24 +208,30 @@ impl LandingForceBalance {
         self.zone_enemy - self.naval_capacity > self.ashore
     }
 
-    /// 作戦地域の敵に対して費用当たりの働きが最も良い戦車（`budget` 以内）。
-    pub(crate) fn best_tank(
+    /// 作戦地域の敵に対して、輸送船の積載枠1つ当たりの戦力が最も高い戦闘部隊（`budget` 以内）。
+    ///
+    /// 戦力は「与える損害価値 × 100 ÷（100 ＋ 受ける損害%）」。間接部隊は射程の内側から、
+    /// 直接部隊は隣接から撃つとして見積もる。
+    pub(crate) fn best_landing_combat_unit(
         &self,
         board: &PlayerBoard,
         chart: &DamageChart,
         stats_of: &dyn Fn(UnitType) -> Option<UnitStats>,
         budget: u32,
     ) -> Option<UnitType> {
-        TANK_CANDIDATES
+        LANDING_COMBAT_CANDIDATES
             .iter()
             .filter_map(|unit_type| {
                 let stats = stats_of(*unit_type)?;
                 if stats.cost > budget {
                     return None;
                 }
-                let dealt = average_damage_value(board, chart, &stats, &self.zone_enemies, 1);
-                let taken = average_damage_taken(board, chart, &stats, &self.zone_enemies);
-                let score = dealt * 1_000 / (i64::from(stats.cost) + taken).max(1);
+                let distance = stats.min_range.max(1);
+                let dealt =
+                    average_damage_value(board, chart, &stats, &self.zone_enemies, distance);
+                let taken_value = average_damage_taken(board, chart, &stats, &self.zone_enemies);
+                let taken_percent = taken_value * 100 / i64::from(stats.cost).max(1);
+                let score = dealt * 100 / (100 + taken_percent);
                 Some((score, *unit_type))
             })
             .max_by_key(|(score, unit_type)| (*score, std::cmp::Reverse(*unit_type as u32)))

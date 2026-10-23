@@ -47,7 +47,7 @@ pub(crate) struct AssaultTuning {
     pub(crate) keep_beachhead: bool,
     /// 撃てない戦艦を浜の支援位置へ集めるか。
     pub(crate) battleship_support: bool,
-    /// 揚陸作戦の間、占領役より戦闘部隊を先に積むか。
+    /// 揚陸作戦の間、占領役より戦闘部隊（重戦闘部隊が最優先）を先に積むか。
     pub(crate) combat_first: bool,
     /// 揚陸作戦の間、運ぶ戦闘部隊の購入を許す積載枠の割合（%）。None なら常の基準。
     pub(crate) heavy_backlog_percent: Option<u32>,
@@ -73,7 +73,7 @@ impl AssaultTuning {
             embark_slack: read("OPENWARS_ASSAULT_EMBARK_SLACK", 2),
             keep_beachhead: read("OPENWARS_ASSAULT_KEEP_BEACHHEAD", 0u32) != 0,
             battleship_support: read("OPENWARS_ASSAULT_BS_SUPPORT", 0u32) != 0,
-            combat_first: read("OPENWARS_ASSAULT_COMBAT_FIRST", 0u32) != 0,
+            combat_first: read("OPENWARS_ASSAULT_COMBAT_FIRST", 1u32) != 0,
             heavy_backlog_percent: std::env::var("OPENWARS_ASSAULT_HEAVY_PERCENT")
                 .ok()
                 .and_then(|value| value.parse().ok()),

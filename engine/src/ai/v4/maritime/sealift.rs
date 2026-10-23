@@ -7,8 +7,10 @@
 //! 2. 出発・航行: 積荷を載せた輸送部隊を目的の陸塊へ進める。今手番にまだ乗れる部隊が
 //!    居る場合は、乗船を待ってから出る。
 //! 3. 迎え: 空の輸送部隊を、取り残された部隊の近くの乗船地点へ向かわせる。
-//! 4. 乗船: 行動を終えた輸送部隊へ、取り残された部隊を乗せる。
-//! 5. 集結: まだ乗れない取り残された部隊を乗船地点の近くへ寄せる（生産施設は塞がない）。
+//! 4. 相乗り: 取り残された歩兵を装甲車へ載せる（輸送船の1枠で2体を運ぶ）。
+//! 5. 乗船: 行動を終えた輸送部隊へ、取り残された部隊を乗せる。揚陸作戦の間は
+//!    中戦車・重戦車・重自走砲など1枠あたりの戦力が大きい部隊から積む。
+//! 6. 集結: まだ乗れない取り残された部隊を乗船地点の近くへ寄せる（生産施設は塞がない）。
 //!
 //! 輸送部隊は積載すると同じ手番に移動できず、積んだ部隊はその手番に降ろせない。
 //! 輸送船は港か浅瀬からしか降ろせない。輸送ヘリは燃料が尽きると墜落するため、
@@ -181,6 +183,31 @@ pub(crate) fn is_sealift_transport(stats: &UnitStats) -> bool {
     ) && stats.max_cargo > 0
 }
 
+/// 1枠あたりの戦力が大きく、揚陸作戦で先に運ぶ重戦闘部隊の価格の下限
+/// （中戦車・重戦車・重自走砲。軽戦車・ロケット砲などは含まない）。
+const HEAVY_COMBAT_COST: u32 = 15000;
+
+/// 歩兵を載せて陸上を運ぶ部隊か（装甲車）。
+pub(crate) fn is_ground_carrier(unit: &BoardUnit) -> bool {
+    unit.stats.max_cargo > 0 && !is_sealift_transport(&unit.stats) && is_ground(unit)
+}
+
+/// 取り残された部隊を輸送部隊へ積む順（小さいほど先）。
+fn loading_rank(unit: &BoardUnit, combat_first: bool) -> u8 {
+    let carrier = is_ground_carrier(unit) && unit.cargo.is_some_and(|cargo| cargo.loaded > 0);
+    let heavy = !unit.stats.can_capture && !carrier && unit.stats.cost >= HEAVY_COMBAT_COST;
+    match (combat_first, heavy, carrier, unit.stats.can_capture) {
+        (true, true, ..) => 0,
+        (true, _, true, _) => 1,
+        (true, _, _, false) => 2,
+        (true, ..) => 3,
+        (false, _, true, _) => 0,
+        (false, _, _, true) => 1,
+        (false, true, ..) => 2,
+        (false, ..) => 3,
+    }
+}
+
 /// 輸送の判断が必要な状態か。行動を終えていない輸送部隊があるか、行動を終えた
 /// 輸送部隊に空きがあり、まだ乗り込める未行動の地上部隊が居る場合に限る。
 fn has_active_transport(world: &mut World, player_id: PlayerId, skip: &HashSet<Entity>) -> bool {
@@ -235,6 +262,15 @@ struct Cargo {
     stats: UnitStats,
     /// この手番に降ろせるか（今手番に乗った部隊は降ろせない）。
     can_drop: bool,
+    /// この積荷（装甲車）に同乗している占領役の数。
+    passengers: u32,
+}
+
+impl Cargo {
+    /// 揚陸先で拠点を占領する部隊を含むか（占領役自身か、占領役を載せた装甲車）。
+    fn carries_capturer(&self) -> bool {
+        self.stats.can_capture || self.passengers > 0
+    }
 }
 
 /// 1回の判断で共有する輸送の盤面。
@@ -287,9 +323,21 @@ impl SealiftContext {
                 entity,
                 stats: stats.clone(),
                 can_drop: !done.0,
+                passengers: 0,
             });
         }
+        // 装甲車に載った占領役を、装甲車を積んだ輸送部隊の側から数えられるようにする。
+        let passengers: HashMap<Entity, u32> = cargo
+            .iter()
+            .map(|(carrier, list)| {
+                let count = list.iter().filter(|item| item.stats.can_capture).count();
+                (*carrier, count as u32)
+            })
+            .collect();
         for list in cargo.values_mut() {
+            for item in list.iter_mut() {
+                item.passengers = passengers.get(&item.entity).copied().unwrap_or(0);
+            }
             list.sort_by_key(|cargo| cargo.entity);
         }
         let owned = |terrains: &[Terrain]| -> Vec<(usize, usize)> {
@@ -348,17 +396,166 @@ impl SealiftContext {
         transports
     }
 
-    /// 取り残された、輸送部隊に乗れる自軍の地上部隊。
+    /// 取り残された、輸送部隊に乗れる自軍の地上部隊（装甲車へ相乗りする組を除く）。
+    ///
+    /// 積む順は、揚陸作戦の間は重戦闘部隊（中戦車・重戦車・重自走砲）→ 占領役を載せた
+    /// 装甲車 → その他の戦闘部隊 → 占領役。輸送船の積載枠は2つしかないため、1枠あたりの
+    /// 戦力が大きい部隊から運ぶ。作戦の無い間は、中立拠点の収入が最も早く戦局を変えるので
+    /// 占領役（占領役を載せた装甲車を含む）を先に運ぶ。
     fn stranded(&self) -> Vec<&BoardUnit> {
+        let paired: HashSet<Entity> = self
+            .carrier_pairs()
+            .iter()
+            .flat_map(|(carrier, rider)| [carrier.entity, rider.entity])
+            .collect();
         let mut units: Vec<_> = self
+            .own_units()
+            .filter(|unit| self.landmasses.is_stranded(unit) && !paired.contains(&unit.entity))
+            .collect();
+        let combat_first = self.assault.is_some() && assault_tuning().combat_first;
+        units.sort_by_key(|unit| (loading_rank(unit, combat_first), unit.entity));
+        units
+    }
+
+    /// 取り残された陸塊で、空の装甲車と、それに相乗りする占領役の組。
+    ///
+    /// 装甲車に歩兵を載せてから輸送船へ積むと、輸送船の1枠で装甲車と歩兵の2体を運べる。
+    /// 装甲車ごとに、同じ陸塊で最も近い占領役を1体ずつ割り当てる。
+    fn carrier_pairs(&self) -> Vec<(&BoardUnit, &BoardUnit)> {
+        let stranded: Vec<&BoardUnit> = self
             .own_units()
             .filter(|unit| self.landmasses.is_stranded(unit))
             .collect();
-        // 占領役を先に運ぶ（中立拠点の収入が最も早く戦局を変える）。揚陸作戦の間は、
-        // 浜を確保する戦闘部隊を先に運ぶ。
-        let combat_first = self.assault.is_some() && assault_tuning().combat_first;
-        units.sort_by_key(|unit| (unit.stats.can_capture == combat_first, unit.entity));
-        units
+        let mut carriers: Vec<&BoardUnit> = stranded
+            .iter()
+            .copied()
+            .filter(|unit| is_ground_carrier(unit) && unit.cargo.is_some_and(|c| c.loaded == 0))
+            .collect();
+        carriers.sort_by_key(|unit| unit.entity);
+        let map = &self.board.map;
+        let mut taken = HashSet::default();
+        let mut pairs = Vec::new();
+        for carrier in carriers {
+            let landmass = self.landmasses.land.at(carrier.position);
+            let rider = stranded
+                .iter()
+                .copied()
+                .filter(|unit| {
+                    unit.stats.can_capture
+                        && !taken.contains(&unit.entity)
+                        && carrier
+                            .stats
+                            .loadable_unit_types
+                            .contains(&unit.stats.unit_type)
+                        && self.landmasses.land.at(unit.position) == landmass
+                })
+                .min_by_key(|unit| {
+                    (
+                        map.distance(
+                            unit.position.x,
+                            unit.position.y,
+                            carrier.position.x,
+                            carrier.position.y,
+                        ),
+                        unit.entity,
+                    )
+                });
+            if let Some(rider) = rider {
+                taken.insert(rider.entity);
+                pairs.push((carrier, rider));
+            }
+        }
+        pairs
+    }
+
+    /// 装甲車と占領役の相乗り。装甲車を先に乗船セルの近くへ寄せ（歩兵を載せた手番は
+    /// 動けない）、届く歩兵を載せ、届かない歩兵は装甲車へ寄せる。
+    fn pair_carriers(&self, transports: &[&BoardUnit]) -> Option<(Entity, AiCommand)> {
+        let pairs = self.carrier_pairs();
+        if std::env::var("OPENWARS_SEALIFT_DEBUG").is_ok() {
+            let list: Vec<String> = pairs
+                .iter()
+                .map(|(c, r)| {
+                    format!(
+                        "R({},{}){}<-I({},{}){}",
+                        c.position.x,
+                        c.position.y,
+                        if self.fresh.contains(&c.entity) {
+                            ""
+                        } else {
+                            "*"
+                        },
+                        r.position.x,
+                        r.position.y,
+                        if self.fresh.contains(&r.entity) {
+                            ""
+                        } else {
+                            "*"
+                        }
+                    )
+                })
+                .collect();
+            eprintln!("PAIRS {}", list.join(" "));
+        }
+        for (carrier, _) in &pairs {
+            if self.fresh.contains(&carrier.entity)
+                && let Some(command) = self.gather(carrier, transports)
+            {
+                return Some((carrier.entity, command));
+            }
+        }
+        let map = &self.board.map;
+        for (carrier, rider) in &pairs {
+            let target = (carrier.position.x, carrier.position.y);
+            if self.fresh.contains(&rider.entity)
+                && map.distance(rider.position.x, rider.position.y, target.0, target.1)
+                    <= rider.stats.max_movement
+                && self.reachable(rider).contains_key(&target)
+            {
+                return Some((
+                    rider.entity,
+                    AiCommand::Load {
+                        target_pos: carrier.position,
+                        transport_entity: carrier.entity,
+                    },
+                ));
+            }
+        }
+        for (carrier, rider) in &pairs {
+            if !self.fresh.contains(&rider.entity) {
+                continue;
+            }
+            let current = (rider.position.x, rider.position.y);
+            // 生産施設を塞がない → 装甲車に近い → 現在地に留まる。
+            let Some(cell) = self
+                .reachable(rider)
+                .keys()
+                .copied()
+                .filter(|cell| self.is_free_for(rider, *cell))
+                .min_by_key(|cell| {
+                    (
+                        self.production_sites.contains(cell),
+                        map.distance(cell.0, cell.1, carrier.position.x, carrier.position.y),
+                        *cell != current,
+                        *cell,
+                    )
+                })
+            else {
+                continue;
+            };
+            if cell != current {
+                return Some((
+                    rider.entity,
+                    AiCommand::Wait {
+                        target_pos: GridPosition {
+                            x: cell.0,
+                            y: cell.1,
+                        },
+                    },
+                ));
+            }
+        }
+        None
     }
 
     fn decide(&self) -> Option<(Entity, AiCommand)> {
@@ -427,7 +624,11 @@ impl SealiftContext {
         if !overseas_demand {
             return None;
         }
-        // 4. 乗船。
+        // 4. 装甲車への相乗り（輸送船の1枠で装甲車と歩兵を運ぶ）。
+        if let Some(decision) = self.pair_carriers(&transports) {
+            return Some(decision);
+        }
+        // 5. 乗船。
         for unit in &stranded {
             if !self.fresh.contains(&unit.entity) {
                 continue;
@@ -436,7 +637,7 @@ impl SealiftContext {
                 return Some((unit.entity, command));
             }
         }
-        // 5. 集結。生産施設を塞いでいる部隊から先に動かし、施設を空ける。
+        // 6. 集結。生産施設を塞いでいる部隊から先に動かし、施設を空ける。
         let mut gathering = stranded.clone();
         gathering.sort_by_key(|unit| {
             !self
@@ -573,8 +774,15 @@ impl SealiftContext {
     /// 積荷の構成に対する、陸塊 `landmass` へ揚陸する価値。送る理由が無ければNone。
     fn landing_value(&self, cargo: &[Cargo], landmass: u32) -> Option<i64> {
         let info = self.landmasses.info.get(&landmass)?;
-        let capturers = cargo.iter().filter(|cargo| cargo.stats.can_capture).count() as i64;
-        let fighters = cargo.len() as i64 - capturers;
+        // 占領役を載せた装甲車は、占領役と戦闘役の両方として数える。
+        let capturers = cargo
+            .iter()
+            .map(|cargo| i64::from(cargo.stats.can_capture) + i64::from(cargo.passengers))
+            .sum::<i64>();
+        let fighters = cargo
+            .iter()
+            .filter(|cargo| !cargo.stats.can_capture)
+            .count() as i64;
         let capture_need = i64::from(info.capture_need());
         let assigned_capturers = capturers.min(capture_need);
         let mut value = assigned_capturers * CAPTURE_SLOT_VALUE;
@@ -716,7 +924,7 @@ impl SealiftContext {
         let Some(info) = self.landmasses.info.get(&landmass) else {
             return Vec::new();
         };
-        if item.stats.can_capture && !info.unowned.is_empty() {
+        if item.carries_capturer() && !info.unowned.is_empty() {
             return info.unowned.clone();
         }
         let enemy_property = self.board.properties.iter().filter(|property| {
@@ -1291,6 +1499,82 @@ mod tests {
             command,
             AiCommand::Load { transport_entity, .. } if transport_entity == lander
         ));
+    }
+
+    #[test]
+    fn stranded_infantry_rides_in_a_recon_instead_of_taking_a_lander_slot() {
+        // 輸送船は浅瀬(x=3)で乗船を待つ。歩兵は輸送船の枠を使わず、装甲車へ乗る。
+        let mut world = naval_world(&["H..,~~~~,C."]);
+        property(&mut world, 1, 0, 0);
+        property(&mut world, 0, 9, 0);
+        let lander = spawn(&mut world, 1, UnitType::Lander, 3, 0);
+        world.entity_mut(lander).insert(ActionCompleted(true));
+        world.entity_mut(lander).insert(HasMoved(true));
+        let infantry = spawn(&mut world, 1, UnitType::Infantry, 1, 0);
+        let recon = spawn(&mut world, 1, UnitType::Recon, 2, 0);
+
+        let (entity, command) = decide(&mut world).unwrap();
+        assert_eq!(entity, infantry);
+        assert!(
+            matches!(command, AiCommand::Load { transport_entity, .. } if transport_entity == recon),
+            "歩兵は装甲車へ乗る: {command:?}"
+        );
+
+        // 歩兵を載せた装甲車は、次の手番に輸送船へ乗る。
+        world.entity_mut(infantry).insert((
+            Transporting(recon),
+            GridPosition { x: 9999, y: 9999 },
+            ActionCompleted(true),
+        ));
+        world
+            .get_mut::<crate::components::CargoCapacity>(recon)
+            .unwrap()
+            .loaded
+            .push(infantry);
+        let (entity, command) = decide(&mut world).unwrap();
+        assert_eq!(entity, recon);
+        assert!(matches!(
+            command,
+            AiCommand::Load { transport_entity, .. } if transport_entity == lander
+        ));
+    }
+
+    #[test]
+    fn heavy_tank_boards_before_light_tank() {
+        // 輸送船の枠は1枠あたりの戦力が大きい部隊から使う。
+        let mut world = naval_world(&["H..,~~~~,C."]);
+        property(&mut world, 1, 0, 0);
+        property(&mut world, 2, 9, 0);
+        let lander = spawn(&mut world, 1, UnitType::Lander, 3, 0);
+        world.entity_mut(lander).insert(ActionCompleted(true));
+        world.entity_mut(lander).insert(HasMoved(true));
+        spawn(&mut world, 1, UnitType::Tank, 2, 0);
+        let medium = spawn(&mut world, 1, UnitType::MdTank, 1, 0);
+
+        let (entity, command) = decide(&mut world).unwrap();
+        assert_eq!(entity, medium, "中戦車が先に乗る: {command:?}");
+        assert!(matches!(
+            command,
+            AiCommand::Load { transport_entity, .. } if transport_entity == lander
+        ));
+    }
+
+    #[test]
+    fn lander_lands_a_recon_carrying_infantry_next_to_a_neutral_city() {
+        // 歩兵を載せた装甲車は占領役として、中立都市の島へ降ろす。
+        let mut world = naval_world(&["H.~~~,C."]);
+        property(&mut world, 1, 0, 0);
+        property(&mut world, 0, 6, 0);
+        let lander = spawn(&mut world, 1, UnitType::Lander, 3, 0);
+        let recon = load(&mut world, lander, UnitType::Recon, 1);
+        load(&mut world, recon, UnitType::Infantry, 1);
+
+        let (entity, command) = decide(&mut world).unwrap();
+        assert_eq!(entity, lander);
+        assert!(
+            matches!(command, AiCommand::Drop { cargo_entity, .. } if cargo_entity == recon),
+            "装甲車を降ろす: {command:?}"
+        );
     }
 
     #[test]

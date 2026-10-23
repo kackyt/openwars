@@ -474,10 +474,15 @@ pub fn cleanup_cargo_system(
     q_cargo: Query<(Entity, &Transporting)>,
 ) {
     for event in destroyed_events.read() {
-        for (cargo_ent, trans) in q_cargo.iter() {
-            if trans.0 == event.entity {
-                // 輸送ユニットが破壊されたので、搭載ユニットも破壊（デスポーン）
-                commands.entity(cargo_ent).despawn();
+        // 輸送ユニットが破壊されたので、搭載ユニットも破壊（デスポーン）する。
+        // 輸送船に積んだ装甲車の中の歩兵のように入れ子で積まれた部隊も、まとめて破壊する。
+        let mut lost = vec![event.entity];
+        while let Some(transport) = lost.pop() {
+            for (cargo_ent, trans) in q_cargo.iter() {
+                if trans.0 == transport {
+                    commands.entity(cargo_ent).despawn();
+                    lost.push(cargo_ent);
+                }
             }
         }
     }
@@ -922,6 +927,29 @@ mod tests {
         // 両方 0 になるはず
         assert_eq!(world.get::<Health>(cargo1_entity).unwrap().current, 0);
         assert_eq!(world.get::<Health>(cargo2_entity).unwrap().current, 0);
+    }
+
+    #[test]
+    fn destroying_a_lander_also_destroys_infantry_inside_its_recon() {
+        let mut world = World::new();
+        world.init_resource::<Events<UnitDestroyedEvent>>();
+        // 輸送船 ← 装甲車 ← 歩兵 の入れ子積載。
+        let lander = world.spawn_empty().id();
+        let recon = world.spawn(Transporting(lander)).id();
+        let infantry = world.spawn(Transporting(recon)).id();
+        let bystander = world.spawn_empty().id();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(cleanup_cargo_system);
+        world.send_event(UnitDestroyedEvent { entity: lander });
+        schedule.run(&mut world);
+
+        assert!(world.get_entity(recon).is_err());
+        assert!(
+            world.get_entity(infantry).is_err(),
+            "装甲車の中の歩兵も失われる"
+        );
+        assert!(world.get_entity(bystander).is_ok());
     }
 
     #[test]

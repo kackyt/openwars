@@ -10,7 +10,7 @@
 //!   取り残された部隊を運ぶ輸送部隊と、海上戦域に寄与する戦艦を買う。
 
 use super::landmass::Landmasses;
-use super::sealift::is_sealift_transport;
+use super::sealift::{is_ground_carrier, is_sealift_transport};
 use super::theater::MaritimeTheater;
 use crate::ai::context::board::PlayerBoard;
 use crate::collections::HashSet;
@@ -35,6 +35,8 @@ const MAX_AIR_COMBAT_UNITS: u32 = 6;
 const MAX_LANDERS: u32 = 6;
 /// 余剰資金（輸送船3隻分ごとに1隻）で引き上げる輸送部隊の上限の最大幅。
 const MAX_EXTRA_SEALIFT_TRANSPORTS: u32 = 4;
+/// 輸送船の積載枠のうち、歩兵を載せた装甲車に回す割合（%）。
+const CARRIER_SLOT_PERCENT: u32 = 50;
 /// 同時に保有する輸送部隊（輸送船・輸送ヘリ）の上限。
 const MAX_SEALIFT_TRANSPORTS: u32 = 6;
 
@@ -63,6 +65,12 @@ pub(crate) struct SealiftStatus {
     pub(crate) heavy_slots: u32,
     /// 他の陸塊に、運ぶ理由（未所有拠点・敵）があるか。
     pub(crate) overseas_demand: bool,
+    /// 取り残された占領役のうち、装甲車に載っていない（地図上に居る）数。
+    pub(crate) loose_capturers: u32,
+    /// 取り残された、空の装甲車の数。
+    pub(crate) empty_carriers: u32,
+    /// 取り残された、占領役を載せた装甲車の数。
+    pub(crate) loaded_carriers: u32,
 }
 
 impl SealiftStatus {
@@ -93,8 +101,19 @@ impl SealiftStatus {
                     _ => status.helicopters += 1,
                 }
             } else if landmasses.is_stranded(unit) {
-                if unit.stats.can_capture {
+                if is_ground_carrier(unit) {
+                    // 歩兵を載せた装甲車は輸送船の1枠に占領役を運ぶ。空の装甲車は歩兵を
+                    // 載せて1枠に収まるので、積載枠の需給に数えない。
+                    match unit.cargo {
+                        Some(cargo) if cargo.loaded > 0 => {
+                            status.stranded_capturers += 1;
+                            status.loaded_carriers += 1;
+                        }
+                        _ => status.empty_carriers += 1,
+                    }
+                } else if unit.stats.can_capture {
                     status.stranded_capturers += 1;
+                    status.loose_capturers += 1;
                 } else {
                     status.stranded_others += 1;
                 }
@@ -282,6 +301,8 @@ pub(crate) fn decide_supplementary_production(
             .saturating_add(spendable / surplus_per_battleship)
             .min(supply_cap),
     };
+    // 輸送船の積載枠のうち、歩兵を載せた装甲車に回す分。残りは戦車などの重戦闘部隊に使う。
+    let carrier_cap = (status.heavy_slots * CARRIER_SLOT_PERCENT / 100).max(1);
     // 揚陸作戦があれば、戦艦と戦車の要否を作戦の火力・地上戦力の需給から決める
     // （[`super::force_balance`]）。無ければ従来どおり盤面の艦船数と余剰資金で決める。
     let balance =
@@ -322,13 +343,19 @@ pub(crate) fn decide_supplementary_production(
             .get_resource::<crate::resources::DamageChart>()
             .cloned()
             .unwrap_or_default();
-        let tank = (balance.ground_combat_needed() && stranded < status.heavy_slots)
+        // 作戦地域の敵を受け止める必要があるか、戦艦2隻分を超えて資金が余っている（他に
+        // 使い道が無い）なら、輸送船の積載枠のうち装甲車に回さない分まで重戦闘部隊を待たせる。
+        let budget = spendable.saturating_sub(reserve);
+        let surplus = budget >= cost_of(UnitType::Battleship).saturating_mul(2);
+        let heavy_room = status.heavy_slots.saturating_sub(carrier_cap).max(1);
+        let tank = ((balance.ground_combat_needed() || surplus)
+            && status.stranded_others < heavy_room)
             .then(|| {
-                balance.best_tank(
+                balance.best_landing_combat_unit(
                     &board,
                     &chart,
                     &|unit_type| registry.get_stats(unit_type).cloned(),
-                    spendable.saturating_sub(reserve),
+                    budget,
                 )
             })
             .flatten();
@@ -351,6 +378,16 @@ pub(crate) fn decide_supplementary_production(
             );
         }
         wishes.extend(tank);
+    }
+    // 輸送船で運ぶ歩兵を装甲車へ載せると、輸送船の1枠で2体を運べる。装甲車に載って
+    // いない取り残された歩兵の数まで、装甲車を買い足す（歩兵1体につき装甲車1台）。
+    // 本拠島で待つ装甲車は輸送船の積載枠の半分まで（残りの枠は戦車などの重戦闘部隊に使う）。
+    if status.overseas_demand
+        && status.landers > 0
+        && status.loose_capturers > status.empty_carriers
+        && status.empty_carriers + status.loaded_carriers < carrier_cap
+    {
+        wishes.push(UnitType::Recon);
     }
     let factories: Vec<GridPosition> = board
         .properties
