@@ -23,6 +23,7 @@ mod assault;
 mod landing_site;
 
 pub(crate) use assault::{AssaultPlans, tuning as assault_tuning};
+pub(crate) use landing_site::strength as landing_site_strength;
 
 use super::landmass::{Landmasses, is_ground};
 use super::theater::sea_distances;

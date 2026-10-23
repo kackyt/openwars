@@ -13,6 +13,7 @@
 //! 艦船を使うかどうかは [`theater::MaritimeTheater`] が盤面から判定する。港があっても
 //! 陸続きで敵が艦船を持たない盤面では艦船を買わない。
 
+pub(crate) mod force_balance;
 pub(crate) mod landmass;
 pub(crate) mod naval_combat;
 pub(crate) mod production;

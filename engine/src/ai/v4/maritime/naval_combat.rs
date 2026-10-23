@@ -25,6 +25,10 @@ use bevy_ecs::prelude::*;
 const KILL_BONUS_PERCENT: u32 = 30;
 /// 港へ戻って修理を受けるHP（100満点）。
 const REPAIR_HP_THRESHOLD: u32 = 30;
+/// 撃てない手番に港へ届くなら補給へ回る、主兵装の残弾。
+const LOW_AMMO: u32 = 2;
+/// 港の近くで補給を待っているとみなす距離。
+const PORT_QUEUE_RADIUS: u32 = 2;
 /// 港までの海路に加えて残しておく燃料。
 const FUEL_MARGIN: u32 = 6;
 
@@ -82,6 +86,9 @@ pub(crate) fn decide_naval_action(
         .iter()
         .filter(|unit| ready.contains(&unit.entity))
     {
+        if naval.should_vacate_port(unit) {
+            continue;
+        }
         if let Some((value, command)) = naval.best_fire(unit)
             && best_fire.as_ref().is_none_or(|(best, _, _)| value > *best)
         {
@@ -296,10 +303,20 @@ impl<'a> NavalBoard<'a> {
     }
 
     /// 補給・修理のため港へ戻るべきか。
-    fn needs_resupply(&self, unit: &BoardUnit, port_distance: Option<u32>) -> bool {
+    ///
+    /// `port_in_reach` は補給先の港へ今手番に入れるか。撃てない手番（この関数は射撃を
+    /// 選ばなかった戦艦だけに呼ばれる）に港へ届くなら、主兵装が尽きる前に補給して、
+    /// 射撃の機会がある手番を補給の往復で失わないようにする。
+    fn needs_resupply(
+        &self,
+        unit: &BoardUnit,
+        port_distance: Option<u32>,
+        port_in_reach: bool,
+    ) -> bool {
         // 主兵装（ammo1: 対艦ミサイル）が地上部隊・艦船を撃てる唯一の兵装である。
         // 副兵装（艦対空ミサイル）が残っていても、主兵装が尽きれば砲撃の役目を果たせない。
-        let out_of_ammo = unit.ammo.is_some_and(|(ammo1, _)| ammo1 == 0);
+        let ammo1 = unit.ammo.map_or(u32::MAX, |(ammo1, _)| ammo1);
+        let out_of_ammo = ammo1 == 0 || (ammo1 <= LOW_AMMO && port_in_reach);
         let low_fuel = match (unit.fuel, port_distance) {
             (Some(fuel), Some(distance)) => fuel <= distance.saturating_add(FUEL_MARGIN),
             _ => false,
@@ -321,37 +338,110 @@ impl<'a> NavalBoard<'a> {
             unit.stats.unit_type,
             &self.board.registry,
         );
-        let free_ports: Vec<_> = self
+        let current = (unit.position.x, unit.position.y);
+        // 持ち場: 揚陸作戦があれば浜の守り（居なければ浜の周り）を射程に捉える支援位置、
+        // なければ次の手番に敵を射程へ捉えられる射撃位置。補給後に戻る先でもあるため、
+        // 弾薬を満載した状態で撃てるかで決める。
+        let mut rearmed = unit.clone();
+        rearmed.ammo = Some((unit.stats.max_ammo1, unit.stats.max_ammo2));
+        let support =
+            if self.supports_landing || super::sealift::assault_tuning().battleship_support {
+                self.beach_support_cells(&rearmed)
+            } else {
+                HashSet::default()
+            };
+        let (station, focus) = if support.is_empty() {
+            (self.firing_cells(&rearmed), None)
+        } else {
+            (support.clone(), Some(&support))
+        };
+        let station_field = sea_distances(self.board, station.iter().copied());
+        // 補給先の港は「今いる位置から港まで」と「港から持ち場まで」の海路の合計が最短の港。
+        // 前線から遠い港へ戻ると、補給後に持ち場へ戻る手番が増える。港そのものが持ち場なら
+        // 補給した次の手番から撃てる。
+        let from_here = sea_distances(self.board, std::iter::once(current));
+        // 補給は1港で1手番1隻しか受けられない。補給を待つ味方の戦艦が多い港は、その分の
+        // 待ち時間（1隻あたり1手番の移動量）を加えて比べ、補給先を港へ分散させる。
+        let movement = unit.stats.max_movement.max(1);
+        let port = self
             .own_ports
             .iter()
             .copied()
             .filter(|port| {
-                *port == (unit.position.x, unit.position.y) || !self.occupancy.contains_key(port)
+                *port == current
+                    || self.occupancy.get(port).is_none_or(|occupant| {
+                        occupant.player_id == self.player_id
+                            && occupant.unit_type == UnitType::Battleship
+                    })
             })
-            .collect();
-        let port_distances = sea_distances(self.board, free_ports.iter().copied());
-        let current = (unit.position.x, unit.position.y);
-        if self.needs_resupply(unit, port_distances.get(&current).copied()) {
-            return self.move_toward(&reachable, &port_distances, unit, true, None);
+            .filter_map(|port| {
+                let there = *from_here.get(&port)?;
+                let back = station_field.get(&port).copied().unwrap_or(0);
+                let queue = self.battleships_waiting_at(unit, port);
+                Some((there + back + queue * movement, port))
+            })
+            .min_by_key(|(round_trip, port)| (*round_trip, *port))
+            .map(|(_, port)| port);
+        let port_distance = port.and_then(|port| from_here.get(&port).copied());
+        let port_in_reach = port.is_some_and(|port| reachable.contains_key(&port));
+        if let Some(port) = port
+            && self.needs_resupply(unit, port_distance, port_in_reach)
+        {
+            let to_port = sea_distances(self.board, std::iter::once(port));
+            return self.move_toward(&reachable, &to_port, unit, true, None);
         }
-        // 揚陸作戦があれば、浜の守り（居なければ浜の周り）を射程に捉える位置へ集める。
-        if self.supports_landing || super::sealift::assault_tuning().battleship_support {
-            let support = self.beach_support_cells(unit);
-            if !support.is_empty() {
-                let approach = sea_distances(self.board, support.iter().copied());
-                return self.move_toward(&reachable, &approach, unit, false, Some(&support));
-            }
-        }
-
-        // 次の手番に敵を射程へ捉えられる海上セルを射撃位置とする。
-        let firing_cells = self.firing_cells(unit);
-        if firing_cells.is_empty() {
+        if station.is_empty() {
             return Some(AiCommand::Wait {
                 target_pos: unit.position,
             });
         }
-        let approach = sea_distances(self.board, firing_cells.iter().copied());
-        self.move_toward(&reachable, &approach, unit, false, None)
+        self.move_toward(&reachable, &station_field, unit, false, focus)
+    }
+
+    /// 港 `port` の上に居るか、近くで補給を待っている（主兵装が少ない）、他の自軍の戦艦の数。
+    fn battleships_waiting_at(&self, unit: &BoardUnit, port: (usize, usize)) -> u32 {
+        self.board
+            .units
+            .iter()
+            .filter(|other| {
+                other.owner == self.player_id
+                    && other.entity != unit.entity
+                    && other.is_deployed()
+                    && is_warship(&other.stats)
+                    && {
+                        let distance = self.board.map.distance(
+                            port.0,
+                            port.1,
+                            other.position.x,
+                            other.position.y,
+                        );
+                        distance == 0
+                            || (distance <= PORT_QUEUE_RADIUS
+                                && other.ammo.is_some_and(|(ammo1, _)| ammo1 <= LOW_AMMO))
+                    }
+            })
+            .count() as u32
+    }
+
+    /// 港の上の戦艦が、補給を待つ味方のために港を空けるべきか。
+    ///
+    /// 補給を終えた戦艦が港の上から撃ち続けると、後続の戦艦が補給できず、待つ間ずっと
+    /// 撃てない。主兵装の尽きた味方が近くに来ていれば、港からは撃たずに持ち場へ移る。
+    fn should_vacate_port(&self, unit: &BoardUnit) -> bool {
+        let here = (unit.position.x, unit.position.y);
+        self.own_ports.contains(&here)
+            && self.board.units.iter().any(|other| {
+                other.owner == self.player_id
+                    && other.entity != unit.entity
+                    && other.is_deployed()
+                    && is_warship(&other.stats)
+                    && other.ammo.is_some_and(|(ammo1, _)| ammo1 == 0)
+                    && self
+                        .board
+                        .map
+                        .distance(here.0, here.1, other.position.x, other.position.y)
+                        <= other.stats.max_movement.saturating_mul(2)
+            })
     }
 
     /// 揚陸作戦の浜を支援する射撃位置。浜の守り（停泊セルの近くの敵地上部隊）を
@@ -648,6 +738,60 @@ mod tests {
             panic!("港へ戻るはず: {command:?}");
         };
         assert_eq!(target_pos, GridPosition { x: 0, y: 0 });
+    }
+
+    #[test]
+    fn battleship_tops_up_ammo_when_it_cannot_fire_and_a_port_is_in_reach() {
+        // 敵は射程外（撃てない手番）。残弾2で港に今手番に届くなら、尽きる前に補給する。
+        let mut world = naval_world(&["P~~~~~~~~~~~~~."]);
+        property(&mut world, 1, 0, 0);
+        let battleship = spawn(&mut world, 1, UnitType::Battleship, 3, 0);
+        world
+            .get_mut::<crate::components::Ammo>(battleship)
+            .unwrap()
+            .ammo1 = 2;
+        spawn(&mut world, 2, UnitType::Tank, 14, 0);
+
+        let (_, command) =
+            decide_naval_action(&mut world, PlayerId(1), &HashSet::default()).unwrap();
+        assert!(
+            matches!(command, AiCommand::Wait { target_pos } if target_pos == GridPosition { x: 0, y: 0 }),
+            "港で補給する: {command:?}"
+        );
+
+        // 残弾が十分なら敵へ寄せる。
+        world
+            .get_mut::<crate::components::Ammo>(battleship)
+            .unwrap()
+            .ammo1 = 3;
+        let (_, command) =
+            decide_naval_action(&mut world, PlayerId(1), &HashSet::default()).unwrap();
+        assert!(
+            matches!(command, AiCommand::Wait { target_pos } if target_pos.x > 3),
+            "敵へ寄せる: {command:?}"
+        );
+    }
+
+    #[test]
+    fn battleship_resupplies_at_the_port_nearest_to_its_firing_station() {
+        // 西の港(0,0)は近いが前線から遠い。東の港(10,0)は少し遠いが、それ自体が戦車を
+        // 射程に捉える射撃位置。往復の短い東の港へ向かう。
+        let mut world = naval_world(&["P~~~~~~~~~P~~~~~."]);
+        property(&mut world, 1, 0, 0);
+        property(&mut world, 1, 10, 0);
+        let battleship = spawn(&mut world, 1, UnitType::Battleship, 4, 0);
+        world
+            .get_mut::<crate::components::Ammo>(battleship)
+            .unwrap()
+            .ammo1 = 0;
+        spawn(&mut world, 2, UnitType::Tank, 16, 0);
+
+        let (_, command) =
+            decide_naval_action(&mut world, PlayerId(1), &HashSet::default()).unwrap();
+        let AiCommand::Wait { target_pos } = command else {
+            panic!("補給へ向かうはず: {command:?}");
+        };
+        assert!(target_pos.x > 4, "東の港へ向かう: {target_pos:?}");
     }
 
     #[test]

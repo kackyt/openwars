@@ -33,6 +33,8 @@ const SURPLUS_PER_EXTRA_BATTLESHIP: u32 = 3;
 const MAX_AIR_COMBAT_UNITS: u32 = 6;
 /// 作戦生産に輸送船の買い足しを許す上限。
 const MAX_LANDERS: u32 = 6;
+/// 余剰資金（輸送船3隻分ごとに1隻）で引き上げる輸送部隊の上限の最大幅。
+const MAX_EXTRA_SEALIFT_TRANSPORTS: u32 = 4;
 /// 同時に保有する輸送部隊（輸送船・輸送ヘリ）の上限。
 const MAX_SEALIFT_TRANSPORTS: u32 = 6;
 
@@ -111,6 +113,7 @@ impl SealiftStatus {
 /// - 地上部隊: 生産施設の陸塊に仕事（未所有拠点・敵）が無く、既に取り残された部隊が
 ///   輸送能力を超えている場合に見送る。占領役以外は輸送船（港）が無い限り陸塊を出られない。
 /// - 輸送船: 既に十分な数を持っていれば見送り、港を戦艦の生産へ回す。
+/// - 戦艦: 揚陸作戦の火力が足りている、または港で回せる補給を超えるなら見送る。
 pub(crate) fn rejects_ground_purchase(
     world: &mut World,
     player_id: PlayerId,
@@ -124,14 +127,31 @@ pub(crate) fn rejects_ground_purchase(
         return false;
     };
     let lander = stats.unit_type == UnitType::Lander;
+    let battleship = stats.unit_type == UnitType::Battleship;
     // 地図が無ければ陸塊を判定できないので見送らない（盤面の無い生産計画の検証など）。
-    if (!lander && matches!(stats.movement_type, MovementType::Air | MovementType::Ship))
+    if (!lander
+        && !battleship
+        && matches!(stats.movement_type, MovementType::Air | MovementType::Ship))
         || !world.contains_resource::<crate::resources::Map>()
     {
         return false;
     }
     let board = PlayerBoard::observe(world, player_id);
     let landmasses = Landmasses::observe(&board, player_id);
+    if battleship {
+        // 戦艦は港でしか補給できない。揚陸作戦の火力が足りている、または港の数で回せる
+        // 補給を超える戦艦は撃てないので見送る（[`super::force_balance`]）。
+        let theater = MaritimeTheater::observe(&board, player_id);
+        let supply_cap = theater.own_ports.len() * super::force_balance::BATTLESHIPS_PER_PORT;
+        let not_needed = super::force_balance::LandingForceBalance::observe(
+            world,
+            &board,
+            &landmasses,
+            player_id,
+        )
+        .is_some_and(|balance| !balance.battleship_needed());
+        return not_needed || theater.own_battleships as usize >= supply_cap;
+    }
     if lander {
         // 港は戦艦と輸送船で取り合う。輸送船が揃った後も買い足すと戦艦を出せない。
         return SealiftStatus::observe(&board, &landmasses, player_id).landers
@@ -181,7 +201,20 @@ pub(crate) fn rejects_ground_purchase(
         };
     }
     if stats.can_capture {
-        stranded >= total_cap
+        // 揚陸作戦で戦闘役（戦車）が要る間は、積載枠の半分を戦闘役のために空けておく。
+        let combat_needed = super::force_balance::LandingForceBalance::observe(
+            world,
+            &board,
+            &landmasses,
+            player_id,
+        )
+        .is_some_and(|balance| balance.ground_combat_needed());
+        let capturer_cap = if combat_needed {
+            (total_cap / 2).max(MIN_STRANDED_BACKLOG)
+        } else {
+            total_cap
+        };
+        stranded >= capturer_cap
     } else if theater.own_ports.is_empty() {
         // 輸送船を持てない盤面では、占領役以外の地上部隊は本拠島から出られない。
         true
@@ -236,47 +269,88 @@ pub(crate) fn decide_supplementary_production(
     let theater = MaritimeTheater::observe(&board, player_id);
 
     let mut wishes = Vec::new();
-    if let Some(transport) = transport_wish(&status, &theater) {
-        wishes.push(transport);
-    }
     // 戦艦が役立つ盤面で資金が大きく余っている場合は、余剰に応じて上限を引き上げる。
     // 使い道の無い資金は戦局に寄与しないため、射程へ捉えられる敵がいる限り艦隊へ回す。
     let surplus_per_battleship = tuned("OPENWARS_BS_SURPLUS", SURPLUS_PER_EXTRA_BATTLESHIP)
         .saturating_mul(cost_of(UnitType::Battleship))
         .max(1);
+    // 戦艦は港でしか補給できない。港の数で回せる補給の量を超えて持っても撃てない。
+    let supply_cap = (theater.own_ports.len() * super::force_balance::BATTLESHIPS_PER_PORT) as u32;
     let battleship_cap = match theater.battleship_cap() {
         0 => 0,
-        cap => cap.saturating_add(spendable / surplus_per_battleship),
+        cap => cap
+            .saturating_add(spendable / surplus_per_battleship)
+            .min(supply_cap),
     };
-    if theater.own_battleships < battleship_cap {
+    // 揚陸作戦があれば、戦艦と戦車の要否を作戦の火力・地上戦力の需給から決める
+    // （[`super::force_balance`]）。無ければ従来どおり盤面の艦船数と余剰資金で決める。
+    let balance =
+        super::force_balance::LandingForceBalance::observe(world, &board, &landmasses, player_id);
+    let battleship_wanted = theater.battleship_cap() > 0
+        && match &balance {
+            Some(balance) => balance.battleship_needed(),
+            None => theater.own_battleships < battleship_cap,
+        };
+    if battleship_wanted {
         wishes.push(UnitType::Battleship);
+    }
+    // 輸送部隊の上限は、戦艦が要らない（補充を終えた）間だけ余剰資金で引き上げる（港の
+    // 生産枠を戦艦と取り合わない）。余った資金を、運べずに溜まった部隊の輸送力へ回す。
+    let surplus_transports = if battleship_wanted {
+        0
+    } else {
+        (spendable / cost_of(UnitType::Lander).saturating_mul(3).max(1))
+            .min(MAX_EXTRA_SEALIFT_TRANSPORTS)
+    };
+    if let Some(transport) = transport_wish(&status, &theater, surplus_transports) {
+        wishes.insert(0, transport);
     }
     if let Some(aircraft) = air_wish(&board, &theater, player_id, spendable, &cost_of) {
         wishes.push(aircraft);
     }
-    // 揚陸作戦の上陸部隊（歩兵だけでは浜の守りを破れない）。輸送船の積載枠に空きがある間だけ。
-    let has_assault = world
-        .get_resource::<super::sealift::AssaultPlans>()
-        .is_some_and(|plans| plans.0.contains_key(&player_id));
-    let landing_tank = match tuned("OPENWARS_ASSAULT_TANKS", 0) {
-        1 => Some(UnitType::MdTank),
-        2 => Some(UnitType::Tank),
-        3 => Some(UnitType::TankZ),
-        _ => None,
-    };
-    // 戦艦（敵の守りを崩す火力）を先に確保する。戦艦の上限に達していなければ、戦艦1隻分を
-    // 残した余りでだけ買う。待機させる地上部隊は合計で輸送船の積載枠まで。
-    let battleship_reserve = if theater.own_battleships < battleship_cap {
-        cost_of(UnitType::Battleship)
-    } else {
-        0
-    };
-    if let Some(tank) = landing_tank
-        && has_assault
-        && status.stranded_capturers + status.stranded_others < status.heavy_slots
-        && spendable >= battleship_reserve.saturating_add(cost_of(tank))
-    {
-        wishes.push(tank);
+    // 戦艦で削り切れない作戦地域の敵を受け止める戦車。運べる分（輸送船の積載枠の空き）だけ、
+    // 戦艦が要る間は戦艦1隻分の資金を残した余りで買う（港が埋まっている手番でも次の
+    // 手番の戦艦を買えるようにする）。
+    if let Some(balance) = &balance {
+        let stranded = status.stranded_capturers + status.stranded_others;
+        let reserve = if battleship_wanted {
+            cost_of(UnitType::Battleship)
+        } else {
+            0
+        };
+        let chart = world
+            .get_resource::<crate::resources::DamageChart>()
+            .cloned()
+            .unwrap_or_default();
+        let tank = (balance.ground_combat_needed() && stranded < status.heavy_slots)
+            .then(|| {
+                balance.best_tank(
+                    &board,
+                    &chart,
+                    &|unit_type| registry.get_stats(unit_type).cloned(),
+                    spendable.saturating_sub(reserve),
+                )
+            })
+            .flatten();
+        if std::env::var("OPENWARS_ASSAULT_TRACE").is_ok() {
+            eprintln!(
+                "FORCE p{} T{turn} zone{} flow{} naval{} ashore{} bs{}/{} need_bs{} need_ground{} slots{}/{} tank{:?} funds{}",
+                player_id.0,
+                balance.zone_enemy,
+                balance.enemy_flow,
+                balance.naval_capacity,
+                balance.ashore,
+                balance.battleships,
+                balance.battleship_limit,
+                battleship_wanted,
+                balance.ground_combat_needed(),
+                stranded,
+                status.heavy_slots,
+                tank,
+                spendable
+            );
+        }
+        wishes.extend(tank);
     }
     let factories: Vec<GridPosition> = board
         .properties
@@ -320,9 +394,14 @@ pub(crate) fn decide_supplementary_production(
 ///
 /// 占領役だけなら速く安い輸送ヘリ（空港）を、戦車など占領役以外が溜まっていれば
 /// 輸送船（港）を選ぶ。
-fn transport_wish(status: &SealiftStatus, theater: &MaritimeTheater) -> Option<UnitType> {
+fn transport_wish(
+    status: &SealiftStatus,
+    theater: &MaritimeTheater,
+    surplus_transports: u32,
+) -> Option<UnitType> {
     if !status.overseas_demand
-        || status.transports() >= tuned("OPENWARS_MAX_SEALIFT", MAX_SEALIFT_TRANSPORTS)
+        || status.transports()
+            >= tuned("OPENWARS_MAX_SEALIFT", MAX_SEALIFT_TRANSPORTS) + surplus_transports
     {
         return None;
     }
@@ -440,11 +519,11 @@ mod tests {
             ..SealiftStatus::default()
         };
         assert_eq!(
-            transport_wish(&status, &theater(true, true)),
+            transport_wish(&status, &theater(true, true), 0),
             Some(UnitType::TransportHelicopter)
         );
         assert_eq!(
-            transport_wish(&status, &theater(true, false)),
+            transport_wish(&status, &theater(true, false), 0),
             Some(UnitType::Lander)
         );
     }
@@ -459,7 +538,7 @@ mod tests {
             ..SealiftStatus::default()
         };
         assert_eq!(
-            transport_wish(&status, &theater(true, true)),
+            transport_wish(&status, &theater(true, true), 0),
             Some(UnitType::Lander)
         );
     }
@@ -472,12 +551,12 @@ mod tests {
             overseas_demand: true,
             ..SealiftStatus::default()
         };
-        assert_eq!(transport_wish(&status, &theater(true, true)), None);
+        assert_eq!(transport_wish(&status, &theater(true, true), 0), None);
         // 待機が積載枠に達したら（地上部隊の買い足しが止まる点）輸送部隊を足す。
         status.stranded_capturers = 2;
-        assert!(transport_wish(&status, &theater(true, true)).is_some());
+        assert!(transport_wish(&status, &theater(true, true), 0).is_some());
         status.stranded_capturers = 5;
         status.overseas_demand = false;
-        assert_eq!(transport_wish(&status, &theater(true, true)), None);
+        assert_eq!(transport_wish(&status, &theater(true, true), 0), None);
     }
 }
