@@ -58,22 +58,23 @@ pub(crate) fn decide_naval_action(
         .and_then(|plans| plans.0.get(&player_id))
         .map(|plan| plan.stops.clone())
         .unwrap_or_default();
-    // 揚陸後は、橋頭堡を起点にした首都攻略DAGの現在の前線（次に確保する拠点）も砲撃で
-    // 支援する。上陸部隊が前進する先の守りを先に削る。
+    // 揚陸後は、橋頭堡を起点にした首都攻略の支援地点（橋頭堡・前線拠点・敵優勢のNode）も
+    // 砲撃で支援する。上陸部隊が戦っている・前進する先の守りを先に削る。
+    let operation_anchors =
+        crate::ai::v4::capital_route::beachhead_support_anchors(world, player_id);
+    // 揚陸作戦（浜の守りの排除）か上陸後の作戦があれば、撃てない戦艦をその支援位置へ集める。
+    let supports_landing = !operation_anchors.is_empty() || !beach.is_empty();
     let mut beach = beach;
-    for island in crate::ai::v4::capital_route::beachhead_route_islands(world, player_id) {
-        if let Some(fronts) =
-            crate::ai::v4::capital_route::node_operation::capital_route_current_fronts(
-                world, player_id, island,
-            )
-        {
-            beach.extend(fronts.into_iter().map(|front| (front.x, front.y)));
-        }
-    }
+    beach.extend(
+        operation_anchors
+            .into_iter()
+            .map(|anchor| (anchor.x, anchor.y)),
+    );
     beach.sort_unstable();
     beach.dedup();
     let mut naval = NavalBoard::new(&board, &chart, &occupancy, player_id, cargo_costs);
     naval.beach = beach;
+    naval.supports_landing = supports_landing;
 
     let mut best_fire: Option<(u32, Entity, AiCommand)> = None;
     for unit in board
@@ -144,6 +145,8 @@ struct NavalBoard<'a> {
     cargo_costs: HashMap<Entity, u32>,
     /// 揚陸作戦の浜の停泊セル。
     beach: Vec<(usize, usize)>,
+    /// 上陸後の作戦（橋頭堡を起点にした首都攻略）を支援中か。撃てない戦艦を支援位置へ集める。
+    supports_landing: bool,
 }
 
 impl<'a> NavalBoard<'a> {
@@ -177,6 +180,7 @@ impl<'a> NavalBoard<'a> {
             own_ports,
             cargo_costs,
             beach: Vec::new(),
+            supports_landing: false,
         }
     }
 
@@ -331,7 +335,7 @@ impl<'a> NavalBoard<'a> {
             return self.move_toward(&reachable, &port_distances, unit, true, None);
         }
         // 揚陸作戦があれば、浜の守り（居なければ浜の周り）を射程に捉える位置へ集める。
-        if super::sealift::assault_tuning().battleship_support {
+        if self.supports_landing || super::sealift::assault_tuning().battleship_support {
             let support = self.beach_support_cells(unit);
             if !support.is_empty() {
                 let approach = sea_distances(self.board, support.iter().copied());

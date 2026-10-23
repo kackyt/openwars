@@ -127,6 +127,26 @@ impl SealiftContext {
         }
         let landmass = self.assault_landmass()?;
         let sites = self.landing_sites(landmass);
+        if std::env::var("OPENWARS_ASSAULT_TRACE").is_ok() {
+            for site in &sites {
+                eprintln!(
+                    "SITE p{} T{turn} first{:?} n{} free{}/{} drop{} route{:?}/{} counter{} reinf{} fr{} value{} score{}",
+                    self.player_id.0,
+                    site.stops.first(),
+                    site.stops.len(),
+                    site.free_stops,
+                    site.free_drop_cells,
+                    site.drop_cells.len(),
+                    site.route_steps,
+                    site.route_properties,
+                    site.counterattack,
+                    site.reinforcement,
+                    site.friendly,
+                    site.value(),
+                    site.score()
+                );
+            }
+        }
         let (site, since_turn) = self.choose_landing_site(&sites, previous, turn)?;
         // 1手番に降ろせるのは停泊セルの数の輸送船まで。積荷の強い輸送船から数える。
         let mut wave: Vec<i64> = self
@@ -147,8 +167,9 @@ impl SealiftContext {
                 || site.friendly * 100 >= tuning.ratio_percent * defense
                 || (wave.len() >= tuning.min_wave
                     && (power * 100 >= tuning.ratio_percent * defense
-                        || waited >= tuning.max_wait
-                        || wave.len() >= site.free_stops)));
+                        // 待ちが長い・浜が満杯でも、守りの半分に届かない上陸はしない。
+                        || (power * 2 >= defense
+                            && (waited >= tuning.max_wait || wave.len() >= site.free_stops)))));
         if std::env::var("OPENWARS_ASSAULT_TRACE").is_ok() {
             eprintln!(
                 "ASSAULT p{} T{turn} land{landmass} stops{:?} free{} route{:?}/{} counter{} reinf{} fr{} score{} wave{} power{} waited{} launch{launch}",
@@ -229,11 +250,12 @@ impl SealiftContext {
 
     /// 揚陸先の浜を選ぶ。選んだ浜と、その浜で集結を始めた手番を返す。
     ///
-    /// 1. 上陸済みの浜（首都攻略DAGの起点に接する浜）が上陸できるなら、それを使い続ける。
-    ///    塞がれていれば、上陸できる浜のうち橋頭堡に最も近い浜で増援を送る。
-    /// 2. まだ上陸していなければ、上陸できる浜のうち評価（得られるもの÷反撃の危険）が
-    ///    最も良い浜を選ぶ。前の手番の浜は、明らかに良い浜が無い限り変えない。
-    /// 3. 上陸できる浜が無ければ、評価が最も良い浜で待つ（出撃はしない）。
+    /// 敵に塞がれた浜も候補に残す。塞いでいる敵の戦力は反撃の見込みとして評価に入り、
+    /// 戦艦が浜の守りとして優先して撃つ。降車セルが空くまで出撃しない（`plan_assault`）。
+    ///
+    /// 1. 上陸済みの浜（首都攻略DAGの起点に接する浜）を使い続ける。
+    /// 2. まだ上陸していなければ、評価（得られるもの÷反撃の危険）が最も良い浜を選ぶ。
+    ///    前の手番の浜は、明らかに良い浜が無い限り変えない。
     fn choose_landing_site<'a>(
         &self,
         sites: &'a [LandingSite],
@@ -247,19 +269,9 @@ impl SealiftContext {
                 .filter(|previous| site.stops.iter().any(|stop| previous.stops.contains(stop)))
                 .map_or(turn, |previous| previous.since_turn)
         };
-        let feasible: Vec<&LandingSite> = sites.iter().filter(|site| site.feasible()).collect();
-        let best = feasible
-            .iter()
-            .copied()
-            .max_by_key(|site| (site.score(), std::cmp::Reverse(site.stops.clone())));
         // 1. 橋頭堡（首都攻略DAGの起点）。
-        let beachhead_origin = self.beachhead_origins.first().copied();
-        if let Some(origin) = beachhead_origin {
-            let at_origin = |site: &&LandingSite| site.drop_cells.contains(&origin);
-            if let Some(site) = feasible.iter().copied().find(at_origin) {
-                return Some((site, continuing(site)));
-            }
-            let nearest = feasible.iter().copied().min_by_key(|site| {
+        if let Some(origin) = self.beachhead_origins.first().copied() {
+            let site = sites.iter().min_by_key(|site| {
                 let distance = site
                     .drop_cells
                     .iter()
@@ -267,34 +279,27 @@ impl SealiftContext {
                     .min()
                     .unwrap_or(u32::MAX);
                 (distance, site.stops.clone())
-            });
-            if let Some(site) = nearest {
-                return Some((site, continuing(site)));
-            }
-        }
-        // 2. 前の手番の浜を続けるか、より良い浜へ移る。
-        if let Some(best) = best {
-            let kept = previous.and_then(|previous| {
-                feasible
-                    .iter()
-                    .copied()
-                    .find(|site| site.stops.iter().any(|stop| previous.stops.contains(stop)))
-            });
-            let site = match kept {
-                Some(kept)
-                    if (tuning.keep_beachhead && kept.friendly > 0)
-                        || best.score() * 100 <= kept.score() * tuning.switch_percent =>
-                {
-                    kept
-                }
-                _ => best,
-            };
+            })?;
             return Some((site, continuing(site)));
         }
-        // 3. 上陸できる浜が無い。
-        let site = sites
+        // 2. 前の手番の浜を続けるか、より良い浜へ移る。
+        let best = sites
             .iter()
             .max_by_key(|site| (site.score(), std::cmp::Reverse(site.stops.clone())))?;
+        let kept = previous.and_then(|previous| {
+            sites
+                .iter()
+                .find(|site| site.stops.iter().any(|stop| previous.stops.contains(stop)))
+        });
+        let site = match kept {
+            Some(kept)
+                if (tuning.keep_beachhead && kept.friendly > 0)
+                    || best.score() * 100 <= kept.score() * tuning.switch_percent =>
+            {
+                kept
+            }
+            _ => best,
+        };
         Some((site, continuing(site)))
     }
 

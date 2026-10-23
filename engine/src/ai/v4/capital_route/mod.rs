@@ -134,3 +134,48 @@ pub(crate) fn beachhead_route_islands(
         })
         .unwrap_or_default()
 }
+
+/// 橋頭堡を起点にした首都攻略の、艦砲で支援すべき地点。
+///
+/// - 起点（橋頭堡）
+/// - 各進軍路の前線拠点（次に確保する拠点）
+/// - 前提が解放済みで、敵が局地優勢な（Contested）Nodeのanchor
+///
+/// 戦艦はこれらの周りの敵を優先して撃ち、撃てない戦艦はこれらを射程に捉える位置へ移る。
+pub(crate) fn beachhead_support_anchors(
+    world: &bevy_ecs::prelude::World,
+    player_id: crate::components::PlayerId,
+) -> Vec<crate::components::GridPosition> {
+    let mut anchors = Vec::new();
+    let Some(registry) = world.get_resource::<model::CapitalRouteTopologyRegistry>() else {
+        return anchors;
+    };
+    for (key, topology) in registry
+        .topologies
+        .iter()
+        .filter(|(key, topology)| key.player_id == player_id && topology.beachhead)
+    {
+        anchors.push(topology.nodes[topology.start_node.0].anchor);
+        if let Some(fronts) =
+            node_operation::capital_route_current_fronts(world, player_id, key.island_id)
+        {
+            anchors.extend(fronts);
+        }
+        if let Some(operations) = world.get_resource::<model::CapitalRouteNodeOperationRegistry>() {
+            anchors.extend(
+                operations
+                    .operations
+                    .values()
+                    .filter(|operation| {
+                        operation.id.topology == *key
+                            && operation.state
+                                == crate::ai::v4::victory_roadmap::RoadmapNodeState::Contested
+                    })
+                    .map(|operation| operation.anchor),
+            );
+        }
+    }
+    anchors.sort_unstable_by_key(|position| (position.y, position.x));
+    anchors.dedup();
+    anchors
+}

@@ -264,9 +264,17 @@ pub(crate) fn decide_supplementary_production(
         3 => Some(UnitType::TankZ),
         _ => None,
     };
+    // 戦艦（敵の守りを崩す火力）を先に確保する。戦艦の上限に達していなければ、戦艦1隻分を
+    // 残した余りでだけ買う。待機させる地上部隊は合計で輸送船の積載枠まで。
+    let battleship_reserve = if theater.own_battleships < battleship_cap {
+        cost_of(UnitType::Battleship)
+    } else {
+        0
+    };
     if let Some(tank) = landing_tank
         && has_assault
-        && status.stranded_others < status.heavy_slots
+        && status.stranded_capturers + status.stranded_others < status.heavy_slots
+        && spendable >= battleship_reserve.saturating_add(cost_of(tank))
     {
         wishes.push(tank);
     }
