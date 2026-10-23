@@ -382,8 +382,13 @@ pub(crate) fn decide_supplementary_production(
     // 輸送船で運ぶ歩兵を装甲車へ載せると、輸送船の1枠で2体を運べる。装甲車に載って
     // いない取り残された歩兵の数まで、装甲車を買い足す（歩兵1体につき装甲車1台）。
     // 本拠島で待つ装甲車は輸送船の積載枠の半分まで（残りの枠は戦車などの重戦闘部隊に使う）。
+    // 輸送船の積載枠が足りている（待機が枠に収まる）間は、装甲車の分だけ歩兵の到着が遅れるので
+    // 買わない。
+    let slots_short =
+        status.stranded_capturers + status.stranded_others >= status.heavy_slots.max(1);
     if status.overseas_demand
         && status.landers > 0
+        && slots_short
         && status.loose_capturers > status.empty_carriers
         && status.empty_carriers + status.loaded_carriers < carrier_cap
     {
