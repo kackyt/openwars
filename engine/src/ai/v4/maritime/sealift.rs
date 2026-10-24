@@ -1731,6 +1731,34 @@ mod tests {
     }
 
     #[test]
+    fn assault_prefers_the_beach_where_more_landers_can_unload() {
+        // 右の島(x=5..9)の中央に敵首都(7,1)。西は浅瀬1か所(4,1)、東は浅瀬3か所(x=10)。
+        // 首都までの距離と守りは同じなので、1手番に多く降ろせる東の浜を選ぶ。
+        let mut world = naval_world(&[
+            "H.~~~.....,~~",
+            "..~~,..H..,~~",
+            "~~~~~.....,~~",
+            "~~~~~~~~~~~~~",
+        ]);
+        property(&mut world, 1, 0, 0);
+        property(&mut world, 2, 7, 1);
+        for y in 0..3 {
+            let lander = spawn(&mut world, 1, UnitType::Lander, 2, 2 + y / 2);
+            load(&mut world, lander, UnitType::TankZ, 1);
+        }
+        spawn(&mut world, 2, UnitType::Infantry, 7, 1);
+
+        decide(&mut world);
+        let plan = &world.resource::<AssaultPlans>().0[&PlayerId(1)];
+        assert!(plan.stops.contains(&(10, 1)), "東の浜: {:?}", plan.stops);
+        assert!(
+            !plan.stops.contains(&(4, 1)),
+            "西の1か所の浜は選ばない: {:?}",
+            plan.stops
+        );
+    }
+
+    #[test]
     fn assault_lands_on_every_comparable_beach_of_the_island() {
         // 右の島(x=5..9)の中央に敵首都(7,0)。西の浅瀬(x=4)と東の浅瀬(x=10)は首都から同じ
         // 距離で評価が並ぶので、作戦の停泊セルに両方の浜を含めて同時に降ろす。

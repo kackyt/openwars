@@ -71,6 +71,8 @@ pub(crate) struct LandingSite {
     pub(crate) naval_support: i64,
     /// 次の敵手番に降車セルを攻撃できる敵地上部隊（浜の守り）。
     pub(crate) defenders: Vec<Entity>,
+    /// 自軍の輸送船の数（1手番に降ろせる量の上限）。
+    pub(crate) landers: usize,
 }
 
 impl LandingSite {
@@ -92,10 +94,20 @@ impl LandingSite {
         i64::from(self.route_properties) * ROUTE_PROPERTY_VALUE + capital
     }
 
-    /// 得られるもの ÷ 反撃の危険（上陸済みの味方の分だけ危険を下げる）。
+    /// 1手番に降ろせる輸送船の数（停泊セルの数と自軍の輸送船の数の小さい方、最低1）。
+    ///
+    /// 停泊セルが1つの浜は1手番に輸送船1隻（2体）しか降ろせない。上陸後の戦力の積み上げの
+    /// 速さは、この数に比例する。敵に塞がれた停泊セルも、戦艦が守りを撃てば空くので数える。
+    pub(crate) fn capacity(&self) -> i64 {
+        self.stops.len().min(self.landers).max(1) as i64
+    }
+
+    /// 得られるもの × 1手番に降ろせる輸送船の数 ÷ 反撃の危険（上陸済みの味方の分だけ危険を
+    /// 下げる）。停泊セルの少ない浜は、降車セルが少ない分だけ守りも少なく見えるので、降ろせる
+    /// 量で割り引かないと、1か所しかない浜が選ばれ、輸送船がその沖で順番を待つ。
     pub(crate) fn score(&self) -> i64 {
         let risk = (self.threat() - self.friendly).max(0) + RISK_FLOOR;
-        self.value() * 1_000 / risk
+        self.value() * 1_000 * self.capacity() / risk
     }
 }
 
@@ -233,6 +245,17 @@ impl SealiftContext {
             .map(|unit| (unit.position.x, unit.position.y))
             .collect();
 
+        let landers = self
+            .board
+            .units
+            .iter()
+            .filter(|unit| {
+                unit.owner == self.player_id
+                    && unit.is_deployed()
+                    && unit.stats.unit_type == UnitType::Lander
+            })
+            .count();
+
         groups
             .into_iter()
             .map(|stops| {
@@ -362,6 +385,7 @@ impl SealiftContext {
                     friendly,
                     naval_support,
                     defenders: defender_units.iter().map(|unit| unit.entity).collect(),
+                    landers,
                 }
             })
             .collect()
