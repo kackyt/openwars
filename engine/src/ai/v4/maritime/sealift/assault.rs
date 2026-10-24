@@ -156,13 +156,31 @@ impl SealiftContext {
         // 主な浜のほか、上陸できて評価が主な浜の ALSO_LAND_PERCENT 以上ある浜にも同時に降ろす。
         // 1つの浜の少ない停泊セルだけに降ろすと、輸送船がその沖に固まって順番を待ち、
         // 揚陸の量が停泊セルの数で頭打ちになる。
+        let also_percent: i64 = std::env::var("OPENWARS_ALSO_PERCENT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(ALSO_LAND_PERCENT);
+        let also_radius: u32 = std::env::var("OPENWARS_ALSO_RADIUS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(u32::MAX);
+        let map = &self.board.map;
+        let near_primary = |other: &LandingSite| {
+            other.stops.iter().any(|stop| {
+                primary
+                    .stops
+                    .iter()
+                    .any(|own| map.distance(stop.0, stop.1, own.0, own.1) <= also_radius)
+            })
+        };
         let mut stops: Vec<Cell> = sites
             .iter()
             .filter(|other| {
                 other.stops == primary.stops
                     || (other.feasible()
                         && std::env::var("OPENWARS_ONE_BEACH").is_err()
-                        && other.score() * 100 >= primary.score() * ALSO_LAND_PERCENT)
+                        && near_primary(other)
+                        && other.score() * 100 >= primary.score() * also_percent)
             })
             .flat_map(|other| other.stops.iter().copied())
             .collect();
