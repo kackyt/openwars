@@ -50,6 +50,8 @@ use std::rc::Rc;
 const CAPTURE_SLOT_VALUE: i64 = 3000;
 /// 揚陸先の評価で、戦闘役1体が敵の残る陸塊へ加わる価値。
 const COMBAT_SLOT_VALUE: i64 = 2500;
+/// 重戦闘部隊を敵首都の陸塊へ運ぶ価値の、他の陸塊への倍率。
+const CAPITAL_HEAVY_WEIGHT: i64 = 3;
 /// 敵首都のある陸塊へ占領役を届ける上乗せ。
 const ENEMY_CAPITAL_BONUS: i64 = 2000;
 /// 護衛の無い占領役を降ろすとき、敵の地上部隊を数える降車セルからの距離。
@@ -621,7 +623,12 @@ impl SealiftContext {
             let loaded = self.cargo.get(&transport.entity).map_or(0, Vec::len);
             let boardable = self.boardable_here(transport, &stranded);
             let has_room = (loaded as u32) < transport.stats.max_cargo;
-            if has_room && boardable {
+            // 次の敵手番に沈められる場所では乗船を待たない（敵の戦艦が港の沖に居座ると、
+            // 乗船を待つ輸送船と積荷がまとめて沈む）。
+            let safe_here = threat
+                .damage_hp(transport, (transport.position.x, transport.position.y))
+                < transport.health.unwrap_or(100).max(1);
+            if has_room && boardable && safe_here {
                 // 2/3. 今手番に乗れる部隊が居るので、その場で乗船を待つ。
                 return Some((
                     transport.entity,
@@ -811,6 +818,15 @@ impl SealiftContext {
         }
         if info.enemy_capital && capturers > 0 {
             value += ENEMY_CAPITAL_BONUS;
+        }
+        // 重戦闘部隊は敵首都の陸塊（決戦の場）へ優先して運ぶ。周辺の島の争奪には歩兵・
+        // 装甲車を送り続け、重戦闘部隊を揚陸作戦の波にまとめる。
+        if info.enemy_capital {
+            let heavy = cargo
+                .iter()
+                .filter(|item| !item.carries_capturer() && item.stats.cost >= HEAVY_COMBAT_COST)
+                .count() as i64;
+            value += heavy * COMBAT_SLOT_VALUE * (CAPITAL_HEAVY_WEIGHT - 1);
         }
         (value > 0).then_some(value)
     }
@@ -1079,6 +1095,23 @@ impl SealiftContext {
     /// 積荷を載せた輸送部隊を、最も価値の高い陸塊の揚陸地点へ進める。
     fn sail_to_destination(&self, transport: &BoardUnit, threat: &ThreatMap) -> Option<AiCommand> {
         let (landmass, mut cells) = self.destination(transport)?;
+        if std::env::var("OPENWARS_SEALIFT_DEBUG").is_ok() {
+            let mut sample: Vec<_> = cells.iter().copied().collect();
+            sample.sort_unstable();
+            sample.truncate(4);
+            eprintln!(
+                "DEST lander({},{}) landmass{landmass} cargo{:?} cells{:?} assault{:?}",
+                transport.position.x,
+                transport.position.y,
+                self.cargo
+                    .get(&transport.entity)
+                    .map(|c| c.iter().map(|i| i.stats.unit_type).collect::<Vec<_>>()),
+                sample,
+                self.assault
+                    .as_ref()
+                    .map(|plan| (plan.landmass, plan.launch))
+            );
+        }
         // 揚陸作戦の陸塊へは、出撃までは集結海域で待ち、出撃したら作戦の浜へ向かう。
         if let Some(assault_cells) = self.assault_destination(transport, landmass) {
             cells = assault_cells;
@@ -1569,14 +1602,16 @@ mod tests {
 
     #[test]
     fn single_lander_waits_offshore_until_the_wave_can_beat_the_beach_guard() {
-        // 浜（浅瀬x=6）の隣に敵の戦車。歩兵2体の輸送船1隻では守りに届かないので降ろさない。
-        let mut world = naval_world(&["H.~~~~,C.."]);
+        // 浜（浅瀬x=6, y=0..1の2か所）の近くに敵の戦車。歩兵2体の輸送船1隻は、守りに届く
+        // 波（2隻目）がそろうまで降ろさない。
+        let mut world = naval_world(&["H.~~~~,C..", "..~~~~,..."]);
         property(&mut world, 1, 0, 0);
         property(&mut world, 0, 7, 0);
         let lander = spawn(&mut world, 1, UnitType::Lander, 3, 0);
         load(&mut world, lander, UnitType::Infantry, 1);
         load(&mut world, lander, UnitType::Infantry, 1);
         spawn(&mut world, 2, UnitType::Tank, 8, 0);
+        spawn(&mut world, 2, UnitType::Tank, 8, 1);
 
         let (entity, command) = decide(&mut world).unwrap();
         assert_eq!(entity, lander);
@@ -1586,6 +1621,52 @@ mod tests {
         );
         let plans = world.resource::<AssaultPlans>();
         assert!(!plans.0[&PlayerId(1)].launch);
+    }
+
+    #[test]
+    fn single_berth_beach_launches_with_one_lander() {
+        // 浜は浅瀬(x=6)の1か所だけ。輸送船1隻で波がそろうので、軽い守りなら降ろす。
+        let mut world = naval_world(&["H.~~~~,C.."]);
+        property(&mut world, 1, 0, 0);
+        property(&mut world, 0, 7, 0);
+        let lander = spawn(&mut world, 1, UnitType::Lander, 3, 0);
+        load(&mut world, lander, UnitType::TankZ, 1);
+        spawn(&mut world, 2, UnitType::Infantry, 9, 0);
+
+        let (_, command) = decide(&mut world).unwrap();
+        assert!(
+            matches!(command, AiCommand::Drop { transport_target_pos, .. } if transport_target_pos.x == 6),
+            "浜へ降ろす: {command:?}"
+        );
+        assert!(world.resource::<AssaultPlans>().0[&PlayerId(1)].launch);
+    }
+
+    #[test]
+    fn heavy_tank_heads_for_the_enemy_capital_island() {
+        // 近くの島(x=5..6)には敵の歩兵1体、遠くの島(x=13..15)に敵首都(14,0)。重戦車は
+        // 敵首都の島へ向かう。
+        let mut world = naval_world(&["H.~~,..~~~~~,.H.", "..~~~..~~~~~~...", "~~~~~~~~~~~~~~~~"]);
+        property(&mut world, 1, 0, 0);
+        property(&mut world, 2, 14, 0);
+        spawn(&mut world, 2, UnitType::Infantry, 6, 0);
+        spawn(&mut world, 2, UnitType::Infantry, 14, 1);
+        let lander = spawn(&mut world, 1, UnitType::Lander, 2, 1);
+        load(&mut world, lander, UnitType::TankZ, 1);
+
+        let board = PlayerBoard::observe(&mut world, PlayerId(1));
+        let context = SealiftContext::observe(&mut world, PlayerId(1), &HashSet::default());
+        let transport = board
+            .units
+            .iter()
+            .find(|unit| unit.entity == lander)
+            .unwrap();
+        let (landmass, _) = context.destination(transport).unwrap();
+        let capital_island = context
+            .landmasses
+            .land
+            .at(GridPosition { x: 14, y: 0 })
+            .unwrap();
+        assert_eq!(landmass, capital_island);
     }
 
     #[test]

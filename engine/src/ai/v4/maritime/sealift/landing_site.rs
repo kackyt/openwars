@@ -19,8 +19,9 @@ use crate::ai::v4::capital_route::topology::armored_step_distances;
 use crate::ai::v4::maritime::landmass::is_ground;
 use crate::collections::{HashMap, HashSet};
 use crate::components::GridPosition;
-use crate::resources::{MovementType, Terrain};
+use crate::resources::{MovementType, Terrain, UnitType};
 use crate::systems::movement::{calculate_reachable_tile_costs, get_valid_movement_cost};
+use bevy_ecs::prelude::*;
 
 /// 停泊セルを同じ浜にまとめる距離。
 const BEACH_LINK_DISTANCE: u32 = 3;
@@ -38,6 +39,8 @@ const REINFORCEMENT_VALUE: i64 = 7_000;
 const RISK_FLOOR: i64 = 10_000;
 /// 上陸済みの味方を数える、降車セルからの距離。
 const FRIENDLY_RADIUS: u32 = 3;
+/// 戦艦1隻の1射撃で削れる、浜の守り1体の戦力の割合（%）。
+const NAVAL_SHOT_PERCENT: i64 = 65;
 
 /// 1つの揚陸先（浜）の評価。
 #[derive(Debug, Clone)]
@@ -62,6 +65,10 @@ pub(crate) struct LandingSite {
     pub(crate) route_properties: u32,
     /// 降車セルの近くに上陸済みの味方地上戦力。
     pub(crate) friendly: i64,
+    /// 降車セルを射程に収める自軍の戦艦が、1手番に削れる浜の守りの見込み。
+    pub(crate) naval_support: i64,
+    /// 次の敵手番に降車セルを攻撃できる敵地上部隊（浜の守り）。
+    pub(crate) defenders: Vec<Entity>,
 }
 
 impl LandingSite {
@@ -210,13 +217,55 @@ impl SealiftContext {
                     .iter()
                     .filter(|cell| !enemy_occupied.contains(&(cell.x, cell.y)))
                     .count();
+                if std::env::var("OPENWARS_ASSAULT_TRACE").is_ok() {
+                    let cells: Vec<String> = drop_cells
+                        .iter()
+                        .map(|cell| {
+                            let who = self
+                                .board
+                                .units
+                                .iter()
+                                .find(|unit| unit.is_deployed() && unit.position == *cell)
+                                .map(|unit| format!("{:?}p{}", unit.stats.unit_type, unit.owner.0))
+                                .unwrap_or_default();
+                            format!("({},{}){who}", cell.x, cell.y)
+                        })
+                        .collect();
+                    eprintln!("DROPCELLS {:?} {}", stops.first(), cells.join(" "));
+                }
                 // 降車セルへ攻撃できる敵（同じ敵を浜ごとに1回だけ数える）。
-                let counterattack = enemy_ground
+                let defender_units: Vec<&BoardUnit> = enemy_ground
                     .iter()
                     .zip(&strike_cells)
                     .filter(|(_, cells)| drop_cells.iter().any(|cell| cells.contains(cell)))
-                    .map(|(unit, _)| strength(unit))
-                    .sum();
+                    .map(|(unit, _)| *unit)
+                    .collect();
+                let defenders: Vec<i64> =
+                    defender_units.iter().map(|unit| strength(unit)).collect();
+                let counterattack: i64 = defenders.iter().sum();
+                // 降車セルを今の位置から撃てる、主兵装の残る自軍の戦艦。1隻が1手番に守り1体の
+                // 一部を削るとみなし、守りの数で頭打ちにする。
+                let supporting = self
+                    .board
+                    .units
+                    .iter()
+                    .filter(|unit| {
+                        unit.owner == self.player_id
+                            && unit.is_deployed()
+                            && unit.stats.unit_type == UnitType::Battleship
+                            && unit.ammo.is_some_and(|(main, _)| main > 0)
+                            && drop_cells.iter().any(|cell| {
+                                let distance =
+                                    map.distance(cell.x, cell.y, unit.position.x, unit.position.y);
+                                (unit.stats.min_range..=unit.stats.max_range).contains(&distance)
+                            })
+                    })
+                    .count()
+                    .min(defenders.len()) as i64;
+                let naval_support = match defenders.len() as i64 {
+                    0 => 0,
+                    count => supporting * counterattack / count * NAVAL_SHOT_PERCENT / 100,
+                };
                 let reinforcement = enemy_production
                     .iter()
                     .filter(|site| {
@@ -270,6 +319,8 @@ impl SealiftContext {
                     route_steps,
                     route_properties,
                     friendly,
+                    naval_support,
+                    defenders: defender_units.iter().map(|unit| unit.entity).collect(),
                 }
             })
             .collect()

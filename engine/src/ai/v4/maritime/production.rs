@@ -169,12 +169,15 @@ pub(crate) fn rejects_ground_purchase(
             player_id,
         )
         .is_some_and(|balance| !balance.battleship_needed());
-        return not_needed || theater.own_battleships as usize >= supply_cap;
+        return (not_needed && !theater.sea_contested())
+            || theater.own_battleships as usize >= supply_cap;
     }
     if lander {
         // 港は戦艦と輸送船で取り合う。輸送船が揃った後も買い足すと戦艦を出せない。
-        return SealiftStatus::observe(&board, &landmasses, player_id).landers
-            >= tuned("OPENWARS_MAX_LANDERS", MAX_LANDERS);
+        // 制海権を失っている間は、港の沖の敵の戦艦に沈められるので買わない。
+        return MaritimeTheater::observe(&board, player_id).sea_contested()
+            || SealiftStatus::observe(&board, &landmasses, player_id).landers
+                >= tuned("OPENWARS_MAX_LANDERS", MAX_LANDERS);
     }
     let site = GridPosition {
         x: command.target_x,
@@ -193,6 +196,11 @@ pub(crate) fn rejects_ground_purchase(
     }
     let status = SealiftStatus::observe(&board, &landmasses, player_id);
     let theater = MaritimeTheater::observe(&board, player_id);
+    // 制海権を失っている間は、運べない陸塊の地上部隊を買わない。輸送船は港の沖の敵の戦艦に
+    // 沈められ、溜めた部隊は運べない。資金を戦艦へ回して制海権を取り戻す。
+    if theater.sea_contested() {
+        return true;
+    }
     // 揚陸作戦の間は、浜を確保する戦闘部隊を運ぶ分だけ買う。
     let assault_active = world
         .get_resource::<super::sealift::AssaultPlans>()
@@ -307,11 +315,13 @@ pub(crate) fn decide_supplementary_production(
     // （[`super::force_balance`]）。無ければ従来どおり盤面の艦船数と余剰資金で決める。
     let balance =
         super::force_balance::LandingForceBalance::observe(world, &board, &landmasses, player_id);
+    // 制海権を失っている間は、揚陸作戦の需給に関わらず敵の戦艦に並ぶまで補う。
     let battleship_wanted = theater.battleship_cap() > 0
-        && match &balance {
-            Some(balance) => balance.battleship_needed(),
-            None => theater.own_battleships < battleship_cap,
-        };
+        && ((theater.sea_contested() && theater.own_battleships < supply_cap)
+            || match &balance {
+                Some(balance) => balance.battleship_needed(),
+                None => theater.own_battleships < battleship_cap,
+            });
     if battleship_wanted {
         wishes.push(UnitType::Battleship);
     }
@@ -323,7 +333,10 @@ pub(crate) fn decide_supplementary_production(
         (spendable / cost_of(UnitType::Lander).saturating_mul(3).max(1))
             .min(MAX_EXTRA_SEALIFT_TRANSPORTS)
     };
-    if let Some(transport) = transport_wish(&status, &theater, surplus_transports) {
+    // 制海権を失っている間は、輸送船は港の沖で沈められるので買い足さない。
+    if !theater.sea_contested()
+        && let Some(transport) = transport_wish(&status, &theater, surplus_transports)
+    {
         wishes.insert(0, transport);
     }
     if let Some(aircraft) = air_wish(&board, &theater, player_id, spendable, &cost_of) {

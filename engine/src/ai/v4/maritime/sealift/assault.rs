@@ -19,10 +19,13 @@ use crate::ai::v4::maritime::theater::sea_distances;
 use crate::collections::{HashMap, HashSet};
 use crate::components::{GridPosition, PlayerId};
 use crate::resources::MovementType;
+use crate::systems::combat::get_expected_damage;
 use bevy_ecs::prelude::*;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
+/// 浜へ降ろした1体を、次の敵手番に同時に攻撃できる敵の数の見込み。
+const ATTACKERS_PER_LANDED_UNIT: usize = 3;
 /// 乗船地点の選択で航行手番数を見積もる、輸送船の移動力。
 const LANDER_MOVEMENT: u32 = 5;
 
@@ -147,30 +150,37 @@ impl SealiftContext {
         }
         let (site, since_turn) = self.choose_landing_site(&sites, previous, turn)?;
         // 1手番に降ろせるのは停泊セルの数の輸送船まで。積荷の強い輸送船から数える。
-        let mut wave: Vec<i64> = self
+        let mut wave: Vec<(i64, &BoardUnit)> = self
             .assault_wave(landmass, &site.stops)
             .into_iter()
-            .map(|transport| self.cargo_strength(transport))
+            .map(|transport| (self.cargo_strength(transport), transport))
             .collect();
-        wave.sort_unstable_by(|a, b| b.cmp(a));
+        wave.sort_unstable_by_key(|(value, _)| std::cmp::Reverse(*value));
         wave.truncate(site.free_stops);
-        let power: i64 = wave.iter().sum::<i64>() + site.friendly;
+        // 上陸戦力は、降ろす積荷・上陸済みの味方・浜を撃てる戦艦の削り量の和。
+        let power: i64 =
+            wave.iter().map(|(value, _)| value).sum::<i64>() + site.friendly + site.naval_support;
         let waited = turn.saturating_sub(since_turn);
-        // 浜の守りは、次の敵手番に降車セルを攻撃できる敵と近くの敵生産拠点からの増援。
-        let defense = site.threat();
+        // 浜の守りは、降ろした波が次の敵手番に受ける損害の見込み（[`Self::landing_exposure`]）。
+        let landed: Vec<&BoardUnit> = wave
+            .iter()
+            .flat_map(|(_, transport)| self.droppable_cargo(transport))
+            .collect();
+        let defense = self.landing_exposure(site, &landed);
         let defended = defense > site.friendly;
         let launch = !wave.is_empty()
             && site.feasible()
             && (!defended
                 || site.friendly * 100 >= tuning.ratio_percent * defense
-                || (wave.len() >= tuning.min_wave
+                // 停泊セルが少ない浜では、波の最少数を停泊セルの数で頭打ちにする。
+                || (wave.len() >= tuning.min_wave.min(site.free_stops)
                     && (power * 100 >= tuning.ratio_percent * defense
-                        // 待ちが長い・浜が満杯でも、守りの半分に届かない上陸はしない。
+                        // 待ちが長い・浜が満杯なら、損害の見込みが上陸戦力の2倍に届かない限り出撃する。
                         || (power * 2 >= defense
                             && (waited >= tuning.max_wait || wave.len() >= site.free_stops)))));
         if std::env::var("OPENWARS_ASSAULT_TRACE").is_ok() {
             eprintln!(
-                "ASSAULT p{} T{turn} land{landmass} stops{:?} free{} route{:?}/{} counter{} reinf{} fr{} score{} wave{} power{} waited{} launch{launch}",
+                "ASSAULT p{} T{turn} land{landmass} stops{:?} free{} route{:?}/{} counter{} reinf{} fr{} naval{} score{} wave{} power{} waited{} launch{launch}",
                 self.player_id.0,
                 site.stops,
                 site.free_stops,
@@ -179,6 +189,7 @@ impl SealiftContext {
                 site.counterattack,
                 site.reinforcement,
                 site.friendly,
+                site.naval_support,
                 site.score(),
                 wave.len(),
                 power,
@@ -194,6 +205,76 @@ impl SealiftContext {
             since_turn: if launch { turn } else { since_turn },
             launch,
         })
+    }
+
+    /// 輸送船が今手番に降ろせる積荷の部隊。
+    fn droppable_cargo<'a>(&'a self, transport: &BoardUnit) -> Vec<&'a BoardUnit> {
+        self.cargo
+            .get(&transport.entity)
+            .into_iter()
+            .flatten()
+            .filter(|item| item.can_drop)
+            .filter_map(|item| {
+                self.board
+                    .units
+                    .iter()
+                    .find(|unit| unit.entity == item.entity)
+            })
+            .collect()
+    }
+
+    /// 浜へ降ろした部隊 `landed` が、次の敵手番に受ける損害の見込み（資金換算）。
+    ///
+    /// 出撃の判断は、この損害の見込みを上陸戦力と比べる。浜の守りの各部隊は、降ろした部隊のうち最も大きな損害（生産費×損害率）を
+    /// 与えられる部隊を攻撃するとみなす。1体を同時に攻撃できるのは [`ATTACKERS_PER_LANDED_UNIT`] 体
+    /// までとし、損害の大きい守りから数える。生産費で比べると、重戦車にほとんど傷を
+    /// 付けられない歩兵の群れを強い守りと見なしてしまう。近くの敵生産拠点からの増援の
+    /// 見込みを足す。まだ降ろす部隊が無ければ、守りの戦力（生産費×HP）で見積もる。
+    fn landing_exposure(&self, site: &LandingSite, landed: &[&BoardUnit]) -> i64 {
+        if landed.is_empty() {
+            return site.threat();
+        }
+        // 降車セルの地形効果は、最も守りの薄いセルで数える（控えめな見積もり）。
+        let terrain_defense = site
+            .drop_cells
+            .iter()
+            .filter_map(|cell| self.board.map.get_terrain(cell.x, cell.y))
+            .map(|terrain| self.board.registry.get_terrain_defense_bonus(terrain))
+            .min()
+            .unwrap_or(0);
+        let mut blows: Vec<i64> = site
+            .defenders
+            .iter()
+            .filter_map(|entity| self.board.units.iter().find(|unit| unit.entity == *entity))
+            .map(|defender| {
+                landed
+                    .iter()
+                    .map(|target| {
+                        let damage = get_expected_damage(
+                            &defender.stats,
+                            defender.health.unwrap_or(100),
+                            defender
+                                .ammo
+                                .unwrap_or((defender.stats.max_ammo1, defender.stats.max_ammo2)),
+                            &target.stats,
+                            terrain_defense,
+                            defender.stats.min_range.max(1),
+                            &self.board.registry,
+                            &self.chart,
+                            false,
+                        )
+                        .min(target.health.unwrap_or(100));
+                        i64::from(target.stats.cost) * i64::from(damage) / 100
+                    })
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect();
+        blows.sort_unstable_by(|a, b| b.cmp(a));
+        blows.truncate(landed.len() * ATTACKERS_PER_LANDED_UNIT);
+        // 波の戦力を超える損害は数えない（全滅以上の損害は無い）。
+        let wave_value: i64 = landed.iter().map(|unit| strength(unit)).sum();
+        blows.iter().sum::<i64>().min(wave_value) + site.reinforcement
     }
 
     /// 輸送船が今手番に降ろせる積荷の戦力。
