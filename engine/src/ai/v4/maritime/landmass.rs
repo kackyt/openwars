@@ -134,8 +134,8 @@ impl Landmasses {
 
     /// 自軍の地上部隊が今の陸塊で仕事を持たないか。
     ///
-    /// 占領役は未所有拠点も敵部隊も無い陸塊で、戦闘役は戦闘役を送り込む価値の無い陸塊
-    /// （敵部隊も敵拠点も無い、または少数の敵が上陸しただけの本拠）で取り残されている。
+    /// 占領役は未所有拠点も敵部隊も無い陸塊で、戦闘役は敵部隊も敵拠点も無い陸塊で
+    /// 取り残されている。
     pub(crate) fn is_stranded(&self, unit: &BoardUnit) -> bool {
         if !is_ground(unit) || !unit.is_deployed() {
             return false;
@@ -146,7 +146,7 @@ impl Landmasses {
         if unit.stats.can_capture {
             info.unowned.is_empty() && info.enemy_ground == 0
         } else {
-            !info.wants_combat()
+            !info.needs_combat()
         }
     }
 }
