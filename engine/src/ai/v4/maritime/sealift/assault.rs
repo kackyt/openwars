@@ -24,6 +24,8 @@ use bevy_ecs::prelude::*;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
+/// 主な浜と同時に降ろす浜の、評価の下限（主な浜の評価に対する%）。
+const ALSO_LAND_PERCENT: i64 = 25;
 /// 浜へ降ろした1体を、次の敵手番に同時に攻撃できる敵の数の見込み。
 const ATTACKERS_PER_LANDED_UNIT: usize = 3;
 /// 乗船地点の選択で航行手番数を見積もる、輸送船の移動力。
@@ -97,8 +99,10 @@ pub(crate) struct AssaultPlans(pub(crate) HashMap<PlayerId, AssaultPlan>);
 pub(crate) struct AssaultPlan {
     /// 上陸先の陸塊。
     pub(crate) landmass: u32,
-    /// 浜の停泊セル（輸送船が止まって降ろすセル）。
+    /// 上陸に使う全ての浜の停泊セル（輸送船が止まって降ろすセル）。
     pub(crate) stops: Vec<Cell>,
+    /// 主な浜（評価で選んだ浜）の停泊セル。次の手番の浜の選択はこの浜を引き継ぐ。
+    primary: Vec<Cell>,
     /// 浜を起点にした島内の首都攻略DAGの起点（降車セルのうち敵首都へ最も近いセル）。
     pub(crate) origin: Option<GridPosition>,
     /// この判断をした手番。
@@ -148,15 +152,42 @@ impl SealiftContext {
                 );
             }
         }
-        let (site, since_turn) = self.choose_landing_site(&sites, previous, turn)?;
+        let (primary, since_turn) = self.choose_landing_site(&sites, previous, turn)?;
+        // 主な浜のほか、上陸できて評価が主な浜の ALSO_LAND_PERCENT 以上ある浜にも同時に降ろす。
+        // 1つの浜の少ない停泊セルだけに降ろすと、輸送船がその沖に固まって順番を待ち、
+        // 揚陸の量が停泊セルの数で頭打ちになる。
+        let mut stops: Vec<Cell> = sites
+            .iter()
+            .filter(|other| {
+                other.stops == primary.stops
+                    || (other.feasible()
+                        && other.score() * 100 >= primary.score() * ALSO_LAND_PERCENT)
+            })
+            .flat_map(|other| other.stops.iter().copied())
+            .collect();
+        stops.sort_unstable();
+        stops.dedup();
+        // 出撃の判断は主な浜の守りで行い、出撃した波は同時に降ろす全ての浜の停泊セルへ降ろす。
+        let site = primary;
+        let enemy_occupied: HashSet<Cell> = self
+            .board
+            .units
+            .iter()
+            .filter(|unit| unit.owner != self.player_id && unit.is_deployed())
+            .map(|unit| (unit.position.x, unit.position.y))
+            .collect();
+        let free_stops = stops
+            .iter()
+            .filter(|stop| !enemy_occupied.contains(stop))
+            .count();
         // 1手番に降ろせるのは停泊セルの数の輸送船まで。積荷の強い輸送船から数える。
         let mut wave: Vec<(i64, &BoardUnit)> = self
-            .assault_wave(landmass, &site.stops)
+            .assault_wave(landmass, &stops)
             .into_iter()
             .map(|transport| (self.cargo_strength(transport), transport))
             .collect();
         wave.sort_unstable_by_key(|(value, _)| std::cmp::Reverse(*value));
-        wave.truncate(site.free_stops);
+        wave.truncate(free_stops);
         // 上陸戦力は、降ろす積荷・上陸済みの味方・浜を撃てる戦艦の削り量の和。
         let power: i64 =
             wave.iter().map(|(value, _)| value).sum::<i64>() + site.friendly + site.naval_support;
@@ -187,9 +218,10 @@ impl SealiftContext {
         let launch = !wave.is_empty() && site.feasible() && (by_strength || by_exposure);
         if std::env::var("OPENWARS_ASSAULT_TRACE").is_ok() {
             eprintln!(
-                "ASSAULT p{} T{turn} land{landmass} stops{:?} free{} route{:?}/{} counter{} reinf{} fr{} naval{} score{} wave{} power{} waited{} launch{launch}",
+                "ASSAULT p{} T{turn} land{landmass} stops{:?} also{} free{} route{:?}/{} counter{} reinf{} fr{} naval{} score{} wave{} power{} waited{} launch{launch}",
                 self.player_id.0,
                 site.stops,
+                stops.len(),
                 site.free_stops,
                 site.route_steps,
                 site.route_properties,
@@ -205,8 +237,9 @@ impl SealiftContext {
         }
         Some(AssaultPlan {
             landmass,
-            stops: site.stops.clone(),
-            origin: site.origin,
+            stops,
+            primary: primary.stops.clone(),
+            origin: primary.origin,
             decided_turn: turn,
             // 出撃したら、次の波の集結はこの手番から数え直す。
             since_turn: if launch { turn } else { since_turn },
@@ -352,7 +385,11 @@ impl SealiftContext {
         let map = &self.board.map;
         let continuing = |site: &LandingSite| {
             previous
-                .filter(|previous| site.stops.iter().any(|stop| previous.stops.contains(stop)))
+                .filter(|previous| {
+                    site.stops
+                        .iter()
+                        .any(|stop| previous.primary.contains(stop))
+                })
                 .map_or(turn, |previous| previous.since_turn)
         };
         // 1. 橋頭堡（首都攻略DAGの起点）。
@@ -376,11 +413,13 @@ impl SealiftContext {
         let kept = previous.and_then(|previous| {
             sites
                 .iter()
-                .find(|site| site.stops == previous.stops)
+                .find(|site| site.stops == previous.primary)
                 .or_else(|| {
-                    sites
-                        .iter()
-                        .find(|site| site.stops.iter().any(|stop| previous.stops.contains(stop)))
+                    sites.iter().find(|site| {
+                        site.stops
+                            .iter()
+                            .any(|stop| previous.primary.contains(stop))
+                    })
                 })
         });
         let site = match kept {

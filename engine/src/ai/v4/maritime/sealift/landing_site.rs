@@ -177,7 +177,18 @@ impl SealiftContext {
         let mut groups = split;
         groups.sort_unstable();
         groups.dedup();
+        self.evaluate_beaches(landmass, groups)
+    }
 
+    /// 停泊セルの組（浜）ごとの揚陸先の評価。複数の浜を合わせた停泊セルの組も評価できる。
+    pub(super) fn evaluate_beaches(
+        &self,
+        landmass: u32,
+        groups: Vec<Vec<Cell>>,
+    ) -> Vec<LandingSite> {
+        let map = &self.board.map;
+        let registry = &self.board.registry;
+        let on_landmass = |cell: GridPosition| self.landmasses.land.at(cell) == Some(landmass);
         let enemy_capital = self
             .board
             .properties

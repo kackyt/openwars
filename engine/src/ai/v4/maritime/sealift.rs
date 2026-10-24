@@ -193,6 +193,8 @@ pub(crate) fn is_sealift_transport(stats: &UnitStats) -> bool {
     ) && stats.max_cargo > 0
 }
 
+/// 少数の敵が上陸した本拠に守りとして残す戦力の、敵の上陸部隊の戦力に対する比（%）。
+const HOME_GARRISON_PERCENT: i64 = 200;
 /// 1枠あたりの戦力が大きく、揚陸作戦で先に運ぶ重戦闘部隊の価格の下限
 /// （中戦車・重戦車・重自走砲。軽戦車・ロケット砲などは含まない）。
 const HEAVY_COMBAT_COST: u32 = 15000;
@@ -436,10 +438,63 @@ impl SealiftContext {
         let mut units: Vec<_> = self
             .own_units()
             .filter(|unit| self.landmasses.is_stranded(unit) && !paired.contains(&unit.entity))
+            .chain(self.home_surplus())
             .collect();
         let combat_first = self.assault.is_some() && assault_tuning().combat_first;
         units.sort_by_key(|unit| (loading_rank(unit, combat_first), unit.entity));
         units
+    }
+
+    /// 少数の敵が上陸した本拠（自軍の首都の陸塊）で、守りに要らない戦闘役。
+    ///
+    /// 敵の上陸部隊が居る本拠の戦闘役は取り残されていないが、全員を本拠に留めると輸送する
+    /// 部隊が尽きる。敵の上陸部隊の戦力の [`HOME_GARRISON_PERCENT`] を守りとして残し
+    /// （敵に近い部隊から）、残りを輸送を待つ部隊として扱う。
+    fn home_surplus(&self) -> Vec<&BoardUnit> {
+        let Some((home, info)) = self
+            .landmasses
+            .info
+            .iter()
+            .find(|(_, info)| info.own_capital && info.enemy_ground > 0)
+            .map(|(home, info)| (*home, info))
+        else {
+            return Vec::new();
+        };
+        let map = &self.board.map;
+        let on_home = |unit: &BoardUnit| self.landmasses.land.at(unit.position) == Some(home);
+        let enemies: Vec<GridPosition> = self
+            .board
+            .units
+            .iter()
+            .filter(|unit| unit.owner != self.player_id && unit.is_deployed() && on_home(unit))
+            .map(|unit| unit.position)
+            .collect();
+        let distance_to_enemy = |unit: &BoardUnit| {
+            enemies
+                .iter()
+                .map(|enemy| map.distance(enemy.x, enemy.y, unit.position.x, unit.position.y))
+                .min()
+                .unwrap_or(u32::MAX)
+        };
+        let mut combat: Vec<&BoardUnit> = self
+            .own_units()
+            .filter(|unit| {
+                is_ground(unit)
+                    && !unit.stats.can_capture
+                    && !is_ground_carrier(unit)
+                    && on_home(unit)
+            })
+            .collect();
+        combat.sort_by_key(|unit| (distance_to_enemy(unit), unit.entity));
+        let mut garrison = info.enemy_strength * HOME_GARRISON_PERCENT / 100;
+        combat
+            .into_iter()
+            .skip_while(|unit| {
+                let keep = garrison > 0;
+                garrison -= landing_site_strength(unit);
+                keep
+            })
+            .collect()
     }
 
     /// 取り残された陸塊で、空の装甲車と、それに相乗りする占領役の組。
