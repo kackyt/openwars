@@ -20,7 +20,11 @@ use crate::collections::{HashMap, HashSet};
 use crate::components::{GridPosition, PlayerId};
 use crate::resources::MovementType;
 use bevy_ecs::prelude::*;
+use std::rc::Rc;
 use std::sync::OnceLock;
+
+/// 乗船地点の選択で航行手番数を見積もる、輸送船の移動力。
+const LANDER_MOVEMENT: u32 = 5;
 
 /// 揚陸作戦の調整値。
 #[derive(Debug, Clone)]
@@ -39,10 +43,6 @@ pub(crate) struct AssaultTuning {
     pub(crate) switch_percent: i64,
     /// 戦艦が浜の守りを撃つときの、損害価値の上乗せ（%）。
     pub(crate) beach_fire_bonus_percent: u32,
-    /// 乗船地点を浜に近い港・浅瀬へ絞るか。
-    pub(crate) embark: bool,
-    /// 乗船地点の、浜への海路距離の最小からの許容幅。
-    pub(crate) embark_slack: u32,
     /// 味方が上陸済みの浜（橋頭堡）を、他の浜の評価に関わらず続けて使うか。
     pub(crate) keep_beachhead: bool,
     /// 撃てない戦艦を浜の支援位置へ集めるか。
@@ -69,8 +69,6 @@ impl AssaultTuning {
             defense_radius: read("OPENWARS_ASSAULT_DEFENSE_RADIUS", 3),
             switch_percent: read("OPENWARS_ASSAULT_SWITCH", 150),
             beach_fire_bonus_percent: read("OPENWARS_ASSAULT_FIRE_BONUS", 100),
-            embark: read("OPENWARS_ASSAULT_EMBARK", 0u32) != 0,
-            embark_slack: read("OPENWARS_ASSAULT_EMBARK_SLACK", 2),
             keep_beachhead: read("OPENWARS_ASSAULT_KEEP_BEACHHEAD", 0u32) != 0,
             battleship_support: read("OPENWARS_ASSAULT_BS_SUPPORT", 0u32) != 0,
             combat_first: read("OPENWARS_ASSAULT_COMBAT_FIRST", 1u32) != 0,
@@ -336,32 +334,22 @@ impl SealiftContext {
         })
     }
 
-    /// 乗船地点（港・浅瀬）を、揚陸作戦の浜へ海路で近いものに絞る。
+    /// 乗船地点 `cell` から揚陸作戦の浜までの、輸送船の航行手番数。作戦が無ければ0。
     ///
-    /// 取り残された部隊が島の端々の乗船地点へ散ると、輸送船は近くの数体だけを拾って
-    /// 往復し、遠くの部隊（戦車・自走砲など）は運ばれない。浜へ近い乗船地点に集める。
-    pub(super) fn embark_cells(&self, cells: Vec<Cell>) -> Vec<Cell> {
-        let tuning = tuning();
-        let Some(plan) = self.assault.as_ref().filter(|_| tuning.embark) else {
-            return cells;
+    /// 取り残された部隊の乗船地点は、陸路の手番数とこの航行手番数の和で選ぶ。浜へ海路で
+    /// 近い乗船地点でも、部隊が歩いて何手番もかかるなら、近くの港・浅瀬から乗る方が早い。
+    pub(super) fn sail_turns(&self, cell: Cell) -> u32 {
+        let Some(plan) = self.assault.as_ref() else {
+            return 0;
         };
-        let field = sea_distances(&self.board, plan.stops.iter().copied());
-        let Some(nearest) = cells
-            .iter()
-            .filter_map(|cell| field.get(cell))
-            .min()
-            .copied()
-        else {
-            return cells;
-        };
-        cells
-            .into_iter()
-            .filter(|cell| {
-                field
-                    .get(cell)
-                    .is_some_and(|distance| *distance <= nearest + tuning.embark_slack)
-            })
-            .collect()
+        let field = self
+            .sail_cache
+            .borrow_mut()
+            .get_or_insert_with(|| Rc::new(sea_distances(&self.board, plan.stops.iter().copied())))
+            .clone();
+        field
+            .get(&cell)
+            .map_or(0, |distance| distance.div_ceil(LANDER_MOVEMENT))
     }
 
     /// 揚陸作戦の陸塊へ向かう輸送船の目的地。出撃前は集結海域、出撃後は浜の停泊セル。

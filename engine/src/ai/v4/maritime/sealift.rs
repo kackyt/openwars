@@ -56,6 +56,8 @@ const ENEMY_CAPITAL_BONUS: i64 = 2000;
 const DROP_DANGER_RADIUS: u32 = 2;
 /// 揚陸地点を、積荷の目標からこの距離以内に絞る。
 const LANDING_TARGET_RADIUS: u32 = 3;
+/// 輸送船が乗船セルへ来るまでの手番数を見積もる、輸送船の移動力。
+const LANDER_PICKUP_MOVEMENT: u32 = 5;
 /// 燃料の残りがこの手番数分の消費を下回る前に補給へ戻る。
 const FUEL_RESERVE_TURNS: u32 = 2;
 
@@ -244,6 +246,8 @@ fn has_active_transport(world: &mut World, player_id: PlayerId, skip: &HashSet<E
 type Cell = (usize, usize);
 /// unitの到達可能セルと最小移動コスト。
 type ReachableCells = Rc<BTreeMap<Cell, u32>>;
+/// 陸路の移動コストの場（セル → コスト）。
+type LandCosts = Rc<HashMap<Cell, u32>>;
 /// 揚陸地点の優先順のキー（大きいほど良い）: 輸送部隊が撃沈されない、揚陸の価値、
 /// 降車セルの近くの敵の少なさ、積荷の目標への近さ、輸送部隊の被弾の少なさ、座標。
 type DropKey = (
@@ -290,6 +294,15 @@ struct SealiftContext {
     own_ports: Vec<(usize, usize)>,
     reachable_cache: RefCell<HashMap<Entity, ReachableCells>>,
     boarding_cache: RefCell<HashMap<u32, Rc<Vec<Cell>>>>,
+    /// 揚陸作戦の浜からの海路距離（[`assault`] の航行手番数の見積もり）。
+    sail_cache: RefCell<Option<Rc<HashMap<Cell, u32>>>>,
+    /// unitの現在地から陸路で各セルへ移動するコスト（占有は無視する）。
+    walk_cache: RefCell<HashMap<Entity, LandCosts>>,
+    /// 陸塊・移動タイプごとの、各セルから乗船して浜へ着くまでのコスト（陸路の移動コスト
+    /// と、航行手番数を移動力で換算したコストの和）。
+    gather_cache: RefCell<HashMap<(u32, MovementType, u32), LandCosts>>,
+    /// 自軍の輸送船から各セルまでの海路距離。
+    lander_cache: RefCell<Option<LandCosts>>,
     /// この手番の揚陸作戦（敵の守る陸塊への一斉上陸）。
     assault: Option<assault::AssaultPlan>,
     /// 橋頭堡を起点にした首都攻略DAGの起点。揚陸部隊はこの浜へ届け続ける。
@@ -377,6 +390,10 @@ impl SealiftContext {
             assault: None,
             beachhead_origins: Vec::new(),
             boarding_cache: RefCell::default(),
+            sail_cache: RefCell::default(),
+            walk_cache: RefCell::default(),
+            gather_cache: RefCell::default(),
+            lander_cache: RefCell::default(),
         }
     }
 
@@ -526,6 +543,8 @@ impl SealiftContext {
                 continue;
             }
             let current = (rider.position.x, rider.position.y);
+            // 装甲車から陸路で数えたコスト（海を挟んだ装甲車を近いと見なさない）。
+            let carrier_costs = self.walk_costs(carrier);
             // 生産施設を塞がない → 装甲車に近い → 現在地に留まる。
             let Some(cell) = self
                 .reachable(rider)
@@ -535,7 +554,7 @@ impl SealiftContext {
                 .min_by_key(|cell| {
                     (
                         self.production_sites.contains(cell),
-                        map.distance(cell.0, cell.1, carrier.position.x, carrier.position.y),
+                        carrier_costs.get(cell).copied().unwrap_or(u32::MAX),
                         *cell != current,
                         *cell,
                     )
@@ -1184,7 +1203,10 @@ impl SealiftContext {
                 if !boardable {
                     continue;
                 }
-                let walk = map.distance(unit.position.x, unit.position.y, cell.0, cell.1);
+                // 陸路の移動コストで数える（海を挟んだ乗船セルを近いと見なさない）。
+                let Some(walk) = self.walk_to(unit, cell) else {
+                    continue;
+                };
                 let turns = walk.div_ceil(unit.stats.max_movement.max(1));
                 cells
                     .entry(cell)
@@ -1195,7 +1217,7 @@ impl SealiftContext {
         cells
     }
 
-    /// 空の輸送部隊を、取り残された部隊を最も早く拾える乗船セルへ向かわせる。
+    /// 空の輸送部隊を、取り残された部隊を拾って浜へ最も早く届けられる乗船セルへ向かわせる。
     fn go_to_pickup(
         &self,
         transport: &BoardUnit,
@@ -1215,7 +1237,8 @@ impl SealiftContext {
             let Some(distance) = own_field(*cell) else {
                 continue;
             };
-            let turns = distance.div_ceil(movement).max(*walk_turns);
+            // 乗せた後に浜まで航行する手番数も足す（浜から遠い乗船セルで待たない）。
+            let turns = distance.div_ceil(movement).max(*walk_turns) + self.sail_turns(*cell);
             let blocks_production = self.production_sites.contains(cell);
             let key = (turns, blocks_production, *cell);
             if best.is_none_or(|best| key < best) {
@@ -1266,6 +1289,9 @@ impl SealiftContext {
     }
 
     /// まだ乗れない取り残された部隊を、輸送部隊の乗船セルの近くへ寄せる。
+    ///
+    /// 乗船セルは、陸路で歩く手番数と、そこから浜まで輸送船で航行する手番数の和が最も
+    /// 小さいものを選ぶ（[`Self::gather_costs`]）。
     fn gather(&self, unit: &BoardUnit, transports: &[&BoardUnit]) -> Option<AiCommand> {
         let carriers: Vec<&BoardUnit> = transports
             .iter()
@@ -1288,29 +1314,27 @@ impl SealiftContext {
         {
             return self.leave_production_site(unit);
         }
-        let map = &self.board.map;
         let landmass = self.landmasses.land.at(unit.position)?;
         let boarding = self.boarding_cells(landmass);
         if boarding.is_empty() {
             return self.leave_production_site(unit);
         }
+        let costs = self.gather_costs(unit, landmass);
         let current = (unit.position.x, unit.position.y);
-        // 乗船セルの隣で待つ。乗船セル（港）そのものや生産施設は塞がない。
-        // 優先順: 生産施設を塞がない → 乗船セルに近い → 現在地に留まる。
+        // 乗船セルの隣で待つ。乗船セル（港・浅瀬）そのものや生産施設は塞がない。
+        // 優先順: 生産施設を塞がない → 陸路で乗船セルへ歩き浜へ着くまでが早い → 現在地に
+        // 留まる。直線距離で寄せると、海を挟んだ乗船セルへ向かって海岸で止まってしまう。
         let cell = self
             .reachable(unit)
             .keys()
             .copied()
-            .filter(|cell| self.is_free_for(unit, *cell))
+            .filter(|cell| {
+                self.is_free_for(unit, *cell) && (*cell == current || !boarding.contains(cell))
+            })
             .min_by_key(|cell| {
-                let distance = boarding
-                    .iter()
-                    .map(|target| map.distance(cell.0, cell.1, target.0, target.1))
-                    .min()
-                    .unwrap_or(0);
                 (
                     self.production_sites.contains(cell),
-                    distance.max(1),
+                    costs.get(cell).copied().unwrap_or(u32::MAX),
                     *cell != current,
                     *cell,
                 )
@@ -1321,6 +1345,118 @@ impl SealiftContext {
                 y: cell.1,
             },
         })
+    }
+
+    /// 起点（セルと初期コスト）から、移動タイプ `movement_type` の陸路の移動コストで数えた
+    /// 各セルへの最小コスト。占有は無視する（味方は通り抜けられ、敵は動く）。
+    fn land_costs(
+        &self,
+        seeds: impl IntoIterator<Item = (Cell, u32)>,
+        movement_type: MovementType,
+    ) -> HashMap<Cell, u32> {
+        let map = &self.board.map;
+        let mut costs: HashMap<Cell, u32> = HashMap::default();
+        let mut heap = std::collections::BinaryHeap::new();
+        for (cell, cost) in seeds {
+            if costs.get(&cell).is_none_or(|known| cost < *known) {
+                costs.insert(cell, cost);
+                heap.push(Reverse((cost, cell)));
+            }
+        }
+        while let Some(Reverse((cost, cell))) = heap.pop() {
+            if costs.get(&cell).is_some_and(|known| *known < cost) {
+                continue;
+            }
+            for next in map.get_adjacent(cell.0, cell.1) {
+                let Some(step) = map.get_terrain(next.0, next.1).and_then(|terrain| {
+                    get_valid_movement_cost(&self.board.registry, movement_type, terrain)
+                }) else {
+                    continue;
+                };
+                let total = cost + step;
+                if costs.get(&next).is_none_or(|known| total < *known) {
+                    costs.insert(next, total);
+                    heap.push(Reverse((total, next)));
+                }
+            }
+        }
+        costs
+    }
+
+    /// unitの現在地から陸路で各セルへ移動するコスト。同じ判断の中では1unitにつき1回だけ求める。
+    fn walk_costs(&self, unit: &BoardUnit) -> LandCosts {
+        if let Some(cached) = self.walk_cache.borrow().get(&unit.entity) {
+            return Rc::clone(cached);
+        }
+        let costs = Rc::new(self.land_costs(
+            [((unit.position.x, unit.position.y), 0)],
+            unit.stats.movement_type,
+        ));
+        self.walk_cache
+            .borrow_mut()
+            .insert(unit.entity, Rc::clone(&costs));
+        costs
+    }
+
+    /// unitが陸路で乗船セル `cell` へ入るコスト。浅瀬は地上部隊が進めないので、隣の陸の
+    /// セルまでのコストに、輸送船へ乗り込む1歩を足す。
+    fn walk_to(&self, unit: &BoardUnit, cell: Cell) -> Option<u32> {
+        let costs = self.walk_costs(unit);
+        costs.get(&cell).copied().or_else(|| {
+            self.board
+                .map
+                .get_adjacent(cell.0, cell.1)
+                .into_iter()
+                .filter_map(|next| costs.get(&next))
+                .min()
+                .map(|cost| cost + 1)
+        })
+    }
+
+    /// 自軍の輸送船から各セルまでの海路距離（最も近い輸送船から）。同じ判断の中で1回だけ求める。
+    fn lander_arrival(&self) -> LandCosts {
+        if let Some(cached) = self.lander_cache.borrow().as_ref() {
+            return Rc::clone(cached);
+        }
+        let landers: Vec<Cell> = self
+            .own_units()
+            .filter(|unit| {
+                is_sealift_transport(&unit.stats) && unit.stats.movement_type == MovementType::Ship
+            })
+            .map(|unit| (unit.position.x, unit.position.y))
+            .collect();
+        let field = Rc::new(sea_distances(&self.board, landers));
+        *self.lander_cache.borrow_mut() = Some(Rc::clone(&field));
+        field
+    }
+
+    /// 陸塊 `landmass` の各セルから、陸路で乗船セルへ歩き、輸送船で揚陸作戦の浜へ着くまでの
+    /// コスト。輸送船が乗船セルへ来るまでの手番数と、浜までの航行手番数は、unitの移動力で
+    /// 陸路のコストへ換算する（1手番の航行 = 1手番の行軍）。
+    fn gather_costs(&self, unit: &BoardUnit, landmass: u32) -> LandCosts {
+        let movement = unit.stats.max_movement.max(1);
+        let key = (landmass, unit.stats.movement_type, movement);
+        if let Some(cached) = self.gather_cache.borrow().get(&key) {
+            return Rc::clone(cached);
+        }
+        // 輸送船が乗船セルへ来るまでの手番数も足す。輸送船の来ない端の乗船セルで待つと、
+        // 近くに乗船セルがあっても運ばれない。
+        let pickup = self.lander_arrival();
+        let seeds: Vec<(Cell, u32)> = self
+            .boarding_cells(landmass)
+            .iter()
+            .map(|cell| {
+                let arrival = pickup
+                    .get(cell)
+                    .map_or(0, |distance| distance.div_ceil(LANDER_PICKUP_MOVEMENT));
+                (*cell, (self.sail_turns(*cell) + arrival) * movement)
+            })
+            .collect();
+        let costs = Rc::new(self.land_costs(seeds, unit.stats.movement_type));
+        self.gather_cache
+            .borrow_mut()
+            .insert(key, Rc::clone(&costs));
+        costs
     }
 
     /// 陸塊 `landmass` の部隊が輸送船へ乗り込める港・浅瀬。同じ判断の中で陸塊ごとに1回だけ求める。
@@ -1346,7 +1482,7 @@ impl SealiftContext {
                 }
             }
         }
-        let cells = Rc::new(self.embark_cells(cells));
+        let cells = Rc::new(cells);
         self.boarding_cache
             .borrow_mut()
             .insert(landmass, Rc::clone(&cells));
@@ -1574,6 +1710,25 @@ mod tests {
         assert!(
             matches!(command, AiCommand::Drop { cargo_entity, .. } if cargo_entity == recon),
             "装甲車を降ろす: {command:?}"
+        );
+    }
+
+    #[test]
+    fn stranded_unit_walks_around_an_inlet_to_the_boarding_shoal() {
+        // 乗船できる浅瀬(3,0)は入り江の向こう側。直線距離では(0,0)が最も近いが、
+        // 陸路で回り込んで浅瀬へ近づく。
+        let mut world = naval_world(&[".~~,~~~C", ".~~...~~", "......~~"]);
+        property(&mut world, 0, 7, 0);
+        let infantry = spawn(&mut world, 1, UnitType::Infantry, 0, 0);
+        let lander = spawn(&mut world, 1, UnitType::Lander, 4, 0);
+        world.entity_mut(lander).insert(ActionCompleted(true));
+        world.entity_mut(lander).insert(HasMoved(true));
+
+        let (entity, command) = decide(&mut world).unwrap();
+        assert_eq!(entity, infantry);
+        assert!(
+            matches!(command, AiCommand::Wait { target_pos } if target_pos == GridPosition { x: 1, y: 2 }),
+            "入り江を回り込む: {command:?}"
         );
     }
 
