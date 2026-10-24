@@ -451,9 +451,6 @@ impl SealiftContext {
     /// 部隊が尽きる。敵の上陸部隊の戦力の [`HOME_GARRISON_PERCENT`] を守りとして残し
     /// （敵に近い部隊から）、残りを輸送を待つ部隊として扱う。
     fn home_surplus(&self) -> Vec<&BoardUnit> {
-        if std::env::var("OPENWARS_NO_SURPLUS").is_ok() {
-            return Vec::new();
-        }
         let Some((home, info)) = self
             .landmasses
             .info
@@ -1731,6 +1728,23 @@ mod tests {
             .at(GridPosition { x: 14, y: 0 })
             .unwrap();
         assert_eq!(landmass, capital_island);
+    }
+
+    #[test]
+    fn assault_lands_on_every_comparable_beach_of_the_island() {
+        // 右の島(x=5..9)の中央に敵首都(7,0)。西の浅瀬(x=4)と東の浅瀬(x=10)は首都から同じ
+        // 距離で評価が並ぶので、作戦の停泊セルに両方の浜を含めて同時に降ろす。
+        let mut world = naval_world(&["H.~~,..H..,~~", "~~~~~~~~~~~~~"]);
+        property(&mut world, 1, 0, 0);
+        property(&mut world, 2, 7, 0);
+        let lander = spawn(&mut world, 1, UnitType::Lander, 2, 1);
+        load(&mut world, lander, UnitType::TankZ, 1);
+        spawn(&mut world, 2, UnitType::Infantry, 7, 0);
+
+        decide(&mut world);
+        let plan = &world.resource::<AssaultPlans>().0[&PlayerId(1)];
+        assert!(plan.stops.contains(&(4, 0)), "西の浜: {:?}", plan.stops);
+        assert!(plan.stops.contains(&(10, 0)), "東の浜: {:?}", plan.stops);
     }
 
     #[test]
