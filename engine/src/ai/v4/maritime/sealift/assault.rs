@@ -161,6 +161,7 @@ impl SealiftContext {
             .filter(|other| {
                 other.stops == primary.stops
                     || (other.feasible()
+                        && std::env::var("OPENWARS_ONE_BEACH").is_err()
                         && other.score() * 100 >= primary.score() * ALSO_LAND_PERCENT)
             })
             .flat_map(|other| other.stops.iter().copied())

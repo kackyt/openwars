@@ -451,6 +451,9 @@ impl SealiftContext {
     /// 部隊が尽きる。敵の上陸部隊の戦力の [`HOME_GARRISON_PERCENT`] を守りとして残し
     /// （敵に近い部隊から）、残りを輸送を待つ部隊として扱う。
     fn home_surplus(&self) -> Vec<&BoardUnit> {
+        if std::env::var("OPENWARS_NO_SURPLUS").is_ok() {
+            return Vec::new();
+        }
         let Some((home, info)) = self
             .landmasses
             .info
