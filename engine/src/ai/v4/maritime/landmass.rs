@@ -10,6 +10,9 @@ use crate::collections::HashMap;
 use crate::components::{GridPosition, PlayerId};
 use crate::resources::{MovementType, Terrain};
 
+/// 本拠へ戦闘役を送り込むのを止める、敵の上陸部隊に対する自軍の戦力の比（%）。
+const HOME_DEFENSE_PERCENT: i64 = 150;
+
 /// 1つの陸塊の事実。
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LandmassInfo {
@@ -25,6 +28,12 @@ pub(crate) struct LandmassInfo {
     pub(crate) own_capturers: u32,
     /// 陸塊上の自軍の地上部隊の数。
     pub(crate) own_ground: u32,
+    /// 自軍の首都があるか。
+    pub(crate) own_capital: bool,
+    /// 陸塊上の自軍の地上部隊の戦力（生産費×HP）。
+    pub(crate) own_strength: i64,
+    /// 陸塊上の敵の地上部隊の戦力（生産費×HP）。
+    pub(crate) enemy_strength: i64,
 }
 
 impl LandmassInfo {
@@ -36,6 +45,17 @@ impl LandmassInfo {
     /// 戦闘役を送る理由（敵部隊・敵拠点）があるか。
     pub(crate) fn needs_combat(&self) -> bool {
         self.enemy_ground > 0 || self.enemy_owned > 0
+    }
+
+    /// 輸送で戦闘役を送り込む価値があるか。
+    ///
+    /// 自軍の首都の陸塊（本拠）は、そこに居る自軍の戦力が敵の上陸部隊を
+    /// [`HOME_DEFENSE_PERCENT`] まで上回る間は送らない。少数の敵が本拠へ上陸するたびに、
+    /// 積んだ部隊を本拠へ降ろし直して往復すると、敵の本土への揚陸が進まない。
+    pub(crate) fn wants_combat(&self) -> bool {
+        self.needs_combat()
+            && !(self.own_capital
+                && self.own_strength * 100 >= self.enemy_strength * HOME_DEFENSE_PERCENT)
     }
 }
 
@@ -66,6 +86,9 @@ impl Landmasses {
             if property.owner != Some(player_id) {
                 entry.unowned.push(property.position);
             }
+            if property.owner == Some(player_id) && property.terrain == Terrain::Capital {
+                entry.own_capital = true;
+            }
             if property.owner.is_some_and(|owner| owner != player_id) {
                 entry.enemy_owned += 1;
                 if property.terrain == Terrain::Capital {
@@ -82,13 +105,16 @@ impl Landmasses {
                 continue;
             };
             let entry = info.entry(landmass).or_default();
+            let strength = i64::from(unit.stats.cost) * i64::from(unit.health.unwrap_or(100)) / 100;
             if unit.owner == player_id {
                 entry.own_ground += 1;
+                entry.own_strength += strength;
                 if unit.stats.can_capture {
                     entry.own_capturers += 1;
                 }
             } else {
                 entry.enemy_ground += 1;
+                entry.enemy_strength += strength;
             }
         }
         // 拠点の並びを座標順に固定し、走査順に依存しない判断にする。
@@ -108,8 +134,8 @@ impl Landmasses {
 
     /// 自軍の地上部隊が今の陸塊で仕事を持たないか。
     ///
-    /// 占領役は未所有拠点も敵部隊も無い陸塊で、戦闘役は敵部隊も敵拠点も無い陸塊で
-    /// 取り残されている。
+    /// 占領役は未所有拠点も敵部隊も無い陸塊で、戦闘役は戦闘役を送り込む価値の無い陸塊
+    /// （敵部隊も敵拠点も無い、または少数の敵が上陸しただけの本拠）で取り残されている。
     pub(crate) fn is_stranded(&self, unit: &BoardUnit) -> bool {
         if !is_ground(unit) || !unit.is_deployed() {
             return false;
@@ -120,7 +146,7 @@ impl Landmasses {
         if unit.stats.can_capture {
             info.unowned.is_empty() && info.enemy_ground == 0
         } else {
-            !info.needs_combat()
+            !info.wants_combat()
         }
     }
 }

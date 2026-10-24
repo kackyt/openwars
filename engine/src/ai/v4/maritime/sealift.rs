@@ -80,6 +80,9 @@ pub(crate) fn decide_sealift_action(
         return None;
     }
     if !has_active_transport(world, player_id, skip) {
+        if std::env::var("OPENWARS_SEALIFT_DEBUG").is_ok() {
+            eprintln!("SEALIFT-SKIP T{turn} no active transport");
+        }
         return None;
     }
     let mut context = SealiftContext::observe(world, player_id, skip);
@@ -100,6 +103,9 @@ pub(crate) fn decide_sealift_action(
         }
     }
     let decision = context.decide();
+    if std::env::var("OPENWARS_SEALIFT_DEBUG").is_ok() && decision.is_none() {
+        eprintln!("SEALIFT-IDLE T{turn}");
+    }
     if decision.is_none() {
         world.insert_resource(SealiftIdle { player_id, turn });
     }
@@ -812,7 +818,7 @@ impl SealiftContext {
         let capture_need = i64::from(info.capture_need());
         let assigned_capturers = capturers.min(capture_need);
         let mut value = assigned_capturers * CAPTURE_SLOT_VALUE;
-        if info.needs_combat() {
+        if info.wants_combat() {
             // 占領枠を超えた歩兵も、敵の残る陸塊では戦力として働く。
             value += (fighters + capturers - assigned_capturers) * COMBAT_SLOT_VALUE;
         }

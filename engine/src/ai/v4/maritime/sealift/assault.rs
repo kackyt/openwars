@@ -372,10 +372,16 @@ impl SealiftContext {
         let best = sites
             .iter()
             .max_by_key(|site| (site.score(), std::cmp::Reverse(site.stops.clone())))?;
+        // 長い海岸線を分けた浜は重なり合うので、前の手番と同じ停泊セルの浜を優先して引き継ぐ。
         let kept = previous.and_then(|previous| {
             sites
                 .iter()
-                .find(|site| site.stops.iter().any(|stop| previous.stops.contains(stop)))
+                .find(|site| site.stops == previous.stops)
+                .or_else(|| {
+                    sites
+                        .iter()
+                        .find(|site| site.stops.iter().any(|stop| previous.stops.contains(stop)))
+                })
         });
         let site = match kept {
             Some(kept)

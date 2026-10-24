@@ -25,6 +25,8 @@ use bevy_ecs::prelude::*;
 
 /// 停泊セルを同じ浜にまとめる距離。
 const BEACH_LINK_DISTANCE: u32 = 3;
+/// 1つの浜とみなす停泊セルの広がり（端から端までの距離）の上限。
+const MAX_BEACH_SPAN: u32 = 8;
 /// 進軍路沿いの拠点1つの価値（資金換算。収入1,000を約10手番）。
 const ROUTE_PROPERTY_VALUE: i64 = 10_000;
 /// 敵首都の価値。起点から首都までの装甲移動ステップが増えるほど割り引く。
@@ -146,7 +148,35 @@ impl SealiftContext {
             merged.sort_unstable();
             groups.push(merged);
         }
+        // 海岸線に沿って長く連鎖した浜（端から端までMAX_BEACH_SPANを超える）は、停泊セルごとに
+        // 近くの停泊セルだけの浜へ分ける。長い浜を1つにまとめると、海岸線に沿った全ての守りを
+        // 1つの浜の反撃として数え、手薄な区間へ上陸できなくなる。
+        let mut split: Vec<Vec<Cell>> = Vec::new();
+        for group in groups {
+            let span = group
+                .iter()
+                .flat_map(|a| group.iter().map(move |b| map.distance(a.0, a.1, b.0, b.1)))
+                .max()
+                .unwrap_or(0);
+            if span <= MAX_BEACH_SPAN {
+                split.push(group);
+                continue;
+            }
+            for center in &group {
+                split.push(
+                    group
+                        .iter()
+                        .copied()
+                        .filter(|stop| {
+                            map.distance(center.0, center.1, stop.0, stop.1) <= BEACH_LINK_DISTANCE
+                        })
+                        .collect(),
+                );
+            }
+        }
+        let mut groups = split;
         groups.sort_unstable();
+        groups.dedup();
 
         let enemy_capital = self
             .board
