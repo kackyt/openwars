@@ -399,8 +399,10 @@ fn offensive_priority_key(candidate: &IslandCampaignCandidate) -> OffensivePrior
     };
     let logistics_rank = candidate.logistics_priority_rank.unwrap_or(u32::MAX);
     let decision_rank = match candidate.assessment.decision {
-        _ if candidate.logistics_prerequisite => 0,
-        IslandCampaignDecision::Secure => 1,
+        // 自島・確保済み島の未所有施設は輸送不要の歩兵だけで収入へ変わる。洋上の兵站拠点より
+        // 先に資金を回さないと、初手の資金を渡洋パッケージへ取られて足元の拠点を失う。
+        IslandCampaignDecision::Secure => 0,
+        _ if candidate.logistics_prerequisite => 1,
         IslandCampaignDecision::Contest => 2,
         IslandCampaignDecision::Reinforce => 3,
         IslandCampaignDecision::Expand => 4,
@@ -705,35 +707,71 @@ fn push_unique_entity(entities: &mut Vec<Entity>, entity: Entity) {
     }
 }
 
-fn search_campaign_transport_coverage(
+/// cargoを輸送役の空き枠へ同時に割り当てられる最大数（容量付き二部マッチング）。
+///
+/// 輸送役は同じ島に居て、そのcargo種別を積める場合だけ割り当てられる。
+/// `used_slots` は既に埋まっている枠数（積載済みcargo）で、残りの枠だけを使う。
+/// 増加路法（各cargoについて、既に割り当てたcargoを別の輸送役へ移せるかを辿る）で
+/// 最大数を求めるため、輸送役・cargoが多くても多項式時間で終わる。
+fn max_campaign_transport_assignment(
     cargo: &[&CampaignUnitCandidate],
     transports: &[&CampaignUnitCandidate],
-    cargo_index: usize,
-    assigned_counts: &mut [u32],
-) -> bool {
-    if cargo_index == cargo.len() {
-        return true;
+    used_slots: &[u32],
+) -> usize {
+    struct Matching<'a> {
+        cargo: &'a [&'a CampaignUnitCandidate],
+        transports: &'a [&'a CampaignUnitCandidate],
+        capacity: Vec<usize>,
+        assigned: Vec<Vec<usize>>,
     }
-    let unit = cargo[cargo_index];
-    for (index, transport) in transports.iter().enumerate() {
-        if assigned_counts[index] >= transport.available_cargo_slots
-            || transport.island_id != unit.island_id
-            || !transport.loadable_unit_types.contains(&unit.unit_type)
-        {
-            continue;
+
+    impl Matching<'_> {
+        fn compatible(&self, cargo_index: usize, transport_index: usize) -> bool {
+            let unit = self.cargo[cargo_index];
+            let transport = self.transports[transport_index];
+            transport.island_id == unit.island_id
+                && transport.loadable_unit_types.contains(&unit.unit_type)
         }
-        assigned_counts[index] = assigned_counts[index].saturating_add(1);
-        if search_campaign_transport_coverage(
-            cargo,
-            transports,
-            cargo_index.saturating_add(1),
-            assigned_counts,
-        ) {
-            return true;
+
+        /// cargoを空き枠へ入れる。満杯の輸送役は、既存cargoを別の輸送役へ移せる場合だけ使う。
+        fn augment(&mut self, cargo_index: usize, visited: &mut [bool]) -> bool {
+            for transport_index in 0..self.transports.len() {
+                if visited[transport_index] || !self.compatible(cargo_index, transport_index) {
+                    continue;
+                }
+                visited[transport_index] = true;
+                if self.assigned[transport_index].len() < self.capacity[transport_index] {
+                    self.assigned[transport_index].push(cargo_index);
+                    return true;
+                }
+                for slot in 0..self.assigned[transport_index].len() {
+                    let displaced = self.assigned[transport_index][slot];
+                    if self.augment(displaced, visited) {
+                        self.assigned[transport_index][slot] = cargo_index;
+                        return true;
+                    }
+                }
+            }
+            false
         }
-        assigned_counts[index] = assigned_counts[index].saturating_sub(1);
     }
-    false
+
+    let mut matching = Matching {
+        cargo,
+        transports,
+        capacity: transports
+            .iter()
+            .zip(used_slots)
+            .map(|(transport, used)| transport.available_cargo_slots.saturating_sub(*used) as usize)
+            .collect(),
+        assigned: vec![Vec::new(); transports.len()],
+    };
+    (0..cargo.len())
+        .filter(|cargo_index| {
+            let mut visited = vec![false; transports.len()];
+            matching.augment(*cargo_index, &mut visited)
+        })
+        .count()
 }
 
 fn campaign_transport_package_covers(
@@ -779,19 +817,7 @@ fn campaign_transport_package_covers(
         }
     }
     cargo.retain(|unit| !loaded_owner.contains_key(&unit.entity));
-    cargo.sort_by_key(|unit| {
-        let compatible = transports
-            .iter()
-            .enumerate()
-            .filter(|(index, transport)| {
-                assigned_counts[*index] < transport.available_cargo_slots
-                    && transport.island_id == unit.island_id
-                    && transport.loadable_unit_types.contains(&unit.unit_type)
-            })
-            .count();
-        (compatible, unit.entity.to_bits())
-    });
-    search_campaign_transport_coverage(&cargo, &transports, 0, &mut assigned_counts)
+    max_campaign_transport_assignment(&cargo, &transports, &assigned_counts) == cargo.len()
 }
 
 /// 現在予約済みの輸送役が、指定cargoのうち最大何体を同時に運べるか。
@@ -813,32 +839,7 @@ fn campaign_transport_covered_count(
         return 0;
     }
 
-    fn search(
-        cargo: &[&CampaignUnitCandidate],
-        transports: &[&CampaignUnitCandidate],
-        index: usize,
-        assigned: &mut [u32],
-    ) -> usize {
-        if index == cargo.len() {
-            return 0;
-        }
-        let unit = cargo[index];
-        let mut best = search(cargo, transports, index.saturating_add(1), assigned);
-        for (transport_index, transport) in transports.iter().enumerate() {
-            if assigned[transport_index] >= transport.available_cargo_slots
-                || transport.island_id != unit.island_id
-                || !transport.loadable_unit_types.contains(&unit.unit_type)
-            {
-                continue;
-            }
-            assigned[transport_index] = assigned[transport_index].saturating_add(1);
-            best = best.max(1 + search(cargo, transports, index.saturating_add(1), assigned));
-            assigned[transport_index] = assigned[transport_index].saturating_sub(1);
-        }
-        best
-    }
-
-    search(&cargo, &transports, 0, &mut vec![0; transports.len()])
+    max_campaign_transport_assignment(&cargo, &transports, &vec![0; transports.len()])
 }
 
 /// 洋上展開で不足する輸送スロットと、最小費用で全cargoを積める輸送種別を返す。
@@ -1684,8 +1685,11 @@ pub fn classify_island(facts: &IslandCampaignFacts) -> IslandCampaignState {
     if facts.friendly_units > 0 && facts.enemy_units > 0 {
         return IslandCampaignState::Contested;
     }
+    // 防衛対象は自軍の拠点である。拠点を持たず上陸部隊だけが居る島を防衛扱いにすると、
+    // 完全な防衛編成を予約できない限り監視へ落ち、中立拠点の占領競争を放棄してしまう。
+    // そのような島は下のSecured（未所有拠点の確保）として占領を続ける。
     if facts.enemy_units == 0
-        && (facts.friendly_units > 0 || facts.friendly_properties > 0)
+        && facts.friendly_properties > 0
         && facts.enemy_arrival_eta.is_some_and(|eta| eta <= 2)
     {
         return IslandCampaignState::Threatened;

@@ -587,6 +587,42 @@ pub(in crate::ai::v4) fn refresh_capital_route_node_operations(
             };
             operation.assigned_squads.insert(*squad_id);
         }
+        if topology.beachhead && std::env::var("OPENWARS_ASSAULT_TRACE").is_ok() {
+            let turn = world
+                .get_resource::<crate::resources::MatchState>()
+                .map_or(0, |state| state.current_turn_number.0);
+            let mut nodes = operations
+                .operations
+                .values()
+                .filter(|operation| operation.id.topology == key)
+                .collect::<Vec<_>>();
+            nodes.sort_unstable_by_key(|operation| {
+                progress_order(&topology.from_home, operation.anchor)
+            });
+            let text = nodes
+                .iter()
+                .map(|operation| {
+                    let owned = operation
+                        .capture_targets
+                        .iter()
+                        .filter(|target| properties.get(target) == Some(&Some(player_id)))
+                        .count();
+                    format!(
+                        "({},{}){:?}/{:?}:{:?} own{}/{} sq{}",
+                        operation.anchor.x,
+                        operation.anchor.y,
+                        operation.objective,
+                        operation.scope,
+                        operation.state,
+                        owned,
+                        operation.capture_targets.len(),
+                        operation.assigned_squads.len()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!("BEACHHEAD_NODES p{} T{turn} {text}", player_id.0);
+        }
     }
     world.insert_resource(operations);
 }

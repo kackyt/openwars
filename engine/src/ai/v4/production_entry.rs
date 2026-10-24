@@ -26,11 +26,23 @@ pub(in crate::ai::v4) fn issue_next_planned_production(
             .map(|planned| vec![planned.command])
             .unwrap_or_default();
     }
-    let (planned, cancelled) =
-        commit::next_issuable(world, turn, queue, |planned| &planned.command);
-    production_cancellation::release_cancelled_purchases(world, turn, &cancelled);
-    let Some(planned) = planned else {
-        return Vec::new();
+    let planned = loop {
+        let (planned, cancelled) =
+            commit::next_issuable(world, turn, queue, |planned| &planned.command);
+        production_cancellation::release_cancelled_purchases(world, turn, &cancelled);
+        let Some(planned) = planned else {
+            return Vec::new();
+        };
+        // 海で隔てられた盤面で運べない地上部隊を溜めるだけの購入は、発行せずに取り消す。
+        if maritime::rejects_ground_purchase(world, planned.command.player_id, &planned.command) {
+            production_cancellation::release_cancelled_purchases(
+                world,
+                turn,
+                std::slice::from_ref(&planned),
+            );
+            continue;
+        }
+        break planned;
     };
     if let PurchasePurpose::PlanStep(step_ref) = planned.purpose
         && let Some(mut registry) = world.get_resource_mut::<V4RollingPlanRegistry>()
@@ -487,14 +499,27 @@ fn take_campaign_command(
     cache: &mut ProductionTurnState,
     player_id: PlayerId,
 ) -> Option<ProduceUnitCommand> {
-    let issue = cache.take_issuable_campaign_command(world, player_id);
-    production_cancellation::release_cancelled_campaign_commands(
-        world,
-        player_id,
-        issue.planned_turn,
-        &issue.cancelled,
-    );
-    issue.command
+    loop {
+        let issue = cache.take_issuable_campaign_command(world, player_id);
+        production_cancellation::release_cancelled_campaign_commands(
+            world,
+            player_id,
+            issue.planned_turn,
+            &issue.cancelled,
+        );
+        let command = issue.command?;
+        // 海で隔てられた盤面で運べない地上部隊を溜めるだけの購入は、発行せずに取り消す。
+        if maritime::rejects_ground_purchase(world, player_id, &command) {
+            production_cancellation::release_cancelled_campaign_commands(
+                world,
+                player_id,
+                issue.planned_turn,
+                std::slice::from_ref(&command),
+            );
+            continue;
+        }
+        return Some(command);
+    }
 }
 
 /// 生産施設から占領可能unitが対象へ自力到達できるかを判定する。

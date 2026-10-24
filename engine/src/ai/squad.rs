@@ -3893,6 +3893,88 @@ fn synchronize_current_v4_capture_departures(
     }
 }
 
+/// 橋頭堡を起点にした首都攻略DAGの島（揚陸済みの敵首都島）に立っている輸送Squadの
+/// 所属unitを、輸送待ちから外して島内の占領・攻撃Squadへ引き渡す。
+///
+/// 揚陸はSquadの輸送工程とは別に行われる（島嶼間輸送）ため、上陸後も首都攻略の
+/// 輸送待ち（Forming）に残ったunitは通常行動からも首都攻略DAGからも外れていた。
+/// 既に目標の島に居るunitは運ぶ必要が無い。島内のSquadへ移し、DAGの指令に従わせる。
+fn release_landed_transport_units(
+    world: &mut World,
+    manager: &mut SquadManager,
+    player_id: PlayerId,
+) {
+    let islands = crate::ai::v4::capital_route::beachhead_route_islands(world, player_id);
+    if islands.is_empty() {
+        return;
+    }
+    let Some(island_map) = world
+        .get_resource::<crate::ai::islands::IslandMap>()
+        .cloned()
+    else {
+        return;
+    };
+    let island_of = |world: &World, entity: Entity| {
+        if world
+            .get::<crate::components::Transporting>(entity)
+            .is_some()
+            || world.get::<UnitStats>(entity).is_none_or(|stats| {
+                matches!(
+                    stats.movement_type,
+                    crate::resources::MovementType::Air | crate::resources::MovementType::Ship
+                )
+            })
+        {
+            return None;
+        }
+        world
+            .get::<GridPosition>(entity)
+            .and_then(|position| island_map.get_island_at(position))
+            .map(|island| island.id)
+            .filter(|island| islands.contains(island))
+    };
+    let releases = manager
+        .proposal_view()
+        .squads
+        .iter()
+        .filter(|squad| {
+            squad.plan.mission_type == MissionType::Transport
+                && squad.plan.owner_id == Some(player_id)
+                && !matches!(
+                    squad.plan.phase,
+                    MissionPhase::Transport(TransportPhase::Transit | TransportPhase::Drop)
+                )
+        })
+        .filter_map(|squad| {
+            let landed = squad
+                .members
+                .iter()
+                .chain(squad.cargo_entities.iter())
+                .copied()
+                .filter_map(|entity| island_of(world, entity).map(|island| (entity, island)))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            (!landed.is_empty()).then_some((squad.id, landed))
+        })
+        .collect::<Vec<_>>();
+    if std::env::var("OPENWARS_ASSAULT_TRACE").is_ok() {
+        eprintln!(
+            "RELEASE_LANDED p{} {:?}",
+            player_id.0,
+            releases
+                .iter()
+                .map(|(id, landed)| (id.0, landed.len()))
+                .collect::<Vec<_>>()
+        );
+    }
+    for (squad_id, landed) in releases {
+        let entities = landed.keys().copied().collect::<HashSet<_>>();
+        OperationLedger::proposals(manager).remove_mentions(squad_id, &entities);
+        for (entity, island) in landed {
+            handoff_delivered_cargo(world, manager, player_id, entity, Some(island), None);
+        }
+    }
+}
+
 /// 所属欠落と上陸引渡しを作業集合として再接続する。
 /// 古いcacheの全作戦再生と固定3周を廃止し、対象と修復理由の変化だけを処理する。
 fn reconnect_v4_operation_fixed_point(
@@ -3901,6 +3983,7 @@ fn reconnect_v4_operation_fixed_point(
     player_id: PlayerId,
     campaign_assignments: &[crate::ai::island_campaign::IslandCampaignAssignment],
 ) {
+    release_landed_transport_units(world, manager, player_id);
     let mut seen = HashSet::default();
     loop {
         let before = pending_v4_reconnections(world, manager, player_id, campaign_assignments);

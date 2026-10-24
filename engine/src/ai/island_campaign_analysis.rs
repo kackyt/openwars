@@ -1944,7 +1944,30 @@ fn candidate_capture_target_positions(
     // 既に足場がある陸塊では、最短前線とその隣接帯だけを同時実行対象にする。
     // 全未所有施設は毎手番再観測するため捨てず、前線取得後に次の帯へ昇格する。
     // 足場のない島は輸送波の目的一覧を縮めると再上陸が遅れるため従来どおり保持する。
-    if !origins.is_empty()
+    if force_origins && !origins.is_empty() {
+        // V4: 島内の施設群（近い施設のまとまり）ごとに前線帯を持つ。島全体で1つの帯に
+        // 絞ると、最寄りの施設群が詰まった間は離れた施設群へ誰も向かわず作戦が止まる。
+        let enemy_ground: Vec<GridPosition> = units
+            .iter()
+            .filter(|unit| {
+                unit.faction != player_id
+                    && unit.transporting.is_none()
+                    && !matches!(
+                        unit.stats.movement_type,
+                        crate::resources::MovementType::Air | crate::resources::MovementType::Ship
+                    )
+                    && island.tiles.contains(&unit.position)
+            })
+            .map(|unit| unit.position)
+            .collect();
+        let contested = |target: GridPosition| {
+            enemy_ground.iter().any(|enemy| {
+                map.distance(enemy.x, enemy.y, target.x, target.y) <= PROPERTY_GROUP_CONTEST_RADIUS
+            })
+        };
+        targets =
+            property_group_fronts(map, &targets, |target| target_priority(target).1, contested);
+    } else if !origins.is_empty()
         && let Some(nearest_distance) = targets.first().map(|target| target_priority(*target).1)
     {
         targets.retain(|target| target_priority(*target).1 <= nearest_distance.saturating_add(2));
@@ -1957,6 +1980,80 @@ fn candidate_capture_target_positions(
         targets.insert(0, primary_target);
     }
     targets
+}
+
+/// 同じ施設群とみなす施設間の最大距離。
+const PROPERTY_GROUP_LINK_DISTANCE: u32 = 3;
+/// 施設群の中で、最寄りの施設から何マス先までを同時に前線帯へ入れるか。
+const PROPERTY_GROUP_FRONT_DEPTH: u32 = 2;
+/// 施設の周囲この距離に敵の地上部隊が居れば、その施設群は敵と争っているとみなす。
+const PROPERTY_GROUP_CONTEST_RADIUS: u32 = 3;
+
+/// 前線からの距離順に並んだ占領目標を、施設群ごとの前線帯へ絞って並べ直す。
+///
+/// 近い施設どうし（[`PROPERTY_GROUP_LINK_DISTANCE`] 以内で連鎖する施設）を1つの施設群とし、
+/// 各施設群から、その群で最も前線に近い施設と [`PROPERTY_GROUP_FRONT_DEPTH`] 以内の施設を残す。
+/// 担当の割当は先頭から順に行われるため、最も前線に近い施設群の前線帯を先に並べて
+/// 占領役をそこへ集中させ、余った占領役だけを次の施設群へ回す。
+///
+/// 2番目以降の施設群は、前線帯のどの施設も敵と争っていない（`contested` が偽の）場合だけ
+/// 加える。敵の居る施設群へ少数の占領役を分けて送ると、劣勢の局面で各個に撃破される。
+fn property_group_fronts(
+    map: &Map,
+    targets: &[GridPosition],
+    front_distance: impl Fn(GridPosition) -> u32,
+    contested: impl Fn(GridPosition) -> bool,
+) -> Vec<GridPosition> {
+    // 単連結で施設群を作る。入力の並び（前線に近い順）を保ったまま群へ振り分ける。
+    let mut group_of: Vec<Option<usize>> = vec![None; targets.len()];
+    let mut groups: Vec<Vec<GridPosition>> = Vec::new();
+    for start in 0..targets.len() {
+        if group_of[start].is_some() {
+            continue;
+        }
+        let group = groups.len();
+        group_of[start] = Some(group);
+        let mut members = vec![start];
+        let mut cursor = 0;
+        while cursor < members.len() {
+            let current = targets[members[cursor]];
+            cursor += 1;
+            for (index, other) in targets.iter().enumerate() {
+                if group_of[index].is_none()
+                    && map.distance(current.x, current.y, other.x, other.y)
+                        <= PROPERTY_GROUP_LINK_DISTANCE
+                {
+                    group_of[index] = Some(group);
+                    members.push(index);
+                }
+            }
+        }
+        members.sort_unstable();
+        groups.push(members.into_iter().map(|index| targets[index]).collect());
+    }
+    // 各施設群の前線帯。群の並びは、群の先頭（最も前線に近い施設）の順のまま。
+    let fronts: Vec<Vec<GridPosition>> = groups
+        .into_iter()
+        .map(|group| {
+            let nearest = group
+                .iter()
+                .map(|target| front_distance(*target))
+                .min()
+                .unwrap_or(u32::MAX);
+            group
+                .into_iter()
+                .filter(|target| {
+                    front_distance(*target) <= nearest.saturating_add(PROPERTY_GROUP_FRONT_DEPTH)
+                })
+                .collect()
+        })
+        .collect();
+    fronts
+        .into_iter()
+        .enumerate()
+        .filter(|(rank, front)| *rank == 0 || !front.iter().any(|target| contested(*target)))
+        .flat_map(|(_, front)| front)
+        .collect()
 }
 
 /// 占領目標の距離を測る起点。
@@ -2524,6 +2621,53 @@ mod tests {
     use bevy_ecs::prelude::{Entity, World};
 
     const TEST_SEED: u64 = 42;
+
+    fn at(x: usize, y: usize) -> GridPosition {
+        GridPosition { x, y }
+    }
+
+    #[test]
+    fn property_group_fronts_keep_a_front_for_each_separated_group() {
+        let map = Map::new(30, 3, Terrain::Plains, GridTopology::Square);
+        // 前線(x=0)に近い順。x=4..6 の群と、離れた x=20..24 の群。
+        let targets = vec![
+            at(4, 1),
+            at(5, 1),
+            at(6, 1),
+            at(20, 1),
+            at(21, 1),
+            at(24, 1),
+        ];
+        let fronts = property_group_fronts(&map, &targets, |target| target.x as u32, |_| false);
+        // 各群の最寄り＋2以内だけが残り、前線に近い群から順に並ぶ（x=24 は群の前線帯の外）。
+        assert_eq!(
+            fronts,
+            vec![at(4, 1), at(5, 1), at(6, 1), at(20, 1), at(21, 1)]
+        );
+    }
+
+    #[test]
+    fn property_group_fronts_link_chained_properties_into_one_group() {
+        let map = Map::new(30, 3, Terrain::Plains, GridTopology::Square);
+        // 3マス間隔で連鎖する施設は1つの群で、前線帯は最寄り＋2までに絞られる。
+        let targets = vec![at(1, 1), at(4, 1), at(7, 1), at(10, 1)];
+        let fronts = property_group_fronts(&map, &targets, |target| target.x as u32, |_| false);
+        assert_eq!(fronts, vec![at(1, 1)]);
+    }
+
+    #[test]
+    fn property_group_fronts_skip_contested_secondary_groups() {
+        let map = Map::new(30, 3, Terrain::Plains, GridTopology::Square);
+        let targets = vec![at(4, 1), at(20, 1), at(26, 1)];
+        // x=20 の群は敵と争っている。最寄りの群は争っていても常に残す。
+        let fronts = property_group_fronts(
+            &map,
+            &targets,
+            |target| target.x as u32,
+            |target| target.x == 20 || target.x == 4,
+        );
+        assert_eq!(fronts, vec![at(4, 1), at(26, 1)]);
+    }
 
     #[test]
     fn mirrored_land_fronts_choose_the_nearest_property_instead_of_coordinate_order() {
