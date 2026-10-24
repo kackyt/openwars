@@ -132,7 +132,7 @@ pub(crate) fn cells_within_ring(
 /// 1プレイヤー視点の海上・航空戦域の事実。
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MaritimeTheater {
-    /// 敵首都が自軍首都と別の陸塊にあるか。
+    /// 敵首都が自軍首都と別の陸塊（[`super::landmass::label_landmasses`]）にあるか。
     pub(crate) capitals_separated_by_sea: bool,
     /// 自軍所有の港の座標。
     pub(crate) own_ports: Vec<GridPosition>,
@@ -153,7 +153,7 @@ pub(crate) struct MaritimeTheater {
 impl MaritimeTheater {
     /// 盤面から戦域の事実を集める。Worldは書き換えない。
     pub(crate) fn observe(board: &PlayerBoard, player_id: PlayerId) -> Self {
-        let land = Components::label(board, MovementType::Infantry);
+        let land = super::landmass::label_landmasses(board);
         let own_capitals: Vec<_> = board
             .properties
             .iter()

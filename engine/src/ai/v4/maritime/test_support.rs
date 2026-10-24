@@ -9,11 +9,12 @@ use crate::resources::master_data::{MasterDataRegistry, UnitName};
 use crate::resources::{DamageChart, GridTopology, Map, Terrain, UnitType};
 use bevy_ecs::prelude::*;
 
-/// 文字から地形へ。`.`平地 `~`海 `,`浅瀬 `H`首都 `P`港 `C`都市 `F`工場 `A`空港。
+/// 文字から地形へ。`.`平地 `~`海 `,`浅瀬 `^`山 `H`首都 `P`港 `C`都市 `F`工場 `A`空港。
 fn terrain_of(symbol: char) -> Terrain {
     match symbol {
         '~' => Terrain::Sea,
         ',' => Terrain::Shoal,
+        '^' => Terrain::Mountain,
         'H' => Terrain::Capital,
         'P' => Terrain::Port,
         'C' => Terrain::City,
