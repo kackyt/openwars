@@ -102,7 +102,7 @@ pub(crate) struct AssaultPlan {
     /// 上陸に使う全ての浜の停泊セル（輸送船が止まって降ろすセル）。
     pub(crate) stops: Vec<Cell>,
     /// 主な浜（評価で選んだ浜）の停泊セル。次の手番の浜の選択はこの浜を引き継ぐ。
-    primary: Vec<Cell>,
+    pub(crate) primary: Vec<Cell>,
     /// 浜を起点にした島内の首都攻略DAGの起点（降車セルのうち敵首都へ最も近いセル）。
     pub(crate) origin: Option<GridPosition>,
     /// この判断をした手番。

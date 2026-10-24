@@ -1733,7 +1733,7 @@ mod tests {
     #[test]
     fn assault_prefers_the_beach_where_more_landers_can_unload() {
         // 右の島(x=5..9)の中央に敵首都(7,1)。西は浅瀬1か所(4,1)、東は浅瀬3か所(x=10)。
-        // 首都までの距離と守りは同じなので、1手番に多く降ろせる東の浜を選ぶ。
+        // 首都までの距離と守りは同じなので、1手番に多く降ろせる東の浜を主な浜に選ぶ。
         let mut world = naval_world(&[
             "H.~~~.....,~~",
             "..~~,..H..,~~",
@@ -1750,11 +1750,15 @@ mod tests {
 
         decide(&mut world);
         let plan = &world.resource::<AssaultPlans>().0[&PlayerId(1)];
-        assert!(plan.stops.contains(&(10, 1)), "東の浜: {:?}", plan.stops);
         assert!(
-            !plan.stops.contains(&(4, 1)),
-            "西の1か所の浜は選ばない: {:?}",
-            plan.stops
+            plan.primary.contains(&(10, 1)),
+            "主な浜は東: {:?}",
+            plan.primary
+        );
+        assert!(
+            !plan.primary.contains(&(4, 1)),
+            "西の1か所の浜を主な浜にしない: {:?}",
+            plan.primary
         );
     }
 

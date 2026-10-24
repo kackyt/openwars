@@ -25,6 +25,8 @@ use bevy_ecs::prelude::*;
 
 /// 停泊セルを同じ浜にまとめる距離。
 const BEACH_LINK_DISTANCE: u32 = 3;
+/// 浜の評価を1手番に降ろせる輸送船の数で割り引く基準（この数で評価が半分になる）。
+const CAPACITY_HALF: i64 = 2;
 /// 1つの浜とみなす停泊セルの広がり（端から端までの距離）の上限。
 const MAX_BEACH_SPAN: u32 = 8;
 /// 進軍路沿いの拠点1つの価値（資金換算。収入1,000を約10手番）。
@@ -102,12 +104,14 @@ impl LandingSite {
         self.stops.len().min(self.landers).max(1) as i64
     }
 
-    /// 得られるもの × 1手番に降ろせる輸送船の数 ÷ 反撃の危険（上陸済みの味方の分だけ危険を
-    /// 下げる）。停泊セルの少ない浜は、降車セルが少ない分だけ守りも少なく見えるので、降ろせる
-    /// 量で割り引かないと、1か所しかない浜が選ばれ、輸送船がその沖で順番を待つ。
+    /// 得られるもの ÷ 反撃の危険（上陸済みの味方の分だけ危険を下げる）を、1手番に降ろせる
+    /// 輸送船の数で割り引く（降ろせる数 ÷ (降ろせる数 + CAPACITY_HALF)。1か所なら1/3、
+    /// 4か所なら2/3）。停泊セルの少ない浜は、降車セルが少ない分だけ守りも少なく見えるので、
+    /// 降ろせる量で割り引かないと、1か所しかない浜が選ばれ、輸送船がその沖で順番を待つ。
     pub(crate) fn score(&self) -> i64 {
         let risk = (self.threat() - self.friendly).max(0) + RISK_FLOOR;
-        self.value() * 1_000 * self.capacity() / risk
+        let capacity = self.capacity();
+        self.value() * 1_000 / risk * capacity / (capacity + CAPACITY_HALF)
     }
 }
 
