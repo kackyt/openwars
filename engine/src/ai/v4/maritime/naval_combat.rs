@@ -31,6 +31,8 @@ const LOW_AMMO: u32 = 2;
 const PORT_QUEUE_RADIUS: u32 = 2;
 /// 港までの海路に加えて残しておく燃料。
 const FUEL_MARGIN: u32 = 6;
+/// 停泊セルを空ける判断で、輸送船が1手番に進む距離の見積もり。
+const LANDER_REACH: u32 = 5;
 
 /// 自軍の戦艦のうち、まだ行動していない1隻の次の1手を返す。
 ///
@@ -86,7 +88,7 @@ pub(crate) fn decide_naval_action(
         .iter()
         .filter(|unit| ready.contains(&unit.entity))
     {
-        if naval.should_vacate_port(unit) {
+        if naval.should_vacate_port(unit) || naval.should_vacate_berth(unit) {
             continue;
         }
         if let Some((value, command)) = naval.best_fire(unit)
@@ -148,6 +150,10 @@ struct NavalBoard<'a> {
     occupancy: &'a HashMap<(usize, usize), crate::systems::movement::OccupantInfo>,
     threat: ThreatMap<'a>,
     own_ports: HashSet<(usize, usize)>,
+    /// 輸送船が乗せ降ろしに使う停泊セル（陸に接する浅瀬と、自軍以外の港）。
+    berths: HashSet<(usize, usize)>,
+    /// 輸送船（揚陸部隊）の位置。
+    landers: Vec<GridPosition>,
     /// 輸送部隊ごとの積荷の生産費の合計。
     cargo_costs: HashMap<Entity, u32>,
     /// 揚陸作戦の浜の停泊セル。
@@ -169,13 +175,47 @@ impl<'a> NavalBoard<'a> {
             .iter()
             .filter(|unit| unit.owner != player_id && unit.is_deployed())
             .collect();
-        let own_ports = board
+        let own_ports: HashSet<(usize, usize)> = board
             .properties
             .iter()
             .filter(|property| {
                 property.owner == Some(player_id) && property.terrain == Terrain::Port
             })
             .map(|property| (property.position.x, property.position.y))
+            .collect();
+        let map = &board.map;
+        let is_land = |x: usize, y: usize| {
+            map.get_terrain(x, y)
+                .is_some_and(|terrain| !matches!(terrain, Terrain::Sea | Terrain::Shoal))
+        };
+        let mut berths = HashSet::default();
+        for y in 0..map.height {
+            for x in 0..map.width {
+                let berth = match map.get_terrain(x, y) {
+                    Some(Terrain::Shoal) => true,
+                    Some(Terrain::Port) => !own_ports.contains(&(x, y)),
+                    _ => false,
+                };
+                if berth
+                    && map
+                        .get_adjacent(x, y)
+                        .into_iter()
+                        .any(|(nx, ny)| is_land(nx, ny) && (nx, ny) != (x, y))
+                {
+                    berths.insert((x, y));
+                }
+            }
+        }
+        let landers = board
+            .units
+            .iter()
+            .filter(|unit| {
+                unit.owner == player_id
+                    && unit.is_deployed()
+                    && super::sealift::is_sealift_transport(&unit.stats)
+                    && unit.stats.movement_type == MovementType::Ship
+            })
+            .map(|unit| unit.position)
             .collect();
         Self {
             board,
@@ -185,6 +225,8 @@ impl<'a> NavalBoard<'a> {
             occupancy,
             threat: ThreatMap::new(board, chart, occupancy, player_id),
             own_ports,
+            berths,
+            landers,
             cargo_costs,
             beach: Vec::new(),
             supports_landing: false,
@@ -423,6 +465,19 @@ impl<'a> NavalBoard<'a> {
             .count() as u32
     }
 
+    /// 停泊セル（陸に接する浅瀬・自軍以外の港）の上の戦艦が、輸送船のために空けるべきか。
+    ///
+    /// 戦艦が停泊セルの上から撃ち続けると、輸送船がそのセルへ入れず、浜へ降ろせない
+    /// （乗せられない）。2手番で届く範囲に自軍の輸送船が居れば、停泊セルからは撃たずに移る。
+    fn should_vacate_berth(&self, unit: &BoardUnit) -> bool {
+        let here = (unit.position.x, unit.position.y);
+        self.berths.contains(&here)
+            && self.landers.iter().any(|lander| {
+                self.board.map.distance(here.0, here.1, lander.x, lander.y)
+                    <= LANDER_REACH.saturating_mul(2)
+            })
+    }
+
     /// 港の上の戦艦が、補給を待つ味方のために港を空けるべきか。
     ///
     /// 補給を終えた戦艦が港の上から撃ち続けると、後続の戦艦が補給できず、待つ間ずっと
@@ -594,6 +649,7 @@ impl<'a> NavalBoard<'a> {
                     fire,
                     lethal: threat_hp >= hp,
                     blocks_port: !returning_to_port && self.own_ports.contains(&cell),
+                    blocks_berth: self.berths.contains(&cell),
                     stays: cell == current,
                 })
             })
@@ -608,6 +664,7 @@ impl<'a> NavalBoard<'a> {
                 let loss = i64::from(unit.stats.cost) * i64::from(stop.threat_hp) / 100;
                 (
                     !stop.blocks_port,
+                    !stop.blocks_berth,
                     fire - loss,
                     stop.stays,
                     std::cmp::Reverse(stop.cell),
@@ -617,6 +674,7 @@ impl<'a> NavalBoard<'a> {
             candidates.iter().min_by_key(|stop| {
                 (
                     stop.blocks_port,
+                    stop.blocks_berth,
                     stop.lethal,
                     stop.distance,
                     stop.threat_hp,
@@ -647,6 +705,8 @@ struct NavalStop {
     lethal: bool,
     /// 自軍の港（艦船の生産）を塞ぐか。
     blocks_port: bool,
+    /// 輸送船の停泊セル（陸に接する浅瀬・自軍以外の港）を塞ぐか。
+    blocks_berth: bool,
     /// 現在地に留まるか。
     stays: bool,
 }
@@ -676,6 +736,38 @@ mod tests {
             }
             other => panic!("移動せずに射撃するはず: {other:?}"),
         }
+    }
+
+    #[test]
+    fn battleship_leaves_a_shoal_berth_for_an_approaching_lander() {
+        // 戦艦は陸(x=5)に接する浅瀬(4,1)の上。敵戦車は射程内だが、自軍の輸送船が近くに
+        // 居るので、浅瀬からは撃たずに海上へ移って浅瀬を空ける。
+        let mut world = naval_world(&["~~~~~.", "~~~~,.", "~~~~~."]);
+        let battleship = spawn(&mut world, 1, UnitType::Battleship, 4, 1);
+        spawn(&mut world, 1, UnitType::Lander, 0, 1);
+        spawn(&mut world, 2, UnitType::Tank, 5, 2);
+
+        let (entity, command) =
+            decide_naval_action(&mut world, PlayerId(1), &HashSet::default()).unwrap();
+        assert_eq!(entity, battleship);
+        let AiCommand::Wait { target_pos } = command else {
+            panic!("浅瀬を空けて移動するはず: {command:?}");
+        };
+        assert_ne!(target_pos, GridPosition { x: 4, y: 1 });
+    }
+
+    #[test]
+    fn battleship_fires_from_a_shoal_when_no_lander_needs_it() {
+        // 輸送船が居なければ、浅瀬の上からでも撃つ。
+        let mut world = naval_world(&["~~~~~.", "~~~~,.", "~~~~~."]);
+        spawn(&mut world, 1, UnitType::Battleship, 4, 1);
+        let tank = spawn(&mut world, 2, UnitType::Tank, 5, 2);
+        let (_, command) =
+            decide_naval_action(&mut world, PlayerId(1), &HashSet::default()).unwrap();
+        assert!(
+            matches!(command, AiCommand::Attack { target_entity, .. } if target_entity == tank),
+            "撃つはず: {command:?}"
+        );
     }
 
     #[test]
