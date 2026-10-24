@@ -166,18 +166,25 @@ impl SealiftContext {
             .iter()
             .flat_map(|(_, transport)| self.droppable_cargo(transport))
             .collect();
-        let defense = self.landing_exposure(site, &landed);
+        // 浜の守り（次の敵手番に降車セルを攻撃できる敵の生産費×HP）と近くの敵生産拠点からの
+        // 増援で判断する。
+        let defense = site.threat();
         let defended = defense > site.friendly;
-        let launch = !wave.is_empty()
-            && site.feasible()
-            && (!defended
-                || site.friendly * 100 >= tuning.ratio_percent * defense
-                // 停泊セルが少ない浜では、波の最少数を停泊セルの数で頭打ちにする。
-                || (wave.len() >= tuning.min_wave.min(site.free_stops)
-                    && (power * 100 >= tuning.ratio_percent * defense
-                        // 待ちが長い・浜が満杯なら、損害の見込みが上陸戦力の2倍に届かない限り出撃する。
-                        || (power * 2 >= defense
-                            && (waited >= tuning.max_wait || wave.len() >= site.free_stops)))));
+        // 停泊セルが少ない浜では、波の最少数を停泊セルの数で頭打ちにする。
+        let min_wave = tuning.min_wave.min(site.free_stops);
+        let by_strength = !defended
+            || site.friendly * 100 >= tuning.ratio_percent * defense
+            || (wave.len() >= min_wave
+                && (power * 100 >= tuning.ratio_percent * defense
+                    // 待ちが長い・浜が満杯でも、守りの半分に届かない上陸はしない。
+                    || (power * 2 >= defense
+                        && (waited >= tuning.max_wait || wave.len() >= site.free_stops))));
+        // 待ちが長い浜は、降ろした波が受ける損害の見込みで判断し直す。安い歩兵の群れで海岸線を
+        // 埋められると、生産費の守りは大きく見えるが、重戦車にはほとんど傷を付けられない。
+        let by_exposure = waited >= tuning.max_wait
+            && wave.len() >= min_wave
+            && power * 100 >= tuning.ratio_percent * self.landing_exposure(site, &landed);
+        let launch = !wave.is_empty() && site.feasible() && (by_strength || by_exposure);
         if std::env::var("OPENWARS_ASSAULT_TRACE").is_ok() {
             eprintln!(
                 "ASSAULT p{} T{turn} land{landmass} stops{:?} free{} route{:?}/{} counter{} reinf{} fr{} naval{} score{} wave{} power{} waited{} launch{launch}",

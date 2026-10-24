@@ -146,8 +146,6 @@ pub(crate) struct MaritimeTheater {
     pub(crate) enemy_battleships: u32,
     /// 自軍の戦艦の数。
     pub(crate) own_battleships: u32,
-    /// 自軍の港の近く（次の手番に移動して港を射程に収められる位置）に居る敵の戦艦の数。
-    pub(crate) enemy_battleships_near_ports: u32,
     /// 敵の航空機の数。
     pub(crate) enemy_aircraft: u32,
 }
@@ -204,16 +202,6 @@ impl MaritimeTheater {
                     theater.enemy_ships += 1;
                     if unit.stats.unit_type == UnitType::Battleship {
                         theater.enemy_battleships += 1;
-                        // 次の手番に移動して自軍の港を射程に収められる敵の戦艦。
-                        let reach = unit.stats.max_movement + unit.stats.max_range;
-                        if theater.own_ports.iter().any(|port| {
-                            board
-                                .map
-                                .distance(port.x, port.y, unit.position.x, unit.position.y)
-                                <= reach
-                        }) {
-                            theater.enemy_battleships_near_ports += 1;
-                        }
                     }
                 }
                 (MovementType::Ship, false) if unit.stats.unit_type == UnitType::Battleship => {
@@ -238,24 +226,21 @@ impl MaritimeTheater {
             && (self.capitals_separated_by_sea || self.enemy_ships > 0)
     }
 
+    /// 敵が艦隊（[`ENEMY_FLEET_BATTLESHIPS`] 隻以上の戦艦）を持ち、自軍の戦艦より多いか
+    /// （制海権を失っているか）。
+    ///
+    /// 制海権が無いと、敵の戦艦が自軍の港の沖に居座り、乗船を待つ輸送船を港で沈める。
+    /// 揚陸作戦の火力が足りていても、敵の戦艦に並ぶまでは戦艦を補う。序盤の1〜2隻では
+    /// 判断しない（地上部隊と輸送船の生産を止めると、島の確保と揚陸が遅れる）。
+    pub(crate) fn sea_contested(&self) -> bool {
+        self.naval_combat_is_useful()
+            && self.enemy_battleships >= ENEMY_FLEET_BATTLESHIPS
+            && self.own_battleships < self.enemy_battleships
+    }
+
     /// 同時に保有する戦艦の上限。
     ///
     /// 敵戦艦を先に射程へ捉えて数で上回れる数と、海を渡る作戦の火力支援を合わせる。
-    /// 敵の戦艦が自軍の戦艦より多く、制海権を失っているか。
-    ///
-    /// 制海権が無いと、敵の戦艦が自軍の港の沖に居座り、乗船を待つ輸送船を港で沈める。
-    /// 揚陸作戦の火力が足りていても、敵の戦艦に並ぶまでは戦艦を補う。敵が艦隊
-    /// （[`ENEMY_FLEET_BATTLESHIPS`] 隻以上）を持てば全ての戦艦を、そうでなければ自軍の港の
-    /// 近くの戦艦だけを数える（遠くの1隻で地上部隊の生産を止めない）。
-    pub(crate) fn sea_contested(&self) -> bool {
-        let threat = if self.enemy_battleships >= ENEMY_FLEET_BATTLESHIPS {
-            self.enemy_battleships
-        } else {
-            self.enemy_battleships_near_ports
-        };
-        self.naval_combat_is_useful() && self.own_battleships < threat
-    }
-
     pub(crate) fn battleship_cap(&self) -> u32 {
         if !self.naval_combat_is_useful() {
             return 0;
@@ -357,25 +342,30 @@ mod tests {
     }
 
     #[test]
-    fn enemy_battleship_off_own_port_contests_the_sea() {
-        // 自軍の港(2,0)の沖に敵の戦艦。自軍は戦艦を持たない。
+    fn enemy_fleet_contests_the_sea_until_matched() {
+        // 敵は戦艦3隻（艦隊）、自軍は戦艦を持たない。
         let rows = ["H.P~~~~~~~~~~~~~~~~~~~..H", "...~~~~~~~~~~~~~~~~~~~..."];
         let mut board = board_from_rows(&rows, &[(0, 0, 1), (2, 0, 1), (24, 0, 2)]);
-        board.units = vec![battleship(&board, 2, 6, 0)];
-        let theater = MaritimeTheater::observe(&board, PlayerId(1));
-        assert!(theater.sea_contested());
+        board.units = vec![
+            battleship(&board, 2, 18, 0),
+            battleship(&board, 2, 19, 0),
+            battleship(&board, 2, 20, 1),
+        ];
+        assert!(MaritimeTheater::observe(&board, PlayerId(1)).sea_contested());
 
         // 自軍が同じ数の戦艦を持てば、制海権を失っていない。
-        board.units.push(battleship(&board, 1, 4, 1));
+        for x in 4..7 {
+            board.units.push(battleship(&board, 1, x, 1));
+        }
         assert!(!MaritimeTheater::observe(&board, PlayerId(1)).sea_contested());
     }
 
     #[test]
-    fn single_distant_enemy_battleship_does_not_contest_the_sea() {
-        // 敵の戦艦1隻は自軍の港から遠い（次の手番に港を射程に収められない）。
+    fn a_few_enemy_battleships_do_not_contest_the_sea() {
+        // 敵の戦艦2隻は艦隊とみなさない（序盤の地上部隊の生産を止めない）。
         let rows = ["H.P~~~~~~~~~~~~~~~~~~~..H", "...~~~~~~~~~~~~~~~~~~~..."];
         let mut board = board_from_rows(&rows, &[(0, 0, 1), (2, 0, 1), (24, 0, 2)]);
-        board.units = vec![battleship(&board, 2, 21, 0)];
+        board.units = vec![battleship(&board, 2, 6, 0), battleship(&board, 2, 7, 1)];
         assert!(!MaritimeTheater::observe(&board, PlayerId(1)).sea_contested());
     }
 

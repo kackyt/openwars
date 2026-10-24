@@ -821,7 +821,7 @@ impl SealiftContext {
         }
         // 重戦闘部隊は敵首都の陸塊（決戦の場）へ優先して運ぶ。周辺の島の争奪には歩兵・
         // 装甲車を送り続け、重戦闘部隊を揚陸作戦の波にまとめる。
-        if info.enemy_capital {
+        if info.enemy_capital && std::env::var("OPENWARS_NO_HEAVYCAP").is_err() {
             let heavy = cargo
                 .iter()
                 .filter(|item| !item.carries_capturer() && item.stats.cost >= HEAVY_COMBAT_COST)
