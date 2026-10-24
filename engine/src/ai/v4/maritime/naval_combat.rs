@@ -9,6 +9,15 @@
 //!    射撃位置の中で被弾の少ないセルを選ぶ。届かなければ海路で最も近い射撃位置へ寄せる。
 //!    撃つには射程へ入るしかないので、被弾の見積もりで接近そのものは止めない。
 //! 3. 主兵装の弾切れ・燃料不足・大破のときは自軍の港へ戻って補給と修理を受ける。
+//!
+//! 撃てない戦艦の持ち場は役割で決める。
+//!
+//! - 護衛: 積荷を載せた輸送船に近い戦艦（輸送船2隻につき1隻）は、輸送船のそばに付き、
+//!   輸送船を狙える敵を優先して撃つ。輸送船は護衛の居ない敵艦の射程へは入らない
+//!   （[`super::sealift`]）。
+//! - 隘路の支援: 首都同士が隘路だけで結ばれた盤面（[`super::front`]）では、残りの戦艦が
+//!   隘路の出口の敵を砲撃し、陸路の部隊を前へ通す。
+//! - それ以外: 揚陸作戦の浜の守り、なければ次の手番に撃てる敵。
 
 use super::theater::{NAVAL_GUN_MAX_RANGE, cells_within_ring, is_navigable, sea_distances};
 use super::threat::ThreatMap;
@@ -33,6 +42,12 @@ const PORT_QUEUE_RADIUS: u32 = 2;
 const FUEL_MARGIN: u32 = 6;
 /// 停泊セルを空ける判断で、輸送船が1手番に進む距離の見積もり。
 const LANDER_REACH: u32 = 5;
+/// 護衛の戦艦が付く、輸送船からの距離。
+pub(crate) const ESCORT_RADIUS: u32 = 2;
+/// 隘路を塞ぐ敵とみなす、隘路のセルからの距離。
+const FRONT_RADIUS: u32 = 2;
+/// 護衛1隻が受け持つ、積荷を載せた輸送船の数。
+const LANDERS_PER_ESCORT: usize = 2;
 
 /// 自軍の戦艦のうち、まだ行動していない1隻の次の1手を返す。
 ///
@@ -81,6 +96,11 @@ pub(crate) fn decide_naval_action(
     let mut naval = NavalBoard::new(&board, &chart, &occupancy, player_id, cargo_costs);
     naval.beach = beach;
     naval.supports_landing = supports_landing;
+    let land = super::landmass::label_landmasses(&board);
+    naval.front = super::front::NarrowFront::observe_split(&board, player_id, &land)
+        .map(|front| front.corridor.into_iter().collect())
+        .unwrap_or_default();
+    naval.escorts = naval.assign_escorts();
 
     let mut best_fire: Option<(u32, Entity, AiCommand)> = None;
     for unit in board
@@ -160,6 +180,12 @@ struct NavalBoard<'a> {
     beach: Vec<(usize, usize)>,
     /// 上陸後の作戦（橋頭堡を起点にした首都攻略）を支援中か。撃てない戦艦を支援位置へ集める。
     supports_landing: bool,
+    /// 積荷を載せた輸送船の位置。
+    loaded_landers: Vec<GridPosition>,
+    /// 首都同士を結ぶ隘路のセル。隘路の盤面だけ。
+    front: Vec<(usize, usize)>,
+    /// 輸送船の護衛に就く戦艦。
+    escorts: HashSet<Entity>,
 }
 
 impl<'a> NavalBoard<'a> {
@@ -206,7 +232,7 @@ impl<'a> NavalBoard<'a> {
                 }
             }
         }
-        let landers = board
+        let lander_units: Vec<&BoardUnit> = board
             .units
             .iter()
             .filter(|unit| {
@@ -215,6 +241,11 @@ impl<'a> NavalBoard<'a> {
                     && super::sealift::is_sealift_transport(&unit.stats)
                     && unit.stats.movement_type == MovementType::Ship
             })
+            .collect();
+        let landers = lander_units.iter().map(|unit| unit.position).collect();
+        let loaded_landers = lander_units
+            .iter()
+            .filter(|unit| cargo_costs.get(&unit.entity).is_some_and(|cost| *cost > 0))
             .map(|unit| unit.position)
             .collect();
         Self {
@@ -230,7 +261,45 @@ impl<'a> NavalBoard<'a> {
             cargo_costs,
             beach: Vec::new(),
             supports_landing: false,
+            loaded_landers,
+            front: Vec::new(),
+            escorts: HashSet::default(),
         }
+    }
+
+    /// 積荷を載せた輸送船2隻につき1隻の戦艦を、輸送船に海路で近い順に護衛へ就ける。
+    fn assign_escorts(&self) -> HashSet<Entity> {
+        if self.loaded_landers.is_empty() {
+            return HashSet::default();
+        }
+        let to_landers = sea_distances(
+            self.board,
+            self.loaded_landers
+                .iter()
+                .map(|lander| (lander.x, lander.y)),
+        );
+        let mut warships: Vec<(u32, Entity)> = self
+            .board
+            .units
+            .iter()
+            .filter(|unit| {
+                unit.owner == self.player_id && unit.is_deployed() && is_warship(&unit.stats)
+            })
+            .map(|unit| {
+                let distance = to_landers
+                    .get(&(unit.position.x, unit.position.y))
+                    .copied()
+                    .unwrap_or(u32::MAX);
+                (distance, unit.entity)
+            })
+            .collect();
+        warships.sort_unstable();
+        let count = self.loaded_landers.len().div_ceil(LANDERS_PER_ESCORT);
+        warships
+            .into_iter()
+            .take(count)
+            .map(|(_, entity)| entity)
+            .collect()
     }
 
     fn distance(&self, a: GridPosition, b: GridPosition) -> u32 {
@@ -279,7 +348,8 @@ impl<'a> NavalBoard<'a> {
         value
     }
 
-    /// 射撃の価値。揚陸作戦の浜を守る地上部隊は上乗せする。
+    /// 射撃の価値。揚陸作戦の浜を守る地上部隊、隘路を塞ぐ地上部隊、積荷を載せた輸送船を
+    /// 狙える敵は上乗せする。
     fn target_value(&self, defender: &BoardUnit, damage: u32) -> u32 {
         let value = self.damage_value(defender, damage);
         let tuning = super::sealift::assault_tuning();
@@ -290,11 +360,37 @@ impl<'a> NavalBoard<'a> {
                     .distance(stop.0, stop.1, defender.position.x, defender.position.y)
                     <= tuning.defense_radius
             });
-        if guards_beach {
+        if guards_beach || self.blocks_front(defender) || self.threatens_landers(defender) {
             value.saturating_mul(100 + tuning.beach_fire_bonus_percent) / 100
         } else {
             value
         }
+    }
+
+    /// 隘路の中か出口で、陸路の部隊を塞ぐ敵の地上部隊か。
+    fn blocks_front(&self, enemy: &BoardUnit) -> bool {
+        super::landmass::is_ground(enemy)
+            && self.front.iter().any(|cell| {
+                self.board
+                    .map
+                    .distance(cell.0, cell.1, enemy.position.x, enemy.position.y)
+                    <= FRONT_RADIUS
+            })
+    }
+
+    /// 次の敵手番に、積荷を載せた輸送船を撃てる敵か（移動して隣接するか、移動せずに撃つ）。
+    fn threatens_landers(&self, enemy: &BoardUnit) -> bool {
+        let reach = if enemy.stats.min_range > 1 {
+            enemy.stats.max_range
+        } else {
+            enemy.stats.max_movement.saturating_add(1)
+        };
+        self.loaded_landers.iter().any(|lander| {
+            self.board
+                .map
+                .distance(lander.x, lander.y, enemy.position.x, enemy.position.y)
+                <= reach
+        })
     }
 
     /// 輸送部隊に搭載中の部隊の価値（撃沈で同時に失われる）。
@@ -386,12 +482,15 @@ impl<'a> NavalBoard<'a> {
         // 弾薬を満載した状態で撃てるかで決める。
         let mut rearmed = unit.clone();
         rearmed.ammo = Some((unit.stats.max_ammo1, unit.stats.max_ammo2));
-        let support =
-            if self.supports_landing || super::sealift::assault_tuning().battleship_support {
-                self.beach_support_cells(&rearmed)
-            } else {
-                HashSet::default()
-            };
+        let support = if self.escorts.contains(&unit.entity) {
+            self.escort_cells()
+        } else if !self.front.is_empty() {
+            self.front_support_cells(&rearmed)
+        } else if self.supports_landing || super::sealift::assault_tuning().battleship_support {
+            self.beach_support_cells(&rearmed)
+        } else {
+            HashSet::default()
+        };
         let (station, focus) = if support.is_empty() {
             (self.firing_cells(&rearmed), None)
         } else {
@@ -546,6 +645,51 @@ impl<'a> NavalBoard<'a> {
                         NAVAL_GUN_MAX_RANGE,
                     )
                     .filter(|cell| is_navigable(self.board, cell.0, cell.1)),
+                );
+            }
+        }
+        cells
+    }
+
+    /// 護衛の持ち場: 積荷を載せた輸送船から [`ESCORT_RADIUS`] 以内の海上セル。
+    fn escort_cells(&self) -> HashSet<(usize, usize)> {
+        let map = &self.board.map;
+        self.loaded_landers
+            .iter()
+            .flat_map(|lander| cells_within_ring(map, *lander, 1, ESCORT_RADIUS))
+            .filter(|cell| is_navigable(self.board, cell.0, cell.1) && !self.berths.contains(cell))
+            .collect()
+    }
+
+    /// 隘路の支援の持ち場: 隘路を塞ぐ敵の地上部隊を撃てる海上セル。居なければ隘路を
+    /// 射程に捉える海上セル。
+    fn front_support_cells(&self, unit: &BoardUnit) -> HashSet<(usize, usize)> {
+        let map = &self.board.map;
+        let mut cells = HashSet::default();
+        for blocker in self.enemies.iter().filter(|enemy| self.blocks_front(enemy)) {
+            for cell in cells_within_ring(map, blocker.position, 2, NAVAL_GUN_MAX_RANGE) {
+                if !cells.contains(&cell)
+                    && is_navigable(self.board, cell.0, cell.1)
+                    && self.expected_damage(
+                        unit,
+                        blocker,
+                        blocker.position,
+                        map.distance(cell.0, cell.1, blocker.position.x, blocker.position.y),
+                    ) > 0
+                {
+                    cells.insert(cell);
+                }
+            }
+        }
+        if cells.is_empty() {
+            for cell in &self.front {
+                let position = GridPosition {
+                    x: cell.0,
+                    y: cell.1,
+                };
+                cells.extend(
+                    cells_within_ring(map, position, 2, NAVAL_GUN_MAX_RANGE)
+                        .filter(|cell| is_navigable(self.board, cell.0, cell.1)),
                 );
             }
         }
@@ -714,7 +858,7 @@ struct NavalStop {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::v4::maritime::test_support::{naval_world, property, spawn};
+    use crate::ai::v4::maritime::test_support::{load, naval_world, property, spawn};
 
     #[test]
     fn battleship_fires_without_moving_when_enemy_is_in_range() {
@@ -960,5 +1104,24 @@ mod tests {
         spawn(&mut world, 2, UnitType::Tank, 5, 1);
         let skip = HashSet::from_iter([battleship]);
         assert!(decide_naval_action(&mut world, PlayerId(1), &skip).is_none());
+    }
+
+    #[test]
+    fn escort_battleship_joins_the_loaded_lander_instead_of_chasing_targets() {
+        // 積荷を載せた輸送船(1,1)の護衛に就いた戦艦(8,1)は、隣の敵戦車（近すぎて撃てない）を
+        // 撃てる位置へ下がるのではなく、輸送船のそばへ戻る。
+        let mut world = naval_world(&["~~~~~~~~~.", "~~~~~~~~~.", "~~~~~~~~~."]);
+        let lander = spawn(&mut world, 1, UnitType::Lander, 1, 1);
+        load(&mut world, lander, UnitType::Infantry, 1);
+        let battleship = spawn(&mut world, 1, UnitType::Battleship, 8, 1);
+        spawn(&mut world, 2, UnitType::Tank, 9, 1);
+
+        let (entity, command) =
+            decide_naval_action(&mut world, PlayerId(1), &HashSet::default()).unwrap();
+        assert_eq!(entity, battleship);
+        let AiCommand::Wait { target_pos } = command else {
+            panic!("輸送船のそばへ移るはず: {command:?}");
+        };
+        assert!(target_pos.x <= 5, "輸送船へ寄る: {target_pos:?}");
     }
 }

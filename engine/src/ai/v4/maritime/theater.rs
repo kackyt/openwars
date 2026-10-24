@@ -27,15 +27,15 @@ pub(crate) struct Components {
 impl Components {
     /// 指定移動タイプで通行できるセルを、隣接で連結した成分へ塗り分ける。
     pub(crate) fn label(board: &PlayerBoard, movement: MovementType) -> Self {
+        Self::label_where(board, |x, y| is_passable(board, movement, x, y))
+    }
+
+    /// `passable` を満たすセルを、隣接で連結した成分へ塗り分ける。
+    pub(crate) fn label_where(
+        board: &PlayerBoard,
+        passable: impl Fn(usize, usize) -> bool,
+    ) -> Self {
         let map = &board.map;
-        let passable = |x: usize, y: usize| {
-            map.get_terrain(x, y).is_some_and(|terrain| {
-                board
-                    .registry
-                    .get_movement_cost(movement, terrain.as_str())
-                    .is_some_and(|cost| cost < 99)
-            })
-        };
         let mut labels = vec![None; map.width * map.height];
         let mut next = 0_u32;
         for y in 0..map.height {
@@ -73,14 +73,19 @@ impl Components {
     }
 }
 
-/// 艦船が通行できるセルか（海・浅瀬・港）。
-pub(crate) fn is_navigable(board: &PlayerBoard, x: usize, y: usize) -> bool {
+/// 指定移動タイプで通行できるセルか。
+pub(crate) fn is_passable(board: &PlayerBoard, movement: MovementType, x: usize, y: usize) -> bool {
     board.map.get_terrain(x, y).is_some_and(|terrain| {
         board
             .registry
-            .get_movement_cost(MovementType::Ship, terrain.as_str())
+            .get_movement_cost(movement, terrain.as_str())
             .is_some_and(|cost| cost < 99)
     })
+}
+
+/// 艦船が通行できるセルか（海・浅瀬・港）。
+pub(crate) fn is_navigable(board: &PlayerBoard, x: usize, y: usize) -> bool {
+    is_passable(board, MovementType::Ship, x, y)
 }
 
 /// 複数の起点から、艦船の通行可能セルだけをたどった歩数を求める（占有は無視する）。
@@ -134,6 +139,8 @@ pub(crate) fn cells_within_ring(
 pub(crate) struct MaritimeTheater {
     /// 敵首都が自軍首都と別の陸塊（[`super::landmass::label_landmasses`]）にあるか。
     pub(crate) capitals_separated_by_sea: bool,
+    /// 首都同士が隘路だけで結ばれ、海路でも行き来できるか（[`super::front`]）。
+    pub(crate) narrow_front: bool,
     /// 自軍所有の港の座標。
     pub(crate) own_ports: Vec<GridPosition>,
     /// 自軍所有の空港の座標。
@@ -175,7 +182,12 @@ impl MaritimeTheater {
             })
             .filter_map(|property| land.at(property.position))
             .collect();
-        let capitals_separated_by_sea = !enemy_capital_landmasses.is_empty()
+        // 隘路で分けた陸塊は陸続きなので、海で隔てられた盤面としては扱わない（航空機で
+        // 陸塊を越える必要は無い）。戦艦は隘路の支援と輸送船の護衛に使う。
+        let narrow_front =
+            super::front::NarrowFront::observe_split(board, player_id, &land).is_some();
+        let capitals_separated_by_sea = !narrow_front
+            && !enemy_capital_landmasses.is_empty()
             && enemy_capital_landmasses.is_disjoint(&home_landmasses);
 
         let owned = |terrain: Terrain| -> Vec<GridPosition> {
@@ -191,6 +203,7 @@ impl MaritimeTheater {
 
         let mut theater = Self {
             capitals_separated_by_sea,
+            narrow_front,
             own_ports,
             own_airports,
             ..Self::default()
@@ -218,12 +231,13 @@ impl MaritimeTheater {
     /// 艦船（戦艦）が戦闘に寄与できる戦域か。
     ///
     /// 港から射程へ捉えられる敵が居ることを前提に、海を渡らないと敵首都へ届かない
-    /// 盤面か、敵が艦船を出している盤面だけを対象にする。陸続きで敵も艦船を
+    /// 盤面、隘路だけで結ばれた盤面（隘路の支援と輸送船の護衛）か、敵が艦船を出している
+    /// 盤面だけを対象にする。陸続きで敵も艦船を
     /// 持たない盤面では、港があっても艦船へ資金を割かない。
     pub(crate) fn naval_combat_is_useful(&self) -> bool {
         !self.own_ports.is_empty()
             && self.coastal_targets_in_reach
-            && (self.capitals_separated_by_sea || self.enemy_ships > 0)
+            && (self.capitals_separated_by_sea || self.narrow_front || self.enemy_ships > 0)
     }
 
     /// 敵が艦隊（[`ENEMY_FLEET_BATTLESHIPS`] 隻以上の戦艦）を持ち、自軍の戦艦より多いか

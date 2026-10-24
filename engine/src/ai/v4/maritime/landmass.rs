@@ -9,11 +9,13 @@
 //! 車両の通行可否で陸塊を塗り分け、海で隔てられた陸塊と同じく揚陸作戦の対象にする
 //! （[`label_landmasses`]）。
 
+use super::front::NarrowFront;
 use super::theater::Components;
 use crate::ai::context::board::{BoardUnit, PlayerBoard};
-use crate::collections::HashMap;
+use crate::collections::{HashMap, HashSet};
 use crate::components::{GridPosition, PlayerId};
 use crate::resources::{MovementType, Terrain};
+use bevy_ecs::entity::Entity;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
@@ -74,6 +76,12 @@ impl LandmassInfo {
 pub(crate) struct Landmasses {
     pub(crate) land: Components,
     pub(crate) info: HashMap<u32, LandmassInfo>,
+    /// 自軍の首都と敵の首都を結ぶ隘路（[`super::front`]）。隘路で陸塊を分けた盤面だけ。
+    pub(crate) front: Option<NarrowFront>,
+    /// 隘路を押し進む陸路の部隊。本拠に居ても取り残された部隊として扱わない。
+    pub(crate) land_force: HashSet<Entity>,
+    /// 陸路の部隊の割当数に対する不足。
+    pub(crate) land_force_shortfall: usize,
 }
 
 /// 地上を移動する部隊か（航空・艦船を除く）。
@@ -90,6 +98,8 @@ pub(crate) fn is_ground(unit: &BoardUnit) -> bool {
 /// 戦車の陸路でつながらず、その間の歩兵しか通れない区間（山道など）を歩兵が抜けるのに
 /// [`FOOT_PASS_MAX_COST`] を超える移動コストがかかる盤面では、戦車の通行可否で塗り分ける。
 /// 短い峠（山1〜2マス）なら歩兵が陸路で攻め込める方が早いので、歩兵の陸塊のままにする。
+///
+/// 首都同士を結ぶ戦車の陸路が細い隘路だけの盤面は、[`super::front`] が隘路で分ける。
 pub(crate) fn label_landmasses(board: &PlayerBoard) -> Components {
     let foot = Components::label(board, MovementType::Infantry);
     let capitals: Vec<(PlayerId, GridPosition)> = board
@@ -118,7 +128,11 @@ pub(crate) fn label_landmasses(board: &PlayerBoard) -> Components {
         vehicle.at(*a) != vehicle.at(*b)
             && foot_pass_cost(board, &vehicle, *a, *b).is_some_and(|cost| cost > FOOT_PASS_MAX_COST)
     });
-    if long_pass { vehicle } else { foot }
+    if long_pass {
+        return vehicle;
+    }
+    // 戦車の陸路が細い隘路だけなら、隘路を外して両側を別の陸塊にする。
+    super::front::split_narrow_fronts(board, foot, &linked_by_foot)
 }
 
 /// `from` から `to` へ歩兵が歩くときの、戦車の通れないセルでかかる移動コストの最小値。
@@ -164,6 +178,53 @@ fn foot_pass_cost(
         }
     }
     None
+}
+
+/// 隘路を押し進む陸路の部隊と、その割当数に対する不足。
+///
+/// 隘路に居る自軍の地上部隊は陸路の部隊。残りの枠は本拠側の地上部隊から、間接射撃の部隊
+/// （移動後に撃てず、揚陸しても浜で戦えない）、隘路に近い部隊の順に割り当てる。割り当てない
+/// 部隊は海路の部隊として揚陸作戦へ回る。
+fn assign_land_force(
+    board: &PlayerBoard,
+    player_id: PlayerId,
+    front: &NarrowFront,
+) -> (HashSet<Entity>, usize) {
+    let map = &board.map;
+    let own_ground = || {
+        board
+            .units
+            .iter()
+            .filter(|unit| unit.owner == player_id && unit.is_deployed() && is_ground(unit))
+    };
+    let cell = |unit: &BoardUnit| (unit.position.x, unit.position.y);
+    let mut land_force: HashSet<Entity> = own_ground()
+        .filter(|unit| front.corridor.contains(&cell(unit)))
+        .map(|unit| unit.entity)
+        .collect();
+    let distance_to_corridor = |unit: &BoardUnit| {
+        front
+            .corridor
+            .iter()
+            .map(|corridor| map.distance(corridor.0, corridor.1, unit.position.x, unit.position.y))
+            .min()
+            .unwrap_or(u32::MAX)
+    };
+    let mut candidates: Vec<&BoardUnit> = own_ground()
+        .filter(|unit| front.home_side.contains(&cell(unit)))
+        .collect();
+    candidates.sort_by_key(|unit| {
+        (
+            unit.stats.min_range <= 1,
+            distance_to_corridor(unit),
+            unit.entity,
+        )
+    });
+    let quota = front.land_force_quota();
+    let open = quota.saturating_sub(land_force.len());
+    land_force.extend(candidates.iter().take(open).map(|unit| unit.entity));
+    let shortfall = quota.saturating_sub(land_force.len());
+    (land_force, shortfall)
 }
 
 impl Landmasses {
@@ -216,7 +277,19 @@ impl Landmasses {
                 .unowned
                 .sort_by_key(|position| (position.y, position.x));
         }
-        Self { land, info }
+        // 隘路で陸塊を分けた盤面では、陸路と海路へ戦力を割り当てる。
+        let front = NarrowFront::observe_split(board, player_id, &land);
+        let (land_force, land_force_shortfall) = front
+            .as_ref()
+            .map(|front| assign_land_force(board, player_id, front))
+            .unwrap_or_default();
+        Self {
+            land,
+            info,
+            front,
+            land_force,
+            land_force_shortfall,
+        }
     }
 
     /// 座標の陸塊の事実。
@@ -228,9 +301,9 @@ impl Landmasses {
     /// 自軍の地上部隊が今の陸塊で仕事を持たないか。
     ///
     /// 占領役は未所有拠点も敵部隊も無い陸塊で、戦闘役は敵部隊も敵拠点も無い陸塊で
-    /// 取り残されている。
+    /// 取り残されている。隘路を押し進む陸路の部隊は取り残されていない。
     pub(crate) fn is_stranded(&self, unit: &BoardUnit) -> bool {
-        if !is_ground(unit) || !unit.is_deployed() {
+        if !is_ground(unit) || !unit.is_deployed() || self.land_force.contains(&unit.entity) {
             return false;
         }
         let Some((_, info)) = self.at(unit.position) else {
@@ -334,5 +407,52 @@ mod tests {
             landmasses.at(GridPosition { x: 0, y: 0 }).map(|(id, _)| id),
             landmasses.at(GridPosition { x: 0, y: 2 }).map(|(id, _)| id)
         );
+    }
+
+    #[test]
+    fn narrow_front_sends_nearby_and_indirect_units_by_land_and_the_rest_by_sea() {
+        // 首都同士は1マス幅の地峡（x=3, y=3..6）でしかつながらず、両側に港がある。
+        // 陸路の部隊は経路1本あたり6部隊: 間接射撃の自走砲と、地峡に近い戦車から割り当てる。
+        let rows = [
+            "~~~~~~~", "~HP...~", "~.....~", "~.....~", "~~~.~~~", "~~~.~~~", "~.....~", "~HP...~",
+            "~~~~~~~",
+        ];
+        let mut board = board_from_rows(&rows, &[(1, 1, 1), (2, 1, 1), (1, 7, 2), (2, 7, 2)]);
+        let artillery = unit(&board, 1, UnitType::Artillery, 1, 2);
+        let near: Vec<BoardUnit> = [(2, 3), (4, 3), (3, 2)]
+            .into_iter()
+            .map(|(x, y)| unit(&board, 1, UnitType::Tank, x, y))
+            .collect();
+        let middle: Vec<BoardUnit> = [(2, 2), (4, 2)]
+            .into_iter()
+            .map(|(x, y)| unit(&board, 1, UnitType::Tank, x, y))
+            .collect();
+        let far: Vec<BoardUnit> = [(5, 1), (4, 1)]
+            .into_iter()
+            .map(|(x, y)| unit(&board, 1, UnitType::Tank, x, y))
+            .collect();
+        board.units = std::iter::once(artillery.clone())
+            .chain(near.iter().cloned())
+            .chain(middle.iter().cloned())
+            .chain(far.iter().cloned())
+            .collect();
+        let landmasses = Landmasses::observe(&board, PlayerId(1));
+        assert!(landmasses.front.is_some());
+        assert_eq!(landmasses.land_force.len(), 6);
+        assert!(!landmasses.is_stranded(&artillery));
+        for tank in near.iter().chain(&middle) {
+            assert!(
+                !landmasses.is_stranded(tank),
+                "陸路の部隊: {:?}",
+                tank.position
+            );
+        }
+        for tank in &far {
+            assert!(
+                landmasses.is_stranded(tank),
+                "海路の部隊: {:?}",
+                tank.position
+            );
+        }
     }
 }

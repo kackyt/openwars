@@ -16,6 +16,7 @@
 
 pub(crate) mod carrier;
 pub(crate) mod force_balance;
+pub(crate) mod front;
 pub(crate) mod landmass;
 pub(crate) mod naval_combat;
 pub(crate) mod production;

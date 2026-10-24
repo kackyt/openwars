@@ -28,6 +28,7 @@ pub(crate) use assault::{AssaultPlans, tuning as assault_tuning};
 pub(crate) use landing_site::strength as landing_site_strength;
 
 use super::landmass::{Landmasses, is_ground};
+use super::naval_combat::is_warship;
 use super::theater::sea_distances;
 use super::threat::ThreatMap;
 use crate::ai::command::AiCommand;
@@ -162,10 +163,11 @@ pub(crate) fn decide_port_relief(
         .map(|(entity, ..)| entity)
         .min()?;
     let context = SealiftContext::observe(world, player_id, skip);
-    // 港・空港の生産が戦局に効く盤面（海で隔てられた首都、または敵が艦船を出している）に
-    // 限る。陸続きの盤面では、手番の初めに退かせると攻撃の機会を奪うだけになる。
+    // 港・空港の生産が戦局に効く盤面（海で隔てられた首都、隘路だけで結ばれた首都、または
+    // 敵が艦船を出している）に限る。陸続きの盤面では、手番の初めに退かせると攻撃の機会を
+    // 奪うだけになる。
     let theater = super::theater::MaritimeTheater::observe(&context.board, player_id);
-    if !theater.capitals_separated_by_sea && theater.enemy_ships == 0 {
+    if !theater.capitals_separated_by_sea && !theater.narrow_front && theater.enemy_ships == 0 {
         return None;
     }
     let unit = context
@@ -483,6 +485,8 @@ impl SealiftContext {
                     && !unit.stats.can_capture
                     && !is_ground_carrier(unit)
                     && on_home(unit)
+                    // 隘路を押し進む陸路の部隊は守りにも輸送にも回さない。
+                    && !self.landmasses.land_force.contains(&unit.entity)
             })
             .collect();
         combat.sort_by_key(|unit| (distance_to_enemy(unit), unit.entity));
@@ -1134,6 +1138,9 @@ impl SealiftContext {
                     (
                         blocks_production,
                         threat_hp >= hp,
+                        // 輸送船は護衛の戦艦が付かない限り敵艦の射程へ入らない。
+                        transport.stats.movement_type == MovementType::Ship
+                            && self.unescorted_under_naval_fire(cell),
                         distance.div_ceil(movement),
                         threat_hp,
                         distance,
@@ -1151,6 +1158,33 @@ impl SealiftContext {
                 y: cell.1,
             },
         })
+    }
+
+    /// セル `cell` が敵の戦艦の射程内で、近くに自軍の戦艦（護衛）が居ないか。
+    ///
+    /// 戦艦は移動した手番に撃てないため、射程は今の位置から数える。護衛は
+    /// [`super::naval_combat::ESCORT_RADIUS`] 以内の自軍の戦艦。
+    fn unescorted_under_naval_fire(&self, cell: (usize, usize)) -> bool {
+        let map = &self.board.map;
+        let warships = || {
+            self.board
+                .units
+                .iter()
+                .filter(|unit| unit.is_deployed() && is_warship(&unit.stats))
+        };
+        let under_fire = warships()
+            .filter(|unit| unit.owner != self.player_id)
+            .any(|enemy| {
+                let distance = map.distance(cell.0, cell.1, enemy.position.x, enemy.position.y);
+                (enemy.stats.min_range..=enemy.stats.max_range).contains(&distance)
+            });
+        under_fire
+            && !warships()
+                .filter(|unit| unit.owner == self.player_id)
+                .any(|escort| {
+                    map.distance(cell.0, cell.1, escort.position.x, escort.position.y)
+                        <= super::naval_combat::ESCORT_RADIUS
+                })
     }
 
     /// 積荷を載せた輸送部隊を、最も価値の高い陸塊の揚陸地点へ進める。
@@ -1930,5 +1964,56 @@ mod tests {
             panic!("空港へ戻るはず: {command:?}");
         };
         assert_eq!(target_pos, GridPosition { x: 0, y: 0 });
+    }
+
+    /// 右の島に中立都市、中央の海の下側(10,2)に敵の戦艦（射程2〜6）。積荷を載せた輸送船は(4,1)。
+    fn lander_facing_enemy_battleship() -> (World, Entity) {
+        let mut world = naval_world(&["H.~~~~~~~~~~,C..", "..~~~~~~~~~~~~..", "..~~~~~~~~~~~~.."]);
+        property(&mut world, 1, 0, 0);
+        property(&mut world, 0, 13, 0);
+        let lander = spawn(&mut world, 1, UnitType::Lander, 4, 1);
+        load(&mut world, lander, UnitType::Infantry, 1);
+        spawn(&mut world, 2, UnitType::Battleship, 10, 2);
+        (world, lander)
+    }
+
+    fn under_enemy_fire(position: GridPosition) -> bool {
+        let distance = position.x.abs_diff(10) + position.y.abs_diff(2);
+        (2..=6).contains(&distance)
+    }
+
+    #[test]
+    fn unescorted_lander_stays_out_of_enemy_battleship_range() {
+        let (mut world, lander) = lander_facing_enemy_battleship();
+
+        let (entity, command) = decide(&mut world).unwrap();
+        assert_eq!(entity, lander);
+        let AiCommand::Wait { target_pos } = command else {
+            panic!("射程の外で待つはず: {command:?}");
+        };
+        assert!(
+            !under_enemy_fire(target_pos),
+            "護衛無しで射程へ入った: {target_pos:?}"
+        );
+    }
+
+    #[test]
+    fn escorted_lander_sails_into_enemy_battleship_range() {
+        let (mut world, lander) = lander_facing_enemy_battleship();
+        // 護衛の戦艦は輸送船の前方(8,1)。射程へ入れば浜へ1手番早く着く。戦艦は行動済みに
+        // して、輸送の判断だけを見る。
+        let escort = spawn(&mut world, 1, UnitType::Battleship, 8, 1);
+        world.entity_mut(escort).insert(ActionCompleted(true));
+        world.entity_mut(escort).insert(HasMoved(true));
+
+        let (entity, command) = decide(&mut world).unwrap();
+        assert_eq!(entity, lander);
+        let AiCommand::Wait { target_pos } = command else {
+            panic!("護衛と共に進むはず: {command:?}");
+        };
+        assert!(
+            under_enemy_fire(target_pos),
+            "護衛と共に射程へ進む: {target_pos:?}"
+        );
     }
 }

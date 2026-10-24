@@ -186,6 +186,15 @@ pub(crate) fn rejects_ground_purchase(
     let Some((_, info)) = landmasses.at(site) else {
         return false;
     };
+    // 隘路を押し進む陸路の部隊が足りない間は、本拠側の地上部隊を買い足す。
+    if landmasses.land_force_shortfall > 0
+        && landmasses
+            .front
+            .as_ref()
+            .is_some_and(|front| front.home_side.contains(&(site.x, site.y)))
+    {
+        return false;
+    }
     let site_has_work = if stats.can_capture {
         !info.unowned.is_empty() || info.enemy_ground > 0
     } else {
