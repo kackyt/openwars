@@ -1,11 +1,11 @@
 ---
 title: "PLAYBOOK"
-version: "1.21.0"
+version: "1.22.0"
 status: "approved"
 created: "2026-06-06"
-updated: "2026-10-22"
+updated: "2026-10-25"
 owner: "@t_kak"
-ace_entry_count: 48
+ace_entry_count: 50
 tags: [ace, playbook, knowledge-management]
 references:
   - docs/ACE_FRAMEWORK.md
@@ -164,8 +164,8 @@ Playbook が 800 行を超えた場合、以下のように分割する：
 
 | カテゴリ | サブファイル | エントリ数 | 主な内容 |
 | -------- | ------------ | ---------- | -------- |
-| `architecture` | [Architecture](./playbook/architecture.md) | 24 件 | 設計判断、構造上の決定事項、状態管理 |
-| `performance` | [Performance](./playbook/performance.md) | 9 件 | パフォーマンス最適化、キャッシュ、計算量削減 |
+| `architecture` | [Architecture](./playbook/architecture.md) | 25 件 | 設計判断、構造上の決定事項、状態管理 |
+| `performance` | [Performance](./playbook/performance.md) | 10 件 | パフォーマンス最適化、キャッシュ、計算量削減 |
 | `coding` | [Coding](./playbook/coding.md) | 5 件 | コーディングパターン、言語固有・型安全のベストプラクティス |
 | `testing` | [Testing](./playbook/testing.md) | 5 件 | テスト戦略、テストパターン、モック・シミュレーション設計 |
 | `tooling` | [Tooling](./playbook/tooling.md) | 4 件 | ツール設定、ログ出力・可視化、開発環境・スキル |
@@ -227,10 +227,19 @@ Playbook が 800 行を超えた場合、以下のように分割する：
 | [ACE-103-3](./playbook/process.md#ace-103-3) | 構造整理・状態整合化リファクタリングとゲーム挙動・バランス調整の厳格な分離 | `process` | PR #103 | `active` | [詳細](./playbook/process.md#ace-103-3) |
 | [ACE-104-1](./playbook/architecture.md#ace-104-1) | 敵生産口の占位（Blockade）と重要拠点占領の優先度昇格による補充サイクルの遮断 | `architecture` | PR #104 | `active` | [詳細](./playbook/architecture.md#ace-104-1) |
 | [ACE-104-2](./playbook/testing.md#ace-104-2) | イベントログ精査による直感的仮説の反証とボトルネック特定 | `testing` | PR #104 | `active` | [詳細](./playbook/testing.md#ace-104-2) |
+| [ACE-105-1](./playbook/performance.md#ace-105-1) | 輸送ユニット割当における指数全探索から増加路法二部マッチングへの置換とスロット更新 | `performance` | PR #105 | `active` | [詳細](./playbook/performance.md#ace-105-1) |
+| [ACE-105-2](./playbook/architecture.md#ace-105-2) | 待機・編成中（Forming）ユニットに対する足元拠点占領ガードによる作戦フェーズ停止の防止 | `architecture` | PR #105 | `active` | [詳細](./playbook/architecture.md#ace-105-2) |
 
 ---
 
 ## Changelog
+
+### [1.22.0] - 2026-10-25
+
+#### 追加
+
+- PR #105 より知見抽出: ACE-105-1 (performance), ACE-105-2 (architecture)
+- カウンター更新: ACE-103-1 (architecture) helpful+1
 
 ### [1.21.0] - 2026-10-22
 

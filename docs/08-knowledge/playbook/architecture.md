@@ -1,12 +1,12 @@
 ---
 title: "PLAYBOOK - Architecture"
 category: "architecture"
-version: "1.2.0"
+version: "1.3.0"
 status: "approved"
 created: "2026-08-15"
-updated: "2026-10-22"
+updated: "2026-10-25"
 owner: "@t_kak"
-ace_entry_count: 24
+ace_entry_count: 25
 tags: [ace, playbook, architecture]
 references:
   - docs/08-knowledge/PLAYBOOK.md
@@ -432,7 +432,7 @@ references:
 | Category   | architecture |
 | Origin     | PR #103 |
 | Date       | 2026-10-17 |
-| Helpful    | 0 |
+| Helpful    | 1 |
 | Harmful    | 0 |
 | Status     | active |
 
@@ -481,3 +481,22 @@ references:
 **Context**: PR #104 において、終盤 map_6 で敵首都 (4,16) 周辺の工場から毎ターン新造ユニットが湧き出し、自軍の攻撃回数（1手番約10回）と敵の補充ペースが拮抗して首都を落とせない問題が発生していた。また占領役が敵首都上に到達しても隣の敵への攻撃を優先していた。小規模マップ向けだった「敵生産口の占位」と「占領の実行」の優先度を標準マップ経路へ導入し、予約地解放ロジック（`vacate_reserved_capture_sites`）を緩和した結果、map_6 で 64局中64局全局撃破（53/64 → 64/64、撃破率100%）を達成した。
 
 **Action**: 終盤の拠点戦役において、敵生産圏内の敵工場等への占位（次ターン生存可能時）および目標拠点の占領実行を、通常の交戦（Attack）より上位の優先度（Priority）として評価パイプラインに組み込む。また、占領予約（Capture reservation）によって味方の戦闘ユニットが敵生産口へ進入・占位するのを不当にブロックしないよう、予約地解放の例外規則を設ける。
+
+<a id="ace-105-2"></a>
+
+### ACE-105-2: 待機・編成中（Forming）ユニットに対する足元拠点占領ガードによる作戦フェーズ停止の防止
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | architecture |
+| Origin     | PR #105 |
+| Date       | 2026-10-25 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: ユニットが上位作戦（首都強襲など）の集合・輸送待ち（Forming）状態にある場合でも、現在位置が未所有拠点上であればその場での占領行動（Capture）を最優先で許可・実行させないと、待機ユニットが拠点を踏んだまま占領せず、後続フェーズの開放条件（島内拠点全制圧ゲート）が永久に満たされないデッドロックに陥る。
+
+**Context**: PR #105 において、map_18 の中央島で中立空港群の制圧後、首都強襲用の輸送待ち（Forming）に移された歩兵が未所有の都市・拠点を踏んだまま直立不動になり、島内完全制圧ゲートが開かず終盤まで敵本土への強襲が開始されない問題が発生した。これを解消するため `v4::forming_capture` による足元拠点の即時占領フォールバックを導入した。
+
+**Action**: 部隊編成中や輸送待ちなどの「待機状態（Forming / Waiting）」にあるユニットであっても、足元が有効な占領対象（未所有物件）である場合は、待機状態の制約をバイパスして即座に占領コマンドを発行するフォールバック判定を設ける。
