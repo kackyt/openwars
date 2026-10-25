@@ -7,11 +7,11 @@
 use super::approach::{ApproachDistances, nearest_approach_bonus, with_turn_distances};
 use super::board::{SquadRoles, TacticalBoard, movable_units_and_occupancy};
 use super::scoring::{
-    BestAction, BestUnitAction, CAPTURE_SCORE, assess_attack, assess_merge, attack_serves_campaign,
-    capture_or_hunt_score, direct_threat_terrain_score, empty_transport_return_score,
-    reference_point_approach_score, reference_reach, repair_site_at, solo_enemy_approach_score,
-    squad_target_approach_score, stranded_infantry_score, terrain_defense_bonus,
-    v3_positioning_score, wait_recovery_score,
+    BestAction, BestUnitAction, CAPTURE_SCORE, FOREIGN_PRODUCTION_BLOCK_PENALTY, assess_attack,
+    assess_merge, attack_serves_campaign, blocks_own_production, capture_or_hunt_score,
+    direct_threat_terrain_score, empty_transport_return_score, reference_point_approach_score,
+    reference_reach, repair_site_at, solo_enemy_approach_score, squad_target_approach_score,
+    stranded_infantry_score, terrain_defense_bonus, v3_positioning_score, wait_recovery_score,
 };
 use super::unit::UnitState;
 use crate::ai::command::AiCommand;
@@ -307,6 +307,7 @@ fn best_action_for_unit(
             unit,
             &tile,
             distances,
+            executes_capture,
             &mut best,
             probe.as_deref_mut(),
         );
@@ -615,6 +616,7 @@ fn consider_wait(
     unit: &UnitTactics,
     tile: &TileCandidate,
     distances: &mut ApproachDistances,
+    keeps_foreign_production_open: bool,
     best: &mut BestAction,
     mut probe: Option<&mut UnitProbe>,
 ) {
@@ -626,7 +628,26 @@ fn consider_wait(
     }
     let state = &unit.state;
     let repair_site = repair_site_at(board, state, tile.position);
-    let recovery = wait_recovery_score(state, repair_site);
+    let mut recovery = wait_recovery_score(state, repair_site);
+    // 回復できない生産施設（地上部隊にとっての港・空港）も、居座れば艦船・航空機の生産を
+    // 物理的に塞ぐ（V4）。作戦目標への接近点に負けないよう、新たに入って待機する移動は
+    // 候補から外し、既に居る場合も回復拠点の封鎖と同じだけ減点する。
+    if keeps_foreign_production_open
+        && repair_site.is_none()
+        && blocks_own_production(board, tile.position)
+    {
+        if !tile.is_stationary {
+            if let Some(trace) = probe.as_deref_mut() {
+                trace.reject(
+                    "wait_blocks_foreign_production",
+                    tile.position,
+                    || json!({}),
+                );
+            }
+            return;
+        }
+        recovery += FOREIGN_PRODUCTION_BLOCK_PENALTY;
+    }
     let mut score = tile.base_score + recovery;
     let holds_blockade = tile.blockade.holds_site;
     // 敵生産口から始めた健全なunitが、占位を続けられない場所で待機するなら、

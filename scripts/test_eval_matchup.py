@@ -137,6 +137,27 @@ class Issue54EvaluatorTests(unittest.TestCase):
         self.assertEqual({"先攻", "後攻"}, {row["order"] for row in rows})
 
 
+class LandingSummaryTests(unittest.TestCase):
+    def test_counts_landed_unit_types_per_player(self):
+        game = {
+            "final_state": {
+                "diagnostics": {
+                    "landings": [
+                        {"turn": 21, "player_id": 1, "unit_type": "中戦車", "x": 1, "y": 17},
+                        {"turn": 22, "player_id": 1, "unit_type": "軽歩兵", "x": 2, "y": 17},
+                        {"turn": 23, "player_id": 1, "unit_type": "軽歩兵", "x": 2, "y": 18},
+                        {"turn": 20, "player_id": 2, "unit_type": "軽歩兵", "x": 9, "y": 9},
+                    ]
+                }
+            }
+        }
+        self.assertEqual(
+            eval_matchup.summarize_landings(game, 1),
+            "軽歩兵: 2<br>中戦車: 1<br>T21〜T23",
+        )
+        self.assertEqual(eval_matchup.summarize_landings({"final_state": {}}, 1), "-")
+
+
 class MatchSchedulingTests(unittest.TestCase):
     def test_build_match_specs_runs_each_seed_in_both_orders(self):
         specs = build_match_specs(("map_3",), "V3", "V2", (11, 22))

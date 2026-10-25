@@ -461,6 +461,22 @@ pub struct ProductionDiagnostic {
     pub income_log: Vec<String>,
 }
 
+/// 輸送部隊から降ろした部隊の記録（AIの揚陸の評価・検証用）。
+#[derive(Resource, Debug, Clone, Default)]
+pub struct LandingLog {
+    pub entries: Vec<LandingRecord>,
+}
+
+/// 1回の降車。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LandingRecord {
+    pub turn: u32,
+    pub player_id: PlayerId,
+    pub unit_type: UnitType,
+    pub x: usize,
+    pub y: usize,
+}
+
 /// プレイヤーごとの戦闘損益（ゴールド換算）の累計。
 /// ROI（戦闘効率 = 与ダメージ価値 / 被ダメージ価値）の計測に使用する。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

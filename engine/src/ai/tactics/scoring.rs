@@ -525,6 +525,20 @@ pub(crate) fn repair_site_at(
         })
 }
 
+/// 回復できない自軍生産施設に居座ることの減点（生産施設の封鎖と同じ重さ）。
+pub(crate) const FOREIGN_PRODUCTION_BLOCK_PENALTY: i32 = -20_000;
+
+/// 位置が、自軍首都の生産圏内にある自軍の生産施設か（生産を塞ぐ位置か）。
+pub(crate) fn blocks_own_production(board: &TacticalBoard, position: GridPosition) -> bool {
+    board.own_production_sites().any(|site| site == position)
+        && crate::systems::production::is_within_production_range(
+            &board.own_capitals(),
+            position.x,
+            position.y,
+            board.map.topology,
+        )
+}
+
 /// 待機の回復・占有に関する加減点。回復の必要があれば回復拠点で待ち、
 /// 不要なら生産施設を塞がない。`repair_site` は [`repair_site_at`] の結果。
 pub(crate) fn wait_recovery_score(unit: &UnitState, repair_site: Option<bool>) -> i32 {

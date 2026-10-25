@@ -11,6 +11,14 @@ use bevy_ecs::prelude::*;
 /// 何らかの行動を実行した場合はその行動内容（文字列）を `Some` で返し、ターンが終了した場合は `None` を返します。
 /// AIのメイン実行エントリーポイント。
 pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> Option<String> {
+    // 決着後の命令は全て無視される。行動を返し続けると、同じ命令を出し続けて手番が終わらない
+    // （手番の途中で敵首都を落として勝った場合など）。
+    if world
+        .get_resource::<crate::resources::MatchState>()
+        .is_some_and(|state| state.game_over.is_some())
+    {
+        return None;
+    }
     crate::ai::wait_probe::begin_step(world);
     let ai_version = crate::ai::resolve_player_ai_version(world, active_player);
 
@@ -30,5 +38,25 @@ pub fn execute_ai_turn(world: &mut World, active_player: PlayerId) -> Option<Str
         | crate::ai::ai_version::AiVersion::V4 => {
             crate::ai::runtime::turn::execute_turn_step(world, active_player)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resources::master_data::MasterDataRegistry;
+    use crate::resources::{GameOverCondition, GridTopology, MatchState};
+
+    #[test]
+    fn ai_takes_no_action_after_the_game_is_decided() {
+        let registry = MasterDataRegistry::load().unwrap();
+        let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &registry,
+            "map_1",
+            GridTopology::Hex,
+        )
+        .unwrap();
+        world.resource_mut::<MatchState>().game_over = Some(GameOverCondition::Winner(PlayerId(1)));
+        assert_eq!(execute_ai_turn(&mut world, PlayerId(1)), None);
     }
 }

@@ -110,6 +110,43 @@ pub(crate) fn execute_turn_step(world: &mut World, player_id: PlayerId) -> Optio
     {
         return Some(issue_unit_command(world, entity, command));
     }
+    // 戦艦は移動した手番に撃てないため、汎用の戦術評価より先に射撃・位置取りを決める。
+    // 他unitの攻撃より先に撃つことで、後続の直接攻撃が撃破を取りやすくなる。
+    if step.is_v4
+        && let Some((entity, command)) =
+            crate::ai::v4::maritime::decide_naval_action(world, player_id, &step.acted)
+    {
+        return Some(issue_unit_command(world, entity, command));
+    }
+    // 港・空港に居座る地上部隊を退かせ、艦船・航空機の生産枠を空ける（V4）。
+    if step.is_v4
+        && let Some((entity, command)) =
+            crate::ai::v4::maritime::decide_port_relief(world, player_id, &step.acted)
+    {
+        return Some(issue_unit_command(world, entity, command));
+    }
+    // 乗船待ちの占領役は通常行動から外れるため、足元の未所有拠点はここで占領させる（V4）。
+    if step.is_v4
+        && let Some((entity, command)) =
+            crate::ai::v4::forming_capture::decide_forming_capture(world, player_id, &step.acted)
+    {
+        return Some(issue_unit_command(world, entity, command));
+    }
+    // 揚陸した装甲車は、載せてきた歩兵を拠点の近くへ運んで降ろす（V4）。
+    if step.is_v4
+        && let Some((entity, command)) =
+            crate::ai::v4::maritime::decide_carrier_drop(world, player_id, &step.acted)
+    {
+        return Some(issue_transport_command(world, entity, command));
+    }
+    // 島で隔てられた盤面では、仕事の無い陸塊に取り残された地上部隊を輸送船・輸送ヘリで
+    // 運ぶ（V4）。担当しない輸送部隊は従来の輸送Squadへ残す。
+    if step.is_v4
+        && let Some((entity, command)) =
+            crate::ai::v4::maritime::decide_sealift_action(world, player_id, &step.acted)
+    {
+        return Some(issue_transport_command(world, entity, command));
+    }
     crate::ai::wait_probe::stage(world, "transport");
     if let Some((entity, command)) = select_transport_step(world, &step) {
         return Some(issue_transport_command(world, entity, command));
@@ -272,12 +309,66 @@ fn decide_normal_action(
     skip: &HashSet<Entity>,
 ) -> Option<(Entity, AiCommand)> {
     match step.tactics {
-        TurnTactics::Standard => decide_ai_action_v2(world, step.player_id, skip),
+        TurnTactics::Standard => {
+            // 揚陸後の敵首都島では、橋頭堡を起点にした首都攻略DAGのSquad指令
+            // （Nodeの制圧・占領、前衛と待機線、敵生産口の占位）に従って動かす（V4）。
+            if step.is_v4
+                && let Some(action) = decide_beachhead_route_action(world, step.player_id, skip)
+            {
+                return Some(action);
+            }
+            decide_ai_action_v2(world, step.player_id, skip)
+        }
         TurnTactics::SmallMapSquads => {
             crate::ai::v4::home_defense::decide_action(world, step.player_id, skip)
                 .or_else(|| decide_squad_action_v4(world, step.player_id, skip))
         }
     }
+}
+
+/// 橋頭堡DAGの島に居る戦闘役だけを、DAGを読むSquad executorで動かす。
+///
+/// 戦闘役はDAGの前線Nodeを制圧しながら敵首都・敵生産口へ進む。占領役はDAGの順序で
+/// 拠点を待たせると確保が遅れるため、通常の行動選択で橋頭堡の近くの拠点を並行して占領する。
+fn decide_beachhead_route_action(
+    world: &mut World,
+    player_id: PlayerId,
+    skip: &HashSet<Entity>,
+) -> Option<(Entity, AiCommand)> {
+    let mut landed = crate::ai::v4::capital_route::beachhead_route_units(world, player_id);
+    landed.retain(|entity| {
+        world
+            .get::<crate::components::UnitStats>(*entity)
+            .is_some_and(|stats| !stats.can_capture)
+    });
+    if landed.iter().all(|entity| skip.contains(entity)) {
+        return None;
+    }
+    // 他の島のunitは通常の行動選択に残す。
+    let mut others = skip.clone();
+    let mut query = world.query::<(Entity, &crate::components::Faction)>();
+    others.extend(
+        query
+            .iter(world)
+            .filter(|(entity, faction)| faction.0 == player_id && !landed.contains(entity))
+            .map(|(entity, _)| entity),
+    );
+    let action = decide_squad_action_v4(world, player_id, &others);
+    if std::env::var("OPENWARS_ASSAULT_TRACE").is_ok() && action.is_none() {
+        let left: Vec<String> = landed
+            .iter()
+            .filter(|entity| !skip.contains(entity))
+            .map(|entity| crate::ai::v4::capital_route::describe_route_order(world, *entity))
+            .collect();
+        eprintln!("BEACHHEAD_NONE {}", left.join(" | "));
+    }
+    if std::env::var("OPENWARS_ASSAULT_TRACE").is_ok()
+        && let Some((entity, command)) = &action
+    {
+        let route = crate::ai::v4::capital_route::describe_route_order(world, *entity);
+        eprintln!("BEACHHEAD_ACT {entity:?} {command:?} {route}");
+    }
+    action
 }
 
 /// 再接続後の通常行動。輸送Squadのunitも対象に含める（行動済みだけを除外する）。
@@ -300,6 +391,7 @@ fn mark_acted(world: &mut World, entities: impl IntoIterator<Item = Entity>) {
 /// unit命令を適用して行動済みにし、ログ用の命令文字列を返す。
 fn issue_unit_command(world: &mut World, entity: Entity, command: AiCommand) -> String {
     let command_text = format!("{:?}", command);
+
     execute_ai_command(world, entity, command);
     mark_acted(world, [entity]);
     command_text
@@ -378,6 +470,17 @@ fn issue_production_or_end_turn(world: &mut World, step: &TurnStep) -> Option<St
         return issue_production_command(world, command);
     }
     world.insert_resource(queue);
+    // 作戦生産が使い切らなかった資金で、海上戦域に寄与する艦船を補う（V4）。
+    if step.is_v4
+        && let Some(command) = crate::ai::v4::maritime::decide_supplementary_production(
+            world,
+            step.player_id,
+            &produced_sites,
+        )
+        && !failed_last_time(&format!("{:?}", command))
+    {
+        return issue_production_command(world, command);
+    }
     end_turn(world, step.player_id);
     None
 }

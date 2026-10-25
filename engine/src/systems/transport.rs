@@ -276,6 +276,7 @@ pub fn unload_unit_system(
     players: Res<Players>,
     map: Res<Map>,
     master_data: Res<MasterDataRegistry>,
+    mut landing_log: Option<ResMut<crate::resources::LandingLog>>,
 ) {
     if match_state.game_over.is_some() || match_state.current_phase != Phase::Main {
         return;
@@ -398,6 +399,17 @@ pub fn unload_unit_system(
                 .entity(event.transport_entity)
                 .insert(HasMoved(true));
 
+            // 揚陸の検証用に、降ろした部隊の種別と降車先を記録する
+            if let Some(log) = landing_log.as_mut() {
+                log.entries.push(crate::resources::LandingRecord {
+                    turn: match_state.current_turn_number.0,
+                    player_id: trans_faction,
+                    unit_type: cargo.6.unit_type,
+                    x: event.target_x,
+                    y: event.target_y,
+                });
+            }
+
             // 降車完了イベントを送出
             unloaded_writer.send(UnitUnloadedEvent {
                 transport: event.transport_entity,
@@ -462,10 +474,15 @@ pub fn cleanup_cargo_system(
     q_cargo: Query<(Entity, &Transporting)>,
 ) {
     for event in destroyed_events.read() {
-        for (cargo_ent, trans) in q_cargo.iter() {
-            if trans.0 == event.entity {
-                // 輸送ユニットが破壊されたので、搭載ユニットも破壊（デスポーン）
-                commands.entity(cargo_ent).despawn();
+        // 輸送ユニットが破壊されたので、搭載ユニットも破壊（デスポーン）する。
+        // 輸送船に積んだ装甲車の中の歩兵のように入れ子で積まれた部隊も、まとめて破壊する。
+        let mut lost = vec![event.entity];
+        while let Some(transport) = lost.pop() {
+            for (cargo_ent, trans) in q_cargo.iter() {
+                if trans.0 == transport {
+                    commands.entity(cargo_ent).despawn();
+                    lost.push(cargo_ent);
+                }
             }
         }
     }
@@ -545,6 +562,7 @@ mod tests {
             unit_entity: cargo_entity,
         });
 
+        world.init_resource::<crate::resources::LandingLog>();
         let mut schedule = Schedule::default();
         schedule.add_systems(load_unit_system);
         schedule.add_systems(unload_unit_system);
@@ -585,6 +603,12 @@ mod tests {
         let cargo_pos = world.get::<GridPosition>(cargo_entity).unwrap();
         assert_eq!(cargo_pos.x, 6);
         assert_eq!(cargo_pos.y, 5);
+
+        // 降車は検証用の揚陸記録に残る
+        let log = world.resource::<crate::resources::LandingLog>();
+        assert_eq!(log.entries.len(), 1);
+        assert_eq!(log.entries[0].unit_type, UnitType::Infantry);
+        assert_eq!((log.entries[0].x, log.entries[0].y), (6, 5));
 
         let trans_act = world.get::<ActionCompleted>(transport_entity).unwrap();
         assert!(trans_act.0);
@@ -903,6 +927,29 @@ mod tests {
         // 両方 0 になるはず
         assert_eq!(world.get::<Health>(cargo1_entity).unwrap().current, 0);
         assert_eq!(world.get::<Health>(cargo2_entity).unwrap().current, 0);
+    }
+
+    #[test]
+    fn destroying_a_lander_also_destroys_infantry_inside_its_recon() {
+        let mut world = World::new();
+        world.init_resource::<Events<UnitDestroyedEvent>>();
+        // 輸送船 ← 装甲車 ← 歩兵 の入れ子積載。
+        let lander = world.spawn_empty().id();
+        let recon = world.spawn(Transporting(lander)).id();
+        let infantry = world.spawn(Transporting(recon)).id();
+        let bystander = world.spawn_empty().id();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(cleanup_cargo_system);
+        world.send_event(UnitDestroyedEvent { entity: lander });
+        schedule.run(&mut world);
+
+        assert!(world.get_entity(recon).is_err());
+        assert!(
+            world.get_entity(infantry).is_err(),
+            "装甲車の中の歩兵も失われる"
+        );
+        assert!(world.get_entity(bystander).is_ok());
     }
 
     #[test]

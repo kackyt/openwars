@@ -281,6 +281,14 @@ impl ProductionTraceDiagnostics {
         self.recorded_turns.insert(player_id, turn);
         self.by_player.insert(player_id, trace);
     }
+
+    /// 指定手番の生産計画が将来の購入へ取り置いた資金。その手番の計画が無ければNone。
+    pub fn reserved_funds(&self, player_id: PlayerId, turn: u32) -> Option<u32> {
+        (self.recorded_turns.get(&player_id) == Some(&turn))
+            .then(|| self.by_player.get(&player_id))
+            .flatten()
+            .map(|trace| trace.reserved_funds)
+    }
 }
 
 #[cfg(test)]

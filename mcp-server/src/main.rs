@@ -468,7 +468,7 @@ impl OpenWarsAiServer {
 
             let transport_squads = invasion_trace::snapshot_transport_squads(world);
             let diagnostic = world.get_resource::<engine::resources::ProductionDiagnostic>();
-            let diag_info = if let Some(d) = diagnostic {
+            let mut diag_info = if let Some(d) = diagnostic {
                 serde_json::json!({
                     "last_error": d.last_error,
                     "last_event": d.last_event,
@@ -477,6 +477,23 @@ impl OpenWarsAiServer {
             } else {
                 serde_json::json!({})
             };
+            // 揚陸の検証用: 降ろした部隊の手番・勢力・種別・降車先。
+            if let Some(log) = world.get_resource::<engine::resources::LandingLog>() {
+                diag_info["landings"] = serde_json::Value::Array(
+                    log.entries
+                        .iter()
+                        .map(|entry| {
+                            serde_json::json!({
+                                "turn": entry.turn,
+                                "player_id": entry.player_id.0,
+                                "unit_type": entry.unit_type.as_str(),
+                                "x": entry.x,
+                                "y": entry.y
+                            })
+                        })
+                        .collect(),
+                );
+            }
 
             Ok(serde_json::json!({
                 "turn": match_state.current_turn_number.0,

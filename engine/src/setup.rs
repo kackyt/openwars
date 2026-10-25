@@ -24,6 +24,7 @@ pub fn create_world() -> (World, Schedule) {
     // Register events
     world.init_resource::<Events<ProduceUnitCommand>>();
     world.init_resource::<ProductionDiagnostic>();
+    world.init_resource::<crate::resources::LandingLog>();
     world.init_resource::<Events<MoveUnitCommand>>();
     world.init_resource::<Events<AttackUnitCommand>>();
     world.init_resource::<Events<CapturePropertyCommand>>();
