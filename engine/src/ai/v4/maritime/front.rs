@@ -2,7 +2,7 @@
 //!
 //! 首都同士が戦車の通れる1〜2本の細い陸路だけで結ばれている盤面（例: map_49 の地峡）では、
 //! 全軍で陸路を進むと隘路に部隊が詰まり、本拠の戦力が前線へ届かない。両陣営とも港を持ち、
-//! 海路で相手側の海岸へ届くなら、戦力を2つに分けて同時に攻める。
+//! 海路で相手側の海岸へ届き、隘路が拠点の少ない通り道なら、戦力を2つに分けて同時に攻める。
 //!
 //! - 陸路の部隊: 隘路を押し進む部隊。隘路で戦える数（経路ごとの先頭と後詰め）まで、
 //!   間接射撃の部隊と隘路に近い部隊を割り当てる（[`super::landmass`]）。
@@ -21,6 +21,13 @@ use std::collections::VecDeque;
 
 /// 首都同士を結ぶ戦車の陸路が、この本数（互いにセルを共有しない経路の数）以下なら隘路とみなす。
 const NARROW_FRONT_PATHS: usize = 2;
+
+/// 隘路とみなす、隘路のセルに対する拠点の数の上限（%）。
+///
+/// 地峡や橋のような通り道には拠点が少なく、陸路は部隊の通り抜けで頭打ちになるため、
+/// 陸路と海路へ戦力を分けると効く。拠点が密集した区間（セル3つに1つを超える）は、
+/// 拠点を取り合う主戦場なので全軍の陸上作戦に任せる。
+const MAX_CORRIDOR_PROPERTY_PERCENT: usize = 30;
 
 /// 盤面のセル座標。
 type Cell = (usize, usize);
@@ -101,6 +108,15 @@ impl NarrowFront {
                     queue.push_back(next);
                 }
             }
+        }
+        // 拠点の密集した隘路は、通り道ではなく全軍で取り合う主戦場として扱う。
+        let properties = board
+            .properties
+            .iter()
+            .filter(|property| corridor.contains(&(property.position.x, property.position.y)))
+            .count();
+        if properties * 100 > corridor.len() * MAX_CORRIDOR_PROPERTY_PERCENT {
+            return None;
         }
         Some(Self {
             corridor,
@@ -339,6 +355,19 @@ mod tests {
             "~~~~~~~", "~H....~", "~.....~", "~~~.~~~", "~~~.~~~", "~.....~", "~H....~", "~~~~~~~",
         ];
         let board = board_from_rows(&rows, &[(1, 1, 1), (1, 6, 2)]);
+        let land = label_landmasses(&board);
+        assert_eq!(land.at(at(1, 1)), land.at(at(1, 6)));
+    }
+
+    #[test]
+    fn isthmus_crowded_with_cities_is_a_battlefield_not_a_corridor() {
+        // 地峡の2マスとも都市。拠点の密集した区間は全軍で取り合う主戦場として、分けない。
+        let rows = [
+            "~~~~~~~", "~HP...~", "~.....~", "~~~C~~~", "~~~C~~~", "~.....~", "~HP...~", "~~~~~~~",
+        ];
+        let mut properties = PROPERTIES.to_vec();
+        properties.extend([(3, 3, 0), (3, 4, 0)]);
+        let board = board_from_rows(&rows, &properties);
         let land = label_landmasses(&board);
         assert_eq!(land.at(at(1, 1)), land.at(at(1, 6)));
     }
