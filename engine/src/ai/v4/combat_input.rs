@@ -220,6 +220,16 @@ fn collect_production_options(
         &scan.master_data,
         planning_horizon,
         |facility, stats| {
+            // 計画内のどの敵にも損害を与えられない兵種（地上敵しかいない盤面の対空戦車等）は、
+            // 作戦地点へ合流できても戦闘に寄与せず、敵の攻撃を吸うだけの駒になる。
+            // 輸送ユニットは積荷の運搬が役割なので、武装の有無では除外しない。
+            if stats.max_cargo == 0
+                && !enemies.iter().any(|enemy| {
+                    best_damage(&scan.damage_chart, stats.unit_type, enemy.stats.unit_type) > 0
+                })
+            {
+                return false;
+            }
             let can_engage = enemies.iter().any(|enemy| {
                 best_damage(&scan.damage_chart, stats.unit_type, enemy.stats.unit_type) > 0
                     && ctx.can_reach_engagement_envelope(
