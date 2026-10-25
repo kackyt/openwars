@@ -401,6 +401,62 @@ fn combat_plan_projects_only_the_capturer_ordered_this_turn() {
     assert_eq!(input.current_funds, scan.funds);
 }
 
+/// 計画内の敵へ損害を与えられない兵種は、作戦地点へ合流できてもCombat候補にしない。
+/// 航空敵がいなければ対空戦車は戦力にならず、航空敵がいれば候補へ戻る。
+#[test]
+fn combat_plan_excludes_unit_types_that_cannot_damage_any_planned_enemy() {
+    // 航空敵の有無だけを変えて、Capture作戦のCombat計画入力に残る生産候補の兵種を返す。
+    fn option_types(with_air_enemy: bool) -> HashSet<UnitType> {
+        let mut scan = mixed_threat_multi_factory_scan();
+        if !with_air_enemy {
+            scan.enemy_units
+                .retain(|enemy| enemy.stats.unit_type != UnitType::Bcopters);
+        }
+        let anchor = pos(6, 2);
+        scan.campaign_objectives = capture_objective(anchor);
+        let mut ctx = ReachCtx::default();
+        let operations = build_operations(
+            &scan,
+            &mut ctx,
+            &[],
+            PlayerId(1),
+            ProductionPolicy::Standard,
+        );
+        let operation = operations
+            .iter()
+            .find(|operation| operation.kind == OperationKind::Capture)
+            .expect("局地Capture作戦");
+        let input = standard_combat_plan_input(
+            &scan,
+            &mut ctx,
+            operation,
+            &HashSet::default(),
+            &HashSet::default(),
+            scan.funds,
+            false,
+        )
+        .expect("観測敵がいるためCombat計画入力が作られる");
+        input
+            .production_options
+            .iter()
+            .map(|option| option.stats.unit_type)
+            .collect()
+    }
+
+    let ground_only = option_types(false);
+    assert!(
+        !ground_only.contains(&UnitType::AntiAir),
+        "地上敵だけの作戦で対空戦車を候補にしない: {ground_only:?}"
+    );
+    assert!(ground_only.contains(&UnitType::Tank));
+
+    let with_air = option_types(true);
+    assert!(
+        with_air.contains(&UnitType::AntiAir),
+        "航空敵がいれば対空戦車を候補に残す: {with_air:?}"
+    );
+}
+
 /// 敵施設の生産余力も、期限内に到着できる最寄りの1作戦だけへ計上する。
 #[test]
 fn enemy_reinforcement_funds_is_local_unique_and_deadline_bounded() {
