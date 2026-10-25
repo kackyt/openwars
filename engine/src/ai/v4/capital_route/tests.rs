@@ -33,8 +33,9 @@ use crate::ai::v4::capital_route::tactical::{
     capital_route_is_recovering, capital_route_waypoint,
 };
 use crate::ai::v4::capital_route::topology::{
-    armored_entry_bridge_gates, armored_step_distances, capital_route_topology_for, progress_order,
-    same_land_capital_front_reached, same_land_route_fronts,
+    RouteFrontDistances, armored_entry_bridge_gates, armored_step_distances,
+    capital_route_topology_for, progress_order, same_land_capital_front_reached,
+    same_land_route_fronts,
 };
 use crate::ai::v4::production_pipeline::test_exports::{build_operations, combat_plan_input};
 use crate::ai::v4::test_support::*;
@@ -2004,5 +2005,71 @@ fn squad_route_follows_the_branch_of_its_own_target() {
     assert_eq!(
         squad_target_route(topology, map, &MissionType::Defense, Some(south), &closed),
         None
+    );
+}
+
+/// 進軍軸への帰属は、山を挟んだ直線距離ではなく戦車が辿る道のりで決める。
+///
+/// map_20の敵首都は、直線距離では北東の橋の前線に近く見えるが、戦車は南西の前線から
+/// 回る方がずっと早く着く。直線距離で帰属させると、敵首都周辺の需要が橋の軸へ
+/// 数えられ、ほぼ全軍が一本の橋へ送られる。
+#[test]
+fn map20_route_front_distances_follow_the_armored_detour() {
+    let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
+    let master_data = MasterDataRegistry::load().unwrap();
+    let (mut world, _schedule) = crate::setup::initialize_world_from_master_data_with_topology(
+        &master_data,
+        "map_20",
+        GridTopology::Hex,
+    )
+    .expect("map_20を初期化できる");
+    let player = PlayerId(1);
+    let own_capital = world
+        .iter_entities()
+        .find_map(|entity| {
+            let position = entity.get::<GridPosition>()?;
+            let property = entity.get::<Property>()?;
+            (property.terrain == Terrain::Capital && property.owner_id == Some(player))
+                .then_some(*position)
+        })
+        .expect("自首都");
+    let island = world
+        .resource::<crate::ai::islands::IslandMap>()
+        .get_island_at(&own_capital)
+        .expect("首都の島")
+        .id;
+    prepare_capital_route_topologies(&mut world, player);
+    let topology = capital_route_topology_for(&world, player, island).expect("首都ルートDAG");
+    let goal = topology.nodes[topology.goal_node.0].anchor;
+    let fronts = topology
+        .routes
+        .iter()
+        .map(|route| route.front)
+        .collect::<Vec<_>>();
+    assert_eq!(fronts.len(), 2, "map_20は二本の進軍軸を持つ: {fronts:?}");
+    let map = world.resource::<Map>();
+    let data = world.resource::<MasterDataRegistry>();
+    let straight = fronts
+        .iter()
+        .map(|front| map.distance(goal.x, goal.y, front.x, front.y))
+        .collect::<Vec<_>>();
+    let armored = fronts
+        .iter()
+        .map(|front| armored_step_distances(map, data, *front)[&goal])
+        .collect::<Vec<_>>();
+    let straight_nearest = (0..2).min_by_key(|route| straight[*route]).unwrap();
+    let armored_nearest = (0..2).min_by_key(|route| armored[*route]).unwrap();
+    assert_ne!(
+        straight_nearest, armored_nearest,
+        "前提: 敵首都は直線距離と装甲距離で最寄りの軸が異なる straight={straight:?} armored={armored:?}"
+    );
+
+    let distances = RouteFrontDistances::new(map, data, &fronts);
+
+    assert_eq!(distances.nearest_route(map, goal), armored_nearest);
+    assert_eq!(
+        topology.property_routes.get(&goal).map(|route| route.0),
+        Some(armored_nearest),
+        "敵首都の拠点も装甲距離で最寄りの軸へ結びつける"
     );
 }

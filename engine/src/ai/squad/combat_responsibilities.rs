@@ -1,15 +1,16 @@
 //! 敵と首都ルート前線への戦闘責務。
 
 use super::{
-    CampaignResponsibility, Entity, Faction, GridPosition, HashSet, Map, MissionType, PlayerId,
-    TerrainConnectivity, World, campaign_member_attack_distance_with_connectivity,
-    campaign_member_distance_to_position,
+    CampaignResponsibility, Entity, Faction, GridPosition, HashMap, HashSet, Map,
+    MasterDataRegistry, MissionType, PlayerId, TerrainConnectivity, UnitStats, World,
+    campaign_member_attack_distance_with_connectivity, campaign_member_distance_to_position,
 };
 #[cfg(test)]
 use super::{
     OperationOwner, OperationUnitRole, SquadManager, UnitOperationAssignment,
     UnitOperationRegistry, claim_campaign_portfolio_assignments, prepare_campaign_local_assignment,
 };
+use crate::resources::MovementType;
 pub(super) fn campaign_combat_responsibilities(
     world: &World,
     player_id: PlayerId,
@@ -48,17 +49,32 @@ pub(super) fn campaign_combat_responsibilities(
             crate::ai::v4::capital_route::force_demand::same_land_route_breakthrough_positions(
                 world, player_id, island_id,
             );
+        // 敵と占領目標は、山や川を迂回する装甲距離で最寄りの進軍路へ帰属させる。
+        let front_distances = world
+            .get_resource::<MasterDataRegistry>()
+            .map(|master_data| {
+                crate::ai::v4::capital_route::topology::RouteFrontDistances::new(
+                    map,
+                    master_data,
+                    &route_fronts,
+                )
+            });
         let nearest_front = |position: GridPosition| {
-            route_fronts
-                .iter()
-                .enumerate()
-                .min_by_key(|(index, front)| {
-                    (
-                        map.distance(position.x, position.y, front.x, front.y),
-                        *index,
-                    )
-                })
-                .map_or(0, |(index, _)| index)
+            front_distances.as_ref().map_or_else(
+                || {
+                    route_fronts
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(index, front)| {
+                            (
+                                map.distance(position.x, position.y, front.x, front.y),
+                                *index,
+                            )
+                        })
+                        .map_or(0, |(index, _)| index)
+                },
+                |distances| distances.nearest_route(map, position),
+            )
         };
         let route_demands =
             crate::ai::v4::capital_route::force_demand::same_land_route_force_demands(
@@ -156,54 +172,125 @@ pub(super) fn distribute_members_across_route_fronts(
     remaining.dedup();
     let mut distributed = vec![Vec::new(); route_fronts.len()];
 
+    // 各memberから各前線までの距離。山や川を迂回する実際の道のりで測る。直線距離で
+    // 比べると、山の向こうの前線を近いと見誤り、遠回りの装甲路の先にある前線へ
+    // 来た道を引き返させてしまう。
+    let mut front_distances = RouteFrontMemberDistances::new(world, map, route_fronts);
+    let mut preferences = remaining
+        .into_iter()
+        .filter_map(|member| Some((member, front_distances.of(member)?)))
+        .collect::<Vec<_>>();
+    let unpositioned = members
+        .iter()
+        .copied()
+        .filter(|member| world.get::<GridPosition>(*member).is_none())
+        .collect::<Vec<_>>();
+    // 前線間の距離差が大きいmemberほど、別の前線へ回したときの遠回りが大きい。
+    // 枠はこの差が大きい順に埋め、一方の枝を進んだ部隊が首都付近の部隊に枠を
+    // 奪われて反対側の枝へ回されることを防ぐ。
+    preferences.sort_by_key(|(member, distances)| {
+        let mut sorted = distances.clone();
+        sorted.sort_unstable();
+        let regret = match sorted.as_slice() {
+            [best, second, ..] => second.0.saturating_sub(best.0),
+            _ => 0,
+        };
+        (std::cmp::Reverse(regret), member.to_bits())
+    });
+
     // 先に全体需要から決めた枠だけを埋める。配属時には距離だけを使うので、既に
     // 盤面評価へ含めた戦力差や収益をunitごとに二重計上しない。
     let mut unassigned = Vec::new();
-    for member in remaining {
-        let route = world.get::<GridPosition>(member).and_then(|position| {
-            route_fronts
-                .iter()
-                .enumerate()
-                .filter(|(route, _)| {
-                    distributed[*route].len() < route_slots.get(*route).copied().unwrap_or(0)
-                })
-                .min_by_key(|(route, front)| {
-                    (
-                        map.distance(position.x, position.y, front.x, front.y),
-                        *route,
-                    )
-                })
-                .map(|(route, _)| route)
-        });
+    for (member, distances) in &preferences {
+        let route = (0..route_fronts.len())
+            .filter(|route| {
+                distributed[*route].len() < route_slots.get(*route).copied().unwrap_or(0)
+            })
+            .min_by_key(|route| (distances[*route], *route));
         if let Some(route) = route {
-            distributed[route].push(member);
+            distributed[route].push(*member);
         } else {
-            unassigned.push(member);
+            unassigned.push((*member, distances));
         }
     }
 
     // 需要枠を超えるmemberも、同じcampaign内の最寄りrouteへ結び直す。これにより
     // squadを失った遊休戦力や、汎用Reserveへの退避を発生させない。
-    for member in unassigned {
-        let route = world
-            .get::<GridPosition>(member)
-            .map(|position| {
-                route_fronts
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(index, front)| {
-                        (
-                            map.distance(position.x, position.y, front.x, front.y),
-                            distributed[*index].len(),
-                            *index,
-                        )
-                    })
-                    .map_or(0, |(index, _)| index)
-            })
+    for (member, distances) in unassigned {
+        let route = (0..route_fronts.len())
+            .min_by_key(|index| (distances[*index], distributed[*index].len(), *index))
             .unwrap_or(0);
         distributed[route].push(member);
     }
+    for member in unpositioned {
+        distributed[0].push(member);
+    }
     distributed
+}
+
+/// memberの移動種別ごとに、各前線からの歩数表を一度だけ作って引く。
+struct RouteFrontMemberDistances<'a> {
+    world: &'a World,
+    map: &'a Map,
+    route_fronts: &'a [GridPosition],
+    tables: HashMap<MovementType, Vec<HashMap<GridPosition, u32>>>,
+}
+
+impl<'a> RouteFrontMemberDistances<'a> {
+    fn new(world: &'a World, map: &'a Map, route_fronts: &'a [GridPosition]) -> Self {
+        Self {
+            world,
+            map,
+            route_fronts,
+            tables: HashMap::default(),
+        }
+    }
+
+    /// 前線ごとの（道のりの歩数, 直線距離）。位置の無いEntityは `None`。
+    ///
+    /// その移動種別で辿り着けない前線は歩数を最大値にし、直線距離だけで順序を付ける。
+    /// 能力値・マスターデータの無い盤面では直線距離だけを使う。
+    fn of(&mut self, member: Entity) -> Option<Vec<(u32, u32)>> {
+        let position = *self.world.get::<GridPosition>(member)?;
+        let movement_type = self
+            .world
+            .get::<UnitStats>(member)
+            .map(|stats| stats.movement_type);
+        let master_data = self.world.get_resource::<MasterDataRegistry>();
+        let map = self.map;
+        let route_fronts = self.route_fronts;
+        let tables = match (movement_type, master_data) {
+            (Some(movement_type), Some(master_data)) => {
+                Some(self.tables.entry(movement_type).or_insert_with(|| {
+                    route_fronts
+                        .iter()
+                        .map(|front| {
+                            crate::ai::v4::capital_route::topology::movement_step_distances(
+                                map,
+                                master_data,
+                                *front,
+                                movement_type,
+                            )
+                        })
+                        .collect()
+                }))
+            }
+            _ => None,
+        };
+        Some(
+            route_fronts
+                .iter()
+                .enumerate()
+                .map(|(route, front)| {
+                    let straight = map.distance(position.x, position.y, front.x, front.y);
+                    let path = tables.as_ref().map_or(straight, |tables| {
+                        tables[route].get(&position).copied().unwrap_or(u32::MAX)
+                    });
+                    (path, straight)
+                })
+                .collect(),
+        )
+    }
 }
 
 pub(super) fn campaign_combat_responsibilities_for_enemies(
@@ -459,6 +546,90 @@ mod tests {
 
         // Secureの占領要員を固定的にDefenseへ抜き取らない。CaptureとCombatは同じ
         // campaignの別責務として保ち、橋頭堡を担うのは需要配分済みの装甲Combatだけにする。
+    }
+
+    /// 山を挟む地図では、直線距離で近い前線ではなく戦車が実際に早く着く前線へ配る。
+    #[test]
+    fn route_front_distribution_uses_armored_path_instead_of_straight_line() {
+        let master_data = MasterDataRegistry::load().unwrap();
+        let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master_data,
+            "map_20",
+            GridTopology::Hex,
+        )
+        .unwrap();
+        let fronts = vec![GridPosition { x: 18, y: 6 }, GridPosition { x: 8, y: 18 }];
+        let map = world.resource::<Map>().clone();
+        let tank = UnitStats {
+            unit_type: UnitType::Tank,
+            movement_type: MovementType::Tank,
+            ..UnitStats::mock()
+        };
+        let path_tables = fronts
+            .iter()
+            .map(|front| {
+                crate::ai::v4::capital_route::topology::movement_step_distances(
+                    &map,
+                    &master_data,
+                    *front,
+                    MovementType::Tank,
+                )
+            })
+            .collect::<Vec<_>>();
+        // 直線距離では一方の前線が近いのに、戦車の道のりでは他方が5歩以上近いマスを探す。
+        let (position, path_route) = (0..map.height)
+            .flat_map(|y| (0..map.width).map(move |x| GridPosition { x, y }))
+            .find_map(|position| {
+                let path = [
+                    *path_tables[0].get(&position)?,
+                    *path_tables[1].get(&position)?,
+                ];
+                let straight = fronts
+                    .iter()
+                    .map(|front| map.distance(position.x, position.y, front.x, front.y))
+                    .collect::<Vec<_>>();
+                let path_route = usize::from(path[1] < path[0]);
+                let straight_route = usize::from(straight[1] < straight[0]);
+                (straight[0] != straight[1]
+                    && path_route != straight_route
+                    && path[0].abs_diff(path[1]) >= 5)
+                    .then_some((position, path_route))
+            })
+            .expect("map_20には直線距離と道のりで最寄りの前線が逆になる戦車マスがある");
+        let member = world.spawn((Faction(PlayerId(1)), position, tank)).id();
+
+        let distributed =
+            distribute_members_across_route_fronts(&world, &map, &[member], &fronts, &[1, 1]);
+
+        assert_eq!(distributed[path_route], vec![member], "{position:?}");
+    }
+
+    /// 枠が足りないときは、前線間の遠回りが大きい部隊から先に最寄りの前線へ配る。
+    /// 一方の枝を進んだ部隊が、どちらへも行ける首都付近の部隊に枠を奪われない。
+    #[test]
+    fn route_front_distribution_fills_slots_by_detour_regret() {
+        let mut world = setup_test_world();
+        let player = PlayerId(1);
+        // 一体目は二つの前線から等距離、二体目は北の前線のすぐ近くにいる。
+        let undecided = world
+            .spawn((Faction(player), GridPosition { x: 0, y: 5 }))
+            .id();
+        let committed = world
+            .spawn((Faction(player), GridPosition { x: 7, y: 2 }))
+            .id();
+        let map = world.resource::<Map>().clone();
+        let fronts = vec![GridPosition { x: 7, y: 1 }, GridPosition { x: 7, y: 9 }];
+
+        let distributed = distribute_members_across_route_fronts(
+            &world,
+            &map,
+            &[undecided, committed],
+            &fronts,
+            &[1, 1],
+        );
+
+        assert_eq!(distributed[0], vec![committed]);
+        assert_eq!(distributed[1], vec![undecided]);
     }
 
     #[test]
