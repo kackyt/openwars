@@ -5,8 +5,9 @@ use crate::ai::v4::capital_route::model::{
 };
 use crate::ai::v4::capital_route::node_operation::capital_route_dag_all_properties;
 use crate::ai::v4::capital_route::topology::{
-    armored_entry_bridge_gates, armored_step_distances, movement_step_distances,
-    same_land_armored_route_gates, same_land_route_fronts, terrain_component_membership,
+    RouteFrontDistances, armored_entry_bridge_gates, armored_step_distances,
+    movement_step_distances, same_land_armored_route_gates, same_land_route_fronts,
+    terrain_component_membership,
 };
 use crate::ai::v4::trace::campaign_scope_audit_enabled;
 use crate::ai::v4::{
@@ -87,18 +88,10 @@ pub(crate) fn same_land_route_force_demands(
         .max()
         .unwrap_or(0)
         .saturating_add(1);
-    let nearest_front = |position: GridPosition| {
-        fronts
-            .iter()
-            .enumerate()
-            .min_by_key(|(index, front)| {
-                (
-                    map.distance(position.x, position.y, front.x, front.y),
-                    *index,
-                )
-            })
-            .map_or(0, |(index, _)| index)
-    };
+    // 拠点・unitは山や海を迂回する装甲距離で最寄りの軸へ帰属させる。直線距離では、
+    // 山の向こうの敵首都周辺が遠回りの別軸ではなく近く見える軸の需要に数えられる。
+    let front_distances = RouteFrontDistances::new(map, master_data, &fronts);
+    let nearest_front = |position: GridPosition| front_distances.nearest_route(map, position);
     let mut opportunity_values = vec![0_u64; fronts.len()];
     let mut friendly_values = vec![0_u64; fronts.len()];
     let mut enemy_values = vec![0_u64; fronts.len()];
@@ -703,18 +696,9 @@ pub(crate) fn refine_same_land_route_milestones(
             capital_route_dag_all_properties(world, player_id, assignment.island_id)
                 .unwrap_or_else(|| {
                     // Resource未初期化の単体テストなどでは、従来の地形解析へフォールバックする。
-                    let nearest_front = |position: GridPosition| {
-                        route_fronts
-                            .iter()
-                            .enumerate()
-                            .min_by_key(|(index, front)| {
-                                (
-                                    map.distance(position.x, position.y, front.x, front.y),
-                                    *index,
-                                )
-                            })
-                            .map_or(0, |(index, _)| index)
-                    };
+                    let front_distances = RouteFrontDistances::new(map, master_data, &route_fronts);
+                    let nearest_front =
+                        |position: GridPosition| front_distances.nearest_route(map, position);
                     let mut properties = vec![Vec::new(); route_fronts.len()];
                     for entity in world.iter_entities() {
                         let (Some(position), Some(property)) =
