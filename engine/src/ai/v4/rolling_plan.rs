@@ -279,6 +279,9 @@ struct FriendlyAttackProfile {
     ready_turn: u32,
     firing_position: Option<GridPosition>,
     requires_movement: bool,
+    /// 同じ手番にこの敵を直接攻撃できるunit数の上限（敵の周りの到達可能な空きマス数）。
+    /// `None` は上限なし（間接攻撃、または地形を見ない従来モデル）。
+    firing_slots: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1054,6 +1057,8 @@ impl<'c> CombatRun<'c> {
     fn friendly_attacks(&mut self, turn: u32) -> u32 {
         let catalog = self.catalog;
         let mut attack_count = 0_u32;
+        // 敵ごとに、この手番に既に直接攻撃したunit数。周りの空きマスを超えて殴れない。
+        let mut direct_attacks = vec![0_u32; catalog.enemies.len()];
         for index in 0..self.friendly_states.len() {
             let friendly = self.friendly(index);
             let friendly_state = &mut self.friendly_states[index];
@@ -1063,11 +1068,18 @@ impl<'c> CombatRun<'c> {
             {
                 continue;
             }
-            let Some((target_index, attack_profile)) =
-                select_target(friendly, &catalog.enemies, &self.enemy_states, turn)
-            else {
+            let Some((target_index, attack_profile)) = select_target(
+                friendly,
+                &catalog.enemies,
+                &self.enemy_states,
+                &direct_attacks,
+                turn,
+            ) else {
                 continue;
             };
+            if attack_profile.firing_slots.is_some() {
+                direct_attacks[target_index] = direct_attacks[target_index].saturating_add(1);
+            }
             let target = &mut self.enemy_states[target_index];
             let damage = calculate_damage_formula(
                 attack_profile.base_damage,
@@ -1344,6 +1356,8 @@ struct EngagementRow {
     enemy_contact_turn: u32,
     /// 友軍が敵の射程へ入るまでの移動turn。
     friendly_travel: u32,
+    /// 同じ手番にこの敵を直接攻撃できるunit数の上限。
+    firing_slots: Option<u32>,
 }
 
 impl EngagementTemplate {
@@ -1364,6 +1378,10 @@ impl EngagementTemplate {
                 .all(|pair| pair[0] < pair[1]),
             "交戦可能敵indexは盤面走査順の昇順で保持する"
         );
+        // 通常経路では、接近を直線距離ではなく地形と敵の陣取りを踏まえた経路で見積もる。
+        // 小規模マップの拡張経路は独自の実経路projectionを持つため、従来の見積りを保つ。
+        let approach = (!crate::ai::code_path::is_extended())
+            .then(|| ApproachMap::new(input, stats, position));
         let rows = input
             .enemies
             .iter()
@@ -1377,6 +1395,10 @@ impl EngagementTemplate {
                     best_damage(&input.damage_chart, stats.unit_type, enemy.stats.unit_type);
                 let can_attack =
                     engageable_enemy_indices.binary_search(&enemy_index).is_ok() && base_damage > 0;
+                let readiness = approach.as_ref().map_or_else(
+                    || attack_readiness_turns(distance, stats),
+                    |approach| approach.attack_readiness_turns(&input.map, stats, enemy.position),
+                );
                 let attack = can_attack.then(|| {
                     (
                         base_damage,
@@ -1387,10 +1409,29 @@ impl EngagementTemplate {
                             &enemy.stats,
                             distance,
                         ),
-                        attack_readiness_turns(distance, stats),
+                        readiness,
                     )
                 });
                 let enemy_travel = attack_readiness_turns(distance, &enemy.stats);
+                let friendly_travel = approach
+                    .as_ref()
+                    .and_then(|approach| {
+                        approach.travel_turns_into_range(
+                            &input.map,
+                            stats,
+                            enemy.position,
+                            (0, enemy.stats.max_range.max(1)),
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        distance
+                            .saturating_sub(enemy.stats.max_range.max(1))
+                            .div_ceil(stats.max_movement.max(1))
+                    });
+                let firing_slots = approach
+                    .as_ref()
+                    .filter(|_| stats.min_range <= 1)
+                    .map(|approach| approach.firing_slots(&input.map, stats, enemy.position));
                 EngagementRow {
                     attack,
                     enemy_base_damage: best_damage(
@@ -1399,9 +1440,8 @@ impl EngagementTemplate {
                         stats.unit_type,
                     ),
                     enemy_contact_turn: enemy.available_turn.saturating_add(enemy_travel),
-                    friendly_travel: distance
-                        .saturating_sub(enemy.stats.max_range.max(1))
-                        .div_ceil(stats.max_movement.max(1)),
+                    friendly_travel,
+                    firing_slots,
                 }
             })
             .collect::<Vec<EngagementRow>>();
@@ -1455,6 +1495,7 @@ impl EngagementTemplate {
                         base_damage,
                         incoming_damage,
                         ready_turn: available_turn.saturating_add(readiness),
+                        firing_slots: row.firing_slots,
                     },
                 )
             })
@@ -1502,6 +1543,7 @@ fn select_target(
     friendly: &SimFriendly,
     enemies: &[SimEnemy],
     enemy_states: &[EnemyCombatState],
+    direct_attacks: &[u32],
     turn: u32,
 ) -> Option<(usize, FriendlyAttackProfile)> {
     let mut leading_group = None;
@@ -1518,7 +1560,13 @@ fn select_target(
             break;
         }
         let enemy_hp = enemy_states[index].hp;
-        if enemy_hp == 0 || turn < enemies[index].source.available_turn || turn < profile.ready_turn
+        let slots_full = profile
+            .firing_slots
+            .is_some_and(|slots| direct_attacks[index] >= slots);
+        if enemy_hp == 0
+            || turn < enemies[index].source.available_turn
+            || turn < profile.ready_turn
+            || slots_full
         {
             continue;
         }
@@ -1657,6 +1705,155 @@ fn best_damage(chart: &DamageChart, attacker: UnitType, defender: UnitType) -> u
             .get_base_damage_secondary(attacker, defender)
             .unwrap_or(0),
     )
+}
+
+/// 1体の友軍の出発点から、地形の移動コストで測った到達コストの表。
+///
+/// 盤面に現在いる敵のマスは通れないものとして扱い、橋や回廊の出口に陣取った敵の
+/// 向こうへは回り込めないことを接近の見積りへ反映する。敵を避けて届かない地点だけ、
+/// 敵を無視した経路に1手番（敵を押しのける分）を足して見積もる。
+struct ApproachMap {
+    blocked: HashSet<GridPosition>,
+    costs: HashMap<GridPosition, u32>,
+    unblocked_costs: HashMap<GridPosition, u32>,
+}
+
+impl ApproachMap {
+    fn new(input: &RollingPlanInput, stats: &UnitStats, origin: GridPosition) -> Self {
+        let blocked = input
+            .enemies
+            .iter()
+            .filter(|enemy| enemy.available_turn == 0)
+            .map(|enemy| enemy.position)
+            .collect::<HashSet<_>>();
+        let costs = movement_costs(input, stats.movement_type, origin, &blocked);
+        let unblocked_costs =
+            movement_costs(input, stats.movement_type, origin, &HashSet::default());
+        Self {
+            blocked,
+            costs,
+            unblocked_costs,
+        }
+    }
+
+    /// `target` から `range` の距離にあるマスのうち、最も早く着けるマスまでの移動turn。
+    /// どこにも届かなければ `None`。
+    fn travel_turns_into_range(
+        &self,
+        map: &Map,
+        stats: &UnitStats,
+        target: GridPosition,
+        (min_range, max_range): (u32, u32),
+    ) -> Option<u32> {
+        let movement = stats.max_movement.max(1);
+        let cells = cells_within(map, target, max_range)
+            .filter(|(cell, distance)| *distance >= min_range && !self.blocked.contains(cell))
+            .map(|(cell, _)| cell)
+            .collect::<Vec<_>>();
+        cells
+            .iter()
+            .filter_map(|cell| self.costs.get(cell))
+            .min()
+            .map(|cost| cost.div_ceil(movement))
+            .or_else(|| {
+                cells
+                    .iter()
+                    .filter_map(|cell| self.unblocked_costs.get(cell))
+                    .min()
+                    .map(|cost| cost.div_ceil(movement).saturating_add(1))
+            })
+    }
+
+    /// 射撃位置に着いて撃てるまでのturn。間接砲は移動した手番に撃てないため1turn足す。
+    fn attack_readiness_turns(&self, map: &Map, stats: &UnitStats, target: GridPosition) -> u32 {
+        let travel = self
+            .travel_turns_into_range(
+                map,
+                stats,
+                target,
+                (stats.min_range.max(1), stats.max_range.max(1)),
+            )
+            .unwrap_or(u32::MAX / 4);
+        travel.saturating_add(u32::from(travel > 0 && stats.min_range > 1))
+    }
+
+    /// 同じ手番に `target` を直接攻撃できる射撃位置の数（地形上到達でき、敵のいないマス）。
+    ///
+    /// 橋や回廊の出口では周りのマスが少なく、敵の陣取りでさらに減る。周りの敵は
+    /// 交戦中に倒れ得るため、どのマスも塞がれていても1体分は攻撃できるものとする。
+    fn firing_slots(&self, map: &Map, stats: &UnitStats, target: GridPosition) -> u32 {
+        let slots = cells_within(map, target, stats.max_range.max(1))
+            .filter(|(cell, distance)| {
+                *distance >= stats.min_range.max(1)
+                    && !self.blocked.contains(cell)
+                    && self.unblocked_costs.contains_key(cell)
+            })
+            .count();
+        u32::try_from(slots).unwrap_or(u32::MAX).max(1)
+    }
+}
+
+/// `center` から距離 `radius` 以内の盤面内マスと、その距離。
+fn cells_within(
+    map: &Map,
+    center: GridPosition,
+    radius: u32,
+) -> impl Iterator<Item = (GridPosition, u32)> + '_ {
+    let reach = radius as usize;
+    let xs = center.x.saturating_sub(reach)..=(center.x + reach).min(map.width.saturating_sub(1));
+    let ys = center.y.saturating_sub(reach)..=(center.y + reach).min(map.height.saturating_sub(1));
+    ys.flat_map(move |y| xs.clone().map(move |x| GridPosition { x, y }))
+        .filter_map(move |cell| {
+            let distance = map.distance(cell.x, cell.y, center.x, center.y);
+            (distance <= radius).then_some((cell, distance))
+        })
+}
+
+/// `origin` から各マスへの最小移動コスト（Dijkstra）。`blocked` のマスには入らない。
+fn movement_costs(
+    input: &RollingPlanInput,
+    movement_type: MovementType,
+    origin: GridPosition,
+    blocked: &HashSet<GridPosition>,
+) -> HashMap<GridPosition, u32> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let map = &input.map;
+    let mut costs = HashMap::default();
+    costs.insert(origin, 0_u32);
+    let mut queue = BinaryHeap::from([(Reverse(0_u32), origin.y, origin.x)]);
+    while let Some((Reverse(cost), y, x)) = queue.pop() {
+        if costs
+            .get(&GridPosition { x, y })
+            .is_some_and(|best| *best < cost)
+        {
+            continue;
+        }
+        for (next_x, next_y) in map.get_adjacent(x, y) {
+            let next = GridPosition {
+                x: next_x,
+                y: next_y,
+            };
+            if blocked.contains(&next) {
+                continue;
+            }
+            let Some(step) = map.get_terrain(next_x, next_y).and_then(|terrain| {
+                crate::systems::movement::get_valid_movement_cost(
+                    &input.master_data,
+                    movement_type,
+                    terrain,
+                )
+            }) else {
+                continue;
+            };
+            let next_cost = cost.saturating_add(step);
+            if costs.get(&next).is_none_or(|best| next_cost < *best) {
+                costs.insert(next, next_cost);
+                queue.push((Reverse(next_cost), next_y, next_x));
+            }
+        }
+    }
+    costs
 }
 
 fn attack_readiness_turns(distance: u32, stats: &UnitStats) -> u32 {
@@ -1817,6 +2014,56 @@ mod tests {
             delay_cost_per_turn: 5_000,
             search_beam_width: SEARCH_BEAM_WIDTH,
         }
+    }
+
+    /// 橋の出口を敵が塞いでいる対岸の敵へは、直線距離ではなく迂回と押しのけを含めて
+    /// 接近を見積もる。直接攻撃できる数は、敵の周りの敵のいないマスに限られる。
+    #[test]
+    fn approach_map_measures_bridge_crossing_and_firing_slots() {
+        // x=3 の列は海で、(3,0) だけが橋。対岸の出口 (4,0) に敵が陣取る。
+        let mut map = Map::new(7, 3, Terrain::Plains, GridTopology::Square);
+        for y in 1..3 {
+            map.set_terrain(3, y, Terrain::Sea).unwrap();
+        }
+        map.set_terrain(3, 0, Terrain::Bridge).unwrap();
+        let blocker = GridPosition { x: 4, y: 0 };
+        let target = GridPosition { x: 5, y: 1 };
+        let guard = GridPosition { x: 5, y: 0 };
+        let mut input = input();
+        input.map = Arc::new(map);
+        input.enemies = [blocker, target, guard]
+            .into_iter()
+            .map(|position| EnemyPlanUnit {
+                entity: None,
+                stats: stats(UnitType::Infantry, 1_000, 3),
+                position,
+                hp: 100,
+                defense_bonus: 0,
+                available_turn: 0,
+            })
+            .collect();
+        let tank = UnitStats {
+            movement_type: MovementType::Tank,
+            ..stats(UnitType::Tank, 7_000, 3)
+        };
+        let origin = GridPosition { x: 1, y: 1 };
+
+        let approach = ApproachMap::new(&input, &tank, origin);
+
+        // 直線距離なら1手番で隣接できるが、橋を渡り出口の敵を押しのけて回り込む。
+        assert_eq!(
+            attack_readiness_turns(
+                input.map.distance(origin.x, origin.y, target.x, target.y),
+                &tank
+            ),
+            1
+        );
+        assert_eq!(
+            approach.attack_readiness_turns(&input.map, &tank, target),
+            3
+        );
+        // 周りの4マスのうち、敵のいる (5,0) を除く3マスから攻撃できる。
+        assert_eq!(approach.firing_slots(&input.map, &tank, target), 3);
     }
 
     /// F14の共通初期化は入力順、HP、行動可能turn、弾数を保持する。
