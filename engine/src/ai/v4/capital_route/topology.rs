@@ -126,7 +126,7 @@ pub(in crate::ai::v4) fn armored_entry_bridge_gates(
 
 /// 戦車が通行できるマスだけを使い、始点からの最短ステップ距離を求める。
 /// 地形コストの厳密な消費量ではなく、回廊が何本に分かれるかを判定するための探索である。
-pub(crate) fn movement_step_distances(
+pub(in crate::ai::v4) fn movement_step_distances(
     map: &Map,
     master_data: &MasterDataRegistry,
     start: GridPosition,
@@ -164,49 +164,6 @@ pub(in crate::ai::v4) fn armored_step_distances(
     start: GridPosition,
 ) -> HashMap<GridPosition, u32> {
     movement_step_distances(map, master_data, start, MovementType::Tank)
-}
-
-/// 各進軍軸の前線から、装甲部隊が通れるマスだけで数えた距離表。
-///
-/// 盤面上の座標をどの進軍軸へ帰属させるかを、山や海を無視した直線距離ではなく
-/// 実際に戦車が辿る道のりで決めるために使う。直線距離では、山で隔てられた
-/// 敵首都周辺が遠回りの別軸ではなく近く見える軸へ数えられてしまう。
-pub(crate) struct RouteFrontDistances {
-    by_front: Vec<(GridPosition, HashMap<GridPosition, u32>)>,
-}
-
-impl RouteFrontDistances {
-    /// 前線ごとに一度だけ装甲距離を走査する。計算量は 前線数 × 盤面セル数。
-    pub(crate) fn new(
-        map: &Map,
-        master_data: &MasterDataRegistry,
-        fronts: &[GridPosition],
-    ) -> Self {
-        Self {
-            by_front: fronts
-                .iter()
-                .map(|front| (*front, armored_step_distances(map, master_data, *front)))
-                .collect(),
-        }
-    }
-
-    /// 座標に最も近い進軍軸の番号を返す。
-    ///
-    /// 装甲距離で比べ、同距離なら直線距離・軸番号の順で決める。山の中の歩兵のように
-    /// どの前線からも戦車で到達できない座標だけは、従来どおり直線距離で帰属させる。
-    pub(crate) fn nearest_route(&self, map: &Map, position: GridPosition) -> usize {
-        self.by_front
-            .iter()
-            .enumerate()
-            .min_by_key(|(index, (front, distances))| {
-                (
-                    distances.get(&position).copied().unwrap_or(u32::MAX),
-                    map.distance(position.x, position.y, front.x, front.y),
-                    *index,
-                )
-            })
-            .map_or(0, |(index, _)| index)
-    }
 }
 
 /// 橋のない山岳地形でも、両首都の間で独立して続く装甲回廊を最大2本返す。
@@ -565,9 +522,18 @@ pub(in crate::ai::v4) fn build_capital_route_topology(
             .map(|(position, _)| position)?;
         fronts.push(front);
     }
-    // 拠点は戦車が実際に辿る道のりで最寄りの進軍軸へ結びつける。
-    let front_distances = RouteFrontDistances::new(map, master_data, &fronts);
-    let nearest_route = |position: GridPosition| front_distances.nearest_route(map, position);
+    let nearest_route = |position: GridPosition| {
+        fronts
+            .iter()
+            .enumerate()
+            .min_by_key(|(route, front)| {
+                (
+                    map.distance(position.x, position.y, front.x, front.y),
+                    *route,
+                )
+            })
+            .map_or(0, |(route, _)| route)
+    };
     let mut property_routes = HashMap::default();
     for entity in world.iter_entities() {
         let (Some(position), Some(_property)) =

@@ -33,9 +33,6 @@ const MAX_OBJECTIVES: usize = 4;
 /// この手番数以内に施設を攻撃・占領できる敵を、その施設を守る敵とみなす。
 const GUARD_TURNS: u32 = 2;
 
-/// 施設を守る敵の排除へ回す部隊の、交戦までの手番数の上限。
-const GUARD_ENGAGE_TURNS: u32 = 3;
-
 struct UnitView<'a> {
     entity: Entity,
     position: GridPosition,
@@ -638,11 +635,8 @@ pub(super) fn objective_combat_responsibilities(
     .into_iter()
     .filter(|threat| !allocation.handled.contains(&threat.enemy))
     .map(|threat| Threat {
-        // 施設を確保するまでに排除すればよいが、遠くの部隊まで呼び寄せない。
-        // 期限なしで全戦力を候補にすると、山地で防御の高い歩兵一体を削り切るまで
-        // ほぼ全軍が同じ敵へ割り当てられ、橋などの一点へ殺到して停滞する。
-        // 間に合わない部隊は後段で各進軍路の前線へ配り、迂回路を前進させる。
-        deadline: GUARD_ENGAGE_TURNS,
+        // 施設を確保するまでに排除すればよく、到着期限は課さない。
+        deadline: u32::MAX,
         ..threat
     })
     .collect::<Vec<_>>();
