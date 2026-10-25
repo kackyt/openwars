@@ -516,6 +516,9 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
             // 選ぶ案を、安い現在購入で強制的に上書きしないためである。
             next.push((state.clone(), run.clone()));
             for option_index in &option_indices {
+                if !screen_allows_indirect_purchase(input, state, *option_index) {
+                    continue;
+                }
                 if let Some(child) = state.with_affordable_purchase(input, *option_index, slot) {
                     next.push((child, run.with_purchase(*option_index)));
                 }
@@ -595,6 +598,52 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
     selected.candidates_considered = considered;
     selected.search_truncated = truncated;
     Some(selected)
+}
+
+/// 前衛として先頭に立つ直接戦闘unitか（占領・輸送役は含めない）。
+fn is_front_combat(stats: &UnitStats) -> bool {
+    stats.min_range <= 1 && !stats.can_capture && stats.max_cargo == 0
+}
+
+/// 間接砲の購入を、それを先頭で守れる前衛の直接戦闘unitがいる範囲に限る。
+///
+/// 間接砲は移動した手番に撃てず、前衛の後ろから撃って初めて働く。前衛が足りないと
+/// 間接砲が先頭に出て、一本道の回廊や橋で撃てないまま後続を塞ぐ。安い軽戦車を
+/// 数だけ並べても重自走砲の前は守れないため、間接砲1体ごとに、それ以上の価格の
+/// 前衛1体を対応させる（重自走砲には中戦車・重戦車を充てる）。既存の参加戦力と
+/// この案の購入列を合わせて、対応が取れなくなる間接砲の購入だけを除く。
+fn screen_allows_indirect_purchase(
+    input: &RollingPlanInput,
+    state: &SearchState,
+    option_index: usize,
+) -> bool {
+    let option = &input.production_options[option_index];
+    if option.stats.min_range <= 1 {
+        return true;
+    }
+    let units = state
+        .option_indices
+        .iter()
+        .chain(std::iter::once(&option_index))
+        .map(|index| &input.production_options[*index].stats)
+        .chain(input.existing_units.iter().map(|unit| &unit.stats));
+    let mut front_costs = Vec::new();
+    let mut indirect_costs = Vec::new();
+    for stats in units {
+        if is_front_combat(stats) {
+            front_costs.push(stats.cost);
+        } else if stats.min_range > 1 {
+            indirect_costs.push(stats.cost);
+        }
+    }
+    // 高い順に並べて対応させる。どこかで前衛の価格が下回れば対応は取れない。
+    front_costs.sort_unstable_by(|left, right| right.cmp(left));
+    indirect_costs.sort_unstable_by(|left, right| right.cmp(left));
+    front_costs.len() >= indirect_costs.len()
+        && front_costs
+            .iter()
+            .zip(&indirect_costs)
+            .all(|(front, indirect)| front >= indirect)
 }
 
 /// best-effort案の未使用current slotを、即時投入できる直接戦闘unitで埋める。
@@ -2437,6 +2486,75 @@ mod tests {
         update_best_effort(&mut selected, &low_loss);
 
         assert_eq!(selected.unwrap().expected_loss, 2_000);
+    }
+
+    /// 間接砲1体ごとに、それ以上の価格の前衛が要る。安い軽戦車だけでは重自走砲を
+    /// 守れず、前衛が増えれば同じ数だけ間接砲を足せる。
+    #[test]
+    fn indirect_purchase_needs_an_equally_costly_front_unit() {
+        let master = MasterDataRegistry::load().unwrap();
+        let unit = |name: &str| {
+            master
+                .create_unit_stats(&UnitName(name.to_owned()))
+                .unwrap()
+        };
+        let mut input = input();
+        input.production_options = ["重自走砲", "軽戦車", "中戦車"]
+            .into_iter()
+            .enumerate()
+            .map(|(x, name)| {
+                let stats = unit(name);
+                ProductionPlanOption {
+                    capture_target: None,
+                    capture_arrival_turn: None,
+                    capture_completion_turn: None,
+                    capture_durability: None,
+                    capture_blocking_enemy_index: None,
+                    purchase: PlannedPurchase {
+                        facility: GridPosition { x, y: 0 },
+                        unit_type: stats.unit_type,
+                        build_turn: 0,
+                        cost: stats.cost,
+                    },
+                    stats,
+                    engageable_enemy_indices: vec![0],
+                }
+            })
+            .collect();
+        let state = |indices: &[usize]| SearchState {
+            option_indices: indices.to_vec(),
+            ..SearchState::default()
+        };
+        let (heavy_gun, light_tank, medium_tank) = (0, 1, 2);
+
+        // 直接戦闘unitは前衛の有無に関わらず買える。
+        assert!(screen_allows_indirect_purchase(
+            &input,
+            &state(&[]),
+            light_tank
+        ));
+        // 前衛がいなければ間接砲は買えず、安い軽戦車では重自走砲の前衛にならない。
+        assert!(!screen_allows_indirect_purchase(
+            &input,
+            &state(&[]),
+            heavy_gun
+        ));
+        assert!(!screen_allows_indirect_purchase(
+            &input,
+            &state(&[light_tank, light_tank]),
+            heavy_gun
+        ));
+        // 中戦車1体につき重自走砲1体まで。
+        assert!(screen_allows_indirect_purchase(
+            &input,
+            &state(&[medium_tank]),
+            heavy_gun
+        ));
+        assert!(!screen_allows_indirect_purchase(
+            &input,
+            &state(&[medium_tank, heavy_gun]),
+            heavy_gun
+        ));
     }
 
     #[test]
