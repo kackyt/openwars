@@ -41,6 +41,13 @@ impl AiVersion {
         matches!(self, AiVersion::V4)
     }
 
+    /// Squad目標への接近を、直線距離ではなく実経路の残り移動コストで比べるか（V4のみ）。
+    /// 直線距離で比べると、山や川を迂回する道路を進む前進が「目標から遠ざかる」と
+    /// 評価され、戦車が迂回路へ出られずに自陣へ留まる。
+    pub(crate) fn approaches_squad_target_by_path(&self) -> bool {
+        matches!(self, AiVersion::V4)
+    }
+
     /// 敵生産マスの封鎖はV4だけが候補にする。標準経路ではこの追加評価を呼ばない。
     pub(crate) fn uses_enemy_production_blockade(&self) -> bool {
         matches!(self, AiVersion::V4)
