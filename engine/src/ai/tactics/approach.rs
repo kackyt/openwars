@@ -215,6 +215,19 @@ pub(crate) fn approach_bonus(turns: u32, grid_distance: i32, max_movement: u32) 
     (100 - turns as i32).max(0) * 1000 + ((100.0 - moves).max(0.0) * 2000.0) as i32
 }
 
+/// 実経路で目標へ近いほど大きい接近score。到達できるなら、同じターン距離の中の前進を
+/// 直線距離ではなく経路上の残り移動コストで区別する。迂回路を進む前進で直線距離が
+/// 一時的に増えても、経路を進めば必ず加点される。到達不能なら従来どおり直線距離で比べる。
+pub(crate) fn path_approach_bonus(
+    turns: TurnDistance,
+    grid_distance: i32,
+    max_movement: u32,
+) -> i32 {
+    let remaining =
+        path_mp(turns).map_or(grid_distance, |mp| i32::try_from(mp).unwrap_or(i32::MAX));
+    approach_bonus(turns.turns, remaining, max_movement)
+}
+
 /// 到達可能な最寄り目標への接近score（到達不能・目標なしは0）。
 pub(crate) fn nearest_approach_bonus(nearest: Option<Approach>, max_movement: u32) -> i32 {
     match nearest {
@@ -227,7 +240,39 @@ pub(crate) fn nearest_approach_bonus(nearest: Option<Approach>, max_movement: u3
 
 #[cfg(test)]
 mod tests {
-    use super::TargetProgress;
+    use super::{
+        TargetProgress, TurnDistance, UNREACHABLE_MP, approach_bonus, path_approach_bonus,
+    };
+
+    /// 山を迂回する道路を進む前進は、直線距離が増えても実経路の残りが減るので加点される。
+    /// 直線距離で比べる従来のscoreでは、同じ前進が減点になり戦車が自陣に留まっていた。
+    #[test]
+    fn path_approach_rewards_progress_along_a_detour() {
+        // 自陣: 目標まで直線8マス、迂回路で残り24移動力（4ターン）。
+        let home = TurnDistance {
+            turns: 4,
+            used_mp: 24,
+        };
+        // 道路を1手番進んだ先: 直線12マスに離れるが、残りは18移動力（3ターン）。
+        let detour = TurnDistance {
+            turns: 3,
+            used_mp: 18,
+        };
+        assert!(path_approach_bonus(detour, 12, 6) > path_approach_bonus(home, 8, 6));
+        assert!(approach_bonus(detour.turns, 12, 6) < approach_bonus(home.turns, 8, 6));
+    }
+
+    #[test]
+    fn unreachable_target_falls_back_to_grid_distance() {
+        let unreachable = TurnDistance {
+            turns: 99,
+            used_mp: UNREACHABLE_MP,
+        };
+        assert_eq!(
+            path_approach_bonus(unreachable, 7, 6),
+            approach_bonus(99, 7, 6)
+        );
+    }
 
     fn progress(
         current_grid: u32,
