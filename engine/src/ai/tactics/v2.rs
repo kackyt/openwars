@@ -11,7 +11,8 @@ use super::scoring::{
     assess_merge, attack_serves_campaign, blocks_own_production, capture_or_hunt_score,
     direct_threat_terrain_score, empty_transport_return_score, reference_point_approach_score,
     reference_reach, repair_site_at, solo_enemy_approach_score, squad_target_approach_score,
-    stranded_infantry_score, terrain_defense_bonus, v3_positioning_score, wait_recovery_score,
+    squad_target_path_approach_score, stranded_infantry_score, terrain_defense_bonus,
+    v3_positioning_score, wait_recovery_score,
 };
 use super::unit::UnitState;
 use crate::ai::command::AiCommand;
@@ -380,7 +381,10 @@ fn tile_score(
     if !unit.is_solo
         && let Some(target) = unit.squad_target
     {
-        squad_approach = if unit.treats_target_as_reference() {
+        squad_approach = if board.approaches_squad_target_by_path {
+            // V4は参照点・目標地点のどちらも、射程に捉えるまでの実経路で接近を比べる。
+            squad_target_path_approach_score(state, position, target, distances)
+        } else if unit.treats_target_as_reference() {
             reference_point_approach_score(state, position, target, distances)
         } else {
             squad_target_approach_score(state, position, target, distances)

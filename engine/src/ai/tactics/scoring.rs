@@ -4,7 +4,9 @@
 //! 占領を10000点、撃破を5000点などの目安で加減する。行動の優先度（[`ActionPriority`]）は
 //! scoreより先に比べる別軸である。
 
-use super::approach::{ApproachDistances, approach_bonus, manhattan, nearest_approach_bonus};
+use super::approach::{
+    ApproachDistances, approach_bonus, manhattan, nearest_approach_bonus, path_approach_bonus,
+};
 use super::board::TacticalBoard;
 use super::unit::UnitState;
 use crate::ai::command::AiCommand;
@@ -181,6 +183,18 @@ pub(crate) fn squad_target_approach_score(
     let stats = &unit.stats;
     let turns = distances.turns(stats, position, target, stats.max_range);
     approach_bonus(turns.turns, manhattan(position, target), stats.max_movement)
+}
+
+/// Squad目標への実経路での接近（V4）。射程に捉えるまでの経路の残り移動コストで比べる。
+pub(crate) fn squad_target_path_approach_score(
+    unit: &UnitState,
+    position: GridPosition,
+    target: GridPosition,
+    distances: &mut ApproachDistances,
+) -> i32 {
+    let stats = &unit.stats;
+    let turns = distances.turns(stats, position, target, stats.max_range);
+    path_approach_bonus(turns, manhattan(position, target), stats.max_movement)
 }
 
 /// campaignの非占領unitにとってのSquad目標は、全員が重なる駐留マスではなく、
