@@ -431,10 +431,10 @@ T3 P2 begin V4 Standard
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 22, y: 7 }, to: GridPosition { x: 21, y: 7 }, fuel_used: 1 }
   Wait { target_pos: GridPosition { x: 26, y: 12 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 26, y: 9 }, to: GridPosition { x: 26, y: 12 }, fuel_used: 3 }
-  Wait { target_pos: GridPosition { x: 27, y: 10 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 26, y: 8 }, to: GridPosition { x: 27, y: 10 }, fuel_used: 2 }
-  Wait { target_pos: GridPosition { x: 22, y: 6 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 24, y: 7 }, to: GridPosition { x: 22, y: 6 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 26, y: 11 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 26, y: 8 }, to: GridPosition { x: 26, y: 11 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 22, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 24, y: 7 }, to: GridPosition { x: 22, y: 7 }, fuel_used: 2 }
   Wait { target_pos: GridPosition { x: 23, y: 6 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 23, y: 6 }, to: GridPosition { x: 23, y: 6 }, fuel_used: 0 }
   ProduceUnitCommand { player_id: PlayerId(2), target_x: 25, target_y: 4, unit_type: Infantry }
@@ -480,7 +480,7 @@ T3 P2 end
   unit P2 Infantry (21,7) hp=100
   unit P2 Infantry (21,8) hp=100
   unit P2 Infantry (22,5) hp=100
-  unit P2 Infantry (22,6) hp=100
+  unit P2 Infantry (22,7) hp=100
   unit P2 Infantry (22,8) hp=100
   unit P2 Infantry (23,4) hp=100
   unit P2 Infantry (23,5) hp=100
@@ -492,11 +492,11 @@ T3 P2 end
   unit P2 Infantry (25,5) hp=100
   unit P2 Infantry (25,6) hp=100
   unit P2 Infantry (25,7) hp=100
+  unit P2 Infantry (26,11) hp=100
   unit P2 Infantry (26,12) hp=100
   unit P2 Infantry (26,4) hp=100
   unit P2 Infantry (26,5) hp=100
   unit P2 Infantry (26,6) hp=100
-  unit P2 Infantry (27,10) hp=100
   unit P2 Infantry (27,9) hp=100
   prop (0,17) City owner=None cp=100
   prop (0,18) City owner=Some(1) cp=200
@@ -557,20 +557,20 @@ T4 P1 begin V4 Standard
     ev PropertyCapturedEvent { x: 0, y: 17, new_owner: Some(PlayerId(1)) }
   Wait { target_pos: GridPosition { x: 5, y: 11 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 5, y: 12 }, to: GridPosition { x: 5, y: 11 }, fuel_used: 1 }
-  Wait { target_pos: GridPosition { x: 6, y: 16 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 6, y: 16 }, to: GridPosition { x: 6, y: 16 }, fuel_used: 0 }
-  Wait { target_pos: GridPosition { x: 5, y: 15 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 5, y: 15 }, to: GridPosition { x: 5, y: 15 }, fuel_used: 0 }
   Wait { target_pos: GridPosition { x: 5, y: 14 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 5, y: 14 }, to: GridPosition { x: 5, y: 14 }, fuel_used: 0 }
-  Wait { target_pos: GridPosition { x: 5, y: 17 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 5, y: 17 }, to: GridPosition { x: 5, y: 17 }, fuel_used: 0 }
-  Wait { target_pos: GridPosition { x: 7, y: 16 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 7, y: 16 }, to: GridPosition { x: 7, y: 16 }, fuel_used: 0 }
   Wait { target_pos: GridPosition { x: 6, y: 15 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 6, y: 15 }, to: GridPosition { x: 6, y: 15 }, fuel_used: 0 }
+  Wait { target_pos: GridPosition { x: 5, y: 15 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 5, y: 15 }, to: GridPosition { x: 5, y: 15 }, fuel_used: 0 }
+  Wait { target_pos: GridPosition { x: 7, y: 16 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 7, y: 16 }, to: GridPosition { x: 7, y: 16 }, fuel_used: 0 }
+  Wait { target_pos: GridPosition { x: 6, y: 16 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 6, y: 16 }, to: GridPosition { x: 6, y: 16 }, fuel_used: 0 }
   Wait { target_pos: GridPosition { x: 6, y: 17 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 6, y: 17 }, to: GridPosition { x: 6, y: 17 }, fuel_used: 0 }
+  Wait { target_pos: GridPosition { x: 5, y: 17 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 5, y: 17 }, to: GridPosition { x: 5, y: 17 }, fuel_used: 0 }
   Wait { target_pos: GridPosition { x: 6, y: 18 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 6, y: 18 }, to: GridPosition { x: 6, y: 18 }, fuel_used: 0 }
   Wait { target_pos: GridPosition { x: 4, y: 14 } }
@@ -627,7 +627,7 @@ T4 P1 end
   unit P2 Infantry (21,7) hp=100
   unit P2 Infantry (21,8) hp=100
   unit P2 Infantry (22,5) hp=100
-  unit P2 Infantry (22,6) hp=100
+  unit P2 Infantry (22,7) hp=100
   unit P2 Infantry (22,8) hp=100
   unit P2 Infantry (23,4) hp=100
   unit P2 Infantry (23,5) hp=100
@@ -639,11 +639,11 @@ T4 P1 end
   unit P2 Infantry (25,5) hp=100
   unit P2 Infantry (25,6) hp=100
   unit P2 Infantry (25,7) hp=100
+  unit P2 Infantry (26,11) hp=100
   unit P2 Infantry (26,12) hp=100
   unit P2 Infantry (26,4) hp=100
   unit P2 Infantry (26,5) hp=100
   unit P2 Infantry (26,6) hp=100
-  unit P2 Infantry (27,10) hp=100
   unit P2 Infantry (27,9) hp=100
   prop (0,17) City owner=Some(1) cp=200
   prop (0,18) City owner=Some(1) cp=200
@@ -685,8 +685,8 @@ T4 P2 begin V4 Standard
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 25, y: 4 }, to: GridPosition { x: 23, y: 7 }, fuel_used: 3 }
   Wait { target_pos: GridPosition { x: 24, y: 7 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 26, y: 4 }, to: GridPosition { x: 24, y: 7 }, fuel_used: 3 }
-  Wait { target_pos: GridPosition { x: 22, y: 7 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 24, y: 5 }, to: GridPosition { x: 22, y: 7 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 22, y: 6 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 24, y: 5 }, to: GridPosition { x: 22, y: 6 }, fuel_used: 3 }
   Wait { target_pos: GridPosition { x: 24, y: 4 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 25, y: 5 }, to: GridPosition { x: 24, y: 4 }, fuel_used: 2 }
   Wait { target_pos: GridPosition { x: 26, y: 8 } }
@@ -701,29 +701,29 @@ T4 P2 begin V4 Standard
   Capture { target_pos: GridPosition { x: 21, y: 8 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 21, y: 8 }, to: GridPosition { x: 21, y: 8 }, fuel_used: 0 }
     ev PropertyCapturedEvent { x: 21, y: 8, new_owner: Some(PlayerId(2)) }
+  Capture { target_pos: GridPosition { x: 27, y: 14 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 26, y: 11 }, to: GridPosition { x: 27, y: 14 }, fuel_used: 3 }
   Capture { target_pos: GridPosition { x: 21, y: 7 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 21, y: 7 }, to: GridPosition { x: 21, y: 7 }, fuel_used: 0 }
     ev PropertyCapturedEvent { x: 21, y: 7, new_owner: Some(PlayerId(2)) }
   Capture { target_pos: GridPosition { x: 26, y: 14 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 26, y: 12 }, to: GridPosition { x: 26, y: 14 }, fuel_used: 2 }
-  Wait { target_pos: GridPosition { x: 26, y: 13 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 27, y: 10 }, to: GridPosition { x: 26, y: 13 }, fuel_used: 3 }
   Wait { target_pos: GridPosition { x: 26, y: 11 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 27, y: 9 }, to: GridPosition { x: 26, y: 11 }, fuel_used: 2 }
+  Wait { target_pos: GridPosition { x: 22, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 22, y: 7 }, to: GridPosition { x: 22, y: 7 }, fuel_used: 0 }
   Wait { target_pos: GridPosition { x: 21, y: 6 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 23, y: 6 }, to: GridPosition { x: 21, y: 6 }, fuel_used: 2 }
-  Wait { target_pos: GridPosition { x: 22, y: 6 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 22, y: 6 }, to: GridPosition { x: 22, y: 6 }, fuel_used: 0 }
   Wait { target_pos: GridPosition { x: 21, y: 5 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 22, y: 5 }, to: GridPosition { x: 21, y: 5 }, fuel_used: 1 }
   Wait { target_pos: GridPosition { x: 22, y: 5 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 23, y: 5 }, to: GridPosition { x: 22, y: 5 }, fuel_used: 1 }
-  Wait { target_pos: GridPosition { x: 23, y: 4 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 23, y: 4 }, to: GridPosition { x: 23, y: 4 }, fuel_used: 0 }
   Wait { target_pos: GridPosition { x: 23, y: 8 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 23, y: 8 }, to: GridPosition { x: 23, y: 8 }, fuel_used: 0 }
   Wait { target_pos: GridPosition { x: 24, y: 6 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 24, y: 6 }, to: GridPosition { x: 24, y: 6 }, fuel_used: 0 }
+  Wait { target_pos: GridPosition { x: 23, y: 4 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 23, y: 4 }, to: GridPosition { x: 23, y: 4 }, fuel_used: 0 }
   Wait { target_pos: GridPosition { x: 25, y: 7 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 25, y: 7 }, to: GridPosition { x: 25, y: 7 }, fuel_used: 0 }
   ProduceUnitCommand { player_id: PlayerId(2), target_x: 25, target_y: 4, unit_type: Infantry }
@@ -793,11 +793,11 @@ T4 P2 end
   unit P2 Infantry (25,7) hp=100
   unit P2 Infantry (25,8) hp=100
   unit P2 Infantry (26,11) hp=100
-  unit P2 Infantry (26,13) hp=100
   unit P2 Infantry (26,14) hp=100
   unit P2 Infantry (26,4) hp=100
   unit P2 Infantry (26,5) hp=100
   unit P2 Infantry (26,8) hp=100
+  unit P2 Infantry (27,14) hp=100
   prop (0,17) City owner=Some(1) cp=200
   prop (0,18) City owner=Some(1) cp=200
   prop (0,19) City owner=Some(1) cp=200
@@ -818,6 +818,7 @@ T4 P2 end
   prop (26,4) Factory owner=Some(2) cp=200
   prop (26,5) Factory owner=Some(2) cp=200
   prop (26,6) Factory owner=Some(2) cp=200
+  prop (27,14) City owner=None cp=100
   prop (28,2) City owner=Some(2) cp=200
   prop (28,3) City owner=Some(2) cp=200
   prop (28,6) Airport owner=Some(2) cp=300

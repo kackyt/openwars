@@ -359,14 +359,14 @@ T3 P2 begin V4 Standard
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 22, y: 6 }, to: GridPosition { x: 21, y: 8 }, fuel_used: 2 }
   Capture { target_pos: GridPosition { x: 21, y: 7 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 22, y: 7 }, to: GridPosition { x: 21, y: 7 }, fuel_used: 1 }
-  Wait { target_pos: GridPosition { x: 16, y: 7 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 19, y: 3 }, to: GridPosition { x: 16, y: 7 }, fuel_used: 5 }
-  Wait { target_pos: GridPosition { x: 17, y: 7 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 20, y: 3 }, to: GridPosition { x: 17, y: 7 }, fuel_used: 5 }
+  Wait { target_pos: GridPosition { x: 14, y: 3 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 19, y: 3 }, to: GridPosition { x: 14, y: 3 }, fuel_used: 5 }
+  Wait { target_pos: GridPosition { x: 15, y: 3 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 20, y: 3 }, to: GridPosition { x: 15, y: 3 }, fuel_used: 5 }
   Wait { target_pos: GridPosition { x: 21, y: 6 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 23, y: 6 }, to: GridPosition { x: 21, y: 6 }, fuel_used: 2 }
-  Wait { target_pos: GridPosition { x: 22, y: 6 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 24, y: 7 }, to: GridPosition { x: 22, y: 6 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 22, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 24, y: 7 }, to: GridPosition { x: 22, y: 7 }, fuel_used: 2 }
   Wait { target_pos: GridPosition { x: 23, y: 7 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 26, y: 8 }, to: GridPosition { x: 23, y: 7 }, fuel_used: 3 }
   ProduceUnitCommand { player_id: PlayerId(2), target_x: 25, target_y: 4, unit_type: Infantry }
@@ -399,14 +399,14 @@ T3 P2 end
   unit P1 Rockets (5,16) hp=100
   unit P1 Rockets (6,13) hp=100
   unit P1 Rockets (6,14) hp=100
-  unit P2 Bcopters (16,7) hp=100
-  unit P2 Bcopters (17,7) hp=100
+  unit P2 Bcopters (14,3) hp=100
+  unit P2 Bcopters (15,3) hp=100
   unit P2 Bcopters (20,4) hp=100
   unit P2 Bcopters (21,4) hp=100
   unit P2 Infantry (21,6) hp=100
   unit P2 Infantry (21,7) hp=100
   unit P2 Infantry (21,8) hp=100
-  unit P2 Infantry (22,6) hp=100
+  unit P2 Infantry (22,7) hp=100
   unit P2 Infantry (22,8) hp=100
   unit P2 Infantry (23,4) hp=100
   unit P2 Infantry (23,7) hp=100
@@ -456,12 +456,12 @@ T3 P2 end
 T4 P1 begin V3
   Capture { target_pos: GridPosition { x: 9, y: 14 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 7, y: 14 }, to: GridPosition { x: 9, y: 14 }, fuel_used: 2 }
-  Wait { target_pos: GridPosition { x: 11, y: 11 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 9, y: 8 }, to: GridPosition { x: 11, y: 11 }, fuel_used: 4 }
+  Wait { target_pos: GridPosition { x: 7, y: 8 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 9, y: 8 }, to: GridPosition { x: 7, y: 8 }, fuel_used: 3 }
   Wait { target_pos: GridPosition { x: 2, y: 16 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 0, y: 17 }, to: GridPosition { x: 2, y: 16 }, fuel_used: 2 }
-  Wait { target_pos: GridPosition { x: 10, y: 12 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 6, y: 13 }, to: GridPosition { x: 10, y: 12 }, fuel_used: 4 }
+  Wait { target_pos: GridPosition { x: 9, y: 11 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 6, y: 13 }, to: GridPosition { x: 9, y: 11 }, fuel_used: 4 }
   Wait { target_pos: GridPosition { x: 9, y: 12 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 5, y: 13 }, to: GridPosition { x: 9, y: 12 }, fuel_used: 4 }
   Wait { target_pos: GridPosition { x: 8, y: 12 } }
@@ -500,9 +500,8 @@ T4 P1 end
   unit P1 Infantry (3,17) hp=100
   unit P1 Infantry (5,14) hp=100
   unit P1 Infantry (9,14) hp=100
-  unit P1 MdTank (11,11) hp=100
+  unit P1 MdTank (7,8) hp=100
   unit P1 Mech (3,16) hp=100
-  unit P1 Rockets (10,12) hp=100
   unit P1 Rockets (3,15) hp=100
   unit P1 Rockets (4,16) hp=100
   unit P1 Rockets (4,17) hp=100
@@ -510,15 +509,16 @@ T4 P1 end
   unit P1 Rockets (7,14) hp=100
   unit P1 Rockets (8,12) hp=100
   unit P1 Rockets (8,14) hp=100
+  unit P1 Rockets (9,11) hp=100
   unit P1 Rockets (9,12) hp=100
-  unit P2 Bcopters (16,7) hp=100
-  unit P2 Bcopters (17,7) hp=100
+  unit P2 Bcopters (14,3) hp=100
+  unit P2 Bcopters (15,3) hp=100
   unit P2 Bcopters (20,4) hp=100
   unit P2 Bcopters (21,4) hp=100
   unit P2 Infantry (21,6) hp=100
   unit P2 Infantry (21,7) hp=100
   unit P2 Infantry (21,8) hp=100
-  unit P2 Infantry (22,6) hp=100
+  unit P2 Infantry (22,7) hp=100
   unit P2 Infantry (22,8) hp=100
   unit P2 Infantry (23,4) hp=100
   unit P2 Infantry (23,7) hp=100
@@ -571,8 +571,8 @@ T4 P2 begin V4 Standard
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 25, y: 4 }, to: GridPosition { x: 24, y: 7 }, fuel_used: 3 }
   Wait { target_pos: GridPosition { x: 25, y: 7 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 26, y: 4 }, to: GridPosition { x: 25, y: 7 }, fuel_used: 3 }
-  Wait { target_pos: GridPosition { x: 22, y: 7 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 24, y: 5 }, to: GridPosition { x: 22, y: 7 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 22, y: 6 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 24, y: 5 }, to: GridPosition { x: 22, y: 6 }, fuel_used: 3 }
   Wait { target_pos: GridPosition { x: 26, y: 8 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 25, y: 5 }, to: GridPosition { x: 26, y: 8 }, fuel_used: 3 }
   Wait { target_pos: GridPosition { x: 27, y: 8 } }
@@ -590,28 +590,28 @@ T4 P2 begin V4 Standard
   Capture { target_pos: GridPosition { x: 21, y: 7 } }
     ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 21, y: 7 }, to: GridPosition { x: 21, y: 7 }, fuel_used: 0 }
     ev PropertyCapturedEvent { x: 21, y: 7, new_owner: Some(PlayerId(2)) }
-  Wait { target_pos: GridPosition { x: 13, y: 11 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 16, y: 7 }, to: GridPosition { x: 13, y: 11 }, fuel_used: 5 }
-  Wait { target_pos: GridPosition { x: 14, y: 11 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 17, y: 7 }, to: GridPosition { x: 14, y: 11 }, fuel_used: 5 }
-  Wait { target_pos: GridPosition { x: 17, y: 9 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 20, y: 4 }, to: GridPosition { x: 17, y: 9 }, fuel_used: 5 }
-  Wait { target_pos: GridPosition { x: 20, y: 6 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 21, y: 6 }, to: GridPosition { x: 20, y: 6 }, fuel_used: 1 }
-  Wait { target_pos: GridPosition { x: 18, y: 9 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 21, y: 4 }, to: GridPosition { x: 18, y: 9 }, fuel_used: 5 }
+  Wait { target_pos: GridPosition { x: 9, y: 3 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 14, y: 3 }, to: GridPosition { x: 9, y: 3 }, fuel_used: 5 }
+  Wait { target_pos: GridPosition { x: 10, y: 3 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 15, y: 3 }, to: GridPosition { x: 10, y: 3 }, fuel_used: 5 }
+  Wait { target_pos: GridPosition { x: 20, y: 8 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 21, y: 6 }, to: GridPosition { x: 20, y: 8 }, fuel_used: 3 }
+  Wait { target_pos: GridPosition { x: 15, y: 3 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 20, y: 4 }, to: GridPosition { x: 15, y: 3 }, fuel_used: 5 }
+  Wait { target_pos: GridPosition { x: 16, y: 4 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 21, y: 4 }, to: GridPosition { x: 16, y: 4 }, fuel_used: 5 }
   Wait { target_pos: GridPosition { x: 20, y: 7 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 22, y: 6 }, to: GridPosition { x: 20, y: 7 }, fuel_used: 2 }
-  Wait { target_pos: GridPosition { x: 22, y: 6 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 23, y: 7 }, to: GridPosition { x: 22, y: 6 }, fuel_used: 2 }
-  Wait { target_pos: GridPosition { x: 22, y: 4 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 23, y: 4 }, to: GridPosition { x: 22, y: 4 }, fuel_used: 1 }
-  Wait { target_pos: GridPosition { x: 23, y: 7 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 24, y: 6 }, to: GridPosition { x: 23, y: 7 }, fuel_used: 1 }
-  Wait { target_pos: GridPosition { x: 27, y: 7 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 27, y: 6 }, to: GridPosition { x: 27, y: 7 }, fuel_used: 1 }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 22, y: 7 }, to: GridPosition { x: 20, y: 7 }, fuel_used: 2 }
+  Wait { target_pos: GridPosition { x: 22, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 24, y: 6 }, to: GridPosition { x: 22, y: 7 }, fuel_used: 2 }
+  Wait { target_pos: GridPosition { x: 22, y: 9 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 23, y: 7 }, to: GridPosition { x: 22, y: 9 }, fuel_used: 2 }
+  Wait { target_pos: GridPosition { x: 26, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 27, y: 6 }, to: GridPosition { x: 26, y: 7 }, fuel_used: 1 }
   Wait { target_pos: GridPosition { x: 22, y: 5 } }
-    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 23, y: 5 }, to: GridPosition { x: 22, y: 5 }, fuel_used: 1 }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 23, y: 4 }, to: GridPosition { x: 22, y: 5 }, fuel_used: 1 }
+  Wait { target_pos: GridPosition { x: 23, y: 7 } }
+    ev UnitMovedEvent { entity: <entity>, from: GridPosition { x: 23, y: 5 }, to: GridPosition { x: 23, y: 7 }, fuel_used: 2 }
   ProduceUnitCommand { player_id: PlayerId(2), target_x: 25, target_y: 4, unit_type: Infantry }
     ev UnitProducedEvent { player_id: PlayerId(2), target_x: 25, target_y: 4, unit_type: Infantry, entity: <entity> }
   ProduceUnitCommand { player_id: PlayerId(2), target_x: 24, target_y: 3, unit_type: Bcopters }
@@ -632,9 +632,8 @@ T4 P2 end
   unit P1 Infantry (3,17) hp=100
   unit P1 Infantry (5,14) hp=100
   unit P1 Infantry (9,14) hp=100
-  unit P1 MdTank (11,11) hp=100
+  unit P1 MdTank (7,8) hp=100
   unit P1 Mech (3,16) hp=100
-  unit P1 Rockets (10,12) hp=100
   unit P1 Rockets (3,15) hp=100
   unit P1 Rockets (4,16) hp=100
   unit P1 Rockets (4,17) hp=100
@@ -642,22 +641,23 @@ T4 P2 end
   unit P1 Rockets (7,14) hp=100
   unit P1 Rockets (8,12) hp=100
   unit P1 Rockets (8,14) hp=100
+  unit P1 Rockets (9,11) hp=100
   unit P1 Rockets (9,12) hp=100
-  unit P2 Bcopters (13,11) hp=100
-  unit P2 Bcopters (14,11) hp=100
-  unit P2 Bcopters (17,9) hp=100
-  unit P2 Bcopters (18,9) hp=100
+  unit P2 Bcopters (10,3) hp=100
+  unit P2 Bcopters (15,3) hp=100
+  unit P2 Bcopters (16,4) hp=100
   unit P2 Bcopters (24,3) hp=100
+  unit P2 Bcopters (9,3) hp=100
   unit P2 Bomber (25,3) hp=100
-  unit P2 Infantry (20,6) hp=100
   unit P2 Infantry (20,7) hp=100
+  unit P2 Infantry (20,8) hp=100
   unit P2 Infantry (21,7) hp=100
   unit P2 Infantry (21,8) hp=100
-  unit P2 Infantry (22,4) hp=100
+  unit P2 Infantry (22,5) hp=100
   unit P2 Infantry (22,6) hp=100
   unit P2 Infantry (22,7) hp=100
   unit P2 Infantry (22,8) hp=100
-  unit P2 Infantry (23,7) hp=100
+  unit P2 Infantry (22,9) hp=100
   unit P2 Infantry (24,7) hp=100
   unit P2 Infantry (24,8) hp=100
   unit P2 Infantry (25,4) hp=100
@@ -665,10 +665,10 @@ T4 P2 end
   unit P2 Infantry (26,8) hp=100
   unit P2 Infantry (26,9) hp=100
   unit P2 Infantry (27,8) hp=100
-  unit P2 Mech (22,5) hp=100
+  unit P2 Mech (23,7) hp=100
   unit P2 Mech (24,5) hp=100
   unit P2 Mech (26,4) hp=100
-  unit P2 Mech (27,7) hp=100
+  unit P2 Mech (26,7) hp=100
   prop (0,17) City owner=Some(1) cp=200
   prop (0,18) City owner=Some(1) cp=200
   prop (0,19) City owner=Some(1) cp=200
