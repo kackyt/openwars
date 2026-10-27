@@ -49,6 +49,9 @@ pub(in crate::ai::v4) fn flat_map(width: usize, height: usize) -> Map {
     }
 }
 
+/// テスト用盤面のゲーム手番。1手番目だけに掛かる序盤の生産制限を受けない中盤の手番にする。
+pub(in crate::ai::v4) const MIDGAME_TURN: u32 = 10;
+
 pub(in crate::ai::v4) fn pos(x: usize, y: usize) -> GridPosition {
     GridPosition { x, y }
 }
@@ -178,7 +181,7 @@ pub(in crate::ai::v4) fn strait_scan() -> BoardScan {
         master_data: MasterDataRegistry::load().unwrap().into(),
         damage_chart: DamageChart::new().into(),
         current_turn: 1,
-        game_turn: 1,
+        game_turn: MIDGAME_TURN,
         opening_policy: None,
         funds: 20000,
         capital_position: None,
@@ -232,7 +235,7 @@ pub(in crate::ai::v4) fn multi_factory_scan() -> BoardScan {
         master_data: MasterDataRegistry::load().unwrap().into(),
         damage_chart: DamageChart::new().into(),
         current_turn: 1,
-        game_turn: 1,
+        game_turn: MIDGAME_TURN,
         opening_policy: None,
         funds: 20000,
         capital_position: None,
@@ -292,7 +295,7 @@ pub(in crate::ai::v4) fn mixed_threat_multi_factory_scan() -> BoardScan {
         master_data: MasterDataRegistry::load().unwrap().into(),
         damage_chart: damage_chart.into(),
         current_turn: 1,
-        game_turn: 1,
+        game_turn: MIDGAME_TURN,
         opening_policy: None,
         funds: 17000,
         capital_position: None,

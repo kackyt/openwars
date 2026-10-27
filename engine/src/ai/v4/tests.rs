@@ -222,7 +222,7 @@ fn existing_combat_sorties_are_committed_to_only_one_operation() {
     let horizons = vec![5, 5];
     let scan = BoardScan {
         current_turn: 0,
-        game_turn: 0,
+        game_turn: crate::ai::v4::test_support::MIDGAME_TURN,
         opening_policy: None,
         capital_position: None,
         property_entities: HashMap::default(),
@@ -865,7 +865,7 @@ fn combat_plan_does_not_treat_purchase_price_as_destroyed_enemy_value() {
     let enemy_positions = [pos(8, 0), pos(8, 1), pos(8, 2)];
     let scan = BoardScan {
         current_turn: 0,
-        game_turn: 0,
+        game_turn: crate::ai::v4::test_support::MIDGAME_TURN,
         opening_policy: None,
         capital_position: None,
         property_entities: HashMap::default(),
@@ -1039,7 +1039,7 @@ fn strait_scan() -> BoardScan {
 
     BoardScan {
         current_turn: 0,
-        game_turn: 0,
+        game_turn: crate::ai::v4::test_support::MIDGAME_TURN,
         opening_policy: None,
         capital_position: None,
         property_entities: HashMap::default(),
@@ -1227,7 +1227,7 @@ fn multi_factory_scan() -> BoardScan {
 
     BoardScan {
         current_turn: 0,
-        game_turn: 0,
+        game_turn: crate::ai::v4::test_support::MIDGAME_TURN,
         opening_policy: None,
         capital_position: None,
         property_entities: HashMap::default(),
@@ -1617,7 +1617,7 @@ fn mixed_threat_multi_factory_scan() -> BoardScan {
 
     BoardScan {
         current_turn: 0,
-        game_turn: 0,
+        game_turn: crate::ai::v4::test_support::MIDGAME_TURN,
         opening_policy: None,
         capital_position: None,
         property_entities: HashMap::default(),
@@ -1711,7 +1711,7 @@ fn campaign_surplus_targets_enemy_infantry_without_buying_stranded_tank() {
     damage_chart.insert_damage(UnitType::Infantry, UnitType::Tank, 0);
     let scan = BoardScan {
         current_turn: 0,
-        game_turn: 0,
+        game_turn: crate::ai::v4::test_support::MIDGAME_TURN,
         opening_policy: None,
         capital_position: None,
         property_entities: HashMap::default(),
