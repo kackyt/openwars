@@ -260,6 +260,13 @@ fn collect_production_options(
     options.retain(|option| {
         option.purchase.build_turn > 0 || !used_facilities.contains(&option.purchase.facility)
     });
+    // 1手番目の戦闘購入は、占領もできる歩兵類に限る。後手は先手の生産を見てから決めるが、
+    // 相手の歩兵はまだ数手番先にいるので、1手番目から高価な中戦車などを作るのは早計で、
+    // 序盤の資金は先に翼の拠点へ届く歩兵の数に回す。対抗の戦車・砲兵は次手番以降の予定
+    // として計画に残し、2手番目からの計画が作る。
+    if input.policy == ProductionPolicy::Standard && op.facts.opening_turn {
+        options.retain(|option| option.purchase.build_turn > 0 || option.stats.can_capture);
+    }
     for option in &mut options {
         option.engageable_enemy_indices = enemies
             .iter()

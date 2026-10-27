@@ -1041,8 +1041,11 @@ fn observed_operation_facts(
     enemy_reinforcement: &EnemyReinforcementEnvelope,
 ) -> OperationFacts {
     let OperationObservation {
+        scan,
+        kind,
         cluster,
         deploy_lead_time,
+        policy,
         ..
     } = *input;
     let enemy_combat_units = u32::try_from(threats.reachable_threats.len()).unwrap_or(u32::MAX);
@@ -1077,6 +1080,12 @@ fn observed_operation_facts(
         transport_round_trip_turns,
         available_free_cargo_slots,
         unreachable_threat_units,
+        // 序盤は、先に歩兵を敵の拠点へ送り込めた方が翼の拠点を取る。後手が1手番目に
+        // 見えている敵の歩兵へ中戦車などで対抗すると、歩兵の数で負けて占領競争に
+        // 出遅れる（map_20の後手で相手の翼を取れなかった）。
+        opening_turn: policy == ProductionPolicy::Standard
+            && kind == OperationKind::Capture
+            && scan.game_turn <= 1,
     }
 }
 

@@ -120,6 +120,8 @@ pub struct OperationFacts {
     pub available_free_cargo_slots: u32,
     /// 自軍の通常戦力が到達できない位置にいる敵Entity数。
     pub unreachable_threat_units: u32,
+    /// 標準経路のCaptureで、1手番目の生産か。この手番の戦闘購入は歩兵類に限る。
+    pub opening_turn: bool,
 }
 
 /// 観測量から調達モードを決める。フェーズではなく展開リードタイムと輸送要否だけで決まる。
