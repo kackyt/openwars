@@ -425,6 +425,7 @@ impl BoardScan {
             master_data,
             damage_chart,
             current_turn,
+            game_turn: current_turn,
             opening_policy: Some(opening_policy),
             funds,
             capital_position: capital_pos,
@@ -485,6 +486,9 @@ pub(in crate::ai::v4) struct BoardScan {
     pub(in crate::ai::v4) master_data: Arc<MasterDataRegistry>,
     pub(in crate::ai::v4) damage_chart: Arc<DamageChart>,
     pub(in crate::ai::v4) current_turn: u32,
+    /// 実際のゲーム手番。標準経路は `current_turn` を0に固定して既存判断を変えないため、
+    /// 序盤の占領競争の期間判定だけはこちらを使う。
+    pub(in crate::ai::v4) game_turn: u32,
     /// テスト用の直接構築では未指定を標準側として扱う。実盤面走査では必ず設定する。
     pub(in crate::ai::v4) opening_policy: Option<OpeningProductionPolicy>,
     pub(in crate::ai::v4) funds: u32,
@@ -536,6 +540,9 @@ impl BoardScan {
         let unit_registry = world.get_resource::<UnitRegistry>()?.clone();
         let damage_chart = Arc::new(world.get_resource::<DamageChart>()?.clone());
         let master_data = Arc::new(world.get_resource::<MasterDataRegistry>()?.clone());
+        let game_turn = world
+            .get_resource::<MatchState>()
+            .map_or(1, |state| state.current_turn_number.0);
         let funds = world
             .get_resource::<Players>()?
             .0
@@ -848,6 +855,7 @@ impl BoardScan {
 
         Some(BoardScan {
             current_turn: 0,
+            game_turn,
             opening_policy: None,
             capital_position: None,
             property_entities: HashMap::default(),
