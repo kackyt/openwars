@@ -1,0 +1,608 @@
+diff --git a/engine/src/ai/runtime/turn.rs b/engine/src/ai/runtime/turn.rs
+index 1d8b542..02dde94 100644
+--- a/engine/src/ai/runtime/turn.rs
++++ b/engine/src/ai/runtime/turn.rs
+@@ -39,7 +39,7 @@ use bevy_ecs::prelude::*;
+ enum TurnTactics {
+     /// V2/V3と通常経路のV4: 全unitを横断して最良の1手を選ぶ。
+     Standard,
+-    /// 小規模マップのV4: 本拠防衛を先に判定し、SquadごとにDAG・占領契約に沿って1手を選ぶ。
++    /// 小規模マップのV4: SquadごとにDAG・占領契約に沿って1手を選ぶ。
+     SmallMapSquads,
+ }
+ 
+@@ -82,6 +82,15 @@ impl TurnStep {
+     fn early_relief_includes_active_missions(&self) -> bool {
+         self.is_v4 && self.tactics == TurnTactics::Standard
+     }
++
++    /// 標準V4では拠点喪失の最終手段を認め、小規模の既存契約は維持する。
++    fn capture_defense_policy(&self) -> crate::ai::v4::home_defense::CaptureDefensePolicy {
++        use crate::ai::v4::home_defense::CaptureDefensePolicy;
++        match self.tactics {
++            TurnTactics::Standard => CaptureDefensePolicy::LastResort,
++            TurnTactics::SmallMapSquads => CaptureDefensePolicy::PreserveCapture,
++        }
++    }
+ }
+ 
+ /// V2〜V4のAIの手番を1命令だけ進める。命令を出したらその内容、手番を終えたらNone。
+@@ -152,6 +161,19 @@ pub(crate) fn execute_turn_step(world: &mut World, player_id: PlayerId) -> Optio
+         return Some(issue_transport_command(world, entity, command));
+     }
+     let decision_skip = decision_skip_entities(world, &step);
++    // 自拠点の占領阻止に今すぐ動く必要がある部隊だけ、作戦所属を変えずに先に実行する。
++    // 小規模・標準とも同じ防衛契約を使用し、期限に余裕がある場合は通常の作戦を続ける。
++    crate::ai::wait_probe::stage(world, "home_defense");
++    if step.is_v4
++        && let Some((entity, command)) = crate::ai::v4::home_defense::decide_action(
++            world,
++            player_id,
++            &decision_skip,
++            step.capture_defense_policy(),
++        )
++    {
++        return Some(issue_unit_command(world, entity, command));
++    }
+     crate::ai::wait_probe::stage(world, "normal_tactics");
+     if let Some((entity, command)) = decide_normal_action(world, &step, &decision_skip) {
+         return Some(issue_unit_command(world, entity, command));
+@@ -310,8 +332,7 @@ fn decide_normal_action(
+ ) -> Option<(Entity, AiCommand)> {
+     match step.tactics {
+         TurnTactics::Standard => {
+-            // 揚陸後の敵首都島では、橋頭堡を起点にした首都攻略DAGのSquad指令
+-            // （Nodeの制圧・占領、前衛と待機線、敵生産口の占位）に従って動かす（V4）。
++            // 揚陸後の敵首都島では、橋頭堡を起点にした首都攻略DAGのSquad指令に従う。
+             if step.is_v4
+                 && let Some(action) = decide_beachhead_route_action(world, step.player_id, skip)
+             {
+@@ -319,10 +340,7 @@ fn decide_normal_action(
+             }
+             decide_ai_action_v2(world, step.player_id, skip)
+         }
+-        TurnTactics::SmallMapSquads => {
+-            crate::ai::v4::home_defense::decide_action(world, step.player_id, skip)
+-                .or_else(|| decide_squad_action_v4(world, step.player_id, skip))
+-        }
++        TurnTactics::SmallMapSquads => decide_squad_action_v4(world, step.player_id, skip),
+     }
+ }
+ 
+@@ -509,3 +527,209 @@ fn end_turn(world: &mut World, player_id: PlayerId) {
+         events.send(crate::events::NextPhaseCommand);
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::ai::ai_version::{AiVersion, PlayerAiSettings};
++    use crate::ai::islands::IslandMap;
++    use crate::ai::operation_assignment::{
++        OperationOwner, OperationUnitRole, UnitOperationAssignment, UnitOperationRegistry,
++    };
++    use crate::ai::planning::assignment::LedgerKey;
++    use crate::components::{ActionCompleted, Ammo, Faction, Fuel, HasMoved, Health, Property};
++    use crate::resources::master_data::{MasterDataRegistry, UnitName};
++    use crate::resources::{DamageChart, GridTopology, Map, Terrain, UnitType};
++
++    /// 通常経路でも、今迎撃しなければ失う自拠点の防衛を、他の占領行動より先に実行する。
++    #[test]
++    fn standard_v4_executes_urgent_defense_before_unrelated_capture() {
++        let _path = crate::ai::code_path::enter(CodePath::MainCompatible);
++        let player = PlayerId(1);
++        let opponent = PlayerId(2);
++        let (mut world, _) = crate::setup::create_world();
++        let mut map = Map::new(9, 5, Terrain::Plains, GridTopology::Square);
++        for (pos, terrain, owner, capture_points) in [
++            (
++                GridPosition { x: 0, y: 2 },
++                Terrain::Capital,
++                Some(player),
++                200,
++            ),
++            (
++                GridPosition { x: 8, y: 2 },
++                Terrain::Capital,
++                Some(opponent),
++                200,
++            ),
++            (
++                GridPosition { x: 2, y: 2 },
++                Terrain::City,
++                Some(player),
++                100,
++            ),
++            (GridPosition { x: 0, y: 0 }, Terrain::City, None, 200),
++        ] {
++            map.set_terrain(pos.x, pos.y, terrain).unwrap();
++            let mut property = Property::new(terrain, owner, 200);
++            property.capture_points = capture_points;
++            world.spawn((pos, property));
++        }
++        let island = IslandMap::analyze(&map)
++            .get_island_at(&GridPosition { x: 2, y: 2 })
++            .unwrap()
++            .id;
++        world.insert_resource(IslandMap::analyze(&map));
++        world.insert_resource(map);
++        world.insert_resource(MasterDataRegistry::load().unwrap());
++        let mut chart = DamageChart::new();
++        chart.insert_damage(UnitType::Tank, UnitType::Infantry, 60);
++        chart.insert_secondary_damage(UnitType::Tank, UnitType::Infantry, 60);
++        world.insert_resource(chart);
++        let mut settings = PlayerAiSettings::new();
++        settings.set_version(player, AiVersion::V4);
++        world.insert_resource(settings);
++
++        let spawn = |world: &mut World, owner, kind: UnitType, pos| {
++            let stats = world
++                .resource::<MasterDataRegistry>()
++                .create_unit_stats(&UnitName(kind.as_str().to_owned()))
++                .unwrap();
++            world
++                .spawn((
++                    pos,
++                    Faction(owner),
++                    Health {
++                        current: 100,
++                        max: 100,
++                    },
++                    Fuel {
++                        current: stats.max_fuel,
++                        max: stats.max_fuel,
++                    },
++                    Ammo {
++                        ammo1: stats.max_ammo1,
++                        max_ammo1: stats.max_ammo1,
++                        ammo2: stats.max_ammo2,
++                        max_ammo2: stats.max_ammo2,
++                    },
++                    HasMoved(false),
++                    ActionCompleted(false),
++                    stats,
++                ))
++                .id()
++        };
++        let defender = spawn(
++            &mut world,
++            player,
++            UnitType::Tank,
++            GridPosition { x: 1, y: 1 },
++        );
++        let capturer = spawn(
++            &mut world,
++            player,
++            UnitType::Infantry,
++            GridPosition { x: 0, y: 0 },
++        );
++        let enemy = spawn(
++            &mut world,
++            opponent,
++            UnitType::Infantry,
++            GridPosition { x: 2, y: 2 },
++        );
++        let mut manager = SquadManager::default();
++        let squad = {
++            let mut squad = manager.create_owned_squad(MissionType::Capture, player);
++            squad.members.insert(capturer);
++            squad.plan.target = Some(GridPosition { x: 0, y: 0 });
++            squad.plan.target_island = Some(island);
++            squad.plan.departure_authorized = true;
++            squad.id
++        };
++        let defense_squad = {
++            let mut squad = manager.create_owned_squad(MissionType::Attack, player);
++            squad.members.insert(defender);
++            squad.plan.target = Some(GridPosition { x: 8, y: 2 });
++            squad.plan.target_island = Some(island);
++            squad.plan.departure_authorized = true;
++            squad.id
++        };
++        world.insert_resource(manager);
++        let mut registry = UnitOperationRegistry::default();
++        for (entity, squad_id) in [(capturer, squad), (defender, defense_squad)] {
++            registry.apply_assign(
++                LedgerKey::fixture(),
++                entity,
++                UnitOperationAssignment {
++                    owner: OperationOwner::Campaign {
++                        player_id: player,
++                        island_id: island,
++                    },
++                    squad_id: Some(squad_id),
++                    role: OperationUnitRole::Member,
++                    assigned_turn: 1,
++                },
++            );
++        }
++        world.insert_resource(registry);
++        world.insert_resource(
++            crate::ai::strategy_profile::V4StrategyProfileRegistry::with_profile(
++                player,
++                crate::ai::strategy_profile::V4StrategyProfile::Standard,
++            ),
++        );
++        let mut progress = AiTurnProgress::default();
++        progress.mark_squads_planned(player);
++        world.insert_resource(progress);
++        let mut attacks = world
++            .resource::<Events<crate::events::AttackUnitCommand>>()
++            .get_cursor();
++        let command = execute_turn_step(&mut world, player).expect("防衛命令を発行する");
++        let issued = attacks
++            .read(world.resource::<Events<crate::events::AttackUnitCommand>>())
++            .collect::<Vec<_>>();
++        assert!(
++            issued
++                .iter()
++                .any(|event| event.attacker_entity == defender && event.defender_entity == enemy),
++            "最後の占領手番を止められる守備役を先に発行する: {command}"
++        );
++        assert!(world.resource::<AiActionCooldown>().0.contains(&defender));
++        let registry = world.resource::<UnitOperationRegistry>();
++        assert_eq!(registry.assignment(capturer).unwrap().squad_id, Some(squad));
++        assert_eq!(
++            registry.assignment(defender).unwrap().squad_id,
++            Some(defense_squad)
++        );
++        let manager = world.resource::<SquadManager>();
++        let defender_plan = &manager
++            .squads
++            .iter()
++            .find(|entry| entry.id == defense_squad)
++            .unwrap()
++            .plan;
++        assert_eq!(defender_plan.target, Some(GridPosition { x: 8, y: 2 }));
++    }
++
++    #[test]
++    fn defense_entry_is_limited_to_v4_without_changing_small_map_selection() {
++        let player = PlayerId(1);
++        let mut world = World::new();
++        let mut settings = PlayerAiSettings::new();
++        settings.set_version(player, AiVersion::V3);
++        world.insert_resource(settings);
++        let v3 = TurnStep::begin(&world, player, CodePath::MainCompatible);
++        assert_eq!(v3.tactics, TurnTactics::Standard);
++        assert!(!v3.early_relief_includes_active_missions());
++
++        world
++            .resource_mut::<PlayerAiSettings>()
++            .set_version(player, AiVersion::V4);
++        let standard = TurnStep::begin(&world, player, CodePath::MainCompatible);
++        assert_eq!(standard.tactics, TurnTactics::Standard);
++        assert!(standard.early_relief_includes_active_missions());
++        let small = TurnStep::begin(&world, player, CodePath::Extended);
++        assert_eq!(small.tactics, TurnTactics::SmallMapSquads);
++        assert!(!small.early_relief_includes_active_missions());
++    }
++}
+diff --git a/engine/src/ai/v4/home_defense.rs b/engine/src/ai/v4/home_defense.rs
+index d465358..8d4eab2 100644
+--- a/engine/src/ai/v4/home_defense.rs
++++ b/engine/src/ai/v4/home_defense.rs
+@@ -27,9 +27,18 @@ struct DefenseOrder {
+     departure_due: bool,
+ }
+ 
++/// 占領任務を守りつつ、通常の防衛役が不在の場合だけ最終手段を許すか。
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub(crate) enum CaptureDefensePolicy {
++    #[default]
++    PreserveCapture,
++    LastResort,
++}
++
+ #[derive(Debug, Default)]
+ struct DefensePlan {
+     turn: u32,
++    capture_policy: CaptureDefensePolicy,
+     orders: Vec<DefenseOrder>,
+ }
+ 
+@@ -328,7 +337,33 @@ fn response(
+     })
+ }
+ 
+-fn build_plan(world: &World, player: PlayerId, skip: &HashSet<Entity>) -> Option<DefensePlan> {
++/// 最後の行動で占領される拠点について、予測被害が実際に占領を遅らせるか。
++fn delays_last_capture(world: &World, threat: Threat, enemy_hp: u32, damage: u32) -> bool {
++    let Some(property) = world.iter_entities().find_map(|entity| {
++        (entity.get::<GridPosition>() == Some(&threat.property))
++            .then(|| entity.get::<Property>().copied())
++            .flatten()
++    }) else {
++        return false;
++    };
++    if damage >= enemy_hp {
++        return true;
++    }
++    let actions = |hp| {
++        super::property_control::capture_actions_needed(
++            property.capture_points,
++            super::property_control::capture_power_from_hp(hp),
++        )
++    };
++    actions(enemy_hp.saturating_sub(damage)) > actions(enemy_hp)
++}
++
++fn build_plan(
++    world: &World,
++    player: PlayerId,
++    skip: &HashSet<Entity>,
++    capture_policy: CaptureDefensePolicy,
++) -> Option<DefensePlan> {
+     let units = units(world, skip);
+     let mut cache = ActionTurnDistanceCache::default();
+     let threats = threats(world, player, &units, &mut cache)?;
+@@ -361,6 +396,40 @@ fn build_plan(world: &World, player: PlayerId, skip: &HashSet<Entity>) -> Option
+                         response.order.unit.to_bits(),
+                     )
+                 });
++            // 通常の戦闘役が誰も間に合わない最後の手番だけ、占領役を一時的に使う。
++            // 戦闘予測で今回の攻撃が占領を遅らせる場合に限り、任務・所属は書き換えない。
++            let candidate = candidate.or_else(|| {
++                if capture_policy != CaptureDefensePolicy::LastResort
++                    || threat.deadline != 0
++                    || remaining != enemy.hp
++                {
++                    return None;
++                }
++                units
++                    .iter()
++                    .filter(|unit| {
++                        unit.owner == player
++                            && unit.stats.can_capture
++                            && unit.available
++                            && !assigned.contains(&unit.entity)
++                            && !unit.carrying
++                            && !matches!(
++                                unit.stats.movement_type,
++                                MovementType::Air | MovementType::Ship
++                            )
++                    })
++                    .filter_map(|unit| response(world, unit, enemy, threat, &occupied, &mut cache))
++                    .filter(|candidate| {
++                        delays_last_capture(world, threat, enemy.hp, candidate.damage)
++                    })
++                    .min_by_key(|candidate| {
++                        (
++                            Reverse(candidate.damage),
++                            candidate.loss,
++                            candidate.order.unit.to_bits(),
++                        )
++                    })
++            });
+             let Some(candidate) = candidate else {
+                 break;
+             };
+@@ -390,6 +459,7 @@ fn build_plan(world: &World, player: PlayerId, skip: &HashSet<Entity>) -> Option
+         turn: world
+             .get_resource::<MatchState>()
+             .map_or(0, |state| state.current_turn_number.0),
++        capture_policy,
+         orders,
+     })
+ }
+@@ -494,6 +564,7 @@ pub(crate) fn decide_action(
+     world: &mut World,
+     player: PlayerId,
+     skip: &HashSet<Entity>,
++    capture_policy: CaptureDefensePolicy,
+ ) -> Option<(Entity, AiCommand)> {
+     let turn = world
+         .get_resource::<MatchState>()
+@@ -501,9 +572,9 @@ pub(crate) fn decide_action(
+     let cached = world
+         .get_resource::<HomeDefenseRegistry>()
+         .and_then(|registry| registry.plans.get(&player))
+-        .is_some_and(|plan| plan.turn == turn);
++        .is_some_and(|plan| plan.turn == turn && plan.capture_policy == capture_policy);
+     if !cached {
+-        let plan = build_plan(world, player, skip)?;
++        let plan = build_plan(world, player, skip, capture_policy)?;
+         world
+             .get_resource_or_insert_with(HomeDefenseRegistry::default)
+             .plans
+@@ -600,7 +671,13 @@ mod tests {
+         let second = unit(&mut world, PlayerId(1), UnitType::Tank, position(0, 3));
+         unit(&mut world, PlayerId(1), UnitType::Tank, position(0, 4));
+         let enemy = unit(&mut world, PlayerId(2), UnitType::Infantry, position(4, 2));
+-        let plan = build_plan(&world, PlayerId(1), &HashSet::default()).unwrap();
++        let plan = build_plan(
++            &world,
++            PlayerId(1),
++            &HashSet::default(),
++            CaptureDefensePolicy::PreserveCapture,
++        )
++        .unwrap();
+         assert_eq!(
+             plan.orders.len(),
+             2,
+@@ -635,10 +712,15 @@ mod tests {
+         unit(&mut world, PlayerId(1), UnitType::Tank, position(0, 1));
+         unit(&mut world, PlayerId(2), UnitType::Infantry, position(4, 2));
+         assert!(
+-            build_plan(&world, PlayerId(1), &HashSet::default())
+-                .unwrap()
+-                .orders
+-                .is_empty()
++            build_plan(
++                &world,
++                PlayerId(1),
++                &HashSet::default(),
++                CaptureDefensePolicy::PreserveCapture
++            )
++            .unwrap()
++            .orders
++            .is_empty()
+         );
+     }
+ 
+@@ -655,10 +737,15 @@ mod tests {
+         unit(&mut world, PlayerId(1), UnitType::Artillery, position(0, 4));
+         unit(&mut world, PlayerId(2), UnitType::Infantry, position(2, 2));
+         assert!(
+-            build_plan(&world, PlayerId(1), &HashSet::default())
+-                .unwrap()
+-                .orders
+-                .is_empty()
++            build_plan(
++                &world,
++                PlayerId(1),
++                &HashSet::default(),
++                CaptureDefensePolicy::PreserveCapture
++            )
++            .unwrap()
++            .orders
++            .is_empty()
+         );
+     }
+ 
+@@ -669,7 +756,13 @@ mod tests {
+         unit(&mut world, PlayerId(1), UnitType::Tank, position(0, 1));
+         unit(&mut world, PlayerId(1), UnitType::Tank, position(0, 3));
+         let enemy = unit(&mut world, PlayerId(2), UnitType::Infantry, position(4, 2));
+-        let early = build_plan(&world, PlayerId(1), &HashSet::default()).unwrap();
++        let early = build_plan(
++            &world,
++            PlayerId(1),
++            &HashSet::default(),
++            CaptureDefensePolicy::PreserveCapture,
++        )
++        .unwrap();
+         assert!(!early.orders.is_empty());
+         assert!(early.orders.iter().all(|order| !order.departure_due));
+ 
+@@ -684,7 +777,13 @@ mod tests {
+             .unwrap()
+             .id();
+         world.get_mut::<Property>(city).unwrap().capture_points = 100;
+-        let urgent = build_plan(&world, PlayerId(1), &HashSet::default()).unwrap();
++        let urgent = build_plan(
++            &world,
++            PlayerId(1),
++            &HashSet::default(),
++            CaptureDefensePolicy::PreserveCapture,
++        )
++        .unwrap();
+         assert!(!urgent.orders.is_empty());
+         assert!(urgent.orders.iter().all(|order| order.departure_due));
+         let (_, command) =
+@@ -694,6 +793,94 @@ mod tests {
+         );
+     }
+ 
++    /// 占領完了直前の自軍都市と、その隣にいる占領可能な防衛役。
++    fn urgent_capture_fixture(points: u32) -> (World, Entity, Entity) {
++        let mut world = board();
++        let city = world
++            .iter_entities()
++            .find(|entity| {
++                entity.get::<Property>().is_some()
++                    && entity.get::<GridPosition>() == Some(&position(2, 2))
++            })
++            .unwrap()
++            .id();
++        world.get_mut::<Property>(city).unwrap().capture_points = points;
++        world.resource_mut::<DamageChart>().insert_damage(
++            UnitType::Infantry,
++            UnitType::Infantry,
++            55,
++        );
++        let defender = unit(&mut world, PlayerId(1), UnitType::Infantry, position(1, 2));
++        let enemy = unit(&mut world, PlayerId(2), UnitType::Infantry, position(2, 2));
++        (world, defender, enemy)
++    }
++
++    #[test]
++    fn capturer_can_intercept_when_it_is_the_last_effective_defense() {
++        let _path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
++        let (world, defender, enemy) = urgent_capture_fixture(100);
++        let plan = build_plan(
++            &world,
++            PlayerId(1),
++            &HashSet::default(),
++            CaptureDefensePolicy::LastResort,
++        )
++        .unwrap();
++        assert_eq!(
++            plan.orders.len(),
++            1,
++            "通常の防衛役がいない期限直前でも占領を阻止する"
++        );
++        assert_eq!(plan.orders[0].unit, defender);
++        let action = command_for_order(&world, plan.orders[0], &HashSet::default());
++        assert!(
++            matches!(action, Some((unit, AiCommand::Attack { target_entity, .. })) if unit == defender && target_entity == enemy)
++        );
++        // 小規模側の方策では、同じ緊急局面でも従来どおり占領役を転用しない。
++        assert!(
++            build_plan(
++                &world,
++                PlayerId(1),
++                &HashSet::default(),
++                CaptureDefensePolicy::PreserveCapture
++            )
++            .unwrap()
++            .orders
++            .is_empty()
++        );
++    }
++
++    #[test]
++    fn capturer_is_not_diverted_if_damage_cannot_delay_capture() {
++        let (world, _, _) = urgent_capture_fixture(40);
++        let plan = build_plan(
++            &world,
++            PlayerId(1),
++            &HashSet::default(),
++            CaptureDefensePolicy::LastResort,
++        )
++        .unwrap();
++        assert!(
++            plan.orders.is_empty(),
++            "攻撃しても次の占領を止められないなら任務を継続する"
++        );
++    }
++
++    #[test]
++    fn conventional_defender_is_preferred_over_capturer() {
++        let (mut world, capturer, _) = urgent_capture_fixture(100);
++        let defender = unit(&mut world, PlayerId(1), UnitType::Tank, position(3, 2));
++        let plan = build_plan(
++            &world,
++            PlayerId(1),
++            &HashSet::default(),
++            CaptureDefensePolicy::LastResort,
++        )
++        .unwrap();
++        assert!(plan.orders.iter().any(|order| order.unit == defender));
++        assert!(plan.orders.iter().all(|order| order.unit != capturer));
++    }
++
+     #[test]
+     fn capture_units_keep_their_existing_capture_contracts() {
+         let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
+@@ -701,10 +888,15 @@ mod tests {
+         unit(&mut world, PlayerId(1), UnitType::Infantry, position(1, 2));
+         unit(&mut world, PlayerId(2), UnitType::Infantry, position(4, 2));
+         assert!(
+-            build_plan(&world, PlayerId(1), &HashSet::default())
+-                .unwrap()
+-                .orders
+-                .is_empty()
++            build_plan(
++                &world,
++                PlayerId(1),
++                &HashSet::default(),
++                CaptureDefensePolicy::PreserveCapture
++            )
++            .unwrap()
++            .orders
++            .is_empty()
+         );
+     }
+ }

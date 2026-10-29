@@ -1,0 +1,63 @@
+diff --git a/engine/src/ai/v4/combat_input.rs b/engine/src/ai/v4/combat_input.rs
+index fdb0a16..697d006 100644
+--- a/engine/src/ai/v4/combat_input.rs
++++ b/engine/src/ai/v4/combat_input.rs
+@@ -260,28 +260,7 @@ fn collect_production_options(
+     options.retain(|option| {
+         option.purchase.build_turn > 0 || !used_facilities.contains(&option.purchase.facility)
+     });
+-    // 1手番目に歩兵を作れる施設では、戦闘購入も占領できる歩兵類に限る。後手は先手の生産を
+-    // 見てから決めるが、相手の歩兵はまだ数手番先にいるので、1手番目から高価な中戦車などを
+-    // 作るのは早計で、序盤の資金は先に翼の拠点へ届く歩兵の数に回す。対抗の戦車・砲兵は
+-    // 次手番以降の予定として計画に残し、2手番目からの計画が作る。歩兵を作れない空港・港は
+-    // 制限すると施設と資金を遊ばせるだけなので、従来どおりに選ばせる。
+-    if input.policy == ProductionPolicy::Standard && op.facts.opening_turn {
+-        let infantry_facilities = scan
+-            .production_facilities
+-            .iter()
+-            .filter(|(_, terrain)| {
+-                scan.available_types.iter().any(|(unit_type, stats)| {
+-                    stats.can_capture && scan.can_produce(*terrain, *unit_type)
+-                })
+-            })
+-            .map(|(position, _)| *position)
+-            .collect::<HashSet<_>>();
+-        options.retain(|option| {
+-            option.purchase.build_turn > 0
+-                || option.stats.can_capture
+-                || !infantry_facilities.contains(&option.purchase.facility)
+-        });
+-    }
++    // 初手でも合法な戦闘兵種を候補から消さず、到着・資金・占領の計画で比較する。
+     for option in &mut options {
+         option.engageable_enemy_indices = enemies
+             .iter()
+diff --git a/engine/src/ai/v4/tests.rs b/engine/src/ai/v4/tests.rs
+index 21d2b14..48ea709 100644
+--- a/engine/src/ai/v4/tests.rs
++++ b/engine/src/ai/v4/tests.rs
+@@ -344,10 +344,9 @@ fn current_mission_combat_is_not_filtered_by_purchase_plan() {
+     );
+ }
+ 
+-/// 標準経路のCaptureでは、1手番目の戦闘計画が今手番に買えるのは歩兵類だけで、
+-/// 中戦車などは次手番以降の予定として残る。2手番目以降は制限しない。
++/// 序盤でも敵への対応に使える戦闘兵種は候補に残し、実際に買うかは計画で比較する。
+ #[test]
+-fn opening_turn_combat_plan_buys_only_infantry_now() {
++fn opening_turn_combat_plan_can_consider_available_combat_units() {
+     let candidates_at = |game_turn: u32| {
+         let mut scan = mixed_threat_multi_factory_scan();
+         scan.game_turn = game_turn;
+@@ -401,9 +400,8 @@ fn opening_turn_combat_plan_buys_only_infantry_now() {
+     assert!(
+         opening
+             .iter()
+-            .filter(|(build_turn, _)| *build_turn == 0)
+-            .all(|(_, can_capture)| *can_capture),
+-        "1手番目は今手番に歩兵類しか買わない: {opening:?}"
++            .any(|(build_turn, can_capture)| *build_turn == 0 && !*can_capture),
++        "敵に対応できる戦闘兵種は1手番目から比較する: {opening:?}"
+     );
+     assert!(
+         opening
