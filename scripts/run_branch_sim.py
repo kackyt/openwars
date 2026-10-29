@@ -145,7 +145,8 @@ def main() -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    binary = Path(args.bin) if args.bin else build_test_binary()
+    # 実行時の作業ディレクトリは engine/ なので、相対パスはここで絶対パスにする
+    binary = Path(args.bin).resolve() if args.bin else build_test_binary()
     base_env = dict(os.environ)
     base_env.update(
         {
