@@ -7,7 +7,7 @@
 //!    行動済みの解除）から、両軍のAIで `BRANCH_TURNS` ラウンドだけ対局を進める。
 //! 3. 各ラウンドの終わりの盤面を、対局ログの `strategic_history` と同じ形で `BRANCH_OUT` に書く。
 //!
-//! 弾薬・燃料はログに無いので満タンで置く。輸送中の部隊は置かない。
+//! 弾薬・燃料はログに無いので満タンで置く。輸送中の部隊は輸送車に積んだ状態で置く。
 //!
 //! 使い方:
 //! BRANCH_LOG=.../seed1.json BRANCH_FROM=10 BRANCH_TURNS=8 BRANCH_OUT=/tmp/x.json \
@@ -38,7 +38,6 @@ fn place_snapshot(
         .as_array()
         .unwrap()
         .iter()
-        .filter(|unit| unit["transporting_by"].is_null())
         .map(|unit| unit["unit_id"].as_u64().unwrap())
         .collect::<HashSet<_>>();
     entities.retain(|id, _| seen.contains(id));
@@ -79,9 +78,6 @@ fn place_snapshot(
         }
     }
     for unit in snapshot["units"].as_array().unwrap() {
-        if !unit["transporting_by"].is_null() {
-            continue;
-        }
         let unit_type = md
             .unit_type_for_name(unit["unit_type"].as_str().unwrap())
             .unwrap();
@@ -114,23 +110,50 @@ fn place_snapshot(
             HasMoved(false),
             ActionCompleted(false),
         );
-        if let Some(&entity) = entities.get(&id)
-            && world.get_entity(entity).is_ok()
-        {
-            world.entity_mut(entity).insert(fresh);
-            continue;
-        }
-        let entity = world
-            .spawn((UnitId(uuid::Uuid::new_v4()), Faction(owner), stats.clone()))
-            .insert(fresh)
-            .id();
+        let entity = match entities.get(&id) {
+            Some(&entity) if world.get_entity(entity).is_ok() => {
+                world.entity_mut(entity).insert(fresh);
+                entity
+            }
+            _ => {
+                let entity = world
+                    .spawn((UnitId(uuid::Uuid::new_v4()), Faction(owner), stats.clone()))
+                    .insert(fresh)
+                    .id();
+                entities.insert(id, entity);
+                entity
+            }
+        };
+        // 積荷は下で積み直すので、輸送の関係はいったん外す
+        world.entity_mut(entity).remove::<Transporting>();
         if stats.max_cargo > 0 {
             world.entity_mut(entity).insert(CargoCapacity {
                 max: stats.max_cargo,
                 loaded: vec![],
             });
         }
-        entities.insert(id, entity);
+    }
+    // 輸送中の部隊を、エンジンの搭載処理と同じ形（盤外の座標・Transporting・輸送車の積荷リスト）で積む
+    for unit in snapshot["units"].as_array().unwrap() {
+        let Some(carrier_id) = unit["transporting_by"].as_u64() else {
+            continue;
+        };
+        let cargo_id = unit["unit_id"].as_u64().unwrap();
+        let cargo = entities[&cargo_id];
+        let Some(&carrier) = entities.get(&carrier_id) else {
+            // 輸送車がログに無い（通常は起きない）ときは積荷も置かない
+            world.despawn(cargo);
+            entities.remove(&cargo_id);
+            continue;
+        };
+        world.entity_mut(cargo).insert((
+            GridPosition { x: 9999, y: 9999 },
+            Transporting(carrier),
+            ActionCompleted(true),
+        ));
+        if let Some(mut capacity) = world.get_mut::<CargoCapacity>(carrier) {
+            capacity.loaded.push(cargo);
+        }
     }
 }
 
@@ -163,7 +186,8 @@ fn snapshot_json(world: &mut World, md: &MasterDataRegistry, round: u32) -> serd
     let transporting = world
         .query::<(Entity, &Transporting)>()
         .iter(world)
-        .map(|(entity, transporting)| (transporting.0, entity))
+        // 積荷のEntity → 積んでいる輸送車のEntity
+        .map(|(entity, transporting)| (entity, transporting.0))
         .collect::<HashMap<_, _>>();
     let units = world
         .query::<(Entity, &GridPosition, &Faction, &UnitStats, &Health)>()
