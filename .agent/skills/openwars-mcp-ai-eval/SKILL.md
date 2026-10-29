@@ -1,7 +1,7 @@
 ---
 name: openwars-mcp-ai-eval
 description: >-
-  OpenWarsの評価スクリプト `scripts/eval_matchup.py` を使用して、開発中のAIの動作・対戦結果・戦術的パフォーマンス（勝率、思考時間、ZOC支配面積、経済指標など）を自動評価し、レポートを作成するスキルです。AIロジックの評価やバージョン比較（例: V3 vs V1）を行う際に使用します。
+  OpenWarsの評価スクリプト `scripts/eval_matchup.py` を使用して、開発中のAIの動作・対戦結果・戦術的パフォーマンス（勝率、思考時間、ZOC支配面積、経済指標など）を自動評価し、レポートを作成するスキルです。AIロジックの評価やバージョン比較（例: V3 vs V1）を行う際に使用します。また `scripts/run_branch_sim.py`（対局ログの途中局面からの分岐シミュレーション）で、修正の効果をフル対局の前に問題の局面だけでA/B比較する際にも使用します。
 ---
 # OpenWars AI Matchup Evaluator
 
@@ -39,6 +39,36 @@ python scripts/eval_matchup.py --mode batch --map map_3 --p1 V3 --p2 V1 --games 
 - `--criteria`: 合否判定基準 (`objective`, `issue54`, `issue58` など)
 - `--output`: 最終レポートの出力先パス (デフォルト: `matchup_report.md`)
 - `--seed` / `--seeds`: 乱数シードの固定指定
+
+### 2c. 途中局面からの分岐シミュレーション（run_branch_sim.py / compare_branch_sim.py）
+
+60ターンのスイープを回す前に、**問題の起きている局面だけで修正の効果をA/B比較する**ための道具。
+対局ログ（スイープの `games/<変種>/<条件>/seed<N>.json`）の途中の盤面を読み込み、両軍のAIで数ラウンドだけ対局を進める。
+中身は ignored テスト `engine/tests/branch_sim.rs` で、`run_branch_sim.py` がそれを release ビルドして seed ごとに並列起動する（`mcp-server` は使わない）。
+
+```bash
+# 変更後のコードで、10ラウンド目から8ラウンド分進める（--player 側がV4、相手はV200）
+python scripts/run_branch_sim.py \
+    --logs .tmp/sweep-<日付>/games/current/map_20_V200-V4_r0 \
+    --from 10 --turns 8 --jobs 4 --map map_20 --player 2 \
+    --env OPENWARS_CONCENTRATE=1 --out-dir .tmp/branch/after
+
+# 実際の対局・変更前・変更後を、指定ラウンドの終わりの盤面で比べる
+python scripts/compare_branch_sim.py --rounds 13,17 \
+    actual=.tmp/sweep-<日付>/games/current/map_20_V200-V4_r0 \
+    before=.tmp/branch/before after=.tmp/branch/after \
+    --region west:0-12,* --cities "west_cities:10,18;6,17;2,18;2,19"
+```
+
+- 手順: ログの `from-warmup-1`〜`from-2` ラウンドの盤面で対象AIの判断だけを再現して記憶（作戦の割り当てなど）を温め、`from-1` ラウンドの終わりの盤面と資金を置いて、エンジンの手番開始処理から両軍で `--turns` ラウンド進める。
+- 変更前（before）は、変更前のコミットの作業ツリー（`git worktree`）で同じコマンドを回す。テストバイナリを固定したいときは `--bin` で渡す。
+- 出力 `<out-dir>/seed<N>.json` の `results[0].strategic_history` は対局ログと同じ形式。`seed<N>.log` はテストの出力。
+- `compare_branch_sim.py` の指標: `pN_props`（拠点数）、`pN_value`（戦力 = 価格×HP%の合計）、`pN_<領域>`（`--region 名前:x範囲,y範囲` 内の戦力。範囲は `a-b` / `a-` / `-b` / `*`）、`<名前>`（`--cities` の拠点のうち `--player` 側が持つ数）。
+- **忠実度の注意（相対比較にだけ使う）**:
+  - 弾薬・燃料はログに無いので満タンで置く。輸送中の部隊は置かない。
+  - 相手AI（V200）の記憶は分岐時点で空になる。
+  - map_20 で実戦と比べた確認（conc18、T10から8ラウンド）では、拠点数・西側都市数はほぼ一致したが、相手の総戦力が実戦より16〜22%多く出た。絶対値ではなく、同じ条件で回した変更前後の差で判断する。
+  - 同じ盤面からでも実行ごとに揺れるので、12局程度の平均で比べる。
 
 ### 3. 結果の確認と評価レポートの作成・分析
 スクリプトの実行が完了すると、指定した `--output` (標準では `matchup_report.md`) に詳細な評価レポートが生成されます。
