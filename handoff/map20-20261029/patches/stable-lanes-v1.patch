@@ -1,0 +1,1260 @@
+diff --git a/engine/src/ai/squad.rs b/engine/src/ai/squad.rs
+index 30046a3..5889f15 100644
+--- a/engine/src/ai/squad.rs
++++ b/engine/src/ai/squad.rs
+@@ -2332,6 +2332,9 @@ fn assign_campaign_responsibilities_scoped(
+                 .collect()
+         }
+     };
++    let is_standard_v4 = !crate::ai::code_path::is_extended()
++        && crate::ai::resolve_player_ai_version(world, player_id)
++            == crate::ai::ai_version::AiVersion::V4;
+     for responsibility in &mut responsibilities {
+         responsibility
+             .members
+@@ -2358,21 +2361,66 @@ fn assign_campaign_responsibilities_scoped(
+                     && !fixed_ids.contains(&squad.id)
+             })
+             .filter(|squad| squad_is_mutable_by_player(world, squad, player_id))
+-            .filter(|squad| squad.plan.mission_type == responsibility.mission_type)
++            .filter(|squad| {
++                if squad.plan.mission_type == responsibility.mission_type {
++                    true
++                } else if is_standard_v4 {
++                    matches!(
++                        squad.plan.mission_type,
++                        MissionType::Attack | MissionType::Defense
++                    ) && matches!(
++                        responsibility.mission_type,
++                        MissionType::Attack | MissionType::Defense
++                    )
++                } else {
++                    false
++                }
++            })
+             .filter(|squad| squad.plan.target_island == Some(island_id))
+             .min_by_key(|squad| {
+-                let compatibility = if squad.plan.target == Some(responsibility.target) {
+-                    0
+-                } else if squad
+-                    .members
+-                    .iter()
+-                    .any(|member| member_set.contains(member))
+-                {
+-                    1
++                if is_standard_v4 {
++                    // 直前の所属部隊としての継続性を最優先し、メンバーがそのまま残る部隊のIDを維持する。
++                    let shared_members = squad
++                        .members
++                        .iter()
++                        .filter(|m| member_set.contains(m))
++                        .count();
++                    let prior_members =
++                        world
++                            .get_resource::<UnitOperationRegistry>()
++                            .map_or(0, |reg| {
++                                member_set
++                                    .iter()
++                                    .filter(|entity| {
++                                        reg.assignment(**entity).and_then(|a| a.squad_id)
++                                            == Some(squad.id)
++                                            || reg.previous_squad(**entity) == Some(squad.id)
++                                    })
++                                    .count()
++                            });
++                    let continuity = shared_members.max(prior_members);
++                    let (tier, score) = if continuity > 0 {
++                        (0, usize::MAX - continuity)
++                    } else if squad.plan.target == Some(responsibility.target) {
++                        (1, 0)
++                    } else {
++                        (2, 0)
++                    };
++                    (tier, score, squad.id.0)
+                 } else {
+-                    2
+-                };
+-                (compatibility, squad.id.0)
++                    let compatibility = if squad.plan.target == Some(responsibility.target) {
++                        0
++                    } else if squad
++                        .members
++                        .iter()
++                        .any(|member| member_set.contains(member))
++                    {
++                        1
++                    } else {
++                        2
++                    };
++                    (compatibility, 0, squad.id.0)
++                }
+             })
+             .map(|squad| squad.id);
+         let selected_id = existing_id.unwrap_or_else(|| {
+@@ -2457,7 +2505,7 @@ fn assign_campaign_members(
+ }
+ 
+ #[cfg(test)]
+-fn prepare_campaign_local_assignment(
++pub(crate) fn prepare_campaign_local_assignment(
+     world: &World,
+     manager: &mut SquadManager,
+     player_id: PlayerId,
+diff --git a/engine/src/ai/squad/combat_responsibilities.rs b/engine/src/ai/squad/combat_responsibilities.rs
+index bbd044d..b6e9ef6 100644
+--- a/engine/src/ai/squad/combat_responsibilities.rs
++++ b/engine/src/ai/squad/combat_responsibilities.rs
+@@ -74,6 +74,8 @@ pub(super) fn campaign_combat_responsibilities(
+             members,
+             &route_fronts,
+             &route_slots,
++            player_id,
++            island_id,
+         );
+         let mut route_enemies = vec![Vec::new(); route_fronts.len()];
+         for (enemy, position) in enemies {
+@@ -150,16 +152,41 @@ pub(super) fn distribute_members_across_route_fronts(
+     members: &[Entity],
+     route_fronts: &[GridPosition],
+     route_slots: &[usize],
++    player_id: PlayerId,
++    island_id: crate::ai::islands::IslandId,
+ ) -> Vec<Vec<Entity>> {
+     let mut remaining = members.to_vec();
+     remaining.sort_by_key(|entity| entity.to_bits());
+     remaining.dedup();
+     let mut distributed = vec![Vec::new(); route_fronts.len()];
+ 
+-    // 先に全体需要から決めた枠だけを埋める。配属時には距離だけを使うので、既に
+-    // 盤面評価へ含めた戦力差や収益をunitごとに二重計上しない。
++    // 標準V4では、既存の首都ルート継続契約を持つ部隊をそのrouteへ優先配属し、
++    // 毎ターンの前線距離やスロット偏りで別進軍路へ交差配分されることを防ぐ。
++    let is_standard_v4 = !crate::ai::code_path::is_extended()
++        && crate::ai::resolve_player_ai_version(world, player_id)
++            == crate::ai::ai_version::AiVersion::V4;
++
+     let mut unassigned = Vec::new();
+     for member in remaining {
++        if is_standard_v4
++            && let Some(commitment) =
++                crate::ai::v4::capital_route::commitment::active_route_commitment_for_entity(
++                    world, member, player_id, island_id,
++                )
++        {
++            let route = commitment.route_index();
++            if route < route_fronts.len() {
++                distributed[route].push(member);
++                continue;
++            }
++        }
++        unassigned.push(member);
++    }
++
++    // 先に全体需要から決めた枠だけを埋める。配属時には距離だけを使うので、既に
++    // 盤面評価へ含めた戦力差や収益をunitごとに二重計上しない。
++    let mut still_unassigned = Vec::new();
++    for member in unassigned {
+         let route = world.get::<GridPosition>(member).and_then(|position| {
+             route_fronts
+                 .iter()
+@@ -178,13 +205,13 @@ pub(super) fn distribute_members_across_route_fronts(
+         if let Some(route) = route {
+             distributed[route].push(member);
+         } else {
+-            unassigned.push(member);
++            still_unassigned.push(member);
+         }
+     }
+ 
+     // 需要枠を超えるmemberも、同じcampaign内の最寄りrouteへ結び直す。これにより
+     // squadを失った遊休戦力や、汎用Reserveへの退避を発生させない。
+-    for member in unassigned {
++    for member in still_unassigned {
+         let route = world
+             .get::<GridPosition>(member)
+             .map(|position| {
+@@ -481,6 +508,8 @@ mod tests {
+             &[first, second],
+             &fronts,
+             &[1, 1],
++            player,
++            crate::ai::islands::IslandId(0),
+         );
+ 
+         assert_eq!(distributed.len(), 2);
+diff --git a/engine/src/ai/squad/objective_allocation.rs b/engine/src/ai/squad/objective_allocation.rs
+index e990b0c..fe6da8a 100644
+--- a/engine/src/ai/squad/objective_allocation.rs
++++ b/engine/src/ai/squad/objective_allocation.rs
+@@ -448,7 +448,7 @@ fn route_front_responsibilities(
+     .filter(|current| current.len() == fronts.len())
+     .unwrap_or(fronts);
+     let groups = super::combat_responsibilities::distribute_members_across_route_fronts(
+-        world, map, remaining, &fronts, &slots,
++        world, map, remaining, &fronts, &slots, player, island,
+     );
+     remaining.clear();
+     fronts
+diff --git a/engine/src/ai/v4/capital_route/commitment.rs b/engine/src/ai/v4/capital_route/commitment.rs
+index 8d5ec5c..b971361 100644
+--- a/engine/src/ai/v4/capital_route/commitment.rs
++++ b/engine/src/ai/v4/capital_route/commitment.rs
+@@ -200,6 +200,54 @@ pub(in crate::ai::v4) fn inherited_capital_route_commitment(
+         .and_then(|id| registry.commitments.get(id))
+ }
+ 
++/// ユニットが所属していた既存Squadの首都ルート継続契約を返す。
++///
++/// 目標拠点を自軍が確保した場合や、被撃破・回復中・他プレイヤーのユニットの場合は契約解除（None）とする。
++pub(crate) fn active_route_commitment_for_entity(
++    world: &World,
++    entity: Entity,
++    player_id: PlayerId,
++    island_id: crate::ai::islands::IslandId,
++) -> Option<CapitalRouteCommitment> {
++    let faction = world.get::<Faction>(entity)?;
++    if faction.0 != player_id {
++        return None;
++    }
++    let hp = world.get::<Health>(entity)?.current;
++    if hp == 0 {
++        return None;
++    }
++    if crate::ai::v4::capital_route::tactical::capital_route_is_recovering(world, player_id, entity)
++    {
++        return None;
++    }
++    let op_registry =
++        world.get_resource::<crate::ai::operation_assignment::UnitOperationRegistry>()?;
++    let squad_id = op_registry
++        .assignment(entity)
++        .and_then(|a| a.squad_id)
++        .or_else(|| op_registry.previous_squad(entity))?;
++
++    let path_registry = world.get_resource::<CapitalRoutePathRegistry>()?;
++    let commitment = path_registry.commitments.get(&squad_id)?.clone();
++
++    if commitment.player_id != player_id || commitment.island_id != island_id {
++        return None;
++    }
++
++    // 目標確保時の解除: commitment.target が既に自軍拠点なら解除
++    let target_secured = world.iter_entities().any(|e| {
++        e.get::<GridPosition>() == Some(&commitment.target)
++            && e.get::<Property>()
++                .is_some_and(|p| p.owner_id == Some(player_id))
++    });
++    if target_secured {
++        return None;
++    }
++
++    Some(commitment)
++}
++
+ /// 後方Nodeが再び争奪になっても、すでに先のNodeへ投入した前衛は呼び戻さない。
+ ///
+ /// Roadmapの先頭未完了Nodeは新規・後続Squadの行き先として使う。一方、同じ経路・同じ
+@@ -689,9 +737,14 @@ fn retain_previous_routes(
+             continue;
+         };
+         let route = commitment.route.0;
++        let target_invalid = if crate::ai::code_path::is_extended() {
++            targets.get(route).copied().flatten() != Some(commitment.target)
++        } else {
++            targets.get(route).copied().flatten().is_none()
++        };
+         if commitment.player_id != player_id
+             || commitment.island_id != island_id
+-            || targets.get(route).copied().flatten() != Some(commitment.target)
++            || target_invalid
+             || squad_target_route(topology, map, &squad.mission, squad.target, targets)
+                 .is_some_and(|target_route| target_route != route)
+         {
+@@ -851,7 +904,20 @@ fn assign_island_routes(
+             .iter()
+             .filter_map(|squad| {
+                 inherited_capital_route_commitment(context.existing, squad.operation_id)
++                    .or_else(|| context.existing.commitments.get(&squad.id))
+                     .cloned()
++                    .or_else(|| {
++                        let manager = world.get_resource::<crate::ai::squad::SquadManager>()?;
++                        let full_squad = manager.squads.iter().find(|s| s.id == squad.id)?;
++                        full_squad.members.iter().find_map(|&entity| {
++                            active_route_commitment_for_entity(
++                                context.world,
++                                entity,
++                                player_id,
++                                island_id,
++                            )
++                        })
++                    })
+                     .map(|commitment| (squad.id, commitment))
+             })
+             .collect(),
+diff --git a/engine/src/ai/v4/capital_route/model.rs b/engine/src/ai/v4/capital_route/model.rs
+index db7627d..034124f 100644
+--- a/engine/src/ai/v4/capital_route/model.rs
++++ b/engine/src/ai/v4/capital_route/model.rs
+@@ -165,7 +165,7 @@ pub(crate) struct CapitalRouteNodeOperationRegistry {
+ /// 現在の未確保拠点までのセル列を保持する。Entityはこのorderを持つSquadの
+ /// memberとしてだけ経路を参照し、DAG自身がEntityへ別の目標を配らない。
+ #[derive(Debug, Clone)]
+-pub(in crate::ai::v4) struct CapitalRouteCommitment {
++pub(crate) struct CapitalRouteCommitment {
+     pub(in crate::ai::v4) player_id: PlayerId,
+     pub(in crate::ai::v4) island_id: crate::ai::islands::IslandId,
+     pub(in crate::ai::v4) route: CapitalRouteId,
+@@ -199,6 +199,12 @@ pub(in crate::ai::v4) struct CapitalRouteCommitment {
+     pub(in crate::ai::v4) phase: CapitalRouteExecutionPhase,
+ }
+ 
++impl CapitalRouteCommitment {
++    pub(crate) fn route_index(&self) -> usize {
++        self.route.0
++    }
++}
++
+ /// DAG区間でのSquadの役割。回復はmemberごとの戦術的な一時状態であり、
+ /// Squadの戦略orderを書き換えない。
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+diff --git a/engine/src/ai/v4/capital_route/tests.rs b/engine/src/ai/v4/capital_route/tests.rs
+index d4c6128..c3623c3 100644
+--- a/engine/src/ai/v4/capital_route/tests.rs
++++ b/engine/src/ai/v4/capital_route/tests.rs
+@@ -2006,3 +2006,936 @@ fn squad_route_follows_the_branch_of_its_own_target() {
+         None
+     );
+ }
++
++#[test]
++fn campaign_reorganization_preserves_route_commitments_without_cross_assignment() {
++    let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
++    let player = PlayerId(2);
++    let (mut world, island) = map6_route_world(player);
++    let mut settings = crate::ai::ai_version::PlayerAiSettings::new();
++    settings.set_version(player, crate::ai::ai_version::AiVersion::V4);
++    world.insert_resource(settings);
++    world.insert_resource(
++        crate::ai::strategy_profile::V4StrategyProfileRegistry::with_profile(
++            player,
++            crate::ai::strategy_profile::V4StrategyProfile::Standard,
++        ),
++    );
++
++    let topology = capital_route_topology_for(&world, player, island)
++        .unwrap()
++        .clone();
++    assert_eq!(topology.routes.len(), 2, "map_6 has 2 routes");
++
++    let front_north = topology.routes[0].front;
++    let front_south = topology.routes[1].front;
++
++    let unit_north = world
++        .spawn((
++            Faction(player),
++            front_north,
++            Health {
++                current: 100,
++                max: 100,
++            },
++            stats(UnitType::Tank, 7000),
++        ))
++        .id();
++
++    let unit_south = world
++        .spawn((
++            Faction(player),
++            front_south,
++            Health {
++                current: 100,
++                max: 100,
++            },
++            stats(UnitType::Tank, 7000),
++        ))
++        .id();
++
++    let mut manager = crate::ai::squad::SquadManager::default();
++    let mut squad_n = manager.create_owned_squad(MissionType::Attack, player);
++    squad_n.members.insert(unit_north);
++    squad_n.plan_mut().target = Some(front_north);
++    squad_n.plan_mut().target_island = Some(island);
++    let squad_n_id = squad_n.id;
++
++    let mut squad_s = manager.create_owned_squad(MissionType::Attack, player);
++    squad_s.members.insert(unit_south);
++    squad_s.plan_mut().target = Some(front_south);
++    squad_s.plan_mut().target_island = Some(island);
++    let squad_s_id = squad_s.id;
++
++    let mut op_registry = crate::ai::operation_assignment::UnitOperationRegistry::default();
++    op_registry.assign(
++        unit_north,
++        crate::ai::operation_assignment::UnitOperationAssignment {
++            owner: crate::ai::operation_assignment::OperationOwner::TacticalSquad {
++                player_id: player,
++                squad_id: squad_n_id,
++            },
++            squad_id: Some(squad_n_id),
++            role: crate::ai::operation_assignment::OperationUnitRole::Member,
++            assigned_turn: 5,
++        },
++    );
++    op_registry.assign(
++        unit_south,
++        crate::ai::operation_assignment::UnitOperationAssignment {
++            owner: crate::ai::operation_assignment::OperationOwner::TacticalSquad {
++                player_id: player,
++                squad_id: squad_s_id,
++            },
++            squad_id: Some(squad_s_id),
++            role: crate::ai::operation_assignment::OperationUnitRole::Member,
++            assigned_turn: 5,
++        },
++    );
++    world.insert_resource(op_registry);
++
++    let make_commitment = |route_idx: usize, target: GridPosition| CapitalRouteCommitment {
++        player_id: player,
++        island_id: island,
++        route: CapitalRouteId(route_idx),
++        target,
++        target_anchor: target,
++        objective: CapitalRouteNodeObjective::Control,
++        scope: CapitalRouteNodeScope::Point,
++        control_area: vec![target],
++        capture_targets: Vec::new(),
++        crossing_exit: None,
++        crossed: false,
++        execution_target: target,
++        frontline_capacity: 2,
++        path: vec![target],
++        phase: CapitalRouteExecutionPhase::Advance,
++    };
++
++    let mut path_registry = CapitalRoutePathRegistry::default();
++    path_registry
++        .commitments
++        .insert(squad_n_id, make_commitment(0, front_north));
++    path_registry
++        .commitments
++        .insert(squad_s_id, make_commitment(1, front_south));
++    world.insert_resource(path_registry);
++    world.insert_resource(manager);
++
++    let requirement = crate::ai::island_campaign::IslandCampaignRequirement {
++        preferred_transport: None,
++        transport_slots: 0,
++        capture_units: 0,
++        ground_combat_units: 2,
++        combat_units: 2,
++        total_budget: 14_000,
++    };
++    let assignment = crate::ai::island_campaign::IslandCampaignAssignment {
++        island_id: island,
++        decision: crate::ai::island_campaign::IslandCampaignDecision::Assault,
++        target_position: topology.nodes[topology.goal_node.0].anchor,
++        capture_target_positions: vec![front_north, front_south],
++        priority_enemy_types: Vec::new(),
++        requirement: requirement.clone(),
++        purchase_shortfall: requirement,
++        allocated_budget: 14_000,
++        transport_entities: Vec::new(),
++        capture_entities: Vec::new(),
++        combat_entities: vec![unit_north, unit_south],
++        operation_ready: true,
++        continued_from_existing_squad: false,
++    };
++
++    let mut manager = world
++        .remove_resource::<crate::ai::squad::SquadManager>()
++        .unwrap();
++    crate::ai::squad::prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
++    world.insert_resource(manager);
++
++    let mut manager = world
++        .remove_resource::<crate::ai::squad::SquadManager>()
++        .unwrap();
++    crate::ai::v4::capital_route::commitment::refresh_capital_route_path_commitments(
++        &mut world,
++        player,
++        &mut manager,
++    );
++    world.insert_resource(manager);
++
++    let path_registry = world.resource::<CapitalRoutePathRegistry>();
++    let manager = world.resource::<crate::ai::squad::SquadManager>();
++
++    let squad_for_north = manager
++        .squads
++        .iter()
++        .find(|s| s.members.contains(&unit_north))
++        .expect("unit_north belongs to a squad");
++    let squad_for_south = manager
++        .squads
++        .iter()
++        .find(|s| s.members.contains(&unit_south))
++        .expect("unit_south belongs to a squad");
++
++    assert_ne!(
++        squad_for_north.id, squad_for_south.id,
++        "north and south must not be merged into the same squad across routes"
++    );
++
++    let comm_north = path_registry
++        .commitments
++        .get(&squad_for_north.id)
++        .expect("commitment for north squad");
++    let comm_south = path_registry
++        .commitments
++        .get(&squad_for_south.id)
++        .expect("commitment for south squad");
++
++    assert_eq!(
++        comm_north.route,
++        CapitalRouteId(0),
++        "unit_north must retain route 0"
++    );
++    assert_eq!(
++        comm_south.route,
++        CapitalRouteId(1),
++        "unit_south must retain route 1"
++    );
++}
++
++#[test]
++fn route_commitment_releases_when_objective_is_secured() {
++    let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
++    let player = PlayerId(2);
++    let (mut world, island) = map6_route_world(player);
++    let _topology = capital_route_topology_for(&world, player, island)
++        .unwrap()
++        .clone();
++    let frontiers = capital_route_dag_frontier_properties(&world, player, island).unwrap();
++    let target_property = frontiers[0][0];
++
++    let unit = world
++        .spawn((
++            Faction(player),
++            target_property,
++            Health {
++                current: 100,
++                max: 100,
++            },
++            stats(UnitType::Tank, 7000),
++        ))
++        .id();
++
++    let mut manager = crate::ai::squad::SquadManager::default();
++    let mut squad = manager.create_owned_squad(MissionType::Attack, player);
++    squad.members.insert(unit);
++    let squad_id = squad.id;
++
++    let mut op_registry = crate::ai::operation_assignment::UnitOperationRegistry::default();
++    op_registry.assign(
++        unit,
++        crate::ai::operation_assignment::UnitOperationAssignment {
++            owner: crate::ai::operation_assignment::OperationOwner::TacticalSquad {
++                player_id: player,
++                squad_id,
++            },
++            squad_id: Some(squad_id),
++            role: crate::ai::operation_assignment::OperationUnitRole::Member,
++            assigned_turn: 5,
++        },
++    );
++    world.insert_resource(op_registry);
++
++    let mut path_registry = CapitalRoutePathRegistry::default();
++    path_registry.commitments.insert(
++        squad_id,
++        CapitalRouteCommitment {
++            player_id: player,
++            island_id: island,
++            route: CapitalRouteId(0),
++            target: target_property,
++            target_anchor: target_property,
++            objective: CapitalRouteNodeObjective::Control,
++            scope: CapitalRouteNodeScope::Point,
++            control_area: vec![target_property],
++            capture_targets: Vec::new(),
++            crossing_exit: None,
++            crossed: false,
++            execution_target: target_property,
++            frontline_capacity: 1,
++            path: vec![target_property],
++            phase: CapitalRouteExecutionPhase::Advance,
++        },
++    );
++    world.insert_resource(path_registry);
++    world.insert_resource(manager);
++
++    // 未確保時は有効なコミットメントが得られる
++    let active = crate::ai::v4::capital_route::commitment::active_route_commitment_for_entity(
++        &world, unit, player, island,
++    );
++    assert!(active.is_some(), "未確保の時はコミットメントが有効");
++
++    // 目標拠点を自軍が占領・確保する
++    let property_entity = world
++        .iter_entities()
++        .find(|e| e.get::<GridPosition>() == Some(&target_property) && e.contains::<Property>())
++        .map(|e| e.id())
++        .expect("target_property entity");
++    world.get_mut::<Property>(property_entity).unwrap().owner_id = Some(player);
++
++    // 占領完了後はコミットメントが解除される
++    let active_after = crate::ai::v4::capital_route::commitment::active_route_commitment_for_entity(
++        &world, unit, player, island,
++    );
++    assert!(
++        active_after.is_none(),
++        "目標確保後はコミットメント契約が解除される"
++    );
++}
++
++#[test]
++fn route_commitment_handles_recovery_and_player_isolation() {
++    let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
++    let player = PlayerId(2);
++    let enemy_player = PlayerId(1);
++    let (mut world, island) = map6_route_world(player);
++    let topology = capital_route_topology_for(&world, player, island)
++        .unwrap()
++        .clone();
++    let front_north = topology.routes[0].front;
++
++    // 敵ユニット
++    let enemy_unit = world
++        .spawn((
++            Faction(enemy_player),
++            front_north,
++            Health {
++                current: 100,
++                max: 100,
++            },
++            stats(UnitType::Tank, 7000),
++        ))
++        .id();
++
++    // 他プレイヤーのユニットには干渉しない
++    let enemy_comm = crate::ai::v4::capital_route::commitment::active_route_commitment_for_entity(
++        &world, enemy_unit, player, island,
++    );
++    assert!(enemy_comm.is_none(), "他プレイヤーのユニットには干渉しない");
++
++    // 味方ユニット
++    let damaged_unit = world
++        .spawn((
++            Faction(player),
++            front_north,
++            Health {
++                current: 20,
++                max: 100,
++            },
++            stats(UnitType::Tank, 7000),
++        ))
++        .id();
++
++    let mut manager = crate::ai::squad::SquadManager::default();
++    let mut squad = manager.create_owned_squad(MissionType::Attack, player);
++    squad.members.insert(damaged_unit);
++    let squad_id = squad.id;
++
++    let mut op_registry = crate::ai::operation_assignment::UnitOperationRegistry::default();
++    op_registry.assign(
++        damaged_unit,
++        crate::ai::operation_assignment::UnitOperationAssignment {
++            owner: crate::ai::operation_assignment::OperationOwner::TacticalSquad {
++                player_id: player,
++                squad_id,
++            },
++            squad_id: Some(squad_id),
++            role: crate::ai::operation_assignment::OperationUnitRole::Member,
++            assigned_turn: 5,
++        },
++    );
++    world.insert_resource(op_registry);
++
++    let mut path_registry = CapitalRoutePathRegistry::default();
++    path_registry.commitments.insert(
++        squad_id,
++        CapitalRouteCommitment {
++            player_id: player,
++            island_id: island,
++            route: CapitalRouteId(0),
++            target: front_north,
++            target_anchor: front_north,
++            objective: CapitalRouteNodeObjective::Control,
++            scope: CapitalRouteNodeScope::Point,
++            control_area: vec![front_north],
++            capture_targets: Vec::new(),
++            crossing_exit: None,
++            crossed: false,
++            execution_target: front_north,
++            frontline_capacity: 1,
++            path: vec![front_north],
++            phase: CapitalRouteExecutionPhase::Advance,
++        },
++    );
++    world.insert_resource(path_registry);
++    world.insert_resource(manager);
++
++    // 回復中（HP < 70）のユニットは前衛経路から解除される
++    let recovering_comm =
++        crate::ai::v4::capital_route::commitment::active_route_commitment_for_entity(
++            &world,
++            damaged_unit,
++            player,
++            island,
++        );
++    assert!(
++        recovering_comm.is_none(),
++        "回復中のユニットはコミットメントが一時解除される"
++    );
++
++    // 被撃破ユニットも解除される
++    world.get_mut::<Health>(damaged_unit).unwrap().current = 0;
++    let dead_comm = crate::ai::v4::capital_route::commitment::active_route_commitment_for_entity(
++        &world,
++        damaged_unit,
++        player,
++        island,
++    );
++    assert!(dead_comm.is_none(), "被撃破ユニットは契約解除される");
++}
++
++#[test]
++fn campaign_reorganization_distinguishes_tactical_target_switch_from_dag_ownership_change() {
++    let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
++    let player = PlayerId(2);
++    let enemy = PlayerId(1);
++    let (mut world, island) = map6_route_world(player);
++    let mut settings = crate::ai::ai_version::PlayerAiSettings::new();
++    settings.set_version(player, crate::ai::ai_version::AiVersion::V4);
++    world.insert_resource(settings);
++    world.insert_resource(
++        crate::ai::strategy_profile::V4StrategyProfileRegistry::with_profile(
++            player,
++            crate::ai::strategy_profile::V4StrategyProfile::Standard,
++        ),
++    );
++
++    let topology = capital_route_topology_for(&world, player, island)
++        .unwrap()
++        .clone();
++    let frontiers = capital_route_dag_frontier_properties(&world, player, island).unwrap();
++    let front_north = frontiers[0][0];
++    let front_south = frontiers[1][0];
++
++    // 南（route 1）の施設が敵所有である（未奪還）
++    let property_south_entity = world
++        .iter_entities()
++        .find(|e| e.get::<GridPosition>() == Some(&front_south) && e.contains::<Property>())
++        .map(|e| e.id())
++        .expect("front_south property");
++    world
++        .get_mut::<Property>(property_south_entity)
++        .unwrap()
++        .owner_id = Some(enemy);
++
++    // 南ルートに進んでいる戦車
++    let unit = world
++        .spawn((
++            Faction(player),
++            front_south,
++            Health {
++                current: 100,
++                max: 100,
++            },
++            stats(UnitType::Tank, 7000),
++        ))
++        .id();
++
++    // 直前手番（T7相当）で南ルート（route 1）の Commitment を持っている
++    let mut manager = crate::ai::squad::SquadManager::default();
++    let mut squad = manager.create_owned_squad(MissionType::Attack, player);
++    squad.members.insert(unit);
++    squad.plan_mut().target = Some(front_south);
++    squad.plan_mut().target_island = Some(island);
++    let squad_id = squad.id;
++
++    let mut op_registry = crate::ai::operation_assignment::UnitOperationRegistry::default();
++    op_registry.assign(
++        unit,
++        crate::ai::operation_assignment::UnitOperationAssignment {
++            owner: crate::ai::operation_assignment::OperationOwner::TacticalSquad {
++                player_id: player,
++                squad_id,
++            },
++            squad_id: Some(squad_id),
++            role: crate::ai::operation_assignment::OperationUnitRole::Member,
++            assigned_turn: 7,
++        },
++    );
++    world.insert_resource(op_registry);
++
++    let mut path_registry = CapitalRoutePathRegistry::default();
++    path_registry.commitments.insert(
++        squad_id,
++        CapitalRouteCommitment {
++            player_id: player,
++            island_id: island,
++            route: CapitalRouteId(1),
++            target: front_south,
++            target_anchor: front_south,
++            objective: CapitalRouteNodeObjective::Control,
++            scope: CapitalRouteNodeScope::Point,
++            control_area: vec![front_south],
++            capture_targets: Vec::new(),
++            crossing_exit: None,
++            crossed: false,
++            execution_target: front_south,
++            frontline_capacity: 2,
++            path: vec![front_south],
++            phase: CapitalRouteExecutionPhase::Advance,
++        },
++    );
++    world.insert_resource(path_registry);
++    world.insert_resource(manager);
++
++    // 局面: T8で目の前の敵ユニットはいなくなった（戦闘標的の消滅）
++    // しかし南施設 front_south は敵所有のまま（DAG地域の所有変化なし）
++    let requirement = crate::ai::island_campaign::IslandCampaignRequirement {
++        preferred_transport: None,
++        transport_slots: 0,
++        capture_units: 0,
++        ground_combat_units: 1,
++        combat_units: 1,
++        total_budget: 7_000,
++    };
++    let assignment = crate::ai::island_campaign::IslandCampaignAssignment {
++        island_id: island,
++        decision: crate::ai::island_campaign::IslandCampaignDecision::Assault,
++        target_position: topology.nodes[topology.goal_node.0].anchor,
++        capture_target_positions: vec![front_north, front_south],
++        priority_enemy_types: Vec::new(),
++        requirement: requirement.clone(),
++        purchase_shortfall: requirement,
++        allocated_budget: 7_000,
++        transport_entities: Vec::new(),
++        capture_entities: Vec::new(),
++        combat_entities: vec![unit],
++        operation_ready: true,
++        continued_from_existing_squad: false,
++    };
++
++    let mut manager = world
++        .remove_resource::<crate::ai::squad::SquadManager>()
++        .unwrap();
++    crate::ai::squad::prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
++    world.insert_resource(manager);
++
++    let mut manager = world
++        .remove_resource::<crate::ai::squad::SquadManager>()
++        .unwrap();
++    crate::ai::v4::capital_route::commitment::refresh_capital_route_path_commitments(
++        &mut world,
++        player,
++        &mut manager,
++    );
++    world.insert_resource(manager);
++
++    // 検証: 局地敵がいなくなっても、DAG施設が未奪還である限り route 1 を継続すること！
++    let path_registry = world.resource::<CapitalRoutePathRegistry>();
++    let manager = world.resource::<crate::ai::squad::SquadManager>();
++    let squad_for_unit = manager
++        .squads
++        .iter()
++        .find(|s| s.members.contains(&unit))
++        .expect("unit belongs to a squad");
++    let comm = path_registry
++        .commitments
++        .get(&squad_for_unit.id)
++        .expect("commitment for unit squad");
++
++    assert_eq!(
++        comm.route,
++        CapitalRouteId(1),
++        "戦闘標的が切替わってもDAG施設が未確保ならroute 1を維持する"
++    );
++}
++
++#[test]
++fn tactical_target_aligns_with_retained_route_commitments() {
++    let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
++    let player = PlayerId(2);
++    let (mut world, island) = map6_route_world(player);
++    let mut settings = crate::ai::ai_version::PlayerAiSettings::new();
++    settings.set_version(player, crate::ai::ai_version::AiVersion::V4);
++    world.insert_resource(settings);
++    world.insert_resource(
++        crate::ai::strategy_profile::V4StrategyProfileRegistry::with_profile(
++            player,
++            crate::ai::strategy_profile::V4StrategyProfile::Standard,
++        ),
++    );
++
++    let topology = capital_route_topology_for(&world, player, island)
++        .unwrap()
++        .clone();
++    let front_north = topology.routes[0].front;
++    let front_south = topology.routes[1].front;
++    let home = topology.nodes[topology.start_node.0].anchor;
++
++    let unit_north = world
++        .spawn((
++            Faction(player),
++            home,
++            Health {
++                current: 100,
++                max: 100,
++            },
++            stats(UnitType::Tank, 7000),
++        ))
++        .id();
++
++    let unit_south = world
++        .spawn((
++            Faction(player),
++            home,
++            Health {
++                current: 100,
++                max: 100,
++            },
++            stats(UnitType::Tank, 7000),
++        ))
++        .id();
++
++    let mut manager = crate::ai::squad::SquadManager::default();
++    let mut squad_n = manager.create_owned_squad(MissionType::Attack, player);
++    squad_n.members.insert(unit_north);
++    squad_n.plan_mut().target = Some(front_north);
++    squad_n.plan_mut().target_island = Some(island);
++    let squad_n_id = squad_n.id;
++
++    let mut squad_s = manager.create_owned_squad(MissionType::Attack, player);
++    squad_s.members.insert(unit_south);
++    squad_s.plan_mut().target = Some(front_south);
++    squad_s.plan_mut().target_island = Some(island);
++    let squad_s_id = squad_s.id;
++
++    let mut op_registry = crate::ai::operation_assignment::UnitOperationRegistry::default();
++    op_registry.assign(
++        unit_north,
++        crate::ai::operation_assignment::UnitOperationAssignment {
++            owner: crate::ai::operation_assignment::OperationOwner::Campaign {
++                player_id: player,
++                island_id: island,
++            },
++            squad_id: Some(squad_n_id),
++            role: crate::ai::operation_assignment::OperationUnitRole::Member,
++            assigned_turn: 5,
++        },
++    );
++    op_registry.assign(
++        unit_south,
++        crate::ai::operation_assignment::UnitOperationAssignment {
++            owner: crate::ai::operation_assignment::OperationOwner::Campaign {
++                player_id: player,
++                island_id: island,
++            },
++            squad_id: Some(squad_s_id),
++            role: crate::ai::operation_assignment::OperationUnitRole::Member,
++            assigned_turn: 5,
++        },
++    );
++    world.insert_resource(op_registry);
++
++    let make_commitment = |route_idx: usize, target: GridPosition| CapitalRouteCommitment {
++        player_id: player,
++        island_id: island,
++        route: CapitalRouteId(route_idx),
++        target,
++        target_anchor: target,
++        objective: CapitalRouteNodeObjective::Control,
++        scope: CapitalRouteNodeScope::Point,
++        control_area: vec![target],
++        capture_targets: Vec::new(),
++        crossing_exit: None,
++        crossed: false,
++        execution_target: target,
++        frontline_capacity: 2,
++        path: vec![target],
++        phase: CapitalRouteExecutionPhase::Advance,
++    };
++
++    let mut path_registry = CapitalRoutePathRegistry::default();
++    path_registry
++        .commitments
++        .insert(squad_n_id, make_commitment(0, front_north));
++    path_registry
++        .commitments
++        .insert(squad_s_id, make_commitment(1, front_south));
++    world.insert_resource(path_registry);
++    world.insert_resource(manager);
++
++    let requirement = crate::ai::island_campaign::IslandCampaignRequirement {
++        preferred_transport: None,
++        transport_slots: 0,
++        capture_units: 0,
++        ground_combat_units: 2,
++        combat_units: 2,
++        total_budget: 14_000,
++    };
++    let assignment = crate::ai::island_campaign::IslandCampaignAssignment {
++        island_id: island,
++        decision: crate::ai::island_campaign::IslandCampaignDecision::Assault,
++        target_position: topology.nodes[topology.goal_node.0].anchor,
++        capture_target_positions: vec![front_north, front_south],
++        priority_enemy_types: Vec::new(),
++        requirement: requirement.clone(),
++        purchase_shortfall: requirement,
++        allocated_budget: 14_000,
++        transport_entities: Vec::new(),
++        capture_entities: Vec::new(),
++        combat_entities: vec![unit_north, unit_south],
++        operation_ready: true,
++        continued_from_existing_squad: false,
++    };
++
++    let mut manager = world
++        .remove_resource::<crate::ai::squad::SquadManager>()
++        .unwrap();
++    crate::ai::squad::prepare_campaign_local_assignment(&world, &mut manager, player, &assignment);
++    world.insert_resource(manager);
++
++    let mut manager = world
++        .remove_resource::<crate::ai::squad::SquadManager>()
++        .unwrap();
++    crate::ai::v4::capital_route::commitment::refresh_capital_route_path_commitments(
++        &mut world,
++        player,
++        &mut manager,
++    );
++    let squad_for_north = manager
++        .squads
++        .iter()
++        .find(|s| s.members.contains(&unit_north))
++        .unwrap()
++        .clone();
++    let squad_for_south = manager
++        .squads
++        .iter()
++        .find(|s| s.members.contains(&unit_south))
++        .unwrap()
++        .clone();
++    let squad_for_north_id = squad_for_north.id;
++    let squad_for_south_id = squad_for_south.id;
++    println!(
++        "squad_for_north: id={:?}, target={:?}",
++        squad_for_north.id, squad_for_north.plan.target
++    );
++    println!(
++        "squad_for_south: id={:?}, target={:?}",
++        squad_for_south.id, squad_for_south.plan.target
++    );
++    world.insert_resource(manager);
++
++    // UnitOperationRegistry の binding を同期
++    let mut op_registry = world
++        .remove_resource::<crate::ai::operation_assignment::UnitOperationRegistry>()
++        .unwrap();
++    op_registry.assign(
++        unit_north,
++        crate::ai::operation_assignment::UnitOperationAssignment {
++            owner: crate::ai::operation_assignment::OperationOwner::Campaign {
++                player_id: player,
++                island_id: island,
++            },
++            squad_id: Some(squad_for_north_id),
++            role: crate::ai::operation_assignment::OperationUnitRole::Member,
++            assigned_turn: 6,
++        },
++    );
++    op_registry.assign(
++        unit_south,
++        crate::ai::operation_assignment::UnitOperationAssignment {
++            owner: crate::ai::operation_assignment::OperationOwner::Campaign {
++                player_id: player,
++                island_id: island,
++            },
++            squad_id: Some(squad_for_south_id),
++            role: crate::ai::operation_assignment::OperationUnitRole::Member,
++            assigned_turn: 6,
++        },
++    );
++    world.insert_resource(op_registry);
++
++    // 局面テスト: 保持された経路に沿って、戦術目標が整合していることを確認
++    let path_registry = world.resource::<CapitalRoutePathRegistry>();
++    let comm_north = path_registry
++        .commitments
++        .get(&squad_for_north_id)
++        .expect("commitment for north squad");
++    let comm_south = path_registry
++        .commitments
++        .get(&squad_for_south_id)
++        .expect("commitment for south squad");
++
++    println!(
++        "comm_north: route={:?}, target={:?}, execution={:?}",
++        comm_north.route, comm_north.target, comm_north.execution_target
++    );
++    println!(
++        "comm_south: route={:?}, target={:?}, execution={:?}",
++        comm_south.route, comm_south.target, comm_south.execution_target
++    );
++    println!(
++        "front_north={:?}, front_south={:?}",
++        front_north, front_south
++    );
++
++    // 標準戦術が実際に使う campaign_action_context の行動目標を検証
++    let manager = world.resource::<crate::ai::squad::SquadManager>();
++    let action_ctx_north =
++        crate::ai::tactics::campaign::campaign_action_context(&world, player, unit_north, manager)
++            .unwrap()
++            .expect("action context for north unit");
++
++    let action_ctx_south =
++        crate::ai::tactics::campaign::campaign_action_context(&world, player, unit_south, manager)
++            .unwrap()
++            .expect("action context for south unit");
++
++    assert_eq!(
++        action_ctx_north.target, squad_for_north.plan.target,
++        "標準戦術が使う行動目標はSquad目標と完全一致"
++    );
++    assert_eq!(
++        action_ctx_south.target, squad_for_south.plan.target,
++        "標準戦術が使う行動目標はSquad目標と完全一致"
++    );
++
++    assert_eq!(
++        comm_north.route,
++        CapitalRouteId(0),
++        "北ルートのユニットはroute 0を保持"
++    );
++    assert_eq!(
++        comm_south.route,
++        CapitalRouteId(1),
++        "南ルートのユニットはroute 1を保持"
++    );
++
++    assert_ne!(
++        action_ctx_north.target, action_ctx_south.target,
++        "北と南で行動目標が別々の進軍軸の目標を維持していること"
++    );
++}
++
++#[test]
++fn route_commitment_switches_on_explicit_strategic_diversion() {
++    let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
++    let player = PlayerId(2);
++    let (mut world, island) = map6_route_world(player);
++    let mut settings = crate::ai::ai_version::PlayerAiSettings::new();
++    settings.set_version(player, crate::ai::ai_version::AiVersion::V4);
++    world.insert_resource(settings);
++    world.insert_resource(
++        crate::ai::strategy_profile::V4StrategyProfileRegistry::with_profile(
++            player,
++            crate::ai::strategy_profile::V4StrategyProfile::Standard,
++        ),
++    );
++
++    let topology = capital_route_topology_for(&world, player, island)
++        .unwrap()
++        .clone();
++    let front_north = topology.routes[0].front;
++    let front_south = topology.routes[1].front;
++    let home = topology.nodes[topology.start_node.0].anchor;
++
++    let unit = world
++        .spawn((
++            Faction(player),
++            home,
++            Health {
++                current: 100,
++                max: 100,
++            },
++            stats(UnitType::Tank, 7000),
++        ))
++        .id();
++
++    // 直前手番で北ルート（route 0）の Commitment を持っていた
++    let mut manager = crate::ai::squad::SquadManager::default();
++    let mut squad = manager.create_owned_squad(MissionType::Attack, player);
++    squad.members.insert(unit);
++    squad.plan_mut().target = Some(front_north);
++    squad.plan_mut().target_island = Some(island);
++    let squad_id = squad.id;
++
++    let mut op_registry = crate::ai::operation_assignment::UnitOperationRegistry::default();
++    op_registry.assign(
++        unit,
++        crate::ai::operation_assignment::UnitOperationAssignment {
++            owner: crate::ai::operation_assignment::OperationOwner::Campaign {
++                player_id: player,
++                island_id: island,
++            },
++            squad_id: Some(squad_id),
++            role: crate::ai::operation_assignment::OperationUnitRole::Member,
++            assigned_turn: 5,
++        },
++    );
++    world.insert_resource(op_registry);
++
++    let mut path_registry = CapitalRoutePathRegistry::default();
++    path_registry.commitments.insert(
++        squad_id,
++        CapitalRouteCommitment {
++            player_id: player,
++            island_id: island,
++            route: CapitalRouteId(0),
++            target: front_north,
++            target_anchor: front_north,
++            objective: CapitalRouteNodeObjective::Control,
++            scope: CapitalRouteNodeScope::Point,
++            control_area: vec![front_north],
++            capture_targets: Vec::new(),
++            crossing_exit: None,
++            crossed: false,
++            execution_target: front_north,
++            frontline_capacity: 2,
++            path: vec![front_north],
++            phase: CapitalRouteExecutionPhase::Advance,
++        },
++    );
++    world.insert_resource(path_registry);
++    world.insert_resource(manager);
++
++    // 作戦が明示的に南ルート front_south への責務（戦略転換）を指示した局面
++    let mut manager = world
++        .remove_resource::<crate::ai::squad::SquadManager>()
++        .unwrap();
++    let mut squad_ref = manager.edit_each().find(|s| s.id == squad_id).unwrap();
++    squad_ref.plan_mut().target = Some(front_south);
++    world.insert_resource(manager);
++
++    let mut manager = world
++        .remove_resource::<crate::ai::squad::SquadManager>()
++        .unwrap();
++    crate::ai::v4::capital_route::commitment::refresh_capital_route_path_commitments(
++        &mut world,
++        player,
++        &mut manager,
++    );
++    world.insert_resource(manager);
++
++    // 明示的な転換によって、旧 route 0 ではなく新しい route 1 へ正常に切り替わること
++    let path_registry = world.resource::<CapitalRoutePathRegistry>();
++    let comm = path_registry
++        .commitments
++        .get(&squad_id)
++        .expect("commitment for switched squad");
++    assert_eq!(
++        comm.route,
++        CapitalRouteId(1),
++        "明示的な戦略転換により新しい枝route 1へ切り替わること"
++    );
++}

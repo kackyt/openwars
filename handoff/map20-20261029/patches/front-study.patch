@@ -1,0 +1,707 @@
+diff --git a/engine/src/ai/island_campaign_analysis.rs b/engine/src/ai/island_campaign_analysis.rs
+index f012d01..c303b64 100644
+--- a/engine/src/ai/island_campaign_analysis.rs
++++ b/engine/src/ai/island_campaign_analysis.rs
+@@ -1889,11 +1889,10 @@ fn candidate_target_position(
+         })
+         .map(|snapshot| snapshot.position)
+         .collect::<Vec<_>>();
+-    let target_priority = |position: GridPosition| {
+-        capture_front_priority(
+-            map, registry, island, properties, units, player_id, &origins, position,
+-        )
+-    };
++    let context = CaptureFrontPriorityContext::new(
++        map, registry, island, properties, units, player_id, &origins,
++    );
++    let target_priority = |position: GridPosition| context.priority(position);
+     targets.sort_unstable_by_key(|position| target_priority(*position));
+     let nearest = targets.first().copied();
+ 
+@@ -1934,11 +1933,10 @@ fn candidate_capture_target_positions(
+         })
+         .map(|snapshot| snapshot.position)
+         .collect();
+-    let target_priority = |position: GridPosition| {
+-        capture_front_priority(
+-            map, registry, island, properties, units, player_id, &origins, position,
+-        )
+-    };
++    let context = CaptureFrontPriorityContext::new(
++        map, registry, island, properties, units, player_id, &origins,
++    );
++    let target_priority = |position: GridPosition| context.priority(position);
+     targets.sort_by_key(|position| target_priority(*position));
+ 
+     // 既に足場がある陸塊では、最短前線とその隣接帯だけを同時実行対象にする。
+@@ -2104,48 +2102,219 @@ fn capture_origins(
+     owned().map(|snapshot| snapshot.position).collect()
+ }
+ 
+-/// 自軍前線からの占領ETAを第一基準、敵占領兵の到着ETAを同距離帯の競争優先度にする。
+-/// 座標は決定論的な最終tie-breakにだけ使うため、鏡像mapでも前線側を選択できる。
+-#[allow(clippy::too_many_arguments)]
+-fn capture_front_priority(
++#[derive(Copy, Clone, Eq, PartialEq)]
++struct TurnPathState {
++    turns: u32,
++    mp_in_turn: u32,
++    total_mp: u32,
++    position: GridPosition,
++}
++
++impl Ord for TurnPathState {
++    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
++        other
++            .turns
++            .cmp(&self.turns)
++            .then_with(|| other.mp_in_turn.cmp(&self.mp_in_turn))
++            .then_with(|| other.total_mp.cmp(&self.total_mp))
++            .then_with(|| self.position.y.cmp(&other.position.y))
++            .then_with(|| self.position.x.cmp(&other.position.x))
++    }
++}
++
++impl PartialOrd for TurnPathState {
++    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
++        Some(self.cmp(other))
++    }
++}
++
++/// 地形移動コストおよび手番ごとの最大移動力（手番境界）を考慮した最短到達ターン数と消費MPを計算する。
++/// 同一の移動特性を持つ複数の始点を multi-source で一度に展開する。
++fn compute_turn_movement_costs(
+     map: &Map,
+     registry: &MasterDataRegistry,
+     island: &Island,
+-    properties: &[PropertySnapshot],
+-    units: &[UnitSnapshot],
+-    player_id: PlayerId,
+-    friendly_origins: &[GridPosition],
+-    target: GridPosition,
+-) -> (u32, u32, u32, usize, usize) {
+-    let friendly_movement = [UnitType::Infantry, UnitType::Mech]
+-        .into_iter()
+-        .filter_map(|unit_type| unit_stats_for_type(registry, unit_type))
+-        .min_by_key(|stats| stats.cost)
+-        .map_or(1, |stats| stats.max_movement.max(1));
+-    let occupation_turns = properties
+-        .iter()
+-        .find(|snapshot| snapshot.position == target)
+-        .map_or(1, |snapshot| default_capture_turns(&snapshot.property));
+-    let front_distance = friendly_origins
+-        .iter()
+-        .map(|origin| map.distance(origin.x, origin.y, target.x, target.y))
+-        .min()
+-        .unwrap_or(u32::MAX);
+-    let friendly_eta = front_distance
+-        .div_ceil(friendly_movement)
+-        .saturating_add(occupation_turns);
+-    let enemy_eta = units
+-        .iter()
+-        .filter(|unit| unit.faction != player_id && unit.stats.can_capture)
+-        .filter(|unit| unit.transporting.is_none() && island.tiles.contains(&unit.position))
+-        .map(|unit| {
+-            map.distance(unit.position.x, unit.position.y, target.x, target.y)
+-                .div_ceil(unit.stats.max_movement.max(1))
+-                .saturating_add(occupation_turns)
+-        })
+-        .min()
+-        .unwrap_or(u32::MAX);
+-    (friendly_eta, front_distance, enemy_eta, target.y, target.x)
++    movement_type: MovementType,
++    max_mp: u32,
++    starts: &[GridPosition],
++) -> HashMap<GridPosition, (u32, u32)> {
++    let mut best: HashMap<GridPosition, (u32, u32, u32)> = HashMap::default();
++    let mut heap = std::collections::BinaryHeap::new();
++
++    for &start in starts {
++        if island.tiles.contains(&start) {
++            best.insert(start, (0, 0, 0));
++            heap.push(TurnPathState {
++                turns: 0,
++                mp_in_turn: 0,
++                total_mp: 0,
++                position: start,
++            });
++        }
++    }
++
++    while let Some(state) = heap.pop() {
++        let current_cost = (state.turns, state.mp_in_turn, state.total_mp);
++        if best.get(&state.position).is_some_and(|&b| current_cost > b) {
++            continue;
++        }
++
++        for (nx, ny) in map.get_adjacent(state.position.x, state.position.y) {
++            let next_pos = GridPosition { x: nx, y: ny };
++            if !island.tiles.contains(&next_pos) {
++                continue;
++            }
++            let Some(terrain) = map.get_terrain(nx, ny) else {
++                continue;
++            };
++            let Some(move_cost) = get_valid_movement_cost(registry, movement_type, terrain) else {
++                continue;
++            };
++            if move_cost > max_mp {
++                // 最大移動力を超えるコストの地形へは進入不能
++                continue;
++            }
++
++            let (next_turns, next_mp_in_turn) = if state.turns == 0 {
++                (1, move_cost)
++            } else if state.mp_in_turn.saturating_add(move_cost) <= max_mp {
++                (state.turns, state.mp_in_turn + move_cost)
++            } else {
++                (state.turns.saturating_add(1), move_cost)
++            };
++            let next_total_mp = state.total_mp.saturating_add(move_cost);
++            let next_cost = (next_turns, next_mp_in_turn, next_total_mp);
++
++            if best.get(&next_pos).is_none_or(|&b| next_cost < b) {
++                best.insert(next_pos, next_cost);
++                heap.push(TurnPathState {
++                    turns: next_turns,
++                    mp_in_turn: next_mp_in_turn,
++                    total_mp: next_total_mp,
++                    position: next_pos,
++                });
++            }
++        }
++    }
++
++    best.into_iter()
++        .map(|(pos, (turns, _, total_mp))| (pos, (turns, total_mp)))
++        .collect()
++}
++
++/// 前線からの占領優先度計算用のコンテキスト。
++/// 地形および実移動コスト・手番境界（最大移動力）を考慮した実経路距離を事前計算し、
++/// 候補施設ごとの反復呼び出しを O(1) で評価する。
++#[derive(Debug, Clone)]
++pub(in crate::ai::island_campaign_analysis) struct CaptureFrontPriorityContext {
++    friendly_distances: HashMap<GridPosition, (u32, u32)>,
++    enemy_etas: HashMap<GridPosition, u32>,
++    occupation_turns: HashMap<GridPosition, u32>,
++}
++
++impl CaptureFrontPriorityContext {
++    pub(in crate::ai::island_campaign_analysis) fn new(
++        map: &Map,
++        registry: &MasterDataRegistry,
++        island: &Island,
++        properties: &[PropertySnapshot],
++        units: &[UnitSnapshot],
++        player_id: PlayerId,
++        friendly_origins: &[GridPosition],
++    ) -> Self {
++        let (friendly_movement_type, friendly_movement) = [UnitType::Infantry, UnitType::Mech]
++            .into_iter()
++            .filter_map(|unit_type| unit_stats_for_type(registry, unit_type))
++            .min_by_key(|stats| stats.cost)
++            .map_or((MovementType::Infantry, 3), |stats| {
++                (stats.movement_type, stats.max_movement.max(1))
++            });
++
++        let friendly_distances = if !friendly_origins.is_empty() {
++            compute_turn_movement_costs(
++                map,
++                registry,
++                island,
++                friendly_movement_type,
++                friendly_movement,
++                friendly_origins,
++            )
++        } else {
++            HashMap::default()
++        };
++
++        let mut occupation_turns = HashMap::default();
++        for snapshot in properties {
++            if island.tiles.contains(&snapshot.position) {
++                occupation_turns
++                    .insert(snapshot.position, default_capture_turns(&snapshot.property));
++            }
++        }
++
++        let mut enemy_etas: HashMap<GridPosition, u32> = HashMap::default();
++        let enemy_capturers: Vec<_> = units
++            .iter()
++            .filter(|unit| unit.faction != player_id && unit.stats.can_capture)
++            .filter(|unit| unit.transporting.is_none() && island.tiles.contains(&unit.position))
++            .collect();
++
++        // 敵ユニットを (movement_type, max_movement) 別にグループ化し、
++        // 同一特性の敵ユニット群を multi-source で一度に展開する。
++        let mut enemies_by_profile: HashMap<(MovementType, u32), Vec<GridPosition>> =
++            HashMap::default();
++        for enemy in enemy_capturers {
++            let movement = enemy.stats.max_movement.max(1);
++            enemies_by_profile
++                .entry((enemy.stats.movement_type, movement))
++                .or_default()
++                .push(enemy.position);
++        }
++
++        for ((movement_type, max_mp), positions) in enemies_by_profile {
++            let enemy_costs = compute_turn_movement_costs(
++                map,
++                registry,
++                island,
++                movement_type,
++                max_mp,
++                &positions,
++            );
++            for (&target_pos, &(turns, _)) in &enemy_costs {
++                let occ_turns = occupation_turns.get(&target_pos).copied().unwrap_or(1);
++                let eta = turns.saturating_add(occ_turns);
++                enemy_etas
++                    .entry(target_pos)
++                    .and_modify(|min_eta| *min_eta = (*min_eta).min(eta))
++                    .or_insert(eta);
++            }
++        }
++
++        Self {
++            friendly_distances,
++            enemy_etas,
++            occupation_turns,
++        }
++    }
++
++    pub(in crate::ai::island_campaign_analysis) fn priority(
++        &self,
++        target: GridPosition,
++    ) -> (u32, u32, u32, usize, usize) {
++        let occupation_turns = self.occupation_turns.get(&target).copied().unwrap_or(1);
++        let (friendly_turns, front_distance) = self
++            .friendly_distances
++            .get(&target)
++            .copied()
++            .unwrap_or((u32::MAX, u32::MAX));
++        let friendly_eta = if friendly_turns == u32::MAX {
++            u32::MAX
++        } else {
++            friendly_turns.saturating_add(occupation_turns)
++        };
++        let enemy_eta = self.enemy_etas.get(&target).copied().unwrap_or(u32::MAX);
++
++        (friendly_eta, front_distance, enemy_eta, target.y, target.x)
++    }
+ }
+ 
+ fn operation_has_live_capability(operation: &ExistingCampaignOperation) -> bool {
+@@ -2729,6 +2898,313 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn land_front_prefers_navigable_nearer_property_over_sea_divided_property() {
++        let master_data = MasterDataRegistry::load().expect("master data should load");
++        let mut map = Map::new(4, 3, Terrain::Plains, GridTopology::Square);
++        // (2,0), (1,1), (2,1) を海にしてU字型地形を作る
++        map.set_terrain(2, 0, Terrain::Sea).unwrap();
++        map.set_terrain(1, 1, Terrain::Sea).unwrap();
++        map.set_terrain(2, 1, Terrain::Sea).unwrap();
++        let island = IslandMap::analyze(&map).islands.remove(0);
++        let player = PlayerId(1);
++        let property = |x, y, owner| PropertySnapshot {
++            position: GridPosition { x, y },
++            property: Property::new(Terrain::City, owner, 200),
++        };
++
++        let properties = vec![
++            property(1, 0, Some(player)), // 自軍拠点
++            property(0, 2, None),         // 実経路3歩 (マンハッタン距離3)
++            property(3, 0, None),         // 実経路8歩 (海越しの直線マンハッタン距離2)
++        ];
++
++        let target = candidate_target_position(
++            &map,
++            &master_data,
++            &island,
++            &properties,
++            &[],
++            player,
++            None,
++            false,
++        );
++        // 直線距離では (3, 0) が距離2で近く見えるが、海を迂回する実経路では (0, 2) が3歩で近い。
++        // 実経路・移動コストに基づく正しい選定なら (0, 2) が選ばれるべき。
++        assert_eq!(
++            target,
++            Some(GridPosition { x: 0, y: 2 }),
++            "海で隔てられた直線距離2の(3,0)ではなく、実経路3歩の(0,2)が選ばれること"
++        );
++    }
++
++    #[test]
++    fn land_front_rejects_unreachable_property_and_selects_reachable() {
++        let master_data = MasterDataRegistry::load().expect("master data should load");
++        let mut map = Map::new(5, 3, Terrain::Plains, GridTopology::Square);
++        // 列2をすべて海にして東西を完全に分断
++        map.set_terrain(2, 0, Terrain::Sea).unwrap();
++        map.set_terrain(2, 1, Terrain::Sea).unwrap();
++        map.set_terrain(2, 2, Terrain::Sea).unwrap();
++        let island_map = IslandMap::analyze(&map);
++        // 西側の島
++        let west_island = island_map
++            .islands
++            .iter()
++            .find(|isl| isl.tiles.contains(&GridPosition { x: 0, y: 0 }))
++            .expect("west island")
++            .clone();
++        let player = PlayerId(1);
++        let property = |x, y, owner| PropertySnapshot {
++            position: GridPosition { x, y },
++            property: Property::new(Terrain::City, owner, 200),
++        };
++
++        let properties = vec![
++            property(0, 0, Some(player)), // 自軍拠点
++            property(1, 0, None),         // 到達可能な西側都市 (実経路1歩)
++            property(4, 0, None),         // 東側の都市（この島には含まれない/到達不能）
++        ];
++
++        let target = candidate_target_position(
++            &map,
++            &master_data,
++            &west_island,
++            &properties,
++            &[],
++            player,
++            None,
++            false,
++        );
++        assert_eq!(
++            target,
++            Some(GridPosition { x: 1, y: 0 }),
++            "到達不能な都市は除外され、到達可能な都市が選ばれること"
++        );
++    }
++
++    #[test]
++    fn terrain_costs_respect_each_turns_movement_limit() {
++        let master_data = MasterDataRegistry::load().unwrap();
++        let mut map = Map::new(4, 1, Terrain::Plains, GridTopology::Square);
++        for x in 1..4 {
++            map.set_terrain(x, 0, Terrain::Forest).unwrap();
++        }
++        let island = IslandMap::analyze(&map).islands.remove(0);
++        let start = GridPosition { x: 0, y: 0 };
++        let target = GridPosition { x: 3, y: 0 };
++        // 森は歩兵の移動コスト2。移動力3では各手番に1マスしか進めない。
++        let distances = compute_turn_movement_costs(
++            &map,
++            &master_data,
++            &island,
++            MovementType::Infantry,
++            3,
++            &[start],
++        );
++        assert_eq!(distances.get(&target), Some(&(3, 6)));
++    }
++
++    #[test]
++    fn land_front_respects_turn_boundaries_on_rough_terrain() {
++        let master_data = MasterDataRegistry::load().expect("master data should load");
++        let mut map = Map::new(5, 3, Terrain::Plains, GridTopology::Square);
++        map.set_terrain(1, 0, Terrain::Forest).unwrap();
++        map.set_terrain(2, 0, Terrain::Forest).unwrap();
++        map.set_terrain(3, 0, Terrain::Forest).unwrap();
++        // 中央を海で仕切って行0と行2を独立させる
++        map.set_terrain(1, 1, Terrain::Sea).unwrap();
++        map.set_terrain(2, 1, Terrain::Sea).unwrap();
++        map.set_terrain(3, 1, Terrain::Sea).unwrap();
++
++        let island = IslandMap::analyze(&map).islands.remove(0);
++        let player = PlayerId(1);
++        let property = |x, y, owner| PropertySnapshot {
++            position: GridPosition { x, y },
++            property: Property::new(Terrain::City, owner, 200),
++        };
++
++        let properties = vec![
++            property(0, 0, Some(player)), // 自軍起点
++            property(4, 0, None), // 森ルート都市A（単純割なら早く見えるが手番境界で4ターン）
++            property(0, 2, None), // 平地ルート手前都市B (2歩、1ターン)
++        ];
++
++        let target = candidate_target_position(
++            &map,
++            &master_data,
++            &island,
++            &properties,
++            &[],
++            player,
++            None,
++            false,
++        );
++        assert_eq!(
++            target,
++            Some(GridPosition { x: 0, y: 2 }),
++            "手番境界により森ルートが遅延し、平地ルートの手前都市が優先されること"
++        );
++    }
++
++    #[test]
++    fn capture_front_priority_evaluates_different_movement_speeds() {
++        let master_data = MasterDataRegistry::load().expect("master data should load");
++        let map = Map::new(7, 1, Terrain::Plains, GridTopology::Square);
++        let island = IslandMap::analyze(&map).islands.remove(0);
++        let player = PlayerId(1);
++        let enemy = PlayerId(2);
++        let property = |x, owner| PropertySnapshot {
++            position: GridPosition { x, y: 0 },
++            property: Property::new(Terrain::City, owner, 200),
++        };
++
++        let properties = vec![
++            property(0, Some(player)),
++            property(3, None), // 中間都市 (占領ターン1)
++        ];
++
++        // 移動力3の敵歩兵 (x=6)
++        let mut fast_enemy_stats = master_data
++            .create_unit_stats(&crate::resources::master_data::UnitName(
++                UnitType::Infantry.as_str().to_string(),
++            ))
++            .unwrap();
++        fast_enemy_stats.max_movement = 3;
++        let fast_enemy = UnitSnapshot {
++            entity: Entity::from_raw(1),
++            faction: enemy,
++            position: GridPosition { x: 6, y: 0 },
++            stats: fast_enemy_stats,
++            health: Health {
++                current: 100,
++                max: 100,
++            },
++            fuel: None,
++            transporting: None,
++            free_cargo_slots: 0,
++            loaded_cargo_entities: Vec::new(),
++        };
++
++        // 移動力2の遅い敵歩兵 (x=6)
++        let mut slow_enemy_stats = master_data
++            .create_unit_stats(&crate::resources::master_data::UnitName(
++                UnitType::Infantry.as_str().to_string(),
++            ))
++            .unwrap();
++        slow_enemy_stats.max_movement = 2;
++        let slow_enemy = UnitSnapshot {
++            entity: Entity::from_raw(2),
++            faction: enemy,
++            position: GridPosition { x: 6, y: 0 },
++            stats: slow_enemy_stats,
++            health: Health {
++                current: 100,
++                max: 100,
++            },
++            fuel: None,
++            transporting: None,
++            free_cargo_slots: 0,
++            loaded_cargo_entities: Vec::new(),
++        };
++
++        let target_pos = GridPosition { x: 3, y: 0 };
++        // 速い敵の場合: 距離3 / 移動力3 = 1ターン + 占領2 = ETA 3
++        let context_fast = CaptureFrontPriorityContext::new(
++            &map,
++            &master_data,
++            &island,
++            &properties,
++            &[fast_enemy],
++            player,
++            &[GridPosition { x: 0, y: 0 }],
++        );
++        let (_, _, enemy_eta_fast, _, _) = context_fast.priority(target_pos);
++        assert_eq!(enemy_eta_fast, 3, "移動力3の敵はETA 3");
++
++        // 遅い敵の場合: 距離3 / 移動力2 = 2ターン + 占領2 = ETA 4
++        let context_slow = CaptureFrontPriorityContext::new(
++            &map,
++            &master_data,
++            &island,
++            &properties,
++            &[slow_enemy],
++            player,
++            &[GridPosition { x: 0, y: 0 }],
++        );
++        let (_, _, enemy_eta_slow, _, _) = context_slow.priority(target_pos);
++        assert_eq!(enemy_eta_slow, 4, "移動力2の敵はETA 4");
++    }
++
++    #[test]
++    fn capture_front_priority_groups_identical_enemy_movement_into_multi_source() {
++        let master_data = MasterDataRegistry::load().expect("master data should load");
++        let map = Map::new(10, 1, Terrain::Plains, GridTopology::Square);
++        let island = IslandMap::analyze(&map).islands.remove(0);
++        let player = PlayerId(1);
++        let enemy = PlayerId(2);
++        let property = |x, owner| PropertySnapshot {
++            position: GridPosition { x, y: 0 },
++            property: Property::new(Terrain::City, owner, 200),
++        };
++
++        let properties = vec![
++            property(0, Some(player)),
++            property(4, None), // 目標都市 (x=4)
++        ];
++
++        let mut enemy_stats = master_data
++            .create_unit_stats(&crate::resources::master_data::UnitName(
++                UnitType::Infantry.as_str().to_string(),
++            ))
++            .unwrap();
++        enemy_stats.max_movement = 3;
++        let far_enemy = UnitSnapshot {
++            entity: Entity::from_raw(1),
++            faction: enemy,
++            position: GridPosition { x: 9, y: 0 },
++            stats: enemy_stats.clone(),
++            health: Health {
++                current: 100,
++                max: 100,
++            },
++            fuel: None,
++            transporting: None,
++            free_cargo_slots: 0,
++            loaded_cargo_entities: Vec::new(),
++        };
++        let near_enemy = UnitSnapshot {
++            entity: Entity::from_raw(2),
++            faction: enemy,
++            position: GridPosition { x: 5, y: 0 },
++            stats: enemy_stats,
++            health: Health {
++                current: 100,
++                max: 100,
++            },
++            fuel: None,
++            transporting: None,
++            free_cargo_slots: 0,
++            loaded_cargo_entities: Vec::new(),
++        };
++
++        let context = CaptureFrontPriorityContext::new(
++            &map,
++            &master_data,
++            &island,
++            &properties,
++            &[far_enemy, near_enemy],
++            player,
++            &[GridPosition { x: 0, y: 0 }],
++        );
++        let target_pos = GridPosition { x: 4, y: 0 };
++        let (_, _, enemy_eta, _, _) = context.priority(target_pos);
++        assert_eq!(
++            enemy_eta, 3,
++            "最も近い敵からのETA 3 (移動1 + 占領2) が正しく計算されること"
++        );
++    }
++
+     /// 初期配置で敵側にも自軍物件がある盤面では、物件網から測ると占領役のいない
+     /// 敵側の物件が選ばれる。占領役の位置から測れば、占領役の近くの物件を選ぶ。
+     #[test]
+diff --git a/engine/src/ai/island_campaign_analysis/target_selection.rs b/engine/src/ai/island_campaign_analysis/target_selection.rs
+index 6d9aed6..8604058 100644
+--- a/engine/src/ai/island_campaign_analysis/target_selection.rs
++++ b/engine/src/ai/island_campaign_analysis/target_selection.rs
+@@ -1,9 +1,9 @@
+ //! 局地作戦の物件目標と前線起点の選定。
+ 
+ use super::{
+-    ExistingCampaignOperation, GridPosition, HashSet, Island, IslandCampaignDecision, Map,
+-    MasterDataRegistry, MovementType, PlayerId, PropertySnapshot, Terrain, UnitSnapshot,
+-    capture_front_priority, get_valid_movement_cost,
++    CaptureFrontPriorityContext, ExistingCampaignOperation, GridPosition, HashSet, Island,
++    IslandCampaignDecision, Map, MasterDataRegistry, MovementType, PlayerId, PropertySnapshot,
++    Terrain, UnitSnapshot, get_valid_movement_cost,
+ };
+ #[allow(clippy::too_many_arguments)]
+ pub(super) fn candidate_target_position(
+@@ -26,11 +26,10 @@ pub(super) fn candidate_target_position(
+         })
+         .map(|snapshot| snapshot.position)
+         .collect::<Vec<_>>();
+-    let target_priority = |position: GridPosition| {
+-        capture_front_priority(
+-            map, registry, island, properties, units, player_id, &origins, position,
+-        )
+-    };
++    let context = CaptureFrontPriorityContext::new(
++        map, registry, island, properties, units, player_id, &origins,
++    );
++    let target_priority = |position: GridPosition| context.priority(position);
+     targets.sort_unstable_by_key(|position| target_priority(*position));
+     let nearest = targets.first().copied();
+ 
+@@ -129,11 +128,10 @@ pub(super) fn candidate_capture_target_positions(
+         })
+         .map(|snapshot| snapshot.position)
+         .collect();
+-    let target_priority = |position: GridPosition| {
+-        capture_front_priority(
+-            map, registry, island, properties, units, player_id, &origins, position,
+-        )
+-    };
++    let context = CaptureFrontPriorityContext::new(
++        map, registry, island, properties, units, player_id, &origins,
++    );
++    let target_priority = |position: GridPosition| context.priority(position);
+     targets.sort_by_key(|position| target_priority(*position));
+ 
+     let own_capital = properties
+@@ -283,3 +281,48 @@ pub(super) fn capture_front_origins(
+     }
+     owned_property_positions()
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::ai::islands::IslandMap;
++    use crate::components::Property;
++    use crate::resources::GridTopology;
++
++    #[test]
++    fn target_selection_prefers_navigable_nearer_property_over_sea_divided_property() {
++        let master_data = MasterDataRegistry::load().expect("master data should load");
++        let mut map = Map::new(4, 3, Terrain::Plains, GridTopology::Square);
++        map.set_terrain(2, 0, Terrain::Sea).unwrap();
++        map.set_terrain(1, 1, Terrain::Sea).unwrap();
++        map.set_terrain(2, 1, Terrain::Sea).unwrap();
++        let island = IslandMap::analyze(&map).islands.remove(0);
++        let player = PlayerId(1);
++        let property = |x, y, owner| PropertySnapshot {
++            position: GridPosition { x, y },
++            property: Property::new(Terrain::City, owner, 200),
++        };
++
++        let properties = vec![
++            property(1, 0, Some(player)),
++            property(0, 2, None),
++            property(3, 0, None),
++        ];
++
++        let target = candidate_target_position(
++            &map,
++            &master_data,
++            &island,
++            &properties,
++            &[],
++            player,
++            IslandCampaignDecision::Expand,
++            None,
++        );
++        assert_eq!(
++            target,
++            Some(GridPosition { x: 0, y: 2 }),
++            "海で隔てられた直線距離2の(3,0)ではなく、実経路3歩の(0,2)が選ばれること"
++        );
++    }
++}

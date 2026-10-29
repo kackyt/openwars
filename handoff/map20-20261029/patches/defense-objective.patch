@@ -1,0 +1,1016 @@
+diff --git a/engine/src/ai/squad/objective_allocation.rs b/engine/src/ai/squad/objective_allocation.rs
+index e990b0c..3c2b4cc 100644
+--- a/engine/src/ai/squad/objective_allocation.rs
++++ b/engine/src/ai/squad/objective_allocation.rs
+@@ -14,7 +14,8 @@ use super::{
+ use crate::ai::engagement::{Combatant, expected_exchange};
+ use crate::ai::islands::{IslandId, IslandMap};
+ use crate::ai::turn_distance::{
+-    ActionTurnDistanceCache, TerrainConnectivity, calculate_action_distance_to_range,
++    ActionTurnDistanceCache, TerrainConnectivity, calculate_action_distance_respecting_zoc,
++    calculate_action_distance_to_range,
+ };
+ use crate::ai::v4::property_control::{capture_actions_needed, capture_power_from_hp};
+ use crate::collections::{HashMap, HashSet};
+@@ -82,6 +83,15 @@ struct Threat {
+     enemy: Entity,
+     eta: u32,
+     deadline: u32,
++    /// 防衛では次の占領行動を遅らせる最小ダメージ。攻勢では敵集団の排除を目指す。
++    delay_damage: Option<u32>,
++}
++
++/// 通常の攻勢と、期限までの実行が必須な自拠点防衛の到達見積り。
++#[derive(Clone, Copy)]
++enum EngagementTravel {
++    Campaign,
++    Defense,
+ }
+ 
+ /// 盤面の固定資料。
+@@ -117,6 +127,52 @@ fn turns_to_range(
+     )
+ }
+ 
++impl EngagementTravel {
++    /// 防衛は実ゲーム同様に敵ZOCで停止し、通常攻勢は従来の探索方策を保つ。
++    fn turns_to_range(
++        self,
++        board: &Board<'_>,
++        occupied: &HashMap<(usize, usize), OccupantInfo>,
++        unit: &UnitView<'_>,
++        target: GridPosition,
++        range: (u32, u32),
++        cache: &mut ActionTurnDistanceCache,
++    ) -> Option<crate::ai::turn_distance::ActionTurnDistance> {
++        match self {
++            Self::Campaign => turns_to_range(board, occupied, unit, target, range, cache),
++            Self::Defense => calculate_action_distance_respecting_zoc(
++                board.map,
++                board.data,
++                occupied,
++                (unit.position.x, unit.position.y),
++                (target.x, target.y),
++                unit.stats.movement_type,
++                unit.stats.max_movement,
++                unit.fuel,
++                range.0,
++                range.1,
++                unit.owner,
++                cache,
++            ),
++        }
++    }
++
++    fn ready_turn(
++        self,
++        unit: &UnitView<'_>,
++        route: crate::ai::turn_distance::ActionTurnDistance,
++    ) -> u32 {
++        match self {
++            // 従来の攻勢見積りは変更しない。
++            Self::Campaign => route.turns.saturating_add(u32::from(
++                unit.stats.min_range > 1 && route.requires_movement,
++            )),
++            // ZOCを考慮した距離には移動後の間接攻撃準備手番が既に含まれる。
++            Self::Defense => route.turns,
++        }
++    }
++}
++
+ fn base_damage(chart: &DamageChart, attacker: UnitType, defender: UnitType) -> u32 {
+     chart.get_base_damage(attacker, defender).unwrap_or(0).max(
+         chart
+@@ -217,6 +273,7 @@ fn objective_threats(
+                     enemy: enemy.entity,
+                     eta,
+                     deadline,
++                    delay_damage: None,
+                 })
+         })
+         .collect::<Vec<_>>();
+@@ -224,12 +281,110 @@ fn objective_threats(
+     threats
+ }
+ 
++/// 現在の占領完了手数を1手以上延ばすために必要な最小ダメージ。
++fn minimum_capture_delay_damage(capture_points: u32, hp: u32) -> u32 {
++    let actions = capture_actions_needed(capture_points, capture_power_from_hp(hp));
++    if actions == 0 {
++        // 占領済みの異常な入力では、敵を排除するまで安全と見なさない。
++        return hp;
++    }
++    // 残り占領ポイントが actions 回の占領力より大きければ、必要手数が増える。
++    // 占領力はHPの切り上げ10刻みなので、許容HPも10刻みで切り下げる。
++    let max_power = capture_points.saturating_sub(1) / actions;
++    let max_hp = (max_power / 10).saturating_mul(10);
++    hp.saturating_sub(max_hp)
++}
++
++/// 自軍所有施設を奪おうと迫る敵占領役。
++///
++/// 敵から見た最短の占領先を求め、それが自軍施設である場合だけを脅威とする。
++/// 手近な中立施設を取れる敵や、到達不能な敵は除外する（[`crate::ai::v4::home_defense`] と共通の判定）。
++fn defense_threats(
++    world: &World,
++    board: &Board<'_>,
++    player: PlayerId,
++    island: IslandId,
++    enemies: &[&UnitView<'_>],
++    cache: &mut ActionTurnDistanceCache,
++) -> Vec<Threat> {
++    let empty = HashMap::default();
++    let mut properties = world
++        .iter_entities()
++        .filter_map(|entity| {
++            let position = *entity.get::<GridPosition>()?;
++            let property = *entity.get::<Property>()?;
++            (board
++                .islands
++                .get_island_at(&position)
++                .is_some_and(|found| found.id == island))
++            .then_some((position, property))
++        })
++        .collect::<Vec<_>>();
++    properties.sort_unstable_by_key(|(position, _)| (position.y, position.x));
++
++    let mut threats = Vec::new();
++    for enemy in enemies.iter().filter(|enemy| {
++        enemy.owner != player
++            && enemy.stats.can_capture
++            && board
++                .islands
++                .get_island_at(&enemy.position)
++                .is_some_and(|found| found.id == island)
++    }) {
++        // 一体の占領役を複数拠点へ同時に進ませない。まず敵から見た最早の占領先を選ぶ。
++        // 手近な中立を取れる敵を、遠い自軍拠点への即時脅威として数えない。
++        let target = properties
++            .iter()
++            .filter(|(_, property)| {
++                property.owner_id != Some(enemy.owner) && property.max_capture_points > 0
++            })
++            .filter_map(|(position, property)| {
++                let arrival = turns_to_range(board, &empty, enemy, *position, (0, 0), cache)?
++                    .turns
++                    .max(1);
++                let actions = capture_actions_needed(
++                    property.capture_points,
++                    capture_power_from_hp(enemy.hp),
++                );
++                Some((
++                    arrival.saturating_add(actions),
++                    arrival,
++                    *position,
++                    *property,
++                ))
++            })
++            .min_by_key(|(completion, arrival, position, _)| {
++                (*completion, *arrival, position.y, position.x)
++            });
++        let Some((completion, arrival, _, property)) = target else {
++            continue;
++        };
++        if property.owner_id == Some(player) {
++            // 防衛の最終自軍手番はoffsetで completion-2。
++            // この割当器の移動後初撃は1始まり（現在地からの射撃のみ0）なので、
++            // 今手番に移動して攻撃する候補を落とさないよう同じ時間軸へ換算する。
++            threats.push(Threat {
++                enemy: enemy.entity,
++                eta: arrival,
++                deadline: completion.saturating_sub(1),
++                delay_damage: Some(minimum_capture_delay_damage(
++                    property.capture_points,
++                    enemy.hp,
++                )),
++            });
++        }
++    }
++    threats.sort_unstable_by_key(|threat| (threat.deadline, threat.enemy.to_bits()));
++    threats
++}
++
+ /// 1体の部隊が敵集団へ対処する見積り。集団内で最も早く有効打を出せる敵を基準にする。
+ struct Candidate {
+     member: usize,
+     ready: u32,
+     damage: u32,
+     loss: u32,
++    firing_position: GridPosition,
+ }
+ 
+ /// 割当の途中経過。部隊は1つの集団だけを受け持ち、集団に入った敵は再び数えない。
+@@ -249,12 +404,13 @@ impl Allocation {
+         unit: &UnitView<'_>,
+         group: &[&UnitView<'_>],
+         deadline: u32,
++        travel: EngagementTravel,
+         cache: &mut ActionTurnDistanceCache,
+     ) -> Option<Candidate> {
+         group
+             .iter()
+             .filter_map(|enemy| {
+-                let route = turns_to_range(
++                let route = travel.turns_to_range(
+                     board,
+                     occupied,
+                     unit,
+@@ -262,9 +418,7 @@ impl Allocation {
+                     (unit.stats.min_range, unit.stats.max_range),
+                     cache,
+                 )?;
+-                // 間接攻撃は移動した手番に撃てないため、構え直しの1手番を加える。
+-                let setup = u32::from(unit.stats.min_range > 1 && route.requires_movement);
+-                let ready = route.turns.saturating_add(setup);
++                let ready = travel.ready_turn(unit, route);
+                 if ready > deadline {
+                     return None;
+                 }
+@@ -282,11 +436,101 @@ impl Allocation {
+                     ready,
+                     damage: exchange.damage,
+                     loss: exchange.loss,
++                    firing_position: route.firing_position,
+                 })
+             })
+             .min_by_key(|candidate| (candidate.ready, Reverse(candidate.damage), candidate.loss))
+     }
+ 
++    /// 期限内に占領を遅らせられる最小限の防衛役を、射点も含めて仮予約する。
++    /// 必要な損害を満たせない場合は途中の割当を確定せず、他の作戦へ戦力を残す。
++    #[allow(clippy::too_many_arguments)]
++    fn assign_defenses(
++        &mut self,
++        board: &Board<'_>,
++        occupied: &mut HashMap<(usize, usize), OccupantInfo>,
++        fighters: &[UnitView<'_>],
++        enemies: &[&UnitView<'_>],
++        threats: &[Threat],
++        cache: &mut ActionTurnDistanceCache,
++    ) {
++        for threat in threats {
++            if self.handled.contains(&threat.enemy) {
++                continue;
++            }
++            let Some(target) = enemies.iter().find(|enemy| enemy.entity == threat.enemy) else {
++                continue;
++            };
++            let Some(mut remaining) = threat.delay_damage.filter(|damage| *damage > 0) else {
++                continue;
++            };
++            let mut reserved_occupancy = occupied.clone();
++            let mut selected = Vec::new();
++            while remaining > 0 {
++                let candidate = fighters
++                    .iter()
++                    .enumerate()
++                    .filter(|(index, _)| !self.assigned[*index])
++                    .filter(|(index, _)| {
++                        !selected
++                            .iter()
++                            .any(|candidate: &Candidate| candidate.member == *index)
++                    })
++                    .filter_map(|(index, unit)| {
++                        Self::candidate(
++                            board,
++                            &reserved_occupancy,
++                            index,
++                            unit,
++                            &[*target],
++                            threat.deadline,
++                            EngagementTravel::Defense,
++                            cache,
++                        )
++                    })
++                    .min_by_key(|candidate| {
++                        (
++                            candidate.ready,
++                            Reverse(candidate.damage.min(remaining)),
++                            candidate.loss,
++                            fighters[candidate.member].entity.to_bits(),
++                        )
++                    });
++                let Some(candidate) = candidate else { break };
++                remaining = remaining.saturating_sub(candidate.damage);
++                let unit = &fighters[candidate.member];
++                reserved_occupancy.insert(
++                    (candidate.firing_position.x, candidate.firing_position.y),
++                    OccupantInfo {
++                        player_id: unit.owner,
++                        is_transport: false,
++                        unit_type: unit.stats.unit_type,
++                        loadable_types: Vec::new(),
++                        free_slots: 0,
++                    },
++                );
++                selected.push(candidate);
++            }
++            if remaining > 0 {
++                continue;
++            }
++            let members = selected
++                .into_iter()
++                .map(|candidate| {
++                    self.assigned[candidate.member] = true;
++                    fighters[candidate.member].entity
++                })
++                .collect();
++            self.handled.insert(target.entity);
++            *occupied = reserved_occupancy;
++            self.responsibilities.push(CampaignResponsibility {
++                mission_type: MissionType::Attack,
++                target: target.position,
++                members,
++            });
++        }
++    }
++
+     /// 目標の敵と、その周囲で1手番以内に反撃へ加われる敵をまとめた集団。
+     /// 1体ずつの交換だけで必要数を決めると、周囲の敵からの反撃で小部隊を失う。
+     fn support_group<'a, 'w>(
+@@ -317,6 +561,7 @@ impl Allocation {
+ 
+     /// 対処できる部隊が少ない敵から順に、集団の合計HPを削り切るまで、到着の早い順・
+     /// 有効打の大きい順・損失の少ない順に部隊を割り当てる。
++    #[allow(clippy::too_many_arguments)]
+     fn assign(
+         &mut self,
+         board: &Board<'_>,
+@@ -344,6 +589,7 @@ impl Allocation {
+                             unit,
+                             &[*enemy],
+                             threat.deadline,
++                            EngagementTravel::Campaign,
+                             cache,
+                         )
+                         .is_some()
+@@ -367,7 +613,16 @@ impl Allocation {
+                 .enumerate()
+                 .filter(|(index, _)| !self.assigned[*index])
+                 .filter_map(|(index, unit)| {
+-                    Self::candidate(board, occupied, index, unit, &group, threat.deadline, cache)
++                    Self::candidate(
++                        board,
++                        occupied,
++                        index,
++                        unit,
++                        &group,
++                        threat.deadline,
++                        EngagementTravel::Campaign,
++                        cache,
++                    )
+                 })
+                 .collect::<Vec<_>>();
+             if candidates.is_empty() {
+@@ -561,7 +816,7 @@ pub(super) fn objective_combat_responsibilities(
+         .filter_map(|entity| entity.get::<Faction>().map(|_| entity.id()))
+         .filter_map(|entity| unit_view(world, entity))
+         .collect::<Vec<_>>();
+-    let occupied = all_units
++    let mut occupied = all_units
+         .iter()
+         .map(|unit| {
+             (
+@@ -603,10 +858,21 @@ pub(super) fn objective_combat_responsibilities(
+         handled: HashSet::default(),
+         responsibilities: Vec::new(),
+     };
+-    // 1. 目的施設の占領を今すぐ妨げる敵。
++    // 1. 自軍所有施設を奪おうと迫る敵（最優先の防衛）。
++    let defenses = defense_threats(world, &board, player, island, &enemies, &mut cache);
++    allocation.assign_defenses(
++        &board,
++        &mut occupied,
++        &fighters,
++        &enemies,
++        &defenses,
++        &mut cache,
++    );
++
++    // 2. 目的施設の占領を今すぐ妨げる敵。
+     allocation.assign(&board, &occupied, &fighters, &enemies, &threats, &mut cache);
+ 
+-    // 2. 余った戦力は、島内に残る未確保施設（敵の工場・首都を含む）を守る敵へ回す。
++    // 3. 余った戦力は、島内に残る未確保施設（敵の工場・首都を含む）を守る敵へ回す。
+     //    施設から離れて動く敵は対象外にし、島中の敵を追い回さない。
+     let remaining_properties = world
+         .iter_entities()
+diff --git a/engine/src/ai/squad/objective_allocation/tests.rs b/engine/src/ai/squad/objective_allocation/tests.rs
+index 7e7feb7..0ac6e5b 100644
+--- a/engine/src/ai/squad/objective_allocation/tests.rs
++++ b/engine/src/ai/squad/objective_allocation/tests.rs
+@@ -1,7 +1,7 @@
+ //! 施設を目的とする戦闘割当の振る舞い。兵種相性・到着・必要数・追撃範囲を固定する。
+ 
+ use super::*;
+-use crate::components::{Ammo, Faction, Fuel, Health, Property};
++use crate::components::{ActionCompleted, Ammo, Faction, Fuel, HasMoved, Health, Property};
+ use crate::resources::{GridTopology, MovementType, Terrain};
+ 
+ const ME: PlayerId = PlayerId(1);
+@@ -73,6 +73,8 @@ fn unit(world: &mut World, owner: PlayerId, kind: UnitType, at: GridPosition, hp
+                 cost: 7000,
+                 ..UnitStats::mock()
+             },
++            HasMoved(false),
++            ActionCompleted(false),
+         ))
+         .id()
+ }
+@@ -98,6 +100,59 @@ fn allocate(
+     )
+ }
+ 
++/// 防衛段階だけを観測し、後段の正当な進軍・攻撃と区別する。
++fn allocate_defenses(world: &World, members: &[Entity], at: GridPosition) -> Allocation {
++    let board = Board {
++        map: world.resource::<Map>(),
++        data: world.resource::<MasterDataRegistry>(),
++        chart: world.resource::<DamageChart>(),
++        islands: world.resource::<IslandMap>(),
++    };
++    let all = world
++        .iter_entities()
++        .filter_map(|entity| unit_view(world, entity.id()))
++        .collect::<Vec<_>>();
++    let fighters = members
++        .iter()
++        .filter_map(|entity| unit_view(world, *entity))
++        .collect::<Vec<_>>();
++    let enemies = all
++        .iter()
++        .filter(|unit| unit.owner != ME)
++        .collect::<Vec<_>>();
++    let mut occupied = all
++        .iter()
++        .map(|unit| {
++            (
++                (unit.position.x, unit.position.y),
++                OccupantInfo {
++                    player_id: unit.owner,
++                    is_transport: false,
++                    unit_type: unit.stats.unit_type,
++                    loadable_types: Vec::new(),
++                    free_slots: 0,
++                },
++            )
++        })
++        .collect::<HashMap<_, _>>();
++    let mut cache = ActionTurnDistanceCache::default();
++    let threats = defense_threats(world, &board, ME, island(world, at), &enemies, &mut cache);
++    let mut result = Allocation {
++        assigned: vec![false; fighters.len()],
++        handled: HashSet::default(),
++        responsibilities: Vec::new(),
++    };
++    result.assign_defenses(
++        &board,
++        &mut occupied,
++        &fighters,
++        &enemies,
++        &threats,
++        &mut cache,
++    );
++    result
++}
++
+ fn responsibility_of(
+     responsibilities: &[CampaignResponsibility],
+     member: Entity,
+@@ -411,3 +466,487 @@ fn capital_assault_attacks_with_effective_units_and_stages_the_rest() {
+     assert_eq!(for_missiles.mission_type, MissionType::Defense);
+     assert_eq!(for_missiles.target, geometry.staging);
+ }
++
++/// (a) 自軍施設が未喪失のまま期限内に来る敵を観測し、行動可能な非占領戦闘役が
++/// 期限に間に合う責務（Attack）を出す。
++#[test]
++fn threat_approaching_own_property_is_prioritized_for_defense_before_loss() {
++    let objective = pos(20, 1);
++    let mut world = board(30, 3, objective);
++    let own_city = pos(6, 1);
++    world.spawn((own_city, Property::new(Terrain::City, Some(ME), 200)));
++
++    let capturer = unit(&mut world, ME, UnitType::Infantry, pos(19, 1), 100);
++    let tank = unit(&mut world, ME, UnitType::Tank, pos(4, 1), 100);
++    let enemy_infantry_at = pos(10, 1);
++    unit(
++        &mut world,
++        ENEMY,
++        UnitType::Infantry,
++        enemy_infantry_at,
++        100,
++    );
++
++    let responsibilities = allocate(&world, &[tank], &[capturer], objective);
++
++    let for_tank = responsibility_of(&responsibilities, tank);
++    assert_eq!(
++        for_tank.mission_type,
++        MissionType::Attack,
++        "自軍都市を奪いに来る敵歩兵へ攻撃責務を割り当てる"
++    );
++    assert_eq!(
++        for_tank.target, enemy_infantry_at,
++        "標的は自軍都市へ迫る敵歩兵の位置"
++    );
++}
++
++/// 占領力の10刻みを考慮し、次の完了手番を延ばす最小被害を求める。
++#[test]
++fn minimum_defense_damage_respects_capture_power_rounding() {
++    assert_eq!(minimum_capture_delay_damage(200, 100), 10);
++    assert_eq!(minimum_capture_delay_damage(100, 100), 10);
++    assert_eq!(minimum_capture_delay_damage(40, 100), 70);
++    assert_eq!(minimum_capture_delay_damage(1, 100), 100);
++    assert_eq!(minimum_capture_delay_damage(0, 100), 100);
++}
++
++/// 自拠点への占領を遅らせるのに十分な攻撃があれば、残りの戦力を本来の攻勢へ残す。
++#[test]
++fn defense_uses_only_force_needed_to_delay_capture() {
++    let objective = pos(25, 1);
++    let mut world = board(30, 3, objective);
++    let own_city = pos(6, 1);
++    world.spawn((own_city, Property::new(Terrain::City, Some(ME), 200)));
++    let tanks = [pos(3, 0), pos(3, 2)].map(|at| unit(&mut world, ME, UnitType::Tank, at, 100));
++    let enemy_at = pos(10, 1);
++    unit(&mut world, ENEMY, UnitType::Infantry, enemy_at, 100);
++
++    let responsibilities = allocate(&world, &tanks, &[], objective);
++    let interceptors = responsibilities
++        .iter()
++        .filter(|responsibility| {
++            responsibility.mission_type == MissionType::Attack && responsibility.target == enemy_at
++        })
++        .flat_map(|responsibility| responsibility.members.iter().copied())
++        .collect::<Vec<_>>();
++    assert_eq!(
++        interceptors.len(),
++        1,
++        "一撃で占領が遅れる場合は、もう一両を攻勢へ残す"
++    );
++}
++
++/// 期限内の全戦力を使っても占領を遅らせられない場合、実行不能な防衛へ縛らない。
++#[test]
++fn defense_does_not_consume_force_that_cannot_delay_capture() {
++    let objective = pos(40, 1);
++    let mut world = board(60, 3, objective);
++    let own_city = pos(6, 1);
++    let mut city = Property::new(Terrain::City, Some(ME), 200);
++    city.capture_points = 100;
++    world.spawn((own_city, city));
++    world
++        .resource_mut::<DamageChart>()
++        .insert_damage(UnitType::Tank, UnitType::Infantry, 5);
++    world.resource_mut::<DamageChart>().insert_secondary_damage(
++        UnitType::Tank,
++        UnitType::Infantry,
++        5,
++    );
++    let tank = unit(&mut world, ME, UnitType::Tank, pos(3, 1), 100);
++    unit(&mut world, ENEMY, UnitType::Infantry, own_city, 100);
++    let responsibilities = allocate(&world, &[tank], &[], objective);
++    let for_tank = responsibility_of(&responsibilities, tank);
++    assert_ne!(
++        for_tank.target, own_city,
++        "次の占領手番を延ばせない迎撃に部隊を拘束しない"
++    );
++}
++
++/// 2体に必要な迎撃でも、同じ射点を同時に使う実行不能な案を採らない。
++#[test]
++fn defense_does_not_count_one_firing_tile_twice() {
++    let objective = pos(40, 0);
++    let mut world = board(60, 1, objective);
++    let own_city = pos(6, 0);
++    let mut city = Property::new(Terrain::City, Some(ME), 200);
++    city.capture_points = 40;
++    world.spawn((own_city, city));
++    world
++        .resource_mut::<DamageChart>()
++        .insert_damage(UnitType::Tank, UnitType::Infantry, 40);
++    world.resource_mut::<DamageChart>().insert_secondary_damage(
++        UnitType::Tank,
++        UnitType::Infantry,
++        40,
++    );
++    let tanks = [pos(0, 0), pos(1, 0)].map(|at| unit(&mut world, ME, UnitType::Tank, at, 100));
++    unit(&mut world, ENEMY, UnitType::Infantry, own_city, 100);
++    let allocation = allocate_defenses(&world, &tanks, own_city);
++    assert!(
++        allocation.responsibilities.is_empty(),
++        "1つの射点を2体が同時に使う防衛計画は成立しない"
++    );
++    assert!(
++        allocation.assigned.iter().all(|assigned| !assigned),
++        "不成立の仮予約を確定しない"
++    );
++}
++
++/// 別々の合法射点がある場合、2体で占領を遅らせる防衛は成立する。
++#[test]
++fn defense_uses_distinct_firing_tiles_when_two_hits_are_needed() {
++    let objective = pos(40, 1);
++    let mut world = board(60, 3, objective);
++    let own_city = pos(6, 1);
++    let mut city = Property::new(Terrain::City, Some(ME), 200);
++    city.capture_points = 40;
++    world.spawn((own_city, city));
++    world
++        .resource_mut::<DamageChart>()
++        .insert_damage(UnitType::Tank, UnitType::Infantry, 40);
++    world.resource_mut::<DamageChart>().insert_secondary_damage(
++        UnitType::Tank,
++        UnitType::Infantry,
++        40,
++    );
++    let tanks = [pos(0, 0), pos(0, 2)].map(|at| unit(&mut world, ME, UnitType::Tank, at, 100));
++    unit(&mut world, ENEMY, UnitType::Infantry, own_city, 100);
++    let allocation = allocate_defenses(&world, &tanks, own_city);
++    assert_eq!(allocation.responsibilities.len(), 1);
++    assert_eq!(
++        allocation.responsibilities[0].members.len(),
++        2,
++        "異なる射点から2回攻撃できる"
++    );
++}
++
++/// 行動済みの部隊を、次の敵手番より前に攻撃できる防衛役として数えない。
++#[test]
++fn defense_does_not_reuse_a_unit_that_already_acted() {
++    let objective = pos(40, 1);
++    let mut world = board(60, 3, objective);
++    let own_city = pos(6, 1);
++    let mut city = Property::new(Terrain::City, Some(ME), 200);
++    city.capture_points = 100;
++    world.spawn((own_city, city));
++    let tank = unit(&mut world, ME, UnitType::Tank, pos(3, 1), 100);
++    world.get_mut::<ActionCompleted>(tank).unwrap().0 = true;
++    unit(&mut world, ENEMY, UnitType::Infantry, own_city, 100);
++    let allocation = allocate_defenses(&world, &[tank], own_city);
++    assert!(allocation.responsibilities.is_empty(), "行動済みの部隊は次の敵占領より先に攻撃できない");
++}
++
++/// 最後の占領手番の前に、今手番の移動攻撃が間に合う場合は防衛責務を発行する。
++#[test]
++fn defense_can_move_and_attack_before_the_next_capture_action() {
++    // 遠方の攻略目標には敵が間に合わないため、緊急防衛だけがこの敵の担当理由になる。
++    let objective = pos(40, 1);
++    let mut world = board(60, 3, objective);
++    let own_city = pos(6, 1);
++    let mut city = Property::new(Terrain::City, Some(ME), 200);
++    city.capture_points = 100;
++    world.spawn((own_city, city));
++    let tank = unit(&mut world, ME, UnitType::Tank, pos(3, 1), 100);
++    unit(&mut world, ENEMY, UnitType::Infantry, own_city, 100);
++
++    let responsibilities = allocate(&world, &[tank], &[], objective);
++    let for_tank = responsibility_of(&responsibilities, tank);
++    assert_eq!(for_tank.mission_type, MissionType::Attack);
++    assert_eq!(
++        for_tank.target, own_city,
++        "移動後に今手番攻撃できるなら占領を阻止する"
++    );
++}
++
++/// 敵ZOCで今手番の射点へ届かない部隊を、期限直前の迎撃役にしない。
++#[test]
++fn defense_does_not_assume_movement_through_enemy_zoc_in_one_turn() {
++    let objective = pos(40, 1);
++    let mut world = board(60, 3, objective);
++    let own_city = pos(6, 1);
++    let mut city = Property::new(Terrain::City, Some(ME), 200);
++    city.capture_points = 100;
++    world.spawn((own_city, city));
++    let tank = unit(&mut world, ME, UnitType::Tank, pos(0, 1), 100);
++    unit(&mut world, ENEMY, UnitType::Infantry, own_city, 100);
++    unit(&mut world, ENEMY, UnitType::Tank, pos(3, 0), 100);
++
++    let occupancy = [(own_city, UnitType::Infantry), (pos(3, 0), UnitType::Tank)]
++        .into_iter()
++        .map(|(position, unit_type)| {
++            (
++                (position.x, position.y),
++                OccupantInfo {
++                    player_id: ENEMY,
++                    is_transport: false,
++                    unit_type,
++                    loadable_types: Vec::new(),
++                    free_slots: 0,
++                },
++            )
++        })
++        .collect();
++    let map = world.resource::<Map>();
++    let stats = world.get::<UnitStats>(tank).unwrap();
++    let reachable = crate::systems::movement::calculate_reachable_tiles(
++        map,
++        &occupancy,
++        (0, 1),
++        stats.movement_type,
++        stats.max_movement,
++        99,
++        ME,
++        stats.unit_type,
++        world.resource::<MasterDataRegistry>(),
++    );
++    assert!(
++        reachable
++            .iter()
++            .all(|(x, y)| map.distance(*x, *y, own_city.x, own_city.y) > 1),
++        "fixture上は敵ZOCにより今手番の射点に届かない: {reachable:?}"
++    );
++    let responsibilities = allocate(&world, &[tank], &[], objective);
++    let for_tank = responsibility_of(&responsibilities, tank);
++    assert_ne!(
++        for_tank.target, own_city,
++        "期限に届かない迎撃を成立扱いしない"
++    );
++}
++
++/// (b-1) 手近な中立施設を先取りする敵は、遠くの自軍施設への防衛脅威として数えない。
++#[test]
++fn neutral_property_preempting_enemy_is_not_treated_as_defense_threat() {
++    let objective = pos(28, 1);
++    let mut world = board(30, 3, objective);
++    let own_city = pos(4, 1);
++    world.spawn((own_city, Property::new(Terrain::City, Some(ME), 200)));
++    let neutral_city = pos(22, 1);
++    world.spawn((neutral_city, Property::new(Terrain::City, None, 200)));
++
++    let capturer = unit(&mut world, ME, UnitType::Infantry, pos(27, 1), 100);
++    let tank = unit(&mut world, ME, UnitType::Tank, pos(3, 1), 100);
++    // 敵歩兵は(14,1)にいる。中立都市(22,1)へは距離8（到着3手番・完了5手番）、自軍都市(4,1)へは距離10（到着4手番・完了6手番）。
++    // 最短占領目標は中立都市であり、かつ中立都市から離れているため防衛脅威にも守備敵にもならない。
++    unit(&mut world, ENEMY, UnitType::Infantry, pos(14, 1), 100);
++
++    let responsibilities = allocate(&world, &[tank], &[capturer], objective);
++
++    let for_tank = responsibility_of(&responsibilities, tank);
++    // 敵歩兵は中立都市を狙っているため、自軍都市への脅威として戦車を引き抜かず、
++    // 戦車は前進目標の護衛・前衛に回る。
++    assert_eq!(for_tank.mission_type, MissionType::Defense);
++    assert_eq!(for_tank.target, objective);
++}
++
++/// (b-2) 期限に間に合わない遠方の敵には防衛責務を無理に割り当てない。
++#[test]
++fn far_threat_that_cannot_be_reached_in_time_is_not_assigned() {
++    let objective = pos(20, 1);
++    let mut world = board(50, 3, objective);
++    let own_city = pos(6, 1);
++    world.spawn((own_city, Property::new(Terrain::City, Some(ME), 200)));
++
++    let capturer = unit(&mut world, ME, UnitType::Infantry, pos(19, 1), 100);
++    // 戦車が遠くにおり、敵の占領完了に間に合わない
++    let tank = unit(&mut world, ME, UnitType::Tank, pos(35, 1), 100);
++    let enemy_infantry_at = pos(8, 1);
++    unit(
++        &mut world,
++        ENEMY,
++        UnitType::Infantry,
++        enemy_infantry_at,
++        100,
++    );
++
++    let responsibilities = allocate(&world, &[tank], &[capturer], objective);
++
++    let for_tank = responsibility_of(&responsibilities, tank);
++    // 間に合わないので自軍都市防衛にはならず、前進目標へ向かう
++    assert_eq!(for_tank.mission_type, MissionType::Defense);
++    assert_eq!(for_tank.target, objective);
++}
++
++/// (b-3) 到達不能な敵（海に阻まれるなど）には防衛責務を割り当てない。
++#[test]
++fn unreachable_defense_threat_is_not_assigned() {
++    let objective = pos(10, 1);
++    let mut world = board(20, 5, objective);
++    let own_city = pos(2, 1);
++    world.spawn((own_city, Property::new(Terrain::City, Some(ME), 200)));
++
++    let capturer = unit(&mut world, ME, UnitType::Infantry, pos(9, 1), 100);
++    let tank = unit(&mut world, ME, UnitType::Tank, pos(1, 1), 100);
++    // 敵歩兵の周りを海で囲んで到達不能にする
++    let enemy_infantry_at = pos(6, 1);
++    unit(
++        &mut world,
++        ENEMY,
++        UnitType::Infantry,
++        enemy_infantry_at,
++        100,
++    );
++    let mut map = world.resource::<Map>().clone();
++    for y in 0..5 {
++        map.set_terrain(5, y, Terrain::Sea).unwrap();
++    }
++    world.insert_resource(IslandMap::analyze(&map));
++    world.insert_resource(map);
++
++    let responsibilities = allocate(&world, &[tank], &[capturer], objective);
++
++    let for_tank = responsibility_of(&responsibilities, tank);
++    // 到達不能なので敵へは割り当てられない
++    assert_ne!(for_tank.target, enemy_infantry_at);
++}
++
++/// (b-4) 複数の防衛脅威があっても、1体の戦闘役が二重に割り当てられることはない。
++#[test]
++fn multiple_defense_threats_do_not_double_assign_single_unit() {
++    let objective = pos(25, 1);
++    let mut world = board(30, 3, objective);
++    let city1 = pos(6, 0);
++    let city2 = pos(6, 2);
++    world.spawn((city1, Property::new(Terrain::City, Some(ME), 200)));
++    world.spawn((city2, Property::new(Terrain::City, Some(ME), 200)));
++
++    let tank = unit(&mut world, ME, UnitType::Tank, pos(4, 1), 100);
++    // 2体の敵歩兵が別々の自軍都市へ向かっている
++    unit(&mut world, ENEMY, UnitType::Infantry, pos(10, 0), 100);
++    unit(&mut world, ENEMY, UnitType::Infantry, pos(10, 2), 100);
++
++    let responsibilities = allocate(&world, &[tank], &[], objective);
++
++    // 戦車は1つの任務にのみ割り当てられる
++    let count = responsibilities
++        .iter()
++        .filter(|r| r.members.contains(&tank))
++        .count();
++    assert_eq!(
++        count, 1,
++        "戦車は1つの脅威にのみ割り当てられ、二重割当されない"
++    );
++}
++
++/// (b-5) 既存の占領歩兵は防衛戦闘役に転用されない。
++#[test]
++fn capturers_are_not_diverted_to_defense_combat() {
++    let objective = pos(20, 1);
++    let mut world = board(30, 3, objective);
++    let own_city = pos(6, 1);
++    world.spawn((own_city, Property::new(Terrain::City, Some(ME), 200)));
++
++    let capturer = unit(&mut world, ME, UnitType::Infantry, pos(5, 1), 100);
++    let enemy_infantry_at = pos(10, 1);
++    unit(
++        &mut world,
++        ENEMY,
++        UnitType::Infantry,
++        enemy_infantry_at,
++        100,
++    );
++
++    // members（戦闘役候補）には含めず、capturersとしてのみ渡す
++    let responsibilities = allocate(&world, &[], &[capturer], objective);
++
++    // 占領役は戦闘責務のmembersには入らない
++    let assigned_combat = responsibilities
++        .iter()
++        .any(|r| r.members.contains(&capturer));
++    assert!(
++        !assigned_combat,
++        "占領契約を持つ歩兵を防衛戦闘役に転用しない"
++    );
++}
++
++/// (a-実命令) 防衛責務を受けた戦闘役が、実際に敵歩兵へ向かって移動・攻撃する実命令を出す。
++#[test]
++fn defense_responsibility_issues_actual_movement_command_toward_threat() {
++    let _path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
++    let objective = pos(20, 1);
++    let mut world = board(30, 3, objective);
++    let own_city = pos(6, 1);
++    world.spawn((own_city, Property::new(Terrain::City, Some(ME), 200)));
++
++    let tank = unit(&mut world, ME, UnitType::Tank, pos(4, 1), 100);
++    let enemy_infantry_at = pos(10, 1);
++    let enemy = unit(
++        &mut world,
++        ENEMY,
++        UnitType::Infantry,
++        enemy_infantry_at,
++        100,
++    );
++
++    let responsibilities = allocate(&world, &[tank], &[], objective);
++    let for_tank = responsibility_of(&responsibilities, tank);
++    assert_eq!(for_tank.mission_type, MissionType::Attack);
++    assert_eq!(for_tank.target, enemy_infantry_at);
++
++    world.insert_resource(crate::resources::MatchState::default());
++    world.insert_resource(crate::ai::wait_probe::WaitProbe::default());
++    let mut ai = crate::ai::PlayerAiSettings::new();
++    ai.set_version(ME, crate::ai::AiVersion::V4);
++    world.insert_resource(ai);
++    world.insert_resource(crate::ai::squad::SquadManager::default());
++    world.insert_resource(crate::ai::operation_assignment::UnitOperationRegistry::default());
++
++    let mut manager = world
++        .remove_resource::<crate::ai::squad::SquadManager>()
++        .unwrap();
++    let squad_id = {
++        let mut proposals =
++            crate::ai::planning::assignment::OperationLedger::proposals(&mut manager);
++        let mut squad = proposals.create_owned(
++            for_tank.mission_type.clone(),
++            ME,
++            std::collections::BTreeSet::from_iter([tank]),
++            None,
++            Vec::new(),
++        );
++        squad.plan_mut().target = Some(for_tank.target);
++        squad.plan_mut().target_island = Some(island(&world, pos(4, 1)));
++        squad.plan_mut().phase = crate::ai::squad::MissionPhase::MovingToTarget;
++        squad.plan_mut().departure_authorized = true;
++        squad.id
++    };
++    world.insert_resource(manager);
++    let island_id = island(&world, pos(4, 1));
++    world
++        .resource_mut::<crate::ai::operation_assignment::UnitOperationRegistry>()
++        .apply_assign(
++            crate::ai::planning::assignment::LedgerKey::fixture(),
++            tank,
++            crate::ai::operation_assignment::UnitOperationAssignment {
++                owner: crate::ai::operation_assignment::OperationOwner::Campaign {
++                    player_id: ME,
++                    island_id,
++                },
++                squad_id: Some(squad_id),
++                role: crate::ai::operation_assignment::OperationUnitRole::Member,
++                assigned_turn: 1,
++            },
++        );
++
++    let (entity, command) =
++        crate::ai::tactics::v2::decide_action(&mut world, ME, &HashSet::default())
++            .expect("実命令が出る");
++    assert_eq!(entity, tank);
++    match command {
++        crate::ai::command::AiCommand::Wait { target_pos } => {
++            assert!(
++                target_pos.x > 4,
++                "敵歩兵の方向（東）へ前進する位置で待機/射撃構え: {target_pos:?}"
++            );
++        }
++        crate::ai::command::AiCommand::Attack {
++            target_pos,
++            target_entity,
++        } => {
++            assert_eq!(target_entity, enemy);
++            assert!(target_pos.x > 4);
++        }
++        other => panic!("前進または攻撃コマンドを期待したが {other:?}"),
++    }
++}
+diff --git a/engine/src/ai/turn_distance.rs b/engine/src/ai/turn_distance.rs
+index 7b1f438..e0ea12a 100644
+--- a/engine/src/ai/turn_distance.rs
++++ b/engine/src/ai/turn_distance.rs
+@@ -849,6 +849,44 @@ pub fn calculate_action_distance_to_range(
+     )
+ }
+ 
++/// 期限付きの迎撃など、実移動と同じ敵ZOC停止が必要な行動距離を求める。
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn calculate_action_distance_respecting_zoc(
++    map: &Map,
++    registry: &MasterDataRegistry,
++    unit_positions: &HashMap<(usize, usize), OccupantInfo>,
++    start: (usize, usize),
++    target: (usize, usize),
++    movement_type: MovementType,
++    max_mp: u32,
++    max_fuel: u32,
++    interaction_min_range: u32,
++    interaction_max_range: u32,
++    player_id: PlayerId,
++    cache: &mut ActionTurnDistanceCache,
++) -> Option<ActionTurnDistance> {
++    calculate_action_distance_with_policy(
++        map,
++        registry,
++        unit_positions,
++        start,
++        target,
++        movement_type,
++        max_mp,
++        max_fuel,
++        interaction_min_range,
++        interaction_max_range,
++        player_id,
++        normalize_occupancy(unit_positions),
++        ActionDistancePolicy {
++            respect_enemy_zoc: true,
++            coordinate_tiebreaker: false,
++            must_leave_start: false,
++        },
++        cache,
++    )
++}
++
+ /// 始点（start）からマップ上のすべての到達可能な座標への最短到達ターン数をダイクストラ法で一括計算し、
+ /// HashMap として返します。
+ pub fn calculate_all_turn_distances(

@@ -1,0 +1,288 @@
+diff --git a/engine/src/ai/decision_tests.rs b/engine/src/ai/decision_tests.rs
+index 2792ac9..b862e3f 100644
+--- a/engine/src/ai/decision_tests.rs
++++ b/engine/src/ai/decision_tests.rs
+@@ -2811,6 +2811,247 @@ mod tests {
+             assert_eq!(profile_for(&mut world, player), expected_profile);
+         }
+     }
++
++    #[test]
++    fn early_relief_does_not_preempt_normal_advance_when_forward_path_will_clear() {
++        use crate::ai::AiVersion;
++        use crate::ai::runtime::turn::execute_turn_step;
++        use crate::ai::strategy_profile::{V4StrategyProfile, V4StrategyProfileRegistry};
++
++        let player = PlayerId(1);
++        let enemy = PlayerId(2);
++        let mut world = setup_v3_test_world(6, AiVersion::V4);
++        world.insert_resource(V4StrategyProfileRegistry::with_profile(
++            player,
++            V4StrategyProfile::Standard,
++        ));
++
++        // 6x2マップ:
++        // (0,0): Capital, (1,0): Factory, (2,0): Forest, (3,0): Forest, (4,0): Plains, (5,0): City(Enemy)
++        // (0,1): Plains,  (1,1): Sea,     (2,1): Sea,    (3,1): Sea,    (4,1): Plains, (5,1): Plains
++        let map = Map {
++            width: 6,
++            height: 2,
++            tiles: vec![
++                Terrain::Capital,
++                Terrain::Factory,
++                Terrain::Forest,
++                Terrain::Forest,
++                Terrain::Plains,
++                Terrain::City,
++                Terrain::Plains,
++                Terrain::Sea,
++                Terrain::Sea,
++                Terrain::Sea,
++                Terrain::Plains,
++                Terrain::Plains,
++            ],
++            topology: crate::resources::GridTopology::Square,
++        };
++        world.insert_resource(map.clone());
++        world.insert_resource(crate::ai::islands::IslandMap::analyze(&map));
++        world.insert_resource(DamageChart::new());
++
++        world.spawn((
++            GridPosition { x: 0, y: 0 },
++            Property::new(Terrain::Capital, Some(player), 100),
++        ));
++        world.spawn((
++            GridPosition { x: 1, y: 0 },
++            Property::new(Terrain::Factory, Some(player), 100),
++        ));
++        world.spawn((
++            GridPosition { x: 5, y: 0 },
++            Property::new(Terrain::City, Some(enemy), 100),
++        ));
++
++        let stats = world
++            .resource::<MasterDataRegistry>()
++            .create_unit_stats(&crate::resources::master_data::UnitName(
++                UnitType::Infantry.as_str().to_owned(),
++            ))
++            .unwrap();
++
++        // 工場(1,0)上の歩兵A
++        let unit_a = world
++            .spawn((
++                player,
++                Faction(player),
++                HasMoved(false),
++                ActionCompleted(false),
++                GridPosition { x: 1, y: 0 },
++                stats.clone(),
++                Health {
++                    current: 100,
++                    max: 100,
++                },
++                crate::components::Fuel {
++                    current: stats.max_fuel,
++                    max: stats.max_fuel,
++                },
++            ))
++            .id();
++
++        // 前方(2,0)の森にいる歩兵B（未行動）
++        let unit_b = world
++            .spawn((
++                player,
++                Faction(player),
++                HasMoved(false),
++                ActionCompleted(false),
++                GridPosition { x: 2, y: 0 },
++                stats.clone(),
++                Health {
++                    current: 100,
++                    max: 100,
++                },
++                crate::components::Fuel {
++                    current: stats.max_fuel,
++                    max: stats.max_fuel,
++                },
++            ))
++            .id();
++
++        let mut progress = AiTurnProgress::default();
++        progress.mark_squads_planned(player);
++        world.insert_resource(progress);
++
++        let mut manager = crate::ai::squad::SquadManager::new();
++        let mut squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
++        squad.members.insert(unit_a);
++        squad.members.insert(unit_b);
++        squad.plan.target = Some(GridPosition { x: 5, y: 0 });
++        squad.plan.phase = crate::ai::squad::MissionPhase::MovingToTarget;
++        world.insert_resource(manager);
++
++        world.init_resource::<Events<crate::events::ProduceUnitCommand>>();
++        world.init_resource::<Events<crate::events::NextPhaseCommand>>();
++
++        // 1手目の実行
++        let cmd = execute_turn_step(&mut world, player).expect("命令が発行されること");
++        let acted = world
++            .get_resource::<AiActionCooldown>()
++            .map(|c| c.0.clone())
++            .unwrap_or_default();
++
++        assert!(
++            !acted.contains(&unit_a),
++            "工場上のunit_aは前方のunit_bが動く前に目標と逆方向(0,1)へ早期退避してはならない (cmd: {cmd})"
++        );
++        assert!(
++            acted.contains(&unit_b),
++            "前方のunit_bが先に前進するべきである (cmd: {cmd})"
++        );
++    }
++
++    #[test]
++    fn late_relief_vacates_factory_when_unit_cannot_advance() {
++        use crate::ai::AiVersion;
++        use crate::ai::runtime::turn::execute_turn_step;
++        use crate::ai::strategy_profile::{V4StrategyProfile, V4StrategyProfileRegistry};
++
++        let player = PlayerId(1);
++        let enemy = PlayerId(2);
++        let mut world = setup_v3_test_world(6, AiVersion::V4);
++        world.insert_resource(V4StrategyProfileRegistry::with_profile(
++            player,
++            V4StrategyProfile::Standard,
++        ));
++
++        // 6x2マップ: (2,0)がSeaで東へは物理的に進めない盤面
++        let map = Map {
++            width: 6,
++            height: 2,
++            tiles: vec![
++                Terrain::Capital,
++                Terrain::Factory,
++                Terrain::Sea,
++                Terrain::Forest,
++                Terrain::Plains,
++                Terrain::City,
++                Terrain::Plains,
++                Terrain::Sea,
++                Terrain::Sea,
++                Terrain::Sea,
++                Terrain::Plains,
++                Terrain::Plains,
++            ],
++            topology: crate::resources::GridTopology::Square,
++        };
++        world.insert_resource(map.clone());
++        world.insert_resource(crate::ai::islands::IslandMap::analyze(&map));
++        world.insert_resource(DamageChart::new());
++
++        world.spawn((
++            GridPosition { x: 0, y: 0 },
++            Property::new(Terrain::Capital, Some(player), 100),
++        ));
++        world.spawn((
++            GridPosition { x: 1, y: 0 },
++            Property::new(Terrain::Factory, Some(player), 100),
++        ));
++        world.spawn((
++            GridPosition { x: 5, y: 0 },
++            Property::new(Terrain::City, Some(enemy), 100),
++        ));
++
++        let stats = world
++            .resource::<MasterDataRegistry>()
++            .create_unit_stats(&crate::resources::master_data::UnitName(
++                UnitType::Infantry.as_str().to_owned(),
++            ))
++            .unwrap();
++
++        // 工場(1,0)上の歩兵A（東へは進めず、通常行動では候補なし）
++        let unit_a = world
++            .spawn((
++                player,
++                Faction(player),
++                HasMoved(false),
++                ActionCompleted(false),
++                GridPosition { x: 1, y: 0 },
++                stats.clone(),
++                Health {
++                    current: 100,
++                    max: 100,
++                },
++                crate::components::Fuel {
++                    current: stats.max_fuel,
++                    max: stats.max_fuel,
++                },
++            ))
++            .id();
++
++        let mut progress = AiTurnProgress::default();
++        progress.mark_squads_planned(player);
++        world.insert_resource(progress);
++
++        let mut manager = crate::ai::squad::SquadManager::new();
++        let mut squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
++        squad.members.insert(unit_a);
++        squad.plan.target = Some(GridPosition { x: 5, y: 0 });
++        squad.plan.phase = crate::ai::squad::MissionPhase::MovingToTarget;
++        world.insert_resource(manager);
++
++        world.init_resource::<Events<crate::events::ProduceUnitCommand>>();
++        world.init_resource::<Events<crate::events::NextPhaseCommand>>();
++
++        // 通常行動で動けなくても、遅い退避によって工場を空ける退避命令が出る
++        let cmd = execute_turn_step(&mut world, player).expect("退避命令が発行されること");
++        let acted = world
++            .get_resource::<AiActionCooldown>()
++            .map(|c| c.0.clone())
++            .unwrap_or_default();
++
++        assert!(
++            acted.contains(&unit_a),
++            "前進不能なunit_aは遅い退避で工場を空けること (cmd: {cmd})"
++        );
++        assert!(
++            cmd.contains("GridPosition { x: 0, y: 1 }"),
++            "退避先は唯一空いている(0,1)であること (cmd: {cmd})"
++        );
++    }
+ }
+ 
+ // 小規模マップ戦略など拡張経路の実装。main互換経路と本文が異なる関数と拡張専用の項目を置く。
+diff --git a/engine/src/ai/runtime/turn.rs b/engine/src/ai/runtime/turn.rs
+index 1d8b542..ba31223 100644
+--- a/engine/src/ai/runtime/turn.rs
++++ b/engine/src/ai/runtime/turn.rs
+@@ -75,13 +75,6 @@ impl TurnStep {
+             },
+         }
+     }
+-
+-    /// 通常行動の前に、実行中のAttack/Capture任務まで生産施設から退避させるか。
+-    /// 小規模マップでは、工場から届く敵への合法な初撃を退避Waitが横取りしないよう、
+-    /// 前段ではForming中の輸送役・護衛待ち占領役だけを動かす。
+-    fn early_relief_includes_active_missions(&self) -> bool {
+-        self.is_v4 && self.tactics == TurnTactics::Standard
+-    }
+ }
+ 
+ /// V2〜V4のAIの手番を1命令だけ進める。命令を出したらその内容、手番を終えたらNone。
+@@ -100,13 +93,11 @@ pub(crate) fn execute_turn_step(world: &mut World, player_id: PlayerId) -> Optio
+     crate::ai::wait_probe::stage(world, "early_production_relief");
+     // 未完成の島嶼輸送パッケージが生産施設上でFormingすると、不足している次の
+     // 輸送役を自分で生産不能にする。任務所属は維持したまま隣接待機地へ一歩だけ退避する。
++    // 実行中のAttack/Capture任務は通常行動（前進・攻撃）を優先し、動けなかった場合だけ
++    // 通常行動の後の遅い退避（late_production_relief）で工場を空ける。
+     if step.uses_v3_tactics
+-        && let Some((entity, command)) = decide_forming_campaign_site_relief(
+-            world,
+-            player_id,
+-            &step.acted,
+-            step.early_relief_includes_active_missions(),
+-        )
++        && let Some((entity, command)) =
++            decide_forming_campaign_site_relief(world, player_id, &step.acted, false)
+     {
+         return Some(issue_unit_command(world, entity, command));
+     }

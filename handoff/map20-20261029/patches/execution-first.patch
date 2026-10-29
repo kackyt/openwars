@@ -1,0 +1,159 @@
+diff --git a/engine/src/ai/squad/objective_allocation.rs b/engine/src/ai/squad/objective_allocation.rs
+index e990b0c..d2a72ff 100644
+--- a/engine/src/ai/squad/objective_allocation.rs
++++ b/engine/src/ai/squad/objective_allocation.rs
+@@ -606,7 +606,29 @@ pub(super) fn objective_combat_responsibilities(
+     // 1. 目的施設の占領を今すぐ妨げる敵。
+     allocation.assign(&board, &occupied, &fighters, &enemies, &threats, &mut cache);
+ 
+-    // 2. 余った戦力は、島内に残る未確保施設（敵の工場・首都を含む）を守る敵へ回す。
++    // 2. 進軍路が2本以上の島では、余った戦闘役を遠隔の未選択目標へ回す前に、
++    //    決定済みの各進軍路の現在の前線へ、ルートごとの必要戦力に応じて配る。
++    //    （進軍路が1本以下の島では何も配分せず、従来どおり未確保施設の排除や占領前進へ残す）
++    let mut remaining = fighters
++        .iter()
++        .zip(&allocation.assigned)
++        .filter(|(_, assigned)| !**assigned)
++        .map(|(unit, _)| unit.entity)
++        .collect::<Vec<_>>();
++    let route_responsibilities =
++        route_front_responsibilities(world, board.map, player, island, &mut remaining);
++    let assigned_to_route = route_responsibilities
++        .iter()
++        .flat_map(|r| r.members.iter().copied())
++        .collect::<HashSet<_>>();
++    for (index, unit) in fighters.iter().enumerate() {
++        if assigned_to_route.contains(&unit.entity) {
++            allocation.assigned[index] = true;
++        }
++    }
++
++    // 3. それでも余った戦力（進軍路が1本以下の島、または前線へ配備されなかった部隊）は、
++    //    島内に残る未確保施設（敵の工場・首都を含む）を守る敵へ回す。
+     //    施設から離れて動く敵は対象外にし、島中の敵を追い回さない。
+     let remaining_properties = world
+         .iter_entities()
+@@ -664,7 +686,9 @@ pub(super) fn objective_combat_responsibilities(
+         mut responsibilities,
+         ..
+     } = allocation;
+-    // 3. 排除に要らない部隊は施設の前衛・護衛として前進させる。施設へも届かない部隊だけ
++    responsibilities.extend(route_responsibilities);
++
++    // 4. 排除に要らない部隊は施設の前衛・護衛として前進させる。施設へも届かない部隊だけ
+     // 従来どおり届く敵の排除または現地防御に回す。
+     let mut remaining = fighters
+         .iter()
+@@ -672,16 +696,6 @@ pub(super) fn objective_combat_responsibilities(
+         .filter(|(_, assigned)| !**assigned)
+         .map(|(unit, _)| unit.entity)
+         .collect::<Vec<_>>();
+-    // 進軍路が2本以上の島では、余った戦闘役を占領目標そのものへ集めず、首都ルートの
+-    // 各進軍路の現在の前線へ、ルートごとの必要戦力に応じて配る。進軍路が1本以下の島は従来どおり
+-    // 占領目標へ前進させる。
+-    responsibilities.extend(route_front_responsibilities(
+-        world,
+-        board.map,
+-        player,
+-        island,
+-        &mut remaining,
+-    ));
+     responsibilities.extend(campaign_advance_responsibilities(
+         world,
+         &mut remaining,
+diff --git a/engine/src/ai/squad/objective_allocation/tests.rs b/engine/src/ai/squad/objective_allocation/tests.rs
+index 7e7feb7..573f3c6 100644
+--- a/engine/src/ai/squad/objective_allocation/tests.rs
++++ b/engine/src/ai/squad/objective_allocation/tests.rs
+@@ -411,3 +411,91 @@ fn capital_assault_attacks_with_effective_units_and_stages_the_rest() {
+     assert_eq!(for_missiles.mission_type, MissionType::Defense);
+     assert_eq!(for_missiles.target, geometry.staging);
+ }
++
++/// 2ルートある島で、緊急目標脅威を排除した後の余剰戦力は、
++/// 遠方の未選択施設を守る敵に奪われず、決定済みのDAG前線へ配属されるべき。
++#[test]
++fn two_route_surplus_combat_prioritizes_dag_fronts_over_distant_guards() {
++    let (mut world, island) = real_map("map_6", ENEMY);
++    crate::ai::v4::capital_route::prepare_capital_route_topologies(&mut world, ENEMY);
++    let current_fronts =
++        crate::ai::v4::capital_route::node_operation::capital_route_current_fronts(
++            &world, ENEMY, island,
++        )
++        .expect("DAGの前線");
++    assert_eq!(current_fronts.len(), 2, "map_6には2本の前線がある");
++
++    // 1. 占領目標と占領役
++    let objective = pos(21, 8);
++    let capturer = unit(&mut world, ENEMY, UnitType::Infantry, objective, 100);
++
++    // 2. 緊急目標脅威: 占領目標に隣接する敵戦車（HP30なら自軍戦車1両で撃破可能）
++    let threat_pos = pos(20, 8);
++    unit(&mut world, ME, UnitType::Tank, threat_pos, 30);
++
++    // 3. 遠方敵施設守備: 遠くの敵工場(3, 16)を守る敵戦車（HP100、戦車2両が必要）
++    let distant_guard_pos = pos(4, 15);
++    unit(&mut world, ME, UnitType::Tank, distant_guard_pos, 100);
++
++    // 4. 自軍戦闘部隊: 戦車4両（北側近傍に1両、南側近傍に3両）
++    let tanks = [pos(21, 7), pos(22, 8), pos(23, 8), pos(10, 10)]
++        .map(|at| unit(&mut world, ENEMY, UnitType::Tank, at, 100));
++
++    let responsibilities = objective_combat_responsibilities(
++        &world,
++        ENEMY,
++        island,
++        &tanks,
++        &[capturer],
++        &[objective],
++        &mut TerrainConnectivity::default(),
++    );
++
++    let result_summary = responsibilities
++        .iter()
++        .map(|r| (r.mission_type.clone(), r.target, r.members.len()))
++        .collect::<Vec<_>>();
++
++    let threat_assignment = responsibilities
++        .iter()
++        .find(|r| r.mission_type == MissionType::Attack && r.target == threat_pos);
++    assert!(
++        threat_assignment.is_some_and(|r| r.members.len() == 1),
++        "緊急脅威は最優先で必要最小限の部隊(1両)により排除される: {result_summary:?}"
++    );
++
++    // 期待される設計: 決定済みのDAG前線(current_fronts)へ前線防衛(Defense)として配属されること。
++    // 遠方敵ガード(distant_guard_pos)に戦力が横取りされてはならない。
++    let front_assignments = responsibilities
++        .iter()
++        .filter(|r| r.mission_type == MissionType::Defense && current_fronts.contains(&r.target))
++        .collect::<Vec<_>>();
++
++    assert_eq!(
++        front_assignments.len(),
++        2,
++        "DAGの2つの前線それぞれに防衛責務が配属されること。実際の結果: {result_summary:?}"
++    );
++
++    let distant_guard_assignment = responsibilities
++        .iter()
++        .find(|r| r.target == distant_guard_pos);
++    assert!(
++        distant_guard_assignment.is_none(),
++        "遠方の未選択施設ガード排除には戦力が横取りされない"
++    );
++
++    let total_assigned_members = responsibilities
++        .iter()
++        .flat_map(|r| r.members.iter())
++        .count();
++    assert_eq!(
++        total_assigned_members,
++        tanks.len(),
++        "全戦闘役(4両)が漏れなく重複なく割り当てられる（二重割当なし）"
++    );
++    assert!(
++        !front_assignments.is_empty(),
++        "DAG前線への防衛配属が遠方ガード排除に横取りされてはならない。実際の結果: {result_summary:?}"
++    );
++}
