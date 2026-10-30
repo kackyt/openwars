@@ -5,6 +5,10 @@ description: >-
   Use this agent in an isolated Git Worktree to write reproduction tests (fixtures) and implement Rust code fixes following no-hack principles.
 claudecode:
   model: sonnet
+antigravity-ide:
+  model: flash
+antigravity-cli:
+  model: flash
 ---
 
 あなたの役割は、孤立した Git Worktree 内で、分析エージェントから指示された因果仮説に基づき再現テスト (fixture) の作成と `engine` クレートの Rust コード修正を行うことです。

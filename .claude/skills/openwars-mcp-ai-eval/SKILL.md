@@ -3,8 +3,8 @@ name: openwars-mcp-ai-eval
 description: >-
   OpenWarsの評価スクリプト `scripts/eval_matchup.py`（単一バイナリの評価）と
   `scripts/run_matchup_sweep.py`（バイナリ・環境変数の変種を並列で比較）を使用して、開発中のAIの動作・対戦結果・戦術的パフォーマンス（勝率、思考時間、ZOC支配面積、経済指標など）を自動評価し、レポートを作成するスキルです。AIロジックの評価、バージョン比較（例:
-  V3 vs V1）、リファクタ前後の挙動一致確認を行う際に使用します。
-  また `scripts/run_branch_sim.py`（対局ログの途中局面からの分岐シミュレーション）で、修正の効果をフル対局の前に問題の局面だけでA/B比較する際にも使用します。
+  V3 vs V1）、リファクタ前後の挙動一致確認を行う際に使用します。また
+  `scripts/run_branch_sim.py`（対局ログの途中局面からの分岐シミュレーション）で、修正の効果をフル対局の前に問題の局面だけでA/B比較する際にも使用します。
 ---
 # OpenWars AI Matchup Evaluator
 
