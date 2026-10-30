@@ -1,146 +1,150 @@
-# Handoff: V4の複数ルート早期制圧改善
+# Handoff: map_20後攻 V4 — 西の砲台・右辺の守り・西の都市の早期占領
 
-**Generated**: 2026-10-29 12:29 +09:00
+**Generated**: 2026-10-30 09:25 UTC
 
-**Branch**: `claude/dazzling-lovelace-if6j7f`、基準HEAD `d67f31b`
+**Branch**: `claude/dazzling-lovelace-if6j7f`（基準 HEAD `83ecfb4`）
 
-**Status**: In Progress — 改善未達。実験版には失敗テストが残る
+**Status**: In Progress。エンジンの変更は未コミットで、パッチとして `handoff/west-guns-20261030/patches/` に保存した。T20に西の4都市を押さえる目標は未達（最良 15/36局）。次の一手はユーザーの承認待ち（下記「Next Step」）。
+
+前の担当の資料は `handoff/map20-20261029/HANDOFF-20261029.md` に移した。
 
 ## Goal
 
-map_20後攻のように2ルートの早期制圧・維持が重要な盤面で、V4のV200相手の勝率と形勢を改善する。ユーザーは前回の「候補不採用・改善未達」の報告を却下し、設計を壊すことを恐れず仮説に沿って修正し、V200との対戦結果を報告するよう求めた。特定マップや生産列の決め打ちは避ける。
+map_20 の後攻（P2）V4 を、先攻 V200 に対して改善する。特定マップの決め打ちはしない。判断は対局ログと分岐シミュレーションで確かめてから実装する。
+
+## ユーザーの方針（守ること）
+
+- **主戦場の概念をなくす**。配分案どうしを比べて主戦場を選び直さない。進軍路ごとに攻守を決める。
+- **右辺は最低限の守り。ゴーサインは出さない**。右辺の部隊（歩兵を含む）と砲台は工場付近まで下がる。
+- 右辺の砲台は「工場から射程（6マス）以内・味方より前に出ない」範囲に置く。根拠のない数字（3マスなど）は使わない。
+- **西には砲台を3基以上**置く。足りない分は**生産で足す**。右辺の砲台を引き抜かない。
+- 西を掃討したら砲台を前進させる。
+- **西の4都市（(10,18)(6,17)(2,18)(2,19)）をT20までに全部押さえる**。都市を取れないと戦車・砲台を運べず、敵を殲滅できない。
+- 歩兵は川を渡れる（移動コスト2）。橋に殺到しなくてよい。
+- 北東の話と西の話を混ぜない。方針に反する動きが出たら報告する。
+- 見積もりや判断が間違っている限り実装に進まない。実戦の前にシミュレーションで確かめる。
 
 ## Completed
 
-- [x] 既存の集中作戦WIPと、工場退避・前線経路・作戦継続予算の候補を隔離して検証した。後述の退行や効果不足から本体には採用していない。
-- [x] 作戦の進路切替、拠点防衛と占領期限、初手生産を局面テストおよびV200実対戦で調査した。
-- [x] 事前防衛の初期候補をmap_20後攻・12シード・60ターンで基準と比較。序盤拠点は増えたが上限判定勝利は8/12→2/12、通常勝利は0/12→0/12。
-- [x] 引き継ぎ用に実験差分・集計・分析ツールと60T全24対局の圧縮JSONを `handoff/map20-20261029/` に保存した。ユーザーには改善未達・本体未適用を報告済み。
+- [x] 分岐シミュレーター `engine/tests/branch_sim.rs` と `scripts/run_branch_sim.py`・`scripts/compare_branch_sim.py` を追加し、ai-eval スキルに使い方を追記（コミット済み）。輸送中の部隊の再現と、占領点の出力も追加済み。
+- [x] 砲台の運搬の不具合を直した（パッチ内）。
+  - 森・山に囲まれて二度と乗り直せないマス（北東の都市(24,13)など）へ砲台を降ろさない。
+  - 補給の付き添いの輸送車は、砲台が乗り込めるマスに居る。付き添いは1両だけ。
+  - 撃てる敵の居ない砲台は、自分の戦線の撃てる陣地へ運ぶ（盤面全体で一番敵に近い都市へは運ばない）。
+  - 元の対局では砲台・手番の35%が「動けないまま」だった。
+- [x] 西の砲台を3基にする（パッチ内）。攻めの進軍路へ、新しく作った砲台を合計3基まで割り当てる。既にいる砲台は引き抜かない。足りなければ生産で買う。
+- [x] 主戦場を選び直さない（パッチ内）。攻めの砲台を割り当てた進軍路（西）だけが攻める。右辺の守りの要衝は工場(20,15)。
+- [x] 右辺の歩兵の北への占領をやめる（パッチ内）。原因は実行設定 `OPENWARS_ROUTE_CAPTURE_ALL=1` で、守りの進軍路の先の拠点への占領任務も出ていた。
+- [x] 取れない敵の拠点へ占領役を送らない（パッチ内）。周り6マスの自軍戦力が周り3マスの敵戦力に届かない敵の拠点は外す。ログでは、この判定で「待つ」になった拠点は1,580件中0%しか取れていなかった。
 
-## Not Yet Done
+## 主な数字（分岐シミュレーション、36局 = 3乱数シード × 12局）
 
-- [ ] 実際の作戦・部隊所属・生産予算・実行目標の一貫性と失効条件を設計し、2ルートの早期制圧・保持に結びつける。
-- [ ] 最新の事前防衛実験の行動済みユニット誤計上を修正し、再現テストを通す。防衛戦力を使う機会損失も考慮し、実行された命令まで検証する。
-- [ ] 防衛初期候補の序盤改善が終盤悪化へ転じる具体的局面を同一seedで特定する。原因の断定は未了。
-- [ ] 採用候補について標準版・V200の同条件比較、影響マップの回帰確認、最終ソースの `cargo test`・fmt・clippy を実施する。
+T20の西の都市（T10から11ラウンド）:
+
+| 版 | T20の西の都市 | 4都市すべて | (2,18) | (2,19) |
+|---|---|---|---|---|
+| 基準（conc18） | 2.44 | 7/36 | 7 | 15 |
+| v13（`patches/v13-best.patch`） | 2.97 | **15/36** | 17 | 20 |
+| v14: 予備の歩兵も西の都市へ | 2.81 | 10/36 | 11 | 18 |
+| v15: 近くの歩兵に占領を追加 | 2.97 | 15/36（効果なし） | 17 | 20 |
+| v16: 輸送車が橋で止まらない | 2.86 | 14/36 | 14 | 19 |
+| v17（`patches/v17-latest.patch`）: 川を渡れる部隊も橋で手番を終えない | 2.67 | 6/36 | 7 | 20 |
+
+v13 の方針違反の集計（各360手番）: 右辺が攻め 0、右辺の守りの要衝が工場以外 0（v11以降）、西が守りに回る 0、右辺の砲台が工場から射程より前 0。右辺の部隊が工場から射程より前にいるのは 0.2〜0.8体/手番（北への占領をやめた後）。
+
+戦況（v12相当、T31）: 敵戦力 160k（基準 175k）。右辺の拠点は 1.25（基準 2.5）。右辺を工場付近まで下げて北の都市を手放したため。
 
 ## Failed Approaches (Don't Repeat These)
 
-数値はV4後攻対V200先攻。**上限判定勝利を通常勝利と混同しない。** 同一seedでも行動列に実行時の揺れがあるため、各1回の結果は確率的な確証ではない。
-
-| 案 | 結果と判断 |
+| 案 | 結果 |
 |---|---|
-| 元の集中・進軍路作戦WIP | map_20の60T/12seedは上限判定8勝→9勝、通常勝利0→0。ただしmap_35のT15拠点が3seedとも減少、map_8も悪化。一括採用しない。`handoff/map20-20261029/reports/route-full12.md` |
-| 工場早期退避の単独変更 | map_20の60T/12seedは上限判定8勝→10勝、通常勝利0→0。ただしmap_35の前線が退行。`handoff/map20-20261029/reports/relief-full12.md` |
-| 前線選定を実移動Dijkstra化 | map_20後攻3seedの上限判定2勝→1勝。距離の精緻化だけでは解決しない。`handoff/map20-20261029/reports/front-study-sweep.md` |
-| 自軍拠点防衛の実行順を早める、最後の手段で占領兵も使う | `handoff/map20-20261029/reports/defense-first-screen.md`、`defense-last-resort-screen.md` の短縮試験で目的の根本改善は確認できなかった。 |
-| 初手の戦闘生産制限を外す | map_20 seed1 T8拠点・収入は基準と同じ21・24000。候補を増やすだけでは狙いが実購入・勝利に届くとは限らない。`handoff/map20-20261029/reports/opening-timing-screen.md` |
-| 経路所属を固定 | seed1で観測上の経路切替40/132→1/97だが、経路所属の観測数も170→126に減り、T15拠点19→19。登録から外れただけの可能性があり、数字だけで実移動の改善とは言えない。`handoff/map20-20261029/reports/stable-lanes-v2-screen.md` |
-| 占領期限前の事前防衛責務、初期版 | `handoff/map20-20261029/reports/defense-objective-full12.md`。T15平均拠点19.0→約20.1、収入22000→約23083だが60T上限判定8勝4敗→2勝10敗、通常勝利は両方0。序盤拠点増だけを成功と扱わない。 |
-| 実経路・ZOCを加味して防衛に必要最小限の戦力を使う後続案 | 30T/3seedの短縮スクリーニングではmap_20の上限判定2勝→0勝。`handoff/map20-20261029/reports/defense-minimal-sweep.md`。60T/12seedの結果ではなく、初期版とは別バイナリ。 |
+| 撃てる敵がいる砲台を「より良い陣地」へ移す | 帳簿上の射程内の敵は2倍、実際の射撃は 131→63 回に半減（敵が動くたびに移し替え）。T22以降は3シードとも悪化。 |
+| 右辺の砲台を西へ引き抜く割り当て | 右辺の都市を失い、敵戦力 +39k。 |
+| 資金の取り置き（組の値段に届かない手番に残額を保留） | 不要だった。実際は数え方の誤りで、資金は足りていた。 |
+| 攻めの砲台の割り当てを配分案の攻守に連動 | 配分案の揺れ（西→(16,3)など）で割り当てが外れ、追加の砲台を買い続けた。一度割り当てたら外さない形に直した。 |
+| 予備の歩兵まで西の都市へ向かわせる（v14） | 渋滞が増えて 15→10/36。 |
+| 歩兵が橋で手番を終えない（v17） | 橋は空いた（ふさがり 79%→29%）が、歩兵は川の手前から動かず 15→6/36。 |
 
-## Key Decisions
+## 未解決の原因（いま分かっていること）
 
-| Decision | Rationale |
-|---|---|
-| 退行・効果不足の候補を本体へ移植しない | 序盤の指標改善だけでは目標未達。他マップでの劣化も確認した。 |
-| 単純な距離・重みの調整ではなく、作戦目標・所属・生産・実行の正本と失効条件を検討する | 目標が下流で上書きされる、進路を反転する、攻守と防衛予算が不整合になる例がある。 |
-| 試験は再現fixture→短縮実戦→同条件12seedへ進める | 低コストで仮説と実行到達性を反証し、短縮試験の判定勝敗を本来の60Tと混同しない。 |
-| 中間成果は保存し、既存作業やユーザーファイルを削除しない | 実験ごとに版が異なる。引き継ぎには `handoff/map20-20261029/` のパッチ・集計・圧縮ログを使う。 |
+wait_probe（`OPENWARS_WAIT_PROBE=1 OPENWARS_WAIT_PROBE_PLAYERS=2 OPENWARS_WAIT_PROBE_UNITS= OPENWARS_WAIT_PROBE_TYPES=Infantry OPENWARS_WAIT_PROBE_TURNS=16-16 OPENWARS_WAIT_PROBE_PRINT=1`）で確認した。
+
+- 川の手前（(10〜14, 14〜19)）の歩兵は、出発してよい状態（departure_authorized=true）のまま待機している。
+- 西の攻めの作戦の部隊は20〜57体で、全員が同じ目標(2,18)に向かう。(2,18)は西の端の海沿いの行き止まり。
+- 先に着いた部隊がその周りに留まり、そこから橋のたもと、東岸の道路まで列がつながる。例えば(12,17)の歩兵は、行ける12マスのうち止まれるのが3マスだけ（前方は味方で埋まっている）で、待機を選ぶ。
+- 経路の選び方（歩兵が橋と道路を選ぶ）や橋のふさがりより、「全員が1か所を目指す」ことが渋滞の元。
+
+## Next Step（ユーザーに承認を求めている提案）
+
+1. 西の攻めの作戦で、戦車などの戦闘部隊の行き先を、占領先の都市ではなく敵のいる前線（いまなら回廊の出口(2〜5, 13〜16)）にする。
+2. 占領先の都市へは占領の担当の歩兵だけを向かわせる。
+3. 橋を渡った部隊は、橋のたもとに留まらずに前へ進ませる。
+
+1は進軍路作戦の行き先の決め方（`engine/src/ai/squad/route_operations.rs` の `responsibilities` が攻めの作戦に要衝＝目標を渡している）を変える構造的な変更。承認を得てから着手すること。
 
 ## Current State
 
-**Working**: 本体の追跡ソースは基準 `d67f31b` のまま。作業開始時の基準版では `cargo test --workspace` 1145成功・2無視、fmt・clippy成功。これは**基準版の過去の結果**であり実験版の検証ではない。
+**Working**: HEAD のエンジン・テストは前回のまま。v13 のパッチを当てた状態で `cargo test -p engine --lib`（1124件成功・1無視）、`cargo clippy -p engine --all-targets --all-features -- -D warnings`、`cargo fmt --all -- --check` が通ることを確認済み。
 
-**Broken**: `handoff/map20-20261029/patches/defense-objective.patch` を適用した最新実験版で `defense_does_not_reuse_a_unit_that_already_acted` が失敗。出力: `行動済みの部隊は次の敵占領より先に攻撃できない`、`test result: FAILED. 0 passed; 1 failed`。このテストは前進中に追加したもので、最新実験は未完成。最新ソースに対する全体テスト・fmt・clippyは未確認。
+**Uncommitted engine changes**: なし（作業ツリーは HEAD）。変更はすべてパッチで保存。
 
-**Uncommitted Changes**: `HANDOFF.md` と `handoff/map20-20261029/` の引き継ぎ資材。ユーザー由来の多数の未追跡ファイルもある。実験パッチは基準 `d67f31b` に対する独立の差分であり、互いに重ねて適用しない。
+- `handoff/west-guns-20261030/patches/v13-best.patch` … 一番よかった版。conc18 の土台＋上記の修正。v17 から v15〜v17 の3つの変更を外して作り直し、元の v13 のバイナリと分岐シミュレーションの結果が2局とも完全一致することを確認した。
+- `handoff/west-guns-20261030/patches/v17-latest.patch` … 最新の版（v13 ＋ v15〜v17）。どちらもクリーンな HEAD に `git apply` できることを確認済み。
 
-**重要**: 12seedで測った事前防衛の初期版と、保存した最新の `defense-objective.patch` は異なる。初期版の実行ファイルや正確なソース差分は保存しておらず、対戦ログと集計のみ。初期版の結果を最新パッチの結果と呼ばない。
+**重要**: パッチの土台は conc18（2026-10-29 の実験版。主戦場の配分案 `concentrate_route_efforts` を含む）。今回、主戦場の選び直しは止めたが、配分案の仕組み自体はまだ残っている。序盤（攻めの砲台がまだ無い間）は最初の砲台を付ける進軍路を配分案の比較で選んでいる。
 
 ## Files to Know
 
 | File | Why It Matters |
 |---|---|
-| `handoff/v4-route-operations-wip.patch` | 前セッションの大規模WIP。実験フラグ・デバッグを含み、一括採用不可。元資料は `handoff/map20-20261029/previous-handoff.md`。 |
-| `engine/src/ai/squad/objective_allocation.rs` | 本体側の攻勢戦闘責務の正本。 |
-| `engine/src/ai/operation_assignment.rs`, `engine/src/ai/squad.rs`, `engine/src/ai/runtime/turn.rs` | 作戦割当→部隊→実行の流れを追う入口。 |
-| `engine/src/ai/v4/capital_route/` | 進軍路DAG、戦力・予算・作戦。 |
-| `handoff/map20-20261029/patches/defense-objective.patch` | 最新事前防衛の実験ソース3ファイルと失敗fixture。基準への独立差分。 |
-| `handoff/map20-20261029/patches/` | 他の試案の独立差分。`route-study.patch` は未追跡だった追加ソースも含む。すべて計測後に変化した可能性があり、計測時点の再現と見なさない。 |
-| `handoff/map20-20261029/logs/defense-full12.zip` | 初期事前防衛案と基準版の対戦JSON、全12seed×2。展開方法は下記。 |
-| `handoff/map20-20261029/reports/` | 主要な対戦集計、計測プロトコル、no-hack原則。 |
-| `handoff/map20-20261029/tools/route-contract-analysis-20261029.py` | 同一局面で経路所属・反転・西側拠点を集計。隣の `test_route_contract_analysis_20261029.py` で検証可能。 |
-| `handoff/map20-20261029/tools/compare_benchmarks.py` | seed別結果の比較。12seedの再集計に使える。 |
-| `scripts/run_matchup_sweep.py` | releaseの比較バイナリを用いる並列対戦。 |
-
-## Code Context
-
-本体の攻勢責務入口（`engine/src/ai/squad/objective_allocation.rs`）:
-
-```rust
-pub(super) fn objective_combat_responsibilities(
-    world: &World,
-    player: PlayerId,
-    island: IslandId,
-    members: &[Entity],
-    capture_members: &[Entity],
-    objectives: &[GridPosition],
-    connectivity: &mut TerrainConnectivity,
-) -> Vec<CampaignResponsibility>
-```
-
-最新の実験版では `defense_threats` が自軍施設へ向かう敵占領役と期限を求め、`Allocation::assign_defenses` が期限内の射点・攻撃必要数を用いて仮予約する。既知の欠落は `ActionCompleted` の考慮。攻撃可能時刻は手番順・移動・敵ZOC・間接攻撃・射点競合を含めて計算すること。防衛用距離は実験版の以下を使う:
-
-```rust
-pub(crate) fn calculate_action_distance_respecting_zoc(
-    map: &Map, registry: &MasterDataRegistry,
-    unit_positions: &HashMap<(usize, usize), OccupantInfo>,
-    start: (usize, usize), target: (usize, usize),
-    movement_type: MovementType, max_mp: u32, max_fuel: u32,
-    interaction_min_range: u32, interaction_max_range: u32,
-    player_id: PlayerId, cache: &mut ActionTurnDistanceCache,
-) -> Option<ActionTurnDistance>
-```
-
-この実験版の追加API・ロジックの妥当性や本体採用は未確定。局面fixtureが通っても、実際のSquad再編→命令→位置まで確認する。
+| `handoff/west-guns-20261030/patches/` | 作業中のエンジンの変更（v13・v17）。 |
+| `handoff/west-guns-20261030/logs/conc18-map20-p2-12seeds.zip` | 基準の対局ログ12局（盤面と資金だけに絞った版、1.1MB）。分岐シミュレーションの入力。 |
+| `handoff/west-guns-20261030/tools/` | 分析スクリプト。`run_conc18_branch.sh`（conc18 の環境変数で分岐シミュレーション）、`t20.py`（T20の西の都市と橋のふさがり）、`cmpvar.py`（砲台・戦況の比較）、`gunsim.py`、`guntraj.py`（砲台ごとの軌跡）、`common.py`。出力は `.tmp/gun/<名前>` を読む。 |
+| `engine/tests/branch_sim.rs`, `scripts/run_branch_sim.py`, `scripts/compare_branch_sim.py` | 分岐シミュレーター（コミット済み）。使い方は `.rulesync/skills/openwars-mcp-ai-eval/SKILL.md` の 2c。 |
+| `engine/src/ai/v4/artillery_ferry.rs`（パッチで追加） | 砲台の運搬・割り当て・守り場所。 |
+| `engine/src/ai/v4/capital_route/force_demand.rs` | 配分案と進軍路の攻守・要衝。 |
+| `engine/src/ai/squad/objective_allocation.rs` | 占領の目標の絞り込み（`capture_target_allowed` など）。 |
+| `engine/src/ai/squad/route_operations.rs`（パッチで追加） | 進軍路作戦（Next Step で変える場所）。 |
 
 ## Resume Instructions
 
-1. `git status --short`、`git diff --stat`、`git worktree list` を確認する。旧資料は `handoff/map20-20261029/previous-handoff.md`。保存パッチ・ログを含む `handoff/map20-20261029/` を一緒に引き継ぐ。
-2. 以下で新しい展開先に12seed×2のJSONを取り出し、基準と初期防衛候補の同一ターンの部隊・戦闘資産・生産・拠点・命令を追う。T15の優位がどこで失われるかを特定し、観察と仮説を分ける。勝敗反転seedは1, 4, 8, 9, 10, 12。出力先が既存なら別名にする。
+1. パッチを当てる（v13 から再開する場合）。
 
-   ```powershell
-   python -m zipfile -e handoff/map20-20261029/logs/defense-full12.zip .tmp/handoff-defense-games
-   python handoff/map20-20261029/tools/compare_benchmarks.py .tmp/handoff-defense-games/baseline/map_20_V200-V4_r0 .tmp/handoff-defense-games/defense/map_20_V200-V4_r0 --subject V4 --seeds 12 --turn 15
+   ```bash
+   git apply handoff/west-guns-20261030/patches/v13-best.patch
+   cargo test -p engine --lib
    ```
 
-   期待結果: 通常勝利0→0、60T上限判定勝利8→2。展開後約1.4GBが必要。ファイルの上書きを避けるため展開先が存在しないことを事前に確認する。
-3. 最新実験の独立worktreeを作り、保存パッチを適用して失敗を再現する（PowerShell、既存の作業先は使わない）:
+2. 基準ログを展開する。
 
-   ```powershell
-   $work = '.tmp/handoff-defense-worktree'
-   if (Test-Path -LiteralPath $work) { throw '既存作業を保護するため停止' }
-   $patch = (Resolve-Path 'handoff/map20-20261029/patches/defense-objective.patch').Path
-   git worktree add --detach $work d67f31b
-   if ($LASTEXITCODE -ne 0) { throw 'worktree作成失敗' }
-   git -C $work apply --check $patch
-   if ($LASTEXITCODE -ne 0) { throw 'パッチ検査失敗' }
-   git -C $work apply $patch
-   if ($LASTEXITCODE -ne 0) { throw 'パッチ適用失敗' }
-   $env:CARGO_TARGET_DIR = "$PWD/.tmp/handoff-defense-target"
-   cargo test --manifest-path "$work/Cargo.toml" -p engine defense_does_not_reuse_a_unit_that_already_acted --lib
+   ```bash
+   mkdir -p .tmp/handoff-conc18
+   python3 -m zipfile -e handoff/west-guns-20261030/logs/conc18-map20-p2-12seeds.zip .tmp/handoff-conc18
    ```
 
-   現状の期待結果: 上記アサーションで失敗。修正後は成功し、未行動・次手番・先後・敵ZOC・射点重複・間接攻撃も回帰しないこと。`cargo test --manifest-path "$work/Cargo.toml" -p engine objective_allocation --lib` で関連テストを実行する。
-4. 局面テスト後、変更をreleaseビルドし、基準と候補を**別名で固定**して新しい出力先へ短縮実戦を実行する。計画上の割当だけでなく実命令・実位置・拠点所有を確認。既存exeや出力先は上書きしない。
-5. 有望なら `scripts/run_matchup_sweep.py` で `--map map_20 --p1 V200 --p2 V4 --player-order as-given --seeds 1,2,3,4,5,6,7,8,9,10,11,12 --max-turns 60 --grid-type hex --jobs 8` を基準と候補に同一指定。通常勝利、上限判定、T15/T20以降の指標を別々に示す。map_35・map_8など影響範囲も確認。対局揺れの調査には `--repeats 3` 以上。
-6. 採用後にのみ本体へ統合し、最終状態で `cargo test`、`cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features -- -D warnings` を実行。成功・失敗・未実施を区別して日本語で報告。
+3. 分岐シミュレーション用のテストバイナリを作って固定する。
+
+   ```bash
+   cargo test --release -p engine --test branch_sim --no-run   # 出力の Executable のパスを確認
+   mkdir -p .tmp/gun && cp target/release/deps/branch_sim-<hash> .tmp/gun/branch_sim_v13
+   ```
+
+4. T20 の比較（T10 から 11 ラウンド、3シード）。基準はパッチを当てる前のバイナリで同じように回す。
+
+   ```bash
+   for sd in 1 2 3; do X=$([ $sd = 1 ] && echo "" || echo _s$sd)
+     handoff/west-guns-20261030/tools/run_conc18_branch.sh .tmp/gun/branch_sim_v13 t20_v13$X 10 11 --seed $sd
+   done
+   python3 handoff/west-guns-20261030/tools/t20.py v13          # 版名は .tmp/gun/t20_<版名> に対応
+   ```
+
+5. 方針違反の集計には `OPENWARS_CONCENTRATE_DEBUG=1` を付けて回し、ログの `ROUTE_ORDERS P2` 行（各進軍路の要衝と攻守）を数える。
 
 ## Warnings
 
-- 原則とプロジェクト規約は `CLAUDE.md` を読む。Webのパッケージ管理はpnpm限定。ユーザーへの報告とコードコメントは日本語。
-- `.tmp/` は引き継ぎ対象外。保存したパッチ・集計・圧縮ログは `handoff/map20-20261029/` にあり、引き継ぎ時にこの未追跡フォルダを必ず含める。実行ファイル・ビルド生成物・60Tの初期版以外の詳細ログは保存していない。
-- 行動済み・途中移動・行動不能、敵の占領完了手番と自軍の行動順、射点の重複、進路が到達不能・地域変化・戦力喪失で失効する条件を扱う。存在しない防衛役や同一部隊を複数戦線に計上しない。
-- 間接兵器は直接攻撃ユニットの前衛があって初めて機能する。分岐や任意閾値で特定マップをハックしない。V1〜V4の共通化で関数内 `is_extended` 分岐を増やさない。
-- 既存の旧引き継ぎにある `jobs 4` や作業後の削除手順は今回の運用に優先しない。対戦は `jobs 8` を標準とし、他人や他実験のプロセスは止めない。
+- 分岐シミュレーションは同じ乱数シードなら完全に決定的。ばらつきは `--seed` を変えて見る。
+- 分岐シミュレーションの序盤（T4 から始める）の配置は実戦と合わない（西の砲台が1基になる）。T10・T22 からの分岐で評価している。
+- 弾薬・燃料は満タンで置かれる。相手（V200）の記憶は分岐時点で空になる。絶対値ではなく、同じ条件での変更前後の差で判断する。
+- conc18 の実行設定（`OPENWARS_CONCENTRATE`、`OPENWARS_HOLD`、`OPENWARS_ROUTE_DEFENSE`、`OPENWARS_ARTILLERY_FERRY`、`OPENWARS_POSITIONAL`、`OPENWARS_ROUTE_CAPTURE_ALL`、`OPENWARS_ROUTE_BUDGET_TURNS`）を前提にしている。
+- 60ターンの実戦スイープ（`scripts/run_matchup_sweep.py`）はまだ回していない。勝敗への効果は未確認。
+- 原則とプロジェクト規約は `CLAUDE.md`。ユーザーへの報告とコードのコメントは日本語。
