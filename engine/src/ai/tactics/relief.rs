@@ -18,6 +18,42 @@ pub(crate) fn decide_forming_campaign_site_relief(
     skip_entities: &HashSet<Entity>,
     include_active_missions: bool,
 ) -> Option<(Entity, AiCommand)> {
+    site_relief(
+        world,
+        player_id,
+        skip_entities,
+        include_active_missions,
+        false,
+    )
+}
+
+/// 作戦行動より前に行う早い退避。標準V4では、任務目標から遠ざかる退避はせず、先に動く
+/// 味方が目標側のマスを空けた後の遅い退避へ回す。
+pub(crate) fn decide_early_campaign_site_relief(
+    world: &mut World,
+    player_id: PlayerId,
+    skip_entities: &HashSet<Entity>,
+    include_active_missions: bool,
+) -> Option<(Entity, AiCommand)> {
+    let require_progress = !crate::ai::code_path::is_extended()
+        && crate::ai::resolve_player_ai_version(world, player_id)
+            == crate::ai::ai_version::AiVersion::V4;
+    site_relief(
+        world,
+        player_id,
+        skip_entities,
+        include_active_missions,
+        require_progress,
+    )
+}
+
+fn site_relief(
+    world: &mut World,
+    player_id: PlayerId,
+    skip_entities: &HashSet<Entity>,
+    include_active_missions: bool,
+    require_progress: bool,
+) -> Option<(Entity, AiCommand)> {
     // 拡張経路では、首都攻略DAGの指令先・セル列と、退避先での占領開始を加える。
     // 退避対象の収集・候補順・通常の退避先選択は両経路で共通。
     let is_extended_path = crate::ai::code_path::is_extended();
@@ -49,6 +85,7 @@ pub(crate) fn decide_forming_campaign_site_relief(
                 player_id,
                 *entity,
                 mission_target,
+                require_progress,
                 &group_positions,
                 skip_entities,
                 &production_positions,
@@ -270,6 +307,7 @@ fn select_relief_action_for_unit(
     player_id: PlayerId,
     entity: Entity,
     mission_target: Option<GridPosition>,
+    require_progress: bool,
     group_positions: &[GridPosition],
     skip_entities: &HashSet<Entity>,
     production_positions: &HashSet<(usize, usize)>,
@@ -342,6 +380,15 @@ fn select_relief_action_for_unit(
                 (target_distance, group_distance, *y, *x)
             })
     })?;
+    // 標準V4の早い退避では、任務目標から遠ざかる退避はしない。先に動く味方が目標側の
+    // マスを空けた後の退避（遅い退避）で、目標へ近づく向きに工場を空ける。
+    if require_progress
+        && let Some(target) = mission_target
+        && map.distance(destination.0, destination.1, target.x, target.y)
+            >= map.distance(position.x, position.y, target.x, target.y)
+    {
+        return None;
+    }
     let target_pos = GridPosition {
         x: destination.0,
         y: destination.1,

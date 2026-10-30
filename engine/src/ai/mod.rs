@@ -6,6 +6,7 @@ pub(crate) mod deterministic_parallel;
 pub(crate) mod engagement;
 pub mod engine;
 pub mod eval;
+pub mod features;
 /// 遊兵（任務なし・任務があるのに動けないユニット）の計測
 pub mod idle_audit;
 pub mod island_campaign;

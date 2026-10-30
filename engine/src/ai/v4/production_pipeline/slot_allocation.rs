@@ -145,9 +145,25 @@ pub(super) fn evaluate_rolling_plan(
         player_id,
         input.policy,
     );
-    let Some(combat_input) = rolling_input else {
+    let Some(mut combat_input) = rolling_input else {
         return false;
     };
+    if input.policy == ProductionPolicy::Standard
+        && std::env::var("OPENWARS_COMMIT").is_ok()
+        && let Some(previous) = continuation.as_ref()
+    {
+        // 前の手番の計画が、1手番の収入では買えない購入を今手番に予定して資金を
+        // 残していたなら、その購入を今手番に必ず行う。計画を毎手番作り直すと、
+        // 貯めた目的の購入が来手番へ送られ続け、資金が永久に使われないためである。
+        combat_input.committed_purchases = previous
+            .purchases
+            .iter()
+            .copied()
+            .filter(|purchase| {
+                purchase.build_turn == 0 && purchase.cost > combat_input.income_per_turn
+            })
+            .collect();
+    }
     let Some(selected) = choose_rolling_plan(
         input,
         &operations[op_index],

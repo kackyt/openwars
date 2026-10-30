@@ -43,7 +43,24 @@ pub(in crate::ai::v4) fn plan_production_with_registry(
         return (state.commands, state.plan_trace);
     }
     assign_committed_combat(input, &mut state);
+    let ferries_artillery = input.policy == ProductionPolicy::Standard
+        && crate::ai::v4::artillery_ferry::artillery_ferry_enabled();
+    if ferries_artillery {
+        // 運ぶ手段の無い既存の砲台へ、作戦枠より先に補給輸送車を付ける。
+        allocate_artillery_carriers(input, &mut state);
+        // 攻める進軍路に回せる砲台を揃える（作戦の枠より先に資金を確保する）。
+        allocate_attack_route_guns(input, &mut state);
+    }
     allocate_operation_slots(input, &mut state, plan_registry, contract_registry);
+    if ferries_artillery {
+        // この手番に計画が買った砲台へ、残額で補給輸送車を付ける。
+        allocate_artillery_carriers(input, &mut state);
+    }
+    if input.policy == ProductionPolicy::Standard
+        && crate::ai::v4::ground_lift::ground_lift_enabled()
+    {
+        allocate_ground_lift_carriers(input, &mut state);
+    }
     let surplus = if input.policy.allocates_surplus() {
         let budget = allocate_immediate_reinforcements(input, &mut state, plan_registry);
         allocate_surplus_mobilization(input, &mut state, &budget);
@@ -319,6 +336,12 @@ use immediate_combat::*;
 
 mod mobilization;
 use mobilization::*;
+
+mod ground_lift_carriers;
+use ground_lift_carriers::*;
+
+mod artillery_carriers;
+use artillery_carriers::*;
 
 fn production_operation_trace(
     op: &Operation,

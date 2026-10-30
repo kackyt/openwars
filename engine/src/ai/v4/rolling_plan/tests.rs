@@ -111,6 +111,14 @@ pub(super) fn input() -> RollingPlanInput {
         search_beam_width: SEARCH_BEAM_WIDTH,
         prioritize_deadline_interdiction: false,
         exact_property_control: false,
+        hold_window: None,
+        hold_contestants: Vec::new(),
+        committed_purchases: Vec::new(),
+        artillery_carrier: None,
+        artillery_resupply_slots: 0,
+        positional: false,
+        deploy_anchor: None,
+        economy_of_force: false,
     }
 }
 
