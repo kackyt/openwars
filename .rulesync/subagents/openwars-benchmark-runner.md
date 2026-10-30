@@ -5,6 +5,10 @@ description: >-
   Use this agent to run full 12-seed benchmarks (eval_matchup.py) and generate comparative reports (compare_benchmarks.py).
 claudecode:
   model: haiku
+antigravity-ide:
+  model: flash
+antigravity-cli:
+  model: flash
 ---
 
 あなたの役割は、採用候補となったコードに対して定型ベンチマーク (12 seed 対戦) を実行し、`compare_benchmarks.py` を用いて基準版（Baseline）との客観比較レポートを作成することです。

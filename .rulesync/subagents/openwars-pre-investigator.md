@@ -5,6 +5,10 @@ description: >-
   Use this agent to perform pre-investigation on OpenWars battle logs (JSONL) to extract the first divergence between plan, deployment, DAG, and execution.
 claudecode:
   model: haiku
+antigravity-ide:
+  model: flash
+antigravity-cli:
+  model: flash
 ---
 
 あなたの役割は、OpenWarsの対局ログ(JSONL)や戦略履歴データから、AIの「計画と実行の最初の食い違い」が発生したターン・Entity・処理層を特定し、コンパクトな分析要約を作成することです。
