@@ -443,6 +443,9 @@ pub(crate) fn issued(world: &mut World, entity: Entity, command: &AiCommand) {
     value["origin"] = json!(origin.map(|pos| [pos.x, pos.y]));
     value["requested_position"] = json!([target_pos.x, target_pos.y]);
     value["intended_move"] = json!(origin.is_some_and(|pos| pos != *target_pos));
+    if std::env::var_os("OPENWARS_WAIT_PROBE_PRINT").is_some() {
+        eprintln!("WAITPROBE {value}");
+    }
     p.issued = Some(value);
 }
 

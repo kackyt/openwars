@@ -26,3 +26,22 @@ wasm-bindgen-futures = "0.4.42"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rayon = "1.10"
+
+[features]
+default = []
+v4_all = [
+    "route_concentrate",
+    "route_hold",
+    "route_defense",
+    "artillery_ferry",
+    "positional",
+    "route_capture_all",
+    "route_budget_turns",
+]
+route_concentrate = []
+route_hold = []
+route_defense = []
+artillery_ferry = []
+positional = []
+route_capture_all = []
+route_budget_turns = []

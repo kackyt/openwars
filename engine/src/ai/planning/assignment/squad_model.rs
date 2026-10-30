@@ -566,6 +566,9 @@ pub struct SquadManager {
     list: SquadList,
     pub solo_fallbacks: HashSet<Entity>,
     next_id: u32,
+    /// 標準V4の進軍路作戦の所属（Entity→作戦の要衝）。作戦が続く間、任務の目標が敵unitへ
+    /// 変わっても所属を保ち、毎手番の配り直しで作戦から外さない。
+    pub route_operation_members: crate::collections::HashMap<Entity, GridPosition>,
 }
 
 /// `SquadManager` の読取りview。

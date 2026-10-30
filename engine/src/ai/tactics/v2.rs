@@ -74,8 +74,26 @@ pub(crate) fn decide_action(
         let mut best = BestUnitAction::default();
         for entity in movable_units {
             let Some(unit) = UnitTactics::observe(world, &board, entity) else {
+                if std::env::var_os("OPENWARS_TACTIC_DEBUG").is_some() {
+                    eprintln!("TACTIC P{:?} {:?} skipped(observe)", player_id, entity);
+                }
                 continue;
             };
+            if std::env::var_os("OPENWARS_TACTIC_DEBUG").is_some() {
+                eprintln!(
+                    "TACTIC P{:?} {:?} {:?} at=({},{}) target={:?} solo={} hold={} mission={:?} campaign_target={:?}",
+                    player_id.0,
+                    entity,
+                    unit.state.stats.unit_type,
+                    unit.state.position.x,
+                    unit.state.position.y,
+                    unit.squad_target,
+                    unit.is_solo,
+                    unit.campaign.as_ref().is_some_and(|c| c.holds_position()),
+                    board.squads.mission(entity),
+                    unit.campaign.as_ref().and_then(|c| c.target),
+                );
+            }
             let mut probe = probe_call
                 .as_ref()
                 .map(|call| call.unit(entity, unit.state.stats.unit_type));
@@ -415,6 +433,78 @@ fn tile_score(
     let capture_or_hunt =
         capture_or_hunt_score(world, board, state, unit.is_solo, position, distances);
     score += capture_or_hunt;
+    // 占領友軍の護衛スクリーン & 間接火力支援（Capture Screening & Fire Support）:
+    // 自軍歩兵が占領中、または占領に向けて接近中（物件から距離<=2）の未所有物件について：
+    // 1. 直接戦闘部隊（戦車等）: 物件の隣（距離1）かつ敵に向かい合うマスに展開して壁になる（スクリーン）。
+    // 2. 間接攻撃部隊（自走砲・砲台・ロケット）: その物件に向かってくる敵を射程内に捉えられる陣地に展開する（火力支援）。
+    if !state.stats.can_capture && !board.enemies.is_empty() {
+        let is_direct = state.stats.min_range <= 1;
+        let is_indirect = state.stats.max_range > 1;
+
+        let supports_capture = board.properties.iter().any(|(prop_pos, _, owner)| {
+            if *owner == Some(board.player_id) {
+                return false;
+            }
+            // その物件に自軍の占領役がいる、または距離2以内に接近中
+            let has_capturer = world.iter_entities().any(|e| {
+                let Some(pos) = e.get::<GridPosition>() else {
+                    return false;
+                };
+                let is_our_inf = e
+                    .get::<crate::components::Faction>()
+                    .is_some_and(|f| f.0 == board.player_id)
+                    && e.get::<crate::components::UnitStats>()
+                        .is_some_and(|s| s.can_capture);
+                is_our_inf && board.map.distance(pos.x, pos.y, prop_pos.x, prop_pos.y) <= 2
+            });
+            if !has_capturer {
+                return false;
+            }
+
+            // 直接部隊: 物件の隣で、敵に向かい合って壁になる
+            if is_direct
+                && board
+                    .map
+                    .distance(position.x, position.y, prop_pos.x, prop_pos.y)
+                    == 1
+            {
+                return board.enemies.iter().any(|(enemy_pos, ..)| {
+                    board
+                        .map
+                        .distance(position.x, position.y, enemy_pos.x, enemy_pos.y)
+                        < board
+                            .map
+                            .distance(prop_pos.x, prop_pos.y, enemy_pos.x, enemy_pos.y)
+                });
+            }
+
+            // 間接部隊: その物件の周辺（3マス以内）にいる敵、または物件に向かってくる敵を射程内に捉える
+            if is_indirect {
+                let hits_threat = board.enemies.iter().any(|(enemy_pos, ..)| {
+                    let dist_to_prop =
+                        board
+                            .map
+                            .distance(enemy_pos.x, enemy_pos.y, prop_pos.x, prop_pos.y);
+                    let dist_to_us =
+                        board
+                            .map
+                            .distance(position.x, position.y, enemy_pos.x, enemy_pos.y);
+                    dist_to_prop <= 3
+                        && dist_to_us >= state.stats.min_range
+                        && dist_to_us <= state.stats.max_range
+                });
+                if hits_threat {
+                    return true;
+                }
+            }
+
+            false
+        });
+
+        if supports_capture {
+            score += 3500;
+        }
+    }
     let parts = detailed.then_some(ScoreParts {
         terrain,
         positioning,
@@ -651,6 +741,26 @@ fn consider_wait(
             return;
         }
         recovery += FOREIGN_PRODUCTION_BLOCK_PENALTY;
+    }
+    // 川を渡れる歩兵が橋（Terrain::Bridge）の上で待機すると、
+    // 川を渡れない車両（戦車・自走砲・砲台・輸送車）の進路を物理的に塞ぐ。
+    // 新たに入って待機することは拒否し、既に居る場合も減点して退去を促す。
+    let is_bridge = board.map.get_terrain(tile.position.x, tile.position.y)
+        == Some(crate::resources::Terrain::Bridge);
+    let can_ford_river = crate::systems::movement::get_valid_movement_cost(
+        &board.registry,
+        state.stats.movement_type,
+        crate::resources::Terrain::River,
+    )
+    .is_some_and(|cost| cost < 99);
+    if is_bridge && can_ford_river {
+        if !tile.is_stationary {
+            if let Some(trace) = probe.as_deref_mut() {
+                trace.reject("wait_blocks_bridge_crossing", tile.position, || json!({}));
+            }
+            return;
+        }
+        recovery -= 10_000;
     }
     let mut score = tile.base_score + recovery;
     let holds_blockade = tile.blockade.holds_site;

@@ -2617,6 +2617,83 @@ fn prepare_campaign_local_assignment_scoped(
         | IslandCampaignDecision::Contest
         | IslandCampaignDecision::Reinforce => {
             let capture = local_entities(&assignment.capture_entities);
+            // 進軍路の配分案（V4）を遂行中なら、各進軍路を要衝と所属部隊を持つ作戦として
+            // 遂行する。占領は要衝の周りと中立の施設に絞り、戦闘部隊と、占領先の無い占領役は
+            // 進軍路作戦へ所属させる（所属は前の手番から引き継ぎ、他の割当へ引き抜かない）。
+            let posture_orders = (crate::ai::resolve_player_ai_version(world, player_id)
+                == crate::ai::ai_version::AiVersion::V4)
+                .then(|| {
+                    objective_allocation::posture_orders(world, player_id, assignment.island_id)
+                })
+                .flatten();
+            if let Some(orders) = &posture_orders {
+                let capture_responsibilities = campaign_assignment_capture_responsibilities(
+                    world,
+                    player_id,
+                    assignment,
+                    &capture,
+                    connectivity,
+                );
+                let (mut capture_responsibilities, released) =
+                    objective_allocation::restrict_captures_to_key_points(
+                        world,
+                        capture_responsibilities,
+                        orders,
+                    );
+                let released = objective_allocation::assign_uncovered_route_captures(
+                    world,
+                    &mut capture_responsibilities,
+                    released,
+                    orders,
+                );
+                let combat = assignment
+                    .combat_entities
+                    .iter()
+                    .copied()
+                    .filter(|entity| {
+                        cargo_is_landed_on_assignment_island(world, assignment, *entity)
+                            || entity_can_self_deploy_to_assignment_with_connectivity(
+                                world,
+                                assignment,
+                                *entity,
+                                connectivity,
+                            )
+                    })
+                    .collect::<Vec<_>>();
+                let units = combat.iter().chain(&released).copied().collect::<Vec<_>>();
+                let plan = route_operations::carry_over(world, manager, orders, &units);
+                let (route_responsibilities, route_members) = route_operations::responsibilities(
+                    world,
+                    player_id,
+                    assignment.island_id,
+                    orders,
+                    plan,
+                    connectivity,
+                );
+                // 占領へ回った占領役も所属から外すため、島の占領役も候補に含める。
+                let candidates = units.iter().chain(&capture).copied().collect::<Vec<_>>();
+                route_operations::record_membership(manager, orders, &candidates, &route_members);
+                scope.assign(
+                    world,
+                    manager,
+                    player_id,
+                    assignment.island_id,
+                    capture_responsibilities,
+                    &[MissionType::Capture],
+                );
+                scope.assign(
+                    world,
+                    manager,
+                    player_id,
+                    assignment.island_id,
+                    route_responsibilities,
+                    &[MissionType::Attack, MissionType::Defense],
+                );
+                scope.synchronize_departure(world, manager, player_id, assignment, connectivity);
+                synchronize_campaign_phases(world, manager, player_id, assignment);
+                route_operations::authorize_departures(manager, player_id, &route_members);
+                return;
+            }
             let capture_responsibilities = campaign_assignment_capture_responsibilities(
                 world,
                 player_id,
@@ -11146,6 +11223,7 @@ mod local_assignment;
 // 標準V4の施設を目的とする戦闘割当。
 mod objective_allocation;
 mod planning_policy;
+mod route_operations;
 
 // 再編本体と通常／拡張hookの差分契約。
 // 未追跡のテスト資産のため、ファイルが存在する場合だけ build.rs がcfgを立てる。

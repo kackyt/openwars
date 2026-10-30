@@ -411,6 +411,267 @@ impl Allocation {
     }
 }
 
+/// 占領目標を要衝の周りに絞るときの半径（マス）。要衝の地域（DAGの地域と同じ半径）に限り、
+/// 攻めの要衝が敵本拠の近くでも、その奥の施設へ占領役を散らさない。
+const KEY_POINT_CAPTURE_RADIUS: u32 =
+    crate::ai::v4::capital_route::model::CAPITAL_ROUTE_REGION_RADIUS;
+
+/// この島で遂行中の進軍路の配分案の要衝。配分案が無い、または要衝が別の島なら None。
+pub(super) fn posture_orders(
+    world: &World,
+    player: PlayerId,
+    island: IslandId,
+) -> Option<Vec<crate::ai::v4::capital_route::force_demand::RouteOrder>> {
+    let orders = world
+        .get_resource::<crate::ai::v4::capital_route::force_demand::RoutePostureMemory>()?
+        .by_player
+        .get(&player)?
+        .orders
+        .clone();
+    let islands = world.get_resource::<IslandMap>()?;
+    (!orders.is_empty()
+        && orders.iter().all(|order| {
+            islands
+                .get_island_at(&order.key_point)
+                .is_some_and(|found| found.id == island)
+        }))
+    .then_some(orders)
+}
+
+/// 配分案を遂行中なら、占領目標を要衝の周りの施設と中立の施設に絞る。敵陣深くの施設へ
+/// 占領役を送り出さない。戻り値は (残す占領責務, 占領先から外した占領役)。外した占領役は
+/// 進軍路作戦へ所属させる。
+pub(super) fn restrict_captures_to_key_points(
+    world: &World,
+    responsibilities: Vec<CampaignResponsibility>,
+    orders: &[crate::ai::v4::capital_route::force_demand::RouteOrder],
+) -> (Vec<CampaignResponsibility>, Vec<Entity>) {
+    let Some(map) = world.get_resource::<Map>() else {
+        return (responsibilities, Vec::new());
+    };
+    // 占領目標を絞らない（route_capture_all）。ただし守りの進軍路（ゴーサインを
+    // 出していない最低限の守り）の側の施設は、守りの要衝の周りに限る。
+    let capture_all = crate::ai::features::route_capture_all_enabled();
+    let mut kept = Vec::new();
+    let mut released = Vec::new();
+    for responsibility in responsibilities {
+        let player = responsibility
+            .members
+            .iter()
+            .find_map(|member| world.get::<Faction>(*member).map(|faction| faction.0));
+        let allowed = if capture_all {
+            player.is_none_or(|player| {
+                capture_target_allowed(world, map, player, responsibility.target, orders)
+            })
+        } else {
+            key_point_capture_target(world, map, responsibility.target, orders)
+        };
+        if allowed {
+            kept.push(responsibility);
+        } else {
+            released.extend(responsibility.members);
+        }
+    }
+    (kept, released)
+}
+
+/// 敵の施設を占領しに行く見込みがあるか: 施設の周り [`CAPTURE_ENEMY_RADIUS`] マスの敵の
+/// 戦力が、周り [`CAPTURE_OWN_RADIUS`] マスの自軍の戦力以下。中立・自軍の施設は常に行く。
+/// 対局ログ（分岐シミュレーション36局、T10〜17）では、この判定で待つとした敵の施設は
+/// 4手番以内に一度も取れず（1580件で0%）、占領役は敵陣の手前で詰まっていた。行くとした
+/// 西の都市は23%を取れた。取れない施設へ占領役を割り振らず、取れる施設へ回す。
+fn capture_is_holdable(world: &World, map: &Map, player: PlayerId, target: GridPosition) -> bool {
+    let owner = world.iter_entities().find_map(|entity| {
+        (entity.get::<GridPosition>() == Some(&target))
+            .then(|| entity.get::<Property>().map(|property| property.owner_id))
+            .flatten()
+    });
+    if !owner.flatten().is_some_and(|owner| owner != player) {
+        return true;
+    }
+    let mut enemy = 0_u64;
+    let mut own = 0_u64;
+    for entity in world.iter_entities() {
+        let (Some(position), Some(faction), Some(stats)) = (
+            entity.get::<GridPosition>(),
+            entity.get::<Faction>(),
+            entity.get::<UnitStats>(),
+        ) else {
+            continue;
+        };
+        let hp = entity
+            .get::<crate::components::Health>()
+            .map_or(100, |health| health.current);
+        let value = u64::from(stats.cost) * u64::from(hp) / 100;
+        let distance = map.distance(position.x, position.y, target.x, target.y);
+        if faction.0 == player {
+            if distance <= CAPTURE_OWN_RADIUS {
+                own += value;
+            }
+        } else if distance <= CAPTURE_ENEMY_RADIUS {
+            enemy += value;
+        }
+    }
+    // 周囲に自軍の強力な支援戦力（20,000以上）がいる場合、または自軍が敵戦力の過半を持っているなら占領認可する
+    own >= enemy || (own >= 20_000 && own.saturating_mul(2) >= enemy)
+}
+
+/// 配分案を遂行中（占領目標を絞らない実験 OPENWARS_ROUTE_CAPTURE_ALL を含む）に、占領役を
+/// 割り振ってよい施設か: 守りの進軍路の先（[`beyond_defended_route`]）ではなく、取れる見込みが
+/// ある（[`capture_is_holdable`]）。占領役を割り振る前に目標を絞り、近い占領役が取れない施設に
+/// 取られて、取れる施設（攻めの進軍路の都市）の担当が遠い占領役だけになるのを防ぐ。
+pub(super) fn capture_target_allowed(
+    world: &World,
+    map: &Map,
+    player: PlayerId,
+    target: GridPosition,
+    orders: &[crate::ai::v4::capital_route::force_demand::RouteOrder],
+) -> bool {
+    !beyond_defended_route(map, target, orders) && capture_is_holdable(world, map, player, target)
+}
+
+/// 進軍路作戦へ回す占領役（released）のうち、まだ誰も占領に向かっていない攻勢進軍路上の
+/// 取れる見込みのある施設へ、余った占領役を1施設1体ずつ割り当てる。
+/// 全員が同じ1都市（Milestone）に殺到して渋滞を起こすのを防ぎ、取れる都市を並行して奪還する。
+pub(super) fn assign_uncovered_route_captures(
+    world: &World,
+    capture_responsibilities: &mut Vec<CampaignResponsibility>,
+    released: Vec<Entity>,
+    orders: &[crate::ai::v4::capital_route::force_demand::RouteOrder],
+) -> Vec<Entity> {
+    let Some(map) = world.get_resource::<Map>() else {
+        return released;
+    };
+    let mut covered = capture_responsibilities
+        .iter()
+        .map(|r| r.target)
+        .collect::<crate::collections::HashSet<_>>();
+    let mut remaining = Vec::new();
+    let mut capturers = Vec::new();
+    for entity in released {
+        if world
+            .get::<UnitStats>(entity)
+            .is_some_and(|stats| stats.can_capture)
+        {
+            capturers.push(entity);
+        } else {
+            remaining.push(entity);
+        }
+    }
+    if capturers.is_empty() {
+        return remaining;
+    }
+    let player = world
+        .get::<Faction>(capturers[0])
+        .map(|faction| faction.0)
+        .unwrap_or(PlayerId(0));
+
+    // 島内の未所有施設のうち、まだ誰も向かっておらず、かつ占領認可される施設を探す
+    let mut candidates = world
+        .iter_entities()
+        .filter_map(|entity| {
+            let position = *entity.get::<GridPosition>()?;
+            let property = entity.get::<Property>()?;
+            (property.owner_id != Some(player)
+                && !covered.contains(&position)
+                && capture_target_allowed(world, map, player, position, orders))
+            .then_some(position)
+        })
+        .collect::<Vec<_>>();
+
+    // 攻勢進軍路の要衝に近い施設から順に割り当てる
+    let attack_key = orders.iter().find(|o| !o.defend).map(|o| o.key_point);
+    if let Some(key) = attack_key {
+        candidates.sort_by_key(|pos| map.distance(pos.x, pos.y, key.x, key.y));
+    }
+
+    for target in candidates {
+        if capturers.is_empty() {
+            break;
+        }
+        // 最も近い占領役を選ぶ
+        let nearest_idx = capturers
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, entity)| {
+                world.get::<GridPosition>(**entity).map_or(u32::MAX, |pos| {
+                    map.distance(pos.x, pos.y, target.x, target.y)
+                })
+            })
+            .map(|(idx, _)| idx);
+
+        if let Some(idx) = nearest_idx {
+            let entity = capturers.remove(idx);
+            covered.insert(target);
+            capture_responsibilities.push(CampaignResponsibility {
+                mission_type: MissionType::Capture,
+                target,
+                members: vec![entity],
+            });
+        }
+    }
+
+    remaining.extend(capturers);
+    remaining
+}
+
+/// [`capture_is_holdable`] で数える敵の範囲（施設からのマス数）。
+const CAPTURE_ENEMY_RADIUS: u32 = 3;
+
+/// [`capture_is_holdable`] で数える自軍の範囲（施設からのマス数）。占領役の後ろから
+/// 詰めてくる戦力も数える。
+const CAPTURE_OWN_RADIUS: u32 = 6;
+
+/// 守りの進軍路の側で、守りの要衝の周りより先にある施設か。施設に最も近い要衝（攻めの作戦は
+/// 要衝と集結点、守りの作戦は要衝）が守りの作戦のもので、その要衝の地域
+/// （[`KEY_POINT_CAPTURE_RADIUS`]）の外にある。守りの進軍路には前へ出るゴーサインを出していない
+/// ので、そこへ占領役を送らない（工場付近で守る）。
+pub(super) fn beyond_defended_route(
+    map: &Map,
+    target: GridPosition,
+    orders: &[crate::ai::v4::capital_route::force_demand::RouteOrder],
+) -> bool {
+    let distance = |point: GridPosition| map.distance(point.x, point.y, target.x, target.y);
+    let nearest = orders
+        .iter()
+        .flat_map(|order| {
+            let points = if order.defend {
+                vec![order.key_point]
+            } else {
+                vec![order.key_point, order.staging]
+            };
+            points.into_iter().map(move |point| (point, order.defend))
+        })
+        .min_by_key(|(point, defend)| (distance(*point), !*defend, point.y, point.x));
+    nearest.is_some_and(|(point, defend)| defend && distance(point) > KEY_POINT_CAPTURE_RADIUS)
+}
+
+/// 配分案を遂行中に占領へ向かってよい施設か。中立の施設か、要衝の周りの施設。
+fn key_point_capture_target(
+    world: &World,
+    map: &Map,
+    target: GridPosition,
+    orders: &[crate::ai::v4::capital_route::force_demand::RouteOrder],
+) -> bool {
+    let neutral = world.iter_entities().any(|entity| {
+        entity.get::<GridPosition>() == Some(&target)
+            && entity
+                .get::<Property>()
+                .is_some_and(|property| property.owner_id.is_none())
+    });
+    // 実験: 半径を変える（OPENWARS_ROUTE_CAPTURE_RADIUS）。
+    let radius = std::env::var("OPENWARS_ROUTE_CAPTURE_RADIUS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(KEY_POINT_CAPTURE_RADIUS);
+    neutral
+        || orders.iter().any(|order| {
+            [order.key_point, order.staging]
+                .iter()
+                .any(|point| map.distance(point.x, point.y, target.x, target.y) <= radius)
+        })
+}
+
 /// 余った戦闘役を首都ルートの前線へ配る。配った戦闘役は `remaining` から外す。
 fn route_front_responsibilities(
     world: &World,
@@ -526,6 +787,60 @@ pub(super) fn objective_combat_responsibilities(
     objectives: &[GridPosition],
     connectivity: &mut TerrainConnectivity,
 ) -> Vec<CampaignResponsibility> {
+    combat_responsibilities_for_objectives(
+        world,
+        player,
+        island,
+        members,
+        capture_members,
+        objectives,
+        connectivity,
+        false,
+    )
+}
+
+/// 進軍路作戦の所属部隊だけで、作戦の目標（要衝または集結点）を妨げる敵へ有効な部隊を
+/// 割り当て、残りを目標へ前進させる。島の他の施設の敵や他の進軍路へは配らない。
+pub(super) fn route_operation_responsibilities(
+    world: &World,
+    player: PlayerId,
+    island: IslandId,
+    members: &[Entity],
+    objective: GridPosition,
+    connectivity: &mut TerrainConnectivity,
+) -> Vec<CampaignResponsibility> {
+    let capturers = members
+        .iter()
+        .copied()
+        .filter(|member| {
+            world
+                .get::<UnitStats>(*member)
+                .is_some_and(|stats| stats.can_capture)
+        })
+        .collect::<Vec<_>>();
+    combat_responsibilities_for_objectives(
+        world,
+        player,
+        island,
+        members,
+        &capturers,
+        &[objective],
+        connectivity,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn combat_responsibilities_for_objectives(
+    world: &World,
+    player: PlayerId,
+    island: IslandId,
+    members: &[Entity],
+    capture_members: &[Entity],
+    objectives: &[GridPosition],
+    connectivity: &mut TerrainConnectivity,
+    local_only: bool,
+) -> Vec<CampaignResponsibility> {
     let objectives = &objectives[..objectives.len().min(MAX_OBJECTIVES)];
     let (Some(map), Some(data), Some(chart), Some(islands)) = (
         world.get_resource::<Map>(),
@@ -608,19 +923,24 @@ pub(super) fn objective_combat_responsibilities(
 
     // 2. 余った戦力は、島内に残る未確保施設（敵の工場・首都を含む）を守る敵へ回す。
     //    施設から離れて動く敵は対象外にし、島中の敵を追い回さない。
-    let remaining_properties = world
-        .iter_entities()
-        .filter_map(|entity| {
-            let position = *entity.get::<GridPosition>()?;
-            let property = entity.get::<Property>()?;
-            (property.owner_id != Some(player)
-                && board
-                    .islands
-                    .get_island_at(&position)
-                    .is_some_and(|found| found.id == island))
-            .then_some(position)
-        })
-        .collect::<Vec<_>>();
+    //    進軍路作戦（local_only）は作戦の目標だけを扱い、島の他の施設へは配らない。
+    let remaining_properties = if local_only {
+        Vec::new()
+    } else {
+        world
+            .iter_entities()
+            .filter_map(|entity| {
+                let position = *entity.get::<GridPosition>()?;
+                let property = entity.get::<Property>()?;
+                (property.owner_id != Some(player)
+                    && board
+                        .islands
+                        .get_island_at(&position)
+                        .is_some_and(|found| found.id == island))
+                .then_some(position)
+            })
+            .collect::<Vec<_>>()
+    };
     let guard_deadlines = vec![GUARD_TURNS; remaining_properties.len()];
     let mut guards = objective_threats(
         &board,
@@ -675,13 +995,15 @@ pub(super) fn objective_combat_responsibilities(
     // 進軍路が2本以上の島では、余った戦闘役を占領目標そのものへ集めず、首都ルートの
     // 各進軍路の現在の前線へ、ルートごとの必要戦力に応じて配る。進軍路が1本以下の島は従来どおり
     // 占領目標へ前進させる。
-    responsibilities.extend(route_front_responsibilities(
-        world,
-        board.map,
-        player,
-        island,
-        &mut remaining,
-    ));
+    if !local_only {
+        responsibilities.extend(route_front_responsibilities(
+            world,
+            board.map,
+            player,
+            island,
+            &mut remaining,
+        ));
+    }
     responsibilities.extend(campaign_advance_responsibilities(
         world,
         &mut remaining,

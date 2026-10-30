@@ -176,7 +176,8 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
         });
     }
 
-    let campaign_surplus = match decide_campaign_production_v4(world, player_id, policy) {
+    let campaign_control = decide_campaign_production_v4(world, player_id, policy);
+    let campaign_surplus = match campaign_control {
         CampaignProductionControl::Command(command) => return vec![command],
         CampaignProductionControl::BlockGeneric => return Vec::new(),
         CampaignProductionControl::ContinueWithSurplus(budget) => Some(budget),
@@ -197,6 +198,28 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
         world.insert_resource(turn_plan);
         return Vec::new();
     };
+    // 遂行する進軍路の配分案を、地域の状況が変わるまで持ち越す。比べる進軍路が無くなれば
+    // 要衝の指示も消し、Squadへ古い要衝を渡さない。生産も攻めの進軍路の砲台を揃えるのに
+    // 配分案を読むので、走査結果には残しておく。
+    let memory = world.get_resource_or_insert_with(
+        crate::ai::v4::capital_route::force_demand::RoutePostureMemory::default,
+    );
+    match scan.route_posture.clone() {
+        Some(decision) => {
+            if std::env::var_os("OPENWARS_CONCENTRATE_DEBUG").is_some() {
+                eprintln!(
+                    "ROUTE_ORDERS P{} T{} main={:?} orders={:?}",
+                    player_id.0, turn, decision.main, decision.orders
+                );
+            }
+            memory.into_inner().by_player.insert(player_id, decision);
+        }
+        None => {
+            if memory.by_player.contains_key(&player_id) {
+                memory.into_inner().by_player.remove(&player_id);
+            }
+        }
+    }
     // 敵の初期配置は学習せず、前回走査後に現れた実Entityだけで次手番を予測する。
     let enemy_production_forecast = if policy.reports_property_control() {
         enemy_forecast::observe_enemy_production(world, player_id, turn, &scan)
@@ -204,6 +227,8 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
         EnemyProductionForecastTrace::default()
     };
     scan.enemy_production_forecast = enemy_production_forecast;
+    scan.attack_route_guns =
+        crate::ai::v4::artillery_ferry::attack_route_gun_supply(world, player_id);
     if let Some(budget) = campaign_surplus {
         scan.funds = scan.funds.min(budget);
     }

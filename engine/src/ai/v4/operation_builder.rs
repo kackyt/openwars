@@ -1061,8 +1061,18 @@ fn observed_operation_facts(
     // 輸送 1 往復にかかるターン数（片道リードタイムの 2 倍）
     let transport_round_trip_turns = deploy_lead_time.saturating_mul(2).max(1);
 
+    // 防衛作戦の対象は守る地点であり、自軍が保持している拠点に占領要員は要らない。
+    // 敵や中立に渡っている拠点だけを、奪還のための占領対象として数える。
+    let target_property_count = if kind == OperationKind::Defense {
+        cluster
+            .iter()
+            .filter(|position| scan.open_properties.contains(position))
+            .count()
+    } else {
+        cluster.len()
+    };
     OperationFacts {
-        target_property_count: cluster.len() as u32,
+        target_property_count: target_property_count as u32,
         friendly_capture_units_committed,
         enemy_combat_units,
         friendly_combat_units_committed,
