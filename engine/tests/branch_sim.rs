@@ -213,6 +213,7 @@ fn snapshot_json(world: &mut World, md: &MasterDataRegistry, round: u32) -> serd
                 "x": position.x,
                 "y": position.y,
                 "owner": property.owner_id.map(|owner| owner.0),
+                "capture_points": property.capture_points,
                 "terrain": format!("{:?}", property.terrain),
             })
         })
