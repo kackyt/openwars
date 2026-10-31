@@ -1004,18 +1004,41 @@ fn combat_responsibilities_for_objectives(
             &mut remaining,
         ));
     }
+    let route_fronts = crate::ai::v4::capital_route::node_operation::capital_route_current_fronts(
+        world, player, island,
+    )
+    .unwrap_or_else(|| {
+        crate::ai::v4::capital_route::topology::same_land_route_fronts(world, player, island)
+    });
+    let is_same_land =
+        crate::ai::v4::capital_route::topology::is_same_land_capital_island(world, player, island);
+    // 同一陸地の首都戦役では、余った戦闘部隊は後方の占領目標ではなく首都進軍路の前線へ前進させる。
+    let advance_destinations = if is_same_land && !route_fronts.is_empty() {
+        route_fronts.as_slice()
+    } else {
+        objectives
+    };
     responsibilities.extend(campaign_advance_responsibilities(
         world,
         &mut remaining,
-        objectives,
+        advance_destinations,
         connectivity,
     ));
+    let advance_targets = if is_same_land && !route_fronts.is_empty() {
+        route_fronts.as_slice()
+    } else if !objectives.is_empty() {
+        objectives
+    } else if !route_fronts.is_empty() {
+        route_fronts.as_slice()
+    } else {
+        &[]
+    };
     responsibilities.extend(campaign_combat_responsibilities(
         world,
         player,
         island,
         &remaining,
-        &[],
+        advance_targets,
         connectivity,
     ));
     responsibilities

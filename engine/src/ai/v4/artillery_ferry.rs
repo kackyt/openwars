@@ -175,6 +175,7 @@ pub(crate) fn decide_artillery_ferry(
         .or_else(|| ferry.board())
         .or_else(|| ferry.meet())
         .or_else(|| ferry.tend())
+        .or_else(|| ferry.vacate_facility())
         .or_else(|| ferry.hold());
     if std::env::var("OPENWARS_ARTILLERY_FERRY_DEBUG").is_ok() {
         let guns = board
@@ -539,11 +540,18 @@ impl ArtilleryFerry<'_> {
     }
 
     /// 降ろす位置の評価: 次の手番に撃てる敵の価値から、その位置で受ける損害の価値を引く。
+    /// 自軍都市の上ならターン開始時に修復（最大20HP）が効くため、受ける損害の実効リスクが相殺される。
     fn emplacement_value(&self, gun: &BoardUnit, cell: Cell) -> i64 {
         let Some((_, shot)) = self.best_shot(gun, cell) else {
             return 0;
         };
-        let risk = i64::from(self.threat.damage_hp(gun, cell)) * i64::from(gun.stats.cost) / 100;
+        let damage_hp = self.threat.damage_hp(gun, cell);
+        let net_damage_hp = if self.on_own_property(cell) {
+            damage_hp.saturating_sub(20)
+        } else {
+            damage_hp
+        };
+        let risk = i64::from(net_damage_hp) * i64::from(gun.stats.cost) / 100;
         shot - risk
     }
 
@@ -570,6 +578,26 @@ impl ArtilleryFerry<'_> {
                     enemy.position.y,
                 ) < reach
         })
+    }
+
+    /// 自軍に盾（スクリーン）を形成できる直接戦闘部隊が存在するか。
+    fn has_direct_escorts(&self) -> bool {
+        self.own()
+            .any(|unit| unit.stats.min_range <= 1 && unit.stats.max_cargo == 0)
+    }
+
+    /// 砲台を守る味方の直接部隊が存在するか。孤立無援の危険地帯への据え付けを防ぐ。
+    /// 都市であれ平地であれ、敵が存在し自軍に直接部隊がいる限り、前方に味方直接部隊の盾（screened）が
+    /// 存在することを完全必須化し、味方の援護がない場所への布陣を禁止する。
+    fn can_safely_emplace(&self, gun: &BoardUnit, cell: Cell) -> bool {
+        if self.enemies().next().is_none() {
+            return true;
+        }
+        if self.has_direct_escorts() {
+            return self.screened(cell);
+        }
+        // 直接部隊がいない環境（単体テスト等）では、敵からの被弾脅威がゼロの安全な場所のみ許可する
+        self.threat.damage_hp(gun, cell) == 0
     }
 
     /// `origin` から輸送車で `turns` 手番以内に運べる陣地と、その評価（[`Self::emplacement_value`]）・
@@ -608,7 +636,8 @@ impl ArtilleryFerry<'_> {
                     && self.in_zone(gun, *cell)
                     && !self.on_own_facility(*cell)
                     && !self.on_unowned_property(*cell)
-                    && self.screened(*cell)
+                    && !self.is_city_reserved_for_repair(*cell, gun)
+                    && self.can_safely_emplace(gun, *cell)
             })
             .filter_map(|(cell, cost)| {
                 let value = self.emplacement_value(gun, cell);
@@ -768,6 +797,28 @@ impl ArtilleryFerry<'_> {
             .any(|neighbor| self.passable(&gun.stats, neighbor))
     }
 
+    /// そのセルが自軍都市であり、かつ周囲の味方直接戦闘部隊の回復のために空けておくべきか。
+    /// 都市の周囲（距離 2 以内）に消耗（HP <= 75）して回復を必要としている味方直接部隊が居る場合、
+    /// その部隊の回復を阻害しないよう都市を空けておく。
+    fn is_city_reserved_for_repair(&self, cell: Cell, gun: &BoardUnit) -> bool {
+        if !self.on_own_property(cell) {
+            return false;
+        }
+        let gun_needs_service = gun.health.is_some_and(|h| h < 100)
+            || gun.ammo.is_some_and(|(curr, _)| curr <= 3)
+            || gun.fuel.is_some_and(|f| f <= 10);
+        if gun_needs_service {
+            return false;
+        }
+        self.own().any(|unit| {
+            unit.entity != gun.entity
+                && !is_ferried_gun(&unit.stats)
+                && !is_artillery_carrier(&unit.stats)
+                && unit.health.is_some_and(|h| h <= 75)
+                && self.distance(cell, unit.position) <= 2
+        })
+    }
+
     fn has_room(&self, carrier: &BoardUnit) -> bool {
         carrier
             .cargo
@@ -910,8 +961,8 @@ impl ArtilleryFerry<'_> {
             vec![current]
         };
         let hp = carrier.health.unwrap_or(100).max(1);
-        // (輸送車が撃破されない, 降ろす位置の評価, 自軍の拠点, 輸送車の被弾が少ない, 座標)。
-        type DropKey = (bool, i64, bool, Reverse<u32>, Reverse<(Cell, Cell)>);
+        // (輸送車が撃破されない, 降ろす位置の評価, 輸送車の被弾が少ない, 座標)。
+        type DropKey = (bool, i64, Reverse<u32>, Reverse<(Cell, Cell)>);
         let mut best_drop: Option<DropKey> = None;
         // (撃破されない, 前線に近い, 被弾が少ない, 座標) が最大の移動先。
         type MoveKey = (bool, Reverse<u32>, Reverse<u32>, Reverse<Cell>);
@@ -929,7 +980,7 @@ impl ArtilleryFerry<'_> {
                     .or_else(|| self.guards.get(&gun.entity))
                     .map(|point| Self::cell(*point))
             });
-        let frontline = self.frontline_city(gun).filter(|_| destination.is_none());
+        let frontline = self.frontline_city(gun);
         let travel = destination
             .or(frontline.map(Self::cell))
             .map(|goal| self.travel_costs(carrier, goal));
@@ -968,7 +1019,8 @@ impl ArtilleryFerry<'_> {
                     || !self.in_zone(gun, cell)
                     || self.on_own_facility(cell)
                     || self.on_unowned_property(cell)
-                    || (self.guards.contains_key(&gun.entity) && !self.screened(cell))
+                    || self.is_city_reserved_for_repair(cell, gun)
+                    || !self.can_safely_emplace(gun, cell)
                 {
                     continue;
                 }
@@ -976,19 +1028,13 @@ impl ArtilleryFerry<'_> {
                 if value <= 0 {
                     continue;
                 }
-                let key = (
-                    survives,
-                    value,
-                    self.on_own_property(cell),
-                    Reverse(threat_hp),
-                    Reverse((stop, cell)),
-                );
+                let key = (survives, value, Reverse(threat_hp), Reverse((stop, cell)));
                 if best_drop.is_none_or(|best| key > best) {
                     best_drop = Some(key);
                 }
             }
         }
-        if let Some((true, _, _, _, Reverse((stop, cell)))) = best_drop {
+        if let Some((true, _, _, Reverse((stop, cell)))) = best_drop {
             return Some(AiCommand::Drop {
                 transport_target_pos: GridPosition {
                     x: stop.0,
@@ -1002,10 +1048,9 @@ impl ArtilleryFerry<'_> {
             });
         }
         // 受け持ちの範囲まで来たのに撃てる位置が無ければ、範囲の中の盾の後ろ（味方より前に
-        // 出ない）に据えて待つ。攻めの砲台は要衝から射程以内まで来てから要衝に最も近いマスへ
-        // （それより手前では輸送車が前へ進み続ける）。守りの砲台は寄ってくる敵に最も近いマス
-        // （敵が来れば撃てる）。
-        // 撃てる位置が出るまで積んだまま走り回ると、着いた砲台がいつまでも撃てない。
+        // 出ない）に据えて待つ。攻めの砲台は要衝から射程以内（距離<=3）まで前進してから据える。
+        // ただし、味方スクリーンに守られた自軍都市（修復・自動補給拠点）に到達した場合は
+        // 敵の接近を安全に待ち受けるため早期据え付けを許可する。
         if let Some(home) = self
             .routes
             .get(&gun.entity)
@@ -1035,8 +1080,12 @@ impl ArtilleryFerry<'_> {
                         && self.in_zone(gun, *cell)
                         && !self.on_own_facility(*cell)
                         && !self.on_unowned_property(*cell)
-                        && (self.screened(*cell) || self.enemies().next().is_none())
-                        && (!attacking || self.distance(*cell, home) <= gun.stats.max_range)
+                        && !self.is_city_reserved_for_repair(*cell, gun)
+                        && self.can_safely_emplace(gun, *cell)
+                        && (!attacking
+                            || self.distance(*cell, home) <= 3
+                            || self.on_own_property(*cell)
+                            || !fresh)
                 })
                 .min_by_key(|(stop, cell)| {
                     let toward = if attacking {
@@ -1063,7 +1112,7 @@ impl ArtilleryFerry<'_> {
                 });
             }
         }
-        // 前線の都市の隣まで来られるなら、都市の上へ据える。
+        // 前線の都市の隣まで来られるなら、味方の盾の後ろであることを厳格に確認して都市の上へ据える。
         if let Some(city) = frontline {
             let city_cell = Self::cell(city);
             let city_free = city_cell == current || !self.occupancy.contains_key(&city_cell);
@@ -1078,6 +1127,8 @@ impl ArtilleryFerry<'_> {
                     && *stop != city_cell
                     && self.distance(*stop, city) == 1
                     && self.passable(&gun.stats, city_cell)
+                    && !self.is_city_reserved_for_repair(city_cell, gun)
+                    && self.can_safely_emplace(gun, city_cell)
             })
             .max_by_key(|stop| {
                 let threat_hp = self.threat.damage_hp(carrier, *stop);
@@ -1122,17 +1173,34 @@ impl ArtilleryFerry<'_> {
             .collect()
     }
 
-    /// 撃てる敵の居ない砲台に、運んで撃てる場所があるか。攻めの砲台・守りの砲台は、受け持ちの
-    /// 範囲に撃てる陣地があるときだけ運ぶ（無ければ据えたまま待つ。積んで同じマスへ降ろし
-    /// 直すだけになる）。配分案の無い砲台は運ぶ。
+    /// 撃てる敵の居ない砲台に、運んで撃てる場所、または前進すべき攻めの作戦目標があるか。
     fn has_better_place(&self, gun: &BoardUnit) -> bool {
+        let current = Self::cell(gun.position);
+        // 自軍の生産施設（工場・首都など）の上にいる砲台は、施設を空けて後続の生産を
+        // 可能にするために絶対に運ぶ。
+        if self.on_own_facility(current) {
+            return true;
+        }
+        // 配分案の無い砲台は常に運ぶ。
         if !self.routes.contains_key(&gun.entity) && !self.guards.contains_key(&gun.entity) {
             return true;
         }
-        let current = Self::cell(gun.position);
-        self.sites(gun, current, FAR_SITE_SEARCH_TURNS)
+        // 4手番以内に今すぐ敵を撃てる陣地があるなら運ぶ。
+        if self
+            .sites(gun, current, FAR_SITE_SEARCH_TURNS)
             .iter()
             .any(|(cell, ..)| *cell != current)
+        {
+            return true;
+        }
+        // 攻めの砲台は、撃てる敵が居なくなっても要衝（進軍目標）が遠いなら前進のために運ぶ。
+        // （守りの砲台は陣地で寄ってくる敵を待つため、前進運搬はしない）
+        if let Some(home) = self.routes.get(&gun.entity)
+            && self.distance(current, *home) > 2
+        {
+            return true;
+        }
+        false
     }
 
     /// 砲台がそのセルへ1歩で乗り込めるか。
@@ -1278,14 +1346,91 @@ impl ArtilleryFerry<'_> {
             })
     }
 
+    /// 5.5 自軍生産施設（工場・首都など）の上にいる補給輸送車や砲台は、
+    ///     施設を塞いで後続の生産を止めることを防ぐため、施設の外へ退く（vacate）。
+    fn vacate_facility(&self) -> Option<(Entity, AiCommand)> {
+        // まず補給輸送車: 移動力があるので前線方向の空きマスへ進む
+        for carrier in self.own().filter(|unit| {
+            is_artillery_carrier(&unit.stats)
+                && self.can_act(unit)
+                && !self.moved.contains(&unit.entity)
+                && self.on_own_facility(Self::cell(unit.position))
+        }) {
+            let current = Self::cell(carrier.position);
+            let hp = carrier.health.unwrap_or(100).max(1);
+            let best_stop = self
+                .stops(carrier)
+                .into_iter()
+                .filter(|stop| *stop != current && !self.on_own_facility(*stop))
+                .min_by_key(|stop| {
+                    let nearest_enemy = self
+                        .enemies()
+                        .map(|e| self.distance(*stop, e.position))
+                        .min()
+                        .unwrap_or(u32::MAX);
+                    let threat_hp = self.threat.damage_hp(carrier, *stop);
+                    (threat_hp >= hp, nearest_enemy, threat_hp, *stop)
+                });
+            if let Some(stop) = best_stop {
+                return Some((
+                    carrier.entity,
+                    AiCommand::Wait {
+                        target_pos: GridPosition {
+                            x: stop.0,
+                            y: stop.1,
+                        },
+                    },
+                ));
+            }
+        }
+        // 砲台: 工場の上にいる砲台で、隣に空いている平地等があれば1歩出て工場を空ける
+        for gun in self.own().filter(|unit| {
+            is_ferried_gun(&unit.stats)
+                && self.can_act(unit)
+                && !self.moved.contains(&unit.entity)
+                && unit.fuel.is_none_or(|f| f > 0)
+                && self.on_own_facility(Self::cell(unit.position))
+        }) {
+            let current = Self::cell(gun.position);
+            let empty_adjacent = self
+                .board
+                .map
+                .get_adjacent(current.0, current.1)
+                .into_iter()
+                .filter(|cell| {
+                    !self.occupancy.contains_key(cell)
+                        && self.passable(&gun.stats, *cell)
+                        && !self.on_own_facility(*cell)
+                })
+                .min_by_key(|cell| {
+                    let threat = self.threat.damage_hp(gun, *cell);
+                    (threat, *cell)
+                });
+            if let Some(target) = empty_adjacent {
+                return Some((
+                    gun.entity,
+                    AiCommand::Wait {
+                        target_pos: GridPosition {
+                            x: target.0,
+                            y: target.1,
+                        },
+                    },
+                ));
+            }
+        }
+        None
+    }
+
     /// 6. 砲台と、交戦中の砲台の補給に残る補給輸送車は、動かずにその場で待つ。砲台は燃料1で、
     ///    自分で1歩動くと輸送車へ乗れなくなるので、迎えを待つ砲台も通常の戦術で動かさない。
+    ///    ただし、自軍の生産施設の上にいる場合は後続の生産を塞ぐため待機させない。
     fn hold(&self) -> Option<(Entity, AiCommand)> {
         self.own()
             .find(|unit| {
                 self.can_act(unit)
                     && !self.moved.contains(&unit.entity)
                     && (is_ferried_gun(&unit.stats) || self.tends_engaged_gun(unit))
+                    && !self.on_own_facility(Self::cell(unit.position))
             })
             .map(|unit| {
                 (

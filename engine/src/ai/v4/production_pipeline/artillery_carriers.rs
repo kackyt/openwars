@@ -44,6 +44,18 @@ pub(super) fn allocate_artillery_carriers(
         .filter(|unit| is_ferried_gun(&unit.stats))
         .map(|unit| unit.pos)
         .collect::<Vec<_>>();
+    // 近くに補給輸送車が居ない孤立した砲台（護衛を失って前線に取り残された砲台）。
+    let unescorted_guns = scan
+        .my_units
+        .iter()
+        .filter(|unit| {
+            is_ferried_gun(&unit.stats)
+                && !carriers
+                    .iter()
+                    .any(|c| scan.map.distance(c.pos.x, c.pos.y, unit.pos.x, unit.pos.y) <= 2)
+        })
+        .map(|unit| unit.pos)
+        .collect::<Vec<_>>();
     place_new_guns_for_fastest_emplacement(
         input,
         state,
@@ -113,14 +125,21 @@ pub(super) fn allocate_artillery_carriers(
                     .map(|gun| scan.map.distance(position.x, position.y, gun.x, gun.y))
                     .min()
                     .unwrap_or(u32::MAX);
+                let to_unescorted = unescorted_guns
+                    .iter()
+                    .map(|gun| scan.map.distance(position.x, position.y, gun.x, gun.y))
+                    .min()
+                    .unwrap_or(u32::MAX);
                 let to_existing = guns
                     .iter()
                     .map(|gun| scan.map.distance(position.x, position.y, gun.x, gun.y))
                     .min()
                     .unwrap_or(u32::MAX);
-                // 組で買った砲台の輸送車は、その砲台の隣に置く。
+                // 組で買った砲台の輸送車はその砲台の隣に置き、既存の孤立砲台があればそれに近い施設を優先。
                 let nearest = if prepaid > 0 {
                     to_new
+                } else if !unescorted_guns.is_empty() {
+                    to_unescorted
                 } else {
                     to_new.min(to_existing)
                 };

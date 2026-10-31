@@ -158,10 +158,13 @@ impl ApproachDistances<'_> {
     ) -> Option<Approach> {
         let mut nearest: Option<Approach> = None;
         for target in targets {
-            let candidate = (
-                self.turns(stats, from, target, range),
-                manhattan(from, target),
-            );
+            let turns = self.turns(stats, from, target, range);
+            // 陸上直接部隊（射程 <= 1）で海などにより到達不能（used_mp == UNREACHABLE_MP）な敵は、
+            // 直線マンハッタン距離だけで海岸線へ吸い寄せられて袋小路で行き止まりになるのを防ぐ。
+            if stats.max_range <= 1 && turns.used_mp == UNREACHABLE_MP {
+                continue;
+            }
+            let candidate = (turns, manhattan(from, target));
             if nearest.is_none_or(|current| candidate < current) {
                 nearest = Some(candidate);
             }

@@ -382,17 +382,20 @@ pub(super) fn indirect_upgrade_preserves_direct_plan(
     candidate: &ForcePackagePlan,
     direct_plan: &ForcePackagePlan,
 ) -> bool {
-    let (candidate_capture_count, candidate_direct_count) =
+    let (candidate_capture_count, _candidate_direct_count) =
         current_direct_role_counts(input, candidate);
-    let (direct_capture_count, direct_direct_count) =
+    let (direct_capture_count, _direct_direct_count) =
         current_direct_role_counts(input, direct_plan);
     let preserves_current_direct_roles = if uses_small_map_tactical_rules(input) {
         // 小規模mapでは、前線の壁役（直接射点）が完全に消滅しない限り、
         // 狭隘地形（橋など）の後方から撃てる間接部隊への置き換えを認める。
         candidate.direct_fire_lane_count > 0 || direct_plan.direct_fire_lane_count == 0
     } else {
-        // 標準mapは既存の汎用編成比較をそのまま残す。
-        candidate_direct_count >= direct_direct_count
+        // 標準mapでも、前線の壁役（直接射点）が維持されているか、
+        // あるいは直接射点が存在しない（または間接が有効）なら間接部隊への置き換えを認める。
+        candidate.direct_fire_lane_count >= direct_plan.direct_fire_lane_count
+            || candidate.direct_fire_lane_count > 0
+            || direct_plan.direct_fire_lane_count == 0
     };
     candidate.cleared_capture_lane_count() >= direct_plan.cleared_capture_lane_count()
         && candidate_capture_count >= direct_capture_count

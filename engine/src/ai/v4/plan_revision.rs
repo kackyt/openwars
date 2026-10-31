@@ -900,9 +900,18 @@ impl V4RollingPlanRegistry {
                 priority_enemies.sort_unstable_by_key(|entity| entity.to_bits());
                 // 首都攻略は初撃までに予定された波が揃った時点で出撃させる。全購入stepの
                 // 完成を待つと、生産済みの戦力が集結地点で滞留し生産施設の周辺を塞ぐ。
+                // すでに活動中の戦力が複数（2体以上）ある場合も、集結地での滞留・デッドロックを防ぐため出撃させる。
                 let formation_complete = first_attack_wave_produced(plan);
+                let has_existing_force = plan.execution.snapshot.active_entity_count >= 2
+                    || plan
+                        .steps
+                        .iter()
+                        .filter(|s| s.status == PurchaseStatus::Produced)
+                        .count()
+                        >= 2;
                 let posture = if plan.kind != OperationKind::AssaultCapital
-                    || (capital_assault_authorized && formation_complete && plan.execution_ready)
+                    || ((capital_assault_authorized || formation_complete || has_existing_force)
+                        && plan.execution_ready)
                 {
                     super::deployment::DeploymentPosture::Execute
                 } else {
@@ -1200,12 +1209,26 @@ impl V4RollingPlanRegistry {
             };
         }
 
-        // 兵站・防衛生産が当手番の施設を先に使っただけなら、首都編成を撤回しない。
-        // 実在する同じ施設の購入を次手番へずらし、購入列とPlanIdを維持する。
-        if kind == OperationKind::AssaultCapital
-            && !formation_must_replan
+        // 首都攻略作戦（AssaultCapital）は高額戦力（重戦車・重自走砲等）を要求するため、
+        // 施設競合だけでなく一時的な手持ち資金不足（次ターン収入待ち）でも計画を撤回せず延期（defer）する。
+        // 一方、占領（Capture）や防衛（Defense）作戦は即応性が重視されるため、
+        // 施設競合時のみ延期し、施設が空いているのに資金不足の場合は安価なユニット（歩兵等）への再立案（Revised）に進む。
+        let can_defer = if kind == OperationKind::AssaultCapital {
+            production_slot_deferred
+                || matches!(
+                    continuation_error,
+                    Some(
+                        FixedPackageError::ProductionSlotUnavailable
+                            | FixedPackageError::FundingUnavailable
+                    )
+                )
+        } else {
+            production_slot_deferred
+        };
+
+        if !formation_must_replan
             && !authorization_activated
-            && production_slot_deferred
+            && can_defer
             && matches!(
                 continuation_error,
                 Some(
@@ -1910,62 +1933,56 @@ mod tests {
     }
 
     #[test]
-    fn capital_budget_conflict_defers_instead_of_withdrawing_the_plan() {
-        let player = PlayerId(1);
-        let enemy = Entity::from_raw(10);
-        let anchor = GridPosition { x: 9, y: 9 };
-        let enemies = HashSet::from_iter([enemy]);
-        let mut registry = V4RollingPlanRegistry::default();
-        let created = registry.select(
-            player,
-            3,
+    fn budget_or_slot_conflict_defers_instead_of_withdrawing_the_plan_for_all_kinds() {
+        for kind in [
+            OperationKind::Capture,
+            OperationKind::Defense,
             OperationKind::AssaultCapital,
-            anchor,
-            vec![anchor],
-            enemies.clone(),
-            None,
-            feasible_plan(0),
-            None,
-            HashSet::default(),
-        );
-        let continuation = registry
-            .continuation(
+        ] {
+            let player = PlayerId(1);
+            let enemy = Entity::from_raw(10);
+            let anchor = GridPosition { x: 9, y: 9 };
+            let enemies = HashSet::from_iter([enemy]);
+            let mut registry = V4RollingPlanRegistry::default();
+            let created = registry.select(
                 player,
                 3,
-                OperationKind::AssaultCapital,
-                &[anchor],
-                &enemies,
-            )
-            .unwrap();
-        let facility = created.plan.purchases[0].facility;
+                kind,
+                anchor,
+                vec![anchor],
+                enemies.clone(),
+                None,
+                feasible_plan(0),
+                None,
+                HashSet::default(),
+            );
+            let continuation = registry
+                .continuation(player, 3, kind, &[anchor], &enemies)
+                .unwrap();
+            let facility = created.plan.purchases[0].facility;
 
-        let selected = registry.select(
-            player,
-            3,
-            OperationKind::AssaultCapital,
-            anchor,
-            vec![anchor],
-            enemies.clone(),
-            Some((continuation, Err(FixedPackageError::FundingUnavailable))),
-            feasible_plan(0),
-            None,
-            HashSet::from_iter([facility]),
-        );
-
-        assert_eq!(selected.plan_id, created.plan_id);
-        assert_eq!(selected.disposition, PlanDisposition::Continued);
-        assert_eq!(selected.reason, Some(ReplanReason::ProductionSlotDeferred));
-        let deferred = registry
-            .continuation(
+            let selected = registry.select(
                 player,
-                4,
-                OperationKind::AssaultCapital,
-                &[anchor],
-                &enemies,
-            )
-            .unwrap();
-        assert!(!deferred.production_failed);
-        assert_eq!(deferred.purchases[0].build_turn, 0);
+                3,
+                kind,
+                anchor,
+                vec![anchor],
+                enemies.clone(),
+                Some((continuation, Err(FixedPackageError::FundingUnavailable))),
+                feasible_plan(0),
+                None,
+                HashSet::from_iter([facility]),
+            );
+
+            assert_eq!(selected.plan_id, created.plan_id);
+            assert_eq!(selected.disposition, PlanDisposition::Continued);
+            assert_eq!(selected.reason, Some(ReplanReason::ProductionSlotDeferred));
+            let deferred = registry
+                .continuation(player, 4, kind, &[anchor], &enemies)
+                .unwrap();
+            assert!(!deferred.production_failed);
+            assert_eq!(deferred.purchases[0].build_turn, 0);
+        }
     }
 
     #[test]
