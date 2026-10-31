@@ -329,10 +329,9 @@ fn update_gun_routes(
             let Some(assigned) = squad_routes.get(&entity).copied() else {
                 continue;
             };
-            match orders
-                .iter()
-                .min_by_key(|(candidate, _)| (distance(*candidate, assigned), candidate.y, candidate.x))
-            {
+            match orders.iter().min_by_key(|(candidate, _)| {
+                (distance(*candidate, assigned), candidate.y, candidate.x)
+            }) {
                 Some((key_point, false)) => {
                     routes.insert(entity, *key_point);
                 }

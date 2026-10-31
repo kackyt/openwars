@@ -141,4 +141,3 @@ fn route_operation_indirect_and_loaded_gun_report_route_key_point() {
         Some(key_point)
     );
 }
-
