@@ -580,24 +580,20 @@ impl ArtilleryFerry<'_> {
         })
     }
 
-    /// 自軍に盾（スクリーン）を形成できる直接戦闘部隊が存在するか。
-    fn has_direct_escorts(&self) -> bool {
-        self.own()
-            .any(|unit| unit.stats.min_range <= 1 && unit.stats.max_cargo == 0)
-    }
-
-    /// 砲台を守る味方の直接部隊が存在するか。孤立無援の危険地帯への据え付けを防ぐ。
-    /// 都市であれ平地であれ、敵が存在し自軍に直接部隊がいる限り、前方に味方直接部隊の盾（screened）が
-    /// 存在することを完全必須化し、味方の援護がない場所への布陣を禁止する。
+    /// 砲台を守る味方の直接部隊が存在するか、または敵の脅威が届かない安全な位置か。
+    /// 敵の移動・攻撃が届かない完全安全マス（threat == 0）であれば即座に布陣可能。
+    /// 敵の脅威圏内（threat > 0）にあるマスでは、前方に味方直接部隊の盾（screened）が
+    /// 存在することを完全必須化し、無防備な最前線への据え付けを禁止する。
     fn can_safely_emplace(&self, gun: &BoardUnit, cell: Cell) -> bool {
         if self.enemies().next().is_none() {
             return true;
         }
-        if self.has_direct_escorts() {
-            return self.screened(cell);
+        // 敵の被弾脅威がゼロの安全な場所は安全に布陣可能
+        if self.threat.damage_hp(gun, cell) == 0 {
+            return true;
         }
-        // 直接部隊がいない環境（単体テスト等）では、敵からの被弾脅威がゼロの安全な場所のみ許可する
-        self.threat.damage_hp(gun, cell) == 0
+        // 敵の脅威圏内では、前方に味方直接部隊の盾（スクリーン）が存在することが必須
+        self.screened(cell)
     }
 
     /// `origin` から輸送車で `turns` 手番以内に運べる陣地と、その評価（[`Self::emplacement_value`]）・
@@ -964,8 +960,9 @@ impl ArtilleryFerry<'_> {
         // (輸送車が撃破されない, 降ろす位置の評価, 輸送車の被弾が少ない, 座標)。
         type DropKey = (bool, i64, Reverse<u32>, Reverse<(Cell, Cell)>);
         let mut best_drop: Option<DropKey> = None;
-        // (撃破されない, 前線に近い, 被弾が少ない, 座標) が最大の移動先。
-        type MoveKey = (bool, Reverse<u32>, Reverse<u32>, Reverse<Cell>);
+        // (撃破されない, 被弾ゼロの安全地帯, 前線に近い, 被弾が少ない, 座標) が最大の移動先。
+        // 降車できない補給車が敵の射程内（threat_hp > 0）へ無防備に突っ込んで被弾するのを防ぐ。
+        type MoveKey = (bool, bool, Reverse<u32>, Reverse<u32>, Reverse<Cell>);
         let mut best_move: Option<MoveKey> = None;
         // 今手番に撃てる位置へ降ろせないときの向かう先: 近くの陣地、無ければ少し遠くまでで
         // 最も早く着ける陣地（今の戦線を押し上げる）。進軍路に割り当てた砲台は、陣地が
@@ -1005,6 +1002,7 @@ impl ArtilleryFerry<'_> {
             let survives = threat_hp < hp;
             let move_key = (
                 survives,
+                threat_hp == 0,
                 Reverse(front(stop)),
                 Reverse(threat_hp),
                 Reverse(stop),

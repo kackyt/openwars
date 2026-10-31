@@ -140,10 +140,10 @@ fn select_mobilization_candidate(
     let per_slot_budget = immediate_reinforcement_funds / free_slots as u32;
     let own_capturers = scan.my_units.iter().filter(|u| u.stats.can_capture).count();
     let unowned_properties = scan.open_properties.len();
-    // 敵首都への進撃作戦、または占領役が十分（未所有物件数以上、または3体以上）いる場合は
+    // 敵首都への進撃作戦、または占領役が十分（未所有物件数以上、または4体以上）いる場合は
     // 前線進軍・包囲のための戦闘部隊の動員を許可する。
     let is_assault = op.kind == OperationKind::AssaultCapital;
-    let capturers_sufficient = own_capturers >= 3 && own_capturers >= unowned_properties;
+    let capturers_sufficient = own_capturers >= 4 || own_capturers >= unowned_properties;
     let capturers_saturated = own_capturers >= 15
         || (own_capturers >= 6 && own_capturers >= unowned_properties.saturating_mul(2));
     let allow_combat_unit =
@@ -262,11 +262,9 @@ fn mobilization_key(
         0
     };
     let has_damage = !has_unresolved_live_threat || damage > 0;
-    let movement_rank = if is_small_map {
-        std::cmp::Reverse(movement)
-    } else {
-        std::cmp::Reverse(0)
-    };
+    // 機動力（移動力）が高いユニットを優先評価し、足の遅い部隊ばかりで
+    // 前線や遠隔拠点への展開が手遅れになるのを防ぐ。
+    let movement_rank = std::cmp::Reverse(movement);
     (
         !has_damage,
         !fits_budget,

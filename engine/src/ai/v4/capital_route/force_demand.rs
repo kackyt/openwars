@@ -5,8 +5,9 @@ use crate::ai::v4::capital_route::model::{
 };
 use crate::ai::v4::capital_route::node_operation::capital_route_dag_all_properties;
 use crate::ai::v4::capital_route::topology::{
-    armored_entry_bridge_gates, armored_step_distances, movement_step_distances,
-    same_land_armored_route_gates, same_land_route_fronts, terrain_component_membership,
+    armored_entry_bridge_gates, armored_step_distances, capital_route_topology_for,
+    movement_step_distances, same_land_armored_route_gates, same_land_route_fronts,
+    terrain_component_membership,
 };
 use crate::ai::v4::trace::campaign_scope_audit_enabled;
 use crate::ai::v4::{
@@ -100,25 +101,30 @@ pub(crate) fn same_land_route_force_demands(
             .map_or(0, |(index, _)| index)
     };
     let mut opportunity_values = vec![0_u64; fronts.len()];
+    let mut defended_asset_values = vec![0_u64; fronts.len()];
     let mut friendly_values = vec![0_u64; fronts.len()];
     let mut enemy_values = vec![0_u64; fronts.len()];
     let mut capital_threat_values = vec![0_u64; fronts.len()];
 
+    let topology = capital_route_topology_for(world, player_id, island_id);
     for entity in world.iter_entities() {
         let (Some(position), Some(property)) =
             (entity.get::<GridPosition>(), entity.get::<Property>())
         else {
             continue;
         };
-        if property.owner_id == Some(player_id)
-            || property.terrain == Terrain::Capital
+        if property.terrain == Terrain::Capital
             || island_map
                 .get_island_at(position)
                 .is_none_or(|island| island.id != island_id)
         {
             continue;
         }
-        let route = nearest_front(*position);
+        let route = topology
+            .and_then(|t| t.property_routes.get(position))
+            .map(|r| r.0)
+            .filter(|r| *r < fronts.len())
+            .unwrap_or_else(|| nearest_front(*position));
         let arrival = from_home.get(position).copied().unwrap_or(u32::MAX / 4);
         if arrival >= u32::MAX / 4 {
             continue;
@@ -137,11 +143,21 @@ pub(crate) fn same_land_route_force_demands(
             .min()
             .unwrap_or(0);
         let remaining_turns = campaign_horizon.saturating_sub(arrival).saturating_add(1) as u64;
-        opportunity_values[route] = opportunity_values[route].saturating_add(
-            income
-                .saturating_add(production_value)
-                .saturating_mul(remaining_turns),
-        );
+        let property_value = income
+            .saturating_add(production_value)
+            .saturating_mul(remaining_turns);
+
+        if property.owner_id == Some(player_id) {
+            // 自軍所有物件の防衛資産価値: その進軍路が守るべき前線・回廊の自陣物件（都市・工場等）。
+            // 自首都直近（arrival <= 2）の本拠地施設は特定の進軍路に偏らせないため除外する。
+            if arrival > 2 {
+                defended_asset_values[route] =
+                    defended_asset_values[route].saturating_add(property_value);
+            }
+        } else {
+            // 未所有・敵物件の攻略機会価値
+            opportunity_values[route] = opportunity_values[route].saturating_add(property_value);
+        }
     }
 
     for entity in world.iter_entities() {
@@ -186,12 +202,14 @@ pub(crate) fn same_land_route_force_demands(
         .into_iter()
         .enumerate()
         .map(|(route, opportunity_value)| {
+            let defended_value = defended_asset_values[route];
             let force_deficit_value = enemy_values[route].saturating_sub(friendly_values[route]);
             let capital_threat = capital_threat_values[route];
             RouteForceDemand {
                 opportunity_value,
                 force_deficit_value,
                 demand_value: opportunity_value
+                    .saturating_add(defended_value)
                     .saturating_add(force_deficit_value)
                     .saturating_add(capital_threat),
             }

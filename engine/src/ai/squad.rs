@@ -2155,31 +2155,67 @@ fn campaign_combat_responsibilities(
 ///
 /// 各memberは自分から最も近い前進先へ向かう（同距離なら `advance_targets` の優先順）。
 /// どの前進先へも到達できないmemberは `remaining` に残す。
-fn campaign_advance_responsibilities(
+pub(super) fn campaign_advance_responsibilities(
     world: &World,
     remaining: &mut Vec<Entity>,
     advance_targets: &[GridPosition],
     connectivity: &mut TerrainConnectivity,
 ) -> Vec<CampaignResponsibility> {
-    if advance_targets.is_empty() {
+    campaign_advance_responsibilities_with_limit(
+        world,
+        remaining,
+        advance_targets,
+        connectivity,
+        None,
+    )
+}
+
+/// 目標ごとの受入上限（`max_members_per_target`）を指定可能な前進防御責務の割り当て。
+///
+/// 目標施設に本当に近い部隊を優先して各目標へ配分し、満員になった目標はスキップする。
+/// これにより、後方施設への部隊集中滞留を防ぎ、余剰部隊を前線進軍用として `remaining` に残す。
+pub(super) fn campaign_advance_responsibilities_with_limit(
+    world: &World,
+    remaining: &mut Vec<Entity>,
+    advance_targets: &[GridPosition],
+    connectivity: &mut TerrainConnectivity,
+    max_members_per_target: Option<usize>,
+) -> Vec<CampaignResponsibility> {
+    if advance_targets.is_empty() || remaining.is_empty() {
         return Vec::new();
     }
+    // 各memberと各targetの(距離, target_index, member)ペアを収集し、距離順にソートする。
+    let mut member_target_pairs = Vec::new();
+    for member in remaining.iter().copied() {
+        for (index, target) in advance_targets.iter().enumerate() {
+            if let Some(distance) =
+                campaign_member_distance_to_position(world, member, *target, connectivity)
+            {
+                member_target_pairs.push((distance, index, member));
+            }
+        }
+    }
+    member_target_pairs
+        .sort_by_key(|(distance, index, member)| (*distance, *index, member.to_bits()));
+
     let mut members_by_target: Vec<Vec<Entity>> = vec![Vec::new(); advance_targets.len()];
-    remaining.retain(|member| {
-        let nearest = advance_targets
-            .iter()
-            .enumerate()
-            .filter_map(|(index, target)| {
-                campaign_member_distance_to_position(world, *member, *target, connectivity)
-                    .map(|distance| (distance, index))
-            })
-            .min();
-        let Some((_, index)) = nearest else {
-            return true;
-        };
-        members_by_target[index].push(*member);
-        false
-    });
+    let mut assigned = HashSet::default();
+
+    for (_distance, index, member) in member_target_pairs {
+        if assigned.contains(&member) {
+            continue;
+        }
+        if let Some(limit) = max_members_per_target {
+            if members_by_target[index].len() >= limit {
+                continue;
+            }
+        }
+        members_by_target[index].push(member);
+        assigned.insert(member);
+    }
+
+    remaining.retain(|member| !assigned.contains(member));
+
     advance_targets
         .iter()
         .zip(members_by_target)
