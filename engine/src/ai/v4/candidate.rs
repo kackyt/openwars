@@ -100,7 +100,7 @@ pub(in crate::ai::v4) fn planned_deployment(
         operation_binding: None,
         anchor: op.anchor,
         staging_anchor: op.staging_anchor,
-        posture: if op.kind == OperationKind::AssaultCapital {
+        posture: if op.kind == OperationKind::AssaultCapital && !op.execution_authorized {
             deployment::DeploymentPosture::Forming
         } else {
             deployment::DeploymentPosture::Execute

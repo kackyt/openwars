@@ -505,6 +505,113 @@ fn tile_score(
             score += 3500;
         }
     }
+    // 自軍砲台の護衛スクリーン指令（Artillery Escort & Screening）:
+    // 展開・布陣中の自軍砲台（砲台または最小射程>=3の長射程間接部隊）について、
+    // 自軍の直接戦闘部隊（戦車・装甲車・重歩兵・軽歩兵等）は砲台の前方（敵に向かい合う隣接・前哨マス）
+    // に展開して壁（スクリーン）を形成し、敵の突入・近接肉薄から砲台を強固に防護する。
+    if state.stats.min_range <= 1 && state.stats.max_cargo == 0 && !board.enemies.is_empty() {
+        let screens_artillery = world.iter_entities().any(|e| {
+            let Some(gun_pos) = e.get::<GridPosition>() else {
+                return false;
+            };
+            let is_our_gun = e
+                .get::<crate::components::Faction>()
+                .is_some_and(|f| f.0 == board.player_id)
+                && e.get::<crate::components::UnitStats>().is_some_and(|s| {
+                    s.unit_type == crate::resources::UnitType::Artillery || s.min_range >= 3
+                });
+            if !is_our_gun {
+                return false;
+            }
+            let dist_to_gun = board
+                .map
+                .distance(position.x, position.y, gun_pos.x, gun_pos.y);
+            if dist_to_gun == 1 || dist_to_gun == 2 {
+                board.enemies.iter().any(|(enemy_pos, ..)| {
+                    let gun_to_enemy =
+                        board
+                            .map
+                            .distance(gun_pos.x, gun_pos.y, enemy_pos.x, enemy_pos.y);
+                    let us_to_enemy =
+                        board
+                            .map
+                            .distance(position.x, position.y, enemy_pos.x, enemy_pos.y);
+                    us_to_enemy < gun_to_enemy
+                })
+            } else {
+                false
+            }
+        });
+        if screens_artillery {
+            score += 4500;
+        }
+    }
+    // 間接包囲砲撃陣地の展開（Siege & Fire Support Positioning）:
+    // V3/V4において、間接部隊（重自走砲・自走砲・ロケット・砲台）が、
+    // 敵首都・工場や敵部隊を射程内に捉えられるマスに布陣する場合、包囲砲撃陣地ボーナスを付与する。
+    if board.uses_v3_tactics && state.stats.max_range > 1 {
+        let targets_in_range = board
+            .enemies
+            .iter()
+            .filter(|(enemy_pos, ..)| {
+                let dist = board
+                    .map
+                    .distance(position.x, position.y, enemy_pos.x, enemy_pos.y);
+                dist >= state.stats.min_range && dist <= state.stats.max_range
+            })
+            .count();
+        let properties_in_range = board
+            .properties
+            .iter()
+            .filter(|(prop_pos, terrain, owner)| {
+                if *owner == Some(board.player_id) {
+                    return false;
+                }
+                if *terrain != crate::resources::Terrain::Capital
+                    && *terrain != crate::resources::Terrain::Factory
+                {
+                    return false;
+                }
+                let dist = board
+                    .map
+                    .distance(position.x, position.y, prop_pos.x, prop_pos.y);
+                dist >= state.stats.min_range && dist <= state.stats.max_range
+            })
+            .count();
+        if targets_in_range > 0 || properties_in_range > 0 {
+            score += 1500
+                + (targets_in_range as i32 * 500).min(2000)
+                + (properties_in_range as i32 * 800).min(1600);
+        }
+    }
+    // 狭隘路（橋・川）の突破ボーナス（Breakthrough Crossing & Forcible Entry）:
+    // 橋や川から対岸の陸地へ突入・上陸する移動を強力に優先する。
+    // また、敵陣に向かって橋や川へ踏み込む積極的な突入前進にも前進ボーナスを付与する。
+    let start_is_bridge = board.map.get_terrain(state.position.x, state.position.y)
+        == Some(crate::resources::Terrain::Bridge);
+    let dest_is_bridge =
+        board.map.get_terrain(position.x, position.y) == Some(crate::resources::Terrain::Bridge);
+    if start_is_bridge && !dest_is_bridge {
+        score += 6000;
+    }
+    let start_is_river = board.map.get_terrain(state.position.x, state.position.y)
+        == Some(crate::resources::Terrain::River);
+    let dest_is_river =
+        board.map.get_terrain(position.x, position.y) == Some(crate::resources::Terrain::River);
+    if start_is_river && !dest_is_river {
+        score += 6000;
+    }
+    if (dest_is_bridge || dest_is_river) && !start_is_bridge && !start_is_river {
+        let is_toward_enemy = board.enemies.iter().any(|(e_pos, ..)| {
+            board.map.distance(position.x, position.y, e_pos.x, e_pos.y)
+                < board
+                    .map
+                    .distance(state.position.x, state.position.y, e_pos.x, e_pos.y)
+        });
+        if is_toward_enemy {
+            score += 3000;
+        }
+    }
     let parts = detailed.then_some(ScoreParts {
         terrain,
         positioning,
@@ -660,16 +767,32 @@ fn consider_attacks(
             }
             continue;
         };
+        let is_attacker_on_bridge = board.map.get_terrain(tile.position.x, tile.position.y)
+            == Some(crate::resources::Terrain::Bridge);
+        let mut attack_score = attack.score;
+        if is_attacker_on_bridge && unit.state.stats.min_range <= 1 {
+            if exchange.expected_damage < attack.target_hp {
+                // 撃破できない直接攻撃で橋の上に踏み留まると、後続部隊の進路を塞ぐ
+                if unit.state.stats.max_movement <= 3 {
+                    attack_score -= 8000;
+                } else {
+                    attack_score -= 4000;
+                }
+            } else {
+                // 撃破して橋を開通させる直接攻撃は歓迎
+                attack_score += 4000;
+            }
+        }
         observe_offer(
             probe.as_deref_mut(),
             unit,
             tile,
             "Attack",
             Some(target),
-            (priority, tile.base_score + attack.score),
-            attack.score,
+            (priority, tile.base_score + attack_score),
+            attack_score,
         );
-        best.offer((priority, tile.base_score + attack.score), || {
+        best.offer((priority, tile.base_score + attack_score), || {
             AiCommand::Attack {
                 target_pos: tile.position,
                 target_entity: target,
@@ -753,14 +876,20 @@ fn consider_wait(
         crate::resources::Terrain::River,
     )
     .is_some_and(|cost| cost < 99);
-    if is_bridge && can_ford_river {
-        if !tile.is_stationary {
-            if let Some(trace) = probe.as_deref_mut() {
-                trace.reject("wait_blocks_bridge_crossing", tile.position, || json!({}));
+    if is_bridge {
+        if can_ford_river {
+            if !tile.is_stationary {
+                if let Some(trace) = probe.as_deref_mut() {
+                    trace.reject("wait_blocks_bridge_crossing", tile.position, || json!({}));
+                }
+                return;
             }
-            return;
+            recovery -= 10_000;
+        } else if !tile.is_stationary {
+            // 川を渡れない車両であっても、橋の途中で立ち往生すると後続部隊の進路を完全に塞ぐ。
+            // 橋を渡りきる（対岸へ抜ける）移動を優先させるため、橋上停止は減点する。
+            recovery -= 6_000;
         }
-        recovery -= 10_000;
     }
     let mut score = tile.base_score + recovery;
     let holds_blockade = tile.blockade.holds_site;

@@ -138,16 +138,27 @@ fn select_mobilization_candidate(
     let scan = input.scan;
     let is_small_map = scan.opening_policy == Some(OpeningProductionPolicy::SmallMapExpansion);
     let per_slot_budget = immediate_reinforcement_funds / free_slots as u32;
+    let own_capturers = scan.my_units.iter().filter(|u| u.stats.can_capture).count();
+    let unowned_properties = scan.open_properties.len();
+    // 敵首都への進撃作戦、または占領役が十分（未所有物件数以上、または3体以上）いる場合は
+    // 前線進軍・包囲のための戦闘部隊の動員を許可する。
+    let is_assault = op.kind == OperationKind::AssaultCapital;
+    let capturers_sufficient = own_capturers >= 3 && own_capturers >= unowned_properties;
+    let capturers_saturated = own_capturers >= 15
+        || (own_capturers >= 6 && own_capturers >= unowned_properties.saturating_mul(2));
+    let allow_combat_unit =
+        has_unresolved_live_threat || is_small_map || is_assault || capturers_sufficient;
+
     let mut best_mobilization: Option<SlotCandidate> = None;
     for (facility, terrain) in &scan.free_facilities {
         if allocation.is_facility_used(facility) {
             continue;
         }
         for (unit_type, stats) in &scan.available_types {
-            let allow_combat_unit = has_unresolved_live_threat || is_small_map;
             if stats.cost == 0
                 || stats.cost > immediate_reinforcement_funds
                 || (!allow_combat_unit && !stats.can_capture)
+                || (capturers_saturated && stats.can_capture && !has_unresolved_live_threat)
                 || !scan.can_produce(*terrain, *unit_type)
                 || !can_join_operation(
                     scan,
@@ -171,6 +182,7 @@ fn select_mobilization_candidate(
                 per_slot_budget,
                 has_unresolved_live_threat,
                 is_small_map,
+                allow_combat_unit,
             };
             let key = mobilization_key(
                 scan,
@@ -202,6 +214,7 @@ struct MobilizationRanking {
     per_slot_budget: u32,
     has_unresolved_live_threat: bool,
     is_small_map: bool,
+    allow_combat_unit: bool,
 }
 type MobilizationKey = (
     bool,
@@ -226,8 +239,9 @@ fn mobilization_key(
         per_slot_budget,
         has_unresolved_live_threat,
         is_small_map,
+        allow_combat_unit,
     } = ranking;
-    let fits_budget = if has_unresolved_live_threat || is_small_map {
+    let fits_budget = if has_unresolved_live_threat || is_small_map || allow_combat_unit {
         candidate.cost <= funds
     } else {
         candidate.cost <= per_slot_budget.max(1000)
@@ -236,6 +250,12 @@ fn mobilization_key(
         op.reachable_threats
             .iter()
             .map(|threat| best_damage(&scan.damage_chart, damage_type, threat.stats.unit_type))
+            .max()
+            .unwrap_or(0)
+    } else if allow_combat_unit && !scan.enemy_units.is_empty() {
+        scan.enemy_units
+            .iter()
+            .map(|enemy| best_damage(&scan.damage_chart, damage_type, enemy.stats.unit_type))
             .max()
             .unwrap_or(0)
     } else {
