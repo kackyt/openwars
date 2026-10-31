@@ -1298,25 +1298,6 @@ fn nearest_own_property(
         .copied()
 }
 
-/// 目標に最も近い自軍の地上の生産施設（工場・首都）。
-fn nearest_own_facility(
-    map: &Map,
-    own_properties: &[GridPosition],
-    target: GridPosition,
-) -> Option<GridPosition> {
-    let facilities = own_properties
-        .iter()
-        .copied()
-        .filter(|property| {
-            matches!(
-                map.get_terrain(property.x, property.y),
-                Some(Terrain::Factory | Terrain::Capital)
-            )
-        })
-        .collect::<Vec<_>>();
-    nearest_own_property(map, &facilities, target)
-}
-
 /// 進軍路のCapture目標を、目標に最も近い自軍拠点を守るDefense作戦へ置き換える。
 /// 自軍拠点が無ければ置き換えない。
 fn guard_route(
@@ -1716,7 +1697,6 @@ pub(in crate::ai::v4) fn concentrate_route_efforts(
     budgets: PostureBudgets,
     values: PostureValues,
     decided: Option<&RoutePostureDecision>,
-    gun_anchors: &[GridPosition],
     turns: &mut dyn FnMut(GridPosition, GridPosition) -> Option<u32>,
 ) -> RouteEffortPlan {
     let (own_capital, enemy_capital) = capitals;
@@ -1812,33 +1792,6 @@ pub(in crate::ai::v4) fn concentrate_route_efforts(
             .find(|&&route| objectives[route].anchor == anchor)
             .map(|&route| Some(route)),
     });
-    // 攻めの砲台を割り当てた進軍路（砲台の受け持ちの要衝に最も近い進軍路のうち、砲台の多い
-    // もの）。攻めてよいのはこの進軍路だけで、他の進軍路（右辺のような最低限の守り）は
-    // ゴーサインを出さずに工場付近で守る。配分案どうしを比べて主戦場を選び直すことはしない
-    // （見積もりの揺れで攻める進軍路が入れ替わり、部隊と砲台が戦線の間を往復するため）。
-    // 攻めの砲台がまだ無い序盤だけは、最初に砲台を付ける進軍路を配分案の比較で選ぶ。
-    let gun_route = {
-        let mut counts = vec![0_usize; contested.len()];
-        for anchor in gun_anchors {
-            if let Some((nearest, _)) = contested.iter().enumerate().min_by_key(|(_, route)| {
-                let candidate = objectives[**route].anchor;
-                (
-                    map.distance(anchor.x, anchor.y, candidate.x, candidate.y),
-                    candidate.y,
-                    candidate.x,
-                )
-            }) {
-                counts[nearest] += 1;
-            }
-        }
-        counts
-            .iter()
-            .enumerate()
-            .filter(|(_, count)| **count > 0)
-            .max_by_key(|(position, count)| (**count, std::cmp::Reverse(*position)))
-            .map(|(position, _)| contested[position])
-    };
-    let decided_posture = decided_posture.filter(|main| gun_route.is_none() || *main == gun_route);
     // 決めた案を遂行する間は、各進軍路の要衝と攻守も決めたときのまま保つ（戦力の配分だけを
     // 今の盤面で更新する）。見積もりの揺れで攻守が手番ごとに入れ替わると、部隊が要衝へ
     // 着く前に行き先が変わる。
@@ -1846,11 +1799,8 @@ pub(in crate::ai::v4) fn concentrate_route_efforts(
         .and(decided)
         .map(|decision| decision.orders.as_slice())
         .filter(|orders| orders.len() == contested.len());
-    let posture = match gun_route {
-        Some(route) => Some(route),
-        None => decided_posture
-            .unwrap_or_else(|| choose_route_posture(&prospects, &contested, budgets, values)),
-    };
+    let posture = decided_posture
+        .unwrap_or_else(|| choose_route_posture(&prospects, &contested, budgets, values));
     // 配分案の戦力で各進軍路の要衝を決める。勝てる進軍路（分散案の全進軍路、集中案の
     // 主戦場）は目標を攻め、勝てない進軍路と守りの進軍路は目標に最も近い自軍拠点を守る。
     let main_anchor = posture.map(|main| objectives[main].anchor);
@@ -1907,17 +1857,8 @@ pub(in crate::ai::v4) fn concentrate_route_efforts(
                 return objective;
             };
             let force = u32::try_from(intended(index)).unwrap_or(u32::MAX);
-            // 決めた案を遂行中なら、要衝と攻守を決めたときのまま保つ。ただし攻めの砲台の居ない
-            // 守りの進軍路は、砲台を割り当てる前に決めた案でも工場付近で守る。
-            if let Some(mut order) = decided_orders.map(|orders| orders[route]) {
-                if order.defend
-                    && gun_route.is_some_and(|gun_route| gun_route != index)
-                    && let Some(facility) =
-                        nearest_own_facility(map, own_properties, objective.anchor)
-                {
-                    order.key_point = facility;
-                    order.staging = facility;
-                }
+            // 決めた案を遂行中なら、要衝と攻守を決めたときのまま保つ。
+            if let Some(order) = decided_orders.map(|orders| orders[route]) {
                 orders.push(RouteOrder { force, ..order });
                 return if order.defend {
                     defense_objective(objective, order.key_point)
@@ -1952,22 +1893,10 @@ pub(in crate::ai::v4) fn concentrate_route_efforts(
                 });
                 return objective;
             }
-            // 守りの要衝。攻めの砲台の居る進軍路（西）は、守りに回っても首都の脇まで下がらず、
-            // 目標に最も近い自軍拠点で守る。他の進軍路（右辺）は、前へ出ずに工場付近（目標に
-            // 最も近い自軍の工場・首都）で守る。攻めの砲台がまだ無い序盤は、敵より先に押さえ
-            // られる最も前の地点で守る。
-            let guarded = match gun_route {
-                Some(gun_route) if gun_route == index => {
-                    guard_route(map, objective, own_properties)
-                }
-                Some(_) => match nearest_own_facility(map, own_properties, objective.anchor) {
-                    Some(facility) => defense_objective(objective, facility),
-                    None => guard_route(map, objective, own_properties),
-                },
-                None => match key_point {
-                    Some(key_point) => defense_objective(objective, key_point),
-                    None => guard_route(map, objective, own_properties),
-                },
+            // 守りの要衝は敵より先に押さえられる地点から選ぶ。
+            let guarded = match key_point {
+                Some(key_point) => defense_objective(objective, key_point),
+                None => guard_route(map, objective, own_properties),
             };
             orders.push(RouteOrder {
                 key_point: guarded.anchor,
@@ -2064,6 +1993,81 @@ mod posture_tests {
             exposed_capital_turns: None,
             contact_cap: u32::MAX,
         }
+    }
+
+    #[test]
+    fn existing_posture_keeps_defense_target_even_with_artillery_on_another_route() {
+        let map = Map::new(
+            12,
+            12,
+            Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        let point = |x, y| GridPosition { x, y };
+        let objective = |anchor| CampaignPlanningObjective {
+            island_id: crate::ai::islands::IslandId(0),
+            kind: OperationKind::Capture,
+            anchor,
+            objective_properties: vec![anchor],
+            capture_eta: None,
+            required_capture_survivors: 1,
+            logistics_rank: None,
+            forced_target_enemies: HashSet::default(),
+            protected_capture_entities: HashSet::default(),
+            capture_replacement_pending: false,
+            staging_anchor: anchor,
+            execution_authorized: true,
+        };
+        let snapshot = |pos, unit_type| UnitSnapshot {
+            entity: None,
+            pos,
+            stats: UnitStats {
+                unit_type,
+                cost: 1_000,
+                ..UnitStats::mock()
+            },
+            hp: 100,
+            free_cargo: 0,
+        };
+        let targets = [point(2, 2), point(9, 9)];
+        let orders = vec![
+            RouteOrder {
+                key_point: targets[0],
+                staging: targets[0],
+                defend: false,
+                force: 0,
+            },
+            RouteOrder {
+                key_point: point(8, 8),
+                staging: point(8, 8),
+                defend: true,
+                force: 0,
+            },
+        ];
+        let decided = RoutePostureDecision {
+            main: Some(targets[0]),
+            regions: vec![],
+            orders: orders.clone(),
+        };
+        let plan = concentrate_route_efforts(
+            &map,
+            targets.into_iter().map(objective).collect(),
+            &[snapshot(targets[1], UnitType::Artillery)],
+            &[
+                snapshot(targets[0], UnitType::Infantry),
+                snapshot(targets[1], UnitType::Infantry),
+            ],
+            &[point(7, 7)],
+            &[],
+            (None, None),
+            budgets(0, 0),
+            VALUES,
+            Some(&decided),
+            &mut |a, b| Some(map.distance(a.x, a.y, b.x, b.y)),
+        );
+        assert_eq!(plan.posture, Some(Some(targets[0])));
+        assert_eq!(plan.orders[1].key_point, orders[1].key_point);
+        assert!(plan.orders[1].defend);
     }
 
     #[test]

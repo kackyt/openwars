@@ -421,7 +421,6 @@ impl BoardScan {
             master_data,
             damage_chart,
             current_turn,
-            game_turn: current_turn,
             economy_anchors: Vec::new(),
             route_posture: None,
             attack_route_guns: 0,
@@ -486,9 +485,6 @@ pub(in crate::ai::v4) struct BoardScan {
     pub(in crate::ai::v4) master_data: Arc<MasterDataRegistry>,
     pub(in crate::ai::v4) damage_chart: Arc<DamageChart>,
     pub(in crate::ai::v4) current_turn: u32,
-    /// 実際のゲーム手番。標準経路は `current_turn` を0に固定して既存判断を変えないため、
-    /// 序盤の占領競争の期間判定だけはこちらを使う。
-    pub(in crate::ai::v4) game_turn: u32,
     /// 自軍の都市（砲台の補給先）。標準経路だけが求める。
     pub(in crate::ai::v4) owned_cities: Vec<GridPosition>,
     /// 戦力節約で守る進軍路のDefense作戦地点と、そこへ使ってよい生産額（評価で割り振った
@@ -550,9 +546,6 @@ impl BoardScan {
         let unit_registry = world.get_resource::<UnitRegistry>()?.clone();
         let damage_chart = Arc::new(world.get_resource::<DamageChart>()?.clone());
         let master_data = Arc::new(world.get_resource::<MasterDataRegistry>()?.clone());
-        let game_turn = world
-            .get_resource::<MatchState>()
-            .map_or(1, |state| state.current_turn_number.0);
         let funds = world
             .get_resource::<Players>()?
             .0
@@ -873,7 +866,6 @@ impl BoardScan {
                     budgets,
                     values,
                     decided.as_ref(),
-                    &crate::ai::v4::artillery_ferry::attack_gun_anchors(world, player_id),
                     &mut turns,
                 );
                 campaign_objectives = efforts.objectives;
@@ -1002,7 +994,6 @@ impl BoardScan {
 
         Some(BoardScan {
             current_turn: 0,
-            game_turn,
             economy_anchors,
             route_posture,
             attack_route_guns: 0,
@@ -1012,7 +1003,7 @@ impl BoardScan {
                 .map(|(position, _)| *position)
                 .collect(),
             opening_policy: None,
-            capital_position: None,
+            capital_position: capital_pos,
             property_entities: HashMap::default(),
             neutral_properties: Vec::new(),
             enemy_production_forecast: Default::default(),

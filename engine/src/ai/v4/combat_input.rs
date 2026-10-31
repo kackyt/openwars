@@ -316,33 +316,10 @@ fn collect_production_options(
     options.retain(|option| {
         option.purchase.build_turn > 0 || !used_facilities.contains(&option.purchase.facility)
     });
-    // 1手番目に歩兵を作れる施設では、戦闘購入も占領できる歩兵類に限る。後手は先手の生産を
-    // 見てから決めるが、相手の歩兵はまだ数手番先にいるので、1手番目から高価な中戦車などを
-    // 作るのは早計で、序盤の資金は先に翼の拠点へ届く歩兵の数に回す。対抗の戦車・砲兵は
-    // 次手番以降の予定として計画に残し、2手番目からの計画が作る。歩兵を作れない空港・港は
-    // 制限すると施設と資金を遊ばせるだけなので、従来どおりに選ばせる。
-    if input.policy == ProductionPolicy::Standard && op.facts.opening_turn {
-        let infantry_facilities = scan
-            .production_facilities
-            .iter()
-            .filter(|(_, terrain)| {
-                scan.available_types.iter().any(|(unit_type, stats)| {
-                    stats.can_capture && scan.can_produce(*terrain, *unit_type)
-                })
-            })
-            .map(|(position, _)| *position)
-            .collect::<HashSet<_>>();
-        // 補給輸送車で運ぶ砲台は、前線へ届くまでに時間がかかるので初手から計画に入れられる
-        // ようにする（map_20後手では初手の砲台と歩兵が最善手）。買うかどうかは評価に任せる。
-        let ferries_artillery = crate::ai::v4::artillery_ferry::artillery_ferry_enabled();
-        options.retain(|option| {
-            option.purchase.build_turn > 0
-                || option.stats.can_capture
-                || (ferries_artillery
-                    && crate::ai::v4::artillery_ferry::is_ferried_gun(&option.stats))
-                || !infantry_facilities.contains(&option.purchase.facility)
-        });
-    }
+    // 当手番（build_turn == 0）の購入案は、作戦の利用可能資金以下のものに絞る。
+    options.retain(|option| {
+        option.purchase.build_turn > 0 || option.purchase.cost <= input.remaining_funds
+    });
     // 運ぶ砲台は補給輸送車と組で使うので、計画は組の値段で評価して資金も組の分だけ確保する。
     // 補給輸送車は生産の段で、同じ手番に砲台の隣の施設へ確保した資金で買う。
     if input.policy == ProductionPolicy::Standard
