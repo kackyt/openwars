@@ -28,7 +28,7 @@ wasm-bindgen-futures = "0.4.42"
 rayon = "1.10"
 
 [features]
-default = []
+default = ["v4_all"]
 v4_all = [
     "route_concentrate",
     "route_hold",

@@ -299,6 +299,7 @@ fn two_route_island_sends_surplus_combat_to_each_route_front() {
     let fronts =
         crate::ai::v4::capital_route::topology::same_land_route_fronts(&world, ENEMY, island);
     assert_eq!(fronts.len(), 2, "map_6は北・南の2本: {fronts:?}");
+    assert_eq!(fronts.len(), 2, "map_6は北・南の2本: {fronts:?}");
     // 各前線の近くに戦闘役を置き、距離で両方の前線へ分かれることを確かめる。
     let mut remaining = fronts
         .iter()

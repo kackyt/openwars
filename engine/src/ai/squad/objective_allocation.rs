@@ -8,7 +8,7 @@
 //! 施設の前衛・護衛として前進させる。
 
 use super::{
-    CampaignResponsibility, MissionType, campaign_advance_responsibilities,
+    CampaignResponsibility, MissionType, campaign_advance_responsibilities_with_limit,
     campaign_combat_responsibilities,
 };
 use crate::ai::engagement::{Combatant, expected_exchange};
@@ -702,11 +702,29 @@ fn route_front_responsibilities(
         &demands,
     );
     // 配る先は進軍路の固定識別点ではなく、DAGで求めた各進軍路の現在の前線にする。
+    // まだ橋を突破していない進軍路は、手前の橋のGateを前線目標にして橋の防衛・確保を確実にする。
     // DAGが無い（初期化前の）島だけ識別点を使う。
+    let pending_bridgeheads =
+        crate::ai::v4::capital_route::force_demand::same_land_pending_bridgeheads(
+            world, player, island,
+        );
     let fronts = crate::ai::v4::capital_route::node_operation::capital_route_current_fronts(
         world, player, island,
     )
     .filter(|current| current.len() == fronts.len())
+    .map(|current| {
+        fronts
+            .iter()
+            .enumerate()
+            .map(|(route, gate)| {
+                if pending_bridgeheads.get(route).copied().flatten().is_some() {
+                    *gate
+                } else {
+                    current[route]
+                }
+            })
+            .collect::<Vec<_>>()
+    })
     .unwrap_or(fronts);
     let groups = super::combat_responsibilities::distribute_members_across_route_fronts(
         world, map, remaining, &fronts, &slots,
@@ -1004,26 +1022,57 @@ fn combat_responsibilities_for_objectives(
             &mut remaining,
         ));
     }
-    let route_fronts = crate::ai::v4::capital_route::node_operation::capital_route_current_fronts(
+    let static_fronts =
+        crate::ai::v4::capital_route::topology::same_land_route_fronts(world, player, island);
+    let pending_bridgeheads =
+        crate::ai::v4::capital_route::force_demand::same_land_pending_bridgeheads(
+            world, player, island,
+        );
+    let dynamic_fronts = crate::ai::v4::capital_route::node_operation::capital_route_current_fronts(
         world, player, island,
-    )
-    .unwrap_or_else(|| {
-        crate::ai::v4::capital_route::topology::same_land_route_fronts(world, player, island)
-    });
+    );
+    let route_fronts: Vec<GridPosition> = if let Some(ref current) = dynamic_fronts
+        && current.len() == static_fronts.len()
+    {
+        static_fronts
+            .iter()
+            .enumerate()
+            .map(|(route, gate)| {
+                // まだ橋を突破していないルートは、手前の橋のGateを前線目標にする
+                if pending_bridgeheads.get(route).copied().flatten().is_some() {
+                    *gate
+                } else {
+                    current[route]
+                }
+            })
+            .collect()
+    } else {
+        dynamic_fronts.unwrap_or(static_fronts.clone())
+    };
     let is_same_land =
         crate::ai::v4::capital_route::topology::is_same_land_capital_island(world, player, island);
-    // 同一陸地の首都戦役では、余った戦闘部隊は後方の占領目標ではなく首都進軍路の前線へ前進させる。
-    let advance_destinations = if is_same_land && !route_fronts.is_empty() {
-        route_fronts.as_slice()
-    } else {
-        objectives
-    };
-    responsibilities.extend(campaign_advance_responsibilities(
+    // 各未所有施設（objectives）へは、前衛・護衛として目標施設1つにつき最大2体まで配分する。
+    // （大量の部隊が後方施設に群がる滞留を防ぎつつ、中立・未占領物件の確保を確実にする）
+    const MAX_ADVANCE_MEMBERS_PER_OBJECTIVE: usize = 2;
+    responsibilities.extend(campaign_advance_responsibilities_with_limit(
         world,
         &mut remaining,
-        advance_destinations,
+        objectives,
         connectivity,
+        Some(MAX_ADVANCE_MEMBERS_PER_OBJECTIVE),
     ));
+    // 同一陸地に複数の進軍路がある場合、片方の進軍路だけに全軍が偏るのを防ぐため、
+    // まず各進軍路の前線へ均等に部隊を前進配備する。
+    if is_same_land && route_fronts.len() >= 2 && !remaining.is_empty() {
+        let per_route_limit = (remaining.len() / route_fronts.len()).max(2) + 1;
+        responsibilities.extend(campaign_advance_responsibilities_with_limit(
+            world,
+            &mut remaining,
+            &route_fronts,
+            connectivity,
+            Some(per_route_limit),
+        ));
+    }
     let advance_targets = if is_same_land && !route_fronts.is_empty() {
         route_fronts.as_slice()
     } else if !objectives.is_empty() {
