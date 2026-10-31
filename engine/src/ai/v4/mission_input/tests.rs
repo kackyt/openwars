@@ -78,3 +78,67 @@ fn existing_force_uses_only_the_current_squad_binding() {
         HashSet::from_iter([combat, capture])
     );
 }
+
+#[test]
+fn route_operation_indirect_and_loaded_gun_report_route_key_point() {
+    let player = PlayerId(1);
+    let mut world = World::new();
+    let firing_tile = crate::components::GridPosition { x: 2, y: 2 };
+    let key_point = crate::components::GridPosition { x: 8, y: 8 };
+    let indirect = world.spawn(Faction(player)).id();
+    let truck = world.spawn(Faction(player)).id();
+    let loaded_gun = world
+        .spawn((
+            Faction(player),
+            crate::components::Transporting(truck),
+            crate::components::UnitStats {
+                unit_type: crate::resources::UnitType::Artillery,
+                min_range: 3,
+                max_range: 6,
+                max_movement: 1,
+                ..crate::components::UnitStats::mock()
+            },
+        ))
+        .id();
+    let mut manager = SquadManager::default();
+    manager.route_operation_members.insert(indirect, key_point);
+    manager
+        .route_operation_members
+        .insert(loaded_gun, key_point);
+    let mut proposals = OperationLedger::proposals(&mut manager);
+    let squad_id = {
+        let mut squad = proposals.create_owned(
+            MissionType::Defense,
+            player,
+            BTreeSet::from_iter([indirect]),
+            None,
+            Vec::new(),
+        );
+        squad.plan_mut().target = Some(firing_tile);
+        squad.id
+    };
+    let mut bindings = UnitOperationRegistry::default();
+    bindings.apply_assign(
+        LedgerKey::fixture(),
+        indirect,
+        UnitOperationAssignment {
+            owner: OperationOwner::TacticalSquad {
+                player_id: player,
+                squad_id,
+            },
+            squad_id: Some(squad_id),
+            role: OperationUnitRole::Member,
+            assigned_turn: 1,
+        },
+    );
+    world.insert_resource(bindings);
+    world.insert_resource(manager);
+
+    let assignments = combat_assignments(&world, player);
+    assert_eq!(assignments[&indirect].objective, Some(key_point));
+    assert_eq!(
+        assignments.get(&loaded_gun).and_then(|a| a.objective),
+        Some(key_point)
+    );
+}
+

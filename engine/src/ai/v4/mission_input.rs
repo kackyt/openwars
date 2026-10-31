@@ -49,7 +49,7 @@ pub(super) fn combat_assignments(
     let Some(registry) = world.get_resource::<UnitOperationRegistry>() else {
         return HashMap::default();
     };
-    manager
+    let mut assignments: HashMap<Entity, ActiveTargetAssignment> = manager
         .squads
         .iter()
         .filter(|squad| {
@@ -62,6 +62,7 @@ pub(super) fn combat_assignments(
         })
         .filter_map(|squad| squad.plan.target.map(|target| (squad, target)))
         .flat_map(|(squad, target)| {
+            let route_members = &manager.route_operation_members;
             squad
                 .members
                 .iter()
@@ -75,18 +76,82 @@ pub(super) fn combat_assignments(
                             .is_some_and(|binding| binding.squad_id == Some(squad.id))
                 })
                 .map(move |entity| {
+                    // 進軍路作戦の間接砲はSquad目標が射撃マスになるため、作戦の要衝を正本として返す。
+                    let objective = route_members.get(&entity).copied().unwrap_or(target);
                     (
                         entity,
                         ActiveTargetAssignment {
                             plan_id: None,
                             slot_kind: SlotKind::Combat,
-                            objective: Some(target),
+                            objective: Some(objective),
                             targets: HashSet::default(),
                         },
                     )
                 })
         })
-        .collect()
+        .collect();
+
+    // 補給輸送車に積載中の砲台はSquadから一時的に外れているが、既存戦力として作戦に残す。
+    let defend_points = world
+        .get_resource::<crate::ai::v4::capital_route::force_demand::RoutePostureMemory>()
+        .and_then(|memory| memory.by_player.get(&player))
+        .map(|decision| {
+            decision
+                .orders
+                .iter()
+                .filter(|order| order.defend)
+                .map(|order| order.key_point)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let map = world.get_resource::<crate::resources::Map>();
+    for entity_ref in world.iter_entities() {
+        let entity = entity_ref.id();
+        if assignments.contains_key(&entity) {
+            continue;
+        }
+        let (Some(faction), Some(transporting), Some(stats)) = (
+            entity_ref.get::<Faction>(),
+            entity_ref.get::<crate::components::Transporting>(),
+            entity_ref.get::<crate::components::UnitStats>(),
+        ) else {
+            continue;
+        };
+        if faction.0 != player || !super::artillery_ferry::is_ferried_gun(stats) {
+            continue;
+        }
+        let objective = manager
+            .route_operation_members
+            .get(&entity)
+            .copied()
+            .or_else(|| super::artillery_ferry::assigned_attack_route(world, player, entity))
+            .or_else(|| {
+                let carrier_pos = world.get::<crate::components::GridPosition>(transporting.0)?;
+                let map = map?;
+                defend_points
+                    .iter()
+                    .min_by_key(|point| {
+                        (
+                            map.distance(carrier_pos.x, carrier_pos.y, point.x, point.y),
+                            point.y,
+                            point.x,
+                        )
+                    })
+                    .copied()
+            });
+        if let Some(target) = objective {
+            assignments.insert(
+                entity,
+                ActiveTargetAssignment {
+                    plan_id: None,
+                    slot_kind: SlotKind::Combat,
+                    objective: Some(target),
+                    targets: HashSet::default(),
+                },
+            );
+        }
+    }
+    assignments
 }
 
 #[cfg(test)]

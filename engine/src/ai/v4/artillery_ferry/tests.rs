@@ -457,27 +457,10 @@ fn existing_gun_is_not_pulled_to_the_attack_route() {
         ),
         "前から居た砲台はその場で撃つはず: {command:?}"
     );
-    assert!(attack_route_gun_supply(&mut world, PlayerId(1)) == 0);
 }
 
 #[test]
-fn new_gun_counts_toward_the_attack_route_before_it_is_assigned() {
-    let mut world = line_world();
-    set_route_posture(
-        &mut world,
-        GridPosition { x: 3, y: 0 },
-        GridPosition { x: 14, y: 0 },
-    );
-    let old = spawn(&mut world, 1, UnitType::Artillery, 12, 0);
-    set_previous_guns(&mut world, &[old]);
-    // 作ったばかりの砲台は、まだ割り当てを決めていなくても攻めの進軍路の砲台として数え、
-    // 生産が同じ砲台を買い直さない。前から居た砲台は数えない。
-    spawn(&mut world, 1, UnitType::Artillery, 15, 0);
-    assert_eq!(attack_route_gun_supply(&mut world, PlayerId(1)), 1);
-}
-
-#[test]
-fn attack_route_keeps_its_guns_and_takes_only_up_to_the_quota() {
+fn new_guns_join_the_attack_route_without_a_fixed_quota() {
     let mut world = naval_world(&["H.............................H"]);
     property(&mut world, 2, 0, 0);
     property(&mut world, 1, 30, 0);
@@ -489,10 +472,11 @@ fn attack_route_keeps_its_guns_and_takes_only_up_to_the_quota() {
         GridPosition { x: 3, y: 0 },
         GridPosition { x: 27, y: 0 },
     );
-    // 途中の局面から始めた最初の手番。攻めの要衝(x=3)の受け持ちの範囲に据わっている3基は
-    // 攻めの砲台として数え、範囲の外の2基（守りの側）は割り当てない。
-    let guns = [8, 10, 12, 22, 24].map(|x| spawn(&mut world, 1, UnitType::Artillery, x, 0));
+    // 前の手番から居た2基は割り当てず、新しく作った4基は、固定の上限なしに攻めの要衝へ付ける。
+    let old = [22, 24].map(|x| spawn(&mut world, 1, UnitType::Artillery, x, 0));
+    let new = [8, 10, 12, 14].map(|x| spawn(&mut world, 1, UnitType::Artillery, x, 0));
     spawn(&mut world, 2, UnitType::HeavySpGun, 0, 0);
+    set_previous_guns(&mut world, &old);
     decide(&mut world);
     let routes = world
         .resource::<GunRouteAssignment>()
@@ -501,12 +485,45 @@ fn attack_route_keeps_its_guns_and_takes_only_up_to_the_quota() {
         .unwrap()
         .routes
         .clone();
-    for gun in &guns[..3] {
+    for gun in &new {
         assert_eq!(routes.get(gun), Some(&GridPosition { x: 3, y: 0 }));
     }
-    for gun in &guns[3..] {
+    for gun in &old {
         assert_eq!(routes.get(gun), None);
     }
+}
+
+#[test]
+fn new_gun_assigned_to_defend_route_by_squad_manager_is_not_hijacked_to_attack() {
+    let mut world = naval_world(&["H.............................H"]);
+    property(&mut world, 2, 0, 0);
+    property(&mut world, 1, 30, 0);
+    let mut chart = DamageChart::new();
+    chart.insert_damage(UnitType::Artillery, UnitType::HeavySpGun, 88);
+    world.insert_resource(chart);
+    let attack = GridPosition { x: 3, y: 0 };
+    let defend = GridPosition { x: 24, y: 0 };
+    set_route_posture(&mut world, attack, defend);
+    set_previous_guns(&mut world, &[]);
+    let defend_gun = spawn(&mut world, 1, UnitType::Artillery, 25, 0);
+    let attack_gun = spawn(&mut world, 1, UnitType::Artillery, 15, 0);
+    spawn(&mut world, 2, UnitType::HeavySpGun, 0, 0);
+    let mut manager = crate::ai::squad::SquadManager::default();
+    manager.route_operation_members.insert(defend_gun, defend);
+    manager.route_operation_members.insert(attack_gun, attack);
+    world.insert_resource(manager);
+
+    decide(&mut world);
+
+    let routes = world
+        .resource::<GunRouteAssignment>()
+        .by_player
+        .get(&PlayerId(1))
+        .unwrap()
+        .routes
+        .clone();
+    assert_eq!(routes.get(&attack_gun), Some(&attack));
+    assert_eq!(routes.get(&defend_gun), None);
 }
 
 #[test]

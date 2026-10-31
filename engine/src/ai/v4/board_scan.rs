@@ -423,7 +423,6 @@ impl BoardScan {
             current_turn,
             economy_anchors: Vec::new(),
             route_posture: None,
-            attack_route_guns: 0,
             owned_cities: Vec::new(),
             opening_policy: Some(opening_policy),
             funds,
@@ -432,6 +431,7 @@ impl BoardScan {
             production_facilities,
             available_types,
             my_units,
+            ferried_units: Vec::new(),
             enemy_units,
             owned_airport_count,
             property_entities,
@@ -492,9 +492,6 @@ pub(in crate::ai::v4) struct BoardScan {
     pub(in crate::ai::v4) economy_anchors: Vec<(GridPosition, u32)>,
     /// 遂行する進軍路の配分案（[`crate::ai::v4::RoutePostureMemory`]へ持ち越す）。
     pub(in crate::ai::v4) route_posture: Option<RoutePostureDecision>,
-    /// 攻める進軍路に回っている砲台の数（`artillery_ferry::attack_route_gun_supply`）。
-    /// 生産の入口で埋める。
-    pub(in crate::ai::v4) attack_route_guns: usize,
     /// テスト用の直接構築では未指定を標準側として扱う。実盤面走査では必ず設定する。
     pub(in crate::ai::v4) opening_policy: Option<OpeningProductionPolicy>,
     pub(in crate::ai::v4) funds: u32,
@@ -506,6 +503,8 @@ pub(in crate::ai::v4) struct BoardScan {
     pub(in crate::ai::v4) production_facilities: Vec<(GridPosition, Terrain)>,
     pub(in crate::ai::v4) available_types: Vec<(UnitType, UnitStats)>,
     pub(in crate::ai::v4) my_units: Vec<UnitSnapshot>,
+    /// 補給輸送車に積載中の自軍砲台（盤面占有はしないが、既存戦力・進軍路戦力には含める）。
+    pub(in crate::ai::v4) ferried_units: Vec<UnitSnapshot>,
     pub(in crate::ai::v4) enemy_units: Vec<UnitSnapshot>,
     /// 首都の生産範囲内にある所有空港総数（占有中を含む）
     pub(in crate::ai::v4) owned_airport_count: u32,
@@ -652,6 +651,37 @@ impl BoardScan {
                 }
             }
         }
+        let mut ferried_units = Vec::new();
+        for UnitRow {
+            entity,
+            faction,
+            stats,
+            health,
+            transporting,
+            ..
+        } in unit_rows(world, queries)
+        {
+            let Some(carrier_entity) = transporting.map(|t| t.0) else {
+                continue;
+            };
+            if faction.0 != player_id || !crate::ai::v4::artillery_ferry::is_ferried_gun(stats) {
+                continue;
+            }
+            if let Some(carrier) = my_units
+                .iter()
+                .find(|u| u.entity == Some(carrier_entity))
+                .filter(|u| crate::ai::v4::artillery_ferry::is_artillery_carrier(&u.stats))
+            {
+                ferried_units.push(UnitSnapshot {
+                    entity: Some(entity),
+                    pos: carrier.pos,
+                    hp: health.map_or(100, |h| h.current),
+                    free_cargo: 0,
+                    stats: stats.clone(),
+                });
+            }
+        }
+        ferried_units.sort_unstable_by_key(|unit| unit.entity.map(Entity::to_bits));
 
         // --- 拠点の走査 ---
         let mut capital_pos = None;
@@ -855,10 +885,15 @@ impl BoardScan {
                     .and_then(|memory| memory.by_player.get(&player_id))
                     .filter(|decision| decision.regions == region_state)
                     .cloned();
+                let all_own_units = my_units
+                    .iter()
+                    .chain(&ferried_units)
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let efforts = concentrate_route_efforts(
                     &map,
                     campaign_objectives,
-                    &my_units,
+                    &all_own_units,
                     &enemy_units,
                     &own_positions,
                     &regions,
@@ -878,10 +913,15 @@ impl BoardScan {
             }
             // 配分案で各進軍路の攻守を決めた場合は、それに従う。
             if crate::ai::features::route_defense_enabled() && route_posture.is_none() {
+                let all_own_units = my_units
+                    .iter()
+                    .chain(&ferried_units)
+                    .cloned()
+                    .collect::<Vec<_>>();
                 campaign_objectives = defend_outmatched_routes(
                     &map,
                     campaign_objectives,
-                    &my_units,
+                    &all_own_units,
                     &enemy_units,
                     &own_positions,
                     funds.saturating_add(my_income.saturating_mul(budget_turns)),
@@ -996,7 +1036,6 @@ impl BoardScan {
             current_turn: 0,
             economy_anchors,
             route_posture,
-            attack_route_guns: 0,
             owned_cities: owned_properties
                 .iter()
                 .filter(|(_, terrain)| *terrain == Terrain::City)
@@ -1015,6 +1054,7 @@ impl BoardScan {
             production_facilities,
             available_types,
             my_units,
+            ferried_units,
             enemy_units,
             owned_airport_count,
             open_properties,

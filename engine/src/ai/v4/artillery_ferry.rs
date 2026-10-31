@@ -28,10 +28,10 @@
 //! 砲台は、隣に砲台の通れるマスが一つも無いマス（森・山に囲まれた都市など）へは降ろさない。
 //! そこからは二度と輸送車へ乗れず、撃つ敵が居なくなっても前へ運べなくなる。
 //!
-//! 攻める進軍路には、新しく作った砲台を [`GUNS_FOR_ATTACK_ROUTES`] 基まで割り当てる
-//! （[`update_gun_routes`]）。隘路の多い盤面では、射程の長い砲台が盾の後ろから回廊の敵を
-//! 一方的に撃てるので、攻めの進軍路の戦力の中心に置く。既に居る砲台（守りの進軍路の砲台など）
-//! は割り当てを変えず、足りない分は生産で足す。割り当てた砲台は、その進軍路の要衝の周り
+//! 攻める進軍路には、新しく作った砲台を割り当てる（[`update_gun_routes`]）。隘路の多い盤面では、
+//! 射程の長い砲台が盾の後ろから回廊の敵を一方的に撃てるので、攻めの進軍路の戦力の中心に置く。
+//! 既に居る砲台（守りの進軍路の砲台など）は割り当てを変えない。何基作るかは生産計画が決める。
+//! 割り当てた砲台は、その進軍路の要衝の周り
 //! （射程＋[`ROUTE_ZONE_MARGIN`]マス）を受け持ち、外に居れば撃てる敵が居ても積んで運ぶ。
 //! 攻めの要衝は占領が進むと先へ移るので、受け持ちの範囲も前へ動き、砲台は前線について前進する。
 //!
@@ -61,10 +61,6 @@ type Cell = (usize, usize);
 
 /// 射程の外でも、この距離までに敵が居れば動かずに待つ（敵が寄ってくれば撃てる）。
 pub(crate) const HOLD_MARGIN: u32 = 2;
-
-/// 攻める進軍路に割り当てる砲台の数（合計の最低限）。配分案が別の進軍路を攻めに選び直しても
-/// 追加で買わない。
-pub(crate) const GUNS_FOR_ATTACK_ROUTES: usize = 3;
 
 /// 進軍路に割り当てた砲台が受け持つ範囲（要衝から、射程にこのマス数を足した距離まで）。
 const ROUTE_ZONE_MARGIN: u32 = 4;
@@ -252,18 +248,15 @@ fn own_guns(world: &mut World, player: PlayerId) -> Vec<(Entity, UnitStats, Grid
     guns
 }
 
-/// 攻める進軍路（配分案の守りでない作戦）へ、砲台を合計 [`GUNS_FOR_ATTACK_ROUTES`] 基まで
-/// 割り当てる。手番の最初に一度だけ決める。
+/// 攻める進軍路（配分案の守りでない作戦）へ、新しく作った砲台を割り当てる。手番の最初に
+/// 一度だけ決める。砲台を何基買うかは生産計画（RollingPlan）が決め、ここでは数を固定しない。
 ///
 /// - 一度割り当てた砲台は外さない。前の要衝に最も近い要衝を持つ作戦が攻めの作戦なら、その
 ///   要衝へ付け替え（要衝が前へ移ると受け持ちも前へ動く）、守りの作戦の方が近ければ（配分案が
 ///   攻守を入れ替えた）前の要衝のまま、その場の受け持ちを続ける。配分案は手番ごとに揺れるので、
-///   それに合わせて砲台を戦線の間で運び直したり、買い足したりしない。
-/// - 合計が足りなければ、攻めの要衝の受け持ちの範囲に既に据わっている砲台を、その進軍路の
-///   砲台にする（もうそこを撃っているので、動かすことにはならない）。
-/// - まだ足りなければ、新しく作った砲台（前の手番までに居なかった砲台）のうち、要衝に近い
-///   ものから加える。既に居る砲台（右辺の守りなど）は引き抜かない。足りない分は生産で足す
-///   （`production_pipeline::artillery_carriers::allocate_attack_route_guns`）。
+///   それに合わせて砲台を戦線の間で運び直したりしない。
+/// - 新しく作った砲台（前の手番までに居なかった砲台）は、割り当ての少ない攻めの要衝から順に、
+///   要衝に近いものを割り当てる。既に居る砲台（守りの砲台など）は引き抜かない。
 fn update_gun_routes(
     world: &mut World,
     player: PlayerId,
@@ -315,42 +308,54 @@ fn update_gun_routes(
         };
         routes.insert(*entity, kept);
     }
-    // 合計が足りなければ、攻めの要衝の受け持ちの範囲に据わっている砲台を、その進軍路の砲台にする。
-    for (entity, stats, at, emplaced) in &guns {
-        if routes.len() >= GUNS_FOR_ATTACK_ROUTES {
-            break;
-        }
-        if routes.contains_key(entity) || !emplaced {
-            continue;
-        }
-        if let Some(point) = attack_points
-            .iter()
-            .filter(|point| distance(*at, **point) <= route_zone_radius(stats))
-            .min_by_key(|point| (distance(*at, **point), point.y, point.x))
-        {
-            routes.insert(*entity, *point);
-        }
-    }
-    // 足りない分は、新しく作った砲台から加える。
+    // 新しく作った砲台（前の手番までに居なかった砲台）を、進軍路作戦（SquadManager）の
+    // 所属に従って攻め・守りに振り分ける。守りの進軍路へ配属された砲台は攻めへ引き抜かない。
     let is_new = |entity: &Entity| {
         previous
             .as_ref()
             .is_some_and(|previous| !previous.seen.contains(entity))
     };
-    // 攻めの要衝が複数あれば、割り当ての少ない要衝から順に埋める。
-    while routes.len() < GUNS_FOR_ATTACK_ROUTES {
-        let Some(point) = attack_points.iter().min_by_key(|point| {
-            (
-                routes.values().filter(|assigned| assigned == point).count(),
-                point.y,
-                point.x,
-            )
-        }) else {
-            break;
-        };
+    let squad_routes = world
+        .get_resource::<crate::ai::squad::SquadManager>()
+        .map(|manager| manager.route_operation_members.clone());
+    let mut defending_new = HashSet::<Entity>::default();
+    if let Some(squad_routes) = squad_routes.as_ref() {
+        let unassigned_new_guns: Vec<Entity> = guns
+            .iter()
+            .map(|(entity, ..)| *entity)
+            .filter(|entity| !routes.contains_key(entity) && is_new(entity))
+            .collect();
+        for entity in unassigned_new_guns {
+            let Some(assigned) = squad_routes.get(&entity).copied() else {
+                continue;
+            };
+            match orders
+                .iter()
+                .min_by_key(|(candidate, _)| (distance(*candidate, assigned), candidate.y, candidate.x))
+            {
+                Some((key_point, false)) => {
+                    routes.insert(entity, *key_point);
+                }
+                Some((_, true)) => {
+                    defending_new.insert(entity);
+                }
+                None => {}
+            }
+        }
+    }
+    // SquadManagerに所属が無い新しい砲台（単体テスト等）は、割り当ての少ない攻めの要衝から順に埋める。
+    while let Some(point) = attack_points.iter().min_by_key(|point| {
+        (
+            routes.values().filter(|assigned| assigned == point).count(),
+            point.y,
+            point.x,
+        )
+    }) {
         let Some((entity, ..)) = guns
             .iter()
-            .filter(|(entity, ..)| !routes.contains_key(entity) && is_new(entity))
+            .filter(|(entity, ..)| {
+                !routes.contains_key(entity) && !defending_new.contains(entity) && is_new(entity)
+            })
             .min_by_key(|(entity, _, at, _)| (distance(*at, *point), *entity))
         else {
             break;
@@ -371,6 +376,19 @@ fn update_gun_routes(
     );
     world.insert_resource(memory);
     routes
+}
+
+/// 運搬中の砲台について、記憶している攻めの進軍路の要衝を返す（生産の既存戦力照合用）。
+pub(in crate::ai::v4) fn assigned_attack_route(
+    world: &World,
+    player: PlayerId,
+    gun: Entity,
+) -> Option<GridPosition> {
+    world
+        .get_resource::<GunRouteAssignment>()
+        .and_then(|memory| memory.by_player.get(&player))
+        .and_then(|routes| routes.routes.get(&gun))
+        .copied()
 }
 
 /// 攻めに割り当てていない砲台の守り場所: 最も近い守りの進軍路の要衝（攻めの砲台の居ない
@@ -408,21 +426,6 @@ fn guard_posts(
                 .map(|point| (entity, *point))
         })
         .collect()
-}
-
-/// 攻める進軍路に回っている砲台の数: 割り当て済みの砲台と、まだ割り当てを決めていない
-/// 新しい砲台（次の運搬の判断で割り当てられる）。生産が足りない分を買うのに使う。
-pub(crate) fn attack_route_gun_supply(world: &mut World, player: PlayerId) -> usize {
-    let guns = own_guns(world, player);
-    let Some(memory) = world
-        .get_resource::<GunRouteAssignment>()
-        .and_then(|memory| memory.by_player.get(&player))
-    else {
-        return 0;
-    };
-    guns.iter()
-        .filter(|(entity, ..)| memory.routes.contains_key(entity) || !memory.seen.contains(entity))
-        .count()
 }
 
 /// その手番に運搬の判断が尽きたことの記録。

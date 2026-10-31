@@ -129,16 +129,19 @@ pub(crate) struct RollingPlanInput {
     /// 前の手番の計画が資金を残して今手番に予定した購入。探索はこれを買った状態から始める。
     pub committed_purchases: Vec<PlannedPurchase>,
     /// 自力でほとんど動けない砲台を運ぶ輸送部隊（補給輸送車）の能力。Someなら、砲台は
-    /// この輸送部隊で射撃位置まで運ばれる前提で接近を見積もる（標準経路）。
+    /// この輸送部隊で射撃位置まで運ばれる前提で接近・補給を見積もる（標準経路）。
     pub artillery_carrier: Option<UnitStats>,
-    /// 砲台を据えて毎手番補給できる、前線の自軍都市の数。
-    pub artillery_resupply_slots: usize,
-    /// 位置の価値を見積もるか（標準経路）。前衛が生きている間は敵の直接攻撃が砲台へ
-    /// 届かず、運ぶ砲台は作戦地点に据えて、敵が地形を通って射程へ入ってから撃つ。
+    /// 自軍が所有する都市（砲台の優先据え付け・補給修理候補）。
+    pub owned_cities: Vec<GridPosition>,
+    /// 位置の価値を見積もるか（標準経路）。前衛が隘路を塞いでいる間は敵の地上直接攻撃が
+    /// 後ろの砲台へ届かず、運ぶ砲台は作戦地点を射程に収める自軍側陣地へ据える。
     pub positional: bool,
-    /// 作戦地点。位置の価値を見積もるとき、運ぶ砲台をここへ据える。
+    /// 作戦地点。位置の価値を見積もるとき、運ぶ砲台はこの地点を射程に収める陣地へ据える。
     pub deploy_anchor: Option<GridPosition>,
-    /// 戦力節約で守る作戦か。主戦場へ資金を回すため、保持できる案のうち最も安い案を選ぶ。
+    /// 拠点防衛作戦か。trueなら砲台は陣地に留まって敵の接近を待ち受け、false（攻勢）なら
+    /// 進軍途上の敵を射程に捉えた段階での早期降車砲撃も併用する。
+    pub defensive_emplacement: bool,
+    /// 戦力節約で守る作戦か。主戦場へ資金を回すため、保持できる案のうち損耗込みの総費用が最小の案を選ぶ。
     /// 使える資金は配分案で割り振った互角分に絞られている。
     pub economy_of_force: bool,
     /// 占領が1ターン遅れる機会損失。実行可能案同士の比較にだけ用いる。
@@ -381,8 +384,10 @@ struct SimulationCatalog {
     existing_by_enemy_damage: Vec<Vec<usize>>,
     /// 1turnに攻撃できる友軍数の上限（前線の幅と間接砲の射撃位置）。`None` は上限なし。
     frontage: Option<BattleFrontage>,
-    /// 補給できる都市に据えて、弾切れせずに撃ち続けられる砲台の数。
-    gun_resupply_slots: usize,
+    /// 補給輸送車と組で運用する砲台が毎手番補給を受けられるか。
+    ferried_resupply: bool,
+    /// 運搬砲台を運ぶ補給輸送車の移動種別。
+    carrier_movement_type: Option<MovementType>,
     /// 前衛が後ろの間接砲を敵の直接攻撃から守るか。
     positional: bool,
 }
@@ -420,11 +425,11 @@ impl SimulationCatalog {
         });
         catalog.frontage = frontage;
         catalog.positional = input.positional;
-        catalog.gun_resupply_slots = if input.artillery_carrier.is_some() {
-            input.artillery_resupply_slots
-        } else {
-            0
-        };
+        catalog.ferried_resupply = input.artillery_carrier.is_some();
+        catalog.carrier_movement_type = input
+            .artillery_carrier
+            .as_ref()
+            .map(|carrier| carrier.movement_type);
         catalog
     }
 
@@ -474,7 +479,8 @@ impl SimulationCatalog {
             enemies,
             existing_by_enemy_damage,
             frontage: None,
-            gun_resupply_slots: 0,
+            ferried_resupply: false,
+            carrier_movement_type: None,
             positional: false,
         }
     }
@@ -523,30 +529,99 @@ fn committed_root(input: &RollingPlanInput) -> SearchState {
     root
 }
 
-/// 運ぶ砲台を据える位置。作戦地点に置けなければ、その周り2マス以内で地点に最も近い
-/// 置けるマス。
-fn emplacement_site(input: &RollingPlanInput, gun: &UnitStats) -> Option<GridPosition> {
+/// 運ぶ砲台を据える陣地と、そこへ据えて撃てるようになるまでの手番数。
+///
+/// 作戦地点（`deploy_anchor`）の上に砲台を置くと最小射程の内側に入って撃てず被弾するため、
+/// 作戦地点を射程（`min_range..=max_range`）に収める自軍側の到達可能マスを選ぶ。
+/// 敵に塞がれない経路で最も早く据えられ、自軍都市（修復・補給）で、より後方の安全な位置を優先する。
+fn emplacement_site(
+    input: &RollingPlanInput,
+    carrier: &UnitStats,
+    gun: &UnitStats,
+    origin: GridPosition,
+    approach: &ApproachMap,
+) -> Option<(GridPosition, u32)> {
     let anchor = input.deploy_anchor?;
     let placeable = |position: GridPosition| {
-        input
+        !approach.blocked.contains(&position)
+            && input
+                .map
+                .get_terrain(position.x, position.y)
+                .is_some_and(|terrain| {
+                    crate::systems::movement::get_valid_movement_cost(
+                        &input.master_data,
+                        gun.movement_type,
+                        terrain,
+                    )
+                    .is_some()
+                })
+    };
+    let movement = carrier.max_movement.max(1);
+    let ferry_to = |site: GridPosition| -> Option<(bool, u32)> {
+        if site == origin && placeable(site) {
+            return Some((false, 0));
+        }
+        let stops = input
             .map
-            .get_terrain(position.x, position.y)
-            .is_some_and(|terrain| {
-                crate::systems::movement::get_valid_movement_cost(
-                    &input.master_data,
-                    gun.movement_type,
-                    terrain,
-                )
-                .is_some()
+            .get_adjacent(site.x, site.y)
+            .into_iter()
+            .map(|(x, y)| GridPosition { x, y })
+            .filter(|stop| !approach.blocked.contains(stop))
+            .collect::<Vec<_>>();
+        if let Some(cost) = stops
+            .iter()
+            .filter_map(|stop| approach.costs.get(stop))
+            .min()
+        {
+            let travel = cost.div_ceil(movement);
+            return Some((false, travel.max(1)));
+        }
+        stops
+            .iter()
+            .filter_map(|stop| approach.unblocked_costs.get(stop))
+            .min()
+            .map(|cost| {
+                let travel = cost.div_ceil(movement).saturating_add(1);
+                (true, travel.max(1))
             })
     };
-    if placeable(anchor) {
-        return Some(anchor);
+
+    let min_range = gun.min_range.max(1);
+    let max_range = gun.max_range.max(min_range);
+    let best_in_range = cells_within(&input.map, anchor, max_range)
+        .filter(|(cell, distance)| *distance >= min_range && placeable(*cell))
+        .filter_map(|(cell, distance)| {
+            let (blocked_fallback, ferry) = ferry_to(cell)?;
+            let is_city = input.owned_cities.contains(&cell);
+            Some((
+                (
+                    blocked_fallback,
+                    ferry,
+                    !is_city,
+                    std::cmp::Reverse(distance),
+                    cell.y,
+                    cell.x,
+                ),
+                cell,
+                ferry,
+            ))
+        })
+        .min_by_key(|(key, ..)| *key);
+    if let Some((_, site, ferry)) = best_in_range {
+        return Some((site, ferry));
     }
-    cells_within(&input.map, anchor, 2)
-        .filter(|(cell, _)| placeable(*cell))
-        .min_by_key(|(cell, distance)| (*distance, cell.y, cell.x))
-        .map(|(cell, _)| cell)
+
+    // 射程帯に置けるマスが無い極小盤面のみ、作戦地点の近傍へフォールバックする。
+    let fallback_site = if placeable(anchor) {
+        Some(anchor)
+    } else {
+        cells_within(&input.map, anchor, 2)
+            .filter(|(cell, _)| placeable(*cell))
+            .min_by_key(|(cell, distance)| (*distance, cell.y, cell.x))
+            .map(|(cell, _)| cell)
+    }?;
+    let (_, ferry) = ferry_to(fallback_site)?;
+    Some((fallback_site, ferry))
 }
 
 /// 砲台を運ぶ輸送部隊。運ばれる砲台でなければNone。
@@ -922,13 +997,14 @@ fn update_best_hold(
     }
 }
 
-/// 生産額が最も小さい案。同額なら敵の残りHP・損失の小さい案。
+/// 損耗込みの実効費用（生産額＋予測損耗額）が最も小さい案。同額なら生産額・敵残HPの小さい案。
+/// 生産額だけを見ると、すぐ大破して毎手番買い直しになる前衛案が損耗ゼロの陣地防御案より優先される。
 fn update_cheapest(best: &mut Option<ForcePackagePlan>, candidate: &ForcePackagePlan) {
     let key = |plan: &ForcePackagePlan| {
         (
+            plan.production_cost.saturating_add(plan.expected_loss),
             plan.production_cost,
             plan.remaining_hp(),
-            plan.expected_loss,
         )
     };
     if best
@@ -1154,8 +1230,6 @@ struct CombatRun<'c> {
     finished: bool,
     /// 保持期限の手番を終えた時点で、拠点を取って保持できていたか。
     holds_at_window: Option<bool>,
-    /// 補給できる都市を割り当てた砲台の数。
-    resupplied_guns: usize,
 }
 
 impl<'c> CombatRun<'c> {
@@ -1179,10 +1253,9 @@ impl<'c> CombatRun<'c> {
             completed_turns: 0,
             finished: false,
             holds_at_window: None,
-            resupplied_guns: 0,
         };
-        // 補給できる都市の数までの砲台は、毎手番の補給で弾切れせずに撃ち続けられる。
-        // それを超える砲台は弾数（5発）で撃ち止めになるので、買い足すほど価値が落ちる。
+        // 補給輸送車と組で運用する砲台は、随伴する輸送車や拠点から毎手番補給を受けられる。
+        // 同時に撃てる基数は BattleFrontage の射撃位置数と前衛スクリーンの有無で制限される。
         for index in 0..run.friendly_states.len() {
             if is_ferried_gun(&catalog.existing_units[index].stats) {
                 run.resupply_gun(index);
@@ -1214,12 +1287,38 @@ impl<'c> CombatRun<'c> {
         }
     }
 
-    /// 砲台に補給できる都市が残っていれば、その砲台を弾切れしないものとして扱う。
+    /// 補給輸送車と組の砲台は随伴補給により弾切れしないものとして扱う。
     fn resupply_gun(&mut self, index: usize) {
-        if self.resupplied_guns < self.catalog.gun_resupply_slots {
-            self.resupplied_guns += 1;
+        if self.catalog.ferried_resupply {
             self.friendly_states[index].attacks_left = u32::MAX;
         }
+    }
+
+    /// `turn` 時点で戦場に生存している地上直接戦闘unit（保護対象の占領歩兵を含む）の数。
+    fn living_ground_direct_count(&self, turn: u32) -> u32 {
+        let is_ground_direct = |stats: &UnitStats| {
+            stats.min_range <= 1
+                && stats.max_cargo == 0
+                && !matches!(stats.movement_type, MovementType::Air | MovementType::Ship)
+        };
+        let combat = (0..self.friendly_states.len())
+            .filter(|&index| {
+                let friendly = self.friendly(index);
+                self.friendly_states[index].hp > 0
+                    && turn >= friendly.available_turn
+                    && is_ground_direct(&friendly.stats)
+            })
+            .count();
+        let protected = self
+            .catalog
+            .protected_units
+            .iter()
+            .zip(&self.protected_states)
+            .filter(|(unit, state)| {
+                state.hp > 0 && turn >= unit.available_turn && is_ground_direct(&unit.stats)
+            })
+            .count();
+        u32::try_from(combat.saturating_add(protected)).unwrap_or(u32::MAX)
     }
 
     fn friendly(&self, index: usize) -> &'c SimFriendly {
@@ -1293,6 +1392,7 @@ impl<'c> CombatRun<'c> {
             });
         }
         // この手番に前線で交戦した直接戦闘unitと、撃った間接砲の数。
+        let living_ground_direct = self.living_ground_direct_count(turn);
         let mut engaged_front = 0_u32;
         let mut indirect_fired = 0_u32;
         let mut front_attacks: HashMap<FiringLane, u32> = HashMap::default();
@@ -1314,7 +1414,7 @@ impl<'c> CombatRun<'c> {
             ) else {
                 continue;
             };
-            let lane = FiringLane::of(&friendly.stats);
+            let lane = FiringLane::with_carrier(&friendly.stats, catalog.carrier_movement_type);
             if catalog
                 .frontage
                 .as_ref()
@@ -1323,11 +1423,20 @@ impl<'c> CombatRun<'c> {
             {
                 continue;
             }
-            // 間接砲は前線で交戦している直接戦闘unitの後ろからしか撃てない。前衛が
-            // 足りなければ、余った間接砲は前に出るしかなく、移動した手番には撃てない。
+            // 間接砲は前衛スクリーンの後ろから撃つ。橋などの狭い隘路（ground_chokepoint_width が
+            // 小さい戦場）では少数の前衛で隘路全体を塞げるため、後方の射撃位置（frontage.width）
+            // に並ぶ複数の長射程砲が同時に集中砲撃できる。広い平地で前衛が隘路幅に満たない場合は、
+            // 前衛の数までしか後ろに隠れて撃てない（前衛ゼロなら間接単独では撃てない）。
             let is_indirect = lane.indirect_range.is_some();
-            if is_indirect && catalog.frontage.is_some() && indirect_fired >= engaged_front {
-                continue;
+            if is_indirect
+                && let Some(frontage) = catalog.frontage.as_ref()
+            {
+                let screen_units = living_ground_direct.max(engaged_front);
+                if screen_units < frontage.ground_chokepoint_width
+                    && indirect_fired >= screen_units
+                {
+                    continue;
+                }
             }
             if is_indirect {
                 indirect_fired = indirect_fired.saturating_add(1);
@@ -1374,15 +1483,15 @@ impl<'c> CombatRun<'c> {
     /// 間接火力だけの脆い編成を過大評価する。
     fn enemy_attacks(&mut self, turn: u32) {
         let catalog = self.catalog;
-        // 前衛（直接戦闘unit）が戦場に生きている間は、敵の直接攻撃は後ろの砲台へ届かない。
-        let screen_alive = catalog.positional
-            && (0..self.friendly_states.len()).any(|index| {
-                let friendly = self.friendly(index);
-                friendly.stats.min_range <= 1
-                    && friendly.stats.max_cargo == 0
-                    && self.friendly_states[index].hp > 0
-                    && turn >= friendly.available_turn
-            });
+        // 地上直接戦闘unitが隘路幅（ground_chokepoint_width）以上生存していれば前線の壁が成立し、
+        // 敵の地上直接攻撃と、壁の向こうから射程が届かない短射程の敵地上間接砲は後方の長射程砲へ届かない。
+        // 航空部隊（MovementType::Air）は地上の壁を飛び越えて後方の砲台を攻撃できる。
+        let chokepoint = catalog
+            .frontage
+            .as_ref()
+            .map_or(1, |frontage| frontage.ground_chokepoint_width.max(1));
+        let ground_screen_holds =
+            catalog.positional && self.living_ground_direct_count(turn) >= chokepoint;
         for enemy_index in 0..catalog.enemies.len() {
             let enemy = &catalog.enemies[enemy_index];
             let enemy_hp = self.enemy_states[enemy_index].hp;
@@ -1393,7 +1502,15 @@ impl<'c> CombatRun<'c> {
                 continue;
             }
             let existing_count = catalog.existing_units.len();
-            let shield_indirect = screen_alive && enemy.source.stats.min_range <= 1;
+            let shielded_min_max_range = if !ground_screen_holds
+                || matches!(enemy.source.stats.movement_type, MovementType::Air)
+            {
+                None
+            } else if enemy.source.stats.min_range <= 1 {
+                Some(2)
+            } else {
+                Some(enemy.source.stats.max_range.saturating_add(1))
+            };
             let existing_target = strongest_attack_in_damage_order(
                 &catalog.existing_by_enemy_damage[enemy_index],
                 &catalog.existing_units,
@@ -1401,7 +1518,7 @@ impl<'c> CombatRun<'c> {
                 enemy_index,
                 enemy_hp,
                 turn,
-                shield_indirect,
+                shielded_min_max_range,
             );
             let production_target = strongest_enemy_attack(
                 self.production
@@ -1411,7 +1528,7 @@ impl<'c> CombatRun<'c> {
                 enemy_index,
                 enemy_hp,
                 turn,
-                shield_indirect,
+                shielded_min_max_range,
             )
             .map(|(index, damage)| (existing_count + index, damage));
             // 既存unitの後に生産unitが並ぶ。同じdamage・HPなら後方の要素を選ぶ従来の順序を保つ。
@@ -1436,7 +1553,7 @@ impl<'c> CombatRun<'c> {
                 enemy_index,
                 enemy_hp,
                 turn,
-                false,
+                None,
             );
             let (target_states, target_index, damage) = match (combat_target, protected_target) {
                 (Some((_index, damage)), Some((protected_index, protected_damage)))
@@ -1682,10 +1799,16 @@ struct EngagementTemplate {
 struct EngagementRow {
     /// 友軍から攻撃できる場合の (基礎damage, 被反撃damage, 射撃位置までのturn)。
     attack: Option<(u32, u32, u32)>,
+    /// 攻勢の運搬砲台が進軍途上で敵を射程に捉えて早期降車できる場合の相対turn。
+    direct_ferry_readiness: Option<u32>,
     /// 敵からこの友軍への基礎damage（0なら攻撃されない）。
     enemy_base_damage: u32,
-    /// 敵が自力で射程へ入るturn（絶対値）。
+    /// 敵が陣地（または現在地）へ射程に入れるturn（絶対値）。
     enemy_contact_turn: u32,
+    /// 敵が出発点（工場・現在地）まで到達して射程に入れるturn（絶対値）。
+    enemy_origin_contact_turn: u32,
+    /// 砲台が陣地に降車して配置につくまでの相対turn。
+    emplacement_arrival_offset: Option<u32>,
     /// 友軍が敵の射程へ入るまでの移動turn。
     friendly_travel: u32,
     /// 同じ手番にこの敵を直接攻撃できるunit数の上限。
@@ -1718,20 +1841,14 @@ impl EngagementTemplate {
         let carrier = ferry_carrier(input, stats);
         let approach = (!crate::ai::code_path::is_extended())
             .then(|| ApproachMap::new(input, carrier.unwrap_or(stats), position));
-        // 位置の価値を見積もるとき、運ぶ砲台は作戦地点に据える。運び終えるまでのturnと、
-        // 敵が地形を通って据えた位置の射程へ入るturnの遅い方から撃てる。
-        let emplacement = carrier.filter(|_| input.positional).and_then(|carrier| {
-            let site = emplacement_site(input, stats)?;
-            let ferry = approach.as_ref().and_then(|approach| {
-                if site == position {
-                    return Some(0);
-                }
-                approach
-                    .travel_turns_into_range(&input.map, carrier, site, (1, 1))
-                    .map(|travel| travel.max(1).saturating_add(2))
-            })?;
-            Some((site, ferry))
-        });
+        // 位置の価値を見積もるとき、運ぶ砲台は作戦地点を射程に収める陣地に据える。
+        // 運び終えるまでのturnと、敵が地形を通って据えた位置の射程へ入るturnの遅い方から撃てる。
+        let emplacement = carrier
+            .zip(approach.as_ref())
+            .filter(|_| input.positional)
+            .and_then(|(carrier, approach)| {
+                emplacement_site(input, carrier, stats, position, approach)
+            });
         let rows = input
             .enemies
             .iter()
@@ -1764,6 +1881,20 @@ impl EngagementTemplate {
                             enemy.available_turn.saturating_add(travel)
                         })
                 });
+                let direct_ferry_readiness = if !input.defensive_emplacement
+                    && emplacement.is_some()
+                    && let (Some(approach), Some(carrier)) = (approach.as_ref(), carrier)
+                {
+                    Some(approach.ferried_readiness_turns(
+                        &input.map,
+                        carrier,
+                        stats,
+                        position,
+                        enemy.position,
+                    ))
+                } else {
+                    None
+                };
                 let readiness = approach.as_ref().map_or_else(
                     || attack_readiness_turns(distance, stats),
                     |approach| match carrier {
@@ -1793,7 +1924,8 @@ impl EngagementTemplate {
                         readiness,
                     )
                 });
-                // 据えた砲台へ敵が直接攻撃できるturnも、地形を通った経路で測る。
+                let origin_enemy_travel = attack_readiness_turns(distance, &enemy.stats);
+                // 据えた砲台へ敵が攻撃できるturnも、地形を通った経路で測る。
                 let enemy_travel = match (emplacement, enemy_approach.as_ref()) {
                     (Some((site, _)), Some(approach)) => approach
                         .travel_turns_into_range(
@@ -1803,7 +1935,7 @@ impl EngagementTemplate {
                             (enemy.stats.min_range.max(1), enemy.stats.max_range.max(1)),
                         )
                         .unwrap_or(u32::MAX / 4),
-                    _ => attack_readiness_turns(distance, &enemy.stats),
+                    _ => origin_enemy_travel,
                 };
                 let friendly_travel = approach
                     .as_ref()
@@ -1826,12 +1958,17 @@ impl EngagementTemplate {
                     .map(|approach| approach.firing_slots(&input.map, stats, enemy.position));
                 EngagementRow {
                     attack,
+                    direct_ferry_readiness,
                     enemy_base_damage: best_damage(
                         &input.damage_chart,
                         enemy.stats.unit_type,
                         stats.unit_type,
                     ),
                     enemy_contact_turn: enemy.available_turn.saturating_add(enemy_travel),
+                    enemy_origin_contact_turn: enemy
+                        .available_turn
+                        .saturating_add(origin_enemy_travel),
+                    emplacement_arrival_offset: emplacement.map(|(_, ferry)| ferry.saturating_sub(1)),
                     friendly_travel,
                     firing_slots,
                     enemy_in_range_turn,
@@ -1881,25 +2018,37 @@ impl EngagementTemplate {
             .rows
             .iter()
             .map(|row| {
-                row.attack.map(
-                    |(base_damage, incoming_damage, readiness)| FriendlyAttackProfile {
+                row.attack.map(|(base_damage, incoming_damage, readiness)| {
+                    let emplaced_ready = available_turn
+                        .saturating_add(readiness)
+                        .max(row.enemy_in_range_turn.unwrap_or(0));
+                    let ready_turn = match row.direct_ferry_readiness {
+                        Some(direct) => emplaced_ready.min(available_turn.saturating_add(direct)),
+                        None => emplaced_ready,
+                    };
+                    FriendlyAttackProfile {
                         firing_position: None,
                         requires_movement: false,
                         base_damage,
                         incoming_damage,
-                        ready_turn: available_turn
-                            .saturating_add(readiness)
-                            .max(row.enemy_in_range_turn.unwrap_or(0)),
+                        ready_turn,
                         firing_slots: row.firing_slots,
-                    },
-                )
+                    }
+                })
             })
             .collect::<Vec<_>>();
         let enemy_attack_profiles = self
             .rows
             .iter()
             .map(|row| {
-                let contact_turn = if can_advance_to_enemy && row.enemy_in_range_turn.is_none() {
+                // 陣地へ運ぶ砲台は、陣地へ降車するより前には陣地側の敵から攻撃されない
+                // （出発点そのものへ敵が到達する場合を除く）。
+                let contact_turn = if let Some(arrival_offset) = row.emplacement_arrival_offset {
+                    let arrival_at_site = available_turn.saturating_add(arrival_offset);
+                    row.enemy_contact_turn
+                        .max(arrival_at_site)
+                        .min(row.enemy_origin_contact_turn)
+                } else if can_advance_to_enemy && row.enemy_in_range_turn.is_none() {
                     row.enemy_contact_turn
                         .min(available_turn.saturating_add(row.friendly_travel))
                 } else {
@@ -1986,14 +2135,14 @@ fn strategic_rank(stats: &UnitStats) -> u8 {
 }
 
 /// 敵1体が今手番に与えられる最大damageの友軍（同点ならHPの低い方、さらに同点なら後方の要素）。
-/// `shield_indirect` なら、前衛に守られた間接砲は狙えない。
+/// `shielded_min_max_range` が `Some(r)` なら、前衛に守られた最大射程 `r` 以上の間接砲は狙えない。
 fn strongest_enemy_attack<'a>(
     units: impl Iterator<Item = &'a SimFriendly>,
     unit_states: &[UnitCombatState],
     enemy_index: usize,
     enemy_hp: u32,
     turn: u32,
-    shield_indirect: bool,
+    shielded_min_max_range: Option<u32>,
 ) -> Option<(usize, u32)> {
     units
         .zip(unit_states)
@@ -2001,7 +2150,9 @@ fn strongest_enemy_attack<'a>(
         .filter(|(_, (unit, unit_state))| {
             unit_state.hp > 0
                 && turn >= unit.available_turn
-                && !(shield_indirect && unit.stats.min_range > 1)
+                && !shielded_min_max_range.is_some_and(|min_max| {
+                    unit.stats.min_range > 1 && unit.stats.max_range >= min_max
+                })
         })
         .filter_map(|(index, (unit, _))| {
             let profile = unit.enemy_attack_profiles[enemy_index]?;
@@ -2029,12 +2180,14 @@ fn strongest_attack_in_damage_order(
     enemy_index: usize,
     enemy_hp: u32,
     turn: u32,
-    shield_indirect: bool,
+    shielded_min_max_range: Option<u32>,
 ) -> Option<(usize, u32)> {
     let mut best: Option<(u32, u32, usize)> = None;
     for &index in order {
         let unit = &units[index];
-        if shield_indirect && unit.stats.min_range > 1 {
+        if shielded_min_max_range
+            .is_some_and(|min_max| unit.stats.min_range > 1 && unit.stats.max_range >= min_max)
+        {
             continue;
         }
         let Some(profile) = unit.enemy_attack_profiles[enemy_index] else {
@@ -2123,18 +2276,32 @@ fn front_strength(friendly: &SimFriendly) -> u32 {
         .unwrap_or(0)
 }
 
-/// 同じ射撃位置を取り合う友軍の区分。直接戦闘unitは移動種別、間接砲は移動種別と射程で分ける。
+/// 同じ射撃位置を取り合う友軍の区分。直接戦闘unitは移動種別、間接砲は移動種別（および輸送車の有無）と射程で分ける。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FiringLane {
     movement_type: MovementType,
+    carrier_movement_type: Option<MovementType>,
     /// 直接戦闘unitは `None`、間接砲は (最小射程, 最大射程)。
     indirect_range: Option<(u32, u32)>,
 }
 
 impl FiringLane {
+    #[cfg(test)]
     fn of(stats: &UnitStats) -> Self {
+        Self::with_carrier(stats, None)
+    }
+
+    fn for_unit(input: &RollingPlanInput, stats: &UnitStats) -> Self {
+        Self::with_carrier(
+            stats,
+            ferry_carrier(input, stats).map(|carrier| carrier.movement_type),
+        )
+    }
+
+    fn with_carrier(stats: &UnitStats, carrier_move: Option<MovementType>) -> Self {
         Self {
             movement_type: stats.movement_type,
+            carrier_movement_type: carrier_move.filter(|_| is_ferried_gun(stats)),
             indirect_range: (stats.min_range > 1).then_some((stats.min_range, stats.max_range)),
         }
     }
@@ -2144,6 +2311,8 @@ impl FiringLane {
 #[derive(Debug, Clone)]
 struct BattleFrontage {
     widths: HashMap<FiringLane, u32>,
+    /// 地上車両が前線へ至る経路の最小点カット幅（橋などの隘路では 1〜2、広い平地では大）。
+    ground_chokepoint_width: u32,
 }
 
 impl BattleFrontage {
@@ -2159,8 +2328,9 @@ impl BattleFrontage {
 /// 突破せずに入れるマスだけを射撃位置として数える。
 /// - 直接戦闘unit: 出発点から敵に隣接した空きマスへ至る経路を最も狭いところで塞ぐのに
 ///   要るマス数（最小点カット）。橋や細い回廊を通らなければ届かない戦場では小さい。
-/// - 間接砲: いずれかの敵を射程に収める、入れる空きマスの数。射程が短いほど、また川や
-///   山の向こうの敵ほど少なく、撃てる位置が無ければ撃てない。
+/// - 間接砲: いずれかの敵を射程に収める、入れる空きマスの数（運搬砲台は輸送車が到達して
+///   隣へ降ろせる砲台進入可能マスを含む）。射程が短いほど、また川や山の向こうの敵ほど少なく、
+///   撃てる位置が無ければ撃てない。
 ///
 /// 山を越えられる歩兵と戦車では通れる地形が違うため、移動種別ごとに求める。今いる敵が
 /// いなければ上限を設けない。
@@ -2175,6 +2345,7 @@ fn battle_frontage(input: &RollingPlanInput) -> Option<BattleFrontage> {
         return None;
     }
     let mut origins_by_lane: HashMap<FiringLane, Vec<GridPosition>> = HashMap::default();
+    let mut ground_origins = Vec::new();
     let origins = input
         .existing_units
         .iter()
@@ -2187,10 +2358,28 @@ fn battle_frontage(input: &RollingPlanInput) -> Option<BattleFrontage> {
         );
     for (stats, origin) in origins {
         origins_by_lane
-            .entry(FiringLane::of(stats))
+            .entry(FiringLane::for_unit(input, stats))
             .or_default()
             .push(origin);
+        if !matches!(stats.movement_type, MovementType::Air | MovementType::Ship) {
+            ground_origins.push(origin);
+        }
     }
+    for protected in &input.protected_units {
+        if !matches!(
+            protected.stats.movement_type,
+            MovementType::Air | MovementType::Ship
+        ) {
+            ground_origins.push(protected.position);
+        }
+    }
+    ground_origins.sort_unstable_by_key(|pos| (pos.y, pos.x));
+    ground_origins.dedup();
+    let ground_chokepoint_width = if ground_origins.is_empty() {
+        1
+    } else {
+        front_min_cut(input, MovementType::Tank, &ground_origins, &blocked).max(1)
+    };
     let widths = origins_by_lane
         .into_iter()
         .map(|(lane, origins)| {
@@ -2198,25 +2387,65 @@ fn battle_frontage(input: &RollingPlanInput) -> Option<BattleFrontage> {
             // 無ければ撃てない。
             let width = match lane.indirect_range {
                 None => front_min_cut(input, lane.movement_type, &origins, &blocked).max(1),
-                Some(range) => {
-                    indirect_firing_cells(input, lane.movement_type, range, &origins, &blocked)
-                }
+                Some(range) => indirect_firing_cells(
+                    input,
+                    lane.movement_type,
+                    lane.carrier_movement_type,
+                    range,
+                    &origins,
+                    &blocked,
+                ),
             };
             (lane, width)
         })
         .collect();
-    Some(BattleFrontage { widths })
+    Some(BattleFrontage {
+        widths,
+        ground_chokepoint_width,
+    })
 }
 
 /// いずれかの敵を射程に収める、出発点から突破せずに入れる空きマスの数。
+/// 輸送車で運ぶ砲台（`carrier_movement_type` が `Some`）は、輸送車が森などを越えて到達し、
+/// その隣（または同マス）へ降ろせる砲台進入可能マスも射撃位置に含める。
 fn indirect_firing_cells(
     input: &RollingPlanInput,
     movement_type: MovementType,
+    carrier_movement_type: Option<MovementType>,
     (min_range, max_range): (u32, u32),
     origins: &[GridPosition],
     blocked: &HashSet<GridPosition>,
 ) -> u32 {
-    let reachable = reachable_cells(input, movement_type, origins, blocked);
+    let reachable = match carrier_movement_type {
+        None => reachable_cells(input, movement_type, origins, blocked),
+        Some(carrier_move) => {
+            let carrier_reach = reachable_cells(input, carrier_move, origins, blocked);
+            let gun_passable = |cell: GridPosition| {
+                !blocked.contains(&cell)
+                    && input.map.get_terrain(cell.x, cell.y).is_some_and(|terrain| {
+                        crate::systems::movement::get_valid_movement_cost(
+                            &input.master_data,
+                            movement_type,
+                            terrain,
+                        )
+                        .is_some()
+                    })
+            };
+            let mut drop_cells = HashSet::default();
+            for &stop in &carrier_reach {
+                if gun_passable(stop) {
+                    drop_cells.insert(stop);
+                }
+                for (x, y) in input.map.get_adjacent(stop.x, stop.y) {
+                    let adjacent = GridPosition { x, y };
+                    if gun_passable(adjacent) {
+                        drop_cells.insert(adjacent);
+                    }
+                }
+            }
+            drop_cells
+        }
+    };
     let mut cells = HashSet::default();
     for enemy in blocked {
         for (cell, distance) in cells_within(&input.map, *enemy, max_range) {
@@ -2689,9 +2918,10 @@ mod tests {
             hold_contestants: Vec::new(),
             committed_purchases: Vec::new(),
             artillery_carrier: None,
-            artillery_resupply_slots: 0,
+            owned_cities: Vec::new(),
             positional: false,
             deploy_anchor: None,
+            defensive_emplacement: false,
             economy_of_force: false,
             map: Arc::new(map),
             master_data: Arc::new(MasterDataRegistry::load().unwrap()),
@@ -3706,6 +3936,187 @@ mod tests {
 
         assert!(plan.feasible, "{plan:#?}");
         assert_eq!(plan.purchases.len(), 6);
+    }
+
+    #[test]
+    fn chokepoint_bridge_selects_ferried_artillery_across_forest_while_air_bypasses_ground_wall() {
+        // x=2 は森（砲台は徒歩不可・補給輸送車は通行可）、x=9 は (9,1) だけ橋の1マス隘路。
+        // 工場 (0,1) は敵から距離10以上離れており、森を越えなければ射程6でも一切届かない。
+        // 味方の重戦車が橋の手前 (8,1) を塞ぎ、対岸の (10,1) に中戦車、(12,1) に重自走砲、
+        // (13,1) に攻略目標の拠点がある。
+        let mut map = Map::new(18, 3, Terrain::Plains, GridTopology::Square);
+        for y in 0..3 {
+            map.set_terrain(2, y, Terrain::Forest).unwrap();
+        }
+        for y in [0, 2] {
+            map.set_terrain(9, y, Terrain::Sea).unwrap();
+        }
+        map.set_terrain(9, 1, Terrain::Bridge).unwrap();
+        let master = MasterDataRegistry::load().unwrap();
+        let unit = |name: &str| {
+            master
+                .create_unit_stats(&UnitName(name.to_owned()))
+                .unwrap()
+        };
+        let mut raw_chart = DamageChart::new();
+        for (a, d, dmg) in [
+            (UnitType::TankZ, UnitType::MdTank, 86),
+            (UnitType::TankZ, UnitType::HeavySpGun, 85),
+            (UnitType::MdTank, UnitType::TankZ, 23),
+            (UnitType::MdTank, UnitType::MdTank, 46),
+            (UnitType::MdTank, UnitType::HeavySpGun, 78),
+            (UnitType::MdTank, UnitType::Artillery, 82),
+            (UnitType::HeavySpGun, UnitType::TankZ, 21),
+            (UnitType::HeavySpGun, UnitType::MdTank, 83),
+            (UnitType::HeavySpGun, UnitType::HeavySpGun, 63),
+            (UnitType::HeavySpGun, UnitType::Artillery, 42),
+            (UnitType::Artillery, UnitType::MdTank, 87),
+            (UnitType::Artillery, UnitType::HeavySpGun, 88),
+            // 戦闘ヘリ: 重戦車には15で重戦車は生き残るが、砲台には65の大損害を与える。
+            (UnitType::Bcopters, UnitType::TankZ, 5),
+            (UnitType::Bcopters, UnitType::Artillery, 65),
+            (UnitType::Tank, UnitType::MdTank, 28),
+            (UnitType::MdTank, UnitType::Tank, 15),
+            (UnitType::HeavySpGun, UnitType::Tank, 15),
+        ] {
+            raw_chart.insert_damage(a, d, dmg);
+        }
+        let chart = Arc::new(raw_chart);
+        let carrier = unit("補給輸送車");
+        let tank_z = unit("重戦車");
+        let md_tank = unit("中戦車");
+        let heavy_sp = unit("重自走砲");
+        let artillery = unit("砲台");
+        let facility = GridPosition { x: 0, y: 1 };
+        let make_option = |stats: UnitStats, cost: u32| ProductionPlanOption {
+            capture_target: None,
+            capture_arrival_turn: None,
+            capture_completion_turn: None,
+            capture_durability: None,
+            capture_blocking_enemy_index: None,
+            purchase: PlannedPurchase {
+                facility,
+                unit_type: stats.unit_type,
+                build_turn: 0,
+                cost,
+            },
+            stats,
+            engageable_enemy_indices: vec![0, 1],
+        };
+
+        let mut base = input();
+        base.map = Arc::new(map);
+        base.master_data = Arc::new(master);
+        base.damage_chart = chart;
+        base.positional = true;
+        base.artillery_carrier = Some(carrier.clone());
+        base.deploy_anchor = Some(GridPosition { x: 13, y: 1 });
+        base.hold_window = Some(8);
+        base.hold_contestants = vec![true, true];
+        base.current_funds = 24_000;
+        base.income_per_turn = 0;
+        base.existing_units = vec![FriendlyPlanUnit {
+            protection_completion_turn: None,
+            stats: tank_z.clone(),
+            position: GridPosition { x: 8, y: 1 },
+            hp: 100,
+            available_turn: 0,
+            engageable_enemy_indices: vec![0, 1],
+        }];
+        base.enemies = vec![
+            EnemyPlanUnit {
+                entity: Some(Entity::from_raw(1)),
+                stats: md_tank,
+                position: GridPosition { x: 10, y: 1 },
+                hp: 100,
+                defense_bonus: 0,
+                available_turn: 0,
+            },
+            EnemyPlanUnit {
+                entity: Some(Entity::from_raw(2)),
+                stats: heavy_sp.clone(),
+                position: GridPosition { x: 12, y: 1 },
+                hp: 100,
+                defense_bonus: 0,
+                available_turn: 0,
+            },
+        ];
+        base.production_options = vec![
+            make_option(md_tank_clone(&base.enemies[0].stats), 18_000),
+            make_option(heavy_sp, 16_500),
+            make_option(
+                artillery.clone(),
+                artillery.cost.saturating_add(carrier.cost),
+            ),
+        ];
+
+        let frontage = battle_frontage(&base).unwrap();
+        let art_lane = FiringLane::for_unit(&base, &artillery);
+        assert!(
+            frontage.width(&art_lane).unwrap_or(0) > 0,
+            "補給輸送車で森を越えて降ろせる砲台の射撃位置は0にならないはず"
+        );
+        let plan = plan_force_package(&base).expect("隘路突破の編成案");
+        assert!(
+            plan.purchases
+                .iter()
+                .any(|p| p.unit_type == UnitType::Artillery),
+            "1マス橋の隘路では森を越えて運ぶ射程6の砲台が選ばれるはず: {:?}",
+            plan.purchases
+        );
+        assert_eq!(
+            plan.remaining_hp(),
+            0,
+            "据えた砲台が実際に砲撃して対岸の中戦車・重自走砲を撃破するはず: {:?}",
+            plan.target_forecasts
+        );
+
+        // 敵が航空部隊（戦闘ヘリ）なら、5手番で地上の重戦車が生き残っていても飛び越えて砲台を攻撃できる。
+        let bcopters = base
+            .master_data
+            .create_unit_stats(&UnitName("戦闘ヘリ".to_owned()))
+            .unwrap();
+        let mut air_case = base.clone();
+        air_case.hard_deadline = Some(6);
+        air_case.hold_window = None;
+        air_case.existing_units[0].stats = tank_z;
+        air_case.enemies = vec![EnemyPlanUnit {
+            entity: Some(Entity::from_raw(3)),
+            stats: bcopters,
+            position: GridPosition { x: 10, y: 1 },
+            hp: 100,
+            defense_bonus: 0,
+            available_turn: 0,
+        }];
+        air_case.hold_contestants = Vec::new();
+        air_case.production_options = vec![ProductionPlanOption {
+            engageable_enemy_indices: Vec::new(),
+            ..make_option(
+                artillery.clone(),
+                artillery.cost.saturating_add(carrier.cost),
+            )
+        }];
+        let without_gun = evaluate_fixed_package(&air_case, &[]).unwrap();
+        let with_gun = evaluate_fixed_package(
+            &air_case,
+            &[air_case.production_options[0].purchase],
+        )
+        .unwrap();
+        assert!(
+            without_gun.expected_loss < air_case.existing_units[0].stats.cost,
+            "前衛の重戦車は6手番時点で生存している前提: loss={}",
+            without_gun.expected_loss
+        );
+        assert!(
+            with_gun.expected_loss > without_gun.expected_loss,
+            "地上の壁が生き残っていても航空部隊は砲台を攻撃できるはず: with={} without={}",
+            with_gun.expected_loss,
+            without_gun.expected_loss
+        );
+    }
+
+    fn md_tank_clone(stats: &UnitStats) -> UnitStats {
+        stats.clone()
     }
 }
 
