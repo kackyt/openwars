@@ -109,6 +109,13 @@ fn empty_truck_goes_next_to_an_idle_gun() {
 }
 
 #[test]
+fn full_fuel_does_not_make_a_gun_need_refueling() {
+    assert!(!needs_refueling(Some(1), 1));
+    assert!(needs_refueling(Some(0), 1));
+    assert!(!needs_refueling(None, 1));
+}
+
+#[test]
 fn landers_are_not_artillery_carriers() {
     let registry = MasterDataRegistry::load().unwrap();
     let stats = |unit_type: UnitType| {

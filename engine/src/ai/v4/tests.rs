@@ -222,7 +222,6 @@ fn existing_combat_sorties_are_committed_to_only_one_operation() {
     let horizons = vec![5, 5];
     let scan = BoardScan {
         current_turn: 0,
-        game_turn: crate::ai::v4::test_support::MIDGAME_TURN,
         owned_cities: Vec::new(),
         economy_anchors: Vec::new(),
         route_posture: None,
@@ -348,82 +347,6 @@ fn current_mission_combat_is_not_filtered_by_purchase_plan() {
     );
 }
 
-/// 標準経路のCaptureでは、1手番目の戦闘計画が今手番に買えるのは歩兵類だけで、
-/// 中戦車などは次手番以降の予定として残る。2手番目以降は制限しない。
-#[test]
-fn opening_turn_combat_plan_buys_only_infantry_now() {
-    let candidates_at = |game_turn: u32| {
-        let mut scan = mixed_threat_multi_factory_scan();
-        scan.game_turn = game_turn;
-        let anchor = pos(6, 2);
-        scan.open_properties = vec![anchor];
-        scan.campaign_objectives = vec![CampaignPlanningObjective {
-            capture_replacement_pending: false,
-            island_id: crate::ai::islands::IslandId(0),
-            kind: OperationKind::Capture,
-            anchor,
-            objective_properties: vec![anchor],
-            capture_eta: None,
-            required_capture_survivors: 1,
-            logistics_rank: Some(0),
-            forced_target_enemies: HashSet::default(),
-            protected_capture_entities: HashSet::default(),
-            staging_anchor: anchor,
-            execution_authorized: true,
-        }];
-        let mut ctx = ReachCtx::default();
-        let operations = build_operations(
-            &scan,
-            &mut ctx,
-            &[],
-            PlayerId(1),
-            ProductionPolicy::Standard,
-        );
-        let operation = operations
-            .iter()
-            .find(|operation| operation.kind == OperationKind::Capture)
-            .expect("局地Capture作戦");
-        assert_eq!(operation.facts.opening_turn, game_turn <= 1);
-        let input = standard_combat_plan_input(
-            &scan,
-            &mut ctx,
-            operation,
-            &HashSet::default(),
-            &HashSet::default(),
-            scan.funds,
-            false,
-        )
-        .expect("観測敵がいるためCombat計画入力が作られる");
-        input
-            .production_options
-            .iter()
-            .map(|option| (option.purchase.build_turn, option.stats.can_capture))
-            .collect::<Vec<_>>()
-    };
-
-    let opening = candidates_at(1);
-    assert!(
-        opening
-            .iter()
-            .filter(|(build_turn, _)| *build_turn == 0)
-            .all(|(_, can_capture)| *can_capture),
-        "1手番目は今手番に歩兵類しか買わない: {opening:?}"
-    );
-    assert!(
-        opening
-            .iter()
-            .any(|(build_turn, can_capture)| *build_turn > 0 && !*can_capture),
-        "中戦車などは次手番以降の予定として残す: {opening:?}"
-    );
-    let later = candidates_at(2);
-    assert!(
-        later
-            .iter()
-            .any(|(build_turn, can_capture)| *build_turn == 0 && !*can_capture),
-        "2手番目以降は今手番の兵種を制限しない: {later:?}"
-    );
-}
-
 #[test]
 fn combat_plan_projects_only_the_capturer_ordered_this_turn() {
     let mut scan = mixed_threat_multi_factory_scan();
@@ -536,6 +459,56 @@ fn combat_plan_excludes_unit_types_that_cannot_damage_any_planned_enemy() {
         with_air.contains(&UnitType::AntiAir),
         "航空敵がいれば対空戦車を候補に残す: {with_air:?}"
     );
+}
+
+/// 標準経路のCapture作戦で、当手番の非占領戦闘ユニットも購入候補に残る。
+#[test]
+fn opening_turn_allows_non_infantry_combat_purchases() {
+    let mut scan = mixed_threat_multi_factory_scan();
+    let anchor = pos(6, 2);
+    scan.open_properties = vec![anchor];
+    scan.campaign_objectives = vec![CampaignPlanningObjective {
+        capture_replacement_pending: false,
+        island_id: crate::ai::islands::IslandId(0),
+        kind: OperationKind::Capture,
+        anchor,
+        objective_properties: vec![anchor],
+        capture_eta: None,
+        required_capture_survivors: 1,
+        logistics_rank: Some(0),
+        forced_target_enemies: HashSet::default(),
+        protected_capture_entities: HashSet::default(),
+        staging_anchor: anchor,
+        execution_authorized: true,
+    }];
+    let mut ctx = ReachCtx::default();
+    let operations = build_operations(
+        &scan,
+        &mut ctx,
+        &[],
+        PlayerId(1),
+        ProductionPolicy::Standard,
+    );
+    let operation = operations
+        .iter()
+        .find(|operation| operation.kind == OperationKind::Capture)
+        .expect("局地Capture作戦");
+    let input = standard_combat_plan_input(
+        &scan,
+        &mut ctx,
+        operation,
+        &HashSet::default(),
+        &HashSet::default(),
+        scan.funds,
+        false,
+    )
+    .expect("Combat計画入力が作られる");
+
+    let has_non_infantry = input
+        .production_options
+        .iter()
+        .any(|option| option.purchase.build_turn == 0 && !option.stats.can_capture);
+    assert!(has_non_infantry, "当手番の非占領戦闘候補が残る");
 }
 
 /// 敵施設の生産余力も、期限内に到着できる最寄りの1作戦だけへ計上する。
@@ -869,7 +842,6 @@ fn combat_plan_does_not_treat_purchase_price_as_destroyed_enemy_value() {
     let enemy_positions = [pos(8, 0), pos(8, 1), pos(8, 2)];
     let scan = BoardScan {
         current_turn: 0,
-        game_turn: crate::ai::v4::test_support::MIDGAME_TURN,
         owned_cities: Vec::new(),
         economy_anchors: Vec::new(),
         route_posture: None,
@@ -1047,7 +1019,6 @@ fn strait_scan() -> BoardScan {
 
     BoardScan {
         current_turn: 0,
-        game_turn: crate::ai::v4::test_support::MIDGAME_TURN,
         owned_cities: Vec::new(),
         economy_anchors: Vec::new(),
         route_posture: None,
@@ -1239,7 +1210,6 @@ fn multi_factory_scan() -> BoardScan {
 
     BoardScan {
         current_turn: 0,
-        game_turn: crate::ai::v4::test_support::MIDGAME_TURN,
         owned_cities: Vec::new(),
         economy_anchors: Vec::new(),
         route_posture: None,
@@ -1633,7 +1603,6 @@ fn mixed_threat_multi_factory_scan() -> BoardScan {
 
     BoardScan {
         current_turn: 0,
-        game_turn: crate::ai::v4::test_support::MIDGAME_TURN,
         owned_cities: Vec::new(),
         economy_anchors: Vec::new(),
         route_posture: None,
@@ -1731,7 +1700,6 @@ fn campaign_surplus_targets_enemy_infantry_without_buying_stranded_tank() {
     damage_chart.insert_damage(UnitType::Infantry, UnitType::Tank, 0);
     let scan = BoardScan {
         current_turn: 0,
-        game_turn: crate::ai::v4::test_support::MIDGAME_TURN,
         owned_cities: Vec::new(),
         economy_anchors: Vec::new(),
         route_posture: None,

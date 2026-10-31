@@ -96,11 +96,16 @@ pub(super) fn carry_over(
 /// 今手番の所属を記録する。今手番の候補（`units`）のうち作戦に属さなくなった部隊
 /// （占領へ回った等）は外す。SquadManagerは全プレイヤーで共有なので、候補外は触らない。
 pub(super) fn record_membership(
+    world: &World,
     manager: &mut SquadManager,
     orders: &[RouteOrder],
     units: &[Entity],
     plan_members: &[Vec<Entity>],
 ) {
+    // 撃破済みのEntityはプレイヤーを問わず所属台帳から取り除く。
+    manager.route_operation_members.retain(|entity, _| {
+        world.get::<Faction>(*entity).is_some() && world.get::<UnitStats>(*entity).is_some()
+    });
     for unit in units {
         manager.route_operation_members.remove(unit);
     }
@@ -750,4 +755,26 @@ fn firing_position(
                 cell.x,
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn membership_removes_despawned_entities_but_keeps_other_players() {
+        let mut world = World::new();
+        let removed = world.spawn((Faction(PlayerId(1)), UnitStats::mock())).id();
+        let other = world.spawn((Faction(PlayerId(2)), UnitStats::mock())).id();
+        let mut manager = SquadManager::default();
+        let target = GridPosition { x: 1, y: 1 };
+        manager.route_operation_members.insert(removed, target);
+        manager.route_operation_members.insert(other, target);
+        world.despawn(removed);
+
+        record_membership(&world, &mut manager, &[], &[], &[]);
+
+        assert!(!manager.route_operation_members.contains_key(&removed));
+        assert_eq!(manager.route_operation_members.get(&other), Some(&target));
+    }
 }

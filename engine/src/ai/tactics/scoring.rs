@@ -484,35 +484,6 @@ pub(crate) fn assess_attack(
     if expected_damage >= target_health.current {
         score += 5000;
     }
-    // 標的が橋（Terrain::Bridge）の上にいる場合、進軍路（ボトルネック）を塞いでいる敵であるため、
-    // 早期排除による進軍開通ボーナスを付与する。
-    // 特に間接攻撃部隊による安全な排除は、味方部隊の突入路を開くため最優先する。
-    if board.map.get_terrain(target_position.x, target_position.y)
-        == Some(crate::resources::Terrain::Bridge)
-    {
-        score += 8000;
-        if unit.stats.min_range > 1 {
-            score += 4000;
-        }
-    }
-    // 敵首都・工場の上にいる敵、または敵の間接攻撃部隊（砲台・自走砲・ロケット等）に対する優先排除ボーナス。
-    // 海越しの包囲砲撃やチョークポイントの突破において、敵の防衛中核と火力を早期制圧する。
-    let target_terrain = board.map.get_terrain(target_position.x, target_position.y);
-    let is_on_capital_or_factory = target_terrain == Some(crate::resources::Terrain::Capital)
-        || target_terrain == Some(crate::resources::Terrain::Factory);
-    if is_on_capital_or_factory {
-        score += 6000;
-        if unit.stats.min_range > 1 {
-            score += 4000; // 間接部隊による安全な防衛拠点・工場制圧砲撃
-        }
-    }
-    if target_stats.min_range > 1 {
-        // 敵の間接部隊は味方の突入部隊を射程外から迎撃する要であるため、最優先で沈黙させる（対砲兵戦）
-        score += 5000;
-        if unit.stats.min_range > 1 {
-            score += 3000;
-        }
-    }
     Some(AttackAssessment {
         target_hp: target_health.current,
         target_position,

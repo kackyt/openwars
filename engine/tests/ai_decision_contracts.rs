@@ -134,8 +134,8 @@ fn check_turn_contracts(world: &World, observation: &TurnObservation) -> Vec<Str
     }
     if planned_cost > trace.funds {
         violations.push(format!(
-            "{context}: 購入案の合計 {planned_cost} が配分開始資金 {} を超える",
-            trace.funds
+            "{context}: 購入案の合計 {planned_cost} が配分開始資金 {} を超える: {:?}",
+            trace.funds, trace.steps
         ));
     }
 

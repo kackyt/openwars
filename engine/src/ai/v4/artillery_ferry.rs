@@ -90,6 +90,11 @@ pub(crate) fn is_ferried_gun(stats: &UnitStats) -> bool {
     stats.min_range > 1 && stats.max_movement <= 1
 }
 
+/// 現在燃料が最大値に満たない場合だけ補給が必要。
+fn needs_refueling(fuel: Option<u32>, max_fuel: u32) -> bool {
+    fuel.is_some_and(|current| current < max_fuel)
+}
+
 /// 砲台を積んで陸上を走る輸送部隊（補給輸送車）の能力か。輸送船・輸送ヘリは含めない。
 pub(crate) fn is_artillery_carrier(stats: &UnitStats) -> bool {
     stats.max_cargo > 0
@@ -366,16 +371,6 @@ fn update_gun_routes(
     );
     world.insert_resource(memory);
     routes
-}
-
-/// 攻めの進軍路に割り当てた砲台の、受け持ちの要衝（配分案が、攻めの砲台の居る進軍路を
-/// 工場付近まで下げないために読む）。
-pub(crate) fn attack_gun_anchors(world: &World, player: PlayerId) -> Vec<GridPosition> {
-    world
-        .get_resource::<GunRouteAssignment>()
-        .and_then(|memory| memory.by_player.get(&player))
-        .map(|routes| routes.routes.values().copied().collect())
-        .unwrap_or_default()
 }
 
 /// 攻めに割り当てていない砲台の守り場所: 最も近い守りの進軍路の要衝（攻めの砲台の居ない
@@ -802,7 +797,7 @@ impl ArtilleryFerry<'_> {
         }
         let gun_needs_service = gun.health.is_some_and(|h| h < 100)
             || gun.ammo.is_some_and(|(curr, _)| curr <= 3)
-            || gun.fuel.is_some_and(|f| f <= 10);
+            || needs_refueling(gun.fuel, gun.stats.max_fuel);
         if gun_needs_service {
             return false;
         }

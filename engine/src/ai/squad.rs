@@ -2708,7 +2708,13 @@ fn prepare_campaign_local_assignment_scoped(
                 );
                 // 占領へ回った占領役も所属から外すため、島の占領役も候補に含める。
                 let candidates = units.iter().chain(&capture).copied().collect::<Vec<_>>();
-                route_operations::record_membership(manager, orders, &candidates, &route_members);
+                route_operations::record_membership(
+                    world,
+                    manager,
+                    orders,
+                    &candidates,
+                    &route_members,
+                );
                 scope.assign(
                     world,
                     manager,
