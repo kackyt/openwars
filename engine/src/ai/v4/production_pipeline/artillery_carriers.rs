@@ -6,9 +6,19 @@
 //! 既存の砲台へ残額で輸送車を付ける。
 
 use super::*;
-use crate::ai::v4::artillery_ferry::{
-    GUNS_FOR_ATTACK_ROUTES, is_artillery_carrier, is_ferried_gun,
-};
+use crate::ai::v4::artillery_ferry::{is_artillery_carrier, is_ferried_gun};
+
+/// 計画が砲台の購入額に上乗せして確保した、補給輸送車の分の資金。
+///
+/// 計画は砲台を輸送車との組の値段で評価する。発注する命令・traceは兵種ごとの実単価で記録するので、
+/// 組の値段が実単価を上回る分（上乗せ）を、輸送車を買うための確保額として取り出す。
+pub(super) fn carrier_surcharge(unit_type: UnitType, planned_cost: u32, scan: &BoardScan) -> u32 {
+    scan.available_types
+        .iter()
+        .find(|(candidate, _)| *candidate == unit_type)
+        .filter(|(_, stats)| is_ferried_gun(stats))
+        .map_or(0, |(_, stats)| planned_cost.saturating_sub(stats.cost))
+}
 
 /// 砲台に対して足りない補給輸送車を、残額と空き施設で買う。新しく買う砲台の隣の施設を
 /// 優先し、次の手番にすぐ積み込めるようにする。
@@ -71,22 +81,6 @@ pub(super) fn allocate_artillery_carriers(
             y: planned.command.target_y,
         })
         .collect::<Vec<_>>();
-    // 計画は砲台を補給輸送車との組の値段で買い、輸送車の分の資金を既に確保している。
-    let gun_cost = |unit_type: UnitType| {
-        scan.available_types
-            .iter()
-            .find(|(candidate, _)| *candidate == unit_type)
-            .map_or(0, |(_, stats)| stats.cost)
-    };
-    let mut prepaid = state
-        .commands
-        .iter()
-        .filter(|planned| {
-            is_gun_type(planned.command.unit_type)
-                && planned.cost
-                    >= gun_cost(planned.command.unit_type).saturating_add(carrier_stats.cost)
-        })
-        .count();
     let new_carriers = state
         .commands
         .iter()
@@ -135,13 +129,13 @@ pub(super) fn allocate_artillery_carriers(
                     .map(|gun| scan.map.distance(position.x, position.y, gun.x, gun.y))
                     .min()
                     .unwrap_or(u32::MAX);
-                // 組で買った砲台の輸送車はその砲台の隣に置き、既存の孤立砲台があればそれに近い施設を優先。
-                let nearest = if prepaid > 0 {
+                // 今手番に買った砲台の輸送車はその砲台の隣に置き、無ければ孤立した既存の砲台に近い施設を優先。
+                let nearest = if !new_guns.is_empty() {
                     to_new
                 } else if !unescorted_guns.is_empty() {
                     to_unescorted
                 } else {
-                    to_new.min(to_existing)
+                    to_existing
                 };
                 (nearest, position.y, position.x)
             });
@@ -149,16 +143,10 @@ pub(super) fn allocate_artillery_carriers(
             return;
         };
         let remaining_funds_before = state.allocation.remaining_funds();
-        // 組で確保済みの輸送車は、配分から重ねて差し引かない。
-        let claimed_cost = if prepaid > 0 {
-            prepaid -= 1;
-            0
-        } else {
-            carrier_stats.cost
-        };
+        // 輸送車も実単価で資金と施設を確保する。確保できなければ買わない。
         if state
             .allocation
-            .try_claim(facility, claimed_cost, 0)
+            .try_claim(facility, carrier_stats.cost, 0)
             .is_err()
         {
             return;
@@ -186,7 +174,7 @@ pub(super) fn allocate_artillery_carriers(
                 unit_type: carrier_type,
             },
             role: SlotKind::Transport,
-            cost: claimed_cost,
+            cost: carrier_stats.cost,
             purpose: PurchasePurpose::Mobilization,
             deployment: None,
             capture_intent: None,
@@ -344,121 +332,5 @@ fn set_facility(planned: &mut PlannedProduction, facility: GridPosition) {
     if let Some(intent) = planned.capture_intent.as_mut() {
         intent.command.target_x = facility.x;
         intent.command.target_y = facility.y;
-    }
-}
-
-/// 攻める進軍路（配分案の守りでない作戦）に回っている砲台（[`BoardScan::attack_route_guns`]:
-/// 割り当て済みと、これから割り当てる新しい砲台）が、合計 [`GUNS_FOR_ATTACK_ROUTES`] 基に
-/// 満たなければ、攻めの要衝に最も近い空き施設で砲台を買う。既に居る砲台（右辺の守りなど）は
-/// 回さないので、その分を引き抜かずに足す。作戦の枠より先に資金を確保する。輸送車との組の
-/// 値段に届けば組で確保し（[`allocate_artillery_carriers`] が隣に輸送車を付ける）、届かなければ
-/// 砲台だけを買う（輸送車は次の手番以降に、運ぶ手段の無い砲台へ付ける）。
-pub(super) fn allocate_attack_route_guns(
-    input: &ProductionInputs<'_>,
-    state: &mut ProductionState,
-) {
-    let ProductionInputs {
-        scan, player_id, ..
-    } = *input;
-    let Some(posture) = scan.route_posture.as_ref() else {
-        return;
-    };
-    let attack_points = posture
-        .orders
-        .iter()
-        .filter(|order| !order.defend)
-        .map(|order| order.key_point)
-        .collect::<Vec<_>>();
-    if attack_points.is_empty() {
-        return;
-    }
-    let Some((gun_type, gun_stats)) = scan
-        .available_types
-        .iter()
-        .find(|(_, stats)| is_ferried_gun(stats))
-        .map(|(unit_type, stats)| (*unit_type, stats.clone()))
-    else {
-        return;
-    };
-    let Some(carrier_cost) = scan
-        .available_types
-        .iter()
-        .find(|(_, stats)| is_artillery_carrier(stats))
-        .map(|(_, stats)| stats.cost)
-    else {
-        return;
-    };
-    let distance = |a: GridPosition, b: GridPosition| scan.map.distance(a.x, a.y, b.x, b.y);
-    let bought = state
-        .commands
-        .iter()
-        .filter(|planned| planned.command.unit_type == gun_type)
-        .count();
-    let mut wanted = GUNS_FOR_ATTACK_ROUTES.saturating_sub(scan.attack_route_guns + bought);
-    let pair_cost = gun_stats.cost.saturating_add(carrier_cost);
-    // 攻めの要衝を順に回り、それぞれの要衝に最も近い空き施設で買う。
-    let mut points = attack_points.iter().cycle();
-    while wanted > 0 {
-        let Some(point) = points.next().copied() else {
-            return;
-        };
-        let Some(operation_kind) = state
-            .operations
-            .iter()
-            .min_by_key(|operation| distance(operation.anchor, point))
-            .map(|operation| operation.kind)
-        else {
-            return;
-        };
-        let allocation = &state.allocation;
-        let facility = scan
-            .free_facilities
-            .iter()
-            .filter(|(position, terrain)| {
-                !allocation.is_facility_used(position) && scan.can_produce(*terrain, gun_type)
-            })
-            .map(|(position, _)| *position)
-            .min_by_key(|position| (distance(*position, point), position.y, position.x));
-        let Some(facility) = facility else {
-            return;
-        };
-        let remaining_funds_before = state.allocation.remaining_funds();
-        let cost = if remaining_funds_before >= pair_cost {
-            pair_cost
-        } else {
-            gun_stats.cost
-        };
-        if state.allocation.try_claim(facility, cost, 0).is_err() {
-            return;
-        }
-        // 施設の付け替え（[`place_new_guns_for_fastest_emplacement`]）が要衝への到着で
-        // 比べるよう、作戦地点には要衝を記録する。
-        state.plan_trace.steps.push(ProductionStepTrace {
-            operation_kind,
-            operation_anchor: point,
-            slot_kind: SlotKind::Combat,
-            deficit_before: 0.0,
-            deficit_after: 0.0,
-            remaining_funds_before,
-            decision: ProductionDecision::ProducedImmediateReinforcement {
-                unit_type: gun_type,
-                cost,
-                facility,
-            },
-        });
-        state.commands.push(PlannedProduction {
-            command: ProduceUnitCommand {
-                player_id,
-                target_x: facility.x,
-                target_y: facility.y,
-                unit_type: gun_type,
-            },
-            role: SlotKind::Combat,
-            cost,
-            purpose: PurchasePurpose::Mobilization,
-            deployment: None,
-            capture_intent: None,
-        });
-        wanted -= 1;
     }
 }

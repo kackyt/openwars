@@ -616,10 +616,13 @@ fn commit_slot_order(
     } = *order;
     let SlotRequest { op_index, .. } = request;
     let rolling_plan = rolling_plans.get(&op_index);
+    // 計画が輸送車の分まで確保した購入額のうち、砲台そのものの実単価だけをここで確保する。
+    // 輸送車は確定直後に実単価で別施設へ買う（下の `allocate_artillery_carriers`）。
+    let carrier_reserve = carrier_surcharge(candidate.unit_type, candidate.cost, input.scan);
     if allocation
         .try_claim(
             candidate.facility,
-            candidate.cost,
+            candidate.cost.saturating_sub(carrier_reserve),
             operation_priority_rank(&operations[op_index], input.policy),
         )
         .is_err()
@@ -646,6 +649,10 @@ fn commit_slot_order(
         contract_registry,
     );
     record_slot_order(input, state, order, deployment);
+    if carrier_reserve > 0 {
+        // 確保した資金が他の枠に使われる前に、今買った砲台へ輸送車を付ける。
+        allocate_artillery_carriers(input, state);
+    }
     true
 }
 fn record_slot_order(
@@ -702,6 +709,11 @@ fn record_slot_order(
             &candidate,
         );
     }
+    // 発注する命令とtraceは実単価で記録する（輸送車の分の上乗せは含めない）。
+    let issued_cost =
+        candidate
+            .cost
+            .saturating_sub(carrier_surcharge(candidate.unit_type, candidate.cost, scan));
     plan_trace.steps.push(ProductionStepTrace {
         operation_kind,
         operation_anchor,
@@ -715,7 +727,7 @@ fn record_slot_order(
         remaining_funds_before,
         decision: ProductionDecision::Produced {
             unit_type: candidate.unit_type,
-            cost: candidate.cost,
+            cost: issued_cost,
             facility: candidate.facility,
         },
     });
@@ -746,7 +758,7 @@ fn record_slot_order(
             unit_type: candidate.unit_type,
         },
         role: effective_slot_kind,
-        cost: candidate.cost,
+        cost: issued_cost,
         purpose,
         deployment,
         capture_intent,

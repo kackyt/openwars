@@ -166,7 +166,7 @@ fn collect_existing_force(input: &CombatInputs<'_>, ctx: &mut ReachCtx, draft: &
     let capture_completion_turn = draft.capture_completion_turn;
     let required_capture_survivors = draft.required_capture_survivors;
     let mut existing_units = Vec::new();
-    for unit in &scan.my_units {
+    for unit in scan.my_units.iter().chain(&scan.ferried_units) {
         if input.policy == ProductionPolicy::Standard && unit.stats.max_cargo > 0 {
             continue;
         }
@@ -448,10 +448,11 @@ fn finish_combat_input(input: &CombatInputs<'_>, draft: CombatDraft) -> Option<R
                 .map(|(_, stats)| stats.clone())
         })
         .flatten(),
-        artillery_resupply_slots: artillery_resupply_slots(scan),
+        owned_cities: scan.owned_cities.clone(),
         positional: input.policy == ProductionPolicy::Standard
             && crate::ai::features::positional_enabled(),
         deploy_anchor: Some(op.anchor),
+        defensive_emplacement: op.kind == OperationKind::Defense,
         economy_of_force: economy_budget.is_some(),
         delay_cost_per_turn: op.facts.target_property_count.max(1).saturating_mul(1_000),
         search_beam_width: if op.kind == OperationKind::Capture {
@@ -468,31 +469,6 @@ fn finish_combat_input(input: &CombatInputs<'_>, draft: CombatDraft) -> Option<R
         exact_property_control: input.policy.uses_joint_capture()
             && !op.property_controls.is_empty(),
     })
-}
-
-/// 砲台を据えて毎手番補給できる、前線の自軍都市の数。敵が射程のすぐ外までに居る都市に限る。
-/// 都市が少ない盤面では、それを超える砲台は弾切れで撃ち止めになる。
-fn artillery_resupply_slots(scan: &BoardScan) -> usize {
-    let Some(reach) = scan
-        .available_types
-        .iter()
-        .find(|(_, stats)| crate::ai::v4::artillery_ferry::is_ferried_gun(stats))
-        .map(|(_, stats)| {
-            stats
-                .max_range
-                .saturating_add(crate::ai::v4::artillery_ferry::HOLD_MARGIN)
-        })
-    else {
-        return 0;
-    };
-    scan.owned_cities
-        .iter()
-        .filter(|city| {
-            scan.enemy_units
-                .iter()
-                .any(|enemy| scan.map.distance(city.x, city.y, enemy.pos.x, enemy.pos.y) <= reach)
-        })
-        .count()
 }
 
 /// 交戦できるかを測る移動タイプ。自力でほとんど動けない砲台は、運ぶ輸送部隊の足で測る。

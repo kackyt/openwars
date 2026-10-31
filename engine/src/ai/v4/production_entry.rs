@@ -227,8 +227,6 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
         EnemyProductionForecastTrace::default()
     };
     scan.enemy_production_forecast = enemy_production_forecast;
-    scan.attack_route_guns =
-        crate::ai::v4::artillery_ferry::attack_route_gun_supply(world, player_id);
     if let Some(budget) = campaign_surplus {
         scan.funds = scan.funds.min(budget);
     }

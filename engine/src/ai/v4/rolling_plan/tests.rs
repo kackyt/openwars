@@ -115,9 +115,10 @@ pub(super) fn input() -> RollingPlanInput {
         hold_contestants: Vec::new(),
         committed_purchases: Vec::new(),
         artillery_carrier: None,
-        artillery_resupply_slots: 0,
+        owned_cities: Vec::new(),
         positional: false,
         deploy_anchor: None,
+        defensive_emplacement: false,
         economy_of_force: false,
     }
 }

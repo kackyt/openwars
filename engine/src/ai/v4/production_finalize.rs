@@ -50,7 +50,12 @@ pub(super) fn finalize(
                         move |(purchase_index, purchase)| {
                             let same_purchase = purchase.build_turn == 0
                                 && purchase.unit_type == planned.command.unit_type
-                                && purchase.cost == planned.cost
+                                // 計画の購入額は砲台と輸送車の組の値段で、命令は実単価。
+                                && (purchase.cost == planned.cost
+                                    || purchase.cost
+                                        == planned.cost.saturating_add(
+                                            carrier_package_cost(scan, planned.command.unit_type),
+                                        ))
                                 && purchase.facility == facility(planned);
                             let same_plan = match planned.purpose {
                                 PurchasePurpose::PlanStep(reference) => {
@@ -71,6 +76,28 @@ pub(super) fn finalize(
         optimize_production_facility_assignments(scan, commands);
     }
     commit_facilities(commands, trace, registry, &produced_steps, &rolling_links);
+}
+
+/// 計画が砲台の購入額へ上乗せする、補給輸送車の価格。砲台でなければ、または運搬を使わない
+/// 経路では0。計画側の上乗せ（`combat_input`）と同じ条件で求める。
+fn carrier_package_cost(scan: &BoardScan, unit_type: UnitType) -> u32 {
+    use crate::ai::v4::artillery_ferry::{
+        artillery_ferry_enabled, is_artillery_carrier, is_ferried_gun,
+    };
+    if crate::ai::code_path::is_extended() || !artillery_ferry_enabled() {
+        return 0;
+    }
+    let is_gun = scan
+        .available_types
+        .iter()
+        .any(|(candidate, stats)| *candidate == unit_type && is_ferried_gun(stats));
+    if !is_gun {
+        return 0;
+    }
+    scan.available_types
+        .iter()
+        .find(|(_, stats)| is_artillery_carrier(stats))
+        .map_or(0, |(_, stats)| stats.cost)
 }
 
 fn facility(planned: &PlannedProduction) -> GridPosition {

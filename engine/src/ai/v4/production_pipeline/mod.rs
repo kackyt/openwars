@@ -48,8 +48,6 @@ pub(in crate::ai::v4) fn plan_production_with_registry(
     if ferries_artillery {
         // 運ぶ手段の無い既存の砲台へ、作戦枠より先に補給輸送車を付ける。
         allocate_artillery_carriers(input, &mut state);
-        // 攻める進軍路に回せる砲台を揃える（作戦の枠より先に資金を確保する）。
-        allocate_attack_route_guns(input, &mut state);
     }
     allocate_operation_slots(input, &mut state, plan_registry, contract_registry);
     if ferries_artillery {
@@ -178,6 +176,7 @@ fn assign_committed_combat(input: &ProductionInputs<'_>, state: &mut ProductionS
         let Some(unit) = scan
             .my_units
             .iter()
+            .chain(&scan.ferried_units)
             .find(|unit| unit.entity == Some(entity))
         else {
             continue;
