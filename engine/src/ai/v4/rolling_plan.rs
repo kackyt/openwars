@@ -1428,12 +1428,9 @@ impl<'c> CombatRun<'c> {
             // に並ぶ複数の長射程砲が同時に集中砲撃できる。広い平地で前衛が隘路幅に満たない場合は、
             // 前衛の数までしか後ろに隠れて撃てない（前衛ゼロなら間接単独では撃てない）。
             let is_indirect = lane.indirect_range.is_some();
-            if is_indirect
-                && let Some(frontage) = catalog.frontage.as_ref()
-            {
+            if is_indirect && let Some(frontage) = catalog.frontage.as_ref() {
                 let screen_units = living_ground_direct.max(engaged_front);
-                if screen_units < frontage.ground_chokepoint_width
-                    && indirect_fired >= screen_units
+                if screen_units < frontage.ground_chokepoint_width && indirect_fired >= screen_units
                 {
                     continue;
                 }
@@ -1968,7 +1965,8 @@ impl EngagementTemplate {
                     enemy_origin_contact_turn: enemy
                         .available_turn
                         .saturating_add(origin_enemy_travel),
-                    emplacement_arrival_offset: emplacement.map(|(_, ferry)| ferry.saturating_sub(1)),
+                    emplacement_arrival_offset: emplacement
+                        .map(|(_, ferry)| ferry.saturating_sub(1)),
                     friendly_travel,
                     firing_slots,
                     enemy_in_range_turn,
@@ -2422,14 +2420,17 @@ fn indirect_firing_cells(
             let carrier_reach = reachable_cells(input, carrier_move, origins, blocked);
             let gun_passable = |cell: GridPosition| {
                 !blocked.contains(&cell)
-                    && input.map.get_terrain(cell.x, cell.y).is_some_and(|terrain| {
-                        crate::systems::movement::get_valid_movement_cost(
-                            &input.master_data,
-                            movement_type,
-                            terrain,
-                        )
-                        .is_some()
-                    })
+                    && input
+                        .map
+                        .get_terrain(cell.x, cell.y)
+                        .is_some_and(|terrain| {
+                            crate::systems::movement::get_valid_movement_cost(
+                                &input.master_data,
+                                movement_type,
+                                terrain,
+                            )
+                            .is_some()
+                        })
             };
             let mut drop_cells = HashSet::default();
             for &stop in &carrier_reach {
@@ -2730,7 +2731,7 @@ impl ApproachMap {
                 gun.max_range.max(1).saturating_add(1),
             ),
         )
-        .map_or(u32::MAX / 4, |travel| travel.max(1).saturating_add(2))
+        .map_or(u32::MAX / 4, |travel| travel.max(1))
     }
 
     /// 同じ手番に `target` を直接攻撃できる射撃位置の数（地形上到達でき、敵のいないマス）。
@@ -4097,11 +4098,8 @@ mod tests {
             )
         }];
         let without_gun = evaluate_fixed_package(&air_case, &[]).unwrap();
-        let with_gun = evaluate_fixed_package(
-            &air_case,
-            &[air_case.production_options[0].purchase],
-        )
-        .unwrap();
+        let with_gun =
+            evaluate_fixed_package(&air_case, &[air_case.production_options[0].purchase]).unwrap();
         assert!(
             without_gun.expected_loss < air_case.existing_units[0].stats.cost,
             "前衛の重戦車は6手番時点で生存している前提: loss={}",

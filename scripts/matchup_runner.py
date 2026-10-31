@@ -189,15 +189,22 @@ class McpServerClient:
                 stderr = None
         else:
             stderr = subprocess.DEVNULL
-        self.process = subprocess.Popen(
-            self.command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=stderr,
-            text=True,
-            encoding="utf-8",
-            env=env,
-        )
+        for attempt in range(5):
+            try:
+                self.process = subprocess.Popen(
+                    self.command,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr,
+                    text=True,
+                    encoding="utf-8",
+                    env=env,
+                )
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.3 * (attempt + 1))
         _JOB.assign(self.process)
         # MCP 初期化シーケンス
         self._send(
