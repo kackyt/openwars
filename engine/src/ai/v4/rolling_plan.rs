@@ -384,8 +384,6 @@ struct SimulationCatalog {
     existing_by_enemy_damage: Vec<Vec<usize>>,
     /// 1turnに攻撃できる友軍数の上限（前線の幅と間接砲の射撃位置）。`None` は上限なし。
     frontage: Option<BattleFrontage>,
-    /// 補給輸送車と組で運用する砲台が毎手番補給を受けられるか。
-    ferried_resupply: bool,
     /// 運搬砲台を運ぶ補給輸送車の移動種別。
     carrier_movement_type: Option<MovementType>,
     /// 前衛が後ろの間接砲を敵の直接攻撃から守るか。
@@ -425,7 +423,6 @@ impl SimulationCatalog {
         });
         catalog.frontage = frontage;
         catalog.positional = input.positional;
-        catalog.ferried_resupply = input.artillery_carrier.is_some();
         catalog.carrier_movement_type = input
             .artillery_carrier
             .as_ref()
@@ -479,7 +476,6 @@ impl SimulationCatalog {
             enemies,
             existing_by_enemy_damage,
             frontage: None,
-            ferried_resupply: false,
             carrier_movement_type: None,
             positional: false,
         }
@@ -1254,13 +1250,6 @@ impl<'c> CombatRun<'c> {
             finished: false,
             holds_at_window: None,
         };
-        // 補給輸送車と組で運用する砲台は、随伴する輸送車や拠点から毎手番補給を受けられる。
-        // 同時に撃てる基数は BattleFrontage の射撃位置数と前衛スクリーンの有無で制限される。
-        for index in 0..run.friendly_states.len() {
-            if is_ferried_gun(&catalog.existing_units[index].stats) {
-                run.resupply_gun(index);
-            }
-        }
         for option_index in &state.option_indices {
             run.add_production(*option_index);
         }
@@ -1282,16 +1271,6 @@ impl<'c> CombatRun<'c> {
         );
         self.production.push(option_index);
         self.friendly_states.push(UnitCombatState::of(unit));
-        if is_ferried_gun(&unit.stats) {
-            self.resupply_gun(self.friendly_states.len() - 1);
-        }
-    }
-
-    /// 補給輸送車と組の砲台は随伴補給により弾切れしないものとして扱う。
-    fn resupply_gun(&mut self, index: usize) {
-        if self.catalog.ferried_resupply {
-            self.friendly_states[index].attacks_left = u32::MAX;
-        }
     }
 
     /// `turn` 時点で戦場に生存している地上直接戦闘unit（保護対象の占領歩兵を含む）の数。
@@ -4115,6 +4094,314 @@ mod tests {
 
     fn md_tank_clone(stats: &UnitStats) -> UnitStats {
         stats.clone()
+    }
+
+    #[test]
+    fn artillery_without_actual_carrier_does_not_fire_infinitely() {
+        let map = Map::new(10, 1, Terrain::Plains, GridTopology::Square);
+        let mut raw_chart = DamageChart::new();
+        raw_chart.insert_damage(UnitType::Artillery, UnitType::MdTank, 30);
+        let chart = Arc::new(raw_chart);
+
+        let mut input = input();
+        input.map = Arc::new(map);
+        input.damage_chart = chart;
+        input.positional = true;
+        let master = MasterDataRegistry::load().unwrap();
+        // 前衛ユニット（壁役）として重戦車を配置
+        let mut tank_z = master
+            .create_unit_stats(&UnitName("重戦車".to_owned()))
+            .unwrap();
+        tank_z.max_ammo1 = 0; // 攻撃なし
+
+        let carrier = master
+            .create_unit_stats(&UnitName("補給輸送車".to_owned()))
+            .unwrap();
+        input.artillery_carrier = Some(carrier);
+        input.owned_cities = Vec::new();
+
+        // 実在する補給車はなく、平地に砲台（弾数2発）が1基ある
+        let mut artillery = master
+            .create_unit_stats(&UnitName("砲台".to_owned()))
+            .unwrap();
+        artillery.max_ammo1 = 2;
+        artillery.max_ammo2 = 0;
+
+        input.existing_units = vec![
+            FriendlyPlanUnit {
+                protection_completion_turn: None,
+                stats: tank_z,
+                position: GridPosition { x: 2, y: 0 },
+                hp: 100,
+                available_turn: 0,
+                engageable_enemy_indices: vec![],
+            },
+            FriendlyPlanUnit {
+                protection_completion_turn: None,
+                stats: artillery.clone(),
+                position: GridPosition { x: 0, y: 0 },
+                hp: 100,
+                available_turn: 0,
+                engageable_enemy_indices: vec![0],
+            },
+        ];
+
+        // 敵は射程内の (4, 0) にHP 100 の中戦車
+        // 1発30ダメージなので撃破には4発必要。残弾2発では削りきれず40HP残るはず
+        let mut md_tank = master
+            .create_unit_stats(&UnitName("中戦車".to_owned()))
+            .unwrap();
+        md_tank.max_ammo1 = 0; // 反撃なし
+        input.enemies = vec![EnemyPlanUnit {
+            entity: Some(Entity::from_raw(1)),
+            stats: md_tank,
+            position: GridPosition { x: 4, y: 0 },
+            hp: 100,
+            defense_bonus: 0,
+            available_turn: 0,
+        }];
+        input.hard_deadline = Some(5);
+        input.production_options = Vec::new();
+
+        let catalog = SimulationCatalog::new(&input);
+        let state = SearchState::default();
+        let run = CombatRun::start(&catalog, &state);
+
+        // 1. 実在補給車がない場合、friendly_stateのattacks_leftが架空のu32::MAXに化けてはならない
+        assert_eq!(
+            run.friendly_states[1].attacks_left, 2,
+            "実在補給がない場合、砲台の残弾はスペック通りの有限弾数(2)であるべき"
+        );
+
+        // 2. 計画シミュレーションでも、4回撃って敵を撃破（残HP 0）する架空勝利になってはならず、
+        // 2回射撃（31*2=62ダメージ）した時点で弾切れとなり残HP 38で止まるはず
+        let plan = plan_force_package(&input).expect("計画シミュレーション");
+        assert_eq!(
+            plan.remaining_hp(),
+            38,
+            "実在補給がない砲台は残弾2発で弾切れし、HP100の敵を削りきれないはず"
+        );
+    }
+
+    #[test]
+    fn distant_carrier_or_city_does_not_infinite_resupply() {
+        let map = Map::new(20, 1, Terrain::Plains, GridTopology::Square);
+        let mut raw_chart = DamageChart::new();
+        raw_chart.insert_damage(UnitType::Artillery, UnitType::MdTank, 30);
+        let chart = Arc::new(raw_chart);
+
+        let mut input = input();
+        input.map = Arc::new(map);
+        input.damage_chart = chart;
+        input.positional = true;
+
+        let master = MasterDataRegistry::load().unwrap();
+        let carrier = master
+            .create_unit_stats(&UnitName("補給輸送車".to_owned()))
+            .unwrap();
+        input.artillery_carrier = Some(carrier.clone());
+        // 自軍都市が離れた位置に存在
+        input.owned_cities = vec![GridPosition { x: 19, y: 0 }];
+
+        let mut artillery = master
+            .create_unit_stats(&UnitName("砲台".to_owned()))
+            .unwrap();
+        artillery.max_ammo1 = 2;
+        artillery.max_ammo2 = 0;
+
+        let mut tank_z = master
+            .create_unit_stats(&UnitName("重戦車".to_owned()))
+            .unwrap();
+        tank_z.max_ammo1 = 0;
+
+        // 盤面に補給車がいるが、はるか遠方 (18, 0) にいて交戦中の砲台 (0, 0) へ隣接・随伴できない
+        input.existing_units = vec![
+            FriendlyPlanUnit {
+                protection_completion_turn: None,
+                stats: tank_z,
+                position: GridPosition { x: 2, y: 0 },
+                hp: 100,
+                available_turn: 0,
+                engageable_enemy_indices: vec![],
+            },
+            FriendlyPlanUnit {
+                protection_completion_turn: None,
+                stats: artillery,
+                position: GridPosition { x: 0, y: 0 },
+                hp: 100,
+                available_turn: 0,
+                engageable_enemy_indices: vec![0],
+            },
+            FriendlyPlanUnit {
+                protection_completion_turn: None,
+                stats: carrier,
+                position: GridPosition { x: 18, y: 0 },
+                hp: 100,
+                available_turn: 0,
+                engageable_enemy_indices: vec![],
+            },
+        ];
+
+        let mut md_tank = master
+            .create_unit_stats(&UnitName("中戦車".to_owned()))
+            .unwrap();
+        md_tank.max_ammo1 = 0;
+        input.enemies = vec![EnemyPlanUnit {
+            entity: Some(Entity::from_raw(1)),
+            stats: md_tank,
+            position: GridPosition { x: 4, y: 0 },
+            hp: 100,
+            defense_bonus: 0,
+            available_turn: 0,
+        }];
+        input.hard_deadline = Some(5);
+        input.production_options = Vec::new();
+
+        let catalog = SimulationCatalog::new(&input);
+        let state = SearchState::default();
+        let run = CombatRun::start(&catalog, &state);
+
+        // 遠方の車や都市があっても、砲台の残弾が架空にu32::MAXに化けてはならない
+        assert_eq!(
+            run.friendly_states[1].attacks_left, 2,
+            "到達・随伴できない遠方の車や都市によって砲台残弾が無制限化されてはならない"
+        );
+
+        let plan = plan_force_package(&input).expect("計画シミュレーション");
+        assert_eq!(
+            plan.remaining_hp(),
+            38,
+            "遠方の車や都市による架空補給を排除し、現在の弾薬(2発)で弾切れするはず"
+        );
+    }
+
+    #[test]
+    fn single_carrier_with_multiple_guns_does_not_infinite_resupply() {
+        let map = Map::new(10, 1, Terrain::Plains, GridTopology::Square);
+        let mut raw_chart = DamageChart::new();
+        raw_chart.insert_damage(UnitType::Artillery, UnitType::MdTank, 30);
+        let chart = Arc::new(raw_chart);
+
+        let mut input = input();
+        input.map = Arc::new(map);
+        input.damage_chart = chart;
+        input.positional = true;
+
+        let master = MasterDataRegistry::load().unwrap();
+        let carrier = master
+            .create_unit_stats(&UnitName("補給輸送車".to_owned()))
+            .unwrap();
+        input.artillery_carrier = Some(carrier.clone());
+
+        let mut artillery1 = master
+            .create_unit_stats(&UnitName("砲台".to_owned()))
+            .unwrap();
+        artillery1.max_ammo1 = 2;
+        artillery1.max_ammo2 = 0;
+
+        let mut artillery2 = artillery1.clone();
+        artillery2.max_ammo1 = 1;
+
+        let mut tank_z = master
+            .create_unit_stats(&UnitName("重戦車".to_owned()))
+            .unwrap();
+        tank_z.max_ammo1 = 0;
+
+        // 車1台に対して砲台が2基ある
+        input.existing_units = vec![
+            FriendlyPlanUnit {
+                protection_completion_turn: None,
+                stats: tank_z,
+                position: GridPosition { x: 2, y: 0 },
+                hp: 100,
+                available_turn: 0,
+                engageable_enemy_indices: vec![],
+            },
+            FriendlyPlanUnit {
+                protection_completion_turn: None,
+                stats: artillery1,
+                position: GridPosition { x: 0, y: 0 },
+                hp: 100,
+                available_turn: 0,
+                engageable_enemy_indices: vec![0],
+            },
+            FriendlyPlanUnit {
+                protection_completion_turn: None,
+                stats: artillery2,
+                position: GridPosition { x: 1, y: 0 },
+                hp: 100,
+                available_turn: 0,
+                engageable_enemy_indices: vec![0],
+            },
+            FriendlyPlanUnit {
+                protection_completion_turn: None,
+                stats: carrier,
+                position: GridPosition { x: 0, y: 0 },
+                hp: 100,
+                available_turn: 0,
+                engageable_enemy_indices: vec![],
+            },
+        ];
+
+        let catalog = SimulationCatalog::new(&input);
+        let state = SearchState::default();
+        let run = CombatRun::start(&catalog, &state);
+
+        // 複数砲台があっても各々の現在弾薬に制限される
+        assert_eq!(
+            run.friendly_states[1].attacks_left, 2,
+            "砲台1は現在弾薬(2)に制限される"
+        );
+        assert_eq!(
+            run.friendly_states[2].attacks_left, 1,
+            "砲台2は現在弾薬(1)に制限される"
+        );
+    }
+
+    #[test]
+    fn actual_resupply_reflects_in_next_plan_input() {
+        // 実補給の反映確認: ゲームシステムで実際に補給を受ければ、次回計画入力時に実残弾として反映される
+        let map = Map::new(10, 1, Terrain::Plains, GridTopology::Square);
+        let mut raw_chart = DamageChart::new();
+        raw_chart.insert_damage(UnitType::Artillery, UnitType::MdTank, 30);
+        let chart = Arc::new(raw_chart);
+
+        let mut input = input();
+        input.map = Arc::new(map);
+        input.damage_chart = chart;
+        input.positional = true;
+
+        let master = MasterDataRegistry::load().unwrap();
+        let mut artillery = master
+            .create_unit_stats(&UnitName("砲台".to_owned()))
+            .unwrap();
+
+        // ターンN: 弾薬が1発に減っていた状態
+        artillery.max_ammo1 = 1;
+        input.existing_units = vec![FriendlyPlanUnit {
+            protection_completion_turn: None,
+            stats: artillery.clone(),
+            position: GridPosition { x: 0, y: 0 },
+            hp: 100,
+            available_turn: 0,
+            engageable_enemy_indices: vec![0],
+        }];
+
+        let catalog_before = SimulationCatalog::new(&input);
+        assert_eq!(
+            catalog_before.existing_units[0].attacks_left, 1,
+            "補給前の計画では現在残弾1として評価される"
+        );
+
+        // ゲーム内で実補給が行われ、弾薬が5発に回復した状態の次回ターン入力 (ターンN+1)
+        artillery.max_ammo1 = 5;
+        input.existing_units[0].stats = artillery;
+
+        let catalog_after = SimulationCatalog::new(&input);
+        assert_eq!(
+            catalog_after.existing_units[0].attacks_left, 5,
+            "実補給を受けた次回手番の計画では回復した実残弾5として自然に評価される"
+        );
     }
 }
 

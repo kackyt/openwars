@@ -671,23 +671,6 @@ fn consider_wait(
         }
         recovery += FOREIGN_PRODUCTION_BLOCK_PENALTY;
     }
-    // 川を渡れる歩兵が橋（Terrain::Bridge）の上で待機すると、
-    // 川を渡れない車両（戦車・自走砲・砲台・輸送車）の進路を物理的に塞ぐ。
-    // 新たに入って待機する候補は拒否する。
-    let is_bridge = board.map.get_terrain(tile.position.x, tile.position.y)
-        == Some(crate::resources::Terrain::Bridge);
-    let can_ford_river = crate::systems::movement::get_valid_movement_cost(
-        &board.registry,
-        state.stats.movement_type,
-        crate::resources::Terrain::River,
-    )
-    .is_some_and(|cost| cost < 99);
-    if is_bridge && can_ford_river && !tile.is_stationary {
-        if let Some(trace) = probe.as_deref_mut() {
-            trace.reject("wait_blocks_bridge_crossing", tile.position, || json!({}));
-        }
-        return;
-    }
     let mut score = tile.base_score + recovery;
     let holds_blockade = tile.blockade.holds_site;
     // 敵生産口から始めた健全なunitが、占位を続けられない場所で待機するなら、
